@@ -2086,6 +2086,48 @@ pub struct ExplicitDeRegistered {
 // AmfUe - AMF UE Context
 // ============================================================================
 
+/// An Allocation and Retention Priority, as `Arp` (TS 29.571) carries it.
+///
+/// The two enum members are stored as the strings received. `PreemptionCapability`
+/// and `PreemptionVulnerability` are `anyOf[enum, string]` in TS 29.571 — an
+/// extensible enum — so a value outside the two named ones is permitted by the
+/// schema. Presence is therefore enforced (both are `required` in `Arp`) and the
+/// value is not, which is the same stance this tree took for other extensible
+/// enumerations, and it means an ARP is echoed back exactly as the SMF stated it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EbiArp {
+    /// `priorityLevel`, 1..=15 (1 is highest). Validated on ingest.
+    pub priority_level: u8,
+    /// `preemptCap`, e.g. `NOT_PREEMPT` / `MAY_PREEMPT`.
+    pub preempt_cap: String,
+    /// `preemptVuln`, e.g. `NOT_PREEMPTABLE` / `PREEMPTABLE`.
+    pub preempt_vuln: String,
+}
+
+/// One EPS Bearer Identity this AMF has assigned to a PDU session (#117).
+///
+/// TS 23.502 §4.11.1.4.1: for a PDU session that may move to EPS, the SMF asks
+/// the AMF for an EBI per QoS flow that needs one, supplying that flow's ARP; the
+/// AMF owns the identity space and answers with the values it allocated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignedEbi {
+    /// The allocated EBI, always in [`EBI_ASSIGNABLE`].
+    pub ebi: u8,
+    /// The PDU session the EBI belongs to.
+    pub pdu_session_id: u8,
+    /// The ARP the SMF supplied for the flow this EBI maps.
+    pub arp: EbiArp,
+}
+
+/// EBI values an AMF may assign.
+///
+/// TS 24.301 §9.3.2 reserves 0 ("no EPS bearer identity assigned") and 1..=4, so
+/// the assignable space is 5..=15 — eleven per UE, which is also the ceiling on
+/// how many EPS bearers a UE can hold. Exhaustion is therefore a real outcome and
+/// not a theoretical one, and `AssignedEbiData.failedArpList` is how it is
+/// reported rather than a 5xx.
+pub const EBI_ASSIGNABLE: std::ops::RangeInclusive<u8> = 5..=15;
+
 /// AMF UE context
 #[derive(Debug, Clone)]
 pub struct AmfUe {
@@ -2109,6 +2151,13 @@ pub struct AmfUe {
     /// carries no usable `gpsis` entry this stays `None` and every consumer
     /// omits the member rather than conveying a derived one (issue #205).
     pub gpsi: Option<String>,
+    /// EBIs assigned to this UE for 5GS↔EPS interworking (#117,
+    /// `Namf_Communication_EBIAssignment`, TS 29.518 §6.1.6.2.5).
+    ///
+    /// Per-UE rather than per-session because the identity space is per-UE: TS
+    /// 24.301 gives a UE eleven assignable EBIs across ALL its PDU sessions, so a
+    /// per-session pool could hand the same EBI to two sessions of one UE.
+    pub assigned_ebis: Vec<AssignedEbi>,
     /// Masked IMEISV
     pub masked_imeisv: [u8; NEXTGCORE_MAX_IMEISV_LEN],
     /// Masked IMEISV length
@@ -2670,6 +2719,7 @@ impl AmfUe {
             home_plmn_id: PlmnId::default(),
             pei: None,
             gpsi: None,
+            assigned_ebis: Vec::new(),
             masked_imeisv: [0u8; NEXTGCORE_MAX_IMEISV_LEN],
             masked_imeisv_len: 0,
             imeisv_bcd: String::new(),

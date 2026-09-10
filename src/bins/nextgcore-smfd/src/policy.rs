@@ -987,6 +987,11 @@ pub fn build_establishment_accept(
     // the IE. `mtu`: IPv4 link MTU for the same IE; `None` omits it.
     dns_servers: &[std::net::Ipv4Addr],
     mtu: Option<u16>,
+    // `mapped_eps_bearer_id`: the EBI the AMF assigned this session's default
+    // flow, when EPS interworking is enabled and an assignment succeeded (#117).
+    // `None` omits the Mapped EPS bearer contexts IE, which is the whole
+    // behaviour of an interworking-disabled deployment.
+    mapped_eps_bearer_id: Option<u8>,
 ) -> Vec<u8> {
     use crate::gsm_build::{
         encode_qos_flow_descriptions, encode_qos_rules, pf_component_type, pf_direction,
@@ -1119,6 +1124,20 @@ pub fn build_establishment_accept(
             msg.extend_from_slice(&(epco.len() as u16).to_be_bytes());
             msg.extend_from_slice(&epco);
         }
+    }
+
+    // Mapped EPS bearer contexts (IEI 0x75, TLV-E), TS 24.501 §9.11.4.8 — #117.
+    //
+    // This is the LIVE accept path, and it is the one that matters: the three
+    // `gsm_build` builders the issue names have no production caller (they belong
+    // to the `SmfSess`-based model #223 is about), so emitting the IE only there
+    // would have been a correct encoder no UE would ever receive. Both paths call
+    // the same `encode_mapped_eps_bearer_context`, so they cannot drift.
+    if let Some(ebi) = mapped_eps_bearer_id {
+        let mapped = crate::gsm_build::encode_mapped_eps_bearer_context(ebi, five_qi);
+        msg.push(crate::gsm_build::IEI_MAPPED_EPS_BEARER_CONTEXTS);
+        msg.extend_from_slice(&(mapped.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&mapped);
     }
 
     // DNN (IEI 0x25)
@@ -1280,6 +1299,77 @@ mod tests {
         assert!(parse_establishment_request(&[0x2E, 1, 1, 0xC1]).is_none()); // missing mandatory IE
     }
 
+    /// #117: the LIVE accept builder emits the Mapped EPS bearer contexts IE.
+    ///
+    /// Added after a revert exposed the hole: with the emit removed from
+    /// `build_establishment_accept`, the whole smfd suite still passed, because the
+    /// only tests touching the IE drive the three `gsm_build` builders — and those
+    /// have NO production caller. So the IE was covered exactly where it does not
+    /// matter and uncovered on the one path a UE actually receives. That is the
+    /// "correct implementation, unreachable" trap, caught in my own diff.
+    #[test]
+    fn the_live_accept_carries_mapped_eps_bearer_contexts_when_an_ebi_is_assigned() {
+        let build = |ebi: Option<u8>| {
+            build_establishment_accept(
+                5,
+                3,
+                pdu_session_type::IPV4,
+                2,
+                9,
+                9,
+                200_000_000,
+                50_000_000,
+                [10, 45, 0, 2],
+                [0u8; 8],
+                1,
+                None,
+                "internet",
+                None,
+                &[],
+                None,
+                ebi,
+            )
+        };
+
+        let without = build(None);
+        let with = build(Some(6));
+        assert_eq!(
+            with.len(),
+            without.len() + 10,
+            "the IE is IEI + 2-octet length + a 7-octet context"
+        );
+
+        // Locate and decode it: IEI, two-octet length, then the context.
+        let at = with
+            .windows(3)
+            .position(|w| {
+                w[0] == crate::gsm_build::IEI_MAPPED_EPS_BEARER_CONTEXTS
+                    && u16::from_be_bytes([w[1], w[2]]) == 7
+            })
+            .expect("IEI 0x75 with a 7-octet contents length must be present");
+        let body = &with[at + 3..at + 10];
+        assert_eq!(body[0] >> 4, 6, "the EBI in bits 8..5 of octet 4");
+        assert_eq!(body[0] & 0x0f, 0, "bits 4..1 of octet 4 are spare");
+        assert_eq!(u16::from_be_bytes([body[1], body[2]]), 4, "context length");
+        assert_eq!(body[3] >> 6, 0b01, "operation code: create new EPS bearer");
+        assert_eq!(body[3] & 0x0f, 1, "one EPS parameter");
+        assert_eq!(
+            &body[4..7],
+            &[0x01, 0x01, 9],
+            "Mapped EPS QoS parameters carrying the QCI"
+        );
+
+        // With no EBI the bytes must be exactly what they were before #117: this is
+        // criterion 5 on the live path.
+        assert!(
+            !without
+                .windows(3)
+                .any(|w| w[0] == crate::gsm_build::IEI_MAPPED_EPS_BEARER_CONTEXTS
+                    && u16::from_be_bytes([w[1], w[2]]) == 7),
+            "an interworking-disabled deployment must emit no such IE"
+        );
+    }
+
     #[test]
     fn accept_message_carries_policy_values() {
         // SSC mode 2, PDU type IPv4 (0x01), QFI 9, 5QI 9 (QFI == 5QI → no 0x79)
@@ -1299,6 +1389,7 @@ mod tests {
             "internet",
             None,
             &[],
+            None,
             None,
         );
         // SM header (TS 24.501 §9.3 / Table 8.3.2.1.1 octets 1-4)
@@ -1391,6 +1482,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         );
         // header | octet-5 | QoS rules LV-E | Session-AMBR LV | PDU address.
         const PINNED_PREFIX: [u8; 30] = [
@@ -1435,6 +1527,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         );
         // S-NSSAI present with SST + 3-byte SD.
         let snssai_at = msg
@@ -1478,6 +1571,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
         );
         // octet-5: SSC mode 1 | IPv4v6 (0x13)
         assert_eq!(msg[4], (1 << 4) | pdu_session_type::IPV4V6);
@@ -1513,6 +1607,7 @@ mod tests {
             "internet",
             Some(gsm_cause::PDU_SESSION_TYPE_IPV4_ONLY_ALLOWED),
             &[],
+            None,
             None,
         );
         // Header(4)+octet5(1)+QoS-LV-E(11)+Session-AMBR(7) = 23 bytes; the 5GSM

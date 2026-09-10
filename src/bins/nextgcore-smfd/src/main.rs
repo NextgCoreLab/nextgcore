@@ -32,6 +32,7 @@ use std::sync::Arc;
 mod binding;
 mod context;
 mod easdf; // #114: EASDF selection + DNS-context lifecycle (TS 23.501 §5.6.7)
+mod eps_iwk; // #117: 5GS↔EPS interworking, EBI assignment over Namf_Communication
 mod event;
 mod gn_build;
 mod gn_handler;
@@ -452,6 +453,20 @@ async fn main() -> Result<()> {
             report_uri: format!("{advertise_uri}/nsmf-pdusession/v1/easdf-dns-reports"),
             edge_fqdn_patterns: patterns,
         });
+    }
+
+    // ---- #117: 5GS↔EPS interworking (TS 23.502 §4.11.1.4.1) ----
+    //
+    // Off by default. When on, an establishing PDU session asks the AMF for an EPS
+    // Bearer Identity and carries the Mapped EPS bearer contexts IE to the UE, so
+    // the session can later be moved to the EPC. A runtime switch rather than the
+    // cargo feature #117 suggests -- see `eps_iwk.rs` for why, and for why #276's
+    // listener IS a feature while this is not.
+    if std::env::var("SMF_EPS_INTERWORKING")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        eps_iwk::enable();
     }
 
     // Initialize SMF context
@@ -2977,6 +2992,25 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     )
     .await;
 
+    // ---- #117: 5GS↔EPS interworking, EBI assignment (TS 23.502 §4.11.1.4.1) ----
+    //
+    // Off by default. Awaited BEFORE the N1 accept is built, because the accept is
+    // where the Mapped EPS bearer contexts IE has to appear: an EBI learned after
+    // the accept went out could not be conveyed to the UE without a Modification
+    // Command it did not ask for. Non-fatal by construction -- `request_ebi`
+    // returns None for every failure, and a session without an EBI is a working
+    // 5G session that simply cannot be moved to the EPC.
+    //
+    // The AMF's authority is its `smContextStatusUri` callback root, the only
+    // address this SMF has for it.
+    let mapped_eps_bearer_id = eps_iwk::request_ebi(
+        sm_context_status_uri.as_deref(),
+        &supi,
+        pdu_session_id,
+        decision.arp_priority_level,
+    )
+    .await;
+
     // ---- #78: fill in the registered session, so Retrieve answers with the real
     // session rather than with whatever `sess_add_by_psi` defaulted to ----
     //
@@ -3011,6 +3045,29 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         }
     }
 
+    // ---- #117: record the assigned EBI on a QoS flow ----
+    //
+    // `SmfBearer.ebi` is where the Mapped EPS bearer contexts encoder reads the
+    // identity from, and until now the ONLY writer of that field was the EPC
+    // GTPv2 path (`gtp_handler.rs`) — so an EBI could exist only for a session
+    // established from the EPC side, never for a 5GC-first one. This is the Namf
+    // writer #117 asks for.
+    //
+    // The flow is created ONLY when an EBI was assigned. `qos_flow_add` has no
+    // other production caller (the live 5G path carries its QoS on the session and
+    // the policy binding), so creating one unconditionally would populate a store
+    // nothing reads and change what `max_num_of_bearer` means for every session.
+    if let (Some(ebi), Some(sess_id)) = (mapped_eps_bearer_id, registered_sess_id) {
+        eps_iwk::record_mapped_eps_bearer(
+            sess_id,
+            ebi,
+            qfi,
+            decision.def_five_qi,
+            decision.arp_priority_level,
+            &supi,
+        );
+    }
+
     // ---- Store the policy binding (drives later update/release/notify) ----
     if let Ok(context) = ctx.read() {
         if let Ok(mut bindings) = context.policy_bindings.write() {
@@ -3034,6 +3091,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     fsm: fsm.clone(),
                     easdf_dns_context_id: easdf_dns_context_id.clone(),
                     easdf_reported_eas: Vec::new(),
+                    mapped_eps_bearer_id,
                 },
             );
         }
@@ -3073,6 +3131,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         est_5gsm_cause,
         epco_dns,
         epco_mtu,
+        mapped_eps_bearer_id,
     );
 
     // ---- N2 SM Information: real-APER PDUSessionResourceSetupRequestTransfer ----
@@ -4627,6 +4686,14 @@ async fn handle_sm_context_retrieve(sm_context_ref: &str) -> SbiResponse {
     let ctx = smf_self();
     if let Ok(context) = ctx.read() {
         if let Some(sess) = context.sess_find_by_sm_context_ref(sm_context_ref) {
+            // #117: the EBI the AMF assigned this session, when interworking is on.
+            // Read from the policy binding, which is where the create path recorded
+            // it; `None` reproduces #78's output exactly.
+            let eps_bearer_id = context
+                .policy_bindings
+                .read()
+                .ok()
+                .and_then(|b| b.get(sm_context_ref).and_then(|p| p.mapped_eps_bearer_id));
             let up_cnx_state = match sess.up_cnx_state {
                 context::UpCnxState::Activated => "ACTIVATED",
                 context::UpCnxState::Activating => "ACTIVATING",
@@ -4646,7 +4713,7 @@ async fn handle_sm_context_retrieve(sm_context_ref: &str) -> SbiResponse {
                 // SmContextRetrievedData (TS29502_Nsmf_PDUSession.yaml), and it was
                 // absent -- so the body did not deserialise as the type the AMF
                 // expects even once Retrieve started answering 200.
-                "ueEpsPdnConnection": build_ue_eps_pdn_connection(&sess),
+                "ueEpsPdnConnection": build_ue_eps_pdn_connection(&sess, eps_bearer_id),
             });
             // Only include what the session actually holds: an absent member means
             // "not applicable", while a member present with a placeholder value is a
@@ -4677,15 +4744,20 @@ async fn handle_sm_context_retrieve(sm_context_ref: &str) -> SbiResponse {
 /// 5GS↔EPS interworking (TS 23.502 §4.11.1.4.1). It is a `Bytes` (base64-encoded
 /// octet string) in the yaml: the encoded `ueEpsPdnConnection` container.
 ///
-/// **What this returns, and what it deliberately does not.** This SMF has no EPS
-/// bearer contexts to describe — there is no EBI assignment and no Mapped EPS
-/// bearer context IE anywhere in the tree, which is issue #117's defect, not this
-/// one. So the value here is the minimal PDN-connection descriptor derivable from
-/// the 5GS session (APN, PDN type, the UE address, the default bearer's QoS), and
-/// **not** a bearer-context list it would have to invent. A fabricated bearer list
-/// would be worse than a minimal one: the AMF would forward it to an MME that
+/// **What this returns, and what it deliberately does not.** #78 shipped the
+/// minimal PDN-connection descriptor derivable from the 5GS session (APN, PDN
+/// type, the UE address, the default bearer's QoS) and **no** bearer-context list,
+/// because there was no EBI assignment anywhere in the tree and a fabricated
+/// bearer list is worse than a minimal one: the AMF would forward it to an MME that
 /// would then try to use bearers this SMF has not established.
-fn build_ue_eps_pdn_connection(sess: &context::SmfSess) -> String {
+///
+/// #117 changes exactly one thing about that: when an EBI **was** assigned, the
+/// descriptor names it. That is not a fabrication — the AMF allocated the identity
+/// and the UE has already been told about it in the Mapped EPS bearer contexts IE,
+/// so an MME receiving it will find the bearer the UE claims to have. With no EBI
+/// assigned (interworking off, or the assignment failed) the output is byte-for-byte
+/// what #78 produced, which is what keeps criterion 5 true.
+fn build_ue_eps_pdn_connection(sess: &context::SmfSess, eps_bearer_id: Option<u8>) -> String {
     use base64::Engine as _;
     // TS 24.301 PDN type values: 1 = IPv4, 2 = IPv6, 3 = IPv4v6.
     let pdn_type: u8 = match sess.session_type {
@@ -4708,6 +4780,12 @@ fn build_ue_eps_pdn_connection(sess: &context::SmfSess) -> String {
     // Default bearer QoS: the 5QI the session was authorised with, which is what
     // maps onto the EPS QCI.
     buf.push(sess.session_qos.index);
+    // #117: the EPS bearer identity, when one was assigned. Appended rather than
+    // inserted so the prefix stays identical to #78's output for a session without
+    // one — a peer parsing the earlier form reads the same first bytes.
+    if let Some(ebi) = eps_bearer_id {
+        buf.push(ebi);
+    }
     base64::engine::general_purpose::STANDARD.encode(&buf)
 }
 
@@ -5220,6 +5298,7 @@ mod tests {
             "internet",
             None,
             &[],
+            None,
             None,
         );
         let n2 = build_setup_request_transfer(0x0001_0001, [10, 45, 0, 1], 1, 9, 8).unwrap();
@@ -5882,6 +5961,7 @@ mod tests {
                         // #114: no EASDF DNS context by default, so the release
                         // path has nothing to delete.
                         easdf_dns_context_id: None,
+                        mapped_eps_bearer_id: None,
                         easdf_reported_eas: Vec::new(),
                     },
                 );
@@ -6468,6 +6548,7 @@ mod tests {
             None,
             &dns,
             Some(1400),
+            None,
         );
 
         // The ePCO IE (0x7B) must be present with a two-octet TLV-E length.
@@ -6518,6 +6599,7 @@ mod tests {
             "internet",
             None,
             &[],
+            None,
             None,
         );
         assert!(
@@ -6786,6 +6868,83 @@ mod tests {
         );
     }
 
+    /// #117 criterion 4: the retrieved `ueEpsPdnConnection` NAMES the assigned EBI
+    /// when one exists, and is byte-identical to #78's output when none does.
+    ///
+    /// #78 deliberately shipped a minimal descriptor with no bearer contexts,
+    /// because there was no EBI assignment in the tree and a fabricated bearer list
+    /// would have an MME trying to use bearers this SMF never established. #117
+    /// changes exactly that precondition, so the descriptor can now name a real
+    /// identity — and the unchanged-when-absent half is criterion 5.
+    #[tokio::test]
+    async fn the_retrieved_ue_eps_pdn_connection_names_the_assigned_ebi() {
+        use base64::Engine as _;
+
+        let without = seed_registered_session("imsi-001010000000123", 7, "internet");
+        let body: serde_json::Value = serde_json::from_str(
+            handle_sm_context_retrieve(&without)
+                .await
+                .http
+                .content
+                .as_deref()
+                .expect("body"),
+        )
+        .expect("json");
+        let baseline = base64::engine::general_purpose::STANDARD
+            .decode(
+                body["ueEpsPdnConnection"]
+                    .as_str()
+                    .expect("ueEpsPdnConnection is required"),
+            )
+            .expect("base64");
+
+        // Same session, now with an EBI recorded on its policy binding.
+        let with = seed_registered_session("imsi-001010000000124", 8, "internet");
+        if let Ok(ctx) = smf_self().read() {
+            if let Ok(mut bindings) = ctx.policy_bindings.write() {
+                bindings.insert(
+                    with.clone(),
+                    context::PolicyBinding {
+                        supi: "imsi-001010000000124".to_string(),
+                        psi: 8,
+                        dnn: "internet".to_string(),
+                        mapped_eps_bearer_id: Some(6),
+                        ..context::PolicyBinding::snapshot_default()
+                    },
+                );
+            }
+        }
+        let body: serde_json::Value = serde_json::from_str(
+            handle_sm_context_retrieve(&with)
+                .await
+                .http
+                .content
+                .as_deref()
+                .expect("body"),
+        )
+        .expect("json");
+        let carried = base64::engine::general_purpose::STANDARD
+            .decode(body["ueEpsPdnConnection"].as_str().expect("required"))
+            .expect("base64");
+
+        assert_eq!(
+            carried.len(),
+            baseline.len() + 1,
+            "exactly one octet more: the EBI, appended"
+        );
+        assert_eq!(
+            &carried[..baseline.len()],
+            &baseline[..],
+            "the prefix must be unchanged, so a peer parsing #78's form reads the \
+             same first bytes"
+        );
+        assert_eq!(
+            *carried.last().expect("last octet"),
+            6,
+            "the descriptor must name the EBI the AMF assigned"
+        );
+    }
+
     /// #78 criteria 1 + 2: Retrieve answers 200 with a body that deserialises as
     /// `SmContextRetrievedData`, INCLUDING the required `ueEpsPdnConnection`.
     ///
@@ -7008,7 +7167,7 @@ mod tests {
         let reference = seed_registered_session("imsi-001010000000083", 4, "internet");
 
         // Retrieve
-        let resp = smf_sbi_request_handler(SbiRequest::post(&format!(
+        let resp = smf_sbi_request_handler(SbiRequest::post(format!(
             "/nsmf-pdusession/v1/sm-contexts/{reference}/retrieve"
         )))
         .await;
@@ -7019,7 +7178,7 @@ mod tests {
 
         // Update
         let resp = smf_sbi_request_handler(
-            SbiRequest::post(&format!(
+            SbiRequest::post(format!(
                 "/nsmf-pdusession/v1/sm-contexts/{reference}/modify"
             ))
             .with_body(
@@ -7032,7 +7191,7 @@ mod tests {
 
         // Release
         let resp = smf_sbi_request_handler(
-            SbiRequest::post(&format!(
+            SbiRequest::post(format!(
                 "/nsmf-pdusession/v1/sm-contexts/{reference}/release"
             ))
             .with_body(
@@ -7044,7 +7203,7 @@ mod tests {
         assert_eq!(resp.status, 204, "release through the router");
 
         // And it is gone: a second retrieve is 404, not a stale 200.
-        let resp = smf_sbi_request_handler(SbiRequest::post(&format!(
+        let resp = smf_sbi_request_handler(SbiRequest::post(format!(
             "/nsmf-pdusession/v1/sm-contexts/{reference}/retrieve"
         )))
         .await;

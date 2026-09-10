@@ -18,9 +18,9 @@ use nextgcore_sbi::server::{send_error, send_method_not_allowed, send_not_found}
 use serde_json::{json, Value};
 
 use crate::context::{
-    amf_self, AmfSess, AmfUe, EventSubscription, LcsCorrelationRecord, NrCgi, PendingPositioningDl,
-    PlmnId, PositioningDlKind, RanUe, Tai5gs, UeContextTransferState, UeN1N2InfoSubscription,
-    NEXTGCORE_INVALID_POOL_ID,
+    amf_self, AmfSess, AmfUe, AssignedEbi, EbiArp, EventSubscription, LcsCorrelationRecord, NrCgi,
+    PendingPositioningDl, PlmnId, PositioningDlKind, RanUe, Tai5gs, UeContextTransferState,
+    UeN1N2InfoSubscription, EBI_ASSIGNABLE, NEXTGCORE_INVALID_POOL_ID,
 };
 use crate::namf_handler::{
     self, AccessType, DeregistrationData, DeregistrationReason, N1N2MessageTransferCause,
@@ -80,6 +80,7 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
         //   POST   /namf-comm/v1/ue-contexts/{ueContextId}/n1-n2-messages
         //   POST   /namf-comm/v1/ue-contexts/{ueContextId}/n1-n2-messages/subscriptions
         //   DELETE /namf-comm/v1/ue-contexts/{ueContextId}/n1-n2-messages/subscriptions/{subscriptionId}
+        //   POST   /namf-comm/v1/ue-contexts/{ueContextId}/assign-ebi
         //   POST   /namf-comm/v1/ue-contexts/{ueContextId}/transfer
         //   POST   /namf-comm/v1/ue-contexts/{ueContextId}/transfer-update
         // --------------------------------------------------------------
@@ -97,6 +98,8 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
                 ("DELETE", "n1-n2-messages", 7) if parts[5] == "subscriptions" => {
                     handle_n1n2_subscription_delete(ue_context_id, parts[6])
                 }
+                // EBIAssignment (TS 29.518 §6.1.6.2.5), #117
+                ("POST", "assign-ebi", 5) => handle_assign_ebi(ue_context_id, &request),
                 ("POST", "transfer", 5) => handle_ue_context_transfer(ue_context_id, &request),
                 ("POST", "transfer-update", 5) => {
                     handle_registration_status_update(ue_context_id, &request)
@@ -1883,6 +1886,294 @@ fn build_ue_context_json(ue: &AmfUe, sessions: &[AmfSess]) -> Value {
     }
 
     ue_context
+}
+
+// ---------------------------------------------------------------------------
+// EBIAssignment (TS 29.518 §6.1.6.2.5), issue #117
+// ---------------------------------------------------------------------------
+
+/// Parse one `Arp` (TS 29.571): all three members are `required`.
+///
+/// `priorityLevel` is range-checked (1..=15) because it is a plain integer with
+/// declared bounds. The two pre-emption members are checked for PRESENCE only:
+/// both are `anyOf[enum, string]` in TS 29.571, i.e. extensible, so rejecting an
+/// unlisted value would refuse something the schema permits. They are stored and
+/// echoed verbatim.
+fn parse_arp(value: &Value, attr: &str) -> Result<EbiArp, Box<SbiResponse>> {
+    let priority_level = match value.get("priorityLevel").and_then(Value::as_u64) {
+        Some(p) if (1..=15).contains(&p) => p as u8,
+        Some(p) => {
+            return Err(Box::new(mandatory_ie_incorrect(
+                &format!("{attr}.priorityLevel"),
+                &format!("{p} is outside the ArpPriorityLevel range 1..=15"),
+            )))
+        }
+        None => {
+            return Err(Box::new(mandatory_ie_missing(&format!(
+                "{attr}.priorityLevel"
+            ))))
+        }
+    };
+    let member = |key: &str| -> Result<String, Box<SbiResponse>> {
+        match value.get(key).and_then(Value::as_str) {
+            Some(v) if !v.is_empty() => Ok(v.to_string()),
+            _ => Err(Box::new(mandatory_ie_missing(&format!("{attr}.{key}")))),
+        }
+    };
+    Ok(EbiArp {
+        priority_level,
+        preempt_cap: member("preemptCap")?,
+        preempt_vuln: member("preemptVuln")?,
+    })
+}
+
+/// Serialise an `Arp` back onto the wire.
+fn arp_json(arp: &EbiArp) -> Value {
+    json!({
+        "priorityLevel": arp.priority_level,
+        "preemptCap": arp.preempt_cap,
+        "preemptVuln": arp.preempt_vuln,
+    })
+}
+
+/// Serialise an `EbiArpMapping` (TS 29.502): both members are `required`.
+fn ebi_arp_mapping_json(assigned: &AssignedEbi) -> Value {
+    json!({
+        "epsBearerId": assigned.ebi,
+        "arp": arp_json(&assigned.arp),
+    })
+}
+
+/// The lowest free EBI for this UE, or `None` when all eleven are taken.
+///
+/// Lowest-free rather than round-robin so a released EBI is reused promptly: the
+/// space is only eleven wide per UE, and an allocator that kept climbing would
+/// exhaust it after eleven session lifetimes rather than after eleven concurrent
+/// bearers.
+fn next_free_ebi(assigned: &[AssignedEbi]) -> Option<u8> {
+    EBI_ASSIGNABLE
+        .clone()
+        .find(|c| !assigned.iter().any(|a| a.ebi == *c))
+}
+
+/// POST /namf-comm/v1/ue-contexts/{ueContextId}/assign-ebi —
+/// Namf_Communication_EBIAssignment (TS 29.518 §6.1.6.2.5), issue #117.
+///
+/// TS 23.502 §4.11.1.4.1: for a PDU session that may be moved to EPS, the SMF
+/// asks the AMF for an EPS Bearer Identity per QoS flow that needs one, supplying
+/// that flow's ARP. The AMF owns the EBI space for the UE and answers with what it
+/// allocated. Without this operation the two sides cannot agree on bearer
+/// identities and no PDU session can be transferred to the EPC.
+///
+/// The order of operations is release → modify → assign, and it matters: a
+/// request that releases EBI 5 and asks for one more must be able to hand 5 back
+/// out. Doing it the other way round would fail an assignment that the release in
+/// the same request had just made possible.
+fn handle_assign_ebi(ue_context_id: &str, request: &SbiRequest) -> SbiResponse {
+    let Some(mut ue) = find_ue_by_context_id(ue_context_id) else {
+        return context_not_found(ue_context_id);
+    };
+    let Some(body) = parse_json_body(request) else {
+        return malformed_body();
+    };
+
+    // `pduSessionId` is the ONLY required member of AssignEbiData.
+    let pdu_session_id = match body.get("pduSessionId").and_then(Value::as_u64) {
+        Some(id) if id <= 255 => id as u8,
+        Some(id) => {
+            return mandatory_ie_incorrect(
+                "pduSessionId",
+                &format!("{id} is outside the PduSessionId range 0..=255"),
+            )
+        }
+        None => return mandatory_ie_missing("pduSessionId"),
+    };
+
+    // ---- releasedEbiList: free these before allocating anything ----
+    let mut released: Vec<u8> = Vec::new();
+    if let Some(list) = body.get("releasedEbiList").and_then(Value::as_array) {
+        for entry in list {
+            let Some(ebi) = entry.as_u64().filter(|e| *e <= 15).map(|e| e as u8) else {
+                return mandatory_ie_incorrect(
+                    "releasedEbiList",
+                    "entries must be an EpsBearerId in 0..=15",
+                );
+            };
+            // Release is idempotent: an EBI this AMF does not hold is reported as
+            // released anyway, because the SMF's intent (it is not in use) is
+            // already satisfied and a 4xx would strand the SMF's retry.
+            ue.assigned_ebis.retain(|a| a.ebi != ebi);
+            if !released.contains(&ebi) {
+                released.push(ebi);
+            }
+        }
+    }
+
+    // ---- modifiedEbiList: re-ARP an EBI already held ----
+    let mut modified: Vec<u8> = Vec::new();
+    if let Some(list) = body.get("modifiedEbiList").and_then(Value::as_array) {
+        for entry in list {
+            let Some(ebi) = entry
+                .get("epsBearerId")
+                .and_then(Value::as_u64)
+                .filter(|e| *e <= 15)
+                .map(|e| e as u8)
+            else {
+                return mandatory_ie_missing("modifiedEbiList.epsBearerId");
+            };
+            let arp = match entry.get("arp") {
+                Some(v) => match parse_arp(v, "modifiedEbiList.arp") {
+                    Ok(arp) => arp,
+                    Err(response) => return *response,
+                },
+                None => return mandatory_ie_missing("modifiedEbiList.arp"),
+            };
+            match ue.assigned_ebis.iter_mut().find(|a| a.ebi == ebi) {
+                Some(existing) => {
+                    existing.arp = arp;
+                    existing.pdu_session_id = pdu_session_id;
+                    if !modified.contains(&ebi) {
+                        modified.push(ebi);
+                    }
+                }
+                None => {
+                    // Modifying an EBI this AMF never assigned is a state
+                    // disagreement, not a malformed request. 409 is what the
+                    // operation defines for exactly that, and answering 200 while
+                    // silently ignoring the entry would leave the SMF believing an
+                    // ARP change took effect.
+                    return assign_ebi_error(
+                        409,
+                        "Conflict",
+                        &format!("EBI {ebi} is not assigned to UE '{ue_context_id}'"),
+                        "EBI_NOT_ASSIGNED",
+                        pdu_session_id,
+                        &[],
+                    );
+                }
+            }
+        }
+    }
+
+    // ---- arpList: one EBI per ARP, in the order given ----
+    let mut assigned_now: Vec<AssignedEbi> = Vec::new();
+    let mut failed: Vec<EbiArp> = Vec::new();
+    if let Some(list) = body.get("arpList").and_then(Value::as_array) {
+        for entry in list {
+            let arp = match parse_arp(entry, "arpList") {
+                Ok(arp) => arp,
+                Err(response) => return *response,
+            };
+            match next_free_ebi(&ue.assigned_ebis) {
+                Some(ebi) => {
+                    let assignment = AssignedEbi {
+                        ebi,
+                        pdu_session_id,
+                        arp,
+                    };
+                    ue.assigned_ebis.push(assignment.clone());
+                    assigned_now.push(assignment);
+                }
+                // Exhaustion is a modelled outcome, not an error: eleven EBIs is
+                // also the most EPS bearers a UE can have, so a twelfth request is
+                // the SMF asking for something that cannot exist.
+                None => failed.push(arp),
+            }
+        }
+    }
+
+    // Every ARP failed AND at least one was asked for: nothing was achieved, so
+    // the operation failed. TS 29.518 defines 403 + AssignEbiError for this, which
+    // carries the failed ARPs so the SMF knows which flows have no EBI.
+    if !failed.is_empty() && assigned_now.is_empty() {
+        return assign_ebi_error(
+            403,
+            "Forbidden",
+            &format!(
+                "no EBI is available for UE '{ue_context_id}': all {} assignable \
+                 identities (TS 24.301 §9.3.2 reserves 0..=4) are in use",
+                EBI_ASSIGNABLE.clone().count()
+            ),
+            "INSUFFICIENT_RESOURCES",
+            pdu_session_id,
+            &failed,
+        );
+    }
+
+    // Persist before answering: an EBI reported as assigned and not recorded would
+    // be handed out again on the next request, and two PDU sessions of one UE
+    // would map to one EPS bearer.
+    if let Ok(guard) = amf_self().read() {
+        guard.amf_ue_update(&ue);
+    }
+
+    let mut response = json!({
+        "pduSessionId": pdu_session_id,
+        // `required` and `minItems: 0`, so an empty array is emitted rather than
+        // the member being omitted.
+        "assignedEbiList": assigned_now
+            .iter()
+            .map(ebi_arp_mapping_json)
+            .collect::<Vec<_>>(),
+    });
+    // The remaining members are `minItems: 1`, so each is emitted only when
+    // non-empty: an empty array would violate the schema it is declared under.
+    if !failed.is_empty() {
+        response["failedArpList"] = json!(failed.iter().map(arp_json).collect::<Vec<_>>());
+    }
+    if !released.is_empty() {
+        response["releasedEbiList"] = json!(released);
+    }
+    if !modified.is_empty() {
+        response["modifiedEbiList"] = json!(modified);
+    }
+
+    log::info!(
+        "[{ue_context_id}] EBI assignment psi={pdu_session_id}: assigned {:?}, failed {}, \
+         released {:?}, modified {:?} ({} of {} EBIs now held)",
+        assigned_now.iter().map(|a| a.ebi).collect::<Vec<_>>(),
+        failed.len(),
+        released,
+        modified,
+        ue.assigned_ebis.len(),
+        EBI_ASSIGNABLE.clone().count()
+    );
+
+    SbiResponse::with_status(200)
+        .with_json_body(&response)
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
+/// An `AssignEbiError` response: `error` + `failureDetails`, both `required`.
+///
+/// Note this is NOT `application/problem+json`: the operation defines its own
+/// error body with the ProblemDetails nested under `error`, because the SMF needs
+/// the failed ARP list alongside the problem to know which QoS flows are without
+/// an EBI.
+fn assign_ebi_error(
+    status: u16,
+    title: &str,
+    detail: &str,
+    cause: &str,
+    pdu_session_id: u8,
+    failed: &[EbiArp],
+) -> SbiResponse {
+    let mut failure_details = json!({ "pduSessionId": pdu_session_id });
+    if !failed.is_empty() {
+        failure_details["failedArpList"] = json!(failed.iter().map(arp_json).collect::<Vec<_>>());
+    }
+    let body = json!({
+        "error": {
+            "status": status,
+            "title": title,
+            "detail": detail,
+            "cause": cause,
+        },
+        "failureDetails": failure_details,
+    });
+    SbiResponse::with_status(status)
+        .with_json_body(&body)
+        .unwrap_or_else(|_| SbiResponse::with_status(status))
 }
 
 /// POST /namf-comm/v1/ue-contexts/{ueContextId}/transfer —
@@ -3896,5 +4187,344 @@ mod tests {
             .expect("json");
         assert_eq!(namf_request_handler(req).await.status, 204);
         assert!(drain_network_deregs_for(ue.id).is_empty());
+    }
+    // ---- #117: EBIAssignment (TS 29.518 §6.1.6.2.5) --------------------------
+
+    /// Through the ROUTER, not by calling the handler directly: the routing arm
+    /// is half of criterion 1, and a test that called `handle_assign_ebi` would
+    /// pass with the arm absent (a 405, in production).
+    fn assign_ebi_request(supi: &str, body: Value) -> SbiResponse {
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/assign-ebi"))
+            .with_body(body.to_string(), "application/json");
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime")
+            .block_on(namf_request_handler(req))
+    }
+
+    fn arp(priority: u8) -> Value {
+        json!({
+            "priorityLevel": priority,
+            "preemptCap": "NOT_PREEMPT",
+            "preemptVuln": "PREEMPTABLE",
+        })
+    }
+
+    /// #117 criterion 1: the operation is routed, allocates from a per-UE pool,
+    /// and answers an `AssignedEbiData` of the shape TS 29.518 declares.
+    ///
+    /// The shape assertions are against the yaml, not against what this
+    /// implementation happens to emit: `pduSessionId` and `assignedEbiList` are
+    /// the two `required` members, `assignedEbiList` items are `EbiArpMapping`
+    /// (`epsBearerId` + `arp`, both required), and the three optional lists are
+    /// `minItems: 1` — so each must be ABSENT rather than empty, which is the part
+    /// a "just serialise the struct" implementation gets wrong.
+    #[test]
+    fn assign_ebi_allocates_from_a_per_ue_pool_and_answers_assigned_ebi_data() {
+        let supi = "imsi-001010000000117";
+        setup_ue(supi, true, true);
+
+        let resp = assign_ebi_request(
+            supi,
+            json!({
+                "pduSessionId": 5,
+                "arpList": [arp(1), arp(8)],
+            }),
+        );
+        assert_eq!(resp.status, 200, "body: {:?}", resp.http.content);
+        let body = body_json(&resp);
+
+        assert_eq!(body["pduSessionId"], json!(5));
+        let assigned = body["assignedEbiList"]
+            .as_array()
+            .expect("assignedEbiList is a required member of AssignedEbiData");
+        assert_eq!(assigned.len(), 2, "one EBI per ARP entry");
+
+        // TS 24.301 §9.3.2: 0..=4 are reserved, so an assignment inside them would
+        // collide with the EPS reserved space.
+        for (i, entry) in assigned.iter().enumerate() {
+            let ebi = entry["epsBearerId"].as_u64().expect("epsBearerId required");
+            assert!(
+                (5..=15).contains(&ebi),
+                "EBI {ebi} is outside the assignable range 5..=15"
+            );
+            assert_eq!(
+                entry["arp"]["priorityLevel"],
+                json!(if i == 0 { 1 } else { 8 }),
+                "each mapping must carry back the ARP it was requested with"
+            );
+            assert_eq!(entry["arp"]["preemptCap"], json!("NOT_PREEMPT"));
+            assert_eq!(entry["arp"]["preemptVuln"], json!("PREEMPTABLE"));
+        }
+        let first = assigned[0]["epsBearerId"].as_u64().expect("ebi");
+        let second = assigned[1]["epsBearerId"].as_u64().expect("ebi");
+        assert_ne!(first, second, "two flows must not share one EBI");
+
+        // minItems: 1 on all three, so an empty array is not a legal value.
+        for optional in ["failedArpList", "releasedEbiList", "modifiedEbiList"] {
+            assert!(
+                body.get(optional).is_none(),
+                "{optional} is minItems:1, so it must be absent rather than empty"
+            );
+        }
+
+        // A SECOND request for the same UE must not hand out the same EBIs: the
+        // pool is per-UE and spans every one of its PDU sessions.
+        let resp = assign_ebi_request(
+            supi,
+            json!({
+                "pduSessionId": 6,
+                "arpList": [arp(2)],
+            }),
+        );
+        assert_eq!(resp.status, 200);
+        let third = body_json(&resp)["assignedEbiList"][0]["epsBearerId"]
+            .as_u64()
+            .expect("ebi");
+        assert!(
+            third != first && third != second,
+            "EBI {third} was already assigned to another session of this UE"
+        );
+    }
+
+    /// Release frees an EBI for reuse, and it happens BEFORE assignment inside one
+    /// request — a request that releases 5 and asks for one more must be able to
+    /// hand 5 straight back out.
+    #[test]
+    fn assign_ebi_releases_before_it_assigns_so_a_freed_ebi_is_reusable() {
+        let supi = "imsi-001010000000118";
+        setup_ue(supi, true, true);
+
+        let first = body_json(&assign_ebi_request(
+            supi,
+            json!({
+                "pduSessionId": 5,
+                "arpList": [arp(1)],
+            }),
+        ))["assignedEbiList"][0]["epsBearerId"]
+            .as_u64()
+            .expect("ebi");
+
+        let body = body_json(&assign_ebi_request(
+            supi,
+            json!({
+                "pduSessionId": 5,
+                "releasedEbiList": [first],
+                "arpList": [arp(3)],
+            }),
+        ));
+        assert_eq!(
+            body["releasedEbiList"],
+            json!([first]),
+            "the release must be reported back"
+        );
+        assert_eq!(
+            body["assignedEbiList"][0]["epsBearerId"],
+            json!(first),
+            "the EBI freed in this same request must be reassignable within it"
+        );
+    }
+
+    /// Pool exhaustion is a modelled outcome. Eleven EBIs is also the most EPS
+    /// bearers a UE can hold, so a twelfth is a request for something that cannot
+    /// exist — and the SMF has to be told WHICH flows went without one, which is
+    /// what `failedArpList` is for.
+    #[test]
+    fn assign_ebi_reports_exhaustion_rather_than_inventing_an_ebi() {
+        let supi = "imsi-001010000000119";
+        setup_ue(supi, true, true);
+
+        // Eleven assignable identities: 5..=15.
+        let eleven: Vec<Value> = (1..=11).map(|i| arp((i % 15) + 1)).collect();
+        let body = body_json(&assign_ebi_request(
+            supi,
+            json!({
+                "pduSessionId": 5,
+                "arpList": eleven,
+            }),
+        ));
+        assert_eq!(
+            body["assignedEbiList"].as_array().expect("list").len(),
+            11,
+            "all eleven assignable EBIs must be usable"
+        );
+        assert!(body.get("failedArpList").is_none());
+
+        // Partial: one more ARP with nothing left. Every ARP failed and none was
+        // assigned, so TS 29.518's 403 + AssignEbiError applies.
+        let resp = assign_ebi_request(
+            supi,
+            json!({
+                "pduSessionId": 6,
+                "arpList": [arp(4)],
+            }),
+        );
+        assert_eq!(resp.status, 403, "body: {:?}", resp.http.content);
+        let body = body_json(&resp);
+        assert_eq!(
+            body["error"]["cause"],
+            json!("INSUFFICIENT_RESOURCES"),
+            "AssignEbiError.error is required and carries the ProblemDetails"
+        );
+        assert_eq!(
+            body["failureDetails"]["pduSessionId"],
+            json!(6),
+            "AssignEbiError.failureDetails is required"
+        );
+        assert_eq!(
+            body["failureDetails"]["failedArpList"][0]["priorityLevel"],
+            json!(4),
+            "the SMF must learn WHICH flow got no EBI"
+        );
+
+        // Partial success: free two, ask for three. Two are assigned and one fails,
+        // which is a 200 carrying both lists -- not a 403.
+        let held: Vec<u64> = body_json(&assign_ebi_request(supi, json!({"pduSessionId": 5})))
+            .get("assignedEbiList")
+            .and_then(Value::as_array)
+            .map(|_| Vec::new())
+            .unwrap_or_default();
+        assert!(held.is_empty(), "a request with no arpList assigns nothing");
+
+        let resp = assign_ebi_request(
+            supi,
+            json!({
+                "pduSessionId": 5,
+                "releasedEbiList": [5, 6],
+                "arpList": [arp(1), arp(2), arp(3)],
+            }),
+        );
+        assert_eq!(resp.status, 200);
+        let body = body_json(&resp);
+        assert_eq!(body["assignedEbiList"].as_array().expect("list").len(), 2);
+        assert_eq!(
+            body["failedArpList"]
+                .as_array()
+                .expect("failedArpList")
+                .len(),
+            1,
+            "a partial failure is a 200 carrying both lists, not a 403"
+        );
+    }
+
+    /// The request-validation surface: the one required member, the ARP members,
+    /// and an unknown UE.
+    #[test]
+    fn assign_ebi_rejects_a_malformed_request_and_an_unknown_ue() {
+        let supi = "imsi-001010000000120";
+        setup_ue(supi, true, true);
+
+        // pduSessionId is the ONLY required member of AssignEbiData.
+        let resp = assign_ebi_request(supi, json!({ "arpList": [arp(1)] }));
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem_cause(&resp), "MANDATORY_IE_MISSING");
+
+        // ...and a request with ONLY it is legal: it assigns nothing and answers
+        // an empty assignedEbiList, which minItems:0 permits.
+        let resp = assign_ebi_request(supi, json!({ "pduSessionId": 5 }));
+        assert_eq!(resp.status, 200);
+        assert_eq!(body_json(&resp)["assignedEbiList"], json!([]));
+
+        // Arp's three members are all required.
+        for missing in ["priorityLevel", "preemptCap", "preemptVuln"] {
+            let mut a = arp(1);
+            a.as_object_mut().expect("obj").remove(missing);
+            let resp = assign_ebi_request(supi, json!({"pduSessionId": 5, "arpList": [a]}));
+            assert_eq!(resp.status, 400, "missing Arp.{missing} must be refused");
+            assert_eq!(problem_cause(&resp), "MANDATORY_IE_MISSING");
+        }
+
+        // ArpPriorityLevel is 1..=15 and is a plain integer, so its value IS
+        // checked -- unlike the two pre-emption members, which are extensible
+        // enums and are checked for presence only.
+        let resp = assign_ebi_request(
+            supi,
+            json!({
+                "pduSessionId": 5,
+                "arpList": [json!({"priorityLevel": 0, "preemptCap": "x", "preemptVuln": "y"})],
+            }),
+        );
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem_cause(&resp), "MANDATORY_IE_INCORRECT");
+
+        let resp = assign_ebi_request(
+            supi,
+            json!({
+                "pduSessionId": 5,
+                "arpList": [json!({
+                    "priorityLevel": 9,
+                    "preemptCap": "SOME_FUTURE_VALUE",
+                    "preemptVuln": "ANOTHER",
+                })],
+            }),
+        );
+        assert_eq!(
+            resp.status, 200,
+            "PreemptionCapability is anyOf[enum, string]; an unlisted value is \
+             permitted by the schema and must not be refused"
+        );
+
+        // A UE this AMF does not hold.
+        let resp = assign_ebi_request("imsi-999990000000000", json!({"pduSessionId": 5}));
+        assert_eq!(resp.status, 404);
+        assert_eq!(problem_cause(&resp), "CONTEXT_NOT_FOUND");
+    }
+
+    /// Modifying an EBI the AMF never assigned is a state disagreement, and 409 is
+    /// what the operation defines for it. Answering 200 while ignoring the entry
+    /// would leave the SMF believing an ARP change took effect.
+    #[test]
+    fn assign_ebi_modifies_a_held_ebi_and_409s_one_it_does_not_hold() {
+        let supi = "imsi-001010000000121";
+        setup_ue(supi, true, true);
+
+        let ebi = body_json(&assign_ebi_request(
+            supi,
+            json!({
+                "pduSessionId": 5,
+                "arpList": [arp(1)],
+            }),
+        ))["assignedEbiList"][0]["epsBearerId"]
+            .as_u64()
+            .expect("ebi");
+
+        let body = body_json(&assign_ebi_request(
+            supi,
+            json!({
+                "pduSessionId": 5,
+                "modifiedEbiList": [{"epsBearerId": ebi, "arp": arp(12)}],
+            }),
+        ));
+        assert_eq!(body["modifiedEbiList"], json!([ebi]));
+
+        // The new ARP is what is held now, not the old one. Read back through a
+        // fresh assignment's echo of the stored state.
+        let stored = amf_self()
+            .read()
+            .expect("ctx")
+            .amf_ue_find_by_supi(supi)
+            .expect("ue");
+        let held = stored
+            .assigned_ebis
+            .iter()
+            .find(|a| a.ebi as u64 == ebi)
+            .expect("the EBI is still held");
+        assert_eq!(
+            held.arp.priority_level, 12,
+            "the modify must replace the stored ARP, not just be reported"
+        );
+
+        let resp = assign_ebi_request(
+            supi,
+            json!({
+                "pduSessionId": 5,
+                "modifiedEbiList": [{"epsBearerId": 15, "arp": arp(3)}],
+            }),
+        );
+        assert_eq!(resp.status, 409, "body: {:?}", resp.http.content);
+        assert_eq!(
+            body_json(&resp)["error"]["cause"],
+            json!("EBI_NOT_ASSIGNED")
+        );
     }
 }
