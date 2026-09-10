@@ -15,23 +15,25 @@
 //!   SGW-C's sessions are removed rather than left believed-in
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 use nextgcore_pfcp::header::{PfcpHeader, PfcpMessageType};
 use nextgcore_pfcp::message::{
     AssociationReleaseResponse, AssociationSetupRequest, AssociationSetupResponse,
-    HeartbeatRequest, HeartbeatResponse, PfcpMessage as PfcpLibMessage,
-    SessionEstablishmentRequest as LibSessionEstablishmentRequest,
+    HeartbeatRequest, HeartbeatResponse, NodeReportRequest, NodeReportResponse,
+    PfcpMessage as PfcpLibMessage, SessionEstablishmentRequest as LibSessionEstablishmentRequest,
     SessionModificationRequest as LibSessionModificationRequest,
 };
 use nextgcore_pfcp::types::{
     ApplyAction as LibApplyAction, CreateFar as LibCreateFar, CreatePdr as LibCreatePdr,
     CreateQer as LibCreateQer, CreateUrr as LibCreateUrr, FSeid as LibFSeid, FTeid as LibFTeid,
-    GateStatus as LibGateStatus, NodeId, PfcpCause, UpFunctionFeatures as LibUpFunctionFeatures,
+    GateStatus as LibGateStatus, NodeId, NodeReportType as LibNodeReportType, PfcpCause,
+    RemoteGtpUPeer as LibRemoteGtpUPeer, UpFunctionFeatures as LibUpFunctionFeatures,
     UpdateQer as LibUpdateQer, UpdateUrr as LibUpdateUrr,
+    UserPlanePathFailureReport as LibUserPlanePathFailureReport,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
@@ -57,6 +59,10 @@ pub mod pfcp_msg_type {
     pub const ASSOCIATION_RELEASE_RESPONSE: u8 = 10;
     /// TS 29.244 §7.2.2.1: answered when the version octet is not 1.
     pub const VERSION_NOT_SUPPORTED_RESPONSE: u8 = 11;
+    /// TS 29.244 §7.4.5 — the UP function reports a user-plane path failure
+    /// (TS 23.007 §20.3.4). Issue #217.
+    pub const NODE_REPORT_REQUEST: u8 = 12;
+    pub const NODE_REPORT_RESPONSE: u8 = 13;
     pub const SESSION_ESTABLISHMENT_REQUEST: u8 = 50;
     pub const SESSION_ESTABLISHMENT_RESPONSE: u8 = 51;
     pub const SESSION_MODIFICATION_REQUEST: u8 = 52;
@@ -237,17 +243,115 @@ pub struct SxaPeer {
 /// a per-packet executor in front of user-plane forwarding.
 struct QueuedRequest {
     msg_type: u8,
-    seid: u64,
+    /// `None` for a node-level message, which carries no SEID (TS 29.244 §7.2.2.1).
+    seid: Option<u64>,
     body: Vec<u8>,
-    to: SocketAddr,
-    sess_id: u64,
+    to: QueuedDestination,
+    /// What to do with the response. A node-level message has no session, so this
+    /// cannot be a bare `sess_id`: routing a Node Report Response into
+    /// `handle_session_report_response` would look up session 0 and log a rejection
+    /// for a session that never existed.
+    sink: ResponseSink,
 }
 
-static OUTBOUND: OnceLock<mpsc::UnboundedSender<QueuedRequest>> = OnceLock::new();
+/// Where a queued request goes.
+#[derive(Debug, Clone, Copy)]
+enum QueuedDestination {
+    /// A session-level request: the SGW-C named on the session's CP F-SEID.
+    Addr(SocketAddr),
+    /// A node-level request (TS 29.244 §7.4): every ASSOCIATED peer. Resolved in
+    /// the drain task rather than by the synchronous caller, because the peer table
+    /// is behind an async lock — and resolving it at enqueue time would report a
+    /// path failure to a peer that had gone away in between.
+    AssociatedPeers,
+}
+
+/// Who handles the response to a queued request.
+#[derive(Debug, Clone, Copy)]
+enum ResponseSink {
+    /// Feed it to `handle_session_report_response` for this session.
+    Session(u64),
+    /// Decode and log it (TS 29.244 §7.4.6: a Node Report Response carries only a
+    /// Cause, and there is nothing to retry that T1/N1 has not already tried).
+    NodeReport,
+}
+
+/// The running node's outbound queue, and the node itself.
+///
+/// **Settable rather than install-once (#217).** They were `OnceLock`s, which is
+/// first-wins: whichever node a process opened first stayed installed forever. That
+/// was survivable while the only sync sender was a Session Report addressed by the
+/// session's own CP F-SEID, but a Node Report is addressed to *the node's associated
+/// peers* — so it can only be asserted against the node the test actually opened, and
+/// under `#[tokio::test]` every test has its own runtime and its own socket. The same
+/// reasoning as smfd's `PFCP_CLIENT` (#289), and the same shape.
+///
+/// What changes for the running SGW-U: nothing. `main` opens exactly one node and runs
+/// it once, so replace-on-install and set-once are the same behaviour there.
+///
+/// [`SXA_TEST_LOCK`] serialises the tests that depend on which node is installed.
+static OUTBOUND: std::sync::RwLock<Option<mpsc::UnboundedSender<QueuedRequest>>> =
+    std::sync::RwLock::new(None);
 
 /// The running Sxa node, so the sync API can resolve a peer and the metrics
 /// endpoint can report association state.
-static SXA_NODE: OnceLock<Arc<SxaNode>> = OnceLock::new();
+static SXA_NODE: std::sync::RwLock<Option<Arc<SxaNode>>> = std::sync::RwLock::new(None);
+
+/// Serialises every test that reads or writes [`SXA_NODE`] / [`OUTBOUND`].
+///
+/// ONE lock for both, declared here beside them rather than in `mod tests`: they are
+/// always installed together and a second lock would be a second, disjoint agreement
+/// about the same variables.
+#[cfg(test)]
+pub(crate) static SXA_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The outbound queue of the running node, if one is installed.
+fn outbound() -> Option<mpsc::UnboundedSender<QueuedRequest>> {
+    OUTBOUND.read().ok()?.clone()
+}
+
+/// Holds [`SXA_TEST_LOCK`] and leaves the process-global node and queue empty on both
+/// sides of a test.
+///
+/// Crate-visible because the set of tests that install a node is wider than this
+/// module: `main.rs`'s `test_pfcp_path_open_close` calls `pfcp_open`, which installs
+/// the global too — and while `SXA_NODE` was an install-once `OnceLock` that was
+/// harmless, now it overwrites whichever node a concurrent test is asserting against.
+///
+/// Cleared on ACQUIRE as well as on drop, so a test asserting "no transport is running"
+/// is not at the mercy of whether a sibling installed one.
+#[cfg(test)]
+pub(crate) struct SxaTestGuard(#[allow(dead_code)] tokio::sync::MutexGuard<'static, ()>);
+
+#[cfg(test)]
+impl Drop for SxaTestGuard {
+    fn drop(&mut self) {
+        clear_sxa_globals_for_test();
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn sxa_test_guard() -> SxaTestGuard {
+    let guard = SXA_TEST_LOCK.lock().await;
+    clear_sxa_globals_for_test();
+    SxaTestGuard(guard)
+}
+
+/// Uninstall the node and its queue, returning the process to its pre-startup state.
+///
+/// Test-only, and the "release" half of the per-test install: a test that opened a
+/// node must not leave it behind for a sibling, whose runtime would then find a socket
+/// belonging to a runtime that has shut down. Not offered to production — a running
+/// SGW-U has no reason to un-install its own Sxa endpoint.
+#[cfg(test)]
+pub(crate) fn clear_sxa_globals_for_test() {
+    if let Ok(mut slot) = SXA_NODE.write() {
+        *slot = None;
+    }
+    if let Ok(mut slot) = OUTBOUND.write() {
+        *slot = None;
+    }
+}
 
 /// PFCP node ids, unique for the whole PROCESS rather than per `SxaNode`.
 ///
@@ -260,7 +364,7 @@ static NEXT_NODE_ID: AtomicU32 = AtomicU32::new(1);
 
 /// The process-wide Sxa node, once [`SxaNode::open`] has run.
 pub fn sxa_node() -> Option<Arc<SxaNode>> {
-    SXA_NODE.get().cloned()
+    SXA_NODE.read().ok()?.clone()
 }
 
 /// The SGW-U's PFCP endpoint on Sxa: one UDP socket, transactions matched on
@@ -324,7 +428,9 @@ impl SxaNode {
             "PFCP/Sxa listening on {bound} (Node ID {local_ip}, Recovery Time Stamp \
              {recovery_time_stamp})"
         );
-        let _ = SXA_NODE.set(node.clone());
+        if let Ok(mut slot) = SXA_NODE.write() {
+            *slot = Some(node.clone());
+        }
         Ok(node)
     }
 
@@ -412,10 +518,13 @@ impl SxaNode {
     ///
     /// This is what `send_pfcp_request`'s "In actual implementation: create local
     /// transaction, set timeout callback, send message" comment described.
+    /// `seid` is `None` for a NODE-level message (Heartbeat, Association, Node
+    /// Report): TS 29.244 §7.2.2.1 clears the S flag for those, so a SEID field of 0
+    /// would be a malformed header rather than a zero SEID.
     pub async fn request(
         &self,
         msg_type: u8,
-        seid: u64,
+        seid: Option<u64>,
         body: &[u8],
         to: SocketAddr,
     ) -> Result<(u8, Vec<u8>), PfcpRequestError> {
@@ -433,7 +542,7 @@ impl SxaNode {
             let (tx, rx) = oneshot::channel();
             self.pending.lock().await.insert(seq, tx);
 
-            if let Err(e) = self.send(msg_type, Some(seid), seq, body, to).await {
+            if let Err(e) = self.send(msg_type, seid, seq, body, to).await {
                 self.pending.lock().await.remove(&seq);
                 return Err(PfcpRequestError::Local(e));
             }
@@ -471,8 +580,11 @@ impl SxaNode {
     /// task owns the socket and no lock is shared with `gtp_path`'s threads.
     pub async fn run(self: Arc<Self>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         let (tx, mut queued) = mpsc::unbounded_channel();
-        if OUTBOUND.set(tx).is_err() {
-            log::warn!("PFCP outbound queue already installed; this run() will not drain it");
+        if let Ok(mut slot) = OUTBOUND.write() {
+            if slot.is_some() {
+                log::warn!("PFCP outbound queue replaced: the previous node's queue is dropped");
+            }
+            *slot = Some(tx);
         }
         let mut buf = vec![0u8; 8192];
         loop {
@@ -497,15 +609,41 @@ impl SxaNode {
                     // for that long would stall every inbound message including the
                     // response this request is waiting for.
                     tokio::spawn(async move {
-                        match node.request(req.msg_type, req.seid, &req.body, req.to).await {
-                            Ok((resp_type, body)) => {
-                                sess_report_response_received(req.sess_id, resp_type, &body);
+                        // A node-level request fans out here, where the peer table can
+                        // be read: one transaction per associated peer.
+                        let targets = match req.to {
+                            QueuedDestination::Addr(addr) => vec![addr],
+                            QueuedDestination::AssociatedPeers => node
+                                .peers()
+                                .await
+                                .into_iter()
+                                .filter(|p| p.state == PfcpNodeState::Associated)
+                                .map(|p| p.addr)
+                                .collect(),
+                        };
+                        if targets.is_empty() {
+                            log::warn!(
+                                "PFCP request type={} has no associated peer to send to; \
+                                 nothing was reported",
+                                req.msg_type
+                            );
+                            return;
+                        }
+                        for to in targets {
+                            match node.request(req.msg_type, req.seid, &req.body, to).await {
+                                Ok((resp_type, body)) => match req.sink {
+                                    ResponseSink::Session(sess_id) => {
+                                        sess_report_response_received(sess_id, resp_type, &body);
+                                    }
+                                    ResponseSink::NodeReport => {
+                                        node_report_response_received(resp_type, &body, to);
+                                    }
+                                },
+                                Err(e) => log::error!(
+                                    "PFCP request type={} to {to} failed: {e}",
+                                    req.msg_type
+                                ),
                             }
-                            Err(e) => log::error!(
-                                "PFCP request type={} for session {} failed: {e}",
-                                req.msg_type,
-                                req.sess_id
-                            ),
                         }
                     });
                 }
@@ -1535,17 +1673,133 @@ pub fn send_session_report_request(
         sess.sgwc_sxa_f_seid.seid,
         report.report_type()
     );
-    let tx = OUTBOUND
-        .get()
+    let tx = outbound()
         .ok_or_else(|| "PFCP path is not running: no Sxa transport to send on".to_string())?;
     tx.send(QueuedRequest {
         msg_type: msg.msg_type,
-        seid: msg.seid,
+        seid: Some(msg.seid),
         body: msg.data,
-        to,
-        sess_id: sess.id,
+        to: QueuedDestination::Addr(to),
+        sink: ResponseSink::Session(sess.id),
     })
     .map_err(|_| "PFCP outbound queue is closed".to_string())
+}
+
+/// Which user-plane path event a Node Report carries (TS 29.244 §8.2.68).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathReport {
+    /// UPFR — the GTP-U path to these peers is down (TS 23.007 §20.3.4).
+    Failure,
+    /// UPRR — it came back (§20.3.5.1). Reported for the same reason the failure
+    /// is: an SGW-C that tore down or suspended state on the failure has no other
+    /// way to learn it can stop.
+    Recovery,
+}
+
+/// Report a GTP-U user-plane path failure (or recovery) to the SGW-C with a PFCP
+/// Node Report Request (TS 23.007 §20.3.4, TS 29.244 §7.4.5). Issue #217.
+///
+/// Callable from the SYNCHRONOUS data path for the same reason
+/// [`send_session_report_request`] is: detection happens on `gtp_path`'s GTP-U
+/// receive thread, which runs a blocking socket and cannot await. The request is
+/// enqueued and the node's task performs the I/O with T1/N1 retransmission.
+///
+/// This is a NODE-level message: no SEID, and addressed to every associated peer
+/// rather than to one session's SGW-C, because a failed path affects every session
+/// forwarding over it — including sessions belonging to other CP functions.
+pub fn send_node_report_request(peers: &[IpAddr], report: PathReport) -> Result<(), String> {
+    if peers.is_empty() {
+        return Err("no peers to report: refusing to send an empty Node Report".to_string());
+    }
+
+    let node = sxa_node().ok_or_else(|| {
+        "PFCP path is not running: no Sxa node to build a Node Report from".to_string()
+    })?;
+
+    // Checked HERE, synchronously, rather than left for the drain task to discover:
+    // the caller is the one that knows which path failed, so it is the only place that
+    // can say "the failure of 10.0.0.1 was not reported" rather than logging a bare
+    // message type. `associated_peer_count` is the sync gauge the metrics render
+    // already uses, refreshed on every peer mutation.
+    if node.associated_peer_count() == 0 {
+        return Err("no associated SGW-C: there is nobody to report the path to".to_string());
+    }
+
+    let node_report_type = LibNodeReportType {
+        upfr: report == PathReport::Failure,
+        uprr: report == PathReport::Recovery,
+        ..Default::default()
+    };
+    let request = NodeReportRequest {
+        node_id: NodeId::new_ipv4(node.local_ip.octets()),
+        node_report_type,
+        // TS 29.244 Table 7.4.5.1-1 carries the peer list in a User Plane Path
+        // Failure Report for both directions; §8.2.83's Remote GTP-U Peer is the
+        // member that names which path.
+        user_plane_path_failure_report: Some(LibUserPlanePathFailureReport {
+            remote_gtpu_peers: peers
+                .iter()
+                .map(|ip| match ip {
+                    IpAddr::V4(v4) => LibRemoteGtpUPeer {
+                        ipv4: Some(v4.octets()),
+                        ipv6: None,
+                    },
+                    IpAddr::V6(v6) => LibRemoteGtpUPeer {
+                        ipv4: None,
+                        ipv6: Some(v6.octets()),
+                    },
+                })
+                .collect(),
+        }),
+    };
+    let mut body = BytesMut::new();
+    request.encode(&mut body);
+
+    log::info!(
+        "Queueing PFCP Node Report Request: {} for {:?} (TS 23.007 §20.3.4)",
+        if report == PathReport::Failure {
+            "User Plane Path Failure"
+        } else {
+            "User Plane Path Recovery"
+        },
+        peers
+    );
+    let tx = outbound()
+        .ok_or_else(|| "PFCP path is not running: no Sxa transport to send on".to_string())?;
+    tx.send(QueuedRequest {
+        msg_type: pfcp_msg_type::NODE_REPORT_REQUEST,
+        seid: None,
+        body: body.to_vec(),
+        to: QueuedDestination::AssociatedPeers,
+        sink: ResponseSink::NodeReport,
+    })
+    .map_err(|_| "PFCP outbound queue is closed".to_string())
+}
+
+/// Log the answer to a Node Report Request (TS 29.244 §7.4.6).
+///
+/// Decode-and-log rather than a retry: the report is not session state, T1/N1 has
+/// already retransmitted it, and re-sending on a rejection would loop against a CP
+/// function that has said no. A non-accepted cause is logged at `warn` because it
+/// means the SGW-C is NOT acting on a path failure the SGW-U detected.
+fn node_report_response_received(resp_type: u8, body: &[u8], from: SocketAddr) {
+    if resp_type != pfcp_msg_type::NODE_REPORT_RESPONSE {
+        log::warn!("Unexpected response type {resp_type} to a Node Report Request from {from}");
+        return;
+    }
+    let mut cursor = Bytes::copy_from_slice(body);
+    match NodeReportResponse::decode(&mut cursor) {
+        Ok(rsp) if rsp.cause == PfcpCause::RequestAccepted => {
+            log::info!("Node Report accepted by {from}");
+        }
+        Ok(rsp) => log::warn!(
+            "Node Report REJECTED by {from}: cause={:?}, offending_ie={:?} — the SGW-C is not \
+             acting on the path failure",
+            rsp.cause,
+            rsp.offending_ie
+        ),
+        Err(e) => log::warn!("Node Report Response from {from} is malformed: {e}"),
+    }
 }
 
 /// Where to send a session-level request for `sess`: the SGW-C address from the CP
@@ -1632,7 +1886,8 @@ mod tests {
     use nextgcore_pfcp::types::{CreateQer, CreateUrr};
 
     /// A bound node plus a socket standing in for the SGW-C.
-    async fn node_and_peer() -> (Arc<SxaNode>, UdpSocket) {
+    async fn node_and_peer() -> (SxaTestGuard, Arc<SxaNode>, UdpSocket) {
+        let guard = sxa_test_guard().await;
         sgwu_context_init(1024);
         // A CH F-TEID asks the UP function to allocate, which needs its own GTP-U
         // address; without one `process_create_pdr` correctly answers
@@ -1643,7 +1898,7 @@ mod tests {
             .await
             .expect("bind Sxa socket");
         let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
-        (node, peer)
+        (guard, node, peer)
     }
 
     /// Encode a PFCP message the way an SGW-C would put it on the wire.
@@ -1726,7 +1981,7 @@ mod tests {
     /// that separates a bound socket from a claim about one.
     #[tokio::test]
     async fn the_sxa_socket_is_really_bound() {
-        let (node, _peer) = node_and_peer().await;
+        let (_guard, node, _peer) = node_and_peer().await;
         let bound = node.local_addr();
         assert_ne!(bound.port(), 0, "an ephemeral bind must resolve to a port");
         assert!(sxa_node().is_some(), "the node is installed process-wide");
@@ -1736,7 +1991,7 @@ mod tests {
     /// codec and answered (TS 29.244 §6.2.2.2 — "shall reply").
     #[tokio::test]
     async fn an_inbound_heartbeat_request_is_answered_with_our_recovery_time_stamp() {
-        let (node, peer) = node_and_peer().await;
+        let (_guard, node, peer) = node_and_peer().await;
         let mut body = BytesMut::new();
         PfcpLibMessage::HeartbeatRequest(HeartbeatRequest::new(4242)).encode_body(&mut body);
 
@@ -1767,7 +2022,7 @@ mod tests {
     /// attributable to a node.
     #[tokio::test]
     async fn an_association_setup_request_is_accepted_and_the_peer_recorded() {
-        let (node, peer) = node_and_peer().await;
+        let (_guard, node, peer) = node_and_peer().await;
         let mut body = BytesMut::new();
         PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
             NodeId::new_ipv4([127, 0, 0, 9]),
@@ -1813,7 +2068,7 @@ mod tests {
     /// response produced.
     #[tokio::test]
     async fn a_session_establishment_request_creates_a_session_and_is_answered() {
-        let (node, peer) = node_and_peer().await;
+        let (_guard, node, peer) = node_and_peer().await;
 
         // Associate first: TS 29.244 §6.2.6.2 has no session signalling without one,
         // and the peer record is what tags the session with its node.
@@ -1907,7 +2162,7 @@ mod tests {
     /// the handler is exactly what passed in that state.
     #[tokio::test]
     async fn a_modification_over_the_wire_closes_a_qer_gate_and_removes_a_urr() {
-        let (node, peer) = node_and_peer().await;
+        let (_guard, node, peer) = node_and_peer().await;
 
         let mut assoc = BytesMut::new();
         PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
@@ -2086,6 +2341,8 @@ mod tests {
     /// transaction completed on the answer rather than on a timer.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_request_retransmits_on_t1_and_completes_on_the_answer() {
+        // Holds the lock because `run()` installs the process-global outbound queue.
+        let _guard = sxa_test_guard().await;
         sgwu_context_init(1024);
         // A 200ms T1 with N1 = 2, so the assertion is about the retransmission rather
         // than about the production interval.
@@ -2134,7 +2391,12 @@ mod tests {
         tokio::spawn(async move { pump.run(rx).await });
 
         let (resp_type, body) = node
-            .request(pfcp_msg_type::SESSION_REPORT_REQUEST, 1, &[], peer_addr)
+            .request(
+                pfcp_msg_type::SESSION_REPORT_REQUEST,
+                Some(1),
+                &[],
+                peer_addr,
+            )
             .await
             .expect("the third attempt must be answered");
         assert_eq!(resp_type, pfcp_msg_type::SESSION_REPORT_RESPONSE);
@@ -2158,7 +2420,7 @@ mod tests {
     /// nothing would leave the state identical.
     #[tokio::test]
     async fn peer_failure_runs_the_fsm_restoration_and_removes_that_nodes_sessions() {
-        let (node, peer) = node_and_peer().await;
+        let (_guard, node, peer) = node_and_peer().await;
         let mut assoc = BytesMut::new();
         PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
             NodeId::new_ipv4([127, 0, 0, 9]),
@@ -2211,7 +2473,7 @@ mod tests {
     /// Stamp on a re-association flushes them (TS 23.007 §19A).
     #[tokio::test]
     async fn a_changed_recovery_time_stamp_flushes_that_peers_sessions() {
-        let (node, peer) = node_and_peer().await;
+        let (_guard, node, peer) = node_and_peer().await;
         let assoc = |rts: u32| {
             let mut body = BytesMut::new();
             PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
@@ -2255,7 +2517,7 @@ mod tests {
     /// than succeeding silently.
     #[tokio::test]
     async fn a_session_deletion_is_answered_and_an_unknown_seid_is_refused() {
-        let (node, peer) = node_and_peer().await;
+        let (_guard, node, peer) = node_and_peer().await;
         let ctx = sgwu_self();
         let sess = ctx
             .sess_add(&FSeid::with_ipv4(0xDD01, Ipv4Addr::new(127, 0, 0, 9)))
@@ -2306,11 +2568,320 @@ mod tests {
         );
     }
 
+    // ================================================================
+    // #217: a detected GTP-U path failure reaches the SGW-C
+    // ================================================================
+
+    /// Bring the peer to Associated, then start the node's run loop so the outbound
+    /// queue is drained. Returns the shutdown sender, which must be kept alive.
+    async fn associate_and_run(
+        node: &Arc<SxaNode>,
+        peer: &UdpSocket,
+    ) -> tokio::sync::watch::Sender<bool> {
+        let mut assoc = BytesMut::new();
+        PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            3000,
+        ))
+        .encode_body(&mut assoc);
+        // Associated BEFORE `run` starts, because `deliver` and `run` would otherwise
+        // both read the node's socket and race for the datagram.
+        deliver(
+            node,
+            peer,
+            &wire(pfcp_msg_type::ASSOCIATION_SETUP_REQUEST, None, 1, &assoc),
+        )
+        .await;
+        let _ = recv_decoded(peer).await;
+        assert!(
+            node.is_associated().await,
+            "a Node Report goes to ASSOCIATED peers, so the handshake is the precondition"
+        );
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let pump = node.clone();
+        tokio::spawn(async move { pump.run(rx).await });
+        // `run` installs the outbound queue in its own body, so a report queued before
+        // the task is first polled would be refused with "no Sxa transport". Waiting
+        // for the install is the test's business, not the production path's: a running
+        // SGW-U opens and runs the node before any GTP-U peer exists to fail.
+        for _ in 0..200 {
+            if outbound().is_some() {
+                return tx;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("the node's run loop never installed its outbound queue");
+    }
+
+    /// Read datagrams from the peer until one is a Node Report Request naming
+    /// `about`, answering each with an accepted Node Report Response. Returns how
+    /// many matching reports arrived within the window.
+    ///
+    /// Scoped to `about` on purpose: `note_echo_unanswered` is process-global and the
+    /// `gtp_path` path tests call it too, so a sibling's transition can enqueue onto
+    /// whichever node is installed. Counting datagrams would make this test's result
+    /// depend on its neighbours; counting reports ABOUT THIS PEER does not.
+    async fn count_node_reports_about(
+        peer: &UdpSocket,
+        about: IpAddr,
+        window: std::time::Duration,
+    ) -> (usize, Option<LibNodeReportType>) {
+        let mut matched = 0usize;
+        let mut kind = None;
+        let deadline = tokio::time::Instant::now() + window;
+        let mut buf = vec![0u8; 8192];
+        while let Ok(Ok((len, from))) =
+            tokio::time::timeout_at(deadline, peer.recv_from(&mut buf)).await
+        {
+            let mut cursor = Bytes::copy_from_slice(&buf[..len]);
+            let Ok(header) = PfcpHeader::decode(&mut cursor) else {
+                continue;
+            };
+            if header.message_type as u8 != pfcp_msg_type::NODE_REPORT_REQUEST {
+                continue;
+            }
+            assert_eq!(
+                header.seid, None,
+                "a Node Report is a NODE-level message: TS 29.244 §7.2.2.1 clears the S \
+                 flag, so a SEID field here would be a malformed header"
+            );
+            let body = cursor.to_vec();
+            let mut body_cursor = Bytes::copy_from_slice(&body);
+            let report = NodeReportRequest::decode(&mut body_cursor)
+                .expect("the bytes on the wire must decode as a Node Report Request");
+
+            // Answer so the transaction completes rather than retransmitting.
+            let mut rsp = BytesMut::new();
+            NodeReportResponse {
+                node_id: NodeId::new_ipv4([127, 0, 0, 9]),
+                cause: PfcpCause::RequestAccepted,
+                offending_ie: None,
+            }
+            .encode(&mut rsp);
+            let pkt = wire(
+                pfcp_msg_type::NODE_REPORT_RESPONSE,
+                None,
+                header.sequence_number,
+                &rsp,
+            );
+            peer.send_to(&pkt, from).await.expect("answer the report");
+
+            let names_it = report
+                .user_plane_path_failure_report
+                .as_ref()
+                .is_some_and(|r| {
+                    r.remote_gtpu_peers.iter().any(|p| match about {
+                        IpAddr::V4(v4) => p.ipv4 == Some(v4.octets()),
+                        IpAddr::V6(v6) => p.ipv6 == Some(v6.octets()),
+                    })
+                });
+            if names_it {
+                matched += 1;
+                kind = Some(report.node_report_type);
+            }
+        }
+        (matched, kind)
+    }
+
+    /// #217: a detected GTP-U path failure produces a Node Report Request with UPFR
+    /// and the failed peer, ONCE, on the transition.
+    ///
+    /// The bytes are captured on a socket and decoded, which is what separates this
+    /// from asserting the builder: before #217 `grep -c NODE_REPORT` over this file was
+    /// 0 — there was no builder, no send site and no dispatch arm, so a path failure
+    /// the SGW-U had detected reached the SGW-C through no path at all.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_gtpu_path_is_reported_once_over_the_wire() {
+        let (_guard, node, peer) = node_and_peer().await;
+        let _shutdown = associate_and_run(&node, &peer).await;
+
+        let failed = IpAddr::V4(Ipv4Addr::new(10, 217, 0, 1));
+        crate::gtp_path::forget_gtpu_path(failed);
+
+        // Four unanswered Echoes EXCEED the default N3-REQUESTS of 3, which is the
+        // transition (TS 23.007 §20.3.1).
+        for _ in 0..4 {
+            crate::gtp_path::note_echo_unanswered(failed);
+        }
+        assert!(
+            crate::gtp_path::gtpu_path_state(failed).failed,
+            "the precondition: detection must have fired"
+        );
+
+        let (count, kind) =
+            count_node_reports_about(&peer, failed, std::time::Duration::from_millis(600)).await;
+        assert_eq!(count, 1, "the failure must be reported exactly once");
+        let kind = kind.expect("a matching report carries a Node Report Type");
+        assert!(
+            kind.upfr,
+            "TS 29.244 §8.2.68: UPFR is the bit that says this is a User Plane Path \
+             Failure Report"
+        );
+        assert!(!kind.uprr, "and it is not a recovery");
+
+        // Several more failing probe rounds for a path already down: no second report.
+        for _ in 0..5 {
+            crate::gtp_path::note_echo_unanswered(failed);
+        }
+        let (again, _) =
+            count_node_reports_about(&peer, failed, std::time::Duration::from_millis(400)).await;
+        assert_eq!(
+            again, 0,
+            "the report fires on the TRANSITION, not once per probe round — otherwise \
+             one dead eNB is a Node Report storm at the Echo cadence"
+        );
+
+        crate::gtp_path::forget_gtpu_path(failed);
+    }
+
+    /// #217: a recovered path is reported too, with UPRR rather than UPFR
+    /// (TS 23.007 §20.3.5.1).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recovered_gtpu_path_is_reported_with_uprr() {
+        let (_guard, node, peer) = node_and_peer().await;
+        let _shutdown = associate_and_run(&node, &peer).await;
+
+        let path = IpAddr::V4(Ipv4Addr::new(10, 217, 0, 2));
+        crate::gtp_path::forget_gtpu_path(path);
+
+        // An answered Echo on a HEALTHY path is not a transition and reports nothing.
+        crate::gtp_path::note_echo_answered(path);
+        let (none, _) =
+            count_node_reports_about(&peer, path, std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            none, 0,
+            "every answered Echo would otherwise be a Node Report, which is the same \
+             storm as the failure side"
+        );
+
+        for _ in 0..4 {
+            crate::gtp_path::note_echo_unanswered(path);
+        }
+        let (down, kind) =
+            count_node_reports_about(&peer, path, std::time::Duration::from_millis(600)).await;
+        assert_eq!(down, 1);
+        assert!(kind.expect("type").upfr);
+
+        crate::gtp_path::note_echo_answered(path);
+        let (up, kind) =
+            count_node_reports_about(&peer, path, std::time::Duration::from_millis(600)).await;
+        assert_eq!(up, 1, "the recovery is reported once");
+        let kind = kind.expect("a matching report carries a Node Report Type");
+        assert!(
+            kind.uprr && !kind.upfr,
+            "a recovery sets UPRR and not UPFR: an SGW-C that suspended state on the \
+             failure has no other way to learn it can stop"
+        );
+
+        crate::gtp_path::forget_gtpu_path(path);
+    }
+
+    /// With no association there is no SGW-C to report to, and the caller is TOLD so
+    /// rather than handed a silent success.
+    ///
+    /// Both halves are asserted: the error names the reason (so the `gtp_path` warn can
+    /// name which path went unreported), and nothing reaches the wire.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_path_failure_with_no_associated_peer_reports_to_nobody_and_says_so() {
+        let (_guard, node, peer) = node_and_peer().await;
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let pump = node.clone();
+        tokio::spawn(async move { pump.run(rx).await });
+        for _ in 0..200 {
+            if outbound().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            !node.is_associated().await,
+            "the precondition: no peer has associated"
+        );
+
+        let failed = IpAddr::V4(Ipv4Addr::new(10, 217, 0, 3));
+        let err = send_node_report_request(&[failed], PathReport::Failure).expect_err(
+            "with no association there is nothing to send to, and Ok would be the stub's \
+             lie again",
+        );
+        assert!(
+            err.contains("no associated SGW-C"),
+            "the error must name WHY nothing was reported, got {err}"
+        );
+
+        crate::gtp_path::forget_gtpu_path(failed);
+        for _ in 0..4 {
+            crate::gtp_path::note_echo_unanswered(failed);
+        }
+        let (count, _) =
+            count_node_reports_about(&peer, failed, std::time::Duration::from_millis(400)).await;
+        assert_eq!(
+            count, 0,
+            "and nothing reaches the wire: a Node Report is not sent to a peer that has \
+             not associated (TS 29.244 §6.2.6.2)"
+        );
+        crate::gtp_path::forget_gtpu_path(failed);
+    }
+
+    /// The Node Report builder itself: our own Node ID, and the peer list.
+    ///
+    /// Asserted separately from the wire tests because a Node ID naming the wrong
+    /// address makes the SGW-C attribute the failure to another SGW-U, and the wire
+    /// tests would look identical.
+    #[tokio::test]
+    async fn a_node_report_names_this_sgwus_own_node_id() {
+        let (_guard, node, peer) = node_and_peer().await;
+        let _shutdown = associate_and_run(&node, &peer).await;
+
+        let failed = IpAddr::V4(Ipv4Addr::new(10, 217, 0, 4));
+        send_node_report_request(&[failed], PathReport::Failure).expect("queued");
+
+        let mut buf = vec![0u8; 8192];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), peer.recv_from(&mut buf))
+                .await
+                .expect("the report must reach the wire")
+                .expect("recv");
+        let mut cursor = Bytes::copy_from_slice(&buf[..len]);
+        let header = PfcpHeader::decode(&mut cursor).expect("header");
+        assert_eq!(
+            header.message_type as u8,
+            pfcp_msg_type::NODE_REPORT_REQUEST
+        );
+        let mut body = cursor;
+        let report = NodeReportRequest::decode(&mut body).expect("decodable");
+        assert_eq!(
+            report.node_id,
+            NodeId::new_ipv4(node.local_ip.octets()),
+            "the Node ID must be OURS: the SGW-C keys the failure on which UP function \
+             reported it"
+        );
+        assert_eq!(
+            report
+                .user_plane_path_failure_report
+                .expect("the peer list is the point of the message")
+                .remote_gtpu_peers
+                .len(),
+            1
+        );
+    }
+
+    /// An empty peer list is refused rather than sent: a Node Report with no Remote
+    /// GTP-U Peer names no path, so the SGW-C could not act on it.
+    #[tokio::test]
+    async fn a_node_report_with_no_peers_is_refused() {
+        let (_guard, node, peer) = node_and_peer().await;
+        let _shutdown = associate_and_run(&node, &peer).await;
+        let err = send_node_report_request(&[], PathReport::Failure)
+            .expect_err("an empty report must not be sent");
+        assert!(err.contains("no peers"), "got {err}");
+    }
+
     /// An unsupported version is answered with Version Not Supported Response
     /// (TS 29.244 §7.2.2.1), not dropped.
     #[tokio::test]
     async fn an_unsupported_version_is_answered_rather_than_dropped() {
-        let (node, peer) = node_and_peer().await;
+        let (_guard, node, peer) = node_and_peer().await;
         let mut pkt = wire(pfcp_msg_type::HEARTBEAT_REQUEST, None, 6, &[]);
         pkt[0] = (2 << 5) | (pkt[0] & 0x07); // version 2
 
@@ -2383,8 +2954,15 @@ mod tests {
     /// This is the shape the old stub had: `send_pfcp_request` logged and returned
     /// `Ok(())`, so every Downlink Data Report the data path produced was silently
     /// discarded while its caller believed it had been sent.
-    #[test]
-    fn a_session_report_without_a_running_transport_is_an_error_not_a_silent_ok() {
+    ///
+    /// #217 made this DETERMINISTIC. It used to accept either outcome, because
+    /// `OUTBOUND` was set-once and a sibling test's node could have installed a queue
+    /// this test would then legitimately send on. Now the guard clears the globals on
+    /// acquire, so "not running" is the actual state and the error is the only correct
+    /// answer.
+    #[tokio::test]
+    async fn a_session_report_without_a_running_transport_is_an_error_not_a_silent_ok() {
+        let _guard = sxa_test_guard().await;
         sgwu_context_init(1024);
         let sess = SgwuSess {
             id: 1,
@@ -2397,18 +2975,11 @@ mod tests {
             pdr_id: Some(1),
             ..Default::default()
         };
-        // Either the queue is not installed (this test alone) or it is (a sibling
-        // started a node first). Both are correct; what must never happen is an
-        // unsendable report reported as sent.
-        match send_session_report_request(&sess, &report) {
-            Err(e) => assert!(
-                e.contains("not running") || e.contains("closed"),
-                "the error must name why nothing was sent, got {e}"
-            ),
-            Ok(()) => assert!(
-                OUTBOUND.get().is_some(),
-                "Ok is only honest when there is a transport to send on"
-            ),
-        }
+        let err = send_session_report_request(&sess, &report)
+            .expect_err("with no transport installed, this must not report success");
+        assert!(
+            err.contains("not running"),
+            "the error must name why nothing was sent, got {err}"
+        );
     }
 }

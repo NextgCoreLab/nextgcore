@@ -265,6 +265,11 @@ mod tests {
     /// rather than fighting a live SGW-U for UDP/8805.
     #[tokio::test]
     async fn test_pfcp_path_open_close() {
+        // `pfcp_open` installs the process-global Sxa node, which #217 made settable —
+        // so without this guard it overwrites the node a concurrent `pfcp_path` test is
+        // asserting against, and that test fails for a reason nothing in its own body
+        // explains.
+        let _guard = pfcp_path::sxa_test_guard().await;
         std::env::set_var("PFCP_BIND_ADDR", "127.0.0.1:0");
         let node = pfcp_path::pfcp_open().await.expect("bind");
         assert_ne!(node.local_addr().port(), 0, "a real socket was bound");

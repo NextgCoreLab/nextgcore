@@ -344,6 +344,19 @@ pub struct GtpuPathState {
 /// GTP-U path table keyed by peer IP.
 static GTPU_PATHS: OnceLock<std::sync::Mutex<HashMap<IpAddr, GtpuPathState>>> = OnceLock::new();
 
+/// Serialises the tests that assert on [`GTPU_PATHS`] as a whole, or that set
+/// `SGWU_GTPU_N3_REQUESTS`.
+///
+/// Declared here beside the global rather than in `mod tests`, so there is one
+/// agreement about it. Needed because `failed_gtpu_paths()` returns the WHOLE table:
+/// two tests failing different peers concurrently each see the other's peer in the
+/// list, and the symptom is an assertion about peer B reporting peer A — which reads
+/// as a per-peer bug in the code under test rather than as test interference. `N3` is
+/// worse: it is a process-wide env var, so one test lowering it changes how many
+/// unanswered Echoes another test needs.
+#[cfg(test)]
+static GTPU_PATH_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn gtpu_paths() -> &'static std::sync::Mutex<HashMap<IpAddr, GtpuPathState>> {
     GTPU_PATHS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
@@ -388,37 +401,76 @@ pub fn gtpu_peer_addresses() -> Vec<IpAddr> {
 /// "reaches", which would fail a path one probe early.
 pub fn note_echo_unanswered(peer: IpAddr) -> GtpuPathState {
     let limit = n3_requests();
-    let Ok(mut paths) = gtpu_paths().lock() else {
-        return GtpuPathState::default();
+    let (state, transitioned) = {
+        let Ok(mut paths) = gtpu_paths().lock() else {
+            return GtpuPathState::default();
+        };
+        let state = paths.entry(peer).or_default();
+        state.unanswered = state.unanswered.saturating_add(1);
+        let mut transitioned = false;
+        if state.unanswered > limit && !state.failed {
+            state.failed = true;
+            transitioned = true;
+            log::error!(
+                "GTP-U path to {peer} is DOWN: {} unanswered Echo Requests exceeds \
+                 N3-REQUESTS={limit} (TS 23.007 Section 20.3.1)",
+                state.unanswered
+            );
+        }
+        (state.clone(), transitioned)
     };
-    let state = paths.entry(peer).or_default();
-    state.unanswered = state.unanswered.saturating_add(1);
-    if state.unanswered > limit && !state.failed {
-        state.failed = true;
-        log::error!(
-            "GTP-U path to {peer} is DOWN: {} unanswered Echo Requests exceeds \
-             N3-REQUESTS={limit} (TS 23.007 Section 20.3.1)",
-            state.unanswered
-        );
+    // Report on the TRANSITION only (#217). Every further probe round for a peer
+    // already known down re-enters this function, and reporting each time would be a
+    // Node Report storm toward the SGW-C for one failure. The path lock is released
+    // first: the report enqueues onto the async node, and holding a data-path mutex
+    // across that is how the forwarding threads would come to wait on the control
+    // plane.
+    if transitioned {
+        report_path_transition(peer, crate::pfcp_path::PathReport::Failure);
     }
-    state.clone()
+    state
+}
+
+/// Send the Node Report for a path transition, or say why it could not be sent
+/// (TS 23.007 §20.3.4 / §20.3.5.1).
+///
+/// A failure to report is logged at `warn` and NOT retried here: the transport
+/// already retransmits T1×N1, and the two remaining reasons — no association yet, or
+/// no transport running — are both states in which there is no SGW-C to tell. Silence
+/// would be the wrong answer because the SGW-C then never learns the path is down,
+/// which is the whole defect #217 names.
+fn report_path_transition(peer: IpAddr, report: crate::pfcp_path::PathReport) {
+    if let Err(e) = crate::pfcp_path::send_node_report_request(&[peer], report) {
+        log::warn!("GTP-U path {report:?} for {peer} was NOT reported to the SGW-C: {e}");
+    }
 }
 
 /// Record an Echo Response, clearing the path's failure state.
 pub fn note_echo_answered(peer: IpAddr) -> GtpuPathState {
-    let Ok(mut paths) = gtpu_paths().lock() else {
-        return GtpuPathState::default();
+    let (state, recovered) = {
+        let Ok(mut paths) = gtpu_paths().lock() else {
+            return GtpuPathState::default();
+        };
+        let state = paths.entry(peer).or_default();
+        let recovered = state.failed;
+        if recovered {
+            log::warn!(
+                "GTP-U path to {peer} RECOVERED after {} misses",
+                state.unanswered
+            );
+        }
+        state.unanswered = 0;
+        state.failed = false;
+        (state.clone(), recovered)
     };
-    let state = paths.entry(peer).or_default();
-    if state.failed {
-        log::warn!(
-            "GTP-U path to {peer} RECOVERED after {} misses",
-            state.unanswered
-        );
+    // The recovery is a transition too, and reported for the same reason (#217): an
+    // SGW-C that suspended or tore down state on the failure has no other way to
+    // learn it can stop. Only a path that was actually DOWN recovers — an answered
+    // Echo on a healthy path reports nothing.
+    if recovered {
+        report_path_transition(peer, crate::pfcp_path::PathReport::Recovery);
     }
-    state.unanswered = 0;
-    state.failed = false;
-    state.clone()
+    state
 }
 
 /// Current path state for a peer.
@@ -1742,6 +1794,9 @@ mod tests {
     /// a path down one probe early.
     #[test]
     fn path_fails_only_after_exceeding_n3_requests() {
+        let _paths = GTPU_PATH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let peer = IpAddr::V4(Ipv4Addr::new(10, 61, 0, 1));
         forget_gtpu_path(peer);
         std::env::set_var("SGWU_GTPU_N3_REQUESTS", "3");
@@ -1768,6 +1823,9 @@ mod tests {
     /// discarded Echo Responses entirely, so nothing could ever recover.
     #[test]
     fn echo_response_clears_the_path_failure() {
+        let _paths = GTPU_PATH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let peer = IpAddr::V4(Ipv4Addr::new(10, 61, 0, 2));
         forget_gtpu_path(peer);
         std::env::set_var("SGWU_GTPU_N3_REQUESTS", "1");
@@ -1791,6 +1849,9 @@ mod tests {
     /// Paths are tracked per peer: one dead eNB must not mark another down.
     #[test]
     fn path_state_is_per_peer() {
+        let _paths = GTPU_PATH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dead = IpAddr::V4(Ipv4Addr::new(10, 61, 0, 3));
         let alive = IpAddr::V4(Ipv4Addr::new(10, 61, 0, 4));
         forget_gtpu_path(dead);
