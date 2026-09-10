@@ -2929,6 +2929,309 @@ impl RemoveFar {
     }
 }
 
+/// Update QER - grouped IE for Session Modification (TS 29.244 Table 7.5.4.5-1)
+///
+/// Every provisioning member is optional except the QER ID: an Update QER that
+/// names only a new Gate Status must leave the bitrates alone. That is why this is
+/// not `CreateQer` reused — a `GateStatus` that defaults to open would re-open a
+/// gate the CP function never mentioned, which is the opposite of the intent.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UpdateQer {
+    pub qer_id: u32,
+    pub gate_status: Option<GateStatus>,
+    pub maximum_bitrate: Option<Bitrate>,
+    pub guaranteed_bitrate: Option<Bitrate>,
+    pub qfi: Option<u8>,
+}
+
+impl UpdateQer {
+    pub fn new(qer_id: u32) -> Self {
+        Self {
+            qer_id,
+            gate_status: None,
+            maximum_bitrate: None,
+            guaranteed_bitrate: None,
+            qfi: None,
+        }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{encode_u32_ie, encode_u8_ie, IeHeader, IeType};
+
+        encode_u32_ie(buf, IeType::QerId, self.qer_id);
+
+        if let Some(gate_status) = &self.gate_status {
+            encode_u8_ie(buf, IeType::GateStatus, gate_status.encode());
+        }
+
+        if let Some(mbr) = &self.maximum_bitrate {
+            let mut mbr_buf = BytesMut::new();
+            mbr.encode(&mut mbr_buf);
+            let header = IeHeader::new(IeType::Mbr as u16, mbr_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&mbr_buf);
+        }
+
+        if let Some(gbr) = &self.guaranteed_bitrate {
+            let mut gbr_buf = BytesMut::new();
+            gbr.encode(&mut gbr_buf);
+            let header = IeHeader::new(IeType::Gbr as u16, gbr_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&gbr_buf);
+        }
+
+        if let Some(qfi) = self.qfi {
+            encode_u8_ie(buf, IeType::Qfi, qfi);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        use crate::ie::{IeHeader, IeType, RawIe};
+
+        let mut qer_id = 0u32;
+        let mut gate_status = None;
+        let mut maximum_bitrate = None;
+        let mut guaranteed_bitrate = None;
+        let mut qfi = None;
+
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            match ie.ie_type {
+                t if t == IeType::QerId as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        qer_id = data.get_u32();
+                    }
+                }
+                t if t == IeType::GateStatus as u16 => {
+                    if !ie.data.is_empty() {
+                        gate_status = Some(GateStatus::decode(ie.data[0]));
+                    }
+                }
+                t if t == IeType::Mbr as u16 => {
+                    let mut data = ie.data;
+                    maximum_bitrate = Some(Bitrate::decode(&mut data)?);
+                }
+                t if t == IeType::Gbr as u16 => {
+                    let mut data = ie.data;
+                    guaranteed_bitrate = Some(Bitrate::decode(&mut data)?);
+                }
+                t if t == IeType::Qfi as u16 => {
+                    if !ie.data.is_empty() {
+                        qfi = Some(ie.data[0]);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            qer_id,
+            gate_status,
+            maximum_bitrate,
+            guaranteed_bitrate,
+            qfi,
+        })
+    }
+}
+
+/// Update URR - grouped IE for Session Modification (TS 29.244 Table 7.5.4.4-1)
+///
+/// Optional members for the same reason as `UpdateQer`: an Update URR carrying only
+/// a new Volume Threshold must not reset the Measurement Method, and must not
+/// disturb the volume measured so far.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UpdateUrr {
+    pub urr_id: u32,
+    pub measurement_method: Option<MeasurementMethod>,
+    pub reporting_triggers: Option<ReportingTriggers>,
+    pub measurement_period: Option<u32>,
+    pub volume_threshold: Option<VolumeThreshold>,
+    /// Volume Quota (TS 29.244 §8.2.14) — same wire structure as the §8.2.13
+    /// threshold, as in `CreateUrr`.
+    pub volume_quota: Option<VolumeThreshold>,
+    pub time_threshold: Option<u32>,
+}
+
+impl UpdateUrr {
+    pub fn new(urr_id: u32) -> Self {
+        Self {
+            urr_id,
+            measurement_method: None,
+            reporting_triggers: None,
+            measurement_period: None,
+            volume_threshold: None,
+            volume_quota: None,
+            time_threshold: None,
+        }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{encode_u32_ie, encode_u8_ie, IeHeader, IeType};
+
+        encode_u32_ie(buf, IeType::UrrId, self.urr_id);
+
+        if let Some(method) = &self.measurement_method {
+            encode_u8_ie(buf, IeType::MeasurementMethod, method.encode());
+        }
+
+        if let Some(triggers) = &self.reporting_triggers {
+            // Reporting Triggers is a 3-octet bitmask (TS 29.244 §8.2.19).
+            let rt = triggers.encode();
+            let header = IeHeader::new(IeType::ReportingTriggers as u16, rt.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&rt);
+        }
+
+        if let Some(period) = self.measurement_period {
+            encode_u32_ie(buf, IeType::MeasurementPeriod, period);
+        }
+
+        if let Some(vt) = &self.volume_threshold {
+            let mut vt_buf = BytesMut::new();
+            vt.encode(&mut vt_buf);
+            let header = IeHeader::new(IeType::VolumeThreshold as u16, vt_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&vt_buf);
+        }
+
+        if let Some(vq) = &self.volume_quota {
+            let mut vq_buf = BytesMut::new();
+            vq.encode(&mut vq_buf);
+            let header = IeHeader::new(IeType::VolumeQuota as u16, vq_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&vq_buf);
+        }
+
+        if let Some(tt) = self.time_threshold {
+            encode_u32_ie(buf, IeType::TimeThreshold, tt);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        use crate::ie::{IeHeader, IeType, RawIe};
+
+        let mut urr_id = 0u32;
+        let mut measurement_method = None;
+        let mut reporting_triggers = None;
+        let mut measurement_period = None;
+        let mut volume_threshold = None;
+        let mut volume_quota = None;
+        let mut time_threshold = None;
+
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            match ie.ie_type {
+                t if t == IeType::UrrId as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        urr_id = data.get_u32();
+                    }
+                }
+                t if t == IeType::MeasurementMethod as u16 => {
+                    if !ie.data.is_empty() {
+                        measurement_method = Some(MeasurementMethod::decode(ie.data[0]));
+                    }
+                }
+                t if t == IeType::ReportingTriggers as u16 => {
+                    reporting_triggers = Some(ReportingTriggers::decode(&ie.data)?);
+                }
+                t if t == IeType::MeasurementPeriod as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        measurement_period = Some(data.get_u32());
+                    }
+                }
+                t if t == IeType::VolumeThreshold as u16 => {
+                    let mut data = ie.data;
+                    volume_threshold = Some(VolumeThreshold::decode(&mut data)?);
+                }
+                t if t == IeType::VolumeQuota as u16 => {
+                    let mut data = ie.data;
+                    volume_quota = Some(VolumeThreshold::decode(&mut data)?);
+                }
+                t if t == IeType::TimeThreshold as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        time_threshold = Some(data.get_u32());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            urr_id,
+            measurement_method,
+            reporting_triggers,
+            measurement_period,
+            volume_threshold,
+            volume_quota,
+            time_threshold,
+        })
+    }
+}
+
+/// Remove QER - grouped IE for Session Modification (TS 29.244 Table 7.5.4.7-1)
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RemoveQer {
+    pub qer_id: u32,
+}
+
+impl RemoveQer {
+    pub fn new(qer_id: u32) -> Self {
+        Self { qer_id }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{encode_u32_ie, IeType};
+        encode_u32_ie(buf, IeType::QerId, self.qer_id);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        use crate::ie::{IeHeader, IeType, RawIe};
+        let mut qer_id = 0u32;
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            if ie.ie_type == IeType::QerId as u16 && ie.data.len() >= 4 {
+                let mut data = ie.data;
+                qer_id = data.get_u32();
+            }
+        }
+        Ok(Self { qer_id })
+    }
+}
+
+/// Remove URR - grouped IE for Session Modification (TS 29.244 Table 7.5.4.6-1)
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RemoveUrr {
+    pub urr_id: u32,
+}
+
+impl RemoveUrr {
+    pub fn new(urr_id: u32) -> Self {
+        Self { urr_id }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{encode_u32_ie, IeType};
+        encode_u32_ie(buf, IeType::UrrId, self.urr_id);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        use crate::ie::{IeHeader, IeType, RawIe};
+        let mut urr_id = 0u32;
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            if ie.ie_type == IeType::UrrId as u16 && ie.data.len() >= 4 {
+                let mut data = ie.data;
+                urr_id = data.get_u32();
+            }
+        }
+        Ok(Self { urr_id })
+    }
+}
+
 /// Usage Report (Session Report) - grouped IE in Session Report Request
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageReportSrr {

@@ -31,6 +31,7 @@ use nextgcore_pfcp::types::{
     ApplyAction as LibApplyAction, CreateFar as LibCreateFar, CreatePdr as LibCreatePdr,
     CreateQer as LibCreateQer, CreateUrr as LibCreateUrr, FSeid as LibFSeid, FTeid as LibFTeid,
     GateStatus as LibGateStatus, NodeId, PfcpCause, UpFunctionFeatures as LibUpFunctionFeatures,
+    UpdateQer as LibUpdateQer, UpdateUrr as LibUpdateUrr,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
@@ -1331,6 +1332,63 @@ fn urr_from_lib(urr: &LibCreateUrr) -> crate::sxa_handler::CreateUrrRequest {
     }
 }
 
+/// Volume Threshold / Volume Quota -> the store's `Volume`, preserving "absent".
+///
+/// `urr_from_lib` flattens `None` to a default `Volume` because a Create states the
+/// rule's whole shape; an Update must NOT, or an Update naming only a new Time
+/// Threshold would zero the volume thresholds it never mentioned.
+fn volume_from_lib(
+    v: Option<&nextgcore_pfcp::types::VolumeThreshold>,
+) -> Option<crate::context::Volume> {
+    v.map(|v| crate::context::Volume {
+        total: v.tovol.then_some(v.total_volume),
+        uplink: v.ulvol.then_some(v.uplink_volume),
+        downlink: v.dlvol.then_some(v.downlink_volume),
+    })
+}
+
+/// Update QER (#304). Every member stays `Option`: the handler's
+/// `process_update_qer` leaves a `None` alone, which is what TS 29.244
+/// Table 7.5.4.5-1's conditional IEs mean.
+fn update_qer_from_lib(qer: &LibUpdateQer) -> crate::sxa_handler::UpdateQerRequest {
+    crate::sxa_handler::UpdateQerRequest {
+        qer_id: qer.qer_id,
+        gate_status: qer.gate_status.as_ref().map(gate_status_octet),
+        mbr: qer
+            .maximum_bitrate
+            .as_ref()
+            .map(|br| crate::sxa_handler::Mbr {
+                ul: br.uplink,
+                dl: br.downlink,
+            }),
+        gbr: qer
+            .guaranteed_bitrate
+            .as_ref()
+            .map(|br| crate::sxa_handler::Gbr {
+                ul: br.uplink,
+                dl: br.downlink,
+            }),
+    }
+}
+
+/// Update URR (#304). Same `Option`-preserving rule as `update_qer_from_lib`.
+fn update_urr_from_lib(urr: &LibUpdateUrr) -> crate::sxa_handler::UpdateUrrRequest {
+    crate::sxa_handler::UpdateUrrRequest {
+        urr_id: urr.urr_id,
+        measurement_method: urr.measurement_method.as_ref().map(|m| m.encode()),
+        // As in `urr_from_lib`: the handler models the first TWO octets of Reporting
+        // Triggers (§8.2.41) as a u16 with octet 5 in the low byte.
+        reporting_triggers: urr.reporting_triggers.as_ref().map(|t| {
+            let t = t.encode();
+            u16::from(t[0]) | (u16::from(t[1]) << 8)
+        }),
+        volume_threshold: volume_from_lib(urr.volume_threshold.as_ref()),
+        volume_quota: volume_from_lib(urr.volume_quota.as_ref()),
+        time_threshold: urr.time_threshold,
+        measurement_period: urr.measurement_period,
+    }
+}
+
 fn establishment_from_lib(
     req: &LibSessionEstablishmentRequest,
     cp_f_seid: &crate::context::FSeid,
@@ -1408,16 +1466,10 @@ fn modification_from_lib(
         remove_fars: req.remove_fars.iter().map(|r| r.far_id).collect(),
         create_qers: req.create_qers.iter().map(qer_from_lib).collect(),
         create_urrs: req.create_urrs.iter().map(urr_from_lib).collect(),
-        // The library's SessionModificationRequest models no Update QER / Remove QER /
-        // Update URR / Remove URR (the IE types exist; the structs do not), so those
-        // lists arrive EMPTY however the SGW-C populated them. The handler's code for
-        // them is therefore still reachable only in-process. Filed as its own issue
-        // rather than hand-decoded here, which would put a second IE decoder beside
-        // the library one.
-        update_qers: Vec::new(),
-        remove_qers: Vec::new(),
-        update_urrs: Vec::new(),
-        remove_urrs: Vec::new(),
+        update_qers: req.update_qers.iter().map(update_qer_from_lib).collect(),
+        remove_qers: req.remove_qers.iter().map(|r| r.qer_id).collect(),
+        update_urrs: req.update_urrs.iter().map(update_urr_from_lib).collect(),
+        remove_urrs: req.remove_urrs.iter().map(|r| r.urr_id).collect(),
         create_bar: None,
         remove_bar: None,
     }
@@ -1841,6 +1893,188 @@ mod tests {
         assert!(
             ctx.pdr_find(sess.id, 1).is_some(),
             "the Create PDR must have been INSTALLED on the session, not just parsed"
+        );
+    }
+
+    /// #304: an Update QER closing a gate and a Remove URR arrive OVER THE WIRE and
+    /// reach the rule store.
+    ///
+    /// Before #304 the library's `SessionModificationRequest` modelled none of the four
+    /// Update/Remove QER/URR IEs, so `modification_from_lib` filled those lists with
+    /// `Vec::new()` unconditionally: the SGW-C got `REQUEST_ACCEPTED`, the gate stayed
+    /// OPEN and the session kept being measured on a URR the CP function had removed.
+    /// Asserted from a bound socket rather than by calling the handler, because calling
+    /// the handler is exactly what passed in that state.
+    #[tokio::test]
+    async fn a_modification_over_the_wire_closes_a_qer_gate_and_removes_a_urr() {
+        let (node, peer) = node_and_peer().await;
+
+        let mut assoc = BytesMut::new();
+        PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            2000,
+        ))
+        .encode_body(&mut assoc);
+        deliver(
+            &node,
+            &peer,
+            &wire(pfcp_msg_type::ASSOCIATION_SETUP_REQUEST, None, 1, &assoc),
+        )
+        .await;
+        let _ = recv_decoded(&peer).await;
+
+        // Establish a session carrying a QER with both gates OPEN, a volume URR, and a
+        // PDR measured against that URR and policed by that QER.
+        let cp_seid = 0x0000_0000_0000_3040u64;
+        let mut req = LibSessionEstablishmentRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            LibFSeid::new_ipv4(cp_seid, [127, 0, 0, 9]),
+        );
+        let mut pdi = Pdi::new(SourceInterface::Access);
+        let mut f_teid = FTeid::new_ipv4(0, [127, 0, 0, 1]);
+        f_teid.ch = true;
+        pdi.local_f_teid = Some(f_teid);
+        let mut pdr = CreatePdr::new(1, 100, pdi);
+        pdr.far_id = Some(1);
+        pdr.qer_id = Some(7);
+        pdr.urr_ids = vec![3, 4];
+        req.create_pdrs.push(pdr);
+        let mut far = CreateFar::new(1, ApplyAction::forward());
+        far.forwarding_parameters = Some(ForwardingParameters::new(DestinationInterface::Core));
+        req.create_fars.push(far);
+        req.create_qers
+            .push(CreateQer::new(7, GateStatus::both_open()));
+        req.create_qers
+            .push(CreateQer::new(8, GateStatus::both_open()));
+        for urr_id in [3u32, 4] {
+            let mut urr = CreateUrr::new(
+                urr_id,
+                MeasurementMethod {
+                    volum: true,
+                    ..Default::default()
+                },
+                ReportingTriggers::default(),
+            );
+            urr.volume_threshold = Some(VolumeThreshold::new_total(1_000));
+            urr.volume_quota = Some(VolumeThreshold::new_total(2_000));
+            req.create_urrs.push(urr);
+        }
+        let mut body = BytesMut::new();
+        req.encode(&mut body);
+        deliver(
+            &node,
+            &peer,
+            &wire(
+                pfcp_msg_type::SESSION_ESTABLISHMENT_REQUEST,
+                Some(0),
+                2,
+                &body,
+            ),
+        )
+        .await;
+        let _ = recv_decoded(&peer).await;
+
+        let ctx = sgwu_self();
+        let sess = ctx
+            .sess_find_by_sgwc_sxa_seid(cp_seid)
+            .expect("the Establishment must create a session");
+        assert_eq!(
+            ctx.qer_find(sess.id, 7).and_then(|q| q.gate_status),
+            Some(crate::context::gate_status::OPEN),
+            "the gate starts open, so the assertion after the modification is about the \
+             modification"
+        );
+        assert!(ctx.qer_find(sess.id, 8).is_some());
+        assert!(ctx.urr_find(sess.id, 3).is_some() && ctx.urr_find(sess.id, 4).is_some());
+        assert_eq!(
+            ctx.pdr_find(sess.id, 1).map(|p| p.urr_ids),
+            Some(vec![3, 4])
+        );
+
+        // One Session Modification exercising all four IEs #304 added: close both gates
+        // on QER 7, remove QER 8, re-threshold URR 3, remove URR 4.
+        let mut modification = LibSessionModificationRequest::new();
+        let mut uqer = LibUpdateQer::new(7);
+        uqer.gate_status = Some(LibGateStatus::both_closed());
+        modification.update_qers.push(uqer);
+        modification
+            .remove_qers
+            .push(nextgcore_pfcp::types::RemoveQer::new(8));
+        let mut uurr = LibUpdateUrr::new(3);
+        uurr.volume_threshold = Some(VolumeThreshold::new_total(9_000));
+        modification.update_urrs.push(uurr);
+        modification
+            .remove_urrs
+            .push(nextgcore_pfcp::types::RemoveUrr::new(4));
+        let mut body = BytesMut::new();
+        modification.encode(&mut body);
+        deliver(
+            &node,
+            &peer,
+            &wire(
+                pfcp_msg_type::SESSION_MODIFICATION_REQUEST,
+                Some(sess.sgwu_sxa_seid),
+                3,
+                &body,
+            ),
+        )
+        .await;
+
+        let (header, resp_body) = recv_decoded(&peer).await;
+        assert_eq!(
+            header.message_type as u8,
+            pfcp_msg_type::SESSION_MODIFICATION_RESPONSE
+        );
+        assert_eq!(
+            find_cause(&resp_body),
+            Some(sxa_build::pfcp_cause::REQUEST_ACCEPTED)
+        );
+
+        // The accepted response must be TRUE: both changes reached the store.
+        let qer = ctx
+            .qer_find(sess.id, 7)
+            .expect("the QER must still exist after an Update");
+        assert_eq!(
+            qer.gate_status,
+            Some(0x05),
+            "TS 29.244 §8.2.7: UL and DL both CLOSED — an accepted Update QER that left \
+             the gate open would police nothing"
+        );
+        assert!(
+            ctx.qer_find(sess.id, 8).is_none(),
+            "a Remove QER the SGW-U accepted must actually remove it"
+        );
+        assert!(
+            ctx.urr_find(sess.id, 4).is_none(),
+            "a Remove URR the SGW-U accepted must actually remove it, or the session \
+             keeps being measured on a rule the SGW-C believes is gone"
+        );
+        assert_eq!(
+            ctx.pdr_find(sess.id, 1).map(|p| p.urr_ids),
+            Some(vec![3]),
+            "and the PDR must be detached from the REMOVED URR only (#267), not left \
+             naming a dead one nor stripped of the live one"
+        );
+        let urr3 = ctx
+            .urr_find(sess.id, 3)
+            .expect("the updated URR must survive its Update");
+        assert_eq!(
+            urr3.volume_threshold.total,
+            Some(9_000),
+            "the Update URR's new Volume Threshold must reach the store"
+        );
+        assert_eq!(
+            urr3.measurement_method,
+            crate::context::measurement_method::VOLUME,
+            "and an Update naming only a threshold must leave the Measurement Method \
+             alone — `Some(0)` here would stop the rule measuring anything"
+        );
+        assert_eq!(
+            urr3.volume_quota.total,
+            Some(2_000),
+            "the Volume Quota the Establishment provisioned must SURVIVE an Update that \
+             does not mention it: mapping an absent IE to a default Volume would revoke \
+             the subscriber's allowance on every unrelated modification"
         );
     }
 
