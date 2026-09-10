@@ -1556,6 +1556,23 @@ pub struct PolicyBinding {
     /// that work will read from, and keeping it empty-by-default means a session
     /// that never got a report is indistinguishable from the pre-#114 state.
     pub easdf_reported_eas: Vec<String>,
+    /// The session's S-NSSAI, as the create request stated it (#293).
+    ///
+    /// Kept here because a re-read of the subscriber's SM data has to be scoped to the
+    /// same slice the session was created for: `sm-data` is one entry per S-NSSAI, and
+    /// a lookup that guessed would apply another slice's session-AMBR to this session.
+    /// The `sd` is the hex string as received, not a parsed integer, so the value
+    /// compared against the UDM's document is the one the AMF sent rather than a
+    /// re-formatting of it.
+    pub sst: u8,
+    pub sd: Option<String>,
+    /// The `Nudm_SDM_Subscribe` subscription id for this session (#293), or `None`
+    /// when the UDM leg is off, no UDM was discoverable, or the subscribe failed.
+    ///
+    /// Held here for the same reason as `easdf_dns_context_id`: it is removed with the
+    /// binding at release, and a subscription whose session is gone is an orphan that
+    /// keeps notifying a callback URI whose `smContextRef` no longer resolves.
+    pub sdm_subscription_id: Option<String>,
 }
 
 impl PolicyBinding {
@@ -1584,6 +1601,9 @@ impl PolicyBinding {
             easdf_dns_context_id: None,
             mapped_eps_bearer_id: None,
             easdf_reported_eas: Vec::new(),
+            sst: 0,
+            sd: None,
+            sdm_subscription_id: None,
         }
     }
 }

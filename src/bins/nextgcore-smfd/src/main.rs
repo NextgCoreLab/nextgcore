@@ -1579,6 +1579,20 @@ async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             }
         }
 
+        // #293: Nudm_SDM_Notification sink (TS 29.503 §5.2.2.6). The SMF chooses
+        // this URI when it subscribes, so its shape is ours: per SM context, so a
+        // notification names the live session it has to be applied to. The route
+        // exists BEFORE any subscribe is sent -- a subscription whose callback 404s
+        // is strictly worse than no subscription, because the UDM then retries
+        // against us.
+        ("nsmf-callback", "sdm-notify", "POST") => {
+            if let Some(sm_context_ref) = resource_id {
+                handle_sdm_notification(sm_context_ref, &request).await
+            } else {
+                send_bad_request("Missing SM context reference", None)
+            }
+        }
+
         // N1N2 Transfer Failure Notification (from AMF)
         ("nsmf-callback", "n1-n2-failure", "POST") => {
             if let Some(sm_context_ref) = resource_id {
@@ -2844,6 +2858,30 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     .await;
     let subscribed = udm::fetch_sm_data(&supi, &dnn, sst, snssai_sd.as_deref()).await;
 
+    // #293: subscribe to changes in what was just fetched, so an administrative edit
+    // reaches a session that is already up (TS 23.502 §4.3.2.2.1 step 4,
+    // Nudm_SDM_Subscribe). The callback URI is per SM context and points at the route
+    // this same change added -- #79 left the subscribe out precisely because
+    // subscribing without a handler creates a UDM resource that notifies into a 404,
+    // which is worse than not subscribing.
+    //
+    // Awaited BEFORE the binding is stored so the id is recorded with it; a
+    // subscription created and not recorded is an orphan on the UDM, because the
+    // release path would have nothing to delete. Same shape, and same reason, as the
+    // EASDF DNS context below.
+    let sdm_subscription_id = udm::subscribe_sm_data(
+        &supi,
+        &format!(
+            "{}/nsmf-callback/v1/sdm-notify/{}",
+            self_sbi_uri(),
+            sm_context_ref
+        ),
+        &dnn,
+        sst,
+        snssai_sd.as_deref(),
+    )
+    .await;
+
     // ---- Npcf_SMPolicyControl_Create (TS 29.512 §4.2.2) ----
     let notification_uri = format!(
         "{}/nsmf-callback/v1/sm-policy-notify/{}",
@@ -3215,6 +3253,9 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     easdf_dns_context_id: easdf_dns_context_id.clone(),
                     easdf_reported_eas: Vec::new(),
                     mapped_eps_bearer_id,
+                    sst,
+                    sd: snssai_sd.clone(),
+                    sdm_subscription_id: sdm_subscription_id.clone(),
                 },
             );
         }
@@ -4625,6 +4666,23 @@ async fn handle_sm_context_release(
         }
     }
 
+    // #293: tell the UDM this session is over — remove the serving-SMF record and
+    // delete the SDM subscription created at establishment. Both read off the binding
+    // taken above, both are best-effort for the same reason as the EASDF delete, and
+    // both name what is left behind on failure.
+    //
+    // Without the deregistration a UDM accumulates serving-SMF records for released
+    // sessions, so a procedure resolving the serving SMF through the UDM resolves a
+    // released session to this SMF. Without the unsubscribe the UDM keeps notifying a
+    // callback URI whose smContextRef no longer resolves — which the notification
+    // handler answers 404 to, deliberately.
+    if let Some(binding) = &binding {
+        udm::deregister_serving_smf(&binding.supi, binding.psi).await;
+        if let Some(sub_id) = &binding.sdm_subscription_id {
+            udm::unsubscribe_sm_data(&binding.supi, sub_id).await;
+        }
+    }
+
     // #291: give this session's EPS bearer identity back to the AMF, which owns the
     // space. Same shape as the EASDF delete above and for the same reason: read off
     // the binding taken above, so a session that never had an EBI costs nothing, and
@@ -5201,6 +5259,174 @@ async fn handle_sm_policy_notify(sm_context_ref: &str, request: &SbiRequest) -> 
                 b.ambr_dl_bps = dec.sess_ambr_dl_bps;
                 b.five_qi = dec.def_five_qi;
             }
+        }
+        // Issue #191: durable too, not just in memory.
+        ctx.persist();
+    }
+
+    SbiResponse::with_status(204)
+}
+
+/// `POST /nsmf-callback/v1/sdm-notify/{smContextRef}` — `Nudm_SDM_Notification`
+/// (issue #293, TS 29.503 §5.2.2.6).
+///
+/// The UDM tells us the subscriber's SM data changed; this applies the change to the
+/// LIVE session so an administrative edit to a session-AMBR or default 5QI takes
+/// effect without waiting for the UE to re-establish. Before #293 an edit was
+/// invisible until then — the same class of defect #56 fixed on the HSS side for EPS.
+///
+/// **The change is re-fetched, not read out of the notification.** A
+/// `ModificationNotification` carries `notifyItems[].changes[]` as
+/// operation/path/newValue triples over the `sm-data` document, so honouring it
+/// literally means implementing a patch interpreter over a free-form
+/// `dnnConfigurations` map — where a path this SMF fails to understand yields "no
+/// change" indistinguishably from "nothing changed". Re-reading the authoritative
+/// document with the same `fetch_sm_data` the establishment path uses has one
+/// behaviour to keep correct instead of two, and cannot silently apply half an edit.
+/// The notification's role is to say *when*, and for which resource.
+///
+/// **With a PCF configured this SMF deliberately does NOT apply the change.** See
+/// the log line and `specs/fix-smfd-udm-sdm-subscribe-uecm-dereg.md`: TS 23.503
+/// §6.1.3.2 makes the PCF the authority on session-AMBR and default QoS, and a
+/// subscription-driven override applied behind its back would leave the SMF enforcing
+/// something the PCF never authorised.
+async fn handle_sdm_notification(sm_context_ref: &str, request: &SbiRequest) -> SbiResponse {
+    log::info!("Nudm_SDM_Notification for ref={sm_context_ref}");
+
+    // The body is parsed before the context lookup so a malformed notification is a
+    // 400 rather than a 404 for a session that does exist.
+    let Some(body) = request
+        .http
+        .content
+        .as_deref()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+    else {
+        return problem_400(
+            "INVALID_MSG_FORMAT",
+            "ModificationNotification body required",
+        );
+    };
+
+    let Some(binding) = lookup_policy_binding(sm_context_ref) else {
+        // A notification for a session this SMF no longer holds means the
+        // unsubscribe did not reach the UDM. Answering 404 is what tells it to stop.
+        log::warn!(
+            "Nudm_SDM_Notification for unknown ref={sm_context_ref}: the SDM \
+             subscription outlived its session"
+        );
+        return send_not_found(
+            &format!("No SM context for ref={sm_context_ref}"),
+            Some("CONTEXT_NOT_FOUND"),
+        );
+    };
+
+    // `notifyItems` is what names the changed resource. An empty or absent list is
+    // accepted (204) and applied anyway: the UDM has told us this subscription's
+    // monitored resource changed, and refusing to act on a shape difference would
+    // make the leg silently useless against a UDM that reports it differently.
+    let items = body["notifyItems"].as_array().map(Vec::len).unwrap_or(0);
+    log::debug!("Nudm_SDM_Notification ref={sm_context_ref}: {items} notify item(s)");
+
+    if binding.sm_policy_id.is_some() {
+        // TS 23.503 §6.1.3.2. The PCF authorised this session's QoS with the
+        // subscription as one of its inputs; re-deriving it here from the
+        // subscription alone would override a policy decision with the value that
+        // decision was made from. The PCF learns about subscription changes through
+        // its own policy-data subscription to the UDR.
+        log::info!(
+            "[{}] SM data changed, but a PCF authorised this session ({}): the change \
+             is NOT applied here — the PCF is the authority on session-AMBR and default \
+             QoS (TS 23.503 §6.1.3.2) and learns of subscription changes from the UDR",
+            binding.supi,
+            binding.sm_policy_id.as_deref().unwrap_or("")
+        );
+        return SbiResponse::with_status(204);
+    }
+
+    // Scoped to the DNN *and* the S-NSSAI the session was created for: `sm-data` is
+    // one entry per S-NSSAI, so a guessed slice would apply another slice's
+    // session-AMBR to this session -- and `parse_sm_data` falls back to the first
+    // entry rather than failing, so the mistake would look like a successful update.
+    let Some(subscribed) = udm::fetch_sm_data(
+        &binding.supi,
+        &binding.dnn,
+        binding.sst,
+        binding.sd.as_deref(),
+    )
+    .await
+    else {
+        log::warn!(
+            "[{}] SM data changed but could not be re-read: ref={sm_context_ref} keeps \
+             the QoS it was established with",
+            binding.supi
+        );
+        return SbiResponse::with_status(204);
+    };
+
+    // Rebuild the same decision the establishment path would build now, so one code
+    // path decides what a subscription means (`apply_subscribed_baseline` over the
+    // config default) rather than two.
+    let mut decision = policy::PolicyDecision::config_default_for_dnn(&binding.dnn);
+    decision.apply_subscribed_baseline(&subscribed);
+
+    if decision.sess_ambr_ul_bps == binding.ambr_ul_bps
+        && decision.sess_ambr_dl_bps == binding.ambr_dl_bps
+        && decision.def_five_qi == binding.five_qi
+    {
+        log::info!(
+            "[{}] SM data notification for ref={sm_context_ref} changes nothing this \
+             session enforces",
+            binding.supi
+        );
+        return SbiResponse::with_status(204);
+    }
+
+    log::info!(
+        "[{}] applying changed SM data to ref={sm_context_ref}: AMBR UL/DL {}/{} -> \
+         {}/{} bps, 5QI {} -> {}",
+        binding.supi,
+        binding.ambr_ul_bps,
+        binding.ambr_dl_bps,
+        decision.sess_ambr_ul_bps,
+        decision.sess_ambr_dl_bps,
+        binding.five_qi,
+        decision.def_five_qi
+    );
+
+    // The N4 QER, through the SAME function the PCF-update path uses: a second way to
+    // change a live session's QoS is a second thing to keep correct, and #293 asks
+    // for this one explicitly.
+    if let Some(seid) = lookup_upf_seid(sm_context_ref) {
+        if let Err(e) = pfcp_update_session_qer(
+            smf_n4_seid_for(sm_context_ref),
+            seid,
+            binding.qfi,
+            decision.sess_ambr_ul_bps,
+            decision.sess_ambr_dl_bps,
+        )
+        .await
+        {
+            log::error!("Failed to apply subscription-updated QoS: {e}");
+            return SbiResponse::with_status(504);
+        }
+    }
+
+    if let Ok(ctx) = smf_self().read() {
+        if let Ok(mut bindings) = ctx.policy_bindings.write() {
+            if let Some(b) = bindings.get_mut(sm_context_ref) {
+                b.ambr_ul_bps = decision.sess_ambr_ul_bps;
+                b.ambr_dl_bps = decision.sess_ambr_dl_bps;
+                b.five_qi = decision.def_five_qi;
+            }
+        }
+        // The session carries the AMBR the Retrieve and the EPS-interworking encoders
+        // read, so leaving it stale would make the two disagree about one value.
+        if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
+            sess.session_ambr = context::SessionAmbr {
+                uplink: decision.sess_ambr_ul_bps,
+                downlink: decision.sess_ambr_dl_bps,
+            };
+            ctx.sess_update(&sess);
         }
         // Issue #191: durable too, not just in memory.
         ctx.persist();
@@ -6234,6 +6460,11 @@ mod tests {
                         easdf_dns_context_id: None,
                         mapped_eps_bearer_id: None,
                         easdf_reported_eas: Vec::new(),
+                        sst: 1,
+                        sd: Some("010203".to_string()),
+                        // #293: no SDM subscription by default, so the release path
+                        // has nothing to unsubscribe.
+                        sdm_subscription_id: None,
                     },
                 );
             }
@@ -6498,6 +6729,99 @@ mod tests {
         nrf.stop().await.expect("stop");
     }
 
+    /// A loopback UDM that records every request and answers the four operations the
+    /// SMF performs: `sm-data` (with whatever body the caller installs),
+    /// `sdm-subscriptions` (201 + Location), the UECM registration (201) and both
+    /// deletes (204). Returns the recorded `(method, uri, body)` list (#293).
+    ///
+    /// Points `UDM_SBI_*` at itself, which is how both discovery paths find a UDM in
+    /// tests; the caller must hold `crate::UDM_ENV_TEST_LOCK`.
+    async fn spawn_recording_udm(
+        sm_data: serde_json::Value,
+    ) -> (
+        nextgcore_sbi::server::SbiServer,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+    ) {
+        use nextgcore_sbi::message::SbiResponse;
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let port = nextgcore_sbi::test_support::free_port();
+        let udm = SbiServer::new(SbiServerConfig::new(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            port,
+        ))));
+        udm.start(move |req: SbiRequest| {
+            let sink = sink.clone();
+            let sm_data = sm_data.clone();
+            async move {
+                sink.lock().unwrap_or_else(|e| e.into_inner()).push((
+                    req.header.method.clone(),
+                    req.header.uri.clone(),
+                    req.http.content.clone().unwrap_or_default(),
+                ));
+                if req.header.method == "DELETE" {
+                    return SbiResponse::with_status(204);
+                }
+                if req.header.uri.contains("/sdm-subscriptions") {
+                    return SbiResponse::with_status(201)
+                        .with_header(
+                            "Location",
+                            format!("{}/sub-293", req.header.uri.trim_end_matches('/')),
+                        )
+                        .with_json_body(&serde_json::json!({ "subscriptionId": "sub-293" }))
+                        .unwrap_or_else(|_| SbiResponse::with_status(201));
+                }
+                if req.header.uri.contains("/sm-data") {
+                    return SbiResponse::with_status(200)
+                        .with_json_body(&sm_data)
+                        .unwrap_or_else(|_| SbiResponse::with_status(200));
+                }
+                SbiResponse::with_status(201)
+            }
+        })
+        .await
+        .expect("udm start");
+
+        std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UDM_SBI_PORT", port.to_string());
+        (udm, seen)
+    }
+
+    /// An `sm-data` body with the given session-AMBR and default 5QI for `internet` on
+    /// S-NSSAI `{sst:1, sd:010203}` — the slice `create_request` and `seed_binding`
+    /// use — behind a DECOY entry for a different slice.
+    ///
+    /// The decoy is the point (#293): `sm-data` is one entry per S-NSSAI and
+    /// `parse_sm_data` falls back to the FIRST entry when none matches, so a re-read
+    /// that lost the session's S-NSSAI would apply these decoy values and look like a
+    /// successful update. Any test asserting the real values therefore also asserts
+    /// that the re-read stayed scoped to the right slice.
+    fn sm_data_with(ul: &str, dl: &str, five_qi: u8) -> serde_json::Value {
+        serde_json::json!([
+            {
+                "singleNssai": { "sst": 2 },
+                "dnnConfigurations": {
+                    "internet": {
+                        "sessionAmbr": { "uplink": "1 Mbps", "downlink": "2 Mbps" },
+                        "5gQosProfile": { "5qi": 9, "arp": { "priorityLevel": 15 } }
+                    }
+                }
+            },
+            {
+                "singleNssai": { "sst": 1, "sd": "010203" },
+                "dnnConfigurations": {
+                    "internet": {
+                        "sessionAmbr": { "uplink": ul, "downlink": dl },
+                        "5gQosProfile": { "5qi": five_qi, "arp": { "priorityLevel": 8 } }
+                    }
+                }
+            }
+        ])
+    }
+
     /// Seed a binding that carries an assigned EBI and an AMF callback root, i.e.
     /// the state a session established with EPS interworking on leaves behind (#291).
     fn seed_binding_with_ebi(sm_context_ref: &str, psi: u8, ebi: u8, amf_uri: &str) {
@@ -6694,6 +7018,327 @@ mod tests {
         eps_iwk::set_for_test(false);
     }
 
+    /// #293 criteria 1 + 4: the create subscribes to SM data, and the release both
+    /// deregisters the serving-SMF record and deletes that subscription.
+    ///
+    /// End to end through the real handlers, which #289's UPF stand-in is what makes
+    /// possible: before it, no test could drive a create past its N4 leg, so a
+    /// subscribe on the establishment path could only have been asserted by calling
+    /// the helper — the shape that let #276's dead `create_dns_context` survive a month.
+    ///
+    /// Lock order (see `pfcp_path::N4_TEST_LOCK`): switch locks first, N4 last.
+    #[tokio::test]
+    async fn the_create_subscribes_to_sm_data_and_the_release_deregisters_and_unsubscribes() {
+        let _g = udm::SWITCH_LOCK.lock().await;
+        let _env = crate::UDM_ENV_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        let (udm_srv, seen) = spawn_recording_udm(sm_data_with("100 Mbps", "500 Mbps", 7)).await;
+        udm::set_for_test(true);
+        smf_context_init(64, 256, 512);
+
+        let supi = "imsi-001010000000293";
+        let psi = 8u8;
+        seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let resp = handle_sm_context_create(&create_request(
+            supi,
+            psi,
+            &n1(
+                psi,
+                1,
+                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
+                &[0x91, 0x00],
+            ),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "the create must reach the success path");
+        let sm_context_ref = serde_json::from_str::<serde_json::Value>(
+            resp.http.content.as_deref().expect("JSON root"),
+        )
+        .expect("json")["smContextRef"]
+            .as_str()
+            .expect("smContextRef")
+            .to_string();
+        assert!(
+            upf.seen()
+                .contains(&pfcp_path::pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST),
+            "the 201 must have been earned on the N4 wire"
+        );
+
+        let requests = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let sub = requests
+            .iter()
+            .find(|(m, u, _)| m == "POST" && u.contains("/sdm-subscriptions"))
+            .unwrap_or_else(|| panic!("the create must send Nudm_SDM_Subscribe, got {requests:?}"));
+        assert_eq!(
+            sub.1,
+            format!("/nudm-sdm/v2/{supi}/sdm-subscriptions"),
+            "TS 29.503 §5.2.2.3's collection, at v2 like the rest of Nudm_SDM"
+        );
+        let body: serde_json::Value = serde_json::from_str(&sub.2).expect("json");
+        for required in ["nfInstanceId", "callbackReference", "monitoredResourceUris"] {
+            assert!(
+                body.get(required).is_some(),
+                "SdmSubscription.{required} is required, got {body}"
+            );
+        }
+        let callback = body["callbackReference"].as_str().unwrap_or_default();
+        assert!(
+            callback.ends_with(&format!("/nsmf-callback/v1/sdm-notify/{sm_context_ref}")),
+            "the callback must name the route this SMF serves and the session it is \
+             for, got {callback}"
+        );
+        assert!(
+            body["monitoredResourceUris"][0]
+                .as_str()
+                .unwrap_or_default()
+                .contains("/sm-data"),
+            "the monitored resource is the sm-data document this session depends on, \
+             got {body}"
+        );
+        // The subscription id is recorded on the binding, or the release could not
+        // delete it (the orphan case `subscribe_sm_data` warns about).
+        assert_eq!(
+            lookup_policy_binding(&sm_context_ref).and_then(|b| b.sdm_subscription_id),
+            Some("sub-293".to_string()),
+            "the id from the Location header must be stored with the binding"
+        );
+
+        // ---- release: the UECM record goes, and so does the subscription ----
+        seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        assert_eq!(
+            handle_sm_context_release(&sm_context_ref, None)
+                .await
+                .status,
+            204
+        );
+        let requests = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(
+            requests.iter().any(|(m, u, _)| m == "DELETE"
+                && u == &format!("/nudm-uecm/v1/{supi}/registrations/smf-registrations/{psi}")),
+            "the release must remove the serving-SMF record for its own pduSessionId, \
+             got {requests:?}"
+        );
+        assert!(
+            requests.iter().any(|(m, u, _)| m == "DELETE"
+                && u == &format!("/nudm-sdm/v2/{supi}/sdm-subscriptions/sub-293")),
+            "the release must delete the SDM subscription it created, got {requests:?}"
+        );
+
+        udm::set_for_test(false);
+        std::env::remove_var("UDM_SBI_ADDR");
+        std::env::remove_var("UDM_SBI_PORT");
+        udm_srv.stop().await.expect("stop");
+    }
+
+    /// #293 criterion 3: the notification callback applies a changed session-AMBR and
+    /// default 5QI to a LIVE session, read back off the session and the binding.
+    ///
+    /// Also the PCF-precedence half (criterion 5): the same notification against a
+    /// session a PCF authorised changes nothing, because TS 23.503 §6.1.3.2 makes the
+    /// PCF the authority and the subscription is one of its inputs.
+    #[tokio::test]
+    async fn a_sdm_notification_applies_the_changed_ambr_to_a_live_session() {
+        let _g = udm::SWITCH_LOCK.lock().await;
+        let _env = crate::UDM_ENV_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        // The UDM now answers with DIFFERENT values from the ones the session holds.
+        let (udm_srv, seen) = spawn_recording_udm(sm_data_with("40 Mbps", "80 Mbps", 6)).await;
+        udm::set_for_test(true);
+        smf_context_init(64, 256, 512);
+
+        // A real registered session, so the fill-in the handler updates is there to
+        // read back.
+        let supi = "imsi-001010000000296";
+        let sm_context_ref = {
+            let ctx = smf_self();
+            let context = ctx.read().expect("context");
+            let (reference, _id) = register_sm_context(&context, supi, 9).expect("register");
+            reference
+        };
+        seed_binding(&sm_context_ref, 9);
+        if let Ok(ctx) = smf_self().read() {
+            if let Ok(mut bindings) = ctx.policy_bindings.write() {
+                if let Some(b) = bindings.get_mut(&sm_context_ref) {
+                    b.supi = supi.to_string();
+                    b.sdm_subscription_id = Some("sub-293".to_string());
+                }
+            }
+        }
+
+        let notify = |reference: &str| {
+            SbiRequest::post(format!("/nsmf-callback/v1/sdm-notify/{reference}")).with_body(
+                serde_json::json!({
+                    "notifyItems": [{
+                        "resourceId": format!("/nudm-sdm/v2/{supi}/sm-data"),
+                        "changes": [{ "op": "REPLACE", "path": "/sessionAmbr" }],
+                    }]
+                })
+                .to_string(),
+                "application/json",
+            )
+        };
+
+        let resp = smf_sbi_request_handler(notify(&sm_context_ref)).await;
+        assert_eq!(
+            resp.status, 204,
+            "a notification for a live session is a 204"
+        );
+
+        // The session and the binding must BOTH carry the new values: the Retrieve and
+        // the EPS-interworking encoders read the session, the update and release paths
+        // read the binding, and a change applied to one leaves them disagreeing.
+        let binding = lookup_policy_binding(&sm_context_ref).expect("binding");
+        assert_eq!(
+            (binding.ambr_ul_bps, binding.ambr_dl_bps, binding.five_qi),
+            (40_000_000, 80_000_000, 6),
+            "the changed subscription must reach the binding"
+        );
+        let sess = smf_self()
+            .read()
+            .expect("context")
+            .sess_find_by_sm_context_ref(&sm_context_ref)
+            .expect("session");
+        assert_eq!(
+            (sess.session_ambr.uplink, sess.session_ambr.downlink),
+            (40_000_000, 80_000_000),
+            "and the session, which is what Retrieve answers with"
+        );
+        assert!(
+            seen.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|(m, u, _)| m == "GET" && u.contains("/sm-data")),
+            "the change is RE-READ from the UDM rather than parsed out of the \
+             notification -- see handle_sdm_notification"
+        );
+
+        // ---- PCF precedence: the same notification changes nothing ----
+        let pcf_ref = {
+            let ctx = smf_self();
+            let context = ctx.read().expect("context");
+            let (reference, _id) = register_sm_context(&context, supi, 10).expect("register");
+            reference
+        };
+        seed_binding(&pcf_ref, 10);
+        if let Ok(ctx) = smf_self().read() {
+            if let Ok(mut bindings) = ctx.policy_bindings.write() {
+                if let Some(b) = bindings.get_mut(&pcf_ref) {
+                    b.supi = supi.to_string();
+                    b.sm_policy_id = Some("pol-1".to_string());
+                }
+            }
+        }
+        let before = lookup_policy_binding(&pcf_ref).expect("binding");
+        assert_eq!(smf_sbi_request_handler(notify(&pcf_ref)).await.status, 204);
+        let after = lookup_policy_binding(&pcf_ref).expect("binding");
+        assert_eq!(
+            (after.ambr_ul_bps, after.ambr_dl_bps, after.five_qi),
+            (before.ambr_ul_bps, before.ambr_dl_bps, before.five_qi),
+            "a PCF-authorised session must not be re-derived from the subscription: \
+             TS 23.503 §6.1.3.2 makes the PCF the authority, and the subscription is \
+             one of ITS inputs"
+        );
+
+        // A notification for a session this SMF does not hold is a 404, which is what
+        // tells the UDM to stop notifying a subscription that outlived its session.
+        assert_eq!(
+            smf_sbi_request_handler(notify("no-such-ref")).await.status,
+            404
+        );
+        // A malformed body is refused rather than silently accepted.
+        assert_eq!(
+            smf_sbi_request_handler(
+                SbiRequest::post(format!("/nsmf-callback/v1/sdm-notify/{sm_context_ref}"))
+                    .with_body("not json".to_string(), "application/json")
+            )
+            .await
+            .status,
+            400
+        );
+
+        udm::set_for_test(false);
+        std::env::remove_var("UDM_SBI_ADDR");
+        std::env::remove_var("UDM_SBI_PORT");
+        udm_srv.stop().await.expect("stop");
+    }
+
+    /// #293 criterion 2: a failed UDM teardown does not fail the session release.
+    ///
+    /// Port 1 is closed, so both the deregistration and the unsubscribe fail at
+    /// connect. The release must still answer 204 and still drop its local state — a
+    /// session whose teardown depends on the UDM answering would be a session the SMF
+    /// cannot release during a UDM outage.
+    #[tokio::test]
+    async fn a_failed_udm_teardown_does_not_fail_the_session_release() {
+        let _g = udm::SWITCH_LOCK.lock().await;
+        let _env = crate::UDM_ENV_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        udm::set_for_test(true);
+        std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UDM_SBI_PORT", "1");
+
+        seed_binding("udm-teardown-dead", 11);
+        if let Ok(ctx) = smf_self().read() {
+            if let Ok(mut bindings) = ctx.policy_bindings.write() {
+                if let Some(b) = bindings.get_mut("udm-teardown-dead") {
+                    b.sdm_subscription_id = Some("sub-dead".to_string());
+                }
+            }
+        }
+
+        assert_eq!(
+            handle_sm_context_release("udm-teardown-dead", None)
+                .await
+                .status,
+            204,
+            "an unreachable UDM must not turn a session release into a failure"
+        );
+        assert!(
+            lookup_policy_binding("udm-teardown-dead").is_none(),
+            "the release must complete locally regardless"
+        );
+
+        udm::set_for_test(false);
+        std::env::remove_var("UDM_SBI_ADDR");
+        std::env::remove_var("UDM_SBI_PORT");
+    }
+
+    /// #293 criterion 6: with the UDM leg off, the release sends nothing — not even
+    /// for a binding that carries a subscription id from an earlier enabled run.
+    #[tokio::test]
+    async fn a_disabled_udm_leg_neither_deregisters_nor_unsubscribes() {
+        let _g = udm::SWITCH_LOCK.lock().await;
+        let _env = crate::UDM_ENV_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (udm_srv, seen) = spawn_recording_udm(sm_data_with("100 Mbps", "500 Mbps", 7)).await;
+        udm::set_for_test(false);
+
+        seed_binding("udm-off-ref", 12);
+        if let Ok(ctx) = smf_self().read() {
+            if let Ok(mut bindings) = ctx.policy_bindings.write() {
+                if let Some(b) = bindings.get_mut("udm-off-ref") {
+                    b.sdm_subscription_id = Some("sub-293".to_string());
+                }
+            }
+        }
+        seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
+
+        assert_eq!(
+            handle_sm_context_release("udm-off-ref", None).await.status,
+            204
+        );
+        let requests = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(
+            requests.is_empty(),
+            "a disabled UDM leg must not dial the UDM at all, got {requests:?}"
+        );
+
+        std::env::remove_var("UDM_SBI_ADDR");
+        std::env::remove_var("UDM_SBI_PORT");
+        udm_srv.stop().await.expect("stop");
+    }
+
     fn n1(psi: u8, pti: u8, message_type: u8, tail: &[u8]) -> Vec<u8> {
         let mut m = vec![0x2E, psi, pti, message_type];
         m.extend_from_slice(tail);
@@ -6714,6 +7359,11 @@ mod tests {
             "dnn": "internet",
             "anType": "3GPP_ACCESS",
             "ratType": "NR",
+            // #293: the serving PLMN, which `SmfRegistration.plmnId` is `required` to
+            // carry. A real AMF sends the GUAMI; without it the UECM registration is
+            // (correctly) not sent at all, so a create test that omitted it could not
+            // exercise the UDM leg.
+            "guami": { "plmnId": { "mcc": "001", "mnc": "01" } },
             "n1SmMsg": { "contentId": "n1SmMsg" },
         });
         SbiRequest::post("/nsmf-pdusession/v1/sm-contexts")
