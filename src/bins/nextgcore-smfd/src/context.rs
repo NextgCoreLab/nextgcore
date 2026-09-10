@@ -861,6 +861,18 @@ pub struct SmfBearer {
 }
 
 impl SmfBearer {
+    /// The EBI assigned to this flow, or `None` when it has none (#117).
+    ///
+    /// `ebi` is a bare `u8` whose zero value is not a valid identity: TS 24.301
+    /// §9.3.2 defines 0 as "no EPS bearer identity assigned" and reserves 1..=4,
+    /// so an unset field and a real EBI are distinguishable without an `Option`.
+    /// This accessor exists so no caller has to remember that — emitting a Mapped
+    /// EPS bearer contexts IE with EBI 0 would tell the UE to build a bearer on
+    /// the reserved identity.
+    pub fn assigned_ebi(&self) -> Option<u8> {
+        (self.ebi >= 5 && self.ebi <= 15).then_some(self.ebi)
+    }
+
     pub fn new(id: u64, sess_id: u64) -> Self {
         Self {
             id,
@@ -1530,6 +1542,13 @@ pub struct PolicyBinding {
     /// release: a DNS context whose session is gone is exactly the orphan the
     /// delete exists to prevent.
     pub easdf_dns_context_id: Option<String>,
+    /// The EPS Bearer Identity the AMF assigned this session's default QoS flow
+    /// (#117), or `None` when EPS interworking is off or the assignment failed.
+    ///
+    /// Held on the binding rather than only on the `SmfSess` because the binding is
+    /// what the release, update and retrieve paths already key off; a value only on
+    /// the session would be invisible to them.
+    pub mapped_eps_bearer_id: Option<u8>,
     /// EAS address(es) the EASDF last reported for this session (#114).
     ///
     /// Recorded, not yet acted on: inserting a UL-CL toward the reported EAS is
@@ -1546,7 +1565,7 @@ impl PolicyBinding {
     /// Not a `Default` impl: an empty `supi` with `psi` 0 names no session, and a
     /// binding is only ever created from a real SM context request. Only serde
     /// reaches this, and only for a member the snapshot does not carry.
-    fn snapshot_default() -> Self {
+    pub(crate) fn snapshot_default() -> Self {
         Self {
             sm_policy_id: None,
             supi: String::new(),
@@ -1563,6 +1582,7 @@ impl PolicyBinding {
             sm_context_status_uri: None,
             fsm: crate::gsm_sm::GsmFsm::new(0),
             easdf_dns_context_id: None,
+            mapped_eps_bearer_id: None,
             easdf_reported_eas: Vec::new(),
         }
     }

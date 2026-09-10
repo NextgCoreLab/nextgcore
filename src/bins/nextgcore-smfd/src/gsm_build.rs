@@ -730,6 +730,102 @@ fn encode_bitrate(bitrate: u64) -> Vec<u8> {
 // GSM Message Building Functions
 // ============================================================================
 
+// ---------------------------------------------------------------------------
+// Mapped EPS bearer contexts, IEI 0x75 (TS 24.501 §9.11.4.8), issue #117
+// ---------------------------------------------------------------------------
+
+/// IEI of the Mapped EPS bearer contexts IE (TS 24.501 §9.11.4.8).
+pub const IEI_MAPPED_EPS_BEARER_CONTEXTS: u8 = 0x75;
+
+/// Operation code "Create new EPS bearer" (bits 8..7 of octet 7 = `01`).
+const MAPPED_EPS_OP_CREATE: u8 = 0b01 << 6;
+
+/// E bit (bit 5 of octet 7): the parameters list is included.
+const MAPPED_EPS_E_PARAMS_INCLUDED: u8 = 1 << 4;
+
+/// EPS parameter identifier 01H — Mapped EPS QoS parameters, whose contents are
+/// coded per TS 24.301 §9.9.4.3 (QCI first, bit rates optional).
+const EPS_PARAM_MAPPED_EPS_QOS: u8 = 0x01;
+
+/// Map a 5QI onto the EPS QCI that means the same thing, or `None`.
+///
+/// TS 23.501 Table 5.7.4-1 gives the standardised 5QI values 1..=9 the same
+/// numeric QCI, which is what makes 5GS↔EPS QoS mapping possible at all for them.
+/// For any other 5QI — non-standardised, or one of the higher standardised values
+/// with no EPS equivalent — there is **no defined QCI**, and this returns `None`
+/// so the caller omits the QoS parameter rather than inventing one. An EPS bearer
+/// context with an empty parameters list is legal (the IE's 7-octet minimum is
+/// exactly that case); a bearer carrying a QCI the operator never configured is
+/// not, and an MME would enforce it.
+pub fn qci_for_5qi(five_qi: u8) -> Option<u8> {
+    (1..=9).contains(&five_qi).then_some(five_qi)
+}
+
+/// Encode the Mapped EPS bearer contexts IE **contents** for one EPS bearer.
+///
+/// Layout, per figures 9.11.4.8.1–9.11.4.8.3:
+///
+/// ```text
+/// octet 4      EPS bearer identity in bits 8..5, bits 4..1 spare (zero)
+/// octets 5..6  length of the mapped EPS bearer context (octet 7 onward)
+/// octet 7      operation code (8..7) | spare (6) | E bit (5) | #params (4..1)
+/// octets 8..u  EPS parameters list: id, length, contents — repeated
+/// ```
+///
+/// Returns the contents only; the caller writes the IEI and the two-octet outer
+/// length (`write_tlv_e` does both).
+///
+/// `five_qi` is mapped through [`qci_for_5qi`]; when it has no EPS equivalent the
+/// parameters list is empty and the E bit is clear, which the spec permits and
+/// which is honest about what this SMF knows.
+pub fn encode_mapped_eps_bearer_context(ebi: u8, five_qi: u8) -> Vec<u8> {
+    let mut params: Vec<u8> = Vec::new();
+    let mut param_count = 0u8;
+    if let Some(qci) = qci_for_5qi(five_qi) {
+        // TS 24.301 §9.9.4.3: the 3-octet form of the EPS QoS IE is IEI, length
+        // and QCI, so as an EPS *parameter* the contents are the QCI alone. The
+        // optional bit-rate octets are omitted deliberately: octet 4 cannot be
+        // included without octets 5..7, and this SMF has no per-bearer MBR/GBR to
+        // put in them (the session AMBR travels in its own IE).
+        params.push(EPS_PARAM_MAPPED_EPS_QOS);
+        params.push(1);
+        params.push(qci);
+        param_count = 1;
+    }
+
+    let mut octet7 = MAPPED_EPS_OP_CREATE | (param_count & 0x0f);
+    if param_count > 0 {
+        octet7 |= MAPPED_EPS_E_PARAMS_INCLUDED;
+    }
+
+    // The context length covers octet 7 onward, which is why the whole IE has a
+    // 7-octet minimum: IEI + 2 outer length + EBI + 2 context length + octet 7.
+    let context_len = (1 + params.len()) as u16;
+
+    let mut out = Vec::with_capacity(3 + 1 + params.len());
+    out.push((ebi & 0x0f) << 4);
+    out.extend_from_slice(&context_len.to_be_bytes());
+    out.push(octet7);
+    out.extend_from_slice(&params);
+    out
+}
+
+/// Emit the Mapped EPS bearer contexts IE onto `builder` when `ebi` is set.
+///
+/// A single helper so the three N1 builders here and the live accept builder in
+/// `policy.rs` cannot disagree about the encoding — the shape of bug where two
+/// copies of one IE drift and only the unused copy is tested.
+pub fn write_mapped_eps_bearer_contexts(
+    builder: &mut GsmMessageBuilder,
+    ebi: Option<u8>,
+    five_qi: u8,
+) {
+    if let Some(ebi) = ebi {
+        let contents = encode_mapped_eps_bearer_context(ebi, five_qi);
+        builder.write_tlv_e(IEI_MAPPED_EPS_BEARER_CONTEXTS, &contents);
+    }
+}
+
 /// Build PDU Session Establishment Accept message
 pub fn build_pdu_session_establishment_accept(
     sess: &SmfSess,
@@ -780,6 +876,12 @@ pub fn build_pdu_session_establishment_accept(
     let default_desc = encode_default_qos_flow_description(qos_flow);
     let qos_desc_bytes = encode_qos_flow_descriptions(&[default_desc]);
     builder.write_tlv_e(0x79, &qos_desc_bytes);
+
+    // Mapped EPS bearer contexts (optional, IEI = 0x75), #117. Emitted only when
+    // the AMF assigned this flow an EBI: without one there is no EPS bearer to
+    // describe, and an IE naming EBI 0 would tell the UE to build a bearer on the
+    // identity TS 24.301 §9.3.2 reserves for "none".
+    write_mapped_eps_bearer_contexts(&mut builder, qos_flow.assigned_ebi(), qos_flow.qos.index);
 
     // DNN (optional, IEI = 0x25). Labelled-name form, same encoder the live
     // accept path uses — a single label with dots inline is malformed for any
@@ -836,6 +938,23 @@ pub fn build_pdu_session_modification_command(
             .collect();
         let qos_desc_bytes = encode_qos_flow_descriptions(&descs);
         builder.write_tlv_e(0x79, &qos_desc_bytes);
+    }
+
+    // Mapped EPS bearer contexts (optional, IEI = 0x75), #117. TS 24.501
+    // §8.3.2.7 lets the Modification Command carry it, so a flow that GAINED an
+    // EBI mid-session is conveyed here rather than only at establishment. One
+    // context per flow holding an EBI; flows without one contribute nothing, and
+    // when no flow has one the IE is omitted entirely rather than emitted empty.
+    let mapped: Vec<u8> = qos_flows
+        .iter()
+        .filter_map(|f| {
+            f.assigned_ebi()
+                .map(|ebi| encode_mapped_eps_bearer_context(ebi, f.qos.index))
+        })
+        .flatten()
+        .collect();
+    if !mapped.is_empty() {
+        builder.write_tlv_e(IEI_MAPPED_EPS_BEARER_CONTEXTS, &mapped);
     }
 
     Some(builder.build())
@@ -981,6 +1100,12 @@ pub fn build_pdu_session_establishment_accept_extended(
     let default_desc = encode_default_qos_flow_description(qos_flow);
     let qos_desc_bytes = encode_qos_flow_descriptions(&[default_desc]);
     builder.write_tlv_e(0x79, &qos_desc_bytes);
+
+    // Mapped EPS bearer contexts (optional, IEI = 0x75), #117. Emitted only when
+    // the AMF assigned this flow an EBI: without one there is no EPS bearer to
+    // describe, and an IE naming EBI 0 would tell the UE to build a bearer on the
+    // identity TS 24.301 §9.3.2 reserves for "none".
+    write_mapped_eps_bearer_contexts(&mut builder, qos_flow.assigned_ebi(), qos_flow.qos.index);
 
     // Extended protocol configuration options (optional, IEI = 0x7B)
     // Build ePCO with DNS servers and MTU
@@ -1595,5 +1720,246 @@ mod tests {
     fn test_gsm_message_builder_default() {
         let builder = GsmMessageBuilder::default();
         assert!(builder.is_empty());
+    }
+    // ---- #117: Mapped EPS bearer contexts, IEI 0x75 --------------------------
+
+    /// Find and fully decode the Mapped EPS bearer contexts IE in a built N1
+    /// message, returning `(offset, contexts)` where each context is
+    /// `(ebi, octet7, params)`.
+    ///
+    /// A scan-and-VALIDATE rather than a walk: the Establishment Accept begins with
+    /// mandatory V/LV fields that are not TLVs, so a length-driven walk from the
+    /// 5GSM header does not work without a full message parser. And a scan alone
+    /// would be a false guard — 0x75 is an ordinary byte that can appear inside
+    /// another IE's contents. So every candidate offset is parsed as
+    /// TS 24.501 §9.11.4.8 and accepted only if the whole structure is
+    /// self-consistent: the outer length fits the buffer, each context's own length
+    /// fits the outer contents, and the parameters consume their context exactly.
+    #[allow(clippy::type_complexity)]
+    fn decode_mapped_eps_at(msg: &[u8]) -> Option<(usize, Vec<(u8, u8, Vec<(u8, Vec<u8>)>)>)> {
+        for at in 0..msg.len() {
+            if msg[at] != IEI_MAPPED_EPS_BEARER_CONTEXTS || at + 3 > msg.len() {
+                continue;
+            }
+            let len = u16::from_be_bytes([msg[at + 1], msg[at + 2]]) as usize;
+            if len < 4 || at + 3 + len > msg.len() {
+                continue;
+            }
+            let body = &msg[at + 3..at + 3 + len];
+            let mut contexts = Vec::new();
+            let mut b = 0usize;
+            let mut consistent = true;
+            while b < body.len() {
+                if b + 4 > body.len() || body[b] & 0x0f != 0 {
+                    // Bits 4..1 of octet 4 are spare and shall be zero.
+                    consistent = false;
+                    break;
+                }
+                let ebi = body[b] >> 4;
+                let ctx_len = u16::from_be_bytes([body[b + 1], body[b + 2]]) as usize;
+                if ctx_len == 0 || b + 3 + ctx_len > body.len() {
+                    consistent = false;
+                    break;
+                }
+                let octet7 = body[b + 3];
+                let params_bytes = &body[b + 4..b + 3 + ctx_len];
+                let mut params = Vec::new();
+                let mut p = 0usize;
+                while p < params_bytes.len() {
+                    if p + 2 > params_bytes.len() {
+                        consistent = false;
+                        break;
+                    }
+                    let id = params_bytes[p];
+                    let plen = params_bytes[p + 1] as usize;
+                    if p + 2 + plen > params_bytes.len() {
+                        consistent = false;
+                        break;
+                    }
+                    params.push((id, params_bytes[p + 2..p + 2 + plen].to_vec()));
+                    p += 2 + plen;
+                }
+                if !consistent {
+                    break;
+                }
+                if (octet7 & 0x0f) as usize != params.len() {
+                    // The number-of-parameters field must match what is there.
+                    consistent = false;
+                    break;
+                }
+                contexts.push((ebi, octet7, params));
+                b += 3 + ctx_len;
+            }
+            if consistent && b == body.len() && !contexts.is_empty() {
+                return Some((at, contexts));
+            }
+        }
+        None
+    }
+
+    /// The first (and, for the accept builders, only) mapped EPS bearer context.
+    fn decode_mapped_eps(msg: &[u8]) -> Option<(u8, u8, Vec<(u8, Vec<u8>)>)> {
+        decode_mapped_eps_at(msg).map(|(_, mut c)| c.remove(0))
+    }
+
+    fn bearer_with_ebi(ebi: u8, five_qi: u8) -> SmfBearer {
+        let mut b = create_test_bearer();
+        b.ebi = ebi;
+        b.qos.index = five_qi;
+        b
+    }
+
+    /// #117 criterion 3: the IE is emitted and decodes to the expected EBI and
+    /// parameters, and it is ABSENT when no EBI was assigned.
+    ///
+    /// The absent half is criterion 5: a deployment with interworking off must
+    /// produce the same N1 bytes it did before, and an IE emitted with EBI 0 would
+    /// tell the UE to build a bearer on the identity TS 24.301 §9.3.2 reserves for
+    /// "none assigned".
+    #[test]
+    fn establishment_accept_carries_mapped_eps_bearer_contexts_only_when_an_ebi_exists() {
+        let sess = create_test_sess();
+
+        let msg = build_pdu_session_establishment_accept(&sess, &bearer_with_ebi(7, 9))
+            .expect("accept builds");
+        let (ebi, octet7, params) =
+            decode_mapped_eps(&msg).expect("IEI 0x75 must be present when an EBI is held");
+        assert_eq!(ebi, 7, "the EBI occupies bits 8..5 of octet 4");
+        assert_eq!(
+            octet7 >> 6,
+            0b01,
+            "operation code must be 'Create new EPS bearer'"
+        );
+        assert_eq!(
+            octet7 & 0x20,
+            0,
+            "bit 6 of octet 7 is spare and must be zero"
+        );
+        assert_eq!(
+            octet7 & 0x10,
+            0x10,
+            "the E bit must say the parameters list is included"
+        );
+        assert_eq!(octet7 & 0x0f, 1, "one EPS parameter");
+        assert_eq!(
+            params,
+            vec![(0x01u8, vec![9u8])],
+            "01H is Mapped EPS QoS parameters; its contents are the QCI (TS 24.301 §9.9.4.3)"
+        );
+
+        // No EBI: the IE must not appear at all.
+        let msg = build_pdu_session_establishment_accept(&sess, &bearer_with_ebi(0, 9))
+            .expect("accept builds");
+        assert!(
+            decode_mapped_eps(&msg).is_none(),
+            "EBI 0 means 'none assigned' and must not produce an IE"
+        );
+        // ...nor for a RESERVED identity.
+        let msg = build_pdu_session_establishment_accept(&sess, &bearer_with_ebi(4, 9))
+            .expect("accept builds");
+        assert!(
+            decode_mapped_eps(&msg).is_none(),
+            "EBIs 1..=4 are reserved by TS 24.301 §9.3.2"
+        );
+    }
+
+    /// The extended accept builder emits it too — the two accept builders are
+    /// separate functions and a fix applied to one is invisible in the other.
+    #[test]
+    fn the_extended_establishment_accept_also_carries_the_ie() {
+        let sess = create_test_sess();
+        let msg = build_pdu_session_establishment_accept_extended(
+            &sess,
+            &bearer_with_ebi(9, 5),
+            &[std::net::Ipv4Addr::new(8, 8, 8, 8)],
+            Some(1400),
+        )
+        .expect("extended accept builds");
+        let (ebi, _, params) = decode_mapped_eps(&msg).expect("IEI 0x75 present");
+        assert_eq!(ebi, 9);
+        assert_eq!(params, vec![(0x01u8, vec![5u8])]);
+    }
+
+    /// TS 24.501 §8.3.2.7: the Modification Command may carry the IE, so a flow
+    /// that gains an EBI mid-session is conveyed without a new establishment. One
+    /// context per flow holding an EBI, and none for flows without one.
+    #[test]
+    fn the_modification_command_carries_one_context_per_flow_holding_an_ebi() {
+        let sess = create_test_sess();
+        let flows = vec![
+            bearer_with_ebi(5, 9),
+            bearer_with_ebi(0, 9), // no EBI: contributes nothing
+            bearer_with_ebi(6, 8),
+        ];
+        let msg = build_pdu_session_modification_command(
+            &sess,
+            &flows,
+            qos_rule_code::CREATE_NEW_QOS_RULE,
+            qos_flow_description_code::CREATE_NEW_QOS_FLOW_DESCRIPTION,
+        )
+        .expect("modification command builds");
+
+        // Two contexts back to back inside one IE: decode the first, then check the
+        // IE is long enough to hold the second.
+        let (ebi, _, params) = decode_mapped_eps(&msg).expect("IEI 0x75 present");
+        assert_eq!(ebi, 5, "the first flow holding an EBI comes first");
+        assert_eq!(params, vec![(0x01u8, vec![9u8])]);
+        let (_, contexts) = decode_mapped_eps_at(&msg).expect("IEI 0x75 present");
+        assert_eq!(
+            contexts.len(),
+            2,
+            "two contexts, and NOT three: the flow without an EBI contributes nothing"
+        );
+        assert_eq!(
+            contexts.iter().map(|c| c.0).collect::<Vec<_>>(),
+            vec![5, 6],
+            "in flow order, skipping the one with no EBI"
+        );
+        assert_eq!(contexts[1].2, vec![(0x01u8, vec![8u8])]);
+
+        // No flow holds an EBI: the IE is omitted rather than emitted empty.
+        let msg = build_pdu_session_modification_command(
+            &sess,
+            &[bearer_with_ebi(0, 9)],
+            qos_rule_code::CREATE_NEW_QOS_RULE,
+            qos_flow_description_code::CREATE_NEW_QOS_FLOW_DESCRIPTION,
+        )
+        .expect("builds");
+        assert!(decode_mapped_eps(&msg).is_none());
+    }
+
+    /// A 5QI with no EPS equivalent yields a bearer context with an EMPTY
+    /// parameters list, not an invented QCI.
+    ///
+    /// TS 23.501 Table 5.7.4-1 gives 5QIs 1..=9 the same numeric QCI; there is no
+    /// defined QCI for 5QI 82 (a delay-critical XR value). An MME would *enforce*
+    /// whatever QCI it was handed, so guessing one is worse than omitting the
+    /// parameter — and the 7-octet minimum length of the IE is exactly this case.
+    #[test]
+    fn a_five_qi_with_no_eps_equivalent_omits_the_qos_parameter_rather_than_inventing_a_qci() {
+        assert_eq!(qci_for_5qi(9), Some(9));
+        assert_eq!(qci_for_5qi(1), Some(1));
+        assert_eq!(qci_for_5qi(82), None);
+        assert_eq!(qci_for_5qi(0), None);
+
+        let contents = encode_mapped_eps_bearer_context(5, 82);
+        assert_eq!(
+            contents.len(),
+            4,
+            "EBI + 2-octet length + octet 7, and no parameters"
+        );
+        assert_eq!(contents[3] & 0x0f, 0, "no EPS parameters");
+        assert_eq!(
+            contents[3] & 0x10,
+            0,
+            "the E bit must be clear when the parameters list is empty"
+        );
+
+        let sess = create_test_sess();
+        let msg =
+            build_pdu_session_establishment_accept(&sess, &bearer_with_ebi(5, 82)).expect("builds");
+        let (ebi, _, params) = decode_mapped_eps(&msg).expect("the IE is still emitted");
+        assert_eq!(ebi, 5, "the bearer identity is still conveyed");
+        assert!(params.is_empty());
     }
 }
