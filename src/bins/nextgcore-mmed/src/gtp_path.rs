@@ -1293,6 +1293,11 @@ mod tests {
                 Gtp2IeType::BearerContext as u8,
                 "Bearer Contexts to be created",
             ),
+            // Added by #52: a conformant PGW answers ConditionalIeMissing for an E-UTRAN
+            // session without these, so the MME -> SGW-C -> PGW chain cannot complete
+            // while they are absent. Found by building the anchor, not by inspection.
+            (Gtp2IeType::ServingNetwork as u8, "Serving Network"),
+            (Gtp2IeType::Uli as u8, "User Location Information"),
         ] {
             assert!(
                 received.get_ie(ie_type, 0).is_some(),

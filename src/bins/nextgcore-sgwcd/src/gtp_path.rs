@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 
 use nextgcore_gtp::v2::header::Gtp2MessageType;
-use nextgcore_gtp::v2::ie::{Gtp2IeType, Gtp2RecoveryIe};
+use nextgcore_gtp::v2::ie::{
+    Gtp2BearerContextIe, Gtp2FTeidIe, Gtp2IeType, Gtp2PaaIe, Gtp2RecoveryIe,
+};
 use nextgcore_gtp::v2::message::Gtp2Message;
 use nextgcore_gtp::v2::xact::{Gtp2XactConfig, Gtp2XactMgr};
 
@@ -435,6 +437,39 @@ pub fn gtp_open() -> Result<(), String> {
             .or(advertised),
     );
 
+    // ---- S5/S8 (#52) ----
+    //
+    // The dedicated S5-C address (criterion 6). Unset means "same address as S11",
+    // which is what the shipped compose file describes; the accessor's fallback makes
+    // that explicit rather than reusing `s11_address()` inside the builder.
+    ctx.set_s5c_address(
+        std::env::var("SGWC_S5C_ADVERTISE")
+            .ok()
+            .and_then(|v| v.parse::<Ipv4Addr>().ok()),
+    );
+
+    // The PGW this SGW-C anchors sessions at. Unset means the S5/S8 leg cannot be
+    // relayed, and the SGW-C then REFUSES an S11 Create Session Request rather than
+    // answering it from local state — the behaviour #52 exists to remove. Env-configured
+    // like every other address this daemon takes.
+    let pgw_peer = std::env::var("SGWC_PGW_S5C").ok().and_then(|v| {
+        // A bare address means the fixed GTPv2-C port (TS 29.274 §4.1).
+        v.parse::<std::net::SocketAddr>().ok().or_else(|| {
+            v.parse::<Ipv4Addr>()
+                .ok()
+                .map(|ip| std::net::SocketAddr::from((ip, 2123)))
+        })
+    });
+    match pgw_peer {
+        Some(peer) => log::info!("S5/S8 PGW peer: {peer}"),
+        None => log::warn!(
+            "no SGWC_PGW_S5C configured: the S5/S8 leg is unavailable, so a Create Session \
+             Request will be REFUSED rather than answered from local state (TS 29.274 §7.2.1 \
+             requires the SGW to relay it to a PGW)"
+        ),
+    }
+    ctx.set_pgw_s5c_peer(pgw_peer);
+
     set_s11_server(server);
     Ok(())
 }
@@ -735,9 +770,93 @@ fn handle_datagram(inner: &Arc<GtpcInner>, data: &[u8], peer: SocketAddr) {
         {
             dispatch_bearer_response(inner, &msg, peer, data);
         }
+        // ---- S5/S8 (#52) ----
+        //
+        // The PGW's answer to our Create Session Request. This arm is what wires
+        // `s5c_handler` into the receive path at last: it had no production caller, so
+        // no PGW response could ever be acted on.
+        t if t == T::CreateSessionResponse as u8 => {
+            dispatch_s5c_create_session_response(&msg, peer);
+        }
+        // PGW-INITIATED bearer procedures (TS 29.274 §7.2.3, §7.2.15, §7.2.9.2).
+        // Forwarded to the MME, which is the node that owns the UE's NAS session.
+        // `SgwcFsm::handle_s5c_message` was a log-only stub, so these could never be
+        // originated or relayed.
+        t if t == T::CreateBearerRequest as u8
+            || t == T::UpdateBearerRequest as u8
+            || t == T::DeleteBearerRequest as u8 =>
+        {
+            forward_pgw_bearer_procedure_to_mme(inner, &msg, peer, data);
+        }
         other => {
             log::error!("[DROP] Unhandled GTPv2-C message type {other} from {peer}");
         }
+    }
+}
+
+/// Relay a PGW-initiated bearer procedure to the MME (#52 criterion 7).
+///
+/// TS 23.401 §5.4.1/§5.4.2/§5.4.4: the SGW relays the PGW's Create/Update/Delete Bearer
+/// Request to the MME on S11 and relays the MME's response back. The SGW-C is a relay
+/// here, not an endpoint — it re-addresses the message to the MME's S11 TEID and keeps
+/// the PGW's own content, because the bearer parameters are the PGW's decision.
+///
+/// The MME's response comes back through `dispatch_bearer_response`, which already
+/// existed. What was missing was this direction: `SgwcFsm::handle_s5c_message` logged and
+/// returned, so a PGW-initiated procedure died at the SGW-C.
+fn forward_pgw_bearer_procedure_to_mme(
+    inner: &Arc<GtpcInner>,
+    msg: &Gtp2Message,
+    peer: SocketAddr,
+    data: &[u8],
+) {
+    let ctx = sgwc_self();
+    let msg_type = msg.header.message_type;
+
+    // The session this procedure belongs to, by the local S5-C TEID the PGW addressed.
+    let local_teid = msg.header.teid.unwrap_or(0);
+    // `sess_find_by_teid` resolves by the SXA SEID, and that works here because
+    // `sess_add` assigns `sgw_s5c_teid = seid as u32` from the same value
+    // (`context.rs:791-792`) — the S5-C TEID IS the low 32 bits of the SEID. Stated
+    // because it is true by construction rather than by intent: an allocator that
+    // stopped deriving one from the other would break this lookup silently.
+    let Some(sess) = ctx.sess_find_by_teid(local_teid) else {
+        log::warn!(
+            "S5/S8 message type {msg_type} from {peer} for local S5-C TEID {local_teid:#x} \
+             matches no session; cannot relay it to any MME"
+        );
+        return;
+    };
+    let Some(ue) = ctx.ue_find_by_id(sess.sgwc_ue_id) else {
+        log::warn!("S5/S8 message type {msg_type} from {peer}: the session has no UE context");
+        return;
+    };
+    let Some(mme_peer) = ue.mme_addr else {
+        log::warn!(
+            "S5/S8 message type {msg_type} from {peer}: no MME address recorded for this UE, so \
+             the procedure cannot be relayed"
+        );
+        return;
+    };
+
+    // Re-address to the MME: its S11 TEID, and a sequence number from THIS node's
+    // transaction space, because the SGW-C is the initiator on the S11 leg.
+    let mut relayed = msg.clone();
+    relayed.header.teid = Some(ue.mme_s11_teid);
+    let server = GtpcServer {
+        inner: inner.clone(),
+    };
+    let seq = server.alloc_sequence();
+    relayed.header.sequence_number = seq;
+
+    log::info!(
+        "Relaying PGW-initiated S5/S8 message type {msg_type} from {peer} to MME {mme_peer} \
+         (S11 TEID {:#x}, seq {seq})",
+        ue.mme_s11_teid
+    );
+    let _ = data;
+    if let Err(e) = server.send_request(mme_peer, &relayed, sess.id) {
+        log::error!("Relay of S5/S8 message type {msg_type} to MME {mme_peer} failed: {e}");
     }
 }
 
@@ -1028,15 +1147,30 @@ fn dispatch_create_session_request(server: &GtpcServer, msg: &Gtp2Message, peer:
     if let Some(pdn_type) = parsed.pdn_type {
         sess.paa.pdn_type = pdn_type;
     }
-    if let Some(ref paa) = parsed.paa {
-        sess.paa.pdn_type = paa.pdn_type;
-        sess.paa.ipv4_addr = paa.ipv4_addr.map(Ipv4Addr::from);
-        sess.paa.ipv6_addr = paa.ipv6_addr.map(std::net::Ipv6Addr::from);
+    // #52 criterion 5: the MME's PAA is NOT copied onto the session.
+    //
+    // TS 23.401 §5.3.2.1 makes PDN address allocation a PGW function. Copying the MME's
+    // proposal here is what made the SGW-C look like it had allocated something: the UE
+    // received back the address it had asked about, with no node in the deployment
+    // having allocated anything. The session's PAA is now written only in
+    // `dispatch_s5c_create_session_response`, from the PGW's answer.
+    //
+    // The requested PDN TYPE above is kept, because it is the UE's request and the PGW
+    // may answer with a different one (causes 18/19 exist for exactly that).
+    if parsed.paa.is_some() {
+        log::debug!(
+            "Create Session Request carries a PAA; it is a REQUEST and is not applied — the PGW \
+             allocates the PDN address (TS 23.401 §5.3.2.1)"
+        );
     }
     if let Some(ref ambr) = parsed.ambr {
         sess.ambr_ul = ambr.uplink;
         sess.ambr_dl = ambr.downlink;
     }
+    // Held for the S5/S8 relay (#52): the PGW needs both for an E-UTRAN session, and the
+    // SGW-C is the only node that has them.
+    sess.serving_network = parsed.serving_network.clone();
+    sess.uli = parsed.uli.clone();
     ctx.sess_update(&sess);
 
     // Bearer QoS + user-plane endpoint allocation
@@ -1103,29 +1237,204 @@ fn dispatch_create_session_request(server: &GtpcServer, msg: &Gtp2Message, peer:
     // hard-coded REQUEST_ACCEPTED -- before the request had even left, since the transport
     // discarded it -- so the MME was told a bearer existed whose user plane might not.
     let sess = ctx.sess_find_by_id(sess.id).unwrap_or(sess);
-    if let Err(e) = pfcp_path::send_session_establishment_request(
-        &sess,
-        seq as u64,
-        None,
-        0,
-        pfcp_path::S11Continuation::CreateSession {
-            peer,
-            seq,
-            teid: ue.mme_s11_teid,
-        },
-    ) {
-        // The request could not even be queued (no transport running): that IS a local
-        // failure, and the MME is answered now rather than waiting for a response that
-        // will never come.
-        log::error!("PFCP Session Establishment failed: {e}");
+    let continuation = pfcp_path::S11Continuation::CreateSession {
+        peer,
+        seq,
+        teid: ue.mme_s11_teid,
+    };
+
+    // TS 29.274 §7.2.1: "The Create Session Request message shall be sent on the S11
+    // interface by the MME to the SGW, AND ON THE S5/S8 INTERFACE BY THE SGW TO THE
+    // PGW." Both legs are mandatory. This used to skip the second one entirely and
+    // answer the MME from local state, so no node in the deployment allocated a PDN
+    // address and there was no anchor gateway (#52).
+    //
+    // The order is §5.3.2.1's: relay to the PGW FIRST, because the PGW's response
+    // carries the PAA and the PGW-U F-TEID that the SGW-U's Sxa session needs. The Sxa
+    // establishment therefore moves into `s5c_create_session_response`, and the S11
+    // answer stays gated on it exactly as #54 left it.
+    let Some(pgw_peer) = ctx.pgw_s5c_peer() else {
+        // No PGW configured. Refusing is the honest answer: answering locally is the
+        // defect, and TS 29.274 §8.4's cause 72 says which peer is missing.
+        log::error!(
+            "Create Session Request from {peer}: no PGW S5/S8 peer configured, so this session \
+             cannot be anchored; refusing rather than answering from local state"
+        );
         send_cause_response(
             server,
             peer,
             Gtp2MessageType::CreateSessionResponse,
             ue.mme_s11_teid,
             seq,
-            sxa_handler::gtp_cause_from_pfcp(sxa_handler::pfcp_cause::SYSTEM_FAILURE),
+            gtp_cause::REMOTE_PEER_NOT_RESPONDING,
         );
+        return;
+    };
+
+    let s5c_seq = server.alloc_sequence();
+    let msg = match s11_build::build_s5c_create_session_request(&sess, s5c_seq) {
+        Ok(msg) => msg,
+        Err(e) => {
+            log::error!("Create Session Request: cannot build the S5/S8 leg: {e}");
+            send_cause_response(
+                server,
+                peer,
+                Gtp2MessageType::CreateSessionResponse,
+                ue.mme_s11_teid,
+                seq,
+                gtp_cause::SYSTEM_FAILURE,
+            );
+            return;
+        }
+    };
+
+    // Record what the PGW's answer has to continue, before the request goes out: a
+    // response that arrives before the record exists would be uncorrelated and dropped.
+    register_pending_s5c(s5c_seq, sess.id, continuation);
+
+    if let Err(e) = server.send_request(pgw_peer, &msg, sess.id) {
+        log::error!("S5/S8 Create Session Request to {pgw_peer} failed: {e}");
+        take_pending_s5c(s5c_seq);
+        send_cause_response(
+            server,
+            peer,
+            Gtp2MessageType::CreateSessionResponse,
+            ue.mme_s11_teid,
+            seq,
+            gtp_cause::REMOTE_PEER_NOT_RESPONDING,
+        );
+    }
+}
+
+/// What an S5/S8 Create Session Response has to continue (#52).
+///
+/// Keyed by the S5-C sequence number, which is what correlates the PGW's answer to the
+/// request. The S11 continuation rides along untouched, so the MME's answer is still
+/// produced by #54's `sxa_response` path once the SGW-U has confirmed — this stage is
+/// inserted BEFORE that one rather than replacing it.
+static PENDING_S5C: std::sync::Mutex<
+    Option<std::collections::HashMap<u32, (u64, pfcp_path::S11Continuation)>>,
+> = std::sync::Mutex::new(None);
+
+fn register_pending_s5c(seq: u32, sess_id: u64, continuation: pfcp_path::S11Continuation) {
+    if let Ok(mut map) = PENDING_S5C.lock() {
+        map.get_or_insert_with(std::collections::HashMap::new)
+            .insert(seq, (sess_id, continuation));
+    }
+}
+
+fn take_pending_s5c(seq: u32) -> Option<(u64, pfcp_path::S11Continuation)> {
+    PENDING_S5C
+        .lock()
+        .ok()
+        .and_then(|mut map| map.as_mut().and_then(|m| m.remove(&seq)))
+}
+
+/// The PGW answered our S5/S8 Create Session Request (#52 criteria 5 and 7).
+///
+/// This is where the SGW-C stops inventing an answer. The PAA, the PGW's control and
+/// user-plane F-TEIDs and the APN-Restriction are written onto the session from the
+/// PGW's response, and only then is the SGW-U provisioned — so the S11 response #54
+/// builds from that session carries the PGW's values rather than the MME's own PAA
+/// echoed back.
+fn dispatch_s5c_create_session_response(msg: &Gtp2Message, peer: SocketAddr) {
+    let seq = msg.header.sequence_number;
+    let Some((sess_id, continuation)) = take_pending_s5c(seq) else {
+        log::warn!(
+            "S5/S8 Create Session Response from {peer} (seq={seq}) matches no pending request; \
+             dropping rather than acting on a datagram this SGW-C did not ask for"
+        );
+        return;
+    };
+
+    let ctx = sgwc_self();
+    let cause = msg
+        .get_ie(Gtp2IeType::Cause as u8, 0)
+        .and_then(|ie| ie.value.first().copied())
+        .unwrap_or(gtp_cause::SYSTEM_FAILURE);
+
+    // The PGW's control-plane F-TEID is at instance 1 (TS 29.274 Table 7.2.2-1); the
+    // SGW's own echo is at instance 0.
+    let pgw_c = msg
+        .get_ie(Gtp2IeType::FTeid as u8, 1)
+        .and_then(|ie| Gtp2FTeidIe::decode(&ie.value).ok());
+    // The PGW-U endpoint lives in the Bearer Context at instance 2.
+    let pgw_u = msg
+        .get_ie(Gtp2IeType::BearerContext as u8, 0)
+        .and_then(|ie| Gtp2BearerContextIe::decode(&ie.value).ok())
+        .and_then(|bc| bc.fteid(2).ok().flatten());
+
+    // ---- criterion 5: the SGW-C stops inventing the answer ----
+    //
+    // The PAA, the PGW's control address and the APN-Restriction come from the PGW's
+    // response and are written onto the session, which is what #54's `sxa_response`
+    // builds the S11 Create Session Response from. Before #52 the PAA was COPIED from
+    // the MME's request (`parsed.paa` into `sess.paa`), so the UE was handed back the
+    // address it had asked about with no node having allocated anything.
+    if let Some(paa) = msg
+        .get_ie(Gtp2IeType::Paa as u8, 0)
+        .and_then(|ie| Gtp2PaaIe::decode(&ie.value).ok())
+    {
+        if let Some(mut sess) = ctx.sess_find_by_id(sess_id) {
+            sess.paa.pdn_type = paa.pdn_type;
+            sess.paa.ipv4_addr = paa.ipv4_addr.map(std::net::Ipv4Addr::from);
+            sess.paa.ipv6_addr = paa.ipv6_addr.map(std::net::Ipv6Addr::from);
+            if let Some(ft) = pgw_c.as_ref() {
+                sess.pgw_addr = ft.ipv4_addr.map(std::net::Ipv4Addr::from);
+            }
+            ctx.sess_update(&sess);
+            log::info!(
+                "S5/S8 Create Session Response from {peer}: PGW allocated PAA {:?} (pdn_type={})",
+                sess.paa.ipv4_addr,
+                sess.paa.pdn_type
+            );
+        }
+    } else if cause == gtp_cause::REQUEST_ACCEPTED {
+        // An accepted response with no PAA is a PGW that claims success and allocated
+        // nothing. Answering the MME from local state here is exactly the defect.
+        log::error!(
+            "S5/S8 Create Session Response from {peer} was accepted but carries NO PAA: the \
+             session has no PDN address and cannot be completed"
+        );
+        crate::sxa_response::fail_with_cause(continuation, gtp_cause::MANDATORY_IE_MISSING);
+        return;
+    }
+
+    let existing = ctx.sess_find_by_id(sess_id);
+    match crate::s5c_handler::handle_create_session_response(
+        existing.as_ref(),
+        0,
+        &[],
+        cause,
+        pgw_c.map(|ft| ft.teid).unwrap_or(0),
+        pgw_u.map(|ft| ft.teid).unwrap_or(0),
+    ) {
+        crate::s5c_handler::HandlerResult::Error(cause) => {
+            log::error!(
+                "S5/S8 Create Session Response from {peer} REJECTED the session: cause {cause}"
+            );
+            // The PGW refused, so there is no anchor and no user plane to provision. The
+            // MME gets the PGW's own cause rather than a local guess.
+            crate::sxa_response::fail_with_cause(continuation, cause);
+            return;
+        }
+        other => log::debug!("S5/S8 Create Session Response handled: {other:?}"),
+    }
+
+    let Some(sess) = ctx.sess_find_by_id(sess_id) else {
+        log::error!("S5/S8 Create Session Response for session {sess_id}, which is gone");
+        crate::sxa_response::fail(
+            continuation,
+            "the session was removed while the PGW answered",
+        );
+        return;
+    };
+
+    // Now the SGW-U can be provisioned: it has a PGW-U endpoint to tunnel to.
+    if let Err(e) =
+        pfcp_path::send_session_establishment_request(&sess, seq as u64, None, 0, continuation)
+    {
+        log::error!("PFCP Session Establishment failed after the PGW answered: {e}");
     }
 }
 
@@ -1509,20 +1818,70 @@ fn dispatch_bearer_resource_command(server: &GtpcServer, msg: &Gtp2Message, peer
     let result =
         s11_handler::handle_bearer_resource_command(ue.as_ref(), seq as u64, &[], linked_ebi);
 
-    let teid = ue.map(|u| u.mme_s11_teid).unwrap_or(0);
+    let teid = ue.as_ref().map(|u| u.mme_s11_teid).unwrap_or(0);
     match result {
         HandlerResult::ForwardToPgw => {
-            // S5-C forwarding toward a live PGW peer is not wired yet; the
-            // spec triggered message on failure is the Bearer Resource
-            // Failure Indication (TS 29.274 Section 7.2.6)
-            send_cause_response(
-                server,
-                peer,
-                Gtp2MessageType::BearerResourceFailureIndication,
-                teid,
-                seq,
-                gtp_cause::SERVICE_NOT_SUPPORTED,
-            );
+            // #52 criterion 7: forwarded to the PGW instead of refused.
+            //
+            // TS 29.274 §7.2.5: the Bearer Resource Command is relayed by the SGW to the
+            // PGW, which decides. `SERVICE_NOT_SUPPORTED` was the honest answer while no
+            // PGW peer existed — it is no longer, and answering it now would refuse a
+            // procedure this node can carry.
+            let ctx = sgwc_self();
+            match ctx.pgw_s5c_peer() {
+                Some(pgw_peer) => {
+                    let mut relayed = msg.clone();
+                    // Re-addressed to the PGW's control TEID and this node's own
+                    // sequence space, because the SGW-C is the initiator on the S5-C leg.
+                    // The linked bearer names the PDN connection, so the session it
+                    // belongs to is the one whose PGW TEID this command must be
+                    // addressed to. First-of-list would pick the wrong PDN for a
+                    // multi-PDN UE.
+                    let pgw_teid = ue
+                        .as_ref()
+                        .and_then(|u| {
+                            ctx.sess_list_for_ue(u.id).into_iter().find(|s| {
+                                ctx.default_bearer_in_sess(s.id)
+                                    .is_some_and(|b| b.ebi == linked_ebi)
+                            })
+                        })
+                        .map(|s| s.pgw_s5c_teid)
+                        .unwrap_or(0);
+                    relayed.header.teid = Some(pgw_teid);
+                    let s5c_seq = server.alloc_sequence();
+                    relayed.header.sequence_number = s5c_seq;
+                    log::info!(
+                        "Relaying Bearer Resource Command to PGW {pgw_peer} (S5-C TEID \
+                         {pgw_teid:#x}, seq {s5c_seq})"
+                    );
+                    if let Err(e) = server.send_request(pgw_peer, &relayed, 0) {
+                        log::error!("Bearer Resource Command relay to {pgw_peer} failed: {e}");
+                        send_cause_response(
+                            server,
+                            peer,
+                            Gtp2MessageType::BearerResourceFailureIndication,
+                            teid,
+                            seq,
+                            gtp_cause::REMOTE_PEER_NOT_RESPONDING,
+                        );
+                    }
+                }
+                None => {
+                    // Still the honest answer when there is no anchor to ask.
+                    log::info!(
+                        "Bearer Resource Command cannot be forwarded: no PGW S5/S8 peer \
+                         configured"
+                    );
+                    send_cause_response(
+                        server,
+                        peer,
+                        Gtp2MessageType::BearerResourceFailureIndication,
+                        teid,
+                        seq,
+                        gtp_cause::SERVICE_NOT_SUPPORTED,
+                    );
+                }
+            }
         }
         HandlerResult::Error(cause) => {
             send_cause_response(
@@ -1655,6 +2014,20 @@ mod tests {
         ));
         msg.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Imsi as u8, 0, imsi));
         msg.add_ie(Gtp2Ie::from_slice(Gtp2IeType::RatType as u8, 0, &[6]));
+        // A real MME sends both (TS 29.274 Table 7.2.1-1), and the PGW requires them for
+        // an E-UTRAN session, so the fixture sends what the wire actually carries.
+        msg.add_ie(Gtp2Ie::from_slice(
+            Gtp2IeType::ServingNetwork as u8,
+            0,
+            &[0x99, 0xf9, 0x07],
+        ));
+        msg.add_ie(Gtp2Ie::from_slice(
+            Gtp2IeType::Uli as u8,
+            0,
+            &[
+                0x18, 0x99, 0xf9, 0x07, 0x00, 0x01, 0x99, 0xf9, 0x07, 0x00, 0x00, 0x00, 0x01,
+            ],
+        ));
         msg.add_ie(Gtp2FTeidIe::new_ipv4(10, 0xAA01, [127, 0, 0, 1]).to_ie(0));
         msg.add_ie(Gtp2Ie::from_slice(
             Gtp2IeType::Apn as u8,
@@ -1871,6 +2244,268 @@ mod tests {
         .flatten()
     }
 
+    /// A stand-in PGW that answers an S5/S8 Create Session Request with an ALLOCATED
+    /// PDN address and its own F-TEIDs (#52).
+    ///
+    /// This is what makes the chain testable end to end through the SGW-C: S11 in,
+    /// S5/S8 out, S5/S8 in, Sxa out, Sxa in, S11 out. The address it returns is
+    /// deliberately DIFFERENT from anything the MME asks about, so a test can prove the
+    /// PAA the MME receives came from the anchor rather than from its own request.
+    struct StandInPgw {
+        addr: SocketAddr,
+        /// Message types received, in order.
+        seen: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    /// The address this stand-in allocates. Not in 10.45.0.0/16 and not anything a test
+    /// asks for, so its presence in the S11 response can only have come from here.
+    const PGW_ALLOCATED_ADDR: [u8; 4] = [10, 77, 3, 9];
+
+    async fn stand_in_pgw() -> StandInPgw {
+        let sock = std::sync::Arc::new(
+            tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind stand-in PGW"),
+        );
+        let addr = sock.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let handle = sock.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                let Ok((len, from)) = handle.recv_from(&mut buf).await else {
+                    return;
+                };
+                let mut bytes = Bytes::copy_from_slice(&buf[..len]);
+                let Ok(msg) = Gtp2Message::decode(&mut bytes) else {
+                    continue;
+                };
+                recorded
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(msg.header.message_type);
+                if msg.header.message_type != Gtp2MessageType::CreateSessionRequest as u8 {
+                    continue;
+                }
+
+                // Answer as a PGW does: Cause, its own control F-TEID at instance 1, the
+                // ALLOCATED PAA, and a Bearer Context carrying the PGW-U endpoint.
+                let mut resp = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+                    Gtp2MessageType::CreateSessionResponse as u8,
+                    // Addressed to the SGW's own control TEID, which the request's
+                    // Sender F-TEID named.
+                    msg.get_ie(Gtp2IeType::FTeid as u8, 0)
+                        .and_then(|ie| Gtp2FTeidIe::decode(&ie.value).ok())
+                        .map(|ft| ft.teid)
+                        .unwrap_or(0),
+                    msg.header.sequence_number,
+                ));
+                let mut cause_buf = bytes::BytesMut::new();
+                nextgcore_gtp::v2::Gtp2CauseIe::new(gtp_cause::REQUEST_ACCEPTED)
+                    .encode(&mut cause_buf, 0);
+                let mut c = cause_buf.freeze();
+                if let Ok(ie) = nextgcore_gtp::v2::ie::Gtp2Ie::decode(&mut c) {
+                    resp.add_ie(ie);
+                }
+                resp.add_ie(Gtp2FTeidIe::new_ipv4(7, 0x0BEE_F001, [127, 0, 0, 1]).to_ie(1));
+                resp.add_ie(Gtp2PaaIe::ipv4(PGW_ALLOCATED_ADDR).to_ie(0));
+                let mut bc = Gtp2BearerContextIe::new();
+                bc.set_ebi(5);
+                bc.set_fteid(2, &Gtp2FTeidIe::new_ipv4(6, 0x0BEE_F002, [127, 0, 0, 1]));
+                resp.add_bearer_context(0, &bc);
+
+                let _ = handle.send_to(&resp.encode(), from).await;
+            }
+        });
+        let _ = sock;
+        StandInPgw { addr, seen }
+    }
+
+    /// Point the SGW-C at a stand-in PGW. Returns it so the test can assert what it saw.
+    async fn with_stand_in_pgw() -> StandInPgw {
+        let pgw = stand_in_pgw().await;
+        sgwc_self().set_pgw_s5c_peer(Some(pgw.addr));
+        pgw
+    }
+
+    /// #52 criterion 9, the load-bearing assertion of the whole issue: the PDN Address
+    /// the MME receives was ALLOCATED BY THE PGW, not echoed from its own request.
+    ///
+    /// Drives the full chain through the SGW-C over real sockets — S11 in, S5/S8 out,
+    /// S5/S8 in, Sxa out, Sxa in, S11 out — and asserts the address in the S11 Create
+    /// Session Response is the stand-in PGW's, which no other node in the test knows.
+    /// Before #52 the SGW-C copied the MME's PAA onto the session and answered from local
+    /// state, so this assertion could not have held however the test was written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_paa_the_mme_receives_is_allocated_by_the_pgw() {
+        let _sgwu = stand_in_sgwu(
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::from_millis(0),
+        )
+        .await;
+        // Set AFTER `stand_in_sgwu`: that call takes the guard over this process's
+        // ambient SGW-C configuration, and setting the PGW peer before it is exactly the
+        // unlocked-writer race #308 was about.
+        let pgw = with_stand_in_pgw().await;
+        let server = test_server(1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x52];
+
+        sock.send_to(&csr(0x5201, &imsi).encode(), server.local_addr())
+            .unwrap();
+
+        let response = recv_s11(&sock).await.expect("the response must arrive");
+        assert_eq!(
+            response.header.message_type,
+            Gtp2MessageType::CreateSessionResponse as u8
+        );
+        assert_eq!(
+            response
+                .get_ie(Gtp2IeType::Cause as u8, 0)
+                .and_then(|ie| ie.value.first().copied()),
+            Some(gtp_cause::REQUEST_ACCEPTED),
+            "the chain must complete"
+        );
+
+        // The PGW was actually asked. Before #52 the SGW-C never sent an S5/S8 message.
+        assert!(
+            pgw.seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&(Gtp2MessageType::CreateSessionRequest as u8)),
+            "the SGW-C must RELAY a Create Session Request to the PGW (TS 29.274 §7.2.1)"
+        );
+
+        // And the address the MME is given is the anchor's.
+        let paa = response
+            .get_ie(Gtp2IeType::Paa as u8, 0)
+            .and_then(|ie| Gtp2PaaIe::decode(&ie.value).ok())
+            .expect("the response must carry a PAA");
+        assert_eq!(
+            paa.ipv4_addr,
+            Some(PGW_ALLOCATED_ADDR),
+            "the PDN address must be the one the PGW allocated, not the MME's own echoed back"
+        );
+    }
+
+    /// #52: the relayed S5/S8 Create Session Request carries every IE the ANCHOR requires.
+    ///
+    /// Mirrors smfd's `handle_create_session_request` conditional-IE checks, which reject
+    /// with `ConditionalIeMissing` without Serving Network, ULI or PAA. This is the
+    /// cross-daemon parity check #51 needed too: `smfd` is a binary with no lib target, so
+    /// its validation cannot be called from here, and a mirrored list is the strongest
+    /// available guard. It is load-bearing rather than decorative — the first version of
+    /// this PR relayed NEITHER Serving Network nor ULI, and the real anchor refused it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_relayed_s5c_request_carries_what_the_anchor_requires() {
+        let _sgwu = stand_in_sgwu(
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::from_millis(0),
+        )
+        .await;
+        let pgw = with_stand_in_pgw().await;
+        // A recording socket in place of the answering stand-in, so the REQUEST can be
+        // inspected rather than only its effect.
+        let recorder = std::sync::Arc::new(
+            tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind recorder"),
+        );
+        sgwc_self().set_pgw_s5c_peer(Some(recorder.local_addr().unwrap()));
+        let _ = pgw;
+
+        let server = test_server(1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x51];
+        sock.send_to(&csr(0x5101, &imsi).encode(), server.local_addr())
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(3), recorder.recv_from(&mut buf))
+            .await
+            .expect("the SGW-C must relay to the PGW")
+            .expect("recv");
+        let mut bytes = Bytes::copy_from_slice(&buf[..len]);
+        let relayed = Gtp2Message::decode(&mut bytes).expect("the relay must be decodable");
+
+        assert_eq!(
+            relayed.header.message_type,
+            Gtp2MessageType::CreateSessionRequest as u8
+        );
+        for (ie_type, name) in [
+            (Gtp2IeType::Imsi as u8, "IMSI"),
+            (Gtp2IeType::RatType as u8, "RAT Type"),
+            (Gtp2IeType::FTeid as u8, "Sender F-TEID"),
+            (Gtp2IeType::Apn as u8, "APN"),
+            (
+                Gtp2IeType::BearerContext as u8,
+                "Bearer Contexts to be created",
+            ),
+            (Gtp2IeType::ServingNetwork as u8, "Serving Network"),
+            (Gtp2IeType::Uli as u8, "User Location Information"),
+        ] {
+            assert!(
+                relayed.get_ie(ie_type, 0).is_some(),
+                "the anchor requires {name}: without it smfd answers ConditionalIeMissing"
+            );
+        }
+
+        // The Sender F-TEID names the S5/S8 SGW control interface, not S11.
+        let ft = Gtp2FTeidIe::decode(&relayed.get_ie(Gtp2IeType::FTeid as u8, 0).unwrap().value)
+            .expect("decode");
+        assert_eq!(
+            ft.interface_type,
+            s11_build::f_teid_interface::S5_S8_SGW_GTP_C,
+            "the S5/S8 leg must name the S5/S8 interface type"
+        );
+    }
+
+    /// With no PGW configured the SGW-C REFUSES rather than answering from local state.
+    ///
+    /// Answering locally is the defect #52 exists to fix, so the absence of an anchor has
+    /// to be visible to the MME instead of being papered over with a fabricated success.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_session_request_with_no_pgw_is_refused() {
+        let _sgwu = stand_in_sgwu(
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::from_millis(0),
+        )
+        .await;
+        // Deliberately NO anchor, set under the same guard the stand-in SGW-U holds.
+        sgwc_self().set_pgw_s5c_peer(None);
+        let server = test_server(1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x53];
+
+        sock.send_to(&csr(0x5301, &imsi).encode(), server.local_addr())
+            .unwrap();
+
+        let response = recv_s11(&sock)
+            .await
+            .expect("a refusal must still be answered");
+        assert_eq!(
+            response.header.message_type,
+            Gtp2MessageType::CreateSessionResponse as u8
+        );
+        assert_eq!(
+            response
+                .get_ie(Gtp2IeType::Cause as u8, 0)
+                .and_then(|ie| ie.value.first().copied()),
+            Some(gtp_cause::REMOTE_PEER_NOT_RESPONDING),
+            "no anchor must be reported, not fabricated as success"
+        );
+        assert!(
+            response.get_ie(Gtp2IeType::Paa as u8, 0).is_none(),
+            "a refused session must carry no PDN address"
+        );
+    }
+
     /// #54 criterion 6, first half: NO Create Session Response is sent until the PFCP
     /// Session Establishment Response arrives — and then it is the full accepted one.
     ///
@@ -1883,6 +2518,11 @@ mod tests {
             Duration::from_millis(400),
         )
         .await;
+        // #52: the S11 Create Session Request is now RELAYED to a PGW, so the chain
+        // needs an anchor. Set AFTER `stand_in_sgwu`, because that call is what takes the
+        // guard over this process's ambient SGW-C configuration — setting the PGW peer
+        // before it is exactly the unlocked-writer race #308 was about.
+        let _pgw = with_stand_in_pgw().await;
         let server = test_server(1000, 1);
         // The gated answer is sent through the PROCESS-GLOBAL S11 server (the Sxa response
         // path has no other handle), so this test's own server has to be the installed one.
@@ -1984,6 +2624,11 @@ mod tests {
             Duration::ZERO,
         )
         .await;
+        // #52: the S11 Create Session Request is now RELAYED to a PGW, so the chain
+        // needs an anchor. Set AFTER `stand_in_sgwu`, because that call is what takes the
+        // guard over this process's ambient SGW-C configuration — setting the PGW peer
+        // before it is exactly the unlocked-writer race #308 was about.
+        let _pgw = with_stand_in_pgw().await;
         let server = test_server(1000, 1);
         set_s11_server(server.clone());
         let sock = client();
@@ -2025,6 +2670,11 @@ mod tests {
             Duration::ZERO,
         )
         .await;
+        // #52: the S11 Create Session Request is now RELAYED to a PGW, so the chain
+        // needs an anchor. Set AFTER `stand_in_sgwu`, because that call is what takes the
+        // guard over this process's ambient SGW-C configuration — setting the PGW peer
+        // before it is exactly the unlocked-writer race #308 was about.
+        let _pgw = with_stand_in_pgw().await;
         let server = test_server(1000, 1);
         set_s11_server(server.clone());
         let sock = client();
@@ -2087,6 +2737,11 @@ mod tests {
             Duration::ZERO,
         )
         .await;
+        // #52: the S11 Create Session Request is now RELAYED to a PGW, so the chain
+        // needs an anchor. Set AFTER `stand_in_sgwu`, because that call is what takes the
+        // guard over this process's ambient SGW-C configuration — setting the PGW peer
+        // before it is exactly the unlocked-writer race #308 was about.
+        let _pgw = with_stand_in_pgw().await;
         let server = test_server(1000, 1);
         set_s11_server(server.clone());
         let sock = client();
@@ -2154,6 +2809,11 @@ mod tests {
             Duration::ZERO,
         )
         .await;
+        // #52: the S11 Create Session Request is now RELAYED to a PGW, so the chain
+        // needs an anchor. Set AFTER `stand_in_sgwu`, because that call is what takes the
+        // guard over this process's ambient SGW-C configuration — setting the PGW peer
+        // before it is exactly the unlocked-writer race #308 was about.
+        let _pgw = with_stand_in_pgw().await;
         let server = test_server(1000, 1);
         set_s11_server(server.clone());
         let sock = client();
@@ -2219,6 +2879,11 @@ mod tests {
             Duration::ZERO,
         )
         .await;
+        // #52: the S11 Create Session Request is now RELAYED to a PGW, so the chain
+        // needs an anchor. Set AFTER `stand_in_sgwu`, because that call is what takes the
+        // guard over this process's ambient SGW-C configuration — setting the PGW peer
+        // before it is exactly the unlocked-writer race #308 was about.
+        let _pgw = with_stand_in_pgw().await;
         let server = test_server(1000, 1);
         set_s11_server(server.clone());
         let sock = client();
@@ -2282,6 +2947,11 @@ mod tests {
             Duration::ZERO,
         )
         .await;
+        // #52: the S11 Create Session Request is now RELAYED to a PGW, so the chain
+        // needs an anchor. Set AFTER `stand_in_sgwu`, because that call is what takes the
+        // guard over this process's ambient SGW-C configuration — setting the PGW peer
+        // before it is exactly the unlocked-writer race #308 was about.
+        let _pgw = with_stand_in_pgw().await;
         let server = test_server(1000, 1);
         set_s11_server(server.clone());
         let sock = client();
@@ -2403,6 +3073,11 @@ mod tests {
             Duration::ZERO,
         )
         .await;
+        // #52: the S11 Create Session Request is now RELAYED to a PGW, so the chain
+        // needs an anchor. Set AFTER `stand_in_sgwu`, because that call is what takes the
+        // guard over this process's ambient SGW-C configuration — setting the PGW peer
+        // before it is exactly the unlocked-writer race #308 was about.
+        let _pgw = with_stand_in_pgw().await;
         let server = test_server(1000, 1);
         set_s11_server(server.clone());
         let sock = client();
@@ -2435,6 +3110,11 @@ mod tests {
             Duration::ZERO,
         )
         .await;
+        // #52: the S11 Create Session Request is now RELAYED to a PGW, so the chain
+        // needs an anchor. Set AFTER `stand_in_sgwu`, because that call is what takes the
+        // guard over this process's ambient SGW-C configuration — setting the PGW peer
+        // before it is exactly the unlocked-writer race #308 was about.
+        let _pgw = with_stand_in_pgw().await;
         let server = test_server(1000, 1);
         set_s11_server(server.clone());
         let sock = client();

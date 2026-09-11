@@ -74,6 +74,16 @@ pub struct ParsedCreateSessionRequest {
     pub paa: Option<Gtp2PaaIe>,
     pub ambr: Option<Gtp2AmbrIe>,
     pub indication: Option<Gtp2IndicationIe>,
+    /// Serving Network (TS 29.274 §8.18) and User Location Information (§8.21),
+    /// retained so they can be RELAYED on the S5/S8 leg (#52).
+    ///
+    /// Neither was parsed before #52, because nothing relayed anything: the SGW-C
+    /// answered the MME locally. A conformant PGW requires both for an E-UTRAN session —
+    /// this tree's own smfd rejects a Create Session Request without them with
+    /// `ConditionalIeMissing` — so a relay that dropped them would be refused by the very
+    /// anchor it was built to reach. Found by building the anchor, not by inspection.
+    pub serving_network: Option<Vec<u8>>,
+    pub uli: Option<Vec<u8>>,
 }
 
 pub fn parse_create_session_request(
@@ -92,6 +102,14 @@ pub fn parse_create_session_request(
         .value
         .first()
         .ok_or_else(|| IeError::incorrect_mandatory(Gtp2IeType::RatType))?;
+
+    // Serving Network and ULI: relayed verbatim on the S5/S8 leg (#52).
+    let serving_network = msg
+        .get_ie(Gtp2IeType::ServingNetwork as u8, 0)
+        .map(|ie| ie.value.to_vec());
+    let uli = msg
+        .get_ie(Gtp2IeType::Uli as u8, 0)
+        .map(|ie| ie.value.to_vec());
 
     // Sender F-TEID for control plane (M)
     let fteid_ie = require(msg, Gtp2IeType::FTeid, 0)?;
@@ -144,6 +162,8 @@ pub fn parse_create_session_request(
         paa,
         ambr,
         indication,
+        serving_network,
+        uli,
     })
 }
 
