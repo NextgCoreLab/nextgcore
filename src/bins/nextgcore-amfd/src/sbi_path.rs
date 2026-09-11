@@ -1073,6 +1073,79 @@ pub struct SmContextUpdateResponse {
 
 /// Call SMF to update SM context with N1 SM info (UE-initiated modification)
 ///
+/// Call the SMF with an N2 SM transfer and return what it answers (#70).
+///
+/// Generalises [`call_smf_update_sm_context`], which hardcodes
+/// `n2SmInfoType: "PDU_RES_SETUP_RSP"` and DISCARDS the response body. Both are wrong for
+/// mobility: a path switch is `PATH_SWITCH_REQ`, and the whole point of the exchange is the
+/// `PathSwitchRequestAcknowledgeTransfer` the SMF puts in its answer
+/// (TS 29.502 §5.2.2.3.3). Before #70 the AMF never made this call at all and echoed the
+/// gNB's own request transfer back to it instead.
+///
+/// Returns the response's `n2SmInfo` binary part, empty when the SMF sent none — which is
+/// the caller's cue that it has nothing conformant to put in the acknowledge.
+pub async fn call_smf_update_sm_context_n2(
+    smf_host: &str,
+    smf_port: u16,
+    sm_context_ref: &str,
+    n2_sm_info_type: &str,
+    n2_sm_info: &[u8],
+) -> SbiResult<SmContextUpdateResponse> {
+    log::info!(
+        "Calling SMF SM Context Update ({n2_sm_info_type}): ref={sm_context_ref}, \
+         n2_len={}",
+        n2_sm_info.len()
+    );
+
+    let client = crate::attach_oauth2(
+        SbiClient::for_peer(smf_host, smf_port),
+        nextgcore_sbi::types::NfType::Smf,
+    );
+
+    let body = serde_json::json!({
+        "n2SmInfo": { "contentId": "n2SmInfo" },
+        "n2SmInfoType": n2_sm_info_type,
+    });
+
+    let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify");
+    let request = SbiRequest::post(&path)
+        .with_body(body.to_string(), content_type::APPLICATION_JSON)
+        .with_part(SbiPart::with_content(
+            "n2SmInfo",
+            content_type::APPLICATION_NGAP,
+            bytes::Bytes::copy_from_slice(n2_sm_info),
+        ));
+    let response = client
+        .send_request(request)
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("SMF update failed: {e}")))?;
+
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "SMF update ({n2_sm_info_type}) returned status {}",
+            response.status
+        )));
+    }
+
+    let response_body: serde_json::Value = response
+        .http
+        .content
+        .as_deref()
+        .and_then(|c| serde_json::from_str(c).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let n2_sm_info = extract_binary_ref(&response, &response_body, "n2SmInfo").unwrap_or_default();
+
+    log::info!(
+        "SMF SM Context Updated ({n2_sm_info_type}): ref={sm_context_ref}, \
+         answered n2_len={}",
+        n2_sm_info.len()
+    );
+    Ok(SmContextUpdateResponse {
+        n1_sm_msg: Vec::new(),
+        n2_sm_info,
+    })
+}
+
 /// Sends POST /nsmf-pdusession/v1/sm-contexts/{ref}/modify with N1 SM info
 /// from UE's PDU Session Modification Request. Returns updated N1+N2 from SMF.
 pub async fn call_smf_update_sm_context_with_n1(
