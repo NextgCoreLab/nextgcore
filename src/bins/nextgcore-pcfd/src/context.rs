@@ -429,6 +429,27 @@ pub struct PlmnPresence {
 }
 
 /// PCF Session context
+/// An SM policy association the PCF could not restore (issue #193).
+///
+/// The typed `PcfSess` deserialisation is per-record so one schema change does
+/// not discard the whole snapshot. What that leaves is an association the SMF
+/// still holds and the PCF has no record of: the next `Npcf_SMPolicyControl`
+/// update or delete gets 404, with no explanation.
+///
+/// TS 29.512 §4.2.4 defines the message for closing it honestly -- POST
+/// `{notificationUri}/terminate` with a `TerminationNotification` -- and both
+/// members here are salvaged from the RAW record, since it failed typed
+/// deserialisation rather than JSON parsing.
+#[derive(Debug, Clone)]
+pub struct UnrestorableAssociation {
+    /// The resource id the SMF holds, if salvageable.
+    pub sm_policy_id: Option<String>,
+    /// The SMF's callback, if salvageable.
+    pub notification_uri: Option<String>,
+    /// What went wrong, for the operator log and the termination cause.
+    pub reason: String,
+}
+
 /// Port of pcf_sess_t from context.h
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PcfSess {
@@ -1244,6 +1265,10 @@ pub struct PcfContext {
     ue_sm_list: RwLock<HashMap<u64, PcfUeSm>>,
     /// Session list (by pool ID)
     sess_list: RwLock<HashMap<u64, PcfSess>>,
+    /// SM policy associations a restore could not reinstate (issue #193).
+    /// Declared beside `sess_list` because it describes records that failed to
+    /// land there.
+    unrestorable_associations: RwLock<Vec<UnrestorableAssociation>>,
     /// App session list (by pool ID)
     app_list: RwLock<HashMap<u64, PcfApp>>,
     /// SUPI -> UE AM ID hash
@@ -1319,6 +1344,7 @@ impl PcfContext {
             ue_am_list: RwLock::new(HashMap::new()),
             ue_sm_list: RwLock::new(HashMap::new()),
             sess_list: RwLock::new(HashMap::new()),
+            unrestorable_associations: RwLock::new(Vec::new()),
             app_list: RwLock::new(HashMap::new()),
             supi_am_hash: RwLock::new(HashMap::new()),
             supi_sm_hash: RwLock::new(HashMap::new()),
@@ -1621,6 +1647,37 @@ impl PcfContext {
     /// Each counter becomes `max(persisted, max_restored_id + 1)`: persisting
     /// alone trusts a value that could predate the records, recomputing alone
     /// would reuse a deleted record's id.
+    /// Policy associations this restore could not reinstate, with whatever
+    /// consumer callback could be salvaged (issue #193).
+    ///
+    /// See [`UnrestorableAssociation`]. Drained once at boot by
+    /// `sbi_path::pcf_notify_unrestorable_at_boot`; not persisted, because it
+    /// describes one restore rather than durable state.
+    pub fn take_unrestorable_associations(&self) -> Vec<UnrestorableAssociation> {
+        match self.unrestorable_associations.write() {
+            Ok(mut p) => std::mem::take(&mut *p),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Queue an unrestorable association without a snapshot, for the wire test
+    /// in `sbi_path` (#193). `restore_from` is the only production writer.
+    #[cfg(test)]
+    pub fn queue_unrestorable_association_for_test(
+        &self,
+        sm_policy_id: Option<String>,
+        notification_uri: Option<String>,
+        reason: String,
+    ) {
+        if let Ok(mut pending) = self.unrestorable_associations.write() {
+            pending.push(UnrestorableAssociation {
+                sm_policy_id,
+                notification_uri,
+                reason,
+            });
+        }
+    }
+
     fn restore_from(
         &self,
         doc: &serde_json::Value,
@@ -1660,10 +1717,54 @@ impl PcfContext {
 
         let ue_ams: Vec<PcfUeAm> = records(doc, "ueAms");
         let ue_sms: Vec<PcfUeSm> = records(doc, "ueSms");
-        let sessions: Vec<PcfSess> = records(doc, "sessions");
+
+        // #193: a skipped `sessions` record is an SM policy association the SMF
+        // still believes in. TS 29.512 §4.2.4 defines the message for exactly this
+        // -- POST {notificationUri}/terminate -- so the association can be closed
+        // honestly instead of answering 404 the next time the SMF touches it. Both
+        // members are salvaged from the RAW record: the record failed TYPED
+        // deserialisation, not JSON parsing, so they are still readable.
+        let mut unrestorable: Vec<UnrestorableAssociation> = Vec::new();
+        let sessions: Vec<PcfSess> = doc
+            .get("sessions")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| match serde_json::from_value::<PcfSess>(v.clone()) {
+                        Ok(t) => Some(t),
+                        Err(e) => {
+                            log::warn!("skipping unreadable PCF sessions record: {e}");
+                            unrestorable.push(UnrestorableAssociation {
+                                sm_policy_id: v
+                                    .get("sm_policy_id")
+                                    .and_then(|i| i.as_str())
+                                    .map(str::to_string),
+                                notification_uri: v
+                                    .get("notification_uri")
+                                    .and_then(|u| u.as_str())
+                                    .map(str::to_string),
+                                reason: format!("policy association could not be restored: {e}"),
+                            });
+                            None
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let apps: Vec<PcfApp> = records(doc, "apps");
         let event_subs: Vec<PcEventSubscription> = records(doc, "eventSubs");
         let restored = ue_ams.len() + ue_sms.len() + sessions.len() + apps.len() + event_subs.len();
+        if !unrestorable.is_empty() {
+            log::error!(
+                "{} SM policy association(s) could not be restored: the SMF still holds them and \
+                 would get 404 on its next update. Their consumers are notified at boot where a \
+                 notificationUri could be salvaged.",
+                unrestorable.len()
+            );
+            if let Ok(mut pending) = self.unrestorable_associations.write() {
+                pending.extend(unrestorable);
+            }
+        }
 
         let mut max_ue_am = 0u64;
         let mut max_ue_sm = 0u64;
@@ -2517,6 +2618,99 @@ mod tests {
         ctx.set_state_file(path.to_path_buf())
             .expect("arming a fresh state file must succeed");
         ctx
+    }
+
+    // ── #193: an association the PCF cannot restore ──
+
+    /// A `sessions` record that fails TYPED deserialisation still yields the
+    /// SMF's `notificationUri` and the resource id, because the file is valid JSON.
+    ///
+    /// That salvage is the whole basis of the boot-time termination: without it
+    /// the PCF knows an association is unusable and has no way to say so.
+    #[test]
+    fn an_unrestorable_association_yields_a_salvaged_callback_and_resource_id() {
+        let path = temp_state_path("unrestorable-assoc");
+        // `psi` is a u8 on `PcfSess`, so a string fails deserialisation while the
+        // object stays perfectly good JSON -- what a schema move looks like.
+        let doc = serde_json::json!({
+            "version": PcfContext::SNAPSHOT_VERSION,
+            "ueAms": [],
+            "ueSms": [],
+            "sessions": [{
+                "sm_policy_id": "pol-193-1",
+                "psi": "not-a-number",
+                "notification_uri": "http://smf.example/callbacks/sm-policy"
+            }],
+            "apps": [],
+            "eventSubs": []
+        });
+        std::fs::write(&path, serde_json::to_string(&doc).expect("json")).expect("write snapshot");
+
+        let ctx = ctx_with_state(&path);
+        let pending = ctx.take_unrestorable_associations();
+
+        assert_eq!(pending.len(), 1, "the skipped association must be recorded");
+        assert_eq!(pending[0].sm_policy_id.as_deref(), Some("pol-193-1"));
+        assert_eq!(
+            pending[0].notification_uri.as_deref(),
+            Some("http://smf.example/callbacks/sm-policy"),
+            "the callback must be SALVAGED from the raw record, or the SMF cannot be told"
+        );
+        assert!(
+            pending[0].reason.contains("could not be restored"),
+            "the reason carries the deserialisation error, reason was {:?}",
+            pending[0].reason
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The list is DRAINED: a second read is empty, so a later boot cannot
+    /// terminate an association the SMF released long ago.
+    #[test]
+    fn unrestorable_associations_are_taken_once() {
+        let path = temp_state_path("unrestorable-assoc-once");
+        let doc = serde_json::json!({
+            "version": PcfContext::SNAPSHOT_VERSION,
+            "sessions": [{
+                "sm_policy_id": "pol-193-2",
+                "psi": "not-a-number",
+                "notification_uri": "http://smf.example/callbacks/sm-policy"
+            }]
+        });
+        std::fs::write(&path, serde_json::to_string(&doc).expect("json")).expect("write snapshot");
+
+        let ctx = ctx_with_state(&path);
+        assert_eq!(ctx.take_unrestorable_associations().len(), 1);
+        assert!(
+            ctx.take_unrestorable_associations().is_empty(),
+            "the list must be drained, not re-read"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A well-formed snapshot queues nothing. Without this, "record the failures"
+    /// could be satisfied by a version that records every record.
+    #[test]
+    fn a_readable_snapshot_queues_no_unrestorable_association() {
+        let path = temp_state_path("unrestorable-assoc-clean");
+        let sess_id = {
+            let ctx = ctx_with_state(&path);
+            let (_, _, sess, _) = populate(&ctx);
+            ctx.persist();
+            sess.sm_policy_id
+        };
+
+        let restored = ctx_with_state(&path);
+
+        assert!(
+            restored.take_unrestorable_associations().is_empty(),
+            "every record read cleanly, so nothing is unrestorable"
+        );
+        assert!(
+            restored.sess_find_by_sm_policy_id(&sess_id).is_some(),
+            "precondition: the association really did restore"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Populate one of everything, with the nested trees filled in so a round

@@ -317,6 +317,19 @@ pub async fn run() -> Result<()> {
         // and the store would then refuse every later write to protect the file.
         let restored = guard.set_state_file(std::path::PathBuf::from(&path))?;
         log::info!("PCF durable state: {path} ({restored} record(s) restored)");
+        // Release the context lock first: the notifier takes its own read guard,
+        // and `std::sync::RwLock` is not reentrant.
+        drop(guard);
+        // #193: an association the PCF could not restore is one the SMF still
+        // holds. Terminate it (TS 29.512 §4.2.4) before the SBI server accepts
+        // anything, so no update arrives for a policy that is already gone.
+        let (notified, unnotifiable) = crate::sbi_path::pcf_notify_unrestorable_associations();
+        if notified + unnotifiable > 0 {
+            log::warn!(
+                "PCF boot restoration signalling: {notified} association(s) terminated toward \
+                 the SMF, {unnotifiable} unreachable"
+            );
+        }
     } else {
         log::info!(
             "PCF durable state disabled (no --state-file / NEXTGCORE_PCF_STATE_FILE): \

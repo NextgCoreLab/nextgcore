@@ -51,6 +51,7 @@ mod pfcp_sm;
 mod policy;
 #[cfg(test)]
 mod property_tests;
+mod restoration; // #193: restoration signalling for resources the UPF no longer holds
 mod session_extensions; // #199-#201: IPv6 dual-stack, SSC modes, Ethernet PDU
 pub mod slicing; // Rel-17: per-slice QoS profiles
 mod smf_sm;
@@ -562,6 +563,21 @@ async fn main() -> Result<()> {
         // write to protect the file, so the run would be silently non-durable too.
         let restored = guard.set_state_file(std::path::PathBuf::from(&path))?;
         log::info!("SMF durable state: {path} ({restored} record(s) restored)");
+        // The context lock must be released before the notifier runs: it takes its
+        // own read guard, and `std::sync::RwLock` is not reentrant.
+        drop(guard);
+        // #193: a restored session whose policy binding did not survive is unusable
+        // and its consumer still believes in it. This is the ONE restoration signal
+        // that belongs at boot -- it needs no evidence from the UPF -- and it runs
+        // before the SBI server accepts anything, so no update can arrive for a
+        // session that is about to be dropped.
+        let (notified, unnotifiable) = restoration::notify_unrestorable_at_boot().await;
+        if notified + unnotifiable > 0 {
+            log::warn!(
+                "SMF boot restoration signalling: {notified} consumer(s) notified, \
+                 {unnotifiable} unreachable"
+            );
+        }
     } else {
         log::info!(
             "SMF durable state disabled (no --state-file / NEXTGCORE_SMF_STATE_FILE): PFCP \
@@ -2090,10 +2106,19 @@ async fn pfcp_session_modify(
             log::info!("PFCP Session Modification successful");
             Ok(())
         }
-        Some(cause) => anyhow::bail!(
-            "PFCP Session Modification rejected: cause {cause} ({})",
-            pfcp_path::cause_name(cause)
-        ),
+        Some(cause) => {
+            // #193: cause 65 means the UPF has no such session, so the SMF must
+            // stop treating it as live and tell the AMF. Every other cause is
+            // about the request, and dropping the session on those would destroy
+            // a live one over a malformed message.
+            if restoration::cause_means_session_gone(cause) {
+                restoration::reconcile_session_not_found(upf_seid).await;
+            }
+            anyhow::bail!(
+                "PFCP Session Modification rejected: cause {cause} ({})",
+                pfcp_path::cause_name(cause)
+            )
+        }
         None => anyhow::bail!("PFCP Session Modification Response missing mandatory Cause IE"),
     }
 }
@@ -2130,10 +2155,18 @@ async fn pfcp_session_delete(smf_n4_seid: u64, upf_seid: u64) -> Result<()> {
             log::info!("PFCP Session Deletion successful");
             Ok(())
         }
-        Some(cause) => anyhow::bail!(
-            "PFCP Session Deletion rejected: cause {cause} ({})",
-            pfcp_path::cause_name(cause)
-        ),
+        Some(cause) => {
+            // #193: a deletion the UPF answers with "no such context" has already
+            // achieved its purpose at the UPF; what remains is the SMF's own
+            // belief in the session, which reconciliation removes.
+            if restoration::cause_means_session_gone(cause) {
+                restoration::reconcile_session_not_found(upf_seid).await;
+            }
+            anyhow::bail!(
+                "PFCP Session Deletion rejected: cause {cause} ({})",
+                pfcp_path::cause_name(cause)
+            )
+        }
         None => anyhow::bail!("PFCP Session Deletion Response missing mandatory Cause IE"),
     }
 }
@@ -3468,6 +3501,12 @@ async fn pfcp_update_session_qer(
         .map_err(|e| anyhow::anyhow!("PFCP Session Modification (QoS) failed: {e}"))?;
     match pfcp_path::parse_cause(&resp_body) {
         Some(pfcp_path::pfcp_cause::REQUEST_ACCEPTED) => Ok(()),
+        Some(cause) if restoration::cause_means_session_gone(cause) => {
+            // #193: see `pfcp_session_modify` -- the SMF and UPF disagree about
+            // this session's existence and the UPF is authoritative.
+            restoration::reconcile_session_not_found(upf_seid).await;
+            anyhow::bail!("PFCP Session Modification (QoS) rejected: cause={cause}")
+        }
         cause => anyhow::bail!("PFCP Session Modification (QoS) rejected: cause={cause:?}"),
     }
 }
@@ -3492,6 +3531,11 @@ async fn pfcp_deactivate_dl_far(smf_n4_seid: u64, upf_seid: u64) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("PFCP DL FAR deactivation failed: {e}"))?;
     match pfcp_path::parse_cause(&resp_body) {
         Some(pfcp_path::pfcp_cause::REQUEST_ACCEPTED) => Ok(()),
+        Some(cause) if restoration::cause_means_session_gone(cause) => {
+            // #193: as above.
+            restoration::reconcile_session_not_found(upf_seid).await;
+            anyhow::bail!("PFCP DL FAR deactivation rejected: cause={cause}")
+        }
         cause => anyhow::bail!("PFCP DL FAR deactivation rejected: cause={cause:?}"),
     }
 }
@@ -8044,6 +8088,129 @@ mod tests {
     ///
     /// Positive assertions throughout: each reads a value only reachable by
     /// executing the step it names, so no early return can satisfy them.
+    // ── #193: the SMF stops believing a session the UPF says it does not have ──
+
+    /// Criterion 3 driven over a REAL N4 round trip, from the production entry
+    /// point, rather than by calling the reconciler directly.
+    ///
+    /// The stand-in UPF is told to answer Session Modification with cause 65
+    /// ("Session context not found"), which is what a UPF says about a session it
+    /// has no context for -- the shape a restored snapshot produces when the UPF
+    /// dropped the session without restarting, so the Recovery Time Stamp
+    /// interlock #191 added cannot see it.
+    ///
+    /// This is the test that guards the WIRING at the four N4 call sites.
+    /// `restoration`'s own tests would all still pass with every one of them
+    /// removed.
+    #[tokio::test]
+    async fn a_cause_65_modification_drops_the_session_and_notifies_the_amf() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        smf_context_init(64, 256, 512);
+
+        let posts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let bodies: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_posts = std::sync::Arc::clone(&posts);
+        let sink_bodies = std::sync::Arc::clone(&bodies);
+        let (amf, amf_addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let posts = std::sync::Arc::clone(&sink_posts);
+                let bodies = std::sync::Arc::clone(&sink_bodies);
+                async move {
+                    posts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(c) = req.http.content.as_deref() {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(c) {
+                            if let Ok(mut b) = bodies.lock() {
+                                b.push(v);
+                            }
+                        }
+                    }
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await;
+        let status_uri = format!("http://127.0.0.1:{}/callbacks/sm-status", amf_addr.port());
+
+        // A session the SMF believes in -- as a restored snapshot would leave it --
+        // whose AMF supplied a status callback.
+        let sm_context_ref = "cause65-ref";
+        // A SEID of this test's own rather than the stand-in's constant
+        // `upf_seid`: every other test that establishes a session against the
+        // stand-in maps its own reference to that SAME value, so a reverse lookup
+        // on it is ambiguous and this test failed 1 run in 5 on `HashMap`
+        // iteration order. The stand-in answers whatever SEID it is sent.
+        let seid = 0x0193_4000_u64;
+        {
+            let global = smf_self();
+            let ctx = global.read().expect("context");
+            {
+                let mut sessions = ctx.pfcp_sessions.write().expect("sessions");
+                sessions.insert(sm_context_ref.to_string(), seid);
+            }
+            let mut b = context::PolicyBinding::snapshot_default();
+            b.supi = "imsi-001010000000193".to_string();
+            b.psi = 7;
+            b.sm_context_status_uri = Some(status_uri.clone());
+            ctx.policy_bindings
+                .write()
+                .expect("bindings")
+                .insert(sm_context_ref.to_string(), b);
+        }
+
+        upf.answer_sessions_with(pfcp_path::pfcp_cause::SESSION_CONTEXT_NOT_FOUND);
+        let result = pfcp_session_modify(upf.upf_seid, seid, 0x1234, [10, 0, 0, 1]).await;
+
+        let still_live = {
+            let global = smf_self();
+            let ctx = global.read().expect("context");
+            let sessions = ctx.pfcp_sessions.read().expect("sessions");
+            let present = sessions.contains_key(sm_context_ref);
+            present
+        };
+        {
+            let global = smf_self();
+            let ctx = global.read().expect("context");
+            {
+                let mut sessions = ctx.pfcp_sessions.write().expect("sessions");
+                sessions.remove(sm_context_ref);
+            }
+            ctx.policy_bindings
+                .write()
+                .expect("bindings")
+                .remove(sm_context_ref);
+        }
+        let seen_posts = posts.load(std::sync::atomic::Ordering::SeqCst);
+        let seen_bodies = bodies.lock().expect("bodies").clone();
+        amf.stop().await.expect("stop amf");
+
+        assert!(
+            result.is_err(),
+            "a rejected modification is still an error to its caller"
+        );
+        assert!(
+            upf.seen()
+                .contains(&pfcp_path::pfcp_message_type::SESSION_MODIFICATION_REQUEST),
+            "the round trip really happened -- asserted from the stand-in's own record"
+        );
+        assert!(
+            !still_live,
+            "the UPF is authoritative: a session it has no context for must not stay in the \
+             SMF's session map, or every later request repeats the same round trip to the same \
+             answer"
+        );
+        assert_eq!(
+            seen_posts, 1,
+            "the AMF holds a context for this session and must be told it is gone"
+        );
+        assert_eq!(
+            seen_bodies[0]["statusInfo"]["resourceStatus"], "RELEASED",
+            "body was {:?}",
+            seen_bodies[0]
+        );
+    }
+
     #[tokio::test]
     async fn a_successful_create_registers_an_activated_session_and_its_binding() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;

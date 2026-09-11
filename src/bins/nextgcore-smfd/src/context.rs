@@ -1702,6 +1702,15 @@ pub struct SmfContext {
     /// SM policy bindings: sm_context_ref -> PCF policy association + GSM FSM
     pub policy_bindings: RwLock<HashMap<String, PolicyBinding>>,
 
+    /// Sessions a restore could not fully reinstate, with whatever consumer
+    /// callback could be salvaged (issue #193).
+    ///
+    /// Populated by [`Self::restore_from`] and drained once at boot by
+    /// `restoration::notify_unrestorable_at_boot`. Not persisted: it describes one
+    /// restore, not durable state, and re-notifying on every subsequent boot would
+    /// tell an AMF about a context it released long ago.
+    pub unrestorable_sessions: RwLock<Vec<UnrestorableSession>>,
+
     /// Last Recovery Time Stamp each UPF peer reported, keyed by the peer's
     /// socket address (issue #191).
     ///
@@ -1722,6 +1731,29 @@ pub struct SmfContext {
     /// functions: it enforces "never overwrite a snapshot you could not read"
     /// internally, and a new adopter has no reason to take that on manually.
     state: nextgcore_core::state_store::StateStore,
+}
+
+/// A session the SMF restored but cannot actually serve, because the record that
+/// carried its policy state did not survive (issue #193).
+///
+/// The typed `PolicyBinding` deserialisation is per-record precisely so one
+/// schema change does not discard the whole snapshot -- but a session whose
+/// binding is gone has no PCF association, no authorized QoS and no GSM FSM
+/// state, so the SMF can neither modify nor cleanly release it. The consumer
+/// still believes it exists.
+///
+/// `status_uri` is salvaged from the RAW JSON of the failed record rather than
+/// from the typed value, which is the whole point: the file was already validated
+/// as JSON by the store, so `smContextStatusUri` is still readable even when the
+/// record as a whole is not. Without that salvage there would be nobody to tell.
+#[derive(Debug, Clone)]
+pub struct UnrestorableSession {
+    /// The key the AMF holds.
+    pub sm_context_ref: String,
+    /// The AMF's status callback, if it could be salvaged.
+    pub status_uri: Option<String>,
+    /// What went wrong, for the operator-facing log and the notification cause.
+    pub reason: String,
 }
 
 /// Why smfd durable state could not be loaded (issue #191).
@@ -1788,6 +1820,7 @@ impl SmfContext {
                 .unwrap_or(std::net::Ipv4Addr::new(127, 0, 0, 1)),
             initialized: AtomicBool::new(false),
             pfcp_sessions: RwLock::new(HashMap::new()),
+            unrestorable_sessions: RwLock::new(Vec::new()),
             policy_bindings: RwLock::new(HashMap::new()),
             upf_recovery_time_stamps: RwLock::new(HashMap::new()),
             state: nextgcore_core::state_store::StateStore::disabled(),
@@ -1969,16 +2002,35 @@ impl SmfContext {
         // Per-record, so one binding whose schema moved does not discard the rest:
         // the file was already validated as JSON by the store, so a bad record
         // means a schema change, not corruption.
+        // #193: a skipped binding is not merely lost state. The session under the
+        // same key restores independently below, so the SMF ends up holding a PDU
+        // session with no PCF association, no authorized QoS and no FSM state --
+        // one it can neither modify nor cleanly release -- while the AMF still
+        // believes in it. The consumer callback is salvaged from the RAW record so
+        // boot has somebody to tell; the record failed TYPED deserialisation, not
+        // JSON parsing, so the field is still readable.
+        let mut unrestorable: Vec<UnrestorableSession> = Vec::new();
         let policy_bindings: HashMap<String, PolicyBinding> = doc
             .get("policyBindings")
             .and_then(|v| v.as_object().cloned())
             .map(|obj| {
                 obj.into_iter()
-                    .filter_map(|(k, v)| match serde_json::from_value::<PolicyBinding>(v) {
-                        Ok(b) => Some((k, b)),
-                        Err(e) => {
-                            log::warn!("skipping unreadable SMF policy binding {k}: {e}");
-                            None
+                    .filter_map(|(k, v)| {
+                        let salvaged = v
+                            .get("smContextStatusUri")
+                            .and_then(|u| u.as_str())
+                            .map(str::to_string);
+                        match serde_json::from_value::<PolicyBinding>(v) {
+                            Ok(b) => Some((k, b)),
+                            Err(e) => {
+                                log::warn!("skipping unreadable SMF policy binding {k}: {e}");
+                                unrestorable.push(UnrestorableSession {
+                                    sm_context_ref: k,
+                                    status_uri: salvaged,
+                                    reason: format!("policy binding could not be restored: {e}"),
+                                });
+                                None
+                            }
                         }
                     })
                     .collect()
@@ -2024,6 +2076,31 @@ impl SmfContext {
             if self.ipv4_pool.reserve(*addr) {
                 n_addrs += 1;
             }
+        }
+
+        // #193: only sessions that actually restored are worth signalling about --
+        // an entry for a binding with no session under the same key describes
+        // nothing the consumer can be told is released.
+        let n_unrestorable = {
+            let sessions_present: Vec<UnrestorableSession> = match self.pfcp_sessions.read() {
+                Ok(map) => unrestorable
+                    .into_iter()
+                    .filter(|u| map.contains_key(&u.sm_context_ref))
+                    .collect(),
+                Err(_) => Vec::new(),
+            };
+            let n = sessions_present.len();
+            if let Ok(mut pending) = self.unrestorable_sessions.write() {
+                pending.extend(sessions_present);
+            }
+            n
+        };
+        if n_unrestorable > 0 {
+            log::error!(
+                "{n_unrestorable} restored PFCP session(s) have NO policy binding: the SMF can \
+                 neither modify nor cleanly release them. Their consumers are notified at boot \
+                 where a callback could be salvaged."
+            );
         }
 
         let restored = n_sessions + n_bindings + n_addrs;
@@ -3370,6 +3447,100 @@ mod tests {
         b.fsm.state = state;
         b.easdf_dns_context_id = Some("dns-ctx-9".to_string());
         b
+    }
+
+    // ── #193: a session whose binding record did not survive ──
+
+    /// A snapshot whose binding record cannot be typed still yields its consumer
+    /// callback, because the file is valid JSON and only the TYPED read failed.
+    ///
+    /// That salvage is what makes a boot-time notification possible at all. It is
+    /// asserted here, on the context, rather than only through the notifier: the
+    /// notifier can be given the entry by any means, and what must hold is that
+    /// `restore_from` produces it from a record it could not read.
+    #[test]
+    fn an_unreadable_binding_yields_its_session_and_a_salvaged_callback() {
+        let path = temp_state_path("unrestorable");
+        // Hand-written snapshot: `policyBindings` holds a record with a member of
+        // the wrong TYPE, which is what a schema move looks like. `psi` is a u8 in
+        // `PolicyBinding`, so a string fails deserialisation while the object
+        // remains perfectly good JSON.
+        let doc = serde_json::json!({
+            "version": SmfContext::SNAPSHOT_VERSION,
+            "pfcpSessions": { "orphan-ref": 0x0193_2000u64 },
+            "policyBindings": {
+                "orphan-ref": {
+                    "psi": "not-a-number",
+                    "smContextStatusUri": "http://amf.example/callbacks/sm-status"
+                }
+            },
+            "ipv4Allocations": [],
+            "upfRecoveryTimeStamps": {}
+        });
+        std::fs::write(&path, serde_json::to_string(&doc).expect("json")).expect("write snapshot");
+
+        let ctx = ctx_with_state(&path);
+
+        assert!(
+            ctx.policy_bindings
+                .read()
+                .expect("bindings")
+                .get("orphan-ref")
+                .is_none(),
+            "precondition: the binding record must have been skipped"
+        );
+        assert_eq!(
+            ctx.pfcp_sessions
+                .read()
+                .expect("sessions")
+                .get("orphan-ref")
+                .copied(),
+            Some(0x0193_2000),
+            "the session restores independently -- which is exactly why it is left \
+             unserviceable"
+        );
+        let pending = ctx.unrestorable_sessions.read().expect("pending").clone();
+        assert_eq!(pending.len(), 1, "the orphaned session must be recorded");
+        assert_eq!(pending[0].sm_context_ref, "orphan-ref");
+        assert_eq!(
+            pending[0].status_uri.as_deref(),
+            Some("http://amf.example/callbacks/sm-status"),
+            "the callback must be SALVAGED from the raw record; without it there is nobody to \
+             notify and the whole boot signal is impossible"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A skipped binding with NO session under the same key is not a stranded
+    /// resource: there is nothing the consumer could be told is released, so it
+    /// must not be queued for notification.
+    #[test]
+    fn an_unreadable_binding_with_no_session_is_not_queued() {
+        let path = temp_state_path("unrestorable-no-session");
+        let doc = serde_json::json!({
+            "version": SmfContext::SNAPSHOT_VERSION,
+            "pfcpSessions": {},
+            "policyBindings": {
+                "binding-only-ref": {
+                    "psi": "not-a-number",
+                    "smContextStatusUri": "http://amf.example/callbacks/sm-status"
+                }
+            },
+            "ipv4Allocations": [],
+            "upfRecoveryTimeStamps": {}
+        });
+        std::fs::write(&path, serde_json::to_string(&doc).expect("json")).expect("write snapshot");
+
+        let ctx = ctx_with_state(&path);
+
+        assert!(
+            ctx.unrestorable_sessions
+                .read()
+                .expect("pending")
+                .is_empty(),
+            "with no session there is no stranded resource, so notifying would invent one"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The whole point of #191: a session created before a restart, and the

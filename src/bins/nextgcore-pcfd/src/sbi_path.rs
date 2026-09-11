@@ -729,6 +729,82 @@ pub fn pcf_sbi_send_smpolicycontrol_delete_notify(sess_id: u64, app_session_id: 
     spawn_notification(uri, "/update", body, "SM policy delete")
 }
 
+/// Tell the SMF that SM policy associations this boot could not restore are
+/// terminated (issue #193, TS 29.512 §4.2.4).
+///
+/// # Why at boot, and why this message
+///
+/// A `sessions` record that failed typed deserialisation leaves the SMF holding
+/// an `Npcf_SMPolicyControl` association the PCF has no record of. Every later
+/// update or delete on it gets 404, with nothing saying why, and the SMF has no
+/// way to distinguish that from a request it got wrong. TS 29.512 §4.2.4 defines
+/// exactly the signal for this -- `POST {notificationUri}/terminate` carrying a
+/// `TerminationNotification` -- so the association can be closed rather than left
+/// to rot.
+///
+/// This needs no evidence from any peer: the PCF knows at restore time that it
+/// cannot serve the association. That is what makes it a boot-time signal, unlike
+/// the SMF's session-level restoration, which has to wait for the UPF to say which
+/// incarnation answered.
+///
+/// Drains the pending list, so a second call is a no-op: re-notifying on a later
+/// boot would terminate an association the SMF released long ago.
+///
+/// Returns `(notified, unnotifiable)`.
+pub fn pcf_notify_unrestorable_associations() -> (usize, usize) {
+    let pending = match crate::context::pcf_self().read() {
+        Ok(ctx) => ctx.take_unrestorable_associations(),
+        Err(_) => Vec::new(),
+    };
+    if pending.is_empty() {
+        return (0, 0);
+    }
+    let mut notified = 0usize;
+    let mut unnotifiable = 0usize;
+    for entry in &pending {
+        match (
+            entry.notification_uri.as_deref(),
+            entry.sm_policy_id.as_deref(),
+        ) {
+            (Some(uri), Some(id)) => {
+                log::warn!(
+                    "boot restoration: SM policy association {id} cannot be served ({}); \
+                     terminating it toward {uri}",
+                    entry.reason
+                );
+                // TS 29.512 TerminationNotification: the resource the consumer
+                // holds, plus a cause. UNSPECIFIED because none of the enumerated
+                // causes describes "the producer lost its own record" -- inventing a
+                // closer-sounding one would misreport what happened.
+                let body = serde_json::json!({
+                    "resourceUri": format!("/npcf-smpolicycontrol/v1/sm-policies/{id}"),
+                    "cause": "UNSPECIFIED",
+                });
+                if spawn_notification(uri.to_string(), "/terminate", body, "SM policy terminate") {
+                    notified += 1;
+                } else {
+                    unnotifiable += 1;
+                }
+            }
+            _ => {
+                log::error!(
+                    "boot restoration: an SM policy association cannot be served ({}) and its \
+                     record yielded no notificationUri/smPolicyId pair, so the SMF will not learn \
+                     of this from us -- it will see a 404 on its next update",
+                    entry.reason
+                );
+                unnotifiable += 1;
+            }
+        }
+    }
+    log::warn!(
+        "boot restoration: {} unrestorable SM policy association(s); {notified} terminated \
+         toward the SMF, {unnotifiable} with no reachable consumer",
+        pending.len()
+    );
+    (notified, unnotifiable)
+}
+
 /// Send policy authorization terminate notify to the AF over HTTP
 /// (TS 29.514 §4.2.5.2: POST {notifUri}/terminate with TerminationInfo).
 pub fn pcf_sbi_send_policyauthorization_terminate_notify(app_id: u64) -> bool {
@@ -1738,6 +1814,106 @@ pub fn pcf_sess_deregister_bsf_binding(binding_id: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── #193: the boot-time SM policy termination reaches the SMF ──
+
+    /// The wire assertion for #193's PCF half: a salvaged association produces a
+    /// real `POST {notificationUri}/terminate` carrying a `TerminationNotification`
+    /// (TS 29.512 §4.2.4), not a log line.
+    ///
+    /// `spawn_notification` is fire-and-forget, so the stub SMF counts arrivals and
+    /// the test waits for one with a bounded poll rather than sleeping a fixed
+    /// interval.
+    #[tokio::test]
+    async fn boot_terminates_an_unrestorable_association_toward_the_smf() {
+        use nextgcore_sbi::message::{SbiRequest as Req, SbiResponse as Resp};
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        // Plaintext loopback SMF: declare the dev profile rather than inherit it.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let bodies: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_hits = Arc::clone(&hits);
+        let sink_bodies = Arc::clone(&bodies);
+        let (smf, smf_addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: Req| {
+                let hits = Arc::clone(&sink_hits);
+                let bodies = Arc::clone(&sink_bodies);
+                async move {
+                    let path = req.header.uri.split('?').next().unwrap_or("").to_string();
+                    if req.header.method == "POST" && path.ends_with("/terminate") {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        if let Some(c) = req.http.content.as_deref() {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(c) {
+                                if let Ok(mut b) = bodies.lock() {
+                                    b.push(v);
+                                }
+                            }
+                        }
+                        return Resp::with_status(204);
+                    }
+                    Resp::with_status(404)
+                }
+            })
+            .await;
+        let notif_uri = format!(
+            "http://127.0.0.1:{}/nsmf-callback/v1/sm-policy-notify/193",
+            smf_addr.port()
+        );
+
+        // The shape `restore_from` produces from a record it could not type.
+        if let Ok(ctx) = crate::context::pcf_self().read() {
+            ctx.queue_unrestorable_association_for_test(
+                Some("pol-193-wire".to_string()),
+                Some(notif_uri.clone()),
+                "policy association could not be restored: test".to_string(),
+            );
+        }
+
+        let (notified, unnotifiable) = pcf_notify_unrestorable_associations();
+        assert_eq!((notified, unnotifiable), (1, 0));
+
+        // Bounded wait for the spawned POST rather than a fixed sleep.
+        let deadline = std::time::Instant::now() + Duration::from_secs(8);
+        while hits.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let seen = hits.load(Ordering::SeqCst);
+        let seen_bodies = bodies.lock().expect("bodies").clone();
+        smf.stop().await.expect("stop stub SMF");
+
+        assert_eq!(
+            seen, 1,
+            "the SMF must receive a terminate for an association the PCF cannot serve"
+        );
+        assert_eq!(
+            seen_bodies[0]["resourceUri"], "/npcf-smpolicycontrol/v1/sm-policies/pol-193-wire",
+            "TS 29.512 TerminationNotification names the resource the SMF holds, body was {:?}",
+            seen_bodies[0]
+        );
+        assert_eq!(
+            seen_bodies[0]["cause"], "UNSPECIFIED",
+            "no enumerated cause describes 'the producer lost its own record'"
+        );
+    }
+
+    /// A queued association with no salvageable pair sends nothing and is counted
+    /// as unreachable, rather than appearing to have been terminated.
+    #[tokio::test]
+    async fn boot_counts_an_association_with_no_callback_as_unreachable() {
+        if let Ok(ctx) = crate::context::pcf_self().read() {
+            ctx.queue_unrestorable_association_for_test(
+                Some("pol-193-mute".to_string()),
+                None,
+                "policy association could not be restored: test".to_string(),
+            );
+        }
+        let (notified, unnotifiable) = pcf_notify_unrestorable_associations();
+        assert_eq!((notified, unnotifiable), (0, 1));
+    }
 
     #[test]
     fn test_sbi_server_config_default() {
