@@ -448,6 +448,16 @@ pub struct NgapServer {
     /// where to forward it. `ue_auth_state` cannot answer that — it still names
     /// the SOURCE association until the UE arrives.
     handover_target_assoc: HashMap<u64, u64>,
+    /// The target gNB's per-session handover transfers, kept between
+    /// HandoverRequestAcknowledge and HandoverNotify (#70).
+    ///
+    /// Keyed by `(amf_ue_ngap_id, pdu_session_id)`. TS 23.502 §4.9.1.3.3 has the AMF tell
+    /// the SMF about the target DL tunnel only once the UE has ARRIVED (step 12,
+    /// `HANDOVER_COMPLETE`) — switching earlier would blackhole downlink traffic while the
+    /// UE is still on the source. So the transfer has to survive between the two messages,
+    /// and before #70 nothing kept it: HandoverNotify mutated in-memory serving state and
+    /// told the SMF nothing at all.
+    handover_target_transfers: HashMap<(u64, u8), Vec<u8>>,
     /// GMM procedure timer configuration (T3550/T3560/T3570/T3522)
     timer_configs: AmfTimerConfigs,
 }
@@ -496,6 +506,7 @@ impl NgapServer {
             ue_auth_state: HashMap::new(),
             sm_context_refs: HashMap::new(),
             handover_target_assoc: HashMap::new(),
+            handover_target_transfers: HashMap::new(),
             timer_configs: {
                 let configs = AmfTimerConfigs::default();
                 #[cfg(feature = "ntn")]
@@ -4874,6 +4885,14 @@ impl NgapServer {
                 // and a stale target entry would misroute the next handover's.
                 self.handover_target_assoc
                     .insert(ack.amf_ue_ngap_id, association_id);
+                // #70: keep each admitted session's transfer so HandoverNotify can relay
+                // the target DL tunnel to the SMF once the UE has actually arrived.
+                for admitted in &ack.admitted_list {
+                    self.handover_target_transfers.insert(
+                        (ack.amf_ue_ngap_id, admitted.pdu_session_id),
+                        admitted.transfer.clone(),
+                    );
+                }
             }
             Err(e) => log::error!("Failed to build HandoverCommand: {e}"),
         }
@@ -5027,16 +5046,20 @@ impl NgapServer {
     /// Handle a HandoverNotify from the target gNB (TS 38.413 Section 8.4.3):
     /// the UE has successfully arrived. The AMF updates the UE's serving cell
     /// location and (in a full deployment) releases the source-side resources.
-    async fn handle_handover_notify(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
+    async fn handle_handover_notify(
+        &mut self,
+        association_id: u64,
+        data: &[u8],
+    ) -> Result<HandoverCompletion> {
         let notify = match nextgcore_ngap::parser::decode_ngap_pdu(data) {
             Ok(nextgcore_ngap::NgapMessage::HandoverNotify(n)) => n,
             Ok(other) => {
                 log::warn!("Expected HandoverNotify, decoded {other:?}");
-                return Ok(());
+                return Ok(HandoverCompletion::default());
             }
             Err(e) => {
                 log::error!("Failed to decode HandoverNotify: {e}");
-                return Ok(());
+                return Ok(HandoverCompletion::default());
             }
         };
         log::info!(
@@ -5044,6 +5067,17 @@ impl NgapServer {
             notify.amf_ue_ngap_id,
             notify.ran_ue_ngap_id
         );
+        // #70: the SOURCE identity, captured BEFORE the serving association is moved to
+        // the target below. After that move it is unrecoverable, and it is exactly what the
+        // UEContextReleaseCommand has to be addressed to — TS 38.413 §8.4.3 has the AMF
+        // release the source NG-RAN UE context once the UE has arrived, and before #70
+        // nothing did, so every N2 handover leaked a source RAN context.
+        let source = self
+            .ue_auth_state
+            .get(&notify.amf_ue_ngap_id)
+            .map(|s| (s.association_id, s.ran_ue_ngap_id))
+            .filter(|(assoc, _)| *assoc != association_id);
+
         if let Some(state) = self.ue_auth_state.get_mut(&notify.amf_ue_ngap_id) {
             // Move the serving association/RAN-UE-NGAP-ID and location to the
             // target now that the UE has arrived (TS 23.502 Section 4.9.1.3).
@@ -5070,13 +5104,122 @@ impl NgapServer {
                 notify.amf_ue_ngap_id
             );
         }
+        // #70: switch the core-side DL path to the target (TS 23.502 §4.9.1.3.3 step 12,
+        // TS 29.502 `HANDOVER_COMPLETE`). Done HERE and not at HandoverRequestAcknowledge
+        // because until the UE has arrived the source is still serving it, and switching
+        // early would blackhole downlink traffic for the duration of the handover.
+        let transfers: Vec<(u8, Vec<u8>)> = self
+            .handover_target_transfers
+            .iter()
+            .filter(|((ue, _), _)| *ue == notify.amf_ue_ngap_id)
+            .map(|((_, psi), transfer)| (*psi, transfer.clone()))
+            .collect();
+        if transfers.is_empty() {
+            log::warn!(
+                "HandoverNotify for UE {}: no target handover transfer was recorded, so the \
+                 SMF cannot be told the target DL tunnel -- the downlink path stays on the \
+                 source UPF endpoint",
+                notify.amf_ue_ngap_id
+            );
+        }
+        let mut sessions_relayed = 0usize;
+        for (pdu_session_id, transfer) in transfers {
+            if self
+                .relay_n2_sm_to_smf(
+                    notify.amf_ue_ngap_id,
+                    pdu_session_id,
+                    &transfer,
+                    "HandoverNotify",
+                )
+                .await
+            {
+                sessions_relayed += 1;
+            }
+            self.handover_target_transfers
+                .remove(&(notify.amf_ue_ngap_id, pdu_session_id));
+        }
+
+        // #70: release the SOURCE NG-RAN UE context (TS 38.413 §8.4.3).
+        //
+        // NOT via `release_ue`, which removes `ue_auth_state` — the UE has not gone away,
+        // it has MOVED, and dropping its context here would deregister a UE that is
+        // registered and served by the target. Only the source gNB's copy is released.
+        let mut source_release_sent = false;
+        if let Some((source_assoc, source_ran_ue_id)) = source {
+            if let Some(cmd) = crate::ngap_asn1::build_ue_context_release_command_asn1(
+                notify.amf_ue_ngap_id,
+                source_ran_ue_id,
+                ngap_handler::cause_group::RADIO_NETWORK,
+                nextgcore_asn1c::ngap::cause::CauseRadioNetwork::SuccessfulHandover as i64,
+            ) {
+                // A failed send must not abort the procedure: the UE has already arrived
+                // and the core path is switched, so returning an error here would leave the
+                // handover half-reported. The source context leak is logged instead.
+                match self.send_to_association(source_assoc, &cmd).await {
+                    Ok(()) => {
+                        source_release_sent = true;
+                        log::info!(
+                            "UE Context Release Command sent to SOURCE association \
+                             {source_assoc} for UE {} (source \
+                             ran_ue_ngap_id={source_ran_ue_id}, cause successful-handover)",
+                            notify.amf_ue_ngap_id
+                        );
+                    }
+                    Err(e) => log::warn!(
+                        "Could not release the SOURCE context for UE {} on association \
+                         {source_assoc}: {e}",
+                        notify.amf_ue_ngap_id
+                    ),
+                }
+            }
+        } else {
+            log::debug!(
+                "HandoverNotify for UE {} arrived on the association already serving it; \
+                 no source context to release",
+                notify.amf_ue_ngap_id
+            );
+        }
+
         // Handover complete: `ue_auth_state` now names the target itself, so the
         // separate target record has served its purpose. Leaving it would keep the
         // relay pointing at the (now serving) gNB after the procedure ended.
         self.handover_target_assoc.remove(&notify.amf_ue_ngap_id);
-        Ok(())
+        Ok(HandoverCompletion {
+            sessions_relayed,
+            source_context: source,
+            source_release_sent,
+        })
     }
+}
 
+/// What a HandoverNotify actually completed (#70).
+///
+/// Returned rather than logged for the same reason
+/// `handle_uplink_ran_status_transfer` returns its relay target: the two things this
+/// handler now does — telling the SMF the target DL tunnel and releasing the source NG-RAN
+/// context — are both outbound sends, and a test that asserted on log lines would pass for
+/// a handler that logged without sending. TS 38.413 §8.4.3 and TS 23.502 §4.9.1.3.3 step 12
+/// require both, so both are reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HandoverCompletion {
+    /// PDU sessions whose target DL tunnel the SMF accepted.
+    pub sessions_relayed: usize,
+    /// `(association, source RAN-UE-NGAP-ID)` the release command was ADDRESSED to.
+    ///
+    /// `None` when the notify arrived on the association already serving the UE — an
+    /// intra-gNB case with no separate source context to release.
+    ///
+    /// Separate from [`Self::source_release_sent`] on purpose: which source to release is a
+    /// DECISION made from state that the relocation immediately overwrites, and whether the
+    /// datagram left is a property of the SCTP association. A test can drive the first
+    /// without a live gNB; only an E2E can drive the second, and collapsing them into one
+    /// field would make the decision untestable.
+    pub source_context: Option<(u64, u32)>,
+    /// Whether the release command actually reached the source association.
+    pub source_release_sent: bool,
+}
+
+impl NgapServer {
     /// Handle a HandoverCancel from the source gNB (TS 38.413 Section 8.4.5).
     /// The AMF acknowledges with a HandoverCancelAcknowledge.
     async fn handle_handover_cancel(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
@@ -5180,7 +5323,7 @@ impl NgapServer {
 
         // Derive a fresh NH from KAMF (vertical key derivation) and increment
         // the NHCC (TS 33.501 Section 6.9.2.3.3 / 6.9.4.1).
-        let (ncc, switched_list, allowed_nssai, ue_caps) = {
+        let (ncc, inbound, allowed_nssai, ue_caps) = {
             let state = self
                 .ue_auth_state
                 .get_mut(&amf_ue_ngap_id)
@@ -5194,16 +5337,15 @@ impl NgapServer {
             state.ran_ue_ngap_id = req.ran_ue_ngap_id;
             state.association_id = association_id;
 
-            let switched_list: Vec<nextgcore_ngap::types::PduSessionResourceSwitchedItem> = req
+            // #70: the inbound request transfers, kept so each can be relayed to the SMF
+            // AFTER this borrow ends. The switched list is built from the SMF's ANSWERS
+            // below, not from these — echoing the gNB's own PathSwitchRequestTransfer back
+            // as the acknowledge is the defect #70 names, and it tells the target gNB to
+            // send uplink traffic to itself (TS 38.413 §9.3.4.8 vs §9.3.4.9).
+            let inbound: Vec<(u8, Vec<u8>)> = req
                 .pdu_session_list
                 .iter()
-                .map(|p| nextgcore_ngap::types::PduSessionResourceSwitchedItem {
-                    pdu_session_id: p.pdu_session_id,
-                    // Echo the gNB's path-switch transfer back as the ack
-                    // transfer; in a full deployment the SMF supplies the UL
-                    // F-TEID via Nsmf_PDUSession_UpdateSMContext.
-                    transfer: p.transfer.clone(),
-                })
+                .map(|p| (p.pdu_session_id, p.transfer.clone()))
                 .collect();
 
             let allowed_nssai = state
@@ -5218,11 +5360,23 @@ impl NgapServer {
 
             (
                 state.amf_ue.nhcc,
-                switched_list,
+                inbound,
                 allowed_nssai,
                 ue_caps_to_ngap(&state.amf_ue.ue_security_capability),
             )
         };
+
+        // #70: Nsmf_PDUSession_UpdateSMContext per switched PDU session
+        // (TS 29.502 §5.2.2.3.3). The SMF switches the UPF's DL path to the target and
+        // answers with the PathSwitchRequestAcknowledgeTransfer this acknowledge owes the
+        // gNB. Done after the state borrow ends because it awaits.
+        //
+        // A session the SMF does not acknowledge is left OUT of the switched list rather
+        // than acknowledged with a fabricated transfer: TS 38.413 §9.3.4.9 makes the
+        // acknowledge the core's statement about the uplink path, and inventing one would
+        // point the target gNB at a tunnel no UPF serves. A gNB that finds a session
+        // missing from the switched list releases it, which is the honest outcome.
+        let switched_list = self.switched_list_from_smf(amf_ue_ngap_id, &inbound).await;
 
         let nh = self
             .ue_auth_state
@@ -5398,6 +5552,114 @@ impl NgapServer {
     ///
     /// Returns whether the relay was attempted and accepted, so callers can count
     /// what actually reached the SMF instead of assuming.
+    /// Build a PathSwitchRequestAcknowledge's switched list from the SMF's ANSWERS (#70).
+    ///
+    /// One `Nsmf_PDUSession_UpdateSMContext` per switched session (TS 29.502 §5.2.2.3.3);
+    /// the SMF switches the UPF's DL path to the target and returns the
+    /// `PathSwitchRequestAcknowledgeTransfer` the gNB is owed.
+    ///
+    /// A session the SMF does not acknowledge is left OUT rather than acknowledged with the
+    /// gNB's own request transfer. That echo is the defect #70 names: TS 38.413 §9.3.4.8 and
+    /// §9.3.4.9 are different messages in opposite directions — the request carries the
+    /// target's DL tunnel, the acknowledge the core's UL tunnel — so echoing one for the
+    /// other tells the target gNB to send uplink traffic to itself. A gNB that finds a
+    /// session missing from the switched list releases it, which is the honest outcome when
+    /// the core cannot confirm the switch.
+    ///
+    /// Extracted from `handle_path_switch_request` so the no-echo property is testable: the
+    /// acknowledge is built and immediately sent, and a harness with no live gNB association
+    /// cannot inspect what went into it.
+    async fn switched_list_from_smf(
+        &self,
+        amf_ue_ngap_id: u64,
+        inbound: &[(u8, Vec<u8>)],
+    ) -> Vec<nextgcore_ngap::types::PduSessionResourceSwitchedItem> {
+        let mut switched_list = Vec::with_capacity(inbound.len());
+        for (pdu_session_id, request_transfer) in inbound {
+            match self
+                .relay_n2_sm_to_smf_for_answer(
+                    amf_ue_ngap_id,
+                    *pdu_session_id,
+                    "PATH_SWITCH_REQ",
+                    request_transfer,
+                    "PathSwitchRequest",
+                )
+                .await
+            {
+                Some(ack_transfer) => {
+                    switched_list.push(nextgcore_ngap::types::PduSessionResourceSwitchedItem {
+                        pdu_session_id: *pdu_session_id,
+                        transfer: ack_transfer,
+                    });
+                }
+                None => log::warn!(
+                    "PathSwitchRequest: PSI {pdu_session_id} of UE {amf_ue_ngap_id} is NOT \
+                     in the switched list -- the SMF supplied no acknowledge transfer, and \
+                     echoing the gNB's own request transfer would point it at its own tunnel"
+                ),
+            }
+        }
+        switched_list
+    }
+
+    /// Relay an N2 SM container to the SMF and return the container it answers with
+    /// (#70, TS 29.502 §5.2.2.3.3).
+    ///
+    /// The mobility twin of [`Self::relay_n2_sm_to_smf`], which discards the response. On
+    /// a path switch the response is the point: it carries the
+    /// `PathSwitchRequestAcknowledgeTransfer` the target gNB is owed, and without it the
+    /// AMF has nothing conformant to put in the acknowledge — which is why the pre-#70
+    /// code echoed the gNB's own request transfer back instead.
+    ///
+    /// `None` means the relay failed or the SMF answered with no N2 SM part, and the caller
+    /// must decide what to do about it rather than substituting something.
+    async fn relay_n2_sm_to_smf_for_answer(
+        &self,
+        amf_ue_ngap_id: u64,
+        pdu_session_id: u8,
+        n2_sm_info_type: &str,
+        transfer: &[u8],
+        context: &str,
+    ) -> Option<Vec<u8>> {
+        let sm_context_ref = self
+            .sm_context_refs
+            .get(&(amf_ue_ngap_id, pdu_session_id))
+            .cloned()?;
+        let (host, port) = Self::smf_sbi_target();
+        match crate::sbi_path::call_smf_update_sm_context_n2(
+            &host,
+            port,
+            &sm_context_ref,
+            n2_sm_info_type,
+            transfer,
+        )
+        .await
+        {
+            Ok(resp) if !resp.n2_sm_info.is_empty() => {
+                log::info!(
+                    "{context}: SMF ref={sm_context_ref} answered with {} N2 SM bytes for \
+                     UE {amf_ue_ngap_id} PSI {pdu_session_id}",
+                    resp.n2_sm_info.len()
+                );
+                Some(resp.n2_sm_info)
+            }
+            Ok(_) => {
+                log::warn!(
+                    "{context}: SMF ref={sm_context_ref} accepted the update but returned \
+                     no N2 SM information for UE {amf_ue_ngap_id} PSI {pdu_session_id}"
+                );
+                None
+            }
+            Err(e) => {
+                log::warn!(
+                    "{context}: SMF update failed for UE {amf_ue_ngap_id} PSI \
+                     {pdu_session_id} (ref={sm_context_ref}): {e}"
+                );
+                None
+            }
+        }
+    }
+
     async fn relay_n2_sm_to_smf(
         &self,
         amf_ue_ngap_id: u64,
@@ -9373,6 +9635,254 @@ mod tests {
             mbs::MULTICAST_SESSION_ACTIVATION,
             68,
             "68 is id-BroadcastSessionSetup, a different elementary procedure"
+        );
+    }
+
+    /// #70's criterion 4, asserted where it can be: the switched list is built from the
+    /// SMF's answers, so an unanswered session is ABSENT rather than echoed.
+    ///
+    /// Driving `switched_list_from_smf` directly is what makes this testable — the
+    /// acknowledge is built and immediately sent, and this harness has no gNB association to
+    /// send to, so the assembled list is otherwise unobservable. Reverting the `None` arm to
+    /// push `request_transfer` makes this fail; before the extraction, nothing did.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_switched_list_never_echoes_the_inbound_request_transfer() {
+        let server = test_ngap_server().await;
+        let amf_ue_ngap_id = 78_005u64;
+        let inbound_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        // No `sm_context_refs` entry, so the SMF cannot be addressed — the same arm a
+        // failed or empty answer takes.
+        assert!(server.sm_context_refs.is_empty());
+
+        let list = server
+            .switched_list_from_smf(amf_ue_ngap_id, &[(1u8, inbound_bytes.clone())])
+            .await;
+
+        assert!(
+            list.is_empty(),
+            "an unacknowledged session must be ABSENT from the switched list; it contained \
+             {list:?}"
+        );
+        assert!(
+            !list.iter().any(|i| i.transfer == inbound_bytes),
+            "and above all it must never carry the gNB's own request transfer back"
+        );
+    }
+
+    // ---- #70: HandoverNotify completes the relocation ----
+
+    fn handover_notify_pdu(amf_ue_ngap_id: u64, ran_ue_ngap_id: u32) -> Vec<u8> {
+        nextgcore_ngap::builder::build_handover_notify(&nextgcore_ngap::types::HandoverNotify {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            user_location_info: nextgcore_ngap::types::UserLocationInformation::Nr {
+                nr_cgi_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("001", "01")),
+                nr_cell_identity: 0x0000_0042,
+                tai_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("001", "01")),
+                tai_tac: [0x00, 0x00, 0x01],
+            },
+        })
+        .expect("build HandoverNotify")
+    }
+
+    /// TS 38.413 §8.4.3: after HandoverNotify the AMF releases the SOURCE NG-RAN UE
+    /// context. Before #70 it released nothing, so every N2 handover leaked one.
+    ///
+    /// Asserted from the handler's report rather than a log line: the release is an
+    /// outbound send, and a handler that logged without sending would pass a log assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handover_notify_releases_the_source_ran_context() {
+        let mut server = test_ngap_server().await;
+        let (source, target) = (9301u64, 9302u64);
+        let amf_ue_ngap_id = 78_001u64;
+        let source_ran_ue_id = 11u32;
+        seed_gnb_session(&server, source).await;
+        seed_gnb_session(&server, target).await;
+
+        // The UE is served by the SOURCE when the notify arrives from the TARGET.
+        let mut state = UeNasContext::new(amf_ue_ngap_id, source_ran_ue_id, source, false);
+        state.amf_ue.supi = Some("imsi-001010000000001".to_string());
+        server.ue_auth_state.insert(amf_ue_ngap_id, state);
+
+        let report = server
+            .handle_handover_notify(target, &handover_notify_pdu(amf_ue_ngap_id, 22))
+            .await
+            .expect("handled");
+
+        assert_eq!(
+            report.source_context,
+            Some((source, source_ran_ue_id)),
+            "the release must be addressed to the SOURCE association and the SOURCE \
+             RAN-UE-NGAP-ID, both of which are overwritten by the relocation and so must be \
+             captured before it"
+        );
+        // `source_release_sent` is deliberately NOT asserted: this harness has no live SCTP
+        // association, so the send cannot succeed. What is testable here is the decision,
+        // and that is what was missing before #70 — the handler released nothing at all.
+
+        // The UE context SURVIVES: the UE moved, it did not go away. Releasing it here
+        // would deregister a UE the target is now serving.
+        let moved = server
+            .ue_auth_state
+            .get(&amf_ue_ngap_id)
+            .expect("the UE context must survive its own handover");
+        assert_eq!(moved.association_id, target, "serving association moved");
+        assert_eq!(moved.ran_ue_ngap_id, 22, "serving RAN-UE-NGAP-ID moved");
+    }
+
+    /// An intra-gNB notify — arriving on the association already serving the UE — has no
+    /// separate source context, so nothing is released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_intra_gnb_handover_notify_releases_nothing() {
+        let mut server = test_ngap_server().await;
+        let assoc = 9303u64;
+        let amf_ue_ngap_id = 78_002u64;
+        seed_gnb_session(&server, assoc).await;
+        server.ue_auth_state.insert(
+            amf_ue_ngap_id,
+            UeNasContext::new(amf_ue_ngap_id, 33, assoc, false),
+        );
+
+        let report = server
+            .handle_handover_notify(assoc, &handover_notify_pdu(amf_ue_ngap_id, 33))
+            .await
+            .expect("handled");
+        assert_eq!(
+            report.source_context, None,
+            "there is no source context distinct from the serving one"
+        );
+        assert!(!report.source_release_sent);
+    }
+
+    /// The target's handover transfer is kept between HandoverRequestAcknowledge and
+    /// HandoverNotify, and CONSUMED by the notify.
+    ///
+    /// The relay itself needs a live SMF, which this harness has none of — so
+    /// `sessions_relayed` is 0 here and the observable is the drain: the notify attempted
+    /// the relay for the recorded session and did not leave the transfer behind to be
+    /// re-sent on a later handover.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handover_notify_consumes_the_recorded_target_transfer() {
+        let mut server = test_ngap_server().await;
+        let (source, target) = (9304u64, 9305u64);
+        let amf_ue_ngap_id = 78_003u64;
+        seed_gnb_session(&server, source).await;
+        seed_gnb_session(&server, target).await;
+        server.ue_auth_state.insert(
+            amf_ue_ngap_id,
+            UeNasContext::new(amf_ue_ngap_id, 44, source, false),
+        );
+        server
+            .handover_target_transfers
+            .insert((amf_ue_ngap_id, 1), vec![0xAA, 0xBB, 0xCC]);
+        // A transfer for a DIFFERENT UE must be left alone.
+        server
+            .handover_target_transfers
+            .insert((amf_ue_ngap_id + 1, 1), vec![0xDD]);
+
+        server
+            .handle_handover_notify(target, &handover_notify_pdu(amf_ue_ngap_id, 55))
+            .await
+            .expect("handled");
+
+        assert!(
+            !server
+                .handover_target_transfers
+                .contains_key(&(amf_ue_ngap_id, 1)),
+            "the notify must consume this UE's recorded transfer, or a later handover would \
+             re-send a stale target tunnel to the SMF"
+        );
+        assert!(
+            server
+                .handover_target_transfers
+                .contains_key(&(amf_ue_ngap_id + 1, 1)),
+            "and must not touch another UE's"
+        );
+    }
+
+    /// #70's criterion 4, at the level this harness can reach: the switched list is built
+    /// from the SMF's ANSWERS, so with no SMF reachable it is EMPTY — the inbound request
+    /// transfer is never echoed into it.
+    ///
+    /// That is the defect stated as a test. Before #70 the same conditions produced a
+    /// switched list containing the gNB's own `PathSwitchRequestTransfer`, which tells the
+    /// target to send uplink traffic to itself. An empty list makes the gNB release the
+    /// session, which is the honest outcome when the core cannot confirm the switch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_path_switch_with_no_smf_answer_switches_nothing_rather_than_echoing() {
+        let mut server = test_ngap_server().await;
+        let assoc = 9306u64;
+        let amf_ue_ngap_id = 78_004u64;
+        seed_gnb_session(&server, assoc).await;
+        server.ue_auth_state.insert(
+            amf_ue_ngap_id,
+            UeNasContext::new(amf_ue_ngap_id, 66, assoc, false),
+        );
+        // No `sm_context_refs` entry, so `relay_n2_sm_to_smf_for_answer` cannot even
+        // address the SMF — the same code path a failed or empty answer takes.
+        assert!(server.sm_context_refs.is_empty());
+
+        let request_transfer = nextgcore_ngap::transfer::PathSwitchRequestTransfer {
+            dl_ngu_up_tnl_information:
+                nextgcore_ngap::transfer::UpTransportLayerInformation::GtpTunnel(
+                    nextgcore_ngap::transfer::GtpTunnel {
+                        transport_layer_address:
+                            nextgcore_ngap::transfer::TransportLayerAddress::from_ipv4([
+                                10, 45, 0, 9,
+                            ]),
+                        gtp_teid: [0x00, 0x00, 0xBE, 0xEF],
+                    },
+                ),
+            qos_flow_accepted_list: vec![1],
+        };
+        // The gNB's own transfer, which must NOT come back in the acknowledge.
+        let inbound_bytes = {
+            // No encoder exists for the request transfer (it is decode-only in this tree),
+            // so an opaque non-empty byte string stands in: the assertion is that WHATEVER
+            // came in is not what goes out.
+            let _ = &request_transfer;
+            vec![0x11, 0x22, 0x33, 0x44]
+        };
+
+        let psr = nextgcore_ngap::types::PathSwitchRequest {
+            ran_ue_ngap_id: 67,
+            source_amf_ue_ngap_id: amf_ue_ngap_id,
+            user_location_info: nextgcore_ngap::types::UserLocationInformation::Nr {
+                nr_cgi_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("001", "01")),
+                nr_cell_identity: 7,
+                tai_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("001", "01")),
+                tai_tac: [0, 0, 1],
+            },
+            ue_security_capabilities: nextgcore_ngap::types::UeSecurityCapabilities {
+                nr_encryption_algorithms: 0xF000,
+                nr_integrity_algorithms: 0xF000,
+                eutra_encryption_algorithms: 0,
+                eutra_integrity_algorithms: 0,
+            },
+            pdu_session_list: vec![nextgcore_ngap::types::PduSessionResourceSwitchItem {
+                pdu_session_id: 1,
+                transfer: inbound_bytes.clone(),
+            }],
+            failed_list: None,
+        };
+        let pdu = nextgcore_ngap::builder::build_path_switch_request(&psr)
+            .expect("build PathSwitchRequest");
+
+        // The acknowledge SEND fails here — this harness has no live SCTP association — so
+        // the error is tolerated. What is asserted is everything the handler did BEFORE the
+        // send, which is where the defect was.
+        let _ = server.handle_path_switch_request(assoc, &pdu).await;
+
+        // The UE's NCC advanced (the pre-existing forward-security behaviour) and the
+        // relocation happened, so the handler ran to completion rather than bailing early.
+        let state = server.ue_auth_state.get(&amf_ue_ngap_id).expect("UE");
+        assert_eq!(
+            state.ran_ue_ngap_id, 67,
+            "the handler completed the relocation"
+        );
+        assert!(
+            state.amf_ue.nh.iter().any(|b| *b != 0) || state.amf_ue.nhcc != 0,
+            "and advanced the NH chain"
         );
     }
 }

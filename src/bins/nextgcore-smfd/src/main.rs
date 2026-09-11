@@ -3285,6 +3285,16 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     if let Ok(mut sessions) = ctx.pfcp_sessions.write() {
                         sessions.insert(sm_context_ref.to_string(), result.upf_seid);
                     }
+                    // #70: keep the UPF's uplink endpoint too. The PATH_SWITCH_REQ
+                    // handler owes the target gNB a PathSwitchRequestAcknowledgeTransfer
+                    // naming it (TS 38.413 §9.3.4.9), and this is the only point at which
+                    // the UPF has just told us what it is.
+                    if let Ok(mut endpoints) = ctx.upf_ul_endpoints.write() {
+                        endpoints.insert(
+                            sm_context_ref.to_string(),
+                            (result.upf_teid, result.upf_addr),
+                        );
+                    }
                     // Issue #191: after the write guard drops -- `persist` takes a
                     // read lock on this same map and RwLock is not reentrant.
                     ctx.persist();
@@ -3575,6 +3585,16 @@ fn lookup_upf_seid(sm_context_ref: &str) -> Option<u64> {
             .read()
             .ok()
             .and_then(|sessions| sessions.get(sm_context_ref).copied())
+    })
+}
+
+/// The UPF's N3 uplink endpoint for an SM context, if establishment recorded one (#70).
+fn lookup_upf_ul_endpoint(sm_context_ref: &str) -> Option<(u32, [u8; 4])> {
+    smf_self().read().ok().and_then(|ctx| {
+        ctx.upf_ul_endpoints
+            .read()
+            .ok()
+            .and_then(|endpoints| endpoints.get(sm_context_ref).copied())
     })
 }
 
@@ -3909,8 +3929,73 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
 
             let mut response_body = serde_json::json!({ "upCnxState": "ACTIVATED" });
             if n2_sm_info_type == "PATH_SWITCH_REQ" {
-                // Echo the (unchanged) UL tunnel back to the target gNB
-                response_body["n2SmInfoType"] = serde_json::json!("PATH_SWITCH_REQ_ACK");
+                // #70: the acknowledge TRANSFER, not just the type. TS 29.502 §5.2.2.3.3
+                // makes the Path Switch Request Acknowledge Transfer an N2 SM information
+                // part of this response, and TS 38.413 §9.3.4.9 makes it a different
+                // message from the request the gNB sent — the request carries the
+                // target's DL tunnel, the acknowledge carries the core's UL tunnel.
+                // Before #70 this branch answered with the type and no part at all, and
+                // the AMF filled the gap by echoing the gNB's own request transfer back,
+                // which tells the target to send uplink traffic to itself.
+                //
+                // The UL endpoint is unchanged by an Xn path switch (only the DL side
+                // moves), so this re-states it rather than allocating anything. When
+                // establishment recorded no endpoint the transfer is sent with the UL
+                // tunnel ABSENT, which §9.3.4.9 permits and which honestly means "no
+                // change" — better than inventing a tunnel the UPF does not serve.
+                let ack = match lookup_upf_ul_endpoint(sm_context_ref) {
+                    Some((teid, addr)) => {
+                        use nextgcore_ngap::transfer::{
+                            GtpTunnel, PathSwitchRequestAcknowledgeTransfer, TransportLayerAddress,
+                            UpTransportLayerInformation,
+                        };
+                        PathSwitchRequestAcknowledgeTransfer {
+                            ul_ngu_up_tnl_information: Some(
+                                UpTransportLayerInformation::GtpTunnel(GtpTunnel {
+                                    transport_layer_address: TransportLayerAddress::from_ipv4(addr),
+                                    gtp_teid: teid.to_be_bytes(),
+                                }),
+                            ),
+                            ..Default::default()
+                        }
+                    }
+                    None => {
+                        log::warn!(
+                            "PATH_SWITCH_REQ for ref={sm_context_ref}: no recorded UPF uplink \
+                             endpoint, so the acknowledge carries no UL tunnel (TS 38.413 \
+                             §9.3.4.9 permits its absence, and it means the UL path is \
+                             unchanged)"
+                        );
+                        nextgcore_ngap::transfer::PathSwitchRequestAcknowledgeTransfer::default()
+                    }
+                };
+                use nextgcore_sbi::constants::content_type;
+                match ack.encode() {
+                    Ok(bytes) => {
+                        response_body["n2SmInfoType"] = serde_json::json!("PATH_SWITCH_REQ_ACK");
+                        response_body["n2SmInfo"] = serde_json::json!({ "contentId": "n2SmInfo" });
+                        return SbiResponse::with_status(200)
+                            .with_body(response_body.to_string(), content_type::APPLICATION_JSON)
+                            .with_part(nextgcore_sbi::message::SbiPart::with_content(
+                                "n2SmInfo",
+                                content_type::APPLICATION_NGAP,
+                                bytes::Bytes::from(bytes),
+                            ));
+                    }
+                    Err(e) => {
+                        // The user plane is already switched at this point, so the switch
+                        // itself succeeded; what failed is telling the gNB about it.
+                        // Answering 500 lets the AMF fail the PathSwitchRequest rather
+                        // than acknowledge one whose transfer is missing.
+                        log::error!(
+                            "Failed to encode PathSwitchRequestAcknowledgeTransfer for \
+                             ref={sm_context_ref}: {e:?}"
+                        );
+                        return nextgcore_sbi::server::send_internal_error(
+                            "could not build the Path Switch Request Acknowledge Transfer",
+                        );
+                    }
+                }
             }
             SbiResponse::with_status(200).with_body(response_body.to_string(), "application/json")
         }
@@ -9918,5 +10003,107 @@ mod oauth2_h8_tests {
         assert_ne!(resp.status, 401, "valid token must not be 401");
         assert_ne!(resp.status, 403, "valid token must not be 403");
         server.stop().await.expect("stop");
+    }
+}
+
+/// #70: the Path Switch Request Acknowledge Transfer the SMF owes the target gNB.
+#[cfg(test)]
+mod path_switch_ack_tests {
+    use super::*;
+
+    // ---- #70: the PATH_SWITCH_REQ acknowledge transfer ----
+
+    /// TS 29.502 §5.2.2.3.3: the `PATH_SWITCH_REQ` response carries the Path Switch Request
+    /// Acknowledge Transfer as an N2 SM information part, not just the type.
+    ///
+    /// Before #70 this branch answered `{upCnxState, n2SmInfoType}` with no part at all,
+    /// which is why the AMF had nothing to put in the acknowledge and echoed the gNB's own
+    /// request transfer back instead.
+    ///
+    /// Asserted by DECODING the bytes as a `PathSwitchRequestAcknowledgeTransfer`, because
+    /// "a non-empty part is present" would pass for any bytes at all — including a copy of
+    /// the request transfer, which is precisely the defect.
+    #[test]
+    fn the_path_switch_acknowledge_transfer_carries_the_recorded_uplink_endpoint() {
+        use nextgcore_ngap::transfer::{
+            PathSwitchRequestAcknowledgeTransfer, UpTransportLayerInformation,
+        };
+
+        // The shape the handler builds when establishment recorded an endpoint.
+        let ack = PathSwitchRequestAcknowledgeTransfer {
+            ul_ngu_up_tnl_information: Some(UpTransportLayerInformation::GtpTunnel(
+                nextgcore_ngap::transfer::GtpTunnel {
+                    transport_layer_address:
+                        nextgcore_ngap::transfer::TransportLayerAddress::from_ipv4([10, 45, 0, 1]),
+                    gtp_teid: 0x0001_0001u32.to_be_bytes(),
+                },
+            )),
+            ..Default::default()
+        };
+        let bytes = ack
+            .encode()
+            .expect("the handler must be able to encode this");
+        assert!(!bytes.is_empty(), "the n2SmInfo part must be non-empty");
+
+        let decoded =
+            PathSwitchRequestAcknowledgeTransfer::decode(&bytes).expect("decode as the ack type");
+        match decoded.ul_ngu_up_tnl_information {
+            Some(UpTransportLayerInformation::GtpTunnel(t)) => {
+                assert_eq!(
+                    t.gtp_teid,
+                    0x0001_0001u32.to_be_bytes(),
+                    "the UPF uplink TEID must survive: it is what the target gNB sends to"
+                );
+            }
+            other => panic!("expected a GTP tunnel, got {other:?}"),
+        }
+    }
+
+    /// The absent-endpoint fallback is a VALID transfer meaning "the uplink path is
+    /// unchanged" (TS 38.413 §9.3.4.9 makes every member optional), not an error and not an
+    /// invented tunnel.
+    #[test]
+    fn an_acknowledge_without_a_recorded_endpoint_is_still_a_valid_transfer() {
+        use nextgcore_ngap::transfer::PathSwitchRequestAcknowledgeTransfer;
+        let bytes = PathSwitchRequestAcknowledgeTransfer::default()
+            .encode()
+            .expect("encode");
+        assert!(
+            !bytes.is_empty(),
+            "even the no-change form has a preamble, so the n2SmInfo part is non-empty"
+        );
+        let decoded = PathSwitchRequestAcknowledgeTransfer::decode(&bytes).expect("decode");
+        assert!(
+            decoded.ul_ngu_up_tnl_information.is_none(),
+            "and it says 'no uplink change' rather than naming a tunnel the UPF does not serve"
+        );
+    }
+
+    /// The UPF uplink endpoint recorded at establishment is what the acknowledge reads.
+    ///
+    /// This is the store #70 added; without it the handler could only ever send the
+    /// no-change form.
+    #[test]
+    fn the_upf_uplink_endpoint_is_recorded_and_looked_up_by_context_ref() {
+        let ctx = context::SmfContext::new();
+        {
+            let mut endpoints = ctx.upf_ul_endpoints.write().expect("write");
+            endpoints.insert("ref-1".to_string(), (0x0001_0002, [10, 45, 0, 3]));
+        }
+        let got = ctx
+            .upf_ul_endpoints
+            .read()
+            .expect("read")
+            .get("ref-1")
+            .copied();
+        assert_eq!(got, Some((0x0001_0002, [10, 45, 0, 3])));
+        assert!(
+            ctx.upf_ul_endpoints
+                .read()
+                .expect("read")
+                .get("ref-2")
+                .is_none(),
+            "an unrelated context ref must not resolve to another session's tunnel"
+        );
     }
 }

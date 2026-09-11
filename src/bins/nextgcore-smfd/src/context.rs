@@ -1699,6 +1699,22 @@ pub struct SmfContext {
     /// cross-test contamination from a process-wide singleton.
     pub pfcp_sessions: RwLock<HashMap<String, u64>>,
 
+    /// The UPF's N3 uplink endpoint per SM context: `sm_context_ref -> (TEID, IPv4)`
+    /// (#70).
+    ///
+    /// Recorded at establishment, when the UPF's Created PDR names it, so the
+    /// `PATH_SWITCH_REQ` handler can put it in the
+    /// `PathSwitchRequestAcknowledgeTransfer` it owes the target gNB
+    /// (TS 38.413 §9.3.4.9). Before #70 nothing kept it past establishment, so the only
+    /// acknowledge the SMF could have built would have carried no UL tunnel at all — and
+    /// the AMF echoed the gNB's own request transfer back instead, telling the target to
+    /// send uplink traffic to itself.
+    ///
+    /// Separate from `pfcp_sessions` rather than widened into it: that map is keyed and
+    /// consumed as "which N4 session serves this context", and every one of its readers
+    /// wants exactly the SEID.
+    pub upf_ul_endpoints: RwLock<HashMap<String, (u32, [u8; 4])>>,
+
     /// SM policy bindings: sm_context_ref -> PCF policy association + GSM FSM
     pub policy_bindings: RwLock<HashMap<String, PolicyBinding>>,
 
@@ -1820,6 +1836,7 @@ impl SmfContext {
                 .unwrap_or(std::net::Ipv4Addr::new(127, 0, 0, 1)),
             initialized: AtomicBool::new(false),
             pfcp_sessions: RwLock::new(HashMap::new()),
+            upf_ul_endpoints: RwLock::new(HashMap::new()),
             unrestorable_sessions: RwLock::new(Vec::new()),
             policy_bindings: RwLock::new(HashMap::new()),
             upf_recovery_time_stamps: RwLock::new(HashMap::new()),

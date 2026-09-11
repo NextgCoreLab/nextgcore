@@ -1759,6 +1759,120 @@ impl PathSwitchRequestTransfer {
     }
 }
 
+// ============================================================================
+// Path Switch Request Acknowledge Transfer (TS 38.413 Section 9.3.4.9)
+// ============================================================================
+
+/// PathSwitchRequestAcknowledgeTransfer - built by the SMF, consumed by the target gNB.
+///
+/// The SMF's answer to a [`PathSwitchRequestTransfer`]: it tells the target gNB the UL
+/// NG-U endpoint to send on, and optionally re-states the user-plane security policy and
+/// its result.
+///
+/// # Why this exists (#70)
+///
+/// Before #70 the AMF echoed the gNB's own `PathSwitchRequestTransfer` back to it as the
+/// acknowledge transfer, because there was nothing else to send: this type did not exist,
+/// the AMF never asked the SMF, and the SMF's `PATH_SWITCH_REQ` branch answered with no
+/// `n2SmInfo` at all. TS 38.413 §9.3.4.9 makes these two different transfers with
+/// different contents and opposite directions — the request carries the target's DL
+/// tunnel, the acknowledge carries the core's UL tunnel — so echoing one for the other
+/// tells the target gNB to send uplink traffic to itself.
+///
+/// # Optionality
+///
+/// Every member is OPTIONAL in the ASN.1, so an empty acknowledge is legal and means "no
+/// change". That is deliberately representable: `Default` gives exactly that, and it is
+/// the honest encoding for a path switch where the UL tunnel did not move.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PathSwitchRequestAcknowledgeTransfer {
+    /// UL NG-U UP TNL information - the UPF N3 endpoint the target gNB sends uplink to.
+    pub ul_ngu_up_tnl_information: Option<UpTransportLayerInformation>,
+    /// User-plane security policy for the switched session.
+    pub security_indication: Option<SecurityIndication>,
+    /// The security result actually applied.
+    pub new_security_result: Option<SecurityResult>,
+    /// QoS flows the core is releasing as part of the switch.
+    pub qos_flow_to_release_list: Vec<QosFlowWithCauseItem>,
+}
+
+impl PathSwitchRequestAcknowledgeTransfer {
+    pub fn encode(&self) -> NgapResult<Vec<u8>> {
+        let mut encoder = AperEncoder::new();
+        // SEQUENCE preamble: extension marker, then one present-bit per OPTIONAL member
+        // in declaration order (uL-NGU-UP-TNLInformation, securityIndication,
+        // newSecurityResult, qosFlowToReleaseList, iE-Extensions).
+        encoder.write_bit(false); // extension marker
+        encoder.write_bit(self.ul_ngu_up_tnl_information.is_some());
+        encoder.write_bit(self.security_indication.is_some());
+        encoder.write_bit(self.new_security_result.is_some());
+        encoder.write_bit(!self.qos_flow_to_release_list.is_empty());
+        encoder.write_bit(false); // no iE-Extensions
+
+        if let Some(tnl) = &self.ul_ngu_up_tnl_information {
+            tnl.encode(&mut encoder)?;
+        }
+        if let Some(si) = &self.security_indication {
+            si.encode(&mut encoder)?;
+        }
+        if let Some(sr) = &self.new_security_result {
+            sr.encode(&mut encoder)?;
+        }
+        if !self.qos_flow_to_release_list.is_empty() {
+            // QosFlowListWithCause ::= SEQUENCE (SIZE(1..64)) OF QosFlowWithCauseItem
+            encoder.encode_constrained_length(self.qos_flow_to_release_list.len(), 1, 64)?;
+            for item in &self.qos_flow_to_release_list {
+                item.encode(&mut encoder)?;
+            }
+        }
+        encoder.align();
+        Ok(encoder.into_bytes().to_vec())
+    }
+
+    pub fn decode(data: &[u8]) -> NgapResult<Self> {
+        let mut decoder = AperDecoder::new(data);
+        let _ext = decoder.read_bit()?;
+        let tnl_present = decoder.read_bit()?;
+        let si_present = decoder.read_bit()?;
+        let sr_present = decoder.read_bit()?;
+        let release_present = decoder.read_bit()?;
+        let _ie_ext = decoder.read_bit()?;
+
+        let ul_ngu_up_tnl_information = if tnl_present {
+            Some(UpTransportLayerInformation::decode(&mut decoder)?)
+        } else {
+            None
+        };
+        let security_indication = if si_present {
+            Some(SecurityIndication::decode(&mut decoder)?)
+        } else {
+            None
+        };
+        let new_security_result = if sr_present {
+            Some(SecurityResult::decode(&mut decoder)?)
+        } else {
+            None
+        };
+        let qos_flow_to_release_list = if release_present {
+            let count = decoder.decode_constrained_length(1, 64)?;
+            let mut list = Vec::with_capacity(count);
+            for _ in 0..count {
+                list.push(QosFlowWithCauseItem::decode(&mut decoder)?);
+            }
+            list
+        } else {
+            Vec::new()
+        };
+
+        Ok(Self {
+            ul_ngu_up_tnl_information,
+            security_indication,
+            new_security_result,
+            qos_flow_to_release_list,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2171,6 +2285,94 @@ mod tests {
             prop_assert_eq!(bytes[0], 0x00);
             let decoded = PduSessionResourceSetupRequestTransfer::decode(&bytes).unwrap();
             prop_assert_eq!(decoded, transfer);
+        }
+    }
+    // ------------------------------------------------------------------
+    // PathSwitchRequestAcknowledgeTransfer (#70, TS 38.413 §9.3.4.9)
+    // ------------------------------------------------------------------
+
+    /// Every member is OPTIONAL, so the empty transfer must round-trip — it is the honest
+    /// encoding for a path switch where the UL tunnel did not move.
+    #[test]
+    fn path_switch_ack_transfer_round_trips_empty() {
+        let empty = PathSwitchRequestAcknowledgeTransfer::default();
+        let bytes = empty.encode().expect("encode");
+        let decoded = PathSwitchRequestAcknowledgeTransfer::decode(&bytes).expect("decode");
+        assert_eq!(decoded, empty);
+        assert!(decoded.ul_ngu_up_tnl_information.is_none());
+        assert!(decoded.qos_flow_to_release_list.is_empty());
+    }
+
+    /// The member that matters: the UL tunnel the target gNB must send uplink to.
+    #[test]
+    fn path_switch_ack_transfer_round_trips_the_ul_tunnel() {
+        let transfer = PathSwitchRequestAcknowledgeTransfer {
+            ul_ngu_up_tnl_information: Some(sample_tunnel()),
+            ..Default::default()
+        };
+        let bytes = transfer.encode().expect("encode");
+        let decoded = PathSwitchRequestAcknowledgeTransfer::decode(&bytes).expect("decode");
+        assert_eq!(decoded, transfer);
+        assert_eq!(
+            decoded.ul_ngu_up_tnl_information,
+            Some(sample_tunnel()),
+            "the UPF endpoint must survive: it is the whole point of the acknowledge"
+        );
+    }
+
+    /// All members together, so the present-bit order in the preamble is exercised.
+    ///
+    /// Order matters and a wrong one is silent: with only one member set, any preamble
+    /// ordering decodes back to the same value, so a permutation would pass. Setting all
+    /// of them is what pins the sequence.
+    #[test]
+    fn path_switch_ack_transfer_round_trips_every_member() {
+        let transfer = PathSwitchRequestAcknowledgeTransfer {
+            ul_ngu_up_tnl_information: Some(sample_tunnel()),
+            security_indication: Some(SecurityIndication {
+                integrity_protection_indication: ProtectionIndication::Required,
+                confidentiality_protection_indication: ProtectionIndication::Preferred,
+                maximum_integrity_protected_data_rate_ul: Some(
+                    MaximumIntegrityProtectedDataRate::Bitrate64kbs,
+                ),
+            }),
+            new_security_result: Some(SecurityResult {
+                integrity_protection_result: ProtectionResult::Performed,
+                confidentiality_protection_result: ProtectionResult::NotPerformed,
+            }),
+            qos_flow_to_release_list: vec![QosFlowWithCauseItem {
+                qos_flow_identifier: 5,
+                cause: Cause::RadioNetwork(CauseRadioNetwork::Unspecified),
+            }],
+        };
+        let bytes = transfer.encode().expect("encode");
+        let decoded = PathSwitchRequestAcknowledgeTransfer::decode(&bytes).expect("decode");
+        assert_eq!(decoded, transfer);
+    }
+
+    /// The acknowledge and the request are DIFFERENT transfers, which is the defect #70
+    /// names: the AMF echoed the request back as the acknowledge.
+    ///
+    /// Decoding an acknowledge's bytes as a request (or the reverse) must not quietly
+    /// succeed with plausible contents — that is what made the echo invisible.
+    #[test]
+    fn an_acknowledge_transfer_is_not_a_request_transfer() {
+        let ack = PathSwitchRequestAcknowledgeTransfer {
+            ul_ngu_up_tnl_information: Some(sample_tunnel()),
+            ..Default::default()
+        };
+        let ack_bytes = ack.encode().expect("encode");
+
+        // The request has a 4-bit preamble and two MANDATORY members; the acknowledge has
+        // a 6-bit preamble and none. They cannot be the same bytes for the same tunnel.
+        match PathSwitchRequestTransfer::decode(&ack_bytes) {
+            Err(_) => {}
+            Ok(req) => assert_ne!(
+                req.dl_ngu_up_tnl_information,
+                sample_tunnel(),
+                "an acknowledge must not decode as a request naming the same tunnel — if it \
+                 did, echoing one for the other would be undetectable on the wire"
+            ),
         }
     }
 }
