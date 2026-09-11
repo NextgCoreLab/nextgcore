@@ -51,11 +51,12 @@ pub mod prelude {
         SessionModificationResponse, SessionReportRequest, SessionReportResponse,
     };
     pub use crate::types::{
-        ApplyAction, Bitrate, CpFunctionFeatures, CreateBar, CreateFar, CreatePdr, CreateQer,
-        CreateUrr, DestinationInterface, DownlinkDataReport, FSeid, FTeid, ForwardingParameters,
-        GateStatus, MeasurementMethod, NodeId, NodeIdType, OuterHeaderCreation, OuterHeaderRemoval,
-        Pdi, PfcpCause, RemoveFar, RemovePdr, RemoveQer, RemoveUrr, ReportType, ReportingTriggers,
-        SourceInterface, UeIpAddress, UpFunctionFeatures, UpdateFar, UpdatePdr, UpdateQer,
-        UpdateUrr, UsageReportSrr, VolumeMeasurement, VolumeThreshold,
+        ApplyAction, Bitrate, CpFunctionFeatures, CreateBar, CreateBridgeInfoForTsc, CreateFar,
+        CreatePdr, CreateQer, CreateUrr, CreatedBridgeInfoForTsc, DestinationInterface,
+        DownlinkDataReport, FSeid, FTeid, FiveGsUserPlaneNodeId, ForwardingParameters, GateStatus,
+        MeasurementMethod, NodeId, NodeIdType, OuterHeaderCreation, OuterHeaderRemoval, Pdi,
+        PfcpCause, RemoveFar, RemovePdr, RemoveQer, RemoveUrr, ReportType, ReportingTriggers,
+        SourceInterface, TscManagementInformation, UeIpAddress, UpFunctionFeatures, UpdateFar,
+        UpdatePdr, UpdateQer, UpdateUrr, UsageReportSrr, VolumeMeasurement, VolumeThreshold,
     };
 }

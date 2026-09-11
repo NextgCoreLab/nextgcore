@@ -2608,6 +2608,55 @@ fn parse_asc_req_data(root: &serde_json::Value) -> AscReqData {
         ue_ipv4: opt_str("ueIpv4"),
         ue_ipv6: opt_str("ueIpv6"),
         ue_mac: opt_str("ueMac"),
+        tsc: parse_tsc_containers(root),
+    }
+}
+
+/// Parse one TS 29.514 / TS 29.512 `PortManagementContainer` (#321).
+///
+/// Both members are REQUIRED by the schema, so a value missing either is dropped
+/// rather than defaulted: a `portNum` defaulted to 0 would be indistinguishable
+/// from the NW-TT port, which is the port number the TSCTSF's own derivation
+/// assigns to the network side.
+fn parse_port_management_container(v: &serde_json::Value) -> Option<PortManagementContainer> {
+    let cont = v.get("portManCont")?.as_str()?;
+    let num = v.get("portNum")?.as_u64()?;
+    Some(PortManagementContainer {
+        port_man_cont: cont.to_string(),
+        port_num: num as u32,
+    })
+}
+
+/// Parse the TSC management containers from an `AppSessionContextReqData` (#321,
+/// TS 29.514 Table 5.7.3-1).
+fn parse_tsc_containers(root: &serde_json::Value) -> TscManagementContainers {
+    let opt_str = |key: &str| {
+        root.get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    TscManagementContainers {
+        bridge_man_cont: root
+            .get("tsnBridgeManCont")
+            .and_then(|v| v.get("bridgeManCont"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        port_man_cont_dstt: root
+            .get("tsnPortManContDstt")
+            .and_then(parse_port_management_container),
+        port_man_cont_nwtts: root
+            .get("tsnPortManContNwtts")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(parse_port_management_container)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        notif_uri: opt_str("tscNotifUri"),
+        notif_corre_id: opt_str("tscNotifCorreId"),
     }
 }
 
@@ -2809,6 +2858,35 @@ pub async fn handle_app_session_create(request: &SbiRequest) -> SbiResponse {
     let app_session_id = app.app_session_id.clone();
     let bound_sess = Some(bound_sess);
 
+    // #321: TSC management containers are recorded whether or not the request
+    // carries media components. A TSCTSF time-synchronization authorisation has NO
+    // medComponents at all (its AppSessionContext carries the containers and a UE
+    // address and nothing else), so gating the store on media components would drop
+    // exactly the case this exists for.
+    let carries_tsc = !asc.tsc.is_empty();
+    if carries_tsc {
+        if let Some(ref sess) = bound_sess {
+            if let Ok(context) = ctx.read() {
+                if let Some(mut latest) = context.sess_find_by_id(sess.id) {
+                    // REPLACES rather than merges: the containers are a complete
+                    // statement of the port and bridge configuration, so keeping
+                    // stale ports alongside new ones would tell the SMF to apply a
+                    // configuration the AF has withdrawn.
+                    latest.tsc_containers = asc.tsc.clone();
+                    context.sess_update(&latest);
+                }
+            }
+            log::info!(
+                "App session create recorded TSC containers on sess_id={} (DS-TT: {}, \
+                 NW-TT ports: {}, UMIC: {})",
+                sess.id,
+                asc.tsc.port_man_cont_dstt.is_some(),
+                asc.tsc.port_man_cont_nwtts.len(),
+                asc.tsc.bridge_man_cont.is_some()
+            );
+        }
+    }
+
     if !asc.med_components.is_empty() {
         // AF media components → PCC rules persisted on the bound session and
         // pushed to the SMF in an SM policy update notify (TS 29.514 §4.2.2.2).
@@ -2831,8 +2909,14 @@ pub async fn handle_app_session_create(request: &SbiRequest) -> SbiResponse {
             notify_af_resource_allocation(app.id, installed > 0);
         }
     } else if let Some(ref sess) = bound_sess {
-        // No medComponents: bind + generic notify, as today.
-        pcf_sbi_send_smpolicycontrol_update_notify(sess.id);
+        // No medComponents. The AF-shaped notify is used when TSC containers are
+        // present because that is the one that carries them; otherwise the generic
+        // subscription-derived notify, as before.
+        if carries_tsc {
+            pcf_sbi_send_af_smpolicycontrol_update_notify(sess.id);
+        } else {
+            pcf_sbi_send_smpolicycontrol_update_notify(sess.id);
+        }
     }
 
     log::info!(
@@ -3135,6 +3219,24 @@ pub async fn handle_app_session_modify(app_session_id: &str, request: &SbiReques
 
     match app {
         Some(app) => {
+            // #321: a PATCH carrying TSC containers replaces the stored set, so a
+            // reconfiguration reaches the SMF. Handled before the media-component
+            // branch so a PATCH that carries BOTH pushes one notification holding
+            // both, rather than two notifications each missing half.
+            let carries_tsc = !asc.tsc.is_empty();
+            if carries_tsc {
+                if let Ok(context) = ctx.read() {
+                    if let Some(mut sess) = context.sess_find_by_id(app.sess_id) {
+                        sess.tsc_containers = asc.tsc.clone();
+                        context.sess_update(&sess);
+                    }
+                }
+                log::info!(
+                    "App session modify replaced TSC containers on sess_id={}",
+                    app.sess_id
+                );
+            }
+
             if !asc.med_components.is_empty() {
                 // Re-derive the AF PCC rules and push them to the SMF.
                 let mut installed = 0usize;
@@ -3152,6 +3254,8 @@ pub async fn handle_app_session_modify(app_session_id: &str, request: &SbiReques
                     app.sess_id
                 );
                 notify_af_resource_allocation(app.id, installed > 0);
+            } else if carries_tsc {
+                pcf_sbi_send_af_smpolicycontrol_update_notify(app.sess_id);
             }
 
             let mut resp_body = build_app_session_context(&app.app_session_id, req_root, &asc);

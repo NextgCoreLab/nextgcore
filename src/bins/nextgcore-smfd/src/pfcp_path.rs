@@ -376,6 +376,105 @@ pub fn forget_session_peer(smf_n4_seid: u64) {
     if let Ok(mut map) = session_peers().write() {
         map.remove(&smf_n4_seid);
     }
+    forget_session_bridge_info(smf_n4_seid);
+}
+
+/// The 5GS bridge info a TSC-capable UPF reported per session (#321), keyed by the
+/// SMF-side N4 SEID for the same collision reason as [`SESSION_PEERS`].
+static SESSION_BRIDGE_INFO: OnceLock<
+    std::sync::RwLock<HashMap<u64, nextgcore_pfcp::types::CreatedBridgeInfoForTsc>>,
+> = OnceLock::new();
+
+fn session_bridge_info(
+) -> &'static std::sync::RwLock<HashMap<u64, nextgcore_pfcp::types::CreatedBridgeInfoForTsc>> {
+    SESSION_BRIDGE_INFO.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+}
+
+/// Record the DS-TT port number and 5GS User Plane Node ID a UPF allocated for a
+/// session (TS 29.244 §7.5.3.6).
+pub fn record_session_bridge_info(
+    smf_n4_seid: u64,
+    info: nextgcore_pfcp::types::CreatedBridgeInfoForTsc,
+) {
+    if let Ok(mut map) = session_bridge_info().write() {
+        map.insert(smf_n4_seid, info);
+    }
+}
+
+/// The recorded bridge info for a session, if the UPF supplied any.
+pub fn session_bridge_info_for(
+    smf_n4_seid: u64,
+) -> Option<nextgcore_pfcp::types::CreatedBridgeInfoForTsc> {
+    session_bridge_info()
+        .read()
+        .ok()
+        .and_then(|map| map.get(&smf_n4_seid).copied())
+}
+
+/// Drop a session's bridge info. Called from [`forget_session_peer`] rather than
+/// separately, so the two maps cannot diverge into a bridge record for a session
+/// whose UPF binding is gone.
+fn forget_session_bridge_info(smf_n4_seid: u64) {
+    if let Ok(mut map) = session_bridge_info().write() {
+        map.remove(&smf_n4_seid);
+    }
+}
+
+/// The most recent TSC Management Information a UPF reported per UPF SEID (#321).
+///
+/// Keyed by the UPF SEID, unlike the two maps above: a Session Report Request
+/// arrives addressed to the SMF with the UPF's own SEID in the header, and that is
+/// the only key available at the point the report is decoded.
+///
+/// Holds the LATEST report rather than a history: a TSC report is a statement of
+/// current port configuration, so an older one is superseded rather than additional.
+static TSC_REPORTS: OnceLock<
+    std::sync::RwLock<HashMap<u64, Vec<nextgcore_pfcp::types::TscManagementInformation>>>,
+> = OnceLock::new();
+
+fn tsc_reports(
+) -> &'static std::sync::RwLock<HashMap<u64, Vec<nextgcore_pfcp::types::TscManagementInformation>>>
+{
+    TSC_REPORTS.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+}
+
+/// Record the TSC Management Information a Session Report carried.
+///
+/// An EMPTY report list is not stored: it would be indistinguishable from a decoded
+/// report that happened to carry nothing, and the caller already logs the
+/// TMIR-without-IE case as the peer contradiction it is.
+pub fn record_tsc_report(
+    upf_seid: u64,
+    reports: Vec<nextgcore_pfcp::types::TscManagementInformation>,
+) {
+    if reports.is_empty() {
+        return;
+    }
+    if let Ok(mut map) = tsc_reports().write() {
+        map.insert(upf_seid, reports);
+    }
+}
+
+/// The TSC Management Information last reported for a UPF SEID.
+pub fn tsc_reports_for(
+    upf_seid: u64,
+) -> Option<Vec<nextgcore_pfcp::types::TscManagementInformation>> {
+    tsc_reports()
+        .read()
+        .ok()
+        .and_then(|map| map.get(&upf_seid).cloned())
+}
+
+/// Clear the recorded TSC reports.
+///
+/// Test-only, and declared BESIDE the map rather than in a `mod tests`: the map is
+/// process-global, so a test that mutates it races every sibling that reads it, and
+/// a lock declared elsewhere is a second agreement rather than one.
+#[cfg(test)]
+pub fn clear_tsc_reports_for_test() {
+    if let Ok(mut map) = tsc_reports().write() {
+        map.clear();
+    }
 }
 
 /// Resolve the PFCP client serving an EXISTING session by the SMF-side N4
@@ -989,6 +1088,14 @@ pub(crate) mod stand_in {
         /// lets one drive the SMF's cause-65 reconciliation over a real round trip
         /// rather than by calling the reconciler directly.
         session_cause: Arc<std::sync::atomic::AtomicU8>,
+        /// Bodies of the Session Modification Requests this stand-in received, in
+        /// order (#321).
+        ///
+        /// `seen` records message TYPES, which cannot answer "did the SMF send the
+        /// TSC IE, and with which containers" — the question the `tscu` gate turns
+        /// on. A gate test asserting only that a modification was or was not sent
+        /// would pass for a modification that carried the wrong IE.
+        pub(crate) modification_bodies: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
         /// Serialises every N4 test against every other; released with this value.
         _n4_guard: tokio::sync::MutexGuard<'static, ()>,
     }
@@ -1010,6 +1117,19 @@ pub(crate) mod stand_in {
         /// Forget the recorded traffic, so a test asserts only about its own.
         pub(crate) fn clear_seen(&self) {
             self.seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            self.modification_bodies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+        }
+
+        /// Bodies of the Session Modification Requests received since the last
+        /// [`Self::clear_seen`] (#321).
+        pub(crate) fn modification_bodies(&self) -> Vec<Vec<u8>> {
+            self.modification_bodies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
         }
 
         /// Answer the next Session Modification / Deletion with `cause` (#193).
@@ -1090,14 +1210,32 @@ pub(crate) mod stand_in {
     ///
     /// Not associated yet — [`associated_upf`] adds the handshake.
     pub(crate) async fn install_stand_in_upf() -> StandInUpf {
+        install_stand_in_upf_with_features(UpFunctionFeatures {
+            ftup: true,
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// Install a stand-in UPF advertising exactly `features` (#321).
+    ///
+    /// The features have to be chosen at INSTALL time, not later: they are baked
+    /// into the Association Setup Response, and the SMF reads them from the stored
+    /// `AssociationState` afterwards. A setter would only take effect on a
+    /// re-association, which is a different test.
+    pub(crate) async fn install_stand_in_upf_with_features(
+        features: UpFunctionFeatures,
+    ) -> StandInUpf {
         let n4_guard = N4_TEST_LOCK.lock().await;
         let (client, upf_sock) = client_with_silent_peer().await;
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let modification_bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
         let upf_seid = 0x0000_0000_dead_beef_u64;
         let upf_teid = 0x0000_1289_u32;
         let upf_ip = [127, 0, 0, 4];
 
         let recorded = seen.clone();
+        let recorded_bodies = modification_bodies.clone();
         let session_cause = Arc::new(std::sync::atomic::AtomicU8::new(
             pfcp_cause::REQUEST_ACCEPTED,
         ));
@@ -1116,6 +1254,12 @@ pub(crate) mod stand_in {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push(h.msg_type);
+                if h.msg_type == pfcp_message_type::SESSION_MODIFICATION_REQUEST {
+                    recorded_bodies
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(buf[h.body_offset..len].to_vec());
+                }
 
                 let reply = match h.msg_type {
                     pfcp_message_type::ASSOCIATION_SETUP_REQUEST => {
@@ -1124,10 +1268,7 @@ pub(crate) mod stand_in {
                             nextgcore_pfcp::types::PfcpCause::RequestAccepted,
                             rts,
                         );
-                        resp.up_function_features = Some(UpFunctionFeatures {
-                            ftup: true,
-                            ..Default::default()
-                        });
+                        resp.up_function_features = Some(features);
                         Some(Vec::from(build_message(
                             &PfcpMessage::AssociationSetupResponse(resp),
                             h.sequence_number,
@@ -1194,6 +1335,7 @@ pub(crate) mod stand_in {
             upf_teid,
             upf_ip,
             session_cause,
+            modification_bodies,
             _n4_guard: n4_guard,
         }
     }
@@ -1202,6 +1344,22 @@ pub(crate) mod stand_in {
     /// success path.
     pub(crate) async fn associated_upf() -> StandInUpf {
         let upf = install_stand_in_upf().await;
+        upf.client
+            .associate()
+            .await
+            .expect("the stand-in UPF must accept the association");
+        upf.clear_seen();
+        upf
+    }
+
+    /// An associated stand-in UPF advertising exactly `features` (#321).
+    ///
+    /// Note what the DEFAULT stand-in advertises: `ftup` only, so `tscu` is CLEAR.
+    /// That makes "a UPF that did not advertise TSC support" the default case rather
+    /// than something a test has to arrange, and the TSC-capable case the one that
+    /// states itself explicitly.
+    pub(crate) async fn associated_upf_with_features(features: UpFunctionFeatures) -> StandInUpf {
+        let upf = install_stand_in_upf_with_features(features).await;
         upf.client
             .associate()
             .await

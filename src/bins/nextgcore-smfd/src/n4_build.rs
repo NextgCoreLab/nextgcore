@@ -288,71 +288,90 @@ pub mod pfcp_ie {
     pub const IP_MULTICAST_ADDRESSING_INFO: u16 = 188;
     pub const JOIN_IP_MULTICAST_INFORMATION: u16 = 189;
     pub const LEAVE_IP_MULTICAST_INFORMATION: u16 = 190;
-    pub const CREATED_BRIDGE_INFO_FOR_TSC: u16 = 191;
-    pub const TSC_MANAGEMENT_INFORMATION: u16 = 192;
-    pub const TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_MODIFICATION_REQUEST: u16 = 193;
-    pub const TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_MODIFICATION_RESPONSE: u16 = 194;
-    pub const TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_REPORT_REQUEST: u16 = 195;
-    pub const CLOCK_DRIFT_CONTROL_INFORMATION: u16 = 196;
-    pub const CLOCK_DRIFT_REPORT: u16 = 197;
-    pub const REQUESTED_CLOCK_DRIFT_INFORMATION: u16 = 198;
-    pub const TIME_DOMAIN_NUMBER: u16 = 199;
-    pub const TIME_OFFSET_THRESHOLD: u16 = 200;
-    pub const CUMULATIVE_RATE_RATIO_THRESHOLD: u16 = 201;
-    pub const TIME_OFFSET_MEASUREMENT: u16 = 202;
-    pub const CUMULATIVE_RATE_RATIO_MEASUREMENT: u16 = 203;
-    pub const REMOVE_SRR: u16 = 204;
-    pub const CREATE_SRR: u16 = 205;
-    pub const UPDATE_SRR: u16 = 206;
-    pub const SESSION_REPORT: u16 = 207;
-    pub const SRR_ID: u16 = 208;
-    pub const ACCESS_AVAILABILITY_CONTROL_INFORMATION: u16 = 209;
-    pub const REQUESTED_ACCESS_AVAILABILITY_INFORMATION: u16 = 210;
-    pub const ACCESS_AVAILABILITY_REPORT: u16 = 211;
-    pub const ACCESS_AVAILABILITY_INFORMATION: u16 = 212;
-    pub const PROVIDE_ATSSS_CONTROL_INFORMATION: u16 = 213;
-    pub const ATSSS_CONTROL_PARAMETERS: u16 = 214;
-    pub const MPTCP_CONTROL_INFORMATION: u16 = 215;
-    pub const ATSSS_LL_CONTROL_INFORMATION: u16 = 216;
-    pub const PMF_CONTROL_INFORMATION: u16 = 217;
-    pub const MPTCP_PARAMETERS: u16 = 218;
-    pub const ATSSS_LL_PARAMETERS: u16 = 219;
-    pub const PMF_PARAMETERS: u16 = 220;
-    pub const MPTCP_ADDRESS_INFORMATION: u16 = 221;
-    pub const UE_LINK_SPECIFIC_IP_ADDRESS: u16 = 222;
-    pub const PMF_ADDRESS_INFORMATION: u16 = 223;
-    pub const ATSSS_LL_INFORMATION: u16 = 224;
-    pub const DATA_NETWORK_ACCESS_IDENTIFIER: u16 = 225;
-    pub const UE_IP_ADDRESS_POOL_INFORMATION: u16 = 226;
-    pub const AVERAGE_PACKET_DELAY: u16 = 227;
-    pub const MINIMUM_PACKET_DELAY: u16 = 228;
-    pub const MAXIMUM_PACKET_DELAY: u16 = 229;
-    pub const QOS_REPORT_TRIGGER: u16 = 230;
-    pub const GTP_U_PATH_QOS_CONTROL_INFORMATION: u16 = 231;
-    pub const GTP_U_PATH_QOS_REPORT: u16 = 232;
-    pub const QOS_INFORMATION_IN_GTP_U_PATH_QOS_REPORT: u16 = 233;
-    pub const GTP_U_PATH_INTERFACE_TYPE: u16 = 234;
-    pub const QOS_MONITORING_PER_QOS_FLOW_CONTROL_INFORMATION: u16 = 235;
-    pub const REQUESTED_QOS_MONITORING: u16 = 236;
-    pub const REPORTING_FREQUENCY: u16 = 237;
-    pub const PACKET_DELAY_THRESHOLDS: u16 = 238;
-    pub const MINIMUM_WAIT_TIME: u16 = 239;
-    pub const QOS_MONITORING_REPORT: u16 = 240;
-    pub const QOS_MONITORING_MEASUREMENT: u16 = 241;
-    pub const MT_EDT_CONTROL_INFORMATION: u16 = 242;
-    pub const DL_DATA_PACKETS_SIZE: u16 = 243;
-    pub const QER_CONTROL_INDICATIONS: u16 = 244;
-    pub const PACKET_RATE_STATUS_REPORT: u16 = 245;
-    pub const NF_INSTANCE_ID: u16 = 246;
-    pub const ETHERNET_CONTEXT_INFORMATION: u16 = 247;
-    pub const REDUNDANT_TRANSMISSION_PARAMETERS: u16 = 248;
-    pub const UPDATED_PDR: u16 = 249;
-    pub const S_NSSAI: u16 = 250;
-    pub const IP_VERSION: u16 = 251;
-    pub const PFCPASREQ_FLAGS: u16 = 252;
-    pub const DATA_STATUS: u16 = 253;
-    pub const PROVIDE_RDS_CONFIGURATION_INFORMATION: u16 = 254;
-    pub const RDS_CONFIGURATION_INFORMATION: u16 = 255;
+    // NOTE (#321): every constant from here down was WRONG before #321. The table
+    // omitted IP Multicast Address (191), so 191 onward was shifted by one, and
+    // further omissions grew the shift to seven by 202 — e.g. TSC Management
+    // Information within a Session Modification Request was declared as 193
+    // (really Packet Rate Status) instead of 199. `S_NSSAI` was the only one of the
+    // 65 with a caller, and it was live: `add_s_nssai` sent every 5GC session's
+    // slice identity as IE 250, "DL Data Packets Size". Nothing in this tree reads
+    // S-NSSAI over N4, which is why it went unnoticed. Pinned against
+    // `nextgcore_pfcp::ie::IeType` by a test at the bottom of this file so it
+    // cannot drift again.
+    pub const IP_MULTICAST_ADDRESS: u16 = 191;
+    pub const SOURCE_IP_ADDRESS: u16 = 192;
+    pub const PACKET_RATE_STATUS: u16 = 193;
+    pub const CREATE_BRIDGE_INFO_FOR_TSC: u16 = 194;
+    pub const CREATED_BRIDGE_INFO_FOR_TSC: u16 = 195;
+    pub const DS_TT_PORT_NUMBER: u16 = 196;
+    pub const NW_TT_PORT_NUMBER: u16 = 197;
+    pub const FIVEGS_USER_PLANE_NODE: u16 = 198;
+    pub const TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_MODIFICATION_REQUEST: u16 = 199;
+    pub const TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_MODIFICATION_RESPONSE: u16 = 200;
+    pub const TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_REPORT_REQUEST: u16 = 201;
+    pub const PORT_MANAGEMENT_INFORMATION_CONTAINER: u16 = 202;
+    pub const CLOCK_DRIFT_CONTROL_INFORMATION: u16 = 203;
+    pub const REQUESTED_CLOCK_DRIFT_INFORMATION: u16 = 204;
+    pub const CLOCK_DRIFT_REPORT: u16 = 205;
+    pub const TIME_DOMAIN_NUMBER: u16 = 206;
+    pub const TIME_OFFSET_THRESHOLD: u16 = 207;
+    pub const CUMULATIVE_RATE_RATIO_THRESHOLD: u16 = 208;
+    pub const TIME_OFFSET_MEASUREMENT: u16 = 209;
+    pub const CUMULATIVE_RATE_RATIO_MEASUREMENT: u16 = 210;
+    pub const REMOVE_SRR: u16 = 211;
+    pub const CREATE_SRR: u16 = 212;
+    pub const UPDATE_SRR: u16 = 213;
+    pub const SESSION_REPORT: u16 = 214;
+    pub const SRR_ID: u16 = 215;
+    pub const ACCESS_AVAILABILITY_CONTROL_INFORMATION: u16 = 216;
+    pub const REQUESTED_ACCESS_AVAILABILITY_INFORMATION: u16 = 217;
+    pub const ACCESS_AVAILABILITY_REPORT: u16 = 218;
+    pub const ACCESS_AVAILABILITY_INFORMATION: u16 = 219;
+    pub const PROVIDE_ATSSS_CONTROL_INFORMATION: u16 = 220;
+    pub const ATSSS_CONTROL_PARAMETERS: u16 = 221;
+    pub const MPTCP_CONTROL_INFORMATION: u16 = 222;
+    pub const ATSSS_LL_CONTROL_INFORMATION: u16 = 223;
+    pub const PMF_CONTROL_INFORMATION: u16 = 224;
+    pub const MPTCP_PARAMETERS: u16 = 225;
+    pub const ATSSS_LL_PARAMETERS: u16 = 226;
+    pub const PMF_PARAMETERS: u16 = 227;
+    pub const MPTCP_ADDRESS_INFORMATION: u16 = 228;
+    pub const UE_LINK_SPECIFIC_IP_ADDRESS: u16 = 229;
+    pub const PMF_ADDRESS_INFORMATION: u16 = 230;
+    pub const ATSSS_LL_INFORMATION: u16 = 231;
+    pub const DATA_NETWORK_ACCESS_IDENTIFIER: u16 = 232;
+    pub const UE_IP_ADDRESS_POOL_INFORMATION: u16 = 233;
+    pub const AVERAGE_PACKET_DELAY: u16 = 234;
+    pub const MINIMUM_PACKET_DELAY: u16 = 235;
+    pub const MAXIMUM_PACKET_DELAY: u16 = 236;
+    pub const QOS_REPORT_TRIGGER: u16 = 237;
+    pub const GTP_U_PATH_QOS_CONTROL_INFORMATION: u16 = 238;
+    pub const GTP_U_PATH_QOS_REPORT: u16 = 239;
+    pub const QOS_INFORMATION_IN_GTP_U_PATH_QOS_REPORT: u16 = 240;
+    pub const GTP_U_PATH_INTERFACE_TYPE: u16 = 241;
+    pub const QOS_MONITORING_PER_QOS_FLOW_CONTROL_INFORMATION: u16 = 242;
+    pub const REQUESTED_QOS_MONITORING: u16 = 243;
+    pub const REPORTING_FREQUENCY: u16 = 244;
+    pub const PACKET_DELAY_THRESHOLDS: u16 = 245;
+    pub const MINIMUM_WAIT_TIME: u16 = 246;
+    pub const QOS_MONITORING_REPORT: u16 = 247;
+    pub const QOS_MONITORING_MEASUREMENT: u16 = 248;
+    pub const MT_EDT_CONTROL_INFORMATION: u16 = 249;
+    pub const DL_DATA_PACKETS_SIZE: u16 = 250;
+    pub const QER_CONTROL_INDICATIONS: u16 = 251;
+    pub const PACKET_RATE_STATUS_REPORT: u16 = 252;
+    pub const NF_INSTANCE_ID: u16 = 253;
+    pub const ETHERNET_CONTEXT_INFORMATION: u16 = 254;
+    pub const REDUNDANT_TRANSMISSION_PARAMETERS: u16 = 255;
+    pub const UPDATED_PDR: u16 = 256;
+    pub const S_NSSAI: u16 = 257;
+    pub const IP_VERSION: u16 = 258;
+    pub const PFCPASREQ_FLAGS: u16 = 259;
+    pub const DATA_STATUS: u16 = 260;
+    pub const PROVIDE_RDS_CONFIGURATION_INFORMATION: u16 = 261;
+    pub const RDS_CONFIGURATION_INFORMATION: u16 = 262;
+    /// TS 29.244 §8.2.182, the UMIC (#321).
+    pub const USER_PLANE_NODE_MANAGEMENT_INFORMATION_CONTAINER: u16 = 266;
 }
 
 // ============================================================================
@@ -1093,6 +1112,13 @@ pub struct SessionModificationParams {
     pub update_urrs: Vec<(UrrParams, u64)>,
     /// URRs to remove
     pub remove_urr_ids: Vec<u32>,
+    /// TSC Management Information IEs (IE 199, TS 29.244 §7.5.4.18), #321.
+    ///
+    /// The codec lives in `nextgcore-pfcp`; this builder emits its bytes under the
+    /// carrier IE type, so there is ONE encoder for the containers even though this
+    /// crate builds its messages with a raw TLV builder rather than the library's
+    /// typed messages.
+    pub tsc_management_info: Vec<nextgcore_pfcp::types::TscManagementInformation>,
 }
 
 /// Build PFCP Session Modification Request
@@ -1186,6 +1212,18 @@ pub fn build_session_modification_request(params: &SessionModificationParams) ->
     for urr_id in &params.remove_urr_ids {
         let urr_bytes = build_remove_urr(*urr_id);
         builder.add_tlv(pfcp_ie::REMOVE_URR, &urr_bytes);
+    }
+
+    // TSC Management Information (IE 199, TS 29.244 §7.5.4.18), #321. The grouped
+    // payload is produced by `nextgcore-pfcp`'s codec rather than assembled here, so
+    // the PMIC/UMIC/NW-TT encoding has exactly one implementation in the tree.
+    for tsc in params.tsc_management_info.iter().filter(|t| !t.is_empty()) {
+        let mut tsc_buf = bytes::BytesMut::new();
+        tsc.encode(&mut tsc_buf);
+        builder.add_tlv(
+            pfcp_ie::TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_MODIFICATION_REQUEST,
+            &tsc_buf,
+        );
     }
 
     builder.build()
@@ -1716,6 +1754,167 @@ pub fn build_create_bar(params: &BarParams) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pin this crate's `pfcp_ie` numbers against `nextgcore_pfcp::ie::IeType`,
+    /// which is the tree's authoritative TS 29.244 Table 8.1.2-1 transcription (#321).
+    ///
+    /// # Why this test exists
+    ///
+    /// Before #321 this table was WRONG from IE 191 down. It omitted IP Multicast
+    /// Address (191), which shifted everything after it, and further omissions grew
+    /// the shift to seven by IE 202 — so `S_NSSAI` was declared as 250 instead of
+    /// 257, and `add_s_nssai` sent every 5GC session's slice identity under
+    /// "DL Data Packets Size". It went unnoticed for two reasons worth naming: no
+    /// peer in this tree reads S-NSSAI over N4, and the other 64 shifted constants
+    /// had no callers at all, so nothing failed. A second, hand-maintained copy of a
+    /// 250-row wire table cannot be kept correct by review; it has to be pinned.
+    ///
+    /// Only the numbers are compared, not the names: this module spells them
+    /// `SCREAMING_SNAKE` and uses some alternative-but-equivalent names (e.g.
+    /// `UPDATE_BAR_RESPONSE` for the library's `UpdateBar`), and those are
+    /// deliberate rather than drift.
+    #[test]
+    fn test_pfcp_ie_numbers_match_the_authoritative_table() {
+        use nextgcore_pfcp::ie::IeType;
+
+        // (this crate's constant, the library's constant) for every IE this module
+        // declares that the library also declares. A mismatch here means one of the
+        // two disagrees with TS 29.244, and the library is the one with the
+        // round-trip tests.
+        let pairs: [(&str, u16, u16); 24] = [
+            (
+                "IpMulticastAddress",
+                pfcp_ie::IP_MULTICAST_ADDRESS,
+                IeType::IpMulticastAddress as u16,
+            ),
+            (
+                "SourceIpAddress",
+                pfcp_ie::SOURCE_IP_ADDRESS,
+                IeType::SourceIpAddress as u16,
+            ),
+            (
+                "PacketRateStatus",
+                pfcp_ie::PACKET_RATE_STATUS,
+                IeType::PacketRateStatus as u16,
+            ),
+            (
+                "CreateBridgeInfoForTsc",
+                pfcp_ie::CREATE_BRIDGE_INFO_FOR_TSC,
+                IeType::CreateBridgeInfoForTsc as u16,
+            ),
+            (
+                "CreatedBridgeInfoForTsc",
+                pfcp_ie::CREATED_BRIDGE_INFO_FOR_TSC,
+                IeType::CreatedBridgeInfoForTsc as u16,
+            ),
+            (
+                "DsTtPortNumber",
+                pfcp_ie::DS_TT_PORT_NUMBER,
+                IeType::DsTtPortNumber as u16,
+            ),
+            (
+                "NwTtPortNumber",
+                pfcp_ie::NW_TT_PORT_NUMBER,
+                IeType::NwTtPortNumber as u16,
+            ),
+            (
+                "FivegsUserPlaneNode",
+                pfcp_ie::FIVEGS_USER_PLANE_NODE,
+                IeType::FivegsUserPlaneNode as u16,
+            ),
+            (
+                "TscManagementInformationSmr",
+                pfcp_ie::TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_MODIFICATION_REQUEST,
+                IeType::TscManagementInformationSmr as u16,
+            ),
+            (
+                "TscManagementInformationSmrsp",
+                pfcp_ie::TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_MODIFICATION_RESPONSE,
+                IeType::TscManagementInformationSmrsp as u16,
+            ),
+            (
+                "TscManagementInformationSrr",
+                pfcp_ie::TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_REPORT_REQUEST,
+                IeType::TscManagementInformationSrr as u16,
+            ),
+            (
+                "PortManagementInformationContainer",
+                pfcp_ie::PORT_MANAGEMENT_INFORMATION_CONTAINER,
+                IeType::PortManagementInformationContainer as u16,
+            ),
+            (
+                "ClockDriftControlInformation",
+                pfcp_ie::CLOCK_DRIFT_CONTROL_INFORMATION,
+                IeType::ClockDriftControlInformation as u16,
+            ),
+            (
+                "RequestedClockDriftInformation",
+                pfcp_ie::REQUESTED_CLOCK_DRIFT_INFORMATION,
+                IeType::RequestedClockDriftInformation as u16,
+            ),
+            (
+                "ClockDriftReport",
+                pfcp_ie::CLOCK_DRIFT_REPORT,
+                IeType::ClockDriftReport as u16,
+            ),
+            (
+                "TimeDomainNumber",
+                pfcp_ie::TIME_DOMAIN_NUMBER,
+                IeType::TimeDomainNumber as u16,
+            ),
+            ("RemoveSrr", pfcp_ie::REMOVE_SRR, IeType::RemoveSrr as u16),
+            ("CreateSrr", pfcp_ie::CREATE_SRR, IeType::CreateSrr as u16),
+            (
+                "SessionReport",
+                pfcp_ie::SESSION_REPORT,
+                IeType::SessionReport as u16,
+            ),
+            ("SrrId", pfcp_ie::SRR_ID, IeType::SrrId as u16),
+            (
+                "AtsssControlParameters",
+                pfcp_ie::ATSSS_CONTROL_PARAMETERS,
+                IeType::AtsssControlParameters as u16,
+            ),
+            (
+                "QosMonitoringReport",
+                pfcp_ie::QOS_MONITORING_REPORT,
+                IeType::QosMonitoringReport as u16,
+            ),
+            (
+                "NfInstanceId",
+                pfcp_ie::NF_INSTANCE_ID,
+                IeType::NfInstanceId as u16,
+            ),
+            (
+                "RedundantTransmissionParameters",
+                pfcp_ie::REDUNDANT_TRANSMISSION_PARAMETERS,
+                IeType::RedundantTransmissionParameters as u16,
+            ),
+        ];
+        for (name, ours, theirs) in pairs {
+            assert_eq!(
+                ours, theirs,
+                "{name}: smfd's pfcp_ie says {ours}, nextgcore-pfcp's IeType says \
+                 {theirs} — one of them disagrees with TS 29.244 Table 8.1.2-1"
+            );
+        }
+
+        // S-NSSAI is past the library table's range (it stops at 255 and resumes at
+        // 290), so it is pinned against the spec directly. TS 29.244 §8.2.176
+        // Figure 8.2.176-1: "Type = 257 (decimal)". This is the one that was live and
+        // wrong, so it gets its own assertion with the clause cited.
+        assert_eq!(
+            pfcp_ie::S_NSSAI,
+            257,
+            "S-NSSAI is IE 257 (TS 29.244 §8.2.176); 250 is DL Data Packets Size"
+        );
+        // The UMIC, likewise past the library's contiguous range (§8.2.182).
+        assert_eq!(
+            pfcp_ie::USER_PLANE_NODE_MANAGEMENT_INFORMATION_CONTAINER,
+            266,
+            "User Plane Node Management Information Container is IE 266 (§8.2.182)"
+        );
+    }
 
     #[test]
     fn test_pfcp_cause_from_u8() {

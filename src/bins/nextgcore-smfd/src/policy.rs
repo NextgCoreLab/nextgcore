@@ -89,6 +89,106 @@ pub struct PolicyDecision {
     /// True when this decision is the documented config-default fallback
     /// (no PCF configured), not an authorized PCF decision.
     pub is_config_default: bool,
+    /// TSC management containers the PCF authorised for this session (#321,
+    /// TS 29.512 `SmPolicyDecision.tsnBridgeManCont` / `tsnPortManContDstt` /
+    /// `tsnPortManContNwtts`), decoded from base64 ready for N4.
+    pub tsc: TscContainers,
+}
+
+/// The TSC management containers a PCF decision carries, decoded (#321).
+///
+/// Base64 on the SBI (TS 29.571 `Bytes`), raw octets on N4 (TS 29.244 §8.2.144 and
+/// §8.2.182), so the decode happens exactly once, here, at the boundary between
+/// the two — rather than in the N4 builder where a decode failure would be
+/// discovered with a half-built message in hand.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TscContainers {
+    /// The UMIC — bridge-level, no port identity.
+    pub bridge_man_cont: Option<Vec<u8>>,
+    /// The DS-TT port's PMIC, with its port number.
+    pub port_man_cont_dstt: Option<(Vec<u8>, u32)>,
+    /// One PMIC per NW-TT port, with its port number.
+    pub port_man_cont_nwtts: Vec<(Vec<u8>, u32)>,
+}
+
+impl TscContainers {
+    /// Whether the decision authorised any TSC configuration at all.
+    pub fn is_empty(&self) -> bool {
+        self.bridge_man_cont.is_none()
+            && self.port_man_cont_dstt.is_none()
+            && self.port_man_cont_nwtts.is_empty()
+    }
+
+    /// The TSC Management Information IEs these containers become on N4.
+    ///
+    /// One IE per NW-TT port carrying its PMIC and port number, plus one carrying
+    /// the UMIC alone — which is the split TS 29.244 §7.5.4.18's own note
+    /// prescribes ("several instances ... containing a Port Management Information
+    /// Container together with a NW-TT Port Number, and only one instance ...
+    /// containing a User Plane Node Management Information Container").
+    ///
+    /// The DS-TT container is deliberately NOT sent: §7.5.4.18 gives the TSC
+    /// Management Information IE an NW-TT Port Number and no DS-TT one, because the
+    /// device-side port's configuration travels to the DS-TT over NAS
+    /// (TS 24.501 §5.4.5), not over N4. Sending it here with an NW-TT port number
+    /// would tell the UPF to apply device-side configuration to a network-side port.
+    pub fn to_n4_ies(&self) -> Vec<nextgcore_pfcp::types::TscManagementInformation> {
+        use nextgcore_pfcp::types::TscManagementInformation;
+        let mut out = Vec::new();
+        for (cont, port) in &self.port_man_cont_nwtts {
+            out.push(TscManagementInformation::port(cont.clone(), *port));
+        }
+        if let Some(umic) = &self.bridge_man_cont {
+            out.push(TscManagementInformation::user_plane_node(umic.clone()));
+        }
+        out
+    }
+}
+
+/// Decode a TS 29.571 `Bytes` (base64) member, or `None` when absent or malformed.
+///
+/// A malformed container is dropped WITH A WARNING rather than passed through: the
+/// N4 IE is an octet string, so anything would encode, and a UPF would then apply
+/// (or reject) configuration the PCF never sent. Logging it is what makes the gap
+/// attributable to the PCF rather than to the UPF.
+fn decode_container(v: Option<&serde_json::Value>, what: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let s = v?.as_str()?;
+    match base64::engine::general_purpose::STANDARD.decode(s) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            log::warn!("SmPolicyDecision {what} is not valid base64, ignoring: {e}");
+            None
+        }
+    }
+}
+
+/// Parse one TS 29.512 `PortManagementContainer`. Both members are required by the
+/// schema, so a value missing either is dropped rather than defaulted — a `portNum`
+/// defaulted to 0 would name the NW-TT port the TSCTSF's derivation reserves.
+fn parse_port_container(v: &serde_json::Value) -> Option<(Vec<u8>, u32)> {
+    let cont = decode_container(v.get("portManCont"), "portManCont")?;
+    let num = v.get("portNum")?.as_u64()?;
+    Some((cont, num as u32))
+}
+
+/// Parse the TSC containers out of an `SmPolicyDecision` (#321).
+pub fn parse_tsc_containers(json: &serde_json::Value) -> TscContainers {
+    TscContainers {
+        bridge_man_cont: decode_container(
+            json.get("tsnBridgeManCont")
+                .and_then(|v| v.get("bridgeManCont")),
+            "tsnBridgeManCont.bridgeManCont",
+        ),
+        port_man_cont_dstt: json
+            .get("tsnPortManContDstt")
+            .and_then(parse_port_container),
+        port_man_cont_nwtts: json
+            .get("tsnPortManContNwtts")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(parse_port_container).collect())
+            .unwrap_or_default(),
+    }
 }
 
 impl PolicyDecision {
@@ -132,6 +232,10 @@ impl PolicyDecision {
             pcc_rules: Vec::new(),
             triggers: Vec::new(),
             is_config_default: true,
+            // No PCF means no TSC authorisation. There is deliberately no local
+            // default here: TSC configuration comes from a TSN AF via the PCF, and
+            // inventing one would have the SMF configure a bridge nobody asked for.
+            tsc: TscContainers::default(),
         }
     }
 
@@ -686,6 +790,7 @@ pub fn parse_sm_policy_decision(sm_policy_id: &str, json: &serde_json::Value) ->
         ..PolicyDecision::config_default()
     };
     dec.is_config_default = false;
+    dec.tsc = parse_tsc_containers(json);
 
     // Session rules: authorized session AMBR + default QoS
     if let Some(rules) = json.get("sessRules").and_then(|v| v.as_object()) {
@@ -2059,5 +2164,115 @@ mod tests {
             port: 7777,
         };
         let _ = ep.client();
+    }
+    // ------------------------------------------------------------------
+    // TSC containers in an SmPolicyDecision (#321)
+    // ------------------------------------------------------------------
+
+    /// The SMF half of criterion 5: the containers the PCF authorised are parsed out
+    /// of the decision and base64-DECODED, so what reaches N4 is the octet string the
+    /// TSN AF built.
+    #[test]
+    fn test_tsc_containers_parsed_and_base64_decoded_from_a_decision() {
+        // "umic" / "dstt" / "nwtt" in base64.
+        let json = serde_json::json!({
+            "tsnBridgeManCont": { "bridgeManCont": "dW1pYw==" },
+            "tsnPortManContDstt": { "portManCont": "ZHN0dA==", "portNum": 1 },
+            "tsnPortManContNwtts": [
+                { "portManCont": "bnd0dA==", "portNum": 7 },
+                { "portManCont": "bnd0dA==", "portNum": 8 }
+            ],
+        });
+        let dec = parse_sm_policy_decision("pol-1", &json);
+
+        assert_eq!(
+            dec.tsc.bridge_man_cont.as_deref(),
+            Some(&b"umic"[..]),
+            "the UMIC must arrive as raw octets: N4 carries an octet string, not base64"
+        );
+        assert_eq!(
+            dec.tsc.port_man_cont_dstt,
+            Some((b"dstt".to_vec(), 1)),
+            "the DS-TT container keeps its port number even though it is not sent over N4"
+        );
+        assert_eq!(dec.tsc.port_man_cont_nwtts.len(), 2);
+        assert_eq!(dec.tsc.port_man_cont_nwtts[0], (b"nwtt".to_vec(), 7));
+        assert_eq!(dec.tsc.port_man_cont_nwtts[1], (b"nwtt".to_vec(), 8));
+        assert!(!dec.tsc.is_empty());
+    }
+
+    /// A decision with no TSC members yields no TSC configuration, so the ordinary
+    /// PCF path is unchanged.
+    #[test]
+    fn test_decision_without_tsc_members_authorises_no_tsc() {
+        let json = serde_json::json!({ "sessRules": {} });
+        let dec = parse_sm_policy_decision("pol-2", &json);
+        assert!(dec.tsc.is_empty());
+        assert!(dec.tsc.to_n4_ies().is_empty());
+    }
+
+    /// A container that is not valid base64 is DROPPED, not passed through.
+    ///
+    /// The N4 IE is an octet string, so any bytes would encode and the UPF would
+    /// then apply — or reject — configuration the PCF never sent. Dropping makes the
+    /// gap attributable to the PCF.
+    #[test]
+    fn test_malformed_base64_container_is_dropped() {
+        let json = serde_json::json!({
+            "tsnBridgeManCont": { "bridgeManCont": "not!valid!base64!" },
+            "tsnPortManContNwtts": [{ "portManCont": "bnd0dA==", "portNum": 7 }],
+        });
+        let dec = parse_sm_policy_decision("pol-3", &json);
+        assert!(
+            dec.tsc.bridge_man_cont.is_none(),
+            "a malformed UMIC must not become a container of garbage bytes"
+        );
+        assert_eq!(
+            dec.tsc.port_man_cont_nwtts.len(),
+            1,
+            "and the well-formed siblings in the same decision must survive it"
+        );
+    }
+
+    /// A `PortManagementContainer` missing `portNum` is dropped rather than
+    /// defaulted to 0 — which is the port number the TSCTSF's own derivation
+    /// reserves for the NW-TT side, so a default would silently name a real port.
+    #[test]
+    fn test_port_container_without_port_num_is_dropped() {
+        let json = serde_json::json!({
+            "tsnPortManContNwtts": [
+                { "portManCont": "bnd0dA==" },
+                { "portManCont": "bnd0dA==", "portNum": 7 }
+            ],
+        });
+        let dec = parse_sm_policy_decision("pol-4", &json);
+        assert_eq!(dec.tsc.port_man_cont_nwtts, vec![(b"nwtt".to_vec(), 7)]);
+    }
+
+    /// `to_n4_ies` produces one IE per NW-TT port plus one for the UMIC, and
+    /// deliberately omits the DS-TT container.
+    ///
+    /// TS 29.244 §7.5.4.18 gives the TSC Management Information IE an NW-TT Port
+    /// Number and no DS-TT one: the device-side port's configuration travels to the
+    /// DS-TT over NAS, not over N4. Sending it here would attribute device-side
+    /// configuration to a network-side port.
+    #[test]
+    fn test_to_n4_ies_omits_the_dstt_container() {
+        let tsc = TscContainers {
+            bridge_man_cont: Some(b"umic".to_vec()),
+            port_man_cont_dstt: Some((b"dstt".to_vec(), 1)),
+            port_man_cont_nwtts: vec![(b"nwtt".to_vec(), 7)],
+        };
+        let ies = tsc.to_n4_ies();
+        assert_eq!(ies.len(), 2, "one NW-TT PMIC and one UMIC");
+        assert!(
+            !ies.iter()
+                .any(|ie| ie.port_management_container.as_deref() == Some(&b"dstt"[..])),
+            "the DS-TT container must NOT go over N4"
+        );
+        assert!(
+            ies.iter().all(|ie| ie.conditional_holds()),
+            "every emitted IE must satisfy the NW-TT-port conditional"
+        );
     }
 }

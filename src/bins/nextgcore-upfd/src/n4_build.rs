@@ -171,6 +171,17 @@ pub mod pfcp_ie {
     pub const UR_SEQN: u16 = 104;
     /// Suggested Buffering Packets Count (TS 29.244 8.2.103)
     pub const SUGGESTED_BUFFERING_PACKETS_COUNT: u16 = 140;
+    /// NW-TT Port Number (TS 29.244 §8.2.142), #321.
+    pub const NW_TT_PORT_NUMBER: u16 = 197;
+    /// TSC Management Information within a Session Modification Request
+    /// (TS 29.244 §7.5.4.18), #321.
+    pub const TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_MODIFICATION_REQUEST: u16 = 199;
+    /// TSC Management Information within a Session Modification Response
+    /// (TS 29.244 §7.5.5.3), #321.
+    pub const TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_MODIFICATION_RESPONSE: u16 = 200;
+    /// TSC Management Information within a Session Report Request
+    /// (TS 29.244 §7.5.8.5), #321.
+    pub const TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_REPORT_REQUEST: u16 = 201;
 }
 
 /// PFCPSMReq-Flags bit values (TS 29.244 8.2.50)
@@ -769,6 +780,21 @@ pub fn build_session_modification_response_with_reports(
     created_pdrs: &[CreatedPdr],
     usage_reports: &[UsageReport],
 ) -> Vec<u8> {
+    build_session_modification_response_full(msg_type, created_pdrs, usage_reports, &[])
+}
+
+/// Build Session Modification Response, also carrying the TSC Management
+/// Information the UP function applied (IE 200, TS 29.244 §7.5.5.3), #321.
+///
+/// The echo is what lets the CP function tell "applied" from "accepted": a bare
+/// `RequestAccepted` for a TSC modification says the message was well-formed, not
+/// that any port configuration landed.
+pub fn build_session_modification_response_full(
+    msg_type: u8,
+    created_pdrs: &[CreatedPdr],
+    usage_reports: &[UsageReport],
+    tsc_management_info: &[nextgcore_pfcp::types::TscManagementInformation],
+) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
 
     // Cause - Request Accepted
@@ -781,6 +807,16 @@ pub fn build_session_modification_response_with_reports(
 
     for report in usage_reports {
         builder.add_usage_report(report, pfcp_ie::USAGE_REPORT_SMR);
+    }
+
+    // TSC Management Information (IE 200), encoded by the library codec.
+    for tsc in tsc_management_info.iter().filter(|t| !t.is_empty()) {
+        let mut tsc_buf = BytesMut::new();
+        tsc.encode(&mut tsc_buf);
+        builder.add_tlv(
+            pfcp_ie::TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_MODIFICATION_RESPONSE,
+            &tsc_buf,
+        );
     }
 
     let _ = msg_type;

@@ -686,6 +686,18 @@ pub struct TsnBridge {
     pub time_aware_scheduling_enabled: bool,
     /// Cycle time for time-aware scheduling (nanoseconds)
     pub cycle_time_ns: u64,
+    /// Port Management Information Containers received over N4, keyed by the NW-TT
+    /// port number they were sent with (#321, TS 29.244 §8.2.144).
+    ///
+    /// Held as RAW OCTETS and not interpreted: §8.2.144 says the container encodes a
+    /// Port management message from clause 8 of TS 24.539, and this tree has no
+    /// TS 24.539 codec. Storing them is what makes the configuration the SMF sent
+    /// observable and reportable; acting on their contents needs that codec and is a
+    /// stated ceiling.
+    pub port_management_containers: HashMap<u32, Vec<u8>>,
+    /// The User Plane Node Management Information Container (the UMIC) last received
+    /// over N4 (§8.2.182). Bridge-level, so there is one, not one per port.
+    pub user_plane_node_management_container: Option<Vec<u8>>,
 }
 
 impl TsnBridge {
@@ -699,7 +711,84 @@ impl TsnBridge {
             cnc_interface: None,
             time_aware_scheduling_enabled: false,
             cycle_time_ns: 1_000_000, // Default 1ms cycle
+            port_management_containers: HashMap::new(),
+            user_plane_node_management_container: None,
         }
+    }
+
+    /// Apply one TSC Management Information IE received over N4 (#321,
+    /// TS 29.244 §7.5.4.18).
+    ///
+    /// Returns whether anything was applied. A PMIC with no NW-TT Port Number is
+    /// REJECTED rather than stored under a default port: §7.5.4.18 makes the port
+    /// number conditional-mandatory when a PMIC is present precisely because port
+    /// configuration with no port is unattributable, and defaulting it to 0 would
+    /// silently attribute it to whichever port happens to be numbered 0.
+    pub fn apply_tsc_management_information(
+        &mut self,
+        tsc: &nextgcore_pfcp::types::TscManagementInformation,
+    ) -> bool {
+        let mut applied = false;
+
+        match (&tsc.port_management_container, tsc.nw_tt_port_number) {
+            (Some(pmic), Some(port)) => {
+                // A port the bridge has no entry for gets one: the SMF naming a port
+                // in a PMIC is how the UPF learns the NW-TT side exists at all, and
+                // dropping the container until some other message creates the port
+                // would make the order of unrelated messages decide whether TSC works.
+                self.ports
+                    .entry(port as u16)
+                    .or_insert_with(|| TsnBridgePort {
+                        port_id: port as u16,
+                        vlan_id: 0,
+                        priority: 0,
+                        is_trunk: false,
+                        allowed_vlans: Vec::new(),
+                        port_type: TsnPortType::NetworkSideTt,
+                        time_aware_shaper_enabled: false,
+                        gate_control_list: Vec::new(),
+                    });
+                self.port_management_containers.insert(port, pmic.clone());
+                applied = true;
+            }
+            (Some(_), None) => {
+                log::warn!(
+                    "[TSN Bridge] TSC Management Information carries a PMIC with no NW-TT \
+                     Port Number — not applied (TS 29.244 Table 7.5.4.18-1)"
+                );
+            }
+            (None, _) => {}
+        }
+
+        if let Some(umic) = &tsc.user_plane_node_management_container {
+            self.user_plane_node_management_container = Some(umic.clone());
+            applied = true;
+        }
+
+        applied
+    }
+
+    /// What this bridge would report back in a TSC Management Information IE
+    /// (§7.5.5.3): the containers it holds, per port, plus the bridge-level one.
+    ///
+    /// This is an echo of what was applied, which is what makes the SMF's
+    /// "N sent, M echoed" comparison meaningful rather than a guess.
+    pub fn tsc_management_information(
+        &self,
+    ) -> Vec<nextgcore_pfcp::types::TscManagementInformation> {
+        use nextgcore_pfcp::types::TscManagementInformation;
+        let mut out: Vec<_> = self
+            .port_management_containers
+            .iter()
+            .map(|(port, cont)| TscManagementInformation::port(cont.clone(), *port))
+            .collect();
+        // Deterministic order: a HashMap iteration order would make the response
+        // bytes differ run to run for identical state, which no test can pin.
+        out.sort_by_key(|ie| ie.nw_tt_port_number);
+        if let Some(umic) = &self.user_plane_node_management_container {
+            out.push(TscManagementInformation::user_plane_node(umic.clone()));
+        }
+        out
     }
 
     /// Add a bridge port

@@ -202,8 +202,16 @@ pub enum IeType {
     IpMulticastAddress = 191,
     SourceIpAddress = 192,
     PacketRateStatus = 193,
+    /// TS 29.244 §8.2.140. Renamed "Create Bridge/Router Info" in Rel-18 when
+    /// DetNet was added (the RII flag beside BII); the Rel-17 spelling is kept
+    /// because it is what every 5GS-TSN caller in this tree means by it.
     CreateBridgeInfoForTsc = 194,
+    /// TS 29.244 §7.5.3.6, "Created Bridge/Router Info" from Rel-18 on.
     CreatedBridgeInfoForTsc = 195,
+    /// TS 29.244 §8.2.141. The spec calls this bare "Port Number" from Rel-18 on,
+    /// because for DetNet it is the PDU session's port rather than a DS-TT one.
+    /// For TSN (BII set) it IS the DS-TT port, which is the only case this tree
+    /// drives.
     DsTtPortNumber = 196,
     NwTtPortNumber = 197,
     FivegsUserPlaneNode = 198,
@@ -264,6 +272,11 @@ pub enum IeType {
     NfInstanceId = 253,
     EthernetContextInformation = 254,
     RedundantTransmissionParameters = 255,
+    /// TS 29.244 §8.2.182, the UMIC. The N4 counterpart of TS 29.512's
+    /// `BridgeManagementContainer` — the two specs name the same octet string
+    /// differently, which is why the SBI-side member is `tsnBridgeManCont` while
+    /// the IE is "User Plane Node Management Information Container".
+    UserPlaneNodeManagementInformationContainer = 266,
     PfcpSessionChangeInfo = 290,
     GroupId = 291,
     CpIpAddress = 292,

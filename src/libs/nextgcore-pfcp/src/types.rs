@@ -4267,6 +4267,294 @@ impl PfcpSessionChangeInfo {
     }
 }
 
+// ============================================================================
+// 5GS TSC bridge management (TS 29.244 §5.26, issue #321)
+// ============================================================================
+//
+// The SMF-to-UPF half of 5GS-TSN. The IE *identifiers* for all of this were
+// already declared in `ie.rs` with zero users; what follows is the codec, and
+// `message.rs` carries it on the four messages TS 29.244 puts it on.
+//
+// The three "TSC Management Information" IEs (199 within a Session Modification
+// Request, 200 within its Response, 201 within a Session Report Request) have
+// BYTE-IDENTICAL contents — Tables 7.5.4.18-1, 7.5.5.3-1 and 7.5.8.5-1 list the
+// same three members — so one type serves all three and the carrier IE type is
+// the caller's choice, not the type's. Modelling them as three structs would
+// triple the codec to encode the same bytes.
+
+/// Create Bridge/Router Info (TS 29.244 §8.2.140, IE 194).
+///
+/// One flags octet, sent on a Session Establishment Request to ask the UP
+/// function to allocate a port number and report its 5GS User Plane Node ID.
+///
+/// `bii` requests IEEE TSN bridge information; `rii` requests IETF DetNet router
+/// information. They are independent bits, so both, either or neither can be set
+/// — and "neither" is a real request that asks for nothing, which is why this is
+/// not modelled as an enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CreateBridgeInfoForTsc {
+    /// BII (bit 1): Bridge Information Indication — a DS-TT port number and the
+    /// related 5GS User Plane Node ID are requested.
+    pub bii: bool,
+    /// RII (bit 2): Router Information Indication — a PDU-session port number and
+    /// the related 5GS User Plane Node ID are requested (DetNet).
+    pub rii: bool,
+}
+
+impl CreateBridgeInfoForTsc {
+    /// Request IEEE TSN bridge information.
+    pub fn bridge() -> Self {
+        Self {
+            bii: true,
+            rii: false,
+        }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8((self.bii as u8) | ((self.rii as u8) << 1));
+    }
+
+    /// Decode from the IE payload.
+    ///
+    /// An EMPTY payload decodes to "neither flag set" rather than an error: the
+    /// figure's octet 5 is the only defined octet and a zero-length IE carries no
+    /// request, which is the same thing. Erroring would reject a message whose
+    /// meaning is unambiguous.
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        let flags = data.first().copied().unwrap_or(0);
+        Ok(Self {
+            bii: flags & 0x01 != 0,
+            rii: flags & 0x02 != 0,
+        })
+    }
+}
+
+/// 5GS User Plane Node ID (TS 29.244 §8.2.143, IE 198).
+///
+/// A flags octet whose BID bit says whether the 8-octet node-ID value follows.
+/// For IEEE TSN the value is the Bridge ID of IEEE 802.1Q clause 14.2.5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FiveGsUserPlaneNodeId {
+    /// The node ID, present iff the BID flag was set.
+    ///
+    /// `Option` rather than a bool plus a value, so a BID flag set with no value
+    /// (or a value with the flag clear) cannot be represented and then mis-sent.
+    pub node_id: Option<u64>,
+}
+
+impl FiveGsUserPlaneNodeId {
+    pub fn new(node_id: u64) -> Self {
+        Self {
+            node_id: Some(node_id),
+        }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(u8::from(self.node_id.is_some()));
+        if let Some(id) = self.node_id {
+            buf.put_u64(id);
+        }
+    }
+
+    /// Decode from the IE payload.
+    ///
+    /// The value is read only when BID is set AND eight octets are actually
+    /// present. A BID flag with a short value yields `None` rather than a
+    /// zero-padded node ID: a bridge ID that is wrong is worse than one that is
+    /// missing, because the SMF reports it to the PCF as the bridge's identity.
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        let flags = data.first().copied().unwrap_or(0);
+        let node_id = if flags & 0x01 != 0 && data.len() >= 9 {
+            Some(u64::from_be_bytes([
+                data[1], data[2], data[3], data[4], data[5], data[6], data[7], data[8],
+            ]))
+        } else {
+            None
+        };
+        Ok(Self { node_id })
+    }
+}
+
+/// Created Bridge/Router Info (TS 29.244 §7.5.3.6, IE 195) — grouped.
+///
+/// The UP function's answer to a `CreateBridgeInfoForTsc`: the port number it
+/// allocated for the PDU session, and its own 5GS User Plane Node ID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CreatedBridgeInfoForTsc {
+    /// Port Number (IE 196). For TSN this is the DS-TT port number.
+    pub port_number: Option<u32>,
+    /// 5GS User Plane Node ID (IE 198).
+    pub user_plane_node_id: Option<FiveGsUserPlaneNodeId>,
+}
+
+impl CreatedBridgeInfoForTsc {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{IeHeader, IeType};
+
+        if let Some(port) = self.port_number {
+            // §8.2.141: Length = 4, and for TSN the value is an Unsigned16 in
+            // octets 7-8 with 5-6 zero. Encoding the whole u32 big-endian gives
+            // exactly that for any port that fits in 16 bits, and stays correct
+            // for a DetNet Unsigned32 port.
+            let header = IeHeader::new(IeType::DsTtPortNumber as u16, 4);
+            header.encode(buf);
+            buf.put_u32(port);
+        }
+        if let Some(node) = &self.user_plane_node_id {
+            let mut node_buf = BytesMut::new();
+            node.encode(&mut node_buf);
+            let header = IeHeader::new(IeType::FivegsUserPlaneNode as u16, node_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&node_buf);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        use crate::ie::{IeHeader, IeType, RawIe};
+
+        let mut port_number = None;
+        let mut user_plane_node_id = None;
+
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            match ie.ie_type {
+                t if t == IeType::DsTtPortNumber as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        port_number = Some(data.get_u32());
+                    }
+                }
+                t if t == IeType::FivegsUserPlaneNode as u16 => {
+                    user_plane_node_id = Some(FiveGsUserPlaneNodeId::decode(&ie.data)?);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            port_number,
+            user_plane_node_id,
+        })
+    }
+}
+
+/// TSC Management Information (TS 29.244 §7.5.4.18 / §7.5.5.3 / §7.5.8.5) —
+/// grouped, carried as IE 199, 200 or 201 depending on the message.
+///
+/// Both containers are OPAQUE octet strings: §8.2.144 and §8.2.182 say they carry
+/// a Port management message and a User plane node management message defined in
+/// clauses 8 and 9 of TS 24.539. **This tree has no TS 24.539 codec**, so the
+/// containers are transported byte-exact and not interpreted — which is the
+/// correct behaviour for the SMF (a pure relay between the PCF and the UPF) and a
+/// stated ceiling for the UPF.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TscManagementInformation {
+    /// Port Management Information Container (IE 202) — the PMIC.
+    pub port_management_container: Option<Vec<u8>>,
+    /// User Plane Node Management Information Container (IE 266) — the UMIC.
+    pub user_plane_node_management_container: Option<Vec<u8>>,
+    /// NW-TT Port Number (IE 197). Conditional: the tables require it when a PMIC
+    /// is present, because a port container without a port is unattributable.
+    pub nw_tt_port_number: Option<u32>,
+}
+
+impl TscManagementInformation {
+    /// A PMIC for one NW-TT port. The port number is not optional here, since
+    /// that is exactly the condition the tables state.
+    pub fn port(container: Vec<u8>, nw_tt_port_number: u32) -> Self {
+        Self {
+            port_management_container: Some(container),
+            user_plane_node_management_container: None,
+            nw_tt_port_number: Some(nw_tt_port_number),
+        }
+    }
+
+    /// A UMIC, which is bridge-level and carries no port identity.
+    pub fn user_plane_node(container: Vec<u8>) -> Self {
+        Self {
+            port_management_container: None,
+            user_plane_node_management_container: Some(container),
+            nw_tt_port_number: None,
+        }
+    }
+
+    /// Whether this carries anything at all.
+    ///
+    /// An empty TSC Management Information IE is legal to decode (every member is
+    /// O or C) but pointless to send, so senders check this rather than emitting a
+    /// four-octet IE that says nothing.
+    pub fn is_empty(&self) -> bool {
+        self.port_management_container.is_none()
+            && self.user_plane_node_management_container.is_none()
+            && self.nw_tt_port_number.is_none()
+    }
+
+    /// Whether the conditional in Tables 7.5.4.18-1/7.5.5.3-1/7.5.8.5-1 holds:
+    /// "When PMIC IE is present, this IE shall contain the related NW-TT Port
+    /// Number."
+    ///
+    /// A PMIC with no port number is the one shape a receiver cannot act on — it
+    /// has port configuration and nothing to apply it to — so it is reported
+    /// rather than silently accepted.
+    pub fn conditional_holds(&self) -> bool {
+        self.port_management_container.is_none() || self.nw_tt_port_number.is_some()
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{encode_bytes_ie, IeHeader, IeType};
+
+        if let Some(pmic) = &self.port_management_container {
+            encode_bytes_ie(buf, IeType::PortManagementInformationContainer, pmic);
+        }
+        if let Some(umic) = &self.user_plane_node_management_container {
+            encode_bytes_ie(
+                buf,
+                IeType::UserPlaneNodeManagementInformationContainer,
+                umic,
+            );
+        }
+        if let Some(port) = self.nw_tt_port_number {
+            // §8.2.142: Length = 4, TSN value an Unsigned16 in octets 7-8.
+            let header = IeHeader::new(IeType::NwTtPortNumber as u16, 4);
+            header.encode(buf);
+            buf.put_u32(port);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        use crate::ie::{IeHeader, IeType, RawIe};
+
+        let mut port_management_container = None;
+        let mut user_plane_node_management_container = None;
+        let mut nw_tt_port_number = None;
+
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            match ie.ie_type {
+                t if t == IeType::PortManagementInformationContainer as u16 => {
+                    port_management_container = Some(ie.data.to_vec());
+                }
+                t if t == IeType::UserPlaneNodeManagementInformationContainer as u16 => {
+                    user_plane_node_management_container = Some(ie.data.to_vec());
+                }
+                t if t == IeType::NwTtPortNumber as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        nw_tt_port_number = Some(data.get_u32());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            port_management_container,
+            user_plane_node_management_container,
+            nw_tt_port_number,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5104,5 +5392,188 @@ mod tests {
         let decoded = OuterHeaderCreation::decode(&mut b).unwrap();
         assert!(decoded.description.gtpu_udp_ipv4);
         assert_eq!(decoded.teid, Some(0x1234_5678));
+    }
+
+    // ========================================================================
+    // 5GS TSC bridge management (#321)
+    // ========================================================================
+    //
+    // These decode HAND-BUILT wire buffers, not this module's own encoder output.
+    // A pure round-trip test passes for any self-consistent pair of functions,
+    // including one that agrees with itself on the wrong IE type number — which is
+    // exactly the mistake worth catching when five IE numbers land at once.
+
+    /// Build an IE header plus payload the way a peer would, without going
+    /// anywhere near the encoder under test.
+    fn wire_ie(ie_type: u16, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&ie_type.to_be_bytes());
+        out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn test_tsc_management_information_decodes_hand_built_wire() {
+        // TS 29.244 Table 7.5.4.18-1: PMIC (202), UMIC (266), NW-TT Port (197).
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&wire_ie(202, &[0xAA, 0xBB, 0xCC]));
+        wire.extend_from_slice(&wire_ie(266, &[0x01, 0x02]));
+        // §8.2.142: Length 4, TSN port is an Unsigned16 in octets 7-8.
+        wire.extend_from_slice(&wire_ie(197, &[0x00, 0x00, 0x00, 0x07]));
+
+        let mut buf = Bytes::from(wire);
+        let tsc = TscManagementInformation::decode(&mut buf).unwrap();
+
+        assert_eq!(
+            tsc.port_management_container.as_deref(),
+            Some(&[0xAA, 0xBB, 0xCC][..]),
+            "PMIC must survive byte-exact: it is an opaque TS 24.539 payload"
+        );
+        assert_eq!(
+            tsc.user_plane_node_management_container.as_deref(),
+            Some(&[0x01, 0x02][..])
+        );
+        assert_eq!(tsc.nw_tt_port_number, Some(7));
+        assert!(tsc.conditional_holds());
+    }
+
+    #[test]
+    fn test_tsc_management_information_encodes_expected_ie_numbers() {
+        // The golden half: the container IE numbers are 202 and 266, and 266 is
+        // NOT a number this tree could round-trip its way into by accident — it
+        // was absent from `IeType` until #321.
+        let mut buf = BytesMut::new();
+        TscManagementInformation {
+            port_management_container: Some(vec![0x11]),
+            user_plane_node_management_container: Some(vec![0x22, 0x33]),
+            nw_tt_port_number: Some(0x0102),
+        }
+        .encode(&mut buf);
+
+        assert_eq!(
+            buf.to_vec(),
+            vec![
+                0x00, 0xCA, 0x00, 0x01, 0x11, // 202, len 1, PMIC
+                0x01, 0x0A, 0x00, 0x02, 0x22, 0x33, // 266, len 2, UMIC
+                0x00, 0xC5, 0x00, 0x04, 0x00, 0x00, 0x01, 0x02, // 197, len 4, port
+            ],
+            "TSC Management Information must encode PMIC=202, UMIC=266, NW-TT=197"
+        );
+    }
+
+    #[test]
+    fn test_tsc_management_information_pmic_without_port_fails_the_conditional() {
+        // "When PMIC IE is present, this IE shall contain the related NW-TT Port
+        // Number." Port configuration with no port to apply it to is the one shape
+        // a receiver cannot act on, so it must be reportable rather than silently
+        // accepted.
+        let tsc = TscManagementInformation {
+            port_management_container: Some(vec![0x01]),
+            user_plane_node_management_container: None,
+            nw_tt_port_number: None,
+        };
+        assert!(!tsc.conditional_holds());
+
+        // A UMIC alone carries no port identity at all, so the conditional is
+        // vacuously satisfied — not a violation.
+        assert!(TscManagementInformation::user_plane_node(vec![0x01]).conditional_holds());
+    }
+
+    #[test]
+    fn test_tsc_management_information_empty_is_detected() {
+        let mut buf = Bytes::new();
+        let decoded = TscManagementInformation::decode(&mut buf).unwrap();
+        assert!(
+            decoded.is_empty(),
+            "an IE with no members decodes rather than erroring, but must report empty \
+             so senders do not emit it"
+        );
+    }
+
+    #[test]
+    fn test_create_bridge_info_flag_bits_golden() {
+        // TS 29.244 §8.2.140: BII is octet-5 bit 1 (0x01), RII is bit 2 (0x02).
+        let mut buf = BytesMut::new();
+        CreateBridgeInfoForTsc::bridge().encode(&mut buf);
+        assert_eq!(buf.to_vec(), vec![0x01], "BII must be 0x01");
+
+        let mut buf = BytesMut::new();
+        CreateBridgeInfoForTsc {
+            bii: false,
+            rii: true,
+        }
+        .encode(&mut buf);
+        assert_eq!(buf.to_vec(), vec![0x02], "RII must be 0x02");
+
+        // Decoded from a hand-built octet, both bits set.
+        let both = CreateBridgeInfoForTsc::decode(&[0x03]).unwrap();
+        assert!(both.bii && both.rii);
+
+        // An empty payload is "asks for nothing", not an error.
+        let none = CreateBridgeInfoForTsc::decode(&[]).unwrap();
+        assert!(!none.bii && !none.rii);
+    }
+
+    #[test]
+    fn test_five_gs_user_plane_node_id_bid_flag_and_value() {
+        // §8.2.143: octet 5 bit 1 is BID; the value is an Unsigned64 after it.
+        let mut buf = BytesMut::new();
+        FiveGsUserPlaneNodeId::new(0x0011_2233_4455_6677).encode(&mut buf);
+        assert_eq!(
+            buf.to_vec(),
+            vec![0x01, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77],
+            "BID set then the 8-octet bridge ID"
+        );
+
+        let decoded = FiveGsUserPlaneNodeId::decode(&[0x01, 0, 0, 0, 0, 0, 0, 0, 0x2A]).unwrap();
+        assert_eq!(decoded.node_id, Some(42));
+
+        // BID clear: no value, even if octets follow.
+        let clear = FiveGsUserPlaneNodeId::decode(&[0x00, 0xFF, 0xFF]).unwrap();
+        assert_eq!(clear.node_id, None);
+    }
+
+    #[test]
+    fn test_five_gs_user_plane_node_id_short_value_is_absent_not_padded() {
+        // A BID flag with only four octets of value must NOT yield a zero-padded
+        // bridge ID: the SMF reports this to the PCF as the bridge's identity, and
+        // a wrong identity is worse than a missing one.
+        let short = FiveGsUserPlaneNodeId::decode(&[0x01, 0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+        assert_eq!(short.node_id, None);
+    }
+
+    #[test]
+    fn test_created_bridge_info_decodes_hand_built_wire() {
+        // TS 29.244 Table 7.5.3.6-1: Port Number (196) + 5GS User Plane Node ID (198).
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&wire_ie(196, &[0x00, 0x00, 0x00, 0x05]));
+        wire.extend_from_slice(&wire_ie(198, &[0x01, 0, 0, 0, 0, 0, 0, 0x12, 0x34]));
+
+        let mut buf = Bytes::from(wire);
+        let created = CreatedBridgeInfoForTsc::decode(&mut buf).unwrap();
+
+        assert_eq!(
+            created.port_number,
+            Some(5),
+            "DS-TT port from the UP function"
+        );
+        assert_eq!(
+            created.user_plane_node_id.and_then(|n| n.node_id),
+            Some(0x1234),
+            "bridge ID per IEEE 802.1Q clause 14.2.5"
+        );
+    }
+
+    #[test]
+    fn test_created_bridge_info_round_trip_through_own_encoder() {
+        let original = CreatedBridgeInfoForTsc {
+            port_number: Some(0xABCD),
+            user_plane_node_id: Some(FiveGsUserPlaneNodeId::new(0xFFFF_0000_FFFF_0000)),
+        };
+        let mut buf = BytesMut::new();
+        original.encode(&mut buf);
+        let mut b = buf.freeze();
+        assert_eq!(CreatedBridgeInfoForTsc::decode(&mut b).unwrap(), original);
     }
 }

@@ -6,10 +6,11 @@ use crate::error::{PfcpError, PfcpResult};
 use crate::header::{PfcpHeader, PfcpMessageType};
 use crate::ie::{encode_u16_ie, encode_u32_ie, encode_u8_ie, IeHeader, IeType, RawIe};
 use crate::types::{
-    ApplicationIdsPfds, CpFunctionFeatures, CreateBar, CreateFar, CreatePdr, CreateQer, CreateUrr,
-    DownlinkDataReport, FSeid, FqCsid, GracefulReleasePeriod, LoadControlInformation, NodeId,
-    NodeReportType, PfcpAssociationReleaseRequest, PfcpCause, PfcpSessionChangeInfo,
-    PfdPartialFailureInformation, RemoveFar, RemovePdr, RemoveQer, RemoveUrr, ReportType,
+    ApplicationIdsPfds, CpFunctionFeatures, CreateBar, CreateBridgeInfoForTsc, CreateFar,
+    CreatePdr, CreateQer, CreateUrr, CreatedBridgeInfoForTsc, DownlinkDataReport, FSeid, FqCsid,
+    GracefulReleasePeriod, LoadControlInformation, NodeId, NodeReportType,
+    PfcpAssociationReleaseRequest, PfcpCause, PfcpSessionChangeInfo, PfdPartialFailureInformation,
+    RemoveFar, RemovePdr, RemoveQer, RemoveUrr, ReportType, TscManagementInformation,
     UpFunctionFeatures, UpdateFar, UpdatePdr, UpdateQer, UpdateUrr, UsageReportSrr,
     UserPlanePathFailureReport,
 };
@@ -406,6 +407,10 @@ pub struct SessionEstablishmentRequest {
     pub create_qers: Vec<CreateQer>,
     pub create_urrs: Vec<CreateUrr>,
     pub create_bar: Option<CreateBar>,
+    /// Create Bridge/Router Info (IE 194, TS 29.244 §5.26.2), #321. Present when
+    /// the session is for TSC and the SMF wants the UP function to allocate a port
+    /// number and report its 5GS User Plane Node ID.
+    pub create_bridge_info: Option<CreateBridgeInfoForTsc>,
 }
 
 impl SessionEstablishmentRequest {
@@ -418,6 +423,7 @@ impl SessionEstablishmentRequest {
             create_qers: Vec::new(),
             create_urrs: Vec::new(),
             create_bar: None,
+            create_bridge_info: None,
         }
     }
 
@@ -480,6 +486,18 @@ impl SessionEstablishmentRequest {
             header.encode(buf);
             buf.put_slice(&bar_buf);
         }
+
+        // Create Bridge/Router Info (IE 194)
+        if let Some(bridge) = &self.create_bridge_info {
+            let mut bridge_buf = BytesMut::new();
+            bridge.encode(&mut bridge_buf);
+            let header = IeHeader::new(
+                IeType::CreateBridgeInfoForTsc as u16,
+                bridge_buf.len() as u16,
+            );
+            header.encode(buf);
+            buf.put_slice(&bridge_buf);
+        }
     }
 
     pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
@@ -490,6 +508,7 @@ impl SessionEstablishmentRequest {
         let mut create_qers = Vec::new();
         let mut create_urrs = Vec::new();
         let mut create_bar = None;
+        let mut create_bridge_info = None;
 
         while buf.remaining() >= IeHeader::LEN {
             let ie = RawIe::decode(buf)?;
@@ -522,6 +541,9 @@ impl SessionEstablishmentRequest {
                     let mut data = ie.data;
                     create_bar = Some(CreateBar::decode(&mut data)?);
                 }
+                t if t == IeType::CreateBridgeInfoForTsc as u16 => {
+                    create_bridge_info = Some(CreateBridgeInfoForTsc::decode(&ie.data)?);
+                }
                 _ => {}
             }
         }
@@ -539,6 +561,7 @@ impl SessionEstablishmentRequest {
             create_qers,
             create_urrs,
             create_bar,
+            create_bridge_info,
         })
     }
 }
@@ -552,6 +575,10 @@ pub struct SessionEstablishmentResponse {
     /// Created PDR(s) carrying the UP-allocated local F-TEID(s); present when
     /// the request is accepted (§7.5.3.2).
     pub created_pdrs: Vec<CreatedPdr>,
+    /// Created Bridge/Router Info (IE 195, TS 29.244 §7.5.3.6), #321. The UP
+    /// function's answer to a `create_bridge_info` on the request: the allocated
+    /// port number and the 5GS User Plane Node ID.
+    pub created_bridge_info: Option<CreatedBridgeInfoForTsc>,
 }
 
 impl SessionEstablishmentResponse {
@@ -561,6 +588,7 @@ impl SessionEstablishmentResponse {
             cause,
             up_f_seid: None,
             created_pdrs: Vec::new(),
+            created_bridge_info: None,
         }
     }
 
@@ -594,6 +622,18 @@ impl SessionEstablishmentResponse {
             header.encode(buf);
             buf.put_slice(&cpdr_buf);
         }
+
+        // Created Bridge/Router Info (IE 195)
+        if let Some(bridge) = &self.created_bridge_info {
+            let mut bridge_buf = BytesMut::new();
+            bridge.encode(&mut bridge_buf);
+            let header = IeHeader::new(
+                IeType::CreatedBridgeInfoForTsc as u16,
+                bridge_buf.len() as u16,
+            );
+            header.encode(buf);
+            buf.put_slice(&bridge_buf);
+        }
     }
 
     pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
@@ -602,6 +642,7 @@ impl SessionEstablishmentResponse {
         let mut cause: Option<PfcpCause> = None;
         let mut up_f_seid = None;
         let mut created_pdrs = Vec::new();
+        let mut created_bridge_info = None;
 
         while buf.remaining() >= IeHeader::LEN {
             let ie = RawIe::decode(buf)?;
@@ -623,6 +664,10 @@ impl SessionEstablishmentResponse {
                     let mut data = ie.data;
                     created_pdrs.push(CreatedPdr::decode(&mut data)?);
                 }
+                t if t == IeType::CreatedBridgeInfoForTsc as u16 => {
+                    let mut data = ie.data;
+                    created_bridge_info = Some(CreatedBridgeInfoForTsc::decode(&mut data)?);
+                }
                 _ => {}
             }
         }
@@ -643,6 +688,7 @@ impl SessionEstablishmentResponse {
             cause,
             up_f_seid,
             created_pdrs,
+            created_bridge_info,
         })
     }
 }
@@ -723,6 +769,13 @@ pub struct SessionModificationRequest {
     /// the session measured on a rule the CP function believes is gone.
     pub remove_urrs: Vec<RemoveUrr>,
     pub pfcp_smreq_flags: Option<u8>,
+    /// TSC Management Information (IE 199, TS 29.244 §7.5.4.18), #321.
+    ///
+    /// A LIST, not an option: §7.5.4.18's own note says that for multiple ports
+    /// there may be several instances carrying a PMIC with its NW-TT Port Number,
+    /// and only one carrying a UMIC. Modelling it as a single value would silently
+    /// drop every port after the first.
+    pub tsc_management_info: Vec<TscManagementInformation>,
 }
 
 impl Default for SessionModificationRequest {
@@ -749,6 +802,7 @@ impl SessionModificationRequest {
             remove_qers: Vec::new(),
             remove_urrs: Vec::new(),
             pfcp_smreq_flags: None,
+            tsc_management_info: Vec::new(),
         }
     }
 
@@ -870,6 +924,20 @@ impl SessionModificationRequest {
         if let Some(flags) = self.pfcp_smreq_flags {
             encode_u8_ie(buf, IeType::PfcpSmreqFlags, flags);
         }
+
+        // TSC Management Information (IE 199). An empty instance is skipped rather
+        // than emitted: a four-octet IE with no members asks the UP function for
+        // nothing while looking like a request.
+        for tsc in self.tsc_management_info.iter().filter(|t| !t.is_empty()) {
+            let mut tsc_buf = BytesMut::new();
+            tsc.encode(&mut tsc_buf);
+            let header = IeHeader::new(
+                IeType::TscManagementInformationSmr as u16,
+                tsc_buf.len() as u16,
+            );
+            header.encode(buf);
+            buf.put_slice(&tsc_buf);
+        }
     }
 
     pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
@@ -939,6 +1007,12 @@ impl SessionModificationRequest {
                         result.pfcp_smreq_flags = Some(ie.data[0]);
                     }
                 }
+                t if t == IeType::TscManagementInformationSmr as u16 => {
+                    let mut data = ie.data;
+                    result
+                        .tsc_management_info
+                        .push(TscManagementInformation::decode(&mut data)?);
+                }
                 _ => {}
             }
         }
@@ -953,6 +1027,9 @@ pub struct SessionModificationResponse {
     pub cause: PfcpCause,
     pub offending_ie: Option<u16>,
     pub created_pdrs: Vec<CreatedPdr>,
+    /// TSC Management Information (IE 200, TS 29.244 §7.5.5.3), #321. What the UP
+    /// function actually applied, reported back on the same transaction.
+    pub tsc_management_info: Vec<TscManagementInformation>,
 }
 
 impl SessionModificationResponse {
@@ -961,6 +1038,7 @@ impl SessionModificationResponse {
             cause,
             offending_ie: None,
             created_pdrs: Vec::new(),
+            tsc_management_info: Vec::new(),
         }
     }
 
@@ -980,6 +1058,18 @@ impl SessionModificationResponse {
             header.encode(buf);
             buf.put_slice(&cpdr_buf);
         }
+
+        // TSC Management Information (IE 200)
+        for tsc in self.tsc_management_info.iter().filter(|t| !t.is_empty()) {
+            let mut tsc_buf = BytesMut::new();
+            tsc.encode(&mut tsc_buf);
+            let header = IeHeader::new(
+                IeType::TscManagementInformationSmrsp as u16,
+                tsc_buf.len() as u16,
+            );
+            header.encode(buf);
+            buf.put_slice(&tsc_buf);
+        }
     }
 
     pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
@@ -987,6 +1077,7 @@ impl SessionModificationResponse {
         let mut cause: Option<PfcpCause> = None;
         let mut offending_ie = None;
         let mut created_pdrs = Vec::new();
+        let mut tsc_management_info = Vec::new();
 
         while buf.remaining() >= IeHeader::LEN {
             let ie = RawIe::decode(buf)?;
@@ -1006,6 +1097,10 @@ impl SessionModificationResponse {
                     let mut data = ie.data;
                     created_pdrs.push(CreatedPdr::decode(&mut data)?);
                 }
+                t if t == IeType::TscManagementInformationSmrsp as u16 => {
+                    let mut data = ie.data;
+                    tsc_management_info.push(TscManagementInformation::decode(&mut data)?);
+                }
                 _ => {}
             }
         }
@@ -1015,6 +1110,7 @@ impl SessionModificationResponse {
             cause,
             offending_ie,
             created_pdrs,
+            tsc_management_info,
         })
     }
 }
@@ -1082,6 +1178,11 @@ pub struct SessionReportRequest {
     pub report_type: ReportType,
     pub downlink_data_report: Option<DownlinkDataReport>,
     pub usage_reports: Vec<UsageReportSrr>,
+    /// TSC Management Information (IE 201, TS 29.244 §7.5.8.5), #321. The UP
+    /// function reporting port or user-plane-node management information the
+    /// SMF did not ask for in a transaction — an NW-TT port whose configuration
+    /// changed, for instance. Accompanied by the `tmir` bit in the Report Type.
+    pub tsc_management_info: Vec<TscManagementInformation>,
 }
 
 impl SessionReportRequest {
@@ -1090,6 +1191,7 @@ impl SessionReportRequest {
             report_type,
             downlink_data_report: None,
             usage_reports: Vec::new(),
+            tsc_management_info: Vec::new(),
         }
     }
 
@@ -1111,12 +1213,25 @@ impl SessionReportRequest {
             header.encode(buf);
             buf.put_slice(&ur_buf);
         }
+
+        // TSC Management Information (IE 201)
+        for tsc in self.tsc_management_info.iter().filter(|t| !t.is_empty()) {
+            let mut tsc_buf = BytesMut::new();
+            tsc.encode(&mut tsc_buf);
+            let header = IeHeader::new(
+                IeType::TscManagementInformationSrr as u16,
+                tsc_buf.len() as u16,
+            );
+            header.encode(buf);
+            buf.put_slice(&tsc_buf);
+        }
     }
 
     pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
         let mut report_type = ReportType::default();
         let mut downlink_data_report = None;
         let mut usage_reports = Vec::new();
+        let mut tsc_management_info = Vec::new();
 
         while buf.remaining() >= IeHeader::LEN {
             let ie = RawIe::decode(buf)?;
@@ -1134,6 +1249,10 @@ impl SessionReportRequest {
                     let mut data = ie.data;
                     usage_reports.push(UsageReportSrr::decode(&mut data)?);
                 }
+                t if t == IeType::TscManagementInformationSrr as u16 => {
+                    let mut data = ie.data;
+                    tsc_management_info.push(TscManagementInformation::decode(&mut data)?);
+                }
                 _ => {}
             }
         }
@@ -1142,6 +1261,7 @@ impl SessionReportRequest {
             report_type,
             downlink_data_report,
             usage_reports,
+            tsc_management_info,
         })
     }
 }
@@ -3139,5 +3259,129 @@ mod tests {
             SessionEstablishmentResponse::decode(&mut buf.freeze()),
             Err(PfcpError::MissingMandatoryIe(_))
         ));
+    }
+
+    // ========================================================================
+    // 5GS TSC carriage (#321)
+    // ========================================================================
+    //
+    // One `TscManagementInformation` type serves IE 199, 200 and 201, so the ONLY
+    // thing that distinguishes the three carriers is the number each message
+    // encodes it under. That is exactly what a copy-paste between the three arms
+    // gets wrong, and what a self-round-trip cannot detect — each message would
+    // decode its own output happily under any number, as long as it agreed with
+    // itself. So these assert the carrier number ON THE WIRE.
+
+    /// The IE type numbers present at the top level of an encoded body.
+    fn top_level_ie_types(body: &[u8]) -> Vec<u16> {
+        let mut out = Vec::new();
+        let mut buf = Bytes::copy_from_slice(body);
+        while buf.remaining() >= IeHeader::LEN {
+            match RawIe::decode(&mut buf) {
+                Ok(ie) => out.push(ie.ie_type),
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn test_session_modification_request_carries_tsc_under_ie_199() {
+        let mut req = SessionModificationRequest::new();
+        req.tsc_management_info
+            .push(TscManagementInformation::port(vec![0x01, 0x02], 3));
+        let mut buf = BytesMut::new();
+        req.encode(&mut buf);
+
+        assert!(
+            top_level_ie_types(&buf).contains(&199),
+            "a Session Modification Request must carry TSC Management Information as IE 199 \
+             (TS 29.244 §7.5.4.18), not 200 or 201"
+        );
+        let decoded = SessionModificationRequest::decode(&mut buf.freeze()).unwrap();
+        assert_eq!(decoded.tsc_management_info.len(), 1);
+        assert_eq!(decoded.tsc_management_info[0].nw_tt_port_number, Some(3));
+    }
+
+    #[test]
+    fn test_session_modification_response_carries_tsc_under_ie_200() {
+        let mut resp = SessionModificationResponse::new(PfcpCause::RequestAccepted);
+        resp.tsc_management_info
+            .push(TscManagementInformation::user_plane_node(vec![0xAB]));
+        let mut buf = BytesMut::new();
+        resp.encode(&mut buf);
+
+        assert!(
+            top_level_ie_types(&buf).contains(&200),
+            "a Session Modification Response must carry it as IE 200 (§7.5.5.3)"
+        );
+        let decoded = SessionModificationResponse::decode(&mut buf.freeze()).unwrap();
+        assert_eq!(
+            decoded.tsc_management_info[0]
+                .user_plane_node_management_container
+                .as_deref(),
+            Some(&[0xAB][..])
+        );
+    }
+
+    #[test]
+    fn test_session_report_request_carries_tsc_under_ie_201() {
+        let mut rt = ReportType::default();
+        rt.tmir = true;
+        let mut req = SessionReportRequest::new(rt);
+        req.tsc_management_info
+            .push(TscManagementInformation::port(vec![0x09], 11));
+        let mut buf = BytesMut::new();
+        req.encode(&mut buf);
+
+        assert!(
+            top_level_ie_types(&buf).contains(&201),
+            "a Session Report Request must carry it as IE 201 (§7.5.8.5)"
+        );
+        let decoded = SessionReportRequest::decode(&mut buf.freeze()).unwrap();
+        assert!(
+            decoded.report_type.tmir,
+            "the TMIR bit is what tells the SMF a TSC report is present at all"
+        );
+        assert_eq!(decoded.tsc_management_info[0].nw_tt_port_number, Some(11));
+    }
+
+    #[test]
+    fn test_session_establishment_carries_create_and_created_bridge_info() {
+        let mut req = SessionEstablishmentRequest::new(
+            NodeId::new_ipv4([10, 45, 0, 1]),
+            FSeid::new_ipv4(1, [10, 45, 0, 1]),
+        );
+        req.create_bridge_info = Some(CreateBridgeInfoForTsc::bridge());
+        let mut buf = BytesMut::new();
+        req.encode(&mut buf);
+        assert!(
+            top_level_ie_types(&buf).contains(&194),
+            "Create Bridge/Router Info is IE 194"
+        );
+        let decoded = SessionEstablishmentRequest::decode(&mut buf.freeze()).unwrap();
+        assert_eq!(
+            decoded.create_bridge_info.map(|b| b.bii),
+            Some(true),
+            "the BII bit must survive the round trip: it is what asks the UPF to allocate"
+        );
+
+        let mut resp = SessionEstablishmentResponse::new(PfcpCause::RequestAccepted);
+        resp.node_id = Some(NodeId::new_ipv4([10, 45, 0, 2]));
+        resp.up_f_seid = Some(FSeid::new_ipv4(2, [10, 45, 0, 2]));
+        resp.created_bridge_info = Some(CreatedBridgeInfoForTsc {
+            port_number: Some(4),
+            user_plane_node_id: Some(FiveGsUserPlaneNodeId::new(0xBEEF)),
+        });
+        let mut rbuf = BytesMut::new();
+        resp.encode(&mut rbuf);
+        assert!(
+            top_level_ie_types(&rbuf).contains(&195),
+            "Created Bridge/Router Info is IE 195"
+        );
+        let rdecoded = SessionEstablishmentResponse::decode(&mut rbuf.freeze()).unwrap();
+        let created = rdecoded.created_bridge_info.unwrap();
+        assert_eq!(created.port_number, Some(4));
+        assert_eq!(created.user_plane_node_id.unwrap().node_id, Some(0xBEEF));
     }
 }
