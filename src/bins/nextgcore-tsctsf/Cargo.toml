@@ -23,6 +23,9 @@ anyhow.workspace = true
 # QosTscSession) are deserialised from the request bodies rather than stored as
 # raw JSON strings.
 serde = { workspace = true, features = ["derive"] }
+# #284: TS 29.571 `Bytes` is base64, and the PMIC/UMIC containers are typed as
+# Bytes in TS 29.512's PortManagementContainer / BridgeManagementContainer.
+base64.workspace = true
 serde_yaml.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
