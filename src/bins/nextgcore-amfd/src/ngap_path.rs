@@ -8176,10 +8176,11 @@ mod tests {
     ) {
         use nextgcore_sbi::message::{SbiRequest, SbiResponse};
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
-        let port = nextgcore_sbi::test_support::free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         let (tx, rx) = mpsc::channel(8);
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
-        let server = SbiServer::new(SbiServerConfig::new(addr));
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), port_listener);
         server
             .start(move |req: SbiRequest| {
                 let tx = tx.clone();
@@ -8565,8 +8566,8 @@ mod tests {
         let seen: Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
-        let addr = nextgcore_sbi::test_support::ephemeral_addr();
-        let server = NSbiServer::new(NSbiCfg::new(addr));
+        let (addr_listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = NSbiServer::on_listener(NSbiCfg::new(addr), addr_listener);
         server
             .start(move |req: SReq| {
                 let sink = Arc::clone(&sink);

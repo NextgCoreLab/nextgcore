@@ -3235,15 +3235,6 @@ mod tests {
         out
     }
 
-    /// Reserve a loopback port for a test server.
-    ///
-    /// Delegates to the shared helper: 21 crates each had a private
-    /// probe-and-drop copy of this, which is TOCTOU and flaked under parallel
-    /// `cargo test`. One implementation means one place to harden.
-    fn free_port() -> u16 {
-        nextgcore_sbi::test_support::free_port()
-    }
-
     /// Serializes tests that mutate the *global* NSSF availability/restriction
     /// state (the context is a process-wide singleton). Without this, the
     /// PLMN-supported restriction one test installs could leak into another
@@ -3258,11 +3249,12 @@ mod tests {
 
     async fn start_nssf_server() -> (SbiServer, u16) {
         nssf_context_init(512);
-        let port = free_port();
-        let server = SbiServer::new(SbiServerConfig::new(SocketAddr::from((
-            [127, 0, 0, 1],
-            port,
-        ))));
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
+        let server = SbiServer::on_listener(
+            SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+            port_listener,
+        );
         server
             .start(nssf_sbi_request_handler)
             .await
@@ -3315,12 +3307,13 @@ mod tests {
     /// and the NSSF audience.
     async fn start_nssf_server_oauth2(jwks: serde_json::Value) -> (SbiServer, u16) {
         nssf_context_init(512);
-        let port = free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         let mut cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
         cfg.require_oauth2 = true;
         cfg.oauth2_jwks = Some(jwks);
         cfg = cfg.with_expected_audience_nf_type(NfType::Nssf);
-        let server = SbiServer::new(cfg);
+        let server = SbiServer::on_listener(cfg, port_listener);
         server
             .start(nssf_sbi_request_handler)
             .await
@@ -3532,11 +3525,12 @@ mod tests {
         let client = SbiClient::with_host_port("127.0.0.1", port);
 
         // Notification receiver on its own ephemeral port
-        let recv_port = free_port();
-        let receiver = SbiServer::new(SbiServerConfig::new(SocketAddr::from((
-            [127, 0, 0, 1],
-            recv_port,
-        ))));
+        let (recv_listener, recv_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let recv_port = recv_addr.port();
+        let receiver = SbiServer::on_listener(
+            SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], recv_port))),
+            recv_listener,
+        );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         receiver
             .start(move |req: SbiRequest| {

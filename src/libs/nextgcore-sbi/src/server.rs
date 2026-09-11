@@ -896,6 +896,10 @@ pub struct SbiServer {
     config: SbiServerConfig,
     /// Server state
     state: Arc<Mutex<ServerState>>,
+    /// A listener the caller bound before constructing this server, for
+    /// [`SbiServer::on_listener`]. Taken by the first `start()`; `None` there
+    /// means `start()` binds `config.addr` itself, which is the ordinary path.
+    prebound: Arc<Mutex<Option<std::net::TcpListener>>>,
 }
 
 impl SbiServer {
@@ -904,12 +908,57 @@ impl SbiServer {
         Self {
             config,
             state: Arc::new(Mutex::new(ServerState::Stopped)),
+            prebound: Arc::new(Mutex::new(None)),
         }
     }
 
     /// Create a server with address
     pub fn with_addr(addr: SocketAddr) -> Self {
         Self::new(SbiServerConfig::new(addr))
+    }
+
+    /// Create a server that will serve on a listener the caller has **already
+    /// bound**, rather than binding `config.addr` itself (#313).
+    ///
+    /// # Why this exists
+    ///
+    /// The ordinary path picks an address and binds it inside [`start`](Self::start).
+    /// For a test that needs an unused port, that means asking the OS for one
+    /// (bind `:0`, read the port, drop the probe) and then binding it again —
+    /// and between the drop and the real bind the port belongs to nobody, so a
+    /// concurrently-starting process can take it. `cargo test --workspace` runs
+    /// one test binary per crate at once, so that window is reachable: it
+    /// surfaces as a bind failure inside `start()`, not as a wrong answer.
+    ///
+    /// Handing the server the listener removes the window entirely — the port is
+    /// bound from the moment it is chosen. See
+    /// [`crate::test_support::bound_listener`] for the reservation helper and
+    /// [`crate::test_support::sbi_server_on_free_port`] for the whole shape.
+    ///
+    /// # `config.addr` is overwritten
+    ///
+    /// Deliberately: the listener's real local address is authoritative, and a
+    /// server whose `config.addr` disagreed with the socket it serves would
+    /// misreport itself in `stop()`'s log and in any URI derived from the
+    /// config. That also lets a caller pass a config built with a placeholder
+    /// address. If `local_addr()` fails — it does not for a bound listener —
+    /// `config.addr` is left as supplied.
+    ///
+    /// # Restart
+    ///
+    /// The listener is consumed by the first `start()`. A `stop()`/`start()`
+    /// cycle re-binds `config.addr` like any other server, which reopens the
+    /// same window for that one re-bind; nothing in this workspace restarts a
+    /// server on a reserved port.
+    pub fn on_listener(mut config: SbiServerConfig, listener: std::net::TcpListener) -> Self {
+        if let Ok(actual) = listener.local_addr() {
+            config.addr = actual;
+        }
+        Self {
+            config,
+            state: Arc::new(Mutex::new(ServerState::Stopped)),
+            prebound: Arc::new(Mutex::new(Some(listener))),
+        }
     }
 
     /// Get the server configuration
@@ -956,9 +1005,24 @@ impl SbiServer {
             return Err(SbiError::ServerError("Server already running".to_string()));
         }
 
-        let listener = TcpListener::bind(self.config.addr)
-            .await
-            .map_err(|e| SbiError::ServerError(format!("Failed to bind: {e}")))?;
+        // #313: serve a caller-supplied listener when one was reserved, so the
+        // chosen port is never unbound between selection and use. Taken (not
+        // cloned) so a later restart falls back to the ordinary bind.
+        let listener = match self.prebound.lock().await.take() {
+            Some(std_listener) => {
+                std_listener.set_nonblocking(true).map_err(|e| {
+                    SbiError::ServerError(format!(
+                        "Failed to set pre-bound listener nonblocking: {e}"
+                    ))
+                })?;
+                TcpListener::from_std(std_listener).map_err(|e| {
+                    SbiError::ServerError(format!("Failed to adopt pre-bound listener: {e}"))
+                })?
+            }
+            None => TcpListener::bind(self.config.addr)
+                .await
+                .map_err(|e| SbiError::ServerError(format!("Failed to bind: {e}")))?,
+        };
 
         let tls_acceptor = if self.config.scheme == UriScheme::Https {
             Some(self.build_tls_acceptor()?)
@@ -1839,13 +1903,12 @@ mod tests {
         use crate::client::SbiClient;
         use crate::message::SbiPart;
 
-        // Find a free localhost port for the test server.
-        let port = crate::test_support::free_port();
+        // #313: a reserved listener, so the port is never unbound between
+        // selection and use.
+        let (listener, addr) = crate::test_support::bound_listener().into_parts();
+        let port = addr.port();
 
-        let server = SbiServer::new(SbiServerConfig::new(SocketAddr::from((
-            [127, 0, 0, 1],
-            port,
-        ))));
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
         server
             .start(|request: SbiRequest| async move {
                 // hyper delivered the custom header lowercased; the
@@ -1921,11 +1984,14 @@ mod tests {
         mut config: SbiServerConfig,
         handler: H,
     ) -> (SbiServer, u16) {
-        let port = crate::test_support::free_port();
-        config.addr = SocketAddr::from(([127, 0, 0, 1], port));
-        let server = SbiServer::new(config);
+        // #313: the reservation stays bound, and `on_listener` overwrites
+        // `config.addr` from the socket, so the caller's placeholder address is
+        // irrelevant.
+        let (listener, addr) = crate::test_support::bound_listener().into_parts();
+        config.addr = addr;
+        let server = SbiServer::on_listener(config, listener);
         server.start(handler).await.expect("value expected");
-        (server, port)
+        (server, addr.port())
     }
 
     #[tokio::test]
@@ -2115,12 +2181,12 @@ mod tests {
             Arc::new(std::sync::Mutex::new(None));
         let sink = Arc::clone(&seen);
 
-        let port = crate::test_support::free_port();
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let (listener, addr) = crate::test_support::bound_listener().into_parts();
+        let port = addr.port();
         let mut cfg = SbiServerConfig::new(addr);
         cfg.require_oauth2 = true;
         cfg.oauth2_jwks = Some(jwks);
-        let server = SbiServer::new(cfg);
+        let server = SbiServer::on_listener(cfg, listener);
         server
             .start(move |req: SbiRequest| {
                 let sink = Arc::clone(&sink);
@@ -2172,9 +2238,9 @@ mod tests {
             Arc::new(std::sync::Mutex::new(None));
         let sink = Arc::clone(&seen);
 
-        let port = crate::test_support::free_port();
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        let server = SbiServer::new(SbiServerConfig::new(addr));
+        let (listener, addr) = crate::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
         server
             .start(move |req: SbiRequest| {
                 let sink = Arc::clone(&sink);

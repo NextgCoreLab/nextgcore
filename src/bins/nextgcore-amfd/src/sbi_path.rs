@@ -2115,7 +2115,16 @@ mod tests {
     // UeACRequestData and maps 204 / 200-acuFailureList / 403, degrade-open.
     // ------------------------------------------------------------------
 
-    /// Reserve a loopback port for the NSACF stub server.
+    /// Reserve a loopback port by KEEPING IT BOUND, for a stub server this
+    /// process is about to serve (#313).
+    fn nsacf_reserved_port() -> nextgcore_sbi::test_support::BoundListener {
+        nextgcore_sbi::test_support::bound_listener()
+    }
+
+    /// A loopback port with NOTHING listening on it, for the two tests that
+    /// assert the degrade-open path on a transport error. These deliberately do
+    /// not want a reservation: a bound port would be reachable, which is the
+    /// opposite of what they measure.
     fn nsacf_free_port() -> u16 {
         nextgcore_sbi::test_support::free_port()
     }
@@ -2173,10 +2182,12 @@ mod tests {
         // it describes a dev-profile deployment (issue #63). Declared explicitly
         // rather than inherited from the environment.
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        let port = nsacf_free_port();
-        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let server = nextgcore_sbi::server::SbiServer::new(
+        let reservation = nsacf_reserved_port();
+        let port = reservation.port();
+        let (listener, addr) = reservation.into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
             nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
         );
         server.start(stub_nsacf_ue).await.expect("start stub NSACF");
 
@@ -2843,10 +2854,12 @@ mod tests {
     }
 
     async fn start_pcf_ue_policy_stub() -> (nextgcore_sbi::server::SbiServer, u16) {
-        let port = nsacf_free_port();
-        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let server = nextgcore_sbi::server::SbiServer::new(
+        let reservation = nsacf_reserved_port();
+        let port = reservation.port();
+        let (listener, addr) = reservation.into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
             nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
         );
         server
             .start(stub_pcf_ue_policy)

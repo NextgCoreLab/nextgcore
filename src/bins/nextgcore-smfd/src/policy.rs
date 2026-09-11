@@ -1840,11 +1840,12 @@ mod tests {
         nextgcore_sbi::message::SbiResponse::with_status(404)
     }
 
-    /// Reserve a loopback port for a test server.
+    /// A loopback port with **nothing listening on it**.
     ///
-    /// Delegates to the shared helper: 21 crates each had a private
-    /// probe-and-drop copy of this, which is TOCTOU and flaked under parallel
-    /// `cargo test`. One implementation means one place to harden.
+    /// Both callers assert a bounded-timeout transport error against an absent
+    /// peer, so a reservation would defeat them: `bound_listener` keeps the port
+    /// bound, which makes it reachable. The stub servers in this module take a
+    /// reservation instead (#313); these two deliberately do not.
     fn free_port() -> u16 {
         nextgcore_sbi::test_support::free_port()
     }
@@ -1854,10 +1855,12 @@ mod tests {
         // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
         // dev-profile deployment (issue #63). Declared rather than inherited.
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        let port = free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let server = nextgcore_sbi::server::SbiServer::new(
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
             nextgcore_sbi::server::SbiServerConfig::new(addr),
+            port_listener,
         );
         server
             .start(stub_pcf_handler)
@@ -1980,10 +1983,12 @@ mod tests {
         // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
         // dev-profile deployment (issue #63). Declared rather than inherited.
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        let port = free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let server = nextgcore_sbi::server::SbiServer::new(
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
             nextgcore_sbi::server::SbiServerConfig::new(addr),
+            port_listener,
         );
         server
             .start(stub_nsacf_handler)

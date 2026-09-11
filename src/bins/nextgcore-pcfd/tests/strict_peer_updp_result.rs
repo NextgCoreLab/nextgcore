@@ -194,9 +194,11 @@ async fn start_stub_consumer() -> (
 ) {
     let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&seen);
-    let addr = nextgcore_sbi::test_support::ephemeral_addr();
-    let server =
-        nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(addr));
+    let (addr_listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let server = nextgcore_sbi::server::SbiServer::on_listener(
+        nextgcore_sbi::server::SbiServerConfig::new(addr),
+        addr_listener,
+    );
     server
         .start(move |req: nextgcore_sbi::message::SbiRequest| {
             let sink = Arc::clone(&sink);

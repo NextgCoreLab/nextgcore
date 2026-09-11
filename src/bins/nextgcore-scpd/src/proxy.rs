@@ -2146,7 +2146,6 @@ impl ScpProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::SocketAddr;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     // ------------------------------------------------------------------
@@ -2417,15 +2416,28 @@ mod tests {
     /// Delegates to the shared helper. This crate previously carried its own
     /// process-wide dedup (PR #138); that logic now lives in one place so all
     /// 21 crates share it and there is a single site to harden further.
-    fn ephemeral_port() -> u16 {
-        nextgcore_sbi::test_support::free_port()
+    /// Reserve a loopback port by KEEPING IT BOUND (#313).
+    ///
+    /// Every port this module acquires is then served -- by one of the
+    /// `start_*` helpers or by an inline `SbiServer` -- so none of them wants
+    /// the bare number `free_port` returns. That number leaves the port unbound
+    /// between selection and use, and this file is where the symptom was first
+    /// measured: roughly 1 run in 10 failed to bind before the in-process
+    /// issued-port set was added, and that set does not cover a second test
+    /// BINARY.
+    fn reserve_port() -> nextgcore_sbi::test_support::BoundListener {
+        nextgcore_sbi::test_support::bound_listener()
     }
 
     /// Start a mock producer that echoes the request (method, uri, body and
     /// selected headers) as JSON and returns Binding/Oci headers.
-    async fn start_mock_producer(port: u16) -> nextgcore_sbi::server::SbiServer {
-        let server = nextgcore_sbi::server::SbiServer::new(
-            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+    async fn start_mock_producer(
+        reservation: nextgcore_sbi::test_support::BoundListener,
+    ) -> nextgcore_sbi::server::SbiServer {
+        let (listener, addr) = reservation.into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
         );
         server
             .start(|request: SbiRequest| async move {
@@ -2460,10 +2472,15 @@ mod tests {
     }
 
     /// Start the SCP itself: an SbiServer fronting a ScpProxy.
-    async fn start_scp(port: u16, config: ScpProxyConfig) -> nextgcore_sbi::server::SbiServer {
+    async fn start_scp(
+        reservation: nextgcore_sbi::test_support::BoundListener,
+        config: ScpProxyConfig,
+    ) -> nextgcore_sbi::server::SbiServer {
         let proxy = Arc::new(ScpProxy::new(config));
-        let server = nextgcore_sbi::server::SbiServer::new(
-            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        let (listener, addr) = reservation.into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
         );
         server
             .start(move |request: SbiRequest| {
@@ -2485,10 +2502,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_model_c_forwarding_end_to_end() {
-        let producer_port = ephemeral_port();
-        let scp_port = ephemeral_port();
-        let producer = start_mock_producer(producer_port).await;
-        let scp = start_scp(scp_port, ScpProxyConfig::default()).await;
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
+        let producer = start_mock_producer(producer_listener).await;
+        let scp = start_scp(scp_listener, ScpProxyConfig::default()).await;
 
         let request = SbiRequest::post("/nudm-uecm/v1/registrations")
             .with_body(r#"{"hello":"world"}"#, "application/json")
@@ -2541,12 +2560,14 @@ mod tests {
     /// Start a mock NRF whose nnrf-disc answers with a single-producer
     /// SearchResult, counting how many discovery queries it served.
     async fn start_mock_nrf(
-        port: u16,
+        reservation: nextgcore_sbi::test_support::BoundListener,
         producer_port: u16,
         hits: Arc<AtomicU64>,
     ) -> nextgcore_sbi::server::SbiServer {
-        let server = nextgcore_sbi::server::SbiServer::new(
-            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        let (listener, addr) = reservation.into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
         );
         server
             .start(move |request: SbiRequest| {
@@ -2602,15 +2623,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_model_d_discovery_forwarding_and_binding_stickiness() {
-        let producer_port = ephemeral_port();
-        let nrf_port = ephemeral_port();
-        let scp_port = ephemeral_port();
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
         let nrf_hits = Arc::new(AtomicU64::new(0));
 
-        let producer = start_mock_producer(producer_port).await;
-        let nrf = start_mock_nrf(nrf_port, producer_port, nrf_hits.clone()).await;
+        let producer = start_mock_producer(producer_listener).await;
+        let nrf = start_mock_nrf(nrf_listener, producer_port, nrf_hits.clone()).await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 ..Default::default()
@@ -2667,12 +2691,14 @@ mod tests {
     async fn test_upstream_error_body_is_preserved() {
         // A producer that always answers 409 with a ProblemDetails body:
         // the SCP must relay it verbatim, not replace it.
-        let producer_port = ephemeral_port();
-        let scp_port = ephemeral_port();
-        let server =
-            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-                SocketAddr::from(([127, 0, 0, 1], producer_port)),
-            ));
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(producer_listener.addr()),
+            producer_listener.into_listener(),
+        );
         server
             .start(|_request: SbiRequest| async move {
                 SbiResponse::with_status(409).with_body(
@@ -2682,7 +2708,7 @@ mod tests {
             })
             .await
             .expect("producer start");
-        let scp = start_scp(scp_port, ScpProxyConfig::default()).await;
+        let scp = start_scp(scp_listener, ScpProxyConfig::default()).await;
 
         let request = SbiRequest::post("/nudm-uecm/v1/registrations").with_header(
             "3gpp-Sbi-Target-apiRoot",
@@ -2724,11 +2750,12 @@ mod tests {
     #[tokio::test]
     async fn test_slow_producer_is_504_within_bounded_timeout() {
         // A producer that never answers within the SCP's request timeout.
-        let producer_port = ephemeral_port();
-        let server =
-            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-                SocketAddr::from(([127, 0, 0, 1], producer_port)),
-            ));
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(producer_listener.addr()),
+            producer_listener.into_listener(),
+        );
         server
             .start(|_request: SbiRequest| async move {
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -2769,11 +2796,12 @@ mod tests {
     /// change that.
     #[tokio::test]
     async fn test_nrf_returning_no_candidates_is_404_discovery_failure() {
-        let nrf_port = ephemeral_port();
-        let server =
-            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-                SocketAddr::from(([127, 0, 0, 1], nrf_port)),
-            ));
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(nrf_listener.addr()),
+            nrf_listener.into_listener(),
+        );
         server
             .start(|_request: SbiRequest| async move {
                 SbiResponse::ok().with_body(r#"{"nfInstances":[]}"#, "application/json")
@@ -2855,11 +2883,12 @@ mod tests {
     /// since the NRF answered and answered badly.
     #[tokio::test]
     async fn test_nrf_error_response_is_502_discovery_failure() {
-        let nrf_port = ephemeral_port();
-        let server =
-            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-                SocketAddr::from(([127, 0, 0, 1], nrf_port)),
-            ));
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(nrf_listener.addr()),
+            nrf_listener.into_listener(),
+        );
         server
             .start(|_request: SbiRequest| async move {
                 SbiResponse::with_status(500)
@@ -2889,11 +2918,12 @@ mod tests {
             discovery_failure_of(&proxy_with_nrf("http://127.0.0.1:1".to_string())).await;
 
         // 2. NRF answers non-200.
-        let erroring_port = ephemeral_port();
-        let erroring =
-            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-                SocketAddr::from(([127, 0, 0, 1], erroring_port)),
-            ));
+        let erroring_listener = reserve_port();
+        let erroring_port = erroring_listener.port();
+        let erroring = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(erroring_listener.addr()),
+            erroring_listener.into_listener(),
+        );
         erroring
             .start(|_request: SbiRequest| async move { SbiResponse::with_status(503) })
             .await
@@ -2903,11 +2933,12 @@ mod tests {
                 .await;
 
         // 3. NRF answers 200 with an empty SearchResult.
-        let empty_port = ephemeral_port();
-        let empty =
-            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-                SocketAddr::from(([127, 0, 0, 1], empty_port)),
-            ));
+        let empty_listener = reserve_port();
+        let empty_port = empty_listener.port();
+        let empty = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(empty_listener.addr()),
+            empty_listener.into_listener(),
+        );
         empty
             .start(|_request: SbiRequest| async move {
                 SbiResponse::ok().with_body(r#"{"nfInstances":[]}"#, "application/json")
@@ -2990,13 +3021,15 @@ mod tests {
     /// the nnrf-oauth2 access-token endpoint, so the SCP can perform delegated
     /// discovery and then acquire an OAuth2 token. Counts token requests.
     async fn start_mock_nrf_with_oauth2(
-        port: u16,
+        reservation: nextgcore_sbi::test_support::BoundListener,
         producer_port: u16,
         token: &'static str,
         token_hits: Arc<AtomicU64>,
     ) -> nextgcore_sbi::server::SbiServer {
-        let server = nextgcore_sbi::server::SbiServer::new(
-            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        let (listener, addr) = reservation.into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
         );
         server
             .start(move |request: SbiRequest| {
@@ -3049,9 +3082,13 @@ mod tests {
 
     /// A producer that echoes back the Authorization header it received, so a
     /// test can assert the SCP attached a delegated Bearer token.
-    async fn start_auth_echo_producer(port: u16) -> nextgcore_sbi::server::SbiServer {
-        let server = nextgcore_sbi::server::SbiServer::new(
-            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+    async fn start_auth_echo_producer(
+        reservation: nextgcore_sbi::test_support::BoundListener,
+    ) -> nextgcore_sbi::server::SbiServer {
+        let (listener, addr) = reservation.into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
         );
         server
             .start(|request: SbiRequest| async move {
@@ -3073,21 +3110,24 @@ mod tests {
     /// Authorization the consumer sent.
     #[tokio::test]
     async fn test_model_d_attaches_delegated_bearer_token() {
-        let producer_port = ephemeral_port();
-        let nrf_port = ephemeral_port();
-        let scp_port = ephemeral_port();
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
         let token_hits = Arc::new(AtomicU64::new(0));
 
-        let producer = start_auth_echo_producer(producer_port).await;
+        let producer = start_auth_echo_producer(producer_listener).await;
         let nrf = start_mock_nrf_with_oauth2(
-            nrf_port,
+            nrf_listener,
             producer_port,
             "scp-delegated-token",
             token_hits.clone(),
         )
         .await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 nf_instance_id: Some("scp-instance-1".into()),
@@ -3133,13 +3173,15 @@ mod tests {
     /// it, so each test states its own expectation about the identity the SCP
     /// asserted.
     async fn start_recording_nrf(
-        port: u16,
+        reservation: nextgcore_sbi::test_support::BoundListener,
         producer_port: u16,
         token: &'static str,
         token_bodies: Arc<tokio::sync::Mutex<Vec<String>>>,
     ) -> nextgcore_sbi::server::SbiServer {
-        let server = nextgcore_sbi::server::SbiServer::new(
-            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        let (listener, addr) = reservation.into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
         );
         server
             .start(move |request: SbiRequest| {
@@ -3181,9 +3223,13 @@ mod tests {
 
     /// A producer that echoes the Authorization it received AND whether the
     /// consumer's CCA header leaked through to it.
-    async fn start_header_echo_producer(port: u16) -> nextgcore_sbi::server::SbiServer {
-        let server = nextgcore_sbi::server::SbiServer::new(
-            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+    async fn start_header_echo_producer(
+        reservation: nextgcore_sbi::test_support::BoundListener,
+    ) -> nextgcore_sbi::server::SbiServer {
+        let (listener, addr) = reservation.into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
         );
         server
             .start(|request: SbiRequest| async move {
@@ -3233,15 +3279,24 @@ mod tests {
     /// against the consumer's registered key (TS 33.501 §13.4.1.3.2).
     #[tokio::test]
     async fn delegated_token_asserts_the_consumer_identity_when_the_consumer_attests_it() {
-        let (producer_port, nrf_port, scp_port) =
-            (ephemeral_port(), ephemeral_port(), ephemeral_port());
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
         let bodies = Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
-        let producer = start_header_echo_producer(producer_port).await;
-        let nrf =
-            start_recording_nrf(nrf_port, producer_port, "consumer-token", bodies.clone()).await;
+        let producer = start_header_echo_producer(producer_listener).await;
+        let nrf = start_recording_nrf(
+            nrf_listener,
+            producer_port,
+            "consumer-token",
+            bodies.clone(),
+        )
+        .await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 nf_instance_id: Some("scp-instance-1".into()),
@@ -3297,14 +3352,19 @@ mod tests {
     /// after #64, because the CCA we can sign has `sub` = the SCP.
     #[tokio::test]
     async fn delegated_token_stays_scp_attested_without_a_consumer_cca() {
-        let (producer_port, nrf_port, scp_port) =
-            (ephemeral_port(), ephemeral_port(), ephemeral_port());
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
         let bodies = Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
-        let producer = start_header_echo_producer(producer_port).await;
-        let nrf = start_recording_nrf(nrf_port, producer_port, "scp-token", bodies.clone()).await;
+        let producer = start_header_echo_producer(producer_listener).await;
+        let nrf =
+            start_recording_nrf(nrf_listener, producer_port, "scp-token", bodies.clone()).await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 nf_instance_id: Some("scp-instance-1".into()),
@@ -3339,14 +3399,18 @@ mod tests {
     /// authentication: assert the consumer's identity with no assertion.
     #[tokio::test]
     async fn trust_requester_identity_asserts_the_consumer_without_a_cca() {
-        let (producer_port, nrf_port, scp_port) =
-            (ephemeral_port(), ephemeral_port(), ephemeral_port());
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
         let bodies = Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
-        let producer = start_header_echo_producer(producer_port).await;
-        let nrf = start_recording_nrf(nrf_port, producer_port, "tok", bodies.clone()).await;
+        let producer = start_header_echo_producer(producer_listener).await;
+        let nrf = start_recording_nrf(nrf_listener, producer_port, "tok", bodies.clone()).await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 nf_instance_id: Some("scp-instance-1".into()),
@@ -3384,14 +3448,18 @@ mod tests {
     /// `nudm-sdm`, so only reading the header can produce the right token.
     #[tokio::test]
     async fn access_scope_header_sets_the_delegated_token_scope() {
-        let (producer_port, nrf_port, scp_port) =
-            (ephemeral_port(), ephemeral_port(), ephemeral_port());
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
         let bodies = Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
-        let producer = start_header_echo_producer(producer_port).await;
-        let nrf = start_recording_nrf(nrf_port, producer_port, "tok", bodies.clone()).await;
+        let producer = start_header_echo_producer(producer_listener).await;
+        let nrf = start_recording_nrf(nrf_listener, producer_port, "tok", bodies.clone()).await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 nf_instance_id: Some("scp-instance-1".into()),
@@ -3429,14 +3497,18 @@ mod tests {
     /// authorisation at the producer.
     #[tokio::test]
     async fn two_consumers_of_one_target_scope_each_get_their_own_token() {
-        let (producer_port, nrf_port, scp_port) =
-            (ephemeral_port(), ephemeral_port(), ephemeral_port());
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
         let bodies = Arc::new(tokio::sync::Mutex::new(Vec::new()));
 
-        let producer = start_header_echo_producer(producer_port).await;
-        let nrf = start_recording_nrf(nrf_port, producer_port, "tok", bodies.clone()).await;
+        let producer = start_header_echo_producer(producer_listener).await;
+        let nrf = start_recording_nrf(nrf_listener, producer_port, "tok", bodies.clone()).await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 nf_instance_id: Some("scp-instance-1".into()),
@@ -3579,12 +3651,14 @@ mod tests {
     /// hits, so a test can assert **which** endpoint served a request — and that
     /// a live producer was *not* contacted.
     async fn start_named_producer(
-        port: u16,
+        reservation: nextgcore_sbi::test_support::BoundListener,
         name: &'static str,
         hits: Arc<AtomicU64>,
     ) -> nextgcore_sbi::server::SbiServer {
-        let server = nextgcore_sbi::server::SbiServer::new(
-            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        let (listener, addr) = reservation.into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
         );
         server
             .start(move |request: SbiRequest| {
@@ -3606,11 +3680,13 @@ mod tests {
     /// A mock NRF that answers every `nnrf-disc` query with `search_result`, and
     /// serves the token endpoint the Model D path needs.
     async fn start_nrf_serving(
-        port: u16,
+        reservation: nextgcore_sbi::test_support::BoundListener,
         search_result: serde_json::Value,
     ) -> nextgcore_sbi::server::SbiServer {
-        let server = nextgcore_sbi::server::SbiServer::new(
-            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        let (listener, addr) = reservation.into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
         );
         server
             .start(move |request: SbiRequest| {
@@ -3640,17 +3716,21 @@ mod tests {
     /// visible: the sdm producer is live and would have answered 200 too.
     #[tokio::test]
     async fn test_model_d_addresses_the_requested_services_endpoint() {
-        let sdm_port = ephemeral_port();
-        let uecm_port = ephemeral_port();
-        let nrf_port = ephemeral_port();
-        let scp_port = ephemeral_port();
+        let sdm_listener = reserve_port();
+        let sdm_port = sdm_listener.port();
+        let uecm_listener = reserve_port();
+        let uecm_port = uecm_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
         let sdm_hits = Arc::new(AtomicU64::new(0));
         let uecm_hits = Arc::new(AtomicU64::new(0));
 
-        let sdm = start_named_producer(sdm_port, "sdm", sdm_hits.clone()).await;
-        let uecm = start_named_producer(uecm_port, "uecm", uecm_hits.clone()).await;
+        let sdm = start_named_producer(sdm_listener, "sdm", sdm_hits.clone()).await;
+        let uecm = start_named_producer(uecm_listener, "uecm", uecm_hits.clone()).await;
         let nrf = start_nrf_serving(
-            nrf_port,
+            nrf_listener,
             serde_json::json!({
                 "validityPeriod": 3600,
                 "nfInstances": [{
@@ -3676,7 +3756,7 @@ mod tests {
         )
         .await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 ..Default::default()
@@ -3717,14 +3797,17 @@ mod tests {
     /// the SCP declined rather than that the forward happened to fail.
     #[tokio::test]
     async fn test_model_d_unsupported_api_version_is_400_invalid_api() {
-        let producer_port = ephemeral_port();
-        let nrf_port = ephemeral_port();
-        let scp_port = ephemeral_port();
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
         let hits = Arc::new(AtomicU64::new(0));
 
-        let producer = start_named_producer(producer_port, "uecm-v1", hits.clone()).await;
+        let producer = start_named_producer(producer_listener, "uecm-v1", hits.clone()).await;
         let nrf = start_nrf_serving(
-            nrf_port,
+            nrf_listener,
             serde_json::json!({
                 "validityPeriod": 3600,
                 "nfInstances": [{
@@ -3743,7 +3826,7 @@ mod tests {
         )
         .await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 ..Default::default()
@@ -3831,15 +3914,18 @@ mod tests {
     async fn test_model_d_reselects_the_next_candidate_when_the_first_refuses() {
         // Port 1 on loopback refuses immediately (privileged, nothing listening).
         const DEAD_PORT: u16 = 1;
-        let live_port = ephemeral_port();
-        let nrf_port = ephemeral_port();
-        let scp_port = ephemeral_port();
+        let live_listener = reserve_port();
+        let live_port = live_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
         let live_hits = Arc::new(AtomicU64::new(0));
 
-        let live = start_named_producer(live_port, "second", live_hits.clone()).await;
-        let nrf = start_nrf_serving(nrf_port, uecm_instances(&[DEAD_PORT, live_port])).await;
+        let live = start_named_producer(live_listener, "second", live_hits.clone()).await;
+        let nrf = start_nrf_serving(nrf_listener, uecm_instances(&[DEAD_PORT, live_port])).await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 connect_timeout: Duration::from_millis(500),
@@ -3882,9 +3968,10 @@ mod tests {
     /// #211's `(504, NRF_NOT_REACHABLE)`: the cause still names which node failed.
     #[tokio::test]
     async fn test_model_d_exhausted_candidates_is_504_distinct_from_discovery_failure() {
-        let nrf_port = ephemeral_port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
         // Two candidates, both refusing.
-        let nrf = start_nrf_serving(nrf_port, uecm_instances(&[1, 2])).await;
+        let nrf = start_nrf_serving(nrf_listener, uecm_instances(&[1, 2])).await;
         let proxy = ScpProxy::new(ScpProxyConfig {
             nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
             connect_timeout: Duration::from_millis(500),
@@ -3897,11 +3984,12 @@ mod tests {
         assert_eq!(exhausted, (504, "TARGET_NF_NOT_REACHABLE".to_string()));
 
         // A genuine discovery error: the NRF answers non-200.
-        let broken_port = ephemeral_port();
-        let broken =
-            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-                SocketAddr::from(([127, 0, 0, 1], broken_port)),
-            ));
+        let broken_listener = reserve_port();
+        let broken_port = broken_listener.port();
+        let broken = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(broken_listener.addr()),
+            broken_listener.into_listener(),
+        );
         broken
             .start(|_r: SbiRequest| async move { SbiResponse::with_status(500) })
             .await
@@ -3934,18 +4022,23 @@ mod tests {
     /// "did not reselect" from "reselected and the second also failed".
     #[tokio::test]
     async fn test_model_d_does_not_reselect_on_a_producer_error() {
-        let erroring_port = ephemeral_port();
-        let live_port = ephemeral_port();
-        let nrf_port = ephemeral_port();
-        let scp_port = ephemeral_port();
+        let erroring_listener = reserve_port();
+        let erroring_port = erroring_listener.port();
+        let live_listener = reserve_port();
+        let live_port = live_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
         let erroring_hits = Arc::new(AtomicU64::new(0));
         let live_hits = Arc::new(AtomicU64::new(0));
 
-        let erroring = start_counting_500_producer(erroring_port, erroring_hits.clone()).await;
-        let live = start_named_producer(live_port, "second", live_hits.clone()).await;
-        let nrf = start_nrf_serving(nrf_port, uecm_instances(&[erroring_port, live_port])).await;
+        let erroring = start_counting_500_producer(erroring_listener, erroring_hits.clone()).await;
+        let live = start_named_producer(live_listener, "second", live_hits.clone()).await;
+        let nrf =
+            start_nrf_serving(nrf_listener, uecm_instances(&[erroring_port, live_port])).await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 connect_timeout: Duration::from_millis(500),
@@ -3982,12 +4075,14 @@ mod tests {
     /// possible.
     #[tokio::test]
     async fn test_max_producer_attempts_bounds_the_reselection_walk() {
-        let live_port = ephemeral_port();
-        let nrf_port = ephemeral_port();
+        let live_listener = reserve_port();
+        let live_port = live_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
         let live_hits = Arc::new(AtomicU64::new(0));
 
-        let live = start_named_producer(live_port, "third", live_hits.clone()).await;
-        let nrf = start_nrf_serving(nrf_port, uecm_instances(&[1, 2, live_port])).await;
+        let live = start_named_producer(live_listener, "third", live_hits.clone()).await;
+        let nrf = start_nrf_serving(nrf_listener, uecm_instances(&[1, 2, live_port])).await;
 
         let bounded = ScpProxy::new(ScpProxyConfig {
             nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
@@ -4030,18 +4125,23 @@ mod tests {
     /// be served by the sibling rather than shed with a 503.
     #[tokio::test]
     async fn test_an_open_circuit_reselects_rather_than_shedding() {
-        let flapping_port = ephemeral_port();
-        let live_port = ephemeral_port();
-        let nrf_port = ephemeral_port();
-        let scp_port = ephemeral_port();
+        let flapping_listener = reserve_port();
+        let flapping_port = flapping_listener.port();
+        let live_listener = reserve_port();
+        let live_port = live_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
         let flapping_hits = Arc::new(AtomicU64::new(0));
         let live_hits = Arc::new(AtomicU64::new(0));
 
-        let flapping = start_counting_500_producer(flapping_port, flapping_hits.clone()).await;
-        let live = start_named_producer(live_port, "sibling", live_hits.clone()).await;
-        let nrf = start_nrf_serving(nrf_port, uecm_instances(&[flapping_port, live_port])).await;
+        let flapping = start_counting_500_producer(flapping_listener, flapping_hits.clone()).await;
+        let live = start_named_producer(live_listener, "sibling", live_hits.clone()).await;
+        let nrf =
+            start_nrf_serving(nrf_listener, uecm_instances(&[flapping_port, live_port])).await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 connect_timeout: Duration::from_millis(500),
@@ -4120,23 +4220,26 @@ mod tests {
     /// untouched and the consumer gets the 504 the slow producer earned.
     #[tokio::test]
     async fn test_a_timeout_does_not_reselect() {
-        let slow_port = ephemeral_port();
-        let live_port = ephemeral_port();
-        let nrf_port = ephemeral_port();
+        let slow_listener = reserve_port();
+        let slow_port = slow_listener.port();
+        let live_listener = reserve_port();
+        let live_port = live_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
         let live_hits = Arc::new(AtomicU64::new(0));
 
-        let slow =
-            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-                SocketAddr::from(([127, 0, 0, 1], slow_port)),
-            ));
+        let slow = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(slow_listener.addr()),
+            slow_listener.into_listener(),
+        );
         slow.start(|_r: SbiRequest| async move {
             tokio::time::sleep(Duration::from_secs(5)).await;
             SbiResponse::ok()
         })
         .await
         .expect("slow producer start");
-        let live = start_named_producer(live_port, "second", live_hits.clone()).await;
-        let nrf = start_nrf_serving(nrf_port, uecm_instances(&[slow_port, live_port])).await;
+        let live = start_named_producer(live_listener, "second", live_hits.clone()).await;
+        let nrf = start_nrf_serving(nrf_listener, uecm_instances(&[slow_port, live_port])).await;
 
         let proxy = ScpProxy::new(ScpProxyConfig {
             nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
@@ -4167,12 +4270,14 @@ mod tests {
     /// A producer answering `201` with `Location: <location>`, optionally naming
     /// itself in `3gpp-Sbi-Producer-Id`, and echoing the URI it was asked for.
     async fn start_location_producer(
-        port: u16,
+        reservation: nextgcore_sbi::test_support::BoundListener,
         location: Option<&'static str>,
         own_producer_id: Option<&'static str>,
     ) -> nextgcore_sbi::server::SbiServer {
-        let server = nextgcore_sbi::server::SbiServer::new(
-            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        let (listener, addr) = reservation.into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
         );
         server
             .start(move |request: SbiRequest| async move {
@@ -4223,15 +4328,18 @@ mod tests {
     /// so this drives both and compares them.
     #[tokio::test]
     async fn test_producer_id_is_identical_on_a_cache_miss_and_the_following_hit() {
-        let producer_port = ephemeral_port();
-        let nrf_port = ephemeral_port();
-        let scp_port = ephemeral_port();
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
         let hits = Arc::new(AtomicU64::new(0));
 
-        let producer = start_named_producer(producer_port, "udm", hits.clone()).await;
-        let nrf = start_nrf_serving(nrf_port, udm_with_set_and_group(producer_port)).await;
+        let producer = start_named_producer(producer_listener, "udm", hits.clone()).await;
+        let nrf = start_nrf_serving(nrf_listener, udm_with_set_and_group(producer_port)).await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 ..Default::default()
@@ -4286,15 +4394,19 @@ mod tests {
     /// would pass against the overwriting code.
     #[tokio::test]
     async fn test_a_downstream_producer_id_is_not_overwritten() {
-        let producer_port = ephemeral_port();
-        let nrf_port = ephemeral_port();
-        let scp_port = ephemeral_port();
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
 
         let producer =
-            start_location_producer(producer_port, None, Some("nfinst=downstream-chosen")).await;
-        let nrf = start_nrf_serving(nrf_port, udm_with_set_and_group(producer_port)).await;
+            start_location_producer(producer_listener, None, Some("nfinst=downstream-chosen"))
+                .await;
+        let nrf = start_nrf_serving(nrf_listener, udm_with_set_and_group(producer_port)).await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 ..Default::default()
@@ -4327,16 +4439,22 @@ mod tests {
     /// `route()`'s Model C path proves it is actionable.
     #[tokio::test]
     async fn test_relative_location_after_retargeting_gains_a_usable_target_apiroot() {
-        let producer_port = ephemeral_port();
-        let nrf_port = ephemeral_port();
-        let scp_port = ephemeral_port();
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
 
-        let producer =
-            start_location_producer(producer_port, Some("/nudm-uecm/v1/registrations/42"), None)
-                .await;
-        let nrf = start_nrf_serving(nrf_port, udm_with_set_and_group(producer_port)).await;
+        let producer = start_location_producer(
+            producer_listener,
+            Some("/nudm-uecm/v1/registrations/42"),
+            None,
+        )
+        .await;
+        let nrf = start_nrf_serving(nrf_listener, udm_with_set_and_group(producer_port)).await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 ..Default::default()
@@ -4387,19 +4505,22 @@ mod tests {
     /// applied to every 2xx.
     #[tokio::test]
     async fn test_absolute_location_gets_no_target_apiroot() {
-        let producer_port = ephemeral_port();
-        let nrf_port = ephemeral_port();
-        let scp_port = ephemeral_port();
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
 
         let producer = start_location_producer(
-            producer_port,
+            producer_listener,
             Some("http://udm.example.org:8080/nudm-uecm/v1/registrations/42"),
             None,
         )
         .await;
-        let nrf = start_nrf_serving(nrf_port, udm_with_set_and_group(producer_port)).await;
+        let nrf = start_nrf_serving(nrf_listener, udm_with_set_and_group(producer_port)).await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 ..Default::default()
@@ -4434,13 +4555,18 @@ mod tests {
     /// echoing its own apiRoot back at it would be noise.
     #[tokio::test]
     async fn test_model_c_relative_location_is_not_annotated() {
-        let producer_port = ephemeral_port();
-        let scp_port = ephemeral_port();
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
 
-        let producer =
-            start_location_producer(producer_port, Some("/nudm-uecm/v1/registrations/42"), None)
-                .await;
-        let scp = start_scp(scp_port, ScpProxyConfig::default()).await;
+        let producer = start_location_producer(
+            producer_listener,
+            Some("/nudm-uecm/v1/registrations/42"),
+            None,
+        )
+        .await;
+        let scp = start_scp(scp_listener, ScpProxyConfig::default()).await;
 
         let request = SbiRequest::post("/nudm-uecm/v1/registrations").with_header(
             custom_header::TARGET_APIROOT,
@@ -4474,13 +4600,15 @@ mod tests {
     /// The counters are the point: the callback path must not touch either
     /// endpoint, and asserting a 200 alone would pass while a token was minted.
     async fn start_counting_nrf(
-        port: u16,
+        reservation: nextgcore_sbi::test_support::BoundListener,
         producer_port: u16,
         disc_hits: Arc<AtomicU64>,
         token_hits: Arc<AtomicU64>,
     ) -> nextgcore_sbi::server::SbiServer {
-        let server = nextgcore_sbi::server::SbiServer::new(
-            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        let (listener, addr) = reservation.into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
         );
         server
             .start(move |request: SbiRequest| {
@@ -4521,19 +4649,27 @@ mod tests {
     /// `test_callback_with_an_absolute_uri_is_routed_in_process`).
     #[tokio::test]
     async fn test_callback_with_discovery_headers_is_not_discovery_gated() {
-        let callback_port = ephemeral_port();
-        let decoy_port = ephemeral_port();
-        let nrf_port = ephemeral_port();
+        let callback_listener = reserve_port();
+        let callback_port = callback_listener.port();
+        let decoy_listener = reserve_port();
+        let decoy_port = decoy_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
         let callback_hits = Arc::new(AtomicU64::new(0));
         let decoy_hits = Arc::new(AtomicU64::new(0));
         let disc_hits = Arc::new(AtomicU64::new(0));
         let token_hits = Arc::new(AtomicU64::new(0));
 
         let callback_target =
-            start_named_producer(callback_port, "callback-target", callback_hits.clone()).await;
-        let decoy = start_named_producer(decoy_port, "decoy", decoy_hits.clone()).await;
-        let nrf =
-            start_counting_nrf(nrf_port, decoy_port, disc_hits.clone(), token_hits.clone()).await;
+            start_named_producer(callback_listener, "callback-target", callback_hits.clone()).await;
+        let decoy = start_named_producer(decoy_listener, "decoy", decoy_hits.clone()).await;
+        let nrf = start_counting_nrf(
+            nrf_listener,
+            decoy_port,
+            disc_hits.clone(),
+            token_hits.clone(),
+        )
+        .await;
         let proxy = ScpProxy::new(ScpProxyConfig {
             nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
             connect_timeout: Duration::from_millis(500),
@@ -4587,23 +4723,32 @@ mod tests {
     /// discriminates is `test_callback_with_discovery_headers_is_not_discovery_gated`.
     #[tokio::test]
     async fn test_callback_routes_without_discovery_or_token() {
-        let callback_port = ephemeral_port();
-        let nrf_port = ephemeral_port();
-        let scp_port = ephemeral_port();
+        let callback_listener = reserve_port();
+        let callback_port = callback_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
         let callback_hits = Arc::new(AtomicU64::new(0));
         let disc_hits = Arc::new(AtomicU64::new(0));
         let token_hits = Arc::new(AtomicU64::new(0));
         // A producer the SCP would have discovered had it taken the delegated path.
-        let decoy_port = ephemeral_port();
+        let decoy_listener = reserve_port();
+        let decoy_port = decoy_listener.port();
         let decoy_hits = Arc::new(AtomicU64::new(0));
 
         let callback_target =
-            start_named_producer(callback_port, "callback-target", callback_hits.clone()).await;
-        let decoy = start_named_producer(decoy_port, "decoy", decoy_hits.clone()).await;
-        let nrf =
-            start_counting_nrf(nrf_port, decoy_port, disc_hits.clone(), token_hits.clone()).await;
+            start_named_producer(callback_listener, "callback-target", callback_hits.clone()).await;
+        let decoy = start_named_producer(decoy_listener, "decoy", decoy_hits.clone()).await;
+        let nrf = start_counting_nrf(
+            nrf_listener,
+            decoy_port,
+            disc_hits.clone(),
+            token_hits.clone(),
+        )
+        .await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 ..Default::default()
@@ -4672,16 +4817,18 @@ mod tests {
     /// its query intact, not the absolute URI.
     #[tokio::test]
     async fn test_callback_with_an_absolute_uri_is_routed_in_process() {
-        let callback_port = ephemeral_port();
-        let nrf_port = ephemeral_port();
+        let callback_listener = reserve_port();
+        let callback_port = callback_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
         let callback_hits = Arc::new(AtomicU64::new(0));
         let disc_hits = Arc::new(AtomicU64::new(0));
         let token_hits = Arc::new(AtomicU64::new(0));
 
         let callback_target =
-            start_named_producer(callback_port, "callback-target", callback_hits.clone()).await;
+            start_named_producer(callback_listener, "callback-target", callback_hits.clone()).await;
         let nrf = start_counting_nrf(
-            nrf_port,
+            nrf_listener,
             callback_port,
             disc_hits.clone(),
             token_hits.clone(),
@@ -4813,10 +4960,12 @@ mod tests {
     /// OAuth2 client; the SCP does not strip or replace it).
     #[tokio::test]
     async fn test_model_c_preserves_consumer_authorization() {
-        let producer_port = ephemeral_port();
-        let scp_port = ephemeral_port();
-        let producer = start_auth_echo_producer(producer_port).await;
-        let scp = start_scp(scp_port, ScpProxyConfig::default()).await;
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
+        let producer = start_auth_echo_producer(producer_listener).await;
+        let scp = start_scp(scp_listener, ScpProxyConfig::default()).await;
 
         let request = SbiRequest::post("/nudm-uecm/v1/registrations")
             .with_header(
@@ -4844,9 +4993,14 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// A producer that always answers a fixed error status with a small body.
-    async fn start_status_producer(port: u16, status: u16) -> nextgcore_sbi::server::SbiServer {
-        let server = nextgcore_sbi::server::SbiServer::new(
-            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+    async fn start_status_producer(
+        reservation: nextgcore_sbi::test_support::BoundListener,
+        status: u16,
+    ) -> nextgcore_sbi::server::SbiServer {
+        let (listener, addr) = reservation.into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
         );
         server
             .start(move |_request: SbiRequest| async move {
@@ -4863,11 +5017,13 @@ mod tests {
     /// A producer that 401s (Bearer challenge) for its first `fail_count`
     /// requests, then answers 200 — used to drive the scpd-07 token retry.
     async fn start_token_gated_producer(
-        port: u16,
+        reservation: nextgcore_sbi::test_support::BoundListener,
         fail_count: u64,
     ) -> nextgcore_sbi::server::SbiServer {
-        let server = nextgcore_sbi::server::SbiServer::new(
-            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        let (listener, addr) = reservation.into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
         );
         let calls = Arc::new(AtomicU64::new(0));
         server
@@ -4898,12 +5054,14 @@ mod tests {
     /// An NRF whose nnrf-disc records every query parameter it received into
     /// `captured`, then returns a one-producer SearchResult.
     async fn start_mock_nrf_capturing(
-        port: u16,
+        reservation: nextgcore_sbi::test_support::BoundListener,
         producer_port: u16,
         captured: Arc<std::sync::Mutex<HashMap<String, String>>>,
     ) -> nextgcore_sbi::server::SbiServer {
-        let server = nextgcore_sbi::server::SbiServer::new(
-            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        let (listener, addr) = reservation.into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
         );
         server
             .start(move |request: SbiRequest| {
@@ -4960,10 +5118,12 @@ mod tests {
     /// body and status stay verbatim; the SCP does not stamp `Server` on it.
     #[tokio::test]
     async fn test_relayed_error_gains_via_verbatim_body() {
-        let producer_port = ephemeral_port();
-        let scp_port = ephemeral_port();
-        let producer = start_status_producer(producer_port, 409).await;
-        let scp = start_scp(scp_port, ScpProxyConfig::default()).await;
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
+        let producer = start_status_producer(producer_listener, 409).await;
+        let scp = start_scp(scp_listener, ScpProxyConfig::default()).await;
 
         let request = SbiRequest::post("/nudm-uecm/v1/registrations").with_header(
             "3gpp-Sbi-Target-apiRoot",
@@ -5029,10 +5189,12 @@ mod tests {
     /// the SCP's own Via on the request seen by the producer.
     #[tokio::test]
     async fn test_forward_decrements_hops_and_inserts_via() {
-        let producer_port = ephemeral_port();
-        let scp_port = ephemeral_port();
-        let producer = start_mock_producer(producer_port).await;
-        let scp = start_scp(scp_port, ScpProxyConfig::default()).await;
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
+        let producer = start_mock_producer(producer_listener).await;
+        let scp = start_scp(scp_listener, ScpProxyConfig::default()).await;
 
         let request = SbiRequest::get("/nudm-uecm/v1/registrations")
             .with_header(
@@ -5061,10 +5223,12 @@ mod tests {
     /// params pass through (TS 29.500 §6.10.2.6).
     #[tokio::test]
     async fn test_ck_cache_key_param_is_stripped() {
-        let producer_port = ephemeral_port();
-        let scp_port = ephemeral_port();
-        let producer = start_mock_producer(producer_port).await;
-        let scp = start_scp(scp_port, ScpProxyConfig::default()).await;
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
+        let producer = start_mock_producer(producer_listener).await;
+        let scp = start_scp(scp_listener, ScpProxyConfig::default()).await;
 
         let request = SbiRequest::get("/nudm-uecm/v1/registrations")
             .with_param("ck", "cache-key-abc")
@@ -5094,15 +5258,18 @@ mod tests {
     /// NRF as its nnrf-disc query parameter.
     #[tokio::test]
     async fn test_all_discovery_factors_forwarded_to_nrf() {
-        let producer_port = ephemeral_port();
-        let nrf_port = ephemeral_port();
-        let scp_port = ephemeral_port();
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
         let captured = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
-        let producer = start_mock_producer(producer_port).await;
-        let nrf = start_mock_nrf_capturing(nrf_port, producer_port, captured.clone()).await;
+        let producer = start_mock_producer(producer_listener).await;
+        let nrf = start_mock_nrf_capturing(nrf_listener, producer_port, captured.clone()).await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 ..Default::default()
@@ -5165,21 +5332,24 @@ mod tests {
     /// once — the consumer sees 200 and the NRF served ≥2 token requests.
     #[tokio::test]
     async fn test_delegated_401_refreshes_token_and_retries_once() {
-        let producer_port = ephemeral_port();
-        let nrf_port = ephemeral_port();
-        let scp_port = ephemeral_port();
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
         let token_hits = Arc::new(AtomicU64::new(0));
 
-        let producer = start_token_gated_producer(producer_port, 1).await;
+        let producer = start_token_gated_producer(producer_listener, 1).await;
         let nrf = start_mock_nrf_with_oauth2(
-            nrf_port,
+            nrf_listener,
             producer_port,
             "scp-delegated-token",
             token_hits.clone(),
         )
         .await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 nf_instance_id: Some("scp-instance-1".into()),
@@ -5214,21 +5384,24 @@ mod tests {
     /// to the consumer after the single retry.
     #[tokio::test]
     async fn test_delegated_persistent_401_is_relayed() {
-        let producer_port = ephemeral_port();
-        let nrf_port = ephemeral_port();
-        let scp_port = ephemeral_port();
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
         let token_hits = Arc::new(AtomicU64::new(0));
 
-        let producer = start_token_gated_producer(producer_port, u64::MAX).await;
+        let producer = start_token_gated_producer(producer_listener, u64::MAX).await;
         let nrf = start_mock_nrf_with_oauth2(
-            nrf_port,
+            nrf_listener,
             producer_port,
             "scp-delegated-token",
             token_hits.clone(),
         )
         .await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 nf_instance_id: Some("scp-instance-1".into()),
@@ -5256,15 +5429,18 @@ mod tests {
     /// single NRF discovery hit (the second is served from the cache).
     #[tokio::test]
     async fn test_discovery_cache_serves_second_request() {
-        let producer_port = ephemeral_port();
-        let nrf_port = ephemeral_port();
-        let scp_port = ephemeral_port();
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
         let nrf_hits = Arc::new(AtomicU64::new(0));
 
-        let producer = start_mock_producer(producer_port).await;
-        let nrf = start_mock_nrf(nrf_port, producer_port, nrf_hits.clone()).await;
+        let producer = start_mock_producer(producer_listener).await;
+        let nrf = start_mock_nrf(nrf_listener, producer_port, nrf_hits.clone()).await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 ..Default::default()
@@ -5297,17 +5473,20 @@ mod tests {
     /// cause ACCESS_TOKEN_DENIED rather than forwarding tokenless.
     #[tokio::test]
     async fn test_delegated_token_rejection_maps_to_403() {
-        let producer_port = ephemeral_port();
-        let nrf_port = ephemeral_port();
-        let scp_port = ephemeral_port();
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
 
-        let producer = start_mock_producer(producer_port).await;
+        let producer = start_mock_producer(producer_listener).await;
         // NRF answers discovery but rejects the access-token request (not with
         // MISSING_PARAMETER) — the SCP must map this to 403 ACCESS_TOKEN_DENIED.
-        let nrf_server =
-            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-                SocketAddr::from(([127, 0, 0, 1], nrf_port)),
-            ));
+        let nrf_server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(nrf_listener.addr()),
+            nrf_listener.into_listener(),
+        );
         nrf_server
             .start(move |request: SbiRequest| async move {
                 if request.header.uri == "/nnrf-oauth2/v1/access-token" {
@@ -5335,7 +5514,7 @@ mod tests {
             .expect("nrf start");
 
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 ..Default::default()
@@ -5366,15 +5545,18 @@ mod tests {
     /// URI seen by the producer.
     #[tokio::test]
     async fn test_apiprefix_propagates_into_forwarded_uri() {
-        let producer_port = ephemeral_port();
-        let nrf_port = ephemeral_port();
-        let scp_port = ephemeral_port();
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
 
-        let producer = start_mock_producer(producer_port).await;
-        let nrf_server =
-            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-                SocketAddr::from(([127, 0, 0, 1], nrf_port)),
-            ));
+        let producer = start_mock_producer(producer_listener).await;
+        let nrf_server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(nrf_listener.addr()),
+            nrf_listener.into_listener(),
+        );
         nrf_server
             .start(move |request: SbiRequest| async move {
                 // A real NRF serves both nnrf-disc and nnrf-oauth2; the SCP
@@ -5404,7 +5586,7 @@ mod tests {
             .await
             .expect("nrf start");
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 ..Default::default()
@@ -5434,11 +5616,13 @@ mod tests {
     /// stripped as in the default next-hop-producer deployment).
     #[tokio::test]
     async fn test_next_hop_scp_reinserts_target_apiroot() {
-        let producer_port = ephemeral_port();
-        let scp_port = ephemeral_port();
-        let producer = start_mock_producer(producer_port).await;
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
+        let producer = start_mock_producer(producer_listener).await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 next_hop_scp: true,
                 ..Default::default()
@@ -5504,15 +5688,18 @@ mod tests {
     /// producer to the consumer via `3gpp-Sbi-Producer-Id` in `nfinst=` form.
     #[tokio::test]
     async fn test_sticky_reselection_reports_producer_id() {
-        let producer_port = ephemeral_port();
-        let nrf_port = ephemeral_port();
-        let scp_port = ephemeral_port();
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
         let nrf_hits = Arc::new(AtomicU64::new(0));
 
-        let producer = start_mock_producer(producer_port).await;
-        let nrf = start_mock_nrf(nrf_port, producer_port, nrf_hits.clone()).await;
+        let producer = start_mock_producer(producer_listener).await;
+        let nrf = start_mock_nrf(nrf_listener, producer_port, nrf_hits.clone()).await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 ..Default::default()
@@ -5549,15 +5736,18 @@ mod tests {
     /// Producer-Id when the profile declares an NF set.
     #[tokio::test]
     async fn test_group_and_set_member_selection_reports_ids() {
-        let producer_port = ephemeral_port();
-        let nrf_port = ephemeral_port();
-        let scp_port = ephemeral_port();
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
 
-        let producer = start_mock_producer(producer_port).await;
-        let nrf_server =
-            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-                SocketAddr::from(([127, 0, 0, 1], nrf_port)),
-            ));
+        let producer = start_mock_producer(producer_listener).await;
+        let nrf_server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(nrf_listener.addr()),
+            nrf_listener.into_listener(),
+        );
         nrf_server
             .start(move |request: SbiRequest| async move {
                 // A real NRF serves both nnrf-disc and nnrf-oauth2; the SCP
@@ -5588,7 +5778,7 @@ mod tests {
             .await
             .expect("nrf start");
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 ..Default::default()
@@ -5628,15 +5818,18 @@ mod tests {
     /// Producer-Id (status-gated to 2xx), but still gains the relay Via.
     #[tokio::test]
     async fn test_relayed_500_carries_no_producer_id() {
-        let producer_port = ephemeral_port();
-        let nrf_port = ephemeral_port();
-        let scp_port = ephemeral_port();
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let nrf_listener = reserve_port();
+        let nrf_port = nrf_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
         let nrf_hits = Arc::new(AtomicU64::new(0));
 
-        let producer = start_status_producer(producer_port, 500).await;
-        let nrf = start_mock_nrf(nrf_port, producer_port, nrf_hits.clone()).await;
+        let producer = start_status_producer(producer_listener, 500).await;
+        let nrf = start_mock_nrf(nrf_listener, producer_port, nrf_hits.clone()).await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
                 ..Default::default()
@@ -5812,11 +6005,13 @@ mod tests {
 
     /// A producer that always answers 500 and counts the requests that reach it.
     async fn start_counting_500_producer(
-        port: u16,
+        reservation: nextgcore_sbi::test_support::BoundListener,
         hits: Arc<AtomicU64>,
     ) -> nextgcore_sbi::server::SbiServer {
-        let server = nextgcore_sbi::server::SbiServer::new(
-            nextgcore_sbi::server::SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+        let (listener, addr) = reservation.into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
         );
         server
             .start(move |_request: SbiRequest| {
@@ -5839,13 +6034,15 @@ mod tests {
     /// and after the open timeout admits a single half-open probe.
     #[tokio::test]
     async fn test_circuit_breaker_opens_sheds_load_then_probes() {
-        let producer_port = ephemeral_port();
-        let scp_port = ephemeral_port();
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
         let hits = Arc::new(AtomicU64::new(0));
 
-        let producer = start_counting_500_producer(producer_port, hits.clone()).await;
+        let producer = start_counting_500_producer(producer_listener, hits.clone()).await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 circuit_failure_threshold: 2,
                 circuit_open_timeout: Duration::from_millis(200),
@@ -5905,11 +6102,13 @@ mod tests {
     /// many forwards — success resets the failure count.
     #[tokio::test]
     async fn test_circuit_breaker_stays_closed_on_success() {
-        let producer_port = ephemeral_port();
-        let scp_port = ephemeral_port();
-        let producer = start_mock_producer(producer_port).await;
+        let producer_listener = reserve_port();
+        let producer_port = producer_listener.port();
+        let scp_listener = reserve_port();
+        let scp_port = scp_listener.port();
+        let producer = start_mock_producer(producer_listener).await;
         let scp = start_scp(
-            scp_port,
+            scp_listener,
             ScpProxyConfig {
                 circuit_failure_threshold: 2,
                 ..Default::default()

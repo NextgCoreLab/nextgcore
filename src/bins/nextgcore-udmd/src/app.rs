@@ -3814,15 +3814,6 @@ mod tests {
             .unwrap_or_else(|_| SbiResponse::with_status(500))
     }
 
-    /// Reserve a loopback port for a test server.
-    ///
-    /// Delegates to the shared helper: 21 crates each had a private
-    /// probe-and-drop copy of this, which is TOCTOU and flaked under parallel
-    /// `cargo test`. One implementation means one place to harden.
-    fn free_port() -> u16 {
-        nextgcore_sbi::test_support::free_port()
-    }
-
     fn unhex(s: &str) -> Vec<u8> {
         crate::nudm_handler::hex_to_bytes(s)
     }
@@ -3856,21 +3847,25 @@ mod tests {
             }
 
             // --- mock UDR on an ephemeral port ---
-            let udr_port = free_port();
-            let udr_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
-                [127, 0, 0, 1],
-                udr_port,
-            ))));
+            let (udr_listener, udr_addr) =
+                nextgcore_sbi::test_support::bound_listener().into_parts();
+            let udr_port = udr_addr.port();
+            let udr_server = SbiServer::on_listener(
+                NextgcoreSbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], udr_port))),
+                udr_listener,
+            );
             udr_server.start(mock_udr_handler).await.expect("udr start");
             std::env::set_var("UDR_SBI_ADDR", "127.0.0.1");
             std::env::set_var("UDR_SBI_PORT", udr_port.to_string());
 
             // --- real UDM handler on an ephemeral port ---
-            let udm_port = free_port();
-            let udm_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
-                [127, 0, 0, 1],
-                udm_port,
-            ))));
+            let (udm_listener, udm_addr) =
+                nextgcore_sbi::test_support::bound_listener().into_parts();
+            let udm_port = udm_addr.port();
+            let udm_server = SbiServer::on_listener(
+                NextgcoreSbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], udm_port))),
+                udm_listener,
+            );
             udm_server
                 .start(udm_sbi_request_handler)
                 .await
@@ -5491,9 +5486,10 @@ mod tests {
     /// backing store.
     async fn start_mock_udr_context_data() -> (SbiServer, CtxStore) {
         let store: CtxStore = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-        let port = free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        let server = SbiServer::new(NextgcoreSbiServerConfig::new(addr));
+        let server = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), port_listener);
         let handler_store = Arc::clone(&store);
         server
             .start(move |req: SbiRequest| {
@@ -5517,9 +5513,10 @@ mod tests {
 
     /// Start the real UDM SBI server and return it with a client for it.
     async fn start_real_udm() -> (SbiServer, nextgcore_sbi::client::SbiClient) {
-        let port = free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        let server = SbiServer::new(NextgcoreSbiServerConfig::new(addr));
+        let server = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), port_listener);
         server
             .start(udm_sbi_request_handler)
             .await
@@ -5792,9 +5789,10 @@ mod tests {
 
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = Arc::clone(&hits);
-        let port = free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        let server = SbiServer::new(NextgcoreSbiServerConfig::new(addr));
+        let server = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), port_listener);
         server
             .start(move |_req: SbiRequest| {
                 let counter = Arc::clone(&counter);
@@ -5839,9 +5837,10 @@ mod tests {
         state
             .patch_status
             .store(204, std::sync::atomic::Ordering::SeqCst);
-        let udr_port = free_port();
-        let udr_addr = SocketAddr::from(([127, 0, 0, 1], udr_port));
-        let udr_server = SbiServer::new(NextgcoreSbiServerConfig::new(udr_addr));
+        let (udr_listener, udr_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let udr_port = udr_addr.port();
+        let udr_server =
+            SbiServer::on_listener(NextgcoreSbiServerConfig::new(udr_addr), udr_listener);
         let handler_state = Arc::clone(&state);
         udr_server
             .start(move |req: SbiRequest| {
@@ -6449,9 +6448,10 @@ mod tests {
 
         // Stand up amfd's REAL Namf handler and register it as the serving AMF.
         let amf_instance_id = "amf-for-mt-test";
-        let amf_port = free_port();
-        let amf_addr = SocketAddr::from(([127, 0, 0, 1], amf_port));
-        let amf_server = SbiServer::new(NextgcoreSbiServerConfig::new(amf_addr));
+        let (amf_listener, amf_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let amf_port = amf_addr.port();
+        let amf_server =
+            SbiServer::on_listener(NextgcoreSbiServerConfig::new(amf_addr), amf_listener);
         amf_server
             .start(nextgcore_amfd::namf_request_handler)
             .await
@@ -6540,10 +6540,6 @@ mod oauth2_h8_tests {
     use std::net::SocketAddr;
     use std::time::Duration;
 
-    fn free_port() -> u16 {
-        nextgcore_sbi::test_support::free_port()
-    }
-
     fn build_es256_token(
         sk: &p256::ecdsa::SigningKey,
         kid: &str,
@@ -6584,12 +6580,13 @@ mod oauth2_h8_tests {
 
     async fn start_server(jwks: serde_json::Value) -> (SbiServer, u16) {
         super::udm_context_init(64, 64);
-        let port = free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         let mut cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
         cfg.require_oauth2 = true;
         cfg.oauth2_jwks = Some(jwks);
         cfg = cfg.with_expected_audience_nf_type(NfType::Udm);
-        let server = SbiServer::new(cfg);
+        let server = SbiServer::on_listener(cfg, port_listener);
         server
             .start(super::udm_sbi_request_handler)
             .await

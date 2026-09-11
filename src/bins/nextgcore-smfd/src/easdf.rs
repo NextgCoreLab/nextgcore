@@ -440,11 +440,13 @@ pub(crate) mod tests {
 
         // EASDF: 201 + Location + dnsContextId on create, 204 on delete.
         let sink = seen.clone();
-        let easdf_port = nextgcore_sbi::test_support::free_port();
-        let easdf = SbiServer::new(SbiServerConfig::new(SocketAddr::from((
-            [127, 0, 0, 1],
-            easdf_port,
-        ))));
+        let (easdf_listener, easdf_addr) =
+            nextgcore_sbi::test_support::bound_listener().into_parts();
+        let easdf_port = easdf_addr.port();
+        let easdf = SbiServer::on_listener(
+            SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], easdf_port))),
+            easdf_listener,
+        );
         easdf
             .start(move |req: SbiRequest| {
                 let sink = sink.clone();
@@ -469,11 +471,12 @@ pub(crate) mod tests {
         // NRF: one EASDF advertising BOTH services, the dnscontext one pointing at
         // the EASDF above and the other at a dead port — so selecting the wrong
         // service fails loudly rather than silently working.
-        let nrf_port = nextgcore_sbi::test_support::free_port();
-        let nrf = SbiServer::new(SbiServerConfig::new(SocketAddr::from((
-            [127, 0, 0, 1],
-            nrf_port,
-        ))));
+        let (nrf_listener, nrf_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let nrf_port = nrf_addr.port();
+        let nrf = SbiServer::on_listener(
+            SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], nrf_port))),
+            nrf_listener,
+        );
         nrf.start(move |_req: SbiRequest| async move {
             SbiResponse::with_status(200)
                 .with_json_body(&serde_json::json!({

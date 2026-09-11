@@ -797,11 +797,12 @@ mod tests {
         let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, String)>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = seen.clone();
-        let port = nextgcore_sbi::test_support::free_port();
-        let udm = SbiServer::new(SbiServerConfig::new(SocketAddr::from((
-            [127, 0, 0, 1],
-            port,
-        ))));
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
+        let udm = SbiServer::on_listener(
+            SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+            port_listener,
+        );
         udm.start(move |req: SbiRequest| {
             let sink = sink.clone();
             async move {

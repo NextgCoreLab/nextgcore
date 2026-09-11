@@ -39,22 +39,29 @@ jobs:
         with:
           workspaces: src
       - name: cargo test
-        # No retry. There was one, for two named races: process-global state and
-        # the free_port TOCTOU. #308 fixed the first (one ambient test lock per
-        # crate, covering readers as well as writers) and measured what the retry
-        # had been hiding -- about 1 whole-workspace run in 5, in three smfd tests,
-        # for months, because a single retry passes ~96% of the time at that rate
-        # and the warning annotation went unread. A retry that can hide a 20% flake
-        # is not a flake mitigation, it is a detector for exactly the failures
-        # nobody investigates.
+        # No retry, and nothing left for one to hide. There was one, for two named
+        # races: process-global state and the free_port TOCTOU.
         #
-        # What genuinely remains is #313: free_port hands out a port and unbinds it
-        # before the caller binds, and each test BINARY has its own issued-port set,
-        # so two crates can be given the same port. That fails as a bind panic, not
-        # as a wrong answer, and it did not occur once in ~60 whole-crate runs under
-        # synthetic 40-way load. Closing it needs SbiServer to accept a pre-bound
-        # listener, which is #313's subject; until then a rare red here is the
-        # honest signal and should be re-run, not retried automatically.
+        # #308 fixed the first (one ambient test lock per crate, covering readers
+        # as well as writers) and measured what the retry had been hiding -- about
+        # 1 whole-workspace run in 5, in three smfd tests, for months, because a
+        # single retry passes ~96% of the time at that rate and the warning
+        # annotation went unread. A retry that can hide a 20% flake is not a flake
+        # mitigation, it is a detector for exactly the failures nobody
+        # investigates.
+        #
+        # #313 CLOSED the second. `free_port` used to hand out a port and unbind it
+        # before the caller bound it, with a per-BINARY issued-port set, so two
+        # crates could be given the same port and one would fail to bind.
+        # `test_support::bound_listener` now keeps the port bound and
+        # `SbiServer::on_listener` serves that listener, so there is no window:
+        # all 243 ephemeral-port server starts in this workspace now reserve.
+        # `free_port` survives only for the 10 callers that want a port with
+        # NOTHING listening on it (transport-error and degrade-open tests), where
+        # being unbound is the point, plus one integration test that hands ports to
+        # a child PROCESS and so cannot pass a socket at all.
+        #
+        # So a red here is a real failure. Read it, do not re-run it.
         run: cd src && cargo test --workspace
 
       - name: cargo test (non-default features)

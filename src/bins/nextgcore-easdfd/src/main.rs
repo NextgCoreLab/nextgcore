@@ -1502,11 +1502,15 @@ easdf:
         let seen: std::sync::Arc<Mutex<Vec<serde_json::Value>>> =
             std::sync::Arc::new(Mutex::new(Vec::new()));
         let sink = seen.clone();
-        let port = nextgcore_sbi::test_support::free_port();
-        let smf =
-            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-                std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-            ));
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
+        let smf = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                port,
+            ))),
+            port_listener,
+        );
         smf.start(move |req: SbiRequest| {
             let sink = sink.clone();
             async move {

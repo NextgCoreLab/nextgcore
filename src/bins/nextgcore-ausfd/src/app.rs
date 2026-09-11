@@ -2287,15 +2287,6 @@ mod tests {
         }
     }
 
-    /// Reserve a loopback port for a test server.
-    ///
-    /// Delegates to the shared helper: 21 crates each had a private
-    /// probe-and-drop copy of this, which is TOCTOU and flaked under parallel
-    /// `cargo test`. One implementation means one place to harden.
-    fn free_port() -> u16 {
-        nextgcore_sbi::test_support::free_port()
-    }
-
     /// Full HTTP-level flow: 5G-AKA success + failure, EAP-AKA' success +
     /// failure, strict-peer rejections (missing attrs, bad SNN).
     ///
@@ -2317,21 +2308,25 @@ mod tests {
             ausf_context_init(64);
 
             // --- mock UDM on an ephemeral port ---
-            let udm_port = free_port();
-            let udm_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
-                [127, 0, 0, 1],
-                udm_port,
-            ))));
+            let (udm_listener, udm_addr) =
+                nextgcore_sbi::test_support::bound_listener().into_parts();
+            let udm_port = udm_addr.port();
+            let udm_server = SbiServer::on_listener(
+                NextgcoreSbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], udm_port))),
+                udm_listener,
+            );
             udm_server.start(mock_udm_handler).await.expect("udm start");
             std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
             std::env::set_var("UDM_SBI_PORT", udm_port.to_string());
 
             // --- real AUSF handler on an ephemeral port ---
-            let ausf_port = free_port();
-            let ausf_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
-                [127, 0, 0, 1],
-                ausf_port,
-            ))));
+            let (ausf_listener, ausf_addr) =
+                nextgcore_sbi::test_support::bound_listener().into_parts();
+            let ausf_port = ausf_addr.port();
+            let ausf_server = SbiServer::on_listener(
+                NextgcoreSbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], ausf_port))),
+                ausf_listener,
+            );
             ausf_server
                 .start(ausf_sbi_request_handler)
                 .await
@@ -2686,21 +2681,25 @@ mod tests {
             ausf_context_init(128);
 
             // Mock UDM
-            let udm_port = free_port();
-            let udm_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
-                [127, 0, 0, 1],
-                udm_port,
-            ))));
+            let (udm_listener, udm_addr) =
+                nextgcore_sbi::test_support::bound_listener().into_parts();
+            let udm_port = udm_addr.port();
+            let udm_server = SbiServer::on_listener(
+                NextgcoreSbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], udm_port))),
+                udm_listener,
+            );
             udm_server.start(mock_udm_handler).await.expect("udm start");
             std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
             std::env::set_var("UDM_SBI_PORT", udm_port.to_string());
 
             // Real AUSF handler
-            let ausf_port = free_port();
-            let ausf_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
-                [127, 0, 0, 1],
-                ausf_port,
-            ))));
+            let (ausf_listener, ausf_addr) =
+                nextgcore_sbi::test_support::bound_listener().into_parts();
+            let ausf_port = ausf_addr.port();
+            let ausf_server = SbiServer::on_listener(
+                NextgcoreSbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], ausf_port))),
+                ausf_listener,
+            );
             ausf_server
                 .start(ausf_sbi_request_handler)
                 .await
@@ -2982,20 +2981,24 @@ mod tests {
             ausf_context_init(128);
 
             // Mock UDM (real Milenage + 5G KDFs) + real AUSF handler.
-            let udm_port = free_port();
-            let udm_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
-                [127, 0, 0, 1],
-                udm_port,
-            ))));
+            let (udm_listener, udm_addr) =
+                nextgcore_sbi::test_support::bound_listener().into_parts();
+            let udm_port = udm_addr.port();
+            let udm_server = SbiServer::on_listener(
+                NextgcoreSbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], udm_port))),
+                udm_listener,
+            );
             udm_server.start(mock_udm_handler).await.expect("udm start");
             std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
             std::env::set_var("UDM_SBI_PORT", udm_port.to_string());
 
-            let ausf_port = free_port();
-            let ausf_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
-                [127, 0, 0, 1],
-                ausf_port,
-            ))));
+            let (ausf_listener, ausf_addr) =
+                nextgcore_sbi::test_support::bound_listener().into_parts();
+            let ausf_port = ausf_addr.port();
+            let ausf_server = SbiServer::on_listener(
+                NextgcoreSbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], ausf_port))),
+                ausf_listener,
+            );
             ausf_server
                 .start(ausf_sbi_request_handler)
                 .await
@@ -3114,20 +3117,24 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(60), async {
             ausf_context_init(128);
 
-            let udm_port = free_port();
-            let udm_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
-                [127, 0, 0, 1],
-                udm_port,
-            ))));
+            let (udm_listener, udm_addr) =
+                nextgcore_sbi::test_support::bound_listener().into_parts();
+            let udm_port = udm_addr.port();
+            let udm_server = SbiServer::on_listener(
+                NextgcoreSbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], udm_port))),
+                udm_listener,
+            );
             udm_server.start(mock_udm_handler).await.expect("udm start");
             std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
             std::env::set_var("UDM_SBI_PORT", udm_port.to_string());
 
-            let ausf_port = free_port();
-            let ausf_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
-                [127, 0, 0, 1],
-                ausf_port,
-            ))));
+            let (ausf_listener, ausf_addr) =
+                nextgcore_sbi::test_support::bound_listener().into_parts();
+            let ausf_port = ausf_addr.port();
+            let ausf_server = SbiServer::on_listener(
+                NextgcoreSbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], ausf_port))),
+                ausf_listener,
+            );
             ausf_server
                 .start(ausf_sbi_request_handler)
                 .await
@@ -3304,20 +3311,24 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(60), async {
             ausf_context_init(64);
 
-            let udm_port = free_port();
-            let udm_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
-                [127, 0, 0, 1],
-                udm_port,
-            ))));
+            let (udm_listener, udm_addr) =
+                nextgcore_sbi::test_support::bound_listener().into_parts();
+            let udm_port = udm_addr.port();
+            let udm_server = SbiServer::on_listener(
+                NextgcoreSbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], udm_port))),
+                udm_listener,
+            );
             udm_server.start(mock_udm_handler).await.expect("udm start");
             std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
             std::env::set_var("UDM_SBI_PORT", udm_port.to_string());
 
-            let ausf_port = free_port();
-            let ausf_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
-                [127, 0, 0, 1],
-                ausf_port,
-            ))));
+            let (ausf_listener, ausf_addr) =
+                nextgcore_sbi::test_support::bound_listener().into_parts();
+            let ausf_port = ausf_addr.port();
+            let ausf_server = SbiServer::on_listener(
+                NextgcoreSbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], ausf_port))),
+                ausf_listener,
+            );
             ausf_server
                 .start(ausf_sbi_request_handler)
                 .await
@@ -3438,21 +3449,25 @@ mod tests {
             ausf_context_init(128);
 
             // Mock UDM (so the permissive/matching case can reach 201).
-            let udm_port = free_port();
-            let udm_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
-                [127, 0, 0, 1],
-                udm_port,
-            ))));
+            let (udm_listener, udm_addr) =
+                nextgcore_sbi::test_support::bound_listener().into_parts();
+            let udm_port = udm_addr.port();
+            let udm_server = SbiServer::on_listener(
+                NextgcoreSbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], udm_port))),
+                udm_listener,
+            );
             udm_server.start(mock_udm_handler).await.expect("udm start");
             std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
             std::env::set_var("UDM_SBI_PORT", udm_port.to_string());
 
             // Real AUSF handler.
-            let ausf_port = free_port();
-            let ausf_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
-                [127, 0, 0, 1],
-                ausf_port,
-            ))));
+            let (ausf_listener, ausf_addr) =
+                nextgcore_sbi::test_support::bound_listener().into_parts();
+            let ausf_port = ausf_addr.port();
+            let ausf_server = SbiServer::on_listener(
+                NextgcoreSbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], ausf_port))),
+                ausf_listener,
+            );
             ausf_server
                 .start(ausf_sbi_request_handler)
                 .await
@@ -3587,20 +3602,24 @@ mod tests {
             ausf_context_init(128);
 
             // Mock UDM (real Milenage + 5G KDFs) + real AUSF dispatcher.
-            let udm_port = free_port();
-            let udm_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
-                [127, 0, 0, 1],
-                udm_port,
-            ))));
+            let (udm_listener, udm_addr) =
+                nextgcore_sbi::test_support::bound_listener().into_parts();
+            let udm_port = udm_addr.port();
+            let udm_server = SbiServer::on_listener(
+                NextgcoreSbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], udm_port))),
+                udm_listener,
+            );
             udm_server.start(mock_udm_handler).await.expect("udm start");
             std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
             std::env::set_var("UDM_SBI_PORT", udm_port.to_string());
 
-            let ausf_port = free_port();
-            let ausf_server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
-                [127, 0, 0, 1],
-                ausf_port,
-            ))));
+            let (ausf_listener, ausf_addr) =
+                nextgcore_sbi::test_support::bound_listener().into_parts();
+            let ausf_port = ausf_addr.port();
+            let ausf_server = SbiServer::on_listener(
+                NextgcoreSbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], ausf_port))),
+                ausf_listener,
+            );
             ausf_server
                 .start(ausf_sbi_request_handler)
                 .await
@@ -3778,10 +3797,6 @@ mod oauth2_h8_tests {
     use std::net::SocketAddr;
     use std::time::Duration;
 
-    fn free_port() -> u16 {
-        nextgcore_sbi::test_support::free_port()
-    }
-
     fn build_es256_token(
         sk: &p256::ecdsa::SigningKey,
         kid: &str,
@@ -3822,12 +3837,13 @@ mod oauth2_h8_tests {
 
     async fn start_server(jwks: serde_json::Value) -> (SbiServer, u16) {
         super::ausf_context_init(64);
-        let port = free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         let mut cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
         cfg.require_oauth2 = true;
         cfg.oauth2_jwks = Some(jwks);
         cfg = cfg.with_expected_audience_nf_type(NfType::Ausf);
-        let server = SbiServer::new(cfg);
+        let server = SbiServer::on_listener(cfg, port_listener);
         server
             .start(super::ausf_sbi_request_handler)
             .await

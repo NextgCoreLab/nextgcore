@@ -2534,15 +2534,6 @@ nsacf:
     // HTTP-level tests (ephemeral ports, bounded timeouts)
     // -----------------------------------------------------------------
 
-    /// Reserve a loopback port for a test server.
-    ///
-    /// Delegates to the shared helper: 21 crates each had a private
-    /// probe-and-drop copy of this, which is TOCTOU and flaked under parallel
-    /// `cargo test`. One implementation means one place to harden.
-    fn free_port() -> u16 {
-        nextgcore_sbi::test_support::free_port()
-    }
-
     /// Serializes every test that touches the PROCESS-GLOBAL NSACF context.
     /// `start_nsacf_server*` re-inits (wipes) the shared store, so two such
     /// tests running on parallel test threads corrupt each other's quota/UE
@@ -2555,11 +2546,12 @@ nsacf:
     async fn start_nsacf_server() -> (SbiServer, u16, tokio::sync::MutexGuard<'static, ()>) {
         let guard = GLOBAL_CTX_TEST_LOCK.lock().await;
         nsacf_context_init(64);
-        let port = free_port();
-        let server = SbiServer::new(SbiServerConfig::new(SocketAddr::from((
-            [127, 0, 0, 1],
-            port,
-        ))));
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
+        let server = SbiServer::on_listener(
+            SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+            port_listener,
+        );
         server
             .start(nsacf_sbi_request_handler)
             .await
@@ -2615,12 +2607,13 @@ nsacf:
     ) -> (SbiServer, u16, tokio::sync::MutexGuard<'static, ()>) {
         let guard = GLOBAL_CTX_TEST_LOCK.lock().await;
         nsacf_context_init(64);
-        let port = free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         let mut cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
         cfg.require_oauth2 = true;
         cfg.oauth2_jwks = Some(jwks);
         cfg = cfg.with_expected_audience_nf_type(NfType::Nsacf);
-        let server = SbiServer::new(cfg);
+        let server = SbiServer::on_listener(cfg, port_listener);
         server
             .start(nsacf_sbi_request_handler)
             .await
@@ -3080,11 +3073,12 @@ nsacf:
         let (server, port, _ctx_guard) = start_nsacf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
 
-        let recv_port = free_port();
-        let receiver = SbiServer::new(SbiServerConfig::new(SocketAddr::from((
-            [127, 0, 0, 1],
-            recv_port,
-        ))));
+        let (recv_listener, recv_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let recv_port = recv_addr.port();
+        let receiver = SbiServer::on_listener(
+            SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], recv_port))),
+            recv_listener,
+        );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         receiver
             .start(move |req: SbiRequest| {
@@ -3277,11 +3271,12 @@ nsacf:
         let client = SbiClient::with_host_port("127.0.0.1", port);
 
         // Notification receiver
-        let recv_port = free_port();
-        let receiver = SbiServer::new(SbiServerConfig::new(SocketAddr::from((
-            [127, 0, 0, 1],
-            recv_port,
-        ))));
+        let (recv_listener, recv_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let recv_port = recv_addr.port();
+        let receiver = SbiServer::on_listener(
+            SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], recv_port))),
+            recv_listener,
+        );
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         receiver
             .start(move |req: SbiRequest| {

@@ -472,25 +472,15 @@ mod tests {
     /// handler returns a body byte-identical to the HTTP/2 path.
     #[tokio::test]
     async fn http3_body_is_byte_identical_to_http2() {
-        // HTTP/2 (h2c) side — probe-bind-drop to pick a free port (the
-        // server binds only its configured address), retrying if a parallel
-        // test steals the port in the probe→bind window.
-        let (h2_server, port) = {
-            let mut started = None;
-            for _ in 0..5 {
-                let port = crate::test_support::free_port();
-                let server = SbiServer::new(SbiServerConfig::new(SocketAddr::from((
-                    [127, 0, 0, 1],
-                    port,
-                ))));
-                if server.start(fixed_json_handler).await.is_ok() {
-                    started = Some((server, port));
-                    break;
-                }
-            }
-            started.expect("h2 server after 5 attempts")
-        };
-        let h2_client = SbiClient::with_host_port("127.0.0.1", port);
+        // HTTP/2 (h2c) side. This used to probe-bind-drop for a port and RETRY
+        // FIVE TIMES, because the port was unbound between the probe and the
+        // server's own bind and a parallel test could take it. #313 removed the
+        // window rather than the symptom: the reservation stays bound and the
+        // server serves it, so a single attempt is now correct and a failure
+        // here means a real failure.
+        let (h2_server, h2_addr) =
+            crate::test_support::sbi_server_on_free_port(fixed_json_handler).await;
+        let h2_client = SbiClient::with_host_port("127.0.0.1", h2_addr.port());
         let h2_response = h2_client.get(REQ_PATH).await.expect("h2 GET");
         assert_eq!(h2_response.status, 200);
         let h2_body = h2_response.http.content.expect("h2 body");
