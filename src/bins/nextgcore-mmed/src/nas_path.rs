@@ -216,6 +216,41 @@ pub fn nas_eps_send_emm_to_esm(
 // ============================================================================
 // EMM Message Send Functions
 // ============================================================================
+/// The T3412 value to signal, in seconds (TS 23.401 §4.3.17.3, TS 29.272 §7.3.134).
+///
+/// The subscription wins, then the configured default. Both accepts wrote a literal
+/// 3600 before #46 while the S6a codec had been round-tripping the subscribed timer
+/// all along — so every UE was told to re-register on a cadence its own subscription
+/// had not asked for.
+///
+/// `mme.time.t3412` is the configured fallback and is already parsed; a deployment
+/// that sets neither gets the shipped 3600, which is the value that used to be
+/// hardcoded, so nothing changes for a subscription that states no timer.
+fn t3412_for(mme_ue: &MmeUe) -> u32 {
+    t3412_from(
+        mme_ue.subscribed_rau_tau_timer,
+        crate::context::mme_self().time.t3412,
+    )
+}
+
+/// The precedence, as a pure function of the two inputs.
+///
+/// Split from [`t3412_for`] so the ordering is testable without the process-global
+/// context: `mme_self().time` is a plain field set at construction, so a test cannot
+/// vary the configured value, and the precedence is the part worth pinning.
+fn t3412_from(subscribed: u32, configured: u64) -> u32 {
+    /// What used to be hardcoded, so a deployment that configures nothing and a
+    /// subscription that states nothing behave exactly as before.
+    const DEFAULT_T3412_SECS: u32 = 3600;
+
+    if subscribed > 0 {
+        return subscribed;
+    }
+    if configured > 0 {
+        return configured as u32;
+    }
+    DEFAULT_T3412_SECS
+}
 
 /// Send attach accept message
 ///
@@ -254,13 +289,9 @@ pub fn nas_eps_send_attach_accept(
 
     // Build EMM attach accept with ESM message
     let tai_list = vec![mme_ue.tai.clone()];
-    let emm_message = emm_build::build_attach_accept(
-        mme_ue,
-        &esm_message,
-        3600, // T3412 value in seconds
-        &tai_list,
-    )
-    .map_err(|_| NasError::BuildFailed)?;
+    let emm_message =
+        emm_build::build_attach_accept(mme_ue, &esm_message, t3412_for(mme_ue), &tai_list)
+            .map_err(|_| NasError::BuildFailed)?;
 
     // Apply security encoding
     let secured_message = nas_security::nas_eps_security_encode(
@@ -595,10 +626,12 @@ pub fn nas_eps_send_tau_accept(
     log::debug!("[{}] Tracking area update accept", mme_ue.imsi_bcd);
 
     let tai_list = vec![mme_ue.tai.clone()];
-    let plain_message = emm_build::build_tau_accept(
-        mme_ue, 3600, // T3412 value
-        &tai_list, 0, // EPS bearer context status
-    );
+    // The EPS bearer context status is built from the bearers the caller passed, so
+    // the UE and the MME can discover a disagreement about which bearers exist —
+    // which is the IE's only purpose, and it was always sent as 0.
+    let bearer_status = emm_build::eps_bearer_context_status(bearers.iter().map(|b| b.ebi));
+    let plain_message =
+        emm_build::build_tau_accept(mme_ue, t3412_for(mme_ue), &tai_list, bearer_status);
 
     // Apply security encoding
     let emm_message = nas_security::nas_eps_security_encode(
@@ -1095,6 +1128,24 @@ pub fn nas_eps_send_downlink_nas_transport(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #46 criterion 3: the SUBSCRIPTION wins, then the configured value, then the
+    /// 3600 that used to be hardcoded.
+    ///
+    /// The order is the whole point: a subscription that states a timer must not be
+    /// overridden by an operator default, and a deployment that configures neither must
+    /// behave exactly as it did before this issue.
+    #[test]
+    fn t3412_prefers_the_subscription_then_the_configured_value() {
+        assert_eq!(t3412_from(720, 1800), 720, "the subscription wins");
+        assert_eq!(t3412_from(0, 1800), 1800, "then the configured value");
+        assert_eq!(t3412_from(0, 0), 3600, "then the shipped default");
+        assert_ne!(
+            t3412_from(720, 1800),
+            3600,
+            "a subscribed timer must not silently become the old hardcoded value"
+        );
+    }
 
     #[test]
     fn test_nas_error_display() {

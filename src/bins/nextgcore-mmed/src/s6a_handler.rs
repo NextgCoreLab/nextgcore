@@ -156,8 +156,21 @@ pub fn mme_s6a_handle_ula(mme_ue: &mut MmeUe, ula_message: &UlaMessage) -> S6aRe
     // Update network access mode
     mme_ue.network_access_mode = subscription_data.network_access_mode;
 
-    // Update subscribed RAU/TAU timer
-    // Note: subscribed_rau_tau_timer field would need to be added to MmeUe if needed
+    // Update subscribed RAU/TAU timer (TS 29.272 §7.3.134).
+    //
+    // #46: this was a comment saying the field "would need to be added to MmeUe if
+    // needed", while the shared S6a codec had been round-tripping the AVP all along
+    // and both NAS accepts hardcoded 3600 s. TS 23.401 §4.3.17.3 derives T3412 from
+    // this value, so dropping it told every UE to re-register on a cadence its
+    // subscription had not asked for.
+    mme_ue.subscribed_rau_tau_timer = subscription_data.subscribed_rau_tau_timer;
+    if mme_ue.subscribed_rau_tau_timer > 0 {
+        log::debug!(
+            "[{}] subscribed periodic RAU/TAU timer: {} s",
+            mme_ue.imsi_bcd,
+            mme_ue.subscribed_rau_tau_timer
+        );
+    }
 
     // Update charging characteristics
     if let Some(cc) = subscription_data.charging_characteristics {
@@ -898,7 +911,15 @@ mod tests {
                     name: "internet".to_string(),
                     qos: Qos {
                         qci: 9,
+                        arp: Arp {
+                            priority_level: 7,
+                            ..Default::default()
+                        },
                         ..Default::default()
+                    },
+                    ambr: Bitrate {
+                        uplink: 1_000_000,
+                        downlink: 4_000_000,
                     },
                     ..Default::default()
                 },
@@ -921,6 +942,18 @@ mod tests {
         let bearer = ctx.bearer_find_by_id(first.bearer_list[0]).unwrap();
         assert_eq!(bearer.ebi, crate::context::MIN_EPS_BEARER_ID);
         assert_eq!(bearer.qos.qci, 9);
+        // #46 criterion 8(a): the ARP and the APN-AMBR must survive too. The QCI
+        // alone was asserted before, so a subscription whose priority or rate limit
+        // was dropped looked persisted.
+        assert_eq!(
+            bearer.qos.arp.priority_level, 7,
+            "the subscribed ARP priority must reach the bearer"
+        );
+        assert_eq!(
+            (first.ambr.uplink, first.ambr.downlink),
+            (1_000_000, 4_000_000),
+            "the subscribed APN-AMBR must reach the session"
+        );
 
         // The second session gets the next EBI, not a duplicate.
         let second = ctx.sess_find_by_id(sess_list[1]).unwrap();
@@ -935,6 +968,60 @@ mod tests {
         assert_eq!(materialise_subscribed_sessions(&ctx, mme_ue_id), 2);
         assert_eq!(ctx.sess_pool.read().unwrap().len(), 2);
         assert_eq!(ctx.bearer_pool.read().unwrap().len(), 2);
+    }
+
+    /// #46 criterion 3: the subscribed periodic RAU/TAU timer must reach the UE
+    /// context from the ULA.
+    ///
+    /// The S6a codec round-tripped this AVP all along and mmed dropped it under a
+    /// comment saying the field "would need to be added to MmeUe if needed", so both
+    /// NAS accepts signalled a hardcoded 3600 s whatever the subscription said.
+    #[test]
+    fn the_subscribed_rau_tau_timer_reaches_the_ue_context() {
+        let mut mme_ue = MmeUe::default();
+        let mut ula = UlaMessage {
+            result_code: result_code::DIAMETER_SUCCESS,
+            ..Default::default()
+        };
+        ula.subscription_data.subscribed_rau_tau_timer = 720;
+        ula.subscription_data.apn_configs = vec![ApnConfiguration {
+            service_selection: "internet".to_string(),
+            qci: 9,
+            ..Default::default()
+        }];
+
+        assert_eq!(
+            mme_s6a_handle_ula(&mut mme_ue, &ula).expect("ULA handled"),
+            EmmCause::RequestAccepted
+        );
+        assert_eq!(
+            mme_ue.subscribed_rau_tau_timer, 720,
+            "the subscribed timer must be recorded, not dropped"
+        );
+    }
+
+    /// A subscription that states no timer leaves the field at 0, which is what makes
+    /// the configured fallback reachable rather than being overwritten by a zero.
+    #[test]
+    fn an_absent_subscribed_timer_leaves_the_field_zero() {
+        let mut mme_ue = MmeUe {
+            subscribed_rau_tau_timer: 999,
+            ..Default::default()
+        };
+        let mut ula = UlaMessage {
+            result_code: result_code::DIAMETER_SUCCESS,
+            ..Default::default()
+        };
+        ula.subscription_data.apn_configs = vec![ApnConfiguration {
+            service_selection: "internet".to_string(),
+            ..Default::default()
+        }];
+
+        mme_s6a_handle_ula(&mut mme_ue, &ula).expect("ULA handled");
+        assert_eq!(
+            mme_ue.subscribed_rau_tau_timer, 0,
+            "a subscription with no timer must not leave a stale one in place"
+        );
     }
 
     /// A UE with one subscribed APN materialised, plus the session the UE's own
