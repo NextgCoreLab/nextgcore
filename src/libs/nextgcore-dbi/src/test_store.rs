@@ -200,6 +200,9 @@ mod tests {
                 amf_hex: "8000".into(),
                 sqn,
                 auth_method: "5G_AKA".into(),
+                algorithm_id: None,
+                topc_hex: None,
+                top_hex: None,
             },
         )
         .expect("provision");
@@ -248,6 +251,9 @@ mod tests {
                 amf_hex: "8000".into(),
                 sqn: 0x40,
                 auth_method: "5G_AKA".into(),
+                algorithm_id: None,
+                topc_hex: None,
+                top_hex: None,
             },
         )
         .expect("re-provision");

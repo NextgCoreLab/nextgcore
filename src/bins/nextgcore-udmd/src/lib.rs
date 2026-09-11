@@ -9,6 +9,7 @@
 /// around [`app::run`]. Peer NF crates drive `udm_sbi_request_handler` (and the
 /// sub-handlers below) in-process for strict-peer tests.
 pub mod app;
+pub mod av_algorithm; // #115: which f1-f5* algorithm generates a subscriber's AVs
 pub mod context;
 pub mod event;
 #[cfg(feature = "nes")]

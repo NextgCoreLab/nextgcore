@@ -151,6 +151,14 @@ pub struct UdmUe {
     pub k: [u8; NEXTGCORE_KEY_LEN],
     /// OPc key (16 bytes)
     pub opc: [u8; NEXTGCORE_KEY_LEN],
+    /// TUAK TOPc (TS 35.231 §6.1), 256-bit, when the subscriber is TUAK-provisioned
+    /// (#115). `None` for a MILENAGE subscriber, which is every subscriber that carries
+    /// no `encTopcKey`.
+    pub topc: Option<[u8; 32]>,
+    /// TS 29.505 `algorithmId`: which f1-f5* parameter set generates this subscriber's
+    /// vectors (#115). Opaque and HPLMN-operator specific; interpreted by
+    /// [`crate::av_algorithm::AvAlgorithm::from_algorithm_id`].
+    pub algorithm_id: Option<String>,
     /// AMF value (2 bytes)
     pub amf: [u8; NEXTGCORE_AMF_LEN],
     /// RAND value (16 bytes)
@@ -215,6 +223,8 @@ impl UdmUe {
             auth_event_id: None,
             k: [0u8; NEXTGCORE_KEY_LEN],
             opc: [0u8; NEXTGCORE_KEY_LEN],
+            topc: None,
+            algorithm_id: None,
             amf: [0u8; NEXTGCORE_AMF_LEN],
             rand: [0u8; NEXTGCORE_RAND_LEN],
             sqn: [0u8; NEXTGCORE_SQN_LEN],

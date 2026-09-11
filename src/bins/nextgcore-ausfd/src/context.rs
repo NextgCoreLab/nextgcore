@@ -187,23 +187,44 @@ impl AusfUe {
         log::info!("[AUSF SNPN] NID set for UE context: nid={nid}");
     }
 
-    /// Use NID for KAUSF key derivation (TS 33.501 Annex A.2)
-    /// In SNPN, KAUSF derivation includes NID as input parameter
-    pub fn derive_kausf_with_nid(&mut self, _ck: &[u8; 16], _ik: &[u8; 16]) {
-        // Standard KAUSF derivation: KAUSF = KDF(CK, IK, serving_network_name, SQN ⊕ AK)
-        // SNPN enhancement: serving_network_name includes NID
-        if let Some(ref nid) = self.snpn_nid {
-            let serving_network_with_nid = format!(
-                "5G:{}:NID-{}",
-                self.serving_network_name.as_deref().unwrap_or(""),
-                nid
-            );
-            log::debug!(
-                "[AUSF SNPN] KAUSF derivation with NID: serving_network={serving_network_with_nid}"
-            );
-            // In production, this would use nextgcore_kdf_kausf with NID-augmented serving network name
-            // For now, we log the intent
-        }
+    /// Whether the serving network name this AUSF was given identifies a standalone
+    /// non-public network (TS 33.501 Annex I.3.2, #115).
+    ///
+    /// The name is `"5G" ":" SN Id` (§6.1.1.4.1), and Annex I.3.2 redefines the SNPN
+    /// SN Id as `PLMN ID:NID` — so an SNPN name has one more `":"`-separated component
+    /// than a PLMN one. The AUSF does not construct this string: §6.1.1.4.3 makes that
+    /// the SEAF's job, and the AUSF receives it in `servingNetworkName` and forwards it
+    /// to the UDM. What it can do is RECOGNISE it, so an SNPN NID recorded on this
+    /// context can be checked against the name the SEAF actually sent.
+    ///
+    /// # What replaced `derive_kausf_with_nid`
+    ///
+    /// This is the remains of a stub #115 asked to either implement or remove. It was
+    /// removed, because it was wrong in a way implementing could not fix: **the AUSF
+    /// does not derive K_AUSF at all.** TS 33.501 §6.1.3.2 has the UDM/ARPF compute
+    /// CK/IK and derive K_AUSF, then send the 5G HE AV to the AUSF — which is exactly
+    /// what this build does (`app.rs` reads `kausf` out of the Nudm response). The stub
+    /// also built `5G:{serving_network_name}:NID-{nid}` where `serving_network_name`
+    /// already began with `5G:`, producing `5G:5G:mnc….3gppnetwork.org:NID-x`: a
+    /// duplicated service code and a `NID-` prefix Annex I.3.2 does not have. And it had
+    /// no callers. The construction now lives in amfd's
+    /// `snpn_serving_network_name` — the SEAF, per §6.1.1.4.3.
+    pub fn serving_network_is_snpn(&self) -> bool {
+        // "5G" ":" PLMN-ID ":" NID -> three components; a PLMN name has two.
+        self.serving_network_name
+            .as_deref()
+            .map(|n| n.split(':').count() >= 3)
+            .unwrap_or(false)
+    }
+
+    /// The NID the serving network name carries, if it names an SNPN
+    /// (TS 33.501 Annex I.3.2).
+    pub fn serving_network_nid(&self) -> Option<&str> {
+        let name = self.serving_network_name.as_deref()?;
+        let mut parts = name.splitn(3, ':');
+        let _service_code = parts.next()?;
+        let _plmn_id = parts.next()?;
+        parts.next().filter(|nid| !nid.is_empty())
     }
 
     /// Support Default Credential Server (DCS) for SNPN onboarding

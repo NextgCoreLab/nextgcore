@@ -1937,8 +1937,9 @@ impl NgapServer {
                 .await
                 .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
 
-        // Serving network name from the serving PLMN (TS 24.501 / TS 33.501 6.1.1.4)
-        let snn = serving_network_name_from_plmn(&state.amf_ue.nr_tai.plmn_id);
+        // Serving network name from the serving PLMN (TS 24.501 / TS 33.501 6.1.1.4),
+        // augmented with the NID when this is an SNPN (Annex I.3.2, #115).
+        let snn = serving_network_name_for_ue(&state.amf_ue);
 
         match crate::sbi_path::call_ausf_authenticate_with_resync(
             &ausf_host,
@@ -2181,6 +2182,55 @@ impl NgapServer {
                 .await?;
             return Ok(());
         };
+        // NIA0 is EMERGENCY-ONLY (TS 33.501 §6.7.2 / §5.11, #115).
+        //
+        // The empty-intersection case above already fails closed. The residual hole is
+        // NIA0 being *selected* and applied: `select_integrity_algorithm` returns
+        // `Some(0)` when NIA0 is the only algorithm in the intersection, and the AMF
+        // mask contains NIA0 whenever the operator lists it in `integrity_order` —
+        // `algorithm_order_to_mask`'s `0x0E` is only the default for an EMPTY
+        // configuration, not a ceiling on what a configured order may contain. So a
+        // deployment that names NIA0 in its order, facing a UE that advertises only
+        // NIA0, would run an ordinary registration with no NAS integrity protection
+        // at all, and nothing said so.
+        //
+        // Checked HERE rather than inside `select_integrity_algorithm`: whether NIA0 is
+        // permissible is a property of the SESSION, not of the algorithm sets, and the
+        // selector is a pure function of two masks with no access to the registration
+        // type. Putting the check in the selector would mean passing the session in, or
+        // — worse — silently masking NIA0 out and reporting an empty intersection,
+        // which would tell the operator their configuration is unsupported rather than
+        // their request is refused.
+        if selected_int == 0 && !nas_security::nia0_permitted(state.amf_ue.registration_type) {
+            log::error!(
+                "UE {amf_ue_ngap_id}: NIA0 (null integrity) selected for a NON-EMERGENCY \
+                 registration (type={}, ue_ia={:#04x}, amf_mask={amf_int_mask:#06x}); \
+                 rejecting registration — TS 33.501 §6.7.2 permits NIA0 only for an \
+                 unauthenticated emergency session. Remove NIA0 from the AMF's \
+                 integrity_order to stop offering it.",
+                state.amf_ue.registration_type,
+                state.amf_ue.ue_security_capability.ia
+            );
+            let reject =
+                gmm_build::build_registration_reject(GmmCause::SecurityModeRejectedUnspecified);
+            self.ue_auth_state.insert(amf_ue_ngap_id, state);
+            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
+                .await?;
+            self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                .await?;
+            return Ok(());
+        }
+        if selected_int == 0 {
+            // Permitted, and worth a record: an emergency session running without NAS
+            // integrity is a deliberate, spec-sanctioned exception, and an operator
+            // reading the logs should be able to tell it from the defect above.
+            log::warn!(
+                "UE {amf_ue_ngap_id}: NIA0 (null integrity) accepted for an EMERGENCY \
+                 registration (TS 33.501 §6.7.2) — this session has no NAS integrity \
+                 protection"
+            );
+        }
+
         state.amf_ue.selected_int_algorithm = selected_int;
         state.amf_ue.selected_enc_algorithm =
             nas_security::select_encryption_algorithm(ue_enc_mask, amf_enc_mask);
@@ -3408,7 +3458,7 @@ impl NgapServer {
                     .read()
                     .ok()
                     .and_then(|guard| guard.amf_ue_find_by_id(amf_ue_ngap_id))
-                    .and_then(|ue| ue.supi)
+                    .and_then(|ue| ue.supi.clone())
             });
 
         // A3 registry lookup (exact-class "LPP", fail-closed) + fallback LCS
@@ -3504,7 +3554,7 @@ impl NgapServer {
                     .read()
                     .ok()
                     .and_then(|guard| guard.amf_ue_find_by_id(amf_ue_ngap_id))
-                    .and_then(|ue| ue.supi)
+                    .and_then(|ue| ue.supi.clone())
             });
 
         // A3 registry lookup (exact-class "UPDP", fail-closed): only a PCF that
@@ -4107,7 +4157,7 @@ impl NgapServer {
                     .read()
                     .ok()
                     .and_then(|guard| guard.amf_ue_find_by_id(amf_ue_ngap_id))
-                    .and_then(|ue| ue.supi)
+                    .and_then(|ue| ue.supi.clone())
             });
 
         // A3 registry lookup (exact-class, fail-closed) + fallback LCS
@@ -6765,6 +6815,42 @@ fn parse_bitrate_bps(s: &str) -> Option<u64> {
 fn serving_network_name_from_plmn(plmn: &PlmnId) -> String {
     let (mcc, mnc) = plmn_mcc_mnc_strings(plmn);
     format!("5G:mnc{mnc:0>3}.mcc{mcc:0>3}.3gppnetwork.org")
+}
+
+/// Serving network name for a standalone non-public network
+/// (TS 33.501 Annex I.3.2, #115).
+///
+/// §6.1.1.4.1 makes the serving network name the service code `"5G"` concatenated with
+/// the SN Id by `":"`. Annex I.3.2 then redefines the SN Id for an SNPN:
+///
+/// > `SN Id = PLMN ID:NID`
+///
+/// so the name gains one further `":"`-separated component. Everything that consumes it
+/// — K_SEAF, K_AUSF, CK'/IK' and (X)RES* — is bound to the serving network through this
+/// string, which is why Annex I.3.1 says the definition "needs modification for
+/// standalone non-public networks": without the NID, two SNPNs sharing a PLMN ID derive
+/// the *same* anchor key, and a UE authenticated to one would be accepted by the other.
+///
+/// # Why this is here and not in ausfd
+///
+/// §6.1.1.4.3 makes constructing this the SEAF's job, and the AUSF only receives it (in
+/// `servingNetworkName`) and passes it to the UDM. #115 asks for the SNPN work in
+/// `ausfd::AusfUe::derive_kausf_with_nid`, and that function was wrong on three counts:
+/// the AUSF does not derive K_AUSF at all (§6.1.3.2 has the UDM/ARPF do it and send the
+/// 5G HE AV), it built `5G:{name}:NID-{nid}` where `{name}` already began with `5G:` —
+/// so `5G:5G:mnc…:NID-x`, neither the spec's separator nor its component — and it had no
+/// callers. It is removed and replaced by this, in the NF that owns the construction.
+fn snpn_serving_network_name(plmn: &PlmnId, nid: &str) -> String {
+    format!("{}:{nid}", serving_network_name_from_plmn(plmn))
+}
+
+/// The serving network name for this UE: SNPN-augmented when it is authenticating to a
+/// standalone non-public network, the plain PLMN form otherwise (#115).
+fn serving_network_name_for_ue(amf_ue: &crate::context::AmfUe) -> String {
+    match amf_ue.snpn_nid.as_deref().filter(|n| !n.trim().is_empty()) {
+        Some(nid) => snpn_serving_network_name(&amf_ue.nr_tai.plmn_id, nid),
+        None => serving_network_name_from_plmn(&amf_ue.nr_tai.plmn_id),
+    }
 }
 
 /// Convert a wire-format security capability octet (bit 8 = algorithm 0,

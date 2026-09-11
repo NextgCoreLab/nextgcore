@@ -34,6 +34,12 @@ ntn = ["dep:nextgcore-proto"]
 nextgcore-asn1c = { workspace = true }
 nextgcore-core = { workspace = true }
 nextgcore-crypt = { workspace = true }
+# #115: TS 33.501 §5.9 — long-lived NAS/AS key material must not outlive the UE
+# context in recoverable memory. Already in this crate's dependency graph via
+# p256/elliptic-curve, so this declares a direct use of code that was compiled in
+# regardless; `Zeroize` gives a clear the optimiser may not elide, which a plain
+# `= [0u8; N]` in a `Drop` does not guarantee.
+zeroize = { workspace = true }
 nextgcore-nas = { workspace = true }
 # ntn-feature-only: bespoke NTN research types (issue #18).
 nextgcore-proto = { workspace = true, optional = true }
