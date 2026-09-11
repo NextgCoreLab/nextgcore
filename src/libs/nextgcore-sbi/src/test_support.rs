@@ -29,9 +29,15 @@ use std::sync::{Mutex, OnceLock};
 /// claim the port in that gap. Eliminating that requires handing callers a
 /// PRE-BOUND `TcpListener` — the port is then never unbound — which in turn
 /// requires [`crate::server::SbiServer`] to accept a listener instead of only a
-/// `SocketAddr` (it binds internally today). That API change is tracked
-/// separately; when it lands, every caller of this helper inherits it, which is
-/// the point of having one implementation rather than 21.
+/// `SocketAddr` (it binds internally today). That API change is tracked as #313;
+/// when it lands, every caller of this helper inherits it, which is the point of
+/// having one implementation rather than 21. (It said "tracked separately" for
+/// months while no such issue existed — #308 filed it.)
+///
+/// Note that each test BINARY has its own `ISSUED` set, so the cross-process case
+/// this cannot close is precisely `cargo test --workspace`, where one binary per
+/// crate runs concurrently. That is why #313 matters more than the low rate
+/// suggests, and why `ci.yml` names it where the blanket retry used to be.
 ///
 /// # Panics
 ///

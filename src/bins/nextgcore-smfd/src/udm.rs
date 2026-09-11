@@ -80,11 +80,11 @@ pub fn smf_instance_id() -> &'static str {
     SMF_INSTANCE_ID.get_or_init(|| uuid::Uuid::new_v4().to_string())
 }
 
-/// Serialises tests that touch the process-global switch. `pub` within the crate
-/// because `main.rs`'s tests toggle the same variable — one agreement, not two.
-#[cfg(test)]
-pub static SWITCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
+/// Test-only: set the switch without going through startup.
+///
+/// The caller must hold [`crate::context::PROCESS_STATE_TEST_LOCK`]: this switch is
+/// one of the four ambient globals that lock covers, and #308 showed that guarding
+/// the writers while leaving the readers free is not weaker protection but none.
 #[cfg(test)]
 pub fn set_for_test(on: bool) {
     UDM_ENABLED.store(on, Ordering::SeqCst);
@@ -757,7 +757,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_disabled_leg_neither_fetches_nor_registers() {
-        let _g = SWITCH_LOCK.lock().await;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         set_for_test(false);
         assert!(fetch_sm_data("imsi-1", "internet", 1, None).await.is_none());
         assert!(
@@ -786,8 +786,7 @@ mod tests {
         // the crate-root one `main.rs`'s #204 tests also take — a lock of this
         // module's own would be a second disjoint agreement about one variable, and
         // that is exactly how this test first flaked.
-        let _g = SWITCH_LOCK.lock().await;
-        let _env = crate::UDM_ENV_TEST_LOCK.lock().await;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         set_for_test(true);
 
         // `(method, path, body, dnn-query-param)`. The fourth field exists because

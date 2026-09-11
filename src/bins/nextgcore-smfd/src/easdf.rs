@@ -84,22 +84,15 @@ pub fn enabled() -> bool {
     EASDF_ENABLED.load(Ordering::SeqCst)
 }
 
-/// Serialises every test that touches the process-global switch (#114).
-///
-/// `EASDF_ENABLED` is a static and `EASDF_CONFIG` a `OnceLock`, so a test that
-/// toggles either while a sibling is mid-flight changes the sibling's answer —
-/// which is exactly how the two tests in this module failed on their first run.
-/// Public within the crate because `main.rs`'s tests toggle the same switch: a
-/// lock private to this module's test submodule would be two disjoint agreements
-/// about one variable.
-///
-/// A `tokio::sync::Mutex`, not a `std` one: every holder awaits while holding it
-/// (they drive loopback servers), and a `std` guard held across an await blocks
-/// the executor thread — `clippy::await_holding_lock`.
-#[cfg(test)]
-pub static SWITCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// Test-only: enable/disable without going through startup.
+///
+/// `EASDF_ENABLED` is a static and `EASDF_CONFIG` a `RwLock`, so a test that toggles
+/// either while a sibling is mid-flight changes the sibling's answer — which is
+/// exactly how the two tests in this module failed on their first run (#114).
+///
+/// The caller must therefore hold [`crate::context::PROCESS_STATE_TEST_LOCK`]. This
+/// module kept a switch lock of its own until #308, which showed that one lock per
+/// switch cannot order a test that names no switch at all.
 #[cfg(test)]
 pub fn set_for_test(config: Option<EasdfConfig>) {
     let enabled = config.is_some();
@@ -378,8 +371,6 @@ pub(crate) mod tests {
         assert_eq!(dnscontext_endpoint(&profile), None);
     }
 
-    use super::SWITCH_LOCK;
-
     /// The create decision, as a pure function: no config, or a config naming no
     /// edge pattern, means no DNS context.
     ///
@@ -412,7 +403,7 @@ pub(crate) mod tests {
     /// produced — the guard on the default posture.
     #[tokio::test]
     async fn the_leg_is_off_by_default() {
-        let _g = SWITCH_LOCK.lock().await;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         set_for_test(None);
         assert!(!enabled());
         assert_eq!(
@@ -523,7 +514,7 @@ pub(crate) mod tests {
     /// happened.
     #[tokio::test]
     async fn the_dns_context_is_created_and_deleted_over_the_wire() {
-        let _g = SWITCH_LOCK.lock().await;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let (nrf, easdf, seen) = spawn_nrf_and_easdf().await;
 
         let ctx_id = create_dns_context(

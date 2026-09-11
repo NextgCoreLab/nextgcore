@@ -915,9 +915,12 @@ pub fn clear_pfcp_sessions() -> usize {
 /// (`pub(crate)`) instead of being re-declared there.
 ///
 /// Lock order, where a test needs more than one process-global: take
-/// `easdf::SWITCH_LOCK` (or any other module's switch lock) FIRST, then this
+/// [`crate::context::PROCESS_STATE_TEST_LOCK`] — the one agreement about the SMF
+/// context, the feature switches and the `UDM_SBI_*` environment — FIRST, then this
 /// one. Every call site in the crate follows that order; reversing it anywhere
-/// reintroduces the deadlock this comment exists to prevent.
+/// reintroduces the deadlock this comment exists to prevent. Note that
+/// [`stand_in::associated_upf`] takes THIS lock on the caller's behalf, so a test
+/// that wants both must take the ambient one itself and let the stand-in take this.
 #[cfg(test)]
 pub(crate) static N4_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -1557,6 +1560,7 @@ mod tests {
     /// instead of establishing. There is one installer in the test build.
     #[tokio::test]
     async fn test_select_upf_defaults_to_global_client_and_bindings_resolve() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         // Association state is irrelevant to a single-peer pool: `select_upf`
         // returns the default client without consulting it (the load-aware path
         // needs the feature AND more than one peer).
@@ -1689,6 +1693,7 @@ mod tests {
     /// and the restored sessions are never questioned.
     #[tokio::test]
     async fn a_seeded_recovery_time_stamp_makes_a_peer_restart_detectable() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         // Serialised: this test can reach a teardown, which flushes the
         // process-global session map (see N4_TEST_LOCK).
         let _map_guard = N4_TEST_LOCK.lock().await;
@@ -1735,6 +1740,7 @@ mod tests {
     /// pointless.
     #[tokio::test]
     async fn an_unchanged_recovery_time_stamp_leaves_restored_sessions_alone() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         // Serialised: this test can reach a teardown, which flushes the
         // process-global session map (see N4_TEST_LOCK).
         let _map_guard = N4_TEST_LOCK.lock().await;

@@ -58,16 +58,12 @@ pub fn enabled() -> bool {
     EPS_IWK_ENABLED.load(Ordering::SeqCst)
 }
 
-/// Serialises every test that touches the process-global switch.
-///
-/// Public within the crate because `main.rs`'s tests toggle the same variable; a
-/// lock private to this module would be a second disjoint agreement about one
-/// variable, which is the collision shape this repo keeps recording (and which
-/// #276 hit as a hang rather than a flake).
-#[cfg(test)]
-pub static SWITCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// Test-only: set the switch without going through startup.
+///
+/// The caller must hold [`crate::context::PROCESS_STATE_TEST_LOCK`]. This module kept
+/// a switch lock of its own until #308: one lock per switch serialises that switch's
+/// writers and orders nothing else, and the release path reads this switch from tests
+/// that never mention interworking.
 #[cfg(test)]
 pub fn set_for_test(on: bool) {
     EPS_IWK_ENABLED.store(on, Ordering::SeqCst);
@@ -343,7 +339,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_disabled_leg_dials_nothing() {
-        let _g = SWITCH_LOCK.lock().await;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         set_for_test(false);
         // A URI that would fail loudly if it were dialled at all.
         assert_eq!(
@@ -428,7 +424,7 @@ mod tests {
         // would make this test fail for a reason unrelated to what it asserts.
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
 
-        let _g = SWITCH_LOCK.lock().await;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         set_for_test(true);
 
         let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> =
@@ -517,6 +513,7 @@ mod tests {
     /// in the context and no GTPv2 message is involved anywhere.
     #[test]
     fn the_assigned_ebi_reaches_smf_bearer_without_the_gtpv2_path() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.blocking_lock();
         use crate::context::{smf_context_init, smf_self};
 
         smf_context_init(64, 256, 512);

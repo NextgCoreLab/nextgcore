@@ -3083,6 +3083,52 @@ pub fn smf_context_init(max_ue: usize, max_sess: usize, max_bearer: usize) {
     };
 }
 
+/// The ONE agreement about this process's ambient SMF state, for tests (#308).
+///
+/// Four globals are involved and they cannot be guarded separately, because the
+/// production paths under test read all four together:
+/// - [`GLOBAL_SMF_CONTEXT`] — [`smf_context_init`] calls `SmfContext::init`, which
+///   clears the UE, session, bearer, policy-binding and PFCP-session maps for the
+///   WHOLE process rather than for the test that asked;
+/// - `udm::UDM_ENABLED`, `easdf`'s config slot and `eps_iwk::EPS_IWK_ENABLED` — the
+///   feature switches `handle_sm_context_create` / `_release` consult, so a sibling
+///   that turns one ON changes what a create does in a test that never mentions it;
+/// - the `UDM_SBI_ADDR` / `UDM_SBI_PORT` / `NRF_URI` environment — the fallback
+///   `discover_udm_service_endpoint` resolves, which names one UDM for every `nudm`
+///   service, so whoever wrote it last owns every sibling's UDM traffic.
+///
+/// Before #308 the writers of the last two were locked (three per-module
+/// `SWITCH_LOCK`s plus a crate-root `UDM_ENV_TEST_LOCK`) and the READERS were not,
+/// and the context wipe was not guarded at all. That asymmetry is not a smaller
+/// version of the same protection, it is none: `cargo test --workspace` failed
+/// about 1 run in 5 in three different tests, each one a locked writer and an
+/// unlocked reader disagreeing about a global neither test names —
+/// - a create-path test read a sibling's subscribed session-AMBR (40/80 Mbps) in
+///   place of the config default, because the sibling's UDM switch was still on;
+/// - a release-path test's `DELETE` landed on another test's recording UDM, which
+///   then found it instead of its own `PUT`;
+/// - a sibling `smf_context_init` cleared the policy bindings between a create and
+///   the assertion that the create had stored one.
+///
+/// Four locks over one ambient state were four disjoint agreements: each
+/// serialised its own writers and none could order a test that did not know about
+/// it. This is deliberately ONE lock, declared beside the largest of the globals
+/// it guards rather than inside any `mod tests`, so every module reaches the same
+/// static (`pub(crate)`) instead of declaring its own — #276 showed that a second
+/// lock over shared state HANGS the suite rather than merely flaking it.
+///
+/// Lock order, for a test that needs a UPF as well: take THIS one first, then
+/// [`crate::pfcp_path::N4_TEST_LOCK`] (which
+/// [`crate::pfcp_path::stand_in::associated_upf`] takes on the test's behalf and
+/// holds for the life of the returned value). Every call site in the crate follows
+/// that order; reversing it anywhere reintroduces a deadlock.
+///
+/// Sync `#[test]` functions take it with `blocking_lock()`, which is sound
+/// precisely because they have no runtime to block.
+#[cfg(test)]
+pub(crate) static PROCESS_STATE_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 /// Finalize the global SMF context
 pub fn smf_context_final() {
     let ctx = smf_self();
@@ -3253,6 +3299,7 @@ mod tests {
 
     #[test]
     fn test_cascade_removal() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.blocking_lock();
         let mut ctx = SmfContext::new();
         ctx.init(100, 200, 400);
 
