@@ -262,6 +262,11 @@ pub struct LmfContext {
     /// Populated via [`LmfContext::set_cell_coord`] from config or tests.
     /// Empty means unconfigured; real solvers fall back to the heuristic placeholder.
     cell_registry: RwLock<HashMap<String, TrpCoord>>,
+
+    /// Per-UE LPP positioning capability, as reported over LPP (#103). Absent means
+    /// no exchange happened, which `UeLppCapability::Unknown` is distinct from
+    /// `EcidOnly` precisely to express.
+    ue_capabilities: RwLock<HashMap<String, crate::codec_glue::UeLppCapability>>,
     /// Registered deferred/periodic/triggered LDR sessions (ldrReference -> ctx). lmfd#1.
     ldr_sessions: RwLock<HashMap<String, LdrContext>>,
     /// A8: running EventNotify trigger tasks (ldrReference -> abort handle). A
@@ -321,6 +326,7 @@ impl LmfContext {
             ],
             initialized: AtomicBool::new(false),
             cell_registry: RwLock::new(HashMap::new()),
+            ue_capabilities: RwLock::new(HashMap::new()),
             up_subscriptions: RwLock::new(HashMap::new()),
             up_configs: RwLock::new(HashMap::new()),
             exposure_subscriptions: RwLock::new(HashMap::new()),
@@ -927,6 +933,84 @@ impl LmfContext {
         }
     }
 
+    /// What this LMF knows about `supi`'s LPP positioning capability (#103).
+    ///
+    /// `Unknown` unless a `ProvideCapabilities` has been decoded for that UE. Kept on
+    /// the context rather than passed through the request path because the capability
+    /// exchange and the positioning request are separate LPP transactions, possibly
+    /// minutes apart.
+    pub fn ue_lpp_capability(&self, supi: &str) -> crate::codec_glue::UeLppCapability {
+        self.ue_capabilities
+            .read()
+            .ok()
+            .and_then(|c| c.get(supi).copied())
+            .unwrap_or_default()
+    }
+
+    /// Record what a UE reported (#103). Called from the N1 uplink path when a
+    /// `ProvideCapabilities` arrives.
+    pub fn note_ue_lpp_capability(&self, supi: &str, cap: crate::codec_glue::UeLppCapability) {
+        if let Ok(mut c) = self.ue_capabilities.write() {
+            c.insert(supi.to_string(), cap);
+        }
+    }
+
+    /// Empty the cell-coordinate registry (#103).
+    ///
+    /// Test-only, and needed because neither `init` nor `fini` clears it (see
+    /// [`PROCESS_STATE_TEST_LOCK`]): a test that needs a KNOWN set of reference
+    /// points has to remove whatever a sibling left, or it asserts against a scene it
+    /// did not build.
+    #[cfg(test)]
+    pub fn clear_cell_registry_for_test(&self) {
+        if let Ok(mut reg) = self.cell_registry.write() {
+            reg.clear();
+        }
+    }
+
+    /// The centroid of the configured reference points, with the spread around it
+    /// (#103).
+    ///
+    /// Returns `(lat, lon, spread_m)` where the spread is the greatest distance from
+    /// the centroid to any point — the honest uncertainty of "somewhere in this
+    /// deployment", which is what a GNSS reference location amounts to. `None` when
+    /// nothing is configured, so a caller cannot accidentally send (0, 0).
+    ///
+    /// A single reference point yields a spread of 0, which is correct: the reference
+    /// location IS that point.
+    pub fn reference_centroid(&self) -> Option<(f64, f64, f64)> {
+        let cells = self.cell_registry.read().ok()?;
+        if cells.is_empty() {
+            return None;
+        }
+        let n = cells.len() as f64;
+        let lat = cells.values().map(|c| c.lat_deg).sum::<f64>() / n;
+        let lon = cells.values().map(|c| c.lon_deg).sum::<f64>() / n;
+        // Equirectangular metres: exact enough for an uncertainty figure, and the
+        // alternative (a geodesic) would be precision the input does not have.
+        const M_PER_DEG: f64 = 111_320.0;
+        let spread = cells
+            .values()
+            .map(|c| {
+                let dy = (c.lat_deg - lat) * M_PER_DEG;
+                let dx = (c.lon_deg - lon) * M_PER_DEG * lat.to_radians().cos();
+                dy.hypot(dx)
+            })
+            .fold(0.0f64, f64::max);
+        Some((lat, lon, spread))
+    }
+
+    /// How many reference points the registry holds (#103).
+    ///
+    /// Read by the positioning path to decide two things before spending a
+    /// measurement campaign: whether a fix is possible at all (zero points means it
+    /// is not, and the request is refused loudly rather than answered with a
+    /// fabricated coordinate), and whether a multilateration method is worth
+    /// requesting (`select_lpp_method` needs at least three).
+    pub fn reference_point_count(&self) -> usize {
+        self.cell_registry.read().map(|c| c.len()).unwrap_or(0)
+    }
+
     /// Build an owned [`TrpRegistry`] snapshot from the current cell
     /// coordinates (centroid-anchored origin). The caller drops the read lock
     /// before any write operations.
@@ -1164,24 +1248,56 @@ pub fn lmf_context_init(max_measurements: usize) {
     let ctx = lmf_self();
     if let Ok(mut context) = ctx.write() {
         context.init(max_measurements);
+        // #103, TEST BUILDS ONLY: empty the cell-coordinate registry.
+        //
+        // `init` does not clear it (and never did, despite what
+        // `PROCESS_STATE_TEST_LOCK`'s doc used to claim), so coordinates written by one
+        // test persisted for the life of the binary and every later test's behaviour
+        // depended on the ORDER it ran in. That was invisible until #103 made an empty
+        // registry change an outcome -- and then it produced four separate flakes at
+        // roughly 1 whole-workspace run in 8, each of which passed a first green run.
+        //
+        // Clearing here makes the registry a function of each test's own seeding, so a
+        // test that needs coordinates fails DETERMINISTICALLY without them instead of
+        // depending on a sibling. That is the difference between a bug found by a
+        // 20-run loop and one found by a single `cargo test`.
+        //
+        // Production is untouched: `lmf_context_init` runs once at startup, before
+        // `site_config::load_into_context` fills the registry.
+        #[cfg(test)]
+        context.clear_cell_registry_for_test();
     };
 }
 
 /// The ONE agreement about the process-global LMF context, for tests (#308).
 ///
-/// [`lmf_context_init`] calls `LmfContext::init`, which clears the measurement,
-/// session and **cell-coordinate** registries for the whole process — 32 tests call
-/// it — and `seed_scene_and_build_multi_rtt_lpp` writes coordinates INTO the global
-/// one via [`LmfContext::set_cell_coord`] and never removes them. `capabilities_body`
+/// # Correction (#103): what init and fini actually clear
+///
+/// This doc used to say that `lmf_context_init` "clears the measurement, session and
+/// **cell-coordinate** registries for the whole process". **It clears none of them.**
+/// `LmfContext::init` early-returns when the context is already initialized and
+/// otherwise only records `max_measurements`; `fini` clears UE locations,
+/// measurements, reports and LDR sessions, and **not** the cell-coordinate registry.
+///
+/// So coordinates written by any test persist for the life of the test binary. That
+/// makes the lock below MORE necessary rather than less — the sharing is
+/// unconditional rather than dependent on a wipe — but the mechanism #308 recorded
+/// was wrong, and a test that relied on `init` for isolation would silently inherit
+/// a sibling's scene. #103's own assistance-data tests did exactly that and failed
+/// on the first run, which is how this was found; they now call
+/// [`LmfContext::clear_cell_registry_for_test`].
+///
+/// `seed_scene_and_build_multi_rtt_lpp` writes coordinates INTO the global registry
+/// via [`LmfContext::set_cell_coord`] and never removes them, and `capabilities_body`
 /// derives `nrppaSupported` / `nlsInterfaceSupported` from exactly that registry.
 ///
 /// So `test_capabilities_handler_serves_the_derived_body` had a genuine TOCTOU: it
 /// reads the served body from `handle_capabilities()` and then recomputes the
-/// expected body from the context, and a sibling wiping or seeding coordinates
-/// between the two reads makes them disagree. Its own doc comment said the equality
-/// "holds whatever state a sibling test has left behind" — true of state left
-/// behind, false of state changed in the gap, which is why it failed 2 of 20
-/// `cargo test --workspace` runs while `-p nextgcore-lmfd` alone was always green.
+/// expected body from the context, and a sibling seeding coordinates between the two
+/// reads makes them disagree. Its own doc comment said the equality "holds whatever
+/// state a sibling test has left behind" — true of state left behind, false of state
+/// changed in the gap, which is why it failed 2 of 20 `cargo test --workspace` runs
+/// while `-p nextgcore-lmfd` alone was always green.
 ///
 /// Declared beside the global rather than inside `mod tests` so a sibling module
 /// reaches this static instead of declaring a second one, and taken by every test

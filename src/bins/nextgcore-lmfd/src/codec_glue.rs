@@ -66,6 +66,353 @@ pub fn build_lpp_ecid_request(transaction_number: u8) -> Result<Vec<u8>, String>
         .map_err(|e| format!("LPP RequestLocationInformation encode: {e}"))
 }
 
+/// Which LPP positioning method an LMF-initiated request asks for (#103).
+///
+/// Named separately from `positioning::PositioningMethodKind` (which describes what
+/// a solver *produced*) because these are the methods this LMF can *request* over
+/// LPP, and the two sets are not the same: AoA has a solver and no LPP request body
+/// in this build, and asking for a method whose report it cannot decode would be
+/// worse than not asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LppMethod {
+    /// Enhanced Cell-ID: serving-cell RSRP/RSRQ. The fallback.
+    Ecid,
+    /// NR Multi-RTT: UE Rx-Tx time differences against several TRPs.
+    MultiRtt,
+    /// NR DL-TDOA: reference-signal time differences.
+    DlTdoa,
+}
+
+impl LppMethod {
+    /// The TS 29.572 `PositioningMethod` string, for the response's
+    /// `positioningMethod` member.
+    pub fn as_spec_str(self) -> &'static str {
+        match self {
+            LppMethod::Ecid => "NR_ECID",
+            LppMethod::MultiRtt => "MULTI-RTT",
+            LppMethod::DlTdoa => "DL_TDOA",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #103: MO-LR assistance data (TS 37.355 §5.2, TS 23.273 §6.2)
+// ---------------------------------------------------------------------------
+
+/// Decode a UE-originated LPP PDU and report whether it is a
+/// `RequestAssistanceData` (#103).
+///
+/// Before this, an MO-LR with `ueLocationServiceInd == LOCATION_ASSISTANCE_DATA`
+/// answered 204 without looking at the UE's PDU at all — so a UE asking for
+/// assistance got a success it could not use, and a UE asking for something else got
+/// the same answer.
+///
+/// Returns the transaction number to answer on, so the response correlates: an
+/// assistance-data response on the wrong transaction is one the UE discards.
+pub fn decode_lpp_request_assistance_data(bytes: &[u8]) -> Result<u8, String> {
+    let msg = LppMessage::decode(bytes).map_err(|e| format!("LPP decode: {e}"))?;
+    let txn = msg
+        .transaction_id
+        .as_ref()
+        .map(|t| t.transaction_number.0)
+        .ok_or_else(|| "LPP message carries no transactionID to answer on".to_string())?;
+    match &msg.message_body {
+        Some(LppMessageBody::C1(MessageBodyC1::RequestAssistanceData(_))) => Ok(txn),
+        Some(LppMessageBody::C1(other)) => Err(format!(
+            "LPP body is {}, not RequestAssistanceData",
+            body_name(other)
+        )),
+        _ => Err("LPP message carries no c1 body".to_string()),
+    }
+}
+
+/// A body's name, for an error message that says what arrived instead.
+fn body_name(body: &MessageBodyC1) -> &'static str {
+    match body {
+        MessageBodyC1::RequestCapabilities(_) => "RequestCapabilities",
+        MessageBodyC1::ProvideCapabilities(_) => "ProvideCapabilities",
+        MessageBodyC1::RequestAssistanceData(_) => "RequestAssistanceData",
+        MessageBodyC1::ProvideAssistanceData(_) => "ProvideAssistanceData",
+        MessageBodyC1::RequestLocationInformation(_) => "RequestLocationInformation",
+        MessageBodyC1::ProvideLocationInformation(_) => "ProvideLocationInformation",
+    }
+}
+
+/// Build an LPP `ProvideAssistanceData` carrying a GNSS **reference location**
+/// (#103, TS 37.355 §5.2).
+///
+/// # Why a reference location and not an ephemeris
+///
+/// A-GNSS assistance can be many things; what this LMF actually *knows* is where its
+/// reference points are. A coarse reference position is genuine, useful assistance —
+/// it is what lets a UE narrow its GNSS search — and it is derivable from the
+/// configured registry with no external data source. Ephemerides, ionospheric models
+/// and Earth-orientation parameters would all have to come from a GNSS data feed this
+/// build has no client for, and fabricating them would be worse than omitting them.
+///
+/// So the response carries `gnssCommonAssistData.gnssReferenceLocation` and nothing
+/// else, and that is stated rather than implied.
+///
+/// The uncertainty is honest too: `uncertainty_m` should be the spread of the
+/// reference points the centroid was taken over, so a UE weighting the assistance by
+/// its uncertainty is given the real figure rather than a confident-looking zero.
+pub fn build_lpp_provide_assistance_data(
+    transaction_number: u8,
+    lat_deg: f64,
+    lon_deg: f64,
+    uncertainty_m: f64,
+) -> Result<Vec<u8>, String> {
+    use nextgcore_asn1c::lpp::a_gnss::common::{AGnssProvideAssistanceData, GnssCommonAssistData};
+    use nextgcore_asn1c::lpp::a_gnss::reference_location::{
+        AltitudeDirection, EllipsoidPointWithAltitudeAndUncertaintyEllipsoid,
+        GnssReferenceLocation, LatitudeSign,
+    };
+
+    // TS 23.032 §6.1 magnitude-and-sign, as the GAD encoders in `nlmf` already do
+    // for the northbound body. Reused rather than re-derived so the two cannot
+    // disagree about the same coordinate.
+    let (sign, degrees_latitude) = if lat_deg < 0.0 {
+        (LatitudeSign::South, lat_deg.abs())
+    } else {
+        (LatitudeSign::North, lat_deg)
+    };
+    let degrees_latitude =
+        ((degrees_latitude.min(90.0) / 90.0) * f64::from(1u32 << 23)).round() as u32;
+    let degrees_latitude = degrees_latitude.min((1u32 << 23) - 1);
+    let degrees_longitude =
+        ((lon_deg.clamp(-180.0, 180.0) / 360.0) * f64::from(1u32 << 24)).round() as i32;
+    let degrees_longitude = degrees_longitude.clamp(-(1i32 << 23), (1i32 << 23) - 1);
+
+    let three_d_location = EllipsoidPointWithAltitudeAndUncertaintyEllipsoid {
+        latitude_sign: sign,
+        degrees_latitude,
+        degrees_longitude,
+        altitude_direction: AltitudeDirection::Height,
+        // Altitude 0 with a MAXIMAL altitude uncertainty: the registry's coordinates
+        // are 2-D in every deployment this build supports, so claiming a height would
+        // be claiming knowledge. A large uncertainty says "unknown" in the only
+        // vocabulary the IE has.
+        altitude: 0,
+        uncertainty_semi_major: crate::nlmf::encode_gad_uncertainty(uncertainty_m),
+        uncertainty_semi_minor: crate::nlmf::encode_gad_uncertainty(uncertainty_m),
+        // A circular uncertainty region, so the major-axis orientation is arbitrary.
+        orientation_major_axis: 0,
+        uncertainty_altitude: 127,
+        // 68% — one standard deviation, the convention the northbound encoder uses.
+        confidence: 68,
+    };
+
+    let msg = LppMessage {
+        transaction_id: Some(LppTransactionId {
+            // The LMF answers on the UE's transaction, so the initiator is the UE
+            // that opened it. Sending `LocationServer` here would open a SECOND
+            // transaction and leave the UE's request unanswered.
+            initiator: Initiator::TargetDevice,
+            transaction_number: TransactionNumber(transaction_number),
+        }),
+        // The assistance data completes the exchange the UE opened.
+        end_transaction: true,
+        sequence_number: None,
+        acknowledgement: None,
+        message_body: Some(LppMessageBody::C1(MessageBodyC1::ProvideAssistanceData(
+            nextgcore_asn1c::lpp::a_gnss::body::ProvideAssistanceData {
+                ies: nextgcore_asn1c::lpp::a_gnss::body::ProvideAssistanceDataR9 {
+                    a_gnss: Some(AGnssProvideAssistanceData {
+                        gnss_common_assist_data: Some(GnssCommonAssistData {
+                            gnss_reference_time: None,
+                            gnss_reference_location: Some(GnssReferenceLocation {
+                                three_d_location,
+                            }),
+                            gnss_ionospheric_model: None,
+                            gnss_earth_orientation_parameters: None,
+                        }),
+                        gnss_generic_assist_data: None,
+                    }),
+                },
+            },
+        ))),
+    };
+    msg.encode()
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("LPP ProvideAssistanceData encode: {e}"))
+}
+
+/// What this LMF knows about a UE's LPP positioning capabilities (#103).
+///
+/// # Why three values and not a set of booleans
+///
+/// The tree's `ProvideCapabilitiesR9` models exactly two members — `common` and
+/// `ecid` — so **the wire cannot currently tell this LMF that a UE supports
+/// Multi-RTT or DL-TDOA**. A capability model with a bit per method would therefore
+/// have one bit that is always false and two that can never be set, which reads as
+/// "the UE does not support them" when the truth is "this build cannot ask".
+///
+/// Three values keep that distinction visible: [`Self::Unknown`] means no exchange
+/// happened (or the codec cannot represent the answer), which is not the same as
+/// [`Self::EcidOnly`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UeLppCapability {
+    /// No capability exchange, or one this build cannot interpret.
+    #[default]
+    Unknown,
+    /// The UE reported E-CID capabilities and nothing this build recognises beyond
+    /// them. The only value a `ProvideCapabilities` decode can currently produce.
+    EcidOnly,
+    /// The UE reported support for a high-accuracy method. **Not reachable from the
+    /// wire in this build** — `ProvideCapabilitiesR9` has no member for it — and
+    /// present so the selection logic is written against the real question rather
+    /// than around a missing one.
+    AdvancedMethods,
+}
+
+/// Classify a decoded LPP `ProvideCapabilities` (#103).
+///
+/// Returns [`UeLppCapability::EcidOnly`] when the UE reported E-CID capabilities,
+/// and `Unknown` otherwise — including for a report carrying only `common` IEs,
+/// which says nothing about method support.
+pub fn classify_ue_capability(
+    caps: &nextgcore_asn1c::lpp::capabilities::ProvideCapabilities,
+) -> UeLppCapability {
+    if caps.ies.ecid.is_some() {
+        UeLppCapability::EcidOnly
+    } else {
+        UeLppCapability::Unknown
+    }
+}
+
+/// Minimum reference points a multilateration method needs.
+///
+/// Three: both Multi-RTT trilateration and DL-TDOA hyperbolic multilateration need
+/// at least three known positions to fix a 2-D point, and the solvers in
+/// `positioning` enforce the same bound. Requesting a method the registry cannot
+/// solve for would spend a UE measurement campaign to arrive at no fix.
+pub const MIN_POINTS_FOR_MULTILATERATION: usize = 3;
+
+/// Choose the LPP method for a positioning request (#103 criterion 4).
+///
+/// Before this the network-initiated leg always asked for E-CID with the other two
+/// bodies hardcoded `None`, so a request for ≤10 m accuracy was answered by a
+/// method whose output is a Timing-Advance ring hundreds of metres across — the
+/// unmet-QoS-commitment defect #103 names.
+///
+/// The rule, in order:
+///
+/// 1. **Fewer than [`MIN_POINTS_FOR_MULTILATERATION`] reference points configured
+///    ⇒ E-CID.** No amount of QoS makes a multilateration solvable against two
+///    known positions, and asking anyway wastes a measurement campaign.
+/// 2. **The UE reported E-CID only ⇒ E-CID.** Asking a UE for a method it has said
+///    it cannot perform gets an error or an empty report.
+/// 3. **High-accuracy or emergency QoS ⇒ Multi-RTT.** Multi-RTT is the more
+///    accurate of the two available methods because the RTT is a two-sided
+///    measurement, and this LMF now solicits the gNB half over NRPPa.
+/// 4. **Low-latency QoS ⇒ E-CID**, deliberately: one serving-cell measurement with
+///    no PRS scheduling is the fastest thing available, and `LOW_DELAY` is a
+///    statement about time rather than accuracy.
+/// 5. **Otherwise E-CID.**
+///
+/// `Unknown` capability takes the high-accuracy branch rather than falling back:
+/// answering a ≤10 m request with E-CID would commit to an accuracy the method
+/// cannot deliver, which is worse than asking a UE a question it might decline.
+/// The absence of a fallback *retry* when that request does come back empty is
+/// stated as a ceiling rather than hidden here.
+pub fn select_lpp_method(
+    qos: crate::context::PositioningQos,
+    reference_points: usize,
+    capability: UeLppCapability,
+) -> LppMethod {
+    use crate::context::PositioningQos;
+
+    if reference_points < MIN_POINTS_FOR_MULTILATERATION {
+        return LppMethod::Ecid;
+    }
+    if capability == UeLppCapability::EcidOnly {
+        return LppMethod::Ecid;
+    }
+    match qos {
+        PositioningQos::HighAccuracy | PositioningQos::Emergency => LppMethod::MultiRtt,
+        PositioningQos::LowLatency | PositioningQos::BestEffort => LppMethod::Ecid,
+    }
+}
+
+/// Encode an LMF-initiated `RequestLocationInformation` for `method` (#103).
+///
+/// Before this, every network-initiated request was E-CID with `nr_multi_rtt` and
+/// `nr_dl_tdoa` hardcoded `None`, so the requested LCS QoS could never influence
+/// what was measured. The library already had encoders and decoders for all three
+/// bodies; nothing selected between them.
+///
+/// One body per request rather than several at once: TS 37.355 permits a request to
+/// ask for more than one, but this LMF's report decoders each key on their own body
+/// and a combined request would make "which method answered" ambiguous — a
+/// distinction the response's `positioningMethod` has to state.
+pub fn build_lpp_request(method: LppMethod, transaction_number: u8) -> Result<Vec<u8>, String> {
+    let ies = match method {
+        LppMethod::Ecid => RequestLocationInformationR9 {
+            // requestedMeasurements: bit0 = rsrpReq, bit1 = rsrqReq.
+            ecid: Some(EcidRequestLocationInformation {
+                requested_measurements: requested_measurements(&[true, true]),
+            }),
+            nr_multi_rtt: None,
+            nr_dl_tdoa: None,
+        },
+        LppMethod::MultiRtt => RequestLocationInformationR9 {
+            ecid: None,
+            nr_multi_rtt: Some(
+                nextgcore_asn1c::lpp::nr_multi_rtt::NrMultiRttRequestLocationInformation {
+                    // The Rx-Tx time difference IS the ranging observable, so a
+                    // Multi-RTT request that did not ask for it would return
+                    // RSRP the E-CID path already gets.
+                    rx_tx_time_diff_measurement_info_request: true,
+                    // bit0 = prsrsrpReq: the PRS RSRP accompanies each range and is
+                    // what the solver weights by.
+                    requested_measurements: requested_measurements(&[true]),
+                    // This LMF provides no PRS assistance data, so it must not claim
+                    // availability -- a UE told assistance is available and given
+                    // none reports nothing.
+                    assistance_availability: false,
+                    report_config: nextgcore_asn1c::lpp::nr_multi_rtt::NrMultiRttReportConfig {
+                        // Up to 4 measurements per TRP; trilateration needs >=3
+                        // TRPs and more samples per TRP only helps.
+                        max_dl_prs_rx_tx_time_diff_meas_per_trp: Some(4),
+                        timing_reporting_granularity_factor: None,
+                    },
+                    additional_paths: false,
+                },
+            ),
+            nr_dl_tdoa: None,
+        },
+        LppMethod::DlTdoa => RequestLocationInformationR9 {
+            ecid: None,
+            nr_multi_rtt: None,
+            nr_dl_tdoa: Some(
+                nextgcore_asn1c::lpp::nr_dl_tdoa::NrDlTdoaRequestLocationInformation {
+                    // The RSTD is the observable; without it there is nothing to
+                    // multilaterate.
+                    rstd_measurement_info_request: true,
+                    requested_measurements: requested_measurements(&[true]),
+                    assistance_availability: false,
+                    additional_paths: false,
+                },
+            ),
+        },
+    };
+    let msg = LppMessage {
+        transaction_id: Some(LppTransactionId {
+            initiator: Initiator::LocationServer,
+            transaction_number: TransactionNumber(transaction_number),
+        }),
+        end_transaction: false,
+        sequence_number: None,
+        acknowledgement: None,
+        message_body: Some(LppMessageBody::C1(
+            MessageBodyC1::RequestLocationInformation(RequestLocationInformation { ies }),
+        )),
+    };
+    msg.encode()
+        .map(|b| b.to_vec())
+        .map_err(|e| format!("LPP RequestLocationInformation ({method:?}) encode: {e}"))
+}
+
 // ---------------------------------------------------------------------------
 // Timing constant
 // ---------------------------------------------------------------------------

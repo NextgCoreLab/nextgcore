@@ -157,6 +157,60 @@ pub fn build_n1n2_transfer_request(
     ))
 }
 
+/// Content-Id of the NRPPa binary part in an N2 information transfer (#103).
+///
+/// Distinct from [`LPP_CONTENT_ID`]: a transfer may carry both an LPP N1 message and
+/// an NRPPa N2 PDU, and the AMF resolves each `contentId` independently, so sharing
+/// one would make the second part unreachable.
+pub const NRPPA_CONTENT_ID: &str = "nrppa-req";
+
+/// Content type of an NRPPa PDU part (TS 29.518: NGAP-shaped binary).
+pub const N2_CONTENT_TYPE: &str = "application/vnd.3gpp.ngap";
+
+/// Build an N1N2MessageTransfer carrying an **NRPPa PDU toward the serving gNB**
+/// (#103, TS 29.518 §5.2.2.3, TS 23.273 §6.11.2).
+///
+/// The AMF's positioning relay accepts exactly this shape — an
+/// `n2InfoContainer.nrppaInfo` with `nrppaPdu.ngapIeType == "NRPPA_PDU"` and a
+/// `ngapData.contentId` resolving to a binary part — and delivers it over NGAP
+/// procedure 8 (UE-associated NRPPa transport). `nfId` carries this LMF's identity,
+/// which the AMF seeds into the NGAP RoutingID so the gNB's uplink reply routes back
+/// here rather than to whichever LMF the AMF last spoke to.
+///
+/// `n2InformationClass` is `"NRPPa"`, matching the class this LMF already subscribes
+/// its N2 notify callback under: a transfer whose class disagreed with the
+/// subscription would be delivered and then have nowhere to report back to.
+pub fn build_n2_nrppa_transfer_request(
+    ue_context_id: &str,
+    lcs_correlation_id: &str,
+    serving_lmf_identification: &str,
+    nrppa_pdu: Vec<u8>,
+) -> SbiRequest {
+    let body = serde_json::json!({
+        "n2InfoContainer": {
+            "n2InformationClass": "NRPPa",
+            "nrppaInfo": {
+                "nfId": serving_lmf_identification,
+                "nrppaPdu": {
+                    "ngapIeType": "NRPPA_PDU",
+                    "ngapData": { "contentId": NRPPA_CONTENT_ID },
+                },
+            },
+        },
+        "lcsCorrelationId": lcs_correlation_id,
+        "servingLMFIdentification": serving_lmf_identification,
+    });
+    SbiRequest::post(format!(
+        "/namf-comm/v1/ue-contexts/{ue_context_id}/n1-n2-messages"
+    ))
+    .with_body(body.to_string(), "application/json")
+    .with_part(SbiPart::with_content(
+        NRPPA_CONTENT_ID,
+        N2_CONTENT_TYPE,
+        Bytes::from(nrppa_pdu),
+    ))
+}
+
 /// Build the N1N2MessageSubscribe request:
 /// `POST /namf-comm/v1/ue-contexts/{ueContextId}/n1-n2-messages/subscriptions`
 /// registering both the LPP (N1) and NRPPa (N2) notify callbacks.
@@ -362,6 +416,41 @@ pub async fn ensure_n1n2_subscription(amf: &DiscoveredAmf, ue_context_id: &str) 
 /// 504 UE_NOT_REACHABLE → [`TransferOutcome::UeNotReachable`]; a 409
 /// temporary rejection is retried exactly once (bounded); anything else
 /// fails closed.
+/// POST an NRPPa N2 information transfer (#103).
+///
+/// Best-effort by design and separate from [`send_n1n2_transfer`]: the NRPPa leg
+/// solicits gNB measurements that *improve* a fix, while the LPP leg is what asks
+/// the UE for the measurements a fix needs at all. A gNB that declines NRPPa must
+/// not fail a positioning request the UE could still answer, so this returns the
+/// outcome for logging and the caller proceeds either way.
+pub async fn send_n2_nrppa_transfer(
+    amf: &DiscoveredAmf,
+    ue_context_id: &str,
+    lcs_correlation_id: &str,
+    serving_lmf_identification: &str,
+    nrppa_pdu: Vec<u8>,
+) -> TransferOutcome {
+    let client = client_for(amf);
+    let request = build_n2_nrppa_transfer_request(
+        ue_context_id,
+        lcs_correlation_id,
+        serving_lmf_identification,
+        nrppa_pdu,
+    );
+    match client.send_request(request).await {
+        Ok(resp) if resp.status == 200 => TransferOutcome::Initiated,
+        Ok(resp) if resp.status == 504 => TransferOutcome::UeNotReachable,
+        Ok(resp) => {
+            log::warn!("NRPPa N2 transfer returned status {}", resp.status);
+            TransferOutcome::Failed(format!("NRPPa N2 transfer status {}", resp.status))
+        }
+        Err(e) => {
+            log::warn!("NRPPa N2 transfer failed: {e}");
+            TransferOutcome::Failed(format!("NRPPa N2 transfer: {e}"))
+        }
+    }
+}
+
 pub async fn send_n1n2_transfer(
     amf: &DiscoveredAmf,
     ue_context_id: &str,

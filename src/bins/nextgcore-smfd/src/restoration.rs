@@ -344,6 +344,7 @@ pub fn cause_means_session_gone(cause: u8) -> bool {
 mod tests {
     use super::*;
     use crate::context::PROCESS_STATE_TEST_LOCK;
+    use crate::pfcp_path::N4_TEST_LOCK;
     use nextgcore_sbi::message::{SbiRequest, SbiResponse};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -456,6 +457,13 @@ mod tests {
     #[tokio::test]
     async fn an_unrecoverable_session_notifies_the_amf_status_callback() {
         let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        // These tests seed and read `pfcp_sessions`, which `N4_TEST_LOCK` also
+        // guards: `teardown_association` calls `clear_pfcp_sessions`, wiping the map
+        // for the WHOLE process. Taking only the ambient lock left a window in which
+        // an `pfcp_path` sibling cleared the map between the seed and the assertion,
+        // which made `two_references_on_one_seid_are_both_reconciled` fail about 1
+        // whole-workspace run in 12. Documented order: ambient first, N4 second.
+        let _n4 = N4_TEST_LOCK.lock().await;
         let sink = start_status_sink().await;
         seed_session("restore-notify-ref", 0x0193_0001, Some(&sink.uri));
 
@@ -493,6 +501,13 @@ mod tests {
     #[tokio::test]
     async fn a_session_with_no_callback_is_counted_not_notified() {
         let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        // These tests seed and read `pfcp_sessions`, which `N4_TEST_LOCK` also
+        // guards: `teardown_association` calls `clear_pfcp_sessions`, wiping the map
+        // for the WHOLE process. Taking only the ambient lock left a window in which
+        // an `pfcp_path` sibling cleared the map between the seed and the assertion,
+        // which made `two_references_on_one_seid_are_both_reconciled` fail about 1
+        // whole-workspace run in 12. Documented order: ambient first, N4 second.
+        let _n4 = N4_TEST_LOCK.lock().await;
         let sink = start_status_sink().await;
         seed_session("restore-silent-ref", 0x0193_0002, None);
 
@@ -519,6 +534,13 @@ mod tests {
     #[tokio::test]
     async fn a_session_the_upf_does_not_have_is_dropped_and_the_amf_told() {
         let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        // These tests seed and read `pfcp_sessions`, which `N4_TEST_LOCK` also
+        // guards: `teardown_association` calls `clear_pfcp_sessions`, wiping the map
+        // for the WHOLE process. Taking only the ambient lock left a window in which
+        // an `pfcp_path` sibling cleared the map between the seed and the assertion,
+        // which made `two_references_on_one_seid_are_both_reconciled` fail about 1
+        // whole-workspace run in 12. Documented order: ambient first, N4 second.
+        let _n4 = N4_TEST_LOCK.lock().await;
         let sink = start_status_sink().await;
         seed_session("restore-disagree-ref", 0x0193_0003, Some(&sink.uri));
         assert!(
@@ -552,6 +574,13 @@ mod tests {
     #[tokio::test]
     async fn reconciliation_touches_only_the_named_session() {
         let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        // These tests seed and read `pfcp_sessions`, which `N4_TEST_LOCK` also
+        // guards: `teardown_association` calls `clear_pfcp_sessions`, wiping the map
+        // for the WHOLE process. Taking only the ambient lock left a window in which
+        // an `pfcp_path` sibling cleared the map between the seed and the assertion,
+        // which made `two_references_on_one_seid_are_both_reconciled` fail about 1
+        // whole-workspace run in 12. Documented order: ambient first, N4 second.
+        let _n4 = N4_TEST_LOCK.lock().await;
         let sink = start_status_sink().await;
         seed_session("restore-scope-gone", 0x0193_0004, Some(&sink.uri));
         seed_session("restore-scope-alive", 0x0193_0005, Some(&sink.uri));
@@ -583,6 +612,13 @@ mod tests {
     #[tokio::test]
     async fn two_references_on_one_seid_are_both_reconciled() {
         let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        // These tests seed and read `pfcp_sessions`, which `N4_TEST_LOCK` also
+        // guards: `teardown_association` calls `clear_pfcp_sessions`, wiping the map
+        // for the WHOLE process. Taking only the ambient lock left a window in which
+        // an `pfcp_path` sibling cleared the map between the seed and the assertion,
+        // which made `two_references_on_one_seid_are_both_reconciled` fail about 1
+        // whole-workspace run in 12. Documented order: ambient first, N4 second.
+        let _n4 = N4_TEST_LOCK.lock().await;
         let sink = start_status_sink().await;
         seed_session("restore-dup-a", 0x0193_0006, Some(&sink.uri));
         seed_session("restore-dup-b", 0x0193_0006, Some(&sink.uri));
@@ -607,6 +643,13 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_seid_reconciles_nothing() {
         let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        // These tests seed and read `pfcp_sessions`, which `N4_TEST_LOCK` also
+        // guards: `teardown_association` calls `clear_pfcp_sessions`, wiping the map
+        // for the WHOLE process. Taking only the ambient lock left a window in which
+        // an `pfcp_path` sibling cleared the map between the seed and the assertion,
+        // which made `two_references_on_one_seid_are_both_reconciled` fail about 1
+        // whole-workspace run in 12. Documented order: ambient first, N4 second.
+        let _n4 = N4_TEST_LOCK.lock().await;
         let sink = start_status_sink().await;
 
         let reconciled = reconcile_session_not_found(0xdead_beef_0193).await;
@@ -622,6 +665,13 @@ mod tests {
     #[tokio::test]
     async fn boot_notifies_the_consumer_of_a_session_it_cannot_serve() {
         let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        // These tests seed and read `pfcp_sessions`, which `N4_TEST_LOCK` also
+        // guards: `teardown_association` calls `clear_pfcp_sessions`, wiping the map
+        // for the WHOLE process. Taking only the ambient lock left a window in which
+        // an `pfcp_path` sibling cleared the map between the seed and the assertion,
+        // which made `two_references_on_one_seid_are_both_reconciled` fail about 1
+        // whole-workspace run in 12. Documented order: ambient first, N4 second.
+        let _n4 = N4_TEST_LOCK.lock().await;
         let sink = start_status_sink().await;
         // The shape `restore_from` produces: a session in the map, no binding, and
         // a callback salvaged from the record that could not be typed.
@@ -668,6 +718,13 @@ mod tests {
     #[tokio::test]
     async fn boot_reports_a_session_whose_consumer_cannot_be_reached() {
         let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        // These tests seed and read `pfcp_sessions`, which `N4_TEST_LOCK` also
+        // guards: `teardown_association` calls `clear_pfcp_sessions`, wiping the map
+        // for the WHOLE process. Taking only the ambient lock left a window in which
+        // an `pfcp_path` sibling cleared the map between the seed and the assertion,
+        // which made `two_references_on_one_seid_are_both_reconciled` fail about 1
+        // whole-workspace run in 12. Documented order: ambient first, N4 second.
+        let _n4 = N4_TEST_LOCK.lock().await;
         let sink = start_status_sink().await;
         {
             let global = crate::context::smf_self();
@@ -701,6 +758,13 @@ mod tests {
     #[tokio::test]
     async fn boot_notification_happens_once() {
         let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        // These tests seed and read `pfcp_sessions`, which `N4_TEST_LOCK` also
+        // guards: `teardown_association` calls `clear_pfcp_sessions`, wiping the map
+        // for the WHOLE process. Taking only the ambient lock left a window in which
+        // an `pfcp_path` sibling cleared the map between the seed and the assertion,
+        // which made `two_references_on_one_seid_are_both_reconciled` fail about 1
+        // whole-workspace run in 12. Documented order: ambient first, N4 second.
+        let _n4 = N4_TEST_LOCK.lock().await;
         let sink = start_status_sink().await;
         {
             let global = crate::context::smf_self();
@@ -737,6 +801,13 @@ mod tests {
     #[tokio::test]
     async fn nothing_restored_means_nothing_emitted() {
         let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        // These tests seed and read `pfcp_sessions`, which `N4_TEST_LOCK` also
+        // guards: `teardown_association` calls `clear_pfcp_sessions`, wiping the map
+        // for the WHOLE process. Taking only the ambient lock left a window in which
+        // an `pfcp_path` sibling cleared the map between the seed and the assertion,
+        // which made `two_references_on_one_seid_are_both_reconciled` fail about 1
+        // whole-workspace run in 12. Documented order: ambient first, N4 second.
+        let _n4 = N4_TEST_LOCK.lock().await;
         let sink = start_status_sink().await;
         // No seeding: this is boot with no snapshot.
         let drained = {
