@@ -3833,6 +3833,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state (current-thread test)
     async fn test_http_generate_auth_data_flows() {
+        let _udr_env = crate::sbi_path::UDR_ENV_TEST_LOCK.lock().await;
         // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
         // dev-profile deployment (issue #63). Declared rather than inherited.
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -4249,6 +4250,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state (current-thread test)
     async fn test_sdm_subscribe_persists_and_unsubscribe_is_idempotent() {
+        let _udr_env = crate::sbi_path::UDR_ENV_TEST_LOCK.lock().await;
         // Serialize on udmd's global-context/UDR-env guard: this test re-inits
         // the process-global UDM context and/or sets UDR_SBI_* env vars, which
         // races any other udmd test doing the same (the CI-flaky AUTS-resync).
@@ -4349,6 +4351,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state (current-thread test)
     async fn test_auth_event_returns_201_with_location_header() {
+        let _udr_env = crate::sbi_path::UDR_ENV_TEST_LOCK.lock().await;
         // Serialize on udmd's global-context/UDR-env guard: this test re-inits
         // the process-global UDM context and/or sets UDR_SBI_* env vars, which
         // races any other udmd test doing the same (the CI-flaky AUTS-resync).
@@ -4407,6 +4410,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state (current-thread test)
     async fn test_ee_subscribe_persists_and_unsubscribe_404_then_204() {
+        let _udr_env = crate::sbi_path::UDR_ENV_TEST_LOCK.lock().await;
         // Serialize on udmd's global-context/UDR-env guard: this test re-inits
         // the process-global UDM context and/or sets UDR_SBI_* env vars, which
         // races any other udmd test doing the same (the CI-flaky AUTS-resync).
@@ -4922,6 +4926,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize process-global UDM state (context, UDM_NOTIFY_DISABLE, SBI profile)
     async fn sdm_subscribe_refuses_a_subscription_missing_a_mandatory_ie() {
+        let _udr_env = crate::sbi_path::UDR_ENV_TEST_LOCK.lock().await;
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -4996,6 +5001,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize process-global UDM state (context, UDM_NOTIFY_DISABLE, SBI profile)
     async fn ee_modify_applies_the_patch_and_the_change_is_readable_back() {
+        let _udr_env = crate::sbi_path::UDR_ENV_TEST_LOCK.lock().await;
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -5158,6 +5164,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)]
     async fn sdm_multi_data_set_get_is_routed_and_fans_out() {
+        let _udr_env = crate::sbi_path::UDR_ENV_TEST_LOCK.lock().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
@@ -5252,6 +5259,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)]
     async fn ue_context_in_amf_data_reads_the_stored_registration() {
+        let _udr_env = crate::sbi_path::UDR_ENV_TEST_LOCK.lock().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
@@ -5333,6 +5341,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)]
     async fn every_routed_sdm_data_set_answers_a_derived_status() {
+        let _udr_env = crate::sbi_path::UDR_ENV_TEST_LOCK.lock().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
@@ -5550,6 +5559,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
     async fn test_http_uecm_registration_surface() {
+        let _udr_env = crate::sbi_path::UDR_ENV_TEST_LOCK.lock().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
@@ -5817,6 +5827,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
     async fn test_http_ueau_ausf_pinning_delete_auth_and_sqn_withholding() {
+        let _udr_env = crate::sbi_path::UDR_ENV_TEST_LOCK.lock().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
@@ -6254,6 +6265,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
     async fn test_http_id_translation_result_both_directions() {
+        let _udr_env = crate::sbi_path::UDR_ENV_TEST_LOCK.lock().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
@@ -6329,6 +6341,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize global UDM state
     async fn test_http_nudm_pp_and_mt_are_served() {
+        let _udr_env = crate::sbi_path::UDR_ENV_TEST_LOCK.lock().await;
         use nextgcore_sbi::context::{global_context, NfInstance, NfService};
         use nextgcore_sbi::types::{NfType, SbiServiceType};
 

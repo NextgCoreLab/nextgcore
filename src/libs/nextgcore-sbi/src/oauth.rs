@@ -70,6 +70,52 @@ pub fn reset_oauth2_standard_paths_default() {
     OAUTH2_PATH_MODE.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Serializes every test that reads or mutates [`OAUTH2_PATH_MODE`], the
+/// process-wide default OAuth2 path selector (I4).
+///
+/// Declared here beside the global rather than inside this module's `mod tests`,
+/// where it lived until #308. The move is the whole fix: a lock inside a test
+/// submodule is unreachable from a sibling module, and this selector has readers
+/// in TWO sibling modules —
+/// - `security.rs`'s `production_profile_configures_tls_mtls_and_oauth2` asserts the
+///   derived JWKS URI is the BESPOKE `/nnrf-oauth2/v1/jwks`, which
+///   `apply_sbi_security_policy` obtains through [`JwksCache::for_nrf`] and therefore
+///   through this selector. With `test_flag_flips_default_to_standard` in flight it
+///   gets `/oauth2/retrieve-key`, and it failed 1 of 20 `cargo test --workspace` runs.
+/// - `client.rs`'s `test_oauth2_token_attached_when_enabled` stubs a token endpoint at
+///   the bespoke `/nnrf-oauth2/v1/access-token` only, so a flipped selector makes its
+///   client dial `/oauth2/token` and get nothing. That one was found by WIDENING the
+///   writer's window during #308's revert pass, not by a failing CI run — it is the
+///   same defect, one window narrower.
+///
+/// A `tokio::sync::Mutex` rather than a `std` one: two of the guarded tests await
+/// while holding it (they drive loopback token endpoints), and a `std` guard held
+/// across an await blocks the executor thread — `clippy::await_holding_lock`, which
+/// those two were already tripping before #308. Tokio mutexes do not poison, so the
+/// poison tolerance the `std` version needed is gone rather than lost.
+#[cfg(test)]
+pub(crate) static PATH_MODE_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Take [`PATH_MODE_GUARD`] from a **sync** test and pin the shipped (env-driven)
+/// baseline, clearing any override leaked by a previously-panicked guarded test.
+///
+/// `blocking_lock` is sound here precisely because a sync `#[test]` has no runtime
+/// to block; async tests must use [`lock_path_mode_async`].
+#[cfg(test)]
+pub(crate) fn lock_path_mode() -> tokio::sync::MutexGuard<'static, ()> {
+    let g = PATH_MODE_GUARD.blocking_lock();
+    reset_oauth2_standard_paths_default();
+    g
+}
+
+/// [`lock_path_mode`] for an `async` test.
+#[cfg(test)]
+pub(crate) async fn lock_path_mode_async() -> tokio::sync::MutexGuard<'static, ()> {
+    let g = PATH_MODE_GUARD.lock().await;
+    reset_oauth2_standard_paths_default();
+    g
+}
+
 /// Whether newly-constructed OAuth2 clients / JWKS caches default to the
 /// standard TS 29.510 paths. Resolves the programmatic override first, then
 /// [`OAUTH2_STANDARD_PATHS_ENV`], defaulting to `false` (bespoke).
@@ -1542,19 +1588,10 @@ pub async fn fetch_jwks(jwks_uri: &str) -> SbiResult<serde_json::Value> {
 mod tests {
     use super::*;
 
-    /// Serializes every test that reads or mutates the process-wide default
-    /// OAuth2 path selector (I4) so a parallel flip cannot perturb a
-    /// default-asserting test. Poison-tolerant so one panicking test does not
-    /// cascade-fail the rest.
-    static PATH_MODE_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn lock_path_mode() -> std::sync::MutexGuard<'static, ()> {
-        let g = PATH_MODE_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        // Clear any override leaked by a previously-panicked guarded test so we
-        // start from the shipped (env-driven) baseline.
-        reset_oauth2_standard_paths_default();
-        g
-    }
+    /// The selector's guard now lives beside the global it guards, because
+    /// `security.rs`'s tests take the SAME one (#308) and a sibling module cannot
+    /// reach a static inside this file's test submodule.
+    use super::{lock_path_mode, lock_path_mode_async};
 
     /// Same treatment for the process-wide CCA signing key (issue #64): tests
     /// that flip it must not perturb one asserting the default.
@@ -2505,7 +2542,7 @@ mod tests {
         // The I4 selector is read at construction; hold the guard only over the
         // (synchronous) build to pin the bespoke baseline, then release before I/O.
         let client = {
-            let _g = lock_path_mode();
+            let _g = lock_path_mode_async().await;
             OAuth2Client::new(format!("http://{addr}"), "amf-1", NfType::Amf)
         };
         let resp = client
@@ -2626,7 +2663,7 @@ mod tests {
         // The selector is read at construction; flip → build → reset all under
         // the guard, then release before the network I/O (no lock across await).
         let client = {
-            let _g = lock_path_mode();
+            let _g = lock_path_mode_async().await;
             set_oauth2_standard_paths_default(true);
             let c = OAuth2Client::new(format!("http://{addr}"), "amf-1", NfType::Amf);
             reset_oauth2_standard_paths_default();

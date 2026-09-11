@@ -2885,6 +2885,7 @@ mod tests {
 
     #[test]
     fn test_parse_qos() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.blocking_lock();
         assert_eq!(parse_qos("EMERGENCY"), PositioningQos::Emergency);
         assert_eq!(parse_qos("HIGH_ACCURACY"), PositioningQos::HighAccuracy);
         assert_eq!(parse_qos("whatever"), PositioningQos::BestEffort);
@@ -2961,6 +2962,7 @@ mod tests {
     // single test so no other test observes a partially-toggled state.
     #[tokio::test]
     async fn test_debug_endpoints_flag_gates_bespoke_routes() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
 
         // The bespoke/debug routes, each with the method it normally handles.
@@ -3030,6 +3032,7 @@ mod tests {
     // registry match) returns 500 POSITIONING_FAILED — never 200 with lat 0.0.
     #[tokio::test]
     async fn test_determine_location_empty_registry_no_fabricated_zero_fix() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
         // A decodable Multi-RTT measurement for an UN-seeded PCI: no registry hit.
         let lpp = build_multi_rtt_lpp(&[(303, 5000)], 62);
@@ -3049,6 +3052,7 @@ mod tests {
     // -- lmfd-02 + lmfd-04: 200 OK with a GAD LocationDataExt ----------------
     #[tokio::test]
     async fn test_determine_location_returns_200_location_data_ext() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         // Seed a real fix (h_accuracy 50 < requested 100 -> FULFILLED).
         seed_fix("imsi-001010000000001", 50.0);
         let body = r#"{
@@ -3088,6 +3092,7 @@ mod tests {
     /// emergency or regulatory one) could not tell.
     #[tokio::test]
     async fn test_assured_qos_class_refuses_an_unmet_accuracy() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         // 200 m achieved accuracy against a 10 m request: not fulfillable.
         seed_fix("imsi-001010000000101", 200.0);
         let request = |qos: &str| {
@@ -3149,6 +3154,7 @@ mod tests {
     /// previous fix makes it derivable, and omits it when it does not.
     #[tokio::test]
     async fn test_velocity_requested_populates_the_estimate_when_derivable() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         // TWO fixes for the same UE, 10 s and ~111 m apart. The first is displaced
         // into `previous_location` by the second, which is the two-fix history the
         // derivation needs — a single fix has no velocity.
@@ -3196,6 +3202,7 @@ mod tests {
     // -- lmfd-04: shape negotiation honors supportedGADShapes ----------------
     #[tokio::test]
     async fn test_determine_location_negotiates_ellipse_shape() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         seed_fix("imsi-001010000000002", 40.0);
         let body = r#"{
             "supi": "imsi-001010000000002",
@@ -3213,6 +3220,7 @@ mod tests {
     // -- lmfd-03 + lmfd-10: ecgi/ncgi exclusion -> 400 ProblemDetails --------
     #[tokio::test]
     async fn test_determine_location_ecgi_ncgi_exclusion_400() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let body = r#"{
             "ecgi": { "plmnId": { "mcc": "001", "mnc": "01" }, "eutraCellId": "0000001" },
             "ncgi": { "plmnId": { "mcc": "001", "mnc": "01" }, "nrCellId": "000000001" }
@@ -3233,6 +3241,7 @@ mod tests {
     // -- lmfd-03 + lmfd-10: malformed body -> 400 ProblemDetails -------------
     #[tokio::test]
     async fn test_determine_location_malformed_body_400() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let req = SbiRequest::post("/nlmf-loc/v1/determine-location")
             .with_body("not json", "application/json");
         let resp = handle_determine_location(&req).await;
@@ -3247,6 +3256,7 @@ mod tests {
     // to perform positioning procedure").
     #[tokio::test]
     async fn test_determine_location_timeout_504() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let body = r#"{ "supi": "imsi-001010000000003", "maxRespTime": 0 }"#;
         let req =
             SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
@@ -3271,6 +3281,7 @@ mod tests {
     // (never the retired invented cause, never a fabricated 200).
     #[tokio::test]
     async fn test_determine_location_unreachable_amf_504_unreachable_user() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         // A SUPI never seeded by any test: no per-SUPI stored fix exists, so
         // the handler runs the live procedure and fails at AMF discovery.
         let body = r#"{ "supi": "imsi-001010000000404" }"#;
@@ -3294,6 +3305,7 @@ mod tests {
     // received but the solver produced no fix.
     #[tokio::test]
     async fn test_positioning_outcome_solver_failed_maps_to_500() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
         let input: nlmf::InputData =
             serde_json::from_str(r#"{ "supi": "imsi-001010000000405" }"#).unwrap();
@@ -3315,6 +3327,7 @@ mod tests {
     // -- A2: a real fix on the session channel -> 200 LocationDataExt --------
     #[tokio::test]
     async fn test_positioning_outcome_fix_maps_to_200() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
         let input: nlmf::InputData = serde_json::from_str(
             r#"{ "supi": "imsi-001010000000406",
@@ -3358,6 +3371,7 @@ mod tests {
     // -- A2: timeout on the session channel -> 504 + session expired ---------
     #[tokio::test]
     async fn test_positioning_outcome_timeout_504_and_session_expired() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
         // NO_DELAY -> zero wait budget -> immediate timeout (no real sleeps).
         let input: nlmf::InputData = serde_json::from_str(
@@ -3385,6 +3399,7 @@ mod tests {
     // -- A2: no target UE identity -> 400 MANDATORY_IE_MISSING ---------------
     #[tokio::test]
     async fn test_determine_location_no_target_identity_400() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let body = r#"{ "locationQoS": { "hAccuracy": 50.0 } }"#;
         let req =
             SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
@@ -3397,6 +3412,7 @@ mod tests {
     // -- A2: stored fix served with an HONEST age (not hardcoded 0) ----------
     #[tokio::test]
     async fn test_determine_location_stored_fix_reports_real_age() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         // Captured 5 minutes ago.
         seed_fix_at("imsi-001010000000408", 40.0, unix_now() - 300);
         let body = r#"{ "supi": "imsi-001010000000408" }"#;
@@ -3414,6 +3430,7 @@ mod tests {
     // -- A2: a stored fix with UNKNOWN capture instant is not short-circuited -
     #[tokio::test]
     async fn test_determine_location_ageless_stored_fix_not_served() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         // timestamp 0 = capture instant unknown -> age cannot be honoured ->
         // the live procedure runs (and 504s here: no AMF discoverable).
         seed_fix_at("imsi-001010000000409", 40.0, 0);
@@ -3430,6 +3447,7 @@ mod tests {
     // the MT-LR path — another UE's completed report is never served. --------
     #[tokio::test]
     async fn test_determine_location_never_serves_another_ues_report() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
         // Complete a measurement report (for some unrelated request) so a
         // "global newest report" exists — the retired latest_location fallback
@@ -3530,6 +3548,7 @@ mod tests {
     // -- lmfd-12: unknown positioning method on the debug route -> 400 -------
     #[tokio::test]
     async fn test_measurement_request_unknown_method_400() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
         let body = r#"{ "amfUeNgapId": 1, "positioningMethod": "BOGUS" }"#;
         let req = SbiRequest::post("/nlmf-loc/v1/measurements").with_body(body, "application/json");
@@ -3543,6 +3562,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_configure_up_204() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let body = r#"{
             "upNotifyCallBackUri": "http://af/up-notify",
             "notifCorrelationId": "nc-001",
@@ -3555,6 +3575,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_configure_up_missing_ue_id_400() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let body = r#"{
             "upNotifyCallBackUri": "http://af/up-notify",
             "notifCorrelationId": "nc-002"
@@ -3570,6 +3591,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_measure_location_unknown_403() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let body = r#"{}"#;
         let req =
             SbiRequest::post("/nlmf-loc/v1/measure-location").with_body(body, "application/json");
@@ -3583,6 +3605,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_location_context_transfer_204() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let body = r#"{
             "amfId": "amf-01",
             "ldrType": "PERIODIC",
@@ -3602,6 +3625,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_location_context_transfer_bad_event_class_403() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let body = r#"{
             "amfId": "amf-01",
             "ldrType": "UE_AVAILABLE",
@@ -3621,6 +3645,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cancel_location_lifecycle() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         // Seed an LDR session directly.
         lmf_self().read().unwrap().register_ldr(LdrContext {
             ldr_reference: "bb01".to_string(),
@@ -3650,6 +3675,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_up_subscribe_201_and_unsubscribe_204() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
         let body = r#"{
             "upNotifyCallBackUri": "http://af/up",
@@ -3702,6 +3728,7 @@ mod tests {
     /// forgotten one.
     #[tokio::test]
     async fn test_configure_up_persists_the_configuration() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
         let body = r#"{
             "upNotifyCallBackUri": "http://af/up-cfg",
@@ -3804,6 +3831,7 @@ mod tests {
     /// against a literal, so it holds whatever state a sibling test has left behind.
     #[tokio::test]
     async fn test_capabilities_handler_serves_the_derived_body() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
         let resp = handle_capabilities().await;
         assert_eq!(resp.status, 200);
@@ -3828,6 +3856,7 @@ mod tests {
     /// key would make a UE decipher assistance data into noise.
     #[tokio::test]
     async fn test_nlmf_broadcast_cipher_key_data() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
 
         let req = SbiRequest::post("/nlmf-broadcast/v1/cipher-key-data").with_body(
@@ -3866,6 +3895,7 @@ mod tests {
     /// `TS29572_Nlmf_DataExposure.yaml`.
     #[tokio::test]
     async fn test_nlmf_dataexposure_subscription_crud() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
 
         let body = r#"{
@@ -3996,6 +4026,7 @@ mod tests {
     /// relocation, and the stored record made it look live.
     #[tokio::test]
     async fn test_context_transfer_rearms_periodic_reporting() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
 
         let body = serde_json::json!({
@@ -4052,6 +4083,7 @@ mod tests {
     /// The honest half of the same change.
     #[tokio::test]
     async fn test_context_transfer_without_periodic_info_does_not_invent_a_cadence() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
 
         let body = serde_json::json!({
@@ -4096,6 +4128,7 @@ mod tests {
     /// reader of the issue does not "fix" it.
     #[tokio::test]
     async fn test_dummy_event_class_is_accepted_because_the_yaml_defines_it() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
 
         let transfer = |event_class: &str, reference: &str| {
@@ -4189,6 +4222,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_determine_location_assistance_data_204() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let body =
             r#"{"supi":"imsi-001010000000012","ueLocationServiceInd":"LOCATION_ASSISTANCE_DATA"}"#;
         let req =
@@ -4201,6 +4235,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_determine_location_deferred_ldr_registers_and_cancellable() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         seed_fix("imsi-001010000000013", 40.0);
         let body = r#"{
             "supi": "imsi-001010000000013",
@@ -4354,6 +4389,7 @@ mod tests {
     // -- A5 acceptance: LPP bytes reach the decode adapter -> a real fix ------
     #[tokio::test]
     async fn test_determine_location_multipart_lpp_produces_fix_200() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
         let lpp = seed_scene_and_build_multi_rtt_lpp(55);
         let input = r#"{"supi":"imsi-001010000000501",
@@ -4384,6 +4420,7 @@ mod tests {
     // fallen through to the network path (504). 500-vs-504 is the discriminator.
     #[tokio::test]
     async fn test_determine_location_multipart_lpp_no_fix_500() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
         let lpp = build_multi_rtt_lpp(&[(301, 5000)], 60);
         let input = r#"{"supi":"imsi-001010000000502","lppMessage":{"contentId":"lpp-1"}}"#;
@@ -4397,6 +4434,7 @@ mod tests {
     // -- A5 acceptance: a dangling contentId fails 400 (never silently ignored) -
     #[tokio::test]
     async fn test_determine_location_lpp_dangling_content_id_400() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
         let lpp = build_multi_rtt_lpp(&[(301, 5000)], 61);
         // lppMessage references "lpp-missing"; the part carries a DIFFERENT id.
@@ -4415,6 +4453,7 @@ mod tests {
     // -- A5: a lppMessage IE with NO multipart parts at all -> 400 ------------
     #[tokio::test]
     async fn test_determine_location_lpp_ref_without_parts_400() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
         // application/json body (no binary parts) carrying a lppMessage ref.
         let body = r#"{"supi":"imsi-001010000000504","lppMessage":{"contentId":"lpp-x"}}"#;
@@ -4429,6 +4468,7 @@ mod tests {
     // -- A5: content-type gate rejects unsupported media types with 415 -------
     #[tokio::test]
     async fn test_determine_location_unsupported_media_type_415() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let req = SbiRequest::post("/nlmf-loc/v1/determine-location")
             .with_body("not json or multipart", "text/plain");
         let resp = handle_determine_location(&req).await;
@@ -4447,6 +4487,7 @@ mod tests {
     // gate (application/json) or the multipart branch (no parts).
     #[tokio::test]
     async fn test_determine_location_plain_json_unaffected() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         seed_fix("imsi-001010000000505", 50.0);
         let body = r#"{
             "supi": "imsi-001010000000505",
@@ -4469,6 +4510,7 @@ mod tests {
     // handler round-trip (TS 29.500 boundary handling), yielding the same fix.
     #[tokio::test]
     async fn test_determine_location_multipart_roundtrip_via_sbi_codec() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         use bytes::Bytes;
         use nextgcore_sbi::message::SbiPart;
         use nextgcore_sbi::multipart;
@@ -4616,6 +4658,7 @@ mod tests {
     // callback handler completes a pending session with a measurement-derived fix.
     #[tokio::test]
     async fn test_n1_message_notify_strict_peer_completes_session_with_fix() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         use nextgcore_sbi::multipart;
         lmf_context_init(1024);
         let supi = "imsi-001010000000601";
@@ -4702,6 +4745,7 @@ mod tests {
     // -- A4: an unknown lcsCorrelationId / LPP transaction → 404, no ingestion.
     #[tokio::test]
     async fn test_n1_message_notify_unknown_correlation_404() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
         // txn 249 + a fresh UUID correlation: neither matches any session.
         let lpp = build_ecid_lpp(42, 60, 800, 249);
@@ -4731,6 +4775,7 @@ mod tests {
     // -- A4: jsonData references a contentId with no matching part → 400.
     #[tokio::test]
     async fn test_n1_message_notify_missing_binary_part_400() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
         let json = "{\"n1MessageContainer\":{\"n1MessageClass\":\"LPP\",\
              \"n1MessageContent\":{\"contentId\":\"n1-lpp\"}},\
@@ -4748,6 +4793,7 @@ mod tests {
     // the session; the report is attached to the session's request_id.
     #[tokio::test]
     async fn test_n2_info_notify_completes_session() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
         let supi = "imsi-001010000000602";
         let ctx = lmf_self();
@@ -4798,6 +4844,7 @@ mod tests {
     // -- A4: N2InfoNotify with an unknown lcsCorrelationId → 404.
     #[tokio::test]
     async fn test_n2_info_notify_unknown_correlation_404() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
         let nrppa = build_nrppa_ecid_report();
         let json = format!(
@@ -5109,6 +5156,7 @@ mod a8_event_notify_tests {
     // -- A8 acceptance: exactly reportingAmount callbacks, then the task stops.
     #[tokio::test]
     async fn test_periodic_ldr_emits_exact_amount_then_stops() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
         let (server, port) = start_sink().await;
         let path = "/sink/a8-exact/cb";
@@ -5166,6 +5214,7 @@ mod a8_event_notify_tests {
     // -- A8 acceptance: cancel-location mid-stream stops emission.
     #[tokio::test]
     async fn test_periodic_ldr_cancel_stops_emission() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
         let (server, port) = start_sink().await;
         let path = "/sink/a8-cancel/cb";
@@ -5204,6 +5253,7 @@ mod a8_event_notify_tests {
     // retried forever (one report + one retry, then the session is dropped).
     #[tokio::test]
     async fn test_periodic_ldr_failing_gmlc_auto_cancels() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
         let (server, port) = start_sink().await;
         let path = "/sink/a8-fail/cb";
@@ -5323,6 +5373,7 @@ mod a8_event_notify_tests {
     // -- A8 unit: callback-URI splitter (host/port/path + scheme defaults). ---
     #[test]
     fn test_split_callback_uri() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.blocking_lock();
         assert_eq!(
             split_callback_uri("http://10.0.0.5:8080/gmlc/cb"),
             Some(("10.0.0.5".to_string(), 8080, "/gmlc/cb".to_string()))
@@ -5620,6 +5671,7 @@ mod positioning_chain_strict_peer {
     /// returns a measurement-derived fix, driven end-to-end across BOTH real NFs.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_positioning_chain_returns_200_computed_fix_via_real_amfd() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         // Drives REAL amfd peer-call code against a loopback PLAINTEXT stub, i.e.
         // describes a dev-profile deployment (issue #63). Declared, not inherited.
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -5717,6 +5769,7 @@ mod positioning_chain_strict_peer {
     /// the real harness (proving the A2 leg), then fail-closes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_positioning_chain_silent_ue_times_out_504() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _serial = chain_lock().lock().await;
         let supi = "imsi-001010000000702".to_string();
 
@@ -5741,6 +5794,7 @@ mod positioning_chain_strict_peer {
     /// POSITIONING_FAILED (TS 29.572 Table 6.1.7.3-1), never a fabricated fix.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_positioning_chain_corrupt_lpp_reply_maps_to_500() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         // Drives REAL amfd peer-call code against a loopback PLAINTEXT stub, i.e.
         // describes a dev-profile deployment (issue #63). Declared, not inherited.
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
@@ -5799,6 +5853,7 @@ mod positioning_chain_strict_peer {
     /// pending. Driven through lmfd's REAL notify handler + amfd's REAL producer.
     #[tokio::test]
     async fn test_positioning_chain_correlation_isolation() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _serial = chain_lock().lock().await;
         lmf_context_init(1024);
         let supi_a = "imsi-001010000000704";
@@ -5893,6 +5948,7 @@ mod positioning_chain_strict_peer {
     /// killing the "prepared and logged" (log-only) non-delivery.
     #[tokio::test]
     async fn test_h4_lmfd_transfer_strict_peer_amfd_extracts_exact_lpp() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _serial = chain_lock().lock().await;
         let supi = "imsi-001010000000731";
         seed_amf_connected_ue(supi);
@@ -5934,6 +5990,7 @@ mod positioning_chain_strict_peer {
     /// real handler (TS 29.518 Table 6.1.7.3-1) — not a fake 200.
     #[tokio::test]
     async fn test_h4_lmfd_transfer_idle_ue_504_ue_not_reachable() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _serial = chain_lock().lock().await;
         let supi = "imsi-001010000000732";
         seed_amf_idle_ue(supi);
@@ -5950,6 +6007,7 @@ mod positioning_chain_strict_peer {
     /// amfd's real handler (the transfer can never land for an absent UE).
     #[tokio::test]
     async fn test_h4_lmfd_transfer_unknown_ue_404() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _serial = chain_lock().lock().await;
         nextgcore_amfd::test_support::init_context();
         let supi = "imsi-001019999999999"; // never seeded

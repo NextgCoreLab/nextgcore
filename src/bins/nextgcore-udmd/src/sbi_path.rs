@@ -400,6 +400,21 @@ pub async fn udm_sbi_send_request(
     }
 }
 
+/// The ONE agreement about the `UDR_SBI_ADDR` / `UDR_SBI_PORT` environment, for
+/// tests (#308).
+///
+/// Declared beside the fallback below rather than inside `mod tests`, so a sibling
+/// module that starts writing these variables reaches the same static instead of
+/// declaring a second one. `app.rs` had three writers and no lock at all: each
+/// pointed the fallback at its own mock UDR, and the fallback names ONE UDR for
+/// every `nudr` query, so whoever wrote last owned every sibling's UDR traffic.
+///
+/// It covers readers as well as writers. `smfd`'s equivalent flake (#308's subject)
+/// was a locked writer and an unlocked reader disagreeing about one variable, which
+/// is not weaker protection than none — it is none, with a lock to look at.
+#[cfg(test)]
+pub(crate) static UDR_ENV_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Discover UDR and send a NUDR-DR request
 ///
 /// Port of udm_sbi_discover_and_send() for UDR queries.

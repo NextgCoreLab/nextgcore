@@ -1523,6 +1523,19 @@ enum UdmAuthData {
     },
 }
 
+/// The ONE agreement about the `UDM_SBI_ADDR` / `UDM_SBI_PORT` environment and the
+/// process-wide AUSF context, for tests.
+///
+/// Moved out of `mod tests` by #308. Every writer and every reader of that
+/// environment in this crate already took it, so this is a relocation and not a
+/// behaviour change — but a lock declared inside a test submodule is unreachable
+/// from a sibling module, and the next module that needs it declares a second one.
+/// That is exactly how `smfd` ended up with four locks over one ambient state and a
+/// suite that failed 1 whole-workspace run in 5. Declared beside the fallback below
+/// so there is one place to find it.
+#[cfg(test)]
+pub(crate) static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Send NUDM-UEAU generate-auth-data request to UDM via SBI client
 async fn send_udm_generate_auth_data(
     supi_or_suci: &str,
@@ -2086,9 +2099,7 @@ async fn run_event_loop_async(
 mod tests {
     use super::*;
 
-    /// Serialise integration tests that share global env vars (UDM_SBI_ADDR/PORT)
-    /// and the process-wide AUSF context.
-    static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    use super::TEST_MUTEX;
 
     /// Initiate a 5G-AKA authentication session and return the confirmation href
     /// and the RAND bytes needed to compute a valid RES*.

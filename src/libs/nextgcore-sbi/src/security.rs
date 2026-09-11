@@ -822,6 +822,17 @@ mod profile_tests {
     /// bound to this NF's own audience.
     #[test]
     fn production_profile_configures_tls_mtls_and_oauth2() {
+        // The JWKS URI asserted below is DERIVED, through `JwksCache::for_nrf`, from
+        // the process-wide OAuth2 path selector — so this test is a reader of that
+        // global and must take the same guard its writers in `oauth.rs` take (#308).
+        // Without it, `test_flag_flips_default_to_standard` running concurrently
+        // yields `/oauth2/retrieve-key` here.
+        let _paths = crate::oauth::lock_path_mode();
+        // The JWKS URI asserted below is DERIVED, through `JwksCache::for_nrf`, from
+        // the process-wide OAuth2 path selector — so this test is a reader of that
+        // global and must take the same guard its writers in `oauth.rs` take (#308).
+        // Without it, `test_flag_flips_default_to_standard` running concurrently
+        // yields `/oauth2/retrieve-key` here.
         let dir = std::env::temp_dir().join(format!("sbi-profile-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let cert = dir.join("server.crt");

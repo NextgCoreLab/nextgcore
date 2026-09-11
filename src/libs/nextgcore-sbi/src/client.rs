@@ -1434,6 +1434,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_oauth2_token_attached_when_enabled() {
+        // The stub below answers the BESPOKE token path only, so this test reads the
+        // process-wide OAuth2 path selector through `OAuth2Client::new` and must take
+        // the same guard `oauth.rs`'s writers take (#308).
+        let _paths = crate::oauth::lock_path_mode_async().await;
         let addr = serve_token_and_echo("test-access-token").await;
         let nrf_uri = format!("http://{addr}");
 

@@ -1167,6 +1167,30 @@ pub fn lmf_context_init(max_measurements: usize) {
     };
 }
 
+/// The ONE agreement about the process-global LMF context, for tests (#308).
+///
+/// [`lmf_context_init`] calls `LmfContext::init`, which clears the measurement,
+/// session and **cell-coordinate** registries for the whole process — 32 tests call
+/// it — and `seed_scene_and_build_multi_rtt_lpp` writes coordinates INTO the global
+/// one via [`LmfContext::set_cell_coord`] and never removes them. `capabilities_body`
+/// derives `nrppaSupported` / `nlsInterfaceSupported` from exactly that registry.
+///
+/// So `test_capabilities_handler_serves_the_derived_body` had a genuine TOCTOU: it
+/// reads the served body from `handle_capabilities()` and then recomputes the
+/// expected body from the context, and a sibling wiping or seeding coordinates
+/// between the two reads makes them disagree. Its own doc comment said the equality
+/// "holds whatever state a sibling test has left behind" — true of state left
+/// behind, false of state changed in the gap, which is why it failed 2 of 20
+/// `cargo test --workspace` runs while `-p nextgcore-lmfd` alone was always green.
+///
+/// Declared beside the global rather than inside `mod tests` so a sibling module
+/// reaches this static instead of declaring a second one, and taken by every test
+/// that touches the context — readers included. #308 measured what guarding only the
+/// writers is worth: nothing, with a lock to look at.
+#[cfg(test)]
+pub(crate) static PROCESS_STATE_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 pub fn lmf_context_final() {
     let ctx = lmf_self();
     if let Ok(mut context) = ctx.write() {

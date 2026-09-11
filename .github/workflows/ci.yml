@@ -39,12 +39,23 @@ jobs:
         with:
           workspaces: src
       - name: cargo test
-        # Retry once: a few NF tests share process-global state (context /
-        # UDR_SBI_* env) and ephemeral ports (free_port TOCTOU), which can race
-        # under the runner's heavy parallel load. A single retry clears a flake
-        # while a deterministic failure still fails twice. TODO: proper deflake
-        # (bind-and-keep ports + one cross-crate serialize lock).
-        run: cd src && (cargo test --workspace || (echo '::warning::cargo test flaked, retrying once' && cargo test --workspace))
+        # No retry. There was one, for two named races: process-global state and
+        # the free_port TOCTOU. #308 fixed the first (one ambient test lock per
+        # crate, covering readers as well as writers) and measured what the retry
+        # had been hiding -- about 1 whole-workspace run in 5, in three smfd tests,
+        # for months, because a single retry passes ~96% of the time at that rate
+        # and the warning annotation went unread. A retry that can hide a 20% flake
+        # is not a flake mitigation, it is a detector for exactly the failures
+        # nobody investigates.
+        #
+        # What genuinely remains is #313: free_port hands out a port and unbinds it
+        # before the caller binds, and each test BINARY has its own issued-port set,
+        # so two crates can be given the same port. That fails as a bind panic, not
+        # as a wrong answer, and it did not occur once in ~60 whole-crate runs under
+        # synthetic 40-way load. Closing it needs SbiServer to accept a pre-bound
+        # listener, which is #313's subject; until then a rare red here is the
+        # honest signal and should be re-run, not retried automatically.
+        run: cd src && cargo test --workspace
 
       - name: cargo test (non-default features)
         # Feature-gated paths are invisible to the default build, so a gated

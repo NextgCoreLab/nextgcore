@@ -1158,20 +1158,6 @@ impl DefaultDnnError {
     }
 }
 
-/// The ONE agreement about the `UDM_SBI_ADDR` / `UDM_SBI_PORT` / `NRF_URI`
-/// environment, for tests.
-///
-/// Declared at the crate root rather than inside `mod tests` because `udm.rs`'s
-/// tests set the same variables (#79) and a sibling module cannot reach a static
-/// inside this file's test submodule. It was in `mod tests` first, and the result
-/// was a flaky `the_smf_registers_with_the_udm_and_fetches_sm_data`: another test
-/// re-pointed `UDM_SBI_PORT` at its own loopback UDM between the registration and
-/// the `sm-data` fetch, so the fetch reached a server that answers 201 to
-/// everything and returned no subscription. Env is per-process; two locks over it
-/// are two disjoint agreements.
-#[cfg(test)]
-pub(crate) static UDM_ENV_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 /// Resolve a UDM `nudm-sdm` endpoint.
 ///
 /// NRF discovery first (TS 29.510 §5.3.2), because that is the mechanism a real
@@ -5972,6 +5958,7 @@ mod tests {
     /// a source-grepping guard would match its own justification.
     #[tokio::test]
     async fn create_sm_context_without_supi_is_rejected() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         smf_context_init(64, 256, 512);
         let body = serde_json::json!({
             "pduSessionId": 5,
@@ -6255,11 +6242,6 @@ mod tests {
         }
     }
 
-    /// The lock over the `UDM_SBI_*` / `NRF_URI` environment now lives at the crate
-    /// root, because `udm.rs`'s tests take the SAME one (#79). Re-exported under the
-    /// local name so the call sites below are unchanged.
-    use super::UDM_ENV_TEST_LOCK;
-
     /// **Issue #204, end to end.** `fetch_subscribed_default_dnn` really reaches a
     /// UDM, sends a conformant `Nudm_SDM_Get smf-select-data` with a
     /// percent-encoded `single-nssai`, and returns the flagged DNN.
@@ -6268,7 +6250,7 @@ mod tests {
     /// and the plumbing around it, which is the half a unit test cannot see.
     #[tokio::test]
     async fn fetch_subscribed_default_dnn_queries_the_udm_and_returns_the_flagged_dnn() {
-        let _guard = UDM_ENV_TEST_LOCK.lock().await;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         // The stub UDM is a loopback PLAINTEXT peer, which describes a dev-profile
         // deployment; the default profile is Production and would require client
         // TLS material this test has no business inventing.
@@ -6366,7 +6348,7 @@ mod tests {
     /// REFUSED with a cause that says so — never a silent `"internet"`.
     #[tokio::test]
     async fn dnn_less_create_with_no_udm_is_refused_not_defaulted() {
-        let _guard = UDM_ENV_TEST_LOCK.lock().await;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         std::env::remove_var("UDM_SBI_ADDR");
         std::env::remove_var("UDM_SBI_PORT");
         std::env::remove_var("NRF_URI");
@@ -6419,6 +6401,7 @@ mod tests {
     /// The path portion is extracted from an absolute AMF callback URI.
     #[test]
     fn uri_path_extraction() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.blocking_lock();
         assert_eq!(
             uri_path("http://amf.example:7777/namf-comm/v1/ue-contexts/imsi-1/sm-context-status/7"),
             "/namf-comm/v1/ue-contexts/imsi-1/sm-context-status/7"
@@ -6481,6 +6464,7 @@ mod tests {
     /// handler that parsed nothing.
     #[tokio::test]
     async fn easdf_dns_report_is_attributed_to_its_session() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         seed_binding("easdf-report-ref", 7);
         // Give that session a DNS context id to be matched against.
         if let Ok(ctx) = smf_self().read() {
@@ -6569,8 +6553,9 @@ mod tests {
     /// green (#276).
     #[tokio::test]
     async fn a_failed_establishment_creates_no_easdf_dns_context() {
-        // Lock order (see `pfcp_path::N4_TEST_LOCK`): switch lock first, N4 second.
-        let _g = easdf::SWITCH_LOCK.lock().await;
+        // Lock order (see `context::PROCESS_STATE_TEST_LOCK`): ambient state first,
+        // N4 second — `stand_in` takes the N4 lock on this test's behalf.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _upf = pfcp_path::stand_in::unassociated_upf().await;
         let (nrf, easdf_srv, seen) = easdf::tests::spawn_nrf_and_easdf().await;
         smf_context_init(64, 256, 512);
@@ -6634,8 +6619,9 @@ mod tests {
     /// context that can never match a query.
     #[tokio::test]
     async fn an_established_session_creates_its_easdf_dns_context() {
-        // Lock order (see `pfcp_path::N4_TEST_LOCK`): switch lock first, N4 second.
-        let _g = easdf::SWITCH_LOCK.lock().await;
+        // Lock order (see `context::PROCESS_STATE_TEST_LOCK`): ambient state first,
+        // N4 second — `stand_in` takes the N4 lock on this test's behalf.
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let upf = pfcp_path::stand_in::associated_upf().await;
         let (nrf, easdf_srv, seen) = easdf::tests::spawn_nrf_and_easdf().await;
         smf_context_init(64, 256, 512);
@@ -6690,7 +6676,7 @@ mod tests {
     /// wiring is not", for the third time in this session.
     #[tokio::test]
     async fn releasing_a_session_deletes_its_easdf_dns_context() {
-        let _g = easdf::SWITCH_LOCK.lock().await;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let (nrf, easdf_srv, seen) = easdf::tests::spawn_nrf_and_easdf().await;
 
         seed_binding("easdf-release-ref", 9);
@@ -6735,7 +6721,7 @@ mod tests {
     /// deletes (204). Returns the recorded `(method, uri, body)` list (#293).
     ///
     /// Points `UDM_SBI_*` at itself, which is how both discovery paths find a UDM in
-    /// tests; the caller must hold `crate::UDM_ENV_TEST_LOCK`.
+    /// tests; the caller must hold [`crate::context::PROCESS_STATE_TEST_LOCK`].
     async fn spawn_recording_udm(
         sm_data: serde_json::Value,
     ) -> (
@@ -6897,7 +6883,7 @@ mod tests {
     /// asserted is a recorded HTTP request with the identity in it.
     #[tokio::test]
     async fn releasing_a_session_returns_its_ebi_to_the_amf() {
-        let _g = eps_iwk::SWITCH_LOCK.lock().await;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         eps_iwk::set_for_test(true);
         let (amf, amf_uri, seen) = spawn_recording_amf().await;
@@ -6966,7 +6952,7 @@ mod tests {
     /// even for a binding that carries an EBI from an earlier enabled run.
     #[tokio::test]
     async fn a_disabled_interworking_leg_releases_no_ebi() {
-        let _g = eps_iwk::SWITCH_LOCK.lock().await;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         eps_iwk::set_for_test(false);
         let (amf, amf_uri, seen) = spawn_recording_amf().await;
@@ -6999,7 +6985,7 @@ mod tests {
     /// fails at connect.
     #[tokio::test]
     async fn a_failed_ebi_release_does_not_fail_the_session_release() {
-        let _g = eps_iwk::SWITCH_LOCK.lock().await;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         eps_iwk::set_for_test(true);
 
@@ -7029,8 +7015,7 @@ mod tests {
     /// Lock order (see `pfcp_path::N4_TEST_LOCK`): switch locks first, N4 last.
     #[tokio::test]
     async fn the_create_subscribes_to_sm_data_and_the_release_deregisters_and_unsubscribes() {
-        let _g = udm::SWITCH_LOCK.lock().await;
-        let _env = crate::UDM_ENV_TEST_LOCK.lock().await;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let upf = pfcp_path::stand_in::associated_upf().await;
         let (udm_srv, seen) = spawn_recording_udm(sm_data_with("100 Mbps", "500 Mbps", 7)).await;
@@ -7139,8 +7124,7 @@ mod tests {
     /// PCF the authority and the subscription is one of its inputs.
     #[tokio::test]
     async fn a_sdm_notification_applies_the_changed_ambr_to_a_live_session() {
-        let _g = udm::SWITCH_LOCK.lock().await;
-        let _env = crate::UDM_ENV_TEST_LOCK.lock().await;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         // The UDM now answers with DIFFERENT values from the ones the session holds.
         let (udm_srv, seen) = spawn_recording_udm(sm_data_with("40 Mbps", "80 Mbps", 6)).await;
@@ -7271,8 +7255,7 @@ mod tests {
     /// cannot release during a UDM outage.
     #[tokio::test]
     async fn a_failed_udm_teardown_does_not_fail_the_session_release() {
-        let _g = udm::SWITCH_LOCK.lock().await;
-        let _env = crate::UDM_ENV_TEST_LOCK.lock().await;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         udm::set_for_test(true);
         std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
@@ -7308,8 +7291,7 @@ mod tests {
     /// for a binding that carries a subscription id from an earlier enabled run.
     #[tokio::test]
     async fn a_disabled_udm_leg_neither_deregisters_nor_unsubscribes() {
-        let _g = udm::SWITCH_LOCK.lock().await;
-        let _env = crate::UDM_ENV_TEST_LOCK.lock().await;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (udm_srv, seen) = spawn_recording_udm(sm_data_with("100 Mbps", "500 Mbps", 7)).await;
         udm::set_for_test(false);
@@ -7423,6 +7405,7 @@ mod tests {
     /// container must run the 5GSM procedure, not fall through to `upCnxState`.
     #[tokio::test]
     async fn modify_with_only_an_n1_container_runs_the_release_procedure() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let reference = "n77-release";
         seed_binding(reference, 5);
 
@@ -7567,6 +7550,7 @@ mod tests {
 
     #[tokio::test]
     async fn n1_message_for_an_unknown_context_is_404_and_a_malformed_one_400() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         smf_context_init(64, 256, 512);
         let resp = handle_n1_sm_message(
             "n77-absent",
@@ -7866,6 +7850,7 @@ mod tests {
 
     #[test]
     fn smf_yaml_dns_and_mtu_are_parsed() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.blocking_lock();
         // The shipped docker config has declared these all along; nothing read
         // them, so the UE received no DNS configuration.
         let dir = std::env::temp_dir();
@@ -7940,6 +7925,7 @@ mod tests {
     /// `a_successful_create_registers_an_activated_session_and_its_binding` below.
     #[tokio::test]
     async fn a_failed_create_leaves_no_registered_sm_context() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _upf = pfcp_path::stand_in::unassociated_upf().await;
         smf_context_init(64, 256, 512);
         let supi = "imsi-001010000000086";
@@ -7994,6 +7980,7 @@ mod tests {
     /// executing the step it names, so no early return can satisfy them.
     #[tokio::test]
     async fn a_successful_create_registers_an_activated_session_and_its_binding() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let upf = pfcp_path::stand_in::associated_upf().await;
         smf_context_init(64, 256, 512);
         let supi = "imsi-001010000000290";
@@ -8071,6 +8058,7 @@ mod tests {
     /// separately from the same counter would have left it one behind.
     #[test]
     fn register_sm_context_returns_the_reference_that_resolves_to_it() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.blocking_lock();
         smf_context_init(64, 256, 512);
         let ctx = smf_self();
         let context = ctx.read().expect("context");
@@ -8118,6 +8106,7 @@ mod tests {
     /// registration yields is the one that resolves.
     #[test]
     fn a_registered_session_resolves_by_the_reference_it_minted() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.blocking_lock();
         smf_context_init(64, 256, 512);
         let ctx = smf_self();
         let context = ctx.read().expect("context");
@@ -8154,6 +8143,7 @@ mod tests {
     /// identity — and the unchanged-when-absent half is criterion 5.
     #[tokio::test]
     async fn the_retrieved_ue_eps_pdn_connection_names_the_assigned_ebi() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         use base64::Engine as _;
 
         let without = seed_registered_session("imsi-001010000000123", 7, "internet");
@@ -8384,6 +8374,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn a_released_session_notifies_its_event_subscriber() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
 
         let _g = event_exposure::lock_store();
@@ -8581,6 +8572,7 @@ mod tests {
     /// `404 CONTEXT_NOT_FOUND` for a session that had just been created.
     #[tokio::test]
     async fn retrieve_answers_200_with_ue_eps_pdn_connection() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let reference = seed_registered_session("imsi-001010000000078", 7, "internet");
 
         let resp = handle_sm_context_retrieve(&reference).await;
@@ -8614,6 +8606,7 @@ mod tests {
     /// `application/json` it used to send.
     #[tokio::test]
     async fn retrieve_of_an_unknown_ref_is_404_problem_details() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         smf_context_init(64, 256, 512);
         let resp = handle_sm_context_retrieve("no-such-ref-78").await;
         assert_eq!(resp.status, 404);
@@ -8632,6 +8625,7 @@ mod tests {
     /// everything would satisfy the first alone.
     #[tokio::test]
     async fn update_rejects_an_unknown_ref_and_still_serves_a_known_one() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let reference = seed_registered_session("imsi-001010000000079", 9, "internet");
 
         let unknown = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts/nope-78/modify").with_body(
@@ -8659,6 +8653,7 @@ mod tests {
     /// known one parses `SmContextReleaseData` and answers 204.
     #[tokio::test]
     async fn release_rejects_an_unknown_ref_and_parses_release_data() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let reference = seed_registered_session("imsi-001010000000080", 3, "internet");
 
         let unknown = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts/gone-78/release")
@@ -8727,6 +8722,7 @@ mod tests {
     /// "rejected".
     #[tokio::test]
     async fn n2_handover_states_are_processed_not_refused() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let reference = seed_registered_session("imsi-001010000000081", 5, "internet");
 
         for (info_type, requested, expected) in [
@@ -8766,6 +8762,7 @@ mod tests {
     /// operator unable to tell a switched tunnel from an unswitched one.
     #[tokio::test]
     async fn handover_complete_without_a_target_endpoint_still_completes() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let reference = seed_registered_session("imsi-001010000000082", 6, "internet");
         let req = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts/x/modify").with_body(
             serde_json::json!({
@@ -8872,6 +8869,7 @@ mod tests {
     /// `trigger_service_request` flag, both of which the issue explicitly rules out.
     #[tokio::test]
     async fn a_downlink_data_report_pages_the_ue_via_the_amf() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
         // dev-profile deployment. Declared rather than inherited: the default
         // `SbiProfile` is Production, which would refuse the plaintext connection and
@@ -8974,6 +8972,7 @@ mod tests {
     /// pages" would be satisfied by a version that pages unconditionally.
     #[tokio::test]
     async fn a_downlink_data_report_for_an_active_connection_does_not_page() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         // Drives production peer-call code against a loopback PLAINTEXT peer, i.e. a
         // dev-profile deployment. Declared rather than inherited: the default
         // `SbiProfile` is Production, which would refuse the plaintext connection and
