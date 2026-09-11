@@ -1956,6 +1956,23 @@ impl MmeContext {
     /// Add a new MME UE
     pub fn mme_ue_add(&self, enb_ue_id: u64) -> u64 {
         let id = self.next_pool_id();
+        // #329: the UE's own S11 control-plane TEID, allocated HERE and registered in
+        // the lookup index in the same breath.
+        //
+        // Before this it was never assigned at all: `mme_s11_teid` stayed at
+        // `Default`'s 0, so every Create Session Request carried a Sender F-TEID of 0,
+        // and `mme_s11_teid_hash` had a reader (`mme_ue_find_by_s11_local_teid`) and
+        // **no writer anywhere in the crate** — so that lookup always returned `None`
+        // and every Create Session Response was dropped as matching no UE. The MME
+        // could ask for a session and could not recognise the answer.
+        //
+        // Derived from the pool id rather than from a second counter: the pool id is
+        // already unique per live UE, so the two cannot drift apart, and the index is
+        // keyed by exactly the value the Sender F-TEID carries. The low 32 bits are
+        // taken because a TEID is 32-bit (TS 29.274 §8.22); `saturating_add(1)` keeps
+        // it non-zero, since 0 is what the broken state used and a real peer treats it
+        // as "no TEID assigned".
+        let mme_s11_teid = (id as u32).saturating_add(1);
         let mme_ue = MmeUe {
             id,
             enb_ue_id,
@@ -1964,9 +1981,32 @@ impl MmeContext {
             // E-UTRAN, because S1 is the only access this MME has (#51). Set here
             // rather than left at `Default`'s 0, which is a reserved RAT value.
             rat_type: crate::s11_build::rat_type::EUTRAN,
+            mme_s11_teid,
             ..Default::default()
         };
         self.mme_ue_pool.write().unwrap().insert(id, mme_ue);
+        self.mme_s11_teid_hash
+            .write()
+            .unwrap()
+            .insert(mme_s11_teid, id);
+
+        // #329: the UE's SGW-side context, created WITH the UE rather than on the
+        // Create Session RESPONSE.
+        //
+        // `set_sgw_s11_teid_for_ue` creates one if it is missing, and that was the only
+        // production creator — but it runs on the response path, while
+        // `send_create_session_request` resolves `sgw_ue_find_by_id(mme_ue.sgw_ue_id)`
+        // on the REQUEST path and returned `ContextNotFound` for every attach because
+        // the id was still `NEXTGCORE_INVALID_POOL_ID`. So the MME could not send the
+        // request whose response would have created the context it needed to send it.
+        //
+        // The SGW node id stays invalid: TS 23.401 §4.3.8.1 selects the SGW by TAI/APN
+        // via DNS, which this tree does not implement, so there is no node to point at
+        // yet — the peer comes from `sgwc_list` at send time.
+        // `set_sgw_s11_teid_for_ue`'s create-if-missing branch survives as a fallback
+        // for any UE that predates this.
+        let sgw_ue_id = self.sgw_ue_add(NEXTGCORE_INVALID_POOL_ID);
+        self.sgw_ue_associate_mme_ue(sgw_ue_id, id);
         id
     }
 
@@ -1976,6 +2016,16 @@ impl MmeContext {
             // Remove from hash tables
             if !ue.imsi_bcd.is_empty() {
                 self.imsi_ue_hash.write().unwrap().remove(&ue.imsi_bcd);
+            }
+            // #329: keyed by the REMOVED context's TEID, not by anything re-derived —
+            // the same discipline the IMSI line above follows, and for the same reason
+            // a previous defect here taught (re-deriving the key dropped the surviving
+            // mapping instead of the dead one).
+            if ue.mme_s11_teid != 0 {
+                self.mme_s11_teid_hash
+                    .write()
+                    .unwrap()
+                    .remove(&ue.mme_s11_teid);
             }
             true
         } else {

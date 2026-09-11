@@ -53,8 +53,13 @@ use crate::emm_build::{EmmCause, NAS_PROTOCOL_DISCRIMINATOR_EMM, NAS_PROTOCOL_DI
 use crate::emm_handler;
 use crate::esm_build::{CreateAction, EsmCause};
 use crate::esm_handler;
+use crate::gtp_path;
 use crate::nas_path::{self, GtpCreateAction};
+// #329: `s11_build`'s create action is a THIRD enum with the same purpose as
+// `esm_build::CreateAction` and `nas_path::GtpCreateAction`. Aliased rather than
+// imported bare so the three cannot be confused at a glance in this file.
 use crate::nas_security::{self, SecurityHeaderTypeFlags};
+use crate::s11_build::GtpCreateAction as S11CreateAction;
 use crate::s1ap_build::{self, nas_cause};
 use crate::s1ap_path;
 
@@ -1319,11 +1324,11 @@ pub fn handle_esm_message(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue: &MmeUe, esm:
                         return;
                     }
 
-                    log::info!(
-                        "[{}] PDN connectivity accepted locally; the S11 Create Session Request \
-                         to the SGW is not implemented (#51)",
-                        mme_ue.imsi_bcd
-                    );
+                    // #329: send the Create Session Request. Before this, the branch
+                    // logged "not implemented (#51)" — and #51 had shipped the sender,
+                    // the transaction layer and the transport, leaving only this call
+                    // site, which fell between #51's and #46's scopes.
+                    send_s11_create_session(ctx, enb_ue.id, sess_id, create_action, mme_ue);
                 }
                 Err(e) => {
                     log::warn!(
@@ -1383,11 +1388,21 @@ pub fn handle_esm_message(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue: &MmeUe, esm:
                     if let Some(bearer) = ctx.bearer_pool.write().unwrap().get_mut(&bearer_id) {
                         bearer.t3489.pkbuf = None;
                     }
-                    log::info!(
-                        "[{}] ESM information complete; the S11 Create Session Request to the \
-                         SGW is not implemented (#51)",
-                        mme_ue.imsi_bcd
-                    );
+                    // #329: the deferred half of the PDN Connectivity Request. The UE
+                    // withheld its APN and sent it here (TS 24.301 §6.5.1.2), so this
+                    // is where that session finally has enough to ask the SGW.
+                    //
+                    // The create action is re-derived from the EMM procedure rather
+                    // than carried from the PDN Connectivity Request: the ESM
+                    // Information Response arrives on the same EMM procedure, and
+                    // re-reading it keeps one rule for both sites instead of a stored
+                    // copy that can go stale.
+                    let create_action = match mme_ue.nas_eps.type_ {
+                        MmeEpsType::AttachRequest => CreateAction::InAttachRequest,
+                        MmeEpsType::TauRequest => CreateAction::InTauRequest,
+                        _ => CreateAction::InPdnConnectivityRequest,
+                    };
+                    send_s11_create_session(ctx, enb_ue.id, sess_id, create_action, mme_ue);
                 }
                 Err(e) => log::warn!(
                     "[{}] ESM Information Response rejected: {e}",
@@ -1603,6 +1618,61 @@ fn locate_session(ctx: &MmeContext, mme_ue_id: u64, pti: u8, ebi: u8) -> Option<
         .sess_find_by_id(sess_id)
         .and_then(|sess| sess.bearer_list.first().copied())?;
     Some((sess_id, bearer_id))
+}
+
+/// Ask the Serving GW to create the session's bearers over S11 (#329,
+/// TS 23.401 §5.3.2.1 step 4).
+///
+/// Called from the two points where the ESM procedure has everything the Create
+/// Session Request needs: a PDN Connectivity Request that carried its APN, and the
+/// ESM Information Response that supplied one withheld from it. Both used to log
+/// "the S11 Create Session Request to the SGW is not implemented (#51)" — and #51 had
+/// in fact shipped the sender, the sequencing and the transport, leaving only this
+/// call.
+///
+/// # Why the create action is mapped rather than passed through
+///
+/// The tree has THREE parallel create-action enums: `esm_build::CreateAction` (what
+/// the ESM handlers take), `nas_path::GtpCreateAction` (what the ESM builders take)
+/// and `s11_build::GtpCreateAction` (what the S11 builder takes). They are not
+/// interchangeable and none is a superset — `s11_build`'s has `UplinkNasTransport` and
+/// `PathSwitchRequest`, the others have `InPdnConnectivityRequest` and `InHandover`.
+/// Unifying them is a separate change with its own blast radius; mapping explicitly
+/// here at least puts the correspondence in one readable place instead of leaving the
+/// next reader to infer it.
+///
+/// A failure is logged and NOT propagated to the UE as a reject. TS 23.401 has the MME
+/// wait for the SGW; the ESM procedure is still open and its T3485/T3489 timers govern
+/// what happens when no answer arrives, so synthesising a reject here would race them.
+fn send_s11_create_session(
+    ctx: &MmeContext,
+    enb_ue_id: u64,
+    sess_id: u64,
+    create_action: CreateAction,
+    mme_ue: &MmeUe,
+) {
+    let gtp_action = match create_action {
+        CreateAction::InAttachRequest => S11CreateAction::AttachRequest,
+        CreateAction::InTauRequest => S11CreateAction::TrackingAreaUpdate,
+        // A standalone PDN Connectivity Request arrives in an Uplink NAS Transport,
+        // which is exactly what TS 29.274's create action distinguishes it by.
+        CreateAction::InPdnConnectivityRequest => S11CreateAction::UplinkNasTransport,
+        CreateAction::InHandover => S11CreateAction::PathSwitchRequest,
+    };
+
+    match gtp_path::send_create_session_request(ctx, enb_ue_id, sess_id, gtp_action) {
+        Ok(xact) => log::info!(
+            "[{}] S11 Create Session Request sent to the SGW (action={gtp_action:?}, \
+             local S11 TEID {:#x})",
+            mme_ue.imsi_bcd,
+            xact.local_teid
+        ),
+        Err(e) => log::error!(
+            "[{}] S11 Create Session Request could not be sent: {e:?} — the ESM \
+             procedure stays open and its timer governs the outcome",
+            mme_ue.imsi_bcd
+        ),
+    }
 }
 
 /// Send ESM INFORMATION REQUEST, arming T3489's retransmission buffer.
@@ -2664,6 +2734,139 @@ mod tests {
             .unwrap()
             .sess_list
             .is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // The attach path's S11 Create Session Request (#329)
+    // ------------------------------------------------------------------
+
+    /// The criterion this issue exists for: driving a real PDN Connectivity Request
+    /// through the NAS dispatch makes a Create Session Request reach the wire.
+    ///
+    /// Before #329 this branch logged "the S11 Create Session Request to the SGW is not
+    /// implemented (#51)" and returned — so `gtp_path::send_create_session_request` had
+    /// no caller at all and no attach could complete. A test that called the sender
+    /// directly would have passed against that state, which is why this one starts from
+    /// an uplink NAS PDU.
+    ///
+    /// It is also the ONLY test in this crate that installs the process-wide S11 server:
+    /// `S11_SERVER` is a `OnceLock`, so a second installer would silently use the
+    /// first's socket and assert about a sibling's traffic. It therefore also carries
+    /// the correlation assertions, rather than leaving those to a second install.
+    #[test]
+    fn the_pdn_connectivity_path_sends_a_create_session_request() {
+        use nextgcore_gtp::v2::{Gtp2IeType, Gtp2Message};
+
+        let _guard = crate::gtp_path::lock_s11();
+        crate::gtp_path::clear_pending_creates_for_test();
+
+        // A stand-in SGW-C that only receives, plus the MME's real S11 socket.
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("peer bind");
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("peer timeout");
+        let peer_addr = peer.local_addr().expect("peer addr");
+        let server = crate::gtp_path::GtpcServer::open(
+            "127.0.0.1:0",
+            nextgcore_gtp::v2::xact::Gtp2XactConfig::default(),
+            7,
+        )
+        .expect("S11 bind");
+        if !crate::gtp_path::install_server(server) {
+            // A sibling installed first; this test would then be asserting about that
+            // socket rather than its own. Skipped rather than made flaky.
+            return;
+        }
+
+        let mut ctx = test_ctx();
+        ctx.sgwc_list = vec![peer_addr];
+        let enb_ue_id = enb_with_connection(&ctx);
+        let mme_ue_id = ue_with_vector(&ctx, enb_ue_id);
+
+        // A real ATTACH REQUEST first, so the UE's EMM procedure IS an attach. Without
+        // it `mme_ue.nas_eps.type_` is unset and the create action derives to
+        // `UplinkNasTransport` — correct for a standalone PDN connectivity request, but
+        // not the path this issue is about.
+        nas_eps_handle_uplink(
+            &ctx,
+            uplink(
+                enb_ue_id,
+                &attach_request(&[0x08, 0x29, 0x43, 0x65, 0x87, 0x09, 0x21, 0x43], &[]),
+            ),
+        );
+
+        // Establish the security context the ESM handler requires.
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &authentication_response()));
+        assert!(
+            ctx.mme_ue_find_by_id(mme_ue_id)
+                .unwrap()
+                .security_context_available,
+            "precondition: the ESM handler refuses without a security context"
+        );
+
+        // A well-formed PDN CONNECTIVITY REQUEST: PDN type IPv4 (high nibble 1) and
+        // request type 1 (initial request), then an APN IE so the request is complete
+        // and does NOT divert into an ESM Information Request instead.
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        let mut esm = vec![
+            NAS_PROTOCOL_DISCRIMINATOR_ESM,
+            7, // procedure transaction identity
+            EsmMessageType::PdnConnectivityRequest as u8,
+            0x11, // PDN type IPv4 | request type 1
+            0x28, // Access Point Name IEI
+        ];
+        let apn = b"\x08internet";
+        esm.push(apn.len() as u8);
+        esm.extend_from_slice(apn);
+        let protected = protect_uplink(&mme_ue, 1, &esm);
+
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &protected));
+
+        // The CSR must be on the wire.
+        let mut buf = [0u8; 4096];
+        let (len, _) = peer
+            .recv_from(&mut buf)
+            .expect("a Create Session Request must reach the SGW-C");
+        let mut bytes = bytes::Bytes::copy_from_slice(&buf[..len]);
+        let received = Gtp2Message::decode(&mut bytes).expect("the CSR must decode");
+        assert_eq!(
+            received.header.message_type,
+            crate::s11_build::message_type::CREATE_SESSION_REQUEST,
+            "the NAS path must send a Create Session Request, not some other message"
+        );
+
+        // The Sender F-TEID must carry a REAL S11 TEID. Before #329 `mme_s11_teid` was
+        // never assigned, so this was 0 and no response could be attributed to a UE.
+        let fteid = nextgcore_gtp::v2::Gtp2FTeidIe::decode(
+            &received
+                .get_ie(Gtp2IeType::FTeid as u8, 0)
+                .expect("Sender F-TEID is mandatory")
+                .value,
+        )
+        .expect("the F-TEID must decode");
+        assert_ne!(
+            fteid.teid, 0,
+            "the Sender F-TEID must name a real TEID: 0 is the pre-#329 value and \\
+             mme_s11_teid_hash cannot resolve it"
+        );
+        assert_eq!(
+            ctx.mme_ue_find_by_s11_local_teid(fteid.teid),
+            Some(mme_ue_id),
+            "and that TEID must resolve back to this UE, which is what lets the \\
+             Create Session Response be attributed"
+        );
+
+        // The pending record must be keyed by the sequence number that went out, and
+        // must name an ATTACH (the UE's EMM procedure), so the response continues to an
+        // Attach Accept rather than to nothing.
+        let pending = crate::gtp_path::take_pending_create(received.header.sequence_number)
+            .expect("the wire sequence number must be the record's key");
+        assert_eq!(
+            pending.create_action,
+            crate::s11_build::GtpCreateAction::AttachRequest
+        );
+        assert_eq!(pending.enb_ue_id, enb_ue_id);
+
+        crate::gtp_path::clear_pending_creates_for_test();
     }
 
     #[test]
