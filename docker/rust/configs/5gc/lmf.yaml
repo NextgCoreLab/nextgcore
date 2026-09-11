@@ -10,3 +10,19 @@ lmf:
         port: 7777
   nrf:
     uri: http://172.23.0.10:7777
+  # #103: cell/TRP reference coordinates. Every geometric solver reads these; with
+  # none configured DetermineLocation is refused (it does not fabricate a fix), and
+  # with fewer than three only E-CID is selectable however high the requested
+  # accuracy. Commented out because the matched-simulator E2E path does not run
+  # positioning and these coordinates would be fictional for it -- uncomment and
+  # replace with the real cell positions for a deployment that uses LCS.
+  # positioning:
+  #   cells:
+  #     - id: pci-42        # the key measurement reports use (NR-CGI or pci-<n>)
+  #       lat: 37.5665
+  #       lon: 126.9780
+  #       height: 38.0      # optional, metres above the WGS-84 ellipsoid
+  #   trps:
+  #     - id: trp-1
+  #       lat: 37.5670
+  #       lon: 126.9790

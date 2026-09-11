@@ -36,6 +36,11 @@ pub mod cause {
     pub const LOCATION_TRANSFER_NOT_SUPPORTED: &str = "LOCATION_TRANSFER_NOT_SUPPORTED";
     pub const INSUFFICIENT_RESOURCES: &str = "INSUFFICIENT_RESOURCES";
     pub const EVENT_REPORT_UNRECOGNIZED: &str = "EVENT_REPORT_UNRECOGNIZED";
+    /// TS 29.572 Table 6.1.7.3-1 (`29572-k00.txt:7672`): **501 Not Implemented** —
+    /// "The request for creation of a subscription is rejected because none of the
+    /// events is supported by the LMF." #103 uses it for the area- and motion-event
+    /// deferred LDRs, which this LMF cannot arm.
+    pub const UNSUPPORTED_EVENT_TYPE: &str = "UNSUPPORTED_EVENT_TYPE";
     pub const LOCATION_MEASUREMENT_UNKNOWN: &str = "LOCATION_MEASUREMENT_UNKNOWN";
     /// #104: the cause for a `404` on a UP-location subscription that does not
     /// exist (TS 29.572 §6.1.4.9). `up-unsubscribe` previously answered `204` for

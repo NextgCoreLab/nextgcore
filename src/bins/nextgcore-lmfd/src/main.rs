@@ -30,10 +30,12 @@ mod context;
 // AMF, N1N2MessageSubscribe registration, multipart N1N2MessageTransfer POST).
 mod namf_client;
 mod nlmf;
-// lmfd-08: real multilateration solvers (ECID / Multi-RTT / TDOA / AoA).
-// Wired into `context::compute_location`; solve_tdoa remains available for
-// lmfd-05/06 (NRPPa TDOA) but is not yet called (dead_code = "allow").
+mod nrppa_downlink; // #103: LMF-initiated NRPPa toward NG-RAN
+                    // lmfd-08: real multilateration solvers (ECID / Multi-RTT / TDOA / AoA).
+                    // Wired into `context::compute_location`; solve_tdoa remains available for
+                    // lmfd-05/06 (NRPPa TDOA) but is not yet called (dead_code = "allow").
 mod positioning;
+mod site_config; // #103: cell/TRP coordinates from configuration
 
 pub use context::*;
 
@@ -221,6 +223,32 @@ async fn main() -> Result<()> {
     log::info!("Location Management Function (3GPP TS 23.273)");
 
     lmf_context_init(args.max_measurements);
+
+    // #103: load the cell/TRP reference points BEFORE the SBI server accepts a
+    // DetermineLocation, so no request is answered against a half-filled registry.
+    // Every geometric solver reads this; before #103 the only writer was test code,
+    // so a deployed LMF could never produce a fix.
+    let site_config = site_config::load_into_context(&args.config);
+    // #103: the NRPPa downlink is new external N2 signalling, so it is gated and
+    // resolved once before anything can be served.
+    nrppa_downlink::init_from_env();
+    // One line an operator can act on, stated once at startup rather than discovered
+    // per request: with no reference points, DetermineLocation refuses (it does not
+    // fabricate), and with fewer than three no multilateration method is selectable
+    // however high the requested accuracy.
+    if site_config.is_empty() {
+        log::warn!(
+            "LMF positioning is NON-FUNCTIONAL: no reference points configured, so every \
+             DetermineLocation will be refused with 500 POSITIONING_FAILED"
+        );
+    } else if site_config.len() < crate::codec_glue::MIN_POINTS_FOR_MULTILATERATION {
+        log::warn!(
+            "LMF positioning has {} reference point(s): fewer than {} means only E-CID is \
+             selectable, so a high-accuracy LCS QoS will be answered by a Timing-Advance ring",
+            site_config.len(),
+            crate::codec_glue::MIN_POINTS_FOR_MULTILATERATION
+        );
+    }
 
     // A7 (lmfd-11): the bespoke/debug ingest routes are OFF unless explicitly
     // enabled. Default-off is the fail-closed direction; positioning is not on
@@ -772,6 +800,35 @@ async fn initiate_positioning(
         )));
     };
 
+    // #103 criterion 2: refuse LOUDLY when no reference points are configured, before
+    // spending an AMF discovery, an LPP transfer and the whole wait budget to arrive
+    // at the same answer. Every geometric solver reads the registry, so with it empty
+    // no fix is possible for any UE, any method and any amount of waiting. The problem
+    // detail names the configuration rather than saying "positioning failed", because
+    // the operator's action is to provision coordinates.
+    //
+    // AFTER the target-identity check, not before: a request carrying no target is a
+    // 400 whatever the deployment looks like, and validating the REQUEST before the
+    // DEPLOYMENT is the order a consumer can reason about. Putting this first made
+    // `test_determine_location_no_target_identity_400` answer 500 whenever no sibling
+    // test had seeded coordinates -- a real ordering bug, caught by a 20-run loop
+    // rather than by the single green run that preceded it.
+    let reference_points = match lmf_self().read() {
+        Ok(context) => context.reference_point_count(),
+        Err(_) => 0,
+    };
+    if reference_points == 0 {
+        log::error!(
+            "DetermineLocation refused: the cell/TRP reference-point registry is EMPTY, so no \
+             location fix can be solved. Provision lmf.positioning.cells / .trps."
+        );
+        return Err(Box::new(problem(
+            500,
+            nlmf::cause::POSITIONING_FAILED,
+            "No cell or TRP reference points are configured (lmf.positioning.cells / .trps), so              no location fix can be solved for any UE",
+        )));
+    }
+
     // Serving-AMF discovery (TS 29.510). Fail-closed: unreachable NRF or no
     // AMF instance means the user cannot be reached for positioning.
     let Some(amf) = namf_client::discover_amf(input.amf_id.as_deref()).await else {
@@ -782,8 +839,23 @@ async fn initiate_positioning(
         )));
     };
 
+    // #103 criterion 4: the requested method now follows the LCS QoS, the number of
+    // configured reference points and the UE's reported LPP capability, instead of
+    // being E-CID unconditionally.
+    let qos = positioning_qos_from_input(input);
+    let capability = match (input.supi.as_deref(), lmf_self().read()) {
+        (Some(supi), Ok(context)) => context.ue_lpp_capability(supi),
+        _ => crate::codec_glue::UeLppCapability::Unknown,
+    };
+    let method = crate::codec_glue::select_lpp_method(qos, reference_points, capability);
+    log::info!(
+        "DetermineLocation: selected LPP method {} (qos={qos:?}, {reference_points} reference \
+         point(s), UE capability {capability:?})",
+        method.as_spec_str()
+    );
+
     let txn = LPP_TRANSACTION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let lpp_pdu = match crate::codec_glue::build_lpp_ecid_request(txn) {
+    let lpp_pdu = match crate::codec_glue::build_lpp_request(method, txn) {
         Ok(pdu) => pdu,
         Err(e) => {
             return Err(Box::new(problem(
@@ -796,10 +868,20 @@ async fn initiate_positioning(
 
     // Measurement-store entry + correlation session, registered BEFORE the
     // POST (TS 29.572 CorrelationID minted inside; TS 37.355 txn indexed).
-    let qos = positioning_qos_from_input(input);
+    // `PositioningMethod` (TS 23.273 6.1, the measurement-store enum) has one
+    // `NrBased` variant covering DL-TDOA/UL-TDOA/DL-AoD/UL-AoA/Multi-RTT, so both
+    // multilateration methods map onto it. The finer distinction lives in
+    // `LppMethod`, which is what the request body and the response's
+    // `positioningMethod` are built from.
+    let stored_method = match method {
+        crate::codec_glue::LppMethod::Ecid => PositioningMethod::Ecid,
+        crate::codec_glue::LppMethod::MultiRtt | crate::codec_glue::LppMethod::DlTdoa => {
+            PositioningMethod::NrBased
+        }
+    };
     let registered = match lmf_self().read() {
         Ok(context) => context
-            .measurement_request(0, PositioningMethod::Ecid, None, None, qos)
+            .measurement_request(0, stored_method, None, None, qos)
             .map(|req| {
                 context.positioning_session_register(input.supi.clone(), txn, req.request_id)
             }),
@@ -821,6 +903,30 @@ async fn initiate_positioning(
         .ok()
         .and_then(|c| c.nf_instance_id())
         .unwrap_or_else(|| "nextgcore-lmf".to_string());
+
+    // #103 criterion 3: solicit the gNB half of the measurement over NRPPa, BEFORE
+    // the LPP transfer asks the UE for its half — TS 23.273 §6.11.2 has the LMF
+    // initiate the E-CID measurement toward NG-RAN, and a report that arrives before
+    // the request was sent cannot be correlated.
+    //
+    // Best-effort and deliberately not fatal: the NRPPa leg IMPROVES a fix (the gNB's
+    // Rx-Tx half, the TA, the serving cell as NG-RAN sees it) while the LPP leg is
+    // what asks for the measurements a fix needs at all. A gNB that declines NRPPa
+    // must not fail a request the UE could still answer.
+    if nrppa_downlink::enabled() {
+        match nrppa_downlink::build_ecid_measurement_initiation(NRPPA_UE_MEASUREMENT_ID) {
+            Ok((nrppa_txn, nrppa_pdu)) => {
+                let outcome =
+                    namf_client::send_n2_nrppa_transfer(&amf, target, &corr, &lmf_id, nrppa_pdu)
+                        .await;
+                log::info!(
+                    "NRPPa E-CID Measurement Initiation (transaction {nrppa_txn:?}) toward the \
+                     serving gNB: {outcome:?}"
+                );
+            }
+            Err(e) => log::warn!("NRPPa E-CID Measurement Initiation not sent: {e}"),
+        }
+    }
 
     match namf_client::send_n1n2_transfer(&amf, target, &corr, &lmf_id, lpp_pdu).await {
         namf_client::TransferOutcome::Initiated => Ok((corr, rx)),
@@ -846,6 +952,18 @@ async fn initiate_positioning(
         }
     }
 }
+
+/// The `LMF-UE-MeasurementID` this LMF uses for its NRPPa E-CID measurements (#103).
+///
+/// Fixed at 1 rather than allocated per session: TS 38.455 constrains the IE to
+/// 1..=15, and this LMF has one outstanding NRPPa E-CID measurement per UE at a time
+/// (the request is sent inside `initiate_positioning`, which is per-request). A
+/// per-session allocator over 15 values would need a free-list and a release path,
+/// which nothing here has, and exhausting it would fail requests that currently
+/// succeed. The consequence — two concurrent positioning requests for DIFFERENT UEs
+/// share the id — is safe because the id is scoped to the NG-RAN/UE association, not
+/// to the LMF.
+const NRPPA_UE_MEASUREMENT_ID: u16 = 1;
 
 /// Map `InputData` QoS hints onto the internal [`PositioningQos`].
 fn positioning_qos_from_input(input: &nlmf::InputData) -> PositioningQos {
@@ -1024,8 +1142,7 @@ async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
     if input.ue_location_service_ind.as_deref()
         == Some(nlmf::ue_location_service_ind::LOCATION_ASSISTANCE_DATA)
     {
-        log::info!("MO-LR location-assistance-data delivery -> 204 No Content");
-        return SbiResponse::no_content();
+        return handle_mo_lr_assistance_data(request, &input).await;
     }
 
     // A5: MO-LR flow — the UE's own LPP PDU is carried in a
@@ -1055,6 +1172,41 @@ async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
     if let (Some(ldr_type), Some(ldr_ref)) =
         (input.ldr_type.as_deref(), input.ldr_reference.as_deref())
     {
+        // #103 criterion 6: an area- or motion-event LDR is REFUSED rather than
+        // registered and answered 200.
+        //
+        // It used to be registered and answered 200 while nothing ever armed it in
+        // the UE and nothing ever reported it — "the worst failure mode for a
+        // location service, because the AMF/GMLC believe the request succeeded",
+        // which is #103's own description of the defect. Arming it needs UE-side
+        // event detection over LPP that does not exist here, and the alternative to
+        // building it is to say so.
+        //
+        // 501 with `UNSUPPORTED_EVENT_TYPE` is the spec's own answer for exactly
+        // this: TS 29.572 Table 6.1.7.3-1 defines it as "the request for creation of
+        // a subscription is rejected because none of the events is supported by the
+        // LMF". Not a 400 (the request is well-formed) and not a 403 (nothing is
+        // forbidden) — the LMF has not implemented it.
+        if matches!(
+            ldr_type,
+            nlmf::ldr_type::ENTERING_INTO_AREA
+                | nlmf::ldr_type::LEAVING_FROM_AREA
+                | nlmf::ldr_type::BEING_INSIDE_AREA
+                | nlmf::ldr_type::MOTION
+        ) {
+            log::warn!(
+                "deferred LDR [{ldr_ref}] of type {ldr_type} refused: this LMF cannot arm \
+                 area- or motion-event triggers (no UE-side event detection), so accepting it \
+                 would promise reports that never arrive"
+            );
+            return problem(
+                501,
+                nlmf::cause::UNSUPPORTED_EVENT_TYPE,
+                &format!(
+                    "ldrType {ldr_type} requires UE-side event detection that this LMF does not                      implement; PERIODIC deferred location is supported"
+                ),
+            );
+        }
         let periodic = periodic_reporting_from_input(&input);
         if let Ok(c) = lmf_self().read() {
             c.register_ldr(LdrContext {
@@ -1066,9 +1218,13 @@ async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
             });
         }
         // A8: only PERIODIC + periodicEventInfo + a reachable H-GMLC callback +
-        // a target SUPI drives the trigger scheduler. Anything else registers
-        // the context only (areaEventInfo/motionEventInfo triggers are SCOPED
-        // OUT — they need UE-side event detection).
+        // a target SUPI drives the trigger scheduler. The area- and motion-event
+        // types no longer reach here at all — #103 refuses them above — so what
+        // remains unarmed is `UE_AVAILABLE`, which registers the context only. That
+        // one is left registered rather than refused because its trigger source is a
+        // DIFFERENT NF: TS 23.273 has the AMF report UE reachability, so the LMF
+        // waiting for it is the right shape and the gap is the AMF subscription, not
+        // a missing UE capability. Named here rather than left to be discovered.
         if ldr_type == nlmf::ldr_type::PERIODIC {
             match (
                 periodic,
@@ -1162,6 +1318,132 @@ fn find_binary_part(request: &SbiRequest, content_id: &str) -> Option<Vec<u8>> {
 /// 200 `LocationDataExt`; no solvable fix → 500 `POSITIONING_FAILED`
 /// (never a fabricated coordinate). No `LmfContext` lock is held across the
 /// await (the completion receiver is moved out of the lock scope).
+/// MO-LR requesting **location assistance data** (#103 criterion 5, TS 23.273 §6.2,
+/// TS 37.355 §5.2).
+///
+/// Before #103 this logged a line and answered 204 without looking at the UE's PDU:
+/// a UE asking for assistance data got a success carrying nothing, which is the
+/// worst failure mode for a location service because the UE believes it was served.
+///
+/// Now: decode the UE's `RequestAssistanceData`, build a real
+/// `ProvideAssistanceData` carrying a GNSS reference location derived from the
+/// configured reference points, and deliver it over the same N1 path the
+/// network-initiated leg uses. 204 remains the answer to the AMF — the assistance
+/// data goes to the UE, not into the DetermineLocation response — but it is a 204
+/// that means something happened.
+///
+/// A UE that supplied no PDU still gets assistance: TS 23.273 §6.2 has the request
+/// arrive over NAS, and a consumer that sets `ueLocationServiceInd` without attaching
+/// the UE's LPP message is asking on the UE's behalf. In that case the LMF answers on
+/// transaction 0 rather than refusing, and says so.
+async fn handle_mo_lr_assistance_data(
+    request: &SbiRequest,
+    input: &nlmf::InputData,
+) -> SbiResponse {
+    // #103 criterion 2 applies here too: assistance data IS a reference location, so
+    // with no reference points there is nothing to send.
+    let reference = match lmf_self().read() {
+        Ok(context) => context.reference_centroid(),
+        Err(_) => None,
+    };
+    let Some((lat, lon, spread_m)) = reference else {
+        log::error!(
+            "MO-LR assistance data refused: no cell/TRP reference points are configured, so \
+             there is no reference location to provide"
+        );
+        return problem(
+            500,
+            nlmf::cause::POSITIONING_FAILED,
+            "No cell or TRP reference points are configured (lmf.positioning.cells / .trps), so              no GNSS reference location can be provided",
+        );
+    };
+
+    // Decode the UE's request when one was attached, so the response answers the
+    // right transaction. A body that is present but is NOT a RequestAssistanceData is
+    // a client error: answering it with assistance data would be answering a question
+    // that was not asked.
+    let txn = match input
+        .lpp_message
+        .as_ref()
+        .and_then(|r| find_binary_part(request, &r.content_id))
+    {
+        Some(bytes) => match crate::codec_glue::decode_lpp_request_assistance_data(&bytes) {
+            Ok(txn) => txn,
+            Err(e) => {
+                return problem(
+                    400,
+                    nlmf::cause::MANDATORY_IE_INCORRECT,
+                    &format!("InputData.lppMessage is not an LPP RequestAssistanceData: {e}"),
+                )
+            }
+        },
+        None => {
+            log::info!(
+                "MO-LR assistance data: no UE LPP message attached; answering on transaction 0"
+            );
+            0
+        }
+    };
+
+    let pdu = match crate::codec_glue::build_lpp_provide_assistance_data(txn, lat, lon, spread_m) {
+        Ok(pdu) => pdu,
+        Err(e) => {
+            return problem(
+                500,
+                nlmf::cause::POSITIONING_FAILED,
+                &format!("LPP ProvideAssistanceData encode failed: {e}"),
+            )
+        }
+    };
+
+    // Deliver it to the UE over the same N1 path the network-initiated leg uses. A
+    // failure here is reported rather than swallowed: a 204 for assistance data that
+    // never left the LMF is the defect being removed.
+    let Some(target) = input
+        .supi
+        .as_deref()
+        .or(input.gpsi.as_deref())
+        .or(input.pei.as_deref())
+    else {
+        return problem(
+            400,
+            nlmf::cause::MANDATORY_IE_MISSING,
+            "InputData carries no target UE identity (supi, gpsi or pei)",
+        );
+    };
+    let Some(amf) = namf_client::discover_amf(input.amf_id.as_deref()).await else {
+        return problem(
+            504,
+            nlmf::cause::UNREACHABLE_USER,
+            "No serving AMF with namf-comm discoverable via the NRF",
+        );
+    };
+    let lmf_id = lmf_self()
+        .read()
+        .ok()
+        .and_then(|c| c.nf_instance_id())
+        .unwrap_or_else(|| "nextgcore-lmf".to_string());
+    let corr = format!("assist-{}", uuid::Uuid::new_v4());
+    match namf_client::send_n1n2_transfer(&amf, target, &corr, &lmf_id, pdu).await {
+        namf_client::TransferOutcome::Initiated => {
+            log::info!(
+                "MO-LR assistance data delivered: GNSS reference location                  ({lat:.6}, {lon:.6}) ±{spread_m:.0} m on LPP transaction {txn}"
+            );
+            SbiResponse::no_content()
+        }
+        namf_client::TransferOutcome::UeNotReachable => problem(
+            504,
+            nlmf::cause::UNREACHABLE_USER,
+            "The serving AMF reports the target UE is not reachable (UE_NOT_REACHABLE)",
+        ),
+        namf_client::TransferOutcome::Failed(e) => problem(
+            504,
+            nlmf::cause::UNREACHABLE_USER,
+            &format!("Assistance-data N1N2MessageTransfer failed: {e}"),
+        ),
+    }
+}
+
 async fn handle_mo_lr_lpp(request: &SbiRequest, input: &nlmf::InputData) -> SbiResponse {
     // Collect every referenced LPP part (primary + extensions), in order.
     let mut refs: Vec<&nlmf::RefToBinaryData> = Vec::new();
@@ -3282,6 +3564,21 @@ mod tests {
     #[tokio::test]
     async fn test_determine_location_unreachable_amf_504_unreachable_user() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        // #103: seed a reference point, because the live procedure now refuses with
+        // 500 BEFORE AMF discovery when the registry is empty. This test used to reach
+        // AMF discovery only because a SIBLING happened to have seeded coordinates --
+        // neither `init` nor `fini` clears the registry -- so it was ordering-coupled
+        // and #103's own registry-clearing test exposed it. Seeded here so it fails at
+        // AMF discovery for its own reason.
+        lmf_context_init(1024);
+        {
+            let ctx = lmf_self();
+            let guard = ctx.read().expect("context");
+            guard.set_cell_coord(
+                "amf-unreachable-cell",
+                crate::positioning::TrpCoord::new(37.5, 126.9, 0.0),
+            );
+        }
         // A SUPI never seeded by any test: no per-SUPI stored fix exists, so
         // the handler runs the live procedure and fails at AMF discovery.
         let body = r#"{ "supi": "imsi-001010000000404" }"#;
@@ -3431,6 +3728,19 @@ mod tests {
     #[tokio::test]
     async fn test_determine_location_ageless_stored_fix_not_served() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        // #103: seed a reference point, for the same reason as
+        // `test_determine_location_never_serves_another_ues_report` -- the live
+        // procedure refuses with 500 before AMF discovery on an empty registry, and
+        // this test asserts the 504 it gets AFTER discovery fails.
+        {
+            let ctx = lmf_self();
+            let guard = ctx.read().expect("context");
+            guard.set_cell_coord(
+                "ageless-fix-cell",
+                crate::positioning::TrpCoord::new(37.5, 126.9, 0.0),
+            );
+        }
         // timestamp 0 = capture instant unknown -> age cannot be honoured ->
         // the live procedure runs (and 504s here: no AMF discoverable).
         seed_fix_at("imsi-001010000000409", 40.0, 0);
@@ -3449,6 +3759,19 @@ mod tests {
     async fn test_determine_location_never_serves_another_ues_report() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
+        // #103: seed a reference point. The live procedure now refuses with 500 BEFORE
+        // AMF discovery when the registry is empty, and neither `init` nor `fini`
+        // clears the registry -- so this test used to reach AMF discovery only because
+        // a SIBLING had seeded coordinates. That coupling made it fail about 1 run in
+        // 8 once #103 added a test that clears the registry.
+        {
+            let ctx = lmf_self();
+            let guard = ctx.read().expect("context");
+            guard.set_cell_coord(
+                "mt-lr-isolation-cell",
+                crate::positioning::TrpCoord::new(37.5, 126.9, 0.0),
+            );
+        }
         // Complete a measurement report (for some unrelated request) so a
         // "global newest report" exists — the retired latest_location fallback
         // would have served it to ANY supi.
@@ -4218,17 +4541,444 @@ mod tests {
         );
     }
 
-    // -- lmfd#1: 204 assistance-data branch -----------------------------------
+    // -- #103: config-loaded coordinates, method selection, LDR refusal --------
 
+    /// #103 criteria 1 and 7: coordinates loaded from CONFIGURATION reach the solver,
+    /// with no `#[cfg(test)]` writer involved.
+    ///
+    /// The registry is filled by `site_config::load_into_context` reading a real file,
+    /// and the fix is then produced by `measurement_report` — the same runtime path a
+    /// DetermineLocation drives. Before #103 the only writer was test code, so a
+    /// deployed LMF's registry was always empty.
     #[tokio::test]
-    async fn test_determine_location_assistance_data_204() {
+    async fn coordinates_from_a_config_file_reach_the_solver() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        lmf_self()
+            .read()
+            .expect("context")
+            .clear_cell_registry_for_test();
+
+        // A real file, read by the real loader. Three cells so the E-CID solver has a
+        // serving cell and the registry has a usable origin.
+        let path = std::env::temp_dir().join(format!(
+            "nextgcore-lmf-site-{}-{}.yaml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(
+            &path,
+            r#"
+lmf:
+  positioning:
+    cells:
+      - id: pci-501
+        lat: 37.5000
+        lon: 126.9000
+      - id: pci-502
+        lat: 37.5050
+        lon: 126.9100
+    trps:
+      - id: pci-503
+        lat: 37.5100
+        lon: 126.9200
+"#,
+        )
+        .expect("write config");
+
+        let cfg = site_config::load_into_context(&path.to_string_lossy());
+        let _ = std::fs::remove_file(&path);
+        assert!(cfg.rejected.is_empty(), "{:?}", cfg.rejected);
+        assert_eq!(cfg.cells.len(), 2);
+        assert_eq!(cfg.trps.len(), 1);
+
+        let count = lmf_self().read().expect("context").reference_point_count();
+        assert_eq!(
+            count, 3,
+            "cells AND trps both land in the registry the solvers read"
+        );
+
+        // The runtime path: a measurement report against a configured cell yields a
+        // real fix. No test-only writer touched the registry.
+        let request_id = {
+            let ctx = lmf_self();
+            let guard = ctx.read().expect("context");
+            guard
+                .measurement_request(
+                    0,
+                    PositioningMethod::Ecid,
+                    None,
+                    None,
+                    PositioningQos::BestEffort,
+                )
+                .expect("measurement store has room")
+                .request_id
+        };
+        let fix = lmf_self()
+            .read()
+            .expect("context")
+            .measurement_report(
+                request_id,
+                vec![context::CellMeasurement {
+                    nr_cgi: "pci-501".to_string(),
+                    rsrp: Some(-80),
+                    rsrq: None,
+                    timing_advance: Some(4),
+                    aoa: None,
+                    rtt_ns: None,
+                    rstd_ns: None,
+                }],
+            )
+            .expect(
+                "a report against a CONFIGURED cell must produce a fix -- this is the whole \
+                 point of #103 criterion 1",
+            );
+        assert!(
+            (fix.latitude - 37.5).abs() < 0.5 && (fix.longitude - 126.9).abs() < 0.5,
+            "the fix must be near the configured cell, got ({}, {})",
+            fix.latitude,
+            fix.longitude
+        );
+        assert_ne!(
+            (fix.latitude, fix.longitude),
+            (0.0, 0.0),
+            "lat/lon 0,0 is the heuristic placeholder's signature and must never appear"
+        );
+    }
+
+    /// The ordering interlock: a request with NO target identity is a 400 even with an
+    /// empty registry.
+    ///
+    /// The registry check ran first in the first draft, which made this answer 500
+    /// whenever no sibling test had seeded coordinates -- a real ordering bug that a
+    /// single green run hid and a 20-run loop caught. Validating the REQUEST before the
+    /// DEPLOYMENT is the order a consumer can reason about, and this pins it.
+    #[tokio::test]
+    async fn a_request_with_no_target_is_400_even_with_an_empty_registry() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        lmf_self()
+            .read()
+            .expect("context")
+            .clear_cell_registry_for_test();
+
+        let req = SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(
+            r#"{"externalClientType":"EMERGENCY_SERVICES"}"#,
+            "application/json",
+        );
+        let resp = handle_determine_location(&req).await;
+        assert_eq!(
+            resp.status, 400,
+            "a malformed request is a client error whatever the deployment looks like"
+        );
+    }
+
+    /// #103 criterion 2: with no coordinates configured, DetermineLocation fails
+    /// LOUDLY and names the configuration, instead of returning a placeholder.
+    #[tokio::test]
+    async fn determine_location_with_no_reference_points_refuses_and_says_why() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        lmf_self()
+            .read()
+            .expect("context")
+            .clear_cell_registry_for_test();
+
+        let body = r#"{"supi":"imsi-001010000000103","locationQoS":{"hAccuracy":5.0}}"#;
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
+        let resp = handle_determine_location(&req).await;
+        assert_eq!(resp.status, 500);
+        let detail = resp.http.content.clone().unwrap_or_default();
+        assert!(
+            detail.contains("POSITIONING_FAILED"),
+            "TS 29.572 Table 6.1.7.3-1 cause, got {detail}"
+        );
+        assert!(
+            detail.contains("lmf.positioning.cells"),
+            "the detail must name the configuration to provision, not just say 'failed'; got \
+             {detail}"
+        );
+    }
+
+    /// #103 criterion 4: a high-accuracy QoS selects a NON-E-CID method, and E-CID is
+    /// only the fallback.
+    ///
+    /// Every branch of the rule is exercised as the SOLE reason for its outcome, so a
+    /// branch that is written and then ignored fails this rather than passing on
+    /// another branch's work.
+    #[test]
+    fn the_positioning_method_follows_qos_capability_and_the_registry() {
+        use crate::codec_glue::{select_lpp_method, LppMethod, UeLppCapability};
+
+        // High accuracy, enough reference points, capability unknown -> Multi-RTT.
+        assert_eq!(
+            select_lpp_method(PositioningQos::HighAccuracy, 3, UeLppCapability::Unknown),
+            LppMethod::MultiRtt,
+            "answering a <=10 m request with E-CID commits to an accuracy a TA ring cannot \
+             deliver"
+        );
+        assert_eq!(
+            select_lpp_method(PositioningQos::Emergency, 5, UeLppCapability::Unknown),
+            LppMethod::MultiRtt,
+            "an emergency fix is a high-accuracy fix"
+        );
+
+        // Same QoS, TOO FEW reference points -> E-CID fallback. The registry is the
+        // sole difference.
+        assert_eq!(
+            select_lpp_method(PositioningQos::HighAccuracy, 2, UeLppCapability::Unknown),
+            LppMethod::Ecid,
+            "two known positions cannot be multilaterated against, whatever the QoS asks"
+        );
+
+        // Same QoS, enough points, UE says E-CID only -> E-CID. Capability is the sole
+        // difference.
+        assert_eq!(
+            select_lpp_method(PositioningQos::HighAccuracy, 3, UeLppCapability::EcidOnly),
+            LppMethod::Ecid,
+            "asking a UE for a method it has said it cannot perform gets an empty report"
+        );
+
+        // Low latency prefers the cheapest measurement, not the most accurate.
+        assert_eq!(
+            select_lpp_method(PositioningQos::LowLatency, 9, UeLppCapability::Unknown),
+            LppMethod::Ecid,
+            "LOW_DELAY is a statement about time, and PRS scheduling is not fast"
+        );
+        assert_eq!(
+            select_lpp_method(PositioningQos::BestEffort, 9, UeLppCapability::Unknown),
+            LppMethod::Ecid
+        );
+
+        // The selected method changes the ENCODED REQUEST, not just a log line.
+        let ecid = crate::codec_glue::build_lpp_request(LppMethod::Ecid, 1).expect("encode");
+        let multi = crate::codec_glue::build_lpp_request(LppMethod::MultiRtt, 1).expect("encode");
+        let tdoa = crate::codec_glue::build_lpp_request(LppMethod::DlTdoa, 1).expect("encode");
+        assert_ne!(ecid, multi, "a Multi-RTT request must not encode as E-CID");
+        assert_ne!(multi, tdoa);
+        assert_ne!(ecid, tdoa);
+    }
+
+    /// #103 criterion 6: an area- or motion-event LDR is refused with a
+    /// spec-compliant error, not accepted and never reported.
+    #[tokio::test]
+    async fn area_and_motion_ldrs_are_refused_with_unsupported_event_type() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        {
+            let ctx = lmf_self();
+            let guard = ctx.read().expect("context");
+            guard.clear_cell_registry_for_test();
+            // Coordinates present, so a refusal cannot be mistaken for criterion 2's.
+            guard.set_cell_coord(
+                "ldr-cell",
+                crate::positioning::TrpCoord::new(37.5, 126.9, 0.0),
+            );
+        }
+
+        for ldr_type in [
+            nlmf::ldr_type::ENTERING_INTO_AREA,
+            nlmf::ldr_type::LEAVING_FROM_AREA,
+            nlmf::ldr_type::BEING_INSIDE_AREA,
+            nlmf::ldr_type::MOTION,
+        ] {
+            let body = format!(
+                r#"{{"supi":"imsi-001010000000103","ldrType":"{ldr_type}","ldrReference":"ldr-1"}}"#
+            );
+            let req = SbiRequest::post("/nlmf-loc/v1/determine-location")
+                .with_body(body, "application/json");
+            let resp = handle_determine_location(&req).await;
+            assert_eq!(
+                resp.status, 501,
+                "{ldr_type} must be 501 Not Implemented (TS 29.572 UNSUPPORTED_EVENT_TYPE), not \
+                 a 200 promising reports that never arrive"
+            );
+            let detail = resp.http.content.clone().unwrap_or_default();
+            assert!(
+                detail.contains("UNSUPPORTED_EVENT_TYPE"),
+                "{ldr_type}: got {detail}"
+            );
+            // And it must NOT have been registered: a refused request that left a
+            // context behind would be cancellable and reportable, which is the
+            // half-accepted state this replaces.
+            assert!(
+                lmf_self()
+                    .read()
+                    .expect("context")
+                    .ldr_find("ldr-1")
+                    .is_none(),
+                "{ldr_type} was refused, so no LDR context may remain"
+            );
+        }
+    }
+
+    /// The interlock: a PERIODIC LDR is still accepted. Without this, "refuse the
+    /// unarmed types" could be satisfied by refusing every deferred LDR, which would
+    /// break the one deferred flow that genuinely works.
+    #[tokio::test]
+    async fn a_periodic_ldr_is_still_accepted() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        {
+            let ctx = lmf_self();
+            let guard = ctx.read().expect("context");
+            guard.clear_cell_registry_for_test();
+            guard.set_cell_coord(
+                "periodic-cell",
+                crate::positioning::TrpCoord::new(37.5, 126.9, 0.0),
+            );
+        }
+        let body = r#"{"supi":"imsi-001010000000104","ldrType":"PERIODIC","ldrReference":"ldr-p"}"#;
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
+        let resp = handle_determine_location(&req).await;
+        assert_ne!(
+            resp.status, 501,
+            "PERIODIC deferred location works and must not be swept up in the refusal"
+        );
+        assert!(
+            lmf_self()
+                .read()
+                .expect("context")
+                .ldr_find("ldr-p")
+                .is_some(),
+            "a PERIODIC LDR must still register its reporting context"
+        );
+    }
+
+    // -- #103: the assistance-data branch now DELIVERS something ---------------
+    //
+    // This replaces `test_determine_location_assistance_data_204`, which asserted a
+    // bare 204 with NO coordinates configured. That 204 was the defect #103 names:
+    // "callers receive 2xx success for MO-LR assistance-data requests that silently
+    // did nothing". Pinning it would have pinned the bug, so the assertion changed
+    // direction rather than being deleted -- the two tests below cover both sides.
+
+    /// With no reference points configured there is no reference location to
+    /// provide, so the request is refused LOUDLY instead of answered 204.
+    #[tokio::test]
+    async fn assistance_data_with_no_reference_points_is_refused() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        // Neither init nor fini clears the cell registry, so a sibling's scene has to
+        // be removed explicitly -- see `PROCESS_STATE_TEST_LOCK`'s correction note.
+        lmf_self()
+            .read()
+            .expect("context")
+            .clear_cell_registry_for_test();
         let body =
             r#"{"supi":"imsi-001010000000012","ueLocationServiceInd":"LOCATION_ASSISTANCE_DATA"}"#;
         let req =
             SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
         let resp = handle_determine_location(&req).await;
-        assert_eq!(resp.status, 204);
+        assert_eq!(
+            resp.status, 500,
+            "a 204 here would tell the AMF the UE was served assistance data that does not exist"
+        );
+        let detail = resp.http.content.clone().unwrap_or_default();
+        assert!(
+            detail.contains("reference points"),
+            "the problem detail must name the configuration an operator has to fix, got {detail}"
+        );
+    }
+
+    /// #103 criterion 5: with coordinates configured, the request produces a
+    /// NON-EMPTY LPP `ProvideAssistanceData` rather than a bare 204.
+    ///
+    /// Asserted on the encoded PDU rather than through the SBI handler, because the
+    /// delivery leg needs an AMF and the criterion is about the payload. The handler's
+    /// refusal path is covered above, and the encode is what "non-empty
+    /// assistance-data response" means.
+    #[tokio::test]
+    async fn assistance_data_encodes_a_reference_location_from_the_configured_cells() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        {
+            let ctx = lmf_self();
+            let guard = ctx.read().expect("context");
+            guard.clear_cell_registry_for_test();
+            guard.set_cell_coord(
+                "assist-cell-1",
+                crate::positioning::TrpCoord::new(37.5000, 126.9000, 0.0),
+            );
+            guard.set_cell_coord(
+                "assist-cell-2",
+                crate::positioning::TrpCoord::new(37.5100, 126.9200, 0.0),
+            );
+        }
+        let (lat, lon, spread) = lmf_self()
+            .read()
+            .expect("context")
+            .reference_centroid()
+            .expect("two cells are configured, so there is a centroid");
+        assert!(
+            (lat - 37.505).abs() < 1e-6 && (lon - 126.91).abs() < 1e-6,
+            "the centroid must be the mean of the configured points, got ({lat}, {lon})"
+        );
+        assert!(
+            spread > 0.0,
+            "two separated points have a non-zero spread, which is the honest uncertainty"
+        );
+
+        let pdu = crate::codec_glue::build_lpp_provide_assistance_data(9, lat, lon, spread)
+            .expect("encode");
+        assert!(
+            !pdu.is_empty(),
+            "the criterion is a NON-EMPTY assistance-data response"
+        );
+
+        // Decoded, so the assertion is about the message rather than about some bytes.
+        let decoded = nextgcore_asn1c::lpp::message::LppMessage::decode(&pdu)
+            .expect("the emitted PDU must decode");
+        assert_eq!(
+            decoded
+                .transaction_id
+                .as_ref()
+                .map(|t| t.transaction_number.0),
+            Some(9),
+            "the response must answer the UE's transaction, or the UE discards it"
+        );
+        let body = decoded.message_body.expect("a c1 body");
+        let nextgcore_asn1c::lpp::message::LppMessageBody::C1(c1) = body else {
+            panic!("expected a c1 body");
+        };
+        let nextgcore_asn1c::lpp::message::MessageBodyC1::ProvideAssistanceData(pad) = c1 else {
+            panic!("expected ProvideAssistanceData");
+        };
+        let a_gnss = pad.ies.a_gnss.expect("a-gnss assistance is present");
+        let common = a_gnss
+            .gnss_common_assist_data
+            .expect("gnssCommonAssistData is present");
+        let reference = common
+            .gnss_reference_location
+            .expect("the reference LOCATION is the assistance this LMF can honestly provide");
+        assert_ne!(
+            reference.three_d_location.degrees_latitude, 0,
+            "a zero latitude would mean the centroid never reached the encoder"
+        );
+        assert_eq!(
+            reference.three_d_location.confidence, 68,
+            "one standard deviation, matching the northbound encoder's convention"
+        );
+    }
+
+    /// A body that is present but is not a `RequestAssistanceData` is a client error.
+    /// Answering it with assistance data would be answering a question nobody asked.
+    #[test]
+    fn a_non_assistance_lpp_body_is_not_treated_as_a_request() {
+        let request_location =
+            crate::codec_glue::build_lpp_request(crate::codec_glue::LppMethod::Ecid, 5)
+                .expect("encode");
+        let err = crate::codec_glue::decode_lpp_request_assistance_data(&request_location)
+            .expect_err("a RequestLocationInformation is not a RequestAssistanceData");
+        assert!(
+            err.contains("RequestLocationInformation"),
+            "the error must say what arrived instead, got {err}"
+        );
     }
 
     // -- lmfd#1: deferred LDR registers context and is cancellable -----------
@@ -5760,6 +6510,18 @@ mod positioning_chain_strict_peer {
 
         lmf_context_init(1024);
         prime_lmf_self();
+        // #103: seed a reference point. The live procedure refuses with 500 before any
+        // peer is contacted when the registry is empty, and `lmf_context_init` now
+        // clears it in test builds -- so a test that must reach the AMF has to provision
+        // its own scene rather than inherit a sibling's.
+        {
+            let ctx = lmf_self();
+            let guard = ctx.read().expect("context");
+            guard.set_cell_coord(
+                "chain-reference-cell",
+                crate::positioning::TrpCoord::new(37.5, 126.9, 0.0),
+            );
+        }
         seed_amf_connected_ue(&supi);
         let (amf_server, nrf_server, _tap_rx) = start_positioning_harness(supi.clone()).await;
 
@@ -5788,6 +6550,18 @@ mod positioning_chain_strict_peer {
 
         lmf_context_init(1024);
         prime_lmf_self();
+        // #103: seed a reference point. The live procedure refuses with 500 before any
+        // peer is contacted when the registry is empty, and `lmf_context_init` now
+        // clears it in test builds -- so a test that must reach the AMF has to provision
+        // its own scene rather than inherit a sibling's.
+        {
+            let ctx = lmf_self();
+            let guard = ctx.read().expect("context");
+            guard.set_cell_coord(
+                "chain-reference-cell",
+                crate::positioning::TrpCoord::new(37.5, 126.9, 0.0),
+            );
+        }
         seed_amf_connected_ue(&supi);
         let (amf_server, nrf_server, mut tap_rx) = start_positioning_harness(supi.clone()).await;
 
