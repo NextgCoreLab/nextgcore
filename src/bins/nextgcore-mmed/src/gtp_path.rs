@@ -83,6 +83,103 @@ pub fn server() -> Option<&'static GtpcServer> {
     S11_SERVER.get()
 }
 
+/// What a sent Create Session Request was for, so its response can continue the
+/// procedure that started it (#329).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingCreate {
+    /// The EMM/ESM procedure that triggered the request.
+    pub create_action: GtpCreateAction,
+    /// The eNB UE context the continuation has to answer on.
+    pub enb_ue_id: u64,
+    /// The session the response's PAA and bearer TEIDs belong to.
+    pub sess_id: u64,
+}
+
+/// Pending Create Session Requests, keyed by S11 sequence number.
+///
+/// # Why this exists at all
+///
+/// `send_create_session_request` returns a `GtpXactData` carrying the create action
+/// and the eNB UE id, and the caller was expected to hold it — but it had **no
+/// caller**, so nothing did (#329). The response path
+/// (`s11_handler::dispatch_triggered`) receives only the raw bytes, the message type,
+/// the sequence number and the peer, so without this it cannot tell an attach's
+/// Create Session Response from a TAU's, and would either answer every one with an
+/// Attach Accept or none.
+///
+/// Keyed by SEQUENCE NUMBER because that is what the transaction layer already
+/// correlates on (`GtpcInner::match_response`), so there is one notion of "which
+/// request is this the answer to" rather than two that can disagree. Keyed by the
+/// local TEID instead would collapse two concurrent requests for the same UE.
+///
+/// Entries are TAKEN, not read: a response consumes its record, so a retransmitted
+/// or duplicated response cannot drive the continuation twice.
+static PENDING_CREATES: OnceLock<Mutex<HashMap<u32, PendingCreate>>> = OnceLock::new();
+
+fn pending_creates() -> &'static Mutex<HashMap<u32, PendingCreate>> {
+    PENDING_CREATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record what a Create Session Request at `seq` was for.
+fn record_pending_create(seq: u32, pending: PendingCreate) {
+    if let Ok(mut map) = pending_creates().lock() {
+        map.insert(seq, pending);
+    }
+}
+
+/// Take the record for the Create Session Request at `seq`, if this MME sent one.
+///
+/// `None` means either that the response is for a request this MME did not send, or
+/// that its record was already consumed — both of which are reasons NOT to continue a
+/// procedure, which is why the caller treats them the same way.
+pub fn take_pending_create(seq: u32) -> Option<PendingCreate> {
+    pending_creates().lock().ok()?.remove(&seq)
+}
+
+/// Serialises every test that installs the process-wide S11 server, touches the MME
+/// context's GTP-C configuration, or drives the S11 response path.
+///
+/// Declared beside the globals it guards rather than inside a `mod tests`, per #308,
+/// and `pub(crate)` so `s11_handler`'s tests share THIS lock: the globals involved are
+/// `S11_SERVER`, `PENDING_CREATES`, and `mme_self()`'s UE/session/bearer pools plus its
+/// `gtpc_list` / `sgwc_list`, and they cannot be guarded separately. A second lock over
+/// the same variables would be two disjoint agreements rather than one — #276 showed
+/// that mistake HANGS the suite rather than merely flaking it, which is why this is
+/// promoted here instead of re-declared in `s11_handler` (#329).
+#[cfg(test)]
+pub(crate) static S11_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`S11_TEST_LOCK`], recovering from a poisoned guard so one failing test does
+/// not cascade into every sibling.
+#[cfg(test)]
+pub(crate) fn lock_s11() -> std::sync::MutexGuard<'static, ()> {
+    S11_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Record a pending create without sending anything.
+///
+/// Test-only. The response path's behaviour turns entirely on whether a record exists
+/// and what create action it names, and driving that through a real socket send would
+/// make every response-side test also a transport test — so this seeds the one input
+/// the response path reads. Callers hold [`S11_TEST_LOCK`].
+#[cfg(test)]
+pub(crate) fn record_pending_create_for_test(seq: u32, pending: PendingCreate) {
+    record_pending_create(seq, pending);
+}
+
+/// Drop every pending record.
+///
+/// Declared here beside the map rather than in a `mod tests`: it is process-global, so
+/// a test that mutates it races every sibling that reads it, and a second lock
+/// declared elsewhere would be a second agreement rather than one. Callers hold
+/// [`S11_TEST_LOCK`].
+#[cfg(test)]
+pub fn clear_pending_creates_for_test() {
+    if let Ok(mut map) = pending_creates().lock() {
+        map.clear();
+    }
+}
+
 /// Send `msg` as an initial message to the configured Serving GW.
 ///
 /// One place resolves the peer and reports the two ways a send can fail before it
@@ -671,6 +768,18 @@ pub fn send_create_session_request(
     let xact_id = ctx.next_pool_id();
     send_to_sgwc(ctx, &msg, xact_id)?;
 
+    // #329: record what this request was for BEFORE returning, so the response path
+    // can continue the procedure. Recorded after the send succeeds: a request that
+    // never left would leave a record no response can ever consume.
+    record_pending_create(
+        seq,
+        PendingCreate {
+            create_action,
+            enb_ue_id,
+            sess_id,
+        },
+    );
+
     Ok(GtpXactData {
         xact_id,
         create_action: Some(create_action),
@@ -1141,17 +1250,8 @@ const GTP_CMD_XACT_ID_FLAG: u64 = 0x8000_0000_0000_0000;
 mod tests {
     use super::*;
 
-    /// Serialises every test that installs the process-wide S11 server or touches the
-    /// MME context's GTP-C configuration.
-    ///
-    /// Declared beside the globals it guards rather than in a submodule, per #308: the
-    /// `S11_SERVER` `OnceLock` and `mme_self()`'s `gtpc_list` / `sgwc_list` are
-    /// process-wide, and a test that binds a socket while a sibling is reading the
-    /// peer list gets the sibling's answer.
-    static S11_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn lock_s11() -> std::sync::MutexGuard<'static, ()> {
-        S11_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        super::lock_s11()
     }
 
     #[test]

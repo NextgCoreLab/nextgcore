@@ -606,14 +606,31 @@ pub fn build_activate_default_bearer_context_request(
     sess: &MmeSess,
     create_action: crate::nas_path::GtpCreateAction,
 ) -> Vec<u8> {
-    // Get default bearer from session (first bearer)
+    // The bearer this message activates.
+    //
+    // #329: `sess.session.as_ref()...expect("value expected")` used to be here, and it
+    // was a REACHABLE PANIC — `sess.session` is the subscription record, absent for any
+    // session the HSS has not populated, and this function is on the Attach Accept path.
+    // It survived only because that path had no caller (see the issue). A crashing MME
+    // is strictly worse than one that activates a bearer with default QoS and says so.
+    let subscribed_qos = sess.session.as_ref().map(|s| s.qos.clone());
+    if subscribed_qos.is_none() {
+        log::warn!(
+            "session for APN '{}' carries no subscribed QoS; activating the default \
+             bearer with default QoS values",
+            sess.apn
+        );
+    }
     let default_bearer = MmeBearer {
-        ebi: 5, // Default EBI
-        qos: sess
-            .session
-            .as_ref()
-            .map(|s| s.qos.clone())
-            .expect("value expected"),
+        // EBI 5 is the lowest value TS 24.007 §11.2.3.1.5 assigns to an EPS bearer, so
+        // it is the right FALLBACK for a caller that has no bearer to name — but a
+        // caller that does have one should use
+        // `build_activate_default_bearer_context_request_with_params` and pass it,
+        // which is what the Attach Accept path now does (#329). Leaving this to
+        // fabricate an EBI for that path made the UE bind whatever bearer the message
+        // named rather than the one the MME had created.
+        ebi: 5,
+        qos: subscribed_qos.unwrap_or_default(),
         ..Default::default()
     };
 

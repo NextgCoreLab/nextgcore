@@ -281,10 +281,18 @@ pub fn nas_eps_send_attach_accept(
 
     log::debug!("[{}] Attach accept", mme_ue.imsi_bcd);
 
-    // Build ESM activate default bearer context request
-    let esm_message = esm_build::build_activate_default_bearer_context_request(
+    // Build ESM activate default bearer context request.
+    //
+    // #329: `_with_params` and the REAL `default_bearer`, not the simplified helper.
+    // That helper fabricates `ebi: 5` because it has no bearer to name, and this
+    // function is handed the actual default bearer — so the simplified call made the
+    // Attach Accept tell the UE to bind EBI 5 whatever the MME had actually created,
+    // and the E-RAB in the enclosing Initial Context Setup (built from
+    // `default_bearer` a few lines below) could then name a different one.
+    let esm_message = esm_build::build_activate_default_bearer_context_request_with_params(
         sess,
-        GtpCreateAction::InAttachRequest,
+        default_bearer,
+        esm_build::CreateAction::InAttachRequest,
     );
 
     // Build EMM attach accept with ESM message
