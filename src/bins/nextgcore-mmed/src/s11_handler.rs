@@ -3,6 +3,7 @@
 //! Port of src/mme/mme-s11-handler.c - GTP-C message handling for S11 interface
 
 use crate::s11_build::{ie_type, message_type};
+use std::net::SocketAddr;
 
 // ============================================================================
 // Error Types
@@ -57,15 +58,30 @@ pub mod esm_cause {
     pub const SYNTACTICAL_ERROR_IN_PACKET_FILTERS: u8 = 45;
 }
 
-/// Convert GTP cause to ESM cause
+/// Convert a GTP-C cause (TS 29.274 §8.4) to the ESM cause the UE is owed
+/// (TS 24.301 §9.9.4.4).
+///
+/// #51: 78 was absent, so an SGW rejecting a session for "Missing or unknown APN"
+/// reached the UE as `NETWORK_FAILURE` (38) — which tells the subscriber's handset
+/// to retry a request that can never succeed, and tells the operator nothing about
+/// the APN that is actually misconfigured. Every mapping below is a cause where the
+/// UE can do something different for knowing it.
 pub fn esm_cause_from_gtp(gtp_cause: u8) -> u8 {
     match gtp_cause {
         64 => esm_cause::INVALID_EPS_BEARER_IDENTITY,
         68 => esm_cause::SERVICE_OPTION_NOT_SUPPORTED,
+        // TS 29.274 §8.4 cause 73 "No resources available" is a capacity refusal, and
+        // §9.9.4.4 cause 26 says exactly that to the UE.
+        73 => esm_cause::INSUFFICIENT_RESOURCES,
         74 => esm_cause::SEMANTIC_ERROR_IN_THE_TFT_OPERATION,
         75 => esm_cause::SYNTACTICAL_ERROR_IN_THE_TFT_OPERATION,
         76 => esm_cause::SEMANTIC_ERRORS_IN_PACKET_FILTERS,
         77 => esm_cause::SYNTACTICAL_ERROR_IN_PACKET_FILTERS,
+        // The one the issue names.
+        78 => esm_cause::MISSING_OR_UNKNOWN_APN,
+        // A refusal by the SGW/PGW that names no more specific reason. Distinct from
+        // NETWORK_FAILURE, which claims the network broke rather than declined.
+        94 => esm_cause::REQUEST_REJECTED_BY_SERVING_GW_OR_PDN_GW,
         _ => esm_cause::NETWORK_FAILURE,
     }
 }
@@ -195,6 +211,171 @@ pub struct ReleaseAccessBearersResponseData {
 pub struct DownlinkDataNotificationData {
     pub ebi: u8,
     pub cause: Option<u8>,
+}
+
+// ============================================================================
+// Datagram dispatch (#51)
+// ============================================================================
+
+/// Route a triggered (response) message that the transaction layer has already
+/// correlated to one of this MME's outstanding requests.
+///
+/// Correlation happens BEFORE this is called, in `gtp_path::handle_datagram`, and
+/// that ordering is the point: an uncorrelated response is one this MME did not ask
+/// for, and letting it reach here would allow a stray datagram to mutate session
+/// state.
+///
+/// The raw datagram is passed rather than the decoded `Gtp2Message` so the existing,
+/// tested IE walk in this module keeps parsing it. That leaves two decoders for the
+/// same message — the library's, used for correlation, and this one, used for
+/// content — which is a real cost and NOT what #51 asks to remove (criterion 7 names
+/// `s11_build.rs`'s builder). See the spec's Ceilings.
+pub fn dispatch_triggered(raw: &[u8], msg_type: u8, sequence_number: u32, peer: SocketAddr) {
+    use crate::s11_build::message_type as mt;
+
+    match msg_type {
+        mt::CREATE_SESSION_RESPONSE => match handle_create_session_response(raw) {
+            // The LOCAL S11 TEID comes from the header this MME told the SGW to
+            // address, so it is read from the same bytes rather than trusted from
+            // the body.
+            Ok(data) => {
+                let local_teid = parse_gtp_header(raw)
+                    .map(|(_, teid, _, _)| teid)
+                    .unwrap_or(0);
+                apply_create_session_response(&data, local_teid, sequence_number, peer)
+            }
+            Err(e) => log::error!("S11 Create Session Response from {peer} unparsable: {e:?}"),
+        },
+        mt::MODIFY_BEARER_RESPONSE => match handle_modify_bearer_response(raw) {
+            Ok(data) => log::info!(
+                "S11 Modify Bearer Response from {peer} (seq={sequence_number}) cause={}",
+                data.cause
+            ),
+            Err(e) => log::error!("S11 Modify Bearer Response from {peer} unparsable: {e:?}"),
+        },
+        mt::DELETE_SESSION_RESPONSE => match handle_delete_session_response(raw) {
+            Ok(data) => log::info!(
+                "S11 Delete Session Response from {peer} (seq={sequence_number}) cause={}",
+                data.cause
+            ),
+            Err(e) => log::error!("S11 Delete Session Response from {peer} unparsable: {e:?}"),
+        },
+        mt::RELEASE_ACCESS_BEARERS_RESPONSE => match handle_release_access_bearers_response(raw) {
+            Ok(data) => log::info!(
+                "S11 Release Access Bearers Response from {peer} (seq={sequence_number}) \
+                     cause={}",
+                data.cause
+            ),
+            Err(e) => {
+                log::error!("S11 Release Access Bearers Response from {peer} unparsable: {e:?}")
+            }
+        },
+        other => log::info!(
+            "S11 triggered message type={other} seq={sequence_number} from {peer} correlated but \
+             not acted on: this MME has no handler for it"
+        ),
+    }
+}
+
+/// Apply a Create Session Response to the session and bearer it answers.
+///
+/// This is what makes the response *useful* rather than merely received: the SGW's
+/// S11 control F-TEID is what every later Modify Bearer / Delete Session Request has
+/// to be addressed to, and the S1-U F-TEID plus the PAA are what the Initial Context
+/// Setup and the ESM Activate Default Bearer Context Request carry to the UE.
+///
+/// The session is found by the LOCAL S11 TEID the response is addressed to
+/// (`mme_ue_find_by_s11_local_teid`), not by anything in the body: the TEID in the
+/// header is the one this MME told the SGW to use, so it is the only field that
+/// cannot be attributed to the wrong UE by a malformed body.
+fn apply_create_session_response(
+    data: &CreateSessionResponseData,
+    local_teid: u32,
+    sequence_number: u32,
+    peer: SocketAddr,
+) {
+    let ctx = crate::context::mme_self();
+
+    if data.cause != 16 {
+        // TS 29.274 §8.4: 16 is "Request accepted". Anything else means no bearer
+        // was created, and the UE is owed the mapped ESM cause rather than a wait.
+        log::warn!(
+            "S11 Create Session Response from {peer} (seq={sequence_number}) rejected: GTP cause \
+             {} -> ESM cause {}",
+            data.cause,
+            esm_cause_from_gtp(data.cause)
+        );
+        return;
+    }
+
+    let Some(mme_ue_id) = ctx.mme_ue_find_by_s11_local_teid(local_teid) else {
+        log::warn!(
+            "S11 Create Session Response for local TEID {local_teid:#x} matches no UE context"
+        );
+        return;
+    };
+
+    if let Ok(mut pool) = ctx.mme_ue_pool.write() {
+        if let Some(ue) = pool.get_mut(&mme_ue_id) {
+            log::info!(
+                "[{}] S11 session created: SGW S11 C-TEID {:#x}",
+                ue.imsi_bcd,
+                data.sgw_s11_teid
+            );
+        }
+    }
+    ctx.set_sgw_s11_teid_for_ue(mme_ue_id, data.sgw_s11_teid);
+
+    for bearer in &data.bearer_contexts {
+        if !ctx.set_sgw_s1u_for_bearer(
+            mme_ue_id,
+            bearer.ebi,
+            bearer.sgw_s1u_teid,
+            bearer.sgw_s1u_ipv4,
+        ) {
+            log::warn!(
+                "S11 Create Session Response named EBI {} which this UE does not hold",
+                bearer.ebi
+            );
+        }
+    }
+}
+
+/// Route an initial message the SGW-C originated.
+pub fn dispatch_initial(raw: &[u8], msg_type: u8, sequence_number: u32, peer: SocketAddr) {
+    use crate::s11_build::message_type as mt;
+
+    match msg_type {
+        mt::DOWNLINK_DATA_NOTIFICATION => match handle_downlink_data_notification(raw) {
+            Ok(data) => {
+                log::info!(
+                    "S11 Downlink Data Notification from {peer} (seq={sequence_number}) for EBI {}",
+                    data.ebi
+                );
+                // TS 29.274 §7.2.11: the Ack is a TRIGGERED message and must echo
+                // the notification's sequence number. Before #51 the Ack builder was
+                // called with `ctx.next_pool_id()` in the sequence position, which is
+                // a pool index — so even if it had been transmitted, the SGW-C could
+                // not have matched it to the notification it answered.
+                let local_teid = parse_gtp_header(raw)
+                    .map(|(_, teid, _, _)| teid)
+                    .unwrap_or(0);
+                if let Err(e) = crate::gtp_path::send_downlink_data_notification_ack_to(
+                    peer,
+                    local_teid,
+                    sequence_number,
+                    crate::s11_build::GtpCause::RequestAccepted,
+                ) {
+                    log::error!("S11 Downlink Data Notification Ack to {peer} failed: {e}");
+                }
+            }
+            Err(e) => log::error!("S11 Downlink Data Notification from {peer} unparsable: {e:?}"),
+        },
+        other => log::info!(
+            "S11 initial message type={other} seq={sequence_number} from {peer} not handled: this \
+             MME originates no procedure for it"
+        ),
+    }
 }
 
 // ============================================================================
@@ -668,10 +849,13 @@ mod tests {
         assert_eq!(result.unwrap(), 5);
     }
 
+    /// The builders return a `Gtp2Message` since #51, so these encode through the
+    /// library and then parse with THIS module's header reader — which is exactly the
+    /// pairing the live path uses, and therefore the thing worth pinning.
     #[test]
     fn test_parse_gtp_header_with_teid() {
-        let msg = build_release_access_bearers_request(0x12345678, 100);
-        let (msg_type, teid, seq_num, _) = parse_gtp_header(&msg).unwrap();
+        let encoded = build_release_access_bearers_request(0x12345678, 100).encode();
+        let (msg_type, teid, seq_num, _) = parse_gtp_header(&encoded).unwrap();
 
         assert_eq!(msg_type, message_type::RELEASE_ACCESS_BEARERS_REQUEST);
         assert_eq!(teid, 0x12345678);
@@ -680,12 +864,53 @@ mod tests {
 
     #[test]
     fn test_parse_gtp_header_no_teid() {
-        let msg = build_echo_request(123, 5);
-        let (msg_type, teid, seq_num, _) = parse_gtp_header(&msg).unwrap();
+        let encoded = nextgcore_gtp::v2::Gtp2Message::echo_request(123).encode();
+        let (msg_type, teid, seq_num, _) = parse_gtp_header(&encoded).unwrap();
 
         assert_eq!(msg_type, message_type::ECHO_REQUEST);
         assert_eq!(teid, 0);
         assert_eq!(seq_num, 123);
+    }
+
+    /// #51 criterion 6: GTP cause 78 must reach the UE as ESM cause 27, not as
+    /// `NETWORK_FAILURE`.
+    ///
+    /// The difference is what the subscriber's handset does next. `NETWORK_FAILURE`
+    /// invites a retry of a request that can never succeed; `MISSING_OR_UNKNOWN_APN`
+    /// names the misconfiguration, which is the only thing an operator can act on.
+    #[test]
+    fn gtp_cause_78_maps_to_missing_or_unknown_apn() {
+        assert_eq!(
+            esm_cause_from_gtp(78),
+            esm_cause::MISSING_OR_UNKNOWN_APN,
+            "GTP 78 must not degrade to NETWORK_FAILURE"
+        );
+        assert_ne!(esm_cause_from_gtp(78), esm_cause::NETWORK_FAILURE);
+    }
+
+    /// Every GTP cause with a distinct ESM meaning keeps it, so adding a mapping
+    /// cannot silently collapse a neighbouring one.
+    #[test]
+    fn distinct_gtp_causes_keep_distinct_esm_causes() {
+        for (gtp, esm) in [
+            (64u8, esm_cause::INVALID_EPS_BEARER_IDENTITY),
+            (68, esm_cause::SERVICE_OPTION_NOT_SUPPORTED),
+            (73, esm_cause::INSUFFICIENT_RESOURCES),
+            (74, esm_cause::SEMANTIC_ERROR_IN_THE_TFT_OPERATION),
+            (75, esm_cause::SYNTACTICAL_ERROR_IN_THE_TFT_OPERATION),
+            (76, esm_cause::SEMANTIC_ERRORS_IN_PACKET_FILTERS),
+            (77, esm_cause::SYNTACTICAL_ERROR_IN_PACKET_FILTERS),
+            (78, esm_cause::MISSING_OR_UNKNOWN_APN),
+            (94, esm_cause::REQUEST_REJECTED_BY_SERVING_GW_OR_PDN_GW),
+        ] {
+            assert_eq!(
+                esm_cause_from_gtp(gtp),
+                esm,
+                "GTP cause {gtp} lost its distinct ESM mapping"
+            );
+        }
+        // A cause TS 29.274 does not define really is a network failure.
+        assert_eq!(esm_cause_from_gtp(200), esm_cause::NETWORK_FAILURE);
     }
 
     #[test]
