@@ -6,12 +6,12 @@ use crate::n4_build::{
     build_association_release_response, build_association_setup_response, build_failure_response,
     build_heartbeat_response, build_session_deletion_response,
     build_session_establishment_response, build_session_modification_response,
-    build_session_report_request, parse_create_bar, parse_create_far, parse_create_pdr,
-    parse_create_qer, parse_create_urr, parse_pfcpsmreq_flags, parse_recovery_time_stamp, pfcp_ie,
-    pfcp_type, pfcpsmreq_flags, CreatedPdr, DownlinkDataReport, DownlinkDataServiceInfo,
-    ErrorIndicationReport, FSeid, FTeid, NodeId, ParsedCreateBar, ParsedCreateFar, ParsedCreatePdr,
-    ParsedCreateQer, ParsedCreateUrr, ParsedFSeid, ParsedIe, ParsedPfcpHeader, PfcpCause,
-    ReportType, UserPlaneReport,
+    build_session_modification_response_with_reports, build_session_report_request,
+    parse_create_bar, parse_create_far, parse_create_pdr, parse_create_qer, parse_create_urr,
+    parse_pfcpsmreq_flags, parse_recovery_time_stamp, pfcp_ie, pfcp_type, pfcpsmreq_flags,
+    CreatedPdr, DownlinkDataReport, DownlinkDataServiceInfo, ErrorIndicationReport, FSeid, FTeid,
+    NodeId, ParsedCreateBar, ParsedCreateFar, ParsedCreatePdr, ParsedCreateQer, ParsedCreateUrr,
+    ParsedFSeid, ParsedIe, ParsedPfcpHeader, PfcpCause, ReportType, UserPlaneReport,
 };
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -398,16 +398,37 @@ pub enum PfcpSessionEvent {
         bars: Vec<ParsedCreateBar>,
     },
     /// Session modified - update forwarding rules
+    ///
+    /// Carries every rule operation TS 29.244 Table 7.5.4.1-1 defines. Before #306
+    /// it carried Update FAR, Update QER and BAR only, and the handler parsed only
+    /// those — so a Create/Update/Remove URR, a Remove QER and every PDR and FAR
+    /// operation were answered `RequestAccepted` and dropped.
     SessionModified {
         upf_seid: u64,
         /// Updated downlink TEID
         dl_teid: Option<u32>,
         /// Updated gNB address
         gnb_addr: Option<Ipv4Addr>,
+        /// Rule ids to detach, applied BEFORE the creates so a modification that
+        /// removes and re-creates the same id ends with the new rule (§7.5.4).
+        removed_pdr_ids: Vec<u16>,
+        removed_far_ids: Vec<u32>,
+        removed_qer_ids: Vec<u32>,
+        removed_urr_ids: Vec<u32>,
+        /// Rules created on this live session.
+        created_pdrs: Vec<ParsedCreatePdr>,
+        created_fars: Vec<ParsedCreateFar>,
+        created_qers: Vec<ParsedCreateQer>,
+        created_urrs: Vec<ParsedCreateUrr>,
+        /// Updated PDR rules
+        updated_pdrs: Vec<ParsedCreatePdr>,
         /// Updated FAR rules
         updated_fars: Vec<ParsedCreateFar>,
         /// Updated QERs
         updated_qers: Vec<ParsedCreateQer>,
+        /// Updated URRs. Re-threshold in place: the volume already measured against
+        /// the rule must survive (see `DataPlaneUrr::set_reporting`).
+        updated_urrs: Vec<ParsedCreateUrr>,
         /// Created/updated BARs
         updated_bars: Vec<ParsedCreateBar>,
         /// SMF requested End Marker packets on the old DL tunnel (SNDEM)
@@ -519,6 +540,76 @@ pub struct HeartbeatState {
 /// minutes.
 pub const HEARTBEAT_MAX_MISSES: u32 = 3;
 
+/// Why a Usage Report is being generated, which decides its Usage Report Trigger
+/// (TS 29.244 §8.2.36, #306).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageReportReason {
+    /// The URR is going away — the session is being deleted, or the URR removed.
+    Termination,
+    /// The CP function asked for a report now (QAURR).
+    Immediate,
+}
+
+/// Record the FIRST rule operation that could not be honoured (#306).
+///
+/// First and not last, because TS 29.244 §7.5.5 gives ONE Cause and ONE Offending IE
+/// for the whole message: with several failures the CP function can only act on one,
+/// and the earliest is the one whose rejection explains the rest.
+fn note_first_failure(slot: &mut Option<(PfcpCause, u16)>, cause: PfcpCause, ie_type: u16) {
+    if slot.is_none() {
+        *slot = Some((cause, ie_type));
+    }
+}
+
+/// Pull the `u32` rule id out of a Remove X IE body (TS 29.244 §7.5.4.6-§7.5.4.9).
+///
+/// `None` when the id sub-IE is absent or short — a malformed removal, which the
+/// caller reports rather than skipping.
+fn parse_rule_id_u32(body: &[u8], id_ie_type: u16) -> Option<u32> {
+    let ies = ParsedIe::parse_all(body);
+    let ie = ParsedIe::find_ie(&ies, id_ie_type)?;
+    if ie.value.len() < 4 {
+        return None;
+    }
+    Some(u32::from_be_bytes([
+        ie.value[0],
+        ie.value[1],
+        ie.value[2],
+        ie.value[3],
+    ]))
+}
+
+/// [`parse_rule_id_u32`] for the PDR ID, which TS 29.244 §8.2.36 makes 16-bit.
+fn parse_rule_id_u16(body: &[u8], id_ie_type: u16) -> Option<u16> {
+    let ies = ParsedIe::parse_all(body);
+    let ie = ParsedIe::find_ie(&ies, id_ie_type)?;
+    if ie.value.len() < 2 {
+        return None;
+    }
+    Some(u16::from_be_bytes([ie.value[0], ie.value[1]]))
+}
+
+/// Parse every IE of one type with the establishment path's parser, noting a
+/// malformed body as an Offending IE rather than dropping it silently (#306).
+fn parse_rule_list<T>(
+    ies: &[ParsedIe],
+    ie_type: u16,
+    parse: impl Fn(&[u8]) -> Result<T, &'static str>,
+    failure: &mut Option<(PfcpCause, u16)>,
+) -> Vec<T> {
+    let mut out = Vec::new();
+    for ie in ParsedIe::find_all_ies(ies, ie_type) {
+        match parse(&ie.value) {
+            Ok(rule) => out.push(rule),
+            Err(e) => {
+                log::warn!("Failed to parse rule in IE {ie_type}: {e}");
+                note_first_failure(failure, PfcpCause::MandatoryIeIncorrect, ie_type);
+            }
+        }
+    }
+    out
+}
+
 /// PFCP session information stored in server
 #[derive(Debug, Clone)]
 pub struct PfcpSessionInfo {
@@ -529,6 +620,26 @@ pub struct PfcpSessionInfo {
     pub ul_teid: u32,
     pub dl_teid: u32,
     pub gnb_addr: Option<Ipv4Addr>,
+    /// Which rule ids this session holds, by kind (#306).
+    ///
+    /// The PFCP layer tracks the ids; the data plane holds the rules' behaviour.
+    /// Both are needed, and the split is not redundancy: a Session Modification
+    /// Response has to be built and sent BEFORE the data plane has consumed the
+    /// event, so validating an Update against the data plane's store would reject
+    /// a rule created by a modification one round earlier that the consumer has
+    /// not applied yet. These sets are written synchronously in the handler, in
+    /// the same order the CP function sent the requests, so they are the only
+    /// race-free answer to "does this rule exist" at response-building time.
+    pub rules: SessionRuleIds,
+}
+
+/// The rule ids a session holds, by kind (TS 29.244 §7.5.4, #306).
+#[derive(Debug, Clone, Default)]
+pub struct SessionRuleIds {
+    pub pdr_ids: std::collections::HashSet<u16>,
+    pub far_ids: std::collections::HashSet<u32>,
+    pub qer_ids: std::collections::HashSet<u32>,
+    pub urr_ids: std::collections::HashSet<u32>,
 }
 
 impl PfcpServer {
@@ -1299,7 +1410,8 @@ impl PfcpServer {
             .await
             .map_err(|e| format!("Send error: {e}"))?;
 
-        // Store session info
+        // Store session info, including which rule ids the session now holds so a
+        // later modification's Update/Remove can be validated against them (#306).
         let session_info = PfcpSessionInfo {
             upf_seid,
             smf_seid,
@@ -1308,6 +1420,12 @@ impl PfcpServer {
             ul_teid,
             dl_teid,
             gnb_addr,
+            rules: SessionRuleIds {
+                pdr_ids: parsed_pdrs.iter().map(|p| p.pdr_id).collect(),
+                far_ids: parsed_fars.iter().map(|f| f.far_id).collect(),
+                qer_ids: parsed_qers.iter().map(|q| q.qer_id).collect(),
+                urr_ids: parsed_urrs.iter().map(|u| u.urr_id).collect(),
+            },
         };
 
         {
@@ -1353,50 +1471,121 @@ impl PfcpServer {
 
         let ies = ParsedIe::parse_all(payload);
 
-        // Parse Update FARs
+        // Every rule operation TS 29.244 Table 7.5.4.1-1 defines. Before #306 this
+        // parsed Update FAR, Update QER and BAR only; the rest were answered
+        // `RequestAccepted` and dropped on the floor.
+        //
+        // `offending` records the first IE type whose operation could not be honoured,
+        // so the response can carry a Cause plus an Offending IE (§7.5.5) rather than
+        // a bare acceptance. Collected while parsing and evaluated once, because
+        // §7.5.5 gives ONE Cause for the whole message: a partially-applied
+        // modification has no truthful per-rule answer on this message, and reporting
+        // the FIRST failure is the only thing the CP function can act on.
+        let mut failure: Option<(PfcpCause, u16)> = None;
+
         let mut updated_dl_teid: Option<u32> = None;
         let mut updated_gnb_addr: Option<Ipv4Addr> = None;
-        let mut mod_fars = Vec::new();
 
-        // Update FAR IE type = 10
-        for far_ie in ParsedIe::find_all_ies(&ies, pfcp_ie::UPDATE_FAR) {
-            match parse_create_far(&far_ie.value) {
-                Ok(far) => {
-                    log::debug!(
-                        "Update FAR {}: apply_action={:#x}",
-                        far.far_id,
-                        far.apply_action
-                    );
-                    if let Some(ref fp) = far.forwarding_parameters {
-                        if let Some(ref ohc) = fp.outer_header_creation {
-                            updated_dl_teid = Some(ohc.teid);
-                            updated_gnb_addr = ohc.ipv4;
-                            log::debug!(
-                                "Updated downlink: TEID={:#x}, gNB={:?}",
-                                ohc.teid,
-                                ohc.ipv4
-                            );
-                        }
-                    }
-                    mod_fars.push(far);
-                }
-                Err(e) => {
-                    log::warn!("Failed to parse Update FAR: {e}");
-                }
+        // ---- Removals: rule id only (TS 29.244 §7.5.4.6-7.5.4.9) ----
+        let removed_pdr_ids: Vec<u16> = ParsedIe::find_all_ies(&ies, pfcp_ie::REMOVE_PDR)
+            .iter()
+            .filter_map(|ie| parse_rule_id_u16(&ie.value, pfcp_ie::PDR_ID))
+            .collect();
+        let removed_far_ids: Vec<u32> = ParsedIe::find_all_ies(&ies, pfcp_ie::REMOVE_FAR)
+            .iter()
+            .filter_map(|ie| parse_rule_id_u32(&ie.value, pfcp_ie::FAR_ID))
+            .collect();
+        let removed_qer_ids: Vec<u32> = ParsedIe::find_all_ies(&ies, pfcp_ie::REMOVE_QER)
+            .iter()
+            .filter_map(|ie| parse_rule_id_u32(&ie.value, pfcp_ie::QER_ID))
+            .collect();
+        let removed_urr_ids: Vec<u32> = ParsedIe::find_all_ies(&ies, pfcp_ie::REMOVE_URR)
+            .iter()
+            .filter_map(|ie| parse_rule_id_u32(&ie.value, pfcp_ie::URR_ID))
+            .collect();
+
+        // A Remove IE whose rule-id sub-IE is missing or short is malformed, and is
+        // reported rather than skipped: silently dropping it is the defect #306 is
+        // about, one level down.
+        for (ie_type, parsed, total) in [
+            (
+                pfcp_ie::REMOVE_PDR,
+                removed_pdr_ids.len(),
+                ParsedIe::find_all_ies(&ies, pfcp_ie::REMOVE_PDR).len(),
+            ),
+            (
+                pfcp_ie::REMOVE_FAR,
+                removed_far_ids.len(),
+                ParsedIe::find_all_ies(&ies, pfcp_ie::REMOVE_FAR).len(),
+            ),
+            (
+                pfcp_ie::REMOVE_QER,
+                removed_qer_ids.len(),
+                ParsedIe::find_all_ies(&ies, pfcp_ie::REMOVE_QER).len(),
+            ),
+            (
+                pfcp_ie::REMOVE_URR,
+                removed_urr_ids.len(),
+                ParsedIe::find_all_ies(&ies, pfcp_ie::REMOVE_URR).len(),
+            ),
+        ] {
+            if parsed < total {
+                log::warn!(
+                    "{} of {total} Remove IE {ie_type} carried no rule id",
+                    total - parsed
+                );
+                note_first_failure(&mut failure, PfcpCause::MandatoryIeMissing, ie_type);
             }
         }
 
-        // Parse Update QERs (IE type 14)
-        let mut mod_qers = Vec::new();
-        for qer_ie in ParsedIe::find_all_ies(&ies, pfcp_ie::UPDATE_QER) {
-            match parse_create_qer(&qer_ie.value) {
-                Ok(qer) => {
-                    log::debug!("Update QER {}: qfi={:?}", qer.qer_id, qer.qfi);
-                    mod_qers.push(qer);
-                }
-                Err(e) => {
-                    log::warn!("Failed to parse Update QER: {e}");
-                }
+        // ---- Creates and updates ----
+        // Update X carries the same IE set as Create X (Table 7.5.4.2-1 vs
+        // 7.5.2.2-1 and siblings), so the establishment path's parsers are reused
+        // rather than duplicated.
+        let created_pdrs = parse_rule_list(
+            &ies,
+            pfcp_ie::CREATE_PDR,
+            crate::n4_build::parse_create_pdr,
+            &mut failure,
+        );
+        let updated_pdrs = parse_rule_list(
+            &ies,
+            pfcp_ie::UPDATE_PDR,
+            crate::n4_build::parse_create_pdr,
+            &mut failure,
+        );
+        let created_fars =
+            parse_rule_list(&ies, pfcp_ie::CREATE_FAR, parse_create_far, &mut failure);
+        let mod_fars = parse_rule_list(&ies, pfcp_ie::UPDATE_FAR, parse_create_far, &mut failure);
+        let created_qers =
+            parse_rule_list(&ies, pfcp_ie::CREATE_QER, parse_create_qer, &mut failure);
+        let mod_qers = parse_rule_list(&ies, pfcp_ie::UPDATE_QER, parse_create_qer, &mut failure);
+        let created_urrs = parse_rule_list(
+            &ies,
+            pfcp_ie::CREATE_URR,
+            crate::n4_build::parse_create_urr,
+            &mut failure,
+        );
+        let mod_urrs = parse_rule_list(
+            &ies,
+            pfcp_ie::UPDATE_URR,
+            crate::n4_build::parse_create_urr,
+            &mut failure,
+        );
+
+        // The DL tunnel this session forwards on is whatever the LAST Outer Header
+        // Creation on the message names, from a Create or an Update alike. Creates
+        // are considered first so an Update in the same message wins, which is the
+        // order §7.5.4 applies them in.
+        for far in created_fars.iter().chain(mod_fars.iter()) {
+            if let Some(ohc) = far
+                .forwarding_parameters
+                .as_ref()
+                .and_then(|fp| fp.outer_header_creation.as_ref())
+            {
+                updated_dl_teid = Some(ohc.teid);
+                updated_gnb_addr = ohc.ipv4;
+                log::debug!("Updated downlink: TEID={:#x}, gNB={:?}", ohc.teid, ohc.ipv4);
             }
         }
 
@@ -1413,13 +1602,23 @@ impl PfcpServer {
         }
 
         // PFCPSMReq-Flags (TS 29.244 8.2.50): SNDEM → emit End Marker on the
-        // old DL tunnel; DROBU → discard buffered DL packets
+        // old DL tunnel; DROBU → discard buffered DL packets; QAURR → report every
+        // URR immediately in this response. QAURR was declared as a constant and
+        // read nowhere until #306, so an SMF asking for all usage reports got a
+        // bare acceptance and no reports.
         let smreq_flags = parse_pfcpsmreq_flags(payload).unwrap_or(0);
         let send_end_marker = smreq_flags & pfcpsmreq_flags::SNDEM != 0;
         let drop_buffered = smreq_flags & pfcpsmreq_flags::DROBU != 0;
+        let query_all_urrs = smreq_flags & pfcpsmreq_flags::QAURR != 0;
 
         // Update session info; respond Session Context Not Found for an
         // unknown SEID (TS 29.244 7.5.5, cause 65)
+        //
+        // The rule-id bookkeeping is updated in the SAME critical section, in
+        // §7.5.4's application order — remove, then create, then update — so a
+        // modification that removes and re-creates one id ends holding it, and an
+        // Update naming a rule this session does not hold is caught HERE, before a
+        // response claiming acceptance has been sent.
         let lookup = {
             let mut sessions = self.sessions.write().await;
             if let Some(session) = sessions.get_mut(&upf_seid) {
@@ -1430,6 +1629,105 @@ impl PfcpServer {
                 if let Some(addr) = updated_gnb_addr {
                     session.gnb_addr = Some(addr);
                 }
+
+                // Removing a rule the session does not hold is IDEMPOTENT SUCCESS,
+                // deliberately: the CP function asked for the rule to be gone and it
+                // is gone, so answering §7.5.5's rule-failure cause would fail a
+                // modification that achieved exactly what was requested. Logged at
+                // debug so it is visible without being an error.
+                for id in &removed_pdr_ids {
+                    if !session.rules.pdr_ids.remove(id) {
+                        log::debug!("Remove PDR {id}: not held by SEID {upf_seid:#x}, idempotent");
+                    }
+                }
+                for id in &removed_far_ids {
+                    if !session.rules.far_ids.remove(id) {
+                        log::debug!("Remove FAR {id}: not held by SEID {upf_seid:#x}, idempotent");
+                    }
+                }
+                for id in &removed_qer_ids {
+                    if !session.rules.qer_ids.remove(id) {
+                        log::debug!("Remove QER {id}: not held by SEID {upf_seid:#x}, idempotent");
+                    }
+                }
+                for id in &removed_urr_ids {
+                    if !session.rules.urr_ids.remove(id) {
+                        log::debug!("Remove URR {id}: not held by SEID {upf_seid:#x}, idempotent");
+                    }
+                }
+
+                for p in &created_pdrs {
+                    session.rules.pdr_ids.insert(p.pdr_id);
+                }
+                for f in &created_fars {
+                    session.rules.far_ids.insert(f.far_id);
+                }
+                for q in &created_qers {
+                    session.rules.qer_ids.insert(q.qer_id);
+                }
+                for u in &created_urrs {
+                    session.rules.urr_ids.insert(u.urr_id);
+                }
+
+                // Updating a rule the session does NOT hold is a different case from
+                // removing one: the new threshold, gate or forwarding action has
+                // nowhere to land, so the CP function's intent is not satisfied and
+                // §7.5.5's Rule creation/modification Failure is the truthful answer.
+                // Ignoring it is precisely the "accepted a modification it did not
+                // apply" defect this issue is about.
+                for p in &updated_pdrs {
+                    if !session.rules.pdr_ids.contains(&p.pdr_id) {
+                        log::warn!(
+                            "Update PDR {}: no such rule on SEID {upf_seid:#x}",
+                            p.pdr_id
+                        );
+                        note_first_failure(
+                            &mut failure,
+                            PfcpCause::RuleCreationModificationFailure,
+                            pfcp_ie::UPDATE_PDR,
+                        );
+                    }
+                }
+                for f in &mod_fars {
+                    if !session.rules.far_ids.contains(&f.far_id) {
+                        log::warn!(
+                            "Update FAR {}: no such rule on SEID {upf_seid:#x}",
+                            f.far_id
+                        );
+                        note_first_failure(
+                            &mut failure,
+                            PfcpCause::RuleCreationModificationFailure,
+                            pfcp_ie::UPDATE_FAR,
+                        );
+                    }
+                }
+                for q in &mod_qers {
+                    if !session.rules.qer_ids.contains(&q.qer_id) {
+                        log::warn!(
+                            "Update QER {}: no such rule on SEID {upf_seid:#x}",
+                            q.qer_id
+                        );
+                        note_first_failure(
+                            &mut failure,
+                            PfcpCause::RuleCreationModificationFailure,
+                            pfcp_ie::UPDATE_QER,
+                        );
+                    }
+                }
+                for u in &mod_urrs {
+                    if !session.rules.urr_ids.contains(&u.urr_id) {
+                        log::warn!(
+                            "Update URR {}: no such rule on SEID {upf_seid:#x}",
+                            u.urr_id
+                        );
+                        note_first_failure(
+                            &mut failure,
+                            PfcpCause::RuleCreationModificationFailure,
+                            pfcp_ie::UPDATE_URR,
+                        );
+                    }
+                }
+
                 Some((session.smf_seid, old_tunnel))
             } else {
                 None
@@ -1455,11 +1753,56 @@ impl PfcpServer {
             }
         };
 
-        // Build response
-        let resp_payload = build_session_modification_response(
-            pfcp_type::SESSION_MODIFICATION_RESPONSE,
-            &[], // No created PDRs for modification
-        );
+        // Usage Reports the response owes the CP function, carried in IE 78
+        // (USAGE_REPORT_SMR — the Session-Modification-Response carrier).
+        //
+        // A removed URR must report before it is detached (TS 29.244 §8.2.36's TERMR
+        // covers "removal of the URR" as well as session termination). Dropping the
+        // residual instead would lose measured volume the CP function is billing on —
+        // the compromise #215 had to settle for on the SGW-U side, and it is
+        // avoidable here because this server already holds a data-plane handle for the
+        // deletion path's final reports.
+        //
+        // QAURR (§8.2.50) asks for every URR to report immediately; the flag was
+        // parsed nowhere before #306, so an SMF setting it got a bare acceptance and
+        // no reports at all.
+        let mut usage_reports = Vec::new();
+        if !removed_urr_ids.is_empty() {
+            usage_reports.extend(self.collect_usage_reports(
+                upf_seid,
+                Some(&removed_urr_ids),
+                UsageReportReason::Termination,
+            ));
+        }
+        if query_all_urrs {
+            let already: std::collections::HashSet<u32> =
+                usage_reports.iter().map(|r| r.urr_id).collect();
+            usage_reports.extend(
+                self.collect_usage_reports(upf_seid, None, UsageReportReason::Immediate)
+                    .into_iter()
+                    // A URR removed by this same message has already reported with
+                    // TERMR; reporting it twice would double-count it.
+                    .filter(|r| !already.contains(&r.urr_id)),
+            );
+        }
+
+        // Build response. A rule operation that could not be honoured answers with
+        // §7.5.5's Cause and Offending IE instead of a bare RequestAccepted — the
+        // whole point of #306.
+        let resp_payload = match failure {
+            Some((cause, offending_ie)) => {
+                log::warn!(
+                    "Session Modification for SEID {upf_seid:#x} rejected: cause {} offending IE {offending_ie}",
+                    cause as u8
+                );
+                build_failure_response(cause, Some(offending_ie))
+            }
+            None => build_session_modification_response_with_reports(
+                pfcp_type::SESSION_MODIFICATION_RESPONSE,
+                &[], // No created PDRs for modification
+                &usage_reports,
+            ),
+        };
 
         let response = self.build_response(
             pfcp_type::SESSION_MODIFICATION_RESPONSE,
@@ -1474,11 +1817,28 @@ impl PfcpServer {
             .await
             .map_err(|e| format!("Send error: {e}"))?;
 
+        // A rejected modification applies NOTHING. Sending the event anyway would
+        // leave the data plane holding rules the response just said were refused,
+        // which is the same divergence in the other direction.
+        if failure.is_some() {
+            return Ok(());
+        }
+
         // Notify data plane
         let has_changes = updated_dl_teid.is_some()
             || updated_gnb_addr.is_some()
+            || !removed_pdr_ids.is_empty()
+            || !removed_far_ids.is_empty()
+            || !removed_qer_ids.is_empty()
+            || !removed_urr_ids.is_empty()
+            || !created_pdrs.is_empty()
+            || !created_fars.is_empty()
+            || !created_qers.is_empty()
+            || !created_urrs.is_empty()
+            || !updated_pdrs.is_empty()
             || !mod_fars.is_empty()
             || !mod_qers.is_empty()
+            || !mod_urrs.is_empty()
             || !mod_bars.is_empty()
             || send_end_marker
             || drop_buffered;
@@ -1488,8 +1848,18 @@ impl PfcpServer {
                 upf_seid,
                 dl_teid: updated_dl_teid,
                 gnb_addr: updated_gnb_addr,
+                removed_pdr_ids,
+                removed_far_ids,
+                removed_qer_ids,
+                removed_urr_ids,
+                created_pdrs,
+                created_fars,
+                created_qers,
+                created_urrs,
+                updated_pdrs,
                 updated_fars: mod_fars,
                 updated_qers: mod_qers,
+                updated_urrs: mod_urrs,
                 updated_bars: mod_bars,
                 send_end_marker,
                 drop_buffered,
@@ -1584,6 +1954,24 @@ impl PfcpServer {
     /// Collect final usage reports (TERMR trigger) from the data-plane URRs
     /// of a session that is being deleted.
     fn collect_final_usage_reports(&self, upf_seid: u64) -> Vec<crate::n4_build::UsageReport> {
+        self.collect_usage_reports(upf_seid, None, UsageReportReason::Termination)
+    }
+
+    /// Read the current counters of a session's URRs and build Usage Reports.
+    ///
+    /// `only` restricts the set to named URR ids — which is what a Remove URR needs,
+    /// so a modification reports the residual volume of the rules it is detaching and
+    /// nothing else (#306). `None` means every URR on the session, for a deletion's
+    /// final reports or a QAURR query.
+    ///
+    /// Read-only on the counters: the caller decides whether the URR survives, and
+    /// resetting here would zero a rule that is merely being queried.
+    fn collect_usage_reports(
+        &self,
+        upf_seid: u64,
+        only: Option<&[u32]>,
+        reason: UsageReportReason,
+    ) -> Vec<crate::n4_build::UsageReport> {
         let dp = match self.data_plane.read().unwrap().clone() {
             Some(dp) => dp,
             None => return Vec::new(),
@@ -1594,9 +1982,15 @@ impl PfcpServer {
         };
         let urrs = session.urrs.read().unwrap();
         urrs.values()
+            .filter(|urr| only.is_none_or(|ids| ids.contains(&urr.urr_id)))
             .map(|urr| {
                 let mut trigger = crate::n4_build::UsageReportTrigger::default();
-                trigger.termination_report = true;
+                match reason {
+                    // TS 29.244 §8.2.36: TERMR covers the removal of the URR as well
+                    // as the termination of the session.
+                    UsageReportReason::Termination => trigger.termination_report = true,
+                    UsageReportReason::Immediate => trigger.immediate_report = true,
+                }
                 crate::n4_build::UsageReport {
                     urr_id: urr.urr_id,
                     ur_seqn: urr.next_ur_seqn(),
@@ -2125,6 +2519,542 @@ mod tests {
         );
     }
 
+    // ================================================================
+    // #306: a Session Modification's rule operations reach the rule store
+    //
+    // Every one of these drives a REAL datagram into the bound socket and then runs
+    // the event through `crate::handle_pfcp_session_event` -- the production apply
+    // path, not a copy of it. Asserting the parsed event alone would pass in exactly
+    // the broken state this issue describes, because before #306 the parse was the
+    // half that was missing and the apply was the half that did not exist.
+    // ================================================================
+
+    /// Body of a Create/Update URR IE. Update URR carries the same IE set as Create
+    /// URR (TS 29.244 Table 7.5.4.10-1 vs 7.5.2.4-1), which is why one helper serves.
+    fn urr_body(
+        id: u32,
+        vol_total: Option<u64>,
+        time_threshold: Option<u32>,
+        period: Option<u32>,
+    ) -> Vec<u8> {
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_u32(pfcp_ie::URR_ID, id);
+        // Measurement Method: VOLUM | DURAT
+        b.add_u8(pfcp_ie::MEASUREMENT_METHOD, 0x02 | 0x01);
+        // Reporting Triggers: PERIO | VOLTH | TIMTH
+        b.add_u8(pfcp_ie::REPORTING_TRIGGERS, 0x01 | 0x02 | 0x04);
+        if let Some(v) = vol_total {
+            // Volume Threshold (§8.2.13): flags byte then the selected u64s.
+            let mut value = vec![0x01u8];
+            value.extend_from_slice(&v.to_be_bytes());
+            b.add_tlv(pfcp_ie::VOLUME_THRESHOLD, &value);
+        }
+        if let Some(s) = time_threshold {
+            b.add_u32(pfcp_ie::TIME_THRESHOLD, s);
+        }
+        if let Some(s) = period {
+            b.add_u32(pfcp_ie::MEASUREMENT_PERIOD, s);
+        }
+        b.build()
+    }
+
+    /// Body of a Remove FAR / Remove QER / Remove URR IE: the rule id, nothing else.
+    fn remove_body_u32(id_ie: u16, id: u32) -> Vec<u8> {
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_u32(id_ie, id);
+        b.build()
+    }
+
+    /// Body of a Remove PDR IE (the PDR ID is 16-bit).
+    fn remove_body_u16(id: u16) -> Vec<u8> {
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_pdr_id(id);
+        b.build()
+    }
+
+    fn qer_body(id: u32, qfi: u8) -> Vec<u8> {
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_u32(pfcp_ie::QER_ID, id);
+        b.add_u8(pfcp_ie::QFI, qfi);
+        b.build()
+    }
+
+    fn far_body(id: u32, apply_action: u16) -> Vec<u8> {
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_u32(pfcp_ie::FAR_ID, id);
+        b.add_u16(pfcp_ie::APPLY_ACTION, apply_action);
+        b.build()
+    }
+
+    fn pdr_body(pdr_id: u16, precedence: u32, far_id: u32, qer_id: u32, urr_id: u32) -> Vec<u8> {
+        let mut pdi = crate::n4_build::PfcpMessageBuilder::new();
+        pdi.add_u8(pfcp_ie::SOURCE_INTERFACE, 0); // Access
+        pdi.add_f_teid(&crate::n4_build::FTeid {
+            teid: 0x1234,
+            ipv4: Some(Ipv4Addr::new(127, 0, 0, 4)),
+            ipv6: None,
+            choose: false,
+            choose_id: None,
+        });
+        pdi.add_ue_ip_address(
+            &crate::n4_build::UeIpAddress {
+                ipv4: Some(Ipv4Addr::new(10, 45, 0, 42)),
+                ipv6: None,
+                ipv6_prefix_len: 0,
+            },
+            false,
+        );
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_pdr_id(pdr_id);
+        b.add_u32(pfcp_ie::PRECEDENCE, precedence);
+        b.add_tlv(pfcp_ie::PDI, &pdi.build());
+        b.add_u32(pfcp_ie::FAR_ID, far_id);
+        b.add_u32(pfcp_ie::QER_ID, qer_id);
+        b.add_u32(pfcp_ie::URR_ID, urr_id);
+        b.build()
+    }
+
+    /// An associated server with ONE established session carrying PDR 1, FAR 1,
+    /// QER 1 and URR 1, applied to a real data plane.
+    ///
+    /// The data plane is attached to the server (`set_data_plane`), which is what
+    /// lets a Remove URR pull the residual counters for its Usage Report.
+    async fn established_session() -> (
+        Arc<PfcpServer>,
+        UdpSocket,
+        SocketAddr,
+        mpsc::Receiver<PfcpSessionEvent>,
+        Arc<crate::data_plane::DataPlane>,
+        u64,
+    ) {
+        let (server, smf, addr, mut rx) = spawn_test_server().await;
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            AtomicBool::new(false),
+        )));
+        server.set_data_plane(dp.clone());
+
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        b.add_f_seid(&crate::n4_build::FSeid {
+            seid: 0x4242,
+            ipv4: Some(Ipv4Addr::new(127, 0, 0, 9)),
+            ipv6: None,
+        });
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr_body(1, 100, 1, 1, 1));
+        b.add_tlv(pfcp_ie::CREATE_FAR, &far_body(1, 0x02));
+        b.add_tlv(pfcp_ie::CREATE_QER, &qer_body(1, 5));
+        b.add_tlv(
+            pfcp_ie::CREATE_URR,
+            &urr_body(1, Some(1_000_000), Some(60), Some(30)),
+        );
+        let resp = exchange(&smf, addr, &encode_pfcp(50, Some(0), 2, &b.build())).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::RequestAccepted as u8,
+            "the establishment this fixture depends on must succeed"
+        );
+        let (hdr, _) = ParsedPfcpHeader::parse(&resp).unwrap();
+        let _ = hdr;
+        let upf_seid = server
+            .sessions
+            .read()
+            .await
+            .keys()
+            .copied()
+            .next()
+            .expect("the server must hold the session it just accepted");
+
+        let evt = rx.recv().await.expect("SessionEstablished");
+        crate::handle_pfcp_session_event(&dp, evt).await;
+        assert!(
+            dp.sessions.find_by_seid(upf_seid).is_some(),
+            "the data plane must hold the session before any modification"
+        );
+        (server, smf, addr, rx, dp, upf_seid)
+    }
+
+    /// Apply the next session event through the production handler.
+    async fn apply_next(
+        rx: &mut mpsc::Receiver<PfcpSessionEvent>,
+        dp: &crate::data_plane::DataPlane,
+    ) {
+        let evt = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("a session event must be emitted")
+            .expect("channel open");
+        crate::handle_pfcp_session_event(dp, evt).await;
+    }
+
+    fn usage_reports_in(resp: &[u8]) -> Vec<(u32, u64)> {
+        let (_, body) = ParsedPfcpHeader::parse(resp).unwrap();
+        let ies = ParsedIe::parse_all(body);
+        ParsedIe::find_all_ies(&ies, pfcp_ie::USAGE_REPORT_SMR)
+            .iter()
+            .filter_map(|ie| {
+                let inner = ParsedIe::parse_all(&ie.value);
+                let id = ParsedIe::find_ie(&inner, pfcp_ie::URR_ID)?;
+                let urr_id =
+                    u32::from_be_bytes([id.value[0], id.value[1], id.value[2], id.value[3]]);
+                // Volume Measurement (§8.2.14): flags byte then the selected u64s,
+                // total first.
+                let vm = ParsedIe::find_ie(&inner, pfcp_ie::VOLUME_MEASUREMENT)?;
+                let total = if vm.value.len() >= 9 && vm.value[0] & 0x01 != 0 {
+                    u64::from_be_bytes(vm.value[1..9].try_into().ok()?)
+                } else {
+                    0
+                };
+                Some((urr_id, total))
+            })
+            .collect()
+    }
+
+    /// Criterion 1: provisioning charging mid-session is the normal way it is added,
+    /// and before #306 the UPF answered `RequestAccepted` and measured nothing.
+    #[tokio::test]
+    async fn a_modification_creating_a_urr_provisions_measurement() {
+        let (_server, smf, addr, mut rx, dp, upf_seid) = established_session().await;
+
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(
+            pfcp_ie::CREATE_URR,
+            &urr_body(7, Some(555), Some(11), Some(9)),
+        );
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        assert_eq!(resp[1], pfcp_type::SESSION_MODIFICATION_RESPONSE);
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+
+        let session = dp.sessions.find_by_seid(upf_seid).unwrap();
+        let urrs = session.urrs.read().unwrap();
+        let urr = urrs.get(&7).expect("Create URR must install the rule");
+        assert_eq!(urr.volume_threshold_total(), Some(555));
+        assert_eq!(urr.time_threshold_secs(), Some(11));
+        assert_eq!(
+            urr.measurement_period_secs(),
+            Some(9),
+            "the Measurement Period must survive the wire: the PERIO trigger is \
+             useless without it"
+        );
+    }
+
+    /// Criterion 2, and the reason the thresholds are atomic: re-thresholding must
+    /// not zero the volume the CP function is accounting on.
+    #[tokio::test]
+    async fn an_update_urr_rethresholds_without_resetting_the_measured_volume() {
+        let (_server, smf, addr, mut rx, dp, upf_seid) = established_session().await;
+
+        // Measure something against URR 1 first.
+        {
+            let session = dp.sessions.find_by_seid(upf_seid).unwrap();
+            let urrs = session.urrs.read().unwrap();
+            let urr = urrs.get(&1).expect("the fixture installs URR 1");
+            urr.record(4096, true);
+            urr.record(2048, false);
+            assert_eq!(urr.acc_total_bytes.load(Ordering::Relaxed), 6144);
+        }
+
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::UPDATE_URR, &urr_body(1, Some(99), Some(5), None));
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+
+        let session = dp.sessions.find_by_seid(upf_seid).unwrap();
+        let urrs = session.urrs.read().unwrap();
+        let urr = urrs.get(&1).expect("Update URR must not remove the rule");
+        assert_eq!(
+            urr.volume_threshold_total(),
+            Some(99),
+            "the new threshold must be in force"
+        );
+        assert_eq!(
+            urr.acc_total_bytes.load(Ordering::Relaxed),
+            6144,
+            "an Update URR must NOT reset the volume measured so far"
+        );
+        assert_eq!(urr.acc_ul_bytes.load(Ordering::Relaxed), 4096);
+        assert_eq!(
+            urr.measurement_period_secs(),
+            None,
+            "a period the update omits is withdrawn, not silently retained"
+        );
+    }
+
+    /// Criterion 3 plus the leak the issue names: a removed URR must report what it
+    /// measured and then stop measuring.
+    #[tokio::test]
+    async fn a_removed_urr_reports_its_residual_volume_then_stops_measuring() {
+        let (_server, smf, addr, mut rx, dp, upf_seid) = established_session().await;
+
+        let urr_arc = {
+            let session = dp.sessions.find_by_seid(upf_seid).unwrap();
+            let urrs = session.urrs.read().unwrap();
+            let urr = urrs.get(&1).unwrap().clone();
+            urr.record(1500, true);
+            urr.record(500, false);
+            urr
+        };
+
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::REMOVE_URR, &remove_body_u32(pfcp_ie::URR_ID, 1));
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+
+        // The residual volume leaves in the RESPONSE, in IE 78. Dropping it would
+        // lose measured traffic the CP function is billing on.
+        assert_eq!(
+            usage_reports_in(&resp),
+            vec![(1, 2000)],
+            "a removed URR must report its residual volume before being detached"
+        );
+
+        apply_next(&mut rx, &dp).await;
+        let session = dp.sessions.find_by_seid(upf_seid).unwrap();
+        assert!(
+            !session.urrs.read().unwrap().contains_key(&1),
+            "Remove URR must detach the rule"
+        );
+        // And the counters are unreachable from the data path: `urr_record`'s only
+        // route to them is the map the rule was just removed from.
+        assert_eq!(Arc::strong_count(&urr_arc), 1);
+    }
+
+    /// Criterion 4: the other three removals.
+    #[tokio::test]
+    async fn removing_a_qer_a_pdr_and_a_far_detaches_each_of_them() {
+        let (_server, smf, addr, mut rx, dp, upf_seid) = established_session().await;
+        {
+            let session = dp.sessions.find_by_seid(upf_seid).unwrap();
+            assert!(session.qers.read().unwrap().contains_key(&1));
+            assert!(session.fars.read().unwrap().contains_key(&1));
+            assert_eq!(session.pdrs.read().unwrap().len(), 1);
+        }
+
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::REMOVE_QER, &remove_body_u32(pfcp_ie::QER_ID, 1));
+        b.add_tlv(pfcp_ie::REMOVE_FAR, &remove_body_u32(pfcp_ie::FAR_ID, 1));
+        b.add_tlv(pfcp_ie::REMOVE_PDR, &remove_body_u16(1));
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+
+        let session = dp.sessions.find_by_seid(upf_seid).unwrap();
+        assert!(
+            session.qers.read().unwrap().is_empty(),
+            "Remove QER must remove the policing, not leave it installed"
+        );
+        assert!(session.fars.read().unwrap().is_empty());
+        assert!(
+            session.pdrs.read().unwrap().is_empty(),
+            "Remove PDR must remove the detection rule"
+        );
+    }
+
+    /// Criterion 5. An Update naming a rule the session does not hold has nowhere to
+    /// land, so §7.5.5's Cause and Offending IE are the truthful answer -- and
+    /// NOTHING is applied, because a response that refused must not be followed by
+    /// an event that applies.
+    #[tokio::test]
+    async fn an_update_for_an_absent_rule_is_refused_with_an_offending_ie() {
+        let (_server, smf, addr, mut rx, dp, upf_seid) = established_session().await;
+
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::UPDATE_URR, &urr_body(4242, Some(1), None, None));
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::RuleCreationModificationFailure as u8,
+            "an unapplicable rule operation must not be answered RequestAccepted"
+        );
+        let (_, body) = ParsedPfcpHeader::parse(&resp).unwrap();
+        let ies = ParsedIe::parse_all(body);
+        let off = ParsedIe::find_ie(&ies, pfcp_ie::OFFENDING_IE)
+            .expect("§7.5.5 pairs the cause with the offending IE");
+        assert_eq!(
+            u16::from_be_bytes([off.value[0], off.value[1]]),
+            pfcp_ie::UPDATE_URR
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv())
+                .await
+                .is_err(),
+            "a refused modification must emit no apply event"
+        );
+        let session = dp.sessions.find_by_seid(upf_seid).unwrap();
+        assert!(!session.urrs.read().unwrap().contains_key(&4242));
+    }
+
+    /// The other half of criterion 5's decision, stated so it is not mistaken for an
+    /// oversight: a REMOVAL of something absent is idempotent success, because the
+    /// end state is exactly what the CP function asked for.
+    #[tokio::test]
+    async fn a_removal_of_an_absent_rule_is_idempotent_success() {
+        let (_server, smf, addr, _rx, _dp, upf_seid) = established_session().await;
+
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::REMOVE_URR, &remove_body_u32(pfcp_ie::URR_ID, 999));
+        b.add_tlv(pfcp_ie::REMOVE_QER, &remove_body_u32(pfcp_ie::QER_ID, 999));
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::RequestAccepted as u8,
+            "the rule is gone, which is what was asked -- failing would refuse a \
+             modification that achieved its intent"
+        );
+    }
+
+    /// A malformed rule body is reported rather than skipped: dropping it silently is
+    /// this issue's defect one level down.
+    #[tokio::test]
+    async fn a_malformed_rule_body_is_reported_as_an_offending_ie() {
+        let (_server, smf, addr, _rx, _dp, upf_seid) = established_session().await;
+
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        // A Create URR with no URR ID at all.
+        let mut bad = crate::n4_build::PfcpMessageBuilder::new();
+        bad.add_u32(pfcp_ie::TIME_THRESHOLD, 10);
+        b.add_tlv(pfcp_ie::CREATE_URR, &bad.build());
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::MandatoryIeIncorrect as u8);
+        let (_, body) = ParsedPfcpHeader::parse(&resp).unwrap();
+        let ies = ParsedIe::parse_all(body);
+        let off = ParsedIe::find_ie(&ies, pfcp_ie::OFFENDING_IE).unwrap();
+        assert_eq!(
+            u16::from_be_bytes([off.value[0], off.value[1]]),
+            pfcp_ie::CREATE_URR
+        );
+    }
+
+    /// QAURR (§8.2.50) was a constant with no reader: an SMF asking for every URR to
+    /// report got a bare acceptance and no reports.
+    #[tokio::test]
+    async fn qaurr_reports_every_urr_in_the_response() {
+        let (_server, smf, addr, _rx, dp, upf_seid) = established_session().await;
+        {
+            let session = dp.sessions.find_by_seid(upf_seid).unwrap();
+            let urrs = session.urrs.read().unwrap();
+            urrs.get(&1).unwrap().record(777, true);
+        }
+
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_u8(pfcp_ie::PFCPSMREQ_FLAGS, pfcpsmreq_flags::QAURR);
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(
+            usage_reports_in(&resp),
+            vec![(1, 777)],
+            "QAURR must produce a Usage Report per URR"
+        );
+    }
+
+    /// A create and a remove of the SAME id in one message must end holding the NEW
+    /// rule: §7.5.4 applies removals before creates, and getting that order wrong
+    /// leaves the session with nothing.
+    #[tokio::test]
+    async fn a_remove_and_create_of_one_id_ends_with_the_new_rule() {
+        let (_server, smf, addr, mut rx, dp, upf_seid) = established_session().await;
+
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::REMOVE_URR, &remove_body_u32(pfcp_ie::URR_ID, 1));
+        b.add_tlv(pfcp_ie::CREATE_URR, &urr_body(1, Some(4242), None, None));
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+
+        let session = dp.sessions.find_by_seid(upf_seid).unwrap();
+        let urrs = session.urrs.read().unwrap();
+        let urr = urrs
+            .get(&1)
+            .expect("the re-created rule must be the one that survives");
+        assert_eq!(urr.volume_threshold_total(), Some(4242));
+        assert_eq!(
+            urr.acc_total_bytes.load(Ordering::Relaxed),
+            0,
+            "it is a NEW rule, so its counters start at zero -- unlike an update"
+        );
+    }
+
+    /// #306 criterion 6's cost, guarded rather than accepted.
+    ///
+    /// This PR extends upfd's own `ParsedIe` walk instead of moving onto
+    /// `nextgcore_pfcp::message::SessionModificationRequest` (see the spec for why).
+    /// The argument against that choice is drift: two decoders for one message.
+    ///
+    /// So the two are pinned against each other. The message is built by the LIBRARY
+    /// encoder and decoded by BOTH, and the rule ids and thresholds must agree. If
+    /// the library's wire format moves and upfd's walk does not follow, this fails
+    /// here rather than in a deployment -- which is the guarantee moving onto the
+    /// library decoder would have given for free.
+    #[test]
+    fn the_library_decoder_and_upfds_walk_agree_on_one_modification() {
+        use bytes::{Bytes, BytesMut};
+        use nextgcore_pfcp::message::SessionModificationRequest;
+        use nextgcore_pfcp::types::{RemoveQer, RemoveUrr, UpdateUrr, VolumeThreshold};
+
+        let mut req = SessionModificationRequest::new();
+        req.remove_urrs.push(RemoveUrr::new(11));
+        req.remove_qers.push(RemoveQer::new(22));
+        let mut update = UpdateUrr {
+            urr_id: 33,
+            ..Default::default()
+        };
+        update.measurement_period = Some(77);
+        update.volume_threshold = Some(VolumeThreshold::new_total(8888));
+        req.update_urrs.push(update);
+
+        let mut buf = BytesMut::new();
+        req.encode(&mut buf);
+        let wire = buf.freeze();
+
+        // Round trip through the library, so a change in ITS decoder is visible too.
+        let via_library = SessionModificationRequest::decode(&mut wire.clone())
+            .expect("the library must decode what it encoded");
+        assert_eq!(
+            via_library
+                .remove_urrs
+                .iter()
+                .map(|r| r.urr_id)
+                .collect::<Vec<_>>(),
+            vec![11]
+        );
+
+        // And through upfd's walk, which is what the handler actually uses.
+        let ies = ParsedIe::parse_all(&wire);
+        let removed_urrs: Vec<u32> = ParsedIe::find_all_ies(&ies, pfcp_ie::REMOVE_URR)
+            .iter()
+            .filter_map(|ie| super::parse_rule_id_u32(&ie.value, pfcp_ie::URR_ID))
+            .collect();
+        let removed_qers: Vec<u32> = ParsedIe::find_all_ies(&ies, pfcp_ie::REMOVE_QER)
+            .iter()
+            .filter_map(|ie| super::parse_rule_id_u32(&ie.value, pfcp_ie::QER_ID))
+            .collect();
+        let mut failure = None;
+        let updated_urrs = super::parse_rule_list(
+            &ies,
+            pfcp_ie::UPDATE_URR,
+            crate::n4_build::parse_create_urr,
+            &mut failure,
+        );
+
+        assert_eq!(removed_urrs, vec![11], "Remove URR must decode identically");
+        assert_eq!(removed_qers, vec![22], "Remove QER must decode identically");
+        assert!(
+            failure.is_none(),
+            "the library's Update URR must parse cleanly"
+        );
+        assert_eq!(updated_urrs.len(), 1);
+        assert_eq!(updated_urrs[0].urr_id, 33);
+        assert_eq!(
+            updated_urrs[0].measurement_period_secs,
+            Some(77),
+            "the Measurement Period the library encodes is the one upfd reads"
+        );
+        assert_eq!(updated_urrs[0].volume_threshold_total, Some(8888));
+    }
+
     #[tokio::test]
     async fn test_session_modification_unknown_seid_rejected() {
         let (_server, smf, addr, _rx) = spawn_test_server().await;
@@ -2551,6 +3481,7 @@ mod tests {
                 ul_teid: 0x100,
                 dl_teid: 0x200,
                 gnb_addr: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                rules: SessionRuleIds::default(),
             })
             .await;
         (server, smf, upf_seid, smf_seid)
