@@ -342,14 +342,37 @@ fn dispatch_emm(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, pdu: &[u8]) {
             );
             release_ue_context(ctx, enb_ue);
         }
-        emm_type::TAU_COMPLETE | emm_type::GUTI_REALLOCATION_COMPLETE => {
-            log::debug!(
-                "EMM 0x{message_type:02x} acknowledged by enb_ue_s1ap_id={}",
-                enb_ue.enb_ue_s1ap_id
-            );
+        emm_type::TAU_COMPLETE => {
+            log::debug!("TAU Complete from enb_ue_s1ap_id={}", enb_ue.enb_ue_s1ap_id);
             // TS 24.301 §5.5.3.2.4: the TAU procedure completed (issue #45).
             if let Some(mme_ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
                 mme_ue.t3450.stop();
+            }
+            // The GUTI the accept carried is now the UE's (#46). Committed HERE and
+            // not at send time: until the UE acknowledges, it still answers to the
+            // old identity, and promoting early would make `mme_ue_find_by_s_tmsi`
+            // miss a UE that returns before the accept arrives.
+            ctx.commit_staged_guti(mme_ue_id);
+        }
+        emm_type::GUTI_REALLOCATION_COMPLETE => {
+            log::debug!(
+                "GUTI Reallocation Complete from enb_ue_s1ap_id={}",
+                enb_ue.enb_ue_s1ap_id
+            );
+            // TS 24.301 §5.4.1.3: the reallocation completed, so T3450 stops and the
+            // new GUTI takes effect. Split from the TAU arm by #46 because the two
+            // procedures are different and sharing an arm hid that neither committed
+            // anything.
+            if let Some(mme_ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
+                mme_ue.t3450.stop();
+            }
+            if ctx.commit_staged_guti(mme_ue_id) {
+                log::info!("GUTI reallocation completed for mme_ue_id={mme_ue_id}");
+            } else {
+                log::warn!(
+                    "GUTI Reallocation Complete for mme_ue_id={mme_ue_id} with no staged GUTI: \
+                     the UE acknowledged an identity this MME did not allocate"
+                );
             }
         }
         emm_type::EMM_STATUS => {
@@ -458,6 +481,45 @@ fn emm_attach_request(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, body: &[
             }
         }
     };
+
+    // TS 24.301 §9.9.3.11 attach type 3 is an EMERGENCY attach. Recorded on the
+    // context so the rest of the stack can tell one from a normal attach (#46).
+    //
+    // What this does NOT do, stated because the difference matters: emergency BEARER
+    // SERVICES are not implemented. §5.5.1.3 lets an emergency attach proceed for an
+    // unauthenticated or unsubscribed UE with EIA0/NIA0 and an emergency APN, and
+    // none of that exists here — so an emergency attach still goes through the normal
+    // authentication and subscription path and will fail wherever that fails. The flag
+    // makes the case visible instead of silently indistinguishable, and the accept's
+    // EPS attach result is now correct for it (§9.9.3.10 has no emergency value, so it
+    // is EPS-only).
+    if parsed.attach_type == crate::emm_build::AttachType::EpsEmergencyAttach as u8 {
+        if let Ok(mut pool) = ctx.mme_ue_pool.write() {
+            if let Some(ue) = pool.get_mut(&mme_ue_id) {
+                ue.emergency_attach = true;
+            }
+        }
+        log::warn!(
+            "EMERGENCY attach requested on enb_ue_s1ap_id={}: recognised and recorded, but \
+             emergency bearer services (unauthenticated access, EIA0/NIA0, emergency APN) are \
+             not implemented, so this attach follows the normal path",
+            enb_ue.enb_ue_s1ap_id
+        );
+    }
+
+    // Allocate the GUTI this attach will hand the UE (TS 24.301 §5.4.1). Staged in
+    // `next`; promoted to `current` when the UE acknowledges. Before #46 nothing
+    // allocated one, so the accepts' `next.m_tmsi.is_some()` gate was never true
+    // outside tests and the GUTI IE was dead code — which also left
+    // `mme_ue_find_by_s_tmsi` and the GUTI-identified attach lookup below permanently
+    // dormant, as `resolve_mme_ue`'s comment said.
+    if !ctx.allocate_guti(mme_ue_id) {
+        log::warn!(
+            "no GUTI allocated for enb_ue_s1ap_id={}: the UE will be given none and must keep \
+             identifying itself by IMSI",
+            enb_ue.enb_ue_s1ap_id
+        );
+    }
 
     if let Some(imsi) = parsed.imsi.as_deref() {
         log::info!(
@@ -798,10 +860,27 @@ fn emm_tau_request(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, body: &[u8]
         parsed.update_type,
         parsed.active_flag
     );
-    // No E-RABs can be listed: bearers are established over S11, which is not
-    // implemented (#51). The accept therefore never asks for Initial Context
-    // Setup, and subscribed timer / GUTI reallocation content is #46.
-    if let Err(e) = nas_path::nas_eps_send_tau_accept(mme_ue, enb_ue, false, &[]) {
+    // TS 24.301 §5.5.3.2.4: the TAU accept may reallocate the GUTI, and rotating it
+    // on mobility is what keeps the temporary identity temporary (#46).
+    ctx.allocate_guti(mme_ue_id);
+    // The UE's active bearers, so the accept can carry a real EPS bearer context
+    // status (#46). An empty slice was passed while S11 could establish nothing;
+    // #51 gave the MME a real S11 endpoint, so a UE that has completed an attach
+    // holds bearers worth reporting. Initial Context Setup is still not requested
+    // from here — that is the attach path's job, and it has no caller yet (#51's
+    // ceiling).
+    let bearers: Vec<crate::context::MmeBearer> = mme_ue
+        .sess_list
+        .iter()
+        .filter_map(|sess_id| ctx.sess_find_by_id(*sess_id))
+        .flat_map(|sess| {
+            sess.bearer_list
+                .iter()
+                .filter_map(|id| ctx.bearer_find_by_id(*id))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    if let Err(e) = nas_path::nas_eps_send_tau_accept(mme_ue, enb_ue, false, &bearers) {
         log::error!("[{}] TAU Accept send failed: {e}", mme_ue.imsi_bcd);
     }
 }
@@ -2432,6 +2511,66 @@ mod tests {
         let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
         assert!(!mme_ue.t3460.is_running());
         assert!(mme_ue.t3460.pkbuf.is_none());
+    }
+
+    /// #46 criterion 4 and 5: a GUTI Reallocation Complete promotes the staged GUTI so
+    /// the UE becomes resolvable by S-TMSI.
+    ///
+    /// 0x51 shared an arm with TAU Complete before #46 and neither committed anything,
+    /// so the acknowledgement was recorded and the new identity never took effect.
+    #[test]
+    fn guti_reallocation_complete_commits_the_staged_guti() {
+        // Its OWN context with a served GUMMEI: `test_ctx()` has none, and adding one
+        // there would change the ambient state every other test in this module runs
+        // against.
+        let mut ctx = test_ctx();
+        ctx.served_gummei = vec![crate::context::ServedGummei {
+            num_of_plmn_id: 1,
+            plmn_id: vec![crate::context::PlmnId::new("001", "01")],
+            num_of_mme_gid: 1,
+            mme_gid: vec![2],
+            num_of_mme_code: 1,
+            mme_code: vec![1],
+        }];
+        ctx.num_of_served_gummei = 1;
+        let ctx = ctx;
+        let enb_ue_id = enb_with_connection(&ctx);
+        let mme_ue_id = ue_with_vector(&ctx, enb_ue_id);
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &authentication_response()));
+
+        assert!(
+            ctx.allocate_guti(mme_ue_id),
+            "the fixture's served GUMMEI must allow an allocation"
+        );
+        let staged = ctx
+            .mme_ue_find_by_id(mme_ue_id)
+            .unwrap()
+            .next
+            .m_tmsi
+            .expect("staged");
+        let mme_code = ctx.mme_ue_find_by_id(mme_ue_id).unwrap().next.guti.mme_code;
+        assert_eq!(
+            ctx.mme_ue_find_by_s_tmsi(mme_code, staged),
+            None,
+            "a staged GUTI must not resolve before the UE acknowledges it"
+        );
+
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        let complete = protect_uplink(
+            &mme_ue,
+            1,
+            &[
+                NAS_PROTOCOL_DISCRIMINATOR_EMM,
+                NasEpsMessageType::GutiReallocationComplete as u8,
+            ],
+        );
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &complete));
+
+        assert_eq!(
+            ctx.mme_ue_find_by_s_tmsi(mme_code, staged),
+            Some(mme_ue_id),
+            "the acknowledged GUTI must resolve the UE by S-TMSI"
+        );
     }
 
     #[test]

@@ -392,6 +392,35 @@ impl NasBuffer {
 // EMM Message Building Functions
 // ============================================================================
 
+/// The EPS attach result to signal, and whether the CS domain was refused
+/// (TS 24.301 §9.9.3.10, §5.5.1.3.4.3).
+///
+/// A combined EPS/IMSI attach can only be ACCEPTED as combined if this MME actually
+/// has an SGs association for the UE's tracking area — `csmap_id` is the same test
+/// the Extended Service Request path already uses to refuse CS fallback, so this is
+/// the tree's existing notion of "is there a VLR", not a new one.
+///
+/// When the UE asked for combined and there is no SGs association, §5.5.1.3.4.3 is
+/// explicit: answer "EPS only" AND set the EMM cause to #18 "CS domain not
+/// available". Answering EPS-only with no cause — which is what a hardcoded result
+/// did — tells the UE the network declined without saying why, so it never falls back
+/// to attaching to the CS domain over another access.
+fn attach_result_for(mme_ue: &MmeUe) -> (u8, bool) {
+    let combined_requested = mme_ue.nas_eps.attach_type == AttachType::CombinedEpsImsiAttach as u8;
+    if !combined_requested {
+        return (AttachType::EpsAttach as u8, false);
+    }
+    if mme_ue.csmap_id == crate::context::NEXTGCORE_INVALID_POOL_ID {
+        log::info!(
+            "[{}] combined EPS/IMSI attach requested with no SGs association: answering EPS \
+             only with EMM cause #18 (TS 24.301 §5.5.1.3.4.3)",
+            mme_ue.imsi_bcd
+        );
+        return (AttachType::EpsAttach as u8, true);
+    }
+    (AttachType::CombinedEpsImsiAttach as u8, false)
+}
+
 /// Build attach accept message
 pub fn build_attach_accept(
     mme_ue: &MmeUe,
@@ -409,8 +438,16 @@ pub fn build_attach_accept(
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_EMM);
     buf.write_u8(NasEpsMessageType::AttachAccept as u8);
 
-    // EPS attach result (4 bits) + spare (4 bits)
-    let attach_result = AttachType::EpsAttach as u8;
+    // EPS attach result (TS 24.301 §9.9.3.10): 1 = EPS only, 2 = combined EPS/IMSI.
+    //
+    // #46: this was the literal `AttachType::EpsAttach`, so a UE that asked for a
+    // combined EPS/IMSI attach was always told EPS-only with no cause — which reads
+    // to the UE as "the network chose not to", and leaves it with no reason to
+    // attach to the CS domain separately.
+    //
+    // §9.9.3.11 has three attach TYPES and §9.9.3.10 only two RESULTS: an emergency
+    // attach (type 3) is an EPS-only attach, so it answers 1.
+    let (attach_result, cs_domain_refused) = attach_result_for(mme_ue);
     buf.write_u8(attach_result & 0x07);
 
     // T3412 value
@@ -443,6 +480,14 @@ pub fn build_attach_accept(
         buf.write_u8(mme_ue.next.guti.mme_code);
         // M-TMSI
         buf.write_u32(mme_ue.next.guti.m_tmsi);
+    }
+
+    // EMM cause (IEI 0x53, optional). Present only to say WHY a combined attach was
+    // downgraded; a UE that asked for EPS-only gets no cause, because there is
+    // nothing to explain.
+    if cs_domain_refused {
+        buf.write_u8(0x53);
+        buf.write_u8(EmmCause::CsDomainNotAvailable as u8);
     }
 
     Ok(buf.into_vec())
@@ -606,7 +651,10 @@ pub fn build_tau_accept(
     buf.write_u8(NasEpsMessageType::TauAccept as u8);
 
     // EPS update result (4 bits) + spare (4 bits)
-    buf.write_u8(0x00); // TA updated
+    // EPS update result (TS 24.301 §9.9.3.44). Hardcoded to 0 ("TA updated") before
+    // #46, so a UE that asked for a combined TA/LA update was never told whether its
+    // location area had been updated — and had no reason to think it had not.
+    buf.write_u8(eps_update_result_for(mme_ue) & 0x07);
 
     // Optional: T3412 value
     if t3412_value > 0 {
@@ -639,6 +687,96 @@ pub fn build_tau_accept(
         buf.write_u8(0x57); // EPS bearer context status IEI
         buf.write_u8(2); // Length
         buf.write_u16(eps_bearer_status);
+    }
+
+    buf.into_vec()
+}
+
+/// The EPS update result to signal (TS 24.301 §9.9.3.44, §5.5.3.2.4).
+///
+/// TAU types (§9.9.3.45): 0 = TA updating, 1 = combined TA/LA updating,
+/// 2 = combined with IMSI attach, 3 = periodic updating.
+/// Update results (§9.9.3.44): 0 = TA updated, 1 = combined TA/LA updated.
+///
+/// A combined update can only be reported as combined if this MME has an SGs
+/// association for the UE — same `csmap_id` test as the attach result and as the
+/// Extended Service Request path. Reporting "combined TA/LA updated" without one
+/// would claim a VLR update that never happened, which is worse than the
+/// conservative answer: the UE would believe it is reachable for CS services it
+/// cannot receive.
+///
+/// ISR (results 4 and 5) is deliberately never signalled: Idle-mode Signalling
+/// Reduction requires an S3/S4 SGSN association, and this MME has none.
+fn eps_update_result_for(mme_ue: &MmeUe) -> u8 {
+    const TA_UPDATED: u8 = 0;
+    const COMBINED_TA_LA_UPDATED: u8 = 1;
+
+    let combined_requested = matches!(mme_ue.nas_eps.update_type, 1 | 2);
+    if !combined_requested {
+        return TA_UPDATED;
+    }
+    if mme_ue.csmap_id == crate::context::NEXTGCORE_INVALID_POOL_ID {
+        log::info!(
+            "[{}] combined TA/LA update requested with no SGs association: reporting \
+             \"TA updated\" (TS 24.301 §5.5.3.2.4)",
+            mme_ue.imsi_bcd
+        );
+        return TA_UPDATED;
+    }
+    COMBINED_TA_LA_UPDATED
+}
+
+/// The EPS bearer context status bitmap for a UE's active bearers
+/// (TS 24.301 §9.9.2.1).
+///
+/// Bit N of the 16-bit value means EBI N is active. EBIs 0-4 are reserved
+/// (TS 24.007 §11.2.3.1.5), so only 5-15 can ever be set.
+///
+/// Always passed as `0` before #46, and the builder omits the IE when it is zero — so
+/// after a TAU the UE and the MME had no way to discover they disagreed about which
+/// bearers exist, which is the whole purpose of the IE.
+pub fn eps_bearer_context_status(ebis: impl IntoIterator<Item = u8>) -> u16 {
+    let mut status = 0u16;
+    for ebi in ebis {
+        if (crate::context::MIN_EPS_BEARER_ID..=crate::context::MAX_EPS_BEARER_ID).contains(&ebi) {
+            status |= 1 << ebi;
+        } else {
+            log::warn!("EBI {ebi} is outside the assignable range; omitted from the bearer status");
+        }
+    }
+    status
+}
+
+/// Build GUTI Reallocation Command (TS 24.301 §5.4.1, §8.2.16).
+///
+/// The standalone GUTI reallocation procedure. `GutiReallocationCommand = 0x50` and
+/// `GutiReallocationComplete = 0x51` existed as enum values with no builder and no
+/// handler, so a GUTI could never be refreshed outside an attach or a TAU — which
+/// means the temporary identity a UE presents was never rotated, and the IMSI
+/// confidentiality the GUTI exists to provide degrades with every reuse.
+///
+/// The GUTI is taken from `next`, which is where [`crate::context::MmeContext::allocate_guti`]
+/// stages it; `current` is promoted only when the UE acknowledges with 0x51.
+pub fn build_guti_reallocation_command(mme_ue: &MmeUe, tai_list: &[EpsTai]) -> Vec<u8> {
+    let mut buf = NasBuffer::new();
+    buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_EMM);
+    buf.write_u8(NasEpsMessageType::GutiReallocationCommand as u8);
+
+    // GUTI (M, §9.9.3.12): the whole point of the message, so it is written
+    // unconditionally rather than gated on `next.m_tmsi` the way the accepts are.
+    buf.write_u8(11); // Length
+    buf.write_u8(0xf6); // Odd/even + type = GUTI
+    let plmn = encode_plmn_id(&mme_ue.next.guti.plmn_id);
+    buf.write_bytes(&plmn);
+    buf.write_u16(mme_ue.next.guti.mme_gid);
+    buf.write_u8(mme_ue.next.guti.mme_code);
+    buf.write_u32(mme_ue.next.guti.m_tmsi);
+
+    // TAI list (O, IEI 0x54)
+    if !tai_list.is_empty() {
+        buf.write_u8(0x54);
+        let tai_list_data = encode_tai_list(tai_list);
+        buf.write_lv(&tai_list_data);
     }
 
     buf.into_vec()
@@ -828,6 +966,194 @@ fn encode_time_zone(offset_quarters: i8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ================================================================
+    // #46: the accept messages say what the negotiated procedure produced
+    // ================================================================
+
+    fn ue_with(attach_type: u8, csmap_id: u64) -> MmeUe {
+        let mut ue = MmeUe {
+            csmap_id,
+            ..Default::default()
+        };
+        ue.nas_eps.attach_type = attach_type;
+        ue
+    }
+
+    /// #46 criterion 8(c): a combined EPS/IMSI attach must yield a COMBINED result.
+    ///
+    /// The result was the literal `AttachType::EpsAttach`, so a UE asking for combined
+    /// attach was always told EPS-only.
+    #[test]
+    fn a_combined_attach_with_an_sgs_association_yields_a_combined_result() {
+        let ue = ue_with(AttachType::CombinedEpsImsiAttach as u8, 42);
+        let msg = build_attach_accept(&ue, &[0x01], 600, &[]).expect("build");
+        assert_eq!(
+            msg[2] & 0x07,
+            AttachType::CombinedEpsImsiAttach as u8,
+            "a combined attach with a VLR must be accepted as combined"
+        );
+    }
+
+    /// TS 24.301 §5.5.1.3.4.3: with no SGs association the MME answers EPS-only AND
+    /// says why with EMM cause #18. Answering EPS-only silently — which a hardcoded
+    /// result did — leaves the UE with no reason to attach to the CS domain elsewhere.
+    #[test]
+    fn a_combined_attach_without_an_sgs_association_is_eps_only_with_cause_18() {
+        let ue = ue_with(
+            AttachType::CombinedEpsImsiAttach as u8,
+            crate::context::NEXTGCORE_INVALID_POOL_ID,
+        );
+        let msg = build_attach_accept(&ue, &[0x01], 600, &[]).expect("build");
+        assert_eq!(msg[2] & 0x07, AttachType::EpsAttach as u8);
+        let cause_iei = msg
+            .windows(2)
+            .position(|w| w[0] == 0x53)
+            .expect("the EMM cause IE must be present");
+        assert_eq!(
+            msg[cause_iei + 1],
+            EmmCause::CsDomainNotAvailable as u8,
+            "the UE must be told the CS domain is unavailable, not just refused"
+        );
+    }
+
+    /// An EPS-only attach gets no cause, because there is nothing to explain.
+    #[test]
+    fn an_eps_only_attach_carries_no_emm_cause() {
+        let ue = ue_with(AttachType::EpsAttach as u8, 42);
+        let msg = build_attach_accept(&ue, &[0x01], 600, &[]).expect("build");
+        assert_eq!(msg[2] & 0x07, AttachType::EpsAttach as u8);
+        assert!(
+            !msg.windows(2).any(|w| w[0] == 0x53),
+            "an unremarkable accept must not carry an EMM cause"
+        );
+    }
+
+    /// TS 24.301 §9.9.3.10 has two attach RESULTS and §9.9.3.11 three TYPES: an
+    /// emergency attach is an EPS-only attach, so it answers 1 rather than echoing 3.
+    #[test]
+    fn an_emergency_attach_is_answered_eps_only() {
+        let ue = ue_with(AttachType::EpsEmergencyAttach as u8, 42);
+        let msg = build_attach_accept(&ue, &[0x01], 600, &[]).expect("build");
+        assert_eq!(msg[2] & 0x07, AttachType::EpsAttach as u8);
+    }
+
+    /// #46 criterion 8(b): T3412 is encoded from the value passed, not a literal 3600.
+    ///
+    /// The encoding is a GPRS Timer, so the assertion is against the encoded unit and
+    /// value rather than the raw seconds — which is also what makes it catch a caller
+    /// that passes the right number to the wrong parameter.
+    #[test]
+    fn the_attach_accept_encodes_the_t3412_it_is_given() {
+        let ue = ue_with(AttachType::EpsAttach as u8, 42);
+        let subscribed = build_attach_accept(&ue, &[0x01], 720, &[]).expect("build");
+        let hardcoded = build_attach_accept(&ue, &[0x01], 3600, &[]).expect("build");
+        assert_eq!(
+            subscribed[3],
+            GprsTimer::from_sec(720).encode(),
+            "the accept must encode the timer it was given"
+        );
+        assert_ne!(
+            subscribed[3], hardcoded[3],
+            "720 s and 3600 s must not encode identically, or this test proves nothing"
+        );
+    }
+
+    /// #46 criterion 8(d): a TAU accept with active bearers must carry a NONZERO EPS
+    /// bearer context status, or the UE and the MME cannot resynchronise.
+    #[test]
+    fn a_tau_accept_with_active_bearers_carries_a_nonzero_bearer_status() {
+        let ue = MmeUe::default();
+        let status = eps_bearer_context_status([5u8, 6]);
+        assert_ne!(status, 0, "two active bearers must set two bits");
+        assert_eq!(status, (1 << 5) | (1 << 6));
+
+        let msg = build_tau_accept(&ue, 600, &[], status);
+        let iei = msg
+            .windows(2)
+            .position(|w| w[0] == 0x57)
+            .expect("the EPS bearer context status IE must be present");
+        assert_eq!(msg[iei + 1], 2, "the IE is two octets long");
+        assert_eq!(u16::from_be_bytes([msg[iei + 2], msg[iei + 3]]), status);
+    }
+
+    /// EBIs 0-4 are reserved (TS 24.007 §11.2.3.1.5), so they can never appear in the
+    /// bitmap — a bearer claiming one is a bug worth surfacing, not a bit to set.
+    #[test]
+    fn reserved_ebis_are_excluded_from_the_bearer_status() {
+        assert_eq!(eps_bearer_context_status([0u8, 4, 16, 255]), 0);
+        assert_eq!(eps_bearer_context_status([5u8]), 1 << 5);
+        assert_eq!(eps_bearer_context_status(std::iter::empty()), 0);
+    }
+
+    /// #46 criterion 7: the EPS update result must follow the TAU type and the SGs
+    /// outcome, not be a hardcoded "TA updated".
+    #[test]
+    fn the_eps_update_result_follows_the_tau_type_and_the_sgs_association() {
+        // Plain TA updating, and periodic updating: TA updated.
+        for update_type in [0u8, 3] {
+            let mut ue = MmeUe {
+                csmap_id: 42,
+                ..Default::default()
+            };
+            ue.nas_eps.update_type = update_type;
+            assert_eq!(build_tau_accept(&ue, 600, &[], 0)[2] & 0x07, 0);
+        }
+        // Combined, with a VLR: combined TA/LA updated.
+        for update_type in [1u8, 2] {
+            let mut ue = MmeUe {
+                csmap_id: 42,
+                ..Default::default()
+            };
+            ue.nas_eps.update_type = update_type;
+            assert_eq!(
+                build_tau_accept(&ue, 600, &[], 0)[2] & 0x07,
+                1,
+                "a combined update with a VLR must be reported as combined"
+            );
+        }
+        // Combined, with no VLR: TA updated, because claiming the LA was updated
+        // would tell the UE it is reachable for CS services it cannot receive.
+        let mut ue = MmeUe {
+            csmap_id: crate::context::NEXTGCORE_INVALID_POOL_ID,
+            ..Default::default()
+        };
+        ue.nas_eps.update_type = 1;
+        assert_eq!(build_tau_accept(&ue, 600, &[], 0)[2] & 0x07, 0);
+    }
+
+    /// #46 criterion 5: the GUTI Reallocation Command exists and carries the staged
+    /// GUTI. `GutiReallocationCommand = 0x50` was an enum value with no builder, so a
+    /// GUTI could never be refreshed outside an attach or a TAU.
+    #[test]
+    fn the_guti_reallocation_command_carries_the_staged_guti() {
+        let mut ue = MmeUe::default();
+        ue.next.m_tmsi = Some(0x0102_0304);
+        ue.next.guti = crate::context::EpsGuti {
+            plmn_id: PlmnId::new("999", "70"),
+            mme_gid: 2,
+            mme_code: 1,
+            m_tmsi: 0x0102_0304,
+        };
+
+        let msg = build_guti_reallocation_command(&ue, &[]);
+        assert_eq!(msg[0], NAS_PROTOCOL_DISCRIMINATOR_EMM);
+        assert_eq!(msg[1], NasEpsMessageType::GutiReallocationCommand as u8);
+        assert_eq!(msg[2], 11, "the GUTI IE is 11 octets of content");
+        assert_eq!(msg[3], 0xf6, "odd/even indicator plus type = GUTI");
+        // Content layout (TS 24.301 §9.9.3.12): 0xf6, PLMN (3), MME group id (2),
+        // MME code (1), M-TMSI (4) — so the M-TMSI is the LAST four of the eleven.
+        assert_eq!(
+            u32::from_be_bytes([msg[10], msg[11], msg[12], msg[13]]),
+            0x0102_0304,
+            "the command must carry the GUTI that was staged"
+        );
+        assert_eq!(
+            msg.len(),
+            2 + 1 + 11,
+            "header, length octet, and 11 of content"
+        );
+    }
 
     #[test]
     fn test_encode_tai_list_type0_single_plmn() {

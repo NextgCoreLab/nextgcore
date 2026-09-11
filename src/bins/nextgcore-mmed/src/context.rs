@@ -1190,6 +1190,23 @@ pub struct MmeUe {
     pub csmap_id: u64,
     /// HSS map pool ID
     pub hssmap_id: u64,
+
+    /// Subscribed periodic RAU/TAU timer, in seconds, from the S6a ULA
+    /// (TS 29.272 §7.3.134). `0` means the subscription did not state one.
+    ///
+    /// #46: the shared S6a codec round-tripped this AVP all along and mmed dropped
+    /// it on the floor with the comment "would need to be added to MmeUe if needed",
+    /// so both accepts signalled a hardcoded 3600 s regardless of the subscriber's
+    /// profile. TS 23.401 §4.3.17.3 derives T3412 from this value, so a UE was told
+    /// to re-register on a cadence the HSS had not asked for.
+    pub subscribed_rau_tau_timer: u32,
+
+    /// Whether the UE asked for EMERGENCY attach (TS 24.301 §9.9.3.11 value 3).
+    ///
+    /// Recorded so the rest of the stack can distinguish an emergency attach from a
+    /// normal one. What it does NOT mean is that emergency bearer services are
+    /// implemented — see `emm_handler`'s emergency branch for the boundary.
+    pub emergency_attach: bool,
 }
 
 // ============================================================================
@@ -1446,6 +1463,11 @@ pub struct MmeContext {
 
     /// MME UE S1AP ID generator
     pub mme_ue_s1ap_id: AtomicU32,
+    /// M-TMSI allocation counter (#46).
+    ///
+    /// Starts at 1 because 0 is the "no GUTI allocated" encoding — see
+    /// [`MmeContext::allocate_m_tmsi`].
+    pub m_tmsi_counter: AtomicU32,
 
     /// MME UE list
     pub mme_ue_list: Vec<u64>,
@@ -1552,6 +1574,7 @@ impl MmeContext {
             sgsap_port: 29118,
             relative_capacity: 255,
             mme_ue_s1ap_id: AtomicU32::new(1),
+            m_tmsi_counter: AtomicU32::new(1),
             pool_id_counter: AtomicU64::new(NEXTGCORE_MIN_POOL_ID),
             initialized: AtomicBool::new(false),
             integrity_order: DEFAULT_INTEGRITY_ORDER.to_vec(),
@@ -1589,6 +1612,118 @@ impl MmeContext {
         } else {
             id
         }
+    }
+
+    /// Allocate an M-TMSI that no UE context currently holds (#46).
+    ///
+    /// From a process-global counter, not a per-UE one: the M-TMSI is the key
+    /// `mme_ue_find_by_s_tmsi` looks a UE up by, so two UEs minting the same value
+    /// would make one of them unreachable by S-TMSI and the other resolvable to the
+    /// wrong context. The counter is then checked against the pool, because a
+    /// wrapped counter can collide with a long-lived UE that is still attached.
+    ///
+    /// `0` is skipped: the encoding treats a zero M-TMSI as "no GUTI allocated"
+    /// (`TmsiInfo::m_tmsi` is `None` for exactly that state), so handing one out
+    /// would produce a UE that holds a GUTI the accept builder refuses to emit.
+    ///
+    /// Returns `None` only if 1024 consecutive candidates are all in use, which for
+    /// a 32-bit space means the pool is effectively full.
+    pub fn allocate_m_tmsi(&self) -> Option<u32> {
+        for _ in 0..1024 {
+            let candidate = self.m_tmsi_counter.fetch_add(1, Ordering::SeqCst);
+            if candidate == 0 {
+                continue;
+            }
+            let taken = self
+                .mme_ue_pool
+                .read()
+                .map(|pool| {
+                    pool.values().any(|ue| {
+                        ue.current.m_tmsi == Some(candidate) || ue.next.m_tmsi == Some(candidate)
+                    })
+                })
+                .unwrap_or(true);
+            if !taken {
+                return Some(candidate);
+            }
+        }
+        log::error!("no free M-TMSI after 1024 attempts: the S-TMSI space is exhausted");
+        None
+    }
+
+    /// Allocate a GUTI for this UE and stage it in `next` (TS 24.301 §5.4.1).
+    ///
+    /// Staged rather than applied, because the UE does not hold the new GUTI until it
+    /// acknowledges the message carrying it. `current` is promoted from `next` by
+    /// [`Self::commit_staged_guti`] when the Attach Complete / TAU Complete / GUTI
+    /// Reallocation Complete arrives — which is what makes the allocated GUTI
+    /// resolvable by `mme_ue_find_by_s_tmsi`. Before #46 nothing wrote either, so the
+    /// accept builders' `next.m_tmsi.is_some()` gate was never true outside tests and
+    /// the GUTI IE was dead code.
+    ///
+    /// The GUMMEI comes from the served GUMMEI this MME is configured with; with none
+    /// configured there is nothing to build a GUTI from and this returns `false`
+    /// rather than inventing an identity that no eNB would route.
+    pub fn allocate_guti(&self, mme_ue_id: u64) -> bool {
+        let Some(gummei) = self.served_gummei.first() else {
+            log::warn!("no served GUMMEI configured: cannot allocate a GUTI");
+            return false;
+        };
+        let (Some(plmn_id), Some(&mme_gid), Some(&mme_code)) = (
+            gummei.plmn_id.first().cloned(),
+            gummei.mme_gid.first(),
+            gummei.mme_code.first(),
+        ) else {
+            log::warn!("served GUMMEI is incomplete: cannot allocate a GUTI");
+            return false;
+        };
+        let Some(m_tmsi) = self.allocate_m_tmsi() else {
+            return false;
+        };
+        let Ok(mut pool) = self.mme_ue_pool.write() else {
+            return false;
+        };
+        let Some(ue) = pool.get_mut(&mme_ue_id) else {
+            return false;
+        };
+        ue.next.m_tmsi = Some(m_tmsi);
+        ue.next.guti = EpsGuti {
+            plmn_id,
+            mme_gid,
+            mme_code,
+            m_tmsi,
+        };
+        log::info!(
+            "[{}] GUTI allocated: mme_gid={mme_gid} mme_code={mme_code} m_tmsi=0x{m_tmsi:08x}",
+            ue.imsi_bcd
+        );
+        true
+    }
+
+    /// Promote a staged GUTI to `current` once the UE has acknowledged it.
+    ///
+    /// Without this the allocation is decorative: `mme_ue_find_by_s_tmsi` matches on
+    /// `current.m_tmsi`, so a UE that returns with only an S-TMSI would not be found
+    /// and would be made to re-identify itself with its IMSI — the confidentiality
+    /// the GUTI exists to provide, lost at the first mobility event.
+    pub fn commit_staged_guti(&self, mme_ue_id: u64) -> bool {
+        let Ok(mut pool) = self.mme_ue_pool.write() else {
+            return false;
+        };
+        let Some(ue) = pool.get_mut(&mme_ue_id) else {
+            return false;
+        };
+        if ue.next.m_tmsi.is_none() {
+            return false;
+        }
+        ue.current.m_tmsi = ue.next.m_tmsi;
+        ue.current.guti = ue.next.guti.clone();
+        log::debug!(
+            "[{}] GUTI committed: m_tmsi=0x{:08x}",
+            ue.imsi_bcd,
+            ue.current.guti.m_tmsi
+        );
+        true
     }
 }
 
@@ -2245,4 +2380,133 @@ pub fn mme_context_init_with_config(config_path: &str) -> bool {
 /// Finalize the global MME context
 pub fn mme_context_final() {
     mme_self().final_();
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A context with one served GUMMEI, built the way configuration builds it —
+    /// `served_gummei` is set at construction rather than mutated afterwards, which is
+    /// why this test owns its context instead of using `mme_self()`.
+    fn ctx_with_gummei() -> MmeContext {
+        let mut ctx = MmeContext::new();
+        ctx.init();
+        ctx.served_gummei = vec![ServedGummei {
+            num_of_plmn_id: 1,
+            plmn_id: vec![PlmnId::new("999", "70")],
+            num_of_mme_gid: 1,
+            mme_gid: vec![2],
+            num_of_mme_code: 1,
+            mme_code: vec![1],
+        }];
+        ctx.num_of_served_gummei = 1;
+        ctx
+    }
+
+    /// #46 criterion 4: the M-TMSI comes from a PROCESS-GLOBAL counter, so two UEs
+    /// never mint the same one.
+    ///
+    /// It is the key `mme_ue_find_by_s_tmsi` looks a UE up by: a duplicate makes one UE
+    /// unreachable by S-TMSI and resolves the other to the wrong context. Per-instance
+    /// numbering would be invisible in production, where there is one instance.
+    #[test]
+    fn allocated_m_tmsis_are_unique_and_never_zero() {
+        let ctx = ctx_with_gummei();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..500 {
+            let m = ctx.allocate_m_tmsi().expect("the space is not exhausted");
+            assert_ne!(
+                m, 0,
+                "0 encodes \"no GUTI allocated\" and must never be issued"
+            );
+            assert!(seen.insert(m), "M-TMSI {m} was issued twice");
+        }
+    }
+
+    /// With no served GUMMEI there is nothing to build a GUTI from, and inventing one
+    /// would produce an identity no eNB could route.
+    #[test]
+    fn allocate_guti_refuses_without_a_served_gummei() {
+        let ctx = MmeContext::new();
+        ctx.init();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        let enb_ue_id = ctx.enb_ue_add(enb_id, 46);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+        assert!(
+            !ctx.allocate_guti(mme_ue_id),
+            "it must refuse rather than invent a GUMMEI"
+        );
+        assert!(ctx
+            .mme_ue_find_by_id(mme_ue_id)
+            .unwrap()
+            .next
+            .m_tmsi
+            .is_none());
+    }
+
+    /// A GUTI is STAGED in `next` and only becomes `current` when the UE acknowledges.
+    ///
+    /// Promoting early would make `mme_ue_find_by_s_tmsi` match a UE on an identity it
+    /// has not been told about; never promoting at all — which is what happened before
+    /// #46, because nothing allocated or committed one — leaves that lookup permanently
+    /// dormant and forces every returning UE to re-identify by IMSI.
+    #[test]
+    fn a_guti_is_staged_then_committed_and_becomes_resolvable() {
+        let ctx = ctx_with_gummei();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        let enb_ue_id = ctx.enb_ue_add(enb_id, 46);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+
+        assert!(ctx.allocate_guti(mme_ue_id));
+        let staged = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        let m_tmsi = staged.next.m_tmsi.expect("staged in next");
+        assert_eq!(staged.next.guti.mme_gid, 2);
+        assert_eq!(staged.next.guti.mme_code, 1);
+        assert!(
+            staged.current.m_tmsi.is_none(),
+            "the UE has not acknowledged it yet, so current must be untouched"
+        );
+        assert_eq!(
+            ctx.mme_ue_find_by_s_tmsi(1, m_tmsi),
+            None,
+            "a staged GUTI must not resolve: the UE still answers to the old identity"
+        );
+
+        assert!(ctx.commit_staged_guti(mme_ue_id));
+        assert_eq!(
+            ctx.mme_ue_find_by_s_tmsi(1, m_tmsi),
+            Some(mme_ue_id),
+            "once acknowledged, the GUTI must resolve the UE by S-TMSI"
+        );
+    }
+
+    /// Committing with nothing staged is a disagreement worth reporting, not a no-op to
+    /// swallow: it means the UE acknowledged an identity this MME never allocated.
+    #[test]
+    fn committing_with_nothing_staged_reports_false() {
+        let ctx = ctx_with_gummei();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        let enb_ue_id = ctx.enb_ue_add(enb_id, 46);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+        assert!(!ctx.commit_staged_guti(mme_ue_id));
+    }
+
+    /// The RAT Type defaults to E-UTRAN, not to `Default`'s 0 — which is a reserved
+    /// value a conformant SGW would reject on the S11 Create Session Request.
+    #[test]
+    fn a_new_ue_defaults_to_the_eutran_rat_type() {
+        let ctx = ctx_with_gummei();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        let enb_ue_id = ctx.enb_ue_add(enb_id, 46);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+        assert_eq!(
+            ctx.mme_ue_find_by_id(mme_ue_id).unwrap().rat_type,
+            crate::s11_build::rat_type::EUTRAN
+        );
+    }
 }
