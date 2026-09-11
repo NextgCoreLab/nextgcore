@@ -1,18 +1,11 @@
 //! GTP-C Message Handling
 
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
 //!
 //! Port of src/smf/s5c-handler.c - GTP-C message handling for SMF
 //! Handles GTPv2-C (S5/S8) request and response processing
 
-use std::net::{Ipv4Addr, Ipv6Addr};
-
-use crate::context::{IpAddr as SmfIpAddr, Qos, SmfBearer, SmfContext, SmfSess, SmfUe};
-use crate::gtp_build::{
-    gtp2_ie_type, gtp2_message_type, gtp2_rat_type, pdn_type, BearerQos, FTeid, Gtp2Cause, Paa,
-};
+use crate::context::{SmfBearer, SmfSess, SmfUe};
+use crate::gtp_build::{gtp2_rat_type, BearerQos, FTeid, Gtp2Cause, Paa};
 
 // ============================================================================
 // GTPv2-C Request Parsing Structures
@@ -397,9 +390,24 @@ pub fn handle_create_session_request(
         let _ = selection_mode;
     }
 
-    // Store UE session type from PAA
+    // Store the UE's REQUESTED session type from the PAA, converted into the numbering
+    // `session_type` uses.
+    //
+    // `Paa::pdn_type` is the GTP PDN Type IE (TS 29.274 §8.34: 1=IPv4, 2=IPv6,
+    // 3=IPv4v6); `PduSessionType` is the NAS/5G enum, where `Ipv4 == 0`.
+    // `build_create_session_response` compares `ue_session_type != session_type as u8` to
+    // decide between cause 16 and cause 18 "New PDN type due to network preference", so
+    // storing the raw GTP value made EVERY IPv4 session answer 18 — a spurious "the
+    // network chose differently" on a request the network honoured exactly.
+    //
+    // Latent until #52, because nothing called this handler or that builder in
+    // production. Found by driving a real Create Session Request into the new socket.
     if let Some(ref paa) = req.paa {
-        sess.ue_session_type = paa.pdn_type;
+        sess.ue_session_type = match paa.pdn_type {
+            2 => crate::context::PduSessionType::Ipv6,
+            3 => crate::context::PduSessionType::Ipv4v6,
+            _ => crate::context::PduSessionType::Ipv4,
+        } as u8;
     }
 
     // Set SGW S5C TEID and IP
@@ -466,7 +474,7 @@ fn buffer_to_bcd(buf: &[u8]) -> String {
 /// Port of smf_s5c_handle_delete_session_request
 pub fn handle_delete_session_request(
     sess: &SmfSess,
-    req: &DeleteSessionRequest,
+    _req: &DeleteSessionRequest,
     has_gx_peer: bool,
     has_s6b_peer: bool,
 ) -> DeleteSessionResult {
@@ -881,12 +889,609 @@ impl IndicationFlags {
 }
 
 // ============================================================================
+// S5/S8 wire dispatch (#52)
+// ============================================================================
+
+use crate::gtp_build::gtp2_message_type;
+use nextgcore_gtp::v2::{
+    Gtp2AmbrIe, Gtp2ApnIe, Gtp2BearerContextIe, Gtp2FTeidIe, Gtp2IeType, Gtp2Message, Gtp2PaaIe,
+};
+
+/// Decode a Create Session Request off the wire into this module's own struct.
+///
+/// The IEs are decoded by the shared, round-trip-tested library and mapped onto
+/// [`CreateSessionRequest`], which had no parser at all before #52 — it was
+/// constructed only by tests, which is why `handle_create_session_request` had no
+/// production caller.
+///
+/// Mandatory-IE absence is reported as the cause TS 29.274 §7.7 gives for it rather
+/// than defaulted, because a request missing the Sender F-TEID or the Bearer Context
+/// is one the PGW cannot answer usefully.
+fn parse_create_session_request(msg: &Gtp2Message) -> Result<CreateSessionRequest, Gtp2Cause> {
+    let mut req = CreateSessionRequest::default();
+
+    let imsi = msg
+        .get_ie(Gtp2IeType::Imsi as u8, 0)
+        .ok_or(Gtp2Cause::MandatoryIeMissing)?;
+    req.imsi = imsi.value.to_vec();
+
+    req.msisdn = msg
+        .get_ie(Gtp2IeType::Msisdn as u8, 0)
+        .map(|ie| ie.value.to_vec());
+    req.mei = msg
+        .get_ie(Gtp2IeType::Mei as u8, 0)
+        .map(|ie| ie.value.to_vec());
+    req.serving_network = msg
+        .get_ie(Gtp2IeType::ServingNetwork as u8, 0)
+        .and_then(|ie| ie.value.get(..3).map(|v| [v[0], v[1], v[2]]));
+
+    req.rat_type = msg
+        .get_ie(Gtp2IeType::RatType as u8, 0)
+        .and_then(|ie| ie.value.first().copied())
+        .ok_or(Gtp2Cause::MandatoryIeMissing)?;
+
+    let fteid_ie = msg
+        .get_ie(Gtp2IeType::FTeid as u8, 0)
+        .ok_or(Gtp2Cause::MandatoryIeMissing)?;
+    let fteid =
+        Gtp2FTeidIe::decode(&fteid_ie.value).map_err(|_| Gtp2Cause::MandatoryIeIncorrect)?;
+    req.sender_f_teid = Some(FTeid::new_ipv4(
+        fteid.interface_type,
+        fteid.teid,
+        std::net::Ipv4Addr::from(fteid.ipv4_addr.unwrap_or([0, 0, 0, 0])),
+    ));
+
+    let apn_ie = msg
+        .get_ie(Gtp2IeType::Apn as u8, 0)
+        .ok_or(Gtp2Cause::MandatoryIeMissing)?;
+    let apn = Gtp2ApnIe::decode(&apn_ie.value)
+        .map_err(|_| Gtp2Cause::MandatoryIeIncorrect)?
+        .to_string();
+    if apn.is_empty() {
+        return Err(Gtp2Cause::MandatoryIeIncorrect);
+    }
+    req.apn = Some(apn);
+
+    req.selection_mode = msg
+        .get_ie(Gtp2IeType::SelectionMode as u8, 0)
+        .and_then(|ie| ie.value.first().copied());
+    req.pdn_type = msg
+        .get_ie(Gtp2IeType::PdnType as u8, 0)
+        .and_then(|ie| ie.value.first().copied())
+        .map(|v| v & 0x07)
+        .unwrap_or(1);
+
+    // The PAA the SGW-C sends is a REQUEST, not an assignment: TS 23.401 §5.3.2.1
+    // makes address allocation a PGW function. It is parsed so the handler's
+    // conditional-IE check passes and then deliberately replaced by the address this
+    // node allocates — see `dispatch_s5s8_request`.
+    req.paa = msg
+        .get_ie(Gtp2IeType::Paa as u8, 0)
+        .and_then(|ie| Gtp2PaaIe::decode(&ie.value).ok())
+        .map(|paa| {
+            Paa::ipv4(std::net::Ipv4Addr::from(
+                paa.ipv4_addr.unwrap_or([0, 0, 0, 0]),
+            ))
+        });
+
+    req.ambr = msg
+        .get_ie(Gtp2IeType::Ambr as u8, 0)
+        .and_then(|ie| Gtp2AmbrIe::decode(&ie.value).ok())
+        .map(|ambr| (ambr.uplink, ambr.downlink));
+
+    let bc_ie = msg
+        .get_ie(Gtp2IeType::BearerContext as u8, 0)
+        .ok_or(Gtp2Cause::MandatoryIeMissing)?;
+    let bc =
+        Gtp2BearerContextIe::decode(&bc_ie.value).map_err(|_| Gtp2Cause::MandatoryIeIncorrect)?;
+    let ebi = bc.ebi().map_err(|_| Gtp2Cause::MandatoryIeMissing)?;
+    let qos = bc
+        .bearer_qos()
+        .map_err(|_| Gtp2Cause::MandatoryIeIncorrect)?
+        .ok_or(Gtp2Cause::MandatoryIeMissing)?;
+    // The SGW's S5/S8-U endpoint, at instance 2 (TS 29.274 Table 7.2.1-2). This is the
+    // downlink tunnel the PGW-U forwards to.
+    let s5u = bc.fteid(2).ok().flatten().map(|ft| {
+        FTeid::new_ipv4(
+            ft.interface_type,
+            ft.teid,
+            std::net::Ipv4Addr::from(ft.ipv4_addr.unwrap_or([0, 0, 0, 0])),
+        )
+    });
+    req.bearer_contexts.push(BearerContextToCreate {
+        ebi,
+        bearer_qos: Some(BearerQos {
+            qci: qos.qci,
+            priority_level: qos.pl,
+            pre_emption_capability: qos.pci,
+            pre_emption_vulnerability: qos.pvi,
+            ul_mbr: qos.mbr_ul,
+            dl_mbr: qos.mbr_dl,
+            ul_gbr: qos.gbr_ul,
+            dl_gbr: qos.gbr_dl,
+        }),
+        s5u_sgw_f_teid: s5u,
+        s2b_u_epdg_f_teid: None,
+    });
+
+    req.pco = msg
+        .get_ie(Gtp2IeType::Pco as u8, 0)
+        .map(|ie| ie.value.to_vec());
+    // Extended PCO (TS 29.274 §8.128, IE type 197). Read by numeric type because the
+    // library's `Gtp2IeType` does not model it; the alternative was to drop an IE the
+    // SGW-C may legitimately send.
+    const EXTENDED_PCO_IE_TYPE: u8 = 197;
+    req.epco = msg
+        .get_ie(EXTENDED_PCO_IE_TYPE, 0)
+        .map(|ie| ie.value.to_vec());
+    req.uli = msg
+        .get_ie(Gtp2IeType::Uli as u8, 0)
+        .map(|ie| ie.value.to_vec());
+
+    Ok(req)
+}
+
+/// Route an initial S5/S8 message from the SGW-C.
+pub async fn dispatch_s5s8_request(
+    server: &crate::gtp_path::S5S8Server,
+    msg_type: u8,
+    sequence_number: u32,
+    raw: &[u8],
+    peer: std::net::SocketAddr,
+) {
+    match msg_type {
+        gtp2_message_type::CREATE_SESSION_REQUEST => {
+            create_session(server, sequence_number, raw, peer).await
+        }
+        other => {
+            // TS 29.274 §7.7: answer with a cause rather than dropping the request, so
+            // the SGW-C's transaction completes instead of expiring on T3.
+            log::warn!(
+                "S5/S8 message type {other} from {peer} is not implemented by this PGW-C; \
+                 answering Service not supported"
+            );
+            let response = crate::gtp_build::build_error_message(
+                other.wrapping_add(1),
+                0,
+                Gtp2Cause::ServiceNotSupported,
+            );
+            server.send_response_public(peer, &response).await;
+        }
+    }
+}
+
+/// Route a triggered S5/S8 message that closed one of this node's transactions.
+pub fn dispatch_s5s8_response(msg_type: u8, _raw: &[u8], peer: std::net::SocketAddr) {
+    log::info!("S5/S8 response type={msg_type} from {peer} correlated");
+}
+
+/// Terminate a Create Session Request: allocate the PDN Address, provision the PGW-U
+/// over N4, and answer from what actually happened (#52 criterion 2).
+///
+/// TS 23.401 §5.3.2.1 makes address allocation a PGW function, which is why the PAA the
+/// SGW-C sent is discarded rather than echoed — echoing it is precisely what sgwcd used
+/// to do, and it meant no node in the deployment ever allocated an address.
+async fn create_session(
+    server: &crate::gtp_path::S5S8Server,
+    sequence_number: u32,
+    raw: &[u8],
+    peer: std::net::SocketAddr,
+) {
+    let mut bytes = bytes::Bytes::copy_from_slice(raw);
+    let msg = match Gtp2Message::decode(&mut bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            log::error!("S5/S8 Create Session Request from {peer} undecodable: {e}");
+            return;
+        }
+    };
+
+    let req = match parse_create_session_request(&msg) {
+        Ok(req) => req,
+        Err(cause) => {
+            log::warn!("S5/S8 Create Session Request from {peer} rejected: cause {cause:?}");
+            let response = crate::gtp_build::build_error_message(
+                gtp2_message_type::CREATE_SESSION_RESPONSE,
+                0,
+                cause,
+            );
+            server.send_response_public(peer, &response).await;
+            return;
+        }
+    };
+
+    let apn = req.apn.clone().unwrap_or_default();
+    let context = crate::context::smf_self();
+
+    // The PDN Address. Allocated HERE, by the anchor, which is the whole point.
+    let Some(ue_ipv4) = context.read().ok().and_then(|ctx| ctx.ipv4_pool.allocate()) else {
+        log::error!("S5/S8 Create Session Request from {peer}: the IPv4 pool is exhausted");
+        let response = crate::gtp_build::build_error_message(
+            gtp2_message_type::CREATE_SESSION_RESPONSE,
+            0,
+            Gtp2Cause::AllDynamicAddressesAreOccupied,
+        );
+        server.send_response_public(peer, &response).await;
+        return;
+    };
+
+    log::info!(
+        "S5/S8 Create Session Request from {peer}: APN '{apn}', allocated PDN address {ue_ipv4}"
+    );
+
+    // The UE and the session. `sess_add_by_apn` is the EPS entry into the session model
+    // — it sets `epc = true` and takes the APN and RAT type — and had no production
+    // caller before #52, because nothing terminated S5/S8 to call it.
+    //
+    // The guard is taken and DROPPED before anything is awaited. A `std::sync` read
+    // guard held across an `.await` is not `Send` (so this would not compile inside a
+    // spawned task) and would hold the whole SMF context for the duration of an N4
+    // round trip, blocking every 5G session on this daemon behind one LTE one.
+    let created = match context.read() {
+        Ok(ctx) => ctx
+            .ue_find_by_imsi(&req.imsi)
+            .or_else(|| ctx.ue_add_by_imsi(&req.imsi))
+            .and_then(|ue| {
+                ctx.sess_add_by_apn(ue.id, &apn, req.rat_type)
+                    .map(|sess| (ue, sess))
+            }),
+        Err(_) => None,
+    };
+    let Some((mut smf_ue, mut sess)) = created else {
+        release_and_reject(
+            server,
+            &context,
+            ue_ipv4,
+            peer,
+            sequence_number,
+            Gtp2Cause::NoResourcesAvailable,
+        )
+        .await;
+        return;
+    };
+
+    // The SGW's control-plane TEID is what the response is addressed to, and the PDN
+    // address is the one THIS node allocated rather than the one the SGW-C proposed.
+    if let Some(ref sender) = req.sender_f_teid {
+        sess.sgw_s5c_teid = sender.teid;
+    }
+    sess.ipv4_addr = Some(ue_ipv4);
+    // What this PGW-C actually serves: IPv4 only, because `ipv4_pool` is the only address
+    // pool it has. An IPv6 or IPv4v6 request therefore legitimately gets cause 18.
+    sess.session_type = crate::context::PduSessionType::Ipv4;
+    if let Some((ul_kbps, dl_kbps)) = req.ambr {
+        sess.session_ambr.uplink = u64::from(ul_kbps) * 1000;
+        sess.session_ambr.downlink = u64::from(dl_kbps) * 1000;
+    }
+
+    let bc = &req.bearer_contexts[0];
+    let qos = bc.bearer_qos.as_ref().expect("checked by the parser");
+    let mut bearer = crate::context::SmfBearer {
+        ebi: bc.ebi,
+        qos: crate::context::Qos {
+            index: qos.qci,
+            arp_priority_level: qos.priority_level,
+            arp_preempt_cap: qos.pre_emption_capability,
+            arp_preempt_vuln: qos.pre_emption_vulnerability,
+            mbr_uplink: qos.ul_mbr,
+            mbr_downlink: qos.dl_mbr,
+            gbr_uplink: qos.ul_gbr,
+            gbr_downlink: qos.dl_gbr,
+        },
+        ..Default::default()
+    };
+    if let Some(ref s5u) = bc.s5u_sgw_f_teid {
+        bearer.sgw_s5u_teid = s5u.teid;
+        bearer.sgw_s5u_ip.ipv4 = s5u.ipv4_addr;
+    }
+
+    // Validate through the handler this issue exists to make reachable. It has always
+    // been correct; it just had `#[cfg(test)]` callers only.
+    //
+    // `has_policy_source` and not `has_gx_peer`: this daemon has Gx STATE
+    // (`gsm_sm.rs`'s CCR/CCA fields) and no Gx transport, and TS 23.401 does not require
+    // a PCRF for a PGW to serve a session. `policy::PolicyDecision::config_default_for_dnn`
+    // is a policy source, and it is the same one the 5G path falls back to when no PCF is
+    // configured (the recorded precedence is PCF, then subscription, then config
+    // default). Passing `false` here would make this endpoint answer
+    // `RemotePeerNotResponding` to every Create Session Request — a socket that binds and
+    // refuses everything.
+    match handle_create_session_request(&mut sess, &mut smf_ue, &req, true, true) {
+        CreateSessionResult::Rejected(cause) => {
+            log::warn!(
+                "S5/S8 Create Session Request from {peer} rejected by the handler: {cause:?}"
+            );
+            release_and_reject(server, &context, ue_ipv4, peer, sequence_number, cause).await;
+            return;
+        }
+        CreateSessionResult::Accepted => {}
+    }
+
+    // Provision the PGW-U over N4. TS 23.401 §5.3.2.1 has the PGW answer once the user
+    // plane exists, and `RequestAccepted` means the request was actually fulfilled — so
+    // the response is built AFTER this, from what the UPF gave.
+    let session_qos = crate::SessionQos {
+        qfi: bc.ebi,
+        ambr_ul_bps: sess.session_ambr.uplink,
+        ambr_dl_bps: sess.session_ambr.downlink,
+        xr_flow: None,
+    };
+    let n4 = match crate::pfcp_session_establish(
+        sess.smf_n4_seid,
+        ue_ipv4.octets(),
+        &apn,
+        1,
+        &session_qos,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            log::error!(
+                "S5/S8 Create Session Request from {peer}: the PGW-U never provisioned the \
+                 session ({e}); answering rather than leaving the SGW-C on T3"
+            );
+            release_and_reject(
+                server,
+                &context,
+                ue_ipv4,
+                peer,
+                sequence_number,
+                Gtp2Cause::RemotePeerNotResponding,
+            )
+            .await;
+            return;
+        }
+    };
+
+    // The PGW-U's F-TEID is the uplink endpoint the SGW-U will forward to.
+    bearer.pgw_s5u_teid = n4.upf_teid;
+    bearer.pgw_s5u_addr = Some(std::net::Ipv4Addr::from(n4.upf_addr));
+
+    let local_ipv4 = match server.local_addr().ip() {
+        std::net::IpAddr::V4(v4) => Some(v4),
+        std::net::IpAddr::V6(_) => None,
+    };
+    let response = crate::gtp_build::build_create_session_response(
+        &sess,
+        std::slice::from_ref(&bearer),
+        local_ipv4,
+        None,
+        req.pco.as_deref(),
+        req.apco.as_deref(),
+        req.epco.as_deref(),
+        true,
+        true,
+    );
+    // The response echoes the request's sequence number: it is a triggered message.
+    let response = with_sequence_number(response, sequence_number);
+    server.send_response_public(peer, &response).await;
+    log::info!(
+        "S5/S8 Create Session Response to {peer}: PAA {ue_ipv4} (allocated here), PGW-U TEID \
+         {:#x}, EBI {}",
+        n4.upf_teid,
+        bearer.ebi
+    );
+}
+
+/// Release the allocated address and answer with a cause.
+///
+/// The address is returned to the pool on every failure path: leaking one per refused
+/// request exhausts a /16 silently, and the UE never received it.
+async fn release_and_reject(
+    server: &crate::gtp_path::S5S8Server,
+    context: &std::sync::Arc<std::sync::RwLock<crate::context::SmfContext>>,
+    ue_ipv4: std::net::Ipv4Addr,
+    peer: std::net::SocketAddr,
+    sequence_number: u32,
+    cause: Gtp2Cause,
+) {
+    if let Ok(ctx) = context.read() {
+        ctx.ipv4_pool.release(ue_ipv4);
+    }
+    let response =
+        crate::gtp_build::build_error_message(gtp2_message_type::CREATE_SESSION_RESPONSE, 0, cause);
+    // A refusal is a triggered message too: it must echo the sequence number, or the
+    // SGW-C waits out T3 on a rejection it already received.
+    let response = with_sequence_number(response, sequence_number);
+    server.send_response_public(peer, &response).await;
+}
+
+/// Set the sequence number of an encoded GTPv2-C message.
+///
+/// The builders in `gtp_build` do not take one — they were written when nothing was
+/// transmitted — so rather than thread a sequence number through eight signatures for
+/// one caller, the message is decoded, its header set, and re-encoded.
+///
+/// Decode-and-re-encode rather than patching the three octets in place: the offset
+/// depends on whether the TEID-present flag is set, and the first version of this
+/// function assumed it was and wrote the sequence four octets early. A triggered
+/// message that does not echo the request's sequence cannot be correlated by the peer,
+/// so getting this silently wrong is exactly the class of defect #52 is about.
+fn with_sequence_number(encoded: Vec<u8>, sequence_number: u32) -> Vec<u8> {
+    let mut bytes = bytes::Bytes::copy_from_slice(&encoded);
+    match Gtp2Message::decode(&mut bytes) {
+        Ok(mut msg) => {
+            msg.header.sequence_number = sequence_number;
+            msg.encode().to_vec()
+        }
+        Err(e) => {
+            log::error!(
+                "cannot set the sequence number on a message this node just built ({e}); sending \
+                 it unchanged, which the peer will not be able to correlate"
+            );
+            encoded
+        }
+    }
+}
+
+// ============================================================================
 // Unit Tests
 // ============================================================================
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
+
+    // ================================================================
+    // #52: the PGW-C role on the wire
+    // ================================================================
+
+    /// Build an S5/S8 Create Session Request the way sgwcd's builder does.
+    fn s5c_csr(seq: u32, sgw_c_teid: u32, requested_paa: [u8; 4]) -> bytes::BytesMut {
+        use nextgcore_gtp::v2::{
+            Gtp2ApnIe, Gtp2BearerContextIe, Gtp2BearerQosIe, Gtp2FTeidIe, Gtp2Header, Gtp2Message,
+            Gtp2PaaIe, Gtp2RatTypeIe,
+        };
+        let mut msg = Gtp2Message::new(Gtp2Header::new(
+            gtp2_message_type::CREATE_SESSION_REQUEST,
+            0,
+            seq,
+        ));
+        msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
+            Gtp2IeType::Imsi as u8,
+            0,
+            &[0x09, 0x91, 0x07, 0x00, 0x00, 0x00, 0x00, 0x01],
+        ));
+        let mut buf = bytes::BytesMut::new();
+        Gtp2RatTypeIe::new(6).encode(&mut buf, 0);
+        let mut b = buf.freeze();
+        msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::decode(&mut b).unwrap());
+        msg.add_ie(Gtp2FTeidIe::new_ipv4(7, sgw_c_teid, [127, 0, 0, 1]).to_ie(0));
+        // Serving Network and ULI: what sgwcd's relay actually sends since #52, and what
+        // this handler requires for an E-UTRAN session. The fixture carried neither at
+        // first and the handler answered `ConditionalIeMissing` — which is the handler
+        // being right, and is how the missing relay in sgwcd was found.
+        msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
+            Gtp2IeType::ServingNetwork as u8,
+            0,
+            &[0x99, 0xf9, 0x07],
+        ));
+        msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
+            Gtp2IeType::Uli as u8,
+            0,
+            &[
+                0x18, 0x99, 0xf9, 0x07, 0x00, 0x01, 0x99, 0xf9, 0x07, 0x00, 0x00, 0x00, 0x01,
+            ],
+        ));
+        let mut buf = bytes::BytesMut::new();
+        Gtp2ApnIe::from_string("internet").encode(&mut buf, 0);
+        let mut b = buf.freeze();
+        msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::decode(&mut b).unwrap());
+        // The PAA the SGW-C proposes. TS 23.401 §5.3.2.1 makes this a REQUEST, and the
+        // test asserts it is NOT what comes back.
+        msg.add_ie(Gtp2PaaIe::ipv4(requested_paa).to_ie(0));
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(5);
+        bc.set_bearer_qos(&Gtp2BearerQosIe::new(9, 0, 0, 0, 0));
+        bc.set_fteid(2, &Gtp2FTeidIe::new_ipv4(4, 0x0505_0505, [127, 0, 0, 1]));
+        msg.add_bearer_context(0, &bc);
+        msg.encode()
+    }
+
+    /// #52 criterion 2, over the wire: the PGW-C allocates the PDN Address itself.
+    ///
+    /// The SGW-C's request proposes `10.99.99.99`; the response must carry an address from
+    /// this node's own pool instead, because TS 23.401 §5.3.2.1 makes allocation a PGW
+    /// function. Before #52 nothing terminated S5/S8 at all, so no address was ever
+    /// allocated anywhere in the deployment.
+    #[tokio::test]
+    async fn a_create_session_request_is_answered_with_an_address_this_node_allocated() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _upf = crate::pfcp_path::stand_in::associated_upf().await;
+        crate::context::smf_context_init(64, 256, 512);
+
+        let server = crate::gtp_path::S5S8Server::open("127.0.0.1:0".parse().unwrap(), 3)
+            .await
+            .expect("bind");
+        let sgw = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind sgw");
+
+        const REQUESTED: [u8; 4] = [10, 99, 99, 99];
+        sgw.send_to(&s5c_csr(0x77, 0x0A0A_0A0A, REQUESTED), server.local_addr())
+            .await
+            .expect("send csr");
+
+        let mut buf = vec![0u8; 4096];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), sgw.recv_from(&mut buf))
+                .await
+                .expect("the PGW-C must answer")
+                .expect("recv");
+        let mut bytes = bytes::Bytes::copy_from_slice(&buf[..len]);
+        let resp = nextgcore_gtp::v2::Gtp2Message::decode(&mut bytes).expect("decode");
+
+        assert_eq!(
+            resp.header.message_type,
+            gtp2_message_type::CREATE_SESSION_RESPONSE
+        );
+        assert_eq!(
+            resp.header.sequence_number, 0x77,
+            "a triggered message echoes the request's sequence number"
+        );
+        assert_eq!(
+            resp.get_ie(Gtp2IeType::Cause as u8, 0)
+                .and_then(|ie| ie.value.first().copied()),
+            Some(16),
+            "the session must be accepted once the PGW-U is provisioned"
+        );
+
+        let paa = resp
+            .get_ie(Gtp2IeType::Paa as u8, 0)
+            .and_then(|ie| Gtp2PaaIe::decode(&ie.value).ok())
+            .expect("the response must carry a PAA");
+        let allocated = paa.ipv4_addr.expect("an IPv4 address");
+        assert_ne!(
+            allocated, REQUESTED,
+            "the PGW must ALLOCATE an address, not echo the one the SGW-C proposed"
+        );
+        assert_eq!(
+            allocated[0], 10,
+            "the address must come from this node's own pool"
+        );
+
+        // APN-Restriction is mandatory in the response for an E-UTRAN session.
+        assert!(
+            resp.get_ie(Gtp2IeType::ApnRestriction as u8, 0).is_some(),
+            "TS 29.274 Table 7.2.2-1 makes APN-Restriction present for E-UTRAN"
+        );
+        server.close();
+    }
+
+    /// An Echo Request is answered with this node's Recovery (#52 criterion 3).
+    #[tokio::test]
+    async fn an_echo_request_is_answered_with_recovery() {
+        let server = crate::gtp_path::S5S8Server::open("127.0.0.1:0".parse().unwrap(), 9)
+            .await
+            .expect("bind");
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let echo = nextgcore_gtp::v2::Gtp2Message::echo_request(5);
+        peer.send_to(&echo.encode(), server.local_addr())
+            .await
+            .expect("send");
+
+        let mut buf = vec![0u8; 4096];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), peer.recv_from(&mut buf))
+                .await
+                .expect("the PGW-C must answer an Echo")
+                .expect("recv");
+        let mut bytes = bytes::Bytes::copy_from_slice(&buf[..len]);
+        let resp = nextgcore_gtp::v2::Gtp2Message::decode(&mut bytes).expect("decode");
+        assert_eq!(resp.header.message_type, gtp2_message_type::ECHO_RESPONSE);
+        assert_eq!(resp.header.sequence_number, 5);
+        assert_eq!(
+            resp.get_ie(Gtp2IeType::Recovery as u8, 0)
+                .and_then(|ie| ie.value.first().copied()),
+            Some(9),
+            "Recovery is mandatory in an Echo Response (TS 29.274 §7.1.2)"
+        );
+        server.close();
+    }
 
     #[test]
     fn test_buffer_to_bcd() {

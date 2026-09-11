@@ -208,6 +208,16 @@ struct SbiClient {
     nrf: Option<Vec<AddrEntry>>,
 }
 
+/// `smf.gtpc`: the S5/S8 interface this PGW-C terminates (#52).
+///
+/// Declared in the shipped `docker/rust/configs/5gc/smf.yaml` all along and read by
+/// nothing, because no socket existed to bind it to — the same shape `mme.gtpc` had
+/// before #51.
+#[derive(Debug, Default, Deserialize)]
+struct GtpcSection {
+    server: Option<Vec<AddrEntry>>,
+}
+
 /// SBI section (server list + client)
 #[derive(Debug, Default, Deserialize)]
 struct SbiSection {
@@ -219,6 +229,7 @@ struct SbiSection {
 #[derive(Debug, Default, Deserialize)]
 struct SmfSection {
     sbi: Option<SbiSection>,
+    gtpc: Option<GtpcSection>,
     /// DNS servers signalled to the UE in the establishment accept's ePCO IE.
     ///
     /// The shipped `docker/rust/configs/5gc/smf.yaml` has declared these (and
@@ -250,6 +261,11 @@ struct SmfConfig {
     dns_servers: Vec<std::net::Ipv4Addr>,
     /// IPv4 link MTU for the same IE.
     mtu: Option<u16>,
+    /// S5/S8 GTP-C bind address, from `smf.gtpc.server[0]` (#52). `None` leaves the
+    /// PGW-C role unbound, which is what every deployment before #52 had.
+    gtpc_addr: Option<String>,
+    /// S5/S8 GTP-C port. TS 29.274 §4.1 fixes GTPv2-C at UDP 2123.
+    gtpc_port: u16,
 }
 
 impl Default for SmfConfig {
@@ -263,6 +279,8 @@ impl Default for SmfConfig {
             nrf_uri: None,
             dns_servers: Vec::new(),
             mtu: None,
+            gtpc_addr: None,
+            gtpc_port: 2123,
         }
     }
 }
@@ -322,6 +340,27 @@ fn load_config(path: &str) -> SmfConfig {
             }
         }
         config.mtu = smf.mtu;
+
+        // S5/S8 bind address (#52). Only the first entry is bound; a second is named
+        // in a warning rather than silently ignored, matching how `sbi.server` and
+        // `mme.gtpc.server` are handled.
+        if let Some(gtpc) = smf.gtpc {
+            let servers = gtpc.server.unwrap_or_default();
+            if servers.len() > 1 {
+                log::warn!(
+                    "{} smf.gtpc.server addresses configured; only the first is bound",
+                    servers.len()
+                );
+            }
+            if let Some(first) = servers.into_iter().next() {
+                if let Some(addr) = first.address {
+                    config.gtpc_addr = Some(addr);
+                }
+                if let Some(port) = first.port {
+                    config.gtpc_port = port;
+                }
+            }
+        }
     }
 
     config
@@ -645,6 +684,19 @@ async fn main() -> Result<()> {
     );
     log::info!("SMF N4 PFCP socket bound on {pfcp_bind_addr} (UPF peers: {upf_pfcp_addrs:?})");
 
+    // The S5/S8 (PGW-C) role (#52). Bound AFTER the N4 socket and the PFCP pool,
+    // because a Create Session Request cannot be answered without a UPF to provision —
+    // binding first would accept requests this daemon could only reject.
+    let s5s8_bind = config.gtpc_addr.as_deref().and_then(|addr| {
+        match format!("{addr}:{}", config.gtpc_port).parse::<std::net::SocketAddr>() {
+            Ok(sa) => Some(sa),
+            Err(e) => {
+                log::warn!("smf.gtpc.server address '{addr}' is unparsable ({e}); S5/S8 not bound");
+                None
+            }
+        }
+    });
+
     let pfcp_clients: Vec<Arc<pfcp_path::PfcpClient>> = upf_pfcp_addrs
         .iter()
         .map(|&peer| {
@@ -658,6 +710,14 @@ async fn main() -> Result<()> {
     // Installs the whole pool and pool slot 0 as the process-wide default
     // client (the legacy single-client paths keep working unchanged).
     pfcp_path::set_global_pool(pfcp_clients.clone());
+
+    // Recovery counter for S5/S8. Derived from the process start rather than persisted:
+    // smfd has no restart-counter file, and inventing one here would be a second answer
+    // to a question mmed and sgwcd already answer their own way. Stated as a ceiling.
+    if let Err(e) = gtp_path::s5s8_open(s5s8_bind, 1).await {
+        log::error!("Failed to bind the S5/S8 GTP-C socket: {e}");
+        return Err(anyhow::anyhow!("S5/S8 bind failed: {e}"));
+    }
     let pfcp_client = pfcp_clients[0].clone();
 
     // #191: hand each client the Recovery Time Stamp the durable snapshot recorded

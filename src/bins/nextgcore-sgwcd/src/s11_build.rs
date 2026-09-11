@@ -487,7 +487,12 @@ pub fn build_s5c_create_session_request(
         fteid(
             f_teid_interface::S5_S8_SGW_GTP_C,
             sess.sgw_s5c_teid,
-            ctx.s11_address(),
+            // #52 criterion 6: the S5-C address, not the S11 one. The two are different
+            // reference points and a deployment may address them separately; the
+            // accessor falls back to the S11 address for the single-address deployment
+            // the shipped compose file describes, so this is a stated decision rather
+            // than a hardcoded reuse.
+            ctx.s5c_address(),
             None,
         )?
         .to_ie(0),
@@ -499,6 +504,28 @@ pub fn build_s5c_create_session_request(
     Gtp2ApnIe::from_string(apn).encode(&mut apn_buf, 0);
     let mut b = apn_buf.freeze();
     msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::decode(&mut b).map_err(|e| e.to_string())?);
+
+    // Serving Network (C) and ULI (C), relayed from the MME's request (#52).
+    //
+    // A conformant PGW requires both for an E-UTRAN session — this tree's own smfd
+    // answers `ConditionalIeMissing` without them — so omitting them makes the relay
+    // refused by the anchor it exists to reach. They are relayed VERBATIM: their content
+    // is the MME's report of where the UE is, and re-deriving it here would be inventing
+    // it.
+    if let Some(ref sn) = sess.serving_network {
+        msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
+            Gtp2IeType::ServingNetwork as u8,
+            0,
+            sn,
+        ));
+    }
+    if let Some(ref uli) = sess.uli {
+        msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
+            Gtp2IeType::Uli as u8,
+            0,
+            uli,
+        ));
+    }
 
     // Selection Mode (C, instance 0)
     let mut sel_buf = bytes::BytesMut::new();

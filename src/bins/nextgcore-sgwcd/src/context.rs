@@ -237,6 +237,11 @@ pub struct SgwcSess {
     pub pfcp_node_id: Option<u64>,
     /// Parent UE ID
     pub sgwc_ue_id: u64,
+    /// Serving Network (TS 29.274 §8.18) from the MME's Create Session Request, held so
+    /// the S5/S8 leg can relay it (#52). A conformant PGW requires it for E-UTRAN.
+    pub serving_network: Option<Vec<u8>>,
+    /// User Location Information (§8.21), likewise relayed rather than re-derived.
+    pub uli: Option<Vec<u8>>,
 }
 
 impl SgwcSess {
@@ -256,6 +261,8 @@ impl SgwcSess {
             gnode_id: None,
             pfcp_node_id: None,
             sgwc_ue_id,
+            serving_network: None,
+            uli: None,
         }
     }
 
@@ -448,6 +455,10 @@ pub struct SgwcContext {
     far_id_generator: AtomicU64,
     /// Local S11/S5-C control-plane IPv4 address
     s11_addr: RwLock<Option<Ipv4Addr>>,
+    /// Local S5-C control-plane address (#52 criterion 6). Distinct from `s11_addr`.
+    s5c_addr: RwLock<Option<Ipv4Addr>>,
+    /// The PGW's S5/S8-C peer (#52).
+    pgw_s5c_peer: RwLock<Option<std::net::SocketAddr>>,
     /// Advertised SGW-U GTP-U IPv4 address (user-plane endpoints)
     gtpu_addr: RwLock<Option<Ipv4Addr>>,
 
@@ -486,6 +497,8 @@ impl SgwcContext {
             pdr_id_generator: AtomicUsize::new(1),
             far_id_generator: AtomicU64::new(1),
             s11_addr: RwLock::new(None),
+            s5c_addr: RwLock::new(None),
+            pgw_s5c_peer: RwLock::new(None),
             gtpu_addr: RwLock::new(None),
             max_num_of_ue: 0,
             max_num_of_sess: 0,
@@ -570,9 +583,49 @@ impl SgwcContext {
         }
     }
 
-    /// Local S11/S5-C control-plane address
+    /// Local S11 control-plane address
     pub fn s11_address(&self) -> Option<Ipv4Addr> {
         self.s11_addr.read().ok().and_then(|a| *a)
+    }
+
+    /// Set the local S5-C control-plane address (#52 criterion 6).
+    pub fn set_s5c_address(&self, addr: Option<Ipv4Addr>) {
+        if let Ok(mut a) = self.s5c_addr.write() {
+            *a = addr;
+        }
+    }
+
+    /// Local S5-C control-plane address, for the Sender F-TEID of an S5/S8 request.
+    ///
+    /// `build_s5c_create_session_request` reused `s11_address()` before #52, which its
+    /// own comment flagged: the S11 and S5/S8 interfaces are different reference points
+    /// and a deployment may well address them separately. Falls back to the S11 address
+    /// when none is configured — the single-address deployment the shipped compose file
+    /// describes — rather than refusing to build, but the fallback is now a stated
+    /// decision instead of a hardcoded reuse.
+    pub fn s5c_address(&self) -> Option<Ipv4Addr> {
+        self.s5c_addr
+            .read()
+            .ok()
+            .and_then(|a| *a)
+            .or_else(|| self.s11_address())
+    }
+
+    /// Set the PGW's S5/S8-C peer address (#52).
+    pub fn set_pgw_s5c_peer(&self, peer: Option<std::net::SocketAddr>) {
+        if let Ok(mut p) = self.pgw_s5c_peer.write() {
+            *p = peer;
+        }
+    }
+
+    /// The PGW this SGW-C relays Create Session Requests to.
+    ///
+    /// `None` means no PGW is configured, and the SGW-C then refuses the S11 request
+    /// rather than answering it locally — which is the defect #52 exists to fix. There
+    /// is no PGW SELECTION function here: TS 23.401 §4.3.8.1 selects by APN via DNS,
+    /// which this tree does not implement, so one configured peer is the honest model.
+    pub fn pgw_s5c_peer(&self) -> Option<std::net::SocketAddr> {
+        self.pgw_s5c_peer.read().ok().and_then(|p| *p)
     }
 
     /// Set the advertised SGW-U GTP-U address

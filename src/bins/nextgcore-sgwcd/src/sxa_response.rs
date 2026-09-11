@@ -43,6 +43,38 @@ pub fn dispatch(sess_id: u64, continuation: S11Continuation, resp_type: u8, body
     }
 }
 
+/// Answer the waiting S11 procedure with a SPECIFIC cause (#52).
+///
+/// [`fail`] answers `REMOTE_PEER_NOT_RESPONDING`, which is right when a peer went
+/// silent. When the PGW answered and REFUSED, the MME is owed the PGW's own cause: the
+/// difference between "the anchor did not reply" and "the anchor said no, because the
+/// APN is unknown" is the difference between a retry and a fix.
+pub fn fail_with_cause(continuation: S11Continuation, cause: u8) {
+    match continuation {
+        S11Continuation::None => {}
+        S11Continuation::CreateSession { peer, seq, teid } => {
+            answer(
+                peer,
+                Gtp2MessageType::CreateSessionResponse,
+                teid,
+                seq,
+                cause,
+            );
+        }
+        S11Continuation::DeleteSession {
+            peer, seq, teid, ..
+        } => {
+            answer(
+                peer,
+                Gtp2MessageType::DeleteSessionResponse,
+                teid,
+                seq,
+                cause,
+            );
+        }
+    }
+}
+
 /// The transaction never completed (T1 x N1 expiry, or a local error).
 ///
 /// The MME is waiting. Answering now with a mapped cause is what stops the procedure

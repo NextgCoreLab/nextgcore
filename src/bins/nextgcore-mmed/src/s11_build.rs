@@ -407,6 +407,21 @@ pub fn build_create_session_request(
         Gtp2ApnIe::from_string(&sess.apn).encode(buf, 0)
     })?);
 
+    // Serving Network (C, TS 29.274 §8.18) and ULI (C, §8.21).
+    //
+    // Added by #52, not #51: #51's criteria named only the Sender F-TEID and the Bearer
+    // Contexts, and these two were listed in that issue's PROSE. Building the anchor
+    // (smfd's PGW-C role) is what showed they are load-bearing — a conformant PGW
+    // answers `ConditionalIeMissing` for an E-UTRAN session without them, so the
+    // MME→SGW-C→PGW chain cannot complete while they are absent, however conformant the
+    // first hop looks on its own.
+    msg.add_ie(Gtp2Ie::from_slice(
+        Gtp2IeType::ServingNetwork as u8,
+        0,
+        &encode_plmn_bcd(&mme_ue.tai.plmn_id),
+    ));
+    msg.add_ie(uli_ie(mme_ue)?);
+
     // Selection Mode (C)
     msg.add_ie(typed_ie(|buf| Gtp2SelectionModeIe::new(0).encode(buf, 0))?);
 

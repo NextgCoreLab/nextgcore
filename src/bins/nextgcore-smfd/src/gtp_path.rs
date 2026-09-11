@@ -1,24 +1,22 @@
 //! GTP Path Management
 
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
 //!
 //! Port of src/smf/gtp-path.c - GTP path management for SMF
 //! Handles GTP-C and GTP-U path setup, teardown, and message sending
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
+
+use nextgcore_gtp::v2::xact::{Gtp2XactConfig, Gtp2XactMgr};
 
 use crate::context::{SmfBearer, SmfSess};
 use crate::gtp_build::{
     build_create_bearer_request, build_create_session_response, build_delete_bearer_request,
     build_delete_session_response, build_echo_response, build_error_message,
     build_modify_bearer_response, build_update_bearer_request, gtp2_message_type, Gtp2Cause,
-    Gtp2MessageBuilder,
 };
 
 // ============================================================================
@@ -998,4 +996,236 @@ mod tests {
         assert_eq!(gtp_modify_flags::TFT_UPDATE, 0x01);
         assert_eq!(gtp_modify_flags::QOS_UPDATE, 0x02);
     }
+}
+
+// ============================================================================
+// S5/S8 GTP-C server: the PGW-C role on the wire (#52)
+// ============================================================================
+
+/// The PGW-C's S5/S8 GTPv2-C endpoint.
+///
+/// Before #52 this daemon bound no GTP-C socket at all: `GTPC_PORT` appeared only in
+/// in-memory `GtpNode` bookkeeping and test asserts, and every `gtp_handler` function
+/// had `#[cfg(test)]` callers only. So nothing terminated S5/S8, no node allocated the
+/// PDN Address, and the dual 5G/LTE core had no anchor gateway for LTE.
+///
+/// **Async, unlike mmed's and sgwcd's servers.** Those are synchronous because the NAS
+/// and S1AP paths that originate their messages are; this one is the terminating end,
+/// and answering a Create Session Request requires awaiting an N4 exchange with the
+/// UPF (`pfcp_session_establish`). An async receive loop lets the handler await that
+/// directly, which is why smfd needs none of the deferred-continuation machinery #54
+/// had to build for sgwcd.
+///
+/// The T3-RESPONSE/N3-REQUESTS budget still comes from the shared [`Gtp2XactMgr`], so
+/// all three GTP-C endpoints in this tree agree about how long a message may take.
+pub struct S5S8Server {
+    socket: Arc<tokio::net::UdpSocket>,
+    local_addr: SocketAddr,
+    restart_counter: u8,
+    xact: tokio::sync::Mutex<Gtp2XactMgr>,
+    running: Arc<AtomicBool>,
+}
+
+/// The process-wide S5/S8 server.
+///
+/// A `OnceLock` for the same reason mmed's is: the PGW-initiated bearer procedures are
+/// triggered from code that threads no transport handle. `None` means the socket was
+/// never bound, and a send then reports that rather than pretending to have sent.
+static S5S8_SERVER: OnceLock<Arc<S5S8Server>> = OnceLock::new();
+
+/// The installed S5/S8 server, or `None` when the PGW-C role is not bound.
+pub fn s5s8_server() -> Option<&'static Arc<S5S8Server>> {
+    S5S8_SERVER.get()
+}
+
+impl S5S8Server {
+    /// Bind the S5/S8 socket and spawn the receive and T3/N3 tasks.
+    pub async fn open(bind: SocketAddr, restart_counter: u8) -> Result<Arc<Self>, String> {
+        let socket = tokio::net::UdpSocket::bind(bind)
+            .await
+            .map_err(|e| format!("bind {bind}: {e}"))?;
+        let local_addr = socket.local_addr().map_err(|e| e.to_string())?;
+        let server = Arc::new(Self {
+            socket: Arc::new(socket),
+            local_addr,
+            restart_counter,
+            xact: tokio::sync::Mutex::new(Gtp2XactMgr::new(Gtp2XactConfig::default())),
+            running: Arc::new(AtomicBool::new(true)),
+        });
+
+        // Receive loop.
+        {
+            let server = server.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                while server.running.load(Ordering::SeqCst) {
+                    match server.socket.recv_from(&mut buf).await {
+                        Ok((len, peer)) => {
+                            let datagram = buf[..len].to_vec();
+                            let server = server.clone();
+                            // Spawned per datagram: answering a Create Session Request
+                            // awaits an N4 exchange, and handling it inline would stop
+                            // this socket receiving anything else for its duration —
+                            // including the SGW-C's retransmission of the very request
+                            // being served.
+                            tokio::spawn(async move {
+                                server.handle_datagram(&datagram, peer).await;
+                            });
+                        }
+                        Err(e) => {
+                            if server.running.load(Ordering::SeqCst) {
+                                log::error!("S5/S8 recv error: {e}");
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // T3-RESPONSE / N3-REQUESTS loop for the requests this node originates
+        // (PGW-initiated Create/Update/Delete Bearer).
+        {
+            let server = server.clone();
+            tokio::spawn(async move {
+                while server.running.load(Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    let poll = {
+                        let mut xact = server.xact.lock().await;
+                        xact.poll(std::time::Instant::now())
+                    };
+                    for (peer, encoded) in poll.retransmits {
+                        log::warn!("S5/S8 T3 expiry: retransmitting to {peer}");
+                        if let Err(e) = server.socket.send_to(&encoded, peer).await {
+                            log::error!("S5/S8 retransmit to {peer} failed: {e}");
+                        }
+                    }
+                    for xact in poll.exhausted {
+                        log::error!(
+                            "S5/S8 N3 exhausted: peer {} not responding (type={}, seq={})",
+                            xact.peer,
+                            xact.message_type,
+                            xact.sequence_number
+                        );
+                    }
+                }
+            });
+        }
+
+        log::info!("SMF/PGW-C S5/S8 GTP-C server listening on {local_addr}");
+        Ok(server)
+    }
+
+    /// Stop the receive and retransmission tasks.
+    pub fn close(&self) {
+        self.running.store(false, Ordering::SeqCst);
+    }
+
+    /// Local bound address, which is also the PGW's S5/S8-C address on the wire.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// The restart counter advertised in Recovery IEs.
+    pub fn restart_counter(&self) -> u8 {
+        self.restart_counter
+    }
+
+    /// Send a triggered (response) message, echoing the request's sequence number.
+    pub async fn send_response_public(&self, peer: SocketAddr, encoded: &[u8]) {
+        if let Err(e) = self.socket.send_to(encoded, peer).await {
+            log::error!("S5/S8 response to {peer} failed: {e}");
+        }
+    }
+
+    /// Send an initial (request) message and arm T3/N3.
+    ///
+    /// Used by the PGW-initiated bearer procedures, which are the only messages this
+    /// node originates on S5/S8.
+    pub async fn send_request(&self, peer: SocketAddr, encoded: Vec<u8>, message_type: u8) -> u32 {
+        let seq = {
+            let mut xact = self.xact.lock().await;
+            let seq = xact.alloc_sequence();
+            xact.register_request(
+                seq,
+                message_type,
+                peer,
+                bytes::Bytes::from(encoded.clone()),
+                0,
+            );
+            seq
+        };
+        if let Err(e) = self.socket.send_to(&encoded, peer).await {
+            log::error!("S5/S8 request to {peer} failed: {e}");
+        }
+        seq
+    }
+
+    /// Outstanding transactions awaiting a triggered message.
+    pub async fn outstanding(&self) -> usize {
+        self.xact.lock().await.outstanding()
+    }
+
+    async fn handle_datagram(&self, data: &[u8], peer: SocketAddr) {
+        let mut bytes = bytes::Bytes::copy_from_slice(data);
+        let msg = match nextgcore_gtp::v2::Gtp2Message::decode(&mut bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                log::error!("[DROP] cannot decode S5/S8 datagram from {peer}: {e}");
+                return;
+            }
+        };
+        let msg_type = msg.header.message_type;
+        let seq = msg.header.sequence_number;
+
+        // Echo: path management, no session state (TS 29.274 §7.1.1). Answered here
+        // rather than through the handler layer, which would only add a hop.
+        if msg_type == gtp2_message_type::ECHO_REQUEST {
+            let mut reply =
+                nextgcore_gtp::v2::Gtp2Message::echo_response(seq, self.restart_counter);
+            reply.header.sequence_number = seq;
+            self.send_response_public(peer, &reply.encode()).await;
+            return;
+        }
+        if msg_type == gtp2_message_type::ECHO_RESPONSE {
+            log::debug!("S5/S8 Echo Response from {peer}");
+            return;
+        }
+
+        // A triggered message closes one of this node's own transactions.
+        let matched = {
+            let mut xact = self.xact.lock().await;
+            xact.match_response(seq, msg_type)
+        };
+        if let Some(closed) = matched {
+            log::debug!(
+                "S5/S8 RX response type={msg_type} seq={seq} from {peer} correlates to type={}",
+                closed.message_type
+            );
+            crate::gtp_handler::dispatch_s5s8_response(msg_type, data, peer);
+            return;
+        }
+
+        // An initial message from the SGW-C.
+        crate::gtp_handler::dispatch_s5s8_request(self, msg_type, seq, data, peer).await;
+    }
+}
+
+/// Bind the S5/S8 socket from configuration and install it process-wide (#52).
+///
+/// With no `smf.gtpc.server` configured this returns `Ok(())` and logs why: an SMF with
+/// no S5/S8 address is a 5G-only deployment, and refusing to start would break every
+/// existing 5GC config that never needed the socket.
+pub async fn s5s8_open(bind: Option<SocketAddr>, restart_counter: u8) -> Result<(), String> {
+    let Some(bind) = bind else {
+        log::info!(
+            "no smf.gtpc.server configured: the S5/S8 (PGW-C) role is NOT bound, so no LTE \
+             session can be anchored here"
+        );
+        return Ok(());
+    };
+    let server = S5S8Server::open(bind, restart_counter).await?;
+    if S5S8_SERVER.set(server).is_err() {
+        log::warn!("an S5/S8 server is already installed; this one is dropped");
+    }
+    Ok(())
 }
