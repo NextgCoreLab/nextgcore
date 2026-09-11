@@ -35,6 +35,10 @@ const EXTENDED_RNC_ID_CONSTRAINT: Constraint = Constraint::new(4096, 65535);
 /// `CSFallbackIndicator ::= ENUMERATED { cs-fallback-required, ...,
 /// cs-fallback-high-priority }`: one root value, one extension addition.
 const CS_FALLBACK_INDICATOR_CONSTRAINT: Constraint = Constraint::extensible(0, 0);
+/// `Direct-Forwarding-Path-Availability ::= ENUMERATED { directPathAvailable, ... }`:
+/// one root value and an extension marker, so the root needs no value bits at all and
+/// the IE's PRESENCE is what carries the meaning.
+const DIRECT_FORWARDING_PATH_AVAILABILITY_CONSTRAINT: Constraint = Constraint::extensible(0, 0);
 /// `OverloadAction ::= ENUMERATED { .. 3 root values .., ..., 4 additions }`
 const OVERLOAD_ACTION_CONSTRAINT: Constraint = Constraint::extensible(0, 2);
 /// `SubscriberProfileIDforRFP ::= INTEGER (1..256)`
@@ -2619,6 +2623,71 @@ pub fn decode_erab_data_forwarding_list(
         ProtocolIeId::E_RAB_DATA_FORWARDING_ITEM,
         decode_erab_data_forwarding_item,
     )
+}
+
+// ============================================================================
+// Status Transfer IEs (§9.1.5.6 / §9.1.5.7)
+// ============================================================================
+
+/// Push an `ENB-StatusTransfer-TransparentContainer` IE carrying `value` verbatim.
+///
+/// The bytes are installed as the open-type value with NO re-encoding, which is what
+/// makes the MME's relay byte-preserving (TS 36.413 §8.4.7). Going through `push_ie`
+/// would run them back through an `AperEncoder`, and an encoder that pads or aligns
+/// differently from the peer that produced them would change the PDCP SN/HFN status
+/// the procedure exists to carry intact.
+pub fn encode_enb_status_transfer_container(
+    container: &mut ProtocolIeContainer,
+    value: &[u8],
+) -> S1apResult<()> {
+    container.push(ProtocolIeField {
+        id: ProtocolIeId::ENB_STATUS_TRANSFER_TRANSPARENT_CONTAINER,
+        criticality: Criticality::Reject,
+        value: value.to_vec(),
+    });
+    Ok(())
+}
+
+/// The raw open-type value of an `ENB-StatusTransfer-TransparentContainer` IE.
+///
+/// Not decoded into a `Bearers-SubjectToStatusTransfer` model on purpose; see
+/// [`crate::types::EnbStatusTransfer::status_transfer_container`].
+pub fn decode_enb_status_transfer_container(field: &ProtocolIeField) -> S1apResult<Vec<u8>> {
+    Ok(field.value.clone())
+}
+
+/// Push a `Direct-Forwarding-Path-Availability` IE (TS 36.413 §9.2.1.16).
+pub fn encode_direct_forwarding_path_availability(
+    container: &mut ProtocolIeContainer,
+    value: DirectForwardingPathAvailability,
+) -> S1apResult<()> {
+    let index = match value {
+        DirectForwardingPathAvailability::DirectPathAvailable => 0,
+    };
+    push_ie(
+        container,
+        ProtocolIeId::DIRECT_FORWARDING_PATH_AVAILABILITY,
+        Criticality::Ignore,
+        |encoder| {
+            encoder.encode_enumerated(index, &DIRECT_FORWARDING_PATH_AVAILABILITY_CONSTRAINT)?;
+            Ok(())
+        },
+    )
+}
+
+/// Decode a `Direct-Forwarding-Path-Availability` IE.
+///
+/// An unknown value is an EXTENSION ADDITION, not a protocol error: the ASN.1 marks
+/// the type extensible, and §9.2.1.16's only defined root value already means "a
+/// direct path is available". A future addition still tells us that much, so it is
+/// mapped to the root value rather than rejected -- refusing it would fail a handover
+/// over an IE whose criticality is `ignore`.
+pub fn decode_direct_forwarding_path_availability(
+    field: &ProtocolIeField,
+) -> S1apResult<DirectForwardingPathAvailability> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let _ = decoder.decode_enumerated(&DIRECT_FORWARDING_PATH_AVAILABILITY_CONSTRAINT)?;
+    Ok(DirectForwardingPathAvailability::DirectPathAvailable)
 }
 
 // ============================================================================

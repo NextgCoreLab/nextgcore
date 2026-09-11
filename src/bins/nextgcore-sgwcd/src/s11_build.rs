@@ -30,8 +30,21 @@ pub mod f_teid_interface {
     pub const S5_S8_PGW_GTP_C: u8 = 7;
     pub const S11_MME_GTP_C: u8 = 10;
     pub const S11_S4_SGW_GTP_C: u8 = 11;
-    pub const SGW_GTP_U_DL_DATA_FORWARDING: u8 = 22;
-    pub const SGW_GTP_U_UL_DATA_FORWARDING: u8 = 23;
+    /// SGW/UPF GTP-U interface for DL data forwarding.
+    ///
+    /// #48: this said **22**, which TS 29.274 §8.22 defines as "SGSN GTP-U interface
+    /// for data forwarding". The authoritative value is 23, and Table 7.2.19-2 NOTE 3
+    /// says so twice over: "for DL data forwarding the SGW shall set the interface type
+    /// in the F-TEID to 23". Inert until #48 because nothing allocated a forwarding
+    /// tunnel, so the emitting branch was never taken -- the same latency that hid
+    /// `smfd`'s S_NSSAI=250 (#321).
+    pub const SGW_GTP_U_DL_DATA_FORWARDING: u8 = 23;
+    /// SGW GTP-U interface for UL data forwarding.
+    ///
+    /// #48: this said **23**, which is the DL value above, so the two directions would
+    /// have gone out indistinguishable. Table 7.2.19-2 NOTE 4: "for UL data forwarding
+    /// the SGW shall set the interface type in the F-TEID to 28".
+    pub const SGW_GTP_U_UL_DATA_FORWARDING: u8 = 28;
 }
 
 /// RAT Type values (TS 29.274 Section 8.17)
@@ -411,7 +424,14 @@ pub fn build_create_indirect_data_forwarding_tunnel_response(
                                 f_teid_interface::SGW_GTP_U_UL_DATA_FORWARDING,
                                 &tunnel,
                             ) {
-                                bc.set_fteid(1, &ft);
+                                // #48: instance **4**, "S1-U SGW F-TEID for UL data
+                                // forwarding" (TS 29.274 Table 7.2.19-2). This was
+                                // instance 1, which that table assigns to "S12 SGW
+                                // F-TEID for DL data forwarding" -- so an MME reading
+                                // the response conformantly would have taken the UL
+                                // endpoint for a second DL one on an interface this
+                                // deployment does not have.
+                                bc.set_fteid(4, &ft);
                             }
                         }
                         _ => {}
@@ -686,6 +706,30 @@ pub fn build_s5c_create_bearer_response(
 
 #[cfg(test)]
 mod tests {
+
+    /// #48: same guard as `mmed`'s. Both SGW forwarding interface types were wrong here
+    /// (22 and 23, i.e. "SGSN GTP-U for data forwarding" and the DL value used twice) and
+    /// inert because nothing allocated a forwarding tunnel.
+    #[test]
+    fn f_teid_interface_types_match_ts29274_clause_8_22() {
+        use super::f_teid_interface as iface;
+        assert_eq!(iface::S1_U_SGW_GTP_U, 1, "1: S1-U SGW GTP-U interface");
+        assert_eq!(
+            iface::S11_S4_SGW_GTP_C,
+            11,
+            "11: S11/S4 SGW GTP-C interface"
+        );
+        assert_eq!(
+            iface::SGW_GTP_U_DL_DATA_FORWARDING,
+            23,
+            "23: SGW/UPF GTP-U interface for DL data forwarding (Table 7.2.19-2 NOTE 3)"
+        );
+        assert_eq!(
+            iface::SGW_GTP_U_UL_DATA_FORWARDING,
+            28,
+            "28: SGW GTP-U interface for UL data forwarding (Table 7.2.19-2 NOTE 4)"
+        );
+    }
     use super::*;
     use bytes::Bytes;
 

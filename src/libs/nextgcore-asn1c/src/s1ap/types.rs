@@ -174,6 +174,12 @@ impl ProtocolIeId {
     pub const E_RAB_SETUP_ITEM_BEARER_SU_RES: Self = Self(39);
     pub const SECURITY_CONTEXT: Self = Self(40);
     pub const HANDOVER_RESTRICTION_LIST: Self = Self(41);
+    /// `id-Direct-Forwarding-Path-Availability` (TS 36.413 §9.3.5, ProtocolIE-ID 79).
+    ///
+    /// Read from the vendored spec (`6g_docs/specs/36413-j20.txt:34389`), not inferred
+    /// from neighbouring ids: 79 sits between `id-UEIdentityIndexValue` (80) and the
+    /// 60s, nowhere near the handover IEs, so guessing from context gets it wrong.
+    pub const DIRECT_FORWARDING_PATH_AVAILABILITY: Self = Self(79);
     pub const UE_PAGING_ID: Self = Self(43);
     pub const PAGING_DRX: Self = Self(44);
     pub const TAI_LIST: Self = Self(46);

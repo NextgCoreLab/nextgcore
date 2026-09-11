@@ -654,12 +654,52 @@ pub fn build_handover_required(msg: &HandoverRequired) -> S1apResult<Vec<u8>> {
     ie::encode_handover_type(&mut container, msg.handover_type)?;
     ie::encode_cause(&mut container, &msg.cause)?;
     ie::encode_target_id(&mut container, &msg.target_id)?;
+    if let Some(availability) = msg.direct_forwarding_path_availability {
+        ie::encode_direct_forwarding_path_availability(&mut container, availability)?;
+    }
     ie::encode_source_to_target_container(&mut container, &msg.source_to_target_container)?;
 
     encode_pdu(&initiating(
         ProcedureCode::HANDOVER_PREPARATION,
         Criticality::Reject,
         InitiatingMessageValue::HandoverRequired(container),
+    ))
+}
+
+/// Build an eNB Status Transfer PDU (TS 36.413 §8.4.6, procedure code 24).
+///
+/// The MME never sends this -- the source eNB does. It exists so a test can produce a
+/// real one, and because a builder that can only construct half of a relay cannot
+/// prove the relay preserves anything.
+pub fn build_enb_status_transfer(msg: &EnbStatusTransfer) -> S1apResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+    ie::encode_mme_ue_s1ap_id(&mut container, msg.mme_ue_s1ap_id, Criticality::Reject)?;
+    ie::encode_enb_ue_s1ap_id(&mut container, msg.enb_ue_s1ap_id, Criticality::Reject)?;
+    ie::encode_enb_status_transfer_container(&mut container, &msg.status_transfer_container)?;
+
+    encode_pdu(&initiating(
+        ProcedureCode::ENB_STATUS_TRANSFER,
+        Criticality::Ignore,
+        InitiatingMessageValue::Other(container),
+    ))
+}
+
+/// Build an MME Status Transfer PDU (TS 36.413 §8.4.7, procedure code 25).
+///
+/// Criticality `ignore` for both: §8.4.7 makes the whole procedure best-effort from the
+/// target's point of view -- a target that cannot use the status still completes the
+/// handover, it just re-establishes PDCP. Rejecting would turn a continuity
+/// optimisation into a handover failure.
+pub fn build_mme_status_transfer(msg: &MmeStatusTransfer) -> S1apResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+    ie::encode_mme_ue_s1ap_id(&mut container, msg.mme_ue_s1ap_id, Criticality::Reject)?;
+    ie::encode_enb_ue_s1ap_id(&mut container, msg.enb_ue_s1ap_id, Criticality::Reject)?;
+    ie::encode_enb_status_transfer_container(&mut container, &msg.status_transfer_container)?;
+
+    encode_pdu(&initiating(
+        ProcedureCode::MME_STATUS_TRANSFER,
+        Criticality::Ignore,
+        InitiatingMessageValue::Other(container),
     ))
 }
 

@@ -271,6 +271,14 @@ impl MmeApp {
             // sweep walks the UE pool and does nothing unless a deadline passed.
             nas_timer::expire_nas_timers(ctx, std::time::Instant::now());
 
+            // Release target eNB resources for handover preparations that ran out of
+            // time (#48, TS 36.413 §8.4.5.2). Rides the same tick for the same reason:
+            // a sweep that cannot silently stop firing. A no-op unless a handover is
+            // outstanding.
+            for send in s1ap_handler::expire_handover_preparations(ctx, std::time::Instant::now()) {
+                s1ap_path::s1ap_send(send);
+            }
+
             // Signal or lift S1AP overload if the attached-UE count crossed the
             // configured threshold (TS 36.413 §8.7.6). A no-op unless
             // `mme.overload.max_ue` is set, which it is not by default.

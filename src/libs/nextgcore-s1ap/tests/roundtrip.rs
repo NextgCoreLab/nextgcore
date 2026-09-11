@@ -767,6 +767,9 @@ fn handover_required_roundtrip() {
             },
             selected_tai: sample_tai(),
         },
+        direct_forwarding_path_availability: Some(
+            DirectForwardingPathAvailability::DirectPathAvailable,
+        ),
         source_to_target_container: vec![1, 2, 3, 4, 5],
     };
     let bytes = build_handover_required(&msg).unwrap();
@@ -775,6 +778,99 @@ fn handover_required_roundtrip() {
             assert_eq!(decoded.handover_type, HandoverType::IntraLte);
             assert_eq!(decoded.target_id, msg.target_id);
             assert_eq!(decoded.source_to_target_container, vec![1, 2, 3, 4, 5]);
+            // #48: the IE that decides direct vs. indirect forwarding. Asserted here
+            // because the MME's whole forwarding decision rests on it, and the
+            // absent case is covered by the two sibling tests below -- which is the
+            // half that matters, since ABSENT is what selects indirect forwarding.
+            assert_eq!(
+                decoded.direct_forwarding_path_availability,
+                Some(DirectForwardingPathAvailability::DirectPathAvailable)
+            );
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+}
+
+/// #48: a Handover Required with NO Direct Forwarding Path Availability IE decodes to
+/// `None`, which is what makes the MME choose indirect forwarding. Separate from the
+/// present-case assertion above because a decoder that hard-coded `Some(..)` would
+/// pass that one.
+#[test]
+fn handover_required_without_direct_forwarding_availability_decodes_to_none() {
+    let msg = HandoverRequired {
+        mme_ue_s1ap_id: 7,
+        enb_ue_s1ap_id: 8,
+        handover_type: HandoverType::IntraLte,
+        cause: Cause::RadioNetwork(CauseRadioNetwork::HandoverDesirableForRadioReason),
+        target_id: TargetId::TargetEnbId {
+            global_enb_id: GlobalEnbId {
+                plmn_identity: PLMN,
+                enb_id: EnbId::Macro(0x11111),
+            },
+            selected_tai: sample_tai(),
+        },
+        direct_forwarding_path_availability: None,
+        source_to_target_container: vec![0xAA],
+    };
+    let bytes = build_handover_required(&msg).unwrap();
+    match decode_s1ap_pdu(&bytes).unwrap() {
+        S1apMessage::HandoverRequired(decoded) => {
+            assert_eq!(
+                decoded.direct_forwarding_path_availability, None,
+                "an absent IE must not become Some(..); indirect forwarding depends on it"
+            );
+            assert_eq!(decoded.source_to_target_container, vec![0xAA]);
+        }
+        other => panic!("unexpected message: {other:?}"),
+    }
+}
+
+/// #48 criterion 2: the eNB Status Transfer container survives source -> MME -> target
+/// UNCHANGED (TS 36.413 §8.4.6/§8.4.7).
+///
+/// The container is a `SEQUENCE`, not an `OCTET STRING`, so "byte-preserving" is a real
+/// claim and not a tautology: this decodes a real eNB Status Transfer, relays the
+/// container into an MME Status Transfer under the TARGET's UE ids, and decodes that
+/// back. The payload is asserted equal; the ids are asserted DIFFERENT, since relaying
+/// the source's ids to the target is the obvious way to get this wrong.
+#[test]
+fn status_transfer_container_round_trips_source_to_target_unchanged() {
+    // Shaped like a real Bearers-SubjectToStatusTransfer payload rather than a flat
+    // run of one byte, so a codec that truncated or padded would show up.
+    let payload = vec![0x00, 0x01, 0xF0, 0x0D, 0x7F, 0x80, 0x00, 0x2A, 0xFF];
+
+    let from_source = build_enb_status_transfer(&EnbStatusTransfer {
+        mme_ue_s1ap_id: 1001,
+        enb_ue_s1ap_id: 11,
+        status_transfer_container: payload.clone(),
+    })
+    .unwrap();
+
+    let decoded_at_mme = match decode_s1ap_pdu(&from_source).unwrap() {
+        S1apMessage::EnbStatusTransfer(m) => m,
+        other => panic!("unexpected message: {other:?}"),
+    };
+    assert_eq!(
+        decoded_at_mme.status_transfer_container, payload,
+        "the MME must receive the container the source eNB sent"
+    );
+
+    let to_target = build_mme_status_transfer(&MmeStatusTransfer {
+        mme_ue_s1ap_id: 2002,
+        enb_ue_s1ap_id: 22,
+        status_transfer_container: decoded_at_mme.status_transfer_container.clone(),
+    })
+    .unwrap();
+
+    match decode_s1ap_pdu(&to_target).unwrap() {
+        S1apMessage::MmeStatusTransfer(m) => {
+            assert_eq!(
+                m.status_transfer_container, payload,
+                "the target eNB must receive the SOURCE's container byte for byte; a \
+                 modified PDCP SN/HFN status is worse than none"
+            );
+            assert_eq!(m.mme_ue_s1ap_id, 2002, "relayed under the target's ids");
+            assert_eq!(m.enb_ue_s1ap_id, 22);
         }
         other => panic!("unexpected message: {other:?}"),
     }
@@ -793,6 +889,7 @@ fn handover_required_target_rnc_roundtrip() {
             rac: Some(0x42),
             rnc_id: 5000, // > 4095, exercises extendedRNC-ID
         },
+        direct_forwarding_path_availability: None,
         source_to_target_container: vec![9, 9],
     };
     let bytes = build_handover_required(&msg).unwrap();
@@ -817,6 +914,7 @@ fn handover_required_target_cgi_roundtrip() {
             ci: 0x0002,
             rac: None,
         },
+        direct_forwarding_path_availability: None,
         source_to_target_container: vec![7],
     };
     let bytes = build_handover_required(&msg).unwrap();

@@ -30,16 +30,71 @@ pub fn dispatch(sess_id: u64, continuation: S11Continuation, resp_type: u8, body
         }
         pfcp_msg_type::SESSION_DELETION_RESPONSE => deletion_response(sess_id, continuation, body),
         pfcp_msg_type::SESSION_MODIFICATION_RESPONSE => {
-            // Modification responses gate no S11 procedure today (see the spec's
-            // ceiling); the cause is logged so a rejected modification is not silent.
             let cause = find_cause(body);
             if cause != Some(sxa_handler::pfcp_cause::REQUEST_ACCEPTED) {
                 log::warn!(
                     "PFCP Session Modification for session {sess_id} was REJECTED: cause={cause:?}"
                 );
             }
+            // #48: ONE modification now gates an S11 procedure -- the indirect
+            // forwarding install. Every other modification still gates nothing, which is
+            // why this dispatches on the continuation rather than on the response.
+            if let S11Continuation::IndirectForwarding { .. } = continuation {
+                indirect_forwarding_response(continuation, cause);
+            }
         }
         other => log::warn!("Unexpected PFCP response type {other} for session {sess_id}"),
+    }
+}
+
+/// Answer the MME's Create Indirect Data Forwarding Tunnel Request now that the SGW-U
+/// has spoken (#48).
+///
+/// The response is built by `s11_build`, not by [`answer`], because a bare cause is not
+/// enough: TS 29.274 Table 7.2.19-2 wants the per-bearer forwarding F-TEIDs, and those
+/// are the whole point of the procedure. A cause-only accept is what this used to send.
+fn indirect_forwarding_response(continuation: S11Continuation, pfcp_cause: Option<u8>) {
+    let S11Continuation::IndirectForwarding {
+        peer,
+        seq,
+        teid,
+        sgwc_ue_id,
+    } = continuation
+    else {
+        return;
+    };
+
+    let accepted = pfcp_cause == Some(sxa_handler::pfcp_cause::REQUEST_ACCEPTED);
+    let cause = if accepted {
+        gtp_cause::REQUEST_ACCEPTED
+    } else {
+        log::warn!(
+            "Create Indirect Data Forwarding Tunnel Response to {peer} carries a failure: the \
+             SGW-U refused the forwarding rules (pfcp_cause={pfcp_cause:?})"
+        );
+        gtp_cause::SYSTEM_FAILURE
+    };
+
+    let Some(server) = gtp_path::s11_server() else {
+        log::error!("S11 server not open: cannot answer {peer}");
+        return;
+    };
+    match s11_build::build_create_indirect_data_forwarding_tunnel_response(sgwc_ue_id, seq, cause) {
+        Ok(response) => {
+            if let Err(e) = server.send_response(peer, &response) {
+                log::error!("Indirect tunnel response to {peer} failed: {e}");
+            }
+        }
+        Err(e) => {
+            log::error!("Failed to build indirect tunnel response: {e}");
+            answer(
+                peer,
+                Gtp2MessageType::CreateIndirectDataForwardingTunnelResponse,
+                teid,
+                seq,
+                gtp_cause::SYSTEM_FAILURE,
+            );
+        }
     }
 }
 
@@ -67,6 +122,17 @@ pub fn fail_with_cause(continuation: S11Continuation, cause: u8) {
             answer(
                 peer,
                 Gtp2MessageType::DeleteSessionResponse,
+                teid,
+                seq,
+                cause,
+            );
+        }
+        S11Continuation::IndirectForwarding {
+            peer, seq, teid, ..
+        } => {
+            answer(
+                peer,
+                Gtp2MessageType::CreateIndirectDataForwardingTunnelResponse,
                 teid,
                 seq,
                 cause,
@@ -112,6 +178,24 @@ pub fn fail(continuation: S11Continuation, reason: &str) {
             answer(
                 peer,
                 Gtp2MessageType::DeleteSessionResponse,
+                teid,
+                seq,
+                gtp_cause::REMOTE_PEER_NOT_RESPONDING,
+            );
+        }
+        S11Continuation::IndirectForwarding {
+            peer, seq, teid, ..
+        } => {
+            // #48: the MME is waiting to send its Handover Command. Answering a failure
+            // now lets the handover proceed WITHOUT forwarding, which loses buffered
+            // downlink data -- but leaving the MME to time out loses the handover.
+            log::error!(
+                "Create Indirect Data Forwarding Tunnel Response to {peer} carries a failure: \
+                 the SGW-U never installed the forwarding rules ({reason})"
+            );
+            answer(
+                peer,
+                Gtp2MessageType::CreateIndirectDataForwardingTunnelResponse,
                 teid,
                 seq,
                 gtp_cause::REMOTE_PEER_NOT_RESPONDING,

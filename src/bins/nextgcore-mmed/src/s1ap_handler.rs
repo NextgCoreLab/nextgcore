@@ -18,15 +18,16 @@ use crate::s1ap_build::{
 };
 use nextgcore_s1ap::{
     builder, decode_s1ap_pdu, BroadcastCancelledAreaList, BroadcastCompletedAreaList, Cause,
-    CauseRadioNetwork, CriticalityDiagnostics, EnbConfigurationUpdate, EnbId, ErabSwitchedItem,
-    ErabToBeSetupItemHoReq, ErrorIndication, HandoverCancel, HandoverCancelAcknowledge,
-    HandoverCommand, HandoverFailure, HandoverNotify, HandoverPreparationFailure, HandoverRequest,
-    HandoverRequestAcknowledge, HandoverRequired, HandoverType as S1apHandoverType,
-    InitialContextSetupFailure, InitialContextSetupResponse, InitialUeMessage, KillResponse,
-    NasNonDeliveryIndication, PathSwitchRequest, PathSwitchRequestAcknowledge,
-    PathSwitchRequestFailure, Reset, ResetAcknowledge, ResetType, S1SetupRequest, S1apMessage,
-    SecurityContext, TargetId, TimeToWait, UeAmbr, UeCapabilityInfoIndication,
-    UeContextReleaseComplete, UeContextReleaseRequest, UlNasTransport, WriteReplaceWarningResponse,
+    CauseRadioNetwork, CriticalityDiagnostics, EnbConfigurationUpdate, EnbId, EnbStatusTransfer,
+    ErabDataForwardingItem, ErabSwitchedItem, ErabToBeSetupItemHoReq, ErrorIndication,
+    HandoverCancel, HandoverCancelAcknowledge, HandoverCommand, HandoverFailure, HandoverNotify,
+    HandoverPreparationFailure, HandoverRequest, HandoverRequestAcknowledge, HandoverRequired,
+    HandoverType as S1apHandoverType, InitialContextSetupFailure, InitialContextSetupResponse,
+    InitialUeMessage, KillResponse, MmeStatusTransfer, NasNonDeliveryIndication, PathSwitchRequest,
+    PathSwitchRequestAcknowledge, PathSwitchRequestFailure, Reset, ResetAcknowledge, ResetType,
+    S1SetupRequest, S1apMessage, SecurityContext, TargetId, TimeToWait, UeAmbr,
+    UeCapabilityInfoIndication, UeContextReleaseComplete, UeContextReleaseRequest, UlNasTransport,
+    WriteReplaceWarningResponse,
 };
 
 // ============================================================================
@@ -103,6 +104,19 @@ impl S1apSend {
         vec![S1apSend { enb_id, pdu }]
     }
 }
+
+/// How long a prepared handover may stay outstanding before the MME releases the
+/// target eNB's resources (#48).
+///
+/// TS 36.413 names TS1RELOCprep and TS1RELOCoverall for the SOURCE eNB and leaves the
+/// MME's own supervision to implementation, so this value is a local choice, not a
+/// specified one. 10 s is comfortably longer than the source's own TS1RELOCprep (a few
+/// seconds in practice) so the source's failure handling runs first and this only fires
+/// when the source went away too -- which is exactly the case that used to leak the
+/// context forever. `cause = tS1relocoverall-expiry` (TS 36.413 §9.2.1.3, value 8) is
+/// the cause that says so on the wire.
+pub const HANDOVER_PREPARATION_SUPERVISION: std::time::Duration =
+    std::time::Duration::from_secs(10);
 
 // ============================================================================
 // Top-Level Dispatch
@@ -211,6 +225,7 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
         S1apMessage::HandoverFailure(msg) => handle_handover_failure(ctx, enb_id, &msg),
         S1apMessage::HandoverNotify(msg) => handle_handover_notify(ctx, enb_id, &msg),
         S1apMessage::HandoverCancel(msg) => handle_handover_cancel(ctx, enb_id, &msg),
+        S1apMessage::EnbStatusTransfer(msg) => handle_enb_status_transfer(ctx, enb_id, &msg),
         S1apMessage::PathSwitchRequest(msg) => handle_path_switch_request(ctx, enb_id, &msg),
         S1apMessage::InitialContextSetupResponse(msg) => {
             handle_initial_context_setup_response(ctx, enb_id, &msg);
@@ -293,6 +308,7 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
         | S1apMessage::PathSwitchRequestAcknowledge(_)
         | S1apMessage::PathSwitchRequestFailure(_)
         | S1apMessage::HandoverCancelAcknowledge(_)
+        | S1apMessage::MmeStatusTransfer(_)
         | S1apMessage::MmeConfigurationUpdate(_)
         | S1apMessage::EnbConfigurationUpdateAcknowledge(_)
         | S1apMessage::EnbConfigurationUpdateFailure(_)
@@ -1086,16 +1102,27 @@ pub fn handle_handover_required(
 
     // Allocate the target eNB UE context (eNB UE S1AP ID arrives in the Ack)
     let target_ue_id = ctx.enb_ue_add(target_enb_pool_id, INVALID_UE_S1AP_ID);
+    // #48: the source eNB's own statement about its transport to the target
+    // (TS 36.413 §8.4.1.2). ABSENT means no direct path, which is what selects
+    // indirect forwarding through the Serving GW -- so the default is `false` and the
+    // IE's presence is the only thing that turns direct forwarding on.
+    let direct_forwarding_available = msg.direct_forwarding_path_availability.is_some();
+
     let target_mme_ue_s1ap_id = {
         let mut pool = ctx.enb_ue_pool.write().unwrap();
         if let Some(source) = pool.get_mut(&source_ue_id) {
             source.target_ue_id = target_ue_id;
             source.handover_type = ho_type_from_s1ap(msg.handover_type);
+            source.direct_forwarding_available = direct_forwarding_available;
         }
         if let Some(target) = pool.get_mut(&target_ue_id) {
             target.source_ue_id = source_ue_id;
             target.mme_ue_id = source_ue.mme_ue_id;
             target.handover_type = ho_type_from_s1ap(msg.handover_type);
+            // #48: arm the preparation supervision. Without this a UE that never
+            // arrives at the target leaks this context for the life of the process.
+            target.handover_prep_deadline =
+                Some(std::time::Instant::now() + HANDOVER_PREPARATION_SUPERVISION);
             target.mme_ue_s1ap_id
         } else {
             return handover_preparation_failure(
@@ -1213,12 +1240,34 @@ pub fn handle_handover_request_acknowledge(
         target.clone()
     };
 
-    // Record the admitted DL endpoints on the bearer contexts
+    // Record the admitted S1-U endpoint AND the data-forwarding endpoints on the
+    // bearer contexts.
+    //
+    // #48: the forwarding endpoints used to be decoded by `nextgcore-s1ap` and then
+    // DROPPED here -- only `gtp_teid`/`transport_layer_address` were stored -- so the
+    // target's answer to "where should the source forward my buffered downlink data?"
+    // was thrown away and the Handover Command's forwarding list was always empty.
+    // §9.1.5.2's E-RABs Subject to Forwarding List is built from exactly these.
+    let mut admitted_forwarding = false;
     for item in &msg.erab_admitted_list {
         if let Some(bearer_id) = ctx.bearer_find_by_ebi(target_ue.mme_ue_id, item.erab_id) {
             if let Some(bearer) = ctx.bearer_pool.write().unwrap().get_mut(&bearer_id) {
                 bearer.target_s1u_teid = item.gtp_teid;
                 bearer.target_s1u_ip = transport_address_to_ip(&item.transport_layer_address);
+                if let Some(teid) = item.dl_gtp_teid {
+                    bearer.enb_dl_teid = teid;
+                    admitted_forwarding = true;
+                }
+                if let Some(addr) = &item.dl_transport_layer_address {
+                    bearer.enb_dl_ip = transport_address_to_ip(addr);
+                }
+                if let Some(teid) = item.ul_gtp_teid {
+                    bearer.enb_ul_teid = teid;
+                    admitted_forwarding = true;
+                }
+                if let Some(addr) = &item.ul_transport_layer_address {
+                    bearer.enb_ul_ip = transport_address_to_ip(addr);
+                }
             }
         }
     }
@@ -1228,12 +1277,107 @@ pub fn handle_handover_request_acknowledge(
         return Vec::new();
     };
 
+    // #48: choose the forwarding path (TS 23.401 §5.5.1.1.2 vs §5.5.1.2).
+    //
+    // Indirect forwarding needs a Serving GW round trip BEFORE the Handover Command
+    // can be built, because the endpoints the source must forward to are the SGW's and
+    // the SGW allocates them in the CIDFT response. So the command is DEFERRED in that
+    // case and sent from `s11_handler`'s CIDFT-response path -- deferring is not an
+    // optimisation, it is the only order in which the command can carry real
+    // endpoints. Sending it now with an empty list is what this used to do.
+    //
+    // The target admitting no forwarding endpoints at all means it does not want
+    // forwarding, so neither path applies and the command goes out immediately with an
+    // empty list -- which §9.1.5.2 permits, the IE being optional.
+    if !source_ue.direct_forwarding_available && admitted_forwarding {
+        // Park what the command will need before the request goes out: the
+        // target-to-source container is opaque and produced once, so it cannot be
+        // re-derived when the response lands.
+        {
+            let mut pool = ctx.enb_ue_pool.write().unwrap();
+            if let Some(target) = pool.get_mut(&target_ue.id) {
+                target.pending_handover_command = Some(crate::context::PendingHandoverCommand {
+                    handover_type: ho_type_to_s1ap(target_ue.handover_type),
+                    erab_to_release_list: msg
+                        .erab_failed_list
+                        .iter()
+                        .map(|item| nextgcore_s1ap::ErabItem {
+                            erab_id: item.erab_id,
+                            cause: item.cause,
+                        })
+                        .collect(),
+                    target_to_source_container: msg.target_to_source_container.clone(),
+                });
+            }
+        }
+        match crate::gtp_path::send_create_indirect_data_forwarding_tunnel_request(
+            ctx,
+            target_ue.id,
+            target_ue.mme_ue_id,
+        ) {
+            Ok(_) => {
+                log::info!(
+                    "No direct forwarding path for mme_ue_s1ap_id={}: requested indirect \
+                     forwarding tunnels from the SGW, Handover Command deferred until the \
+                     response",
+                    msg.mme_ue_s1ap_id
+                );
+                return Vec::new();
+            }
+            Err(e) => {
+                // Falling through with the TARGET's endpoints would tell the source to
+                // forward straight to the target over a path the source just said it
+                // does not have. An empty list loses the buffered data; a wrong list
+                // sends it into a black hole. So: empty, and say so.
+                log::error!(
+                    "Indirect forwarding tunnel request failed ({e:?}); continuing the handover \
+                     WITHOUT data forwarding, so buffered downlink data for \
+                     mme_ue_s1ap_id={} is lost",
+                    msg.mme_ue_s1ap_id
+                );
+                // The command is about to be sent synchronously below, so the parked
+                // copy must go: a late CIDFT response finding it would send a SECOND
+                // Handover Command for the same handover.
+                let mut pool = ctx.enb_ue_pool.write().unwrap();
+                if let Some(target) = pool.get_mut(&target_ue.id) {
+                    target.pending_handover_command = None;
+                }
+            }
+        }
+    }
+
+    let forwarding_list = if source_ue.direct_forwarding_available && admitted_forwarding {
+        target_forwarding_list(ctx, target_ue.mme_ue_id)
+    } else {
+        Vec::new()
+    };
+
+    match build_handover_command_pdu(ctx, &source_ue, &target_ue, msg, forwarding_list) {
+        Some(send) => vec![send],
+        None => Vec::new(),
+    }
+}
+
+/// Build the Handover Command for a prepared handover.
+///
+/// Shared by the direct-forwarding path (which returns it from the S1AP handler) and
+/// the indirect path (which sends it from the CIDFT response, once the SGW's endpoints
+/// are known). One builder rather than two because the only difference between the two
+/// cases is which endpoints are in the forwarding list, and a second copy of the
+/// release-list and container plumbing is a second copy that can drift.
+pub(crate) fn build_handover_command_pdu(
+    _ctx: &MmeContext,
+    source_ue: &crate::context::EnbUe,
+    target_ue: &crate::context::EnbUe,
+    ack: &HandoverRequestAcknowledge,
+    erab_subject_to_forwarding_list: Vec<ErabDataForwardingItem>,
+) -> Option<S1apSend> {
     let command = HandoverCommand {
         mme_ue_s1ap_id: source_ue.mme_ue_s1ap_id,
         enb_ue_s1ap_id: source_ue.enb_ue_s1ap_id,
         handover_type: ho_type_to_s1ap(target_ue.handover_type),
-        erab_subject_to_forwarding_list: Vec::new(),
-        erab_to_release_list: msg
+        erab_subject_to_forwarding_list,
+        erab_to_release_list: ack
             .erab_failed_list
             .iter()
             .map(|item| nextgcore_s1ap::ErabItem {
@@ -1241,16 +1385,168 @@ pub fn handle_handover_request_acknowledge(
                 cause: item.cause,
             })
             .collect(),
-        target_to_source_container: msg.target_to_source_container.clone(),
+        target_to_source_container: ack.target_to_source_container.clone(),
     };
 
     match builder::build_handover_command(&command) {
-        Ok(pdu) => vec![S1apSend {
+        Ok(pdu) => Some(S1apSend {
             enb_id: source_ue.enb_id,
             pdu,
-        }],
+        }),
         Err(e) => {
             log::error!("Failed to build Handover Command: {e}");
+            None
+        }
+    }
+}
+
+/// E-RABs Subject to Forwarding List pointing at the TARGET eNB's endpoints, for
+/// DIRECT forwarding (TS 23.401 §5.5.1.1.2).
+pub(crate) fn target_forwarding_list(
+    ctx: &MmeContext,
+    mme_ue_id: u64,
+) -> Vec<ErabDataForwardingItem> {
+    forwarding_list_from(ctx, mme_ue_id, |bearer| {
+        (
+            bearer.enb_dl_teid,
+            &bearer.enb_dl_ip,
+            bearer.enb_ul_teid,
+            &bearer.enb_ul_ip,
+        )
+    })
+}
+
+/// E-RABs Subject to Forwarding List pointing at the SERVING GW's endpoints, for
+/// INDIRECT forwarding (TS 23.401 §5.5.1.2).
+pub(crate) fn sgw_forwarding_list(ctx: &MmeContext, mme_ue_id: u64) -> Vec<ErabDataForwardingItem> {
+    forwarding_list_from(ctx, mme_ue_id, |bearer| {
+        (
+            bearer.sgw_dl_teid,
+            &bearer.sgw_dl_ip,
+            bearer.sgw_ul_teid,
+            &bearer.sgw_ul_ip,
+        )
+    })
+}
+
+/// Build the forwarding list from whichever endpoint pair `pick` selects.
+///
+/// A bearer with a zero TEID contributes NOTHING for that direction rather than an
+/// item with `teid: 0`: §9.1.5.2's DL/UL members are optional, and a zero TEID is a
+/// valid-looking instruction to forward into nowhere. A bearer with neither direction
+/// is left out of the list entirely.
+fn forwarding_list_from<F>(ctx: &MmeContext, mme_ue_id: u64, pick: F) -> Vec<ErabDataForwardingItem>
+where
+    F: Fn(
+        &crate::context::MmeBearer,
+    ) -> (u32, &crate::context::IpAddr, u32, &crate::context::IpAddr),
+{
+    ue_bearers(ctx, mme_ue_id)
+        .iter()
+        .filter_map(|bearer| {
+            let (dl_teid, dl_ip, ul_teid, ul_ip) = pick(bearer);
+            if dl_teid == 0 && ul_teid == 0 {
+                return None;
+            }
+            Some(ErabDataForwardingItem {
+                erab_id: bearer.ebi,
+                dl_transport_layer_address: (dl_teid != 0)
+                    .then(|| s1ap_build::ip_to_transport_address(dl_ip)),
+                dl_gtp_teid: (dl_teid != 0).then_some(dl_teid),
+                ul_transport_layer_address: (ul_teid != 0)
+                    .then(|| s1ap_build::ip_to_transport_address(ul_ip)),
+                ul_gtp_teid: (ul_teid != 0).then_some(ul_teid),
+            })
+        })
+        .collect()
+}
+
+/// Handle eNB Status Transfer from the source eNB (TS 36.413 §8.4.6) by relaying the
+/// transparent container to the target eNB as an MME Status Transfer (§8.4.7).
+///
+/// The container carries the uplink PDCP-SN/HFN receiver status and the downlink
+/// PDCP-SN/HFN transmitter status per E-RAB, and §8.4.6 says it is transferred "from
+/// the source to the target eNB via the MME". This message used to decode to
+/// `S1apMessage::Unknown` and be answered with an Error Indication carrying
+/// `abstract-syntax-error-reject`, so every S1 handover with RLC-AM bearers lost PDCP
+/// continuity AND the source eNB was told the MME could not parse a message it had
+/// sent correctly (#48).
+///
+/// The relay is byte-for-byte: the container is not decoded on the way through. See
+/// `nextgcore_s1ap::EnbStatusTransfer::status_transfer_container` for why.
+pub fn handle_enb_status_transfer(
+    ctx: &MmeContext,
+    enb_id: u64,
+    msg: &EnbStatusTransfer,
+) -> Vec<S1apSend> {
+    let Some(source_ue_id) = ctx.enb_ue_find_by_mme_ue_s1ap_id(msg.mme_ue_s1ap_id) else {
+        return error_indication(
+            enb_id,
+            Some(msg.enb_ue_s1ap_id),
+            Some(msg.mme_ue_s1ap_id),
+            S1apCauseGroup::RadioNetwork,
+            radio_network_cause::UNKNOWN_MME_UE_S1AP_ID,
+        );
+    };
+    let Some(source_ue) = ctx.enb_ue_find_by_id(source_ue_id) else {
+        return error_indication(
+            enb_id,
+            Some(msg.enb_ue_s1ap_id),
+            Some(msg.mme_ue_s1ap_id),
+            S1apCauseGroup::RadioNetwork,
+            radio_network_cause::UNKNOWN_MME_UE_S1AP_ID,
+        );
+    };
+
+    // No prepared target means there is no handover to carry the status into. §8.4.6
+    // defines no failure message for this procedure, so an Error Indication is the
+    // only conformant way to say so -- and "message not compatible with receiver
+    // state" is the accurate cause, unlike the abstract-syntax-error this used to get.
+    let target_ue_id = source_ue.target_ue_id;
+    if target_ue_id == NEXTGCORE_INVALID_POOL_ID {
+        log::warn!(
+            "eNB Status Transfer for mme_ue_s1ap_id={} with no handover in preparation",
+            msg.mme_ue_s1ap_id
+        );
+        return error_indication(
+            enb_id,
+            Some(msg.enb_ue_s1ap_id),
+            Some(msg.mme_ue_s1ap_id),
+            S1apCauseGroup::Protocol,
+            protocol_cause::MESSAGE_NOT_COMPATIBLE_WITH_RECEIVER_STATE,
+        );
+    }
+    let Some(target_ue) = ctx.enb_ue_find_by_id(target_ue_id) else {
+        return error_indication(
+            enb_id,
+            Some(msg.enb_ue_s1ap_id),
+            Some(msg.mme_ue_s1ap_id),
+            S1apCauseGroup::Protocol,
+            protocol_cause::MESSAGE_NOT_COMPATIBLE_WITH_RECEIVER_STATE,
+        );
+    };
+
+    // Addressed with the TARGET association's ids, not the source's: the container is
+    // the only thing that crosses unchanged.
+    let relay = MmeStatusTransfer {
+        mme_ue_s1ap_id: target_ue.mme_ue_s1ap_id,
+        enb_ue_s1ap_id: target_ue.enb_ue_s1ap_id,
+        status_transfer_container: msg.status_transfer_container.clone(),
+    };
+    match builder::build_mme_status_transfer(&relay) {
+        Ok(pdu) => {
+            log::info!(
+                "Relaying eNB Status Transfer ({} bytes) to target eNB {} as MME Status Transfer",
+                msg.status_transfer_container.len(),
+                target_ue.enb_id
+            );
+            vec![S1apSend {
+                enb_id: target_ue.enb_id,
+                pdu,
+            }]
+        }
+        Err(e) => {
+            log::error!("Failed to build MME Status Transfer: {e}");
             Vec::new()
         }
     }
@@ -1273,6 +1569,15 @@ pub fn handle_handover_failure(
     let Some(target_ue) = ctx.enb_ue_find_by_id(target_ue_id) else {
         return Vec::new();
     };
+    // #48: the target reported the failure itself, so it is releasing its own
+    // resources -- no release command, but the supervision must be disarmed before the
+    // context goes, or the sweep would try to release an id that no longer exists.
+    {
+        let mut pool = ctx.enb_ue_pool.write().unwrap();
+        if let Some(target) = pool.get_mut(&target_ue_id) {
+            target.handover_prep_deadline = None;
+        }
+    }
     ctx.enb_ue_remove(target_ue_id);
 
     let Some(source_ue) = ctx.enb_ue_find_by_id(target_ue.source_ue_id) else {
@@ -1280,6 +1585,7 @@ pub fn handle_handover_failure(
     };
     if let Some(source) = ctx.enb_ue_pool.write().unwrap().get_mut(&source_ue.id) {
         source.target_ue_id = NEXTGCORE_INVALID_POOL_ID;
+        source.direct_forwarding_available = false;
     }
 
     let failure = HandoverPreparationFailure {
@@ -1343,6 +1649,16 @@ pub fn handle_handover_notify(
         mme_ue.enb_ue_id = target_ue_id;
     }
 
+    // #48: the UE arrived, so the preparation is no longer outstanding. Disarming here
+    // rather than letting the deadline lapse harmlessly matters because the sweep would
+    // otherwise release a target that is now SERVING the UE.
+    {
+        let mut pool = ctx.enb_ue_pool.write().unwrap();
+        if let Some(target) = pool.get_mut(&target_ue_id) {
+            target.handover_prep_deadline = None;
+        }
+    }
+
     // Release the source eNB context (TS 36.413 §8.4.3: successful handover)
     let Some(source_ue) = ctx.enb_ue_find_by_id(target_ue.source_ue_id) else {
         return Vec::new();
@@ -1390,12 +1706,26 @@ pub fn handle_handover_cancel(
             Some(source) => {
                 let target = source.target_ue_id;
                 source.target_ue_id = NEXTGCORE_INVALID_POOL_ID;
+                source.direct_forwarding_available = false;
                 target
             }
             None => NEXTGCORE_INVALID_POOL_ID,
         }
     };
+
+    // #48: tell the TARGET to release before dropping our own record of it.
+    //
+    // §8.4.5.2 says the MME/target "release any resources associated with the handover
+    // preparation", and the target's resources are reserved from the Handover Request
+    // Acknowledge onwards -- radio, an S1-U endpoint, a UE context. Freeing only the
+    // MME's copy (what this used to do) leaves the target holding all of it with
+    // nothing left that could ever ask for it back, since the ids that addressed it
+    // are gone.
+    let mut sends = Vec::new();
     if target_ue_id != NEXTGCORE_INVALID_POOL_ID {
+        if let Some(release) = release_prepared_target(ctx, target_ue_id, "handover cancelled") {
+            sends.push(release);
+        }
         ctx.enb_ue_remove(target_ue_id);
     }
 
@@ -1409,12 +1739,122 @@ pub fn handle_handover_cancel(
         mme_ue_s1ap_id: msg.mme_ue_s1ap_id,
         enb_ue_s1ap_id: msg.enb_ue_s1ap_id,
     }) {
-        Ok(pdu) => S1apSend::to_origin(enb_id, pdu),
+        Ok(pdu) => {
+            sends.push(S1apSend { enb_id, pdu });
+            sends
+        }
         Err(e) => {
             log::error!("Failed to build Handover Cancel Acknowledge: {e}");
-            Vec::new()
+            sends
         }
     }
+}
+
+/// Tell a prepared target eNB to release the resources it reserved for a handover that
+/// is not going to complete, and disarm the preparation supervision.
+///
+/// `HANDOVER_CANCELLED` on an explicit cancel and `TS1_RELOCOVERALL_EXPIRY` on a
+/// timeout, since those are what §9.2.1.3 provides and they tell the target which of
+/// the two happened -- a distinction it needs for its own counters.
+fn release_prepared_target(ctx: &MmeContext, target_ue_id: u64, reason: &str) -> Option<S1apSend> {
+    let target_ue = ctx.enb_ue_find_by_id(target_ue_id)?;
+    {
+        let mut pool = ctx.enb_ue_pool.write().unwrap();
+        if let Some(target) = pool.get_mut(&target_ue_id) {
+            target.handover_prep_deadline = None;
+        }
+    }
+
+    // A target that never answered the Handover Request has no eNB-UE-S1AP-ID yet, so
+    // there is nothing to address a release to; the reservation is the target's own to
+    // time out. Passing INVALID_UE_S1AP_ID on the wire would name a context the target
+    // does not have.
+    if target_ue.enb_ue_s1ap_id == INVALID_UE_S1AP_ID {
+        log::info!(
+            "Prepared target for mme_ue_s1ap_id={} never acknowledged ({reason}); no release to \
+             send",
+            target_ue.mme_ue_s1ap_id
+        );
+        return None;
+    }
+
+    let cause_value = if reason == "handover cancelled" {
+        radio_network_cause::HANDOVER_CANCELLED
+    } else {
+        radio_network_cause::TS1_RELOCOVERALL_EXPIRY
+    };
+    match s1ap_build::build_ue_context_release_command(
+        Some(target_ue.enb_ue_s1ap_id),
+        target_ue.mme_ue_s1ap_id,
+        S1apCauseGroup::RadioNetwork,
+        cause_value,
+    ) {
+        Ok(pdu) => {
+            log::info!(
+                "Releasing prepared target eNB {} for mme_ue_s1ap_id={} ({reason})",
+                target_ue.enb_id,
+                target_ue.mme_ue_s1ap_id
+            );
+            Some(S1apSend {
+                enb_id: target_ue.enb_id,
+                pdu,
+            })
+        }
+        Err(e) => {
+            log::error!("Failed to build UE Context Release Command for prepared target: {e}");
+            None
+        }
+    }
+}
+
+/// Sweep the eNB-UE pool for handover preparations that ran out of time, releasing the
+/// target and freeing the context (#48).
+///
+/// Rides `MmeApp::run`'s existing 100 ms tick, the same way `nas_timer::expire_nas_timers`
+/// does: no extra task, no channel, and it cannot silently stop firing. Cheap when
+/// idle -- a walk of the pool that does nothing unless a deadline passed.
+///
+/// RETURNS the release commands rather than sending them, so the DECISION (which target
+/// to release, and freeing the context) is separable from the TRANSMISSION (which needs
+/// the process-global S1AP queue and a live SCTP association). A test can then assert
+/// the decision; asserting the send would need an eNB.
+#[must_use]
+pub fn expire_handover_preparations(ctx: &MmeContext, now: std::time::Instant) -> Vec<S1apSend> {
+    let mut sends = Vec::new();
+    let expired: Vec<u64> = ctx
+        .enb_ue_pool
+        .read()
+        .unwrap()
+        .values()
+        .filter(|ue| ue.handover_prep_deadline.is_some_and(|at| now >= at))
+        .map(|ue| ue.id)
+        .collect();
+
+    for target_ue_id in expired {
+        let source_ue_id = ctx
+            .enb_ue_find_by_id(target_ue_id)
+            .map(|ue| ue.source_ue_id)
+            .unwrap_or(NEXTGCORE_INVALID_POOL_ID);
+
+        log::warn!(
+            "Handover preparation supervision expired for target enb_ue_id={target_ue_id} after \
+             {}s; releasing the target",
+            HANDOVER_PREPARATION_SUPERVISION.as_secs()
+        );
+        if let Some(send) = release_prepared_target(ctx, target_ue_id, "preparation timed out") {
+            sends.push(send);
+        }
+        if source_ue_id != NEXTGCORE_INVALID_POOL_ID {
+            let mut pool = ctx.enb_ue_pool.write().unwrap();
+            if let Some(source) = pool.get_mut(&source_ue_id) {
+                source.target_ue_id = NEXTGCORE_INVALID_POOL_ID;
+                source.direct_forwarding_available = false;
+            }
+        }
+        ctx.enb_ue_remove(target_ue_id);
+    }
+
+    sends
 }
 
 /// Handle Path Switch Request (X2 handover, TS 36.413 §8.4.4): move the UE's
@@ -2116,6 +2556,9 @@ mod tests {
                     tac: 2,
                 },
             },
+            // #48: ABSENT, which means no direct path and therefore INDIRECT
+            // forwarding -- the behaviour these tests were written against.
+            direct_forwarding_path_availability: None,
             source_to_target_container: vec![0xDE, 0xAD],
         };
         let bytes = builder::build_handover_required(&ho).unwrap();
@@ -2156,6 +2599,9 @@ mod tests {
                     tac: 2,
                 },
             },
+            // #48: ABSENT, which means no direct path and therefore INDIRECT
+            // forwarding -- the behaviour these tests were written against.
+            direct_forwarding_path_availability: None,
             source_to_target_container: vec![0x01],
         };
         let bytes = builder::build_handover_required(&ho).unwrap();
@@ -2207,6 +2653,9 @@ mod tests {
                     tac: 2,
                 },
             },
+            // #48: ABSENT, which means no direct path and therefore INDIRECT
+            // forwarding -- the behaviour these tests were written against.
+            direct_forwarding_path_availability: None,
             source_to_target_container: vec![0x01],
         };
         let out = handle_s1ap_message(
@@ -2294,6 +2743,295 @@ mod tests {
         assert_eq!(
             source_ue.ue_ctx_rel_action,
             UeCtxRelAction::S1HandoverComplete
+        );
+    }
+
+    /// Set up a prepared handover: source UE, one bearer, a registered target eNB, and a
+    /// Handover Required already processed. Returns
+    /// `(source_enb_id, source_ue_id, target_enb_id, mme_ue_s1ap_id, target_mme_ue_s1ap_id, bearer_id)`.
+    ///
+    /// `direct` decides whether the Handover Required carries Direct Forwarding Path
+    /// Availability, which is what selects direct over indirect forwarding.
+    fn prepared_handover(ctx: &MmeContext, direct: bool) -> (u64, u64, u64, u32, u32, u64) {
+        let (source_enb_id, source_ue_id, mme_ue_id, mme_ue_s1ap_id) = add_ue(ctx);
+        let bearer_id = ctx.bearer_add(0, mme_ue_id);
+        {
+            let mut pool = ctx.bearer_pool.write().unwrap();
+            let bearer = pool.get_mut(&bearer_id).unwrap();
+            bearer.ebi = 5;
+            bearer.sgw_s1u_teid = 0x5555;
+            bearer.sgw_s1u_ip.ipv4 = Some([10, 0, 0, 2]);
+            bearer.qos.qci = 9;
+            bearer.qos.arp.priority_level = 8;
+        }
+        let target_enb_id = ctx.enb_add("127.0.0.8:36412".parse().unwrap());
+        ctx.enb_set_enb_id(target_enb_id, 0x2222);
+
+        let ho = HandoverRequired {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id: 100,
+            handover_type: S1apHandoverType::IntraLte,
+            cause: Cause::RadioNetwork(CauseRadioNetwork::HandoverDesirableForRadioReason),
+            target_id: TargetId::TargetEnbId {
+                global_enb_id: GlobalEnbId {
+                    plmn_identity: s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
+                    enb_id: nextgcore_s1ap::EnbId::Macro(0x2222),
+                },
+                selected_tai: nextgcore_s1ap::Tai {
+                    plmn_identity: s1ap_build::encode_plmn_id(&PlmnId::new("310", "410")),
+                    tac: 2,
+                },
+            },
+            direct_forwarding_path_availability: direct
+                .then_some(nextgcore_s1ap::DirectForwardingPathAvailability::DirectPathAvailable),
+            source_to_target_container: vec![0x01],
+        };
+        let out = handle_s1ap_message(
+            ctx,
+            source_enb_id,
+            &builder::build_handover_required(&ho).unwrap(),
+        );
+        let target_mme_ue_s1ap_id = match decode_s1ap_pdu(&out[0].pdu).unwrap() {
+            S1apMessage::HandoverRequest(req) => req.mme_ue_s1ap_id,
+            other => panic!("expected HandoverRequest, got {other:?}"),
+        };
+        (
+            source_enb_id,
+            source_ue_id,
+            target_enb_id,
+            mme_ue_s1ap_id,
+            target_mme_ue_s1ap_id,
+            bearer_id,
+        )
+    }
+
+    /// A Handover Request Acknowledge admitting DL and UL data-forwarding endpoints.
+    fn ack_with_forwarding(target_mme_ue_s1ap_id: u32) -> HandoverRequestAcknowledge {
+        HandoverRequestAcknowledge {
+            mme_ue_s1ap_id: target_mme_ue_s1ap_id,
+            enb_ue_s1ap_id: 300,
+            erab_admitted_list: vec![nextgcore_s1ap::ErabAdmittedItem {
+                erab_id: 5,
+                transport_layer_address: vec![10, 0, 0, 8],
+                gtp_teid: 0x8888,
+                dl_transport_layer_address: Some(vec![10, 0, 0, 9]),
+                dl_gtp_teid: Some(0xDDDD),
+                ul_transport_layer_address: Some(vec![10, 0, 0, 10]),
+                ul_gtp_teid: Some(0xEEEE),
+            }],
+            erab_failed_list: Vec::new(),
+            target_to_source_container: vec![0xBE, 0xEF],
+        }
+    }
+
+    /// #48 criterion 4: the admitted DL/UL forwarding TEIDs reach the Handover Command's
+    /// E-RABs Subject to Forwarding List.
+    ///
+    /// Both halves are asserted, because they failed for different reasons before: the
+    /// TEIDs were decoded by `nextgcore-s1ap` and DROPPED in
+    /// `handle_handover_request_acknowledge` (so the bearer never held them), and the
+    /// list was hard-coded to `Vec::new()` (so even a populated bearer could not reach
+    /// the wire).
+    #[test]
+    fn direct_forwarding_populates_the_handover_command_forwarding_list() {
+        let ctx = ctx_with_gummei();
+        let (source_enb_id, _, target_enb_id, mme_ue_s1ap_id, target_mme_ue_s1ap_id, bearer_id) =
+            prepared_handover(&ctx, true);
+
+        let out = handle_s1ap_message(
+            &ctx,
+            target_enb_id,
+            &builder::build_handover_request_acknowledge(&ack_with_forwarding(
+                target_mme_ue_s1ap_id,
+            ))
+            .unwrap(),
+        );
+
+        // The endpoints were recorded on the bearer.
+        let bearer = ctx.bearer_find_by_id(bearer_id).unwrap();
+        assert_eq!(bearer.enb_dl_teid, 0xDDDD, "admitted DL forwarding TEID");
+        assert_eq!(bearer.enb_dl_ip.ipv4, Some([10, 0, 0, 9]));
+        assert_eq!(bearer.enb_ul_teid, 0xEEEE, "admitted UL forwarding TEID");
+        assert_eq!(bearer.enb_ul_ip.ipv4, Some([10, 0, 0, 10]));
+
+        // And they reached the Handover Command.
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].enb_id, source_enb_id);
+        match decode_s1ap_pdu(&out[0].pdu).unwrap() {
+            S1apMessage::HandoverCommand(cmd) => {
+                assert_eq!(cmd.mme_ue_s1ap_id, mme_ue_s1ap_id);
+                assert_eq!(
+                    cmd.erab_subject_to_forwarding_list.len(),
+                    1,
+                    "a direct-forwarding handover must carry a forwarding list, not the empty \
+                     one this used to send"
+                );
+                let item = &cmd.erab_subject_to_forwarding_list[0];
+                assert_eq!(item.erab_id, 5);
+                assert_eq!(item.dl_gtp_teid, Some(0xDDDD));
+                assert_eq!(item.dl_transport_layer_address, Some(vec![10, 0, 0, 9]));
+                assert_eq!(item.ul_gtp_teid, Some(0xEEEE));
+                assert_eq!(item.ul_transport_layer_address, Some(vec![10, 0, 0, 10]));
+            }
+            other => panic!("expected HandoverCommand, got {other:?}"),
+        }
+    }
+
+    /// #48 criteria 1 and 2: an eNB Status Transfer is dispatched (not answered with an
+    /// Error Indication) and relayed to the target under the TARGET's ids with the
+    /// container byte for byte.
+    #[test]
+    fn enb_status_transfer_is_relayed_to_the_target_unchanged() {
+        let ctx = ctx_with_gummei();
+        let (source_enb_id, _, target_enb_id, mme_ue_s1ap_id, target_mme_ue_s1ap_id, _) =
+            prepared_handover(&ctx, true);
+        let _ = handle_s1ap_message(
+            &ctx,
+            target_enb_id,
+            &builder::build_handover_request_acknowledge(&ack_with_forwarding(
+                target_mme_ue_s1ap_id,
+            ))
+            .unwrap(),
+        );
+
+        let payload = vec![0x00, 0x01, 0xF0, 0x0D, 0x7F, 0x80, 0x2A];
+        let status = nextgcore_s1ap::EnbStatusTransfer {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id: 100,
+            status_transfer_container: payload.clone(),
+        };
+        let out = handle_s1ap_message(
+            &ctx,
+            source_enb_id,
+            &builder::build_enb_status_transfer(&status).unwrap(),
+        );
+
+        assert_eq!(out.len(), 1, "the status must be relayed, not dropped");
+        assert_eq!(
+            out[0].enb_id, target_enb_id,
+            "the relay goes to the TARGET eNB"
+        );
+        match decode_s1ap_pdu(&out[0].pdu).unwrap() {
+            S1apMessage::MmeStatusTransfer(relay) => {
+                assert_eq!(
+                    relay.status_transfer_container, payload,
+                    "the PDCP SN/HFN status must cross unchanged"
+                );
+                assert_eq!(
+                    relay.mme_ue_s1ap_id, target_mme_ue_s1ap_id,
+                    "addressed with the target association's MME-UE-S1AP-ID"
+                );
+                assert_eq!(relay.enb_ue_s1ap_id, 300, "and the target's eNB-UE-S1AP-ID");
+            }
+            // This is the pre-#48 behaviour: proc 24 fell through to Unknown and was
+            // answered with abstract-syntax-error-reject.
+            S1apMessage::ErrorIndication(e) => {
+                panic!("status transfer answered with an Error Indication: {e:?}")
+            }
+            other => panic!("expected MmeStatusTransfer, got {other:?}"),
+        }
+    }
+
+    /// #48 criterion 6, first half: a cancelled handover tells the prepared target to
+    /// release, with cause `handover-cancelled`.
+    #[test]
+    fn handover_cancel_releases_the_prepared_target() {
+        let ctx = ctx_with_gummei();
+        let (source_enb_id, source_ue_id, target_enb_id, mme_ue_s1ap_id, target_mme_ue_s1ap_id, _) =
+            prepared_handover(&ctx, true);
+        let _ = handle_s1ap_message(
+            &ctx,
+            target_enb_id,
+            &builder::build_handover_request_acknowledge(&ack_with_forwarding(
+                target_mme_ue_s1ap_id,
+            ))
+            .unwrap(),
+        );
+        let target_ue_id = ctx.enb_ue_find_by_id(source_ue_id).unwrap().target_ue_id;
+        assert_ne!(target_ue_id, NEXTGCORE_INVALID_POOL_ID);
+
+        let cancel = HandoverCancel {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id: 100,
+            cause: Cause::RadioNetwork(CauseRadioNetwork::HandoverCancelled),
+        };
+        let out = handle_s1ap_message(
+            &ctx,
+            source_enb_id,
+            &builder::build_handover_cancel(&cancel).unwrap(),
+        );
+
+        let release = out.iter().find(|send| send.enb_id == target_enb_id).expect(
+            "the prepared target must be told to release; freeing only the MME's copy \
+                     strands the target's radio and S1-U reservation",
+        );
+        match decode_s1ap_pdu(&release.pdu).unwrap() {
+            S1apMessage::UeContextReleaseCommand(cmd) => assert_eq!(
+                cmd.cause,
+                Cause::RadioNetwork(CauseRadioNetwork::HandoverCancelled)
+            ),
+            other => panic!("expected UeContextReleaseCommand to the target, got {other:?}"),
+        }
+
+        // The source still gets its acknowledge, and the target context is gone.
+        assert!(
+            out.iter().any(|send| send.enb_id == source_enb_id),
+            "the source must still be acknowledged"
+        );
+        assert!(ctx.enb_ue_find_by_id(target_ue_id).is_none());
+    }
+
+    /// #48 criterion 6, second half: a preparation that never completes is released by
+    /// the supervision sweep instead of leaking the target context.
+    ///
+    /// Asserts the DECISION (which target, and that the context is freed), not the
+    /// transmission: `expire_handover_preparations` returns the sends precisely so this
+    /// is assertable without an eNB on the other end of an SCTP association.
+    #[test]
+    fn handover_preparation_supervision_releases_a_target_that_never_completes() {
+        let ctx = ctx_with_gummei();
+        let (_, source_ue_id, target_enb_id, _, target_mme_ue_s1ap_id, _) =
+            prepared_handover(&ctx, true);
+        let _ = handle_s1ap_message(
+            &ctx,
+            target_enb_id,
+            &builder::build_handover_request_acknowledge(&ack_with_forwarding(
+                target_mme_ue_s1ap_id,
+            ))
+            .unwrap(),
+        );
+        let target_ue_id = ctx.enb_ue_find_by_id(source_ue_id).unwrap().target_ue_id;
+
+        // Nothing has expired yet, so the sweep is a no-op. Asserted so the expiry below
+        // cannot pass merely because the sweep releases everything it sees.
+        assert!(
+            expire_handover_preparations(&ctx, std::time::Instant::now()).is_empty(),
+            "a live preparation must not be released"
+        );
+        assert!(ctx.enb_ue_find_by_id(target_ue_id).is_some());
+
+        let past = std::time::Instant::now() + HANDOVER_PREPARATION_SUPERVISION;
+        let sends = expire_handover_preparations(&ctx, past);
+
+        assert_eq!(sends.len(), 1, "the expired target must be released");
+        assert_eq!(sends[0].enb_id, target_enb_id);
+        match decode_s1ap_pdu(&sends[0].pdu).unwrap() {
+            S1apMessage::UeContextReleaseCommand(cmd) => assert_eq!(
+                cmd.cause,
+                Cause::RadioNetwork(CauseRadioNetwork::TS1relocoverallExpiry),
+                "the cause must say the relocation supervision expired, not that it was \
+                 cancelled"
+            ),
+            other => panic!("expected UeContextReleaseCommand, got {other:?}"),
+        }
+        assert!(
+            ctx.enb_ue_find_by_id(target_ue_id).is_none(),
+            "the leaked context is the defect; the release alone does not fix it"
+        );
+        assert_eq!(
+            ctx.enb_ue_find_by_id(source_ue_id).unwrap().target_ue_id,
+            NEXTGCORE_INVALID_POOL_ID,
+            "the source must no longer point at a context that is gone"
         );
     }
 
