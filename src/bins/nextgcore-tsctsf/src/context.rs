@@ -117,6 +117,20 @@ pub struct TimeSyncExposureConfig {
     pub clock_quality_acceptance_criteria: Option<ClockQualityAcceptanceCriteria>,
     /// Temporary validity condition, kept as received.
     pub temporal_validity: Option<serde_json::Value>,
+    /// The UE address of the DS-TT this configuration applies to (#284).
+    ///
+    /// **Not a TS 23.502 §5.2.27.2.2 input.** These exist because TS 29.514's
+    /// `AppSessionContextReqData` requires `oneOf [ueIpv4, ueIpv6, ueMac]` and a
+    /// time-synchronization configuration's mandatory inputs carry SUPIs and a
+    /// `upNodeId` but no UE address — so without one, the actuation leg cannot
+    /// build a conformant body. Optional, and their absence declines actuation with
+    /// a named reason rather than sending a body that violates the schema.
+    ///
+    /// A DS-TT behind an Ethernet PDU session has a MAC, which is the TS 23.501
+    /// §5.28 case, so `ueMac` is checked first.
+    pub ue_mac: Option<String>,
+    pub ue_ipv4: Option<String>,
+    pub ue_ipv6: Option<String>,
     /// The whole body as received, so nothing a consumer sent is lost.
     #[serde(skip)]
     pub raw: serde_json::Value,
@@ -137,6 +151,9 @@ impl Default for TimeSyncExposureConfig {
             clock_quality_detail_level: None,
             clock_quality_acceptance_criteria: None,
             temporal_validity: None,
+            ue_mac: None,
+            ue_ipv4: None,
+            ue_ipv6: None,
             raw: serde_json::Value::Null,
         }
     }
@@ -821,6 +838,22 @@ impl Default for TsctsfContext {
 /// Global TSCTSF context
 static GLOBAL_TSCTSF_CONTEXT: std::sync::OnceLock<Arc<RwLock<TsctsfContext>>> =
     std::sync::OnceLock::new();
+
+/// One agreement about every process-global in this crate: the TSCTSF context and
+/// `actuation`'s enable switch (#284).
+///
+/// Declared **here, beside the largest global it guards**, rather than inside
+/// `main`'s `mod tests` where it used to live. A guard inside one module's `mod
+/// tests` is unreachable from every sibling module, so `actuation`'s tests — which
+/// flip a process-global switch that `main`'s handlers read — would have had to
+/// declare a second lock over the same state. #308 established that two locks over
+/// one ambient state are two disjoint agreements rather than one, and #276 showed
+/// that the same mistake HANGS the suite rather than merely flaking it.
+///
+/// A `std` mutex rather than a `tokio` one: every holder here is a sync `#[test]`
+/// or a `block_on` wrapper with no live runtime to block, and poisoning is absorbed
+/// by `into_inner` at the call site.
+pub static PROCESS_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn tsctsf_self() -> Arc<RwLock<TsctsfContext>> {
     GLOBAL_TSCTSF_CONTEXT

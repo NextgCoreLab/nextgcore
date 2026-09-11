@@ -65,6 +65,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod actuation; // #284: derivation + PCF actuation for stored TSC configurations
 mod context;
 
 pub use context::*;
@@ -203,6 +204,9 @@ async fn main() -> Result<()> {
     );
 
     tsctsf_context_init(args.max_configs);
+    // #284: resolve the actuation switch once, before anything can be served, so
+    // no request is answered under a different setting from the next.
+    actuation::init_from_env();
 
     let nf_instance_id = args
         .nf_instance_id
@@ -387,7 +391,7 @@ async fn handle_config_create(request: &SbiRequest) -> SbiResponse {
     let mut config = config;
     config.raw = data.clone();
 
-    let stored = context::TimeSyncConfig::new(config);
+    let stored = context::TimeSyncConfig::new(config.clone());
     let config_id = stored.id.clone();
     let ctx = tsctsf_self();
     let insert = match ctx.read() {
@@ -404,6 +408,11 @@ async fn handle_config_create(request: &SbiRequest) -> SbiResponse {
 
     let location = format!("/ntsctsf-time-synchronization/v1/configuration/{config_id}");
     log::info!("Time-sync configuration created: id={config_id}");
+    // #284: the stored record now DOES something. Off by default, so with the
+    // switch clear this is a no-op and the response below is byte-identical to
+    // #113's.
+    actuate_time_sync_create(&config_id, &config).await;
+    report_capability_change().await;
     SbiResponse::with_status(201)
         .with_header("Location", location.clone())
         .with_json_body(&config_body(&config_id, &data, &location))
@@ -615,6 +624,12 @@ async fn handle_config_delete(config_id: &str) -> SbiResponse {
     match removed {
         Some(_) => {
             log::info!("Time-sync configuration removed: id={config_id}");
+            // #284: a delete must retract what the create authorised, or the PCF is
+            // left enforcing policy for a configuration that no longer exists.
+            if actuation::enabled() {
+                actuation::policy_authorization_delete(config_id).await;
+            }
+            report_capability_change().await;
             SbiResponse::with_status(204)
         }
         None => send_not_found(
@@ -863,6 +878,19 @@ async fn handle_qos_tsc_create(request: &SbiRequest) -> SbiResponse {
         created.transaction_ref_id,
         created.af_id
     );
+    // #284: a QoS/TSC session carries a UE address as a mandated input, so its
+    // actuation is unconditional -- unlike a time-sync configuration's.
+    if actuation::enabled() {
+        match actuation::build_qos_tsc_app_session(&created, &qos_tsc_notif_uri(&created)) {
+            Ok(asc) => {
+                actuation::policy_authorization_create(&created.transaction_ref_id, &asc).await;
+            }
+            Err(reason) => log::warn!(
+                "not actuating QoS/TSC session {}: {reason}",
+                created.transaction_ref_id
+            ),
+        }
+    }
     let mut body = data;
     if let Some(obj) = body.as_object_mut() {
         obj.insert(
@@ -938,12 +966,87 @@ async fn handle_qos_tsc_delete(transaction_id: &str) -> SbiResponse {
     match removed {
         Some(_) => {
             log::info!("QoS/TSC assistance session removed: transaction={transaction_id}");
+            // #284: retract the PCF authorisation this session created.
+            if actuation::enabled() {
+                actuation::policy_authorization_delete(transaction_id).await;
+            }
             SbiResponse::with_status(204)
         }
         None => send_not_found(
             &format!("Transaction {transaction_id} not found"),
             Some("TRANSACTION_NOT_FOUND"),
         ),
+    }
+}
+
+// ============================================================================
+// #284: actuation glue -- the SBI handlers' view of `actuation`
+// ============================================================================
+
+/// The notification URI to give the PCF for a time-sync configuration.
+///
+/// The AF's own `notificationTargetAddr`: the PCF's TSC notifications are about
+/// the configuration the AF asked for, so the AF is who wants them. A TSCTSF-side
+/// callback would need a receiving route this build does not serve, and pointing
+/// the PCF at a 404 would be worse than pointing it at the consumer.
+fn time_sync_notif_uri(cfg: &context::TimeSyncExposureConfig) -> String {
+    cfg.notification_target_addr.clone()
+}
+
+/// The same for a QoS/TSC session, which types its target as optional.
+fn qos_tsc_notif_uri(session: &context::QosTscSession) -> String {
+    session.notification_target_addr.clone().unwrap_or_default()
+}
+
+/// Actuate a time-sync create: derive, then authorise with the PCF.
+///
+/// A no-op with the switch off, which is the shipped default. With it on, a
+/// configuration that cannot produce a conformant body (no UE address, or
+/// unmeetable clock-quality criteria) is DECLINED with the reason logged at warn
+/// rather than half-sent -- the stored record and the 201 are unaffected either
+/// way, because #113's control plane is the contract the consumer was answered
+/// against.
+async fn actuate_time_sync_create(config_id: &str, cfg: &context::TimeSyncExposureConfig) {
+    if !actuation::enabled() {
+        return;
+    }
+    let derived = actuation::derive_tsn_management(cfg);
+    log::info!(
+        "time-sync configuration {config_id} derives {} DS-TT port(s) + {} NW-TT port(s), \
+         gmEnabled={}, clockQuality={:?}",
+        derived.dstt_ports.len(),
+        derived.nwtt_ports.len(),
+        derived.gm_enabled,
+        derived.clock_quality
+    );
+    match actuation::build_time_sync_app_session(cfg, &derived, &time_sync_notif_uri(cfg)) {
+        Ok(asc) => {
+            actuation::policy_authorization_create(config_id, &asc).await;
+        }
+        Err(reason) => {
+            log::warn!("not actuating time-sync configuration {config_id}: {reason}")
+        }
+    }
+}
+
+/// Recompute the derived capability set and fire `CapsNotify` if it changed
+/// (#284 criterion 5).
+///
+/// This is the in-tree capability SOURCE that #113's `admin/capability-change`
+/// route stood in for. It fires on a change, not on every request: a create that
+/// alters nothing about the derived capabilities must not wake every subscriber.
+async fn report_capability_change() {
+    if !actuation::enabled() {
+        return;
+    }
+    let configs = match tsctsf_self().read() {
+        Ok(c) => c.config_list(),
+        Err(_) => return,
+    };
+    let caps = actuation::derive_capabilities(&configs);
+    if actuation::capabilities_changed(&caps) {
+        let notified = notify_capability_change(&caps).await;
+        log::info!("CapsNotify (derived capability change): {notified} subscriber(s)");
     }
 }
 
@@ -1194,6 +1297,16 @@ pub async fn notify_capability_change(capabilities: &serde_json::Value) -> usize
 /// with the number of subscribers notified, so an operator can tell "notified
 /// nobody because nobody subscribed" from "notified nobody because the fan-out is
 /// broken" — two states a 204 would conflate.
+///
+/// # A TEST-ONLY SHIM as of #284
+///
+/// #113 added this because `CapsNotify` had no in-tree producer at all. It now has
+/// one: [`report_capability_change`] recomputes the derived capability set on every
+/// configuration change and fires the notification when it differs. This route is
+/// kept rather than removed for two reasons — #113's subscribe/notify/unsubscribe
+/// test drives the fan-out through it, and it lets an operator force a fan-out
+/// while diagnosing — but it is **not** a capability source and must not be
+/// mistaken for one. Anything relying on it in a deployment is relying on a shim.
 async fn handle_admin_capability_change(request: &SbiRequest) -> SbiResponse {
     let capabilities: serde_json::Value = match &request.http.content {
         Some(body) => match serde_json::from_str(body) {
@@ -1335,13 +1448,18 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    /// Serializes tests that touch the process-global TSCTSF context.
-    static GLOBAL_TEST_LOCK: Mutex<()> = Mutex::new(());
-
+    /// Serializes tests that touch any process-global in this crate.
+    ///
+    /// #284 moved the static itself to `context`, beside the context it guards, so
+    /// `actuation`'s tests reach the SAME lock: they flip the actuation switch,
+    /// which these handlers read. A second lock declared here would be a second
+    /// disjoint agreement over one ambient state -- #308's defect, and #276 showed
+    /// that shape hangs the suite.
     fn lock_globals() -> std::sync::MutexGuard<'static, ()> {
-        GLOBAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        crate::context::PROCESS_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Reset the process-global context. Callers must hold [`lock_globals`].
@@ -1611,6 +1729,351 @@ mod tests {
             .await
             .expect("notification sink start");
         (server, format!("http://127.0.0.1:{port}/notify"), seen)
+    }
+
+    // ── #284: the actuation leg, ON and OFF ──
+
+    /// A stand-in PCF that records every request and answers a
+    /// `Npcf_PolicyAuthorization_Create` with 201 + Location, so the
+    /// `appSessionId` the TSCTSF records comes off the wire.
+    async fn spawn_stub_pcf() -> (
+        nextgcore_sbi::server::SbiServer,
+        u16,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>,
+    ) {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let (server, addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    let body = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|b| serde_json::from_str(b).ok())
+                        .unwrap_or(serde_json::Value::Null);
+                    let uri = req.header.uri.clone();
+                    sink.lock().unwrap_or_else(|e| e.into_inner()).push((
+                        req.header.method.clone(),
+                        uri.clone(),
+                        body,
+                    ));
+                    if uri == "/npcf-policyauthorization/v1/app-sessions" {
+                        return SbiResponse::with_status(201).with_header(
+                            "Location",
+                            "/npcf-policyauthorization/v1/app-sessions/asc-284".to_string(),
+                        );
+                    }
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await;
+        (server, addr.port(), seen)
+    }
+
+    /// Take the switch, the PCF pointer and the derived-capability memo back to a
+    /// known state. Callers hold [`lock_globals`].
+    fn reset_actuation(pcf_port: Option<u16>) {
+        actuation::clear_app_sessions_for_test();
+        actuation::reset_capabilities_for_test();
+        match pcf_port {
+            Some(p) => std::env::set_var("PCF_URI", format!("http://127.0.0.1:{p}")),
+            None => std::env::remove_var("PCF_URI"),
+        }
+    }
+
+    /// #284 criterion 2: with the switch ON, a time-sync create issues
+    /// `Npcf_PolicyAuthorization_Create` toward the PCF, and the delete issues the
+    /// matching delete.
+    ///
+    /// Asserted by observing the outbound HTTP request -- method, path and body --
+    /// which is what the criterion demands instead of a log line.
+    #[test]
+    fn the_switch_on_issues_policy_authorization_create_and_delete() {
+        let _g = lock_globals();
+        reset_context();
+        block_on(async {
+            let (pcf, pcf_port, seen) = spawn_stub_pcf().await;
+            reset_actuation(Some(pcf_port));
+            actuation::set_for_test(true);
+
+            let created = tsctsf_sbi_request_handler(create_request(serde_json::json!({
+                "timeDomain": 24,
+                "gmEnable": true,
+                "gmPriority": 128,
+                "supis": ["imsi-001010000000284"],
+                // TS 29.514 requires oneOf [ueIpv4, ueIpv6, ueMac]; a time-sync
+                // configuration has no mandatory UE address, so the consumer
+                // supplies one or actuation declines.
+                "ueMac": "00-11-22-33-44-55",
+            })))
+            .await;
+            assert_eq!(created.status, 201);
+            let body: serde_json::Value =
+                serde_json::from_str(created.http.content.as_deref().expect("body")).expect("json");
+            let config_id = body["configId"].as_str().expect("configId").to_string();
+
+            let requests = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let create = requests
+                .iter()
+                .find(|(m, u, _)| m == "POST" && u == "/npcf-policyauthorization/v1/app-sessions")
+                .expect("a create must reach the PCF; got {requests:?}");
+            let asc = &create.2["ascReqData"];
+            assert_eq!(
+                asc["ueMac"], "00-11-22-33-44-55",
+                "the oneOf-required UE address must be present, body was {:?}",
+                create.2
+            );
+            assert_eq!(asc["supi"], "imsi-001010000000284");
+            assert!(
+                asc["tsnBridgeManCont"]["bridgeManCont"].is_string(),
+                "the UMIC must be carried as TS 29.571 Bytes (base64), got {:?}",
+                asc["tsnBridgeManCont"]
+            );
+            assert_eq!(
+                asc["tsnPortManContDstt"]["portNum"], 1,
+                "the DS-TT port is numbered from 1"
+            );
+            assert_eq!(
+                asc["tsnPortManContNwtts"][0]["portNum"], 0,
+                "the N6 termination takes port 0"
+            );
+            assert_eq!(asc["suppFeat"], "0");
+            assert_eq!(
+                actuation::app_session_for(&config_id).as_deref(),
+                Some("asc-284"),
+                "the appSessionId is taken from the PCF's Location header"
+            );
+
+            // The delete must retract it, at the TS 29.514 §4.2.5 custom operation
+            // rather than as an HTTP DELETE.
+            seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            let deleted = tsctsf_sbi_request_handler(SbiRequest::delete(&format!(
+                "/ntsctsf-time-synchronization/v1/configuration/{config_id}"
+            )))
+            .await;
+            assert_eq!(deleted.status, 204);
+            let requests = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            assert!(
+                requests.iter().any(|(m, u, _)| m == "POST"
+                    && u == "/npcf-policyauthorization/v1/app-sessions/asc-284/delete"),
+                "the delete must reach the PCF as the custom operation; got {requests:?}"
+            );
+            assert!(
+                actuation::app_session_for(&config_id).is_none(),
+                "the recorded app session must be forgotten, or a second delete would repeat it"
+            );
+
+            actuation::set_for_test(false);
+            reset_actuation(None);
+            pcf.stop().await.expect("stop stub PCF");
+        });
+    }
+
+    /// #284 criterion 3: with the switch OFF, NO outbound request is made and the
+    /// control-plane behaviour is byte-identical.
+    ///
+    /// The byte-identical half is asserted by comparing the whole 201 body against
+    /// the same create with the switch on -- a weaker test would let actuation
+    /// quietly add a member to what the consumer gets back.
+    #[test]
+    fn the_switch_off_makes_no_outbound_request() {
+        let _g = lock_globals();
+        reset_context();
+        block_on(async {
+            let (pcf, pcf_port, seen) = spawn_stub_pcf().await;
+            reset_actuation(Some(pcf_port));
+            actuation::set_for_test(false);
+
+            let req = || {
+                create_request(serde_json::json!({
+                    "timeDomain": 24,
+                    "gmEnable": true,
+                    "supis": ["imsi-001010000000284"],
+                    "ueMac": "00-11-22-33-44-55",
+                }))
+            };
+            let off = tsctsf_sbi_request_handler(req()).await;
+            assert_eq!(off.status, 201);
+            assert!(
+                seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty(),
+                "the switch is off: nothing may leave this process"
+            );
+
+            // Same request with the switch on, to compare the consumer-visible body.
+            actuation::set_for_test(true);
+            let on = tsctsf_sbi_request_handler(req()).await;
+            assert_eq!(on.status, on.status);
+            let strip_id = |r: &SbiResponse| {
+                let mut v: serde_json::Value =
+                    serde_json::from_str(r.http.content.as_deref().expect("body")).expect("json");
+                // The minted id and self link differ by construction.
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("configId");
+                    o.remove("self");
+                }
+                v
+            };
+            assert_eq!(
+                strip_id(&off),
+                strip_id(&on),
+                "actuation must not change one byte of what the consumer is answered"
+            );
+            assert_eq!(off.status, on.status);
+
+            actuation::set_for_test(false);
+            reset_actuation(None);
+            pcf.stop().await.expect("stop stub PCF");
+        });
+    }
+
+    /// A configuration with NO UE address is declined rather than sent: TS 29.514
+    /// requires `oneOf [ueIpv4, ueIpv6, ueMac]`, and a time-sync configuration's
+    /// mandatory inputs carry none.
+    #[test]
+    fn a_configuration_with_no_ue_address_is_not_actuated() {
+        let _g = lock_globals();
+        reset_context();
+        block_on(async {
+            let (pcf, pcf_port, seen) = spawn_stub_pcf().await;
+            reset_actuation(Some(pcf_port));
+            actuation::set_for_test(true);
+
+            let created = tsctsf_sbi_request_handler(create_request(serde_json::json!({
+                "timeDomain": 24,
+                "gmEnable": true,
+                "supis": ["imsi-001010000000284"],
+            })))
+            .await;
+            assert_eq!(
+                created.status, 201,
+                "the control plane still answers: #113's contract is unaffected"
+            );
+            let posts = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            assert!(
+                !posts
+                    .iter()
+                    .any(|(_, u, _)| u == "/npcf-policyauthorization/v1/app-sessions"),
+                "a body violating oneOf must not be sent; got {posts:?}"
+            );
+
+            actuation::set_for_test(false);
+            reset_actuation(None);
+            pcf.stop().await.expect("stop stub PCF");
+        });
+    }
+
+    /// A configuration whose clock-quality criteria can never be met is declined:
+    /// authorising it would commit the TSCTSF to a service it cannot deliver.
+    #[test]
+    fn unmeetable_clock_quality_criteria_are_not_actuated() {
+        let _g = lock_globals();
+        reset_context();
+        block_on(async {
+            let (pcf, pcf_port, seen) = spawn_stub_pcf().await;
+            reset_actuation(Some(pcf_port));
+            actuation::set_for_test(true);
+
+            let created = tsctsf_sbi_request_handler(create_request(serde_json::json!({
+                "timeDomain": 24,
+                "gmEnable": true,
+                "supis": ["imsi-001010000000284"],
+                "ueMac": "00-11-22-33-44-55",
+                // 100 is Reserved in IEEE 1588-2019 Table 4.
+                "clockQualityAcceptanceCriteria": { "clockClass": 100 },
+            })))
+            .await;
+            assert_eq!(created.status, 201);
+            let posts = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            assert!(
+                !posts
+                    .iter()
+                    .any(|(_, u, _)| u == "/npcf-policyauthorization/v1/app-sessions"),
+                "an impossible criterion must not be authorised; got {posts:?}"
+            );
+
+            actuation::set_for_test(false);
+            reset_actuation(None);
+            pcf.stop().await.expect("stop stub PCF");
+        });
+    }
+
+    /// #284 criterion 5: a capability change from a REAL source drives CapsNotify.
+    ///
+    /// The source is the derived capability set, recomputed on every configuration
+    /// change. The second create changes nothing about it, and must therefore NOT
+    /// notify -- which is what makes this a change trigger rather than a
+    /// per-request one, and what distinguishes it from #113's admin poke.
+    #[test]
+    fn a_derived_capability_change_drives_caps_notify_and_an_unchanged_set_does_not() {
+        let _g = lock_globals();
+        reset_context();
+        block_on(async {
+            let (sink, notif_uri, seen) = spawn_notification_sink().await;
+            let (pcf, pcf_port, _pcf_seen) = spawn_stub_pcf().await;
+            reset_actuation(Some(pcf_port));
+            actuation::set_for_test(true);
+
+            // A capability subscriber.
+            let sub = tsctsf_sbi_request_handler(post(
+                "/ntsctsf-time-synchronization/v1/subscriptions",
+                // §5.2.27.2.6 needs a SCOPE as well as a target: either a
+                // (DNN, S-NSSAI) pair or an AF-Service-Identifier.
+                serde_json::json!({
+                    "notificationTargetAddr": notif_uri,
+                    "afServiceId": "tsn-284",
+                }),
+            ))
+            .await;
+            assert_eq!(sub.status, 201, "CapsSubscribe must be served");
+            seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
+
+            // A create that introduces a time domain and a grandmaster.
+            let first = tsctsf_sbi_request_handler(create_request(serde_json::json!({
+                "timeDomain": 24,
+                "gmEnable": true,
+                "supis": ["imsi-284-a"],
+                "ueMac": "00-11-22-33-44-55",
+            })))
+            .await;
+            assert_eq!(first.status, 201);
+            let after_first = seen.lock().unwrap_or_else(|e| e.into_inner()).len();
+            assert_eq!(
+                after_first, 1,
+                "the derived capability set changed, so the subscriber must be told"
+            );
+            let (_, body) = seen.lock().unwrap_or_else(|e| e.into_inner())[0].clone();
+            assert_eq!(
+                body["timeSyncCapabilities"]["timeDomains"],
+                serde_json::json!([24]),
+                "the notification carries the DERIVED set, not whatever an admin route was \
+                 handed; body was {body:?}"
+            );
+            assert_eq!(body["timeSyncCapabilities"]["gmCapable"], true);
+
+            // A second create with the same domain and profile changes nothing.
+            let second = tsctsf_sbi_request_handler(create_request(serde_json::json!({
+                "timeDomain": 24,
+                "gmEnable": true,
+                "supis": ["imsi-284-b"],
+                "ueMac": "00-11-22-33-44-66",
+            })))
+            .await;
+            assert_eq!(second.status, 201);
+            assert_eq!(
+                seen.lock().unwrap_or_else(|e| e.into_inner()).len(),
+                after_first,
+                "an unchanged capability set must not wake the subscriber again"
+            );
+
+            actuation::set_for_test(false);
+            reset_actuation(None);
+            pcf.stop().await.expect("stop stub PCF");
+            sink.stop().await.expect("stop sink");
+        });
     }
 
     /// #113 criterion 1: PATCH updates a stored configuration and answers 200;

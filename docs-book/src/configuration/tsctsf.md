@@ -140,5 +140,77 @@ From the clap `Args` struct in `src/bins/nextgcore-tsctsf/src/main.rs`:
 - **OAuth2** producer enforcement mirrors dccfd: enable with
   `NEXTGCORE_SBI_OAUTH2_REQUIRE=1` or `tsctsf.sbi.oauth2.require: true`; tokens are
   verified against the NRF JWKS with audience `TSCTSF`.
-- **Environment variables:** `NEXTGCORE_SBI_OAUTH2_REQUIRE` and
-  `OTEL_EXPORTER_OTLP_ENDPOINT` (default `http://jaeger:4317`).
+- **Environment variables:** `NEXTGCORE_SBI_OAUTH2_REQUIRE`, `TSCTSF_ACTUATION`,
+  `PCF_URI` and `OTEL_EXPORTER_OTLP_ENDPOINT` (default `http://jaeger:4317`).
+
+## Actuation (#284) — off by default
+
+Before #284 a stored configuration did **nothing**: no PCF was contacted, no
+port-management information was derived, and the UPF's `tsn_bridge` was never
+touched. With `TSCTSF_ACTUATION=1` the TSCTSF now derives and authorises.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `TSCTSF_ACTUATION` | unset (off) | `1`/`true`/`yes`/`on` enables actuation. A **runtime** switch rather than a cargo feature, so CI compiles and exercises both states. |
+| `PCF_URI` | unset | The serving PCF, e.g. `http://pcf:7777`. Unset falls back to NRF discovery (`target-nf-type=PCF&requester-nf-type=TSCTSF`), taking the `npcf-policyauthorization` service's own endpoint rather than the profile's first service. |
+
+**What happens with the switch on.** A time-synchronization or QoS/TSC create
+issues `Npcf_PolicyAuthorization_Create` (`POST
+/npcf-policyauthorization/v1/app-sessions`) and records the `appSessionId` from the
+response `Location`; the matching delete issues `POST
+.../app-sessions/{appSessionId}/delete` (TS 29.514 §4.2.5 — a custom operation, not
+an HTTP DELETE). A time-sync body carries the derived containers:
+`tsnBridgeManCont` (the UMIC), `tsnPortManContDstt` and `tsnPortManContNwtts`. A
+QoS/TSC body carries one media component with `tscaiInputUl`/`tscaiInputDl` and
+`tscaiTimeDom`.
+
+**A time-sync create needs a UE address that TS 23.502 does not require.**
+TS 29.514's `AppSessionContextReqData` requires `oneOf [ueIpv4, ueIpv6, ueMac]`,
+and a §5.2.27.2.2 time-synchronization configuration's mandatory inputs are SUPIs
+and a `upNodeId` — no UE address. So the configuration accepts optional `ueMac`,
+`ueIpv4` and `ueIpv6` members (`ueMac` first: a DS-TT behind an Ethernet PDU
+session has one, the TS 23.501 §5.28 case), and with none of them present the
+actuation is **declined with the reason logged at warn** rather than a body being
+sent that violates the schema. The 201 and the stored record are unaffected either
+way. A QoS/TSC session needs no such member: §5.2.27.3.2 makes a UE address a
+required input.
+
+**Clock-quality criteria that can never be met are declined.** The derivation
+statically checks the stated criteria against what IEEE 1588-2019 can report — a
+`clockClass` outside Table 4's specified set `{6,7,13,14,52,58,187,193,248,255}`, a
+`clockAccuracy` outside the Table 5 enumeration `0x20..=0x31` (or `0xFE` unknown),
+or a `synchronizationState` outside `{SYNCHRONIZED, NOT_SYNCHRONIZED}`. Every
+failing criterion is reported, not just the first. Authorising such a configuration
+would commit the TSCTSF to a service it cannot deliver.
+
+**`CapsNotify` now has an in-tree source.** The derived capability set (time
+domains, PTP profiles, grandmaster capability, and a count of configurations with
+unmeetable criteria) is recomputed on every configuration change, and the
+notification fires only when the set actually **differs** — a create that changes
+nothing must not wake every subscriber.
+`POST /ntsctsf-time-synchronization/v1/admin/capability-change` is retained as a
+**test-only shim** and is documented as such in the code: it is not a capability
+source and anything relying on it in a deployment is relying on a shim.
+
+**Limits worth knowing:**
+
+- **The UPF's `tsn_bridge` is still `None`.** Driving it needs the N4 leg — a PFCP
+  TSC container codec, an `smfd` path that carries it, and a `upfd` consumer.
+  `nextgcore-pfcp` has the IE type constants (`CreateBridgeInfoForTsc` 194,
+  `TscManagementInformationSmr` 199 …) with **zero users** and no container codec,
+  and the `tscu` UP-function-feature bit is encoded and decoded but never acted on.
+  Tracked separately; #284's own suggested approach makes this piece meaningful
+  only once that codec exists.
+- **The PMIC/UMIC octet strings are this build's own TLV encoding** of the managed
+  objects a configuration determines, not the IEEE 802.1Q clause 12 encoding —
+  there is no 802.1Q managed-object codec in this tree. The derivation (which
+  objects, per port, per side) is the specified and tested part.
+- **The derived capability set is not a 5GS capability report.** The gNB and UPF do
+  not report their (g)PTP capability into this tree at all. This reports what the
+  TSCTSF has been asked to support and can derive.
+- **The notification URI given to the PCF is the AF's own.** The TSCTSF serves no
+  TSC-notification receiving route, and pointing the PCF at a 404 would be worse
+  than pointing it at the consumer that asked.
+- **`suppFeat` is `"0"`.** This consumer negotiates no optional TS 29.514 feature;
+  claiming one it does not implement would make the PCF send responses it cannot
+  read.
