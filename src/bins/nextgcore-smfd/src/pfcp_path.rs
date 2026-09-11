@@ -733,7 +733,15 @@ impl PfcpClient {
     }
 
     /// Mark the association down and flush all PFCP session state.
+    ///
+    /// #193: the consumers are told BEFORE the flush. Every PDU session on this
+    /// UPF is gone (TS 23.527 §4.2), and the AMF holds an `smContextStatusUri`
+    /// for each one; the join from session to callback runs through the map this
+    /// is about to empty, so notifying afterwards would have nobody to notify.
+    /// Previously this cleared the map, logged a count, and left every AMF
+    /// believing in contexts that could not carry a packet.
     async fn teardown_association(&self, reason: &str) {
+        let notified = crate::restoration::notify_sessions_unrecoverable(reason).await;
         {
             let mut assoc = self.assoc.write().await;
             assoc.associated = false;
@@ -745,7 +753,10 @@ impl PfcpClient {
             assoc.peer_load_seq = None;
         }
         let cleared = clear_pfcp_sessions();
-        log::warn!("PFCP association torn down ({reason}); {cleared} stale sessions flushed");
+        log::warn!(
+            "PFCP association torn down ({reason}); {cleared} stale sessions flushed, \
+             {notified} AMF status callback(s) notified"
+        );
     }
 
     /// Run the PFCP Association Setup procedure (TS 29.244 6.2.6).
@@ -973,6 +984,11 @@ pub(crate) mod stand_in {
         pub(crate) upf_teid: u32,
         /// The N3 address it reports alongside the F-TEID.
         pub(crate) upf_ip: [u8; 4],
+        /// The Cause this stand-in answers Session Modification and Deletion with
+        /// (#193). `REQUEST_ACCEPTED` unless a test asks otherwise, which is what
+        /// lets one drive the SMF's cause-65 reconciliation over a real round trip
+        /// rather than by calling the reconciler directly.
+        session_cause: Arc<std::sync::atomic::AtomicU8>,
         /// Serialises every N4 test against every other; released with this value.
         _n4_guard: tokio::sync::MutexGuard<'static, ()>,
     }
@@ -994,6 +1010,17 @@ pub(crate) mod stand_in {
         /// Forget the recorded traffic, so a test asserts only about its own.
         pub(crate) fn clear_seen(&self) {
             self.seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+
+        /// Answer the next Session Modification / Deletion with `cause` (#193).
+        ///
+        /// Scoped to the session-level messages on purpose: making the
+        /// ASSOCIATION handshake fail is a different test, and a stand-in that
+        /// refused everything could not first establish the session the
+        /// reconciliation is about.
+        pub(crate) fn answer_sessions_with(&self, cause: u8) {
+            self.session_cause
+                .store(cause, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -1071,6 +1098,10 @@ pub(crate) mod stand_in {
         let upf_ip = [127, 0, 0, 4];
 
         let recorded = seen.clone();
+        let session_cause = Arc::new(std::sync::atomic::AtomicU8::new(
+            pfcp_cause::REQUEST_ACCEPTED,
+        ));
+        let answered_cause = session_cause.clone();
         tokio::spawn(async move {
             let rts = 0x5EED_0289_u32;
             let mut buf = vec![0u8; 8192];
@@ -1130,13 +1161,19 @@ pub(crate) mod stand_in {
                         pfcp_message_type::SESSION_MODIFICATION_RESPONSE,
                         Some(h.seid),
                         h.sequence_number,
-                        &tlv(19, &[pfcp_cause::REQUEST_ACCEPTED]),
+                        &tlv(
+                            19,
+                            &[answered_cause.load(std::sync::atomic::Ordering::SeqCst)],
+                        ),
                     )),
                     pfcp_message_type::SESSION_DELETION_REQUEST => Some(encode_wire_message(
                         pfcp_message_type::SESSION_DELETION_RESPONSE,
                         Some(h.seid),
                         h.sequence_number,
-                        &tlv(19, &[pfcp_cause::REQUEST_ACCEPTED]),
+                        &tlv(
+                            19,
+                            &[answered_cause.load(std::sync::atomic::Ordering::SeqCst)],
+                        ),
                     )),
                     _ => None,
                 };
@@ -1156,6 +1193,7 @@ pub(crate) mod stand_in {
             upf_seid,
             upf_teid,
             upf_ip,
+            session_cause,
             _n4_guard: n4_guard,
         }
     }
@@ -1772,6 +1810,169 @@ mod tests {
             seid,
             Some(0x1234),
             "a session on a UPF that did not restart must survive"
+        );
+    }
+
+    // ── #193: the detection is wired to a SIGNAL, not only to a local flush ──
+
+    /// The end-to-end shape of #193's criterion 1, driven from the same entry
+    /// point production uses: a changed Recovery Time Stamp on a heartbeat or
+    /// association reaches `check_peer_restart`, which tears the association
+    /// down, and the teardown must now tell the AMF before it empties the map.
+    ///
+    /// This is the test that guards the WIRING. `restoration`'s own tests call
+    /// `notify_sessions_unrecoverable` directly, so they would all still pass with
+    /// the call removed from `teardown_association` — which is exactly the defect
+    /// #193 describes, one layer up.
+    #[tokio::test]
+    async fn a_peer_restart_notifies_the_amf_before_flushing_the_session_map() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+
+        // Plaintext loopback AMF: declare the dev profile rather than inherit it.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_posts = Arc::clone(&posts);
+        let sink_bodies = Arc::clone(&bodies);
+        let (amf, amf_addr) = nextgcore_sbi::test_support::sbi_server_on_free_port(
+            move |req: nextgcore_sbi::message::SbiRequest| {
+                let posts = Arc::clone(&sink_posts);
+                let bodies = Arc::clone(&sink_bodies);
+                async move {
+                    posts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(c) = req.http.content.as_deref() {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(c) {
+                            if let Ok(mut b) = bodies.lock() {
+                                b.push(v);
+                            }
+                        }
+                    }
+                    nextgcore_sbi::message::SbiResponse::with_status(204)
+                }
+            },
+        )
+        .await;
+        let status_uri = format!("http://127.0.0.1:{}/callbacks/sm-status", amf_addr.port());
+
+        let (client, _upf) = make_client_with_peer().await;
+        client.seed_peer_recovery_time_stamp(4242).await;
+        client.set_assoc_state_for_test(true, None, None).await;
+        {
+            let global = smf_self();
+            let ctx = global.read().expect("smf context");
+            {
+                let mut sessions = ctx.pfcp_sessions.write().expect("sessions");
+                sessions.insert("restart-signal-ref".to_string(), 0x0193_1000);
+            }
+            let mut b = crate::context::PolicyBinding::snapshot_default();
+            b.supi = "imsi-001010000000193".to_string();
+            b.psi = 9;
+            b.sm_context_status_uri = Some(status_uri.clone());
+            ctx.policy_bindings
+                .write()
+                .expect("bindings")
+                .insert("restart-signal-ref".to_string(), b);
+        }
+
+        // The UPF came back as a new incarnation.
+        client.check_peer_restart(9999).await;
+
+        let flushed = {
+            let global = smf_self();
+            let ctx = global.read().expect("smf context");
+            let sessions = ctx.pfcp_sessions.read().expect("sessions");
+            let present = sessions.contains_key("restart-signal-ref");
+            !present
+        };
+        {
+            let global = smf_self();
+            let ctx = global.read().expect("smf context");
+            ctx.policy_bindings
+                .write()
+                .expect("bindings")
+                .remove("restart-signal-ref");
+        }
+        let seen_posts = posts.load(std::sync::atomic::Ordering::SeqCst);
+        let seen_bodies = bodies.lock().expect("bodies").clone();
+        amf.stop().await.expect("stop amf");
+
+        assert!(flushed, "the stale session is still flushed locally");
+        assert_eq!(
+            seen_posts, 1,
+            "the AMF must be told the session is gone -- this is the notification the flush \
+             used to replace with a log line"
+        );
+        assert_eq!(
+            seen_bodies[0]["statusInfo"]["resourceStatus"], "RELEASED",
+            "body was {:?}",
+            seen_bodies[0]
+        );
+    }
+
+    /// The interlock's other side, at the wiring level: a UPF that did NOT
+    /// restart must produce NO notification. Without this, "notify on teardown"
+    /// could be satisfied by a version that notifies unconditionally, which would
+    /// release every live session on every heartbeat.
+    #[tokio::test]
+    async fn an_unchanged_stamp_notifies_nobody() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _map_guard = N4_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink_posts = Arc::clone(&posts);
+        let (amf, amf_addr) = nextgcore_sbi::test_support::sbi_server_on_free_port(
+            move |_req: nextgcore_sbi::message::SbiRequest| {
+                let posts = Arc::clone(&sink_posts);
+                async move {
+                    posts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    nextgcore_sbi::message::SbiResponse::with_status(204)
+                }
+            },
+        )
+        .await;
+        let status_uri = format!("http://127.0.0.1:{}/callbacks/sm-status", amf_addr.port());
+
+        let (client, _upf) = make_client_with_peer().await;
+        client.seed_peer_recovery_time_stamp(7777).await;
+        client.set_assoc_state_for_test(true, None, None).await;
+        {
+            let global = smf_self();
+            let ctx = global.read().expect("smf context");
+            {
+                let mut sessions = ctx.pfcp_sessions.write().expect("sessions");
+                sessions.insert("no-restart-signal-ref".to_string(), 0x0193_1001);
+            }
+            let mut b = crate::context::PolicyBinding::snapshot_default();
+            b.sm_context_status_uri = Some(status_uri.clone());
+            ctx.policy_bindings
+                .write()
+                .expect("bindings")
+                .insert("no-restart-signal-ref".to_string(), b);
+        }
+
+        client.check_peer_restart(7777).await;
+
+        {
+            let global = smf_self();
+            let ctx = global.read().expect("smf context");
+            {
+                let mut sessions = ctx.pfcp_sessions.write().expect("sessions");
+                sessions.remove("no-restart-signal-ref");
+            }
+            ctx.policy_bindings
+                .write()
+                .expect("bindings")
+                .remove("no-restart-signal-ref");
+        }
+        let seen = posts.load(std::sync::atomic::Ordering::SeqCst);
+        amf.stop().await.expect("stop amf");
+
+        assert_eq!(
+            seen, 0,
+            "an unchanged stamp is not a restart, so releasing the session would be a fabricated \
+             outage"
         );
     }
 }

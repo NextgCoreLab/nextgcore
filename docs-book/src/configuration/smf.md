@@ -136,11 +136,60 @@ in. An unchanged stamp means they are genuinely still valid.
 - The flush is process-wide, not per-peer — `clear_pfcp_sessions` empties the
   whole map, so with several UPFs configured one peer's restart discards the
   session bookkeeping for all of them. The map has no peer column to do better.
-- Reconciling *which* sessions survived a restart, and signalling peers about
-  the ones that did not, is TS 23.527 restoration work tracked as #193. This
-  interlock is the minimum that makes restoring the map safe, not that work.
 - Not enabled in the shipped Docker compose (unlike `udrd`), so the default E2E
   path is unchanged.
+
+## Restoration signalling (#193)
+
+The interlock above decides what the SMF *believes*. This decides what it
+**tells the AMF**, which before #193 was nothing: the SMF flushed N sessions,
+logged a count, and left every AMF holding an `smContextStatusUri` for a PDU
+session that could no longer carry a packet. The AMF found out on its next
+request, as a 404 with no context, or never.
+
+**Signal emitted:** `SmContextStatusNotification` (TS 29.502 §6.1.6.2.8) POSTed
+to the `smContextStatusUri` the AMF supplied at SM Context Create, with
+`statusInfo.resourceStatus = RELEASED` and a `cause` naming why.
+
+**Two triggers, both evidence rather than assumption:**
+
+| Trigger | Scope | Cause carried |
+|---|---|---|
+| The UPF's Recovery Time Stamp changed, or the association was released | every session on that UPF (TS 23.527 §4.2) | the teardown reason, e.g. `peer restarted` |
+| The UPF answered a request for one session with cause 65, *Session context not found* (TS 29.244 §7.5.3.1) | that one session only | `session context not found at the UPF` |
+
+The second is the SMF/UPF **reconciliation** path, and it is the case the
+Recovery Time Stamp interlock cannot see: no restart happened, so the stamp
+matches and the restored session is kept — yet the UPF may still have no context
+for it (reconfigured, deleted out of band, or a snapshot predating a UPF-side
+deletion). The UPF's own cause code is the only evidence, and the SMF now drops
+the session and notifies rather than logging the cause and repeating the round
+trip on every later request. Only cause 65 does this: the other rejection causes
+are about the *request*, and dropping a session on those would destroy a live
+one over a malformed message.
+
+**Nothing is emitted at boot.** A boot-time burst would have to guess: at boot
+the SMF has restored a session map and cannot yet know whether the UPF agrees.
+The first Association Setup is when the truth arrives, which is why that is where
+the signal is emitted (TS 29.500 §6.5 permits either reading; this is the lazy
+one in substance — self-throttling, and no burst against a consumer that may
+itself be restarting).
+
+**Limits worth knowing:**
+
+- **Not gated on `--state-file`.** A memory-only SMF strands the AMF's view just
+  as thoroughly when a live UPF restarts, so gating the signal on persistence
+  would leave the shipped default carrying the defect. What the default *does*
+  keep is silence at boot: with no snapshot there are no restored sessions and
+  nothing is emitted.
+- **A session whose AMF supplied no `smContextStatusUri` cannot be told
+  anything.** The count in the log reports those separately rather than implying
+  every consumer was notified.
+- **No throttling.** One POST per session, sequentially. A UPF restart with a
+  large session count produces a proportional burst at the AMF.
+- **Only the SMF→AMF direction.** The PCF holds an SM policy association for the
+  same sessions and is not notified here; that is `Npcf_SMPolicyControl_Delete`
+  on the release path, which this does not drive.
 
 ## Parsed-but-inert YAML sections
 
