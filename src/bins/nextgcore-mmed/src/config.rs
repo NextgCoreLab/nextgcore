@@ -75,6 +75,27 @@ struct S1apYaml {
     server: Option<Vec<ServerYaml>>,
 }
 
+/// `mme.gtpc`: the S11 interface (#51).
+///
+/// `server` is what the MME binds; `client.sgwc` is the Serving GW it sends a
+/// Create Session Request to. Both were unread until #51, because until then no
+/// socket existed to bind and no message ever left the MME.
+#[derive(Debug, Default, Deserialize)]
+struct GtpcYaml {
+    server: Option<Vec<ServerYaml>>,
+    client: Option<GtpcClientYaml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GtpcClientYaml {
+    sgwc: Option<Vec<ServerYaml>>,
+    /// Present in the shipped config and deliberately unused: the MME's S11 peer is
+    /// the SGW-C. An `smf` entry describes the PGW-C the SGW-C talks to over S5/S8
+    /// (#52), which is not an MME peer.
+    #[allow(dead_code)]
+    smf: Option<Vec<ServerYaml>>,
+}
+
 /// A single `<timer>: { value: <seconds> }` entry under `mme.time`, matching the
 /// nesting the 5GC configs use for `amf.time`.
 #[derive(Debug, Default, Deserialize)]
@@ -104,6 +125,7 @@ struct MmeSection {
     #[serde(rename = "freeDiameter")]
     free_diameter: Option<String>,
     s1ap: Option<S1apYaml>,
+    gtpc: Option<GtpcYaml>,
     gummei: Option<Vec<GummeiYaml>>,
     tai: Option<Vec<TaiYaml>>,
     security: Option<SecurityYaml>,
@@ -193,6 +215,54 @@ fn apply(ctx: &mut MmeContext, mme: MmeSection) {
     if let Some(free_diameter) = mme.free_diameter {
         apply_fd_conf(ctx, &free_diameter);
         ctx.diam_conf_path = Some(free_diameter);
+    }
+
+    // S11 GTP-C bind addresses and the Serving GW peer (#51). Same shape and same
+    // one-address-is-bound rule as S1AP below.
+    if let Some(gtpc) = mme.gtpc {
+        for server in gtpc.server.unwrap_or_default() {
+            let Some(address) = server.address else {
+                continue;
+            };
+            let port = server.port.unwrap_or(ctx.gtpc_port);
+            match parse_socket_addr(&address, port) {
+                Some(addr) => {
+                    log::info!("S11 GTP-C server address: {addr}");
+                    ctx.gtpc_list.push(addr);
+                }
+                None => log::warn!("Ignoring unparsable GTP-C server address '{address}'"),
+            }
+        }
+        if ctx.gtpc_list.len() > 1 {
+            log::warn!(
+                "{} GTP-C server addresses configured; only the first is bound",
+                ctx.gtpc_list.len()
+            );
+        }
+        for peer in gtpc
+            .client
+            .and_then(|client| client.sgwc)
+            .unwrap_or_default()
+        {
+            let Some(address) = peer.address else {
+                continue;
+            };
+            let port = peer.port.unwrap_or(ctx.gtpc_port);
+            match parse_socket_addr(&address, port) {
+                Some(addr) => {
+                    log::info!("S11 Serving GW peer: {addr}");
+                    ctx.sgwc_list.push(addr);
+                }
+                None => log::warn!("Ignoring unparsable SGW-C address '{address}'"),
+            }
+        }
+        if ctx.sgwc_list.len() > 1 {
+            log::warn!(
+                "{} SGW-C peers configured; the first is used for every session because \
+                 TS 23.401 §4.3.8.1 SGW selection (DNS by TAI/APN) is not implemented",
+                ctx.sgwc_list.len()
+            );
+        }
     }
 
     // S1AP bind addresses. `S1apServer::bind` takes one address, so the first

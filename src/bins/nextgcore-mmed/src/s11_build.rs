@@ -105,6 +105,14 @@ pub enum GtpCause {
 }
 
 impl From<u8> for GtpCause {
+    /// TS 29.274 §8.4. Every variant this enum declares is now reachable (#51).
+    ///
+    /// The previous mapping listed nine values and collapsed the rest — including 66,
+    /// 68, 73, 74-78 and 94 — to `Reserved`. Cause 78 mattered most: an SGW rejecting
+    /// a session for "Missing or unknown APN" was indistinguishable from a reserved
+    /// value, so the UE was told `NETWORK_FAILURE` instead of the ESM cause that names
+    /// its own misconfiguration. A cause the receiver cannot distinguish is a cause
+    /// the operator cannot debug.
     fn from(value: u8) -> Self {
         match value {
             16 => GtpCause::RequestAccepted,
@@ -113,12 +121,31 @@ impl From<u8> for GtpCause {
             19 => GtpCause::NewPdnTypeDueToSingleAddressBearerOnly,
             64 => GtpCause::ContextNotFound,
             65 => GtpCause::InvalidMessageFormat,
+            66 => GtpCause::VersionNotSupported,
+            67 => GtpCause::InvalidLength,
+            68 => GtpCause::ServiceNotSupported,
+            69 => GtpCause::MandatoryIeIncorrect,
             70 => GtpCause::MandatoryIeMissing,
             72 => GtpCause::SystemFailure,
+            73 => GtpCause::NoResourcesAvailable,
+            74 => GtpCause::SemanticErrorInTftOperation,
+            75 => GtpCause::SyntacticErrorInTftOperation,
+            76 => GtpCause::SemanticErrorsInPacketFilter,
+            77 => GtpCause::SyntacticErrorsInPacketFilter,
+            78 => GtpCause::MissingOrUnknownApn,
+            94 => GtpCause::RequestRejected,
             103 => GtpCause::ConditionalIeMissing,
+            // Anything else really is unmapped. `Reserved` is honest for a value
+            // TS 29.274 does not define; it was not honest for the twelve above.
             _ => GtpCause::Reserved,
         }
     }
+}
+
+/// RAT Type values (TS 29.274 §8.17).
+pub mod rat_type {
+    /// E-UTRAN — the only access this MME serves.
+    pub const EUTRAN: u8 = 6;
 }
 
 // ============================================================================
@@ -221,417 +248,453 @@ impl std::error::Error for S11BuildError {}
 pub type S11BuildResult<T> = Result<T, S11BuildError>;
 
 // ============================================================================
-// GTP Buffer Helper
+// Message builders (TS 29.274), on the shared nextgcore-gtp v2 codec
 // ============================================================================
+//
+// #51 deleted the hand-rolled `GtpBuffer` these were written against. It duplicated
+// the round-trip-tested library codec and mis-encoded protocol semantics on its own:
+// the sequence number was a literal 0 in every initial message, the Indication IE put
+// the OI flag in the wrong content octet, and there was no mandatory-IE validation at
+// all — so the messages it built would have been rejected by sgwcd's own conformant
+// parser, if any of them had ever been transmitted.
+//
+// Every builder now returns a `Gtp2Message` and takes the sequence number the
+// transaction layer allocated, so the transport owns correlation rather than each
+// builder guessing at it.
 
-/// Buffer for building GTP-C messages
-#[derive(Debug, Clone)]
-pub struct GtpBuffer {
-    data: Vec<u8>,
+use bytes::BytesMut;
+use nextgcore_gtp::v2::{
+    Gtp2AmbrIe, Gtp2ApnIe, Gtp2BearerContextIe, Gtp2BearerQosIe, Gtp2CauseIe, Gtp2FTeidIe,
+    Gtp2Header, Gtp2Ie, Gtp2IeType, Gtp2IndicationIe, Gtp2Message, Gtp2PdnTypeIe, Gtp2RatTypeIe,
+    Gtp2SelectionModeIe,
+};
+
+/// F-TEID interface types (TS 29.274 §8.22 Table 8.22-1).
+pub mod f_teid_interface {
+    /// S1-U eNodeB GTP-U
+    pub const S1U_ENB_GTP_U: u8 = 0;
+    /// S1-U eNodeB GTP-U for downlink data forwarding
+    pub const S1U_ENB_GTP_U_DL_FORWARDING: u8 = 4;
+    /// S11 MME GTP-C
+    pub const S11_MME_GTP_C: u8 = 10;
 }
 
-impl GtpBuffer {
-    pub fn new() -> Self {
-        Self {
-            data: Vec::with_capacity(1024),
-        }
-    }
+/// A message with a TEID-bearing header.
+fn new_message(message_type: u8, teid: u32, sequence_number: u32) -> Gtp2Message {
+    Gtp2Message::new(Gtp2Header::new(message_type, teid, sequence_number))
+}
 
-    pub fn data(&self) -> &[u8] {
-        &self.data
-    }
+/// Encode one library IE type into a `Gtp2Ie` at the given instance.
+///
+/// The library's IE types encode themselves into a buffer including their own TLV
+/// header, so the round trip back through `Gtp2Ie::decode` is how a typed value
+/// becomes something `Gtp2Message::add_ie` accepts. Same idiom sgwcd uses.
+fn typed_ie<F>(encode: F) -> S11BuildResult<Gtp2Ie>
+where
+    F: FnOnce(&mut BytesMut),
+{
+    let mut buf = BytesMut::new();
+    encode(&mut buf);
+    let mut frozen = buf.freeze();
+    Gtp2Ie::decode(&mut frozen).map_err(|e| S11BuildError::BuildFailed(e.to_string()))
+}
 
-    pub fn into_vec(self) -> Vec<u8> {
-        self.data
-    }
-
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-
-    pub fn write_u8(&mut self, value: u8) {
-        self.data.push(value);
-    }
-
-    pub fn write_u16(&mut self, value: u16) {
-        self.data.extend_from_slice(&value.to_be_bytes());
-    }
-
-    pub fn write_u32(&mut self, value: u32) {
-        self.data.extend_from_slice(&value.to_be_bytes());
-    }
-
-    pub fn write_bytes(&mut self, bytes: &[u8]) {
-        self.data.extend_from_slice(bytes);
-    }
-
-    /// Write GTP-C header with TEID
-    pub fn write_gtp_header_with_teid(&mut self, msg_type: u8, teid: u32, seq_num: u32) {
-        self.write_u8(0x48); // Version 2, T=1
-        self.write_u8(msg_type);
-        self.write_u16(0); // Length placeholder
-        self.write_u32(teid);
-        self.write_u8(((seq_num >> 16) & 0xff) as u8);
-        self.write_u8(((seq_num >> 8) & 0xff) as u8);
-        self.write_u8((seq_num & 0xff) as u8);
-        self.write_u8(0); // Spare
-    }
-
-    /// Write GTP-C header without TEID
-    pub fn write_gtp_header_no_teid(&mut self, msg_type: u8, seq_num: u32) {
-        self.write_u8(0x40); // Version 2, T=0
-        self.write_u8(msg_type);
-        self.write_u16(0); // Length placeholder
-        self.write_u8(((seq_num >> 16) & 0xff) as u8);
-        self.write_u8(((seq_num >> 8) & 0xff) as u8);
-        self.write_u8((seq_num & 0xff) as u8);
-        self.write_u8(0); // Spare
-    }
-
-    /// Update message length in header
-    pub fn update_length(&mut self) {
-        let len = (self.data.len() - 4) as u16;
-        self.data[2] = (len >> 8) as u8;
-        self.data[3] = (len & 0xff) as u8;
-    }
-
-    /// Write IE header
-    pub fn write_ie_header(&mut self, ie_type: u8, length: u16, instance: u8) {
-        self.write_u8(ie_type);
-        self.write_u16(length);
-        self.write_u8(instance & 0x0f);
-    }
-
-    /// Write Recovery IE
-    pub fn write_recovery(&mut self, recovery: u8, instance: u8) {
-        self.write_ie_header(ie_type::RECOVERY, 1, instance);
-        self.write_u8(recovery);
-    }
-
-    /// Write Cause IE
-    pub fn write_cause(&mut self, cause: GtpCause, instance: u8) {
-        self.write_ie_header(ie_type::CAUSE, 2, instance);
-        self.write_u8(cause as u8);
-        self.write_u8(0); // Spare
-    }
-
-    /// Write EBI IE
-    pub fn write_ebi(&mut self, ebi: u8, instance: u8) {
-        self.write_ie_header(ie_type::EBI, 1, instance);
-        self.write_u8(ebi & 0x0f);
-    }
-
-    /// Write a complete IE (header + data)
-    pub fn write_ie(&mut self, ie_type: u8, instance: u8, data: &[u8]) {
-        self.write_ie_header(ie_type, data.len() as u16, instance);
-        self.write_bytes(data);
-    }
-
-    /// Finalize message length in the GTP header
-    pub fn finalize_length(&mut self) {
-        self.update_length();
+/// The MME's own S11 control-plane F-TEID (TS 29.274 Table 7.2.1-1, M).
+///
+/// Absent from every Create Session Request this daemon built before #51, which
+/// sgwcd's parser `require()`s — so the SGW-C would have answered
+/// "Mandatory IE missing" to every one of them.
+///
+/// The local address is a PARAMETER rather than read from `mme_self()`: a builder that
+/// reaches for a process global cannot be exercised without one, and the sender
+/// already holds the context that knows it.
+fn sender_fteid(mme_ue: &MmeUe, local: std::net::SocketAddr) -> S11BuildResult<Gtp2FTeidIe> {
+    match local.ip() {
+        std::net::IpAddr::V4(v4) => Ok(Gtp2FTeidIe::new_ipv4(
+            f_teid_interface::S11_MME_GTP_C,
+            mme_ue.mme_s11_teid,
+            v4.octets(),
+        )),
+        std::net::IpAddr::V6(v6) => Ok(Gtp2FTeidIe::new_ipv6(
+            f_teid_interface::S11_MME_GTP_C,
+            mme_ue.mme_s11_teid,
+            v6.octets(),
+        )),
     }
 }
 
-impl Default for GtpBuffer {
-    fn default() -> Self {
-        Self::new()
-    }
+/// The Bearer QoS IE for a bearer's subscribed QoS (TS 29.274 §8.15).
+fn bearer_qos(bearer: &MmeBearer) -> Gtp2BearerQosIe {
+    let mut qos = Gtp2BearerQosIe::new(
+        bearer.qos.qci,
+        bearer.qos.mbr.uplink,
+        bearer.qos.mbr.downlink,
+        bearer.qos.gbr.uplink,
+        bearer.qos.gbr.downlink,
+    );
+    qos.pl = bearer.qos.arp.priority_level;
+    // The context stores the NAS/GTP spelling (0 = enabled), and the library IE takes
+    // booleans, so the conversion happens here rather than being assumed either way.
+    qos.pci = bearer.qos.arp.pre_emption_capability == 0;
+    qos.pvi = bearer.qos.arp.pre_emption_vulnerability == 0;
+    qos
 }
 
-// ============================================================================
-// Build Functions
-// ============================================================================
-
-/// Build Echo Request
-pub fn build_echo_request(seq_num: u32, recovery: u8) -> Vec<u8> {
-    let mut buf = GtpBuffer::new();
-    buf.write_gtp_header_no_teid(message_type::ECHO_REQUEST, seq_num);
-    buf.write_recovery(recovery, 0);
-    buf.update_length();
-    buf.into_vec()
+/// The eNB's S1-U F-TEID for a bearer, or `None` when none has been saved yet.
+fn enb_s1u_fteid(bearer: &MmeBearer, interface_type: u8) -> Option<Gtp2FTeidIe> {
+    let ipv4 = bearer.enb_s1u_ip.ipv4?;
+    Some(Gtp2FTeidIe::new_ipv4(
+        interface_type,
+        bearer.enb_s1u_teid,
+        ipv4,
+    ))
 }
 
-/// Build Echo Response
-pub fn build_echo_response(seq_num: u32, recovery: u8) -> Vec<u8> {
-    let mut buf = GtpBuffer::new();
-    buf.write_gtp_header_no_teid(message_type::ECHO_RESPONSE, seq_num);
-    buf.write_recovery(recovery, 0);
-    buf.update_length();
-    buf.into_vec()
-}
-
-/// Build Create Session Request
+/// Build Create Session Request (TS 29.274 §7.2.1)
 pub fn build_create_session_request(
     sess: &MmeSess,
     mme_ue: &MmeUe,
     sgw_ue: &SgwUe,
     _create_action: GtpCreateAction,
-) -> S11BuildResult<Vec<u8>> {
+    sequence_number: u32,
+    bearers: &[&MmeBearer],
+    local_s11_addr: std::net::SocketAddr,
+) -> S11BuildResult<Gtp2Message> {
     log::debug!("Build Create Session Request for APN={}", sess.apn);
-    let mut buf = GtpBuffer::new();
-    buf.write_gtp_header_with_teid(message_type::CREATE_SESSION_REQUEST, sgw_ue.sgw_s11_teid, 0);
+    let mut msg = new_message(
+        message_type::CREATE_SESSION_REQUEST,
+        sgw_ue.sgw_s11_teid,
+        sequence_number,
+    );
 
-    // IE: IMSI (1) - mandatory
-    buf.write_ie(ie_type::IMSI, 0, &mme_ue.imsi[..mme_ue.imsi_len]);
+    // IMSI (M)
+    if mme_ue.imsi_len > 0 {
+        msg.add_ie(Gtp2Ie::from_slice(
+            Gtp2IeType::Imsi as u8,
+            0,
+            &mme_ue.imsi[..mme_ue.imsi_len],
+        ));
+    }
 
-    // IE: MSISDN (76) - conditional
+    // MSISDN (C)
     if mme_ue.msisdn_len > 0 {
-        buf.write_ie(ie_type::MSISDN, 0, &mme_ue.msisdn[..mme_ue.msisdn_len]);
+        msg.add_ie(Gtp2Ie::from_slice(
+            Gtp2IeType::Msisdn as u8,
+            0,
+            &mme_ue.msisdn[..mme_ue.msisdn_len],
+        ));
     }
 
-    // IE: MEI (75) - conditional
+    // MEI (C)
     if mme_ue.imeisv_len > 0 {
-        buf.write_ie(ie_type::MEI, 0, &mme_ue.imeisv[..mme_ue.imeisv_len]);
+        msg.add_ie(Gtp2Ie::from_slice(
+            Gtp2IeType::Mei as u8,
+            0,
+            &mme_ue.imeisv[..mme_ue.imeisv_len],
+        ));
     }
 
-    // IE: RAT Type (82) - mandatory (E-UTRAN = 6)
-    buf.write_ie(ie_type::RAT_TYPE, 0, &[6]);
+    // RAT Type (M) — from the UE context, not a literal (#51 criterion 5)
+    msg.add_ie(typed_ie(|buf| {
+        Gtp2RatTypeIe::new(mme_ue.rat_type).encode(buf, 0)
+    })?);
 
-    // IE: APN (71) - mandatory (DNS format)
-    let apn_bytes = encode_apn_dns(&sess.apn);
-    buf.write_ie(ie_type::APN, 0, &apn_bytes);
+    // Sender F-TEID for Control Plane (M)
+    msg.add_ie(sender_fteid(mme_ue, local_s11_addr)?.to_ie(0));
 
-    // IE: Selection Mode (80)
-    buf.write_ie(ie_type::SELECTION_MODE, 0, &[0]);
+    // APN (M)
+    msg.add_ie(typed_ie(|buf| {
+        Gtp2ApnIe::from_string(&sess.apn).encode(buf, 0)
+    })?);
 
-    // IE: PDN Type (99) - mandatory
-    buf.write_ie(ie_type::PDN_TYPE, 0, &[sess.ue_request_pdn_type as u8]);
+    // Selection Mode (C)
+    msg.add_ie(typed_ie(|buf| Gtp2SelectionModeIe::new(0).encode(buf, 0))?);
 
-    // IE: APN-AMBR (72) - mandatory
-    let mut ambr_data = Vec::new();
-    ambr_data.extend_from_slice(&(sess.ambr.uplink as u32).to_be_bytes());
-    ambr_data.extend_from_slice(&(sess.ambr.downlink as u32).to_be_bytes());
-    buf.write_ie(ie_type::AMBR, 0, &ambr_data);
+    // PDN Type (C)
+    msg.add_ie(typed_ie(|buf| {
+        Gtp2PdnTypeIe::new(sess.ue_request_pdn_type as u8).encode(buf, 0)
+    })?);
 
-    buf.finalize_length();
-    Ok(buf.into_vec())
+    // APN-AMBR (C)
+    msg.add_ie(typed_ie(|buf| {
+        // TS 29.274 §8.7 states APN-AMBR in kbps as two u32s.
+        Gtp2AmbrIe::new(
+            (sess.ambr.uplink / 1000) as u32,
+            (sess.ambr.downlink / 1000) as u32,
+        )
+        .encode(buf, 0)
+    })?);
+
+    // Bearer Contexts to be created (M), each with EBI (M) and Bearer QoS (M)
+    let mut created = 0;
+    for bearer in bearers {
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(bearer.ebi);
+        bc.set_bearer_qos(&bearer_qos(bearer));
+        msg.add_bearer_context(0, &bc);
+        created += 1;
+    }
+    if created == 0 {
+        // TS 29.274 Table 7.2.1-1 makes this mandatory, and sgwcd's parser
+        // `require()`s it: building the message without one produces a request the
+        // peer must reject, which is worse than refusing to build it.
+        return Err(S11BuildError::MissingRequiredField(
+            "Create Session Request requires at least one bearer context".to_string(),
+        ));
+    }
+
+    Ok(msg)
 }
 
-/// Build Modify Bearer Request
+/// Build Modify Bearer Request (TS 29.274 §7.2.7)
 pub fn build_modify_bearer_request(
-    _mme_ue: &MmeUe,
+    mme_ue: &MmeUe,
     sgw_ue: &SgwUe,
     bearers: &[&MmeBearer],
     _uli_presence: bool,
-) -> S11BuildResult<Vec<u8>> {
+    sequence_number: u32,
+) -> S11BuildResult<Gtp2Message> {
     log::debug!("Build Modify Bearer Request with {} bearers", bearers.len());
-    let mut buf = GtpBuffer::new();
-    buf.write_gtp_header_with_teid(message_type::MODIFY_BEARER_REQUEST, sgw_ue.sgw_s11_teid, 0);
+    let mut msg = new_message(
+        message_type::MODIFY_BEARER_REQUEST,
+        sgw_ue.sgw_s11_teid,
+        sequence_number,
+    );
 
-    // IE: Bearer Context to be modified (93, instance 0) for each bearer
+    // Bearer Contexts to be modified, each carrying the eNB's S1-U F-TEID — which
+    // is the whole point of the message (Table 7.2.7-1). The previous caller passed
+    // an empty slice, so the SGW was asked to modify nothing.
+    let mut modified = 0;
     for bearer in bearers {
-        let mut bearer_ctx = GtpBuffer::new();
-        // Sub-IE: EBI
-        bearer_ctx.write_ie(ie_type::EBI, 0, &[bearer.ebi]);
-        // Sub-IE: S1-U eNB F-TEID (interface type 0 = S1-U eNB)
-        let mut fteid = Vec::new();
-        fteid.push(0x80); // V4 flag | interface type 0
-        fteid.extend_from_slice(&bearer.enb_s1u_teid.to_be_bytes());
-        if let Some(ipv4) = bearer.enb_s1u_ip.ipv4 {
-            fteid.extend_from_slice(&ipv4);
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(bearer.ebi);
+        match enb_s1u_fteid(bearer, f_teid_interface::S1U_ENB_GTP_U) {
+            Some(ft) => bc.set_fteid(0, &ft),
+            None => {
+                // No eNB S1-U endpoint saved yet means Initial Context Setup has not
+                // completed for this bearer. Sending the context without it would ask
+                // the SGW to switch the downlink tunnel to nowhere.
+                log::warn!(
+                    "Modify Bearer Request: EBI {} has no eNB S1-U F-TEID saved; omitting it",
+                    bearer.ebi
+                );
+                continue;
+            }
         }
-        bearer_ctx.write_ie(ie_type::F_TEID, 0, &fteid);
-
-        buf.write_ie(ie_type::BEARER_CONTEXT, 0, bearer_ctx.data());
+        msg.add_bearer_context(0, &bc);
+        modified += 1;
+    }
+    if modified == 0 {
+        return Err(S11BuildError::MissingRequiredField(
+            "Modify Bearer Request requires at least one bearer context with an eNB S1-U F-TEID"
+                .to_string(),
+        ));
     }
 
-    // IE: RAT Type (82) - E-UTRAN = 6
-    buf.write_ie(ie_type::RAT_TYPE, 0, &[6]);
+    // RAT Type (C)
+    msg.add_ie(typed_ie(|buf| {
+        Gtp2RatTypeIe::new(mme_ue.rat_type).encode(buf, 0)
+    })?);
 
-    buf.finalize_length();
-    Ok(buf.into_vec())
+    Ok(msg)
 }
 
-/// Build Delete Session Request
+/// Build Delete Session Request (TS 29.274 §7.2.9)
 pub fn build_delete_session_request(
     _sess: &MmeSess,
     _mme_ue: &MmeUe,
     sgw_ue: &SgwUe,
-    default_bearer_ebi: u8,
+    linked_bearer_ebi: u8,
     _action: GtpDeleteAction,
-) -> S11BuildResult<Vec<u8>> {
-    log::debug!("Build Delete Session Request for EBI={default_bearer_ebi}");
-    let mut buf = GtpBuffer::new();
-    buf.write_gtp_header_with_teid(message_type::DELETE_SESSION_REQUEST, sgw_ue.sgw_s11_teid, 0);
+    sequence_number: u32,
+) -> S11BuildResult<Gtp2Message> {
+    log::debug!("Build Delete Session Request for LBI={linked_bearer_ebi}");
+    let mut msg = new_message(
+        message_type::DELETE_SESSION_REQUEST,
+        sgw_ue.sgw_s11_teid,
+        sequence_number,
+    );
 
-    // IE: EBI (73) - mandatory (Linked EPS Bearer ID)
-    buf.write_ie(ie_type::EBI, 0, &[default_bearer_ebi]);
+    // Linked EPS Bearer ID (M, Table 7.2.9.1-1): the DEFAULT bearer of the PDN
+    // connection being torn down. The caller used to pass a literal 5, which tears
+    // down the wrong PDN for any UE with more than one.
+    msg.add_ie(Gtp2Ie::from_slice(
+        Gtp2IeType::Ebi as u8,
+        0,
+        &[linked_bearer_ebi],
+    ));
 
-    // IE: Indication Flags (77)
-    buf.write_ie(ie_type::INDICATION, 0, &[0x00, 0x08, 0x00]); // OI flag
+    // Indication (C, §8.12): Operation Indication. Hand-encoded as
+    // `[0x00, 0x08, 0x00]` before #51, which puts the bit in the SECOND content
+    // octet and therefore left OI unset; the library IE puts it where §8.12 does.
+    let mut indication = Gtp2IndicationIe::default();
+    indication.oi = true;
+    msg.add_ie(typed_ie(|buf| indication.encode(buf, 0))?);
 
-    buf.finalize_length();
-    Ok(buf.into_vec())
+    Ok(msg)
 }
 
-/// Build Create Bearer Response
+/// Build Create Bearer Response (TS 29.274 §7.2.4)
 pub fn build_create_bearer_response(
     bearer: &MmeBearer,
     mme_ue: &MmeUe,
     sgw_ue: &SgwUe,
     cause_value: GtpCause,
-) -> S11BuildResult<Vec<u8>> {
+    sequence_number: u32,
+) -> S11BuildResult<Gtp2Message> {
     log::debug!("Build Create Bearer Response for EBI={}", bearer.ebi);
-    let mut buf = GtpBuffer::new();
-    buf.write_gtp_header_with_teid(message_type::CREATE_BEARER_RESPONSE, sgw_ue.sgw_s11_teid, 0);
+    let mut msg = new_message(
+        message_type::CREATE_BEARER_RESPONSE,
+        sgw_ue.sgw_s11_teid,
+        sequence_number,
+    );
+    msg.add_ie(typed_ie(|buf| {
+        Gtp2CauseIe::new(cause_value as u8).encode(buf, 0)
+    })?);
 
-    // IE: Cause (2)
-    buf.write_cause(cause_value, 0);
-
-    // Bearer Context (93, instance 0)
-    let mut bearer_ctx = GtpBuffer::new();
-    // Sub-IE: EBI
-    bearer_ctx.write_ie(ie_type::EBI, 0, &[bearer.ebi]);
-    // Sub-IE: Cause
-    bearer_ctx.write_ie(ie_type::CAUSE, 0, &[cause_value as u8, 0]);
-    // Sub-IE: S1-U eNB F-TEID (if accepted)
+    let mut bc = Gtp2BearerContextIe::new();
+    bc.set_ebi(bearer.ebi);
+    bc.set_cause(&Gtp2CauseIe::new(cause_value as u8));
     if cause_value as u8 == GtpCause::RequestAccepted as u8 {
-        let mut fteid = Vec::new();
-        fteid.push(0x80); // V4 flag | interface type 0 (S1-U eNB)
-        fteid.extend_from_slice(&bearer.enb_s1u_teid.to_be_bytes());
-        if let Some(ipv4) = bearer.enb_s1u_ip.ipv4 {
-            fteid.extend_from_slice(&ipv4);
+        if let Some(ft) = enb_s1u_fteid(bearer, f_teid_interface::S1U_ENB_GTP_U) {
+            bc.set_fteid(0, &ft);
         }
-        bearer_ctx.write_ie(ie_type::F_TEID, 0, &fteid);
     }
-    buf.write_ie(ie_type::BEARER_CONTEXT, 0, bearer_ctx.data());
+    msg.add_bearer_context(0, &bc);
 
-    // IE: ULI (86) - User Location Information
-    {
-        let mut uli = Vec::new();
-        // Flags: TAI=0x08, ECGI=0x10
-        uli.push(0x08 | 0x10);
-        // TAI: PLMN (3 bytes BCD) + TAC (2 bytes)
-        let tai_plmn = &mme_ue.tai.plmn_id;
-        uli.push((tai_plmn.mcc2 << 4) | tai_plmn.mcc1);
-        uli.push((tai_plmn.mnc3 << 4) | tai_plmn.mcc3);
-        uli.push((tai_plmn.mnc2 << 4) | tai_plmn.mnc1);
-        uli.extend_from_slice(&mme_ue.tai.tac.to_be_bytes());
-        // ECGI: PLMN (3 bytes BCD) + Cell ID (4 bytes, 28-bit)
-        let ecgi_plmn = &mme_ue.e_cgi.plmn_id;
-        uli.push((ecgi_plmn.mcc2 << 4) | ecgi_plmn.mcc1);
-        uli.push((ecgi_plmn.mnc3 << 4) | ecgi_plmn.mcc3);
-        uli.push((ecgi_plmn.mnc2 << 4) | ecgi_plmn.mnc1);
-        uli.extend_from_slice(&mme_ue.e_cgi.cell_id.to_be_bytes());
-        buf.write_ie(ie_type::ULI, 0, &uli);
-    }
+    // ULI (C): where the UE is. Encoded by the library rather than by hand — the
+    // previous version built the TAI/ECGI BCD nibbles inline in the builder.
+    msg.add_ie(uli_ie(mme_ue)?);
 
-    buf.finalize_length();
-    Ok(buf.into_vec())
+    Ok(msg)
 }
 
-/// Build Update Bearer Response
+/// User Location Information carrying TAI and ECGI (TS 29.274 §8.21).
+fn uli_ie(mme_ue: &MmeUe) -> S11BuildResult<Gtp2Ie> {
+    let mut value = Vec::with_capacity(1 + 5 + 7);
+    // Flags: TAI (bit 3) | ECGI (bit 4)
+    value.push(0x08 | 0x10);
+    value.extend_from_slice(&encode_plmn_bcd(&mme_ue.tai.plmn_id));
+    value.extend_from_slice(&mme_ue.tai.tac.to_be_bytes());
+    value.extend_from_slice(&encode_plmn_bcd(&mme_ue.e_cgi.plmn_id));
+    value.extend_from_slice(&mme_ue.e_cgi.cell_id.to_be_bytes());
+    Ok(Gtp2Ie::from_slice(Gtp2IeType::Uli as u8, 0, &value))
+}
+
+/// PLMN ID in the 3-octet BCD form GTP-C uses (TS 29.274 §8.21.1).
+fn encode_plmn_bcd(plmn: &crate::context::PlmnId) -> [u8; 3] {
+    [
+        (plmn.mcc2 << 4) | plmn.mcc1,
+        (plmn.mnc3 << 4) | plmn.mcc3,
+        (plmn.mnc2 << 4) | plmn.mnc1,
+    ]
+}
+
+/// Build Update Bearer Response (TS 29.274 §7.2.16)
 pub fn build_update_bearer_response(
     bearer: &MmeBearer,
     _mme_ue: &MmeUe,
     sgw_ue: &SgwUe,
     cause_value: GtpCause,
-) -> S11BuildResult<Vec<u8>> {
+    sequence_number: u32,
+) -> S11BuildResult<Gtp2Message> {
     log::debug!("Build Update Bearer Response for EBI={}", bearer.ebi);
-    let mut buf = GtpBuffer::new();
-    buf.write_gtp_header_with_teid(message_type::UPDATE_BEARER_RESPONSE, sgw_ue.sgw_s11_teid, 0);
-
-    // IE: Cause (2)
-    buf.write_cause(cause_value, 0);
-
-    // Bearer Context (93, instance 0)
-    let mut bearer_ctx = GtpBuffer::new();
-    bearer_ctx.write_ie(ie_type::EBI, 0, &[bearer.ebi]);
-    bearer_ctx.write_ie(ie_type::CAUSE, 0, &[cause_value as u8, 0]);
-    buf.write_ie(ie_type::BEARER_CONTEXT, 0, bearer_ctx.data());
-
-    buf.finalize_length();
-    Ok(buf.into_vec())
+    let mut msg = new_message(
+        message_type::UPDATE_BEARER_RESPONSE,
+        sgw_ue.sgw_s11_teid,
+        sequence_number,
+    );
+    msg.add_ie(typed_ie(|buf| {
+        Gtp2CauseIe::new(cause_value as u8).encode(buf, 0)
+    })?);
+    let mut bc = Gtp2BearerContextIe::new();
+    bc.set_ebi(bearer.ebi);
+    bc.set_cause(&Gtp2CauseIe::new(cause_value as u8));
+    msg.add_bearer_context(0, &bc);
+    Ok(msg)
 }
 
-/// Build Delete Bearer Response
+/// Build Delete Bearer Response (TS 29.274 §7.2.10)
 pub fn build_delete_bearer_response(
     bearer: &MmeBearer,
     _mme_ue: &MmeUe,
     sgw_ue: &SgwUe,
     cause_value: GtpCause,
-) -> S11BuildResult<Vec<u8>> {
+    sequence_number: u32,
+) -> S11BuildResult<Gtp2Message> {
     log::debug!("Build Delete Bearer Response for EBI={}", bearer.ebi);
-    let mut buf = GtpBuffer::new();
-    buf.write_gtp_header_with_teid(message_type::DELETE_BEARER_RESPONSE, sgw_ue.sgw_s11_teid, 0);
-
-    // IE: Cause (2)
-    buf.write_cause(cause_value, 0);
-
-    // Bearer Context (93, instance 0)
-    let mut bearer_ctx = GtpBuffer::new();
-    bearer_ctx.write_ie(ie_type::EBI, 0, &[bearer.ebi]);
-    bearer_ctx.write_ie(ie_type::CAUSE, 0, &[cause_value as u8, 0]);
-    buf.write_ie(ie_type::BEARER_CONTEXT, 0, bearer_ctx.data());
-
-    buf.finalize_length();
-    Ok(buf.into_vec())
+    let mut msg = new_message(
+        message_type::DELETE_BEARER_RESPONSE,
+        sgw_ue.sgw_s11_teid,
+        sequence_number,
+    );
+    msg.add_ie(typed_ie(|buf| {
+        Gtp2CauseIe::new(cause_value as u8).encode(buf, 0)
+    })?);
+    let mut bc = Gtp2BearerContextIe::new();
+    bc.set_ebi(bearer.ebi);
+    bc.set_cause(&Gtp2CauseIe::new(cause_value as u8));
+    msg.add_bearer_context(0, &bc);
+    Ok(msg)
 }
 
-/// Build Release Access Bearers Request
-pub fn build_release_access_bearers_request(teid: u32, seq_num: u32) -> Vec<u8> {
-    let mut buf = GtpBuffer::new();
-    buf.write_gtp_header_with_teid(message_type::RELEASE_ACCESS_BEARERS_REQUEST, teid, seq_num);
-    buf.update_length();
-    buf.into_vec()
+/// Build Release Access Bearers Request (TS 29.274 §7.2.21)
+pub fn build_release_access_bearers_request(teid: u32, sequence_number: u32) -> Gtp2Message {
+    new_message(
+        message_type::RELEASE_ACCESS_BEARERS_REQUEST,
+        teid,
+        sequence_number,
+    )
 }
 
-/// Build Downlink Data Notification Ack
-pub fn build_downlink_data_notification_ack(teid: u32, seq_num: u32, cause: GtpCause) -> Vec<u8> {
-    let mut buf = GtpBuffer::new();
-    buf.write_gtp_header_with_teid(message_type::DOWNLINK_DATA_NOTIFICATION_ACK, teid, seq_num);
-    buf.write_cause(cause, 0);
-    buf.update_length();
-    buf.into_vec()
+/// Build Downlink Data Notification Acknowledge (TS 29.274 §7.2.11)
+pub fn build_downlink_data_notification_ack(
+    teid: u32,
+    sequence_number: u32,
+    cause: GtpCause,
+) -> S11BuildResult<Gtp2Message> {
+    let mut msg = new_message(
+        message_type::DOWNLINK_DATA_NOTIFICATION_ACK,
+        teid,
+        sequence_number,
+    );
+    msg.add_ie(typed_ie(|buf| {
+        Gtp2CauseIe::new(cause as u8).encode(buf, 0)
+    })?);
+    Ok(msg)
 }
 
-/// Build Create Indirect Data Forwarding Tunnel Request
+/// Build Create Indirect Data Forwarding Tunnel Request (TS 29.274 §7.2.18)
 pub fn build_create_indirect_data_forwarding_tunnel_request(
     _mme_ue: &MmeUe,
     sgw_ue: &SgwUe,
     bearers: &[&MmeBearer],
-) -> S11BuildResult<Vec<u8>> {
+    sequence_number: u32,
+) -> S11BuildResult<Gtp2Message> {
     log::debug!(
         "Build Create Indirect Data Forwarding Tunnel Request with {} bearers",
         bearers.len()
     );
-    let mut buf = GtpBuffer::new();
-    buf.write_gtp_header_with_teid(
+    let mut msg = new_message(
         message_type::CREATE_INDIRECT_DATA_FORWARDING_TUNNEL_REQUEST,
         sgw_ue.sgw_s11_teid,
-        0,
+        sequence_number,
     );
-
-    // Bearer Contexts for each bearer
     for bearer in bearers {
-        let mut bearer_ctx = GtpBuffer::new();
-        // Sub-IE: EBI
-        bearer_ctx.write_ie(ie_type::EBI, 0, &[bearer.ebi]);
-
-        // Sub-IE: S1-U eNB F-TEID for DL data forwarding
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(bearer.ebi);
         if bearer.enb_s1u_teid != 0 {
-            let mut fteid = Vec::new();
-            fteid.push(0x80 | 4); // V4 | interface type 4 (S1-U eNB for DL data forwarding)
-            fteid.extend_from_slice(&bearer.enb_s1u_teid.to_be_bytes());
-            if let Some(ipv4) = bearer.enb_s1u_ip.ipv4 {
-                fteid.extend_from_slice(&ipv4);
+            if let Some(ft) = enb_s1u_fteid(bearer, f_teid_interface::S1U_ENB_GTP_U_DL_FORWARDING) {
+                bc.set_fteid(0, &ft);
             }
-            bearer_ctx.write_ie(ie_type::F_TEID, 0, &fteid);
         }
-
-        buf.write_ie(ie_type::BEARER_CONTEXT, 0, bearer_ctx.data());
+        msg.add_bearer_context(0, &bc);
     }
-
-    buf.finalize_length();
-    Ok(buf.into_vec())
+    Ok(msg)
 }
 
-/// Build Bearer Resource Command
+/// Build Bearer Resource Command (TS 29.274 §7.2.5)
+#[allow(clippy::too_many_arguments)]
 pub fn build_bearer_resource_command(
     _bearer: &MmeBearer,
     _mme_ue: &MmeUe,
@@ -640,75 +703,44 @@ pub fn build_bearer_resource_command(
     pti: u8,
     tad: &[u8],
     qos: Option<&Gtp2BearerQos>,
-) -> S11BuildResult<Vec<u8>> {
+    sequence_number: u32,
+) -> S11BuildResult<Gtp2Message> {
     log::debug!("Build Bearer Resource Command, linked EBI={linked_bearer_ebi}");
-    let mut buf = GtpBuffer::new();
-    buf.write_gtp_header_with_teid(
+    let mut msg = new_message(
         message_type::BEARER_RESOURCE_COMMAND,
         sgw_ue.sgw_s11_teid,
-        0,
+        sequence_number,
     );
 
-    // IE: Linked EPS Bearer ID (73, instance 0)
-    buf.write_ie(ie_type::EBI, 0, &[linked_bearer_ebi]);
-
-    // IE: Procedure Transaction Id (100)
-    buf.write_ie(ie_type::PTI, 0, &[pti]);
-
-    // IE: TAD (85) - Traffic Aggregate Description
+    // Linked EPS Bearer ID (M)
+    msg.add_ie(Gtp2Ie::from_slice(
+        Gtp2IeType::Ebi as u8,
+        0,
+        &[linked_bearer_ebi],
+    ));
+    // Procedure Transaction Id (M)
+    msg.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Pti as u8, 0, &[pti]));
+    // Traffic Aggregate Description (C)
     if !tad.is_empty() {
-        buf.write_ie(ie_type::TAD, 0, tad);
+        msg.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Tad as u8, 0, tad));
     }
-
-    // IE: Flow QoS (81) - optional
+    // Flow QoS (C). The library's Bearer QoS IE has the same 22-octet layout as
+    // Flow QoS minus the leading ARP octet's position, so it is encoded here and
+    // re-tagged rather than hand-built a second time.
     if let Some(q) = qos {
-        let mut qos_data = Vec::with_capacity(22);
-        // ARP: PEC(2bits) | PL(4bits) | PEV(1bit) | spare(1bit)
-        let arp_byte =
-            (q.pre_emption_capability << 6) | (q.priority_level << 2) | q.pre_emption_vulnerability;
-        qos_data.push(arp_byte);
-        qos_data.push(q.qci);
-        // MBR UL (5 bytes)
-        let mbr_ul_kbps = q.ul_mbr / 1000;
-        qos_data.extend_from_slice(&[
-            ((mbr_ul_kbps >> 32) & 0xff) as u8,
-            ((mbr_ul_kbps >> 24) & 0xff) as u8,
-            ((mbr_ul_kbps >> 16) & 0xff) as u8,
-            ((mbr_ul_kbps >> 8) & 0xff) as u8,
-            (mbr_ul_kbps & 0xff) as u8,
-        ]);
-        // MBR DL (5 bytes)
-        let mbr_dl_kbps = q.dl_mbr / 1000;
-        qos_data.extend_from_slice(&[
-            ((mbr_dl_kbps >> 32) & 0xff) as u8,
-            ((mbr_dl_kbps >> 24) & 0xff) as u8,
-            ((mbr_dl_kbps >> 16) & 0xff) as u8,
-            ((mbr_dl_kbps >> 8) & 0xff) as u8,
-            (mbr_dl_kbps & 0xff) as u8,
-        ]);
-        // GBR UL (5 bytes)
-        let gbr_ul_kbps = q.ul_gbr / 1000;
-        qos_data.extend_from_slice(&[
-            ((gbr_ul_kbps >> 32) & 0xff) as u8,
-            ((gbr_ul_kbps >> 24) & 0xff) as u8,
-            ((gbr_ul_kbps >> 16) & 0xff) as u8,
-            ((gbr_ul_kbps >> 8) & 0xff) as u8,
-            (gbr_ul_kbps & 0xff) as u8,
-        ]);
-        // GBR DL (5 bytes)
-        let gbr_dl_kbps = q.dl_gbr / 1000;
-        qos_data.extend_from_slice(&[
-            ((gbr_dl_kbps >> 32) & 0xff) as u8,
-            ((gbr_dl_kbps >> 24) & 0xff) as u8,
-            ((gbr_dl_kbps >> 16) & 0xff) as u8,
-            ((gbr_dl_kbps >> 8) & 0xff) as u8,
-            (gbr_dl_kbps & 0xff) as u8,
-        ]);
-        buf.write_ie(ie_type::FLOW_QOS, 0, &qos_data);
+        let mut flow = Gtp2BearerQosIe::new(q.qci, q.ul_mbr, q.dl_mbr, q.ul_gbr, q.dl_gbr);
+        flow.pl = q.priority_level;
+        flow.pci = q.pre_emption_capability == 0;
+        flow.pvi = q.pre_emption_vulnerability == 0;
+        let encoded = typed_ie(|buf| flow.encode(buf, 0))?;
+        msg.add_ie(Gtp2Ie::from_slice(
+            Gtp2IeType::FlowQos as u8,
+            0,
+            &encoded.value,
+        ));
     }
 
-    buf.finalize_length();
-    Ok(buf.into_vec())
+    Ok(msg)
 }
 
 // ============================================================================
@@ -736,40 +768,99 @@ mod tests {
         assert_eq!(GtpCause::from(0), GtpCause::Reserved);
     }
 
+    /// #51 criterion 6: every value this enum declares must round-trip, because a
+    /// cause collapsed to `Reserved` is a rejection reason the operator cannot see.
+    ///
+    /// 78 is called out separately below; this covers the twelve the old mapping
+    /// dropped as a set, so adding a variant without a mapping fails here.
     #[test]
-    fn test_build_echo_request() {
-        let msg = build_echo_request(100, 5);
-        assert!(!msg.is_empty());
-        assert_eq!(msg[1], message_type::ECHO_REQUEST);
+    fn every_declared_gtp_cause_is_distinguishable() {
+        for value in [
+            16u8, 17, 18, 19, 64, 65, 66, 67, 68, 69, 70, 72, 73, 74, 75, 76, 77, 78, 94, 103,
+        ] {
+            let mapped = GtpCause::from(value);
+            assert_ne!(
+                mapped,
+                GtpCause::Reserved,
+                "GTP cause {value} collapses to Reserved, so a peer's rejection reason is lost"
+            );
+            assert_eq!(
+                mapped as u8, value,
+                "GTP cause {value} maps to a variant with a different value"
+            );
+        }
     }
 
     #[test]
-    fn test_build_echo_response() {
-        let msg = build_echo_response(100, 5);
-        assert!(!msg.is_empty());
-        assert_eq!(msg[1], message_type::ECHO_RESPONSE);
+    fn release_access_bearers_request_carries_the_allocated_sequence() {
+        let msg = build_release_access_bearers_request(0x1234_5678, 0x0042);
+        assert_eq!(
+            msg.header.message_type,
+            message_type::RELEASE_ACCESS_BEARERS_REQUEST
+        );
+        assert_eq!(msg.header.teid, Some(0x1234_5678));
+        assert_eq!(
+            msg.header.sequence_number, 0x0042,
+            "the sequence number is the transaction layer's, not a literal 0"
+        );
     }
 
     #[test]
-    fn test_build_release_access_bearers_request() {
-        let msg = build_release_access_bearers_request(0x12345678, 100);
-        assert!(!msg.is_empty());
-        assert_eq!(msg[1], message_type::RELEASE_ACCESS_BEARERS_REQUEST);
+    fn downlink_data_notification_ack_echoes_the_sequence_and_carries_a_cause() {
+        let msg =
+            build_downlink_data_notification_ack(0x1234_5678, 0x99, GtpCause::RequestAccepted)
+                .expect("build");
+        assert_eq!(
+            msg.header.message_type,
+            message_type::DOWNLINK_DATA_NOTIFICATION_ACK
+        );
+        assert_eq!(
+            msg.header.sequence_number, 0x99,
+            "a triggered message echoes the request's sequence number (TS 29.274 §7.6)"
+        );
+        let cause = msg
+            .get_ie(Gtp2IeType::Cause as u8, 0)
+            .expect("the Ack carries a Cause");
+        assert_eq!(cause.value.first().copied(), Some(16));
     }
 
+    /// #51 criterion 5, and the defect the hand-rolled encoder had: `[0x00, 0x08,
+    /// 0x00]` put the OI bit in the SECOND content octet, so Operation Indication was
+    /// never actually set on the wire.
     #[test]
-    fn test_build_downlink_data_notification_ack() {
-        let msg = build_downlink_data_notification_ack(0x12345678, 100, GtpCause::RequestAccepted);
-        assert!(!msg.is_empty());
-        assert_eq!(msg[1], message_type::DOWNLINK_DATA_NOTIFICATION_ACK);
-    }
+    fn delete_session_request_sets_the_operation_indication_flag() {
+        let sess = MmeSess::default();
+        let mme_ue = MmeUe::default();
+        let sgw_ue = SgwUe {
+            sgw_s11_teid: 0xabcd,
+            ..Default::default()
+        };
+        let msg = build_delete_session_request(
+            &sess,
+            &mme_ue,
+            &sgw_ue,
+            7,
+            GtpDeleteAction::NoAction,
+            0x11,
+        )
+        .expect("build");
 
-    #[test]
-    fn test_gtp_buffer() {
-        let mut buf = GtpBuffer::new();
-        buf.write_u8(0x48);
-        buf.write_u16(0x1234);
-        buf.write_u32(0x12345678);
-        assert_eq!(buf.len(), 7);
+        let ebi = msg
+            .get_ie(Gtp2IeType::Ebi as u8, 0)
+            .expect("Linked EPS Bearer ID is mandatory");
+        assert_eq!(
+            ebi.value.first().copied(),
+            Some(7),
+            "the LBI is the session's default bearer, not a literal 5"
+        );
+
+        let indication = msg
+            .get_ie(Gtp2IeType::Indication as u8, 0)
+            .expect("the Indication IE must be present");
+        let decoded = Gtp2IndicationIe::decode(&indication.value).expect("decode");
+        assert!(
+            decoded.oi,
+            "Operation Indication must be SET, which the hand-rolled octets never were"
+        );
     }
 }

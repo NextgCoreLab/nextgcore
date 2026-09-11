@@ -1175,6 +1175,17 @@ pub struct MmeUe {
     /// Bearer to modify list (pool IDs)
     pub bearer_to_modify_list: Vec<u64>,
 
+    /// The RAT this UE is currently served over (TS 29.274 §8.17), for the RAT Type
+    /// IE on S11 (#51).
+    ///
+    /// A field rather than the literal `6` the builders used, so there is one place
+    /// that decides it. It is E-UTRAN for every attach this MME can accept today,
+    /// because S1 is the only access it has — nothing sets it otherwise until an
+    /// inter-RAT arrival exists (Gn/S3, #62). Defaulted in `MmeUe::new` rather than
+    /// left at `Default`'s zero, which is a reserved RAT value a conformant SGW
+    /// would reject.
+    pub rat_type: u8,
+
     /// CS map pool ID
     pub csmap_id: u64,
     /// HSS map pool ID
@@ -1362,6 +1373,21 @@ pub struct MmeContext {
     /// S1AP IPv6 server addresses
     pub s1ap_list6: Vec<std::net::SocketAddr>,
 
+    /// S11 GTP-C bind port (TS 29.274 §4.1: GTPv2-C uses UDP 2123).
+    pub gtpc_port: u16,
+    /// S11 GTP-C addresses to bind, from `mme.gtpc.server` (#51).
+    ///
+    /// `config.rs` deliberately did not read `mme.gtpc` before #51 — its module doc
+    /// said so and named this issue — because there was no socket to bind it to.
+    pub gtpc_list: Vec<std::net::SocketAddr>,
+    /// Serving GW S11 peers, from `mme.gtpc.client.sgwc`.
+    ///
+    /// The first is the one a Create Session Request is sent to. There is no SGW
+    /// selection function here: TS 23.401 §4.3.8.1 selects by TAI/APN via DNS, which
+    /// this tree does not implement, so a single configured peer is the honest model
+    /// and a second entry is warned about rather than silently ignored.
+    pub sgwc_list: Vec<std::net::SocketAddr>,
+
     /// SGW list
     pub sgw_list: Vec<u64>,
     /// Current SGW for round-robin
@@ -1522,6 +1548,7 @@ impl MmeContext {
     pub fn new() -> Self {
         Self {
             s1ap_port: 36412,
+            gtpc_port: 2123,
             sgsap_port: 29118,
             relative_capacity: 255,
             mme_ue_s1ap_id: AtomicU32::new(1),
@@ -1799,6 +1826,9 @@ impl MmeContext {
             enb_ue_id,
             enb_ue_holding_id: NEXTGCORE_INVALID_POOL_ID,
             sgw_ue_id: NEXTGCORE_INVALID_POOL_ID,
+            // E-UTRAN, because S1 is the only access this MME has (#51). Set here
+            // rather than left at `Default`'s 0, which is a reserved RAT value.
+            rat_type: crate::s11_build::rat_type::EUTRAN,
             ..Default::default()
         };
         self.mme_ue_pool.write().unwrap().insert(id, mme_ue);
@@ -2040,6 +2070,64 @@ impl MmeContext {
         if let Some(mme_ue) = self.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
             mme_ue.sgw_ue_id = sgw_ue_id;
         }
+    }
+
+    /// Record the SGW's S11 control-plane TEID for a UE (#51).
+    ///
+    /// Every later Modify Bearer / Delete Session Request for this session has to be
+    /// addressed to it, so a Create Session Response whose TEID is parsed and dropped
+    /// leaves the MME able to create a session and unable to modify or delete it.
+    ///
+    /// Creates the `SgwUe` association when the UE has none, because the Create
+    /// Session Response is the first point at which the SGW's identity is known.
+    pub fn set_sgw_s11_teid_for_ue(&self, mme_ue_id: u64, sgw_s11_teid: u32) {
+        let existing = self
+            .mme_ue_pool
+            .read()
+            .ok()
+            .and_then(|pool| pool.get(&mme_ue_id).map(|ue| ue.sgw_ue_id));
+        let sgw_ue_id = match existing {
+            Some(id) if id != NEXTGCORE_INVALID_POOL_ID => id,
+            _ => {
+                let id = self.sgw_ue_add(NEXTGCORE_INVALID_POOL_ID);
+                self.sgw_ue_associate_mme_ue(id, mme_ue_id);
+                id
+            }
+        };
+        if let Ok(mut pool) = self.sgw_ue_pool.write() {
+            if let Some(sgw_ue) = pool.get_mut(&sgw_ue_id) {
+                sgw_ue.sgw_s11_teid = sgw_s11_teid;
+            }
+        }
+    }
+
+    /// Record the SGW's S1-U user-plane endpoint on the bearer with this EBI (#51).
+    ///
+    /// This is the downlink tunnel the eNB is told to send to in the Initial Context
+    /// Setup Request, so a bearer without it has no user plane however cleanly the
+    /// control plane completed. Returns `false` when the UE holds no such EBI, which
+    /// the caller reports: a Create Session Response naming an EBI the MME did not
+    /// ask for is a disagreement worth surfacing, not a bearer to create silently.
+    pub fn set_sgw_s1u_for_bearer(
+        &self,
+        mme_ue_id: u64,
+        ebi: u8,
+        sgw_s1u_teid: u32,
+        sgw_s1u_ipv4: Option<[u8; 4]>,
+    ) -> bool {
+        let Ok(mut pool) = self.bearer_pool.write() else {
+            return false;
+        };
+        for bearer in pool.values_mut() {
+            if bearer.mme_ue_id == mme_ue_id && bearer.ebi == ebi {
+                bearer.sgw_s1u_teid = sgw_s1u_teid;
+                if let Some(v4) = sgw_s1u_ipv4 {
+                    bearer.sgw_s1u_ip.ipv4 = Some(v4);
+                }
+                return true;
+            }
+        }
+        false
     }
 }
 
