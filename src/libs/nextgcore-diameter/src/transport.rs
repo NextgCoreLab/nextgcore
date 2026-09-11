@@ -363,6 +363,19 @@ pub struct DiameterClient {
     hop_by_hop: u32,
     /// End-to-End identifier counter (RFC 6733 Section 3)
     end_to_end: u32,
+    /// Alternate peers to fail a pending request over to (RFC 6733 §5.5.4).
+    ///
+    /// Empty by default, which is exactly the pre-existing behaviour: with nowhere to
+    /// fail over to, a timeout is still a timeout. A daemon opts in with
+    /// [`DiameterClient::with_alternates`].
+    alternate_addrs: Vec<SocketAddr>,
+    /// Peers this client has marked SUSPECT (RFC 3539 §3.4) because a request to them
+    /// timed out or their connection dropped mid-exchange.
+    ///
+    /// Recorded rather than acted on beyond failover: §3.4 gives the watchdog the
+    /// decision to tear a peer down, and this client is not the watchdog. What the set
+    /// is for is not failing the same request back onto a peer that just failed it.
+    suspect_addrs: std::collections::HashSet<SocketAddr>,
 }
 
 impl DiameterClient {
@@ -383,7 +396,32 @@ impl DiameterClient {
             pending_requests: std::collections::VecDeque::new(),
             hop_by_hop: seed,
             end_to_end: seed,
+            alternate_addrs: Vec::new(),
+            suspect_addrs: std::collections::HashSet::new(),
         }
+    }
+
+    /// Declare alternate peers for failover (RFC 6733 §5.5.4).
+    ///
+    /// The primary given to [`DiameterClient::new`] is tried first; on a timeout or a
+    /// mid-exchange disconnect the request is re-sent to each of these in order, with the
+    /// `T` flag set, until one answers or they are exhausted.
+    ///
+    /// A builder rather than a `new` parameter so no existing caller changes: failover is
+    /// opt-in, and a deployment with one HSS has nothing to fail over TO.
+    pub fn with_alternates(mut self, alternates: Vec<SocketAddr>) -> Self {
+        self.alternate_addrs = alternates;
+        self
+    }
+
+    /// The peers this client currently considers suspect (RFC 3539 §3.4).
+    pub fn suspect_peers(&self) -> impl Iterator<Item = &SocketAddr> {
+        self.suspect_addrs.iter()
+    }
+
+    /// Whether this client has any alternate to fail over to.
+    pub fn has_alternates(&self) -> bool {
+        !self.alternate_addrs.is_empty()
     }
 
     fn next_hop_by_hop(&mut self) -> u32 {
@@ -505,6 +543,20 @@ impl DiameterClient {
     /// The deadline covers the whole exchange rather than being reset per event,
     /// so a peer streaming watchdogs or unmatched answers cannot extend it
     /// indefinitely.
+    /// # Failover (RFC 6733 §5.5.4)
+    ///
+    /// When alternates are configured with [`DiameterClient::with_alternates`], a timeout
+    /// or a mid-exchange disconnect does not end the request: the failing peer is marked
+    /// SUSPECT (RFC 3539 §3.4) and the request is re-sent to each alternate in turn with
+    /// the `T` flag set, until one answers or they are exhausted. With no alternates the
+    /// behaviour is unchanged — a timeout is still a timeout.
+    ///
+    /// **The End-to-End identifier is preserved across the failover and the Hop-by-Hop
+    /// identifier is not.** That asymmetry is the whole mechanism §5.5.4 relies on: the
+    /// `T` flag says "this may be a duplicate", and the recipient can only act on that by
+    /// matching the End-to-End identifier against what it has already processed. Assigning
+    /// a fresh one would make the duplicate undetectable and the flag decorative. Hop-by-
+    /// Hop is per-connection (§3), so the new connection gets a new one.
     pub async fn send_request(&mut self, msg: &DiameterMessage) -> DiameterResult<DiameterMessage> {
         let mut request = msg.clone();
         if request.header.hop_by_hop_id == 0 {
@@ -513,6 +565,87 @@ impl DiameterClient {
         if request.header.end_to_end_id == 0 {
             request.header.end_to_end_id = self.next_end_to_end();
         }
+
+        // The primary first, then each alternate. Collected up front so the borrow of
+        // `self.alternate_addrs` ends before the loop mutates `self`.
+        let alternates = self.alternate_addrs.clone();
+        let mut last_error = match self.attempt_request(&request).await {
+            Ok(answer) => return Ok(answer),
+            Err(e) if Self::is_failover_trigger(&e) => {
+                self.suspect_addrs.insert(self.peer_addr);
+                e
+            }
+            // A malformed request or an unconfigured client is not a peer problem, and
+            // re-sending it to every alternate would multiply one caller's mistake into N
+            // failed exchanges.
+            Err(e) => return Err(e),
+        };
+
+        for alternate in alternates {
+            if self.suspect_addrs.contains(&alternate) {
+                log::debug!("Skipping suspect alternate Diameter peer {alternate}");
+                continue;
+            }
+            log::warn!(
+                "Failing Diameter request (command {}, end-to-end {}) over to {alternate} \
+                 with the T flag set (RFC 6733 §5.5.4): {last_error}",
+                request.header.command_code,
+                request.header.end_to_end_id
+            );
+
+            // Retarget. The old peer is dropped, which closes its connection — the
+            // request is no longer outstanding on it as far as this client is concerned.
+            self.peer = None;
+            self.peer_addr = alternate;
+            if let Err(e) = self.connect().await {
+                log::warn!("Alternate Diameter peer {alternate} is unreachable: {e}");
+                self.suspect_addrs.insert(alternate);
+                last_error = e;
+                continue;
+            }
+
+            let mut retransmit = request.clone();
+            // T: potentially re-transmitted (§5.5.4). Set, not replaced: the request bit
+            // and any proxiable bit the caller chose must survive.
+            retransmit.header.flags |= crate::message::cmd_flags::RETRANSMIT;
+            // New connection, new Hop-by-Hop; End-to-End deliberately untouched.
+            retransmit.header.hop_by_hop_id = self.next_hop_by_hop();
+
+            match self.attempt_request(&retransmit).await {
+                Ok(answer) => return Ok(answer),
+                Err(e) if Self::is_failover_trigger(&e) => {
+                    self.suspect_addrs.insert(alternate);
+                    last_error = e;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(last_error)
+    }
+
+    /// Whether an error means "try another peer" rather than "this request is wrong".
+    ///
+    /// A timeout and a mid-exchange disconnect are peer problems; a missing connection or
+    /// an encoding failure is the caller's, and failing those over would turn one mistake
+    /// into one per configured peer.
+    fn is_failover_trigger(e: &DiameterError) -> bool {
+        match e {
+            DiameterError::RequestTimeout { .. } => true,
+            DiameterError::Protocol(msg) => msg == "peer disconnected",
+            _ => false,
+        }
+    }
+
+    /// One request/answer exchange against the currently connected peer.
+    ///
+    /// Split out of [`DiameterClient::send_request`] so the failover loop above has one
+    /// attempt to repeat rather than a copy of the whole wait loop — which is what would
+    /// otherwise drift between the primary and the retransmit path.
+    async fn attempt_request(
+        &mut self,
+        request: &DiameterMessage,
+    ) -> DiameterResult<DiameterMessage> {
         let hop_by_hop_id = request.header.hop_by_hop_id;
         let command = request.header.command_code;
         let timeout = Duration::from_secs(self.config.request_timeout as u64);
@@ -522,7 +655,7 @@ impl DiameterClient {
             .as_mut()
             .ok_or(DiameterError::Protocol("not connected".into()))?;
 
-        peer.send_message(&request).await?;
+        peer.send_message(request).await?;
 
         // Deadline is computed AFTER the send so a slow write does not eat into
         // the answer window.
@@ -1459,6 +1592,253 @@ mod request_timeout_tests {
         assert!(answer.header.is_answer());
         assert_eq!(answer.result_code(), Some(2001));
         server.abort();
+    }
+    // ------------------------------------------------------------------
+    // Failover with the T flag (RFC 6733 §5.5.4)
+    // ------------------------------------------------------------------
+
+    /// A peer that accepts the connection, answers the CER, then goes silent — the shape
+    /// `silent_peer_yields_request_timeout` uses, as a reusable primary.
+    fn spawn_silent_peer(listener: DiameterListener) -> tokio::task::JoinHandle<()> {
+        let cfg = server_config();
+        tokio::spawn(async move {
+            let transport = listener.accept().await.unwrap();
+            let mut peer = crate::peer::DiameterPeer::new_responder(transport, &cfg);
+            peer.start().await.unwrap();
+            let _cer = peer.next_event().await.unwrap();
+            let _request = peer.next_event().await.unwrap();
+            // Hold the connection open and answer nothing, so the client can only escape
+            // via its own deadline.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        })
+    }
+
+    /// A peer that answers the first application request it receives, reporting the flags
+    /// and identifiers the request carried.
+    #[allow(clippy::type_complexity)]
+    fn spawn_answering_peer(
+        listener: DiameterListener,
+    ) -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<(u8, u32, u32)>,
+    ) {
+        let cfg = server_config();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let transport = listener.accept().await.unwrap();
+            let mut peer = crate::peer::DiameterPeer::new_responder(transport, &cfg);
+            peer.start().await.unwrap();
+            let _cer = peer.next_event().await.unwrap();
+            loop {
+                match peer.next_event().await {
+                    Ok(PeerEvent::Message(req)) if req.header.is_request() => {
+                        let _ = tx.send((
+                            req.header.flags,
+                            req.header.hop_by_hop_id,
+                            req.header.end_to_end_id,
+                        ));
+                        let mut answer = DiameterMessage::new_answer(&req);
+                        answer.add_avp(Avp::mandatory(
+                            crate::common::avp_code::RESULT_CODE,
+                            AvpData::Unsigned32(2001),
+                        ));
+                        peer.send_message(&answer).await.unwrap();
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        (handle, rx)
+    }
+
+    /// The criterion: a request that times out on the primary is re-sent to the alternate
+    /// **with the T flag set**, and the alternate's answer is returned to the caller.
+    #[tokio::test]
+    async fn a_timed_out_request_fails_over_to_an_alternate_with_the_t_flag() {
+        let primary_listener = DiameterListener::bind(([127, 0, 0, 1], 0).into())
+            .await
+            .unwrap();
+        let primary_addr = primary_listener.local_addr().unwrap();
+        let alternate_listener = DiameterListener::bind(([127, 0, 0, 1], 0).into())
+            .await
+            .unwrap();
+        let alternate_addr = alternate_listener.local_addr().unwrap();
+
+        let primary = spawn_silent_peer(primary_listener);
+        let (alternate, observed) = spawn_answering_peer(alternate_listener);
+
+        let mut client = DiameterClient::new(client_config(), primary_addr)
+            .with_alternates(vec![alternate_addr]);
+        client.connect().await.unwrap();
+
+        let air = DiameterMessage::new_request(318, 16777251);
+        let answer = client
+            .send_request(&air)
+            .await
+            .expect("the alternate must answer, so the caller sees success not a timeout");
+        assert!(answer.header.is_answer());
+        assert_eq!(answer.header.command_code, 318);
+
+        let (flags, _hbh, _e2e) = observed
+            .await
+            .expect("the alternate must report what it saw");
+        assert_ne!(
+            flags & crate::message::cmd_flags::RETRANSMIT,
+            0,
+            "the re-sent request must carry the T flag (RFC 6733 §5.5.4): without it the \
+             alternate cannot know it may be a duplicate"
+        );
+        assert_ne!(
+            flags & crate::message::cmd_flags::REQUEST,
+            0,
+            "and it must still be a request — the T flag is set, not assigned"
+        );
+
+        // The primary is now suspect (RFC 3539 §3.4).
+        assert!(
+            client.suspect_peers().any(|a| *a == primary_addr),
+            "the peer that timed out must be marked suspect"
+        );
+
+        primary.abort();
+        alternate.abort();
+    }
+
+    /// The End-to-End identifier must SURVIVE the failover and the Hop-by-Hop must not.
+    ///
+    /// This is the mechanism the T flag depends on: §5.5.4's flag says "possibly a
+    /// duplicate", and the only way a recipient can act on that is by matching the
+    /// End-to-End identifier against what it has already processed. A fresh one would make
+    /// the duplicate undetectable and the flag decorative. Hop-by-Hop is per-connection
+    /// (§3), so the new connection must get a new one.
+    #[tokio::test]
+    async fn failover_preserves_end_to_end_and_reassigns_hop_by_hop() {
+        let primary_listener = DiameterListener::bind(([127, 0, 0, 1], 0).into())
+            .await
+            .unwrap();
+        let primary_addr = primary_listener.local_addr().unwrap();
+        let alternate_listener = DiameterListener::bind(([127, 0, 0, 1], 0).into())
+            .await
+            .unwrap();
+        let alternate_addr = alternate_listener.local_addr().unwrap();
+
+        let primary = spawn_silent_peer(primary_listener);
+        let (alternate, observed) = spawn_answering_peer(alternate_listener);
+
+        let mut client = DiameterClient::new(client_config(), primary_addr)
+            .with_alternates(vec![alternate_addr]);
+        client.connect().await.unwrap();
+
+        // Explicit identifiers so the comparison is against values this test chose rather
+        // than against whatever the counter happened to produce.
+        let mut air = DiameterMessage::new_request(318, 16777251);
+        air.header.hop_by_hop_id = 0x1111_1111;
+        air.header.end_to_end_id = 0x2222_2222;
+
+        client.send_request(&air).await.expect("alternate answers");
+        let (_flags, hop_by_hop, end_to_end) = observed.await.unwrap();
+
+        assert_eq!(
+            end_to_end, 0x2222_2222,
+            "the End-to-End identifier must be preserved, or the T flag means nothing"
+        );
+        assert_ne!(
+            hop_by_hop, 0x1111_1111,
+            "the Hop-by-Hop identifier is per-connection (§3) and must be reassigned"
+        );
+
+        primary.abort();
+        alternate.abort();
+    }
+
+    /// With no alternates configured the behaviour is exactly as before: a timeout is a
+    /// timeout. This is what keeps every existing caller unchanged.
+    #[tokio::test]
+    async fn without_alternates_a_timeout_is_still_a_timeout() {
+        let listener = DiameterListener::bind(([127, 0, 0, 1], 0).into())
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let primary = spawn_silent_peer(listener);
+
+        let mut client = DiameterClient::new(client_config(), addr);
+        assert!(!client.has_alternates());
+        client.connect().await.unwrap();
+
+        let air = DiameterMessage::new_request(318, 16777251);
+        assert!(
+            matches!(
+                client.send_request(&air).await,
+                Err(DiameterError::RequestTimeout { .. })
+            ),
+            "with nowhere to fail over to, the timeout must surface unchanged"
+        );
+        primary.abort();
+    }
+
+    /// An unreachable alternate is marked suspect and skipped rather than retried, and the
+    /// caller gets an error instead of an unbounded wait.
+    #[tokio::test]
+    async fn an_unreachable_alternate_is_marked_suspect_and_the_request_fails() {
+        let primary_listener = DiameterListener::bind(([127, 0, 0, 1], 0).into())
+            .await
+            .unwrap();
+        let primary_addr = primary_listener.local_addr().unwrap();
+        // Bind then drop, so the port is (almost certainly) closed: an alternate that
+        // cannot be dialled at all.
+        let dead_addr = {
+            let l = DiameterListener::bind(([127, 0, 0, 1], 0).into())
+                .await
+                .unwrap();
+            l.local_addr().unwrap()
+        };
+
+        let primary = spawn_silent_peer(primary_listener);
+        let mut client =
+            DiameterClient::new(client_config(), primary_addr).with_alternates(vec![dead_addr]);
+        client.connect().await.unwrap();
+
+        let air = DiameterMessage::new_request(318, 16777251);
+        let result = client.send_request(&air).await;
+        assert!(
+            result.is_err(),
+            "an exhausted alternate list must surface an error"
+        );
+        assert!(
+            client.suspect_peers().any(|a| *a == primary_addr),
+            "the primary that timed out is suspect"
+        );
+        assert!(
+            client.suspect_peers().any(|a| *a == dead_addr),
+            "and so is the alternate that could not be reached"
+        );
+        primary.abort();
+    }
+
+    /// A caller error — no connection at all — must NOT be multiplied across every
+    /// alternate. `is_failover_trigger` is what draws that line.
+    #[test]
+    fn only_peer_failures_trigger_failover() {
+        assert!(DiameterClient::is_failover_trigger(
+            &DiameterError::RequestTimeout {
+                command: 318,
+                seconds: 30
+            }
+        ));
+        assert!(DiameterClient::is_failover_trigger(
+            &DiameterError::Protocol("peer disconnected".into())
+        ));
+        assert!(
+            !DiameterClient::is_failover_trigger(&DiameterError::Protocol("not connected".into())),
+            "an unconfigured client is the caller's problem, not a peer's: failing it over \
+             would turn one mistake into one failed exchange per configured peer"
+        );
+        assert!(!DiameterClient::is_failover_trigger(
+            &DiameterError::MissingAvp("Origin-Host".into())
+        ));
     }
 }
 
