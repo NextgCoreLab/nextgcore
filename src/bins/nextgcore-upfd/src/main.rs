@@ -258,6 +258,17 @@ async fn main() -> Result<()> {
         .context("Failed to create PFCP server")?;
     let pfcp_server = Arc::new(pfcp_server);
 
+    // #325: point the NFProfile/LCI load gauge at the N4 session census. It used to
+    // read `UpfContext::sess_list`, which nothing outside `mod tests` ever wrote, so
+    // this UPF advertised `load: 0` to the NRF and to the SMF however many sessions
+    // it was carrying. The handle is taken from the server rather than the count
+    // being pushed into the context, so there is one store and one reader of it.
+    //
+    // The NRF heartbeat worker was spawned above with a closure that calls
+    // `get_load()` per tick, so it picks this up on its next tick; the load reported
+    // in the registration itself is 0, which is correct at start-up.
+    upf_self().set_session_gauge(pfcp_server.session_count_handle());
+
     // Run data plane (if enabled)
     let data_plane = Arc::new(data_plane);
 

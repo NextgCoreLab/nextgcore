@@ -48,8 +48,6 @@ pub struct Pdr {
     pub f_teid: FTeidInfo,
     pub ue_ip_addr_len: usize,
     pub ue_ip_addr: UeIpAddrInfo,
-    pub ipv4_framed_routes: Vec<String>,
-    pub ipv6_framed_routes: Vec<String>,
 }
 
 /// PDI (Packet Detection Information)

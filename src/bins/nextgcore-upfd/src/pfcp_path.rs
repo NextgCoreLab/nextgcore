@@ -15,7 +15,7 @@ use crate::n4_build::{
 };
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -503,6 +503,17 @@ pub struct PfcpServer {
     session_tx: mpsc::Sender<PfcpSessionEvent>,
     /// Active sessions: UPF SEID -> SessionInfo
     sessions: tokio::sync::RwLock<HashMap<u64, PfcpSessionInfo>>,
+    /// How many sessions [`Self::sessions`] holds, published for
+    /// `UpfContext::get_load` (#325).
+    ///
+    /// `sessions` is behind a `tokio` lock, so a synchronous load gauge cannot read
+    /// it; this is the sync-readable projection. Maintained by
+    /// [`Self::publish_session_count`], which is called inside EVERY write scope
+    /// that changes the map's size and always ASSIGNS `sessions.len()` -- never
+    /// increments -- so it cannot hold a count the map never had. A future mutation
+    /// site that forgot it would leave a stale number until the next write, which is
+    /// a wrong gauge, not a wrong forwarding decision.
+    session_count: Arc<AtomicUsize>,
     /// Current PFCP association (None until Association Setup succeeds)
     association: tokio::sync::RwLock<Option<PfcpAssociation>>,
     /// Data plane handle for pulling final URR counters on session deletion
@@ -691,6 +702,7 @@ impl PfcpServer {
             shutdown,
             session_tx,
             sessions: tokio::sync::RwLock::new(HashMap::new()),
+            session_count: Arc::new(AtomicUsize::new(0)),
             association: tokio::sync::RwLock::new(None),
             data_plane: std::sync::RwLock::new(None),
             pending_reports: tokio::sync::Mutex::new(HashMap::new()),
@@ -758,6 +770,7 @@ impl PfcpServer {
             let mut sessions = self.sessions.write().await;
             let n = sessions.len();
             sessions.clear();
+            self.publish_session_count(&sessions);
             n
         };
         log::warn!("Cleared {count} PFCP sessions after peer failure");
@@ -1454,6 +1467,7 @@ impl PfcpServer {
         {
             let mut sessions = self.sessions.write().await;
             sessions.insert(upf_seid, session_info.clone());
+            self.publish_session_count(&sessions);
         }
 
         // Notify data plane with full rule set
@@ -1990,7 +2004,9 @@ impl PfcpServer {
         // Remove session
         let session_info = {
             let mut sessions = self.sessions.write().await;
-            sessions.remove(&upf_seid)
+            let removed = sessions.remove(&upf_seid);
+            self.publish_session_count(&sessions);
+            removed
         };
 
         // Unknown SEID → Session Context Not Found (TS 29.244 7.5.7, cause 65)
@@ -2051,6 +2067,26 @@ impl PfcpServer {
     /// for Session Deletion Responses.
     pub fn set_data_plane(&self, dp: Arc<crate::data_plane::DataPlane>) {
         *self.data_plane.write().unwrap() = Some(dp);
+    }
+
+    /// Republish the session count from the map's own length.
+    ///
+    /// Takes the write guard so it can only be called from inside a critical section
+    /// that already holds the map — which is the point: a projection computed
+    /// outside the lock could publish a length the map no longer has. Assignment
+    /// rather than increment/decrement for the same reason.
+    fn publish_session_count(&self, sessions: &HashMap<u64, PfcpSessionInfo>) {
+        self.session_count
+            .store(sessions.len(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A read handle on the live N4 session count, for `UpfContext::get_load`.
+    ///
+    /// Handed to the process-global context at start-up rather than read from it:
+    /// this server owns the session store, and the context owning a *copy* is the
+    /// two-stores-one-path shape #325 rejected.
+    pub fn session_count_handle(&self) -> Arc<AtomicUsize> {
+        Arc::clone(&self.session_count)
     }
 
     /// Collect final usage reports (TERMR trigger) from the data-plane URRs
@@ -2429,7 +2465,9 @@ impl PfcpServer {
     /// Test hook: insert a session so UPF-initiated reports can resolve the
     /// CP function (SMF) address.
     async fn test_insert_session(&self, info: PfcpSessionInfo) {
-        self.sessions.write().await.insert(info.upf_seid, info);
+        let mut sessions = self.sessions.write().await;
+        sessions.insert(info.upf_seid, info);
+        self.publish_session_count(&sessions);
     }
 
     /// Test hook: force every pending report's T1 timer to be considered
@@ -3092,7 +3130,7 @@ mod tests {
     /// library decoder would have given for free.
     #[test]
     fn the_library_decoder_and_upfds_walk_agree_on_one_modification() {
-        use bytes::{Bytes, BytesMut};
+        use bytes::BytesMut;
         use nextgcore_pfcp::message::SessionModificationRequest;
         use nextgcore_pfcp::types::{RemoveQer, RemoveUrr, UpdateUrr, VolumeThreshold};
 
@@ -3383,6 +3421,93 @@ mod tests {
         assert_eq!(
             response_cause(&resp),
             PfcpCause::SessionContextNotFound as u8
+        );
+    }
+
+    /// #325 criterion 3: the store the production load reader reads is the store the
+    /// production N4 writer writes.
+    ///
+    /// A test cannot assert the *absence* of some future parallel session store, but
+    /// it can assert that property — and its violation was the bug.
+    /// `UpfContext::get_load` read `sess_list`, which only `mod tests` ever wrote, so
+    /// the gauge was 0 in every deployment while a test that called `sess_add`
+    /// directly proved 20% for 2-of-10 and passed.
+    ///
+    /// So nothing here touches a session store: the count is driven entirely by
+    /// Association Setup / Session Establishment / Session Deletion over the socket,
+    /// through the real handlers.
+    // A `std::sync::Mutex` guard across awaits, deliberately: the lock's whole job is
+    // to serialise this test against every sibling that touches the process-global
+    // context, and the awaits are exactly the window a sibling could interleave in. A
+    // second, `tokio` lock for the async half would recreate the split this lock
+    // exists to prevent (#308).
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn the_load_gauge_follows_the_live_n4_session_store() {
+        let _guard = crate::context::UPF_GLOBAL_TEST_LOCK.lock().unwrap();
+
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        crate::context::upf_self().set_session_gauge(server.session_count_handle());
+
+        assert_eq!(
+            crate::context::upf_self().sess_count(),
+            0,
+            "no session has been established yet"
+        );
+
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        b.add_f_seid(&crate::n4_build::FSeid {
+            seid: 0x325,
+            ipv4: Some(Ipv4Addr::new(127, 0, 0, 9)),
+            ipv6: None,
+        });
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr_body(1, 100, 1, 1, 1));
+        b.add_tlv(pfcp_ie::CREATE_FAR, &far_body(1, 0x02));
+        let resp = exchange(&smf, addr, &encode_pfcp(50, Some(0), 2, &b.build())).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::RequestAccepted as u8,
+            "the establishment this assertion depends on must succeed"
+        );
+
+        let upf_seid = server
+            .sessions
+            .read()
+            .await
+            .keys()
+            .copied()
+            .next()
+            .expect("the server must hold the session it just accepted");
+        assert_eq!(
+            crate::context::upf_self().sess_count(),
+            1,
+            "an established N4 session must be visible to the load gauge; 0 here is \
+             the shipped defect, a UPF advertising load 0 while serving a session"
+        );
+
+        // A ceiling makes get_load report a percentage rather than a raw count.
+        crate::context::upf_self().init(4);
+        assert_eq!(
+            crate::context::upf_self().get_load(),
+            25,
+            "1 of 4 sessions is 25%"
+        );
+
+        let resp = exchange(&smf, addr, &encode_pfcp(54, Some(upf_seid), 3, &[])).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::RequestAccepted as u8,
+            "the deletion this assertion depends on must succeed"
+        );
+        assert_eq!(
+            crate::context::upf_self().sess_count(),
+            0,
+            "a deleted session must leave the gauge; a gauge that only ever counts up \
+             would pass the establishment assertion above and still be wrong"
         );
     }
 
