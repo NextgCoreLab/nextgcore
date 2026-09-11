@@ -188,11 +188,17 @@ builds headers the way a peer would, without touching the encoder under test.
 
 ## Ceilings
 
-- **`UpfSess.tsn_bridge` is still unreachable, and so is the rest of that store.**
-  `UpfContext::sess_add` has no production caller, so `rule_match`'s lookups by UE IP
-  always return `None`. This is a pre-existing defect of the shape #223 describes for
-  `smfd` ("two parallel session models, one dead"), it is wider than #321, and it is
-  filed separately. The live bridge is on `PfcpSessionInfo`.
+- ~~**`UpfSess.tsn_bridge` is still unreachable, and so is the rest of that store.**~~
+  **RESOLVED by #325**, in the direction this note was waiting for: the dead half was
+  deleted rather than populated. `UpfSess`, `UpfContext::sess_list`, the five lookup
+  indices, the two framed-route tries and `rule_match`'s two UE-IP lookups are gone,
+  so there is no longer a `tsn_bridge` field in an unreachable store — the live bridge
+  on `PfcpSessionInfo`, which is where #321 put it and why, is now the only one.
+  #325 also found what the dead store cost in production, which this note did not
+  reach: `UpfContext::sess_count` had a production caller in `get_load`, so the UPF
+  advertised `load: 0` to the NRF and (under `compute-aware-upf`) in the PFCP Load
+  Control IE regardless of how many sessions it held. #223 remains open as the same
+  defect class in `smfd`.
 - **No TS 24.539 codec**, so the UPF stores the containers rather than acting on
   their contents. `TsnBridge.port_management_containers` and
   `user_plane_node_management_container` hold the raw octets; the gate-control lists

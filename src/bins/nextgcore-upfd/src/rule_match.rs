@@ -2,10 +2,16 @@
 //!
 //! Port of src/upf/rule-match.c - Rule matching for packet forwarding
 //!
-//! This module provides functions to find UPF sessions based on packet content,
-//! specifically by extracting the destination IP address from IP headers.
-
-use crate::context::{upf_self, UpfSess};
+//! This module provides IP-header accessors used to extract addresses and the IP
+//! version from a raw packet buffer.
+//!
+//! #325: it also carried `upf_sess_find_by_ue_ip_address` and its `_src` sibling,
+//! which mapped a packet to a `context::UpfSess` through `UpfContext::sess_list` --
+//! a store nothing outside `mod tests` ever wrote, so both always returned `None`.
+//! Neither had a caller outside this file's own tests either, so no packet was ever
+//! affected: the live UE-IP lookup is `data_plane::DataPlaneSessionManager`'s
+//! `find_by_ue_ip`, over an index the N4 establishment path populates. Both
+//! functions are gone with the store.
 
 // ============================================================================
 // IP Header Constants
@@ -145,174 +151,6 @@ impl Ipv6Header {
 // ============================================================================
 // Rule Matching Functions
 // ============================================================================
-
-/// Find UPF session by UE IP address from packet buffer
-///
-/// This function extracts the destination IP address from the packet's IP header
-/// and finds the corresponding UPF session.
-///
-/// Port of upf_sess_find_by_ue_ip_address() from src/upf/rule-match.c
-///
-/// # Arguments
-/// * `data` - Packet data buffer containing IP packet
-///
-/// # Returns
-/// * `Some(UpfSess)` - The session matching the destination IP address
-/// * `None` - If no matching session found or packet is invalid
-pub fn upf_sess_find_by_ue_ip_address(data: &[u8]) -> Option<UpfSess> {
-    if data.is_empty() {
-        log::error!("Empty packet buffer");
-        return None;
-    }
-
-    // Get IP version from first byte
-    let version = (data[0] >> 4) & 0x0F;
-
-    match version {
-        IP_VERSION_4 => {
-            if data.len() < IPV4_MIN_HEADER_LEN {
-                log::error!(
-                    "Invalid IPv4 packet [Packet Length:{}, Min Required:{}]",
-                    data.len(),
-                    IPV4_MIN_HEADER_LEN
-                );
-                return None;
-            }
-
-            // Safety: We've verified the buffer is large enough
-            let ip_hdr = unsafe { &*(data.as_ptr() as *const Ipv4Header) };
-
-            // Verify version matches
-            if ip_hdr.version() != IP_VERSION_4 {
-                log::error!("IPv4 version mismatch in header");
-                return None;
-            }
-
-            let dst_addr = ip_hdr.dst_addr();
-            let sess = upf_self().sess_find_by_ipv4(dst_addr);
-
-            if let Some(ref s) = sess {
-                if let Some(ref ipv4) = s.ipv4 {
-                    let addr_bytes = ipv4.addr[0].to_be_bytes();
-                    log::trace!(
-                        "PAA IPv4:{}.{}.{}.{}",
-                        addr_bytes[0],
-                        addr_bytes[1],
-                        addr_bytes[2],
-                        addr_bytes[3]
-                    );
-                }
-            }
-
-            sess
-        }
-        IP_VERSION_6 => {
-            if data.len() < IPV6_HEADER_LEN {
-                log::error!(
-                    "Invalid IPv6 packet [Packet Length:{}, Min Required:{}]",
-                    data.len(),
-                    IPV6_HEADER_LEN
-                );
-                return None;
-            }
-
-            // Safety: We've verified the buffer is large enough
-            let ip6_hdr = unsafe { &*(data.as_ptr() as *const Ipv6Header) };
-
-            let dst_addr = ip6_hdr.dst_addr();
-            let sess = upf_self().sess_find_by_ipv6(&dst_addr);
-
-            if let Some(ref s) = sess {
-                if let Some(ref ipv6) = s.ipv6 {
-                    log::trace!(
-                        "PAA IPv6:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
-                        (ipv6.addr[0] >> 16) & 0xFFFF,
-                        ipv6.addr[0] & 0xFFFF,
-                        (ipv6.addr[1] >> 16) & 0xFFFF,
-                        ipv6.addr[1] & 0xFFFF,
-                        (ipv6.addr[2] >> 16) & 0xFFFF,
-                        ipv6.addr[2] & 0xFFFF,
-                        (ipv6.addr[3] >> 16) & 0xFFFF,
-                        ipv6.addr[3] & 0xFFFF
-                    );
-                }
-            }
-
-            sess
-        }
-        _ => {
-            log::error!(
-                "Invalid packet [IP version:{}, Packet Length:{}]",
-                version,
-                data.len()
-            );
-            // Log hex dump for debugging (first 64 bytes max)
-            let dump_len = data.len().min(64);
-            log::error!("Packet hex dump: {:02x?}", &data[..dump_len]);
-            None
-        }
-    }
-}
-
-/// Find UPF session by source IP address from packet buffer
-///
-/// This function extracts the source IP address from the packet's IP header
-/// and finds the corresponding UPF session. Useful for uplink packet matching.
-///
-/// # Arguments
-/// * `data` - Packet data buffer containing IP packet
-///
-/// # Returns
-/// * `Some(UpfSess)` - The session matching the source IP address
-/// * `None` - If no matching session found or packet is invalid
-pub fn upf_sess_find_by_ue_ip_address_src(data: &[u8]) -> Option<UpfSess> {
-    if data.is_empty() {
-        log::error!("Empty packet buffer");
-        return None;
-    }
-
-    // Get IP version from first byte
-    let version = (data[0] >> 4) & 0x0F;
-
-    match version {
-        IP_VERSION_4 => {
-            if data.len() < IPV4_MIN_HEADER_LEN {
-                log::error!(
-                    "Invalid IPv4 packet [Packet Length:{}, Min Required:{}]",
-                    data.len(),
-                    IPV4_MIN_HEADER_LEN
-                );
-                return None;
-            }
-
-            let ip_hdr = unsafe { &*(data.as_ptr() as *const Ipv4Header) };
-            let src_addr = ip_hdr.src_addr();
-            upf_self().sess_find_by_ipv4(src_addr)
-        }
-        IP_VERSION_6 => {
-            if data.len() < IPV6_HEADER_LEN {
-                log::error!(
-                    "Invalid IPv6 packet [Packet Length:{}, Min Required:{}]",
-                    data.len(),
-                    IPV6_HEADER_LEN
-                );
-                return None;
-            }
-
-            let ip6_hdr = unsafe { &*(data.as_ptr() as *const Ipv6Header) };
-            let src_addr = ip6_hdr.src_addr();
-            upf_self().sess_find_by_ipv6(&src_addr)
-        }
-        _ => {
-            log::error!(
-                "Invalid packet [IP version:{}, Packet Length:{}]",
-                version,
-                data.len()
-            );
-            None
-        }
-    }
-}
 
 /// Extract IP version from packet buffer
 ///
@@ -554,19 +392,25 @@ mod tests {
         assert!(get_ipv6_dst_addr(&ipv4_packet).is_none());
     }
 
+    /// The malformed-buffer rejections that `upf_sess_find_by_ue_ip_address` used
+    /// to assert (#325 removed it). Restated against `get_ip_version`, which is the
+    /// surviving entry point that inspects the version nibble, so the coverage the
+    /// deleted test provided is not silently lost with it.
     #[test]
     fn test_invalid_packets() {
         // Empty packet
-        assert!(upf_sess_find_by_ue_ip_address(&[]).is_none());
+        assert!(get_ip_version(&[]).is_none());
 
-        // Too short IPv4 packet
-        assert!(upf_sess_find_by_ue_ip_address(&[0x45; 10]).is_none());
+        // Invalid IP version (3)
+        assert!(get_ip_version(&[0x30u8; 40]).is_none());
 
-        // Too short IPv6 packet
-        assert!(upf_sess_find_by_ue_ip_address(&[0x60; 20]).is_none());
+        // A well-formed version nibble is still accepted, so the assertions above
+        // fail for the version and not because the function rejects everything.
+        assert_eq!(get_ip_version(&[0x45u8; 20]), Some(IP_VERSION_4));
+        assert_eq!(get_ip_version(&[0x60u8; 40]), Some(IP_VERSION_6));
 
-        // Invalid IP version
-        let invalid = vec![0x30u8; 40]; // Version 3
-        assert!(upf_sess_find_by_ue_ip_address(&invalid).is_none());
+        // Too-short buffers are the ACCESSORS' business, not the version nibble's.
+        assert!(get_ipv4_dst_addr(&[0x45; 10]).is_none());
+        assert!(get_ipv6_dst_addr(&[0x60; 20]).is_none());
     }
 }
