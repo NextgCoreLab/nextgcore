@@ -67,7 +67,41 @@ From the clap `Args` struct in `src/bins/nextgcore-eesd/src/main.rs`:
 ## Behavior notes
 
 - **OAuth2 is fail-closed and per-operation** (eesd-08, `auth.rs`): every `eees-*` route runs `require_oauth2` *before* method dispatch. No JWKS configured, or a missing/invalid/expired bearer → 401; a valid token whose space-delimited `scope` lacks the per-API scope (the scope string equals the apiName, e.g. `eees-easregistration`) → 403 `INSUFFICIENT_SCOPE`. The shipped docker-compose command passes no `--oauth2-jwks-file`, so in that deployment every protected EES operation answers 401; `main.rs` logs a startup warning to that effect.
-- **ECS, not NRF**: with `--ecs-uri` set, the EES POSTs an `EESRegistration` to `{ecsApiRoot}/eecs-eesregistration/v1/registrations` and, on 200/201, spawns a refresh task that PUTs the resource every 60 s. A failed initial POST is logged (`will operate without ECS`) and **not retried**; without `--ecs-uri` the daemon runs standalone.
+- **ECS, not NRF**: with `--ecs-uri` set, the EES POSTs an `EESRegistration` to `{ecsApiRoot}/eecs-eesregistration/v1/registrations` and, on 200/201, spawns a refresh task that PUTs the resource every 60 s; without `--ecs-uri` the daemon runs standalone. As of #107 the initial POST is **retried with capped exponential backoff** (5 attempts, 500 ms doubling to a 30 s cap) instead of being abandoned after one failure, the refresh **re-POSTs** on any non-2xx instead of looping on a resource the ECS no longer has, and the body carries live `easIds` and an `expTime` instead of `null` — see *Restoring a lost registration* below.
+
+## Restoring a lost registration, and the ECS role (#107)
+
+Three things were silently brittle before #107, and one thing was missing entirely.
+
+**The EDGE-6 client.**
+
+| was | now |
+|---|---|
+| one POST, then `warn!("will operate without ECS")` forever — a transient blip during startup dropped the EES from the registry permanently | retried up to `MAX_REGISTRATION_ATTEMPTS` (5) with backoff `500 ms → 1 s → 2 s → 4 s`, capped at 30 s. The body is **rebuilt each attempt**, so an EAS that registered while the ECS was unreachable appears in the registration that finally lands |
+| the refresh only ever PUT; a 404 — what an ECS returns for a resource lost across a restart — was logged and the loop kept PUTting forever | any **non-2xx** re-POSTs and adopts the new `registrationId`. Not only 404: a 410 or a schema-version 400 leave the EES in the identical state, and re-creating is idempotent from this side, so the narrower check would buy nothing and loop forever on those |
+| `easIds: null` and `expTime: null`, so the ECS's view of this EES was wrong even on the happy path and target-EES selection could never match it | both derived from live state on every POST **and** every refresh. `expTime` is 10 minutes out and the refresh runs every 60 s, so a live EES is never expired while one that stopped refreshing is |
+
+`easIds` is absent rather than `[]` when the EES serves no EAS: the member is optional, and an empty array asserts "serves no EAS" where absent says "not stated". Either way the ECS's discovery does not match it, which is the point — an EES advertising no EAS cannot be selected as a target.
+
+**The ECS role.** All eight ECS-side APIs were unimplemented anywhere in the workspace, so an EEC had no EDGE-4 bootstrap and an EES could not be brought into a deployment through an ECS. `ECS_ROLE=1` now makes this process serve three of them:
+
+| API | Path | What it does |
+|---|---|---|
+| `Eecs_EESRegistration` | `POST/PUT/GET/DELETE /eecs-eesregistration/v1/registrations[/{registrationId}]` | EDGE-6. Mints the `registrationId` server-side and returns it in `Location`. **404 for an id it does not hold**, which is what makes the client's re-POST recovery reachable. |
+| `Eecs_ServiceProvisioning` | `POST /eecs-serviceprovisioning/v1/provisioning-requests` | EDGE-4. Returns the registered EES endpoints an EEC needs. `eecId` is mandatory. An ECS with no EES answers **200 with an empty list**, not 404 — "none available yet" and "not served here" are different states. |
+| `Eecs_TargetEESDiscovery` | `POST /eecs-targeteesdiscovery/v1/target-ees-discovery` | Matches `easId` (directly, or via an AC profile's `easIds`) against the registered `eesProf.easIds`. An unfiltered query returns every EES: "which EESs exist" is a legitimate discovery. |
+
+| Variable | Default | Effect |
+|---|---|---|
+| `ECS_ROLE` | unset (off) | `1`/`true`/`yes`/`on` serves the three `eecs-*` APIs from this process. A **runtime** switch rather than a cargo feature, per this project's convention that a feature-gated path is left uncompiled by CI and rots. |
+
+**Limits worth knowing:**
+
+- **Five of the eight ECS APIs are not implemented** — `Eecs_ECSDiscovery`, `Eecs_EASInfoManagement`, `Eecs_ACREvents`, `Eecs_ECSServiceProvisioning` and `Ecas_SelectedEES`. They answer 404, deliberately: a route returning a fabricated 2xx is worse than one that is honest about not existing. #107's own suggested approach scoped the initial surface to three.
+- **The role is a role, not a separate `ecsd`.** An ECS has no `nfType` in TS 29.510 — the same fact that made EDGE-6 registration replace this daemon's old NRF self-registration — so a separate binary would gain none of the NF machinery that justifies one, and the registry an ECS matches against is the EAS pool this process already keeps. With `ECS_ROLE` unset the `eecs-*` paths answer 404 exactly as before.
+- **The ECS registry is in memory**, like every other piece of EES state, so it is lost on restart — which is precisely the case the hardened client's re-POST recovery handles.
+- **The `eecs-*` routes are not OAuth2-gated.** They are a different reference point (EDGE-4/EDGE-6) with different consumers, and requiring an `eees-*` scope would make an EEC's bootstrap need an EAS's token. A test pins the contrast.
+- **`ECS_ROLE` is not set by any compose service**, so the default E2E path is unchanged.
 - **Capacity and rejection**: the single `--max-eas` value caps each resource family independently in `context.rs` — EAS registrations, EEC registrations, discovery subscriptions, AC-information subscriptions, ACR-management-event subscriptions, ACR-events subscriptions, and stored EEC contexts. On exhaustion, create handlers return **507** with cause `INSUFFICIENT_RESOURCES`. Mandatory-IE violations return 400 `MANDATORY_IE_MISSING`; malformed JSON returns 400 `INVALID_MSG_FORMAT`; changing an immutable `easId`/`eecId` on update returns 403 `MODIFICATION_NOT_ALLOWED`.
 - **Registration lifecycle** (eesd-12): a sweep every 30 s (`LIFECYCLE_SWEEP_INTERVAL_SECS`) drops expired EAS/EEC registrations; an EEC registration created without `expTime` is minted one 3600 s out (`DEFAULT_EEC_REG_LIFETIME_SECS` in `eec.rs`). All state is in-memory only — there is no state file, and the context is cleared on shutdown.
 - **Notification callbacks** (D6, `notifier.rs`): every subscription callback is POSTed to its `notificationDestination` through a bounded queue (default capacity 1024; a full queue drops the newest with a warning) with bounded retry per the `--callback-*` flags; `suppFeat` negotiation echoes the hex-AND of the consumer's mask with `EES_SUPPORTED_FEATURES = 0x1` (`types.rs`).
