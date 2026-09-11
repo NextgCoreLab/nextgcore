@@ -1020,6 +1020,52 @@ async fn handle_pfcp_session_report(
         );
     }
 
+    // TSC Management Information Report (TMIR, bit 0x10 — §8.2.21 bit 5), #321.
+    //
+    // The UPF reporting port or user-plane-node management information the SMF did
+    // not ask for in a transaction: an NW-TT port whose configuration changed, or a
+    // bridge-level change. TS 23.502 Annex F.1 has the SMF relay this to the TSN AF
+    // or TSCTSF via the PCF.
+    //
+    // Decoded and RECORDED here; the onward relay to the PCF is a stated ceiling —
+    // see `specs/fix-pfcp-tsc-container-codec.md`. Decoding it is what criterion 4
+    // asks for, and what makes the report attributable rather than an unknown IE.
+    if report_type & 0x10 != 0 {
+        let reports = decode_tsc_from_report(payload);
+        if reports.is_empty() {
+            // TMIR set with no IE 201 is the peer contradicting itself. Said plainly,
+            // because the alternative reading — "a TSC report arrived and we dropped
+            // it" — is the one worth ruling out.
+            log::warn!(
+                "Session Report for SEID=0x{seid:016x} set TMIR but carried no TSC \
+                 Management Information IE (TS 29.244 §7.5.8.5)"
+            );
+        }
+        for tsc in &reports {
+            log::info!(
+                "TSC Management Information Report: SEID=0x{seid:016x}, NW-TT port={:?}, \
+                 PMIC={} byte(s), UMIC={} byte(s)",
+                tsc.nw_tt_port_number,
+                tsc.port_management_container
+                    .as_ref()
+                    .map(|c| c.len())
+                    .unwrap_or(0),
+                tsc.user_plane_node_management_container
+                    .as_ref()
+                    .map(|c| c.len())
+                    .unwrap_or(0),
+            );
+            if !tsc.conditional_holds() {
+                log::warn!(
+                    "TSC report for SEID=0x{seid:016x} carries a PMIC with no NW-TT Port \
+                     Number, so it names no port to attribute the configuration to \
+                     (TS 29.244 Table 7.5.8.5-1)"
+                );
+            }
+        }
+        pfcp_path::record_tsc_report(seid, reports);
+    }
+
     let mut offset = 0;
     while offset + 4 <= payload.len() {
         let ie_type = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
@@ -1914,6 +1960,36 @@ async fn pfcp_session_establish(
     let dl_far_bytes = n4_build::build_create_far(&dl_far);
     builder.add_tlv(pfcp_ie::CREATE_FAR, &dl_far_bytes);
 
+    // Create Bridge/Router Info (IE 194, TS 29.244 §5.26.2), #321.
+    //
+    // Sent when — and only when — the UPF advertised TSCU in its UP Function
+    // Features. Asking a UPF that did not advertise TSC support for a DS-TT port
+    // number is asking for a resource it has no concept of, and §6.2.2 says a UP
+    // function may reject a request carrying an unsupported feature's IEs outright,
+    // which would fail every session establishment against a plain UPF.
+    //
+    // Sent at ESTABLISHMENT rather than when a TSN AF appears, because §5.26.2 puts
+    // this IE on the Establishment Request only, and the SMF cannot know at that
+    // point whether a TSCTSF will later authorise this session — the TSCTSF binds
+    // its app session by UE IP, which requires the session to exist first. So a
+    // TSC-capable UPF is asked once, up front, and the answer is held.
+    let tsc_capable = client
+        .association()
+        .await
+        .up_function_features
+        .map(|f| f.tscu)
+        .unwrap_or(false);
+    if tsc_capable {
+        let mut bridge_buf = bytes::BytesMut::new();
+        nextgcore_pfcp::types::CreateBridgeInfoForTsc::bridge().encode(&mut bridge_buf);
+        builder.add_tlv(pfcp_ie::CREATE_BRIDGE_INFO_FOR_TSC, &bridge_buf);
+        log::debug!(
+            "PFCP Session Establishment: requesting 5GS bridge info (BII) from {} — \
+             it advertised TSCU",
+            client.peer()
+        );
+    }
+
     let payload = builder.build();
 
     // Send through the transaction engine: T1 retransmission up to N1
@@ -1949,6 +2025,9 @@ async fn pfcp_session_establish(
     let mut upf_seid: u64 = 0;
     let mut upf_teid: u32 = 0;
     let mut upf_ip: [u8; 4] = [127, 0, 0, 1];
+    // #321: the DS-TT port number and 5GS User Plane Node ID the UPF allocated,
+    // present only when the BII request above was sent and honoured.
+    let mut bridge_info: Option<nextgcore_pfcp::types::CreatedBridgeInfoForTsc> = None;
 
     let mut offset = 0;
     while offset + 4 <= resp_payload.len() {
@@ -2021,6 +2100,18 @@ async fn pfcp_session_establish(
                     inner_off = inner_end;
                 }
             }
+            // Created Bridge/Router Info (IE 195, TS 29.244 §7.5.3.6), #321.
+            //
+            // Decoded with the library codec rather than hand-parsed inline like the
+            // two IEs above, so the grouped-IE parsing has one implementation and one
+            // set of tests.
+            195 => {
+                let mut data = bytes::Bytes::copy_from_slice(ie_value);
+                match nextgcore_pfcp::types::CreatedBridgeInfoForTsc::decode(&mut data) {
+                    Ok(info) => bridge_info = Some(info),
+                    Err(e) => log::warn!("malformed Created Bridge Info for TSC, ignoring: {e}"),
+                }
+            }
             _ => {}
         }
         offset = ie_end;
@@ -2036,6 +2127,33 @@ async fn pfcp_session_establish(
     }
 
     log::info!("PFCP Session Established: UPF SEID=0x{upf_seid:016x}, UPF TEID=0x{upf_teid:08x}");
+
+    // #321: a TSC-capable UPF answers the BII request with the DS-TT port it
+    // allocated and its own 5GS User Plane Node ID (the Bridge ID). Recorded against
+    // the SMF-side SEID so a later TSC authorisation has the bridge identity to
+    // report to the PCF, and so the NW-TT containers can be applied to a session
+    // whose device-side port is known.
+    if let Some(info) = bridge_info {
+        log::info!(
+            "5GS bridge info from {}: DS-TT port={:?}, bridge ID={:?}",
+            client.peer(),
+            info.port_number,
+            info.user_plane_node_id.and_then(|n| n.node_id)
+        );
+        pfcp_path::record_session_bridge_info(smf_n4_seid, info);
+    } else if tsc_capable {
+        // The UPF advertised TSCU and was asked, but answered nothing. §7.5.3.6
+        // makes both members conditional-mandatory once BII is set, so this is the
+        // peer not honouring its own advertised feature — worth saying, because the
+        // consequence appears much later as a TSC authorisation with no bridge to
+        // apply it to.
+        log::warn!(
+            "{} advertised TSCU but its Session Establishment Response carried no \
+             Created Bridge Info: TSC authorisation for this session will have no \
+             DS-TT port or bridge ID to report (TS 29.244 §7.5.3.6)",
+            client.peer()
+        );
+    }
 
     // Issue #20: remember which UPF this session was established on so
     // modification/deletion keep signalling the same peer. Keyed by the
@@ -3509,6 +3627,140 @@ async fn pfcp_update_session_qer(
         }
         cause => anyhow::bail!("PFCP Session Modification (QoS) rejected: cause={cause:?}"),
     }
+}
+
+/// Carry the PCF-authorised TSC management containers to the UPF in a Session
+/// Modification (IE 199, TS 29.244 §7.5.4.18), #321.
+///
+/// # The `tscu` gate
+///
+/// An SMF must not send TSC containers to a UPF that did not advertise TSC support
+/// in its UP Function Features (§8.2.25's TSCU bit). Two reasons, and the second is
+/// the one that bites: a UPF with no TSC concept has nothing to apply them to, and
+/// §6.2.2 lets a UP function reject a request carrying an unsupported feature's IEs
+/// — so sending them anyway risks failing the whole modification, taking the
+/// unrelated rule changes in the same message down with it.
+///
+/// Returns the number of TSC IEs sent — 0 when the UPF is not TSC-capable or the
+/// decision authorised nothing, which is a successful no-op rather than an error.
+async fn pfcp_send_tsc_containers(
+    smf_n4_seid: u64,
+    upf_seid: u64,
+    tsc: &policy::TscContainers,
+) -> Result<usize> {
+    let ies = tsc.to_n4_ies();
+    if ies.is_empty() {
+        return Ok(0);
+    }
+
+    let client = pfcp_path::client_for_session(smf_n4_seid)
+        .ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
+
+    let features = client.association().await.up_function_features;
+    if !features.map(|f| f.tscu).unwrap_or(false) {
+        // Declined with the reason named, not dropped quietly: the PCF authorised a
+        // TSC configuration and it is NOT being enforced, which an operator reading
+        // "policy applied" would otherwise never learn.
+        log::warn!(
+            "TSC containers authorised for SEID 0x{smf_n4_seid:016x} but {} did not \
+             advertise TSCU (TS 29.244 §8.2.25): {} IE(s) NOT sent, so the port and \
+             bridge configuration is not enforced",
+            client.peer(),
+            ies.len()
+        );
+        return Ok(0);
+    }
+
+    // A PMIC with no NW-TT port number cannot be applied to anything. Caught here
+    // rather than on the wire, so the UPF is never asked to make sense of it.
+    if let Some(bad) = ies.iter().find(|ie| !ie.conditional_holds()) {
+        anyhow::bail!(
+            "refusing to send a TSC Management Information IE whose PMIC carries no \
+             NW-TT Port Number (TS 29.244 Table 7.5.4.18-1 makes it conditional-\
+             mandatory): {bad:?}"
+        );
+    }
+
+    let sent = ies.len();
+    let params = n4_build::SessionModificationParams {
+        tsc_management_info: ies,
+        ..Default::default()
+    };
+    let payload = n4_build::build_session_modification_request(&params);
+    let (_, resp_body) = client
+        .request(
+            pfcp_path::pfcp_message_type::SESSION_MODIFICATION_REQUEST,
+            Some(upf_seid),
+            &payload,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("PFCP Session Modification (TSC) failed: {e}"))?;
+
+    match pfcp_path::parse_cause(&resp_body) {
+        Some(pfcp_path::pfcp_cause::REQUEST_ACCEPTED) => {
+            // §7.5.5.3: the response may echo what the UPF applied. Decoded so a
+            // mismatch is visible, and because a response carrying IE 200 that
+            // nothing reads is the defect #321 was filed about, one message over.
+            let echoed = decode_tsc_from_response(&resp_body);
+            log::info!(
+                "TSC containers applied on UPF SEID 0x{upf_seid:016x}: {sent} IE(s) sent, \
+                 {} echoed back",
+                echoed.len()
+            );
+            Ok(sent)
+        }
+        Some(cause) if restoration::cause_means_session_gone(cause) => {
+            restoration::reconcile_session_not_found(upf_seid).await;
+            anyhow::bail!("PFCP Session Modification (TSC) rejected: cause={cause}")
+        }
+        cause => anyhow::bail!("PFCP Session Modification (TSC) rejected: cause={cause:?}"),
+    }
+}
+
+/// Decode every TSC Management Information IE at the top level of a PFCP body,
+/// under the carrier IE type given.
+///
+/// Shared by the Session Modification Response (IE 200) and the Session Report
+/// Request (IE 201) readers, because the grouped contents are identical and only
+/// the carrier differs (§7.5.5.3 vs §7.5.8.5).
+fn decode_tsc_ies(
+    body: &[u8],
+    carrier: u16,
+) -> Vec<nextgcore_pfcp::types::TscManagementInformation> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    while offset + 4 <= body.len() {
+        let ie_type = u16::from_be_bytes([body[offset], body[offset + 1]]);
+        let ie_len = u16::from_be_bytes([body[offset + 2], body[offset + 3]]) as usize;
+        let start = offset + 4;
+        let end = start + ie_len;
+        if end > body.len() {
+            break;
+        }
+        if ie_type == carrier {
+            let mut data = bytes::Bytes::copy_from_slice(&body[start..end]);
+            match nextgcore_pfcp::types::TscManagementInformation::decode(&mut data) {
+                Ok(tsc) => out.push(tsc),
+                Err(e) => log::warn!("malformed TSC Management Information IE {carrier}: {e}"),
+            }
+        }
+        offset = end;
+    }
+    out
+}
+
+/// The TSC Management Information IEs a Session Modification Response carried
+/// (IE 200, TS 29.244 §7.5.5.3).
+fn decode_tsc_from_response(body: &[u8]) -> Vec<nextgcore_pfcp::types::TscManagementInformation> {
+    decode_tsc_ies(body, 200)
+}
+
+/// The TSC Management Information IEs a Session Report Request carried
+/// (IE 201, TS 29.244 §7.5.8.5).
+pub(crate) fn decode_tsc_from_report(
+    body: &[u8],
+) -> Vec<nextgcore_pfcp::types::TscManagementInformation> {
+    decode_tsc_ies(body, 201)
 }
 
 /// Deactivate the downlink FAR (back to BUFF) — used when the AN-side
@@ -5339,6 +5591,29 @@ async fn handle_sm_policy_notify(sm_context_ref: &str, request: &SbiRequest) -> 
             log::error!("Failed to apply PCF-updated QoS: {e}");
             return SbiResponse::with_status(504);
         }
+
+        // #321: the TSC leg of the same decision. Sent as its OWN Session
+        // Modification rather than folded into the QER update above, because the two
+        // have different failure meanings: a rejected QER update means the
+        // authorised bandwidth is not enforced, while a rejected TSC update means
+        // the bridge is not configured. Sharing one message would make a single
+        // Cause answer for both, which §7.5.5 cannot express.
+        if !dec.tsc.is_empty() {
+            match pfcp_send_tsc_containers(smf_n4_seid_for(sm_context_ref), seid, &dec.tsc).await {
+                Ok(0) => {}
+                Ok(n) => log::info!(
+                    "Applied PCF-authorised TSC configuration to ref={sm_context_ref}: \
+                     {n} TSC Management Information IE(s)"
+                ),
+                Err(e) => {
+                    // NOT a 504 for the whole notification: the QoS half above was
+                    // applied and reporting failure would have the PCF retry a
+                    // decision that partly landed. The TSC half is reported as the
+                    // error it is and the notification is still accepted.
+                    log::error!("Failed to apply PCF-authorised TSC configuration: {e}");
+                }
+            }
+        }
     }
 
     // Persist the updated AMBR in the binding
@@ -5559,6 +5834,242 @@ async fn handle_amf_status_change(sm_context_ref: &str) -> SbiResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // 5GS TSC container carriage (#321)
+    // ------------------------------------------------------------------
+    //
+    // Every one of these drives the REAL wire path: the SMF's own
+    // `pfcp_send_tsc_containers` against a stand-in UPF that records the bodies it
+    // received. Asserting on the recorded body rather than on a log line is what
+    // makes "the gate held" distinguishable from "the gate is not implemented".
+
+    /// A PMIC/UMIC pair, as a PCF decision would deliver them.
+    #[cfg(test)]
+    fn tsc_fixture() -> policy::TscContainers {
+        policy::TscContainers {
+            bridge_man_cont: Some(vec![0xE1, 0xE2]),
+            port_man_cont_dstt: Some((vec![0xD1], 1)),
+            port_man_cont_nwtts: vec![(vec![0xF1, 0xF2, 0xF3], 7)],
+        }
+    }
+
+    /// Every TSC Management Information IE (199) in a recorded request body.
+    #[cfg(test)]
+    fn tsc_ies_in(body: &[u8]) -> Vec<nextgcore_pfcp::types::TscManagementInformation> {
+        decode_tsc_ies(body, 199)
+    }
+
+    /// Criterion 2 (SMF half): a Session Modification actually carries the
+    /// containers, under IE 199, with the octets the PCF authorised.
+    #[tokio::test]
+    async fn test_tsc_containers_are_carried_on_a_session_modification() {
+        let upf = pfcp_path::stand_in::associated_upf_with_features(
+            nextgcore_pfcp::types::UpFunctionFeatures {
+                ftup: true,
+                tscu: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        pfcp_path::record_session_peer(0xABCD, upf.client.peer());
+
+        let sent = pfcp_send_tsc_containers(0xABCD, upf.upf_seid, &tsc_fixture())
+            .await
+            .expect("a TSC-capable UPF must accept the modification");
+
+        // Two IEs: one NW-TT port PMIC, one bridge-level UMIC. The DS-TT container
+        // is deliberately NOT among them -- see `TscContainers::to_n4_ies`.
+        assert_eq!(sent, 2, "one NW-TT PMIC IE plus one UMIC IE");
+
+        let bodies = upf.modification_bodies();
+        assert_eq!(bodies.len(), 1, "exactly one Session Modification was sent");
+        let ies = tsc_ies_in(&bodies[0]);
+        assert_eq!(
+            ies.len(),
+            2,
+            "both TSC IEs must be on the wire under IE 199"
+        );
+
+        let pmic = ies
+            .iter()
+            .find(|ie| ie.port_management_container.is_some())
+            .expect("a PMIC IE must be present");
+        assert_eq!(
+            pmic.port_management_container.as_deref(),
+            Some(&[0xF1, 0xF2, 0xF3][..]),
+            "the PMIC octets must reach the UPF byte-exact: they are an opaque \
+             TS 24.539 payload the SMF only relays"
+        );
+        assert_eq!(
+            pmic.nw_tt_port_number,
+            Some(7),
+            "the NW-TT port number the PCF named must travel with its container"
+        );
+
+        let umic = ies
+            .iter()
+            .find(|ie| ie.user_plane_node_management_container.is_some())
+            .expect("a UMIC IE must be present");
+        assert_eq!(
+            umic.user_plane_node_management_container.as_deref(),
+            Some(&[0xE1, 0xE2][..])
+        );
+        assert!(
+            umic.nw_tt_port_number.is_none(),
+            "a UMIC is bridge-level and must carry no port identity"
+        );
+
+        // `SESSION_PEERS` is process-global and outlives this test's N4 guard, so the
+        // mapping is removed rather than left pointing at a stand-in that is about to
+        // be dropped. A leaked entry makes `client_for_session` fall back to the
+        // default client for that SEID, which is the kind of cross-test coupling that
+        // only shows up as an order-dependent failure.
+        pfcp_path::forget_session_peer(0xABCD);
+    }
+
+    /// Criterion 3: a UPF that did not advertise TSCU is NOT sent TSC containers.
+    ///
+    /// The default stand-in advertises `ftup` only, so this is the ordinary case.
+    #[tokio::test]
+    async fn test_tsc_containers_withheld_from_a_upf_without_tscu() {
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        assert!(
+            !upf.client
+                .association()
+                .await
+                .up_function_features
+                .unwrap()
+                .tscu,
+            "precondition: the default stand-in must NOT advertise TSCU"
+        );
+        pfcp_path::record_session_peer(0xABCE, upf.client.peer());
+
+        let sent = pfcp_send_tsc_containers(0xABCE, upf.upf_seid, &tsc_fixture())
+            .await
+            .expect("withholding is a successful no-op, not an error");
+
+        assert_eq!(sent, 0, "nothing may be sent to a UPF without TSCU");
+        assert!(
+            upf.modification_bodies().is_empty(),
+            "NO Session Modification at all may be sent: the message exists only to \
+             carry the TSC IEs, so sending an empty one would be traffic that asks \
+             the UPF for nothing"
+        );
+
+        pfcp_path::forget_session_peer(0xABCE);
+    }
+
+    /// An authorisation carrying nothing sends nothing, even to a capable UPF.
+    #[tokio::test]
+    async fn test_empty_tsc_authorisation_sends_no_modification() {
+        let upf = pfcp_path::stand_in::associated_upf_with_features(
+            nextgcore_pfcp::types::UpFunctionFeatures {
+                ftup: true,
+                tscu: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        pfcp_path::record_session_peer(0xABCF, upf.client.peer());
+
+        let sent =
+            pfcp_send_tsc_containers(0xABCF, upf.upf_seid, &policy::TscContainers::default())
+                .await
+                .expect("no containers is a no-op");
+        assert_eq!(sent, 0);
+        assert!(upf.modification_bodies().is_empty());
+
+        pfcp_path::forget_session_peer(0xABCF);
+    }
+
+    /// Criterion 4: a Session Report carrying IE 201 reaches the SMF, is decoded,
+    /// and is observable from the SMF's own state rather than from a log line.
+    #[tokio::test]
+    async fn test_session_report_tsc_management_information_is_decoded() {
+        let _guard = pfcp_path::N4_TEST_LOCK.lock().await;
+        pfcp_path::clear_tsc_reports_for_test();
+
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let seid = 0x0000_0000_0BAD_F00Du64;
+
+        // Body: Report Type with TMIR (bit 5 => 0x10) plus one IE 201 carrying a
+        // PMIC and its NW-TT port. Hand-built, so the test does not depend on the
+        // SMF's own encoder agreeing with itself.
+        let mut tsc_buf = bytes::BytesMut::new();
+        nextgcore_pfcp::types::TscManagementInformation::port(vec![0xAA, 0xBB], 9)
+            .encode(&mut tsc_buf);
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x00, 39, 0x00, 0x01, 0x10]); // Report Type = TMIR
+        body.extend_from_slice(&[0x00, 201]);
+        body.extend_from_slice(&(tsc_buf.len() as u16).to_be_bytes());
+        body.extend_from_slice(&tsc_buf);
+
+        let pkt = pfcp_path::encode_wire_message(
+            pfcp_path::pfcp_message_type::SESSION_REPORT_REQUEST,
+            Some(seid),
+            42,
+            &body,
+        );
+
+        handle_pfcp_session_report(&sock, &pkt, peer_addr).await;
+
+        let reports = pfcp_path::tsc_reports_for(seid)
+            .expect("the decoded TSC report must be recorded against the SEID");
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0].port_management_container.as_deref(),
+            Some(&[0xAA, 0xBB][..])
+        );
+        assert_eq!(reports[0].nw_tt_port_number, Some(9));
+
+        // And the SMF still answers the report, rather than treating an IE it now
+        // understands as a reason to stop.
+        let mut rbuf = vec![0u8; 512];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), peer.recv_from(&mut rbuf))
+                .await
+                .expect("a Session Report Response must be sent")
+                .unwrap();
+        let h = pfcp_path::parse_wire_header(&rbuf[..len]).unwrap();
+        assert_eq!(
+            h.msg_type,
+            pfcp_path::pfcp_message_type::SESSION_REPORT_RESPONSE
+        );
+
+        pfcp_path::clear_tsc_reports_for_test();
+    }
+
+    /// A TMIR bit with no IE 201 records nothing, and does not invent an empty
+    /// report. The peer contradicted itself; storing `Some(vec![])` would make
+    /// "reported nothing" indistinguishable from "reported an empty container set".
+    #[tokio::test]
+    async fn test_session_report_tmir_without_ie_records_nothing() {
+        let _guard = pfcp_path::N4_TEST_LOCK.lock().await;
+        pfcp_path::clear_tsc_reports_for_test();
+
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let seid = 0x0000_0000_0BAD_BEEFu64;
+
+        let body = vec![0x00, 39, 0x00, 0x01, 0x10]; // TMIR set, no IE 201
+        let pkt = pfcp_path::encode_wire_message(
+            pfcp_path::pfcp_message_type::SESSION_REPORT_REQUEST,
+            Some(seid),
+            43,
+            &body,
+        );
+        handle_pfcp_session_report(&sock, &pkt, peer_addr).await;
+
+        assert!(
+            pfcp_path::tsc_reports_for(seid).is_none(),
+            "TMIR with no TSC IE must record nothing"
+        );
+        pfcp_path::clear_tsc_reports_for_test();
+    }
 
     #[test]
     fn test_smf_config_default() {

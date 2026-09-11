@@ -6,12 +6,12 @@ use crate::n4_build::{
     build_association_release_response, build_association_setup_response, build_failure_response,
     build_heartbeat_response, build_session_deletion_response,
     build_session_establishment_response, build_session_modification_response,
-    build_session_modification_response_with_reports, build_session_report_request,
-    parse_create_bar, parse_create_far, parse_create_pdr, parse_create_qer, parse_create_urr,
-    parse_pfcpsmreq_flags, parse_recovery_time_stamp, pfcp_ie, pfcp_type, pfcpsmreq_flags,
-    CreatedPdr, DownlinkDataReport, DownlinkDataServiceInfo, ErrorIndicationReport, FSeid, FTeid,
-    NodeId, ParsedCreateBar, ParsedCreateFar, ParsedCreatePdr, ParsedCreateQer, ParsedCreateUrr,
-    ParsedFSeid, ParsedIe, ParsedPfcpHeader, PfcpCause, ReportType, UserPlaneReport,
+    build_session_modification_response_full, build_session_report_request, parse_create_bar,
+    parse_create_far, parse_create_pdr, parse_create_qer, parse_create_urr, parse_pfcpsmreq_flags,
+    parse_recovery_time_stamp, pfcp_ie, pfcp_type, pfcpsmreq_flags, CreatedPdr, DownlinkDataReport,
+    DownlinkDataServiceInfo, ErrorIndicationReport, FSeid, FTeid, NodeId, ParsedCreateBar,
+    ParsedCreateFar, ParsedCreatePdr, ParsedCreateQer, ParsedCreateUrr, ParsedFSeid, ParsedIe,
+    ParsedPfcpHeader, PfcpCause, ReportType, UserPlaneReport,
 };
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -631,6 +631,24 @@ pub struct PfcpSessionInfo {
     /// the same order the CP function sent the requests, so they are the only
     /// race-free answer to "does this rule exist" at response-building time.
     pub rules: SessionRuleIds,
+    /// The 5GS TSN bridge this session is part of, once the SMF has configured one
+    /// over N4 (#321, TS 23.501 §5.28).
+    ///
+    /// `None` until a Session Modification carries TSC management information —
+    /// which is the transition #284's criterion 4 asks to be demonstrated.
+    ///
+    /// # Why here and not on `context::UpfSess`
+    ///
+    /// `UpfSess` also has a `tsn_bridge` field, and it is UNREACHABLE: nothing in
+    /// production calls `UpfContext::sess_add`, so that session store is never
+    /// populated (`rule_match` reads it and therefore always finds nothing).
+    /// Populating it would be a correct change in a place no wire path runs through,
+    /// and a test for it could only assert against a session it had hand-built
+    /// itself — which is exactly the unit test that already exists and is exactly
+    /// why #284's criterion 4 stayed unmet. THIS map is the store the N4 handler
+    /// writes, so it is the one where "the UPF's own state" means something. The
+    /// parallel-store defect is filed as its own issue rather than fixed here.
+    pub tsn_bridge: Option<crate::context::TsnBridge>,
 }
 
 /// The rule ids a session holds, by kind (TS 29.244 §7.5.4, #306).
@@ -1426,6 +1444,11 @@ impl PfcpServer {
                 qer_ids: parsed_qers.iter().map(|q| q.qer_id).collect(),
                 urr_ids: parsed_urrs.iter().map(|u| u.urr_id).collect(),
             },
+            // #321: no bridge until the SMF configures one. An establishment
+            // deliberately does not create an empty one — `Some(empty bridge)` and
+            // `None` would then both mean "not configured", and the transition
+            // #284's criterion 4 asks about would no longer be observable.
+            tsn_bridge: None,
         };
 
         {
@@ -1601,6 +1624,45 @@ impl PfcpServer {
             }
         }
 
+        // TSC Management Information (IE 199, TS 29.244 §7.5.4.18), #321. Parsed
+        // here with the rest of the message so a malformed instance is reported
+        // through the same `failure` channel as every other rule operation, rather
+        // than being answered `RequestAccepted` and dropped — the defect #306 fixed
+        // for the rule IEs and this issue fixes for the TSC ones.
+        let mut tsc_ies: Vec<nextgcore_pfcp::types::TscManagementInformation> = Vec::new();
+        for ie in ParsedIe::find_all_ies(
+            &ies,
+            pfcp_ie::TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_MODIFICATION_REQUEST,
+        ) {
+            let mut data = bytes::Bytes::copy_from_slice(&ie.value);
+            match nextgcore_pfcp::types::TscManagementInformation::decode(&mut data) {
+                Ok(tsc) if tsc.conditional_holds() => tsc_ies.push(tsc),
+                Ok(_) => {
+                    // A PMIC with no NW-TT Port Number names no port to apply it to.
+                    // Answered with the Conditional-IE-missing cause rather than
+                    // accepted, because accepting it would report success for
+                    // configuration the UPF cannot attribute.
+                    log::warn!(
+                        "TSC Management Information carries a PMIC with no NW-TT Port \
+                         Number (TS 29.244 Table 7.5.4.18-1)"
+                    );
+                    note_first_failure(
+                        &mut failure,
+                        PfcpCause::ConditionalIeMissing,
+                        pfcp_ie::NW_TT_PORT_NUMBER,
+                    );
+                }
+                Err(e) => {
+                    log::warn!("malformed TSC Management Information IE: {e}");
+                    note_first_failure(
+                        &mut failure,
+                        PfcpCause::MandatoryIeIncorrect,
+                        pfcp_ie::TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_MODIFICATION_REQUEST,
+                    );
+                }
+            }
+        }
+
         // PFCPSMReq-Flags (TS 29.244 8.2.50): SNDEM → emit End Marker on the
         // old DL tunnel; DROBU → discard buffered DL packets; QAURR → report every
         // URR immediately in this response. QAURR was declared as a constant and
@@ -1728,12 +1790,48 @@ impl PfcpServer {
                     }
                 }
 
-                Some((session.smf_seid, old_tunnel))
+                // #321: apply the TSC containers in the SAME critical section as the
+                // rule bookkeeping, so the response's echo (IE 200) describes state
+                // that is already committed rather than state a concurrent
+                // modification could still change.
+                if !tsc_ies.is_empty() {
+                    let bridge = session.tsn_bridge.get_or_insert_with(|| {
+                        // The bridge ID is the UPF's own 5GS User Plane Node ID. The
+                        // SEID is used as its basis so it is stable per session and
+                        // distinct across sessions; a real deployment reads it from
+                        // configuration (TS 29.244 §5.26.2 says these identities "may
+                        // be pre-configured in the UPF based on deployment"), which is
+                        // a recorded ceiling rather than something to invent here.
+                        crate::context::TsnBridge::new(upf_seid.to_be_bytes())
+                    });
+                    let mut applied = 0usize;
+                    for tsc in &tsc_ies {
+                        if bridge.apply_tsc_management_information(tsc) {
+                            applied += 1;
+                        }
+                    }
+                    log::info!(
+                        "TSC management information applied to SEID {upf_seid:#x}: \
+                         {applied}/{} IE(s), bridge now holds {} port(s)",
+                        tsc_ies.len(),
+                        bridge.port_count()
+                    );
+                }
+
+                Some((
+                    session.smf_seid,
+                    old_tunnel,
+                    session
+                        .tsn_bridge
+                        .as_ref()
+                        .map(|b| b.tsc_management_information())
+                        .unwrap_or_default(),
+                ))
             } else {
                 None
             }
         };
-        let (smf_seid, old_dl_tunnel) = match lookup {
+        let (smf_seid, old_dl_tunnel, tsc_echo) = match lookup {
             Some(v) => v,
             None => {
                 log::warn!("Session Modification for unknown SEID {upf_seid:#x} — rejecting");
@@ -1797,10 +1895,14 @@ impl PfcpServer {
                 );
                 build_failure_response(cause, Some(offending_ie))
             }
-            None => build_session_modification_response_with_reports(
+            None => build_session_modification_response_full(
                 pfcp_type::SESSION_MODIFICATION_RESPONSE,
                 &[], // No created PDRs for modification
                 &usage_reports,
+                // #321: echo the TSC configuration this session now holds, so the SMF
+                // can tell an applied modification from a merely accepted one. Empty
+                // for every non-TSC session, so no existing response changes.
+                &tsc_echo,
             ),
         };
 
@@ -3055,6 +3157,221 @@ mod tests {
         assert_eq!(updated_urrs[0].volume_threshold_total, Some(8888));
     }
 
+    // ------------------------------------------------------------------
+    // 5GS TSC bridge configuration over N4 (#321)
+    // ------------------------------------------------------------------
+
+    /// Build a TSC Management Information IE payload (#321). Uses the library
+    /// codec, which is the encoder a real SMF uses, so the test exercises the same
+    /// bytes rather than a test-local approximation.
+    fn tsc_ie(pmic: Option<(&[u8], u32)>, umic: Option<&[u8]>) -> Vec<u8> {
+        let tsc = nextgcore_pfcp::types::TscManagementInformation {
+            port_management_container: pmic.map(|(c, _)| c.to_vec()),
+            nw_tt_port_number: pmic.map(|(_, p)| p),
+            user_plane_node_management_container: umic.map(|c| c.to_vec()),
+        };
+        let mut buf = bytes::BytesMut::new();
+        tsc.encode(&mut buf);
+        buf.to_vec()
+    }
+
+    /// #284's criterion 4, which is what #321 exists to make satisfiable: a Session
+    /// Modification carrying a PMIC/UMIC takes `tsn_bridge` from `None` to
+    /// populated.
+    ///
+    /// Asserted from `PfcpServer::sessions` — the store the N4 wire path writes —
+    /// and NOT from a log line, and not from a hand-built session either. The
+    /// session here was established over the socket by the fixture.
+    #[tokio::test]
+    async fn test_tsc_management_information_populates_the_tsn_bridge() {
+        let (server, smf, addr, _rx, _dp, upf_seid) = established_session().await;
+
+        // The precondition #284's criterion 4 is stated against.
+        assert!(
+            server
+                .sessions
+                .read()
+                .await
+                .get(&upf_seid)
+                .expect("session")
+                .tsn_bridge
+                .is_none(),
+            "precondition: an established session has NO TSN bridge until the SMF \
+             configures one"
+        );
+
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(
+            pfcp_ie::TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_MODIFICATION_REQUEST,
+            &tsc_ie(Some((&[0x11, 0x22, 0x33], 7)), None),
+        );
+        b.add_tlv(
+            pfcp_ie::TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_MODIFICATION_REQUEST,
+            &tsc_ie(None, Some(&[0xAB, 0xCD])),
+        );
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 9, &b.build())).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::RequestAccepted as u8,
+            "a well-formed TSC modification must be accepted"
+        );
+
+        let sessions = server.sessions.read().await;
+        let bridge = sessions
+            .get(&upf_seid)
+            .expect("session")
+            .tsn_bridge
+            .as_ref()
+            .expect("the TSN bridge must exist after a TSC modification");
+
+        assert_eq!(
+            bridge
+                .port_management_containers
+                .get(&7)
+                .map(|c| c.as_slice()),
+            Some(&[0x11, 0x22, 0x33][..]),
+            "the PMIC must be stored against the NW-TT port number it arrived with, \
+             byte-exact (it is an opaque TS 24.539 payload)"
+        );
+        assert_eq!(
+            bridge.user_plane_node_management_container.as_deref(),
+            Some(&[0xAB, 0xCD][..]),
+            "the UMIC is bridge-level, so it is stored once and not per port"
+        );
+        assert_eq!(
+            bridge.port_count(),
+            1,
+            "the PMIC's port must exist as a bridge port: naming it in a PMIC is how \
+             the UPF learns the NW-TT side exists"
+        );
+        assert_eq!(
+            bridge.ports.get(&7).map(|p| p.port_type),
+            Some(crate::context::TsnPortType::NetworkSideTt),
+            "a port learned from a TSC Management Information IE is network-side: the \
+             IE carries an NW-TT Port Number and no DS-TT one"
+        );
+    }
+
+    /// The response echoes what was applied (IE 200, TS 29.244 §7.5.5.3), so the
+    /// SMF can tell an APPLIED modification from a merely accepted one.
+    #[tokio::test]
+    async fn test_tsc_modification_response_echoes_what_was_applied() {
+        let (_server, smf, addr, _rx, _dp, upf_seid) = established_session().await;
+
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(
+            pfcp_ie::TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_MODIFICATION_REQUEST,
+            &tsc_ie(Some((&[0x55], 3)), None),
+        );
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 10, &b.build())).await;
+
+        let (_h, payload) = ParsedPfcpHeader::parse(&resp).unwrap();
+        let ies = ParsedIe::parse_all(payload);
+        let echoed = ParsedIe::find_all_ies(
+            &ies,
+            pfcp_ie::TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_MODIFICATION_RESPONSE,
+        );
+        assert_eq!(
+            echoed.len(),
+            1,
+            "the response must carry the applied TSC configuration under IE 200"
+        );
+        let mut data = bytes::Bytes::copy_from_slice(&echoed[0].value);
+        let decoded = nextgcore_pfcp::types::TscManagementInformation::decode(&mut data).unwrap();
+        assert_eq!(decoded.nw_tt_port_number, Some(3));
+        assert_eq!(
+            decoded.port_management_container.as_deref(),
+            Some(&[0x55][..])
+        );
+    }
+
+    /// A PMIC with no NW-TT Port Number is REJECTED with the conditional-IE cause,
+    /// not accepted and dropped.
+    ///
+    /// This is the shape §7.5.4.18's conditional exists to forbid: port
+    /// configuration with no port to attribute it to. Accepting it would report
+    /// success for something the UPF cannot apply — the defect class #306 fixed for
+    /// the rule IEs.
+    #[tokio::test]
+    async fn test_tsc_pmic_without_port_number_is_rejected() {
+        let (server, smf, addr, _rx, _dp, upf_seid) = established_session().await;
+
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(
+            pfcp_ie::TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_MODIFICATION_REQUEST,
+            // PMIC present, NW-TT Port Number absent.
+            &tsc_ie_pmic_only(&[0x99]),
+        );
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 11, &b.build())).await;
+
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::ConditionalIeMissing as u8,
+            "a PMIC with no NW-TT Port Number must be refused, not silently dropped"
+        );
+        assert!(
+            server
+                .sessions
+                .read()
+                .await
+                .get(&upf_seid)
+                .expect("session")
+                .tsn_bridge
+                .is_none(),
+            "a refused modification must apply NOTHING: a bridge created from a \
+             rejected message is the divergence the Cause exists to prevent"
+        );
+    }
+
+    /// A PMIC with no port number, built directly rather than through the codec's
+    /// `port()` constructor (which requires one).
+    fn tsc_ie_pmic_only(pmic: &[u8]) -> Vec<u8> {
+        let tsc = nextgcore_pfcp::types::TscManagementInformation {
+            port_management_container: Some(pmic.to_vec()),
+            nw_tt_port_number: None,
+            user_plane_node_management_container: None,
+        };
+        let mut buf = bytes::BytesMut::new();
+        tsc.encode(&mut buf);
+        buf.to_vec()
+    }
+
+    /// A modification with no TSC IE leaves `tsn_bridge` alone, so no existing
+    /// session acquires a bridge as a side effect of this feature.
+    #[tokio::test]
+    async fn test_non_tsc_modification_leaves_the_bridge_absent() {
+        let (server, smf, addr, mut rx, dp, upf_seid) = established_session().await;
+
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::UPDATE_QER, &qer_body(1, 6));
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 12, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+
+        assert!(
+            server
+                .sessions
+                .read()
+                .await
+                .get(&upf_seid)
+                .expect("session")
+                .tsn_bridge
+                .is_none(),
+            "an ordinary modification must not create a TSN bridge"
+        );
+
+        let (_h, payload) = ParsedPfcpHeader::parse(&resp).unwrap();
+        let ies = ParsedIe::parse_all(payload);
+        assert!(
+            ParsedIe::find_all_ies(
+                &ies,
+                pfcp_ie::TSC_MANAGEMENT_INFORMATION_WITHIN_SESSION_MODIFICATION_RESPONSE,
+            )
+            .is_empty(),
+            "and its response must carry no TSC IE"
+        );
+    }
+
     #[tokio::test]
     async fn test_session_modification_unknown_seid_rejected() {
         let (_server, smf, addr, _rx) = spawn_test_server().await;
@@ -3482,6 +3799,7 @@ mod tests {
                 dl_teid: 0x200,
                 gnb_addr: Some(Ipv4Addr::new(127, 0, 0, 1)),
                 rules: SessionRuleIds::default(),
+                tsn_bridge: None,
             })
             .await;
         (server, smf, upf_seid, smf_seid)

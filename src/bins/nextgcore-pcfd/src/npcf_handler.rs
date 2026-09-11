@@ -77,6 +77,106 @@ pub struct AscReqData {
     pub ue_ipv4: Option<String>,
     pub ue_ipv6: Option<String>,
     pub ue_mac: Option<String>,
+    /// The TSC management containers a TSN AF / TSCTSF supplied (#321).
+    pub tsc: TscManagementContainers,
+}
+
+/// One port's management information container (TS 29.512 / TS 29.514
+/// `PortManagementContainer`), #321.
+///
+/// The schema marks BOTH members required, so neither is optional here: a
+/// container with no port number cannot be applied to anything, and a port number
+/// with no container configures nothing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PortManagementContainer {
+    /// `portManCont` — the PMIC as a TS 29.571 `Bytes`, i.e. base64.
+    ///
+    /// Kept base64 rather than decoded here: this PCF is a RELAY for it (TS 23.502
+    /// Annex F puts the PCF between the TSCTSF and the SMF and gives it nothing to
+    /// decide about the contents), and decoding then re-encoding an opaque octet
+    /// string only adds a way to corrupt it.
+    pub port_man_cont: String,
+    /// `portNum` — TS 29.512 `TsnPortNumber`.
+    pub port_num: u32,
+}
+
+/// The TSC management containers carried between the TSCTSF, the PCF and the SMF
+/// (TS 29.514 `AppSessionContextReqData` → TS 29.512 `SmPolicyDecision`), #321.
+///
+/// The member names are IDENTICAL in both specs, which is why this one type serves
+/// both the inbound parse and the outbound build.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TscManagementContainers {
+    /// `tsnBridgeManCont.bridgeManCont` — the UMIC. Base64, for the same relay
+    /// reason as `PortManagementContainer::port_man_cont`.
+    pub bridge_man_cont: Option<String>,
+    /// `tsnPortManContDstt` — the device-side (DS-TT) port's PMIC.
+    pub port_man_cont_dstt: Option<PortManagementContainer>,
+    /// `tsnPortManContNwtts` — one per network-side (NW-TT) port. `minItems: 1`
+    /// in the schema, so an empty vector means "absent" and is not serialised.
+    pub port_man_cont_nwtts: Vec<PortManagementContainer>,
+    /// `tscNotifUri` — where TSC management notifications should be sent.
+    pub notif_uri: Option<String>,
+    /// `tscNotifCorreId`.
+    pub notif_corre_id: Option<String>,
+}
+
+impl TscManagementContainers {
+    /// Whether anything TSC-related was supplied at all.
+    ///
+    /// The whole set is optional: the overwhelming majority of app sessions are
+    /// ordinary media authorisations with no TSC members, and those must not
+    /// acquire a TSC leg just because the members are now parsed.
+    pub fn is_empty(&self) -> bool {
+        self.bridge_man_cont.is_none()
+            && self.port_man_cont_dstt.is_none()
+            && self.port_man_cont_nwtts.is_empty()
+    }
+
+    /// Serialise to the TS 29.512 `SmPolicyDecision` fragment carrying these
+    /// containers to the SMF. Returns the members to merge, empty when there is
+    /// nothing to say.
+    pub fn to_decision_fragment(&self) -> serde_json::Map<String, serde_json::Value> {
+        let mut out = serde_json::Map::new();
+        if let Some(umic) = &self.bridge_man_cont {
+            out.insert(
+                "tsnBridgeManCont".to_string(),
+                serde_json::json!({ "bridgeManCont": umic }),
+            );
+        }
+        if let Some(dstt) = &self.port_man_cont_dstt {
+            out.insert(
+                "tsnPortManContDstt".to_string(),
+                serde_json::json!({
+                    "portManCont": dstt.port_man_cont,
+                    "portNum": dstt.port_num,
+                }),
+            );
+        }
+        if !self.port_man_cont_nwtts.is_empty() {
+            out.insert(
+                "tsnPortManContNwtts".to_string(),
+                serde_json::Value::Array(
+                    self.port_man_cont_nwtts
+                        .iter()
+                        .map(|p| {
+                            serde_json::json!({
+                                "portManCont": p.port_man_cont,
+                                "portNum": p.port_num,
+                            })
+                        })
+                        .collect(),
+                ),
+            );
+        }
+        if let Some(uri) = &self.notif_uri {
+            out.insert("tscNotifUri".to_string(), serde_json::json!(uri));
+        }
+        if let Some(id) = &self.notif_corre_id {
+            out.insert("tscNotifCorreId".to_string(), serde_json::json!(id));
+        }
+        out
+    }
 }
 
 /// Media Component
@@ -411,14 +511,21 @@ pub fn af_pcc_rules_to_decision(rules: &[AfPccRule]) -> (serde_json::Value, serd
 /// Build the SmPolicyNotification body that pushes the AF-derived PCC rules
 /// stored on a session to the SMF (TS 29.512 §4.2.3.2). Used by the outbound
 /// `pcf_sbi_send_af_smpolicycontrol_update_notify` path.
+///
+/// #321: also carries the TSC management containers, which is the PCF → SMF hop of
+/// 5GS-TSN. TS 29.512's `SmPolicyDecision` defines `tsnBridgeManCont`,
+/// `tsnPortManContDstt` and `tsnPortManContNwtts` under exactly the names
+/// TS 29.514 uses on the inbound PolicyAuthorization leg, so this is a copy and
+/// not a translation — there is no mapping step in which they could be corrupted.
 pub fn build_af_sm_policy_notification(sess: &PcfSess) -> serde_json::Value {
     let (pcc_rules, qos_decs) = af_pcc_rules_to_decision(&sess.af_pcc_rules);
+    let mut decision = serde_json::Map::new();
+    decision.insert("pccRules".to_string(), pcc_rules);
+    decision.insert("qosDecs".to_string(), qos_decs);
+    decision.extend(sess.tsc_containers.to_decision_fragment());
     serde_json::json!({
         "resourceUri": format!("/npcf-smpolicycontrol/v1/sm-policies/{}", sess.sm_policy_id),
-        "smPolicyDecision": {
-            "pccRules": pcc_rules,
-            "qosDecs": qos_decs,
-        },
+        "smPolicyDecision": serde_json::Value::Object(decision),
     })
 }
 
@@ -1079,5 +1186,96 @@ mod tests {
         assert!(is_serving_plmn_vplmn("001", "99"));
         // Absent serving PLMN → home (false), preserving the H-PCF default.
         assert!(!is_serving_plmn_vplmn("", ""));
+    }
+    // ------------------------------------------------------------------
+    // TSC container relay to the SMF (#321)
+    // ------------------------------------------------------------------
+
+    /// Criterion 5's PCF half: the containers a TSN AF supplied reach the SMF in the
+    /// `SmPolicyDecision`, under the TS 29.512 member names.
+    ///
+    /// Asserted on the built JSON, and on the exact member NAMES: TS 29.512 and
+    /// TS 29.514 spell these identically, which is what makes the PCF a copier
+    /// rather than a translator — and a renamed member here would silently produce a
+    /// decision the SMF's parser skips.
+    #[test]
+    fn test_tsc_containers_reach_the_sm_policy_decision() {
+        let mut sess = PcfSess::new(7, 1, 5);
+        sess.tsc_containers = TscManagementContainers {
+            bridge_man_cont: Some("dW1pYw==".to_string()), // "umic"
+            port_man_cont_dstt: Some(PortManagementContainer {
+                port_man_cont: "ZHN0dA==".to_string(), // "dstt"
+                port_num: 1,
+            }),
+            port_man_cont_nwtts: vec![PortManagementContainer {
+                port_man_cont: "bnd0dA==".to_string(), // "nwtt"
+                port_num: 7,
+            }],
+            notif_uri: Some("http://tsctsf.example/notify".to_string()),
+            notif_corre_id: Some("corr-1".to_string()),
+        };
+
+        let body = build_af_sm_policy_notification(&sess);
+        let dec = &body["smPolicyDecision"];
+
+        assert_eq!(
+            dec["tsnBridgeManCont"]["bridgeManCont"], "dW1pYw==",
+            "the UMIC travels under tsnBridgeManCont.bridgeManCont"
+        );
+        assert_eq!(dec["tsnPortManContDstt"]["portManCont"], "ZHN0dA==");
+        assert_eq!(
+            dec["tsnPortManContDstt"]["portNum"], 1,
+            "portNum is REQUIRED alongside portManCont (TS 29.512 PortManagementContainer)"
+        );
+        assert_eq!(dec["tsnPortManContNwtts"][0]["portManCont"], "bnd0dA==");
+        assert_eq!(dec["tsnPortManContNwtts"][0]["portNum"], 7);
+        assert_eq!(dec["tscNotifUri"], "http://tsctsf.example/notify");
+        assert_eq!(dec["tscNotifCorreId"], "corr-1");
+
+        // The PCC-rule half of the same decision is untouched, so a session with
+        // both an AF media authorisation and a TSC one gets ONE notification
+        // carrying both rather than two each missing half.
+        assert!(dec.get("pccRules").is_some());
+        assert!(dec.get("qosDecs").is_some());
+    }
+
+    /// A session with no TSC authorisation produces a decision with NO TSC members,
+    /// so every ordinary AF notification is byte-identical to before #321.
+    #[test]
+    fn test_no_tsc_containers_adds_no_members() {
+        let sess = PcfSess::new(8, 1, 5);
+        let body = build_af_sm_policy_notification(&sess);
+        let dec = &body["smPolicyDecision"];
+        for member in [
+            "tsnBridgeManCont",
+            "tsnPortManContDstt",
+            "tsnPortManContNwtts",
+            "tscNotifUri",
+            "tscNotifCorreId",
+        ] {
+            assert!(
+                dec.get(member).is_none(),
+                "{member} must be absent, not null: TS 29.512 members are optional \
+                 and a null would be a value the SMF has to interpret"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tsc_containers_is_empty_ignores_notification_members_only() {
+        // notifUri alone is not a configuration: a TSCTSF that sent only a callback
+        // has authorised nothing to apply, so this must not count as TSC-carrying or
+        // the SMF would be sent an empty modification.
+        let notif_only = TscManagementContainers {
+            notif_uri: Some("http://x/y".to_string()),
+            ..Default::default()
+        };
+        assert!(notif_only.is_empty());
+
+        let with_umic = TscManagementContainers {
+            bridge_man_cont: Some("dW1pYw==".to_string()),
+            ..Default::default()
+        };
+        assert!(!with_umic.is_empty());
     }
 }

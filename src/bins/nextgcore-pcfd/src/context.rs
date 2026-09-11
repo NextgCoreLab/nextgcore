@@ -521,6 +521,17 @@ pub struct PcfSess {
     /// `access_type`.
     #[serde(default)]
     pub policy_dnn_data: Option<serde_json::Value>,
+    /// The TSC management containers an AF (in practice the TSCTSF) supplied for
+    /// this PDU session over `Npcf_PolicyAuthorization`, held for onward delivery
+    /// to the SMF in the SM policy decision (#321, TS 23.502 Annex F.1).
+    ///
+    /// Stored on the SESSION rather than the app session because that is what the
+    /// SM policy notification is keyed on, and because a later app-session modify
+    /// replacing the containers must replace what the SMF will next be told rather
+    /// than add to it. `#[serde(default)]` for the same snapshot reason as
+    /// `access_type`.
+    #[serde(default)]
+    pub tsc_containers: crate::npcf_handler::TscManagementContainers,
 }
 
 impl PcfSess {
@@ -552,6 +563,7 @@ impl PcfSess {
             af_pcc_rules: Vec::new(),
             access_type: None,
             policy_dnn_data: None,
+            tsc_containers: Default::default(),
         }
     }
 
