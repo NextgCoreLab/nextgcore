@@ -695,6 +695,36 @@ async fn update_session_stats() {
     // period checks as well.
 }
 
+/// Build a data-plane PDR from a wire-parsed Create/Update PDR.
+///
+/// Extracted by #306 so the establishment path and the modification path install
+/// PDRs through ONE builder. They were about to be two, and two builders for one
+/// rule is how the SDF-filter compilation (or the QFI, or the precedence) ends up
+/// present on one path and missing on the other.
+fn data_plane_pdr_from_parsed(p: &crate::n4_build::ParsedCreatePdr) -> data_plane::DataPlanePdr {
+    // Compile SDF filter's flow description into an IpfwRule
+    let sdf_rule = p.pdi.sdf_flow_description.as_ref().and_then(|desc| {
+        match nextgcore_ipfw::compile_rule(desc) {
+            Ok(rule) => Some(rule),
+            Err(e) => {
+                log::warn!("Failed to compile SDF filter '{desc}': {e}");
+                None
+            }
+        }
+    });
+    data_plane::DataPlanePdr {
+        pdr_id: p.pdr_id,
+        precedence: p.precedence,
+        source_interface: p.pdi.source_interface,
+        far_id: p.far_id,
+        qer_id: p.qer_id,
+        urr_ids: p.urr_ids.clone(),
+        outer_header_removal: p.outer_header_removal,
+        sdf_rule,
+        qfi: p.pdi.qfi,
+    }
+}
+
 /// Handle PFCP session events (connect PFCP to data plane)
 async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
     use data_plane::{
@@ -742,35 +772,8 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                 if let Some(session) = data_plane.sessions.find_by_seid(upf_seid) {
                     // Install PDRs from PFCP (replace defaults if provided)
                     if !pdrs.is_empty() {
-                        let mut dp_pdrs: Vec<DataPlanePdr> = pdrs
-                            .iter()
-                            .map(|p| {
-                                // Compile SDF filter's flow description into an IpfwRule
-                                let sdf_rule =
-                                    p.pdi.sdf_flow_description.as_ref().and_then(|desc| {
-                                        match nextgcore_ipfw::compile_rule(desc) {
-                                            Ok(rule) => Some(rule),
-                                            Err(e) => {
-                                                log::warn!(
-                                                    "Failed to compile SDF filter '{desc}': {e}"
-                                                );
-                                                None
-                                            }
-                                        }
-                                    });
-                                DataPlanePdr {
-                                    pdr_id: p.pdr_id,
-                                    precedence: p.precedence,
-                                    source_interface: p.pdi.source_interface,
-                                    far_id: p.far_id,
-                                    qer_id: p.qer_id,
-                                    urr_ids: p.urr_ids.clone(),
-                                    outer_header_removal: p.outer_header_removal,
-                                    sdf_rule,
-                                    qfi: p.pdi.qfi,
-                                }
-                            })
-                            .collect();
+                        let mut dp_pdrs: Vec<DataPlanePdr> =
+                            pdrs.iter().map(data_plane_pdr_from_parsed).collect();
                         dp_pdrs.sort_by_key(|p| p.precedence);
                         *session.pdrs.write().unwrap() = dp_pdrs;
                     }
@@ -854,11 +857,17 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                     if !urrs.is_empty() {
                         let mut dp_urrs = std::collections::HashMap::new();
                         for u in &urrs {
-                            let mut urr = DataPlaneUrr::new(u.urr_id);
-                            urr.volume_threshold_total = u.volume_threshold_total;
-                            urr.volume_threshold_ul = u.volume_threshold_ul;
-                            urr.volume_threshold_dl = u.volume_threshold_dl;
-                            urr.time_threshold_secs = u.time_threshold_secs;
+                            let urr = DataPlaneUrr::new(u.urr_id);
+                            urr.set_reporting(
+                                u.volume_threshold_total,
+                                u.volume_threshold_ul,
+                                u.volume_threshold_dl,
+                                u.time_threshold_secs,
+                                // #306: parsed from the wire since the Measurement
+                                // Period IE is; before that the PERIO trigger flag
+                                // arrived with no cadence behind it.
+                                u.measurement_period_secs,
+                            );
                             dp_urrs.insert(u.urr_id, Arc::new(urr));
                         }
                         *session.urrs.write().unwrap() = dp_urrs;
@@ -878,8 +887,18 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
             upf_seid,
             dl_teid,
             gnb_addr,
+            removed_pdr_ids,
+            removed_far_ids,
+            removed_qer_ids,
+            removed_urr_ids,
+            created_pdrs,
+            created_fars,
+            created_qers,
+            created_urrs,
+            updated_pdrs,
             updated_fars,
             updated_qers,
+            updated_urrs,
             updated_bars,
             send_end_marker,
             drop_buffered,
@@ -908,9 +927,124 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
             // Update FAR rules in the data plane session
             let mut any_far_forwards = false;
             if let Some(session) = data_plane.sessions.find_by_seid(upf_seid) {
-                if !updated_fars.is_empty() {
+                // Removals first, in TS 29.244 §7.5.4's order, so a modification that
+                // removes and re-creates one rule id ends holding the NEW rule
+                // (#306). Every one of these was parsed nowhere before, so the UPF
+                // answered `RequestAccepted` and kept detecting, policing and
+                // measuring on rules the SMF believed were gone.
+                if !removed_pdr_ids.is_empty() {
+                    let mut dp_pdrs = session.pdrs.write().unwrap();
+                    let before = dp_pdrs.len();
+                    dp_pdrs.retain(|p| !removed_pdr_ids.contains(&p.pdr_id));
+                    log::info!(
+                        "Removed {} PDRs for SEID={upf_seid:#x}",
+                        before - dp_pdrs.len()
+                    );
+                }
+                if !removed_far_ids.is_empty() {
                     let mut dp_fars = session.fars.write().unwrap();
-                    for f in &updated_fars {
+                    for id in &removed_far_ids {
+                        dp_fars.remove(id);
+                    }
+                }
+                if !removed_qer_ids.is_empty() {
+                    let mut dp_qers = session.qers.write().unwrap();
+                    for id in &removed_qer_ids {
+                        dp_qers.remove(id);
+                    }
+                    log::info!(
+                        "Removed {} QERs for SEID={upf_seid:#x}: policing no longer applied",
+                        removed_qer_ids.len()
+                    );
+                }
+                if !removed_urr_ids.is_empty() {
+                    // The residual volume has already been reported in the Session
+                    // Modification Response (TERMR), so dropping the rule here loses
+                    // no measurement. Dropping the `Arc` is what stops the counters:
+                    // `urr_record`'s only route to them is this map.
+                    let mut dp_urrs = session.urrs.write().unwrap();
+                    for id in &removed_urr_ids {
+                        dp_urrs.remove(id);
+                    }
+                    log::info!(
+                        "Removed {} URRs for SEID={upf_seid:#x}: measurement stopped",
+                        removed_urr_ids.len()
+                    );
+                }
+
+                // Creates: rules added to a session that is already running.
+                // Provisioning charging mid-session is the normal way it is added.
+                if !created_pdrs.is_empty() {
+                    let mut dp_pdrs = session.pdrs.write().unwrap();
+                    for p in &created_pdrs {
+                        dp_pdrs.retain(|e| e.pdr_id != p.pdr_id);
+                        dp_pdrs.push(data_plane_pdr_from_parsed(p));
+                    }
+                    // The fast path takes the first match, so precedence order is
+                    // load-bearing rather than cosmetic (lower value wins).
+                    dp_pdrs.sort_by_key(|p| p.precedence);
+                }
+                if !created_urrs.is_empty() {
+                    let mut dp_urrs = session.urrs.write().unwrap();
+                    for u in &created_urrs {
+                        let urr = DataPlaneUrr::new(u.urr_id);
+                        urr.set_reporting(
+                            u.volume_threshold_total,
+                            u.volume_threshold_ul,
+                            u.volume_threshold_dl,
+                            u.time_threshold_secs,
+                            u.measurement_period_secs,
+                        );
+                        dp_urrs.insert(u.urr_id, Arc::new(urr));
+                    }
+                    log::info!(
+                        "Created {} URRs for SEID={upf_seid:#x}: measurement provisioned",
+                        created_urrs.len()
+                    );
+                }
+                if !updated_urrs.is_empty() {
+                    // Re-threshold IN PLACE. Rebuilding the rule would zero the
+                    // volume measured so far, which the CP function is accounting on
+                    // — a wrong bill rather than a lost setting.
+                    let dp_urrs = session.urrs.read().unwrap();
+                    for u in &updated_urrs {
+                        match dp_urrs.get(&u.urr_id) {
+                            Some(urr) => urr.set_reporting(
+                                u.volume_threshold_total,
+                                u.volume_threshold_ul,
+                                u.volume_threshold_dl,
+                                u.time_threshold_secs,
+                                u.measurement_period_secs,
+                            ),
+                            // Unreachable in practice: the handler refuses an Update
+                            // for a rule the session does not hold, so this arm means
+                            // the two stores have diverged. Logged rather than
+                            // silently created, because inventing the rule here would
+                            // hide that divergence.
+                            None => log::warn!(
+                                "Update URR {} applied to no rule on SEID {upf_seid:#x}: \
+                                 PFCP and data-plane rule sets have diverged",
+                                u.urr_id
+                            ),
+                        }
+                    }
+                }
+                if !updated_pdrs.is_empty() {
+                    let mut dp_pdrs = session.pdrs.write().unwrap();
+                    for p in &updated_pdrs {
+                        dp_pdrs.retain(|e| e.pdr_id != p.pdr_id);
+                        dp_pdrs.push(data_plane_pdr_from_parsed(p));
+                    }
+                    dp_pdrs.sort_by_key(|p| p.precedence);
+                }
+
+                // Create FAR and Update FAR install the same shape, so they run
+                // through one loop.
+                let far_writes: Vec<&crate::n4_build::ParsedCreateFar> =
+                    created_fars.iter().chain(updated_fars.iter()).collect();
+                if !far_writes.is_empty() {
+                    let mut dp_fars = session.fars.write().unwrap();
+                    for f in &far_writes {
                         let ohc_teid = f
                             .forwarding_parameters
                             .as_ref()
@@ -938,12 +1072,14 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                             },
                         );
                     }
-                    log::info!("Updated {} FARs for SEID={upf_seid:#x}", updated_fars.len());
+                    log::info!("Installed {} FARs for SEID={upf_seid:#x}", far_writes.len());
                 }
 
-                if !updated_qers.is_empty() {
+                let qer_writes: Vec<&crate::n4_build::ParsedCreateQer> =
+                    created_qers.iter().chain(updated_qers.iter()).collect();
+                if !qer_writes.is_empty() {
                     let mut dp_qers = session.qers.write().unwrap();
-                    for q in &updated_qers {
+                    for q in &qer_writes {
                         let mut qer = DataPlaneQer::new(q.qer_id);
                         // Reflective QoS / paging policy the SMF asked for.
                         // Parsed since #81; previously decoded nowhere, so a
@@ -965,7 +1101,7 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                         }
                         dp_qers.insert(q.qer_id, qer);
                     }
-                    log::info!("Updated {} QERs for SEID={upf_seid:#x}", updated_qers.len());
+                    log::info!("Installed {} QERs for SEID={upf_seid:#x}", qer_writes.len());
                 }
 
                 if !updated_bars.is_empty() {

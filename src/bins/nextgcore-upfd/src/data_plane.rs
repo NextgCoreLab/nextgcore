@@ -1118,15 +1118,43 @@ impl DataPlaneQer {
     }
 }
 
+/// Sentinel for "no volume threshold provisioned" in [`DataPlaneUrr`]'s atomic
+/// threshold slots (#306).
+///
+/// The thresholds have to be mutable in place, because TS 29.244 Table 7.5.4.1-1's
+/// Update URR re-thresholds a LIVE rule and must not disturb the volume already
+/// measured against it — so they cannot stay plain `Option<u64>` behind the `Arc`
+/// the data plane holds. An atomic with a sentinel is preferred to a lock because
+/// `record` runs per packet.
+///
+/// `u64::MAX` and not `0`: a zero-byte volume threshold is a threshold that is
+/// already met, which is a meaningful (if useless) provisioning, whereas 16 exabytes
+/// is not reachable. Confusing the two would silently turn "measure without a
+/// threshold" into "report on the first packet".
+pub const NO_VOLUME_THRESHOLD: u64 = u64::MAX;
+
+/// Sentinel for "no time threshold / measurement period provisioned".
+///
+/// `0` is safe here where it is not for volume: TS 29.244 §8.2.32 states the Time
+/// Threshold as a duration after which the UP function shall report, and a zero
+/// duration has no reading that differs from "not provisioned".
+pub const NO_TIME_THRESHOLD: u32 = 0;
+
 /// Lightweight URR for usage reporting in the data plane
 #[derive(Debug)]
 pub struct DataPlaneUrr {
     pub urr_id: u32,
-    pub volume_threshold_total: Option<u64>,
-    pub volume_threshold_ul: Option<u64>,
-    pub volume_threshold_dl: Option<u64>,
-    pub time_threshold_secs: Option<u32>,
-    pub measurement_period_secs: Option<u32>,
+    /// Volume thresholds, in bytes. [`NO_VOLUME_THRESHOLD`] means unprovisioned.
+    /// Atomic so an Update URR can re-threshold without rebuilding the rule and
+    /// losing its counters — read through [`Self::volume_threshold_total`] and
+    /// friends rather than directly.
+    volume_threshold_total_raw: AtomicU64,
+    volume_threshold_ul_raw: AtomicU64,
+    volume_threshold_dl_raw: AtomicU64,
+    /// Time threshold and measurement period, in seconds. [`NO_TIME_THRESHOLD`]
+    /// means unprovisioned.
+    time_threshold_secs_raw: std::sync::atomic::AtomicU32,
+    measurement_period_secs_raw: std::sync::atomic::AtomicU32,
     /// Accumulated volume since last report
     pub acc_total_bytes: AtomicU64,
     pub acc_ul_bytes: AtomicU64,
@@ -1146,14 +1174,82 @@ pub struct DataPlaneUrr {
 }
 
 impl DataPlaneUrr {
+    /// The provisioned total-volume threshold, or `None` when unprovisioned.
+    pub fn volume_threshold_total(&self) -> Option<u64> {
+        Self::volume(&self.volume_threshold_total_raw)
+    }
+
+    /// The provisioned uplink-volume threshold, or `None`.
+    pub fn volume_threshold_ul(&self) -> Option<u64> {
+        Self::volume(&self.volume_threshold_ul_raw)
+    }
+
+    /// The provisioned downlink-volume threshold, or `None`.
+    pub fn volume_threshold_dl(&self) -> Option<u64> {
+        Self::volume(&self.volume_threshold_dl_raw)
+    }
+
+    /// The provisioned time threshold in seconds, or `None`.
+    pub fn time_threshold_secs(&self) -> Option<u32> {
+        Self::secs(&self.time_threshold_secs_raw)
+    }
+
+    /// The provisioned measurement period in seconds, or `None`.
+    pub fn measurement_period_secs(&self) -> Option<u32> {
+        Self::secs(&self.measurement_period_secs_raw)
+    }
+
+    fn volume(slot: &AtomicU64) -> Option<u64> {
+        match slot.load(Ordering::Relaxed) {
+            NO_VOLUME_THRESHOLD => None,
+            v => Some(v),
+        }
+    }
+
+    fn secs(slot: &std::sync::atomic::AtomicU32) -> Option<u32> {
+        match slot.load(Ordering::Relaxed) {
+            NO_TIME_THRESHOLD => None,
+            v => Some(v),
+        }
+    }
+
+    /// Install this URR's reporting triggers, replacing whatever was provisioned
+    /// before and **leaving every counter alone** (TS 29.244 Table 7.5.4.1-1, #306).
+    ///
+    /// That is the whole reason the thresholds are atomic: an Update URR re-thresholds
+    /// a rule that is already measuring, and the CP function's own accounting assumes
+    /// the volume measured so far survives. Rebuilding the rule would silently zero it,
+    /// which is a wrong bill rather than a lost setting.
+    pub fn set_reporting(
+        &self,
+        volume_total: Option<u64>,
+        volume_ul: Option<u64>,
+        volume_dl: Option<u64>,
+        time_threshold_secs: Option<u32>,
+        measurement_period_secs: Option<u32>,
+    ) {
+        let vol = |v: Option<u64>| v.unwrap_or(NO_VOLUME_THRESHOLD);
+        let sec = |v: Option<u32>| v.unwrap_or(NO_TIME_THRESHOLD);
+        self.volume_threshold_total_raw
+            .store(vol(volume_total), Ordering::Relaxed);
+        self.volume_threshold_ul_raw
+            .store(vol(volume_ul), Ordering::Relaxed);
+        self.volume_threshold_dl_raw
+            .store(vol(volume_dl), Ordering::Relaxed);
+        self.time_threshold_secs_raw
+            .store(sec(time_threshold_secs), Ordering::Relaxed);
+        self.measurement_period_secs_raw
+            .store(sec(measurement_period_secs), Ordering::Relaxed);
+    }
+
     pub fn new(urr_id: u32) -> Self {
         Self {
             urr_id,
-            volume_threshold_total: None,
-            volume_threshold_ul: None,
-            volume_threshold_dl: None,
-            time_threshold_secs: None,
-            measurement_period_secs: None,
+            volume_threshold_total_raw: AtomicU64::new(NO_VOLUME_THRESHOLD),
+            volume_threshold_ul_raw: AtomicU64::new(NO_VOLUME_THRESHOLD),
+            volume_threshold_dl_raw: AtomicU64::new(NO_VOLUME_THRESHOLD),
+            time_threshold_secs_raw: std::sync::atomic::AtomicU32::new(NO_TIME_THRESHOLD),
+            measurement_period_secs_raw: std::sync::atomic::AtomicU32::new(NO_TIME_THRESHOLD),
             acc_total_bytes: AtomicU64::new(0),
             acc_ul_bytes: AtomicU64::new(0),
             acc_dl_bytes: AtomicU64::new(0),
@@ -1180,7 +1276,7 @@ impl DataPlaneUrr {
         if is_uplink {
             let ul = self.acc_ul_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
             self.acc_ul_pkts.fetch_add(1, Ordering::Relaxed);
-            if let Some(thresh) = self.volume_threshold_ul {
+            if let Some(thresh) = self.volume_threshold_ul() {
                 if ul >= thresh {
                     self.threshold_exceeded.store(true, Ordering::Relaxed);
                     return true;
@@ -1189,7 +1285,7 @@ impl DataPlaneUrr {
         } else {
             let dl = self.acc_dl_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
             self.acc_dl_pkts.fetch_add(1, Ordering::Relaxed);
-            if let Some(thresh) = self.volume_threshold_dl {
+            if let Some(thresh) = self.volume_threshold_dl() {
                 if dl >= thresh {
                     self.threshold_exceeded.store(true, Ordering::Relaxed);
                     return true;
@@ -1206,7 +1302,7 @@ impl DataPlaneUrr {
         }
 
         // Check total volume threshold
-        if let Some(thresh) = self.volume_threshold_total {
+        if let Some(thresh) = self.volume_threshold_total() {
             if total >= thresh {
                 self.threshold_exceeded.store(true, Ordering::Relaxed);
                 return true;
@@ -1214,7 +1310,7 @@ impl DataPlaneUrr {
         }
 
         // Check time threshold
-        if let Some(time_thresh) = self.time_threshold_secs {
+        if let Some(time_thresh) = self.time_threshold_secs() {
             let report_time = self.last_report_time.read().unwrap();
             if let Some(last) = *report_time {
                 if last.elapsed().as_secs() >= time_thresh as u64 {
@@ -2855,7 +2951,7 @@ impl DataPlane {
             // Also check time-based thresholds (measurement period)
             for (urr_id, urr) in urrs.iter() {
                 if !urr.threshold_exceeded.load(Ordering::Relaxed) {
-                    if let Some(period) = urr.measurement_period_secs {
+                    if let Some(period) = urr.measurement_period_secs() {
                         let last_report = urr.last_report_time.read().unwrap();
                         if let Some(last) = *last_report {
                             if last.elapsed().as_secs() >= period as u64 {

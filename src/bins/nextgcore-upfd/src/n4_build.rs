@@ -125,6 +125,11 @@ pub mod pfcp_ie {
     pub const NODE_ID: u16 = 60;
     pub const MEASUREMENT_METHOD: u16 = 62;
     pub const USAGE_REPORT_TRIGGER: u16 = 63;
+    /// TS 29.244 §8.2.37. Parsed since #306: the PERIO reporting-trigger FLAG was
+    /// parsed and the period itself was not, so a periodic URR was provisioned with
+    /// no cadence and `DataPlaneUrr::measurement_period_secs`'s only reader could
+    /// never fire.
+    pub const MEASUREMENT_PERIOD: u16 = 64;
     pub const VOLUME_MEASUREMENT: u16 = 66;
     pub const DURATION_MEASUREMENT: u16 = 67;
     pub const TIME_OF_FIRST_PACKET: u16 = 69;
@@ -749,6 +754,21 @@ pub fn build_session_establishment_response(
 /// Build Session Modification Response
 /// Port of upf_n4_build_session_modification_response
 pub fn build_session_modification_response(msg_type: u8, created_pdrs: &[CreatedPdr]) -> Vec<u8> {
+    build_session_modification_response_with_reports(msg_type, created_pdrs, &[])
+}
+
+/// Build Session Modification Response, optionally carrying Usage Reports.
+///
+/// The carrier is IE 78 (`USAGE_REPORT_SMR`) — the Session-Modification-Response
+/// spelling of the Usage Report, distinct from the 79/80 the Deletion Response and
+/// Report Request use. #306 needs it so a Remove URR can report the volume it
+/// measured before the rule is detached, and so QAURR can be honoured; the constant
+/// and `add_usage_report`'s carrier parameter were both already here, with no caller.
+pub fn build_session_modification_response_with_reports(
+    msg_type: u8,
+    created_pdrs: &[CreatedPdr],
+    usage_reports: &[UsageReport],
+) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
 
     // Cause - Request Accepted
@@ -757,6 +777,10 @@ pub fn build_session_modification_response(msg_type: u8, created_pdrs: &[Created
     // Created PDRs
     for pdr in created_pdrs {
         builder.add_created_pdr(pdr);
+    }
+
+    for report in usage_reports {
+        builder.add_usage_report(report, pfcp_ie::USAGE_REPORT_SMR);
     }
 
     let _ = msg_type;
@@ -1649,6 +1673,18 @@ pub fn parse_create_urr(data: &[u8]) -> Result<ParsedCreateUrr, &'static str> {
         }
     }
 
+    // Measurement Period (IE type 64) - u32 seconds, the PERIO trigger's cadence
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::MEASUREMENT_PERIOD) {
+        if ie.value.len() >= 4 {
+            urr.measurement_period_secs = Some(u32::from_be_bytes([
+                ie.value[0],
+                ie.value[1],
+                ie.value[2],
+                ie.value[3],
+            ]));
+        }
+    }
+
     Ok(urr)
 }
 
@@ -1665,6 +1701,8 @@ pub struct ParsedCreateUrr {
     pub volume_threshold_ul: Option<u64>,
     pub volume_threshold_dl: Option<u64>,
     pub time_threshold_secs: Option<u32>,
+    /// Measurement Period (IE type 64), the PERIO trigger's cadence.
+    pub measurement_period_secs: Option<u32>,
 }
 
 /// Parsed Node ID
