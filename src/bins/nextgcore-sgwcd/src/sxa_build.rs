@@ -372,6 +372,80 @@ pub fn build_session_report_response(sess: &SgwcSess, cause: u8) -> Option<PfcpM
 ///
 /// The PDR matches inbound traffic on the tunnel's own F-TEID and strips the GTP-U
 /// header; the FAR forwards it to the peer endpoint, or buffers when there is not one yet.
+/// Build the Session Modification that installs the indirect data-forwarding rules
+/// (#48, TS 23.401 §5.5.1.2).
+///
+/// One Create PDR / Create FAR pair per forwarding tunnel. The direction mapping is the
+/// forwarding path's, not the serving path's:
+///
+/// - the DL forwarding tunnel receives from the SOURCE eNB (ACCESS) and forwards to the
+///   TARGET eNB (also ACCESS) -- both ends are radio, which is what makes indirect
+///   forwarding an eNB-to-eNB relay through the SGW-U rather than a core-bound path;
+/// - the UL forwarding tunnel is the mirror.
+///
+/// So both PDI source and FAR destination are ACCESS, unlike every other rule this
+/// module builds. Getting that wrong would send forwarded user data out of the SGi
+/// interface.
+pub fn build_indirect_forwarding_rules(sess: &SgwcSess, bearer_ids: &[u64]) -> Option<PfcpMessage> {
+    let ctx = sgwc_self();
+
+    let mut msg = PfcpMessage::new(pfcp_type::SESSION_MODIFICATION_REQUEST, sess.sgwu_sxa_seid);
+    let mut req = LibSessionModificationRequest::new();
+    let mut rules = 0usize;
+
+    for bearer_id in bearer_ids {
+        let Some(bearer) = ctx.bearer_find_by_id(*bearer_id) else {
+            continue;
+        };
+        for tunnel_id in &bearer.tunnel_ids {
+            let Some(tunnel) = ctx.tunnel_find_by_id(*tunnel_id) else {
+                continue;
+            };
+            if !matches!(
+                tunnel.interface_type,
+                crate::context::gtp_interface::SGW_GTP_U_DL_DATA_FORWARDING
+                    | crate::context::gtp_interface::SGW_GTP_U_UL_DATA_FORWARDING
+            ) {
+                continue;
+            }
+            let mut create = LibSessionEstablishmentRequest::new(
+                NodeId::new_ipv4([0, 0, 0, 0]),
+                FSeid::new_ipv4(0, [0, 0, 0, 0]),
+            );
+            push_create_rules(
+                &mut create,
+                &tunnel,
+                pfcp_interface::ACCESS,
+                pfcp_interface::ACCESS,
+            );
+            rules += create.create_pdrs.len();
+            req.create_pdrs.extend(create.create_pdrs);
+            req.create_fars.extend(create.create_fars);
+        }
+    }
+
+    // No rules means no forwarding tunnel had a usable PDR id, so there is nothing to
+    // install. Sending an empty modification would be answered `REQUEST_ACCEPTED` and
+    // would gate the S11 answer on a message that provisioned nothing.
+    if rules == 0 {
+        log::error!(
+            "No indirect forwarding rules to install for session {}",
+            sess.id
+        );
+        return None;
+    }
+
+    let mut body = BytesMut::new();
+    req.encode(&mut body);
+    msg.data = body.to_vec();
+    log::debug!(
+        "Built indirect forwarding Session Modification: seid=0x{:x}, rules={rules}, len={}",
+        msg.seid,
+        msg.data.len()
+    );
+    Some(msg)
+}
+
 fn push_create_rules(
     req: &mut LibSessionEstablishmentRequest,
     tunnel: &SgwcTunnel,

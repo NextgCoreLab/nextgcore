@@ -723,6 +723,22 @@ pub struct EnbUeRelCause {
     pub cause: i64,
 }
 
+/// The parts of a Handover Request Acknowledge a deferred Handover Command still needs.
+///
+/// Only the pieces that cannot be recovered from context: the forwarding list is
+/// rebuilt from the bearers at send time, but the target-to-source container is an
+/// opaque blob the target produced once, and the failed-E-RAB list is the target's
+/// verdict on bearers it declined.
+#[derive(Debug, Clone)]
+pub struct PendingHandoverCommand {
+    /// Handover type, as it will be echoed in the command
+    pub handover_type: nextgcore_s1ap::HandoverType,
+    /// E-RABs the target declined, to be released by the source
+    pub erab_to_release_list: Vec<nextgcore_s1ap::ErabItem>,
+    /// The target's opaque container for the source
+    pub target_to_source_container: Vec<u8>,
+}
+
 /// eNB UE context
 #[derive(Debug, Clone, Default)]
 pub struct EnbUe {
@@ -754,6 +770,37 @@ pub struct EnbUe {
     pub enb_id: u64,
     /// Related MME UE pool ID
     pub mme_ue_id: u64,
+
+    /// Whether the source eNB reported a DIRECT forwarding path to the target
+    /// (TS 36.413 §8.4.1.2), recorded on the SOURCE context from the Handover
+    /// Required.
+    ///
+    /// Set on the source rather than the target because it is the source's statement
+    /// about its own transport, and because the Handover Request Acknowledge -- where
+    /// the decision is acted on -- resolves the source through `target.source_ue_id`
+    /// anyway. `false` (the `Default`) means indirect forwarding through the Serving
+    /// GW, which is the correct reading of an ABSENT IE (#48).
+    pub direct_forwarding_available: bool,
+
+    /// The Handover Command deferred while indirect forwarding tunnels are set up.
+    ///
+    /// Indirect forwarding needs the Serving GW's endpoints, which only the CIDFT
+    /// Response carries, so the command cannot be built when the Handover Request
+    /// Acknowledge arrives -- but the ack is the only carrier of the failed-E-RAB list
+    /// and the target-to-source container. Rather than re-derive those (which is not
+    /// possible: the container is opaque), the ack's contribution is parked here and
+    /// replayed when the response lands (#48). `None` on the direct-forwarding path,
+    /// where the command goes out immediately.
+    pub pending_handover_command: Option<PendingHandoverCommand>,
+
+    /// Deadline for a handover preparation this context is the TARGET of.
+    ///
+    /// Set when `handle_handover_required` allocates the target context; cleared on
+    /// Handover Notify, Handover Cancel and Handover Failure. On expiry the target
+    /// eNB is told to release and the context is freed -- without it a UE that never
+    /// arrives leaks an `enb_ue` per attempt (#48). `Option` rather than a sentinel
+    /// `Instant` so "no preparation outstanding" is unrepresentable as a time.
+    pub handover_prep_deadline: Option<std::time::Instant>,
 }
 
 // ============================================================================

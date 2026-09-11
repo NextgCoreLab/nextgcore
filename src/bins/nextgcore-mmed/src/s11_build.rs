@@ -273,8 +273,27 @@ use nextgcore_gtp::v2::{
 pub mod f_teid_interface {
     /// S1-U eNodeB GTP-U
     pub const S1U_ENB_GTP_U: u8 = 0;
-    /// S1-U eNodeB GTP-U for downlink data forwarding
-    pub const S1U_ENB_GTP_U_DL_FORWARDING: u8 = 4;
+    /// eNodeB/gNodeB GTP-U interface for DL data forwarding.
+    ///
+    /// #48: this constant said **4**, which TS 29.274 §8.22 defines as "S5/S8 SGW
+    /// GTP-U interface". The only user was `build_create_indirect_data_forwarding_tunnel_request`,
+    /// which itself had no caller, so the wrong value was inert -- exactly the shape
+    /// of the S_NSSAI=250 defect #321 found in `smfd`'s hand-copied IE table. Making
+    /// the CIDFT path reachable makes it live, so it is read from the spec here:
+    /// `6g_docs/specs/29274-j60.txt:27219` lists "19: eNodeB/gNodeB GTP-U interface
+    /// for DL data forwarding".
+    pub const ENB_GTP_U_DL_DATA_FORWARDING: u8 = 19;
+    /// eNodeB GTP-U interface for UL data forwarding (TS 29.274 §8.22, value 20).
+    ///
+    /// Absent before #48, so the UL half of a forwarding pair could not be expressed
+    /// at all.
+    pub const ENB_GTP_U_UL_DATA_FORWARDING: u8 = 20;
+    /// SGW/UPF GTP-U interface for DL data forwarding (TS 29.274 §8.22, value 23;
+    /// Table 7.2.19-2 NOTE 3 mandates it for the SGW's DL forwarding F-TEID).
+    pub const SGW_GTP_U_DL_DATA_FORWARDING: u8 = 23;
+    /// SGW GTP-U interface for UL data forwarding (TS 29.274 §8.22, value 28;
+    /// Table 7.2.19-2 NOTE 4).
+    pub const SGW_GTP_U_UL_DATA_FORWARDING: u8 = 28;
     /// S11 MME GTP-C
     pub const S11_MME_GTP_C: u8 = 10;
 }
@@ -348,6 +367,20 @@ fn enb_s1u_fteid(bearer: &MmeBearer, interface_type: u8) -> Option<Gtp2FTeidIe> 
         bearer.enb_s1u_teid,
         ipv4,
     ))
+}
+
+/// An F-TEID from an explicit TEID and context address, for the data-forwarding
+/// endpoints (which are NOT the bearer's serving S1-U endpoint).
+fn forwarding_fteid(
+    interface_type: u8,
+    teid: u32,
+    ip: &crate::context::IpAddr,
+) -> Option<Gtp2FTeidIe> {
+    if teid == 0 {
+        return None;
+    }
+    let ipv4 = ip.ipv4?;
+    Some(Gtp2FTeidIe::new_ipv4(interface_type, teid, ipv4))
 }
 
 /// Build Create Session Request (TS 29.274 §7.2.1)
@@ -695,13 +728,29 @@ pub fn build_create_indirect_data_forwarding_tunnel_request(
         sgw_ue.sgw_s11_teid,
         sequence_number,
     );
+    // #48: this used to send the bearer's SERVING S1-U endpoint
+    // (`bearer.enb_s1u_teid`, the SOURCE eNB's) under the wrong interface type, which
+    // asked the SGW to forward downlink data to the eNB the UE is leaving. TS 29.274
+    // Table 7.2.18-2 wants the TARGET eNodeB's DL data-forwarding F-TEID at instance
+    // 0 and its UL one at instance 4 -- the endpoints the target admits in the
+    // Handover Request Acknowledge, which `handle_handover_request_acknowledge` now
+    // records on `enb_dl_*` / `enb_ul_*`.
     for bearer in bearers {
         let mut bc = Gtp2BearerContextIe::new();
         bc.set_ebi(bearer.ebi);
-        if bearer.enb_s1u_teid != 0 {
-            if let Some(ft) = enb_s1u_fteid(bearer, f_teid_interface::S1U_ENB_GTP_U_DL_FORWARDING) {
-                bc.set_fteid(0, &ft);
-            }
+        if let Some(ft) = forwarding_fteid(
+            f_teid_interface::ENB_GTP_U_DL_DATA_FORWARDING,
+            bearer.enb_dl_teid,
+            &bearer.enb_dl_ip,
+        ) {
+            bc.set_fteid(0, &ft);
+        }
+        if let Some(ft) = forwarding_fteid(
+            f_teid_interface::ENB_GTP_U_UL_DATA_FORWARDING,
+            bearer.enb_ul_teid,
+            &bearer.enb_ul_ip,
+        ) {
+            bc.set_fteid(4, &ft);
         }
         msg.add_bearer_context(0, &bc);
     }
@@ -774,6 +823,39 @@ fn encode_apn_dns(apn: &str) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+
+    /// #48: the F-TEID interface types are wire values from TS 29.274 §8.22, read from
+    /// `6g_docs/specs/29274-j60.txt`, and two of them were WRONG while their only user
+    /// had no caller. A hand-maintained wire table cannot be kept correct by review, so
+    /// the numbers are asserted as literals against the spec clause -- the same guard
+    /// #321 added after `smfd` shipped S-NSSAI under IE 250.
+    #[test]
+    fn f_teid_interface_types_match_ts29274_clause_8_22() {
+        use super::f_teid_interface as iface;
+        assert_eq!(iface::S1U_ENB_GTP_U, 0, "0: S1-U eNodeB GTP-U interface");
+        assert_eq!(iface::S11_MME_GTP_C, 10, "10: S11 MME GTP-C interface");
+        assert_eq!(
+            iface::ENB_GTP_U_DL_DATA_FORWARDING,
+            19,
+            "19: eNodeB/gNodeB GTP-U interface for DL data forwarding (was 4, which is \
+             S5/S8 SGW GTP-U)"
+        );
+        assert_eq!(
+            iface::ENB_GTP_U_UL_DATA_FORWARDING,
+            20,
+            "20: eNodeB GTP-U interface for UL data forwarding"
+        );
+        assert_eq!(
+            iface::SGW_GTP_U_DL_DATA_FORWARDING,
+            23,
+            "23: SGW/UPF GTP-U interface for DL data forwarding (Table 7.2.19-2 NOTE 3)"
+        );
+        assert_eq!(
+            iface::SGW_GTP_U_UL_DATA_FORWARDING,
+            28,
+            "28: SGW GTP-U interface for UL data forwarding (Table 7.2.19-2 NOTE 4)"
+        );
+    }
     use super::*;
 
     #[test]

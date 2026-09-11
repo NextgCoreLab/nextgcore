@@ -438,8 +438,69 @@ pub struct HandoverRequired {
     pub cause: Cause,
     /// Target ID
     pub target_id: TargetId,
+    /// Direct Forwarding Path Availability (optional, TS 36.413 §8.4.1.2).
+    ///
+    /// Present means the source eNB has a direct X2/transport path to the target, so
+    /// the MME must NOT set up indirect forwarding through the Serving GW. Absent
+    /// means no direct path is available, which is what selects indirect forwarding.
+    /// `Direct-Forwarding-Path-Availability ::= ENUMERATED { directPathAvailable,
+    /// ... }` has exactly one root value, so its presence carries the whole meaning
+    /// -- which is why this is an `Option<()>`-shaped enum rather than a bool with a
+    /// default: "absent" and "present" are the two states, and a `bool` would invite
+    /// a caller to write `false` where the wire has no IE at all.
+    pub direct_forwarding_path_availability: Option<DirectForwardingPathAvailability>,
     /// Source to Target Transparent Container
     pub source_to_target_container: Vec<u8>,
+}
+
+/// Direct Forwarding Path Availability (TS 36.413 §9.2.1.16).
+///
+/// ASN.1: `Direct-Forwarding-Path-Availability ::= ENUMERATED { directPathAvailable,
+/// ... }` -- one root value plus an extension marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectForwardingPathAvailability {
+    /// `directPathAvailable`: the source eNB can forward straight to the target.
+    DirectPathAvailable,
+}
+
+/// eNB Status Transfer - sent by the source eNB to the MME (TS 36.413 §8.4.6).
+///
+/// Carries the PDCP SN and HFN receiver/transmitter status for each E-RAB to which
+/// PDCP-SN and HFN status preservation applies, so the target eNB can continue the
+/// RLC-AM bearers without a PDCP re-establishment. The MME's job is to relay it
+/// (§8.4.7), not to interpret it.
+#[derive(Debug, Clone)]
+pub struct EnbStatusTransfer {
+    /// MME UE S1AP ID (the SOURCE side's, since the source eNB sends this)
+    pub mme_ue_s1ap_id: u32,
+    /// eNB UE S1AP ID (the source eNB's)
+    pub enb_ue_s1ap_id: u32,
+    /// `ENB-StatusTransfer-TransparentContainer`, held as the RAW APER-encoded
+    /// open-type value of the IE rather than as a decoded structure.
+    ///
+    /// Deliberate. §8.4.6 makes this a container the MME forwards, and the whole
+    /// point of the procedure is that the PDCP SN/HFN counts reach the target
+    /// UNCHANGED. Decoding into a `Bearers-SubjectToStatusTransfer` model and
+    /// re-encoding would put a codec this tree does not need between the two eNBs,
+    /// where any modelling gap silently becomes a corrupted PDCP count -- which is
+    /// exactly the failure the procedure exists to prevent. Carrying the bytes makes
+    /// byte-preservation a property of the type rather than of a test.
+    pub status_transfer_container: Vec<u8>,
+}
+
+/// MME Status Transfer - sent by the MME to the target eNB (TS 36.413 §8.4.7).
+///
+/// The relay half of the eNB Status Transfer. Same IE set, with the ids of the
+/// TARGET eNB's UE association rather than the source's.
+#[derive(Debug, Clone)]
+pub struct MmeStatusTransfer {
+    /// MME UE S1AP ID of the TARGET association
+    pub mme_ue_s1ap_id: u32,
+    /// eNB UE S1AP ID allocated by the TARGET eNB
+    pub enb_ue_s1ap_id: u32,
+    /// The container relayed verbatim from the eNB Status Transfer. See
+    /// [`EnbStatusTransfer::status_transfer_container`].
+    pub status_transfer_container: Vec<u8>,
 }
 
 /// Handover Command - sent by MME to source eNB

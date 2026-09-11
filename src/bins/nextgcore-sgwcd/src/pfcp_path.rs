@@ -175,6 +175,20 @@ pub enum S11Continuation {
         teid: u32,
         sess_id: u64,
     },
+    /// Answer the MME's Create Indirect Data Forwarding Tunnel Request once the SGW-U
+    /// has installed the forwarding rules (#48).
+    ///
+    /// Gated for the same reason the Create Session answer is: TS 29.274 §7.2.2 makes
+    /// `Request accepted` mean the request was FULFILLED, and this response carries
+    /// F-TEIDs the source eNB is about to forward user data to. Answering before the
+    /// SGW-U has the rules would advertise a datapath that does not exist yet -- which
+    /// is the defect #48 describes, one step earlier.
+    IndirectForwarding {
+        peer: SocketAddr,
+        seq: u32,
+        teid: u32,
+        sgwc_ue_id: u64,
+    },
 }
 
 /// An outbound PFCP request queued by a synchronous caller.
@@ -878,6 +892,28 @@ pub fn send_bearer_to_modify_list(
         flags
     );
     enqueue(&msg, sess.id, S11Continuation::None)
+}
+
+/// Install the indirect data-forwarding rules on the SGW-U (#48).
+///
+/// A Session Modification carrying a Create PDR / Create FAR pair per forwarding
+/// tunnel: the PDR matches on the tunnel's own local F-TEID and the FAR forwards to the
+/// endpoint the MME gave for that direction. Without this the SGW-C allocated F-TEIDs
+/// and answered `REQUEST_ACCEPTED` while the SGW-U had no rule for them, so anything the
+/// source eNB forwarded was dropped at the user plane.
+pub fn send_indirect_forwarding_tunnels(
+    sess: &SgwcSess,
+    bearer_ids: &[u64],
+    continuation: S11Continuation,
+) -> Result<(), String> {
+    let msg = sxa_build::build_indirect_forwarding_rules(sess, bearer_ids)
+        .ok_or_else(|| "Failed to build indirect forwarding rules".to_string())?;
+    log::info!(
+        "PFCP Session Modification for indirect forwarding: sess_id={}, bearers={}",
+        sess.id,
+        bearer_ids.len()
+    );
+    enqueue(&msg, sess.id, continuation)
 }
 
 /// Send Session Deletion Request to SGW-U

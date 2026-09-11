@@ -1746,11 +1746,15 @@ fn dispatch_indirect_tunnel_request(
         return;
     };
 
+    // #48: the DECODED message, not `&[]`. The handler needs the request's Bearer
+    // Contexts to know which bearers to allocate forwarding tunnels for and where the
+    // target eNB wants the data sent; passing an empty slice is why it could only ever
+    // return a bare accept.
     let result = if create {
         s11_handler::handle_create_indirect_data_forwarding_tunnel_request(
             Some(&ue),
             seq as u64,
-            &[],
+            msg,
         )
     } else {
         s11_handler::handle_delete_indirect_data_forwarding_tunnel_request(
@@ -1763,17 +1767,26 @@ fn dispatch_indirect_tunnel_request(
     match result {
         HandlerResult::SendPfcp => {
             if create {
-                match s11_build::build_create_indirect_data_forwarding_tunnel_response(
-                    ue.id,
-                    seq,
-                    gtp_cause::REQUEST_ACCEPTED,
-                ) {
-                    Ok(response) => {
-                        if let Err(e) = server.send_response(peer, &response) {
-                            log::error!("Indirect tunnel response to {peer} failed: {e}");
-                        }
+                // #48: the answer is now GATED on the SGW-U installing the forwarding
+                // rules. It used to be built right here with a hard-coded
+                // REQUEST_ACCEPTED and no F-TEIDs, before any PFCP message existed --
+                // the same "accepted means fulfilled" violation #54 fixed for Create
+                // Session, one procedure over.
+                match install_indirect_forwarding(&ue, peer, seq) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        log::error!(
+                            "Failed to install indirect forwarding rules on the SGW-U: {e}"
+                        );
+                        send_cause_response(
+                            server,
+                            peer,
+                            response_type,
+                            ue.mme_s11_teid,
+                            seq,
+                            gtp_cause::SYSTEM_FAILURE,
+                        );
                     }
-                    Err(e) => log::error!("Failed to build indirect tunnel response: {e}"),
                 }
             } else {
                 send_cause_response(
@@ -1791,6 +1804,65 @@ fn dispatch_indirect_tunnel_request(
         }
         _ => {}
     }
+}
+
+/// Ask the SGW-U to install the forwarding rules the CIDFT handler just allocated, and
+/// gate the MME's answer on its response (#48).
+fn install_indirect_forwarding(
+    ue: &crate::context::SgwcUe,
+    peer: SocketAddr,
+    seq: u32,
+) -> Result<(), String> {
+    let ctx = sgwc_self();
+    // A UE may hold several sessions; the forwarding tunnels were allocated on the
+    // bearers of whichever session held the requested EBIs, so each session with a
+    // forwarding tunnel gets its own modification. In practice that is one.
+    let mut sent = 0usize;
+    for sess_id in &ue.sess_ids {
+        let Some(sess) = ctx.sess_find_by_id(*sess_id) else {
+            continue;
+        };
+        let bearer_ids: Vec<u64> = sess
+            .bearer_ids
+            .iter()
+            .copied()
+            .filter(|bid| has_forwarding_tunnel(&ctx, *bid))
+            .collect();
+        if bearer_ids.is_empty() {
+            continue;
+        }
+        pfcp_path::send_indirect_forwarding_tunnels(
+            &sess,
+            &bearer_ids,
+            pfcp_path::S11Continuation::IndirectForwarding {
+                peer,
+                seq,
+                teid: ue.mme_s11_teid,
+                sgwc_ue_id: ue.id,
+            },
+        )?;
+        sent += 1;
+    }
+    if sent == 0 {
+        return Err("no session carries a forwarding tunnel".to_string());
+    }
+    Ok(())
+}
+
+/// Whether a bearer carries at least one data-forwarding tunnel.
+fn has_forwarding_tunnel(ctx: &crate::context::SgwcContext, bearer_id: u64) -> bool {
+    let Some(bearer) = ctx.bearer_find_by_id(bearer_id) else {
+        return false;
+    };
+    bearer.tunnel_ids.iter().any(|tid| {
+        ctx.tunnel_find_by_id(*tid).is_some_and(|t| {
+            matches!(
+                t.interface_type,
+                crate::context::gtp_interface::SGW_GTP_U_DL_DATA_FORWARDING
+                    | crate::context::gtp_interface::SGW_GTP_U_UL_DATA_FORWARDING
+            )
+        })
+    })
 }
 
 fn dispatch_bearer_resource_command(server: &GtpcServer, msg: &Gtp2Message, peer: SocketAddr) {
@@ -3407,7 +3479,7 @@ mod tests {
     /// builder so a change to it fails here rather than only over a socket.
     #[test]
     fn version_not_supported_is_eight_octets_with_no_teid() {
-        let bytes = build_version_not_supported(0x0102_03);
+        let bytes = build_version_not_supported(0x0001_0203);
         assert_eq!(bytes.len(), 8);
         assert_eq!((bytes[0] >> 5) & 0x07, 2);
         assert_eq!(bytes[0] & 0x08, 0, "the T flag must be clear (no TEID)");

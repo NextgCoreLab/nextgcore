@@ -52,6 +52,8 @@ pub enum S1apMessage {
     PathSwitchRequestFailure(PathSwitchRequestFailure),
     HandoverCancel(HandoverCancel),
     HandoverCancelAcknowledge(HandoverCancelAcknowledge),
+    EnbStatusTransfer(EnbStatusTransfer),
+    MmeStatusTransfer(MmeStatusTransfer),
     UeCapabilityInfoIndication(UeCapabilityInfoIndication),
     EnbConfigurationUpdate(EnbConfigurationUpdate),
     EnbConfigurationUpdateAcknowledge(EnbConfigurationUpdateAcknowledge),
@@ -208,6 +210,12 @@ fn decode_initiating(
         ProcedureCode::HANDOVER_CANCEL => {
             Ok(S1apMessage::HandoverCancel(parse_handover_cancel(ies)?))
         }
+        ProcedureCode::ENB_STATUS_TRANSFER => Ok(S1apMessage::EnbStatusTransfer(
+            parse_enb_status_transfer(ies)?,
+        )),
+        ProcedureCode::MME_STATUS_TRANSFER => Ok(S1apMessage::MmeStatusTransfer(
+            parse_mme_status_transfer(ies)?,
+        )),
         ProcedureCode::UE_CAPABILITY_INFO_INDICATION => Ok(
             S1apMessage::UeCapabilityInfoIndication(parse_ue_capability_info_indication(ies)?),
         ),
@@ -1040,6 +1048,7 @@ fn parse_handover_required(container: ProtocolIeContainer) -> S1apResult<Handove
     let mut handover_type = None;
     let mut cause = None;
     let mut target_id = None;
+    let mut direct_forwarding_path_availability = None;
     let mut source_to_target_container = None;
 
     for field in &container.ies {
@@ -1059,6 +1068,10 @@ fn parse_handover_required(container: ProtocolIeContainer) -> S1apResult<Handove
             ProtocolIeId::TARGET_ID => {
                 target_id = Some(ie::decode_target_id(field)?);
             }
+            ProtocolIeId::DIRECT_FORWARDING_PATH_AVAILABILITY => {
+                direct_forwarding_path_availability =
+                    Some(ie::decode_direct_forwarding_path_availability(field)?);
+            }
             ProtocolIeId::SOURCE_TO_TARGET_TRANSPARENT_CONTAINER => {
                 source_to_target_container = Some(ie::decode_source_to_target_container(field)?);
             }
@@ -1072,10 +1085,68 @@ fn parse_handover_required(container: ProtocolIeContainer) -> S1apResult<Handove
         handover_type: handover_type.ok_or(S1apError::MissingMandatoryIe("HandoverType"))?,
         cause: cause.ok_or(S1apError::MissingMandatoryIe("Cause"))?,
         target_id: target_id.ok_or(S1apError::MissingMandatoryIe("TargetID"))?,
+        direct_forwarding_path_availability,
         source_to_target_container: source_to_target_container.ok_or(
             S1apError::MissingMandatoryIe("Source-ToTarget-TransparentContainer"),
         )?,
     })
+}
+
+/// Parse an eNB Status Transfer (TS 36.413 §9.1.5.6). All three IEs are mandatory.
+fn parse_enb_status_transfer(container: ProtocolIeContainer) -> S1apResult<EnbStatusTransfer> {
+    let (mme_ue_s1ap_id, enb_ue_s1ap_id, status_transfer_container) =
+        parse_status_transfer_ies(&container)?;
+    Ok(EnbStatusTransfer {
+        mme_ue_s1ap_id,
+        enb_ue_s1ap_id,
+        status_transfer_container,
+    })
+}
+
+/// Parse an MME Status Transfer (TS 36.413 §9.1.5.7).
+///
+/// The MME sends this, so an MME receiving one is a protocol error -- but decoding it
+/// is what lets the receiver SAY so with the right cause instead of answering
+/// "abstract syntax error" to a message it understands perfectly well. It is also what
+/// a test needs to assert the relay is byte-identical.
+fn parse_mme_status_transfer(container: ProtocolIeContainer) -> S1apResult<MmeStatusTransfer> {
+    let (mme_ue_s1ap_id, enb_ue_s1ap_id, status_transfer_container) =
+        parse_status_transfer_ies(&container)?;
+    Ok(MmeStatusTransfer {
+        mme_ue_s1ap_id,
+        enb_ue_s1ap_id,
+        status_transfer_container,
+    })
+}
+
+/// The IE set shared by §9.1.5.6 and §9.1.5.7, which is identical in both.
+fn parse_status_transfer_ies(container: &ProtocolIeContainer) -> S1apResult<(u32, u32, Vec<u8>)> {
+    let mut mme_ue_s1ap_id = None;
+    let mut enb_ue_s1ap_id = None;
+    let mut status_container = None;
+
+    for field in &container.ies {
+        match field.id {
+            ProtocolIeId::MME_UE_S1AP_ID => {
+                mme_ue_s1ap_id = Some(ie::decode_mme_ue_s1ap_id(field)?);
+            }
+            ProtocolIeId::ENB_UE_S1AP_ID => {
+                enb_ue_s1ap_id = Some(ie::decode_enb_ue_s1ap_id(field)?);
+            }
+            ProtocolIeId::ENB_STATUS_TRANSFER_TRANSPARENT_CONTAINER => {
+                status_container = Some(ie::decode_enb_status_transfer_container(field)?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok((
+        mme_ue_s1ap_id.ok_or(S1apError::MissingMandatoryIe("MME-UE-S1AP-ID"))?,
+        enb_ue_s1ap_id.ok_or(S1apError::MissingMandatoryIe("eNB-UE-S1AP-ID"))?,
+        status_container.ok_or(S1apError::MissingMandatoryIe(
+            "eNB-StatusTransfer-TransparentContainer",
+        ))?,
+    ))
 }
 
 fn parse_handover_command(container: ProtocolIeContainer) -> S1apResult<HandoverCommand> {

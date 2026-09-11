@@ -108,6 +108,27 @@ pub struct CreateSessionResponseData {
     pub epco: Option<Vec<u8>>,
 }
 
+/// One bearer's forwarding endpoints from a Create Indirect Data Forwarding Tunnel
+/// Response (TS 29.274 Table 7.2.19-2).
+#[derive(Debug, Clone, Default)]
+pub struct IndirectForwardingBearer {
+    pub ebi: u8,
+    pub cause: u8,
+    /// SGW DL data-forwarding TEID (instance 0 or 3, interface type 23)
+    pub sgw_dl_teid: u32,
+    pub sgw_dl_ipv4: Option<[u8; 4]>,
+    /// SGW UL data-forwarding TEID (instance 4 or 5, interface type 28)
+    pub sgw_ul_teid: u32,
+    pub sgw_ul_ipv4: Option<[u8; 4]>,
+}
+
+/// A parsed Create Indirect Data Forwarding Tunnel Response.
+#[derive(Debug, Clone, Default)]
+pub struct CreateIndirectTunnelResponseData {
+    pub cause: u8,
+    pub bearers: Vec<IndirectForwardingBearer>,
+}
+
 /// Bearer context created
 #[derive(Debug, Clone, Default)]
 pub struct BearerContextCreated {
@@ -270,6 +291,20 @@ pub fn dispatch_triggered(raw: &[u8], msg_type: u8, sequence_number: u32, peer: 
                 log::error!("S11 Release Access Bearers Response from {peer} unparsable: {e:?}")
             }
         },
+        mt::CREATE_INDIRECT_DATA_FORWARDING_TUNNEL_RESPONSE => {
+            match handle_create_indirect_tunnel_response(raw) {
+                Ok(data) => {
+                    let local_teid = parse_gtp_header(raw)
+                        .map(|(_, teid, _, _)| teid)
+                        .unwrap_or(0);
+                    apply_indirect_forwarding_response(&data, local_teid, peer)
+                }
+                Err(e) => log::error!(
+                    "S11 Create Indirect Data Forwarding Tunnel Response from {peer} \
+                     unparsable: {e:?}"
+                ),
+            }
+        }
         other => log::info!(
             "S11 triggered message type={other} seq={sequence_number} from {peer} correlated but \
              not acted on: this MME has no handler for it"
@@ -859,6 +894,246 @@ pub fn handle_delete_session_response(data: &[u8]) -> S11Result<DeleteSessionRes
 }
 
 /// Handle Release Access Bearers Response
+/// Parse a Create Indirect Data Forwarding Tunnel Response (TS 29.274 §7.2.19).
+///
+/// The SGW's forwarding endpoints are keyed by INSTANCE, per Table 7.2.19-2: DL at
+/// instance 0 (S1-U) or 3 (target-selected SGW), UL at 4 (S1-U) or 5 (SGW). NOTE 3 and
+/// NOTE 4 also fix the interface types at 23 for DL and 28 for UL, and both are
+/// checked -- an F-TEID whose instance says "UL" and whose interface type says "DL" is
+/// contradictory, and taking the instance's word for it would install a forwarding rule
+/// in the wrong direction. NOTE 1/NOTE 2 permit the SGW to send SEVERAL instances when
+/// it cannot decide which applies, so the first match wins and later ones are ignored
+/// rather than overwriting it.
+pub fn handle_create_indirect_tunnel_response(
+    data: &[u8],
+) -> S11Result<CreateIndirectTunnelResponseData> {
+    let (msg_type, _, _, payload) = parse_gtp_header(data)?;
+    if msg_type != message_type::CREATE_INDIRECT_DATA_FORWARDING_TUNNEL_RESPONSE {
+        return Err(S11Error::InvalidMessageFormat);
+    }
+
+    let mut result = CreateIndirectTunnelResponseData::default();
+    let mut offset = 0;
+    while offset < payload.len() {
+        let Some((ie_t, length, _instance, value)) = parse_ie_header(&payload[offset..]) else {
+            break;
+        };
+        match ie_t {
+            ie_type::CAUSE => {
+                if let Some(cause) = parse_cause(value) {
+                    result.cause = cause;
+                }
+            }
+            ie_type::BEARER_CONTEXT => {
+                if let Some(bearer) = parse_indirect_forwarding_bearer(value) {
+                    result.bearers.push(bearer);
+                }
+            }
+            _ => {}
+        }
+        offset += 4 + length as usize;
+    }
+
+    if result.cause == 0 {
+        return Err(S11Error::MandatoryIeMissing("Cause".to_string()));
+    }
+    Ok(result)
+}
+
+/// Parse one Bearer Context of a CIDFT Response (Table 7.2.19-2).
+fn parse_indirect_forwarding_bearer(value: &[u8]) -> Option<IndirectForwardingBearer> {
+    use crate::s11_build::f_teid_interface as iface;
+
+    let mut bearer = IndirectForwardingBearer::default();
+    let mut have_ebi = false;
+    let mut offset = 0;
+    while offset < value.len() {
+        let Some((ie_t, length, instance, inner)) = parse_ie_header(&value[offset..]) else {
+            break;
+        };
+        match ie_t {
+            ie_type::EBI => {
+                if let Some(ebi) = parse_ebi(inner) {
+                    bearer.ebi = ebi;
+                    have_ebi = true;
+                }
+            }
+            ie_type::CAUSE => {
+                if let Some(cause) = parse_cause(inner) {
+                    bearer.cause = cause;
+                }
+            }
+            ie_type::F_TEID => {
+                if let Some((iface_type, teid, ipv4, _)) = parse_f_teid(inner) {
+                    match instance {
+                        // DL: S1-U (0) or target-selected SGW (3)
+                        0 | 3
+                            if iface_type == iface::SGW_GTP_U_DL_DATA_FORWARDING
+                                && bearer.sgw_dl_teid == 0 =>
+                        {
+                            bearer.sgw_dl_teid = teid;
+                            bearer.sgw_dl_ipv4 = ipv4;
+                        }
+                        // UL: S1-U (4) or SGW (5)
+                        4 | 5
+                            if iface_type == iface::SGW_GTP_U_UL_DATA_FORWARDING
+                                && bearer.sgw_ul_teid == 0 =>
+                        {
+                            bearer.sgw_ul_teid = teid;
+                            bearer.sgw_ul_ipv4 = ipv4;
+                        }
+                        other => log::debug!(
+                            "CIDFT Response F-TEID at instance {other} with interface type \
+                             {iface_type} ignored: not a forwarding endpoint this MME uses"
+                        ),
+                    }
+                }
+            }
+            _ => {}
+        }
+        offset += 4 + length as usize;
+    }
+
+    have_ebi.then_some(bearer)
+}
+
+/// Record the SGW's forwarding endpoints and send the Handover Command that was
+/// deferred waiting for them (#48, TS 23.401 §5.5.1.2.2).
+///
+/// The command could not be sent at Handover Request Acknowledge time because the
+/// endpoints the source eNB must forward to are the SGW's, and only this response
+/// carries them. The UE is found by the LOCAL S11 TEID in the header for the same
+/// reason `apply_create_session_response` does: it is the TEID this MME told the SGW to
+/// use, so a malformed body cannot attribute the response to another UE.
+fn apply_indirect_forwarding_response(
+    data: &CreateIndirectTunnelResponseData,
+    local_teid: u32,
+    peer: std::net::SocketAddr,
+) {
+    let ctx = crate::context::mme_self();
+
+    let Some(mme_ue_id) = ctx.mme_ue_find_by_s11_local_teid(local_teid) else {
+        log::error!(
+            "CIDFT Response from {peer} for unknown local S11 TEID {local_teid:#x}: no UE to \
+             complete the handover for"
+        );
+        return;
+    };
+
+    // TS 29.274 §8.4: 16 is "Request accepted". Anything else means no forwarding
+    // tunnels exist, and the handover must still proceed -- a UE that cannot get its
+    // buffered downlink data forwarded is better off attached to the target than stuck
+    // between cells. So the command goes out with an EMPTY forwarding list, and the
+    // loss is logged rather than hidden.
+    if data.cause != 16 {
+        log::error!(
+            "SGW refused indirect forwarding tunnels (cause={}); completing the handover WITHOUT \
+             data forwarding, so buffered downlink data is lost",
+            data.cause
+        );
+    } else {
+        for bearer in &data.bearers {
+            let Some(bearer_id) = ctx.bearer_find_by_ebi(mme_ue_id, bearer.ebi) else {
+                log::warn!(
+                    "CIDFT Response names EBI {} which this UE does not have",
+                    bearer.ebi
+                );
+                continue;
+            };
+            if let Some(b) = ctx.bearer_pool.write().unwrap().get_mut(&bearer_id) {
+                b.sgw_dl_teid = bearer.sgw_dl_teid;
+                b.sgw_dl_ip = ipv4_to_context_ip(bearer.sgw_dl_ipv4);
+                b.sgw_ul_teid = bearer.sgw_ul_teid;
+                b.sgw_ul_ip = ipv4_to_context_ip(bearer.sgw_ul_ipv4);
+            }
+        }
+    }
+
+    // The prepared target is the one this UE is moving to; the command goes to its
+    // SOURCE.
+    let Some(mme_ue) = ctx.mme_ue_find_by_id(mme_ue_id) else {
+        return;
+    };
+    let Some(source_ue) = ctx.enb_ue_find_by_id(mme_ue.enb_ue_id) else {
+        log::error!("CIDFT Response with no source eNB UE context");
+        return;
+    };
+    let target_ue_id = source_ue.target_ue_id;
+    if target_ue_id == crate::context::NEXTGCORE_INVALID_POOL_ID {
+        log::error!(
+            "CIDFT Response for mme_ue_id={mme_ue_id} with no handover in preparation: the \
+             forwarding tunnels are recorded but there is no Handover Command to send"
+        );
+        return;
+    }
+    // Confirm the target context still exists before building a command that names it;
+    // the supervision sweep may have released it while the SGW was answering.
+    if ctx.enb_ue_find_by_id(target_ue_id).is_none() {
+        log::warn!(
+            "CIDFT Response for target enb_ue_id={target_ue_id} that no longer exists; the \
+             preparation was released while the SGW was answering"
+        );
+        return;
+    }
+
+    let forwarding_list = if data.cause == 16 {
+        crate::s1ap_handler::sgw_forwarding_list(ctx, mme_ue_id)
+    } else {
+        Vec::new()
+    };
+
+    // The Handover Request Acknowledge's failed-E-RAB list and target-to-source
+    // container were consumed when the ack arrived, so they are replayed from what the
+    // deferral stored on the target context.
+    // TAKEN, not cloned: TS 29.274 §7.6 makes a GTP-C response retransmittable, and a
+    // second Handover Command for one handover would have the source eNB hand the UE
+    // over twice. Clearing it here makes the send idempotent.
+    let pending = {
+        let mut pool = ctx.enb_ue_pool.write().unwrap();
+        match pool.get_mut(&target_ue_id) {
+            Some(target) => target.pending_handover_command.take(),
+            None => None,
+        }
+    };
+    let Some(pending) = pending else {
+        log::warn!(
+            "CIDFT Response for a handover with no stored Handover Request Acknowledge: either \
+             the command already went out (a retransmitted response) or the preparation is gone"
+        );
+        return;
+    };
+
+    let command = nextgcore_s1ap::HandoverCommand {
+        mme_ue_s1ap_id: source_ue.mme_ue_s1ap_id,
+        enb_ue_s1ap_id: source_ue.enb_ue_s1ap_id,
+        handover_type: pending.handover_type,
+        erab_subject_to_forwarding_list: forwarding_list,
+        erab_to_release_list: pending.erab_to_release_list,
+        target_to_source_container: pending.target_to_source_container,
+    };
+    match nextgcore_s1ap::builder::build_handover_command(&command) {
+        Ok(pdu) => {
+            log::info!(
+                "Indirect forwarding tunnels ready; sending the deferred Handover Command to \
+                 source eNB {}",
+                source_ue.enb_id
+            );
+            crate::s1ap_path::s1ap_send(crate::s1ap_handler::S1apSend {
+                enb_id: source_ue.enb_id,
+                pdu,
+            });
+        }
+        Err(e) => log::error!("Failed to build the deferred Handover Command: {e}"),
+    }
+}
+
+/// A context IP from an optional wire IPv4 address.
+fn ipv4_to_context_ip(ipv4: Option<[u8; 4]>) -> crate::context::IpAddr {
+    let mut ip = crate::context::IpAddr::default();
+    ip.ipv4 = ipv4;
+    ip
+}
+
 pub fn handle_release_access_bearers_response(
     data: &[u8],
 ) -> S11Result<ReleaseAccessBearersResponseData> {
