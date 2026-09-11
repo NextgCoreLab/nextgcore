@@ -3797,9 +3797,9 @@ mod tests {
     async fn test_http_lifecycle_register_discover_patch_deregister() {
         use serde_json::json;
 
-        let addr = nextgcore_sbi::test_support::ephemeral_addr();
+        let (addr_listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
 
-        let server = SbiServer::new(NextgcoreSbiServerConfig::new(addr));
+        let server = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), addr_listener);
         server
             .start(nrf_sbi_request_handler)
             .await
@@ -4106,8 +4106,8 @@ mod tests {
     async fn test_shared_deregister_self_removes_the_profile_from_the_real_nrf() {
         use serde_json::json;
 
-        let addr = nextgcore_sbi::test_support::ephemeral_addr();
-        let server = SbiServer::new(NextgcoreSbiServerConfig::new(addr));
+        let (addr_listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), addr_listener);
         server
             .start(nrf_sbi_request_handler)
             .await
@@ -6127,8 +6127,8 @@ mod tests {
         let received: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
         let sink = Arc::clone(&received);
 
-        let addr = nextgcore_sbi::test_support::ephemeral_addr();
-        let subscriber = SbiServer::new(NextgcoreSbiServerConfig::new(addr));
+        let (addr_listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let subscriber = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), addr_listener);
         subscriber
             .start(move |req: SbiRequest| {
                 let sink = Arc::clone(&sink);

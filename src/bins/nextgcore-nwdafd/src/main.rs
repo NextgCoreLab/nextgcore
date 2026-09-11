@@ -1238,11 +1238,12 @@ mod g21_strict_peer_tests {
         nwdaf_context_init("nwdaf-test".to_string(), 1024);
 
         // Real nwdafd SBI server on a free localhost port.
-        let port = nextgcore_sbi::test_support::free_port();
-        let server = SbiServer::new(NextgcoreSbiServerConfig::new(SocketAddr::from((
-            [127, 0, 0, 1],
-            port,
-        ))));
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
+        let server = SbiServer::on_listener(
+            NextgcoreSbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+            port_listener,
+        );
         server
             .start(nwdaf_sbi_request_handler)
             .await
@@ -1403,15 +1404,6 @@ mod oauth2_h8_tests {
     use std::net::SocketAddr;
     use std::time::Duration;
 
-    /// Reserve a loopback port for a test server.
-    ///
-    /// Delegates to the shared helper: 21 crates each had a private
-    /// probe-and-drop copy of this, which is TOCTOU and flaked under parallel
-    /// `cargo test`. One implementation means one place to harden.
-    fn free_port() -> u16 {
-        nextgcore_sbi::test_support::free_port()
-    }
-
     fn build_es256_token(
         sk: &p256::ecdsa::SigningKey,
         kid: &str,
@@ -1452,12 +1444,13 @@ mod oauth2_h8_tests {
 
     async fn start_server(jwks: serde_json::Value) -> (SbiServer, u16) {
         super::nwdaf_context_init("nwdaf-h8-test".to_string(), 256);
-        let port = free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         let mut cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
         cfg.require_oauth2 = true;
         cfg.oauth2_jwks = Some(jwks);
         cfg = cfg.with_expected_audience_nf_type(NfType::Nwdaf);
-        let server = SbiServer::new(cfg);
+        let server = SbiServer::on_listener(cfg, port_listener);
         server
             .start(super::nwdaf_sbi_request_handler)
             .await

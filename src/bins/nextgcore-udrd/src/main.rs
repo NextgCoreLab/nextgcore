@@ -4128,11 +4128,6 @@ udr:
     use std::time::Duration;
     use tokio::sync::mpsc;
 
-    /// Loopback address on a shared-helper-issued ephemeral port.
-    fn ephemeral_addr() -> SocketAddr {
-        nextgcore_sbi::test_support::ephemeral_addr()
-    }
-
     /// Serializes tests that depend on the global nextgcore-dbi backend
     /// state: the WSB-6 tests enable the in-memory dbi test store while
     /// `test_http_auth_provisioning_and_plmn_validation` asserts the
@@ -4170,16 +4165,21 @@ udr:
         u16,
         mpsc::UnboundedReceiver<(String, String)>,
     ) {
-        let udr_addr = ephemeral_addr();
-        let udr_server = SbiServer::new(NextgcoreSbiServerConfig::new(udr_addr));
+        let (udr_listener, udr_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let udr_server =
+            SbiServer::on_listener(NextgcoreSbiServerConfig::new(udr_addr), udr_listener);
         udr_server
             .start(udr_sbi_request_handler)
             .await
             .expect("UDR SBI server starts");
 
-        let listener_addr = ephemeral_addr();
+        let (listener_listener, listener_addr) =
+            nextgcore_sbi::test_support::bound_listener().into_parts();
         let (tx, rx) = mpsc::unbounded_channel::<(String, String)>();
-        let listener = SbiServer::new(NextgcoreSbiServerConfig::new(listener_addr));
+        let listener = SbiServer::on_listener(
+            NextgcoreSbiServerConfig::new(listener_addr),
+            listener_listener,
+        );
         listener
             .start(move |req: SbiRequest| {
                 let tx = tx.clone();
@@ -4679,8 +4679,8 @@ udr:
         // backend lock so it cannot overlap with the WSB-6 tests that enable
         // the in-memory dbi test store.
         let _backend = DBI_BACKEND_LOCK.lock().await;
-        let udr_addr = ephemeral_addr();
-        let udr = SbiServer::new(NextgcoreSbiServerConfig::new(udr_addr));
+        let (udr_listener, udr_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let udr = SbiServer::on_listener(NextgcoreSbiServerConfig::new(udr_addr), udr_listener);
         udr.start(udr_sbi_request_handler)
             .await
             .expect("UDR SBI server starts");
@@ -4960,8 +4960,8 @@ udr:
     /// imsi- and suci- must be unchanged.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_varueid_routing() {
-        let udr_addr = ephemeral_addr();
-        let udr = SbiServer::new(NextgcoreSbiServerConfig::new(udr_addr));
+        let (udr_listener, udr_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let udr = SbiServer::on_listener(NextgcoreSbiServerConfig::new(udr_addr), udr_listener);
         udr.start(udr_sbi_request_handler)
             .await
             .expect("UDR SBI server starts");
@@ -5291,8 +5291,8 @@ udr:
 
     /// Spin up the UDR SBI server and return a client for it.
     async fn start_udr() -> (SbiServer, SbiClient) {
-        let addr = ephemeral_addr();
-        let udr = SbiServer::new(NextgcoreSbiServerConfig::new(addr));
+        let (addr_listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let udr = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), addr_listener);
         udr.start(udr_sbi_request_handler)
             .await
             .expect("UDR SBI server starts");
@@ -5584,8 +5584,8 @@ udr:
     #[tokio::test]
     async fn wsb6_patch_stores_exact_sqn_no_side_effect() {
         let _store = DbiTestStore::enable().await;
-        let udr_addr = ephemeral_addr();
-        let udr = SbiServer::new(NextgcoreSbiServerConfig::new(udr_addr));
+        let (udr_listener, udr_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let udr = SbiServer::on_listener(NextgcoreSbiServerConfig::new(udr_addr), udr_listener);
         udr.start(udr_sbi_request_handler)
             .await
             .expect("UDR SBI server starts");
@@ -5633,8 +5633,8 @@ udr:
     #[tokio::test]
     async fn wsb6_auth_status_put_delete_no_sqn_side_effect() {
         let _store = DbiTestStore::enable().await;
-        let udr_addr = ephemeral_addr();
-        let udr = SbiServer::new(NextgcoreSbiServerConfig::new(udr_addr));
+        let (udr_listener, udr_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let udr = SbiServer::on_listener(NextgcoreSbiServerConfig::new(udr_addr), udr_listener);
         udr.start(udr_sbi_request_handler)
             .await
             .expect("UDR SBI server starts");
@@ -5693,8 +5693,8 @@ udr:
     #[tokio::test]
     async fn wsb6_udm_av_flow_advances_sqn_one_step_per_av() {
         let _store = DbiTestStore::enable().await;
-        let udr_addr = ephemeral_addr();
-        let udr = SbiServer::new(NextgcoreSbiServerConfig::new(udr_addr));
+        let (udr_listener, udr_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let udr = SbiServer::on_listener(NextgcoreSbiServerConfig::new(udr_addr), udr_listener);
         udr.start(udr_sbi_request_handler)
             .await
             .expect("UDR SBI server starts");

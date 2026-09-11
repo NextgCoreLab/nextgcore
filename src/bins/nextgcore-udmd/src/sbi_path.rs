@@ -1139,9 +1139,10 @@ mod tests {
         // Production profile would make the client attempt TLS against it.
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
 
-        let addr = nextgcore_sbi::test_support::ephemeral_addr();
-        let server = nextgcore_sbi::server::SbiServer::new(
+        let (addr_listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
             nextgcore_sbi::server::SbiServerConfig::new(addr),
+            addr_listener,
         );
         server
             .start(|_req: SbiRequest| async move {

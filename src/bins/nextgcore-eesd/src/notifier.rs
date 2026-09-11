@@ -477,28 +477,29 @@ mod tests {
     /// index, return `(status, Retry-After?)`.
     type Responder = Arc<dyn Fn(usize) -> (u16, Option<String>) + Send + Sync>;
 
-    /// Reserve a loopback port for a test server.
+    /// Reserve a loopback port for a test server by KEEPING IT BOUND (#313).
     ///
-    /// Delegates to the shared helper: 21 crates each had a private
-    /// probe-and-drop copy of this, which is TOCTOU and flaked under parallel
-    /// `cargo test`. One implementation means one place to harden.
-    fn free_port() -> u16 {
-        nextgcore_sbi::test_support::free_port()
+    /// Every caller here goes on to serve the port, so none of them wants the
+    /// bare number `free_port` returns: that leaves the port unbound between
+    /// selection and use, and a concurrently-starting test binary can take it.
+    fn reserve_port() -> nextgcore_sbi::test_support::BoundListener {
+        nextgcore_sbi::test_support::bound_listener()
     }
 
-    /// Spin a `nextgcore-sbi` `SbiServer` on `127.0.0.1:port` acting as the
+    /// Spin a `nextgcore-sbi` `SbiServer` on the reserved port acting as the
     /// subscriber callback receiver. It counts every POST, records the decoded
     /// JSON body, and answers per `responder`.
     async fn start_receiver(
-        port: u16,
+        reservation: nextgcore_sbi::test_support::BoundListener,
         counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         bodies: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
         responder: Responder,
     ) -> nextgcore_sbi::SbiServer {
-        use std::net::SocketAddr;
-        let server = nextgcore_sbi::SbiServer::new(nextgcore_sbi::SbiServerConfig::new(
-            SocketAddr::from(([127, 0, 0, 1], port)),
-        ));
+        let (listener, addr) = reservation.into_parts();
+        let server = nextgcore_sbi::SbiServer::on_listener(
+            nextgcore_sbi::SbiServerConfig::new(addr),
+            listener,
+        );
         let handler = move |req: SbiRequest| {
             let counter = counter.clone();
             let bodies = bodies.clone();
@@ -543,11 +544,12 @@ mod tests {
     /// spec JSON we sent, the receiver's 204 ends the exchange, nothing dropped.
     #[tokio::test]
     async fn test_sbi_notifier_delivers_one_post() {
-        let port = free_port();
+        let reservation = reserve_port();
+        let port = reservation.port();
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
         let responder: Responder = Arc::new(|_| (204, None));
-        let server = start_receiver(port, counter.clone(), bodies.clone(), responder).await;
+        let server = start_receiver(reservation, counter.clone(), bodies.clone(), responder).await;
 
         let n = SbiNotifier::spawn(SbiNotifierConfig {
             base_backoff: Duration::from_millis(10),
@@ -584,11 +586,12 @@ mod tests {
     /// attempts observed and eventual success (no drop).
     #[tokio::test]
     async fn test_sbi_notifier_retries_then_succeeds() {
-        let port = free_port();
+        let reservation = reserve_port();
+        let port = reservation.port();
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
         let responder: Responder = Arc::new(|n| if n < 2 { (500, None) } else { (204, None) });
-        let server = start_receiver(port, counter.clone(), bodies.clone(), responder).await;
+        let server = start_receiver(reservation, counter.clone(), bodies.clone(), responder).await;
 
         let n = SbiNotifier::spawn(SbiNotifierConfig {
             max_attempts: 3,
@@ -619,11 +622,12 @@ mod tests {
     /// POSTs then a counted drop (no infinite loop, no panic).
     #[tokio::test]
     async fn test_sbi_notifier_exhausts_then_drops() {
-        let port = free_port();
+        let reservation = reserve_port();
+        let port = reservation.port();
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
         let responder: Responder = Arc::new(|_| (500, None));
-        let server = start_receiver(port, counter.clone(), bodies.clone(), responder).await;
+        let server = start_receiver(reservation, counter.clone(), bodies.clone(), responder).await;
 
         let n = SbiNotifier::spawn(SbiNotifierConfig {
             max_attempts: 3,
@@ -654,7 +658,8 @@ mod tests {
     /// ~1 s (far above the tiny base backoff), proving the header is honoured.
     #[tokio::test]
     async fn test_sbi_notifier_honors_retry_after() {
-        let port = free_port();
+        let reservation = reserve_port();
+        let port = reservation.port();
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
         let responder: Responder = Arc::new(|n| {
@@ -664,7 +669,7 @@ mod tests {
                 (204, None)
             }
         });
-        let server = start_receiver(port, counter.clone(), bodies.clone(), responder).await;
+        let server = start_receiver(reservation, counter.clone(), bodies.clone(), responder).await;
 
         let n = SbiNotifier::spawn(SbiNotifierConfig {
             max_attempts: 3,
@@ -718,11 +723,12 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
-        let port = free_port();
+        let reservation = reserve_port();
+        let port = reservation.port();
         let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
         let responder: Responder = Arc::new(|_| (204, None));
-        let server = start_receiver(port, counter.clone(), bodies.clone(), responder).await;
+        let server = start_receiver(reservation, counter.clone(), bodies.clone(), responder).await;
 
         // Install the real sender as THE process notifier for this test.
         install_sbi_notifier(SbiNotifierConfig {

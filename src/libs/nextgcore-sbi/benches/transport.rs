@@ -52,18 +52,12 @@ fn fixed_body_handler(
     }
 }
 
-/// Pick a free loopback port (probe-bind-drop; single-process bench, and
-/// server starts retry to absorb the small TOCTOU window).
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("probe bind")
-        .local_addr()
-        .expect("probe addr")
-        .port()
-}
-
-/// Start an `SbiServer` on a free port, retrying if the probed port was
-/// stolen between probe and bind.
+/// Start an `SbiServer` on a **reserved** loopback port.
+///
+/// This carried its own unguarded probe-bind-drop `free_port` plus a five-attempt
+/// retry to absorb the window it created. #313 removed the window instead: the
+/// shared reservation stays bound until the server adopts it, so one attempt is
+/// correct and a failure is a real failure.
 async fn start_h2_server<H>(
     make_config: impl Fn(SocketAddr) -> SbiServerConfig,
     handler: H,
@@ -75,14 +69,10 @@ where
         + Sync
         + 'static,
 {
-    for _ in 0..5 {
-        let port = free_port();
-        let server = SbiServer::new(make_config(SocketAddr::from(([127, 0, 0, 1], port))));
-        if server.start(handler.clone()).await.is_ok() {
-            return (server, port);
-        }
-    }
-    panic!("could not bind an SbiServer after 5 attempts");
+    let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let server = SbiServer::on_listener(make_config(addr), listener);
+    server.start(handler).await.expect("SbiServer starts");
+    (server, addr.port())
 }
 
 /// One warm GET against an `SbiClient`, asserting success and full body.

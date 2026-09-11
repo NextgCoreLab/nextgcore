@@ -2574,25 +2574,17 @@ mod tests {
             .to_string()
     }
 
-    /// Reserve a loopback port for a test server.
-    ///
-    /// Delegates to the shared helper: 21 crates each had a private
-    /// probe-and-drop copy of this, which is TOCTOU and flaked under parallel
-    /// `cargo test`. One implementation means one place to harden.
-    fn free_port() -> u16 {
-        nextgcore_sbi::test_support::free_port()
-    }
-
     /// Start a capture server on an ephemeral port; returns (server, port, rx)
     async fn start_capture_server() -> (
         SbiServer,
         u16,
         tokio::sync::mpsc::Receiver<(String, String)>,
     ) {
-        let port = free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         let (tx, rx) = tokio::sync::mpsc::channel::<(String, String)>(16);
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
-        let server = SbiServer::new(SbiServerConfig::new(addr));
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), port_listener);
         server
             .start(move |req: SbiRequest| {
                 let tx = tx.clone();
@@ -4052,9 +4044,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_namf_server_http_roundtrip() {
         amf_context_init(64, 1024, 4096);
-        let port = free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
-        let server = SbiServer::new(SbiServerConfig::new(addr));
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), port_listener);
         server
             .start(namf_request_handler)
             .await

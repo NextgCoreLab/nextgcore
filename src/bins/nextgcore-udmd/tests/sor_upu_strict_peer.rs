@@ -139,13 +139,6 @@ fn test_kausf(tag: u8) -> [u8; 32] {
     k
 }
 
-fn free_port() -> u16 {
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
-    let port = probe.local_addr().expect("probe addr").port();
-    drop(probe);
-    port
-}
-
 /// Seed the ausfd per-SUPI anchor store (F-02) with a known KAUSF, exactly as
 /// a completed primary authentication would (TS 33.501 §6.14.1). `anchor_refresh`
 /// resets both counters to 0x0001 (§6.14.2.3 / §6.15.2.2).
@@ -219,11 +212,12 @@ async fn sor_upu_strict_peer_end_to_end() {
 
     tokio::time::timeout(Duration::from_secs(60), async {
         // Stand up the REAL ausfd SBI HTTP/2 server + dispatcher.
-        let ausf_port = free_port();
-        let ausf_server = SbiServer::new(SbiServerConfig::new(SocketAddr::from((
-            [127, 0, 0, 1],
-            ausf_port,
-        ))));
+        let (ausf_listener, ausf_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let ausf_port = ausf_addr.port();
+        let ausf_server = SbiServer::on_listener(
+            SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], ausf_port))),
+            ausf_listener,
+        );
         ausf_server
             .start(ausf_sbi_request_handler)
             .await

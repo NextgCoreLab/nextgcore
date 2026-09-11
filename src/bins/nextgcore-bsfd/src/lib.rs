@@ -2820,16 +2820,11 @@ mod tests {
     use nextgcore_sbi::client::SbiClient;
     use serde_json::json;
 
-    /// Loopback address on a shared-helper-issued ephemeral port.
-    fn ephemeral_addr() -> SocketAddr {
-        nextgcore_sbi::test_support::ephemeral_addr()
-    }
-
     async fn start_bsf() -> (SbiServer, SbiClient) {
         // The handlers consult the global BSF context: initialize it once.
         bsf_context_init(1024);
-        let addr = ephemeral_addr();
-        let server = SbiServer::new(NextgcoreSbiServerConfig::new(addr));
+        let (addr_listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), addr_listener);
         server
             .start(bsf_sbi_request_handler)
             .await
@@ -2882,12 +2877,12 @@ mod tests {
     /// and the BSF audience.
     async fn start_bsf_oauth2(jwks: serde_json::Value) -> (SbiServer, SbiClient) {
         bsf_context_init(1024);
-        let addr = ephemeral_addr();
+        let (addr_listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let mut cfg = NextgcoreSbiServerConfig::new(addr);
         cfg.require_oauth2 = true;
         cfg.oauth2_jwks = Some(jwks);
         cfg = cfg.with_expected_audience_nf_type(NfType::Bsf);
-        let server = SbiServer::new(cfg);
+        let server = SbiServer::on_listener(cfg, addr_listener);
         server
             .start(bsf_sbi_request_handler)
             .await
@@ -4657,8 +4652,8 @@ mod tests {
         let recorded: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = Arc::clone(&recorded);
-        let cb_addr = ephemeral_addr();
-        let cb = SbiServer::new(NextgcoreSbiServerConfig::new(cb_addr));
+        let (cb_listener, cb_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let cb = SbiServer::on_listener(NextgcoreSbiServerConfig::new(cb_addr), cb_listener);
         cb.start(move |req: SbiRequest| {
             let sink = Arc::clone(&sink);
             async move {
@@ -4804,8 +4799,8 @@ mod tests {
         let recorded: Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = Arc::clone(&recorded);
-        let cb_addr = ephemeral_addr();
-        let cb = SbiServer::new(NextgcoreSbiServerConfig::new(cb_addr));
+        let (cb_listener, cb_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let cb = SbiServer::on_listener(NextgcoreSbiServerConfig::new(cb_addr), cb_listener);
         cb.start(move |req: SbiRequest| {
             let sink = Arc::clone(&sink);
             async move {

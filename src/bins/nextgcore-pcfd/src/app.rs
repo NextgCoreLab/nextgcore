@@ -3569,9 +3569,11 @@ mod tests {
         // suite indefinitely while holding the shared pcf_context).
         let mut started: Option<(SbiServer, u16)> = None;
         for attempt in 0..4u32 {
-            let port = nextgcore_sbi::test_support::free_port();
+            let (port_listener, port_addr) =
+                nextgcore_sbi::test_support::bound_listener().into_parts();
+            let port = port_addr.port();
             let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-            let server = SbiServer::new(SbiServerConfig::new(addr));
+            let server = SbiServer::on_listener(SbiServerConfig::new(addr), port_listener);
             match tokio::time::timeout(
                 Duration::from_secs(10),
                 server.start(pcf_sbi_request_handler),
@@ -4220,9 +4222,10 @@ mod tests {
     ) -> nextgcore_sbi::server::SbiServer {
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        let port = nextgcore_sbi::test_support::free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        let server = SbiServer::new(SbiServerConfig::new(addr));
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), port_listener);
         let handler = move |req: SbiRequest| {
             let am_data = am_data.clone();
             async move {
@@ -4294,9 +4297,9 @@ mod tests {
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
 
         let notified = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let smf_port = nextgcore_sbi::test_support::free_port();
-        let smf_addr = SocketAddr::from(([127, 0, 0, 1], smf_port));
-        let smf = SbiServer::new(SbiServerConfig::new(smf_addr));
+        let (smf_listener, smf_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let smf_port = smf_addr.port();
+        let smf = SbiServer::on_listener(SbiServerConfig::new(smf_addr), smf_listener);
         let seen = notified.clone();
         smf.start(move |req: SbiRequest| {
             let seen = seen.clone();
@@ -4318,9 +4321,9 @@ mod tests {
         .expect("stub SMF starts");
 
         let udr_queries = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let udr_port = nextgcore_sbi::test_support::free_port();
-        let udr_addr = SocketAddr::from(([127, 0, 0, 1], udr_port));
-        let udr = SbiServer::new(SbiServerConfig::new(udr_addr));
+        let (udr_listener, udr_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let udr_port = udr_addr.port();
+        let udr = SbiServer::on_listener(SbiServerConfig::new(udr_addr), udr_listener);
         let queries = udr_queries.clone();
         udr.start(move |req: SbiRequest| {
             let sm_data_for = sm_data_for.clone();
@@ -4709,9 +4712,9 @@ mod tests {
         // An NRF that advertises a UDR on a port with nothing listening: discovery
         // succeeds, every nudr-dr GET fails.
         let dead_udr_port = nextgcore_sbi::test_support::free_port();
-        let nrf_port = nextgcore_sbi::test_support::free_port();
-        let nrf_addr = SocketAddr::from(([127, 0, 0, 1], nrf_port));
-        let nrf = SbiServer::new(SbiServerConfig::new(nrf_addr));
+        let (nrf_listener, nrf_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let nrf_port = nrf_addr.port();
+        let nrf = SbiServer::on_listener(SbiServerConfig::new(nrf_addr), nrf_listener);
         nrf.start(move |_req: SbiRequest| async move {
             SbiResponse::with_status(200)
                 .with_json_body(&serde_json::json!({
@@ -5030,9 +5033,9 @@ mod tests {
         let seen: Arc<StdMutex<Vec<(String, serde_json::Value)>>> =
             Arc::new(StdMutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
-        let amf_port = nextgcore_sbi::test_support::free_port();
-        let amf_addr = SocketAddr::from(([127, 0, 0, 1], amf_port));
-        let amf = SbiServer::new(SbiServerConfig::new(amf_addr));
+        let (amf_listener, amf_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let amf_port = amf_addr.port();
+        let amf = SbiServer::on_listener(SbiServerConfig::new(amf_addr), amf_listener);
         amf.start(move |req: SbiRequest| {
             let sink = Arc::clone(&sink);
             async move {
@@ -5162,9 +5165,10 @@ mod tests {
         // Primary: always 500, so every attempt against it fails.
         let primary_hits = Arc::new(AtomicUsize::new(0));
         let hits = Arc::clone(&primary_hits);
-        let primary_port = nextgcore_sbi::test_support::free_port();
-        let primary_addr = SocketAddr::from(([127, 0, 0, 1], primary_port));
-        let primary = SbiServer::new(SbiServerConfig::new(primary_addr));
+        let (primary_listener, primary_addr) =
+            nextgcore_sbi::test_support::bound_listener().into_parts();
+        let primary_port = primary_addr.port();
+        let primary = SbiServer::on_listener(SbiServerConfig::new(primary_addr), primary_listener);
         primary
             .start(move |_req: SbiRequest| {
                 let hits = Arc::clone(&hits);
@@ -5179,9 +5183,9 @@ mod tests {
         // Alternate: accepts.
         let alt_hits = Arc::new(AtomicUsize::new(0));
         let hits = Arc::clone(&alt_hits);
-        let alt_port = nextgcore_sbi::test_support::free_port();
-        let alt_addr = SocketAddr::from(([127, 0, 0, 1], alt_port));
-        let alternate = SbiServer::new(SbiServerConfig::new(alt_addr));
+        let (alt_listener, alt_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let alt_port = alt_addr.port();
+        let alternate = SbiServer::on_listener(SbiServerConfig::new(alt_addr), alt_listener);
         alternate
             .start(move |_req: SbiRequest| {
                 let hits = Arc::clone(&hits);
@@ -5223,9 +5227,9 @@ mod tests {
         // A 4xx is a decision, not a transient fault: it must NOT be retried.
         let rejecting_hits = Arc::new(AtomicUsize::new(0));
         let hits = Arc::clone(&rejecting_hits);
-        let rej_port = nextgcore_sbi::test_support::free_port();
-        let rej_addr = SocketAddr::from(([127, 0, 0, 1], rej_port));
-        let rejecting = SbiServer::new(SbiServerConfig::new(rej_addr));
+        let (rej_listener, rej_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let rej_port = rej_addr.port();
+        let rejecting = SbiServer::on_listener(SbiServerConfig::new(rej_addr), rej_listener);
         rejecting
             .start(move |_req: SbiRequest| {
                 let hits = Arc::clone(&hits);
@@ -5627,9 +5631,10 @@ mod tests {
         let seen: Arc<StdMutex<Vec<(String, serde_json::Value)>>> =
             Arc::new(StdMutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
-        let port = nextgcore_sbi::test_support::free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        let af = SbiServer::new(SbiServerConfig::new(addr));
+        let af = SbiServer::on_listener(SbiServerConfig::new(addr), port_listener);
         af.start(move |req: SbiRequest| {
             let sink = Arc::clone(&sink);
             async move {
@@ -5871,9 +5876,10 @@ mod tests {
     ) {
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        let port = nextgcore_sbi::test_support::free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        let server = SbiServer::new(SbiServerConfig::new(addr));
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), port_listener);
         let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = std::sync::Arc::clone(&recorded);
         let handler = move |req: SbiRequest| {
@@ -6822,9 +6828,10 @@ mod tests {
         pcf_context_init(64, 64);
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
 
-        let port = nextgcore_sbi::test_support::free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        let nrf = SbiServer::new(SbiServerConfig::new(addr));
+        let nrf = SbiServer::on_listener(SbiServerConfig::new(addr), port_listener);
         // Every registration PUT, recorded with the id it targeted.
         let puts = std::sync::Arc::new(std::sync::Mutex::new(
             Vec::<(String, serde_json::Value)>::new(),
@@ -7049,15 +7056,6 @@ mod oauth2_h8_tests {
     use std::net::SocketAddr;
     use std::time::Duration;
 
-    /// Reserve a loopback port for a test server.
-    ///
-    /// Delegates to the shared helper: 21 crates each had a private
-    /// probe-and-drop copy of this, which is TOCTOU and flaked under parallel
-    /// `cargo test`. One implementation means one place to harden.
-    fn free_port() -> u16 {
-        nextgcore_sbi::test_support::free_port()
-    }
-
     fn build_es256_token(
         sk: &p256::ecdsa::SigningKey,
         kid: &str,
@@ -7098,12 +7096,13 @@ mod oauth2_h8_tests {
 
     async fn start_server(jwks: serde_json::Value) -> (SbiServer, u16) {
         super::pcf_context_init(64, 64);
-        let port = free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         let mut cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
         cfg.require_oauth2 = true;
         cfg.oauth2_jwks = Some(jwks);
         cfg = cfg.with_expected_audience_nf_type(NfType::Pcf);
-        let server = SbiServer::new(cfg);
+        let server = SbiServer::on_listener(cfg, port_listener);
         server
             .start(super::pcf_sbi_request_handler)
             .await

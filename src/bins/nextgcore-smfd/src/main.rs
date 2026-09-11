@@ -6315,16 +6315,20 @@ mod tests {
         // deployment; the default profile is Production and would require client
         // TLS material this test has no business inventing.
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        let port = nextgcore_sbi::test_support::free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         type Seen = (Vec<String>, Vec<std::collections::HashMap<String, String>>);
         let seen: Arc<std::sync::Mutex<Seen>> =
             Arc::new(std::sync::Mutex::new((Vec::new(), Vec::new())));
         let seen_in_handler = Arc::clone(&seen);
 
-        let server =
-            nextgcore_sbi::server::SbiServer::new(nextgcore_sbi::server::SbiServerConfig::new(
-                std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-            ));
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                port,
+            ))),
+            port_listener,
+        );
         server
             .start(move |req: SbiRequest| {
                 let seen = Arc::clone(&seen_in_handler);
@@ -6794,11 +6798,12 @@ mod tests {
         let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = seen.clone();
-        let port = nextgcore_sbi::test_support::free_port();
-        let udm = SbiServer::new(SbiServerConfig::new(std::net::SocketAddr::from((
-            [127, 0, 0, 1],
-            port,
-        ))));
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
+        let udm = SbiServer::on_listener(
+            SbiServerConfig::new(std::net::SocketAddr::from(([127, 0, 0, 1], port))),
+            port_listener,
+        );
         udm.start(move |req: SbiRequest| {
             let sink = sink.clone();
             let sm_data = sm_data.clone();
@@ -6895,11 +6900,12 @@ mod tests {
         let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = seen.clone();
-        let port = nextgcore_sbi::test_support::free_port();
-        let amf = SbiServer::new(SbiServerConfig::new(std::net::SocketAddr::from((
-            [127, 0, 0, 1],
-            port,
-        ))));
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
+        let amf = SbiServer::on_listener(
+            SbiServerConfig::new(std::net::SocketAddr::from(([127, 0, 0, 1], port))),
+            port_listener,
+        );
         amf.start(move |req: SbiRequest| {
             let sink = sink.clone();
             async move {
@@ -8444,11 +8450,12 @@ mod tests {
         let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = seen.clone();
-        let port = nextgcore_sbi::test_support::free_port();
-        let consumer = SbiServer::new(SbiServerConfig::new(std::net::SocketAddr::from((
-            [127, 0, 0, 1],
-            port,
-        ))));
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
+        let consumer = SbiServer::on_listener(
+            SbiServerConfig::new(std::net::SocketAddr::from(([127, 0, 0, 1], port))),
+            port_listener,
+        );
         consumer
             .start(move |req: SbiRequest| {
                 let sink = sink.clone();
@@ -8941,11 +8948,12 @@ mod tests {
         let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = seen.clone();
-        let port = nextgcore_sbi::test_support::free_port();
-        let amf = SbiServer::new(SbiServerConfig::new(std::net::SocketAddr::from((
-            [127, 0, 0, 1],
-            port,
-        ))));
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
+        let amf = SbiServer::on_listener(
+            SbiServerConfig::new(std::net::SocketAddr::from(([127, 0, 0, 1], port))),
+            port_listener,
+        );
         amf.start(move |req: SbiRequest| {
             let sink = sink.clone();
             async move {
@@ -9044,11 +9052,12 @@ mod tests {
         let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = seen.clone();
-        let port = nextgcore_sbi::test_support::free_port();
-        let amf = SbiServer::new(SbiServerConfig::new(std::net::SocketAddr::from((
-            [127, 0, 0, 1],
-            port,
-        ))));
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
+        let amf = SbiServer::on_listener(
+            SbiServerConfig::new(std::net::SocketAddr::from(([127, 0, 0, 1], port))),
+            port_listener,
+        );
         amf.start(move |req: SbiRequest| {
             let sink = sink.clone();
             async move {
@@ -9105,15 +9114,6 @@ mod oauth2_h8_tests {
     use nextgcore_sbi::types::NfType;
     use std::time::Duration;
 
-    /// Reserve a loopback port for a test server.
-    ///
-    /// Delegates to the shared helper: 21 crates each had a private
-    /// probe-and-drop copy of this, which is TOCTOU and flaked under parallel
-    /// `cargo test`. One implementation means one place to harden.
-    fn free_port() -> u16 {
-        nextgcore_sbi::test_support::free_port()
-    }
-
     /// Mint an ES256 access token in the NRF's shape, signed by `sk`.
     fn build_es256_token(
         sk: &p256::ecdsa::SigningKey,
@@ -9156,12 +9156,13 @@ mod oauth2_h8_tests {
 
     async fn start_server(jwks: serde_json::Value) -> (SbiServer, u16) {
         smf_context_init(64, 256, 512);
-        let port = free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         let mut cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
         cfg.require_oauth2 = true;
         cfg.oauth2_jwks = Some(jwks);
         cfg = cfg.with_expected_audience_nf_type(NfType::Smf);
-        let server = SbiServer::new(cfg);
+        let server = SbiServer::on_listener(cfg, port_listener);
         server
             .start(smf_sbi_request_handler)
             .await

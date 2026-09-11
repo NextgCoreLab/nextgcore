@@ -4883,15 +4883,6 @@ mod oauth2_h8_tests {
     use std::net::SocketAddr;
     use std::time::Duration;
 
-    /// Reserve a loopback port for a test server.
-    ///
-    /// Delegates to the shared helper: 21 crates each had a private
-    /// probe-and-drop copy of this, which is TOCTOU and flaked under parallel
-    /// `cargo test`. One implementation means one place to harden.
-    fn free_port() -> u16 {
-        nextgcore_sbi::test_support::free_port()
-    }
-
     fn build_es256_token(
         sk: &p256::ecdsa::SigningKey,
         kid: &str,
@@ -4932,12 +4923,13 @@ mod oauth2_h8_tests {
 
     async fn start_server(jwks: serde_json::Value) -> (SbiServer, u16) {
         super::lmf_context_init(256);
-        let port = free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         let mut cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
         cfg.require_oauth2 = true;
         cfg.oauth2_jwks = Some(jwks);
         cfg = cfg.with_expected_audience_nf_type(NfType::Lmf);
-        let server = SbiServer::new(cfg);
+        let server = SbiServer::on_listener(cfg, port_listener);
         server
             .start(super::lmf_sbi_request_handler)
             .await
@@ -5114,14 +5106,11 @@ mod a8_event_notify_tests {
             .insert(path.to_string(), status);
     }
 
-    fn free_port() -> u16 {
-        nextgcore_sbi::test_support::free_port()
-    }
-
     async fn start_sink() -> (SbiServer, u16) {
-        let port = free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         let cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
-        let server = SbiServer::new(cfg);
+        let server = SbiServer::on_listener(cfg, port_listener);
         server.start(sink_handler).await.expect("sink server start");
         (server, port)
     }
@@ -5440,10 +5429,6 @@ mod positioning_chain_strict_peer {
     /// (never-reset) global AMF context.
     static NEXT_NGAP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(88_000);
 
-    fn free_port() -> u16 {
-        nextgcore_sbi::test_support::free_port()
-    }
-
     fn body_json(resp: &SbiResponse) -> serde_json::Value {
         serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).expect("json body")
     }
@@ -5585,9 +5570,9 @@ mod positioning_chain_strict_peer {
     ) {
         let (tap_tx, tap_rx) = tokio::sync::mpsc::channel::<(String, Vec<u8>)>(4);
 
-        let amf_port = free_port();
-        let amf_addr: SocketAddr = format!("127.0.0.1:{amf_port}").parse().expect("amf addr");
-        let amf_server = SbiServer::new(SbiServerConfig::new(amf_addr));
+        let (amf_listener, amf_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let amf_port = amf_addr.port();
+        let amf_server = SbiServer::on_listener(SbiServerConfig::new(amf_addr), amf_listener);
         amf_server
             .start(move |req: SbiRequest| {
                 let tap_tx = tap_tx.clone();
@@ -5634,9 +5619,9 @@ mod positioning_chain_strict_peer {
             .await
             .expect("amf server start");
 
-        let nrf_port = free_port();
-        let nrf_addr: SocketAddr = format!("127.0.0.1:{nrf_port}").parse().expect("nrf addr");
-        let nrf_server = SbiServer::new(SbiServerConfig::new(nrf_addr));
+        let (nrf_listener, nrf_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let nrf_port = nrf_addr.port();
+        let nrf_server = SbiServer::on_listener(SbiServerConfig::new(nrf_addr), nrf_listener);
         let search = serde_json::json!({
             "nfInstances": [{
                 "nfInstanceId": "amf-strict-peer",

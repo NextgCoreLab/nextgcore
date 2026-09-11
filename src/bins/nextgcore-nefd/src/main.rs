@@ -3387,10 +3387,6 @@ mod northbound_auth_tests {
     use std::net::SocketAddr;
     use std::time::Duration;
 
-    fn free_port() -> u16 {
-        nextgcore_sbi::test_support::free_port()
-    }
-
     fn build_es256_token(
         sk: &p256::ecdsa::SigningKey,
         kid: &str,
@@ -3432,12 +3428,13 @@ mod northbound_auth_tests {
 
     async fn start_enforcing_server(jwks: serde_json::Value) -> (SbiServer, u16) {
         super::nef_context_init(256, 256);
-        let port = free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         let mut cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
         cfg.require_oauth2 = true;
         cfg.oauth2_jwks = Some(jwks);
         cfg = cfg.with_expected_audience_nf_type(NfType::Nef);
-        let server = SbiServer::new(cfg);
+        let server = SbiServer::on_listener(cfg, port_listener);
         server
             .start(super::nef_sbi_request_handler)
             .await

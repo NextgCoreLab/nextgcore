@@ -244,16 +244,9 @@ async fn pcfd_client_registers_binding_with_real_bsfd_over_http() {
         .unwrap_or_else(|e| e.into_inner());
     init_peers();
 
-    fn ephemeral_addr() -> std::net::SocketAddr {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
-        let addr = probe.local_addr().expect("probe addr");
-        drop(probe);
-        addr
-    }
-
     // Real bsfd SBI server.
-    let bsf_addr = ephemeral_addr();
-    let bsf_server = SbiServer::new(SbiServerConfig::new(bsf_addr));
+    let (bsf_listener, bsf_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let bsf_server = SbiServer::on_listener(SbiServerConfig::new(bsf_addr), bsf_listener);
     bsf_server
         .start(nextgcore_bsfd::bsf_sbi_request_handler)
         .await
@@ -261,8 +254,8 @@ async fn pcfd_client_registers_binding_with_real_bsfd_over_http() {
 
     // Mock NRF advertising ONLY the real BSF endpoint (discovery bootstrap).
     let bsf_port = bsf_addr.port();
-    let nrf_addr = ephemeral_addr();
-    let nrf_server = SbiServer::new(SbiServerConfig::new(nrf_addr));
+    let (nrf_listener, nrf_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let nrf_server = SbiServer::on_listener(SbiServerConfig::new(nrf_addr), nrf_listener);
     let nrf_handler = move |req: SbiRequest| async move {
         let path = req.header.uri.split('?').next().unwrap_or("");
         if path == "/nnrf-disc/v1/nf-instances" {
@@ -333,23 +326,16 @@ async fn pcfd_updates_binding_ip_at_real_bsfd_over_http() {
         .unwrap_or_else(|e| e.into_inner());
     init_peers();
 
-    fn ephemeral_addr() -> std::net::SocketAddr {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
-        let addr = probe.local_addr().expect("probe addr");
-        drop(probe);
-        addr
-    }
-
-    let bsf_addr = ephemeral_addr();
-    let bsf_server = SbiServer::new(SbiServerConfig::new(bsf_addr));
+    let (bsf_listener, bsf_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let bsf_server = SbiServer::on_listener(SbiServerConfig::new(bsf_addr), bsf_listener);
     bsf_server
         .start(nextgcore_bsfd::bsf_sbi_request_handler)
         .await
         .expect("start real bsfd");
 
     let bsf_port = bsf_addr.port();
-    let nrf_addr = ephemeral_addr();
-    let nrf_server = SbiServer::new(SbiServerConfig::new(nrf_addr));
+    let (nrf_listener, nrf_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let nrf_server = SbiServer::on_listener(SbiServerConfig::new(nrf_addr), nrf_listener);
     let nrf_handler = move |req: SbiRequest| async move {
         let path = req.header.uri.split('?').next().unwrap_or("");
         if path == "/nnrf-disc/v1/nf-instances" {
@@ -452,23 +438,16 @@ async fn sm_policy_update_wires_the_bsf_binding_update() {
     nextgcore_pcfd::test_support::init_context();
     nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
 
-    fn ephemeral_addr() -> std::net::SocketAddr {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
-        let addr = probe.local_addr().expect("probe addr");
-        drop(probe);
-        addr
-    }
-
-    let bsf_addr = ephemeral_addr();
-    let bsf_server = SbiServer::new(SbiServerConfig::new(bsf_addr));
+    let (bsf_listener, bsf_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let bsf_server = SbiServer::on_listener(SbiServerConfig::new(bsf_addr), bsf_listener);
     bsf_server
         .start(nextgcore_bsfd::bsf_sbi_request_handler)
         .await
         .expect("start real bsfd");
     let bsf_port = bsf_addr.port();
 
-    let nrf_addr = ephemeral_addr();
-    let nrf_server = SbiServer::new(SbiServerConfig::new(nrf_addr));
+    let (nrf_listener, nrf_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+    let nrf_server = SbiServer::on_listener(SbiServerConfig::new(nrf_addr), nrf_listener);
     let nrf_handler = move |req: SbiRequest| async move {
         let path = req.header.uri.split('?').next().unwrap_or("");
         if path == "/nnrf-disc/v1/nf-instances" {

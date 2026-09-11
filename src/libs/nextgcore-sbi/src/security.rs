@@ -1014,7 +1014,6 @@ mod mtls_oauth2_e2e {
     use crate::message::{SbiRequest, SbiResponse};
     use crate::oauth::OAuth2Client;
     use crate::server::{SbiServer, SbiServerConfig};
-    use std::net::SocketAddr;
     use std::sync::Arc;
 
     /// A CA plus a server leaf and a client leaf signed by it, written as PEM.
@@ -1130,11 +1129,9 @@ mod mtls_oauth2_e2e {
 
     /// A stub NRF that answers the access-token endpoint with `token`.
     async fn start_stub_nrf(token: String) -> (SbiServer, u16) {
-        let port = crate::test_support::free_port();
-        let server = SbiServer::new(SbiServerConfig::new(SocketAddr::from((
-            [127, 0, 0, 1],
-            port,
-        ))));
+        let (listener, addr) = crate::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
         server
             .start(move |_req: SbiRequest| {
                 let token = token.clone();
@@ -1157,7 +1154,8 @@ mod mtls_oauth2_e2e {
     /// The producer: mTLS listener that requires an OAuth2 token whose audience
     /// is its own NF type, configured through the PRODUCTION profile.
     async fn start_producer(pki: &Pki, jwks: serde_json::Value) -> (SbiServer, u16) {
-        let port = crate::test_support::free_port();
+        let (listener, addr) = crate::test_support::bound_listener().into_parts();
+        let port = addr.port();
         let policy = SbiSecurityPolicy {
             tls_paths: TlsPaths {
                 cert: pki.server_cert.clone(),
@@ -1169,7 +1167,7 @@ mod mtls_oauth2_e2e {
             },
             ..SbiSecurityPolicy::production()
         };
-        let mut cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
+        let mut cfg = SbiServerConfig::new(addr);
         // A static JWKS stands in for the NRF's live one, so the producer's
         // verification is exercised without a second network dependency.
         cfg.oauth2_jwks = Some(jwks);
@@ -1183,7 +1181,7 @@ mod mtls_oauth2_e2e {
         .expect("production profile applies");
         assert!(cfg.verify_client && cfg.require_oauth2);
 
-        let server = SbiServer::new(cfg);
+        let server = SbiServer::on_listener(cfg, listener);
         server
             .start(|_req: SbiRequest| async move { SbiResponse::ok() })
             .await
@@ -1380,7 +1378,8 @@ mod mtls_oauth2_e2e {
         let pki = pki_with_uri_san("peercert", "urn:uuid:consumer-42");
         let signing = crate::oauth::generate_es256_key();
 
-        let port = crate::test_support::free_port();
+        let (listener, addr) = crate::test_support::bound_listener().into_parts();
+        let port = addr.port();
         let policy = SbiSecurityPolicy {
             tls_paths: TlsPaths {
                 cert: pki.server_cert.clone(),
@@ -1392,7 +1391,7 @@ mod mtls_oauth2_e2e {
             },
             ..SbiSecurityPolicy::production()
         };
-        let mut cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
+        let mut cfg = SbiServerConfig::new(addr);
         cfg.oauth2_jwks = Some(jwks(signing.verifying_key()));
         let cfg = apply_sbi_security_policy(
             cfg,
@@ -1404,7 +1403,7 @@ mod mtls_oauth2_e2e {
         .expect("production profile applies");
 
         // The handler reports back what identity the server saw.
-        let server = SbiServer::new(cfg);
+        let server = SbiServer::on_listener(cfg, listener);
         server
             .start(|req: SbiRequest| async move {
                 let seen = req.peer_cert_nf_instance_id.clone().unwrap_or_default();
@@ -1444,11 +1443,9 @@ mod mtls_oauth2_e2e {
     /// identity is `None` rather than anything a caller could act on.
     #[tokio::test]
     async fn a_plaintext_connection_surfaces_no_peer_identity() {
-        let port = crate::test_support::free_port();
-        let server = SbiServer::new(SbiServerConfig::new(SocketAddr::from((
-            [127, 0, 0, 1],
-            port,
-        ))));
+        let (listener, addr) = crate::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
         server
             .start(|req: SbiRequest| async move {
                 let present = req.peer_cert_nf_instance_id.is_some();

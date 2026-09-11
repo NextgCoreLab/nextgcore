@@ -266,8 +266,8 @@ mod tests {
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&seen);
-        let addr = nextgcore_sbi::test_support::ephemeral_addr();
-        let server = SbiServer::new(SbiServerConfig::new(addr));
+        let (addr_listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), addr_listener);
         server
             .start(move |req: SbiRequest| {
                 let sink = Arc::clone(&sink);

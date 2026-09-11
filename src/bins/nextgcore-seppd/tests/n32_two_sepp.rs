@@ -16,7 +16,6 @@
 //! 5. Capability mismatch -> negotiation failure (HTTP 400,
 //!    NEGOTIATION_NOT_ALLOWED)
 
-use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -30,12 +29,25 @@ use nextgcore_seppd::prins::{protect_message, N32fErrorType};
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const PHASE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// A loopback port for a peer that binds it itself.
+///
+/// #313 replaced the probe-drop shape with a reservation everywhere the server
+/// is an `SbiServer` this process starts. **The three callers here cannot take
+/// one**, and the reasons are structural rather than effort:
+///
+/// - `ChildSepp::spawn_inner` passes its two ports to a real CHILD PROCESS on
+///   the command line. A bound listener cannot travel that way without fd
+///   inheritance, which nothing in this tree does.
+/// - `n32_error_reports_are_delivered_to_the_peer` hands its port to
+///   `start_n32_listener(host, port, tls)`, a PRODUCTION entry point whose
+///   signature is a configured host and port. Threading a listener through it
+///   would change production API for a test's benefit.
+///
+/// What this does fix is that the copy was raw: it had no in-process issued-port
+/// set at all, so two threads in this binary could be handed the same port. It
+/// now delegates to the shared helper, which has one.
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("bind ephemeral")
-        .local_addr()
-        .expect("local addr")
-        .port()
+    nextgcore_sbi::test_support::free_port()
 }
 
 /// A peer SEPP running as a real child process; killed on drop.

@@ -663,15 +663,6 @@ mod oauth2_h8_tests {
     use std::net::SocketAddr;
     use std::time::Duration;
 
-    /// Reserve a loopback port for a test server.
-    ///
-    /// Delegates to the shared helper: 21 crates each had a private
-    /// probe-and-drop copy of this, which is TOCTOU and flaked under parallel
-    /// `cargo test`. One implementation means one place to harden.
-    fn free_port() -> u16 {
-        nextgcore_sbi::test_support::free_port()
-    }
-
     fn build_es256_token(
         sk: &p256::ecdsa::SigningKey,
         kid: &str,
@@ -712,12 +703,13 @@ mod oauth2_h8_tests {
 
     async fn start_server(jwks: serde_json::Value) -> (SbiServer, u16) {
         super::dccf_context_init(256);
-        let port = free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         let mut cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
         cfg.require_oauth2 = true;
         cfg.oauth2_jwks = Some(jwks);
         cfg = cfg.with_expected_audience_nf_type(NfType::Dccf);
-        let server = SbiServer::new(cfg);
+        let server = SbiServer::on_listener(cfg, port_listener);
         server
             .start(dccf_request_handler)
             .await
@@ -851,11 +843,12 @@ mod data_management_tests {
     async fn spawn_consumer() -> (SbiServer, u16, Arc<StdMutex<Vec<serde_json::Value>>>) {
         let seen: Arc<StdMutex<Vec<serde_json::Value>>> = Arc::new(StdMutex::new(Vec::new()));
         let sink = seen.clone();
-        let port = nextgcore_sbi::test_support::free_port();
-        let server = SbiServer::new(SbiServerConfig::new(SocketAddr::from((
-            [127, 0, 0, 1],
-            port,
-        ))));
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
+        let server = SbiServer::on_listener(
+            SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+            port_listener,
+        );
         server
             .start(move |req: SbiRequest| {
                 let sink = sink.clone();
@@ -1175,11 +1168,13 @@ mod data_management_tests {
             // Producer: counts the subscriptions created on it.
             let created = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let counter = created.clone();
-            let producer_port = nextgcore_sbi::test_support::free_port();
-            let producer = SbiServer::new(SbiServerConfig::new(SocketAddr::from((
-                [127, 0, 0, 1],
-                producer_port,
-            ))));
+            let (producer_listener, producer_addr) =
+                nextgcore_sbi::test_support::bound_listener().into_parts();
+            let producer_port = producer_addr.port();
+            let producer = SbiServer::on_listener(
+                SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], producer_port))),
+                producer_listener,
+            );
             producer
                 .start(move |req: SbiRequest| {
                     let counter = counter.clone();
@@ -1197,11 +1192,13 @@ mod data_management_tests {
 
             // NRF: answers the NF profile retrieval with an event-exposure service
             // pointing at the producer above.
-            let nrf_port = nextgcore_sbi::test_support::free_port();
-            let nrf = SbiServer::new(SbiServerConfig::new(SocketAddr::from((
-                [127, 0, 0, 1],
-                nrf_port,
-            ))));
+            let (nrf_listener, nrf_addr) =
+                nextgcore_sbi::test_support::bound_listener().into_parts();
+            let nrf_port = nrf_addr.port();
+            let nrf = SbiServer::on_listener(
+                SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], nrf_port))),
+                nrf_listener,
+            );
             nrf.start(move |_req: SbiRequest| async move {
                 SbiResponse::ok()
                     .with_json_body(&serde_json::json!({

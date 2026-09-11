@@ -1833,9 +1833,10 @@ mod tests {
             Resp::with_status(404)
         }
 
-        let port = nextgcore_sbi::test_support::free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let server = SbiServer::new(SbiServerConfig::new(addr));
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), port_listener);
         server.start(stub_smf).await.expect("start stub SMF");
 
         let uri = format!("http://127.0.0.1:{port}/nsmf-callback/v1/sm-policy-notify/42");
@@ -1907,9 +1908,10 @@ mod tests {
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
         use std::time::Duration;
 
-        let port = nextgcore_sbi::test_support::free_port();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let server = SbiServer::new(SbiServerConfig::new(addr));
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), port_listener);
 
         // Mock NRF/UDR: the closure captures its own port so the NRF
         // SearchResult advertises a UDR endpoint that points back at itself.
