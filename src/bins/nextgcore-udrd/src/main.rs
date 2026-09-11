@@ -1028,6 +1028,29 @@ async fn handle_auth_data(
                     .and_then(|s| u64::from_str_radix(s, 16).ok())
                     .unwrap_or(0),
                 auth_method,
+                // #115: TS 29.505 `algorithmId` and `encTopcKey`. Both optional, both
+                // stored verbatim — `algorithmId` because the spec makes its values
+                // HPLMN-operator specific and the UDR is not the component that
+                // interprets them, `encTopcKey` because it is opaque key material.
+                //
+                // Validated for LENGTH and hex-ness though, like `encPermanentKey`
+                // above: a TOPc that is not 32 bytes cannot be used by TUAK at all, and
+                // discovering that at authentication time turns a provisioning mistake
+                // into an outage. `top` is accepted under the same rule so an operator
+                // can provision TOP and let the UDR derive TOPc (TS 35.231 §7.1).
+                algorithm_id: body
+                    .get("algorithmId")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string()),
+                topc_hex: match validate_optional_key_256(&body, "encTopcKey") {
+                    Ok(v) => v,
+                    Err(resp) => return *resp,
+                },
+                top_hex: match validate_optional_key_256(&body, "top") {
+                    Ok(v) => v,
+                    Err(resp) => return *resp,
+                },
             };
             match nextgcore_dbi::subscription::nextgcore_dbi_provision_auth_info_async(
                 supi.to_string(),
@@ -3714,6 +3737,32 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 /// The SequenceNumber object carries `sqnScheme` and `indLength` alongside the
 /// 12-hex-digit `sqn` per the TS 29.505 SequenceNumber shape (the UE-side IND
 /// is 5 bits per TS 33.102 SQN array management).
+/// Validate an optional 256-bit key member provisioned as hex (#115).
+///
+/// Returns `Ok(None)` when absent — which is the normal case for every non-TUAK
+/// subscriber — and a 400 when present but not 64 hex characters. Rejecting at
+/// provisioning time rather than at authentication time is the point: TS 35.231's TOP and
+/// TOPc are 256-bit, and a short or non-hex value silently becomes a zero-padded key that
+/// authenticates against nothing.
+fn validate_optional_key_256(
+    body: &serde_json::Value,
+    member: &str,
+) -> Result<Option<String>, Box<SbiResponse>> {
+    match body.get(member).and_then(|v| v.as_str()) {
+        None => Ok(None),
+        Some("") => Ok(None),
+        Some(s) if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            Ok(Some(s.to_string()))
+        }
+        Some(_) => Err(Box::new(send_error(
+            400,
+            "Bad Request",
+            &format!("{member} must be 64 hex characters (a 256-bit TUAK operator field)"),
+            Some("MANDATORY_IE_INCORRECT"),
+        ))),
+    }
+}
+
 fn build_auth_subscription_json(
     supi: &str,
     auth_info: &nextgcore_dbi::subscription::NextgcoreDbiAuthInfo,
@@ -3735,7 +3784,7 @@ fn build_auth_subscription_json(
     const IND_MASK: u64 = (1u64 << IND_LENGTH) - 1; // 0x1F
     let sqn_zeroed = (auth_info.sqn & SQN_48_MASK) & !IND_MASK;
 
-    serde_json::json!({
+    let mut out = serde_json::json!({
         "authenticationMethod": auth_method,
         "encPermanentKey": bytes_to_hex(&auth_info.k),
         "encOpcKey": bytes_to_hex(if auth_info.use_opc { &auth_info.opc } else { &auth_info.op }),
@@ -3746,7 +3795,29 @@ fn build_auth_subscription_json(
             "sqn": format!("{sqn_zeroed:012x}"),
             "indLength": IND_LENGTH
         }
-    })
+    });
+
+    // #115: TS 29.505 `algorithmId` and `encTopcKey`, both optional (0..1) and both
+    // OMITTED when not provisioned rather than emitted as empty strings — an empty
+    // `algorithmId` is not "MILENAGE", it is a value the UDM would have to interpret,
+    // and the whole point of the field being absent is that there is nothing to
+    // interpret. Every subscriber provisioned before #115 therefore serialises exactly
+    // as it did before.
+    if let Some(obj) = out.as_object_mut() {
+        if !auth_info.algorithm_id.is_empty() {
+            obj.insert(
+                "algorithmId".to_string(),
+                serde_json::json!(auth_info.algorithm_id),
+            );
+        }
+        if auth_info.use_topc {
+            obj.insert(
+                "encTopcKey".to_string(),
+                serde_json::json!(bytes_to_hex(&auth_info.topc)),
+            );
+        }
+    }
+    out
 }
 
 /// Lossless AMBR formatter (udrd-02).
@@ -6553,5 +6624,133 @@ udr:
         );
         // No filter: unchanged.
         assert_eq!(filter_sm_policy_data(&doc, None, None), Some(doc));
+    }
+    // ------------------------------------------------------------------
+    // algorithmId / encTopcKey in AuthenticationSubscription (#115)
+    // ------------------------------------------------------------------
+
+    fn auth_info_with(
+        algorithm_id: &str,
+        topc: Option<[u8; 32]>,
+    ) -> nextgcore_dbi::subscription::NextgcoreDbiAuthInfo {
+        let mut info = nextgcore_dbi::subscription::NextgcoreDbiAuthInfo {
+            k: [0xab; 16],
+            use_opc: true,
+            opc: [0x55; 16],
+            op: [0u8; 16],
+            amf: [0x80, 0x00],
+            rand: [0u8; 16],
+            sqn: 0x21,
+            authentication_method: "5G_AKA".to_string(),
+            algorithm_id: algorithm_id.to_string(),
+            topc: [0u8; 32],
+            top: [0u8; 32],
+            use_topc: false,
+        };
+        if let Some(topc) = topc {
+            info.topc = topc;
+            info.use_topc = true;
+        }
+        info
+    }
+
+    /// TS 29.505 §5.2.3: `algorithmId` and `encTopcKey` are served when provisioned.
+    #[test]
+    fn the_auth_subscription_serves_algorithm_id_and_enc_topc_key() {
+        let topc = [0x7a; 32];
+        let json = build_auth_subscription_json(
+            "imsi-001010000000001",
+            &auth_info_with("tuak", Some(topc)),
+        );
+
+        assert_eq!(json["algorithmId"], "tuak");
+        assert_eq!(
+            json["encTopcKey"].as_str().unwrap().len(),
+            64,
+            "a 256-bit TOPc serialises as 64 hex characters"
+        );
+        assert_eq!(
+            json["encTopcKey"].as_str().unwrap(),
+            "7a".repeat(32),
+            "and it must be the bytes that were stored, not a re-derivation"
+        );
+        // The pre-existing members are untouched.
+        assert_eq!(json["authenticationMethod"], "5G_AKA");
+        assert_eq!(json["encPermanentKey"], "ab".repeat(16));
+    }
+
+    /// A subscriber with neither member serialises exactly as it did before #115.
+    ///
+    /// The members are OMITTED, not emitted as empty strings: TS 29.505 makes them 0..1,
+    /// and an empty `algorithmId` is a value the UDM would have to interpret rather than
+    /// the absence of one. This is the assertion that keeps every existing subscriber
+    /// working.
+    #[test]
+    fn a_subscriber_without_them_serialises_as_before() {
+        let json = build_auth_subscription_json("imsi-001010000000002", &auth_info_with("", None));
+        assert!(
+            json.get("algorithmId").is_none(),
+            "absent, not empty: found {:?}",
+            json.get("algorithmId")
+        );
+        assert!(json.get("encTopcKey").is_none(), "absent, not empty");
+        // And the response still carries everything it always did.
+        for member in [
+            "authenticationMethod",
+            "encPermanentKey",
+            "encOpcKey",
+            "authenticationManagementField",
+            "supi",
+            "sequenceNumber",
+        ] {
+            assert!(json.get(member).is_some(), "{member} must still be served");
+        }
+    }
+
+    /// An `algorithmId` with no TOPc still serves the identifier: the UDR stores what it
+    /// was given and does not second-guess the provisioning, which is what makes the
+    /// UDM's own refusal the place that failure is reported.
+    #[test]
+    fn an_algorithm_id_without_a_topc_is_still_served() {
+        let json =
+            build_auth_subscription_json("imsi-001010000000003", &auth_info_with("tuak", None));
+        assert_eq!(json["algorithmId"], "tuak");
+        assert!(json.get("encTopcKey").is_none());
+    }
+
+    /// A 256-bit operator field must be exactly 64 hex characters at provisioning time.
+    ///
+    /// Rejecting here rather than at authentication time is the point: a short TOPc
+    /// becomes a zero-padded key that authenticates against nothing, and the operator
+    /// would see it as a UE-side MAC failure rather than as the typo it is.
+    #[test]
+    fn a_malformed_operator_field_is_refused_at_provisioning() {
+        let ok = serde_json::json!({ "encTopcKey": "7a".repeat(32) });
+        assert_eq!(
+            validate_optional_key_256(&ok, "encTopcKey").unwrap(),
+            Some("7a".repeat(32))
+        );
+
+        // Absent and empty are both fine — the normal case for every MILENAGE subscriber.
+        assert_eq!(
+            validate_optional_key_256(&serde_json::json!({}), "encTopcKey").unwrap(),
+            None
+        );
+        assert_eq!(
+            validate_optional_key_256(&serde_json::json!({ "encTopcKey": "" }), "encTopcKey")
+                .unwrap(),
+            None
+        );
+
+        // Too short, too long, and not hex are all 400.
+        for bad in ["7a".repeat(16), "7a".repeat(33), "z".repeat(64)] {
+            let body = serde_json::json!({ "encTopcKey": bad });
+            let err = validate_optional_key_256(&body, "encTopcKey")
+                .expect_err("a malformed 256-bit field must be refused");
+            assert_eq!(
+                err.status, 400,
+                "and refused with 400, not silently dropped"
+            );
+        }
     }
 }

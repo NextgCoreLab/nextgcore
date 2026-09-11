@@ -24,6 +24,20 @@ pub struct NextgcoreDbiAuthInfo {
     /// or "EAP_AKA_PRIME". Empty for subscriber docs provisioned before this
     /// field existed; the UDR GET builder then defaults to "5G_AKA".
     pub authentication_method: String,
+    /// TS 29.505 `algorithmId` (#115): which f1-f5* parameter set generates this
+    /// subscriber's authentication vectors. Empty when not provisioned, which the UDM
+    /// treats as MILENAGE — the behaviour every existing subscriber already has.
+    pub algorithm_id: String,
+    /// TUAK TOPc (TS 35.231 §6.1), 256-bit. Populated iff `use_topc`.
+    pub topc: [u8; 32],
+    /// TUAK TOP, 256-bit, from which TOPc is derived when only TOP is provisioned.
+    pub top: [u8; 32],
+    /// Whether `topc` holds usable material.
+    ///
+    /// The same shape as `use_opc`, and for the same reason: a consumer must be able to
+    /// tell "no TUAK operator field provisioned" from "an all-zero one", because the
+    /// second would silently authenticate against the wrong key rather than failing.
+    pub use_topc: bool,
 }
 
 /// Get authentication info for a subscriber
@@ -146,6 +160,37 @@ pub(crate) fn parse_auth_info(security: &Document, supi: &str) -> NextgcoreDbiAu
         auth_info.authentication_method = m.to_string();
     }
 
+    // #115: TS 29.505 algorithmId, opaque. Absent for every subscriber provisioned
+    // before TUAK existed, which the UDM reads as MILENAGE.
+    if let Ok(id) = security.get_str(NEXTGCORE_ALGORITHM_ID_STRING) {
+        auth_info.algorithm_id = id.to_string();
+    }
+
+    // #115: the TUAK operator field. TOPc directly if provisioned, otherwise derived
+    // from TOP and K — the same precedence as OPc/OP above, and for the same reason:
+    // provisioning wins, because deriving over operator-supplied material would discard
+    // it, and serving TOP where TOPc is wanted would authenticate against the wrong key.
+    if let Ok(topc_str) = security.get_str(NEXTGCORE_TOPC_STRING) {
+        nextgcore_ascii_to_hex(topc_str, &mut auth_info.topc);
+        auth_info.use_topc = true;
+    }
+    if let Ok(top_str) = security.get_str(NEXTGCORE_TOP_STRING) {
+        nextgcore_ascii_to_hex(top_str, &mut auth_info.top);
+        if !auth_info.use_topc {
+            match nextgcore_crypt::tuak::tuak_topc(&auth_info.top, &auth_info.k, 1) {
+                Ok(topc) => {
+                    auth_info.topc = topc;
+                    auth_info.use_topc = true;
+                }
+                Err(e) => log::error!(
+                    "TUAK TOPc derivation from TOP failed for {supi}: {e}. TUAK \
+                     authentication will fail for this subscriber -- provision topc \
+                     directly, or fix the k/top values."
+                ),
+            }
+        }
+    }
+
     auth_info
 }
 
@@ -261,6 +306,12 @@ pub struct NextgcoreDbiAuthProvision {
     pub sqn: u64,
     /// Authentication method (TS 29.505 AuthMethod), e.g. "5G_AKA" / "EAP_AKA_PRIME".
     pub auth_method: String,
+    /// TS 29.505 `algorithmId` (#115), opaque and operator-specific.
+    pub algorithm_id: Option<String>,
+    /// TS 29.505 `encTopcKey`: TUAK TOPc as 64 hex characters.
+    pub topc_hex: Option<String>,
+    /// TUAK TOP as 64 hex characters, when TOPc is not provisioned directly.
+    pub top_hex: Option<String>,
 }
 
 /// Create or replace the authentication subscription for a subscriber.
@@ -301,6 +352,28 @@ pub fn nextgcore_dbi_provision_auth_info(
         set.insert(
             format!("{}.{}", NEXTGCORE_SECURITY_STRING, NEXTGCORE_OP_STRING),
             op.as_str(),
+        );
+    }
+    // #115
+    if let Some(id) = &p.algorithm_id {
+        set.insert(
+            format!(
+                "{}.{}",
+                NEXTGCORE_SECURITY_STRING, NEXTGCORE_ALGORITHM_ID_STRING
+            ),
+            id.as_str(),
+        );
+    }
+    if let Some(topc) = &p.topc_hex {
+        set.insert(
+            format!("{}.{}", NEXTGCORE_SECURITY_STRING, NEXTGCORE_TOPC_STRING),
+            topc.as_str(),
+        );
+    }
+    if let Some(top) = &p.top_hex {
+        set.insert(
+            format!("{}.{}", NEXTGCORE_SECURITY_STRING, NEXTGCORE_TOP_STRING),
+            top.as_str(),
         );
     }
 

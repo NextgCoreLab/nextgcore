@@ -1048,35 +1048,37 @@ mod tests {
     }
 
     fn create_test_amf_ue() -> AmfUe {
-        AmfUe {
-            id: 1,
-            ran_ue_id: 1,
-            access_type: 1,
-            nas_tsc: 0,
-            nas_ksi: 1,
-            selected_enc_algorithm: 1,
-            selected_int_algorithm: 2,
-            abba: [0x00, 0x00],
-            abba_len: 2,
-            rand: [0u8; 16],
-            autn: vec![0u8; 16],
-            ue_security_capability: crate::context::UeSecurityCapability {
-                ea: 0xf0,
-                ia: 0xf0,
-                eea: 0,
-                eia: 0,
-            },
-            next_guti: Guti5gs {
-                plmn_id: PlmnId::new("001", "01"),
-                amf_region_id: 1,
-                amf_set_id: 1,
-                amf_pointer: 1,
-                tmsi: 0x12345678,
-            },
-            pdu_session_status_present: false,
-            sessions: vec![],
-            ..Default::default()
-        }
+        // #115: `AmfUe` implements `Drop` (key zeroization), and the
+        // `..Default::default()` functional-update form is not allowed on a `Drop`
+        // type — it would move fields out of the default value. Built then mutated.
+        let mut ue = AmfUe::default();
+        ue.id = 1;
+        ue.ran_ue_id = 1;
+        ue.access_type = 1;
+        ue.nas_tsc = 0;
+        ue.nas_ksi = 1;
+        ue.selected_enc_algorithm = 1;
+        ue.selected_int_algorithm = 2;
+        ue.abba = [0x00, 0x00];
+        ue.abba_len = 2;
+        ue.rand = [0u8; 16];
+        ue.autn = vec![0u8; 16];
+        ue.ue_security_capability = crate::context::UeSecurityCapability {
+            ea: 0xf0,
+            ia: 0xf0,
+            eea: 0,
+            eia: 0,
+        };
+        ue.next_guti = Guti5gs {
+            plmn_id: PlmnId::new("001", "01"),
+            amf_region_id: 1,
+            amf_set_id: 1,
+            amf_pointer: 1,
+            tmsi: 0x12345678,
+        };
+        ue.pdu_session_status_present = false;
+        ue.sessions = vec![];
+        ue
     }
 
     #[test]

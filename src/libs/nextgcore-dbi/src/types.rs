@@ -54,6 +54,20 @@ pub const NEXTGCORE_AMF_STRING: &str = "amf";
 pub const NEXTGCORE_RAND_STRING: &str = "rand";
 pub const NEXTGCORE_SQN_STRING: &str = "sqn";
 pub const NEXTGCORE_AUTH_METHOD_STRING: &str = "authenticationMethod";
+/// TS 29.505 `AuthenticationSubscription.algorithmId` (#115).
+///
+/// An OPAQUE, HPLMN-operator-specific handle, not an enum: the spec says it
+/// "identifies a parameter set securely stored in the UDM (ARPF) that provides details
+/// on the algorithm and parameters used to generate authentication vectors. Values and
+/// their meaning are HPLMN-operator specific." So the UDR stores whatever was
+/// provisioned and the UDM interprets it — which is why this is a `String` here and a
+/// lookup there, rather than an enum in either place.
+pub const NEXTGCORE_ALGORITHM_ID_STRING: &str = "algorithmId";
+/// TS 29.505 `AuthenticationSubscription.encTopcKey` (#115): the TUAK operator-variant
+/// field TOPc, the counterpart of MILENAGE's OPc. 256-bit, so 64 hex characters.
+pub const NEXTGCORE_TOPC_STRING: &str = "topc";
+/// The 256-bit TUAK operator field TOP, from which TOPc is derived (TS 35.231 §6.1).
+pub const NEXTGCORE_TOP_STRING: &str = "top";
 pub const NEXTGCORE_MME_HOST_STRING: &str = "mme_host";
 pub const NEXTGCORE_MME_REALM_STRING: &str = "mme_realm";
 pub const NEXTGCORE_MME_TIMESTAMP_STRING: &str = "mme_timestamp";

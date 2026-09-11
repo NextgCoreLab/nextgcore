@@ -17,6 +17,7 @@ pub mod ml_kem; // ML-KEM (CRYSTALS-Kyber) post-quantum KEM
 pub mod sha; // SHA-1 and SHA-2
 pub mod snow3g; // SNOW 3G stream cipher
 pub mod snow5g;
+pub mod tuak; // TUAK algorithm set (TS 35.231), the Keccak-based alternative to MILENAGE
 pub mod zuc; // ZUC stream cipher
 pub mod zuc256; // ZUC-256 stream cipher (256-bit security) // SNOW5G stream cipher (placeholder)
 

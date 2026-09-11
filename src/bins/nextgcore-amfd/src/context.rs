@@ -1997,6 +1997,41 @@ pub struct AmfUeMemento {
     pub selected_int_algorithm: u8,
 }
 
+impl AmfUeMemento {
+    /// Clear every piece of long-lived key material this memento holds
+    /// (#115, TS 33.501 §5.9).
+    ///
+    /// A memento is a *copy* of a live UE's security context, taken so a failed
+    /// procedure can be rolled back — so it is a second place the same keys live, and
+    /// dropping it without clearing leaves them recoverable in freed heap for the rest
+    /// of the process's life.
+    pub fn zeroize_keys(&mut self) {
+        use zeroize::Zeroize;
+        self.kamf.zeroize();
+        self.knas_int.zeroize();
+        self.knas_enc.zeroize();
+        self.kgnb.zeroize();
+        self.nh.zeroize();
+        // Not keys, but they are the authentication challenge and the expected
+        // response: retaining them alongside a cleared KAMF would still let an
+        // attacker with memory access replay or verify against them.
+        self.rand.zeroize();
+        self.hxres_star.zeroize();
+    }
+}
+
+impl Drop for AmfUe {
+    fn drop(&mut self) {
+        self.zeroize_keys();
+    }
+}
+
+impl Drop for AmfUeMemento {
+    fn drop(&mut self) {
+        self.zeroize_keys();
+    }
+}
+
 // ============================================================================
 // NAS State
 // ============================================================================
@@ -2412,6 +2447,49 @@ pub enum SnpnOnboardingState {
 }
 
 impl AmfUe {
+    /// Clear every piece of long-lived key material this UE context holds
+    /// (#115, TS 33.501 §5.9 / §6.2).
+    ///
+    /// # Why `Drop` rather than a call in `amf_ue_remove`
+    ///
+    /// `AmfContext::amf_ue_remove` RETURNS the removed context, and its own body reads
+    /// `removed.supi` afterwards — so zeroizing there would either clear a value the
+    /// caller is about to use, or have to be sequenced after every caller's last read,
+    /// which is exactly the kind of ordering obligation that goes stale. Doing it in
+    /// `Drop` covers every teardown path there is, including the ones a grep for
+    /// "remove" would not find: a UE dropped when a procedure aborts, a clone taken for
+    /// a memento, and the whole-list clear in `amf_ue_remove_all`.
+    ///
+    /// `AmfUe` is `Clone`, and each clone clears only its OWN buffers — which is the
+    /// wanted behaviour, since each copy is separately recoverable memory.
+    ///
+    /// # Deviation from the issue's suggested approach
+    ///
+    /// #115 suggests wrapping the fields in `Zeroizing`. This uses the `Zeroize` trait
+    /// on the existing arrays instead, for two reasons: the field types are read at 75
+    /// sites across amfd and a wrapper would need `Zeroizing::new` at every write (a
+    /// missed one is a silent regression, and the compiler cannot tell a forgotten wrap
+    /// from an intentional plain array); and it matches the precedent #115 itself cites
+    /// as already-correct, `ausfd`'s `AusfUe::zeroize`. The security property the
+    /// criterion asks for — cleared on drop, not elided by the optimiser, test-asserted
+    /// — is what `Zeroize` provides; `ausfd`'s plain `= [0u8; 32]` does not, and is
+    /// worth converting separately.
+    pub fn zeroize_keys(&mut self) {
+        use zeroize::Zeroize;
+        // The 5G key hierarchy this context holds (TS 33.501 §6.2).
+        self.kamf.zeroize();
+        self.knas_int.zeroize();
+        self.knas_enc.zeroize();
+        self.kgnb.zeroize();
+        self.nh.zeroize();
+        // The authentication challenge and expected-response material. Not keys, but
+        // retaining them beside cleared keys still leaves something to verify against.
+        self.rand.zeroize();
+        self.autn.zeroize();
+        self.xres_star.zeroize();
+        self.hxres_star.zeroize();
+    }
+
     /// Start SNPN-specific authentication
     /// Returns true if SNPN authentication should proceed
     pub fn start_snpn_auth(&mut self, nid: &str) -> bool {
@@ -3988,5 +4066,199 @@ mod tests {
         // Restore the process-wide default (never leave the canary ON).
         set_nas_security_canary(false);
         assert!(!nas_security_canary());
+    }
+    // ------------------------------------------------------------------
+    // Key zeroization (#115, TS 33.501 §5.9)
+    // ------------------------------------------------------------------
+
+    /// Fill every key buffer with a recognisable non-zero pattern.
+    fn ue_with_key_material() -> AmfUe {
+        let mut ue = AmfUe::default();
+        ue.kamf = [0xa1; NEXTGCORE_SHA256_DIGEST_SIZE];
+        ue.knas_int = [0xa2; NEXTGCORE_SHA256_DIGEST_SIZE / 2];
+        ue.knas_enc = [0xa3; NEXTGCORE_SHA256_DIGEST_SIZE / 2];
+        ue.kgnb = [0xa4; NEXTGCORE_SHA256_DIGEST_SIZE];
+        ue.nh = [0xa5; NEXTGCORE_SHA256_DIGEST_SIZE];
+        ue.rand = [0xa6; NEXTGCORE_RAND_LEN];
+        ue.autn = vec![0xa7; NEXTGCORE_AUTN_LEN];
+        ue.xres_star = [0xa8; NEXTGCORE_MAX_RES_LEN];
+        ue.hxres_star = [0xa9; NEXTGCORE_MAX_RES_LEN];
+        ue
+    }
+
+    /// Every long-lived key the 5G hierarchy puts in this context must be cleared.
+    ///
+    /// Enumerated field by field rather than asserted in bulk, so a key added later and
+    /// left out of `zeroize_keys` fails HERE with its own name rather than being covered
+    /// by a loop that only sees the fields it was written against.
+    #[test]
+    fn zeroize_keys_clears_every_key_buffer() {
+        let mut ue = ue_with_key_material();
+        // Precondition: the buffers really are non-zero, so the assertions below cannot
+        // pass against a context that never held anything.
+        assert!(ue.kamf.iter().any(|b| *b != 0));
+
+        ue.zeroize_keys();
+
+        assert_eq!(ue.kamf, [0u8; NEXTGCORE_SHA256_DIGEST_SIZE], "KAMF");
+        assert_eq!(
+            ue.knas_int,
+            [0u8; NEXTGCORE_SHA256_DIGEST_SIZE / 2],
+            "KNASint"
+        );
+        assert_eq!(
+            ue.knas_enc,
+            [0u8; NEXTGCORE_SHA256_DIGEST_SIZE / 2],
+            "KNASenc"
+        );
+        assert_eq!(ue.kgnb, [0u8; NEXTGCORE_SHA256_DIGEST_SIZE], "KgNB");
+        assert_eq!(ue.nh, [0u8; NEXTGCORE_SHA256_DIGEST_SIZE], "NH");
+        assert_eq!(ue.rand, [0u8; NEXTGCORE_RAND_LEN], "RAND");
+        // `autn` is a `Vec<u8>`, and `Zeroize for Vec` zeroes the whole capacity and
+        // then truncates — so "cleared" here means empty, with the backing bytes wiped
+        // before the allocation is released.
+        assert!(ue.autn.is_empty(), "AUTN");
+        assert_eq!(ue.xres_star, [0u8; NEXTGCORE_MAX_RES_LEN], "XRES*");
+        assert_eq!(ue.hxres_star, [0u8; NEXTGCORE_MAX_RES_LEN], "HXRES*");
+    }
+
+    /// Dropping the context must clear the keys, because that is the path every teardown
+    /// takes — including the ones a grep for "remove" would not find.
+    ///
+    /// # Why the value is dropped in place in memory this frame still owns
+    ///
+    /// The obvious formulation — `Box` it, keep a pointer, `drop` it, read the pointer —
+    /// reads memory that has been RETURNED TO THE ALLOCATOR, so whether the old bytes are
+    /// still there is the allocator's decision, not the code's. An earlier draft of this
+    /// test did exactly that and passed and failed on alternate runs against unchanged
+    /// code, which makes it worse than no test: it would have reported the zeroization
+    /// broken at random, and could equally have reported it working when it was not.
+    ///
+    /// `MaybeUninit` plus `drop_in_place` runs the same `Drop` over storage **this stack
+    /// frame owns for the whole test**, so nothing can reuse it and the read is
+    /// deterministic. That is the only difference; the destructor under test is identical.
+    #[test]
+    fn dropping_a_ue_context_clears_its_key_material() {
+        let mut slot = std::mem::MaybeUninit::<AmfUe>::uninit();
+        let ptr = slot.as_mut_ptr();
+        // SAFETY: `ptr` is a valid, aligned, uninitialised `AmfUe` slot owned by `slot`.
+        unsafe { ptr.write(ue_with_key_material()) };
+
+        let size = std::mem::size_of::<AmfUe>();
+        // SAFETY: `slot` is initialised by the write above and lives until end of scope.
+        let before = unsafe { std::slice::from_raw_parts(ptr as *const u8, size).to_vec() };
+        let kamf_pattern = [0xa1u8; NEXTGCORE_SHA256_DIGEST_SIZE];
+        assert!(
+            before
+                .windows(kamf_pattern.len())
+                .any(|w| w == kamf_pattern),
+            "precondition: the KAMF pattern must be present before the drop, or this test \
+             proves nothing"
+        );
+
+        // SAFETY: `slot` holds an initialised `AmfUe` and is not read as an `AmfUe`
+        // again. The storage itself remains owned by this frame.
+        unsafe { std::ptr::drop_in_place(ptr) };
+
+        // SAFETY: reading the DROPPED-but-still-owned storage as raw bytes. Nothing
+        // interprets the `String`/`Vec` fields, whose pointers are now dangling.
+        let after = unsafe { std::slice::from_raw_parts(ptr as *const u8, size).to_vec() };
+        assert!(
+            !after.windows(kamf_pattern.len()).any(|w| w == kamf_pattern),
+            "KAMF must not survive the drop in recoverable memory"
+        );
+        for (name, pattern) in [
+            ("KNASint", 0xa2u8),
+            ("KNASenc", 0xa3),
+            ("KgNB", 0xa4),
+            ("NH", 0xa5),
+        ] {
+            let needle = [pattern; 16];
+            assert!(
+                !after.windows(needle.len()).any(|w| w == needle),
+                "{name} must not survive the drop"
+            );
+        }
+    }
+
+    /// A clone clears its OWN buffers and leaves the original's alone, which is what makes
+    /// `Drop` safe on a `Clone` type holding keys.
+    #[test]
+    fn dropping_a_clone_does_not_clear_the_original() {
+        let ue = ue_with_key_material();
+        let clone = ue.clone();
+        assert_eq!(clone.kamf, ue.kamf);
+        drop(clone);
+        assert!(
+            ue.kamf.iter().all(|b| *b == 0xa1),
+            "the original must be untouched by a clone's teardown"
+        );
+    }
+
+    /// The memento is a SECOND copy of the same keys, so it is cleared too.
+    #[test]
+    fn zeroize_keys_clears_the_memento_copy() {
+        // Built then mutated: `AmfUeMemento` implements `Drop`, which forbids the
+        // `..Default::default()` functional-update form.
+        let mut memento = AmfUeMemento::default();
+        memento.kamf = [0xb1; NEXTGCORE_SHA256_DIGEST_SIZE];
+        memento.knas_int = [0xb2; NEXTGCORE_SHA256_DIGEST_SIZE / 2];
+        memento.knas_enc = [0xb3; NEXTGCORE_SHA256_DIGEST_SIZE / 2];
+        memento.kgnb = [0xb4; NEXTGCORE_SHA256_DIGEST_SIZE];
+        memento.nh = [0xb5; NEXTGCORE_SHA256_DIGEST_SIZE];
+        memento.rand = [0xb6; NEXTGCORE_RAND_LEN];
+        memento.hxres_star = [0xb7; NEXTGCORE_MAX_RES_LEN];
+        memento.zeroize_keys();
+        assert_eq!(memento.kamf, [0u8; NEXTGCORE_SHA256_DIGEST_SIZE]);
+        assert_eq!(memento.knas_int, [0u8; NEXTGCORE_SHA256_DIGEST_SIZE / 2]);
+        assert_eq!(memento.knas_enc, [0u8; NEXTGCORE_SHA256_DIGEST_SIZE / 2]);
+        assert_eq!(memento.kgnb, [0u8; NEXTGCORE_SHA256_DIGEST_SIZE]);
+        assert_eq!(memento.nh, [0u8; NEXTGCORE_SHA256_DIGEST_SIZE]);
+        assert_eq!(memento.rand, [0u8; NEXTGCORE_RAND_LEN]);
+        assert_eq!(memento.hxres_star, [0u8; NEXTGCORE_MAX_RES_LEN]);
+    }
+
+    /// A UE removed from the context has its keys cleared when the caller drops it, which
+    /// is the per-UE teardown the criterion asks about.
+    #[test]
+    fn a_ue_removed_from_the_context_has_its_keys_cleared_on_drop() {
+        let mut ctx = AmfContext::new();
+        // `AmfContext::new()` starts with `max_num_of_ue: 0`, so `amf_ue_add` refuses
+        // every UE until the configured limit is applied. Set explicitly here rather than
+        // worked around, because a test that silently got `None` and skipped would prove
+        // nothing.
+        ctx.init(2, 4, 4);
+        let ran_ue_id = 1u64;
+        let Some(mut ue) = ctx.amf_ue_add(ran_ue_id) else {
+            panic!("the context must allocate a UE");
+        };
+        ue.kamf = [0xc1; NEXTGCORE_SHA256_DIGEST_SIZE];
+        let id = ue.id;
+        ctx.amf_ue_update(&ue);
+
+        let removed = ctx.amf_ue_remove(id).expect("the UE must be removable");
+        assert!(
+            removed.kamf.iter().all(|b| *b == 0xc1),
+            "amf_ue_remove RETURNS the context, so its keys must still be readable here — \
+             zeroizing inside the removal would clear a value the caller is about to use"
+        );
+        // Dropped in place in storage this frame owns, for the reason spelled out on
+        // `dropping_a_ue_context_clears_its_key_material`: reading memory handed back to
+        // the allocator makes the assertion the allocator's decision rather than the
+        // destructor's.
+        let mut slot = std::mem::MaybeUninit::<AmfUe>::uninit();
+        let ptr = slot.as_mut_ptr();
+        // SAFETY: `ptr` is a valid, aligned, uninitialised `AmfUe` slot.
+        unsafe { ptr.write(removed) };
+        let size = std::mem::size_of::<AmfUe>();
+        // SAFETY: initialised above, and not read as an `AmfUe` afterwards.
+        unsafe { std::ptr::drop_in_place(ptr) };
+        // SAFETY: dropped-but-owned storage, read as raw bytes only.
+        let after = unsafe { std::slice::from_raw_parts(ptr as *const u8, size).to_vec() };
+        let needle = [0xc1u8; NEXTGCORE_SHA256_DIGEST_SIZE];
+        assert!(
+            !after.windows(needle.len()).any(|w| w == needle),
+            "the keys must be gone once the caller drops the removed context"
+        );
     }
 }

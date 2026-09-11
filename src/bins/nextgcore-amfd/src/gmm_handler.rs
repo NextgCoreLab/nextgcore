@@ -780,11 +780,12 @@ mod tests {
     use crate::gmm_build::registration_type;
 
     fn create_test_amf_ue() -> AmfUe {
-        AmfUe {
-            id: 1,
-            ran_ue_id: 1,
-            ..Default::default()
-        }
+        // #115: AmfUe implements Drop (key zeroization), which forbids the
+        // `..Default::default()` functional-update form.
+        let mut ue = AmfUe::default();
+        ue.id = 1;
+        ue.ran_ue_id = 1;
+        ue
     }
 
     fn create_test_ran_ue() -> RanUe {

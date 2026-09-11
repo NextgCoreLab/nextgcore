@@ -2985,6 +2985,16 @@ pub async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest)
         .get("encPermanentKey")
         .and_then(|v| v.as_str());
     let opc_hex = auth_sub_json.get("encOpcKey").and_then(|v| v.as_str());
+    // #115: TS 29.505 `algorithmId` and `encTopcKey`. Both optional — absent for every
+    // MILENAGE subscriber, which is every subscriber provisioned before #115.
+    let algorithm_id = auth_sub_json
+        .get("algorithmId")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let topc_hex = auth_sub_json
+        .get("encTopcKey")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let amf_hex = auth_sub_json
         .get("authenticationManagementField")
         .and_then(|v| v.as_str());
@@ -3026,6 +3036,25 @@ pub async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest)
 
     ue.serving_network_name = Some(serving_network_name.to_string());
     ue.supi = Some(supi.clone());
+    // #115
+    ue.algorithm_id = algorithm_id.clone();
+    ue.topc = topc_hex.as_deref().and_then(|hex| {
+        let bytes = crate::nudm_handler::hex_to_bytes(hex);
+        // Exactly 32 bytes, not "at least": a short TOPc zero-padded to length is a key
+        // that authenticates against nothing, and the failure would surface at the UE as
+        // a MAC failure rather than here as the provisioning error it is.
+        match <[u8; 32]>::try_from(bytes.as_slice()) {
+            Ok(topc) => Some(topc),
+            Err(_) => {
+                log::error!(
+                    "[{supi}] encTopcKey decoded to {} bytes, not the 32 a TUAK TOPc \
+                     needs; treating the subscriber as having none",
+                    bytes.len()
+                );
+                None
+            }
+        }
+    });
     // TS 33.501 §6.14.2.1 / §6.15.2.1: SoR and UPU protection must be computed
     // by the AUSF that holds this UE's K_AUSF, i.e. the one that authenticated
     // it. That is the AUSF named here, so record it now — before #84 the IE was
@@ -3124,15 +3153,44 @@ pub async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest)
     nextgcore_core::rand::nextgcore_random(&mut rand);
     ue.rand = rand;
 
-    let (autn, ik, ck, _ak, res) =
-        match nextgcore_crypt::milenage::milenage_generate(&ue.opc, &ue.amf, &ue.k, &ue.sqn, &rand)
-        {
-            Ok(result) => result,
-            Err(e) => {
-                log::error!("[{supi}] Milenage generate failed: {e:?}");
-                return nextgcore_sbi::server::send_internal_error("Milenage computation failed");
-            }
-        };
+    // #115: run the subscriber's own algorithm (TS 33.501 §6.1.3), chosen from the
+    // TS 29.505 `algorithmId` the UDR served. MILENAGE when nothing says otherwise, so
+    // every subscriber provisioned before #115 is unaffected.
+    //
+    // The choice and the computation both live in `av_algorithm`, which is the single
+    // decision point — inlining the `match` here would put the rule somewhere no test can
+    // reach without an SBI server and a UDR.
+    let algorithm = crate::av_algorithm::AvAlgorithm::from_algorithm_id(ue.algorithm_id.as_deref());
+    let av_inputs = crate::av_algorithm::AvInputs {
+        k: &ue.k,
+        opc: &ue.opc,
+        topc: ue.topc.as_ref(),
+        amf: &ue.amf,
+        sqn: &ue.sqn,
+        rand: &rand,
+    };
+    let (autn, ik, ck, _ak, res) = match crate::av_algorithm::generate_av(algorithm, &av_inputs) {
+        Ok(result) => result,
+        Err(crate::av_algorithm::AvError::MissingOperatorField { field }) => {
+            log::error!(
+                "[{supi}] algorithmId selects {algorithm:?} but {field} is not provisioned; \
+                 refusing to generate a vector rather than producing one the UE cannot \
+                 verify"
+            );
+            return send_problem(
+                500,
+                "UNSPECIFIED",
+                &format!("subscriber has no {field} provisioned for {algorithm:?}"),
+            );
+        }
+        Err(crate::av_algorithm::AvError::Algorithm(msg)) => {
+            log::error!("[{supi}] {msg}");
+            return nextgcore_sbi::server::send_internal_error(
+                "authentication vector computation failed",
+            );
+        }
+    };
+    log::info!("[{supi}] authentication vector generated with {algorithm:?}");
 
     // Step 5: Update UE context
     {

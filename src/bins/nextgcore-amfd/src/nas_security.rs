@@ -914,6 +914,29 @@ pub fn select_integrity_algorithm_with_pqc(
     }
 }
 
+/// Whether NIA0 (null NAS integrity) may be applied to a session with this 5GS
+/// registration type (TS 33.501 §6.7.2 / §5.11, #115).
+///
+/// §6.7.2 permits NIA0 only for an unauthenticated emergency session. Everything else —
+/// initial registration, mobility updating, periodic updating — must have real NAS
+/// integrity protection, so an NIA0 selection there is refused and the registration
+/// rejected.
+///
+/// # Why this is a function and not an inline check
+///
+/// It is the ONE decision point, called from exactly one place
+/// (`ngap_path::handle_authentication_response_nas`). Inlining it would leave the rule
+/// untestable without standing up an AUSF, an NGAP association and a UE, and duplicating
+/// it into a test would prove only that the copy agrees with itself.
+///
+/// It is deliberately NOT inside [`select_integrity_algorithm`]: that is a pure function
+/// of the UE and AMF algorithm masks and has no session to consult, and masking NIA0 out
+/// there would report an empty intersection — telling the operator their configuration is
+/// unsupported rather than that this particular request is refused.
+pub fn nia0_permitted(registration_type: u8) -> bool {
+    registration_type == crate::gmm_build::registration_type::EMERGENCY
+}
+
 /// NAS ciphering enforcement policy (Item 118)
 ///
 /// Controls whether null algorithms (NEA0/NIA0) are accepted.
@@ -2044,6 +2067,80 @@ mod tests {
         assert_eq!(
             ue.ul_count, 0x0000_0100,
             "overflow octet incremented exactly once"
+        );
+    }
+    // ------------------------------------------------------------------
+    // NIA0 emergency-only gate (#115)
+    // ------------------------------------------------------------------
+
+    /// TS 33.501 §6.7.2: NIA0 is for unauthenticated EMERGENCY sessions and nothing else.
+    #[test]
+    fn nia0_is_permitted_only_for_an_emergency_registration() {
+        use crate::gmm_build::registration_type;
+
+        assert!(
+            nia0_permitted(registration_type::EMERGENCY),
+            "an emergency registration may run without NAS integrity (§6.7.2)"
+        );
+        for (rt, name) in [
+            (registration_type::INITIAL, "initial"),
+            (registration_type::MOBILITY_UPDATING, "mobility updating"),
+            (registration_type::PERIODIC_UPDATING, "periodic updating"),
+        ] {
+            assert!(
+                !nia0_permitted(rt),
+                "a {name} registration must NOT be allowed to run with null integrity"
+            );
+        }
+        // An unset or reserved type is refused too: fail-closed is the whole point, and
+        // 0 is what an uninitialised context carries.
+        assert!(
+            !nia0_permitted(0),
+            "an unset registration type must be refused"
+        );
+        assert!(
+            !nia0_permitted(7),
+            "a reserved registration type must be refused"
+        );
+    }
+
+    /// The gate must key on the EMERGENCY constant specifically, so renumbering
+    /// `registration_type` cannot silently widen it.
+    #[test]
+    fn the_gate_keys_on_the_emergency_registration_type_value() {
+        assert_eq!(
+            crate::gmm_build::registration_type::EMERGENCY,
+            4,
+            "TS 24.501 §9.11.3.7 5GS registration type: emergency registration is 4"
+        );
+        for rt in 0u8..=15 {
+            assert_eq!(
+                nia0_permitted(rt),
+                rt == 4,
+                "only registration type 4 (emergency) may permit NIA0"
+            );
+        }
+    }
+
+    /// `select_integrity_algorithm` CAN return NIA0 — which is why the gate is needed.
+    ///
+    /// This pins the precondition the whole fix rests on. #115 described the AMF mask as
+    /// excluding NIA0, and `algorithm_order_to_mask`'s `0x0E` argument is only the default
+    /// for an EMPTY configured order; an operator that lists NIA0 gets bit 0 set, the
+    /// intersection is non-empty, and `Some(0)` comes back.
+    #[test]
+    fn the_selector_returns_nia0_when_it_is_the_only_common_algorithm() {
+        assert_eq!(
+            select_integrity_algorithm(0x01, 0x01),
+            Some(0),
+            "NIA0 is selectable when both sides offer only it — so applying the result \
+             without a session-level gate is what left ordinary registrations unprotected"
+        );
+        assert_eq!(
+            select_integrity_algorithm(0x01, 0x0E),
+            None,
+            "with NIA0 absent from the AMF mask the intersection is empty and the \
+             existing fail-close handles it"
         );
     }
 }
