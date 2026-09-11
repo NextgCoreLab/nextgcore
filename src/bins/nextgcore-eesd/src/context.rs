@@ -1614,6 +1614,26 @@ impl Default for EesContext {
 }
 
 /// Global EES context (thread-safe singleton).
+/// One agreement about every process-global in this crate: the EES context, the
+/// JWKS store, and the ECS role's enable switch and registry (#107).
+///
+/// Declared **beside the largest global it guards** rather than in `auth`, where it
+/// lived. That mattered as soon as #107 added a second process-global: a test for it
+/// naturally reached for a lock in `context`, which would have been a SECOND
+/// disjoint agreement over the same ambient state -- #308's defect, and #276 showed
+/// that shape HANGS the suite rather than merely flaking it. It cost one collateral
+/// failure in this PR before being collapsed, which is exactly how cheap the
+/// mistake is to make.
+///
+/// `auth::GLOBAL_STATE_TEST_LOCK` is now an alias for this static, so the 55 call
+/// sites that take it and the new ones that take this one are the same lock.
+///
+/// `relocation::PULL_HOOK_LOCK` is deliberately a second, INNER lock: it guards a
+/// different thing (the test pull hook's installed closure) and is already correct.
+/// Order, where both are needed: this one first.
+#[cfg(test)]
+pub static PROCESS_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 static GLOBAL_EES_CONTEXT: std::sync::OnceLock<Arc<RwLock<EesContext>>> =
     std::sync::OnceLock::new();
 

@@ -84,11 +84,15 @@ pub fn clear_auth_jwks() {
     }
 }
 
-/// Serializes tests that mutate the process-global JWKS / EES context across
-/// modules (`auth` + `main` router tests) so they don't race under the default
-/// parallel test runner.
+/// Serializes tests that mutate any process-global in this crate.
+///
+/// An ALIAS for `context::PROCESS_STATE_TEST_LOCK` as of #107, not a second static.
+/// It used to be declared here, which made a test for a new global in another module
+/// reach for its own lock -- two disjoint agreements over one ambient state, which is
+/// #308's defect and #276's hang. Kept under this name so the 55 existing call sites
+/// do not churn.
 #[cfg(test)]
-pub(crate) static GLOBAL_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) use crate::context::PROCESS_STATE_TEST_LOCK as GLOBAL_STATE_TEST_LOCK;
 
 /// Per-operation OAuth2 gate.
 ///

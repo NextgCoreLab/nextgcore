@@ -112,6 +112,7 @@ mod auth;
 mod capabilities;
 mod context;
 mod ecs_registration;
+mod ecs_role; // #107: the ECS role (EDGE-4 provisioning, EDGE-6 registration, discovery)
 mod eec;
 mod notifier;
 mod relocation;
@@ -348,6 +349,10 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
     // eesd-01: self-register toward the ECS (EDGE-6), not the NRF.
+    // #107: resolve the ECS-role switch before anything can be served, so no
+    // request is answered under a different setting from the next.
+    ecs_role::init_from_env();
+
     ecs_registration::start_ecs_registration(
         args.ecs_uri.as_deref(),
         &ees_id,
@@ -776,7 +781,14 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
                 _ => send_method_not_allowed(method, "instances/{instanceId}"),
             }
         }
-        _ => send_not_found(&format!("Resource not found: {path}"), None),
+        // #107: the ECS role's eecs-* APIs, when this process is running one.
+        // Checked LAST and only after every eees-* arm, so an ECS route can never
+        // shadow an EES one; `route` returns None with the role off, which leaves
+        // the 404 below in charge exactly as before.
+        _ => match ecs_role::route(parts.as_slice(), &request) {
+            Some(resp) => resp,
+            None => send_not_found(&format!("Resource not found: {path}"), None),
+        },
     }
 }
 
@@ -2951,6 +2963,120 @@ mod tests {
         assert_eq!(args.max_eas, 512);
         // eesd-01: NRF removed in favour of an optional ECS apiRoot.
         assert!(args.ecs_uri.is_none());
+    }
+
+    // ── #107: the ECS role through the real router ──
+
+    /// #107 criteria 1 and 2 through `ees_sbi_request_handler` itself, not through
+    /// `ecs_role`'s functions: the route has to be reachable, and the arm is added at
+    /// the END of a 30-arm match where a typo would leave it shadowed or unreached.
+    ///
+    /// Also the interlock: with the role OFF the same path is a 404, so a deployment
+    /// that does not want an ECS is unchanged.
+    #[test]
+    fn the_ecs_role_is_reachable_through_the_router_only_when_enabled() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ecs_role::clear_registry_for_test();
+
+        let body = serde_json::json!({
+            "eesProf": {
+                "eesId": "ees-router.example.com",
+                "endPt": { "ipv4Addrs": ["10.0.0.9"], "port": 7814 },
+                "easIds": ["eas-router"],
+            },
+        });
+        let request = || {
+            SbiRequest::post("/eecs-eesregistration/v1/registrations")
+                .with_json_body(&body)
+                .expect("serialize")
+        };
+
+        // OFF: the path is a 404, exactly as before #107.
+        ecs_role::set_for_test(false);
+        let off = block_on(ees_sbi_request_handler(request()));
+        assert_eq!(
+            off.status, 404,
+            "with the role off an eecs-* path must be indistinguishable from a mistyped URI"
+        );
+
+        // ON: created, with a Location.
+        ecs_role::set_for_test(true);
+        let on = block_on(ees_sbi_request_handler(request()));
+        assert_eq!(
+            on.status, 201,
+            "the route must be reachable through the router"
+        );
+        let location = on
+            .http
+            .get_header("location")
+            .expect("201 must carry a Location")
+            .clone();
+        assert!(location.starts_with("/eecs-eesregistration/v1/registrations/"));
+
+        // And the refresh, also through the router.
+        let refresh = block_on(ees_sbi_request_handler(
+            SbiRequest::put(&location)
+                .with_json_body(&body)
+                .expect("serialize"),
+        ));
+        assert!(
+            (200..300).contains(&refresh.status),
+            "the PUT refresh must be 2xx through the router, got {}",
+            refresh.status
+        );
+
+        // Discovery finds it, which is the point of registering at all.
+        let discovered = block_on(ees_sbi_request_handler(
+            SbiRequest::post("/eecs-targeteesdiscovery/v1/target-ees-discovery")
+                .with_json_body(&serde_json::json!({ "easId": "eas-router" }))
+                .expect("serialize"),
+        ));
+        assert_eq!(discovered.status, 200);
+        let found: serde_json::Value =
+            serde_json::from_str(discovered.http.content.as_deref().expect("body")).expect("json");
+        assert_eq!(found["eesProfiles"][0]["eesId"], "ees-router.example.com");
+
+        ecs_role::set_for_test(false);
+        ecs_role::clear_registry_for_test();
+    }
+
+    /// An `eecs-*` route must not require an EES OAuth2 scope. The ECS APIs are a
+    /// different reference point (EDGE-4/EDGE-6) with different consumers, and gating
+    /// them on an `eees-*` scope would make an EEC's bootstrap need an EAS's token.
+    #[test]
+    fn the_ecs_routes_do_not_demand_an_ees_scope() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ecs_role::clear_registry_for_test();
+        ecs_role::set_for_test(true);
+        // No JWKS configured at all: an `eees-*` route fails closed with 401 here.
+        auth::clear_auth_jwks();
+
+        let resp = block_on(ees_sbi_request_handler(
+            SbiRequest::post("/eecs-serviceprovisioning/v1/provisioning-requests")
+                .with_json_body(&serde_json::json!({ "eecId": "eec-1" }))
+                .expect("serialize"),
+        ));
+        assert_eq!(
+            resp.status, 200,
+            "EDGE-4 provisioning must not be gated on an EES service scope"
+        );
+
+        // Contrast: an eees-* route with no JWKS is 401, so the difference is real
+        // rather than an artefact of this test's setup.
+        let ees_route = block_on(ees_sbi_request_handler(SbiRequest::post(
+            "/eees-easregistration/v1/registrations",
+        )));
+        assert_eq!(
+            ees_route.status, 401,
+            "the EES routes still fail closed, which is what makes the contrast meaningful"
+        );
+
+        ecs_role::set_for_test(false);
+        ecs_role::clear_registry_for_test();
     }
 
     /// eesd-01: a legacy `nees-*` path is no longer routed → 404.
