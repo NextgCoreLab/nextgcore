@@ -2462,9 +2462,31 @@ mod tests {
 
     /// #65 acceptance: `stop()` drains in-flight streams instead of killing them.
     ///
-    /// The handler sleeps, so shutdown is requested while the request is
-    /// genuinely mid-flight. Before the graceful path existed, the connection task
-    /// was detached and the client saw a transport error here.
+    /// The handler parks on a signal the test controls, so shutdown is requested
+    /// while the request is genuinely mid-flight. Before the graceful path
+    /// existed, the connection task was detached and the client saw a transport
+    /// error here.
+    ///
+    /// #326: this used to assert a wall-clock LOWER BOUND on how long `stop()`
+    /// blocked (`elapsed() >= 150 ms`) after an unsynchronised 80 ms sleep that
+    /// merely hoped the request had reached the handler. Under a loaded
+    /// whole-workspace run the 80 ms overshot, the fixed 300 ms handler was
+    /// already more than 150 ms through by the time `stop()` was called, and the
+    /// bound failed with nothing wrong with the drain — about 1 run in 5. The
+    /// property is an ORDERING, not a duration, so it is asserted as one:
+    ///
+    /// - the handler signals ENTRY, so nothing has to guess when it was reached;
+    /// - `stop()` runs in its own task, and the test asserts that task is STILL
+    ///   PENDING while the handler is parked. That is deterministic in both
+    ///   directions: the drain barrier cannot release until the connection task
+    ///   returns, which cannot happen until the handler does, so no amount of
+    ///   scheduling delay can make a correct `stop()` look finished.
+    ///
+    /// The `sleep` before the pending check is a revert-DETECTOR, not a
+    /// correctness dependency: a `stop()` that skips the drain needs some slice of
+    /// time to run to completion before `is_finished()` can observe it. Waiting
+    /// longer never invalidates the assertion, which is the direction that makes
+    /// it safe under load.
     ///
     /// Ceiling, stated rather than implied: this asserts the OBSERVABLE
     /// consequence of the GOAWAY (in-flight completes, connection then closes),
@@ -2473,30 +2495,53 @@ mod tests {
     #[tokio::test]
     async fn stop_drains_an_in_flight_request() {
         use crate::client::SbiClient;
+        use tokio::sync::Notify;
 
-        let (server, port) =
-            start_test_server(SbiServerConfig::default(), |_req: SbiRequest| async {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                SbiResponse::with_status(200).with_body("drained", "text/plain")
-            })
-            .await;
+        // `entered` fires on handler entry; `release` lets the test decide when the
+        // handler returns. `Notify` rather than a oneshot because the handler is an
+        // `Fn` and may be called more than once, and because a `notify_one` that
+        // arrives first stores its permit instead of being lost.
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+
+        let handler = {
+            let entered = entered.clone();
+            let release = release.clone();
+            move |_req: SbiRequest| {
+                let entered = entered.clone();
+                let release = release.clone();
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    SbiResponse::with_status(200).with_body("drained", "text/plain")
+                }
+            }
+        };
+
+        let (server, port) = start_test_server(SbiServerConfig::default(), handler).await;
         let client = Arc::new(SbiClient::with_host_port("127.0.0.1", port));
 
-        // Fire the request, let it reach the handler, then stop the server.
         let in_flight = {
             let client = client.clone();
             tokio::spawn(async move { client.send_request(SbiRequest::get("/slow")).await })
         };
-        tokio::time::sleep(Duration::from_millis(80)).await;
 
-        let stop_started = std::time::Instant::now();
-        server.stop().await.expect("stop");
-        // stop() must have WAITED for the drain rather than returning at once.
+        // Synchronised, not slept for: the handler is now definitely running and
+        // parked, so the request is definitely in flight.
+        entered.notified().await;
+
+        let server = Arc::new(server);
+        let stop_task = {
+            let server = server.clone();
+            tokio::spawn(async move { server.stop().await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
-            stop_started.elapsed() >= Duration::from_millis(150),
-            "stop() returned in {:?}, so it did not wait for the in-flight stream",
-            stop_started.elapsed()
+            !stop_task.is_finished(),
+            "stop() returned while a stream was still in flight, so it did not drain"
         );
+
+        release.notify_one();
 
         let response = in_flight
             .await
@@ -2504,6 +2549,8 @@ mod tests {
             .expect("an in-flight request must complete across a graceful shutdown");
         assert_eq!(response.status, 200);
         assert_eq!(response.http.content.as_deref(), Some("drained"));
+
+        stop_task.await.expect("stop task joined").expect("stop");
     }
 
     /// #65: after a graceful stop the listener is gone, so a NEW connection is
