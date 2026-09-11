@@ -1209,6 +1209,13 @@ pub async fn handle_ue_policy_create(request: &SbiRequest) -> SbiResponse {
     // PolicyAssociation (no bespoke `uePolicy` field — that octet string is the
     // EpsUrsp path, not the primary Annex-D delivery); delivery runs in an
     // async task so it does not block this response.
+    // #91: record the UE's installed-UPSI list from `uePolReq` BEFORE delivery is
+    // spawned. Order matters: the delivery task computes the delta from this, so
+    // ingesting afterwards would race and the first delivery would always be full.
+    if let Some(ue_pol_req) = data.get("uePolReq").and_then(|v| v.as_str()) {
+        ue_policy::ingest_ue_policy_request(&assoc.pol_asso_id, ue_pol_req);
+    }
+
     if ue_policy::delivery_enabled() {
         spawn_ue_policy_delivery(&assoc.pol_asso_id, supi, &data);
     }
@@ -1252,6 +1259,19 @@ fn ue_policy_source_plmn(data: &serde_json::Value) -> (String, String) {
 /// never blocked; on encode failure or an AMF error the association's
 /// `delivery_state` becomes `Failed` (fail-closed — never `Delivered` without
 /// a MANAGE UE POLICY COMPLETE, item E6).
+/// Re-run UE-policy delivery for an association that already has one (#91,
+/// TS 29.525 §4.2.3.1).
+///
+/// A thin wrapper over [`spawn_ue_policy_delivery`], which already allocates a FRESH
+/// PTI and re-resolves the rules from the UDR, so re-evaluation is exactly what running
+/// it again does. Named separately because the call site's reason differs and the
+/// difference is worth being able to grep for: a create is the first delivery, an update
+/// is a re-delivery whose delta is computed against whatever the UE has since reported.
+fn spawn_ue_policy_redelivery(pol_asso_id: &str, supi: &str, data: &serde_json::Value) {
+    log::info!("[{pol_asso_id}] UE policy: re-evaluating and re-delivering after an update");
+    spawn_ue_policy_delivery(pol_asso_id, supi, data);
+}
+
 fn spawn_ue_policy_delivery(pol_asso_id: &str, supi: &str, data: &serde_json::Value) {
     let (mcc, mnc) = ue_policy_source_plmn(data);
     let pti = ue_policy::alloc_pti();
@@ -1294,8 +1314,37 @@ fn spawn_ue_policy_delivery(pol_asso_id: &str, supi: &str, data: &serde_json::Va
             rules.clone(),
         );
 
-        let pdu = match ue_policy::build_manage_ue_policy_command(pti, upsc, &mcc, &mnc, &rules) {
-            Ok(pdu) => pdu,
+        // #91: only the sections the UE does not already have. `installed` comes from
+        // the UE STATE INDICATION in `uePolReq` (or a later uplink one); empty means a
+        // full delivery, which is the pre-#91 behaviour and the correct one when the UE
+        // reported nothing.
+        let installed = ue_policy::installed_upscs_for_plmn(&id, &mcc, &mnc);
+        let built = ue_policy::build_manage_ue_policy_delta(
+            pti,
+            upsc,
+            &mcc,
+            &mnc,
+            &rules,
+            ue_policy::MAX_UE_POLICY_PART_CONTENTS,
+            &installed,
+        );
+        let (pdu, delivered_upscs) = match built {
+            Ok(Some(v)) => v,
+            // Every section is already installed at the UE, so the delta is empty and
+            // there is nothing to send. Marked Delivered rather than left Pending: the
+            // UE HAS the policy, and leaving it Pending would fail the association on
+            // T3501 for a delivery that was correctly not made.
+            Ok(None) => {
+                log::info!(
+                    "[{supi}] UE policy: the UE already has every section {installed:?}; \
+                     nothing to deliver"
+                );
+                ue_policy::ue_policy_update_delivery_state(
+                    &id,
+                    ue_policy::DeliveryState::Delivered,
+                );
+                return;
+            }
             Err(e) => {
                 log::warn!("[{supi}] UE policy: URSP encode failed ({e}); marking delivery Failed");
                 ue_policy::ue_policy_update_delivery_state(
@@ -1305,6 +1354,7 @@ fn spawn_ue_policy_delivery(pol_asso_id: &str, supi: &str, data: &serde_json::Va
                 return;
             }
         };
+        ue_policy::ue_policy_set_delivered_upscs(&id, delivered_upscs);
 
         // Wave-6 E6: SUBSCRIBE to the AMF's uplink UE-policy notifications
         // BEFORE the transfer (TS 29.525 §4.2.2.2 subscribe→transfer→notify
@@ -1517,26 +1567,117 @@ pub async fn handle_ue_policy_n1_notify(pol_asso_id: &str, request: &SbiRequest)
     SbiResponse::with_status(204)
 }
 
+/// `Npcf_UEPolicyControl_Update` (TS 29.525 §4.2.3.1).
+///
+/// #91: this used to parse the body only to validate that it was JSON, discard it, and
+/// answer a canned `200 {resourceUri, triggers}`. That is worse than a gap: an AMF or
+/// OAM integration driving an update was told the policy had been re-evaluated when
+/// nothing had changed. The members that carry a decision are now ACTED ON before the
+/// 200 goes out, and the response reports what the update actually did.
 pub async fn handle_ue_policy_update(pol_asso_id: &str, request: &SbiRequest) -> SbiResponse {
     let body = match &request.http.content {
         Some(c) => c,
         None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
     };
-    if let Err(e) = serde_json::from_str::<serde_json::Value>(body) {
-        return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON"));
-    }
-    match ue_policy::ue_policy_find(pol_asso_id) {
-        Some(_) => SbiResponse::with_status(200)
-            .with_json_body(&serde_json::json!({
-                "resourceUri": format!("/npcf-ue-policy-control/v1/policies/{pol_asso_id}"),
-                "triggers": ["UE_POLICY"],
-            }))
-            .unwrap_or_else(|_| SbiResponse::with_status(200)),
-        None => send_not_found(
+    let data: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+    };
+
+    // Resolved BEFORE anything is applied: a 404 must not have side effects.
+    let Some(existing) = ue_policy::ue_policy_find(pol_asso_id) else {
+        return send_not_found(
             &format!("UE Policy {pol_asso_id} not found"),
             Some("POLICY_NOT_FOUND"),
-        ),
+        );
+    };
+    let supi = existing.supi.clone();
+
+    // `notificationUri` (§5.6.2.4): where subsequent notifications go. Applied first
+    // because a re-delivery below may want to notify, and notifying the OLD URI after
+    // being told it changed is the defect this member exists to prevent.
+    if let Some(uri) = data.get("notificationUri").and_then(|v| v.as_str()) {
+        if uri != existing.notification_uri {
+            ue_policy::ue_policy_set_notification_uri(pol_asso_id, uri);
+            log::info!("[{pol_asso_id}] UE policy update: notificationUri -> {uri}");
+        }
     }
+
+    // `uePolReq` (§5.6.2.4, `Bytes`): a fresh UE STATE INDICATION, so the UE's
+    // installed-UPSI baseline moves and the next delivery is a delta against the NEW
+    // baseline.
+    let mut reported = 0usize;
+    if let Some(ue_pol_req) = data.get("uePolReq").and_then(|v| v.as_str()) {
+        reported = ue_policy::ingest_ue_policy_request(pol_asso_id, ue_pol_req);
+    }
+
+    // `uePolDelResult`: the delivery result the UE returned, relayed by the AMF on the
+    // update rather than through the N1 notify callback. Same UPDP container, so the
+    // same correlation applies -- including the PTI check, which is what stops a stale
+    // result from a previous command flipping this association's state (D.2.1.6).
+    let mut delivery_outcome = None;
+    if let Some(result_b64) = data.get("uePolDelResult").and_then(|v| v.as_str()) {
+        use base64::Engine as _;
+        match base64::engine::general_purpose::STANDARD.decode(result_b64) {
+            Ok(container) => {
+                let outcome = ue_policy::apply_ue_policy_ul_container(pol_asso_id, &container);
+                log::info!("[{pol_asso_id}] UE policy update: uePolDelResult -> {outcome:?}");
+                delivery_outcome = Some(format!("{outcome:?}"));
+            }
+            Err(e) => {
+                return send_bad_request(
+                    &format!("uePolDelResult is not valid base64: {e}"),
+                    Some("INVALID_UE_POL_DEL_RESULT"),
+                )
+            }
+        }
+    }
+
+    // `triggers`: which of the PCF's request triggers the consumer now observes. Stored
+    // so the association reports what it was last told rather than a constant.
+    let mut triggers: Vec<String> = data
+        .get("triggers")
+        .and_then(|t| t.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if triggers.is_empty() {
+        triggers = vec!["UE_POLICY".to_string()];
+    }
+    ue_policy::ue_policy_set_triggers(pol_asso_id, triggers.clone());
+
+    // Re-evaluate and re-deliver. TS 29.525 §4.2.3.1 makes an update a trigger for
+    // (re)delivery of UE policy, and the `UE_POLICY` trigger names exactly that. It is
+    // driven by the trigger the consumer sent, or by a fresh `uePolReq` -- an update
+    // that changes only a notification URI must NOT re-push policy to the UE.
+    let redeliver = triggers.iter().any(|t| t == "UE_POLICY") || reported > 0;
+    let mut redelivered = false;
+    if redeliver && ue_policy::delivery_enabled() {
+        // A fresh PTI, because this is a NEW UE-policy delivery procedure and reusing
+        // the old one would make the UE's answer indistinguishable from an answer to
+        // the previous command (D.1.2/D.2.1.6).
+        spawn_ue_policy_redelivery(pol_asso_id, &supi, &data);
+        redelivered = true;
+    }
+
+    let resp = serde_json::json!({
+        "resourceUri": format!("/npcf-ue-policy-control/v1/policies/{pol_asso_id}"),
+        "triggers": triggers,
+        // Non-3GPP diagnostics, deliberately additive: the spec body for a 200 here is
+        // `PolicyUpdate`, whose members are all optional, and reporting what the update
+        // DID is what makes it distinguishable from the canned 200 it replaced.
+        "nextgcoreUpdateApplied": {
+            "reportedUpsis": reported,
+            "redelivered": redelivered,
+            "deliveryResult": delivery_outcome,
+        },
+    });
+    SbiResponse::with_status(200)
+        .with_json_body(&resp)
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
 // SM Policy Control handlers
@@ -3575,6 +3716,104 @@ mod tests {
             Some(b) => req.with_json_body(&b).expect("encode test body"),
             None => req,
         }
+    }
+
+    /// #91 criterion 4: `Npcf_UEPolicyControl_Update` ACTS on the request instead of
+    /// returning a canned 200.
+    ///
+    /// The stub 200 it replaced discarded the whole `PolicyAssociationUpdateRequest` and
+    /// always answered `{resourceUri, triggers: ["UE_POLICY"]}` -- so a consumer driving
+    /// an update was told the policy had been re-evaluated when nothing had changed.
+    /// Every assertion here is on association state the update MUTATED, not on the
+    /// response shape, because the response was the part that already looked right.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ue_policy_update_applies_the_request_instead_of_answering_a_canned_200() {
+        use base64::Engine as _;
+
+        // Delivery off, so the update's re-delivery decision is observable without an
+        // AMF: the state changes are the subject here, not the N1N2 transfer.
+        std::env::set_var("PCF_UE_POLICY_DELIVERY", "off");
+        let assoc =
+            ue_policy::ue_policy_add("imsi-001010000091004", "http://127.0.0.1:9/old-notify", "");
+        let id = assoc.pol_asso_id.clone();
+        ue_policy::ue_policy_set_delivery(
+            &id,
+            0x90,
+            1,
+            Some(("001".into(), "01".into())),
+            ue_policy::default_wire_rules(),
+        );
+
+        // A UE STATE INDICATION reporting UPSC 1 installed for 001-01, PTI 0.
+        let indication = nextgcore_nas::fiveg::ue_policy::UeStateIndication {
+            pti: 0,
+            upsi_list: nextgcore_nas::fiveg::ue_policy::UpsiList {
+                sublists: vec![nextgcore_nas::fiveg::ue_policy::UpsiSublist {
+                    plmn_id: nextgcore_nas::common::types::PlmnId {
+                        mcc: [0, 0, 1],
+                        mnc: [0, 1, 0x0F],
+                        mnc_len: 2,
+                    },
+                    upscs: vec![1],
+                }],
+            },
+            classmark: Default::default(),
+            os_ids: Vec::new(),
+        }
+        .encode()
+        .expect("encode indication");
+
+        let resp = handle_ue_policy_update(
+            &id,
+            &make_request(
+                "PATCH",
+                &format!("/npcf-ue-policy-control/v1/policies/{id}"),
+                Some(serde_json::json!({
+                    "notificationUri": "http://127.0.0.1:9/new-notify",
+                    "triggers": ["PLMN_CH"],
+                    "uePolReq": base64::engine::general_purpose::STANDARD.encode(&indication),
+                })),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+
+        let after = ue_policy::ue_policy_find(&id).expect("association survives the update");
+        assert_eq!(
+            after.notification_uri, "http://127.0.0.1:9/new-notify",
+            "notificationUri must be APPLIED; notifying the old URI after being told it \
+             changed is what this member exists to prevent"
+        );
+        assert_eq!(
+            after.triggers,
+            vec!["PLMN_CH".to_string()],
+            "the triggers the consumer observes must be recorded, not hard-coded to UE_POLICY"
+        );
+        assert_eq!(
+            after.reported_upsis,
+            vec![("001".to_string(), "01".to_string(), 1)],
+            "uePolReq must move the installed-UPSI baseline so the next delivery is a delta"
+        );
+
+        // And the response reports what it did, rather than a constant.
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+        assert_eq!(body["triggers"], serde_json::json!(["PLMN_CH"]));
+        assert_eq!(body["nextgcoreUpdateApplied"]["reportedUpsis"], 1);
+
+        // A 404 must still be a 404, and must not have applied anything.
+        let resp = handle_ue_policy_update(
+            "no-such-association",
+            &make_request(
+                "PATCH",
+                "/npcf-ue-policy-control/v1/policies/no-such-association",
+                Some(serde_json::json!({ "triggers": ["UE_POLICY"] })),
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 404);
+
+        std::env::remove_var("PCF_UE_POLICY_DELIVERY");
     }
 
     fn full_create_body(supi: &str, psi: u8) -> serde_json::Value {

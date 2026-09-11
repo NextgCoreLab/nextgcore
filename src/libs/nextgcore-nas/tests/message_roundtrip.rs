@@ -176,7 +176,61 @@ fn gmm_registration_request_all_optional_ies() {
             psi: 0x0004,
         }),
         nas_message_container: Some(NasMessageContainer::new(vec![0x7e, 0x00, 0x41, 0x01])),
+        // #91: the UE policy container of TS 24.501 §5.5.1.2.2, which is what lets a
+        // Registration Request carry a UE STATE INDICATION.
+        payload_container_type: Some(PayloadContainerType::UePolicyContainer),
+        payload_container: Some(PayloadContainer::new(vec![0x00, 0x04, 0x00, 0x00, 0x01])),
     }));
+}
+
+/// #91: a Registration Request with NO payload container still round-trips, and the
+/// UE-policy accessor says so. Separate from the all-IEs test because a decoder that
+/// invented a container would pass that one.
+#[test]
+fn gmm_registration_request_without_payload_container() {
+    let msg = RegistrationRequest {
+        registration_type: RegistrationType::new(true, RegistrationTypeValue::InitialRegistration),
+        ngksi: KeySetIdentifier::new(0, 1),
+        mobile_identity: MobileIdentity::Suci(test_suci()),
+        ..Default::default()
+    };
+    roundtrip_5gmm(FiveGmmMessage::RegistrationRequest(msg.clone()));
+    assert!(
+        msg.ue_policy_container().is_none(),
+        "no container means no UE policy container"
+    );
+}
+
+/// #91: the accessor is the gate the AMF uses, so it must refuse a container whose
+/// type is something else -- routing an SMS container into the PCF's UPDP decoder
+/// would be worse than dropping it.
+#[test]
+fn gmm_registration_request_payload_container_type_gates_the_accessor() {
+    let ue_policy = RegistrationRequest {
+        payload_container_type: Some(PayloadContainerType::UePolicyContainer),
+        payload_container: Some(PayloadContainer::new(vec![0xAA, 0xBB])),
+        ..Default::default()
+    };
+    assert_eq!(ue_policy.ue_policy_container(), Some(&[0xAAu8, 0xBB][..]));
+
+    let sms = RegistrationRequest {
+        payload_container_type: Some(PayloadContainerType::SmsContainer),
+        payload_container: Some(PayloadContainer::new(vec![0xAA, 0xBB])),
+        ..Default::default()
+    };
+    assert!(
+        sms.ue_policy_container().is_none(),
+        "an SMS container is not a UE policy container"
+    );
+
+    let untyped = RegistrationRequest {
+        payload_container: Some(PayloadContainer::new(vec![0xAA, 0xBB])),
+        ..Default::default()
+    };
+    assert!(
+        untyped.ue_policy_container().is_none(),
+        "a container with no type cannot be claimed to be a UE policy container"
+    );
 }
 
 #[test]

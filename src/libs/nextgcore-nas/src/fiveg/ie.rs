@@ -300,6 +300,28 @@ pub enum PayloadContainerType {
     EventNotification = 9,
 }
 
+impl PayloadContainerType {
+    /// The type for a wire value, or `None` for a spare/unknown one.
+    ///
+    /// `None` rather than a default: §9.11.3.40 leaves values spare, and mapping an
+    /// unknown one onto `N1SmInformation` would have the AMF route a payload it
+    /// cannot identify into the SMF path.
+    pub fn from_u8(value: u8) -> Option<Self> {
+        Some(match value & 0x0F {
+            1 => Self::N1SmInformation,
+            2 => Self::SmsContainer,
+            3 => Self::LppMessage,
+            4 => Self::SorTransparentContainer,
+            5 => Self::UeParametersUpdateTransparentContainer,
+            6 => Self::UePolicyContainer,
+            7 => Self::UeParametersUpdateTransparentContainerForUeInitiated,
+            8 => Self::MultiplePayloads,
+            9 => Self::EventNotification,
+            _ => return None,
+        })
+    }
+}
+
 /// Payload container (TS 24.501 Section 9.11.3.39)
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PayloadContainer {

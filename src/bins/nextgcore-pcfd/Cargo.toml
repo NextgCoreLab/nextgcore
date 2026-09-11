@@ -52,6 +52,10 @@ thiserror.workspace = true
 uuid.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
+# #91: TS 29.525's `uePolReq` is TS 29.571 `Bytes`, i.e. base64. Promoted from a
+# dev-dependency, where it already was, so production code can decode the member
+# rather than only tests being able to encode it. No new crate enters the tree.
+base64.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
