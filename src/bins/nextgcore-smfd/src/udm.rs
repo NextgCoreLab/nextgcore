@@ -276,6 +276,87 @@ pub async fn fetch_sm_data(
     Some(data)
 }
 
+/// `EpsInterworkingIndication` (TS 29.502 `SmContextCreateData.epsInterworkingInd`).
+///
+/// The AMF tells the SMF, per PDU session, whether it may need to move to EPS and by
+/// which mechanism. Before #116 the member was not parsed at all, so every session
+/// looked identical to a non-interworking one and the SMF had no basis for registering
+/// a `pgwFqdn`.
+///
+/// The enum is modelled as the OpenAPI defines it rather than as a bool, because the
+/// four values are not two: `WITHOUT_N26` and `WITH_N26` differ in *mechanism* and
+/// `IWK_NON_3GPP` is a different interface again. Collapsing them would discard the
+/// distinction the next issue (#62, the N26 leg) needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EpsInterworkingInd {
+    /// `NONE`, or the member absent — the default. Not the same as "unknown": TS 29.502
+    /// gives no default, and an absent indication means the AMF is not asking for
+    /// interworking, which is what `NONE` says.
+    #[default]
+    None,
+    /// `WITH_N26` — interworking using the N26 interface (single-registration mode).
+    WithN26,
+    /// `WITHOUT_N26` — interworking without N26 (the UE may use dual registration).
+    WithoutN26,
+    /// `IWK_NON_3GPP` — interworking with non-3GPP access.
+    IwkNon3gpp,
+}
+
+impl EpsInterworkingInd {
+    /// Parse the member from an `SmContextCreateData` body.
+    ///
+    /// An UNRECOGNISED string is `None` rather than an error: the OpenAPI defines the
+    /// type as `anyOf [enum, string]` explicitly "to provide forward-compatibility with
+    /// future extensions", so a future value must not fail the session — and treating
+    /// something unknown as interworking-capable would register a `pgwFqdn` on a guess.
+    pub fn from_body(body: &serde_json::Value) -> Self {
+        match body.get("epsInterworkingInd").and_then(|v| v.as_str()) {
+            Some("WITH_N26") => Self::WithN26,
+            Some("WITHOUT_N26") => Self::WithoutN26,
+            Some("IWK_NON_3GPP") => Self::IwkNon3gpp,
+            Some("NONE") | None => Self::None,
+            Some(other) => {
+                log::info!(
+                    "epsInterworkingInd={other:?} is not a value this build recognises; \
+                     treated as NONE (TS 29.502 defines the type as forward-compatible)"
+                );
+                Self::None
+            }
+        }
+    }
+
+    /// Does this indication mean the session may move to EPS?
+    ///
+    /// `IWK_NON_3GPP` is EXCLUDED: it is interworking with non-3GPP access, not with
+    /// the EPC, so it does not imply an MME will ever look for a PGW-C+SMF.
+    pub fn is_interworking(self) -> bool {
+        matches!(self, Self::WithN26 | Self::WithoutN26)
+    }
+
+    /// The wire spelling, for logs.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "NONE",
+            Self::WithN26 => "WITH_N26",
+            Self::WithoutN26 => "WITHOUT_N26",
+            Self::IwkNon3gpp => "IWK_NON_3GPP",
+        }
+    }
+}
+
+/// The PGW-C+SMF FQDN to register with the UDM, from `SMF_PGW_FQDN`.
+///
+/// An env var, like every other smfd switch: this daemon has no clap `Args` struct
+/// (see `eps_iwk`'s note on why the interworking leg is a runtime switch and not a
+/// cargo feature). Blank is treated as unset so an empty value in a compose file does
+/// not register an empty FQDN.
+fn configured_pgw_fqdn() -> Option<String> {
+    std::env::var("SMF_PGW_FQDN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// `Nudm_UECM_Registration` — register as the serving SMF for this PDU session
 /// (TS 29.503 §5.3.2.2, `PUT .../registrations/smf-registrations/{pduSessionId}`).
 ///
@@ -296,6 +377,7 @@ pub async fn register_as_serving_smf(
     sst: u8,
     sd: Option<&str>,
     plmn: Option<(&str, &str)>,
+    eps_interworking: EpsInterworkingInd,
 ) -> bool {
     if !enabled() {
         return false;
@@ -327,6 +409,48 @@ pub async fn register_as_serving_smf(
     });
     if let Some(sd) = sd {
         body["singleNssai"]["sd"] = serde_json::json!(sd);
+    }
+
+    // `pgwFqdn` (TS 29.503 `SmfRegistration`, optional) — the non-N26 interworking
+    // bootstrap (#116). It is how an MME, resolving the subscriber through the
+    // HSS/UDM, finds THIS PGW-C+SMF for a session the UE established on 5GS. Without
+    // it the non-N26 path cannot start at all, whatever else is implemented.
+    //
+    // Sent only when BOTH hold:
+    //
+    // 1. the AMF said the session is EPS-interworking-capable (`epsInterworkingInd`
+    //    `WITH_N26` or `WITHOUT_N26`) -- honouring the indication rather than
+    //    registering a PGW FQDN for a session that will never move to EPS; and
+    // 2. an FQDN is configured (`SMF_PGW_FQDN`).
+    //
+    // No FQDN is DERIVED when the variable is unset, and that is deliberate.
+    // TS 23.003 §19.4.2.8 fixes the zone (`node.epc.mnc<MNC>.mcc<MCC>.3gppnetwork.org`)
+    // and explicitly places it "into the operator's control", so the leaf label is the
+    // operator's to choose -- a name synthesised here would be well-formed and still
+    // NXDOMAIN. An MME that resolves a fabricated FQDN and fails is worse off than an
+    // MME that finds no `pgwFqdn` and falls back to its own APN-based PGW selection,
+    // so the member is omitted and the reason logged.
+    if eps_interworking.is_interworking() {
+        match configured_pgw_fqdn() {
+            Some(fqdn) => {
+                body["pgwFqdn"] = serde_json::json!(fqdn);
+                log::info!(
+                    "[{supi}] PSI {pdu_session_id} is EPS-interworking-capable \
+                     (epsInterworkingInd={}): registering pgwFqdn={fqdn} so an MME can \
+                     resolve this PGW-C+SMF through the UDM/HSS (TS 29.503 SmfRegistration)",
+                    eps_interworking.as_str()
+                );
+            }
+            None => log::warn!(
+                "[{supi}] PSI {pdu_session_id} is EPS-interworking-capable \
+                 (epsInterworkingInd={}) but SMF_PGW_FQDN is not set, so no pgwFqdn is \
+                 registered: an MME cannot resolve this PGW-C+SMF through the UDM/HSS and \
+                 will fall back to its own PGW selection. Not synthesised -- TS 23.003 \
+                 §19.4.2.8 leaves the leaf label under operator control, so a made-up name \
+                 would resolve to nothing",
+                eps_interworking.as_str()
+            ),
+        }
     }
 
     let path = format!("/nudm-uecm/v1/{supi}/registrations/smf-registrations/{pdu_session_id}");
@@ -761,7 +885,16 @@ mod tests {
         set_for_test(false);
         assert!(fetch_sm_data("imsi-1", "internet", 1, None).await.is_none());
         assert!(
-            !register_as_serving_smf("imsi-1", 5, "internet", 1, None, Some(("001", "01"))).await
+            !register_as_serving_smf(
+                "imsi-1",
+                5,
+                "internet",
+                1,
+                None,
+                Some(("001", "01")),
+                EpsInterworkingInd::None
+            )
+            .await
         );
     }
     /// #79 criterion 1, on the wire: the SMF really performs
@@ -830,8 +963,16 @@ mod tests {
 
         let supi = "imsi-001010000000079";
         assert!(
-            register_as_serving_smf(supi, 5, "internet", 1, Some("010203"), Some(("001", "01")))
-                .await,
+            register_as_serving_smf(
+                supi,
+                5,
+                "internet",
+                1,
+                Some("010203"),
+                Some(("001", "01")),
+                EpsInterworkingInd::None
+            )
+            .await,
             "the UECM registration must succeed against a 201"
         );
         let data = fetch_sm_data(supi, "internet", 1, Some("010203"))
@@ -892,13 +1033,193 @@ mod tests {
         // A registration with no serving PLMN is NOT sent: plmnId is required, and
         // inventing one would record the session as served somewhere it is not.
         seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        assert!(!register_as_serving_smf(supi, 6, "internet", 1, None, None).await);
+        assert!(
+            !register_as_serving_smf(supi, 6, "internet", 1, None, None, EpsInterworkingInd::None)
+                .await
+        );
         let after = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert!(
             !after
                 .iter()
                 .any(|(_, uri, _, _)| uri.contains("smf-registrations") && uri.contains(supi)),
             "no PLMN means no registration on the wire, got {after:?}"
+        );
+
+        set_for_test(false);
+        std::env::remove_var("UDM_SBI_ADDR");
+        std::env::remove_var("UDM_SBI_PORT");
+        udm.stop().await.expect("stop");
+    }
+    /// #116 criterion 3 (the parse half): `epsInterworkingInd` is read as the four
+    /// values TS 29.502 defines, and only the two that mean EPS count as interworking.
+    #[test]
+    fn eps_interworking_ind_is_parsed_as_ts29502_defines_it() {
+        let of = |v: serde_json::Value| EpsInterworkingInd::from_body(&v);
+        assert_eq!(
+            of(serde_json::json!({})),
+            EpsInterworkingInd::None,
+            "an absent member is NONE: TS 29.502 gives no default, and absent means the \
+             AMF is not asking for interworking"
+        );
+        assert_eq!(
+            of(serde_json::json!({"epsInterworkingInd": "NONE"})),
+            EpsInterworkingInd::None
+        );
+        assert_eq!(
+            of(serde_json::json!({"epsInterworkingInd": "WITH_N26"})),
+            EpsInterworkingInd::WithN26
+        );
+        assert_eq!(
+            of(serde_json::json!({"epsInterworkingInd": "WITHOUT_N26"})),
+            EpsInterworkingInd::WithoutN26
+        );
+        assert_eq!(
+            of(serde_json::json!({"epsInterworkingInd": "IWK_NON_3GPP"})),
+            EpsInterworkingInd::IwkNon3gpp
+        );
+        assert_eq!(
+            of(serde_json::json!({"epsInterworkingInd": "SOMETHING_REL20"})),
+            EpsInterworkingInd::None,
+            "an unrecognised value is NONE, not an error: the OpenAPI defines the type \
+             as anyOf[enum, string] expressly for forward compatibility, and treating \
+             something unknown as interworking would register a pgwFqdn on a guess"
+        );
+
+        assert!(EpsInterworkingInd::WithN26.is_interworking());
+        assert!(EpsInterworkingInd::WithoutN26.is_interworking());
+        assert!(
+            !EpsInterworkingInd::IwkNon3gpp.is_interworking(),
+            "IWK_NON_3GPP is interworking with NON-3GPP access, not with the EPC: no MME \
+             will ever look for a PGW-C+SMF because of it"
+        );
+        assert!(!EpsInterworkingInd::None.is_interworking());
+    }
+
+    /// #116 criterion 3 (the wire half): the UECM registration carries `pgwFqdn` for an
+    /// EPS-interworking session, and does NOT for a session the AMF did not mark.
+    ///
+    /// The recorded request body is the assertion, for the reason #79's test gives: a
+    /// return-value check would pass against a function that sent nothing.
+    #[tokio::test]
+    async fn the_uecm_registration_carries_pgw_fqdn_only_for_an_interworking_session() {
+        use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        use std::net::SocketAddr;
+
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        // The switch, the UDM_SBI_* environment AND `SMF_PGW_FQDN` are all
+        // process-global; one lock covers all of them (#308 -- a second lock would be a
+        // second disjoint agreement about the same variables).
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        set_for_test(true);
+
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let (l, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let udm = SbiServer::on_listener(
+            SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port))),
+            l,
+        );
+        udm.start(move |req: SbiRequest| {
+            let sink = sink.clone();
+            async move {
+                if req.header.uri.contains("smf-registrations") {
+                    sink.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(req.http.content.clone().unwrap_or_default());
+                }
+                SbiResponse::with_status(201)
+            }
+        })
+        .await
+        .expect("udm start");
+        std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UDM_SBI_PORT", port.to_string());
+        std::env::set_var(
+            "SMF_PGW_FQDN",
+            "topon.smf-pgw.node.epc.mnc01.mcc001.3gppnetwork.org",
+        );
+
+        let supi = "imsi-001010000000116";
+        // An EPS-interworking session: pgwFqdn present, so an MME resolving this
+        // subscriber through the HSS/UDM can find this PGW-C+SMF.
+        assert!(
+            register_as_serving_smf(
+                supi,
+                5,
+                "internet",
+                1,
+                None,
+                Some(("001", "01")),
+                EpsInterworkingInd::WithoutN26
+            )
+            .await
+        );
+        let bodies = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let body: serde_json::Value =
+            serde_json::from_str(bodies.last().expect("a registration was sent")).expect("json");
+        assert_eq!(
+            body["pgwFqdn"],
+            serde_json::json!("topon.smf-pgw.node.epc.mnc01.mcc001.3gppnetwork.org"),
+            "SmfRegistration.pgwFqdn must carry the configured FQDN verbatim (TS 29.503)"
+        );
+        // Still a conformant registration: the four `required` members survive.
+        for required in ["smfInstanceId", "pduSessionId", "singleNssai", "plmnId"] {
+            assert!(
+                body.get(required).is_some(),
+                "SmfRegistration.{required} is required, got {body}"
+            );
+        }
+
+        // A session the AMF did NOT mark for interworking: no pgwFqdn. Registering one
+        // would advertise an EPS path for a session that will never take it.
+        seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        assert!(
+            register_as_serving_smf(
+                supi,
+                6,
+                "internet",
+                1,
+                None,
+                Some(("001", "01")),
+                EpsInterworkingInd::None
+            )
+            .await
+        );
+        let bodies = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let body: serde_json::Value =
+            serde_json::from_str(bodies.last().expect("a registration was sent")).expect("json");
+        assert!(
+            body.get("pgwFqdn").is_none(),
+            "epsInterworkingInd=NONE must not register a pgwFqdn, got {body}"
+        );
+
+        // Configured-but-not-interworking and interworking-but-not-configured are
+        // different: with no FQDN the member is OMITTED rather than synthesised, because
+        // TS 23.003 §19.4.2.8 leaves the leaf label under operator control and a made-up
+        // name would resolve to nothing.
+        std::env::remove_var("SMF_PGW_FQDN");
+        seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        assert!(
+            register_as_serving_smf(
+                supi,
+                7,
+                "internet",
+                1,
+                None,
+                Some(("001", "01")),
+                EpsInterworkingInd::WithN26
+            )
+            .await
+        );
+        let bodies = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let body: serde_json::Value =
+            serde_json::from_str(bodies.last().expect("a registration was sent")).expect("json");
+        assert!(
+            body.get("pgwFqdn").is_none(),
+            "with SMF_PGW_FQDN unset no FQDN is invented, got {body}"
         );
 
         set_for_test(false);

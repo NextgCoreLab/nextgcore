@@ -1818,6 +1818,22 @@ impl NgapServer {
         state.amf_ue.registration_type = req.registration_type;
         state.amf_ue.nas_ue_tsc = req.tsc;
         state.amf_ue.nas_ue_ksi = req.ksi;
+        // #116: EPC NAS ("S1 mode") support from the UE's 5GMM capability IE
+        // (TS 24.501 §9.11.3.1 octet 3 bit 1). `gmm_capability.s1_mode` had no writer
+        // at all before this, so `build_registration_accept` could not obey
+        // §5.5.1.2.4 -- which makes the IWK N26 indication conditional on precisely
+        // this bit. Recorded here, with the other capability-shaped fields, so it is
+        // set before any branch that reads it.
+        state.amf_ue.gmm_capability.s1_mode = req.s1_mode;
+        // Computed here, before anything moves a field out of `req` (the security
+        // capability below is not `Copy`): this predicate reads three of them.
+        let guti_mapped_from_eps = req.guti_is_mapped_from_eps();
+        if req.s1_mode {
+            log::info!(
+                "UE claims S1 mode (EPC NAS) support: the Registration Accept will carry \
+                 the 5GS network feature support IE with IWK N26 (TS 24.501 §5.5.1.2.4)"
+            );
+        }
         // #91: park the UE policy container for the Npcf_UEPolicyControl_Create that
         // happens later in the procedure. Overwritten, not merged, on a re-sent
         // Registration Request: the latest one is the UE's current installed set, and
@@ -1937,7 +1953,59 @@ impl NgapServer {
                     .await?;
             }
             t if t == mobile_identity_type::GUTI => {
-                if let Some(guti) = req.guti {
+                if guti_mapped_from_eps {
+                    // EPS→5GS mobility (#116). The identity is a 5G-GUTI the UE MAPPED
+                    // from its 4G-GUTI (TS 23.003 §2.10.2.2.2), not a native one, and
+                    // the two are structurally indistinguishable -- so storing it in
+                    // `old_guti` claimed a native context that never existed and threw
+                    // away the only identity an MME could be asked about.
+                    //
+                    // Recover the 4G-GUTI by the reverse mapping §2.10.2.1.3 requires,
+                    // and keep it where it cannot be mistaken for a native 5G-GUTI.
+                    let mapped = req.guti.as_ref().map(|g| {
+                        nextgcore_nas::interworking::five_g_guti_to_eps_guti(
+                            &nextgcore_nas::fiveg::types::FiveGGuti {
+                                plmn_id: crate::gmm_build::to_nextgcore_plmn(&g.plmn_id),
+                                amf_region_id: g.amf_region_id,
+                                amf_set_id: g.amf_set_id,
+                                amf_pointer: g.amf_pointer,
+                                tmsi: g.tmsi,
+                            },
+                        )
+                    });
+                    if let Some(ref eps_guti) = mapped {
+                        log::info!(
+                            "EPS→5GS registration: 5GS mobile identity is a 5G-GUTI mapped \
+                             from EPS; recovered 4G-GUTI (MME GID={:#06x}, MME code={:#04x}, \
+                             M-TMSI={:#010x}) from the reverse mapping (TS 23.003 §2.10.2.1.3). \
+                             This AMF has no N26 leg, so the UE context is NOT retrieved from \
+                             the old MME (#62); the UE is identified afresh by SUCI instead of \
+                             the registration being rejected",
+                            eps_guti.mme_gid,
+                            eps_guti.mme_code,
+                            eps_guti.m_tmsi
+                        );
+                    }
+                    state.amf_ue.mapped_eps_guti = mapped;
+                    // The Additional GUTI IE, when the UE included one, IS the native
+                    // 5G-GUTI (§5.5.1.2.2) -- so that, and only that, may become
+                    // `old_guti`.
+                    if let Some(native) = req.additional_guti {
+                        state.amf_ue.old_guti = native;
+                    }
+                    if let Some(ref container) = req.eps_nas_message_container {
+                        // Not decoded: the ATTACH/TAU REQUEST inside is an EPS NAS
+                        // message whose handling IS the N26 leg (#62). Recording its
+                        // presence and size is the honest ceiling -- pretending to
+                        // have processed it would be worse than saying it was not.
+                        log::info!(
+                            "EPS NAS message container present ({} octets): carries the \
+                             ATTACH/TAU REQUEST the MME would handle. Not processed -- \
+                             EPS NAS interpretation is the N26 leg (#62)",
+                            container.len()
+                        );
+                    }
+                } else if let Some(guti) = req.guti {
                     state.amf_ue.old_guti = guti;
                 }
                 // GUTI unknown to this AMF instance: identify the UE by SUCI
@@ -4780,6 +4848,56 @@ impl NgapServer {
             required.handover_type
         );
 
+        // Inter-system handover (TS 38.413 §9.3.1.22 HandoverType): decide on the
+        // TYPE before looking for a target gNB, because for anything but intra-5GS
+        // there is no gNB to look for (#116).
+        //
+        // #116's criterion 7 describes an unconditional `handover_type != 0` reject in
+        // `ngap_handler`. That reject no longer exists -- re-verified at `bf57ddd`, the
+        // only survivor is the `HO_TARGET_NOT_ALLOWED` constant -- and its absence left
+        // something WORSE than an honest refusal: the type was logged and then passed
+        // straight through into the `HandoverRequest` below. So a `fivegs-to-eps`
+        // preparation was resolved against connected gNBs and either failed with
+        // `UnknownTargetId` (a cause that misdescribes the reason: the target is an
+        // MME, not an unknown gNB) or, if some gNB's id happened to match, was
+        // forwarded to a gNB as a 5GS→EPS handover the AMF cannot carry out.
+        //
+        // Declined honestly instead, with local cleanup. `ho-target-not-allowed` is
+        // the accurate cause: the target system is not one this AMF may hand over to,
+        // because it has no N26 leg toward an MME (#62 builds it). Nothing is torn
+        // down for the UE -- it stays registered and served on 5GS, which is the
+        // graceful degradation #116 asks for rather than a hard failure.
+        if let Some((cause, target_system)) = inter_system_handover_refusal(required.handover_type)
+        {
+            log::warn!(
+                "HandoverRequired with HandoverType={:?} ({target_system}): declining with \
+                 ho-target-not-allowed. This AMF has no inter-system handover leg -- N26 \
+                 toward an MME is not implemented (#62) -- so the preparation is refused \
+                 rather than forwarded to a gNB as if it were intra-5GS. The UE keeps its \
+                 5GS registration and PDU sessions; nothing is released.",
+                required.handover_type
+            );
+            let failure = nextgcore_ngap::types::HandoverPreparationFailure {
+                amf_ue_ngap_id: required.amf_ue_ngap_id,
+                ran_ue_ngap_id: required.ran_ue_ngap_id,
+                cause: nextgcore_ngap::types::Cause::RadioNetwork(cause),
+                criticality_diagnostics: None,
+            };
+            // Local cleanup, the same state HandoverCancel drops: a relay target and
+            // any per-session transfers left from an earlier preparation for this UE.
+            // Dropped BEFORE the failure is sent, so a failed send cannot leave a
+            // stale relay target that a later Uplink RAN Status Transfer would follow
+            // to a gNB this UE is not moving to.
+            self.handover_target_assoc.remove(&required.amf_ue_ngap_id);
+            self.handover_target_transfers
+                .retain(|(ue, _psi), _| *ue != required.amf_ue_ngap_id);
+            if let Ok(bytes) = nextgcore_ngap::builder::build_handover_preparation_failure(&failure)
+            {
+                self.send_to_association(association_id, &bytes).await?;
+            }
+            return Ok(());
+        }
+
         // Locate the target gNB association from the TargetID's Global RAN Node
         // ID. Without a matching connected gNB the AMF cannot allocate handover
         // resources (inter-AMF / N2 relocation needs Namf_Communication, which
@@ -6390,6 +6508,27 @@ struct ParsedRegistrationRequest {
     nas_message_container_present: bool,
     /// Payload container type from the half-octet IEI `8-` (TS 24.501 §9.11.3.40).
     payload_container_type: Option<u8>,
+    /// Whether the UE claimed S1 mode (EPC NAS) support in its 5GMM capability IE
+    /// (IEI 0x10, TS 24.501 §9.11.3.1 octet 3 bit 1).
+    ///
+    /// #116: the IE was walked past by the default TLV arm, so `s1_mode` was
+    /// write-never and the AMF could not obey §5.5.1.2.4 — which makes signalling
+    /// `IWK N26` conditional on exactly this bit.
+    s1_mode: bool,
+    /// EPS NAS message container contents (IEI 0x70, TLV-E, TS 24.501 §9.11.3.24).
+    ///
+    /// #116: previously skipped. Per §5.5.1.2.2 a UE arriving from EPS puts an
+    /// ATTACH REQUEST (or TRACKING AREA UPDATE REQUEST) here, and its PRESENCE is how
+    /// the AMF knows the 5GS mobile identity holds a 5G-GUTI **mapped** from a
+    /// 4G-GUTI rather than a native one — see [`Self::guti_is_mapped_from_eps`].
+    eps_nas_message_container: Option<Vec<u8>>,
+    /// Additional GUTI IE (IEI 0x77, TLV-E) decoded as a 5G-GUTI.
+    ///
+    /// Per §5.5.1.2.2 a UE that maps a 4G-GUTI into the 5GS mobile identity IE puts
+    /// its valid NATIVE 5G-GUTI here, if it holds one. So on the EPS→5GS path this is
+    /// the identity that may be treated as native, and the one in the mobile identity
+    /// IE is not.
+    additional_guti: Option<Guti5gs>,
     /// Payload container contents from IEI 0x7B (§9.11.3.39).
     ///
     /// #91: §5.5.1.2.2 lets a UE carry a "UE policy container" here holding a UE
@@ -6412,6 +6551,26 @@ impl ParsedRegistrationRequest {
             (Some(PAYLOAD_CONTAINER_TYPE_UE_POLICY), Some(bytes)) => Some(bytes),
             _ => None,
         }
+    }
+
+    /// Is the 5GS mobile identity a 5G-GUTI **mapped from a 4G-GUTI** (TS 23.003
+    /// §2.10.2.2.2) rather than a native one?
+    ///
+    /// There is no separate identity TYPE for it — §9.11.3.4 has one `5G-GUTI` value
+    /// and a mapped GUTI is structurally identical to a native one, which is exactly
+    /// why storing it as native was silent. The discriminator is the **EPS NAS message
+    /// container**: §5.5.1.2.2 requires a UE that maps its 4G-GUTI to include an
+    /// ATTACH REQUEST in that IE, and §5.5.1.3.4 case c.2 reads the same way round
+    /// ("has included the 5G-GUTI mapped from the 4G-GUTI in the 5GS mobile identity
+    /// IE and not included an Additional GUTI IE").
+    ///
+    /// Gated on the identity actually being a GUTI: a UE registering with a SUCI can
+    /// also carry an EPS NAS message container, and calling that a mapped GUTI would
+    /// be a second wrong answer.
+    fn guti_is_mapped_from_eps(&self) -> bool {
+        self.eps_nas_message_container.is_some()
+            && self.identity_type == mobile_identity_type::GUTI
+            && self.guti.is_some()
     }
 }
 
@@ -6784,6 +6943,41 @@ fn extract_nas_message_container(nas: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
+/// Should this HandoverRequired be refused because it is an INTER-SYSTEM handover?
+///
+/// Returns the NGAP cause and a label for the log, or `None` for intra-5GS (which the
+/// AMF does handle).
+///
+/// Split out from `handle_handover_required` so the DECISION is assertable without the
+/// transmission: driving that handler needs an SCTP-connected gNB the unit harness does
+/// not have (`context.rs` says so in as many words -- "amfd has no harness that drives
+/// `handle_handover_required`"). The same decision/transmission split this tree uses for
+/// #70, #91, #48 and #69.
+///
+/// `ho-target-not-allowed` (TS 38.413 CauseRadioNetwork 8) is the accurate cause: the
+/// target system is not one this AMF may hand over to, because it has no N26 leg toward
+/// an MME (#62). Deliberately NOT `unknown-target-id`, which is what the pre-#116 code
+/// ended up answering by falling through to the connected-gNB search -- that cause says
+/// "I do not know that gNB" about a target which is an MME, and it would send an
+/// operator looking for a RAN misconfiguration.
+fn inter_system_handover_refusal(
+    handover_type: nextgcore_ngap::types::HandoverType,
+) -> Option<(
+    nextgcore_asn1c::ngap::cause::CauseRadioNetwork,
+    &'static str,
+)> {
+    use nextgcore_ngap::types::HandoverType as Ht;
+    let target_system = match handover_type {
+        Ht::Intra5gs => return None,
+        Ht::FivegsToEps => "EPS (fivegs-to-eps)",
+        Ht::EpsTo5gs => "5GS (eps-to-5gs)",
+    };
+    Some((
+        nextgcore_asn1c::ngap::cause::CauseRadioNetwork::HoTargetNotAllowed,
+        target_system,
+    ))
+}
+
 fn parse_registration_request_pdu(nas: &[u8]) -> Option<ParsedRegistrationRequest> {
     // EPD + sec hdr + msg type + (ngKSI | 5GS registration type) + LV-E identity
     if nas.len() < 6 {
@@ -6913,6 +7107,21 @@ fn parse_registration_request_pdu(nas: &[u8]) -> Option<ParsedRegistrationReques
                 req.presencemask |= reg_present::LAST_VISITED_TAI;
                 pos += 7;
             }
+            // 5GMM capability (IEI 0x10, TLV, TS 24.501 §9.11.3.1). Parsed for its
+            // octet-3 bit 1 (`S1 mode` / EPC NAS supported), which §5.5.1.2.4 makes
+            // the precondition for signalling IWK N26 back (#116). Must precede the
+            // default TLV arm, which used to walk straight past it.
+            0x10 => {
+                if pos + 1 >= nas.len() {
+                    break;
+                }
+                let len = nas[pos + 1] as usize;
+                if pos + 2 + len <= nas.len() {
+                    req.s1_mode =
+                        nextgcore_nas::interworking::claims_s1_mode(&nas[pos + 2..pos + 2 + len]);
+                }
+                pos += 2 + len;
+            }
             // TLV-E IEs (2-byte length): EPS NAS container (0x70),
             // NAS message container (0x71), additional GUTI (0x77),
             // payload containers (0x7B/0x7C)
@@ -6922,11 +7131,30 @@ fn parse_registration_request_pdu(nas: &[u8]) -> Option<ParsedRegistrationReques
                 }
                 let len = ((nas[pos + 1] as usize) << 8) | (nas[pos + 2] as usize);
                 match iei {
+                    // EPS NAS message container (§9.11.3.24). KEPT, not skipped
+                    // (#116): its presence is how the AMF learns the 5GS mobile
+                    // identity holds a GUTI mapped from EPS, and its contents are the
+                    // ATTACH / TAU REQUEST the MME would have handled. Bounds-checked
+                    // rather than trusted -- `len` came off the wire.
+                    0x70 => {
+                        if pos + 3 + len <= nas.len() {
+                            req.eps_nas_message_container =
+                                Some(nas[pos + 3..pos + 3 + len].to_vec());
+                        }
+                    }
                     // NAS message container (TS 24.501 §4.4.6): not permitted in
                     // an unprotected initial NAS message.
                     0x71 => req.nas_message_container_present = true,
-                    // Additional GUTI — cleartext IE.
-                    0x77 => req.presencemask |= reg_present::ADDITIONAL_GUTI,
+                    // Additional GUTI — cleartext IE. Decoded (#116), not just
+                    // counted: on the EPS→5GS path this carries the UE's NATIVE
+                    // 5G-GUTI, so it is the one that may be treated as native.
+                    0x77 => {
+                        req.presencemask |= reg_present::ADDITIONAL_GUTI;
+                        if pos + 3 + len <= nas.len() {
+                            req.additional_guti =
+                                crate::gmm_handler::parse_guti(&nas[pos + 3..pos + 3 + len]);
+                        }
+                    }
                     // Payload container (#91): kept, not skipped. Bounds-checked
                     // here rather than trusted, since `len` comes off the wire.
                     0x7B => {
@@ -7626,6 +7854,222 @@ mod tests {
         // Requested NSSAI (IEI 0x2F): one S-NSSAI, SST=1
         nas.extend_from_slice(&[0x2F, 0x02, 0x01, 0x01]);
         nas
+    }
+
+    /// A Registration Request from a UE arriving from EPS (TS 24.501 §5.5.1.2.2):
+    /// the 5GS mobile identity holds a 5G-GUTI **mapped** from the UE's 4G-GUTI, and
+    /// an ATTACH REQUEST rides in the EPS NAS message container IE.
+    ///
+    /// The GUTI bytes are built by mapping a chosen 4G-GUTI FORWARD through
+    /// TS 23.003 §2.10.2.2.2, exactly as the UE would, so the test's fixture is not
+    /// produced by the code under test -- the AMF's reverse mapping has something
+    /// independent to be checked against.
+    fn eps_mobility_registration_request(with_additional_guti: bool) -> (Vec<u8>, (u16, u8, u32)) {
+        // The 4G-GUTI the (imaginary) MME issued.
+        const MME_GID: u16 = 0xAB9B;
+        const MME_CODE: u8 = 0b0110_1010;
+        const M_TMSI: u32 = 0x1234_5678;
+
+        // UE-side mapping, §2.10.2.2.2: MME GID 15..8 -> AMF Region ID;
+        // GID 7..0 -> Set ID 9..2; Code 7..6 -> Set ID 1..0; Code 5..0 -> Pointer.
+        let region = (MME_GID >> 8) as u8;
+        let set_id = ((MME_GID & 0x00FF) << 2) | ((MME_CODE >> 6) as u16 & 0x03);
+        let pointer = MME_CODE & 0x3F;
+
+        let mut nas = vec![0x7E, 0x00, 0x41, 0x09];
+        // 5GS mobile identity (LV-E): type 2 = 5G-GUTI, PLMN 001/01.
+        let guti = vec![
+            0xF2, // spare | type 5G-GUTI (2)
+            0x00,
+            0xF1,
+            0x10, // PLMN 001/01
+            region,
+            (set_id >> 2) as u8,
+            (((set_id & 0x03) as u8) << 6) | pointer,
+            (M_TMSI >> 24) as u8,
+            (M_TMSI >> 16) as u8,
+            (M_TMSI >> 8) as u8,
+            M_TMSI as u8,
+        ];
+        nas.extend_from_slice(&(guti.len() as u16).to_be_bytes());
+        nas.extend_from_slice(&guti);
+        // 5GMM capability (IEI 0x10, TLV): octet 3 bit 1 = S1 mode supported.
+        nas.extend_from_slice(&[0x10, 0x01, 0x01]);
+        // EPS NAS message container (IEI 0x70, TLV-E) holding a stand-in ATTACH REQUEST.
+        let attach: &[u8] = &[0x07, 0x41, 0x71, 0x0B];
+        nas.push(0x70);
+        nas.extend_from_slice(&(attach.len() as u16).to_be_bytes());
+        nas.extend_from_slice(attach);
+        if with_additional_guti {
+            // Additional GUTI (IEI 0x77, TLV-E): the UE's NATIVE 5G-GUTI, deliberately
+            // a different TMSI so it cannot be confused with the mapped one.
+            let native = vec![
+                0xF2, 0x00, 0xF1, 0x10, 0x01, 0x00, 0x40, 0xDE, 0xAD, 0xBE, 0xEF,
+            ];
+            nas.push(0x77);
+            nas.extend_from_slice(&(native.len() as u16).to_be_bytes());
+            nas.extend_from_slice(&native);
+        }
+        (nas, (MME_GID, MME_CODE, M_TMSI))
+    }
+
+    /// #116 criterion 7: an inter-system HandoverRequired is declined with the correct
+    /// cause instead of being treated as intra-5GS.
+    ///
+    /// #116's text describes an unconditional `handover_type != 0` reject in
+    /// `ngap_handler` at a cited line pair. **That reject no longer exists** -- only the
+    /// `HO_TARGET_NOT_ALLOWED` constant survives -- and its absence was worse than the
+    /// reject: the type was logged and then passed STRAIGHT INTO the `HandoverRequest`,
+    /// so a 5GS→EPS preparation was resolved against connected gNBs and either failed
+    /// with `unknown-target-id` (a cause that misdescribes an MME as an unknown gNB) or
+    /// was forwarded to a gNB as a handover this AMF cannot carry out.
+    #[test]
+    fn an_inter_system_handover_is_declined_with_ho_target_not_allowed() {
+        use nextgcore_asn1c::ngap::cause::CauseRadioNetwork as Cr;
+        use nextgcore_ngap::types::HandoverType as Ht;
+
+        assert_eq!(
+            inter_system_handover_refusal(Ht::Intra5gs),
+            None,
+            "intra-5GS handover is handled, not refused: this must stay the ONLY \
+             accepted type, or the refusal would break working N2 handover"
+        );
+
+        for (ht, label) in [
+            (Ht::FivegsToEps, "EPS (fivegs-to-eps)"),
+            (Ht::EpsTo5gs, "5GS (eps-to-5gs)"),
+        ] {
+            let (cause, target) = inter_system_handover_refusal(ht)
+                .unwrap_or_else(|| panic!("{ht:?} must be refused, not forwarded to a gNB"));
+            assert_eq!(
+                cause,
+                Cr::HoTargetNotAllowed,
+                "{ht:?}: the target system is not one this AMF may hand over to -- it has \
+                 no N26 leg (#62). NOT UnknownTargetId, which would blame RAN config"
+            );
+            assert_eq!(target, label);
+        }
+
+        // The cause's wire value, against the spec table rather than the enum name:
+        // an enum renamed or reordered must not silently change what goes on the wire.
+        assert_eq!(
+            Cr::HoTargetNotAllowed as i64,
+            8,
+            "ho-target-not-allowed is CauseRadioNetwork 8 (TS 38.413 §9.3.1.2)"
+        );
+    }
+
+    /// #116 criterion 2: the LIVE parser captures the UE's S1-mode capability.
+    ///
+    /// The parser #116's text cites (`gmm_handler`'s) has only test callers -- its own
+    /// `handle_registration_request` is called from three places, all inside
+    /// `mod tests` -- so implementing this there would have been a correct fix in an
+    /// unreachable place. This is the parser `handle_registration_request_nas` uses.
+    #[test]
+    fn the_live_parser_captures_ue_s1_mode_capability() {
+        let (nas, _) = eps_mobility_registration_request(false);
+        let req = parse_registration_request_pdu(&nas).expect("parse");
+        assert!(
+            req.s1_mode,
+            "5GMM capability IEI 0x10 with octet 3 bit 1 set means S1 mode supported \
+             (TS 24.501 §9.11.3.1); it used to be walked past by the default TLV arm"
+        );
+
+        // And the bit is read, not merely the IE's presence: HO attach (bit 2) is not
+        // S1 mode. Same IE, one bit over.
+        let mut ho_attach_only = nas.clone();
+        let iei = ho_attach_only
+            .windows(3)
+            .position(|w| w == [0x10, 0x01, 0x01])
+            .expect("the capability IE is in the fixture");
+        ho_attach_only[iei + 2] = 0x02;
+        let req = parse_registration_request_pdu(&ho_attach_only).expect("parse");
+        assert!(
+            !req.s1_mode,
+            "octet 3 bit 2 is HO attach, not S1 mode -- a presence-only check would \
+             pass here and advertise IWK N26 to a UE that never claimed EPC NAS"
+        );
+    }
+
+    /// #116 criterion 4: a mapped EPS-GUTI is recognised AS mapped, and is not stored
+    /// as a native 5G-GUTI.
+    #[test]
+    fn a_mapped_eps_guti_is_recognised_as_mapped_and_reverse_maps_to_the_4g_guti() {
+        let (nas, (mme_gid, mme_code, m_tmsi)) = eps_mobility_registration_request(false);
+        let req = parse_registration_request_pdu(&nas).expect("parse");
+
+        assert_eq!(
+            req.identity_type,
+            mobile_identity_type::GUTI,
+            "precondition: the identity is a GUTI"
+        );
+        assert_eq!(
+            req.eps_nas_message_container.as_deref(),
+            Some(&[0x07u8, 0x41, 0x71, 0x0B][..]),
+            "the EPS NAS message container must be KEPT, not skipped: it carries the \
+             ATTACH/TAU REQUEST, and its presence is the discriminator"
+        );
+        assert!(
+            req.guti_is_mapped_from_eps(),
+            "a GUTI plus an EPS NAS message container is a MAPPED 5G-GUTI \
+             (TS 24.501 §5.5.1.2.2, §5.5.1.3.4 c.2), not a native one"
+        );
+
+        // The reverse mapping (§2.10.2.1.3) must recover the MME's own 4G-GUTI --
+        // the fixture computed the 5GS fields forward, independently of this code.
+        let g = req.guti.as_ref().expect("guti");
+        let eps = nextgcore_nas::interworking::five_g_guti_to_eps_guti(
+            &nextgcore_nas::fiveg::types::FiveGGuti {
+                plmn_id: crate::gmm_build::to_nextgcore_plmn(&g.plmn_id),
+                amf_region_id: g.amf_region_id,
+                amf_set_id: g.amf_set_id,
+                amf_pointer: g.amf_pointer,
+                tmsi: g.tmsi,
+            },
+        );
+        assert_eq!(eps.mme_gid, mme_gid, "MME Group ID must round-trip");
+        assert_eq!(eps.mme_code, mme_code, "MME Code must round-trip");
+        assert_eq!(eps.m_tmsi, m_tmsi, "M-TMSI must round-trip");
+
+        // A GUTI with NO EPS NAS message container is native, and must not be
+        // mistaken for mapped -- otherwise every ordinary mobility registration
+        // would be treated as an inter-system move.
+        let mut native_only = nas.clone();
+        let at = native_only
+            .windows(3)
+            .position(|w| w == [0x70, 0x00, 0x04])
+            .expect("container IEI in fixture");
+        native_only.drain(at..at + 3 + 4);
+        let req = parse_registration_request_pdu(&native_only).expect("parse");
+        assert!(req.guti.is_some(), "still a GUTI");
+        assert!(
+            !req.guti_is_mapped_from_eps(),
+            "without an EPS NAS message container the GUTI is NATIVE"
+        );
+    }
+
+    /// The Additional GUTI IE is decoded, because on the EPS→5GS path that -- not the
+    /// mobile identity -- is the UE's native 5G-GUTI (TS 24.501 §5.5.1.2.2).
+    #[test]
+    fn the_additional_guti_ie_is_decoded_not_just_counted() {
+        let (nas, _) = eps_mobility_registration_request(true);
+        let req = parse_registration_request_pdu(&nas).expect("parse");
+        let native = req
+            .additional_guti
+            .expect("additional GUTI must be decoded");
+        assert_eq!(
+            native.tmsi, 0xDEAD_BEEF,
+            "the Additional GUTI's own TMSI, distinct from the mapped identity's"
+        );
+        assert_ne!(
+            native.tmsi,
+            req.guti.as_ref().expect("guti").tmsi,
+            "the two identities must not be conflated"
+        );
+        assert!(
+            req.presencemask & reg_present::ADDITIONAL_GUTI != 0,
+            "and the §4.4.6 presence bit is still set"
+        );
     }
 
     #[test]

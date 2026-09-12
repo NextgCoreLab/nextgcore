@@ -485,6 +485,27 @@ pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
         .unwrap_or(540);
     let t3512_value = Some(encode_gprs_timer3_seconds(t3512_seconds));
 
+    // 5GS network feature support (IEI 0x21, TS 24.501 §9.11.3.5), carrying IWK N26.
+    //
+    // Emitted ONLY to a UE that claimed S1 mode, because that is what §5.5.1.2.4
+    // says: "If the UE included S1 mode supported indication in the REGISTRATION
+    // REQUEST message, the AMF supporting interworking with EPS shall set the IWK N26
+    // bit". A UE that never asked gets the IE omitted rather than a bit it has no use
+    // for. `gmm_capability.s1_mode` is populated by the live registration parser
+    // (`ngap_path::parse_registration_request_pdu`), which is where #116's criterion 2
+    // had to land: the `gmm_handler` parser its text cites has only test callers.
+    let network_feature_support = if amf_ue.gmm_capability.s1_mode {
+        Some(nextgcore_nas::interworking::FiveGsNetworkFeatureSupport {
+            iwk_n26: iwk_n26_posture(),
+            // IMS voice over PS is not offered by this core: there is no IMS leg, and
+            // claiming it would have a UE attempt voice over a PS session that cannot
+            // carry it. Omitted as false rather than left unstated.
+            ims_vops_3gpp: false,
+        })
+    } else {
+        None
+    };
+
     let msg =
         nextgcore_msg::FiveGmmMessage::RegistrationAccept(nextgcore_msg::RegistrationAccept {
             registration_result,
@@ -494,6 +515,7 @@ pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
             tai_list,
             allowed_nssai,
             rejected_nssai: None,
+            network_feature_support,
             pdu_session_status: None,
             t3512_value,
             t3502_value: None,
@@ -501,10 +523,31 @@ pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
     Some(nextgcore_msg::build_5gmm_message(&msg).to_vec())
 }
 
+/// The interworking posture this AMF can honestly advertise (TS 24.501 §9.11.3.5).
+///
+/// A **constant**, and deliberately not a config knob, which is a stated deviation
+/// from #116's criterion 1 ("set according to configured capability").
+///
+/// The bit does not mean "interworking supported"; it means *"interworking WITHOUT an
+/// N26 interface is supported"*. So the value follows from one fact: this AMF has no
+/// N26 leg — no GTPv2-C toward an MME, no Forward Relocation, nothing (#62 tracks
+/// building it). Therefore `WithoutN26Supported`, i.e. the bit is SET, and a UE that
+/// supports dual-registration mode may use it (§5.5.1.2.4 case b).
+///
+/// A knob was considered and rejected: its only other setting would advertise an N26
+/// interface that does not exist, and a UE believing it would operate in
+/// single-registration mode and expect session continuity on an inter-system move
+/// that this core cannot perform. A configuration option whose non-default value is
+/// always a lie is worse than a constant — and when #62 lands, this function is the
+/// single place that changes.
+fn iwk_n26_posture() -> nextgcore_nas::interworking::Iwk26 {
+    nextgcore_nas::interworking::Iwk26::WithoutN26Supported
+}
+
 /// Convert amfd's nibble-encoded PLMN into the nextgcore-nas digit-array `PlmnId` so the
 /// two encoders emit identical bytes. amfd marks a 2-digit MNC with `mnc3 == 0xf`;
 /// nextgcore-nas derives the 0xF filler from `mnc_len == 2`, so the two agree byte-for-byte.
-fn to_nextgcore_plmn(p: &crate::context::PlmnId) -> nextgcore_types::PlmnId {
+pub(crate) fn to_nextgcore_plmn(p: &crate::context::PlmnId) -> nextgcore_types::PlmnId {
     let mnc_len = if p.mnc3 == 0x0f { 2 } else { 3 };
     nextgcore_types::PlmnId::new([p.mcc1, p.mcc2, p.mcc3], [p.mnc1, p.mnc2, p.mnc3], mnc_len)
 }
@@ -1749,5 +1792,75 @@ mod tests {
         assert_eq!(GmmCause::from(11), GmmCause::PlmnNotAllowed);
         assert_eq!(GmmCause::from(0), GmmCause::RequestAccepted);
         assert_eq!(GmmCause::from(255), GmmCause::ProtocolErrorUnspecified);
+    }
+    /// #116 criterion 1: the Registration Accept carries the 5GS network feature
+    /// support IE with `IWK N26`, and carries it ONLY to a UE that claimed S1 mode.
+    ///
+    /// Asserted as exact bytes in position, not by searching for the pattern: a
+    /// `windows(3)` search for `21 01 40` would also match those three octets
+    /// occurring inside a neighbouring IE's value, which is how a
+    /// wrongly-positioned IE passes a sloppy test.
+    #[test]
+    fn registration_accept_carries_iwk_n26_only_for_an_s1_mode_ue() {
+        let mut ue = create_test_amf_ue();
+        ue.access_type = 1;
+        ue.next_guti.tmsi = 0; // omit the GUTI IE, to keep the expected image short
+        ue.allowed_nssai.clear();
+        ue.requested_nssai.clear();
+        ue.nr_tai = crate::context::Tai5gs {
+            plmn_id: crate::context::PlmnId::new("001", "01"),
+            tac: 0x010203,
+        };
+
+        // A UE that did NOT claim S1 mode: no IE at all. TS 24.501 §5.5.1.2.4 makes
+        // the indication conditional on the UE's S1-mode indication, and a UE that
+        // never asked has no use for an interworking posture.
+        ue.gmm_capability.s1_mode = false;
+        let mut expected = vec![0x7e, 0x00, 0x42, 0x01, ue.access_type & 0x07];
+        let tl = encode_tai_list(&ue.nr_tai);
+        expected.extend_from_slice(&[0x54, tl.len() as u8]);
+        expected.extend_from_slice(&tl);
+        expected.extend_from_slice(&[0x5e, 0x01, 0xA9]);
+        assert_eq!(
+            build_registration_accept(&ue),
+            Some(expected.clone()),
+            "a UE that did not claim S1 mode must get NO 5GS network feature support IE"
+        );
+
+        // A UE that DID: the IE appears between the TAI list (0x54) and T3512 (0x5E),
+        // per the §8.2.7 table order, with contents length 1 and IWK N26 SET.
+        ue.gmm_capability.s1_mode = true;
+        let mut expected_s1 = vec![0x7e, 0x00, 0x42, 0x01, ue.access_type & 0x07];
+        expected_s1.extend_from_slice(&[0x54, tl.len() as u8]);
+        expected_s1.extend_from_slice(&tl);
+        expected_s1.extend_from_slice(&[0x21, 0x01, 0x40]);
+        expected_s1.extend_from_slice(&[0x5e, 0x01, 0xA9]);
+        assert_eq!(
+            build_registration_accept(&ue),
+            Some(expected_s1),
+            "IEI 0x21, length 1, octet 3 = 0x40: IWK N26 SET, meaning 'interworking \
+             WITHOUT N26 interface supported' -- which is the truthful value because this \
+             AMF has no N26 leg. A 0x00 here would tell the UE the opposite (that N26 \
+             exists and it must use single-registration mode)"
+        );
+    }
+
+    /// The posture is the one the absence of an N26 leg dictates.
+    ///
+    /// Separate from the byte test so that when #62 lands and this becomes variable,
+    /// the thing that changes is one assertion with a name that says why.
+    #[test]
+    fn iwk_n26_posture_says_this_amf_has_no_n26_leg() {
+        assert_eq!(
+            iwk_n26_posture(),
+            nextgcore_nas::interworking::Iwk26::WithoutN26Supported,
+            "with no GTPv2-C leg toward an MME, the only honest posture is \
+             'interworking without N26 supported' (#62 builds the leg)"
+        );
+        assert_eq!(
+            iwk_n26_posture().bit(),
+            0x40,
+            "and it encodes as octet 3 bit 7 SET"
+        );
     }
 }
