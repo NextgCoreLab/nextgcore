@@ -1350,6 +1350,34 @@ pub enum PcfStateError {
     },
 }
 
+/// Take a write guard, using the data even when the lock is POISONED (#338).
+///
+/// The pattern this replaces on the removal paths is `self.x.write().ok()?`, which
+/// turns a poisoned lock into a silent `None` return. On a *lookup* that reads as
+/// "not found"; on a *removal* it is a LEAK, because the record stays and the
+/// caller is told the removal happened as far as it can tell — it only sees
+/// `Option`, and every removal already returns `None` for "was not there".
+///
+/// The concrete failure it caused: `sess_remove` acquired five locks this way
+/// BEFORE `sess_list.remove(&id)`, and two of them (`ipv4addr_hash`,
+/// `ipv6prefix_hash`) are not touched by `sess_add`. So with either one poisoned,
+/// a create SUCCEEDS, the UAV refusal path's compensating `sess_remove` returns
+/// `None` having removed nothing, and the refused session is leaked — reproduced
+/// deterministically in
+/// `a_poisoned_index_does_not_turn_a_removal_into_a_silent_no_op`. Because a
+/// poisoned lock stays poisoned for the life of the process, EVERY later removal
+/// leaked too, including ordinary SM-policy deletes, until `max_num_of_sess`
+/// refused all creates. That is the unbounded growth #90 fixed, reachable again by
+/// another route.
+///
+/// Using the data through the poison is the right trade here: the alternative is a
+/// permanent, unbounded leak, and the worst case is a stale INDEX entry, whose
+/// lookups resolve to an id that is no longer in the primary list and answer
+/// `None` — which is what a caller of a removed record should get anyway.
+fn write_through_poison<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|e| e.into_inner())
+}
+
 impl PcfContext {
     pub fn new() -> Self {
         Self {
@@ -1520,8 +1548,9 @@ impl PcfContext {
 
     pub fn event_sub_remove(&self, sub_id: &str) -> Option<PcEventSubscription> {
         let sub = {
-            let mut list = self.event_sub_list.write().ok()?;
-            let mut hash = self.event_sub_id_hash.write().ok()?;
+            // Poison-tolerant (#338): see `write_through_poison`.
+            let mut list = write_through_poison(&self.event_sub_list);
+            let mut hash = write_through_poison(&self.event_sub_id_hash);
             let id = hash.remove(sub_id)?;
             list.remove(&id)?
         };
@@ -1935,9 +1964,11 @@ impl PcfContext {
     }
 
     pub fn ue_am_remove(&self, id: u64) -> Option<PcfUeAm> {
-        let mut ue_am_list = self.ue_am_list.write().ok()?;
-        let mut supi_am_hash = self.supi_am_hash.write().ok()?;
-        let mut association_id_hash = self.association_id_hash.write().ok()?;
+        // Poison-tolerant for the reason given on `write_through_poison`: a
+        // removal that gives up silently is a leak, not a "not found" (#338).
+        let mut ue_am_list = write_through_poison(&self.ue_am_list);
+        let mut supi_am_hash = write_through_poison(&self.supi_am_hash);
+        let mut association_id_hash = write_through_poison(&self.association_id_hash);
 
         if let Some(ue_am) = ue_am_list.remove(&id) {
             supi_am_hash.remove(&ue_am.supi);
@@ -2040,8 +2071,11 @@ impl PcfContext {
         // sess_list -> ue_sm_list order used by sess_add/sess_remove and
         // deadlocks under concurrent SBI requests (AB-BA lock inversion).
         let ue_sm = {
-            let mut ue_sm_list = self.ue_sm_list.write().ok()?;
-            let mut supi_sm_hash = self.supi_sm_hash.write().ok()?;
+            // Poison-tolerant (#338): see `write_through_poison`. This one also
+            // cascades into `sess_remove_all_for_ue`, so giving up here would strand
+            // the UE's sessions as well as the UE.
+            let mut ue_sm_list = write_through_poison(&self.ue_sm_list);
+            let mut supi_sm_hash = write_through_poison(&self.supi_sm_hash);
             let ue_sm = ue_sm_list.remove(&id)?;
             supi_sm_hash.remove(&ue_sm.supi);
             ue_sm
@@ -2169,12 +2203,17 @@ impl PcfContext {
         // snapshot read-locks sess_list and ue_sm_list, and std RwLock is not
         // reentrant, so persisting inside this block deadlocks (issue #66/#192).
         let sess = {
-            let mut sess_list = self.sess_list.write().ok()?;
-            let mut sm_policy_id_hash = self.sm_policy_id_hash.write().ok()?;
-            let mut ipv4addr_hash = self.ipv4addr_hash.write().ok()?;
-            let mut ipv6prefix_hash = self.ipv6prefix_hash.write().ok()?;
-            let mut ue_sm_list = self.ue_sm_list.write().ok()?;
+            // `write_through_poison`, not `.write().ok()?`: two of these five are
+            // never touched by `sess_add`, so a poisoned one used to abort the
+            // removal here having added nothing -- leaking the session and, from
+            // then on, every session (#338).
+            let mut sess_list = write_through_poison(&self.sess_list);
+            let mut sm_policy_id_hash = write_through_poison(&self.sm_policy_id_hash);
+            let mut ipv4addr_hash = write_through_poison(&self.ipv4addr_hash);
+            let mut ipv6prefix_hash = write_through_poison(&self.ipv6prefix_hash);
+            let mut ue_sm_list = write_through_poison(&self.ue_sm_list);
 
+            // The ONLY `None` this function may return: the session was not there.
             let sess = sess_list.remove(&id)?;
             sm_policy_id_hash.remove(&sess.sm_policy_id);
             if sess.ipv4addr != 0 {
@@ -2379,9 +2418,10 @@ impl PcfContext {
 
     pub fn app_remove(&self, id: u64) -> Option<PcfApp> {
         // Canonical lock order: sess_list before app_list (see app_add).
-        let mut sess_list = self.sess_list.write().ok()?;
-        let mut app_list = self.app_list.write().ok()?;
-        let mut app_session_id_hash = self.app_session_id_hash.write().ok()?;
+        // Poison-tolerant (#338): see `write_through_poison`.
+        let mut sess_list = write_through_poison(&self.sess_list);
+        let mut app_list = write_through_poison(&self.app_list);
+        let mut app_session_id_hash = write_through_poison(&self.app_session_id_hash);
 
         if let Some(app) = app_list.remove(&id) {
             app_session_id_hash.remove(&app.app_session_id);
@@ -2516,6 +2556,59 @@ pub fn pcf_instance_get_load() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #338: a poisoned auxiliary index must not turn a removal into a silent no-op.
+    ///
+    /// This is the mechanism behind the flake #338 filed, and it is a CORRECTNESS
+    /// defect rather than a test artefact — which is the fork #338's last criterion
+    /// asks to be decided before fixing.
+    ///
+    /// `ipv6prefix_hash` is chosen deliberately: `sess_add` does not touch it, so a
+    /// create SUCCEEDS while the compensating `sess_remove` on the UAV refusal path
+    /// used to abort before reaching `sess_list.remove` and return `None` having
+    /// removed nothing. The caller cannot tell that from "was not there", because
+    /// both are `None`. And a poisoned lock stays poisoned for the life of the
+    /// process, so from the first panic onward EVERY removal leaked — ordinary
+    /// SM-policy deletes included.
+    ///
+    /// A LOCAL `PcfContext` is used, never `pcf_self()`: poisoning is permanent, so
+    /// poisoning the process-global here would break every sibling test in the
+    /// binary — which is precisely how this defect surfaced in the first place.
+    #[test]
+    fn a_poisoned_index_does_not_turn_a_removal_into_a_silent_no_op() {
+        let mut ctx = PcfContext::new();
+        ctx.init(64, 64);
+        let ue = ctx.ue_sm_add("imsi-001010000000999").expect("ue_sm");
+        let sess = ctx.sess_add(ue.id, 7).expect("sess");
+        assert_eq!(ctx.sess_count(), 1, "precondition: the session was created");
+
+        // Poison ONE index that `sess_add` never acquires, the way a panicking
+        // sibling does: hold its write guard and unwind.
+        let joined = std::thread::scope(|s| {
+            s.spawn(|| {
+                let _held = ctx.ipv6prefix_hash.write().unwrap();
+                panic!("deliberate: poison ipv6prefix_hash");
+            })
+            .join()
+        });
+        assert!(joined.is_err(), "the poisoning thread must have panicked");
+        assert!(
+            ctx.ipv6prefix_hash.is_poisoned(),
+            "precondition: the index is poisoned"
+        );
+
+        assert!(
+            ctx.sess_remove(sess.id).is_some(),
+            "a poisoned INDEX must not make the removal report 'was not there'"
+        );
+        assert_eq!(
+            ctx.sess_count(),
+            0,
+            "the session must be gone: reporting the removal while leaving the record \
+             is how a refused UAV create leaked one session per attempt, and then every \
+             later delete leaked too, until max_num_of_sess refused all creates"
+        );
+    }
 
     #[test]
     fn test_pcf_context_new() {
