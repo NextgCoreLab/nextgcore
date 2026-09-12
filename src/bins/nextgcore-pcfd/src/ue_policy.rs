@@ -9,7 +9,26 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, PartialEq)]
 pub enum TrafficDescriptorComponent {
     /// Application identifier (OSId + OSAppId)
+    ///
+    /// An OPAQUE operator string. TS 24.526 Table 5.2.1's "OS Id + OS App Id type"
+    /// needs a structured 16-octet UUID plus a length-prefixed app id, which this
+    /// cannot supply, so it remains unencodable -- use
+    /// [`TrafficDescriptorComponent::OsIdOsAppId`] for anything that must reach the
+    /// wire (#91).
     AppId(String),
+    /// OS Id + OS App Id (TS 24.526 Table 5.2.1, type `0b00001000`): a 16-octet
+    /// RFC 4122 UUID and an OS App Id.
+    OsIdOsAppId { os_id: [u8; 16], app_id: String },
+    /// IPv4 remote address + mask (type `0b00010000`).
+    Ipv4RemoteAddress { addr: [u8; 4], mask: [u8; 4] },
+    /// IPv6 remote address + prefix length (type `0b00100001`).
+    Ipv6RemoteAddress { addr: [u8; 16], prefix_len: u8 },
+    /// IPv4 protocol identifier / IPv6 next header (type `0b00110000`).
+    ProtocolIdentifier(u8),
+    /// Single remote port (type `0b01010000`).
+    SingleRemotePort(u16),
+    /// Remote port range, low limit first (type `0b01010001`).
+    RemotePortRange { low: u16, high: u16 },
     /// IP 3-tuple: dest IP prefix, protocol, port range
     IpDesc {
         dest_ip_prefix: String, // e.g., "192.168.0.0/16"
@@ -275,6 +294,22 @@ pub struct UePolicyAssociation {
     /// COMPLETE (D.2.1.3 — the section becomes an installed UPSI). `None` until
     /// a COMPLETE with the matching PTI arrives.
     pub installed_upsc: Option<u16>,
+    /// Every section UPSC the delivered command carried (#91). `upsc` above stays
+    /// the FIRST one, which is what the existing COMPLETE correlation uses; this is
+    /// the whole set, so a multi-section delivery is not misreported as one section.
+    pub delivered_upscs: Vec<u16>,
+    /// The request triggers the consumer last said it observes (TS 29.525
+    /// §5.6.2.4). Defaults to `["UE_POLICY"]`, which is what the create answers with
+    /// and what an update omitting the member means (#91).
+    pub triggers: Vec<String>,
+    /// The UPSIs the UE reported as already installed, from the UE STATE INDICATION
+    /// in its Registration Request's UE policy container, as `(mcc, mnc, upsc)`
+    /// (#91, TS 24.501 §5.5.1.2.2 / D.6.4).
+    ///
+    /// Empty means the UE reported nothing, which is NOT the same as reporting an
+    /// empty list -- both lead to a full delivery, but only the second is a statement
+    /// by the UE, and the log distinguishes them.
+    pub reported_upsis: Vec<(String, String, u16)>,
 }
 
 fn ue_policy_store() -> &'static Mutex<HashMap<String, UePolicyAssociation>> {
@@ -292,6 +327,9 @@ pub fn ue_policy_add(supi: &str, notification_uri: &str, supp_feat: &str) -> UeP
         plmn: None,
         rules: Vec::new(),
         delivery_state: DeliveryState::Pending,
+        delivered_upscs: Vec::new(),
+        triggers: vec!["UE_POLICY".to_string()],
+        reported_upsis: Vec::new(),
         n1n2_subscription_id: None,
         installed_upsc: None,
     };
@@ -515,8 +553,13 @@ pub enum UePolicyResultOutcome {
     /// A COMPLETE/REJECT whose PTI does not match the association's (stale /
     /// duplicate command, D.2.1.6) — dropped, state unchanged (never panics).
     PtiMismatch { expected: u8, got: u8 },
-    /// A decodable message that is not a COMPLETE/REJECT (e.g. UE STATE
-    /// INDICATION 0x04) — not part of this loop; state unchanged.
+    /// UE STATE INDICATION (0x04): the UE reported the UPSIs it already has
+    /// installed. Recorded on the association so the next delivery can be a delta
+    /// (#91); the delivery state itself is unchanged, since this is not a result.
+    /// Carries how many UPSIs were reported.
+    StateReported(usize),
+    /// A decodable message that is not a COMPLETE/REJECT/UE STATE INDICATION —
+    /// not part of this loop; state unchanged.
     Ignored(u8),
     /// The container did not decode as a UPDP message (malformed) — dropped,
     /// state unchanged (fail-closed, no crash).
@@ -593,14 +636,164 @@ pub fn apply_ue_policy_ul_container(pol_asso_id: &str, container: &[u8]) -> UePo
             );
             UePolicyResultOutcome::Rejected(cause)
         }
+        nas_updp::UPDP_MSG_UE_STATE_INDICATION => {
+            // #91: this used to fall into the `other` arm and be logged-and-ignored, so
+            // the UE's installed-UPSI list never reached the PCF and no delta was
+            // possible. It is NOT a delivery result -- D.2.1.6's PTI correlation does
+            // not apply -- so the PTI is recorded rather than matched, and the delivery
+            // state is left alone.
+            let Ok(indication) = nas_updp::UeStateIndication::decode(container) else {
+                return UePolicyResultOutcome::Undecodable;
+            };
+            let reported = flatten_upsi_list(&indication.upsi_list);
+            log::info!(
+                "[{pol_asso_id}] UE policy: UE STATE INDICATION (PTI={:#04x}) reports {} \
+                 installed UPSI(s): {reported:?}",
+                indication.pti,
+                reported.len()
+            );
+            ue_policy_set_reported_upsis(pol_asso_id, reported.clone());
+            UePolicyResultOutcome::StateReported(reported.len())
+        }
         other => {
             log::info!(
                 "[{pol_asso_id}] UE policy: uplink UPDP message type {other:#04x} is not a \
-                 COMPLETE/REJECT; ignoring (not part of the delivery-result loop)"
+                 COMPLETE/REJECT/UE STATE INDICATION; ignoring (not part of the \
+                 delivery-result loop)"
             );
             UePolicyResultOutcome::Ignored(other)
         }
     }
+}
+
+/// Flatten a D.6.4 UPSI list into `(mcc, mnc, upsc)` triples.
+///
+/// The PLMN is carried per SUBLIST, so a UPSC on its own is ambiguous: the same code
+/// means different content in different PLMNs (Table D.6.2.1). Keeping the PLMN with
+/// each UPSC is what lets the delta be computed against the serving PLMN only.
+pub fn flatten_upsi_list(list: &nas_updp::UpsiList) -> Vec<(String, String, u16)> {
+    let mut out = Vec::new();
+    for sublist in &list.sublists {
+        let (mcc, mnc) = plmn_id_to_strings(&sublist.plmn_id);
+        for upsc in &sublist.upscs {
+            out.push((mcc.clone(), mnc.clone(), *upsc));
+        }
+    }
+    out
+}
+
+/// Render a NAS [`PlmnId`](nextgcore_nas::common::types::PlmnId) back to decimal
+/// MCC/MNC strings, so a reported UPSI can be compared with the association's
+/// configured `plmn` pair.
+fn plmn_id_to_strings(plmn: &nextgcore_nas::common::types::PlmnId) -> (String, String) {
+    let digits = |ds: &[u8]| -> String {
+        ds.iter()
+            .filter(|d| **d <= 9)
+            .map(|d| char::from(b'0' + d))
+            .collect()
+    };
+    // MNC length comes from `mnc_len`, not from spotting the 0x0F filler: the BCD
+    // decoder normalises the filler nibble to 0, so a 2-digit MNC "01" arrives as
+    // `[0, 1, 0]` and filtering on the value alone would render it "010".
+    let mnc_len = usize::from(plmn.mnc_len).clamp(2, 3);
+    (digits(&plmn.mcc), digits(&plmn.mnc[..mnc_len.min(3)]))
+}
+
+/// Point an association's notifications at a new URI (#91, TS 29.525 §5.6.2.4).
+pub fn ue_policy_set_notification_uri(pol_asso_id: &str, uri: &str) {
+    if let Ok(mut m) = ue_policy_store().lock() {
+        if let Some(a) = m.get_mut(pol_asso_id) {
+            a.notification_uri = uri.to_string();
+        }
+    }
+}
+
+/// Record the request triggers the consumer says it observes (#91).
+pub fn ue_policy_set_triggers(pol_asso_id: &str, triggers: Vec<String>) {
+    if let Ok(mut m) = ue_policy_store().lock() {
+        if let Some(a) = m.get_mut(pol_asso_id) {
+            a.triggers = triggers;
+        }
+    }
+}
+
+/// Record which section UPSCs a delivery actually carried (#91). No-op once the
+/// association is gone.
+pub fn ue_policy_set_delivered_upscs(pol_asso_id: &str, upscs: Vec<u16>) {
+    if let Ok(mut m) = ue_policy_store().lock() {
+        if let Some(a) = m.get_mut(pol_asso_id) {
+            a.delivered_upscs = upscs;
+        }
+    }
+}
+
+/// Record the UPSIs a UE reported as installed. No-op once the association is gone,
+/// like every other setter here.
+pub fn ue_policy_set_reported_upsis(pol_asso_id: &str, upsis: Vec<(String, String, u16)>) {
+    if let Ok(mut m) = ue_policy_store().lock() {
+        if let Some(a) = m.get_mut(pol_asso_id) {
+            a.reported_upsis = upsis;
+        }
+    }
+}
+
+/// The UPSCs the UE reported installed FOR THIS PLMN, which is the set a delta must
+/// skip. UPSCs reported for another PLMN are deliberately not counted: they name
+/// different content.
+pub fn installed_upscs_for_plmn(pol_asso_id: &str, mcc: &str, mnc: &str) -> Vec<u16> {
+    let Ok(m) = ue_policy_store().lock() else {
+        return Vec::new();
+    };
+    let Some(a) = m.get(pol_asso_id) else {
+        return Vec::new();
+    };
+    a.reported_upsis
+        .iter()
+        .filter(|(rm, rn, _)| rm == mcc && rn == mnc)
+        .map(|(_, _, upsc)| *upsc)
+        .collect()
+}
+
+/// Decode a base64 `uePolReq` from a PolicyAssociation(Update)Request and, when it is
+/// a UE STATE INDICATION, record the reported UPSIs on the association (#91).
+///
+/// Returns how many UPSIs were recorded. A `uePolReq` that is not base64, or not a UPDP
+/// message, or a UPDP message of some other type, records nothing and says why -- the
+/// association create must not fail on it, since TS 29.525 makes the member optional
+/// and a malformed one is the consumer's mistake, not a reason to refuse policy.
+pub fn ingest_ue_policy_request(pol_asso_id: &str, ue_pol_req_b64: &str) -> usize {
+    use base64::Engine as _;
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(ue_pol_req_b64) else {
+        log::warn!("[{pol_asso_id}] uePolReq is not valid base64; ignoring");
+        return 0;
+    };
+    match nas_updp::peek_message_type(&bytes) {
+        Ok(nas_updp::UPDP_MSG_UE_STATE_INDICATION) => {}
+        Ok(other) => {
+            log::warn!(
+                "[{pol_asso_id}] uePolReq carries UPDP message type {other:#04x}, not a UE \
+                 STATE INDICATION; no UPSI list to record"
+            );
+            return 0;
+        }
+        Err(e) => {
+            log::warn!("[{pol_asso_id}] uePolReq is not a decodable UPDP message ({e}); ignoring");
+            return 0;
+        }
+    }
+    let Ok(indication) = nas_updp::UeStateIndication::decode(&bytes) else {
+        log::warn!("[{pol_asso_id}] uePolReq UE STATE INDICATION did not decode; ignoring");
+        return 0;
+    };
+    let reported = flatten_upsi_list(&indication.upsi_list);
+    log::info!(
+        "[{pol_asso_id}] uePolReq: UE reports {} installed UPSI(s) {reported:?}; the next \
+         delivery will be a delta",
+        reported.len()
+    );
+    let n = reported.len();
+    ue_policy_set_reported_upsis(pol_asso_id, reported);
+    n
 }
 
 /// Summarize a decoded D.6.3 UE policy section management result into a
@@ -777,11 +970,53 @@ fn map_td_component(
         // an explicit match-all component here would still be valid.
         TrafficDescriptorComponent::Dnn(d) => N::Dnn(d.clone()),
         TrafficDescriptorComponent::DomainName(fqdn) => N::DestinationFqdn(fqdn.clone()),
-        // Unrepresentable in this direct mapping (fail-closed rather than
-        // silently drop): the pcfd model stores an opaque `AppId` string and a
-        // CIDR `IpDesc` string, but TS 24.526 Table 5.2.1 needs a structured
-        // 16-octet OS Id + app id / explicit address+mask, and defines NO
-        // S-NSSAI / non-IP / Ethernet traffic-descriptor component identifier.
+        // #91: the structured components. Each maps 1:1 onto a Table 5.2.1 type,
+        // which is exactly why they were added to the pcfd model -- the pre-#91
+        // `AppId(String)` and `IpDesc { dest_ip_prefix: String, .. }` could not, and
+        // fail-closing on them was correct rather than lazy.
+        TrafficDescriptorComponent::OsIdOsAppId { os_id, app_id } => N::OsIdOsAppId {
+            os_id: *os_id,
+            os_app_id: app_id.as_bytes().to_vec(),
+        },
+        TrafficDescriptorComponent::Ipv4RemoteAddress { addr, mask } => N::Ipv4RemoteAddress {
+            addr: *addr,
+            mask: *mask,
+        },
+        TrafficDescriptorComponent::Ipv6RemoteAddress { addr, prefix_len } => {
+            N::Ipv6RemoteAddress {
+                addr: *addr,
+                prefix_len: *prefix_len,
+            }
+        }
+        TrafficDescriptorComponent::ProtocolIdentifier(p) => N::ProtocolIdentifier(*p),
+        TrafficDescriptorComponent::SingleRemotePort(p) => N::SingleRemotePort(*p),
+        TrafficDescriptorComponent::RemotePortRange { low, high } => {
+            if low > high {
+                return Err(format!(
+                    "remote port range {low}-{high} is inverted; Table 5.2.1 transmits the LOW \
+                     limit first, so an inverted range matches nothing"
+                ));
+            }
+            N::RemotePortRange {
+                low: *low,
+                high: *high,
+            }
+        }
+        // Still unrepresentable, fail-closed rather than silently dropped:
+        //
+        // - `AppId` is an opaque operator string where Table 5.2.1 needs a 16-octet
+        //   UUID + length-prefixed app id (use `OsIdOsAppId`);
+        // - `IpDesc` is a CIDR string where the table needs an explicit address+mask
+        //   (use `Ipv4RemoteAddress`/`Ipv6RemoteAddress` + `ProtocolIdentifier` +
+        //   `SingleRemotePort`/`RemotePortRange`, which is what an IP 3-tuple
+        //   decomposes into);
+        // - `SNssai` has NO traffic-descriptor component identifier at all.
+        //   #91's criterion 6 asks for one, but TS 24.526 V18.5.0 Table 5.2.1 lists
+        //   none and says "all other values are spare"
+        //   (`specs/24526-i50.txt:2467-2498`). S-NSSAI is a ROUTE SELECTION
+        //   descriptor component, which `map_rsd` already emits. That part of the
+        //   criterion is void, not unimplemented;
+        // - `NonIp`/`Ethernet` likewise have no component identifier.
         other => {
             return Err(format!(
                 "traffic descriptor component {other:?} is not representable on the wire \
@@ -837,6 +1072,146 @@ fn map_rsd(rsd: &RouteSelectionDescriptor) -> Result<nas_updp::RouteSelectionDes
 /// (`mcc`/`mnc`) → ONE instruction (`upsc`) → ONE URSP part built from
 /// `rules`. Fail-closed: any unrepresentable rule/component or over-length
 /// container returns `Err` (never Ok-with-holes).
+/// The largest UE policy part CONTENTS a single section can carry.
+///
+/// Figure D.6.2.7's contents length is a 2-octet field, and Table D.6.2.1 NOTE 2 makes
+/// it cover the part-type octet as well, so the URSP bytes themselves get one less than
+/// `u16::MAX`. This is the bound the encoder fails closed on, and therefore the bound
+/// [`build_manage_ue_policy_command`] partitions against.
+pub const MAX_UE_POLICY_PART_CONTENTS: usize = u16::MAX as usize - 1;
+
+/// Build a MANAGE UE POLICY COMMAND, partitioning the rules across as many UE policy
+/// sections as they need (#91, TS 23.502 §4.2.4.3 / TS 24.501 Annex D).
+///
+/// Returns the PDU and the UPSCs of the sections it contains, first section first.
+///
+/// This used to build exactly ONE section with ONE part and `Err` when the result was
+/// over-length -- so a policy larger than one section was undeliverable rather than
+/// split, and the UPSC was a hard-coded `1`. Sections are numbered from `first_upsc`
+/// upward; each is its own instruction inside the PLMN sublist, which is how D.6.2.4
+/// expresses more than one section for one PLMN.
+pub fn build_manage_ue_policy_command_sections(
+    pti: u8,
+    first_upsc: u16,
+    mcc: &str,
+    mnc: &str,
+    rules: &[UrspRule],
+    max_part_contents: usize,
+) -> Result<(Vec<u8>, Vec<u16>), String> {
+    build_manage_ue_policy_delta(pti, first_upsc, mcc, mnc, rules, max_part_contents, &[])?
+        .ok_or_else(|| "no sections to deliver".to_string())
+}
+
+/// The same partitioning, minus the sections the UE already reports installed (#91,
+/// TS 24.501 §5.5.1.2.2 / TS 29.525 §4.2.2.2.1).
+///
+/// `installed_upscs` comes from the UE's UPSI list in a UE STATE INDICATION. A section
+/// whose UPSC the UE already holds is OMITTED: that is the delta the PSI list exists to
+/// make possible, and re-pushing an installed section is the behaviour #91 describes as
+/// the PCF "only ever pushing a full, statically-built policy".
+///
+/// `Ok(None)` means every section is already installed, so there is nothing to send at
+/// all. Distinguished from `Ok(Some(..))` rather than returned as an empty PDU, because
+/// a MANAGE UE POLICY COMMAND whose sublist has no instructions is not a conformant
+/// message (D.6.2.3 requires at least one) and would also start a T3501 the UE has no
+/// reason to answer.
+pub fn build_manage_ue_policy_delta(
+    pti: u8,
+    first_upsc: u16,
+    mcc: &str,
+    mnc: &str,
+    rules: &[UrspRule],
+    max_part_contents: usize,
+    installed_upscs: &[u16],
+) -> Result<Option<(Vec<u8>, Vec<u16>)>, String> {
+    if rules.is_empty() {
+        return Err("no URSP rules to deliver".into());
+    }
+    let mut wire_rules = Vec::with_capacity(rules.len());
+    for r in rules {
+        wire_rules.push(map_pcfd_rule_to_wire(r)?);
+    }
+
+    // Partition on ENCODED size, one rule at a time, because a rule's encoded length
+    // depends on its components and cannot be predicted from the count. Encoding each
+    // candidate group is the only way to know it fits.
+    let mut groups: Vec<Vec<nas_updp::UrspRule>> = Vec::new();
+    let mut current: Vec<nas_updp::UrspRule> = Vec::new();
+    for rule in wire_rules {
+        let mut candidate = current.clone();
+        candidate.push(rule.clone());
+        let size = nas_updp::encode_ursp_rules(&candidate)
+            .map_err(|e| e.to_string())?
+            .len();
+        if size <= max_part_contents {
+            current = candidate;
+            continue;
+        }
+        // The candidate is too big. If the group already holds something, close it and
+        // start a new one with this rule. If it does not, this SINGLE rule exceeds a
+        // whole section on its own -- there is nothing left to split, so it is a real
+        // error rather than an infinite loop.
+        if current.is_empty() {
+            return Err(format!(
+                "a single URSP rule encodes to {size} octets, which exceeds the \
+                 {max_part_contents}-octet UE policy part limit (TS 24.501 Figure D.6.2.7); \
+                 it cannot be split across sections"
+            ));
+        }
+        groups.push(std::mem::take(&mut current));
+        current = vec![rule];
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+
+    let plmn_id = parse_plmn(mcc, mnc)?;
+    let mut instructions = Vec::with_capacity(groups.len());
+    let mut upscs = Vec::with_capacity(groups.len());
+    for (i, group) in groups.iter().enumerate() {
+        // A distinct UPSC per section, which is what makes them separately
+        // installable, separately confirmable and separately deletable (D.2.1.3).
+        //
+        // Numbered from `first_upsc` over ALL sections, including skipped ones, so a
+        // section's code does not shift when a neighbour is already installed -- a
+        // shifting code would make the UE's reported UPSI list refer to different
+        // content on the next delivery, which is worse than re-pushing.
+        let upsc = first_upsc
+            .checked_add(u16::try_from(i).map_err(|_| "too many UE policy sections")?)
+            .ok_or("UE policy section codes would wrap past 65535")?;
+        if installed_upscs.contains(&upsc) {
+            log::info!(
+                "UE policy: section UPSC={upsc} is already installed at the UE; omitted from \
+                 the delta"
+            );
+            continue;
+        }
+        let part = nas_updp::UePolicyPart::ursp(group).map_err(|e| e.to_string())?;
+        instructions.push(nas_updp::Instruction {
+            upsc,
+            parts: vec![part],
+        });
+        upscs.push(upsc);
+    }
+
+    if instructions.is_empty() {
+        return Ok(None);
+    }
+
+    let list = nas_updp::UePolicySectionManagementList {
+        sublists: vec![nas_updp::PlmnSublist {
+            plmn_id,
+            instructions,
+        }],
+    };
+    let pdu = nas_updp::ManageUePolicyCommand { pti, list }
+        .encode()
+        .map_err(|e| e.to_string())?;
+    Ok(Some((pdu, upscs)))
+}
+
+/// [`build_manage_ue_policy_command_sections`] against the spec's own section bound,
+/// keeping the single-PDU signature the delivery path and the golden vectors use.
 pub fn build_manage_ue_policy_command(
     pti: u8,
     upsc: u16,
@@ -844,24 +1219,8 @@ pub fn build_manage_ue_policy_command(
     mnc: &str,
     rules: &[UrspRule],
 ) -> Result<Vec<u8>, String> {
-    let mut wire_rules = Vec::with_capacity(rules.len());
-    for r in rules {
-        wire_rules.push(map_pcfd_rule_to_wire(r)?);
-    }
-    let part = nas_updp::UePolicyPart::ursp(&wire_rules).map_err(|e| e.to_string())?;
-    let plmn_id = parse_plmn(mcc, mnc)?;
-    let list = nas_updp::UePolicySectionManagementList {
-        sublists: vec![nas_updp::PlmnSublist {
-            plmn_id,
-            instructions: vec![nas_updp::Instruction {
-                upsc,
-                parts: vec![part],
-            }],
-        }],
-    };
-    nas_updp::ManageUePolicyCommand { pti, list }
-        .encode()
-        .map_err(|e| e.to_string())
+    build_manage_ue_policy_command_sections(pti, upsc, mcc, mnc, rules, MAX_UE_POLICY_PART_CONTENTS)
+        .map(|(pdu, _)| pdu)
 }
 
 /// Parse an MCC/MNC decimal string pair into a NAS [`PlmnId`] (MCC is always 3
@@ -983,19 +1342,163 @@ fn parse_one_rule(v: &serde_json::Value) -> Result<UrspRule, String> {
     })
 }
 
+/// Parse a provisioned traffic descriptor into the pcfd model.
+///
+/// #91: this used to accept `matchAll`/`dnn`/`fqdn` only, and to RETURN ON THE FIRST
+/// MATCH -- so a descriptor naming two components silently became one. TS 24.526 §5.2
+/// gives the components of one traffic descriptor AND semantics, so every recognised
+/// key now contributes and the descriptor carries all of them.
+///
+/// `matchAll` is exclusive by rule, not by convenience: Table 5.2.1 says "if the
+/// match-all type traffic descriptor component is included in a traffic descriptor,
+/// there shall be no traffic descriptor component with a type other than match-all".
+/// A descriptor combining them is rejected rather than silently narrowed.
 fn parse_td(v: &serde_json::Value) -> Result<TrafficDescriptor, String> {
-    if v.get("matchAll").and_then(|m| m.as_bool()) == Some(true) {
-        return Ok(TrafficDescriptor::new(vec![]));
-    }
+    let match_all = v.get("matchAll").and_then(|m| m.as_bool()) == Some(true);
+    let mut components = Vec::new();
+
     if let Some(dnn) = v.get("dnn").and_then(|d| d.as_str()) {
-        return Ok(TrafficDescriptor::for_dnn(dnn));
+        components.push(TrafficDescriptorComponent::Dnn(dnn.to_string()));
     }
     if let Some(fqdn) = v.get("fqdn").and_then(|d| d.as_str()) {
-        return Ok(TrafficDescriptor::new(vec![
-            TrafficDescriptorComponent::DomainName(fqdn.to_string()),
-        ]));
+        components.push(TrafficDescriptorComponent::DomainName(fqdn.to_string()));
     }
-    Err("unknown trafficDescriptor (expected matchAll/dnn/fqdn)".into())
+    if let Some(os) = v.get("osAppId") {
+        let os_id_str = os
+            .get("osId")
+            .and_then(|s| s.as_str())
+            .ok_or("osAppId.osId is required and must be a UUID string")?;
+        let app_id = os
+            .get("appId")
+            .and_then(|s| s.as_str())
+            .ok_or("osAppId.appId is required and must be a string")?;
+        components.push(TrafficDescriptorComponent::OsIdOsAppId {
+            os_id: parse_uuid_bytes(os_id_str)?,
+            app_id: app_id.to_string(),
+        });
+    }
+    if let Some(ip) = v.get("ipv4RemoteAddress") {
+        let addr = ip
+            .get("addr")
+            .and_then(|s| s.as_str())
+            .ok_or("ipv4RemoteAddress.addr is required")?;
+        // The MASK is required, not defaulted to /32: Table 5.2.1 transmits address
+        // then mask, and guessing a mask changes which traffic the rule matches.
+        let mask = ip
+            .get("mask")
+            .and_then(|s| s.as_str())
+            .ok_or("ipv4RemoteAddress.mask is required (Table 5.2.1 encodes address + mask)")?;
+        components.push(TrafficDescriptorComponent::Ipv4RemoteAddress {
+            addr: parse_ipv4_octets(addr)?,
+            mask: parse_ipv4_octets(mask)?,
+        });
+    }
+    if let Some(ip) = v.get("ipv6RemoteAddress") {
+        let addr = ip
+            .get("addr")
+            .and_then(|s| s.as_str())
+            .ok_or("ipv6RemoteAddress.addr is required")?;
+        let prefix_len = ip
+            .get("prefixLength")
+            .and_then(|p| p.as_u64())
+            .ok_or("ipv6RemoteAddress.prefixLength is required")?;
+        if prefix_len > 128 {
+            return Err(format!(
+                "ipv6RemoteAddress.prefixLength {prefix_len} exceeds 128"
+            ));
+        }
+        components.push(TrafficDescriptorComponent::Ipv6RemoteAddress {
+            addr: parse_ipv6_octets(addr)?,
+            prefix_len: prefix_len as u8,
+        });
+    }
+    if let Some(p) = v.get("protocol") {
+        let p = p.as_u64().ok_or("protocol must be a number")?;
+        let p = u8::try_from(p).map_err(|_| format!("protocol {p} exceeds one octet"))?;
+        components.push(TrafficDescriptorComponent::ProtocolIdentifier(p));
+    }
+    if let Some(p) = v.get("remotePort") {
+        let p = p.as_u64().ok_or("remotePort must be a number")?;
+        let p = u16::try_from(p).map_err(|_| format!("remotePort {p} exceeds two octets"))?;
+        components.push(TrafficDescriptorComponent::SingleRemotePort(p));
+    }
+    if let Some(r) = v.get("remotePortRange") {
+        let low = r
+            .get("low")
+            .and_then(|p| p.as_u64())
+            .ok_or("remotePortRange.low is required")?;
+        let high = r
+            .get("high")
+            .and_then(|p| p.as_u64())
+            .ok_or("remotePortRange.high is required")?;
+        let low = u16::try_from(low).map_err(|_| format!("remotePortRange.low {low} too large"))?;
+        let high =
+            u16::try_from(high).map_err(|_| format!("remotePortRange.high {high} too large"))?;
+        if low > high {
+            return Err(format!(
+                "remotePortRange {low}-{high} is inverted (Table 5.2.1 sends the low limit first)"
+            ));
+        }
+        components.push(TrafficDescriptorComponent::RemotePortRange { low, high });
+    }
+
+    if match_all {
+        if !components.is_empty() {
+            return Err(
+                "trafficDescriptor combines matchAll with other components; Table 5.2.1 \
+                 forbids it"
+                    .into(),
+            );
+        }
+        // An EMPTY component set is how this module represents match-all, which
+        // `map_pcfd_rule_to_wire` turns into the explicit match-all component.
+        return Ok(TrafficDescriptor::new(vec![]));
+    }
+    if components.is_empty() {
+        return Err(
+            "unknown trafficDescriptor (expected matchAll, or one or more of dnn / fqdn / \
+             osAppId / ipv4RemoteAddress / ipv6RemoteAddress / protocol / remotePort / \
+             remotePortRange)"
+                .into(),
+        );
+    }
+    Ok(TrafficDescriptor::new(components))
+}
+
+/// Parse an RFC 4122 UUID string into its 16 octets.
+///
+/// Hyphens are optional so both `PCF_URSP_RULES` hand-authoring styles work; anything
+/// that is not 32 hex digits is an error rather than a zero-padded guess, since a
+/// wrong OS Id matches a different application.
+fn parse_uuid_bytes(s: &str) -> Result<[u8; 16], String> {
+    let hex: String = s.chars().filter(|c| *c != '-').collect();
+    if hex.len() != 32 {
+        return Err(format!(
+            "osId '{s}' is not a 16-octet UUID (expected 32 hex digits, got {})",
+            hex.len()
+        ));
+    }
+    let mut out = [0u8; 16];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| format!("osId '{s}' is not hexadecimal"))?;
+    }
+    Ok(out)
+}
+
+/// Parse a dotted-quad into four octets. Used for both address and mask, since
+/// Table 5.2.1 encodes the mask as a full four-octet field rather than a prefix length.
+fn parse_ipv4_octets(s: &str) -> Result<[u8; 4], String> {
+    s.parse::<std::net::Ipv4Addr>()
+        .map(|a| a.octets())
+        .map_err(|_| format!("'{s}' is not a dotted-quad IPv4 address"))
+}
+
+/// Parse an IPv6 literal into sixteen octets.
+fn parse_ipv6_octets(s: &str) -> Result<[u8; 16], String> {
+    s.parse::<std::net::Ipv6Addr>()
+        .map(|a| a.octets())
+        .map_err(|_| format!("'{s}' is not an IPv6 address"))
 }
 
 fn parse_rsd(v: &serde_json::Value) -> Result<RouteSelectionDescriptor, String> {
@@ -1437,6 +1940,303 @@ mod tests {
         assoc.pol_asso_id
     }
 
+    /// A UE STATE INDICATION reporting `upscs` installed for PLMN 001-01.
+    fn ue_state_indication(pti: u8, upscs: &[u16]) -> Vec<u8> {
+        let plmn = nextgcore_nas::common::types::PlmnId {
+            mcc: [0, 0, 1],
+            mnc: [0, 1, 0x0F],
+            mnc_len: 2,
+        };
+        let sublists = if upscs.is_empty() {
+            Vec::new()
+        } else {
+            vec![nas_updp::UpsiSublist {
+                plmn_id: plmn,
+                upscs: upscs.to_vec(),
+            }]
+        };
+        nas_updp::UeStateIndication {
+            pti,
+            upsi_list: nas_updp::UpsiList { sublists },
+            classmark: nas_updp::UePolicyClassmark::default(),
+            os_ids: Vec::new(),
+        }
+        .encode()
+        .expect("encode UE STATE INDICATION")
+    }
+
+    /// #91 criterion 3: a UE STATE INDICATION is DECODED and its UPSI list recorded,
+    /// where it used to be logged-and-ignored.
+    #[test]
+    fn ue_state_indication_records_the_reported_upsi_list() {
+        let id = seed_pending_assoc(0x88);
+        let container = ue_state_indication(0x01, &[1, 7]);
+
+        assert_eq!(
+            apply_ue_policy_ul_container(&id, &container),
+            UePolicyResultOutcome::StateReported(2),
+            "the UE reported two installed UPSIs; Ignored(0x04) is the pre-#91 answer"
+        );
+
+        let assoc = ue_policy_find(&id).expect("assoc");
+        assert_eq!(
+            assoc.reported_upsis,
+            vec![
+                ("001".to_string(), "01".to_string(), 1),
+                ("001".to_string(), "01".to_string(), 7),
+            ],
+            "the PLMN must travel with each UPSC: the same code means different content \
+             in a different PLMN"
+        );
+        // A UE STATE INDICATION is not a delivery result, so the state must not move.
+        assert_eq!(assoc.delivery_state, DeliveryState::Pending);
+
+        // And the PLMN filter is a filter: a UPSC reported for 001-01 is not installed
+        // for 002-02.
+        assert_eq!(installed_upscs_for_plmn(&id, "001", "01"), vec![1, 7]);
+        assert!(installed_upscs_for_plmn(&id, "002", "02").is_empty());
+    }
+
+    /// #91 criterion 3: with the UE's installed list known, only the MISSING sections
+    /// are scheduled -- and when none are missing, nothing is sent at all.
+    #[test]
+    fn the_delta_omits_sections_the_ue_already_has() {
+        // Two rules, forced into two sections by a tiny part limit.
+        let rules = two_rule_set();
+        let (_, all) =
+            build_manage_ue_policy_command_sections(0x80, 1, "001", "01", &rules, ONE_RULE_FITS)
+                .expect("two sections");
+        assert_eq!(
+            all,
+            vec![1, 2],
+            "the fixture must really produce two sections"
+        );
+
+        // The UE has section 1 → only section 2 is delivered, and it keeps the code 2
+        // rather than being renumbered to 1.
+        let (_, delta) =
+            build_manage_ue_policy_delta(0x80, 1, "001", "01", &rules, ONE_RULE_FITS, &[1])
+                .expect("delta builds")
+                .expect("one section still missing");
+        assert_eq!(
+            delta,
+            vec![2],
+            "a delivered section must keep its code when a neighbour is skipped, or the \
+             UE's reported UPSI would come to mean different content"
+        );
+
+        // The UE has both → nothing to send.
+        assert!(
+            build_manage_ue_policy_delta(0x80, 1, "001", "01", &rules, ONE_RULE_FITS, &[1, 2])
+                .expect("delta builds")
+                .is_none(),
+            "an empty delta must be None, not a command with an empty sublist"
+        );
+
+        // The UE has a code we never assigned → full delivery.
+        let (_, delta) =
+            build_manage_ue_policy_delta(0x80, 1, "001", "01", &rules, ONE_RULE_FITS, &[99])
+                .expect("delta builds")
+                .expect("nothing was skipped");
+        assert_eq!(delta, vec![1, 2]);
+    }
+
+    /// #91 criterion 5: an over-length policy is PARTITIONED into ≥2 sections with
+    /// distinct UPSCs instead of failing closed.
+    #[test]
+    fn an_over_length_policy_is_partitioned_into_multiple_sections() {
+        let rules = two_rule_set();
+
+        // Against the spec's own bound both rules fit one section.
+        let (_, upscs) = build_manage_ue_policy_command_sections(
+            0x80,
+            1,
+            "001",
+            "01",
+            &rules,
+            MAX_UE_POLICY_PART_CONTENTS,
+        )
+        .expect("one section");
+        assert_eq!(upscs, vec![1], "nothing to partition at the real limit");
+
+        // With a limit that one rule fits and two do not, the policy is SPLIT rather
+        // than refused -- which is the behaviour change. Before #91 this was `Err`.
+        let (pdu, upscs) =
+            build_manage_ue_policy_command_sections(0x80, 1, "001", "01", &rules, ONE_RULE_FITS)
+                .expect("partitioned, not refused");
+        assert_eq!(upscs, vec![1, 2], "two sections, distinct UPSCs");
+
+        // The PDU really carries two instructions, read back through the decoder.
+        let decoded = nas_updp::ManageUePolicyCommand::decode(&pdu).expect("decode");
+        assert_eq!(decoded.pti, 0x80);
+        assert_eq!(decoded.list.sublists.len(), 1, "one PLMN sublist");
+        let instructions = &decoded.list.sublists[0].instructions;
+        assert_eq!(instructions.len(), 2, "two sections in one command");
+        assert_eq!(instructions[0].upsc, 1);
+        assert_eq!(instructions[1].upsc, 2);
+        assert!(
+            instructions.iter().all(|i| i.parts.len() == 1),
+            "one URSP part per section"
+        );
+
+        // A single rule that cannot fit a section at all is still an honest error:
+        // there is nothing left to split.
+        let err = build_manage_ue_policy_command_sections(0x80, 1, "001", "01", &rules, 20)
+            .expect_err("one rule alone exceeds a 4-octet part");
+        assert!(
+            err.contains("cannot be split across sections"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A part limit that fits exactly ONE rule of [`two_rule_set`] and not two.
+    ///
+    /// Measured rather than guessed: one rule of that set encodes to 41 octets, so 60
+    /// admits one and refuses two. A hard-coded 40 would refuse even one and the
+    /// partitioning tests would fail for the wrong reason.
+    const ONE_RULE_FITS: usize = 60;
+
+    #[test]
+    fn the_partition_fixture_limit_really_fits_exactly_one_rule() {
+        let rules = two_rule_set();
+        let wire: Vec<_> = rules
+            .iter()
+            .map(|r| map_pcfd_rule_to_wire(r).expect("map"))
+            .collect();
+        let one = nas_updp::encode_ursp_rules(&wire[..1])
+            .expect("encode one")
+            .len();
+        let both = nas_updp::encode_ursp_rules(&wire)
+            .expect("encode both")
+            .len();
+        assert!(
+            one <= ONE_RULE_FITS && both > ONE_RULE_FITS,
+            "the partitioning tests depend on this: one rule is {one} octets and both are \
+             {both}, against a limit of {ONE_RULE_FITS}"
+        );
+    }
+
+    /// Two distinct URSP rules, used by the partitioning tests. Distinct precedences so
+    /// they are not deduplicated, and distinct DNNs so they encode differently.
+    fn two_rule_set() -> Vec<UrspRule> {
+        vec![
+            UrspRule {
+                precedence: 10,
+                traffic_descriptors: vec![TrafficDescriptor::for_dnn("internet")],
+                route_selection_descriptors: vec![RouteSelectionDescriptor {
+                    precedence: 1,
+                    dnn: Some("internet".into()),
+                    snssai: Some((1, None)),
+                    pdu_type: RouteSelectionPduType::Ipv4v6,
+                    ssc_mode: 1,
+                    access_type: None,
+                }],
+            },
+            UrspRule {
+                precedence: 20,
+                traffic_descriptors: vec![TrafficDescriptor::for_dnn("ims")],
+                route_selection_descriptors: vec![RouteSelectionDescriptor {
+                    precedence: 1,
+                    dnn: Some("ims".into()),
+                    snssai: Some((1, None)),
+                    pdu_type: RouteSelectionPduType::Ipv4v6,
+                    ssc_mode: 1,
+                    access_type: None,
+                }],
+            },
+        ]
+    }
+
+    /// #91 criterion 6: every TS 24.526 Table 5.2.1 component the issue names, except
+    /// the one the table does not define.
+    ///
+    /// A round trip through `parse_td` and the wire encoder, since the criterion is
+    /// about both halves: parsing the provisioned JSON and emitting the component.
+    #[test]
+    fn traffic_descriptor_components_cover_table_5_2_1() {
+        let json = serde_json::json!({
+            "osAppId": { "osId": "97a498e3-fc92-5c94-8986-0333d06e4e47", "appId": "com.example" },
+            "ipv4RemoteAddress": { "addr": "192.0.2.1", "mask": "255.255.255.0" },
+            "ipv6RemoteAddress": { "addr": "2001:db8::1", "prefixLength": 64 },
+            "protocol": 6,
+            "remotePort": 443,
+            "remotePortRange": { "low": 1000, "high": 2000 },
+            "dnn": "internet",
+            "fqdn": "example.com",
+        });
+        let td = parse_td(&json).expect("all components parse");
+        assert_eq!(
+            td.components.len(),
+            8,
+            "TS 24.526 §5.2 gives the components of ONE descriptor AND semantics, so every \
+             recognised key must contribute -- the pre-#91 parser returned on the first match"
+        );
+
+        // Every one of them reaches the wire.
+        for c in &td.components {
+            map_td_component(c).unwrap_or_else(|e| panic!("{c:?} must encode: {e}"));
+        }
+
+        // The structured OS Id really is the 16 octets of the UUID.
+        let os = td
+            .components
+            .iter()
+            .find_map(|c| match c {
+                TrafficDescriptorComponent::OsIdOsAppId { os_id, .. } => Some(*os_id),
+                _ => None,
+            })
+            .expect("OsIdOsAppId present");
+        assert_eq!(os[0], 0x97);
+        assert_eq!(os[15], 0x47);
+
+        // S-NSSAI is the void half of criterion 6: Table 5.2.1 defines no traffic
+        // descriptor component identifier for it (specs/24526-i50.txt:2467-2498), so it
+        // must still fail closed rather than be silently dropped.
+        let err = map_td_component(&TrafficDescriptorComponent::SNssai { sst: 1, sd: None })
+            .expect_err("S-NSSAI has no traffic-descriptor component type");
+        assert!(err.contains("not representable"), "unexpected error: {err}");
+
+        // matchAll is exclusive by rule, not by convenience.
+        let err = parse_td(&serde_json::json!({ "matchAll": true, "dnn": "internet" }))
+            .expect_err("matchAll cannot be combined");
+        assert!(err.contains("matchAll"), "unexpected error: {err}");
+        // And alone it is the empty component set this module uses for match-all.
+        assert!(parse_td(&serde_json::json!({ "matchAll": true }))
+            .expect("matchAll alone")
+            .components
+            .is_empty());
+
+        // A required sub-member missing is an error, not a default: guessing an IPv4
+        // mask changes which traffic the rule matches.
+        let err = parse_td(&serde_json::json!({ "ipv4RemoteAddress": { "addr": "192.0.2.1" } }))
+            .expect_err("mask is required");
+        assert!(err.contains("mask is required"), "unexpected error: {err}");
+    }
+
+    /// #91: `uePolReq` is base64 UPDP. A UE STATE INDICATION in it moves the installed
+    /// baseline; anything else is ignored without failing the association.
+    #[test]
+    fn ue_pol_req_ingest_records_only_a_ue_state_indication() {
+        use base64::Engine as _;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+
+        let id = seed_pending_assoc(0x89);
+        assert_eq!(
+            ingest_ue_policy_request(&id, &b64(&ue_state_indication(0x00, &[3]))),
+            1
+        );
+        assert_eq!(installed_upscs_for_plmn(&id, "001", "01"), vec![3]);
+
+        // Not base64 → 0, and the previously recorded baseline is untouched.
+        assert_eq!(ingest_ue_policy_request(&id, "not base64!!"), 0);
+        assert_eq!(installed_upscs_for_plmn(&id, "001", "01"), vec![3]);
+
+        // A MANAGE UE POLICY COMPLETE (0x02) is a delivery result, not an installed-set
+        // report, so it records nothing here.
+        assert_eq!(ingest_ue_policy_request(&id, &b64(&[0x89, 0x02])), 0);
+        assert_eq!(installed_upscs_for_plmn(&id, "001", "01"), vec![3]);
+    }
+
     /// T3501 state machine (TS 24.501 D.2.1.5): first expiry retransmits, the
     /// second aborts — exactly ONE retransmission.
     #[test]
@@ -1595,10 +2395,18 @@ mod tests {
             apply_ue_policy_ul_container(&id, &[0x86]),
             UePolicyResultOutcome::Undecodable
         );
-        // A decodable-but-irrelevant message (UE STATE INDICATION 0x04) is ignored.
+        // #91: a TRUNCATED UE STATE INDICATION (PTI + type, no UPSI list) is
+        // Undecodable, not Ignored. It used to be Ignored because 0x04 fell into the
+        // catch-all arm and was never decoded at all -- so a malformed one and a valid
+        // one were indistinguishable.
         assert_eq!(
             apply_ue_policy_ul_container(&id, &[0x00, 0x04]),
-            UePolicyResultOutcome::Ignored(0x04)
+            UePolicyResultOutcome::Undecodable
+        );
+        // A UPDP type that really is outside this loop is still Ignored.
+        assert_eq!(
+            apply_ue_policy_ul_container(&id, &[0x00, 0x09]),
+            UePolicyResultOutcome::Ignored(0x09)
         );
         assert_eq!(
             ue_policy_find(&id).expect("assoc").delivery_state,

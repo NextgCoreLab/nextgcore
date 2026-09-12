@@ -131,6 +131,22 @@ pub struct RegistrationRequest {
     /// initial NAS message for the cleartext-IE registration flow (TS 24.501
     /// §4.4.6 / §9.11.3.33).
     pub nas_message_container: Option<NasMessageContainer>,
+    /// Payload container type (IEI `8-`, TV, 1 octet — TS 24.501 §9.11.3.40,
+    /// Table 8.2.6.1.1).
+    ///
+    /// A half-octet IEI: the type value occupies the LOW nibble of the same octet
+    /// whose HIGH nibble is the IEI `8`. Carried with
+    /// [`Self::payload_container`], and `UePolicyContainer` (6) is the value that
+    /// makes a Registration Request carry a UE STATE INDICATION (#91).
+    pub payload_container_type: Option<PayloadContainerType>,
+    /// Payload container (IEI 0x7B, TLV-E, 4-65538 — TS 24.501 §9.11.3.39,
+    /// Table 8.2.6.1.1).
+    ///
+    /// §5.5.1.2.2: the UE may include a "UE policy container" here carrying a UE
+    /// STATE INDICATION with the UPSIs it already has installed, so the PCF can
+    /// deliver only the delta. Before #91 neither IE was modelled, so the whole
+    /// message was dropped at the NAS layer and the PSI diff was impossible.
+    pub payload_container: Option<PayloadContainer>,
 }
 
 impl RegistrationRequest {
@@ -180,6 +196,17 @@ impl RegistrationRequest {
         if let Some(ref nmc) = self.nas_message_container {
             buf.put_u8(0x71); // IEI (TLV-E)
             nmc.encode(buf);
+        }
+        // Payload container type (IEI `8-`, TV) then Payload container (0x7B,
+        // TLV-E), in Table 8.2.6.1.1 order. The TYPE is emitted only alongside a
+        // container: a type with nothing to type is meaningless, and a container
+        // with no type cannot be interpreted, so they travel together or not at all.
+        if let (Some(pct), Some(pc)) =
+            (self.payload_container_type, self.payload_container.as_ref())
+        {
+            buf.put_u8(0x80 | (pct as u8 & 0x0F)); // IEI `8-` in the high nibble
+            buf.put_u8(0x7B); // IEI (TLV-E)
+            pc.encode(buf);
         }
     }
 
@@ -263,11 +290,43 @@ impl RegistrationRequest {
                     buf.advance(1);
                     msg.nas_message_container = Some(NasMessageContainer::decode(buf)?);
                 }
+                0x80 => {
+                    // Payload container type (half-octet IEI `8-`, TV).
+                    //
+                    // An UNKNOWN type value is kept as `None` rather than rejected:
+                    // §9.11.3.40 leaves values spare, and a Registration Request
+                    // that is otherwise valid must not fail on a payload the AMF
+                    // does not recognise. The container below is then still decoded
+                    // and simply not interpretable, which is the honest state.
+                    buf.advance(1);
+                    msg.payload_container_type = PayloadContainerType::from_u8(iei & 0x0F);
+                }
+                0x7B => {
+                    // Payload container (TLV-E) — §5.5.1.2.2's UE policy container
+                    buf.advance(1);
+                    msg.payload_container = Some(PayloadContainer::decode(buf)?);
+                }
                 _ => skip_unknown_ie(buf, iei)?,
             }
         }
 
         Ok(msg)
+    }
+
+    /// The Payload container's contents when it is a UE policy container
+    /// (TS 24.501 §5.5.1.2.2), else `None`.
+    ///
+    /// Both IEs must be present and the type must be `UePolicyContainer`: a
+    /// container of some other type is not a UE policy container, and a container
+    /// with no type at all cannot be claimed to be one. Returning the bytes rather
+    /// than a decoded UPDP message keeps the NAS layer out of the UPDP codec's
+    /// business -- the AMF forwards these octets to the PCF, which is the node that
+    /// owns Annex D.
+    pub fn ue_policy_container(&self) -> Option<&[u8]> {
+        match (self.payload_container_type, self.payload_container.as_ref()) {
+            (Some(PayloadContainerType::UePolicyContainer), Some(pc)) => Some(&pc.data),
+            _ => None,
+        }
     }
 }
 
@@ -1425,11 +1484,13 @@ impl UlNasTransport {
             2 => PayloadContainerType::SmsContainer,
             3 => PayloadContainerType::LppMessage,
             4 => PayloadContainerType::SorTransparentContainer,
-            5 => PayloadContainerType::UeParametersUpdateTransparentContainer,
-            6 => PayloadContainerType::UePolicyContainer,
-            7 => PayloadContainerType::UeParametersUpdateTransparentContainerForUeInitiated,
-            8 => PayloadContainerType::MultiplePayloads,
-            9 => PayloadContainerType::EventNotification,
+            5 => PayloadContainerType::UePolicyContainer,
+            6 => PayloadContainerType::UeParametersUpdateTransparentContainer,
+            7 => PayloadContainerType::LocationServices,
+            8 => PayloadContainerType::CiotUserData,
+            9 => PayloadContainerType::ServiceLevelAa,
+            10 => PayloadContainerType::EventNotification,
+            15 => PayloadContainerType::MultiplePayloads,
             _ => PayloadContainerType::N1SmInformation,
         };
         let payload_container = PayloadContainer::decode(buf)?;
@@ -1538,11 +1599,13 @@ impl DlNasTransport {
             2 => PayloadContainerType::SmsContainer,
             3 => PayloadContainerType::LppMessage,
             4 => PayloadContainerType::SorTransparentContainer,
-            5 => PayloadContainerType::UeParametersUpdateTransparentContainer,
-            6 => PayloadContainerType::UePolicyContainer,
-            7 => PayloadContainerType::UeParametersUpdateTransparentContainerForUeInitiated,
-            8 => PayloadContainerType::MultiplePayloads,
-            9 => PayloadContainerType::EventNotification,
+            5 => PayloadContainerType::UePolicyContainer,
+            6 => PayloadContainerType::UeParametersUpdateTransparentContainer,
+            7 => PayloadContainerType::LocationServices,
+            8 => PayloadContainerType::CiotUserData,
+            9 => PayloadContainerType::ServiceLevelAa,
+            10 => PayloadContainerType::EventNotification,
+            15 => PayloadContainerType::MultiplePayloads,
             _ => PayloadContainerType::N1SmInformation,
         };
         let payload_container = PayloadContainer::decode(buf)?;

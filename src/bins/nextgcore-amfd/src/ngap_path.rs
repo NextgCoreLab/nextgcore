@@ -370,6 +370,21 @@ struct UeNasContext {
     initial_context_setup_request_sent: bool,
     /// Initial Context Setup Response received from the gNB.
     initial_context_setup_response_received: bool,
+    /// Whether the Registration Accept has left the AMF for this UE (#91).
+    ///
+    /// Gates the UE-policy association create, because creating it is what makes the
+    /// PCF deliver the DL MANAGE UE POLICY COMMAND, and that must not precede the
+    /// Accept (TS 23.502 §4.2.4.3 against §4.2.2.2.2). A flag rather than trusting the
+    /// call order: an invariant a future caller cannot accidentally break is worth one
+    /// bool, and it makes the ordering assertable without an SCTP peer.
+    registration_accept_sent: bool,
+    /// The UE policy container from the Registration Request, if the UE sent one
+    /// (#91, TS 24.501 §5.5.1.2.2).
+    ///
+    /// Held here rather than acted on at parse time because the PCF association it
+    /// belongs to is created later in the procedure, and because it must survive the
+    /// authentication round trips in between.
+    ue_policy_container: Option<Vec<u8>>,
 }
 
 impl UeNasContext {
@@ -402,8 +417,24 @@ impl UeNasContext {
             gmm_fsm: GmmFsm::new(amf_ue_ngap_id),
             initial_context_setup_request_sent: false,
             initial_context_setup_response_received: false,
+            registration_accept_sent: false,
+            ue_policy_container: None,
         }
     }
+}
+
+/// What [`NgapServer::create_ue_policy_association`] decided (#91).
+///
+/// Returned rather than only logged so the ORDERING invariant is assertable without an
+/// SCTP peer or a live PCF: `Skipped` names why, and `Attempted` means the guard passed
+/// and the SBI call was made. Whether that call SUCCEEDED is a property of the PCF and
+/// not of this decision, which is the same split #70 recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UePolicyCreate {
+    /// The create was not attempted; the `&'static str` says why.
+    Skipped(&'static str),
+    /// The guard passed and `Npcf_UEPolicyControl_Create` was called.
+    Attempted,
 }
 
 /// NGAP Server - handles all gNB connections via SCTP
@@ -1787,6 +1818,12 @@ impl NgapServer {
         state.amf_ue.registration_type = req.registration_type;
         state.amf_ue.nas_ue_tsc = req.tsc;
         state.amf_ue.nas_ue_ksi = req.ksi;
+        // #91: park the UE policy container for the Npcf_UEPolicyControl_Create that
+        // happens later in the procedure. Overwritten, not merged, on a re-sent
+        // Registration Request: the latest one is the UE's current installed set, and
+        // a stale UPSI list would have the PCF compute the diff against the wrong
+        // baseline. `None` clears it for the same reason.
+        state.ue_policy_container = req.ue_policy_container().map(|c| c.to_vec());
         // Store the UE security capability EXACTLY as received so the
         // Security Mode Command replays it (TS 33.501 Section 6.7.2)
         if let Some(cap) = req.sec_cap {
@@ -2796,40 +2833,17 @@ impl NgapServer {
             }
         }
 
-        // 3b) Npcf_UEPolicyControl_Create (TS 29.525 §4.2.2 / TS 23.503
-        // §6.6.2: URSP provision trigger at registration) — Wave-6 E7. The
-        // AMF is the NF service consumer; the same PCF endpoint the AM-policy
-        // create resolved is reused (no second NRF round-trip). Fire-and-
-        // forget for the control plane: any failure logs a WARN and NEVER
-        // fails the registration (the policy feature itself fails closed —
-        // no association, no URSP delivery). Kill-switch
-        // AMF_UE_POLICY_ASSOC=off restores the pre-E7 byte-flow.
-        if crate::sbi_path::ue_policy_assoc_enabled() {
-            match crate::sbi_path::call_pcf_ue_policy_create(
-                &pcf_host,
-                pcf_port,
-                &supi,
-                &serving_mcc,
-                &serving_mnc,
-                &guami_mcc,
-                &guami_mnc,
-                &amf_id_hex,
-            )
-            .await
-            {
-                Ok(assoc) => {
-                    log::info!("[{supi}] UE policy association created (polAssoId={assoc})");
-                    state.ue_policy_association_id = Some(assoc.clone());
-                    state.amf_ue.ue_policy_association.id = Some(assoc);
-                }
-                Err(e) => {
-                    log::warn!(
-                        "[{supi}] Npcf_UEPolicyControl_Create failed \
-                         (registration continues unaffected): {e}"
-                    );
-                }
-            }
-        }
+        // 3b) Npcf_UEPolicyControl_Create used to run HERE, at step 3b, which is
+        // before the Registration Accept egresses -- and the PCF spawns the DL
+        // MANAGE UE POLICY COMMAND the moment the association is created, so the
+        // URSP delivery could overtake the Accept (#91, TS 23.502 §4.2.4.3 vs
+        // §4.2.2.2.2). It now runs at the END of `send_registration_accept`, so the
+        // association -- and therefore the delivery -- cannot precede the Accept.
+        //
+        // The PCF endpoint and the identifiers it needs are recomputed there rather
+        // than threaded through: `send_registration_accept` already owns the state,
+        // and carrying five strings across two functions to save one NRF-cached
+        // lookup would be the more fragile arrangement.
 
         // amfd-06 — Allowed NSSAI (TS 23.502 §4.2.2.2.3 / TS 24.501 §9.11.3.37):
         // the authorized set comes ONLY from network-authoritative sources — the
@@ -3027,6 +3041,11 @@ impl NgapServer {
                 "Registration Accept (update) sent via DownlinkNASTransport to UE \
                  {amf_ue_ngap_id} (5G-TMSI=0x{tmsi:08x})"
             );
+            // #91: AFTER the Accept is on the wire, never before.
+            if let Some(s) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) {
+                s.registration_accept_sent = true;
+            }
+            let _ = self.create_ue_policy_association(amf_ue_ngap_id).await;
             return Ok(());
         }
 
@@ -3098,7 +3117,119 @@ impl NgapServer {
             "Initial Context Setup Request sent to gNB for UE {amf_ue_ngap_id} \
              (KgNB derived, Registration Accept piggybacked, 5G-TMSI=0x{tmsi:08x})"
         );
+        // #91: the Registration Accept rides this ICS, so it has now egressed and the
+        // UE policy association -- whose creation triggers the PCF's DL MANAGE UE
+        // POLICY COMMAND -- may safely be created.
+        if let Some(s) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) {
+            s.registration_accept_sent = true;
+        }
+        let _ = self.create_ue_policy_association(amf_ue_ngap_id).await;
         Ok(())
+    }
+
+    /// Create the UE's `Npcf_UEPolicyControl` association, carrying the UE policy
+    /// container from the Registration Request when the UE sent one (#91).
+    ///
+    /// # Why this runs after the Registration Accept
+    ///
+    /// The PCF spawns its DL MANAGE UE POLICY COMMAND as soon as the association is
+    /// created, so creating the association at registration step 3b -- where this used
+    /// to live -- let the URSP delivery overtake the Accept (TS 23.502 §4.2.4.3
+    /// against §4.2.2.2.2). Ordering it here needs no new protocol and no new flag:
+    /// the create IS the trigger, so moving the create moves the delivery.
+    ///
+    /// Failures log a WARN and never affect the registration -- the UE is already
+    /// accepted by this point, and the policy feature fails closed (no association,
+    /// no URSP). `AMF_UE_POLICY_ASSOC=off` restores the pre-E7 byte-flow.
+    async fn create_ue_policy_association(&mut self, amf_ue_ngap_id: u64) -> UePolicyCreate {
+        if !crate::sbi_path::ue_policy_assoc_enabled() {
+            return UePolicyCreate::Skipped("kill-switch off");
+        }
+        let Some(state) = self.ue_auth_state.get(&amf_ue_ngap_id) else {
+            return UePolicyCreate::Skipped("no UE context");
+        };
+        // The ordering invariant, enforced rather than assumed.
+        if !state.registration_accept_sent {
+            log::warn!(
+                "UE {amf_ue_ngap_id}: refusing to create the UE policy association before the \
+                 Registration Accept has egressed; the PCF would deliver URSP first (#91)"
+            );
+            return UePolicyCreate::Skipped("Registration Accept not yet sent");
+        }
+        let Some(supi) = state.amf_ue.supi.clone() else {
+            return UePolicyCreate::Skipped("no SUPI");
+        };
+        let (serving_mcc, serving_mnc) = plmn_mcc_mnc_strings(&state.amf_ue.nr_tai.plmn_id);
+        let ue_policy_container = state.ue_policy_container.clone();
+
+        let (guami_plmn, amf_region, amf_set, amf_pointer) = {
+            let ctx = self.amf_context.read().await;
+            match ctx.served_guami.first() {
+                Some(g) => (
+                    g.plmn_id.clone(),
+                    g.amf_id.region,
+                    g.amf_id.set,
+                    g.amf_id.pointer,
+                ),
+                None => {
+                    let fallback = self
+                        .ue_auth_state
+                        .get(&amf_ue_ngap_id)
+                        .map(|s| s.amf_ue.nr_tai.plmn_id.clone())
+                        .unwrap_or_default();
+                    (fallback, 2, 1, 0)
+                }
+            }
+        };
+        let amf_id_hex = format!(
+            "{:06x}",
+            ((amf_region as u32) << 16) | ((amf_set as u32) << 6) | (amf_pointer as u32)
+        );
+        let (guami_mcc, guami_mnc) = plmn_mcc_mnc_strings(&guami_plmn);
+
+        // The same PCF that serves AM policy: TS 29.525 and TS 29.507 are two
+        // services of one NF, and this build has no separate UE-policy PCF. Reusing
+        // the AM-policy service name is also what step 3b did.
+        let (pcf_host, pcf_port) = crate::sbi_path::resolve_nf_endpoint_async(
+            crate::sbi_path::SbiServiceType::NpcfAmPolicyControl,
+        )
+        .await
+        .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
+
+        match crate::sbi_path::call_pcf_ue_policy_create(
+            &pcf_host,
+            pcf_port,
+            &supi,
+            &serving_mcc,
+            &serving_mnc,
+            &guami_mcc,
+            &guami_mnc,
+            &amf_id_hex,
+            ue_policy_container.as_deref(),
+        )
+        .await
+        {
+            Ok(assoc) => {
+                log::info!(
+                    "[{supi}] UE policy association created after Registration Accept \
+                     (polAssoId={assoc}, uePolReq={})",
+                    if ue_policy_container.is_some() {
+                        "present"
+                    } else {
+                        "absent"
+                    }
+                );
+                if let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) {
+                    state.ue_policy_association_id = Some(assoc.clone());
+                    state.amf_ue.ue_policy_association.id = Some(assoc);
+                }
+            }
+            Err(e) => log::warn!(
+                "[{supi}] Npcf_UEPolicyControl_Create failed \
+                 (registration already accepted, unaffected): {e}"
+            ),
+        }
+        UePolicyCreate::Attempted
     }
 
     /// Handle Service Request (TS 24.501 Section 5.6.1)
@@ -6257,6 +6388,31 @@ struct ParsedRegistrationRequest {
     /// Whether a NAS message container IE (0x71) was present. Per TS 24.501
     /// §4.4.6 it must not appear in an unprotected initial NAS message.
     nas_message_container_present: bool,
+    /// Payload container type from the half-octet IEI `8-` (TS 24.501 §9.11.3.40).
+    payload_container_type: Option<u8>,
+    /// Payload container contents from IEI 0x7B (§9.11.3.39).
+    ///
+    /// #91: §5.5.1.2.2 lets a UE carry a "UE policy container" here holding a UE
+    /// STATE INDICATION with the UPSIs it already has installed. The bytes were
+    /// SKIPPED before -- the arm that handles 0x7B advanced past them and kept
+    /// nothing -- so the PCF could never learn the UE's installed set and could only
+    /// push a full policy.
+    payload_container: Option<Vec<u8>>,
+}
+
+impl ParsedRegistrationRequest {
+    /// The payload container's contents when it is a UE policy container.
+    ///
+    /// Gated on the TYPE, because a container of some other type is not one:
+    /// forwarding an SMS container to the PCF's UPDP decoder would be worse than
+    /// dropping it. `PAYLOAD_CONTAINER_TYPE_UE_POLICY` is `6` (§9.11.3.40).
+    fn ue_policy_container(&self) -> Option<&[u8]> {
+        const PAYLOAD_CONTAINER_TYPE_UE_POLICY: u8 = 6;
+        match (self.payload_container_type, self.payload_container.as_ref()) {
+            (Some(PAYLOAD_CONTAINER_TYPE_UE_POLICY), Some(bytes)) => Some(bytes),
+            _ => None,
+        }
+    }
 }
 
 /// Presence bits set in `ParsedRegistrationRequest::presencemask` for the
@@ -6771,12 +6927,25 @@ fn parse_registration_request_pdu(nas: &[u8]) -> Option<ParsedRegistrationReques
                     0x71 => req.nas_message_container_present = true,
                     // Additional GUTI — cleartext IE.
                     0x77 => req.presencemask |= reg_present::ADDITIONAL_GUTI,
+                    // Payload container (#91): kept, not skipped. Bounds-checked
+                    // here rather than trusted, since `len` comes off the wire.
+                    0x7B => {
+                        if pos + 3 + len <= nas.len() {
+                            req.payload_container = Some(nas[pos + 3..pos + 3 + len].to_vec());
+                        }
+                    }
                     _ => {}
                 }
                 pos += 3 + len;
             }
             // Type-1 TV (IEI in high nibble)
-            b if b & 0x80 != 0 => pos += 1,
+            b if b & 0x80 != 0 => {
+                // Payload container type (#91): IEI `8-`, value in the low nibble.
+                if b & 0xF0 == 0x80 {
+                    req.payload_container_type = Some(b & 0x0F);
+                }
+                pos += 1;
+            }
             // Default: assume TLV
             _ => {
                 if pos + 1 >= nas.len() {
@@ -8563,6 +8732,98 @@ mod tests {
         )
         .await
         .expect("NGAP test server")
+    }
+
+    /// #91 criterion 7: the UE policy association -- and therefore the PCF's DL MANAGE
+    /// UE POLICY COMMAND -- is not created before the Registration Accept has egressed.
+    ///
+    /// Asserted on the DECISION rather than on the wire, because the transmission needs
+    /// a PCF and the ordering does not. The guard is what makes the ordering an
+    /// invariant instead of a call-site convention: `create_ue_policy_association` used
+    /// to run at registration step 3b, well before the Accept, and the PCF spawns
+    /// delivery the moment the association exists.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ue_policy_association_is_not_created_before_registration_accept() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+
+        let amf_ue_ngap_id = 9_100_001u64;
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 91, 1, false);
+        ue_ctx.amf_ue.supi = Some("imsi-001010000091001".to_string());
+        assert!(
+            !ue_ctx.registration_accept_sent,
+            "a fresh context has not sent an Accept"
+        );
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        // The kill-switch must be on, or the skip below would be for the wrong reason.
+        assert!(
+            crate::sbi_path::ue_policy_assoc_enabled(),
+            "AMF_UE_POLICY_ASSOC defaults on; this test asserts the ORDERING guard, not \
+             the kill-switch"
+        );
+
+        assert_eq!(
+            ngap.create_ue_policy_association(amf_ue_ngap_id).await,
+            UePolicyCreate::Skipped("Registration Accept not yet sent"),
+            "creating the association here is what let the URSP delivery overtake the \
+             Registration Accept"
+        );
+
+        // Once the Accept has egressed, the same call proceeds. `Attempted` is the
+        // decision; whether the PCF answered is the PCF's business and is not asserted.
+        ngap.ue_auth_state
+            .get_mut(&amf_ue_ngap_id)
+            .expect("ctx")
+            .registration_accept_sent = true;
+        assert_eq!(
+            ngap.create_ue_policy_association(amf_ue_ngap_id).await,
+            UePolicyCreate::Attempted
+        );
+    }
+
+    /// #91 criterion 1/2, amfd half: the Registration Request's Payload container is
+    /// CAPTURED rather than skipped, and only a UE-policy-typed one is offered to the
+    /// PCF.
+    #[test]
+    fn registration_request_payload_container_is_captured_and_type_gated() {
+        // A Registration Request with a SUCI identity, then the payload container type
+        // (half-octet IEI `8-`, value 6 = UE policy container) and the container
+        // (IEI 0x7B, TLV-E) holding a 3-octet UE STATE INDICATION.
+        let mut nas = vec![
+            0x7e, 0x00, 0x41, // EPD, sec hdr, message type
+            0x79, // ngKSI | registration type
+        ];
+        // 5GS mobile identity (LV-E): SUCI, null scheme.
+        let identity = [0x01u8, 0x00, 0xf1, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        nas.extend_from_slice(&(identity.len() as u16).to_be_bytes());
+        nas.extend_from_slice(&identity);
+        // Payload container type = 6.
+        nas.push(0x86);
+        // Payload container: IEI 0x7B, 2-octet length, contents.
+        nas.push(0x7B);
+        nas.extend_from_slice(&3u16.to_be_bytes());
+        nas.extend_from_slice(&[0x01, 0x04, 0xAB]);
+
+        let req = parse_registration_request_pdu(&nas).expect("parse");
+        assert_eq!(req.payload_container_type, Some(6));
+        assert_eq!(
+            req.payload_container.as_deref(),
+            Some(&[0x01u8, 0x04, 0xAB][..]),
+            "the container was SKIPPED before #91, so the PCF could never see the UPSI list"
+        );
+        assert_eq!(req.ue_policy_container(), Some(&[0x01u8, 0x04, 0xAB][..]));
+
+        // Same container under an SMS type (2) is NOT offered as a UE policy container.
+        let mut sms = nas.clone();
+        let type_pos = sms.iter().position(|b| *b == 0x86).expect("type octet");
+        sms[type_pos] = 0x82;
+        let req = parse_registration_request_pdu(&sms).expect("parse");
+        assert_eq!(req.payload_container_type, Some(2));
+        assert!(
+            req.ue_policy_container().is_none(),
+            "an SMS container must not reach the PCF's UPDP decoder"
+        );
     }
 
     /// WSB-4: the NGAP `process_network_deregs` pump is the (non-test) caller

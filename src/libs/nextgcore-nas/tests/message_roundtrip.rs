@@ -176,7 +176,139 @@ fn gmm_registration_request_all_optional_ies() {
             psi: 0x0004,
         }),
         nas_message_container: Some(NasMessageContainer::new(vec![0x7e, 0x00, 0x41, 0x01])),
+        // #91: the UE policy container of TS 24.501 §5.5.1.2.2, which is what lets a
+        // Registration Request carry a UE STATE INDICATION.
+        payload_container_type: Some(PayloadContainerType::UePolicyContainer),
+        payload_container: Some(PayloadContainer::new(vec![0x00, 0x04, 0x00, 0x00, 0x01])),
     }));
+}
+
+/// #91: the payload container type values are wire values from TS 24.501
+/// Table 9.11.3.40.1, and two of them were SWAPPED while the enum's only symbolic user
+/// happened to be the one that was right.
+///
+/// Asserted as literals against the clause, the guard #321 added after `smfd` shipped
+/// S-NSSAI under the wrong IE number. `amfd` carries its own correct copy in
+/// `gmm_handler::payload_container_type`, so the two must agree — and the assertion on
+/// `UePolicyContainer` is the one #91 depends on, since a Registration Request declaring
+/// its UE policy container as a "UE parameters update transparent container" would never
+/// reach the PCF's UPDP decoder.
+#[test]
+fn test_payload_container_types_match_ts24501_table_9_11_3_40_1() {
+    use PayloadContainerType as T;
+    assert_eq!(T::N1SmInformation as u8, 1, "0001 N1 SM information");
+    assert_eq!(T::SmsContainer as u8, 2, "0010 SMS");
+    assert_eq!(T::LppMessage as u8, 3, "0011 LPP message container");
+    assert_eq!(
+        T::SorTransparentContainer as u8,
+        4,
+        "0100 SOR transparent container"
+    );
+    assert_eq!(
+        T::UePolicyContainer as u8,
+        5,
+        "0101 UE policy container — was 6, which is UE parameters update"
+    );
+    assert_eq!(
+        T::UeParametersUpdateTransparentContainer as u8,
+        6,
+        "0110 UE parameters update transparent container — was 5"
+    );
+    assert_eq!(
+        T::LocationServices as u8,
+        7,
+        "0111 Location services message container"
+    );
+    assert_eq!(T::CiotUserData as u8, 8, "1000 CIoT user data container");
+    assert_eq!(
+        T::ServiceLevelAa as u8,
+        9,
+        "1001 Service-level-AA container"
+    );
+    assert_eq!(
+        T::EventNotification as u8,
+        10,
+        "1010 Event notification — was 9"
+    );
+    assert_eq!(
+        T::MultiplePayloads as u8,
+        15,
+        "1111 Multiple payloads — was 8"
+    );
+
+    // The decoder must agree with the encoder for every one of them, or a container the
+    // AMF sends is not the container it reads back.
+    for t in [
+        T::N1SmInformation,
+        T::SmsContainer,
+        T::LppMessage,
+        T::SorTransparentContainer,
+        T::UePolicyContainer,
+        T::UeParametersUpdateTransparentContainer,
+        T::LocationServices,
+        T::CiotUserData,
+        T::ServiceLevelAa,
+        T::EventNotification,
+        T::MultiplePayloads,
+    ] {
+        assert_eq!(
+            PayloadContainerType::from_u8(t as u8),
+            Some(t),
+            "{t:?} must round-trip through from_u8"
+        );
+    }
+    // A spare value is None, not silently mapped onto N1 SM information.
+    assert_eq!(PayloadContainerType::from_u8(11), None);
+}
+
+/// #91: a Registration Request with NO payload container still round-trips, and the
+/// UE-policy accessor says so. Separate from the all-IEs test because a decoder that
+/// invented a container would pass that one.
+#[test]
+fn gmm_registration_request_without_payload_container() {
+    let msg = RegistrationRequest {
+        registration_type: RegistrationType::new(true, RegistrationTypeValue::InitialRegistration),
+        ngksi: KeySetIdentifier::new(0, 1),
+        mobile_identity: MobileIdentity::Suci(test_suci()),
+        ..Default::default()
+    };
+    roundtrip_5gmm(FiveGmmMessage::RegistrationRequest(msg.clone()));
+    assert!(
+        msg.ue_policy_container().is_none(),
+        "no container means no UE policy container"
+    );
+}
+
+/// #91: the accessor is the gate the AMF uses, so it must refuse a container whose
+/// type is something else -- routing an SMS container into the PCF's UPDP decoder
+/// would be worse than dropping it.
+#[test]
+fn gmm_registration_request_payload_container_type_gates_the_accessor() {
+    let ue_policy = RegistrationRequest {
+        payload_container_type: Some(PayloadContainerType::UePolicyContainer),
+        payload_container: Some(PayloadContainer::new(vec![0xAA, 0xBB])),
+        ..Default::default()
+    };
+    assert_eq!(ue_policy.ue_policy_container(), Some(&[0xAAu8, 0xBB][..]));
+
+    let sms = RegistrationRequest {
+        payload_container_type: Some(PayloadContainerType::SmsContainer),
+        payload_container: Some(PayloadContainer::new(vec![0xAA, 0xBB])),
+        ..Default::default()
+    };
+    assert!(
+        sms.ue_policy_container().is_none(),
+        "an SMS container is not a UE policy container"
+    );
+
+    let untyped = RegistrationRequest {
+        payload_container: Some(PayloadContainer::new(vec![0xAA, 0xBB])),
+        ..Default::default()
+    };
+    assert!(
+        untyped.ue_policy_container().is_none(),
+        "a container with no type cannot be claimed to be a UE policy container"
+    );
 }
 
 #[test]

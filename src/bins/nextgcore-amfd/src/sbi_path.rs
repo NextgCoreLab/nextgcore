@@ -1943,13 +1943,16 @@ pub async fn call_pcf_ue_policy_create(
     guami_mcc: &str,
     guami_mnc: &str,
     guami_amf_id_hex: &str,
+    // `ue_policy_container`: the UE policy container from the Registration Request's
+    // Payload container (TS 24.501 §5.5.1.2.2), or `None` when the UE sent none (#91).
+    ue_policy_container: Option<&[u8]>,
 ) -> SbiResult<String> {
     let client = crate::attach_oauth2(
         SbiClient::for_peer(pcf_host, pcf_port),
         nextgcore_sbi::types::NfType::Pcf,
     );
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "notificationUri": format!("/namf-callback/v1/{supi}/ue-policy-notify"),
         "supi": supi,
         "suppFeat": "",
@@ -1959,6 +1962,23 @@ pub async fn call_pcf_ue_policy_create(
             "amfId": guami_amf_id_hex,
         },
     });
+
+    // #91: `uePolReq` is `UePolicyRequest`, which TS29525_Npcf_UEPolicyControl.yaml
+    // resolves to TS 29.571 `Bytes` -- a base64-encoded octet string. So the UE's UPDP
+    // message travels verbatim, base64'd, and the PCF is the node that decodes Annex D.
+    // The member is OMITTED rather than sent empty when the UE sent no container: an
+    // empty `uePolReq` would claim the UE reported an empty installed set, which is a
+    // different statement from "the UE reported nothing".
+    if let Some(container) = ue_policy_container {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "uePolReq".to_string(),
+                serde_json::Value::String(
+                    base64::engine::general_purpose::STANDARD.encode(container),
+                ),
+            );
+        }
+    }
 
     let response = client
         .post_json("/npcf-ue-policy-control/v1/policies", &body)
@@ -2863,6 +2883,42 @@ mod tests {
             return nextgcore_sbi::message::SbiResponse::with_status(503);
         }
 
+        // #91: this SUPI is only used by the test that passes a UE policy container, so
+        // the stub can insist on `uePolReq` being present, base64, and byte-exact. The
+        // assertion lives here rather than in the test because it is the SERIALISED
+        // BODY the criterion is about, and the stub is the only place that sees it.
+        if body["supi"].as_str() == Some("imsi-with-ue-policy-container") {
+            use base64::Engine as _;
+            let expected = base64::engine::general_purpose::STANDARD.encode([0x01u8, 0x04, 0xAB]);
+            if body["uePolReq"].as_str() != Some(expected.as_str()) {
+                return nextgcore_sbi::message::SbiResponse::with_status(400).with_body(
+                    serde_json::json!({
+                        "status": 400,
+                        "cause": "MISSING_OR_WRONG_UE_POL_REQ",
+                        "detail": format!("got {:?}, want {expected}", body["uePolReq"]),
+                    })
+                    .to_string(),
+                    "application/problem+json",
+                );
+            }
+        }
+
+        // And when no container was passed, `uePolReq` must be ABSENT rather than an
+        // empty string: an empty one claims the UE reported an empty installed set,
+        // which is a different statement from "the UE reported nothing".
+        if body["supi"].as_str() == Some("imsi-without-ue-policy-container")
+            && !body["uePolReq"].is_null()
+        {
+            return nextgcore_sbi::message::SbiResponse::with_status(400).with_body(
+                serde_json::json!({
+                    "status": 400,
+                    "cause": "UNEXPECTED_UE_POL_REQ",
+                })
+                .to_string(),
+                "application/problem+json",
+            );
+        }
+
         // amfd's notification URI convention (mirrors the AM-policy one):
         // /namf-callback/v1/{supi}/ue-policy-notify.
         let supi = body["supi"].as_str().unwrap_or_default();
@@ -2962,10 +3018,59 @@ mod tests {
             "001",
             "01",
             "020040",
+            None,
         )
         .await
         .expect("UE policy create against paired stub");
         assert_eq!(assoc, "pol-ue-42", "polAssoId parsed from Location");
+
+        server.stop().await.expect("server stop");
+    }
+
+    /// #91 criterion 2: `call_pcf_ue_policy_create` emits `uePolReq` in the
+    /// `Npcf_UEPolicyControl_Create` body, base64 per TS 29.571 `Bytes`, and omits it
+    /// entirely when the UE sent no container.
+    ///
+    /// The stub does the checking, and answers 400 when the member is missing, wrong or
+    /// unexpectedly present -- so a `.expect()` here fails on exactly that. Asserting
+    /// through the stub rather than on a locally-built body is what makes this a claim
+    /// about the SERIALISED request.
+    #[tokio::test]
+    async fn ue_policy_create_carries_the_ue_policy_container_as_ue_pol_req() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (server, port) = start_pcf_ue_policy_stub().await;
+
+        // PTI 0x01, message type 0x04 (UE STATE INDICATION), one payload octet.
+        let container = [0x01u8, 0x04, 0xAB];
+        let assoc = call_pcf_ue_policy_create(
+            "127.0.0.1",
+            port,
+            "imsi-with-ue-policy-container",
+            "001",
+            "01",
+            "001",
+            "01",
+            "020040",
+            Some(&container),
+        )
+        .await
+        .expect("the stub 400s unless uePolReq is present and byte-exact");
+        assert_eq!(assoc, "pol-ue-42");
+
+        let assoc = call_pcf_ue_policy_create(
+            "127.0.0.1",
+            port,
+            "imsi-without-ue-policy-container",
+            "001",
+            "01",
+            "001",
+            "01",
+            "020040",
+            None,
+        )
+        .await
+        .expect("the stub 400s if uePolReq appears when no container was passed");
+        assert_eq!(assoc, "pol-ue-42");
 
         server.stop().await.expect("server stop");
     }
@@ -2986,6 +3091,7 @@ mod tests {
             "001",
             "01",
             "020040",
+            None,
         )
         .await;
         assert!(result.is_err(), "5xx from PCF must surface as Err");
@@ -3006,6 +3112,7 @@ mod tests {
             "001",
             "01",
             "020040",
+            None,
         )
         .await;
         assert!(result.is_err(), "unreachable PCF must surface as Err");
