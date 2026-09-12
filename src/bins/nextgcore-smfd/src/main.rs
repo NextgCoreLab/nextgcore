@@ -5435,9 +5435,40 @@ fn build_ue_eps_pdn_connection(sess: &context::SmfSess, eps_bearer_id: Option<u8
         Some(addr) => buf.extend_from_slice(&addr.octets()),
         None => buf.extend_from_slice(&[0, 0, 0, 0]),
     }
-    // Default bearer QoS: the 5QI the session was authorised with, which is what
-    // maps onto the EPS QCI.
-    buf.push(sess.session_qos.index);
+    // Default bearer QoS as an EPS **QCI**, mapped per TS 23.502 Annex C.
+    //
+    // #62: this used to push `sess.session_qos.index` — the raw 5QI — with a comment
+    // asserting it "is what maps onto the EPS QCI". For the standardised 5QIs 1..=9
+    // that happens to be true, which is why it was invisible; for anything else the
+    // container handed to an AMF (and onward to an MME) declared a QCI value that
+    // TS 23.203 does not define, and an MME would either reject the PDN connection or
+    // enforce a QoS the session was never authorised with.
+    //
+    // The mapping already existed and this was its second, unmapped call site.
+    // `gsm_build::encode_mapped_eps_bearer_context` — the IE that tells the *UE* about
+    // the same bearer — goes through `qci_for_5qi`, so the two descriptions of one
+    // bearer disagreed: the UE was told "no mapped EPS QoS" while the MME was told a
+    // QCI equal to a 5QI with no EPS equivalent. One wire fact, two spellings, and only
+    // the tested one was right (#335, #340).
+    //
+    // A 5QI with no EPS equivalent encodes as **0**, which TS 24.301 §9.9.4.3 reserves.
+    // The layout here is positional (#78's), so the octet cannot be omitted the way
+    // `encode_mapped_eps_bearer_context` omits its whole parameter — and a reserved
+    // value an MME must reject is a better answer than a plausible wrong one.
+    match gsm_build::qci_for_5qi(sess.session_qos.index) {
+        Some(qci) => buf.push(qci),
+        None => {
+            log::warn!(
+                "[smContextRef={}] 5QI {} has no standardised EPS QCI (TS 23.502 Annex C maps only \
+                 standardised 5QIs one-to-one), so the ueEpsPdnConnection carries the \
+                 reserved QCI 0: this session's default bearer cannot be described to an \
+                 MME, and moving it to EPS will be refused rather than mis-enforced",
+                sess.sm_context_ref.as_deref().unwrap_or("unknown-ref"),
+                sess.session_qos.index
+            );
+            buf.push(0);
+        }
+    }
     // #117: the EPS bearer identity, when one was assigned. Appended rather than
     // inserted so the prefix stays identical to #78's output for a session without
     // one — a peer parsing the earlier form reads the same first bytes.
@@ -8967,6 +8998,76 @@ mod tests {
                 .map(|s| s.id),
             Some(second.id)
         );
+    }
+
+    /// #62 criterion 1: the `ueEpsPdnConnection` carries an EPS **QCI**, mapped per
+    /// TS 23.502 Annex C — not the raw 5QI.
+    ///
+    /// The defect was invisible for the default 5QI: Annex C maps standardised 5QIs
+    /// one-to-one, so for 5QI 9 the mapped and unmapped answers are the same octet.
+    /// It only shows on a 5QI with no EPS equivalent, which is why the test drives one.
+    ///
+    /// It also pins the DISAGREEMENT that made this a defect rather than a nit: the
+    /// same bearer is described to the UE by
+    /// `gsm_build::encode_mapped_eps_bearer_context`, which has always gone through
+    /// `qci_for_5qi`. So before this change the UE was told "no mapped EPS QoS" while
+    /// the MME was told a QCI equal to a 5QI that TS 23.203 does not define.
+    #[tokio::test]
+    async fn the_retrieved_ue_eps_pdn_connection_carries_a_mapped_qci_not_the_raw_5qi() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        use base64::Engine as _;
+
+        // Decode the QoS octet out of the container. Layout (#78, positional):
+        // [apn_len][apn ...][pdn_type][ipv4 x4][qci]  (+ [ebi] when assigned)
+        async fn qos_octet_for(sm_ref: &str) -> u8 {
+            let body: serde_json::Value = serde_json::from_str(
+                handle_sm_context_retrieve(sm_ref)
+                    .await
+                    .http
+                    .content
+                    .as_deref()
+                    .expect("body"),
+            )
+            .expect("json");
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(body["ueEpsPdnConnection"].as_str().expect("required"))
+                .expect("base64");
+            let apn_len = bytes[0] as usize;
+            // apn_len + 1 (len octet) + 1 (pdn type) + 4 (ipv4) = index of the QCI
+            bytes[apn_len + 6]
+        }
+
+        // A standardised 5QI: Annex C maps it 1:1, so the octet is the same number.
+        let standardised = seed_registered_session("imsi-001010000000620", 3, "internet");
+        assert_eq!(
+            qos_octet_for(&standardised).await,
+            9,
+            "5QI 9 is standardised, so the QCI is 9 (TS 23.502 Annex C, one-to-one)"
+        );
+
+        // A 5QI with NO EPS equivalent must not be emitted as if it were a QCI.
+        let unmappable = seed_registered_session("imsi-001010000000621", 4, "internet");
+        if let Ok(ctx) = smf_self().read() {
+            if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(&unmappable) {
+                sess.session_qos.index = 82;
+                ctx.sess_update(&sess);
+            }
+        }
+        assert_eq!(
+            qos_octet_for(&unmappable).await,
+            0,
+            "5QI 82 has no standardised EPS QCI, so the reserved QCI 0 goes on the wire \
+             (TS 24.301 §9.9.4.3) -- an MME rejects that, where 82 would be enforced as \
+             a QCI the session was never authorised with"
+        );
+        // And the two descriptions of one bearer now agree: the UE-facing IE omits its
+        // QoS parameter for exactly the 5QIs the MME-facing container reports as 0.
+        assert_eq!(
+            gsm_build::qci_for_5qi(82),
+            None,
+            "the UE-facing mapped-EPS-bearer IE omits its QoS parameter for this 5QI"
+        );
+        assert_eq!(gsm_build::qci_for_5qi(9), Some(9));
     }
 
     /// #117 criterion 4: the retrieved `ueEpsPdnConnection` NAMES the assigned EBI
