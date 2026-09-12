@@ -1470,10 +1470,30 @@ pub const IE_ID_SOURCE_TO_TARGET_TRANSPARENT_CONTAINER: u16 = 101;
 pub const IE_ID_TARGET_TO_SOURCE_TRANSPARENT_CONTAINER: u16 = 106;
 pub const IE_ID_SECURITY_CONTEXT: u16 = 93;
 pub const IE_ID_PDU_SESSION_RESOURCE_FAILED_TO_SETUP_LIST_HO_ACK: u16 = 56;
-pub const IE_ID_UE_PAGING_IDENTITY: u16 = 112;
-pub const IE_ID_PAGING_DRX: u16 = 70;
-pub const IE_ID_TAI_LIST_FOR_PAGING: u16 = 106;
-pub const IE_ID_PAGING_PRIORITY: u16 = 69;
+// Paging IE ids (TS 38.413 §9.3.1, `6g_docs/specs/38413-j30.txt:59485-59661`).
+//
+// #69: ALL FOUR were wrong, and all four were inert because nothing in this tree ever
+// built a PAGING PDU -- `build_paging_asn1` and `send_paging` had no callers. Making the
+// paging pump reachable makes them live, so they are read from the spec here:
+//
+// | constant                     | was | is  | what the wrong value meant                |
+// |------------------------------|-----|-----|-------------------------------------------|
+// | `IE_ID_UE_PAGING_IDENTITY`   | 112 | 115 | 112 is `id-UEContextRequest`              |
+// | `IE_ID_PAGING_DRX`           | 70  | 50  | 70 is `id-MaskedIMEISV`                   |
+// | `IE_ID_TAI_LIST_FOR_PAGING`  | 106 | 103 | 106 is `id-TargetID`                      |
+// | `IE_ID_PAGING_PRIORITY`      | 69  | 52  | 69 is `id-LocationReportingRequestType`   |
+//
+// The UE paging identity is the load-bearing one: a gNB reading the AMF's 5G-S-TMSI as a
+// UEContextRequest could not page anybody. Pinned by
+// `paging_ie_ids_match_ts38413_clause_9_3_1`, the guard #321/#48 established after the
+// same class of defect in `smfd` and `mmed`. The live IE ids in this file
+// (`IE_ID_ALLOWED_NSSAI` 0, `IE_ID_RRC_ESTABLISHMENT_CAUSE` 90,
+// `IE_ID_UE_CONTEXT_REQUEST` 112) were checked at the same time and are correct — which
+// is the pattern: the ids something exercises are right, the ids nothing exercises rot.
+pub const IE_ID_UE_PAGING_IDENTITY: u16 = 115;
+pub const IE_ID_PAGING_DRX: u16 = 50;
+pub const IE_ID_TAI_LIST_FOR_PAGING: u16 = 103;
+pub const IE_ID_PAGING_PRIORITY: u16 = 52;
 pub const IE_ID_UE_RADIO_CAPABILITY_FOR_PAGING: u16 = 119;
 pub const IE_ID_PAGING_ORIGIN: u16 = 64;
 pub const IE_ID_ASSISTANCE_DATA_FOR_PAGING: u16 = 2;
@@ -2848,6 +2868,58 @@ mod unknown_ie_tests {
                 value: vec![],
             };
             assert!(handle_unknown_ie(&field).is_ok());
+        }
+    }
+}
+
+#[cfg(test)]
+mod paging_ie_id_tests {
+    use super::*;
+
+    /// #69: the four Paging IE ids are wire values from TS 38.413 §9.3.1, and all four
+    /// were wrong while nothing in the tree built a PAGING PDU.
+    ///
+    /// Asserted as literals against the clause — the guard #321 added after `smfd`
+    /// shipped S-NSSAI under IE 250 and #48 added after `mmed`/`sgwcd` shipped F-TEID
+    /// interface types 4/22/23. The neighbouring LIVE ids are asserted alongside, because
+    /// what makes this class of defect diagnosable is that the exercised ids are right
+    /// and only the unexercised ones rot.
+    #[test]
+    fn paging_ie_ids_match_ts38413_clause_9_3_1() {
+        assert_eq!(
+            IE_ID_UE_PAGING_IDENTITY, 115,
+            "id-UEPagingIdentity — was 112, which is id-UEContextRequest, so a gNB would              have read the AMF's 5G-S-TMSI as a UE context request and paged nobody"
+        );
+        assert_eq!(IE_ID_PAGING_DRX, 50, "id-PagingDRX — was 70");
+        assert_eq!(
+            IE_ID_TAI_LIST_FOR_PAGING, 103,
+            "id-TAIListForPaging — was 106"
+        );
+        assert_eq!(IE_ID_PAGING_PRIORITY, 52, "id-PagingPriority — was 69");
+
+        // The live ids, unchanged, as the control: these are exercised by every
+        // registration and are correct.
+        assert_eq!(IE_ID_ALLOWED_NSSAI, 0, "id-AllowedNSSAI");
+        assert_eq!(
+            IE_ID_RRC_ESTABLISHMENT_CAUSE, 90,
+            "id-RRCEstablishmentCause"
+        );
+        assert_eq!(IE_ID_UE_CONTEXT_REQUEST, 112, "id-UEContextRequest");
+
+        // And they must all be distinct: the pre-#69 UE_PAGING_IDENTITY collided with
+        // UE_CONTEXT_REQUEST, which is exactly the collision a literal-assertion test
+        // cannot catch on its own.
+        let ids = [
+            IE_ID_UE_PAGING_IDENTITY,
+            IE_ID_PAGING_DRX,
+            IE_ID_TAI_LIST_FOR_PAGING,
+            IE_ID_PAGING_PRIORITY,
+            IE_ID_UE_CONTEXT_REQUEST,
+        ];
+        for (i, a) in ids.iter().enumerate() {
+            for b in &ids[i + 1..] {
+                assert_ne!(a, b, "two NGAP IE ids collide: {a} and {b}");
+            }
         }
     }
 }
