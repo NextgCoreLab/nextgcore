@@ -2072,16 +2072,33 @@ fn ho_type_from_s1ap(handover_type: S1apHandoverType) -> crate::context::Handove
         S1apHandoverType::LteToGeran => crate::context::HandoverType::LteToGeran,
         S1apHandoverType::UtranToLte => crate::context::HandoverType::UtranToLte,
         S1apHandoverType::GeranToLte => crate::context::HandoverType::GeranToLte,
+        // #62: the inbound direction too. An eNB that supports the extension can send
+        // either of these, and mapping them to `IntraLte` on the way in would record
+        // the UE as doing an intra-LTE handover — so every later decision about it
+        // (bearer handling, target selection) would be made about the wrong procedure.
+        S1apHandoverType::EpsTo5gs => crate::context::HandoverType::EpsTo5gs,
+        S1apHandoverType::FiveGsToEps => crate::context::HandoverType::FiveGsToEps,
     }
 }
 
 /// Map the context Handover Type onto the S1AP representation.
-/// 5GS interworking types never reach the S1AP handover path.
 fn ho_type_to_s1ap(handover_type: crate::context::HandoverType) -> S1apHandoverType {
     match handover_type {
-        crate::context::HandoverType::IntraLte
-        | crate::context::HandoverType::EpsTo5gs
-        | crate::context::HandoverType::FiveGsToEps => S1apHandoverType::IntraLte,
+        crate::context::HandoverType::IntraLte => S1apHandoverType::IntraLte,
+        // #62: these two used to collapse into `IntraLte` under the comment "5GS
+        // interworking types never reach the S1AP handover path". They are no longer
+        // unrepresentable: TS 36.413 defines `eps-to-5gs` and `fivegs-to-eps` as the
+        // two extension additions of `HandoverType` (`36413-j20.txt:30619`), and the
+        // wire enum now carries them.
+        //
+        // Collapsing was worse than the comment suggested. If one of them DID reach
+        // this path, the eNB was told "intra-LTE handover" about an inter-system move
+        // and would admit it as an ordinary LTE handover — the eNB acting on a wrong
+        // wire value, rather than an unused branch. Mapping them truthfully means an
+        // eNB that does not support the extension can reject a value it does not
+        // recognise, which is what the extension marker is for.
+        crate::context::HandoverType::EpsTo5gs => S1apHandoverType::EpsTo5gs,
+        crate::context::HandoverType::FiveGsToEps => S1apHandoverType::FiveGsToEps,
         crate::context::HandoverType::LteToUtran => S1apHandoverType::LteToUtran,
         crate::context::HandoverType::LteToGeran => S1apHandoverType::LteToGeran,
         crate::context::HandoverType::UtranToLte => S1apHandoverType::UtranToLte,
@@ -3691,6 +3708,53 @@ mod tests {
                 );
             }
             other => panic!("expected ErrorIndication, got {other:?}"),
+        }
+    }
+    /// #62 criterion 6: the 5GS interworking handover types are no longer collapsed
+    /// onto `IntraLte`, in either direction.
+    ///
+    /// The old mapping's comment said these "never reach the S1AP handover path", which
+    /// made it look like a harmless placeholder. It was not: if one DID reach it, the
+    /// eNB was handed `intralte` for an inter-system move and would admit it as an
+    /// ordinary LTE handover — a wrong value acted on, not an unused branch. Now they
+    /// map onto the two extension additions TS 36.413 defines
+    /// (`36413-j20.txt:30619`), so an eNB that does not implement the extension can
+    /// reject a value it does not recognise, which is what the `...` marker is for.
+    #[test]
+    fn interworking_handover_types_are_not_collapsed_onto_intra_lte() {
+        use crate::context::HandoverType as Ctx;
+
+        assert_eq!(
+            ho_type_to_s1ap(Ctx::EpsTo5gs),
+            S1apHandoverType::EpsTo5gs,
+            "EpsTo5gs must go on the wire as eps-to-5gs, not as intralte"
+        );
+        assert_eq!(
+            ho_type_to_s1ap(Ctx::FiveGsToEps),
+            S1apHandoverType::FiveGsToEps,
+            "FiveGsToEps must go on the wire as fivegs-to-eps, not as intralte"
+        );
+
+        // The inbound direction too: mapping these to IntraLte on the way IN would
+        // record the UE as doing an intra-LTE handover, so every later decision about
+        // it would be made about the wrong procedure.
+        assert_eq!(ho_type_from_s1ap(S1apHandoverType::EpsTo5gs), Ctx::EpsTo5gs);
+        assert_eq!(
+            ho_type_from_s1ap(S1apHandoverType::FiveGsToEps),
+            Ctx::FiveGsToEps
+        );
+
+        // Every OTHER mapping is unchanged -- the point of the guard is that adding the
+        // two extension values did not disturb the five root ones.
+        for (ctx, wire) in [
+            (Ctx::IntraLte, S1apHandoverType::IntraLte),
+            (Ctx::LteToUtran, S1apHandoverType::LteToUtran),
+            (Ctx::LteToGeran, S1apHandoverType::LteToGeran),
+            (Ctx::UtranToLte, S1apHandoverType::UtranToLte),
+            (Ctx::GeranToLte, S1apHandoverType::GeranToLte),
+        ] {
+            assert_eq!(ho_type_to_s1ap(ctx), wire, "{ctx:?} must be unchanged");
+            assert_eq!(ho_type_from_s1ap(wire), ctx, "{wire:?} must be unchanged");
         }
     }
 }

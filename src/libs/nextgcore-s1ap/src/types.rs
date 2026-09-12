@@ -423,6 +423,26 @@ pub enum HandoverType {
     LteToGeran = 2,
     UtranToLte = 3,
     GeranToLte = 4,
+    /// `eps-to-5gs`, the FIRST extension addition after the `...` marker (#62).
+    ///
+    /// TS 36.413 `HandoverType ::= ENUMERATED { intralte, ltetoutran, ltetogeran,
+    /// utrantolte, gerantolte, ..., eps-to-5gs, fivegs-to-eps }`
+    /// (`36413-j20.txt:30619`).
+    ///
+    /// The two interworking values were **absent from this enum entirely**, so
+    /// `mmed`'s `ho_type_to_s1ap` had nothing to map its own `EpsTo5gs` /
+    /// `FiveGsToEps` onto and collapsed both to `IntraLte` — putting
+    /// "intra-LTE handover" on the wire for an inter-system move. The eNB then
+    /// admits it as an ordinary LTE handover.
+    ///
+    /// Being past the extension marker matters for the encoding, not just the value:
+    /// `HANDOVER_TYPE_CONSTRAINT` is `Constraint::extensible(0, 4)`, so the APER
+    /// encoder writes the extension bit and then `value - 4 - 1` as a normally-small
+    /// non-negative number. `eps-to-5gs` is therefore extension index 0 and
+    /// `fivegs-to-eps` index 1 — NOT the plain constrained values 5 and 6.
+    EpsTo5gs = 5,
+    /// `fivegs-to-eps`, the second extension addition. See [`HandoverType::EpsTo5gs`].
+    FiveGsToEps = 6,
 }
 
 /// Handover Required - sent by source eNB to MME

@@ -2044,6 +2044,12 @@ pub fn decode_handover_type(field: &ProtocolIeField) -> S1apResult<HandoverType>
         2 => Ok(HandoverType::LteToGeran),
         3 => Ok(HandoverType::UtranToLte),
         4 => Ok(HandoverType::GeranToLte),
+        // The two extension additions after the `...` marker (#62). `decode_enumerated`
+        // returns them already re-based onto 5 and 6, so they read like root values
+        // here; the extension bit and the normally-small index are handled inside the
+        // decoder, which is why these arms are plain.
+        5 => Ok(HandoverType::EpsTo5gs),
+        6 => Ok(HandoverType::FiveGsToEps),
         _ => Err(S1apError::InvalidIeValue {
             ie_name: "HandoverType",
             reason: format!("unknown value {value}"),
@@ -3383,5 +3389,94 @@ pub fn decode_broadcast_cancelled_area_list(
             ie_name: "BroadcastCancelledAreaList",
             reason: format!("unsupported choice index {index}"),
         }),
+    }
+}
+
+#[cfg(test)]
+mod handover_type_tests {
+    use super::*;
+
+    /// #62: `eps-to-5gs` and `fivegs-to-eps` are the two EXTENSION ADDITIONS of
+    /// TS 36.413's `HandoverType`, and they round-trip.
+    ///
+    /// Both directions are asserted, and so is the fact that they are encoded as
+    /// extensions rather than as root values 5 and 6. That distinction is the whole
+    /// reason this was not a one-line enum edit: `HandoverType ::= ENUMERATED {
+    /// intralte, ltetoutran, ltetogeran, utrantolte, gerantolte, ..., eps-to-5gs,
+    /// fivegs-to-eps }` (`36413-j20.txt:30619`) puts them past the `...`, so X.691
+    /// §14.6 encodes them as the extension bit plus a normally-small index — 0 for
+    /// `eps-to-5gs`, 1 for `fivegs-to-eps` — not as the constrained numbers 5 and 6.
+    /// An implementation that emitted 5 in the root range would be read by a peer as a
+    /// root value out of range.
+    #[test]
+    fn handover_type_interworking_values_round_trip_as_extension_additions() {
+        for (ht, expected_index) in [
+            (HandoverType::EpsTo5gs, 0u64),
+            (HandoverType::FiveGsToEps, 1u64),
+        ] {
+            let mut container = ProtocolIeContainer::new();
+            encode_handover_type(&mut container, ht).expect("encode");
+            let field = container
+                .ies
+                .iter()
+                .find(|f| f.id == ProtocolIeId::HANDOVER_TYPE)
+                .expect("the IE must be present");
+
+            // The extension bit is the FIRST bit of the encoding, and the index
+            // follows it. Asserted on the raw octet so this pins the wire form, not
+            // just that our own decoder agrees with our own encoder (#91).
+            let first = field.value[0];
+            assert_eq!(
+                first & 0x80,
+                0x80,
+                "{ht:?}: bit 8 is the extension bit and must be SET for a value past \
+                 the `...` marker; clear would encode it as a root value"
+            );
+            // normally-small non-negative (X.691 §11.6): a single `0` bit, then 6 bits
+            // of value. So after the extension bit the octet is
+            // `[ext=1][small=0][v5..v0]` and the index is the low six bits.
+            let index = (first & 0x3F) as u64;
+            assert_eq!(
+                index, expected_index,
+                "{ht:?}: extension index is counted from the end of the root, so \
+                 eps-to-5gs is 0 and fivegs-to-eps is 1 -- NOT 5 and 6"
+            );
+
+            assert_eq!(
+                decode_handover_type(field).expect("decode"),
+                ht,
+                "{ht:?} must survive the round trip"
+            );
+        }
+    }
+
+    /// The five root values are untouched by the extension additions.
+    ///
+    /// The guard that matters for a change like this: adding values past the marker
+    /// must not shift the encoding of anything already on the wire, or every existing
+    /// LTE handover breaks.
+    #[test]
+    fn handover_type_root_values_are_unchanged() {
+        for ht in [
+            HandoverType::IntraLte,
+            HandoverType::LteToUtran,
+            HandoverType::LteToGeran,
+            HandoverType::UtranToLte,
+            HandoverType::GeranToLte,
+        ] {
+            let mut container = ProtocolIeContainer::new();
+            encode_handover_type(&mut container, ht).expect("encode");
+            let field = container
+                .ies
+                .iter()
+                .find(|f| f.id == ProtocolIeId::HANDOVER_TYPE)
+                .expect("the IE must be present");
+            assert_eq!(
+                field.value[0] & 0x80,
+                0,
+                "{ht:?} is a ROOT value: the extension bit must be CLEAR"
+            );
+            assert_eq!(decode_handover_type(field).expect("decode"), ht);
+        }
     }
 }
