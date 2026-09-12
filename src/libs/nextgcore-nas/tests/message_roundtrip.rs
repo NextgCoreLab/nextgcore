@@ -183,6 +183,84 @@ fn gmm_registration_request_all_optional_ies() {
     }));
 }
 
+/// #91: the payload container type values are wire values from TS 24.501
+/// Table 9.11.3.40.1, and two of them were SWAPPED while the enum's only symbolic user
+/// happened to be the one that was right.
+///
+/// Asserted as literals against the clause, the guard #321 added after `smfd` shipped
+/// S-NSSAI under the wrong IE number. `amfd` carries its own correct copy in
+/// `gmm_handler::payload_container_type`, so the two must agree — and the assertion on
+/// `UePolicyContainer` is the one #91 depends on, since a Registration Request declaring
+/// its UE policy container as a "UE parameters update transparent container" would never
+/// reach the PCF's UPDP decoder.
+#[test]
+fn test_payload_container_types_match_ts24501_table_9_11_3_40_1() {
+    use PayloadContainerType as T;
+    assert_eq!(T::N1SmInformation as u8, 1, "0001 N1 SM information");
+    assert_eq!(T::SmsContainer as u8, 2, "0010 SMS");
+    assert_eq!(T::LppMessage as u8, 3, "0011 LPP message container");
+    assert_eq!(
+        T::SorTransparentContainer as u8,
+        4,
+        "0100 SOR transparent container"
+    );
+    assert_eq!(
+        T::UePolicyContainer as u8,
+        5,
+        "0101 UE policy container — was 6, which is UE parameters update"
+    );
+    assert_eq!(
+        T::UeParametersUpdateTransparentContainer as u8,
+        6,
+        "0110 UE parameters update transparent container — was 5"
+    );
+    assert_eq!(
+        T::LocationServices as u8,
+        7,
+        "0111 Location services message container"
+    );
+    assert_eq!(T::CiotUserData as u8, 8, "1000 CIoT user data container");
+    assert_eq!(
+        T::ServiceLevelAa as u8,
+        9,
+        "1001 Service-level-AA container"
+    );
+    assert_eq!(
+        T::EventNotification as u8,
+        10,
+        "1010 Event notification — was 9"
+    );
+    assert_eq!(
+        T::MultiplePayloads as u8,
+        15,
+        "1111 Multiple payloads — was 8"
+    );
+
+    // The decoder must agree with the encoder for every one of them, or a container the
+    // AMF sends is not the container it reads back.
+    for t in [
+        T::N1SmInformation,
+        T::SmsContainer,
+        T::LppMessage,
+        T::SorTransparentContainer,
+        T::UePolicyContainer,
+        T::UeParametersUpdateTransparentContainer,
+        T::LocationServices,
+        T::CiotUserData,
+        T::ServiceLevelAa,
+        T::EventNotification,
+        T::MultiplePayloads,
+    ] {
+        assert_eq!(
+            PayloadContainerType::from_u8(t as u8),
+            Some(t),
+            "{t:?} must round-trip through from_u8"
+        );
+    }
+    // A spare value is None, not silently mapped onto N1 SM information.
+    assert_eq!(PayloadContainerType::from_u8(11), None);
+}
+
 /// #91: a Registration Request with NO payload container still round-trips, and the
 /// UE-policy accessor says so. Separate from the all-IEs test because a decoder that
 /// invented a container would pass that one.

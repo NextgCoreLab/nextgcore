@@ -65,6 +65,39 @@ already *skipped* `0x7B` correctly — the TLV-E arm advanced past it and kept n
 now captures the bytes (bounds-checked, since `len` comes off the wire) and the type from
 the `8-` nibble, with the same type-gated accessor.
 
+## A live wire-format defect, found while reading Table 9.11.3.40.1
+
+`PayloadContainerType` had **UE policy container and UE parameters update transparent
+container swapped** (5 and 6), and 7/8/9 attached to the wrong meanings entirely:
+
+| value | the enum said | TS 24.501 Table 9.11.3.40.1 says |
+|---|---|---|
+| 5 | UE parameters update transparent container | **UE policy container** |
+| 6 | UE policy container | **UE parameters update transparent container** |
+| 7 | `…ForUeInitiated` (not a defined value at all) | Location services message container |
+| 8 | Multiple payloads | CIoT user data container |
+| 9 | Event notification | Service-level-AA container |
+| 10 | — | Event notification |
+| 15 | — | Multiple payloads |
+
+It was **inert**, for two reasons: the only symbolic user was `N1SmInformation`, which was
+right; and `amfd` carries its own *correct* copy in
+`gmm_handler::payload_container_type` (`UE_POLICY_CONTAINER = 5`,
+`MULTIPLE_PAYLOADS = 0x0F`), so the DL NAS path never went out wrong.
+
+**Criterion 1 is what made it matter.** The Registration Request UE policy container is
+the first new on-wire user of the enum, and with `UePolicyContainer = 6` that Registration
+Request would have declared its payload to be a "UE parameters update transparent
+container" — the PCF would never see the UPSI list, and the round-trip test would have
+passed anyway because it is self-consistently wrong.
+
+Same shape as `smfd`'s `S_NSSAI = 250` (#321) and `mmed`/`sgwcd`'s F-TEID interface types
+(#48): a hand-maintained wire table is wrong, and nothing notices until something reaches
+the wire through it. Values read from `6g_docs/specs/24501-j62.txt:79601` onward, and
+`test_payload_container_types_match_ts24501_table_9_11_3_40_1` pins all eleven as literals
+against the clause plus a `from_u8` round trip, so the two copies in this tree cannot
+drift apart again silently.
+
 ## Criterion 2 — `uePolReq`
 
 `TS29525_Npcf_UEPolicyControl.yaml:450` makes `uePolReq` a `UePolicyRequest`, which
@@ -178,7 +211,7 @@ decoded, so a malformed one and a valid one were indistinguishable. It is now
 
 ## Verification
 
-- Workspace **6513 → 6525** tests, 0 failures.
+- Workspace **6513 → 6526** tests, 0 failures.
 - `cargo clippy --workspace` 0 errors; `nextgcore-nas`, `nextgcore-amfd` and
   `nextgcore-pcfd` all at **0 warnings**. `cargo fmt` clean. Gated
   `easdfd --features dns-udp` clean.

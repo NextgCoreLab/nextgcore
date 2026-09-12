@@ -284,7 +284,25 @@ impl NasMessageContainer {
     }
 }
 
-/// Payload container type (TS 24.501 Section 9.11.3.40)
+/// Payload container type (TS 24.501 §9.11.3.40, Table 9.11.3.40.1).
+///
+/// # The values were wrong, and #91 is what made it matter
+///
+/// This enum had **UE policy container and UE parameters update transparent container
+/// swapped** (5 and 6), and 7/8/9 attached to the wrong meanings entirely. It was inert
+/// because the only symbolic user was `N1SmInformation`, which happened to be right --
+/// and `amfd` carries its OWN correct copy in `gmm_handler::payload_container_type`
+/// (UE_POLICY_CONTAINER = 5, MULTIPLE_PAYLOADS = 0x0F), so nothing on the DL NAS path
+/// went out wrong.
+///
+/// #91 added the first new on-wire user: the Registration Request's UE policy container.
+/// With `UePolicyContainer = 6` that Registration Request would have declared its
+/// payload to be a "UE parameters update transparent container", and the PCF would never
+/// see the UPSI list. Same shape as `smfd`'s `S_NSSAI = 250` (#321): a hand-maintained
+/// wire table is wrong and nothing notices until something reaches the wire through it.
+///
+/// Values read from `6g_docs/specs/24501-j62.txt:79601` onward, not from memory.
+/// `test_payload_container_types_match_ts24501_table_9_11_3_40_1` pins them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u8)]
 pub enum PayloadContainerType {
@@ -293,11 +311,22 @@ pub enum PayloadContainerType {
     SmsContainer = 2,
     LppMessage = 3,
     SorTransparentContainer = 4,
-    UeParametersUpdateTransparentContainer = 5,
-    UePolicyContainer = 6,
-    UeParametersUpdateTransparentContainerForUeInitiated = 7,
-    MultiplePayloads = 8,
-    EventNotification = 9,
+    /// `0101` — was 6.
+    UePolicyContainer = 5,
+    /// `0110` — was 5.
+    UeParametersUpdateTransparentContainer = 6,
+    /// `0111` Location services message container (TS 23.273). Was mislabelled
+    /// "UeParametersUpdateTransparentContainerForUeInitiated", which is not a value
+    /// Table 9.11.3.40.1 defines at all.
+    LocationServices = 7,
+    /// `1000` CIoT user data container. Was mislabelled `MultiplePayloads`.
+    CiotUserData = 8,
+    /// `1001` Service-level-AA container. Was mislabelled `EventNotification`.
+    ServiceLevelAa = 9,
+    /// `1010` Event notification. Was 9.
+    EventNotification = 10,
+    /// `1111` Multiple payloads. Was 8; `amfd`'s own copy already had 0x0F.
+    MultiplePayloads = 15,
 }
 
 impl PayloadContainerType {
@@ -312,11 +341,13 @@ impl PayloadContainerType {
             2 => Self::SmsContainer,
             3 => Self::LppMessage,
             4 => Self::SorTransparentContainer,
-            5 => Self::UeParametersUpdateTransparentContainer,
-            6 => Self::UePolicyContainer,
-            7 => Self::UeParametersUpdateTransparentContainerForUeInitiated,
-            8 => Self::MultiplePayloads,
-            9 => Self::EventNotification,
+            5 => Self::UePolicyContainer,
+            6 => Self::UeParametersUpdateTransparentContainer,
+            7 => Self::LocationServices,
+            8 => Self::CiotUserData,
+            9 => Self::ServiceLevelAa,
+            10 => Self::EventNotification,
+            15 => Self::MultiplePayloads,
             _ => return None,
         })
     }
