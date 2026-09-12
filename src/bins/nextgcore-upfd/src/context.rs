@@ -14,54 +14,35 @@
 //! how a dead store reached the wire: as a `load: 0` advertised to the NRF and to
 //! the SMF by a UPF serving any number of sessions.
 //!
+//! It used to carry a second, parallel PFCP RULE model beside that session model —
+//! `Pdr`/`Pdi`/`FTeid`/`SdfFilter`/`Far`/`OuterHeaderCreation`/`ForwardingParameters`/
+//! `DuplicatingParameters`/`RedirectInformation`/`HeaderEnrichment`, a `UeIp` reachable
+//! only from `Pdr.ue_ip`, and a token-bucket `RateLimiter` — with no importer in any
+//! module and no reader in any test, so unlike the session model it never reached the
+//! wire. Deleted in #335. The live rule model is `n4_handler`'s (parsed from the N4
+//! wire) feeding `data_plane`'s `DataPlanePdr`/`DataPlaneFar`; note that `n4_handler`,
+//! `n4_build` and `data_plane` each spell some of those names for THEIR OWN type, which
+//! is what made a grep-based reachability check misleading and is why both halves of
+//! this rot survived so long.
+//!
+//! What did NOT hide either half is `dead_code = "allow"` (`Cargo.toml`), despite being
+//! the obvious suspect. Measured on this branch: with the lint at `warn` the workspace
+//! emits 277 warnings and **upfd emits none of them**, because the lint does not fire on
+//! `pub` items in a bin crate — a `pub fn` added to this file warns not at all, while the
+//! same `fn` made private warns immediately. Narrowing the allow would therefore have
+//! bought noise, not detection; the thing that finds this class is the importer grep both
+//! #325 and #335 used.
+//!
 //! The live session stores are `pfcp_path::PfcpServer::sessions` (the N4 census,
 //! written by the establishment/deletion handlers) and
 //! `data_plane::DataPlaneSessionManager` (the forwarding tables, including the UE-IP
-//! index the data path actually uses). This module holds neither. It holds the TSN
-//! bridge model that `PfcpSessionInfo` points at, the PFCP rule types, and the
-//! process-global context whose only live business is the load gauge.
+//! index the data path actually uses). This module holds neither, and no longer holds
+//! any PFCP rule type. It holds the TSN bridge model that `PfcpSessionInfo` points at
+//! and the process-global context whose only live business is the load gauge.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-
-// ============================================================================
-// UE IP Address
-// ============================================================================
-
-/// UE IP address structure
-#[derive(Debug, Clone, Default)]
-pub struct UeIp {
-    /// IPv4 address (network byte order)
-    pub addr: [u32; 4],
-    /// Subnet reference (for IPv4/IPv6 pool management)
-    pub subnet_id: Option<u64>,
-}
-
-impl UeIp {
-    /// Create from IPv4 address
-    pub fn from_ipv4(addr: Ipv4Addr) -> Self {
-        Self {
-            addr: [u32::from_be_bytes(addr.octets()), 0, 0, 0],
-            subnet_id: None,
-        }
-    }
-
-    /// Create from IPv6 address
-    pub fn from_ipv6(addr: Ipv6Addr) -> Self {
-        let octets = addr.octets();
-        Self {
-            addr: [
-                u32::from_be_bytes([octets[0], octets[1], octets[2], octets[3]]),
-                u32::from_be_bytes([octets[4], octets[5], octets[6], octets[7]]),
-                u32::from_be_bytes([octets[8], octets[9], octets[10], octets[11]]),
-                u32::from_be_bytes([octets[12], octets[13], octets[14], octets[15]]),
-            ],
-            subnet_id: None,
-        }
-    }
-}
 
 // ============================================================================
 // TSN Bridge (Rel-18, IEEE 802.1Q)
@@ -517,293 +498,6 @@ impl TsnBridge {
 }
 
 // ============================================================================
-// PDR / FAR Structures for Rel-16 Completeness
-// ============================================================================
-
-/// Packet Detection Rule - comprehensive structure per TS 29.244
-#[derive(Debug, Clone)]
-pub struct Pdr {
-    /// PDR ID
-    pub pdr_id: u16,
-    /// Precedence
-    pub precedence: u32,
-    /// Source interface (0=Access, 1=Core, 2=SGi-LAN, etc.)
-    pub source_interface: u8,
-    /// UE IP address for matching
-    pub ue_ip: Option<UeIp>,
-    /// F-TEID for GTP-U matching
-    pub f_teid: Option<FTeid>,
-    /// SDF filter (optional)
-    pub sdf_filter: Option<SdfFilter>,
-    /// Associated FAR ID
-    pub far_id: Option<u32>,
-    /// Associated QER ID
-    pub qer_id: Option<u32>,
-    /// Associated URR IDs
-    pub urr_ids: Vec<u32>,
-    /// Outer header removal
-    pub outer_header_removal: Option<u8>,
-}
-
-impl Pdr {
-    /// Match a packet against this PDR
-    /// Returns true if all PDR matching criteria are met
-    pub fn pdr_match(
-        &self,
-        source_interface: u8,
-        ue_ip: Option<&UeIp>,
-        f_teid: Option<u32>,
-        _sdf_match: bool, // SDF filter matching placeholder
-    ) -> bool {
-        // Check source interface
-        if self.source_interface != source_interface {
-            return false;
-        }
-
-        // Check UE IP if specified
-        if let Some(pdr_ue_ip) = &self.ue_ip {
-            match ue_ip {
-                Some(packet_ue_ip) => {
-                    if pdr_ue_ip.addr != packet_ue_ip.addr {
-                        return false;
-                    }
-                }
-                None => return false,
-            }
-        }
-
-        // Check F-TEID if specified
-        if let Some(pdr_fteid) = &self.f_teid {
-            match f_teid {
-                Some(packet_teid) => {
-                    if pdr_fteid.teid != packet_teid {
-                        return false;
-                    }
-                }
-                None => return false,
-            }
-        }
-
-        // SDF filter matching: compile and check flow description if present
-        if let Some(ref sdf) = self.sdf_filter {
-            if let Some(ref desc) = sdf.flow_description {
-                if let Ok(rule) = nextgcore_ipfw::compile_rule(desc) {
-                    // Without actual packet data here, we accept if the rule compiled OK.
-                    // Real per-packet SDF matching happens in DataPlaneSession::match_pdr_with_packet.
-                    let _ = rule;
-                }
-            }
-        }
-
-        true
-    }
-}
-
-/// F-TEID for PDR matching
-#[derive(Debug, Clone)]
-pub struct FTeid {
-    /// TEID value
-    pub teid: u32,
-    /// IPv4 address
-    pub ipv4: Option<Ipv4Addr>,
-    /// IPv6 address
-    pub ipv6: Option<Ipv6Addr>,
-}
-
-/// SDF Filter for application-level filtering
-#[derive(Debug, Clone)]
-pub struct SdfFilter {
-    /// Flow description (e.g., "permit in ip from 10.0.0.0/8 to assigned")
-    pub flow_description: Option<String>,
-    /// TOS traffic class
-    pub tos_traffic_class: Option<u16>,
-    /// Security parameter index
-    pub security_parameter_index: Option<u32>,
-    /// Flow label
-    pub flow_label: Option<u32>,
-}
-
-/// Forwarding Action Rule - comprehensive structure per TS 29.244
-#[derive(Debug, Clone)]
-pub struct Far {
-    /// FAR ID
-    pub far_id: u32,
-    /// Apply Action (bitmask: DROP=0x01, FORW=0x02, BUFF=0x04, NOCP=0x08, DUPL=0x10)
-    pub apply_action: u16,
-    /// Destination interface
-    pub destination_interface: u8,
-    /// Outer header creation (for forwarding)
-    pub outer_header_creation: Option<OuterHeaderCreation>,
-    /// Forwarding parameters
-    pub forwarding_parameters: Option<ForwardingParameters>,
-    /// Duplicating parameters (for packet duplication)
-    pub duplicating_parameters: Vec<DuplicatingParameters>,
-    /// BAR ID (for buffering)
-    pub bar_id: Option<u8>,
-}
-
-impl Far {
-    /// Check if FAR action includes forwarding
-    pub fn should_forward(&self) -> bool {
-        (self.apply_action & 0x02) != 0
-    }
-
-    /// Check if FAR action includes dropping
-    pub fn should_drop(&self) -> bool {
-        (self.apply_action & 0x01) != 0
-    }
-
-    /// Check if FAR action includes buffering
-    pub fn should_buffer(&self) -> bool {
-        (self.apply_action & 0x04) != 0
-    }
-
-    /// Check if FAR action includes duplicating
-    pub fn should_duplicate(&self) -> bool {
-        (self.apply_action & 0x10) != 0
-    }
-}
-
-/// Outer Header Creation for FAR
-#[derive(Debug, Clone)]
-pub struct OuterHeaderCreation {
-    /// GTP-U TEID for encapsulation
-    pub teid: u32,
-    /// Peer IPv4 address
-    pub ipv4: Option<Ipv4Addr>,
-    /// Peer IPv6 address
-    pub ipv6: Option<Ipv6Addr>,
-    /// Port number
-    pub port: u16,
-}
-
-/// Forwarding Parameters
-#[derive(Debug, Clone)]
-pub struct ForwardingParameters {
-    /// Destination interface
-    pub destination_interface: u8,
-    /// Network instance (e.g., APN/DNN)
-    pub network_instance: Option<String>,
-    /// Redirect information
-    pub redirect_information: Option<RedirectInformation>,
-    /// Header enrichment
-    pub header_enrichment: Option<HeaderEnrichment>,
-}
-
-/// Duplicating Parameters (for packet duplication to multiple destinations)
-#[derive(Debug, Clone)]
-pub struct DuplicatingParameters {
-    /// Destination interface
-    pub destination_interface: u8,
-    /// Outer header creation
-    pub outer_header_creation: Option<OuterHeaderCreation>,
-}
-
-/// Redirect Information
-#[derive(Debug, Clone)]
-pub struct RedirectInformation {
-    /// Redirect server address type
-    pub redirect_address_type: u8,
-    /// Redirect server address
-    pub redirect_server_address: String,
-}
-
-/// Header Enrichment
-#[derive(Debug, Clone)]
-pub struct HeaderEnrichment {
-    /// Header type
-    pub header_type: u8,
-    /// Header field name
-    pub header_field_name: String,
-    /// Header field value
-    pub header_field_value: String,
-}
-
-// ============================================================================
-// Rate Limiter (Token Bucket) - Rel-16
-// ============================================================================
-
-/// Per-flow token bucket rate limiter
-#[derive(Debug)]
-pub struct RateLimiter {
-    /// Rate in bits per second
-    pub rate_bps: u64,
-    /// Burst size in bytes
-    pub burst_bytes: u64,
-    /// Current token count (in bytes)
-    tokens: AtomicU64,
-    /// Last update timestamp (nanoseconds since epoch)
-    last_update: AtomicU64,
-}
-
-impl RateLimiter {
-    /// Create a new rate limiter
-    pub fn new(rate_bps: u64, burst_bytes: u64) -> Self {
-        Self {
-            rate_bps,
-            burst_bytes,
-            tokens: AtomicU64::new(burst_bytes),
-            last_update: AtomicU64::new(Self::now_nanos()),
-        }
-    }
-
-    /// Get current time in nanoseconds
-    fn now_nanos() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("value expected")
-            .as_nanos() as u64
-    }
-
-    /// Check if a packet of given size can be forwarded
-    /// Returns true if packet is allowed, false if it should be rate-limited
-    pub fn allow_packet(&self, packet_size: usize) -> bool {
-        let now = Self::now_nanos();
-        let last = self.last_update.load(Ordering::Relaxed);
-
-        // Calculate elapsed time in seconds
-        let elapsed_ns = now.saturating_sub(last);
-        let elapsed_secs = elapsed_ns as f64 / 1_000_000_000.0;
-
-        // Calculate tokens to add based on rate
-        let tokens_to_add = (self.rate_bps as f64 * elapsed_secs / 8.0) as u64;
-
-        // Get current tokens and add new tokens (capped at burst size)
-        let current_tokens = self.tokens.load(Ordering::Relaxed);
-        let new_tokens = (current_tokens + tokens_to_add).min(self.burst_bytes);
-
-        // Check if we have enough tokens for this packet
-        if new_tokens >= packet_size as u64 {
-            // Consume tokens
-            self.tokens
-                .store(new_tokens - packet_size as u64, Ordering::Relaxed);
-            self.last_update.store(now, Ordering::Relaxed);
-            true
-        } else {
-            // Not enough tokens - rate limit
-            false
-        }
-    }
-
-    /// Reset the rate limiter
-    pub fn reset(&self) {
-        self.tokens.store(self.burst_bytes, Ordering::Relaxed);
-        self.last_update.store(Self::now_nanos(), Ordering::Relaxed);
-    }
-}
-
-impl Clone for RateLimiter {
-    fn clone(&self) -> Self {
-        Self {
-            rate_bps: self.rate_bps,
-            burst_bytes: self.burst_bytes,
-            tokens: AtomicU64::new(self.tokens.load(Ordering::Relaxed)),
-            last_update: AtomicU64::new(self.last_update.load(Ordering::Relaxed)),
-        }
-    }
-}
-
-// ============================================================================
 // UPF Context
 // ============================================================================
 
@@ -872,7 +566,17 @@ impl UpfContext {
         log::info!("UPF context finalized");
     }
 
-    /// Check if context is initialized
+    /// Check if context is initialized.
+    ///
+    /// `#[cfg(test)]` because the only reader is
+    /// `the_session_ceiling_reaches_the_global_context`, and the newly-effective
+    /// `dead_code` gate (see the crate attribute in `main.rs`) said so the moment it
+    /// was turned on. The FLAG is production state — `init` uses it to latch
+    /// double-initialisation and `fini` to refuse a second teardown — so what is
+    /// test-only is this accessor, not the thing it reads. Saying that in the
+    /// signature is the difference between a test affordance and the test-only
+    /// reader class that #325 was.
+    #[cfg(test)]
     pub fn is_initialized(&self) -> bool {
         self.initialized.load(Ordering::SeqCst)
     }
