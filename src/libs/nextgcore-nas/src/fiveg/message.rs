@@ -353,6 +353,12 @@ pub struct RegistrationAccept {
     pub allowed_nssai: Option<Nssai>,
     /// Rejected NSSAI
     pub rejected_nssai: Option<Vec<u8>>,
+    /// 5GS network feature support (TS 24.501 §9.11.3.5), carrying the `IWK N26`
+    /// bit a UE needs in order to know which 5GS↔EPS interworking mode is on
+    /// offer (§5.5.1.2.4). `None` omits the IE, which is what this core did
+    /// unconditionally before #116 — so an S1-mode-capable UE could not learn
+    /// that interworking existed at all.
+    pub network_feature_support: Option<crate::interworking::FiveGsNetworkFeatureSupport>,
     /// PDU session status
     pub pdu_session_status: Option<PduSessionStatus>,
     /// T3512 value
@@ -392,6 +398,12 @@ impl RegistrationAccept {
             buf.put_u8(0x11); // IEI
             buf.put_u8(rejected_nssai.len() as u8);
             buf.put_slice(rejected_nssai);
+        }
+        if let Some(nfs) = self.network_feature_support {
+            // 5GS network feature support (TS 24.501 §9.11.3.5): TLV, IEI 0x21.
+            // Placed here to keep the §8.2.7 table order — after Rejected NSSAI
+            // (0x11) / Configured NSSAI (0x31), before PDU session status (0x50).
+            buf.put_slice(&nfs.encode_tlv());
         }
         if let Some(ref pss) = self.pdu_session_status {
             buf.put_u8(0x50); // IEI
@@ -476,6 +488,31 @@ impl RegistrationAccept {
                         });
                     }
                     msg.rejected_nssai = Some(buf.copy_to_bytes(len).to_vec());
+                }
+                0x21 => {
+                    // 5GS network feature support (TLV, TS 24.501 §9.11.3.5). Only
+                    // octet 3 is modelled, but the whole contents field is consumed
+                    // so the IE walk stays aligned — a decoder that stopped after
+                    // the modelled octet would read the next octet as an IEI.
+                    buf.advance(1);
+                    if buf.remaining() < 1 {
+                        return Err(NasError::BufferTooShort {
+                            expected: 1,
+                            actual: buf.remaining(),
+                        });
+                    }
+                    let len = buf.get_u8() as usize;
+                    if buf.remaining() < len {
+                        return Err(NasError::BufferTooShort {
+                            expected: len,
+                            actual: buf.remaining(),
+                        });
+                    }
+                    let contents = buf.copy_to_bytes(len);
+                    msg.network_feature_support =
+                        crate::interworking::FiveGsNetworkFeatureSupport::decode_contents(
+                            &contents,
+                        );
                 }
                 0x50 => {
                     buf.advance(1);

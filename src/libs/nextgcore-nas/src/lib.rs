@@ -40,6 +40,7 @@ pub mod common;
 pub mod eps;
 pub mod error;
 pub mod fiveg;
+pub mod interworking;
 
 #[cfg(test)]
 mod property_tests;

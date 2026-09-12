@@ -2213,6 +2213,17 @@ pub struct AmfUe {
     pub next_guti: Guti5gs,
     /// Old GUTI (for context transfer)
     pub old_guti: Guti5gs,
+    /// The 4G-GUTI recovered from a 5G-GUTI the UE mapped from EPS (TS 23.003
+    /// §2.10.2.1.3 reverse mapping), when this registration arrived from EPS.
+    ///
+    /// `Some` only when the Registration Request carried an EPS NAS message container
+    /// alongside a GUTI, which is the discriminator §5.5.1.3.4 c.2 uses. Kept SEPARATE
+    /// from [`AmfUe::old_guti`] on purpose (#116): a mapped 5G-GUTI is structurally
+    /// identical to a native one, so storing it in `old_guti` made the AMF look up a
+    /// native context that never existed, and lose the one identity an MME could have
+    /// been asked about. This is the value a Context Request over N26 would carry when
+    /// that leg exists (#62).
+    pub mapped_eps_guti: Option<nextgcore_nas::eps::types::EpsGuti>,
     /// UE context transfer state
     pub amf_ue_context_transfer_state: UeContextTransferState,
     /// GUAMI pointer index
@@ -2808,6 +2819,7 @@ impl AmfUe {
             next_m_tmsi: None,
             next_guti: Guti5gs::default(),
             old_guti: Guti5gs::default(),
+            mapped_eps_guti: None,
             amf_ue_context_transfer_state: UeContextTransferState::Initial,
             guami_index: None,
             gnb_ostream_id: 0,

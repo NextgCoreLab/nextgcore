@@ -368,10 +368,92 @@ fn gmm_registration_accept_full_ie_roundtrip() {
         tai_list: Some(test_tai_list()),
         allowed_nssai: Some(test_nssai()),
         rejected_nssai: Some(vec![0x01, 0x01, 0x7B]),
+        // #116: the 5GS network feature support IE (0x21), so the decode arm is
+        // exercised in the middle of a full IE walk rather than on its own. That is the
+        // property that matters here: an IE whose contents length is not consumed
+        // exactly leaves the walk misaligned, and the NEXT IE is then read from the
+        // wrong offset -- which shows up as a corrupted `pdu_session_status`, not as a
+        // complaint about 0x21.
+        network_feature_support: Some(nextgcore_nas::interworking::FiveGsNetworkFeatureSupport {
+            iwk_n26: nextgcore_nas::interworking::Iwk26::WithoutN26Supported,
+            ims_vops_3gpp: true,
+        }),
         pdu_session_status: Some(test_pdu_session_status()),
         t3512_value: Some(GprsTimer3::new(GprsTimer3::UNIT_1_HOUR, 1)),
         t3502_value: Some(GprsTimer2::new(12)),
     }));
+}
+
+/// #116: the 5GS network feature support IE survives a full encode/decode, and its
+/// bytes are the ones TS 24.501 Table 8.2.7.1 and Table 9.11.3.5.1 specify.
+///
+/// Byte-asserted as well as round-tripped, because a round trip proves only that the
+/// codec is its own inverse: the same wrong bit on both sides is invisible to it. That
+/// is exactly how a swapped payload-container type shipped in #91.
+#[test]
+fn gmm_registration_accept_network_feature_support_bytes() {
+    let accept = RegistrationAccept {
+        registration_result: RegistrationResult {
+            sms_allowed: true,
+            value: RegistrationResultValue::ThreeGppAccess,
+        },
+        network_feature_support: Some(nextgcore_nas::interworking::FiveGsNetworkFeatureSupport {
+            iwk_n26: nextgcore_nas::interworking::Iwk26::WithoutN26Supported,
+            ims_vops_3gpp: false,
+        }),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    accept.encode(&mut buf);
+    assert_eq!(
+        buf.to_vec(),
+        vec![
+            0x01, 0x09, // 5GS registration result (LV)
+            0x21, 0x01, 0x40, // IEI 0x21, len 1, octet 3: IWK N26 (bit 7) SET
+        ],
+        "IWK N26 SET means 'interworking WITHOUT N26 supported'. A 0x00 here would \
+         claim the opposite -- that an N26 interface exists"
+    );
+
+    // And the IE is positioned per the §8.2.7 table: after Rejected NSSAI (0x11),
+    // before PDU session status (0x50).
+    let ordered = RegistrationAccept {
+        registration_result: RegistrationResult {
+            sms_allowed: true,
+            value: RegistrationResultValue::ThreeGppAccess,
+        },
+        rejected_nssai: Some(vec![0x01]),
+        network_feature_support: Some(nextgcore_nas::interworking::FiveGsNetworkFeatureSupport {
+            iwk_n26: nextgcore_nas::interworking::Iwk26::N26Supported,
+            ims_vops_3gpp: true,
+        }),
+        pdu_session_status: Some(test_pdu_session_status()),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    ordered.encode(&mut buf);
+    let bytes = buf.to_vec();
+    let at_11 = bytes
+        .iter()
+        .position(|&b| b == 0x11)
+        .expect("rejected NSSAI");
+    let at_21 = bytes
+        .iter()
+        .position(|&b| b == 0x21)
+        .expect("feature support");
+    let at_50 = bytes
+        .iter()
+        .position(|&b| b == 0x50)
+        .expect("session status");
+    assert!(
+        at_11 < at_21 && at_21 < at_50,
+        "IEI order must be 0x11 < 0x21 < 0x50 (TS 24.501 Table 8.2.7.1), got {bytes:02X?}"
+    );
+    assert_eq!(
+        bytes[at_21 + 2] & 0x40,
+        0,
+        "N26Supported encodes IWK N26 CLEAR"
+    );
 }
 
 #[test]

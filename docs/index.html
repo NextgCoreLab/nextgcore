@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>NextGCore — Agentic 6G Core Network</title>
-  <meta name="description" content="5G Core Network in Rust. 24 Network Functions with AI-native analytics, intent-based automation, zero-trust security, and full 4G/EPC interworking. Targets 3GPP Rel-15 with selected Rel-17/18 features; 6G/Rel-20 capabilities are non-normative research prototypes (no frozen Rel-20 specs exist).">
+  <meta name="description" content="5G Core Network in Rust. 24 Network Functions with AI-native analytics, intent-based automation, zero-trust security, and a full 4G/EPC network-function set (MME, HSS, SGW, PCRF). 5GS&#8596;EPS interworking is PARTIAL: capability signalling and identity mapping are implemented, N26 session continuity is not. Targets 3GPP Rel-15 with selected Rel-17/18 features; 6G/Rel-20 capabilities are non-normative research prototypes (no frozen Rel-20 specs exist).">
   <link rel="stylesheet" href="css/style.css">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔷</text></svg>">
 </head>
@@ -36,7 +36,7 @@
         <span>v0.1.0</span> &middot; 3GPP Rel-15 / Rel-17/18 features &middot; 6G prototypes (non-normative, no frozen Rel-20 specs)
       </div>
       <h1>Agentic <span class="accent">6G Core</span> Network</h1>
-      <p>The first AI-native 5G/6G Core Network — 24 Network Functions with ML-driven analytics, intent-based autonomous operations, zero-trust security, and edge intelligence — plus full 4G/EPC interworking (MME, HSS, SGW, PCRF). Built entirely in Rust.</p>
+      <p>The first AI-native 5G/6G Core Network — 24 Network Functions with ML-driven analytics, intent-based autonomous operations, zero-trust security, and edge intelligence — plus a full 4G/EPC network-function set (MME, HSS, SGW, PCRF). Built entirely in Rust. <strong>5GS&#8596;EPS interworking is partial</strong>: the AMF signals the IWK-N26 indicator and maps 5G-GUTI&#8596;EPS-GUTI, and the SMF registers a PGW-C+SMF FQDN for the non-N26 path, but there is no N26 interface and therefore no inter-system session continuity — see the <a href="features.html">feature matrix</a>.</p>
       <div class="hero-buttons">
         <a href="#quickstart" class="btn btn-primary">Get Started</a>
         <a href="#ai-native" class="btn btn-secondary">Explore AI Features</a>

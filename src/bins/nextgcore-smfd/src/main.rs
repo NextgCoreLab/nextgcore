@@ -3042,6 +3042,12 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                 p.get("mnc")?.as_str()?.to_string(),
             ))
         });
+    // #116: the AMF's per-session EPS-interworking indication (TS 29.502
+    // `SmContextCreateData.epsInterworkingInd`). Parsed here and passed to the UECM
+    // registration, which is the only thing that acts on it today: it decides whether a
+    // `pgwFqdn` is registered so an MME can resolve this PGW-C+SMF (the non-N26
+    // bootstrap). Previously the member was not read anywhere in smfd.
+    let eps_interworking = udm::EpsInterworkingInd::from_body(&req_body);
     udm::register_as_serving_smf(
         &supi,
         pdu_session_id,
@@ -3051,6 +3057,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         serving_plmn
             .as_ref()
             .map(|(mcc, mnc)| (mcc.as_str(), mnc.as_str())),
+        eps_interworking,
     )
     .await;
     let subscribed = udm::fetch_sm_data(&supi, &dnn, sst, snssai_sd.as_deref()).await;
