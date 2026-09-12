@@ -6841,11 +6841,13 @@ mod tests {
         std::env::remove_var("PCF_UAV_POSITION");
         std::env::set_var("PCF_UAV_DNN", "uav");
 
-        // The PCF context is process-global and is not reset between tests, so the
-        // leak is asserted as a DELTA over this one create rather than as an
-        // absolute count of the whole suite's sessions.
+        // The PCF context is process-global and is not reset between tests. This
+        // used to be asserted as a `sess_count()` DELTA over the one create, which
+        // is the fragile part (#338): 29 pcfd tests mutate the global context
+        // WITHOUT taking CONTEXT_GUARD, so any of them can move the count between
+        // the two reads. The leak is asserted per-(SUPI, PSI) below instead, which
+        // no sibling's session can move.
         let ctx = crate::context::pcf_self();
-        let before = ctx.read().expect("ctx").sess_count();
 
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
@@ -6870,26 +6872,28 @@ mod tests {
         assert_eq!(body["cause"], "UAV_FLIGHT_NOT_AUTHORIZED");
 
         // #90 criterion 5: the refusal leaves NO session behind.
-        let after = ctx.read().expect("ctx").sess_count();
-        assert_eq!(
-            after, before,
-            "a rejected UAV create must not leak a PcfSess (it leaked one per attempt before #90)"
-        );
-        // And specifically: the (ue_sm, psi) pair the refused create used holds no
-        // session, so a later legitimate create for it is not blocked by a ghost.
+        //
+        // The UE-SM lookup is `expect`, not `if let Some(..)`. That matters: the
+        // session assertion below is a NEGATIVE one, and a negative assertion is
+        // satisfied by every path that never arrived — including a create rejected
+        // before it ever resolved a UE-SM. Requiring the UE-SM to be there first is
+        // the positive half that proves the path DID arrive, and it is true by
+        // construction because the refusal removes the session, not the UE (the
+        // create resolves the UE-SM find-then-add, so a retry reuses it).
         let ue_sm = ctx
             .read()
             .expect("ctx")
-            .ue_sm_find_by_supi("imsi-001010000000910");
-        if let Some(ue_sm) = ue_sm {
-            assert!(
-                ctx.read()
-                    .expect("ctx")
-                    .sess_find_by_psi(ue_sm.id, 5)
-                    .is_none(),
-                "the refused (ue_sm, psi) must hold no session"
-            );
-        }
+            .ue_sm_find_by_supi("imsi-001010000000910")
+            .expect("the refused create must still have resolved a UE-SM");
+        assert!(
+            ctx.read()
+                .expect("ctx")
+                .sess_find_by_psi(ue_sm.id, 5)
+                .is_none(),
+            "a rejected UAV create must leave no PcfSess for its (SUPI, PSI) — it \
+             leaked one per attempt before #90, and again for every removal once any \
+             index lock was poisoned (#338)"
+        );
 
         std::env::remove_var("PCF_UAV_DNN");
     }
@@ -6934,7 +6938,6 @@ mod tests {
             }
 
             let ctx = crate::context::pcf_self();
-            let before = ctx.read().expect("ctx").sess_count();
             let supi = format!("imsi-00101000000093{i}");
             let resp = pcf_sbi_request_handler(make_request(
                 "POST",
@@ -6957,10 +6960,27 @@ mod tests {
             let body: serde_json::Value =
                 serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
             assert_eq!(body["cause"], "UAV_FLIGHT_NOT_AUTHORIZED", "{label}");
-            assert_eq!(
-                ctx.read().expect("ctx").sess_count(),
-                before,
-                "{label}: the refusal must not leak a session"
+            // Scoped to THIS (SUPI, PSI), not a `sess_count()` delta. The delta was
+            // the flake #338 reported: 29 pcfd tests mutate the process-global PCF
+            // context without taking CONTEXT_GUARD, so a sibling creating or
+            // deleting a session between the two reads falsified it — and it read 0
+            // outright if any sibling had poisoned `sess_list`, since `sess_count`
+            // answers `unwrap_or(0)`. The UE-SM `expect` is the positive half: it
+            // proves the create reached the point of resolving a UE-SM, so the
+            // negative session assertion is not satisfied by a path that never ran.
+            let ue_sm = ctx
+                .read()
+                .expect("ctx")
+                .ue_sm_find_by_supi(&supi)
+                .unwrap_or_else(|| {
+                    panic!("{label}: the refused create must still have resolved a UE-SM")
+                });
+            assert!(
+                ctx.read()
+                    .expect("ctx")
+                    .sess_find_by_psi(ue_sm.id, 9)
+                    .is_none(),
+                "{label}: the refusal must leave no session for this (SUPI, PSI)"
             );
         }
 
