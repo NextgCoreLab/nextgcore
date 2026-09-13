@@ -260,6 +260,9 @@ enum NasProcTimer {
     T3570,
     /// Network-initiated Deregistration Request sent
     T3522,
+    /// Configuration Update Command sent, waiting for Configuration Update Complete
+    /// (TS 24.501 §5.4.4)
+    T3555,
 }
 
 impl NasProcTimer {
@@ -269,6 +272,7 @@ impl NasProcTimer {
             Self::T3560 => AmfTimerId::T3560,
             Self::T3570 => AmfTimerId::T3570,
             Self::T3522 => AmfTimerId::T3522,
+            Self::T3555 => AmfTimerId::T3555,
         }
     }
 
@@ -314,6 +318,62 @@ impl NasProcTimer {
     }
 }
 
+/// Choose an ngKSI for a new NAS security context that the UE is not already using
+/// (TS 24.501 §5.4.1.3.2).
+///
+/// `ue_ksi` is the value the UE reported in its Registration Request. ngKSI values
+/// 0..=6 identify a key set; 7 is the reserved "no key is available" value and is
+/// therefore never SELECTED, only accepted as input.
+///
+/// Returns `ue_ksi + 1` modulo the 0..=6 range, which is the smallest change that is
+/// guaranteed distinct. Distinctness is the whole requirement: the spec asks for "a
+/// value different from any in use", and the UE holds at most one 5G context.
+fn select_ngksi(ue_ksi: u8) -> u8 {
+    const NO_KEY_AVAILABLE: u8 = 7;
+    if ue_ksi >= NO_KEY_AVAILABLE {
+        // The UE holds no key, so every identifier is free; 0 is the conventional first.
+        return 0;
+    }
+    (ue_ksi + 1) % NO_KEY_AVAILABLE
+}
+
+/// What TS 24.501 §4.4.4.3 says to do with a message whose integrity check failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntegrityFailureAction {
+    /// Re-run authentication; nothing from the message is applied.
+    Reauthenticate,
+    /// Answer SERVICE REJECT with 5GMM cause #9.
+    ServiceReject,
+    /// Discard, which is the rule for everything §4.4.4.3 does not except.
+    Discard,
+}
+
+/// Map a MAC-failed message to its §4.4.4.3 action.
+///
+/// Pure, and separate from the handler, because this mapping IS the conformance
+/// requirement: it can then be asserted over its whole domain rather than by driving one
+/// message through a server. `has_context` distinguishes the two cases the spec does --
+/// the exceptions apply to a message arriving on an EXISTING security context; without
+/// one there is nothing to have failed against and nothing to re-authenticate.
+fn integrity_failure_action(msg_type: u8, has_context: bool) -> IntegrityFailureAction {
+    if !has_context {
+        return IntegrityFailureAction::Discard;
+    }
+    match msg_type {
+        message_type::REGISTRATION_REQUEST => IntegrityFailureAction::Reauthenticate,
+        message_type::SERVICE_REQUEST => IntegrityFailureAction::ServiceReject,
+        _ => IntegrityFailureAction::Discard,
+    }
+}
+
+/// Whether NAS-based 5G-GUTI reallocation (the UE Configuration Update procedure) is
+/// enabled. Off unless `AMF_GUTI_REALLOCATION` is set to a truthy value.
+fn guti_reallocation_enabled() -> bool {
+    std::env::var("AMF_GUTI_REALLOCATION")
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 /// Pending retransmission of a downlink NAS message
 #[derive(Debug, Clone)]
 struct NasRetx {
@@ -325,6 +385,28 @@ struct NasRetx {
     retries: u32,
     /// The complete NGAP Downlink NAS Transport PDU to resend
     ngap_pdu: Vec<u8>,
+}
+
+/// Which reachability supervision timer is running for an idle registered UE
+/// (TS 24.501 §5.3.7).
+///
+/// The two run in sequence, never together: the mobile reachable timer bounds how long
+/// the network waits for a UE that has gone idle, and only when THAT expires does the
+/// implicit deregistration timer start. Modelling them as one deadline plus a phase makes
+/// the ordering structural rather than something two independent timers have to agree on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReachabilityPhase {
+    /// Mobile reachable timer running; on expiry the implicit-dereg timer starts.
+    MobileReachable,
+    /// Implicit deregistration timer running; on expiry the UE is deregistered.
+    ImplicitDeregistration,
+}
+
+/// A running reachability timer for one idle UE.
+#[derive(Debug, Clone, Copy)]
+struct Reachability {
+    phase: ReachabilityPhase,
+    deadline: Instant,
 }
 
 /// Per-UE NAS/registration state for the live NGAP path.
@@ -353,8 +435,11 @@ struct UeNasContext {
     pei_requested: bool,
     /// Count of authentication failures (MAC #20 / sync #21) seen
     auth_failure_count: u8,
-    /// Pending NAS retransmission (T3550/T3560/T3570/T3522)
+    /// Pending NAS retransmission (T3550/T3555/T3560/T3570/T3522)
     retx: Option<NasRetx>,
+    /// Running reachability supervision (TS 24.501 §5.3.7). `None` while the UE has a
+    /// live N1 signalling connection: a UE the AMF can reach needs no supervision.
+    reachability: Option<Reachability>,
     /// UDM SDM subscription ID (from Nudm_SDM_Subscribe)
     sdm_subscription_id: Option<String>,
     /// PCF AM policy association ID (from Npcf_AMPolicyControl_Create)
@@ -411,6 +496,7 @@ impl UeNasContext {
             pei_requested: false,
             auth_failure_count: 0,
             retx: None,
+            reachability: None,
             sdm_subscription_id: None,
             policy_association_id: None,
             ue_policy_association_id: None,
@@ -491,6 +577,13 @@ pub struct NgapServer {
     handover_target_transfers: HashMap<(u64, u8), Vec<u8>>,
     /// GMM procedure timer configuration (T3550/T3560/T3570/T3522)
     timer_configs: AmfTimerConfigs,
+    /// Emergency services state (TS 23.167, TS 24.501 §5.5.1.2). Held by the server so
+    /// an emergency registration has somewhere to record its context; before this the
+    /// handler was constructed only inside its own unit tests.
+    emergency: crate::emergency::EmergencyHandler,
+    /// Whether an NGAP Overload Start has been broadcast and not yet stopped, so the
+    /// signal is sent on transitions only (TS 38.413 §8.7.6/§8.7.7).
+    ngap_overload_declared: bool,
 }
 
 impl NgapServer {
@@ -538,8 +631,17 @@ impl NgapServer {
             sm_context_refs: HashMap::new(),
             handover_target_assoc: HashMap::new(),
             handover_target_transfers: HashMap::new(),
+            emergency: crate::emergency::EmergencyHandler::new(),
+            ngap_overload_declared: false,
             timer_configs: {
-                let configs = AmfTimerConfigs::default();
+                // Reachability timers derive from the CONFIGURED T3512
+                // (`amf.time.t3512.value`), per TS 24.501 §5.3.7, with
+                // AMF_MOBILE_REACHABLE_SECS / AMF_IMPLICIT_DEREG_SECS as overrides.
+                let t3512_secs = crate::context::amf_self()
+                    .read()
+                    .map(|ctx| ctx.t3512_value)
+                    .unwrap_or(540);
+                let configs = AmfTimerConfigs::default().with_reachability_from(t3512_secs);
                 #[cfg(feature = "ntn")]
                 let configs = {
                     let mut configs = configs;
@@ -573,8 +675,16 @@ impl NgapServer {
 
     /// Poll for incoming NGAP messages and server events
     pub async fn poll(&mut self) -> Result<bool> {
-        // Check GMM procedure timers (T3550/T3560/T3570/T3522 retransmission)
+        // Check GMM procedure timers (T3550/T3555/T3560/T3570/T3522 retransmission)
         self.process_nas_timers().await?;
+
+        // Reachability supervision for idle registered UEs (TS 24.501 §5.3.7):
+        // mobile reachable -> implicit deregistration. Dormant when no UE is idle.
+        self.process_reachability_timers().await?;
+
+        // Keep the RAN's view of overload in step with the NAS congestion posture.
+        // A no-op unless the posture just changed, and the posture is off by default.
+        self.sync_ngap_overload().await?;
 
         // Deliver any LCS positioning downlinks the Namf SBI handler enqueued
         // (TS 23.273): NRPPa→gNB (N2) / LPP→UE (N1). Dormant when none pending.
@@ -789,6 +899,14 @@ impl NgapServer {
                 } else if data[0] == 0x20 {
                     // SuccessfulOutcome = UEContextReleaseComplete from gNB
                     log::info!("UE Context Release Complete from gNB");
+                    // TS 24.501 §5.3.7: the N1 signalling connection is now gone. For a
+                    // UE that is still REGISTERED this is the moment the mobile reachable
+                    // timer starts -- the AMF can no longer reach it, and something has
+                    // to bound how long it holds the context before deciding the UE is
+                    // gone. Before this nothing started either reachability timer, so a
+                    // UE that never came back was held forever.
+                    self.start_reachability_supervision(association_id, data)
+                        .await;
                 }
             }
             Some(20) => {
@@ -1471,14 +1589,22 @@ impl NgapServer {
             match decoded {
                 Ok(plain) => {
                     if mac_failed {
-                        // TS 24.501 Section 4.4.3.3: messages failing integrity
-                        // check are discarded (registration/dereg/service request
-                        // exceptions are handled before security establishment)
-                        log::warn!(
-                            "NAS MAC verification failed for UE {}, discarding message",
-                            ul_nas.amf_ue_ngap_id
-                        );
-                        return Ok(());
+                        // TS 24.501 §4.4.4.3: a message that fails the integrity check is
+                        // discarded, EXCEPT for the named cases. The old comment here
+                        // claimed those exceptions were "handled before security
+                        // establishment" -- but this discard runs AFTER the security
+                        // context has been resolved, so a MAC-failed mobility
+                        // REGISTRATION REQUEST or SERVICE REQUEST on an existing context
+                        // reached it and was dropped, which is the one thing §4.4.4.3
+                        // says must not happen to them.
+                        return self
+                            .handle_integrity_check_failure(
+                                association_id,
+                                &ul_nas,
+                                &plain,
+                                sec_hdr,
+                            )
+                            .await;
                     }
                     plain
                 }
@@ -1581,6 +1707,44 @@ impl NgapServer {
                         state.suci,
                         state.amf_ue.current_guti.tmsi
                     );
+                }
+            }
+            message_type::CONFIGURATION_UPDATE_COMPLETE => {
+                // TS 24.501 §5.4.4.3: the COMPLETE stops T3555 and the procedure is
+                // finished. Before this the type had no arm at all, so a conformant
+                // UE's acknowledgement was logged as "Unhandled 5GMM message type
+                // 0x55" and the AMF retransmitted the command four more times.
+                if let Some(state) = self.ue_auth_state.get_mut(&ul_nas.amf_ue_ngap_id) {
+                    let was_pending = matches!(
+                        state.retx,
+                        Some(NasRetx {
+                            timer: NasProcTimer::T3555,
+                            ..
+                        })
+                    );
+                    if was_pending {
+                        state.retx = None;
+                        // The UE accepted the new identity, so it becomes the current
+                        // one (TS 33.501 §6.12.3).
+                        state.amf_ue.current_guti = state.amf_ue.next_guti.clone();
+                        state.amf_ue.current_m_tmsi = Some(state.amf_ue.next_guti.tmsi);
+                        log::info!(
+                            "[{}] Configuration Update Complete: 5G-GUTI reallocated \
+                             (5G-TMSI=0x{:08x})",
+                            state.suci,
+                            state.amf_ue.current_guti.tmsi
+                        );
+                    } else {
+                        // Not an error: TS 24.501 permits a COMPLETE for a command the
+                        // AMF has already given up on. Logged rather than dropped
+                        // silently, because it also catches a UE acknowledging a command
+                        // this AMF never sent.
+                        log::info!(
+                            "Configuration Update Complete from UE {} with no T3555 \
+                             pending; nothing to stop",
+                            ul_nas.amf_ue_ngap_id
+                        );
+                    }
                 }
             }
             message_type::SERVICE_REQUEST => {
@@ -1763,6 +1927,30 @@ impl NgapServer {
             return Ok(());
         }
 
+        // TS 24.501 §5.3.5: NAS-level congestion control. Under overload the AMF sheds
+        // load by refusing the registration with 5GMM cause #22 and a T3346 back-off, so
+        // the UE waits instead of retrying immediately. Without it the AMF has no
+        // NAS-level defence at all: every refused UE comes straight back.
+        //
+        // EMERGENCY registrations are exempt, and that exemption is the reason this check
+        // is here rather than at the reject sites: §5.3.5 forbids applying congestion
+        // control to emergency services, and a regulatory obligation must not be shed.
+        if req.registration_type != crate::gmm_build::registration_type::EMERGENCY {
+            if let Some(backoff) = self.nas_congestion_backoff() {
+                log::warn!(
+                    "NAS congestion: rejecting registration from UE {amf_ue_ngap_id} with \
+                     5GMM #22 and a {backoff}s T3346 back-off (TS 24.501 §5.3.5)"
+                );
+                let reject = gmm_build::build_registration_reject_with_backoff(
+                    GmmCause::Congestion,
+                    Some(backoff),
+                );
+                self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
+                    .await?;
+                return Ok(());
+            }
+        }
+
         log::info!(
             "Registration Request: type={}, ngKSI={}/{}, identity_type={}, suci={:?}",
             req.registration_type,
@@ -1784,6 +1972,45 @@ impl NgapServer {
                  suci={:?}); accepting as a distinct multi-SUPI registration",
                 req.suci
             );
+        }
+
+        // TS 24.501 §5.5.1.2 / TS 23.167: an EMERGENCY registration is not an ordinary
+        // one. It is admitted without a verified subscription where regulation requires
+        // it, and it must be recorded as an emergency context so the emergency DNN and
+        // P-CSCF are used for its session. Before this the registration type was read
+        // only by `nia0_permitted` and the handler had no caller outside its own tests,
+        // so an emergency registration was processed as a normal one -- which is a
+        // regulatory-grade gap, not a cosmetic one.
+        if req.registration_type == crate::gmm_build::registration_type::EMERGENCY {
+            let has_supi = self
+                .ue_auth_state
+                .get(&amf_ue_ngap_id)
+                .and_then(|s| s.amf_ue.supi.clone())
+                .is_some()
+                || req.suci.is_some();
+            // The handler is keyed by a u32; the AMF UE NGAP ID is 40 bits on the wire
+            // (TS 38.413), so the truncation is recorded rather than hidden. It is safe
+            // here because the key only has to be unique among CONCURRENT emergency
+            // registrations, and #353 tracks widening it.
+            let ctx = self
+                .emergency
+                .handle_emergency_registration(amf_ue_ngap_id as u32, has_supi);
+            log::warn!(
+                "EMERGENCY registration from UE {amf_ue_ngap_id}: authenticated={}, \
+                 reg_type={:?}, emergency DNN '{}' (TS 24.501 §5.5.1.2, TS 23.167)",
+                ctx.authenticated,
+                ctx.reg_type,
+                self.emergency.emergency_dnn()
+            );
+            // No new "is emergency" flag: `AmfUe.registration_type` is assigned from
+            // this same request a few lines below and already carries the answer, which
+            // is how `nas_security::nia0_permitted` reads it. A second field would be a
+            // copy that can disagree with the first.
+            //
+            // Falls through to the normal registration flow deliberately: the
+            // authentication, security-mode and Registration Accept steps are the same
+            // procedure. What differs is that the emergency context now EXISTS, so the
+            // emergency DNN / P-CSCF are available for the session that follows.
         }
 
         // Periodic registration updating with live security context: refresh
@@ -2075,8 +2302,17 @@ impl NgapServer {
                 // Initial ABBA (TS 33.501 Annex A.7.1)
                 state.amf_ue.abba = [0x00, 0x00];
                 state.amf_ue.abba_len = 2;
+                // TS 24.501 §5.4.1.3.2: the AMF selects an ngKSI DIFFERENT from any
+                // the UE already holds. This used to force 0, so a UE whose current
+                // ngKSI was 0 -- the value the AMF itself hands out first, making it
+                // the common case -- was offered the key set identifier it was already
+                // using, and the two ends could end up pointing the same identifier at
+                // different keys.
+                //
+                // nas_tsc stays 0: this is a NATIVE 5G security context, not one mapped
+                // from EPS (TS 24.501 §9.11.3.32).
                 state.amf_ue.nas_tsc = 0;
-                state.amf_ue.nas_ksi = 0;
+                state.amf_ue.nas_ksi = select_ngksi(state.amf_ue.nas_ue_ksi);
 
                 let auth_request = gmm_build::build_authentication_request(&state.amf_ue);
                 // amfd-07: keep the reporting GmmState in step with the live
@@ -3356,7 +3592,178 @@ impl NgapServer {
         self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
             .await?;
         log::info!("Service Accept sent to UE {amf_ue_ngap_id} (protected)");
+
+        // TS 33.501 §6.12.3: reallocate the 5G-GUTI after a service request. This is the
+        // moment that matters for identity privacy -- the UE has just used the identity
+        // it was paged with -- and NAS-based reallocation is the UE Configuration Update
+        // procedure, which is why this is the live caller criterion 1 asks for.
+        self.reallocate_guti_via_configuration_update(
+            association_id,
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+        )
+        .await?;
         Ok(())
+    }
+
+    /// Reallocate the 5G-GUTI with a UE Configuration Update, supervised by T3555
+    /// (TS 24.501 §5.4.4, TS 33.501 §6.12.3).
+    ///
+    /// Off unless `AMF_GUTI_REALLOCATION` is set, and deliberately so: this adds an
+    /// outbound NAS message to a procedure that previously ended at the Service Accept,
+    /// and a UE that does not implement CONFIGURATION UPDATE COMMAND would leave T3555 to
+    /// retransmit four times before aborting. #72 asks for exactly this shape ("each can
+    /// ship behind an off-default gate until wired end-to-end"). A runtime switch rather
+    /// than a cargo feature so both states stay inside `cargo test --workspace`.
+    async fn reallocate_guti_via_configuration_update(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+    ) -> Result<()> {
+        if !guti_reallocation_enabled() {
+            return Ok(());
+        }
+        let Some(plain) = self.build_guti_reallocation_command(amf_ue_ngap_id) else {
+            return Ok(());
+        };
+        let Some(protected) = self.protect_nas(amf_ue_ngap_id, &plain) else {
+            return Ok(());
+        };
+        let ngap_pdu = self
+            .send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
+            .await?;
+        // Armed only once the command has been HANDED TO THE TRANSPORT: a timer
+        // supervising a message that never left would abort a procedure that never
+        // started. The `?` above is what enforces that ordering.
+        self.arm_retx(amf_ue_ngap_id, NasProcTimer::T3555, ngap_pdu);
+        log::info!(
+            "Configuration Update Command sent to UE {amf_ue_ngap_id}: 5G-GUTI reallocation, \
+             T3555 armed"
+        );
+        Ok(())
+    }
+
+    /// Assign a fresh 5G-GUTI and build the CONFIGURATION UPDATE COMMAND that carries it.
+    ///
+    /// Split from the transmission so the message's CONTENT is testable without an SCTP
+    /// association: what matters conformance-wise -- a new TMSI, the old one still
+    /// current, and an acknowledgement request so a COMPLETE is owed -- is decided here.
+    ///
+    /// `None` when there is nothing to send: no context, not registered, or no security
+    /// context (a UCU is integrity protected, so without one there is nothing to protect
+    /// it with).
+    fn build_guti_reallocation_command(&mut self, amf_ue_ngap_id: u64) -> Option<Vec<u8>> {
+        {
+            let state = self.ue_auth_state.get_mut(&amf_ue_ngap_id)?;
+            if !state.registered || !state.amf_ue.security_context_available {
+                return None;
+            }
+            // A fresh 5G-TMSI, kept in next_guti until the UE acknowledges: the old GUTI
+            // stays current meanwhile, so a UE that never answers is still addressable.
+            // `generate_new_guti` sources the TMSI from the OS CSPRNG and touches only
+            // the TMSI, so the PLMN and AMF identifiers of the current GUTI carry over
+            // (TS 23.003 §2.10.1: the 5G-TMSI must not be predictable).
+            state.amf_ue.next_guti = state.amf_ue.current_guti.clone();
+            state.amf_ue.generate_new_guti();
+            let param = crate::gmm_build::ConfigurationUpdateCommandParam {
+                // Acknowledgement requested: without it there is no COMPLETE, so the
+                // AMF could never know whether the UE adopted the new identity.
+                acknowledgement_requested: true,
+                registration_requested: false,
+                guti: true,
+                ..Default::default()
+            };
+            gmm_build::build_configuration_update_command(&state.amf_ue, &param)
+        }
+    }
+
+    /// Apply the TS 24.501 §4.4.4.3 integrity-check-failure exceptions.
+    ///
+    /// The rule is "discard, except" -- and the exceptions exist because the alternative
+    /// is worse than processing a message whose MAC did not verify:
+    ///
+    /// - **REGISTRATION REQUEST**: re-run authentication. A UE whose security context has
+    ///   diverged from the AMF's (a lost SMC, a restarted AMF, a rolled-over COUNT) can
+    ///   only ever produce a failing MAC, so discarding leaves it unable to register at
+    ///   all — it retries, fails the same check, and is stuck until it powers off. The
+    ///   message is NOT trusted: nothing from it is applied, it triggers a fresh
+    ///   authentication, and the UE must pass that before anything is accepted.
+    /// - **SERVICE REQUEST**: answer SERVICE REJECT with 5GMM cause #9 ("UE identity
+    ///   cannot be derived by the network"), which tells the UE to register again rather
+    ///   than keep asking for service on a context the network cannot verify. Sent as a
+    ///   PLAIN message: there is no usable security context to protect it with, which is
+    ///   the whole reason we are here.
+    /// - **anything else**: discarded, as before. A protected DEREGISTRATION REQUEST or
+    ///   UL NAS TRANSPORT with a bad MAC is either corruption or an attacker, and acting
+    ///   on it is what integrity protection exists to prevent.
+    async fn handle_integrity_check_failure(
+        &mut self,
+        association_id: u64,
+        ul_nas: &crate::ngap_asn1::UplinkNasTransportData,
+        plain: &[u8],
+        sec_hdr: u8,
+    ) -> Result<()> {
+        let amf_ue_ngap_id = ul_nas.amf_ue_ngap_id;
+        let ran_ue_ngap_id = ul_nas.ran_ue_ngap_id;
+        // The decoded plaintext is only used to learn WHICH message it is; nothing in it
+        // is applied to the UE context.
+        let msg_type = plain.get(2).copied().unwrap_or(0);
+        let has_context = self
+            .ue_auth_state
+            .get(&amf_ue_ngap_id)
+            .is_some_and(|s| s.amf_ue.security_context_available);
+
+        match integrity_failure_action(msg_type, has_context) {
+            IntegrityFailureAction::Reauthenticate => {
+                log::warn!(
+                    "MAC verification failed for a REGISTRATION REQUEST from UE \
+                     {amf_ue_ngap_id} on an existing security context: re-authenticating \
+                     (TS 24.501 §4.4.4.3) rather than discarding"
+                );
+                // integrity_protected = false: the request did NOT verify, so the
+                // handler must treat its contents as cleartext and demand
+                // authentication, exactly as it would for a first registration.
+                self.handle_registration_request_nas(
+                    association_id,
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    plain,
+                    false,
+                )
+                .await
+            }
+            IntegrityFailureAction::ServiceReject => {
+                log::warn!(
+                    "MAC verification failed for a SERVICE REQUEST from UE \
+                     {amf_ue_ngap_id}: SERVICE REJECT #9 (TS 24.501 §4.4.4.3)"
+                );
+                let reject = self.integrity_failure_service_reject(amf_ue_ngap_id);
+                self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
+                    .await?;
+                Ok(())
+            }
+            IntegrityFailureAction::Discard => {
+                log::warn!(
+                    "NAS MAC verification failed for UE {amf_ue_ngap_id} \
+                     (message type 0x{msg_type:02x}, security header 0x{sec_hdr:02x}), \
+                     discarding: TS 24.501 §4.4.4.3 lists no exception for it"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// The SERVICE REJECT the §4.4.4.3 exception sends: 5GMM cause #9, plain, because the
+    /// security context that would have protected it is the one that just failed.
+    fn integrity_failure_service_reject(&self, amf_ue_ngap_id: u64) -> Vec<u8> {
+        let default_ue = crate::context::AmfUe::default();
+        let amf_ue = self
+            .ue_auth_state
+            .get(&amf_ue_ngap_id)
+            .map(|s| &s.amf_ue)
+            .unwrap_or(&default_ue);
+        gmm_build::build_service_reject(amf_ue, GmmCause::UeIdentityCannotBeDerivedByTheNetwork)
     }
 
     /// Handle UE-initiated Deregistration Request (TS 24.501 Section 5.5.2.2):
@@ -4549,6 +4956,183 @@ impl NgapServer {
         }
     }
 
+    /// The T3346 back-off to impose, or `None` when the AMF is not congested.
+    ///
+    /// Reads the registered-UE count from the global context rather than from
+    /// `ue_auth_state`: the context is the authoritative registry, and a UE mid-
+    /// registration is not yet load the way a registered one is.
+    fn nas_congestion_backoff(&self) -> Option<u64> {
+        let registered = crate::context::amf_self()
+            .read()
+            .map(|ctx| ctx.amf_ue_count())
+            .unwrap_or(0);
+        if crate::congestion::is_active(registered) {
+            Some(crate::congestion::backoff_secs())
+        } else {
+            None
+        }
+    }
+
+    /// Keep the NGAP overload signal in step with the NAS congestion posture
+    /// (TS 38.413 §8.7.6/§8.7.7).
+    ///
+    /// Sent only on a TRANSITION, so a sustained overload does not re-broadcast Overload
+    /// Start to every gNB on every poll. This also gives `send_overload_start` /
+    /// `send_overload_stop` their first production caller: both were `pub async fn` with
+    /// no callers at all, so the AMF could declare NAS congestion to a UE while telling
+    /// the RAN nothing.
+    async fn sync_ngap_overload(&mut self) -> Result<()> {
+        let registered = crate::context::amf_self()
+            .read()
+            .map(|ctx| ctx.amf_ue_count())
+            .unwrap_or(0);
+        let congested = crate::congestion::is_active(registered);
+        if congested == self.ngap_overload_declared {
+            return Ok(());
+        }
+        self.ngap_overload_declared = congested;
+        if congested {
+            let reduce = crate::congestion::ngap_reduce_percent();
+            log::warn!(
+                "NAS congestion entered ({registered} registered UEs): broadcasting NGAP \
+                 Overload Start, asking for a {reduce}% reduction"
+            );
+            self.send_overload_start(reduce).await
+        } else {
+            log::info!("NAS congestion cleared: broadcasting NGAP Overload Stop");
+            self.send_overload_stop().await
+        }
+    }
+
+    /// Start mobile-reachable supervision for every registered UE whose N1 connection
+    /// this release complete ended (TS 24.501 §5.3.7).
+    ///
+    /// The AMF UE NGAP ID is parsed from the message when possible; a Release Complete
+    /// that cannot be parsed falls back to the association's UEs, because the alternative
+    /// -- supervising nobody -- is the defect being fixed.
+    async fn start_reachability_supervision(&mut self, association_id: u64, data: &[u8]) {
+        let Some(config) = self.timer_configs.get(AmfTimerId::MobileReachable).cloned() else {
+            return;
+        };
+        if !config.enabled {
+            log::debug!("Mobile reachable timer disabled by configuration; not supervising");
+            return;
+        }
+        let parsed = crate::ngap_asn1::parse_ue_context_release_complete_asn1(data);
+        let targets: Vec<u64> = match parsed {
+            Some(amf_ue_ngap_id) => vec![amf_ue_ngap_id],
+            None => self
+                .ue_auth_state
+                .iter()
+                .filter(|(_, s)| s.association_id == association_id)
+                .map(|(id, _)| *id)
+                .collect(),
+        };
+        let deadline = Instant::now() + config.duration;
+        for amf_ue_ngap_id in targets {
+            let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) else {
+                continue;
+            };
+            if !state.registered {
+                // An unregistered UE has no context worth supervising; the release
+                // already disposed of it.
+                continue;
+            }
+            state.reachability = Some(Reachability {
+                phase: ReachabilityPhase::MobileReachable,
+                deadline,
+            });
+            log::info!(
+                "Mobile reachable timer started for UE {amf_ue_ngap_id} ({:?}) after N1 \
+                 release (TS 24.501 §5.3.7)",
+                config.duration
+            );
+        }
+    }
+
+    /// Advance the reachability timers: mobile reachable -> implicit deregistration ->
+    /// implicit deregistration performed (TS 24.501 §5.3.7).
+    ///
+    /// Driven from the same poll as the retransmission timers, so there is one clock in
+    /// this path rather than two that can disagree.
+    async fn process_reachability_timers(&mut self) -> Result<()> {
+        let now = Instant::now();
+        let due: Vec<u64> = self
+            .ue_auth_state
+            .iter()
+            .filter(|(_, s)| s.reachability.is_some_and(|r| r.deadline <= now))
+            .map(|(id, _)| *id)
+            .collect();
+
+        for amf_ue_ngap_id in due {
+            let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) else {
+                continue;
+            };
+            let Some(reachability) = state.reachability else {
+                continue;
+            };
+            match reachability.phase {
+                ReachabilityPhase::MobileReachable => {
+                    let Some(config) = self
+                        .timer_configs
+                        .get(AmfTimerId::ImplicitDeregistration)
+                        .cloned()
+                    else {
+                        state.reachability = None;
+                        continue;
+                    };
+                    if !config.enabled {
+                        // The operator asked for mobile-reachable supervision without
+                        // implicit deregistration. Honoured literally: stop here rather
+                        // than deregister, which is the thing they turned off.
+                        log::info!(
+                            "Mobile reachable timer expired for UE {amf_ue_ngap_id}; implicit \
+                             deregistration is disabled, so the context is kept"
+                        );
+                        state.reachability = None;
+                        continue;
+                    }
+                    state.reachability = Some(Reachability {
+                        phase: ReachabilityPhase::ImplicitDeregistration,
+                        deadline: now + config.duration,
+                    });
+                    log::info!(
+                        "Mobile reachable timer expired for UE {amf_ue_ngap_id}: implicit \
+                         deregistration timer started ({:?})",
+                        config.duration
+                    );
+                }
+                ReachabilityPhase::ImplicitDeregistration => {
+                    // TS 24.501 §5.3.7: implicitly deregister. No NAS message is sent --
+                    // the UE is unreachable, which is why we are here.
+                    log::warn!(
+                        "Implicit deregistration timer expired for UE {amf_ue_ngap_id}: \
+                         deregistering implicitly (TS 24.501 §5.3.7)"
+                    );
+                    state.reachability = None;
+                    self.release_all_pdu_sessions(amf_ue_ngap_id).await;
+                    self.ue_auth_state.remove(&amf_ue_ngap_id);
+                    // The global context's RAN UE and AMF UE entries go too, or the
+                    // implicit deregistration would free the NAS state and leave the NGAP
+                    // one behind -- a UE that is deregistered and still occupies an id.
+                    let handle = crate::context::amf_self();
+                    let ids = handle
+                        .read()
+                        .ok()
+                        .and_then(|ctx| ctx.ran_ue_find_by_amf_ue_ngap_id(amf_ue_ngap_id))
+                        .map(|ran_ue| (ran_ue.id, ran_ue.amf_ue_id));
+                    if let Some((ran_ue_id, amf_ue_id)) = ids {
+                        if let Ok(ctx) = handle.read() {
+                            ctx.ran_ue_remove(ran_ue_id);
+                            ctx.amf_ue_remove(amf_ue_id);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Process GMM procedure timers: retransmit up to the configured maximum,
     /// then apply the per-timer abnormal action (TS 24.501 Sections 5.4.1.3.7,
     /// 5.4.3.7, 5.5.1.2.8, 5.5.2.3.6)
@@ -4629,6 +5213,27 @@ impl NgapServer {
                             .await?;
                         self.ue_auth_state.remove(&amf_ue_ngap_id);
                     }
+                }
+                NasProcTimer::T3555 => {
+                    // TS 24.501 §5.4.4.3: after the fourth retransmission the AMF
+                    // ABORTS the UE configuration update procedure. The UE never
+                    // acknowledged, so the reallocated 5G-GUTI is NOT committed: the UE
+                    // is still addressable by the one it has.
+                    //
+                    // The spec's fuller answer is that both GUTIs stay valid until the
+                    // next successful procedure, because the COMPLETE may simply have
+                    // been lost. That needs a GUTI-indexed UE lookup to act on, which
+                    // is #352 (split from #72's criteria 4-6) -- until it lands there is
+                    // nothing that could FIND a UE by the new GUTI, so keeping the old
+                    // one as the single valid identity is the honest behaviour rather
+                    // than a compromise.
+                    log::warn!(
+                        "T3555 aborted for UE {amf_ue_ngap_id}: no Configuration Update \
+                         Complete, keeping the current 5G-GUTI (the new one was never \
+                         acknowledged)"
+                    );
+                    state.amf_ue.next_guti = state.amf_ue.current_guti.clone();
+                    self.ue_auth_state.insert(amf_ue_ngap_id, state);
                 }
                 NasProcTimer::T3522 => {
                     // Implicit deregistration (TS 24.501 Section 5.5.2.3.6)
@@ -10588,6 +11193,556 @@ mod tests {
         assert!(
             state.amf_ue.nh.iter().any(|b| *b != 0) || state.amf_ue.nhcc != 0,
             "and advanced the NH chain"
+        );
+    }
+    // ------------------------------------------------------------------
+    // #72 criteria 1, 2, 3, 7, 8, 9, 11
+    // (criteria 4-6 split to #352; criterion 10 was already met on main)
+    // ------------------------------------------------------------------
+
+    /// Criterion 7: the Authentication Request must advertise an ngKSI the UE is not
+    /// already using (TS 24.501 §5.4.1.3.2).
+    ///
+    /// Asserted over the whole input domain rather than at one sample, because the
+    /// property is "different from what the UE reported" and the interesting inputs are
+    /// the boundaries: 0 (the value the AMF hands out first, so the common collision) and
+    /// 7 ("no key available", which is not a key set and so must not be selected).
+    #[test]
+    fn a_selected_ngksi_is_never_the_one_the_ue_already_holds() {
+        for ue_ksi in 0u8..=6 {
+            let selected = select_ngksi(ue_ksi);
+            assert_ne!(
+                selected, ue_ksi,
+                "ngKSI {selected} collides with the UE's {ue_ksi}"
+            );
+            assert!(
+                selected <= 6,
+                "7 means 'no key available' and is not selectable"
+            );
+        }
+        // 7 and anything above it mean the UE holds no key, so every identifier is free.
+        for no_key in [7u8, 8, 255] {
+            assert_eq!(select_ngksi(no_key), 0);
+        }
+    }
+
+    /// Criterion 3: a MAC-failed SERVICE REQUEST on an existing context is answered with
+    /// SERVICE REJECT #9, not discarded (TS 24.501 §4.4.4.3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_mac_failed_service_request_is_answered_with_service_reject_9() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let amf_ue_ngap_id = 7_200_001u64;
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 72, 1, false);
+        ue_ctx.amf_ue.security_context_available = true;
+        ue_ctx.registered = true;
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        // The message the exception sends, asserted on the bytes rather than on a log
+        // line. The send itself cannot succeed here (the test server has no association),
+        // which is why the assertion is on what is BUILT.
+        let reject = ngap.integrity_failure_service_reject(amf_ue_ngap_id);
+        assert_eq!(
+            reject.get(2).copied(),
+            Some(message_type::SERVICE_REJECT),
+            "the answer must be a SERVICE REJECT: {reject:02x?}"
+        );
+        assert_eq!(
+            reject.get(3).copied(),
+            Some(GmmCause::UeIdentityCannotBeDerivedByTheNetwork as u8),
+            "TS 24.501 §4.4.4.3 names 5GMM cause #9, not a discard"
+        );
+
+        // And the handler reaches that branch for this message type.
+        assert_eq!(
+            integrity_failure_action(message_type::SERVICE_REQUEST, true),
+            IntegrityFailureAction::ServiceReject
+        );
+        let ul_nas = crate::ngap_asn1::UplinkNasTransportData {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id: 72,
+            nas_pdu: Vec::new(),
+        };
+        let plain = [0x7E, 0x00, message_type::SERVICE_REQUEST, 0x00];
+        let attempted = ngap
+            .handle_integrity_check_failure(1, &ul_nas, &plain, 0x02)
+            .await;
+        // The test server has no gNB association, so a send FAILS -- which is the canary
+        // `test_ngap_server` documents: an Err here proves the exception branch tried to
+        // transmit, and the Ok in the sibling discard test proves that one did not. This
+        // is the only positive discriminator available without a live association, and it
+        // is stronger than a log assertion.
+        let err = attempted.expect_err(
+            "the SERVICE REJECT branch must attempt a send; Ok would mean it discarded",
+        );
+        assert!(
+            err.to_string().contains("Association not found"),
+            "the failure must be the absent association, not a build error: {err}"
+        );
+    }
+
+    /// Criterion 3, the mapping itself, over its whole domain: the two exceptions and
+    /// nothing else, and neither of them without a security context.
+    #[test]
+    fn the_integrity_failure_exceptions_are_exactly_the_two_ts_24_501_names() {
+        assert_eq!(
+            integrity_failure_action(message_type::REGISTRATION_REQUEST, true),
+            IntegrityFailureAction::Reauthenticate
+        );
+        assert_eq!(
+            integrity_failure_action(message_type::SERVICE_REQUEST, true),
+            IntegrityFailureAction::ServiceReject
+        );
+        // Every other protected type, including the ones a careless reading would add.
+        for msg_type in [
+            message_type::UL_NAS_TRANSPORT,
+            message_type::DEREGISTRATION_REQUEST_FROM_UE,
+            message_type::SECURITY_MODE_COMPLETE,
+            message_type::REGISTRATION_COMPLETE,
+            message_type::CONFIGURATION_UPDATE_COMPLETE,
+            message_type::GMM_STATUS,
+        ] {
+            assert_eq!(
+                integrity_failure_action(msg_type, true),
+                IntegrityFailureAction::Discard,
+                "0x{msg_type:02x} has no §4.4.4.3 exception"
+            );
+        }
+        // Without a security context there is nothing the check could have failed
+        // against, so even the excepted types are discarded.
+        for msg_type in [
+            message_type::REGISTRATION_REQUEST,
+            message_type::SERVICE_REQUEST,
+        ] {
+            assert_eq!(
+                integrity_failure_action(msg_type, false),
+                IntegrityFailureAction::Discard
+            );
+        }
+    }
+
+    /// Criterion 3, the other half: a protected message type with NO exception is still
+    /// discarded. Without this, "handle the exceptions" could be implemented as "handle
+    /// everything", which is what integrity protection exists to prevent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_mac_failed_message_without_an_exception_is_still_discarded() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let amf_ue_ngap_id = 7_200_002u64;
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 72, 1, false);
+        ue_ctx.amf_ue.security_context_available = true;
+        ue_ctx.registered = true;
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        let ul_nas = crate::ngap_asn1::UplinkNasTransportData {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id: 72,
+            nas_pdu: Vec::new(),
+        };
+        let plain = [0x7E, 0x00, message_type::UL_NAS_TRANSPORT, 0x00];
+        ngap.handle_integrity_check_failure(1, &ul_nas, &plain, 0x02)
+            .await
+            .expect("discarding is not an error");
+        assert_eq!(
+            integrity_failure_action(message_type::UL_NAS_TRANSPORT, true),
+            IntegrityFailureAction::Discard,
+            "a MAC-failed UL NAS TRANSPORT must be discarded, not answered"
+        );
+        assert!(
+            ngap.ue_auth_state
+                .get(&amf_ue_ngap_id)
+                .is_some_and(|s| s.retx.is_none()),
+            "a discarded message must start no procedure"
+        );
+    }
+
+    /// Criteria 1 and 2: the UE Configuration Update procedure is emitted by a live
+    /// procedure, supervised by T3555, and the COMPLETE stops it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_guti_reallocation_arms_t3555_and_the_complete_stops_it() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let amf_ue_ngap_id = 7_200_010u64;
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 72, 1, false);
+        ue_ctx.registered = true;
+        ue_ctx.amf_ue.security_context_available = true;
+        ue_ctx.amf_ue.current_guti.tmsi = 0x1111_1111;
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        // Off by default: the reallocation must not happen unless asked for.
+        assert!(!guti_reallocation_enabled(), "the switch ships off");
+        let _ = ngap
+            .reallocate_guti_via_configuration_update(1, amf_ue_ngap_id, 72)
+            .await;
+        assert!(
+            ngap.ue_auth_state
+                .get(&amf_ue_ngap_id)
+                .is_some_and(|s| s.retx.is_none()),
+            "with the switch off nothing is sent and no timer is armed"
+        );
+
+        // The command itself, asserted on its bytes. The builder is separate from the
+        // transmission precisely so this is checkable without an SCTP association.
+        let command = ngap
+            .build_guti_reallocation_command(amf_ue_ngap_id)
+            .expect("a registered UE with a security context gets a command");
+        assert_eq!(
+            command[2],
+            crate::gmm_build::message_type::CONFIGURATION_UPDATE_COMMAND,
+            "the reallocation must ride on a CONFIGURATION UPDATE COMMAND: {command:02x?}"
+        );
+        // Configuration update indication is a type-1 TV, IEI 0xD in the high nibble,
+        // bit 1 = acknowledgement requested. Without the ack there is no COMPLETE, so the
+        // AMF could never learn whether the UE adopted the identity.
+        assert!(
+            command[3..]
+                .iter()
+                .any(|b| b & 0xF0 == 0xD0 && b & 0x01 == 0x01),
+            "acknowledgement must be requested: {command:02x?}"
+        );
+        // 5G-GUTI IE (0x77, TLV-E) present, or the command reallocates nothing.
+        assert!(
+            command[3..].contains(&0x77),
+            "the new 5G-GUTI must be carried: {command:02x?}"
+        );
+
+        let new_tmsi = ngap
+            .ue_auth_state
+            .get(&amf_ue_ngap_id)
+            .map(|s| s.amf_ue.next_guti.tmsi)
+            .expect("context");
+        assert_ne!(
+            new_tmsi, 0x1111_1111,
+            "a reallocation must produce a DIFFERENT 5G-TMSI"
+        );
+        assert_eq!(
+            ngap.ue_auth_state
+                .get(&amf_ue_ngap_id)
+                .map(|s| s.amf_ue.current_guti.tmsi),
+            Some(0x1111_1111),
+            "the old GUTI stays current until the UE acknowledges, or a UE that never \
+             answers becomes unaddressable"
+        );
+
+        // With the switch on, the procedure transmits (and so the absent association
+        // surfaces). This is as far as a unit test reaches: T3555 is armed only after the
+        // PDU is handed to the transport, which needs a real association.
+        std::env::set_var("AMF_GUTI_REALLOCATION", "1");
+        let attempted = ngap
+            .reallocate_guti_via_configuration_update(1, amf_ue_ngap_id, 72)
+            .await;
+        std::env::remove_var("AMF_GUTI_REALLOCATION");
+        assert!(
+            attempted.is_err(),
+            "the Configuration Update Command must be transmitted"
+        );
+    }
+
+    /// Criterion 1's other half: an inbound CONFIGURATION UPDATE COMPLETE stops T3555 and
+    /// commits the reallocated GUTI, and is not logged as an unhandled message type.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_configuration_update_complete_stops_t3555_and_commits_the_guti() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let amf_ue_ngap_id = 7_200_015u64;
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 72, 1, false);
+        ue_ctx.registered = true;
+        ue_ctx.amf_ue.current_guti.tmsi = 0x4444_4444;
+        ue_ctx.amf_ue.next_guti.tmsi = 0x5555_5555;
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+        ngap.arm_retx(amf_ue_ngap_id, NasProcTimer::T3555, vec![0x00, 0x2E]);
+        assert!(
+            ngap.ue_auth_state
+                .get(&amf_ue_ngap_id)
+                .is_some_and(|s| s.retx.is_some()),
+            "precondition: T3555 is pending"
+        );
+
+        // A plain CONFIGURATION UPDATE COMPLETE (0x55), APER-encoded as a real Uplink NAS
+        // Transport and fed through the LIVE dispatch — not by calling an inner handler.
+        // That is the point: before #72 the type had no arm, so the message reached the
+        // `other =>` catch-all, and only the full path can show that it no longer does.
+        let ul_pdu = nextgcore_ngap::builder::build_uplink_nas_transport(
+            &nextgcore_ngap::types::UplinkNasTransport {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id: 72,
+                nas_pdu: vec![
+                    0x7E,
+                    security_header::PLAIN_NAS_MESSAGE,
+                    message_type::CONFIGURATION_UPDATE_COMPLETE,
+                ],
+                user_location_info: nextgcore_ngap::types::UserLocationInformation::Nr {
+                    nr_cgi_plmn: [0x00, 0xF1, 0x10],
+                    nr_cell_identity: 1,
+                    tai_plmn: [0x00, 0xF1, 0x10],
+                    tai_tac: [0x00, 0x00, 0x01],
+                },
+            },
+        )
+        .expect("encode an Uplink NAS Transport");
+        ngap.handle_uplink_nas_transport(1, &ul_pdu)
+            .await
+            .expect("the COMPLETE must be handled");
+
+        let state = ngap
+            .ue_auth_state
+            .get(&amf_ue_ngap_id)
+            .expect("the context survives");
+        assert!(
+            state.retx.is_none(),
+            "the COMPLETE must stop T3555, or the command is retransmitted four more times"
+        );
+        assert_eq!(
+            state.amf_ue.current_guti.tmsi, 0x5555_5555,
+            "the acknowledged GUTI becomes the current one (TS 33.501 §6.12.3)"
+        );
+    }
+
+    /// Criterion 2's abnormal case: T3555 retransmits up to the configured maximum and
+    /// then aborts WITHOUT committing the unacknowledged GUTI (TS 24.501 §5.4.4.3).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn t3555_retransmits_then_aborts_keeping_the_current_guti() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let amf_ue_ngap_id = 7_200_011u64;
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 72, 1, false);
+        ue_ctx.registered = true;
+        ue_ctx.amf_ue.current_guti.tmsi = 0x2222_2222;
+        ue_ctx.amf_ue.next_guti.tmsi = 0x3333_3333;
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+        ngap.arm_retx(amf_ue_ngap_id, NasProcTimer::T3555, vec![0x00, 0x2E]);
+
+        let (max_count, _) = NasProcTimer::T3555.config(&ngap.timer_configs);
+        assert!(max_count >= 1, "T3555 must have a retransmission budget");
+
+        // Force expiry `max_count` times: each is a retransmission, and the timer stays.
+        for expected in 1..=max_count {
+            if let Some(state) = ngap.ue_auth_state.get_mut(&amf_ue_ngap_id) {
+                if let Some(retx) = state.retx.as_mut() {
+                    retx.deadline = Instant::now() - Duration::from_secs(1);
+                }
+            }
+            ngap.process_nas_timers().await.expect("timer pass");
+            let retries = ngap
+                .ue_auth_state
+                .get(&amf_ue_ngap_id)
+                .and_then(|s| s.retx.as_ref())
+                .map(|r| r.retries);
+            assert_eq!(
+                retries,
+                Some(expected),
+                "expiry {expected} must retransmit and keep the timer armed"
+            );
+        }
+
+        // One more expiry exhausts the budget and aborts.
+        if let Some(state) = ngap.ue_auth_state.get_mut(&amf_ue_ngap_id) {
+            if let Some(retx) = state.retx.as_mut() {
+                retx.deadline = Instant::now() - Duration::from_secs(1);
+            }
+        }
+        ngap.process_nas_timers().await.expect("abort pass");
+        let state = ngap
+            .ue_auth_state
+            .get(&amf_ue_ngap_id)
+            .expect("the UE context survives an aborted UCU");
+        assert!(state.retx.is_none(), "the timer must be disarmed on abort");
+        assert_eq!(
+            state.amf_ue.current_guti.tmsi, 0x2222_2222,
+            "the UE never acknowledged, so the OLD GUTI is still the valid one"
+        );
+        assert_eq!(
+            state.amf_ue.next_guti.tmsi, 0x2222_2222,
+            "and the unacknowledged one is dropped rather than left pending forever"
+        );
+    }
+
+    /// Criterion 8: an EMERGENCY registration reaches the emergency handler from the live
+    /// NAS path (TS 24.501 §5.5.1.2, TS 23.167).
+    ///
+    /// Asserted on the emergency context the branch records, not on the registration
+    /// outcome: the registration goes on to need an AUSF, which this test has no business
+    /// providing, and the branch runs before that.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_emergency_registration_reaches_the_emergency_handler() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let amf_ue_ngap_id = 7_200_012u64;
+        ngap.ue_auth_state.insert(
+            amf_ue_ngap_id,
+            UeNasContext::new(amf_ue_ngap_id, 72, 1, false),
+        );
+        assert_eq!(
+            ngap.emergency.active_count(),
+            0,
+            "precondition: no emergency context yet"
+        );
+
+        // A REGISTRATION REQUEST whose 5GS registration type is EMERGENCY (4). Octet 4
+        // low three bits carry the type, which is what the live parser reads.
+        let mut nas = vec![
+            0x7E,
+            0x00,
+            message_type::REGISTRATION_REQUEST,
+            crate::gmm_build::registration_type::EMERGENCY,
+        ];
+        // 5GS mobile identity (LV-E) holding a SUCI, so the request is well formed.
+        let suci = vec![
+            0x01, 0x00, 0xF1, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+        ];
+        nas.extend_from_slice(&(suci.len() as u16).to_be_bytes());
+        nas.extend_from_slice(&suci);
+
+        let _ = ngap
+            .handle_registration_request_nas(1, amf_ue_ngap_id, 72, &nas, false)
+            .await;
+        assert_eq!(
+            ngap.emergency.active_count(),
+            1,
+            "the emergency branch must record a context; before #72 the handler had no \
+             caller outside its own tests"
+        );
+    }
+
+    /// Criterion 11: under congestion a registration is refused with 5GMM #22 AND a
+    /// T3346 back-off, and an emergency registration is exempt (TS 24.501 §5.3.5).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nas_congestion_rejects_with_a_backoff_but_never_an_emergency() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        // The congestion posture is process-global, so take ITS lock -- the one declared
+        // beside it in `congestion.rs`, not a private one here that could not order
+        // against the congestion module's own tests.
+        let _guard = crate::congestion::congestion_test_guard();
+        let previous = crate::congestion::set_forced(true);
+        assert!(
+            ngap.nas_congestion_backoff().is_some(),
+            "a forced posture must be congested"
+        );
+
+        // An ordinary registration is refused, and the refusal is transmitted (so the
+        // absent association surfaces).
+        let ordinary = 7_200_013u64;
+        ngap.ue_auth_state
+            .insert(ordinary, UeNasContext::new(ordinary, 72, 1, false));
+        let mut nas = vec![
+            0x7E,
+            0x00,
+            message_type::REGISTRATION_REQUEST,
+            crate::gmm_build::registration_type::INITIAL,
+        ];
+        let suci = vec![
+            0x01, 0x00, 0xF1, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11,
+        ];
+        nas.extend_from_slice(&(suci.len() as u16).to_be_bytes());
+        nas.extend_from_slice(&suci);
+        let refused = ngap
+            .handle_registration_request_nas(1, ordinary, 72, &nas, false)
+            .await;
+        assert!(
+            refused.is_err(),
+            "the congestion reject must be transmitted, so the absent association surfaces"
+        );
+
+        // The same request as an EMERGENCY registration is NOT shed: §5.3.5 forbids
+        // applying congestion control to emergency services.
+        let emergency = 7_200_014u64;
+        ngap.ue_auth_state
+            .insert(emergency, UeNasContext::new(emergency, 72, 1, false));
+        nas[3] = crate::gmm_build::registration_type::EMERGENCY;
+        let _ = ngap
+            .handle_registration_request_nas(1, emergency, 72, &nas, false)
+            .await;
+        assert_eq!(
+            ngap.emergency.active_count(),
+            1,
+            "an emergency registration must reach the emergency handler even while the \
+             AMF is shedding load"
+        );
+
+        crate::congestion::set_forced(previous);
+    }
+
+    /// Criterion 9: both reachability timers are configured, and the sequence is
+    /// mobile-reachable -> implicit-dereg -> the UE context is gone
+    /// (TS 24.501 §5.3.7).
+    ///
+    /// Deadlines are set directly rather than waited on: the timers are minutes long by
+    /// configuration, and what is under test is the state machine, not the clock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_reachability_timers_run_in_sequence_and_end_in_deregistration() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        assert!(
+            ngap.timer_configs
+                .get(AmfTimerId::MobileReachable)
+                .is_some(),
+            "criterion 9: MobileReachable must have a TimerConfig"
+        );
+        assert!(
+            ngap.timer_configs
+                .get(AmfTimerId::ImplicitDeregistration)
+                .is_some(),
+            "criterion 9: ImplicitDeregistration must have a TimerConfig"
+        );
+
+        let amf_ue_ngap_id = 7_200_003u64;
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 72, 1, false);
+        ue_ctx.registered = true;
+        ue_ctx.reachability = Some(Reachability {
+            phase: ReachabilityPhase::MobileReachable,
+            deadline: Instant::now() - Duration::from_secs(1),
+        });
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        ngap.process_reachability_timers().await.expect("phase 1");
+        let phase = ngap
+            .ue_auth_state
+            .get(&amf_ue_ngap_id)
+            .and_then(|s| s.reachability)
+            .map(|r| r.phase);
+        assert_eq!(
+            phase,
+            Some(ReachabilityPhase::ImplicitDeregistration),
+            "mobile-reachable expiry must START the implicit deregistration timer, \
+             not deregister immediately"
+        );
+
+        // Force the second deadline past and run again.
+        if let Some(state) = ngap.ue_auth_state.get_mut(&amf_ue_ngap_id) {
+            state.reachability = Some(Reachability {
+                phase: ReachabilityPhase::ImplicitDeregistration,
+                deadline: Instant::now() - Duration::from_secs(1),
+            });
+        }
+        ngap.process_reachability_timers().await.expect("phase 2");
+        assert!(
+            !ngap.ue_auth_state.contains_key(&amf_ue_ngap_id),
+            "implicit deregistration must remove the UE context (TS 24.501 §5.3.7)"
+        );
+    }
+
+    /// A UE with a live N1 connection is never supervised: `reachability` is `None` until
+    /// the connection is released, so an idle-timer expiry cannot reach a connected UE.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connected_ue_is_not_under_reachability_supervision() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let amf_ue_ngap_id = 7_200_004u64;
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 72, 1, false);
+        ue_ctx.registered = true;
+        assert!(
+            ue_ctx.reachability.is_none(),
+            "a fresh context is unsupervised"
+        );
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        ngap.process_reachability_timers()
+            .await
+            .expect("nothing due");
+        assert!(
+            ngap.ue_auth_state.contains_key(&amf_ue_ngap_id),
+            "a connected UE must survive a poll with no timer running"
         );
     }
 }

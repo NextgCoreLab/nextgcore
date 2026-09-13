@@ -7,6 +7,7 @@
 //! thin wrapper around [`run`].
 
 pub mod amf_sm;
+pub mod congestion; // NAS-level congestion control posture (TS 24.501 §5.3.5)
 pub mod context;
 pub mod emergency; // #203: Emergency services (TS 23.167)
 pub mod event;

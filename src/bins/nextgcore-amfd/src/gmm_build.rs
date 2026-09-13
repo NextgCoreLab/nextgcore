@@ -391,6 +391,43 @@ fn encode_gprs_timer3_seconds(seconds: u64) -> nextgcore_types::GprsTimer3 {
     T3::new(T3::UNIT_1_MINUTE, 9)
 }
 
+/// Encode a duration in seconds as a GPRS Timer 2 IE value octet
+/// (TS 24.008 §10.5.7.4, carried by TS 24.501 §9.11.2.4 as the T3346 value).
+///
+/// The octet is 3 bits of unit (bits 8-6) and 5 bits of value (bits 5-1), so it can
+/// only express `value × unit` with `value <= 31`. Same policy as
+/// [`encode_gprs_timer3_seconds`]: pick the COARSEST unit that represents the requested
+/// duration exactly, so a configured value is either encoded faithfully or refused --
+/// never silently rounded to something the operator did not ask for.
+///
+/// Units, coarsest first: decihours (6 min), 1 min, 2 s. `None` for a duration no unit
+/// can express exactly, so the caller omits the IE rather than emitting a wrong
+/// back-off: a UE told to wait the wrong time is worse than one told nothing, because
+/// it acts on the value with full confidence.
+fn encode_gprs_timer2_seconds(seconds: u64) -> Option<nextgcore_types::GprsTimer2> {
+    // (unit code in bits 8-6, seconds per tick), coarsest first.
+    const UNITS: [(u8, u64); 3] = [(2, 360), (1, 60), (0, 2)];
+    if seconds == 0 {
+        // Unit 111 = "timer is deactivated" (TS 24.008 Table 10.5.163).
+        return Some(nextgcore_types::GprsTimer2::new(0x07 << 5));
+    }
+    for (unit, tick) in UNITS {
+        if seconds.is_multiple_of(tick) {
+            let ticks = seconds / tick;
+            if (1..=31).contains(&ticks) {
+                return Some(nextgcore_types::GprsTimer2::new(
+                    (unit << 5) | (ticks as u8 & 0x1F),
+                ));
+            }
+        }
+    }
+    log::warn!(
+        "T3346 value {seconds}s is not representable as a GPRS Timer 2 \
+         (value x unit, value <= 31); omitting the back-off IE"
+    );
+    None
+}
+
 pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
     // nas-06 Phase 2 (Tier C, REGISTRATION-CRITICAL): encoded via nextgcore-nas. Byte-
     // identical to the prior hand-rolled output — 5GS registration result LV
@@ -597,9 +634,35 @@ pub fn encode_nssai_value(snssais: &[crate::context::SNssai]) -> Vec<u8> {
 /// optional T3346/T3502/EAP IEs are not emitted by amfd). Locked by
 /// `drift_registration_reject_through_nextgcore_nas` and `golden_registration_reject`.
 pub fn build_registration_reject(gmm_cause: GmmCause) -> Vec<u8> {
+    build_registration_reject_with_backoff(gmm_cause, None)
+}
+
+/// Build a Registration Reject carrying an optional T3346 back-off
+/// (TS 24.501 §5.3.5 NAS-level congestion control, §8.2.8).
+///
+/// `t3346_secs` is the wait the AMF is imposing. The IE only makes sense alongside a
+/// congestion cause -- TS 24.501 §5.3.5 pairs the back-off with 5GMM cause #22 -- so a
+/// caller passing one with an unrelated cause is logged: a UE that receives a back-off
+/// with, say, #3 "illegal UE" is being told both "never come back" and "come back in
+/// 60 s".
+pub fn build_registration_reject_with_backoff(
+    gmm_cause: GmmCause,
+    t3346_secs: Option<u64>,
+) -> Vec<u8> {
+    let t3346_value = t3346_secs.and_then(|secs| {
+        if gmm_cause != GmmCause::Congestion {
+            log::warn!(
+                "T3346 back-off of {secs}s attached to Registration Reject cause #{} rather \
+                 than #22 (Congestion); TS 24.501 §5.3.5 pairs the back-off with congestion",
+                gmm_cause as u8
+            );
+        }
+        encode_gprs_timer2_seconds(secs)
+    });
     let msg =
         nextgcore_msg::FiveGmmMessage::RegistrationReject(nextgcore_msg::RegistrationReject {
             gmm_cause: gmm_cause as u8,
+            t3346_value,
             ..Default::default()
         });
     nextgcore_msg::build_5gmm_message(&msg).to_vec()
@@ -642,10 +705,30 @@ pub fn build_service_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
 /// rolled output — mandatory 5GMM cause, then the optional PDU session status
 /// (0x50). Locked by `golden_service_reject`.
 pub fn build_service_reject(amf_ue: &AmfUe, gmm_cause: GmmCause) -> Vec<u8> {
+    build_service_reject_with_backoff(amf_ue, gmm_cause, None)
+}
+
+/// Build a Service Reject carrying an optional T3346 back-off
+/// (TS 24.501 §5.3.5, §8.2.18). See [`build_registration_reject_with_backoff`].
+pub fn build_service_reject_with_backoff(
+    amf_ue: &AmfUe,
+    gmm_cause: GmmCause,
+    t3346_secs: Option<u64>,
+) -> Vec<u8> {
+    let t3346_value = t3346_secs.and_then(|secs| {
+        if gmm_cause != GmmCause::Congestion {
+            log::warn!(
+                "T3346 back-off of {secs}s attached to Service Reject cause #{} rather than \
+                 #22 (Congestion); TS 24.501 §5.3.5 pairs the back-off with congestion",
+                gmm_cause as u8
+            );
+        }
+        encode_gprs_timer2_seconds(secs)
+    });
     let msg = nextgcore_msg::FiveGmmMessage::ServiceReject(nextgcore_msg::ServiceReject {
         gmm_cause: gmm_cause as u8,
         pdu_session_status: pdu_session_status_ie(amf_ue),
-        t3346_value: None,
+        t3346_value,
         eap_message: None,
     });
     nextgcore_msg::build_5gmm_message(&msg).to_vec()
@@ -1861,6 +1944,73 @@ mod tests {
             iwk_n26_posture().bit(),
             0x40,
             "and it encodes as octet 3 bit 7 SET"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // #72 criterion 11: the T3346 congestion back-off (TS 24.501 §5.3.5)
+    // ------------------------------------------------------------------
+
+    /// The back-off must reach the WIRE, with the IEI TS 24.501 §8.2.8 assigns it.
+    #[test]
+    fn a_congestion_registration_reject_carries_the_t3346_ie() {
+        let plain = build_registration_reject(GmmCause::Congestion);
+        assert!(
+            !plain.contains(&0x5F),
+            "precondition: without a back-off the T3346 IEI must be absent"
+        );
+
+        let with_backoff = build_registration_reject_with_backoff(GmmCause::Congestion, Some(60));
+        assert_eq!(with_backoff[2], message_type::REGISTRATION_REJECT);
+        assert_eq!(
+            with_backoff[3],
+            GmmCause::Congestion as u8,
+            "5GMM cause #22 is what the back-off accompanies"
+        );
+        // T3346 IE: IEI 0x5F, length 1, then the value octet. 60 s is 1 x 1 minute, so
+        // unit 001 in bits 8-6 and value 1 -> 0x21.
+        let iei = with_backoff
+            .windows(3)
+            .position(|w| w[0] == 0x5F && w[1] == 0x01)
+            .expect("the T3346 IE must be present");
+        assert_eq!(
+            with_backoff[iei + 2],
+            0x21,
+            "60s must encode as 1 x 1 minute (unit 001, value 1), not 30 x 2s"
+        );
+    }
+
+    #[test]
+    fn a_congestion_service_reject_carries_the_t3346_ie() {
+        let ue = AmfUe::default();
+        let plain = build_service_reject(&ue, GmmCause::Congestion);
+        assert!(!plain.contains(&0x5F), "precondition: no back-off, no IE");
+
+        let with_backoff = build_service_reject_with_backoff(&ue, GmmCause::Congestion, Some(360));
+        // 360 s is 1 x decihour: unit 010, value 1 -> 0x41. Coarsest-first, so NOT
+        // 6 x 1 minute (0x26).
+        let iei = with_backoff
+            .windows(3)
+            .position(|w| w[0] == 0x5F && w[1] == 0x01)
+            .expect("the T3346 IE must be present");
+        assert_eq!(with_backoff[iei + 2], 0x41);
+    }
+
+    /// The encoder refuses a duration it cannot express exactly, rather than rounding to
+    /// a wait the operator did not ask for.
+    #[test]
+    fn an_unrepresentable_backoff_is_omitted_not_rounded() {
+        // 3 s: not a multiple of 2 s... it is, 1.5 ticks -- no. 3 is odd, so no unit
+        // divides it. 63 s likewise (not a multiple of 60, 360, or 2).
+        assert_eq!(encode_gprs_timer2_seconds(63), None);
+        // And the representable neighbours are exact.
+        assert_eq!(encode_gprs_timer2_seconds(62).map(|t| t.value), Some(0x1F));
+        assert_eq!(encode_gprs_timer2_seconds(60).map(|t| t.value), Some(0x21));
+        // 0 is the spec's "deactivated" row (unit 111), not an omission.
+        assert_eq!(
+            encode_gprs_timer2_seconds(0).map(|t| t.value),
+            Some(0xE0),
+            "0 means the timer is deactivated (TS 24.008 Table 10.5.163)"
         );
     }
 }

@@ -137,6 +137,10 @@ pub struct AmfTimerConfigs {
     pub t3570: TimerConfig,
     /// NG holding configuration
     pub ng_holding: TimerConfig,
+    /// Mobile reachable timer configuration (TS 24.501 §5.3.7)
+    pub mobile_reachable: TimerConfig,
+    /// Implicit deregistration timer configuration (TS 24.501 §5.3.7)
+    pub implicit_deregistration: TimerConfig,
     /// Per-AMF default NTN timing advance (issue #18, non-normative
     /// research). Applied to any UE without a per-UE advance; populated at
     /// NGAP-server startup from the `AMF_NTN_TIMING_ADVANCE_US` env var.
@@ -165,6 +169,22 @@ impl Default for AmfTimerConfigs {
                 max_count: 0,
                 duration: Duration::from_secs(30),
             },
+            // Mobile reachable timer (TS 24.501 §5.3.7). Started when the N1
+            // signalling connection of a registered UE is released; on expiry the
+            // implicit deregistration timer starts.
+            //
+            // The default is T3512 + 4 minutes, which is the relationship TS 24.501
+            // §5.3.7 describes ("slightly longer than the periodic registration update
+            // timer"): a UE that is registering periodically must never be found
+            // unreachable merely because its next registration has not fallen due.
+            // T3512 itself is operator-configured (`amf.time.t3512.value`), so
+            // `AmfTimerConfigs::with_t3512` re-derives this from the configured value;
+            // this default assumes the shipped 540 s.
+            mobile_reachable: TimerConfig::new(0, DEFAULT_T3512_SECS + 4 * 60),
+            // Implicit deregistration timer (TS 24.501 §5.3.7). Started when the
+            // mobile reachable timer expires; on ITS expiry the AMF implicitly
+            // deregisters the UE.
+            implicit_deregistration: TimerConfig::new(0, 4 * 60),
             #[cfg(feature = "ntn")]
             ntn_default_timing_advance: None,
         }
@@ -182,8 +202,68 @@ impl AmfTimerConfigs {
             AmfTimerId::T3560 => Some(&self.t3560),
             AmfTimerId::T3570 => Some(&self.t3570),
             AmfTimerId::NgHolding => Some(&self.ng_holding),
+            AmfTimerId::MobileReachable => Some(&self.mobile_reachable),
+            AmfTimerId::ImplicitDeregistration => Some(&self.implicit_deregistration),
             _ => None,
         }
+    }
+
+    /// Re-derive the reachability timers from the configured T3512 and the
+    /// `AMF_MOBILE_REACHABLE_SECS` / `AMF_IMPLICIT_DEREG_SECS` overrides.
+    ///
+    /// Sourced from configuration rather than fixed, per TS 24.501 §5.3.7, which sets
+    /// no value and only the relationship to T3512. An explicit override wins over the
+    /// derivation, so an operator can decouple the two.
+    ///
+    /// A value of 0 DISABLES the timer, which is the honest reading of "do not run it":
+    /// the alternative -- treating 0 as "expire immediately" -- would implicitly
+    /// deregister every UE the moment it went idle.
+    pub fn with_reachability_from(mut self, t3512_secs: u64) -> Self {
+        let derived = t3512_secs.saturating_add(4 * 60);
+        let mobile_reachable = env_secs("AMF_MOBILE_REACHABLE_SECS").unwrap_or(derived);
+        let implicit_dereg = env_secs("AMF_IMPLICIT_DEREG_SECS").unwrap_or(4 * 60);
+        self.mobile_reachable = TimerConfig {
+            enabled: mobile_reachable > 0,
+            max_count: 0,
+            duration: Duration::from_secs(mobile_reachable),
+        };
+        self.implicit_deregistration = TimerConfig {
+            enabled: implicit_dereg > 0,
+            max_count: 0,
+            duration: Duration::from_secs(implicit_dereg),
+        };
+        log::info!(
+            "AMF reachability timers: mobile-reachable {}s (enabled={}), implicit-dereg {}s \
+             (enabled={}), derived from T3512={}s",
+            mobile_reachable,
+            self.mobile_reachable.enabled,
+            implicit_dereg,
+            self.implicit_deregistration.enabled,
+            t3512_secs
+        );
+        self
+    }
+}
+
+/// The shipped `amf.time.t3512.value`, used only as the fallback the compile-time
+/// default of [`AmfTimerConfigs::mobile_reachable`] is derived from. The live value
+/// comes from configuration via [`AmfTimerConfigs::with_reachability_from`].
+const DEFAULT_T3512_SECS: u64 = 540;
+
+/// Read a non-negative seconds value from an environment variable.
+///
+/// A value that will not parse is IGNORED with a warning rather than treated as 0,
+/// because 0 disables the timer and a typo must not silently do that.
+fn env_secs(var: &str) -> Option<u64> {
+    match std::env::var(var) {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(v) => Some(v),
+            Err(e) => {
+                log::warn!("{var}={raw:?} is not a number of seconds ({e}); ignoring");
+                None
+            }
+        },
+        Err(_) => None,
     }
 }
 
