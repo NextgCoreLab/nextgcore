@@ -1378,6 +1378,36 @@ fn write_through_poison<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, 
     lock.write().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Take a read guard, using the data even when the lock is POISONED (#344).
+///
+/// The read half of [`write_through_poison`], and the same judgement reached for
+/// the same reason. #338 fixed the five removal functions because there a silent
+/// give-up is a leak; #344 asked which of three semantics the LOOKUP family
+/// should get, since answering from a map a panic left mid-update is a different
+/// trade from answering `None` for a record that is sitting right there.
+///
+/// **This file now has one semantics: read and write THROUGH the poison.** The
+/// reasoning, recorded because the alternatives are defensible:
+///
+/// - A poisoned lock means a thread unwound while holding it. Every write scope
+///   here is a short straight line of `insert`/`remove` calls on `HashMap`s under
+///   separate locks, so the realistic torn state is ONE INDEX UPDATED AND ITS
+///   SIBLING NOT — exactly the state `write_through_poison` already accepts on the
+///   removal paths, and a state whose stale index entry resolves to an id that is
+///   not in the primary list and so answers `None` anyway.
+/// - A false "not found" is not the safer answer. Poison is PERMANENT, so from the
+///   first panic every lookup 404s a live session for the life of the process: the
+///   SMF is told its association does not exist, deletes nothing, and the record
+///   is leaked. That is the #338 defect reached from the read side.
+/// - Propagating the poison as a distinguishable error (so a handler could 503)
+///   was rejected: it changes 14 signatures and every caller, and a PCF that 503s
+///   every request forever is the availability outcome of aborting without the
+///   clarity of a crash. Aborting the process was rejected for the same reason
+///   #338 chose to keep serving — a localized bug should not take the NF down.
+fn read_through_poison<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|e| e.into_inner())
+}
+
 impl PcfContext {
     pub fn new() -> Self {
         Self {
@@ -1433,12 +1463,8 @@ impl PcfContext {
         // Event subscriptions hang off no UE, so the two removals above do not
         // reach them; cleared explicitly or a re-init would inherit the previous
         // run's subscriptions (and, in tests, the previous test's).
-        if let Ok(mut list) = self.event_sub_list.write() {
-            list.clear();
-        }
-        if let Ok(mut hash) = self.event_sub_id_hash.write() {
-            hash.clear();
-        }
+        write_through_poison(&self.event_sub_list).clear();
+        write_through_poison(&self.event_sub_id_hash).clear();
         self.initialized.store(false, Ordering::SeqCst);
         log::info!("PCF context finalized");
     }
@@ -1495,8 +1521,8 @@ impl PcfContext {
         raw: serde_json::Value,
     ) -> Option<PcEventSubscription> {
         let sub = {
-            let mut list = self.event_sub_list.write().ok()?;
-            let mut hash = self.event_sub_id_hash.write().ok()?;
+            let mut list = write_through_poison(&self.event_sub_list);
+            let mut hash = write_through_poison(&self.event_sub_id_hash);
             let id = self.next_event_sub_id.fetch_add(1, Ordering::SeqCst) as u64;
             let sub = PcEventSubscription {
                 id,
@@ -1521,23 +1547,21 @@ impl PcfContext {
     }
 
     pub fn event_sub_find_by_subscription_id(&self, sub_id: &str) -> Option<PcEventSubscription> {
-        let id = *self.event_sub_id_hash.read().ok()?.get(sub_id)?;
-        self.event_sub_list.read().ok()?.get(&id).cloned()
+        let id = *read_through_poison(&self.event_sub_id_hash).get(sub_id)?;
+        read_through_poison(&self.event_sub_list).get(&id).cloned()
     }
 
     /// Replace a subscription in place (PUT). The `subscription_id` and pool id
     /// are preserved by the caller, so the derived index needs no update.
     pub fn event_sub_update(&self, sub: &PcEventSubscription) -> bool {
         let ok = {
-            match self.event_sub_list.write() {
-                Ok(mut list) => match list.get_mut(&sub.id) {
-                    Some(slot) => {
-                        *slot = sub.clone();
-                        true
-                    }
-                    None => false,
-                },
-                Err(_) => false,
+            let mut list = write_through_poison(&self.event_sub_list);
+            match list.get_mut(&sub.id) {
+                Some(slot) => {
+                    *slot = sub.clone();
+                    true
+                }
+                None => false,
             }
         };
         if ok {
@@ -1565,9 +1589,9 @@ impl PcfContext {
     /// lock across an await — the notify path is async and the guard is not
     /// `Send`-safe to hold across it.
     pub fn event_subs_wanting(&self, event: &str, dnn: Option<&str>) -> Vec<PcEventSubscription> {
-        let Ok(list) = self.event_sub_list.read() else {
-            return Vec::new();
-        };
+        // Through the poison (#344): giving up here returns "nobody subscribed",
+        // which drops every notification for the life of the process.
+        let list = read_through_poison(&self.event_sub_list);
         let mut out: Vec<PcEventSubscription> = list
             .values()
             .filter(|s| s.wants(event) && s.dnn_matches(dnn))
@@ -1582,15 +1606,15 @@ impl PcfContext {
     /// Charge one report against `maxReportNbr`. Separate from the send so the
     /// counter moves only for a notification actually dispatched.
     pub fn event_sub_count_report(&self, id: u64) {
-        let counted = match self.event_sub_list.write() {
-            Ok(mut list) => match list.get_mut(&id) {
+        let counted = {
+            let mut list = write_through_poison(&self.event_sub_list);
+            match list.get_mut(&id) {
                 Some(sub) => {
                     sub.report_count = sub.report_count.saturating_add(1);
                     true
                 }
                 None => false,
-            },
-            Err(_) => false,
+            }
         };
         if counted {
             self.persist();
@@ -1599,7 +1623,7 @@ impl PcfContext {
 
     #[cfg(test)]
     pub fn event_sub_count(&self) -> usize {
-        self.event_sub_list.read().map(|l| l.len()).unwrap_or(0)
+        read_through_poison(&self.event_sub_list).len()
     }
 
     /// Serialize the four primary lists to one snapshot document.
@@ -1623,10 +1647,14 @@ impl PcfContext {
             lock: &RwLock<HashMap<u64, T>>,
             key: impl Fn(&T) -> K,
         ) -> Vec<T> {
-            let mut v: Vec<T> = lock
-                .read()
-                .map(|m| m.values().cloned().collect())
-                .unwrap_or_default();
+            // Through the poison (#344), and this is the site with the worst
+            // consequence in the file: `unwrap_or_default()` here made a poisoned
+            // list serialise as an EMPTY array, and `persist` then wrote that over
+            // a good snapshot. Every record in that list was lost on disk, silently
+            // and permanently -- the durable-state analogue of the leak #338 fixed
+            // in memory, and the one thing #66's "refuse to overwrite what you
+            // could not read" rule exists to prevent.
+            let mut v: Vec<T> = read_through_poison(lock).values().cloned().collect();
             v.sort_by_key(|t| key(t));
             v
         }
@@ -1695,10 +1723,7 @@ impl PcfContext {
     /// `sbi_path::pcf_notify_unrestorable_at_boot`; not persisted, because it
     /// describes one restore rather than durable state.
     pub fn take_unrestorable_associations(&self) -> Vec<UnrestorableAssociation> {
-        match self.unrestorable_associations.write() {
-            Ok(mut p) => std::mem::take(&mut *p),
-            Err(_) => Vec::new(),
-        }
+        std::mem::take(&mut *write_through_poison(&self.unrestorable_associations))
     }
 
     /// Queue an unrestorable association without a snapshot, for the wire test
@@ -1710,13 +1735,11 @@ impl PcfContext {
         notification_uri: Option<String>,
         reason: String,
     ) {
-        if let Ok(mut pending) = self.unrestorable_associations.write() {
-            pending.push(UnrestorableAssociation {
-                sm_policy_id,
-                notification_uri,
-                reason,
-            });
-        }
+        write_through_poison(&self.unrestorable_associations).push(UnrestorableAssociation {
+            sm_policy_id,
+            notification_uri,
+            reason,
+        });
     }
 
     fn restore_from(
@@ -1802,9 +1825,7 @@ impl PcfContext {
                  notificationUri could be salvaged.",
                 unrestorable.len()
             );
-            if let Ok(mut pending) = self.unrestorable_associations.write() {
-                pending.extend(unrestorable);
-            }
+            write_through_poison(&self.unrestorable_associations).extend(unrestorable);
         }
 
         let mut max_ue_am = 0u64;
@@ -1814,11 +1835,10 @@ impl PcfContext {
         let mut max_event_sub = 0u64;
 
         // ── primary lists + the indexes derived from each ────────────────────
-        if let (Ok(mut list), Ok(mut supi_hash), Ok(mut assoc_hash)) = (
-            self.ue_am_list.write(),
-            self.supi_am_hash.write(),
-            self.association_id_hash.write(),
-        ) {
+        {
+            let mut list = write_through_poison(&self.ue_am_list);
+            let mut supi_hash = write_through_poison(&self.supi_am_hash);
+            let mut assoc_hash = write_through_poison(&self.association_id_hash);
             for ue_am in ue_ams {
                 max_ue_am = max_ue_am.max(ue_am.id);
                 supi_hash.insert(ue_am.supi.clone(), ue_am.id);
@@ -1826,21 +1846,20 @@ impl PcfContext {
                 list.insert(ue_am.id, ue_am);
             }
         }
-        if let (Ok(mut list), Ok(mut supi_hash)) =
-            (self.ue_sm_list.write(), self.supi_sm_hash.write())
         {
+            let mut list = write_through_poison(&self.ue_sm_list);
+            let mut supi_hash = write_through_poison(&self.supi_sm_hash);
             for ue_sm in ue_sms {
                 max_ue_sm = max_ue_sm.max(ue_sm.id);
                 supi_hash.insert(ue_sm.supi.clone(), ue_sm.id);
                 list.insert(ue_sm.id, ue_sm);
             }
         }
-        if let (Ok(mut list), Ok(mut policy_hash), Ok(mut v4), Ok(mut v6)) = (
-            self.sess_list.write(),
-            self.sm_policy_id_hash.write(),
-            self.ipv4addr_hash.write(),
-            self.ipv6prefix_hash.write(),
-        ) {
+        {
+            let mut list = write_through_poison(&self.sess_list);
+            let mut policy_hash = write_through_poison(&self.sm_policy_id_hash);
+            let mut v4 = write_through_poison(&self.ipv4addr_hash);
+            let mut v6 = write_through_poison(&self.ipv6prefix_hash);
             for sess in sessions {
                 max_sess = max_sess.max(sess.id);
                 policy_hash.insert(sess.sm_policy_id.clone(), sess.id);
@@ -1855,9 +1874,9 @@ impl PcfContext {
                 list.insert(sess.id, sess);
             }
         }
-        if let (Ok(mut list), Ok(mut app_hash)) =
-            (self.app_list.write(), self.app_session_id_hash.write())
         {
+            let mut list = write_through_poison(&self.app_list);
+            let mut app_hash = write_through_poison(&self.app_session_id_hash);
             for app in apps {
                 max_app = max_app.max(app.id);
                 app_hash.insert(app.app_session_id.clone(), app.id);
@@ -1868,9 +1887,9 @@ impl PcfContext {
         // other seven: a persisted index that disagreed with the list would make
         // GET/PUT/DELETE resolve to a different consumer's subscription, which is
         // worse than resolving to nothing.
-        if let (Ok(mut list), Ok(mut sub_hash)) =
-            (self.event_sub_list.write(), self.event_sub_id_hash.write())
         {
+            let mut list = write_through_poison(&self.event_sub_list);
+            let mut sub_hash = write_through_poison(&self.event_sub_id_hash);
             for sub in event_subs {
                 max_event_sub = max_event_sub.max(sub.id);
                 sub_hash.insert(sub.subscription_id.clone(), sub.id);
@@ -1939,9 +1958,9 @@ impl PcfContext {
     // UE AM management
 
     pub fn ue_am_add(&self, supi: &str) -> Option<PcfUeAm> {
-        let mut ue_am_list = self.ue_am_list.write().ok()?;
-        let mut supi_am_hash = self.supi_am_hash.write().ok()?;
-        let mut association_id_hash = self.association_id_hash.write().ok()?;
+        let mut ue_am_list = write_through_poison(&self.ue_am_list);
+        let mut supi_am_hash = write_through_poison(&self.supi_am_hash);
+        let mut association_id_hash = write_through_poison(&self.association_id_hash);
 
         if ue_am_list.len() >= self.max_num_of_ue {
             log::error!("Maximum number of UE AMs [{}] reached", self.max_num_of_ue);
@@ -1985,15 +2004,13 @@ impl PcfContext {
     }
 
     pub fn ue_am_remove_all(&self) {
-        if let (Ok(mut ue_am_list), Ok(mut supi_am_hash), Ok(mut association_id_hash)) = (
-            self.ue_am_list.write(),
-            self.supi_am_hash.write(),
-            self.association_id_hash.write(),
-        ) {
-            ue_am_list.clear();
-            supi_am_hash.clear();
-            association_id_hash.clear();
-        }
+        // Through the poison (#344): `*_remove_all` is a REMOVAL, so a silent
+        // give-up here is the leak #338 fixed -- reached by a different syntax,
+        // which is why the `.ok()?` sweep missed it. `fini` calls this, so on a
+        // poisoned index the previous run's associations survived a re-init.
+        write_through_poison(&self.ue_am_list).clear();
+        write_through_poison(&self.supi_am_hash).clear();
+        write_through_poison(&self.association_id_hash).clear();
     }
 
     pub fn ue_am_find_by_supi(&self, supi: &str) -> Option<PcfUeAm> {
@@ -2001,8 +2018,8 @@ impl PcfContext {
         // ue_am_add/remove take ue_am_list then supi_am_hash, so a hash-first
         // read here inverts that order and deadlocks a concurrent writer
         // (read(supi_am_hash) waits on write, while write(ue_am_list) waits on read).
-        let ue_am_list = self.ue_am_list.read().ok()?;
-        let supi_am_hash = self.supi_am_hash.read().ok()?;
+        let ue_am_list = read_through_poison(&self.ue_am_list);
+        let supi_am_hash = read_through_poison(&self.supi_am_hash);
         supi_am_hash
             .get(supi)
             .and_then(|&id| ue_am_list.get(&id).cloned())
@@ -2011,28 +2028,28 @@ impl PcfContext {
     pub fn ue_am_find_by_association_id(&self, association_id: &str) -> Option<PcfUeAm> {
         // AB-BA: ue_am_list before association_id_hash (canonical
         // primary-list-first; matches ue_am_add/remove).
-        let ue_am_list = self.ue_am_list.read().ok()?;
-        let association_id_hash = self.association_id_hash.read().ok()?;
+        let ue_am_list = read_through_poison(&self.ue_am_list);
+        let association_id_hash = read_through_poison(&self.association_id_hash);
         association_id_hash
             .get(association_id)
             .and_then(|&id| ue_am_list.get(&id).cloned())
     }
 
     pub fn ue_am_find_by_id(&self, id: u64) -> Option<PcfUeAm> {
-        let ue_am_list = self.ue_am_list.read().ok()?;
+        let ue_am_list = read_through_poison(&self.ue_am_list);
         ue_am_list.get(&id).cloned()
     }
 
     pub fn ue_am_update(&self, ue_am: &PcfUeAm) -> bool {
-        let updated = match self.ue_am_list.write() {
-            Ok(mut ue_am_list) => match ue_am_list.get_mut(&ue_am.id) {
+        let updated = {
+            let mut ue_am_list = write_through_poison(&self.ue_am_list);
+            match ue_am_list.get_mut(&ue_am.id) {
                 Some(existing) => {
                     *existing = ue_am.clone();
                     true
                 }
                 None => false,
-            },
-            Err(_) => false,
+            }
         };
         // Guard dropped by the match arm ending -- see ue_am_add.
         if updated {
@@ -2044,8 +2061,8 @@ impl PcfContext {
     // UE SM management
 
     pub fn ue_sm_add(&self, supi: &str) -> Option<PcfUeSm> {
-        let mut ue_sm_list = self.ue_sm_list.write().ok()?;
-        let mut supi_sm_hash = self.supi_sm_hash.write().ok()?;
+        let mut ue_sm_list = write_through_poison(&self.ue_sm_list);
+        let mut supi_sm_hash = write_through_poison(&self.supi_sm_hash);
 
         if ue_sm_list.len() >= self.max_num_of_ue {
             log::error!("Maximum number of UE SMs [{}] reached", self.max_num_of_ue);
@@ -2091,46 +2108,39 @@ impl PcfContext {
     }
 
     pub fn ue_sm_remove_all(&self) {
-        if let (Ok(mut ue_sm_list), Ok(mut supi_sm_hash)) =
-            (self.ue_sm_list.write(), self.supi_sm_hash.write())
-        {
-            ue_sm_list.clear();
-            supi_sm_hash.clear();
-        }
+        // Through the poison (#344): see ue_am_remove_all.
+        write_through_poison(&self.ue_sm_list).clear();
+        write_through_poison(&self.supi_sm_hash).clear();
         // Clear sessions and apps
-        if let Ok(mut sess_list) = self.sess_list.write() {
-            sess_list.clear();
-        }
-        if let Ok(mut app_list) = self.app_list.write() {
-            app_list.clear();
-        }
+        write_through_poison(&self.sess_list).clear();
+        write_through_poison(&self.app_list).clear();
     }
 
     pub fn ue_sm_find_by_supi(&self, supi: &str) -> Option<PcfUeSm> {
         // AB-BA: ue_sm_list before supi_sm_hash (canonical primary-list-first;
         // matches ue_sm_add, which takes ue_sm_list then supi_sm_hash).
-        let ue_sm_list = self.ue_sm_list.read().ok()?;
-        let supi_sm_hash = self.supi_sm_hash.read().ok()?;
+        let ue_sm_list = read_through_poison(&self.ue_sm_list);
+        let supi_sm_hash = read_through_poison(&self.supi_sm_hash);
         supi_sm_hash
             .get(supi)
             .and_then(|&id| ue_sm_list.get(&id).cloned())
     }
 
     pub fn ue_sm_find_by_id(&self, id: u64) -> Option<PcfUeSm> {
-        let ue_sm_list = self.ue_sm_list.read().ok()?;
+        let ue_sm_list = read_through_poison(&self.ue_sm_list);
         ue_sm_list.get(&id).cloned()
     }
 
     pub fn ue_sm_update(&self, ue_sm: &PcfUeSm) -> bool {
-        let updated = match self.ue_sm_list.write() {
-            Ok(mut ue_sm_list) => match ue_sm_list.get_mut(&ue_sm.id) {
+        let updated = {
+            let mut ue_sm_list = write_through_poison(&self.ue_sm_list);
+            match ue_sm_list.get_mut(&ue_sm.id) {
                 Some(existing) => {
                     *existing = ue_sm.clone();
                     true
                 }
                 None => false,
-            },
-            Err(_) => false,
+            }
         };
         if updated {
             self.persist();
@@ -2141,9 +2151,9 @@ impl PcfContext {
     // Session management
 
     pub fn sess_add(&self, pcf_ue_sm_id: u64, psi: u8) -> Option<PcfSess> {
-        let mut sess_list = self.sess_list.write().ok()?;
-        let mut sm_policy_id_hash = self.sm_policy_id_hash.write().ok()?;
-        let mut ue_sm_list = self.ue_sm_list.write().ok()?;
+        let mut sess_list = write_through_poison(&self.sess_list);
+        let mut sm_policy_id_hash = write_through_poison(&self.sm_policy_id_hash);
+        let mut ue_sm_list = write_through_poison(&self.ue_sm_list);
 
         // A PDU session is identified by (UE SM, PSI): TS 29.512 §4.2.2.2 makes
         // the SM policy association one-per-PDU-session, so a repeat create for
@@ -2241,20 +2251,22 @@ impl PcfContext {
     }
 
     fn sess_remove_all_for_ue(&self, pcf_ue_sm_id: u64) {
-        if let Ok(mut sess_list) = self.sess_list.write() {
-            let sess_ids: Vec<u64> = sess_list
-                .values()
-                .filter(|s| s.pcf_ue_sm_id == pcf_ue_sm_id)
-                .map(|s| s.id)
-                .collect();
-            for id in sess_ids {
-                sess_list.remove(&id);
-            }
+        // Through the poison (#344): this is the cascade `ue_sm_remove` relies on,
+        // and `ue_sm_remove` is already poison-tolerant (#338). Giving up here
+        // stranded every session of a UE whose removal had just succeeded.
+        let mut sess_list = write_through_poison(&self.sess_list);
+        let sess_ids: Vec<u64> = sess_list
+            .values()
+            .filter(|s| s.pcf_ue_sm_id == pcf_ue_sm_id)
+            .map(|s| s.id)
+            .collect();
+        for id in sess_ids {
+            sess_list.remove(&id);
         }
     }
 
     pub fn sess_find_by_id(&self, id: u64) -> Option<PcfSess> {
-        let sess_list = self.sess_list.read().ok()?;
+        let sess_list = read_through_poison(&self.sess_list);
         sess_list.get(&id).cloned()
     }
 
@@ -2264,15 +2276,15 @@ impl PcfContext {
         // hash-first read here inverts that order and deadlocks a concurrent
         // create/delete — this is the cycle the concurrent sm_policy_* handler
         // tests hit (the 2fbcae0 fix normalized only the list<->list edges).
-        let sess_list = self.sess_list.read().ok()?;
-        let sm_policy_id_hash = self.sm_policy_id_hash.read().ok()?;
+        let sess_list = read_through_poison(&self.sess_list);
+        let sm_policy_id_hash = read_through_poison(&self.sm_policy_id_hash);
         sm_policy_id_hash
             .get(sm_policy_id)
             .and_then(|&id| sess_list.get(&id).cloned())
     }
 
     pub fn sess_find_by_psi(&self, pcf_ue_sm_id: u64, psi: u8) -> Option<PcfSess> {
-        let sess_list = self.sess_list.read().ok()?;
+        let sess_list = read_through_poison(&self.sess_list);
         sess_list
             .values()
             .find(|s| s.pcf_ue_sm_id == pcf_ue_sm_id && s.psi == psi)
@@ -2284,8 +2296,8 @@ impl PcfContext {
             let ipv4addr = u32::from(addr);
             // AB-BA: sess_list before ipv4addr_hash (canonical primary-list-first;
             // sess_remove/sess_update take sess_list then ipv4addr_hash).
-            let sess_list = self.sess_list.read().ok()?;
-            let ipv4addr_hash = self.ipv4addr_hash.read().ok()?;
+            let sess_list = read_through_poison(&self.sess_list);
+            let ipv4addr_hash = read_through_poison(&self.ipv4addr_hash);
             return ipv4addr_hash
                 .get(&ipv4addr)
                 .and_then(|&id| sess_list.get(&id).cloned());
@@ -2304,7 +2316,7 @@ impl PcfContext {
     pub fn sess_find_by_ipv6_ue_addr(&self, ue_ipv6: &str) -> Option<PcfSess> {
         let addr: std::net::Ipv6Addr = ue_ipv6.parse().ok()?;
         let octets = addr.octets();
-        let sess_list = self.sess_list.read().ok()?;
+        let sess_list = read_through_poison(&self.sess_list);
         sess_list
             .values()
             .find(|sess| match sess.ipv6prefix {
@@ -2317,8 +2329,8 @@ impl PcfContext {
     pub fn sess_find_by_ipv6addr(&self, ipv6prefix_string: &str) -> Option<PcfSess> {
         // AB-BA: sess_list before ipv6prefix_hash (canonical primary-list-first;
         // sess_remove/sess_update take sess_list then ipv6prefix_hash).
-        let sess_list = self.sess_list.read().ok()?;
-        let ipv6prefix_hash = self.ipv6prefix_hash.read().ok()?;
+        let sess_list = read_through_poison(&self.sess_list);
+        let ipv6prefix_hash = read_through_poison(&self.ipv6prefix_hash);
         ipv6prefix_hash
             .get(ipv6prefix_string)
             .and_then(|&id| sess_list.get(&id).cloned())
@@ -2337,11 +2349,10 @@ impl PcfContext {
     /// the guards are released by returning, which is what lets the caller
     /// persist without deadlocking.
     fn sess_update_locked(&self, sess: &PcfSess) -> bool {
-        if let (Ok(mut sess_list), Ok(mut ipv4addr_hash), Ok(mut ipv6prefix_hash)) = (
-            self.sess_list.write(),
-            self.ipv4addr_hash.write(),
-            self.ipv6prefix_hash.write(),
-        ) {
+        {
+            let mut sess_list = write_through_poison(&self.sess_list);
+            let mut ipv4addr_hash = write_through_poison(&self.ipv4addr_hash);
+            let mut ipv6prefix_hash = write_through_poison(&self.ipv6prefix_hash);
             if let Some(existing) = sess_list.get_mut(&sess.id) {
                 // Update IPv4 hash if changed
                 if existing.ipv4addr != sess.ipv4addr {
@@ -2374,17 +2385,16 @@ impl PcfContext {
         s_nssai: &SNssai,
         dnn: &str,
     ) -> usize {
-        if let Ok(sess_list) = self.sess_list.read() {
-            return sess_list
-                .values()
-                .filter(|s| {
-                    s.pcf_ue_sm_id == pcf_ue_sm_id
-                        && &s.s_nssai == s_nssai
-                        && s.dnn.as_deref() == Some(dnn)
-                })
-                .count();
-        }
-        0
+        // Through the poison (#344): 0 here reads as "this UE has no session on
+        // this DNN", which is the answer that lets a duplicate through.
+        read_through_poison(&self.sess_list)
+            .values()
+            .filter(|s| {
+                s.pcf_ue_sm_id == pcf_ue_sm_id
+                    && &s.s_nssai == s_nssai
+                    && s.dnn.as_deref() == Some(dnn)
+            })
+            .count()
     }
 
     // App session management
@@ -2395,9 +2405,9 @@ impl PcfContext {
         // app_add/app_remove MUST take sess_list first too — acquiring app_list
         // then sess_list here would deadlock against a concurrent sess_remove
         // (AB-BA lock inversion).
-        let mut sess_list = self.sess_list.write().ok()?;
-        let mut app_list = self.app_list.write().ok()?;
-        let mut app_session_id_hash = self.app_session_id_hash.write().ok()?;
+        let mut sess_list = write_through_poison(&self.sess_list);
+        let mut app_list = write_through_poison(&self.app_list);
+        let mut app_session_id_hash = write_through_poison(&self.app_session_id_hash);
 
         let id = self.next_app_id.fetch_add(1, Ordering::SeqCst) as u64;
         let app = PcfApp::new(id, sess_id);
@@ -2438,43 +2448,44 @@ impl PcfContext {
     }
 
     fn app_remove_all_for_sess(&self, sess_id: u64) {
-        if let Ok(mut app_list) = self.app_list.write() {
-            let app_ids: Vec<u64> = app_list
-                .values()
-                .filter(|a| a.sess_id == sess_id)
-                .map(|a| a.id)
-                .collect();
-            for id in app_ids {
-                app_list.remove(&id);
-            }
+        // Through the poison (#344): the cascade `sess_remove` (already
+        // poison-tolerant, #338) relies on. See sess_remove_all_for_ue.
+        let mut app_list = write_through_poison(&self.app_list);
+        let app_ids: Vec<u64> = app_list
+            .values()
+            .filter(|a| a.sess_id == sess_id)
+            .map(|a| a.id)
+            .collect();
+        for id in app_ids {
+            app_list.remove(&id);
         }
     }
 
     pub fn app_find_by_id(&self, id: u64) -> Option<PcfApp> {
-        let app_list = self.app_list.read().ok()?;
+        let app_list = read_through_poison(&self.app_list);
         app_list.get(&id).cloned()
     }
 
     pub fn app_find_by_app_session_id(&self, app_session_id: &str) -> Option<PcfApp> {
         // AB-BA: app_list before app_session_id_hash (canonical primary-list-first;
         // app_add/app_remove take sess_list then app_list then app_session_id_hash).
-        let app_list = self.app_list.read().ok()?;
-        let app_session_id_hash = self.app_session_id_hash.read().ok()?;
+        let app_list = read_through_poison(&self.app_list);
+        let app_session_id_hash = read_through_poison(&self.app_session_id_hash);
         app_session_id_hash
             .get(app_session_id)
             .and_then(|&id| app_list.get(&id).cloned())
     }
 
     pub fn app_update(&self, app: &PcfApp) -> bool {
-        let updated = match self.app_list.write() {
-            Ok(mut app_list) => match app_list.get_mut(&app.id) {
+        let updated = {
+            let mut app_list = write_through_poison(&self.app_list);
+            match app_list.get_mut(&app.id) {
                 Some(existing) => {
                     *existing = app.clone();
                     true
                 }
                 None => false,
-            },
-            Err(_) => false,
+            }
         };
         if updated {
             self.persist();
@@ -2482,10 +2493,21 @@ impl PcfContext {
         updated
     }
 
-    /// Get instance load percentage
+    /// NFProfile `load` gauge reported to the NRF (TS 29.510 §5.2.2.3.2).
+    ///
+    /// #344 asked whether a load gauge may report "unknown", by analogy with the
+    /// UPF's `load: 0` (#325). The question does not arise once the counts are read
+    /// through the poison: the length is knowable, so there is nothing to report as
+    /// unknown and no `Option` to plumb through the NRF profile builder.
+    ///
+    /// Note #344's own text says `sess_count()` feeds this. It does not -- this
+    /// reads `ue_am_list` and `ue_sm_list` directly -- but the defect it describes
+    /// was real at those two lines: `unwrap_or(0)` on a poisoned list made a PCF
+    /// serving live associations advertise `load: 0` to the NRF, permanently, and
+    /// an SMF doing load-aware selection would pick it every time.
     pub fn get_load(&self) -> i32 {
-        let ue_am_count = self.ue_am_list.read().map(|l| l.len()).unwrap_or(0);
-        let ue_sm_count = self.ue_sm_list.read().map(|l| l.len()).unwrap_or(0);
+        let ue_am_count = read_through_poison(&self.ue_am_list).len();
+        let ue_sm_count = read_through_poison(&self.ue_sm_list).len();
         let total = ue_am_count + ue_sm_count;
         let max = self.max_num_of_ue * 2;
         if max == 0 {
@@ -2495,19 +2517,19 @@ impl PcfContext {
     }
 
     pub fn ue_am_count(&self) -> usize {
-        self.ue_am_list.read().map(|l| l.len()).unwrap_or(0)
+        read_through_poison(&self.ue_am_list).len()
     }
 
     pub fn ue_sm_count(&self) -> usize {
-        self.ue_sm_list.read().map(|l| l.len()).unwrap_or(0)
+        read_through_poison(&self.ue_sm_list).len()
     }
 
     pub fn sess_count(&self) -> usize {
-        self.sess_list.read().map(|l| l.len()).unwrap_or(0)
+        read_through_poison(&self.sess_list).len()
     }
 
     pub fn app_count(&self) -> usize {
-        self.app_list.read().map(|l| l.len()).unwrap_or(0)
+        read_through_poison(&self.app_list).len()
     }
 }
 
@@ -2531,26 +2553,25 @@ pub fn pcf_self() -> Arc<RwLock<PcfContext>> {
 /// Initialize the global PCF context
 pub fn pcf_context_init(max_ue: usize, max_sess: usize) {
     let ctx = pcf_self();
-    if let Ok(mut context) = ctx.write() {
-        context.init(max_ue, max_sess);
-    };
+    write_through_poison(&ctx).init(max_ue, max_sess);
 }
 
 /// Finalize the global PCF context
 pub fn pcf_context_final() {
     let ctx = pcf_self();
-    if let Ok(mut context) = ctx.write() {
-        context.fini();
-    };
+    write_through_poison(&ctx).fini();
 }
 
 /// Get instance load (for NF instance load reporting)
+///
+/// Through the poison at the OUTER lock too (#344): the inner counts being honest
+/// is no use if this wrapper still answers 0 for the whole process.
 pub fn pcf_instance_get_load() -> i32 {
     let ctx = pcf_self();
-    if let Ok(context) = ctx.read() {
-        return context.get_load();
-    }
-    0
+    // Guard bound rather than used inline: a temporary in the tail expression
+    // outlives `ctx`, which the borrow checker rejects.
+    let context = read_through_poison(&ctx);
+    context.get_load()
 }
 
 #[cfg(test)]
@@ -2608,6 +2629,162 @@ mod tests {
              is how a refused UAV create leaked one session per attempt, and then every \
              later delete leaked too, until max_num_of_sess refused all creates"
         );
+    }
+
+    /// Poison one lock the way a panicking sibling does, and assert it happened.
+    ///
+    /// Always on a LOCAL `PcfContext`, never `pcf_self()`: poisoning is permanent,
+    /// so poisoning the process-global would break every sibling test in the binary
+    /// — which is how the #338 defect surfaced in the first place.
+    fn poison<T: Send + Sync>(lock: &RwLock<T>) {
+        let joined = std::thread::scope(|s| {
+            s.spawn(|| {
+                let _held = lock.write().unwrap();
+                panic!("deliberate: poison a context lock");
+            })
+            .join()
+        });
+        assert!(joined.is_err(), "the poisoning thread must have panicked");
+        assert!(lock.is_poisoned(), "precondition: the lock is poisoned");
+    }
+
+    /// #344, the lookup family: a poisoned lock must not turn a live record into a
+    /// false "not found".
+    ///
+    /// This is the read-side of #338. `.read().ok()?` returned `None`, which the
+    /// caller cannot tell from "was never there" — so an SBI handler 404s a session
+    /// that is sitting in the map, the SMF is told its association does not exist,
+    /// it deletes nothing, and the record leaks. Permanently, because poison is
+    /// permanent.
+    #[test]
+    fn a_poisoned_lock_does_not_turn_a_lookup_into_a_false_404() {
+        let mut ctx = PcfContext::new();
+        ctx.init(64, 64);
+        let ue = ctx.ue_sm_add("imsi-001010000000111").expect("ue_sm");
+        let sess = ctx.sess_add(ue.id, 3).expect("sess");
+        let policy_id = sess.sm_policy_id.clone();
+        assert!(
+            !policy_id.is_empty(),
+            "precondition: the session has a policy id"
+        );
+
+        poison(&ctx.sess_list);
+
+        let found = ctx
+            .sess_find_by_id(sess.id)
+            .expect("a poisoned list must not answer 'not found' for a live session");
+        assert_eq!(found.id, sess.id);
+        assert_eq!(
+            ctx.sess_find_by_sm_policy_id(&policy_id).map(|s| s.id),
+            Some(sess.id),
+            "the indexed lookup must resolve too: this is the one an SBI handler uses"
+        );
+        assert_eq!(
+            ctx.ue_sm_find_by_supi("imsi-001010000000111").map(|u| u.id),
+            Some(ue.id),
+            "a sibling family reading through the same poison must also resolve"
+        );
+    }
+
+    /// #344, the add family: a poisoned INDEX must not fail the create.
+    ///
+    /// `sm_policy_id_hash` is chosen because `sess_add` takes it while the caller's
+    /// preceding `ue_sm_add` does not, so the create is the first operation to meet
+    /// the poison — the mirror of the index choice in the #338 removal test.
+    #[test]
+    fn a_poisoned_index_does_not_fail_an_add() {
+        let mut ctx = PcfContext::new();
+        ctx.init(64, 64);
+        let ue = ctx.ue_sm_add("imsi-001010000000222").expect("ue_sm");
+
+        poison(&ctx.sm_policy_id_hash);
+
+        let sess = ctx
+            .sess_add(ue.id, 9)
+            .expect("a poisoned index must not fail the create");
+        assert_eq!(ctx.sess_count(), 1);
+        assert_eq!(
+            ctx.sess_find_by_sm_policy_id(&sess.sm_policy_id)
+                .map(|s| s.id),
+            Some(sess.id),
+            "the index written through the poison must still resolve"
+        );
+    }
+
+    /// #344's load question: a poisoned list must not make the PCF advertise
+    /// `load: 0` while it is serving associations.
+    ///
+    /// Same shape as the UPF's `load: 0` (#325), and the reason "may a load gauge
+    /// report unknown?" needs no answer: read through the poison and the count is
+    /// knowable, so there is nothing to report as unknown.
+    #[test]
+    fn a_poisoned_list_does_not_make_the_load_gauge_report_zero() {
+        let mut ctx = PcfContext::new();
+        ctx.init(2, 4); // max_num_of_ue = 2 -> denominator 4
+        ctx.ue_am_add("imsi-001010000000331").expect("am");
+        ctx.ue_am_add("imsi-001010000000332").expect("am");
+        assert_eq!(ctx.get_load(), 50, "precondition: 2 of 4 slots");
+
+        poison(&ctx.ue_am_list);
+
+        assert_eq!(
+            ctx.ue_am_count(),
+            2,
+            "the count must come through the poison, not answer 0"
+        );
+        assert_eq!(
+            ctx.get_load(),
+            50,
+            "a PCF serving associations must not advertise load: 0 to the NRF"
+        );
+    }
+
+    /// #344, the site the issue does not name and the worst consequence in the
+    /// file: a poisoned list must not be PERSISTED as an empty array.
+    ///
+    /// `snapshot`'s helper read each list with `.unwrap_or_default()`, so a poisoned
+    /// list serialised as `[]` and the very next `persist` wrote that over a good
+    /// snapshot. Every record in that list was then gone from disk as well as
+    /// unreadable in memory — permanent, silent data loss, and exactly what #66's
+    /// "never overwrite what you could not read" rule exists to prevent (it guarded
+    /// an unreadable FILE; nothing guarded an unreadable LIST).
+    #[test]
+    fn a_poisoned_list_is_not_persisted_as_an_empty_snapshot() {
+        let path = temp_state_path("poisoned-snapshot");
+        let ctx = ctx_with_state(&path);
+        let ue_sm = ctx.ue_sm_add("imsi-001010000000441").expect("sm");
+        let sess = ctx.sess_add(ue_sm.id, 4).expect("sess");
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        assert_eq!(
+            doc["sessions"].as_array().map(Vec::len),
+            Some(1),
+            "precondition: the session reached the snapshot"
+        );
+
+        poison(&ctx.sess_list);
+
+        // Any later mutation re-persists. This one does not touch sess_list at all,
+        // so before the fix the session was collateral damage of an unrelated write.
+        ctx.ue_am_add("imsi-001010000000442").expect("am");
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read")).expect("json");
+        let sessions = doc["sessions"]
+            .as_array()
+            .expect("sessions must still be an array");
+        assert_eq!(
+            sessions.len(),
+            1,
+            "a poisoned list must not be written out as empty: {doc}"
+        );
+        assert_eq!(
+            sessions[0]["id"].as_u64(),
+            Some(sess.id),
+            "and it must be the same session"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
