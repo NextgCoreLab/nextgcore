@@ -1136,11 +1136,60 @@ pub fn nssf_context_init_with_state(state_path: Option<PathBuf>) -> bool {
 }
 
 /// Initialize the global NSSF context
+///
+/// LATCHES: [`NssfContext::init`] returns early once `initialized` is set, and
+/// it clears nothing even on the first call — it only records `max_num_of_nf`.
+/// So calling this a second time is a no-op, and it can never be used to give a
+/// caller a fresh context. Production wants exactly that (the restore at
+/// [`nssf_context_init_with_state`] runs first and must survive this call);
+/// tests that need isolation must use [`nssf_test_guard`].
 pub fn nssf_context_init(max_nf: usize) {
     let ctx = nssf_self();
     if let Ok(mut context) = ctx.write() {
         context.init(max_nf);
     };
+}
+
+/// The ONE lock over the process-global NSSF context.
+///
+/// Declared here, beside the global it guards, so every module's tests take the
+/// same one. #346: nssfd had three guards over this single global — a
+/// `NSSF_TEST_LOCK` private to `main`'s test module, an `availability_state_guard`
+/// tokio mutex next to it, and nothing at all in `nnssf_handler`, whose
+/// `setup_context` mutated the global from seven tests. Guards that do not order
+/// against each other do not serialise anything: a test holding one ran
+/// concurrently with a test holding the other, which is how CI saw
+/// `test_nsselection_ue_cu_no_requested_nssai_no_allowed_list` lose its
+/// `configuredNssai` to a sibling's availability document.
+///
+/// Poison-tolerant at every acquisition site, so one failing test does not turn
+/// its siblings into misleading second failures.
+#[cfg(test)]
+pub(crate) static NSSF_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serialise on [`NSSF_TEST_LOCK`] and hand the caller a context it fully owns.
+///
+/// Returns the guard, so the caller holds it for the rest of the test:
+/// `let _guard = context::nssf_test_guard(512);`.
+///
+/// A lock alone was never enough here. It orders access; it does not reset
+/// state, and `nssf_context_init` resets nothing either, so before #346 no
+/// nssfd test started from a known context — whichever test ran first decided
+/// what every later one read. This replaces the global's contents outright
+/// rather than clearing field by field, so a field added later cannot be
+/// forgotten here.
+#[cfg(test)]
+pub(crate) fn nssf_test_guard(max_nf: usize) -> std::sync::MutexGuard<'static, ()> {
+    let guard = NSSF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let ctx = nssf_self();
+    if let Ok(mut context) = ctx.write() {
+        // `NssfContext::new()` and not `mem::take`/`fini`: `fini` clears only the
+        // NSI and home tables, leaving availability, subscriptions, the target
+        // AMF set and the PLMN restriction behind — the four that actually leaked.
+        *context = NssfContext::new();
+        context.init(max_nf);
+    }
+    guard
 }
 
 /// Finalize the global NSSF context
