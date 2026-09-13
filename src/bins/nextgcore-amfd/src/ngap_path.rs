@@ -1988,13 +1988,9 @@ impl NgapServer {
                 .and_then(|s| s.amf_ue.supi.clone())
                 .is_some()
                 || req.suci.is_some();
-            // The handler is keyed by a u32; the AMF UE NGAP ID is 40 bits on the wire
-            // (TS 38.413), so the truncation is recorded rather than hidden. It is safe
-            // here because the key only has to be unique among CONCURRENT emergency
-            // registrations, and #353 tracks widening it.
             let ctx = self
                 .emergency
-                .handle_emergency_registration(amf_ue_ngap_id as u32, has_supi);
+                .handle_emergency_registration(amf_ue_ngap_id, has_supi);
             log::warn!(
                 "EMERGENCY registration from UE {amf_ue_ngap_id}: authenticated={}, \
                  reg_type={:?}, emergency DNN '{}' (TS 24.501 §5.5.1.2, TS 23.167)",

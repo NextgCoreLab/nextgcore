@@ -133,8 +133,15 @@ impl EmergencyContext {
 pub struct EmergencyHandler {
     /// Emergency number list per PLMN
     emergency_numbers: HashMap<[u8; 3], Vec<EmergencyNumber>>,
-    /// Active emergency contexts (keyed by AMF UE NGAP ID)
-    active_contexts: HashMap<u32, EmergencyContext>,
+    /// Active emergency contexts, keyed by AMF UE NGAP ID.
+    ///
+    /// `u64`, not `u32`: the AMF UE NGAP ID is `INTEGER (0..2^40-1)` on the wire
+    /// (TS 38.413 §9.3.3.1) and the rest of amfd carries it as `u64`. A `u32` key
+    /// truncated the top 8 bits, so two UEs whose ids differed only above bit 32
+    /// shared one entry -- the second overwriting the first's authentication state
+    /// and assigned PDU session, and either one's release freeing the other's
+    /// context (#353).
+    active_contexts: HashMap<u64, EmergencyContext>,
     /// Emergency DNN name
     emergency_dnn: String,
     /// IMS P-CSCF address for emergency
@@ -179,7 +186,7 @@ impl EmergencyHandler {
     /// Handles emergency registration
     pub fn handle_emergency_registration(
         &mut self,
-        amf_ue_ngap_id: u32,
+        amf_ue_ngap_id: u64,
         has_supi: bool,
     ) -> EmergencyContext {
         self.emergency_count += 1;
@@ -195,7 +202,7 @@ impl EmergencyHandler {
     }
 
     /// Assigns an emergency PDU session
-    pub fn assign_emergency_pdu_session(&mut self, amf_ue_ngap_id: u32, psi: u8) -> bool {
+    pub fn assign_emergency_pdu_session(&mut self, amf_ue_ngap_id: u64, psi: u8) -> bool {
         if let Some(ctx) = self.active_contexts.get_mut(&amf_ue_ngap_id) {
             ctx.pdu_session_id = Some(psi);
             true
@@ -220,8 +227,18 @@ impl EmergencyHandler {
     }
 
     /// Releases an emergency context
-    pub fn release_emergency(&mut self, amf_ue_ngap_id: u32) -> bool {
+    pub fn release_emergency(&mut self, amf_ue_ngap_id: u64) -> bool {
         self.active_contexts.remove(&amf_ue_ngap_id).is_some()
+    }
+
+    /// The emergency context recorded for `amf_ue_ngap_id`, if any.
+    ///
+    /// Companion to [`Self::active_count`]: without it the stored context is
+    /// write-only — `assign_emergency_pdu_session` records a PDU session id that
+    /// nothing could read back, so a context silently replaced by a colliding key
+    /// was undetectable from outside this type.
+    pub fn emergency_context(&self, amf_ue_ngap_id: u64) -> Option<&EmergencyContext> {
+        self.active_contexts.get(&amf_ue_ngap_id)
     }
 
     /// Returns active emergency session count
@@ -338,5 +355,62 @@ mod tests {
     fn test_emergency_dnn() {
         let handler = EmergencyHandler::new();
         assert_eq!(handler.emergency_dnn(), "sos");
+    }
+
+    /// #353: two UEs whose AMF UE NGAP IDs differ ONLY above bit 32 keep separate
+    /// emergency contexts.
+    ///
+    /// The AMF UE NGAP ID is `INTEGER (0..2^40-1)` (TS 38.413 §9.3.3.1). `1` and
+    /// `1 + (1 << 32)` are both legal ids and are chosen because they are
+    /// indistinguishable under the old `u32` key: `(1 + (1 << 32)) as u32 == 1`. So
+    /// every assertion below is reachable only if the key really is 40-bit-wide.
+    ///
+    /// Content, not just count: the two UEs are registered with OPPOSITE `has_supi`
+    /// and given DIFFERENT PDU sessions, so an overwrite is visible as the wrong
+    /// authentication state rather than only as a smaller `active_count`.
+    #[test]
+    fn ids_differing_above_bit_32_keep_separate_emergency_contexts() {
+        let low = 1u64;
+        let high = 1u64 + (1u64 << 32);
+        assert_eq!(low as u32, high as u32, "the fixture must actually collide");
+
+        let mut handler = EmergencyHandler::new();
+        handler.handle_emergency_registration(low, false);
+        handler.handle_emergency_registration(high, true);
+
+        assert_eq!(
+            handler.active_count(),
+            2,
+            "each UE needs its own emergency context; a truncating key merges them"
+        );
+        assert!(handler.assign_emergency_pdu_session(low, 5));
+        assert!(handler.assign_emergency_pdu_session(high, 6));
+
+        let low_ctx = handler
+            .emergency_context(low)
+            .expect("the low id must still have its own context");
+        assert!(
+            !low_ctx.authenticated,
+            "the low UE registered without a SUPI and must not inherit the high UE's \
+             authenticated state"
+        );
+        assert_eq!(low_ctx.pdu_session_id, Some(5));
+
+        let high_ctx = handler
+            .emergency_context(high)
+            .expect("the high id must have a context of its own, not the low id's");
+        assert!(high_ctx.authenticated);
+        assert_eq!(high_ctx.pdu_session_id, Some(6));
+
+        // Releasing one must not free the other. On the old key the first release
+        // removed the single shared entry, so this second one returned false and the
+        // surviving UE was left believing it still held an emergency context.
+        assert!(handler.release_emergency(low));
+        assert_eq!(handler.active_count(), 1);
+        assert!(
+            handler.release_emergency(high),
+            "the high UE's context must survive the low UE's release"
+        );
+        assert_eq!(handler.active_count(), 0);
     }
 }
