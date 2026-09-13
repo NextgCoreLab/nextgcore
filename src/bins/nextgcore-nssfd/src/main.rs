@@ -1029,9 +1029,16 @@ fn handle_ns_selection_registration(
         // finds nothing rather than as a bad response. Absent is checkable by the
         // consumer; a plausible wrong value is acted on with full confidence.
         let target_amf_set = context.get_target_amf_set();
+        // #346: `Some` only when a restriction is actually configured --
+        // `plmn_supported_snssais()` returns an empty vec for both "no
+        // restriction" and "restricted to {}", and those are opposite answers.
+        let plmn_snssai_restriction = context
+            .has_plmn_snssai_restriction()
+            .then(|| context.plmn_supported_snssais());
         nnssf_handler::RegistrationContextSnapshot {
             supported_for_tai,
             per_nf_support: context.per_nf_supported_snssais(),
+            plmn_snssai_restriction,
             nsi_info: context
                 .nsi_get_all()
                 .iter()
@@ -3126,22 +3133,17 @@ async fn run_event_loop_async(
 
 #[cfg(test)]
 mod tests {
-    /// Process-wide lock for tests that re-initialise the process-global NSSF
-    /// context.
-    ///
-    /// `nssf_context_init` WIPES that context, and 27 tests in this file call it.
-    /// Cargo runs them concurrently in one process, so one test's init landed
-    /// between another's init and its assertion — the second then computed its
-    /// answer from an empty context. That is how CI saw
-    /// `test_nsselection_ue_cu_no_requested_nssai_no_allowed_list` fail with
-    /// "must include configuredNssai derived from subscribedNssai" while the same
-    /// run's retry failed two DIFFERENT tests instead: different symptoms, one
-    /// cause. Before this, nssfd had no test guard of any kind.
-    ///
-    /// Poison-tolerant, so one failing test does not turn its siblings into
-    /// misleading second failures.
-    static NSSF_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    //! The single guard over the process-global NSSF context is
+    //! [`context::nssf_test_guard`], declared beside the global in `context.rs`
+    //! so `nnssf_handler`'s tests take the same one. Every test here that reads
+    //! or writes that global — including the ones that only read it through a
+    //! handler — starts with `let _guard = context::nssf_test_guard(512);`.
+    //!
+    //! #346 replaced three guards with that one. The claim the old comment made
+    //! here, that `nssf_context_init` "WIPES that context", was false: it latches
+    //! on `initialized` and clears nothing, so the per-test `nssf_context_init(512)`
+    //! was a no-op after the first test in the process and no test ever started
+    //! from a known context. The guard resets it.
     use super::*;
     use nextgcore_sbi::client::SbiClient;
     use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
@@ -3235,20 +3237,7 @@ mod tests {
         out
     }
 
-    /// Serializes tests that mutate the *global* NSSF availability/restriction
-    /// state (the context is a process-wide singleton). Without this, the
-    /// PLMN-supported restriction one test installs could leak into another
-    /// running concurrently and flip an expected 200 into a 403 (or vice
-    /// versa). An async-aware `tokio::sync::Mutex` is used so the guard may be
-    /// held across the handler `.await` points (clippy `await_holding_lock`),
-    /// and it does not poison on a failing test.
-    async fn availability_state_guard() -> tokio::sync::MutexGuard<'static, ()> {
-        static GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-        GUARD.lock().await
-    }
-
     async fn start_nssf_server() -> (SbiServer, u16) {
-        nssf_context_init(512);
         let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let port = port_addr.port();
         let server = SbiServer::on_listener(
@@ -3306,7 +3295,6 @@ mod tests {
     /// Start an NSSF SBI server with OAuth2 enforcement keyed to a static JWKS
     /// and the NSSF audience.
     async fn start_nssf_server_oauth2(jwks: serde_json::Value) -> (SbiServer, u16) {
-        nssf_context_init(512);
         let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let port = port_addr.port();
         let mut cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
@@ -3351,6 +3339,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_oauth2_missing_token_rejected() {
+        let _guard = context::nssf_test_guard(512);
         let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
         let (server, port) = start_nssf_server_oauth2(jwks_for(&sk, "nrf-es256")).await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
@@ -3370,6 +3359,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_oauth2_valid_token_accepted() {
+        let _guard = context::nssf_test_guard(512);
         let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
         let (server, port) = start_nssf_server_oauth2(jwks_for(&sk, "nrf-es256")).await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
@@ -3393,6 +3383,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_oauth2_wrong_audience_rejected() {
+        let _guard = context::nssf_test_guard(512);
         let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
         let (server, port) = start_nssf_server_oauth2(jwks_for(&sk, "nrf-es256")).await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
@@ -3420,7 +3411,7 @@ mod tests {
         // an unwrap panic here rather than as anything pointing at the sibling.
         // Taking the guard those tests ALREADY take is the fix; a private lock
         // would not order them.
-        let _state_guard = availability_state_guard().await;
+        let _guard = context::nssf_test_guard(512);
         with_nssf_context(|c| c.set_plmn_supported_snssais(None));
         let (server, port) = start_nssf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
@@ -3462,6 +3453,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_nsselection_missing_mandatory_params() {
+        let _guard = context::nssf_test_guard(512);
         let (server, port) = start_nssf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
 
@@ -3513,7 +3505,7 @@ mod tests {
         // Serialize against the nssfd-01 restriction tests and clear any
         // restriction so this lifecycle PUT/PATCH path sees the default
         // allow-all (matched-sim back-compat).
-        let _state_guard = availability_state_guard().await;
+        let _guard = context::nssf_test_guard(512);
         // #94: this drives a REAL HTTP client against a real SbiServer with no
         // OAuth2 configured, so there is no attested caller identity for the
         // server to bind to — which is precisely the deployment the documented
@@ -3773,9 +3765,7 @@ mod tests {
     /// 403 SNSSAI_NOT_SUPPORTED; nothing stored, no notification spawned.
     #[tokio::test]
     async fn test_availability_put_unsupported_snssai_403() {
-        let _guard = NSSF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _state_guard = availability_state_guard().await;
-        nssf_context_init(512);
+        let _guard = context::nssf_test_guard(512);
         // Restrict the PLMN to sst=1 only; the PUT reports sst=2 (outside it).
         with_nssf_context(|c| {
             c.set_plmn_supported_snssais(Some(vec![context::SNssai::new(1, None)]))
@@ -3810,9 +3800,7 @@ mod tests {
     /// (b) PUT with an empty NF Id -> 403 NOT_AUTHORIZED.
     #[tokio::test]
     async fn test_availability_put_empty_nf_id_403_not_authorized() {
-        let _guard = NSSF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _state_guard = availability_state_guard().await;
-        nssf_context_init(512);
+        let _guard = context::nssf_test_guard(512);
         with_nssf_context(|c| c.set_plmn_supported_snssais(None)); // no restriction
 
         let body = json!({
@@ -3841,9 +3829,7 @@ mod tests {
     /// -> 200 and stored.
     #[tokio::test]
     async fn test_availability_put_all_supported_200_stored() {
-        let _guard = NSSF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _state_guard = availability_state_guard().await;
-        nssf_context_init(512);
+        let _guard = context::nssf_test_guard(512);
         with_nssf_context(|c| c.set_plmn_supported_snssais(None)); // default allow-all
 
         let nf_id = "amf-nssfd01-ok";
@@ -3873,9 +3859,7 @@ mod tests {
     /// unchanged.
     #[tokio::test]
     async fn test_availability_patch_unsupported_snssai_403_original_unchanged() {
-        let _guard = NSSF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _state_guard = availability_state_guard().await;
-        nssf_context_init(512);
+        let _guard = context::nssf_test_guard(512);
         // Restrict to sst=1: the initial PUT (sst=1) is accepted; the PATCH
         // that appends sst=2 must be rejected and leave the stored doc intact.
         with_nssf_context(|c| {
@@ -3949,9 +3933,7 @@ mod tests {
     /// includes restrictedSnssaiList containing the expected RestrictedSnssai.
     #[tokio::test]
     async fn test_availability_authorized_response_restricted_snssai_list() {
-        let _guard = NSSF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _guard = availability_state_guard().await;
-        nssf_context_init(512);
+        let _guard = context::nssf_test_guard(512);
         with_nssf_context(|c| {
             c.set_plmn_snssai_restrictions(
                 &context::PlmnId::new("001", "01"),
@@ -4000,9 +3982,7 @@ mod tests {
     /// supportedSnssaiList equals the input (back-compat).
     #[tokio::test]
     async fn test_availability_authorized_response_no_restriction_no_restricted_list() {
-        let _guard = NSSF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _guard = availability_state_guard().await;
-        nssf_context_init(512);
+        let _guard = context::nssf_test_guard(512);
         with_nssf_context(|c| c.clear_plmn_snssai_restrictions());
 
         let doc = serde_json::json!({
@@ -4035,8 +4015,7 @@ mod tests {
     /// authorized_availability_response returns 204 when no entries remain.
     #[test]
     fn test_availability_authorized_response_empty_entries_is_204() {
-        let _guard = NSSF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        nssf_context_init(512);
+        let _guard = context::nssf_test_guard(512);
         let doc = serde_json::json!({"supportedNssaiAvailabilityData": []});
         let resp = authorized_availability_response(&doc);
         assert_eq!(
@@ -4050,9 +4029,7 @@ mod tests {
     /// authorized_availability_response returns 200 when entries are present.
     #[tokio::test]
     async fn test_availability_authorized_response_nonempty_is_200() {
-        let _guard = NSSF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _guard = availability_state_guard().await;
-        nssf_context_init(512);
+        let _guard = context::nssf_test_guard(512);
         with_nssf_context(|c| c.clear_plmn_snssai_restrictions());
         let doc = serde_json::json!({
             "supportedNssaiAvailabilityData": [{
@@ -4074,9 +4051,7 @@ mod tests {
     /// → response allowedSnssaiList contains only A.
     #[tokio::test]
     async fn test_pdu_nsselection_allowed_narrowed_to_requested_snssai() {
-        let _guard = NSSF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _state_guard = availability_state_guard().await;
-        nssf_context_init(512);
+        let _guard = context::nssf_test_guard(512);
         // Configure three NSIs so the old all-NSIs path would have returned 3.
         with_nssf_context(|c| {
             c.nsi_add("http://nrf.example.com", 1, None);
@@ -4134,8 +4109,7 @@ mod tests {
     /// is stored for the test nfId).
     #[tokio::test]
     async fn test_availability_patch_wrong_content_type_415() {
-        let _guard = NSSF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        nssf_context_init(512);
+        let _guard = context::nssf_test_guard(512);
 
         let wrong_ct_req =
             SbiRequest::patch("/nnssf-nssaiavailability/v1/nssai-availability/amf-ct-test")
@@ -4176,8 +4150,7 @@ mod tests {
     /// allowedNssaiList (TS 29.531 §5.2.2.2.4).
     #[test]
     fn test_nsselection_ue_cu_no_requested_nssai_no_allowed_list() {
-        let _guard = NSSF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        nssf_context_init(512);
+        let _guard = context::nssf_test_guard(512);
         let info_json = serde_json::json!({
             "subscribedNssai": [
                 {"subscribedSnssai": {"sst": 1}, "defaultIndication": true}
@@ -4198,12 +4171,172 @@ mod tests {
         );
     }
 
+    /// #346, the conformance half: ONE AMF's availability document must not erase
+    /// a subscribed S-NSSAI from the UE's Configured NSSAI.
+    ///
+    /// This is the CI failure made deterministic. `configuredNssai` used to be
+    /// filtered by the union of every registered availability document, so the
+    /// state installed below -- a single AMF reporting a slice this UE is not
+    /// subscribed to -- emptied it and
+    /// `test_nsselection_ue_cu_no_requested_nssai_no_allowed_list` failed with
+    /// "must include configuredNssai derived from subscribedNssai". On CI that
+    /// state arrived from a sibling test; in a deployment it arrives from any AMF
+    /// that registers a partial picture, and the UE then stores the truncated
+    /// Configured NSSAI in non-volatile memory (TS 24.501 Annex C.1).
+    ///
+    /// Asserts the availability state directly, not just the response, so a
+    /// future change that stops installing the state cannot make this pass by
+    /// never reaching the condition.
+    #[test]
+    fn a_foreign_amf_availability_report_does_not_erase_configured_nssai() {
+        let _guard = context::nssf_test_guard(512);
+        let foreign_doc = serde_json::json!({
+            "supportedNssaiAvailabilityData": [{
+                "tai": {"plmnId": {"mcc": "999", "mnc": "70"}, "tac": "0000c8"},
+                "supportedSnssaiList": [{"sst": 41}]
+            }]
+        });
+        with_nssf_context(|c| {
+            c.set_nssai_availability(
+                "amf-foreign",
+                context::availability_info_from_doc("amf-foreign", foreign_doc),
+            )
+        })
+        .expect("context available");
+
+        // The precondition, asserted rather than assumed: availability data
+        // exists and does NOT cover sst 1.
+        let per_nf =
+            with_nssf_context(|c| c.per_nf_supported_snssais()).expect("context available");
+        assert!(
+            with_nssf_context(|c| c.has_availability_data()).expect("context available"),
+            "precondition: an AMF must have registered availability"
+        );
+        assert!(
+            !per_nf
+                .iter()
+                .any(|(_, list)| list.contains(&context::SNssai::new(1, None))),
+            "precondition: no registered document may cover sst 1, else this proves nothing"
+        );
+        // And no PLMN restriction is configured, so every subscribed slice is
+        // applicable (TS 29.531 §6.2.3.2.3.1 default-allow).
+        assert!(
+            !with_nssf_context(|c| c.has_plmn_snssai_restriction()).expect("context available"),
+            "precondition: no configured PLMN restriction"
+        );
+
+        let info_json = serde_json::json!({
+            "subscribedNssai": [
+                {"subscribedSnssai": {"sst": 1}, "defaultIndication": true}
+            ]
+        });
+        let resp = handle_ns_selection_ue_cu("nf-ue-cu-346", &info_json, None);
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let configured = body["configuredNssai"]
+            .as_array()
+            .expect("configuredNssai must survive a foreign AMF's availability document");
+        assert_eq!(
+            configured.len(),
+            1,
+            "the subscription is one slice, so is the Configured NSSAI: {body}"
+        );
+        assert_eq!(configured[0]["configuredSnssai"]["sst"], 1);
+    }
+
+    /// #346, the conformance half again: a CONFIGURED PLMN restriction DOES filter
+    /// the Configured NSSAI, so the fix above is a change of source and not the
+    /// removal of a filter.
+    #[test]
+    fn a_configured_plmn_restriction_still_filters_configured_nssai() {
+        let _guard = context::nssf_test_guard(512);
+        with_nssf_context(|c| {
+            c.set_plmn_supported_snssais(Some(vec![context::SNssai::new(2, None)]))
+        })
+        .expect("context available");
+
+        let info_json = serde_json::json!({
+            "subscribedNssai": [
+                {"subscribedSnssai": {"sst": 1}, "defaultIndication": true},
+                {"subscribedSnssai": {"sst": 2}}
+            ]
+        });
+        let resp = handle_ns_selection_ue_cu("nf-ue-cu-346b", &info_json, None);
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let configured = body["configuredNssai"].as_array().expect("configuredNssai");
+        assert_eq!(
+            configured.len(),
+            1,
+            "sst 1 is subscribed but not configured in this PLMN: {body}"
+        );
+        assert_eq!(configured[0]["configuredSnssai"]["sst"], 2);
+    }
+
+    /// #346, the isolation half: the guard hands over a context no sibling can
+    /// have touched.
+    ///
+    /// Every field a test can leave behind is dirtied first, so this fails if the
+    /// reset misses one -- which the old `nssf_context_init(512)` did for all of
+    /// them, latching on `initialized` and clearing nothing.
+    #[test]
+    fn the_test_guard_resets_every_field_a_sibling_could_leave_behind() {
+        {
+            let _dirty = context::nssf_test_guard(512);
+            with_nssf_context(|c| {
+                c.set_nssai_availability(
+                    "amf-dirty",
+                    context::availability_info_from_doc(
+                        "amf-dirty",
+                        serde_json::json!({
+                            "supportedNssaiAvailabilityData": [{
+                                "tai": {"plmnId": {"mcc": "999", "mnc": "70"}, "tac": "0000c8"},
+                                "supportedSnssaiList": [{"sst": 41}]
+                            }]
+                        }),
+                    ),
+                );
+                c.set_target_amf_set("999-70-01-001");
+                c.set_plmn_supported_snssais(Some(vec![context::SNssai::new(9, None)]));
+                c.nsi_add("http://nrf.example.com", 7, None);
+            })
+            .expect("context available");
+            // The dirt is really installed: without this the assertions below
+            // would pass on an already-clean context and prove nothing.
+            assert!(
+                with_nssf_context(|c| c.has_availability_data() && c.nsi_count() == 1)
+                    .expect("context available"),
+                "precondition: the sibling state must be installed"
+            );
+        }
+
+        let _guard = context::nssf_test_guard(512);
+        with_nssf_context(|c| {
+            assert!(!c.has_availability_data(), "availability leaked");
+            assert_eq!(c.nsi_count(), 0, "NSI table leaked");
+            assert_eq!(c.get_target_amf_set(), None, "target AMF set leaked");
+            assert!(
+                !c.has_plmn_snssai_restriction(),
+                "PLMN S-NSSAI restriction leaked"
+            );
+            // Initialised with the max_nf asked for, or every nsi_add refuses --
+            // which is how a "0 installed" assertion passes for the wrong reason.
+            assert!(c.is_initialized(), "context must be initialised");
+            assert!(
+                c.nsi_add("http://nrf.example.com", 1, None).is_some(),
+                "max_num_of_nf must be applied, not left at 0"
+            );
+        })
+        .expect("context available");
+    }
+
     /// UE-CU with requestedNssai → full response including allowedNssaiList
     /// (same as registration scenario).
     #[test]
     fn test_nsselection_ue_cu_with_requested_nssai_includes_allowed_list() {
-        let _guard = NSSF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        nssf_context_init(512);
+        let _guard = context::nssf_test_guard(512);
         let info_json = serde_json::json!({
             "subscribedNssai": [
                 {"subscribedSnssai": {"sst": 1}, "defaultIndication": true}
@@ -4229,9 +4362,7 @@ mod tests {
     /// includes targetAmfSet even when no candidateAmfList is produced.
     #[tokio::test]
     async fn test_registration_success_includes_target_amf_set_when_configured() {
-        let _guard = NSSF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _guard = availability_state_guard().await;
-        nssf_context_init(512);
+        let _guard = context::nssf_test_guard(512);
         with_nssf_context(|c| c.set_target_amf_set("001-01-01-001"));
 
         let info_json = serde_json::json!({
@@ -4260,9 +4391,7 @@ mod tests {
     /// is absent from the registration response.
     #[tokio::test]
     async fn test_registration_success_no_target_amf_set_when_not_configured() {
-        let _guard = NSSF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _guard = availability_state_guard().await;
-        nssf_context_init(512);
+        let _guard = context::nssf_test_guard(512);
         with_nssf_context(|c| c.clear_target_amf_set());
 
         let info_json = serde_json::json!({
@@ -4293,13 +4422,12 @@ mod tests {
     /// YAML shape rather than a hand-built struct, so a schema drift breaks it.
     #[test]
     fn shipped_nsi_config_block_is_deserialised_and_installed() {
-        let _guard = NSSF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = context::nssf_test_guard(64);
         // The global NSSF context defaults to max_num_of_nf = 0, so `nsi_add`
         // refuses EVERY insert until `init` runs. Without this the assertions
         // below pass for the wrong reason -- the revert-verify pass caught
         // exactly that: a deliberately-broken loader still "installed 0".
         // Idempotent, so it is safe under the shared process-global context.
-        context::nssf_context_init(64);
 
         // Exactly the shape docker/rust/configs/5gc/nssf.yaml ships.
         let yaml = r#"
@@ -4349,13 +4477,12 @@ nssf:
     /// An `nsi` entry with no `s_nssai` is skipped, not defaulted to SST 0.
     #[test]
     fn nsi_entry_without_snssai_is_skipped_rather_than_defaulted() {
-        let _guard = NSSF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = context::nssf_test_guard(64);
         // The global NSSF context defaults to max_num_of_nf = 0, so `nsi_add`
         // refuses EVERY insert until `init` runs. Without this the assertions
         // below pass for the wrong reason -- the revert-verify pass caught
         // exactly that: a deliberately-broken loader still "installed 0".
         // Idempotent, so it is safe under the shared process-global context.
-        context::nssf_context_init(64);
 
         let yaml = r#"
 nssf:
@@ -4393,13 +4520,12 @@ nssf:
     /// this test evidence about the shipped daemon rather than about the store.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pdu_session_selection_succeeds_for_a_configured_nsi() {
-        let _guard = NSSF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = context::nssf_test_guard(64);
         // The global NSSF context defaults to max_num_of_nf = 0, so `nsi_add`
         // refuses EVERY insert until `init` runs. Without this the assertions
         // below pass for the wrong reason -- the revert-verify pass caught
         // exactly that: a deliberately-broken loader still "installed 0".
         // Idempotent, so it is safe under the shared process-global context.
-        context::nssf_context_init(64);
 
         let yaml = r#"
 nssf:
@@ -4485,6 +4611,7 @@ nssf:
     /// configured — never the 400 it used to fall through to.
     #[test]
     fn pdn_connection_scenario_is_routed_and_maps_configured_snssais() {
+        let _guard = context::nssf_test_guard(512);
         // No mapping configured: the spec's own answer is 403, per §5.2.2.2.5
         // step 2b. The old behaviour was 400 MANDATORY_QUERY_PARAM_MISSING, which
         // accused the consumer of omitting a parameter it had just supplied.
@@ -4530,13 +4657,12 @@ nssf:
     /// S-NSSAIs from the configured NSI table, and 403 when none resolves.
     #[test]
     fn other_purpose_scenario_is_routed_and_returns_nsi_ids() {
-        let _guard = NSSF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = context::nssf_test_guard(64);
         // The global NSSF context defaults to max_num_of_nf = 0, so `nsi_add`
         // refuses EVERY insert until `init` runs. Without this the assertions
         // below pass for the wrong reason -- the revert-verify pass caught
         // exactly that: a deliberately-broken loader still "installed 0".
         // Idempotent, so it is safe under the shared process-global context.
-        context::nssf_context_init(64);
 
         let yaml = r#"
 nssf:
@@ -4786,10 +4912,8 @@ nssf:
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)]
     async fn availability_write_requires_the_caller_to_own_the_document() {
-        let _guard = NSSF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _state_guard = availability_state_guard().await;
+        let _guard = context::nssf_test_guard(512);
         let _posture = with_authz_posture(true);
-        nssf_context_init(512);
 
         let owner = "amf-owner-94";
         let intruder = "amf-intruder-94";
@@ -4866,10 +4990,8 @@ nssf:
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)]
     async fn availability_patch_and_delete_are_bound_to_the_owner() {
-        let _guard = NSSF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _state_guard = availability_state_guard().await;
+        let _guard = context::nssf_test_guard(512);
         let _posture = with_authz_posture(true);
-        nssf_context_init(512);
 
         let owner = "amf-owner-94b";
         let body = json!({
@@ -4947,8 +5069,7 @@ nssf:
     /// matching, and the sweep removes it.
     #[test]
     fn subscription_expiry_is_assigned_enforced_and_swept() {
-        let _guard = NSSF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        nssf_context_init(512);
+        let _guard = context::nssf_test_guard(512);
         let created = subscription_from_json(
             "sub-94-expiry",
             &json!({
@@ -5040,8 +5161,7 @@ nssf:
     /// #94 criterion 5: `taiList` is optional, and `acceptedEvents` is returned.
     #[test]
     fn subscription_create_treats_tai_list_as_optional_and_returns_accepted_events() {
-        let _guard = NSSF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        nssf_context_init(512);
+        let _guard = context::nssf_test_guard(512);
 
         // Only the two members the schema marks required.
         let sub = subscription_from_json(
@@ -5118,9 +5238,7 @@ nssf:
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[allow(clippy::await_holding_lock)]
     async fn configured_restrictions_round_trip_under_the_conformant_key() {
-        let _guard = NSSF_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _state_guard = availability_state_guard().await;
-        nssf_context_init(512);
+        let _guard = context::nssf_test_guard(512);
         with_nssf_context(|c| c.clear_plmn_snssai_restrictions());
 
         // Loaded from YAML through the production config path -- before #94

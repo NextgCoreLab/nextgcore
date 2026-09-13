@@ -298,6 +298,12 @@ pub struct RegistrationContextSnapshot {
     pub nsi_info: Vec<(SNssai, String, String)>,
     /// Configured target AMF set (used when re-selection is needed)
     pub target_amf_set: Option<String>,
+    /// The explicitly CONFIGURED set of S-NSSAIs supported in this PLMN
+    /// (TS 29.531 §6.2.3.2.3.1). `None` = no restriction configured, so every
+    /// subscribed S-NSSAI is applicable in the PLMN. This is the authoritative
+    /// answer to "supported in the serving PLMN"; `per_nf_support` is not (see
+    /// the `configuredNssai` derivation below).
+    pub plmn_snssai_restriction: Option<Vec<SNssai>>,
 }
 
 /// Result of registration-scenario slice authorization
@@ -318,7 +324,9 @@ pub struct RegistrationSelection {
 /// - allowed = requested NSSAIs restricted to the subscription and to the
 ///   S-NSSAIs available in the UE's TA; when the AMF sends no requestedNssai
 ///   the default subscribed S-NSSAIs are used.
-/// - configured = subscribed S-NSSAIs supported in the serving PLMN.
+/// - configured = subscribed S-NSSAIs applicable in the serving PLMN, i.e.
+///   restricted by the CONFIGURED PLMN S-NSSAI set when one exists (#346), never
+///   by what individual AMFs happen to have reported as available.
 /// - requested-but-unsubscribed -> rejectedNssaiInPlmn;
 ///   subscribed-but-unavailable-in-TA -> rejectedNssaiInTa.
 /// - If the requesting AMF (nf-id) reported availability that cannot serve
@@ -389,27 +397,32 @@ pub fn nssf_nsselection_handle_registration(
         sel.allowed.push((s.clone(), nsi, mapped(s)));
     }
 
-    // configuredNssai: subscribed S-NSSAIs supported somewhere in the serving
-    // PLMN (when availability data exists), else the full subscription.
-    let plmn_supported: Vec<SNssai> = {
-        let mut acc: Vec<SNssai> = Vec::new();
-        for (_, list) in &snapshot.per_nf_support {
-            for s in list {
-                if !acc.contains(s) {
-                    acc.push(s.clone());
-                }
-            }
-        }
-        acc
-    };
+    // configuredNssai: the subscribed S-NSSAIs applicable in the serving PLMN
+    // (TS 23.501 §5.15.4.1, returned per TS 29.531 §5.2.2.2.4).
+    //
+    // #346: filtered by the CONFIGURED PLMN S-NSSAI set, not by the union of the
+    // NSSAI-availability documents AMFs have registered. Each of those describes
+    // ONE AMF's slice picture, which is why `per_nf_support` is the right input
+    // for the AMF re-selection immediately below and only there. A slice absent
+    // from every registered document has not been shown unsupported by the PLMN,
+    // only unreported -- registering availability is per-AMF and optional -- so
+    // reading absence as "not supported in the PLMN" silently dropped subscribed
+    // slices from the UE's Configured NSSAI the moment any single AMF registered a
+    // partial picture. The UE stores the Configured NSSAI in non-volatile memory
+    // (TS 24.501 Annex C.1), so that consequence outlives the report that caused
+    // it. It is also what made a passing nssfd suite order-dependent: a sibling
+    // test's availability document decided this member.
     let configured_src: Vec<SNssai> = if subscribed.is_empty() {
         allowed.clone()
     } else {
         subscribed.clone()
     };
     for s in &configured_src {
-        let supported_in_plmn = plmn_supported.is_empty() || plmn_supported.contains(s);
-        if supported_in_plmn && !sel.configured.iter().any(|(c, _)| c == s) {
+        let applicable_in_plmn = match &snapshot.plmn_snssai_restriction {
+            Some(configured) => configured.contains(s),
+            None => true,
+        };
+        if applicable_in_plmn && !sel.configured.iter().any(|(c, _)| c == s) {
             sel.configured.push((s.clone(), mapped(s)));
         }
     }
@@ -573,25 +586,22 @@ pub fn validate_slice_selection(s_nssai: &SNssai, supi: Option<&str>, nrf_uri: &
 mod tests {
     use super::*;
 
-    fn setup_context() {
-        let ctx = nssf_self();
-        let needs_init = {
-            if let Ok(context) = ctx.read() {
-                !context.is_initialized()
-            } else {
-                true
-            }
-        };
-        if needs_init {
-            if let Ok(mut context) = ctx.write() {
-                context.init(100);
-            }
-        }
+    /// Take the one process-global guard and hand this test an empty context.
+    ///
+    /// #346: this used to init the global if it was not already initialised and
+    /// take NO lock, so seven tests here mutated the same singleton that `main`'s
+    /// tests were asserting against -- `test_nrf_slice_availability_configured`
+    /// leaves an NSI in the global NSI table, which every later snapshot reads as
+    /// `nsiInformationList`. Returns the guard, so callers must bind it:
+    /// `let _guard = setup_context();`.
+    #[must_use]
+    fn setup_context() -> std::sync::MutexGuard<'static, ()> {
+        crate::context::nssf_test_guard(100)
     }
 
     #[test]
     fn test_ns_selection_missing_nf_id() {
-        setup_context();
+        let _guard = setup_context();
         let param = NsSelectionParam::default();
         let result = nssf_nnssf_nsselection_handle_get_from_amf_or_vnssf(1, &param);
         match result {
@@ -605,7 +615,7 @@ mod tests {
 
     #[test]
     fn test_ns_selection_missing_nf_type() {
-        setup_context();
+        let _guard = setup_context();
         let param = NsSelectionParam {
             nf_id: Some("test-nf-id".to_string()),
             ..Default::default()
@@ -622,7 +632,7 @@ mod tests {
 
     #[test]
     fn test_ns_selection_missing_slice_info() {
-        setup_context();
+        let _guard = setup_context();
         let param = NsSelectionParam {
             nf_id: Some("test-nf-id".to_string()),
             nf_type: Some("AMF".to_string()),
@@ -640,7 +650,7 @@ mod tests {
 
     #[test]
     fn test_ns_selection_nsi_not_found() {
-        setup_context();
+        let _guard = setup_context();
         let param = NsSelectionParam {
             nf_id: Some("test-nf-id".to_string()),
             nf_type: Some("AMF".to_string()),
@@ -662,7 +672,7 @@ mod tests {
 
     #[test]
     fn test_ns_selection_success() {
-        setup_context();
+        let _guard = setup_context();
 
         // Add an NSI first
         let ctx = nssf_self();
@@ -693,7 +703,7 @@ mod tests {
 
     #[test]
     fn test_nrf_slice_availability_with_nsi() {
-        setup_context();
+        let _guard = setup_context();
 
         let ctx = nssf_self();
         if let Ok(context) = ctx.read() {
@@ -708,7 +718,7 @@ mod tests {
 
     #[test]
     fn test_nrf_slice_availability_not_configured() {
-        setup_context();
+        let _guard = setup_context();
 
         let s_nssai = SNssai::new(99, Some(0xFFFFFF));
         let result = query_nrf_slice_availability("http://nrf.example.com", &s_nssai, "SMF");
