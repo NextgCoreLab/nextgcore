@@ -600,6 +600,23 @@ pub fn parse_initial_context_setup_response_asn1(data: &[u8]) -> Option<(u64, u3
     }
 }
 
+/// Decode a UE Context Release Complete (gNB -> AMF, TS 38.413 §9.2.5.5).
+/// Returns the AMF UE NGAP ID it names, so the AMF can act on the ONE UE whose N1
+/// connection ended rather than on every UE of the association.
+pub fn parse_ue_context_release_complete_asn1(data: &[u8]) -> Option<u64> {
+    match parser::decode_ngap_pdu(data) {
+        Ok(NgapMessage::UeContextReleaseComplete(complete)) => Some(complete.amf_ue_ngap_id),
+        Ok(other) => {
+            log::warn!("Expected UeContextReleaseComplete, got {other:?}");
+            None
+        }
+        Err(e) => {
+            log::warn!("Failed to decode UE Context Release Complete: {e:?}");
+            None
+        }
+    }
+}
+
 /// Decode an Initial Context Setup Failure (gNB -> AMF, TS 38.413 §9.2.2.3).
 /// Returns (amf_ue_ngap_id, ran_ue_ngap_id) on success.
 pub fn parse_initial_context_setup_failure_asn1(data: &[u8]) -> Option<(u64, u32)> {
