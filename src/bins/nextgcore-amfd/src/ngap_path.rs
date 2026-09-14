@@ -10824,6 +10824,96 @@ mod tests {
         );
     }
 
+    /// nextgsim issue #98: the gNB's PDU SESSION RESOURCE NOTIFY must decode HERE
+    /// and reach the SMF-facing relay.
+    ///
+    /// The bytes are **nextgsim's**, pinned as
+    /// `GOLDEN_NOTIFY_PDU` in
+    /// `nextgsim-ngap/src/procedures/pdu_session_resource_notify.rs`. That is the
+    /// whole point: the existing relay test above builds its Notify with
+    /// nextgcore's OWN builder, which is a self round-trip and passes however
+    /// wrong this codec is. These octets come from a **different, independently
+    /// written** APER implementation (nextgsim generates its codec from
+    /// `tools/ngap-17.9.asn`; this one is hand-written), so agreement on them is
+    /// evidence a round trip cannot give.
+    ///
+    /// If this test fails after a codec change on either side, the two products
+    /// have stopped agreeing on the wire — do not "fix" it by re-capturing the
+    /// constant from whichever encoder just changed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_gnbs_own_encoded_notify_decodes_here_and_relays_to_the_smf() {
+        /// Produced by nextgsim's encoder for: AMF-UE-NGAP-ID 42, RAN-UE-NGAP-ID 7,
+        /// Notify List [PSI 5, transfer 40 01 28], Released List [PSI 6,
+        /// transfer 08].
+        const NEXTGSIM_GOLDEN_NOTIFY_PDU: &str =
+            "001e4023000004000a0002002a0055000200070042000700000503400128004340050000060108";
+
+        let bytes: Vec<u8> = (0..NEXTGSIM_GOLDEN_NOTIFY_PDU.len())
+            .step_by(2)
+            .map(|i| {
+                u8::from_str_radix(&NEXTGSIM_GOLDEN_NOTIFY_PDU[i..i + 2], 16).expect("valid hex")
+            })
+            .collect();
+
+        // First: this codec must agree with nextgsim's on the abstract values.
+        match nextgcore_ngap::parser::decode_ngap_pdu(&bytes) {
+            Ok(nextgcore_ngap::NgapMessage::PduSessionResourceNotify(n)) => {
+                assert_eq!(n.amf_ue_ngap_id, 42, "AMF-UE-NGAP-ID");
+                assert_eq!(n.ran_ue_ngap_id, 7, "RAN-UE-NGAP-ID");
+                assert_eq!(n.notify_list.len(), 1, "one notified session");
+                assert_eq!(n.notify_list[0].pdu_session_id, 5);
+                assert_eq!(
+                    n.notify_list[0].transfer,
+                    vec![0x40, 0x01, 0x28],
+                    "the notify transfer must arrive byte for byte -- it is an \
+                     opaque OCTET STRING the SMF parses, so a shifted length here \
+                     lands garbage on N11"
+                );
+                assert_eq!(n.released_list.len(), 1, "one released session");
+                assert_eq!(n.released_list[0].pdu_session_id, 6);
+                assert_eq!(n.released_list[0].transfer, vec![0x08]);
+            }
+            Ok(other) => panic!(
+                "nextgsim's Notify decoded as the wrong message here, so the two \
+                 products disagree on the wire: {other:?}"
+            ),
+            Err(e) => panic!(
+                "nextgsim's Notify does not decode with this parser, so the gNB is \
+                 emitting a PDU this AMF cannot read: {e:?}"
+            ),
+        }
+
+        // Then: the handler must drive the SMF-facing relay for BOTH lists, each
+        // against its own SM context ref.
+        let (_smf, port, seen) = fake_smf().await;
+        let _env = SmfEnvGuard::set(port);
+
+        let mut server = test_ngap_server().await;
+        let ue = 42u64;
+        server
+            .sm_context_refs
+            .insert((ue, 5), "ref-notified".to_string());
+        server
+            .sm_context_refs
+            .insert((ue, 6), "ref-released".to_string());
+
+        server
+            .handle_pdu_session_resource_notify(9601, &bytes)
+            .await
+            .expect("handled");
+
+        let calls = seen.lock().expect("seen").clone();
+        assert_eq!(
+            calls,
+            vec![
+                ("ref-notified".to_string(), vec![0x40, 0x01, 0x28]),
+                ("ref-released".to_string(), vec![0x08]),
+            ],
+            "both the notified and the released container must reach the SMF, each \
+             against its own session's ref: {calls:?}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_session_with_no_stored_sm_context_ref_is_not_relayed_under_a_guessed_one() {
         let (_smf, port, seen) = fake_smf().await;
