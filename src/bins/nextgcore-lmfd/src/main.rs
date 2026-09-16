@@ -2633,6 +2633,25 @@ async fn handle_lpp_binary_report(request: &SbiRequest) -> SbiResponse {
 /// (TS 37.355 §6.1). Returns the session's measurement-store `request_id` on a
 /// hit; `None` fails closed (the caller answers 404 — an uplink report is never
 /// ingested against an unknown or global session).
+/// The SUPI a notification belongs to, resolved the same way
+/// [`resolve_notify_session`] resolves the session (nextgsim #138).
+///
+/// Separate function rather than a widened return type: the session resolution is on
+/// the hot path of every notify, and a caller that wants the request id must not be
+/// made to care about a SUPI that may legitimately be absent.
+fn resolve_notify_supi(lcs_correlation_id: Option<&str>, lpp_txn: Option<u8>) -> Option<String> {
+    let ctx = lmf_self();
+    let context = ctx.read().ok()?;
+    if let Some(corr) = lcs_correlation_id {
+        if let Some(info) = context.positioning_session_find(corr) {
+            return info.supi;
+        }
+    }
+    let txn = lpp_txn?;
+    let corr = context.positioning_session_find_by_transaction(txn)?;
+    context.positioning_session_find(&corr)?.supi
+}
+
 fn resolve_notify_session(lcs_correlation_id: Option<&str>, lpp_txn: Option<u8>) -> Option<u64> {
     let ctx = lmf_self();
     let context = ctx.read().ok()?;
@@ -2713,6 +2732,46 @@ async fn handle_n1_message_notify(request: &SbiRequest) -> SbiResponse {
     // correlation fallback.
     let decoded = codec_glue::decode_lpp_provide_report(&lpp_bytes);
     let lpp_txn = decoded.as_ref().ok().map(|(rid, _)| *rid as u8);
+
+    // The sidelink ranging report (TS 23.586 §5.3.3, nextgsim #138) is stored
+    // against the UE, not against the positioning session: it is a distance to a
+    // peer UE, and this LMF has no coordinates for peer UEs, so no solver can turn
+    // it into a position. Read BEFORE the session lookup because a report is worth
+    // keeping even when it arrives outside a session -- the alternative is dropping
+    // a measurement the UE went to the trouble of making.
+    let sidelink_supi = resolve_notify_supi(lcs_correlation_id, lpp_txn);
+    match codec_glue::decode_lpp_sidelink_ranging(&lpp_bytes) {
+        Ok((_txn, ranges)) if !ranges.is_empty() => match sidelink_supi.as_deref() {
+            Some(supi) => {
+                if let Ok(context) = lmf_self().read() {
+                    log::info!(
+                        "Sidelink ranging report from {supi}: {} range(s) held \
+                         (nearest {:.2} m)",
+                        ranges.len(),
+                        ranges
+                            .iter()
+                            .map(|r| r.range_m)
+                            .fold(f64::INFINITY, f64::min)
+                    );
+                    context.note_sidelink_ranges(supi, ranges);
+                }
+            }
+            // Honest rather than fabricated: without a SUPI there is no UE to file
+            // the ranges against, and inventing a key would make them unfindable and
+            // indistinguishable from another UE's.
+            None => log::warn!(
+                "Sidelink ranging report with {} range(s) cannot be stored: the \
+                 notification names no SUPI (lcsCorrelationId={lcs_correlation_id:?}, \
+                 lppTxn={lpp_txn:?})",
+                ranges.len()
+            ),
+        },
+        Ok(_) => {}
+        // A group-4 body that does not parse means the two ends have diverged, which
+        // is worth a line: the E-CID half of the same message may still be fine, so
+        // this does not fail the notification.
+        Err(e) => log::warn!("Sidelink ranging report present but undecodable: {e}"),
+    }
 
     let Some(request_id) = resolve_notify_session(lcs_correlation_id, lpp_txn) else {
         log::warn!(
@@ -5090,6 +5149,7 @@ lmf:
                             ),
                         }),
                         nr_dl_tdoa: None,
+                        sidelink_ranging: None,
                     },
                 }),
             )),
@@ -5338,11 +5398,82 @@ lmf:
                         }),
                         nr_multi_rtt: None,
                         nr_dl_tdoa: None,
+                        sidelink_ranging: None,
                     },
                 }),
             )),
         };
         msg.encode().expect("encode E-CID lpp").to_vec()
+    }
+
+    /// The sender's hand-derived sidelink ranging report, byte for byte from
+    /// nextgsim's `GOLDEN_SIDELINK_RANGING_REPORT` (nextgsim #137): one range of
+    /// 50.00 m to peer 0xA5A5A5, measured by carrier phase, 3 measurements.
+    ///
+    /// Held as the PAYLOAD rather than as a whole message so the assertion is about
+    /// the report the UE encodes; the LPP framing around it is this codec's, and
+    /// `lpp::sidelink_ranging`'s own tests are what pin the payload bytes against the
+    /// sender.
+    fn sender_golden_report() -> nextgcore_asn1c::lpp::sidelink_ranging::SidelinkRangingReport {
+        use nextgcore_asn1c::lpp::sidelink_ranging::{
+            SidelinkRangingMethod, SidelinkRangingReport, SidelinkRangingResult,
+        };
+        SidelinkRangingReport {
+            results: vec![SidelinkRangingResult {
+                peer_layer2_id: 0x00A5_A5A5,
+                range_cm: 5_000,
+                accuracy_cm: 1,
+                method: SidelinkRangingMethod::CarrierPhase,
+                measurement_count: 3,
+            }],
+        }
+    }
+
+    /// An uplink LPP `ProvideLocationInformation` carrying the sidelink ranging
+    /// report in addition group 4, plus the E-CID body a real UE sends alongside it.
+    fn build_sidelink_ranging_lpp(txn: u8) -> Vec<u8> {
+        use nextgcore_asn1c::lpp::ecid::{
+            EcidProvideLocationInformation, EcidSignalMeasurementInformation,
+            MeasuredResultsElement, ProvideLocationInformation, ProvideLocationInformationR9,
+        };
+        use nextgcore_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
+        use nextgcore_asn1c::lpp::types::{Initiator, LppTransactionId, TransactionNumber};
+        let element = MeasuredResultsElement {
+            phys_cell_id: 7,
+            arfcn_eutra: 1850,
+            system_frame_number: None,
+            rsrp_result: Some(60),
+            rsrq_result: None,
+            ue_rx_tx_time_diff: None,
+        };
+        let msg = LppMessage {
+            transaction_id: Some(LppTransactionId {
+                initiator: Initiator::TargetDevice,
+                transaction_number: TransactionNumber(txn),
+            }),
+            end_transaction: true,
+            sequence_number: None,
+            acknowledgement: None,
+            message_body: Some(LppMessageBody::C1(
+                MessageBodyC1::ProvideLocationInformation(ProvideLocationInformation {
+                    ies: ProvideLocationInformationR9 {
+                        ecid: Some(EcidProvideLocationInformation {
+                            signal_measurement_information: Some(
+                                EcidSignalMeasurementInformation {
+                                    primary_cell_measured_results: None,
+                                    measured_results_list: vec![element],
+                                },
+                            ),
+                            ecid_error: None,
+                        }),
+                        nr_multi_rtt: None,
+                        nr_dl_tdoa: None,
+                        sidelink_ranging: Some(sender_golden_report()),
+                    },
+                }),
+            )),
+        };
+        msg.encode().expect("encode sidelink-ranging lpp").to_vec()
     }
 
     /// Encode an NRPPa E-CID Measurement Report (serving cell + TA + RSRP).
@@ -5520,6 +5651,145 @@ lmf:
         );
         let v = body_json(&resp);
         assert_eq!(v["cause"], "LOCATION_SESSION_UNKNOWN");
+    }
+
+    // -- Sidelink ranging (TS 23.586 §5.3.3, nextgsim #138): the report is stored
+    // against the UE, and NOT fed to any positioning solver.
+    #[tokio::test]
+    async fn test_sidelink_ranging_report_is_stored_against_the_ue() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        let supi = "imsi-001010000000701";
+        let ctx = lmf_self();
+        let corr = {
+            let guard = ctx.read().unwrap();
+            let req = guard
+                .measurement_request(
+                    0,
+                    PositioningMethod::Ecid,
+                    None,
+                    None,
+                    PositioningQos::BestEffort,
+                )
+                .expect("measurement request");
+            guard
+                .positioning_session_register(Some(supi.to_string()), 181, req.request_id)
+                .0
+        };
+        assert!(
+            ctx.read().unwrap().sidelink_ranges(supi).is_empty(),
+            "precondition: the LMF holds no ranges for this UE"
+        );
+
+        let lpp = build_sidelink_ranging_lpp(181);
+        let notify = nextgcore_amfd::namf_server::build_n1_message_notify_request(
+            namf_client::N1_NOTIFY_PATH,
+            Some("sub-sidelink"),
+            "LPP",
+            Some(&corr),
+            Some(supi),
+            &lpp,
+        )
+        .expect("amfd builds N1MessageNotify");
+        assert_eq!(handle_n1_message_notify(&notify).await.status, 204);
+
+        let held = ctx.read().unwrap().sidelink_ranges(supi);
+        assert_eq!(held.len(), 1, "the report must be stored");
+        let range = held[0];
+        assert_eq!(range.peer_layer2_id, 0x00A5_A5A5);
+        assert!(
+            (range.range_m - 50.0).abs() < 0.001,
+            "50.00 m, as the UE measured it -- got {:.3}",
+            range.range_m
+        );
+        assert!((range.accuracy_m - 0.01).abs() < 0.0001, "1 cm");
+        assert_eq!(
+            range.method,
+            nextgcore_asn1c::lpp::sidelink_ranging::SidelinkRangingMethod::CarrierPhase,
+            "the method the UE reported, not one this LMF inferred"
+        );
+        assert_eq!(range.measurement_count, 3);
+    }
+
+    // -- A report that names no UE cannot be filed: the LMF says so and stores
+    // nothing, rather than inventing a key.
+    #[tokio::test]
+    async fn test_sidelink_ranging_report_without_a_supi_is_not_stored() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        let supi = "imsi-001010000000702";
+
+        // A session exists for a DIFFERENT correlation, so the notification below
+        // resolves to no SUPI at all.
+        {
+            let ctx = lmf_self();
+            let guard = ctx.read().unwrap();
+            let req = guard
+                .measurement_request(
+                    0,
+                    PositioningMethod::Ecid,
+                    None,
+                    None,
+                    PositioningQos::BestEffort,
+                )
+                .expect("measurement request");
+            guard.positioning_session_register(Some(supi.to_string()), 182, req.request_id);
+        }
+
+        // txn 250 matches no session, and a fresh correlation matches none either.
+        let lpp = build_sidelink_ranging_lpp(250);
+        let json = format!(
+            "{{\"n1MessageContainer\":{{\"n1MessageClass\":\"LPP\",\
+             \"n1MessageContent\":{{\"contentId\":\"n1-lpp\"}}}},\
+             \"lcsCorrelationId\":\"{}\"}}",
+            uuid::Uuid::new_v4()
+        );
+        let req = notify_request(
+            "/nlmf-loc/v1/notify/n1",
+            &json,
+            "n1-lpp",
+            "application/vnd.3gpp.5gnas",
+            lpp,
+        );
+        // The notification itself is still refused for the unknown session (404) --
+        // that behaviour is unchanged -- and no ranges are filed anywhere.
+        assert_eq!(handle_n1_message_notify(&req).await.status, 404);
+        let ctx = lmf_self();
+        assert!(
+            ctx.read().unwrap().sidelink_ranges(supi).is_empty(),
+            "a report that resolves to no SUPI must not be filed against some \
+             other UE"
+        );
+    }
+
+    // -- An empty report CLEARS what the LMF held: a UE that reports no ranges has
+    // said it no longer holds any.
+    #[tokio::test]
+    async fn test_an_empty_sidelink_report_clears_the_stored_ranges() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        let supi = "imsi-001010000000703";
+        let ctx = lmf_self();
+        {
+            let guard = ctx.read().unwrap();
+            guard.note_sidelink_ranges(
+                supi,
+                vec![crate::codec_glue::SidelinkRange {
+                    peer_layer2_id: 1,
+                    range_m: 12.0,
+                    accuracy_m: 1.0,
+                    method: nextgcore_asn1c::lpp::sidelink_ranging::SidelinkRangingMethod::Rtt,
+                    measurement_count: 1,
+                }],
+            );
+            assert_eq!(guard.sidelink_ranges(supi).len(), 1, "precondition");
+            guard.note_sidelink_ranges(supi, vec![]);
+        }
+        assert!(
+            ctx.read().unwrap().sidelink_ranges(supi).is_empty(),
+            "an empty report must clear the entry, not be ignored -- otherwise the \
+             LMF answers with a distance to a peer that may be gone"
+        );
     }
 
     // -- A4: jsonData references a contentId with no matching part → 400.
@@ -6260,6 +6530,7 @@ mod positioning_chain_strict_peer {
                         }),
                         nr_multi_rtt: None,
                         nr_dl_tdoa: None,
+                        sidelink_ranging: None,
                     },
                 }),
             )),

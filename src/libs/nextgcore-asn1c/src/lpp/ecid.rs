@@ -20,6 +20,7 @@ use super::nr_dl_tdoa::{NrDlTdoaProvideLocationInformation, NrDlTdoaRequestLocat
 use super::nr_multi_rtt::{
     NrMultiRttProvideLocationInformation, NrMultiRttRequestLocationInformation,
 };
+use super::sidelink_ranging::SidelinkRangingReport;
 use crate::per::{Constraint, PerError, PerResult};
 use crate::uper::{UperDecode, UperDecoder, UperEncode, UperEncoder};
 
@@ -252,9 +253,9 @@ impl UperDecode for ProvideLocationInformation {
 /// nr-DL-TDOA). The group is open-type-wrapped as G2 of the declared addition
 /// groups (G1/G2/G3), with the trailing-absent G3 trimmed (X.691 §18.8).
 ///
-/// BACKWARD COMPAT: when neither `nr_multi_rtt` nor `nr_dl_tdoa` is set, no
-/// addition is emitted (extension marker 0), so the encoding is byte-identical
-/// to the E-CID-only v1 form.
+/// BACKWARD COMPAT: when none of `nr_multi_rtt`, `nr_dl_tdoa` or
+/// `sidelink_ranging` is set, no addition is emitted (extension marker 0), so the
+/// encoding is byte-identical to the E-CID-only v1 form.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProvideLocationInformationR9 {
     pub ecid: Option<EcidProvideLocationInformation>,
@@ -262,11 +263,18 @@ pub struct ProvideLocationInformationR9 {
     pub nr_multi_rtt: Option<NrMultiRttProvideLocationInformation>,
     /// NR DL-TDOA provide-body (r16 group member index 3).
     pub nr_dl_tdoa: Option<NrDlTdoaProvideLocationInformation>,
+    /// Sidelink ranging report (TS 23.586 §5.3.3), carried as addition **group 4**
+    /// — past the three TS 37.355 declares, because it is a simulator-defined IE
+    /// and must not squat on a defined group. See
+    /// [`crate::lpp::sidelink_ranging`], and nextgsim #137/#138 for the pair.
+    pub sidelink_ranging: Option<SidelinkRangingReport>,
 }
 
 impl UperEncode for ProvideLocationInformationR9 {
     fn encode_uper(&self, encoder: &mut UperEncoder) -> PerResult<()> {
-        let has_add = self.nr_multi_rtt.is_some() || self.nr_dl_tdoa.is_some();
+        let has_add = self.nr_multi_rtt.is_some()
+            || self.nr_dl_tdoa.is_some()
+            || self.sidelink_ranging.is_some();
         // Extension marker = whether any extension addition follows.
         encoder.encode_sequence_preamble(
             Some(has_add),
@@ -280,6 +288,7 @@ impl UperEncode for ProvideLocationInformationR9 {
             // 4 OPTIONAL members are [nr-ECID, nr-Multi-RTT, nr-DL-AoD,
             // nr-DL-TDOA]. Present members are emitted in declaration order.
             let mut g2 = UperEncoder::new();
+            let g2_needed = self.nr_multi_rtt.is_some() || self.nr_dl_tdoa.is_some();
             g2.encode_sequence_preamble(
                 None,
                 &[
@@ -296,10 +305,29 @@ impl UperEncode for ProvideLocationInformationR9 {
                 tdoa.encode_uper(&mut g2)?;
             }
             let g2_bytes = g2.into_bytes().to_vec();
-            // Addition groups [G1(r13), G2(r16), G3(r19)] — only G2 present.
+            // The sidelink ranging report is its own group, G4.
+            let g4_bytes = match &self.sidelink_ranging {
+                Some(report) => {
+                    let mut g4 = UperEncoder::new();
+                    report.encode_uper(&mut g4)?;
+                    Some(g4.into_bytes().to_vec())
+                }
+                None => None,
+            };
+            // Addition groups [G1(r13), G2(r16), G3(r19), G4(sidelink ranging)].
             // Canonical X.691 §18.8: the extension-presence bit-field is trimmed
-            // to the last present addition, so the trailing-absent G3 is dropped.
-            encoder.encode_extension_additions(&[None, Some(g2_bytes)])?;
+            // to the LAST present addition, so a report with no G4 still emits the
+            // two-group field the v1 form emitted, byte for byte.
+            if g4_bytes.is_some() {
+                encoder.encode_extension_additions(&[
+                    None,
+                    g2_needed.then_some(g2_bytes),
+                    None,
+                    g4_bytes,
+                ])?;
+            } else {
+                encoder.encode_extension_additions(&[None, Some(g2_bytes)])?;
+            }
         }
         Ok(())
     }
@@ -321,9 +349,11 @@ impl UperDecode for ProvideLocationInformationR9 {
         };
         let mut nr_multi_rtt = None;
         let mut nr_dl_tdoa = None;
+        let mut sidelink_ranging = None;
         if ext {
-            // groups[0]=G1(r13), groups[1]=G2(r16), groups[2]=G3(r19) — index by
-            // position; a peer may send fewer groups (trailing-absent trimmed).
+            // groups[0]=G1(r13), groups[1]=G2(r16), groups[2]=G3(r19),
+            // groups[3]=G4(sidelink ranging) — index by position; a peer may send
+            // fewer groups (trailing-absent trimmed).
             let groups = decoder.decode_extension_additions()?;
             if let Some(Some(g2_bytes)) = groups.get(1) {
                 let mut g2 = UperDecoder::new(g2_bytes);
@@ -345,6 +375,15 @@ impl UperDecode for ProvideLocationInformationR9 {
                     nr_dl_tdoa = Some(NrDlTdoaProvideLocationInformation::decode_uper(&mut g2)?);
                 }
             }
+            // The sidelink ranging report (nextgsim #137/#138). A DECODE FAILURE
+            // here is reported rather than skipped: unlike G1/G3, which this codec
+            // never claimed to understand, a group 4 is something only nextg sends,
+            // so bytes that do not parse mean the two ends have diverged and saying
+            // so is more useful than dropping a range.
+            if let Some(Some(g4_bytes)) = groups.get(3) {
+                let mut g4 = UperDecoder::new(g4_bytes);
+                sidelink_ranging = Some(SidelinkRangingReport::decode_uper(&mut g4)?);
+            }
             // groups[0] (r13) and groups[2] (r19), if present, are ignored
             // (forward-compat skip).
         }
@@ -352,6 +391,7 @@ impl UperDecode for ProvideLocationInformationR9 {
             ecid,
             nr_multi_rtt,
             nr_dl_tdoa,
+            sidelink_ranging,
         })
     }
 }
@@ -1087,6 +1127,7 @@ mod tests {
         // byte-identical to the pre-C3 encoding (backward compatibility).
         roundtrip(&ProvideLocationInformation {
             ies: ProvideLocationInformationR9 {
+                sidelink_ranging: None,
                 nr_multi_rtt: None,
                 ecid: Some(EcidProvideLocationInformation {
                     signal_measurement_information: Some(EcidSignalMeasurementInformation {
@@ -1108,11 +1149,13 @@ mod tests {
                 nr_multi_rtt: None,
                 ecid: None,
                 nr_dl_tdoa: Some(minimal_nr_dl_tdoa()),
+                sidelink_ranging: None,
             },
         });
         // E-CID AND nr-DL-TDOA together.
         roundtrip(&ProvideLocationInformation {
             ies: ProvideLocationInformationR9 {
+                sidelink_ranging: None,
                 nr_multi_rtt: None,
                 ecid: Some(EcidProvideLocationInformation {
                     signal_measurement_information: Some(EcidSignalMeasurementInformation {
@@ -1132,6 +1175,7 @@ mod tests {
     #[test]
     fn ecid_only_provide_r9_has_no_extension_addition() {
         let r9 = ProvideLocationInformationR9 {
+            sidelink_ranging: None,
             nr_multi_rtt: None,
             ecid: Some(EcidProvideLocationInformation {
                 signal_measurement_information: None,
@@ -1150,7 +1194,8 @@ mod tests {
 
     /// REQUIRED hand-derived bit-annotated vector for the r16 GROUP FRAMING.
     ///
-    /// Encodes `ProvideLocationInformationR9 { ecid: None, nr_dl_tdoa: Some(min) }`
+    /// Encodes `ProvideLocationInformationR9 { ecid: None, nr_dl_tdoa: Some(min),
+    /// sidelink_ranging: None }`
     /// and verifies the framing prefix bit-for-bit (X.691 §18.9 extension-
     /// addition-group encoding). The deep nr-DL-TDOA sub-type internals are
     /// covered by the round-trip tests; here we pin the GROUP framing.
@@ -1183,6 +1228,7 @@ mod tests {
             nr_multi_rtt: None,
             ecid: None,
             nr_dl_tdoa: Some(minimal_nr_dl_tdoa()),
+            sidelink_ranging: None,
         };
         let mut enc = UperEncoder::new();
         r9.encode_uper(&mut enc).unwrap();
@@ -1234,6 +1280,7 @@ mod tests {
                 ecid: None,
                 nr_multi_rtt: Some(minimal_nr_multi_rtt()),
                 nr_dl_tdoa: None,
+                sidelink_ranging: None,
             },
         });
     }
@@ -1249,6 +1296,7 @@ mod tests {
                 ecid: None,
                 nr_multi_rtt: Some(minimal_nr_multi_rtt()),
                 nr_dl_tdoa: Some(minimal_nr_dl_tdoa()),
+                sidelink_ranging: None,
             },
         };
         roundtrip(&value);

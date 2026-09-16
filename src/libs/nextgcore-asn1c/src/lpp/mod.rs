@@ -37,6 +37,7 @@ pub mod ecid;
 pub mod message;
 pub mod nr_dl_tdoa;
 pub mod nr_multi_rtt;
+pub mod sidelink_ranging;
 pub mod types;
 
 pub use capabilities::*;

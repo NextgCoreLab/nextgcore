@@ -29,6 +29,7 @@ use nextgcore_asn1c::lpp::ecid::{
 use nextgcore_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
 use nextgcore_asn1c::lpp::nr_dl_tdoa::NrRstd;
 use nextgcore_asn1c::lpp::requested_measurements;
+use nextgcore_asn1c::lpp::sidelink_ranging::SidelinkRangingMethod;
 use nextgcore_asn1c::lpp::types::{Initiator, LppTransactionId, TransactionNumber};
 use nextgcore_asn1c::nrppa::ies::{MeasuredResultsValue, NgRanCell};
 use nextgcore_asn1c::nrppa::pdu::{parse_ecid_measurement_report, NrppaPdu};
@@ -837,6 +838,71 @@ pub fn decode_lpp_provide_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasureme
 }
 
 // ---------------------------------------------------------------------------
+// Sidelink ranging adapter (TS 23.586 §5.3.3, nextgsim #138)
+// ---------------------------------------------------------------------------
+
+/// One sidelink range the LMF holds for a UE.
+///
+/// Deliberately NOT a [`CellMeasurement`]: a sidelink range is a distance to another
+/// UE, not a measurement of a cell, and feeding it into the E-CID/Multi-RTT
+/// multilateration would put a peer UE's identity where a cell's global id belongs
+/// and produce a position from an anchor set the LMF has no coordinates for. The
+/// service is separate for that reason (see the issue: "distinct from
+/// `Nlmf_Location`").
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SidelinkRange {
+    /// The ranged peer's PC5 Layer-2 identity.
+    pub peer_layer2_id: u32,
+    /// Distance to that peer, in metres.
+    pub range_m: f64,
+    /// Reported accuracy, in metres.
+    pub accuracy_m: f64,
+    /// How it was measured, as the UE reported it.
+    pub method: SidelinkRangingMethod,
+    /// How many measurements the estimate rests on.
+    pub measurement_count: u16,
+}
+
+/// Adapt a decoded LPP `ProvideLocationInformation` carrying a sidelink ranging
+/// report (addition group 4) into [`SidelinkRange`]s.
+///
+/// Returns an empty `Vec` when the message is not a `ProvideLocationInformation` or
+/// carries no report — which is every message a UE without sidelink ranging sends,
+/// so an empty result is the normal case and not an error.
+pub fn lpp_sidelink_ranging_to_ranges(msg: &LppMessage) -> Vec<SidelinkRange> {
+    let prov = match msg.message_body.as_ref() {
+        Some(LppMessageBody::C1(MessageBodyC1::ProvideLocationInformation(p))) => p,
+        _ => return vec![],
+    };
+    let Some(report) = prov.ies.sidelink_ranging.as_ref() else {
+        return vec![];
+    };
+    report
+        .results
+        .iter()
+        .map(|result| SidelinkRange {
+            peer_layer2_id: result.peer_layer2_id,
+            range_m: result.range_m(),
+            accuracy_m: result.accuracy_m(),
+            method: result.method,
+            measurement_count: result.measurement_count,
+        })
+        .collect()
+}
+
+/// Decode raw LPP UPER bytes and adapt any sidelink ranging report.
+///
+/// Separate from [`decode_lpp_provide_report`] because the two answer different
+/// questions: that one produces cell measurements a solver consumes, this one
+/// produces ranges to peer UEs that no solver can consume. A single function
+/// returning both would invite a caller to treat one as the other.
+pub fn decode_lpp_sidelink_ranging(bytes: &[u8]) -> Result<(u64, Vec<SidelinkRange>), String> {
+    let msg = LppMessage::decode(bytes).map_err(|e| format!("LPP UPER decode: {e}"))?;
+    let request_id = extract_lpp_request_id(&msg).unwrap_or(0);
+    Ok((request_id, lpp_sidelink_ranging_to_ranges(&msg)))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -940,6 +1006,7 @@ mod tests {
                         }),
                         nr_multi_rtt: None,
                         nr_dl_tdoa: None,
+                        sidelink_ranging: None,
                     },
                 }),
             )),
@@ -1015,6 +1082,7 @@ mod tests {
                         }),
                         nr_multi_rtt: None,
                         nr_dl_tdoa: None,
+                        sidelink_ranging: None,
                     },
                 }),
             )),
@@ -1175,6 +1243,7 @@ mod tests {
                             ),
                         }),
                         nr_dl_tdoa: None,
+                        sidelink_ranging: None,
                     },
                 }),
             )),
@@ -1271,6 +1340,7 @@ mod tests {
                                 },
                             ),
                         }),
+                        sidelink_ranging: None,
                     },
                 }),
             )),
@@ -1331,6 +1401,7 @@ mod tests {
                             ),
                         }),
                         nr_dl_tdoa: None,
+                        sidelink_ranging: None,
                     },
                 }),
             )),
