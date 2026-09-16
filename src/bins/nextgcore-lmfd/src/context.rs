@@ -267,6 +267,16 @@ pub struct LmfContext {
     /// no exchange happened, which `UeLppCapability::Unknown` is distinct from
     /// `EcidOnly` precisely to express.
     ue_capabilities: RwLock<HashMap<String, crate::codec_glue::UeLppCapability>>,
+    /// Sidelink ranges reported by each UE (TS 23.586 §5.3.3, nextgsim #138), keyed
+    /// by SUPI. The LATEST report per UE replaces the previous one: a range is a
+    /// snapshot, and accumulating them would make an LMF answer with a distance the
+    /// UE has since re-measured.
+    ///
+    /// Held separately from `cell_registry` and from the positioning sessions, and
+    /// not fed to any solver: a range to a peer UE is not a measurement of a cell,
+    /// and this LMF has no coordinates for peer UEs, so a position derived from it
+    /// would be invented. Lock discipline: taken alone, like every map here.
+    sidelink_ranges: RwLock<HashMap<String, Vec<crate::codec_glue::SidelinkRange>>>,
     /// Registered deferred/periodic/triggered LDR sessions (ldrReference -> ctx). lmfd#1.
     ldr_sessions: RwLock<HashMap<String, LdrContext>>,
     /// A8: running EventNotify trigger tasks (ldrReference -> abort handle). A
@@ -327,6 +337,7 @@ impl LmfContext {
             initialized: AtomicBool::new(false),
             cell_registry: RwLock::new(HashMap::new()),
             ue_capabilities: RwLock::new(HashMap::new()),
+            sidelink_ranges: RwLock::new(HashMap::new()),
             up_subscriptions: RwLock::new(HashMap::new()),
             up_configs: RwLock::new(HashMap::new()),
             exposure_subscriptions: RwLock::new(HashMap::new()),
@@ -952,6 +963,33 @@ impl LmfContext {
     pub fn note_ue_lpp_capability(&self, supi: &str, cap: crate::codec_glue::UeLppCapability) {
         if let Ok(mut c) = self.ue_capabilities.write() {
             c.insert(supi.to_string(), cap);
+        }
+    }
+
+    /// The sidelink ranges this LMF holds for `supi` (nextgsim #138).
+    ///
+    /// Empty when the UE has reported none — which is every UE that does not do
+    /// sidelink ranging, so empty is the normal answer and not a failure.
+    pub fn sidelink_ranges(&self, supi: &str) -> Vec<crate::codec_glue::SidelinkRange> {
+        self.sidelink_ranges
+            .read()
+            .ok()
+            .and_then(|r| r.get(supi).cloned())
+            .unwrap_or_default()
+    }
+
+    /// Record the ranges a UE reported (nextgsim #138), replacing any previous set.
+    ///
+    /// An EMPTY report clears the entry rather than being ignored: a UE that reports
+    /// no ranges has told the LMF it no longer holds any, and keeping the old ones
+    /// would have the LMF answer with a distance to a peer that may be gone.
+    pub fn note_sidelink_ranges(&self, supi: &str, ranges: Vec<crate::codec_glue::SidelinkRange>) {
+        if let Ok(mut map) = self.sidelink_ranges.write() {
+            if ranges.is_empty() {
+                map.remove(supi);
+            } else {
+                map.insert(supi.to_string(), ranges);
+            }
         }
     }
 
