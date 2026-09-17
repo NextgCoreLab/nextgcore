@@ -1320,17 +1320,31 @@ impl NgapServer {
             return Ok(());
         };
 
-        // Drop pending authentication state for the affected UEs
+        // Drop pending authentication state for the affected UEs.
+        //
+        // Via `forget_ue` rather than `ue_auth_state` directly (#356): an NG Reset means
+        // those UEs are gone, so their emergency contexts go with them. The whole-interface
+        // arm collects the ids first because `retain` cannot call `&mut self`; the set is
+        // the same one `retain` matched.
         match &reset.reset_type {
             ResetType::NgInterface => {
-                self.ue_auth_state
-                    .retain(|_, state| state.association_id != association_id);
+                let affected: Vec<u64> = self
+                    .ue_auth_state
+                    .iter()
+                    .filter(|(_, state)| state.association_id == association_id)
+                    .map(|(amf_ue_ngap_id, _)| *amf_ue_ngap_id)
+                    .collect();
+                for amf_ue_ngap_id in affected {
+                    self.forget_ue(amf_ue_ngap_id);
+                }
             }
             ResetType::PartOfNgInterface(connections) => {
-                for item in connections {
-                    if let Some(amf_ue_ngap_id) = item.amf_ue_ngap_id {
-                        self.ue_auth_state.remove(&amf_ue_ngap_id);
-                    }
+                let affected: Vec<u64> = connections
+                    .iter()
+                    .filter_map(|item| item.amf_ue_ngap_id)
+                    .collect();
+                for amf_ue_ngap_id in affected {
+                    self.forget_ue(amf_ue_ngap_id);
                 }
             }
         }
@@ -4322,6 +4336,38 @@ impl NgapServer {
                         self.sm_context_refs
                             .insert((amf_ue_ngap_id, psi), resp.sm_context_ref.clone());
 
+                        // #356: record the emergency PDU session against the UE's
+                        // emergency context. Before this `assign_emergency_pdu_session`
+                        // had no production caller, so `EmergencyContext.pdu_session_id`
+                        // was always `None` and nothing could tell WHICH session carried
+                        // the emergency call -- the one fact an operator needs to
+                        // prioritise or trace it.
+                        //
+                        // The condition is deliberately two-part. The UE must hold an
+                        // emergency context (the method returns `false` otherwise, so
+                        // this is what makes the record meaningful rather than merely
+                        // attempted), AND the session must be on the emergency DNN. A
+                        // DNN-less request counts: TS 23.501 §5.16.4.2 has the network
+                        // use the configured emergency DNN when an emergency-registered
+                        // UE asks for a session without naming one, which is exactly the
+                        // `dnn == None` case that reaches the SMF with the member
+                        // omitted (#204). An emergency-registered UE that explicitly asks
+                        // for some OTHER DNN is not establishing the emergency session
+                        // and must not be recorded as one.
+                        let emergency_dnn = self.emergency.emergency_dnn().to_string();
+                        let on_emergency_dnn = dnn.is_none_or(|d| d == emergency_dnn);
+                        if on_emergency_dnn
+                            && self
+                                .emergency
+                                .assign_emergency_pdu_session(amf_ue_ngap_id, psi)
+                        {
+                            log::warn!(
+                                "Emergency PDU session recorded for UE {amf_ue_ngap_id}: \
+                                 PSI={psi} on DNN '{}' (TS 23.501 §5.16.4.2)",
+                                dnn.unwrap_or(&emergency_dnn)
+                            );
+                        }
+
                         // N1: PDU Session Establishment Accept via DL NAS
                         // TRANSPORT (protected when a context exists)
                         self.send_n1_sm_to_ue(
@@ -5107,7 +5153,11 @@ impl NgapServer {
                     );
                     state.reachability = None;
                     self.release_all_pdu_sessions(amf_ue_ngap_id).await;
-                    self.ue_auth_state.remove(&amf_ue_ngap_id);
+                    // `forget_ue`, not a bare remove (#356): this path never reaches
+                    // `release_ue` -- deliberately, since no NAS message can be sent to an
+                    // unreachable UE -- so it is the third place an emergency context has
+                    // to be freed.
+                    self.forget_ue(amf_ue_ngap_id);
                     // The global context's RAN UE and AMF UE entries go too, or the
                     // implicit deregistration would free the NAS state and leave the NGAP
                     // one behind -- a UE that is deregistered and still occupies an id.
@@ -5282,6 +5332,38 @@ impl NgapServer {
         }
     }
 
+    /// Drop every per-UE state this task owns for a UE that has gone away.
+    ///
+    /// One place, because there are THREE paths that end a UE and they do not converge
+    /// (#356): [`Self::release_ue`], the NG Reset handler, and the implicit
+    /// deregistration the reachability timer performs. Each removed `ue_auth_state`
+    /// directly and none touched `self.emergency`, so an emergency registration's
+    /// context was created on the registration path and never freed --
+    /// `active_count()`, the figure an operator watches during an emergency, counted
+    /// every emergency this process had ever seen instead of the live ones, and a
+    /// recycled AMF UE NGAP ID would have inherited the previous occupant's
+    /// `authenticated` flag and assigned PDU session.
+    ///
+    /// Call this instead of `self.ue_auth_state.remove(..)` whenever the UE is GONE.
+    /// Not on the paths that take the state out and put it back (the retransmission
+    /// timers do this) and not on handover, where the UE has moved rather than left --
+    /// `handle_handover_notify` documents why it must not use `release_ue` either.
+    fn forget_ue(&mut self, amf_ue_ngap_id: u64) {
+        self.ue_auth_state.remove(&amf_ue_ngap_id);
+        // Logged at info, and only when there WAS one: the overwhelming majority of
+        // releases are for ordinary UEs, and a line per release saying "no emergency
+        // context" would bury the ones that matter. `active_count` is included because
+        // the live figure is the operator-facing number and this is the only place it
+        // decreases.
+        if self.emergency.release_emergency(amf_ue_ngap_id) {
+            log::info!(
+                "Emergency context released for UE {amf_ue_ngap_id}: {} emergency \
+                 registration(s) still active (TS 23.167)",
+                self.emergency.active_count()
+            );
+        }
+    }
+
     /// Send a UEContextReleaseCommand with a NAS cause and drop the UE's
     /// NAS state (0 = normal-release, 1 = authentication-failure,
     /// 2 = deregister)
@@ -5292,7 +5374,7 @@ impl NgapServer {
         ran_ue_ngap_id: u32,
         nas_cause: u8,
     ) -> Result<()> {
-        self.ue_auth_state.remove(&amf_ue_ngap_id);
+        self.forget_ue(amf_ue_ngap_id);
         if let Some(cmd) = crate::ngap_asn1::build_ue_context_release_command_asn1(
             amf_ue_ngap_id,
             ran_ue_ngap_id,
@@ -10261,6 +10343,51 @@ mod tests {
         (server, addr.port(), seen)
     }
 
+    /// A fake SMF that answers `Nsmf_PDUSession_CreateSMContext` with a body
+    /// `call_smf_create_sm_context` can parse.
+    ///
+    /// Distinct from [`fake_smf`], which answers `204 No Content` — enough for the
+    /// relay tests that only care that a request arrived, but it makes the create call
+    /// fail with "Empty response body", so the `Ok(resp)` arm this fixture needs is
+    /// never entered. The 201 body uses the base64-in-JSON form of `n1SmMsg`/`n2SmInfo`
+    /// rather than multipart parts: `extract_binary_ref` accepts both and this one can be
+    /// written as a literal.
+    async fn fake_smf_creating_sm_contexts(
+        sm_context_ref: &'static str,
+    ) -> (nextgcore_sbi::server::SbiServer, u16) {
+        use base64::Engine as _;
+        use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+        use nextgcore_sbi::server::{SbiServer as NSbiServer, SbiServerConfig as NSbiCfg};
+
+        let (addr_listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = NSbiServer::on_listener(NSbiCfg::new(addr), addr_listener);
+        server
+            .start(move |_req: SReq| async move {
+                let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+                let body = serde_json::json!({
+                    "smContextRef": sm_context_ref,
+                    // A PDU SESSION ESTABLISHMENT ACCEPT shape is not needed: the AMF
+                    // forwards these containers opaquely and the assertions here are about
+                    // the emergency context, not about what the UE receives.
+                    "n1SmMsg": b64(&[0x2e, 0x01, 0x00, 0xc2]),
+                    "n2SmInfo": b64(&[0xa2, 0x00]),
+                });
+                SResp::created()
+                    .with_json_body(&body)
+                    .expect("fake SMF body serialises")
+            })
+            .await
+            .expect("fake SMF starts");
+
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (server, addr.port())
+    }
+
     /// Register a gNB session so handlers that mutate stored gNB state have
     /// something to mutate.
     async fn seed_gnb_session(server: &NgapServer, association_id: u64) {
@@ -11687,6 +11814,284 @@ mod tests {
             1,
             "the emergency branch must record a context; before #72 the handler had no \
              caller outside its own tests"
+        );
+    }
+
+    /// The NAS bytes of a REGISTRATION REQUEST whose 5GS registration type is EMERGENCY.
+    ///
+    /// Shared by the #356 tests below and shaped exactly like
+    /// `an_emergency_registration_reaches_the_emergency_handler`'s literal, so a change to
+    /// what the live parser accepts breaks both together rather than leaving one of them
+    /// asserting against a request the parser silently stopped recognising.
+    fn emergency_registration_nas() -> Vec<u8> {
+        let mut nas = vec![
+            0x7E,
+            0x00,
+            message_type::REGISTRATION_REQUEST,
+            crate::gmm_build::registration_type::EMERGENCY,
+        ];
+        let suci = vec![
+            0x01, 0x00, 0xF1, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+        ];
+        nas.extend_from_slice(&(suci.len() as u16).to_be_bytes());
+        nas.extend_from_slice(&suci);
+        nas
+    }
+
+    /// Registers `amf_ue_ngap_id` as an EMERGENCY UE on `association_id` through the live
+    /// NAS path and asserts the context exists, so a caller cannot mistake "the fixture
+    /// never created one" for "the release worked".
+    async fn register_emergency_ue(
+        ngap: &mut NgapServer,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+    ) {
+        ngap.ue_auth_state.insert(
+            amf_ue_ngap_id,
+            UeNasContext::new(amf_ue_ngap_id, 72, association_id, false),
+        );
+        let nas = emergency_registration_nas();
+        let _ = ngap
+            .handle_registration_request_nas(association_id, amf_ue_ngap_id, 72, &nas, false)
+            .await;
+        assert!(
+            ngap.emergency.emergency_context(amf_ue_ngap_id).is_some(),
+            "fixture precondition: UE {amf_ue_ngap_id} must hold an emergency context \
+             before the release under test"
+        );
+
+        // Re-inserted, because this fixture has no AUSF and no transport: the registration
+        // falls through to `start_authentication`, which TAKES the NAS state out
+        // (`ue_auth_state.remove`) and can only put it back on the AUSF success arm. Its
+        // failure arm does reach `release_ue` -- and so would free the emergency context --
+        // but only after a `send_nas_pdu(..)?` that this server cannot complete, so the
+        // call returns early with the state already gone.
+        //
+        // A UE that is registered and attached, which is the state every path under test
+        // starts from, holds both. Modelling that explicitly is what keeps these tests
+        // about the release paths instead of about the fixture's missing AUSF.
+        ngap.ue_auth_state.insert(
+            amf_ue_ngap_id,
+            UeNasContext::new(amf_ue_ngap_id, 72, association_id, false),
+        );
+    }
+
+    /// **#356**: an emergency context is freed when the UE is released.
+    ///
+    /// `release_emergency` had no production caller at all, so `active_count()` -- the
+    /// figure an operator watches during an emergency -- counted every emergency
+    /// registration the process had ever seen and only ever grew.
+    ///
+    /// Driven through `finish_deregistration`, the common tail of both deregistration
+    /// directions, rather than by calling `release_ue`: the funnel is what was missing the
+    /// call, so entering above it is what proves the wiring. The `Result` is discarded
+    /// because the association does not exist in this fixture and the UE Context Release
+    /// Command cannot be sent -- the state change under test happens before the send, and
+    /// asserting on the send would be asserting about the fixture.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_emergency_context_is_freed_when_the_ue_is_released() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let amf_ue_ngap_id = 7_356_001u64;
+        register_emergency_ue(&mut ngap, 1, amf_ue_ngap_id).await;
+        assert_eq!(ngap.emergency.active_count(), 1);
+
+        let _ = ngap.finish_deregistration(1, amf_ue_ngap_id, 72).await;
+
+        assert_eq!(
+            ngap.emergency.active_count(),
+            0,
+            "the live figure must fall to zero when the only emergency UE goes away; \
+             before #356 nothing ever removed an entry"
+        );
+        assert!(
+            ngap.emergency.emergency_context(amf_ue_ngap_id).is_none(),
+            "the context itself must be gone, not merely uncounted: a stale entry lets \
+             assign_emergency_pdu_session write into a dead context, and a recycled AMF \
+             UE NGAP ID inherits the previous occupant's authenticated flag"
+        );
+        // The cumulative counter is deliberately unaffected -- it is the total, and an
+        // operator reading it as a live figure is the confusion #356 describes.
+        assert_eq!(
+            ngap.emergency.total_emergency_count(),
+            1,
+            "releasing a context must not rewrite history: total_emergency_count is \
+             cumulative by design"
+        );
+    }
+
+    /// **#356**: an NG Reset frees the emergency contexts of the UEs it drops, and only
+    /// those.
+    ///
+    /// The second path that ends a UE without reaching `release_ue`. Both reset types are
+    /// covered because they drop state by different means -- one filters by association,
+    /// the other names UEs -- so a fix applied to only one arm would still leak.
+    ///
+    /// Two associations, so the assertion is that the right contexts went rather than that
+    /// some did: a `clear()` would pass a single-UE version of this test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ng_reset_frees_only_the_reset_gnbs_emergency_contexts() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let reset_assoc = 356u64;
+        let other_assoc = 357u64;
+        seed_gnb_session(&ngap, reset_assoc).await;
+        seed_gnb_session(&ngap, other_assoc).await;
+
+        let on_reset_gnb = 7_356_010u64;
+        let on_other_gnb = 7_356_011u64;
+        register_emergency_ue(&mut ngap, reset_assoc, on_reset_gnb).await;
+        register_emergency_ue(&mut ngap, other_assoc, on_other_gnb).await;
+        assert_eq!(ngap.emergency.active_count(), 2);
+
+        // PartOfNgInterface: the reset names the UE.
+        let partial = nextgcore_ngap::builder::build_ng_reset(&nextgcore_ngap::types::NgReset {
+            cause: nextgcore_ngap::types::Cause::Transport(
+                nextgcore_asn1c::ngap::cause::CauseTransport::TransportResourceUnavailable,
+            ),
+            reset_type: nextgcore_ngap::types::ResetType::PartOfNgInterface(vec![
+                nextgcore_ngap::types::UeAssociatedLogicalNgConnectionItem {
+                    amf_ue_ngap_id: Some(on_reset_gnb),
+                    ran_ue_ngap_id: Some(72),
+                },
+            ]),
+        })
+        .expect("build NG Reset");
+        // Result discarded: the NG Reset Acknowledge cannot be sent over this fixture's
+        // transport, and the state drop under test happens before that send.
+        let _ = ngap.handle_ng_reset(reset_assoc, &partial).await;
+
+        assert!(
+            ngap.emergency.emergency_context(on_reset_gnb).is_none(),
+            "the named UE's emergency context must go with its NAS state"
+        );
+        assert!(
+            ngap.emergency.emergency_context(on_other_gnb).is_some(),
+            "a reset on one gNB must not free another gNB's UE"
+        );
+
+        // NgInterface: the reset names no UE, so the whole association goes.
+        let whole = nextgcore_ngap::builder::build_ng_reset(&nextgcore_ngap::types::NgReset {
+            cause: nextgcore_ngap::types::Cause::Transport(
+                nextgcore_asn1c::ngap::cause::CauseTransport::TransportResourceUnavailable,
+            ),
+            reset_type: nextgcore_ngap::types::ResetType::NgInterface,
+        })
+        .expect("build NG Reset");
+        let _ = ngap.handle_ng_reset(other_assoc, &whole).await;
+
+        assert_eq!(
+            ngap.emergency.active_count(),
+            0,
+            "a whole-interface reset must free the emergency contexts of every UE it \
+             drops; the retain-based arm removed their NAS state and left the emergency \
+             entries behind"
+        );
+    }
+
+    /// A 5GSM PDU SESSION ESTABLISHMENT REQUEST for `psi`.
+    ///
+    /// `handle_5gsm_message` reads the PSI out of octet 1 and the message type out of
+    /// octet 3, so those are the two that have to be right.
+    fn pdu_session_establishment_request(psi: u8) -> Vec<u8> {
+        vec![
+            0x2E, // extended protocol discriminator: 5GSM
+            psi, 0x01, // PTI
+            0xC1, // PDU SESSION ESTABLISHMENT REQUEST
+        ]
+    }
+
+    /// **#356**: the emergency PDU session is recorded against the UE's emergency
+    /// context, and only for a session that is actually the emergency one.
+    ///
+    /// `assign_emergency_pdu_session` had no production caller, so
+    /// `EmergencyContext.pdu_session_id` was always `None` -- nothing could say WHICH
+    /// session carried the emergency call. The three cases in one test share the
+    /// `SmfEnvGuard`, which serialises on a process-global lock; splitting them would only
+    /// make three tests queue for it.
+    ///
+    /// The `Result`s are discarded because `send_n1_sm_to_ue` follows the recording and
+    /// cannot reach a gNB from this fixture. The recording is asserted from the emergency
+    /// context, which is the state the operator reads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_emergency_pdu_session_is_recorded_only_when_it_is_the_emergency_session() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (_smf, port) = fake_smf_creating_sm_contexts("smf-ref-emergency").await;
+        let _env = SmfEnvGuard::set(port);
+        let mut ngap = test_ngap_server().await;
+
+        // 1. DNN omitted. TS 23.501 §5.16.4.2: the network uses the configured emergency
+        //    DNN, so this IS the emergency session even though the UE named nothing. It is
+        //    also the common case, because #204 deliberately omits the member when the UE
+        //    sends no DNN IE.
+        let implicit = 7_356_020u64;
+        register_emergency_ue(&mut ngap, 1, implicit).await;
+        let _ = ngap
+            .handle_5gsm_message(1, implicit, 72, &pdu_session_establishment_request(3), None)
+            .await;
+        assert_eq!(
+            ngap.emergency
+                .emergency_context(implicit)
+                .expect("the emergency context must still exist")
+                .pdu_session_id,
+            Some(3),
+            "a DNN-less session for an emergency-registered UE is the emergency session \
+             (TS 23.501 §5.16.4.2); before #356 nothing recorded any PSI at all"
+        );
+
+        // 2. The emergency DNN named explicitly.
+        let explicit = 7_356_021u64;
+        register_emergency_ue(&mut ngap, 1, explicit).await;
+        let emergency_dnn = ngap.emergency.emergency_dnn().to_string();
+        let _ = ngap
+            .handle_5gsm_message(
+                1,
+                explicit,
+                72,
+                &pdu_session_establishment_request(7),
+                Some(&emergency_dnn),
+            )
+            .await;
+        assert_eq!(
+            ngap.emergency
+                .emergency_context(explicit)
+                .expect("the emergency context must still exist")
+                .pdu_session_id,
+            Some(7)
+        );
+
+        // 3. NEGATIVE: an emergency-registered UE establishing a session on some OTHER
+        //    DNN. Recording that would tell an operator the emergency call is on a PSI
+        //    that carries ordinary traffic. Asserted alongside a POSITIVE fact -- the
+        //    context still exists and the SM context ref was stored -- so a fixture that
+        //    never reached the SMF at all cannot pass this by arriving nowhere.
+        let other_dnn = 7_356_022u64;
+        register_emergency_ue(&mut ngap, 1, other_dnn).await;
+        let _ = ngap
+            .handle_5gsm_message(
+                1,
+                other_dnn,
+                72,
+                &pdu_session_establishment_request(9),
+                Some("internet"),
+            )
+            .await;
+        assert_eq!(
+            ngap.sm_context_refs
+                .get(&(other_dnn, 9))
+                .map(String::as_str),
+            Some("smf-ref-emergency"),
+            "control: the session must really have been created at the SMF, or the \
+             assertion below would pass for a request that never got there"
+        );
+        assert_eq!(
+            ngap.emergency
+                .emergency_context(other_dnn)
+                .expect("the emergency context must still exist")
+                .pdu_session_id,
+            None,
+            "a session on an ordinary DNN is not the emergency session, even for an \
+             emergency-registered UE"
         );
     }
 
