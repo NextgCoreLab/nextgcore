@@ -40,10 +40,14 @@ fn issued_ports() -> &'static Mutex<HashSet<u16>> {
 /// so there is no window at all.
 ///
 /// What is left for this helper is the callers that need a port but never bind
-/// it — a "nothing is listening here" address for a connection-refused test, a
-/// URI in a notification body that is never dialled, a UDP peer. Holding a TCP
-/// listener on those would change what the test measures, which is why #313 did
-/// not delete this function.
+/// it — a URI in a notification body that is never dialled, a UDP peer. Holding a
+/// TCP listener on those would change what the test measures, which is why #313
+/// did not delete this function.
+///
+/// **Not** for a connection-refused test. This doc used to list that as a
+/// legitimate use and it is not: the port is free, so a sibling test's
+/// `bind(:0)` can be handed it and the refusal never happens. Use
+/// [`refused_port`], which explains the flake that came of it.
 ///
 /// The original symptom, for the record: 21 crates each had a private copy of
 /// the unguarded probe-drop helper, and under parallel `cargo test` it surfaced
@@ -68,6 +72,41 @@ pub fn free_port() -> u16 {
         }
     }
     panic!("could not obtain an unused ephemeral port in 256 attempts");
+}
+
+/// A loopback port that is guaranteed to REFUSE a connection, for a test whose
+/// subject is the failure path.
+///
+/// [`free_port`] is the wrong tool for that, and this exists because using it
+/// there is a real flake rather than a theoretical one. `free_port` binds a
+/// probe, records the port and **drops** the listener, so the port is free — and
+/// nothing stops the kernel handing that same port to a sibling test whose stub
+/// server binds `127.0.0.1:0` a moment later. The port the first test picked for
+/// "nothing is listening here" then has a server on it, the connection succeeds,
+/// and its `assert!(result.is_err())` fails.
+///
+/// Observed as `nextgcore-amfd`'s `ue_policy_create_unreachable_is_err` failing
+/// about **1 workspace run in 7** on a clean `main`. `issued_ports` cannot help:
+/// it stops this helper handing the same port out twice, and the collision is
+/// with a `bind(:0)` that never goes through this helper at all.
+///
+/// Port **1** is the answer, and the idiom was already in the tree —
+/// `nextgcore-scpd`'s proxy tests use it with the note "Port 1 on loopback
+/// refuses immediately (privileged, nothing listening)". It is below the
+/// privileged threshold and far below `ip_local_port_range`, so no
+/// `bind(:0)` in this process can ever be assigned it, which is what makes the
+/// refusal deterministic rather than probable.
+///
+/// Use [`free_port`] only where the port is genuinely never dialled (a
+/// notification URI in a body, a UDP peer). Use [`bound_listener`] where it will
+/// be served.
+pub fn refused_port() -> u16 {
+    1
+}
+
+/// A loopback `SocketAddr` that refuses. See [`refused_port`].
+pub fn refused_addr() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], refused_port()))
 }
 
 /// A loopback `SocketAddr` on a port from [`free_port`], for the callers that
