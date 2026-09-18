@@ -1147,6 +1147,54 @@ pub fn sgwc_self() -> Arc<SgwcContext> {
         .clone()
 }
 
+/// The ONE agreement about this process's ambient SGW-C state, for tests (#368).
+///
+/// Declared beside the largest of the globals it guards rather than inside any
+/// `mod tests`, so every module reaches this same static instead of declaring its
+/// own. It guards, together:
+///
+/// - the **scalar address slots** on [`SGWC_CONTEXT`] — `s11_addr`, `gtpu_addr`,
+///   `s5c_addr` and `pgw_s5c_peer`. Unlike the UE/session/bearer maps (which tests
+///   keep apart with unique IMSIs) these hold exactly one value for the whole
+///   process, so whoever wrote one last owns every sibling's answer;
+/// - [`crate::pfcp_path::SXA_NODE`] and its outbound queue, installed and
+///   uninstalled together by the Sxa tests;
+/// - [`crate::gtp_path::S11_SERVER`], installed by the same tests for the same
+///   reason (the gated answer goes through the process-global one);
+/// - the `SGWC_SGWU_ADDR` / `SGWC_PFCP_NODE_IP` environment the stand-in SGW-U sets.
+///
+/// # The failure that widened its remit
+///
+/// This was `pfcp_path::SXA_TEST_LOCK`, covering only the last three. The scalar
+/// addresses were unguarded, and `s11_build::tests::test_create_session_response_round_trip`
+/// failed about 1 whole-workspace run in 8 while being clean in 10 isolation runs:
+/// `s11_build::tests::provision` sets `s11_addr` to `10.11.0.5` and asserts the
+/// Sender F-TEID carries it, but `build_create_session_response` re-reads the global
+/// at `s11_build.rs:183` *after* `provision` returned — so when
+/// `gtp_path::tests::test_server` set the same slot to `10.99.0.2` in the window
+/// between, the F-TEID carried `10.99.0.2` and the assertion failed. A pure codec
+/// round trip that flakes is not pure; the impurity was this slot.
+///
+/// Widened rather than joined by a second lock: #276 showed that a second lock over
+/// shared state HANGS the suite rather than merely flaking it, and one agreement
+/// means there is no lock order to get wrong.
+///
+/// # One acquisition point per test
+///
+/// Take it **once**, at the top of the test, and pass `&ProcessStateGuard` to
+/// [`crate::gtp_path::tests::test_server`], `stand_in_sgwu` and
+/// [`crate::s11_build::tests::provision`]. Those helpers require the reference
+/// rather than taking the lock themselves, because twelve `gtp_path` tests call two
+/// of them in the same test and a helper-side acquisition would deadlock against
+/// itself — the compiler now proves the caller holds it instead.
+///
+/// Sync `#[test]` functions take it with
+/// [`crate::pfcp_path::process_state_test_guard_blocking`], which is sound precisely
+/// because they have no runtime to block.
+#[cfg(test)]
+pub(crate) static PROCESS_STATE_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 // ============================================================================
 // Tests
 // ============================================================================

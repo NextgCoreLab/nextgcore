@@ -735,7 +735,13 @@ mod tests {
 
     /// Create a UE + session + bearer in the global context with realistic
     /// addressing, returning (ue_id, sess). IMSIs must be unique per test.
-    fn provision(imsi: &[u8]) -> (u64, SgwcSess) {
+    ///
+    /// Requires `&ProcessStateGuard` because `s11_address` is a single process-global
+    /// slot that the builders re-read at build time: `gtp_path::tests::test_server`
+    /// sets it to `10.99.0.2`, so without the guard this helper's `10.11.0.5` could be
+    /// overwritten between the write here and the read in
+    /// `build_create_session_response` (#368).
+    fn provision(_ambient: &crate::pfcp_path::ProcessStateGuard, imsi: &[u8]) -> (u64, SgwcSess) {
         let ctx = sgwc_self();
         ctx.set_s11_address(Some(Ipv4Addr::new(10, 11, 0, 5)));
 
@@ -778,9 +784,41 @@ mod tests {
         Gtp2Message::decode(&mut bytes).unwrap()
     }
 
+    /// The deterministic demonstration of the #368 flake.
+    ///
+    /// `test_create_session_response_round_trip` is a pure-looking encode/decode round
+    /// trip that failed about 1 whole-workspace run in 8 and was clean in 10 isolation
+    /// runs. It is not pure: the Sender F-TEID address is read from the process-global
+    /// `s11_addr` slot **at build time**, not captured by `provision`. So a sibling's
+    /// write between the two lands in the message.
+    ///
+    /// This asserts exactly that, with the sibling's write performed inline instead of
+    /// waited for -- a revert of a probabilistic failure proves nothing, whereas this
+    /// fails the moment the builder stops re-reading the slot.
+    #[test]
+    fn the_sender_fteid_address_is_read_from_the_global_at_build_time() {
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let (_, sess) = provision(&ambient, &[0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x09]);
+
+        // What `gtp_path::tests::test_server` writes. Before #368 it could land here.
+        sgwc_self().set_s11_address(Some(Ipv4Addr::new(10, 99, 0, 2)));
+
+        let msg = build_create_session_response(&sess, 0x123456, 7).unwrap();
+        let decoded = round_trip(&msg);
+        let fteid_ie = decoded.get_ie(Gtp2IeType::FTeid as u8, 0).unwrap();
+        let ft = Gtp2FTeidIe::decode(&fteid_ie.value).unwrap();
+        assert_eq!(
+            ft.ipv4_addr,
+            Some([10, 99, 0, 2]),
+            "the builder re-reads the global slot, so a write after provision() is what \
+             the message carries -- this is the impurity that made the round trip flake"
+        );
+    }
+
     #[test]
     fn test_create_session_response_round_trip() {
-        let (_, sess) = provision(&[0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x01]);
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let (_, sess) = provision(&ambient, &[0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x01]);
         let msg = build_create_session_response(&sess, 0x123456, 7).unwrap();
         let decoded = round_trip(&msg);
 
@@ -828,7 +866,8 @@ mod tests {
 
     #[test]
     fn test_modify_bearer_response_round_trip() {
-        let (_, sess) = provision(&[0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x02]);
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let (_, sess) = provision(&ambient, &[0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x02]);
         let msg = build_modify_bearer_response(&sess, 2, gtp_cause::REQUEST_ACCEPTED).unwrap();
         let decoded = round_trip(&msg);
 
@@ -848,7 +887,8 @@ mod tests {
 
     #[test]
     fn test_modify_bearer_response_reject_has_no_bearer_context() {
-        let (_, sess) = provision(&[0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x03]);
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let (_, sess) = provision(&ambient, &[0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x03]);
         let msg = build_modify_bearer_response(&sess, 3, gtp_cause::CONTEXT_NOT_FOUND).unwrap();
         let decoded = round_trip(&msg);
         assert_eq!(
@@ -889,7 +929,8 @@ mod tests {
 
     #[test]
     fn test_downlink_data_notification_round_trip() {
-        let (_, sess) = provision(&[0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x04]);
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let (_, sess) = provision(&ambient, &[0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x04]);
         let ctx = sgwc_self();
         let bearer = ctx.bearer_find_by_id(sess.bearer_ids[0]).unwrap();
 
@@ -919,7 +960,8 @@ mod tests {
 
     #[test]
     fn test_indirect_tunnel_responses_round_trip() {
-        let (ue_id, _) = provision(&[0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x05]);
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let (ue_id, _) = provision(&ambient, &[0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x05]);
         let msg = build_create_indirect_data_forwarding_tunnel_response(
             ue_id,
             8,
@@ -963,7 +1005,8 @@ mod tests {
 
     #[test]
     fn test_s5c_create_session_request_round_trip() {
-        let (_, sess) = provision(&[0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x06]);
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let (_, sess) = provision(&ambient, &[0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x06]);
         let msg = build_s5c_create_session_request(&sess, 11).unwrap();
         let decoded = round_trip(&msg);
 
@@ -987,7 +1030,8 @@ mod tests {
 
     #[test]
     fn test_s5c_delete_session_request_round_trip() {
-        let (_, sess) = provision(&[0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x07]);
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let (_, sess) = provision(&ambient, &[0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x07]);
         let msg = build_s5c_delete_session_request(&sess, 12).unwrap();
         let decoded = round_trip(&msg);
         assert_eq!(
@@ -1002,7 +1046,8 @@ mod tests {
 
     #[test]
     fn test_s5c_modify_bearer_and_create_bearer_response_round_trip() {
-        let (_, sess) = provision(&[0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x08]);
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let (_, sess) = provision(&ambient, &[0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x08]);
 
         let msg = build_s5c_modify_bearer_request(&sess, 13).unwrap();
         let decoded = round_trip(&msg);

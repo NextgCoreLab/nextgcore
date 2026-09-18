@@ -214,10 +214,11 @@ static OUTBOUND: std::sync::RwLock<Option<mpsc::UnboundedSender<QueuedRequest>>>
 /// The running Sxa node, so the synchronous S11 dispatch can resolve a peer.
 static SXA_NODE: std::sync::RwLock<Option<Arc<SxaNode>>> = std::sync::RwLock::new(None);
 
-/// Serialises every test that reads or writes [`SXA_NODE`] / [`OUTBOUND`]. One lock for
-/// both: they are always installed together.
-#[cfg(test)]
-pub(crate) static SXA_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// The lock that serialises every test touching this process's ambient SGW-C state
+// lives beside the largest global it guards: `context::PROCESS_STATE_TEST_LOCK`. It
+// used to be declared here as `SXA_TEST_LOCK`, covering only [`SXA_NODE`] /
+// [`OUTBOUND`] and the S11 server; #368 widened its remit to the scalar address
+// slots on the global context, which were unguarded and flaked.
 
 /// The process-wide Sxa node, once [`pfcp_open`] has run.
 pub fn sxa_node() -> Option<Arc<SxaNode>> {
@@ -239,12 +240,17 @@ pub(crate) fn clear_sxa_globals_for_test() {
     }
 }
 
-/// Holds [`SXA_TEST_LOCK`] and leaves the globals empty on both sides of a test.
+/// Holds [`crate::context::PROCESS_STATE_TEST_LOCK`] and leaves the ambient globals
+/// empty on both sides of a test.
+///
+/// Take it once per test and pass `&ProcessStateGuard` to the helpers that touch
+/// ambient state; see the lock's own documentation for why they require the reference
+/// rather than acquiring it themselves.
 #[cfg(test)]
-pub(crate) struct SxaTestGuard(#[allow(dead_code)] tokio::sync::MutexGuard<'static, ()>);
+pub(crate) struct ProcessStateGuard(#[allow(dead_code)] tokio::sync::MutexGuard<'static, ()>);
 
 #[cfg(test)]
-impl Drop for SxaTestGuard {
+impl Drop for ProcessStateGuard {
     fn drop(&mut self) {
         clear_sxa_globals_for_test();
         // The S11 server is installed by the same tests, for the same reason (the gated
@@ -255,10 +261,19 @@ impl Drop for SxaTestGuard {
 }
 
 #[cfg(test)]
-pub(crate) async fn sxa_test_guard() -> SxaTestGuard {
-    let guard = SXA_TEST_LOCK.lock().await;
+pub(crate) async fn process_state_test_guard() -> ProcessStateGuard {
+    let guard = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
     clear_sxa_globals_for_test();
-    SxaTestGuard(guard)
+    ProcessStateGuard(guard)
+}
+
+/// The sync `#[test]` counterpart. `blocking_lock` is sound here precisely because a
+/// sync test has no runtime to block.
+#[cfg(test)]
+pub(crate) fn process_state_test_guard_blocking() -> ProcessStateGuard {
+    let guard = crate::context::PROCESS_STATE_TEST_LOCK.blocking_lock();
+    clear_sxa_globals_for_test();
+    ProcessStateGuard(guard)
 }
 
 // ============================================================================
@@ -1021,7 +1036,7 @@ mod tests {
     /// the assertion that separates a bound socket from a claim about one.
     #[tokio::test]
     async fn test_pfcp_open_close() {
-        let _guard = sxa_test_guard().await;
+        let _guard = process_state_test_guard().await;
         std::env::set_var("SGWC_PFCP_BIND_ADDR", "127.0.0.1:0");
         let node = pfcp_open().await.expect("bind");
         assert_ne!(node.local_addr().port(), 0, "a real socket was bound");
@@ -1034,7 +1049,7 @@ mod tests {
     /// instead of returning Ok — the shape the old `send_pfcp_message` had.
     #[tokio::test]
     async fn a_session_request_without_a_running_transport_is_an_error_not_a_silent_ok() {
-        let _guard = sxa_test_guard().await;
+        let _guard = process_state_test_guard().await;
         let sess = SgwcSess {
             id: 1,
             sgwc_sxa_seid: 0x1000,
