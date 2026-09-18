@@ -3628,13 +3628,31 @@ fn build_smf_selection_data(
         } else {
             format!("{:02x}", slice.s_nssai.sst)
         };
+        // `defaultDnnIndicator` is emitted ONLY when provisioned true (#264, TS 29.503
+        // `DnnInfo`; TS 23.501 §5.6.1). The member is typed `boolean` with no default and
+        // carries one meaning -- "this is the subscribed default" -- so emitting `false` on
+        // every other entry would assert that the operator considered each one and rejected
+        // it, where omission says the subscription is silent.
+        //
+        // That distinction is load-bearing for the consumer: `smfd`'s `select_default_dnn`
+        // treats a single unflagged DNN as the unambiguous default (rule 2) and refuses a
+        // multi-DNN set with none flagged (rule 3), and it can only tell those apart if
+        // "not flagged" and "flagged false" look the same on the wire.
         let dnn_infos: Vec<serde_json::Value> = slice
             .session
             .iter()
             .filter_map(|sess| {
-                sess.name
-                    .as_ref()
-                    .map(|dnn| serde_json::json!({"dnn": dnn}))
+                sess.name.as_ref().map(|dnn| {
+                    let mut info = serde_json::Map::new();
+                    info.insert("dnn".to_string(), serde_json::Value::String(dnn.clone()));
+                    if sess.default_dnn_indicator {
+                        info.insert(
+                            "defaultDnnIndicator".to_string(),
+                            serde_json::Value::Bool(true),
+                        );
+                    }
+                    serde_json::Value::Object(info)
+                })
             })
             .collect();
         if !dnn_infos.is_empty() {
@@ -6750,6 +6768,120 @@ udr:
             assert_eq!(
                 err.status, 400,
                 "and refused with 400, not silently dropped"
+            );
+        }
+    }
+
+    // ====================================================================
+    // #264: the subscribed default DNN reaches smf-sel-data
+    // ====================================================================
+
+    /// A subscription with two DNNs on one slice; `flag_ims` flags the second as default.
+    fn two_dnn_subscription(flag_ims: bool) -> nextgcore_dbi::types::NextgcoreSubscriptionData {
+        use nextgcore_dbi::types::{
+            NextgcoreSNssai, NextgcoreSession, NextgcoreSliceData, NextgcoreSubscriptionData,
+        };
+        let internet = NextgcoreSession {
+            name: Some("internet".to_string()),
+            default_dnn_indicator: false,
+            ..Default::default()
+        };
+        let ims = NextgcoreSession {
+            name: Some("ims".to_string()),
+            default_dnn_indicator: flag_ims,
+            ..Default::default()
+        };
+        NextgcoreSubscriptionData {
+            slice: vec![NextgcoreSliceData {
+                // `new(1, None)` rather than `NextgcoreSNssai { sst: 1, ..Default::default() }`:
+                // `Default` leaves `sd.v` at 0, and `has_sd()` is `sd.v != NO_SD_VALUE`, so a
+                // defaulted S-NSSAI claims to carry an SD of 0 and keys itself "01-000000".
+                // The constructor writes the no-SD sentinel, which is what an SST-only
+                // subscription actually looks like.
+                s_nssai: NextgcoreSNssai::new(1, None),
+                default_indicator: true,
+                num_of_session: 2,
+                session: vec![internet, ims],
+            }],
+            num_of_slice: 1,
+            ..Default::default()
+        }
+    }
+
+    /// The `dnnInfos` entry for `dnn` out of the single slice the fixture builds.
+    fn dnn_info(smf_sel: &serde_json::Value, dnn: &str) -> serde_json::Value {
+        smf_sel["subscribedSnssaiInfos"]["01"]["dnnInfos"]
+            .as_array()
+            .expect("dnnInfos must be an array")
+            .iter()
+            .find(|i| i["dnn"] == dnn)
+            .unwrap_or_else(|| panic!("no dnnInfos entry for {dnn}"))
+            .clone()
+    }
+
+    /// **#264**: a provisioned default DNN is emitted as `DnnInfo.defaultDnnIndicator`.
+    ///
+    /// Before this the emitter wrote `{"dnn": <name>}` and nothing else, so nothing in this
+    /// tree could produce the flag TS 23.501 §5.6.1 selects on -- `smfd`'s
+    /// `select_default_dnn` rule 1 reads exactly this member and could only ever fire
+    /// against a third-party UDR.
+    ///
+    /// The member name is a literal against TS 29.503's `DnnInfo` because a misspelling is
+    /// invisible: `select_default_dnn` would fall through to rule 2 or 3 and refuse the
+    /// session, which reads as a provisioning mistake rather than a wire bug. `smfd`'s
+    /// `select_default_dnn_uses_the_indicator_and_refuses_to_guess` covers the CONSUMING
+    /// half with the same literal; this covers the producing half.
+    #[test]
+    fn a_provisioned_default_dnn_is_emitted_as_the_indicator() {
+        let smf_sel = build_smf_selection_data(&two_dnn_subscription(true));
+
+        assert_eq!(
+            dnn_info(&smf_sel, "ims")["defaultDnnIndicator"],
+            serde_json::json!(true),
+            "the flagged DNN must carry defaultDnnIndicator: true (TS 29.503 DnnInfo)"
+        );
+    }
+
+    /// **#264**: an UNflagged DNN omits the member rather than emitting `false`.
+    ///
+    /// The load-bearing half, and a deliberate choice rather than an omission. `smfd`'s
+    /// rule 2 treats a single unflagged DNN as the unambiguous default and rule 3 refuses a
+    /// multi-DNN set with none flagged; it can only tell those apart if "the operator did
+    /// not flag this one" and "the operator considered and rejected this one" look the same
+    /// on the wire. TS 29.503 types the member `boolean` with no default, so absence is how
+    /// the spec says the subscription is silent.
+    #[test]
+    fn an_unflagged_dnn_omits_the_indicator_rather_than_emitting_false() {
+        let smf_sel = build_smf_selection_data(&two_dnn_subscription(true));
+
+        let internet = dnn_info(&smf_sel, "internet");
+        assert!(
+            internet.get("defaultDnnIndicator").is_none(),
+            "an unflagged DNN must omit the member, not assert a considered false: got \
+             {internet}"
+        );
+        assert_eq!(
+            internet["dnn"],
+            serde_json::json!("internet"),
+            "control: the entry is still emitted, so this cannot pass by the DNN being \
+             dropped altogether"
+        );
+    }
+
+    /// **#264**: a subscription that flags nothing emits no indicator anywhere.
+    ///
+    /// The negative that keeps the emitter honest. Without it an emitter hardcoding `true`
+    /// would pass the positive test above and every DNN would claim to be the default,
+    /// which `select_default_dnn` would resolve to whichever came first -- exactly the
+    /// arbitrary choice #204 exists to remove.
+    #[test]
+    fn a_subscription_flagging_nothing_emits_no_indicator() {
+        let smf_sel = build_smf_selection_data(&two_dnn_subscription(false));
+
+        for dnn in ["internet", "ims"] {
+            assert!(
+                dnn_info(&smf_sel, dnn).get("defaultDnnIndicator").is_none(),
+                "{dnn} must carry no indicator when the operator flagged none"
             );
         }
     }

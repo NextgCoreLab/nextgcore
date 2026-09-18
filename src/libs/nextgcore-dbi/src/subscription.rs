@@ -779,6 +779,12 @@ fn parse_session(doc: &Document) -> NextgcoreSession {
         session.lbo_roaming_allowed = lbo;
     }
 
+    // #264. Absent leaves it `false` from `Default`, which is the additive migration:
+    // every existing subscriber document lacks the key and keeps behaving as it did.
+    if let Ok(default_dnn) = doc.get_bool(NEXTGCORE_DEFAULT_DNN_INDICATOR_STRING) {
+        session.default_dnn_indicator = default_dnn;
+    }
+
     if let Ok(qos_doc) = doc.get_document(NEXTGCORE_QOS_STRING) {
         session.qos = parse_qos(qos_doc);
     }
@@ -919,6 +925,74 @@ pub fn nextgcore_dbi_policy_subscription(supi: &str) -> DbiResult<NextgcoreSubsc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ================================================================
+    // #264: the per-DNN default marker survives the BSON round trip
+    // ================================================================
+
+    /// **#264**: `parse_session` reads `default_dnn_indicator` off the document.
+    ///
+    /// Provisioning it is useless if the parser drops it, and the drop would be silent:
+    /// `udrd` would emit no `defaultDnnIndicator`, `smfd` would fall through to rule 2 or 3
+    /// and refuse the DNN-less session, and the operator would see a refusal for a DNN they
+    /// had flagged. Both `true` and the absent case are asserted, because absent-is-false is
+    /// the migration story for every existing subscriber document.
+    #[test]
+    fn parse_session_reads_the_default_dnn_indicator() {
+        let mut flagged = Document::new();
+        flagged.insert(NEXTGCORE_NAME_STRING, "ims");
+        flagged.insert(NEXTGCORE_DEFAULT_DNN_INDICATOR_STRING, true);
+        assert!(
+            parse_session(&flagged).default_dnn_indicator,
+            "a provisioned default DNN must reach NextgcoreSession"
+        );
+
+        let mut unflagged = Document::new();
+        unflagged.insert(NEXTGCORE_NAME_STRING, "internet");
+        unflagged.insert(NEXTGCORE_DEFAULT_DNN_INDICATOR_STRING, false);
+        assert!(
+            !parse_session(&unflagged).default_dnn_indicator,
+            "an explicit false must stay false"
+        );
+
+        let mut absent = Document::new();
+        absent.insert(NEXTGCORE_NAME_STRING, "internet");
+        assert!(
+            !parse_session(&absent).default_dnn_indicator,
+            "and an EXISTING document with no such key must default to false, which is what \
+             makes #264 additive: every subscriber provisioned before it keeps behaving as it \
+             did"
+        );
+        assert_eq!(
+            parse_session(&absent).name.as_deref(),
+            Some("internet"),
+            "control: the rest of the session still parses, so the assertion above cannot \
+             pass by the parse having failed"
+        );
+    }
+
+    /// The SLICE-level default flag and the per-DNN one are different fields.
+    ///
+    /// They are one word apart in Mongo (`default_indicator` on the slice,
+    /// `default_dnn_indicator` on the session) and answer different questions -- which slice
+    /// a UE gets when it asks for none, versus which DNN inside that slice. A parser that
+    /// read one key for both would look correct on any single-slice single-DNN subscriber,
+    /// which is every subscriber in this tree's E2E.
+    #[test]
+    fn the_slice_default_and_the_dnn_default_are_not_the_same_key() {
+        let mut session = Document::new();
+        session.insert(NEXTGCORE_NAME_STRING, "internet");
+        // The SLICE's key, on the SESSION document: must be ignored here.
+        session.insert(NEXTGCORE_DEFAULT_INDICATOR_STRING, true);
+        assert!(
+            !parse_session(&session).default_dnn_indicator,
+            "the slice-level `default_indicator` must not set the per-DNN flag"
+        );
+        assert_ne!(
+            NEXTGCORE_DEFAULT_INDICATOR_STRING, NEXTGCORE_DEFAULT_DNN_INDICATOR_STRING,
+            "and the two constants must stay distinct"
+        );
+    }
 
     // 3GPP TS 35.208 Test Set 1, mirroring the constants in
     // nextgcore-crypt/src/milenage.rs so the expected OPc is anchored to the
