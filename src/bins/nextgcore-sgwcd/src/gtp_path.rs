@@ -2050,7 +2050,15 @@ mod tests {
     };
     use std::net::UdpSocket;
 
-    fn test_server(t3_ms: u64, n3: u32) -> GtpcServer {
+    /// Requires `&ProcessStateGuard` because it writes the process-global scalar
+    /// address slots: a sibling that reads one back through production code sees
+    /// whatever was written last (#368). The guard is taken by the test rather than
+    /// here, so a test that also builds a stand-in SGW-U does not deadlock on itself.
+    fn test_server(
+        _ambient: &crate::pfcp_path::ProcessStateGuard,
+        t3_ms: u64,
+        n3: u32,
+    ) -> GtpcServer {
         sgwc_self().set_gtpu_address(Some(Ipv4Addr::new(10, 99, 0, 1)));
         sgwc_self().set_s11_address(Some(Ipv4Addr::new(10, 99, 0, 2)));
         GtpcServer::open(
@@ -2115,7 +2123,8 @@ mod tests {
 
     #[test]
     fn test_echo_request_response_with_recovery() {
-        let server = test_server(1000, 1);
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let server = test_server(&ambient, 1000, 1);
         let sock = client();
 
         let echo = Gtp2Message::echo_request(0x77);
@@ -2143,7 +2152,6 @@ mod tests {
     /// after `delay`, which is what makes "no Create Session Response until the SGW-U
     /// answers" observable rather than asserted.
     struct StandInSgwu {
-        _guard: crate::pfcp_path::SxaTestGuard,
         /// Requests the stand-in received, as (msg_type, seid, body).
         seen: std::sync::Arc<std::sync::Mutex<Vec<(u8, Option<u64>, Vec<u8>)>>>,
         /// The stand-in's own socket, so a test can push a Session Report Request at the
@@ -2189,14 +2197,17 @@ mod tests {
         }
     }
 
-    async fn stand_in_sgwu(cause: u8, delay: Duration) -> StandInSgwu {
+    async fn stand_in_sgwu(
+        _ambient: &crate::pfcp_path::ProcessStateGuard,
+        cause: u8,
+        delay: Duration,
+    ) -> StandInSgwu {
         use nextgcore_pfcp::header::PfcpHeader as PHeader;
         use nextgcore_pfcp::message::{
             SessionDeletionResponse, SessionEstablishmentResponse, SessionModificationResponse,
         };
         use nextgcore_pfcp::types::{FSeid, NodeId, PfcpCause};
 
-        let guard = crate::pfcp_path::sxa_test_guard().await;
         let up = std::sync::Arc::new(
             tokio::net::UdpSocket::bind("127.0.0.1:0")
                 .await
@@ -2294,7 +2305,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         StandInSgwu {
-            _guard: guard,
             seen,
             sock: up,
             sgwc_addr: node.local_addr(),
@@ -2411,7 +2421,9 @@ mod tests {
     /// state, so this assertion could not have held however the test was written.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_paa_the_mme_receives_is_allocated_by_the_pgw() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
         let _sgwu = stand_in_sgwu(
+            &ambient,
             crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
             Duration::from_millis(0),
         )
@@ -2420,7 +2432,7 @@ mod tests {
         // ambient SGW-C configuration, and setting the PGW peer before it is exactly the
         // unlocked-writer race #308 was about.
         let pgw = with_stand_in_pgw().await;
-        let server = test_server(1000, 1);
+        let server = test_server(&ambient, 1000, 1);
         set_s11_server(server.clone());
         let sock = client();
         sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
@@ -2473,7 +2485,9 @@ mod tests {
     /// this PR relayed NEITHER Serving Network nor ULI, and the real anchor refused it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_relayed_s5c_request_carries_what_the_anchor_requires() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
         let _sgwu = stand_in_sgwu(
+            &ambient,
             crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
             Duration::from_millis(0),
         )
@@ -2489,7 +2503,7 @@ mod tests {
         sgwc_self().set_pgw_s5c_peer(Some(recorder.local_addr().unwrap()));
         let _ = pgw;
 
-        let server = test_server(1000, 1);
+        let server = test_server(&ambient, 1000, 1);
         set_s11_server(server.clone());
         let sock = client();
         let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x51];
@@ -2542,14 +2556,16 @@ mod tests {
     /// to be visible to the MME instead of being papered over with a fabricated success.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_create_session_request_with_no_pgw_is_refused() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
         let _sgwu = stand_in_sgwu(
+            &ambient,
             crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
             Duration::from_millis(0),
         )
         .await;
         // Deliberately NO anchor, set under the same guard the stand-in SGW-U holds.
         sgwc_self().set_pgw_s5c_peer(None);
-        let server = test_server(1000, 1);
+        let server = test_server(&ambient, 1000, 1);
         set_s11_server(server.clone());
         let sock = client();
         sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
@@ -2585,7 +2601,9 @@ mod tests {
     /// 150ms for the first attempt, so the "not yet" half is observed rather than assumed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn no_create_session_response_until_the_sgwu_answers() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
         let sgwu = stand_in_sgwu(
+            &ambient,
             crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
             Duration::from_millis(400),
         )
@@ -2595,7 +2613,7 @@ mod tests {
         // guard over this process's ambient SGW-C configuration — setting the PGW peer
         // before it is exactly the unlocked-writer race #308 was about.
         let _pgw = with_stand_in_pgw().await;
-        let server = test_server(1000, 1);
+        let server = test_server(&ambient, 1000, 1);
         // The gated answer is sent through the PROCESS-GLOBAL S11 server (the Sxa response
         // path has no other handle), so this test's own server has to be the installed one.
         set_s11_server(server.clone());
@@ -2691,7 +2709,9 @@ mod tests {
     /// hard-coded `REQUEST_ACCEPTED`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_refused_user_plane_yields_a_mapped_gtp_cause() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
         let _sgwu = stand_in_sgwu(
+            &ambient,
             crate::sxa_handler::pfcp_cause::NO_RESOURCES_AVAILABLE,
             Duration::ZERO,
         )
@@ -2701,7 +2721,7 @@ mod tests {
         // guard over this process's ambient SGW-C configuration — setting the PGW peer
         // before it is exactly the unlocked-writer race #308 was about.
         let _pgw = with_stand_in_pgw().await;
-        let server = test_server(1000, 1);
+        let server = test_server(&ambient, 1000, 1);
         set_s11_server(server.clone());
         let sock = client();
         let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x55];
@@ -2737,7 +2757,9 @@ mod tests {
     /// deletion result. A refusal keeps the session, so a retry can still reach it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_refused_deletion_keeps_the_session_and_says_so() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
         let _sgwu = stand_in_sgwu(
+            &ambient,
             crate::sxa_handler::pfcp_cause::SYSTEM_FAILURE,
             Duration::ZERO,
         )
@@ -2747,7 +2769,7 @@ mod tests {
         // guard over this process's ambient SGW-C configuration — setting the PGW peer
         // before it is exactly the unlocked-writer race #308 was about.
         let _pgw = with_stand_in_pgw().await;
-        let server = test_server(1000, 1);
+        let server = test_server(&ambient, 1000, 1);
         set_s11_server(server.clone());
         let sock = client();
         let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x56];
@@ -2804,7 +2826,9 @@ mod tests {
     /// and idle-mode delivery could not work however correct the pieces were.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_downlink_data_report_pages_the_ue() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
         let sgwu = stand_in_sgwu(
+            &ambient,
             crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
             Duration::ZERO,
         )
@@ -2814,7 +2838,7 @@ mod tests {
         // guard over this process's ambient SGW-C configuration — setting the PGW peer
         // before it is exactly the unlocked-writer race #308 was about.
         let _pgw = with_stand_in_pgw().await;
-        let server = test_server(1000, 1);
+        let server = test_server(&ambient, 1000, 1);
         set_s11_server(server.clone());
         let sock = client();
         let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x57];
@@ -2876,7 +2900,9 @@ mod tests {
     /// message ever drained.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_refused_ddn_discards_the_buffered_packets() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
         let sgwu = stand_in_sgwu(
+            &ambient,
             crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
             Duration::ZERO,
         )
@@ -2886,7 +2912,7 @@ mod tests {
         // guard over this process's ambient SGW-C configuration — setting the PGW peer
         // before it is exactly the unlocked-writer race #308 was about.
         let _pgw = with_stand_in_pgw().await;
-        let server = test_server(1000, 1);
+        let server = test_server(&ambient, 1000, 1);
         set_s11_server(server.clone());
         let sock = client();
         let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x58];
@@ -2946,7 +2972,9 @@ mod tests {
     /// all.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_ddn_failure_indication_discards_the_buffered_packets() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
         let sgwu = stand_in_sgwu(
+            &ambient,
             crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
             Duration::ZERO,
         )
@@ -2956,7 +2984,7 @@ mod tests {
         // guard over this process's ambient SGW-C configuration — setting the PGW peer
         // before it is exactly the unlocked-writer race #308 was about.
         let _pgw = with_stand_in_pgw().await;
-        let server = test_server(1000, 1);
+        let server = test_server(&ambient, 1000, 1);
         set_s11_server(server.clone());
         let sock = client();
         let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x5A];
@@ -3014,7 +3042,9 @@ mod tests {
     /// busy idle UE could produce a notification per downlink packet.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_data_notification_delay_throttles_the_next_ddn() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
         let sgwu = stand_in_sgwu(
+            &ambient,
             crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
             Duration::ZERO,
         )
@@ -3024,7 +3054,7 @@ mod tests {
         // guard over this process's ambient SGW-C configuration — setting the PGW peer
         // before it is exactly the unlocked-writer race #308 was about.
         let _pgw = with_stand_in_pgw().await;
-        let server = test_server(1000, 1);
+        let server = test_server(&ambient, 1000, 1);
         set_s11_server(server.clone());
         let sock = client();
         let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x59];
@@ -3088,7 +3118,8 @@ mod tests {
 
     #[test]
     fn test_create_session_request_missing_imsi_rejected() {
-        let server = test_server(1000, 1);
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let server = test_server(&ambient, 1000, 1);
         let sock = client();
 
         let mut msg = csr(0x1002, &[0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x02]);
@@ -3111,7 +3142,8 @@ mod tests {
 
     #[test]
     fn test_modify_bearer_request_unknown_teid_rejected() {
-        let server = test_server(1000, 1);
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let server = test_server(&ambient, 1000, 1);
         let sock = client();
 
         let msg = Gtp2Message::new(nextgcore_gtp::v2::header::Gtp2Header::new(
@@ -3140,7 +3172,9 @@ mod tests {
     /// and creates no second session.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_duplicate_request_answered_from_cache() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
         let _sgwu = stand_in_sgwu(
+            &ambient,
             crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
             Duration::ZERO,
         )
@@ -3150,7 +3184,7 @@ mod tests {
         // guard over this process's ambient SGW-C configuration — setting the PGW peer
         // before it is exactly the unlocked-writer race #308 was about.
         let _pgw = with_stand_in_pgw().await;
-        let server = test_server(1000, 1);
+        let server = test_server(&ambient, 1000, 1);
         set_s11_server(server.clone());
         let sock = client();
         let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x03];
@@ -3177,7 +3211,9 @@ mod tests {
     /// alone would time out.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_full_session_lifecycle_over_socket() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
         let _sgwu = stand_in_sgwu(
+            &ambient,
             crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
             Duration::ZERO,
         )
@@ -3187,7 +3223,7 @@ mod tests {
         // guard over this process's ambient SGW-C configuration — setting the PGW peer
         // before it is exactly the unlocked-writer race #308 was about.
         let _pgw = with_stand_in_pgw().await;
-        let server = test_server(1000, 1);
+        let server = test_server(&ambient, 1000, 1);
         set_s11_server(server.clone());
         let sock = client();
         let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x04];
@@ -3269,9 +3305,10 @@ mod tests {
 
     #[test]
     fn test_ddn_t3_n3_retransmission_and_exhaustion() {
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
         // Tiny T3, N3=2: the silent peer must see 1 + 2 = 3 datagrams,
         // after which the path is marked Failed.
-        let server = test_server(50, 2);
+        let server = test_server(&ambient, 50, 2);
         let silent_peer = client();
         let peer_addr = silent_peer.local_addr().unwrap();
 
@@ -3321,7 +3358,8 @@ mod tests {
 
     #[test]
     fn test_ddn_ack_matches_transaction() {
-        let server = test_server(1000, 1);
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let server = test_server(&ambient, 1000, 1);
         let mme = client();
         let peer_addr = mme.local_addr().unwrap();
 
@@ -3370,7 +3408,8 @@ mod tests {
 
     #[test]
     fn test_peer_restart_counter_staleness_detected() {
-        let server = test_server(1000, 1);
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let server = test_server(&ambient, 1000, 1);
         let sock = client();
 
         // First echo with restart counter 3
@@ -3417,7 +3456,8 @@ mod tests {
     /// elicit a type-3 Version Not Supported Indication, not a silent drop.
     #[test]
     fn unsupported_gtp_version_gets_a_version_not_supported_reply() {
-        let server = test_server(200, 2);
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let server = test_server(&ambient, 200, 2);
         let sock = client();
 
         // GTPv3 header: version 3 in the top 3 bits of the flags octet.
@@ -3457,7 +3497,8 @@ mod tests {
     /// becoming "reply to anything we cannot parse".
     #[test]
     fn lower_gtp_version_is_still_dropped_silently() {
-        let server = test_server(200, 2);
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let server = test_server(&ambient, 200, 2);
         let sock = client();
         sock.set_read_timeout(Some(Duration::from_millis(300)))
             .unwrap();

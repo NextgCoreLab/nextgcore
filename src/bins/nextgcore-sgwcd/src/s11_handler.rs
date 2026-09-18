@@ -825,6 +825,11 @@ mod tests {
         use crate::s11_build::{
             build_create_indirect_data_forwarding_tunnel_response, f_teid_interface,
         };
+        // `gtpu_address` is a single process-global slot and
+        // `gtp_path::tests::test_server` sets it to 10.99.0.1; the handler re-reads it
+        // at `s11_handler.rs:529`, so the write and the read must not be interleaved
+        // with a sibling's (#368).
+        let _ambient = crate::pfcp_path::process_state_test_guard_blocking();
         let ctx = sgwc_self();
         ctx.set_gtpu_address(Some(Ipv4Addr::new(10, 11, 0, 7)));
 

@@ -756,6 +756,30 @@ pub fn pcf_notify_unrestorable_associations() -> (usize, usize) {
         Ok(ctx) => ctx.take_unrestorable_associations(),
         Err(_) => Vec::new(),
     };
+    notify_unrestorable_associations(pending)
+}
+
+/// The notification decision for one drained batch, split out of
+/// [`pcf_notify_unrestorable_associations`] so it can be driven without the
+/// process-global queue (#368).
+///
+/// The queue lives on `pcf_self()` and `PcfContext::take_unrestorable_associations`
+/// drains it with `std::mem::take`, so two tests that each queue an entry and then
+/// call the wrapper see *each other's* entry: whoever drains first reports both, and
+/// the loser drains nothing. That is what made
+/// `boot_terminates_an_unrestorable_association_toward_the_smf` and
+/// `boot_counts_an_association_with_no_callback_as_unreachable` fail in the *same*
+/// run about 1 workspace run in 8 -- the window between one test's queue and its own
+/// drain is short, which is why ten isolation runs never showed it and a loaded
+/// runner does.
+///
+/// Taking the batch as an argument removes the shared mutation rather than locking
+/// around it, so the behavioural tests are deterministic and order-independent.
+/// `pcf_notify_unrestorable_associations` keeps its own test, because a batch
+/// function proves nothing about whether the wrapper drains the global.
+fn notify_unrestorable_associations(
+    pending: Vec<crate::context::UnrestorableAssociation>,
+) -> (usize, usize) {
     if pending.is_empty() {
         return (0, 0);
     }
@@ -1824,6 +1848,10 @@ mod tests {
     /// `spawn_notification` is fire-and-forget, so the stub SMF counts arrivals and
     /// the test waits for one with a bounded poll rather than sleeping a fixed
     /// interval.
+    ///
+    /// Drives `notify_unrestorable_associations` with its own batch rather than the
+    /// process-global queue: see that function's doc for the race this and its
+    /// sibling used to lose (#368).
     #[tokio::test]
     async fn boot_terminates_an_unrestorable_association_toward_the_smf() {
         use nextgcore_sbi::message::{SbiRequest as Req, SbiResponse as Resp};
@@ -1865,15 +1893,12 @@ mod tests {
         );
 
         // The shape `restore_from` produces from a record it could not type.
-        if let Ok(ctx) = crate::context::pcf_self().read() {
-            ctx.queue_unrestorable_association_for_test(
-                Some("pol-193-wire".to_string()),
-                Some(notif_uri.clone()),
-                "policy association could not be restored: test".to_string(),
-            );
-        }
-
-        let (notified, unnotifiable) = pcf_notify_unrestorable_associations();
+        let (notified, unnotifiable) =
+            notify_unrestorable_associations(vec![crate::context::UnrestorableAssociation {
+                sm_policy_id: Some("pol-193-wire".to_string()),
+                notification_uri: Some(notif_uri.clone()),
+                reason: "policy association could not be restored: test".to_string(),
+            }]);
         assert_eq!((notified, unnotifiable), (1, 0));
 
         // Bounded wait for the spawned POST rather than a fixed sleep.
@@ -1904,15 +1929,75 @@ mod tests {
     /// as unreachable, rather than appearing to have been terminated.
     #[tokio::test]
     async fn boot_counts_an_association_with_no_callback_as_unreachable() {
+        let (notified, unnotifiable) =
+            notify_unrestorable_associations(vec![crate::context::UnrestorableAssociation {
+                sm_policy_id: Some("pol-193-mute".to_string()),
+                notification_uri: None,
+                reason: "policy association could not be restored: test".to_string(),
+            }]);
+        assert_eq!((notified, unnotifiable), (0, 1));
+    }
+
+    /// A batch carrying both shapes is counted per entry, not per batch.
+    ///
+    /// This is also the deterministic demonstration of the #368 flake: `(1, 1)` is
+    /// exactly what the drain returned when the two tests above raced, because each
+    /// had queued one entry into the same process-global `Vec` and whichever drained
+    /// first got both. The one expecting `(1, 0)` then saw this value and the one
+    /// expecting `(0, 1)` drained an empty queue and saw `(0, 0)` -- which is why
+    /// both failed in the same run rather than in different ones.
+    #[tokio::test]
+    async fn a_mixed_batch_is_counted_per_entry() {
+        let (notified, unnotifiable) = notify_unrestorable_associations(vec![
+            crate::context::UnrestorableAssociation {
+                sm_policy_id: Some("pol-368-a".to_string()),
+                notification_uri: Some("http://127.0.0.1:1/nsmf-callback/v1/x".to_string()),
+                reason: "policy association could not be restored: test".to_string(),
+            },
+            crate::context::UnrestorableAssociation {
+                sm_policy_id: Some("pol-368-b".to_string()),
+                notification_uri: None,
+                reason: "policy association could not be restored: test".to_string(),
+            },
+        ]);
+        assert_eq!(
+            (notified, unnotifiable),
+            (1, 1),
+            "one salvageable pair is terminated and one unsalvageable entry is counted"
+        );
+    }
+
+    /// The wrapper's own wiring: `pcf_notify_unrestorable_associations` drains the
+    /// process-global queue and a second call is a no-op.
+    ///
+    /// This is the ONLY test that touches that queue, and it must stay the only one:
+    /// `take_unrestorable_associations` drains the whole `Vec`, so a sibling that
+    /// queues concurrently is reported by whichever test drains first (#368). Assert
+    /// behaviour through `notify_unrestorable_associations` instead, which takes its
+    /// batch as an argument.
+    ///
+    /// Kept because a batch-function test cannot show that the wrapper reads the
+    /// global at all -- delete this and the drain could be removed with every other
+    /// test still green.
+    #[tokio::test]
+    async fn the_boot_notifier_drains_the_process_global_queue_once() {
         if let Ok(ctx) = crate::context::pcf_self().read() {
             ctx.queue_unrestorable_association_for_test(
-                Some("pol-193-mute".to_string()),
+                Some("pol-368-drain".to_string()),
                 None,
                 "policy association could not be restored: test".to_string(),
             );
         }
-        let (notified, unnotifiable) = pcf_notify_unrestorable_associations();
-        assert_eq!((notified, unnotifiable), (0, 1));
+        assert_eq!(
+            pcf_notify_unrestorable_associations(),
+            (0, 1),
+            "the wrapper must read the queue the restore path writes"
+        );
+        assert_eq!(
+            pcf_notify_unrestorable_associations(),
+            (0, 0),
+            "the queue is drained, so a later boot does not re-terminate"
+        );
     }
 
     #[test]
