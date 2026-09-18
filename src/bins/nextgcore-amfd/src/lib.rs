@@ -63,7 +63,7 @@ use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::mpsc;
 
 // ---------------------------------------------------------------------------
 // Typed YAML configuration structs
@@ -319,8 +319,6 @@ pub struct AmfApp {
     timer_manager: timer::TimerManager,
     /// Metrics
     metrics: metrics::AmfMetrics,
-    /// AMF context (thread-safe)
-    amf_context: Arc<RwLock<context::AmfContext>>,
     /// NGAP event channel sender
     ngap_event_tx: Option<mpsc::Sender<event::AmfEvent>>,
     /// NGAP event channel receiver
@@ -335,7 +333,6 @@ impl AmfApp {
             running: Arc::new(AtomicBool::new(true)),
             timer_manager: timer::TimerManager::new(),
             metrics: metrics::AmfMetrics::new(),
-            amf_context: Arc::new(RwLock::new(context::AmfContext::new())),
             ngap_event_tx: Some(tx),
             ngap_event_rx: Some(rx),
         }
@@ -413,7 +410,23 @@ impl AmfApp {
             }
         }
 
-        let mut ctx = self.amf_context.write().await;
+        // THE process AMF context (#363). This used to be a second, injected
+        // `AmfContext` instance distinct from `context::amf_self()`, which meant every
+        // field set below was inert for any reader that went through the global -- and
+        // the 5GMM timers had to be written to BOTH to work around it. There is now one
+        // instance, so there is nothing to keep in step.
+        //
+        // A `std::sync::RwLockWriteGuard` is `!Send` and so must not be held across an
+        // `.await`. It is not: the only `.await` in this function is the NRF-URI seed
+        // above, which completes before the guard is taken. Keep it that way -- the
+        // compiler will refuse a new `.await` below this line, which is the point.
+        let ctx_arc = context::amf_self();
+        // Write THROUGH the poison. This replaced a `tokio::sync::RwLock`, which cannot
+        // poison, so refusing to apply the configuration on a poisoned lock would be a
+        // NEW failure mode -- and the one it would produce is the worst available: an
+        // AMF running with default `integrity_order`/`ciphering_order` and no operator
+        // signal that the YAML was ignored.
+        let mut ctx = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
 
         // AMF name
         if let Some(name) = amf_section.amf_name {
@@ -518,19 +531,13 @@ impl AmfApp {
         // T3512 came solely from the context default and agreed with the YAML
         // only by coincidence. A config change was silently inert.
         //
-        // These are applied to BOTH contexts on purpose. `self.amf_context` (the
-        // one this function fills, and the one NGAP is handed) and the global
-        // `context::amf_self()` are separate `AmfContext` instances today — see
-        // `apply_timer_conf`. `build_registration_accept` reads the global, so
-        // writing only `ctx` here would leave the YAML inert for the one message
-        // that actually carries T3512.
+        // #363 removed the double write that used to stand here. `ctx` IS the global
+        // now, so `build_registration_accept` -- which reads `amf_self()` -- sees this
+        // write like every other reader. A second `amf_self().write()` here would not
+        // merely be redundant, it would DEADLOCK: `std::sync::RwLock` is not reentrant
+        // and this function already holds the write guard.
         let timers = amf_section.time.unwrap_or_default();
         Self::apply_timer_conf(&mut ctx, &timers);
-        if let Ok(mut global) = context::amf_self().write() {
-            Self::apply_timer_conf(&mut global, &timers);
-        } else {
-            log::warn!("global AMF context lock poisoned; T3512/T3502 left at defaults");
-        }
 
         log::info!(
             "AMF configuration loaded: {} GUAMI, {} TAI, {} PLMN support, T3512={}s",
@@ -660,13 +667,7 @@ impl AmfApp {
             .take()
             .ok_or_else(|| anyhow::anyhow!("NGAP event sender already taken"))?;
 
-        ngap_path::amf_ngap_open(
-            Some(ngap_addr),
-            sctp_backend,
-            Arc::clone(&self.amf_context),
-            event_tx,
-        )
-        .await?;
+        ngap_path::amf_ngap_open(Some(ngap_addr), sctp_backend, event_tx).await?;
 
         log::info!("NGAP server initialized on {ngap_addr}");
         Ok(())
@@ -826,11 +827,6 @@ impl AmfApp {
     pub fn timer_manager(&self) -> &timer::TimerManager {
         &self.timer_manager
     }
-
-    /// Get AMF context reference
-    pub fn amf_context(&self) -> Arc<RwLock<context::AmfContext>> {
-        Arc::clone(&self.amf_context)
-    }
 }
 
 impl Default for AmfApp {
@@ -976,6 +972,164 @@ mod tests {
     fn test_amf_app_creation() {
         let app = AmfApp::new();
         assert!(app.running.load(Ordering::SeqCst));
+    }
+
+    /// #363: there is ONE `AmfContext` in the process, so everything the config loader
+    /// writes is read back by the readers that go through `context::amf_self()` — which
+    /// is every reader in the crate except the 8 sites that used to hold an injected
+    /// instance.
+    ///
+    /// Before this change the loader filled a *second, distinct* `AmfContext` that only
+    /// `NgapServer` could see. `integrity_order`, `ciphering_order`, `served_guami`,
+    /// `served_tai` and PLMN support were therefore inert for every reader that went
+    /// through the global, and the 5GMM timers worked only because `apply_timer_conf`
+    /// was called TWICE, once per instance.
+    ///
+    /// **Deleting that double write is this change's revert-verification**, and this is
+    /// the test that fails if the split comes back: with two instances the loader's
+    /// write lands on the injected one and `amf_self()` still reports the defaults.
+    ///
+    /// The fixture deliberately avoids every default. `t3512` is **777**, not 540 —
+    /// 540 is both `AmfContext::new()`'s default *and* what every shipped config
+    /// declares, so a test using it would pass whether or not the YAML was read at all.
+    /// That coincidence is the whole reason the T3512 bug went unnoticed. The algorithm
+    /// orders are `NIA3,NIA1` / `NEA3,NEA1`: non-empty (the default is empty) and in a
+    /// non-preference order, so the assertion cannot be satisfied by the fallback mask.
+    #[tokio::test]
+    async fn the_config_loader_writes_the_context_the_ngap_readers_read() {
+        use std::io::Write;
+
+        let yaml = r#"
+amf:
+  amf_name: amf-363
+  guami:
+    - plmn_id: { mcc: 001, mnc: 01 }
+      amf_id: { region: 7, set: 9, pointer: 3 }
+  tai:
+    - plmn_id: { mcc: 001, mnc: 01 }
+      tac: 363
+  plmn_support:
+    - plmn_id: { mcc: 001, mnc: 01 }
+      s_nssai:
+        - sst: 3
+          sd: 999
+  security:
+    integrity_order: [ NIA3, NIA1 ]
+    ciphering_order: [ NEA3, NEA1 ]
+  time:
+    t3512:
+      value: 777
+    t3502:
+      value: 888
+"#;
+        let path = std::env::temp_dir().join("nextgcore-amfd-363-one-context.yaml");
+        {
+            let mut f = std::fs::File::create(&path).expect("write the fixture config");
+            f.write_all(yaml.as_bytes())
+                .expect("write the fixture config");
+        }
+
+        // The context is process-global, so restore whatever a sibling left behind. The
+        // loader PUSHES onto these vectors, so the restore truncates to the saved
+        // lengths rather than cloning the elements.
+        context::amf_context_init(64, 1024, 4096);
+        let ctx_arc = context::amf_self();
+        let saved = {
+            let c = ctx_arc.read().unwrap_or_else(|e| e.into_inner());
+            (
+                c.integrity_order.len(),
+                c.ciphering_order.len(),
+                c.served_guami.len(),
+                c.served_tai.len(),
+                c.plmn_support.len(),
+                c.num_of_integrity_order,
+                c.num_of_ciphering_order,
+                c.num_of_served_guami,
+                c.num_of_served_tai,
+                c.num_of_plmn_support,
+                c.t3512_value,
+                c.t3502_value,
+                c.amf_name.clone(),
+            )
+        };
+
+        AmfApp::new()
+            .load_config(path.to_str().expect("utf-8 temp path"))
+            .await
+            .expect("the fixture config must load");
+
+        {
+            let c = ctx_arc.read().unwrap_or_else(|e| e.into_inner());
+
+            // The security-relevant pair, which #363 names as the one to worry about:
+            // written to the injected instance only, so inert for a global reader.
+            assert_eq!(
+                c.integrity_order[saved.0..],
+                [3u8, 1u8],
+                "integrity_order must reach the global context IN ORDER"
+            );
+            assert_eq!(
+                c.ciphering_order[saved.1..],
+                [3u8, 1u8],
+                "ciphering_order must reach the global context IN ORDER"
+            );
+            // Asserted through the registration path's OWN reader rather than by
+            // recomputing the mask here: NIA3|NIA1 is 0b1010 within the 0x0E window.
+            assert_eq!(
+                ngap_path::algorithm_order_to_mask(&c.integrity_order[saved.0..], 0x0E),
+                (1 << 3) | (1 << 1),
+                "the NAS integrity mask the registration path computes must come from \
+                 the configured order, not the default"
+            );
+
+            assert_eq!(
+                c.t3512_value, 777,
+                "T3512 must come from the YAML; 540 would be the default AND what every \
+                 shipped config says, so it cannot distinguish the two"
+            );
+            assert_eq!(c.t3502_value, 888, "T3502 must come from the YAML");
+            assert_eq!(c.amf_name.as_deref(), Some("amf-363"));
+
+            let guami = c.served_guami.last().expect("a GUAMI was configured");
+            assert_eq!(
+                (guami.amf_id.region, guami.amf_id.set, guami.amf_id.pointer),
+                (7, 9, 3),
+                "served_guami must reach the global context: sites that build the UECM \
+                 registration, the UE policy association and the Handover Request all \
+                 read it from there"
+            );
+            let tai = c.served_tai.last().expect("a TAI was configured");
+            assert_eq!(
+                tai.list0.tac,
+                vec![363],
+                "served_tai must reach the global context: NG Setup matches against it"
+            );
+            let plmn = c.plmn_support.last().expect("PLMN support was configured");
+            assert_eq!(
+                plmn.s_nssai.first().map(|s| (s.sst, s.sd)),
+                Some((3, Some(999))),
+                "plmn_support must reach the global context: it is the PLMN default the \
+                 Allowed NSSAI selection falls back to"
+            );
+        }
+
+        {
+            let mut c = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
+            c.integrity_order.truncate(saved.0);
+            c.ciphering_order.truncate(saved.1);
+            c.served_guami.truncate(saved.2);
+            c.served_tai.truncate(saved.3);
+            c.plmn_support.truncate(saved.4);
+            c.num_of_integrity_order = saved.5;
+            c.num_of_ciphering_order = saved.6;
+            c.num_of_served_guami = saved.7;
+            c.num_of_served_tai = saved.8;
+            c.num_of_plmn_support = saved.9;
+            c.t3512_value = saved.10;
+            c.t3502_value = saved.11;
+            c.amf_name = saved.12;
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -23,9 +23,7 @@ use nextgcore_sctp::{
     NextgcoreSctpInfo, SctpServer, SctpServerConfig, ServerEvent, NEXTGCORE_NGAP_SCTP_PORT,
 };
 
-use crate::context::{
-    AmfContext, AmfGnb, AmfUe, Guti5gs, PlmnId, SNssai, SupportedTa, UeSecurityCapability,
-};
+use crate::context::{AmfGnb, AmfUe, Guti5gs, PlmnId, SNssai, SupportedTa, UeSecurityCapability};
 use crate::event::AmfEvent;
 use crate::gmm_build::{self, message_type, mobile_identity_type, security_header, GmmCause};
 use crate::gmm_handler::payload_container_type;
@@ -535,8 +533,6 @@ pub struct NgapServer {
     assoc_to_addr: Arc<RwLock<HashMap<u64, SocketAddr>>>,
     /// Next gNB ID
     next_gnb_id: Arc<Mutex<u64>>,
-    /// AMF context reference
-    amf_context: Arc<RwLock<AmfContext>>,
     /// Event sender for NGAP events
     event_tx: mpsc::Sender<AmfEvent>,
     /// Server event receiver
@@ -588,10 +584,16 @@ pub struct NgapServer {
 
 impl NgapServer {
     /// Create a new NGAP server on the selected SCTP backend.
+    ///
+    /// Reads the AMF context through [`crate::context::amf_self`] rather than taking an
+    /// injected one. Before #363 it took an `Arc<tokio::sync::RwLock<AmfContext>>` that
+    /// was a *second, distinct* instance from the global, so this module read two
+    /// different `AmfContext`s a few lines apart -- 8 sites from the injected one and 23
+    /// from the global -- and every setting the config loader wrote had to be written
+    /// twice or be inert on one side.
     pub async fn new(
         bind_addr: SocketAddr,
         backend: SctpBackend,
-        amf_context: Arc<RwLock<AmfContext>>,
         event_tx: mpsc::Sender<AmfEvent>,
     ) -> Result<Self> {
         // Configure SCTP server
@@ -624,7 +626,6 @@ impl NgapServer {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             assoc_to_addr: Arc::new(RwLock::new(HashMap::new())),
             next_gnb_id: Arc::new(Mutex::new(1)),
-            amf_context,
             event_tx,
             server_event_rx,
             ue_auth_state: HashMap::new(),
@@ -1227,7 +1228,11 @@ impl NgapServer {
         let response_data: Option<Vec<u8>> = {
             let mut sessions = self.sessions.write().await;
             if let Some(session) = sessions.get_mut(&association_id) {
-                let ctx = self.amf_context.read().await;
+                let ctx_arc = crate::context::amf_self();
+                // Read THROUGH the poison: this replaced a `tokio::sync::RwLock`,
+                // which cannot poison, so bailing here would be a new failure mode
+                // rather than a preserved one (#363).
+                let ctx = ctx_arc.read().unwrap_or_else(|e| e.into_inner());
 
                 // Handle the request
                 let result =
@@ -2535,11 +2540,19 @@ impl NgapServer {
         // Select NAS algorithms from the UE's replayed capabilities and the
         // AMF-supported set (configured order; default NIA2/NEA2 preference)
         let amf_int_mask = {
-            let ctx = self.amf_context.read().await;
+            let ctx_arc = crate::context::amf_self();
+            // Read THROUGH the poison: this replaced a `tokio::sync::RwLock`,
+            // which cannot poison, so bailing here would be a new failure mode
+            // rather than a preserved one (#363).
+            let ctx = ctx_arc.read().unwrap_or_else(|e| e.into_inner());
             algorithm_order_to_mask(&ctx.integrity_order, 0x0E) // NIA1-3, never NIA0 by preference
         };
         let amf_enc_mask = {
-            let ctx = self.amf_context.read().await;
+            let ctx_arc = crate::context::amf_self();
+            // Read THROUGH the poison: this replaced a `tokio::sync::RwLock`,
+            // which cannot poison, so bailing here would be a new failure mode
+            // rather than a preserved one (#363).
+            let ctx = ctx_arc.read().unwrap_or_else(|e| e.into_inner());
             algorithm_order_to_mask(&ctx.ciphering_order, 0x0F)
         };
         let ue_int_mask = wire_caps_to_mask(state.amf_ue.ue_security_capability.ia);
@@ -3074,7 +3087,11 @@ impl NgapServer {
 
         // GUAMI of this AMF (for UECM registration)
         let (guami_plmn, amf_region, amf_set, amf_pointer) = {
-            let ctx = self.amf_context.read().await;
+            let ctx_arc = crate::context::amf_self();
+            // Read THROUGH the poison: this replaced a `tokio::sync::RwLock`,
+            // which cannot poison, so bailing here would be a new failure mode
+            // rather than a preserved one (#363).
+            let ctx = ctx_arc.read().unwrap_or_else(|e| e.into_inner());
             match ctx.served_guami.first() {
                 Some(g) => (
                     g.plmn_id.clone(),
@@ -3203,7 +3220,11 @@ impl NgapServer {
             .map(|(sst, sd)| SNssai { sst: *sst, sd: *sd })
             .collect();
         let plmn_default: Vec<SNssai> = {
-            let ctx = self.amf_context.read().await;
+            let ctx_arc = crate::context::amf_self();
+            // Read THROUGH the poison: this replaced a `tokio::sync::RwLock`,
+            // which cannot poison, so bailing here would be a new failure mode
+            // rather than a preserved one (#363).
+            let ctx = ctx_arc.read().unwrap_or_else(|e| e.into_inner());
             ctx.plmn_support
                 .first()
                 .map(|ps| ps.s_nssai.clone())
@@ -3424,7 +3445,11 @@ impl NgapServer {
         // Build the Initial Context Setup Request carrying the protected
         // Registration Accept as the NAS-PDU.
         let ics = {
-            let ctx = self.amf_context.read().await;
+            let ctx_arc = crate::context::amf_self();
+            // Read THROUGH the poison: this replaced a `tokio::sync::RwLock`,
+            // which cannot poison, so bailing here would be a new failure mode
+            // rather than a preserved one (#363).
+            let ctx = ctx_arc.read().unwrap_or_else(|e| e.into_inner());
             crate::ngap_asn1::build_initial_context_setup_request_asn1(
                 &ctx,
                 amf_ue_ngap_id,
@@ -3504,7 +3529,11 @@ impl NgapServer {
         let ue_policy_container = state.ue_policy_container.clone();
 
         let (guami_plmn, amf_region, amf_set, amf_pointer) = {
-            let ctx = self.amf_context.read().await;
+            let ctx_arc = crate::context::amf_self();
+            // Read THROUGH the poison: this replaced a `tokio::sync::RwLock`,
+            // which cannot poison, so bailing here would be a new failure mode
+            // rather than a preserved one (#363).
+            let ctx = ctx_arc.read().unwrap_or_else(|e| e.into_inner());
             match ctx.served_guami.first() {
                 Some(g) => (
                     g.plmn_id.clone(),
@@ -5744,7 +5773,11 @@ impl NgapServer {
         };
 
         let (guami_plmn, amf_region, amf_set, amf_pointer) = {
-            let ctx = self.amf_context.read().await;
+            let ctx_arc = crate::context::amf_self();
+            // Read THROUGH the poison: this replaced a `tokio::sync::RwLock`,
+            // which cannot poison, so bailing here would be a new failure mode
+            // rather than a preserved one (#363).
+            let ctx = ctx_arc.read().unwrap_or_else(|e| e.into_inner());
             match ctx.served_guami.first() {
                 Some(g) => (
                     g.plmn_id.clone(),
@@ -8412,7 +8445,11 @@ fn supported_ta_from_ngap(item: &nextgcore_ngap::types::SupportedTaItem) -> Supp
 
 /// Convert a configured algorithm preference order into a support mask;
 /// `default_mask` when no order is configured
-fn algorithm_order_to_mask(order: &[u8], default_mask: u8) -> u8 {
+///
+/// `pub(crate)` so #363's one-context test can assert the NAS algorithm selection
+/// through the SAME reader the registration path uses, rather than reimplementing the
+/// mask arithmetic in the test and proving only that two copies of it agree.
+pub(crate) fn algorithm_order_to_mask(order: &[u8], default_mask: u8) -> u8 {
     if order.is_empty() {
         return default_mask;
     }
@@ -8461,10 +8498,9 @@ impl NgapServerHandle {
     pub async fn new(
         bind_addr: SocketAddr,
         backend: SctpBackend,
-        amf_context: Arc<RwLock<AmfContext>>,
         event_tx: mpsc::Sender<AmfEvent>,
     ) -> Result<Self> {
-        let server = NgapServer::new(bind_addr, backend, amf_context, event_tx).await?;
+        let server = NgapServer::new(bind_addr, backend, event_tx).await?;
         Ok(Self {
             inner: Arc::new(Mutex::new(server)),
         })
@@ -8506,7 +8542,6 @@ static NGAP_SERVER: once_cell::sync::OnceCell<NgapServerHandle> = once_cell::syn
 pub async fn amf_ngap_open(
     bind_addr: Option<SocketAddr>,
     backend: SctpBackend,
-    amf_context: Arc<RwLock<AmfContext>>,
     event_tx: mpsc::Sender<AmfEvent>,
 ) -> Result<()> {
     let addr = bind_addr.unwrap_or_else(|| {
@@ -8515,7 +8550,7 @@ pub async fn amf_ngap_open(
             .expect("value expected")
     });
 
-    let handle = NgapServerHandle::new(addr, backend, amf_context, event_tx).await?;
+    let handle = NgapServerHandle::new(addr, backend, event_tx).await?;
     let local_addr = handle.local_addr().await;
 
     let _ = NGAP_SERVER.set(handle);
@@ -8552,15 +8587,14 @@ pub async fn amf_ngap_poll() -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::AmfContext;
     use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn test_ngap_server_creation() {
         let (tx, _rx) = mpsc::channel(100);
-        let ctx = Arc::new(RwLock::new(AmfContext::new()));
-
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let handle = NgapServerHandle::new(addr, SctpBackend::Userspace, ctx, tx).await;
+        let handle = NgapServerHandle::new(addr, SctpBackend::Userspace, tx).await;
 
         assert!(handle.is_ok());
         let handle = handle.unwrap();
@@ -9958,14 +9992,9 @@ mod tests {
         let (etx, _erx) = mpsc::channel(64);
         // Leak the receiver so spawned event sends never error the test.
         std::mem::forget(_erx);
-        NgapServer::new(
-            "127.0.0.1:0".parse().unwrap(),
-            SctpBackend::Userspace,
-            Arc::new(RwLock::new(AmfContext::new())),
-            etx,
-        )
-        .await
-        .expect("NGAP test server")
+        NgapServer::new("127.0.0.1:0".parse().unwrap(), SctpBackend::Userspace, etx)
+            .await
+            .expect("NGAP test server")
     }
 
     /// #91 criterion 7: the UE policy association -- and therefore the PCF's DL MANAGE
@@ -11207,28 +11236,42 @@ mod tests {
         // NG Setup is rejected on "no matching TAI", so this test would stay green
         // even if the fabricated-request path came back — it would be passing for
         // the wrong reason. Revert-verification is what exposed that.
-        let ctx = Arc::new(RwLock::new({
-            let mut c = AmfContext::new();
-            c.num_of_served_tai = 1;
-            c.served_tai.push(crate::context::ServedTai {
+        //
+        // #363: this used to seed an INJECTED `AmfContext` that only the NGAP server
+        // could see. There is one instance now, so the TAI goes into the global —
+        // which is the only reason this test still proves what it claims.
+        //
+        // Written to be idempotent, and it is the only writer of `served_tai` in the
+        // process outside the config loader (verified by grep: every other write is on
+        // a locally-constructed context in `ngap_handler`'s own tests). A second,
+        // unconditional push would make `num_of_served_tai` disagree with the vector's
+        // length on a re-run — the accumulate-on-a-global hazard that a per-instance
+        // context used to hide.
+        {
+            let ctx_arc = crate::context::amf_self();
+            let mut c = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
+            let tai = crate::context::ServedTai {
                 list0: crate::context::Tai0List {
                     plmn_id: PlmnId::new("999", "70"),
                     tac: vec![1],
                 },
                 ..Default::default()
-            });
-            c
-        }));
+            };
+            if !c
+                .served_tai
+                .iter()
+                .any(|t| t.list0.plmn_id == tai.list0.plmn_id && t.list0.tac == tai.list0.tac)
+            {
+                c.served_tai.push(tai);
+                c.num_of_served_tai = c.served_tai.len();
+            }
+        }
         let (etx, _erx) = mpsc::channel(64);
         std::mem::forget(_erx);
-        let mut server = NgapServer::new(
-            "127.0.0.1:0".parse().unwrap(),
-            SctpBackend::Userspace,
-            ctx,
-            etx,
-        )
-        .await
-        .expect("NGAP test server");
+        let mut server =
+            NgapServer::new("127.0.0.1:0".parse().unwrap(), SctpBackend::Userspace, etx)
+                .await
+                .expect("NGAP test server");
         let assoc = 9601u64;
         seed_gnb_session(&server, assoc).await;
         let _ = server
