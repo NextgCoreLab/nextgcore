@@ -2128,10 +2128,14 @@ impl NgapServer {
                         let reject = gmm_build::build_registration_reject(
                             GmmCause::PermanentlyNotAuthorized,
                         );
-                        self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
-                            .await?;
-                        self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
-                            .await?;
+                        self.reject_and_release(
+                            association_id,
+                            amf_ue_ngap_id,
+                            ran_ue_ngap_id,
+                            &reject,
+                            1,
+                        )
+                        .await?;
                         return Ok(());
                     }
                     if is_snpn_onboarding_suci(&suci) {
@@ -2345,9 +2349,20 @@ impl NgapServer {
                 log::error!("AUSF authentication failed for {}: {e}", state.suci);
                 let cause = gmm_cause_from_sbi_error(&e);
                 let reject = gmm_build::build_registration_reject(cause);
-                self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
-                    .await?;
-                self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                // The state is deliberately NOT put back here, unlike in every sibling
+                // failure arm (#359). Those arms re-insert because they refuse a UE the
+                // caller may still be holding; this one has already decided the UE is gone,
+                // and `reject_and_release` reads nothing from the map -- it builds the reject
+                // from `cause`, and `release_ue` takes the ids as arguments. Re-inserting
+                // would be one line whose removal changes no observable behaviour, which is
+                // the kind of line that reads as load-bearing and is not.
+                //
+                // What makes that safe is that `release_ue` now runs unconditionally: before
+                // this fix the `?` on the reject send returned first, so the state was gone
+                // AND nothing had released it. `forget_ue`'s removal is a no-op on this arm
+                // and its `release_emergency` is not, which is why the emergency context is
+                // the observable in the test.
+                self.reject_and_release(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject, 1)
                     .await?;
             }
         }
@@ -2420,10 +2435,14 @@ impl NgapServer {
             log::error!("HXRES* verification failed - sending Authentication Reject");
             let auth_reject = gmm_build::build_authentication_reject();
             self.ue_auth_state.insert(amf_ue_ngap_id, state);
-            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &auth_reject)
-                .await?;
-            self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
-                .await?;
+            self.reject_and_release(
+                association_id,
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                &auth_reject,
+                1,
+            )
+            .await?;
             return Ok(());
         }
         // Log the pass, not just the failure. HRES*/HXRES* comparison is where
@@ -2450,10 +2469,14 @@ impl NgapServer {
                 log::error!("AUSF 5G-AKA confirmation failed: {e}");
                 let auth_reject = gmm_build::build_authentication_reject();
                 self.ue_auth_state.insert(amf_ue_ngap_id, state);
-                self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &auth_reject)
-                    .await?;
-                self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
-                    .await?;
+                self.reject_and_release(
+                    association_id,
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    &auth_reject,
+                    1,
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -2465,10 +2488,14 @@ impl NgapServer {
             );
             let auth_reject = gmm_build::build_authentication_reject();
             self.ue_auth_state.insert(amf_ue_ngap_id, state);
-            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &auth_reject)
-                .await?;
-            self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
-                .await?;
+            self.reject_and_release(
+                association_id,
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                &auth_reject,
+                1,
+            )
+            .await?;
             return Ok(());
         }
 
@@ -2491,9 +2518,7 @@ impl NgapServer {
             let reject =
                 gmm_build::build_registration_reject(GmmCause::SecurityModeRejectedUnspecified);
             self.ue_auth_state.insert(amf_ue_ngap_id, state);
-            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
-                .await?;
-            self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+            self.reject_and_release(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject, 1)
                 .await?;
             return Ok(());
         };
@@ -2538,9 +2563,7 @@ impl NgapServer {
             let reject =
                 gmm_build::build_registration_reject(GmmCause::SecurityModeRejectedUnspecified);
             self.ue_auth_state.insert(amf_ue_ngap_id, state);
-            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
-                .await?;
-            self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+            self.reject_and_release(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject, 1)
                 .await?;
             return Ok(());
         };
@@ -2576,9 +2599,7 @@ impl NgapServer {
             let reject =
                 gmm_build::build_registration_reject(GmmCause::SecurityModeRejectedUnspecified);
             self.ue_auth_state.insert(amf_ue_ngap_id, state);
-            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
-                .await?;
-            self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+            self.reject_and_release(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject, 1)
                 .await?;
             return Ok(());
         }
@@ -2698,10 +2719,14 @@ impl NgapServer {
         if failure_count > 1 {
             log::error!("Repeated authentication failure: Authentication Reject");
             let auth_reject = gmm_build::build_authentication_reject();
-            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &auth_reject)
-                .await?;
-            self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
-                .await?;
+            self.reject_and_release(
+                association_id,
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                &auth_reject,
+                1,
+            )
+            .await?;
             return Ok(());
         }
 
@@ -2711,10 +2736,14 @@ impl NgapServer {
                 let Some(auts) = auts else {
                     log::error!("Synch failure without AUTS parameter: Authentication Reject");
                     let auth_reject = gmm_build::build_authentication_reject();
-                    self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &auth_reject)
-                        .await?;
-                    self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
-                        .await?;
+                    self.reject_and_release(
+                        association_id,
+                        amf_ue_ngap_id,
+                        ran_ue_ngap_id,
+                        &auth_reject,
+                        1,
+                    )
+                    .await?;
                     return Ok(());
                 };
                 self.start_authentication(
@@ -2734,10 +2763,14 @@ impl NgapServer {
             _ => {
                 log::error!("Unhandled auth failure cause #{cause}: Authentication Reject");
                 let auth_reject = gmm_build::build_authentication_reject();
-                self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &auth_reject)
-                    .await?;
-                self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
-                    .await?;
+                self.reject_and_release(
+                    association_id,
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    &auth_reject,
+                    1,
+                )
+                .await?;
             }
         }
         Ok(())
@@ -2873,28 +2906,35 @@ impl NgapServer {
                             );
                             // Security Mode Reject (#23), then abort the
                             // registration and release the UE context.
+                            //
+                            // The FIRST of the two sends is best-effort as well (#359):
+                            // this is the only refusal path in the file that emits two NAS
+                            // messages, so a `?` on the Security Mode Reject skipped the
+                            // Registration Reject AND the release. Bidding-down is an
+                            // ATTACK signal, which makes it the worst arm to abandon
+                            // half-applied.
                             let reject = gmm_build::build_security_mode_reject(
                                 GmmCause::UeSecurityCapabilitiesMismatch,
                             );
-                            self.send_nas_pdu(
+                            self.deliver_nas_best_effort(
                                 association_id,
                                 amf_ue_ngap_id,
                                 ran_ue_ngap_id,
                                 &reject,
+                                "the Security Mode Reject",
                             )
-                            .await?;
+                            .await;
                             let reg_reject = gmm_build::build_registration_reject(
                                 GmmCause::UeSecurityCapabilitiesMismatch,
                             );
-                            self.send_nas_pdu(
+                            self.reject_and_release(
                                 association_id,
                                 amf_ue_ngap_id,
                                 ran_ue_ngap_id,
                                 &reg_reject,
+                                23,
                             )
                             .await?;
-                            self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 23)
-                                .await?;
                             return Ok(());
                         }
                         log::info!(
@@ -3025,9 +3065,7 @@ impl NgapServer {
             let reject =
                 gmm_build::build_registration_reject(GmmCause::SecurityModeRejectedUnspecified);
             self.ue_auth_state.insert(amf_ue_ngap_id, state);
-            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
-                .await?;
-            self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+            self.reject_and_release(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject, 1)
                 .await?;
             return Ok(());
         };
@@ -3073,28 +3111,25 @@ impl NgapServer {
             log::error!("[{supi}] Nudm_UECM_Registration failed: {e}");
             let reject = gmm_build::build_registration_reject(gmm_cause_from_sbi_error(&e));
             self.ue_auth_state.insert(amf_ue_ngap_id, state);
-            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
-                .await?;
-            self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+            self.reject_and_release(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject, 1)
                 .await?;
             return Ok(());
         }
 
         // 2) Nudm_SDM_Get (am-data) + Nudm_SDM_Subscribe
-        let am_data =
-            match crate::sbi_path::call_udm_sdm_get_am_data(&udm_host, udm_port, &supi).await {
-                Ok(d) => d,
-                Err(e) => {
-                    log::error!("[{supi}] Nudm_SDM_Get failed: {e}");
-                    let reject = gmm_build::build_registration_reject(gmm_cause_from_sbi_error(&e));
-                    self.ue_auth_state.insert(amf_ue_ngap_id, state);
-                    self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
-                        .await?;
-                    self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
-                        .await?;
-                    return Ok(());
-                }
-            };
+        let am_data = match crate::sbi_path::call_udm_sdm_get_am_data(&udm_host, udm_port, &supi)
+            .await
+        {
+            Ok(d) => d,
+            Err(e) => {
+                log::error!("[{supi}] Nudm_SDM_Get failed: {e}");
+                let reject = gmm_build::build_registration_reject(gmm_cause_from_sbi_error(&e));
+                self.ue_auth_state.insert(amf_ue_ngap_id, state);
+                self.reject_and_release(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject, 1)
+                    .await?;
+                return Ok(());
+            }
+        };
         match crate::sbi_path::call_udm_sdm_subscribe(
             &udm_host,
             udm_port,
@@ -3108,9 +3143,7 @@ impl NgapServer {
                 log::error!("[{supi}] Nudm_SDM_Subscribe failed: {e}");
                 let reject = gmm_build::build_registration_reject(gmm_cause_from_sbi_error(&e));
                 self.ue_auth_state.insert(amf_ue_ngap_id, state);
-                self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
-                    .await?;
-                self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                self.reject_and_release(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject, 1)
                     .await?;
                 return Ok(());
             }
@@ -3139,9 +3172,7 @@ impl NgapServer {
                 log::error!("[{supi}] Npcf_AMPolicyControl_Create failed: {e}");
                 let reject = gmm_build::build_registration_reject(gmm_cause_from_sbi_error(&e));
                 self.ue_auth_state.insert(amf_ue_ngap_id, state);
-                self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
-                    .await?;
-                self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                self.reject_and_release(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject, 1)
                     .await?;
                 return Ok(());
             }
@@ -3186,9 +3217,7 @@ impl NgapServer {
             );
             let reject = gmm_build::build_registration_reject(GmmCause::NoNetworkSlicesAvailable);
             self.ue_auth_state.insert(amf_ue_ngap_id, state);
-            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
-                .await?;
-            self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+            self.reject_and_release(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject, 1)
                 .await?;
             return Ok(());
         }
@@ -3260,9 +3289,7 @@ impl NgapServer {
                     GmmCause::InsufficientResourcesForSpecificSlice,
                 );
                 self.ue_auth_state.insert(amf_ue_ngap_id, state);
-                self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
-                    .await?;
-                self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                self.reject_and_release(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject, 1)
                     .await?;
                 return Ok(());
             }
@@ -5239,11 +5266,17 @@ impl NgapServer {
                     self.ue_auth_state.insert(amf_ue_ngap_id, state);
                 }
                 NasProcTimer::T3560 => {
-                    // Abort authentication/SMC and release the N1 connection
+                    // Abort authentication/SMC and release the N1 connection.
+                    //
+                    // No trailing `ue_auth_state.remove`: `release_ue` calls `forget_ue`
+                    // as its first act, so the entry is already gone. The raw remove that
+                    // used to sit here was redundant AND against `forget_ue`'s own
+                    // instruction to be the only remover of a UE that is gone -- one
+                    // funnel, or #356's emergency context leaks again the next time a path
+                    // is added beside it.
                     self.ue_auth_state.insert(amf_ue_ngap_id, state);
                     self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
                         .await?;
-                    self.ue_auth_state.remove(&amf_ue_ngap_id);
                 }
                 NasProcTimer::T3570 => {
                     if state.pei_requested {
@@ -5253,11 +5286,11 @@ impl NgapServer {
                         self.complete_registration(association_id, amf_ue_ngap_id, ran_ue_ngap_id)
                             .await?;
                     } else {
-                        // SUCI identification aborted: release
+                        // SUCI identification aborted: release. `release_ue` -> `forget_ue`
+                        // owns the removal; see the T3560 arm.
                         self.ue_auth_state.insert(amf_ue_ngap_id, state);
                         self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
                             .await?;
-                        self.ue_auth_state.remove(&amf_ue_ngap_id);
                     }
                 }
                 NasProcTimer::T3555 => {
@@ -5282,10 +5315,15 @@ impl NgapServer {
                     self.ue_auth_state.insert(amf_ue_ngap_id, state);
                 }
                 NasProcTimer::T3522 => {
-                    // Implicit deregistration (TS 24.501 Section 5.5.2.3.6)
+                    // Implicit deregistration (TS 24.501 Section 5.5.2.3.6).
+                    //
+                    // The raw remove that used to sit between these two calls was worse
+                    // than the other two: it ran BEFORE `release_ue`, so `forget_ue` found
+                    // nothing to remove and this path depended on `release_emergency`
+                    // being reachable without the map entry. `release_ue` -> `forget_ue`
+                    // owns the removal.
                     self.ue_auth_state.insert(amf_ue_ngap_id, state);
                     self.release_all_pdu_sessions(amf_ue_ngap_id).await;
-                    self.ue_auth_state.remove(&amf_ue_ngap_id);
                     self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 2)
                         .await?;
                 }
@@ -5362,6 +5400,75 @@ impl NgapServer {
                 self.emergency.active_count()
             );
         }
+    }
+
+    /// Deliver a NAS PDU on a path whose OUTCOME does not depend on it arriving.
+    ///
+    /// `send_nas_pdu` maps any SCTP send failure to `Err`, and on a refusal path that
+    /// error must not become the caller's: the AMF has already decided to end this UE, and
+    /// a `?` here abandons the decision half-applied. Logged at warn rather than swallowed,
+    /// because a reject the UE never received is a real diagnostic -- the UE will keep
+    /// retrying a registration the AMF has refused.
+    ///
+    /// Use ONLY where the caller goes on to release the UE. Anywhere the procedure
+    /// continues, a failed send genuinely is fatal and `?` is correct.
+    async fn deliver_nas_best_effort(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        nas: &[u8],
+        what: &str,
+    ) {
+        if let Err(e) = self
+            .send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, nas)
+            .await
+        {
+            log::warn!(
+                "UE {amf_ue_ngap_id}: {what} could not be delivered ({e}); continuing to \
+                 release the UE, which is the part that must happen (#359)"
+            );
+        }
+    }
+    /// Refuse a NAS procedure in flight: deliver `nas_reject`, then release the UE
+    /// **whether or not the reject arrived**.
+    ///
+    /// NINETEEN sites used to write `send_nas_pdu(..).await?;` immediately followed by
+    /// `release_ue(..).await?;`, so a failed reject send returned early and the release
+    /// never ran (#359). The window is narrow -- the association has to fail between the
+    /// decision to refuse and the reject being written -- but it is exactly the moment when
+    /// the gNB link is already unhealthy, i.e. when the two failures correlate.
+    ///
+    /// What was lost is not just the release command. `start_authentication` TAKES the UE's
+    /// NAS state out of `ue_auth_state` and its AUSF-failure arm never put it back, so the
+    /// early return left the `AmfUe` context gone with no release at all: the RAN kept a UE
+    /// the AMF had forgotten, every later NAS message from it hit an empty map and was
+    /// dropped by a `return Ok(())` guard, no T3560 was armed to recover it, and #356's
+    /// emergency context was orphaned because all three release sites need the UE to still
+    /// be in the map or to be named by a reset.
+    ///
+    /// A release command that cannot be delivered is still the right bookkeeping:
+    /// [`Self::release_ue`] calls [`Self::forget_ue`] as its FIRST act, so the AMF stops
+    /// holding a UE it can no longer reach either way. This is the one funnel for that
+    /// decision, so no individual arm can regress to the `?` form.
+    async fn reject_and_release(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        nas_reject: &[u8],
+        nas_cause: u8,
+    ) -> Result<()> {
+        self.deliver_nas_best_effort(
+            association_id,
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            nas_reject,
+            "the NAS reject",
+        )
+        .await;
+        self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, nas_cause)
+            .await
     }
 
     /// Send a UEContextReleaseCommand with a NAS cause and drop the UE's
@@ -11776,6 +11883,21 @@ mod tests {
     /// Asserted on the emergency context the branch records, not on the registration
     /// outcome: the registration goes on to need an AUSF, which this test has no business
     /// providing, and the branch runs before that.
+    ///
+    /// Reachability is read off `total_emergency_count`, the CUMULATIVE counter, and the
+    /// live figure is asserted separately at zero (#359). Both halves are the point: before
+    /// #359 this fixture's missing AUSF made `start_authentication` return early with the
+    /// UE's NAS state already taken out of the map, so the emergency context it had just
+    /// created was never freed and `active_count()` stayed at 1. Now the AUSF failure
+    /// refuses the registration and releases the UE, which frees the context -- so
+    /// `active_count()` is the wrong instrument for "was the branch reached" and only ever
+    /// looked right because of the defect.
+    ///
+    /// Note what this test does NOT claim: that refusing an emergency registration on an
+    /// AUSF failure is the right policy. TS 33.501 §6.7.2 / TS 23.167 allow an
+    /// UNAUTHENTICATED emergency session where regulation requires one, and this tree has
+    /// no such path -- the refusal is what `start_authentication` has always decided for
+    /// every registration type. Filed as #361; #359 only made the decision take effect.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_emergency_registration_reaches_the_emergency_handler() {
         crate::context::amf_context_init(64, 1024, 4096);
@@ -11810,10 +11932,21 @@ mod tests {
             .handle_registration_request_nas(1, amf_ue_ngap_id, 72, &nas, false)
             .await;
         assert_eq!(
-            ngap.emergency.active_count(),
+            ngap.emergency.total_emergency_count(),
             1,
             "the emergency branch must record a context; before #72 the handler had no \
              caller outside its own tests"
+        );
+        assert_eq!(
+            ngap.emergency.active_count(),
+            0,
+            "and the AUSF failure this fixture provokes must then RELEASE it: before #359 \
+             the refusal returned early with the UE's NAS state already taken out, so the \
+             context it had just created leaked and this figure stayed at 1"
+        );
+        assert!(
+            !ngap.ue_auth_state.contains_key(&amf_ue_ngap_id),
+            "and the NAS state goes with it, rather than being left with no release"
         );
     }
 
@@ -11838,41 +11971,182 @@ mod tests {
         nas
     }
 
-    /// Registers `amf_ue_ngap_id` as an EMERGENCY UE on `association_id` through the live
-    /// NAS path and asserts the context exists, so a caller cannot mistake "the fixture
-    /// never created one" for "the release worked".
-    async fn register_emergency_ue(
-        ngap: &mut NgapServer,
-        association_id: u64,
-        amf_ue_ngap_id: u64,
-    ) {
+    /// Puts `amf_ue_ngap_id` into the state every release path under test starts from: an
+    /// EMERGENCY UE on `association_id` holding BOTH a NAS context and an emergency
+    /// context. Asserts both, so a caller cannot mistake "the fixture never created one"
+    /// for "the release worked".
+    ///
+    /// Built directly rather than by driving `handle_registration_request_nas` (#359). It
+    /// used to drive the live path and then re-insert the NAS state, with a comment
+    /// explaining that the fixture's missing AUSF made `start_authentication` return early
+    /// from a `send_nas_pdu(..)?` with the state already taken out -- i.e. the fixture was
+    /// standing on the defect #359 fixes. Now the AUSF failure refuses the registration and
+    /// releases the UE, so driving the live path would tear down the precondition it was
+    /// there to establish, and re-registering afterwards would double
+    /// `total_emergency_count`, which two of these tests assert on.
+    ///
+    /// Nothing is lost by constructing it: that the live NAS path REACHES the emergency
+    /// branch is what `an_emergency_registration_reaches_the_emergency_handler` covers, and
+    /// these tests are about the release paths. `emergency_registration_nas` is still shared
+    /// with that test, so a change to what the parser accepts still breaks them together.
+    fn register_emergency_ue(ngap: &mut NgapServer, association_id: u64, amf_ue_ngap_id: u64) {
         ngap.ue_auth_state.insert(
             amf_ue_ngap_id,
             UeNasContext::new(amf_ue_ngap_id, 72, association_id, false),
         );
-        let nas = emergency_registration_nas();
-        let _ = ngap
-            .handle_registration_request_nas(association_id, amf_ue_ngap_id, 72, &nas, false)
-            .await;
+        // `has_supi: true` matches what the live branch computes for
+        // `emergency_registration_nas`, whose 5GS mobile identity carries a SUCI.
+        ngap.emergency
+            .handle_emergency_registration(amf_ue_ngap_id, true);
         assert!(
             ngap.emergency.emergency_context(amf_ue_ngap_id).is_some(),
             "fixture precondition: UE {amf_ue_ngap_id} must hold an emergency context \
              before the release under test"
         );
+        assert!(
+            ngap.ue_auth_state.contains_key(&amf_ue_ngap_id),
+            "fixture precondition: UE {amf_ue_ngap_id} must hold a NAS context too -- the \
+             release paths resolve the UE through `ue_auth_state`"
+        );
+    }
 
-        // Re-inserted, because this fixture has no AUSF and no transport: the registration
-        // falls through to `start_authentication`, which TAKES the NAS state out
-        // (`ue_auth_state.remove`) and can only put it back on the AUSF success arm. Its
-        // failure arm does reach `release_ue` -- and so would free the emergency context --
-        // but only after a `send_nas_pdu(..)?` that this server cannot complete, so the
-        // call returns early with the state already gone.
-        //
-        // A UE that is registered and attached, which is the state every path under test
-        // starts from, holds both. Modelling that explicitly is what keeps these tests
-        // about the release paths instead of about the fixture's missing AUSF.
+    // ========================================================================
+    // #359: a refusal whose NAS reject cannot be sent must still release the UE
+    // ========================================================================
+
+    /// **#359**, the arm the issue names: an AUSF failure whose Registration Reject also
+    /// fails to send must leave the UE RELEASED, not vanished.
+    ///
+    /// `start_authentication` opens by TAKING the UE's NAS state out of `ue_auth_state` and,
+    /// before this fix, only the AUSF success arm put it back. The failure arm then ran
+    /// `send_nas_pdu(..).await?` -- which this fixture cannot complete, having no transport
+    /// -- so it returned early with the state already gone and `release_ue` never reached.
+    /// The RAN kept a UE the AMF had forgotten, every later NAS message from it hit an empty
+    /// map and was dropped by a `return Ok(())` guard, and no T3560 was armed to recover it.
+    ///
+    /// **The emergency context is the observable, and the issue's criterion 4 (prefer
+    /// asserting on `ue_auth_state` directly, so the guard does not depend on #356) cannot
+    /// be met on THIS arm** -- because `ue_auth_state` no longer holds the UE either way.
+    /// Before the fix it was removed by `start_authentication` and never put back; after the
+    /// fix it is removed by `forget_ue`. Same end state, opposite meanings. What separates
+    /// them is whether a RELEASE happened, and `release_emergency` is the only in-process
+    /// witness to that: it is reachable only from `forget_ue`, which is reachable only from
+    /// `release_ue`. `a_refusal_whose_reject_cannot_be_sent_still_releases_the_ue` below is
+    /// the companion that DOES discriminate on `ue_auth_state` alone, on the other eighteen
+    /// sites, where the state was re-inserted before the send and so used to linger.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ausf_failure_whose_reject_cannot_be_sent_still_releases_the_ue() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let amf_ue_ngap_id = 7_359_001u64;
+        register_emergency_ue(&mut ngap, 1, amf_ue_ngap_id);
+
+        // No AUSF is reachable, so the Nausf_UEAuthentication call fails; no association
+        // exists, so the Registration Reject cannot be written either. Both at once is the
+        // correlated failure the issue describes -- the reject send fails exactly when the
+        // gNB link is already unhealthy.
+        let _ = ngap.start_authentication(1, amf_ue_ngap_id, 72, None).await;
+
+        assert!(
+            ngap.emergency.emergency_context(amf_ue_ngap_id).is_none(),
+            "the refusal must reach `release_ue` -> `forget_ue` even though the reject could \
+             not be delivered: before #359 the `?` on the reject send returned first, so \
+             this context survived a UE that no longer existed anywhere else"
+        );
+        assert_eq!(
+            ngap.emergency.active_count(),
+            0,
+            "and the live emergency figure an operator watches must fall with it"
+        );
+        assert!(
+            !ngap.ue_auth_state.contains_key(&amf_ue_ngap_id),
+            "and no NAS state is left behind"
+        );
+    }
+
+    /// **#359**, the wider defect: NINETEEN sites wrote `send_nas_pdu(..).await?` immediately
+    /// followed by `release_ue(..).await?`, so a failed reject send abandoned the release on
+    /// every one of them.
+    ///
+    /// Driven through `handle_authentication_response_nas`'s HXRES* mismatch, which is a
+    /// site that DOES re-insert the state before refusing -- so `ue_auth_state` discriminates
+    /// on its own, with no dependence on #356. Before the fix the state was put back, the
+    /// reject send failed, the function returned early, and the entry LINGERED with no
+    /// release command and nothing scheduled to clean it up; the UE occupied an AMF UE NGAP
+    /// ID indefinitely and a recycled ID would have inherited its context.
+    ///
+    /// The mismatch is provoked by leaving `hxres_star` zeroed and supplying a RES* whose
+    /// SHA-256 cannot be zero, rather than by patching the comparison: the assertion has to
+    /// traverse the real §6.1.3.2.0 check to reach the arm under test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusal_whose_reject_cannot_be_sent_still_releases_the_ue() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let amf_ue_ngap_id = 7_359_002u64;
         ngap.ue_auth_state.insert(
             amf_ue_ngap_id,
-            UeNasContext::new(amf_ue_ngap_id, 72, association_id, false),
+            UeNasContext::new(amf_ue_ngap_id, 72, 1, false),
+        );
+
+        // AUTHENTICATION RESPONSE carrying a 16-byte RES* (IEI 0x2D, TLV).
+        let mut nas = vec![0x7E, 0x00, message_type::AUTHENTICATION_RESPONSE, 0x2D, 16];
+        nas.extend_from_slice(&[0xA5u8; 16]);
+
+        let _ = ngap
+            .handle_authentication_response_nas(1, amf_ue_ngap_id, 72, &nas)
+            .await;
+
+        assert!(
+            !ngap.ue_auth_state.contains_key(&amf_ue_ngap_id),
+            "the HXRES* mismatch must release the UE even though the Authentication Reject \
+             could not be delivered: before #359 the `?` on that send returned first and \
+             this entry stayed in the map forever, holding an AMF UE NGAP ID for a UE the \
+             AMF had already refused"
+        );
+    }
+
+    /// **#359**, the two-message refusal: the bidding-down path sends a Security Mode Reject
+    /// AND a Registration Reject before releasing, so a `?` on the FIRST send skipped both
+    /// the second message and the release.
+    ///
+    /// The only arm in the file that emits two NAS messages, and the worst one to abandon
+    /// half-applied: a capability mismatch between the cleartext initial RegistrationRequest
+    /// and the integrity-protected replay is an ATTACK signature (TS 33.501 §6.7.2), so
+    /// leaving the UE in the map with no release is leaving a UE whose security capabilities
+    /// were tampered with.
+    ///
+    /// Driven through the real `handle_security_mode_complete_nas`. The three existing
+    /// bidding-down tests re-implement the comparison by hand against
+    /// `extract_nas_message_container`, which cannot reach the handler's refusal arm at all
+    /// -- this is the first test that does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bidding_down_refusal_whose_first_reject_cannot_be_sent_still_releases_the_ue() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let amf_ue_ngap_id = 7_359_003u64;
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 72, 1, false);
+        // The capabilities the AMF recorded from the CLEARTEXT initial RegistrationRequest.
+        ue_ctx.amf_ue.ue_security_capability = UeSecurityCapability {
+            ea: 0xF0,
+            ia: 0xF0,
+            eea: 0,
+            eia: 0,
+        };
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        // The protected replay downgrades both to the null algorithms -- the bidding-down
+        // signature. Same fixture the hand-rolled tests above use, so a change to what the
+        // container parser accepts breaks them together.
+        let smc = smc_with_replayed_caps(0x80, 0x80);
+        let _ = ngap
+            .handle_security_mode_complete_nas(1, amf_ue_ngap_id, 72, &smc)
+            .await;
+
+        assert!(
+            !ngap.ue_auth_state.contains_key(&amf_ue_ngap_id),
+            "a detected bidding-down attempt must release the UE even though neither reject \
+             could be delivered: before #359 the `?` on the Security Mode Reject returned \
+             first, so the Registration Reject was never built and the UE stayed in the map"
         );
     }
 
@@ -11893,7 +12167,7 @@ mod tests {
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
         let amf_ue_ngap_id = 7_356_001u64;
-        register_emergency_ue(&mut ngap, 1, amf_ue_ngap_id).await;
+        register_emergency_ue(&mut ngap, 1, amf_ue_ngap_id);
         assert_eq!(ngap.emergency.active_count(), 1);
 
         let _ = ngap.finish_deregistration(1, amf_ue_ngap_id, 72).await;
@@ -11940,8 +12214,8 @@ mod tests {
 
         let on_reset_gnb = 7_356_010u64;
         let on_other_gnb = 7_356_011u64;
-        register_emergency_ue(&mut ngap, reset_assoc, on_reset_gnb).await;
-        register_emergency_ue(&mut ngap, other_assoc, on_other_gnb).await;
+        register_emergency_ue(&mut ngap, reset_assoc, on_reset_gnb);
+        register_emergency_ue(&mut ngap, other_assoc, on_other_gnb);
         assert_eq!(ngap.emergency.active_count(), 2);
 
         // PartOfNgInterface: the reset names the UE.
@@ -12025,7 +12299,7 @@ mod tests {
         //    also the common case, because #204 deliberately omits the member when the UE
         //    sends no DNN IE.
         let implicit = 7_356_020u64;
-        register_emergency_ue(&mut ngap, 1, implicit).await;
+        register_emergency_ue(&mut ngap, 1, implicit);
         let _ = ngap
             .handle_5gsm_message(1, implicit, 72, &pdu_session_establishment_request(3), None)
             .await;
@@ -12041,7 +12315,7 @@ mod tests {
 
         // 2. The emergency DNN named explicitly.
         let explicit = 7_356_021u64;
-        register_emergency_ue(&mut ngap, 1, explicit).await;
+        register_emergency_ue(&mut ngap, 1, explicit);
         let emergency_dnn = ngap.emergency.emergency_dnn().to_string();
         let _ = ngap
             .handle_5gsm_message(
@@ -12066,7 +12340,7 @@ mod tests {
         //    context still exists and the SM context ref was stored -- so a fixture that
         //    never reached the SMF at all cannot pass this by arriving nowhere.
         let other_dnn = 7_356_022u64;
-        register_emergency_ue(&mut ngap, 1, other_dnn).await;
+        register_emergency_ue(&mut ngap, 1, other_dnn);
         let _ = ngap
             .handle_5gsm_message(
                 1,
@@ -12144,8 +12418,17 @@ mod tests {
         let _ = ngap
             .handle_registration_request_nas(1, emergency, 72, &nas, false)
             .await;
+        // The CUMULATIVE counter, for the reason
+        // `an_emergency_registration_reaches_the_emergency_handler` records (#359): this
+        // fixture has no AUSF either, so the registration is refused and the UE released a
+        // few statements later, which frees the context. `active_count()` read 1 here only
+        // because that refusal used to return early with the UE's NAS state already gone.
+        //
+        // What is under test is unchanged and is still the whole point of §5.3.5: the
+        // congestion check did NOT shed this request, so the emergency branch RAN. The
+        // control is the ordinary registration above, which never reaches it.
         assert_eq!(
-            ngap.emergency.active_count(),
+            ngap.emergency.total_emergency_count(),
             1,
             "an emergency registration must reach the emergency handler even while the \
              AMF is shedding load"
