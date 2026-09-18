@@ -1519,8 +1519,24 @@ async fn run_s6a_peer(
     let result = loop {
         tokio::select! {
             event = peer.next_event() => match event {
-                Ok(PeerEvent::Established { origin_host, origin_realm }) => {
+                Ok(PeerEvent::Established { origin_host, origin_realm, peer_origin_state_id }) => {
                     log::info!("S6a peer established: {origin_host} ({origin_realm})");
+                    // #287: the peer's Origin-State-Id has already been compared and logged
+                    // by the peer state machine (see nextgcore-diameter's `restart` module).
+                    // Named here at info level so an S6a trace shows the value the restart
+                    // detection is working from, and says what this NF does about it.
+                    //
+                    // The HSS discards NOTHING on a detected MME restart, and that is a
+                    // decision rather than an omission: a restarted MME re-registers with a
+                    // fresh Update-Location-Request on its next attach, and that overwrites
+                    // `mme_host` / `mme_realm` idempotently. The aggressive reading -- purge
+                    // the affected subscriber state -- is detach-adjacent, which is the
+                    // hazard #56 flagged when it defaulted the subscriber-change watcher OFF.
+                    log::info!(
+                        "S6a peer {origin_host} Origin-State-Id {peer_origin_state_id:?}; a \
+                         restart is detected and reported, and no subscriber state is \
+                         discarded -- an MME that restarted re-registers via ULR (TS 23.007)"
+                    );
                     register_mme_peer(&origin_host, tx.clone());
                     registered_host = Some(origin_host);
                 }

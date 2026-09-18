@@ -463,9 +463,25 @@ async fn run_connection(transport: DiameterTransport, config: DiameterConfig) {
     loop {
         tokio::select! {
             event = peer.next_event() => match event {
-                Ok(PeerEvent::Established { origin_host, origin_realm }) => {
+                Ok(PeerEvent::Established { origin_host, origin_realm, peer_origin_state_id }) => {
                     log::info!(
                         "Diameter peer established: host={origin_host}, realm={origin_realm} ({peer_addr})"
+                    );
+                    // #287: already compared and logged by the peer state machine (see
+                    // nextgcore-diameter's `restart` module). Named here so a Gx trace shows
+                    // the value, and so the log says what this NF does about it.
+                    //
+                    // The PCRF does NOT release the Gx sessions of a restarted PCEF today.
+                    // Two reasons, both recorded rather than left to inference: #57 chose
+                    // persistence over restart signalling for this state, and `PcrfContext`
+                    // indexes Gx sessions by session-id and UE IP but not by Origin-Host, so
+                    // there is no way to ask what is held for this peer without a new index.
+                    // Filed as #365 with that index named; it must default OFF, because
+                    // releasing on a false positive drops live traffic.
+                    log::info!(
+                        "Diameter peer {origin_host} Origin-State-Id {peer_origin_state_id:?}; \
+                         a restart is detected and reported, and no Gx session is released \
+                         (see #365)"
                     );
                     register_peer(&origin_host, out_tx.clone());
                     registered = Some(origin_host);
