@@ -462,6 +462,9 @@ impl<T: crate::transport::DiameterTransportIo> DiameterPeer<T> {
             .and_then(|avp| avp.as_u32());
         let outcome = crate::restart::observe_peer_restart(origin_host, peer_origin_state_id);
         crate::restart::log_peer_restart_outcome(origin_host, outcome);
+        // #365: hand the outcome to whatever reaction this binary installed. Here rather
+        // than inside `observe_peer_restart` so recording a value stays side-effect free.
+        crate::restart::notify_peer_restart_observer(origin_host, outcome);
         peer_origin_state_id
     }
 

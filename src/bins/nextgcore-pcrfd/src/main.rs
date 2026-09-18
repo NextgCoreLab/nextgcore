@@ -304,6 +304,13 @@ fn main() -> Result<()> {
     }
     log::info!("Rx interface initialized");
 
+    // #365: react to a detected PCEF restart. Installed AFTER Gx and Rx are up, because
+    // the reaction releases Gx sessions and aborts Rx ones; installing it earlier would
+    // arm a handler whose two interfaces do not exist yet. Detection itself (#287) is
+    // always on and needs no installation -- this only registers what to DO about it,
+    // and it does nothing at all unless PCRF_RELEASE_RESTARTED_PCEF_SESSIONS is set.
+    nextgcore_pcrfd::peer_restart::install();
+
     // Dispatch entry event to transition to operational state
     let mut entry_event = PcrfEvent::entry();
     pcrf_sm.dispatch(&mut entry_event);

@@ -47,11 +47,18 @@
 //!   is detach-adjacent, which is the hazard #56 flagged when it defaulted the
 //!   subscriber-change watcher OFF.
 //! - **pcrfd** — a restarted PCEF has lost its Gx sessions, and releasing the PCRF's copies
-//!   would be the conformant tidy-up. #57 chose **persistence over restart signalling** for
-//!   this, and that decision is not overturned here. It also cannot be implemented cheaply:
-//!   `PcrfContext` indexes Gx sessions by session-id and by UE IP, not by `Origin-Host`, so
-//!   there is no way to ask "what do I hold for this peer" without a new index. Filed as
-//!   #365 rather than half-built.
+//!   is the conformant tidy-up. **Implemented in #365**, behind a runtime switch defaulting
+//!   OFF (`PCRF_RELEASE_RESTARTED_PCEF_SESSIONS`), in `nextgcore_pcrfd::peer_restart`. The
+//!   new index this was thought to need turned out to be unnecessary: `PcrfGxSession`
+//!   already carried `peer_host`, written on the CCR-I, so the set is *derived* by walking
+//!   the session index rather than maintained as a second map that could disagree with it.
+//!   #57's choice of persistence over restart signalling is **not** overturned — the two
+//!   are complements, persistence surviving *our* restart and this cleaning up after
+//!   *theirs*.
+//!
+//! So the sentence above — "nothing in this tree tears state down on a detected restart" —
+//! is now true only with the switch off, which is the default. An NF opts in by installing
+//! a [`PeerRestartObserver`]; absent one, detection remains purely diagnostic.
 //! - **mmed** — nothing to discard. Its S6a state is request-scoped: a request in flight when
 //!   the peer went away is already failed by the transport teardown, which fails every
 //!   waiter in the pending map.
@@ -133,6 +140,55 @@ pub fn observe_peer_restart(origin_host: &str, origin_state_id: Option<u32>) -> 
         Some(previous) if previous == current => PeerRestartOutcome::Unchanged { current },
         Some(previous) if previous < current => PeerRestartOutcome::Restarted { previous, current },
         Some(previous) => PeerRestartOutcome::Regressed { previous, current },
+    }
+}
+
+/// An NF's reaction to an observed peer-restart outcome (#365).
+///
+/// A plain `fn` pointer rather than a boxed closure: the reaction is a property of the
+/// *binary*, decided once at startup, not a per-peer callback, and an `fn` keeps this
+/// module free of any allocation or `Send`/`Sync` bound reasoning on a path that runs
+/// inside a peer's CER handling.
+pub type PeerRestartObserver = fn(&str, PeerRestartOutcome);
+
+/// The installed reaction, if any.
+///
+/// `OnceLock`, so a binary cannot end up with two reactions racing to tear the same
+/// state down. Absent by default: detection stays non-destructive unless an NF opts in,
+/// which is the split this module's header describes -- §8.16 defines the signal, TS 23.007
+/// defines the reaction, and this is the seam between them.
+static OBSERVER: OnceLock<PeerRestartObserver> = OnceLock::new();
+
+/// Install this binary's reaction to a detected peer restart.
+///
+/// Returns `false` if one was already installed, in which case the existing one is kept
+/// and this call did nothing — reported rather than silently ignored so a double install
+/// is a visible programming error instead of a coin flip about which reaction runs.
+///
+/// The observer is called for **every** outcome, not only [`PeerRestartOutcome::Restarted`].
+/// That is deliberate: the branch belongs to the NF, and handing it only restarts would
+/// hide `Regressed` — the one outcome that means the signal itself cannot be trusted —
+/// from the code best placed to log it against its own state.
+pub fn set_peer_restart_observer(observer: PeerRestartObserver) -> bool {
+    let installed = OBSERVER.set(observer).is_ok();
+    if !installed {
+        log::error!(
+            "a peer-restart observer is already installed; the second one is IGNORED. Only \
+             one reaction per process is supported (RFC 6733 §8.16 detection, TS 23.007 \
+             reaction)"
+        );
+    }
+    installed
+}
+
+/// Hand an outcome to the installed reaction, if there is one.
+///
+/// Called from the CER/CEA path beside [`log_peer_restart_outcome`], not from
+/// [`observe_peer_restart`], so recording a value stays free of side effects and this
+/// crate's own unit tests of the comparison cannot trip a reaction.
+pub(crate) fn notify_peer_restart_observer(origin_host: &str, outcome: PeerRestartOutcome) {
+    if let Some(observer) = OBSERVER.get() {
+        observer(origin_host, outcome);
     }
 }
 

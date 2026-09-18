@@ -120,6 +120,22 @@ has no working foundation: `origin_state_id()` recomputes wall-clock on every ca
 so it is not a per-instance restart indicator at all (now #280). Choosing signalling
 would have meant fixing a diameter-layer defect #57 explicitly scoped out.
 
+**This is not an either/or with peer-restart cleanup, and #365 added the other half.**
+The two answer different questions and both are now implemented:
+
+| | survives | question it answers |
+|---|---|---|
+| **persistence** (this spec, #57) | **our** restart | "what did I hold before I died?" |
+| **peer-restart release** (#365) | **their** restart | "what do I hold that the peer has forgotten?" |
+
+They are complements, not alternatives. A Gx session reloaded from this spec's snapshot
+is exactly the record that *should* be released when its PCEF reconnects with a higher
+`Origin-State-Id` — persistence is what lets the stale copy outlive the process that
+made it, so without #365's release the durability added here makes the staleness
+*longer-lived*, not shorter. Note the asymmetry in their defaults, which is deliberate:
+persistence defaults **on** because it destroys nothing, while #365's release defaults
+**off** because it drops traffic on a false positive.
+
 **Deviation from the suggested approach:** #57 suggested persisting to "the existing
 MongoDB". This tree's established restoration model is `StateStore` (seven NFs use
 it), and pcrfd never initialises a Mongo client at all — `build_subscriber_session_data`'s
