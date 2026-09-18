@@ -371,7 +371,10 @@ const View = ({ visible, disableOnClickOutside, subscriber, onEdit, onDelete, on
                       slice.session.map(session =>
                     <div key={session.name}>
                       <div className="body">
-                        <div className="large_data">{session.name}</div>
+                        <div className="large_data">
+                          {session.name} {session.default_dnn_indicator ==
+                              true ? "(Default DNN)" : ""}
+                        </div>
                         <div className="medium_data">{
                             session.type === 1 ? "IPv4" :
                             session.type === 2 ? "IPv6" :
