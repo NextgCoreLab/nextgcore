@@ -3102,7 +3102,10 @@ mod tests {
     /// An unreachable PCF (connection refused) also yields Err, not a panic.
     #[tokio::test]
     async fn ue_policy_create_unreachable_is_err() {
-        let port = nsacf_free_port(); // nothing listening
+        // A port that CANNOT be handed to a sibling test's `bind(:0)`. This used to be
+        // `nsacf_free_port()`, which is free rather than unbindable, and that made this
+        // test fail about 1 workspace run in 7 -- see `refused_port`.
+        let port = nextgcore_sbi::test_support::refused_port();
         let result = call_pcf_ue_policy_create(
             "127.0.0.1",
             port,

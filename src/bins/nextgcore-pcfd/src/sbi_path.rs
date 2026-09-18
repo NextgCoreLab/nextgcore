@@ -2044,7 +2044,9 @@ mod tests {
         // Intentionally NOT served: the test needs a port with nothing listening.
         // The shared helper still guarantees no other test is handed this port,
         // which is what makes "unreachable" reliable rather than accidental.
-        let dead_port = nextgcore_sbi::test_support::free_port();
+        // `refused_port`, not `free_port`: a free port can be handed to a sibling test's
+        // `bind(:0)`, and then the "dead" peer answers. See `refused_port`.
+        let dead_port = nextgcore_sbi::test_support::refused_port();
         let dead_uri = format!("http://127.0.0.1:{dead_port}/cb");
         let res = tokio::time::timeout(
             Duration::from_secs(8),

@@ -2758,7 +2758,9 @@ mod tests {
         // An unreachable producer is a retryable dependency failure -> 503, and
         // above all NOT 201. This is the case that used to be indistinguishable
         // from success.
-        let dead_port = nextgcore_sbi::test_support::free_port();
+        // `refused_port`, not `free_port`: a free port can be handed to a sibling test's
+        // `bind(:0)`, and then the "dead" peer answers. See `refused_port`.
+        let dead_port = nextgcore_sbi::test_support::refused_port();
         set_producers(Some(&format!("http://127.0.0.1:{dead_port}")), None);
         let response = block_on(handle_monitoring_subscription_create(
             "af1",

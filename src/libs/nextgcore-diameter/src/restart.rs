@@ -169,34 +169,24 @@ pub fn log_peer_restart_outcome(origin_host: &str, outcome: PeerRestartOutcome) 
     }
 }
 
-/// Forget every recorded value.
-///
-/// Test-only, and it exists because the map is process-global: two tests observing the same
-/// `Origin-Host` would otherwise see each other's baseline, and the one that ran second
-/// would report `Unchanged` where it expected `FirstSighting`. Tests that use it take
-/// [`test_lock`].
-#[cfg(test)]
-pub(crate) fn reset_for_test() {
-    match seen().lock() {
-        Ok(mut map) => map.clear(),
-        Err(poisoned) => poisoned.into_inner().clear(),
-    }
-}
-
-/// The lock every test touching the process-global map must take.
-///
-/// Declared beside the global it guards rather than inside a `mod tests`, so a sibling module
-/// that grows a test against this state can reach it. One lock, not one per test file: the
-/// hazard is the shared map, and a second lock over the same state is no protection at all.
-#[cfg(test)]
-pub(crate) fn test_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Every test in this module uses hostnames unique to it, and NOTHING clears the map.
+    //
+    // That is deliberate and it replaces a `reset_for_test` + module lock pair that caused a
+    // flake on `main` (about 1 workspace run in 7). The reset cleared the map WHOLESALE, so
+    // it reached keys it did not own: `peer::tests::the_capabilities_exchange_feeds_the_\
+    // restart_tracker` records two hosts through a real CER/CEA over a socket and then
+    // asserts they are recorded, and a reset landing between its exchange and its assertion
+    // turned `Unchanged` into `FirstSighting`.
+    //
+    // Unique keys protect against COLLISIONS; they do not protect against a global clear.
+    // The fix is to have nothing clear the map at all, which removes the hazard instead of
+    // ordering it -- a lock would only have made the destructive write happen at a different
+    // moment, and the write was the problem. Any test added here must follow the same rule:
+    // pick a hostname no other test uses, and never clear.
 
     /// A first value is a baseline, and an unchanged one is not a restart.
     ///
@@ -205,20 +195,17 @@ mod tests {
     /// worse than not detecting anything.
     #[test]
     fn a_first_value_is_a_baseline_and_an_unchanged_one_is_not_a_restart() {
-        let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
-        reset_for_test();
-
         assert_eq!(
-            observe_peer_restart("mme.example.org", Some(1000)),
+            observe_peer_restart("baseline-mme.287.example.org", Some(1000)),
             PeerRestartOutcome::FirstSighting { current: 1000 },
             "the first value seen has nothing to be compared against"
         );
         assert_eq!(
-            observe_peer_restart("mme.example.org", Some(1000)),
+            observe_peer_restart("baseline-mme.287.example.org", Some(1000)),
             PeerRestartOutcome::Unchanged { current: 1000 }
         );
         assert!(
-            !observe_peer_restart("mme.example.org", Some(1000)).is_restart(),
+            !observe_peer_restart("baseline-mme.287.example.org", Some(1000)).is_restart(),
             "and `is_restart` must agree, since that is what callers branch on"
         );
     }
@@ -226,11 +213,8 @@ mod tests {
     /// An INCREASED value is a restart, and only that variant reports as one.
     #[test]
     fn an_increased_value_is_a_restart() {
-        let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
-        reset_for_test();
-
-        observe_peer_restart("hss.example.org", Some(1000));
-        let outcome = observe_peer_restart("hss.example.org", Some(1001));
+        observe_peer_restart("increase-hss.287.example.org", Some(1000));
+        let outcome = observe_peer_restart("increase-hss.287.example.org", Some(1001));
         assert_eq!(
             outcome,
             PeerRestartOutcome::Restarted {
@@ -249,11 +233,8 @@ mod tests {
     /// restart here.
     #[test]
     fn a_decreased_value_is_a_violation_and_not_a_restart() {
-        let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
-        reset_for_test();
-
-        observe_peer_restart("pcef.example.org", Some(5000));
-        let outcome = observe_peer_restart("pcef.example.org", Some(4999));
+        observe_peer_restart("regress-pcef.287.example.org", Some(5000));
+        let outcome = observe_peer_restart("regress-pcef.287.example.org", Some(4999));
         assert_eq!(
             outcome,
             PeerRestartOutcome::Regressed {
@@ -276,22 +257,19 @@ mod tests {
     /// would be missed.
     #[test]
     fn an_absent_avp_is_not_a_restart_and_preserves_the_baseline() {
-        let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
-        reset_for_test();
-
         assert_eq!(
-            observe_peer_restart("silent.example.org", None),
+            observe_peer_restart("absent-silent.287.example.org", None),
             PeerRestartOutcome::NotAdvertised
         );
 
-        observe_peer_restart("flaky.example.org", Some(7));
+        observe_peer_restart("absent-flaky.287.example.org", Some(7));
         assert_eq!(
-            observe_peer_restart("flaky.example.org", None),
+            observe_peer_restart("absent-flaky.287.example.org", None),
             PeerRestartOutcome::NotAdvertised,
             "an omission says nothing about whether the peer restarted"
         );
         assert_eq!(
-            observe_peer_restart("flaky.example.org", Some(7)),
+            observe_peer_restart("absent-flaky.287.example.org", Some(7)),
             PeerRestartOutcome::Unchanged { current: 7 },
             "and the baseline survived the omission: without that this would read as a \
              FirstSighting and the NEXT increase would be measured from the wrong value"
@@ -304,21 +282,18 @@ mod tests {
     /// restart look like every peer's.
     #[test]
     fn each_peer_is_tracked_under_its_own_origin_host() {
-        let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
-        reset_for_test();
-
-        observe_peer_restart("a.example.org", Some(100));
-        observe_peer_restart("b.example.org", Some(200));
+        observe_peer_restart("perhost-a.287.example.org", Some(100));
+        observe_peer_restart("perhost-b.287.example.org", Some(200));
 
         assert_eq!(
-            observe_peer_restart("a.example.org", Some(101)),
+            observe_peer_restart("perhost-a.287.example.org", Some(101)),
             PeerRestartOutcome::Restarted {
                 previous: 100,
                 current: 101
             }
         );
         assert_eq!(
-            observe_peer_restart("b.example.org", Some(200)),
+            observe_peer_restart("perhost-b.287.example.org", Some(200)),
             PeerRestartOutcome::Unchanged { current: 200 },
             "b must be unaffected by a's restart"
         );
