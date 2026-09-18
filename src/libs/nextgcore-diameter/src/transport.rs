@@ -315,6 +315,7 @@ impl DiameterServer {
                 Ok(Ok(PeerEvent::Established {
                     origin_host,
                     origin_realm,
+                    ..
                 })) => {
                     log::info!("Peer established: host={origin_host}, realm={origin_realm}");
                 }
@@ -447,6 +448,7 @@ impl DiameterClient {
             PeerEvent::Established {
                 origin_host,
                 origin_realm,
+                ..
             } => {
                 log::info!("Connected to Diameter peer: host={origin_host}, realm={origin_realm}");
                 self.peer = Some(peer);

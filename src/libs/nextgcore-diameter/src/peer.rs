@@ -59,6 +59,14 @@ pub enum PeerEvent {
     Established {
         origin_host: String,
         origin_realm: String,
+        /// The peer's `Origin-State-Id` from the CER/CEA, if it sent one (RFC 6733
+        /// §8.16). `None` means the peer does not implement the AVP, which is
+        /// permitted -- and is NOT the same as a value of 0.
+        ///
+        /// Carried on the event rather than only compared inside the handler so a
+        /// consumer can make its own decision: the library reports the restart and
+        /// deliberately destroys nothing (see [`crate::restart`]).
+        peer_origin_state_id: Option<u32>,
     },
     /// Received an application-level message (not a base protocol message)
     Message(DiameterMessage),
@@ -421,6 +429,8 @@ impl<T: crate::transport::DiameterTransportIo> DiameterPeer<T> {
             return Ok(PeerEvent::Disconnected);
         }
 
+        let peer_origin_state_id = Self::observe_capabilities_exchange(&cer, &origin_host);
+
         self.remote_host = Some(origin_host.clone());
         self.remote_realm = Some(origin_realm.clone());
         self.state = PeerState::Open;
@@ -428,7 +438,31 @@ impl<T: crate::transport::DiameterTransportIo> DiameterPeer<T> {
         Ok(PeerEvent::Established {
             origin_host,
             origin_realm,
+            peer_origin_state_id,
         })
+    }
+
+    /// Read the peer's `Origin-State-Id` out of a CER or CEA, compare it against the last
+    /// one seen from that host, and log what changed (RFC 6733 §8.16).
+    ///
+    /// Called from the CER and CEA paths only. A DWA carrying a changed value cannot mean a
+    /// restart -- the connection it arrived on survived -- so it is not routed here; see
+    /// [`crate::restart`] for that reasoning and for what no NF does with the outcome.
+    fn observe_capabilities_exchange(msg: &DiameterMessage, origin_host: &str) -> Option<u32> {
+        // `as_u32`, not a match on `AvpData::Unsigned32`. A DECODED AVP is `Raw`: the
+        // decoder has no dictionary, so it cannot know that code 278 is an Unsigned32, and
+        // matching the enum variant returns `None` for every message that actually came off
+        // the wire. The round-trip test caught exactly that -- a variant match passed
+        // against a hand-built message and failed against a real CER. `as_u32` is how
+        // `result_code()` and every other integer reader in this crate does it, and it
+        // still returns `None` for a value that is not four bytes, so a malformed
+        // Origin-State-Id is ignored rather than fabricating a restart.
+        let peer_origin_state_id = msg
+            .find_avp(avp_code::ORIGIN_STATE_ID)
+            .and_then(|avp| avp.as_u32());
+        let outcome = crate::restart::observe_peer_restart(origin_host, peer_origin_state_id);
+        crate::restart::log_peer_restart_outcome(origin_host, outcome);
+        peer_origin_state_id
     }
 
     /// Handle incoming CEA: validate result code and transition to Open
@@ -454,6 +488,8 @@ impl<T: crate::transport::DiameterTransportIo> DiameterPeer<T> {
             .ok_or_else(|| DiameterError::MissingAvp("Origin-Realm".into()))?
             .to_string();
 
+        let peer_origin_state_id = Self::observe_capabilities_exchange(&cea, &origin_host);
+
         self.remote_host = Some(origin_host.clone());
         self.remote_realm = Some(origin_realm.clone());
         self.state = PeerState::Open;
@@ -461,6 +497,7 @@ impl<T: crate::transport::DiameterTransportIo> DiameterPeer<T> {
         Ok(PeerEvent::Established {
             origin_host,
             origin_realm,
+            peer_origin_state_id,
         })
     }
 
@@ -617,7 +654,7 @@ pub async fn run_peer_with_keepalive(
             }
             event_result = peer.next_event() => {
                 match event_result? {
-                    PeerEvent::Established { origin_host, origin_realm } => {
+                    PeerEvent::Established { origin_host, origin_realm, .. } => {
                         log::info!(
                             "Peer established: host={origin_host}, realm={origin_realm}"
                         );
@@ -1044,6 +1081,115 @@ mod tests {
         assert_eq!(cer_osi, latched, "the CER did not carry the latched value");
     }
 
+    /// **#287**, the WIRING: the CER/CEA path feeds the restart tracker.
+    ///
+    /// `restart.rs`'s own tests cover the comparison; nothing there proves the peer handlers
+    /// ever call it. This drives a real CER/CEA exchange over a socket and then asks the
+    /// tracker what it knows: a host it has recorded answers `Unchanged` for the same value,
+    /// where a host it has never seen answers `FirstSighting`. That difference is the whole
+    /// assertion, and it fails if either handler stops observing.
+    ///
+    /// Hostnames are unique to this test rather than guarded by `restart::test_lock`. The
+    /// tracker's map is process-global, so a shared hostname would let `test_cer_cea_exchange`
+    /// populate it first and turn the `FirstSighting` precondition into `Unchanged`. Unique
+    /// keys REMOVE the hazard where a lock would only order it -- and ordering is not enough
+    /// here, because the other test's write is the problem, not the interleaving.
+    #[tokio::test]
+    async fn the_capabilities_exchange_feeds_the_restart_tracker() {
+        use crate::restart::{observe_peer_restart, PeerRestartOutcome};
+
+        let server_host = "hss-287.epc.mnc001.mcc001.3gppnetwork.org";
+        let client_host = "mme-287.epc.mnc001.mcc001.3gppnetwork.org";
+        let realm = "epc.mnc001.mcc001.3gppnetwork.org";
+
+        // Precondition: neither host is known to the tracker yet. Asserted rather than
+        // assumed, because a name collision with another test would silently make the
+        // post-conditions below vacuous.
+        assert_eq!(
+            observe_peer_restart(server_host, None),
+            PeerRestartOutcome::NotAdvertised,
+            "precondition: an absent AVP tells the tracker nothing and records nothing"
+        );
+
+        let addr: std::net::SocketAddr = ([127, 0, 0, 1], 0).into();
+        let listener = DiameterListener::bind(addr).await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+        let server_cfg = test_config(server_host, realm);
+        let client_cfg = test_config(client_host, realm);
+
+        let handle = tokio::spawn(async move {
+            let transport = listener.accept().await.unwrap();
+            let mut peer = DiameterPeer::new_responder(transport, &server_cfg);
+            peer.start().await.unwrap();
+            peer.next_event().await.unwrap()
+        });
+
+        let transport = DiameterTransport::connect(listen_addr).await.unwrap();
+        let mut client = DiameterPeer::new_initiator(transport, &client_cfg);
+        client.start().await.unwrap();
+        let client_event = client.next_event().await.unwrap();
+        let server_event = handle.await.unwrap();
+        assert!(matches!(client_event, PeerEvent::Established { .. }));
+        assert!(matches!(server_event, PeerEvent::Established { .. }));
+
+        // The responder saw the CLIENT's CER, so the client's host is now recorded.
+        assert_eq!(
+            observe_peer_restart(client_host, Some(origin_state_id())),
+            PeerRestartOutcome::Unchanged {
+                current: origin_state_id()
+            },
+            "handle_cer must have recorded the peer's Origin-State-Id: an unrecorded host \
+             would answer FirstSighting here"
+        );
+        // And the initiator saw the SERVER's CEA. Both directions, because the two handlers
+        // observe separately.
+        assert_eq!(
+            observe_peer_restart(server_host, Some(origin_state_id())),
+            PeerRestartOutcome::Unchanged {
+                current: origin_state_id()
+            },
+            "handle_cea must have recorded it too"
+        );
+
+        // ---- #287 question 4: a DWA must NOT feed the tracker ----
+        //
+        // The peer cannot have restarted while the connection the DWA arrived on survived,
+        // so a changed value there is a protocol anomaly -- a misconfigured peer, or a
+        // message that is not from whom it claims. Observing it would let one malformed
+        // watchdog answer look like a restart to whatever reaction is wired downstream.
+        //
+        // Driven through the SAME live peer, which is already Open after the exchange
+        // above, rather than through a fake transport or a test-only state setter. The
+        // discriminating observation is that the DWA's Origin-Host stays UNRECORDED: a
+        // handler that observed watchdog answers would key the tracker on it, and the
+        // assertion below would then read Unchanged.
+        let dwa_host = "dwa-287.epc.mnc001.mcc001.3gppnetwork.org";
+        let dwr = DiameterMessage::new_request(base_cmd::DEVICE_WATCHDOG, BASE_APPLICATION_ID);
+        let mut dwa = DiameterMessage::new_answer(&dwr);
+        dwa.add_avp(Avp::mandatory(
+            avp_code::ORIGIN_HOST,
+            AvpData::DiameterIdentity(dwa_host.to_string()),
+        ));
+        dwa.add_avp(Avp::mandatory(
+            avp_code::ORIGIN_STATE_ID,
+            AvpData::Unsigned32(4_242_424),
+        ));
+        assert!(
+            matches!(
+                client.handle_message(dwa).await.unwrap(),
+                PeerEvent::WatchdogAck
+            ),
+            "precondition: the DWA is dispatched as a watchdog answer, so the base-protocol \
+             arm under test is the one that ran"
+        );
+        assert_eq!(
+            observe_peer_restart(dwa_host, Some(4_242_424)),
+            PeerRestartOutcome::FirstSighting { current: 4_242_424 },
+            "the DWA must not have been observed: a tracker fed from the watchdog path \
+             would answer Unchanged here"
+        );
+    }
+
     #[tokio::test]
     async fn test_cer_cea_exchange() {
         let addr: std::net::SocketAddr = ([127, 0, 0, 1], 0).into();
@@ -1069,9 +1215,21 @@ mod tests {
                 PeerEvent::Established {
                     origin_host,
                     origin_realm,
+                    peer_origin_state_id,
                 } => {
                     assert_eq!(origin_host, "mme.epc.mnc001.mcc001.3gppnetwork.org");
                     assert_eq!(origin_realm, "epc.mnc001.mcc001.3gppnetwork.org");
+                    // #287: the CER's Origin-State-Id reached the event. A ROUND TRIP --
+                    // the client encoded it, it crossed the socket, and the responder
+                    // decoded it -- which a hand-built message handed to a mapping
+                    // function could not prove. Both peers run in this process, so the
+                    // value is the latched `origin_state_id()`.
+                    assert_eq!(
+                        peer_origin_state_id,
+                        Some(origin_state_id()),
+                        "the CER's Origin-State-Id must reach the Established event; \
+                         before #287 it was decoded by nothing at all"
+                    );
                 }
                 _ => panic!("expected Established event"),
             }
@@ -1090,9 +1248,19 @@ mod tests {
             PeerEvent::Established {
                 origin_host,
                 origin_realm,
+                peer_origin_state_id,
             } => {
                 assert_eq!(origin_host, "hss.epc.mnc001.mcc001.3gppnetwork.org");
                 assert_eq!(origin_realm, "epc.mnc001.mcc001.3gppnetwork.org");
+                // #287, the other direction: the CEA's Origin-State-Id. Both directions
+                // are asserted because `handle_cer` and `handle_cea` read it separately,
+                // so wiring one and forgetting the other would leave half the peers
+                // undetectable.
+                assert_eq!(
+                    peer_origin_state_id,
+                    Some(origin_state_id()),
+                    "the CEA's Origin-State-Id must reach the Established event too"
+                );
             }
             _ => panic!("expected Established event"),
         }

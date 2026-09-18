@@ -23,6 +23,7 @@ pub mod gx;
 pub mod gy;
 pub mod message;
 pub mod peer;
+pub mod restart;
 pub mod rx;
 pub mod s6a;
 pub mod s6b;
