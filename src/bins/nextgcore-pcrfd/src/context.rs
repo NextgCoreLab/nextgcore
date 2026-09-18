@@ -648,6 +648,52 @@ impl PcrfContext {
         removed
     }
 
+    /// The Gx sessions this PCRF holds for one PCEF, as `(Session-Id, bound Rx indexes)`
+    /// sorted by Session-Id (#365).
+    ///
+    /// # Derived, not indexed
+    ///
+    /// #365 costed a `HashMap<String, Vec<usize>>` from `Origin-Host` to session indexes
+    /// and rejected it, for the reason the AMF work keeps rediscovering: an index
+    /// maintained beside a list can disagree with it and then resolve to the **wrong**
+    /// record. Walking the sessions makes disagreement impossible by construction, and
+    /// this runs once per peer restart — not per message — so O(n) is the right trade.
+    /// `PcrfGxSession::peer_host` is therefore the only state this needs, and it already
+    /// existed, written on the CCR-I at `gx_path.rs`.
+    ///
+    /// # Why it walks the INDEX and not the session vector
+    ///
+    /// `gx_session_remove` deliberately removes only the `gx_sid_hash` entry and the IP
+    /// maps, leaving the positional `gx_sessions` element in place — `rx_sessions` holds
+    /// indexes into that vector, so compacting it would repoint every binding. A released
+    /// session therefore still *exists* in the vector, and iterating it would hand back
+    /// sessions that were released long ago. `gx_sid_hash` is the set of sessions that are
+    /// actually reachable, which is the set this question is about.
+    ///
+    /// # Sorted
+    ///
+    /// `gx_sid_hash` is a `HashMap`, so its iteration order is not stable across runs.
+    /// Sorting keeps the release order — and any test that asserts on it — deterministic.
+    pub fn gx_sessions_for_peer(&self, origin_host: &str) -> Vec<(String, Vec<usize>)> {
+        // Canonical lock order: primary list before the index (see `gx_session_remove`).
+        let (Ok(sessions), Ok(hash)) = (self.gx_sessions.read(), self.gx_sid_hash.read()) else {
+            log::error!(
+                "Gx session lock poisoned; cannot tell what is held for peer {origin_host}"
+            );
+            return Vec::new();
+        };
+        let mut held: Vec<(String, Vec<usize>)> = hash
+            .iter()
+            .filter_map(|(sid, &idx)| {
+                let session = sessions.get(idx)?;
+                (session.peer_host.as_deref() == Some(origin_host))
+                    .then(|| (sid.clone(), session.rx_sessions.clone()))
+            })
+            .collect();
+        held.sort_by(|a, b| a.0.cmp(&b.0));
+        held
+    }
+
     /// Remove all Gx sessions
     pub fn gx_session_remove_all(&self) {
         if let (Ok(mut sessions), Ok(mut hash), Ok(mut ipv4), Ok(mut ipv6)) = (

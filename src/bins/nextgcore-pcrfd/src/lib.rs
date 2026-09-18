@@ -10,6 +10,7 @@ pub mod context;
 pub mod event;
 pub mod fd_path;
 pub mod gx_path;
+pub mod peer_restart; // #365: release a restarted PCEF's Gx sessions
 pub mod rx_path;
 pub mod sm;
 
