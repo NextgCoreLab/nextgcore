@@ -118,6 +118,19 @@ fn parse_session_data(doc: &Document, dnn: &str) -> DbiResult<NextgcoreSessionDa
         session_data.session.lbo_roaming_allowed = lbo;
     }
 
+    // Parse the per-DNN default marker (#264). Absent leaves it `false`, the same
+    // additive migration as in `subscription.rs`'s `parse_session`.
+    //
+    // No caller of THIS parser reads the flag today -- `pcfd`'s `nudr_handler` wants the
+    // QoS and AMBR. It is parsed here anyway because both functions produce the same
+    // `NextgcoreSession`, and a field that one producer fills and the other silently
+    // leaves at `false` makes the type mean two different things depending on which
+    // reader built it. That is a divergence, not dead code, which is why it is tested
+    // below rather than deferred until something reads it.
+    if let Ok(default_dnn) = doc.get_bool(NEXTGCORE_DEFAULT_DNN_INDICATOR_STRING) {
+        session_data.session.default_dnn_indicator = default_dnn;
+    }
+
     // Parse QoS
     if let Ok(qos_doc) = doc.get_document(NEXTGCORE_QOS_STRING) {
         session_data.session.qos = parse_qos(qos_doc);
@@ -311,4 +324,43 @@ fn parse_pcc_rule_qos(doc: &Document) -> NextgcoreQos {
     }
 
     qos
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **#264**: this parser fills the per-DNN default marker too.
+    ///
+    /// `subscription.rs::parse_session` and this function are two independent producers of
+    /// `NextgcoreSession` from the same Mongo shape. Nothing reads the flag off THIS one
+    /// yet, so the test is what stops it from being an unexercised line: it pins that the
+    /// two producers agree, which is the property that matters when a reader is added.
+    #[test]
+    fn parse_session_data_reads_the_default_dnn_indicator() {
+        let mut flagged = Document::new();
+        flagged.insert(NEXTGCORE_NAME_STRING, "ims");
+        flagged.insert(NEXTGCORE_DEFAULT_DNN_INDICATOR_STRING, true);
+        let parsed = parse_session_data(&flagged, "ims").expect("a named session parses");
+        assert!(
+            parsed.session.default_dnn_indicator,
+            "a provisioned default DNN must reach NextgcoreSession through this parser as \
+             well, or the same type means different things depending on which producer \
+             built it"
+        );
+
+        let mut absent = Document::new();
+        absent.insert(NEXTGCORE_NAME_STRING, "internet");
+        let parsed = parse_session_data(&absent, "internet").expect("a named session parses");
+        assert!(
+            !parsed.session.default_dnn_indicator,
+            "and an existing document with no such key defaults to false"
+        );
+        assert_eq!(
+            parsed.session.name.as_deref(),
+            Some("internet"),
+            "control: the rest still parses, so the assertion above cannot pass by the \
+             parse having failed"
+        );
+    }
 }

@@ -95,6 +95,14 @@ pub const NEXTGCORE_SESSION_STRING: &str = "session";
 pub const NEXTGCORE_NAME_STRING: &str = "name";
 pub const NEXTGCORE_TYPE_STRING: &str = "type";
 pub const NEXTGCORE_LBO_ROAMING_ALLOWED_STRING: &str = "lbo_roaming_allowed";
+/// Per-DNN default marker inside one slice's `session` array (nextgcore #264).
+///
+/// Distinct from [`NEXTGCORE_DEFAULT_INDICATOR_STRING`], which is the SLICE-level
+/// default-S-NSSAI flag on `NextgcoreSlice`. The two answer different questions --
+/// "which slice does a UE get when it asks for none" versus "which DNN inside this
+/// slice does it get when it asks for none" -- and conflating them is why the name
+/// is spelled out rather than reusing the shorter one.
+pub const NEXTGCORE_DEFAULT_DNN_INDICATOR_STRING: &str = "default_dnn_indicator";
 pub const NEXTGCORE_QOS_STRING: &str = "qos";
 pub const NEXTGCORE_INDEX_STRING: &str = "index";
 pub const NEXTGCORE_ARP_STRING: &str = "arp";
@@ -211,6 +219,20 @@ pub struct NextgcoreSession {
     pub name: Option<String>,
     pub session_type: i32,
     pub lbo_roaming_allowed: bool,
+    /// Whether this DNN is the subscribed DEFAULT for its slice
+    /// (`DnnInfo.defaultDnnIndicator`, TS 29.503; TS 23.501 §5.6.1).
+    ///
+    /// The SMF selects the subscribed default DNN when the UE provides none.
+    /// Before #264 nothing in this tree could mark one, so `smfd`'s
+    /// `select_default_dnn` could only resolve the unambiguous single-DNN case and
+    /// had to refuse a DNN-less session for a multi-DNN subscriber.
+    ///
+    /// `false` when the Mongo document omits the field, which is what makes this
+    /// additive: an existing subscriber keeps the single-DNN behaviour and nothing
+    /// regresses. It is the operator's job to flag one, and flagging none is a
+    /// legitimate provisioning state -- not an error to be papered over by picking
+    /// the first entry.
+    pub default_dnn_indicator: bool,
     pub qos: NextgcoreQos,
     pub ambr: NextgcoreAmbr,
     pub smf_ip: NextgcoreIp,

@@ -76,7 +76,11 @@ const Profile = new Schema({
         },
       }],
 
-      lbo_roaming_allowed: Boolean
+      lbo_roaming_allowed: Boolean,
+      // nextgcore #264: DnnInfo.defaultDnnIndicator (TS 29.503). Which DNN a UE
+      // gets inside this slice when it requests none (TS 23.501 5.6.1). Distinct
+      // from the slice-level `default_indicator` above, which picks the slice.
+      default_dnn_indicator: Boolean
 
     }]
   }],

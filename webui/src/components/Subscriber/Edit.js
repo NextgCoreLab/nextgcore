@@ -204,6 +204,10 @@ const schema = {
                   "type": "boolean",
                   "title": "LBO Roaming Allowed",
                 },
+                "default_dnn_indicator": {
+                  "type": "boolean",
+                  "title": "Default DNN/APN for this slice",
+                },
                 "qos": {
                   "type": "object",
                   "title": "",
@@ -561,6 +565,9 @@ const uiSchema = {
             classNames: "col-xs-4",
           },
           "lbo_roaming_allowed": {
+            classNames: "col-xs-12",
+          },
+          "default_dnn_indicator": {
             classNames: "col-xs-12",
           },
           "qos": {
