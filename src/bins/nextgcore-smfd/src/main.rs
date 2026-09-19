@@ -3123,6 +3123,11 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                 sd: snssai_sd.as_deref(),
                 ue_ipv4: ue_ip_octets,
                 notification_uri: &notification_uri,
+                // #310: the PCF's only input for the subscribed session-AMBR. The
+                // UDR's policy data does not carry it (TS 29.519 §5.6.2), so a
+                // create that omits it leaves the PCF with nothing to bound its
+                // authorisation by -- which is what this leg did before #310.
+                subs_sess_ambr: subscribed.as_ref(),
             };
             match policy::sm_policy_create(&pcf, &create_ctx).await {
                 Ok(decision) => {
@@ -4052,8 +4057,18 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                     if let Some(ref pol_id) = b.sm_policy_id {
                         match policy::resolve_pcf_endpoint().await {
                             Some(pcf) => {
-                                match policy::sm_policy_update(&pcf, pol_id, &["RES_MO_RE"], None)
-                                    .await
+                                // #310: no `subsSessAmbr`. A UE-initiated resource
+                                // modification reports no subscription change, and
+                                // restating an unchanged subscribed value would have
+                                // the PCF re-evaluate a bound that did not move.
+                                match policy::sm_policy_update(
+                                    &pcf,
+                                    pol_id,
+                                    &["RES_MO_RE"],
+                                    None,
+                                    None,
+                                )
+                                .await
                                 {
                                     Ok(dec) => {
                                         authorized =
@@ -5773,11 +5788,21 @@ async fn handle_sm_policy_notify(sm_context_ref: &str, request: &SbiRequest) -> 
 /// behaviour to keep correct instead of two, and cannot silently apply half an edit.
 /// The notification's role is to say *when*, and for which resource.
 ///
-/// **With a PCF configured this SMF deliberately does NOT apply the change.** See
-/// the log line and `specs/fix-smfd-udm-sdm-subscribe-uecm-dereg.md`: TS 23.503
-/// §6.1.3.2 makes the PCF the authority on session-AMBR and default QoS, and a
-/// subscription-driven override applied behind its back would leave the SMF enforcing
-/// something the PCF never authorised.
+/// **With a PCF configured this SMF does not apply the change itself — it REPORTS it
+/// to the PCF** (#310, TS 29.512 §4.2.4, `SE_AMBR_CH`). TS 23.503 §6.1.3.2 makes the
+/// PCF the authority on session-AMBR and default QoS, and the subscribed value is one
+/// of its INPUTS, so applying a subscription-driven override behind its back would
+/// leave the SMF enforcing something the PCF never authorised. But the PCF cannot
+/// learn of the change on its own: `SmPolicyDnnData`, the UDR's policy-data resource,
+/// carries no session-AMBR (TS 29.519 §5.6.2), and `SmPolicyContextData.subsSessAmbr`
+/// — which the SMF supplies — is its only input for it.
+///
+/// #293 recorded the opposite ("the PCF learns of subscription changes from the UDR")
+/// and that claim was **false**: it named a path that structurally cannot carry the
+/// datum. #310 overturned it. So the PCF arm re-reads and compares exactly as the
+/// no-PCF arm does, and on a genuine difference POSTs `/sm-policies/{id}/update` with
+/// `SE_AMBR_CH` and the new `subsSessAmbr`, then applies the PCF's ANSWER through the
+/// same code the PCF-notify path uses.
 async fn handle_sdm_notification(sm_context_ref: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("Nudm_SDM_Notification for ref={sm_context_ref}");
 
@@ -5815,26 +5840,14 @@ async fn handle_sdm_notification(sm_context_ref: &str, request: &SbiRequest) -> 
     let items = body["notifyItems"].as_array().map(Vec::len).unwrap_or(0);
     log::debug!("Nudm_SDM_Notification ref={sm_context_ref}: {items} notify item(s)");
 
-    if binding.sm_policy_id.is_some() {
-        // TS 23.503 §6.1.3.2. The PCF authorised this session's QoS with the
-        // subscription as one of its inputs; re-deriving it here from the
-        // subscription alone would override a policy decision with the value that
-        // decision was made from. The PCF learns about subscription changes through
-        // its own policy-data subscription to the UDR.
-        log::info!(
-            "[{}] SM data changed, but a PCF authorised this session ({}): the change \
-             is NOT applied here — the PCF is the authority on session-AMBR and default \
-             QoS (TS 23.503 §6.1.3.2) and learns of subscription changes from the UDR",
-            binding.supi,
-            binding.sm_policy_id.as_deref().unwrap_or("")
-        );
-        return SbiResponse::with_status(204);
-    }
-
     // Scoped to the DNN *and* the S-NSSAI the session was created for: `sm-data` is
     // one entry per S-NSSAI, so a guessed slice would apply another slice's
     // session-AMBR to this session -- and `parse_sm_data` falls back to the first
     // entry rather than failing, so the mistake would look like a successful update.
+    //
+    // #310: this re-read is now shared by BOTH arms. Before, the PCF arm returned 204
+    // before reaching it, so the change reached a PCF-authorised session through no
+    // path at all.
     let Some(subscribed) = udm::fetch_sm_data(
         &binding.supi,
         &binding.dnn,
@@ -5869,21 +5882,91 @@ async fn handle_sdm_notification(sm_context_ref: &str, request: &SbiRequest) -> 
         return SbiResponse::with_status(204);
     }
 
-    log::info!(
-        "[{}] applying changed SM data to ref={sm_context_ref}: AMBR UL/DL {}/{} -> \
-         {}/{} bps, 5QI {} -> {}",
-        binding.supi,
-        binding.ambr_ul_bps,
-        binding.ambr_dl_bps,
-        decision.sess_ambr_ul_bps,
-        decision.sess_ambr_dl_bps,
-        binding.five_qi,
-        decision.def_five_qi
-    );
+    // ---- #310: with a PCF, REPORT the change; the PCF decides ----
+    //
+    // The change detection above ran against what this session ENFORCES, which after a
+    // PCF decision is the AUTHORISED value, not the subscribed one. So a subscription
+    // raised above what the PCF authorised is reported (its input changed, and the PCF
+    // may now authorise more) and the PCF is free to answer with the same decision.
+    // That judgement is the PCF's to make, which is the whole point of reporting.
+    if let Some(sm_policy_id) = binding.sm_policy_id.clone() {
+        let Some(pcf) = policy::resolve_pcf_endpoint().await else {
+            // A session with an sm_policy_id and no resolvable PCF: the PCF this
+            // session was authorised by is gone. Applying the subscription instead
+            // would have the SMF enforce something no PCF authorised, so the session
+            // keeps what it has.
+            log::warn!(
+                "[{}] SM data changed for PCF-authorised ref={sm_context_ref} \
+                 (smPolicyId={sm_policy_id}) but no PCF is resolvable: the session keeps \
+                 the QoS the PCF last authorised",
+                binding.supi
+            );
+            return SbiResponse::with_status(204);
+        };
+        log::info!(
+            "[{}] SM data changed for PCF-authorised ref={sm_context_ref}: reporting \
+             SE_AMBR_CH to the PCF (smPolicyId={sm_policy_id}) with subsSessAmbr \
+             UL/DL {:?}/{:?} bps — TS 23.503 §6.1.3.2 makes the PCF the authority and \
+             the subscribed value one of ITS inputs (TS 29.512 §4.2.4)",
+            binding.supi,
+            subscribed.sess_ambr_ul_bps,
+            subscribed.sess_ambr_dl_bps
+        );
+        decision = match policy::sm_policy_update(
+            &pcf,
+            &sm_policy_id,
+            &["SE_AMBR_CH"],
+            None,
+            Some(&subscribed),
+        )
+        .await
+        {
+            Ok(authorised) => authorised,
+            Err(e) => {
+                // 204, not 5xx: the notification WAS understood, and a retry would
+                // re-drive a leg whose failure the UDM cannot see. Nothing was
+                // applied, so there is nothing to roll back, and the value the
+                // session still enforces is one the PCF authorised -- the safe
+                // state. Falling back to the subscribed value here is exactly the
+                // "SMF enforces what the PCF never authorised" defect this arm
+                // exists to avoid.
+                log::error!(
+                    "[{}] SE_AMBR_CH report to the PCF failed for ref={sm_context_ref}: \
+                     {e} — the session keeps the QoS the PCF last authorised",
+                    binding.supi
+                );
+                return SbiResponse::with_status(204);
+            }
+        };
+        log::info!(
+            "[{}] PCF re-authorised ref={sm_context_ref}: AMBR UL/DL {}/{} -> {}/{} bps, \
+             5QI {} -> {}",
+            binding.supi,
+            binding.ambr_ul_bps,
+            binding.ambr_dl_bps,
+            decision.sess_ambr_ul_bps,
+            decision.sess_ambr_dl_bps,
+            binding.five_qi,
+            decision.def_five_qi
+        );
+    } else {
+        log::info!(
+            "[{}] applying changed SM data to ref={sm_context_ref}: AMBR UL/DL {}/{} -> \
+             {}/{} bps, 5QI {} -> {}",
+            binding.supi,
+            binding.ambr_ul_bps,
+            binding.ambr_dl_bps,
+            decision.sess_ambr_ul_bps,
+            decision.sess_ambr_dl_bps,
+            binding.five_qi,
+            decision.def_five_qi
+        );
+    }
 
     // The N4 QER, through the SAME function the PCF-update path uses: a second way to
     // change a live session's QoS is a second thing to keep correct, and #293 asks
-    // for this one explicitly.
+    // for this one explicitly. #310: and it is the same code for the PCF-authorised
+    // decision, so there is one apply path rather than two.
     if let Some(seid) = lookup_upf_seid(sm_context_ref) {
         if let Err(e) = pfcp_update_session_qer(
             smf_n4_seid_for(sm_context_ref),
@@ -7941,7 +8024,15 @@ mod tests {
              notification -- see handle_sdm_notification"
         );
 
-        // ---- PCF precedence: the same notification changes nothing ----
+        // ---- PCF precedence (#293 criterion 5, as #310 left it) ----
+        //
+        // A PCF-authorised session is STILL not re-derived from the subscription — the
+        // PCF is the authority (TS 23.503 §6.1.3.2). What #310 changed is that the
+        // change is now REPORTED to the PCF instead of dropped; the SMF applies the
+        // PCF's answer, never the subscription. Here the PCF is unreachable (port 1),
+        // so there is no answer and the session keeps what the PCF last authorised —
+        // the safe state, and explicitly NOT the subscribed value.
+        std::env::set_var("PCF_URI", "http://127.0.0.1:1");
         let pcf_ref = {
             let ctx = smf_self();
             let context = ctx.read().expect("context");
@@ -7965,8 +8056,15 @@ mod tests {
             (before.ambr_ul_bps, before.ambr_dl_bps, before.five_qi),
             "a PCF-authorised session must not be re-derived from the subscription: \
              TS 23.503 §6.1.3.2 makes the PCF the authority, and the subscription is \
-             one of ITS inputs"
+             one of ITS inputs. With the PCF unreachable the session keeps the QoS the \
+             PCF last authorised (40/80 Mbps would be the SUBSCRIBED value leaking in)"
         );
+        assert_ne!(
+            (after.ambr_ul_bps, after.ambr_dl_bps),
+            (40_000_000, 80_000_000),
+            "and specifically NOT the subscribed value the UDM just reported"
+        );
+        std::env::remove_var("PCF_URI");
 
         // A notification for a session this SMF does not hold is a 404, which is what
         // tells the UDM to stop notifying a subscription that outlived its session.
@@ -7988,6 +8086,300 @@ mod tests {
         udm::set_for_test(false);
         std::env::remove_var("UDM_SBI_ADDR");
         std::env::remove_var("UDM_SBI_PORT");
+        udm_srv.stop().await.expect("stop");
+    }
+
+    /// A loopback PCF that records every `/update` body and answers with the
+    /// `authSessAmbr` the caller installs, or a status the caller installs instead
+    /// (#310). Points `PCF_URI` at itself; the caller must hold
+    /// [`crate::context::PROCESS_STATE_TEST_LOCK`] and must remove `PCF_URI`.
+    async fn spawn_recording_pcf(
+        answer: Result<(u64, u64), u16>,
+    ) -> (
+        nextgcore_sbi::server::SbiServer,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    ) {
+        use nextgcore_sbi::message::SbiResponse;
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = port_addr.port();
+        let pcf = SbiServer::on_listener(
+            SbiServerConfig::new(std::net::SocketAddr::from(([127, 0, 0, 1], port))),
+            port_listener,
+        );
+        pcf.start(move |req: SbiRequest| {
+            let sink = sink.clone();
+            async move {
+                let body: serde_json::Value = req
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|c| serde_json::from_str(c).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                sink.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((req.header.uri.clone(), body));
+                match answer {
+                    Err(status) => SbiResponse::with_status(status),
+                    Ok((ul, dl)) => SbiResponse::with_status(200)
+                        .with_json_body(&serde_json::json!({
+                            "sessRules": {
+                                "SessRule-310": {
+                                    "sessRuleId": "SessRule-310",
+                                    "authSessAmbr": {
+                                        "uplink": policy::format_bitrate(ul),
+                                        "downlink": policy::format_bitrate(dl),
+                                    },
+                                    "authDefQos": { "5qi": 6, "arp": { "priorityLevel": 8 } },
+                                }
+                            },
+                            "pccRules": {}, "qosDecs": {}, "chgDecs": {}, "traffContDecs": {},
+                        }))
+                        .unwrap_or_else(|_| SbiResponse::with_status(200)),
+                }
+            }
+        })
+        .await
+        .expect("pcf start");
+        std::env::set_var("PCF_URI", format!("http://127.0.0.1:{port}"));
+        (pcf, seen)
+    }
+
+    /// Seed a PCF-authorised live session: a registered SM context plus a binding
+    /// carrying an `sm_policy_id` and the AMBR the PCF authorised (#310).
+    fn seed_pcf_authorised(supi: &str, psi: u8, sm_policy_id: &str) -> String {
+        let sm_context_ref = {
+            let ctx = smf_self();
+            let context = ctx.read().expect("context");
+            let (reference, _id) = register_sm_context(&context, supi, psi).expect("register");
+            reference
+        };
+        seed_binding(&sm_context_ref, psi);
+        if let Ok(ctx) = smf_self().read() {
+            if let Ok(mut bindings) = ctx.policy_bindings.write() {
+                if let Some(b) = bindings.get_mut(&sm_context_ref) {
+                    b.supi = supi.to_string();
+                    b.sm_policy_id = Some(sm_policy_id.to_string());
+                    b.sdm_subscription_id = Some("sub-310".to_string());
+                }
+            }
+        }
+        sm_context_ref
+    }
+
+    /// An `Nudm_SDM_Notification` body naming the `sm-data` resource.
+    fn sdm_notify(sm_context_ref: &str, supi: &str) -> SbiRequest {
+        SbiRequest::post(format!("/nsmf-callback/v1/sdm-notify/{sm_context_ref}")).with_body(
+            serde_json::json!({
+                "notifyItems": [{
+                    "resourceId": format!("/nudm-sdm/v2/{supi}/sm-data"),
+                    "changes": [{ "op": "REPLACE", "path": "/sessionAmbr" }],
+                }]
+            })
+            .to_string(),
+            "application/json",
+        )
+    }
+
+    /// #310, the whole chain: a subscribed session-AMBR change against a
+    /// PCF-authorised LIVE session is REPORTED to the PCF with `SE_AMBR_CH` and the new
+    /// `subsSessAmbr`, and the PCF's ANSWER is what the session ends up enforcing.
+    ///
+    /// Before #310 this arm returned 204 and did nothing: `sm_policy_update` had no
+    /// production caller at all, so the change reached a PCF-authorised session through
+    /// no path. #293 recorded that the PCF would learn it from the UDR instead, and that
+    /// claim was false — `SmPolicyDnnData` carries no session-AMBR (TS 29.519 §5.6.2).
+    ///
+    /// Every assertion is POSITIVE and on the wire or on state: the recorded POST path,
+    /// the reported trigger, the reported `subsSessAmbr` value, and the PCF's
+    /// `authSessAmbr` read back off both the binding and the session. The PCF's answer
+    /// (30/70) is deliberately DIFFERENT from both the subscribed value (40/80) and the
+    /// session's previous value (100/100), so "the PCF's answer was applied" cannot be
+    /// satisfied by either leaking through.
+    ///
+    /// **Seam**: pcfd is a stub here — the two daemons are not run in one process. The
+    /// real pcfd arm is asserted on its own side
+    /// (`the_authorised_ambr_is_bounded_by_the_reported_subscribed_ambr`).
+    #[tokio::test]
+    async fn a_sdm_notification_reports_se_ambr_ch_to_the_pcf_and_applies_the_answer() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        // The UDM reports 40/80 Mbps; the session holds 100/100.
+        let (udm_srv, _seen) = spawn_recording_udm(sm_data_with("40 Mbps", "80 Mbps", 6)).await;
+        // The PCF authorises 30/70 — its own call, neither the subscribed value nor the
+        // session's previous one.
+        let (pcf_srv, pcf_seen) = spawn_recording_pcf(Ok((30_000_000, 70_000_000))).await;
+        udm::set_for_test(true);
+        smf_context_init(64, 256, 512);
+
+        let supi = "imsi-001010000000310";
+        let sm_context_ref = seed_pcf_authorised(supi, 20, "pol-310");
+
+        assert_eq!(
+            smf_sbi_request_handler(sdm_notify(&sm_context_ref, supi))
+                .await
+                .status,
+            204
+        );
+
+        // ---- the report, on the wire ----
+        let reported = pcf_seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert_eq!(
+            reported.len(),
+            1,
+            "exactly one SE_AMBR_CH report, got {reported:?}"
+        );
+        let (uri, body) = &reported[0];
+        assert_eq!(
+            uri, "/npcf-smpolicycontrol/v1/sm-policies/pol-310/update",
+            "TS 29.512 §4.2.4: POST /sm-policies/{{id}}/update"
+        );
+        assert_eq!(
+            body["repPolicyCtrlReqTriggers"],
+            serde_json::json!(["SE_AMBR_CH"]),
+            "the reported trigger names the change (TS 29.512 §5.6.3.6)"
+        );
+        assert_eq!(
+            body["subsSessAmbr"]["uplink"], "40 Mbps",
+            "and carries the NEW subscribed value: the PCF has no other input for it, \
+             because the UDR's SmPolicyDnnData has no session-AMBR (TS 29.519 §5.6.2). \
+             Body was {body}"
+        );
+        assert_eq!(body["subsSessAmbr"]["downlink"], "80 Mbps");
+
+        // ---- the PCF's answer, applied ----
+        let binding = lookup_policy_binding(&sm_context_ref).expect("binding");
+        assert_eq!(
+            (binding.ambr_ul_bps, binding.ambr_dl_bps, binding.five_qi),
+            (30_000_000, 70_000_000, 6),
+            "the PCF's AUTHORISED value must reach the binding — not the subscribed \
+             40/80 (that would be the SMF overriding the PCF) and not the previous \
+             100/100 (that would be the report changing nothing)"
+        );
+        let sess = smf_self()
+            .read()
+            .expect("context")
+            .sess_find_by_sm_context_ref(&sm_context_ref)
+            .expect("session");
+        assert_eq!(
+            (sess.session_ambr.uplink, sess.session_ambr.downlink),
+            (30_000_000, 70_000_000),
+            "and the session, which is what Retrieve and the EPS encoders read"
+        );
+
+        std::env::remove_var("PCF_URI");
+        udm::set_for_test(false);
+        std::env::remove_var("UDM_SBI_ADDR");
+        std::env::remove_var("UDM_SBI_PORT");
+        pcf_srv.stop().await.expect("stop");
+        udm_srv.stop().await.expect("stop");
+    }
+
+    /// #310: a notification whose re-read changes nothing this session enforces reports
+    /// NOTHING to the PCF.
+    ///
+    /// The subscription is re-read and compared first, so a UDM that notifies liberally
+    /// does not cost one PCF round trip plus one N4 Session Modification per
+    /// notification. Asserted on the PCF having received no request at all — which is a
+    /// negative, so it is paired with the positive test above: the same harness, the
+    /// same seeding, one value changed.
+    #[tokio::test]
+    async fn an_sdm_notification_that_changes_nothing_reports_nothing_to_the_pcf() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        // The UDM reports exactly what `seed_binding` already holds (100/100, 5QI 9).
+        let (udm_srv, _seen) = spawn_recording_udm(sm_data_with("100 Mbps", "100 Mbps", 9)).await;
+        let (pcf_srv, pcf_seen) = spawn_recording_pcf(Ok((30_000_000, 70_000_000))).await;
+        udm::set_for_test(true);
+        smf_context_init(64, 256, 512);
+
+        let supi = "imsi-001010000000317";
+        let sm_context_ref = seed_pcf_authorised(supi, 21, "pol-317");
+
+        assert_eq!(
+            smf_sbi_request_handler(sdm_notify(&sm_context_ref, supi))
+                .await
+                .status,
+            204
+        );
+        assert!(
+            pcf_seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "a notification that changes nothing this session enforces must not cost a \
+             PCF round trip"
+        );
+        // And the session is untouched, i.e. the early return did not clobber it.
+        let binding = lookup_policy_binding(&sm_context_ref).expect("binding");
+        assert_eq!(
+            (binding.ambr_ul_bps, binding.ambr_dl_bps),
+            (100_000_000, 100_000_000)
+        );
+
+        std::env::remove_var("PCF_URI");
+        udm::set_for_test(false);
+        std::env::remove_var("UDM_SBI_ADDR");
+        std::env::remove_var("UDM_SBI_PORT");
+        pcf_srv.stop().await.expect("stop");
+        udm_srv.stop().await.expect("stop");
+    }
+
+    /// #310 Decision 3: a PCF that REJECTS the `SE_AMBR_CH` report leaves the session
+    /// enforcing what the PCF last authorised, and the notification is still a 204.
+    ///
+    /// Not a 5xx: the notification was received and understood, and a retry would
+    /// re-drive a leg whose failure the UDM cannot see. And specifically not a fallback
+    /// to the subscribed value — that is the "SMF enforces what the PCF never
+    /// authorised" conformance defect #293's Decision 3 refused, and #310 keeps
+    /// refusing.
+    #[tokio::test]
+    async fn a_pcf_that_rejects_the_se_ambr_ch_report_leaves_the_session_as_authorised() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (udm_srv, _seen) = spawn_recording_udm(sm_data_with("40 Mbps", "80 Mbps", 6)).await;
+        // The PCF refuses the re-authorisation.
+        let (pcf_srv, pcf_seen) = spawn_recording_pcf(Err(403)).await;
+        udm::set_for_test(true);
+        smf_context_init(64, 256, 512);
+
+        let supi = "imsi-001010000000318";
+        let sm_context_ref = seed_pcf_authorised(supi, 22, "pol-318");
+
+        assert_eq!(
+            smf_sbi_request_handler(sdm_notify(&sm_context_ref, supi))
+                .await
+                .status,
+            204,
+            "the notification was understood; a 5xx would have the UDM retry a leg \
+             whose failure it cannot see"
+        );
+        // The report WAS attempted — this is what makes the 204 "reported and refused"
+        // rather than "never reported".
+        assert_eq!(
+            pcf_seen.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            1,
+            "the report must have been attempted"
+        );
+
+        let binding = lookup_policy_binding(&sm_context_ref).expect("binding");
+        assert_eq!(
+            (binding.ambr_ul_bps, binding.ambr_dl_bps, binding.five_qi),
+            (100_000_000, 100_000_000, 9),
+            "a refused re-authorisation leaves the session enforcing what the PCF last \
+             authorised; 40/80 Mbps here would be the SMF enforcing a value no PCF ever \
+             authorised"
+        );
+
+        std::env::remove_var("PCF_URI");
+        udm::set_for_test(false);
+        std::env::remove_var("UDM_SBI_ADDR");
+        std::env::remove_var("UDM_SBI_PORT");
+        pcf_srv.stop().await.expect("stop");
         udm_srv.stop().await.expect("stop");
     }
 

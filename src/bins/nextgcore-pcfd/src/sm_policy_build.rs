@@ -234,6 +234,31 @@ pub fn arp_json(priority_level: u8, preempt_cap: bool, preempt_vuln: bool) -> se
     })
 }
 
+/// Parse a TS 29.571 `BitRate` string ("100 Mbps", "1 Gbps", "500 Kbps") into bits
+/// per second — the inverse of [`format_bitrate`] (#310).
+///
+/// Returns `None` for anything unparseable rather than defaulting to zero, for the
+/// same reason smfd's own parser records: an AMBR of 0 would police the subscriber's
+/// traffic to a standstill, which is far worse than falling back to the value the PCF
+/// already holds. Callers therefore treat `None` as "the peer stated no usable bound"
+/// and leave their own value in place.
+pub fn parse_bitrate(s: &str) -> Option<u64> {
+    let (num, unit) = s.trim().split_once(' ')?;
+    let value: f64 = num.parse().ok()?;
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    let mult: u64 = match unit {
+        "bps" => 1,
+        "Kbps" => 1_000,
+        "Mbps" => 1_000_000,
+        "Gbps" => 1_000_000_000,
+        "Tbps" => 1_000_000_000_000,
+        _ => return None,
+    };
+    Some((value * mult as f64) as u64)
+}
+
 /// Format bitrate as a human-readable string per 3GPP TS 29.571
 pub fn format_bitrate(bps: u64) -> String {
     if bps >= 1_000_000_000 && bps.is_multiple_of(1_000_000_000) {
