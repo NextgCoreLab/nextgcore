@@ -353,7 +353,7 @@ pub async fn amf_nrf_register(sbi_addr: &str, sbi_port: u16) -> Result<String, S
 
     let nf_instance_id = uuid::Uuid::new_v4().to_string();
 
-    let nf_profile = serde_json::json!({
+    let mut nf_profile = serde_json::json!({
         "nfInstanceId": nf_instance_id,
         "nfType": "AMF",
         "nfStatus": "REGISTERED",
@@ -373,6 +373,34 @@ pub async fn amf_nrf_register(sbi_addr: &str, sbi_port: u16) -> Result<String, S
         "allowedNfTypes": ["SMF", "AUSF", "UDM", "PCF", "NSSF"],
         "heartBeatTimer": 10
     });
+
+    // #92: publish `amfInfo.guamiList` (TS 29.510 §6.1.6.2.4 `AmfInfo`), the GUAMIs
+    // this AMF serves. Without it there is nothing in the AMF's registered profile
+    // that identifies WHICH AMF it is, so a PCF holding a UE's serving-AMF GUAMI has
+    // no way to pick the right instance out of a multi-AMF SearchResult and must fall
+    // back to the first one — the #92 defect, from the other end. The PLMN/AMF-ID are
+    // the configured `served_guami`, i.e. the same values the AMF puts in its
+    // `Nudm_UECM` registration and its `PolicyAssociationRequest`, so the PCF's
+    // client-side check compares like with like.
+    //
+    // Omitted rather than faked when no GUAMI is configured: an `amfInfo` with an
+    // empty `guamiList` would claim this AMF serves nothing, and a PCF would exclude
+    // it from every GUAMI match instead of falling back to it.
+    let guami_list = served_guami_list_json();
+    if !guami_list.is_empty() {
+        if let Some(obj) = nf_profile.as_object_mut() {
+            obj.insert(
+                "amfInfo".to_string(),
+                serde_json::json!({ "guamiList": guami_list }),
+            );
+        }
+    } else {
+        log::warn!(
+            "AMF NRF registration carries no amfInfo.guamiList (no GUAMI configured). A PCF \
+             cannot identify this AMF as a UE's serving AMF and will fall back to whichever \
+             AMF the NRF lists first (#92)."
+        );
+    }
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");
@@ -1615,6 +1643,79 @@ pub fn dereg_callback_uri(supi: &str) -> String {
     )
 }
 
+/// This AMF's configured GUAMIs as a TS 29.571 `Guami` JSON array, for the
+/// `amfInfo.guamiList` of its NRF profile (#92, TS 29.510 §6.1.6.2.4).
+///
+/// Empty when no GUAMI is configured, which the caller treats as "omit `amfInfo`"
+/// rather than "register an empty list" — see the call site.
+///
+/// `amfId` is the same 6-hex-digit Region/Set/Pointer packing the
+/// `PolicyAssociationRequest` carries. It HAS to be: the PCF compares the GUAMI from
+/// that request against the `guamiList` from this profile, so two different renderings
+/// of one AMF ID would never match, GUAMI selection would silently fall back to the
+/// first discovered AMF every time, and #92's defect would be restored with every test
+/// still green. That is why both sides now go through [`guami_json`] instead of
+/// formatting independently — a divergence is invisible to any test that does not
+/// compare the two, which is how it stayed unnoticed.
+pub(crate) fn served_guami_list_json() -> Vec<serde_json::Value> {
+    let ctx_arc = crate::context::amf_self();
+    // Read THROUGH the poison, the convention in this crate since the RwLock
+    // migration (#363): this replaced a `tokio::sync::RwLock`, which cannot poison, so
+    // bailing here would be a NEW failure mode rather than a preserved one.
+    let ctx = ctx_arc.read().unwrap_or_else(|e| e.into_inner());
+    ctx.served_guami.iter().map(guami_json).collect()
+}
+
+/// One TS 29.571 `Guami` as JSON — the single renderer for both sides of the GUAMI
+/// comparison (#92): the `guamiList` this AMF publishes to the NRF, and the `guami` it
+/// sends in the `PolicyAssociationRequest`.
+pub(crate) fn guami_json(g: &crate::context::Guami) -> serde_json::Value {
+    let p = &g.plmn_id;
+    let mcc = format!("{}{}{}", p.mcc1, p.mcc2, p.mcc3);
+    // mnc3 == 0xF is the 2-digit-MNC filler nibble (TS 24.501 §9.11.3.5), so it is
+    // dropped rather than rendered — "01" and "01F" are not the same PLMN string, and
+    // only the first is a TS 29.571 `Mnc`.
+    let mnc = if p.mnc3 == 0xf {
+        format!("{}{}", p.mnc1, p.mnc2)
+    } else {
+        format!("{}{}{}", p.mnc1, p.mnc2, p.mnc3)
+    };
+    serde_json::json!({
+        "plmnId": { "mcc": mcc, "mnc": mnc },
+        "amfId": amf_id_hex(&g.amf_id),
+    })
+}
+
+/// The 6-hex-digit `AmfId` packing: Region 8 bits, Set 10 bits, Pointer 6 bits
+/// (TS 23.003 §2.10.1), #92.
+///
+/// Extracted so the NRF profile and the `PolicyAssociationRequest` cannot pack it
+/// differently — see [`guami_json`].
+pub(crate) fn amf_id_hex(id: &crate::context::AmfId) -> String {
+    format!(
+        "{:06x}",
+        ((id.region as u32) << 16) | ((id.set as u32) << 6) | (id.pointer as u32)
+    )
+}
+
+/// The absolute `Npcf_UEPolicyControl` `notificationUri` this AMF registers for
+/// `supi` (#92, TS 29.525 §4.2.2.2 / TS 29.500 §6.1). Routed by `namf_server` at
+/// `POST /namf-callback/v1/{supi}/ue-policy-notify`.
+///
+/// Built from the SAME [`advertised_sbi_base`] as [`dereg_callback_uri`], so the two
+/// cannot drift and the scheme follows the configured SBI transport security. Before
+/// #92 this was the RELATIVE literal `"/namf-callback/v1/{supi}/ue-policy-notify"`: a
+/// path with no scheme and no authority, which a PCF has no way to POST to — so the
+/// §4.2.4 update/terminate notification leg could not have worked even once the PCF
+/// started sending it. It also named a path `namf_server` did not route, so the
+/// resource it advertised did not exist either.
+pub fn ue_policy_notification_uri(supi: &str) -> String {
+    format!(
+        "{}/namf-callback/v1/{supi}/ue-policy-notify",
+        advertised_sbi_base()
+    )
+}
+
 /// Nudm_UECM_Registration (amf3gpp-access):
 /// PUT /nudm-uecm/v1/{supi}/registrations/amf-3gpp-access (TS 29.503 5.3.2.2.2)
 pub async fn call_udm_uecm_registration(
@@ -1953,7 +2054,9 @@ pub async fn call_pcf_ue_policy_create(
     );
 
     let mut body = serde_json::json!({
-        "notificationUri": format!("/namf-callback/v1/{supi}/ue-policy-notify"),
+        // #92: ABSOLUTE and scheme-derived (was a relative path the PCF could not POST
+        // to), from the same self-URI helper as `deregCallbackUri`.
+        "notificationUri": ue_policy_notification_uri(supi),
         "supi": supi,
         "suppFeat": "",
         "servingPlmn": { "mcc": serving_plmn_mcc, "mnc": serving_plmn_mnc },
@@ -2201,6 +2304,82 @@ mod tests {
     #[test]
     fn test_nsacf_service_name() {
         assert_eq!(SbiServiceType::NnsacfNsac.service_name(), "nnsacf-nsac");
+    }
+
+    /// #92: the `amfInfo.guamiList` this AMF publishes to the NRF and the `guami` it
+    /// sends in the `PolicyAssociationRequest` are the SAME rendering of the same GUAMI.
+    ///
+    /// This is the assertion that makes GUAMI-based AMF targeting real rather than
+    /// notional. The PCF selects the serving AMF by comparing the association's stored
+    /// `guami` (from the create request) against each discovered instance's
+    /// `amfInfo.guamiList` (from the NRF profile). If those two renderings disagreed —
+    /// a different `amfId` packing, or `"01F"` where the other says `"01"` — no candidate
+    /// would ever match, every delivery would fall back to the first discovered AMF, and
+    /// **#92's defect would be restored with every other test in this change still
+    /// green.** Neither side is byte-compared against the other anywhere else: the
+    /// serving-AMF tests supply `amfInfo` as their own stub-NRF fixture, so they assert
+    /// the PCF's matching logic against hand-written data and cannot see a producer/
+    /// consumer divergence.
+    ///
+    /// Guarded structurally as well as by assertion: both sides now call `guami_json`,
+    /// so the renderings cannot drift. The test pins the rendering itself, which is what
+    /// a peer NRF and a peer PCF both depend on.
+    #[test]
+    fn the_registered_guami_list_and_the_policy_request_guami_render_identically() {
+        use crate::context::{AmfId, Guami, PlmnId};
+
+        // MCC 001 / MNC 01 (2-digit, so mnc3 is the 0xF filler nibble), Region 0x02,
+        // Set 1, Pointer 0 — the matched-sim identity.
+        let guami = Guami {
+            plmn_id: PlmnId {
+                mcc1: 0,
+                mcc2: 0,
+                mcc3: 1,
+                mnc1: 0,
+                mnc2: 1,
+                mnc3: 0xf,
+            },
+            amf_id: AmfId {
+                region: 0x02,
+                set: 1,
+                pointer: 0,
+            },
+        };
+
+        let rendered = guami_json(&guami);
+        // The exact wire shape a peer NRF stores and a peer PCF reads. Pinned rather
+        // than compared to itself: `{:06x}` of (region<<16 | set<<6 | pointer) is the
+        // TS 23.003 §2.10.1 packing, and the filler nibble must NOT appear in the MNC.
+        assert_eq!(rendered["plmnId"]["mcc"], "001");
+        assert_eq!(
+            rendered["plmnId"]["mnc"], "01",
+            "the 2-digit-MNC filler nibble must be dropped: \"01F\" is not a TS 29.571 Mnc"
+        );
+        assert_eq!(
+            rendered["amfId"], "020040",
+            "AmfId packs as Region<<16 | Set<<6 | Pointer (TS 23.003 §2.10.1)"
+        );
+
+        // The `PolicyAssociationRequest` side, built the way `ngap_path` builds it: the
+        // same packer, so the two cannot disagree.
+        assert_eq!(
+            amf_id_hex(&guami.amf_id),
+            rendered["amfId"].as_str().expect("amfId is a string"),
+            "the PolicyAssociationRequest's amfId and the NRF profile's amfId must be \
+             the SAME string, or the PCF matches neither and every delivery silently \
+             falls back to the first discovered AMF"
+        );
+
+        // A 3-digit MNC renders all three digits, so the filler-nibble rule above is a
+        // rule about the filler and not about truncation.
+        let three_digit = Guami {
+            plmn_id: PlmnId {
+                mnc3: 2,
+                ..guami.plmn_id.clone()
+            },
+            amf_id: guami.amf_id.clone(),
+        };
+        assert_eq!(guami_json(&three_digit)["plmnId"]["mnc"], "012");
     }
 
     // ------------------------------------------------------------------
@@ -2921,14 +3100,28 @@ mod tests {
 
         // amfd's notification URI convention (mirrors the AM-policy one):
         // /namf-callback/v1/{supi}/ue-policy-notify.
+        //
+        // #92: compared against the ABSOLUTE URI now, produced by the same
+        // `ue_policy_notification_uri` helper production uses. Asserting the helper's
+        // output rather than re-spelling the literal is deliberate: the criterion is
+        // that the URI is absolute and scheme-correct, and re-spelling it here would
+        // let a future change to the helper's scheme pass a stub that still demanded
+        // `http`. The absolute-ness is then asserted separately below, because
+        // comparing a value to itself proves nothing about its shape.
         let supi = body["supi"].as_str().unwrap_or_default();
-        if body["notificationUri"].as_str()
-            != Some(format!("/namf-callback/v1/{supi}/ue-policy-notify").as_str())
+        let notification_uri = body["notificationUri"].as_str().unwrap_or_default();
+        if notification_uri != ue_policy_notification_uri(supi)
+            || !(notification_uri.starts_with("http://")
+                || notification_uri.starts_with("https://"))
         {
             return nextgcore_sbi::message::SbiResponse::with_status(400).with_body(
                 serde_json::json!({
                     "status": 400,
                     "cause": "INVALID_NOTIFICATION_URI",
+                    "detail": format!(
+                        "expected the absolute {}, got {notification_uri:?}",
+                        ue_policy_notification_uri(supi)
+                    ),
                 })
                 .to_string(),
                 "application/problem+json",

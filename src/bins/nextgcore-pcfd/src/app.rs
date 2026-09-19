@@ -415,6 +415,13 @@ pub async fn run() -> Result<()> {
         nrf_uri: args.nrf_uri.clone(),
     };
 
+    // #92 criterion 5: record the listener's transport security BEFORE any callback
+    // URI can be built, from the SAME `tls_enabled` that decides the NFProfile service
+    // `scheme` in `build_pcf_nf_instance`. Taking it from one source is what keeps the
+    // scheme the PCF ADVERTISES and the scheme its callback URIs use from disagreeing —
+    // and a disagreement there is silent until a peer tries to POST.
+    sbi_path::set_sbi_tls_active(sbi_config.tls_enabled);
+
     // Open legacy SBI server (for context initialization)
     pcf_sbi_open(Some(sbi_config)).map_err(|e| anyhow::anyhow!(e))?;
 
@@ -638,6 +645,23 @@ pub async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             if parts.len() >= 5 && parts[4] == "n1-message-notify" =>
         {
             handle_ue_policy_n1_notify(parts[3], &request).await
+        }
+        // #92 UE-reachability retry: the serving AMF's CONNECTIVITY_STATE_REPORT
+        // (TS 29.518 §6.2.6.2.4). Path built by `ue_policy_connectivity_callback_uri`
+        // from the same segment constant this arm matches, so the URI the AMF is told
+        // about and the URI served here cannot drift.
+        ("npcf-ue-policy-control", "notify", "POST")
+            if parts.len() >= 5 && parts[4] == UE_POLICY_CONNECTIVITY_NOTIFY_SEGMENT =>
+        {
+            handle_ue_policy_connectivity_notify(parts[3], &request).await
+        }
+        // #92: the AMF's asynchronous N1N2MsgTxfrFailureNotification for a transfer
+        // that carried `n1n2FailureTxfNotifURI` (TS 29.518 §6.1.6.2.8). Path built by
+        // `sbi_path::ue_policy_n1n2_failure_uri` from the shared constant.
+        ("npcf-ue-policy-control", "notify", "POST")
+            if parts.len() >= 5 && parts[4] == sbi_path::UE_POLICY_N1N2_FAILURE_PATH_SUFFIX =>
+        {
+            handle_ue_policy_n1n2_failure_notify(parts[3], &request).await
         }
 
         // SM Policy Control Service (npcf-smpolicycontrol, TS 29.512)
@@ -1203,6 +1227,21 @@ pub async fn handle_ue_policy_create(request: &SbiRequest) -> SbiResponse {
     let negotiated = negotiate_features(Some(supp_feat), PCF_UE_POLICY_SUPPORTED_FEATURES);
     let assoc = ue_policy::ue_policy_add(supi, notification_uri, &negotiated);
 
+    // #92: record the SERVING AMF's identity from the PolicyAssociationRequest
+    // (TS 29.525 §4.2.2.2) BEFORE delivery is spawned, because the delivery task is
+    // what discovers the AMF and it must target THIS one rather than whichever the
+    // NRF lists first. amfd already sends `guami`; `servingNfId` is the stronger
+    // identifier when a consumer sends it. Both are optional in the schema, and when
+    // neither is present the three Namf legs log the first-endpoint fallback
+    // explicitly (see `resolve_serving_amf`) instead of silently guessing.
+    ue_policy::ue_policy_set_serving_amf(
+        &assoc.pol_asso_id,
+        data.get("guami").and_then(ue_policy::AmfGuami::from_json),
+        data.get("servingNfId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    );
+
     // Wave-6 E4: assemble URSP rules and DELIVER them to the UE as a MANAGE UE
     // POLICY COMMAND over Namf_Communication_N1N2MessageTransfer (TS 29.525
     // §4.2.2.2 / TS 24.501 D.2.1.2). The 201 body stays the spec-shaped
@@ -1363,7 +1402,7 @@ fn spawn_ue_policy_delivery(pol_asso_id: &str, supi: &str, data: &serde_json::Va
         // is degraded-but-safe: the transfer still runs, but with no result
         // loop the association will fall to Failed on T3501 (fail-closed).
         if let Some(callback_uri) = ue_policy_notify_callback_uri(&id) {
-            match sbi_path::pcf_subscribe_ue_policy_notify(&supi, &callback_uri).await {
+            match sbi_path::pcf_subscribe_ue_policy_notify(&id, &supi, &callback_uri).await {
                 Ok(Some(sub_id)) => {
                     ue_policy::ue_policy_set_subscription_id(&id, &sub_id);
                     log::info!("[{supi}] UE policy: N1N2MessageSubscribe (UPDP) ok (sub={sub_id})");
@@ -1380,7 +1419,7 @@ fn spawn_ue_policy_delivery(pol_asso_id: &str, supi: &str, data: &serde_json::Va
             );
         }
 
-        match sbi_path::pcf_deliver_ue_policy(&supi, &pdu).await {
+        match sbi_path::pcf_deliver_ue_policy(&id, &supi, &pdu).await {
             Ok(()) => {
                 // 200/202 only means the AMF accepted the downlink — the
                 // association stays Pending until the UE returns a MANAGE UE
@@ -1396,26 +1435,155 @@ fn spawn_ue_policy_delivery(pol_asso_id: &str, supi: &str, data: &serde_json::Va
                 let dur = ue_policy::t3501_duration();
                 let supi_retx = supi.clone();
                 let pdu_retx = pdu.clone();
+                let id_retx = id.clone();
                 ue_policy::run_t3501(&id, dur, move || {
                     let supi = supi_retx.clone();
                     let pdu = pdu_retx.clone();
+                    let id = id_retx.clone();
                     async move {
-                        if let Err(e) = sbi_path::pcf_deliver_ue_policy(&supi, &pdu).await {
+                        if let Err(e) = sbi_path::pcf_deliver_ue_policy(&id, &supi, &pdu).await {
                             log::warn!("[{supi}] UE policy: T3501 retransmission failed ({e})");
                         }
                     }
                 })
                 .await;
             }
-            Err(e) => {
-                log::warn!("[{supi}] UE policy: delivery failed ({e})");
+            Err(e) => handle_ue_policy_delivery_failure(&id, &supi, pdu.clone(), e).await,
+        }
+    });
+}
+
+/// Decide what a failed UE-policy delivery means, and act on it (#92).
+///
+/// A CM-IDLE UE is the one delivery failure that WILL resolve itself — the UE comes
+/// back to CM-CONNECTED and the SAME command is deliverable. Driving it straight to
+/// `Failed` (the pre-#92 behaviour) makes the policy permanently undelivered for a UE
+/// that was merely asleep, and the operator sees stale policy with no error. So that
+/// case parks the command and arms a connectivity-state subscription; any OTHER
+/// failure stays terminal, because retrying a rejection cannot help
+/// (TS 23.502 §4.2.4.3).
+///
+/// A named function rather than an inline match arm so the classification is drivable
+/// in a test with the real store and the real subscribe call — the arm it replaced
+/// lived inside a `tokio::spawn` closure, which a test can only reach by racing the
+/// whole delivery pipeline.
+pub async fn handle_ue_policy_delivery_failure(
+    pol_asso_id: &str,
+    supi: &str,
+    pdu: Vec<u8>,
+    error: String,
+) {
+    if ue_policy::is_ue_unreachable_failure(&error) {
+        log::info!(
+            "[{supi}] UE policy: delivery failed because the UE is not reachable ({error}); \
+             arming a CONNECTIVITY_STATE_REPORT subscription to retry on return to \
+             CM-CONNECTED rather than failing the association"
+        );
+        arm_ue_policy_reachability_retry(pol_asso_id, supi, pdu).await;
+    } else {
+        log::warn!("[{supi}] UE policy: delivery failed ({error})");
+        ue_policy::ue_policy_update_delivery_state(
+            pol_asso_id,
+            ue_policy::DeliveryState::Failed(error),
+        );
+    }
+}
+
+/// Arm a UE-reachability retry for a UE-policy delivery that failed because the UE
+/// was CM-IDLE (#92, TS 23.502 §4.2.4.3 / TS 29.518 §5.3.2.2.2).
+///
+/// Two things happen, and BOTH matter:
+///
+/// 1. The pending delivery is parked in the process-global retry store, keyed by
+///    association. That store is what the `n1n2-failure-notify` and
+///    `connectivity-state-notify` callback routes consult, so a wake-up from either
+///    source finds the command to resend. Parking it is also what keeps the
+///    association `Pending` rather than `Failed`: `Pending` is the honest state for
+///    a delivery that has not concluded, and it is what stops the E6 loop from
+///    reporting a terminal outcome the PCF has not observed.
+/// 2. A `Namf_EventExposure` subscription for `CONNECTIVITY_STATE_REPORT` is
+///    created at the serving AMF, so the AMF pushes the CM-state transition to this
+///    PCF. Without it nothing wakes the retry: the AMF's synchronous 504 is the last
+///    word it says unless asked for more.
+///
+/// Best-effort on the subscription: if the AMF refuses it, or there is no AMF, the
+/// delivery stays parked and the blind T3501 timer is still the backstop. Degraded,
+/// not broken — and the log says which.
+async fn arm_ue_policy_reachability_retry(pol_asso_id: &str, supi: &str, pdu: Vec<u8>) {
+    ue_policy::ue_policy_park_pending_delivery(pol_asso_id, supi, pdu);
+
+    let Some(callback_uri) = ue_policy_connectivity_callback_uri(pol_asso_id) else {
+        log::warn!(
+            "[{supi}] UE policy: no PCF self-identity; cannot subscribe to \
+             CONNECTIVITY_STATE_REPORT. The delivery is parked and only the blind T3501 \
+             timer will retry it."
+        );
+        return;
+    };
+    match sbi_path::pcf_subscribe_amf_connectivity_state(pol_asso_id, supi, &callback_uri).await {
+        Ok(Some(sub_id)) => {
+            ue_policy::ue_policy_set_connectivity_subscription_id(pol_asso_id, &sub_id);
+            log::info!(
+                "[{supi}] UE policy: CONNECTIVITY_STATE_REPORT subscription created at the \
+                 serving AMF (sub={sub_id}); delivery will be retried on return to CM-CONNECTED"
+            );
+        }
+        Ok(None) => log::warn!(
+            "[{supi}] UE policy: no AMF reachable to subscribe CONNECTIVITY_STATE_REPORT; \
+             the parked delivery relies on the blind T3501 timer"
+        ),
+        Err(e) => log::warn!(
+            "[{supi}] UE policy: CONNECTIVITY_STATE_REPORT subscribe failed ({e}); the parked \
+             delivery relies on the blind T3501 timer"
+        ),
+    }
+}
+
+/// Retry a parked UE-policy delivery because the UE became reachable again (#92).
+///
+/// Shared by the two wake-up sources — the AMF's `CONNECTIVITY_STATE_REPORT`
+/// notification and its `N1N2MsgTxfrFailureNotification` — so a retry means the same
+/// thing whichever arrived. Returns whether a delivery was actually retried, which
+/// is what the callback routes assert on: a wake-up for an association with nothing
+/// parked is a no-op, not an error (the delivery may have concluded between the
+/// AMF's notification and its arrival here).
+async fn retry_parked_ue_policy_delivery(pol_asso_id: &str, why: &str) -> bool {
+    let Some((supi, pdu)) = ue_policy::ue_policy_take_pending_delivery(pol_asso_id) else {
+        log::debug!(
+            "[{pol_asso_id}] UE policy: {why}, but no parked delivery for this association \
+             (already retried, concluded, or deleted)"
+        );
+        return false;
+    };
+    log::info!("[{pol_asso_id}] UE policy: {why}; retrying the parked MANAGE UE POLICY COMMAND");
+    match sbi_path::pcf_deliver_ue_policy(pol_asso_id, &supi, &pdu).await {
+        Ok(()) => {
+            log::info!(
+                "[{supi}] UE policy: retried delivery accepted by the serving AMF, awaiting \
+                 MANAGE UE POLICY COMPLETE"
+            );
+            true
+        }
+        Err(e) => {
+            // Still unreachable: re-park rather than fail. The UE went back to idle
+            // between the AMF's report and this transfer, which is ordinary, and
+            // failing on it would make the retry path narrower than the problem.
+            if ue_policy::is_ue_unreachable_failure(&e) {
+                log::info!(
+                    "[{supi}] UE policy: the UE was idle again by the time the retry ran ({e}); \
+                     re-parking the delivery"
+                );
+                ue_policy::ue_policy_park_pending_delivery(pol_asso_id, &supi, pdu);
+            } else {
+                log::warn!("[{supi}] UE policy: retried delivery failed terminally ({e})");
                 ue_policy::ue_policy_update_delivery_state(
-                    &id,
+                    pol_asso_id,
                     ue_policy::DeliveryState::Failed(e),
                 );
             }
+            false
         }
-    });
+    }
 }
 
 /// Build this PCF's `n1NotifyCallbackUri` for an association's UE-policy
@@ -1424,13 +1592,48 @@ fn spawn_ue_policy_delivery(pol_asso_id: &str, supi: &str, data: &serde_json::Va
 /// correlates the COMPLETE/REJECT back to the right association. `None` when
 /// the PCF self-identity was not published (e.g. no config) — the caller then
 /// skips the subscribe.
+///
+/// #92 criterion 5: the scheme is derived from the configured SBI transport
+/// security (`sbi_path::advertised_sbi_scheme`) rather than the literal `http://`
+/// this used to emit. A TLS deployment registered a cleartext URI for an `https`
+/// listener, and every `N1MessageNotify` the AMF tried to POST failed to connect —
+/// which presents at the AMF with nothing naming the PCF's own subscription
+/// (TS 29.500 §6.1).
 fn ue_policy_notify_callback_uri(pol_asso_id: &str) -> Option<String> {
     let info = sbi_path::pcf_self_info()?;
     Some(format!(
-        "http://{}:{}/npcf-ue-policy-control/v1/notify/{}/n1-message-notify",
-        info.sbi_addr, info.sbi_port, pol_asso_id
+        "{}://{}:{}/npcf-ue-policy-control/v1/notify/{}/n1-message-notify",
+        sbi_path::advertised_sbi_scheme(),
+        info.sbi_addr,
+        info.sbi_port,
+        pol_asso_id
     ))
 }
+
+/// Build this PCF's `eventNotifyUri` for an association's UE-reachability retry
+/// (#92): the serving AMF POSTs an `AmfEventNotification` carrying the
+/// `CONNECTIVITY_STATE_REPORT` here when the UE's CM state changes.
+///
+/// Same `notify/{polAssoId}/...` convention and the same scheme derivation as
+/// [`ue_policy_notify_callback_uri`], so the association a wake-up belongs to is in
+/// the path rather than having to be recovered from the body's `notifyCorrelationId`.
+fn ue_policy_connectivity_callback_uri(pol_asso_id: &str) -> Option<String> {
+    let info = sbi_path::pcf_self_info()?;
+    Some(format!(
+        "{}://{}:{}{}/{pol_asso_id}/{}",
+        sbi_path::advertised_sbi_scheme(),
+        info.sbi_addr,
+        info.sbi_port,
+        sbi_path::UE_POLICY_N1N2_FAILURE_PATH_PREFIX,
+        UE_POLICY_CONNECTIVITY_NOTIFY_SEGMENT,
+    ))
+}
+
+/// Trailing path segment of the `CONNECTIVITY_STATE_REPORT` callback (#92). One
+/// constant shared by the URI builder and the router arm below, so the URI the AMF
+/// is told about is one this PCF serves — the failure mode otherwise is a
+/// subscription that works until it fires.
+pub const UE_POLICY_CONNECTIVITY_NOTIFY_SEGMENT: &str = "connectivity-state-notify";
 
 pub async fn handle_ue_policy_get(pol_asso_id: &str) -> SbiResponse {
     match ue_policy::ue_policy_find(pol_asso_id) {
@@ -1455,12 +1658,42 @@ pub async fn handle_ue_policy_delete(pol_asso_id: &str) -> SbiResponse {
     // T3501 loop (it reads the store each expiry) — cancel-on-delete.
     let assoc = ue_policy::ue_policy_find(pol_asso_id);
     if ue_policy::ue_policy_remove(pol_asso_id) {
+        // #92: drop any delivery parked for a UE-reachability retry. Without this a
+        // CONNECTIVITY_STATE_REPORT arriving after the delete would resend policy for
+        // an association the PCF has released — the cancel-on-delete rule the rest of
+        // this module follows, applied to the one store that is not keyed off
+        // `ue_policy_store`.
+        ue_policy::ue_policy_drop_parked_delivery(pol_asso_id);
         if let Some(a) = assoc {
+            // #92: the terminate notification (TS 29.525 §4.2.4). Sent BEFORE the
+            // unsubscribes and from the values captured above, because the association
+            // is already gone from the store. §4.2.4 models termination as the PCF
+            // asking the consumer to release the association; the pre-#92 behaviour —
+            // the PCF silently forgetting its own state — is why an AMF could hold an
+            // association whose every later update got a bare 404.
+            sbi_path::pcf_send_ue_policy_terminate_notify(
+                pol_asso_id,
+                &a.notification_uri,
+                &a.triggers,
+            );
+            // Both unsubscribes need the serving AMF, and the store can no longer
+            // supply it, so the captured values are threaded through.
+            let guami = a.guami.clone();
+            let serving_nf_id = a.serving_nf_id.clone();
             if let Some(sub_id) = a.n1n2_subscription_id {
                 let supi = a.supi.clone();
+                let guami = guami.clone();
+                let serving_nf_id = serving_nf_id.clone();
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     handle.spawn(async move {
-                        match sbi_path::pcf_unsubscribe_ue_policy_notify(&supi, &sub_id).await {
+                        match sbi_path::pcf_unsubscribe_ue_policy_notify(
+                            &supi,
+                            &sub_id,
+                            guami.as_ref(),
+                            serving_nf_id.as_deref(),
+                        )
+                        .await
+                        {
                             Ok(true) => log::info!(
                                 "[{supi}] UE policy: N1N2MessageUnSubscribe ok (sub={sub_id})"
                             ),
@@ -1474,6 +1707,37 @@ pub async fn handle_ue_policy_delete(pol_asso_id: &str) -> SbiResponse {
                     });
                 }
             }
+            // #92: and the CM-state subscription the reachability retry armed, if any.
+            // Leaving it would have the AMF pushing CONNECTIVITY_STATE_REPORTs at a PCF
+            // with nothing to do with them until the subscription expires.
+            if let Some(sub_id) = a.connectivity_subscription_id {
+                let supi = a.supi.clone();
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        match sbi_path::pcf_unsubscribe_amf_connectivity_state(
+                            &supi,
+                            &sub_id,
+                            guami.as_ref(),
+                            serving_nf_id.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(true) => log::info!(
+                                "[{supi}] UE policy: CONNECTIVITY_STATE_REPORT unsubscribed \
+                                 (sub={sub_id})"
+                            ),
+                            Ok(false) => log::debug!(
+                                "[{supi}] UE policy: no AMF reachable to unsubscribe CM-state \
+                                 (sub={sub_id})"
+                            ),
+                            Err(e) => log::warn!(
+                                "[{supi}] UE policy: CONNECTIVITY_STATE_REPORT unsubscribe \
+                                 failed ({e})"
+                            ),
+                        }
+                    });
+                }
+            }
         }
         SbiResponse::with_status(204)
     } else {
@@ -1482,6 +1746,90 @@ pub async fn handle_ue_policy_delete(pol_asso_id: &str) -> SbiResponse {
             Some("POLICY_NOT_FOUND"),
         )
     }
+}
+
+/// `CONNECTIVITY_STATE_REPORT` callback (#92, TS 29.518 §6.2.6.2.4): the serving
+/// AMF POSTs an `AmfEventNotification` here when the UE's CM state changes, because
+/// a UE-policy delivery failed while the UE was CM-IDLE and
+/// [`arm_ue_policy_reachability_retry`] subscribed to be told when that stopped
+/// being true (TS 23.502 §4.2.4.3).
+///
+/// A report whose `cmState` is `CONNECTED` retries the parked delivery; `IDLE` (the
+/// transition INTO idle, which the same subscription also reports) is acknowledged
+/// and ignored, since the delivery is already parked for exactly that state. Always
+/// 204 — the notification was consumed, and whether a retry happened is the PCF's
+/// business, not a status the AMF can act on (TS 29.518 §5.3.2.5.2).
+pub async fn handle_ue_policy_connectivity_notify(
+    pol_asso_id: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
+    let data: serde_json::Value = request
+        .http
+        .content
+        .as_deref()
+        .and_then(|c| serde_json::from_str(c).ok())
+        .unwrap_or(serde_json::Value::Null);
+
+    // AmfEventNotification.reportList[].cmInfoList[].cmState (TS 29.518
+    // §6.2.6.2.5 / Table 6.2.6.2.6-1). Scanned across the whole report list rather
+    // than just the first entry: a notification may batch several reports, and the
+    // one that matters is whichever says CONNECTED.
+    let connected = data
+        .get("reportList")
+        .and_then(|l| l.as_array())
+        .is_some_and(|reports| {
+            reports.iter().any(|r| {
+                r.get("cmInfoList")
+                    .and_then(|l| l.as_array())
+                    .is_some_and(|cms| {
+                        cms.iter().any(|cm| {
+                            cm.get("cmState").and_then(|s| s.as_str()) == Some("CONNECTED")
+                        })
+                    })
+            })
+        });
+
+    if connected {
+        retry_parked_ue_policy_delivery(pol_asso_id, "the UE returned to CM-CONNECTED").await;
+    } else {
+        log::debug!(
+            "[{pol_asso_id}] UE policy: CONNECTIVITY_STATE_REPORT reports no CONNECTED state; \
+             the parked delivery stays parked"
+        );
+    }
+    SbiResponse::with_status(204)
+}
+
+/// `N1N2MsgTxfrFailureNotification` callback (#92, TS 29.518 §6.1.6.2.8): the AMF
+/// reports the ASYNCHRONOUS outcome of an `N1N2MessageTransfer` that carried
+/// `n1n2FailureTxfNotifURI`.
+///
+/// The AMF side of this already existed (`namf_server.rs`'s
+/// `ue_not_reachable_error`); what did not exist was a PCF that supplied the URI and
+/// served the callback, so the notification had nowhere to go. A `UE_NOT_REACHABLE`
+/// cause parks nothing new — the synchronous 504 on the same transfer already did —
+/// but it DOES confirm the AMF agrees the transfer is dead, so the parked delivery is
+/// left in place and logged rather than retried immediately, which would just fail
+/// again.
+///
+/// Always 204: a consumer callback acknowledges receipt.
+pub async fn handle_ue_policy_n1n2_failure_notify(
+    pol_asso_id: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
+    let cause = request
+        .http
+        .content
+        .as_deref()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+        .and_then(|v| v.get("cause").and_then(|c| c.as_str()).map(str::to_string))
+        .unwrap_or_else(|| "<none>".to_string());
+    log::info!(
+        "[{pol_asso_id}] UE policy: N1N2MsgTxfrFailureNotification cause={cause}; parked \
+         delivery retained={}",
+        ue_policy::ue_policy_has_parked_delivery(pol_asso_id)
+    );
+    SbiResponse::with_status(204)
 }
 
 /// Wave-6 E6 — Namf `N1MessageNotify` callback (TS 29.518 §5.2.2.4): the AMF
@@ -1531,6 +1879,40 @@ pub async fn handle_ue_policy_n1_notify(pol_asso_id: &str, request: &SbiRequest)
         log::warn!(
             "[{pol_asso_id}] UE policy notify: unknown association; dropping N1MessageNotify"
         );
+    }
+
+    // #92 criterion 6 / spec Decision 4: the E6 correlation this function performs is
+    // exactly what `context_ursp_for` was documented to serve, and until now it had no
+    // production reader — the process-global UePolicyContext was write-only outside
+    // tests. On a MANAGE UE POLICY COMPLETE the UE has INSTALLED the section, so the
+    // rules provisioned for that SUPI are what the installed UPSC now denotes
+    // (TS 24.501 D.2.1.3; TS 23.503 §6.6.2.2 keeps the applicable UE policy keyed by
+    // the UE). Reading them back here states that correspondence at the moment it
+    // becomes true, and makes a delivery that confirmed a UPSC against an EMPTY
+    // provisioned set visible — which means the association's rules and the context
+    // store disagree, and the UE now holds a section the PCF cannot describe.
+    if let ue_policy::UePolicyResultOutcome::Delivered(upsc) = &outcome {
+        if let Some(supi) = ue_policy::ue_policy_find(pol_asso_id).map(|a| a.supi) {
+            let installed_rules = ue_policy::context_ursp_for(&supi);
+            if installed_rules.is_empty() {
+                log::warn!(
+                    "[{pol_asso_id}] UE policy: UPSC {upsc} confirmed installed at the UE, but \
+                     the UE-policy context holds NO provisioned URSP rules for {supi}. The UE \
+                     has a section this PCF can no longer describe (context cleared, or the \
+                     COMPLETE outlived the provisioning)."
+                );
+            } else {
+                log::info!(
+                    "[{pol_asso_id}] UE policy: UPSC {upsc} installed at the UE now denotes the \
+                     {} provisioned URSP rule(s) for {supi} (precedences {:?})",
+                    installed_rules.len(),
+                    installed_rules
+                        .iter()
+                        .map(|r| r.precedence)
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
     }
 
     // TS 29.523 `SUCCESS_UE_POL_DEL_SP` / `UNSUCCESS_UE_POL_DEL_SP`: the UE
@@ -1603,6 +1985,20 @@ pub async fn handle_ue_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
         }
     }
 
+    // #92: the serving AMF can CHANGE on an update — inter-AMF mobility is exactly
+    // when an AMF re-sends `guami`. Re-recording it before any re-delivery is what
+    // stops the re-push going to the AMF that used to serve this UE. An update that
+    // omits the members leaves the stored value alone (see
+    // `ue_policy_set_serving_amf`): omission is not a statement that the AMF became
+    // unknown.
+    ue_policy::ue_policy_set_serving_amf(
+        pol_asso_id,
+        data.get("guami").and_then(ue_policy::AmfGuami::from_json),
+        data.get("servingNfId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    );
+
     // `uePolReq` (§5.6.2.4, `Bytes`): a fresh UE STATE INDICATION, so the UE's
     // installed-UPSI baseline moves and the next delivery is a delta against the NEW
     // baseline.
@@ -1663,6 +2059,24 @@ pub async fn handle_ue_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
         redelivered = true;
     }
 
+    // #92: NOTIFY the consumer (TS 29.525 §4.2.4: POST {notificationUri}/update with
+    // a PolicyUpdate). #91 made this handler apply the update; it still told the AMF
+    // nothing, so a PCF-initiated policy change was acknowledged with a 200 and then
+    // invisible. Sent AFTER every member has been applied, so the notification
+    // describes the association's post-update state, and after the re-delivery is
+    // spawned, so the two are not ordered against each other by accident. Fired
+    // unconditionally rather than only on a "significant" change: §4.2.4 does not
+    // define significance, and a consumer that can be told less than every update is
+    // a consumer that has to poll.
+    let notified = sbi_path::pcf_send_ue_policy_update_notify(pol_asso_id);
+    if !notified {
+        log::warn!(
+            "[{pol_asso_id}] UE policy update: applied, but the consumer could not be \
+             notified (no notificationUri, or no runtime to deliver on). The consumer will \
+             not learn of this change from us."
+        );
+    }
+
     let resp = serde_json::json!({
         "resourceUri": format!("/npcf-ue-policy-control/v1/policies/{pol_asso_id}"),
         "triggers": triggers,
@@ -1673,6 +2087,9 @@ pub async fn handle_ue_policy_update(pol_asso_id: &str, request: &SbiRequest) ->
             "reportedUpsis": reported,
             "redelivered": redelivered,
             "deliveryResult": delivery_outcome,
+            // #92: whether the §4.2.4 notification was dispatched, so a consumer driving
+            // the update can tell "applied and announced" from "applied only".
+            "notified": notified,
         },
     });
     SbiResponse::with_status(200)

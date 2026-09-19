@@ -3204,10 +3204,17 @@ impl NgapServer {
                 None => (state.amf_ue.nr_tai.plmn_id.clone(), 2, 1, 0),
             }
         };
-        let amf_id_hex = format!(
-            "{:06x}",
-            ((amf_region as u32) << 16) | ((amf_set as u32) << 6) | (amf_pointer as u32)
-        );
+        // #92: through the SHARED packer, not a local `format!`. The PCF matches this
+        // `amfId` against the `amfInfo.guamiList` this AMF registered with the NRF, so
+        // two independent renderings of one AMF ID would never match and GUAMI-based
+        // targeting would fall back to the first discovered AMF on every delivery — the
+        // defect #92 is about, restored by a copy-paste that no test would catch. There
+        // were TWO copies of this packing here, which is the argument by itself.
+        let amf_id_hex = crate::sbi_path::amf_id_hex(&crate::context::AmfId {
+            region: amf_region,
+            set: amf_set,
+            pointer: amf_pointer,
+        });
         let (guami_mcc, guami_mnc) = plmn_mcc_mnc_strings(&guami_plmn);
 
         let (udm_host, udm_port) =
@@ -3653,10 +3660,17 @@ impl NgapServer {
                 }
             }
         };
-        let amf_id_hex = format!(
-            "{:06x}",
-            ((amf_region as u32) << 16) | ((amf_set as u32) << 6) | (amf_pointer as u32)
-        );
+        // #92: through the SHARED packer, not a local `format!`. The PCF matches this
+        // `amfId` against the `amfInfo.guamiList` this AMF registered with the NRF, so
+        // two independent renderings of one AMF ID would never match and GUAMI-based
+        // targeting would fall back to the first discovered AMF on every delivery — the
+        // defect #92 is about, restored by a copy-paste that no test would catch. There
+        // were TWO copies of this packing here, which is the argument by itself.
+        let amf_id_hex = crate::sbi_path::amf_id_hex(&crate::context::AmfId {
+            region: amf_region,
+            set: amf_set,
+            pointer: amf_pointer,
+        });
         let (guami_mcc, guami_mnc) = plmn_mcc_mnc_strings(&guami_plmn);
 
         // The same PCF that serves AM policy: TS 29.525 and TS 29.507 are two

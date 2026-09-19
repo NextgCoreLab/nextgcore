@@ -57,6 +57,16 @@ pub use app::{
     handle_ue_policy_create, pcf_sbi_request_handler, run,
 };
 
+// #92: the UE-policy handlers whose behaviour the serving-AMF / callback tests drive
+// end to end — the update must NOTIFY the consumer, the delete must terminate-notify,
+// and the CM-state callback must retry a parked delivery rather than let it die.
+// Exported for the same reason the create handler above is: the tests assert what the
+// REAL handler does, not what a reimplementation of it would do.
+pub use app::{
+    handle_ue_policy_connectivity_notify, handle_ue_policy_delete,
+    handle_ue_policy_delivery_failure, handle_ue_policy_update,
+};
+
 /// Helpers for in-process strict-peer tests in *other* crates. Not gated behind
 /// `#[cfg(test)]` because cfg(test) items are invisible across crate
 /// boundaries; a dev-dependency test in a peer crate must seed the
