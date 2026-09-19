@@ -1756,6 +1756,107 @@ struct XrSessionFlow {
     gbr_dl_bps: u64,
 }
 
+/// The URR ID this SMF provisions on every PDU session (#80).
+///
+/// One URR per session, not one per direction: the Volume Threshold and Volume Quota
+/// IEs each carry total/uplink/downlink fields (TS 29.244 §8.2.13, §8.2.40), so a
+/// single rule already expresses per-direction limits. Two rules would double the
+/// reports and make "total" ambiguous.
+const SESSION_URR_ID: u32 = 1;
+
+/// The usage-reporting rule this SMF provisions for a new PDU session (#80,
+/// TS 29.244 §5.2.2, §7.5.2.4).
+///
+/// Before #80 the SMF provisioned **no URR at all**, so the UPF measured nothing,
+/// reported nothing, and could not enforce a quota it was never given — the whole
+/// capability was absent rather than degraded.
+///
+/// ## Thresholds are always provisioned; quotas only when configured
+///
+/// Measurement and reporting are unconditional: they are observation, they cannot
+/// change what the data plane forwards, and without them there is no usage reporting.
+/// The QUOTA is what gates traffic, so it is provisioned only when an operator sets
+/// one. That is why #80 needs no feature flag and no runtime switch (see
+/// `specs/fix-n4-usage-reporting-and-quota-enforcement.md`, Decision 1): with no quota
+/// configured the UPF's forwarding behaviour is byte-for-byte what it was, and
+/// enforcement exists exactly where it was asked for. The gate is the provisioned
+/// value, which is what the spec makes the gate.
+///
+/// The values come from config rather than from the PCF's `chgDecs`, which carry
+/// `ratingGroup`/`meteringMethod` and **no volume** — deriving a quota from them would
+/// be inventing one. Sourcing a per-subscriber balance from the CHF is #80's own
+/// declared follow-up.
+fn session_urr_params() -> n4_build::UrrParams {
+    /// Read a `u64` from the environment, ignoring an unparseable or zero value.
+    ///
+    /// Zero is rejected rather than honoured: a zero volume quota would gate the
+    /// subscriber's traffic to nothing from the first packet, which is far more likely
+    /// to be a misconfiguration than an intent, and TS 29.244 gives "unprovisioned" its
+    /// own representation (the IE's absence) for saying so.
+    fn env_u64(key: &str) -> Option<u64> {
+        let raw = std::env::var(key).ok()?;
+        match raw.trim().parse::<u64>() {
+            Ok(0) => {
+                log::warn!("{key}=0 ignored: a zero quota/threshold gates all traffic — omit the variable instead");
+                None
+            }
+            Ok(v) => Some(v),
+            Err(e) => {
+                log::warn!("{key}={raw:?} is not a number ({e}) — ignoring");
+                None
+            }
+        }
+    }
+    fn env_u32(key: &str) -> Option<u32> {
+        env_u64(key).and_then(|v| u32::try_from(v).ok())
+    }
+
+    // Reporting thresholds and cadence, with documented defaults. 1 GiB and 1 hour are
+    // reporting granularity, not limits: they decide how often the UPF tells the SMF
+    // what it measured.
+    let volume_threshold = env_u64("SMF_URR_VOLUME_THRESHOLD").unwrap_or(1024 * 1024 * 1024);
+    let time_threshold = env_u32("SMF_URR_TIME_THRESHOLD").unwrap_or(3600);
+    let measurement_period = env_u32("SMF_URR_MEASUREMENT_PERIOD").unwrap_or(3600);
+
+    // Quotas: absent unless configured. Their presence is what turns measurement into
+    // enforcement.
+    let volume_quota = env_u64("SMF_URR_VOLUME_QUOTA");
+    let time_quota = env_u32("SMF_URR_TIME_QUOTA");
+
+    let mut triggers = n4_build::reporting_trigger::VOLTH
+        | n4_build::reporting_trigger::TIMTH
+        | n4_build::reporting_trigger::PERIO;
+    if volume_quota.is_some() {
+        triggers |= n4_build::reporting_trigger::VOLQU;
+    }
+    if time_quota.is_some() {
+        triggers |= n4_build::reporting_trigger::TIMQU;
+    }
+
+    n4_build::UrrParams {
+        urr_id: SESSION_URR_ID,
+        // Volume AND duration: a time threshold or time quota is unmeasurable without
+        // duration measurement, and provisioning the trigger without the method is the
+        // shape of defect this issue is about.
+        measurement_method: (true, true, false),
+        reporting_triggers: triggers,
+        // Total only. A per-direction threshold would report twice for traffic that is
+        // one session's usage; the UPF accumulates both directions against this rule and
+        // the report carries the UL/DL split regardless (§8.2.42).
+        volume_threshold: Some((Some(volume_threshold), None, None)),
+        volume_quota: volume_quota.map(|q| (Some(q), None, None)),
+        time_threshold: Some(time_threshold),
+        time_quota,
+        // The PERIO trigger's cadence. Setting the trigger without this would leave the
+        // UPF's periodic reporter with no interval and no report would ever fire — which
+        // is the defect #80's criterion 6 is about, on the sending side.
+        measurement_period: Some(measurement_period),
+        // Not provisioned: the UPF neither parses nor enforces Quota Validity Time
+        // (§8.2.113), so sending it would claim an enforcement that does not exist.
+        quota_validity_time: None,
+    }
+}
+
 /// Build a `binding::SessionPolicy` from a parsed `PolicyDecision` so the
 /// XR-aware QoS-flow binding can inspect the authorized 5QI/GBR.
 ///
@@ -1910,6 +2011,25 @@ async fn pfcp_session_establish(
         .map(|x| x.five_qi & 0x3F)
         .unwrap_or(qos.qfi);
 
+    // Create URR 1 (#80, TS 29.244 §5.2.2 / §7.5.2.4): provision usage measurement,
+    // reporting and — when a quota is configured — enforcement.
+    //
+    // This IE was entirely absent before #80, which is why the UPF's URR collector
+    // received no rule and the whole usage-reporting capability was inert. Emitted
+    // BEFORE the PDRs, so the rule the PDRs reference exists in the same message by the
+    // time the UP function reads them (§7.5.2: a PDR may reference a URR created in the
+    // same request, but ordering the IEs this way keeps the message readable).
+    let urr_params = session_urr_params();
+    let urr_bytes = n4_build::build_create_urr(&urr_params);
+    builder.add_tlv(pfcp_ie::CREATE_URR, &urr_bytes);
+    log::info!(
+        "PFCP: provisioning URR {} (volume threshold {:?}, quota {:?}, time quota {:?}s)",
+        urr_params.urr_id,
+        urr_params.volume_threshold.and_then(|(t, _, _)| t),
+        urr_params.volume_quota.and_then(|(t, _, _)| t),
+        urr_params.time_quota,
+    );
+
     // Create PDR 1 (Uplink): UE -> UPF -> DN
     let ul_pdr = PdrParams {
         pdr_id: 1,
@@ -1921,6 +2041,9 @@ async fn pfcp_session_establish(
         far_id: Some(1),
         qer_id: Some(flow_qer_id),
         qfi: Some(flow_qfi),
+        // #80: bound to the URR, which is what makes the UPF measure this PDR's traffic
+        // against it. A URR created and referenced by nothing measures nothing.
+        urr_ids: vec![SESSION_URR_ID],
         ..Default::default()
     };
     let ul_pdr_bytes = n4_build::build_create_pdr(&ul_pdr);
@@ -1945,6 +2068,10 @@ async fn pfcp_session_establish(
         far_id: Some(2),
         qer_id: Some(flow_qer_id),
         qfi: Some(flow_qfi),
+        // #80: the SAME URR as the uplink PDR, so both directions accumulate against one
+        // allowance. A session-level volume allowance that counted only one direction
+        // would let a subscriber download past a quota they uploaded to.
+        urr_ids: vec![SESSION_URR_ID],
         ..Default::default()
     };
     let dl_pdr_bytes = n4_build::build_create_pdr(&dl_pdr);
@@ -8087,6 +8214,254 @@ mod tests {
         std::env::remove_var("UDM_SBI_ADDR");
         std::env::remove_var("UDM_SBI_PORT");
         udm_srv.stop().await.expect("stop");
+    }
+
+    // ==================================================================
+    // #80: N4 usage reporting — the SMF provisions a URR
+    // ==================================================================
+
+    /// Split a flat IE stream into `(type, value)` pairs (#80).
+    ///
+    /// A local TLV walker rather than the builder's own encoder, so a wrong layout
+    /// cannot be agreed with by the thing checking it.
+    fn flat_ies(buf: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut rest = buf;
+        while rest.len() >= 4 {
+            let ty = u16::from_be_bytes([rest[0], rest[1]]);
+            let len = u16::from_be_bytes([rest[2], rest[3]]) as usize;
+            if rest.len() < 4 + len {
+                break;
+            }
+            out.push((ty, rest[4..4 + len].to_vec()));
+            rest = &rest[4 + len..];
+        }
+        out
+    }
+
+    /// #80 criterion 1: the LIVE establishment path provisions a Create URR, and both
+    /// the UL and DL PDRs carry its URR ID.
+    ///
+    /// Driven through the real `pfcp_session_establish` against the stand-in UPF and
+    /// asserted on the **recorded wire body**, because the whole shape of this defect was
+    /// "the builder exists and nothing on the live path calls it": a test against
+    /// `build_create_urr` would have passed before #80 and still does.
+    ///
+    /// The quota is deliberately configured here so the VOLQU/TIMQU triggers are on the
+    /// wire too, and deliberately absent in
+    /// `an_unconfigured_quota_provisions_measurement_without_enforcement` — the pair is
+    /// what shows the gate is the provisioned value rather than a build flag.
+    #[tokio::test]
+    async fn the_establishment_request_provisions_a_urr_bound_to_both_pdrs() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        std::env::set_var("SMF_URR_VOLUME_QUOTA", "5000000");
+        std::env::set_var("SMF_URR_TIME_QUOTA", "900");
+        std::env::set_var("SMF_URR_VOLUME_THRESHOLD", "1000000");
+        std::env::set_var("SMF_URR_MEASUREMENT_PERIOD", "30");
+        upf.clear_seen();
+
+        let qos = SessionQos {
+            qfi: 9,
+            ambr_ul_bps: 100_000_000,
+            ambr_dl_bps: 100_000_000,
+            xr_flow: None,
+        };
+        pfcp_session_establish(0x0080, [10, 45, 0, 80], "internet", 1, &qos)
+            .await
+            .expect("the stand-in UPF must accept the establishment");
+
+        let bodies = upf.establishment_bodies();
+        assert_eq!(bodies.len(), 1, "exactly one establishment was sent");
+        let ies = flat_ies(&bodies[0]);
+
+        // ---- a Create URR is on the wire at all ----
+        let urr_ies: Vec<&Vec<u8>> = ies
+            .iter()
+            .filter(|(t, _)| *t == n4_build::pfcp_ie::CREATE_URR)
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(
+            urr_ies.len(),
+            1,
+            "the establishment must provision exactly one Create URR (TS 29.244 \
+             §7.5.2.4); before #80 it provisioned none, so the UPF measured nothing"
+        );
+        let urr = flat_ies(urr_ies[0]);
+        let urr_field = |ty: u16| -> Vec<u8> {
+            urr.iter()
+                .find(|(t, _)| *t == ty)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("IE {ty} missing from the Create URR: {urr:?}"))
+        };
+        assert_eq!(
+            urr_field(n4_build::pfcp_ie::URR_ID),
+            SESSION_URR_ID.to_be_bytes()
+        );
+        // Volume AND duration measurement: a time quota is unmeasurable without duration.
+        assert_eq!(urr_field(n4_build::pfcp_ie::MEASUREMENT_METHOD), vec![0x03]);
+        let triggers = urr_field(n4_build::pfcp_ie::REPORTING_TRIGGERS);
+        assert_eq!(triggers[0] & 0x02, 0x02, "VOLTH");
+        assert_eq!(triggers[0] & 0x04, 0x04, "TIMTH");
+        assert_eq!(triggers[0] & 0x01, 0x01, "PERIO");
+        assert_eq!(
+            triggers[1] & 0x01,
+            0x01,
+            "VOLQU, since a volume quota is set"
+        );
+        assert_eq!(triggers[1] & 0x02, 0x02, "TIMQU, since a time quota is set");
+        // The configured quota, on the wire, as the flags+u64 body §8.2.40 states.
+        let mut expect_quota = vec![0x01u8];
+        expect_quota.extend_from_slice(&5_000_000u64.to_be_bytes());
+        assert_eq!(urr_field(n4_build::pfcp_ie::VOLUME_QUOTA), expect_quota);
+        assert_eq!(
+            urr_field(n4_build::pfcp_ie::TIME_QUOTA),
+            900u32.to_be_bytes()
+        );
+        assert_eq!(
+            urr_field(n4_build::pfcp_ie::MEASUREMENT_PERIOD),
+            30u32.to_be_bytes(),
+            "PERIO without a Measurement Period is a trigger with no cadence"
+        );
+
+        // ---- BOTH PDRs are bound to it ----
+        let pdrs: Vec<Vec<(u16, Vec<u8>)>> = ies
+            .iter()
+            .filter(|(t, _)| *t == n4_build::pfcp_ie::CREATE_PDR)
+            .map(|(_, v)| flat_ies(v))
+            .collect();
+        assert_eq!(pdrs.len(), 2, "one UL and one DL PDR");
+        for (i, pdr) in pdrs.iter().enumerate() {
+            let bound: Vec<Vec<u8>> = pdr
+                .iter()
+                .filter(|(t, _)| *t == n4_build::pfcp_ie::URR_ID)
+                .map(|(_, v)| v.clone())
+                .collect();
+            assert_eq!(
+                bound,
+                vec![SESSION_URR_ID.to_be_bytes().to_vec()],
+                "PDR #{i} must reference the session URR; a URR nothing references \
+                 measures nothing, and BOTH directions must accumulate against ONE \
+                 allowance or a subscriber downloads past a quota they uploaded to. \
+                 PDR was {pdr:?}"
+            );
+        }
+
+        for k in [
+            "SMF_URR_VOLUME_QUOTA",
+            "SMF_URR_TIME_QUOTA",
+            "SMF_URR_VOLUME_THRESHOLD",
+            "SMF_URR_MEASUREMENT_PERIOD",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
+    /// #80 Decision 1: with no quota configured the establishment still provisions
+    /// measurement and reporting, and provisions NO quota — so the UPF's forwarding
+    /// behaviour is byte-for-byte what it was.
+    ///
+    /// This is what replaces the off-by-default feature flag #80's "feature-gate advice"
+    /// asks for: the gate is the provisioned value, which is what TS 29.244 makes the
+    /// gate. Both states are therefore inside `cargo test --workspace`, which a cargo
+    /// feature would not be.
+    #[tokio::test]
+    async fn an_unconfigured_quota_provisions_measurement_without_enforcement() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        for k in ["SMF_URR_VOLUME_QUOTA", "SMF_URR_TIME_QUOTA"] {
+            std::env::remove_var(k);
+        }
+        upf.clear_seen();
+
+        let qos = SessionQos {
+            qfi: 9,
+            ambr_ul_bps: 100_000_000,
+            ambr_dl_bps: 100_000_000,
+            xr_flow: None,
+        };
+        pfcp_session_establish(0x0081, [10, 45, 0, 81], "internet", 1, &qos)
+            .await
+            .expect("establish");
+
+        let bodies = upf.establishment_bodies();
+        let urr = flat_ies(
+            flat_ies(&bodies[0])
+                .into_iter()
+                .find(|(t, _)| *t == n4_build::pfcp_ie::CREATE_URR)
+                .map(|(_, v)| v)
+                .expect(
+                    "a URR is provisioned even with no quota: measurement is not \
+                         enforcement, and without it there is no usage reporting",
+                )
+                .as_slice(),
+        );
+        // Measurement and reporting: present.
+        assert!(urr
+            .iter()
+            .any(|(t, _)| *t == n4_build::pfcp_ie::VOLUME_THRESHOLD));
+        assert!(urr
+            .iter()
+            .any(|(t, _)| *t == n4_build::pfcp_ie::MEASUREMENT_PERIOD));
+        // Enforcement: absent, values AND triggers.
+        assert!(
+            !urr.iter()
+                .any(|(t, _)| *t == n4_build::pfcp_ie::VOLUME_QUOTA
+                    || *t == n4_build::pfcp_ie::TIME_QUOTA),
+            "no quota configured must mean no quota IE: the UPF cannot gate traffic it \
+             was given no limit for"
+        );
+        let triggers = urr
+            .iter()
+            .find(|(t, _)| *t == n4_build::pfcp_ie::REPORTING_TRIGGERS)
+            .map(|(_, v)| v.clone())
+            .expect("triggers");
+        assert_eq!(
+            triggers[1] & 0x03,
+            0x00,
+            "VOLQU/TIMQU must be clear: announcing a quota trigger with no quota names \
+             a limit that does not exist"
+        );
+    }
+
+    /// #80: a zero or unparseable quota is ignored rather than honoured.
+    ///
+    /// A zero volume quota would gate the subscriber from the first packet. That is far
+    /// more likely a misconfiguration than an intent, and TS 29.244 already has a way to
+    /// say "no quota" — the IE's absence.
+    #[test]
+    fn a_zero_or_unparseable_quota_is_ignored() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.blocking_lock();
+        std::env::set_var("SMF_URR_VOLUME_QUOTA", "0");
+        std::env::set_var("SMF_URR_TIME_QUOTA", "not-a-number");
+        let params = session_urr_params();
+        assert!(
+            params.volume_quota.is_none(),
+            "a zero volume quota must be ignored, not gate every packet"
+        );
+        assert!(
+            params.time_quota.is_none(),
+            "an unparseable quota is no quota"
+        );
+        assert_eq!(
+            params.reporting_triggers & n4_build::reporting_trigger::VOLQU,
+            0,
+            "and no quota means no quota trigger"
+        );
+
+        // A real value is honoured, so the rejection above is about the value and not
+        // about the variable being read at all.
+        std::env::set_var("SMF_URR_VOLUME_QUOTA", "12345");
+        let params = session_urr_params();
+        assert_eq!(params.volume_quota, Some((Some(12345), None, None)));
+        assert_ne!(
+            params.reporting_triggers & n4_build::reporting_trigger::VOLQU,
+            0
+        );
+
+        for k in ["SMF_URR_VOLUME_QUOTA", "SMF_URR_TIME_QUOTA"] {
+            std::env::remove_var(k);
+        }
     }
 
     /// A loopback PCF that records every `/update` body and answers with the

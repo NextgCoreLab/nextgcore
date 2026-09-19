@@ -1096,6 +1096,14 @@ pub(crate) mod stand_in {
         /// on. A gate test asserting only that a modification was or was not sent
         /// would pass for a modification that carried the wrong IE.
         pub(crate) modification_bodies: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        /// Bodies of the Session ESTABLISHMENT Requests this stand-in received, in
+        /// order (#80).
+        ///
+        /// Recorded for the same reason as the modification bodies above: "an
+        /// establishment was sent" cannot answer "did it provision a URR, and was that
+        /// URR bound to both PDRs" — which is what #80 turns on, and which the whole
+        /// usage-reporting capability was silently missing.
+        pub(crate) establishment_bodies: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
         /// Serialises every N4 test against every other; released with this value.
         _n4_guard: tokio::sync::MutexGuard<'static, ()>,
     }
@@ -1121,6 +1129,19 @@ pub(crate) mod stand_in {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clear();
+            self.establishment_bodies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+        }
+
+        /// Bodies of the Session Establishment Requests received since the last
+        /// [`Self::clear_seen`] (#80).
+        pub(crate) fn establishment_bodies(&self) -> Vec<Vec<u8>> {
+            self.establishment_bodies
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
         }
 
         /// Bodies of the Session Modification Requests received since the last
@@ -1230,12 +1251,14 @@ pub(crate) mod stand_in {
         let (client, upf_sock) = client_with_silent_peer().await;
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let modification_bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let establishment_bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
         let upf_seid = 0x0000_0000_dead_beef_u64;
         let upf_teid = 0x0000_1289_u32;
         let upf_ip = [127, 0, 0, 4];
 
         let recorded = seen.clone();
         let recorded_bodies = modification_bodies.clone();
+        let recorded_establishments = establishment_bodies.clone();
         let session_cause = Arc::new(std::sync::atomic::AtomicU8::new(
             pfcp_cause::REQUEST_ACCEPTED,
         ));
@@ -1256,6 +1279,12 @@ pub(crate) mod stand_in {
                     .push(h.msg_type);
                 if h.msg_type == pfcp_message_type::SESSION_MODIFICATION_REQUEST {
                     recorded_bodies
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(buf[h.body_offset..len].to_vec());
+                }
+                if h.msg_type == pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST {
+                    recorded_establishments
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .push(buf[h.body_offset..len].to_vec());
@@ -1336,6 +1365,7 @@ pub(crate) mod stand_in {
             upf_ip,
             session_cause,
             modification_bodies,
+            establishment_bodies,
             _n4_guard: n4_guard,
         }
     }
