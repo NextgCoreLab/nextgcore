@@ -140,6 +140,26 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
             handle_dereg_notify_callback(parts[2], &request)
         }
 
+        // --------------------------------------------------------------
+        // Namf_Callback: Npcf_UEPolicyControl update/terminate notification
+        // (#92, TS 29.525 §4.2.4). The PCF POSTs a `PolicyUpdate` to
+        // `{notificationUri}/update`, or a terminate to
+        // `{notificationUri}/terminate`, where `notificationUri` is the absolute
+        // URI the AMF registered at association create
+        // (`sbi_path::ue_policy_notification_uri`). Before #92 this path was
+        // unrouted and fell to the 404 arm below, so the PCF's notification had
+        // nowhere to land even once the PCF started sending it.
+        //   POST /namf-callback/v1/{supi}/ue-policy-notify/{update|terminate}
+        //   POST /namf-callback/v1/{supi}/ue-policy-notify
+        // --------------------------------------------------------------
+        "namf-callback"
+            if method == "POST"
+                && (4..=5).contains(&parts.len())
+                && parts[3] == "ue-policy-notify" =>
+        {
+            handle_ue_policy_notify_callback(parts[2], parts.get(4).copied(), &request)
+        }
+
         _ => {
             log::warn!("Unknown AMF SBI request: {method} {uri}");
             send_not_found(
@@ -301,6 +321,105 @@ fn handle_dereg_notify_callback(supi: &str, request: &SbiRequest) -> SbiResponse
                 None,
             )
         }
+    }
+}
+
+/// `Npcf_UEPolicyControl` update / terminate notification callback (#92,
+/// TS 29.525 §4.2.4).
+///
+/// The PCF POSTs a `PolicyUpdate` to `{notificationUri}/update` when it
+/// re-evaluates UE policy, and to `{notificationUri}/terminate` when it releases the
+/// association — `notificationUri` being the absolute URI this AMF registered at
+/// association create ([`crate::sbi_path::ue_policy_notification_uri`]).
+///
+/// `operation` is the trailing path segment (`Some("update")`, `Some("terminate")`,
+/// or `None` for a POST to the bare notification URI). All three answer **204 No
+/// Content**, which is what TS 29.525 specifies for the notification callbacks and
+/// what #92's criterion asks for.
+///
+/// # Why this consumes rather than acts
+///
+/// The AMF's role in §4.2.4 is to LEARN that UE policy changed; the policy itself
+/// travels on the N1 wire (TS 24.501 Annex D), which reaches the UE through the
+/// separate `N1N2MessageTransfer` leg the PCF drives. So there is nothing for this
+/// route to forward: acting on the `PolicyUpdate` body would mean the AMF inventing
+/// a second delivery path for content it cannot decode (the UE policy container is
+/// opaque to the AMF — see `try_ue_policy_relay`). The notification is therefore
+/// logged with the resource it names and acknowledged.
+///
+/// A terminate additionally CLEARS the association id from the UE context, because
+/// after it the id names a resource the PCF has released: keeping it would have the
+/// AMF DELETE a 404 at deregistration and, worse, report a live UE-policy
+/// association that does not exist.
+///
+/// Fail-soft rather than fail-closed, unlike `dereg-notify`: a malformed body is
+/// logged and still 204'd. TS 29.500 §5.2.7's fail-closed rule protects a producer
+/// from acting on a request it did not understand, and this route acts on nothing —
+/// 400-ing it would make the PCF retry a notification that cannot be acted on either
+/// way, and TS 29.500 §6.10 makes a 4xx the one status that stops the retry loop.
+fn handle_ue_policy_notify_callback(
+    supi: &str,
+    operation: Option<&str>,
+    request: &SbiRequest,
+) -> SbiResponse {
+    let resource_uri = parse_json_body(request)
+        .and_then(|b| {
+            b.get("resourceUri")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "<none>".to_string());
+
+    match operation {
+        Some("terminate") => {
+            log::info!(
+                "[{supi}] Npcf_UEPolicyControl terminate notification (resourceUri={resource_uri}); \
+                 releasing the stored UE policy association id"
+            );
+            clear_ue_policy_association(supi);
+        }
+        Some("update") | None => {
+            log::info!(
+                "[{supi}] Npcf_UEPolicyControl update notification (resourceUri={resource_uri}); \
+                 the UE policy itself arrives over N1N2MessageTransfer, so this is acknowledged \
+                 and not forwarded"
+            );
+        }
+        Some(other) => {
+            // An unknown sub-resource under a URI this AMF advertised. Logged loudly
+            // because it means the PCF is using an operation this build does not know
+            // about, and answering 204 to it would hide that from both sides.
+            log::warn!(
+                "[{supi}] Npcf_UEPolicyControl notification with unknown operation \
+                 '{other}' (resourceUri={resource_uri}); acknowledged without action"
+            );
+        }
+    }
+
+    SbiResponse::no_content()
+}
+
+/// Forget the UE-policy association id held for `supi` (#92), after the PCF says it
+/// terminated the association.
+///
+/// Best-effort and silent on a missing UE: a terminate for a UE the AMF has already
+/// released is the ordinary race (the PCF's notification and the AMF's own
+/// deregistration cross), not an error worth a WARN on every deregistration.
+fn clear_ue_policy_association(supi: &str) {
+    let Some(mut ue) = find_ue_by_context_id(supi) else {
+        log::debug!(
+            "[{supi}] UE policy terminate notification for a UE this AMF no longer holds; \
+             nothing to clear"
+        );
+        return;
+    };
+    // The context's own clearer, not a hand-rolled field assignment: it also drops
+    // `resource_uri`, and `pcf_ue_policy_associated` reads `id` — leaving a resource URI
+    // behind for an association that no longer exists is how a later DELETE ends up
+    // addressing a released resource.
+    ue.pcf_ue_policy_clear();
+    if let Ok(guard) = amf_self().read() {
+        guard.amf_ue_update(&ue);
     }
 }
 

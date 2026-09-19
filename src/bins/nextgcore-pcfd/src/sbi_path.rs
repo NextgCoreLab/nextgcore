@@ -7,6 +7,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use nextgcore_sbi::context::{global_context, NfInstance, NfService};
 use nextgcore_sbi::types::{NfType, SbiServiceType, UriScheme};
 
+// #92: the serving-AMF GUAMI (`AmfGuami`) and the association store the three Namf
+// UE-policy legs read to target it.
+use crate::ue_policy;
+
 /// SBI server configuration
 #[derive(Debug, Clone)]
 pub struct SbiServerConfig {
@@ -592,6 +596,86 @@ pub fn build_am_policy_update(
     serde_json::Value::Object(body)
 }
 
+// --- #92: the Npcf_UEPolicyControl update/terminate notification leg ---------
+
+/// Build a TS 29.525 §4.2.4 `PolicyUpdate` for a UE-policy association.
+///
+/// Shaped exactly like [`build_am_policy_update`] (TS 29.507 §4.2.4.2), because
+/// TS 29.525 §4.2.4 models the same idea for UE policy and inventing a second
+/// convention for it in the same daemon is how the two drift. `resourceUri` names
+/// the association, which is what lets a consumer holding several correlate the
+/// notification; `triggers` is `nullable` with `minItems: 1`, so an EMPTY list is
+/// OMITTED rather than sent as `[]` — an empty array is not a valid value there,
+/// and sending one claims "no triggers" while meaning "we never populated this".
+pub fn build_ue_policy_update(pol_asso_id: &str, triggers: &[String]) -> serde_json::Value {
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "resourceUri".to_string(),
+        serde_json::json!(format!("/npcf-ue-policy-control/v1/policies/{pol_asso_id}")),
+    );
+    if !triggers.is_empty() {
+        body.insert("triggers".to_string(), serde_json::json!(triggers));
+    }
+    serde_json::Value::Object(body)
+}
+
+/// POST a `PolicyUpdate` to a UE-policy association's stored `notificationUri`
+/// (#92, TS 29.525 §4.2.4: `POST {notificationUri}/update`).
+///
+/// This leg did not exist: `handle_ue_policy_update` applied the update, answered
+/// 200, and told the AMF nothing — so a PCF-initiated policy change was invisible
+/// to the consumer, and an interop partner's AMF could not learn of it at all.
+/// Delivered RELIABLY (retried, then to alternates, TS 29.500 §6.10) through the
+/// same `deliver_notification` the AM/SM legs use.
+///
+/// Returns false when the association is gone or no runtime is available to spawn
+/// the POST; the caller logs rather than failing the update, because the state
+/// change has already been applied and refusing it afterwards would leave the PCF
+/// and the consumer disagreeing in the other direction.
+pub fn pcf_send_ue_policy_update_notify(pol_asso_id: &str) -> bool {
+    let Some(assoc) = crate::ue_policy::ue_policy_find(pol_asso_id) else {
+        log::warn!("[{pol_asso_id}] UE policy notify: association gone; nothing to notify");
+        return false;
+    };
+    if assoc.notification_uri.is_empty() {
+        log::warn!("[{pol_asso_id}] UE policy notify: no notification URI stored");
+        return false;
+    }
+    let body = build_ue_policy_update(pol_asso_id, &assoc.triggers);
+    spawn_notification(assoc.notification_uri, "/update", body, "UE policy update")
+}
+
+/// POST a terminate notification to a UE-policy association's stored
+/// `notificationUri` (#92, TS 29.525 §4.2.4: `POST {notificationUri}/terminate`).
+///
+/// TS 29.525 §4.2.4 models termination as the PCF asking the consumer to release
+/// the association. The alternative — the PCF just dropping its own state — is what
+/// happened before #92, and is why an AMF could hold an association the PCF had
+/// forgotten: every subsequent update on it got a 404 with nothing saying why.
+///
+/// Takes the URI and triggers as arguments rather than reading the store, because
+/// the delete path removes the association BEFORE notifying (it must: the removal
+/// is what stops the T3501 loop), so a store read here would always miss.
+pub fn pcf_send_ue_policy_terminate_notify(
+    pol_asso_id: &str,
+    notification_uri: &str,
+    triggers: &[String],
+) -> bool {
+    if notification_uri.is_empty() {
+        log::warn!("[{pol_asso_id}] UE policy terminate notify: no notification URI stored");
+        return false;
+    }
+    // Same `PolicyUpdate`-shaped body as the update leg: §4.2.4 gives termination
+    // no distinct body, and the suffix is what distinguishes the two operations.
+    let body = build_ue_policy_update(pol_asso_id, triggers);
+    spawn_notification(
+        notification_uri.to_string(),
+        "/terminate",
+        body,
+        "UE policy terminate",
+    )
+}
+
 pub fn pcf_sbi_send_smpolicycontrol_create_response(sess_id: u64, stream_id: u64) -> bool {
     log::debug!(
         "[sess_id={sess_id}, stream_id={stream_id}] Sending SM policy control create response"
@@ -958,56 +1042,296 @@ fn percent_encode(s: &str) -> String {
     nextgcore_sbi::uri_encode::encode_query_value(s)
 }
 
+/// Parse ONE NFProfile's endpoint for `service_name`, or `None` when that
+/// instance does not expose the service with any dialable address.
+///
+/// Extracted from [`parse_first_endpoint`]'s inner loop for #92, so the
+/// GUAMI-aware AMF selection can evaluate candidates one profile at a time
+/// without re-deriving the endpoint rules. Behaviour is byte-identical to the
+/// pre-#92 inner loop, including the subtle part: a matching service with no
+/// usable address does NOT end the search, it falls through to the instance's
+/// next service.
+fn parse_instance_endpoint(
+    nf: &serde_json::Value,
+    service_name: &str,
+) -> Option<DiscoveredEndpoint> {
+    let services = nf.get("nfServices").and_then(|v| v.as_array())?;
+    for svc in services {
+        if svc.get("serviceName").and_then(|v| v.as_str()) != Some(service_name) {
+            continue;
+        }
+        let scheme = svc
+            .get("scheme")
+            .and_then(|v| v.as_str())
+            .unwrap_or("http")
+            .to_string();
+        // Prefer the service ipEndPoints; only when the matching service
+        // carries no endpoint fall back to the instance-level ipv4Addresses.
+        if let Some(ep) = svc
+            .get("ipEndPoints")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+        {
+            if let Some(host) = ep.get("ipv4Address").and_then(|v| v.as_str()) {
+                let port = ep.get("port").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
+                return Some(DiscoveredEndpoint {
+                    host: host.to_string(),
+                    port,
+                    scheme,
+                });
+            }
+        }
+        if let Some(host) = nf
+            .get("ipv4Addresses")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str())
+        {
+            return Some(DiscoveredEndpoint {
+                host: host.to_string(),
+                port: 80,
+                scheme,
+            });
+        }
+    }
+    None
+}
+
 /// Parse the first matching service endpoint from an NRF SearchResult body.
 fn parse_first_endpoint(
     json: &serde_json::Value,
     service_name: &str,
 ) -> Option<DiscoveredEndpoint> {
-    let instances = json.get("nfInstances")?.as_array()?;
-    for nf in instances {
-        let Some(services) = nf.get("nfServices").and_then(|v| v.as_array()) else {
-            continue;
-        };
-        for svc in services {
-            if svc.get("serviceName").and_then(|v| v.as_str()) != Some(service_name) {
-                continue;
+    json.get("nfInstances")?
+        .as_array()?
+        .iter()
+        .find_map(|nf| parse_instance_endpoint(nf, service_name))
+}
+
+/// Which rule picked the AMF endpoint a UE-policy leg is about to dial (#92).
+///
+/// Returned alongside the endpoint so the CALLER logs it. The distinction is the
+/// point of the enum: "the association named an AMF and we found it" and "we used
+/// whatever the NRF listed first" produce the same HTTP request, and before #92
+/// the only way to tell which had happened was to read the source. A deployment
+/// that silently slid from `ByGuami` to `NoGuamiStored` after an upgrade is a real
+/// regression, and it must be visible in an operator's log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmfSelection {
+    /// A candidate's `amfInfo.guamiList` contained the association's GUAMI — this
+    /// is the serving AMF (TS 29.525 §4.2.2.2).
+    ByGuami,
+    /// A candidate's `nfInstanceId` equalled the association's `servingNfId`.
+    /// Preferred over the GUAMI match when both are available: an instance id
+    /// names one profile exactly.
+    ByServingNfId,
+    /// The association holds no GUAMI and no `servingNfId` (created before #92, or
+    /// by an AMF that sent neither) — first endpoint, i.e. the pre-#92 behaviour.
+    NoGuamiStored,
+    /// A GUAMI (and/or `servingNfId`) WAS stored, but no discovered candidate
+    /// claimed it — first endpoint. This is the case worth alarming on: either the
+    /// serving AMF is not registered, or it registered no `amfInfo.guamiList` for
+    /// the PCF to match against.
+    GuamiUnmatched,
+}
+
+impl AmfSelection {
+    /// Human-readable reason for the log line at the call site.
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::ByGuami => "GUAMI match against the candidate's amfInfo.guamiList",
+            Self::ByServingNfId => "servingNfId match against the candidate's nfInstanceId",
+            Self::NoGuamiStored => {
+                "no serving-AMF GUAMI/servingNfId stored on the association; using the FIRST \
+                 discovered endpoint (pre-#92 behaviour)"
             }
-            let scheme = svc
-                .get("scheme")
-                .and_then(|v| v.as_str())
-                .unwrap_or("http")
-                .to_string();
-            // Prefer the service ipEndPoints; only when the matching service
-            // carries no endpoint fall back to the instance-level ipv4Addresses.
-            if let Some(ep) = svc
-                .get("ipEndPoints")
-                .and_then(|v| v.as_array())
-                .and_then(|a| a.first())
-            {
-                if let Some(host) = ep.get("ipv4Address").and_then(|v| v.as_str()) {
-                    let port = ep.get("port").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
-                    return Some(DiscoveredEndpoint {
-                        host: host.to_string(),
-                        port,
-                        scheme,
-                    });
-                }
-            }
-            if let Some(host) = nf
-                .get("ipv4Addresses")
-                .and_then(|v| v.as_array())
-                .and_then(|a| a.first())
-                .and_then(|v| v.as_str())
-            {
-                return Some(DiscoveredEndpoint {
-                    host: host.to_string(),
-                    port: 80,
-                    scheme,
-                });
+            Self::GuamiUnmatched => {
+                "a serving-AMF GUAMI/servingNfId IS stored but no discovered AMF claimed it \
+                 (unregistered serving AMF, or one that registers no amfInfo.guamiList); \
+                 using the FIRST discovered endpoint"
             }
         }
     }
-    None
+
+    /// Whether this selection actually identified the serving AMF, as opposed to
+    /// falling back to the first endpoint.
+    pub fn is_targeted(&self) -> bool {
+        matches!(self, Self::ByGuami | Self::ByServingNfId)
+    }
+}
+
+/// Whether an NFProfile's `amfInfo.guamiList` claims `guami` (#92, TS 29.510
+/// §6.1.6.2.4 `AmfInfo`).
+///
+/// This is the client-side half of spec Decision 1. The query parameter alone is
+/// not enough: this tree's own `nrfd` does not parse `guami`
+/// (`nnrf_handler.rs`'s `DiscoveryQuery` has no such member), and an NRF that
+/// ignores an unknown query parameter answers with EVERY AMF — so a PCF that
+/// trusted the filter would pick the first one again, which is the bug. Reading
+/// the profile is something the PCF can actually verify; "the NRF said so" is not.
+fn instance_serves_guami(nf: &serde_json::Value, guami: &ue_policy::AmfGuami) -> bool {
+    nf.pointer("/amfInfo/guamiList")
+        .and_then(|l| l.as_array())
+        .is_some_and(|list| {
+            list.iter()
+                .filter_map(ue_policy::AmfGuami::from_json)
+                .any(|candidate| candidate.same_amf(guami))
+        })
+}
+
+/// Select the AMF endpoint that serves this UE from an NRF SearchResult (#92).
+///
+/// Pure over the SearchResult so the selection rule is unit-testable without an
+/// NRF: `servingNfId` first (an exact instance id), then a GUAMI match against
+/// `amfInfo.guamiList`, then the first endpoint with the reason recorded. Returns
+/// `None` only when the answer contains no dialable `service_name` endpoint at
+/// all, which is the same condition the pre-#92 code reported as "no AMF
+/// reachable".
+fn select_amf_endpoint(
+    json: &serde_json::Value,
+    service_name: &str,
+    guami: Option<&ue_policy::AmfGuami>,
+    serving_nf_id: Option<&str>,
+) -> Option<(DiscoveredEndpoint, AmfSelection)> {
+    let instances = json.get("nfInstances").and_then(|v| v.as_array())?;
+
+    if let Some(nf_id) = serving_nf_id {
+        if let Some(ep) = instances
+            .iter()
+            .filter(|nf| nf.get("nfInstanceId").and_then(|v| v.as_str()) == Some(nf_id))
+            .find_map(|nf| parse_instance_endpoint(nf, service_name))
+        {
+            return Some((ep, AmfSelection::ByServingNfId));
+        }
+    }
+
+    if let Some(g) = guami {
+        if let Some(ep) = instances
+            .iter()
+            .filter(|nf| instance_serves_guami(nf, g))
+            .find_map(|nf| parse_instance_endpoint(nf, service_name))
+        {
+            return Some((ep, AmfSelection::ByGuami));
+        }
+    }
+
+    // Fallback. Which fallback it is matters to the operator, so the two are
+    // distinguished rather than collapsed into one "not targeted".
+    let why = if guami.is_some() || serving_nf_id.is_some() {
+        AmfSelection::GuamiUnmatched
+    } else {
+        AmfSelection::NoGuamiStored
+    };
+    instances
+        .iter()
+        .find_map(|nf| parse_instance_endpoint(nf, service_name))
+        .map(|ep| (ep, why))
+}
+
+/// Discover the AMF that SERVES this UE (#92, TS 29.525 §4.2.2.2), rather than
+/// whichever AMF the NRF happens to list first.
+///
+/// Deliberately a separate function from [`pcf_discover_endpoint`]: that one is
+/// type-and-service discovery and has five other callers (UDR, BSF, NWDAF) for
+/// which a GUAMI is meaningless. Widening it would put an always-`None` argument
+/// at every one of those call sites.
+///
+/// Sends the TS 29.510 §6.2.3.2.3.1 `guami` query parameter — URL-encoded JSON —
+/// so a conformant NRF filters server-side and the PCF does not download every AMF
+/// profile to discard most of them. It then VERIFIES the answer client-side
+/// (`select_amf_endpoint`), because this tree's NRF ignores the parameter and
+/// TS 29.510 in any case permits an NRF to return instances it could not fully
+/// constrain. Both halves, per spec Decision 1.
+///
+/// The [`AmfSelection`] is returned so the caller can log WHICH rule chose the
+/// endpoint; `Ok(None)` when no NRF is configured or the answer has no dialable
+/// endpoint.
+pub async fn pcf_discover_amf_endpoint(
+    service_name: &str,
+    guami: Option<&ue_policy::AmfGuami>,
+    serving_nf_id: Option<&str>,
+) -> Result<Option<(DiscoveredEndpoint, AmfSelection)>, String> {
+    let ctx = global_context();
+    let Some(nrf_uri) = ctx.get_nrf_uri().await else {
+        log::debug!("No NRF URI configured; cannot discover the serving AMF");
+        return Ok(None);
+    };
+    let (nrf_host, nrf_port) = parse_uri_host_port(&nrf_uri)?;
+    let client = ctx.get_client(&nrf_host, nrf_port).await;
+    let mut path = format!(
+        "/nnrf-disc/v1/nf-instances?target-nf-type=AMF&requester-nf-type=PCF&service-names={service_name}"
+    );
+    if let Some(nf_id) = serving_nf_id {
+        // TS 29.510 §6.2.3.2.3.1 `target-nf-instance-id`, which THIS tree's nrfd does
+        // parse — so when amfd starts sending `servingNfId` the filter is server-side
+        // for real, not only advisory.
+        path.push_str(&format!("&target-nf-instance-id={}", percent_encode(nf_id)));
+    }
+    if let Some(g) = guami {
+        // The `guami` parameter is a JSON-serialized Guami, percent-encoded as a
+        // query value (§6.2.3.2.3.1). Sent for conformance with a third-party NRF;
+        // this tree's nrfd ignores it, which is why the client-side check below is
+        // load-bearing rather than belt-and-braces.
+        path.push_str(&format!("&guami={}", percent_encode(&g.to_query_json())));
+    }
+    let response = client
+        .get(&path)
+        .await
+        .map_err(|e| format!("NRF discovery failed: {e}"))?;
+    if response.status != 200 {
+        return Err(format!("NRF discovery returned status {}", response.status));
+    }
+    let body = response
+        .http
+        .content
+        .ok_or("Empty NRF discovery response")?;
+    let json: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("Invalid NRF discovery response: {e}"))?;
+    Ok(select_amf_endpoint(
+        &json,
+        service_name,
+        guami,
+        serving_nf_id,
+    ))
+}
+
+/// Resolve the serving AMF's `namf-comm` endpoint for `pol_asso_id` and log which
+/// rule chose it (#92).
+///
+/// The shared front end for all three UE-policy AMF legs (deliver / subscribe /
+/// unsubscribe), so they cannot drift into targeting different AMFs for the same
+/// association — which would leave the delivery on one AMF and its result
+/// subscription on another, and present as a delivery that is never confirmed.
+async fn resolve_serving_amf(
+    pol_asso_id: &str,
+    leg: &str,
+) -> Result<Option<DiscoveredEndpoint>, String> {
+    let (guami, serving_nf_id) = ue_policy::ue_policy_serving_amf(pol_asso_id);
+    let Some((ep, selection)) =
+        pcf_discover_amf_endpoint("namf-comm", guami.as_ref(), serving_nf_id.as_deref()).await?
+    else {
+        return Ok(None);
+    };
+    // Logged at INFO for a real target and WARN for a fallback: a fallback in a
+    // multi-AMF deployment means this leg may be addressing an AMF that does not
+    // serve the UE, which is exactly the #92 defect and should not be buried at
+    // debug level.
+    if selection.is_targeted() {
+        log::info!(
+            "[{pol_asso_id}] UE policy {leg}: serving AMF {}:{} selected by {}",
+            ep.host,
+            ep.port,
+            selection.reason()
+        );
+    } else {
+        log::warn!(
+            "[{pol_asso_id}] UE policy {leg}: falling back to AMF {}:{} — {}",
+            ep.host,
+            ep.port,
+            selection.reason()
+        );
+    }
+    Ok(Some(ep))
 }
 
 /// Discover the first NF instance of `target_nf_type` exposing `service_name`
@@ -1070,14 +1394,48 @@ pub(crate) fn client_for(
 /// and is invisible until an operator edits a subscriber.
 pub const POLICY_DATA_NOTIFY_PATH: &str = "/npcf-callback/v1/policy-data-change-notify";
 
+/// Whether the SBI listener this PCF started is TLS-protected (#92 criterion 5,
+/// mirroring amfd's `set_sbi_tls_active` for issue #63).
+///
+/// Set once from the resolved transport security before any callback URI is built.
+/// Defaults to `false` so a unit test that never starts a listener keeps describing
+/// a cleartext one.
+static SBI_TLS_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record whether this PCF's SBI listener is TLS-protected. Called by `run()` from
+/// the same `SbiServerConfig.tls_enabled` that decides the NFProfile service
+/// `scheme` (`build_pcf_nf_instance`), so the advertised scheme and the callback
+/// URIs cannot disagree.
+pub fn set_sbi_tls_active(active: bool) {
+    SBI_TLS_ACTIVE.store(active, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The URI scheme this PCF advertises for its own SBI endpoint (#92 criterion 5).
+///
+/// Every callback URI the PCF registers with a peer MUST use it. The two callback
+/// URIs this daemon builds — the policy-data notify sink and the UE-policy
+/// delivery-result/failure callbacks — used to hardcode `http://`, so under TLS the
+/// PCF published a cleartext URL for an `https` listener and every peer that POSTed
+/// to it failed to connect. That failure presents as a peer-side connection error
+/// with nothing naming the PCF's own registration as the cause (TS 29.500 §6.1).
+pub fn advertised_sbi_scheme() -> &'static str {
+    if SBI_TLS_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        "https"
+    } else {
+        "http"
+    }
+}
+
 /// This PCF's policy-data notification URI, or `None` when the self identity was never
 /// published (no config) — the caller then skips the subscribe rather than subscribing
 /// with an address no one can reach.
 pub fn policy_data_notify_uri() -> Option<String> {
     let info = pcf_self_info()?;
     Some(format!(
-        "http://{}:{}{POLICY_DATA_NOTIFY_PATH}",
-        info.sbi_addr, info.sbi_port
+        "{}://{}:{}{POLICY_DATA_NOTIFY_PATH}",
+        advertised_sbi_scheme(),
+        info.sbi_addr,
+        info.sbi_port
     ))
 }
 
@@ -1496,6 +1854,16 @@ pub async fn pcf_deregister_bsf_binding(binding_id: &str) -> Result<bool, String
 /// request. Referenced by `n1MessageContent.contentId` (TS 29.500 §6.1.2.3).
 const UPDP_CONTENT_ID: &str = "updp-pdu";
 
+/// The path this PCF serves the `N1N2MsgTxfrFailureNotification` callback on
+/// (TS 29.518 §6.1.6.2.8), with `{polAssoId}` filled in by
+/// [`ue_policy_n1n2_failure_uri`]. One constant shared by the URI builder and the
+/// router arm, so the URI the AMF is told about is one this PCF actually serves —
+/// a subscription naming a path nothing serves is invisible until it fires.
+pub const UE_POLICY_N1N2_FAILURE_PATH_PREFIX: &str = "/npcf-ue-policy-control/v1/notify";
+/// Trailing segment of the failure-notification callback path (see
+/// [`UE_POLICY_N1N2_FAILURE_PATH_PREFIX`]).
+pub const UE_POLICY_N1N2_FAILURE_PATH_SUFFIX: &str = "n1n2-failure-notify";
+
 /// Build pcfd's production `Namf_Communication_N1N2MessageTransfer` request
 /// carrying a UE policy container (TS 29.518 §5.2.2.3.1; TS 29.525 §4.2.2.2:
 /// the PCF delivers UE policies via N1N2MessageTransfer). Root JSON =
@@ -1503,17 +1871,34 @@ const UPDP_CONTENT_ID: &str = "updp-pdu";
 /// the MANAGE UE POLICY COMMAND (`updp_pdu`) is the binary part. Kept as a
 /// standalone builder so both the delivery task and the strict-peer test
 /// (against amfd's REAL handler) use identical bytes.
+///
+/// `failure_uri` becomes `n1n2FailureTxfNotifURI` (TS 29.518 §5.2.2.3.1): the AMF
+/// reports the delivery outcome there ASYNCHRONOUSLY instead of the transfer just
+/// failing. #92: omitting it meant a CM-IDLE UE produced a synchronous 504 and
+/// nothing else — the PCF learned the UE was unreachable but never learned it had
+/// become reachable. The member is OMITTED rather than sent empty when the PCF has
+/// no self-identity to advertise: an empty URI is not a URI, and amfd would POST
+/// the failure notification into it.
 pub fn build_ue_policy_n1n2_request(
     supi: &str,
     updp_pdu: &[u8],
+    failure_uri: Option<&str>,
 ) -> nextgcore_sbi::message::SbiRequest {
     use nextgcore_sbi::message::{SbiPart, SbiRequest};
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "n1MessageContainer": {
             "n1MessageClass": "UPDP",
             "n1MessageContent": { "contentId": UPDP_CONTENT_ID }
         }
     });
+    if let Some(uri) = failure_uri {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert(
+                "n1n2FailureTxfNotifURI".to_string(),
+                serde_json::Value::String(uri.to_string()),
+            );
+        }
+    }
     SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
         .with_json_body(&body)
         .expect("n1n2 UPDP root JSON serializes")
@@ -1525,22 +1910,32 @@ pub fn build_ue_policy_n1n2_request(
         ))
 }
 
-/// Discover an AMF and POST the UE policy container over
+/// Discover the SERVING AMF and POST the UE policy container over
 /// `Namf_Communication_N1N2MessageTransfer` (multipart/related, class UPDP).
 /// `Ok(())` when the AMF accepts the transfer (200/202 — delivery still awaits
 /// the UE's MANAGE UE POLICY COMPLETE, item E6); `Err` on no reachable AMF or
 /// a non-2xx (e.g. 504 UE_NOT_REACHABLE), which the caller records as
 /// `DeliveryState::Failed` (fail-closed — never a fake `Delivered`).
 ///
-/// AMF discovery: single-AMF matched sim uses NRF discovery by NF type. E4
-/// risk note — for multi-AMF, the PolicyAssociationRequest `guami`/`servingNfId`
-/// must be honoured to target the serving AMF; that is flagged, not solved here.
-pub async fn pcf_deliver_ue_policy(supi: &str, updp_pdu: &[u8]) -> Result<(), String> {
-    let Some(ep) = pcf_discover_endpoint("AMF", "namf-comm").await? else {
+/// #92: AMF discovery is by the association's stored `guami`/`servingNfId`
+/// (TS 29.525 §4.2.2.2), not by NF type alone. The E4 risk note this doc used to
+/// carry — "for multi-AMF, the PolicyAssociationRequest `guami`/`servingNfId` must
+/// be honoured … that is flagged, not solved here" — is now solved; see
+/// [`resolve_serving_amf`] for the selection rule and the logged fallback.
+pub async fn pcf_deliver_ue_policy(
+    pol_asso_id: &str,
+    supi: &str,
+    updp_pdu: &[u8],
+) -> Result<(), String> {
+    let Some(ep) = resolve_serving_amf(pol_asso_id, "deliver").await? else {
         return Err("no AMF reachable (NRF discovery found no namf-comm endpoint)".into());
     };
     let client = client_for(&ep, NfType::Amf);
-    let req = build_ue_policy_n1n2_request(supi, updp_pdu);
+    let req = build_ue_policy_n1n2_request(
+        supi,
+        updp_pdu,
+        ue_policy_n1n2_failure_uri(pol_asso_id).as_deref(),
+    );
     let resp = client
         .send_request(req)
         .await
@@ -1553,6 +1948,25 @@ pub async fn pcf_deliver_ue_policy(supi: &str, updp_pdu: &[u8]) -> Result<(), St
     }
 }
 
+/// This PCF's `n1n2FailureTxfNotifURI` for an association (#92, TS 29.518
+/// §6.1.6.2.8). `None` when the PCF self-identity was never published (no
+/// config) — the member is then omitted rather than advertising an address the
+/// AMF cannot reach.
+///
+/// Scheme-derived like every other callback URI this daemon advertises (#92
+/// criterion 5): a hardcoded `http://` under a TLS listener is a URI no peer can
+/// connect to, and the failure presents on the AMF side with nothing pointing back
+/// at the PCF's own request.
+pub fn ue_policy_n1n2_failure_uri(pol_asso_id: &str) -> Option<String> {
+    let info = pcf_self_info()?;
+    Some(format!(
+        "{}://{}:{}{UE_POLICY_N1N2_FAILURE_PATH_PREFIX}/{pol_asso_id}/{UE_POLICY_N1N2_FAILURE_PATH_SUFFIX}",
+        advertised_sbi_scheme(),
+        info.sbi_addr,
+        info.sbi_port
+    ))
+}
+
 // --- Wave-6 E6: N1N2MessageSubscribe for the UE-policy delivery-result loop --
 
 /// Subscribe to the AMF's uplink UE-policy (`n1MessageClass == "UPDP"`)
@@ -1563,11 +1977,18 @@ pub async fn pcf_deliver_ue_policy(supi: &str, updp_pdu: &[u8]) -> Result<(), St
 /// response body or the Location header) on 201; `Ok(None)` when no AMF is
 /// reachable; `Err` on a non-2xx. The subscription is per-UE and bound to the
 /// UE context lifetime at the AMF.
+///
+/// #92: the subscription goes to the SERVING AMF, selected from the association's
+/// stored `guami`/`servingNfId`. It must be the same AMF the transfer goes to: a
+/// subscription on AMF A and a delivery on AMF B is a delivery whose COMPLETE has
+/// nowhere to arrive, so the association falls to `Failed` on T3501 with no
+/// indication that the two legs disagreed.
 pub async fn pcf_subscribe_ue_policy_notify(
+    pol_asso_id: &str,
     supi: &str,
     callback_uri: &str,
 ) -> Result<Option<String>, String> {
-    let Some(ep) = pcf_discover_endpoint("AMF", "namf-comm").await? else {
+    let Some(ep) = resolve_serving_amf(pol_asso_id, "subscribe").await? else {
         return Ok(None);
     };
     let client = client_for(&ep, NfType::Amf);
@@ -1610,13 +2031,40 @@ pub async fn pcf_subscribe_ue_policy_notify(
 /// Unsubscribe a previously created UE-policy N1N2 notification
 /// (`DELETE .../n1-n2-messages/subscriptions/{subscriptionId}`, TS 29.518
 /// §5.2.2.7), called on association delete. `Ok(true)` on 204/200.
+///
+/// #92: targets the serving AMF like the other two legs, and takes the
+/// association's GUAMI as an argument rather than reading the store — the delete
+/// path has already REMOVED the association by the time it unsubscribes (it
+/// captures the subscription id first, precisely because of that), so a store read
+/// here would always miss and every unsubscribe would fall back to the first
+/// endpoint. Deleting a subscription at the wrong AMF gets a 404 and leaves the
+/// real one to be reaped by UE-context expiry.
 pub async fn pcf_unsubscribe_ue_policy_notify(
     supi: &str,
     subscription_id: &str,
+    guami: Option<&ue_policy::AmfGuami>,
+    serving_nf_id: Option<&str>,
 ) -> Result<bool, String> {
-    let Some(ep) = pcf_discover_endpoint("AMF", "namf-comm").await? else {
+    let Some((ep, selection)) =
+        pcf_discover_amf_endpoint("namf-comm", guami, serving_nf_id).await?
+    else {
         return Ok(false);
     };
+    if selection.is_targeted() {
+        log::info!(
+            "[{supi}] UE policy unsubscribe: serving AMF {}:{} selected by {}",
+            ep.host,
+            ep.port,
+            selection.reason()
+        );
+    } else {
+        log::warn!(
+            "[{supi}] UE policy unsubscribe: falling back to AMF {}:{} — {}",
+            ep.host,
+            ep.port,
+            selection.reason()
+        );
+    }
     let client = client_for(&ep, NfType::Amf);
     let path =
         format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages/subscriptions/{subscription_id}");
@@ -1624,6 +2072,103 @@ pub async fn pcf_unsubscribe_ue_policy_notify(
         .delete(&path)
         .await
         .map_err(|e| format!("N1N2MessageUnSubscribe failed: {e}"))?;
+    Ok(resp.status == 204 || resp.status == 200)
+}
+
+// --- #92: Namf_EventExposure CONNECTIVITY_STATE_REPORT for the reachability retry -
+
+/// Subscribe to the serving AMF's `CONNECTIVITY_STATE_REPORT` for `supi` (#92,
+/// TS 29.518 §5.3.2.2.2 `Namf_EventExposure_Subscribe`), so the AMF pushes the UE's
+/// CM-state transitions to this PCF and a UE-policy delivery parked on a CM-IDLE
+/// failure can be retried when the UE returns to CM-CONNECTED (TS 23.502 §4.2.4.3).
+///
+/// This is the missing wake-up source #92 names: before it, the AMF's synchronous
+/// 504 UE_NOT_REACHABLE was the last thing the PCF ever heard about that UE, and
+/// only the blind T3501 timer would re-try — on a fixed schedule unrelated to
+/// whether the UE had actually come back.
+///
+/// Returns the AMF-minted `subscriptionId` on 201; `Ok(None)` when no AMF is
+/// reachable; `Err` on a non-2xx. `immediateFlag` is deliberately NOT set: the PCF
+/// already knows the UE is idle (that is why it is here), so asking for the current
+/// state would only race the transition it is waiting for.
+pub async fn pcf_subscribe_amf_connectivity_state(
+    pol_asso_id: &str,
+    supi: &str,
+    callback_uri: &str,
+) -> Result<Option<String>, String> {
+    let Some(ep) = resolve_serving_amf(pol_asso_id, "connectivity-subscribe").await? else {
+        return Ok(None);
+    };
+    let client = client_for(&ep, NfType::Amf);
+    // AmfEventSubscription (TS 29.518 Table 6.2.6.2.3-1): eventNotifyUri,
+    // notifyCorrelationId, nfId and a non-empty eventList are all mandatory — amfd's
+    // handler fail-closed-rejects a body missing any of them. The correlation id is
+    // the association, so a notification can be tied back to the parked delivery even
+    // if the path were ever to lose it.
+    let nf_id = pcf_self_info()
+        .map(|i| i.nf_instance_id.clone())
+        .unwrap_or_default();
+    let body = serde_json::json!({
+        "subscription": {
+            "eventList": [{ "type": "CONNECTIVITY_STATE_REPORT" }],
+            "eventNotifyUri": callback_uri,
+            "notifyCorrelationId": pol_asso_id,
+            "nfId": nf_id,
+            "supi": supi,
+        }
+    });
+    let resp = client
+        .post_json("/namf-evts/v1/subscriptions", &body)
+        .await
+        .map_err(|e| format!("Namf_EventExposure_Subscribe failed: {e}"))?;
+    match resp.status {
+        200 | 201 => Ok(resp
+            .http
+            .content
+            .as_deref()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+            .and_then(|v| {
+                v.get("subscriptionId")
+                    .and_then(|s| s.as_str())
+                    .map(str::to_string)
+            })
+            .or_else(|| {
+                resp.http
+                    .get_header("location")
+                    .and_then(|loc| loc.rsplit('/').next())
+                    .map(str::to_string)
+            })),
+        other => Err(format!(
+            "Namf_EventExposure_Subscribe returned status {other}"
+        )),
+    }
+}
+
+/// Delete a `CONNECTIVITY_STATE_REPORT` subscription at the serving AMF (#92,
+/// TS 29.518 §5.3.2.4.2), called from the association delete leg. `Ok(true)` on
+/// 204/200.
+///
+/// Takes the GUAMI explicitly for the same reason
+/// [`pcf_unsubscribe_ue_policy_notify`] does: the association is already removed by
+/// the time the delete leg unsubscribes.
+pub async fn pcf_unsubscribe_amf_connectivity_state(
+    supi: &str,
+    subscription_id: &str,
+    guami: Option<&ue_policy::AmfGuami>,
+    serving_nf_id: Option<&str>,
+) -> Result<bool, String> {
+    let Some((ep, _)) = pcf_discover_amf_endpoint("namf-comm", guami, serving_nf_id).await? else {
+        return Ok(false);
+    };
+    let client = client_for(&ep, NfType::Amf);
+    let resp = client
+        .delete(&format!("/namf-evts/v1/subscriptions/{subscription_id}"))
+        .await
+        .map_err(|e| format!("Namf_EventExposure unsubscribe failed: {e}"))?;
+    log::debug!(
+        "[{supi}] UE policy: CONNECTIVITY_STATE_REPORT unsubscribe -> {}",
+        resp.status
+    );
     Ok(resp.status == 204 || resp.status == 200)
 }
 
