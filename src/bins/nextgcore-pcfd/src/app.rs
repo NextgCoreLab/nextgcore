@@ -29,7 +29,7 @@ use crate::npcf_handler::*;
 use crate::nudr_handler::*;
 use crate::pcf_sm::PcfSmContext;
 use crate::sbi_path::*;
-use crate::sm_policy_build::{build_sm_policy_decision, format_bitrate};
+use crate::sm_policy_build::{build_sm_policy_decision, format_bitrate, parse_bitrate};
 use crate::timer::timer_manager;
 use crate::{npcf_handler, nudr_handler, sbi_path, ue_policy};
 
@@ -1883,6 +1883,35 @@ fn uav_reported_position() -> Option<(f64, f64, f64)> {
     Some((p[0], p[1], p[2]))
 }
 
+/// Parse a TS 29.571 `Ambr` (`{"uplink": "...", "downlink": "..."}`) as reported in
+/// `SmPolicyContextData.subsSessAmbr` / `SmPolicyUpdateContextData.subsSessAmbr`
+/// (#310).
+///
+/// Both members are `required` in the schema, so a value carrying only one direction
+/// is refused whole rather than half-stored: a half-stored bound would silently bound
+/// one direction and leave the other unbounded, which reads as a working bound and is
+/// not one. The strings are kept AS RECEIVED (`context::Ambr` holds `BitRate`
+/// strings), and parsed only where a comparison needs numbers.
+fn parse_subs_sess_ambr(v: Option<&serde_json::Value>) -> Option<crate::context::Ambr> {
+    let obj = v?;
+    let uplink = obj.get("uplink")?.as_str()?;
+    let downlink = obj.get("downlink")?.as_str()?;
+    // Refused now rather than at the comparison: a `subsSessAmbr` this PCF cannot
+    // parse is a reported bound it cannot honour, and storing the string would have
+    // the bound silently disappear later with nothing naming the PCF as the cause.
+    if parse_bitrate(uplink).is_none() || parse_bitrate(downlink).is_none() {
+        log::warn!(
+            "subsSessAmbr is not a parseable TS 29.571 BitRate pair \
+             (uplink={uplink:?}, downlink={downlink:?}); ignoring the reported bound"
+        );
+        return None;
+    }
+    Some(crate::context::Ambr {
+        uplink: uplink.to_string(),
+        downlink: downlink.to_string(),
+    })
+}
+
 pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
     log::info!("SM Policy Create");
 
@@ -1952,6 +1981,13 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
         .get("ipv6AddressPrefix")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    // TS 29.512 §5.6.2.3 `SmPolicyContextData.subsSessAmbr` — the subscribed
+    // session-AMBR, which the SMF is the only NF that holds (#310). Read here because
+    // it is the PCF's ONLY input for it: `SmPolicyDnnData`, the UDR's policy-data
+    // resource, carries no session-AMBR (TS 29.519 §5.6.2). Stored on the session, so
+    // a later `SE_AMBR_CH` update that reports only the trigger still has the
+    // subscribed bound to authorise against.
+    let subs_sess_ambr = parse_subs_sess_ambr(policy_data.get("subsSessAmbr"));
 
     let ctx = pcf_self();
 
@@ -2008,6 +2044,11 @@ pub async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
                     "NON_3GPP_ACCESS" => Some(crate::context::AccessType::NonThreeGppAccess),
                     _ => None,
                 });
+            // #310: the reported subscribed session-AMBR, which the `SE_AMBR_CH` arm
+            // bounds its authorisation by. Before #310 this field was written only by
+            // `npcf_handler::pcf_npcf_smpolicycontrol_handle_create`, a dead C port
+            // with no callers, so on the live path it was neither written nor read.
+            sess.subscribed_sess_ambr = subs_sess_ambr.clone();
             if let Ok(context) = ctx.read() {
                 context.sess_update(&sess);
             }
@@ -2628,22 +2669,109 @@ pub async fn handle_sm_policy_update_notify(
                 log::info!("Generated PCC rule for UE-initiated resource request: 5QI={req_5qi}");
             }
 
-            // If SESS_AMBR_CH trigger, re-evaluate session AMBR
+            // ---- SE_AMBR_CH: re-authorise the session AMBR (#310) ----
+            //
+            // The SMF reports this trigger when the subscribed session-AMBR changed
+            // (TS 29.512 §4.2.4), carrying the new value in `subsSessAmbr` — it is the
+            // only NF that holds it, because the UDR's `SmPolicyDnnData` does not carry
+            // a session-AMBR at all (TS 29.519 §5.6.2).
+            //
+            // Two defects fixed here, both of which made this arm a mechanism with no
+            // effect:
+            //
+            // 1. It re-read the PCF's policy input with an EMPTY SUPI. `""` resolves to
+            //    no subscriber (`nextgcore_dbi_session_data` errors `InvalidSupi`) and
+            //    the error arm hands back a hard-coded 100/100 Mbps, so EVERY
+            //    re-authorisation answered 100/100 Mbps regardless of the subscriber,
+            //    the slice or the DB. The session's real SUPI is resolved from its
+            //    `PcfUeSm` instead.
+            // 2. It ignored the reported `subsSessAmbr` entirely, so even a reported
+            //    change could not change the authorised value.
+            //
+            // TS 23.503 §6.1.3.2 makes this PCF the authority and the subscribed value
+            // one of its INPUTS: the authorised AMBR shall not exceed the subscribed
+            // one. So the reported value BOUNDS the PCF's own policy rather than
+            // replacing it — `min` per direction, independently, because a subscription
+            // that lowers only the uplink must not touch the downlink.
             let sess_rules = if triggers.iter().any(|t| t == "SE_AMBR_CH") {
-                // Re-query session data for updated AMBR
                 let s_nssai = SNssai {
                     sst: sess.s_nssai.sst,
                     sd: sess.s_nssai.sd,
                 };
                 let dnn = sess.dnn.as_deref().unwrap_or("internet");
-                if let Some(sd) = pcf_get_session_data("", None, &s_nssai, dnn) {
+                // The real SUPI. Resolved through the session's parent UE-SM, which is
+                // the only place this PCF holds it.
+                let supi = ctx
+                    .read()
+                    .ok()
+                    .and_then(|context| context.ue_sm_find_by_id(sess.pcf_ue_sm_id))
+                    .map(|ue| ue.supi)
+                    .unwrap_or_default();
+                // The reported bound, else the one the create recorded. An update that
+                // reports the trigger without restating the value is still telling us
+                // the subscription changed, and the stored value is the best bound this
+                // PCF has for it.
+                let reported = parse_subs_sess_ambr(update_data.get("subsSessAmbr"));
+                if reported.is_some() {
+                    // Persisted so a LATER update that omits it still bounds by the
+                    // most recently reported value rather than reverting to the one the
+                    // create carried.
+                    let mut latest = match ctx.read() {
+                        Ok(context) => context
+                            .sess_find_by_sm_policy_id(sm_policy_id)
+                            .unwrap_or_else(|| sess.clone()),
+                        Err(_) => sess.clone(),
+                    };
+                    latest.subscribed_sess_ambr = reported.clone();
+                    if let Ok(context) = ctx.read() {
+                        context.sess_update(&latest);
+                    }
+                }
+                let bound = reported.or_else(|| sess.subscribed_sess_ambr.clone());
+                if supi.is_empty() {
+                    // A session whose UE-SM is gone: re-authorising from the DB default
+                    // would answer with a value belonging to no subscriber, which is the
+                    // pre-#310 behaviour this arm exists to stop. Answered with no
+                    // session rule instead, leaving the SMF enforcing what it has.
+                    log::warn!(
+                        "SE_AMBR_CH for smPolicyId={sm_policy_id}: the session's UE-SM \
+                         (id={}) is gone, so its SUPI cannot be resolved — no session \
+                         rule is authorised and the SMF keeps the AMBR it has",
+                        sess.pcf_ue_sm_id
+                    );
+                    serde_json::json!({})
+                } else if let Some(sd) = pcf_get_session_data(&supi, None, &s_nssai, dnn) {
+                    let bound_bps = bound
+                        .as_ref()
+                        .map(|a| (parse_bitrate(&a.uplink), parse_bitrate(&a.downlink)));
+                    // `min` where a bound was reported, the PCF's own value where it was
+                    // not. An absent direction is NOT treated as an unlimited one: "the
+                    // SMF did not tell us the uplink" is no evidence about the uplink.
+                    let (mut auth_ul, mut auth_dl) = (sd.ambr_uplink, sd.ambr_downlink);
+                    if let Some((ul, dl)) = bound_bps {
+                        if let Some(ul) = ul {
+                            auth_ul = auth_ul.min(ul);
+                        }
+                        if let Some(dl) = dl {
+                            auth_dl = auth_dl.min(dl);
+                        }
+                    }
+                    log::info!(
+                        "SE_AMBR_CH for {supi} (smPolicyId={sm_policy_id}, dnn={dnn}): \
+                         policy {}/{} bps bounded by subscribed {:?} -> authorised \
+                         {auth_ul}/{auth_dl} bps (TS 23.503 §6.1.3.2: the authorised \
+                         session-AMBR shall not exceed the subscribed one)",
+                        sd.ambr_uplink,
+                        sd.ambr_downlink,
+                        bound.as_ref().map(|a| (&a.uplink, &a.downlink)),
+                    );
                     let sess_rule_id = format!("SessRule-{}", sess.sm_policy_id);
                     serde_json::json!({
                         &sess_rule_id: {
                             "sessRuleId": sess_rule_id,
                             "authSessAmbr": {
-                                "uplink": format_bitrate(sd.ambr_uplink),
-                                "downlink": format_bitrate(sd.ambr_downlink),
+                                "uplink": format_bitrate(auth_ul),
+                                "downlink": format_bitrate(auth_dl),
                             },
                         }
                     })
@@ -3868,6 +3996,252 @@ mod tests {
         );
         let resp = pcf_sbi_request_handler(req).await;
         assert_eq!(resp.status, 200);
+    }
+
+    // ==================================================================
+    // #310: SE_AMBR_CH authorises from the REPORTED subscribed AMBR
+    // ==================================================================
+
+    /// Create a session through the REAL router and return its `smPolicyId` (#310).
+    ///
+    /// Through the router rather than by seeding the context directly, because the
+    /// claim under test is that `handle_sm_policy_create` parses and stores
+    /// `subsSessAmbr` — a hand-seeded session would assert the storage and skip the
+    /// parse, which is the half that was missing.
+    async fn create_with_subs_ambr(supi: &str, psi: u8, subs: Option<serde_json::Value>) -> String {
+        let mut body = full_create_body(supi, psi);
+        if let Some(ambr) = subs {
+            body.as_object_mut()
+                .expect("object")
+                .insert("subsSessAmbr".to_string(), ambr);
+        }
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(body),
+        ))
+        .await;
+        assert_eq!(resp.status, 201, "create must succeed");
+        let created: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+        created["smPolicyId"]
+            .as_str()
+            .expect("smPolicyId")
+            .to_string()
+    }
+
+    /// Report `SE_AMBR_CH` through the REAL router and return the `authSessAmbr` the
+    /// PCF answered with, as (uplink, downlink) strings.
+    async fn report_se_ambr_ch(
+        sm_policy_id: &str,
+        subs: Option<serde_json::Value>,
+    ) -> Option<(String, String)> {
+        let mut body = serde_json::json!({ "repPolicyCtrlReqTriggers": ["SE_AMBR_CH"] });
+        if let Some(ambr) = subs {
+            body.as_object_mut()
+                .expect("object")
+                .insert("subsSessAmbr".to_string(), ambr);
+        }
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            &format!("/npcf-smpolicycontrol/v1/sm-policies/{sm_policy_id}/update"),
+            Some(body),
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+        let answered: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+        let rules = answered["sessRules"].as_object()?;
+        let rule = rules.values().next()?;
+        Some((
+            rule["authSessAmbr"]["uplink"].as_str()?.to_string(),
+            rule["authSessAmbr"]["downlink"].as_str()?.to_string(),
+        ))
+    }
+
+    /// #310 criterion: the authorised session-AMBR is BOUNDED BY the reported
+    /// subscribed one (TS 23.503 §6.1.3.2 — the authorised AMBR shall not exceed the
+    /// subscribed one), rather than either ignoring it (pre-#310) or echoing it.
+    ///
+    /// Positive assertion on the answered `authSessAmbr` strings, which are reachable
+    /// only by running the arm: a rejected or unrouted request answers no `sessRules`
+    /// at all and `report_se_ambr_ch` returns `None`, so "the bound held" cannot be
+    /// satisfied by a path that never arrived.
+    ///
+    /// With no MongoDB in the test process `pcf_get_session_data` falls through to its
+    /// documented 100/100 Mbps default, which is the PCF's policy input here. That is
+    /// the SEAM: what is asserted is the bounding arithmetic and which value bounds
+    /// which, not the DB read itself.
+    #[tokio::test]
+    async fn the_authorised_ambr_is_bounded_by_the_reported_subscribed_ambr() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+
+        // Subscription BELOW the PCF's policy (100/100 Mbps): the subscription wins,
+        // because the authorised value may not exceed it.
+        let pol = create_with_subs_ambr("imsi-001010000000311", 11, None).await;
+        assert_eq!(
+            report_se_ambr_ch(
+                &pol,
+                Some(serde_json::json!({ "uplink": "40 Mbps", "downlink": "60 Mbps" })),
+            )
+            .await,
+            Some(("40 Mbps".to_string(), "60 Mbps".to_string())),
+            "a subscription below the PCF's policy must LOWER the authorised AMBR"
+        );
+
+        // Subscription ABOVE the PCF's policy: the PCF's own value stands. The PCF is
+        // the authority; a raised subscription permits more, it does not grant more.
+        let pol = create_with_subs_ambr("imsi-001010000000312", 12, None).await;
+        assert_eq!(
+            report_se_ambr_ch(
+                &pol,
+                Some(serde_json::json!({ "uplink": "900 Mbps", "downlink": "900 Mbps" })),
+            )
+            .await,
+            Some(("100 Mbps".to_string(), "100 Mbps".to_string())),
+            "a subscription above the PCF's policy must NOT raise the authorised AMBR \
+             past what the PCF authorises"
+        );
+
+        // Mixed: each direction bounded independently. A subscription that lowers only
+        // the uplink must leave the downlink alone.
+        let pol = create_with_subs_ambr("imsi-001010000000313", 13, None).await;
+        assert_eq!(
+            report_se_ambr_ch(
+                &pol,
+                Some(serde_json::json!({ "uplink": "10 Mbps", "downlink": "900 Mbps" })),
+            )
+            .await,
+            Some(("10 Mbps".to_string(), "100 Mbps".to_string())),
+            "the bound is per direction, independently"
+        );
+
+        // A `subsSessAmbr` this PCF cannot parse is no bound at all -- refused rather
+        // than read as a zero, which would police the subscriber to a standstill.
+        let pol = create_with_subs_ambr("imsi-001010000000314", 14, None).await;
+        assert_eq!(
+            report_se_ambr_ch(
+                &pol,
+                Some(serde_json::json!({ "uplink": "fast", "downlink": "faster" })),
+            )
+            .await,
+            Some(("100 Mbps".to_string(), "100 Mbps".to_string())),
+            "an unparseable reported bound must leave the PCF's own value in place, \
+             NOT zero it"
+        );
+    }
+
+    /// #310 criterion: `PcfSess.subscribed_sess_ambr` gains a REAL reader — the create
+    /// stores what the SMF reported and a later `SE_AMBR_CH` that does not restate the
+    /// value still bounds by it.
+    ///
+    /// Before #310 the field's only writer was
+    /// `npcf_handler::pcf_npcf_smpolicycontrol_handle_create`, a dead C port with no
+    /// callers, so on the live path it was neither written nor read.
+    #[tokio::test]
+    async fn a_create_stores_the_reported_subscribed_ambr_and_a_later_update_bounds_by_it() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+
+        let pol = create_with_subs_ambr(
+            "imsi-001010000000315",
+            15,
+            Some(serde_json::json!({ "uplink": "25 Mbps", "downlink": "35 Mbps" })),
+        )
+        .await;
+
+        // Stored on the session by the LIVE create path.
+        let stored = pcf_self()
+            .read()
+            .expect("context")
+            .sess_find_by_sm_policy_id(&pol)
+            .expect("session")
+            .subscribed_sess_ambr
+            .expect("the create must STORE the reported subsSessAmbr");
+        assert_eq!(
+            (stored.uplink.as_str(), stored.downlink.as_str()),
+            ("25 Mbps", "35 Mbps")
+        );
+
+        // An update reporting the trigger and NOT the value still bounds by it: the
+        // stored value is the best bound this PCF has for a subscription it was told
+        // changed.
+        assert_eq!(
+            report_se_ambr_ch(&pol, None).await,
+            Some(("25 Mbps".to_string(), "35 Mbps".to_string())),
+            "the stored subscribed AMBR must be READ as the bound when an update does \
+             not restate it"
+        );
+
+        // A restated value supersedes it, and is persisted, so a THIRD update that
+        // omits the value bounds by the most recent report rather than the create's.
+        assert_eq!(
+            report_se_ambr_ch(
+                &pol,
+                Some(serde_json::json!({ "uplink": "15 Mbps", "downlink": "20 Mbps" })),
+            )
+            .await,
+            Some(("15 Mbps".to_string(), "20 Mbps".to_string()))
+        );
+        assert_eq!(
+            report_se_ambr_ch(&pol, None).await,
+            Some(("15 Mbps".to_string(), "20 Mbps".to_string())),
+            "a reported bound must be PERSISTED, so a later update that omits it does \
+             not revert to the one the create carried"
+        );
+    }
+
+    /// #310 criterion: the `SE_AMBR_CH` arm reads the session's REAL SUPI.
+    ///
+    /// It used to call `pcf_get_session_data("")`. An empty SUPI resolves to no
+    /// subscriber at all (`nextgcore_dbi_session_data` errors `InvalidSupi`) and the
+    /// error arm hands back a hard-coded 100/100 Mbps, so every re-authorisation
+    /// answered 100/100 Mbps regardless of the subscriber, the slice or the DB.
+    ///
+    /// Guarded POSITIVELY, without a DB: a session whose parent UE-SM has been removed
+    /// can no longer resolve a SUPI, and the arm must then authorise NO session rule
+    /// rather than fall through to the subscriber-less DB default. A `""` SUPI would
+    /// resolve exactly as well with the UE-SM present as absent, so this asserts the
+    /// resolution happened.
+    #[tokio::test]
+    async fn the_se_ambr_ch_arm_reads_the_sessions_real_supi() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+
+        let supi = "imsi-001010000000316";
+        let pol = create_with_subs_ambr(supi, 16, None).await;
+
+        // With the UE-SM present the SUPI resolves and a session rule is authorised.
+        assert!(
+            report_se_ambr_ch(&pol, None).await.is_some(),
+            "a resolvable SUPI must yield an authorised session rule"
+        );
+
+        // Orphan the session from its UE-SM, leaving the SUPI unresolvable. Done by
+        // repointing `pcf_ue_sm_id` rather than by `ue_sm_remove`, which cascades and
+        // would delete the session too — the request would then 404 and assert nothing
+        // about the SUPI.
+        {
+            let ctx = pcf_self();
+            let context = ctx.read().expect("context");
+            let mut sess = context.sess_find_by_sm_policy_id(&pol).expect("session");
+            sess.pcf_ue_sm_id = u64::MAX;
+            context.sess_update(&sess);
+        }
+        assert_eq!(
+            report_se_ambr_ch(&pol, None).await,
+            None,
+            "with no resolvable SUPI the arm must authorise NO session rule rather \
+             than answer with the subscriber-less DB default, which is what \
+             pcf_get_session_data(\"\") did for every session"
+        );
     }
 
     #[tokio::test]

@@ -659,6 +659,50 @@ pub struct SmPolicyCreateContext<'a> {
     pub sd: Option<&'a str>,
     pub ue_ipv4: [u8; 4],
     pub notification_uri: &'a str,
+    /// The subscribed session-AMBR from the UDM's session-management subscription
+    /// data, when the UDM leg supplied one (#310).
+    ///
+    /// The SMF is the only NF that holds this datum — `SmPolicyDnnData`, the UDR's
+    /// policy-data resource, does not carry it (TS 29.519 §5.6.2) — so
+    /// `SmPolicyContextData.subsSessAmbr` (TS 29.512 §5.6.2.3) is the PCF's ONLY
+    /// input for it, and it is this leg that supplies it. Omitting it, as this
+    /// request did before #310, left the PCF unable to bound its authorisation by
+    /// the subscription at all.
+    pub subs_sess_ambr: Option<&'a crate::udm::SubscribedSmData>,
+}
+
+/// The TS 29.571 `Ambr` object for a subscribed session-AMBR, or `None` when the
+/// subscription stated neither direction (#310).
+///
+/// Each direction is emitted only when the subscription states it: TS 29.571 makes
+/// both `uplink` and `downlink` required in `Ambr`, so a half-stated subscription
+/// cannot be expressed and is reported as nothing rather than as a zero — a
+/// `subsSessAmbr` of "0 bps" would have the PCF bound the authorisation to nothing
+/// and police the subscriber's traffic to a standstill.
+fn subs_sess_ambr_json(sub: &crate::udm::SubscribedSmData) -> Option<serde_json::Value> {
+    let (ul, dl) = (sub.sess_ambr_ul_bps?, sub.sess_ambr_dl_bps?);
+    Some(serde_json::json!({
+        "uplink": format_bitrate(ul),
+        "downlink": format_bitrate(dl),
+    }))
+}
+
+/// Format a bit rate as TS 29.571's `BitRate` states it, the inverse of
+/// [`parse_bitrate`] (#310).
+///
+/// The largest unit that divides the value exactly, so a value that round-trips
+/// through the PCF comes back as the same integer rather than accumulating a
+/// floating-point remainder.
+pub fn format_bitrate(bps: u64) -> String {
+    if bps >= 1_000_000_000 && bps.is_multiple_of(1_000_000_000) {
+        format!("{} Gbps", bps / 1_000_000_000)
+    } else if bps >= 1_000_000 && bps.is_multiple_of(1_000_000) {
+        format!("{} Mbps", bps / 1_000_000)
+    } else if bps >= 1_000 && bps.is_multiple_of(1_000) {
+        format!("{} Kbps", bps / 1_000)
+    } else {
+        format!("{bps} bps")
+    }
 }
 
 fn pdu_session_type_name(t: u8) -> &'static str {
@@ -681,7 +725,7 @@ pub async fn sm_policy_create(
     if let Some(sd) = ctx.sd {
         slice_info["sd"] = serde_json::json!(sd);
     }
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "supi": ctx.supi,
         "pduSessionId": ctx.psi,
         "pduSessionType": pdu_session_type_name(ctx.pdu_session_type),
@@ -692,6 +736,13 @@ pub async fn sm_policy_create(
         "servingNetwork": { "mcc": "001", "mnc": "01" },
         "suppFeat": "0",
     });
+    // #310: the subscribed session-AMBR, so the PCF can bound its authorisation by
+    // the subscription (TS 23.503 §6.1.3.2). Absent when the UDM leg is off or the
+    // subscription states no AMBR, in which case the PCF bounds by nothing — the
+    // pre-#310 behaviour, now the documented fallback rather than the only case.
+    if let Some(ambr) = ctx.subs_sess_ambr.and_then(subs_sess_ambr_json) {
+        body["subsSessAmbr"] = ambr;
+    }
 
     let resp = pcf
         .client()
@@ -732,17 +783,27 @@ pub async fn sm_policy_create(
 
 /// Npcf_SMPolicyControl_Update
 /// (POST /npcf-smpolicycontrol/v1/sm-policies/{id}/update)
+///
+/// `subs_sess_ambr` carries the NEW subscribed session-AMBR alongside an
+/// `SE_AMBR_CH` trigger (#310, TS 29.512 §5.6.2.5 `SmPolicyUpdateContextData`).
+/// Reporting the trigger without the value would tell the PCF that the datum it
+/// cannot read changed, and nothing more — which is why the pre-#310 arm on the PCF
+/// side re-derived it from the DB and answered with the value it already held.
 pub async fn sm_policy_update(
     pcf: &PcfEndpoint,
     sm_policy_id: &str,
     triggers: &[&str],
     ue_init_res_req: Option<serde_json::Value>,
+    subs_sess_ambr: Option<&crate::udm::SubscribedSmData>,
 ) -> Result<PolicyDecision, PolicyError> {
     let mut body = serde_json::json!({
         "repPolicyCtrlReqTriggers": triggers,
     });
     if let Some(req) = ue_init_res_req {
         body["ueInitResReq"] = req;
+    }
+    if let Some(ambr) = subs_sess_ambr.and_then(subs_sess_ambr_json) {
+        body["subsSessAmbr"] = ambr;
     }
     let path = format!("/npcf-smpolicycontrol/v1/sm-policies/{sm_policy_id}/update");
     let resp = pcf
@@ -1985,6 +2046,7 @@ mod tests {
             sd: None,
             ue_ipv4: [10, 45, 0, 2],
             notification_uri: "http://127.0.0.1:9/nsmf-callback/v1/sm-policy-notify/1",
+            subs_sess_ambr: None,
         };
 
         let run = async {
@@ -1995,7 +2057,7 @@ mod tests {
             assert_eq!(dec.def_five_qi, 8);
 
             // Update
-            let dec = sm_policy_update(&pcf, "stub-pol-1", &["RES_MO_RE"], None)
+            let dec = sm_policy_update(&pcf, "stub-pol-1", &["RES_MO_RE"], None, None)
                 .await
                 .expect("update");
             assert_eq!(dec.sess_ambr_ul_bps, 20_000_000);
@@ -2017,6 +2079,166 @@ mod tests {
         server.stop().await.ok();
     }
 
+    /// #310 criterion: the create leg carries `SmPolicyContextData.subsSessAmbr`
+    /// (TS 29.512 §5.6.2.3).
+    ///
+    /// Asserted on the RECORDED REQUEST BODY, not on a log line: the PCF's only input
+    /// for the subscribed session-AMBR is this member, so "the SMF supplies it" is a
+    /// claim about the wire. Before #310 the body carried no `subsSessAmbr` at all —
+    /// #310's own description assumed it did, and it did not.
+    ///
+    /// Also the half-stated case: TS 29.571 makes both directions `required` in `Ambr`,
+    /// so a subscription stating only one is reported as NOTHING rather than as a zero
+    /// (a `subsSessAmbr` of "0 bps" would have the PCF bound the authorisation to
+    /// nothing and police the subscriber to a standstill).
+    #[tokio::test]
+    async fn the_sm_policy_create_body_carries_the_subscribed_session_ambr() {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let bodies: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(
+                format!("127.0.0.1:{port}").parse().unwrap(),
+            ),
+            listener,
+        );
+        let recorded = bodies.clone();
+        server
+            .start(move |req: nextgcore_sbi::message::SbiRequest| {
+                let recorded = recorded.clone();
+                async move {
+                    if let Some(b) = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+                    {
+                        recorded.lock().unwrap_or_else(|e| e.into_inner()).push(b);
+                    }
+                    nextgcore_sbi::message::SbiResponse::with_status(201)
+                        .with_header("Location", "/npcf-smpolicycontrol/v1/sm-policies/p-310")
+                        .with_body(
+                            serde_json::json!({
+                                "sessRules": {}, "pccRules": {}, "qosDecs": {},
+                                "chgDecs": {}, "traffContDecs": {},
+                            })
+                            .to_string(),
+                            "application/json",
+                        )
+                }
+            })
+            .await
+            .expect("start stub PCF");
+        let pcf = PcfEndpoint {
+            host: "127.0.0.1".into(),
+            port,
+        };
+
+        // Both directions stated: the member is present, in TS 29.571 BitRate form.
+        let both = crate::udm::SubscribedSmData {
+            sess_ambr_ul_bps: Some(40_000_000),
+            sess_ambr_dl_bps: Some(80_000_000),
+            ..Default::default()
+        };
+        let base = SmPolicyCreateContext {
+            supi: "imsi-001010000000310",
+            psi: 1,
+            pdu_session_type: pdu_session_type::IPV4,
+            dnn: "internet",
+            sst: 1,
+            sd: Some("010203"),
+            ue_ipv4: [10, 45, 0, 4],
+            notification_uri: "http://127.0.0.1:9/cb",
+            subs_sess_ambr: Some(&both),
+        };
+        let run = async {
+            sm_policy_create(&pcf, &base).await.expect("create");
+            let body = bodies.lock().unwrap_or_else(|e| e.into_inner())[0].clone();
+            assert_eq!(
+                body["subsSessAmbr"]["uplink"], "40 Mbps",
+                "the create must carry the subscribed session-AMBR: it is the PCF's ONLY \
+                 input for it (TS 29.519 §5.6.2 gives the UDR's policy data no \
+                 session-AMBR), and body was {body}"
+            );
+            assert_eq!(body["subsSessAmbr"]["downlink"], "80 Mbps");
+
+            // Only one direction stated: nothing is reported, because `Ambr` cannot
+            // express half a pair and a defaulted zero would bound the subscriber to
+            // nothing.
+            let half = crate::udm::SubscribedSmData {
+                sess_ambr_ul_bps: Some(40_000_000),
+                sess_ambr_dl_bps: None,
+                ..Default::default()
+            };
+            bodies.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            sm_policy_create(
+                &pcf,
+                &SmPolicyCreateContext {
+                    subs_sess_ambr: Some(&half),
+                    ..base
+                },
+            )
+            .await
+            .expect("create");
+            let body = bodies.lock().unwrap_or_else(|e| e.into_inner())[0].clone();
+            assert!(
+                body.get("subsSessAmbr").is_none(),
+                "a half-stated subscription must report NO bound rather than a zeroed \
+                 one, got {body}"
+            );
+
+            // No UDM leg at all: the pre-#310 body, now the documented fallback.
+            bodies.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            sm_policy_create(
+                &pcf,
+                &SmPolicyCreateContext {
+                    subs_sess_ambr: None,
+                    ..base
+                },
+            )
+            .await
+            .expect("create");
+            assert!(bodies.lock().unwrap_or_else(|e| e.into_inner())[0]
+                .get("subsSessAmbr")
+                .is_none());
+
+            // And the update leg carries it beside the reported trigger (TS 29.512
+            // §5.6.2.5): reporting SE_AMBR_CH without the value tells the PCF that a
+            // datum it cannot read changed, and nothing more.
+            bodies.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            let _ = sm_policy_update(&pcf, "p-310", &["SE_AMBR_CH"], None, Some(&both)).await;
+            let body = bodies.lock().unwrap_or_else(|e| e.into_inner())[0].clone();
+            assert_eq!(body["repPolicyCtrlReqTriggers"][0], "SE_AMBR_CH");
+            assert_eq!(body["subsSessAmbr"]["uplink"], "40 Mbps");
+            assert_eq!(body["subsSessAmbr"]["downlink"], "80 Mbps");
+        };
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("round trip timed out");
+        server.stop().await.ok();
+    }
+
+    /// `format_bitrate` is the inverse of `parse_bitrate` for every unit, so a value
+    /// that round-trips through the PCF comes back as the same integer (#310).
+    #[test]
+    fn bitrate_formatting_round_trips() {
+        for bps in [
+            42u64,
+            64_000,
+            500_000,
+            40_000_000,
+            100_000_000,
+            2_000_000_000,
+        ] {
+            let s = format_bitrate(bps);
+            assert_eq!(parse_bitrate(&s), Some(bps), "{bps} formatted as {s:?}");
+        }
+        assert_eq!(format_bitrate(1_500_000), "1500 Kbps");
+        assert_eq!(parse_bitrate("1500 Kbps"), Some(1_500_000));
+    }
+
     #[tokio::test]
     async fn sm_policy_create_transport_failure() {
         // Nothing listens on this port — bounded-timeout transport error
@@ -2033,6 +2255,7 @@ mod tests {
             sd: None,
             ue_ipv4: [10, 45, 0, 3],
             notification_uri: "http://127.0.0.1:9/cb",
+            subs_sess_ambr: None,
         };
         let res = tokio::time::timeout(Duration::from_secs(8), sm_policy_create(&pcf, &ctx))
             .await
