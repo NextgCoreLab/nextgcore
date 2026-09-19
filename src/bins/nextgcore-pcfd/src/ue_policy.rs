@@ -310,6 +310,94 @@ pub struct UePolicyAssociation {
     /// empty list -- both lead to a full delivery, but only the second is a statement
     /// by the UE, and the log distinguishes them.
     pub reported_upsis: Vec<(String, String, u16)>,
+    /// The SERVING AMF's GUAMI from the PolicyAssociationRequest (#92, TS 29.525
+    /// §4.2.2.2). Before this, the create body's `guami` reached only
+    /// `ue_policy_source_plmn`, which took the PLMN out of it and dropped the
+    /// `amfId` -- so the three Namf legs (deliver / subscribe / unsubscribe) had
+    /// nothing to target with and used the FIRST NRF-discovered `namf-comm`
+    /// endpoint. In a multi-AMF deployment that is a downlink to an AMF which does
+    /// not serve the UE, and it fails silently: the wrong AMF answers a
+    /// well-formed 504 and the operator sees stale policy, not an error.
+    ///
+    /// `None` for an association created before #92 or by an AMF that sent no
+    /// `guami`; the discovery fallback is then the pre-#92 first-endpoint choice,
+    /// logged as such so "targeted" and "guessed" are distinguishable in an
+    /// operator's log rather than only in the source.
+    pub guami: Option<AmfGuami>,
+    /// `servingNfId` from the PolicyAssociationRequest -- the serving AMF's NF
+    /// instance id (#92). Stored alongside the GUAMI because it is the STRONGER
+    /// identifier when present: an NF instance id selects one NRF profile exactly,
+    /// whereas a GUAMI is matched against a candidate's `amfInfo.guamiList` and an
+    /// AMF that registered no `amfInfo` cannot be matched at all. amfd does not
+    /// currently send it, so this is normally `None`.
+    pub serving_nf_id: Option<String>,
+    /// The `Namf_EventExposure` subscription id armed to wake a delivery that failed
+    /// because the UE was CM-IDLE (#92, `CONNECTIVITY_STATE_REPORT`). `None` until
+    /// such a failure happens — the common case is a reachable UE, which needs no
+    /// subscription. Held so the association delete leg can unsubscribe rather than
+    /// leaving the AMF pushing CM-state reports at a PCF that no longer cares.
+    pub connectivity_subscription_id: Option<String>,
+}
+
+/// The serving AMF's GUAMI as carried in a TS 29.525 `PolicyAssociationRequest`
+/// (`{plmnId: {mcc, mnc}, amfId}`, TS 29.571 `Guami`) — #92.
+///
+/// A small typed struct rather than a retained `serde_json::Value`, because the
+/// only thing the discovery leg does with it is COMPARE it against each candidate
+/// AMF's `amfInfo.guamiList` entries, and a comparison wants the three fields
+/// named. Keeping the raw JSON would also keep whatever else the consumer put in
+/// the object, and then an equality test would be sensitive to members that do
+/// not identify an AMF.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmfGuami {
+    /// GUAMI PLMN mcc, as the decimal-digit string TS 29.571 `PlmnId` uses.
+    pub mcc: String,
+    /// GUAMI PLMN mnc (2 or 3 digits; the width is significant — "01" and "010"
+    /// are different PLMNs).
+    pub mnc: String,
+    /// `amfId`: AMF Region ID + Set ID + Pointer as 6 hex digits (TS 29.571
+    /// `AmfId`). Compared case-insensitively, because the hex case is not part of
+    /// the identity and amfd emits lowercase while the TS 29.510 examples are
+    /// upper — a case-sensitive compare would silently never match.
+    pub amf_id: String,
+}
+
+impl AmfGuami {
+    /// Parse a TS 29.571 `Guami` JSON object, or `None` when any of the three
+    /// identifying members is missing.
+    ///
+    /// All-or-nothing on purpose: a half-populated GUAMI cannot select an AMF, and
+    /// storing one would make the discovery leg believe it has a target while
+    /// matching nothing — which presents as the fallback path with a log line
+    /// claiming a GUAMI was available.
+    pub fn from_json(guami: &serde_json::Value) -> Option<Self> {
+        Some(Self {
+            mcc: guami.pointer("/plmnId/mcc")?.as_str()?.to_string(),
+            mnc: guami.pointer("/plmnId/mnc")?.as_str()?.to_string(),
+            amf_id: guami.get("amfId")?.as_str()?.to_string(),
+        })
+    }
+
+    /// Whether this GUAMI identifies the same AMF as `other`.
+    ///
+    /// `amfId` is compared ASCII-case-insensitively (see the field doc); the PLMN
+    /// digits are compared exactly, since their width carries meaning.
+    pub fn same_amf(&self, other: &Self) -> bool {
+        self.mcc == other.mcc
+            && self.mnc == other.mnc
+            && self.amf_id.eq_ignore_ascii_case(&other.amf_id)
+    }
+
+    /// Render as the TS 29.510 §6.2.3.2.3.1 `guami` discovery query parameter
+    /// value: the JSON serialization of the `Guami` object (the caller
+    /// percent-encodes it).
+    pub fn to_query_json(&self) -> String {
+        serde_json::json!({
+            "plmnId": { "mcc": self.mcc, "mnc": self.mnc },
+            "amfId": self.amf_id,
+        })
+        .to_string()
+    }
 }
 
 fn ue_policy_store() -> &'static Mutex<HashMap<String, UePolicyAssociation>> {
@@ -332,6 +420,12 @@ pub fn ue_policy_add(supi: &str, notification_uri: &str, supp_feat: &str) -> UeP
         reported_upsis: Vec::new(),
         n1n2_subscription_id: None,
         installed_upsc: None,
+        // Populated by `ue_policy_set_serving_amf` from the create body right after
+        // this returns (#92). Not a parameter, so every existing caller — and the
+        // create path's own ordering — stays unchanged.
+        guami: None,
+        serving_nf_id: None,
+        connectivity_subscription_id: None,
     };
     if let Ok(mut m) = ue_policy_store().lock() {
         m.insert(assoc.pol_asso_id.clone(), assoc.clone());
@@ -713,6 +807,159 @@ pub fn ue_policy_set_triggers(pol_asso_id: &str, triggers: Vec<String>) {
     if let Ok(mut m) = ue_policy_store().lock() {
         if let Some(a) = m.get_mut(pol_asso_id) {
             a.triggers = triggers;
+        }
+    }
+}
+
+/// Record the serving AMF's identity for an association from its
+/// PolicyAssociationRequest (#92, TS 29.525 §4.2.2.2).
+///
+/// Called on create AND on update, because §5.6.2.4 lets an update carry the
+/// members again and a UE whose serving AMF changed (inter-AMF mobility) is
+/// precisely the case a stale GUAMI would send policy to the OLD AMF. A `None`
+/// argument leaves the stored value ALONE rather than clearing it: an update that
+/// simply omits the member is not a statement that the AMF became unknown, and
+/// clearing it would silently downgrade a targeted association to the
+/// first-endpoint fallback.
+pub fn ue_policy_set_serving_amf(
+    pol_asso_id: &str,
+    guami: Option<AmfGuami>,
+    serving_nf_id: Option<String>,
+) {
+    if let Ok(mut m) = ue_policy_store().lock() {
+        if let Some(a) = m.get_mut(pol_asso_id) {
+            if let Some(g) = guami {
+                a.guami = Some(g);
+            }
+            if let Some(id) = serving_nf_id {
+                a.serving_nf_id = Some(id);
+            }
+        }
+    }
+}
+
+/// The serving AMF's `(guami, servingNfId)` for an association, or `(None, None)`
+/// when the association is gone (#92).
+///
+/// Returned as a pair rather than through `ue_policy_find` at the call sites so the
+/// three Namf legs each read exactly what they target with, and so a deleted
+/// association degrades to the documented fallback instead of erroring — the legs
+/// run on async tasks that can outlive a delete.
+pub fn ue_policy_serving_amf(pol_asso_id: &str) -> (Option<AmfGuami>, Option<String>) {
+    let Ok(m) = ue_policy_store().lock() else {
+        return (None, None);
+    };
+    match m.get(pol_asso_id) {
+        Some(a) => (a.guami.clone(), a.serving_nf_id.clone()),
+        None => (None, None),
+    }
+}
+
+// --- #92: UE-reachability retry for a delivery to a CM-IDLE UE ---------------
+
+/// Whether a `pcf_deliver_ue_policy` error means "the UE was not reachable"
+/// (#92, TS 29.518 Table 6.1.7.3-1 `UE_NOT_REACHABLE`).
+///
+/// Classified from the error TEXT rather than a typed error, because the delivery
+/// leg's contract is `Result<(), String>` and every one of its five callers already
+/// treats it that way; introducing a typed error for one discriminant would be a
+/// wider change than the behaviour needs. The two forms both appear: amfd answers
+/// the synchronous 504 with cause `UE_NOT_REACHABLE`, and the transport-level
+/// wrapper reports the status only, so `504` is matched as well.
+///
+/// Conservative on purpose: anything it does NOT recognise stays terminal. A
+/// misclassification in the other direction would park a delivery that will never
+/// succeed and leave the association `Pending` forever, which is worse than
+/// failing it — `Pending` is what the T3501 loop and the E6 reporting both read.
+pub fn is_ue_unreachable_failure(error: &str) -> bool {
+    let e = error.to_ascii_uppercase();
+    e.contains("UE_NOT_REACHABLE") || e.contains("STATUS 504")
+}
+
+/// A MANAGE UE POLICY COMMAND parked because the UE was CM-IDLE when it was first
+/// transferred (#92): the SUPI it is for and the exact bytes to resend.
+///
+/// The SAME bytes, not a re-encode: the command carries the PTI the UE will answer
+/// with, and re-encoding could pick up a rule set that changed meanwhile, making the
+/// UE's COMPLETE correlate to a command the PCF no longer holds (TS 24.501 D.2.1.6).
+#[derive(Debug, Clone)]
+struct ParkedDelivery {
+    supi: String,
+    pdu: Vec<u8>,
+}
+
+/// Deliveries parked awaiting the UE's return to CM-CONNECTED, keyed by
+/// association id (#92).
+///
+/// A second process-global beside [`ue_policy_store`] rather than a field on
+/// `UePolicyAssociation`, because a parked delivery is not association STATE that a
+/// GET should report — it is in-flight machinery, and putting a several-hundred-byte
+/// PDU on a struct that is cloned out on every `ue_policy_find` would make every
+/// read of the store more expensive for one rare path.
+fn parked_delivery_store() -> &'static Mutex<HashMap<String, ParkedDelivery>> {
+    static STORE: OnceLock<Mutex<HashMap<String, ParkedDelivery>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Park a delivery for retry when the UE becomes reachable (#92).
+///
+/// No-op once the association is gone: a cancelled association must not be
+/// resurrected by a retry, the same cancel-on-delete rule every setter here
+/// follows. The association's `delivery_state` is deliberately LEFT at `Pending` —
+/// a delivery awaiting reachability has not concluded, and marking it `Failed`
+/// (the pre-#92 behaviour) is the defect.
+pub fn ue_policy_park_pending_delivery(pol_asso_id: &str, supi: &str, pdu: Vec<u8>) {
+    if ue_policy_find(pol_asso_id).is_none() {
+        log::debug!("[{pol_asso_id}] UE policy: not parking a delivery for a deleted association");
+        return;
+    }
+    if let Ok(mut m) = parked_delivery_store().lock() {
+        m.insert(
+            pol_asso_id.to_string(),
+            ParkedDelivery {
+                supi: supi.to_string(),
+                pdu,
+            },
+        );
+    }
+}
+
+/// Take (remove) the delivery parked for `pol_asso_id`, or `None` when there is
+/// none (#92). Removing rather than reading means two wake-ups that race — a
+/// `CONNECTIVITY_STATE_REPORT` and an `N1N2MsgTxfrFailureNotification` for the same
+/// transfer, which is an ordinary pairing — retry ONCE, not twice. A second
+/// transfer with the same PTI is a duplicate command (D.2.1.6), and the UE's single
+/// COMPLETE would leave one of them apparently unanswered.
+pub fn ue_policy_take_pending_delivery(pol_asso_id: &str) -> Option<(String, Vec<u8>)> {
+    let parked = parked_delivery_store().lock().ok()?.remove(pol_asso_id)?;
+    Some((parked.supi, parked.pdu))
+}
+
+/// Whether a delivery is currently parked awaiting reachability (#92). Lets a test
+/// assert the retry was armed, and the delete path drop the parked bytes.
+pub fn ue_policy_has_parked_delivery(pol_asso_id: &str) -> bool {
+    parked_delivery_store()
+        .lock()
+        .map(|m| m.contains_key(pol_asso_id))
+        .unwrap_or(false)
+}
+
+/// Drop any parked delivery for an association (#92) — called from the delete leg,
+/// so a deleted association leaves no PDU behind for a late AMF notification to
+/// resend to a UE the PCF no longer has policy for.
+pub fn ue_policy_drop_parked_delivery(pol_asso_id: &str) {
+    if let Ok(mut m) = parked_delivery_store().lock() {
+        m.remove(pol_asso_id);
+    }
+}
+
+/// Record the `Namf_EventExposure` subscription id armed for an association's
+/// UE-reachability retry (#92), so the delete leg can unsubscribe. No-op once the
+/// association is gone, like every other setter here.
+pub fn ue_policy_set_connectivity_subscription_id(pol_asso_id: &str, subscription_id: &str) {
+    if let Ok(mut m) = ue_policy_store().lock() {
+        if let Some(a) = m.get_mut(pol_asso_id) {
+            a.connectivity_subscription_id = Some(subscription_id.to_string());
         }
     }
 }

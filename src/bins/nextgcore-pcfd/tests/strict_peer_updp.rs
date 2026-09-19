@@ -104,8 +104,11 @@ fn pcfd_updp_accepted_by_real_amfd_and_enqueued_verbatim() {
     // Sanity: pcfd's builder equals the E1 golden command vector.
     assert_eq!(pdu, VEC_F, "pcfd UPDP command must equal E1(f)");
 
-    // pcfd's PRODUCTION multipart request, fed to amfd's REAL handler.
-    let req = build_ue_policy_n1n2_request(supi, &pdu);
+    // pcfd's PRODUCTION multipart request, fed to amfd's REAL handler. `None` for the
+    // failure URI: a reachable UE needs no asynchronous failure callback, and this
+    // test's subject is the byte-exactness of the UPDP part (#92 added the parameter;
+    // `tests/ue_policy_idle_retry.rs` is the one that asserts it reaches the wire).
+    let req = build_ue_policy_n1n2_request(supi, &pdu, None);
     let resp = handle_n1_n2_message_transfer_request(supi, &req);
 
     assert_eq!(
@@ -142,7 +145,7 @@ fn pcfd_updp_to_idle_ue_rejected_504_by_real_amfd() {
     let ue_id = seed_ue(supi, false);
 
     let pdu = pcfd_updp_pdu();
-    let req = build_ue_policy_n1n2_request(supi, &pdu);
+    let req = build_ue_policy_n1n2_request(supi, &pdu, None);
     let resp = handle_n1_n2_message_transfer_request(supi, &req);
 
     assert_eq!(
