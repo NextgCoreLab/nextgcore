@@ -410,6 +410,13 @@ pub mod modify_flags {
     pub const N2_HANDOVER: u64 = 1 << 27;
     pub const FROM_ACTIVATING: u64 = 1 << 28;
     pub const RESTORATION_INDICATION: u64 = 1 << 29;
+    /// Re-provision the Measurement Period on an Update URR (#80).
+    ///
+    /// Its own flag rather than folded into `URR_TIME_THRESH`, because TS 29.244 Table
+    /// 7.5.4.1-1 makes each URR member independently modifiable — and sharing a flag
+    /// would have a caller re-thresholding a rule silently restate (or clear) its
+    /// reporting cadence.
+    pub const URR_MEASUREMENT_PERIOD: u64 = 1 << 30;
 }
 
 // ============================================================================
@@ -1541,6 +1548,28 @@ pub fn build_remove_far(far_id: u32) -> Vec<u8> {
 // URR Builder
 // ============================================================================
 
+/// Reporting Triggers bits (TS 29.244 §8.2.19) — #80.
+///
+/// The IE is three octets sent most-significant first, and
+/// [`PfcpMessageBuilder::add_reporting_triggers`] shifts a `u32` down by 16/8/0 to lay
+/// them out. So octet 1's bits are `0x01_00_00`..`0x80_00_00` here, octet 2's are
+/// `0x00_01_00`.., and the constants have to be written in that frame rather than as
+/// the raw bit positions the spec tables list. Named rather than spelled inline,
+/// because the pre-#80 tree used a bare `0x010000` literal in tests and nothing said
+/// which trigger it was (it is VOLTH).
+pub mod reporting_trigger {
+    /// Periodic reporting — needs a Measurement Period (§8.2.17) to have a cadence.
+    pub const PERIO: u32 = 0x01_00_00;
+    /// Volume threshold: report, keep forwarding.
+    pub const VOLTH: u32 = 0x02_00_00;
+    /// Time threshold: report, keep forwarding.
+    pub const TIMTH: u32 = 0x04_00_00;
+    /// Volume quota: report AND stop forwarding (§5.2.2.2.2).
+    pub const VOLQU: u32 = 0x00_01_00;
+    /// Time quota: report AND stop forwarding.
+    pub const TIMQU: u32 = 0x00_02_00;
+}
+
 /// URR (Usage Reporting Rule) parameters
 #[derive(Debug, Clone, Default)]
 pub struct UrrParams {
@@ -1552,6 +1581,15 @@ pub struct UrrParams {
     pub time_threshold: Option<u32>,
     pub time_quota: Option<u32>,
     pub quota_validity_time: Option<u32>,
+    /// Measurement Period in seconds (IE 64, TS 29.244 §8.2.17) — the PERIO trigger's
+    /// cadence, #80.
+    ///
+    /// Absent before #80, so this SMF could set the PERIO trigger and had no way to say
+    /// how often: the UPF parses the IE (#306) and would have found none, leaving
+    /// `measurement_period_secs` at `None` and no periodic report ever firing. A trigger
+    /// the sender cannot qualify is the same class of defect as a quota the receiver
+    /// cannot read.
+    pub measurement_period: Option<u32>,
 }
 
 /// Build Create URR IE
@@ -1586,6 +1624,12 @@ pub fn build_create_urr(params: &UrrParams) -> Vec<u8> {
     // Time Quota
     if let Some(seconds) = params.time_quota {
         builder.add_time_quota(seconds);
+    }
+
+    // Measurement Period (#80): the PERIO trigger's cadence. Without it the UPF's
+    // periodic reporter has no interval and never fires.
+    if let Some(seconds) = params.measurement_period {
+        builder.add_u32(pfcp_ie::MEASUREMENT_PERIOD, seconds);
     }
 
     // Quota Validity Time
@@ -1639,6 +1683,13 @@ pub fn build_update_urr(params: &UrrParams, modify_flags: u64) -> Vec<u8> {
     if modify_flags & modify_flags::URR_TIME_QUOTA != 0 {
         if let Some(seconds) = params.time_quota {
             builder.add_time_quota(seconds);
+        }
+    }
+
+    // Measurement Period (#80)
+    if modify_flags & modify_flags::URR_MEASUREMENT_PERIOD != 0 {
+        if let Some(seconds) = params.measurement_period {
+            builder.add_u32(pfcp_ie::MEASUREMENT_PERIOD, seconds);
         }
     }
 
@@ -2314,7 +2365,7 @@ mod tests {
         let params = UrrParams {
             urr_id: 1,
             measurement_method: (true, true, false),
-            reporting_triggers: 0x010000,
+            reporting_triggers: reporting_trigger::PERIO,
             volume_threshold: Some((Some(1000000), None, None)),
             time_threshold: Some(3600),
             ..Default::default()
@@ -2322,6 +2373,148 @@ mod tests {
 
         let data = build_create_urr(&params);
         assert!(!data.is_empty());
+    }
+
+    /// Split a flat IE stream into `(type, value)` pairs — a minimal TLV walker for the
+    /// tests below (#80).
+    ///
+    /// Deliberately independent of `PfcpMessageBuilder`: a decoder sharing code with the
+    /// encoder it checks would agree with it about a wrong layout, which is how the
+    /// pre-#321 IE table survived. Four-octet header (type u16, length u16) per
+    /// TS 29.244 §8.1.
+    fn ies_of(buf: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut rest = buf;
+        while rest.len() >= 4 {
+            let ty = u16::from_be_bytes([rest[0], rest[1]]);
+            let len = u16::from_be_bytes([rest[2], rest[3]]) as usize;
+            if rest.len() < 4 + len {
+                break;
+            }
+            out.push((ty, rest[4..4 + len].to_vec()));
+            rest = &rest[4 + len..];
+        }
+        out
+    }
+
+    /// #80 criterion 1 (builder half): a Create URR carries every member it was given,
+    /// under the right IE number, in the layout TS 29.244 states.
+    ///
+    /// Asserted on the DECODED BYTES rather than on `!data.is_empty()` — which is what
+    /// the pre-#80 test above checks, and which a builder emitting nothing but a URR ID
+    /// would also satisfy. The Measurement Period assertion is the one that matters
+    /// most: it did not exist before #80, so this SMF could set the PERIO trigger and
+    /// had no way to say how often, leaving the UPF's periodic reporter with no cadence.
+    #[test]
+    fn a_create_urr_carries_quotas_thresholds_and_the_measurement_period() {
+        let params = UrrParams {
+            urr_id: 7,
+            measurement_method: (true, true, false),
+            reporting_triggers: reporting_trigger::VOLTH
+                | reporting_trigger::TIMTH
+                | reporting_trigger::PERIO
+                | reporting_trigger::VOLQU
+                | reporting_trigger::TIMQU,
+            volume_threshold: Some((Some(1_000_000), None, None)),
+            volume_quota: Some((Some(5_000_000), None, None)),
+            time_threshold: Some(60),
+            time_quota: Some(120),
+            measurement_period: Some(30),
+            quota_validity_time: None,
+        };
+        let ies = ies_of(&build_create_urr(&params));
+        let find = |ty: u16| -> Vec<u8> {
+            ies.iter()
+                .find(|(t, _)| *t == ty)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("IE {ty} missing from Create URR; got {ies:?}"))
+        };
+
+        assert_eq!(find(pfcp_ie::URR_ID), 7u32.to_be_bytes());
+        // Measurement Method (§8.2.16): DURAT | VOLUM.
+        assert_eq!(find(pfcp_ie::MEASUREMENT_METHOD), vec![0x03]);
+
+        // Reporting Triggers (§8.2.19) is three octets, MSB first. The quota bits live
+        // in octet 2 — the octet the UPF did not read at all before #80.
+        let triggers = find(pfcp_ie::REPORTING_TRIGGERS);
+        assert_eq!(triggers.len(), 3, "Reporting Triggers is a 3-octet field");
+        assert_eq!(triggers[0] & 0x01, 0x01, "PERIO in octet 1 bit 1");
+        assert_eq!(triggers[0] & 0x02, 0x02, "VOLTH in octet 1 bit 2");
+        assert_eq!(triggers[0] & 0x04, 0x04, "TIMTH in octet 1 bit 3");
+        assert_eq!(triggers[1] & 0x01, 0x01, "VOLQU in octet 2 bit 1");
+        assert_eq!(triggers[1] & 0x02, 0x02, "TIMQU in octet 2 bit 2");
+
+        // Volume Threshold / Volume Quota: flags octet then one u64 per set flag.
+        // TOVOL only here, so 1 + 8 bytes.
+        let mut expect_vol = vec![0x01u8];
+        expect_vol.extend_from_slice(&1_000_000u64.to_be_bytes());
+        assert_eq!(find(pfcp_ie::VOLUME_THRESHOLD), expect_vol);
+        let mut expect_quota = vec![0x01u8];
+        expect_quota.extend_from_slice(&5_000_000u64.to_be_bytes());
+        assert_eq!(
+            find(pfcp_ie::VOLUME_QUOTA),
+            expect_quota,
+            "the Volume Quota is what gates traffic (§5.2.2.2.2); a Create URR that \
+             omits it provisions measurement without enforcement"
+        );
+
+        assert_eq!(find(pfcp_ie::TIME_THRESHOLD), 60u32.to_be_bytes());
+        assert_eq!(find(pfcp_ie::TIME_QUOTA), 120u32.to_be_bytes());
+        assert_eq!(
+            find(pfcp_ie::MEASUREMENT_PERIOD),
+            30u32.to_be_bytes(),
+            "the PERIO trigger's cadence: set without this, no periodic report can fire"
+        );
+        // Not provisioned, because the UPF neither parses nor enforces it.
+        assert!(
+            !ies.iter().any(|(t, _)| *t == pfcp_ie::QUOTA_VALIDITY_TIME),
+            "Quota Validity Time must not be claimed: nothing enforces it"
+        );
+    }
+
+    /// #80: a Create PDR binds to its URR, which is what makes the UPF measure that
+    /// PDR's traffic against the rule (TS 29.244 §7.5.2.2).
+    ///
+    /// A URR created and referenced by nothing measures nothing — which is half of why
+    /// the capability was inert. Asserted on the wire, inside the Create PDR IE.
+    #[test]
+    fn a_create_pdr_binds_to_its_urr() {
+        let pdr = PdrParams {
+            pdr_id: 1,
+            precedence: 100,
+            source_interface: 0,
+            far_id: Some(1),
+            urr_ids: vec![9],
+            ..Default::default()
+        };
+        let ies = ies_of(&build_create_pdr(&pdr));
+        let urr_ids: Vec<Vec<u8>> = ies
+            .iter()
+            .filter(|(t, _)| *t == pfcp_ie::URR_ID)
+            .map(|(_, v)| v.clone())
+            .collect();
+        assert_eq!(
+            urr_ids,
+            vec![9u32.to_be_bytes().to_vec()],
+            "the PDR must carry the URR ID it is measured against; got {ies:?}"
+        );
+
+        // And a PDR with no URR carries none, so the binding is evidence of a decision
+        // rather than something every PDR has anyway.
+        let plain = PdrParams {
+            pdr_id: 2,
+            ..pdr.clone()
+        };
+        let plain = PdrParams {
+            urr_ids: vec![],
+            ..plain
+        };
+        assert!(
+            !ies_of(&build_create_pdr(&plain))
+                .iter()
+                .any(|(t, _)| *t == pfcp_ie::URR_ID),
+            "a PDR bound to no URR must carry no URR ID"
+        );
     }
 
     #[test]

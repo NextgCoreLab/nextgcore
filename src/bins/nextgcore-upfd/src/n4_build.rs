@@ -1659,42 +1659,35 @@ pub fn parse_create_urr(data: &[u8]) -> Result<ParsedCreateUrr, &'static str> {
         }
     }
 
-    // Reporting Triggers (IE type 37)
+    // Reporting Triggers (IE type 37, TS 29.244 §8.2.19)
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::REPORTING_TRIGGERS) {
         if !ie.value.is_empty() {
             urr.trigger_periodic = (ie.value[0] & 0x01) != 0;
             urr.trigger_volume_threshold = (ie.value[0] & 0x02) != 0;
             urr.trigger_time_threshold = (ie.value[0] & 0x04) != 0;
         }
+        // #80: the QUOTA triggers live in octet 2 and were not read at all before, so a
+        // CP function asking to be told about quota exhaustion was answered with
+        // silence. Recorded rather than acted on: what gates traffic is the QUOTA VALUE
+        // (IE 73/74) below, not this bit — a trigger with no quota names no limit, and a
+        // quota with no trigger is still a limit the UP function must honour
+        // (§5.2.2.2.2 conditions the stop on the quota, not on the trigger). Parsed so a
+        // mismatch between the two is visible.
+        if ie.value.len() >= 2 {
+            urr.trigger_volume_quota = (ie.value[1] & 0x01) != 0;
+            urr.trigger_time_quota = (ie.value[1] & 0x02) != 0;
+        }
     }
 
-    // Volume Threshold (IE type 31) - grouped IE with flags + values
+    // Volume Threshold (IE type 31, TS 29.244 §8.2.13) - flags + values.
+    // #80: through the shared `parse_volume_ie`, which Volume Quota also uses — the
+    // two IEs have the same body and differ only in what the UP function does at the
+    // value, so one parser keeps them from drifting.
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::VOLUME_THRESHOLD) {
-        if !ie.value.is_empty() {
-            let flags = ie.value[0];
-            let mut cursor = &ie.value[1..];
-            if (flags & 0x01) != 0 && cursor.len() >= 8 {
-                urr.volume_threshold_total = Some(u64::from_be_bytes([
-                    cursor[0], cursor[1], cursor[2], cursor[3], cursor[4], cursor[5], cursor[6],
-                    cursor[7],
-                ]));
-                cursor = &cursor[8..];
-            }
-            if (flags & 0x02) != 0 && cursor.len() >= 8 {
-                urr.volume_threshold_ul = Some(u64::from_be_bytes([
-                    cursor[0], cursor[1], cursor[2], cursor[3], cursor[4], cursor[5], cursor[6],
-                    cursor[7],
-                ]));
-                cursor = &cursor[8..];
-            }
-            if (flags & 0x04) != 0 && cursor.len() >= 8 {
-                urr.volume_threshold_dl = Some(u64::from_be_bytes([
-                    cursor[0], cursor[1], cursor[2], cursor[3], cursor[4], cursor[5], cursor[6],
-                    cursor[7],
-                ]));
-            }
-            let _ = cursor; // suppress unused warning
-        }
+        let (total, ul, dl) = parse_volume_ie(&ie.value);
+        urr.volume_threshold_total = total;
+        urr.volume_threshold_ul = ul;
+        urr.volume_threshold_dl = dl;
     }
 
     // Time Threshold (IE type 32) - u32 seconds
@@ -1721,7 +1714,63 @@ pub fn parse_create_urr(data: &[u8]) -> Result<ParsedCreateUrr, &'static str> {
         }
     }
 
+    // Volume Quota (IE type 73, TS 29.244 §8.2.40) - #80.
+    //
+    // Same flags+values layout as Volume Threshold (§8.2.13), and deliberately
+    // parsed by the SAME helper: the two IEs differ only in what the UP function
+    // does when the value is reached (report vs. stop forwarding), so two parsers
+    // would be two places for the layout to drift. Before #80 this IE's constant
+    // existed and nothing read it, so a conformant SMF's quota was silently
+    // discarded and the subscriber was never gated.
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::VOLUME_QUOTA) {
+        let (total, ul, dl) = parse_volume_ie(&ie.value);
+        urr.volume_quota_total = total;
+        urr.volume_quota_ul = ul;
+        urr.volume_quota_dl = dl;
+    }
+
+    // Time Quota (IE type 74, TS 29.244 §8.2.41) - u32 seconds.
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::TIME_QUOTA) {
+        if ie.value.len() >= 4 {
+            urr.time_quota_secs = Some(u32::from_be_bytes([
+                ie.value[0],
+                ie.value[1],
+                ie.value[2],
+                ie.value[3],
+            ]));
+        }
+    }
+
     Ok(urr)
+}
+
+/// Parse the flags+values body shared by Volume Threshold (TS 29.244 §8.2.13) and
+/// Volume Quota (§8.2.40): one flags octet (TOVOL/ULVOL/DLVOL) followed by one
+/// 64-bit value per set flag, in that order (#80).
+///
+/// A truncated body yields `None` for the fields it cannot reach rather than a zero:
+/// a volume quota of 0 would gate the subscriber's traffic to nothing on the strength
+/// of a malformed IE, which is worse than treating the IE as absent.
+fn parse_volume_ie(value: &[u8]) -> (Option<u64>, Option<u64>, Option<u64>) {
+    if value.is_empty() {
+        return (None, None, None);
+    }
+    let flags = value[0];
+    let mut cursor = &value[1..];
+    let mut take = |set: bool| -> Option<u64> {
+        if !set || cursor.len() < 8 {
+            return None;
+        }
+        let v = u64::from_be_bytes([
+            cursor[0], cursor[1], cursor[2], cursor[3], cursor[4], cursor[5], cursor[6], cursor[7],
+        ]);
+        cursor = &cursor[8..];
+        Some(v)
+    };
+    let total = take((flags & 0x01) != 0);
+    let ul = take((flags & 0x02) != 0);
+    let dl = take((flags & 0x04) != 0);
+    (total, ul, dl)
 }
 
 /// Parsed Create URR structure
@@ -1733,12 +1782,25 @@ pub struct ParsedCreateUrr {
     pub trigger_periodic: bool,
     pub trigger_volume_threshold: bool,
     pub trigger_time_threshold: bool,
+    /// VOLQU / TIMQU (octet 2 of the Reporting Triggers IE), #80. Recorded so a
+    /// trigger/value mismatch is visible; the quota VALUES are what gate traffic.
+    pub trigger_volume_quota: bool,
+    pub trigger_time_quota: bool,
     pub volume_threshold_total: Option<u64>,
     pub volume_threshold_ul: Option<u64>,
     pub volume_threshold_dl: Option<u64>,
     pub time_threshold_secs: Option<u32>,
     /// Measurement Period (IE type 64), the PERIO trigger's cadence.
     pub measurement_period_secs: Option<u32>,
+    /// Volume Quota (IE type 73, TS 29.244 §8.2.40) — the volume at which the UP
+    /// function STOPS FORWARDING the matching traffic, as distinct from the
+    /// threshold at which it merely reports (#80, §5.2.2.2.2).
+    pub volume_quota_total: Option<u64>,
+    pub volume_quota_ul: Option<u64>,
+    pub volume_quota_dl: Option<u64>,
+    /// Time Quota (IE type 74, §8.2.41), in seconds — the measured duration after
+    /// which forwarding stops.
+    pub time_quota_secs: Option<u32>,
 }
 
 /// Parsed Node ID
@@ -1949,6 +2011,108 @@ pub fn parse_pfcpsmreq_flags(payload: &[u8]) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #80 criterion 2: `parse_create_urr` decodes Volume Quota (IE 73), Time Quota
+    /// (IE 74) and Measurement Period (IE 64).
+    ///
+    /// The Create URR body is encoded here **byte-for-byte as the SMF's
+    /// `build_create_urr` emits it** (flags octet then one big-endian u64 per set flag
+    /// for the volume IEs, a bare u32 for the time IEs, three octets MSB-first for the
+    /// triggers). The two daemons are separate bin-only crates so they cannot share a
+    /// test process — that is the **stated seam**. What closes it is that the SMF side
+    /// asserts the same layout from the encoder's end
+    /// (`a_create_urr_carries_quotas_thresholds_and_the_measurement_period` in
+    /// `smfd/n4_build.rs`), so an encoder/decoder disagreement fails one side or the
+    /// other rather than passing on both.
+    ///
+    /// Before #80 the Volume Quota and Time Quota constants existed here and NOTHING
+    /// read them, so a conformant SMF's quota was decoded into nothing and the
+    /// subscriber was never gated.
+    #[test]
+    fn volume_and_time_quota_round_trip_through_the_wire() {
+        let mut b = PfcpMessageBuilder::new();
+        b.add_u32(pfcp_ie::URR_ID, 42);
+        b.add_u8(pfcp_ie::MEASUREMENT_METHOD, 0x03); // DURAT | VOLUM
+                                                     // PERIO|VOLTH|TIMTH in octet 1, VOLQU|TIMQU in octet 2.
+        b.add_tlv(pfcp_ie::REPORTING_TRIGGERS, &[0x07, 0x03, 0x00]);
+        // Volume Threshold: TOVOL only.
+        let mut vt = vec![0x01u8];
+        vt.extend_from_slice(&1_000_000u64.to_be_bytes());
+        b.add_tlv(pfcp_ie::VOLUME_THRESHOLD, &vt);
+        // Volume Quota: all three directions, to exercise the multi-field walk.
+        let mut vq = vec![0x07u8];
+        vq.extend_from_slice(&9_000_000u64.to_be_bytes());
+        vq.extend_from_slice(&4_000_000u64.to_be_bytes());
+        vq.extend_from_slice(&5_000_000u64.to_be_bytes());
+        b.add_tlv(pfcp_ie::VOLUME_QUOTA, &vq);
+        b.add_u32(pfcp_ie::TIME_THRESHOLD, 60);
+        b.add_u32(pfcp_ie::TIME_QUOTA, 900);
+        b.add_u32(pfcp_ie::MEASUREMENT_PERIOD, 30);
+
+        let urr = parse_create_urr(&b.build()).expect("a well-formed Create URR parses");
+        assert_eq!(urr.urr_id, 42);
+        assert!(urr.measure_duration && urr.measure_volume);
+        assert!(urr.trigger_periodic && urr.trigger_volume_threshold && urr.trigger_time_threshold);
+        assert!(
+            urr.trigger_volume_quota && urr.trigger_time_quota,
+            "the QUOTA triggers live in octet 2, which was not read at all before #80"
+        );
+        assert_eq!(urr.volume_threshold_total, Some(1_000_000));
+        assert_eq!(
+            (
+                urr.volume_quota_total,
+                urr.volume_quota_ul,
+                urr.volume_quota_dl
+            ),
+            (Some(9_000_000), Some(4_000_000), Some(5_000_000)),
+            "all three Volume Quota fields must decode, in TOVOL/ULVOL/DLVOL order"
+        );
+        assert_eq!(urr.time_threshold_secs, Some(60));
+        assert_eq!(urr.time_quota_secs, Some(900));
+        // VOID criterion, kept as a regression guard: #306 already parsed this, and
+        // #80's enforcement now depends on it.
+        assert_eq!(urr.measurement_period_secs, Some(30));
+
+        // A URR carrying no quota parses as no quota -- so the decode above is evidence
+        // of the IEs being read, not of defaults being invented.
+        let mut plain = PfcpMessageBuilder::new();
+        plain.add_u32(pfcp_ie::URR_ID, 43);
+        plain.add_u8(pfcp_ie::MEASUREMENT_METHOD, 0x02);
+        let urr = parse_create_urr(&plain.build()).expect("parses");
+        assert_eq!(urr.volume_quota_total, None);
+        assert_eq!(urr.time_quota_secs, None);
+        assert!(!urr.trigger_volume_quota);
+    }
+
+    /// #80: a truncated Volume Quota body yields `None` rather than a zero.
+    ///
+    /// A volume quota of 0 gates the subscriber's traffic to nothing from the first
+    /// packet. Inferring one from a malformed IE would turn a wire glitch into a service
+    /// outage, so an unreachable field is treated as absent — which TS 29.244 already
+    /// has a representation for.
+    #[test]
+    fn a_truncated_volume_quota_is_absent_not_zero() {
+        // Flags claim all three fields; only one u64 follows.
+        let mut truncated = vec![0x07u8];
+        truncated.extend_from_slice(&7_777u64.to_be_bytes());
+        let mut b = PfcpMessageBuilder::new();
+        b.add_u32(pfcp_ie::URR_ID, 44);
+        b.add_tlv(pfcp_ie::VOLUME_QUOTA, &truncated);
+        let urr = parse_create_urr(&b.build()).expect("parses");
+        assert_eq!(urr.volume_quota_total, Some(7_777));
+        assert_eq!(
+            (urr.volume_quota_ul, urr.volume_quota_dl),
+            (None, None),
+            "fields the body cannot reach must be ABSENT, never a zero quota"
+        );
+
+        // And an empty body yields nothing at all rather than panicking on value[0].
+        let mut empty = PfcpMessageBuilder::new();
+        empty.add_u32(pfcp_ie::URR_ID, 45);
+        empty.add_tlv(pfcp_ie::VOLUME_QUOTA, &[]);
+        let urr = parse_create_urr(&empty.build()).expect("parses");
+        assert_eq!(urr.volume_quota_total, None);
+    }
 
     /// Issue #20 cross-codec check: the raw-TLV heartbeat-with-load builder
     /// must produce bytes the workspace nextgcore-pfcp codec (used by the

@@ -1140,6 +1140,48 @@ pub const NO_VOLUME_THRESHOLD: u64 = u64::MAX;
 /// duration has no reading that differs from "not provisioned".
 pub const NO_TIME_THRESHOLD: u32 = 0;
 
+/// What recording traffic against a URR means for the packet that was just
+/// measured (TS 29.244 §5.2.2, §5.2.2.2.2) — #80.
+///
+/// A three-state enum rather than a second `bool` beside the existing one. The
+/// forwarding sites have to distinguish "report, keep forwarding" from "stop
+/// forwarding", and with two booleans each call site decides which one means drop —
+/// which is how the single existing boolean came to be discarded at both sites for
+/// as long as it has been.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UrrOutcome {
+    /// Nothing provisioned was reached. Forward.
+    Continue,
+    /// A Volume/Time THRESHOLD was reached: the UP function reports usage and
+    /// **keeps forwarding** (§8.2.13, §8.2.14 — a threshold is a reporting
+    /// condition, not a gate).
+    ThresholdExceeded,
+    /// A Volume/Time QUOTA was exhausted **by this packet**: stop forwarding, and
+    /// report (§5.2.2.2.2).
+    QuotaJustExhausted,
+    /// The quota was already exhausted before this packet: stop forwarding, and do
+    /// **not** report again.
+    ///
+    /// Distinguished from [`Self::QuotaJustExhausted`] in the type rather than by a
+    /// side-channel check at the call sites, because "report once" is a property of the
+    /// transition and the URR is the only thing that knows when it transitioned. A
+    /// gated session under load would otherwise raise one Session Report Request per
+    /// dropped packet.
+    QuotaAlreadyExhausted,
+}
+
+impl UrrOutcome {
+    /// Whether the measured packet may still be forwarded.
+    pub fn may_forward(self) -> bool {
+        matches!(self, Self::Continue | Self::ThresholdExceeded)
+    }
+
+    /// Whether this outcome warrants a usage report toward the CP function.
+    pub fn needs_report(self) -> bool {
+        matches!(self, Self::ThresholdExceeded | Self::QuotaJustExhausted)
+    }
+}
+
 /// Lightweight URR for usage reporting in the data plane
 #[derive(Debug)]
 pub struct DataPlaneUrr {
@@ -1151,10 +1193,34 @@ pub struct DataPlaneUrr {
     volume_threshold_total_raw: AtomicU64,
     volume_threshold_ul_raw: AtomicU64,
     volume_threshold_dl_raw: AtomicU64,
+    /// Volume QUOTAS, in bytes (TS 29.244 §8.2.40), [`NO_VOLUME_THRESHOLD`] when
+    /// unprovisioned — #80.
+    ///
+    /// Held separately from the thresholds above, and not merged with them, because
+    /// the two mean different things at the same value: a threshold reports and keeps
+    /// forwarding, a quota stops forwarding. Atomic for the same Update-URR reason.
+    volume_quota_total_raw: AtomicU64,
+    volume_quota_ul_raw: AtomicU64,
+    volume_quota_dl_raw: AtomicU64,
     /// Time threshold and measurement period, in seconds. [`NO_TIME_THRESHOLD`]
     /// means unprovisioned.
     time_threshold_secs_raw: std::sync::atomic::AtomicU32,
     measurement_period_secs_raw: std::sync::atomic::AtomicU32,
+    /// Time QUOTA in seconds (§8.2.41), [`NO_TIME_THRESHOLD`] when unprovisioned.
+    time_quota_secs_raw: std::sync::atomic::AtomicU32,
+    /// Latched once a quota has been found exhausted (#80).
+    ///
+    /// Latched rather than recomputed for two reasons. First, the report is raised
+    /// exactly ONCE, on the transition: a quota-exhausted session under load would
+    /// otherwise raise one Session Report Request per dropped packet and flood the SMF
+    /// with the news that it is out of quota. Second, the counters are zeroed every
+    /// time a usage report is harvested, so a limit recomputed from them would un-gate
+    /// the session once per harvest interval.
+    ///
+    /// Cleared ONLY by [`Self::set_quotas`] — i.e. by a CP function granting more
+    /// through an Update URR, which is what makes this a quota rather than a teardown.
+    /// Deliberately NOT cleared by [`Self::reset_counters`]; see the note there.
+    pub quota_exhausted: AtomicBool,
     /// Accumulated volume since last report
     pub acc_total_bytes: AtomicU64,
     pub acc_ul_bytes: AtomicU64,
@@ -1197,6 +1263,90 @@ impl DataPlaneUrr {
     /// The provisioned measurement period in seconds, or `None`.
     pub fn measurement_period_secs(&self) -> Option<u32> {
         Self::secs(&self.measurement_period_secs_raw)
+    }
+
+    /// The provisioned total-volume QUOTA, or `None` when unprovisioned (#80).
+    pub fn volume_quota_total(&self) -> Option<u64> {
+        Self::volume(&self.volume_quota_total_raw)
+    }
+
+    /// The provisioned uplink-volume quota, or `None`.
+    pub fn volume_quota_ul(&self) -> Option<u64> {
+        Self::volume(&self.volume_quota_ul_raw)
+    }
+
+    /// The provisioned downlink-volume quota, or `None`.
+    pub fn volume_quota_dl(&self) -> Option<u64> {
+        Self::volume(&self.volume_quota_dl_raw)
+    }
+
+    /// The provisioned time quota in seconds, or `None`.
+    pub fn time_quota_secs(&self) -> Option<u32> {
+        Self::secs(&self.time_quota_secs_raw)
+    }
+
+    /// Whether a provisioned quota has been exhausted, i.e. whether matching traffic
+    /// is currently being dropped (#80).
+    pub fn is_quota_exhausted(&self) -> bool {
+        self.quota_exhausted.load(Ordering::Relaxed)
+    }
+
+    /// Which Usage Report Trigger a report harvested from this URR now carries
+    /// (TS 29.244 §8.2.19) — #80.
+    ///
+    /// Quota outranks threshold: when both were crossed, the fact the CP function needs
+    /// is that traffic is being DROPPED, not that a limit is near. Volume outranks time
+    /// when both quotas are exhausted, because the volume is the value carried in the
+    /// report's `VolumeMeasurement` and so the one the trigger should explain.
+    pub fn report_reason(&self) -> UrrReportReason {
+        if self.is_quota_exhausted() {
+            // Which KIND of quota: re-derived from the provisioned values rather than
+            // stored alongside the latch, so there is one source of truth for "which
+            // limit is in force" and it cannot disagree with itself.
+            let volume_provisioned = self.volume_quota_total().is_some()
+                || self.volume_quota_ul().is_some()
+                || self.volume_quota_dl().is_some();
+            return if volume_provisioned {
+                UrrReportReason::VolumeQuota
+            } else {
+                UrrReportReason::TimeQuota
+            };
+        }
+        UrrReportReason::VolumeThreshold
+    }
+
+    /// Install this URR's quota limits (TS 29.244 §8.2.40, §8.2.41), replacing
+    /// whatever was provisioned before and leaving every counter alone — #80.
+    ///
+    /// Separate from [`Self::set_reporting`] rather than folded into it because an
+    /// Update URR may re-quota without re-thresholding and vice versa (Table
+    /// 7.5.4.1-1 has independent modify flags for each), and one setter would force a
+    /// caller changing one to restate the other or silently clear it.
+    ///
+    /// **Re-provisioning a quota clears the exhaustion latch**, which is what lets a
+    /// CP function top a subscriber up: an Update URR carrying a new quota resumes
+    /// forwarding. Clearing it when the new quota is ALREADY exceeded by the volume
+    /// measured so far is harmless — the next packet re-latches it — and is preferable
+    /// to leaving a session gated by a quota that is no longer provisioned.
+    pub fn set_quotas(
+        &self,
+        volume_total: Option<u64>,
+        volume_ul: Option<u64>,
+        volume_dl: Option<u64>,
+        time_quota_secs: Option<u32>,
+    ) {
+        let vol = |v: Option<u64>| v.unwrap_or(NO_VOLUME_THRESHOLD);
+        self.volume_quota_total_raw
+            .store(vol(volume_total), Ordering::Relaxed);
+        self.volume_quota_ul_raw
+            .store(vol(volume_ul), Ordering::Relaxed);
+        self.volume_quota_dl_raw
+            .store(vol(volume_dl), Ordering::Relaxed);
+        self.time_quota_secs_raw.store(
+            time_quota_secs.unwrap_or(NO_TIME_THRESHOLD),
+            Ordering::Relaxed,
+        );
+        self.quota_exhausted.store(false, Ordering::Relaxed);
     }
 
     fn volume(slot: &AtomicU64) -> Option<u64> {
@@ -1248,6 +1398,11 @@ impl DataPlaneUrr {
             volume_threshold_total_raw: AtomicU64::new(NO_VOLUME_THRESHOLD),
             volume_threshold_ul_raw: AtomicU64::new(NO_VOLUME_THRESHOLD),
             volume_threshold_dl_raw: AtomicU64::new(NO_VOLUME_THRESHOLD),
+            volume_quota_total_raw: AtomicU64::new(NO_VOLUME_THRESHOLD),
+            volume_quota_ul_raw: AtomicU64::new(NO_VOLUME_THRESHOLD),
+            volume_quota_dl_raw: AtomicU64::new(NO_VOLUME_THRESHOLD),
+            time_quota_secs_raw: std::sync::atomic::AtomicU32::new(NO_TIME_THRESHOLD),
+            quota_exhausted: AtomicBool::new(false),
             time_threshold_secs_raw: std::sync::atomic::AtomicU32::new(NO_TIME_THRESHOLD),
             measurement_period_secs_raw: std::sync::atomic::AtomicU32::new(NO_TIME_THRESHOLD),
             acc_total_bytes: AtomicU64::new(0),
@@ -1268,32 +1423,47 @@ impl DataPlaneUrr {
         self.ur_seqn.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Record traffic and check thresholds, returns true if threshold exceeded
-    pub fn record(&self, bytes: u64, is_uplink: bool) -> bool {
+    /// Record traffic against this URR and say what it means for the packet.
+    ///
+    /// #80: returns a [`UrrOutcome`] rather than a bare `bool`, because a THRESHOLD
+    /// and a QUOTA are reached the same way and mean opposite things — a threshold
+    /// reports and keeps forwarding (TS 29.244 §8.2.13), a quota stops forwarding
+    /// (§5.2.2.2.2). The old `bool` could only say "something happened", which is why
+    /// both forwarding sites discarded it and traffic was forwarded past any quota.
+    ///
+    /// **Quota is evaluated before threshold and wins**, per direction and then in
+    /// total: when a single packet crosses both, stopping forwarding is the stronger
+    /// action and the report it generates carries the quota trigger, which is what the
+    /// CP function needs to know. Reporting only the threshold would tell the SMF the
+    /// subscriber is near the limit at the moment it was cut off.
+    ///
+    /// Counters are accumulated for every measured packet, including one that is about
+    /// to be dropped: §5.2.2 has the UP function measure the traffic matching the PDR,
+    /// and the volume that exhausted the quota is part of the usage being reported.
+    pub fn record(&self, bytes: u64, is_uplink: bool) -> UrrOutcome {
         let total = self.acc_total_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
         self.acc_total_pkts.fetch_add(1, Ordering::Relaxed);
 
-        if is_uplink {
+        let mut outcome = UrrOutcome::Continue;
+        // A quota already found exhausted stays exhausted until it is re-provisioned,
+        // so later packets are dropped WITHOUT re-reporting (the latch is what makes
+        // the report once-per-transition rather than once-per-packet).
+        let already_exhausted = self.quota_exhausted.load(Ordering::Relaxed);
+
+        let (directional, dir_threshold, dir_quota) = if is_uplink {
             let ul = self.acc_ul_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
             self.acc_ul_pkts.fetch_add(1, Ordering::Relaxed);
-            if let Some(thresh) = self.volume_threshold_ul() {
-                if ul >= thresh {
-                    self.threshold_exceeded.store(true, Ordering::Relaxed);
-                    return true;
-                }
-            }
+            (ul, self.volume_threshold_ul(), self.volume_quota_ul())
         } else {
             let dl = self.acc_dl_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
             self.acc_dl_pkts.fetch_add(1, Ordering::Relaxed);
-            if let Some(thresh) = self.volume_threshold_dl() {
-                if dl >= thresh {
-                    self.threshold_exceeded.store(true, Ordering::Relaxed);
-                    return true;
-                }
-            }
-        }
+            (dl, self.volume_threshold_dl(), self.volume_quota_dl())
+        };
 
-        // Track first packet time
+        // Track first packet time. Before the early returns below, so the time of the
+        // first packet is recorded even for a session whose very first packet crosses
+        // something -- a usage report with no Time of First Packet is a report the CP
+        // function cannot place in a billing window.
         {
             let mut fpt = self.first_pkt_time.write().unwrap();
             if fpt.is_none() {
@@ -1301,12 +1471,45 @@ impl DataPlaneUrr {
             }
         }
 
-        // Check total volume threshold
-        if let Some(thresh) = self.volume_threshold_total() {
-            if total >= thresh {
-                self.threshold_exceeded.store(true, Ordering::Relaxed);
-                return true;
-            }
+        // ---- Volume quotas: per direction, then total (§8.2.40) ----
+        let volume_quota_hit = dir_quota.is_some_and(|q| directional >= q)
+            || self.volume_quota_total().is_some_and(|q| total >= q);
+        // ---- Time quota (§8.2.41): measured duration since the first packet ----
+        let time_quota_hit = self.time_quota_secs().is_some_and(|q| {
+            self.first_pkt_time
+                .read()
+                .unwrap()
+                .is_some_and(|first| first.elapsed().as_secs() >= q as u64)
+        });
+
+        if already_exhausted {
+            // Latched by an earlier packet: dropped, not re-reported. Checked BEFORE
+            // re-evaluating the limits so a quota that was re-provisioned to nothing
+            // still does not silently resume -- only `set_quotas`/`reset_counters` may
+            // clear the latch.
+            return UrrOutcome::QuotaAlreadyExhausted;
+        }
+        if volume_quota_hit || time_quota_hit {
+            self.quota_exhausted.store(true, Ordering::Relaxed);
+            // The exhaustion is itself reportable, so the 10-second harvest picks it up
+            // as a backstop even if the immediate event is dropped.
+            self.threshold_exceeded.store(true, Ordering::Relaxed);
+            log::info!(
+                "URR {} quota exhausted ({}): total={total}B {}={directional}B — \
+                 matching traffic stops being forwarded (TS 29.244 §5.2.2.2.2)",
+                self.urr_id,
+                if volume_quota_hit { "volume" } else { "time" },
+                if is_uplink { "ul" } else { "dl" },
+            );
+            return UrrOutcome::QuotaJustExhausted;
+        }
+
+        // ---- Thresholds: report, keep forwarding ----
+        if dir_threshold.is_some_and(|t| directional >= t)
+            || self.volume_threshold_total().is_some_and(|t| total >= t)
+        {
+            self.threshold_exceeded.store(true, Ordering::Relaxed);
+            outcome = UrrOutcome::ThresholdExceeded;
         }
 
         // Check time threshold
@@ -1315,12 +1518,12 @@ impl DataPlaneUrr {
             if let Some(last) = *report_time {
                 if last.elapsed().as_secs() >= time_thresh as u64 {
                     self.threshold_exceeded.store(true, Ordering::Relaxed);
-                    return true;
+                    outcome = UrrOutcome::ThresholdExceeded;
                 }
             }
         }
 
-        false
+        outcome
     }
 
     /// Reset counters after generating a report
@@ -1334,6 +1537,18 @@ impl DataPlaneUrr {
         *self.first_pkt_time.write().unwrap() = None;
         *self.last_report_time.write().unwrap() = Some(std::time::Instant::now());
         self.threshold_exceeded.store(false, Ordering::Relaxed);
+        // #80: the exhaustion latch DELIBERATELY SURVIVES a counter reset.
+        //
+        // This function runs every time a usage report is harvested, including the
+        // report that announces the exhaustion. Clearing the latch here would have the
+        // 10-second harvest silently un-gate every quota-exhausted session as a
+        // side-effect of reporting it — the subscriber would be cut off for at most one
+        // harvest interval and then resume, forever, which is not a quota.
+        //
+        // A consumed allowance is consumed: only the CP function granting more
+        // (`set_quotas`, i.e. an Update URR) resumes forwarding. That is TS 29.244
+        // §5.2.2.2.2's model — the UP function stops and reports, and the CP function
+        // decides.
     }
 }
 
@@ -1823,18 +2038,49 @@ impl DataPlaneSession {
         }
     }
 
-    /// Record traffic in all matching URRs. Returns true if any threshold exceeded.
-    pub fn record_urrs(&self, urr_ids: &[u32], bytes: u64, is_uplink: bool) -> bool {
+    /// Record traffic in all matching URRs and return the strongest outcome (#80).
+    ///
+    /// Strongest wins: one exhausted quota among several URRs stops the packet, because
+    /// a quota the CP function provisioned is a limit on this traffic regardless of
+    /// what the other rules measuring it say.
+    ///
+    /// **Every** matching URR is recorded before returning, even once an exhaustion is
+    /// known: they are separate accounting rules and short-circuiting would silently
+    /// stop measuring the others (a wrong bill rather than a lost setting).
+    ///
+    /// The second element is the id of the URR whose quota was exhausted, if any, so a
+    /// report can name the rule that gated the traffic rather than the session.
+    pub fn record_urrs(
+        &self,
+        urr_ids: &[u32],
+        bytes: u64,
+        is_uplink: bool,
+    ) -> (UrrOutcome, Option<u32>) {
         let urrs = self.urrs.read().unwrap();
-        let mut any_exceeded = false;
+        let mut worst = UrrOutcome::Continue;
+        let mut exhausted_id = None;
         for urr_id in urr_ids {
             if let Some(urr) = urrs.get(urr_id) {
-                if urr.record(bytes, is_uplink) {
-                    any_exceeded = true;
+                match urr.record(bytes, is_uplink) {
+                    // A fresh exhaustion is the strongest outcome and always wins: it
+                    // is the one that must be reported.
+                    UrrOutcome::QuotaJustExhausted => {
+                        worst = UrrOutcome::QuotaJustExhausted;
+                        exhausted_id = Some(*urr_id);
+                    }
+                    UrrOutcome::QuotaAlreadyExhausted
+                        if worst != UrrOutcome::QuotaJustExhausted =>
+                    {
+                        worst = UrrOutcome::QuotaAlreadyExhausted;
+                    }
+                    UrrOutcome::ThresholdExceeded if worst == UrrOutcome::Continue => {
+                        worst = UrrOutcome::ThresholdExceeded;
+                    }
+                    _ => {}
                 }
             }
         }
-        any_exceeded
+        (worst, exhausted_id)
     }
 
     /// Check if any URR has a threshold exceeded
@@ -1876,6 +2122,19 @@ pub enum UpfReportEvent {
         smf_seid: u64,
         remote_teid: u32,
         peer_ipv4: Option<Ipv4Addr>,
+    },
+    /// A provisioned Volume/Time Quota was exhausted → Usage Report carrying the
+    /// VOLQU/TIMQU trigger (#80, TS 29.244 §5.2.2.2.2, §8.2.19).
+    ///
+    /// Raised on the transition into exhaustion, not from the 10-second harvest,
+    /// because §5.2.2.2.2 has the UP function report WHEN the quota is exhausted —
+    /// waiting for the next tick leaves the CP function up to ten seconds unaware that
+    /// a subscriber was cut off, which for online charging is the one moment that
+    /// matters. The harvest still catches it as a backstop if this event is dropped.
+    QuotaExhausted {
+        upf_seid: u64,
+        smf_seid: u64,
+        urr_id: u32,
     },
 }
 
@@ -2369,9 +2628,30 @@ impl DataPlane {
                 }
             }
 
-            // Record URR usage
+            // Record URR usage AND honour its verdict (#80, TS 29.244 §5.2.2.2.2).
+            //
+            // The return value used to be discarded here and at the DL site, which is
+            // the single fact that made a provisioned quota decoration: the UPF
+            // measured the traffic, latched nothing, and forwarded the packet anyway.
             if !urr_ids.is_empty() {
-                session.record_urrs(&urr_ids, payload_len, true);
+                let (outcome, exhausted_urr) = session.record_urrs(&urr_ids, payload_len, true);
+                if !outcome.may_forward() {
+                    log::debug!(
+                        "UL packet dropped: quota exhausted on SEID 0x{:x} (urr={exhausted_urr:?})",
+                        session.upf_seid
+                    );
+                    self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                    // Reported only on the transition, which the outcome -- not a
+                    // second check here -- is what distinguishes.
+                    if let (true, Some(urr_id)) = (outcome.needs_report(), exhausted_urr) {
+                        self.send_report_event(UpfReportEvent::QuotaExhausted {
+                            upf_seid: session.upf_seid,
+                            smf_seid: session.smf_seid,
+                            urr_id,
+                        });
+                    }
+                    return;
+                }
             }
         } else {
             // No PDR matched: discard (TS 23.501 5.8.2 — packets not
@@ -2587,9 +2867,29 @@ impl DataPlane {
             None => (session.dl_teid, session.gnb_addr),
         };
 
-        // Record URR usage on forwarded packets
+        // Record URR usage AND honour its verdict (#80, TS 29.244 §5.2.2.2.2).
+        //
+        // A SEPARATE call site from the UL one above, asserted by its own test: they are
+        // reached by different code and a fix to one reads as a fix to both. This is the
+        // site whose discarded return value let downlink traffic flow past an exhausted
+        // quota.
         if !urr_ids.is_empty() {
-            session.record_urrs(&urr_ids, payload_len, false);
+            let (outcome, exhausted_urr) = session.record_urrs(&urr_ids, payload_len, false);
+            if !outcome.may_forward() {
+                log::debug!(
+                    "DL packet dropped: quota exhausted on SEID 0x{:x} (urr={exhausted_urr:?})",
+                    session.upf_seid
+                );
+                self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                if let (true, Some(urr_id)) = (outcome.needs_report(), exhausted_urr) {
+                    self.send_report_event(UpfReportEvent::QuotaExhausted {
+                        upf_seid: session.upf_seid,
+                        smf_seid: session.smf_seid,
+                        urr_id,
+                    });
+                }
+                return;
+            }
         }
 
         // Apply DSCP to the OUTER transport (GTP-U/UDP/IP) header, NOT the
@@ -2920,6 +3220,35 @@ impl DataPlane {
         self.sessions.get_all_session_stats()
     }
 
+    /// Snapshot one URR's live counters for an event-driven report (#80).
+    ///
+    /// Read-only and **non-resetting**, unlike [`Self::collect_urr_reports`]: the harvest
+    /// owns the reset, and resetting here would make the volume this report carries
+    /// vanish from the next one, under-reporting the usage the quota was measuring.
+    ///
+    /// A UR-SEQN is still allocated, because it is per REPORT rather than per reset
+    /// (TS 29.244 §8.2.60) — two reports carrying overlapping volume are exactly what a
+    /// sequence number lets the CP function reconcile.
+    pub fn urr_report_snapshot(&self, upf_seid: u64, urr_id: u32) -> Option<UrrReportEntry> {
+        let seid_map = self.sessions.seid_map.read().unwrap();
+        let session = seid_map.get(&upf_seid)?;
+        let urrs = session.urrs.read().unwrap();
+        let urr = urrs.get(&urr_id)?;
+        Some(UrrReportEntry {
+            upf_seid: session.upf_seid,
+            smf_seid: session.smf_seid,
+            urr_id,
+            ur_seqn: urr.next_ur_seqn(),
+            total_bytes: urr.acc_total_bytes.load(Ordering::Relaxed),
+            ul_bytes: urr.acc_ul_bytes.load(Ordering::Relaxed),
+            dl_bytes: urr.acc_dl_bytes.load(Ordering::Relaxed),
+            total_pkts: urr.acc_total_pkts.load(Ordering::Relaxed),
+            ul_pkts: urr.acc_ul_pkts.load(Ordering::Relaxed),
+            dl_pkts: urr.acc_dl_pkts.load(Ordering::Relaxed),
+            trigger: urr.report_reason(),
+        })
+    }
+
     /// Check all sessions for URR threshold exceedances.
     /// Returns a list of (upf_seid, smf_seid, urr_id, total_bytes, ul_bytes, dl_bytes, total_pkts)
     /// for each URR that has a threshold exceeded. Resets counters after collection.
@@ -2942,6 +3271,11 @@ impl DataPlane {
                         total_pkts: urr.acc_total_pkts.load(Ordering::Relaxed),
                         ul_pkts: urr.acc_ul_pkts.load(Ordering::Relaxed),
                         dl_pkts: urr.acc_dl_pkts.load(Ordering::Relaxed),
+                        // #80: the report says why it exists. An exhausted quota is
+                        // reported as a QUOTA report, not as a threshold report -- that
+                        // distinction is what tells the CP function the subscriber is
+                        // currently being DROPPED rather than merely approaching a limit.
+                        trigger: urr.report_reason(),
                     };
                     urr.reset_counters();
                     reports.push(entry);
@@ -2968,6 +3302,11 @@ impl DataPlane {
                                         total_pkts: urr.acc_total_pkts.load(Ordering::Relaxed),
                                         ul_pkts: urr.acc_ul_pkts.load(Ordering::Relaxed),
                                         dl_pkts: urr.acc_dl_pkts.load(Ordering::Relaxed),
+                                        // #80: PERIO, because that is what this arm is.
+                                        // It used to go out labelled VOLTH -- a
+                                        // pre-existing wire defect, reachable since
+                                        // #306 made periodic reports fire at all.
+                                        trigger: UrrReportReason::Periodic,
                                     };
                                     urr.reset_counters();
                                     reports.push(entry);
@@ -3091,6 +3430,30 @@ pub struct UrrReportEntry {
     pub total_pkts: u64,
     pub ul_pkts: u64,
     pub dl_pkts: u64,
+    /// WHY this report was generated, i.e. which Usage Report Trigger
+    /// (TS 29.244 §8.2.19) the report carries — #80.
+    ///
+    /// Carried per report rather than assumed by the sender. `send_urr_report` used to
+    /// hardcode `volume_threshold = true` on every report it built, so a periodic
+    /// report (reachable since #306) already went out mislabelled as a threshold
+    /// report, and a quota report could not be distinguished from one at all. A CP
+    /// function reading the trigger to decide whether to top a subscriber up was being
+    /// told the wrong thing.
+    pub trigger: UrrReportReason,
+}
+
+/// Why a usage report was generated (TS 29.244 §8.2.19) — #80.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UrrReportReason {
+    /// VOLTH / TIMTH — a threshold was crossed; traffic keeps flowing.
+    #[default]
+    VolumeThreshold,
+    /// PERIO — the Measurement Period elapsed.
+    Periodic,
+    /// VOLQU — a volume quota was exhausted; matching traffic is being dropped.
+    VolumeQuota,
+    /// TIMQU — a time quota was exhausted.
+    TimeQuota,
 }
 
 // ============================================================================
@@ -4338,6 +4701,365 @@ mod tests {
         pkt[10..12].copy_from_slice(&[0, 0]);
         let csum = ipv4_header_checksum(&pkt[..20]);
         pkt[10..12].copy_from_slice(&csum.to_be_bytes());
+    }
+
+    // ==================================================================
+    // #80: Volume/Time Quota enforcement on the forwarding path
+    // ==================================================================
+
+    /// Bind URR `urr_id` to both of a session's PDRs and provision it with `quota`
+    /// bytes of total volume (#80).
+    ///
+    /// The PDR binding is the half the SMF does in production; without it
+    /// `record_urrs` is handed an empty id list and measures nothing, so a test that
+    /// only installed the URR would assert against a rule no packet ever reaches.
+    fn provision_quota(
+        dp: &DataPlane,
+        upf_seid: u64,
+        urr_id: u32,
+        quota: u64,
+    ) -> Arc<DataPlaneUrr> {
+        let session = dp.sessions.find_by_seid(upf_seid).expect("session");
+        for pdr in session.pdrs.write().unwrap().iter_mut() {
+            pdr.urr_ids = vec![urr_id];
+        }
+        let urr = Arc::new(DataPlaneUrr::new(urr_id));
+        urr.set_quotas(Some(quota), None, None, None);
+        session
+            .urrs
+            .write()
+            .unwrap()
+            .insert(urr_id, Arc::clone(&urr));
+        urr
+    }
+
+    /// #80 criterion 4 (uplink half): once a provisioned volume quota is exhausted the
+    /// UPF STOPS FORWARDING matching uplink traffic.
+    ///
+    /// Before #80 `record_urrs`' return value was discarded here, so the UPF measured
+    /// the traffic, latched nothing and forwarded the packet regardless — a subscriber
+    /// who exhausted an allowance was never cut off.
+    ///
+    /// Driven through the real `handle_uplink_packet` with a REAL writable fd, and
+    /// asserted on `ul_packets` — after a control packet has proved that same fd can
+    /// move it.
+    ///
+    /// The first draft passed `tun_fd = -1` like its siblings and asserted
+    /// `dropped_packets == 1` / `ul_packets == 0`. Revert-verification caught it:
+    /// **those assertions pass with uplink enforcement entirely disabled.** With the
+    /// quota check bypassed the packet reaches the TUN write, `libc::write(-1, ..)` fails
+    /// with `EBADF`, and that failure branch increments `dropped_packets` and skips
+    /// `ul_packets` — so the harness satisfied both assertions by the write failing
+    /// rather than by the gate firing. That is precisely the pre-#80 bug this test exists
+    /// to catch, and the first draft did not catch it. Recorded because it is the general
+    /// trap: an assertion satisfied by a path that never arrives.
+    ///
+    /// Two changes make it bite: a writable fd, so a forwarded packet genuinely takes the
+    /// success branch; and a CONTROL packet through the same fd on a quota-free session
+    /// first, so `ul_packets == 1` proves a forward is observable at all. Only then does
+    /// `ul_packets` still being 1 afterwards mean the quota stopped the next one.
+    #[tokio::test]
+    async fn an_exhausted_volume_quota_stops_forwarding_uplink_traffic() {
+        let ue_ip = Ipv4Addr::new(10, 45, 0, 80);
+        let dp = dp_with_ul_session(ue_ip, 0x800).await;
+        let sink = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("/dev/null must be writable");
+        let tun_fd = std::os::unix::io::AsRawFd::as_raw_fd(&sink);
+        let peer: SocketAddr = "127.0.0.1:2152".parse().unwrap();
+
+        let mut inner = make_ipv4_udp_packet(ue_ip.octets(), [8, 8, 8, 8], 1234, 53);
+        finalize_ipv4(&mut inner);
+        let gpdu = encapsulate_dl_gpdu(&inner, 0x800, None);
+
+        // ---- control: with no quota, this exact packet on this exact fd FORWARDS ----
+        dp.handle_uplink_packet(&gpdu, peer, tun_fd).await;
+        assert_eq!(
+            dp.stats.ul_packets.load(Ordering::Relaxed),
+            1,
+            "the harness must be able to observe a forward, or 'not forwarded' proves \
+             nothing"
+        );
+
+        // ---- now a quota smaller than one packet ----
+        // TS 29.244 §5.2.2.2.2 has the UP function stop forwarding the traffic that
+        // matches, which includes the packet that crossed the line.
+        let urr = provision_quota(&dp, 0x55, 1, 10);
+        dp.handle_uplink_packet(&gpdu, peer, tun_fd).await;
+
+        assert!(
+            urr.is_quota_exhausted(),
+            "the quota must be latched as exhausted"
+        );
+        assert_eq!(
+            dp.stats.ul_packets.load(Ordering::Relaxed),
+            1,
+            "the packet that exhausted the quota must NOT be forwarded — still 1 (the \
+             control packet), not 2"
+        );
+        assert_eq!(
+            dp.stats.dropped_packets.load(Ordering::Relaxed),
+            1,
+            "and it must be counted as dropped"
+        );
+        // The volume is still measured: §5.2.2 has the UP function measure the traffic
+        // matching the PDR, and the bytes that exhausted the quota are part of the usage
+        // being reported.
+        assert!(
+            urr.acc_total_bytes.load(Ordering::Relaxed) > 0,
+            "a dropped packet is still measured, or the report under-states the usage"
+        );
+
+        // A SECOND packet past the quota is dropped too, and still not forwarded.
+        dp.handle_uplink_packet(&gpdu, peer, tun_fd).await;
+        assert_eq!(dp.stats.ul_packets.load(Ordering::Relaxed), 1);
+        assert_eq!(dp.stats.dropped_packets.load(Ordering::Relaxed), 2);
+        // And it does NOT re-report: the latch is what keeps a gated session from
+        // raising one Session Report Request per dropped packet.
+        assert_eq!(urr.record(1, true), UrrOutcome::QuotaAlreadyExhausted);
+    }
+
+    /// #80 criterion 4 (downlink half): the same for downlink traffic.
+    ///
+    /// A SEPARATE test rather than the uplink one parameterised over a direction, which
+    /// is what #80's own comment asks for and is right: the two enforcement points are
+    /// different call sites reached by different code, and a fix to one reads as a fix
+    /// to both.
+    #[tokio::test]
+    async fn an_exhausted_volume_quota_stops_forwarding_downlink_traffic() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let dp = DataPlane::new(shutdown);
+        let upf_sock = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dp = DataPlane {
+            gtpu_socket: Some(Arc::new(upf_sock)),
+            ..dp
+        };
+        // A real gNB socket, so "not forwarded" is observable as nothing arriving there
+        // as well as on the counter.
+        let gnb_sock = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gnb_addr = gnb_sock.local_addr().unwrap();
+        let ue_ip = Ipv4Addr::new(10, 45, 0, 81);
+        dp.add_session_from_pfcp(
+            0x55,
+            0x1055,
+            ue_ip,
+            0x801,
+            0x201,
+            gnb_addr,
+            Some(1),
+            Some(9),
+        );
+        let urr = provision_quota(&dp, 0x55, 1, 10);
+
+        let mut inner = make_ipv4_udp_packet([8, 8, 8, 8], ue_ip.octets(), 53, 1234);
+        finalize_ipv4(&mut inner);
+        let gtpu = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+        dp.handle_downlink_packet(&inner, &gtpu).await;
+
+        assert!(urr.is_quota_exhausted(), "the quota must be latched");
+        assert_eq!(
+            dp.stats.dropped_packets.load(Ordering::Relaxed),
+            1,
+            "the downlink packet must be DROPPED at the second enforcement point"
+        );
+        assert_eq!(
+            dp.stats.dl_packets.load(Ordering::Relaxed),
+            0,
+            "and not counted as forwarded downlink traffic"
+        );
+        // Nothing reached the gNB.
+        let mut buf = [0u8; 2048];
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                gnb_sock.recv_from(&mut buf)
+            )
+            .await
+            .is_err(),
+            "no G-PDU may reach the gNB past an exhausted quota"
+        );
+    }
+
+    /// #80 criterion 5: exhaustion raises a usage report toward the SMF, ONCE, carrying
+    /// the quota trigger.
+    ///
+    /// Asserted on the event the data plane raises through its existing report channel
+    /// — the same mechanism Downlink Data Reports use — and on the trigger the report
+    /// will carry. `report_reason` is what `send_urr_report` reads, so asserting it is
+    /// asserting the wire.
+    #[tokio::test]
+    async fn quota_exhaustion_raises_a_usage_report_carrying_volqu() {
+        let ue_ip = Ipv4Addr::new(10, 45, 0, 82);
+        let dp = dp_with_ul_session(ue_ip, 0x802).await;
+        let (tx, mut rx) = mpsc::channel(8);
+        dp.set_report_channel(tx);
+        let urr = provision_quota(&dp, 0x55, 3, 10);
+
+        let mut inner = make_ipv4_udp_packet(ue_ip.octets(), [8, 8, 8, 8], 1234, 53);
+        finalize_ipv4(&mut inner);
+        let gpdu = encapsulate_dl_gpdu(&inner, 0x802, None);
+        dp.handle_uplink_packet(&gpdu, "127.0.0.1:2152".parse().unwrap(), -1)
+            .await;
+
+        match rx.try_recv() {
+            Ok(UpfReportEvent::QuotaExhausted {
+                upf_seid,
+                smf_seid,
+                urr_id,
+            }) => {
+                assert_eq!((upf_seid, smf_seid, urr_id), (0x55, 0x1055, 3));
+            }
+            other => panic!(
+                "exhaustion must raise a QuotaExhausted report event immediately \
+                 (TS 29.244 §5.2.2.2.2 reports WHEN the quota is exhausted, not at the \
+                 next 10s harvest); got {other:?}"
+            ),
+        }
+        // VOLQU, not VOLTH: the CP function needs to know traffic is being DROPPED, not
+        // that a limit is near. Before #80 every report claimed volume_threshold.
+        assert_eq!(urr.report_reason(), UrrReportReason::VolumeQuota);
+
+        // A second dropped packet raises NOTHING: one report per transition.
+        dp.handle_uplink_packet(&gpdu, "127.0.0.1:2152".parse().unwrap(), -1)
+            .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "a gated session must not raise one report per dropped packet"
+        );
+    }
+
+    /// #80: a threshold reports and KEEPS FORWARDING, which is what distinguishes it
+    /// from a quota (TS 29.244 §8.2.13 vs §5.2.2.2.2).
+    ///
+    /// The paired positive for the two enforcement tests above: without it, "traffic is
+    /// dropped when a limit is crossed" would be satisfied by an implementation that
+    /// dropped on a threshold too — turning every reporting-granularity setting into a
+    /// service outage.
+    ///
+    /// **Asserted on `ul_packets`, not on `dropped_packets`**, and given a REAL writable
+    /// fd to do it. This test's first draft passed `tun_fd = -1` like its siblings and
+    /// failed on `dropped_packets == 0` — correctly: because the threshold does permit
+    /// forwarding, the packet reached the TUN write, `libc::write(-1, ..)` returned
+    /// `EBADF`, and the handler counts a write failure as a drop. So in this harness
+    /// `dropped_packets` conflates "policy refused the packet" with "the fake fd could
+    /// not be written to", which makes it the one counter that cannot show forwarding.
+    /// `ul_packets` is incremented only on the successful-write branch, so it is
+    /// reachable ONLY by a packet the policy let through — a positive signal rather than
+    /// the absence of a negative one.
+    #[tokio::test]
+    async fn an_exceeded_threshold_reports_but_keeps_forwarding() {
+        let ue_ip = Ipv4Addr::new(10, 45, 0, 83);
+        let dp = dp_with_ul_session(ue_ip, 0x803).await;
+        let session = dp.sessions.find_by_seid(0x55).expect("session");
+        for pdr in session.pdrs.write().unwrap().iter_mut() {
+            pdr.urr_ids = vec![1];
+        }
+        let urr = Arc::new(DataPlaneUrr::new(1));
+        // A THRESHOLD of 10 bytes and NO quota.
+        urr.set_reporting(Some(10), None, None, None, None);
+        session.urrs.write().unwrap().insert(1, Arc::clone(&urr));
+
+        // A writable stand-in for the TUN device, so a forwarded packet lands on the
+        // success branch and is countable.
+        let sink = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("/dev/null must be writable");
+        let tun_fd = std::os::unix::io::AsRawFd::as_raw_fd(&sink);
+
+        let mut inner = make_ipv4_udp_packet(ue_ip.octets(), [8, 8, 8, 8], 1234, 53);
+        finalize_ipv4(&mut inner);
+        let gpdu = encapsulate_dl_gpdu(&inner, 0x803, None);
+        dp.handle_uplink_packet(&gpdu, "127.0.0.1:2152".parse().unwrap(), tun_fd)
+            .await;
+
+        assert!(
+            urr.threshold_exceeded.load(Ordering::Relaxed),
+            "the threshold must be recorded for reporting"
+        );
+        assert!(
+            !urr.is_quota_exhausted(),
+            "a THRESHOLD is not a quota and must not gate traffic"
+        );
+        assert_eq!(
+            dp.stats.ul_packets.load(Ordering::Relaxed),
+            1,
+            "crossing a reporting THRESHOLD must still FORWARD the packet: a threshold \
+             is a reporting condition (§8.2.13), and gating on it would turn every \
+             reporting-granularity setting into a service outage"
+        );
+        assert_eq!(
+            urr.report_reason(),
+            UrrReportReason::VolumeThreshold,
+            "and it is reported as a threshold, not as a quota"
+        );
+
+        // The contrast, in the same harness with the same fd: a QUOTA on the same rule
+        // stops the very next packet. Without this the test above would pass for an
+        // implementation that never gates anything.
+        urr.set_quotas(Some(1), None, None, None);
+        dp.handle_uplink_packet(&gpdu, "127.0.0.1:2152".parse().unwrap(), tun_fd)
+            .await;
+        assert_eq!(
+            dp.stats.ul_packets.load(Ordering::Relaxed),
+            1,
+            "a QUOTA on the same URR must stop the next packet being forwarded"
+        );
+        assert!(urr.is_quota_exhausted());
+    }
+
+    /// #80: a CP function granting more quota through an Update URR resumes forwarding,
+    /// and a usage-report harvest does NOT.
+    ///
+    /// Both halves matter. `set_quotas` clearing the latch is what makes this a quota
+    /// rather than a teardown. `reset_counters` NOT clearing it is what stops the
+    /// 10-second harvest from silently un-gating every exhausted session as a
+    /// side-effect of reporting it — which would cut a subscriber off for at most one
+    /// harvest interval, forever.
+    #[test]
+    fn only_a_re_provisioned_quota_resumes_forwarding_not_a_report() {
+        let urr = DataPlaneUrr::new(1);
+        urr.set_quotas(Some(10), None, None, None);
+        assert_eq!(urr.record(100, true), UrrOutcome::QuotaJustExhausted);
+        assert!(urr.is_quota_exhausted());
+
+        // Harvesting a report resets the counters and leaves the session GATED.
+        urr.reset_counters();
+        assert!(
+            urr.is_quota_exhausted(),
+            "reporting an exhausted quota must not un-gate the session: the harvest \
+             runs every 10s and would resume forwarding forever"
+        );
+        assert_eq!(urr.record(1, true), UrrOutcome::QuotaAlreadyExhausted);
+
+        // A top-up does resume it.
+        urr.set_quotas(Some(1_000_000), None, None, None);
+        assert!(!urr.is_quota_exhausted());
+        assert_eq!(urr.record(1, true), UrrOutcome::Continue);
+    }
+
+    /// #80: a time quota gates traffic and is reported as TIMQU (TS 29.244 §8.2.41).
+    #[test]
+    fn an_exhausted_time_quota_gates_and_reports_as_timqu() {
+        let urr = DataPlaneUrr::new(1);
+        // Zero seconds: the first packet sets `first_pkt_time` and the elapsed duration
+        // is already >= 0, so the quota is exhausted at once. `NO_TIME_THRESHOLD` is
+        // itself 0, so a zero here means "unprovisioned" -- which is why the SMF refuses
+        // to send one and this test provisions 0 through the setter directly, to reach
+        // the arm without waiting a wall-clock second.
+        urr.set_quotas(None, None, None, Some(1));
+        // Not yet: no time has passed.
+        assert_eq!(urr.record(10, true), UrrOutcome::Continue);
+        // Backdate the first-packet time past the quota.
+        *urr.first_pkt_time.write().unwrap() =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+        assert_eq!(urr.record(10, true), UrrOutcome::QuotaJustExhausted);
+        assert_eq!(
+            urr.report_reason(),
+            UrrReportReason::TimeQuota,
+            "a time-quota exhaustion is reported as TIMQU, not as a volume trigger"
+        );
     }
 
     /// An uplink G-PDU whose inner source IP does not match the session's UE

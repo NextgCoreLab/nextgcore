@@ -336,6 +336,26 @@ async fn main() -> Result<()> {
                         log::error!("Failed to send Error Indication Report: {e}");
                     }
                 }
+                // #80: a quota exhausted on the forwarding path. Reported IMMEDIATELY
+                // rather than waiting for the 10-second harvest, because TS 29.244
+                // §5.2.2.2.2 has the UP function report when the quota is exhausted --
+                // and for online charging the moment a subscriber is cut off is the one
+                // moment the CP function needs promptly. The harvest still reports it as
+                // a backstop if this event is dropped (the URR's `threshold_exceeded` is
+                // also set), so the report cannot be lost, only duplicated -- and a
+                // duplicate carries its own UR-SEQN, which is what §8.2.60 exists for.
+                data_plane::UpfReportEvent::QuotaExhausted {
+                    upf_seid,
+                    smf_seid,
+                    urr_id,
+                } => {
+                    if let Err(e) = pfcp_for_reports
+                        .send_quota_exhausted_report(upf_seid, smf_seid, urr_id)
+                        .await
+                    {
+                        log::error!("Failed to send quota-exhausted Usage Report: {e}");
+                    }
+                }
             }
         }
     });
@@ -906,6 +926,16 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                                 // arrived with no cadence behind it.
                                 u.measurement_period_secs,
                             );
+                            // #80: the quota half. Propagated since Volume Quota (IE
+                            // 73) and Time Quota (IE 74) are now parsed; before that a
+                            // conformant SMF's quota decoded into nothing and the
+                            // subscriber was never gated.
+                            urr.set_quotas(
+                                u.volume_quota_total,
+                                u.volume_quota_ul,
+                                u.volume_quota_dl,
+                                u.time_quota_secs,
+                            );
                             dp_urrs.insert(u.urr_id, Arc::new(urr));
                         }
                         *session.urrs.write().unwrap() = dp_urrs;
@@ -1033,6 +1063,12 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                             u.time_threshold_secs,
                             u.measurement_period_secs,
                         );
+                        urr.set_quotas(
+                            u.volume_quota_total,
+                            u.volume_quota_ul,
+                            u.volume_quota_dl,
+                            u.time_quota_secs,
+                        );
                         dp_urrs.insert(u.urr_id, Arc::new(urr));
                     }
                     log::info!(
@@ -1047,13 +1083,27 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                     let dp_urrs = session.urrs.read().unwrap();
                     for u in &updated_urrs {
                         match dp_urrs.get(&u.urr_id) {
-                            Some(urr) => urr.set_reporting(
-                                u.volume_threshold_total,
-                                u.volume_threshold_ul,
-                                u.volume_threshold_dl,
-                                u.time_threshold_secs,
-                                u.measurement_period_secs,
-                            ),
+                            Some(urr) => {
+                                urr.set_reporting(
+                                    u.volume_threshold_total,
+                                    u.volume_threshold_ul,
+                                    u.volume_threshold_dl,
+                                    u.time_threshold_secs,
+                                    u.measurement_period_secs,
+                                );
+                                // #80: an Update URR carrying a quota is how a CP
+                                // function TOPS A SUBSCRIBER UP -- `set_quotas` clears
+                                // the exhaustion latch, so a gated session resumes
+                                // forwarding. That is what makes a quota a quota rather
+                                // than a teardown, and it is the reason the latch lives
+                                // where a re-provision can reach it.
+                                urr.set_quotas(
+                                    u.volume_quota_total,
+                                    u.volume_quota_ul,
+                                    u.volume_quota_dl,
+                                    u.time_quota_secs,
+                                );
+                            }
                             // Unreachable in practice: the handler refuses an Update
                             // for a rule the session does not hold, so this arm means
                             // the two stores have diverged. Logged rather than

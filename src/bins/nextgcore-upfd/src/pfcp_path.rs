@@ -2280,8 +2280,31 @@ impl PfcpServer {
         let usage_reports: Vec<crate::n4_build::UsageReport> = reports
             .iter()
             .map(|r| {
-                let mut trigger = crate::n4_build::UsageReportTrigger::default();
-                trigger.volume_threshold = true;
+                // #80: the trigger the report CARRIES, from the reason it was
+                // generated. This used to hardcode `volume_threshold = true` on every
+                // report, so a periodic report went out mislabelled as a threshold
+                // report and a quota exhaustion could not be expressed at all -- a CP
+                // function reading the trigger to decide whether to top a subscriber up
+                // was being told the wrong thing (TS 29.244 §8.2.19).
+                use crate::data_plane::UrrReportReason;
+                let trigger = match r.trigger {
+                    UrrReportReason::VolumeThreshold => crate::n4_build::UsageReportTrigger {
+                        volume_threshold: true,
+                        ..Default::default()
+                    },
+                    UrrReportReason::Periodic => crate::n4_build::UsageReportTrigger {
+                        periodic_reporting: true,
+                        ..Default::default()
+                    },
+                    UrrReportReason::VolumeQuota => crate::n4_build::UsageReportTrigger {
+                        volume_quota: true,
+                        ..Default::default()
+                    },
+                    UrrReportReason::TimeQuota => crate::n4_build::UsageReportTrigger {
+                        time_quota: true,
+                        ..Default::default()
+                    },
+                };
 
                 crate::n4_build::UsageReport {
                     urr_id: r.urr_id,
@@ -2324,6 +2347,104 @@ impl PfcpServer {
         log::info!(
             "Sent Session Report Request to {smf_addr} for SEID={upf_seid:#x} ({} URR reports)",
             reports.len()
+        );
+        Ok(())
+    }
+
+    /// Send a Session Report Request the instant a Volume/Time Quota is exhausted
+    /// (#80, TS 29.244 §5.2.2.2.2, §8.2.19).
+    ///
+    /// Distinct from [`Self::send_urr_report`] because it is driven by a data-plane
+    /// EVENT rather than by the harvest: it reads the URR's live counters and builds one
+    /// report for one rule, and it deliberately does **not** reset those counters. The
+    /// harvest owns the reset, and resetting here would make the volume this report
+    /// carries disappear from the next one — under-reporting the very usage the quota
+    /// was measuring.
+    ///
+    /// It also does not clear the exhaustion latch: a report is an announcement, not a
+    /// grant. Only the CP function provisioning more quota (an Update URR) resumes
+    /// forwarding.
+    pub async fn send_quota_exhausted_report(
+        &self,
+        upf_seid: u64,
+        smf_seid: u64,
+        urr_id: u32,
+    ) -> Result<(), String> {
+        let smf_addr = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .get(&upf_seid)
+                .map(|s| s.smf_addr)
+                .ok_or_else(|| format!("Session {upf_seid:#x} not found for quota report"))?
+        };
+
+        // The live counters and the trigger, read off the URR that latched. Without the
+        // data plane attached there is nothing to read, which is not an error: a UPF
+        // running with `--no-dataplane` has no forwarding path to have exhausted a quota
+        // on, so the event cannot arise.
+        // Cloned out of the guard immediately: the guard is a std lock and must not be
+        // held across the `.await` below.
+        let dp = self.data_plane.read().unwrap().clone();
+        let Some(dp) = dp else {
+            return Err("no data plane attached; cannot read URR counters".to_string());
+        };
+        let Some(report) = dp.urr_report_snapshot(upf_seid, urr_id) else {
+            return Err(format!(
+                "URR {urr_id} not found on SEID {upf_seid:#x} for quota report"
+            ));
+        };
+
+        let trigger = match report.trigger {
+            crate::data_plane::UrrReportReason::TimeQuota => crate::n4_build::UsageReportTrigger {
+                time_quota: true,
+                ..Default::default()
+            },
+            // VOLQU for a volume quota, and for anything else: this path is only
+            // reached from a quota exhaustion, so a VOLTH/PERIO reason here would mean
+            // the latch and the provisioned values disagree — reported as the volume
+            // quota it was rather than silently as a threshold.
+            _ => crate::n4_build::UsageReportTrigger {
+                volume_quota: true,
+                ..Default::default()
+            },
+        };
+
+        let user_plane_report = UserPlaneReport {
+            report_type: crate::n4_build::ReportType {
+                usage_report: true,
+                ..Default::default()
+            },
+            usage_reports: vec![crate::n4_build::UsageReport {
+                urr_id,
+                ur_seqn: report.ur_seqn,
+                trigger,
+                volume_measurement: Some(crate::n4_build::VolumeMeasurement {
+                    total_volume: Some(report.total_bytes),
+                    uplink_volume: Some(report.ul_bytes),
+                    downlink_volume: Some(report.dl_bytes),
+                    total_packets: Some(report.total_pkts),
+                    uplink_packets: Some(report.ul_pkts),
+                    downlink_packets: Some(report.dl_pkts),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let payload =
+            build_session_report_request(pfcp_type::SESSION_REPORT_REQUEST, &user_plane_report);
+        self.send_and_track_report(
+            upf_seid,
+            smf_seid,
+            smf_addr,
+            &payload,
+            "Session Report Request (quota exhausted)",
+        )
+        .await?;
+        log::info!(
+            "Sent quota-exhausted Usage Report to {smf_addr} for SEID={upf_seid:#x} URR={urr_id} \
+             ({}B total) — matching traffic is being dropped (TS 29.244 §5.2.2.2.2)",
+            report.total_bytes
         );
         Ok(())
     }
@@ -3065,6 +3186,181 @@ mod tests {
         assert_eq!(
             u16::from_be_bytes([off.value[0], off.value[1]]),
             pfcp_ie::CREATE_URR
+        );
+    }
+
+    /// The Usage Report Trigger octets carried by each Usage Report in a Session
+    /// Report Request (#80, TS 29.244 §8.2.19).
+    ///
+    /// Decoded off the wire so the assertion is about the bytes the SMF receives, not
+    /// about the Rust value that produced them.
+    fn report_triggers_in(pkt: &[u8]) -> Vec<Vec<u8>> {
+        let (_, body) = ParsedPfcpHeader::parse(pkt).unwrap();
+        let ies = ParsedIe::parse_all(body);
+        ParsedIe::find_all_ies(&ies, pfcp_ie::USAGE_REPORT_SRR)
+            .into_iter()
+            .filter_map(|ur| {
+                let inner = ParsedIe::parse_all(&ur.value);
+                ParsedIe::find_ie(&inner, pfcp_ie::USAGE_REPORT_TRIGGER).map(|t| t.value.clone())
+            })
+            .collect()
+    }
+
+    /// #80 criterion 6: a PERIODIC usage report is labelled PERIO on the wire, and a
+    /// quota exhaustion is labelled VOLQU — neither is labelled VOLTH.
+    ///
+    /// `send_urr_report` hardcoded `volume_threshold = true` on every report it built,
+    /// so a periodic report (reachable since #306 made the harvest fire) already went
+    /// out mislabelled as a threshold report, and a quota exhaustion could not be
+    /// expressed at all. A CP function reading the trigger to decide whether to top a
+    /// subscriber up was being told the wrong thing.
+    ///
+    /// Driven through the real `send_urr_report` against a real SMF socket, asserting
+    /// the decoded trigger octets. Positive assertions on specific bits — the paired
+    /// `assert_eq!(.. & 0x02, 0)` for VOLTH is what makes "labelled PERIO" mean "and NOT
+    /// labelled VOLTH", which is the actual defect.
+    #[tokio::test]
+    async fn a_periodic_report_is_labelled_perio_not_volth() {
+        let (server, smf, addr, _rx, _dp, upf_seid) = established_session().await;
+        let _ = addr;
+
+        let entry =
+            |trigger: crate::data_plane::UrrReportReason| crate::data_plane::UrrReportEntry {
+                upf_seid,
+                smf_seid: 0x4242,
+                urr_id: 1,
+                ur_seqn: 0,
+                total_bytes: 1234,
+                ul_bytes: 1000,
+                dl_bytes: 234,
+                total_pkts: 3,
+                ul_pkts: 2,
+                dl_pkts: 1,
+                trigger,
+            };
+
+        // ---- PERIO ----
+        server
+            .send_urr_report(
+                upf_seid,
+                0x4242,
+                vec![entry(crate::data_plane::UrrReportReason::Periodic)],
+            )
+            .await
+            .expect("the report must be sent");
+        let mut buf = vec![0u8; 4096];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                .await
+                .expect("a Session Report Request must arrive")
+                .expect("recv");
+        let triggers = report_triggers_in(&buf[..len]);
+        assert_eq!(triggers.len(), 1, "one Usage Report");
+        assert_eq!(
+            triggers[0][0] & 0x01,
+            0x01,
+            "PERIO must be set on a periodic report (octet 1 bit 1)"
+        );
+        assert_eq!(
+            triggers[0][0] & 0x02,
+            0x00,
+            "and VOLTH must NOT be: before #80 every report claimed volume_threshold, so \
+             a periodic report was indistinguishable from a threshold one"
+        );
+
+        // ---- VOLQU ----
+        server
+            .send_urr_report(
+                upf_seid,
+                0x4242,
+                vec![entry(crate::data_plane::UrrReportReason::VolumeQuota)],
+            )
+            .await
+            .expect("sent");
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                .await
+                .expect("arrives")
+                .expect("recv");
+        let triggers = report_triggers_in(&buf[..len]);
+        assert_eq!(
+            triggers[0][1] & 0x01,
+            0x01,
+            "VOLQU lives in octet 2 bit 1 and is what tells the CP function traffic is \
+             being DROPPED rather than merely approaching a limit"
+        );
+        assert_eq!(triggers[0][0] & 0x02, 0x00, "and not VOLTH");
+
+        // ---- TIMQU ----
+        server
+            .send_urr_report(
+                upf_seid,
+                0x4242,
+                vec![entry(crate::data_plane::UrrReportReason::TimeQuota)],
+            )
+            .await
+            .expect("sent");
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                .await
+                .expect("arrives")
+                .expect("recv");
+        assert_eq!(report_triggers_in(&buf[..len])[0][1] & 0x02, 0x02, "TIMQU");
+    }
+
+    /// #80 criterion 5 (wire half): the event-driven quota report reaches the SMF with
+    /// the VOLQU trigger and the URR's live counters.
+    ///
+    /// This is the path `UpfReportEvent::QuotaExhausted` drives, i.e. the one that
+    /// reports the instant a subscriber is cut off rather than at the next 10-second
+    /// harvest (TS 29.244 §5.2.2.2.2). It reads the URR's counters WITHOUT resetting
+    /// them, which is asserted here: resetting would make the volume this report carries
+    /// vanish from the next one, under-reporting the usage the quota was measuring.
+    #[tokio::test]
+    async fn the_event_driven_quota_report_carries_volqu_and_does_not_reset_counters() {
+        let (server, smf, addr, _rx, dp, upf_seid) = established_session().await;
+        let _ = addr;
+
+        // Provision a quota and exhaust it, so the URR's own state says VOLQU.
+        {
+            let session = dp.sessions.find_by_seid(upf_seid).unwrap();
+            let urrs = session.urrs.read().unwrap();
+            let urr = urrs.get(&1).unwrap();
+            urr.set_quotas(Some(100), None, None, None);
+            assert_eq!(
+                urr.record(500, true),
+                crate::data_plane::UrrOutcome::QuotaJustExhausted
+            );
+        }
+
+        server
+            .send_quota_exhausted_report(upf_seid, 0x4242, 1)
+            .await
+            .expect("the quota report must be sent");
+
+        let mut buf = vec![0u8; 4096];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                .await
+                .expect("a Session Report Request must arrive")
+                .expect("recv");
+        let triggers = report_triggers_in(&buf[..len]);
+        assert_eq!(
+            triggers[0][1] & 0x01,
+            0x01,
+            "the event-driven report must carry VOLQU"
+        );
+        // The counters survive: the harvest owns the reset.
+        let session = dp.sessions.find_by_seid(upf_seid).unwrap();
+        let urrs = session.urrs.read().unwrap();
+        assert_eq!(
+            urrs.get(&1)
+                .unwrap()
+                .acc_total_bytes
+                .load(Ordering::Relaxed),
+            500,
+            "an event-driven report must NOT reset the counters, or the volume it \
+             carries disappears from the next report"
         );
     }
 
