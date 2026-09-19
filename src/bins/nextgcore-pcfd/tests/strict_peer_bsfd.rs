@@ -425,10 +425,36 @@ async fn pcfd_updates_binding_ip_at_real_bsfd_over_http() {
 /// That is the recorded "a tested helper leaves the wiring untested" lesson, so
 /// this drives the REAL SM-policy create and update handlers and then reads the
 /// binding back out of the REAL bsfd.
+///
+/// # Why both waits share ONE deadline (#370)
+///
+/// Both effects this test waits for are produced by a **spawned** task, so they
+/// have to be polled for. The previous shape polled each with `for _ in 0..200 {
+/// .. sleep(20ms) }` — 4 s apiece — inside a 20 s `tokio::time::timeout`. That
+/// made the *inner* loops the real bound at 5× tighter than the timeout enclosing
+/// them, and on `worker_threads = 2` under `cargo test --workspace` this runtime
+/// can go unscheduled for seconds, so the test failed its final `assert_eq!` and
+/// read like a BSF wiring defect when nothing was wrong but scheduling. Measured
+/// on #370: 1 failure in 12 workspace runs, the failing group taking 4.43 s
+/// against a 0.18–0.34 s norm over 25 runs under six CPU-burning loops — i.e. the
+/// 4 s budget, not the effect, was what expired.
+///
+/// One [`Deadline`] for the whole body fixes that by construction: the two waits
+/// divide a single budget (the old shape's worst case was 8 s, neither of its two
+/// stated numbers), and no inner wait can be tighter than the bound the test is
+/// given. Note this weakens NO assertion — both `assert`s below are unchanged and
+/// still fail if the binding never registers or the update never reaches the BSF.
+/// Deliberately not a `tokio::time::timeout` around the body: a timeout cancels
+/// at an arbitrary await point and reports only "timed out", whereas a spent
+/// budget returns here and fails on the assertion that names the missing effect.
+///
+/// The budget is generous because starvation, not the work, is what it absorbs:
+/// the work takes ~0.2 s.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
 async fn sm_policy_update_wires_the_bsf_binding_update() {
     use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+    use nextgcore_sbi::test_support::{poll_until, Deadline};
     use std::time::Duration;
 
     let _guard = nextgcore_pcfd::test_support::CONTEXT_GUARD
@@ -477,6 +503,9 @@ async fn sm_policy_update_wires_the_bsf_binding_update() {
         .set_nrf_uri(format!("http://127.0.0.1:{}", nrf_addr.port()))
         .await;
 
+    // One budget for both waits below. 20 s matches the timeout this replaced.
+    let deadline = Deadline::after(Duration::from_secs(20));
+
     let run = async {
         // Create an SM policy through the REAL handler; its BSF registration is
         // spawned, so poll bsfd until the binding exists.
@@ -507,19 +536,15 @@ async fn sm_policy_update_wires_the_bsf_binding_update() {
         let sm_policy_id = body["smPolicyId"].as_str().expect("smPolicyId").to_string();
 
         // Wait for the spawned binding registration to land in the PCF context.
-        let mut binding_id = String::new();
-        for _ in 0..200 {
-            if let Some(id) = nextgcore_pcfd::context::pcf_self()
+        let binding_id = poll_until(deadline.remaining(), Duration::from_millis(20), || async {
+            nextgcore_pcfd::context::pcf_self()
                 .read()
                 .ok()
                 .and_then(|ctx| ctx.sess_find_by_sm_policy_id(&sm_policy_id))
                 .and_then(|s| s.binding.id.clone())
-            {
-                binding_id = id;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        })
+        .await
+        .unwrap_or_default();
         assert!(
             !binding_id.is_empty(),
             "the create path must register a BSF binding for this test to mean anything"
@@ -542,35 +567,32 @@ async fn sm_policy_update_wires_the_bsf_binding_update() {
 
         // The REAL bsfd must now hold the new address, put there by the handler's
         // own Nbsf_Management_Update.
-        let mut stored_ip = String::new();
-        for _ in 0..200 {
+        let stored_ip = poll_until(deadline.remaining(), Duration::from_millis(20), || async {
             // #98: discovery by UE address rather than the removed individual GET
             // (TS 29.521 defines only DELETE/PATCH there). Polling on the NEW
             // address means a hit is itself the evidence the update landed.
             let mut discover = SbiRequest::get("/nbsf-management/v1/pcfBindings");
             discover.http.set_param("ipv4Addr", "10.45.0.98");
             let resp = nextgcore_bsfd::bsf_sbi_request_handler(discover).await;
-            if resp.status == 200 {
-                let doc: serde_json::Value =
-                    serde_json::from_str(resp.http.content.as_deref().unwrap_or("null")).unwrap();
-                if let Some(ip) = doc.get("ipv4Addr").and_then(|v| v.as_str()) {
-                    stored_ip = ip.to_string();
-                    if stored_ip == "10.45.0.98" {
-                        break;
-                    }
-                }
+            if resp.status != 200 {
+                return None;
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+            let doc: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap_or("null")).unwrap();
+            doc.get("ipv4Addr")
+                .and_then(|v| v.as_str())
+                .filter(|ip| *ip == "10.45.0.98")
+                .map(str::to_string)
+        })
+        .await
+        .unwrap_or_default();
         assert_eq!(
             stored_ip, "10.45.0.98",
             "the SM policy update must reach the BSF (TS 29.513 §6); the binding \
              still advertises the old address"
         );
     };
-    tokio::time::timeout(Duration::from_secs(20), run)
-        .await
-        .expect("SM-policy-update BSF wiring timed out");
+    run.await;
 
     bsf_server.stop().await.ok();
     nrf_server.stop().await.ok();

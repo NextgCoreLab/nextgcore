@@ -6,8 +6,10 @@
 //! convention (see `nextgcore-bsfd`, `-amfd`, `-ausfd`, `-pcfd`, `-udmd`).
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use crate::server::{SbiServer, SbiServerConfig};
 
@@ -219,10 +221,93 @@ where
     (server, addr)
 }
 
+/// Poll `probe` until it yields a value or `budget` is spent, then give up and
+/// return `None` (#370).
+///
+/// # Why a budget and not an iteration count
+///
+/// The shape this replaces is `for _ in 0..200 { ...; sleep(20ms).await }` nested
+/// inside a `tokio::time::timeout(Duration::from_secs(20), ..)`. Counting
+/// iterations makes the *inner* loop the real bound — 200 × 20 ms is 4 s, five
+/// times tighter than the 20 s timeout enclosing it — so the outer timeout can
+/// never be the one that fires. The test then reports a failed assertion that
+/// reads like a wiring defect when all that happened is that a 2-worker runtime
+/// went unscheduled under `cargo test --workspace` oversubscription. Measured on
+/// #370: the failing run's group took 4.43 s against a 0.18–0.34 s norm over 25
+/// runs under six CPU-burning background loops — exactly the 4 s inner budget,
+/// so the thing that expired was patience, not the effect being waited for.
+///
+/// A budget fixes that by construction rather than by choosing a bigger count:
+/// the caller states one duration, the loop honours it whatever the tick
+/// interval, and two polls in one test share the enclosing bound instead of each
+/// silently imposing its own. Pass the budget derived from the test's outer
+/// timeout (see [`Deadline`]) so the inner wait cannot be the tighter of the two.
+///
+/// This weakens no assertion: a probe that never yields still ends the wait, and
+/// the caller still asserts on the value. It only stops a starved runtime from
+/// being reported as a missing effect.
+pub async fn poll_until<T, F, Fut>(budget: Duration, tick: Duration, mut probe: F) -> Option<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Option<T>>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        if let Some(value) = probe().await {
+            return Some(value);
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        // Never sleep past the deadline: a long tick must not extend the budget.
+        tokio::time::sleep(tick.min(deadline - now)).await;
+    }
+}
+
+/// One deadline shared by every wait in a test, so no inner poll can be tighter
+/// than the bound the test is actually given (#370).
+///
+/// Construct it once from the test's total budget and call [`Deadline::remaining`]
+/// at each [`poll_until`]. Two successive polls then divide one budget between
+/// them instead of each getting the whole of its own, which is the property the
+/// fixed-count shape lacked: `sm_policy_update_wires_the_bsf_binding_update` had
+/// *two* 4 s loops inside one 20 s timeout, so its worst case was neither 4 s nor
+/// 20 s but 8 s.
+///
+/// Prefer this to wrapping the body in `tokio::time::timeout`: a timeout that
+/// fires cancels the future at an arbitrary await point and reports only "timed
+/// out", whereas a spent budget returns to the caller, which then fails on its
+/// own assertion and says which effect never arrived.
+#[derive(Debug, Clone, Copy)]
+pub struct Deadline {
+    at: tokio::time::Instant,
+}
+
+impl Deadline {
+    /// A deadline `budget` from now.
+    pub fn after(budget: Duration) -> Self {
+        Self {
+            at: tokio::time::Instant::now() + budget,
+        }
+    }
+
+    /// What is left of the budget, saturating at zero once it is spent.
+    ///
+    /// Zero is a legitimate value to hand [`poll_until`]: the probe still runs
+    /// once, so a wait that arrives exactly at the deadline is decided on the
+    /// state of the world rather than on the clock.
+    pub fn remaining(&self) -> Duration {
+        self.at
+            .saturating_duration_since(tokio::time::Instant::now())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet as Set;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// The core guarantee: no port is ever issued twice in one process.
     #[test]
@@ -327,6 +412,98 @@ mod tests {
         drop(stream);
 
         server.stop().await.expect("stop");
+    }
+
+    /// The happy path: a probe that eventually yields ends the wait with the
+    /// value, without spending the budget.
+    #[tokio::test(start_paused = true)]
+    async fn poll_until_returns_the_first_value_a_probe_yields() {
+        let calls = AtomicUsize::new(0);
+        let got = poll_until(Duration::from_secs(20), Duration::from_millis(20), || {
+            let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+            async move { (n >= 3).then_some(n) }
+        })
+        .await;
+        assert_eq!(
+            got,
+            Some(3),
+            "the third probe yields, so the wait ends there"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "and it stops probing");
+    }
+
+    /// The budget is the bound, and it is honoured rather than approximated: a
+    /// probe that never yields must return `None` at the budget, not before and
+    /// not after.
+    #[tokio::test(start_paused = true)]
+    async fn poll_until_gives_up_at_the_budget() {
+        let start = tokio::time::Instant::now();
+        let got = poll_until(
+            Duration::from_secs(2),
+            Duration::from_millis(20),
+            || async { None::<()> },
+        )
+        .await;
+        assert_eq!(got, None, "a probe that never yields must give up");
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(2),
+            "the budget is the bound; a 20 ms tick must not overshoot it"
+        );
+    }
+
+    /// A tick longer than the remaining budget must be clamped, not slept in
+    /// full. This is the regression guard for the defect the whole helper exists
+    /// to remove -- a wait whose real bound is its own tick arithmetic rather than
+    /// the budget it was given.
+    #[tokio::test(start_paused = true)]
+    async fn a_tick_longer_than_the_budget_does_not_extend_it() {
+        let start = tokio::time::Instant::now();
+        let got = poll_until(
+            Duration::from_millis(50),
+            Duration::from_secs(30),
+            || async { None::<()> },
+        )
+        .await;
+        assert_eq!(got, None);
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_millis(50),
+            "a 30 s tick inside a 50 ms budget must be clamped to the budget"
+        );
+    }
+
+    /// The property the fixed-count shape lacked (#370): two successive waits
+    /// DIVIDE one budget instead of each taking the whole of its own, so the
+    /// worst case is the budget and not a multiple of it.
+    #[tokio::test(start_paused = true)]
+    async fn two_waits_on_one_deadline_share_the_budget() {
+        let start = tokio::time::Instant::now();
+        let deadline = Deadline::after(Duration::from_secs(4));
+
+        let first = poll_until(deadline.remaining(), Duration::from_millis(20), || async {
+            None::<()>
+        })
+        .await;
+        assert_eq!(first, None);
+        assert_eq!(
+            deadline.remaining(),
+            Duration::ZERO,
+            "the first wait spent it"
+        );
+
+        // The second wait still probes once -- a deadline that has just expired
+        // decides on the state of the world, not on the clock.
+        let second = poll_until(deadline.remaining(), Duration::from_millis(20), || async {
+            Some(7)
+        })
+        .await;
+        assert_eq!(second, Some(7));
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_secs(4),
+            "two waits on one deadline total the budget, not twice it"
+        );
     }
 
     /// A placeholder address in the config is replaced by the listener's real
