@@ -59,6 +59,11 @@ criterion = "0.8.2"
 proptest.workspace = true
 # Test-only: generate a self-signed cert for the in-memory TLS exporter test.
 rcgen = "0.13"
+# Test-only: `start_paused` runtimes, so the `poll_until` budget tests assert an
+# EXACT elapsed time instead of a tolerance window (#370). Not in the `full`
+# feature set; dev-only, so no production build gains a time-mocking clock.
+# Precedent: nextgcore-core enables the same feature.
+tokio = { workspace = true, features = ["full", "test-util"] }
 
 [lints]
 workspace = true
