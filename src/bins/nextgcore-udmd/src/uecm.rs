@@ -1817,9 +1817,12 @@ mod tests {
             .ran_ue_add(900_400, ran_ue_ngap_id)
             .expect("ran_ue_add");
         let ue = guard.amf_ue_add(ran.id).expect("amf_ue_add");
-        guard.amf_ue_set_supi(ue.id, supi);
         let mut ue = ue;
         ue.supi = Some(supi.to_string());
+        // #341: publish into amfd's LIVE UE store, which is what its Namf handlers
+        // resolve against now. `amf_ue_set_supi` wrote a SUPI index nothing in
+        // production ever wrote -- the defect #341 removed.
+        guard.amf_ue_publish(&ue, ran_ue_ngap_id as u32, 900_400);
         guard.amf_ue_update(&ue);
         ue.id
     }

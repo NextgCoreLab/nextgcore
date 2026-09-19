@@ -6464,8 +6464,13 @@ mod positioning_chain_strict_peer {
         let _ = g.positioning_dl_drain();
         let ngap_id = NEXT_NGAP_ID.fetch_add(1, Ordering::SeqCst);
         let ran_ue = g.ran_ue_add(900_100, ngap_id).expect("ran_ue_add");
-        let ue = g.amf_ue_add(ran_ue.id).expect("amf_ue_add");
-        g.amf_ue_set_supi(ue.id, supi);
+        let mut ue = g.amf_ue_add(ran_ue.id).expect("amf_ue_add");
+        // #341: published into amfd's LIVE UE store, which is what its Namf
+        // handlers now resolve against. `amf_ue_set_supi` wrote a SUPI index that
+        // only tests ever wrote, which is the defect #341 removed.
+        ue.supi = Some(supi.to_string());
+        g.amf_ue_publish(&ue, ngap_id as u32, 900_100);
+        g.amf_ue_update(&ue);
         g.amf_ue_associate_ran_ue(ue.id, ran_ue.id);
     }
 
@@ -6476,8 +6481,13 @@ mod positioning_chain_strict_peer {
         let ctx = amf_self();
         let g = ctx.read().expect("amf ctx");
         let _ = g.positioning_dl_drain();
-        let ue = g.amf_ue_add(NEXTGCORE_INVALID_POOL_ID).expect("amf_ue_add");
-        g.amf_ue_set_supi(ue.id, supi);
+        let mut ue = g.amf_ue_add(NEXTGCORE_INVALID_POOL_ID).expect("amf_ue_add");
+        // #341: see `seed_amf_connected_ue`. `ran_ue_id` stays invalid, which is
+        // what makes this UE CM-IDLE and the relay fail closed with 504.
+        ue.supi = Some(supi.to_string());
+        ue.ran_ue_id = NEXTGCORE_INVALID_POOL_ID;
+        g.amf_ue_publish(&ue, 0, 0);
+        g.amf_ue_update(&ue);
     }
 
     /// Prime lmfd's own identity + notify-callback base so `initiate_positioning`

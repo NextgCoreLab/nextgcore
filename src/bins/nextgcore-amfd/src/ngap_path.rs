@@ -414,9 +414,15 @@ struct Reachability {
 /// built by gmm_build and protected by nas_security — there is no inline
 /// plain-NAS path.
 #[derive(Debug, Clone)]
-struct UeNasContext {
-    /// Full AMF UE context (security keys, capabilities, GUTI, NSSAI)
-    amf_ue: AmfUe,
+pub struct UeNasContext {
+    /// Full AMF UE context (security keys, capabilities, GUTI, NSSAI).
+    ///
+    /// `pub(crate)` so `AmfContext::amf_ue_update` can write THROUGH to the live
+    /// store (#341): a Namf handler that mutated a UE and stored it only in
+    /// `amf_ue_list` would not see its own change on the next resolve. The rest of
+    /// the record stays private -- the NAS/registration fields belong to this
+    /// module's state machine, not to the SBI layer.
+    pub(crate) amf_ue: AmfUe,
     /// AUSF auth context ID (for 5G-AKA confirmation)
     auth_ctx_id: String,
     /// RAN UE NGAP ID (for building DL NAS Transport)
@@ -468,6 +474,42 @@ struct UeNasContext {
     /// belongs to is created later in the procedure, and because it must survive the
     /// authentication round trips in between.
     ue_policy_container: Option<Vec<u8>>,
+}
+
+impl UeNasContext {
+    /// Publish an `AmfUe` into the live store as a registered UE (#341).
+    ///
+    /// The seam the Namf surface needs: before #341 a UE existed in
+    /// `AmfContext::amf_ue_list` (which only tests wrote) and the SBI handlers
+    /// resolved against that, so nothing a test seeded there was reachable from
+    /// the live store and nothing the NGAP path registered was reachable from the
+    /// handlers. One store means one publish path, and this is it.
+    ///
+    /// `registered` is set because a caller publishing a full `AmfUe` is
+    /// describing a UE that has completed registration -- an unregistered UE has
+    /// no SUPI to resolve by, which is the whole point of the derived resolvers.
+    pub fn published(amf_ue: AmfUe, ran_ue_ngap_id: u32, association_id: u64) -> Self {
+        let mut ctx = Self::new(
+            amf_ue.id,
+            ran_ue_ngap_id,
+            association_id,
+            amf_ue.use_nextgcore_nas_security,
+        );
+        ctx.suci = amf_ue.suci.clone().unwrap_or_default();
+        ctx.amf_ue = amf_ue;
+        ctx.registered = true;
+        ctx
+    }
+}
+
+impl crate::ue_store::UeIdentity for UeNasContext {
+    fn amf_ue(&self) -> &AmfUe {
+        &self.amf_ue
+    }
+
+    fn ran_ue_ngap_id(&self) -> u32 {
+        self.ran_ue_ngap_id
+    }
 }
 
 impl UeNasContext {
@@ -537,8 +579,22 @@ pub struct NgapServer {
     event_tx: mpsc::Sender<AmfEvent>,
     /// Server event receiver
     server_event_rx: mpsc::UnboundedReceiver<ServerEvent>,
-    /// Per-UE NAS/registration state (keyed by AMF-UE-NGAP-ID)
-    ue_auth_state: HashMap<u64, UeNasContext>,
+    /// The one authoritative live-UE store, keyed by AMF-UE-NGAP-ID (#341).
+    ///
+    /// Shared with [`crate::context::AmfContext`] rather than owned here: this map
+    /// used to be a private `HashMap` on this struct, which the whole NGAP
+    /// registration path wrote and only this receive loop read, while every Namf
+    /// SBI handler resolved against a SECOND set of collections in the context
+    /// that only tests ever wrote. Production reader, test-only writer -- so a UE
+    /// that had really registered got `404 CONTEXT_NOT_FOUND` from
+    /// N1N2MessageTransfer, EnableUeReachability, ProvideDomainSelectionInfo and
+    /// per-UE EventExposure. One `Arc` to one store is what makes those answer.
+    ///
+    /// Accessed only through [`crate::ue_store::UeStore`]'s methods, none of which
+    /// hands out a guard: the lock is `std::sync::RwLock`, so a guard held across
+    /// an `.await` would not compile, and a closure that re-entered the store
+    /// would deadlock without failing to compile. See that module's docs.
+    ue_auth_state: std::sync::Arc<crate::ue_store::UeStore<UeNasContext>>,
     /// SM context reference the SMF returned from Nsmf_PDUSession_CreateSMContext,
     /// keyed by (AMF-UE-NGAP-ID, PSI).
     ///
@@ -628,7 +684,10 @@ impl NgapServer {
             next_gnb_id: Arc::new(Mutex::new(1)),
             event_tx,
             server_event_rx,
-            ue_auth_state: HashMap::new(),
+            ue_auth_state: crate::context::amf_self()
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .ue_store(),
             sm_context_refs: HashMap::new(),
             handover_target_assoc: HashMap::new(),
             handover_target_transfers: HashMap::new(),
@@ -1335,9 +1394,14 @@ impl NgapServer {
             ResetType::NgInterface => {
                 let affected: Vec<u64> = self
                     .ue_auth_state
-                    .iter()
+                    // `snapshot` and not `iter`: the loop below calls `forget_ue`,
+                    // which re-enters the store, so a live guard here would
+                    // DEADLOCK -- and unlike a guard crossing an `.await`, that
+                    // does not fail to compile. See `ue_store`'s module docs.
+                    .snapshot()
+                    .into_iter()
                     .filter(|(_, state)| state.association_id == association_id)
-                    .map(|(amf_ue_ngap_id, _)| *amf_ue_ngap_id)
+                    .map(|(amf_ue_ngap_id, _)| amf_ue_ngap_id)
                     .collect();
                 for amf_ue_ngap_id in affected {
                     self.forget_ue(amf_ue_ngap_id);
@@ -1593,7 +1657,7 @@ impl NgapServer {
             ul_nas.nas_pdu.clone()
         } else {
             // Security-protected: decode with the UE's NAS security context
-            let Some(mut state) = self.ue_auth_state.remove(&ul_nas.amf_ue_ngap_id) else {
+            let Some(mut state) = self.ue_auth_state.remove(ul_nas.amf_ue_ngap_id) else {
                 log::warn!(
                     "Protected NAS from unknown UE {} discarded",
                     ul_nas.amf_ue_ngap_id
@@ -1708,7 +1772,7 @@ impl NgapServer {
                 .await?;
             }
             message_type::REGISTRATION_COMPLETE => {
-                if let Some(state) = self.ue_auth_state.get_mut(&ul_nas.amf_ue_ngap_id) {
+                self.ue_auth_state.with_mut(ul_nas.amf_ue_ngap_id, |state| {
                     if matches!(
                         state.retx,
                         Some(NasRetx {
@@ -1726,14 +1790,14 @@ impl NgapServer {
                         state.suci,
                         state.amf_ue.current_guti.tmsi
                     );
-                }
+                });
             }
             message_type::CONFIGURATION_UPDATE_COMPLETE => {
                 // TS 24.501 §5.4.4.3: the COMPLETE stops T3555 and the procedure is
                 // finished. Before this the type had no arm at all, so a conformant
                 // UE's acknowledgement was logged as "Unhandled 5GMM message type
                 // 0x55" and the AMF retransmitted the command four more times.
-                if let Some(state) = self.ue_auth_state.get_mut(&ul_nas.amf_ue_ngap_id) {
+                self.ue_auth_state.with_mut(ul_nas.amf_ue_ngap_id, |state| {
                     let was_pending = matches!(
                         state.retx,
                         Some(NasRetx {
@@ -1764,7 +1828,7 @@ impl NgapServer {
                             ul_nas.amf_ue_ngap_id
                         );
                     }
-                }
+                });
             }
             message_type::SERVICE_REQUEST => {
                 self.handle_service_request_nas(
@@ -1868,47 +1932,64 @@ impl NgapServer {
             report.flight_status
         );
 
-        let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) else {
-            log::warn!("UAV tracking report from unknown UE {amf_ue_ngap_id}; discarding");
-            return;
-        };
-        let Some(uav) = state.amf_ue.uav_auth.as_mut() else {
-            log::warn!(
-                "UAV tracking report from UE {amf_ue_ngap_id} that is not UAV-authorized; \
-                 discarding (no UAV authorization context)"
-            );
-            return;
-        };
-
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(report.timestamp);
 
-        // Geofence check via the NGAP-layer UAV handler: returns true when the
-        // position is within bounds and still authorized (allow), false on an
-        // altitude/area violation or expired authorization (deny).
-        let allowed = crate::ngap_handler::handle_uav_tracking_report(uav, &report, now);
-        if allowed {
-            log::info!(
-                "[UAV Tracking] Geofence ALLOW: UAV {} at ({:.6}, {:.6}) alt={:.1}m within bounds",
-                report.uav_id,
-                report.latitude,
-                report.longitude,
-                report.altitude
-            );
-        } else {
-            log::warn!(
-                "[UAV Tracking] Geofence DENY: UAV {} at ({:.6}, {:.6}) alt={:.1}m violates \
-                 flight authorization; revoking",
-                report.uav_id,
-                report.latitude,
-                report.longitude,
-                report.altitude
-            );
-            uav.revoke_authorization("geofence violation");
-            // TS 23.256: a real deployment would notify the USS/UTM and PCF of
-            // the withdrawn authorization here (documented stub).
+        // The whole decision runs inside `with_mut`, because the geofence check
+        // MUTATES the UAV authorization on a violation: checking under one lock
+        // acquisition and revoking under another would let a concurrent update
+        // land in between. Nothing in here `.await`s, so holding the write lock
+        // for the duration is safe -- and `with_mut` taking a plain closure is
+        // what makes that structural rather than something to remember.
+        let revoked = self
+            .ue_auth_state
+            .with_mut(amf_ue_ngap_id, |state| {
+                let Some(uav) = state.amf_ue.uav_auth.as_mut() else {
+                    log::warn!(
+                        "UAV tracking report from UE {amf_ue_ngap_id} that is not \
+                         UAV-authorized; discarding (no UAV authorization context)"
+                    );
+                    return false;
+                };
+
+                // Geofence check via the NGAP-layer UAV handler: returns true when the
+                // position is within bounds and still authorized (allow), false on an
+                // altitude/area violation or expired authorization (deny).
+                let allowed = crate::ngap_handler::handle_uav_tracking_report(uav, &report, now);
+                if allowed {
+                    log::info!(
+                        "[UAV Tracking] Geofence ALLOW: UAV {} at ({:.6}, {:.6}) alt={:.1}m \
+                         within bounds",
+                        report.uav_id,
+                        report.latitude,
+                        report.longitude,
+                        report.altitude
+                    );
+                    return false;
+                }
+                log::warn!(
+                    "[UAV Tracking] Geofence DENY: UAV {} at ({:.6}, {:.6}) alt={:.1}m violates \
+                     flight authorization; revoking",
+                    report.uav_id,
+                    report.latitude,
+                    report.longitude,
+                    report.altitude
+                );
+                uav.revoke_authorization("geofence violation");
+                true
+            })
+            .unwrap_or_else(|| {
+                log::warn!("UAV tracking report from unknown UE {amf_ue_ngap_id}; discarding");
+                false
+            });
+
+        if revoked {
+            // TS 23.256: a real deployment would notify the USS/UTM and PCF of the
+            // withdrawn authorization here (documented stub). Outside `with_mut`
+            // so the store lock is not held across the notification, which is the
+            // shape that would matter once this stops being a stub.
             notify_uss_authorization(&report.uav_id, "REVOKED");
         }
     }
@@ -2003,7 +2084,7 @@ impl NgapServer {
         if req.registration_type == crate::gmm_build::registration_type::EMERGENCY {
             let has_supi = self
                 .ue_auth_state
-                .get(&amf_ue_ngap_id)
+                .get(amf_ue_ngap_id)
                 .and_then(|s| s.amf_ue.supi.clone())
                 .is_some()
                 || req.suci.is_some();
@@ -2030,7 +2111,7 @@ impl NgapServer {
 
         // Periodic registration updating with live security context: refresh
         if req.registration_type == crate::gmm_build::registration_type::PERIODIC_UPDATING {
-            if let Some(state) = self.ue_auth_state.get(&amf_ue_ngap_id) {
+            if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
                 if state.amf_ue.security_context_available && state.registered {
                     log::info!("Periodic Registration Update from UE {amf_ue_ngap_id}");
                     self.send_registration_accept(association_id, amf_ue_ngap_id, ran_ue_ngap_id)
@@ -2047,7 +2128,7 @@ impl NgapServer {
             return Ok(());
         }
 
-        let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) else {
+        let Some(mut state) = self.ue_auth_state.get(amf_ue_ngap_id) else {
             // Mobility update on an unknown UE: reject so it re-registers
             let reject = gmm_build::build_registration_reject(
                 GmmCause::UeIdentityCannotBeDerivedByTheNetwork,
@@ -2290,7 +2371,7 @@ impl NgapServer {
         ran_ue_ngap_id: u32,
         resync: Option<([u8; 16], [u8; 14])>,
     ) -> Result<()> {
-        let Some(mut state) = self.ue_auth_state.remove(&amf_ue_ngap_id) else {
+        let Some(mut state) = self.ue_auth_state.remove(amf_ue_ngap_id) else {
             return Ok(());
         };
 
@@ -2404,7 +2485,7 @@ impl NgapServer {
             return Ok(());
         };
 
-        let Some(mut state) = self.ue_auth_state.remove(&amf_ue_ngap_id) else {
+        let Some(mut state) = self.ue_auth_state.remove(amf_ue_ngap_id) else {
             log::warn!("Authentication Response for unknown UE {amf_ue_ngap_id}");
             return Ok(());
         };
@@ -2712,20 +2793,20 @@ impl NgapServer {
             pos += 1;
         }
 
-        let (failure_count, rand) = match self.ue_auth_state.get_mut(&amf_ue_ngap_id) {
-            Some(state) => {
-                state.auth_failure_count += 1;
-                if matches!(
-                    state.retx,
-                    Some(NasRetx {
-                        timer: NasProcTimer::T3560,
-                        ..
-                    })
-                ) {
-                    state.retx = None;
-                }
-                (state.auth_failure_count, state.amf_ue.rand)
+        let (failure_count, rand) = match self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
+            state.auth_failure_count += 1;
+            if matches!(
+                state.retx,
+                Some(NasRetx {
+                    timer: NasProcTimer::T3560,
+                    ..
+                })
+            ) {
+                state.retx = None;
             }
+            (state.auth_failure_count, state.amf_ue.rand)
+        }) {
+            Some(counted) => counted,
             None => return Ok(()),
         };
 
@@ -2809,27 +2890,37 @@ impl NgapServer {
         let content = &nas[5..5 + id_len];
         let id_type = content[0] & 0x07;
 
-        let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) else {
-            return Ok(());
-        };
-        // Stop T3570
-        if matches!(
-            state.retx,
-            Some(NasRetx {
-                timer: NasProcTimer::T3570,
-                ..
+        // Stop T3570. Persisted through `with_mut` before anything below `.await`s:
+        // the identity the UE just supplied is read by `start_authentication` and
+        // `complete_registration`, so a mutation dropped with a clone would send
+        // the AMF to the AUSF with no SUCI at all.
+        if self
+            .ue_auth_state
+            .with_mut(amf_ue_ngap_id, |state| {
+                if matches!(
+                    state.retx,
+                    Some(NasRetx {
+                        timer: NasProcTimer::T3570,
+                        ..
+                    })
+                ) {
+                    state.retx = None;
+                }
             })
-        ) {
-            state.retx = None;
+            .is_none()
+        {
+            return Ok(());
         }
 
         match id_type {
             t if t == mobile_identity_type::SUCI => {
                 if let Some((suci, plmn)) = parse_suci_identity(content) {
                     log::info!("Identity Response: SUCI {suci}");
-                    state.suci = suci.clone();
-                    state.amf_ue.suci = Some(suci);
-                    state.amf_ue.home_plmn_id = plmn;
+                    self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
+                        state.suci = suci.clone();
+                        state.amf_ue.suci = Some(suci);
+                        state.amf_ue.home_plmn_id = plmn;
+                    });
                     self.start_authentication(association_id, amf_ue_ngap_id, ran_ue_ngap_id, None)
                         .await?;
                 } else {
@@ -2840,8 +2931,10 @@ impl NgapServer {
                 match decode_pei(content) {
                     Some((pei, digits)) => {
                         log::info!("Identity Response: PEI {pei}");
-                        state.amf_ue.pei = Some(pei);
-                        state.amf_ue.imeisv = Some(digits);
+                        self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
+                            state.amf_ue.pei = Some(pei);
+                            state.amf_ue.imeisv = Some(digits);
+                        });
                     }
                     None => {
                         // Record no PEI rather than one that breaks the
@@ -2853,8 +2946,17 @@ impl NgapServer {
                         );
                     }
                 }
-                if state.pei_requested {
-                    state.pei_requested = false;
+                // Clearing the flag and reading it are one acquisition, so the
+                // registration cannot be completed twice if this arm is re-entered.
+                let was_requested = self
+                    .ue_auth_state
+                    .with_mut(amf_ue_ngap_id, |state| {
+                        let requested = state.pei_requested;
+                        state.pei_requested = false;
+                        requested
+                    })
+                    .unwrap_or(false);
+                if was_requested {
                     self.complete_registration(association_id, amf_ue_ngap_id, ran_ue_ngap_id)
                         .await?;
                 }
@@ -2896,7 +2998,7 @@ impl NgapServer {
                 if let Some(replayed_caps) = inner.sec_cap {
                     let stored = self
                         .ue_auth_state
-                        .get(&amf_ue_ngap_id)
+                        .get(amf_ue_ngap_id)
                         .map(|s| s.amf_ue.ue_security_capability.clone());
                     if let Some(stored) = stored {
                         if replayed_caps.ea != stored.ea
@@ -2975,7 +3077,7 @@ impl NgapServer {
 
         let mut need_pei = false;
         {
-            let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) else {
+            let Some(mut state) = self.ue_auth_state.get(amf_ue_ngap_id) else {
                 return Ok(());
             };
             // Populate the Requested NSSAI from the integrity-protected replay
@@ -3057,7 +3159,7 @@ impl NgapServer {
         amf_ue_ngap_id: u64,
         ran_ue_ngap_id: u32,
     ) -> Result<()> {
-        let Some(mut state) = self.ue_auth_state.remove(&amf_ue_ngap_id) else {
+        let Some(mut state) = self.ue_auth_state.remove(amf_ue_ngap_id) else {
             return Ok(());
         };
 
@@ -3369,7 +3471,7 @@ impl NgapServer {
         amf_ue_ngap_id: u64,
         ran_ue_ngap_id: u32,
     ) -> Result<()> {
-        let Some(mut state) = self.ue_auth_state.remove(&amf_ue_ngap_id) else {
+        let Some(mut state) = self.ue_auth_state.remove(amf_ue_ngap_id) else {
             return Ok(());
         };
 
@@ -3404,9 +3506,9 @@ impl NgapServer {
                  {amf_ue_ngap_id} (5G-TMSI=0x{tmsi:08x})"
             );
             // #91: AFTER the Accept is on the wire, never before.
-            if let Some(s) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) {
+            self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
                 s.registration_accept_sent = true;
-            }
+            });
             let _ = self.create_ue_policy_association(amf_ue_ngap_id).await;
             return Ok(());
         }
@@ -3486,9 +3588,9 @@ impl NgapServer {
         // #91: the Registration Accept rides this ICS, so it has now egressed and the
         // UE policy association -- whose creation triggers the PCF's DL MANAGE UE
         // POLICY COMMAND -- may safely be created.
-        if let Some(s) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) {
+        self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
             s.registration_accept_sent = true;
-        }
+        });
         let _ = self.create_ue_policy_association(amf_ue_ngap_id).await;
         Ok(())
     }
@@ -3511,7 +3613,7 @@ impl NgapServer {
         if !crate::sbi_path::ue_policy_assoc_enabled() {
             return UePolicyCreate::Skipped("kill-switch off");
         }
-        let Some(state) = self.ue_auth_state.get(&amf_ue_ngap_id) else {
+        let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) else {
             return UePolicyCreate::Skipped("no UE context");
         };
         // The ordering invariant, enforced rather than assumed.
@@ -3544,7 +3646,7 @@ impl NgapServer {
                 None => {
                     let fallback = self
                         .ue_auth_state
-                        .get(&amf_ue_ngap_id)
+                        .get(amf_ue_ngap_id)
                         .map(|s| s.amf_ue.nr_tai.plmn_id.clone())
                         .unwrap_or_default();
                     (fallback, 2, 1, 0)
@@ -3589,10 +3691,10 @@ impl NgapServer {
                         "absent"
                     }
                 );
-                if let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) {
+                self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
                     state.ue_policy_association_id = Some(assoc.clone());
                     state.amf_ue.ue_policy_association.id = Some(assoc);
-                }
+                });
             }
             Err(e) => log::warn!(
                 "[{supi}] Npcf_UEPolicyControl_Create failed \
@@ -3615,7 +3717,7 @@ impl NgapServer {
 
         let has_context = self
             .ue_auth_state
-            .get(&amf_ue_ngap_id)
+            .get(amf_ue_ngap_id)
             .map(|s| s.amf_ue.security_context_available && s.registered)
             .unwrap_or(false);
 
@@ -3631,7 +3733,7 @@ impl NgapServer {
         }
 
         // PDU session status (IEI 0x50, TLV) if present
-        if let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) {
+        self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
             let mut pos = 4;
             state.amf_ue.pdu_session_status_present = false;
             while pos + 1 < nas.len() {
@@ -3646,10 +3748,10 @@ impl NgapServer {
                 }
                 pos += 1;
             }
-        }
+        });
 
         let plain = {
-            let state = self.ue_auth_state.get(&amf_ue_ngap_id).expect("checked");
+            let state = self.ue_auth_state.get(amf_ue_ngap_id).expect("checked");
             gmm_build::build_service_accept(&state.amf_ue).unwrap_or_default()
         };
         let Some(protected) = self.protect_nas(amf_ue_ngap_id, &plain) else {
@@ -3720,8 +3822,12 @@ impl NgapServer {
     /// context (a UCU is integrity protected, so without one there is nothing to protect
     /// it with).
     fn build_guti_reallocation_command(&mut self, amf_ue_ngap_id: u64) -> Option<Vec<u8>> {
-        {
-            let state = self.ue_auth_state.get_mut(&amf_ue_ngap_id)?;
+        // `with_mut`: `generate_new_guti` allocates the next 5G-TMSI onto the UE's
+        // context, and that allocation must persist or the COMPLETE the UE returns
+        // would be matched against a `next_guti` the AMF no longer holds -- the UE
+        // would adopt an identity the network had forgotten. Await-free, so the
+        // lock is held only for the build.
+        self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
             if !state.registered || !state.amf_ue.security_context_available {
                 return None;
             }
@@ -3741,7 +3847,7 @@ impl NgapServer {
                 ..Default::default()
             };
             gmm_build::build_configuration_update_command(&state.amf_ue, &param)
-        }
+        })?
     }
 
     /// Apply the TS 24.501 §4.4.4.3 integrity-check-failure exceptions.
@@ -3777,7 +3883,7 @@ impl NgapServer {
         let msg_type = plain.get(2).copied().unwrap_or(0);
         let has_context = self
             .ue_auth_state
-            .get(&amf_ue_ngap_id)
+            .get(amf_ue_ngap_id)
             .is_some_and(|s| s.amf_ue.security_context_available);
 
         match integrity_failure_action(msg_type, has_context) {
@@ -3823,13 +3929,16 @@ impl NgapServer {
     /// The SERVICE REJECT the §4.4.4.3 exception sends: 5GMM cause #9, plain, because the
     /// security context that would have protected it is the one that just failed.
     fn integrity_failure_service_reject(&self, amf_ue_ngap_id: u64) -> Vec<u8> {
-        let default_ue = crate::context::AmfUe::default();
+        // Owned rather than borrowed: the store hands out a CLONE, not a guard
+        // (#341), so there is nothing left to borrow from once the lock is
+        // released. `unwrap_or_default` replaces the previous local-plus-reference
+        // dance.
         let amf_ue = self
             .ue_auth_state
-            .get(&amf_ue_ngap_id)
-            .map(|s| &s.amf_ue)
-            .unwrap_or(&default_ue);
-        gmm_build::build_service_reject(amf_ue, GmmCause::UeIdentityCannotBeDerivedByTheNetwork)
+            .get(amf_ue_ngap_id)
+            .map(|s| s.amf_ue)
+            .unwrap_or_default();
+        gmm_build::build_service_reject(&amf_ue, GmmCause::UeIdentityCannotBeDerivedByTheNetwork)
     }
 
     /// Handle UE-initiated Deregistration Request (TS 24.501 Section 5.5.2.2):
@@ -3852,7 +3961,7 @@ impl NgapServer {
         self.release_all_pdu_sessions(amf_ue_ngap_id).await;
 
         // Purge the AMF registration at UDM
-        if let Some(state) = self.ue_auth_state.get(&amf_ue_ngap_id) {
+        if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
             if let Some(supi) = state.amf_ue.supi.clone() {
                 let (udm_host, udm_port) = crate::sbi_path::resolve_nf_endpoint_async(
                     crate::sbi_path::SbiServiceType::NudmUecm,
@@ -3898,7 +4007,7 @@ impl NgapServer {
         // with AMF_UE_POLICY_ASSOC=off the deregistration flow is unchanged).
         if let Some(pol_asso_id) = self
             .ue_auth_state
-            .get(&amf_ue_ngap_id)
+            .get(amf_ue_ngap_id)
             .and_then(|s| s.ue_policy_association_id.clone())
         {
             tokio::spawn(async move {
@@ -3936,13 +4045,13 @@ impl NgapServer {
         // reached the AMF is leaked for the life of the process.
         if let Some(supi) = self
             .ue_auth_state
-            .get(&amf_ue_ngap_id)
+            .get(amf_ue_ngap_id)
             .and_then(|s| s.amf_ue.supi.clone())
         {
             crate::namf_server::release_all_ebis_on_deregistration(&supi);
         }
 
-        self.ue_auth_state.remove(&amf_ue_ngap_id);
+        self.ue_auth_state.remove(amf_ue_ngap_id);
         // Cause: NAS deregister (TS 38.413 Section 9.3.1.2, CauseNas value 2)
         self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 2)
             .await
@@ -3959,7 +4068,7 @@ impl NgapServer {
         reregistration_required: bool,
         gmm_cause: Option<GmmCause>,
     ) -> Result<()> {
-        let Some(state) = self.ue_auth_state.get(&amf_ue_ngap_id) else {
+        let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) else {
             return Err(anyhow::anyhow!("UE {amf_ue_ngap_id} not found"));
         };
         let association_id = state.association_id;
@@ -4043,13 +4152,16 @@ impl NgapServer {
             ..Default::default()
         };
 
-        // Parse/validate via the GMM handler
-        let action = {
-            let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) else {
-                return Ok(());
-            };
+        // Parse/validate via the GMM handler, through `with_mut` because
+        // `handle_ul_nas_transport` takes `&mut AmfUe` and records what it parsed
+        // (the PDU session id and its request type) onto the context. Mutating a
+        // clone and dropping it would leave the AMF routing a 5GSM message for a
+        // session it has no record of. Await-free.
+        let Some(action) = self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
             let ran_ue = crate::context::RanUe::default();
             crate::gmm_handler::handle_ul_nas_transport(&mut state.amf_ue, &ran_ue, &transport)
+        }) else {
+            return Ok(());
         };
 
         match action {
@@ -4134,7 +4246,7 @@ impl NgapServer {
         // as fallback), mirroring the uplink NRPPa relay.
         let supi = self
             .ue_auth_state
-            .get(&amf_ue_ngap_id)
+            .get(amf_ue_ngap_id)
             .and_then(|s| s.amf_ue.supi.clone())
             .or_else(|| {
                 crate::context::amf_self()
@@ -4230,7 +4342,7 @@ impl NgapServer {
         // key, mirroring the uplink LPP relay.
         let supi = self
             .ue_auth_state
-            .get(&amf_ue_ngap_id)
+            .get(amf_ue_ngap_id)
             .and_then(|s| s.amf_ue.supi.clone())
             .or_else(|| {
                 crate::context::amf_self()
@@ -4326,7 +4438,7 @@ impl NgapServer {
                 // S-NSSAI/DNN: from the UE's allowed slice when known
                 let (sst, sd) = self
                     .ue_auth_state
-                    .get(&amf_ue_ngap_id)
+                    .get(amf_ue_ngap_id)
                     .and_then(|s| s.amf_ue.allowed_nssai.first().map(|n| (n.sst, n.sd)))
                     .unwrap_or((1, None));
                 // DNN from the UE's UL NAS Transport DNN IE (e.g. "xr" for an XR
@@ -4348,7 +4460,7 @@ impl NgapServer {
                 // it can apply a reduced session-AMBR (Rel-17, TS 38.101).
                 let redcap_indication = self
                     .ue_auth_state
-                    .get(&amf_ue_ngap_id)
+                    .get(amf_ue_ngap_id)
                     .map(|s| s.amf_ue.redcap_indication)
                     .unwrap_or(false);
 
@@ -4359,8 +4471,11 @@ impl NgapServer {
                 let identity = {
                     let ctx = crate::context::amf_self();
                     let guard = ctx.read().ok();
+                    // Bound first: the store returns an owned clone, and the
+                    // builder borrows it (#341).
+                    let ue = self.ue_auth_state.get(amf_ue_ngap_id);
                     build_sm_context_identity(
-                        self.ue_auth_state.get(&amf_ue_ngap_id),
+                        ue.as_ref(),
                         guard.as_ref().and_then(|c| c.served_guami.first()),
                     )
                 };
@@ -4455,7 +4570,7 @@ impl NgapServer {
                         // gNB has no KgNB/DRBs to attach the session to.
                         let ics_done = self
                             .ue_auth_state
-                            .get(&amf_ue_ngap_id)
+                            .get(amf_ue_ngap_id)
                             .map(|s| s.initial_context_setup_response_received)
                             .unwrap_or(false);
                         if !ics_done {
@@ -4731,7 +4846,7 @@ impl NgapServer {
             // the immutable borrow is released before the &mut send calls).
             let Some((association_id, ran_ue_ngap_id)) = self
                 .ue_auth_state
-                .get(&item.amf_ue_ngap_id)
+                .get(item.amf_ue_ngap_id)
                 .map(|s| (s.association_id, s.ran_ue_ngap_id))
             else {
                 log::warn!(
@@ -4865,7 +4980,7 @@ impl NgapServer {
         // server's own per-UE state first, the shared AMF context as fallback.
         let supi = self
             .ue_auth_state
-            .get(&amf_ue_ngap_id)
+            .get(amf_ue_ngap_id)
             .and_then(|s| s.amf_ue.supi.clone())
             .or_else(|| {
                 crate::context::amf_self()
@@ -5003,15 +5118,22 @@ impl NgapServer {
     /// Protect a plain inner NAS message with the UE's security context
     /// (integrity protected + ciphered). Returns None without a context.
     fn protect_nas(&mut self, amf_ue_ngap_id: u64, plain: &[u8]) -> Option<Vec<u8>> {
-        let state = self.ue_auth_state.get_mut(&amf_ue_ngap_id)?;
-        if !state.amf_ue.security_context_available {
-            return None;
-        }
-        nas_security::nas_5gs_security_encode(
-            &mut state.amf_ue,
-            plain,
-            security_header::INTEGRITY_PROTECTED_AND_CIPHERED,
-        )
+        // `with_mut`, NOT get-a-clone-and-mutate-it: `nas_5gs_security_encode`
+        // INCREMENTS the downlink NAS COUNT, and that increment has to persist. A
+        // mutation dropped with a clone would protect every downlink message with
+        // the same COUNT, which TS 33.501 §6.4.3.1 forbids precisely because it
+        // makes the keystream reusable. Nothing in the closure `.await`s, so the
+        // write lock is held only across the encode itself.
+        self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
+            if !state.amf_ue.security_context_available {
+                return None;
+            }
+            nas_security::nas_5gs_security_encode(
+                &mut state.amf_ue,
+                plain,
+                security_header::INTEGRITY_PROTECTED_AND_CIPHERED,
+            )
+        })?
     }
 
     /// Build a Downlink NAS Transport NGAP PDU and send it.
@@ -5041,17 +5163,17 @@ impl NgapServer {
             &self.timer_configs,
             duration,
             self.ue_auth_state
-                .get(&amf_ue_ngap_id)
+                .get(amf_ue_ngap_id)
                 .and_then(|s| s.amf_ue.ntn_timing_advance),
         );
-        if let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) {
+        self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
             state.retx = Some(NasRetx {
                 timer,
                 deadline: Instant::now() + duration,
                 retries: 0,
                 ngap_pdu,
             });
-        }
+        });
     }
 
     /// The T3346 back-off to impose, or `None` when the AMF is not congested.
@@ -5121,30 +5243,36 @@ impl NgapServer {
             Some(amf_ue_ngap_id) => vec![amf_ue_ngap_id],
             None => self
                 .ue_auth_state
-                .iter()
+                .snapshot()
+                .into_iter()
                 .filter(|(_, s)| s.association_id == association_id)
-                .map(|(id, _)| *id)
+                .map(|(id, _)| id)
                 .collect(),
         };
         let deadline = Instant::now() + config.duration;
         for amf_ue_ngap_id in targets {
-            let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) else {
-                continue;
-            };
-            if !state.registered {
-                // An unregistered UE has no context worth supervising; the release
-                // already disposed of it.
-                continue;
-            }
-            state.reachability = Some(Reachability {
-                phase: ReachabilityPhase::MobileReachable,
-                deadline,
+            // Await-free, so the arming happens under one lock acquisition: a
+            // get-then-write-back would leave a window in which a release lands and
+            // the timer is re-armed on a UE that no longer exists.
+            let armed = self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
+                if !state.registered {
+                    // An unregistered UE has no context worth supervising; the
+                    // release already disposed of it.
+                    return false;
+                }
+                state.reachability = Some(Reachability {
+                    phase: ReachabilityPhase::MobileReachable,
+                    deadline,
+                });
+                true
             });
-            log::info!(
-                "Mobile reachable timer started for UE {amf_ue_ngap_id} ({:?}) after N1 \
-                 release (TS 24.501 §5.3.7)",
-                config.duration
-            );
+            if armed == Some(true) {
+                log::info!(
+                    "Mobile reachable timer started for UE {amf_ue_ngap_id} ({:?}) after N1 \
+                     release (TS 24.501 §5.3.7)",
+                    config.duration
+                );
+            }
         }
     }
 
@@ -5157,16 +5285,18 @@ impl NgapServer {
         let now = Instant::now();
         let due: Vec<u64> = self
             .ue_auth_state
-            .iter()
+            .snapshot()
+            .into_iter()
             .filter(|(_, s)| s.reachability.is_some_and(|r| r.deadline <= now))
-            .map(|(id, _)| *id)
+            .map(|(id, _)| id)
             .collect();
 
         for amf_ue_ngap_id in due {
-            let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) else {
-                continue;
-            };
-            let Some(reachability) = state.reachability else {
+            let Some(reachability) = self
+                .ue_auth_state
+                .get(amf_ue_ngap_id)
+                .and_then(|s| s.reachability)
+            else {
                 continue;
             };
             match reachability.phase {
@@ -5176,7 +5306,12 @@ impl NgapServer {
                         .get(AmfTimerId::ImplicitDeregistration)
                         .cloned()
                     else {
-                        state.reachability = None;
+                        // Every `reachability` write in this arm goes through
+                        // `with_mut` so it PERSISTS. Mutating a clone and dropping
+                        // it would leave the expired deadline in place, and this
+                        // sweep would then fire on the same UE on every poll.
+                        self.ue_auth_state
+                            .with_mut(amf_ue_ngap_id, |s| s.reachability = None);
                         continue;
                     };
                     if !config.enabled {
@@ -5187,12 +5322,15 @@ impl NgapServer {
                             "Mobile reachable timer expired for UE {amf_ue_ngap_id}; implicit \
                              deregistration is disabled, so the context is kept"
                         );
-                        state.reachability = None;
+                        self.ue_auth_state
+                            .with_mut(amf_ue_ngap_id, |s| s.reachability = None);
                         continue;
                     }
-                    state.reachability = Some(Reachability {
-                        phase: ReachabilityPhase::ImplicitDeregistration,
-                        deadline: now + config.duration,
+                    self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
+                        s.reachability = Some(Reachability {
+                            phase: ReachabilityPhase::ImplicitDeregistration,
+                            deadline: now + config.duration,
+                        });
                     });
                     log::info!(
                         "Mobile reachable timer expired for UE {amf_ue_ngap_id}: implicit \
@@ -5207,7 +5345,11 @@ impl NgapServer {
                         "Implicit deregistration timer expired for UE {amf_ue_ngap_id}: \
                          deregistering implicitly (TS 24.501 §5.3.7)"
                     );
-                    state.reachability = None;
+                    // Cleared BEFORE the await: the release below yields, and a
+                    // sweep that ran in between must not see this deadline still
+                    // due and start a second implicit deregistration.
+                    self.ue_auth_state
+                        .with_mut(amf_ue_ngap_id, |s| s.reachability = None);
                     self.release_all_pdu_sessions(amf_ue_ngap_id).await;
                     // `forget_ue`, not a bare remove (#356): this path never reaches
                     // `release_ue` -- deliberately, since no NAS message can be sent to an
@@ -5242,13 +5384,16 @@ impl NgapServer {
         let now = Instant::now();
         let due: Vec<u64> = self
             .ue_auth_state
-            .iter()
+            // The per-UE work in the loop sends NGAP PDUs and therefore `.await`s,
+            // so the lock must be gone before it starts (#341).
+            .snapshot()
+            .into_iter()
             .filter(|(_, s)| s.retx.as_ref().is_some_and(|r| r.deadline <= now))
-            .map(|(id, _)| *id)
+            .map(|(id, _)| id)
             .collect();
 
         for amf_ue_ngap_id in due {
-            let Some(mut state) = self.ue_auth_state.remove(&amf_ue_ngap_id) else {
+            let Some(mut state) = self.ue_auth_state.remove(amf_ue_ngap_id) else {
                 continue;
             };
             let Some(mut retx) = state.retx.take() else {
@@ -5416,7 +5561,7 @@ impl NgapServer {
     /// timers do this) and not on handover, where the UE has moved rather than left --
     /// `handle_handover_notify` documents why it must not use `release_ue` either.
     fn forget_ue(&mut self, amf_ue_ngap_id: u64) {
-        self.ue_auth_state.remove(&amf_ue_ngap_id);
+        self.ue_auth_state.remove(amf_ue_ngap_id);
         // Logged at info, and only when there WAS one: the overwhelming majority of
         // releases are for ordinary UEs, and a line per release saying "no emergency
         // context" would bury the ones that matter. `active_count` is included because
@@ -5752,7 +5897,7 @@ impl NgapServer {
         let target_assoc = target_assoc.expect("checked is_some");
         // Mutable: advancing the {NH, NCC} chain for the target gNB mutates the
         // stored pair (TS 33.501 Section 6.9.2.3.3).
-        let Some(state) = self.ue_auth_state.get_mut(&required.amf_ue_ngap_id) else {
+        let Some(state) = self.ue_auth_state.get(required.amf_ue_ngap_id) else {
             log::warn!(
                 "HandoverRequired for unknown UE {}; rejecting",
                 required.amf_ue_ngap_id
@@ -5793,7 +5938,17 @@ impl NgapServer {
         // Section 6.9.2.3.3). This MUST NOT copy the stored pair: the target
         // needs an NH the source gNB has never held, which is the whole point
         // of the chain. Shared with the Xn path so the two cannot diverge.
-        let (ho_ncc, ho_nh) = state.amf_ue.advance_next_hop();
+        // Through `with_mut`, because `advance_next_hop` is not a read:
+        // it re-derives NH from KAMF and increments the NH Chaining Count
+        // (TS 33.501 §6.9.2.3.3). Losing that with a dropped clone would hand the
+        // target gNB an NH the AMF does not believe it issued and reuse the same
+        // NCC on the next handover, which is exactly the key separation the
+        // vertical derivation exists to provide. `expect` is sound: the UE was
+        // resolved above and this is the single-threaded NGAP receive loop.
+        let (ho_ncc, ho_nh) = self
+            .ue_auth_state
+            .with_mut(required.amf_ue_ngap_id, |s| s.amf_ue.advance_next_hop())
+            .expect("the UE was resolved at the top of this handler");
 
         let ho_request = nextgcore_ngap::types::HandoverRequest {
             amf_ue_ngap_id: required.amf_ue_ngap_id,
@@ -5904,7 +6059,7 @@ impl NgapServer {
         // one currently holding the UE auth state).
         let source_assoc = self
             .ue_auth_state
-            .get(&ack.amf_ue_ngap_id)
+            .get(ack.amf_ue_ngap_id)
             .map(|s| s.association_id);
         let Some(source_assoc) = source_assoc else {
             log::warn!(
@@ -5914,10 +6069,7 @@ impl NgapServer {
             return Ok(());
         };
         let (ran_ue_ngap_id, handover_type) = {
-            let state = self
-                .ue_auth_state
-                .get(&ack.amf_ue_ngap_id)
-                .expect("checked");
+            let state = self.ue_auth_state.get(ack.amf_ue_ngap_id).expect("checked");
             (
                 state.ran_ue_ngap_id,
                 nextgcore_ngap::types::HandoverType::Intra5gs,
@@ -6097,7 +6249,7 @@ impl NgapServer {
         self.handover_target_assoc.remove(&failure.amf_ue_ngap_id);
         let source = self
             .ue_auth_state
-            .get(&failure.amf_ue_ngap_id)
+            .get(failure.amf_ue_ngap_id)
             .map(|s| (s.association_id, s.ran_ue_ngap_id));
         if let Some((source_assoc, ran_ue_ngap_id)) = source {
             let prep_failure = nextgcore_ngap::types::HandoverPreparationFailure {
@@ -6146,11 +6298,11 @@ impl NgapServer {
         // nothing did, so every N2 handover leaked a source RAN context.
         let source = self
             .ue_auth_state
-            .get(&notify.amf_ue_ngap_id)
+            .get(notify.amf_ue_ngap_id)
             .map(|s| (s.association_id, s.ran_ue_ngap_id))
             .filter(|(assoc, _)| *assoc != association_id);
 
-        if let Some(state) = self.ue_auth_state.get_mut(&notify.amf_ue_ngap_id) {
+        let updated = self.ue_auth_state.with_mut(notify.amf_ue_ngap_id, |state| {
             // Move the serving association/RAN-UE-NGAP-ID and location to the
             // target now that the UE has arrived (TS 23.502 Section 4.9.1.3).
             state.association_id = association_id;
@@ -6170,7 +6322,12 @@ impl NgapServer {
                 "UE {} relocated to target gNB (association {association_id})",
                 notify.amf_ue_ngap_id
             );
-        } else {
+        });
+        // `with_mut` answers `None` when there was no such UE, so the
+        // unknown-UE branch reads off its return value rather than a second
+        // lookup -- one lock acquisition, and no window in which the UE could be
+        // released between the update and the check.
+        if updated.is_none() {
             log::warn!(
                 "HandoverNotify for unknown UE {}; ignoring",
                 notify.amf_ue_ngap_id
@@ -6375,7 +6532,7 @@ impl NgapServer {
         );
 
         // Unknown UE → PathSwitchRequestFailure with unknown-local-UE cause.
-        if !self.ue_auth_state.contains_key(&amf_ue_ngap_id) {
+        if !self.ue_auth_state.contains(amf_ue_ngap_id) {
             log::warn!("PathSwitchRequest for unknown UE {amf_ue_ngap_id}; failing");
             let failure = nextgcore_ngap::types::PathSwitchRequestFailure {
                 amf_ue_ngap_id,
@@ -6395,48 +6552,53 @@ impl NgapServer {
 
         // Derive a fresh NH from KAMF (vertical key derivation) and increment
         // the NHCC (TS 33.501 Section 6.9.2.3.3 / 6.9.4.1).
-        let (ncc, inbound, allowed_nssai, ue_caps) = {
-            let state = self
-                .ue_auth_state
-                .get_mut(&amf_ue_ngap_id)
-                .expect("checked");
-            // Shared with the N2 path (see AmfUe::advance_next_hop) so the two
-            // cannot derive keys differently. The chain is seeded from KgNB at
-            // AS-context establishment, so this no longer chains from zeros.
-            let (_ncc, _nh) = state.amf_ue.advance_next_hop();
-            // Move the UE's serving RAN association and RAN-UE-NGAP-ID to the
-            // target gNB; this is the N3 tunnel/RAN identity update.
-            state.ran_ue_ngap_id = req.ran_ue_ngap_id;
-            state.association_id = association_id;
+        // `with_mut`, because everything this block does to `state` must PERSIST:
+        // it advances the NH key chain and it moves the UE's serving association
+        // to the target gNB. A dropped clone would leave the AMF believing the UE
+        // is still on the source association -- so every later downlink NAS would
+        // be sent to the gNB the UE just left -- and would reuse the NCC on the
+        // next switch. Await-free; the relays below happen after it returns.
+        let (ncc, inbound, allowed_nssai, ue_caps) = self
+            .ue_auth_state
+            .with_mut(amf_ue_ngap_id, |state| {
+                // Shared with the N2 path (see AmfUe::advance_next_hop) so the two
+                // cannot derive keys differently. The chain is seeded from KgNB at
+                // AS-context establishment, so this no longer chains from zeros.
+                let (_ncc, _nh) = state.amf_ue.advance_next_hop();
+                // Move the UE's serving RAN association and RAN-UE-NGAP-ID to the
+                // target gNB; this is the N3 tunnel/RAN identity update.
+                state.ran_ue_ngap_id = req.ran_ue_ngap_id;
+                state.association_id = association_id;
 
-            // #70: the inbound request transfers, kept so each can be relayed to the SMF
-            // AFTER this borrow ends. The switched list is built from the SMF's ANSWERS
-            // below, not from these — echoing the gNB's own PathSwitchRequestTransfer back
-            // as the acknowledge is the defect #70 names, and it tells the target gNB to
-            // send uplink traffic to itself (TS 38.413 §9.3.4.8 vs §9.3.4.9).
-            let inbound: Vec<(u8, Vec<u8>)> = req
-                .pdu_session_list
-                .iter()
-                .map(|p| (p.pdu_session_id, p.transfer.clone()))
-                .collect();
+                // #70: the inbound request transfers, kept so each can be relayed to the SMF
+                // AFTER this borrow ends. The switched list is built from the SMF's ANSWERS
+                // below, not from these — echoing the gNB's own PathSwitchRequestTransfer back
+                // as the acknowledge is the defect #70 names, and it tells the target gNB to
+                // send uplink traffic to itself (TS 38.413 §9.3.4.8 vs §9.3.4.9).
+                let inbound: Vec<(u8, Vec<u8>)> = req
+                    .pdu_session_list
+                    .iter()
+                    .map(|p| (p.pdu_session_id, p.transfer.clone()))
+                    .collect();
 
-            let allowed_nssai = state
-                .amf_ue
-                .allowed_nssai
-                .iter()
-                .map(|s| nextgcore_ngap::types::SNssai {
-                    sst: s.sst,
-                    sd: s.sd.map(|sd| sd.to_be_bytes()[1..4].try_into().unwrap()),
-                })
-                .collect::<Vec<_>>();
+                let allowed_nssai = state
+                    .amf_ue
+                    .allowed_nssai
+                    .iter()
+                    .map(|s| nextgcore_ngap::types::SNssai {
+                        sst: s.sst,
+                        sd: s.sd.map(|sd| sd.to_be_bytes()[1..4].try_into().unwrap()),
+                    })
+                    .collect::<Vec<_>>();
 
-            (
-                state.amf_ue.nhcc,
-                inbound,
-                allowed_nssai,
-                ue_caps_to_ngap(&state.amf_ue.ue_security_capability),
-            )
-        };
+                (
+                    state.amf_ue.nhcc,
+                    inbound,
+                    allowed_nssai,
+                    ue_caps_to_ngap(&state.amf_ue.ue_security_capability),
+                )
+            })
+            .expect("the UE was resolved above");
 
         // #70: Nsmf_PDUSession_UpdateSMContext per switched PDU session
         // (TS 29.502 §5.2.2.3.3). The SMF switches the UPF's DL path to the target and
@@ -6452,7 +6614,7 @@ impl NgapServer {
 
         let nh = self
             .ue_auth_state
-            .get(&amf_ue_ngap_id)
+            .get(amf_ue_ngap_id)
             .expect("checked")
             .amf_ue
             .nh;
@@ -6550,7 +6712,7 @@ impl NgapServer {
              ran_ue_ngap_id={ran_ue_ngap_id} (association {association_id})"
         );
 
-        if let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) {
+        let updated = self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
             state.initial_context_setup_response_received = true;
             // The gNB has the Registration Accept; stop retransmitting the ICS
             // request. T3550 logic that waits for Registration Complete is reset
@@ -6560,7 +6722,8 @@ impl NgapServer {
             // Registered (TS 24.501 §5.5.1.2.4).
             state.gmm_fsm.transition_to_registered();
             log::info!("UE {amf_ue_ngap_id} context established (AS-layer security up)");
-        } else {
+        });
+        if updated.is_none() {
             log::warn!("Initial Context Setup Response for unknown UE {amf_ue_ngap_id}; ignoring");
         }
         Ok(())
@@ -6586,10 +6749,10 @@ impl NgapServer {
         );
 
         // Drop any pending ICS retransmission, then release the NG context.
-        if let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) {
+        self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
             state.retx = None;
             state.gmm_fsm.transition_to_exception();
-        }
+        });
         // NAS cause #22 "congestion" is not appropriate; use #9 (UE identity
         // cannot be derived) so the UE re-registers (TS 24.501 Annex).
         self.release_ue(
@@ -8590,6 +8753,69 @@ mod tests {
     use crate::context::AmfContext;
     use tokio::sync::mpsc;
 
+    /// **#341's acceptance criterion.** A UE that the NGAP path registers must be
+    /// resolvable by the Namf surface, through the same `find_ue_by_context_id`
+    /// every Namf handler goes through.
+    ///
+    /// This is the test the issue asks for, and it is the one that could not have
+    /// passed before: `NgapServer::ue_auth_state` was a private `HashMap` on this
+    /// struct, `find_ue_by_context_id` read `AmfContext::supi_hash`, and the only
+    /// writer of that index was `amf_ue_set_supi`, whose only callers were tests.
+    /// Production reader, test-only writer -- so N1N2MessageTransfer,
+    /// EnableUeReachability, ProvideDomainSelectionInfo and per-UE EventExposure all
+    /// answered 404 CONTEXT_NOT_FOUND for a UE that had really registered.
+    ///
+    /// Driven through the STORE rather than through a full SCTP registration on
+    /// purpose: the assertion is about which store the two sides agree on, and a
+    /// real registration would need a gNB peer to reach the same point. What makes
+    /// it meaningful is that it inserts the way the NGAP path inserts -- `insert` on
+    /// `self.ue_auth_state`, the only write the registration path performs -- and
+    /// reads the way a Namf handler reads, with nothing in between.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ue_the_ngap_path_registers_is_resolvable_by_the_namf_surface() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::amf_context_init(64, 1024, 4096);
+
+        let server = test_ngap_server().await;
+        let amf_ue_ngap_id = 3_410_001u64;
+        let supi = "imsi-001010000341001";
+
+        // Exactly what the NGAP registration path does: build the NAS context and
+        // put it in the store. No call to any context list, no index maintenance.
+        let mut state = UeNasContext::new(amf_ue_ngap_id, 41, 9_410, false);
+        state.amf_ue.supi = Some(supi.to_string());
+        server.ue_auth_state.insert(amf_ue_ngap_id, state);
+
+        // Exactly what every Namf handler does.
+        let resolved = crate::namf_server::find_ue_by_context_id(supi)
+            .expect("a UE registered over NGAP must be resolvable by the Namf surface");
+        assert_eq!(
+            resolved.supi.as_deref(),
+            Some(supi),
+            "and it must be the UE that registered, not merely some UE"
+        );
+
+        // The negative control, so the assertion above cannot pass by accident: an
+        // unknown SUPI must still resolve to nothing. Without this a resolver that
+        // returned the first record for ANY query would look correct.
+        assert!(
+            crate::namf_server::find_ue_by_context_id("imsi-001010000999999").is_none(),
+            "an unregistered SUPI must not resolve"
+        );
+
+        // And the release is symmetric: once the NGAP path forgets the UE, the Namf
+        // surface must 404 again. A store that resolved a released UE would be a
+        // worse defect than the 404 this issue fixed -- the SBI would act on a UE
+        // that no longer has a radio connection.
+        server.ue_auth_state.remove(amf_ue_ngap_id);
+        assert!(
+            crate::namf_server::find_ue_by_context_id(supi).is_none(),
+            "a released UE must stop resolving"
+        );
+    }
+
     #[tokio::test]
     async fn test_ngap_server_creation() {
         let (tx, _rx) = mpsc::channel(100);
@@ -10036,9 +10262,8 @@ mod tests {
         // Once the Accept has egressed, the same call proceeds. `Attempted` is the
         // decision; whether the PCF answered is the PCF's business and is not asserted.
         ngap.ue_auth_state
-            .get_mut(&amf_ue_ngap_id)
-            .expect("ctx")
-            .registration_accept_sent = true;
+            .with_mut(amf_ue_ngap_id, |s| s.registration_accept_sent = true)
+            .expect("ctx");
         assert_eq!(
             ngap.create_ue_policy_association(amf_ue_ngap_id).await,
             UePolicyCreate::Attempted
@@ -10587,8 +10812,14 @@ mod tests {
             let ctx = amf_self();
             let guard = ctx.read().expect("ctx");
             let ran_ue = guard.ran_ue_add(900_291, 291).expect("ran_ue");
-            let ue = guard.amf_ue_add(ran_ue.id).expect("amf_ue");
-            guard.amf_ue_set_supi(ue.id, supi);
+            let mut ue = guard.amf_ue_add(ran_ue.id).expect("amf_ue");
+            // #341: published into the LIVE store, because that is what
+            // `amf_ue_find_by_supi` resolves against now. Seeding only
+            // `amf_ue_list` (which is what `amf_ue_set_supi` did) is precisely the
+            // production-reader/test-only-writer split this issue removed.
+            ue.supi = Some(supi.to_string());
+            ue.id = amf_ue_ngap_id;
+            guard.amf_ue_publish(&ue, 291, 9_291);
             let mut ue = guard.amf_ue_find_by_supi(supi).expect("stored ue");
             ue.assigned_ebis.push(crate::context::AssignedEbi {
                 ebi: 5,
@@ -10602,25 +10833,42 @@ mod tests {
             guard.amf_ue_update(&ue);
         }
 
-        // The NAS state the tail reads the SUPI out of.
-        let mut state = UeNasContext::new(amf_ue_ngap_id, 291, 9_291, false);
-        state.amf_ue.supi = Some(supi.to_string());
-        server.ue_auth_state.insert(amf_ue_ngap_id, state);
+        // The NAS state the tail reads the SUPI out of -- keyed by the SAME
+        // AMF-UE-NGAP-ID as the published record above, because #341 made that key
+        // the identity of the UE. Two records sharing one SUPI is not a state the
+        // one-store design can represent, and the previous version of this test
+        // created exactly that: it published under `ue.id` and then inserted a
+        // second record under `amf_ue_ngap_id`, so `release_all_ebis` cleared one
+        // and the assertion read the other.
+        server.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
+            state.amf_ue.supi = Some(supi.to_string());
+        });
 
         let _ = server
             .finish_deregistration(9_291, amf_ue_ngap_id, 291)
             .await;
 
+        // #341 CHANGED WHAT "freed" MEANS HERE, and the distinction is the point.
+        // The assertion used to be "the stored AmfUe survives deregistration with an
+        // EMPTY ebi list", because the only store was `amf_ue_list`, which nothing in
+        // production ever removed from -- so a leaked identity was leaked for the life
+        // of the process and clearing the list was the only available fix.
+        //
+        // Now the UE lives in ONE store and `finish_deregistration` removes it, so the
+        // identities cannot be held by a surviving record: there is no surviving record.
+        // `None` is therefore a STRONGER outcome than `Some(0)`, not a regression, and
+        // the assertion is written to accept only those two so that a UE left behind
+        // still holding an EBI (the actual defect #291 was about) fails.
         let held = amf_self()
             .read()
             .expect("ctx")
             .amf_ue_find_by_supi(supi)
-            .map(|ue| ue.assigned_ebis.len())
-            .unwrap_or(usize::MAX);
+            .map(|ue| ue.assigned_ebis.len());
         assert_eq!(
-            held, 0,
-            "the deregistration tail must free the UE's EPS bearer identities; the \
-             stored AmfUe survives deregistration, so nothing else will"
+            held.unwrap_or(0),
+            0,
+            "the deregistration tail must leave no UE holding EPS bearer identities; \
+             found {held:?}"
         );
     }
 
@@ -10824,7 +11072,14 @@ mod tests {
         seed_gnb_session(&server, target).await;
 
         // HandoverNotify: the UE arrived, so the separate target record is spent.
-        let ue_notify = 78_001u64;
+        //
+        // #341 made the UE store PROCESS-GLOBAL, so this id must not collide with
+        // another test's: it used to be 78_001, the same key
+        // `handover_notify_releases_the_source_ran_context` uses, which was harmless
+        // while every `NgapServer` owned a private map and is a cross-test race now.
+        // That surfaced as that test reading THIS test's association (9212) instead
+        // of its own (9301), about 1 run in 3.
+        let ue_notify = 78_101u64;
         server.handover_target_assoc.insert(ue_notify, target);
         let notify = nextgcore_ngap::builder::build_handover_notify(
             &nextgcore_ngap::types::HandoverNotify {
@@ -11397,7 +11652,7 @@ mod tests {
         // would deregister a UE the target is now serving.
         let moved = server
             .ue_auth_state
-            .get(&amf_ue_ngap_id)
+            .get(amf_ue_ngap_id)
             .expect("the UE context must survive its own handover");
         assert_eq!(moved.association_id, target, "serving association moved");
         assert_eq!(moved.ran_ue_ngap_id, 22, "serving RAN-UE-NGAP-ID moved");
@@ -11548,7 +11803,7 @@ mod tests {
 
         // The UE's NCC advanced (the pre-existing forward-security behaviour) and the
         // relocation happened, so the handler ran to completion rather than bailing early.
-        let state = server.ue_auth_state.get(&amf_ue_ngap_id).expect("UE");
+        let state = server.ue_auth_state.get(amf_ue_ngap_id).expect("UE");
         assert_eq!(
             state.ran_ue_ngap_id, 67,
             "the handler completed the relocation"
@@ -11713,7 +11968,7 @@ mod tests {
         );
         assert!(
             ngap.ue_auth_state
-                .get(&amf_ue_ngap_id)
+                .get(amf_ue_ngap_id)
                 .is_some_and(|s| s.retx.is_none()),
             "a discarded message must start no procedure"
         );
@@ -11739,7 +11994,7 @@ mod tests {
             .await;
         assert!(
             ngap.ue_auth_state
-                .get(&amf_ue_ngap_id)
+                .get(amf_ue_ngap_id)
                 .is_some_and(|s| s.retx.is_none()),
             "with the switch off nothing is sent and no timer is armed"
         );
@@ -11771,7 +12026,7 @@ mod tests {
 
         let new_tmsi = ngap
             .ue_auth_state
-            .get(&amf_ue_ngap_id)
+            .get(amf_ue_ngap_id)
             .map(|s| s.amf_ue.next_guti.tmsi)
             .expect("context");
         assert_ne!(
@@ -11780,7 +12035,7 @@ mod tests {
         );
         assert_eq!(
             ngap.ue_auth_state
-                .get(&amf_ue_ngap_id)
+                .get(amf_ue_ngap_id)
                 .map(|s| s.amf_ue.current_guti.tmsi),
             Some(0x1111_1111),
             "the old GUTI stays current until the UE acknowledges, or a UE that never \
@@ -11816,7 +12071,7 @@ mod tests {
         ngap.arm_retx(amf_ue_ngap_id, NasProcTimer::T3555, vec![0x00, 0x2E]);
         assert!(
             ngap.ue_auth_state
-                .get(&amf_ue_ngap_id)
+                .get(amf_ue_ngap_id)
                 .is_some_and(|s| s.retx.is_some()),
             "precondition: T3555 is pending"
         );
@@ -11849,7 +12104,7 @@ mod tests {
 
         let state = ngap
             .ue_auth_state
-            .get(&amf_ue_ngap_id)
+            .get(amf_ue_ngap_id)
             .expect("the context survives");
         assert!(
             state.retx.is_none(),
@@ -11880,16 +12135,18 @@ mod tests {
 
         // Force expiry `max_count` times: each is a retransmission, and the timer stays.
         for expected in 1..=max_count {
-            if let Some(state) = ngap.ue_auth_state.get_mut(&amf_ue_ngap_id) {
+            ngap.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
                 if let Some(retx) = state.retx.as_mut() {
                     retx.deadline = Instant::now() - Duration::from_secs(1);
                 }
-            }
+            });
             ngap.process_nas_timers().await.expect("timer pass");
             let retries = ngap
                 .ue_auth_state
-                .get(&amf_ue_ngap_id)
-                .and_then(|s| s.retx.as_ref())
+                .get(amf_ue_ngap_id)
+                // The store hands out a CLONE, so nothing survives to borrow
+                // from; take the field out of the owned value instead (#341).
+                .and_then(|s| s.retx)
                 .map(|r| r.retries);
             assert_eq!(
                 retries,
@@ -11899,15 +12156,15 @@ mod tests {
         }
 
         // One more expiry exhausts the budget and aborts.
-        if let Some(state) = ngap.ue_auth_state.get_mut(&amf_ue_ngap_id) {
+        ngap.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
             if let Some(retx) = state.retx.as_mut() {
                 retx.deadline = Instant::now() - Duration::from_secs(1);
             }
-        }
+        });
         ngap.process_nas_timers().await.expect("abort pass");
         let state = ngap
             .ue_auth_state
-            .get(&amf_ue_ngap_id)
+            .get(amf_ue_ngap_id)
             .expect("the UE context survives an aborted UCU");
         assert!(state.retx.is_none(), "the timer must be disarmed on abort");
         assert_eq!(
@@ -11988,7 +12245,7 @@ mod tests {
              context it had just created leaked and this figure stayed at 1"
         );
         assert!(
-            !ngap.ue_auth_state.contains_key(&amf_ue_ngap_id),
+            !ngap.ue_auth_state.contains(amf_ue_ngap_id),
             "and the NAS state goes with it, rather than being left with no release"
         );
     }
@@ -12047,7 +12304,7 @@ mod tests {
              before the release under test"
         );
         assert!(
-            ngap.ue_auth_state.contains_key(&amf_ue_ngap_id),
+            ngap.ue_auth_state.contains(amf_ue_ngap_id),
             "fixture precondition: UE {amf_ue_ngap_id} must hold a NAS context too -- the \
              release paths resolve the UE through `ue_auth_state`"
         );
@@ -12102,7 +12359,7 @@ mod tests {
             "and the live emergency figure an operator watches must fall with it"
         );
         assert!(
-            !ngap.ue_auth_state.contains_key(&amf_ue_ngap_id),
+            !ngap.ue_auth_state.contains(amf_ue_ngap_id),
             "and no NAS state is left behind"
         );
     }
@@ -12140,7 +12397,7 @@ mod tests {
             .await;
 
         assert!(
-            !ngap.ue_auth_state.contains_key(&amf_ue_ngap_id),
+            !ngap.ue_auth_state.contains(amf_ue_ngap_id),
             "the HXRES* mismatch must release the UE even though the Authentication Reject \
              could not be delivered: before #359 the `?` on that send returned first and \
              this entry stayed in the map forever, holding an AMF UE NGAP ID for a UE the \
@@ -12186,7 +12443,7 @@ mod tests {
             .await;
 
         assert!(
-            !ngap.ue_auth_state.contains_key(&amf_ue_ngap_id),
+            !ngap.ue_auth_state.contains(amf_ue_ngap_id),
             "a detected bidding-down attempt must release the UE even though neither reject \
              could be delivered: before #359 the `?` on the Security Mode Reject returned \
              first, so the Registration Reject was never built and the UE stayed in the map"
@@ -12515,7 +12772,7 @@ mod tests {
         ngap.process_reachability_timers().await.expect("phase 1");
         let phase = ngap
             .ue_auth_state
-            .get(&amf_ue_ngap_id)
+            .get(amf_ue_ngap_id)
             .and_then(|s| s.reachability)
             .map(|r| r.phase);
         assert_eq!(
@@ -12526,15 +12783,15 @@ mod tests {
         );
 
         // Force the second deadline past and run again.
-        if let Some(state) = ngap.ue_auth_state.get_mut(&amf_ue_ngap_id) {
+        ngap.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
             state.reachability = Some(Reachability {
                 phase: ReachabilityPhase::ImplicitDeregistration,
                 deadline: Instant::now() - Duration::from_secs(1),
             });
-        }
+        });
         ngap.process_reachability_timers().await.expect("phase 2");
         assert!(
-            !ngap.ue_auth_state.contains_key(&amf_ue_ngap_id),
+            !ngap.ue_auth_state.contains(amf_ue_ngap_id),
             "implicit deregistration must remove the UE context (TS 24.501 §5.3.7)"
         );
     }
@@ -12558,7 +12815,7 @@ mod tests {
             .await
             .expect("nothing due");
         assert!(
-            ngap.ue_auth_state.contains_key(&amf_ue_ngap_id),
+            ngap.ue_auth_state.contains(amf_ue_ngap_id),
             "a connected UE must survive a poll with no timer running"
         );
     }

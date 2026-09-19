@@ -205,7 +205,7 @@ fn context_not_found(ue_context_id: &str) -> SbiResponse {
 
 /// Look up a UE by its ueContextId path component. Supports the SUPI forms
 /// (imsi-..., nai-...) per TS 29.518 §6.1.3.2.2.
-fn find_ue_by_context_id(ue_context_id: &str) -> Option<AmfUe> {
+pub(crate) fn find_ue_by_context_id(ue_context_id: &str) -> Option<AmfUe> {
     let ctx = amf_self();
     let guard = ctx.read().ok()?;
     if ue_context_id.starts_with("imsi-") || ue_context_id.starts_with("nai-") {
@@ -2535,7 +2535,7 @@ mod tests {
             .ran_ue_add(900_100, ngap_id)
             .expect("ran_ue_add failed");
         let mut ue = guard.amf_ue_add(ran_ue.id).expect("amf_ue_add failed");
-        guard.amf_ue_set_supi(ue.id, supi);
+        // #341: `amf_ue_set_supi` is gone; `amf_ue_publish` below is the seam.
         ue.supi = Some(supi.to_string());
         ue.security_context_available = security;
         ue.nr_tai.tac = 100;
@@ -2547,6 +2547,13 @@ mod tests {
             ue.ran_ue_id = NEXTGCORE_INVALID_POOL_ID;
         }
         guard.amf_ue_update(&ue);
+        // #341: publish into the LIVE store too, which is what the handlers now
+        // resolve against. Before #341 this helper wrote only `amf_ue_list`, and
+        // that was the defect: the Namf surface read a store nothing in production
+        // ever wrote, so these tests passed while a really-registered UE got a 404.
+        // A `ran_ue_ngap_id` of 0 for a CM-IDLE UE matches what the resolver does
+        // with it -- nothing; only the SUPI/GUTI lookups are exercised here.
+        guard.amf_ue_publish(&ue, ngap_id as u32, 1);
         ue
     }
 

@@ -6535,9 +6535,10 @@ mod tests {
             let guard = ctx.read().expect("amf ctx");
             let ran = guard.ran_ue_add(900_500, 60_200).expect("ran_ue_add");
             let ue = guard.amf_ue_add(ran.id).expect("amf_ue_add");
-            guard.amf_ue_set_supi(ue.id, supi);
             let mut ue = ue;
             ue.supi = Some(supi.to_string());
+            // #341: publish into amfd's LIVE UE store (see uecm.rs).
+            guard.amf_ue_publish(&ue, 60_200, 900_500);
             guard.amf_ue_update(&ue);
         }
         // Register the UE in the UDM's UECM store so the serving AMF is known.

@@ -27,6 +27,7 @@ pub mod positioning; // LCS: LMF positioning relay (NRPPa N2 / LPP N1) — TS 23
 pub mod sbi_path;
 pub mod snpn; // Rel-16: SNPN authentication (TS 23.501 §5.30)
 pub mod timer;
+pub mod ue_store; // #341: the one authoritative live-UE store
 pub mod xn_handover; // Rel-15: Xn path switch and N2 handover (TS 23.502 §4.9)
 
 #[cfg(test)]
@@ -1029,8 +1030,16 @@ amf:
                 .expect("write the fixture config");
         }
 
-        // The context is process-global, so restore whatever a sibling left behind. The
-        // loader PUSHES onto these vectors, so the restore truncates to the saved
+        // The context is process-global AND a sibling's `amf_context_final` can empty
+        // it between the save below and the read after the load -- the save/restore
+        // dance cannot defend against that on its own, so hold the one lock that
+        // serialises global-context tests. Observed as roughly 1 workspace run in 4
+        // once #341 gave `fini` more state to clear.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // The loader PUSHES onto these vectors, so the restore truncates to the saved
         // lengths rather than cloning the elements.
         context::amf_context_init(64, 1024, 4096);
         let ctx_arc = context::amf_self();

@@ -46,8 +46,11 @@ fn seed_ue(supi: &str, connected: bool) -> u64 {
     let ngap_id = 70_000 + (supi.bytes().map(u64::from).sum::<u64>() % 20_000);
     let ran_ue = guard.ran_ue_add(900_200, ngap_id).expect("ran_ue_add");
     let mut ue = guard.amf_ue_add(ran_ue.id).expect("amf_ue_add");
-    guard.amf_ue_set_supi(ue.id, supi);
     ue.supi = Some(supi.to_string());
+    // #341: publish into amfd's LIVE UE store, which is what its Namf handlers
+    // resolve against now. `amf_ue_set_supi` wrote a SUPI index nothing in
+    // production ever wrote -- the defect #341 removed.
+    guard.amf_ue_publish(&ue, ngap_id as u32, 900_200);
     ue.security_context_available = true;
     if connected {
         guard.amf_ue_associate_ran_ue(ue.id, ran_ue.id);

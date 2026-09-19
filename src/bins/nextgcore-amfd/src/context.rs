@@ -3,6 +3,8 @@
 //! Port of src/amf/context.c, src/amf/context.h - AMF context with gNB list, UE list, session list, and hash tables
 
 use std::collections::HashMap;
+// #341: the derived resolvers read the UE identity off a live-store record.
+use crate::ue_store::UeIdentity;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -439,6 +441,17 @@ pub struct AmfContext {
     amf_ue_list: RwLock<HashMap<u64, AmfUe>>,
     /// RAN UE list (by pool ID)
     ran_ue_list: RwLock<HashMap<u64, RanUe>>,
+    /// The one authoritative live-UE store (#341), shared with `NgapServer`.
+    ///
+    /// `Arc` because the NGAP receive loop holds the same store rather than a
+    /// copy: before this, the NGAP path wrote a private `HashMap` on `NgapServer`
+    /// and every Namf handler resolved against `amf_ue_list`/`supi_hash` here,
+    /// which only tests ever wrote -- so the SBI surface 404'd on every UE that
+    /// had actually registered. The type is erased through
+    /// [`crate::ue_store::UeStore`]'s generic parameter so `ngap_path`'s
+    /// `UeNasContext`, which holds types private to that module, does not become
+    /// part of this struct's public surface.
+    ue_store: Arc<crate::ue_store::UeStore<crate::ngap_path::UeNasContext>>,
     /// Session list (by pool ID)
     sess_list: RwLock<HashMap<u64, AmfSess>>,
 
@@ -447,12 +460,8 @@ pub struct AmfContext {
     gnb_addr_hash: RwLock<HashMap<String, u64>>,
     /// gNB ID hash (gnb_id -> pool ID)
     gnb_id_hash: RwLock<HashMap<u32, u64>>,
-    /// GUTI UE hash (GUTI -> pool ID)
-    guti_ue_hash: RwLock<HashMap<Guti5gs, u64>>,
     /// SUCI hash (SUCI -> pool ID)
     suci_hash: RwLock<HashMap<String, u64>>,
-    /// SUPI hash (SUPI -> pool ID)
-    supi_hash: RwLock<HashMap<String, u64>>,
 
     // NGAP port
     /// Default NGAP port
@@ -673,12 +682,11 @@ impl AmfContext {
             gnb_list: RwLock::new(HashMap::new()),
             amf_ue_list: RwLock::new(HashMap::new()),
             ran_ue_list: RwLock::new(HashMap::new()),
+            ue_store: Arc::new(crate::ue_store::UeStore::new()),
             sess_list: RwLock::new(HashMap::new()),
             gnb_addr_hash: RwLock::new(HashMap::new()),
             gnb_id_hash: RwLock::new(HashMap::new()),
-            guti_ue_hash: RwLock::new(HashMap::new()),
             suci_hash: RwLock::new(HashMap::new()),
-            supi_hash: RwLock::new(HashMap::new()),
             ngap_port: 38412,
             t3502_value: 720,
             // 540 s = 9 minutes, matching both the wire value the AMF has
@@ -737,6 +745,10 @@ impl AmfContext {
 
         self.gnb_remove_all();
         self.amf_ue_remove_all();
+        // #341: the live store too, or `fini` would leave the UEs the Namf surface
+        // actually resolves against behind while clearing the list it no longer
+        // reads -- a finalize that does not finalize.
+        self.ue_store.clear();
 
         self.initialized.store(false, Ordering::SeqCst);
         log::info!("AMF context finalized");
@@ -1037,17 +1049,11 @@ impl AmfContext {
         let removed = {
             let mut amf_ue_list = self.amf_ue_list.write().ok()?;
             let mut suci_hash = self.suci_hash.write().ok()?;
-            let mut supi_hash = self.supi_hash.write().ok()?;
-            let mut guti_ue_hash = self.guti_ue_hash.write().ok()?;
 
             let amf_ue = amf_ue_list.remove(&id)?;
             if let Some(ref suci) = amf_ue.suci {
                 suci_hash.remove(suci);
             }
-            if let Some(ref supi) = amf_ue.supi {
-                supi_hash.remove(supi);
-            }
-            guti_ue_hash.remove(&amf_ue.current_guti);
             amf_ue
         };
 
@@ -1070,16 +1076,11 @@ impl AmfContext {
 
     /// Remove all AMF UEs
     pub fn amf_ue_remove_all(&self) {
-        if let (Ok(mut amf_ue_list), Ok(mut suci_hash), Ok(mut supi_hash), Ok(mut guti_ue_hash)) = (
-            self.amf_ue_list.write(),
-            self.suci_hash.write(),
-            self.supi_hash.write(),
-            self.guti_ue_hash.write(),
-        ) {
+        if let (Ok(mut amf_ue_list), Ok(mut suci_hash)) =
+            (self.amf_ue_list.write(), self.suci_hash.write())
+        {
             amf_ue_list.clear();
             suci_hash.clear();
-            supi_hash.clear();
-            guti_ue_hash.clear();
         }
 
         // Clear sessions
@@ -1118,24 +1119,61 @@ impl AmfContext {
         amf_ue_list.get(&id).cloned()
     }
 
-    /// Find AMF UE by SUPI
-    pub fn amf_ue_find_by_supi(&self, supi: &str) -> Option<AmfUe> {
-        let id = {
-            let supi_hash = self.supi_hash.read().ok()?;
-            supi_hash.get(supi).copied()
-        }?;
-        let amf_ue_list = self.amf_ue_list.read().ok()?;
-        amf_ue_list.get(&id).cloned()
+    /// The live-UE store, shared rather than copied (#341).
+    ///
+    /// `NgapServer` takes this at construction so the NGAP receive loop and every
+    /// Namf handler are looking at ONE map. Handing out the `Arc` rather than a
+    /// guard is deliberate: the NGAP path is `async`, and a guard on a
+    /// `std::sync::RwLock` cannot cross an `.await`.
+    pub fn ue_store(&self) -> Arc<crate::ue_store::UeStore<crate::ngap_path::UeNasContext>> {
+        Arc::clone(&self.ue_store)
     }
 
-    /// Find AMF UE by GUTI
+    /// Publish a UE into the live store so the Namf surface can resolve it (#341).
+    ///
+    /// The counterpart of [`AmfContext::amf_ue_find_by_supi`]: a UE that is only in
+    /// `amf_ue_list` is invisible to the derived resolvers, because those read the
+    /// live store. Anything that creates a UE outside the NGAP registration path
+    /// -- a test fixture, an inter-AMF context transfer -- has to come through
+    /// here or it will 404 exactly as the pre-#341 code did.
+    pub fn amf_ue_publish(&self, amf_ue: &AmfUe, ran_ue_ngap_id: u32, association_id: u64) {
+        self.ue_store.insert(
+            amf_ue.id,
+            crate::ngap_path::UeNasContext::published(
+                amf_ue.clone(),
+                ran_ue_ngap_id,
+                association_id,
+            ),
+        );
+    }
+
+    /// Find AMF UE by SUPI.
+    ///
+    /// **Resolves against the live store (#341), derived rather than indexed.**
+    /// This used to read `supi_hash`, whose only writer was `amf_ue_set_supi`,
+    /// whose only callers were tests -- so this returned `None` for every UE that
+    /// had actually registered over NGAP, and `find_ue_by_context_id` in
+    /// `namf_server` turned that into `404 CONTEXT_NOT_FOUND`. The scan is O(n)
+    /// per SBI request against O(1) through an index that could disagree with the
+    /// map it indexed; see `ue_store`'s module docs for why that trade is the
+    /// right way round here.
+    pub fn amf_ue_find_by_supi(&self, supi: &str) -> Option<AmfUe> {
+        self.ue_store
+            .find_by_supi(supi)
+            .map(|(_, ue)| ue.amf_ue().clone())
+    }
+
+    /// Find AMF UE by 5G-GUTI.
+    ///
+    /// Derived from the live store for the same reason as
+    /// [`AmfContext::amf_ue_find_by_supi`]. This is the resolver #69's criteria 1
+    /// and 2 need: a Service Request from CM-IDLE arrives carrying a 5G-GUTI and
+    /// nothing else, so a GUTI index that is never written in production means an
+    /// idle UE can never be resolved at all.
     pub fn amf_ue_find_by_guti(&self, guti: &Guti5gs) -> Option<AmfUe> {
-        let id = {
-            let guti_ue_hash = self.guti_ue_hash.read().ok()?;
-            guti_ue_hash.get(guti).copied()
-        }?;
-        let amf_ue_list = self.amf_ue_list.read().ok()?;
-        amf_ue_list.get(&id).cloned()
+        self.ue_store
+            .find_by_guti(guti)
+            .map(|(_, ue)| ue.amf_ue().clone())
     }
 
     /// Set SUCI for an AMF UE
@@ -1156,48 +1194,36 @@ impl AmfContext {
         false
     }
 
-    /// Set SUPI for an AMF UE
-    pub fn amf_ue_set_supi(&self, id: u64, supi: &str) -> bool {
-        let mut amf_ue_list = self.amf_ue_list.write().unwrap();
-        let mut supi_hash = self.supi_hash.write().unwrap();
-
-        if let Some(amf_ue) = amf_ue_list.get_mut(&id) {
-            // Remove old SUPI from hash
-            if let Some(ref old_supi) = amf_ue.supi {
-                supi_hash.remove(old_supi);
-            }
-            // Set new SUPI
-            amf_ue.supi = Some(supi.to_string());
-            supi_hash.insert(supi.to_string(), id);
-            return true;
-        }
-        false
-    }
-
-    /// Update GUTI for an AMF UE
-    pub fn amf_ue_update_guti(&self, id: u64, guti: &Guti5gs) -> bool {
-        let mut amf_ue_list = self.amf_ue_list.write().unwrap();
-        let mut guti_ue_hash = self.guti_ue_hash.write().unwrap();
-
-        if let Some(amf_ue) = amf_ue_list.get_mut(&id) {
-            // Remove old GUTI from hash
-            guti_ue_hash.remove(&amf_ue.current_guti);
-            // Set new GUTI
-            amf_ue.current_guti = guti.clone();
-            guti_ue_hash.insert(guti.clone(), id);
-            return true;
-        }
-        false
-    }
-
-    /// Update AMF UE in the context
+    /// Update AMF UE in the context, writing THROUGH to the live store (#341).
+    ///
+    /// The write-through is the point, and its absence was a real defect found by
+    /// the EBI tests: every Namf handler that mutates a UE reads it back through
+    /// `amf_ue_find_by_supi`, which now resolves against the live store. A handler
+    /// that wrote only `amf_ue_list` would have its own mutation invisible to its
+    /// own next read -- an EBI assignment would be allocated, stored nowhere the
+    /// resolver looks, and handed out a second time.
+    ///
+    /// Only the `AmfUe` is replaced: the live record's NAS/registration fields
+    /// (`retx`, `gmm_fsm`, the serving association) belong to the NGAP path and are
+    /// not the SBI layer's to overwrite.
     pub fn amf_ue_update(&self, amf_ue: &AmfUe) -> bool {
-        let mut amf_ue_list = self.amf_ue_list.write().unwrap();
-        if let Some(existing) = amf_ue_list.get_mut(&amf_ue.id) {
-            *existing = amf_ue.clone();
-            return true;
-        }
-        false
+        let in_list = {
+            let mut amf_ue_list = self.amf_ue_list.write().unwrap();
+            match amf_ue_list.get_mut(&amf_ue.id) {
+                Some(existing) => {
+                    *existing = amf_ue.clone();
+                    true
+                }
+                None => false,
+            }
+        };
+        // Taken after the list guard is dropped, never nested -- the same
+        // never-nest rule `amf_ue_remove` follows.
+        let in_store = self
+            .ue_store
+            .with_mut(amf_ue.id, |ue| ue.amf_ue = amf_ue.clone())
+            .is_some();
+        in_list || in_store
     }
 
     /// Associate AMF UE with RAN UE
@@ -3963,7 +3989,10 @@ mod tests {
         let gnb = ctx.gnb_add("192.168.0.9:38412").unwrap();
         let ran_ue = ctx.ran_ue_add(gnb.id, 2001).unwrap();
         let amf_ue = ctx.amf_ue_add(ran_ue.id).unwrap();
-        ctx.amf_ue_set_supi(amf_ue.id, supi);
+        let mut amf_ue = amf_ue;
+        amf_ue.supi = Some(supi.to_string());
+        ctx.amf_ue_update(&amf_ue);
+        ctx.amf_ue_publish(&amf_ue, 2001, 1);
 
         assert!(ctx.n1n2_subscription_add(
             supi,
