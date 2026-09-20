@@ -1335,8 +1335,63 @@ impl ScpProxy {
             // quietly routing somewhere else would hide that.
             return ApiRoot::parse(api_root).ok().map(|t| (t, None));
         }
-        let (api_root, path) = split_absolute_uri(&request.header.uri)?;
-        ApiRoot::parse(&api_root).ok().map(|t| (t, Some(path)))
+        if let Some((api_root, path)) = split_absolute_uri(&request.header.uri) {
+            return ApiRoot::parse(&api_root).ok().map(|t| (t, Some(path)));
+        }
+
+        // #259: the authority the peer addressed, now preserved beside the path
+        // rather than discarded. This is the TS 29.500 §6.10.7 case -- a producer
+        // names its callback target with an absolute URI and no Target-apiRoot --
+        // and before this it was unreachable over the wire, which made #210's
+        // routing rule a no-op outside in-process tests.
+        let authority = request.header.authority.as_deref()?;
+
+        // The authority on a request that reached THIS SCP is normally the SCP's
+        // own address, i.e. how it was dialled rather than where the callback
+        // should go. Forwarding there would loop back into this proxy, which is
+        // worse than the mis-route being fixed -- so an authority naming us is
+        // not a destination.
+        if self.authority_is_own(authority) {
+            log::debug!(
+                "SCP: callback authority {authority} is this SCP's own address; not \
+                 treating it as a callback target"
+            );
+            return None;
+        }
+
+        // A bare authority carries no scheme. `http` matches the scheme the SCP
+        // listens on and the one ApiRoot::parse defaults elsewhere in this file.
+        ApiRoot::parse(&format!("http://{authority}"))
+            .ok()
+            .map(|t| (t, Some(request.header.uri.clone())))
+    }
+
+    /// Whether `authority` names this SCP, comparing host only so that a peer
+    /// dialling us with or without an explicit port is recognised either way.
+    ///
+    /// The bracketed-IPv6 form is why this is not a bare `rsplit_once(':')`:
+    /// `[::1]:7777` splits at the LAST colon, which falls INSIDE the address and
+    /// yields `[::1`, letting a loopback authority through as a callback target.
+    /// Caught by the test rather than by inspection.
+    fn authority_is_own(&self, authority: &str) -> bool {
+        fn host_of(s: &str) -> String {
+            let s = s.trim();
+            // RFC 3986 §3.2.2: an IPv6 literal is bracketed, and only a colon
+            // AFTER the closing bracket separates the port.
+            let host = if let Some(rest) = s.strip_prefix('[') {
+                rest.split_once(']').map_or(rest, |(inner, _)| inner)
+            } else {
+                s.rsplit_once(':').map_or(s, |(h, _)| h)
+            };
+            host.to_ascii_lowercase()
+        }
+
+        let host = host_of(authority);
+        host == host_of(&self.config.own_fqdn)
+            || host == "localhost"
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
     }
 
     /// Model D delegated discovery (TS 29.500 §6.10.3, TS 29.510 §5.3.2):
@@ -4922,6 +4977,95 @@ mod tests {
         let mut req = SbiRequest::get("/namf-comm/v1/x");
         req.http.set_header(custom_header::CALLBACK, "Notify");
         assert_eq!(proxy.route(&req), RouteDecision::Reject);
+    }
+
+    /// #259: an absolute callback URI reaches the SCP as (path + authority), and
+    /// that authority now names the callback target.
+    ///
+    /// This is the case #259 filed: over HTTP/2 the server discarded the
+    /// authority, so `callback_target`'s absolute-URI arm was unreachable on the
+    /// wire and a §6.10.7-conformant producer was sent through delegated
+    /// discovery to the wrong node. Asserted POSITIVELY on the resolved target,
+    /// not merely on "not Discover".
+    #[test]
+    fn a_callback_authority_names_the_target_when_no_target_apiroot_is_sent() {
+        let proxy = ScpProxy::new(ScpProxyConfig {
+            own_fqdn: "scp.5gc.local".to_string(),
+            ..Default::default()
+        });
+
+        // What convert_request now produces for
+        // `POST http://amf.5gc.local:8080/namf-comm/v1/callback`: path in `uri`,
+        // authority beside it.
+        let mut req = SbiRequest::post("/namf-comm/v1/callback");
+        req.header.authority = Some("amf.5gc.local:8080".to_string());
+        req.http.set_header(custom_header::CALLBACK, "Notify");
+        // Discovery headers are present precisely so that a fall-through to
+        // Discover would be observable if the authority were ignored.
+        req.http.set_header(discovery_header::TARGET_NF_TYPE, "UDM");
+
+        match proxy.route(&req) {
+            RouteDecision::Callback {
+                target,
+                forward_uri,
+            } => {
+                assert_eq!((target.host.as_str(), target.port), ("amf.5gc.local", 8080));
+                assert_eq!(forward_uri.as_deref(), Some("/namf-comm/v1/callback"));
+            }
+            other => panic!("expected Callback to the authority, got {other:?}"),
+        }
+    }
+
+    /// The authority on a request that reached THIS SCP is how it was dialled,
+    /// not where a callback should go. Treating it as a target would forward the
+    /// notification back into this proxy -- a loop, which is worse than the
+    /// mis-route #259 fixes.
+    #[test]
+    fn a_callback_authority_naming_the_scp_itself_is_not_a_target() {
+        let proxy = ScpProxy::new(ScpProxyConfig {
+            own_fqdn: "scp.5gc.local".to_string(),
+            ..Default::default()
+        });
+
+        for authority in [
+            "scp.5gc.local",      // exact
+            "scp.5gc.local:8080", // with a port
+            "SCP.5GC.LOCAL",      // case-insensitive per RFC 3986 §3.2.2
+            "localhost:7777",
+            "127.0.0.1:7777",
+            "[::1]:7777",
+        ] {
+            let mut req = SbiRequest::post("/namf-comm/v1/callback");
+            req.header.authority = Some(authority.to_string());
+            req.http.set_header(custom_header::CALLBACK, "Notify");
+            req.http.set_header(discovery_header::TARGET_NF_TYPE, "UDM");
+
+            assert_eq!(
+                proxy.route(&req),
+                RouteDecision::Discover,
+                "authority {authority:?} names this SCP and must not be a callback target"
+            );
+        }
+    }
+
+    /// Precedence is unchanged: an explicit `Target-apiRoot` still outranks both
+    /// an absolute URI and an authority, because a producer that names its
+    /// destination explicitly must win over one inferred from the transport.
+    #[test]
+    fn target_apiroot_still_outranks_the_authority() {
+        let proxy = ScpProxy::new(ScpProxyConfig::default());
+
+        let mut req = SbiRequest::post("/namf-comm/v1/callback");
+        req.header.authority = Some("wrong.example:9999".to_string());
+        req.http.set_header(custom_header::CALLBACK, "Notify");
+        req.http.set_target_apiroot("http://right.example:8080");
+
+        match proxy.route(&req) {
+            RouteDecision::Callback { target, .. } => {
+                assert_eq!((target.host.as_str(), target.port), ("right.example", 8080));
+            }
+            other => panic!("expected the Target-apiRoot target, got {other:?}"),
+        }
     }
 
     /// scpd-#210 unit: `split_absolute_uri`.

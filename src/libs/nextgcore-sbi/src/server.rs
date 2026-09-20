@@ -593,6 +593,23 @@ async fn convert_request(
     let method = req.method().to_string();
     let uri = req.uri().path().to_string();
 
+    // #259: keep the authority the peer addressed, BESIDE the path rather than
+    // folded into it. hyper surfaces HTTP/2's `:authority` pseudo-header and an
+    // absolute-form request target's authority through the same `uri()`, so one
+    // read covers both; `Host` is the HTTP/1.1 fallback. Discarding this is what
+    // made an absolute callback URI (TS 29.500 §6.10.7) unroutable at the SCP.
+    let authority = req
+        .uri()
+        .authority()
+        .map(|a| a.to_string())
+        .or_else(|| {
+            req.headers()
+                .get(hyper::header::HOST)
+                .and_then(|h| h.to_str().ok())
+                .map(str::to_owned)
+        })
+        .filter(|a| !a.is_empty());
+
     // Extract headers.
     //
     // #65: APPEND rather than set. hyper yields one entry per field LINE, so a
@@ -705,6 +722,7 @@ async fn convert_request(
     // Decompose the URI per TS 29.501 §4.4 so handlers get service name,
     // API version and resource components without re-parsing the path.
     let mut header = crate::message::SbiHeader::with_method_uri(method, uri);
+    header.authority = authority;
     header.decompose_uri();
 
     Ok(SbiRequest {
