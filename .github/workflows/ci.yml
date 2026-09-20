@@ -254,8 +254,17 @@ jobs:
           cd nextgcore/docker/rust
           docker compose down -v
 
+  # NOT an end-to-end attach, and named so deliberately (#328). Nothing in either
+  # repo speaks S1AP or LTE NAS on the UE side, so no UE attach can be
+  # originated; `docker-compose-epc.yml` additionally has no PGW-C container, so
+  # the S5/S8 leg has nothing to reach. This stage asserts bring-up and PFCP
+  # association health, which is the largest honest claim available today, and
+  # catches the compose-drifts-from-the-binaries defect class.
+  #
+  # Option A (an LTE eNB + UE simulator in nextgsim) is what would make this a
+  # true mirror of the 5G stage. See specs/epc-e2e-scope.md.
   docker-e2e-epc:
-    name: Docker E2E (EPC)
+    name: EPC bring-up (no attach; see specs/epc-e2e-scope.md)
     runs-on: ubuntu-latest
     needs: docker-build
     steps:
@@ -298,22 +307,74 @@ jobs:
         run: |
           cd nextgcore/docker/rust
           docker compose -f docker-compose-epc.yml up -d mongodb-epc
-          sleep 5
           docker compose -f docker-compose-epc.yml up -d hss pcrf sgwc sgwu
-          sleep 5
           docker compose -f docker-compose-epc.yml up -d mme
-          sleep 10
 
-      - name: Health check
+      # Gates on the daemons' own runtime rather than a timer. The fixed sleeps
+      # this replaces passed whether or not anything associated, so the stage
+      # could not fail -- which is the #303 criterion-2 complaint.
+      - name: Wait for PFCP association (SGW-C <-> SGW-U over Sxa)
         run: |
           cd nextgcore/docker/rust
-          echo "=== Container status ==="
-          docker compose -f docker-compose-epc.yml ps
-          echo "=== Container details ==="
-          for svc in hss pcrf sgwc sgwu mme; do
-            echo "--- $svc ---"
-            docker inspect nextgcore-$svc --format '{{.State.Status}} {{.State.Health.Status}}' 2>/dev/null || echo "$svc not running"
+          for attempt in $(seq 1 60); do
+            associated=$(docker compose -f docker-compose-epc.yml exec -T sgwu \
+              sh -c "curl -fsS http://localhost:9090/metrics 2>/dev/null \
+                     | awk '/^sgwu_pfcp_associations /{print \$2}'" 2>/dev/null || echo "")
+            if [ -n "$associated" ] && [ "$associated" -ge 1 ] 2>/dev/null; then
+              echo "sgwu_pfcp_associations=$associated after ${attempt}s"
+              exit 0
+            fi
+            sleep 1
           done
+          echo "::error::sgwu_pfcp_associations never reached 1; the SGW-C did not establish Sxa"
+          docker compose -f docker-compose-epc.yml logs --tail=80 sgwc sgwu
+          exit 1
+
+      - name: Assert every EPC NF is healthy
+        run: |
+          cd nextgcore/docker/rust
+          docker compose -f docker-compose-epc.yml ps
+          rc=0
+          # A service missing from the compose file fails here rather than being
+          # silently skipped -- the compose-drift defect class this stage exists
+          # to catch (it would have caught the absent PGW-C service).
+          for svc in hss pcrf sgwc sgwu mme; do
+            state=$(docker inspect "nextgcore-$svc" --format '{{.State.Status}}' 2>/dev/null || echo "absent")
+            health=$(docker inspect "nextgcore-$svc" --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' 2>/dev/null || echo "absent")
+            echo "$svc: state=$state health=$health"
+            if [ "$state" != "running" ]; then
+              echo "::error::$svc is $state, expected running"
+              rc=1
+            fi
+            if [ "$health" = "unhealthy" ]; then
+              echo "::error::$svc reports unhealthy"
+              rc=1
+            fi
+          done
+          exit $rc
+
+      # Stated where an operator reads it, not only in the spec: a green stage
+      # here must not be mistaken for a working EPC attach.
+      - name: State what this stage does NOT assert
+        if: always()
+        run: |
+          cat <<'NOTE'
+          === EPC bring-up stage: scope (see nextgcore specs/epc-e2e-scope.md, #328) ===
+          ASSERTED: all five EPC NFs run and report healthy; the SGW-C established a
+                    PFCP (Sxa) association with the SGW-U, read from the SGW-U's own
+                    live metrics rather than from a timer.
+
+          NOT ASSERTED, and why:
+            * No UE attach. Neither repo has an LTE eNB or UE simulator -- no S1AP
+              (TS 36.413) and no EMM/ESM (TS 24.301) UE side exists, and the compose
+              file has no enb/ue service. The MME's attach chain IS complete in code
+              (s1ap_handler.rs:682 -> nas_dispatch -> s11_handler.rs:258/511); only
+              the originator is missing. Tracked as option A in #328.
+            * No GTP-U user-plane forwarding, and so no 0%-loss claim: that needs an
+              attach to establish a bearer first.
+            * No S5/S8 leg. docker-compose-epc.yml defines no PGW-C/SMF container, so
+              the SMF(PGW) hop of #303's chain has nothing to reach.
+          NOTE
 
       - name: Collect logs on failure
         if: failure()
