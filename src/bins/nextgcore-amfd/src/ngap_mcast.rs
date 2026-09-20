@@ -28,54 +28,13 @@ use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
-use bytes::{BufMut, BytesMut};
+use nextgcore_ngap::ie::MulticastGroupPagingArea;
+use nextgcore_ngap::mbs_transfer::MbsSessionId;
+use nextgcore_ngap::types::TaiListItem;
 
-/// Minimal byte-buffer builder for the simplified MBS NGAP messages below.
-///
-/// The MBS procedures (TS 38.413 Section 9.2.9) are not exposed by nextgcore-ngap
-/// yet, so these messages keep their simplified internal layout. This builder
-/// is private to this module so it cannot leak into the NGAP wire path.
-#[derive(Debug, Default)]
-struct McastMessageBuilder {
-    buffer: BytesMut,
-}
-
-impl McastMessageBuilder {
-    fn new() -> Self {
-        Self {
-            buffer: BytesMut::with_capacity(256),
-        }
-    }
-
-    fn write_u8(&mut self, value: u8) -> &mut Self {
-        self.buffer.put_u8(value);
-        self
-    }
-
-    fn write_u16(&mut self, value: u16) -> &mut Self {
-        self.buffer.put_u16(value);
-        self
-    }
-
-    fn write_u32(&mut self, value: u32) -> &mut Self {
-        self.buffer.put_u32(value);
-        self
-    }
-
-    fn write_u64(&mut self, value: u64) -> &mut Self {
-        self.buffer.put_u64(value);
-        self
-    }
-
-    fn write_bytes(&mut self, data: &[u8]) -> &mut Self {
-        self.buffer.put_slice(data);
-        self
-    }
-
-    fn build(self) -> Vec<u8> {
-        self.buffer.to_vec()
-    }
-}
+/// `maxnoofTAIforPaging` (38413-j30.txt:59347), the ASN.1 upper bound on
+/// `MBS-AreaTAIList`.
+const MAX_TAI_FOR_PAGING: usize = 16;
 
 /// NGAP procedure codes for MBS.
 ///
@@ -266,14 +225,9 @@ impl NgapMcastContext {
             });
 
             // Build NGAP Multicast Session Activation Request
-            let msg = build_mcast_session_activation_request(
-                &session.tmgi,
-                session_id,
-                &transport,
-                session.sst,
-                session.sd,
-            );
-            messages.push((gnb_id, msg));
+            if let Some(msg) = build_mcast_session_activation_request(&session.tmgi) {
+                messages.push((gnb_id, msg));
+            }
         }
 
         log::info!(
@@ -359,8 +313,9 @@ impl NgapMcastContext {
         for gnb_ctx in &mut session.gnb_sessions {
             if gnb_ctx.state == MbsSessionState::Active {
                 gnb_ctx.state = MbsSessionState::Deactivating;
-                let msg = build_mcast_session_deactivation_request(&session.tmgi, session_id);
-                messages.push((gnb_ctx.gnb_id, msg));
+                if let Some(msg) = build_mcast_session_deactivation_request(&session.tmgi) {
+                    messages.push((gnb_ctx.gnb_id, msg));
+                }
             }
         }
 
@@ -431,11 +386,7 @@ impl NgapMcastContext {
         let sessions = self.sessions.read().ok()?;
         let session = sessions.get(&session_id)?;
 
-        Some(build_mcast_group_paging(
-            &session.tmgi,
-            session_id,
-            &session.area_tacs,
-        ))
+        build_mcast_group_paging(&session.tmgi, &session.area_tacs)
     }
 
     /// Get all active MBS sessions
@@ -466,90 +417,86 @@ impl Default for NgapMcastContext {
 // NGAP Message Building for MBS
 // ============================================================================
 
-/// Build Multicast Session Activation Request (AMF -> gNB)
-/// TS 38.413 Section 9.2.9.1
-fn build_mcast_session_activation_request(
-    tmgi: &Tmgi,
-    session_id: u64,
-    transport: &McastTransportInfo,
-    sst: u8,
-    sd: Option<u32>,
-) -> Vec<u8> {
-    let mut builder = McastMessageBuilder::new();
-
-    // Procedure code
-    builder.write_u16(mbs_procedure_code::MULTICAST_SESSION_ACTIVATION);
-    builder.write_u8(0); // criticality: reject
-
-    // MBS Session ID
-    builder.write_u64(session_id);
-
-    // TMGI
-    builder.write_bytes(&tmgi.mbs_service_id);
-    builder.write_bytes(&tmgi.plmn_id);
-
-    // S-NSSAI
-    builder.write_u8(sst);
-    if let Some(sd_val) = sd {
-        builder.write_u8(1); // SD present
-        builder.write_u8((sd_val >> 16) as u8);
-        builder.write_u8((sd_val >> 8) as u8);
-        builder.write_u8(sd_val as u8);
-    } else {
-        builder.write_u8(0); // SD not present
-    }
-
-    // Multicast Transport Layer Information
-    builder.write_u32(transport.dl_teid);
-    let addr_octets = transport.transport_addr.octets();
-    builder.write_u8(4); // IPv4 address length
-    builder.write_bytes(&addr_octets);
-
-    builder.build()
+/// The TMGI as the shared NGAP codec spells it.
+///
+/// `MBS-SessionID` carries the TMGI as PLMN identity then MBS service id
+/// (TS 38.413 §9.3.1.176). Converting here rather than storing an
+/// `MbsSessionId` directly keeps [`Tmgi`]'s `Hash`/`Eq` index usable.
+fn mbs_session_id_of(tmgi: &Tmgi) -> MbsSessionId {
+    MbsSessionId::new(tmgi.plmn_id, tmgi.mbs_service_id)
 }
 
-/// Build Multicast Session Deactivation Request (AMF -> gNB)
-/// TS 38.413 Section 9.2.9.3
-fn build_mcast_session_deactivation_request(tmgi: &Tmgi, session_id: u64) -> Vec<u8> {
-    let mut builder = McastMessageBuilder::new();
-
-    builder.write_u16(mbs_procedure_code::MULTICAST_SESSION_DEACTIVATION);
-    builder.write_u8(0); // criticality: reject
-
-    // MBS Session ID
-    builder.write_u64(session_id);
-
-    // TMGI
-    builder.write_bytes(&tmgi.mbs_service_id);
-    builder.write_bytes(&tmgi.plmn_id);
-
-    builder.build()
+/// Build Multicast Session Activation Request (AMF -> gNB), TS 38.413 §9.2.9.1.
+///
+/// Delegates to `nextgcore_ngap::builder`, so the PDU is real APER with the
+/// outer CHOICE index in byte 0 and the procedure code in byte 1.
+///
+/// The `transport`, `sst` and `sd` the AMF holds are deliberately NOT sent:
+/// `MulticastSessionActivationRequest` carries only `MBS-SessionID` and the
+/// activation transfer (38413-j30.txt:42786). Multicast transport is set up by
+/// the Distribution Setup procedures (69/70) against the MB-UPF; S-NSSAI is not
+/// an IE of this message at all.
+fn build_mcast_session_activation_request(tmgi: &Tmgi) -> Option<Vec<u8>> {
+    nextgcore_ngap::builder::build_multicast_session_activation_request(&mbs_session_id_of(tmgi))
+        .map_err(|e| log::error!("failed to encode MulticastSessionActivationRequest: {e}"))
+        .ok()
 }
 
-/// Build Multicast Group Paging (AMF -> gNBs in MBS area)
-/// TS 38.413 Section 9.2.9.5
-fn build_mcast_group_paging(tmgi: &Tmgi, session_id: u64, area_tacs: &[u32]) -> Vec<u8> {
-    let mut builder = McastMessageBuilder::new();
+/// Build Multicast Session Deactivation Request (AMF -> gNB), TS 38.413 §9.2.9.3.
+fn build_mcast_session_deactivation_request(tmgi: &Tmgi) -> Option<Vec<u8>> {
+    nextgcore_ngap::builder::build_multicast_session_deactivation_request(&mbs_session_id_of(tmgi))
+        .map_err(|e| log::error!("failed to encode MulticastSessionDeactivationRequest: {e}"))
+        .ok()
+}
 
-    builder.write_u16(mbs_procedure_code::MULTICAST_GROUP_PAGING);
-    builder.write_u8(1); // criticality: ignore
-
-    // MBS Session ID
-    builder.write_u64(session_id);
-
-    // TMGI
-    builder.write_bytes(&tmgi.mbs_service_id);
-    builder.write_bytes(&tmgi.plmn_id);
-
-    // MBS Service Area TAC list
-    builder.write_u8(area_tacs.len() as u8);
-    for &tac in area_tacs {
-        builder.write_u8((tac >> 16) as u8);
-        builder.write_u8((tac >> 8) as u8);
-        builder.write_u8(tac as u8);
+/// Build Multicast Group Paging (AMF -> gNBs in the MBS area), TS 38.413 §9.2.9.5.
+///
+/// The stored `area_tacs` become one `MulticastGroupPagingArea` whose
+/// `MBS-AreaTAIList` is those TACs under the AMF's own PLMN. `MBS-AreaTAIList`
+/// is `SEQUENCE (SIZE(1..16)) OF TAI`, so an empty area list cannot be encoded
+/// and yields `None` rather than a PDU asserting an empty area.
+fn build_mcast_group_paging(tmgi: &Tmgi, area_tacs: &[u32]) -> Option<Vec<u8>> {
+    // The APER encoder ALSO refuses a zero length against `SIZE(1..16)` with a
+    // ConstraintViolation, so this early return is not what makes an empty area
+    // safe -- it is what makes the REASON legible. An operator reading
+    // "ConstraintViolation { value: 0, min: 1 }" cannot tell that the session
+    // simply has no service area configured.
+    //
+    // Deliberately NOT claimed as a revert-verified guard: removing it leaves
+    // behaviour identical (verified -- the test still passes with it gone),
+    // which is precisely why the test pins the populated/empty CONTRAST rather
+    // than the empty case alone.
+    if area_tacs.is_empty() {
+        log::warn!(
+            "MulticastGroupPaging not built: MBS-AreaTAIList has ASN.1 lower bound 1 and the \
+             session carries no service-area TAC"
+        );
+        return None;
     }
 
-    builder.build()
+    let area_tai_list = area_tacs
+        .iter()
+        .take(MAX_TAI_FOR_PAGING)
+        .map(|&tac| TaiListItem {
+            tai_plmn: tmgi.plmn_id,
+            tai_tac: [(tac >> 16) as u8, (tac >> 8) as u8, tac as u8],
+        })
+        .collect();
+
+    if area_tacs.len() > MAX_TAI_FOR_PAGING {
+        log::warn!(
+            "MulticastGroupPaging area truncated to maxnoofTAIforPaging={MAX_TAI_FOR_PAGING} \
+             (session carries {} TACs)",
+            area_tacs.len()
+        );
+    }
+
+    nextgcore_ngap::builder::build_multicast_group_paging(
+        &mbs_session_id_of(tmgi),
+        &[MulticastGroupPagingArea { area_tai_list }],
+    )
+    .map_err(|e| log::error!("failed to encode MulticastGroupPaging: {e}"))
+    .ok()
 }
 
 // ============================================================================
@@ -559,6 +506,7 @@ fn build_mcast_group_paging(tmgi: &Tmgi, session_id: u64, area_tacs: &[u32]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nextgcore_asn1c::ngap::types::ProcedureCode;
 
     fn test_tmgi() -> Tmgi {
         Tmgi::new(0x000101, [0x00, 0xF1, 0x10])
@@ -737,46 +685,139 @@ mod tests {
         assert_eq!(s2_found.state, MbsSessionState::Inactive);
     }
 
+    /// Decode an MBS PDU the way a real peer does: byte 0 is the outer NGAP
+    /// CHOICE index and byte 1 is the procedure code (TS 38.413 §9.1).
+    ///
+    /// The tests this replaces read `(msg[0] << 8) | msg[1]` as a u16 procedure
+    /// code, which is what the deleted byte-writer emitted -- so they agreed
+    /// with a format no gNB could parse, and compared a built PDU against the
+    /// same constant it was built from. Decoding through the real codec is what
+    /// makes these assertions mean something.
+    fn decode_initiating(msg: &[u8]) -> (u8, Vec<u16>) {
+        use nextgcore_asn1c::ngap::pdu::{InitiatingMessageValue, NgapPdu};
+        use nextgcore_asn1c::per::{AperDecode, AperDecoder};
+
+        let mut decoder = AperDecoder::new(msg);
+        let pdu = NgapPdu::decode_aper(&mut decoder).expect("MBS PDU must decode as APER");
+        let NgapPdu::InitiatingMessage(im) = pdu else {
+            panic!("expected an InitiatingMessage");
+        };
+        // MBS procedures are not in the generated InitiatingMessageValue enum,
+        // so the decoder routes them to `Other` -- which is the variant the
+        // builders encode through. Asserting on it proves the round trip took
+        // the same path a peer's decoder would.
+        let InitiatingMessageValue::Other(ies) = im.value else {
+            panic!("MBS procedures decode through InitiatingMessageValue::Other");
+        };
+        assert_eq!(msg[0], 0x00, "InitiatingMessage is outer CHOICE index 0");
+        (
+            im.procedure_code.0,
+            ies.ies.iter().map(|ie| ie.id.0).collect(),
+        )
+    }
+
     #[test]
-    fn test_group_paging() {
+    fn a_group_paging_pdu_decodes_as_procedure_74_with_its_area_list() {
         let ctx = NgapMcastContext::new();
         let session = ctx
             .session_create(test_tmgi(), 1, None, vec![1, 2, 3])
             .unwrap();
 
-        let paging_msg = ctx.build_group_paging(session.mbs_session_id).unwrap();
-        assert!(!paging_msg.is_empty());
+        let msg = ctx.build_group_paging(session.mbs_session_id).unwrap();
+        let (proc_code, ies) = decode_initiating(&msg);
+        assert_eq!(proc_code, ProcedureCode::MULTICAST_GROUP_PAGING.0);
+        assert_eq!(proc_code, 74, "38413-j30.txt:59161");
 
-        // Verify procedure code
-        let proc_code = (paging_msg[0] as u16) << 8 | paging_msg[1] as u16;
-        assert_eq!(proc_code, mbs_procedure_code::MULTICAST_GROUP_PAGING);
+        // The IEs are the ones TS 38.413 lists, and the area list is present
+        // rather than merely the session id.
+        assert!(ies.contains(&299), "id-MBS-SessionID");
+        assert!(ies.contains(&307), "id-MulticastGroupPagingAreaList");
     }
 
+    /// A session with no service-area TAC yields NO paging PDU, while an
+    /// otherwise identical session WITH a TAC does -- `MBS-AreaTAIList` is
+    /// `SEQUENCE (SIZE(1..16)) OF TAI`, so there is no such thing as a paging
+    /// PDU for an empty area, and inventing a TAC would page the wrong cells.
+    ///
+    /// Asserted as a CONTRAST pair on purpose. The empty half alone would be a
+    /// false guard: `None` is also what a constraint violation, a lookup miss or
+    /// any other early return produces, so it is satisfied by paths that never
+    /// reach the area list. Only the populated half proves the builder works,
+    /// and only together do they show the empty case is a decision rather than a
+    /// failure. (Measured: removing the explicit `is_empty` check leaves the
+    /// empty half passing, because the encoder refuses length 0 anyway.)
     #[test]
-    fn test_build_activation_message() {
-        let tmgi = test_tmgi();
-        let transport = McastTransportInfo {
-            dl_teid: 0x1234,
-            transport_addr: Ipv4Addr::new(10, 0, 0, 1),
-        };
+    fn a_session_with_no_service_area_builds_no_group_paging() {
+        let ctx = NgapMcastContext::new();
 
-        let msg = build_mcast_session_activation_request(&tmgi, 1, &transport, 1, Some(0x010203));
-        assert!(!msg.is_empty());
-
-        let proc_code = (msg[0] as u16) << 8 | msg[1] as u16;
-        assert_eq!(proc_code, mbs_procedure_code::MULTICAST_SESSION_ACTIVATION);
-    }
-
-    #[test]
-    fn test_build_deactivation_message() {
-        let tmgi = test_tmgi();
-        let msg = build_mcast_session_deactivation_request(&tmgi, 1);
-        assert!(!msg.is_empty());
-
-        let proc_code = (msg[0] as u16) << 8 | msg[1] as u16;
-        assert_eq!(
-            proc_code,
-            mbs_procedure_code::MULTICAST_SESSION_DEACTIVATION
+        let empty = ctx.session_create(test_tmgi(), 1, None, vec![]).unwrap();
+        assert!(
+            ctx.build_group_paging(empty.mbs_session_id).is_none(),
+            "no service area means no paging PDU"
         );
+
+        let populated = ctx
+            .session_create(Tmgi::new(0x00AAAA, [0x00, 0xF1, 0x10]), 1, None, vec![7])
+            .unwrap();
+        let msg = ctx
+            .build_group_paging(populated.mbs_session_id)
+            .expect("one TAC is enough to page");
+        let (proc_code, ies) = decode_initiating(&msg);
+        assert_eq!(proc_code, ProcedureCode::MULTICAST_GROUP_PAGING.0);
+        assert!(ies.contains(&307), "the area list must be on the wire");
+    }
+
+    #[test]
+    fn an_activation_pdu_decodes_as_procedure_71_carrying_session_id_and_transfer() {
+        let msg = build_mcast_session_activation_request(&test_tmgi()).unwrap();
+        let (proc_code, ies) = decode_initiating(&msg);
+        assert_eq!(proc_code, ProcedureCode::MULTICAST_SESSION_ACTIVATION.0);
+        assert_eq!(proc_code, 71, "38413-j30.txt:59155");
+        assert_eq!(
+            ies,
+            vec![299, 304],
+            "TS 38.413 lists exactly id-MBS-SessionID and \
+             id-MulticastSessionActivationRequestTransfer (38413-j30.txt:42786)"
+        );
+    }
+
+    #[test]
+    fn a_deactivation_pdu_decodes_as_procedure_72_with_its_own_transfer_ie() {
+        let msg = build_mcast_session_deactivation_request(&test_tmgi()).unwrap();
+        let (proc_code, ies) = decode_initiating(&msg);
+        assert_eq!(proc_code, ProcedureCode::MULTICAST_SESSION_DEACTIVATION.0);
+        assert_eq!(proc_code, 72, "38413-j30.txt:59157");
+        assert_eq!(
+            ies,
+            vec![299, 305],
+            "deactivation transfer is IE 305, not 304"
+        );
+    }
+
+    /// The four MBS procedure codes are pairwise distinct AND distinct from the
+    /// live neighbours they were once confused with. The pre-fix module used
+    /// 68/69/70/71, so activation was labelled `id-BroadcastSessionSetup`.
+    #[test]
+    fn mbs_procedure_codes_are_distinct_from_the_broadcast_procedures() {
+        let codes = [
+            ProcedureCode::MULTICAST_SESSION_ACTIVATION.0,
+            ProcedureCode::MULTICAST_SESSION_DEACTIVATION.0,
+            ProcedureCode::MULTICAST_SESSION_UPDATE.0,
+            ProcedureCode::MULTICAST_GROUP_PAGING.0,
+        ];
+        assert_eq!(codes, [71, 72, 73, 74]);
+
+        // Controls: the codes an off-by-three lands on (38413-j30.txt:59145-59153).
+        assert_eq!(ProcedureCode::BROADCAST_SESSION_MODIFICATION.0, 66);
+        assert_eq!(ProcedureCode::BROADCAST_SESSION_RELEASE.0, 67);
+        assert_eq!(ProcedureCode::BROADCAST_SESSION_SETUP.0, 68);
+        assert_eq!(ProcedureCode::DISTRIBUTION_SETUP.0, 69);
+        assert_eq!(ProcedureCode::DISTRIBUTION_RELEASE.0, 70);
+        for code in codes {
+            assert!(
+                !(66..=70).contains(&code),
+                "procedure {code} collides with a broadcast/distribution procedure"
+            );
+        }
     }
 }

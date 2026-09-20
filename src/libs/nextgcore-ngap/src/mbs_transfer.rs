@@ -177,7 +177,10 @@ impl MbsSessionId {
         }
     }
 
-    fn encode(&self, encoder: &mut AperEncoder) -> NgapResult<()> {
+    /// Crate-visible so the MBS IE encoders in `ie` can reuse it: the AMF's
+    /// `MBS-SessionID` IE and the MB-SMF's transfers must not drift apart on
+    /// TMGI layout.
+    pub(crate) fn encode(&self, encoder: &mut AperEncoder) -> NgapResult<()> {
         if let Some(nid) = self.nid {
             if nid >= (1u64 << 44) {
                 return Err(invalid(

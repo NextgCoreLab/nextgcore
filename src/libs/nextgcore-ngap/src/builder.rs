@@ -1442,6 +1442,83 @@ pub fn build_handover_preparation_failure(msg: &HandoverPreparationFailure) -> N
     encode_pdu(&pdu)
 }
 
+// ============================================================================
+// MBS: multicast session procedures (TS 23.247 / TS 38.413 §9.2.9)
+// ============================================================================
+
+/// Build a Multicast Session Activation Request (AMF -> NG-RAN).
+///
+/// `MulticastSessionActivationRequest` (38413-j30.txt:42777) carries exactly two
+/// mandatory IEs and nothing else:
+///
+/// - `id-MBS-SessionID` = 299, criticality reject
+/// - `id-MulticastSessionActivationRequestTransfer` = 304, criticality reject,
+///   `OCTET STRING (CONTAINING MulticastSessionActivationRequestTransfer)`
+///
+/// The transfer (`:51642`) restates the session id, which is why it appears
+/// twice rather than one copy being redundant.
+///
+/// Note what the message does NOT carry: no S-NSSAI, no TEID, no transport
+/// address, no TAC list. Multicast transport is established by the Distribution
+/// Setup procedures (69/70) against the MB-UPF, not in the activation request.
+pub fn build_multicast_session_activation_request(
+    mbs_session_id: &crate::mbs_transfer::MbsSessionId,
+) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+    ie::encode_mbs_session_id(&mut container, mbs_session_id)?;
+    ie::encode_multicast_session_activation_request_transfer(&mut container, mbs_session_id)?;
+
+    let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::MULTICAST_SESSION_ACTIVATION,
+        criticality: Criticality::Reject,
+        value: InitiatingMessageValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+/// Build a Multicast Session Deactivation Request (AMF -> NG-RAN).
+///
+/// Same shape as activation (38413-j30.txt:42892) with
+/// `id-MulticastSessionDeactivationRequestTransfer` = 305.
+pub fn build_multicast_session_deactivation_request(
+    mbs_session_id: &crate::mbs_transfer::MbsSessionId,
+) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+    ie::encode_mbs_session_id(&mut container, mbs_session_id)?;
+    ie::encode_multicast_session_deactivation_request_transfer(&mut container, mbs_session_id)?;
+
+    let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::MULTICAST_SESSION_DEACTIVATION,
+        criticality: Criticality::Reject,
+        value: InitiatingMessageValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+/// Build a Multicast Group Paging (AMF -> NG-RAN).
+///
+/// `id-MBS-SessionID` = 299 (reject) plus `id-MulticastGroupPagingAreaList`
+/// = 307 (criticality **ignore**, unlike the two above), per
+/// 38413-j30.txt:43085.
+pub fn build_multicast_group_paging(
+    mbs_session_id: &crate::mbs_transfer::MbsSessionId,
+    paging_areas: &[ie::MulticastGroupPagingArea],
+) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+    ie::encode_mbs_session_id(&mut container, mbs_session_id)?;
+    ie::encode_multicast_group_paging_area_list(&mut container, paging_areas)?;
+
+    let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::MULTICAST_GROUP_PAGING,
+        criticality: Criticality::Ignore,
+        value: InitiatingMessageValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
 #[cfg(test)]
 mod ng_setup_cross_codec {
     //! Cross-codec NG Setup regression guards (E2E NGAP reconciliation).

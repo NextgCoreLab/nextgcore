@@ -34,6 +34,7 @@ use std::time::Duration;
 
 mod context;
 mod n4mb;
+mod namf_client;
 mod subscription;
 mod types;
 
@@ -551,6 +552,37 @@ async fn handle_mbs_session_create(request: &SbiRequest) -> SbiResponse {
                 if let Ok(context) = ctx.read() {
                     context.session_update(&session);
                 }
+            }
+
+            // #75: discover the serving AMF and create the MBS context on it
+            // (TS 23.247 §7.3.1 step 2). This handler used to terminate at
+            // `session_add`, so no AMF interaction happened at all and the N2 MBS
+            // SM containers this MB-SMF builds were never carried to the RAN.
+            //
+            // Deliberately AFTER the local session exists and does NOT fail the
+            // create: the MBS session is the MB-SMF's own resource and TS 29.532
+            // defines no failure cause for "the AMF leg did not complete". A
+            // failure is logged and the RAN simply does not have the session,
+            // which the log names rather than hides.
+            match namf_client::discover_amf().await {
+                Some(amf) => match namf_client::context_create(&amf, &session.tmgi).await {
+                    Some(context_ref) => log::info!(
+                        "MBS session {session_id}: AMF {}:{} created MBS context {context_ref}",
+                        amf.host,
+                        amf.port
+                    ),
+                    None => log::warn!(
+                        "MBS session {session_id}: AMF {}:{} did not create an MBS context; \
+                         the RAN does not have this session",
+                        amf.host,
+                        amf.port
+                    ),
+                },
+                None => log::warn!(
+                    "MBS session {session_id}: no serving AMF discovered (NRF unconfigured, \
+                     unreachable, or no AMF advertises namf-mbs-bc); the RAN does not have \
+                     this session"
+                ),
             }
 
             // mbsmfd-06: respond with CreateRspData{ mbsSession }.

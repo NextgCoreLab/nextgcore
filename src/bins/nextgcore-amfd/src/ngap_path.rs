@@ -217,6 +217,16 @@ pub(crate) static UL_NRPPA_DROPPED_NO_CONSUMER: std::sync::atomic::AtomicU64 =
 // NGAP Server State
 // ============================================================================
 
+/// Which outcome a gNB returned for an AMF-initiated MBS procedure.
+///
+/// Distinguished by the outer NGAP CHOICE index: `0x20` SuccessfulOutcome,
+/// `0x40` UnsuccessfulOutcome (TS 38.413 §9.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MbsOutcome {
+    Successful,
+    Unsuccessful,
+}
+
 /// Connected gNB session
 #[derive(Debug)]
 pub struct GnbSession {
@@ -1135,6 +1145,18 @@ impl NgapServer {
                          from association {association_id}"
                     );
                 }
+            }
+            Some(68) | Some(71) | Some(72) | Some(73) | Some(74) => {
+                // MBS procedures (TS 23.247, TS 38.413 §9.2.9): BroadcastSessionSetup
+                // (68), MulticastSession{Activation,Deactivation,Update} (71/72/73)
+                // and MulticastGroupPaging (74). All are AMF->NG-RAN initiating
+                // messages, so what arrives here is the gNB's OUTCOME.
+                //
+                // Before this arm they fell to the `_` fallthrough and were answered
+                // with an ErrorIndication, which told a conformant gNB the AMF does
+                // not implement MBS at all.
+                self.handle_mbs_outcome(association_id, procedure_code, data)
+                    .await?;
             }
             Some(19) | Some(44) | Some(48) | Some(52) => {
                 // Expected gNB-initiated procedures the AMF accepts without a
@@ -7285,6 +7307,117 @@ impl NgapServer {
             .await;
         }
         Ok(())
+    }
+
+    /// Handle an NG-RAN outcome for an MBS procedure (TS 23.247, TS 38.413 §9.2.9).
+    ///
+    /// All MBS procedures the AMF drives are AMF->NG-RAN initiating messages, so
+    /// what arrives on the association is the gNB's Successful (`0x20`) or
+    /// Unsuccessful (`0x40`) outcome. This updates the per-gNB session state in
+    /// [`crate::ngap_mcast::NgapMcastContext`] so the MB-SMF can later be told
+    /// what the RAN did.
+    ///
+    /// The session is located by `MBS-SessionID` (IE 299), which every MBS
+    /// message carries, rather than by association: one gNB can hold several MBS
+    /// sessions, so the association alone does not identify one.
+    ///
+    /// No ErrorIndication is emitted for an unparseable outcome. The procedure is
+    /// one the AMF *does* implement, so the TS 38.413 §10.3 cause that the `_`
+    /// fallthrough would attach (`abstract-syntax-error-reject`) would be a lie;
+    /// the honest response to a malformed outcome of a known procedure is to log
+    /// it and leave the session in its current state, which a later timeout or a
+    /// re-drive resolves.
+    async fn handle_mbs_outcome(
+        &mut self,
+        association_id: u64,
+        procedure_code: Option<u16>,
+        data: &[u8],
+    ) -> Result<()> {
+        let outcome = match data.first() {
+            Some(0x20) => MbsOutcome::Successful,
+            Some(0x40) => MbsOutcome::Unsuccessful,
+            // An INITIATING MBS message from a gNB. Only
+            // BroadcastSessionReleaseRequired (75) is gNB-initiated in TS 38.413,
+            // and it is not in this arm, so this is a peer error.
+            _ => {
+                log::warn!(
+                    "MBS procedure {procedure_code:?} arrived as an initiating message from \
+                     association {association_id}; the AMF is the initiator for 68/71/72/73/74"
+                );
+                return Ok(());
+            }
+        };
+
+        let Some(mbs_session_id) = crate::ngap_asn1::extract_mbs_session_id(data) else {
+            log::warn!(
+                "MBS outcome for procedure {procedure_code:?} from association \
+                 {association_id} carries no decodable MBS-SessionID (IE 299); \
+                 session state left unchanged"
+            );
+            return Ok(());
+        };
+
+        let gnb_id = self.gnb_id_for_association(association_id).await;
+        let mcast = crate::context::amf_mcast();
+
+        let Some(session) = mcast.session_find_by_tmgi(&mbs_session_id) else {
+            log::warn!(
+                "MBS outcome for an unknown session (tmgi_svc={:#x}) from association \
+                 {association_id}; the AMF holds no such MBS session",
+                mbs_session_id.service_id_u32()
+            );
+            return Ok(());
+        };
+        let session_id = session.mbs_session_id;
+        let success = matches!(outcome, MbsOutcome::Successful);
+
+        match procedure_code {
+            Some(71) => {
+                // The gNB's UL TEID would arrive in the activation response's
+                // transfer. It is NOT read here: multicast transport is
+                // established by the Distribution Setup procedures (69/70), which
+                // this AMF does not yet drive, so there is nowhere for a TEID to
+                // be used. Recording one would be a value with no consumer.
+                let all = mcast.session_activation_response(session_id, gnb_id, None, success);
+                log::info!(
+                    "MBS activation outcome: session={session_id} gnb={gnb_id} \
+                     success={success} all_responded={all}"
+                );
+            }
+            Some(72) => {
+                let all = mcast.session_deactivation_response(session_id, gnb_id);
+                log::info!(
+                    "MBS deactivation outcome: session={session_id} gnb={gnb_id} \
+                     all_inactive={all}"
+                );
+            }
+            // 68 (BroadcastSessionSetup), 73 (MulticastSessionUpdate) and 74
+            // (MulticastGroupPaging) have no state transition to record yet:
+            // broadcast sessions are not modelled in NgapMcastContext, update has
+            // no AMF-side driver, and paging is fire-and-forget with criticality
+            // ignore. Logged so the outcome is visible rather than silently
+            // dropped, and deliberately not invented into a state change.
+            other => {
+                log::info!(
+                    "MBS outcome for procedure {other:?} from association {association_id} \
+                     (session={session_id} gnb={gnb_id} success={success}) accepted; \
+                     no AMF state transition is defined for it yet"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The gNB id this association belongs to, or 0 when the association has no
+    /// completed NG Setup.
+    async fn gnb_id_for_association(&self, association_id: u64) -> u32 {
+        self.sessions
+            .read()
+            .await
+            .get(&association_id)
+            .map(|g| g.id as u32)
+            .unwrap_or(0)
     }
 
     /// Handle UE Context Release Request from gNB
