@@ -100,6 +100,25 @@ name the scheduled job that does.
   dispatch-gated (CONVENTIONS.md) is superseded for the cross-repo E2E case
   specifically: the answer is now the two-gate split, not a decision issue.
 
+## Follow-up found by the first dispatched run (2026-09-20)
+
+Dispatching the workflow after this landed exposed that the cross-repo checkout
+was **already broken, and had been for some time**: all three
+`actions/checkout` steps pinned `ref: first_implementation`, and nextgsim has
+since renamed its default branch, so `git ls-remote --heads` shows only `main`.
+Every heavy job failed at checkout with `The process '/usr/bin/git' failed with
+exit code 1`.
+
+This is the failure mode the decision above was written to prevent, arriving
+one layer deeper than expected: the job was not merely unrun, it was
+**unrunnable**, and dispatch-only gating is exactly why nobody noticed. The last
+successful heavy run was 2026-07-05.
+
+Fixed by tracking `main` rather than re-pinning: a pinned ref is the thing that
+rotted, and a cross-repo E2E is only meaningful against current nextgsim. With
+the nightly schedule now in place, a future rename surfaces within a day instead
+of whenever someone next presses the button.
+
 ## Verification
 
 - `.github/workflows/ci.yml` parses and the three heavy jobs carry a condition

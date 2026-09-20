@@ -1552,6 +1552,134 @@ fn encode_tai_inline(encoder: &mut AperEncoder, tai: &TaiListItem) -> NgapResult
     Ok(())
 }
 
+// ============================================================================
+// MBS IEs (TS 23.247 / TS 38.413 §9.3.5)
+// ============================================================================
+
+/// `id-MBS-SessionID` (38413-j30.txt:60029)
+pub const IE_ID_MBS_SESSION_ID: u16 = 299;
+/// `id-MulticastSessionActivationRequestTransfer` (:60039)
+pub const IE_ID_MULTICAST_SESSION_ACTIVATION_REQUEST_TRANSFER: u16 = 304;
+/// `id-MulticastSessionDeactivationRequestTransfer` (:60041)
+pub const IE_ID_MULTICAST_SESSION_DEACTIVATION_REQUEST_TRANSFER: u16 = 305;
+/// `id-MulticastGroupPagingAreaList` (:60045)
+pub const IE_ID_MULTICAST_GROUP_PAGING_AREA_LIST: u16 = 307;
+
+/// `MulticastGroupPagingAreaItem ::= SEQUENCE { multicastGroupPagingArea,
+/// uE-PagingList OPTIONAL, iE-Extensions OPTIONAL, ... }` (:51714).
+///
+/// `uE-PagingList` is not modelled: group paging in this AMF pages an area, and
+/// a per-UE list would need a UE-scoped consumer that does not exist. Absent is
+/// conformant (the field is OPTIONAL); an empty list would not be, since the
+/// ASN.1 lower bound is 1.
+#[derive(Debug, Clone)]
+pub struct MulticastGroupPagingArea {
+    /// `MBS-AreaTAIList ::= SEQUENCE (SIZE(1..maxnoofTAIforPaging)) OF TAI`
+    /// (:51733), `maxnoofTAIforPaging = 16` (:59347).
+    pub area_tai_list: Vec<TaiListItem>,
+}
+
+/// Encode the `MBS-SessionID` IE.
+///
+/// The value is the shared `MbsSessionId` APER encoder from `mbs_transfer`, so
+/// the AMF and the MB-SMF cannot drift apart on TMGI layout.
+pub fn encode_mbs_session_id(
+    container: &mut ProtocolIeContainer,
+    mbs_session_id: &crate::mbs_transfer::MbsSessionId,
+) -> NgapResult<()> {
+    let mut encoder = AperEncoder::new();
+    mbs_session_id.encode(&mut encoder)?;
+    encoder.align();
+    container.push(ProtocolIeField {
+        id: ProtocolIeId(IE_ID_MBS_SESSION_ID),
+        criticality: Criticality::Reject,
+        value: encoder.into_bytes().to_vec(),
+    });
+    Ok(())
+}
+
+/// Encode `MulticastSessionActivationRequestTransfer` as an IE.
+///
+/// `SEQUENCE { mBS-SessionID, iE-Extensions OPTIONAL, ... }` (:51642), carried
+/// as `OCTET STRING (CONTAINING ...)`. The session id therefore appears both in
+/// the outer IE and inside the transfer; that is the spec's shape, not a
+/// duplication to collapse.
+pub fn encode_multicast_session_activation_request_transfer(
+    container: &mut ProtocolIeContainer,
+    mbs_session_id: &crate::mbs_transfer::MbsSessionId,
+) -> NgapResult<()> {
+    let transfer = encode_multicast_session_transfer_body(mbs_session_id)?;
+    encode_raw_octet_ie(
+        container,
+        IE_ID_MULTICAST_SESSION_ACTIVATION_REQUEST_TRANSFER,
+        Criticality::Reject,
+        &transfer,
+    )
+}
+
+/// Encode `MulticastSessionDeactivationRequestTransfer` as an IE.
+///
+/// Identical body to the activation transfer (:51677) under a different IE id.
+pub fn encode_multicast_session_deactivation_request_transfer(
+    container: &mut ProtocolIeContainer,
+    mbs_session_id: &crate::mbs_transfer::MbsSessionId,
+) -> NgapResult<()> {
+    let transfer = encode_multicast_session_transfer_body(mbs_session_id)?;
+    encode_raw_octet_ie(
+        container,
+        IE_ID_MULTICAST_SESSION_DEACTIVATION_REQUEST_TRANSFER,
+        Criticality::Reject,
+        &transfer,
+    )
+}
+
+/// The shared body of the activation and deactivation transfers:
+/// `SEQUENCE { mBS-SessionID, iE-Extensions OPTIONAL, ... }`.
+fn encode_multicast_session_transfer_body(
+    mbs_session_id: &crate::mbs_transfer::MbsSessionId,
+) -> NgapResult<Vec<u8>> {
+    let mut encoder = AperEncoder::new();
+    encoder.write_bit(false); // extension marker
+    encoder.write_bit(false); // no iE-Extensions
+    mbs_session_id.encode(&mut encoder)?;
+    encoder.align();
+    Ok(encoder.into_bytes().to_vec())
+}
+
+/// Encode the `MulticastGroupPagingAreaList` IE.
+///
+/// Criticality is **ignore**, not reject (:43085) — unlike the MBS-SessionID
+/// and transfer IEs. A peer that cannot parse the area list still pages.
+pub fn encode_multicast_group_paging_area_list(
+    container: &mut ProtocolIeContainer,
+    areas: &[MulticastGroupPagingArea],
+) -> NgapResult<()> {
+    let mut encoder = AperEncoder::new();
+    // SEQUENCE (SIZE(1..maxnoofPagingAreas=64)) (:51711, bound at :59299)
+    encoder.encode_constrained_length(areas.len(), 1, 64)?;
+    for area in areas {
+        // MulticastGroupPagingAreaItem
+        encoder.write_bit(false); // extension marker
+        encoder.write_bit(false); // uE-PagingList absent
+        encoder.write_bit(false); // no iE-Extensions
+                                  // MulticastGroupPagingArea ::= SEQUENCE { mBS-AreaTAIList, ... }
+        encoder.write_bit(false); // extension marker
+        encoder.write_bit(false); // no iE-Extensions
+                                  // MBS-AreaTAIList ::= SEQUENCE (SIZE(1..maxnoofTAIforPaging=16)) OF TAI
+        encoder.encode_constrained_length(area.area_tai_list.len(), 1, 16)?;
+        for tai in &area.area_tai_list {
+            encode_tai_inline(&mut encoder, tai)?;
+        }
+    }
+    encoder.align();
+    container.push(ProtocolIeField {
+        id: ProtocolIeId(IE_ID_MULTICAST_GROUP_PAGING_AREA_LIST),
+        criticality: Criticality::Ignore,
+        value: encoder.into_bytes().to_vec(),
+    });
+    Ok(())
+}
+
 /// Encode SourceToTarget-TransparentContainer IE
 pub fn encode_source_to_target_container(
     container: &mut ProtocolIeContainer,

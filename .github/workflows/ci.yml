@@ -131,7 +131,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: NextgCoreLab/nextgsim
-          ref: first_implementation
+          # nextgsim renamed its default branch; `first_implementation` no longer
+          # exists, so every cross-repo checkout failed with "git failed with exit
+          # code 1". Tracking `main` rather than re-pinning: a pinned ref is what
+          # rotted, and the E2E is only meaningful against current nextgsim.
+          ref: main
           path: nextgsim
 
       - name: Build builder image
@@ -195,7 +199,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: NextgCoreLab/nextgsim
-          ref: first_implementation
+          # nextgsim renamed its default branch; `first_implementation` no longer
+          # exists, so every cross-repo checkout failed with "git failed with exit
+          # code 1". Tracking `main` rather than re-pinning: a pinned ref is what
+          # rotted, and the E2E is only meaningful against current nextgsim.
+          ref: main
           path: nextgsim
 
       - name: Build all images (repeat for job isolation)
@@ -259,7 +267,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: NextgCoreLab/nextgsim
-          ref: first_implementation
+          # nextgsim renamed its default branch; `first_implementation` no longer
+          # exists, so every cross-repo checkout failed with "git failed with exit
+          # code 1". Tracking `main` rather than re-pinning: a pinned ref is what
+          # rotted, and the E2E is only meaningful against current nextgsim.
+          ref: main
           path: nextgsim
 
       - name: Build builder + extract binaries

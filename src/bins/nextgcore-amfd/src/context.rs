@@ -3381,6 +3381,22 @@ pub fn amf_self() -> Arc<RwLock<AmfContext>> {
         .clone()
 }
 
+/// Global MBS NGAP context (TS 23.247).
+///
+/// Held beside [`AmfContext`] rather than as a field of it: the NGAP dispatch
+/// and the Namf MBS SBI handlers both reach MBS state, and either may already
+/// hold the `AmfContext` lock when it does, so a field would invite a deadlock
+/// between the two paths. `NgapMcastContext` carries its own interior locking.
+static GLOBAL_AMF_MCAST_CONTEXT: std::sync::OnceLock<Arc<crate::ngap_mcast::NgapMcastContext>> =
+    std::sync::OnceLock::new();
+
+/// Get the global MBS NGAP context.
+pub fn amf_mcast() -> Arc<crate::ngap_mcast::NgapMcastContext> {
+    GLOBAL_AMF_MCAST_CONTEXT
+        .get_or_init(|| Arc::new(crate::ngap_mcast::NgapMcastContext::new()))
+        .clone()
+}
+
 /// Initialize the global AMF context
 pub fn amf_context_init(max_gnb: usize, max_ue: usize, max_sess: usize) {
     let ctx = amf_self();

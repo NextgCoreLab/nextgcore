@@ -832,6 +832,59 @@ pub fn extract_amf_ue_ngap_id(data: &[u8]) -> Option<u64> {
     }
 }
 
+/// Extract the `MBS-SessionID` (IE 299) from any MBS NGAP PDU as a [`crate::ngap_mcast::Tmgi`].
+///
+/// Every MBS message carries it, and it is what identifies the session: one gNB
+/// can hold several MBS sessions, so the SCTP association alone does not.
+///
+/// The IE is located by walking the decoded `ProtocolIE-Container` rather than
+/// by byte offset, because the container is APER and the preceding IEs are
+/// variable-length. MBS procedures are absent from the generated
+/// `*Value` enums, so they arrive as the `Other` variant -- which is also how
+/// the builders encode them.
+pub fn extract_mbs_session_id(data: &[u8]) -> Option<crate::ngap_mcast::Tmgi> {
+    use nextgcore_asn1c::ngap::pdu::{
+        InitiatingMessageValue, NgapPdu, SuccessfulOutcomeValue, UnsuccessfulOutcomeValue,
+    };
+    use nextgcore_asn1c::per::{AperDecode, AperDecoder};
+
+    let mut decoder = AperDecoder::new(data);
+    let pdu = NgapPdu::decode_aper(&mut decoder).ok()?;
+    let ies = match pdu {
+        NgapPdu::InitiatingMessage(m) => match m.value {
+            InitiatingMessageValue::Other(ies) => ies,
+            _ => return None,
+        },
+        NgapPdu::SuccessfulOutcome(m) => match m.value {
+            SuccessfulOutcomeValue::Other(ies) => ies,
+            _ => return None,
+        },
+        NgapPdu::UnsuccessfulOutcome(m) => match m.value {
+            UnsuccessfulOutcomeValue::Other(ies) => ies,
+            _ => return None,
+        },
+    };
+
+    let field = ies
+        .ies
+        .iter()
+        .find(|ie| ie.id.0 == nextgcore_ngap::ie::IE_ID_MBS_SESSION_ID)?;
+
+    // MBS-SessionID ::= SEQUENCE { pLMNIdentity OCTET STRING (SIZE(3)),
+    //   mBS-ServiceID OCTET STRING (SIZE(3)), ... } plus an optional NID,
+    // matching `MbsSessionId::encode`'s preamble.
+    let mut ie_decoder = AperDecoder::new(&field.value);
+    let _ext = ie_decoder.read_bit().ok()?;
+    let _nid_present = ie_decoder.read_bit().ok()?;
+    let plmn = ie_decoder.decode_octet_string(Some(3), Some(3)).ok()?;
+    let service = ie_decoder.decode_octet_string(Some(3), Some(3)).ok()?;
+
+    Some(crate::ngap_mcast::Tmgi {
+        plmn_id: plmn.try_into().ok()?,
+        mbs_service_id: service.try_into().ok()?,
+    })
+}
+
 /// Extract RAN UE NGAP ID from a UE Context Release Request
 pub fn extract_ran_ue_ngap_id(data: &[u8]) -> Option<u32> {
     match parser::decode_ngap_pdu(data) {

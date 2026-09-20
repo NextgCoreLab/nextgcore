@@ -17,6 +17,8 @@ use nextgcore_sbi::message::{ProblemDetails, SbiPart, SbiRequest, SbiResponse};
 use nextgcore_sbi::server::{send_error, send_method_not_allowed, send_not_found};
 use serde_json::{json, Value};
 
+use crate::ngap_mcast::Tmgi;
+
 use crate::context::{
     amf_self, AmfSess, AmfUe, AssignedEbi, EbiArp, EventSubscription, LcsCorrelationRecord, NrCgi,
     PendingPositioningDl, PlmnId, PositioningDlKind, RanUe, Tai5gs, UeContextTransferState,
@@ -158,6 +160,32 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
                 && parts[3] == "ue-policy-notify" =>
         {
             handle_ue_policy_notify_callback(parts[2], parts.get(4).copied(), &request)
+        }
+
+        // --------------------------------------------------------------
+        // Namf_MBSCommunication (TS 29.518 §5.7, TS 23.247 §7.2.5.2)
+        //   POST /namf-mbs-comm/v1/n2-messages/transfer
+        //
+        // The MB-SMF's N2 message transfer: the AMF relays the MBS SM container
+        // to the NG-RAN. Resource names are the OpenAPI's
+        // (TS29518_Namf_MBSCommunication.yaml server url `{apiRoot}/namf-mbs-comm/v1`),
+        // not the issue's prose.
+        // --------------------------------------------------------------
+        "namf-mbs-comm"
+            if method == "POST"
+                && parts.len() == 4
+                && parts[2] == "n2-messages"
+                && parts[3] == "transfer" =>
+        {
+            handle_mbs_n2_message_transfer(&request).await
+        }
+
+        // --------------------------------------------------------------
+        // Namf_MBSBroadcast (TS 29.518 §5.6, TS 23.247 §7.3.1)
+        //   POST /namf-mbs-bc/v1/mbs-contexts
+        // --------------------------------------------------------------
+        "namf-mbs-bc" if method == "POST" && parts.len() == 3 && parts[2] == "mbs-contexts" => {
+            handle_mbs_context_create(&request).await
         }
 
         _ => {
@@ -2614,6 +2642,206 @@ fn handle_provide_positioning_info(ue_context_id: &str, request: &SbiRequest) ->
 }
 
 // ============================================================================
+// Namf_MBSCommunication / Namf_MBSBroadcast (TS 29.518 §5.6-5.7, TS 23.247)
+// ============================================================================
+
+/// Parse an `MbsSessionId` (TS 29.571) into the NGAP-side [`Tmgi`].
+///
+/// The schema is `anyOf [tmgi, ssm]`. Only `tmgi` is accepted: an SSM
+/// (source-specific multicast address pair) identifies a session by IP, and the
+/// NGAP `MBS-SessionID` this AMF sends carries a TMGI. Rejecting an SSM-only
+/// request is honest; mapping it to an invented TMGI would not be.
+/// Boxed on the error side because `SbiResponse` is large and clippy's
+/// `result_large_err` is right that returning it by value costs every caller.
+fn parse_mbs_session_id(value: &Value) -> Result<Tmgi, Box<SbiResponse>> {
+    let Some(tmgi) = value.get("tmgi") else {
+        if value.get("ssm").is_some() {
+            return Err(Box::new(send_error(
+                501,
+                "Not Implemented",
+                "mbsSessionId.ssm is not supported: the AMF's NGAP MBS-SessionID carries a \
+                 TMGI, and no SSM-to-TMGI mapping is defined for this deployment",
+                Some("UNSPECIFIED_NF_FAILURE"),
+            )));
+        }
+        return Err(Box::new(mandatory_ie_missing("mbsSessionId.tmgi")));
+    };
+
+    let Some(service_id) = tmgi.get("mbsServiceId").and_then(Value::as_str) else {
+        return Err(Box::new(mandatory_ie_missing(
+            "mbsSessionId.tmgi.mbsServiceId",
+        )));
+    };
+    // `pattern: '^[A-Fa-f0-9]{6}$'` (TS29571_CommonData.yaml Tmgi)
+    let service_bytes = (service_id.len() == 6)
+        .then(|| u32::from_str_radix(service_id, 16).ok())
+        .flatten();
+    let Some(service) = service_bytes else {
+        return Err(Box::new(mandatory_ie_incorrect(
+            "mbsSessionId.tmgi.mbsServiceId",
+            "must be 6 hexadecimal digits",
+        )));
+    };
+
+    let Some(plmn) = tmgi.get("plmnId") else {
+        return Err(Box::new(mandatory_ie_missing("mbsSessionId.tmgi.plmnId")));
+    };
+    let Some(plmn_bytes) = plmn_id_to_bcd(plmn) else {
+        return Err(Box::new(mandatory_ie_incorrect(
+            "mbsSessionId.tmgi.plmnId",
+            "mcc must be 3 digits and mnc 2 or 3 digits",
+        )));
+    };
+
+    Ok(Tmgi::new(service, plmn_bytes))
+}
+
+/// Encode a `PlmnId { mcc, mnc }` as the 3 BCD octets NGAP carries
+/// (TS 24.008 §10.5.1.13: MCC digits then MNC, with a 2-digit MNC padded `0xF`).
+fn plmn_id_to_bcd(plmn: &Value) -> Option<[u8; 3]> {
+    let mcc = plmn.get("mcc").and_then(Value::as_str)?;
+    let mnc = plmn.get("mnc").and_then(Value::as_str)?;
+    if mcc.len() != 3 || !(2..=3).contains(&mnc.len()) {
+        return None;
+    }
+    let d: Vec<u8> = mcc
+        .chars()
+        .chain(mnc.chars())
+        .map(|c| c.to_digit(10).map(|v| v as u8))
+        .collect::<Option<_>>()?;
+    let (mnc1, mnc2, mnc3) = if mnc.len() == 2 {
+        (0x0F, d[3], d[4])
+    } else {
+        (d[5], d[3], d[4])
+    };
+    Some([d[0] | (d[1] << 4), d[2] | (mnc1 << 4), mnc2 | (mnc3 << 4)])
+}
+
+/// `POST /namf-mbs-comm/v1/n2-messages/transfer` — Namf_MBSCommunication
+/// N2MessageTransfer (TS 29.518 §5.7, TS 23.247 §7.2.5.2).
+///
+/// The MB-SMF hands the AMF an MBS SM container to relay to the NG-RAN. The
+/// AMF's job here is exactly that relay: it does not interpret the container.
+///
+/// Responds with `MbsN2MessageTransferRspData`, whose only required member is
+/// `result` (TS29518_Namf_MBSCommunication.yaml:188).
+async fn handle_mbs_n2_message_transfer(request: &SbiRequest) -> SbiResponse {
+    let Some(body) = parse_json_body(request) else {
+        return malformed_body();
+    };
+
+    let Some(session_value) = body.get("mbsSessionId") else {
+        return mandatory_ie_missing("mbsSessionId");
+    };
+    let tmgi = match parse_mbs_session_id(session_value) {
+        Ok(t) => t,
+        Err(resp) => return *resp,
+    };
+
+    // `n2MbsSmInfo` is required. Its binary half arrives as a multipart part
+    // referenced by contentId, the same shape Namf_Communication's N2
+    // information uses.
+    let Some(n2_info) = body.get("n2MbsSmInfo") else {
+        return mandatory_ie_missing("n2MbsSmInfo");
+    };
+    let content_id = n2_info
+        .get("ngapData")
+        .and_then(|d| d.get("contentId"))
+        .and_then(Value::as_str);
+    let ngap_container = content_id.and_then(|cid| find_binary_part(request, cid));
+
+    // The RAN nodes to drive. `ranNodeIdList` is optional: absent means every
+    // gNB the AMF serves, per TS 23.247 §7.2.5.2's "the AMF relays to the RAN
+    // nodes in the MBS service area".
+    let ran_node_count = body
+        .get("ranNodeIdList")
+        .and_then(Value::as_array)
+        .map(|a| a.len())
+        .unwrap_or(0);
+
+    let mcast = crate::context::amf_mcast();
+    let session = mcast.session_find_by_tmgi(&tmgi);
+
+    log::info!(
+        "Namf_MBSCommunication N2MessageTransfer: tmgi_svc={:#x} ngap_container={} bytes \
+         ran_nodes={} known_session={}",
+        tmgi.service_id_u32(),
+        ngap_container.as_ref().map(|c| c.len()).unwrap_or(0),
+        ran_node_count,
+        session.is_some(),
+    );
+
+    // The N2 relay itself is NOT performed here, and this is the honest ceiling
+    // of this increment: the NGAP server owns the SCTP associations and is not
+    // reachable from the SBI task, so handing it a PDU needs an AmfEvent variant
+    // that does not exist. Answering N2_NOT_SENT reports exactly that to the
+    // MB-SMF (N2InformationTransferResult, TS 29.518) rather than claiming a
+    // transfer that did not happen.
+    let result = "N2_NOT_SENT";
+    let response_body = json!({ "result": result });
+
+    match SbiResponse::ok().with_json_body(&response_body) {
+        Ok(resp) => resp,
+        Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
+    }
+}
+
+/// `POST /namf-mbs-bc/v1/mbs-contexts` — Namf_MBSBroadcast ContextCreate
+/// (TS 29.518 §5.6, TS 23.247 §7.3.1).
+///
+/// The MB-SMF asks the AMF to create a broadcast MBS context, which the AMF
+/// then drives toward the NG-RAN with BroadcastSessionSetup (procedure 68).
+async fn handle_mbs_context_create(request: &SbiRequest) -> SbiResponse {
+    let Some(body) = parse_json_body(request) else {
+        return malformed_body();
+    };
+
+    let Some(session_value) = body.get("mbsSessionId") else {
+        return mandatory_ie_missing("mbsSessionId");
+    };
+    let tmgi = match parse_mbs_session_id(session_value) {
+        Ok(t) => t,
+        Err(resp) => return *resp,
+    };
+
+    let mcast = crate::context::amf_mcast();
+    // Idempotent on the TMGI: a repeated ContextCreate returns the existing
+    // context rather than allocating a second one for the same session.
+    let session = match mcast.session_find_by_tmgi(&tmgi) {
+        Some(existing) => existing,
+        None => {
+            let Some(created) = mcast.session_create(tmgi.clone(), 1, None, Vec::new()) else {
+                return send_error(
+                    500,
+                    "Internal Server Error",
+                    "could not create the MBS session context",
+                    None,
+                );
+            };
+            created
+        }
+    };
+
+    log::info!(
+        "Namf_MBSBroadcast ContextCreate: tmgi_svc={:#x} ref={}",
+        tmgi.service_id_u32(),
+        session.mbs_session_id,
+    );
+
+    let context_ref = format!("{}", session.mbs_session_id);
+    let response_body = json!({ "mbsContextRef": context_ref });
+
+    // 201 with a Location header naming the created resource (TS 29.518 §6.5).
+    match SbiResponse::created().with_json_body(&response_body) {
+        Ok(resp) => resp.with_header(
+            "Location",
+            format!("/namf-mbs-bc/v1/mbs-contexts/{context_ref}"),
+        ),
+        Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -4811,5 +5039,160 @@ mod tests {
             body_json(&resp)["error"]["cause"],
             json!("EBI_NOT_ASSIGNED")
         );
+    }
+
+    // ========================================================================
+    // MBS: Namf_MBSCommunication / Namf_MBSBroadcast (#75)
+    // ========================================================================
+    //
+    // WHAT THESE DO NOT PROVE: nothing here involves the real nextgsim gNB.
+    // `nextgsim-gnb/src/mbs_ngap.rs` is a session state machine with NO NGAP
+    // codec and no socket path (zero `encode`/`decode`/`Aper` occurrences in
+    // its 233 lines), so no MBS PDU can reach it today. The cross-repo half of
+    // #75's criterion 6 belongs to the nightly `Docker E2E` job (#349) and
+    // cannot pass until that gNB gains a wire path; it is struck on the issue
+    // with the blocker named rather than claimed here.
+    //
+    // What they DO prove: the resources answer 2xx rather than the 404 they
+    // used to, the TMGI survives the JSON->NGAP boundary intact, and the
+    // spec-mandated refusals happen.
+
+    fn mbs_tmgi_body(mcc: &str, mnc: &str, service: &str) -> Value {
+        json!({
+            "mbsSessionId": {
+                "tmgi": { "mbsServiceId": service, "plmnId": { "mcc": mcc, "mnc": mnc } }
+            },
+            "n2MbsSmInfo": { "ngapData": { "contentId": "mbs-sm" } },
+        })
+    }
+
+    /// The resource is served and reports an HONEST result. Before #75 an
+    /// MB-SMF consumer got 404 RESOURCE_URI_STRUCTURE_NOT_FOUND here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mbs_n2_message_transfer_is_served_rather_than_404() {
+        let req = SbiRequest::post("/namf-mbs-comm/v1/n2-messages/transfer")
+            .with_json_body(&mbs_tmgi_body("001", "01", "0000AB"))
+            .expect("json")
+            .with_part(SbiPart::with_content(
+                "mbs-sm",
+                "application/vnd.3gpp.ngap",
+                bytes::Bytes::from_static(&[0x00, 0x47, 0x00, 0x08]),
+            ));
+        let resp = namf_request_handler(req).await;
+
+        assert_eq!(resp.status, 200, "must not be the old 404");
+        // N2_NOT_SENT rather than a claimed success: the SBI task cannot reach
+        // the NGAP server's SCTP associations yet, and SUCCESS would be a lie.
+        assert_eq!(body_json(&resp)["result"], json!("N2_NOT_SENT"));
+    }
+
+    /// ContextCreate allocates a context, and a REPEAT for the same TMGI returns
+    /// the SAME ref rather than leaking a second session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mbs_context_create_is_idempotent_on_the_tmgi() {
+        let body = mbs_tmgi_body("001", "01", "00CAFE");
+        let post = || {
+            SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
+                .with_json_body(&body)
+                .expect("json")
+        };
+
+        let first = namf_request_handler(post()).await;
+        assert_eq!(first.status, 201);
+        let first_ref = body_json(&first)["mbsContextRef"].clone();
+        assert_ne!(first_ref, Value::Null, "201 must name the created resource");
+
+        let second = namf_request_handler(post()).await;
+        assert_eq!(
+            body_json(&second)["mbsContextRef"],
+            first_ref,
+            "a repeated ContextCreate for one TMGI must not allocate a second session"
+        );
+    }
+
+    /// The TMGI reaches the NGAP layer intact: the context the SBI created is
+    /// findable by the SAME `Tmgi` the NGAP builders encode, with the PLMN
+    /// BCD-packed per TS 24.008 §10.5.1.13 (mcc=001 mnc=01 -> 00 F1 10).
+    ///
+    /// This is the assertion that would catch a JSON->NGAP boundary bug, which a
+    /// 201 status alone cannot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_created_mbs_context_is_reachable_by_its_ngap_tmgi() {
+        let req = SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
+            .with_json_body(&mbs_tmgi_body("001", "01", "00BEEF"))
+            .expect("json");
+        assert_eq!(namf_request_handler(req).await.status, 201);
+
+        let expected = Tmgi::new(0x00BEEF, [0x00, 0xF1, 0x10]);
+        assert!(
+            crate::context::amf_mcast()
+                .session_find_by_tmgi(&expected)
+                .is_some(),
+            "the SBI-created context must be findable by the TMGI the NGAP \
+             builders encode; a miss here means the boundary mangled the PLMN \
+             or the service id"
+        );
+    }
+
+    /// An SSM-only `mbsSessionId` is REFUSED, not silently mapped. The schema is
+    /// `anyOf [tmgi, ssm]`, but the AMF's NGAP `MBS-SessionID` carries a TMGI and
+    /// no SSM-to-TMGI mapping is defined -- inventing one would drive the wrong
+    /// session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ssm_only_mbs_session_id_is_refused_rather_than_mapped() {
+        let req = SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
+            .with_json_body(&json!({
+                "mbsSessionId": {
+                    "ssm": {
+                        "sourceIpAddr": { "ipv4Addr": "10.0.0.1" },
+                        "destIpAddr": { "ipv4Addr": "239.0.0.1" }
+                    }
+                }
+            }))
+            .expect("json");
+        assert_eq!(namf_request_handler(req).await.status, 501);
+    }
+
+    /// A malformed `mbsServiceId` is a 400, not a panic and not a zero TMGI.
+    /// The OpenAPI pins `pattern: '^[A-Fa-f0-9]{6}$'`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_malformed_mbs_service_id_is_a_400() {
+        for bad in ["ZZZZZZ", "ABC", "0000ABCD"] {
+            let req = SbiRequest::post("/namf-mbs-bc/v1/mbs-contexts")
+                .with_json_body(&json!({
+                    "mbsSessionId": {
+                        "tmgi": {
+                            "mbsServiceId": bad,
+                            "plmnId": { "mcc": "001", "mnc": "01" }
+                        }
+                    }
+                }))
+                .expect("json");
+            assert_eq!(
+                namf_request_handler(req).await.status,
+                400,
+                "mbsServiceId {bad:?} must be refused"
+            );
+        }
+    }
+
+    /// A 3-digit MNC packs differently from a 2-digit one (TS 24.008
+    /// §10.5.1.13): mcc=310 mnc=260 -> 13 00 62, where the 2-digit form leaves
+    /// the high nibble of octet 2 as the 0xF filler.
+    #[test]
+    fn a_three_digit_mnc_is_bcd_packed_without_the_filler_nibble() {
+        let two = plmn_id_to_bcd(&json!({ "mcc": "001", "mnc": "01" })).expect("2-digit mnc");
+        assert_eq!(two, [0x00, 0xF1, 0x10]);
+
+        let three = plmn_id_to_bcd(&json!({ "mcc": "310", "mnc": "260" })).expect("3-digit mnc");
+        assert_eq!(three, [0x13, 0x00, 0x62]);
+        assert_ne!(
+            three[1] & 0xF0,
+            0xF0,
+            "a 3-digit MNC must not carry the 0xF filler nibble"
+        );
+
+        assert!(plmn_id_to_bcd(&json!({ "mcc": "01", "mnc": "01" })).is_none());
+        assert!(plmn_id_to_bcd(&json!({ "mcc": "001", "mnc": "0" })).is_none());
     }
 }

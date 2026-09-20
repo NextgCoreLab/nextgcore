@@ -100,6 +100,21 @@ impl ProcedureCode {
     pub const UPLINK_UE_ASSOCIATED_NRPPA_TRANSPORT: Self = Self(50);
     pub const WRITE_REPLACE_WARNING: Self = Self(51);
     pub const SECONDARY_RAT_DATA_USAGE_REPORT: Self = Self(52);
+
+    // MBS procedures (TS 23.247), pinned against
+    // 6g_docs/specs/38413-j30.txt:59145-59163. Note 68 is BROADCAST_SESSION_SETUP
+    // while 71 is MULTICAST_SESSION_ACTIVATION -- an earlier off-by-three in the
+    // AMF labelled activation PDUs 68, i.e. as a different elementary procedure.
+    pub const BROADCAST_SESSION_MODIFICATION: Self = Self(66);
+    pub const BROADCAST_SESSION_RELEASE: Self = Self(67);
+    pub const BROADCAST_SESSION_SETUP: Self = Self(68);
+    pub const DISTRIBUTION_SETUP: Self = Self(69);
+    pub const DISTRIBUTION_RELEASE: Self = Self(70);
+    pub const MULTICAST_SESSION_ACTIVATION: Self = Self(71);
+    pub const MULTICAST_SESSION_DEACTIVATION: Self = Self(72);
+    pub const MULTICAST_SESSION_UPDATE: Self = Self(73);
+    pub const MULTICAST_GROUP_PAGING: Self = Self(74);
+    pub const BROADCAST_SESSION_RELEASE_REQUIRED: Self = Self(75);
 }
 
 impl AperEncode for ProcedureCode {
