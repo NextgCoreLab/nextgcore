@@ -68,6 +68,23 @@ docker compose -f docker-compose-epc.yml up -d
 docker compose -f docker-compose-epc.yml logs -f
 ```
 
+> **Scope of the EPC stage — it is bring-up, not an attach.** Unlike the 5G
+> stack, which completes a real UE registration, PDU session and data-plane
+> ping, the EPC deployment asserts only that the five NFs run healthy and that
+> the SGW-C established a PFCP (Sxa) association with the SGW-U.
+>
+> Three things it does **not** exercise, and why:
+>
+> | Not exercised | Reason |
+> |---|---|
+> | UE attach (S1AP + LTE NAS) | Neither repo ships an LTE eNB or UE simulator — no S1AP (TS 36.413) and no EMM/ESM (TS 24.301) UE side — and there is no `enb`/`ue` service here. The MME's attach chain is complete in code; only the originator is missing. |
+> | GTP-U user-plane forwarding | Needs an attach to establish a bearer first, so there is no 0%-loss claim. |
+> | The S5/S8 leg | `docker-compose-epc.yml` defines no PGW-C/SMF container, so that hop has nothing to reach. |
+>
+> Building the eNB/UE simulator is tracked as option A in nextgcore #328; the
+> full reasoning is in `specs/epc-e2e-scope.md`. A green EPC stage means the
+> network came up and associated — not that a subscriber attached.
+
 ### Deploy Full Stack (5GC + EPC)
 
 ```bash
