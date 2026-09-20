@@ -104,8 +104,28 @@ impl UriComponents {
 pub struct SbiHeader {
     /// HTTP method (GET, POST, PUT, DELETE, PATCH, OPTIONS)
     pub method: String,
-    /// Full URI
+    /// Request path. **Path only** — never an absolute URI, even when the peer
+    /// sent one. See [`Self::authority`] for why that separation is deliberate.
     pub uri: String,
+    /// The authority the peer addressed: HTTP/2's `:authority` pseudo-header
+    /// (RFC 9113 §8.3.1), an absolute-form request target's authority, or the
+    /// `Host` header. `None` for an origin-form request that carried neither.
+    ///
+    /// Carried BESIDE `uri` rather than inside it (#259). An absolute callback
+    /// URI is how TS 29.500 §6.10.7 lets a producer name a notification target,
+    /// and the SCP could not see one because the authority was discarded when
+    /// the request was converted. Widening `uri` to sometimes hold an absolute
+    /// URI was the obvious fix and is the wrong one: 39 handlers across the
+    /// daemons compare `header.uri` against a path literal (9 with `==`, 30 with
+    /// `starts_with`) against 7 that decompose it, so each of those 39 would
+    /// become a latent mis-route. A separate field leaves every one of them
+    /// correct by construction.
+    ///
+    /// Only `nextgcore-scpd` reads this. For a normal producer the authority is
+    /// simply how it was reached and carries no routing meaning — and for a
+    /// request that arrived AT an SCP it is the SCP's own address, so treating it
+    /// as a destination would loop.
+    pub authority: Option<String>,
     /// Service name
     pub service_name: Option<String>,
     /// API version
