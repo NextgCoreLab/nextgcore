@@ -1,5 +1,5 @@
 # NextGCore EPC (LTE) Deployment
-# Deploys the 5 EPC NFs: MME, SGW-C, SGW-U, HSS, PCRF
+# Deploys the 7 EPC NFs: MME, SGW-C, SGW-U, PGW-C, PGW-U, HSS, PCRF
 #
 # Network: 172.24.0.0/24 (separate from 5GC at 172.23.0.0/24)
 #
@@ -11,9 +11,61 @@
 #   docker compose -f docker-compose-epc.yml logs -f mme hss
 #   docker compose -f docker-compose-epc.yml down
 #
+# ==========================================================================
+# Why a PGW-C and a PGW-U live HERE rather than being borrowed from the 5GC
+# (issue #380)
+# ==========================================================================
+#
+# This file used to declare six services and no session anchor, so the S5/S8
+# leg the SGW-C relays to had nothing to reach: the SGW-C would log
+# "no SGWC_PGW_S5C configured" and REFUSE every Create Session Request.
+#
+# Both gaps are closed by reusing the 5G binaries, because the PGW-C and PGW-U
+# roles ARE `nextgcore-smfd` and `nextgcore-upfd`:
+#
+#   * `smfd` terminates S5/S8 GTPv2-C — it binds `smf.gtpc.server` and
+#     dispatches Create Session Request through `gtp_handler::create_session`,
+#     which allocates the PDN Address (a PGW function per TS 23.401 §5.3.2.1)
+#     and provisions the user plane over N4/Sxb. TS 23.401 §4.2.1's
+#     single-gateway option permits the combined SGW/PGW node; TS 29.244
+#     §5.2.6 is how that is realised with split CP/UP, over a combined Sxa/Sxb
+#     interface. Nothing here is a separate binary or a new protocol.
+#
+#   * `upfd` is the PGW-U: PFCP on the CP side, GTP-U on the S5-U/SGi side.
+#
+# They are DEDICATED instances on this network, not the 5GC's `smf`/`upf`, for
+# three reasons that each stand alone:
+#
+#   1. Reachability. `core` (172.23.0.0/24) and `epc` (172.24.0.0/24) are
+#      separate Docker bridge networks with no route between them. The 5G
+#      `upf` is not addressable from the SGW-C at all, so "share it" is not a
+#      deployment that comes up.
+#
+#   2. F-TEID addressing. The S5-U F-TEID the PGW-U hands the SGW-U must carry
+#      an address the SGW-U can send GTP-U to (TS 29.274 §8.22). A 172.23.x
+#      address in an F-TEID on this network is a tunnel endpoint that
+#      blackholes — and it would blackhole SILENTLY, because GTP-U is
+#      unacknowledged.
+#
+#   3. One association per CP/UP pair. TS 29.244 §6.2.6 scopes a PFCP
+#      association to one CP/UP function pair, and `upfd` implements exactly
+#      that: `PfcpServer::association` is an `Option`, not a map. A shared UPF
+#      would have the second CP function's Association Setup displace the
+#      first's, and `check_peer_recovery` would then flush the displaced
+#      peer's sessions. Sharing is not merely awkward here; it is a
+#      correctness failure the spec already forbids.
+#
+# The rejected alternative — attaching the 5GC's `smf`/`upf` to BOTH networks
+# via a second `networks:` key — is recorded with its cost in
+# specs/epc-pgw-container.md. In short: it makes the EPC file depend on the 5G
+# file being up, and it gives one `upfd` process two CP peers, which (3) makes
+# incorrect rather than just inelegant.
+#
 # Inter-deployment connectivity:
-#   To bridge EPC ↔ 5GC (e.g. interworking via SMF+PGW-C),
-#   attach a service to both networks via `networks:` keys.
+#   To bridge EPC ↔ 5GC (e.g. 5GS↔EPS interworking, where ONE smfd is both the
+#   SMF and the PGW-C for the same subscriber — TS 23.502 §4.11.1), attach a
+#   service to both networks via `networks:` keys. That is a different
+#   deployment from this one, which is a standalone EPC.
 
 x-common: &common
   restart: on-failure:5
@@ -93,12 +145,143 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
+      # #380: the PGW this SGW-C anchors sessions at, over S5/S8 (TS 29.274
+      # §7.2.1 requires the SGW to RELAY a Create Session Request to a PGW; it
+      # may not answer one from local state). Unset is what this file shipped
+      # with, and `gtp_path.rs` then warns "the S5/S8 leg is unavailable" and
+      # refuses every request -- so the MME's attach chain ended in a rejection
+      # no matter how complete the rest of it was.
+      #
+      # Bare address: the SGW-C appends the fixed GTPv2-C port 2123
+      # (TS 29.274 §4.1).
+      SGWC_PGW_S5C: "172.24.0.4"
     command: ["-c", "/etc/nextgcore/sgwc.yaml"]
     volumes:
       - ./configs/epc/sgwc.yaml:/etc/nextgcore/sgwc.yaml:ro
     networks:
       epc:
         ipv4_address: 172.24.0.3
+
+  # ==========================================================================
+  # PGW-C (issue #380) — the session anchor the S5/S8 leg terminates at.
+  #
+  # `nextgcore-smfd`, deployed in its PGW-C role: TS 23.401 §4.2.1's
+  # single-gateway option permits a combined SGW/PGW, and TS 29.244 §5.2.6
+  # realises it over a combined Sxa/Sxb interface with split CP/UP. The full
+  # decision and the rejected alternative are at the top of this file and in
+  # specs/epc-pgw-container.md.
+  #
+  # Addressed 172.24.0.4 because `configs/epc/mme.yaml` has named
+  # `mme.gtpc.client.smf: 172.24.0.4` all along, against nothing.
+  # ==========================================================================
+  pgwc:
+    image: nextgcore-rust/smf:latest
+    container_name: nextgcore-pgwc
+    <<: *common
+    environment:
+      <<: *common-env
+      # The N4/Sxb peer. `smfd` reads these from the environment rather than
+      # from YAML (see `main.rs`), so they belong here and not in pgwc.yaml.
+      SMF_PFCP_ADDR: 172.24.0.4
+      UPF_PFCP_ADDR: 172.24.0.7
+      UPF_PFCP_PORT: "8805"
+      # This deployment has no NRF and serves cleartext, so the PRODUCTION SBI
+      # profile -- which `smfd` defaults to (#63) and which demands mTLS certs
+      # plus OAuth2 -- would refuse to start, naming the missing certificate
+      # path. Opting out EXPLICITLY, the same way docker-compose.yml does, for
+      # the same reason: a posture that silently falls back to cleartext when a
+      # file is absent is not a posture.
+      #
+      # Note what this does NOT weaken: S5/S8 is GTPv2-C over UDP and carries
+      # no SBI security at all in any deployment (TS 29.274 has no TLS), so the
+      # PGW-C role itself is unaffected by the profile.
+      NEXTGCORE_SBI_PROFILE: dev
+    command: ["-c", "/etc/nextgcore/pgwc.yaml"]
+    volumes:
+      - ./configs/epc/pgwc.yaml:/etc/nextgcore/pgwc.yaml:ro
+    networks:
+      epc:
+        ipv4_address: 172.24.0.4
+    # A FUNCTIONAL probe, for the reason the sgwu healthcheck below records at
+    # length: `kill -0 1` asks whether PID 1 exists, which is true of a daemon
+    # that bound nothing. `smf_up 1` is rendered by the live metrics endpoint,
+    # so it can only be answered while the runtime is actually serving.
+    #
+    # Deliberately NOT `smf_n4_associations` (which the same body carries): the
+    # PGW-C associates with the PGW-U only after both containers are up, so
+    # gating LIVENESS on it would report the PGW-C unhealthy during every normal
+    # bring-up and `restart: on-failure:5` would then thrash it. Association is a
+    # READINESS property, which compose has no separate notion of — so the CI
+    # stage polls `smf_n4_associations` as its readiness gate instead
+    # (.github/workflows/ci.yml, "Wait for PFCP association").
+    healthcheck:
+      test:
+        ["CMD-SHELL", "curl -fsS http://localhost:9090/metrics | grep -q '^smf_up 1$$'"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    depends_on:
+      pgwu:
+        condition: service_started
+
+  # ==========================================================================
+  # PGW-U (issue #380) — `nextgcore-upfd` in its PGW-U role.
+  #
+  # Holds the S5-U (towards the SGW-U) and SGi (towards the packet data
+  # network) ends of the user plane. The TUN device is what makes it the SGi
+  # egress; the 10.45.0.0/16 pool it serves is the same pool `smfd`'s
+  # `ipv4_pool` allocates the PDN Address from (`session_extensions.rs`), so the
+  # address the PGW-C hands the UE in the Create Session Response is an address
+  # this PGW-U will actually route.
+  # ==========================================================================
+  pgwu:
+    image: nextgcore-rust/upf:latest
+    container_name: nextgcore-pgwu
+    <<: *common
+    environment:
+      <<: *common-env
+    command:
+      - "-c"
+      - "/etc/nextgcore/pgwu.yaml"
+      - "--pfcp-addr"
+      - "172.24.0.7"
+      - "--gtpu-addr"
+      - "172.24.0.7"
+      - "--tun-ip"
+      - "10.45.0.1"
+      - "--tun-prefix"
+      - "16"
+      # A TUN device distinct from the 5GC UPF's `ogstun`: the two are separate
+      # network namespaces so the name could be reused, but a distinct name is
+      # what makes `ip addr` on a host running both stacks legible.
+      - "--tun-ifname"
+      - "epctun"
+    volumes:
+      - ./configs/epc/pgwu.yaml:/etc/nextgcore/pgwu.yaml:ro
+    networks:
+      epc:
+        ipv4_address: 172.24.0.7
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    privileged: true
+    user: root
+    # Functional, for the same reason as the sgwu and pgwc probes. `upf_up 1` is
+    # rendered by the live metrics endpoint; `upf_pfcp_associations` is on the
+    # same body and is deliberately left to the CI readiness gate rather than
+    # gating liveness (see pgwc above).
+    healthcheck:
+      test:
+        ["CMD-SHELL", "curl -fsS http://localhost:9090/metrics | grep -q '^upf_up 1$$'"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
 
   mme:
     image: nextgcore-rust/mme:latest
@@ -120,6 +303,14 @@ services:
         condition: service_healthy
       sgwc:
         condition: service_started
+      # #380: the attach chain the MME originates is
+      # MME -> SGW-C -> PGW-C -> PGW-U, so the anchor has to be up before the
+      # MME starts accepting S1AP. `service_healthy` and not `service_started`:
+      # `started` is true of a container whose process has not bound its S5/S8
+      # socket yet, which is precisely the state a Create Session Request cannot
+      # be relayed into.
+      pgwc:
+        condition: service_healthy
 
   # ==========================================================================
   # EPC User Plane

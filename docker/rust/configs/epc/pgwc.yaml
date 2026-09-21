@@ -1,0 +1,100 @@
+# NextGCore PGW-C Configuration for Docker EPC Deployment (issue #380)
+#
+# `nextgcore-smfd` in its PGW-C role. TS 23.401 §4.2.1's single-gateway option
+# permits a combined SGW/PGW; TS 29.244 §5.2.6 realises it with split CP/UP over
+# a combined Sxa/Sxb interface. This is the same binary the 5GC runs as its SMF,
+# configured for the EPC network — see docker-compose-epc.yml for why it is a
+# DEDICATED instance and not the 5GC's `smf` attached to a second network.
+#
+# Root key is `smf:` and not `pgwc:`, because that is what the binary parses
+# (`SmfYaml` in main.rs). Renaming the key here would silently fall back to
+# defaults — the S5/S8 socket would not bind, `s5s8_open` would log "the S5/S8
+# (PGW-C) role is NOT bound", and the SGW-C's relayed Create Session Request
+# would time out against nothing. The role is a deployment property, not a
+# different daemon.
+
+logger:
+  file:
+    path: /var/log/nextgcore/pgwc.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+smf:
+  # SBI is bound because `smfd` always starts its N11 listener, and the EPC has
+  # no NRF to discover it — nothing on this network calls it. Bound to this
+  # node's own address rather than 0.0.0.0 so it is not reachable beyond the
+  # `epc` bridge.
+  #
+  # No `sbi.client.nrf` entry: there is no NRF here, and `smf_nrf_register` logs
+  # "No NRF URI configured, skipping NRF registration" and carries on. An entry
+  # pointing at an absent NRF would produce a registration failure on every
+  # start, which reads like a fault and is not one.
+  sbi:
+    server:
+      - address: 172.24.0.4
+        port: 7777
+
+  # ---------------------------------------------------------------------------
+  # S5/S8 — the interface that makes this a PGW-C.
+  #
+  # TS 29.274 §4.1 fixes GTPv2-C at UDP 2123. This is the address the SGW-C's
+  # `SGWC_PGW_S5C` names, and the address a Create Session Request arrives on.
+  # Without this section `config.gtpc_addr` stays `None` and the PGW-C role is
+  # simply not bound.
+  # ---------------------------------------------------------------------------
+  gtpc:
+    server:
+      - address: 172.24.0.4
+        port: 2123
+
+  # N4/Sxb towards the PGW-U. Declared for documentation symmetry with the 5GC
+  # `smf.yaml`; the binary reads the PFCP peer from SMF_PFCP_ADDR/UPF_PFCP_ADDR
+  # in the environment (set in docker-compose-epc.yml), so these two must agree
+  # with those. They are both stated because an operator reads this file first.
+  pfcp:
+    server:
+      - address: 172.24.0.4
+        port: 8805
+    client:
+      upf:
+        - address: 172.24.0.7
+
+  # S5-U/GTP-U. The PGW-C does not carry user plane itself — the PGW-U does —
+  # but `smfd` reports a GTP-U endpoint in the F-TEIDs it builds.
+  gtpu:
+    server:
+      - address: 172.24.0.4
+
+  metrics:
+    server:
+      - address: 172.24.0.4
+        port: 9090
+
+  # The PDN Address pool this PGW-C allocates from (TS 23.401 §5.3.2.1 makes
+  # address allocation a PGW function). It must match the PGW-U's `--tun-ip` /
+  # `--tun-prefix` and its `session.subnet`, or the PGW-C hands the UE an address
+  # the PGW-U will not route — which fails silently, because GTP-U is
+  # unacknowledged.
+  session:
+    - subnet: 10.45.0.0/16
+      gateway: 10.45.0.1
+
+  # IPv4 only, deliberately and not as an omission: `create_session` sets
+  # `session_type = Ipv4` because `ipv4_pool` is the only pool this PGW-C has, so
+  # an IPv6 or IPv4v6 PDN type legitimately gets cause 18. Declaring a v6 subnet
+  # here would advertise a capability the S5/S8 path does not have.
+  dns:
+    - 8.8.8.8
+    - 8.8.4.4
+  mtu: 1400
+
+  # No TLS: this deployment has no certificates mounted and
+  # NEXTGCORE_SBI_PROFILE=dev in the compose file opts the SBI listener out of
+  # the production profile. S5/S8 is unaffected either way — TS 29.274 defines no
+  # transport security for GTPv2-C.
+  tls:
+    enabled: false

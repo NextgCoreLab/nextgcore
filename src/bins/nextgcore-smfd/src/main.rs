@@ -64,6 +64,58 @@ use smf_sm::SmfFsm;
 /// Global shutdown flag
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// Where the Prometheus endpoint listens (`SMF_METRICS_PORT`, default 9090 — the port
+/// `sgwud` uses and the port `configs/observability/prometheus.yml` already scrapes
+/// `172.23.0.4` on).
+fn metrics_addr() -> SocketAddr {
+    let port: u16 = std::env::var("SMF_METRICS_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9090);
+    SocketAddr::from(([0, 0, 0, 0], port))
+}
+
+/// Render this SMF/PGW-C's runtime state in Prometheus text format (#380).
+///
+/// The numbers that distinguish a working session anchor from a bound-but-useless one:
+/// the N4 association count, whether the S5/S8 (PGW-C) socket is serving, and the
+/// session census. All read from live state — `smf_n4_associations` comes from the
+/// per-peer `PfcpClient` gauges, not from a counter this function increments.
+///
+/// `smf_n4_associations` is the PGW-C analogue of `sgwu_pfcp_associations`, and the
+/// reason it exists: in a combined SGW/PGW deployment (TS 23.401 §4.2.1 single-gateway
+/// option, realised over PFCP per TS 29.244 §5.2.6) the Sxb/N4 association is what turns
+/// a bound S5/S8 socket into a node that can actually answer a Create Session Request —
+/// TS 29.244 §6.2.6.2 forbids session signalling without one. Container-reported health
+/// cannot tell those two apart, which is why this is a metric rather than a `kill -0 1`.
+fn render_metrics() -> String {
+    let pool = pfcp_path::global_pool();
+    let associations = pool.iter().filter(|c| c.is_associated_sync()).count();
+    let sessions = smf_self().read().map(|ctx| ctx.sess_count()).unwrap_or(0);
+    // Whether the PGW-C role is bound at all. `smf.gtpc.server` unset leaves it unbound
+    // (see `s5s8_open`), and a deployment that means to anchor LTE sessions needs to be
+    // able to see the difference rather than infer it from the absence of traffic.
+    let s5s8 = u8::from(gtp_path::s5s8_server().is_some());
+    format!(
+        "# HELP smf_n4_associations Number of associated UPF/PGW-U peers on N4 (Sxb in a combined SGW/PGW)\n\
+         # TYPE smf_n4_associations gauge\n\
+         smf_n4_associations {associations}\n\
+         # HELP smf_n4_peers Number of configured N4 peers\n\
+         # TYPE smf_n4_peers gauge\n\
+         smf_n4_peers {}\n\
+         # HELP smf_sessions Number of sessions held by this SMF/PGW-C\n\
+         # TYPE smf_sessions gauge\n\
+         smf_sessions {sessions}\n\
+         # HELP smf_s5s8_bound 1 when the S5/S8 (PGW-C) GTP-C socket is serving\n\
+         # TYPE smf_s5s8_bound gauge\n\
+         smf_s5s8_bound {s5s8}\n\
+         # HELP smf_up 1 when the SMF runtime is serving\n\
+         # TYPE smf_up gauge\n\
+         smf_up 1\n",
+        pool.len()
+    )
+}
+
 /// Monotonically-increasing PFCP sequence number counter.
 /// Each transaction fetches-and-increments this so concurrent PDU sessions
 /// never reuse the same sequence number.
@@ -846,6 +898,21 @@ async fn main() -> Result<()> {
             }
         }
     });
+
+    // The Prometheus endpoint (#380). Spawned AFTER the N4 pool and the S5/S8 socket
+    // exist, so the first scrape reports the real startup state rather than a zero the
+    // daemon had not reached yet.
+    //
+    // Non-fatal when the port is busy, matching `sgwud`: an SMF that cannot expose
+    // metrics still anchors sessions, and refusing to start would turn an observability
+    // problem into a control-plane outage. The EPC bring-up gate then fails on the
+    // absent metric, which is the honest outcome — it never silently passes.
+    match nextgcore_metrics::nes_energy::serve_metrics(metrics_addr(), Arc::new(render_metrics))
+        .await
+    {
+        Ok((bound, _handle)) => log::info!("SMF metrics endpoint on http://{bound}/metrics"),
+        Err(e) => log::warn!("SMF metrics endpoint not available: {e}"),
+    }
 
     // Main async event loop
     let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
@@ -6178,6 +6245,64 @@ async fn handle_amf_status_change(sm_context_ref: &str) -> SbiResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // #380: the Prometheus endpoint the EPC readiness gate polls
+    // ------------------------------------------------------------------
+
+    /// The render emits the families the gate and the PGW-C healthcheck grep for, and
+    /// `smf_n4_associations` counts the pool's LIVE association state rather than its
+    /// size.
+    ///
+    /// The pool-of-one-un-associated case is the one that matters: it is exactly the
+    /// deployment shape the gate has to reject — a PGW-C container that started, bound its
+    /// S5/S8 socket, and never established Sxb with its PGW-U, which cannot legally answer
+    /// a Create Session Request (TS 29.244 §6.2.6.2) yet reports `kill -0 1` healthy.
+    #[tokio::test]
+    async fn the_metrics_render_counts_live_n4_associations_not_configured_peers() {
+        let upf = pfcp_path::stand_in::install_stand_in_upf().await;
+
+        // Installed but NOT associated: one configured peer, zero associations.
+        let body = render_metrics();
+        for expected in [
+            "# TYPE smf_n4_associations gauge",
+            "smf_n4_associations 0",
+            "smf_n4_peers 1",
+            "smf_up 1",
+        ] {
+            assert!(body.contains(expected), "missing {expected} in:\n{body}");
+        }
+
+        upf.client
+            .associate()
+            .await
+            .expect("the stand-in UPF accepts the association");
+        assert!(
+            render_metrics().contains("smf_n4_associations 1"),
+            "a real Association Setup must move the gauge the gate polls"
+        );
+
+        // And back down. The setter rather than the wire teardown, deliberately: what is
+        // under test HERE is that the render re-reads live state on every scrape. That the
+        // gauge itself follows the real Association Setup and the real teardown is proven
+        // over the socket in `pfcp_path`'s
+        // `the_sync_association_gauge_follows_the_wire_association`, and duplicating that
+        // here would not make either claim stronger.
+        upf.client.set_assoc_state_for_test(false, None, None).await;
+        assert!(
+            render_metrics().contains("smf_n4_associations 0"),
+            "the render must re-read live state on every scrape; a gauge that only \
+             counts up would pass the assertion above and still be wrong"
+        );
+    }
+
+    #[test]
+    fn the_metrics_port_is_9090_unless_overridden() {
+        // The port `sgwud` uses, the port `configs/observability/prometheus.yml` already
+        // scrapes 172.23.0.4 on, and the port the healthcheck curls. A default that
+        // drifted from those would leave the gate polling a closed socket.
+        assert_eq!(metrics_addr().port(), 9090);
+    }
 
     // ------------------------------------------------------------------
     // 5GS TSC container carriage (#321)

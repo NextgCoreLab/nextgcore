@@ -1,0 +1,68 @@
+# NextGCore PGW-U Configuration for Docker EPC Deployment (issue #380)
+#
+# `nextgcore-upfd` in its PGW-U role: the Sxb (N4) peer of the PGW-C, holding the
+# S5-U end of the user plane towards the SGW-U and the SGi end towards the packet
+# data network. TS 29.244 §5.2.6 / TS 23.214 §4.2.2.
+#
+# Root key is `upf:` for the same reason pgwc.yaml's is `smf:` — it is what the
+# binary parses. The role is a deployment property, not a different daemon.
+#
+# NOTE on precedence: `upfd` takes its addresses from CLI FLAGS, not from this
+# file (see `Args` in main.rs; the config file is read and its length logged, and
+# nothing else). The compose file therefore passes --pfcp-addr/--gtpu-addr/
+# --tun-ip/--tun-prefix explicitly, and the values below must agree with them.
+# They are stated here because this is the file an operator reads first, and a
+# config that silently disagrees with the flags is worse than one that has no
+# addresses at all.
+
+logger:
+  file:
+    path: /var/log/nextgcore/pgwu.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+upf:
+  # Sxb/N4 towards the PGW-C at 172.24.0.4.
+  pfcp:
+    server:
+      - address: 172.24.0.7
+        port: 8805
+
+  # S5-U towards the SGW-U (172.24.0.6) and, on the same socket, the GTP-U
+  # encapsulation of SGi traffic. TS 29.281 fixes GTP-U at UDP 2152.
+  #
+  # This address is what ends up in the S5-U F-TEID the PGW-C hands the SGW-U
+  # (TS 29.274 §8.22), which is the reason the PGW-U has to live on THIS network:
+  # a 172.23.x address here would be a tunnel endpoint the SGW-U cannot reach,
+  # and GTP-U being unacknowledged, it would blackhole in silence.
+  gtpu:
+    server:
+      - address: 172.24.0.7
+        port: 2152
+
+  # The SGi egress. `epctun` rather than the 5GC UPF's `ogstun`: the two run in
+  # separate network namespaces so the name could be reused, but a distinct name
+  # is what makes `ip addr` legible on a host running both stacks.
+  #
+  # The subnet must match the PGW-C's `smf.session.subnet` — it is the pool the
+  # PGW-C's `ipv4_pool` allocates the PDN Address from, and the PGW-U is what
+  # routes it.
+  session:
+    - subnet: 10.45.0.0/16
+      gateway: 10.45.0.1
+      dev: epctun
+
+  metrics:
+    server:
+      - address: 172.24.0.7
+        port: 9090
+
+  # No TLS: the UPF exposes no SBI listener in this deployment (`--nrf-uri` is
+  # unset, so the SBI/NRF plane is off entirely), and PFCP and GTP-U define no
+  # transport security of their own.
+  tls:
+    enabled: false

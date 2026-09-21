@@ -256,10 +256,14 @@ jobs:
 
   # NOT an end-to-end attach, and named so deliberately (#328). Nothing in either
   # repo speaks S1AP or LTE NAS on the UE side, so no UE attach can be
-  # originated; `docker-compose-epc.yml` additionally has no PGW-C container, so
-  # the S5/S8 leg has nothing to reach. This stage asserts bring-up and PFCP
-  # association health, which is the largest honest claim available today, and
-  # catches the compose-drifts-from-the-binaries defect class.
+  # originated. This stage asserts bring-up and PFCP association health, which is
+  # the largest honest claim available today, and catches the
+  # compose-drifts-from-the-binaries defect class.
+  #
+  # #380 closed one of the three gaps this comment used to list: the S5/S8 leg now
+  # HAS a container to reach, so the chain MME -> SGW-C -> SGW-U -> PGW-C -> PGW-U
+  # is deployed and both of its PFCP associations (Sxa and Sxb) are asserted below.
+  # The remaining gap is the originator.
   #
   # Option A (an LTE eNB + UE simulator in nextgsim) is what would make this a
   # true mirror of the 5G stage. See specs/epc-e2e-scope.md.
@@ -296,7 +300,12 @@ jobs:
       - name: Build EPC NF images
         run: |
           cd nextgcore/docker/rust
-          for nf in mmed sgwcd sgwud hssd pcrfd; do
+          # smfd and upfd are in this list because #380 deploys them as the PGW-C and
+          # PGW-U (TS 23.401 4.2.1 combined SGW/PGW, realised per TS 29.244 5.2.6).
+          # One image per BINARY, not per role -- the role is which config and which
+          # network a container gets, so `nextgcore-rust/smf` is the PGW-C image here
+          # and the SMF image in the 5G stage.
+          for nf in mmed sgwcd sgwud hssd pcrfd smfd upfd; do
             docker build -f Dockerfile.nf \
               --build-arg CORE_IMAGE=nextgcore-core:latest \
               --build-arg NF_NAME=nextgcore-${nf} \
@@ -307,7 +316,10 @@ jobs:
         run: |
           cd nextgcore/docker/rust
           docker compose -f docker-compose-epc.yml up -d mongodb-epc
-          docker compose -f docker-compose-epc.yml up -d hss pcrf sgwc sgwu
+          # #380: the PGW-U before the PGW-C, so the first Association Setup the
+          # PGW-C sends has a peer to reach rather than having to wait out its
+          # re-association hold-off.
+          docker compose -f docker-compose-epc.yml up -d hss pcrf sgwc sgwu pgwu pgwc
           docker compose -f docker-compose-epc.yml up -d mme
 
       # Gates on the daemons' own runtime rather than a timer. The fixed sleeps
@@ -330,6 +342,70 @@ jobs:
           docker compose -f docker-compose-epc.yml logs --tail=80 sgwc sgwu
           exit 1
 
+      # #380 criterion 2: the same gate, one hop further down the chain. The PGW-C
+      # is the node the S5/S8 leg terminates at, and TS 29.244 6.2.6.2 forbids
+      # session signalling without a PFCP association -- so a PGW-C that bound its
+      # S5/S8 socket but never established Sxb with its PGW-U would answer every
+      # relayed Create Session Request with a failure, while reporting itself
+      # perfectly healthy.
+      #
+      # BOTH ends are asserted, not one:
+      #   * `smf_n4_associations` on the PGW-C says the CP function believes it is
+      #     associated (it received an Association Setup RESPONSE);
+      #   * `upf_pfcp_associations` on the PGW-U says the UP function agrees (it
+      #     accepted an Association Setup REQUEST and stored the peer).
+      # Asserting only the CP side would pass on a PGW-C that had decided it was
+      # associated to a peer that had since flushed the association; asserting only
+      # the UP side would pass on an association some OTHER CP function set up.
+      #
+      # POSITIVE assertions on state only reachable when the association is real --
+      # never "no error in the log", which is satisfied by every path that never
+      # arrives.
+      - name: Wait for PFCP association (PGW-C <-> PGW-U over Sxb/N4)
+        run: |
+          cd nextgcore/docker/rust
+          for attempt in $(seq 1 60); do
+            cp_side=$(docker compose -f docker-compose-epc.yml exec -T pgwc \
+              sh -c "curl -fsS http://localhost:9090/metrics 2>/dev/null \
+                     | awk '/^smf_n4_associations /{print \$2}'" 2>/dev/null || echo "")
+            up_side=$(docker compose -f docker-compose-epc.yml exec -T pgwu \
+              sh -c "curl -fsS http://localhost:9090/metrics 2>/dev/null \
+                     | awk '/^upf_pfcp_associations /{print \$2}'" 2>/dev/null || echo "")
+            if [ -n "$cp_side" ] && [ "$cp_side" -ge 1 ] 2>/dev/null \
+               && [ -n "$up_side" ] && [ "$up_side" -ge 1 ] 2>/dev/null; then
+              echo "smf_n4_associations=$cp_side upf_pfcp_associations=$up_side after ${attempt}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::the PGW-C/PGW-U Sxb association never came up (smf_n4_associations='$cp_side' upf_pfcp_associations='$up_side'); the S5/S8 leg cannot anchor a session"
+          docker compose -f docker-compose-epc.yml logs --tail=80 pgwc pgwu
+          exit 1
+
+      # #380 criterion 2, the other half: the PGW-C's S5/S8 socket is actually
+      # SERVING, not merely configured. `smf_s5s8_bound` is 1 only once
+      # `gtp_path::s5s8_open` has bound the socket and installed the server -- a
+      # PGW-C whose `smf.gtpc.server` were missing or unparsable would log a
+      # warning, come up healthy, associate over Sxb, pass the gate above, and
+      # still have nothing listening on 2123.
+      #
+      # Separate from the association gate because it fails for a different reason
+      # and wants a different error message. An operator reading
+      # "the S5/S8 socket is not bound" goes to pgwc.yaml; one reading
+      # "Sxb never came up" goes to the PGW-U.
+      - name: Assert the PGW-C's S5/S8 socket is serving
+        run: |
+          cd nextgcore/docker/rust
+          bound=$(docker compose -f docker-compose-epc.yml exec -T pgwc \
+            sh -c "curl -fsS http://localhost:9090/metrics 2>/dev/null \
+                   | awk '/^smf_s5s8_bound /{print \$2}'" 2>/dev/null || echo "")
+          echo "smf_s5s8_bound=$bound"
+          if [ "$bound" != "1" ]; then
+            echo "::error::the PGW-C did not bind its S5/S8 GTP-C socket (smf_s5s8_bound='$bound'); a Create Session Request relayed by the SGW-C would reach nothing"
+            docker compose -f docker-compose-epc.yml logs --tail=80 pgwc
+            exit 1
+          fi
+
       - name: Assert every EPC NF is healthy
         run: |
           cd nextgcore/docker/rust
@@ -337,8 +413,15 @@ jobs:
           rc=0
           # A service missing from the compose file fails here rather than being
           # silently skipped -- the compose-drift defect class this stage exists
-          # to catch (it would have caught the absent PGW-C service).
-          for svc in hss pcrf sgwc sgwu mme; do
+          # to catch.
+          #
+          # #380 criterion 3: `pgwc` and `pgwu` are in this list. Note what the list
+          # could NOT do before they were declared -- it cannot catch a service that
+          # was never in the compose file, which is exactly why #380 was filed
+          # separately rather than assumed covered by this loop. Adding a name here
+          # is therefore load-bearing: if the compose file ever loses its session
+          # anchor again, THIS is what fails.
+          for svc in hss pcrf sgwc sgwu pgwc pgwu mme; do
             state=$(docker inspect "nextgcore-$svc" --format '{{.State.Status}}' 2>/dev/null || echo "absent")
             health=$(docker inspect "nextgcore-$svc" --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' 2>/dev/null || echo "absent")
             echo "$svc: state=$state health=$health"
@@ -359,21 +442,32 @@ jobs:
         if: always()
         run: |
           cat <<'NOTE'
-          === EPC bring-up stage: scope (see nextgcore specs/epc-e2e-scope.md, #328) ===
-          ASSERTED: all five EPC NFs run and report healthy; the SGW-C established a
-                    PFCP (Sxa) association with the SGW-U, read from the SGW-U's own
-                    live metrics rather than from a timer.
+          === EPC bring-up stage: scope (see nextgcore specs/epc-e2e-scope.md, #328,
+              and specs/epc-pgw-container.md, #380) ===
+          ASSERTED: all seven EPC NFs run and report healthy; BOTH PFCP associations in
+                    the chain came up, each read from the daemons' own live metrics
+                    rather than from a timer --
+                      * Sxa: SGW-C <-> SGW-U   (sgwu_pfcp_associations >= 1)
+                      * Sxb: PGW-C <-> PGW-U   (smf_n4_associations >= 1 AND
+                                                upf_pfcp_associations >= 1)
+                    and the PGW-C's S5/S8 GTP-C socket is serving
+                    (smf_s5s8_bound == 1), so a Create Session Request relayed by the
+                    SGW-C has a bound socket to reach.
 
           NOT ASSERTED, and why:
             * No UE attach. Neither repo has an LTE eNB or UE simulator -- no S1AP
               (TS 36.413) and no EMM/ESM (TS 24.301) UE side exists, and the compose
               file has no enb/ue service. The MME's attach chain IS complete in code
-              (s1ap_handler.rs:682 -> nas_dispatch -> s11_handler.rs:258/511); only
-              the originator is missing. Tracked as option A in #328.
+              (s1ap_handler.rs -> nas_dispatch -> s11_handler.rs), and as of #380 the
+              S5/S8 hop it ends at is now DEPLOYED as well; only the originator is
+              missing. Tracked as option A in #328 / nextgsim #186.
             * No GTP-U user-plane forwarding, and so no 0%-loss claim: that needs an
               attach to establish a bearer first.
-            * No S5/S8 leg. docker-compose-epc.yml defines no PGW-C/SMF container, so
-              the SMF(PGW) hop of #303's chain has nothing to reach.
+            * No S5/S8 TRANSACTION. The PGW-C's socket is bound and its Sxb
+              association is up, which is every precondition for anchoring a session
+              -- but nothing here sends a Create Session Request, because only an
+              attach originates one. This is the ceiling #380 leaves in place, and it
+              is the same ceiling as the first bullet, not a second gap.
           NOTE
 
       - name: Collect logs on failure

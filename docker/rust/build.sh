@@ -107,6 +107,14 @@ done
 
 echo ""
 echo "=== Building EPC NF images (from core) ==="
+# NOT the whole EPC set: `docker-compose-epc.yml` also runs `nextgcore-rust/smf`
+# and `nextgcore-rust/upf` as its PGW-C and PGW-U (issue #380), and those two are
+# already built by the 5GC loop above from the SAME binaries. They are listed
+# there rather than duplicated here because there is one image per binary, not one
+# per role -- the role is which config and which network a container gets.
+#
+# The coupling is real, so it is stated: removing smfd or upfd from the 5GC loop
+# above would leave the EPC deployment with no session anchor.
 for nf in mmed sgwcd sgwud hssd pcrfd; do
     if [ -f "$BINARIES_DIR/nextgcore-$nf" ]; then
         tag="${nf%d}"

@@ -264,6 +264,18 @@ pub struct PfcpClient {
     pub recovery_time_stamp: u32,
     pending: Mutex<HashMap<u32, oneshot::Sender<(u8, Vec<u8>)>>>,
     assoc: RwLock<AssociationState>,
+    /// Synchronously-readable projection of `assoc.associated` (#380).
+    ///
+    /// `assoc` is behind a `tokio::sync::RwLock`, so it can only be read from an async
+    /// context — and the Prometheus render that the container healthcheck and the EPC
+    /// CI readiness gate poll is a plain `Fn() -> String`. This is the same
+    /// sync-readable-projection shape `sgwud`'s `associated_peers` gauge and `upfd`'s
+    /// `session_count` already use, for exactly that reason.
+    ///
+    /// Maintained by [`Self::publish_associated`], which is called inside EVERY write
+    /// scope that touches `assoc.associated` and always ASSIGNS what the guard holds —
+    /// never toggles — so it cannot report a state the association never had.
+    associated_gauge: std::sync::atomic::AtomicBool,
     timers: SmfTimerConfigs,
 }
 
@@ -569,8 +581,29 @@ impl PfcpClient {
             recovery_time_stamp,
             pending: Mutex::new(HashMap::new()),
             assoc: RwLock::new(AssociationState::default()),
+            associated_gauge: std::sync::atomic::AtomicBool::new(false),
             timers: SmfTimerConfigs::default(),
         }
+    }
+
+    /// Republish the sync-readable association gauge from the guard's own value.
+    ///
+    /// Takes the write guard so it can only be called from inside a critical section
+    /// that already holds `assoc` — a projection computed outside the lock could
+    /// publish a state the association no longer has. Assignment rather than
+    /// set/clear, for the same reason.
+    fn publish_associated(&self, assoc: &AssociationState) {
+        self.associated_gauge
+            .store(assoc.associated, Ordering::Relaxed);
+    }
+
+    /// Whether the N4 association is up, readable from a synchronous context
+    /// (the Prometheus render; #380).
+    ///
+    /// The async [`Self::is_associated`] remains the authority; this is its
+    /// projection, and the two are kept in step by [`Self::publish_associated`].
+    pub fn is_associated_sync(&self) -> bool {
+        self.associated_gauge.load(Ordering::Relaxed)
     }
 
     /// The UPF endpoint this client talks to.
@@ -628,6 +661,9 @@ impl PfcpClient {
         assoc.associated = associated;
         assoc.peer_load = peer_load;
         assoc.peer_load_seq = peer_load_seq;
+        // The projection is published here too, so a test that forces association state
+        // sees the same gauge the wire path would produce.
+        self.publish_associated(&assoc);
     }
 
     /// T1/N1 parameters for a given request type.
@@ -708,6 +744,7 @@ impl PfcpClient {
                 log::error!("Marking PFCP association with {} as DOWN", self.peer);
                 assoc.associated = false;
             }
+            self.publish_associated(&assoc);
         }
 
         result
@@ -850,6 +887,7 @@ impl PfcpClient {
             // post-restart report (peer_load_seq == None) is accepted.
             assoc.peer_load = None;
             assoc.peer_load_seq = None;
+            self.publish_associated(&assoc);
         }
         let cleared = clear_pfcp_sessions();
         log::warn!(
@@ -897,6 +935,7 @@ impl PfcpClient {
             assoc.associated = true;
             assoc.peer_recovery_time_stamp = Some(resp.recovery_time_stamp);
             assoc.up_function_features = resp.up_function_features;
+            self.publish_associated(&assoc);
             log::info!(
                 "PFCP association established with {} (peer RTS={}, UP features={:?})",
                 self.peer,
@@ -1880,6 +1919,48 @@ mod tests {
         a.set_assoc_state_for_test(false, Some(70), Some(1)).await;
         c.set_assoc_state_for_test(false, Some(20), Some(1)).await;
         assert!(select_upf_from(&pool).await.is_none());
+    }
+
+    /// #380: the sync-readable association gauge tracks the REAL wire path.
+    ///
+    /// This is what the EPC bring-up readiness gate and the PGW-C container healthcheck
+    /// poll, through `smf_n4_associations` — so if the gauge did not follow
+    /// `associate()`, the gate would be asserting on a number that never moves and a
+    /// PGW-C with no Sxb association would pass it. Driven through the stand-in UPF's
+    /// Association Setup rather than the test-only setter, because the setter proving
+    /// itself proves nothing.
+    #[tokio::test]
+    async fn the_sync_association_gauge_follows_the_wire_association() {
+        // `install_stand_in_upf` already holds `N4_TEST_LOCK` for the life of `upf`,
+        // which is the serialisation `teardown_association` below needs (it flushes the
+        // process-global session map). Taking a second guard here would deadlock.
+        let upf = stand_in::install_stand_in_upf().await;
+        // Before Association Setup: honestly zero, which is what makes the gate fail on
+        // a PGW-C whose Sxb never came up rather than pass it.
+        assert!(
+            !upf.client.is_associated_sync(),
+            "a fresh client must not report an association"
+        );
+
+        upf.client
+            .associate()
+            .await
+            .expect("the stand-in UPF accepts the association");
+        assert!(
+            upf.client.is_associated_sync(),
+            "the gauge must follow a real Association Setup Response"
+        );
+        // The async authority and its projection must agree.
+        assert_eq!(
+            upf.client.is_associated().await,
+            upf.client.is_associated_sync()
+        );
+
+        upf.client.teardown_association("test").await;
+        assert!(
+            !upf.client.is_associated_sync(),
+            "the gauge must clear when the association is torn down"
+        );
     }
 
     /// Issue #20 review regression: association teardown clears the stored
