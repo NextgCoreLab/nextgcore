@@ -190,21 +190,39 @@ mod tests {
             #[test]
             fn prop_registration_result_round_trip(
                 sms_allowed in prop::bool::ANY,
+                // #361: the "Emergency registered" bit (octet 3 bit 6) is swept here too, so
+                // the two flags are proven INDEPENDENT rather than merely each round-tripping
+                // alone. They share one octet with the 3-bit access-type value, and the failure
+                // a per-field test misses is one flag's mask overlapping the other's or the
+                // value's.
+                emergency_registered in prop::bool::ANY,
                 value in prop::sample::select(vec![
                     RegistrationResultValue::ThreeGppAccess,
                     RegistrationResultValue::Non3gppAccess,
                     RegistrationResultValue::ThreeGppAndNon3gppAccess,
                 ]),
             ) {
-                let result = RegistrationResult { sms_allowed, value };
+                let result = RegistrationResult { sms_allowed, emergency_registered, value };
 
                 let mut buf = BytesMut::new();
                 result.encode(&mut buf);
+
+                // The wire octet, asserted directly: emergency registered is 0x20, SMS allowed
+                // is 0x08, access type occupies bits 1-3 (TS 24.501 Table 9.11.3.6.1). Checked
+                // as well as round-tripped, so the pair is pinned to the table rather than to
+                // this codec's own inverse -- a mask error in both encode and decode would
+                // round-trip perfectly and still be wrong on the wire.
+                prop_assert_eq!(buf[0], 1, "length octet");
+                let expected = (if emergency_registered { 0x20u8 } else { 0 })
+                    | (if sms_allowed { 0x08 } else { 0 })
+                    | (value as u8 & 0x07);
+                prop_assert_eq!(buf[1], expected);
 
                 let mut bytes = buf.freeze();
                 let decoded = RegistrationResult::decode(&mut bytes).unwrap();
 
                 prop_assert_eq!(decoded.sms_allowed, result.sms_allowed);
+                prop_assert_eq!(decoded.emergency_registered, result.emergency_registered);
                 prop_assert_eq!(decoded.value, result.value);
             }
 

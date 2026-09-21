@@ -915,12 +915,20 @@ pub fn select_integrity_algorithm_with_pqc(
 }
 
 /// Whether NIA0 (null NAS integrity) may be applied to a session with this 5GS
-/// registration type (TS 33.501 §6.7.2 / §5.11, #115).
+/// registration type (TS 33.501 §5.2.3 / §10.2.2, #115).
 ///
-/// §6.7.2 permits NIA0 only for an unauthenticated emergency session. Everything else —
-/// initial registration, mobility updating, periodic updating — must have real NAS
-/// integrity protection, so an NIA0 selection there is refused and the registration
-/// rejected.
+/// §5.2.3 carries the restriction: "The UE shall implement NIA0 for integrity protection of
+/// NAS and RRC signalling. NIA0 is only allowed for unauthenticated emergency session as
+/// specified in clause 10.2.2." Everything else — initial registration, mobility updating,
+/// periodic updating — must have real NAS integrity protection, so an NIA0 selection there is
+/// refused and the registration rejected.
+///
+/// **Cite corrected in #361.** #115 and every comment it left cited §6.7.2 for this rule.
+/// §6.7.2 is "NAS security mode command procedure" and says nothing about emergency services
+/// or null algorithms; the restriction is §5.2.3 and its scope is §10.2.2 (with the AMF's
+/// forcing obligation in §6.7.3.6). The substance was right and the clause was not, which
+/// matters because §6.7.2 is what a reader would go to for the rest of the SMC behaviour and
+/// would not find this rule there.
 ///
 /// # Why this is a function and not an inline check
 ///
@@ -940,9 +948,10 @@ pub fn nia0_permitted(registration_type: u8) -> bool {
 /// NAS ciphering enforcement policy (Item 118)
 ///
 /// Controls whether null algorithms (NEA0/NIA0) are accepted.
-/// Per 3GPP TS 33.501 §6.7.2, null integrity (NIA0) SHALL NOT be used
-/// for NAS signaling in production. Null ciphering (NEA0) MAY be used
-/// in limited contexts but is strongly discouraged.
+/// Per 3GPP TS 33.501 §5.2.3, null integrity (NIA0) SHALL NOT be used
+/// for NAS signaling in production — it "is only allowed for unauthenticated emergency
+/// session as specified in clause 10.2.2". Null ciphering (NEA0) MAY be used
+/// in limited contexts but is strongly discouraged. (Cite corrected from §6.7.2 in #361.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NasCipheringPolicy {
     /// Allow null algorithms (development/testing only)
@@ -966,7 +975,7 @@ pub fn validate_algorithm_policy(
         NasCipheringPolicy::AllowNull => Ok(()),
         NasCipheringPolicy::RejectNullIntegrity => {
             if int_algorithm == 0 {
-                Err("NIA0 (null integrity) rejected by security policy (TS 33.501 §6.7.2)")
+                Err("NIA0 (null integrity) rejected by security policy (TS 33.501 §5.2.3)")
             } else {
                 Ok(())
             }
@@ -2073,14 +2082,16 @@ mod tests {
     // NIA0 emergency-only gate (#115)
     // ------------------------------------------------------------------
 
-    /// TS 33.501 §6.7.2: NIA0 is for unauthenticated EMERGENCY sessions and nothing else.
+    /// TS 33.501 §5.2.3: NIA0 is for unauthenticated EMERGENCY sessions and nothing else
+    /// ("NIA0 is only allowed for unauthenticated emergency session as specified in clause
+    /// 10.2.2"). Cite corrected from §6.7.2 in #361.
     #[test]
     fn nia0_is_permitted_only_for_an_emergency_registration() {
         use crate::gmm_build::registration_type;
 
         assert!(
             nia0_permitted(registration_type::EMERGENCY),
-            "an emergency registration may run without NAS integrity (§6.7.2)"
+            "an emergency registration may run without NAS integrity (§5.2.3)"
         );
         for (rt, name) in [
             (registration_type::INITIAL, "initial"),

@@ -29,3 +29,17 @@ amf:
   security:
     integrity_order: ["NIA2", "NIA1", "NIA0"]
     ciphering_order: ["NEA2", "NEA1", "NEA0"]
+
+  # Emergency services (#361, TS 33.501 §10.2.2 / §5.1.2).
+  #
+  # REGULATORY setting, not a tuning knob. `true` (the default, shown explicitly
+  # here so it is a visible decision rather than an omission) lets an EMERGENCY
+  # registration proceed when the AUSF cannot be reached: NIA0/NEA0 forced, no UDM
+  # update, no Allowed NSSAI, emergency DNN only. That is legally REQUIRED in some
+  # jurisdictions (e.g. US FCC E911) and FORBIDDEN in others -- TS 33.501 §5.1.2:
+  # "Serving networks located in regions where unauthenticated emergency services
+  # are forbidden shall not support this feature." Set false where that applies.
+  #
+  # See docs-book/src/configuration/amf.md "Unauthenticated emergency service".
+  emergency:
+    allow_unauthenticated: true
