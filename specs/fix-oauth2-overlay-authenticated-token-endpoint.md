@@ -271,6 +271,43 @@ at 2.14 start / 7.80 end, so the runs were not idle-machine flattery).
 Recorded because it is the second instance this month of process-global test state
 producing a low-rate flake that a single green run hides.
 
+## What the first dispatched run found, which no unit test could
+
+Run
+[35655379256](https://github.com/NextgCoreLab/nextgcore/actions/runs/35655379256):
+`Format`, `Check`, `Clippy`, `Test`, `Docker Build` and `EPC bring-up` all **green**;
+**`Docker E2E` failed** — and it failed on a real defect in this change that 6745
+green unit tests could not have caught.
+
+What it proved works:
+
+- The NRF logged `nrfd-05: token-endpoint client authentication required`. The
+  escape hatch is gone and the secure posture is live. **Criterion 1, observed.**
+- Every NF registered under its **pinned** UUID
+  (`6b1d7e3c-0000-4000-8000-0000000005f0` (SMF), `...000af0` (AMF), `...a05f`
+  (AUSF), …). Blocker 1 is closed in a real container, not just in a test.
+
+What it caught: **`0 trusted CCA key(s) configured`**, and every consumer logging
+
+> `CCA signing key /var/lib/nextgcore/cca/<nf>-cca.key is unusable: failed to
+> write ...: Permission denied (os error 13)`
+
+Cause: a Docker named volume mounted onto a path the image does not create is
+initialised **root-owned**, and these processes run as the non-root `nextgcore`
+user. `Dockerfile.core` already knew this — its comment on `/var/lib/nextgcore`
+states exactly that rule, for exactly this reason, from issue #66 — and the new
+`cca_keys` / `cca_public` volumes did not follow it. Fixed by creating
+`/etc/nextgcore/cca-public` and `/var/lib/nextgcore/cca` in the image and chowning
+them (a volume at a subpath does not inherit a parent's ownership).
+
+Worth recording for two reasons. First, the failure was **loud and diagnosable**
+because the error message names the consequence — "requests will be sent WITHOUT
+client authentication, and an NRF running its default policy will reject them with
+`invalid_client`" — which is what made a 20-minute container run readable in one
+grep. Second, it is precisely the defect class the issue is about: the code was
+correct, every in-process test passed, and the *deployment artefact* was wrong.
+Only the dispatched run could see it, and the PR gate would have reported green.
+
 ## Observation ceiling (criterion 2)
 
 `Docker Build`, `Docker E2E` and `EPC bring-up` are gated
