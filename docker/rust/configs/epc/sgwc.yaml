@@ -12,12 +12,39 @@ global:
     peer: 64
 
 sgwc:
+  # S11/S5-C GTP-C. Declared here and NOT read by the daemon: `gtp_path::gtp_open`
+  # binds `SGWC_S11_BIND` (default 0.0.0.0:2123) and derives the advertised address
+  # from what it bound. Reading this key would also feed `set_gtpu_address`, and the
+  # SGW's user-plane endpoints live on the SGW-U (172.24.0.6), not here — so it is
+  # left unread deliberately rather than by oversight. See `config.rs`'s `GtpcYaml`.
   gtpc:
     server:
       - address: 172.24.0.3
+
+  # ---------------------------------------------------------------------------
+  # Sxa — the interface to the SGW-U. Both keys below are READ by `config.rs`
+  # (#387). Before that nothing parsed this file at all: `configured_sgwu_addr`
+  # read only the env var `SGWC_SGWU_ADDR`, which no compose file sets, so the
+  # SGW-C sent its Association Setup Request to its own loopback, received it
+  # back, and `sgwu_pfcp_associations` never reached 1.
+  # ---------------------------------------------------------------------------
   pfcp:
+    # This node's own Sxa address. Its `address` is what goes into the Node ID IE
+    # of every node-level PFCP message (TS 29.244 §8.2.38); TS 29.244 §6.2.6.2.2
+    # has the SGW-U STORE it as the identifier of the association, so a loopback
+    # value here would key the association on an address meaningless off-host.
+    # One entry only: §5.8.1 gives a CP function ONE Node ID.
     server:
       - address: 172.24.0.3
     client:
+      # The SGW-U this SGW-C associates with and provisions every user plane on
+      # (TS 29.244 §6.2.6.2.1: the CP function retrieves an IP address OF THE UP
+      # FUNCTION before establishing a first PFCP session there). Bare address:
+      # the fixed PFCP port 8805 is assumed (§4.2.2).
+      #
+      # A second entry would be parsed and warned about but NOT used: this SGW-C
+      # has no UP function selection, so associating with a peer no session can be
+      # placed on would advertise a capability it does not have. See
+      # `config::SgwcConfig::sgwu_peer`.
       sgwu:
         - address: 172.24.0.6

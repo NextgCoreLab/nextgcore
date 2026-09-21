@@ -238,6 +238,12 @@ pub(crate) fn clear_sxa_globals_for_test() {
     if let Ok(mut slot) = OUTBOUND.write() {
         *slot = None;
     }
+    // #387: the configured Sxa peer and Node ID are the same kind of single-slot process
+    // state, and are read by every Sxa send. Reset alongside the node so a test starts
+    // from "nothing configured" whichever side of the guard it looks at.
+    let ctx = sgwc_self();
+    ctx.set_sgwu_peers(Vec::new());
+    ctx.set_pfcp_node_ip(None);
 }
 
 /// Holds [`crate::context::PROCESS_STATE_TEST_LOCK`] and leaves the ambient globals
@@ -760,32 +766,77 @@ impl SxaNode {
 ///
 /// `SGWC_PFCP_BIND_ADDR` / `SGWC_PFCP_NODE_IP` / `SGWC_SGWU_ADDR` override the defaults
 /// so a test — or a host with several interfaces — can pick each.
+///
+/// #387: the Node ID now comes from `sgwc.pfcp.server[0].address` (published into the
+/// context by `config::apply`) when `SGWC_PFCP_NODE_IP` is unset, instead of falling
+/// straight through to loopback. TS 29.244 §5.8.1 makes the Node ID the identity of the
+/// association and §6.2.6.2.2 has the UP function STORE it as that identifier, so
+/// `127.0.0.1` asked every remote SGW-U to key the association on an address that is
+/// meaningless off-host. Loopback remains the last resort, because it is the right answer
+/// for a single-host test rig and refusing to start would be worse than a warned-about
+/// default — `config::apply` logs that warning when nothing is configured.
 pub async fn pfcp_open() -> Result<Arc<SxaNode>, String> {
     let bind: SocketAddr = std::env::var("SGWC_PFCP_BIND_ADDR")
         .unwrap_or_else(|_| format!("0.0.0.0:{PFCP_PORT}"))
         .parse()
         .map_err(|e| format!("SGWC_PFCP_BIND_ADDR is not a socket address: {e}"))?;
-    let local_ip: Ipv4Addr = std::env::var("SGWC_PFCP_NODE_IP")
-        .unwrap_or_else(|_| "127.0.0.1".to_string())
-        .parse()
-        .map_err(|e| format!("SGWC_PFCP_NODE_IP is not an IPv4 address: {e}"))?;
+    let local_ip = configured_node_ip()?;
     SxaNode::open(bind, local_ip)
         .await
         .map_err(|e| format!("failed to bind PFCP socket on {bind}: {e}"))
 }
 
+/// The address this SGW-C advertises in the Node ID IE of every node-level Sxa message
+/// (TS 29.244 §8.2.38).
+///
+/// `SGWC_PFCP_NODE_IP` first — the test escape hatch, and the way a multi-homed host
+/// overrides the file — then the configured `sgwc.pfcp.server` address, then loopback.
+fn configured_node_ip() -> Result<Ipv4Addr, String> {
+    if let Ok(value) = std::env::var("SGWC_PFCP_NODE_IP") {
+        return value
+            .parse()
+            .map_err(|e| format!("SGWC_PFCP_NODE_IP is not an IPv4 address: {e}"));
+    }
+    Ok(sgwc_self().pfcp_node_ip().unwrap_or(Ipv4Addr::LOCALHOST))
+}
+
 /// The SGW-U this SGW-C provisions user planes on.
 ///
-/// `SGWC_SGWU_ADDR` takes either `ip` (PFCP's own port is assumed) or `ip:port`. The port
-/// form exists so a test can stand in for an SGW-U on an ephemeral port rather than
-/// fighting a live one for UDP/8805.
+/// #387: resolved from the configured `sgwc.pfcp.client.sgwu` peer, which
+/// `config::apply` publishes into the context at startup. Before that this function read
+/// **only** `SGWC_SGWU_ADDR` — which no compose file sets anywhere in the tree — and fell
+/// back to `Ipv4Addr::LOCALHOST`, so the SGW-C sent its Association Setup Request to its
+/// own Sxa socket, received its own request back ("PFCP message type 5 ... is not handled
+/// on Sxa (CP side)"), retransmitted to T1/N1 exhaustion and never associated. TS 29.244
+/// §6.2.6.2.1 requires the CP function to retrieve an IP address **of the UP function**;
+/// there was nowhere for that address to come from.
+///
+/// Order of precedence, and why:
+///
+/// 1. `SGWC_SGWU_ADDR` — kept as an override because the tests need it: `stand_in_sgwu`
+///    puts an SGW-U on an ephemeral loopback port rather than fighting a live daemon for
+///    UDP/8805, and an env var is what the sibling daemons use for the same purpose. It
+///    takes either `ip` (PFCP's own port is assumed) or `ip:port`.
+/// 2. the configured peer from the YAML file — what production uses.
+/// 3. `127.0.0.1:8805` — the single-host default. Kept rather than made fatal so an
+///    unconfigured daemon still starts and still serves S11 diagnostics; `config::apply`
+///    warns loudly when nothing is configured, which is what was missing before.
 pub fn configured_sgwu_addr() -> SocketAddr {
-    let value = std::env::var("SGWC_SGWU_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-    if let Ok(addr) = value.parse::<SocketAddr>() {
-        return addr;
+    if let Ok(value) = std::env::var("SGWC_SGWU_ADDR") {
+        if let Ok(addr) = value.parse::<SocketAddr>() {
+            return addr;
+        }
+        if let Ok(ip) = value.parse::<Ipv4Addr>() {
+            return SocketAddr::from((ip, PFCP_PORT));
+        }
+        log::warn!(
+            "SGWC_SGWU_ADDR='{value}' is neither an IPv4 address nor ip:port; falling back to \
+             the configured sgwc.pfcp.client.sgwu peer"
+        );
     }
-    let ip: Ipv4Addr = value.parse().unwrap_or(Ipv4Addr::LOCALHOST);
-    SocketAddr::from((ip, PFCP_PORT))
+    sgwc_self()
+        .sgwu_peer()
+        .unwrap_or_else(|| SocketAddr::from((Ipv4Addr::LOCALHOST, PFCP_PORT)))
 }
 
 /// Close the Sxa PFCP path.
@@ -1043,6 +1094,79 @@ mod tests {
         assert!(sxa_node().is_some(), "the node is installed process-wide");
         pfcp_close().await;
         std::env::remove_var("SGWC_PFCP_BIND_ADDR");
+    }
+
+    /// #387: the Sxa destination comes from the CONFIGURED SGW-U, not from loopback.
+    ///
+    /// Asserted as equality against `172.24.0.6:8805` — the address only reachable by
+    /// actually reading `docker/rust/configs/epc/sgwc.yaml` — rather than as "is not
+    /// loopback", which a second bug could satisfy by accident. Before this change
+    /// `configured_sgwu_addr` read only `SGWC_SGWU_ADDR`, which no compose file sets, and
+    /// returned `127.0.0.1:8805`: the SGW-C's own socket.
+    ///
+    /// Takes the process-state guard because it writes `sgwu_peers` on the global context
+    /// and removes `SGWC_SGWU_ADDR` from the environment — both are single-slot process
+    /// state that every concurrent Sxa send reads (see `context::PROCESS_STATE_TEST_LOCK`).
+    #[tokio::test]
+    async fn the_sxa_destination_is_the_configured_sgwu_not_loopback() {
+        let _guard = process_state_test_guard().await;
+        // The override has to be out of the way for the configured value to be the answer;
+        // sibling tests set it and the guard serialises, but it is not otherwise cleared.
+        std::env::remove_var("SGWC_SGWU_ADDR");
+
+        let expected = SocketAddr::from(([172, 24, 0, 6], PFCP_PORT));
+        let config = crate::config::load_config("../../../docker/rust/configs/epc/sgwc.yaml");
+        crate::config::apply(&sgwc_self(), &config);
+        assert_eq!(
+            configured_sgwu_addr(),
+            expected,
+            "every Sxa send must address the SGW-U named in sgwc.pfcp.client.sgwu"
+        );
+
+        // The same resolution the startup association and `enqueue` both go through, so
+        // this is not asserting one call site's behaviour.
+        assert_eq!(
+            sgwc_self().sgwu_peer(),
+            Some(expected),
+            "the context is what both Sxa call sites read"
+        );
+
+        // And the Node ID advertised in the Association Setup Request is the SGW-C's own
+        // configured address, not loopback (TS 29.244 §8.2.38 / §6.2.6.2.2).
+        std::env::remove_var("SGWC_PFCP_NODE_IP");
+        assert_eq!(
+            configured_node_ip().expect("the configured node id parses"),
+            Ipv4Addr::new(172, 24, 0, 3),
+            "the UP function stores the CP function's Node ID as the association identifier"
+        );
+    }
+
+    /// The env override still wins, because `stand_in_sgwu` depends on it to put an SGW-U
+    /// on an ephemeral port instead of fighting a live daemon for UDP/8805.
+    #[tokio::test]
+    async fn the_env_override_beats_the_configured_peer() {
+        let _guard = process_state_test_guard().await;
+        sgwc_self().set_sgwu_peers(vec![SocketAddr::from(([172, 24, 0, 6], PFCP_PORT))]);
+        std::env::set_var("SGWC_SGWU_ADDR", "127.0.0.1:19805");
+        assert_eq!(
+            configured_sgwu_addr(),
+            SocketAddr::from(([127, 0, 0, 1], 19805))
+        );
+        std::env::remove_var("SGWC_SGWU_ADDR");
+    }
+
+    /// With nothing configured and no override the answer is loopback — the single-host
+    /// default, kept deliberately (a daemon that refuses to start is worse) and warned
+    /// about by `config::apply`.
+    #[tokio::test]
+    async fn an_unconfigured_sgwc_still_resolves_loopback() {
+        let _guard = process_state_test_guard().await;
+        std::env::remove_var("SGWC_SGWU_ADDR");
+        assert_eq!(
+            configured_sgwu_addr(),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, PFCP_PORT)),
+            "the guard leaves nothing configured, so this is the unconfigured answer"
+        );
     }
 
     /// A session request cannot be sent before the transport is running, and says so

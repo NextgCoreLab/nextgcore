@@ -3103,6 +3103,8 @@ dependencies = [
  "nextgcore-metrics",
  "nextgcore-pfcp",
  "proptest",
+ "serde",
+ "serde_yaml",
  "tokio",
 ]
 

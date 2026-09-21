@@ -23,6 +23,9 @@ tokio.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
+# #387: reading `sgwc.yaml`, which this daemon took as a path and discarded.
+serde = { workspace = true }
+serde_yaml = { workspace = true }
 
 [dev-dependencies]
 proptest.workspace = true

@@ -12,6 +12,7 @@ use clap::Parser;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+pub mod config;
 pub mod context;
 pub mod event;
 pub mod gtp_path;
@@ -87,11 +88,22 @@ impl SgwcApp {
     /// #54: `async` because opening the Sxa path now binds a real tokio socket and sets up
     /// the PFCP association toward the SGW-U. It used to call a `pfcp_open` that opened
     /// nothing, which is why none of this had to be awaited.
-    pub async fn init(&mut self, _config_path: &str) -> Result<()> {
+    ///
+    /// #387: `config_path` is now READ. It was `_config_path` — taken and discarded — so
+    /// every field of the shipped `sgwc.yaml` was inert, most damagingly
+    /// `pfcp.client.sgwu`: with nothing supplying the SGW-U's address the Sxa association
+    /// went to the SGW-C's own loopback and could never complete.
+    pub async fn init(&mut self, config_path: &str) -> Result<()> {
         log::info!("Initializing SGWC...");
 
         // Initialize SGWC context with default pool sizes
         let ctx = sgwc_self();
+
+        // Read the config file BEFORE `pfcp_open`: the Node ID is baked into the Sxa node
+        // when its socket is opened, so publishing it afterwards would leave the running
+        // node advertising the loopback default for its whole life.
+        let file_config = config::load_config(config_path);
+        config::apply(&ctx, &file_config);
         // In a real implementation, these values would come from config
         if let Ok(mut ctx_guard) = Arc::try_unwrap(ctx.clone()).inspect_err(|_arc| {
             // Context is shared, we need to use interior mutability
