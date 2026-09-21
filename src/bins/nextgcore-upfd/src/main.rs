@@ -144,6 +144,61 @@ struct Args {
 /// Global shutdown flag
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// The live runtime state the Prometheus render reads (#380).
+///
+/// Handles rather than values: both are owned by the `PfcpServer`, and a copy here would
+/// be the second store #325 rejected. Installed once, after the server exists.
+struct MetricsSources {
+    associated: Arc<AtomicBool>,
+    sessions: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+static METRICS_SOURCES: std::sync::OnceLock<MetricsSources> = std::sync::OnceLock::new();
+
+/// Where the Prometheus endpoint listens (`UPF_METRICS_PORT`, default 9090 — the port
+/// `sgwud` uses and the port `configs/observability/prometheus.yml` already scrapes).
+fn metrics_addr() -> SocketAddr {
+    let port: u16 = std::env::var("UPF_METRICS_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9090);
+    SocketAddr::from(([0, 0, 0, 0], port))
+}
+
+/// Render this UPF/PGW-U's runtime state in Prometheus text format (#380).
+///
+/// `upf_pfcp_associations` is the user-plane counterpart of `sgwu_pfcp_associations`, and
+/// exists for the same reason: TS 29.244 §6.2.6.2 forbids session signalling without an
+/// association, so a UPF whose N4/Sxb association never came up cannot carry a single
+/// session — and `kill -0 1` reports it healthy anyway.
+///
+/// 0 or 1, not a count: this UPF holds at most ONE association
+/// (`PfcpServer::association` is an `Option`, not a map), which is the TS 29.244 §6.2.6
+/// one-association-per-CP/UP-function-pair model. Rendered as a gauge rather than under a
+/// boolean name so the assertion reads identically to the SGW-U's.
+fn render_metrics() -> String {
+    let (associations, sessions) = match METRICS_SOURCES.get() {
+        Some(src) => (
+            u8::from(src.associated.load(Ordering::Relaxed)),
+            src.sessions.load(Ordering::Relaxed),
+        ),
+        // Before the PFCP server exists there is genuinely no association and no
+        // session; reporting zero is accurate rather than a placeholder.
+        None => (0, 0),
+    };
+    format!(
+        "# HELP upf_pfcp_associations Associated CP peers on N4/Sxb (0 or 1: TS 29.244 6.2.6 scopes an association to one CP/UP function pair)\n\
+         # TYPE upf_pfcp_associations gauge\n\
+         upf_pfcp_associations {associations}\n\
+         # HELP upf_pfcp_sessions Number of PFCP sessions held on N4/Sxb\n\
+         # TYPE upf_pfcp_sessions gauge\n\
+         upf_pfcp_sessions {sessions}\n\
+         # HELP upf_up 1 when the UPF runtime is serving\n\
+         # TYPE upf_up gauge\n\
+         upf_up 1\n"
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -295,6 +350,24 @@ async fn main() -> Result<()> {
     // `get_load()` per tick, so it picks this up on its next tick; the load reported
     // in the registration itself is 0, which is correct at start-up.
     upf_self().set_session_gauge(pfcp_server.session_count_handle());
+
+    // #380: the Prometheus endpoint. Installed from the SAME handles the load gauge uses,
+    // so the metric and the NRF `/load` report can never disagree about how many sessions
+    // this UPF holds.
+    let _ = METRICS_SOURCES.set(MetricsSources {
+        associated: pfcp_server.associated_handle(),
+        sessions: pfcp_server.session_count_handle(),
+    });
+    // Non-fatal when the port is busy, matching `sgwud`: a UPF that cannot expose metrics
+    // still forwards packets, and refusing to start would turn an observability problem
+    // into a user-plane outage. A readiness gate then fails on the absent metric, which is
+    // the honest outcome — it never silently passes.
+    match nextgcore_metrics::nes_energy::serve_metrics(metrics_addr(), Arc::new(render_metrics))
+        .await
+    {
+        Ok((bound, _handle)) => log::info!("UPF metrics endpoint on http://{bound}/metrics"),
+        Err(e) => log::warn!("UPF metrics endpoint not available: {e}"),
+    }
 
     // Run data plane (if enabled)
     let data_plane = Arc::new(data_plane);
@@ -1319,6 +1392,69 @@ mod tests {
     fn test_args_log_file() {
         let args = Args::parse_from(["nextgcore-upfd", "-l", "/var/log/upf.log"]);
         assert_eq!(args.log_file, Some("/var/log/upf.log".to_string()));
+    }
+
+    // ------------------------------------------------------------------
+    // #380: the Prometheus endpoint the EPC readiness gate polls
+    // ------------------------------------------------------------------
+
+    /// The render emits the families the gate and the healthcheck grep for, in Prometheus
+    /// text format, and reports the association state it is HANDED rather than a constant.
+    ///
+    /// Asserted on the rendered body rather than on the listener binding, because a body
+    /// that reports nothing is the failure worth catching. The 0-and-1 pair matters: a
+    /// render that hard-coded `upf_pfcp_associations 1` would satisfy a
+    /// contains-the-metric-name test and make the gate meaningless.
+    #[test]
+    fn the_metrics_render_reports_the_association_and_session_state() {
+        // `METRICS_SOURCES` is a process-global `OnceLock`, so this asserts the
+        // pre-install rendering (honest zeros) and then the rendering against installed
+        // handles, in that order, inside ONE test — a sibling test racing the install
+        // would see whichever half ran first.
+        let body = render_metrics();
+        for expected in [
+            "# TYPE upf_pfcp_associations gauge",
+            "upf_pfcp_associations 0",
+            "upf_pfcp_sessions 0",
+            "upf_up 1",
+        ] {
+            assert!(
+                body.contains(expected),
+                "missing {expected} before install, in:\n{body}"
+            );
+        }
+
+        let associated = Arc::new(AtomicBool::new(true));
+        let sessions = Arc::new(std::sync::atomic::AtomicUsize::new(7));
+        let _ = METRICS_SOURCES.set(MetricsSources {
+            associated: associated.clone(),
+            sessions,
+        });
+        let body = render_metrics();
+        assert!(
+            body.contains("upf_pfcp_associations 1"),
+            "an installed association must be reported, in:\n{body}"
+        );
+        assert!(
+            body.contains("upf_pfcp_sessions 7"),
+            "the live session count must be reported, in:\n{body}"
+        );
+
+        // And it must come back down: a render that ignored the handle would pass the
+        // assertion above and still report a dead association as up forever.
+        associated.store(false, Ordering::Relaxed);
+        assert!(
+            render_metrics().contains("upf_pfcp_associations 0"),
+            "the render must re-read the handle on every scrape"
+        );
+    }
+
+    #[test]
+    fn the_metrics_port_is_9090_unless_overridden() {
+        // The port `sgwud` uses, the port `prometheus.yml` scrapes, and the port the
+        // healthcheck curls. A default that drifted from those would leave the gate
+        // polling a closed socket.
+        assert_eq!(metrics_addr().port(), 9090);
     }
 
     // ------------------------------------------------------------------

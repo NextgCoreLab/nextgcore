@@ -70,20 +70,32 @@ docker compose -f docker-compose-epc.yml logs -f
 
 > **Scope of the EPC stage — it is bring-up, not an attach.** Unlike the 5G
 > stack, which completes a real UE registration, PDU session and data-plane
-> ping, the EPC deployment asserts only that the five NFs run healthy and that
-> the SGW-C established a PFCP (Sxa) association with the SGW-U.
+> ping, the EPC deployment asserts that the seven NFs run healthy, that **both**
+> PFCP associations in the chain came up — Sxa (SGW-C ↔ SGW-U) and Sxb (PGW-C ↔
+> PGW-U, asserted from both ends) — and that the PGW-C's S5/S8 GTP-C socket is
+> serving.
 >
-> Three things it does **not** exercise, and why:
+> The whole chain `MME → SGW-C → SGW-U → PGW-C → PGW-U` is now **deployed**:
+> issue #380 added the PGW-C and PGW-U, which are `nextgcore-smfd` and
+> `nextgcore-upfd` in their EPC roles (TS 23.401 §4.2.1's single-gateway option,
+> realised over a combined Sxa/Sxb interface per TS 29.244 §5.2.6 — the same
+> binaries, a different config and network). They are dedicated instances on the
+> `epc` network rather than the 5GC's `smf`/`upf`, because the two Docker
+> networks have no route between them, because the S5-U F-TEID must carry an
+> address the SGW-U can actually reach, and because TS 29.244 §6.2.6 scopes a
+> PFCP association to one CP/UP function pair. See `specs/epc-pgw-container.md`.
+>
+> Two things it still does **not** exercise, and why:
 >
 > | Not exercised | Reason |
 > |---|---|
-> | UE attach (S1AP + LTE NAS) | Neither repo ships an LTE eNB or UE simulator — no S1AP (TS 36.413) and no EMM/ESM (TS 24.301) UE side — and there is no `enb`/`ue` service here. The MME's attach chain is complete in code; only the originator is missing. |
-> | GTP-U user-plane forwarding | Needs an attach to establish a bearer first, so there is no 0%-loss claim. |
-> | The S5/S8 leg | `docker-compose-epc.yml` defines no PGW-C/SMF container, so that hop has nothing to reach. |
+> | UE attach (S1AP + LTE NAS) | Neither repo ships an LTE eNB or UE simulator — no S1AP (TS 36.413) and no EMM/ESM (TS 24.301) UE side — and there is no `enb`/`ue` service here. The MME's attach chain is complete in code and every hop it ends at is now deployed; only the originator is missing. |
+> | GTP-U user-plane forwarding, and any S5/S8 *transaction* | Both need an attach to originate a Create Session Request first, so there is no 0%-loss claim and no asserted Create Session Response. The PGW-C's socket is bound and its Sxb association is up — every precondition for anchoring a session — but nothing sends one. |
 >
-> Building the eNB/UE simulator is tracked as option A in nextgcore #328; the
-> full reasoning is in `specs/epc-e2e-scope.md`. A green EPC stage means the
-> network came up and associated — not that a subscriber attached.
+> Building the eNB/UE simulator is tracked as option A in nextgcore #328 and as
+> nextgsim #186; the full reasoning is in `specs/epc-e2e-scope.md`. A green EPC
+> stage means the network came up and associated end to end — not that a
+> subscriber attached.
 
 ### Deploy Full Stack (5GC + EPC)
 
@@ -149,7 +161,7 @@ docker build -f Dockerfile.nf-template \
 | File | Description |
 |------|-------------|
 | `docker-compose.yml` | Matched-sim E2E: MongoDB + 5GC NFs + nextgsim gNB/UE + advanced NFs + observability (no EPC) |
-| `docker-compose-epc.yml` | EPC (4G) only |
+| `docker-compose-epc.yml` | EPC (4G) only: MME, SGW-C, SGW-U, PGW-C, PGW-U, HSS, PCRF. The PGW-C/PGW-U are `smfd`/`upfd` in their EPC roles (#380) |
 | `docker-compose.oauth2.yml` | Overlay: OAuth2 SBI enforcement (`./e2e.sh --overlay oauth2`) |
 | `docker-compose.kernel-sctp.yml` | Overlay: native kernel-SCTP N2 (`./e2e.sh --overlay kernel-sctp`) |
 | `docker-compose.features.yml` | Overlay: Rel-17/18 feature harness (`./e2e.sh --overlay features`) |
@@ -339,16 +351,30 @@ services:
 │  │                   SGW-C (.0.3)                           │   │
 │  │              GTP-C: 2123, PFCP: 8805                    │   │
 │  └─────────────────────────┬───────────────────────────────┘   │
-│                            │ Sxa                               │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                   SGW-U (.0.6)                           │   │
-│  │                    GTP-U: 2152                           │   │
+│                 Sxa        │        S5/S8-C (GTP-C: 2123)      │
+│        ┌───────────────────┴───────────────────┐               │
+│  ┌─────────────────────────┐   ┌───────────────────────────┐   │
+│  │      SGW-U (.0.6)        │   │      PGW-C (.0.4)          │   │
+│  │       GTP-U: 2152        │   │  GTP-C: 2123, PFCP: 8805   │   │
+│  └───────────┬─────────────┘   └─────────────┬─────────────┘   │
+│              │  S5/S8-U (GTP-U: 2152)        │ Sxb (PFCP)      │
+│              │      ┌────────────────────────┘                 │
+│  ┌───────────┴──────┴──────────────────────────────────────┐   │
+│  │                   PGW-U (.0.7)                           │   │
+│  │        GTP-U: 2152, PFCP: 8805, SGi via `epctun`        │   │
+│  │             UE pool 10.45.0.0/16 (gw .0.1)              │   │
 │  └─────────────────────────────────────────────────────────┘   │
 │                                                                 │
 │  ┌─────────────────────────────────────────────────────────┐   │
 │  │                   PCRF (.0.9)                            │   │
 │  │                 Diameter: 3868                           │   │
 │  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  PGW-C and PGW-U are `nextgcore-smfd`/`nextgcore-upfd` in their │
+│  EPC roles (TS 23.401 4.2.1 combined SGW/PGW; TS 29.244 5.2.6). │
+│  Dedicated instances, NOT the 5GC's smf/upf -- the two networks │
+│  have no route between them and an S5-U F-TEID must carry an    │
+│  address the SGW-U can reach. See specs/epc-pgw-container.md.   │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -365,6 +391,10 @@ services:
 | UPF | UDP | 2152 | GTP-U (N3 to gNB) |
 | UPF | UDP | 8805 | PFCP (N4 to SMF) |
 | MME | SCTP | 36412 | S1AP (to eNB) |
+| PGW-C | UDP | 2123 | GTPv2-C (S5/S8-C, from SGW-C). TS 29.274 §4.1 fixes the port. On-network only — not published to the host, since nothing outside the `epc` bridge speaks S5/S8 |
+| PGW-C | UDP | 8805 | PFCP (Sxb/N4 to PGW-U). On-network only |
+| PGW-U | UDP | 2152 | GTP-U (S5/S8-U, to SGW-U). On-network only |
+| PGW-U | UDP | 8805 | PFCP (Sxb/N4 to PGW-C). On-network only |
 | HSS | TCP | 3868 | Diameter (S6a) |
 | MongoDB | TCP | 27017 | Database |
 | Prometheus | TCP | 9090 | Metrics |

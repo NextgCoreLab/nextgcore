@@ -516,6 +516,14 @@ pub struct PfcpServer {
     session_count: Arc<AtomicUsize>,
     /// Current PFCP association (None until Association Setup succeeds)
     association: tokio::sync::RwLock<Option<PfcpAssociation>>,
+    /// Synchronously-readable projection of whether [`Self::association`] is `Some`
+    /// (#380), for the Prometheus render — a plain `Fn() -> String` that cannot take
+    /// the `tokio` guard. Same shape and same reason as `session_count` above.
+    ///
+    /// Maintained by [`Self::publish_associated`], called inside every write scope that
+    /// changes the association and always ASSIGNING `is_some()` rather than toggling, so
+    /// it cannot report a state the association never held.
+    associated: Arc<AtomicBool>,
     /// Data plane handle for pulling final URR counters on session deletion
     data_plane: std::sync::RwLock<Option<Arc<crate::data_plane::DataPlane>>>,
     /// UPF-initiated requests awaiting a response, tracked by sequence number
@@ -704,6 +712,7 @@ impl PfcpServer {
             sessions: tokio::sync::RwLock::new(HashMap::new()),
             session_count: Arc::new(AtomicUsize::new(0)),
             association: tokio::sync::RwLock::new(None),
+            associated: Arc::new(AtomicBool::new(false)),
             data_plane: std::sync::RwLock::new(None),
             pending_reports: tokio::sync::Mutex::new(HashMap::new()),
             heartbeat: tokio::sync::Mutex::new(HeartbeatState::default()),
@@ -733,6 +742,26 @@ impl PfcpServer {
     /// Whether a PFCP association with a CP function is currently up
     pub async fn is_associated(&self) -> bool {
         self.association.read().await.is_some()
+    }
+
+    /// Republish the sync-readable association gauge from the guard's own value (#380).
+    ///
+    /// Takes the guard so it can only be called from inside a critical section that
+    /// already holds the association — a projection computed outside the lock could
+    /// publish a state the association no longer has.
+    fn publish_associated(&self, association: &Option<PfcpAssociation>) {
+        self.associated
+            .store(association.is_some(), Ordering::Relaxed);
+    }
+
+    /// A read handle on the live association state, for the Prometheus render (#380).
+    ///
+    /// Handed out rather than read through the server, matching
+    /// [`Self::session_count_handle`]: this server owns the association, and the render
+    /// owning a *copy* of the state would be the two-stores-one-path shape #325
+    /// rejected.
+    pub fn associated_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.associated)
     }
 
     /// Handle a peer restart or association teardown: drop the association,
@@ -765,7 +794,11 @@ impl PfcpServer {
             }
         }
         log::warn!("PFCP peer {peer} failure ({reason}): clearing association and sessions");
-        *self.association.write().await = None;
+        {
+            let mut association = self.association.write().await;
+            *association = None;
+            self.publish_associated(&association);
+        }
         let count = {
             let mut sessions = self.sessions.write().await;
             let n = sessions.len();
@@ -1001,10 +1034,14 @@ impl PfcpServer {
         // timestamp, the peer restarted — flush stale sessions first
         self.check_peer_recovery(src_addr, rts).await;
 
-        *self.association.write().await = Some(PfcpAssociation {
-            peer_addr: src_addr,
-            recovery_time_stamp: rts,
-        });
+        {
+            let mut association = self.association.write().await;
+            *association = Some(PfcpAssociation {
+                peer_addr: src_addr,
+                recovery_time_stamp: rts,
+            });
+            self.publish_associated(&association);
+        }
 
         let resp_payload = build_association_setup_response(
             &self.local_node_id,
@@ -3804,6 +3841,65 @@ mod tests {
             0,
             "a deleted session must leave the gauge; a gauge that only ever counts up \
              would pass the establishment assertion above and still be wrong"
+        );
+    }
+
+    /// #380: the sync-readable association gauge tracks the REAL wire path.
+    ///
+    /// This is what `upf_pfcp_associations` renders, and what the EPC bring-up readiness
+    /// gate and the PGW-U container healthcheck poll. If the gauge did not follow
+    /// Association Setup, a PGW-U whose Sxb association never came up would pass a gate
+    /// asserting on a number that never moves — which is the defect class #380 exists to
+    /// close, one step further down than the missing container itself.
+    ///
+    /// Driven entirely over the socket through the real handlers, never through a setter.
+    #[tokio::test]
+    async fn the_sync_association_gauge_follows_the_wire_association() {
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        let gauge = server.associated_handle();
+
+        // Before Association Setup: honestly zero. A gate polling this fails here rather
+        // than passing a UPF that cannot legally carry a session (TS 29.244 §6.2.6.2).
+        assert!(
+            !gauge.load(Ordering::Relaxed),
+            "a fresh server must not report an association"
+        );
+
+        let assoc = build_association_setup_request_payload(Some(1));
+        let resp = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::RequestAccepted as u8,
+            "the Association Setup this assertion depends on must succeed"
+        );
+        assert!(
+            gauge.load(Ordering::Relaxed),
+            "the gauge must follow a real Association Setup Request"
+        );
+        // The async authority and its projection must agree.
+        assert_eq!(server.is_associated().await, gauge.load(Ordering::Relaxed));
+
+        // And it must come back DOWN. A gauge that only ever counts up would satisfy the
+        // assertion above and still be wrong.
+        let release = {
+            let mut b = crate::n4_build::PfcpMessageBuilder::new();
+            b.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 1)));
+            b.build()
+        };
+        let resp = exchange(
+            &smf,
+            addr,
+            &encode_pfcp(pfcp_type::ASSOCIATION_RELEASE_REQUEST, None, 2, &release),
+        )
+        .await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::RequestAccepted as u8,
+            "the Association Release this assertion depends on must succeed"
+        );
+        assert!(
+            !gauge.load(Ordering::Relaxed),
+            "the gauge must clear when the peer releases the association"
         );
     }
 
