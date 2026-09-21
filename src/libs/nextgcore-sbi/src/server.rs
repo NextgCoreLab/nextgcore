@@ -104,10 +104,16 @@ pub struct SbiServerConfig {
     /// This NF's instance ID / FQDN, combined with `server_nf_type` as the
     /// `Server` value `<NFTYPE>-<id>` (sbi-02).
     pub server_nf_id: Option<String>,
-    /// #65: producer-side overload reporter. When set and its metric is
-    /// non-zero, every response carries `3gpp-Sbi-Oci` so consumers can apply
-    /// TS 29.500 §6.4.2.2 abatement. `None` (default) emits no OCI, which is the
-    /// prior behaviour.
+    /// #65: producer-side overload reporter. When its metric is non-zero, every
+    /// response carries `3gpp-Sbi-Oci` so consumers can apply TS 29.500 §6.4.2.2
+    /// abatement.
+    ///
+    /// `None` (the default) now means **this process's own reporter**
+    /// ([`crate::overload::self_overload_reporter`]), which #273 drives from the
+    /// NF's `NFProfile.load` gauge on each heartbeat tick. That reporter sits at
+    /// metric 0 until something publishes a load, so a process that never does —
+    /// every test binary — still emits no OCI. `Some` overrides it for an NF that
+    /// wants a reporter of its own.
     ///
     /// The NF owns the metric — see [`OverloadReporter`] for why this layer does
     /// not try to measure load itself.
@@ -198,6 +204,27 @@ impl SbiServerConfig {
     /// since sbi-08 but never reachable from a response until now.
     pub fn with_overload_reporter(mut self, reporter: Arc<OverloadReporter>) -> Self {
         self.overload_reporter = Some(reporter);
+        self
+    }
+
+    /// Emit `3gpp-Sbi-Oci` from **this process's own** reporter, the one the
+    /// heartbeat tick drives from the NF's `NFProfile.load` gauge (#273).
+    ///
+    /// This is the line an NF adds to perform the producer half of TS 29.500 §6.4
+    /// with no reporter of its own to manage:
+    /// [`crate::heartbeat::spawn_heartbeat_worker_with_load`] already publishes
+    /// the NF's load, and this connects that to its responses.
+    ///
+    /// Deliberately **explicit** rather than the default for `overload_reporter ==
+    /// None`. Making the fallback ambient was tried and reverted: the reporter is
+    /// process-global, so one test raising the metric made every other server in
+    /// the same test binary start stamping OCI, and two unrelated `server.rs`
+    /// tests failed in parallel. The same mechanism in production is a daemon
+    /// whose in-process test server suddenly emits overload because another test
+    /// simulated load. An opt-in at the 19 daemons' own server setup is one line
+    /// each and cannot surprise anything that did not ask.
+    pub fn with_self_overload_reporting(mut self) -> Self {
+        self.overload_reporter = Some(crate::overload::self_overload_reporter().clone());
         self
     }
 

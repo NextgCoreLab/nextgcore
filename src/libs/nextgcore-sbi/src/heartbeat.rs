@@ -645,6 +645,37 @@ pub fn spawn_heartbeat_worker(nf_instance_id: String, interval_secs: u64) {
     spawn_heartbeat_worker_with_load(nf_instance_id, interval_secs, || 0);
 }
 
+/// Publish an `NFProfile.load` reading to this process's own
+/// [`OverloadReporter`](crate::overload::OverloadReporter), so responses carry
+/// `3gpp-Sbi-Oci` while the NF is above
+/// [`LOAD_OVERLOAD_THRESHOLD`](crate::overload::LOAD_OVERLOAD_THRESHOLD) (#273).
+///
+/// Extracted from the tick body so it is unit-testable without a running worker,
+/// and `pub` so an NF with a faster-moving signal than the 5s heartbeat (an AMF
+/// reacting to an N2 burst, say) can publish between ticks. Logs only on a
+/// *transition*, honouring §6.4.3.4.3's warning against churning on small
+/// variations: a steady overload produces one line, not one per tick.
+pub fn publish_overload_from_load(nf_instance_id: &str, load_percent: u8) {
+    let reporter = crate::overload::self_overload_reporter();
+    let before = reporter.reduction_metric();
+    reporter.report_load(load_percent);
+    let after = reporter.reduction_metric();
+    if after != before {
+        if after == 0 {
+            log::info!(
+                "NF {nf_instance_id} load {load_percent}% has fallen below the overload \
+                 threshold; withdrawing 3gpp-Sbi-Oci (TS 29.500 §6.4.3.4.3 metric 0)"
+            );
+        } else {
+            log::warn!(
+                "NF {nf_instance_id} load {load_percent}% is at or above the overload \
+                 threshold; asking peers for {after}% traffic reduction via 3gpp-Sbi-Oci \
+                 (TS 29.500 §6.4.3.2)"
+            );
+        }
+    }
+}
+
 /// Like [`spawn_heartbeat_worker`], but PATCHes a real `NFProfile.load` gauge
 /// each tick, computed fresh by `load_fn` (TS 29.510 §5.2.2.3.2).
 ///
@@ -653,6 +684,24 @@ pub fn spawn_heartbeat_worker(nf_instance_id: String, interval_secs: u64) {
 /// capacity). Values are saturated to 100 by [`build_load_patch`]. As with the
 /// plain worker, a PATCH failure only logs a warning and never affects NF
 /// operation, so a temporary NRF outage cannot crash the NF.
+///
+/// # #273: this is also the producer-side overload metric source
+///
+/// The same `load_fn` reading drives
+/// [`self_overload_reporter`](crate::overload::self_overload_reporter) via
+/// [`OverloadReporter::report_load`](crate::overload::OverloadReporter::report_load),
+/// so an NF above [`LOAD_OVERLOAD_THRESHOLD`](crate::overload::LOAD_OVERLOAD_THRESHOLD)
+/// starts stamping `3gpp-Sbi-Oci` on its own responses (TS 29.500 §6.4.3.2)
+/// without any per-daemon wiring. This function is the right place because it is
+/// the ONE place every registering NF in this tree already computes a real
+/// capacity percentage — grep confirms 16 call sites across 16 daemons, each
+/// passing its own gauge. Deriving the OCI here rather than in the SBI server is
+/// the whole point of decision 2 in #273: the number is the NF's, not the
+/// transport's.
+///
+/// Also updated on the ticks where the NRF PATCH is skipped (no NRF URI, or the
+/// NES pause), because peers still need the truth even when the NRF cannot be
+/// told it.
 pub fn spawn_heartbeat_worker_with_load<F>(nf_instance_id: String, interval_secs: u64, load_fn: F)
 where
     F: Fn() -> u8 + Send + 'static,
@@ -661,6 +710,13 @@ where
     // handed it again. Done here rather than at each NF's registration site
     // because every registering NF reaches this function.
     set_registered_nf_instance_id(nf_instance_id.clone());
+
+    // #273: scope the OCI this NF emits to its own NF Instance ID. §6.4.3.4.1
+    // makes a scope mandatory and Table 6.4.3.4.5.2-1 lists `NF-Instance` as the
+    // "all services of this NF instance" scope, which is what a load-derived
+    // metric actually describes — it is computed from whole-NF capacity, not per
+    // service. Done here because this is where the registered ID is known.
+    crate::overload::self_overload_reporter().set_scope("NF-Instance", nf_instance_id.clone());
 
     tokio::spawn(async move {
         log::info!(
@@ -675,6 +731,14 @@ where
 
         loop {
             ticker.tick().await;
+
+            // #273: read the gauge ONCE per tick and publish it to this NF's own
+            // overload reporter before any of the early `continue`s below. A peer
+            // dialling this NF needs the truth about its load even on a tick that
+            // cannot reach the NRF — an NF that is overloaded AND cut off from the
+            // NRF is exactly when abatement matters most.
+            let load = load_fn();
+            publish_overload_from_load(&nf_instance_id, load);
 
             // Issue #22 NES: while paused (deregistered sleep) skip the
             // tick entirely — a deleted NF profile must not be PATCHed.
@@ -704,7 +768,6 @@ where
 
             let client = SbiClient::with_host_port(&nrf_host, nrf_port);
             let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
-            let load = load_fn();
             let body = build_load_patch(load);
 
             // TS 29.510 §5.2.2.3 mandates application/json-patch+json for
@@ -755,7 +818,15 @@ mod tests {
     /// asserts on. The end-to-end path is covered in `nrfd`, whose binary
     /// touches neither global.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see SELF_REPORTER_TEST_LOCK's rationale
     async fn test_registered_nf_instance_id_plumbing() {
+        // #273: `spawn_heartbeat_worker_with_load` now also writes the OCI scope
+        // on the process-global reporter, so this test contends with
+        // `an_nf_above_its_load_threshold_reports_overload_to_a_default_consumer`
+        // over that global even though it asserts nothing about it. Takes the same
+        // lock — declared beside the global in `overload.rs`, never a second one.
+        let _guard = crate::overload::lock_self_reporter();
+
         // Nothing has registered in this test binary.
         clear_registered_nf_instance_id();
         assert_eq!(registered_nf_instance_id(), None);
@@ -795,6 +866,161 @@ mod tests {
 
         clear_registered_nf_instance_id();
         assert_eq!(registered_nf_instance_id(), None);
+    }
+
+    /// #273 decision 2, end to end and on a LIVE path: an NF whose load gauge
+    /// crosses the threshold stamps `3gpp-Sbi-Oci` on its own responses, and a
+    /// DEFAULT consumer of this tree abates against it.
+    ///
+    /// This is the test that makes the producer half *driven* rather than
+    /// reachable-but-undriven. It asserts the whole chain in the order production
+    /// runs it:
+    ///
+    /// 1. `spawn_heartbeat_worker_with_load` — the real production entry point,
+    ///    called at 17 sites — records the scope from the NF instance ID and
+    ///    starts ticking.
+    /// 2. The worker's **own tick** polls the gauge closure and publishes it. This
+    ///    test never calls `publish_overload_from_load` itself: doing so would
+    ///    leave the tick's call to it unpinned, which is precisely the
+    ///    reachable-but-undriven defect being closed. The gauge below returns a
+    ///    value this test controls, so a tick that stopped publishing shows up as
+    ///    the OCI never appearing.
+    /// 3. An `SbiServer` configured with `with_self_overload_reporting()` — the
+    ///    one line each daemon adds, and which `amfd` and `smfd` now carry — picks
+    ///    the metric up and stamps it on a response.
+    /// 4. A DEFAULT `SbiClient` sheds its next request to that server.
+    ///
+    /// Step 4 is what the whole issue is about: the shedding consumer here is
+    /// configured with nothing at all.
+    ///
+    /// Takes `lock_self_reporter()` and restores the reporter, because
+    /// `self_overload_reporter()` is process-global and a leftover non-zero metric
+    /// would make every other server test in this binary emit an OCI.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // see SELF_REPORTER_TEST_LOCK's rationale
+    async fn an_nf_above_its_load_threshold_reports_overload_to_a_default_consumer() {
+        use crate::overload::{self_overload_reporter, LOAD_OVERLOAD_THRESHOLD};
+        use std::sync::atomic::{AtomicU8, Ordering as AtomicOrd};
+
+        let _guard = crate::overload::lock_self_reporter();
+
+        // Distinct literal instance IDs per test in this binary: the scope is
+        // stored on the ONE process-global reporter, so two tests using the same
+        // ID could not tell whose scope they were reading.
+        let nf_instance_id = "c3f1e7d2-2730-4bcd-9a01-000000000273";
+
+        let reporter = self_overload_reporter();
+        reporter.set_operator_metric(0);
+        reporter.report_load(0);
+
+        // The NF's capacity gauge, standing in for `AmfContext::get_ue_load()`.
+        // The worker polls it on every tick, so moving it is how this test
+        // simulates the AMF filling up — through the production path, not past it.
+        let gauge = Arc::new(AtomicU8::new(0));
+        let gauge_for_worker = gauge.clone();
+        // 1s interval so a change to the gauge reaches a tick promptly. No NRF URI
+        // is configured, so each tick takes the "no NRF URI, skipping" branch —
+        // which is exactly the branch #273 must still publish the metric on, and
+        // would be the branch a real overloaded-and-isolated NF took.
+        spawn_heartbeat_worker_with_load(nf_instance_id.to_string(), 1, move || {
+            gauge_for_worker.load(AtomicOrd::Relaxed)
+        });
+
+        // The exact server configuration `amfd` and `smfd` now use in production:
+        // one builder call, no reporter of their own.
+        let (server, addr) = crate::test_support::sbi_server_on_free_port_with(
+            |addr| crate::server::SbiServerConfig::new(addr).with_self_overload_reporting(),
+            |_req: SbiRequest| async { crate::message::SbiResponse::with_status(204) },
+        )
+        .await;
+        let port = addr.port();
+
+        let probe = SbiClient::with_host_port("127.0.0.1", port);
+        let healthy = probe
+            .send_request(SbiRequest::get("/x"))
+            .await
+            .expect("response");
+        assert!(
+            healthy
+                .http
+                .get_header(crate::constants::custom_header::OCI)
+                .is_none(),
+            "an NF below its threshold must emit no OCI at all"
+        );
+
+        // The NF fills up. Only the gauge is touched; the worker's tick is what
+        // must notice.
+        gauge.store(100, AtomicOrd::Relaxed);
+        // The ramp needs headroom to span, or `report_load` would divide by zero.
+        const _: () = assert!(LOAD_OVERLOAD_THRESHOLD < 100);
+        assert_eq!(
+            crate::test_support::poll_until(
+                Duration::from_secs(20),
+                Duration::from_millis(25),
+                || async { (reporter.reduction_metric() == 100).then_some(()) }
+            )
+            .await,
+            Some(()),
+            "the heartbeat tick must publish the gauge: load 100% asks for a 100% \
+             reduction, the deterministic end of the ramp"
+        );
+
+        let loaded = probe
+            .send_request(SbiRequest::get("/x"))
+            .await
+            .expect("response");
+        let header = loaded
+            .http
+            .get_header(crate::constants::custom_header::OCI)
+            .expect("an overloaded NF must stamp 3gpp-Sbi-Oci (TS 29.500 §6.4.3.2)")
+            .clone();
+        let oci = crate::overload::Oci::parse(&header).expect("parseable");
+        assert_eq!(oci.reduction_metric, 100);
+        assert_eq!(
+            oci.extra,
+            vec![("NF-Instance".to_string(), nf_instance_id.to_string())],
+            "the scope must name the instance the heartbeat worker registered"
+        );
+
+        // The consumer half, with a fresh DEFAULT client: the recorded OCI is
+        // conformant, so the next request is shed rather than sent. `probe` is
+        // reused for nothing here because it already recorded an OCI above and a
+        // fresh client proves the reaction needs no priming.
+        let consumer = SbiClient::with_host_port("127.0.0.1", port);
+        assert_eq!(
+            consumer
+                .send_request(SbiRequest::get("/x"))
+                .await
+                .expect("the first request is always sent")
+                .status,
+            204
+        );
+        let err = consumer
+            .send_request(SbiRequest::get("/x"))
+            .await
+            .expect_err("a default consumer must abate against a real NF's OCI");
+        assert!(
+            matches!(err, crate::error::SbiError::OverloadShed(_)),
+            "expected a local shed, got {err:?}"
+        );
+
+        // Recovery through the same path: drop the gauge and the tick withdraws the
+        // OCI (§6.4.3.4.3 — the metric falling to 0 signals the overload ceased).
+        // Asserted as a transition, and it also restores the process-global so
+        // other tests in this binary do not inherit a loaded reporter. The worker
+        // outlives this test's runtime, so the gauge is left at 0 too.
+        gauge.store(0, AtomicOrd::Relaxed);
+        assert_eq!(
+            crate::test_support::poll_until(
+                Duration::from_secs(20),
+                Duration::from_millis(25),
+                || async { (reporter.reduction_metric() == 0).then_some(()) }
+            )
+            .await,
+            Some(()),
+            "a recovered NF must stop asking for reduction"
+        );
+        server.stop().await.expect("stop");
     }
 
     /// Issue #22 NES: the default heartbeat body is byte-identical to the

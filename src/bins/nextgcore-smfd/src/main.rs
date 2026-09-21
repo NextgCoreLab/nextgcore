@@ -612,6 +612,17 @@ async fn main() -> Result<()> {
         nextgcore_sbi::types::NfType::Smf,
         &nrf_uri,
     )?;
+    // #273: perform the producer half of TS 29.500 §6.4. The heartbeat worker
+    // registered below publishes this SMF's session load to the process reporter
+    // on every tick, and this makes each Nsmf response carry the resulting
+    // `3gpp-Sbi-Oci` once that load crosses the overload threshold — so an AMF
+    // creating PDU sessions backs off before `smf_ue_add` starts refusing them
+    // outright (§6.4.3.2).
+    //
+    // NOTE: this is the SMF-instance-wide metric. Per-S-NSSAI/DNN overload
+    // reporting (§6.4.3.4.5.2.2) is optional for an SMF and is not done here; see
+    // specs/decide-oci-shedding-default-and-producer-metric-source.md.
+    sbi_server_config = sbi_server_config.with_self_overload_reporting();
     let sbi_server = SbiServer::new(sbi_server_config);
 
     sbi_server
