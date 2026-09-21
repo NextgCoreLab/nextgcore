@@ -2398,6 +2398,24 @@ pub struct AmfUe {
     /// AUTN as Vec for variable length
     pub autn: Vec<u8>,
 
+    /// This UE is EMERGENCY REGISTERED without a successful primary authentication run
+    /// (#361, TS 33.501 §10.2.2).
+    ///
+    /// Set only by `ngap_path::continue_unauthenticated_emergency_registration`. Everything
+    /// that must behave differently for such a session reads THIS field: the Registration
+    /// Accept sets "Emergency registered" and omits the Allowed NSSAI (TS 23.502 §4.12.2.3),
+    /// `complete_registration` skips the UDM/PCF/NSACF calls (same clause: "the AMF shall not
+    /// update the UDM"), the NGAP capability egress narrows to the null set (§6.7.3.6), and a
+    /// PDU session off the emergency DNN is refused (TS 23.501 §5.16.4.9a).
+    ///
+    /// Distinct from `registration_type == EMERGENCY`, and the distinction is load-bearing: an
+    /// emergency registration that DID authenticate is an ordinary registration with an
+    /// emergency-service scope, keeps its real key hierarchy and its UDM subscription, and
+    /// must not have any of the above applied to it — §10.2.2.2's NOTE says so directly ("In
+    /// case of authentication success the AMF will send a NAS SMC selecting algorithms with a
+    /// non-NULL integrity algorithm").
+    pub unauthenticated_emergency: bool,
+
     // ========================================================================
     // Rel-17 Feature Fields
     // ========================================================================
@@ -2913,6 +2931,9 @@ impl AmfUe {
             pending_psi: None,
             sessions: Vec::new(),
             autn: vec![0u8; NEXTGCORE_AUTN_LEN],
+            // Default deny, like `slice_admission_granted`: a session is treated as an
+            // unauthenticated emergency one only where the AUSF-failure arm says so (#361).
+            unauthenticated_emergency: false,
             redcap_indication: false,
             snpn_nid: None,
             cag_id: None,
@@ -3080,6 +3101,34 @@ pub fn generate_random_tmsi() -> u32 {
             return tmsi;
         }
     }
+}
+
+/// Generate a K_AMF locally, for an unauthenticated emergency session (#361).
+///
+/// TS 33.501 §10.2.2.3.1: "When there has been no successful run of Primary authentication of
+/// the UE, the UE and the AMF **independently generate the K_(AMF) in an implementation
+/// defined way** and populate the 5G NAS security context with this K_(AMF) to be used when
+/// activating a 5G NAS security context. All key derivations proceed as if they were based on
+/// a K_(AMF) generated from a successful Primary authentication run."
+///
+/// "Independently" is the operative word: the UE generates its own and the two never match.
+/// Nothing depends on their matching, because the only algorithms permitted on such a session
+/// are NIA0 (computes no MAC to compare) and NEA0 (enciphers nothing) — §6.7.3.6.
+///
+/// CSPRNG rather than a constant or a zero fill, which would be simpler and would satisfy the
+/// letter of "implementation defined". Two reasons not to: this K_AMF is the root from which
+/// KgNB is derived (Annex A.9) and handed to the RAN, so a predictable root would let anyone
+/// who knows the algorithm reconstruct an AS key the gNB holds; and §5.9.3 requires key
+/// material to be unique per context regardless of the algorithms in force. 32 bytes from two
+/// v4 UUIDs, the same OS CSPRNG (`getrandom`) source `generate_random_tmsi` draws on, so this
+/// introduces no new entropy dependency.
+pub fn generate_local_kamf() -> [u8; NEXTGCORE_SHA256_DIGEST_SIZE] {
+    let mut kamf = [0u8; NEXTGCORE_SHA256_DIGEST_SIZE];
+    let first = uuid::Uuid::new_v4();
+    let second = uuid::Uuid::new_v4();
+    kamf[..16].copy_from_slice(first.as_bytes());
+    kamf[16..].copy_from_slice(second.as_bytes());
+    kamf
 }
 
 impl Default for AmfUe {

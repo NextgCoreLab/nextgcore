@@ -71,6 +71,17 @@ amf:
   time:
     t3512:
       value: 540
+  # Emergency services (#361, TS 33.501 §10.2.2 / §5.1.2).
+  #
+  # REGULATORY setting. `true` (the shipped default, written out so it reads as a
+  # decision) lets an EMERGENCY registration proceed when no authentication vector
+  # can be obtained: NIA0/NEA0 forced, no UDM update, no Allowed NSSAI, emergency
+  # DNN only. Required by law in some jurisdictions, forbidden in others; set false
+  # where TS 33.501 §5.1.2's "shall not support this feature" applies.
+  #
+  # Override without editing this file: AMF_EMERGENCY_ALLOW_UNAUTHENTICATED=0
+  emergency:
+    allow_unauthenticated: true
   # TLS configuration (G36: SBI TLS)
   # Enable: TLS_ENABLED=true SBI_SCHEME=https docker compose up -d
   tls:

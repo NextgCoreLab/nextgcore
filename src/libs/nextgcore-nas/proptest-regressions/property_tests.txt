@@ -6,3 +6,4 @@
 # everyone who runs the test benefits from these saved cases.
 cc 95ec0e18aa360553064a5439005d5e783721f44721e0ecb730b7fc6af367657c # shrinks to guti = FiveGGuti { plmn_id: PlmnId { mcc: [0, 0, 0], mnc: [0, 0, 0], mnc_len: 2 }, amf_region_id: 0, amf_set_id: 0, amf_pointer: 0, tmsi: 0 }
 cc f881ebe500ed64d7d3d69944f5acf1ed706fef2fe3475bb254fb06cf794f3aa1 # shrinks to digits = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+cc 848fdf6c993ba868c22ffe1c574085a2ec41e24977198182de2e5fd6b5999967 # shrinks to sms_allowed = false, emergency_registered = true, value = ThreeGppAccess

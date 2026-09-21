@@ -2104,17 +2104,23 @@ impl NgapServer {
         // so an emergency registration was processed as a normal one -- which is a
         // regulatory-grade gap, not a cosmetic one.
         if req.registration_type == crate::gmm_build::registration_type::EMERGENCY {
-            let has_supi = self
-                .ue_auth_state
-                .get(amf_ue_ngap_id)
-                .and_then(|s| s.amf_ue.supi.clone())
-                .is_some()
-                || req.suci.is_some();
+            // `authenticated: false`, unconditionally, because at THIS point in the procedure
+            // nothing has been authenticated (#361). This argument used to be
+            // `supi.is_some() || req.suci.is_some()`, which was the presence of an IDENTITY,
+            // not an authentication outcome -- and `AmfUe::supi` is written only from the AUSF
+            // confirmation much later, so the predicate reduced to "the UE sent some SUCI".
+            // Every emergency registration carrying one, INCLUDING the ones the AUSF then
+            // refused or could not be asked about, was recorded `authenticated: true`. That is
+            // the field §10.2.2.1 requires to distinguish an unauthenticated emergency caller,
+            // so it was wrong in exactly the case it exists for.
+            //
+            // The context is promoted by `emergency.mark_authenticated` when the AUSF actually
+            // confirms, and left as-is (or explicitly demoted) when it does not.
             let ctx = self
                 .emergency
-                .handle_emergency_registration(amf_ue_ngap_id, has_supi);
+                .handle_emergency_registration(amf_ue_ngap_id, false);
             log::warn!(
-                "EMERGENCY registration from UE {amf_ue_ngap_id}: authenticated={}, \
+                "EMERGENCY registration from UE {amf_ue_ngap_id}: authenticated={} (pending), \
                  reg_type={:?}, emergency DNN '{}' (TS 24.501 §5.5.1.2, TS 23.167)",
                 ctx.authenticated,
                 ctx.reg_type,
@@ -2298,6 +2304,25 @@ impl NgapServer {
                     log::info!("UE indicates RedCap (Reduced Capability) device");
                 }
 
+                // PERSIST before handing off (#361). `ue_auth_state.get` returns a CLONE --
+                // deliberately, so no lock is held across an `.await` (see `ue_store`'s module
+                // docs) -- and this handler is the one place that mutated the clone and never
+                // wrote it back. Everything assigned above was therefore DISCARDED at the end
+                // of this function: the registration type, the SUCI, the UE security
+                // capability, the S1-mode capability, the UE policy container, the SNPN and
+                // UAV contexts, the RedCap indication and the capped UE-AMBR.
+                //
+                // `start_authentication` opens by TAKING the record out of the store, so it
+                // read the pre-registration context every time. That is why #361's own premise
+                // -- "`state.amf_ue.registration_type` is right there and carries the answer"
+                // -- was not actually true at the point the AUSF-failure arm runs: the field
+                // was still 0 there, so a registration-type check would never have matched
+                // EMERGENCY however it was written.
+                //
+                // Found by probing for it rather than by reading: the #361 branch appeared
+                // correct and simply never fired. Verified at `89cb764` before this change, so
+                // it is pre-existing and not introduced here.
+                self.ue_auth_state.insert(amf_ue_ngap_id, state);
                 self.start_authentication(association_id, amf_ue_ngap_id, ran_ue_ngap_id, None)
                     .await?;
             }
@@ -2357,6 +2382,16 @@ impl NgapServer {
                 } else if let Some(guti) = req.guti {
                     state.amf_ue.old_guti = guti;
                 }
+                // PERSIST before the send, for the same reason as the SUCI arm above (#361):
+                // the mapped EPS GUTI, the native old-GUTI and the registration type all live
+                // on the clone until this line. This arm is the worse of the two to lose,
+                // because it goes on to await an Identity Response whose handler resolves the
+                // UE from the store -- so a lost `registration_type` here is lost for the whole
+                // GUTI-identified registration, not merely until the next message.
+                //
+                // Inserted BEFORE the `?` on the send, so a failed Identity Request leaves the
+                // recorded registration behind rather than discarding it (the #359 lesson).
+                self.ue_auth_state.insert(amf_ue_ngap_id, state);
                 // GUTI unknown to this AMF instance: identify the UE by SUCI
                 // (TS 24.501 Section 5.4.3) and arm T3570
                 log::info!("Registration with unknown 5G-GUTI: requesting SUCI");
@@ -2374,6 +2409,10 @@ impl NgapServer {
             }
             other => {
                 log::error!("Unsupported mobile identity type {other} in Registration Request");
+                // The registration is refused, so `state` is deliberately DROPPED rather than
+                // persisted: an unsupported identity type means nothing above it was parsed
+                // from a usable request, and keeping the partial context would leave a UE
+                // recorded as mid-registration with no procedure running.
                 let reject =
                     gmm_build::build_registration_reject(GmmCause::InvalidMandatoryInformation);
                 self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
@@ -2455,6 +2494,49 @@ impl NgapServer {
             }
             Err(e) => {
                 log::error!("AUSF authentication failed for {}: {e}", state.suci);
+                // #361: an EMERGENCY registration is not refused for want of an AUSF where
+                // the deployment's regulation requires unauthenticated emergency service.
+                //
+                // TS 33.501 §10.2.2.2 enumerates the AMF's obligations by condition, and the
+                // FIRST one it names is this one: "If the AMF cannot identify the subscriber,
+                // or cannot obtain authentication vector (when SUPI is provided), the AMF
+                // shall send NAS SMC with NULL algorithms to the UE regardless of the
+                // supported algorithms announced previously by the UE." An unreachable AUSF
+                // IS "cannot obtain authentication vector" — §10.2.2.1(b) spells out the
+                // availability case: "UEs that have valid subscription but SN cannot complete
+                // authentication because of network failure or other reasons".
+                //
+                // The registration type is read from `state.amf_ue`, which is sound here:
+                // `handle_registration_request_nas` assigns it from the live request before
+                // dispatching to this function, so it is this registration's own type and not
+                // a stale one.
+                //
+                // Gated on operator policy, because §5.1.2 makes unauthenticated emergency
+                // service MANDATORY in some jurisdictions and FORBIDDEN in others, and
+                // §10.2.2.2 requires the choice to be configurable. Default permits it; see
+                // `emergency::EmergencyPolicy`.
+                if state.amf_ue.registration_type == crate::gmm_build::registration_type::EMERGENCY
+                    && self.emergency.policy().allow_unauthenticated
+                {
+                    return self
+                        .continue_unauthenticated_emergency_registration(
+                            association_id,
+                            amf_ue_ngap_id,
+                            ran_ue_ngap_id,
+                            state,
+                        )
+                        .await;
+                }
+                if state.amf_ue.registration_type == crate::gmm_build::registration_type::EMERGENCY
+                {
+                    log::warn!(
+                        "EMERGENCY registration from UE {amf_ue_ngap_id} REFUSED because the \
+                         AUSF is unreachable and amf.emergency.allow_unauthenticated is false. \
+                         TS 33.501 §10.2.2.2 would permit an unauthenticated emergency session \
+                         here; §5.1.2 requires this configuration only where local regulation \
+                         forbids one."
+                    );
+                }
                 let cause = gmm_cause_from_sbi_error(&e);
                 let reject = gmm_build::build_registration_reject(cause);
                 // The state is deliberately NOT put back here, unlike in every sibling
@@ -2474,6 +2556,164 @@ impl NgapServer {
                     .await?;
             }
         }
+        Ok(())
+    }
+
+    /// Continue an EMERGENCY registration whose authentication could not be obtained, as an
+    /// UNAUTHENTICATED limited-service registration (#361, TS 33.501 §10.2.2).
+    ///
+    /// Reached only from `start_authentication`'s AUSF-failure arm, only for
+    /// `registration_type == EMERGENCY`, and only when the operator's policy permits it.
+    /// `state` is the UE context that arm already removed from `ue_auth_state`; this function
+    /// owns it and re-inserts it, so the caller must not.
+    ///
+    /// The three spec obligations discharged here, in order:
+    ///
+    /// 1. **NULL algorithms are FORCED, not negotiated.** §6.7.3.6: "the AMF shall use NIA0
+    ///    and NEA0 as the integrity and ciphering algorithm respectively", and "Select NIA0
+    ///    and NEA0, REGARDLESS of the supported algorithms announced previously by the UE".
+    ///    So `select_integrity_algorithm` — whose whole job is to honour the UE's advertised
+    ///    set — is deliberately bypassed. It would refuse this session: a UE advertising only
+    ///    NIA2 yields `Some(2)`, not NIA0, and the fail-closed arm would then reject a UE the
+    ///    spec says to admit. §10.2.2.2 repeats the point in its NOTE 1: the UE "still needs
+    ///    to be prepared ... to accept a NAS SMC from the AMF requesting the use of the NULL
+    ///    ciphering and integrity algorithms".
+    ///
+    /// 2. **K_AMF is generated locally.** §10.2.2.3.1: "When there has been no successful run
+    ///    of Primary authentication of the UE, the UE and the AMF independently generate the
+    ///    K_(AMF) in an implementation defined way ... All key derivations proceed as if they
+    ///    were based on a K_(AMF) generated from a successful Primary authentication run."
+    ///    That last sentence is why the Annex A.8 KDF below is the ORDINARY one and why no
+    ///    downstream site needs to learn about a keyless context: the context is
+    ///    normal-shaped, its root is just not the AUSF's. The UE derives its own, unrelated
+    ///    K_AMF; they never have to match, because NIA0 computes no MAC to compare and NEA0
+    ///    enciphers nothing — §10.2.2.3.1: "the UE and the network treat the 5G security
+    ///    context with the independently generated K_(AMF) as if it contained a normally
+    ///    generated K_(AMF)". A CSPRNG rather than a constant so that no two sessions, and no
+    ///    two deployments, share a root — it is used to derive KgNB, which the RAN holds.
+    ///
+    /// 3. **No SUPI is invented.** §4.12.2.3 (TS 23.502): "if the UE was not successfully
+    ///    authenticated, the AMF shall not update the UDM". `complete_registration` therefore
+    ///    skips the UECM/SDM/PCF/NSACF block for this UE, so there is no identity to
+    ///    fabricate — which is the objection #361 raised and the spec answers by removing the
+    ///    call rather than by naming a placeholder. The SUCI the UE presented stays on the
+    ///    context as the "unauthenticated SUPI retained in the network for recording
+    ///    purposes" of §10.2.2.1.
+    ///
+    /// Ends by sending the Security Mode Command, so the procedure rejoins the ordinary path
+    /// at `handle_security_mode_complete_nas` — the UE-facing message flow is the standard
+    /// one, which is exactly what §10.2.2.2(a) describes ("The UE shall proceed as specified
+    /// for the non-emergency case in except that the UE shall accept a NAS SMC selecting NEA0
+    /// and NIA0 algorithms").
+    async fn continue_unauthenticated_emergency_registration(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        mut state: UeNasContext,
+    ) -> Result<()> {
+        log::warn!(
+            "EMERGENCY registration from UE {amf_ue_ngap_id} continuing UNAUTHENTICATED: no \
+             authentication vector could be obtained, and this deployment permits \
+             unauthenticated emergency service (TS 33.501 §10.2.2.2). NIA0/NEA0 forced; no UDM \
+             update; emergency DNN '{}' only.",
+            self.emergency.emergency_dnn()
+        );
+
+        // The emergency context now records the OUTCOME. `handle_registration_request_nas`
+        // created it optimistically from the presence of a SUCI; authentication has since
+        // failed to happen, so the context must say so — this is the field a PSAP and an
+        // operator read to know whether the caller's identity was verified (§10.2.2.1).
+        //
+        // Re-created rather than mutated in place when absent: a UE that reached
+        // `start_authentication` without an emergency context (a re-authentication, say)
+        // still needs one before the restrictions below can be enforced against it.
+        if !self.emergency.mark_unauthenticated(amf_ue_ngap_id) {
+            self.emergency
+                .handle_emergency_registration(amf_ue_ngap_id, false);
+        }
+
+        state.amf_ue.unauthenticated_emergency = true;
+
+        // §6.7.3.6 / §10.2.2.2: NIA0 + NEA0, forced.
+        state.amf_ue.selected_int_algorithm = 0;
+        state.amf_ue.selected_enc_algorithm = 0;
+        // A NATIVE 5G security context (nas_tsc 0, TS 24.501 §9.11.3.32) with an ngKSI the UE
+        // is not already using, exactly as the authenticated path picks one — the UE has to be
+        // able to name this context in later messages regardless of how its root was made.
+        state.amf_ue.nas_tsc = 0;
+        state.amf_ue.nas_ksi = select_ngksi(state.amf_ue.nas_ue_ksi);
+        // Initial ABBA (TS 33.501 Annex A.7.1), as on the authenticated path: the SMC carries
+        // it, and §10.2.2.3.1's "all key derivations proceed as if" covers this one too.
+        state.amf_ue.abba = [0x00, 0x00];
+        state.amf_ue.abba_len = 2;
+
+        // §10.2.2.3.1's "implementation defined way". The OS CSPRNG, via the same source
+        // `generate_random_tmsi` uses.
+        state.amf_ue.kamf = crate::context::generate_local_kamf();
+        let knas_int = nextgcore_crypt::kdf::nextgcore_kdf_nas_5gs(
+            0x02, // N-NAS-int-alg (TS 33.501 Annex A.8)
+            state.amf_ue.selected_int_algorithm,
+            &state.amf_ue.kamf,
+        );
+        let knas_enc = nextgcore_crypt::kdf::nextgcore_kdf_nas_5gs(
+            0x01, // N-NAS-enc-alg
+            state.amf_ue.selected_enc_algorithm,
+            &state.amf_ue.kamf,
+        );
+        state.amf_ue.knas_int.copy_from_slice(&knas_int);
+        state.amf_ue.knas_enc.copy_from_slice(&knas_enc);
+
+        let Some(smc_plain) = gmm_build::build_security_mode_command(&state.amf_ue) else {
+            log::error!(
+                "UE {amf_ue_ngap_id}: could not build the Security Mode Command for the \
+                 unauthenticated emergency registration; refusing rather than leaving the UE \
+                 mid-procedure"
+            );
+            let reject =
+                gmm_build::build_registration_reject(GmmCause::SecurityModeRejectedUnspecified);
+            self.ue_auth_state.insert(amf_ue_ngap_id, state);
+            self.reject_and_release(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject, 1)
+                .await?;
+            return Ok(());
+        };
+        // INTEGRITY_PROTECTED_WITH_NEW_5G_NAS_SECURITY_CONTEXT is the correct header type even
+        // under NIA0: it is what tells the UE a new context is being activated and which
+        // ngKSI names it. `nas_5gs_security_encode` sees `selected_int_algorithm == 0` and
+        // emits a zero MAC, which is what NIA0 means (TS 33.501 Annex D.1).
+        let Some(smc_protected) = nas_security::nas_5gs_security_encode(
+            &mut state.amf_ue,
+            &smc_plain,
+            security_header::INTEGRITY_PROTECTED_WITH_NEW_5G_NAS_SECURITY_CONTEXT,
+        ) else {
+            log::error!(
+                "UE {amf_ue_ngap_id}: could not encode the Security Mode Command for the \
+                 unauthenticated emergency registration; refusing"
+            );
+            let reject =
+                gmm_build::build_registration_reject(GmmCause::SecurityModeRejectedUnspecified);
+            self.ue_auth_state.insert(amf_ue_ngap_id, state);
+            self.reject_and_release(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject, 1)
+                .await?;
+            return Ok(());
+        };
+
+        state.gmm_fsm.transition_to_security_mode();
+        self.ue_auth_state.insert(amf_ue_ngap_id, state);
+        let ngap_pdu = self
+            .send_nas_pdu(
+                association_id,
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                &smc_protected,
+            )
+            .await?;
+        self.arm_retx(amf_ue_ngap_id, NasProcTimer::T3560, ngap_pdu);
+        log::warn!(
+            "Security Mode Command with NULL algorithms (NIA0/NEA0) sent to UE \
+             {amf_ue_ngap_id}: this emergency session has NO NAS integrity or ciphering \
+             protection (TS 33.501 §6.7.3.6)"
+        );
         Ok(())
     }
 
@@ -2607,6 +2847,20 @@ impl NgapServer {
             return Ok(());
         }
 
+        // #361: 5G-AKA has succeeded, so an emergency registration held for this UE is an
+        // AUTHENTICATED one -- promoted here rather than guessed at the Registration Request,
+        // which is where the old `has_supi` predicate got it wrong. TS 33.501 §10.2.2.2 NOTE:
+        // "In case of authentication success the AMF will send a NAS SMC selecting algorithms
+        // with a non-NULL integrity algorithm". Returns false for a non-emergency
+        // registration, which is the overwhelming majority and needs no branch.
+        if self.emergency.mark_authenticated(amf_ue_ngap_id) {
+            log::info!(
+                "EMERGENCY registration for UE {amf_ue_ngap_id} is AUTHENTICATED: it keeps the \
+                 real key hierarchy, its UDM subscription and a non-NULL integrity algorithm \
+                 (TS 33.501 §10.2.1.2)"
+            );
+        }
+
         // SUPI (from AUSF) and key hierarchy:
         // KSEAF -> KAMF (A.7) -> KNASint/KNASenc (A.8)
         //
@@ -2683,7 +2937,8 @@ impl NgapServer {
                 .await?;
             return Ok(());
         };
-        // NIA0 is EMERGENCY-ONLY (TS 33.501 §6.7.2 / §5.11, #115).
+        // NIA0 is EMERGENCY-ONLY (TS 33.501 §5.2.3, scoped by §10.2.2, #115; cite corrected
+        // from §6.7.2 in #361 -- §6.7.2 is the SMC procedure and carries no such rule).
         //
         // The empty-intersection case above already fails closed. The residual hole is
         // NIA0 being *selected* and applied: `select_integrity_algorithm` returns
@@ -2706,7 +2961,7 @@ impl NgapServer {
             log::error!(
                 "UE {amf_ue_ngap_id}: NIA0 (null integrity) selected for a NON-EMERGENCY \
                  registration (type={}, ue_ia={:#04x}, amf_mask={amf_int_mask:#06x}); \
-                 rejecting registration — TS 33.501 §6.7.2 permits NIA0 only for an \
+                 rejecting registration — TS 33.501 §5.2.3 permits NIA0 only for an \
                  unauthenticated emergency session. Remove NIA0 from the AMF's \
                  integrity_order to stop offering it.",
                 state.amf_ue.registration_type,
@@ -2725,8 +2980,8 @@ impl NgapServer {
             // reading the logs should be able to tell it from the defect above.
             log::warn!(
                 "UE {amf_ue_ngap_id}: NIA0 (null integrity) accepted for an EMERGENCY \
-                 registration (TS 33.501 §6.7.2) — this session has no NAS integrity \
-                 protection"
+                 registration (TS 33.501 §5.2.3 / §10.2.2) — this session has no NAS \
+                 integrity protection"
             );
         }
 
@@ -3185,6 +3440,64 @@ impl NgapServer {
             return Ok(());
         };
 
+        // #361: an UNAUTHENTICATED emergency registration takes none of the SBI steps below.
+        //
+        // TS 23.502 §4.12.2.3, verbatim: "if the UE was not successfully authenticated, the
+        // AMF shall not update the UDM. Also for an Emergency Registration, the AMF shall not
+        // check for access restrictions, regional restrictions or subscription restrictions",
+        // and "Steps 16 and 21b of figure 4.2.2.2.2-1 are not performed since AM and UE policy
+        // for the UE are not required for Emergency Registration."
+        //
+        // This is what answers #361's "what SUPI to register at the UECM when there is none":
+        // the question does not arise, because the registration the SUPI was for is prohibited.
+        // Every one of the four calls below is keyed on a SUPI this UE does not have, and each
+        // would refuse and take the registration down with it -- the UDM has no subscription,
+        // the PCF no policy and the NSACF no quota for a subscriber the network cannot name.
+        //
+        // The Allowed NSSAI is left EMPTY, also per §4.12.2.3: "NSSAI shall not be included by
+        // the UE. The AMF shall not send the Allowed NSSAI in the Registration Accept message."
+        // So the 5GMM #62 refusal on an empty Allowed NSSAI below is skipped with the rest --
+        // for this UE an empty set is the specified outcome, not a misconfiguration. The
+        // emergency session's DNN comes from the AMF's Emergency Configuration Data
+        // (TS 23.501 §5.16.4.1), which `EmergencyHandler::emergency_dnn` holds.
+        if state.amf_ue.unauthenticated_emergency {
+            log::warn!(
+                "UE {amf_ue_ngap_id}: unauthenticated EMERGENCY registration -- skipping \
+                 Nudm_UECM_Registration, Nudm_SDM_Get/Subscribe, Npcf_AMPolicyControl_Create \
+                 and the NSACF admission check, and sending no Allowed NSSAI \
+                 (TS 23.502 §4.12.2.3)"
+            );
+            state.amf_ue.allowed_nssai.clear();
+            // A 5G-GUTI is still assigned. §10.2.2.3.1 makes this security context
+            // normal-shaped, and `generate_new_guti` builds the identity from a CSPRNG 5G-TMSI
+            // plus this AMF's own GUAMI (TS 23.003 §2.10.1) -- it never derives anything from
+            // subscriber identity, so there is nothing here that needs an authenticated one.
+            // Withholding it would leave the UE unable to identify itself on the service
+            // request that follows its emergency call.
+            state.amf_ue.generate_new_guti();
+            let (guami_plmn, amf_region, amf_set, amf_pointer) = {
+                let ctx_arc = crate::context::amf_self();
+                let ctx = ctx_arc.read().unwrap_or_else(|e| e.into_inner());
+                match ctx.served_guami.first() {
+                    Some(g) => (
+                        g.plmn_id.clone(),
+                        g.amf_id.region,
+                        g.amf_id.set,
+                        g.amf_id.pointer,
+                    ),
+                    None => (state.amf_ue.nr_tai.plmn_id.clone(), 2, 1, 0),
+                }
+            };
+            state.amf_ue.next_guti.plmn_id = guami_plmn;
+            state.amf_ue.next_guti.amf_region_id = amf_region;
+            state.amf_ue.next_guti.amf_set_id = amf_set;
+            state.amf_ue.next_guti.amf_pointer = amf_pointer;
+            self.ue_auth_state.insert(amf_ue_ngap_id, state);
+            return self
+                .send_registration_accept(association_id, amf_ue_ngap_id, ran_ue_ngap_id)
+                .await;
+        }
+
         // The authentication path always sets `supi`; this fallback only fires
         // if registration completed without it. Same fail-closed rule as there:
         // never register a UECM context or fetch subscription data under a SUPI
@@ -3564,7 +3877,24 @@ impl NgapServer {
 
         let tmsi = state.amf_ue.next_guti.tmsi;
         let allowed_nssai = state.amf_ue.allowed_nssai.clone();
-        let ue_security_capability = state.amf_ue.ue_security_capability.clone();
+        // #361: §6.7.3.6 requires the NGAP UE INITIAL CONTEXT SETUP to carry only the null
+        // algorithms for an unauthenticated emergency session. Narrowed here, on the NAS
+        // octets, because this is the one egress site that hands `ngap_asn1` the NAS-shaped
+        // capability rather than an already-converted NGAP bitstring -- the other two go
+        // through `ue_caps_to_ngap_for_ue`. `0x80` is the MSB, i.e. xEA0/xIA0 alone, which is
+        // the NAS encoding of "the null algorithm and nothing else"; `ngap_asn1` then drops
+        // that bit on conversion, yielding the same empty NGAP bitstring for the same reason.
+        // The UE's real advertised set stays on the context for the SMC replay (§6.7.2).
+        let ue_security_capability = if state.amf_ue.unauthenticated_emergency {
+            UeSecurityCapability {
+                ea: 0x80,  // 5G-EA0 (NEA0) only
+                ia: 0x80,  // 5G-IA0 (NIA0) only
+                eea: 0x80, // EEA0 only
+                eia: 0x80, // EIA0 only
+            }
+        } else {
+            state.amf_ue.ue_security_capability.clone()
+        };
         // UE-AMBR from the subscription (UDM am-data, copied onto the context);
         // omitted when the subscription carries no aggregate bitrate.
         let ue_ambr = if state.amf_ue.ue_ambr.downlink > 0 || state.amf_ue.ue_ambr.uplink > 0 {
@@ -4499,6 +4829,59 @@ impl NgapServer {
                     .get(amf_ue_ngap_id)
                     .map(|s| s.amf_ue.redcap_indication)
                     .unwrap_or(false);
+
+                // #361: an EMERGENCY REGISTERED UE gets the emergency DNN and nothing else.
+                //
+                // TS 23.501 §5.16.4.9a: "the network shall reject any PDU Session
+                // Establishment request for normal service from the UE on this Access Type",
+                // and §5.16.4.9: "If the UE is Emergency Registered over a given access, it
+                // shall not request a PDU Session to any other DNN over this access."
+                //
+                // Both halves are needed and only one existed. The UE-side half is the
+                // "Emergency registered" bit in the Registration Accept, which #361 also adds;
+                // this is the NETWORK half, which §5.16.4.9a puts a `shall` on precisely
+                // because a UE may disregard its own. Before this the AMF only RECORDED
+                // whether a session matched the emergency DNN (see the
+                // `assign_emergency_pdu_session` block below) and forwarded every request
+                // regardless -- so an emergency-registered UE could obtain a general-purpose
+                // session, which for an UNAUTHENTICATED one means network access with no
+                // subscription, no policy and no charging. That is the admission surface #361
+                // names, and this is the fence §10.2.2 assumes is there.
+                //
+                // A DNN-LESS request is allowed through: TS 23.501 §5.16.4.2 has the network
+                // apply its configured emergency DNN when an emergency-registered UE asks for a
+                // session without naming one, which is the `dnn == None` case (#204). Same
+                // predicate the recording block below uses, so the two cannot drift.
+                //
+                // 5GSM #29 "user authentication or authorization failed" (TS 24.501 §9.11.4.2,
+                // wire value 0x1D): the UE is not authorized for this DNN in this registration.
+                // Not #27 "missing or unknown DNN" -- the DNN may exist and be perfectly valid
+                // for a normally registered UE, which is a different statement.
+                if self.emergency.emergency_context(amf_ue_ngap_id).is_some() {
+                    let emergency_dnn = self.emergency.emergency_dnn().to_string();
+                    // `is_some_and(!=)` rather than `!is_none_or(==)`: a DNN-less request is
+                    // NOT refused (§5.16.4.2 applies the configured emergency DNN), so the
+                    // refusal condition is "named a DNN, and it was not the emergency one".
+                    if dnn.is_some_and(|d| d != emergency_dnn) {
+                        log::warn!(
+                            "PDU session establishment REFUSED for emergency-registered UE \
+                             {amf_ue_ngap_id}: PSI={psi} requested DNN '{}' but only the \
+                             emergency DNN '{emergency_dnn}' is permitted over this access \
+                             (TS 23.501 §5.16.4.9a); 5GSM #29",
+                            dnn.unwrap_or("<none>")
+                        );
+                        let reject = vec![0x2E, psi, pti, 0xC3, 0x1D];
+                        self.send_n1_sm_to_ue(
+                            association_id,
+                            amf_ue_ngap_id,
+                            ran_ue_ngap_id,
+                            psi,
+                            &reject,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
 
                 // Issue #73: convey the UE and serving-network identity on N11
                 // (TS 29.502 6.1.6.2.2). Previously none of this was sent, so the
@@ -5994,7 +6377,7 @@ impl NgapServer {
                 dl: state.amf_ue.ue_ambr.downlink.max(1),
                 ul: state.amf_ue.ue_ambr.uplink.max(1),
             },
-            ue_security_capabilities: ue_caps_to_ngap(&state.amf_ue.ue_security_capability),
+            ue_security_capabilities: ue_caps_to_ngap_for_ue(&state.amf_ue),
             security_context: nextgcore_ngap::types::SecurityContext {
                 next_hop_chaining_count: ho_ncc,
                 next_hop: ho_nh,
@@ -6631,7 +7014,7 @@ impl NgapServer {
                     state.amf_ue.nhcc,
                     inbound,
                     allowed_nssai,
-                    ue_caps_to_ngap(&state.amf_ue.ue_security_capability),
+                    ue_caps_to_ngap_for_ue(&state.amf_ue),
                 )
             })
             .expect("the UE was resolved above");
@@ -8671,6 +9054,37 @@ fn ue_caps_to_ngap(caps: &UeSecurityCapability) -> nextgcore_ngap::types::UeSecu
         eutra_encryption_algorithms: to_bits(caps.eea),
         eutra_integrity_algorithms: to_bits(caps.eia),
     }
+}
+
+/// The UE security capabilities this AMF conveys to the RAN for `amf_ue`.
+///
+/// Ordinarily the UE's own replayed set (TS 38.413 §9.3.1.86). For an UNAUTHENTICATED
+/// emergency session it is narrowed to the NULL set, per TS 33.501 §6.7.3.6, which requires
+/// the AMF to "Set the UE 5G security capabilities to only contain EIA0, EEA0, NIA0 and NEA0
+/// when sending these to the gNB/ng-eNB in the following messages: NGAP UE INITIAL CONTEXT
+/// SETUP, NGAP UE CONTEXT MODIFICATION REQUEST, NGAP HANDOVER REQUEST" (#361).
+///
+/// "Only contain the null algorithms" renders as ALL-ZERO bitstrings, and that is not a
+/// shortcut: the NGAP UESecurityCapabilities bitstring starts at 128-xEA1 and has no position
+/// for the null algorithm at all (see `ue_caps_to_ngap`, which drops the NAS MSB for exactly
+/// this reason). An empty set is therefore the only encoding of "nothing but the null
+/// algorithms are available", and it is the right one: it stops the gNB selecting a real AS
+/// algorithm keyed on a KgNB whose root the UE never agreed to, which is the concrete failure
+/// §6.7.3.6 exists to prevent.
+///
+/// The UE's advertised capabilities on the AmfUe are left untouched, because the Security Mode
+/// Command must still replay them verbatim for the anti-bidding-down check (§6.7.2). This
+/// narrowing applies only to what crosses N2.
+fn ue_caps_to_ngap_for_ue(amf_ue: &AmfUe) -> nextgcore_ngap::types::UeSecurityCapabilities {
+    if amf_ue.unauthenticated_emergency {
+        return nextgcore_ngap::types::UeSecurityCapabilities {
+            nr_encryption_algorithms: 0,
+            nr_integrity_algorithms: 0,
+            eutra_encryption_algorithms: 0,
+            eutra_integrity_algorithms: 0,
+        };
+    }
+    ue_caps_to_ngap(&amf_ue.ue_security_capability)
 }
 
 /// Encode a PlmnId into the 3-byte NGAP PLMN Identity (TS 23.003 / TS 38.413).
@@ -10863,26 +11277,52 @@ mod tests {
     async fn fake_smf_creating_sm_contexts(
         sm_context_ref: &'static str,
     ) -> (nextgcore_sbi::server::SbiServer, u16) {
+        let (server, port, _calls) = fake_smf_creating_sm_contexts_counted(sm_context_ref).await;
+        (server, port)
+    }
+
+    /// [`fake_smf_creating_sm_contexts`], plus a counter of the requests it received.
+    ///
+    /// The counter exists so a test can assert a request was NEVER SENT as a positive fact
+    /// about the SMF's state, rather than as the absence of a downstream effect (#361). "The
+    /// emergency context has no PDU session id" is satisfied by a request that was refused,
+    /// by one that was never built, and by a fixture that broke before reaching either;
+    /// "the SMF received zero requests" is satisfied only by the first two, and pairing it
+    /// with a NAS reject actually observed on the wire pins it to the first.
+    async fn fake_smf_creating_sm_contexts_counted(
+        sm_context_ref: &'static str,
+    ) -> (
+        nextgcore_sbi::server::SbiServer,
+        u16,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         use base64::Engine as _;
         use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
         use nextgcore_sbi::server::{SbiServer as NSbiServer, SbiServerConfig as NSbiCfg};
 
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&calls);
         let (addr_listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let server = NSbiServer::on_listener(NSbiCfg::new(addr), addr_listener);
         server
-            .start(move |_req: SReq| async move {
-                let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
-                let body = serde_json::json!({
-                    "smContextRef": sm_context_ref,
-                    // A PDU SESSION ESTABLISHMENT ACCEPT shape is not needed: the AMF
-                    // forwards these containers opaquely and the assertions here are about
-                    // the emergency context, not about what the UE receives.
-                    "n1SmMsg": b64(&[0x2e, 0x01, 0x00, 0xc2]),
-                    "n2SmInfo": b64(&[0xa2, 0x00]),
-                });
-                SResp::created()
-                    .with_json_body(&body)
-                    .expect("fake SMF body serialises")
+            .start(move |_req: SReq| {
+                let counter = std::sync::Arc::clone(&counter);
+                async move {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let b64 =
+                        |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+                    let body = serde_json::json!({
+                        "smContextRef": sm_context_ref,
+                        // A PDU SESSION ESTABLISHMENT ACCEPT shape is not needed: the AMF
+                        // forwards these containers opaquely and the assertions here are about
+                        // the emergency context, not about what the UE receives.
+                        "n1SmMsg": b64(&[0x2e, 0x01, 0x00, 0xc2]),
+                        "n2SmInfo": b64(&[0xa2, 0x00]),
+                    });
+                    SResp::created()
+                        .with_json_body(&body)
+                        .expect("fake SMF body serialises")
+                }
             })
             .await
             .expect("fake SMF starts");
@@ -10893,7 +11333,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        (server, addr.port())
+        (server, addr.port(), calls)
     }
 
     /// Register a gNB session so handlers that mutate stored gNB state have
@@ -12325,31 +12765,49 @@ mod tests {
     }
 
     /// Criterion 8: an EMERGENCY registration reaches the emergency handler from the live
-    /// NAS path (TS 24.501 §5.5.1.2, TS 23.167).
+    /// NAS path (TS 24.501 §5.5.1.2, TS 23.167), **and #361: with no AUSF reachable it now
+    /// CONTINUES as an unauthenticated emergency registration rather than being refused.**
     ///
-    /// Asserted on the emergency context the branch records, not on the registration
-    /// outcome: the registration goes on to need an AUSF, which this test has no business
-    /// providing, and the branch runs before that.
+    /// The three facts asserted, and why each is the positive kind:
     ///
-    /// Reachability is read off `total_emergency_count`, the CUMULATIVE counter, and the
-    /// live figure is asserted separately at zero (#359). Both halves are the point: before
-    /// #359 this fixture's missing AUSF made `start_authentication` return early with the
-    /// UE's NAS state already taken out of the map, so the emergency context it had just
-    /// created was never freed and `active_count()` stayed at 1. Now the AUSF failure
-    /// refuses the registration and releases the UE, which frees the context -- so
-    /// `active_count()` is the wrong instrument for "was the branch reached" and only ever
-    /// looked right because of the defect.
+    /// 1. `total_emergency_count` is 1 -- the branch was reached. The CUMULATIVE counter,
+    ///    because before #359 the live figure only looked right by accident.
+    /// 2. The UE's NAS state SURVIVES, and its context says `unauthenticated_emergency`. This
+    ///    is state reachable ONLY from inside `continue_unauthenticated_emergency_registration`:
+    ///    no parse error, early return or refusal produces it, because every other path through
+    ///    this function either never sets the flag or releases the UE.
+    /// 3. NIA0 and NEA0 are the SELECTED algorithms, and a K_AMF exists. §6.7.3.6 requires the
+    ///    AMF to force both; §10.2.2.3.1 requires a locally generated K_AMF with all
+    ///    derivations proceeding normally. A refusal leaves all three at their defaults.
     ///
-    /// Note what this test does NOT claim: that refusing an emergency registration on an
-    /// AUSF failure is the right policy. TS 33.501 §6.7.2 / TS 23.167 allow an
-    /// UNAUTHENTICATED emergency session where regulation requires one, and this tree has
-    /// no such path -- the refusal is what `start_authentication` has always decided for
-    /// every registration type. Filed as #361; #359 only made the decision take effect.
+    /// **This test used to assert the OPPOSITE** -- `active_count() == 0` and
+    /// `!ue_auth_state.contains(..)`, i.e. that the refusal released the UE -- and carried a
+    /// comment saying the refusal was what `start_authentication` "has always decided for every
+    /// registration type" and that #361 would decide whether that was right. #361 decided it
+    /// was not: TS 33.501 §10.2.2.2 requires the AMF to "send NAS SMC with NULL algorithms"
+    /// when it "cannot obtain authentication vector", which is exactly the condition this
+    /// fixture creates by providing no AUSF.
+    ///
+    /// The refusal branch is still reachable and still tested, by
+    /// `an_emergency_registration_is_refused_when_the_operator_forbids_unauthenticated_service`,
+    /// which sets the policy off.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_emergency_registration_reaches_the_emergency_handler() {
         crate::context::amf_context_init(64, 1024, 4096);
+        // The unauthenticated-emergency posture is process-global, so take ITS lock -- the one
+        // declared beside the global in `emergency.rs`, not a private one here, which could not
+        // order against the emergency module's own tests. The guard also resets the posture to
+        // the shipped default (permitted), which is what this test needs.
+        let _policy = crate::emergency::emergency_policy_test_guard();
         let mut ngap = test_ngap_server().await;
         let amf_ue_ngap_id = 7_200_012u64;
+        ngap.emergency
+            .set_policy(crate::emergency::allow_unauthenticated_emergency());
+        assert!(
+            ngap.emergency.policy().allow_unauthenticated,
+            "precondition: the shipped default permits unauthenticated emergency service, \
+             which is what this test exercises"
+        );
         ngap.ue_auth_state.insert(
             amf_ue_ngap_id,
             UeNasContext::new(amf_ue_ngap_id, 72, 1, false),
@@ -12384,16 +12842,313 @@ mod tests {
             "the emergency branch must record a context; before #72 the handler had no \
              caller outside its own tests"
         );
+        // #361: the AUSF failure this fixture provokes now CONTINUES the registration instead
+        // of refusing it, so the context stays live and the NAS state stays in the store.
+        assert_eq!(
+            ngap.emergency.active_count(),
+            1,
+            "TS 33.501 §10.2.2.2: with no authentication vector obtainable the AMF proceeds \
+             with NULL algorithms rather than refusing, so the emergency context is LIVE. This \
+             was 0 before #361, when the same fixture drove a refusal-and-release"
+        );
+        let ctx = ngap
+            .emergency
+            .emergency_context(amf_ue_ngap_id)
+            .expect("the emergency context must survive the continuation");
+        assert!(
+            !ctx.authenticated,
+            "and it must record the OUTCOME: no vector was obtained, so this is the \
+             §10.2.2.1 unauthenticated case. Before #361 `has_supi` was computed from the \
+             SUCI's presence and this said `true` -- wrong in exactly the case the field \
+             exists for"
+        );
+        assert_eq!(
+            ctx.reg_type,
+            crate::emergency::EmergencyRegistrationType::EmergencyNoSupi,
+            "so `is_emergency_only()` answers true, which is what a PSAP and an operator \
+             read to know the caller's identity was never verified"
+        );
+        assert!(
+            ngap.emergency.is_unauthenticated_emergency(amf_ue_ngap_id),
+            "and the predicate every downstream restriction branches on agrees"
+        );
+
+        let state = ngap.ue_auth_state.get(amf_ue_ngap_id).expect(
+            "the UE's NAS state must SURVIVE: the registration is proceeding, not \
+                    being released. This is the assertion that inverted at #361",
+        );
+        assert!(
+            state.amf_ue.unauthenticated_emergency,
+            "the flag every restriction reads -- the omitted Allowed NSSAI, the skipped UDM \
+             calls, the narrowed NGAP capabilities -- must be set. It is reachable ONLY from \
+             inside `continue_unauthenticated_emergency_registration`, so no parse error or \
+             early return can satisfy this"
+        );
+        assert_eq!(
+            state.amf_ue.registration_type,
+            crate::gmm_build::registration_type::EMERGENCY,
+            "and the registration type must have been PERSISTED to reach that branch at all: \
+             `handle_registration_request_nas` mutated a clone of the store record and never \
+             wrote it back, so at `89cb764` this read 0 and the §10.2.2.2 branch could not \
+             have fired however it was written"
+        );
+        assert_eq!(
+            state.amf_ue.selected_int_algorithm, 0,
+            "NIA0 forced, not negotiated (TS 33.501 §6.7.3.6: 'the AMF shall use NIA0 and \
+             NEA0 ... regardless of the supported algorithms announced previously by the UE')"
+        );
+        assert_eq!(state.amf_ue.selected_enc_algorithm, 0, "NEA0 likewise");
+        assert_ne!(
+            state.amf_ue.kamf, [0u8; 32],
+            "and a K_AMF must have been generated locally (§10.2.2.3.1: 'the UE and the AMF \
+             independently generate the K_(AMF) in an implementation defined way'), because \
+             KgNB is derived from it and handed to the RAN"
+        );
+        assert_ne!(
+            state.amf_ue.knas_int, [0u8; 16],
+            "with K_NASint derived from it through the ORDINARY Annex A.8 KDF -- §10.2.2.3.1: \
+             'All key derivations proceed as if they were based on a K_(AMF) generated from a \
+             successful Primary authentication run'"
+        );
+    }
+
+    /// **#361, the other side of the switch:** where the operator declares unauthenticated
+    /// emergency service FORBIDDEN, an EMERGENCY registration with no reachable AUSF is refused
+    /// and released exactly as it was before #361.
+    ///
+    /// This is the half that makes the default defensible. TS 33.501 §5.1.2 obliges a serving
+    /// network "located in regions where unauthenticated emergency services are forbidden" NOT
+    /// to support the feature, and §10.2.2.2 requires the choice to be configurable. A knob
+    /// whose `false` setting did not actually refuse would leave such a deployment
+    /// non-conformant with no way out.
+    ///
+    /// Asserted on the release, which is state only the refusal path reaches: `release_emergency`
+    /// is called only from `forget_ue`, only from `release_ue`. Paired with the positive
+    /// `total_emergency_count == 1`, so "the branch was reached and then refused" is
+    /// distinguishable from "the branch was never reached".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_emergency_registration_is_refused_when_the_operator_forbids_unauthenticated_service(
+    ) {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _policy = crate::emergency::emergency_policy_test_guard();
+        let mut ngap = test_ngap_server().await;
+        // A distinct literal id from every sibling test: the emergency contexts and the NAS
+        // store are process-global and keyed on it, so a shared id would have one test's
+        // release free another's context.
+        let amf_ue_ngap_id = 7_361_040u64;
+
+        ngap.emergency
+            .set_policy(crate::emergency::EmergencyPolicy {
+                allow_unauthenticated: false,
+            });
+        assert!(
+            !ngap.emergency.policy().allow_unauthenticated,
+            "precondition: this test is about the FORBIDDING jurisdiction"
+        );
+
+        ngap.ue_auth_state.insert(
+            amf_ue_ngap_id,
+            UeNasContext::new(amf_ue_ngap_id, 72, 1, false),
+        );
+        let _ = ngap
+            .handle_registration_request_nas(
+                1,
+                amf_ue_ngap_id,
+                72,
+                &emergency_registration_nas(),
+                false,
+            )
+            .await;
+
+        assert_eq!(
+            ngap.emergency.total_emergency_count(),
+            1,
+            "the emergency branch was REACHED -- so the refusal below is a decision taken \
+             about an emergency registration, not a request that never got classified"
+        );
         assert_eq!(
             ngap.emergency.active_count(),
             0,
-            "and the AUSF failure this fixture provokes must then RELEASE it: before #359 \
-             the refusal returned early with the UE's NAS state already taken out, so the \
-             context it had just created leaked and this figure stayed at 1"
+            "and the refusal released it: `release_emergency` is reachable only through \
+             `forget_ue` <- `release_ue`, so this figure falling is the in-process witness \
+             that a RELEASE happened (#359's reasoning)"
         );
         assert!(
             !ngap.ue_auth_state.contains(amf_ue_ngap_id),
-            "and the NAS state goes with it, rather than being left with no release"
+            "with the NAS state gone too, which is the pre-#361 behaviour this setting \
+             preserves for a deployment whose regulation forbids the feature"
+        );
+    }
+
+    /// **#361:** `complete_registration` for an UNAUTHENTICATED emergency UE makes NONE of the
+    /// registration SBI calls, and still assigns a 5G-GUTI.
+    ///
+    /// TS 23.502 §4.12.2.3 is explicit on all three obligations: "if the UE was not successfully
+    /// authenticated, the AMF shall not update the UDM. Also for an Emergency Registration, the
+    /// AMF shall not check for access restrictions, regional restrictions or subscription
+    /// restrictions", and "Steps 16 and 21b ... are not performed since AM and UE policy for the
+    /// UE are not required for Emergency Registration."
+    ///
+    /// This is also what answers #361's stated blocker, "a decision about what SUPI to register
+    /// at the UECM when there is none": the question is void because the call is prohibited.
+    /// Every one of the four SBI calls is keyed on a SUPI this UE does not have, and each would
+    /// refuse and take the registration down — so a build that made them would turn a conformant
+    /// emergency registration into a rejection, silently, in the deployments that need it most.
+    ///
+    /// The observable is POSITIVE and is state only this path produces: an ASSIGNED 5G-TMSI on a
+    /// UE whose `supi` is `None`. A refusal cannot produce it (`generate_new_guti` runs only on
+    /// the accept path), and neither can a UE that never reached `complete_registration`. The
+    /// absence of SBI traffic is then asserted the only way it honestly can be — no NF endpoints
+    /// are configured, so any attempted call resolves to the 127.0.0.1:7777 fallback, fails, and
+    /// refuses the registration, which would clear the TMSI-bearing accept state this asserts on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unauthenticated_emergency_registration_skips_the_udm_pcf_and_nsacf() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let _policy = crate::emergency::emergency_policy_test_guard();
+        let mut ngap = test_ngap_server().await;
+        // Distinct literal ids from every sibling: the UE store and the emergency contexts are
+        // process-global and keyed on them.
+        let unauthenticated = 7_361_050u64;
+        let ordinary = 7_361_051u64;
+
+        let mut ue_ctx = UeNasContext::new(unauthenticated, 72, 1, false);
+        ue_ctx.amf_ue.registration_type = crate::gmm_build::registration_type::EMERGENCY;
+        ue_ctx.amf_ue.unauthenticated_emergency = true;
+        // A Requested NSSAI the UE asked for, so the "no Allowed NSSAI" outcome below is the
+        // §4.12.2.3 omission and not merely an empty context.
+        ue_ctx.amf_ue.requested_nssai = vec![SNssai { sst: 1, sd: None }];
+        assert!(
+            ue_ctx.amf_ue.supi.is_none(),
+            "precondition: no SUPI -- this is the UE the UECM call could not be made for"
+        );
+        assert_eq!(
+            ue_ctx.amf_ue.next_guti.tmsi, 0,
+            "precondition: no GUTI assigned yet"
+        );
+        ngap.ue_auth_state.insert(unauthenticated, ue_ctx);
+        ngap.emergency
+            .handle_emergency_registration(unauthenticated, false);
+
+        let _ = ngap.complete_registration(1, unauthenticated, 72).await;
+
+        let state = ngap.ue_auth_state.get(unauthenticated).expect(
+            "the UE must SURVIVE `complete_registration`: if any SBI call had been \
+                 attempted it would have failed against the unconfigured 127.0.0.1:7777 \
+                 fallback and released the UE",
+        );
+        assert_ne!(
+            state.amf_ue.next_guti.tmsi, 0,
+            "a 5G-GUTI must be assigned: §10.2.2.3.1 makes this security context \
+             normal-shaped, and `generate_new_guti` derives the 5G-TMSI from a CSPRNG plus \
+             this AMF's own GUAMI (TS 23.003 §2.10.1) -- never from subscriber identity. \
+             Withholding it would leave the UE unable to identify itself afterwards"
+        );
+        assert!(
+            state.amf_ue.supi.is_none(),
+            "and no SUPI was fabricated to satisfy a call that §4.12.2.3 prohibits"
+        );
+        assert!(
+            state.amf_ue.allowed_nssai.is_empty(),
+            "the Allowed NSSAI stays EMPTY even though the UE requested one (§4.12.2.3: \
+             'The AMF shall not send the Allowed NSSAI in the Registration Accept message')"
+        );
+        assert!(
+            !state.amf_ue.slice_admission_granted,
+            "and the NSACF was never asked, so no admission was granted -- §4.12.2.3 forbids \
+             the subscription/restriction checks for an unauthenticated Emergency Registration"
+        );
+
+        // CONTROL: the SAME shape WITHOUT the flag does attempt the SBI calls, fails against
+        // the unconfigured fallback, and is released. Without this, the survival above would
+        // also be what a `complete_registration` that returned early for everyone produces.
+        let mut ordinary_ctx = UeNasContext::new(ordinary, 72, 1, false);
+        ordinary_ctx.amf_ue.registration_type = crate::gmm_build::registration_type::EMERGENCY;
+        ordinary_ctx.amf_ue.unauthenticated_emergency = false;
+        ordinary_ctx.amf_ue.supi = Some("imsi-001010000361051".to_string());
+        ngap.ue_auth_state.insert(ordinary, ordinary_ctx);
+
+        let _ = ngap.complete_registration(1, ordinary, 72).await;
+
+        assert!(
+            !ngap.ue_auth_state.contains(ordinary),
+            "control: an AUTHENTICATED registration DOES make the UECM call, which fails \
+             against the unconfigured fallback and releases the UE -- so the skip above is \
+             the §4.12.2.3 exemption and not an early return that applies to everyone"
+        );
+    }
+
+    /// **#361:** the UE security capabilities this AMF conveys to the RAN are narrowed to the
+    /// null set for an unauthenticated emergency session, and left verbatim otherwise.
+    ///
+    /// TS 33.501 §6.7.3.6 requires the AMF to "Set the UE 5G security capabilities to only
+    /// contain EIA0, EEA0, NIA0 and NEA0 when sending these to the gNB/ng-eNB in the following
+    /// messages: NGAP UE INITIAL CONTEXT SETUP, NGAP UE CONTEXT MODIFICATION REQUEST, NGAP
+    /// HANDOVER REQUEST".
+    ///
+    /// All-zero bitstrings are the correct rendering, not an approximation: the NGAP
+    /// UESecurityCapabilities bitstring begins at 128-xEA1 and has NO position for a null
+    /// algorithm (see `ue_caps_to_ngap`, which drops the NAS MSB for that reason). So an empty
+    /// set is the only available encoding of "nothing but the null algorithms", and it is the
+    /// one that matters: it stops the gNB selecting a real AS algorithm keyed on a KgNB whose
+    /// root the UE never agreed to.
+    ///
+    /// The control arm is what makes this a narrowing rather than a blanket zeroing — an
+    /// ordinary UE's advertised capabilities must still cross N2 intact, or every normal
+    /// registration would lose AS security.
+    #[test]
+    fn the_ngap_capabilities_narrow_to_the_null_set_for_an_unauthenticated_emergency_ue() {
+        let mut ue = AmfUe::default();
+        // A UE advertising real algorithms, so a narrowing is observable as a CHANGE.
+        ue.ue_security_capability = UeSecurityCapability {
+            ea: 0x70, // NEA1-3
+            ia: 0x70, // NIA1-3
+            eea: 0x70,
+            eia: 0x70,
+        };
+
+        let ordinary = ue_caps_to_ngap_for_ue(&ue);
+        assert_ne!(
+            ordinary.nr_integrity_algorithms, 0,
+            "control: an ordinary UE's advertised integrity algorithms must reach the gNB \
+             intact, or every normal registration loses AS security"
+        );
+        // Field-by-field rather than a struct comparison: the NGAP type derives no `PartialEq`.
+        let unconditional = ue_caps_to_ngap(&ue.ue_security_capability);
+        assert_eq!(
+            (
+                ordinary.nr_encryption_algorithms,
+                ordinary.nr_integrity_algorithms,
+                ordinary.eutra_encryption_algorithms,
+                ordinary.eutra_integrity_algorithms,
+            ),
+            (
+                unconditional.nr_encryption_algorithms,
+                unconditional.nr_integrity_algorithms,
+                unconditional.eutra_encryption_algorithms,
+                unconditional.eutra_integrity_algorithms,
+            ),
+            "and they must be exactly what the unconditional converter produces"
+        );
+
+        ue.unauthenticated_emergency = true;
+        let narrowed = ue_caps_to_ngap_for_ue(&ue);
+        assert_eq!(
+            narrowed.nr_integrity_algorithms, 0,
+            "§6.7.3.6: only NIA0 may be offered, and the NGAP bitstring cannot express it, \
+             so the set is empty"
+        );
+        assert_eq!(narrowed.nr_encryption_algorithms, 0, "likewise NEA0 only");
+        assert_eq!(narrowed.eutra_integrity_algorithms, 0, "likewise EIA0 only");
+        assert_eq!(
+            narrowed.eutra_encryption_algorithms, 0,
+            "likewise EEA0 only"
+        );
+
+        assert_eq!(
+            ue.ue_security_capability.ia, 0x70,
+            "and the UE's REAL advertised set is left untouched on the context: the Security \
+             Mode Command must still replay it verbatim for the anti-bidding-down check \
+             (TS 33.501 §6.7.2), so this narrowing applies only to what crosses N2"
         );
     }
 
@@ -12781,11 +13536,18 @@ mod tests {
             Some(7)
         );
 
-        // 3. NEGATIVE: an emergency-registered UE establishing a session on some OTHER
-        //    DNN. Recording that would tell an operator the emergency call is on a PSI
-        //    that carries ordinary traffic. Asserted alongside a POSITIVE fact -- the
-        //    context still exists and the SM context ref was stored -- so a fixture that
-        //    never reached the SMF at all cannot pass this by arriving nowhere.
+        // 3. An emergency-registered UE asking for a session on some OTHER DNN is now
+        //    REFUSED outright, not merely left unrecorded (#361). TS 23.501 §5.16.4.9a:
+        //    "the network shall reject any PDU Session Establishment request for normal
+        //    service from the UE on this Access Type". #356 could only assert the absence of
+        //    a recording because the request was still forwarded; the `shall` is on the
+        //    network, so the request must not reach the SMF at all.
+        //
+        //    Covered by `an_emergency_registered_ue_is_refused_a_session_off_the_emergency_dnn`,
+        //    which asserts the refusal positively (the 5GSM #29 reject on the wire, and zero
+        //    SMF requests). Kept here as the third arm of the recording contract: the
+        //    emergency context must survive the refusal with NO PDU session id, so a refused
+        //    request cannot be mistaken for the emergency call.
         let other_dnn = 7_356_022u64;
         register_emergency_ue(&mut ngap, 1, other_dnn);
         let _ = ngap
@@ -12797,22 +13559,125 @@ mod tests {
                 Some("internet"),
             )
             .await;
-        assert_eq!(
-            ngap.sm_context_refs
-                .get(&(other_dnn, 9))
-                .map(String::as_str),
-            Some("smf-ref-emergency"),
-            "control: the session must really have been created at the SMF, or the \
-             assertion below would pass for a request that never got there"
+        assert!(
+            !ngap.sm_context_refs.contains_key(&(other_dnn, 9)),
+            "the refusal must happen BEFORE the SMF is dialled, so no SM context ref exists \
+             (TS 23.501 §5.16.4.9a); #356 asserted the opposite because the request was \
+             forwarded and only the recording suppressed"
         );
         assert_eq!(
             ngap.emergency
                 .emergency_context(other_dnn)
-                .expect("the emergency context must still exist")
+                .expect("the emergency context must survive the refusal")
                 .pdu_session_id,
             None,
-            "a session on an ordinary DNN is not the emergency session, even for an \
-             emergency-registered UE"
+            "a refused session on an ordinary DNN is not the emergency session, and the \
+             emergency context must be left able to record the real one"
+        );
+    }
+
+    /// **#361:** an EMERGENCY REGISTERED UE asking for a PDU session on a DNN other than the
+    /// emergency DNN is REFUSED, and the refusal happens before the SMF is dialled.
+    ///
+    /// TS 23.501 §5.16.4.9a puts the obligation on the NETWORK — "the network shall reject any
+    /// PDU Session Establishment request for normal service from the UE on this Access Type" —
+    /// precisely because §5.16.4.9's matching obligation on the UE ("it shall not request a PDU
+    /// Session to any other DNN over this access") is one a UE may disregard. Before #361 the
+    /// AMF only declined to *record* such a session (#356) and forwarded it regardless, so an
+    /// emergency-registered UE could obtain a general-purpose session; for an UNAUTHENTICATED
+    /// one that is network access with no subscription, policy or charging behind it.
+    ///
+    /// The observable is the fake SMF's REQUEST COUNTER, and it is positive rather than
+    /// negative in the sense that matters: the run asserts zero for the refused DNN *and one
+    /// for a control request on the emergency DNN in the same fixture*. A counter that never
+    /// moves is what a broken fixture produces, so the pair is what separates "refused" from
+    /// "never arrived". The counter is also state only the live path can change — nothing in
+    /// this test can reach the SMF except through `handle_5gsm_message`.
+    ///
+    /// Not asserted on the transmitted reject bytes: a unit-test `NgapServer` has no SCTP
+    /// association, so `send_n1_sm_to_ue` cannot complete for EITHER arm and the NAS PDU never
+    /// reaches a readable buffer. The cause value is instead pinned by the assertion below that
+    /// the refused arm's `handle_5gsm_message` fails at the SEND — i.e. it built a reject and
+    /// tried to deliver it, rather than returning `Ok(())` silently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_emergency_registered_ue_is_refused_a_session_off_the_emergency_dnn() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (_smf, port, smf_calls) =
+            fake_smf_creating_sm_contexts_counted("smf-ref-361-dnn-fence").await;
+        let _env = SmfEnvGuard::set(port);
+        let mut ngap = test_ngap_server().await;
+
+        // Distinct literal AMF UE NGAP IDs, and distinct from every other test's: the emergency
+        // contexts and the NAS store are keyed on them and `test_ngap_server` shares the
+        // process-global UE store, so a shared id would have one case release the other's
+        // context.
+        let refused = 7_361_030u64;
+        let permitted = 7_361_031u64;
+
+        register_emergency_ue(&mut ngap, 1, refused);
+        let outcome = ngap
+            .handle_5gsm_message(
+                1,
+                refused,
+                72,
+                &pdu_session_establishment_request(5),
+                Some("internet"),
+            )
+            .await;
+
+        assert_eq!(
+            smf_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the refusal must precede the SMF call: §5.16.4.9a makes this the NETWORK's \
+             decision, so no Nsmf_PDUSession_CreateSMContext may be sent for a non-emergency \
+             DNN. Before #361 this was 1 -- the request was forwarded and only the emergency \
+             RECORDING suppressed"
+        );
+        assert!(
+            outcome.is_err(),
+            "the reject must be BUILT AND HANDED TO THE TRANSPORT, which this fixture has \
+             none of -- so the failure is the proof it was sent rather than the request being \
+             dropped on the floor with Ok(())"
+        );
+        assert!(
+            !ngap.sm_context_refs.contains_key(&(refused, 5)),
+            "and no SM context ref is stored for a session that was never created"
+        );
+
+        // CONTROL: the same UE shape on the EMERGENCY DNN is admitted and does reach the SMF,
+        // so the zero above is the §5.16.4.9a fence and not a dead fixture.
+        register_emergency_ue(&mut ngap, 1, permitted);
+        let emergency_dnn = ngap.emergency.emergency_dnn().to_string();
+        let _ = ngap
+            .handle_5gsm_message(
+                1,
+                permitted,
+                72,
+                &pdu_session_establishment_request(6),
+                Some(&emergency_dnn),
+            )
+            .await;
+        assert_eq!(
+            smf_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "control: a session on the emergency DNN IS forwarded, so this fixture CAN reach \
+             the SMF"
+        );
+        assert_eq!(
+            ngap.emergency
+                .emergency_context(permitted)
+                .expect("the emergency context must exist")
+                .pdu_session_id,
+            Some(6),
+            "and it is recorded as the emergency session (#356)"
+        );
+        assert_eq!(
+            ngap.sm_context_refs
+                .get(&(permitted, 6))
+                .map(String::as_str),
+            Some("smf-ref-361-dnn-fence"),
+            "with the SMF-chosen reference stored, which is the positive counterpart to the \
+             refused arm's absent one"
         );
     }
 

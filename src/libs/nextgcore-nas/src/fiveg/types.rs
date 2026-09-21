@@ -590,6 +590,14 @@ impl Imeisv {
 pub struct RegistrationResult {
     /// SMS over NAS allowed
     pub sms_allowed: bool,
+    /// Registered for emergency services (octet 3 bit 6).
+    ///
+    /// The bit tells the UE it is EMERGENCY REGISTERED, which is what obliges it not to
+    /// request a non-emergency PDU session over this access (TS 24.501 §6.4.1.1,
+    /// TS 23.501 §5.16.4.9a). It exists in the IE (Table 9.11.3.6.1) and did NOT exist in
+    /// this codec, so the one registration outcome that changes what the UE may ask for
+    /// next could not be signalled at all.
+    pub emergency_registered: bool,
     /// Registration result value
     pub value: RegistrationResultValue,
 }
@@ -611,7 +619,10 @@ impl RegistrationResult {
     pub fn encode(&self, buf: &mut BytesMut) {
         buf.put_u8(1); // Length
         let sms_bit = if self.sms_allowed { 0x08 } else { 0 };
-        buf.put_u8(sms_bit | (self.value as u8 & 0x07));
+        // Emergency registered is bit 6, i.e. 0x20 (TS 24.501 Table 9.11.3.6.1). NSSAA
+        // (bit 5) and disaster roaming (bit 7) are not modelled here and encode as 0.
+        let emergency_bit = if self.emergency_registered { 0x20 } else { 0 };
+        buf.put_u8(emergency_bit | sms_bit | (self.value as u8 & 0x07));
     }
 
     /// Decode from bytes
@@ -625,6 +636,7 @@ impl RegistrationResult {
         let _length = buf.get_u8();
         let byte = buf.get_u8();
         let sms_allowed = (byte & 0x08) != 0;
+        let emergency_registered = (byte & 0x20) != 0;
         let value = match byte & 0x07 {
             1 => RegistrationResultValue::ThreeGppAccess,
             2 => RegistrationResultValue::Non3gppAccess,
@@ -633,7 +645,11 @@ impl RegistrationResult {
             9 => RegistrationResultValue::DisasterRoamingServices,
             _ => RegistrationResultValue::ThreeGppAccess,
         };
-        Ok(Self { sms_allowed, value })
+        Ok(Self {
+            sms_allowed,
+            emergency_registered,
+            value,
+        })
     }
 }
 

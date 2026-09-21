@@ -442,8 +442,21 @@ pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
         matches!(amf_ue.access_type & 0x07, 1..=3),
         "5GS registration result access type must be 1/2/3"
     );
+    // "Emergency registered" (octet 3 bit 6, TS 24.501 Table 9.11.3.6.1). Set for an
+    // EMERGENCY registration, which is what tells the UE it must not request a
+    // non-emergency PDU session over this access (§6.4.1.1, TS 23.501 §5.16.4.9a) -- the
+    // UE-side half of the restriction the AMF enforces in `handle_5gsm_message`. Before
+    // #361 the bit had no field in the codec, so an emergency-registered UE was told it
+    // held an ordinary registration.
+    //
+    // Keyed on the registration TYPE, not on `unauthenticated_emergency`: an emergency
+    // registration that authenticated successfully is still emergency registered and still
+    // subject to the same DNN restriction. The authentication outcome changes the security
+    // context and the UDM interaction, not what the UE may ask for.
+    let emergency_registered = amf_ue.registration_type == registration_type::EMERGENCY;
     let registration_result = nextgcore_ftypes::RegistrationResult {
         sms_allowed: false,
+        emergency_registered,
         value: match amf_ue.access_type & 0x07 {
             2 => nextgcore_ftypes::RegistrationResultValue::Non3gppAccess,
             3 => nextgcore_ftypes::RegistrationResultValue::ThreeGppAndNon3gppAccess,
@@ -479,7 +492,18 @@ pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
     });
 
     // Allowed NSSAI (allowed if present, else requested); omitted when empty.
-    let nssai_source: &[crate::context::SNssai] = if !amf_ue.allowed_nssai.is_empty() {
+    //
+    // #361: for an UNAUTHENTICATED emergency registration the IE is omitted unconditionally.
+    // TS 23.502 §4.12.2.3: "NSSAI shall not be included by the UE. The AMF shall not send the
+    // Allowed NSSAI in the Registration Accept message." Clearing `allowed_nssai` in
+    // `complete_registration` is NOT sufficient on its own, because the `else` arm below then
+    // falls back to `requested_nssai` -- which is populated from the integrity-protected SMC
+    // replay and so can be non-empty even here. Echoing the UE's ask back at it would both
+    // breach the clause and assert an authorization no subscription backs, since this UE's
+    // UDM was never consulted.
+    let nssai_source: &[crate::context::SNssai] = if amf_ue.unauthenticated_emergency {
+        &[]
+    } else if !amf_ue.allowed_nssai.is_empty() {
         &amf_ue.allowed_nssai
     } else {
         &amf_ue.requested_nssai
@@ -1387,6 +1411,104 @@ mod tests {
             !roundtrips,
             "DL NAS Transport now round-trips through nextgcore-nas — the PSI TLV/TV \
              divergence is fixed; convert this guard into a byte-equal drift test"
+        );
+    }
+
+    /// **#361:** a Registration Accept for an EMERGENCY registration reports the UE
+    /// "Emergency registered", and for an UNAUTHENTICATED one it carries no Allowed NSSAI.
+    ///
+    /// Two distinct spec obligations, asserted on the same emitted bytes because they land in
+    /// the same message and their interaction is the point:
+    ///
+    /// * **The bit** (TS 24.501 §9.11.3.6 octet 3 bit 6) keys on the registration TYPE. It is
+    ///   what obliges the UE not to request a non-emergency PDU session (§6.4.1.1,
+    ///   TS 23.501 §5.16.4.9a), so it is owed to an AUTHENTICATED emergency registration too --
+    ///   the authentication outcome changes the security context, not what the UE may ask for.
+    /// * **The omitted Allowed NSSAI** (TS 23.502 §4.12.2.3: "The AMF shall not send the
+    ///   Allowed NSSAI in the Registration Accept message") keys on the UNAUTHENTICATED case,
+    ///   because that clause is about a UE whose subscription was never retrieved.
+    ///
+    /// Asserted on the WIRE IEI (0x15), not on `allowed_nssai.is_empty()`: clearing the field in
+    /// `complete_registration` is not sufficient on its own, since the builder falls back to
+    /// `requested_nssai` -- which is populated from the integrity-protected SMC replay and can
+    /// be non-empty here. A struct-level assertion would pass while the UE's own ask was echoed
+    /// back at it as an authorization no subscription supports.
+    #[test]
+    fn a_registration_accept_reports_emergency_registered_and_omits_the_nssai_when_unauthenticated()
+    {
+        /// Whether the Allowed NSSAI IE (IEI 0x15, TS 24.501 §8.2.7) appears in `accept`.
+        ///
+        /// Scans for the IEI rather than parsing, which is sufficient here because the two
+        /// shapes under test differ only in this IE's presence and the comparison is between
+        /// them.
+        fn has_allowed_nssai(accept: &[u8]) -> bool {
+            accept.contains(&0x15)
+        }
+
+        // A CONTROL first: an ordinary registration must have the bit CLEAR and keep its NSSAI.
+        // Without this the assertions below would pass for a builder that set the bit and
+        // dropped the NSSAI unconditionally, which would break every normal registration.
+        let mut ordinary = create_test_amf_ue();
+        ordinary.registration_type = registration_type::INITIAL;
+        ordinary.allowed_nssai = vec![crate::context::SNssai { sst: 1, sd: None }];
+        let bytes = build_registration_accept(&ordinary).expect("ordinary accept builds");
+        assert_eq!(
+            bytes[3], 1,
+            "5GS registration result is the first mandatory IE, encoded LV"
+        );
+        assert_eq!(
+            bytes[4] & 0x20,
+            0,
+            "an INITIAL registration must NOT be reported emergency registered, or every \
+             ordinary UE would be barred from non-emergency PDU sessions"
+        );
+        assert!(
+            has_allowed_nssai(&bytes),
+            "control: an ordinary registration carries its Allowed NSSAI"
+        );
+
+        // An AUTHENTICATED emergency registration: bit SET, NSSAI still carried. Its UDM
+        // subscription WAS retrieved, so §4.12.2.3's omission does not apply to it.
+        let mut authenticated_emergency = create_test_amf_ue();
+        authenticated_emergency.registration_type = registration_type::EMERGENCY;
+        authenticated_emergency.unauthenticated_emergency = false;
+        authenticated_emergency.allowed_nssai = vec![crate::context::SNssai { sst: 1, sd: None }];
+        let bytes = build_registration_accept(&authenticated_emergency).expect("accept builds");
+        assert_eq!(
+            bytes[4] & 0x20,
+            0x20,
+            "an EMERGENCY registration must report 'Emergency registered' (TS 24.501 \
+             Table 9.11.3.6.1); before #361 the codec had no field for the bit at all, so \
+             every emergency UE was told it held an ordinary registration"
+        );
+        assert!(
+            has_allowed_nssai(&bytes),
+            "an AUTHENTICATED emergency registration keeps its Allowed NSSAI: §4.12.2.3's \
+             omission is conditioned on the UE not having been authenticated"
+        );
+
+        // An UNAUTHENTICATED emergency registration: bit SET, NSSAI OMITTED -- even though a
+        // Requested NSSAI is present, which is the fallback that made the struct-level fix
+        // insufficient.
+        let mut unauthenticated_emergency = create_test_amf_ue();
+        unauthenticated_emergency.registration_type = registration_type::EMERGENCY;
+        unauthenticated_emergency.unauthenticated_emergency = true;
+        unauthenticated_emergency.allowed_nssai.clear();
+        unauthenticated_emergency.requested_nssai =
+            vec![crate::context::SNssai { sst: 1, sd: None }];
+        let bytes = build_registration_accept(&unauthenticated_emergency).expect("accept builds");
+        assert_eq!(
+            bytes[4] & 0x20,
+            0x20,
+            "still emergency registered -- the restriction on what the UE may ask for does \
+             not depend on whether it was authenticated"
+        );
+        assert!(
+            !has_allowed_nssai(&bytes),
+            "TS 23.502 §4.12.2.3: 'The AMF shall not send the Allowed NSSAI in the \
+             Registration Accept message'. A non-empty `requested_nssai` is set here on \
+             purpose: clearing `allowed_nssai` alone leaves the builder echoing the UE's own \
+             ask back as an authorization its (never-retrieved) subscription cannot support"
         );
     }
 

@@ -143,6 +143,19 @@ struct NasYaml {
     use_nextgcore_security: Option<bool>,
 }
 
+/// The `amf.emergency` block (#361).
+///
+/// `allow_unauthenticated` is the regulatory switch TS 33.501 §10.2.2.2 and §6.7.3.6 require
+/// to be configurable: whether an EMERGENCY registration the network could not authenticate
+/// (e.g. the AUSF is unreachable) proceeds with NIA0/NEA0 restricted to the emergency DNN, or
+/// is refused. Default `true`; see `emergency::EmergencyPolicy` for the §5.1.2 argument and
+/// `specs/decide-unauthenticated-emergency-registration.md` for the full one. The
+/// `AMF_EMERGENCY_ALLOW_UNAUTHENTICATED` env override takes precedence.
+#[derive(Debug, Default, Deserialize)]
+struct EmergencyYaml {
+    allow_unauthenticated: Option<bool>,
+}
+
 /// A single `<timer>: { value: <seconds> }` entry under `amf.time`.
 ///
 /// The nesting under `value` mirrors the shipped configs
@@ -182,6 +195,7 @@ struct AmfSection {
     sbi: Option<SbiYaml>,
     nas: Option<NasYaml>,
     time: Option<TimeYaml>,
+    emergency: Option<EmergencyYaml>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -396,6 +410,21 @@ impl AmfApp {
                 .and_then(|n| n.use_nextgcore_security),
         );
         context::set_nas_security_canary(nas_canary);
+
+        // #361: the unauthenticated-emergency regulatory switch. Seeded HERE, beside the NAS
+        // canary and before `init_ngap` builds the `EmergencyHandler` that reads it, because
+        // TS 33.501 §5.1.2 makes this a per-deployment legal question the software cannot
+        // infer: it is mandatory in some jurisdictions and forbidden in others. Default ON —
+        // see `emergency::EmergencyPolicy`.
+        emergency::set_allow_unauthenticated_emergency(emergency::EmergencyPolicy::resolve(
+            std::env::var("AMF_EMERGENCY_ALLOW_UNAUTHENTICATED")
+                .ok()
+                .as_deref(),
+            amf_section
+                .emergency
+                .as_ref()
+                .and_then(|e| e.allow_unauthenticated),
+        ));
 
         // Seed NRF URI into SBI context for NF registration
         if let Some(sbi) = &amf_section.sbi {
@@ -980,6 +1009,89 @@ mod tests {
     fn test_amf_app_creation() {
         let app = AmfApp::new();
         assert!(app.running.load(Ordering::SeqCst));
+    }
+
+    /// **#361:** `amf.emergency.allow_unauthenticated: false` from the YAML actually reaches the
+    /// `EmergencyHandler` that enforces it.
+    ///
+    /// This is the wiring the regulatory switch is worthless without, and the shape of the AMF's
+    /// startup makes it non-obvious: `load_config` runs inside `AmfApp::init`, while the handler
+    /// that needs the answer is constructed LATER inside `NgapServer::new` under `init_ngap`. So
+    /// the value travels through a process-global rather than a constructor argument, and the
+    /// thing that can silently break is exactly that hand-off — a knob parsed into a struct field
+    /// nobody reads is the defect class this tree keeps finding (#363's two `AmfContext`s, #341's
+    /// two UE stores).
+    ///
+    /// Asserted through `EmergencyHandler::new()`, i.e. the SAME construction path `NgapServer`
+    /// uses, so the test cannot pass by reading the global the loader just wrote while the real
+    /// handler ignores it.
+    ///
+    /// `false` is the direction that has to work: `true` is the default, so a loader that
+    /// dropped the key entirely would pass a `true` assertion.
+    #[tokio::test]
+    async fn the_config_loader_seeds_the_unauthenticated_emergency_policy() {
+        use std::io::Write;
+
+        // The posture is process-global; take the lock declared beside it in `emergency.rs`,
+        // which also resets it to the shipped default so this test is not reading a
+        // predecessor's value.
+        let _policy = crate::emergency::emergency_policy_test_guard();
+        // ...and the context guard, because `load_config` writes the global AmfContext too.
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // The env override outranks the YAML, so it must be clear for the YAML to be what is
+        // under test here. Its precedence is covered by `EmergencyPolicy::resolve`'s own test.
+        std::env::remove_var("AMF_EMERGENCY_ALLOW_UNAUTHENTICATED");
+        context::amf_context_init(64, 1024, 4096);
+
+        assert!(
+            crate::emergency::EmergencyHandler::new()
+                .policy()
+                .allow_unauthenticated,
+            "precondition: a handler built before any config reads the shipped default (ON)"
+        );
+
+        let yaml = r#"
+amf:
+  amf_name: amf-361
+  emergency:
+    allow_unauthenticated: false
+"#;
+        // A distinct filename from every sibling config test: these run in one process against
+        // one temp dir, so a shared name would have two tests overwrite each other's fixture.
+        let path = std::env::temp_dir().join("nextgcore-amfd-361-emergency-policy.yaml");
+        {
+            let mut f = std::fs::File::create(&path).expect("write the fixture config");
+            f.write_all(yaml.as_bytes())
+                .expect("write the fixture config");
+        }
+
+        AmfApp::new()
+            .load_config(path.to_str().expect("utf-8 temp path"))
+            .await
+            .expect("the fixture config must load");
+
+        assert!(
+            !crate::emergency::allow_unauthenticated_emergency().allow_unauthenticated,
+            "the YAML value must reach the process-wide policy"
+        );
+        assert!(
+            !crate::emergency::EmergencyHandler::new()
+                .policy()
+                .allow_unauthenticated,
+            "and a handler constructed AFTERWARDS -- as `NgapServer::new` does, under \
+             `init_ngap`, which runs after `load_config` -- must adopt it. This is the \
+             hand-off: the handler is built later than the config is read, so the value \
+             travels through a global and this is the assertion that it arrives"
+        );
+
+        // Restore, so a later test in this process does not inherit a forbidding posture and
+        // silently assert the pre-#361 refusal as if it were the default.
+        crate::emergency::set_allow_unauthenticated_emergency(
+            crate::emergency::EmergencyPolicy::default(),
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// #363: there is ONE `AmfContext` in the process, so everything the config loader

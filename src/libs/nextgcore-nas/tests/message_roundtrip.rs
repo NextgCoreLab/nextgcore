@@ -316,6 +316,7 @@ fn gmm_registration_accept() {
     roundtrip_5gmm(FiveGmmMessage::RegistrationAccept(RegistrationAccept {
         registration_result: RegistrationResult {
             sms_allowed: true,
+            emergency_registered: false,
             value: RegistrationResultValue::ThreeGppAccess,
         },
         guti: Some(MobileIdentity::FiveGGuti(test_5g_guti())),
@@ -328,6 +329,62 @@ fn gmm_registration_accept() {
     }));
 }
 
+/// **#361:** a Registration Accept that reports the UE EMERGENCY REGISTERED survives a
+/// full message round-trip with the bit set, and the bit lands on octet 3 bit 6.
+///
+/// Positive, and on the wire rather than on the struct: the flag is meaningless unless it
+/// reaches the UE, because it is what obliges the UE not to request a non-emergency PDU
+/// session (TS 24.501 §6.4.1.1, TS 23.501 §5.16.4.9a). Asserting only `decoded == original`
+/// would pass for an encoder that wrote the flag into the wrong bit and a decoder that read
+/// it back out of the same wrong bit — which is a real risk here, since this octet also
+/// carries SMS-allowed (bit 4) and the 3-bit access-type value, and all three had to be
+/// packed together. So the raw octet is located and checked against TS 24.501
+/// Table 9.11.3.6.1 as well.
+///
+/// Separate from `gmm_registration_accept` (which pins the bit CLEAR) so both states are
+/// exercised: before #361 the field did not exist in the codec at all, so every accept this
+/// tree ever built reported "not registered for emergency services".
+#[test]
+fn gmm_registration_accept_emergency_registered() {
+    let accept = RegistrationAccept {
+        registration_result: RegistrationResult {
+            sms_allowed: false,
+            emergency_registered: true,
+            value: RegistrationResultValue::ThreeGppAccess,
+        },
+        // No Allowed NSSAI: TS 23.502 §4.12.2.3 forbids sending one on an unauthenticated
+        // emergency registration, so this is the shape that actually goes out.
+        guti: Some(MobileIdentity::FiveGGuti(test_5g_guti())),
+        tai_list: Some(test_tai_list()),
+        ..Default::default()
+    };
+    roundtrip_5gmm(FiveGmmMessage::RegistrationAccept(accept.clone()));
+
+    let bytes = nextgcore_nas::fiveg::message::build_5gmm_message(
+        &FiveGmmMessage::RegistrationAccept(accept),
+    );
+    // EPD, security header type, message type, then the 5GS registration result as LV:
+    // length octet then the content octet (TS 24.501 §8.2.7 -- it is the first, mandatory IE).
+    assert_eq!(bytes[3], 1, "5GS registration result length octet");
+    let result_octet = bytes[4];
+    assert_eq!(
+        result_octet & 0x20,
+        0x20,
+        "Emergency registered must be set in octet 3 bit 6 (TS 24.501 Table 9.11.3.6.1); \
+         got {result_octet:#04x}"
+    );
+    assert_eq!(
+        result_octet & 0x08,
+        0,
+        "SMS allowed was not requested and must not be set -- the two flags share the octet"
+    );
+    assert_eq!(
+        result_octet & 0x07,
+        1,
+        "and the 3GPP-access registration result value must survive beside them"
+    );
+}
+
 /// nas-10: byte-vector test for the Equivalent PLMNs (0x4A) and Rejected NSSAI
 /// (0x11) optional IEs, asserting the exact TLV encoding and TS 24.501 §8.2.7
 /// IEI order (Equivalent PLMNs after 5G-GUTI, Rejected NSSAI after Allowed NSSAI).
@@ -336,6 +393,7 @@ fn gmm_registration_accept_new_ie_bytes() {
     let accept = RegistrationAccept {
         registration_result: RegistrationResult {
             sms_allowed: true,
+            emergency_registered: false,
             value: RegistrationResultValue::ThreeGppAccess,
         },
         equivalent_plmns: Some(vec![test_plmn()]),
@@ -360,6 +418,7 @@ fn gmm_registration_accept_full_ie_roundtrip() {
     roundtrip_5gmm(FiveGmmMessage::RegistrationAccept(RegistrationAccept {
         registration_result: RegistrationResult {
             sms_allowed: true,
+            emergency_registered: false,
             value: RegistrationResultValue::ThreeGppAccess,
         },
         presencemask: 0,
@@ -395,6 +454,7 @@ fn gmm_registration_accept_network_feature_support_bytes() {
     let accept = RegistrationAccept {
         registration_result: RegistrationResult {
             sms_allowed: true,
+            emergency_registered: false,
             value: RegistrationResultValue::ThreeGppAccess,
         },
         network_feature_support: Some(nextgcore_nas::interworking::FiveGsNetworkFeatureSupport {
@@ -420,6 +480,7 @@ fn gmm_registration_accept_network_feature_support_bytes() {
     let ordered = RegistrationAccept {
         registration_result: RegistrationResult {
             sms_allowed: true,
+            emergency_registered: false,
             value: RegistrationResultValue::ThreeGppAccess,
         },
         rejected_nssai: Some(vec![0x01]),
