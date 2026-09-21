@@ -23,7 +23,7 @@ use crate::constants::custom_header;
 use crate::error::{SbiError, SbiResult};
 use crate::message::{SbiRequest, SbiResponse};
 use crate::oauth::OAuth2Client;
-use crate::overload::{OverloadRegistry, SendDecision};
+use crate::overload::{OverloadRegistry, SendDecision, ShedPolicy};
 use crate::tls;
 use crate::types::{NfType, UriScheme};
 
@@ -442,15 +442,34 @@ impl SbiClient {
         self
     }
 
-    /// Enable TS 29.500 §6.4.2.2 local **shedding** (#65).
+    /// Widen TS 29.500 §6.4.2.2 local shedding to **any** OCI, including one that
+    /// omits the mandatory `Period-of-Validity` ([`ShedPolicy::Always`]).
     ///
-    /// Recording an OCI and reselecting away from an overloaded producer are
-    /// always on. This additionally allows the client to fail a request locally,
-    /// with [`SbiError::OverloadShed`], when the producer asked for reduction and
-    /// there is no alternate to send it to. Off by default — it is the only part
-    /// of the reaction that can lose a request, so an operator opts in.
+    /// Shedding against a *conformant* OCI is already the default (#273), so this
+    /// is no longer the switch that turns abatement on — it is the switch that
+    /// drops the validity requirement. See [`ShedPolicy`] for what that trades
+    /// away.
     pub fn with_overload_shedding(mut self) -> Self {
         self.overload = Arc::new(OverloadRegistry::with_shedding());
+        self
+    }
+
+    /// Disable local shedding on this client: record and reselect only
+    /// ([`ShedPolicy::Never`]), the pre-#273 default.
+    ///
+    /// For a consumer whose caller cannot distinguish a local
+    /// [`SbiError::OverloadShed`] from a real outage and would rather send into
+    /// the declared overload.
+    pub fn without_overload_shedding(mut self) -> Self {
+        self.overload = Arc::new(OverloadRegistry::without_shedding());
+        self
+    }
+
+    /// Set this client's [`ShedPolicy`] explicitly, ignoring the process-wide
+    /// resolution from
+    /// [`SHED_POLICY_ENV`](crate::overload::SHED_POLICY_ENV).
+    pub fn with_shed_policy(mut self, policy: ShedPolicy) -> Self {
+        self.overload = Arc::new(OverloadRegistry::with_policy(policy));
         self
     }
 
@@ -2114,8 +2133,12 @@ mod tests {
 
     // ─── #65: overload reaction (TS 29.500 §6.4.2.2 / §6.5) ─────────────────
 
-    /// An OCI header value at the given metric, with a bounded validity so a
+    /// An OCI header value at the given metric, with a declared validity so a
     /// recorded entry cannot outlive the test process.
+    ///
+    /// Conformant (TS 29.500 §5.2.3.2.9 makes `Period-of-Validity` mandatory),
+    /// which since #273 also makes it shed-eligible at a default consumer. Use
+    /// [`unbounded_oci_header`] for the non-conformant shape.
     fn oci_header(metric: u8) -> (String, String) {
         (
             custom_header::OCI.to_string(),
@@ -2123,6 +2146,15 @@ mod tests {
                 "Timestamp: 2026-01-01T00:00:00Z; Period-of-Validity: 30s; \
                  Overload-Reduction-Metric: {metric}"
             ),
+        )
+    }
+
+    /// An OCI omitting the mandatory `Period-of-Validity` — the shape #273
+    /// decided must never cause a local drop.
+    fn unbounded_oci_header(metric: u8) -> (String, String) {
+        (
+            custom_header::OCI.to_string(),
+            format!("Timestamp: 2026-01-01T00:00:00Z; Overload-Reduction-Metric: {metric}"),
         )
     }
 
@@ -2230,40 +2262,130 @@ mod tests {
         assert_eq!(err.status_code(), Some(503));
     }
 
-    /// #65: the DEFAULT client does not shed. With no alternate configured, a
-    /// live OCI is recorded and logged but the request is still sent — so
-    /// upgrading to this change cannot start dropping any NF's requests.
+    /// #273 decision 1 — the INVERSION of #272's `the_default_client_records_oci_
+    /// but_does_not_shed`, which asserted that a default client sent into a
+    /// declared overload. It now sheds.
     ///
-    /// This is the guard on the default posture, and it is deliberately the
-    /// inverse of the test above: same producer, same OCI, one builder call
-    /// different.
+    /// The name is kept because it still describes what the test pins: a default
+    /// client records an OCI, and what it does about it now depends on whether the
+    /// OCI is conformant. Kept as ONE test over two producers rather than split,
+    /// because the whole content of decision 1 is the CONTRAST between them — a
+    /// split pair would let one half be deleted and the other still read as a
+    /// complete guard on the default.
+    ///
+    /// `hits` is the load-bearing assertion in both halves. Asserting only on the
+    /// returned error would pass if the request had been sent and 503'd again.
     #[tokio::test]
     async fn the_default_client_records_oci_but_does_not_shed() {
+        // ── Half 1: a CONFORMANT OCI is abated against. §6.4.2.2 now happens in
+        //    a default deployment, which is the substance of #65's complaint.
         let hits = Arc::new(AtomicUsize::new(0));
         let producer = serve_fixed(503, vec![oci_header(100)], "overloaded", hits.clone()).await;
-
         let client = SbiClient::with_host_port("127.0.0.1", producer.port());
-        for _ in 0..3 {
-            let resp = client
+
+        // The first request teaches the client: nothing is known yet, so it goes.
+        assert_eq!(
+            client
                 .send_request(SbiRequest::get("/x"))
                 .await
-                .expect("every request is still sent");
-            assert_eq!(resp.status, 503);
+                .expect("the first request is always sent")
+                .status,
+            503
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        for attempt in 0..3 {
+            let err = client
+                .send_request(SbiRequest::get("/x"))
+                .await
+                .expect_err("a default client must abate against a conformant 100% reduction");
+            assert!(
+                matches!(err, SbiError::OverloadShed(_)),
+                "attempt {attempt}: expected a local shed, got {err:?}"
+            );
         }
         assert_eq!(
             hits.load(Ordering::SeqCst),
-            3,
-            "the default posture must not withhold requests"
+            1,
+            "a shed request must never reach the producer"
         );
-        // The OCI was nonetheless recorded — the reaction is available, just not
-        // destructive by default.
         assert!(
             client
                 .overload_registry()
                 .effective_oci(&client.config().base_uri(), Instant::now())
                 .is_some(),
-            "the OCI must be recorded even when it is not acted on"
+            "the OCI must be recorded, which is what the shedding decision reads"
         );
+
+        // ── Half 2: an OCI omitting the mandatory Period-of-Validity is recorded
+        //    but never shed against, at any metric. No shape of peer header can
+        //    wedge a default consumer off a healthy NF.
+        let loose_hits = Arc::new(AtomicUsize::new(0));
+        let loose_producer = serve_fixed(
+            503,
+            vec![unbounded_oci_header(100)],
+            "overloaded",
+            loose_hits.clone(),
+        )
+        .await;
+        let loose_client = SbiClient::with_host_port("127.0.0.1", loose_producer.port());
+
+        for _ in 0..4 {
+            let resp = loose_client
+                .send_request(SbiRequest::get("/x"))
+                .await
+                .expect("an unbounded OCI must not fail a request locally");
+            assert_eq!(resp.status, 503);
+        }
+        assert_eq!(
+            loose_hits.load(Ordering::SeqCst),
+            4,
+            "every request must reach a producer whose OCI declared no validity"
+        );
+        assert!(
+            loose_client
+                .overload_registry()
+                .effective_oci(&loose_client.config().base_uri(), Instant::now())
+                .is_some(),
+            "it is still RECORDED — reselection uses it, and a conformant \
+             restatement supersedes it"
+        );
+    }
+
+    /// #273: the operator's opt-out is real. With [`ShedPolicy::Never`] a default
+    /// -conformant OCI at 100% still does not withhold a request.
+    ///
+    /// Exists because "the default changed" is only defensible if the previous
+    /// behaviour remains reachable for an operator who needs it, and a switch with
+    /// no test is a switch that rots.
+    #[tokio::test]
+    async fn an_operator_can_opt_out_of_shedding_entirely() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let producer = serve_fixed(503, vec![oci_header(100)], "overloaded", hits.clone()).await;
+
+        let client =
+            SbiClient::with_host_port("127.0.0.1", producer.port()).without_overload_shedding();
+        for _ in 0..3 {
+            assert_eq!(
+                client
+                    .send_request(SbiRequest::get("/x"))
+                    .await
+                    .expect("ShedPolicy::Never must never fail a request locally")
+                    .status,
+                503
+            );
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            3,
+            "an opted-out client must send every request"
+        );
+        // Distinguishes opting out from the reaction being broken: the OCI was
+        // recorded, so the machinery ran and the POLICY is what declined.
+        assert!(client
+            .overload_registry()
+            .effective_oci(&client.config().base_uri(), Instant::now())
+            .is_some());
     }
 
     /// #65: an OCI riding on a **success** response is recorded and acted on

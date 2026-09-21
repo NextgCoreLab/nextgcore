@@ -93,7 +93,10 @@ pub use oauth::{
     AccessTokenError, AccessTokenRequest, AccessTokenResponse, JwksCache, OAuth2Client, TokenCache,
     OAUTH2_STANDARD_PATHS_ENV,
 };
-pub use overload::{Lci, Oci, OverloadControl, OverloadRegistry, OverloadReporter, SendDecision};
+pub use overload::{
+    reset_shed_policy_override, set_shed_policy_override, Lci, Oci, OverloadControl,
+    OverloadRegistry, OverloadReporter, SendDecision, ShedPolicy, SHED_POLICY_ENV,
+};
 #[cfg(feature = "6g-extensions")]
 pub use pubsub::{
     EventBroker, EventFilter, EventReplayBuffer, SbiEvent, SbiEventCategory, Subscription,

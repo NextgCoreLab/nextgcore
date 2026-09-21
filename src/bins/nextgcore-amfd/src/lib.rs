@@ -912,6 +912,13 @@ pub async fn run() -> Result<()> {
     // it BEFORE the NF profile is built. Otherwise the AMF registers an `http://`
     // URL for a TLS listener and every peer that discovers it fails to connect.
     sbi_path::set_sbi_tls_active(sbi_profile.is_production());
+    // #273: perform the producer half of TS 29.500 §6.4. The heartbeat worker
+    // registered below publishes this AMF's UE load (registered UEs against
+    // `max_num_of_ue`) to the process reporter on every tick, and this makes each
+    // Namf response carry the resulting `3gpp-Sbi-Oci` once that load crosses the
+    // overload threshold. Before this, an AMF at capacity answered 503 with no way
+    // for a consumer to know to back off (§6.4.3.2).
+    sbi_server_config = sbi_server_config.with_self_overload_reporting();
     let sbi_server = nextgcore_sbi::server::SbiServer::new(sbi_server_config);
     sbi_server
         .start(namf_server::namf_request_handler)
