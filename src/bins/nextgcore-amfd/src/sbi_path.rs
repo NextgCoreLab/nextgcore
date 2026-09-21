@@ -161,12 +161,22 @@ pub enum SbiServiceType {
     NnrfNfm,
     /// NNRF discovery
     NnrfDisc,
+    /// Namf_Communication on a PEER AMF (#352).
+    ///
+    /// The AMF is both producer and consumer of this service: a target AMF calls
+    /// `UEContextTransfer` / `RegistrationStatusUpdate` on the *source* AMF during
+    /// inter-AMF mobility (TS 29.518 §5.2.2.2.1.1, TS 23.502 §4.2.2.2.2 step 4).
+    /// This variant names the consumer direction — every other variant here names
+    /// a different NF type, so this is the first where target and requester are
+    /// both `AMF`.
+    NamfComm,
 }
 
 impl SbiServiceType {
     /// Get service name string
     pub fn service_name(&self) -> &'static str {
         match self {
+            Self::NamfComm => service_name::NAMF_COMM,
             Self::NausfAuth => service_name::NAUSF_AUTH,
             Self::NudmUecm => service_name::NUDM_UECM,
             Self::NudmSdm => service_name::NUDM_SDM,
@@ -1584,6 +1594,412 @@ pub async fn resolve_nf_endpoint_async(service_type: SbiServiceType) -> SbiResul
     Ok((host, port))
 }
 
+// ============================================================================
+// Inter-AMF Namf_Communication consumer (#352, TS 29.518 §5.2.2.2.1)
+// ============================================================================
+
+/// Locate the AMF that issued `guti`, by the GUAMI the GUTI contains (#352).
+///
+/// # Why this is not an arm of [`resolve_nf_endpoint_async`]
+///
+/// That resolver answers "where is *an* NF of this type", which is the right
+/// question for the AUSF, UDM, SMF, PCF and NSACF — any instance serves any
+/// subscriber. It is the **wrong** question here. There is exactly one AMF that
+/// holds this UE's context, and `find_nf_instances_by_service` returns
+/// `instances.first()`, i.e. an arbitrary one. Fetching a UE context from the
+/// wrong AMF would import another subscriber's MM context under this UE's
+/// identity, which is strictly worse than not transferring at all.
+///
+/// That is the #92 defect from the other end: a consumer that could not identify
+/// *which* AMF a GUAMI named fell back to whichever the NRF listed first.
+///
+/// # How the GUAMI is recovered
+///
+/// From the GUTI itself, with no round trip. TS 23.003 §2.10
+/// (`23003-k00.txt:2479`) defines `<5G-GUTI> = <GUAMI><5G-TMSI>` where
+/// `<GUAMI> = <MCC><MNC><AMF Identifier>` — so a 5G-GUTI *contains* the identity
+/// of the AMF that allocated it. This is what TS 23.502 §4.2.2.2.2 step 4 means
+/// by "The new AMF determines the old AMF using the UE's 5G-GUTI"
+/// (`23502-k20.txt:3973`).
+///
+/// # Why the answer is verified rather than trusted
+///
+/// The query carries the conformant `guami` discovery parameter
+/// (`TS29510_Nnrf_NFDiscovery.yaml:237`, "Guami used to search for an appropriate
+/// AMF"), so against a conformant NRF the filtering is server-side. This tree's
+/// own `nrfd` does **not** implement that filter — its `DiscoveryQuery` has no
+/// `guami` field and `nf_info_for_type` inspects only `udmInfo`/`udrInfo`/
+/// `ausfInfo` — so it answers with every registered AMF. The returned profiles are
+/// therefore re-checked against `amfInfo.guamiList` here. Against a conformant NRF
+/// the check is a no-op; against this one it is what makes the selection correct.
+///
+/// Fails closed: no GUAMI match means `None`, and the caller falls back to
+/// identifying the UE by SUCI.
+pub async fn discover_peer_amf_by_guami(guti: &crate::context::Guti5gs) -> Option<(String, u16)> {
+    let wanted = guami_json(&crate::context::Guami {
+        plmn_id: guti.plmn_id.clone(),
+        amf_id: crate::context::AmfId {
+            region: guti.amf_region_id,
+            set: guti.amf_set_id,
+            pointer: guti.amf_pointer,
+        },
+    });
+
+    let sbi_ctx = global_context();
+    // The AMF must not transfer a context from ITSELF. `served_guami` is checked
+    // by the caller (`registration_request_from_old_amf`), so reaching here means
+    // the GUAMI is foreign — but the NRF cache also holds this AMF's own profile,
+    // so the instance-id comparison below is the second guard.
+    let own_instance_id = sbi_ctx.get_self_instance().await.map(|inst| inst.id);
+
+    if let Some(ep) = peer_amf_from_nrf(&wanted, own_instance_id.as_deref()).await {
+        return Some(ep);
+    }
+
+    // No NRF, or an NRF that knows no matching AMF: the configured peer. This is
+    // the addressless fallback a two-AMF bring-up without an NRF needs, and it is
+    // consulted AFTER discovery and logged when used, so it cannot silently stand
+    // in for discovery in a deployment that has one.
+    let host = std::env::var("AMF_PEER_SBI_ADDR").ok()?;
+    let port = std::env::var("AMF_PEER_SBI_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(7777);
+    log::info!(
+        "Peer AMF for GUAMI {wanted} not discoverable via the NRF; using the configured \
+         AMF_PEER_SBI_ADDR={host}:{port}"
+    );
+    Some((host, port))
+}
+
+/// The NRF half of [`discover_peer_amf_by_guami`]: query by `guami`, then select
+/// the profile whose `amfInfo.guamiList` actually contains it.
+async fn peer_amf_from_nrf(
+    wanted_guami: &serde_json::Value,
+    own_instance_id: Option<&str>,
+) -> Option<(String, u16)> {
+    let sbi_ctx = global_context();
+    let nrf_uri = sbi_ctx.get_nrf_uri().await?;
+    let (nrf_host, nrf_port) = parse_host_port(&nrf_uri)?;
+    let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
+
+    // `guami` is a JSON-valued query parameter (`content: application/json` in
+    // TS 29.510), so it is percent-encoded rather than interpolated raw — `{`, `"`
+    // and `:` all make `Uri::parse` reject the assembled URI (#101). Through the
+    // SHARED query encoder, not a local one: the `+`-for-space form encoding would
+    // be wrong here, which is the distinction `uri_encode`'s module docs pin.
+    let guami_param = nextgcore_sbi::uri_encode::encode_query_value(&wanted_guami.to_string());
+    let path = format!(
+        "/nnrf-disc/v1/nf-instances?target-nf-type=AMF&requester-nf-type=AMF\
+         &service-names={}&guami={guami_param}",
+        service_name::NAMF_COMM
+    );
+
+    let response = client.get(&path).await.ok()?;
+    if response.status != 200 {
+        log::warn!(
+            "Peer-AMF discovery returned status {} for GUAMI {wanted_guami}",
+            response.status
+        );
+        return None;
+    }
+    let json: serde_json::Value =
+        serde_json::from_str(response.http.content.as_deref().unwrap_or("")).ok()?;
+    let instances = json.get("nfInstances")?.as_array()?;
+
+    for inst in instances {
+        if let (Some(id), Some(own)) = (
+            inst.get("nfInstanceId").and_then(|v| v.as_str()),
+            own_instance_id,
+        ) {
+            if id == own {
+                continue;
+            }
+        }
+        let serves_it = inst
+            .get("amfInfo")
+            .and_then(|i| i.get("guamiList"))
+            .and_then(|l| l.as_array())
+            .is_some_and(|held| held.iter().any(|h| guami_json_eq(h, wanted_guami)));
+        if !serves_it {
+            continue;
+        }
+        if let Some(ep) = namf_comm_endpoint(inst) {
+            log::info!(
+                "Peer AMF for GUAMI {wanted_guami} discovered at {}:{} (instance {})",
+                ep.0,
+                ep.1,
+                inst.get("nfInstanceId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+            );
+            return Some(ep);
+        }
+    }
+    log::warn!(
+        "No discovered AMF declares GUAMI {wanted_guami} in amfInfo.guamiList ({} candidate(s) \
+         examined); refusing to guess which AMF holds the UE context",
+        instances.len()
+    );
+    None
+}
+
+/// GUAMI equality over the TS 29.571 `Guami` JSON shape (plmnId + amfId).
+///
+/// `amfId` is hex, so it is compared case-insensitively — the OpenAPI permits
+/// either case and a peer rendering `CAFE00` names the same AMF as one rendering
+/// `cafe00`. Mirrors `nrfd`'s own `guami_eq` (`nrfd/src/sbi_path.rs:1081`); not
+/// shared with it because the two daemons have no common crate for SBI JSON
+/// predicates and inventing one for a 6-line comparison is the larger change.
+fn guami_json_eq(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    let amf_id = |v: &serde_json::Value| {
+        v.get("amfId")
+            .and_then(|x| x.as_str())
+            .map(str::to_ascii_lowercase)
+    };
+    let plmn = |v: &serde_json::Value, k: &str| {
+        v.get("plmnId")
+            .and_then(|p| p.get(k))
+            .and_then(|x| x.as_str())
+            .map(str::to_string)
+    };
+    // A GUAMI missing its amfId identifies no AMF, so it must not match anything
+    // — including another GUAMI that is also missing it.
+    amf_id(a).is_some()
+        && amf_id(a) == amf_id(b)
+        && plmn(a, "mcc").is_some()
+        && plmn(a, "mcc") == plmn(b, "mcc")
+        && plmn(a, "mnc") == plmn(b, "mnc")
+}
+
+/// The `namf-comm` (host, port) of one discovered NF profile.
+fn namf_comm_endpoint(inst: &serde_json::Value) -> Option<(String, u16)> {
+    let services = inst.get("nfServices")?.as_array()?;
+    let svc = services.iter().find(|s| {
+        s.get("serviceName")
+            .and_then(|v| v.as_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case(service_name::NAMF_COMM))
+    })?;
+    let endpoint = svc.get("ipEndPoints").and_then(|v| v.as_array());
+    let port = endpoint
+        .and_then(|e| e.first())
+        .and_then(|e| e.get("port"))
+        .and_then(|v| v.as_u64())
+        .and_then(|p| u16::try_from(p).ok())
+        .unwrap_or(7777);
+    let host = endpoint
+        .and_then(|e| e.first())
+        .and_then(|e| e.get("ipv4Address"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            inst.get("ipv4Addresses")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            inst.get("fqdn")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })?;
+    Some((host, port))
+}
+
+/// What the old AMF returned for a `UEContextTransfer` (#352).
+///
+/// Only the members this AMF acts on are lifted out; `ue_context` keeps the whole
+/// `UeContext` so nothing received is silently dropped. The PDU-session contexts
+/// are carried but NOT re-established — see the ceiling in
+/// `specs/fix-amfd-inter-amf-context-transfer-consumer.md`.
+#[derive(Debug, Clone)]
+pub struct UeContextTransferResponse {
+    /// The UE's SUPI, which is the point of the whole exchange: the target AMF
+    /// had only a 5G-GUTI (TS 23.502 §4.2.2.2.2 step 5).
+    pub supi: Option<String>,
+    /// PEI, when the source AMF held one.
+    pub pei: Option<String>,
+    /// PDU session IDs the source AMF reported as established.
+    pub pdu_session_ids: Vec<u8>,
+    /// The complete `UeContext` object, for logging and for the members this AMF
+    /// does not yet act on.
+    pub ue_context: serde_json::Value,
+}
+
+/// `Namf_Communication_UEContextTransfer` toward the OLD AMF
+/// (TS 29.518 §5.2.2.2.1, TS 23.502 §4.2.2.2.2 step 4).
+///
+/// `POST {peer}/namf-comm/v1/ue-contexts/{5g-guti-…}/transfer`, where the path
+/// component is the UE's 5G-GUTI: §5.2.2.2.1.1 (`29518-k00.txt:2321`) requires the
+/// resource to be "identified by UE's 5G-GUTI", and the target AMF has no SUPI at
+/// this point in the procedure — obtaining it is what the call is for.
+///
+/// `reason` is `INIT_REG` or `MOBI_REG` per §5.2.2.2.1.1: "the NF Service
+/// Consumer … shall set the reason attribute to "INIT_REG" or "MOBI_REG" and
+/// include the integrity protected registration request message which triggered
+/// the UE context transfer in the content" (`:2334`).
+///
+/// The Registration Request travels as a `multipart/related` binary part whose
+/// `contentId` the JSON root references, which is how TS 29.500 §6.1.2.3 carries
+/// N1 material and what this tree's own producer requires
+/// (`namf_server.rs` `handle_ue_context_transfer` rejects a `MOBI_REG` whose
+/// `regRequest.n1MessageContent.contentId` names no part).
+pub async fn call_amf_ue_context_transfer(
+    peer_host: &str,
+    peer_port: u16,
+    guti: &crate::context::Guti5gs,
+    reason: &str,
+    access_type: &str,
+    registration_request: Option<&[u8]>,
+) -> SbiResult<UeContextTransferResponse> {
+    let ue_context_id = guti.to_context_id();
+    log::info!(
+        "Calling UEContextTransfer on peer AMF {peer_host}:{peer_port} for {ue_context_id} \
+         (reason={reason}, accessType={access_type})"
+    );
+
+    let client = crate::attach_oauth2(
+        SbiClient::for_peer(peer_host, peer_port),
+        nextgcore_sbi::types::NfType::Amf,
+    );
+
+    let mut body = serde_json::json!({
+        "reason": reason,
+        "accessType": access_type,
+    });
+    let mut request = SbiRequest::post(format!(
+        "/namf-comm/v1/ue-contexts/{ue_context_id}/transfer"
+    ));
+    if let Some(nas) = registration_request {
+        const REG_REQUEST_CONTENT_ID: &str = "regRequest";
+        body["regRequest"] = serde_json::json!({
+            "n1MessageContainer": {
+                "n1MessageClass": "5GMM",
+                "n1MessageContent": { "contentId": REG_REQUEST_CONTENT_ID },
+            },
+            "n1MessageContent": { "contentId": REG_REQUEST_CONTENT_ID },
+        });
+        request = request.with_part(nextgcore_sbi::message::SbiPart::with_content(
+            REG_REQUEST_CONTENT_ID,
+            "application/vnd.3gpp.5gnas",
+            bytes::Bytes::copy_from_slice(nas),
+        ));
+    }
+    let request = request
+        .with_json_body(&body)
+        .map_err(|e| SbiError::RequestFailed(format!("UEContextTransfer body: {e}")))?;
+
+    let response = client
+        .send_request(request)
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("UEContextTransfer request failed: {e}")))?;
+
+    if !response.is_success() {
+        // 403 INTEGRITY_CHECK_FAIL is the old AMF's verdict on the Registration
+        // Request MAC (§5.2.2.2.1.1 step 2a) and is NOT second-guessed here: only
+        // the old AMF holds the security context the MAC was computed under.
+        return Err(SbiError::RequestFailed(format!(
+            "peer AMF returned status {} for UEContextTransfer of {ue_context_id}",
+            response.status
+        )));
+    }
+
+    let body: serde_json::Value =
+        serde_json::from_str(response.http.content.as_deref().unwrap_or("")).map_err(|e| {
+            SbiError::ResponseParseError(format!("UEContextTransfer response is not JSON: {e}"))
+        })?;
+    let ue_context = body
+        .get("ueContext")
+        .cloned()
+        // §5.2.2.2.1.1 case b) permits a response carrying ONLY `supi`, so an
+        // absent `ueContext` is a protocol error rather than a thin-but-valid one.
+        .ok_or_else(|| {
+            SbiError::ResponseParseError(
+                "UeContextTransferRspData carries no ueContext".to_string(),
+            )
+        })?;
+
+    let pdu_session_ids = ue_context
+        .get("sessionContextList")
+        .and_then(|v| v.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|s| s.get("pduSessionId").and_then(|v| v.as_u64()))
+                .filter_map(|p| u8::try_from(p).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(UeContextTransferResponse {
+        supi: ue_context
+            .get("supi")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        pei: ue_context
+            .get("pei")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        pdu_session_ids,
+        ue_context,
+    })
+}
+
+/// `Namf_Communication_RegistrationStatusUpdate` toward the OLD AMF
+/// (TS 29.518 §5.2.2.2.2, TS 23.502 §4.2.2.2.2 step 10).
+///
+/// `POST {peer}/namf-comm/v1/ue-contexts/{5g-guti-…}/transfer-update`. This is the
+/// half that makes the transfer a transaction rather than a read: TS 23.502 step 5
+/// has the old AMF "start an implementation specific (guard) timer for the UE
+/// context" (`23502-k20.txt:4039`), so without this call the old AMF holds the
+/// context until that timer expires and never learns whether the UE actually
+/// registered elsewhere.
+///
+/// `transferred` false sends `NOT_TRANSFERRED`, which tells the old AMF to KEEP
+/// the context — the correct outcome when registration at this AMF failed after
+/// the fetch, and the reason this takes a flag rather than always reporting
+/// success.
+pub async fn call_amf_registration_status_update(
+    peer_host: &str,
+    peer_port: u16,
+    guti: &crate::context::Guti5gs,
+    transferred: bool,
+) -> SbiResult<()> {
+    let ue_context_id = guti.to_context_id();
+    let status = if transferred {
+        "TRANSFERRED"
+    } else {
+        "NOT_TRANSFERRED"
+    };
+    log::info!(
+        "Calling RegistrationStatusUpdate on peer AMF {peer_host}:{peer_port} for \
+         {ue_context_id} (transferStatus={status})"
+    );
+
+    let client = crate::attach_oauth2(
+        SbiClient::for_peer(peer_host, peer_port),
+        nextgcore_sbi::types::NfType::Amf,
+    );
+
+    let response = client
+        .post_json(
+            &format!("/namf-comm/v1/ue-contexts/{ue_context_id}/transfer-update"),
+            &serde_json::json!({ "transferStatus": status }),
+        )
+        .await
+        .map_err(|e| {
+            SbiError::RequestFailed(format!("RegistrationStatusUpdate request failed: {e}"))
+        })?;
+
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "peer AMF returned status {} for RegistrationStatusUpdate of {ue_context_id}",
+            response.status
+        )));
+    }
+    Ok(())
+}
+
 /// Base URL (`http://{advertised_sbi_addr}:{port}`) the AMF advertises for its
 /// own SBI server — the same address/port `run()` binds the Namf HTTP/2 server
 /// to and the NRF NFProfile advertises (env `AMF_SBI_ADDR`/`AMF_SBI_PORT`,
@@ -2380,6 +2796,196 @@ mod tests {
             amf_id: guami.amf_id.clone(),
         };
         assert_eq!(guami_json(&three_digit)["plmnId"]["mnc"], "012");
+    }
+
+    // ------------------------------------------------------------------
+    // #352: selecting the PEER AMF that issued a 5G-GUTI
+    // ------------------------------------------------------------------
+
+    /// The GUAMI check that makes peer-AMF selection safe.
+    ///
+    /// This tree's `nrfd` does not implement the TS 29.510 `guami` discovery
+    /// filter — its `DiscoveryQuery` has no such field and `nf_info_for_type`
+    /// inspects only `udmInfo`/`udrInfo`/`ausfInfo` — so a `guami`-parameterised
+    /// query is answered with EVERY registered AMF. `peer_amf_from_nrf` therefore
+    /// re-checks each candidate's `amfInfo.guamiList` with this predicate.
+    ///
+    /// Why that matters more than an ordinary filter: fetching a UE context from
+    /// the WRONG AMF imports another subscriber's MM context under this UE's
+    /// identity. Not transferring at all is strictly safer, so the selection must
+    /// fail closed, which is what the "no match" cases below pin.
+    #[test]
+    fn peer_amf_selection_matches_only_the_guami_that_issued_the_guti() {
+        use crate::context::{AmfId, Guami, PlmnId};
+
+        let wanted = guami_json(&Guami {
+            plmn_id: PlmnId::new("001", "01"),
+            amf_id: AmfId {
+                region: 0x02,
+                set: 1,
+                pointer: 0,
+            },
+        });
+
+        assert!(
+            guami_json_eq(&wanted, &wanted),
+            "a GUAMI must match itself, through the rendering a peer actually registers"
+        );
+        // `amfId` is hex and the OpenAPI permits either case, so a peer rendering
+        // `020040` and one rendering `020040`.to_uppercase() name the SAME AMF.
+        assert!(
+            guami_json_eq(
+                &serde_json::json!({"plmnId": {"mcc": "001", "mnc": "01"}, "amfId": "020040"}),
+                &serde_json::json!({"plmnId": {"mcc": "001", "mnc": "01"}, "amfId": "020040"})
+            ),
+            "and case must not decide identity"
+        );
+        assert!(guami_json_eq(
+            &serde_json::json!({"plmnId": {"mcc": "001", "mnc": "01"}, "amfId": "CAFE00"}),
+            &serde_json::json!({"plmnId": {"mcc": "001", "mnc": "01"}, "amfId": "cafe00"})
+        ));
+
+        // Each field on its own must be able to disqualify a candidate: a single
+        // differing AMF Pointer is a DIFFERENT AMF, and packing it into the low 6
+        // bits of `amfId` is what makes that visible here.
+        for (label, other) in [
+            (
+                "a different AMF Pointer",
+                guami_json(&Guami {
+                    plmn_id: PlmnId::new("001", "01"),
+                    amf_id: AmfId {
+                        region: 0x02,
+                        set: 1,
+                        pointer: 1,
+                    },
+                }),
+            ),
+            (
+                "a different AMF Set",
+                guami_json(&Guami {
+                    plmn_id: PlmnId::new("001", "01"),
+                    amf_id: AmfId {
+                        region: 0x02,
+                        set: 2,
+                        pointer: 0,
+                    },
+                }),
+            ),
+            (
+                "a different AMF Region",
+                guami_json(&Guami {
+                    plmn_id: PlmnId::new("001", "01"),
+                    amf_id: AmfId {
+                        region: 0x03,
+                        set: 1,
+                        pointer: 0,
+                    },
+                }),
+            ),
+            (
+                "a different PLMN",
+                guami_json(&Guami {
+                    plmn_id: PlmnId::new("310", "260"),
+                    amf_id: AmfId {
+                        region: 0x02,
+                        set: 1,
+                        pointer: 0,
+                    },
+                }),
+            ),
+        ] {
+            assert!(
+                !guami_json_eq(&wanted, &other),
+                "{label} is a DIFFERENT AMF and must not be selected: transferring a UE \
+                 context from the wrong AMF imports another subscriber's MM context"
+            );
+        }
+
+        // A candidate declaring no `amfId` identifies no AMF, so it must match
+        // nothing -- including another candidate that also omits it. Without this,
+        // two profiles with no amfInfo would compare equal and the first registered
+        // AMF would answer for every GUAMI, which is the #92 defect exactly.
+        let nameless = serde_json::json!({ "plmnId": { "mcc": "001", "mnc": "01" } });
+        assert!(!guami_json_eq(&nameless, &wanted));
+        assert!(!guami_json_eq(&wanted, &nameless));
+        assert!(
+            !guami_json_eq(&nameless, &nameless),
+            "two GUAMIs that both identify nothing must not be treated as the same AMF"
+        );
+    }
+
+    /// The `namf-comm` endpoint is read out of a discovered profile the way the NRF
+    /// writes it, and a profile that serves no `namf-comm` yields nothing.
+    ///
+    /// The fallback order is asserted because it decides reachability in a real
+    /// deployment: a service-level `ipEndPoints` address is more specific than the
+    /// instance-level `ipv4Addresses`, which is more specific than the FQDN.
+    #[test]
+    fn a_discovered_amf_profile_yields_its_namf_comm_endpoint() {
+        let full = serde_json::json!({
+            "nfInstanceId": "peer-amf",
+            "ipv4Addresses": ["10.0.0.9"],
+            "fqdn": "amf2.example.net",
+            "nfServices": [{
+                "serviceName": "namf-comm",
+                "ipEndPoints": [{ "ipv4Address": "10.0.0.8", "port": 8888 }],
+            }],
+        });
+        assert_eq!(
+            namf_comm_endpoint(&full),
+            Some(("10.0.0.8".to_string(), 8888)),
+            "the service's own endpoint outranks the instance address"
+        );
+
+        // No ipEndPoints: fall back to the instance address, and to the SBI default
+        // port rather than inventing one.
+        let instance_only = serde_json::json!({
+            "ipv4Addresses": ["10.0.0.9"],
+            "nfServices": [{ "serviceName": "namf-comm" }],
+        });
+        assert_eq!(
+            namf_comm_endpoint(&instance_only),
+            Some(("10.0.0.9".to_string(), 7777))
+        );
+
+        // FQDN-only deployments are legal (TS 29.510 NFProfile).
+        let fqdn_only = serde_json::json!({
+            "fqdn": "amf2.example.net",
+            "nfServices": [{ "serviceName": "namf-comm" }],
+        });
+        assert_eq!(
+            namf_comm_endpoint(&fqdn_only),
+            Some(("amf2.example.net".to_string(), 7777))
+        );
+
+        // An AMF that does not serve namf-comm cannot answer a UEContextTransfer, so
+        // it must not be selected as if it could.
+        let wrong_service = serde_json::json!({
+            "ipv4Addresses": ["10.0.0.9"],
+            "nfServices": [{ "serviceName": "namf-evts" }],
+        });
+        assert!(namf_comm_endpoint(&wrong_service).is_none());
+        // Nor may an addressless profile be selected: there would be nowhere to send.
+        let addressless = serde_json::json!({
+            "nfServices": [{ "serviceName": "namf-comm" }],
+        });
+        assert!(namf_comm_endpoint(&addressless).is_none());
+    }
+
+    /// The consumer's `SbiServiceType::NamfComm` resolves to the `namf-comm`
+    /// service name, which is what the NRF discovery query and the peer's own
+    /// registered profile agree on.
+    ///
+    /// Trivial-looking, and it is the whole reason the variant exists: a consumer
+    /// that asked for any other service name would be answered with an empty
+    /// SearchResult and fall silently back to the configured peer.
+    #[test]
+    fn the_peer_amf_service_type_names_namf_comm() {
+        assert_eq!(
+            SbiServiceType::NamfComm.service_name(),
+            "namf-comm",
+            "the service the AMF both serves and consumes (TS 29.518 §6.1)"
+        );
     }
 
     // ------------------------------------------------------------------

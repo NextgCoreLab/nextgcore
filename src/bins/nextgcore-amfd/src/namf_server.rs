@@ -251,13 +251,30 @@ fn context_not_found(ue_context_id: &str) -> SbiResponse {
     )
 }
 
-/// Look up a UE by its ueContextId path component. Supports the SUPI forms
-/// (imsi-..., nai-...) per TS 29.518 §6.1.3.2.2.
+/// Look up a UE by its ueContextId path component.
+///
+/// TS 29.518 Table 6.1.3.2.2-1 (`29518-k00.txt:7675`) permits three forms, and a
+/// `5g-guti-…` is the one an inter-AMF `UEContextTransfer` arrives under: a target
+/// AMF holding only the UE's 5G-GUTI has, by definition, no SUPI to address the
+/// old AMF with. §5.2.2.2.1.1 (`:2321`) is explicit — the consumer "shall retrieve
+/// the UE Context by invoking the "transfer" custom method on the URI of an
+/// "Individual ueContext" resource **identified by UE's 5G-GUTI**".
+///
+/// So before #352 the producer half of UEContextTransfer was unreachable in the
+/// only situation it exists for: every `5g-guti-…` request fell to the `else` and
+/// became `404 CONTEXT_NOT_FOUND`. It was addressable by SUPI, which no real
+/// consumer has at that point in the procedure.
 pub(crate) fn find_ue_by_context_id(ue_context_id: &str) -> Option<AmfUe> {
     let ctx = amf_self();
     let guard = ctx.read().ok()?;
     if ue_context_id.starts_with("imsi-") || ue_context_id.starts_with("nai-") {
         guard.amf_ue_find_by_supi(ue_context_id)
+    } else if let Some(guti) = crate::context::Guti5gs::from_context_id(ue_context_id) {
+        // Resolved against the live store's DERIVED GUTI resolver (#341), so this
+        // sees whatever the NGAP registration path committed as `current_guti`
+        // (`ngap_path.rs` Registration Complete / Configuration Update Complete).
+        // Before #341 this would have read an index no production path wrote.
+        guard.amf_ue_find_by_guti(&guti)
     } else {
         None
     }
@@ -4294,6 +4311,141 @@ mod tests {
             .expect("json");
         let resp = namf_request_handler(req).await;
         assert_eq!(resp.status, 404);
+    }
+
+    /// #352 criterion 5: a `UEContextTransfer` addressed by **5G-GUTI** reaches the
+    /// UE, through the real HTTP router.
+    ///
+    /// This is the shape every conformant consumer uses and the only shape a real
+    /// one *can* use: TS 29.518 §5.2.2.2.1.1 has the target AMF invoke `transfer`
+    /// on the resource "identified by UE's 5G-GUTI", and at that point in TS 23.502
+    /// §4.2.2.2.2 the target AMF has no SUPI — obtaining it is the point of the
+    /// call. Before this, `find_ue_by_context_id` handled `imsi-`/`nai-` only, so
+    /// every such request became `404 CONTEXT_NOT_FOUND` and the producer was
+    /// unreachable in its only real use.
+    ///
+    /// The assertion is POSITIVE and on state reachable only through the GUTI
+    /// lookup: the response body must carry the SUPI this AMF holds for that GUTI.
+    /// A consumer supplies the GUTI and nothing else, so returning the right SUPI
+    /// is only possible if the GUTI resolved to the right UE. An
+    /// `assert_ne!(status, 404)` would also be satisfied by a 400 or a 500.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ue_context_transfer_addressed_by_5g_guti_resolves_the_ue() {
+        // A SUPI and a 5G-TMSI no sibling test uses. The AMF context is
+        // process-global and `amf_context_init` is a one-shot `OnceLock` that never
+        // clears, so a shared SUPI or GUTI would have two tests resolve each
+        // other's UE -- the `test_ue_context_transfer_error_paths` flake class.
+        let supi = "imsi-001010000060352";
+        let mut ue = setup_ue(supi, true, true);
+
+        let guti = crate::context::Guti5gs {
+            plmn_id: crate::context::PlmnId::new("001", "01"),
+            amf_region_id: 0x02,
+            amf_set_id: 0x001,
+            amf_pointer: 0x00,
+            tmsi: 0x0352_0001,
+        };
+        ue.current_guti = guti.clone();
+        {
+            let ctx = amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_update(&ue);
+            // Republish so the LIVE store (#341) carries the GUTI: the derived
+            // resolver reads the store, and `amf_ue_update` alone writes the record
+            // the store already holds without re-keying anything.
+            guard.amf_ue_publish(&ue, 900_352, 1);
+        }
+
+        let ue_context_id = guti.to_context_id();
+        assert!(
+            ue_context_id.starts_with("5g-guti-"),
+            "precondition: the path component is the 5G-GUTI form, got {ue_context_id}"
+        );
+
+        let req = SbiRequest::post(format!(
+            "/namf-comm/v1/ue-contexts/{ue_context_id}/transfer"
+        ))
+        .with_json_body(&json!({ "reason": "INIT_REG", "accessType": "3GPP_ACCESS" }))
+        .expect("json");
+        let resp = namf_request_handler(req).await;
+
+        assert_eq!(
+            resp.status, 200,
+            "a 5g-guti ueContextId must address the UE (TS 29.518 §6.1.3.2.2)"
+        );
+        assert_eq!(
+            body_json(&resp)["ueContext"]["supi"].as_str(),
+            Some(supi),
+            "the transferred context must be the UE holding that GUTI -- this is the \
+             SUPI the consumer called to obtain, and it had only the GUTI to ask with"
+        );
+
+        // A well-formed GUTI that matches no UE is a 404, not a mis-resolve to
+        // whichever UE happens to be first in the store.
+        let unknown = crate::context::Guti5gs {
+            tmsi: 0x0352_9999,
+            ..guti.clone()
+        };
+        let req = SbiRequest::post(format!(
+            "/namf-comm/v1/ue-contexts/{}/transfer",
+            unknown.to_context_id()
+        ))
+        .with_json_body(&json!({ "reason": "INIT_REG", "accessType": "3GPP_ACCESS" }))
+        .expect("json");
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 404);
+        assert_eq!(problem_cause(&resp), "CONTEXT_NOT_FOUND");
+    }
+
+    /// The consumer's `RegistrationStatusUpdate` is also GUTI-addressed, because it
+    /// closes the procedure the GUTI-addressed transfer opened (TS 29.518
+    /// §5.2.2.2.2). Asserted separately from the transfer: the two are different
+    /// router arms, and `transfer-update` working by SUPI proves nothing about the
+    /// path a real consumer takes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_registration_status_update_addressed_by_5g_guti_resolves_the_ue() {
+        // Distinct SUPI and 5G-TMSI from every sibling, for the process-global
+        // reason documented on the transfer test above.
+        let supi = "imsi-001010000060353";
+        let mut ue = setup_ue(supi, true, true);
+        let guti = crate::context::Guti5gs {
+            plmn_id: crate::context::PlmnId::new("001", "01"),
+            amf_region_id: 0x02,
+            amf_set_id: 0x001,
+            amf_pointer: 0x00,
+            tmsi: 0x0353_0001,
+        };
+        ue.current_guti = guti.clone();
+        {
+            let ctx = amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_update(&ue);
+            guard.amf_ue_publish(&ue, 900_353, 1);
+        }
+
+        let req = SbiRequest::post(format!(
+            "/namf-comm/v1/ue-contexts/{}/transfer-update",
+            guti.to_context_id()
+        ))
+        .with_json_body(&json!({ "transferStatus": "TRANSFERRED" }))
+        .expect("json");
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 200);
+
+        // Positive assertion on state only the GUTI lookup could have reached: the
+        // old-AMF-side transfer state is recorded against the UE that holds the
+        // GUTI, keyed here by SUPI so the read does not reuse the write's path.
+        let ctx = amf_self();
+        let stored = ctx
+            .read()
+            .expect("ctx lock")
+            .amf_ue_find_by_supi(supi)
+            .expect("the UE is present");
+        assert_eq!(
+            stored.amf_ue_context_transfer_state,
+            UeContextTransferState::RegistrationStatusUpdateOldAmf,
+            "the GUTI must have resolved to THIS UE for its transfer state to move"
+        );
     }
 
     // ------------------------------------------------------------------
