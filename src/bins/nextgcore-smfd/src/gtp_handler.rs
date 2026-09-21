@@ -1,8 +1,26 @@
 //! GTP-C Message Handling
-
 //!
 //! Port of src/smf/s5c-handler.c - GTP-C message handling for SMF
-//! Handles GTPv2-C (S5/S8) request and response processing
+//! Handles GTPv2-C (S5/S8) request and response processing — the **PGW-C role**. Gn/Gp
+//! GTPv1-C is `gn_handler.rs`, which has no transport.
+//!
+//! # Which session model this is written against (#223)
+//!
+//! `SmfSess`/`SmfUe`/`SmfBearer`, and that is the SMF's session model on **both** accesses,
+//! not an EPC-only parallel one. The recorded decision is in
+//! `specs/decide-smf-session-model-and-wire-the-eps-procedures.md`; in short:
+//!
+//! * `SmfSess` is the indexed session store — by id, N4 SEID, TEID, UE address, APN and PSI.
+//!   A GTPv2-C message carries a TEID and nothing else, so this is the only model a wire
+//!   message can resolve. Produced by `sess_add_by_apn` here (EPS, #52) and by
+//!   `sess_add_by_psi` via `main.rs`'s `register_sm_context` (5GC, #78).
+//! * `context::PolicyBinding` is the 5GC **policy-association** model, keyed by
+//!   `smContextRef`: the PCF `smPolicyId`, the EASDF DNS context, the UDM subscription, the
+//!   `GsmFsm`. None of those legs exists on S5/S8, so nothing here touches it.
+//!
+//! #223 was filed believing this module was dead and `SmfSess` had no producer. That was true
+//! when it was written and is not now: `dispatch_s5s8_request` is called from
+//! `gtp_path::S5S8Server::handle_datagram`, which the receive loop drives.
 
 use crate::context::{SmfBearer, SmfSess, SmfUe};
 use crate::gtp_build::{gtp2_rat_type, BearerQos, FTeid, Gtp2Cause, Paa};
@@ -897,6 +915,11 @@ use nextgcore_gtp::v2::{
     Gtp2AmbrIe, Gtp2ApnIe, Gtp2BearerContextIe, Gtp2FTeidIe, Gtp2IeType, Gtp2Message, Gtp2PaaIe,
 };
 
+/// Extended PCO (TS 29.274 §8.128). Read by numeric type because the shared library's
+/// `Gtp2IeType` does not model it; the alternative was to drop an IE the SGW-C may
+/// legitimately send.
+const EXTENDED_PCO_IE_TYPE: u8 = 197;
+
 /// Decode a Create Session Request off the wire into this module's own struct.
 ///
 /// The IEs are decoded by the shared, round-trip-tested library and mapped onto
@@ -1017,10 +1040,6 @@ fn parse_create_session_request(msg: &Gtp2Message) -> Result<CreateSessionReques
     req.pco = msg
         .get_ie(Gtp2IeType::Pco as u8, 0)
         .map(|ie| ie.value.to_vec());
-    // Extended PCO (TS 29.274 §8.128, IE type 197). Read by numeric type because the
-    // library's `Gtp2IeType` does not model it; the alternative was to drop an IE the
-    // SGW-C may legitimately send.
-    const EXTENDED_PCO_IE_TYPE: u8 = 197;
     req.epco = msg
         .get_ie(EXTENDED_PCO_IE_TYPE, 0)
         .map(|ie| ie.value.to_vec());
@@ -1029,6 +1048,165 @@ fn parse_create_session_request(msg: &Gtp2Message) -> Result<CreateSessionReques
         .map(|ie| ie.value.to_vec());
 
     Ok(req)
+}
+
+/// Decode a Delete Session Request (TS 29.274 §7.2.3).
+///
+/// Every IE in this message is optional or conditional — the request is addressed by the
+/// TEID in the header, which is what identifies the session — so this cannot fail on a
+/// missing IE the way the Create Session parser does.
+fn parse_delete_session_request(msg: &Gtp2Message) -> DeleteSessionRequest {
+    DeleteSessionRequest {
+        // The Linked EPS Bearer ID names the default bearer whose removal takes the whole
+        // PDN connection with it (TS 23.401 §5.4.4.1). Carried in the EBI IE, low nibble.
+        //
+        // **Not independently guarded, and recorded as such rather than claimed.** A revert
+        // pass showed that replacing this with `None` breaks no test: every session this
+        // PGW-C establishes has exactly one bearer, so `record_eps_release`'s fallback to the
+        // stored default bearer arrives at the same identity. The two are distinguishable
+        // only for a multi-bearer PDN connection, which nothing in this tree can create yet —
+        // no dedicated-bearer procedure is originated (see `bearer_resource`). Reading the IE
+        // is still the right behaviour: it is what the SGW-C actually asserts, and the
+        // fallback is a fallback.
+        linked_ebi: msg
+            .get_ie(Gtp2IeType::Ebi as u8, 0)
+            .and_then(|ie| ie.value.first().copied())
+            .map(|v| v & 0x0f),
+        pco: msg
+            .get_ie(Gtp2IeType::Pco as u8, 0)
+            .map(|ie| ie.value.to_vec()),
+        epco: msg
+            .get_ie(EXTENDED_PCO_IE_TYPE, 0)
+            .map(|ie| ie.value.to_vec()),
+        indication: msg
+            .get_ie(Gtp2IeType::Indication as u8, 0)
+            .map(|ie| ie.value.to_vec()),
+    }
+}
+
+/// Decode a Modify Bearer Request (TS 29.274 §7.2.7).
+///
+/// The Sender F-TEID is absent on a plain Modify Bearer and present when the SGW has
+/// relocated, which is precisely how [`handle_modify_bearer_request`] distinguishes the two —
+/// so its absence is normal and not an error.
+fn parse_modify_bearer_request(msg: &Gtp2Message) -> ModifyBearerRequest {
+    let mut req = ModifyBearerRequest {
+        sender_f_teid: msg
+            .get_ie(Gtp2IeType::FTeid as u8, 0)
+            .and_then(|ie| Gtp2FTeidIe::decode(&ie.value).ok())
+            .map(|ft| {
+                FTeid::new_ipv4(
+                    ft.interface_type,
+                    ft.teid,
+                    std::net::Ipv4Addr::from(ft.ipv4_addr.unwrap_or([0, 0, 0, 0])),
+                )
+            }),
+        indication: msg
+            .get_ie(Gtp2IeType::Indication as u8, 0)
+            .map(|ie| ie.value.to_vec()),
+        uli: msg
+            .get_ie(Gtp2IeType::Uli as u8, 0)
+            .map(|ie| ie.value.to_vec()),
+        bearer_contexts: Vec::new(),
+    };
+
+    // Bearer Contexts to be modified. The S1-U/S4-U eNodeB F-TEID sits at instance 1 in this
+    // message (TS 29.274 Table 7.2.7-2), unlike the Create Session Request's instance 2 — the
+    // field name `s4u_sgsn_f_teid` is the pre-existing struct's, and it is the downlink
+    // endpoint the PGW-U forwards to either way.
+    if let Some(bc_ie) = msg.get_ie(Gtp2IeType::BearerContext as u8, 0) {
+        if let Ok(bc) = Gtp2BearerContextIe::decode(&bc_ie.value) {
+            if let Ok(ebi) = bc.ebi() {
+                req.bearer_contexts.push(BearerContextToModify {
+                    ebi,
+                    s4u_sgsn_f_teid: bc
+                        .fteid(1)
+                        .ok()
+                        .flatten()
+                        .or(bc.fteid(0).ok().flatten())
+                        .map(|ft| {
+                            FTeid::new_ipv4(
+                                ft.interface_type,
+                                ft.teid,
+                                std::net::Ipv4Addr::from(ft.ipv4_addr.unwrap_or([0, 0, 0, 0])),
+                            )
+                        }),
+                });
+            }
+        }
+    }
+    req
+}
+
+/// Decode a Bearer Resource Command (TS 29.274 §7.2.5).
+///
+/// The Linked EPS Bearer ID and the PTI are mandatory: the LBI names the PDN connection and
+/// the PTI correlates the answer with the UE's own NAS transaction (TS 23.401 §5.4.5), so a
+/// command missing either cannot be answered usefully and is reported as
+/// `MandatoryIeMissing` rather than defaulted.
+fn parse_bearer_resource_command(msg: &Gtp2Message) -> Result<BearerResourceCommand, Gtp2Cause> {
+    let linked_ebi = msg
+        .get_ie(Gtp2IeType::Ebi as u8, 0)
+        .and_then(|ie| ie.value.first().copied())
+        .map(|v| v & 0x0f)
+        .ok_or(Gtp2Cause::MandatoryIeMissing)?;
+    let pti = msg
+        .get_ie(Gtp2IeType::Pti as u8, 0)
+        .and_then(|ie| ie.value.first().copied())
+        .ok_or(Gtp2Cause::MandatoryIeMissing)?;
+
+    Ok(BearerResourceCommand {
+        linked_ebi,
+        // A second EBI at instance 1 names an existing dedicated bearer to modify; its
+        // absence means the UE is asking for a new one.
+        ebi: msg
+            .get_ie(Gtp2IeType::Ebi as u8, 1)
+            .and_then(|ie| ie.value.first().copied())
+            .map(|v| v & 0x0f),
+        pti,
+        // The Traffic Aggregate Description is carried, NOT decoded. The handler's own
+        // comment says a proper TFT-operation decision "would need to parse TAD", and this
+        // change deliberately does not add that decoder — see the spec's ceilings.
+        tad: msg
+            .get_ie(Gtp2IeType::Tad as u8, 0)
+            .map(|ie| ie.value.to_vec()),
+        flow_qos: msg
+            .get_ie(Gtp2IeType::FlowQos as u8, 0)
+            .and_then(|ie| decode_flow_qos(&ie.value)),
+    })
+}
+
+/// Decode a Flow QoS IE (TS 29.274 §8.16).
+///
+/// Written here rather than reusing `Gtp2BearerQosIe::decode` because **Flow QoS is not
+/// Bearer QoS**: §8.16 is 21 octets — QCI then four 5-octet rates — while §8.15 prefixes an
+/// ARP octet and is 22. Decoding one as the other reads the QCI out of the ARP byte and
+/// shifts every rate by one octet, which yields plausible-looking garbage rather than an
+/// error. The first version of this function did exactly that.
+fn decode_flow_qos(value: &[u8]) -> Option<FlowQos> {
+    if value.len() < 21 {
+        return None;
+    }
+    // A 5-octet big-endian rate in kbps, at `off`.
+    let rate = |off: usize| -> u64 {
+        u64::from_be_bytes([
+            0,
+            0,
+            0,
+            value[off],
+            value[off + 1],
+            value[off + 2],
+            value[off + 3],
+            value[off + 4],
+        ])
+    };
+    Some(FlowQos {
+        qci: value[0],
+        ul_mbr: rate(1),
+        dl_mbr: rate(6),
+        ul_gbr: rate(11),
+        dl_gbr: rate(16),
+    })
 }
 
 /// Route an initial S5/S8 message from the SGW-C.
@@ -1042,6 +1220,19 @@ pub async fn dispatch_s5s8_request(
     match msg_type {
         gtp2_message_type::CREATE_SESSION_REQUEST => {
             create_session(server, sequence_number, raw, peer).await
+        }
+        // #223: the EPS procedures that make the session model's own handlers reachable.
+        // Before this, every one of these fell into the `other` arm below and was answered
+        // `ServiceNotSupported` — so a session this PGW-C had established could never be
+        // torn down or modified by the SGW-C that established it.
+        gtp2_message_type::DELETE_SESSION_REQUEST => {
+            delete_session(server, sequence_number, raw, peer).await
+        }
+        gtp2_message_type::MODIFY_BEARER_REQUEST => {
+            modify_bearer(server, sequence_number, raw, peer).await
+        }
+        gtp2_message_type::BEARER_RESOURCE_COMMAND => {
+            bearer_resource(server, sequence_number, raw, peer).await
         }
         other => {
             // TS 29.274 §7.7: answer with a cause rather than dropping the request, so
@@ -1247,6 +1438,50 @@ async fn create_session(
     // The PGW-U's F-TEID is the uplink endpoint the SGW-U will forward to.
     bearer.pgw_s5u_teid = n4.upf_teid;
     bearer.pgw_s5u_addr = Some(std::net::Ipv4Addr::from(n4.upf_addr));
+    sess.upf_n4_seid = n4.upf_seid;
+
+    // STORE what this exchange settled (#223).
+    //
+    // `sess_add_by_apn` returns a CLONE — `context.rs` inserts into `sess_list` and hands
+    // back a copy — so every field set above (the SGW's control TEID, the PDN address, the
+    // session type, the AMBR) had been landing on a throwaway. The response on the wire was
+    // right and the SMF's own state did not know what it had sent: the stored session carried
+    // no address, no TEID and no bearer at all.
+    //
+    // That is why this is fixed HERE rather than filed: the §7.2.3 Delete Session and §7.2.7
+    // Modify Bearer procedures below find their session by the TEID the SGW-C addresses them
+    // to, and a stored `sgw_s5c_teid` of 0 matches nothing. Without this write-back those
+    // procedures would be reachable and inert — the exact defect #223 exists to stop.
+    //
+    // The bearer is created through `bearer_add` (not a literal) so it gets a context-minted
+    // id and is linked into `sess.bearer_ids`; the locally built `bearer` then carries that id
+    // forward, because `build_create_session_response` and the modification path both read it.
+    if let Ok(ctx) = context.read() {
+        match ctx.bearer_add(sess.id) {
+            Some(stored) => {
+                bearer.id = stored.id;
+                bearer.sess_id = stored.sess_id;
+                bearer.qfi = bc.ebi;
+                ctx.bearer_update(&bearer);
+            }
+            None => {
+                // Not fatal: the session is established and the user plane exists, so refusing
+                // it now would tear down a working session over bookkeeping. What is lost is
+                // the ability to modify this bearer later, which is logged as such.
+                log::error!(
+                    "S5/S8 Create Session Request from {peer}: the bearer table is full, so EBI \
+                     {} is not stored — this session cannot be modified or released by EBI",
+                    bc.ebi
+                );
+            }
+        }
+        // After the bearer, so `sess.bearer_ids` (which `bearer_add` appends to under the
+        // context's own lock) is not overwritten by this session's stale copy of it.
+        if let Some(linked) = ctx.sess_find_by_id(sess.id) {
+            sess.bearer_ids = linked.bearer_ids;
+        }
+        ctx.sess_update(&sess);
+    }
 
     let local_ipv4 = match server.local_addr().ip() {
         std::net::IpAddr::V4(v4) => Some(v4),
@@ -1272,6 +1507,546 @@ async fn create_session(
         n4.upf_teid,
         bearer.ebi
     );
+}
+
+/// Find the session an initial S5/S8 message is addressed to.
+///
+/// GTPv2-C addresses a session by the TEID in the header, which the peer learned from the
+/// F-TEID this node sent in its Create Session Response — and that F-TEID carries
+/// `sess.smf_n4_teid`, which `sess_add_by_*` sets equal to the N4 SEID. So the lookup is by
+/// SEID, via `sess_find_by_teid`.
+///
+/// The TEID is `Option` because TS 29.274 §5.5.1 makes it absent on the path-management
+/// messages (Echo, Version Not Supported). A session procedure that arrives without one is
+/// malformed and names no session, so `None` propagates rather than being defaulted to 0.
+///
+/// **What that guard is and is not worth.** It is defence in depth, not a live fix: SEID 0 is
+/// never handed out, because `context.rs`'s `n4_seid_generator` starts at 1, so today a
+/// defaulted 0 would fail to match anyway. It is written this way because the safety of
+/// `unwrap_or(0)` rests on that initial value, and a generator that ever started at 0 would
+/// silently turn a malformed request into a teardown of an unrelated subscriber. Stated
+/// rather than tested: a test would have to reach into a private field to occupy SEID 0, and
+/// asserting on a state the allocator cannot produce would be asserting on the test's own
+/// fixture.
+///
+/// `None` means this PGW-C holds no such session: TS 29.274 §7.7's `ContextNotFound` is the
+/// answer, not a drop.
+fn session_for_teid(teid: Option<u32>) -> Option<crate::context::SmfSess> {
+    let teid = teid?;
+    crate::context::smf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| ctx.sess_find_by_teid(teid))
+}
+
+/// The header TEID rendered for a log line, without inventing a value for its absence.
+fn teid_label(teid: Option<u32>) -> String {
+    match teid {
+        Some(t) => format!("{t:#x}"),
+        None => "absent".to_string(),
+    }
+}
+
+/// Answer a triggered message with a cause, echoing the request's sequence number.
+async fn reject(
+    server: &crate::gtp_path::S5S8Server,
+    response_type: u8,
+    teid: u32,
+    sequence_number: u32,
+    peer: std::net::SocketAddr,
+    cause: Gtp2Cause,
+) {
+    let response = crate::gtp_build::build_error_message(response_type, teid, cause);
+    let response = with_sequence_number(response, sequence_number);
+    server.send_response_public(peer, &response).await;
+}
+
+/// Run the 5GSM release handler over an EPS session and persist what it recorded (#223).
+///
+/// **This is the live caller `gsm_handler::handle_pdu_session_release_request` did not have.**
+/// It validates the session identity and sets `ngap_state = DeleteTriggerUeRequested` — the
+/// SMF's own note that a peer asked for this session to go — and the result is written back
+/// with `sess_update`, so the mutation lands on the stored session rather than a temporary.
+/// `sess` is left carrying it too, so the caller sees the same state the store does.
+///
+/// **Why the PSI is substituted.** `psi` is 0 on an EPS session (`sess_add_by_apn` sets the
+/// APN, not a PSI) and the handler rejects `psi == 0` — correctly, because a 5GSM procedure
+/// needs one. The EPS identity of a PDN connection is its default bearer, so the Linked EPS
+/// Bearer ID stands in: TS 23.401 §5.4.4.1 makes the LBI the thing that names the PDN
+/// connection, exactly as the PSI names the PDU session. Taken from the request when present,
+/// falling back to the stored default bearer's EBI, so a request omitting the optional IE
+/// still releases. Restored afterwards: the substitution is an argument to the handler, not a
+/// change to the session's identity.
+///
+/// Returns whether the release was recorded. A separate function from [`delete_session`]
+/// because that one answers the SGW-C and removes the session in the same breath — within one
+/// scheduler tick of this call — so a test cannot observe this mutation through the socket. It
+/// can observe it here.
+fn record_eps_release(sess: &mut SmfSess, req: &DeleteSessionRequest) -> bool {
+    let release_identity = req.linked_ebi.filter(|&ebi| ebi != 0).or_else(|| {
+        crate::context::smf_self().read().ok().and_then(|ctx| {
+            sess.bearer_ids
+                .first()
+                .and_then(|&id| ctx.bearer_find_by_id(id))
+                .map(|b| b.ebi)
+        })
+    });
+    let Some(identity) = release_identity.filter(|&i| i != 0) else {
+        log::warn!(
+            "S5/S8 Delete Session for session {}: neither the request nor the stored bearers \
+             name an EPS Bearer Identity, so the 5GSM release is not recorded; the teardown \
+             proceeds",
+            sess.id
+        );
+        return false;
+    };
+
+    let restore_psi = sess.psi;
+    sess.psi = identity;
+    let release_req = crate::gsm_handler::PduSessionReleaseRequest {
+        // The GTPv2 cause is not a 5GSM cause, so none is mapped: the handler only logs it,
+        // and inventing a 5GSM value for an EPS teardown would be a fiction.
+        gsm_cause: None,
+        epco: req.epco.clone(),
+        presencemask: 0,
+    };
+    let outcome = crate::gsm_handler::handle_pdu_session_release_request(sess, &release_req);
+    sess.psi = restore_psi;
+
+    match outcome {
+        Ok(()) => {
+            // Persisted BEFORE the N4 delete, so the recorded release survives a UPF that
+            // never answers.
+            if let Ok(ctx) = crate::context::smf_self().read() {
+                ctx.sess_update(sess);
+            }
+            true
+        }
+        Err(cause) => {
+            // Not fatal to the teardown. A session the SGW-C has asked to delete is going
+            // away whatever the 5GSM validation thinks of its identity; refusing here would
+            // strand it at both ends.
+            log::warn!(
+                "S5/S8 Delete Session for session {}: the 5GSM release handler refused identity \
+                 {identity} ({cause:?}); tearing the session down anyway",
+                sess.id
+            );
+            false
+        }
+    }
+}
+
+/// Terminate a Delete Session Request: tear the PDN connection down and answer (#223).
+///
+/// TS 29.274 §7.2.3 / TS 23.401 §5.4.4.1. Removing the default bearer removes the whole PDN
+/// connection, which is why this deletes the session rather than one bearer.
+///
+/// **This is the live caller criterion 2 asks for.** Two handlers run, and the order is the
+/// point: `handle_delete_session_request` is the GTPv2 guard (it refuses when the policy
+/// source or, for WLAN, the S6b peer is absent), and
+/// `gsm_handler::handle_pdu_session_release_request` is the **session-model** handler that
+/// records the release on the session itself. The latter had no production caller at all
+/// before this.
+///
+/// The mutation is observable because the session is re-read from the context, mutated, and
+/// `sess_update`d — not built, handed over and dropped, which is the defect #223 was filed
+/// about.
+async fn delete_session(
+    server: &crate::gtp_path::S5S8Server,
+    sequence_number: u32,
+    raw: &[u8],
+    peer: std::net::SocketAddr,
+) {
+    let mut bytes = bytes::Bytes::copy_from_slice(raw);
+    let msg = match Gtp2Message::decode(&mut bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            log::error!("S5/S8 Delete Session Request from {peer} undecodable: {e}");
+            return;
+        }
+    };
+    let teid = msg.header.teid;
+    let teid_str = teid_label(teid);
+    let req = parse_delete_session_request(&msg);
+
+    let Some(mut sess) = session_for_teid(teid) else {
+        log::warn!(
+            "S5/S8 Delete Session Request from {peer} for TEID {teid_str}: no such session at this \
+             PGW-C"
+        );
+        reject(
+            server,
+            gtp2_message_type::DELETE_SESSION_RESPONSE,
+            0,
+            sequence_number,
+            peer,
+            Gtp2Cause::ContextNotFound,
+        )
+        .await;
+        return;
+    };
+
+    // `has_policy_source` / `has_s6b_peer` are both true for the same reason
+    // `create_session` passes them: this deployment's policy source is the config default
+    // (the 5G path's own fallback when no PCF is configured), and TS 23.401 does not require
+    // a PCRF for a PGW to serve a session. Passing `false` would make this endpoint refuse
+    // every teardown and leak the session forever, which is strictly worse than serving it.
+    if let DeleteSessionResult::Rejected(cause) =
+        handle_delete_session_request(&sess, &req, true, true)
+    {
+        log::warn!("S5/S8 Delete Session Request from {peer} rejected: {cause:?}");
+        reject(
+            server,
+            gtp2_message_type::DELETE_SESSION_RESPONSE,
+            sess.sgw_s5c_teid,
+            sequence_number,
+            peer,
+            cause,
+        )
+        .await;
+        return;
+    }
+
+    // Record the release on the session the context holds.
+    record_eps_release(&mut sess, &req);
+
+    // The user plane. Best-effort for the same reason the 5GC release path is: a UPF that
+    // does not answer must not stop the SMF answering the SGW-C, or the SGW-C retransmits
+    // into a session that is already half gone.
+    if let Err(e) = crate::pfcp_session_delete(sess.smf_n4_seid, sess.upf_n4_seid).await {
+        log::warn!("S5/S8 Delete Session for TEID {teid_str}: the PGW-U teardown failed ({e})");
+    }
+
+    let sgw_teid = sess.sgw_s5c_teid;
+    // `sess_remove` releases the UE address back into the pool and drops the bearers.
+    if let Ok(ctx) = crate::context::smf_self().read() {
+        ctx.sess_remove(sess.id);
+    }
+
+    let response = crate::gtp_build::build_delete_session_response(
+        sgw_teid,
+        req.pco.as_deref(),
+        req.epco.as_deref(),
+    );
+    let response = with_sequence_number(response, sequence_number);
+    server.send_response_public(peer, &response).await;
+    log::info!(
+        "S5/S8 Delete Session Response to {peer}: session {} released",
+        sess.id
+    );
+}
+
+/// Terminate a Modify Bearer Request: re-point the downlink and answer (#223).
+///
+/// TS 29.274 §7.2.7. The SGW sends this after a handover or an idle-to-active transition, and
+/// the F-TEID it carries is the new downlink endpoint the PGW-U must forward to.
+///
+/// **The second live caller criterion 2 asks for.** `handle_modify_bearer_request` decides
+/// what changed, and `gsm_handler::handle_pdu_session_modification_request` — the other
+/// function the criterion names — records the modification on the session. Both write back.
+async fn modify_bearer(
+    server: &crate::gtp_path::S5S8Server,
+    sequence_number: u32,
+    raw: &[u8],
+    peer: std::net::SocketAddr,
+) {
+    let mut bytes = bytes::Bytes::copy_from_slice(raw);
+    let msg = match Gtp2Message::decode(&mut bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            log::error!("S5/S8 Modify Bearer Request from {peer} undecodable: {e}");
+            return;
+        }
+    };
+    let teid = msg.header.teid;
+    let teid_str = teid_label(teid);
+    let req = parse_modify_bearer_request(&msg);
+
+    let Some(mut sess) = session_for_teid(teid) else {
+        log::warn!(
+            "S5/S8 Modify Bearer Request from {peer} for TEID {teid_str}: no such session at this \
+             PGW-C"
+        );
+        reject(
+            server,
+            gtp2_message_type::MODIFY_BEARER_RESPONSE,
+            0,
+            sequence_number,
+            peer,
+            Gtp2Cause::ContextNotFound,
+        )
+        .await;
+        return;
+    };
+
+    // The session's stored bearers, by value: the handlers take `&mut [SmfBearer]` and the
+    // context hands out clones, so these are written back explicitly below.
+    let mut bearers: Vec<crate::context::SmfBearer> = match crate::context::smf_self().read() {
+        Ok(ctx) => sess
+            .bearer_ids
+            .iter()
+            .filter_map(|&id| ctx.bearer_find_by_id(id))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    if bearers.is_empty() {
+        log::warn!(
+            "S5/S8 Modify Bearer Request for TEID {teid_str}: the session holds no bearer to \
+             modify"
+        );
+        reject(
+            server,
+            gtp2_message_type::MODIFY_BEARER_RESPONSE,
+            sess.sgw_s5c_teid,
+            sequence_number,
+            peer,
+            Gtp2Cause::ContextNotFound,
+        )
+        .await;
+        return;
+    }
+
+    let result = handle_modify_bearer_request(&mut sess, &mut bearers, &req);
+    let sgw_relocation = match result {
+        ModifyBearerResult::Rejected(cause) => {
+            log::warn!("S5/S8 Modify Bearer Request from {peer} rejected: {cause:?}");
+            reject(
+                server,
+                gtp2_message_type::MODIFY_BEARER_RESPONSE,
+                sess.sgw_s5c_teid,
+                sequence_number,
+                peer,
+                cause,
+            )
+            .await;
+            return;
+        }
+        ModifyBearerResult::NoModification { sgw_relocation } => sgw_relocation,
+        ModifyBearerResult::ModificationNeeded {
+            bearers_to_modify,
+            end_marker,
+            sgw_relocation,
+        } => {
+            log::info!(
+                "S5/S8 Modify Bearer for TEID {teid_str}: {} bearer(s) to modify, end_marker={}",
+                bearers_to_modify.len(),
+                end_marker
+            );
+
+            // The 5GSM modification handler, over the SAME bearer array the GTPv2 handler
+            // just updated, so its decisions land on the bearers that are written back.
+            //
+            // The request is synthesised from the accepted bearer QoS rather than from a NAS
+            // container, because an EPS Modify Bearer carries no 5GSM message — a QoS flow
+            // description per modified bearer, which is what the handler consumes, and which
+            // is the honest translation of "these bearers changed". The handler requires
+            // exactly one entry in `qos_flow_to_modify_list` (TS 24.501 runs one procedure at
+            // a time), so it is driven for the bearer the SGW actually re-pointed.
+            let modification_scope: Vec<crate::gsm_handler::ParsedQosFlowDescription> = bearers
+                .iter()
+                .filter(|b| bearers_to_modify.contains(&b.id))
+                .take(1)
+                .map(|b| crate::gsm_handler::ParsedQosFlowDescription {
+                    identifier: b.qfi,
+                    code: crate::gsm_build::qos_flow_description_code::MODIFY_NEW_QOS_FLOW_DESCRIPTION,
+                    e_bit: true,
+                    params: vec![crate::gsm_handler::QosFlowParam {
+                        identifier: crate::gsm_handler::qos_flow_param_id::FIVE_QI,
+                        five_qi: b.qos.index,
+                        bitrate: 0,
+                    }],
+                })
+                .collect();
+            if !modification_scope.is_empty() {
+                let mod_req = crate::gsm_handler::PduSessionModificationRequest {
+                    gsm_cause: None,
+                    qos_rules: Vec::new(),
+                    qos_flow_descriptions: modification_scope,
+                    presencemask: 0,
+                };
+                match crate::gsm_handler::handle_pdu_session_modification_request(
+                    &mut sess,
+                    &mod_req,
+                    &mut bearers,
+                ) {
+                    Ok(flags) => log::debug!(
+                        "S5/S8 Modify Bearer for TEID {teid_str}: 5GSM modification recorded, \
+                         PFCP flags {flags:#x}, {} flow(s) pending",
+                        sess.qos_flow_to_modify_list.len()
+                    ),
+                    Err(cause) => log::warn!(
+                        "S5/S8 Modify Bearer for TEID {teid_str}: the 5GSM modification handler \
+                         refused the synthesised scope ({cause:?}); the GTPv2 endpoint update \
+                         still stands"
+                    ),
+                }
+            }
+
+            // Re-point the PGW-U's downlink FAR at the endpoint the SGW just gave.
+            if let Some(bearer) = bearers.iter().find(|b| bearers_to_modify.contains(&b.id)) {
+                if let (teid_dl, Some(addr)) = (bearer.sgw_s5u_teid, bearer.sgw_s5u_ip.ipv4) {
+                    if let Err(e) = crate::pfcp_session_modify(
+                        sess.smf_n4_seid,
+                        sess.upf_n4_seid,
+                        teid_dl,
+                        addr.octets(),
+                    )
+                    .await
+                    {
+                        // Answered anyway: the SGW-C's alternative is T3 expiry and a
+                        // retransmission into the same failure.
+                        log::error!(
+                            "S5/S8 Modify Bearer for TEID {teid_str}: the PGW-U downlink was not \
+                             re-pointed ({e}); answering so the SGW-C is not left on T3"
+                        );
+                    }
+                }
+            }
+            sgw_relocation
+        }
+    };
+
+    // Write back what the handlers changed: the session's SGW control TEID and modification
+    // list, and each bearer's downlink endpoint.
+    if let Ok(ctx) = crate::context::smf_self().read() {
+        ctx.sess_update(&sess);
+        for bearer in &bearers {
+            ctx.bearer_update(bearer);
+        }
+    }
+
+    let response =
+        crate::gtp_build::build_modify_bearer_response(&sess, &bearers, None, sgw_relocation);
+    let response = with_sequence_number(response, sequence_number);
+    server.send_response_public(peer, &response).await;
+    log::info!(
+        "S5/S8 Modify Bearer Response to {peer} for session {} (sgw_relocation={sgw_relocation})",
+        sess.id
+    );
+}
+
+/// Terminate a Bearer Resource Command: the UE-requested bearer resource modification (#223).
+///
+/// TS 29.274 §7.2.5 / TS 23.401 §5.4.5. The UE asks, via the MME and SGW, for a TFT or QoS
+/// change on a bearer; the PGW decides and would normally answer by *initiating* an Update or
+/// Create Bearer Request under the command's PTI.
+///
+/// **What this does and does not do.** The command is parsed, the bearer is found, the
+/// decision is taken by `handle_bearer_resource_command` and written back to the stored
+/// bearer, and a refusal is answered with a Bearer Resource Failure Indication. It does
+/// **not** initiate the follow-on Update Bearer Request: that is a PGW-initiated transaction
+/// with its own T3/N3 budget and a Create/Update Bearer Response to correlate, and
+/// `dispatch_s5s8_response` currently only logs. Accepting the command and silently running
+/// no procedure would be the "correct but inert" shape this issue is about, so the accepted
+/// case logs the decision it reached and says it is not yet transmitted.
+async fn bearer_resource(
+    server: &crate::gtp_path::S5S8Server,
+    sequence_number: u32,
+    raw: &[u8],
+    peer: std::net::SocketAddr,
+) {
+    let mut bytes = bytes::Bytes::copy_from_slice(raw);
+    let msg = match Gtp2Message::decode(&mut bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            log::error!("S5/S8 Bearer Resource Command from {peer} undecodable: {e}");
+            return;
+        }
+    };
+    let teid = msg.header.teid;
+    let teid_str = teid_label(teid);
+
+    let cmd = match parse_bearer_resource_command(&msg) {
+        Ok(cmd) => cmd,
+        Err(cause) => {
+            log::warn!("S5/S8 Bearer Resource Command from {peer} rejected: {cause:?}");
+            reject(
+                server,
+                gtp2_message_type::BEARER_RESOURCE_FAILURE_INDICATION,
+                0,
+                sequence_number,
+                peer,
+                cause,
+            )
+            .await;
+            return;
+        }
+    };
+
+    let Some(sess) = session_for_teid(teid) else {
+        log::warn!(
+            "S5/S8 Bearer Resource Command from {peer} for TEID {teid_str}: no such session at \
+             this PGW-C"
+        );
+        reject(
+            server,
+            gtp2_message_type::BEARER_RESOURCE_FAILURE_INDICATION,
+            0,
+            sequence_number,
+            peer,
+            Gtp2Cause::ContextNotFound,
+        )
+        .await;
+        return;
+    };
+
+    // The bearer the command names: the dedicated one when an EBI at instance 1 is present,
+    // the PDN connection's default bearer otherwise (TS 23.401 §5.4.5).
+    let target_ebi = cmd.ebi.filter(|&e| e != 0).unwrap_or(cmd.linked_ebi);
+    let Some(mut bearer) = crate::context::smf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| ctx.bearer_find_by_ebi(sess.id, target_ebi))
+    else {
+        log::warn!(
+            "S5/S8 Bearer Resource Command for TEID {teid_str}: the session holds no bearer with \
+             EBI {target_ebi}"
+        );
+        reject(
+            server,
+            gtp2_message_type::BEARER_RESOURCE_FAILURE_INDICATION,
+            sess.sgw_s5c_teid,
+            sequence_number,
+            peer,
+            Gtp2Cause::ContextNotFound,
+        )
+        .await;
+        return;
+    };
+
+    // `has_packet_filters` is taken from the presence of a Flow QoS IE, NOT from decoded
+    // TAD contents: the handler's own comment records that distinguishing the TFT operations
+    // properly needs a TAD decoder, and this change deliberately adds none. So a command
+    // carrying only a TAD is treated as a TFT delete, which is what the handler's
+    // `!has_packet_filters && tft_update` branch means.
+    let has_packet_filters = cmd.flow_qos.is_some();
+    match handle_bearer_resource_command(&sess, &mut bearer, &cmd, has_packet_filters) {
+        BearerResourceResult::Rejected(cause) => {
+            log::warn!("S5/S8 Bearer Resource Command from {peer} rejected: {cause:?}");
+            reject(
+                server,
+                gtp2_message_type::BEARER_RESOURCE_FAILURE_INDICATION,
+                sess.sgw_s5c_teid,
+                sequence_number,
+                peer,
+                cause,
+            )
+            .await;
+        }
+        accepted => {
+            // The handler updated the bearer's QoS from the Flow QoS IE; persist it, so the
+            // decision is observable rather than applied to a temporary.
+            if let Ok(ctx) = crate::context::smf_self().read() {
+                ctx.bearer_update(&bearer);
+            }
+            log::info!(
+                "S5/S8 Bearer Resource Command for TEID {teid_str}, EBI {target_ebi}, PTI {}: \
+                 decided {accepted:?}. The bearer's authorized QoS is updated; the follow-on \
+                 PGW-initiated Update Bearer Request is NOT transmitted (see #223).",
+                cmd.pti
+            );
+        }
+    }
 }
 
 /// Release the allocated address and answer with a cause.
@@ -1458,6 +2233,547 @@ mod tests {
             "TS 29.274 Table 7.2.2-1 makes APN-Restriction present for E-UTRAN"
         );
         server.close();
+    }
+
+    // ================================================================
+    // #223: the EPS procedures, and the session model they act on
+    // ================================================================
+
+    /// Establish a session over the real wire and return `(server, sgw_socket, session)`.
+    ///
+    /// Shared by the #223 tests because all three procedures below act on a session that a
+    /// Create Session Request established — which is the point: an EPS teardown or
+    /// modification is only meaningful against a session this PGW-C actually holds.
+    ///
+    /// The caller MUST already hold `PROCESS_STATE_TEST_LOCK` and a stand-in UPF.
+    async fn establish_over_the_wire(
+        restart_counter: u8,
+        imsi_last_octet: u8,
+        sgw_c_teid: u32,
+    ) -> (
+        std::sync::Arc<crate::gtp_path::S5S8Server>,
+        tokio::net::UdpSocket,
+        crate::context::SmfSess,
+    ) {
+        crate::context::smf_context_init(64, 256, 512);
+        let server =
+            crate::gtp_path::S5S8Server::open("127.0.0.1:0".parse().unwrap(), restart_counter)
+                .await
+                .expect("bind");
+        let sgw = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind sgw");
+
+        let mut csr = s5c_csr(0x21, sgw_c_teid, [10, 99, 99, 99]);
+        // A distinct IMSI per test: the session store is process-global, and two tests
+        // sharing an IMSI would share a UE and each other's session list. `s5c_csr`'s IMSI
+        // ends `...01`, so the last octet is overwritten. The value must stay distinct from
+        // every other #223 test's and from `s5c_csr`'s own default.
+        let imsi_pos = csr
+            .windows(8)
+            .position(|w| w == [0x09, 0x91, 0x07, 0x00, 0x00, 0x00, 0x00, 0x01])
+            .expect("the fixture's IMSI is in the encoded request");
+        csr[imsi_pos + 7] = imsi_last_octet;
+
+        sgw.send_to(&csr, server.local_addr())
+            .await
+            .expect("send csr");
+        let mut buf = vec![0u8; 4096];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), sgw.recv_from(&mut buf))
+                .await
+                .expect("the PGW-C must answer the establishment")
+                .expect("recv");
+        let mut bytes = bytes::Bytes::copy_from_slice(&buf[..len]);
+        let resp = nextgcore_gtp::v2::Gtp2Message::decode(&mut bytes).expect("decode");
+        assert_eq!(
+            resp.get_ie(Gtp2IeType::Cause as u8, 0)
+                .and_then(|ie| ie.value.first().copied()),
+            Some(16),
+            "the fixture depends on the establishment being accepted"
+        );
+
+        // The session as the CONTEXT holds it, found the way the wire finds it: by the TEID
+        // this node advertised in the response's F-TEID.
+        let advertised = resp
+            .get_ie(Gtp2IeType::FTeid as u8, 0)
+            .and_then(|ie| nextgcore_gtp::v2::Gtp2FTeidIe::decode(&ie.value).ok())
+            .expect("the response carries the PGW's control F-TEID")
+            .teid;
+        let sess = session_for_teid(Some(advertised))
+            .expect("the established session must be findable by the TEID it advertised");
+        (server, sgw, sess)
+    }
+
+    /// #223: a Create Session Request STORES what it settled.
+    ///
+    /// This is the defect found while verifying #223 and not named in the issue.
+    /// `sess_add_by_apn` returns a clone, and `create_session` mutated that clone —
+    /// so the address, the SGW TEID, the AMBR and the bearer never reached the context.
+    ///
+    /// Asserted by reading the session back OUT of the context, positively, field by field:
+    /// a test that only checked the response would have passed throughout the defect, which
+    /// is exactly how it survived #52.
+    #[tokio::test]
+    async fn an_established_eps_session_is_stored_with_its_address_teid_and_bearer() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _upf = crate::pfcp_path::stand_in::associated_upf().await;
+        // IMSI ...0x31 and SGW TEID 0x3100_0001 are this test's alone — see the fixture.
+        let (server, _sgw, sess) = establish_over_the_wire(3, 0x31, 0x3100_0001).await;
+
+        assert_eq!(
+            sess.sgw_s5c_teid, 0x3100_0001,
+            "the stored session must carry the SGW's control TEID, or no later Delete Session \
+             or Modify Bearer can be addressed to it"
+        );
+        let addr = sess
+            .ipv4_addr
+            .expect("the stored session must carry the PDN address this node allocated");
+        assert_eq!(addr.octets()[0], 10, "and it comes from this node's pool");
+        assert_eq!(
+            sess.session_type,
+            crate::context::PduSessionType::Ipv4,
+            "the session type this PGW-C actually serves"
+        );
+        assert!(sess.epc, "sess_add_by_apn marks the EPS entry");
+
+        // The bearer, which the modification and release paths look up by EBI.
+        let ctx = crate::context::smf_self();
+        let guard = ctx.read().expect("context");
+        let bearer = guard
+            .bearer_find_by_ebi(sess.id, 5)
+            .expect("the accepted bearer context must be stored against the session");
+        assert_eq!(
+            bearer.pgw_s5u_teid, _upf.upf_teid,
+            "the stored bearer must carry the PGW-U F-TEID the UPF allocated"
+        );
+        assert!(
+            sess.bearer_ids.contains(&bearer.id),
+            "and the session must link it, so the Modify Bearer path can enumerate it"
+        );
+        drop(guard);
+        server.close();
+    }
+
+    /// #223 criterion 2, the release half: `gsm_handler::handle_pdu_session_release_request`
+    /// runs over a session the CONTEXT holds, and its mutation is observable there.
+    ///
+    /// The assertion is POSITIVE and on state only this path produces: `ngap_state ==
+    /// DeleteTriggerUeRequested`, read back from the store by id. Asserting the absence of an
+    /// error, or the arrival of a Delete Session Response, would both be satisfied by a
+    /// version that never called the handler — which is the whole complaint of #223.
+    ///
+    /// Driven through `record_eps_release` rather than through the socket **because** the
+    /// full procedure answers the SGW-C and calls `sess_remove` within one scheduler tick of
+    /// the handler returning: an earlier version of this test polled the store from a spawned
+    /// task and lost the race every time. `a_delete_session_request_tears_the_pdn_connection_down`
+    /// below covers the wire half. The session here is a real one, established over the wire,
+    /// so this is not a synthesised fixture.
+    #[tokio::test]
+    async fn a_delete_session_request_records_the_release_on_the_stored_session() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _upf = crate::pfcp_path::stand_in::associated_upf().await;
+        // IMSI ...0x35, SGW TEID 0x3500_0005: distinct from every other #223 test's.
+        let (server, _sgw, mut sess) = establish_over_the_wire(8, 0x35, 0x3500_0005).await;
+
+        assert_ne!(
+            sess.ngap_state,
+            crate::context::NgapState::DeleteTriggerUeRequested,
+            "the fixture must start in a state the handler has to change, or this proves nothing"
+        );
+
+        let req = DeleteSessionRequest {
+            linked_ebi: Some(5),
+            ..Default::default()
+        };
+        assert!(
+            record_eps_release(&mut sess, &req),
+            "the 5GSM release handler must accept the default bearer as the session identity"
+        );
+
+        let stored = crate::context::smf_self()
+            .read()
+            .ok()
+            .and_then(|c| c.sess_find_by_id(sess.id))
+            .expect("the session is still held: the release is recorded before teardown");
+        assert_eq!(
+            stored.ngap_state,
+            crate::context::NgapState::DeleteTriggerUeRequested,
+            "handle_pdu_session_release_request's ONLY effect must reach the session the \
+             CONTEXT holds — if this fails the handler was not called, or was called on a copy \
+             nobody stored, which is the defect #223 was filed about"
+        );
+        assert_eq!(
+            stored.psi, 0,
+            "the EBI substituted for the PSI is an argument to the handler, not a change to \
+             the session's identity"
+        );
+        server.close();
+    }
+
+    /// #223: the release is recorded even when the request omits the Linked EPS Bearer ID.
+    ///
+    /// The LBI is optional in a Delete Session Request (TS 29.274 §7.2.3 Table 7.2.3-1), so
+    /// the session identity falls back to the stored default bearer's EBI. That matters
+    /// because `handle_pdu_session_release_request` refuses identity 0, and an EPS session's
+    /// `psi` IS 0 — so without the fallback a request with no LBI would be torn down with the
+    /// release never recorded.
+    ///
+    /// Added after a revert pass showed the request-side parse and this fallback each covered
+    /// for the other: removing either alone broke no test, because the sibling test above
+    /// supplies an LBI and this path had none. Two halves, two tests.
+    #[tokio::test]
+    async fn a_delete_session_request_with_no_linked_ebi_still_records_the_release() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _upf = crate::pfcp_path::stand_in::associated_upf().await;
+        // IMSI ...0x37, SGW TEID 0x3700_0007: distinct from every other #223 test's.
+        let (server, _sgw, mut sess) = establish_over_the_wire(11, 0x37, 0x3700_0007).await;
+
+        // The distinguishing input: NO Linked EPS Bearer ID.
+        let req = DeleteSessionRequest::default();
+        assert_eq!(
+            req.linked_ebi, None,
+            "this test is about the LBI being absent"
+        );
+        assert!(
+            record_eps_release(&mut sess, &req),
+            "with no LBI the identity must fall back to the stored default bearer's EBI — \
+             without it the 5GSM handler refuses psi 0 and the release goes unrecorded"
+        );
+
+        let stored = crate::context::smf_self()
+            .read()
+            .ok()
+            .and_then(|c| c.sess_find_by_id(sess.id))
+            .expect("the session is still held");
+        assert_eq!(
+            stored.ngap_state,
+            crate::context::NgapState::DeleteTriggerUeRequested,
+            "and the release reaches the STORED session, not a copy"
+        );
+        server.close();
+    }
+
+    /// #223 criterion 2, the wire half: a Delete Session Request is answered and the PDN
+    /// connection is gone (TS 29.274 §7.2.3, TS 23.401 §5.4.4.1).
+    ///
+    /// Before #223 this message fell into the `ServiceNotSupported` arm, so a session this
+    /// PGW-C had established could never be torn down by the SGW-C that established it.
+    #[tokio::test]
+    async fn a_delete_session_request_tears_the_pdn_connection_down() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _upf = crate::pfcp_path::stand_in::associated_upf().await;
+        // IMSI ...0x32, SGW TEID 0x3200_0002: distinct from every other #223 test's.
+        let (server, sgw, sess) = establish_over_the_wire(4, 0x32, 0x3200_0002).await;
+        let established_id = sess.id;
+
+        let dsr = {
+            use nextgcore_gtp::v2::{Gtp2Header, Gtp2Message};
+            let mut msg = Gtp2Message::new(Gtp2Header::new(
+                gtp2_message_type::DELETE_SESSION_REQUEST,
+                // Addressed to the TEID this node advertised, which is how a real SGW-C
+                // addresses it.
+                sess.smf_n4_teid,
+                0x22,
+            ));
+            // Linked EPS Bearer ID: the default bearer, whose removal takes the PDN
+            // connection (TS 29.274 §7.2.3).
+            msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
+                Gtp2IeType::Ebi as u8,
+                0,
+                &[5],
+            ));
+            msg.encode()
+        };
+        sgw.send_to(&dsr, server.local_addr()).await.expect("send");
+
+        let mut buf = vec![0u8; 4096];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), sgw.recv_from(&mut buf))
+                .await
+                .expect("the PGW-C must answer a Delete Session Request")
+                .expect("recv");
+        let mut bytes = bytes::Bytes::copy_from_slice(&buf[..len]);
+        let resp = nextgcore_gtp::v2::Gtp2Message::decode(&mut bytes).expect("decode");
+
+        assert_eq!(
+            resp.header.message_type,
+            gtp2_message_type::DELETE_SESSION_RESPONSE,
+            "not Service not supported, which is what this answered before #223"
+        );
+        assert_eq!(
+            resp.header.sequence_number, 0x22,
+            "a triggered message echoes the request's sequence number"
+        );
+        assert_eq!(
+            resp.get_ie(Gtp2IeType::Cause as u8, 0)
+                .and_then(|ie| ie.value.first().copied()),
+            Some(16),
+            "Request accepted (TS 29.274 §8.4)"
+        );
+
+        assert!(
+            crate::context::smf_self()
+                .read()
+                .ok()
+                .and_then(|c| c.sess_find_by_id(established_id))
+                .is_none(),
+            "the PDN connection must be gone once the response is out: TS 23.401 §5.4.4.1 \
+             makes removing the default bearer remove the whole connection"
+        );
+        server.close();
+    }
+
+    /// #223 criterion 2, the modification half: a Modify Bearer Request reaches
+    /// `gsm_handler::handle_pdu_session_modification_request`, and both handlers' mutations
+    /// are observable on the stored session and bearer.
+    ///
+    /// Positive assertions on state only this path can produce: the bearer's downlink
+    /// endpoint becomes the one the SGW just sent, and `qos_flow_to_modify_list` carries the
+    /// flow the 5GSM handler selected. The latter is the mutation criterion 2 names — it is
+    /// `handle_pdu_session_modification_request`'s entire effect, and nothing else in this
+    /// daemon writes it.
+    #[tokio::test]
+    async fn a_modify_bearer_request_repoints_the_bearer_and_records_the_modification() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _upf = crate::pfcp_path::stand_in::associated_upf().await;
+        // IMSI ...0x33, SGW TEID 0x3300_0003: distinct from every other #223 test's.
+        let (server, sgw, sess) = establish_over_the_wire(5, 0x33, 0x3300_0003).await;
+
+        // The endpoint the SGW relocates to. Deliberately different from the establishment's
+        // `0x0505_0505` / 127.0.0.1, so "re-pointed" is distinguishable from "unchanged".
+        const RELOCATED_TEID: u32 = 0x3300_5555;
+        const RELOCATED_ADDR: [u8; 4] = [127, 0, 0, 2];
+
+        let mbr = {
+            use nextgcore_gtp::v2::{Gtp2BearerContextIe, Gtp2FTeidIe, Gtp2Header, Gtp2Message};
+            let mut msg = Gtp2Message::new(Gtp2Header::new(
+                gtp2_message_type::MODIFY_BEARER_REQUEST,
+                sess.smf_n4_teid,
+                0x23,
+            ));
+            let mut bc = Gtp2BearerContextIe::new();
+            bc.set_ebi(5);
+            // Instance 1: the S1-U/S4-U downlink endpoint in a Modify Bearer Request
+            // (TS 29.274 Table 7.2.7-2).
+            bc.set_fteid(1, &Gtp2FTeidIe::new_ipv4(4, RELOCATED_TEID, RELOCATED_ADDR));
+            msg.add_bearer_context(0, &bc);
+            msg.encode()
+        };
+        sgw.send_to(&mbr, server.local_addr()).await.expect("send");
+
+        let mut buf = vec![0u8; 4096];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), sgw.recv_from(&mut buf))
+                .await
+                .expect("the PGW-C must answer a Modify Bearer Request")
+                .expect("recv");
+        let mut bytes = bytes::Bytes::copy_from_slice(&buf[..len]);
+        let resp = nextgcore_gtp::v2::Gtp2Message::decode(&mut bytes).expect("decode");
+        assert_eq!(
+            resp.header.message_type,
+            gtp2_message_type::MODIFY_BEARER_RESPONSE,
+            "not Service not supported, which is what this answered before #223"
+        );
+        assert_eq!(resp.header.sequence_number, 0x23);
+        assert_eq!(
+            resp.get_ie(Gtp2IeType::Cause as u8, 0)
+                .and_then(|ie| ie.value.first().copied()),
+            Some(16),
+        );
+
+        let ctx = crate::context::smf_self();
+        let guard = ctx.read().expect("context");
+        let bearer = guard
+            .bearer_find_by_ebi(sess.id, 5)
+            .expect("the bearer survives a modification");
+        assert_eq!(
+            bearer.sgw_s5u_teid, RELOCATED_TEID,
+            "handle_modify_bearer_request's endpoint update must reach the STORED bearer"
+        );
+        assert_eq!(
+            bearer.sgw_s5u_ip.ipv4,
+            Some(std::net::Ipv4Addr::from(RELOCATED_ADDR)),
+            "and so must the address"
+        );
+
+        let stored = guard
+            .sess_find_by_id(sess.id)
+            .expect("the session survives a modification");
+        assert_eq!(
+            stored.qos_flow_to_modify_list,
+            vec![bearer.id],
+            "handle_pdu_session_modification_request's ONLY effect is this list; if it is \
+             empty the 5GSM handler was not reached, and if it landed on a temporary the \
+             context would not show it"
+        );
+        drop(guard);
+        server.close();
+    }
+
+    /// #223: a Bearer Resource Command is routed, and the authorized QoS it grants reaches
+    /// the stored bearer (TS 29.274 §7.2.5, TS 23.401 §5.4.5).
+    ///
+    /// The positive assertion is the bearer's MBR read back from the context — a value only
+    /// `handle_bearer_resource_command` writes, from the Flow QoS IE. The command is NOT
+    /// answered with a message on the accept path (the follow-on Update Bearer Request is not
+    /// transmitted; see the function's doc comment and the spec's ceilings), so asserting on
+    /// a response would be asserting on something this change deliberately does not do.
+    #[tokio::test]
+    async fn a_bearer_resource_command_updates_the_stored_bearers_authorized_qos() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _upf = crate::pfcp_path::stand_in::associated_upf().await;
+        // IMSI ...0x34, SGW TEID 0x3400_0004: distinct from every other #223 test's.
+        let (server, sgw, sess) = establish_over_the_wire(6, 0x34, 0x3400_0004).await;
+
+        // The establishment's Bearer QoS carried all-zero rates, so a non-zero MBR here can
+        // only have come from this command.
+        const GRANTED_UL_MBR: u64 = 3_000;
+        const GRANTED_DL_MBR: u64 = 7_000;
+
+        let brc = {
+            use nextgcore_gtp::v2::{Gtp2Header, Gtp2Message};
+            let mut msg = Gtp2Message::new(Gtp2Header::new(
+                gtp2_message_type::BEARER_RESOURCE_COMMAND,
+                sess.smf_n4_teid,
+                0x24,
+            ));
+            // Linked EPS Bearer ID and PTI are mandatory (TS 23.401 §5.4.5).
+            msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
+                Gtp2IeType::Ebi as u8,
+                0,
+                &[5],
+            ));
+            msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
+                Gtp2IeType::Pti as u8,
+                0,
+                &[9],
+            ));
+            // Traffic Aggregate Description. Carried, not decoded — see `decode_flow_qos`'s
+            // caller and the spec's ceilings.
+            msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
+                Gtp2IeType::Tad as u8,
+                0,
+                &[0x21, 0x01, 0x01],
+            ));
+            // Flow QoS (§8.16): QCI then four 5-octet rates, and NO ARP octet — which is what
+            // makes it a different IE from Bearer QoS (§8.15).
+            let mut flow_qos = vec![9u8];
+            for rate in [GRANTED_UL_MBR, GRANTED_DL_MBR, 0u64, 0u64] {
+                flow_qos.extend_from_slice(&rate.to_be_bytes()[3..8]);
+            }
+            msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
+                Gtp2IeType::FlowQos as u8,
+                0,
+                &flow_qos,
+            ));
+            msg.encode()
+        };
+        sgw.send_to(&brc, server.local_addr()).await.expect("send");
+
+        // The command is handled without a reply on the accept path, so the observable is the
+        // stored bearer rather than a datagram.
+        let mut granted = None;
+        for _ in 0..600 {
+            let found = crate::context::smf_self()
+                .read()
+                .ok()
+                .and_then(|c| c.bearer_find_by_ebi(sess.id, 5))
+                .filter(|b| b.qos.mbr_uplink == GRANTED_UL_MBR);
+            if let Some(b) = found {
+                granted = Some(b);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let granted = granted.expect(
+            "handle_bearer_resource_command must write the granted Flow QoS to the STORED \
+             bearer — before #223 this command was answered Service not supported and no \
+             handler ran at all",
+        );
+        assert_eq!(
+            granted.qos.mbr_downlink, GRANTED_DL_MBR,
+            "the downlink rate must be the one the command granted, not the uplink one — \
+             which is what decoding Flow QoS as Bearer QoS would produce"
+        );
+        server.close();
+    }
+
+    /// #223: a session procedure for a TEID this PGW-C does not hold is answered with a
+    /// cause, not dropped and not acted on.
+    ///
+    /// TS 29.274 §7.7. Asserted because the alternative — silence — leaves the SGW-C to
+    /// expire T3 three times over a session that will never exist, and because `Option<u32>`
+    /// TEID handling defaulted to 0 would otherwise match whichever session holds SEID 0.
+    #[tokio::test]
+    async fn a_delete_session_for_an_unknown_teid_is_answered_with_context_not_found() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        crate::context::smf_context_init(64, 256, 512);
+        let server = crate::gtp_path::S5S8Server::open("127.0.0.1:0".parse().unwrap(), 7)
+            .await
+            .expect("bind");
+        let sgw = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind sgw");
+
+        let dsr = {
+            use nextgcore_gtp::v2::{Gtp2Header, Gtp2Message};
+            // 0xDEAD_BEEF is no session's SEID in a context that was just initialised.
+            Gtp2Message::new(Gtp2Header::new(
+                gtp2_message_type::DELETE_SESSION_REQUEST,
+                0xDEAD_BEEF,
+                0x25,
+            ))
+            .encode()
+        };
+        sgw.send_to(&dsr, server.local_addr()).await.expect("send");
+
+        let mut buf = vec![0u8; 4096];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), sgw.recv_from(&mut buf))
+                .await
+                .expect("an unknown TEID must still be ANSWERED")
+                .expect("recv");
+        let mut bytes = bytes::Bytes::copy_from_slice(&buf[..len]);
+        let resp = nextgcore_gtp::v2::Gtp2Message::decode(&mut bytes).expect("decode");
+        assert_eq!(
+            resp.header.message_type,
+            gtp2_message_type::DELETE_SESSION_RESPONSE
+        );
+        assert_eq!(resp.header.sequence_number, 0x25);
+        assert_eq!(
+            resp.get_ie(Gtp2IeType::Cause as u8, 0)
+                .and_then(|ie| ie.value.first().copied()),
+            Some(Gtp2Cause::ContextNotFound as u8),
+            "TS 29.274 §7.7: Context not found, so the SGW-C stops rather than retrying"
+        );
+        server.close();
+    }
+
+    /// Flow QoS (§8.16) is not Bearer QoS (§8.15): 21 octets, no ARP.
+    ///
+    /// A unit guard on the decoder because the shared library models only Bearer QoS, and
+    /// the first version of `decode_flow_qos` reused `Gtp2BearerQosIe::decode` — which reads
+    /// the QCI out of the ARP octet and shifts every rate by one, producing plausible
+    /// garbage rather than an error. This pins the octet layout directly.
+    #[test]
+    fn flow_qos_decodes_without_an_arp_octet() {
+        let mut value = vec![7u8]; // QCI at octet 1, NOT an ARP byte
+        for rate in [1_000u64, 2_000, 3_000, 4_000] {
+            value.extend_from_slice(&rate.to_be_bytes()[3..8]);
+        }
+        assert_eq!(value.len(), 21, "TS 29.274 §8.16 is 21 octets");
+        let qos = decode_flow_qos(&value).expect("a 21-octet Flow QoS decodes");
+        assert_eq!(qos.qci, 7, "the QCI is the FIRST octet");
+        assert_eq!(qos.ul_mbr, 1_000);
+        assert_eq!(qos.dl_mbr, 2_000);
+        assert_eq!(qos.ul_gbr, 3_000);
+        assert_eq!(qos.dl_gbr, 4_000);
+
+        assert!(
+            decode_flow_qos(&value[..20]).is_none(),
+            "a truncated IE must be reported as absent rather than decoded from short data"
+        );
     }
 
     /// An Echo Request is answered with this node's Recovery (#52 criterion 3).

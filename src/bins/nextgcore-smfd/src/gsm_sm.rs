@@ -438,9 +438,22 @@ impl GsmFsm {
     fn handle_s5c_operational(&mut self, event: &SmfEvent) -> GsmFsmResult {
         if let Some(ref gtp) = event.gtp {
             log::debug!("S5-C message in operational: xact_id={:?}", gtp.gtp_xact_id);
-            // Note: Message type parsed from GTP header via gtp_handler
-            // Delete Session Request -> transition to WaitPfcpDeletion
-            // Delete Bearer Response -> check bearer state, release if last bearer
+            // #223: the parse half of the old comment was right, the consequence was not.
+            //
+            // It read "Message type parsed from GTP header via gtp_handler / Delete Session
+            // Request -> transition to WaitPfcpDeletion". `gtp_handler` does parse the type,
+            // but that transition never happens here, because this function is only
+            // reachable from `SmfEvent::s5c_message` and nothing constructs that event.
+            //
+            // Where an S5/S8 Delete Session Request is actually served:
+            // `gtp_handler::delete_session`, dispatched from the socket by
+            // `gtp_path::S5S8Server::handle_datagram`. It runs the §7.2.3 teardown inline —
+            // the 5GSM release handler, then the N4 Session Deletion, then `sess_remove` —
+            // rather than parking the session in a wait state, because the PGW-C must answer
+            // the SGW-C within T3 and has nothing else to wait for.
+            //
+            // Delete Bearer Response is a triggered message for a PGW-initiated procedure
+            // this daemon does not yet originate; `dispatch_s5s8_response` logs it.
         }
         GsmFsmResult::Handled
     }
