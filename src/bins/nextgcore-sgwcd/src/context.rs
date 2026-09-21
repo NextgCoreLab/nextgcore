@@ -461,6 +461,11 @@ pub struct SgwcContext {
     pgw_s5c_peer: RwLock<Option<std::net::SocketAddr>>,
     /// Advertised SGW-U GTP-U IPv4 address (user-plane endpoints)
     gtpu_addr: RwLock<Option<Ipv4Addr>>,
+    /// The address this SGW-C advertises as its PFCP Node ID on Sxa (#387), from
+    /// `sgwc.pfcp.server[0].address`.
+    pfcp_node_ip: RwLock<Option<Ipv4Addr>>,
+    /// The SGW-U peers from `sgwc.pfcp.client.sgwu` (#387), in file order.
+    sgwu_peers: RwLock<Vec<std::net::SocketAddr>>,
 
     // Pool limits
     /// Maximum number of UEs
@@ -500,6 +505,8 @@ impl SgwcContext {
             s5c_addr: RwLock::new(None),
             pgw_s5c_peer: RwLock::new(None),
             gtpu_addr: RwLock::new(None),
+            pfcp_node_ip: RwLock::new(None),
+            sgwu_peers: RwLock::new(Vec::new()),
             max_num_of_ue: 0,
             max_num_of_sess: 0,
             max_num_of_bearer: 0,
@@ -638,6 +645,43 @@ impl SgwcContext {
     /// Advertised SGW-U GTP-U address
     pub fn gtpu_address(&self) -> Option<Ipv4Addr> {
         self.gtpu_addr.read().ok().and_then(|a| *a)
+    }
+
+    /// Set the PFCP Node ID this SGW-C advertises on Sxa (#387).
+    pub fn set_pfcp_node_ip(&self, addr: Option<Ipv4Addr>) {
+        if let Ok(mut a) = self.pfcp_node_ip.write() {
+            *a = addr;
+        }
+    }
+
+    /// The PFCP Node ID this SGW-C advertises on Sxa, if configured.
+    ///
+    /// `None` means no `sgwc.pfcp.server` address was read, and `pfcp_open` then falls
+    /// back to loopback — which is what every deployment had before #387, and what made
+    /// the SGW-C advertise `127.0.0.1` as the association identifier a remote SGW-U is
+    /// required to store (TS 29.244 §6.2.6.2.2).
+    pub fn pfcp_node_ip(&self) -> Option<Ipv4Addr> {
+        self.pfcp_node_ip.read().ok().and_then(|a| *a)
+    }
+
+    /// Set the SGW-U peers read from `sgwc.pfcp.client.sgwu` (#387).
+    pub fn set_sgwu_peers(&self, peers: Vec<std::net::SocketAddr>) {
+        if let Ok(mut p) = self.sgwu_peers.write() {
+            *p = peers;
+        }
+    }
+
+    /// The SGW-U this SGW-C provisions user planes on, or `None` when none is configured.
+    ///
+    /// TS 29.244 §6.2.6.2.1 has the CP function retrieve an IP address **of the UP
+    /// function** before it can establish a first PFCP session there. Before #387 nothing
+    /// read the configured address at all, so `pfcp_path::configured_sgwu_addr` fell back
+    /// to `127.0.0.1` and the SGW-C sent its Association Setup to its own socket.
+    ///
+    /// Only the first configured peer is returned; see `config::SgwcConfig::sgwu_peer` for
+    /// why associating with all of them would advertise a capability this SGW-C lacks.
+    pub fn sgwu_peer(&self) -> Option<std::net::SocketAddr> {
+        self.sgwu_peers.read().ok().and_then(|p| p.first().copied())
     }
 
     // ========================================================================
@@ -1154,9 +1198,12 @@ pub fn sgwc_self() -> Arc<SgwcContext> {
 /// own. It guards, together:
 ///
 /// - the **scalar address slots** on [`SGWC_CONTEXT`] — `s11_addr`, `gtpu_addr`,
-///   `s5c_addr` and `pgw_s5c_peer`. Unlike the UE/session/bearer maps (which tests
-///   keep apart with unique IMSIs) these hold exactly one value for the whole
-///   process, so whoever wrote one last owns every sibling's answer;
+///   `s5c_addr`, `pgw_s5c_peer`, and (since #387) `pfcp_node_ip` and `sgwu_peers`.
+///   Unlike the UE/session/bearer maps (which tests keep apart with unique IMSIs)
+///   these hold exactly one value for the whole process, so whoever wrote one last
+///   owns every sibling's answer. `sgwu_peers` is read by EVERY Sxa send — the
+///   startup association and `pfcp_path::enqueue` alike — so a test that sets it is
+///   choosing the destination of any concurrent test's PFCP request;
 /// - [`crate::pfcp_path::SXA_NODE`] and its outbound queue, installed and
 ///   uninstalled together by the Sxa tests;
 /// - [`crate::gtp_path::S11_SERVER`], installed by the same tests for the same
