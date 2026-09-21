@@ -308,6 +308,65 @@ grep. Second, it is precisely the defect class the issue is about: the code was
 correct, every in-process test passed, and the *deployment artefact* was wrong.
 Only the dispatched run could see it, and the PR gate would have reported green.
 
+## The second dispatched run went green — and the green was PARTLY VACUOUS
+
+Run
+[35660647077](https://github.com/NextgCoreLab/nextgcore/actions/runs/35660647077):
+**all seven jobs green**, `Docker E2E` included. The Dockerfile fix worked —
+**9 public JWKs published**, 11 containers healthy, and the NRF again logged client
+authentication REQUIRED.
+
+Then the log was read rather than trusted, and one of the three overlay assertions
+turned out to prove nothing:
+
+```
+grep -c 'OAuth2 Access Token Request'  ->  0
+```
+
+The step said *"if any `invalid_client` appears, fail"*, found none, and passed —
+because during a bring-up-only run **no NF ever requested a token**. The assertion
+was satisfied by the path never being taken. This is precisely the "a negative
+assertion is satisfied by every path that never arrives" trap, and it survived a
+*green* heavy CI run. Had the log not been read, criterion 2 would have been
+reported as observed on the strength of a check that could not fail.
+
+Replaced with a **positive** assertion: `cca_token_probe`
+(`src/libs/nextgcore-sbi/examples/cca_token_probe.rs`), run inside the AMF and NRF
+containers — the only places that can reach both the private key (on a volume
+deliberately not shared with the host) and the NRF on the core network. It mints a
+CCA with the same `mint_cca` the NFs use, requires a **200 with a JWS-shaped
+token**, and then presents a CCA signed by an **untrusted** key and requires
+`invalid_client` — so a pass cannot come from an NRF that authenticates nobody.
+
+### Validated against a real NRF locally, before trusting it in CI
+
+Rather than discover a flaw in the probe during a 30-minute container run, it was
+driven against a real `nextgcore-nrfd` on a socket:
+
+```
+PASS positive: the NRF issued a token to 6b1d7e3c-...-000000000af0
+               against a signature-verified CCA (scope "nudm-sdm")
+PASS negative: an untrusted CCA key is refused invalid_client
+PROBE EXIT=0
+```
+
+and corroborated from the NRF's own side:
+
+```
+nrfd-187: picked up the CCA trusted key for nfInstanceId 6b1d7e3c-...-000000000af0
+          from .../6b1d7e3c-...-000000000af0.jwk (published after this NRF started)
+OAuth2 Access Token Request
+Issued access token for 6b1d7e3c-...-000000000af0 (AMF) -> UDM scope=nudm-sdm
+```
+
+That is criteria 2, 3 and the late-publish directory lookup all confirmed over a
+real socket, independently of Docker.
+
+The local run also **corrected the probe's own error message**: a first attempt
+failed with "is not registered with this NRF" while the probe blamed the trust
+store, which would have sent a reader to the wrong place. It now branches on the
+NRF's wording and names the actual cause — registry vs trust store vs stale key.
+
 ## Observation ceiling (criterion 2)
 
 `Docker Build`, `Docker E2E` and `EPC bring-up` are gated

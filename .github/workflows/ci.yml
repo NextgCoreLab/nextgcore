@@ -320,18 +320,52 @@ jobs:
             exit 1
           fi
 
-      - name: Assert the authenticated token exchange succeeded
+      # POSITIVE assertion, and it has to be positive. The first version of this
+      # step grepped the logs for `invalid_client` and passed when it found none —
+      # which a dispatched run proved VACUOUS: the log contained zero token
+      # requests, because a bring-up-only run gives the NFs no reason to need a
+      # token. A negative assertion is satisfied by every path that never arrives.
+      #
+      # So drive the live token endpoint over the wire with a CCA signed by a key
+      # the NRF actually holds (from the shared trust-store directory), and require
+      # a real token back. The probe ALSO presents a CCA signed by an untrusted key
+      # and requires `invalid_client`, so a pass cannot come from an NRF that
+      # authenticates nobody — the posture #187 removed.
+      #
+      # Run inside the AMF container: it is the only place that can reach both the
+      # private key (on the `cca_keys` volume, deliberately not shared with the
+      # host) and the NRF on the core network.
+      - name: Assert the authenticated token exchange succeeded (positive + negative)
         run: |
           cd nextgcore/docker/rust
           C="-f docker-compose.yml -f docker-compose.oauth2.yml"
-          # While require_client_auth is on, a signature-verified CCA is the only
-          # way a consumer obtains a token — so an invalid_client anywhere means
-          # the authenticated path is NOT working end to end.
-          if docker compose $C logs | grep -F 'invalid_client'; then
-            echo "::error::a consumer was refused invalid_client -- the authenticated path is not working"
-            exit 1
-          fi
           docker compose $C ps
+          # The probe is extracted from the builder image into binaries/ alongside
+          # the NF binaries (see Dockerfile.builder).
+          test -f binaries/cca_token_probe \
+            || { echo "::error::binaries/cca_token_probe missing -- the builder did not produce it"; exit 1; }
+          docker cp binaries/cca_token_probe nextgcore-amf:/tmp/cca_token_probe
+          docker compose $C exec -T --user root amf chmod 0755 /tmp/cca_token_probe
+          docker compose $C exec -T amf /tmp/cca_token_probe \
+            http://172.23.0.10:7777 \
+            /var/lib/nextgcore/cca/amf-cca.key \
+            6b1d7e3c-0000-4000-8000-000000000af0 \
+            AMF UDM nudm-sdm
+
+      - name: Assert the NRF authenticates to ITSELF under its own policy
+        run: |
+          cd nextgcore/docker/rust
+          C="-f docker-compose.yml -f docker-compose.oauth2.yml"
+          # Criterion 5: with oauth2.require: true the NRF requests tokens from its
+          # own endpoint for outbound notifications and is not exempt from its own
+          # policy. It needs its own CCA key AND a registration in its own registry.
+          docker cp binaries/cca_token_probe nextgcore-nrf:/tmp/cca_token_probe
+          docker compose $C exec -T --user root nrf chmod 0755 /tmp/cca_token_probe
+          docker compose $C exec -T nrf /tmp/cca_token_probe \
+            http://172.23.0.10:7777 \
+            /var/lib/nextgcore/cca/nrf-cca.key \
+            6b1d7e3c-0000-4000-8000-0000000000f0 \
+            NRF UDM nudm-sdm
 
       - name: Collect overlay logs on failure
         if: failure()
