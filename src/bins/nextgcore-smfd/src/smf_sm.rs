@@ -117,13 +117,25 @@ impl SmfFsm {
                 gtp.gnode_id,
                 gtp.gtp_xact_id
             );
-            // Note: GTPv2 message parsing and dispatch handled by gtp_handler module
-            // Message types routed to GSM FSM via event queue:
-            // - Create Session Request/Response -> gsm_sm for session setup
-            // - Delete Session Request/Response -> gsm_sm for session teardown
-            // - Modify Bearer Request/Response -> gsm_sm for bearer modification
-            // - Create/Update/Delete Bearer Response -> gsm_sm for bearer operations
-            // - Bearer Resource Command -> gsm_sm for resource allocation
+            // #223: this arm is VESTIGIAL, and the comment that used to sit here said the
+            // opposite.
+            //
+            // It read "GTPv2 message parsing and dispatch handled by gtp_handler module",
+            // then claimed each message type was "routed to GSM FSM via event queue".
+            // Neither half describes the tree. The live S5/S8 path does not pass through
+            // this FSM at all: `gtp_path::S5S8Server::handle_datagram` decodes the datagram
+            // off the socket and calls `gtp_handler::dispatch_s5s8_request` directly,
+            // because answering a Create Session Request must await an N4 exchange and this
+            // FSM is synchronous. There is no event-queue hop to the GSM FSM for any GTPv2
+            // message.
+            //
+            // And nothing can reach here: `SmfEvent::s5c_message`, the only constructor of
+            // the event this function handles, has no caller in the crate. So the dead code
+            // was this function, not `gtp_handler` — which is the opposite of what #223's
+            // own investigation concluded from these three comments.
+            //
+            // Kept because the event id is part of the ported FSM's shape. A reader looking
+            // for the GTPv2 dispatch wants `gtp_path.rs` and `gtp_handler.rs`.
         }
         SmfFsmResult::Handled
     }
@@ -136,11 +148,21 @@ impl SmfFsm {
                 gtp.gnode_id,
                 gtp.gtp_xact_id
             );
-            // Note: GTPv1 message parsing and dispatch handled by gtp_handler module
-            // Message types routed to GSM FSM via event queue:
-            // - Create PDP Context Request/Response -> gsm_sm for PDP context setup
-            // - Delete PDP Context Request/Response -> gsm_sm for PDP context teardown
-            // - Update PDP Context Request/Response -> gsm_sm for PDP context modification
+            // #223: the comment here named the WRONG MODULE, and the right one is dead.
+            //
+            // It read "GTPv1 message parsing and dispatch handled by gtp_handler module".
+            // `gtp_handler.rs` is GTPv2-only — it imports `nextgcore_gtp::v2` and every
+            // message type it knows is a GTPv2-C one. Gn/Gp GTPv1-C is `gn_handler.rs` and
+            // `gn_build.rs`.
+            //
+            // And unlike the GTPv2 case, which #52 made live, Gn genuinely has no dispatch:
+            // grep for `gn_handler` or `gn_build` outside those two files finds only their
+            // `mod` declarations in `main.rs`. No socket in this daemon binds GTPv1-C
+            // (`gtp_path.rs` binds S5/S8 GTPv2-C only), so no Create/Delete/Update PDP
+            // Context message can arrive, and `SmfEvent::gn_message` has no caller either.
+            //
+            // Recorded rather than fixed: binding a Gn interface is a separate interface with
+            // its own transport, not a comment fix.
         }
         SmfFsmResult::Handled
     }
