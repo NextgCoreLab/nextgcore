@@ -2392,6 +2392,33 @@ impl NgapServer {
                 // Inserted BEFORE the `?` on the send, so a failed Identity Request leaves the
                 // recorded registration behind rather than discarding it (the #359 lesson).
                 self.ue_auth_state.insert(amf_ue_ngap_id, state);
+
+                // #352: decide what this 5G-GUTI actually is before asking for a SUCI.
+                //
+                // Until now this arm asked UNCONDITIONALLY -- "Registration with unknown
+                // 5G-GUTI: requesting SUCI" was logged for every GUTI, including one this
+                // very AMF had issued minutes earlier. TS 23.502 §4.2.2.2.2 skips the
+                // identification entirely in that case, and steps 4-5 exist for the other
+                // case, so a single unconditional branch could serve neither.
+                //
+                // A GUTI mapped from EPS is excluded: it is a 4G identity in 5G clothing
+                // (TS 23.003 §2.10.2.2.2) and matching it against this AMF's GUAMIs or
+                // against a peer AMF would resolve a native context that never existed.
+                // Its handling is the N26 leg (#62), above.
+                if !guti_mapped_from_eps
+                    && self
+                        .resolve_registration_by_guti(amf_ue_ngap_id, nas, req.registration_type)
+                        .await
+                {
+                    // Identified: either locally or from a context fetched from the old
+                    // AMF. No Identity Request, no T3570 -- the SUPI is already known,
+                    // so authentication proceeds straight away (TS 23.502 §4.2.2.2.2
+                    // step 9 follows step 5 directly).
+                    self.start_authentication(association_id, amf_ue_ngap_id, ran_ue_ngap_id, None)
+                        .await?;
+                    return Ok(());
+                }
+
                 // GUTI unknown to this AMF instance: identify the UE by SUCI
                 // (TS 24.501 Section 5.4.3) and arm T3570
                 log::info!("Registration with unknown 5G-GUTI: requesting SUCI");
@@ -2421,6 +2448,346 @@ impl NgapServer {
         }
 
         Ok(())
+    }
+
+    /// Identify a UE that presented a 5G-GUTI, locally or from the AMF that issued
+    /// it (#352; TS 23.502 §4.2.2.2.2 steps 4-5, TS 29.518 §5.2.2.2.1).
+    ///
+    /// Returns `true` when the UE has been identified — its SUPI is on the record
+    /// in the store — and `false` when the caller must fall back to requesting a
+    /// SUCI.
+    ///
+    /// **Identification only: the caller authenticates.** Keeping the AUSF call out
+    /// of here is what makes the identification observable on its own, in a test
+    /// with no AUSF and in a log when authentication later fails. The alternative —
+    /// ending this function with `start_authentication` — folded "did the GUTI
+    /// resolve?" into "did 5G-AKA succeed?", and `start_authentication`'s
+    /// AUSF-failure arm releases the UE, so the resolved state was gone by the time
+    /// anything could look at it.
+    ///
+    /// # The three cases, and why one branch could not serve them
+    ///
+    /// A 5G-GUTI carries the identity of the AMF that allocated it — TS 23.003
+    /// §2.10 makes `<5G-GUTI> = <GUAMI><5G-TMSI>` — so "whose GUTI is this?" is
+    /// answerable locally, with no round trip, and the answer decides everything:
+    ///
+    /// 1. **Mine, and I still hold the context.** The UE is already identified;
+    ///    TS 23.502 §4.2.2.2.2 skips the identification. This is the ordinary
+    ///    mobility/periodic update, and asking such a UE for its SUCI — which is
+    ///    what happened before this — both wastes a round trip and defeats the
+    ///    purpose of the GUTI, whose whole job per TS 23.501 §5.9.4 is to avoid
+    ///    sending a permanent identity over the air.
+    /// 2. **Mine, but the context is gone** (this AMF restarted). Nothing to
+    ///    resolve and no peer to ask, so the SUCI request is correct — it was
+    ///    simply being applied to all three cases.
+    /// 3. **Another AMF's.** Fetch the context from it (steps 4-5). Only here does
+    ///    a network round trip happen, and only here does it need to.
+    ///
+    /// # Both GUTIs are accepted, per TS 24.501 §5.4.4.6
+    ///
+    /// The resolver tries `current_guti` and then `next_guti`. After an aborted
+    /// GUTI reallocation §5.4.4.6 a) defers to b)-1): "the old and the new 5G-GUTI
+    /// shall be considered as valid until the old 5G-GUTI can be considered as
+    /// invalid by the AMF" — because the CONFIGURATION UPDATE COMPLETE may simply
+    /// have been lost and the UE may already have adopted the new one. b)-1) ii)
+    /// then says the AMF "shall consider the new 5G-GUTI as valid **if it is used
+    /// by the UE**", which is the collapse rule: whichever the UE presents becomes
+    /// the sole valid identity. That commit is done below.
+    ///
+    /// (#352 cites §5.4.4.3 for this. That clause is the **UE's** side of the
+    /// procedure and says nothing about what the AMF keeps valid; the network-side
+    /// rule is §5.4.4.6, and it is narrower and more actionable than "both stay
+    /// valid" — it comes with the rule for ending the ambiguity.)
+    async fn resolve_registration_by_guti(
+        &mut self,
+        amf_ue_ngap_id: u64,
+        registration_request: &[u8],
+        registration_type: u8,
+    ) -> bool {
+        let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) else {
+            return false;
+        };
+        let presented = state.amf_ue.old_guti.clone();
+        if presented.tmsi == 0 {
+            // No GUTI was actually parsed out of the request, so there is nothing
+            // to resolve. Distinct from "unknown GUTI": the SUCI request is right.
+            return false;
+        }
+
+        let served_guami = {
+            let ctx_arc = crate::context::amf_self();
+            // Read THROUGH the poison, as every other reader of this context does
+            // since #363: bailing would be a new failure mode, not a preserved one.
+            let ctx = ctx_arc.read().unwrap_or_else(|e| e.into_inner());
+            ctx.served_guami.clone()
+        };
+
+        // Is the GUTI foreign? `registration_request_from_old_amf` already answers
+        // exactly this -- it compares `old_guti` against every served GUAMI and
+        // carries the all-zero-GUTI guard -- and until #352 it had only test
+        // callers. This is its first production use; the alternative was a fourth
+        // copy of the same comparison.
+        if crate::gmm_handler::registration_request_from_old_amf(&state.amf_ue, &served_guami) {
+            return self
+                .fetch_ue_context_from_old_amf(
+                    amf_ue_ngap_id,
+                    &presented,
+                    registration_request,
+                    registration_type,
+                )
+                .await;
+        }
+
+        // The GUTI is one of ours. Resolve it against the live store's DERIVED
+        // resolver (#341/PR #374): `find_by_guti` scans the one authoritative map,
+        // so it sees whatever the registration path last committed as
+        // `current_guti` -- there is no index that could be stale.
+        //
+        // `find_by_guti` matches on `current_guti` only, so the §5.4.4.6 b)-1)
+        // "new GUTI is also valid" case is a second pass over the snapshot. It is
+        // NOT a third store method: a resolver that silently accepted either would
+        // make it impossible for a caller to know WHICH identity matched, and
+        // b)-1) ii) requires exactly that in order to commit the right one.
+        let resolved = {
+            let ctx_arc = crate::context::amf_self();
+            let ctx = ctx_arc.read().unwrap_or_else(|e| e.into_inner());
+            match ctx.amf_ue_find_by_guti(&presented) {
+                Some(ue) => Some((ue, false)),
+                // The reallocated identity the UE may have adopted after an
+                // aborted §5.4.4.6 reallocation.
+                None => ctx
+                    .amf_ue_find_by_pending_guti(&presented)
+                    .map(|ue| (ue, true)),
+            }
+        };
+
+        let Some((known, matched_next_guti)) = resolved else {
+            log::info!(
+                "Registration with a 5G-GUTI this AMF issued (5G-TMSI=0x{:08x}) but whose context \
+                 is no longer held -- identifying the UE by SUCI (TS 24.501 §5.4.3)",
+                presented.tmsi
+            );
+            return false;
+        };
+
+        let Some(supi) = known.supi.clone() else {
+            // A held context with no SUPI is a registration that never got past
+            // authentication. Nothing is adopted from it -- carrying its security
+            // state forward would claim an authentication that did not complete.
+            log::info!(
+                "Registration with a locally-issued 5G-GUTI (5G-TMSI=0x{:08x}) whose context \
+                 carries no SUPI (authentication never completed) -- identifying by SUCI",
+                presented.tmsi
+            );
+            return false;
+        };
+
+        // Adopt the identity and the security context onto THIS registration's
+        // record, then write back. `ue_auth_state.get` returned a clone
+        // (`ue_store.rs`, deliberately, so no guard crosses an `.await`), and this
+        // very handler was the site where #361/PR #389 found ~40 mutated fields
+        // silently discarded for want of this insert.
+        self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
+            s.amf_ue.supi = Some(supi.clone());
+            s.amf_ue.pei = known.pei.clone();
+            s.amf_ue.suci = known.suci.clone();
+            if let Some(ref suci) = known.suci {
+                s.suci = suci.clone();
+            }
+            // The NAS security context, so the mobility update can be integrity
+            // protected without a fresh 5G-AKA run (TS 33.501 §6.9.3).
+            s.amf_ue.kamf = known.kamf;
+            s.amf_ue.knas_int = known.knas_int;
+            s.amf_ue.knas_enc = known.knas_enc;
+            s.amf_ue.selected_int_algorithm = known.selected_int_algorithm;
+            s.amf_ue.selected_enc_algorithm = known.selected_enc_algorithm;
+            s.amf_ue.security_context_available = known.security_context_available;
+            s.amf_ue.ul_count = known.ul_count;
+            s.amf_ue.dl_count = known.dl_count;
+            // TS 24.501 §5.4.4.6 b)-1) ii): the identity the UE actually used
+            // becomes the valid one and the other becomes invalid. Committed for
+            // BOTH matches, not only the `next_guti` one -- when the UE presents
+            // the old GUTI after an aborted reallocation, §5.4.4.6 b)-1) iii)
+            // makes the old one the valid identity, so the dangling `next_guti`
+            // must stop resolving too.
+            s.amf_ue.current_guti = presented.clone();
+            s.amf_ue.current_m_tmsi = Some(presented.tmsi);
+            s.amf_ue.next_guti = presented.clone();
+        });
+
+        if matched_next_guti {
+            log::info!(
+                "[{supi}] Registration presents the REALLOCATED 5G-GUTI \
+                 (5G-TMSI=0x{:08x}): the UE adopted it even though the Configuration Update \
+                 Complete never arrived, so it is now the only valid identity and the old one \
+                 is invalid (TS 24.501 §5.4.4.6 b)-1) ii))",
+                presented.tmsi
+            );
+        } else {
+            log::info!(
+                "[{supi}] Registration with a 5G-GUTI this AMF issued \
+                 (5G-TMSI=0x{:08x}): UE identified from the held context, no Identity Request \
+                 needed (TS 23.502 §4.2.2.2.2)",
+                presented.tmsi
+            );
+        }
+
+        // The caller authenticates. This AMF always re-authenticates a mobility
+        // update rather than reusing the transferred security context -- TS 33.501
+        // §6.1.1.1 leaves that to the AMF -- and what resolving the GUTI bought is
+        // that it runs with the SUPI already known, which is what spared the
+        // Identity Request.
+        true
+    }
+
+    /// Fetch a UE context from the AMF that issued the presented 5G-GUTI
+    /// (#352; TS 23.502 §4.2.2.2.2 steps 4-5, TS 29.518 §5.2.2.2.1).
+    ///
+    /// Returns `true` when the context was transferred and the UE is therefore
+    /// identified, `false` when the caller must fall back to requesting a SUCI.
+    /// Identification only, for the reason documented on
+    /// [`NgapServer::resolve_registration_by_guti`]: the caller authenticates.
+    ///
+    /// Every failure mode returns `false` rather than rejecting the registration.
+    /// That is deliberate and is the whole risk posture of this feature: the SUCI
+    /// path always works, so an unreachable or uncooperative old AMF must cost the
+    /// UE one extra round trip, never its registration. TS 23.502 §4.2.2.2.2 makes
+    /// the transfer conditional ("[Conditional] new AMF to old AMF") and step 4
+    /// says the new AMF "**may** invoke" it.
+    async fn fetch_ue_context_from_old_amf(
+        &mut self,
+        amf_ue_ngap_id: u64,
+        presented: &crate::context::Guti5gs,
+        registration_request: &[u8],
+        registration_type: u8,
+    ) -> bool {
+        // `INIT_REG` vs `MOBI_REG` per TS 29.518 §5.2.2.2.1.1: the reason tells the
+        // old AMF which representation to return -- `MOBI_REG` gets the complete MM
+        // and PDU session contexts, `INIT_REG` omits the sessions for the access
+        // type being registered. It is the UE's registration type, not a guess.
+        let reason = if registration_type == crate::gmm_build::registration_type::MOBILITY_UPDATING
+        {
+            "MOBI_REG"
+        } else {
+            "INIT_REG"
+        };
+
+        log::info!(
+            "Registration with a 5G-GUTI issued by ANOTHER AMF (PLMN {}-{}, AMF \
+             region={:#04x} set={:#06x} pointer={:#04x}, 5G-TMSI=0x{:08x}): retrieving the UE \
+             context over Namf_Communication_UEContextTransfer, reason={reason} \
+             (TS 23.502 §4.2.2.2.2 step 4)",
+            presented.plmn_id.mcc(),
+            presented.plmn_id.mnc(),
+            presented.amf_region_id,
+            presented.amf_set_id,
+            presented.amf_pointer,
+            presented.tmsi,
+        );
+
+        let Some((peer_host, peer_port)) =
+            crate::sbi_path::discover_peer_amf_by_guami(presented).await
+        else {
+            log::info!(
+                "The AMF that issued 5G-TMSI 0x{:08x} could not be located, so there is nobody \
+                 to transfer the context from -- identifying the UE by SUCI instead of rejecting \
+                 the registration (TS 23.502 §4.2.2.2.2 step 4 is [Conditional])",
+                presented.tmsi
+            );
+            return false;
+        };
+
+        // The integrity-protected Registration Request, which §5.2.2.2.1.1 step 1
+        // requires so the OLD AMF can verify the MAC against the security context
+        // it holds. This AMF does not and cannot verify it -- it has no key for
+        // this UE yet, which is the reason the exchange exists.
+        let transferred = match crate::sbi_path::call_amf_ue_context_transfer(
+            &peer_host,
+            peer_port,
+            presented,
+            reason,
+            "3GPP_ACCESS",
+            Some(registration_request),
+        )
+        .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                log::warn!(
+                    "UEContextTransfer to {peer_host}:{peer_port} failed ({e}); identifying the \
+                     UE by SUCI instead. A 403 here is the old AMF's integrity verdict on the \
+                     Registration Request and is NOT overridden -- only it holds the key the MAC \
+                     was computed under (TS 29.518 §5.2.2.2.1.1)"
+                );
+                return false;
+            }
+        };
+
+        let Some(supi) = transferred.supi.clone() else {
+            // §5.2.2.2.1.1 case b) permits a response carrying only `supi`, so a
+            // response carrying NO supi has failed at the one thing the call is
+            // for. Nothing usable was learned.
+            log::warn!(
+                "UEContextTransfer from {peer_host}:{peer_port} returned a UE context with no \
+                 SUPI, which is the one attribute the transfer exists to obtain \
+                 (TS 23.502 §4.2.2.2.2 step 5); identifying the UE by SUCI"
+            );
+            return false;
+        };
+
+        // Adopt what was transferred. Written back through `with_mut` for the
+        // reason #361/PR #389 documents: `get` hands out a clone, and this handler
+        // is where mutating one and dropping it silently disabled a whole branch.
+        //
+        // The SECURITY context is deliberately NOT adopted: the transferred
+        // `mmContextList` carries the algorithms and NAS COUNTs, but TS 33.501
+        // §6.9.3 has the target AMF either run a fresh authentication or derive a
+        // new KAMF via horizontal key derivation from the old one. This AMF
+        // authenticates, so importing the old NAS keys would seed a context that
+        // is about to be replaced -- and doing it half-way (algorithms without
+        // keys) is how a security context ends up self-inconsistent.
+        self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
+            s.amf_ue.supi = Some(supi.clone());
+            if let Some(ref pei) = transferred.pei {
+                s.amf_ue.pei = Some(pei.clone());
+            }
+            s.amf_ue.amf_ue_context_transfer_state =
+                crate::context::UeContextTransferState::TransferNewAmf;
+            // The presented GUTI stays current until this AMF issues its own in
+            // `complete_registration` (which calls `generate_new_guti` and stamps
+            // this AMF's GUAMI), so the UE remains addressable in the meantime.
+            s.amf_ue.current_guti = presented.clone();
+            s.amf_ue.current_m_tmsi = Some(presented.tmsi);
+        });
+
+        log::info!(
+            "[{supi}] UE context transferred from the old AMF at {peer_host}:{peer_port}: \
+             {} PDU session(s) reported. The sessions are NOT re-established here -- moving the \
+             N3 tunnels is Nsmf_PDUSession_UpdateSMContext toward each SMF (TS 23.502 \
+             §4.2.2.2.2 step 21), which is the N2 relocation path and belongs to #74",
+            transferred.pdu_session_ids.len()
+        );
+
+        // Close the procedure at the old AMF (TS 29.518 §5.2.2.2.2). Without this
+        // the old AMF holds the context until the implementation-specific guard
+        // timer TS 23.502 step 5 licenses it to start expires, and never learns
+        // whether the UE registered here. Best-effort: the transfer has already
+        // succeeded, so a failure to report it must not undo the registration.
+        if let Err(e) = crate::sbi_path::call_amf_registration_status_update(
+            &peer_host, peer_port, presented, true,
+        )
+        .await
+        {
+            log::warn!(
+                "[{supi}] RegistrationStatusUpdate to {peer_host}:{peer_port} failed ({e}). The \
+                 context transfer already succeeded, so the registration continues; the old AMF \
+                 will release its copy on its own guard timer (TS 23.502 §4.2.2.2.2 step 5)"
+            );
+        }
+
+        // The caller authenticates, with the SUPI now known -- which is what the
+        // transfer bought: no Identity Request, no SUCI over the air.
+        true
     }
 
     /// Start (or restart, on SQN resync) 5G-AKA via AUSF
@@ -5887,24 +6254,40 @@ impl NgapServer {
                     }
                 }
                 NasProcTimer::T3555 => {
-                    // TS 24.501 §5.4.4.3: after the fourth retransmission the AMF
-                    // ABORTS the UE configuration update procedure. The UE never
-                    // acknowledged, so the reallocated 5G-GUTI is NOT committed: the UE
-                    // is still addressable by the one it has.
+                    // TS 24.501 §5.4.4.6 a): "on the fifth expiry of timer T3555, the
+                    // procedure shall be aborted. In addition, if the CONFIGURATION
+                    // UPDATE COMMAND message includes the 5G-GUTI IE, the network shall
+                    // behave as described in case b)-1)" -- and b)-1) is: "the old and
+                    // the new 5G-GUTI shall be considered as valid until the old 5G-GUTI
+                    // can be considered as invalid by the AMF".
                     //
-                    // The spec's fuller answer is that both GUTIs stay valid until the
-                    // next successful procedure, because the COMPLETE may simply have
-                    // been lost. That needs a GUTI-indexed UE lookup to act on, which
-                    // is #352 (split from #72's criteria 4-6) -- until it lands there is
-                    // nothing that could FIND a UE by the new GUTI, so keeping the old
-                    // one as the single valid identity is the honest behaviour rather
-                    // than a compromise.
+                    // So BOTH identities are kept: `current_guti` (the one the UE
+                    // certainly has) and `next_guti` (the one it may already have
+                    // adopted, since the COMPLETE may simply have been lost). Neither is
+                    // overwritten.
+                    //
+                    // #352 fixes what stood here before: `next_guti = current_guti`,
+                    // which discarded the reallocated identity, so a UE that HAD adopted
+                    // it became unidentifiable -- the §5.4.4.6 b)-1) iii) recovery ("may
+                    // use the identification procedure") was the only way back, on every
+                    // aborted reallocation rather than only on a genuine mismatch.
+                    //
+                    // The window is closed by `resolve_registration_by_guti`, which
+                    // accepts either identity on the next registration and commits
+                    // whichever the UE presents, per b)-1) ii): "shall consider the new
+                    // 5G-GUTI as valid if it is used by the UE".
+                    //
+                    // (#352's own body cites §5.4.4.3 for this rule. That clause is the
+                    // UE's side of the procedure; the network-side rule is §5.4.4.6, and
+                    // it is the one that supplies the collapse rule above.)
                     log::warn!(
                         "T3555 aborted for UE {amf_ue_ngap_id}: no Configuration Update \
-                         Complete, keeping the current 5G-GUTI (the new one was never \
-                         acknowledged)"
+                         Complete after four retransmissions. BOTH 5G-GUTIs stay valid \
+                         (current 5G-TMSI=0x{:08x}, reallocated 5G-TMSI=0x{:08x}) until the \
+                         UE presents one of them (TS 24.501 §5.4.4.6 a) -> b)-1))",
+                        state.amf_ue.current_guti.tmsi,
+                        state.amf_ue.next_guti.tmsi
                     );
-                    state.amf_ue.next_guti = state.amf_ue.current_guti.clone();
                     self.ue_auth_state.insert(amf_ue_ngap_id, state);
                 }
                 NasProcTimer::T3522 => {
@@ -12704,7 +13087,22 @@ mod tests {
     }
 
     /// Criterion 2's abnormal case: T3555 retransmits up to the configured maximum and
-    /// then aborts WITHOUT committing the unacknowledged GUTI (TS 24.501 §5.4.4.3).
+    /// then aborts without COMMITTING the unacknowledged GUTI — the UE never
+    /// acknowledged, so `current_guti` is unchanged (TS 24.501 §5.4.4.6 a)).
+    ///
+    /// **#352 corrected the second half of this.** The test previously also asserted
+    /// that `next_guti` was overwritten with `current_guti`, citing §5.4.4.3. That
+    /// clause is the **UE's** side of the procedure ("Generic UE configuration
+    /// update accepted by the UE") and carries no network-side rule at all; the
+    /// AMF's rule is §5.4.4.6 a), which defers to b)-1): "the old and the new
+    /// 5G-GUTI shall be considered as valid until the old 5G-GUTI can be considered
+    /// as invalid by the AMF". So the reallocated identity is RETAINED, not dropped
+    /// — the COMPLETE may merely have been lost and the UE may already be using it.
+    ///
+    /// So this test now pins three things rather than two: the retransmission
+    /// budget, that the abort does NOT promote the new GUTI to current, and that it
+    /// does not destroy it either. `after_an_aborted_reallocation_the_ue_may_present_
+    /// either_guti` pins the other half — that the retained identity then resolves.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn t3555_retransmits_then_aborts_keeping_the_current_guti() {
         crate::context::amf_context_init(64, 1024, 4096);
@@ -12759,8 +13157,12 @@ mod tests {
             "the UE never acknowledged, so the OLD GUTI is still the valid one"
         );
         assert_eq!(
-            state.amf_ue.next_guti.tmsi, 0x2222_2222,
-            "and the unacknowledged one is dropped rather than left pending forever"
+            state.amf_ue.next_guti.tmsi, 0x3333_3333,
+            "and the unacknowledged one is RETAINED, not dropped: TS 24.501 §5.4.4.6 a) -> \
+             b)-1) keeps both valid until the UE presents one, because the COMPLETE may \
+             simply have been lost. Overwriting it here -- what this asserted before #352, on \
+             a §5.4.4.3 cite that is the UE's side of the procedure -- made a UE that HAD \
+             adopted the new identity unidentifiable"
         );
     }
 
@@ -13829,6 +14231,687 @@ mod tests {
         assert!(
             ngap.ue_auth_state.contains(amf_ue_ngap_id),
             "a connected UE must survive a poll with no timer running"
+        );
+    }
+
+    // ====================================================================
+    // #352: 5G-GUTI-indexed mobility in the registration path
+    // ====================================================================
+
+    /// A REGISTRATION REQUEST whose 5GS mobile identity is the given 5G-GUTI.
+    ///
+    /// The encoding is the one `parse_guti` (`gmm_handler.rs:741`) reads, so this
+    /// exercises the live parser rather than a test-only shape: BCD PLMN with the
+    /// `mnc3` filler nibble in the high half of octet 2, AMF Set ID split 8+2
+    /// across octets 5-6, AMF Pointer in the low 6 bits of octet 6.
+    fn registration_request_with_guti(
+        guti: &crate::context::Guti5gs,
+        registration_type: u8,
+    ) -> Vec<u8> {
+        let p = &guti.plmn_id;
+        let identity = vec![
+            // Type-of-identity 0x02 = 5G-GUTI, in the low 3 bits.
+            mobile_identity_type::GUTI,
+            p.mcc1 | (p.mcc2 << 4),
+            p.mcc3 | (p.mnc3 << 4),
+            p.mnc1 | (p.mnc2 << 4),
+            guti.amf_region_id,
+            (guti.amf_set_id >> 2) as u8,
+            (((guti.amf_set_id & 0x03) as u8) << 6) | (guti.amf_pointer & 0x3f),
+            (guti.tmsi >> 24) as u8,
+            (guti.tmsi >> 16) as u8,
+            (guti.tmsi >> 8) as u8,
+            guti.tmsi as u8,
+        ];
+        let mut nas = vec![
+            0x7E,
+            0x00,
+            message_type::REGISTRATION_REQUEST,
+            registration_type,
+        ];
+        // 5GS mobile identity is LV-E: a 2-octet length.
+        nas.extend_from_slice(&(identity.len() as u16).to_be_bytes());
+        nas.extend_from_slice(&identity);
+        nas
+    }
+
+    /// The GUAMI this AMF serves in the #352 tests, and the GUTI it would issue.
+    ///
+    /// `amf_pointer` 0x11 and region 0x2a are chosen to be distinct from the
+    /// defaults other tests leave in `served_guami`, so a test that forgot to set
+    /// the GUAMI cannot accidentally pass.
+    fn local_guami() -> crate::context::Guami {
+        crate::context::Guami {
+            plmn_id: crate::context::PlmnId::new("001", "01"),
+            amf_id: crate::context::AmfId {
+                region: 0x2a,
+                set: 0x0c1,
+                pointer: 0x11,
+            },
+        }
+    }
+
+    fn guti_from(guami: &crate::context::Guami, tmsi: u32) -> crate::context::Guti5gs {
+        crate::context::Guti5gs {
+            plmn_id: guami.plmn_id.clone(),
+            amf_region_id: guami.amf_id.region,
+            amf_set_id: guami.amf_id.set,
+            amf_pointer: guami.amf_id.pointer,
+            tmsi,
+        }
+    }
+
+    /// Install `local_guami()` as the sole served GUAMI, so
+    /// `registration_request_from_old_amf` has something real to compare against.
+    fn serve_only_local_guami() {
+        let ctx_arc = crate::context::amf_self();
+        let mut ctx = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
+        ctx.served_guami.clear();
+        ctx.served_guami.push(local_guami());
+        ctx.num_of_served_guami = 1;
+    }
+
+    /// #352 criterion 4: a registration presenting a 5G-GUTI **this AMF issued**
+    /// identifies the UE from the held context, with no Identity Request.
+    ///
+    /// Before this, `ngap_path.rs` logged "Registration with unknown 5G-GUTI:
+    /// requesting SUCI" and sent an IDENTITY REQUEST for *every* GUTI, including
+    /// one it had allocated itself — so `amf_ue_find_by_guti` had zero production
+    /// callers and TS 23.502 §4.2.2.2.2's "skip the identification when the context
+    /// is held" was unreachable. It also defeats the 5G-GUTI's purpose
+    /// (TS 23.501 §5.9.4): the UE is asked for a long-term identity it had
+    /// specifically avoided sending.
+    ///
+    /// **Positive assertion.** The check is that the registration's own record now
+    /// carries the SUPI from the *other* record found by GUTI. That state is
+    /// reachable only by the lookup succeeding: nothing else in this fixture knows
+    /// the SUPI, and no parse error or early return can put it there. Asserting
+    /// "no Identity Request was sent" alone would be satisfied by every path that
+    /// never arrives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_registration_with_a_locally_issued_guti_resolves_without_an_identity_request() {
+        // The AMF context and `served_guami` are process-global, so this serialises
+        // with every other test that writes them, on the EXISTING guard.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::amf_context_init(64, 1024, 4096);
+        serve_only_local_guami();
+
+        let mut ngap = test_ngap_server().await;
+        // Distinct literal keys per #352 test: the store is process-global and
+        // `amf_context_init` is a one-shot `OnceLock` that never clears, so a shared
+        // AMF-UE-NGAP-ID or 5G-TMSI would have two tests resolve each other's UE.
+        // Two amfd tests once shared `78_001` and failed ~1 run in 3.
+        let held_ngap_id = 7_352_010u64;
+        let new_ngap_id = 7_352_011u64;
+        let guti = guti_from(&local_guami(), 0x0352_0101);
+        let supi = "imsi-001010000352010";
+
+        // The UE as this AMF already holds it: registered, GUTI committed. This is
+        // the shape `Registration Complete` leaves behind (`current_guti =
+        // next_guti`), inserted the way the registration path inserts.
+        let mut held = UeNasContext::new(held_ngap_id, 52, 9_352, false);
+        held.amf_ue.supi = Some(supi.to_string());
+        held.amf_ue.current_guti = guti.clone();
+        held.amf_ue.security_context_available = true;
+        held.amf_ue.selected_int_algorithm = 2;
+        ngap.ue_auth_state.insert(held_ngap_id, held);
+
+        // A NEW N1 connection presenting that GUTI, as a mobility update.
+        ngap.ue_auth_state.insert(
+            new_ngap_id,
+            UeNasContext::new(new_ngap_id, 53, 9_353, false),
+        );
+        let nas = registration_request_with_guti(
+            &guti,
+            crate::gmm_build::registration_type::MOBILITY_UPDATING,
+        );
+
+        // Drive the whole live handler first, so the GUTI really is parsed off the
+        // wire by `parse_registration_request_pdu` and recorded by the production
+        // path. It returns having also attempted authentication, which fails with no
+        // AUSF and releases the record -- so the identification itself is re-driven
+        // below, on the state the handler left, to be observed on its own.
+        let _ = ngap
+            .handle_registration_request_nas(1, new_ngap_id, 53, &nas, false)
+            .await;
+
+        // The identification step, in isolation. This is the production function the
+        // GUTI arm calls, called with the production arguments; what is skipped is
+        // only `start_authentication`, which needs an AUSF this fixture has no way
+        // to provide and whose failure arm deliberately releases the UE.
+        ngap.ue_auth_state.insert(new_ngap_id, {
+            let mut fresh = UeNasContext::new(new_ngap_id, 53, 9_353, false);
+            fresh.amf_ue.registration_type = crate::gmm_build::registration_type::MOBILITY_UPDATING;
+            fresh.amf_ue.old_guti = guti.clone();
+            fresh
+        });
+        assert!(
+            ngap.resolve_registration_by_guti(
+                new_ngap_id,
+                &nas,
+                crate::gmm_build::registration_type::MOBILITY_UPDATING,
+            )
+            .await,
+            "the GUTI is one this AMF issued and the context IS held, so identification \
+             must succeed -- this is the return value the GUTI arm branches on to skip the \
+             Identity Request"
+        );
+
+        let state = ngap
+            .ue_auth_state
+            .get(new_ngap_id)
+            .expect("the new registration's record must survive the identification");
+        assert_eq!(
+            state.amf_ue.supi.as_deref(),
+            Some(supi),
+            "the UE must be identified from the context found by 5G-GUTI. This SUPI exists \
+             nowhere in the request -- only on the OTHER record -- so it can only have \
+             arrived through `amf_ue_find_by_guti`, which had zero production callers before \
+             #352"
+        );
+        assert!(
+            state.amf_ue.security_context_available,
+            "and the held NAS security context must come with it, so the mobility update can \
+             be integrity protected without a fresh 5G-AKA (TS 33.501 §6.9.3)"
+        );
+        assert_eq!(
+            state.amf_ue.selected_int_algorithm, 2,
+            "including the selected algorithms, not merely the availability flag"
+        );
+        assert_eq!(
+            state.amf_ue.current_guti, guti,
+            "TS 24.501 §5.4.4.6 b)-1) ii): the identity the UE actually used becomes the \
+             valid one"
+        );
+        assert!(
+            !matches!(
+                state.retx,
+                Some(NasRetx {
+                    timer: NasProcTimer::T3570,
+                    ..
+                })
+            ),
+            "and T3570 -- the IDENTITY REQUEST supervision -- must NOT be armed, because no \
+             Identity Request was sent (TS 23.502 §4.2.2.2.2 skips it when the context is held)"
+        );
+    }
+
+    /// #352 criterion 4, the other half: a 5G-GUTI this AMF issued but whose
+    /// context it no longer holds still falls back to the Identity Request.
+    ///
+    /// This is the case the pre-#352 unconditional branch was *right* about, and it
+    /// must keep working — an AMF that restarted has nothing to resolve and no peer
+    /// to ask, so TS 24.501 §5.4.3 identification is the only way forward. Pinned
+    /// so the new branching cannot turn a recoverable restart into a rejected
+    /// registration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_locally_issued_guti_with_no_held_context_still_requests_a_suci() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::amf_context_init(64, 1024, 4096);
+        serve_only_local_guami();
+
+        let mut ngap = test_ngap_server().await;
+        // Distinct from every other #352 test, per the note on the test above.
+        let ngap_id = 7_352_020u64;
+        // A 5G-TMSI this AMF's GUAMI covers but no record carries.
+        let guti = guti_from(&local_guami(), 0x0352_0201);
+
+        // The GUTI recorded on the record the way the production GUTI arm records it
+        // (`state.amf_ue.old_guti = guti`, then `insert`), then the identification
+        // step on its own.
+        //
+        // Driven at the identification step rather than through
+        // `handle_registration_request_nas` because that handler consults
+        // PROCESS-GLOBAL congestion state: `nas_congestion_backoff` reads
+        // `amf_ue_count()` off the shared context, which grows as sibling tests add
+        // UEs, and once it crosses `AMF_CONGESTION_*` the registration is refused
+        // with 5GMM #22 before the GUTI arm is ever reached. Measured at ~3 failures
+        // in 10 whole-crate runs while this went through the full handler, always
+        // with a DEFAULT `AmfUe` on the record -- i.e. the congestion reject, not the
+        // branch under test. The sibling tests that do drive the full handler assert
+        // on state written after that gate, so they are unaffected.
+        ngap.ue_auth_state.insert(ngap_id, {
+            let mut fresh = UeNasContext::new(ngap_id, 54, 9_354, false);
+            fresh.amf_ue.registration_type = crate::gmm_build::registration_type::INITIAL;
+            fresh.amf_ue.old_guti = guti.clone();
+            fresh
+        });
+        let nas =
+            registration_request_with_guti(&guti, crate::gmm_build::registration_type::INITIAL);
+
+        assert!(
+            !ngap
+                .resolve_registration_by_guti(
+                    ngap_id,
+                    &nas,
+                    crate::gmm_build::registration_type::INITIAL,
+                )
+                .await,
+            "the GUTI is this AMF's own but NO context is held, so identification must fail \
+             and the caller must fall back to the Identity Request (TS 24.501 §5.4.3). The \
+             sibling test proves this same fixture DOES identify when a context IS held, so \
+             this is the restart case and not a no-op"
+        );
+
+        let state = ngap
+            .ue_auth_state
+            .get(ngap_id)
+            .expect("the record must survive so the Identity Response can be matched to it");
+        assert!(
+            state.amf_ue.supi.is_none(),
+            "nothing was resolved, so no SUPI may have been invented"
+        );
+        assert_eq!(
+            state.amf_ue.old_guti, guti,
+            "and the presented GUTI must still be RECORDED (#361): the Identity Response \
+             handler resolves the UE from the store, so a GUTI lost here is lost for the \
+             whole GUTI-identified registration"
+        );
+    }
+
+    /// #352 criterion 6: a registration presenting a 5G-GUTI owned by **another**
+    /// AMF fetches the UE context from that AMF over
+    /// `Namf_Communication_UEContextTransfer`.
+    ///
+    /// This is the criterion's whole point, and it needs a second AMF to mean
+    /// anything — which is why #352 was split out of #72 in the first place. A real
+    /// in-process `SbiServer` on an ephemeral port stands in for the old AMF and
+    /// answers the way this tree's own producer answers, so the wire format, the
+    /// `5g-guti-…` path component and the `multipart/related` Registration Request
+    /// are all exercised rather than assumed.
+    ///
+    /// The decision this PR settles is under test here: the AMF decides a GUTI is
+    /// foreign **from the GUTI alone**, by comparing the GUAMI it contains against
+    /// `served_guami`. TS 23.003 §2.10 makes `<5G-GUTI> = <GUAMI><5G-TMSI>`, and
+    /// TS 23.502 §4.2.2.2.2 step 4 says the new AMF "determines the old AMF using
+    /// the UE's 5G-GUTI" — no NRF round trip is needed to reach the verdict, which
+    /// is why the peer is reached here through the configured-peer fallback.
+    ///
+    /// **Positive assertions on state only this path can produce:** the SUPI the
+    /// peer returned (it exists nowhere else in the fixture), the `TransferNewAmf`
+    /// state, and the requests the peer actually received — including that the
+    /// procedure was CLOSED with a `RegistrationStatusUpdate`, which is what stops
+    /// the old AMF holding the context on its guard timer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_foreign_guti_fetches_the_ue_context_from_the_old_amf() {
+        use nextgcore_sbi::message::{SbiRequest, SbiResponse};
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::amf_context_init(64, 1024, 4096);
+        serve_only_local_guami();
+
+        // Distinct from every other #352 test, per the note on the first one.
+        let ngap_id = 7_352_030u64;
+        // Same PLMN, DIFFERENT AMF pointer: an AMF in this operator's network that
+        // is not this one. The narrowest possible difference, so the comparison is
+        // shown to be on the whole GUAMI and not merely on the PLMN.
+        let foreign = crate::context::Guti5gs {
+            amf_pointer: local_guami().amf_id.pointer + 1,
+            ..guti_from(&local_guami(), 0x0352_0301)
+        };
+        // A SUPI that appears NOWHERE in this AMF's state: only the peer knows it,
+        // so finding it on the record proves the transfer happened.
+        let peer_only_supi = "imsi-001010000352030";
+
+        // The old AMF. Answers `transfer` with a UeContextTransferRspData and
+        // `transfer-update` with 200, recording every request so the consumer's
+        // side of the exchange can be asserted.
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let peer_port = addr.port();
+        let (tx, mut rx) = mpsc::channel::<(String, String, usize)>(8);
+        let peer = SbiServer::on_listener(
+            SbiServerConfig::new(format!("127.0.0.1:{peer_port}").parse().expect("addr")),
+            listener,
+        );
+        peer.start(move |req: SbiRequest| {
+            let tx = tx.clone();
+            async move {
+                let uri = req.header.uri.clone();
+                let _ = tx
+                    .send((
+                        uri.clone(),
+                        req.http.content.clone().unwrap_or_default(),
+                        req.http.parts.len(),
+                    ))
+                    .await;
+                if uri.contains("/transfer-update") {
+                    SbiResponse::ok()
+                        .with_json_body(&serde_json::json!({ "regStatusTransferComplete": true }))
+                        .expect("json")
+                } else {
+                    // The shape `handle_ue_context_transfer` produces
+                    // (TS 29.518 Table 6.1.6.2.50-1).
+                    SbiResponse::ok()
+                        .with_json_body(&serde_json::json!({
+                            "ueContext": {
+                                "supi": peer_only_supi,
+                                "pei": "imeisv-0123456789012345",
+                                "mmContextList": [{ "accessType": "3GPP_ACCESS" }],
+                                "sessionContextList": [{
+                                    "pduSessionId": 5,
+                                    "smContextRef": "smctx-5",
+                                    "sNssai": { "sst": 1 },
+                                    "dnn": "internet",
+                                    "accessType": "3GPP_ACCESS",
+                                }],
+                            }
+                        }))
+                        .expect("json")
+                }
+            }
+        })
+        .await
+        .expect("peer AMF start");
+
+        // The peer above serves PLAINTEXT loopback, so this fixture describes a
+        // dev-profile deployment and says so, rather than depending on whatever
+        // `NEXTGCORE_SBI_PROFILE` happens to hold. `SbiClient::for_peer` resolves the
+        // profile, and the default is Production (TLS) -- against a plaintext server
+        // that is an HTTP/2 connection error, not a protocol failure.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        // No NRF in this fixture, so the peer is reached through the configured
+        // fallback -- the same path a two-AMF bring-up without an NRF takes. The
+        // GUAMI-keyed NRF query is covered by `discover_peer_amf_by_guami`'s own
+        // unit tests in `sbi_path`.
+        std::env::set_var("AMF_PEER_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("AMF_PEER_SBI_PORT", peer_port.to_string());
+
+        let mut ngap = test_ngap_server().await;
+        let nas = registration_request_with_guti(
+            &foreign,
+            crate::gmm_build::registration_type::MOBILITY_UPDATING,
+        );
+        // Through the live handler first, so the foreign GUTI is genuinely parsed
+        // off the wire and recorded; then the identification on its own, for the
+        // reason documented on the locally-issued-GUTI test above.
+        let _ = ngap
+            .handle_registration_request_nas(1, ngap_id, 55, &nas, false)
+            .await;
+        ngap.ue_auth_state.insert(ngap_id, {
+            let mut fresh = UeNasContext::new(ngap_id, 55, 9_355, false);
+            fresh.amf_ue.registration_type = crate::gmm_build::registration_type::MOBILITY_UPDATING;
+            fresh.amf_ue.old_guti = foreign.clone();
+            fresh
+        });
+        let identified = ngap
+            .resolve_registration_by_guti(
+                ngap_id,
+                &nas,
+                crate::gmm_build::registration_type::MOBILITY_UPDATING,
+            )
+            .await;
+
+        std::env::remove_var("AMF_PEER_SBI_ADDR");
+        std::env::remove_var("AMF_PEER_SBI_PORT");
+        // Deliberately NOT `reset_sbi_profile_override()`: the override is
+        // PROCESS-WIDE, and resetting it here flipped sibling loopback-plaintext
+        // tests back to Production mid-flight -- measured at 2 failures in 10
+        // whole-crate runs, in `sbi_path`'s `ue_policy_create_carries_the_ue_policy_
+        // container_as_ue_pol_req` and `ngap_path`'s
+        // `setup_response_relays_every_pdu_session_not_just_the_last`, which set the
+        // Dev override and rely on it surviving their own awaits. Every such test in
+        // this crate sets it and leaves it set; smfd's `main.rs` records the same
+        // finding for the same reason. Matching that is what keeps them compatible.
+
+        assert!(
+            identified,
+            "the UE must be identified from the transferred context (TS 23.502 \
+             §4.2.2.2.2 step 5)"
+        );
+        let state = ngap
+            .ue_auth_state
+            .get(ngap_id)
+            .expect("the record must survive the transfer");
+        assert_eq!(
+            state.amf_ue.supi.as_deref(),
+            Some(peer_only_supi),
+            "the SUPI must come from the OLD AMF. It exists nowhere in this AMF's state, so \
+             it can only have arrived over Namf_Communication_UEContextTransfer -- which had \
+             no consumer at all before #352"
+        );
+        assert_eq!(
+            state.amf_ue.pei.as_deref(),
+            Some("imeisv-0123456789012345"),
+            "and so must the rest of what the old AMF sent"
+        );
+        assert_eq!(
+            state.amf_ue.amf_ue_context_transfer_state,
+            crate::context::UeContextTransferState::TransferNewAmf,
+            "the UE is recorded as transferred IN, which is the new-AMF side of \
+             TS 29.518 §5.2.2.2.1"
+        );
+
+        // What the old AMF actually received, in order.
+        let (transfer_uri, transfer_body, transfer_parts) = rx
+            .try_recv()
+            .expect("the peer must have received the transfer");
+        assert!(
+            transfer_uri.contains(&format!(
+                "/ue-contexts/{}/transfer",
+                foreign.to_context_id()
+            )),
+            "the resource must be addressed by the UE's 5G-GUTI (TS 29.518 §5.2.2.2.1.1), \
+             got {transfer_uri}"
+        );
+        assert!(
+            transfer_uri.starts_with("/namf-comm/v1/"),
+            "on the Namf_Communication API root, got {transfer_uri}"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&transfer_body).expect("the request body must be JSON");
+        assert_eq!(
+            body["reason"].as_str(),
+            Some("MOBI_REG"),
+            "a mobility registration update is MOBI_REG, which is what makes the old AMF \
+             return the COMPLETE context rather than omitting the sessions (§5.2.2.2.1.1)"
+        );
+        assert_eq!(body["accessType"].as_str(), Some("3GPP_ACCESS"));
+        assert_eq!(
+            transfer_parts, 1,
+            "the integrity-protected Registration Request must travel as a multipart/related \
+             binary part, because only the OLD AMF holds the key its MAC was computed under \
+             (§5.2.2.2.1.1 step 1)"
+        );
+        assert!(
+            body.pointer("/regRequest/n1MessageContent/contentId")
+                .and_then(|v| v.as_str())
+                .is_some(),
+            "and the JSON root must REFERENCE that part by contentId, which is what this \
+             tree's own producer requires before it will accept a MOBI_REG"
+        );
+
+        let (update_uri, update_body, _) = rx
+            .try_recv()
+            .expect("the procedure must be CLOSED at the old AMF (TS 29.518 §5.2.2.2.2)");
+        assert!(
+            update_uri.contains(&format!(
+                "/ue-contexts/{}/transfer-update",
+                foreign.to_context_id()
+            )),
+            "got {update_uri}"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&update_body).expect("json")
+                ["transferStatus"]
+                .as_str(),
+            Some("TRANSFERRED"),
+            "without this the old AMF holds the UE context until the implementation-specific \
+             guard timer TS 23.502 §4.2.2.2.2 step 5 licenses expires, and never learns the \
+             UE registered here"
+        );
+    }
+
+    /// The same foreign GUTI with NO old AMF reachable must fall back to the
+    /// Identity Request, not reject the registration.
+    ///
+    /// TS 23.502 §4.2.2.2.2 makes the transfer "[Conditional]" and step 4 says the
+    /// new AMF "may invoke" it, so an unreachable peer must cost the UE one extra
+    /// round trip and never its registration. Separate from the test above because
+    /// that one proves the happy path exists and this one proves the failure is
+    /// survivable — a single test could not show both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreachable_old_amf_falls_back_to_identification_rather_than_rejecting() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::amf_context_init(64, 1024, 4096);
+        serve_only_local_guami();
+        // Neither an NRF nor a configured peer, so discovery must fail closed.
+        // Removed rather than assumed absent: these tests share one process.
+        std::env::remove_var("AMF_PEER_SBI_ADDR");
+        std::env::remove_var("AMF_PEER_SBI_PORT");
+
+        let mut ngap = test_ngap_server().await;
+        // Distinct from every other #352 test, per the note on the first one.
+        let ngap_id = 7_352_031u64;
+        let foreign = crate::context::Guti5gs {
+            amf_pointer: local_guami().amf_id.pointer + 1,
+            ..guti_from(&local_guami(), 0x0352_0311)
+        };
+
+        ngap.ue_auth_state.insert(ngap_id, {
+            let mut fresh = UeNasContext::new(ngap_id, 56, 9_356, false);
+            fresh.amf_ue.registration_type = crate::gmm_build::registration_type::MOBILITY_UPDATING;
+            fresh.amf_ue.old_guti = foreign.clone();
+            fresh
+        });
+        let nas = registration_request_with_guti(
+            &foreign,
+            crate::gmm_build::registration_type::MOBILITY_UPDATING,
+        );
+        assert!(
+            !ngap
+                .resolve_registration_by_guti(
+                    ngap_id,
+                    &nas,
+                    crate::gmm_build::registration_type::MOBILITY_UPDATING,
+                )
+                .await,
+            "with no old AMF locatable the UE is NOT identified, so the caller must fall back \
+             to the Identity Request -- the sibling test proves this same fixture DOES \
+             identify when a peer answers, so this is the failure path and not a no-op"
+        );
+
+        let state = ngap.ue_auth_state.get(ngap_id).expect(
+            "the record must survive: an unreachable old AMF costs a round trip, \
+                     never the registration",
+        );
+        assert!(
+            state.amf_ue.supi.is_none(),
+            "nothing may be adopted from a transfer that did not happen"
+        );
+        assert_eq!(
+            state.amf_ue.amf_ue_context_transfer_state,
+            crate::context::UeContextTransferState::Initial,
+            "and no transfer state may be claimed for it"
+        );
+        assert_eq!(
+            state.amf_ue.old_guti, foreign,
+            "the foreign GUTI stays recorded, so the SUCI identification that follows has the \
+             context it needs (#361: this arm's fields were once written to a discarded clone)"
+        );
+    }
+
+    /// #352 / TS 24.501 §5.4.4.6: an aborted 5G-GUTI reallocation leaves **both**
+    /// identities valid, and the UE presenting the reallocated one commits it.
+    ///
+    /// §5.4.4.6 a) defers to b)-1): "the old and the new 5G-GUTI shall be
+    /// considered as valid until the old 5G-GUTI can be considered as invalid by the
+    /// AMF", because the CONFIGURATION UPDATE COMPLETE may simply have been lost and
+    /// the UE may already have adopted the new identity. b)-1) ii) supplies the
+    /// collapse rule: the AMF "shall consider the new 5G-GUTI as valid **if it is
+    /// used by the UE**".
+    ///
+    /// Before #352 the T3555 abort did `next_guti = current_guti`, discarding the
+    /// reallocated identity — so a UE that HAD adopted it was unidentifiable and
+    /// every aborted reallocation forced the §5.4.4.6 b)-1) iii) identification
+    /// recovery. (#352's body cites §5.4.4.3 for this; that clause is the UE's side
+    /// and carries no network-side rule. The correction is what makes the collapse
+    /// rule available at all.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn after_an_aborted_reallocation_the_ue_may_present_either_guti() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::amf_context_init(64, 1024, 4096);
+        serve_only_local_guami();
+
+        let mut ngap = test_ngap_server().await;
+        // Distinct from every other #352 test, per the note on the first one.
+        let held_ngap_id = 7_352_040u64;
+        let new_ngap_id = 7_352_041u64;
+        let old_guti = guti_from(&local_guami(), 0x0352_0401);
+        let realloc_guti = guti_from(&local_guami(), 0x0352_0402);
+        let supi = "imsi-001010000352040";
+
+        // The state a T3555 abort leaves: current_guti is the one the UE certainly
+        // has, next_guti the one it MAY have adopted. Distinct, which is exactly
+        // what the pre-#352 abort destroyed.
+        let mut held = UeNasContext::new(held_ngap_id, 56, 9_356, false);
+        held.amf_ue.supi = Some(supi.to_string());
+        held.amf_ue.current_guti = old_guti.clone();
+        held.amf_ue.next_guti = realloc_guti.clone();
+        ngap.ue_auth_state.insert(held_ngap_id, held);
+
+        // The UE registers with the REALLOCATED identity: it did receive the
+        // CONFIGURATION UPDATE COMMAND and the COMPLETE was lost on the way back.
+        ngap.ue_auth_state.insert(
+            new_ngap_id,
+            UeNasContext::new(new_ngap_id, 57, 9_357, false),
+        );
+        let nas = registration_request_with_guti(
+            &realloc_guti,
+            crate::gmm_build::registration_type::MOBILITY_UPDATING,
+        );
+        // Through the live handler, so the reallocated GUTI is genuinely parsed off
+        // the wire, then the identification on its own -- see the note on
+        // `a_registration_with_a_locally_issued_guti_resolves_without_an_identity_request`
+        // for why authentication is not part of what is asserted here.
+        let _ = ngap
+            .handle_registration_request_nas(1, new_ngap_id, 57, &nas, false)
+            .await;
+        ngap.ue_auth_state.insert(new_ngap_id, {
+            let mut fresh = UeNasContext::new(new_ngap_id, 57, 9_357, false);
+            fresh.amf_ue.registration_type = crate::gmm_build::registration_type::MOBILITY_UPDATING;
+            fresh.amf_ue.old_guti = realloc_guti.clone();
+            fresh
+        });
+        assert!(
+            ngap.resolve_registration_by_guti(
+                new_ngap_id,
+                &nas,
+                crate::gmm_build::registration_type::MOBILITY_UPDATING,
+            )
+            .await,
+            "the UNACKNOWLEDGED 5G-GUTI must identify the UE: §5.4.4.6 b)-1) keeps it valid \
+             after the abort, so this must resolve rather than fall through to a SUCI request"
+        );
+
+        let state = ngap
+            .ue_auth_state
+            .get(new_ngap_id)
+            .expect("the record must survive");
+        assert_eq!(
+            state.amf_ue.supi.as_deref(),
+            Some(supi),
+            "the UE must be identified by the UNACKNOWLEDGED 5G-GUTI: §5.4.4.6 b)-1) keeps it \
+             valid, and this SUPI is reachable only through that resolution"
+        );
+        assert_eq!(
+            state.amf_ue.current_guti, realloc_guti,
+            "§5.4.4.6 b)-1) ii): the identity the UE used becomes the valid one"
+        );
+        assert_eq!(
+            state.amf_ue.next_guti, realloc_guti,
+            "and the ambiguity is CLOSED -- the old identity must stop resolving, or the \
+             dual-validity window would never end"
         );
     }
 }

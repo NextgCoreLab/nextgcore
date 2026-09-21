@@ -234,6 +234,85 @@ pub struct Guti5gs {
     pub tmsi: u32,
 }
 
+impl Guti5gs {
+    /// The `5g-guti-…` form a 5G-GUTI takes as a Namf `ueContextId` path
+    /// component (#352).
+    ///
+    /// TS 29.518 Table 6.1.3.2.2-1 (`29518-k00.txt:7675`) and the OpenAPI
+    /// (`TS29518_Namf_Communication.yaml:48`) both fix the pattern to
+    /// `5g-guti-[0-9]{5,6}[0-9a-fA-F]{14}`: the MCC+MNC digits, then 14 hex
+    /// digits. TS 23.003 §2.10 (`23003-k00.txt:2479`) is what makes 14 the right
+    /// number — `<5G-GUTI> = <GUAMI><5G-TMSI>` with `<AMF Identifier>` = Region 8
+    /// bits + Set 10 + Pointer 6 = 24 bits = 6 hex digits, and the 5G-TMSI 32
+    /// bits = 8 hex digits.
+    ///
+    /// The AMF Identifier is packed by [`crate::sbi_path::amf_id_hex`] rather
+    /// than by a local `format!`, so this rendering and the `amfInfo.guamiList`
+    /// this AMF registers with the NRF cannot disagree about what its own AMF ID
+    /// is — the #92 defect, which was two independent packings of one value.
+    pub fn to_context_id(&self) -> String {
+        format!(
+            "5g-guti-{}{}{}{:08x}",
+            self.plmn_id.mcc(),
+            self.plmn_id.mnc(),
+            crate::sbi_path::amf_id_hex(&AmfId {
+                region: self.amf_region_id,
+                set: self.amf_set_id,
+                pointer: self.amf_pointer,
+            }),
+            self.tmsi,
+        )
+    }
+
+    /// The inverse of [`Guti5gs::to_context_id`]: parse a `5g-guti-…` Namf
+    /// `ueContextId` path component (#352, TS 29.518 §6.1.3.2.2).
+    ///
+    /// Returns `None` for anything that is not exactly the specified shape. Fails
+    /// closed on purpose: a `ueContextId` this AMF cannot parse must become a
+    /// `404 CONTEXT_NOT_FOUND`, never a partially-parsed GUTI that resolves to
+    /// some *other* subscriber's context. The MNC length is what the 5-vs-6 digit
+    /// split encodes (TS 29.571 `Mnc` is `\d{2,3}`), so a 5-digit run is a
+    /// 2-digit MNC and a 6-digit run a 3-digit one — there is no ambiguity to
+    /// guess at.
+    pub fn from_context_id(ue_context_id: &str) -> Option<Self> {
+        let rest = ue_context_id.strip_prefix("5g-guti-")?;
+        // 14 trailing hex digits, so the leading decimal run is everything else.
+        if rest.len() < 5 + 14 {
+            return None;
+        }
+        let (digits, hex) = rest.split_at(rest.len() - 14);
+        if !(5..=6).contains(&digits.len()) || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+
+        let (mcc, mnc) = digits.split_at(3);
+        let plmn_id = PlmnId::new(mcc, mnc);
+        // Round-trip the PLMN through its own renderer: `PlmnId::new` silently
+        // substitutes 0 for a non-digit, so without this a malformed MCC would
+        // yield a *different* PLMN rather than a rejection. The digits were
+        // already range-checked above, so this can only fail if the two
+        // representations disagree — which would itself be the bug.
+        if plmn_id.mcc() != mcc || plmn_id.mnc() != mnc {
+            return None;
+        }
+
+        let amf_id = u32::from_str_radix(&hex[..6], 16).ok()?;
+        let tmsi = u32::from_str_radix(&hex[6..], 16).ok()?;
+        Some(Self {
+            plmn_id,
+            // The inverse of `amf_id_hex`'s packing, kept adjacent to the
+            // forward direction so the two shifts are read together.
+            amf_region_id: ((amf_id >> 16) & 0xff) as u8,
+            amf_set_id: ((amf_id >> 6) & 0x3ff) as u16,
+            amf_pointer: (amf_id & 0x3f) as u8,
+            tmsi,
+        })
+    }
+}
+
 /// RAT type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RatType {
@@ -1174,6 +1253,38 @@ impl AmfContext {
         self.ue_store
             .find_by_guti(guti)
             .map(|(_, ue)| ue.amf_ue().clone())
+    }
+
+    /// Find an AMF UE by a 5G-GUTI this AMF issued but the UE has not yet
+    /// acknowledged (#352, TS 24.501 §5.4.4.6 b)-1)).
+    ///
+    /// After an aborted GUTI reallocation the spec keeps BOTH identities valid —
+    /// "the old and the new 5G-GUTI shall be considered as valid until the old
+    /// 5G-GUTI can be considered as invalid by the AMF" — because the
+    /// CONFIGURATION UPDATE COMPLETE may simply have been lost and the UE may
+    /// already have adopted the new one. `next_guti` is where the unacknowledged
+    /// identity lives, so this is the resolver for that window.
+    ///
+    /// **Separate from [`AmfContext::amf_ue_find_by_guti`] on purpose.** A single
+    /// resolver accepting either would hide *which* identity matched, and
+    /// §5.4.4.6 b)-1) ii) requires knowing: the AMF "shall consider the new
+    /// 5G-GUTI as valid if it is used by the UE", i.e. the match determines which
+    /// identity survives and which becomes invalid. A caller that cannot tell them
+    /// apart cannot perform that commit.
+    ///
+    /// A zero `next_guti.tmsi` never matches: that is the unset value (TS 23.003
+    /// reserves the all-zeros 5G-TMSI), so matching it would resolve every UE with
+    /// no reallocation in flight to the same query.
+    pub fn amf_ue_find_by_pending_guti(&self, guti: &Guti5gs) -> Option<AmfUe> {
+        if guti.tmsi == 0 {
+            return None;
+        }
+        self.ue_store
+            .snapshot()
+            .into_iter()
+            .map(|(_, ue)| ue)
+            .find(|ue| ue.amf_ue().next_guti == *guti)
+            .map(|ue| ue.amf_ue().clone())
     }
 
     /// Set SUCI for an AMF UE
@@ -3556,6 +3667,127 @@ pub fn amf_instance_get_load() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // 5G-GUTI as a Namf `ueContextId` (#352, TS 29.518 §6.1.3.2.2)
+    // ------------------------------------------------------------------
+
+    /// A 5G-GUTI this AMF could have issued renders to the pattern TS 29.518
+    /// Table 6.1.3.2.2-1 fixes, and parses back to the same fields.
+    ///
+    /// The exact literal is asserted rather than only the round trip: a codec that
+    /// is self-consistent but disagrees with the spec's pattern would round-trip
+    /// perfectly and still be rejected by every conformant peer.
+    #[test]
+    fn a_5g_guti_renders_to_the_spec_pattern_and_parses_back() {
+        let guti = Guti5gs {
+            plmn_id: PlmnId::new("001", "01"),
+            amf_region_id: 0x02,
+            amf_set_id: 0x001,
+            amf_pointer: 0x00,
+            tmsi: 0xdead_beef,
+        };
+
+        // amfId packs Region 8 | Set 10 | Pointer 6 = (0x02 << 16) | (1 << 6) = 0x020040.
+        assert_eq!(
+            guti.to_context_id(),
+            "5g-guti-0010102004 0deadbeef".replace(' ', ""),
+            "the rendering must be `5g-guti-<MCC><MNC><6 hex amfId><8 hex 5G-TMSI>`"
+        );
+        // 5 MCC+MNC digits (2-digit MNC) + 14 hex, exactly as the pattern permits.
+        let rendered = guti.to_context_id();
+        let body = rendered.strip_prefix("5g-guti-").expect("the prefix");
+        assert_eq!(body.len(), 5 + 14);
+
+        assert_eq!(
+            Guti5gs::from_context_id(&rendered).expect("the rendering must parse"),
+            guti,
+            "the codec must be a round trip, field for field"
+        );
+    }
+
+    /// A 3-digit MNC uses the 6-digit form, and the parser must not mistake the
+    /// extra digit for part of the AMF ID. This is the whole reason the pattern is
+    /// `[0-9]{5,6}` rather than a fixed width, so both widths are pinned.
+    #[test]
+    fn a_three_digit_mnc_round_trips_without_stealing_a_hex_digit() {
+        let guti = Guti5gs {
+            plmn_id: PlmnId::new("310", "260"),
+            amf_region_id: 0xff,
+            amf_set_id: 0x3ff,
+            amf_pointer: 0x3f,
+            tmsi: 0x0000_0001,
+        };
+        let rendered = guti.to_context_id();
+        assert_eq!(rendered, "5g-guti-310260ffffff00000001");
+        assert_eq!(
+            rendered.strip_prefix("5g-guti-").expect("prefix").len(),
+            6 + 14
+        );
+        let parsed = Guti5gs::from_context_id(&rendered).expect("parse");
+        assert_eq!(parsed, guti);
+        assert_eq!(parsed.plmn_id.mnc(), "260", "the third MNC digit survives");
+        // The maximum-width AMF ID fields survive the pack/unpack shifts.
+        assert_eq!(parsed.amf_region_id, 0xff);
+        assert_eq!(parsed.amf_set_id, 0x3ff);
+        assert_eq!(parsed.amf_pointer, 0x3f);
+    }
+
+    /// Everything that is not the specified shape is refused. A `ueContextId` the
+    /// AMF half-parses would resolve to a DIFFERENT subscriber's context, which is
+    /// worse than the 404 a rejection produces.
+    #[test]
+    fn a_malformed_5g_guti_context_id_is_refused() {
+        for bad in [
+            "imsi-001010000000001",          // a SUPI, handled by the other branch
+            "5g-guti-",                      // prefix only
+            "5g-guti-00101deadbeef",         // too short for 14 trailing hex
+            "5g-guti-0010102004 0deadbee",   // 4 PLMN digits once 14 hex are taken
+            "5g-guti-0010x02004 0deadbeef",  // non-digit in the PLMN run
+            "5g-guti-00101020040deadbeez",   // non-hex in the identifier run
+            "5g-guti-1234567020040deadbeef", // 7 PLMN digits: no such pattern
+            "5g-guti-1010020040deadbeef",    // 4 PLMN digits
+            "",
+        ] {
+            let bad = bad.replace(' ', "");
+            assert!(
+                Guti5gs::from_context_id(&bad).is_none(),
+                "{bad:?} is not a conformant 5g-guti ueContextId and must be refused"
+            );
+        }
+    }
+
+    /// The renderer shares [`crate::sbi_path::amf_id_hex`] with the NRF profile, so
+    /// the `amfId` inside a `ueContextId` and the one in `amfInfo.guamiList` cannot
+    /// disagree about the same AMF. Two independent packings of one value is the
+    /// #92 defect, and this pins that there is only one.
+    #[test]
+    fn the_context_id_amf_id_matches_the_nrf_profile_packing() {
+        let guti = Guti5gs {
+            plmn_id: PlmnId::new("001", "01"),
+            amf_region_id: 0xca,
+            amf_set_id: 0x2fc,
+            amf_pointer: 0x21,
+            tmsi: 0x1234_5678,
+        };
+        let shared = crate::sbi_path::amf_id_hex(&AmfId {
+            region: guti.amf_region_id,
+            set: guti.amf_set_id,
+            pointer: guti.amf_pointer,
+        });
+        let rendered = guti.to_context_id();
+        assert!(
+            rendered.contains(&shared),
+            "the ueContextId {rendered} must carry the SHARED amfId packing {shared}"
+        );
+        // ...and the inverse recovers the fields the shared packer consumed.
+        let parsed = Guti5gs::from_context_id(&rendered).expect("parse");
+        assert_eq!(
+            (parsed.amf_region_id, parsed.amf_set_id, parsed.amf_pointer),
+            (0xca, 0x2fc, 0x21),
+            "the unpacking must be the exact inverse of amf_id_hex's shifts"
+        );
+    }
 
     #[test]
     fn test_amf_context_new() {
