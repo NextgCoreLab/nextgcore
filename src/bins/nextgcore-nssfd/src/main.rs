@@ -545,7 +545,8 @@ async fn main() -> Result<()> {
         // Client side (T1.1): install the process-wide OAuth2 client so
         // outbound SBI calls acquire and attach an NRF-issued Bearer token.
         if let Some(nrf_uri) = nrf_uri_cfg.as_deref() {
-            let nf_instance_id = format!("nssf-{}", uuid::Uuid::new_v4());
+            let nf_instance_id =
+                nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::Nssf).to_string();
             let oauth2 = Arc::new(OAuth2Client::new(nrf_uri, nf_instance_id, NfType::Nssf));
             let _ = OAUTH2_CLIENT.set(Some(oauth2));
         }
@@ -2840,7 +2841,7 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
 
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
 
-    let nf_instance_id = uuid::Uuid::new_v4().to_string();
+    let nf_instance_id = nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::Nssf).to_string();
 
     let nf_profile = serde_json::json!({
         "nfInstanceId": nf_instance_id,

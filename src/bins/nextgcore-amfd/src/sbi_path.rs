@@ -285,7 +285,9 @@ pub fn amf_sbi_open() -> SbiResult<()> {
     log::info!("AMF SBI opening...");
 
     // Build self NF instance for AMF
-    let nf_instance_id = uuid::Uuid::new_v4().to_string();
+    let nf_instance_id =
+        nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf)
+            .to_string();
     let sbi_addr = std::env::var("AMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
     let sbi_port: u16 = std::env::var("AMF_SBI_PORT")
         .ok()
@@ -361,7 +363,9 @@ pub async fn amf_nrf_register(sbi_addr: &str, sbi_port: u16) -> Result<String, S
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
 
-    let nf_instance_id = uuid::Uuid::new_v4().to_string();
+    let nf_instance_id =
+        nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf)
+            .to_string();
 
     let mut nf_profile = serde_json::json!({
         "nfInstanceId": nf_instance_id,

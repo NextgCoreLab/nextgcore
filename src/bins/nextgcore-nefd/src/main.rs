@@ -402,10 +402,16 @@ async fn main() -> Result<()> {
         );
     }
 
-    let nf_instance_id = args
-        .nf_instance_id
-        .clone()
-        .unwrap_or_else(|| format!("nef-{}", uuid::Uuid::new_v4()));
+    // Issue #187: `--nf-instance-id` seeds the shared resolver so the flag keeps
+    // winning, and the fallback is the resolver rather than a local UUID -- an
+    // operator can then pin this NEF's identity from the environment too, which a
+    // CCA trust store keyed by nfInstanceId needs.
+    if let Some(id) = args.nf_instance_id.as_deref() {
+        nextgcore_sbi::nf_instance_id::seed(id);
+    }
+    let nf_instance_id =
+        nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Nef)
+            .to_string();
 
     let notify_base = args
         .notify_base

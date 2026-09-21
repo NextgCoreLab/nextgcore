@@ -109,7 +109,7 @@ pub fn udm_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
     log::info!("Opening UDM SBI server on {}:{}", config.addr, config.port);
 
     // Build self NF instance for UDM
-    let nf_instance_id = uuid::Uuid::new_v4().to_string();
+    let nf_instance_id = nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::Udm).to_string();
     let mut nf_instance = NfInstance::new(&nf_instance_id, NfType::Udm);
     nf_instance.ipv4_addresses.push(config.addr.clone());
 

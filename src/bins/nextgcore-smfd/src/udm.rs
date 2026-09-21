@@ -73,11 +73,19 @@ pub fn set_instance_id(id: &str) {
     }
 }
 
-/// This SMF's instance id. Falls back to a stable per-process uuid when NRF
+/// This SMF's instance id. Falls back to the shared resolver when NRF
 /// registration never happened, so a UECM registration still carries the
 /// `smfInstanceId` its schema requires rather than an empty string.
+///
+/// Issue #187: the fallback resolves through
+/// [`nextgcore_sbi::nf_instance_id`] instead of minting its own UUID. The
+/// comment above says a second, independently minted uuid would point the UDM's
+/// serving-SMF record at an instance nothing else knows — and that is exactly
+/// what this line did whenever registration had not happened yet.
 pub fn smf_instance_id() -> &'static str {
-    SMF_INSTANCE_ID.get_or_init(|| uuid::Uuid::new_v4().to_string())
+    SMF_INSTANCE_ID.get_or_init(|| {
+        nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Smf).to_string()
+    })
 }
 
 /// Test-only: set the switch without going through startup.

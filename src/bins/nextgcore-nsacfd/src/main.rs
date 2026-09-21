@@ -249,7 +249,9 @@ async fn main() -> Result<()> {
         }
     });
 
-    let nf_instance_id = format!("nsacf-{}", uuid::Uuid::new_v4());
+    let nf_instance_id =
+        nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Nsacf)
+            .to_string();
 
     // Parse the config file for the NRF URI and the OAuth2 enforcement knob
     // (nsacf.sbi.oauth2.require). The CLI --nrf-uri remains the fallback, and

@@ -242,7 +242,9 @@ async fn main() -> Result<()> {
     // a real PFCP-session occupancy gauge on every heartbeat. All failures
     // are log-only and never affect UPF packet forwarding.
     if !args.nrf_uri.trim().is_empty() {
-        let nf_instance_id = format!("upf-{}", uuid::Uuid::new_v4());
+        let nf_instance_id =
+            nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Upf)
+                .to_string();
         let sbi_ctx = nextgcore_sbi::context::global_context();
         sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
         match register_upf_with_nrf(&nf_instance_id, &args.pfcp_addr, &args.gtpu_addr).await {

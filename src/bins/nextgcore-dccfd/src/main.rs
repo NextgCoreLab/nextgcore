@@ -241,7 +241,9 @@ fn apply_oauth2_enforcement(mut cfg: SbiServerConfig, nrf_uri: &str) -> SbiServe
     });
     cfg = cfg.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Dccf);
     if let Some(u) = uri {
-        let nf_instance_id = format!("dccf-{}", uuid::Uuid::new_v4());
+        let nf_instance_id =
+            nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Dccf)
+                .to_string();
         let _ = OAUTH2_CLIENT.set(Some(Arc::new(nextgcore_sbi::oauth::OAuth2Client::new(
             u,
             nf_instance_id,
@@ -273,7 +275,9 @@ async fn main() -> Result<()> {
 
     dccf_context_init(args.max_subscriptions);
 
-    let nf_instance_id = format!("dccf-{}", uuid::Uuid::new_v4());
+    let nf_instance_id =
+        nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Dccf)
+            .to_string();
 
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone());

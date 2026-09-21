@@ -197,7 +197,9 @@ async fn apply_oauth2_enforcement(mut cfg: NextgcoreSbiServerConfig) -> Nextgcor
     });
     cfg = cfg.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Smf);
     if let Some(uri) = nrf_uri.as_deref() {
-        let nf_instance_id = format!("smf-{}", uuid::Uuid::new_v4());
+        let nf_instance_id =
+            nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Smf)
+                .to_string();
         let _ = OAUTH2_CLIENT.set(Some(Arc::new(nextgcore_sbi::oauth::OAuth2Client::new(
             uri,
             nf_instance_id,
@@ -1245,7 +1247,9 @@ async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
 
-    let nf_instance_id = uuid::Uuid::new_v4().to_string();
+    let nf_instance_id =
+        nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Smf)
+            .to_string();
 
     let nf_profile = serde_json::json!({
         "nfInstanceId": nf_instance_id,

@@ -157,7 +157,9 @@ fn apply_oauth2_enforcement(mut cfg: SbiServerConfig, nrf_uri: &str) -> SbiServe
     });
     cfg = cfg.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Tsctsf);
     if let Some(u) = uri {
-        let nf_instance_id = format!("tsctsf-{}", uuid::Uuid::new_v4());
+        let nf_instance_id =
+            nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Tsctsf)
+                .to_string();
         let _ = OAUTH2_CLIENT.set(Some(Arc::new(nextgcore_sbi::oauth::OAuth2Client::new(
             u,
             nf_instance_id,
@@ -208,10 +210,14 @@ async fn main() -> Result<()> {
     // no request is answered under a different setting from the next.
     actuation::init_from_env();
 
-    let nf_instance_id = args
-        .nf_instance_id
-        .clone()
-        .unwrap_or_else(|| format!("tsctsf-{}", uuid::Uuid::new_v4()));
+    // Issue #187: the flag seeds the shared resolver (so it still wins) and the
+    // fallback resolves there rather than minting an id no operator can pin.
+    if let Some(id) = args.nf_instance_id.as_deref() {
+        nextgcore_sbi::nf_instance_id::seed(id);
+    }
+    let nf_instance_id =
+        nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Tsctsf)
+            .to_string();
 
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone());

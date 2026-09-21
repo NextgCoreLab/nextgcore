@@ -199,7 +199,9 @@ async fn apply_oauth2_enforcement(mut cfg: NextgcoreSbiServerConfig) -> Nextgcor
     });
     cfg = cfg.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Ausf);
     if let Some(uri) = nrf_uri.as_deref() {
-        let nf_instance_id = format!("ausf-{}", uuid::Uuid::new_v4());
+        let nf_instance_id =
+            nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Ausf)
+                .to_string();
         let _ = OAUTH2_CLIENT.set(Some(Arc::new(nextgcore_sbi::oauth::OAuth2Client::new(
             uri,
             nf_instance_id,
@@ -1734,11 +1736,18 @@ async fn send_udm_auth_result(
     let client = peer_client(host, port, nextgcore_sbi::types::NfType::Udm).await;
 
     let body = serde_json::json!({
+        // Issue #187: fall back to the shared resolver, not a throwaway UUID. A
+        // random id here named an AUSF that nothing in the deployment knows.
         "nfInstanceId": nextgcore_sbi::context::global_context()
             .get_self_instance()
             .await
             .map(|i| i.id)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            .unwrap_or_else(|| {
+                nextgcore_sbi::nf_instance_id::nf_instance_id(
+                    nextgcore_sbi::types::NfType::Ausf,
+                )
+                .to_string()
+            }),
         "success": success,
         "authType": auth_type,
         "timeStamp": crate::nudm_build::get_current_timestamp(),
@@ -1822,7 +1831,9 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
 
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
 
-    let nf_instance_id = uuid::Uuid::new_v4().to_string();
+    let nf_instance_id =
+        nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Ausf)
+            .to_string();
 
     // Build NF Profile for registration
     let nf_profile = build_nf_profile(&nf_instance_id, sbi_addr, sbi_port);

@@ -178,7 +178,8 @@ async fn main() -> Result<()> {
     OAUTH2_ENABLED.store(args.require_oauth2, Ordering::Relaxed);
     TRUST_CALLER_SUPI_HEADER.store(args.trust_caller_supi_header, Ordering::Relaxed);
 
-    let nf_instance_id = format!("pin-app-{}", uuid::Uuid::new_v4());
+    let nf_instance_id =
+        nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Af).to_string();
 
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone());

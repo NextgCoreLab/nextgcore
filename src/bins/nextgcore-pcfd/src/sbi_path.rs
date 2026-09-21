@@ -74,7 +74,11 @@ const PCF_SERVICES: &[(SbiServiceType, &[&str])] = &[
 
 /// Build the PCF NF instance with service information
 fn build_pcf_nf_instance(config: &SbiServerConfig) -> NfInstance {
-    let nf_id = uuid::Uuid::new_v4().to_string();
+    // Issue #187: the self NF instance must carry the SAME nfInstanceId the PCF's
+    // OAuth2 client asserts in a CCA, or the NRF holds a trusted key for one
+    // identity and a registration for another. PR #237 fixed the two-profile half
+    // of this for pcfd; this is the identity half.
+    let nf_id = nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::Pcf).to_string();
     let mut nf_instance = NfInstance::new(&nf_id, NfType::Pcf);
 
     nf_instance.ipv4_addresses.push(config.addr.clone());

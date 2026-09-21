@@ -279,7 +279,9 @@ async fn apply_oauth2_enforcement(mut cfg: NextgcoreSbiServerConfig) -> Nextgcor
     });
     cfg = cfg.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Udm);
     if let Some(uri) = nrf_uri.as_deref() {
-        let nf_instance_id = format!("udm-{}", uuid::Uuid::new_v4());
+        let nf_instance_id =
+            nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Udm)
+                .to_string();
         let _ = OAUTH2_CLIENT.set(Some(Arc::new(nextgcore_sbi::oauth::OAuth2Client::new(
             uri,
             nf_instance_id,
@@ -3585,7 +3587,9 @@ async fn run_event_loop_async(udm_sm: &mut UdmSmContext, shutdown: Arc<AtomicBoo
 /// Returns the NF instance ID on success so the caller can start a heartbeat
 /// worker.
 async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, String> {
-    let nf_instance_id = uuid::Uuid::new_v4().to_string();
+    let nf_instance_id =
+        nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Udm)
+            .to_string();
     register_with_nrf_id(&nf_instance_id, sbi_addr, sbi_port).await
 }
 

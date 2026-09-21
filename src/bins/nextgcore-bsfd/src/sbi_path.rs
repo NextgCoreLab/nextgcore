@@ -63,7 +63,10 @@ fn parse_uri_host_port(uri_str: &str) -> Result<(String, u16), String> {
 
 /// Build the BSF NF instance with service information
 fn build_bsf_nf_instance(config: &SbiServerConfig) -> NfInstance {
-    let nf_id = uuid::Uuid::new_v4().to_string();
+    // Issue #187: the BSF's self NF instance must carry the SAME nfInstanceId its
+    // OAuth2 client asserts in a CCA, or the NRF has a trusted key for one identity
+    // and a registration for another.
+    let nf_id = nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::Bsf).to_string();
     let mut nf_instance = NfInstance::new(&nf_id, NfType::Bsf);
 
     nf_instance.ipv4_addresses.push(config.addr.clone());

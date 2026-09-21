@@ -246,7 +246,9 @@ async fn apply_oauth2_enforcement(mut cfg: NextgcoreSbiServerConfig) -> Nextgcor
     });
     cfg = cfg.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Pcf);
     if let Some(uri) = nrf_uri.as_deref() {
-        let nf_instance_id = format!("pcf-{}", uuid::Uuid::new_v4());
+        let nf_instance_id =
+            nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Pcf)
+                .to_string();
         let _ = OAUTH2_CLIENT.set(Some(Arc::new(nextgcore_sbi::oauth::OAuth2Client::new(
             uri,
             nf_instance_id,

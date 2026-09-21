@@ -192,7 +192,9 @@ fn apply_oauth2_enforcement(
     });
     cfg = cfg.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Lmf);
     if let Some(u) = uri {
-        let nf_instance_id = format!("lmf-{}", uuid::Uuid::new_v4());
+        let nf_instance_id =
+            nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Lmf)
+                .to_string();
         let _ = OAUTH2_CLIENT.set(Some(Arc::new(nextgcore_sbi::oauth::OAuth2Client::new(
             u,
             nf_instance_id,
@@ -262,7 +264,9 @@ async fn main() -> Result<()> {
         );
     }
 
-    let nf_instance_id = format!("lmf-{}", uuid::Uuid::new_v4());
+    let nf_instance_id =
+        nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Lmf)
+            .to_string();
 
     // A2: advertise our identity + notify-callback base for the outbound
     // Namf_Communication leg (subscription callback URIs must be reachable
