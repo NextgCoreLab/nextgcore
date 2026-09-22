@@ -154,6 +154,15 @@ pub enum CcaCertReference {
 /// — a present-but-malformed `x5c` is never silently downgraded to
 /// [`CcaCertReference::Absent`], because that would make a broken certificate a
 /// route to the weaker trust-store path.
+///
+/// **`x5c` is checked FIRST, and that order is a security property, not a
+/// style choice.** §13.3.8.2 asks for one field, but nothing stops a sender
+/// putting both in the header. Taking `x5c` means such a header is evaluated by
+/// the mechanism that requires no outbound fetch, so an attacker cannot get the
+/// `x5u` treatment (see the module docs) merely by adding a URL beside a chain.
+/// Since `x5u` is refused outright here anyway, the practical effect is that a
+/// both-fields header is validated as a chain rather than rejected — the
+/// strictly safer of the two readings, and asserted by a test.
 pub fn cert_reference_from_jose_header(header: &serde_json::Value) -> SbiResult<CcaCertReference> {
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
@@ -661,6 +670,30 @@ mod tests {
                 "a malformed x5c must be refused, not treated as absent: {header:?} -> \
                  {result:?}"
             );
+        }
+    }
+
+    /// A header carrying BOTH fields is treated as `x5c`, never as `x5u`.
+    ///
+    /// §13.3.8.2 asks for one, but nothing stops a sender supplying both, and the
+    /// ordering must not be an accident of how the code happens to be written: if
+    /// `x5u` were checked first, an attacker could force the URL-fetch treatment
+    /// simply by adding a URL beside a legitimate chain. Here the `x5u` is ignored
+    /// and the chain is what gets validated.
+    #[test]
+    fn a_header_with_both_fields_is_treated_as_x5c_not_x5u() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+
+        let der = vec![0x30u8, 0x03, 0x02, 0x01, 0x09];
+        let header = serde_json::json!({
+            "alg": "ES256",
+            "x5u": "http://169.254.169.254/latest/meta-data/",
+            "x5c": [STANDARD.encode(&der)],
+        });
+        match cert_reference_from_jose_header(&header).expect("parse") {
+            CcaCertReference::Chain(chain) => assert_eq!(chain.leaf(), der.as_slice()),
+            other => panic!("a both-fields header must resolve to the chain, got {other:?}"),
         }
     }
 

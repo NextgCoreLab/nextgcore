@@ -279,6 +279,12 @@ test is observed failing, and the change restored. Four reverts were run:
 | made the empty-anchors arm fall through to the trust store | `an_x5c_bearing_cca_is_refused_rather_than_downgraded_to_the_trust_store` | 200 where 400 asserted |
 | returned the trust-store key instead of `verified.es256_verifying_key()` | `a_cca_signed_by_a_key_its_certificate_does_not_certify_is_refused` | 200 where 400 asserted |
 | `OAuth2Client::new` no longer seeds the chain | `a_configured_chain_reaches_the_cca_a_client_actually_builds` | panicked at the `has_cca_cert_chain` assertion |
+| checked `x5u` BEFORE `x5c` in the header parser | `a_header_with_both_fields_is_treated_as_x5c_not_x5u` | resolved to `Url` where `Chain` asserted |
+
+The last one is why the parser's field order is documented as a security property
+rather than left to look arbitrary: §13.3.8.2 asks for one field but nothing stops
+a sender supplying both, and if `x5u` were read first an attacker could force the
+URL-fetch treatment by adding a URL beside a legitimate chain.
 
 One test also failed on first writing and was tightened rather than adjusted:
 `an_expired_leaf_is_refused` initially passed validation 50 years in the future,
@@ -288,9 +294,8 @@ genuinely exercised.
 
 ### Counts and isolation
 
-- `cargo test --workspace --no-fail-fast`: **6778 passed, 0 failed** (6 ignored).
-  20 tests added (11 in `cca_x5c.rs`, 9 across `oauth.rs` and `nrfd`), so the
-  baseline is 6758.
+- `cargo test --workspace --no-fail-fast`: **6781 passed, 0 failed** (6 ignored).
+  21 tests added (12 in `cca_x5c.rs`, 9 across `oauth.rs` and `nrfd`).
 - `cargo fmt --all -- --check` clean; `cargo clippy --workspace` (what CI gates)
   reports **zero** warnings in any file this change touches — the 4 remaining
   warning sites are pre-existing, in `nextgcore-nas`, `nextgcore-eesd` and
