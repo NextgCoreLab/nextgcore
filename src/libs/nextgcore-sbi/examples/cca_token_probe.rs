@@ -65,6 +65,23 @@ async fn main() {
     let (nrf_uri, key_file, instance_id) = (&args[1], &args[2], &args[3]);
     let (own_type, target_type, scope) = (nf_type(&args[4]), nf_type(&args[5]), &args[6]);
 
+    // Issue #187: for a consumer whose NF type no producer lists in
+    // `allowedNfTypes`, a token is CORRECTLY withheld — that is the SBA
+    // authorization decision (TS 33.501 §13.4.1.1.2 step 2), which happens AFTER
+    // client authentication and is a different question.
+    //
+    // The NRF itself is exactly that case: every producer in the overlay restricts
+    // `allowedNfTypes` to its real consumers (the UDM's is [AMF, SMF, AUSF, PCF,
+    // SCP]) and none lists NRF, correctly. A dispatched run proved it, returning
+    // `unauthorized_client ... "NRF" is not in allowedNfTypes of any UDM producer`.
+    //
+    // So in this mode a 200 OR an `unauthorized_client` both count as
+    // authentication having SUCCEEDED, while `invalid_client` — the
+    // authentication failure — still fails the probe. This asserts criterion 5
+    // (the NRF authenticates to itself) without asserting an authorization grant
+    // that ought not to be given.
+    let auth_only = std::env::var("CCA_PROBE_AUTH_ONLY").is_ok_and(|v| v == "1");
+
     // The NF's real signing key, loaded with the same loader the NF used to create
     // it. Absent would mean "generate", so refuse rather than probe with a key the
     // NRF has never seen — that failure would look like a rejection.
@@ -99,6 +116,18 @@ async fn main() {
                 resp.scope.as_deref().unwrap_or(scope)
             );
         }
+        Err(e) if auth_only && e.to_string().contains("unauthorized_client") => {
+            // Authentication SUCCEEDED and authorization declined. The NRF got past
+            // `invalid_client`, which is the only thing criterion 5 claims: it
+            // presented a CCA its own token endpoint verified against its own trust
+            // store, from its own registry entry.
+            println!(
+                "PASS positive (auth-only): the NRF authenticated {instance_id} via a \
+                 signature-verified CCA; the token was then withheld by SBA authorization \
+                 (unauthorized_client), which is the correct allowedNfTypes decision and a \
+                 different question from authentication"
+            );
+        }
         Err(e) => {
             // Name the LIKELY cause from the NRF's own wording rather than
             // guessing one. Validated locally: a probe run against a live nrfd
@@ -107,7 +136,11 @@ async fn main() {
             // would have sent a reader to the wrong place. Criterion 3 of #187 is
             // specifically about the failure being diagnosable.
             let msg = e.to_string();
-            let hint = if msg.contains("not registered") {
+            let hint = if msg.contains("unauthorized_client") {
+                "authentication SUCCEEDED; the token was withheld by SBA authorization \
+                 (allowedNfTypes). If that is the expected outcome for this consumer/producer \
+                 pair, set CCA_PROBE_AUTH_ONLY=1"
+            } else if msg.contains("not registered") {
                 "the CCA verified, but this nfInstanceId is not in the NRF's registry: the NF \
                  never completed NF registration, or it registered under a different id"
             } else if msg.contains("no trusted") {

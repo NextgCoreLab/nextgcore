@@ -359,9 +359,21 @@ jobs:
           # Criterion 5: with oauth2.require: true the NRF requests tokens from its
           # own endpoint for outbound notifications and is not exempt from its own
           # policy. It needs its own CCA key AND a registration in its own registry.
+          #
+          # CCA_PROBE_AUTH_ONLY=1, and the reason is a real finding rather than a
+          # workaround: a dispatched run returned
+          #   unauthorized_client ... "NRF" is not in allowedNfTypes of any UDM producer
+          # which is the CORRECT SBA authorization decision — every producer in the
+          # overlay restricts allowedNfTypes to its actual consumers and none lists
+          # NRF. Authorization is a different question from authentication and
+          # happens after it (TS 33.501 §13.4.1.1.2 step 2).
+          #
+          # So this asserts what criterion 5 actually claims: the NRF gets PAST
+          # client authentication against its own endpoint. `invalid_client` — the
+          # authentication failure — still fails the step.
           docker cp binaries/cca_token_probe nextgcore-nrf:/tmp/cca_token_probe
           docker compose $C exec -T --user root nrf chmod 0755 /tmp/cca_token_probe
-          docker compose $C exec -T nrf /tmp/cca_token_probe \
+          docker compose $C exec -T -e CCA_PROBE_AUTH_ONLY=1 nrf /tmp/cca_token_probe \
             http://172.23.0.10:7777 \
             /var/lib/nextgcore/cca/nrf-cca.key \
             6b1d7e3c-0000-4000-8000-0000000000f0 \

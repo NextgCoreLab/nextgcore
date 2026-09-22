@@ -367,6 +367,64 @@ failed with "is not registered with this NRF" while the probe blamed the trust
 store, which would have sent a reader to the wrong place. It now branches on the
 NRF's wording and names the actual cause — registry vs trust store vs stale key.
 
+## The third dispatched run: criteria 1–4 OBSERVED, and criterion 5's test was wrong
+
+Run
+[35666452178](https://github.com/NextgCoreLab/nextgcore/actions/runs/35666452178).
+Six of seven jobs green. The new positive probe, run inside the AMF container
+against the live NRF:
+
+```
+published CCA public JWKs: 9
+nrfd-05: token-endpoint client authentication required
+PASS positive: the NRF issued a token to 6b1d7e3c-...-000000000af0
+               against a signature-verified CCA (scope "nudm-sdm")
+PASS negative: an untrusted CCA key is refused invalid_client
+```
+
+**Criteria 1, 2, 3 and 4 are therefore observed in containers over the wire**, not
+reasoned about — which is what #187 asked for and what the prior comment on the
+issue said was unreachable.
+
+The NRF-authenticates-to-itself step failed, and the failure was in the **test**,
+not the code:
+
+```
+unauthorized_client ... consumer nfType "NRF" is not in allowedNfTypes
+                        of any UDM producer offering the requested service(s)
+```
+
+That is the **correct** answer. Every producer in the overlay restricts
+`allowedNfTypes` to its real consumers — the UDM's is `[AMF, SMF, AUSF, PCF, SCP]`
+(`docker/rust/configs/5gc/udm.yaml:36`), the UDR's is `[UDM, PCF, AUSF, SCP]`, the
+AMF's is `[SMF, AUSF, UDM, PCF, NSSF]` — and none lists NRF, because the NRF is not
+a consumer of their services. Asking for a UDM token as the NRF *should* be refused.
+
+The important distinction the failure surfaced: **authorization is not
+authentication**, and it happens after it (TS 33.501 §13.4.1.1.2 step 2).
+Criterion 5 claims only that the NRF gets past client authentication at its own
+endpoint. So the probe gained `CCA_PROBE_AUTH_ONLY=1`, under which a 200 *or* an
+`unauthorized_client` both count as authentication having succeeded, while
+`invalid_client` — the authentication failure — still fails. A blanket "accept any
+error" would have been the wrong fix; this accepts exactly one error, by name.
+
+Validated locally against a live `nextgcore-nrfd` configured as the overlay
+configures it (`oauth2.require: true`), which showed all three criterion-5
+mechanisms firing:
+
+```
+nrfd-05: token-endpoint client authentication required ...; 2 trusted CCA key(s) configured
+nrfd-187: the NRF's own CCA signing key is configured; it authenticates to its
+          own token endpoint like any other consumer
+nrfd-187: the NRF registered ITSELF as 6b1d7e3c-...-0000000000f0 so its own
+          access-token requests are from a known client (TS 29.510 §6.3.5.2.2)
+Issued access token for 6b1d7e3c-...-0000000000f0 (NRF) -> UDM scope=nudm-sdm
+```
+
+A run with the NRF's own registration absent was also exercised and produced
+`invalid_client ... is not registered with this NRF` — confirming the
+self-registration is load-bearing and not decorative.
+
 ## Observation ceiling (criterion 2)
 
 `Docker Build`, `Docker E2E` and `EPC bring-up` are gated
