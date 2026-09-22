@@ -30,7 +30,18 @@ RUN groupadd -r nextgcore && useradd -r -g nextgcore -s /bin/false nextgcore
 # path the image does not create is initialised root-owned, and these processes
 # run as `nextgcore`, so the first snapshot write would fail with EACCES. Creating
 # it here lets the volume inherit the right ownership.
-RUN mkdir -p /etc/nextgcore /var/log/nextgcore /var/run/nextgcore /var/lib/nextgcore && \
+#
+# The same rule applies to the two OAuth2 CCA directories (issue #187), and it was
+# learned the hard way: a dispatched Docker E2E run brought the overlay up with
+# ZERO published keys because `/etc/nextgcore/cca-public` did not exist in the
+# image, so its named volume mounted root-owned and every non-root NF failed to
+# write its public JWK.
+#   /var/lib/nextgcore/cca    — each NF's PRIVATE ES256 CCA signing key (0600)
+#   /etc/nextgcore/cca-public — PUBLIC JWKs the NRF loads as its CCA trust store
+# The subdirectory is created explicitly: a volume mounted at a subpath does not
+# inherit ownership from a parent that merely exists.
+RUN mkdir -p /etc/nextgcore /etc/nextgcore/cca-public /var/log/nextgcore \
+        /var/run/nextgcore /var/lib/nextgcore /var/lib/nextgcore/cca && \
     chown -R nextgcore:nextgcore /etc/nextgcore /var/log/nextgcore /var/run/nextgcore \
         /var/lib/nextgcore
 

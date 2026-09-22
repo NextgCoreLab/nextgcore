@@ -2004,4 +2004,138 @@ mod audience_binding_guards {
              with_cca_signing_key when a per-instance key is wanted)."
         );
     }
+
+    /// Issue #187: no daemon mints its own `nfInstanceId`.
+    ///
+    /// Two defects this prevents, both of which were live at `6ba388d`:
+    ///
+    /// * **Unpinnable.** A locally minted UUID changes on every restart, so no
+    ///   NRF-side CCA trust store — which is keyed by `nfInstanceId`
+    ///   (TS 33.501 §13.3.8.3) — can be provisioned in advance. That is why the
+    ///   docker OAuth2 overlay had to set `require_client_auth: false`.
+    /// * **Several identities per process.** `amfd` minted at three separate
+    ///   sites, so the ID its CCA asserted was not the ID it registered under.
+    ///   The token endpoint refuses an unregistered requester, so the
+    ///   authenticated path could not work at all.
+    ///
+    /// A guard rather than a comment because the failure is silent: a new daemon
+    /// that mints its own ID compiles, runs, registers, and is then refused
+    /// `invalid_client` by the NRF with nothing pointing at the cause. Same
+    /// reasoning as the sibling `OAuth2Client::new` guard above.
+    #[test]
+    fn no_daemon_mints_its_own_nf_instance_id() {
+        let bins = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("crate is at <root>/libs/nextgcore-sbi")
+            .join("bins");
+        assert!(bins.is_dir(), "expected {} to exist", bins.display());
+
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+
+        for entry in std::fs::read_dir(&bins).expect("read bins/") {
+            let path = entry.expect("dir entry").path();
+            let crate_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let src = path.join("src");
+            if !src.is_dir() {
+                continue;
+            }
+            for file in std::fs::read_dir(&src).expect("read src/") {
+                let f = file.expect("file entry").path();
+                if f.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&f).unwrap_or_default();
+                scanned += 1;
+                let lines: Vec<&str> = text.lines().collect();
+                for (n, line) in lines.iter().enumerate() {
+                    if !line.contains("Uuid::new_v4()") {
+                        continue;
+                    }
+                    // Decide by the ASSIGNMENT this UUID flows into, not by the
+                    // one line it appears on: the real offenders included
+                    //
+                    //     let nf_instance_id = args
+                    //         .nf_instance_id
+                    //         .clone()
+                    //         .unwrap_or_else(|| format!("nef-{}", Uuid::new_v4()));
+                    //
+                    // where the `Uuid::new_v4()` line names no identity at all.
+                    // A same-line-only check silently passed four of those, so
+                    // look back over the statement this line belongs to.
+                    //
+                    // A UUID for a subscription, correlation or session id is
+                    // unrelated and must stay allowed, so the window stops at the
+                    // nearest preceding `let`/assignment.
+                    let start = n.saturating_sub(6);
+                    let mut statement = String::new();
+                    for prev in lines[start..=n].iter().rev() {
+                        statement.insert_str(0, prev);
+                        statement.insert(0, '\n');
+                        if prev.contains("let ") || prev.contains(" = ") {
+                            break;
+                        }
+                    }
+                    let lower = statement.to_ascii_lowercase();
+                    // `nsi_id`, `registration_id`, `config_id` etc. are other
+                    // things entirely; only this NF's OWN identity is guarded.
+                    let names_own_identity = lower.contains("nf_instance_id")
+                        || lower.contains("nf_id")
+                        || lower.contains("ees_id")
+                        || lower.contains("self_instance");
+                    if !names_own_identity {
+                        continue;
+                    }
+                    // `nf_instance_id` appearing as a FUNCTION PARAMETER (and the
+                    // UUID being assigned to some other field in the same struct
+                    // literal) is not this NF minting its own identity. Verified
+                    // case: `udmd/context.rs`'s subscription constructors take
+                    // `nf_instance_id: Option<String>` and separately mint the
+                    // SUBSCRIPTION's `id`. Requiring the assignment target itself
+                    // to name an identity keeps the guard honest — a guard that
+                    // cries wolf gets the real signal muted.
+                    let assigns_identity = statement.lines().any(|l| {
+                        let l = l.trim();
+                        l.contains("Uuid::new_v4()")
+                            && (l.contains("nf_instance_id")
+                                || l.contains("nf_id")
+                                || l.contains("ees_id"))
+                    }) || statement.lines().any(|l| {
+                        let t = l.trim();
+                        (t.starts_with("let ") || t.starts_with('.') || t.contains("=>"))
+                            && (t.contains("nf_instance_id")
+                                || t.contains("nf_id")
+                                || t.contains("ees_id")
+                                || t.contains("self_instance"))
+                    });
+                    if !assigns_identity {
+                        continue;
+                    }
+                    offenders.push(format!(
+                        "{crate_name}/{}:{}",
+                        f.file_name().unwrap_or_default().to_string_lossy(),
+                        n + 1
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            scanned > 0,
+            "the guard scanned no daemon sources, so it is no longer checking anything"
+        );
+        offenders.sort();
+        assert!(
+            offenders.is_empty(),
+            "these sites mint an nfInstanceId locally instead of resolving the shared one: \
+             {offenders:?}. A locally minted id cannot be pinned by an operator (so no NRF \
+             CCA trust store can be provisioned for it) and can differ from the id the same \
+             process registers under. Call \
+             nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::X) instead."
+        );
+    }
 }

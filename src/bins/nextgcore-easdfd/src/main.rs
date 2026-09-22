@@ -307,10 +307,14 @@ async fn main() -> Result<()> {
         .map(|n| n.uri.clone())
         .unwrap_or_else(|| args.nrf_uri.clone());
 
-    let nf_instance_id = args
-        .nf_instance_id
-        .clone()
-        .unwrap_or_else(|| format!("easdf-{}", uuid::Uuid::new_v4()));
+    // Issue #187: the flag seeds the shared resolver (so it still wins) and the
+    // fallback resolves there rather than minting locally.
+    if let Some(id) = args.nf_instance_id.as_deref() {
+        nextgcore_sbi::nf_instance_id::seed(id);
+    }
+    let nf_instance_id =
+        nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Easdf)
+            .to_string();
 
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone());

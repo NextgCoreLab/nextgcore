@@ -42,87 +42,208 @@
 #   not an SBI surface).
 #
 # ---------------------------------------------------------------------------
-# TOKEN-ENDPOINT CLIENT AUTHENTICATION (issue #64 gaps 1+2)
+# TOKEN-ENDPOINT CLIENT AUTHENTICATION (issue #64 gaps 1+2; issue #187)
 #
-# The NRF now REQUIRES the token requester to authenticate: a Client
-# Credentials Assertion (TS 33.501 §13.3.8) signed with a key the NRF trusts
-# for that nfInstanceId, or an mTLS client identity. This overlay explicitly
-# opts out in configs/5gc/nrf-oauth2.yaml — see the comment there for exactly
-# what is missing.
+# The NRF REQUIRES the token requester to authenticate: a Client Credentials
+# Assertion (TS 33.501 §13.3.8) signed with a key the NRF trusts for that
+# nfInstanceId, or an mTLS client identity. This overlay SATISFIES that — it no
+# longer opts out. `require_client_auth: false` is gone from
+# configs/5gc/nrf-oauth2.yaml, so the NRF logs
 #
-# To run this overlay AUTHENTICATED, three things have to line up:
-#   1. Pin each NF's nfInstanceId (they are random UUIDs per start today, so
-#      there is no stable key to pre-register).
-#   2. Give each NF an ES256 CCA signing key:
-#        environment:
-#          - NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE=/etc/nextgcore/certs/<nf>-cca.key
-#      It is generated on first start if absent (0600) and reused thereafter;
-#      a malformed file is an error, never silently replaced.
-#   3. List the matching PUBLIC keys under nrf.sbi.oauth2.cca_trusted_keys in
-#      nrf-oauth2.yaml, keyed by nfInstanceId, and drop the
-#      require_client_auth: false line.
+#   nrfd-05: token-endpoint client authentication required
+#
+# at startup instead of the DISABLED warn!. If you see the warn!, the posture
+# regressed.
+#
+# HOW IT IS PROVISIONED — three environment variables per NF, no committed keys,
+# no generator script, no templated YAML:
+#
+#   NEXTGCORE_<TYPE>_INSTANCE_ID=<stable uuid>
+#       Pins the nfInstanceId. Before issue #187 every NF minted a fresh UUID
+#       per start (at up to three separate sites per daemon), so the NRF's trust
+#       store — keyed by nfInstanceId — had nothing stable to key on, AND the id
+#       an NF's CCA asserted could differ from the id it registered under.
+#       Resolved once per process now, so both are the same value.
+#       The UUIDs below are fixed, arbitrary, and DEV-ONLY: they identify
+#       containers, not credentials, and are safe to commit (unlike keys).
+#
+#   NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE=/var/lib/nextgcore/cca/<nf>-cca.key
+#       This NF's ES256 CCA signing key. Generated 0600 on first start if
+#       absent and REUSED thereafter; a malformed file is an error, never a
+#       silent regeneration (a new key would invalidate the NRF's trust entry).
+#       On the `cca_keys` volume, which is NOT shared with the NRF: the private
+#       key never leaves the NF.
+#
+#   NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/etc/nextgcore/cca-public
+#       Where the NF publishes the PUBLIC half as <nfInstanceId>.jwk (RFC 7517,
+#       0644). The NRF reads this directory via
+#       nrf.sbi.oauth2.cca_trusted_keys_dir. Shared, and only public keys are
+#       ever written to it.
+#
+# Startup order is not a problem: every NF depends_on the NRF, so the directory
+# is empty when the NRF first reads it, and a key published later is picked up on
+# first use. Still fail-closed — an NF with no published key is refused
+# `invalid_client`, which is the negative case issue #187 criterion 3 asks for.
+#
+# The NRF is NOT exempt from its own policy: with `require: true` it requests
+# tokens from itself for its outbound status notifications, so it has its own CCA
+# key, publishes into the same directory it reads, and registers itself in its
+# own registry (the token endpoint refuses an unregistered requester).
+#
 # Alternatively, terminate TLS at an SCP/ingress that sets
 # x-forwarded-client-cert and set nrf.sbi.oauth2.trust_forwarded_client_cert
 # — but ONLY if that terminator strips any client-supplied copy of the header,
 # because otherwise any client can assert any identity by setting it.
 # ---------------------------------------------------------------------------
 
+# Shared by every NF below: where it keeps its own ES256 CCA signing key
+# (private, per-NF volume) and where it publishes the public half for the NRF
+# (shared, public-keys-only volume). Per-NF values (the pinned nfInstanceId and
+# the key filename) are set on each service.
+x-cca-volumes: &cca-volumes
+  - cca_keys:/var/lib/nextgcore/cca
+  - cca_public:/etc/nextgcore/cca-public
+
 services:
   # -- step 1: NRF (Authorization Server; client side only, token/jwks stay open)
+  #
+  # The NRF authenticates to ITSELF (criterion 5 of issue #187): with
+  # oauth2.require: true it requests tokens from its own endpoint for outbound NF
+  # status notifications, and its own policy applies. So it gets the same three
+  # variables every consumer gets, and reads the directory it also writes to.
   nrf:
+    environment:
+      - NEXTGCORE_NRF_INSTANCE_ID=6b1d7e3c-0000-4000-8000-0000000000f0
+      - NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE=/var/lib/nextgcore/cca/nrf-cca.key
+      - NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/etc/nextgcore/cca-public
     volumes:
       - ./configs/5gc/nrf-oauth2.yaml:/etc/nextgcore/nrf.yaml:ro
       - ./certs:/etc/nextgcore/certs:ro
+      - cca_keys:/var/lib/nextgcore/cca
+      - cca_public:/etc/nextgcore/cca-public
 
   # -- step 2: UDR
   udr:
+    environment:
+      - NEXTGCORE_UDR_INSTANCE_ID=6b1d7e3c-0000-4000-8000-000000000d00
+      - NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE=/var/lib/nextgcore/cca/udr-cca.key
+      - NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/etc/nextgcore/cca-public
     volumes:
       - ./configs/5gc/udr-oauth2.yaml:/etc/nextgcore/udr.yaml:ro
       - ./certs:/etc/nextgcore/certs:ro
+      - cca_keys:/var/lib/nextgcore/cca
+      - cca_public:/etc/nextgcore/cca-public
 
   # -- step 3: UDM + AUSF
   udm:
     environment:
       - NEXTGCORE_SBI_OAUTH2_REQUIRE=1
+      - NEXTGCORE_UDM_INSTANCE_ID=6b1d7e3c-0000-4000-8000-000000000d10
+      - NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE=/var/lib/nextgcore/cca/udm-cca.key
+      - NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/etc/nextgcore/cca-public
+    volumes: *cca-volumes
   ausf:
     environment:
       - NEXTGCORE_SBI_OAUTH2_REQUIRE=1
+      - NEXTGCORE_AUSF_INSTANCE_ID=6b1d7e3c-0000-4000-8000-00000000a05f
+      - NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE=/var/lib/nextgcore/cca/ausf-cca.key
+      - NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/etc/nextgcore/cca-public
+    volumes: *cca-volumes
 
   # -- step 4: PCF, BSF, NSSF, NSACF
   pcf:
     environment:
       - NEXTGCORE_SBI_OAUTH2_REQUIRE=1
+      - NEXTGCORE_PCF_INSTANCE_ID=6b1d7e3c-0000-4000-8000-000000000cf0
+      - NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE=/var/lib/nextgcore/cca/pcf-cca.key
+      - NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/etc/nextgcore/cca-public
+    volumes: *cca-volumes
   bsf:
+    environment:
+      - NEXTGCORE_BSF_INSTANCE_ID=6b1d7e3c-0000-4000-8000-000000000b0f
+      - NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE=/var/lib/nextgcore/cca/bsf-cca.key
+      - NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/etc/nextgcore/cca-public
     volumes:
       - ./configs/5gc/bsf-oauth2.yaml:/etc/nextgcore/bsf.yaml:ro
       - ./certs:/etc/nextgcore/certs:ro
+      - cca_keys:/var/lib/nextgcore/cca
+      - cca_public:/etc/nextgcore/cca-public
   nssf:
+    environment:
+      - NEXTGCORE_NSSF_INSTANCE_ID=6b1d7e3c-0000-4000-8000-0000000055f0
+      - NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE=/var/lib/nextgcore/cca/nssf-cca.key
+      - NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/etc/nextgcore/cca-public
     volumes:
       - ./configs/5gc/nssf-oauth2.yaml:/etc/nextgcore/nssf.yaml:ro
       - ./certs:/etc/nextgcore/certs:ro
+      - cca_keys:/var/lib/nextgcore/cca
+      - cca_public:/etc/nextgcore/cca-public
   nsacf:
+    environment:
+      - NEXTGCORE_NSACF_INSTANCE_ID=6b1d7e3c-0000-4000-8000-00000005acf0
+      - NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE=/var/lib/nextgcore/cca/nsacf-cca.key
+      - NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/etc/nextgcore/cca-public
     volumes:
       - ./configs/5gc/nsacf-oauth2.yaml:/etc/nextgcore/nsacf.yaml:ro
       - ./certs:/etc/nextgcore/certs:ro
+      - cca_keys:/var/lib/nextgcore/cca
+      - cca_public:/etc/nextgcore/cca-public
 
   # -- step 5: AMF + SMF (consumers of UDM/AUSF/PCF/NSACF)
   amf:
     environment:
       - NEXTGCORE_SBI_OAUTH2_REQUIRE=1
+      - NEXTGCORE_AMF_INSTANCE_ID=6b1d7e3c-0000-4000-8000-000000000af0
+      - NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE=/var/lib/nextgcore/cca/amf-cca.key
+      - NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/etc/nextgcore/cca-public
+    volumes: *cca-volumes
   smf:
     environment:
       - NEXTGCORE_SBI_OAUTH2_REQUIRE=1
+      - NEXTGCORE_SMF_INSTANCE_ID=6b1d7e3c-0000-4000-8000-0000000005f0
+      - NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE=/var/lib/nextgcore/cca/smf-cca.key
+      - NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/etc/nextgcore/cca-public
+    volumes: *cca-volumes
 
   # -- step 6: rest (lmf, mbsmf, nwdaf, dccf). ees/pin use their own knob.
   lmf:
     environment:
       - NEXTGCORE_SBI_OAUTH2_REQUIRE=1
+      - NEXTGCORE_LMF_INSTANCE_ID=6b1d7e3c-0000-4000-8000-000000000cf0
+      - NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE=/var/lib/nextgcore/cca/lmf-cca.key
+      - NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/etc/nextgcore/cca-public
+    volumes: *cca-volumes
   mbsmf:
     environment:
       - NEXTGCORE_SBI_OAUTH2_REQUIRE=1
+      - NEXTGCORE_MBSMF_INSTANCE_ID=6b1d7e3c-0000-4000-8000-0000000b05f0
+      - NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE=/var/lib/nextgcore/cca/mbsmf-cca.key
+      - NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/etc/nextgcore/cca-public
+    volumes: *cca-volumes
   nwdaf:
     environment:
       - NEXTGCORE_SBI_OAUTH2_REQUIRE=1
+      - NEXTGCORE_NWDAF_INSTANCE_ID=6b1d7e3c-0000-4000-8000-00000000fdaf
+      - NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE=/var/lib/nextgcore/cca/nwdaf-cca.key
+      - NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/etc/nextgcore/cca-public
+    volumes: *cca-volumes
   dccf:
     environment:
       - NEXTGCORE_SBI_OAUTH2_REQUIRE=1
+      - NEXTGCORE_DCCF_INSTANCE_ID=6b1d7e3c-0000-4000-8000-00000000dccf
+      - NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE=/var/lib/nextgcore/cca/dccf-cca.key
+      - NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR=/etc/nextgcore/cca-public
+    volumes: *cca-volumes
+
+volumes:
+  # Private ES256 CCA signing keys, one file per NF, generated 0600 on first
+  # start and reused thereafter. Named volumes rather than bind mounts for the
+  # same reason `udr_state` is: the NF processes run as the image's non-root
+  # `nextgcore` user, and a bind mount would arrive owned by the host user.
+  #
+  # Nothing in this volume is committed, which is the point of issue #187
+  # criterion 4 — the repository holds no private key material.
+  cca_keys:
+  # PUBLIC halves only, as <nfInstanceId>.jwk (RFC 7517). Shared, because the
+  # NRF reads it as its `cca_trusted_keys_dir`. Private keys never land here.
+  cca_public:

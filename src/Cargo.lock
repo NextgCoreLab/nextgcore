@@ -3018,6 +3018,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls 0.26.4",
+ "uuid",
  "webpki-roots 0.26.11",
  "x509-cert",
 ]

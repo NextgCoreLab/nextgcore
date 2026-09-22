@@ -174,7 +174,9 @@ fn apply_oauth2_enforcement(
     });
     cfg = cfg.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Mbsmf);
     if let Some(u) = uri {
-        let nf_instance_id = format!("mbsmf-{}", uuid::Uuid::new_v4());
+        let nf_instance_id =
+            nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Mbsmf)
+                .to_string();
         let _ = OAUTH2_CLIENT.set(Some(Arc::new(nextgcore_sbi::oauth::OAuth2Client::new(
             u,
             nf_instance_id,
@@ -208,7 +210,9 @@ async fn main() -> Result<()> {
     // Initialize context
     mbsmf_context_init(args.max_sessions);
 
-    let nf_instance_id = format!("mbsmf-{}", uuid::Uuid::new_v4());
+    let nf_instance_id =
+        nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Mbsmf)
+            .to_string();
 
     // Setup shutdown
     let shutdown = Arc::new(AtomicBool::new(false));

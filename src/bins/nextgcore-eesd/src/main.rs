@@ -300,10 +300,13 @@ async fn main() -> Result<()> {
         ..Default::default()
     });
 
-    let ees_id = args
-        .ees_id
-        .clone()
-        .unwrap_or_else(|| format!("ees-{}", uuid::Uuid::new_v4()));
+    // Issue #187: `--ees-id` seeds the shared resolver so it still wins, and the
+    // fallback resolves there instead of minting a UUID no operator can pin.
+    if let Some(id) = args.ees_id.as_deref() {
+        nextgcore_sbi::nf_instance_id::seed(id);
+    }
+    let ees_id = nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Ees)
+        .to_string();
     // #105: the same identity the ECS registration advertises is what an EEC-context
     // pull presents as `ees-id`. Publishing it here rather than reading a second
     // source of truth keeps the S-EES's view of who asked consistent with the ECS's.

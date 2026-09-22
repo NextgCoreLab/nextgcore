@@ -214,6 +214,157 @@ pub fn load_or_create_es256_key(path: &std::path::Path) -> SbiResult<p256::ecdsa
     Ok(key)
 }
 
+/// Serialise an ES256 public key as an RFC 7517 EC JWK, the inverse of
+/// [`parse_es256_jwk`].
+///
+/// `kid` is the owning NF's `nfInstanceId`, because that is the key under which
+/// the NRF stores it (`nrf.sbi.oauth2.cca_trusted_keys`) and looks it up when
+/// verifying a CCA (TS 33.501 §13.3.8.3).
+pub fn es256_public_jwk(key: &p256::ecdsa::VerifyingKey, kid: &str) -> serde_json::Value {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    // Uncompressed SEC1: 0x04 || X (32) || Y (32) — the form `parse_es256_jwk`
+    // reassembles from the x/y coordinates.
+    let point = key.to_encoded_point(false);
+    let bytes = point.as_bytes();
+    let (x, y) = bytes[1..].split_at(32);
+    serde_json::json!({
+        "kty": "EC",
+        "crv": "P-256",
+        "alg": "ES256",
+        "use": "sig",
+        "kid": kid,
+        "x": URL_SAFE_NO_PAD.encode(x),
+        "y": URL_SAFE_NO_PAD.encode(y),
+    })
+}
+
+/// Sidecar filename extension for the public half of a CCA signing key. The NRF
+/// reads a directory of these (`nrf.sbi.oauth2.cca_trusted_keys_dir`).
+pub const CCA_PUBLIC_JWK_EXTENSION: &str = "jwk";
+
+/// Publish the PUBLIC half of this NF's CCA signing key as an RFC 7517 JWK, so
+/// an NRF can be given a trust store without any private key leaving the NF and
+/// without anything being committed to the repository (issue #187, criterion 4).
+///
+/// Written to `<dir>/<nf_instance_id>.jwk`. The NRF's directory loader keys the
+/// entry by the file stem, which is why the filename is the instance ID.
+///
+/// Idempotent in the sense that matters: the file is REWRITTEN from the key that
+/// is actually in use on every start, so it can never drift out of step with the
+/// private key (a stale JWK would make the NRF reject this NF with
+/// `invalid_client` and give no hint why). The *private* key is the thing that
+/// must survive a restart, and [`load_or_create_es256_key`] already guarantees
+/// that: an existing key file is loaded, never replaced. So a second start
+/// republishes the SAME public key.
+///
+/// `0644`: a public key is not a secret, and the NRF runs as a different user.
+pub fn publish_cca_public_jwk(
+    key: &p256::ecdsa::SigningKey,
+    nf_instance_id: &str,
+    dir: &std::path::Path,
+) -> SbiResult<std::path::PathBuf> {
+    if nf_instance_id.trim().is_empty() {
+        return Err(SbiError::ClientError(
+            "cannot publish a CCA public JWK without an nfInstanceId to key it by".to_string(),
+        ));
+    }
+    // A path separator in the instance ID would write outside `dir`. The ID
+    // reaches us from configuration, so it is validated rather than trusted.
+    if nf_instance_id.contains('/') || nf_instance_id.contains('\\') || nf_instance_id == ".." {
+        return Err(SbiError::ClientError(format!(
+            "nfInstanceId {nf_instance_id:?} is not usable as a filename; a CCA trust-store \
+             entry is named after the instance ID it authenticates"
+        )));
+    }
+    std::fs::create_dir_all(dir).map_err(|e| {
+        SbiError::ClientError(format!(
+            "failed to create the CCA public-key directory {}: {e}",
+            dir.display()
+        ))
+    })?;
+    let path = dir.join(format!("{nf_instance_id}.{CCA_PUBLIC_JWK_EXTENSION}"));
+    let jwk = es256_public_jwk(key.verifying_key(), nf_instance_id);
+    let body = serde_json::to_string_pretty(&jwk)
+        .map_err(|e| SbiError::ClientError(format!("failed to serialise the CCA JWK: {e}")))?;
+    std::fs::write(&path, body)
+        .map_err(|e| SbiError::ClientError(format!("failed to write {}: {e}", path.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // World-readable on purpose: the NRF reads this, and it is a public key.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).map_err(|e| {
+            SbiError::ClientError(format!(
+                "failed to set permissions on {}: {e}",
+                path.display()
+            ))
+        })?;
+    }
+    log::info!(
+        "published the CCA public key for nfInstanceId {nf_instance_id} to {}",
+        path.display()
+    );
+    Ok(path)
+}
+
+/// Environment variable naming the directory this NF publishes its CCA PUBLIC
+/// JWK into (issue #187). Unset ⇒ nothing is published, which is the prior
+/// behaviour.
+///
+/// Paired with [`CCA_SIGNING_KEY_FILE_ENV`]: that names the private key this NF
+/// signs with, this names where the NRF can collect the public half. Keeping
+/// them separate means the private key directory need not be shared at all.
+pub const CCA_PUBLIC_JWK_DIR_ENV: &str = "NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR";
+
+/// Publish `key`'s public half when [`CCA_PUBLIC_JWK_DIR_ENV`] names a
+/// directory, and do nothing when it does not (the prior behaviour).
+///
+/// A publish failure is logged, never fatal, and never propagated: the NF can
+/// still run. What it cannot do is be trusted by an NRF loading its trust store
+/// from that directory — so the log names that consequence, because the symptom
+/// an operator would otherwise see is a bare `invalid_client`.
+fn publish_cca_public_jwk_if_configured(key: &p256::ecdsa::SigningKey, nf_instance_id: &str) {
+    let Some(dir) = std::env::var(CCA_PUBLIC_JWK_DIR_ENV)
+        .ok()
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+    else {
+        return;
+    };
+    if let Err(e) = publish_cca_public_jwk(key, nf_instance_id, std::path::Path::new(&dir)) {
+        log::error!(
+            "could not publish this NF's CCA public key to {dir}: {e}. An NRF that loads its \
+             CCA trust store from that directory will have no key for nfInstanceId \
+             {nf_instance_id} and will reject this NF's access-token requests with \
+             invalid_client (TS 33.501 §13.3.8.3)."
+        );
+    }
+}
+
+/// Resolve the CCA signing key from the environment AND publish its public half
+/// when [`CCA_PUBLIC_JWK_DIR_ENV`] is set — the whole consumer-side provisioning
+/// step, in one call an NF makes at startup (issue #187).
+///
+/// Returns whether a signing key is now configured. A *key* failure propagates,
+/// because a malformed key file needs a human (see
+/// [`load_or_create_es256_key`]); a publish failure does not, for the reason
+/// given on [`publish_cca_public_jwk_if_configured`].
+///
+/// `OAuth2Client::new` publishes too, so an NF that only constructs a client is
+/// already covered. Call this when the NF wants the key resolved EAGERLY at
+/// startup — a malformed key file then fails where it can be reported, instead
+/// of at the first token request.
+pub fn init_cca_client_credentials(nf_instance_id: &str) -> SbiResult<bool> {
+    if !init_cca_signing_key_from_env()? {
+        return Ok(false);
+    }
+    if let Some(key) = cca_signing_key_default() {
+        publish_cca_public_jwk_if_configured(&key, nf_instance_id);
+    }
+    Ok(true)
+}
+
 /// Generate a fresh ES256 (ECDSA P-256) signing key.
 pub fn generate_es256_key() -> p256::ecdsa::SigningKey {
     use rand::Rng;
@@ -992,19 +1143,33 @@ impl OAuth2Client {
     /// Create a new OAuth2 client. Its access-token path defaults to
     /// [`OAuth2Client::default_token_path`] (the process-wide selector, I4);
     /// override per instance with [`OAuth2Client::with_token_path`].
+    ///
+    /// Issue #187: this also PUBLISHES the public half of the resolved CCA
+    /// signing key when [`CCA_PUBLIC_JWK_DIR_ENV`] is set, so an NRF can be given
+    /// a trust store without any per-daemon wiring. Every NF already reaches its
+    /// signing key through this constructor (guarded by
+    /// `every_nf_builds_its_oauth2_client_through_the_shared_constructor`), which
+    /// makes it the one place that knows both the key and the `nfInstanceId` the
+    /// NRF will look it up under — so publishing here is the same
+    /// one-implementation argument as seeding the key here.
     pub fn new(
         nrf_uri: impl Into<String>,
         nf_instance_id: impl Into<String>,
         nf_type: NfType,
     ) -> Self {
+        let nf_instance_id = nf_instance_id.into();
+        let cca_signing_key = cca_signing_key_default();
+        if let Some(key) = cca_signing_key.as_ref() {
+            publish_cca_public_jwk_if_configured(key, &nf_instance_id);
+        }
         Self {
             nrf_uri: nrf_uri.into(),
-            nf_instance_id: nf_instance_id.into(),
+            nf_instance_id,
             nf_type,
             cache: TokenCache::new(),
             tls: None,
             token_path: Self::default_token_path().to_string(),
-            cca_signing_key: cca_signing_key_default(),
+            cca_signing_key,
         }
     }
 
@@ -1037,7 +1202,12 @@ impl OAuth2Client {
     /// key is configured. `aud` is the receiving NF's type, `"NRF"` for the
     /// access-token endpoint (TS 33.501 §13.3.8.3: the NRF checks the audience
     /// against its own NF type).
-    fn build_cca(&self) -> Option<String> {
+    ///
+    /// Public (issue #187) so a deployment can assert what its NFs will actually
+    /// present: the `sub` of this assertion is the exact string the NRF looks up
+    /// in `cca_trusted_keys`, so a test that stops at "a key is configured"
+    /// cannot tell a working pin from one that never reached the client.
+    pub fn build_cca(&self) -> Option<String> {
         let key = self.cca_signing_key.as_ref()?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1766,6 +1936,107 @@ mod tests {
             "aabbcc",
             "a failed load must not overwrite the file it could not parse"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #187: the published JWK must be the public half of the key that is
+    /// actually signing, and must parse back through the SAME function the NRF
+    /// uses to load its trust store (`parse_es256_jwk`).
+    ///
+    /// Asserted as a round trip rather than against a fixed vector because the
+    /// failure that matters is a coordinate mix-up or an endianness slip, which
+    /// produces a well-formed JWK for the WRONG key — the NRF would then reject
+    /// every CCA this NF signs with `invalid_client` and nothing would say why.
+    #[test]
+    fn a_published_cca_jwk_is_the_public_half_of_the_signing_key() {
+        let key = generate_es256_key();
+        let jwk = es256_public_jwk(key.verifying_key(), "nf-187-jwk-roundtrip");
+
+        assert_eq!(jwk["kty"], "EC");
+        assert_eq!(jwk["crv"], "P-256");
+        assert_eq!(jwk["alg"], "ES256");
+        // The NRF keys its trust store by nfInstanceId, so the kid carries it.
+        assert_eq!(jwk["kid"], "nf-187-jwk-roundtrip");
+
+        let parsed = parse_es256_jwk(&jwk).expect("the NRF's own loader must accept what we emit");
+        assert_eq!(
+            &parsed,
+            key.verifying_key(),
+            "the published JWK must be THIS key's public half, or the NRF verifies CCAs \
+             against the wrong key and rejects every one of them"
+        );
+
+        // And it really verifies a CCA this key signs (TS 33.501 §13.3.8.3).
+        let cca = mint_cca(
+            &key,
+            "nf-187-jwk-roundtrip",
+            NfType::Nrf.to_str(),
+            1_000,
+            60,
+        );
+        let sig_input = {
+            let mut p = cca.rsplitn(2, '.');
+            let _sig = p.next();
+            p.next().expect("signing input").to_string()
+        };
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        use p256::ecdsa::signature::Verifier;
+        let sig_bytes = URL_SAFE_NO_PAD
+            .decode(cca.rsplit('.').next().expect("signature"))
+            .expect("base64url signature");
+        let sig = p256::ecdsa::Signature::from_slice(&sig_bytes).expect("r||s signature");
+        assert!(
+            parsed.verify(sig_input.as_bytes(), &sig).is_ok(),
+            "a CCA signed by the private key must verify under the published public JWK"
+        );
+    }
+
+    /// Issue #187, criterion 4: publishing is idempotent — a second start
+    /// republishes the same key rather than rotating it — and the private key it
+    /// is derived from survives, because that is what an NRF trust store was
+    /// provisioned against.
+    #[test]
+    fn publishing_a_cca_public_key_twice_republishes_the_same_key() {
+        let dir = std::env::temp_dir().join(format!("sbi-cca-pub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let key_path = dir.join("private").join("amf-cca.key");
+        let jwk_dir = dir.join("public");
+
+        // First "start": key created, public half published.
+        let first = load_or_create_es256_key(&key_path).expect("absent means create");
+        let p1 = publish_cca_public_jwk(&first, "nf-187-idempotent", &jwk_dir).expect("publish");
+        assert_eq!(
+            p1.file_name().and_then(|n| n.to_str()),
+            Some("nf-187-idempotent.jwk"),
+            "the NRF keys its trust store by the file stem, so it must be the instance ID"
+        );
+        let body1 = std::fs::read_to_string(&p1).expect("read");
+
+        // Second "start": same private key loaded, same public JWK republished.
+        let second = load_or_create_es256_key(&key_path).expect("present means load");
+        assert_eq!(
+            first.to_bytes(),
+            second.to_bytes(),
+            "a restart must reuse the existing private key, not replace it"
+        );
+        let p2 = publish_cca_public_jwk(&second, "nf-187-idempotent", &jwk_dir).expect("publish");
+        assert_eq!(p1, p2);
+        assert_eq!(
+            body1,
+            std::fs::read_to_string(&p2).expect("read"),
+            "a second start must republish the SAME public key; a rotated one would silently \
+             stop the NRF trusting this NF"
+        );
+
+        // A path separator in the instance ID must not escape the directory.
+        assert!(
+            publish_cca_public_jwk(&second, "../escape", &jwk_dir).is_err(),
+            "an instance ID with a path separator must be refused, not written outside the \
+             trust-store directory"
+        );
+        assert!(publish_cca_public_jwk(&second, "  ", &jwk_dir).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -40,6 +40,10 @@ hex.workspace = true
 # Randomized W3C traceparent trace-id/span-id (sbi-09) and OCI load-shedding
 # probabilistic reaction (sbi-08). Workspace-pinned; no root Cargo.toml change.
 rand.workspace = true
+# Issue #187: generate this NF's own nfInstanceId when no operator pin is
+# configured. TS 29.571 types NfInstanceId as a UUID, and resolving it in ONE
+# place is what gives ONE process ONE identity (see `nf_instance_id`).
+uuid.workspace = true
 p256 = { workspace = true, features = ["ecdsa"] }
 # Issue #186: parse the URI SubjectAltName out of a peer's verified client
 # certificate (TS 33.310 carries the NF Instance ID there). RustCrypto, so it

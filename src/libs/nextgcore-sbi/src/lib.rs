@@ -34,6 +34,7 @@
 //! - [`server`] - HTTP/2 server implementation
 //! - [`context`] - NF instance and service discovery context
 //! - [`tls`] - TLS/mTLS configuration and certificate loading
+//! - [`nf_instance_id`] - this NF's own pinnable `nfInstanceId` (issue #187)
 //! - [`oauth`] - OAuth2 client credentials flow for 5G SBA
 //! - [`overload`] - OCI/LCI overload & load control parse/emit + reaction
 //! - [`error`] - Error types
@@ -51,6 +52,7 @@ pub mod json_patch; // RFC 6902 JSON Patch engine (shared from nssfd, issue #96)
 pub mod message;
 pub mod multipart;
 pub mod nes; // NES idle/sleep state machine (issue #22, non-normative)
+pub mod nf_instance_id; // This NF's own pinnable nfInstanceId (issue #187)
 pub mod oauth;
 pub mod overload;
 pub mod peer_cert; // NF identity from a verified TLS peer certificate (issue #186)

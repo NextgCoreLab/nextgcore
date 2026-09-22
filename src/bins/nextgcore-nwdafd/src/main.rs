@@ -197,7 +197,9 @@ fn apply_oauth2_enforcement(
     });
     cfg = cfg.with_expected_audience_nf_type(nextgcore_sbi::types::NfType::Nwdaf);
     if let Some(u) = uri {
-        let nf_instance_id = format!("nwdaf-{}", uuid::Uuid::new_v4());
+        let nf_instance_id =
+            nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Nwdaf)
+                .to_string();
         let _ = OAUTH2_CLIENT.set(Some(Arc::new(nextgcore_sbi::oauth::OAuth2Client::new(
             u,
             nf_instance_id,
@@ -228,9 +230,14 @@ async fn main() -> Result<()> {
     log::info!("NextGCore NWDAF v{}", env!("CARGO_PKG_VERSION"));
     log::info!("Network Data Analytics Function (3GPP TS 23.288)");
 
-    let nf_instance_id = args
-        .nf_instance_id
-        .unwrap_or_else(|| format!("nwdaf-{}", uuid::Uuid::new_v4()));
+    // Issue #187: the flag seeds the shared resolver (so it still wins) and the
+    // fallback resolves there rather than minting an id no operator can pin.
+    if let Some(id) = args.nf_instance_id.as_deref() {
+        nextgcore_sbi::nf_instance_id::seed(id);
+    }
+    let nf_instance_id =
+        nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Nwdaf)
+            .to_string();
 
     nwdaf_context_init(nf_instance_id.clone(), args.max_subscriptions);
 

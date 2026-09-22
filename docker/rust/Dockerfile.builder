@@ -97,6 +97,24 @@ RUN CARGO_TARGET=$(cat /tmp/cargo_target) && \
         fi; \
     done
 
+# Issue #187: the CCA token probe, used by the Docker E2E OAuth2 overlay stage to
+# assert POSITIVELY that a consumer completes an authenticated token exchange over
+# the wire (and that an untrusted key is refused). Built here because it must run
+# INSIDE a container: the private CCA key lives on a volume that is deliberately
+# not shared with the host, and the NRF is only reachable on the core network.
+#
+# An example rather than a test binary, because it needs a live NRF and a populated
+# trust store — neither exists under `cargo test`.
+RUN CARGO_TARGET=$(cat /tmp/cargo_target) && \
+    if [ "$(uname -m)" != "$(echo $CARGO_TARGET | cut -d- -f1)" ]; then \
+        cargo build --release --target "$CARGO_TARGET" -p nextgcore-sbi \
+            --example cca_token_probe 2>&1 && \
+        cp "target/$CARGO_TARGET/release/examples/cca_token_probe" /out/; \
+    else \
+        cargo build --release -p nextgcore-sbi --example cca_token_probe 2>&1 && \
+        cp target/release/examples/cca_token_probe /out/; \
+    fi
+
 # Rebuild amfd WITH the native kernel-SCTP NGAP backend (production
 # remediation T0.2b) so `--sctp-backend kernel` is available at runtime; this
 # overwrites the default (userspace-only) amfd binary in /out. The binary still

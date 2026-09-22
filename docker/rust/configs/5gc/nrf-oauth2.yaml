@@ -42,20 +42,35 @@ nrf:
     oauth2:
       require: true
       # ---------------------------------------------------------------------
-      # ESCAPE HATCH (issue #64 gap 1). Client authentication at the token
-      # endpoint now defaults ON: the NRF requires a CCA signed with a key it
-      # trusts for the requesting nfInstanceId, or an mTLS client identity.
+      # Token-endpoint client authentication (TS 33.501 §13.3.1) is REQUIRED
+      # here — by leaving `require_client_auth` unset, so this file inherits the
+      # secure default rather than restating it. The NRF logs
+      # "token-endpoint client authentication required" at startup; if you ever
+      # see the DISABLED warn! instead, something set the escape hatch.
       #
-      # This overlay cannot satisfy that yet, and the reason is concrete: the
-      # NRF verifies a CCA against `cca_trusted_keys`, which is keyed by
-      # nfInstanceId — but no NF in docker-compose.yml pins its instance ID, so
-      # every NF generates a fresh UUID on each start and there is no stable key
-      # to pre-register. Provisioning it needs (a) pinned nfInstanceIds per NF,
-      # (b) a generated ES256 key per NF mounted at
-      # NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE, and (c) the matching public JWKs
-      # listed under cca_trusted_keys here.
+      # Issue #187: the escape hatch (`require_client_auth: false`) that used to
+      # live here is GONE. It was needed because no NF could pin its
+      # nfInstanceId, so the trust store below — keyed by nfInstanceId — had
+      # nothing stable to key on. Both halves are now provisioned by the
+      # overlay, entirely from environment variables:
       #
-      # Until then this overlay explicitly opts out, so the insecure posture is
-      # asked for by name and announced with a startup warn! rather than being a
-      # silent default. DO NOT copy this line into a production config.
-      require_client_auth: false
+      #   NEXTGCORE_<TYPE>_INSTANCE_ID       pins the NF's nfInstanceId
+      #   NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE where it keeps its ES256 CCA key
+      #                                      (generated 0600 on first start,
+      #                                      reused thereafter, never silently
+      #                                      replaced)
+      #   NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR   where it publishes the PUBLIC half
+      #                                      as <nfInstanceId>.jwk
+      #
+      # See docker-compose.oauth2.yml for the values.
+      #
+      # The NRF trusts that directory. No private key is committed anywhere, and
+      # nothing has to template this YAML: each NF writes its own public key and
+      # the NRF reads whatever is there. Because the NRF boots BEFORE every NF
+      # that publishes into it, a key that appears after startup is picked up on
+      # first use — still fail-closed, so an NF with no published key is refused
+      # `invalid_client` (TS 33.501 §13.3.8.3).
+      #
+      # `cca_trusted_keys` (the inline RFC 7517 JWK list) still works and takes
+      # lower precedence; use it for keys you manage out of band.
+      cca_trusted_keys_dir: /etc/nextgcore/cca-public

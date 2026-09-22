@@ -254,6 +254,143 @@ jobs:
           cd nextgcore/docker/rust
           docker compose down -v
 
+      # Issue #187: the OAuth2 overlay is the project's only end-to-end
+      # demonstration of SBI OAuth2, and it used to run with token-endpoint
+      # client authentication DISABLED, because nothing could pin an
+      # nfInstanceId and so no CCA trust store could be provisioned. Both are
+      # fixed; this stage is what keeps them fixed.
+      #
+      # SCHEDULED half of the two-gate split in specs/cross-repo-e2e-gating.md.
+      # The per-PR half is the in-process nrfd test
+      # `a_cca_signed_by_a_directory_published_key_is_accepted_and_an_unpublished_one_is_not`,
+      # which asserts the same positive AND negative outcomes against the real
+      # token handler. Neither substitutes for the other: the unit test cannot
+      # prove two containers complete the exchange over the wire, and this stage
+      # cannot run on a PR.
+      #
+      # SCOPE CEILING, stated rather than implied: this reuses the 10 NF images
+      # the build step above produces, so it exercises nrf/udr/udm/ausf/pcf/
+      # nssf/bsf/amf/smf/upf. The overlay also configures dccf, lmf, mbsmf,
+      # nsacf and nwdaf, and those five are NOT covered here because no image for
+      # them is built in this job. Extending the build list would roughly double
+      # an already ~20-minute stage; the five are Rel-17 NFs off the
+      # registration + PDU-session path this stage asserts.
+      - name: Start the OAuth2 overlay (authenticated token endpoint)
+        run: |
+          cd nextgcore/docker/rust
+          C="-f docker-compose.yml -f docker-compose.oauth2.yml"
+          docker compose $C up -d mongodb nrf
+          sleep 5
+          docker compose $C up -d ausf udm udr pcf nssf bsf
+          sleep 5
+          docker compose $C up -d amf smf upf
+          sleep 15
+
+      - name: Assert client authentication is REQUIRED, not opted out
+        run: |
+          cd nextgcore/docker/rust
+          C="-f docker-compose.yml -f docker-compose.oauth2.yml"
+          LOG=$(docker compose $C logs nrf)
+          echo "$LOG" | grep -F 'token-endpoint client authentication required' \
+            || { echo "::error::the NRF did not log client authentication as REQUIRED"; \
+                 echo "$LOG" | tail -60; exit 1; }
+          # The escape hatch this issue removed must not be back by any route
+          # (the config key, or NRF_SBI_OAUTH2_ALLOW_UNAUTHENTICATED).
+          if echo "$LOG" | grep -F 'client authentication is DISABLED'; then
+            echo "::error::the NRF opted OUT of client authentication -- #187 regressed"
+            exit 1
+          fi
+
+      - name: Assert consumers published CCA keys and no private key leaked
+        run: |
+          cd nextgcore/docker/rust
+          C="-f docker-compose.yml -f docker-compose.oauth2.yml"
+          PUBLISHED=$(docker compose $C exec -T nrf \
+            sh -c 'ls /etc/nextgcore/cca-public/*.jwk 2>/dev/null | wc -l' | tr -d '\r')
+          echo "published CCA public JWKs: $PUBLISHED"
+          if [ "${PUBLISHED:-0}" -lt 2 ]; then
+            echo "::error::expected several published CCA public keys, found ${PUBLISHED:-0}"
+            docker compose $C logs nrf | tail -40
+            exit 1
+          fi
+          # Criterion 4: only PUBLIC material in the shared directory.
+          if docker compose $C exec -T nrf sh -c 'ls /etc/nextgcore/cca-public/' \
+               | grep -q '\.key$'; then
+            echo "::error::a private key is in the PUBLIC JWK directory"
+            exit 1
+          fi
+
+      # POSITIVE assertion, and it has to be positive. The first version of this
+      # step grepped the logs for `invalid_client` and passed when it found none —
+      # which a dispatched run proved VACUOUS: the log contained zero token
+      # requests, because a bring-up-only run gives the NFs no reason to need a
+      # token. A negative assertion is satisfied by every path that never arrives.
+      #
+      # So drive the live token endpoint over the wire with a CCA signed by a key
+      # the NRF actually holds (from the shared trust-store directory), and require
+      # a real token back. The probe ALSO presents a CCA signed by an untrusted key
+      # and requires `invalid_client`, so a pass cannot come from an NRF that
+      # authenticates nobody — the posture #187 removed.
+      #
+      # Run inside the AMF container: it is the only place that can reach both the
+      # private key (on the `cca_keys` volume, deliberately not shared with the
+      # host) and the NRF on the core network.
+      - name: Assert the authenticated token exchange succeeded (positive + negative)
+        run: |
+          cd nextgcore/docker/rust
+          C="-f docker-compose.yml -f docker-compose.oauth2.yml"
+          docker compose $C ps
+          # The probe is extracted from the builder image into binaries/ alongside
+          # the NF binaries (see Dockerfile.builder).
+          test -f binaries/cca_token_probe \
+            || { echo "::error::binaries/cca_token_probe missing -- the builder did not produce it"; exit 1; }
+          docker cp binaries/cca_token_probe nextgcore-amf:/tmp/cca_token_probe
+          docker compose $C exec -T --user root amf chmod 0755 /tmp/cca_token_probe
+          docker compose $C exec -T amf /tmp/cca_token_probe \
+            http://172.23.0.10:7777 \
+            /var/lib/nextgcore/cca/amf-cca.key \
+            6b1d7e3c-0000-4000-8000-000000000af0 \
+            AMF UDM nudm-sdm
+
+      - name: Assert the NRF authenticates to ITSELF under its own policy
+        run: |
+          cd nextgcore/docker/rust
+          C="-f docker-compose.yml -f docker-compose.oauth2.yml"
+          # Criterion 5: with oauth2.require: true the NRF requests tokens from its
+          # own endpoint for outbound notifications and is not exempt from its own
+          # policy. It needs its own CCA key AND a registration in its own registry.
+          #
+          # CCA_PROBE_AUTH_ONLY=1, and the reason is a real finding rather than a
+          # workaround: a dispatched run returned
+          #   unauthorized_client ... "NRF" is not in allowedNfTypes of any UDM producer
+          # which is the CORRECT SBA authorization decision — every producer in the
+          # overlay restricts allowedNfTypes to its actual consumers and none lists
+          # NRF. Authorization is a different question from authentication and
+          # happens after it (TS 33.501 §13.4.1.1.2 step 2).
+          #
+          # So this asserts what criterion 5 actually claims: the NRF gets PAST
+          # client authentication against its own endpoint. `invalid_client` — the
+          # authentication failure — still fails the step.
+          docker cp binaries/cca_token_probe nextgcore-nrf:/tmp/cca_token_probe
+          docker compose $C exec -T --user root nrf chmod 0755 /tmp/cca_token_probe
+          docker compose $C exec -T -e CCA_PROBE_AUTH_ONLY=1 nrf /tmp/cca_token_probe \
+            http://172.23.0.10:7777 \
+            /var/lib/nextgcore/cca/nrf-cca.key \
+            6b1d7e3c-0000-4000-8000-0000000000f0 \
+            NRF UDM nudm-sdm
+
+      - name: Collect overlay logs on failure
+        if: failure()
+        run: |
+          cd nextgcore/docker/rust
+          docker compose -f docker-compose.yml -f docker-compose.oauth2.yml logs --tail=80
+
+      - name: Teardown the overlay
+        if: always()
+        run: |
+          cd nextgcore/docker/rust
+          docker compose -f docker-compose.yml -f docker-compose.oauth2.yml down -v
+
   # NOT an end-to-end attach, and named so deliberately (#328). Nothing in either
   # repo speaks S1AP or LTE NAS on the UE side, so no UE attach can be
   # originated. This stage asserts bring-up and PFCP association health, which is
