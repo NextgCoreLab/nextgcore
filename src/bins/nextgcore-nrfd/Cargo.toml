@@ -34,6 +34,13 @@ p256 = { workspace = true, features = ["ecdsa"] }
 
 [dev-dependencies]
 proptest.workspace = true
+# Issue #393: build a real CA and a real leaf over a CCA signing key, so the x5c
+# binding tests exercise interoperable X.509 rather than a byte fixture of my own
+# making. Test-only: no production path in nrfd generates a certificate.
+rcgen = "0.13"
+# Issue #393: set an explicit notBefore/notAfter on those test certificates.
+# rcgen's default window is 1975..4096, which makes any expiry assertion vacuous.
+time = { version = "0.3", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true
