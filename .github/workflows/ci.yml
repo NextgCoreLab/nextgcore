@@ -346,11 +346,32 @@ jobs:
             || { echo "::error::binaries/cca_token_probe missing -- the builder did not produce it"; exit 1; }
           docker cp binaries/cca_token_probe nextgcore-amf:/tmp/cca_token_probe
           docker compose $C exec -T --user root amf chmod 0755 /tmp/cca_token_probe
+          # Issue #393: capture the output so the mechanism line can be asserted
+          # POSITIVELY below. `tee` keeps it in the log for a human too, and the
+          # pipefail guard means the probe's own exit code still gates the step.
+          set -o pipefail
           docker compose $C exec -T amf /tmp/cca_token_probe \
             http://172.23.0.10:7777 \
             /var/lib/nextgcore/cca/amf-cca.key \
             6b1d7e3c-0000-4000-8000-000000000af0 \
-            AMF UDM nudm-sdm
+            AMF UDM nudm-sdm | tee /tmp/probe-amf.log
+          # Issue #393: assert WHICH binding mechanism this stage exercised, as a
+          # POSITIVE grep for a line the probe always prints. This is deliberately
+          # not a claim that x5c works — it is a claim about what was covered, so
+          # that if someone later wires cca_trust_anchors into the overlay and the
+          # NFs silently keep using the trust store, this step FAILS and says so
+          # instead of staying green while proving less than it appears to.
+          #
+          # Proven able to fail: an earlier local run with the grep inverted (to
+          # expect "x5c certificate chain") failed here, confirming the line is
+          # really emitted and really read rather than matching by accident.
+          grep -F 'binding mechanism: cca_trusted_keys store' /tmp/probe-amf.log \
+            || { echo "::error::the probe did not report the trust-store binding. If \
+                 cca_trust_anchors is now configured in the overlay, update this \
+                 assertion to expect 'binding mechanism: x5c certificate chain' and \
+                 update specs/fix-cca-x5c-certificate-binding.md, which records that \
+                 this stage does NOT cover x5c."; \
+                 cat /tmp/probe-amf.log; exit 1; }
 
       - name: Assert the NRF authenticates to ITSELF under its own policy
         run: |

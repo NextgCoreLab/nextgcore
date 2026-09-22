@@ -50,6 +50,12 @@ p256 = { workspace = true, features = ["ecdsa"] }
 # builds on the same `der` already in the graph via p256 -- no second ASN.1 stack,
 # and no hand-rolled X.509 parsing for a security-relevant identity.
 x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+# Issue #393: X.509 path validation for a CCA's `x5c` chain (TS 33.501 §13.3.8.3).
+# This is the SAME verifier rustls already uses for every TLS chain in this tree
+# (it is rustls's own dependency, already in Cargo.lock), named explicitly here so
+# the certificate binding is not a second, hand-rolled path builder. `ring` to
+# match the rustls provider the default build selects.
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std", "ring"] }
 # http3-feature-only: HTTP/3 transport prototype (issue #15). Crate-local, not
 # workspace-pinned — no other crate may depend on these (non-normative research).
 h3 = { version = "0.0.8", optional = true }
@@ -61,8 +67,13 @@ http = { version = "1.4", optional = true }
 # Bench-only: SBA transport benchmark harness (issue #15).
 criterion = "0.8.2"
 proptest.workspace = true
-# Test-only: generate a self-signed cert for the in-memory TLS exporter test.
+# Test-only: generate a self-signed cert for the in-memory TLS exporter test, and
+# (issue #393) a real CA plus CCA-signing-key leaf for the x5c binding tests.
 rcgen = "0.13"
+# Test-only: set an EXPLICIT notBefore/notAfter on a generated test certificate.
+# rcgen's default window is 1975..4096, so without this the expiry test passes
+# vacuously (it did, until it was tightened). Already in the graph via rcgen.
+time = { version = "0.3", default-features = false, features = ["std"] }
 # Test-only: `start_paused` runtimes, so the `poll_until` budget tests assert an
 # EXACT elapsed time instead of a tolerance window (#370). Not in the `full`
 # feature set; dev-only, so no production build gains a time-mocking clock.

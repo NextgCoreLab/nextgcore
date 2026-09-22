@@ -122,6 +122,26 @@ struct SbiOauth2Yaml {
     /// or partial, and a CCA from an NF with no key in it is rejected
     /// fail-closed (TS 33.501 §13.3.8.3) rather than accepted unverified.
     cca_trusted_keys_dir: Option<String>,
+    /// Issue #393: PEM file of CA certificates that CCA signing certificates are
+    /// validated against, for the `x5c` path of TS 33.501 §13.3.8.2/§13.3.8.3.
+    ///
+    /// This is the CONFORMANT binding. When a CCA carries `x5c`, the NRF validates
+    /// the chain to one of these anchors, requires the leaf's URI SubjectAltName
+    /// (TS 33.310: `urn:uuid:<nfInstanceId>`) to equal the assertion's `sub`, and
+    /// verifies the JWS against the key the leaf certifies — so the certificate,
+    /// not operator configuration, decides who the requester is.
+    ///
+    /// Precedence is deliberate and is NOT a fallback chain:
+    ///
+    /// - CCA carries `x5c` **and** this is set ⇒ the certificate is authoritative
+    ///   and `cca_trusted_keys[_dir]` is not consulted at all, not even on failure.
+    /// - CCA carries `x5c` and this is NOT set ⇒ `invalid_client`. Downgrading to
+    ///   the trust store would let a requester CHOOSE the weaker check by attaching
+    ///   a certificate.
+    /// - CCA carries no `x5c` ⇒ the trust store, exactly as before. This is the
+    ///   no-PKI path that keeps plaintext dev and the docker OAuth2 overlay working
+    ///   (issue #187); it is a documented deviation from §13.3.8.2, confined here.
+    cca_trust_anchors: Option<String>,
 }
 
 /// I1: one entry of the CCA trusted-key store. `jwk` is an RFC 7517 EC JWK
@@ -232,6 +252,14 @@ struct NrfPolicy {
     /// directory and, finding nothing, still rejects (TS 33.501 §13.3.8.3). It
     /// only removes a startup-ordering dependency.
     cca_trusted_keys_dir: Option<std::path::PathBuf>,
+    /// Issue #393: DER CA certificates a CCA's `x5c` chain is validated against
+    /// (TS 33.501 §13.3.8.3). Loaded once at startup from
+    /// `nrf.sbi.oauth2.cca_trust_anchors`.
+    ///
+    /// Empty means the `x5c` path is not configured, and a CCA that carries `x5c`
+    /// is then REFUSED rather than downgraded to the trust store — see the
+    /// precedence rules on the YAML field.
+    cca_trust_anchors: Vec<Vec<u8>>,
 }
 
 impl Default for NrfPolicy {
@@ -260,6 +288,11 @@ impl Default for NrfPolicy {
             trust_forwarded_client_cert: false,
             cca_trusted_keys: std::collections::HashMap::new(),
             cca_trusted_keys_dir: None,
+            // Issue #393: no PKI by default. An NF that presents `x5c` against
+            // this is refused (not downgraded), and an NF that presents none takes
+            // the trust-store path — so the shipped default is byte-compatible
+            // with #187's overlay.
+            cca_trust_anchors: Vec::new(),
         }
     }
 }
@@ -345,8 +378,53 @@ impl NrfPolicy {
                 // the NRF boots before the NFs that publish into this directory.
                 p.cca_trusted_keys_dir = Some(dir);
             }
+            // Issue #393: the CCA certificate trust anchors for the `x5c` path
+            // (TS 33.501 §13.3.8.3).
+            if let Some(path) = o
+                .cca_trust_anchors
+                .as_deref()
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+            {
+                p.load_cca_trust_anchors(std::path::Path::new(path));
+            }
         }
         p
+    }
+
+    /// Issue #393: load the CA certificates a CCA's `x5c` chain is validated
+    /// against (TS 33.501 §13.3.8.3).
+    ///
+    /// A failure is a `warn!` and not fatal, which is NOT a weakening: with no
+    /// anchors loaded, `authenticate_token_client` refuses every `x5c`-bearing CCA
+    /// rather than falling back to the trust store. So a misconfigured anchor file
+    /// makes the conformant path unavailable and fail-closed, instead of making the
+    /// NRF trust chains it cannot validate. The log names that consequence, because
+    /// the symptom at the far end is a bare `invalid_client`.
+    fn load_cca_trust_anchors(&mut self, path: &std::path::Path) {
+        match nextgcore_sbi::tls::load_certs(&path.display().to_string()) {
+            Ok(certs) if certs.is_empty() => log::warn!(
+                "nrfd-393: the CCA trust-anchor file {} holds no certificates. Every CCA that \
+                 carries an x5c chain will be refused invalid_client (TS 33.501 §13.3.8.3); NFs \
+                 with no x5c still use the cca_trusted_keys store.",
+                path.display()
+            ),
+            Ok(certs) => {
+                self.cca_trust_anchors = certs.into_iter().map(|c| c.as_ref().to_vec()).collect();
+                log::info!(
+                    "nrfd-393: loaded {} CCA trust anchor(s) from {}; a CCA carrying x5c is now \
+                     bound to its certificate's NF Instance ID (TS 33.501 §13.3.8.3, TS 33.310)",
+                    self.cca_trust_anchors.len(),
+                    path.display()
+                );
+            }
+            Err(e) => log::warn!(
+                "nrfd-393: cannot read the CCA trust-anchor file {}: {e}. Every CCA that carries \
+                 an x5c chain will be refused invalid_client; NFs with no x5c still use the \
+                 cca_trusted_keys store.",
+                path.display()
+            ),
+        }
     }
 
     /// Issue #187: load every `<nfInstanceId>.jwk` in `dir` into the CCA trust
@@ -2832,13 +2910,20 @@ fn authorize_access_token(
 ///
 /// This function performs the claim-binding plus the iat/aud validation mandated
 /// of the NRF by §13.3.8.3. The CCA's ES256 JWS SIGNATURE is verified by the
-/// companion [`verify_cca_signature`] (I1): the token handler calls it, when the
-/// `cca_verify_signature` policy knob is ON, against the requesting NF's trusted
-/// public key from the `cca_trusted_keys` store. Signature verification is
-/// default-OFF and fail-closed (an issuer with no trusted key, or a bad
-/// signature, is rejected). NF trusted-key distribution beyond this config-store
-/// (e.g. an x5c cert chain or an mTLS client-cert subject surfaced on
-/// `SbiRequest`) remains an additive `nextgcore-sbi` extension.
+/// companion [`verify_cca_signature`] (I1), against a key resolved by
+/// [`resolve_cca_verifying_key`] — which is where §13.3.8.3's FOURTH and final
+/// bullet now lives (issue #393):
+///
+/// > It verifies that the NF instance ID of the NFc in the CCA matches the NF
+/// > instance ID in the public key certificate used for signing the CCA.
+///
+/// When the CCA carries an `x5c` chain (TS 33.501 §13.3.8.2) the NRF validates it
+/// to a configured CA, requires the leaf's URI SubjectAltName to equal `sub`, and
+/// verifies the signature against the key that certificate certifies — so the
+/// certificate is authoritative and `cca_trusted_keys` is not consulted. With no
+/// `x5c` the trust store remains the binding, which is a documented deviation kept
+/// for deployments with no PKI (issue #187). `x5u` is refused by name; the
+/// reasoning is in [`nextgcore_sbi::cca_x5c`].
 fn verify_cca_binding(
     cca_jwt: &str,
     expected_nf_instance_id: &str,
@@ -2990,6 +3075,134 @@ fn verify_cca_signature(
             )
         })?;
     Ok(())
+}
+
+/// Issue #393 (TS 33.501 §13.3.8.3, last bullet): resolve the public key the
+/// CCA's JWS signature must be verified against, and — when the assertion carries
+/// an `x5c` chain — BIND that certificate to the asserted NF Instance ID.
+///
+/// This is the function that decides which of the two mechanisms is authoritative,
+/// so the precedence is exhaustive and has no fallback edge:
+///
+/// | CCA header | `cca_trust_anchors` | outcome |
+/// |---|---|---|
+/// | `x5c` | configured | chain validated, leaf URI SAN == `sub` enforced, key taken FROM THE LEAF. The trust store is not consulted, even on failure. |
+/// | `x5c` | empty | `invalid_client`. Not a downgrade: see below. |
+/// | `x5u` | either | `invalid_client`, naming `x5u` as unsupported. |
+/// | neither | either | the `cca_trusted_keys` store, then `cca_trusted_keys_dir` — unchanged from issue #187. |
+///
+/// **Why an `x5c`-bearing CCA is refused rather than downgraded when no anchors are
+/// configured.** The alternative — try the certificate, fall back to the trust
+/// store — hands the requester the choice of which check it faces, because the
+/// requester decides whether to attach `x5c`. A malformed or untrusted chain would
+/// become a way to reach the weaker path. So the presence of `x5c` COMMITS the
+/// request to the certificate path, and failure there is final.
+///
+/// The key comes from the validated leaf, not from the store, and that is the whole
+/// point: a chain that is validated but not used to verify the signature would
+/// constrain nothing about who actually signed the assertion.
+fn resolve_cca_verifying_key(
+    policy: &NrfPolicy,
+    cca_jwt: &str,
+    nf_instance_id: &str,
+    now: u64,
+) -> Result<p256::ecdsa::VerifyingKey, (&'static str, String)> {
+    use nextgcore_sbi::cca_x5c::{cert_reference_from_jose_header, CcaCertReference};
+
+    let header = decode_cca_jose_header(cca_jwt)?;
+    let reference = cert_reference_from_jose_header(&header).map_err(|e| {
+        (
+            "invalid_client",
+            format!("Client Credentials Assertion certificate reference is unusable: {e}"),
+        )
+    })?;
+
+    match reference {
+        CcaCertReference::Chain(chain) => {
+            if policy.cca_trust_anchors.is_empty() {
+                return Err((
+                    "invalid_client",
+                    "Client Credentials Assertion carries an x5c certificate chain but this NRF \
+                     has no cca_trust_anchors configured, so the certificate binding required by \
+                     TS 33.501 §13.3.8.3 cannot be evaluated. The request is refused rather than \
+                     verified against the cca_trusted_keys store, because falling back would let \
+                     a requester choose the weaker check."
+                        .to_string(),
+                ));
+            }
+            let verified =
+                nextgcore_sbi::cca_x5c::verify_x5c_binding(&chain, &policy.cca_trust_anchors, now)
+                    .map_err(|e| ("invalid_client", format!("CCA x5c chain rejected: {e}")))?;
+
+            // §13.3.8.3's final bullet, the reason this issue exists. Both ids are
+            // named: a mismatch is an operator-visible misissuance or an attempted
+            // impersonation, and "they differ" without saying how is undiagnosable.
+            if verified.nf_instance_id != nf_instance_id {
+                return Err((
+                    "invalid_client",
+                    format!(
+                        "CCA x5c certificate binds NF Instance ID {:?}, but the assertion claims \
+                         {nf_instance_id:?}; TS 33.501 §13.3.8.3 requires them to match",
+                        verified.nf_instance_id
+                    ),
+                ));
+            }
+
+            verified.es256_verifying_key().map_err(|e| {
+                (
+                    "invalid_client",
+                    format!("CCA x5c leaf certificate does not certify a usable ES256 key: {e}"),
+                )
+            })
+        }
+        CcaCertReference::Url(url) => Err((
+            "invalid_client",
+            format!(
+                "Client Credentials Assertion references its signing certificate by x5u ({url}); \
+                 this NRF implements only the x5c arm of TS 33.501 §13.3.8.2, because fetching a \
+                 requester-supplied URL during unauthenticated token issuance is an SSRF and \
+                 availability hazard. Present the certificate chain inline as x5c."
+            ),
+        )),
+        CcaCertReference::Absent => {
+            // No certificate reference: the pre-#393 trust-store path (issue #187).
+            // Fail-closed, unchanged — an issuer with no trusted key is refused.
+            match policy.cca_trusted_keys.get(nf_instance_id) {
+                Some(k) => Ok(*k),
+                None => match policy.lookup_cca_trusted_key_on_disk(nf_instance_id) {
+                    Some(k) => Ok(k),
+                    None => Err((
+                        "invalid_client",
+                        format!(
+                            "no trusted ES256 key configured to verify the CCA signature of \
+                             nfInstanceId {nf_instance_id:?}"
+                        ),
+                    )),
+                },
+            }
+        }
+    }
+}
+
+/// Decode a CCA's JWS protected header to JSON.
+///
+/// Split out because both [`verify_cca_signature`] (which checks `alg`) and
+/// [`resolve_cca_verifying_key`] (which reads `x5c`/`x5u`) need it, and a second
+/// hand-rolled decode of the same attacker-supplied bytes is how the two drift
+/// apart.
+fn decode_cca_jose_header(cca_jwt: &str) -> Result<serde_json::Value, (&'static str, String)> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    let first = cca_jwt.split('.').next().unwrap_or("");
+    URL_SAFE_NO_PAD
+        .decode(first)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .ok_or((
+            "invalid_client",
+            "Client Credentials Assertion header is not valid base64url JSON".to_string(),
+        ))
 }
 
 /// The HTTP header a trusted TLS-terminating SBI ingress / SCP uses to convey
@@ -3168,8 +3381,11 @@ impl ClientAuthentication {
 ///    to the request `nfInstanceId` — a mismatch is rejected regardless of the
 ///    policy flags, since a forged binding is never acceptable.
 /// 2. A present CCA is always claim-checked ([`verify_cca_binding`]). Its
-///    signature is then verified against the trusted key for that issuer; with
-///    no such key the request is rejected rather than downgraded.
+///    signature is then verified against the key [`resolve_cca_verifying_key`]
+///    resolves — the key certified by its `x5c` chain when it carries one
+///    (issue #393, with the §13.3.8.3 certificate binding enforced), else the
+///    trusted key for that issuer. With no usable key the request is rejected
+///    rather than downgraded.
 /// 3. The CCA contributes an identity ONLY if its signature verified. If
 ///    `cca_verify_signature` is off, the assertion is still claim-checked (so a
 ///    contradictory one is refused) but it authenticates nothing — which is the
@@ -3192,29 +3408,13 @@ fn authenticate_token_client(
     if !cca.is_empty() {
         verify_cca_binding(cca, nf_instance_id, now)?;
         if policy.cca_verify_signature {
-            // Fail-closed: an issuer with no trusted key cannot be verified, so
-            // its assertion is refused rather than accepted unverified.
-            //
-            // Issue #187: on a miss, consult `cca_trusted_keys_dir` once before
-            // giving up. The NRF boots before every NF that publishes a key into
-            // that directory, so a startup-only read would legitimately not yet
-            // have the key of an NF registering seconds later. Still fail-closed:
-            // if the directory has nothing either, the request is refused.
-            let key = match policy.cca_trusted_keys.get(nf_instance_id) {
-                Some(k) => *k,
-                None => match policy.lookup_cca_trusted_key_on_disk(nf_instance_id) {
-                    Some(k) => k,
-                    None => {
-                        return Err((
-                            "invalid_client",
-                            format!(
-                                "no trusted ES256 key configured to verify the CCA signature of \
-                                 nfInstanceId {nf_instance_id:?}"
-                            ),
-                        ))
-                    }
-                },
-            };
+            // Issue #393: resolve the verifying key, which is also where the
+            // certificate-to-instance-ID binding of TS 33.501 §13.3.8.3's final
+            // bullet is enforced when the CCA carries `x5c`. Fail-closed at every
+            // branch — see `resolve_cca_verifying_key` for the full precedence,
+            // including why an `x5c`-bearing CCA is never downgraded to the trust
+            // store.
+            let key = resolve_cca_verifying_key(policy, cca, nf_instance_id, now)?;
             verify_cca_signature(cca, &key)?;
             // Signature verified: the assertion now proves the identity. When a
             // certificate identity was also present both bind to the same
@@ -5549,7 +5749,7 @@ mod tests {
             .as_secs();
 
         // POSITIVE: signed with the published key -> authenticated, token issued.
-        let good = nextgcore_sbi::oauth::mint_cca(&trusted, &consumer_id, "NRF", now, 60);
+        let good = nextgcore_sbi::oauth::mint_cca(&trusted, &consumer_id, "NRF", now, 60, &[]);
         let resp = handle_access_token_request_with_policy(
             &auth_token_req(&consumer_id, &ctype, &ptype, Some(&good), None),
             &policy,
@@ -5583,7 +5783,7 @@ mod tests {
         // 401 leaves an operator with no way to tell a missing trust-store entry
         // from a network fault.
         let untrusted = nextgcore_sbi::oauth::generate_es256_key();
-        let forged = nextgcore_sbi::oauth::mint_cca(&untrusted, &consumer_id, "NRF", now, 60);
+        let forged = nextgcore_sbi::oauth::mint_cca(&untrusted, &consumer_id, "NRF", now, 60, &[]);
         let resp = handle_access_token_request_with_policy(
             &auth_token_req(&consumer_id, &ctype, &ptype, Some(&forged), None),
             &policy,
@@ -5605,7 +5805,7 @@ mod tests {
         // And an NF with no published key at all is refused for the other
         // fail-closed reason: no trusted key exists to verify against.
         let (other_id, other_producer, otype, optype) = register_pair("nrfd187nokey");
-        let other_cca = nextgcore_sbi::oauth::mint_cca(&untrusted, &other_id, "NRF", now, 60);
+        let other_cca = nextgcore_sbi::oauth::mint_cca(&untrusted, &other_id, "NRF", now, 60, &[]);
         let resp = handle_access_token_request_with_policy(
             &auth_token_req(&other_id, &otype, &optype, Some(&other_cca), None),
             &policy,
@@ -5667,7 +5867,7 @@ mod tests {
             .unwrap()
             .as_secs();
         let key = nextgcore_sbi::oauth::generate_es256_key();
-        let cca = nextgcore_sbi::oauth::mint_cca(&key, &consumer_id, "NRF", now, 60);
+        let cca = nextgcore_sbi::oauth::mint_cca(&key, &consumer_id, "NRF", now, 60, &[]);
 
         // Before the NF published: refused, fail-closed.
         let resp = handle_access_token_request_with_policy(
@@ -5743,7 +5943,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let cca = nextgcore_sbi::oauth::mint_cca(&key, &self_id, "NRF", now, 60);
+        let cca = nextgcore_sbi::oauth::mint_cca(&key, &self_id, "NRF", now, 60, &[]);
         let resp = handle_access_token_request_with_policy(
             &auth_token_req(&self_id, "NRF", &ptype, Some(&cca), None),
             &policy,
@@ -5943,7 +6143,7 @@ mod tests {
 
         // A CCA correctly signed by SOMEONE ELSE's key, asserting their identity,
         // replayed on a request that claims to be our consumer.
-        let other_cca = nextgcore_sbi::oauth::mint_cca(&key, "a-different-nf", "NRF", now, 60);
+        let other_cca = nextgcore_sbi::oauth::mint_cca(&key, "a-different-nf", "NRF", now, 60, &[]);
         let mut trusted = std::collections::HashMap::new();
         trusted.insert(consumer_id.clone(), *key.verifying_key());
         let policy = NrfPolicy {
@@ -5997,7 +6197,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let cca = nextgcore_sbi::oauth::mint_cca(&key, &consumer_id, "NRF", now, 60);
+        let cca = nextgcore_sbi::oauth::mint_cca(&key, &consumer_id, "NRF", now, 60, &[]);
 
         // The NRF trusts this issuer's public key -- the operator-provisioned half.
         let mut trusted = std::collections::HashMap::new();
@@ -6035,7 +6235,7 @@ mod tests {
         // An assertion signed by an UNTRUSTED key is refused fail-closed, even
         // though its claims are identical.
         let rogue = nextgcore_sbi::oauth::generate_es256_key();
-        let rogue_cca = nextgcore_sbi::oauth::mint_cca(&rogue, &consumer_id, "NRF", now, 60);
+        let rogue_cca = nextgcore_sbi::oauth::mint_cca(&rogue, &consumer_id, "NRF", now, 60, &[]);
         let resp = handle_access_token_request_with_policy(
             &auth_token_req(&consumer_id, &ctype, &ptype, Some(&rogue_cca), None),
             &policy,
@@ -6067,7 +6267,7 @@ mod tests {
     fn a_minted_cca_survives_the_form_body_round_trip() {
         let key = nextgcore_sbi::oauth::generate_es256_key();
         let now = 1_700_000_000u64;
-        let cca = nextgcore_sbi::oauth::mint_cca(&key, "amf-1", "NRF", now, 60);
+        let cca = nextgcore_sbi::oauth::mint_cca(&key, "amf-1", "NRF", now, 60, &[]);
 
         // Encode exactly as OAuth2Client::request_token does.
         let mut req = nextgcore_sbi::oauth::AccessTokenRequest::new(
@@ -6098,7 +6298,7 @@ mod tests {
     fn authenticate_token_client_reports_only_proven_identities() {
         let now = 1_700_000_000u64;
         let key = nextgcore_sbi::oauth::generate_es256_key();
-        let cca = nextgcore_sbi::oauth::mint_cca(&key, "nf-1", "NRF", now, 60);
+        let cca = nextgcore_sbi::oauth::mint_cca(&key, "nf-1", "NRF", now, 60, &[]);
         let mut trusted = std::collections::HashMap::new();
         trusted.insert("nf-1".to_string(), *key.verifying_key());
 
@@ -6149,6 +6349,509 @@ mod tests {
         );
         // ...and a contradictory one is still refused outright.
         assert!(authenticate_token_client(&unchecked, &bare, "nf-2", &cca, now).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #393: the CCA's `x5c` chain and TS 33.501 §13.3.8.3's final
+    // validation step — the NF Instance ID in the CCA must match the one in the
+    // certificate that signed it.
+    // -----------------------------------------------------------------
+
+    /// A CA for CCA signing certificates. Returned as `(der, rcgen cert, rcgen
+    /// key)` so the same CA can issue several leaves — which is what makes the
+    /// contrast pair a controlled comparison rather than two unrelated setups.
+    fn cca_test_ca() -> (Vec<u8>, rcgen::Certificate, rcgen::KeyPair) {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        let mut params = CertificateParams::new(Vec::new()).expect("ca params");
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "nrfd test CCA CA");
+        let key = KeyPair::generate().expect("ca key");
+        let cert = params.self_signed(&key).expect("ca cert");
+        let der = cert.der().to_vec();
+        (der, cert, key)
+    }
+
+    /// Issue a leaf over `signing_key`, carrying `nf_instance_id` as a
+    /// `urn:uuid:` URI SubjectAltName (TS 33.310), signed by `(ca, ca_key)`.
+    ///
+    /// The leaf certifies the CCA **signing** key, which is what makes the binding
+    /// real: `resolve_cca_verifying_key` pulls the key back out of the validated
+    /// certificate and the JWS is checked against it.
+    fn cca_test_leaf(
+        signing_key: &p256::ecdsa::SigningKey,
+        nf_instance_id: &str,
+        ca: &rcgen::Certificate,
+        ca_key: &rcgen::KeyPair,
+    ) -> Vec<u8> {
+        use p256::pkcs8::EncodePrivateKey;
+        use rcgen::{CertificateParams, KeyPair, SanType};
+
+        let pkcs8 = signing_key
+            .to_pkcs8_der()
+            .expect("cca key to pkcs8")
+            .as_bytes()
+            .to_vec();
+        let subject_key = KeyPair::try_from(pkcs8.as_slice()).expect("import the cca key");
+
+        let mut params = CertificateParams::new(Vec::new()).expect("leaf params");
+        params.subject_alt_names = vec![SanType::URI(
+            format!("urn:uuid:{nf_instance_id}")
+                .try_into()
+                .expect("ia5 uri"),
+        )];
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, nf_instance_id);
+        let t = time::OffsetDateTime::now_utc();
+        params.not_before = t - time::Duration::hours(1);
+        params.not_after = t + time::Duration::days(30);
+        params
+            .signed_by(&subject_key, ca, ca_key)
+            .expect("leaf cert")
+            .der()
+            .to_vec()
+    }
+
+    /// **Issue #393, the contrast pair — criterion 2.** TS 33.501 §13.3.8.3's
+    /// final bullet, asserted in both directions:
+    ///
+    /// > It verifies that the NF instance ID of the NFc in the CCA matches the NF
+    /// > instance ID in the public key certificate used for signing the CCA.
+    ///
+    /// Both halves use the SAME CA, the SAME signing key, the SAME claims and the
+    /// same code path. The ONLY difference is the URI SubjectAltName of the leaf
+    /// certificate. So a pass cannot come from the chain failing for an unrelated
+    /// reason, and the refusal is attributable to the binding and nothing else.
+    ///
+    /// Note the negative half is the *interesting* one: its CCA is signed by a key
+    /// whose certificate validates perfectly to the configured CA. Before this
+    /// issue there was no check that could tell the two apart.
+    ///
+    /// Revert-verified: deleting the `verified.nf_instance_id != nf_instance_id`
+    /// arm from `resolve_cca_verifying_key` makes the negative half fail — it
+    /// returns 200 where 400 is asserted.
+    #[tokio::test]
+    async fn a_cca_whose_certificate_names_another_nf_is_refused_and_its_own_is_accepted() {
+        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd393bind");
+        let (ca_der, ca, ca_key) = cca_test_ca();
+
+        let key = nextgcore_sbi::oauth::generate_es256_key();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let policy = NrfPolicy {
+            cca_trust_anchors: vec![ca_der],
+            ..NrfPolicy::default()
+        };
+
+        // POSITIVE: the leaf's URI SAN IS this consumer's instance ID.
+        let own_leaf = cca_test_leaf(&key, &consumer_id, &ca, &ca_key);
+        let good = nextgcore_sbi::oauth::mint_cca(
+            &key,
+            &consumer_id,
+            "NRF",
+            now,
+            60,
+            std::slice::from_ref(&own_leaf),
+        );
+        let resp = handle_access_token_request_with_policy(
+            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&good), None),
+            &policy,
+        )
+        .await;
+        assert_eq!(
+            resp.status, 200,
+            "a CCA whose x5c certificate binds to the asserted nfInstanceId must authenticate, \
+             with NO entry in cca_trusted_keys -- the certificate is the binding: {:?}",
+            resp.http.content
+        );
+        assert!(
+            policy.cca_trusted_keys.is_empty(),
+            "the positive half must not be passing via the trust store, or it proves nothing \
+             about x5c"
+        );
+
+        // NEGATIVE: same CA, same signing key, same claims -- a leaf issued for a
+        // DIFFERENT NF. The chain validates; the binding does not.
+        let other_leaf = cca_test_leaf(&key, "6b1d7e3c-0000-4000-8000-00000000dead", &ca, &ca_key);
+        let impersonating = nextgcore_sbi::oauth::mint_cca(
+            &key,
+            &consumer_id,
+            "NRF",
+            now,
+            60,
+            std::slice::from_ref(&other_leaf),
+        );
+        let resp = handle_access_token_request_with_policy(
+            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&impersonating), None),
+            &policy,
+        )
+        .await;
+        assert_eq!(
+            resp.status, 400,
+            "a certificate issued for a DIFFERENT NF must be refused (TS 33.501 §13.3.8.3): {:?}",
+            resp.http.content
+        );
+        let err = error_of(&resp);
+        assert_eq!(err["error"], "invalid_client");
+        let desc = err["error_description"].as_str().unwrap_or_default();
+        // Criterion 2 asks for the reason to NAME the mismatch. Both ids, so an
+        // operator can tell a misissued certificate from an impersonation attempt.
+        assert!(
+            desc.contains("6b1d7e3c-0000-4000-8000-00000000dead") && desc.contains(&consumer_id),
+            "the refusal must name BOTH the certificate's id and the asserted one, or the \
+             failure is undiagnosable: {desc:?}"
+        );
+
+        let mgr = nf_manager();
+        mgr.deregister(&consumer_id).ok();
+        mgr.deregister(&producer_id).ok();
+    }
+
+    /// **Issue #393, the anti-downgrade property.** A CCA that carries `x5c`
+    /// against an NRF with no `cca_trust_anchors` is refused **even though the
+    /// trust store holds a good key for that NF**.
+    ///
+    /// This is the test that proves the precedence in `resolve_cca_verifying_key`
+    /// is a decision table and not an `unwrap_or` chain. If it were a fallback, a
+    /// requester could choose which check it faces simply by attaching a
+    /// certificate — and attaching a deliberately broken one would be the way to
+    /// reach the weaker path.
+    ///
+    /// Revert-verified: changing the empty-anchors arm to fall through to the
+    /// trust store makes this fail with status 200.
+    #[tokio::test]
+    async fn an_x5c_bearing_cca_is_refused_rather_than_downgraded_to_the_trust_store() {
+        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd393down");
+        let (_, ca, ca_key) = cca_test_ca();
+
+        let key = nextgcore_sbi::oauth::generate_es256_key();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let leaf = cca_test_leaf(&key, &consumer_id, &ca, &ca_key);
+
+        // The trust store WOULD accept this key. The CA is deliberately not
+        // configured.
+        let mut trusted = std::collections::HashMap::new();
+        trusted.insert(consumer_id.clone(), *key.verifying_key());
+        let policy = NrfPolicy {
+            cca_trusted_keys: trusted,
+            cca_trust_anchors: Vec::new(),
+            ..NrfPolicy::default()
+        };
+
+        // Control: with NO x5c the very same key authenticates via the store, so
+        // the refusal below is attributable to x5c and not to a bad key.
+        let plain = nextgcore_sbi::oauth::mint_cca(&key, &consumer_id, "NRF", now, 60, &[]);
+        let resp = handle_access_token_request_with_policy(
+            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&plain), None),
+            &policy,
+        )
+        .await;
+        assert_eq!(
+            resp.status, 200,
+            "control: without x5c this key must still authenticate via the trust store, or this \
+             test is not isolating the downgrade question: {:?}",
+            resp.http.content
+        );
+
+        // Same key, same claims, now WITH x5c and no anchors: refused.
+        let with_chain = nextgcore_sbi::oauth::mint_cca(
+            &key,
+            &consumer_id,
+            "NRF",
+            now,
+            60,
+            std::slice::from_ref(&leaf),
+        );
+        let resp = handle_access_token_request_with_policy(
+            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&with_chain), None),
+            &policy,
+        )
+        .await;
+        assert_eq!(
+            resp.status, 400,
+            "an x5c-bearing CCA must NOT fall back to the trust store: falling back would let a \
+             requester choose the weaker check: {:?}",
+            resp.http.content
+        );
+        let desc = error_of(&resp)["error_description"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            desc.contains("cca_trust_anchors"),
+            "the refusal must name the missing configuration: {desc:?}"
+        );
+
+        let mgr = nf_manager();
+        mgr.deregister(&consumer_id).ok();
+        mgr.deregister(&producer_id).ok();
+    }
+
+    /// **Issue #393: the certificate must be the AUTHORITY, not decoration.**
+    ///
+    /// A CCA whose `x5c` chain validates, and whose leaf URI SAN matches `sub`,
+    /// but whose JWS was signed by a DIFFERENT key than the certificate certifies,
+    /// must be refused.
+    ///
+    /// Without this the implementation could validate a chain, check the SAN, and
+    /// then verify the signature against a trust-store key — which would be
+    /// theatre: the certificate would constrain nothing about who actually signed
+    /// the assertion. So the trust store here holds the signer's key, and the
+    /// request must STILL be refused.
+    ///
+    /// Revert-verified: making `resolve_cca_verifying_key` return the trust-store
+    /// key on the `Chain` arm instead of `verified.es256_verifying_key()` makes
+    /// this fail with status 200.
+    #[tokio::test]
+    async fn a_cca_signed_by_a_key_its_certificate_does_not_certify_is_refused() {
+        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd393auth");
+        let (ca_der, ca, ca_key) = cca_test_ca();
+
+        let certified = nextgcore_sbi::oauth::generate_es256_key();
+        let actual_signer = nextgcore_sbi::oauth::generate_es256_key();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // The leaf certifies `certified` and names the right NF.
+        let leaf = cca_test_leaf(&certified, &consumer_id, &ca, &ca_key);
+        // The assertion is signed by `actual_signer` and carries that same leaf.
+        let cca = nextgcore_sbi::oauth::mint_cca(
+            &actual_signer,
+            &consumer_id,
+            "NRF",
+            now,
+            60,
+            std::slice::from_ref(&leaf),
+        );
+
+        // The trust store holds the ACTUAL signer's key, so an implementation that
+        // verified against the store would accept this.
+        let mut trusted = std::collections::HashMap::new();
+        trusted.insert(consumer_id.clone(), *actual_signer.verifying_key());
+        let policy = NrfPolicy {
+            cca_trusted_keys: trusted,
+            cca_trust_anchors: vec![ca_der],
+            ..NrfPolicy::default()
+        };
+
+        let resp = handle_access_token_request_with_policy(
+            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&cca), None),
+            &policy,
+        )
+        .await;
+        assert_eq!(
+            resp.status, 400,
+            "the signature MUST be verified against the key the certificate certifies; \
+             verifying against the trust store while carrying a certificate would make the \
+             certificate decorative: {:?}",
+            resp.http.content
+        );
+        assert_eq!(error_of(&resp)["error"], "invalid_client");
+
+        let mgr = nf_manager();
+        mgr.deregister(&consumer_id).ok();
+        mgr.deregister(&producer_id).ok();
+    }
+
+    /// **Issue #393: a chain from an unconfigured CA is refused.** The positive
+    /// case must not be reachable with a self-issued certificate, or `x5c` would be
+    /// strictly weaker than the trust store it takes precedence over.
+    #[tokio::test]
+    async fn a_cca_chain_from_an_unconfigured_ca_is_refused() {
+        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd393ca");
+        let (_, rogue_ca, rogue_key) = cca_test_ca();
+        let (trusted_ca_der, _, _) = cca_test_ca();
+
+        let key = nextgcore_sbi::oauth::generate_es256_key();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // A leaf naming the right NF, from the WRONG CA.
+        let leaf = cca_test_leaf(&key, &consumer_id, &rogue_ca, &rogue_key);
+        let cca = nextgcore_sbi::oauth::mint_cca(
+            &key,
+            &consumer_id,
+            "NRF",
+            now,
+            60,
+            std::slice::from_ref(&leaf),
+        );
+
+        let policy = NrfPolicy {
+            cca_trust_anchors: vec![trusted_ca_der],
+            ..NrfPolicy::default()
+        };
+        let resp = handle_access_token_request_with_policy(
+            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&cca), None),
+            &policy,
+        )
+        .await;
+        assert_eq!(
+            resp.status, 400,
+            "a chain that does not reach a configured anchor must be refused, or anyone could \
+             self-issue a certificate naming any NF: {:?}",
+            resp.http.content
+        );
+        assert_eq!(error_of(&resp)["error"], "invalid_client");
+
+        let mgr = nf_manager();
+        mgr.deregister(&consumer_id).ok();
+        mgr.deregister(&producer_id).ok();
+    }
+
+    /// **Issue #393, the stated ceiling.** A CCA that chose §13.3.8.2's OTHER arm
+    /// (`x5u`) is refused with a reason that NAMES `x5u` as unsupported.
+    ///
+    /// Asserted rather than merely documented: a conformant peer sending `x5u` gets
+    /// told which arm this NRF implements, instead of a generic parse error that
+    /// would send an integrator looking in the wrong place. The reasoning for not
+    /// implementing `x5u` (pre-authentication SSRF, requester-controlled latency on
+    /// the auth path) is in `nextgcore_sbi::cca_x5c`.
+    #[tokio::test]
+    async fn a_cca_using_x5u_is_refused_with_a_reason_naming_it() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let (consumer_id, producer_id, ctype, ptype) = register_pair("nrfd393x5u");
+
+        let key = nextgcore_sbi::oauth::generate_es256_key();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Hand-built, because `mint_cca` deliberately cannot emit `x5u`: this is a
+        // conformant PEER's assertion, not one of ours. The URL is the cloud
+        // metadata endpoint, which is what an SSRF against this would target.
+        let header = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "alg": "ES256",
+                "typ": "JWT",
+                "x5u": "http://169.254.169.254/latest/meta-data/",
+            })
+            .to_string(),
+        );
+        let payload = URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "sub": consumer_id, "iss": consumer_id, "aud": "NRF",
+                "iat": now, "exp": now + 60,
+            })
+            .to_string(),
+        );
+        let signing_input = format!("{header}.{payload}");
+        use p256::ecdsa::signature::Signer;
+        let sig: p256::ecdsa::Signature = key.sign(signing_input.as_bytes());
+        let cca = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()));
+
+        // Even with this NF's key in the trust store, `x5u` is refused -- it is not
+        // silently ignored in favour of the store.
+        let mut trusted = std::collections::HashMap::new();
+        trusted.insert(consumer_id.clone(), *key.verifying_key());
+        let policy = NrfPolicy {
+            cca_trusted_keys: trusted,
+            ..NrfPolicy::default()
+        };
+
+        let resp = handle_access_token_request_with_policy(
+            &auth_token_req(&consumer_id, &ctype, &ptype, Some(&cca), None),
+            &policy,
+        )
+        .await;
+        assert_eq!(
+            resp.status, 400,
+            "x5u is not implemented and must be refused, not ignored: {:?}",
+            resp.http.content
+        );
+        let desc = error_of(&resp)["error_description"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            desc.contains("x5u") && desc.contains("x5c"),
+            "the refusal must name the unsupported arm AND the supported one: {desc:?}"
+        );
+
+        let mgr = nf_manager();
+        mgr.deregister(&consumer_id).ok();
+        mgr.deregister(&producer_id).ok();
+    }
+
+    /// **Issue #393 criterion 3.** The trust-store path is UNCHANGED for a CCA
+    /// with no `x5c`, so #187's overlay and its coverage do not regress.
+    ///
+    /// The strongest form of that claim available in a unit test: `mint_cca` with
+    /// no chain must produce a byte-identical JOSE header to the fixed literal it
+    /// replaced. If the header changed at all, every deployment's CCAs would change
+    /// shape, and "nothing regressed" would rest on the NRF being lenient rather
+    /// than on the bytes being the same.
+    #[test]
+    fn minting_without_a_chain_reproduces_the_pre_393_header_exactly() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let key = nextgcore_sbi::oauth::generate_es256_key();
+        let cca = nextgcore_sbi::oauth::mint_cca(&key, "nf-1", "NRF", 1_000, 60, &[]);
+        let header_b64 = cca.split('.').next().expect("header");
+        assert_eq!(
+            header_b64,
+            URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT"}"#),
+            "with no chain the header must be byte-identical to the literal it replaced, or \
+             every existing deployment's CCAs change shape"
+        );
+        // And the x5c-less header carries no certificate reference at all.
+        let header: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(header_b64).expect("b64"))
+                .expect("json");
+        assert!(header.get("x5c").is_none() && header.get("x5u").is_none());
+    }
+
+    /// **Issue #393: `mint_cca` emits a real `x5c`** that the NRF's own parser
+    /// reads back as the DER that went in (criterion 1).
+    ///
+    /// The two halves live in different crates — `mint_cca` encodes, nrfd decodes —
+    /// and RFC 7515 §4.1.6 requires STANDARD base64 for `x5c` while the JWS parts
+    /// themselves are base64url. That asymmetry is the classic x5c interop bug, so
+    /// the round trip is asserted rather than assumed.
+    #[test]
+    fn mint_cca_emits_an_x5c_the_nrf_decodes_back_to_the_same_der() {
+        use nextgcore_sbi::cca_x5c::{cert_reference_from_jose_header, CcaCertReference};
+        let (_, ca, ca_key) = cca_test_ca();
+        let key = nextgcore_sbi::oauth::generate_es256_key();
+        let leaf = cca_test_leaf(&key, "nf-x5c-roundtrip", &ca, &ca_key);
+
+        let cca = nextgcore_sbi::oauth::mint_cca(
+            &key,
+            "nf-x5c-roundtrip",
+            "NRF",
+            1_000,
+            60,
+            std::slice::from_ref(&leaf),
+        );
+        let header = decode_cca_jose_header(&cca).expect("the header must decode");
+        assert_eq!(
+            header["alg"], "ES256",
+            "alg must survive the header rebuild"
+        );
+        assert_eq!(header["typ"], "JWT");
+
+        match cert_reference_from_jose_header(&header).expect("x5c parses") {
+            CcaCertReference::Chain(chain) => assert_eq!(
+                chain.leaf(),
+                leaf.as_slice(),
+                "the DER must round-trip; RFC 7515 §4.1.6 is standard base64, not base64url"
+            ),
+            other => panic!("expected an x5c chain, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------

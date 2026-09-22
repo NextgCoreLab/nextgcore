@@ -401,18 +401,65 @@ pub const CCA_DEFAULT_LIFETIME_SECS: u64 = 60;
 /// receiving NF's *type* (`"NRF"` for the token endpoint), plus `iat` and `exp`.
 /// The signature is ES256 over `base64url(header) "." base64url(payload)`
 /// (RFC 7515 §5.2), with the fixed 64-byte `r||s` form of RFC 7518 §3.4.
+///
+/// # `x5c` (issue #393)
+///
+/// §13.3.8.2 is unconditional about the certificate reference:
+///
+/// > The signed CCA shall include one of the following fields: the X.509 URL
+/// > (x5u) […] or the X.509 Certificate Chain (x5c) […]
+///
+/// (`6g_docs/specs/33501-k20.txt:14370-14380`). `chain` supplies the `x5c` arm:
+/// the DER certificates of the chain that certifies `key`, leaf first. It is
+/// emitted per RFC 7515 §4.1.6 — a JSON array of **standard** base64 (NOT
+/// base64url, and this is the one place in the JOSE header where that is true).
+///
+/// Passing an empty chain omits `x5c` and reproduces the pre-#393 header
+/// byte-for-byte, which is the no-PKI path: the NRF then falls back to its
+/// `cca_trusted_keys` store. That is a documented deviation from §13.3.8.2, kept
+/// because a deployment with no PKI is a real deployment (§13.3.8.1 at
+/// `:14342` notes the CCA already depends on cross-certification to cross a PLMN
+/// boundary) and because removing it would regress issue #187's overlay.
+///
+/// The certificate must certify **this** `key` and carry the NF Instance ID in a
+/// URI SubjectAltName as `urn:uuid:<id>` (TS 33.310 `33310-j50.txt:734`), because
+/// the receiving NRF verifies the JWS against the leaf's public key and compares
+/// that SAN to `sub` (§13.3.8.3's last bullet). A chain over some *other* key —
+/// the NF's TLS certificate, say — would assert a binding that does not exist.
 pub fn mint_cca(
     key: &p256::ecdsa::SigningKey,
     nf_instance_id: &str,
     audience: &str,
     now: u64,
     lifetime_secs: u64,
+    chain: &[Vec<u8>],
 ) -> String {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     use p256::ecdsa::{signature::Signer, Signature};
 
-    let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT"}"#);
+    // Built rather than a fixed literal (issue #393 criterion 1) so `x5c` can be
+    // carried. With no chain the bytes are identical to the former literal:
+    // `serde_json` preserves insertion order for a `json!` object (no
+    // `preserve_order` feature is needed for a literal map) and emits no spaces.
+    let header_json = if chain.is_empty() {
+        serde_json::json!({"alg": "ES256", "typ": "JWT"})
+    } else {
+        serde_json::json!({
+            "alg": "ES256",
+            "typ": "JWT",
+            // RFC 7515 §4.1.6: `x5c` is an array of base64-encoded (Section 4 of
+            // RFC 4648 — i.e. STANDARD base64 WITH padding, not base64url) DER
+            // certificates, the signing certificate first.
+            "x5c": chain
+                .iter()
+                .map(|der| serde_json::Value::String(
+                    base64::engine::general_purpose::STANDARD.encode(der)
+                ))
+                .collect::<Vec<_>>(),
+        })
+    };
+    let header = URL_SAFE_NO_PAD.encode(header_json.to_string().as_bytes());
     let claims = serde_json::json!({
         "sub": nf_instance_id,
         "iss": nf_instance_id,
@@ -427,6 +474,128 @@ pub fn mint_cca(
         "{signing_input}.{}",
         URL_SAFE_NO_PAD.encode(signature.to_bytes())
     )
+}
+
+/// Environment variable naming the PEM file holding the certificate chain that
+/// certifies this NF's CCA signing key (issue #393), leaf first. Emitted as
+/// `x5c` in every CCA this NF mints (TS 33.501 §13.3.8.2).
+///
+/// **This is NOT the NF's TLS certificate.** [`SbiSecurityConfig::CERT_ENV`]
+/// certifies the TLS key pair; the CCA is signed with the separate ES256 key at
+/// [`CCA_SIGNING_KEY_FILE_ENV`]. A chain over the TLS key would assert a binding
+/// that does not exist — the NRF validates the chain and then verifies the JWS
+/// against the leaf's public key, so the two must be the same key.
+///
+/// The certificate must also carry this NF's `nfInstanceId` in a URI
+/// SubjectAltName as `urn:uuid:<id>` (TS 33.310 `33310-j50.txt:734`), or the NRF's
+/// §13.3.8.3 binding check has nothing to compare against and refuses the
+/// assertion.
+///
+/// Unset ⇒ no `x5c` is emitted and the NRF falls back to its `cca_trusted_keys`
+/// store, which is the no-PKI path.
+///
+/// [`SbiSecurityConfig::CERT_ENV`]: crate::security::SbiSecurityConfig::CERT_ENV
+pub const CCA_CERT_CHAIN_FILE_ENV: &str = "NEXTGCORE_SBI_CCA_CERT_FILE";
+
+/// Process-wide CCA certificate chain, resolved once from
+/// [`CCA_CERT_CHAIN_FILE_ENV`]. `Some(vec![])` is cached for "configured but
+/// unusable" as well as "not configured", so a broken file is not re-read on
+/// every token request.
+static CCA_CHAIN_FROM_ENV: OnceLock<Arc<Vec<Vec<u8>>>> = OnceLock::new();
+
+/// Test-only override of the process-wide CCA certificate chain. Production
+/// resolves [`CCA_CERT_CHAIN_FILE_ENV`] instead; a test needs to inject a chain
+/// it just generated, without writing a PEM file and mutating the environment
+/// (which is process-global and therefore racy across the test binary).
+#[cfg(test)]
+pub(crate) static CCA_CHAIN_OVERRIDE: std::sync::RwLock<Option<Arc<Vec<Vec<u8>>>>> =
+    std::sync::RwLock::new(None);
+
+/// Serialises the tests that mutate [`CCA_CHAIN_OVERRIDE`].
+///
+/// Declared HERE, at module scope beside the global it protects, and NOT inside
+/// `mod tests` — the #308 lesson: a lock inside a test submodule is unreachable
+/// from a sibling module, so a reader in another module could never take it. Any
+/// future test elsewhere that constructs an `OAuth2Client` and asserts something
+/// about its `x5c` needs this same guard.
+///
+/// A `std` mutex rather than a `tokio` one because no guarded test awaits while
+/// holding it (they only build clients and read the resolver), so
+/// `clippy::await_holding_lock` does not apply. Poison is tolerated: a panicking
+/// guarded test must not wedge every later one.
+#[cfg(test)]
+pub(crate) static CCA_CHAIN_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`CCA_CHAIN_GUARD`] and clear any override a previously-panicked guarded
+/// test leaked, so each test starts from the shipped (env-driven) baseline.
+#[cfg(test)]
+pub(crate) fn lock_cca_chain() -> std::sync::MutexGuard<'static, ()> {
+    let g = CCA_CHAIN_GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Ok(mut o) = CCA_CHAIN_OVERRIDE.write() {
+        *o = None;
+    }
+    g
+}
+
+/// Load the DER certificates of a PEM chain, leaf first.
+///
+/// Rejects an empty file: a chain file that parses to zero certificates is a
+/// misconfiguration, and returning `Ok(vec![])` would silently degrade the NF to
+/// the no-`x5c` path — the "configured but not working" state that is hardest to
+/// diagnose from the far end, where it shows up as a bare `invalid_client`.
+pub fn load_cca_cert_chain(path: &std::path::Path) -> SbiResult<Vec<Vec<u8>>> {
+    let chain = crate::tls::load_certs(&path.display().to_string())?;
+    if chain.is_empty() {
+        return Err(SbiError::ClientError(format!(
+            "CCA certificate chain {} holds no certificates; an NF with this set but empty \
+             would silently mint CCAs with no x5c (TS 33.501 §13.3.8.2)",
+            path.display()
+        )));
+    }
+    Ok(chain.into_iter().map(|c| c.as_ref().to_vec()).collect())
+}
+
+/// Resolve this NF's CCA certificate chain: the test override first, then
+/// [`CCA_CERT_CHAIN_FILE_ENV`], else empty (no `x5c` emitted).
+///
+/// An unusable chain file is logged once and treated as absent rather than
+/// fatal — the NF still runs and still authenticates via the trust-store path,
+/// and the log names the consequence so the operator is not left reading an
+/// `invalid_client` from the NRF with no local signal.
+pub fn cca_cert_chain_default() -> Arc<Vec<Vec<u8>>> {
+    #[cfg(test)]
+    if let Ok(guard) = CCA_CHAIN_OVERRIDE.read() {
+        if let Some(chain) = guard.as_ref() {
+            return chain.clone();
+        }
+    }
+    CCA_CHAIN_FROM_ENV
+        .get_or_init(|| {
+            let Ok(path) = std::env::var(CCA_CERT_CHAIN_FILE_ENV) else {
+                return Arc::new(Vec::new());
+            };
+            match load_cca_cert_chain(std::path::Path::new(&path)) {
+                Ok(chain) => {
+                    log::info!(
+                        "CCA certificate chain loaded from {path} ({} certificate(s)); CCAs will \
+                         carry x5c (TS 33.501 §13.3.8.2)",
+                        chain.len()
+                    );
+                    Arc::new(chain)
+                }
+                Err(e) => {
+                    log::error!(
+                        "CCA certificate chain {path} is unusable: {e}. CCAs will carry NO x5c, \
+                         so an NRF that requires the certificate binding (TS 33.501 §13.3.8.3) \
+                         will refuse this NF invalid_client."
+                    );
+                    Arc::new(Vec::new())
+                }
+            }
+        })
+        .clone()
 }
 
 /// Environment variable naming the file that holds this NF's ES256 CCA signing
@@ -1116,6 +1285,11 @@ pub struct OAuth2Client {
     /// [`OAuth2Client::with_cca_signing_key`]. `None` sends token requests with
     /// no assertion, which an NRF running its default policy rejects.
     cca_signing_key: Option<Arc<p256::ecdsa::SigningKey>>,
+    /// Issue #393: the certificate chain over `cca_signing_key`, emitted as the
+    /// `x5c` JOSE header of every CCA this client mints (TS 33.501 §13.3.8.2).
+    /// Seeded from the process-wide [`cca_cert_chain_default`]; empty means no
+    /// `x5c`, which is the no-PKI path the NRF's trust store covers.
+    cca_cert_chain: Arc<Vec<Vec<u8>>>,
 }
 
 impl OAuth2Client {
@@ -1170,6 +1344,7 @@ impl OAuth2Client {
             tls: None,
             token_path: Self::default_token_path().to_string(),
             cca_signing_key,
+            cca_cert_chain: cca_cert_chain_default(),
         }
     }
 
@@ -1183,6 +1358,24 @@ impl OAuth2Client {
     pub fn with_cca_signing_key(mut self, key: Arc<p256::ecdsa::SigningKey>) -> Self {
         self.cca_signing_key = Some(key);
         self
+    }
+
+    /// Issue #393: carry `chain` as the `x5c` of every CCA this client mints
+    /// (TS 33.501 §13.3.8.2), overriding the process-wide
+    /// [`cca_cert_chain_default`]. DER certificates, leaf first.
+    ///
+    /// `chain` MUST certify the key set by [`OAuth2Client::with_cca_signing_key`]
+    /// and MUST carry this client's `nfInstanceId` in a URI SubjectAltName
+    /// (TS 33.310): the NRF verifies the JWS against the leaf's public key and
+    /// compares that SAN to the assertion's `sub` (§13.3.8.3).
+    pub fn with_cca_cert_chain(mut self, chain: Vec<Vec<u8>>) -> Self {
+        self.cca_cert_chain = Arc::new(chain);
+        self
+    }
+
+    /// Whether this client will attach an `x5c` certificate chain to its CCAs.
+    pub fn has_cca_cert_chain(&self) -> bool {
+        !self.cca_cert_chain.is_empty()
     }
 
     /// Send access-token requests WITHOUT a Client Credentials Assertion, even
@@ -1219,6 +1412,7 @@ impl OAuth2Client {
             NfType::Nrf.to_str(),
             now,
             CCA_DEFAULT_LIFETIME_SECS,
+            &self.cca_cert_chain,
         ))
     }
 
@@ -1788,7 +1982,7 @@ mod tests {
 
         let key = generate_es256_key();
         let now = 1_700_000_000u64;
-        let cca = mint_cca(&key, "amf-1", "NRF", now, CCA_DEFAULT_LIFETIME_SECS);
+        let cca = mint_cca(&key, "amf-1", "NRF", now, CCA_DEFAULT_LIFETIME_SECS, &[]);
 
         let parts: Vec<&str> = cca.split('.').collect();
         assert_eq!(parts.len(), 3, "a CCA is a three-part JWS");
@@ -1889,6 +2083,103 @@ mod tests {
         reset_cca_signing_key();
     }
 
+    /// **Issue #393.** The process-wide chain resolver feeds every newly-built
+    /// `OAuth2Client`, so an NF gains `x5c` with no per-daemon wiring — the same
+    /// one-implementation argument as the signing key itself.
+    ///
+    /// This is the reachability half of the criterion: `mint_cca` emitting `x5c`
+    /// is useless if no production client ever passes a chain to it. Asserted via
+    /// `build_cca`, which is what `request_token` actually calls.
+    #[test]
+    fn a_configured_chain_reaches_the_cca_a_client_actually_builds() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let _g = lock_cca_chain();
+        let _k = lock_cca_key();
+
+        // Baseline: no chain configured ⇒ no x5c, which is the no-PKI path.
+        let key = Arc::new(generate_es256_key());
+        let bare = OAuth2Client::new("http://nrf:7777", "amf-1", NfType::Amf)
+            .with_cca_signing_key(key.clone());
+        assert!(
+            !bare.has_cca_cert_chain(),
+            "with nothing configured a client must attach no chain"
+        );
+
+        // A chain in the process-wide override reaches a FRESHLY BUILT client.
+        let leaf = vec![0x30u8, 0x03, 0x02, 0x01, 0x07];
+        if let Ok(mut o) = CCA_CHAIN_OVERRIDE.write() {
+            *o = Some(Arc::new(vec![leaf.clone()]));
+        }
+        let client = OAuth2Client::new("http://nrf:7777", "amf-1", NfType::Amf)
+            .with_cca_signing_key(key.clone());
+        assert!(
+            client.has_cca_cert_chain(),
+            "a process-wide chain must reach every new client with no per-NF wiring"
+        );
+
+        // And it really lands in the assertion the client sends.
+        let cca = client.build_cca().expect("a signing key is configured");
+        let header: serde_json::Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(cca.split('.').next().expect("header"))
+                .expect("b64"),
+        )
+        .expect("json");
+        let x5c = header["x5c"].as_array().expect("x5c must be present");
+        assert_eq!(
+            x5c[0].as_str().expect("entry"),
+            base64::engine::general_purpose::STANDARD.encode(&leaf),
+            "the DER must arrive as RFC 7515 §4.1.6 standard base64"
+        );
+
+        // A per-client chain overrides the process-wide one.
+        let other = vec![0x30u8, 0x03, 0x02, 0x01, 0x08];
+        let overridden = OAuth2Client::new("http://nrf:7777", "amf-1", NfType::Amf)
+            .with_cca_signing_key(key)
+            .with_cca_cert_chain(vec![other.clone()]);
+        let cca = overridden.build_cca().expect("key");
+        let header: serde_json::Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD
+                .decode(cca.split('.').next().expect("header"))
+                .expect("b64"),
+        )
+        .expect("json");
+        assert_eq!(
+            header["x5c"][0].as_str().expect("entry"),
+            base64::engine::general_purpose::STANDARD.encode(&other)
+        );
+    }
+
+    /// **Issue #393.** A chain file that parses to ZERO certificates is an error,
+    /// not an empty chain.
+    ///
+    /// The distinction matters for exactly the reason the signing-key loader
+    /// distinguishes absent from invalid: returning `Ok(vec![])` would silently
+    /// degrade an NF that was CONFIGURED for `x5c` to the no-`x5c` path, and the
+    /// only symptom at the far end is a bare `invalid_client` from the NRF.
+    #[test]
+    fn an_empty_or_missing_cca_chain_file_is_an_error_not_an_empty_chain() {
+        let dir = std::env::temp_dir().join(format!("sbi-cca-chain-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let empty = dir.join("empty.pem");
+        std::fs::write(&empty, b"").expect("write");
+        assert!(
+            load_cca_cert_chain(&empty).is_err(),
+            "a PEM file with no certificates must not yield an empty chain"
+        );
+
+        let not_pem = dir.join("garbage.pem");
+        std::fs::write(&not_pem, b"this is not a certificate").expect("write");
+        assert!(load_cca_cert_chain(&not_pem).is_err());
+
+        assert!(load_cca_cert_chain(&dir.join("absent.pem")).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Issue #64: the shared ES256 key loader distinguishes ABSENT (create one)
     /// from INVALID (a human must look at it). Regenerating on a malformed file
     /// would invalidate every credential already issued under the old key — which
@@ -1974,6 +2265,7 @@ mod tests {
             NfType::Nrf.to_str(),
             1_000,
             60,
+            &[],
         );
         let sig_input = {
             let mut p = cca.rsplitn(2, '.');

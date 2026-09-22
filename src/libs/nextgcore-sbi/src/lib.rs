@@ -39,6 +39,7 @@
 //! - [`overload`] - OCI/LCI overload & load control parse/emit + reaction
 //! - [`error`] - Error types
 
+pub mod cca_x5c; // The CCA's x5c chain and its NF-Instance-ID binding (issue #393)
 pub mod constants;
 pub mod context;
 pub mod datetime; // TS 29.571 DateTime <-> epoch seconds (issue #94)

@@ -100,6 +100,26 @@ async fn main() {
     // POSITIVE: the real key the NRF holds the public half of.
     let trusted =
         OAuth2Client::new(nrf_uri, instance_id.clone(), own_type).with_cca_signing_key(key.clone());
+
+    // Issue #393: state WHICH of the two binding mechanisms this run exercises, so
+    // a green log cannot be read as proving the conformant one. `x5c` is attached
+    // only when NEXTGCORE_SBI_CCA_CERT_FILE names a chain over this CCA signing
+    // key; the docker overlay sets no such file, because no CA in that overlay can
+    // certify a key the NF generates at startup. A reader who sees "trust store"
+    // here knows the x5c coverage is the in-process nrfd tests, not this stage.
+    if trusted.has_cca_cert_chain() {
+        println!(
+            "binding mechanism: x5c certificate chain (TS 33.501 §13.3.8.2); the NRF binds the \
+             leaf certificate's URI SAN to this assertion's sub (§13.3.8.3)"
+        );
+    } else {
+        println!(
+            "binding mechanism: cca_trusted_keys store (NEXTGCORE_SBI_CCA_CERT_FILE unset). This \
+             is the no-PKI path and a documented deviation from TS 33.501 §13.3.8.2 -- this run \
+             does NOT exercise the x5c certificate binding."
+        );
+    }
+
     match trusted.request_token(target_type, scope).await {
         Ok(resp) => {
             // A token that is not a JWS is not a token; check shape, not just 200.
