@@ -3052,44 +3052,93 @@ fn parse_qos(s: &str) -> PositioningQos {
     }
 }
 
-/// Build the NFProfile registered with the NRF (TS 29.510), #104.
+/// Every Nlmf service this LMF serves, with the NF types allowed to consume it
+/// (TS 29.510 §6.1.6.2.3 `NFService.allowedNfTypes`).
+///
+/// ONE table (#392), consumed by both [`build_lmf_nf_instance`] (the typed self
+/// instance) and [`build_lmf_nf_profile`] (the NFProfile PUT to the NRF). #104
+/// had already fixed the profile to advertise all three services TS 23.501
+/// Table 7.2.25-1 lists, but the self instance was still built with `nlmf-loc`
+/// alone, so the two disagreed about what this LMF serves.
+const LMF_SERVICES: &[(nextgcore_sbi::types::SbiServiceType, &[&str])] = &[
+    // TS 29.572 Nlmf_Location, consumed by the AMF (and the GMLC via the AMF).
+    (
+        nextgcore_sbi::types::SbiServiceType::NlmfLoc,
+        &["AMF", "GMLC", "SCP"],
+    ),
+    // TS 29.572 Nlmf_Broadcast: ciphering-key provision toward the AMF.
+    (
+        nextgcore_sbi::types::SbiServiceType::NlmfBroadcast,
+        &["AMF", "SCP"],
+    ),
+    // TS 29.572 LMF data exposure, consumed by analytics/exposure NFs.
+    (
+        nextgcore_sbi::types::SbiServiceType::NlmfDataexposure,
+        &["NWDAF", "DCCF", "NEF", "AMF", "SCP"],
+    ),
+];
+
+/// Build this LMF's typed self NF instance from [`LMF_SERVICES`].
+fn build_lmf_nf_instance(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+) -> nextgcore_sbi::context::NfInstance {
+    let mut self_instance =
+        nextgcore_sbi::context::NfInstance::new(nf_instance_id, nextgcore_sbi::types::NfType::Lmf);
+    self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
+    self_instance.heartbeat_interval = 10;
+    for (service_type, _allowed) in LMF_SERVICES {
+        let mut svc = nextgcore_sbi::context::NfService::new(service_type.to_name(), *service_type);
+        svc.port = sbi_port;
+        svc.ip_addresses = vec![sbi_addr.to_string()];
+        self_instance.add_service(svc);
+    }
+    self_instance
+}
+
+/// Build the NFProfile registered with the NRF (TS 29.510 §6.1.6.2.2), #104.
 ///
 /// Extracted from `register_with_nrf` so the advertised service list is
 /// assertable: it was inline, and it was wrong — TS 23.501 Table 7.2.25-1 lists
 /// three LMF services and only `nlmf-loc` appeared, so a consumer discovering
 /// this LMF could not find the other two even once they existed.
+///
+/// #392: now rendered from [`LMF_SERVICES`], with per-service `allowedNfTypes`
+/// and an NF-level union, so the profile and the self instance cannot drift.
 fn build_lmf_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
+    let services: Vec<serde_json::Value> = LMF_SERVICES
+        .iter()
+        .map(|(service_type, allowed)| {
+            let name = service_type.to_name();
+            serde_json::json!({
+                "serviceInstanceId": format!("{nf_instance_id}-{name}"),
+                "serviceName": name,
+                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+                "scheme": "http",
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
+                "allowedNfTypes": allowed,
+            })
+        })
+        .collect();
+
+    let mut nf_allowed: Vec<&str> = Vec::new();
+    for (_, allowed) in LMF_SERVICES {
+        for t in *allowed {
+            if !nf_allowed.contains(t) {
+                nf_allowed.push(t);
+            }
+        }
+    }
+
     serde_json::json!({
         "nfInstanceId": nf_instance_id,
         "nfType": "LMF",
         "nfStatus": "REGISTERED",
         "ipv4Addresses": [sbi_addr],
-        // #104: TS 23.501 Table 7.2.25-1 lists THREE LMF services. Only
-        // `nlmf-loc` was advertised, so a consumer discovering this LMF could not
-        // find the broadcast or data-exposure surfaces even once they existed.
-        "nfServices": [{
-            "serviceInstanceId": format!("{}-nlmf-loc", nf_instance_id),
-            "serviceName": "nlmf-loc",
-            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-            "scheme": "http",
-            "nfServiceStatus": "REGISTERED",
-            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-        }, {
-            "serviceInstanceId": format!("{}-nlmf-broadcast", nf_instance_id),
-            "serviceName": "nlmf-broadcast",
-            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-            "scheme": "http",
-            "nfServiceStatus": "REGISTERED",
-            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-        }, {
-            "serviceInstanceId": format!("{}-nlmf-dataexposure", nf_instance_id),
-            "serviceName": "nlmf-dataexposure",
-            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-            "scheme": "http",
-            "nfServiceStatus": "REGISTERED",
-            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-        }],
-        "allowedNfTypes": ["AMF", "SCP"],
+        "nfServices": services,
+        "allowedNfTypes": nf_allowed,
         "heartBeatTimer": 10
     })
 }
@@ -3133,19 +3182,12 @@ async fn register_with_nrf(
         200 | 201 => {
             log::info!("LMF registered with NRF successfully (id={nf_instance_id})");
 
-            let mut self_instance = nextgcore_sbi::context::NfInstance::new(
-                nf_instance_id,
-                nextgcore_sbi::types::NfType::Lmf,
-            );
-            self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
-            let mut svc = nextgcore_sbi::context::NfService::new(
-                "nlmf-loc",
-                nextgcore_sbi::types::SbiServiceType::NlmfLoc,
-            );
-            svc.port = sbi_port;
-            svc.ip_addresses = vec![sbi_addr.to_string()];
-            self_instance.add_service(svc);
-            sbi_ctx.set_self_instance(self_instance).await;
+            // From the SAME table the profile came from: it used to be built here
+            // with `nlmf-loc` alone, so the self instance claimed one service
+            // while the registered profile claimed three (#392).
+            sbi_ctx
+                .set_self_instance(build_lmf_nf_instance(nf_instance_id, sbi_addr, sbi_port))
+                .await;
 
             Ok(())
         }
@@ -4404,6 +4446,58 @@ mod tests {
                 "{expected} must be advertised, got {names:?}"
             );
         }
+
+        // #392: each service carries its own endpoint and consumer set. Without
+        // ipEndPoints a consumer that discovers the service has no port to dial,
+        // only the NF-level ipv4Addresses.
+        for svc in profile["nfServices"].as_array().expect("nfServices") {
+            let name = svc["serviceName"].as_str().unwrap_or_default();
+            let eps = svc["ipEndPoints"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name} carries no ipEndPoints"));
+            assert_eq!(
+                eps[0]["port"].as_u64(),
+                Some(7816),
+                "{name} must advertise the port passed to the builder"
+            );
+            assert_eq!(eps[0]["ipv4Address"].as_str(), Some("127.0.0.1"));
+            assert!(
+                svc["allowedNfTypes"]
+                    .as_array()
+                    .is_some_and(|a| !a.is_empty()),
+                "{name} must state its allowedNfTypes (TS 29.510 §6.1.6.2.3)"
+            );
+        }
+    }
+
+    /// #392: the typed self instance and the registered profile advertise the SAME
+    /// surface, because both render `LMF_SERVICES`.
+    ///
+    /// #104 had already fixed the PROFILE to carry all three services TS 23.501
+    /// Table 7.2.25-1 lists, but the self instance was still built with
+    /// `nlmf-loc` alone — so this LMF held two different answers to "what do I
+    /// serve", and which one a caller saw depended on which it read.
+    #[test]
+    fn the_lmf_self_instance_matches_the_registered_profile() {
+        let instance = build_lmf_nf_instance("lmf-test-instance", "10.45.0.13", 7777);
+        let profile = build_lmf_nf_profile("lmf-test-instance", "10.45.0.13", 7777);
+
+        let mut from_instance: Vec<String> =
+            instance.services.iter().map(|s| s.name.clone()).collect();
+        let mut from_profile: Vec<String> = profile["nfServices"]
+            .as_array()
+            .expect("nfServices")
+            .iter()
+            .map(|s| s["serviceName"].as_str().unwrap_or_default().to_string())
+            .collect();
+        from_instance.sort();
+        from_profile.sort();
+
+        assert_eq!(
+            from_instance, from_profile,
+            "the self instance carried nlmf-loc alone while the profile carried three"
+        );
+        assert_eq!(from_instance.len(), LMF_SERVICES.len());
     }
 
     /// #104 acceptance: a transferred PERIODIC deferred LDR RESUMES periodic

@@ -2231,6 +2231,98 @@ fn emit_ctx_status_notify(event_type: &str, session_key: Option<serde_json::Valu
     }
 }
 
+/// Every Nmbsmf service this MB-SMF serves: the service type, the API version it
+/// is defined at, and the NF types allowed to consume it (TS 29.510 §6.1.6.2.3
+/// `NFService.allowedNfTypes`).
+///
+/// ONE table (#392), consumed by both [`build_mbsmf_nf_instance`] (the typed self
+/// instance) and [`build_mbsmf_nf_profile`] (the NFProfile PUT to the NRF). The
+/// profile already advertised both services; the self instance carried
+/// `nmbsmf-mbssession` alone, so the two disagreed.
+const MBSMF_SERVICES: &[(nextgcore_sbi::types::SbiServiceType, &str, &[&str])] = &[
+    // TS 29.532 Nmbsmf_MBSSession, consumed by the AMF/SMF/NEF.
+    (
+        nextgcore_sbi::types::SbiServiceType::NmbsmfMbssession,
+        "1.0.0",
+        &["AMF", "SMF", "NEF", "SCP"],
+    ),
+    // TS 29.532 Nmbsmf_TMGI (Allocate/Deallocate). [mbsmfd-04]
+    (
+        nextgcore_sbi::types::SbiServiceType::NmbsmfTmgi,
+        "1.1.0",
+        &["AMF", "SMF", "NEF", "SCP"],
+    ),
+];
+
+/// Build this MB-SMF's typed self NF instance from [`MBSMF_SERVICES`].
+fn build_mbsmf_nf_instance(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+) -> nextgcore_sbi::context::NfInstance {
+    let mut self_instance = nextgcore_sbi::context::NfInstance::new(
+        nf_instance_id,
+        nextgcore_sbi::types::NfType::Mbsmf,
+    );
+    self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
+    self_instance.heartbeat_interval = 10;
+    for (service_type, _full_version, _allowed) in MBSMF_SERVICES {
+        let mut svc = nextgcore_sbi::context::NfService::new(service_type.to_name(), *service_type);
+        svc.port = sbi_port;
+        svc.ip_addresses = vec![sbi_addr.to_string()];
+        self_instance.add_service(svc);
+    }
+    self_instance
+}
+
+/// Build the MB-SMF's NFProfile for NRF registration (TS 29.510 §6.1.6.2.2).
+///
+/// Split out of [`register_with_nrf`] so the advertised service list is
+/// assertable without standing up an NRF. Each service carries its own
+/// `ipEndPoints` and `allowedNfTypes`; the NF-level `allowedNfTypes` is the UNION
+/// over the services, since a type barred at NF level can never reach any
+/// service.
+fn build_mbsmf_nf_profile(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+) -> serde_json::Value {
+    let services: Vec<serde_json::Value> = MBSMF_SERVICES
+        .iter()
+        .map(|(service_type, full_version, allowed)| {
+            let name = service_type.to_name();
+            serde_json::json!({
+                "serviceInstanceId": format!("{nf_instance_id}-{name}"),
+                "serviceName": name,
+                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": full_version}],
+                "scheme": "http",
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
+                "allowedNfTypes": allowed,
+            })
+        })
+        .collect();
+
+    let mut nf_allowed: Vec<&str> = Vec::new();
+    for (_, _, allowed) in MBSMF_SERVICES {
+        for t in *allowed {
+            if !nf_allowed.contains(t) {
+                nf_allowed.push(t);
+            }
+        }
+    }
+
+    serde_json::json!({
+        "nfInstanceId": nf_instance_id,
+        "nfType": "MB_SMF",
+        "nfStatus": "REGISTERED",
+        "ipv4Addresses": [sbi_addr],
+        "nfServices": services,
+        "allowedNfTypes": nf_allowed,
+        "heartBeatTimer": 10
+    })
+}
+
 /// Register MB-SMF with NRF
 async fn register_with_nrf(
     sbi_addr: &str,
@@ -2253,30 +2345,7 @@ async fn register_with_nrf(
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
 
-    let nf_profile = serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "MB_SMF",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": [{
-            "serviceInstanceId": format!("{}-nmbsmf-mbssession", nf_instance_id),
-            "serviceName": "nmbsmf-mbssession",
-            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-            "scheme": "http",
-            "nfServiceStatus": "REGISTERED",
-            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-        }, {
-            // Nmbsmf_TMGI service (Allocate/Deallocate). [mbsmfd-04]
-            "serviceInstanceId": format!("{}-nmbsmf-tmgi", nf_instance_id),
-            "serviceName": "nmbsmf-tmgi",
-            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.1.0"}],
-            "scheme": "http",
-            "nfServiceStatus": "REGISTERED",
-            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-        }],
-        "allowedNfTypes": ["AMF", "SMF", "NEF", "SCP"],
-        "heartBeatTimer": 10
-    });
+    let nf_profile = build_mbsmf_nf_profile(nf_instance_id, sbi_addr, sbi_port);
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");
@@ -2290,19 +2359,11 @@ async fn register_with_nrf(
         200 | 201 => {
             log::info!("MB-SMF registered with NRF successfully (id={nf_instance_id})");
 
-            let mut self_instance = nextgcore_sbi::context::NfInstance::new(
-                nf_instance_id,
-                nextgcore_sbi::types::NfType::Mbsmf,
-            );
-            self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
-            let mut svc = nextgcore_sbi::context::NfService::new(
-                "nmbsmf-mbssession",
-                nextgcore_sbi::types::SbiServiceType::NmbsmfMbssession,
-            );
-            svc.port = sbi_port;
-            svc.ip_addresses = vec![sbi_addr.to_string()];
-            self_instance.add_service(svc);
-            sbi_ctx.set_self_instance(self_instance).await;
+            // From the SAME table the profile came from: it used to be built here
+            // with `nmbsmf-mbssession` alone (#392).
+            sbi_ctx
+                .set_self_instance(build_mbsmf_nf_instance(nf_instance_id, sbi_addr, sbi_port))
+                .await;
 
             Ok(())
         }
@@ -2401,6 +2462,66 @@ mod tests {
             Some(0),
         )
         .to_vec()
+    }
+
+    /// #392: the registered NFProfile advertises both Nmbsmf services, each at its
+    /// own full version, and the typed self instance advertises the SAME surface.
+    ///
+    /// The profile already carried both; the self instance carried
+    /// `nmbsmf-mbssession` alone, so this MB-SMF held two different answers to
+    /// "what do I serve".
+    #[test]
+    fn the_mbsmf_profile_and_self_instance_advertise_one_surface() {
+        let profile = build_mbsmf_nf_profile("mbsmf-test-instance", "10.45.0.14", 7811);
+        let services = profile["nfServices"].as_array().expect("nfServices");
+        let names: Vec<&str> = services
+            .iter()
+            .map(|s| s["serviceName"].as_str().expect("serviceName"))
+            .collect();
+
+        assert!(
+            names.contains(&"nmbsmf-mbssession"),
+            "advertised: {names:?}"
+        );
+        assert!(names.contains(&"nmbsmf-tmgi"), "advertised: {names:?}");
+
+        // The two full versions differ and both are pinned: TMGI is 1.1.0.
+        let tmgi = services
+            .iter()
+            .find(|s| s["serviceName"] == "nmbsmf-tmgi")
+            .expect("nmbsmf-tmgi");
+        assert_eq!(tmgi["versions"][0]["apiFullVersion"], "1.1.0");
+        let session = services
+            .iter()
+            .find(|s| s["serviceName"] == "nmbsmf-mbssession")
+            .expect("nmbsmf-mbssession");
+        assert_eq!(session["versions"][0]["apiFullVersion"], "1.0.0");
+
+        for svc in services {
+            let name = svc["serviceName"].as_str().unwrap_or_default();
+            let eps = svc["ipEndPoints"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name} carries no ipEndPoints"));
+            assert_eq!(eps[0]["port"].as_u64(), Some(7811), "{name} port");
+            assert!(
+                svc["allowedNfTypes"]
+                    .as_array()
+                    .is_some_and(|a| !a.is_empty()),
+                "{name} must state its allowedNfTypes (TS 29.510 §6.1.6.2.3)"
+            );
+        }
+
+        let instance = build_mbsmf_nf_instance("mbsmf-test-instance", "10.45.0.14", 7811);
+        let mut from_instance: Vec<String> =
+            instance.services.iter().map(|s| s.name.clone()).collect();
+        let mut from_profile: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        from_instance.sort();
+        from_profile.sort();
+        assert_eq!(
+            from_instance, from_profile,
+            "the self instance carried nmbsmf-mbssession alone while the profile carried both"
+        );
+        assert_eq!(from_instance.len(), MBSMF_SERVICES.len());
     }
 
     #[test]

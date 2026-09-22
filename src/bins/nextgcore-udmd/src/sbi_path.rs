@@ -48,9 +48,25 @@ static SBI_RUNNING: AtomicBool = AtomicBool::new(false);
 /// `v1` and the other at `v2`, neither advertised the routed `nudm-ee` at all,
 /// and which profile the NRF saw depended on the registration path taken.
 ///
+/// #392 asked whether two registrations should exist at all. For this UDM the
+/// answer is no and always was: there is exactly ONE registration, from
+/// `app::register_with_nrf_id`, and #392 removed the dead second registration
+/// FUNCTION that used to sit below this list. The list stays shared because the
+/// self instance and the NFProfile are two RENDERINGS of one advertised surface,
+/// not two registrations — keeping one list is what makes them unable to drift.
+/// The only other caller of `register_with_nrf_id` is the issue #22 NES resume
+/// path (`nes_driver.rs`), which is a deliberate RE-registration after a
+/// suspend, not a startup duplicate.
+///
 /// The version per service is normative and easy to get wrong: TS 29.503 §6.1.1
 /// says "The `<apiVersion>` shall be v2" for **Nudm_SDM** only; every other
 /// Nudm service is v1.
+///
+/// The four Nudm services this UDM routes only to answer 501
+/// (`nudm-niddau`, `nudm-rsds`, `nudm-ssau`, `nudm-ueid`; see
+/// `app::route_nudm_unimplemented`) are deliberately absent: advertising a 501
+/// makes a consumer discover the service, dial it and fail, where otherwise it
+/// finds no producer and says so.
 pub const UDM_ADVERTISED_SERVICES: [(&str, &str, SbiServiceType); 6] = [
     ("nudm-sdm", "v2", SbiServiceType::NudmSdm),
     ("nudm-uecm", "v1", SbiServiceType::NudmUecm),
@@ -139,59 +155,21 @@ pub fn udm_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
     Ok(())
 }
 
-/// Register UDM NF instance with NRF
-///
-/// Sends NFRegister (PUT) to NRF at /nnrf-nfm/v1/nf-instances/{nfInstanceId}
-pub async fn udm_nrf_register(nrf_host: &str, nrf_port: u16) -> Result<(), String> {
-    let sbi_ctx = global_context();
-    let self_instance = sbi_ctx
-        .get_self_instance()
-        .await
-        .ok_or("Self NF instance not initialized")?;
-
-    let client = sbi_ctx.get_client(nrf_host, nrf_port).await;
-
-    let path = format!("/nnrf-nfm/v1/nf-instances/{}", self_instance.id);
-
-    // Build NF profile JSON for registration through the SHARED builder (#85):
-    // this path used to render the self instance by hand, producing a profile
-    // that differed from the one `app::register_with_nrf_id` sent.
-    let sbi_addr = self_instance
-        .ipv4_addresses
-        .first()
-        .cloned()
-        .unwrap_or_default();
-    let sbi_port = self_instance
-        .services
-        .first()
-        .map(|s| s.port)
-        .unwrap_or(7777);
-    let profile_config = udm_self()
-        .read()
-        .map(|ctx| ctx.nf_profile_config())
-        .unwrap_or_default();
-    let nf_profile = build_udm_nf_profile(&self_instance.id, &sbi_addr, sbi_port, &profile_config);
-
-    let request = SbiRequest::put(&path)
-        .with_json_body(&nf_profile)
-        .map_err(|e| format!("Failed to serialize NF profile: {e}"))?;
-
-    let response = client
-        .send_request(request)
-        .await
-        .map_err(|e| format!("NRF registration request failed: {e}"))?;
-
-    if response.is_success() {
-        // Parse heartbeat interval from response if provided
-        log::info!("UDM registered with NRF (status={})", response.status);
-        Ok(())
-    } else {
-        Err(format!(
-            "NRF registration failed with status {}",
-            response.status
-        ))
-    }
-}
+// #392: a second NRF registration function, `udm_nrf_register`, used to live
+// here. It PUT a full NFProfile to `/nnrf-nfm/v1/nf-instances/{id}` and NOTHING
+// CALLED IT — the only reference outside its own body was the `pub use`
+// re-export in `lib.rs`. The startup path is `app::run` -> `register_with_nrf`
+// -> `register_with_nrf_id`, which is the one registration this UDM performs.
+//
+// Deleted rather than wired up: wiring it would create the very second PUT per
+// startup that #392 exists to remove, and it would have raced
+// `register_with_nrf_id` for last-writer-wins on the same `nfInstanceId` (#187
+// made both paths share one id, so the second PUT overwrites rather than
+// duplicating).
+//
+// `build_udm_nf_profile` above stays: it is the shared serialiser
+// `app::build_udm_nf_profile` delegates to, and the ONE place the advertised
+// service list is rendered.
 
 /// Send NRF heartbeat (PATCH to NRF)
 pub async fn udm_nrf_heartbeat(nrf_host: &str, nrf_port: u16) -> Result<(), String> {

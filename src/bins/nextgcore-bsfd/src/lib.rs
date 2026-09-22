@@ -307,7 +307,7 @@ pub async fn run() -> Result<()> {
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
 
     // Register with NRF and start heartbeat worker
-    match register_with_nrf(&args.sbi_addr, args.sbi_port).await {
+    match register_with_nrf(&args.sbi_addr, args.sbi_port, args.tls).await {
         Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
             // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
             // (BSF bindings vs configured capacity; TS 29.510 §5.2.2.3.2).
@@ -2630,11 +2630,73 @@ async fn run_event_loop_async(bsf_sm: &mut BsfSmContext, shutdown: Arc<AtomicBoo
     Ok(())
 }
 
-/// Register BSF with NRF.
+/// Build the BSF's NFProfile for NRF registration (TS 29.510 §6.1.6.2.2).
+///
+/// The single authoritative profile shape for this BSF: the service list comes
+/// from `sbi_path::BSF_SERVICES`, so it cannot drift from the typed self instance
+/// `bsf_sbi_open` publishes from the same table (#392).
+///
+/// `tls` selects the advertised `scheme`. The literal `"http"` this replaced was
+/// wrong whenever the listener ran TLS: the NRF would then serve consumers a
+/// `http://` endpoint for an HTTPS-only port, and the failure surfaced on THEIR
+/// side as a connection error with nothing pointing back here.
+///
+/// Each service carries its own `ipEndPoints` — without them a consumer that
+/// discovers `nbsf-management` has no port to dial, only the NF-level
+/// `ipv4Addresses` — and its own `allowedNfTypes`; the NF-level `allowedNfTypes`
+/// is the UNION over the services, since a type barred at NF level can never
+/// reach any service.
+fn bsf_nf_profile_json(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+    tls: bool,
+) -> serde_json::Value {
+    let scheme = if tls { "https" } else { "http" };
+    let services: Vec<serde_json::Value> = crate::sbi_path::BSF_SERVICES
+        .iter()
+        .map(|(service_type, allowed)| {
+            let name = service_type.to_name();
+            serde_json::json!({
+                "serviceInstanceId": format!("{nf_instance_id}-{name}"),
+                "serviceName": name,
+                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+                "scheme": scheme,
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
+                "allowedNfTypes": allowed,
+            })
+        })
+        .collect();
+
+    let mut nf_allowed: Vec<&str> = Vec::new();
+    for (_, allowed) in crate::sbi_path::BSF_SERVICES {
+        for t in *allowed {
+            if !nf_allowed.contains(t) {
+                nf_allowed.push(t);
+            }
+        }
+    }
+
+    serde_json::json!({
+        "nfInstanceId": nf_instance_id,
+        "nfType": "BSF",
+        "nfStatus": "REGISTERED",
+        "ipv4Addresses": [sbi_addr],
+        "nfServices": services,
+        "allowedNfTypes": nf_allowed,
+        "heartBeatTimer": 10
+    })
+}
+
+/// Register BSF with NRF — the ONLY NRF registration this BSF performs.
 ///
 /// Returns the NF instance ID on success so the caller can start a heartbeat
 /// worker.
-async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, String> {
+///
+/// #392: `sbi_path::bsf_sbi_open` used to PUT a second, divergent profile before
+/// the SBI listener accepted. It no longer registers; see its doc comment.
+async fn register_with_nrf(sbi_addr: &str, sbi_port: u16, tls: bool) -> Result<String, String> {
     let sbi_ctx = nextgcore_sbi::context::global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
@@ -2653,24 +2715,7 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
 
     let nf_instance_id = nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::Bsf).to_string();
 
-    let nf_profile = serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "BSF",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": [
-            {
-                "serviceInstanceId": format!("{nf_instance_id}-nbsf-management"),
-                "serviceName": "nbsf-management",
-                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                "scheme": "http",
-                "nfServiceStatus": "REGISTERED",
-                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-            }
-        ],
-        "allowedNfTypes": ["PCF", "SMF", "SCP"],
-        "heartBeatTimer": 10
-    });
+    let nf_profile = bsf_nf_profile_json(&nf_instance_id, sbi_addr, sbi_port, tls);
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     let response = client
@@ -2726,6 +2771,109 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #392: the ONE registration this BSF performs carries everything the
+    /// deleted second registration contributed, and more.
+    ///
+    /// `bsf_sbi_open` used to PUT a profile of its own before the SBI listener
+    /// accepted, so every startup registered TWICE under one `nfInstanceId` (#187
+    /// unified the id) and the profile the NRF served was whichever PUT landed
+    /// last. The two were not equivalent, and this test pins the merge rather than
+    /// merely asserting "not twice":
+    ///
+    /// - from the SURVIVING profile: per-service `ipEndPoints` and
+    ///   `allowedNfTypes`, which `bsf_sbi_open`'s profile omitted entirely — a
+    ///   consumer discovering `nbsf-management` from it had no port to dial;
+    /// - from the DELETED profile: the TLS-derived `scheme`, which the survivor
+    ///   hardcoded to `"http"`. Asserted in both positions below, because a
+    ///   `https` listener advertised as `http` fails on the CONSUMER's side with
+    ///   nothing pointing back here.
+    ///
+    /// `each_daemon_registers_with_the_nrf_exactly_once` in `nextgcore-sbi` is the
+    /// other half: it pins that there is exactly one PUT.
+    #[test]
+    fn the_one_bsf_registration_carries_both_former_profiles_attributes() {
+        let plain = bsf_nf_profile_json("bsf-test-instance", "10.45.0.17", 7777, false);
+        let services = plain["nfServices"].as_array().expect("nfServices");
+        assert_eq!(services.len(), 1, "the BSF serves one service");
+
+        let svc = &services[0];
+        assert_eq!(svc["serviceName"], "nbsf-management");
+
+        // Contributed by the surviving profile, absent from the deleted one.
+        let eps = svc["ipEndPoints"]
+            .as_array()
+            .expect("per-service ipEndPoints: without them a consumer has no port to dial");
+        assert_eq!(eps[0]["ipv4Address"], "10.45.0.17");
+        assert_eq!(eps[0]["port"].as_u64(), Some(7777));
+
+        let allowed: Vec<&str> = svc["allowedNfTypes"]
+            .as_array()
+            .expect("per-service allowedNfTypes (TS 29.510 §6.1.6.2.3)")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(allowed.contains(&"PCF"), "the PCF registers bindings");
+        assert!(
+            allowed.contains(&"AF") && allowed.contains(&"NEF"),
+            "the AF and NEF look bindings up: {allowed:?}"
+        );
+
+        // The NF-level set is the union, so nothing is barred at NF level that a
+        // service permits.
+        let nf_level: Vec<&str> = plain["allowedNfTypes"]
+            .as_array()
+            .expect("NF-level allowedNfTypes")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        for t in &allowed {
+            assert!(
+                nf_level.contains(t),
+                "{t} may consume nbsf-management but is barred at NF level: {nf_level:?}"
+            );
+        }
+
+        // Contributed by the DELETED profile: the scheme follows the listener.
+        assert_eq!(
+            svc["scheme"], "http",
+            "a plaintext listener advertises http"
+        );
+        let tls = bsf_nf_profile_json("bsf-test-instance", "10.45.0.17", 7777, true);
+        assert_eq!(
+            tls["nfServices"][0]["scheme"], "https",
+            "a TLS listener must advertise https; the deleted profile derived this from \
+             config.tls_enabled and the survivor hardcoded \"http\""
+        );
+
+        assert_eq!(plain["nfType"], "BSF");
+        assert_eq!(plain["nfStatus"], "REGISTERED");
+        assert_eq!(plain["nfInstanceId"], "bsf-test-instance");
+    }
+
+    /// #392: the typed self instance `bsf_sbi_open` publishes and the registered
+    /// profile advertise the SAME surface, because both render `BSF_SERVICES`.
+    #[test]
+    fn the_bsf_self_instance_matches_the_registered_profile() {
+        let profile = bsf_nf_profile_json("bsf-test-instance", "10.45.0.17", 7777, false);
+        let from_profile: Vec<String> = profile["nfServices"]
+            .as_array()
+            .expect("nfServices")
+            .iter()
+            .map(|s| s["serviceName"].as_str().unwrap_or_default().to_string())
+            .collect();
+        let from_table: Vec<String> = crate::sbi_path::BSF_SERVICES
+            .iter()
+            .map(|(t, _)| t.to_name().to_string())
+            .collect();
+        assert_eq!(from_profile, from_table);
+        assert_eq!(
+            crate::sbi_path::allowed_nf_types_for("nbsf-management").contains(&"PCF"),
+            true
+        );
+        // A service this BSF does not serve has no consumers, rather than all.
+        assert!(crate::sbi_path::allowed_nf_types_for("npcf-smpolicycontrol").is_empty());
+    }
 
     #[test]
     fn test_args_default() {

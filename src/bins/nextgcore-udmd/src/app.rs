@@ -3720,6 +3720,67 @@ mod tests {
         assert_eq!(sdm["versions"][0]["apiFullVersion"], "2.0.0");
     }
 
+    /// #392: the ONE registration this UDM performs advertises every Nudm service
+    /// it really implements, and nothing it only answers 501 for.
+    ///
+    /// Positive on each name. `udmd` is the crate whose `sbi_path.rs` comment #392
+    /// asks about ("ONE list, consumed by both..."): the comment was accurate and
+    /// the list IS shared, so the self instance and the profile agree by
+    /// construction. What #392 removed here was a DEAD second registration function
+    /// (`sbi_path::udm_nrf_register`) that nothing called — the startup path is
+    /// `register_with_nrf` -> `register_with_nrf_id`.
+    ///
+    /// The four services routed only to answer 501 must NOT be advertised:
+    /// advertising a 501 makes a consumer discover the service, dial it and fail,
+    /// where otherwise it finds no producer and says so.
+    #[test]
+    fn the_udm_profile_advertises_every_implemented_nudm_service() {
+        let profile = build_udm_nf_profile("udm-test-instance", "10.45.0.10", 7777);
+        let names: Vec<&str> = profile["nfServices"]
+            .as_array()
+            .expect("nfServices")
+            .iter()
+            .map(|s| s["serviceName"].as_str().expect("serviceName"))
+            .collect();
+
+        for expected in [
+            "nudm-sdm",
+            "nudm-uecm",
+            "nudm-ueau",
+            "nudm-ee",
+            "nudm-pp",
+            "nudm-mt",
+        ] {
+            assert!(
+                names.contains(&expected),
+                "the UDM routes {expected} but does not advertise it; the NRF filters \
+                 discovery on serviceName. Advertised: {names:?}"
+            );
+        }
+
+        for unimplemented in ["nudm-niddau", "nudm-rsds", "nudm-ssau", "nudm-ueid"] {
+            assert!(
+                !names.contains(&unimplemented),
+                "{unimplemented} is routed only to answer 501, so advertising it would make a \
+                 consumer discover it and then fail. Advertised: {names:?}"
+            );
+        }
+
+        assert_eq!(
+            names.len(),
+            crate::sbi_path::UDM_ADVERTISED_SERVICES.len(),
+            "every entry of UDM_ADVERTISED_SERVICES must reach the profile, and nothing else"
+        );
+
+        for svc in profile["nfServices"].as_array().expect("nfServices") {
+            let name = svc["serviceName"].as_str().unwrap_or_default();
+            let eps = svc["ipEndPoints"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name} carries no ipEndPoints"));
+            assert_eq!(eps[0]["port"].as_u64(), Some(7777), "{name} port");
+        }
+    }
+
     #[test]
     fn test_split_snpn_supi() {
         // SNPN (Rel-17, TS 23.501 §5.30): a NID-scoped SUPI splits into the

@@ -69,7 +69,7 @@ pub mod test_support {
 // Re-export SBI path functions
 pub use sbi_path::{
     udm_amf_send_mt_ue_context_info, udm_ausf_send_sor_protect, udm_ausf_send_upu_protect,
-    udm_nrf_discover, udm_nrf_heartbeat, udm_nrf_register, udm_nudr_dr_send_auth_status_delete,
+    udm_nrf_discover, udm_nrf_heartbeat, udm_nudr_dr_send_auth_status_delete,
     udm_nudr_dr_send_auth_status_put, udm_nudr_dr_send_auth_subscription_get,
     udm_nudr_dr_send_auth_subscription_patch, udm_nudr_dr_send_context_delete,
     udm_nudr_dr_send_context_get, udm_nudr_dr_send_context_patch, udm_nudr_dr_send_context_put,
