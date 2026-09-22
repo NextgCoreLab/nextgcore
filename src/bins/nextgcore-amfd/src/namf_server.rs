@@ -79,15 +79,34 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
 
         // --------------------------------------------------------------
         // Namf_Communication (TS 29.518 §6.1)
+        //   PUT    /namf-comm/v1/ue-contexts/{ueContextId}          (CreateUEContext)
+        //   POST   /namf-comm/v1/ue-contexts/{ueContextId}/release
+        //   POST   /namf-comm/v1/ue-contexts/{ueContextId}/relocate
+        //   POST   /namf-comm/v1/ue-contexts/{ueContextId}/cancel-relocate
         //   POST   /namf-comm/v1/ue-contexts/{ueContextId}/n1-n2-messages
         //   POST   /namf-comm/v1/ue-contexts/{ueContextId}/n1-n2-messages/subscriptions
         //   DELETE /namf-comm/v1/ue-contexts/{ueContextId}/n1-n2-messages/subscriptions/{subscriptionId}
         //   POST   /namf-comm/v1/ue-contexts/{ueContextId}/assign-ebi
         //   POST   /namf-comm/v1/ue-contexts/{ueContextId}/transfer
         //   POST   /namf-comm/v1/ue-contexts/{ueContextId}/transfer-update
+        //
+        // #74: the length guard was `>= 5`, so `PUT .../ue-contexts/{id}` — which
+        // has FOUR path segments — could not reach this arm at all and fell to the
+        // 404 at the bottom. Widened to `>= 4` with the 4-segment case handled
+        // explicitly. It stays ONE arm rather than a second `parts[2] ==
+        // "ue-contexts"` arm, because a second one would be shadowed by this for
+        // every path they share, which is how a route ends up unreachable.
         // --------------------------------------------------------------
-        "namf-comm" if parts[2] == "ue-contexts" && parts.len() >= 5 => {
+        "namf-comm" if parts[2] == "ue-contexts" && parts.len() >= 4 => {
             let ue_context_id = parts[3];
+            // CreateUEContext (TS 29.518 §5.2.2.2.3.1): the "Individual UeContext"
+            // document itself, addressed with no sub-resource.
+            if parts.len() == 4 {
+                return match method {
+                    "PUT" => handle_create_ue_context(ue_context_id, &request),
+                    _ => send_method_not_allowed(method, path),
+                };
+            }
             match (method, parts[4], parts.len()) {
                 ("POST", "n1-n2-messages", 5) => {
                     handle_n1_n2_message_transfer_request(ue_context_id, &request)
@@ -106,9 +125,35 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
                 ("POST", "transfer-update", 5) => {
                     handle_registration_status_update(ue_context_id, &request)
                 }
+                // ReleaseUEContext (TS 29.518 §5.2.2.2.4.1), #74
+                ("POST", "release", 5) => handle_release_ue_context(ue_context_id, &request),
+                // RelocateUEContext (TS 29.518 §5.2.2.2.5.1), #74
+                ("POST", "relocate", 5) => handle_relocate_ue_context(ue_context_id, &request),
+                // CancelRelocateUEContext (TS 29.518 §5.2.2.2.6.1), #74
+                ("POST", "cancel-relocate", 5) => {
+                    handle_cancel_relocate_ue_context(ue_context_id, &request)
+                }
                 _ => send_method_not_allowed(method, path),
             }
         }
+
+        // --------------------------------------------------------------
+        // Namf_Communication AMFStatusChange subscriptions (TS 29.518 §5.2.2.5.1),
+        // #74. A consumer subscribes so it is told when this AMF's availability or
+        // GUAMI service changes — the AMF planned-removal procedure (TS 23.501
+        // §5.21.2.2) is what §5.2.2.5.1.1 names as this service's purpose.
+        //   POST   /namf-comm/v1/subscriptions
+        //   GET    /namf-comm/v1/subscriptions/{subscriptionId}
+        //   PUT    /namf-comm/v1/subscriptions/{subscriptionId}
+        //   DELETE /namf-comm/v1/subscriptions/{subscriptionId}
+        // --------------------------------------------------------------
+        "namf-comm" if parts[2] == "subscriptions" => match (method, parts.len()) {
+            ("POST", 3) => handle_amf_status_subscription_create(&request),
+            ("GET", 4) => handle_amf_status_subscription_read(parts[3]),
+            ("PUT", 4) => handle_amf_status_subscription_replace(parts[3], &request),
+            ("DELETE", 4) => handle_amf_status_subscription_delete(parts[3]),
+            _ => send_method_not_allowed(method, path),
+        },
 
         // --------------------------------------------------------------
         // Namf_MT (TS 29.518 §6.3)
@@ -125,11 +170,22 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
 
         // --------------------------------------------------------------
         // Namf_Location (TS 29.518 §6.4)
-        //   POST /namf-loc/v1/{ueContextId}/provide-pos-info
+        //   POST /namf-loc/v1/{ueContextId}/provide-pos-info    (§5.5.2.2)
+        //   POST /namf-loc/v1/{ueContextId}/provide-loc-info    (§5.5.2.4, #74)
+        //   POST /namf-loc/v1/{ueContextId}/cancel-pos-info     (§5.5.2.5, #74)
+        //
+        // The three are `TS29518_Namf_Location.yaml`'s complete path set
+        // (`:28`, `:132`, `:188`); only the first was routed before #74.
         // --------------------------------------------------------------
-        "namf-loc" if parts.len() == 4 && parts[3] == "provide-pos-info" && method == "POST" => {
-            handle_provide_positioning_info(parts[2], &request)
-        }
+        "namf-loc" if method == "POST" && parts.len() == 4 => match parts[3] {
+            "provide-pos-info" => handle_provide_positioning_info(parts[2], &request).await,
+            "provide-loc-info" => handle_provide_location_info(parts[2], &request),
+            "cancel-pos-info" => handle_cancel_location(parts[2], &request).await,
+            _ => send_not_found(
+                &format!("No resource for {method} {path}"),
+                Some("RESOURCE_URI_STRUCTURE_NOT_FOUND"),
+            ),
+        },
 
         // --------------------------------------------------------------
         // Namf_Callback: Nudm_UECM DeregistrationNotification (WSB-4,
@@ -644,6 +700,19 @@ fn subscription_echo_json(sub: &EventSubscription) -> Value {
     if let Some(supi) = &sub.supi {
         subscription["supi"] = json!(supi);
     }
+    // #74 criterion 4: the echo returns every targeting key the consumer sent, not
+    // just the SUPI the AMF may have resolved from it. A consumer that subscribed
+    // by GPSI must see its GPSI back, or it cannot correlate the resource with the
+    // request it made.
+    if let Some(gpsi) = &sub.gpsi {
+        subscription["gpsi"] = json!(gpsi);
+    }
+    if let Some(pei) = &sub.pei {
+        subscription["pei"] = json!(pei);
+    }
+    if let Some(group_id) = &sub.group_id {
+        subscription["groupId"] = json!(group_id);
+    }
     if sub.any_ue {
         subscription["anyUE"] = json!(true);
     }
@@ -712,18 +781,66 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         event_types.push(event_type.to_string());
     }
 
-    let supi = subscription
+    // Targeting (#74 criterion 4, TS 29.518 §5.3.2.2.2).
+    //
+    // `AmfEventSubscription` (TS29518_Namf_EventExposure.yaml:534-594) offers FIVE
+    // target keys — `supi` (:553), `groupId` (:555), `gpsi` (:577), `pei` (:579)
+    // and `anyUE` (:581) — and its `required` list (:589-593) carries none of
+    // them, only `eventList`/`eventNotifyUri`/`notifyCorrelationId`/`nfId`. So a
+    // subscription keyed solely by GPSI is conformant.
+    //
+    // This guard used to read `supi`/`anyUE` ONLY and answer
+    // `MANDATORY_IE_MISSING` for the other three, which refused a conformant
+    // NWDAF/AF outright. Now `MANDATORY_IE_MISSING` is returned only when the
+    // request names NO target at all — which is still a defect worth refusing,
+    // because the AMF would otherwise have to guess whose events to report.
+    let mut supi = subscription
         .get("supi")
+        .and_then(Value::as_str)
+        .map(String::from);
+    let gpsi = subscription
+        .get("gpsi")
+        .and_then(Value::as_str)
+        .map(String::from);
+    let pei = subscription
+        .get("pei")
+        .and_then(Value::as_str)
+        .map(String::from);
+    let group_id = subscription
+        .get("groupId")
         .and_then(Value::as_str)
         .map(String::from);
     let any_ue = subscription
         .get("anyUE")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if supi.is_none() && !any_ue {
-        // TS 29.518: the subscription must target a UE (supi/gpsi/pei/groupId)
-        // or set anyUE.
-        return mandatory_ie_missing("subscription.supi or subscription.anyUE");
+    if supi.is_none() && gpsi.is_none() && pei.is_none() && group_id.is_none() && !any_ue {
+        return mandatory_ie_missing(
+            "subscription.supi, subscription.gpsi, subscription.pei, \
+             subscription.groupId or subscription.anyUE",
+        );
+    }
+
+    // Resolve an external identity to the internal one when the UE is known, so a
+    // GPSI/PEI subscription keys exactly the way a SUPI one does and the existing
+    // SUPI-keyed fire points reach it with no change.
+    //
+    // An UNRESOLVABLE gpsi/pei is accepted and stored unresolved rather than
+    // refused: nothing in §5.3.2.2 conditions a subscription on the target being
+    // registered at subscribe time, so refusing it would swap one wrong rejection
+    // for another. `event_subscriptions_matching_ue` matches on the external
+    // identity too, so such a subscription starts firing once the UE registers.
+    let ctx = amf_self();
+    if supi.is_none() {
+        if let Ok(guard) = ctx.read() {
+            let resolved = gpsi
+                .as_deref()
+                .and_then(|g| guard.amf_ue_find_by_gpsi(g))
+                .or_else(|| pei.as_deref().and_then(|p| guard.amf_ue_find_by_pei(p)));
+            if let Some(ue) = resolved {
+                supi = ue.supi.clone();
+            }
+        }
     }
 
     // Optional expiry: AmfEventMode.expiry (options) or top-level expiry
@@ -749,6 +866,9 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         nf_id: nf_id.to_string(),
         event_types,
         supi: supi.clone(),
+        gpsi,
+        pei,
+        group_id,
         any_ue,
         expiry,
     };
@@ -756,7 +876,6 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
     // Immediate reports for events with immediateFlag (current state)
     let report_list = build_immediate_reports(&immediate_types, supi.as_deref());
 
-    let ctx = amf_self();
     {
         let Ok(guard) = ctx.read() else {
             return send_error(500, "Internal Server Error", "context lock poisoned", None);
@@ -1060,13 +1179,30 @@ async fn deliver_event_notification(sub: EventSubscription, report: Value) -> Re
 /// background tasks. Safe to call from sync code; outside a tokio runtime
 /// the event is dropped with a debug log.
 pub fn fire_amf_event(event_type: &str, supi: Option<&str>, extra: Value) {
+    fire_amf_event_for(event_type, supi, None, None, extra);
+}
+
+/// Fire an AMF event, matching on every identity the reported UE carries (#74).
+///
+/// [`fire_amf_event`] keys on the SUPI alone. Since a subscription may now be
+/// targeted by `gpsi`/`pei` (TS29518_Namf_EventExposure.yaml:577, :579), a SUPI-only
+/// match would leave those subscriptions stored and never delivered. The report also
+/// carries the GPSI and PEI, per Table 6.2.6.2.5-1 (`29518-k00.txt:21951`: `gpsi`
+/// "shall be present if available"; `:21963`: `pei` "may be included").
+pub fn fire_amf_event_for(
+    event_type: &str,
+    supi: Option<&str>,
+    gpsi: Option<&str>,
+    pei: Option<&str>,
+    extra: Value,
+) {
     let ctx = amf_self();
     let subs = {
         let Ok(guard) = ctx.read() else {
             return;
         };
         guard.event_subscriptions_remove_expired();
-        guard.event_subscriptions_matching(event_type, supi)
+        guard.event_subscriptions_matching_ue(event_type, supi, gpsi, pei)
     };
     if subs.is_empty() {
         return;
@@ -1075,7 +1211,13 @@ pub fn fire_amf_event(event_type: &str, supi: Option<&str>, extra: Value) {
         log::debug!("fire_amf_event({event_type}): no tokio runtime, skipping delivery");
         return;
     };
-    let report = build_event_report(event_type, supi, extra);
+    let mut report = build_event_report(event_type, supi, extra);
+    if let Some(gpsi) = gpsi {
+        report["gpsi"] = json!(gpsi);
+    }
+    if let Some(pei) = pei {
+        report["pei"] = json!(pei);
+    }
     for sub in subs {
         let report = report.clone();
         let sub_id = sub.subscription_id.clone();
@@ -1087,20 +1229,31 @@ pub fn fire_amf_event(event_type: &str, supi: Option<&str>, extra: Value) {
     }
 }
 
+/// Fire an AMF event for a UE, passing every identity it carries.
+fn fire_ue_event(ue: &AmfUe, event_type: &str, extra: Value) {
+    fire_amf_event_for(
+        event_type,
+        ue.supi.as_deref(),
+        ue.gpsi.as_deref(),
+        ue.pei.as_deref(),
+        extra,
+    );
+}
+
 /// Fire a LOCATION_REPORT for the UE's current TAI/NCGI
 pub fn fire_location_report(ue: &AmfUe) {
-    fire_amf_event(
+    fire_ue_event(
+        ue,
         "LOCATION_REPORT",
-        ue.supi.as_deref(),
         json!({ "location": nr_location_json(ue) }),
     );
 }
 
 /// Fire a REGISTRATION_STATE_REPORT (REGISTERED / DEREGISTERED)
 pub fn fire_registration_state_report(ue: &AmfUe, registered: bool) {
-    fire_amf_event(
+    fire_ue_event(
+        ue,
         "REGISTRATION_STATE_REPORT",
-        ue.supi.as_deref(),
         json!({
             "rmInfoList": [{
                 "rmState": if registered { "REGISTERED" } else { "DEREGISTERED" },
@@ -1112,10 +1265,71 @@ pub fn fire_registration_state_report(ue: &AmfUe, registered: bool) {
 
 /// Fire a REACHABILITY_REPORT (REACHABLE / UNREACHABLE)
 pub fn fire_reachability_report(ue: &AmfUe, reachable: bool) {
-    fire_amf_event(
+    fire_ue_event(
+        ue,
         "REACHABILITY_REPORT",
-        ue.supi.as_deref(),
         json!({ "reachability": if reachable { "REACHABLE" } else { "UNREACHABLE" } }),
+    );
+}
+
+/// Fire a CONNECTIVITY_STATE_REPORT (CM-CONNECTED / CM-IDLE), #74 criterion 5.
+///
+/// TS 29.518 §6.2 (`29518-k00.txt:24011`): *"A NF subscribes to this event to
+/// receive the current connection management state of a UE... and report for
+/// updated connection management state of a UE... when AMF becomes aware of a
+/// connection management state change of the UE."*
+///
+/// The CM state is exactly what the AMF already derives for the immediate-report
+/// path (`build_immediate_reports`: CM-CONNECTED iff a live RAN UE context
+/// exists), so the same two values are reported at the two transitions the AMF
+/// genuinely observes: Service Request (IDLE→CONNECTED) and N1 release
+/// (CONNECTED→IDLE).
+pub fn fire_connectivity_state_report(ue: &AmfUe, connected: bool) {
+    fire_ue_event(
+        ue,
+        "CONNECTIVITY_STATE_REPORT",
+        json!({
+            "cmInfoList": [{
+                "cmState": if connected { "CONNECTED" } else { "IDLE" },
+                "accessType": "3GPP_ACCESS",
+            }]
+        }),
+    );
+}
+
+/// Fire an ACCESS_TYPE_REPORT for the access the UE is reachable over,
+/// #74 criterion 5.
+///
+/// TS 29.518 §6.2 (`29518-k00.txt:23991`): the consumer receives *"the current
+/// access type(s) of a UE... and updated access type(s)... when AMF becomes aware
+/// of the access type change of the UE."* Fired at registration, which is where
+/// the AMF learns the access type for a UE it did not previously serve.
+pub fn fire_access_type_report(ue: &AmfUe, access_type: &str) {
+    fire_ue_event(
+        ue,
+        "ACCESS_TYPE_REPORT",
+        json!({ "accessTypeList": [access_type] }),
+    );
+}
+
+/// Fire a LOSS_OF_CONNECTIVITY report, #74 criterion 5.
+///
+/// TS 29.518 §6.2 (`29518-k00.txt:24089`) names the triggers exactly: *"when AMF
+/// detects that a target UE is no longer reachable for either signalling or user
+/// plane communication. Such condition is identified when Mobile Reachable timer
+/// expires in the AMF (see TS 23.501), when the UE detaches and when AMF
+/// deregisters from UDM for an active UE."*
+///
+/// The mobile-reachable expiry is the trigger wired here, because it is the one
+/// this AMF already detects: `ngap_path::process_reachability_timers` advances
+/// `ReachabilityPhase::MobileReachable` on the same poll as the retransmission
+/// timers. `lossOfConnectReason` is the TS 29.518 `LossOfConnectivityReason`;
+/// `MAX_DETECTION_TIME_EXPIRED` is the value for that trigger.
+pub fn fire_loss_of_connectivity(ue: &AmfUe, reason: &str) {
+    fire_ue_event(
+        ue,
+        "LOSS_OF_CONNECTIVITY",
+        json!({ "lossOfConnectReason": reason }),
     );
 }
 
@@ -2537,6 +2751,693 @@ fn handle_registration_status_update(ue_context_id: &str, request: &SbiRequest) 
 }
 
 // ============================================================================
+// Inter-AMF UE-context management — the PRODUCER side (TS 29.518 §5.2.2.2, #74)
+//
+// #352/PR #390 built the AMF as the CONSUMER of `UEContextTransfer`; these are the
+// operations a peer AMF calls ON this one. The split is by direction, and #390's
+// own boundary table records it.
+//
+// The UE context this AMF holds is identified by `ueContextId` throughout, resolved
+// by `find_ue_by_context_id` — which #352 already taught to accept a
+// `5g-guti-…` component, so these inherit that rather than re-adding it.
+// ============================================================================
+
+/// Apply a `UeContext` (TS 29.518 §6.1.6.2.2) onto a newly created AMF UE.
+///
+/// Only members this AMF has somewhere to put are read; the rest of the schema is
+/// tolerated and ignored rather than rejected, because a source AMF sending more
+/// than the target can use is conformant and refusing it would break the handover
+/// over an IE the target does not need.
+///
+/// Returns the SUPI when the context carried one, so the caller can index it.
+fn apply_ue_context_json(ue: &mut AmfUe, ue_context: &Value) -> Option<String> {
+    let supi = ue_context
+        .get("supi")
+        .and_then(Value::as_str)
+        .map(String::from);
+    if let Some(supi) = &supi {
+        ue.supi = Some(supi.clone());
+    }
+    if let Some(pei) = ue_context.get("pei").and_then(Value::as_str) {
+        ue.pei = Some(pei.to_string());
+    }
+    if let Some(gpsi) = ue_context.get("gpsi").and_then(Value::as_str) {
+        ue.gpsi = Some(gpsi.to_string());
+    }
+    supi
+}
+
+/// Record the PDU sessions a source AMF transferred, and say plainly which part of
+/// the handover is NOT being completed.
+///
+/// TS 29.518 §5.2.2.2.3.1 has the source AMF carry a `pduSessionList`, and
+/// TS 23.502 step 21 then has the target AMF drive `Nsmf_PDUSession_UpdateSMContext`
+/// per SMF to move the N3 tunnels. PR #390 named this as the gap neither #352 nor
+/// #74 claimed, and it lands here.
+///
+/// **It is recorded, not moved, and the reason is structural.** The endpoints an
+/// `UpdateSMContext` would have to carry are exactly what this tree cannot obtain:
+/// for `/relocate` they come over **N26** from the source MME (§5.2.2.2.5.1: "the NF
+/// Service Consumer shall carry per PDU session the S-NSSAI for serving PLMN, the
+/// MME Control Plane Address and the TEID"), and this AMF has no N26 leg at all —
+/// `gmm_build.rs` advertises `Iwk26::WithoutN26Supported` to every UE for precisely
+/// that reason. Calling the SMF with invented tunnel endpoints would point a live
+/// user plane at an address nobody supplied, which is strictly worse than a
+/// session recorded and a logged omission.
+fn record_transferred_sessions(ue_id: u64, ue_context: &Value, ue_context_id: &str) -> usize {
+    let Some(sessions) = ue_context
+        .get("sessionContextList")
+        .and_then(Value::as_array)
+    else {
+        return 0;
+    };
+    let ctx = amf_self();
+    let mut recorded = 0usize;
+    for session in sessions {
+        let Some(psi) = session
+            .get("pduSessionId")
+            .and_then(Value::as_u64)
+            .and_then(|v| u8::try_from(v).ok())
+        else {
+            continue;
+        };
+        let created = {
+            let Ok(guard) = ctx.read() else { break };
+            guard.sess_add(ue_id, psi)
+        };
+        let Some(mut sess) = created else { continue };
+        if let Some(sm_ref) = session.get("smContextRef").and_then(Value::as_str) {
+            sess.sm_context_ref = Some(sm_ref.to_string());
+        }
+        if let Some(dnn) = session.get("dnn").and_then(Value::as_str) {
+            sess.dnn = Some(dnn.to_string());
+        }
+        if let Some(sst) = session.pointer("/sNssai/sst").and_then(Value::as_u64) {
+            sess.s_nssai.sst = sst as u8;
+        }
+        if let Some(sd) = session
+            .pointer("/sNssai/sd")
+            .and_then(Value::as_str)
+            .and_then(|s| u32::from_str_radix(s, 16).ok())
+        {
+            sess.s_nssai.sd = Some(sd);
+        }
+        if let Ok(guard) = ctx.read() {
+            guard.sess_update(&sess);
+        }
+        recorded += 1;
+    }
+    if recorded > 0 {
+        log::warn!(
+            "[{ue_context_id}] {recorded} transferred PDU session(s) RECORDED but their N3 \
+             tunnels are NOT re-established: TS 23.502 step 21 needs an \
+             Nsmf_PDUSession_UpdateSMContext per SMF carrying the MME control-plane address \
+             and TEID, which arrive over N26 (TS 29.518 §5.2.2.2.5.1) and this AMF has no \
+             N26 leg"
+        );
+    }
+    recorded
+}
+
+/// Create a UE context on THIS AMF, seeded from a peer's `UeContext`.
+///
+/// Shared by CreateUEContext (§5.2.2.2.3.1) and RelocateUEContext (§5.2.2.2.5.1):
+/// both create an "Individual ueContext" resource on the target AMF from a
+/// transferred context, and differ only in what else the request carries and which
+/// members are mandatory.
+///
+/// The created context is INSERTED INTO THE LIVE STORE. Answering 201 and recording
+/// nothing would pass a routing test and fail every real handover, so the insertion
+/// is what makes the operation observable — and it is what the tests assert.
+fn create_transferred_ue_context(
+    ue_context_id: &str,
+    ue_context: &Value,
+) -> Result<(AmfUe, usize), Box<SbiResponse>> {
+    let ctx = amf_self();
+
+    // A RAN UE context is allocated alongside, because an AMF UE without one has no
+    // AMF-UE-NGAP-ID and so cannot be addressed when the target NG-RAN starts
+    // signalling for it. `gnb_id`/`ran_ue_ngap_id` are 0: the target gNB has not yet
+    // sent anything for this UE, and inventing identifiers it never allocated would
+    // put values on the wire that match no RAN state.
+    let (mut ue, ran_ue_id) = {
+        let Ok(guard) = ctx.read() else {
+            return Err(Box::new(send_error(
+                500,
+                "Internal Server Error",
+                "context lock poisoned",
+                None,
+            )));
+        };
+        let Some(ran_ue) = guard.ran_ue_add(0, 0) else {
+            // TS 29.518 Table 6.1.3.2.3.1-3 lists 503 for a producer that cannot
+            // take the context; refusing is what lets the source AMF keep it.
+            return Err(Box::new(send_error(
+                503,
+                "Service Unavailable",
+                "no capacity for a new RAN UE context",
+                Some("INSUFFICIENT_RESOURCES"),
+            )));
+        };
+        let Some(ue) = guard.amf_ue_add(ran_ue.id) else {
+            guard.ran_ue_remove(ran_ue.id);
+            return Err(Box::new(send_error(
+                503,
+                "Service Unavailable",
+                "no capacity for a new UE context",
+                Some("INSUFFICIENT_RESOURCES"),
+            )));
+        };
+        (ue, ran_ue.id)
+    };
+    ue.ran_ue_id = ran_ue_id;
+    // The new-AMF side of TS 29.518 §5.2.2.2.1 — the same state #352's consumer
+    // records when it pulls a context in, reached here by the push direction.
+    ue.amf_ue_context_transfer_state = UeContextTransferState::TransferNewAmf;
+
+    let supi = apply_ue_context_json(&mut ue, ue_context);
+
+    // Write back, then PUBLISH. `amf_ue_add` returned a CLONE and every field set
+    // above is on that clone, so the write-back is not optional — the
+    // discarded-clone bug has been found in this crate twice (#361/PR #389).
+    //
+    // `amf_ue_publish` is the load-bearing half, and #341's own doc comment says why:
+    // "a UE that is only in `amf_ue_list` is invisible to the derived resolvers,
+    // because those read the live store. Anything that creates a UE outside the NGAP
+    // registration path -- a test fixture, an inter-AMF context transfer -- has to
+    // come through here or it will 404 exactly as the pre-#341 code did." That names
+    // this operation. Without it `find_ue_by_context_id` — which resolves through
+    // `ue_store` — would answer 404 for a context this AMF had just created, and
+    // CreateUEContext would be correct-but-unreachable.
+    //
+    // `ran_ue_ngap_id`/`association_id` are 0: no target gNB has signalled for this UE
+    // yet, so there is no real association, and a fabricated one would name an SCTP
+    // association that does not exist.
+    {
+        let Ok(guard) = ctx.read() else {
+            return Err(Box::new(send_error(
+                500,
+                "Internal Server Error",
+                "context lock poisoned",
+                None,
+            )));
+        };
+        guard.amf_ue_update(&ue);
+        guard.amf_ue_publish(&ue, 0, 0);
+    }
+    let _ = &supi;
+
+    let sessions = record_transferred_sessions(ue.id, ue_context, ue_context_id);
+    Ok((ue, sessions))
+}
+
+/// PUT /namf-comm/v1/ue-contexts/{ueContextId} —
+/// Namf_Communication_CreateUEContext (TS 29.518 §5.2.2.2.3.1).
+///
+/// A source AMF that cannot serve the UE creates its context on this AMF during
+/// inter-NG-RAN N2 handover. Mandatory members are `ueContext`, `targetId`,
+/// `sourceToTargetData` and `pduSessionList`
+/// (`TS29518_Namf_Communication.yaml:3668-3672`).
+///
+/// On success: *"the target AMF shall respond with the status code '201 Created'...
+/// together with a HTTP Location header to provide the location of a newly created
+/// resource"* (`29518-k00.txt:2718-2721`), body a `UeContextCreatedData`, whose own
+/// required members are `ueContext`, `targetToSourceData` and `pduSessionList`
+/// (yaml:3701-3704).
+///
+/// `targetToSourceData` echoes the `sourceToTargetData` reference the consumer sent.
+/// The genuine article is the Target-to-Source Transparent Container the TARGET
+/// NG-RAN produces in a HandoverRequestAcknowledge, and no such exchange has
+/// happened at this point in the procedure — so the alternative to echoing is
+/// fabricating a RAN container, which would be decoded by the source gNB.
+fn handle_create_ue_context(ue_context_id: &str, request: &SbiRequest) -> SbiResponse {
+    let Some(body) = parse_json_body(request) else {
+        return malformed_body();
+    };
+
+    let Some(ue_context) = body.get("ueContext") else {
+        return mandatory_ie_missing("ueContext");
+    };
+    let Some(target_id) = body.get("targetId") else {
+        return mandatory_ie_missing("targetId");
+    };
+    // `NgRanTargetId` requires both members (yaml:3774-3776).
+    if target_id.get("ranNodeId").is_none() {
+        return mandatory_ie_missing("targetId.ranNodeId");
+    }
+    if target_id.get("tai").is_none() {
+        return mandatory_ie_missing("targetId.tai");
+    }
+    let Some(source_to_target) = body.get("sourceToTargetData").cloned() else {
+        return mandatory_ie_missing("sourceToTargetData");
+    };
+    let Some(pdu_session_list) = body.get("pduSessionList").and_then(Value::as_array) else {
+        return mandatory_ie_missing("pduSessionList");
+    };
+    // `minItems: 1` (yaml:3653).
+    if pdu_session_list.is_empty() {
+        return mandatory_ie_incorrect("pduSessionList", "must contain at least one entry");
+    }
+
+    // A context already held under this identity is a conflict, not a silent
+    // overwrite: overwriting would discard the MM state of a UE this AMF is serving.
+    if find_ue_by_context_id(ue_context_id).is_some() {
+        return send_error(
+            403,
+            "Forbidden",
+            &format!("A UE context already exists for '{ue_context_id}'"),
+            Some("CONTEXT_NOT_FOUND"),
+        );
+    }
+
+    let (ue, sessions) = match create_transferred_ue_context(ue_context_id, ue_context) {
+        Ok(created) => created,
+        Err(resp) => return *resp,
+    };
+
+    let ue_sessions = {
+        let ctx = amf_self();
+        let Ok(guard) = ctx.read() else {
+            return send_error(500, "Internal Server Error", "context lock poisoned", None);
+        };
+        guard.sess_list_for_ue(ue.id)
+    };
+    let response_body = json!({
+        "ueContext": build_ue_context_json(&ue, &ue_sessions),
+        "targetToSourceData": source_to_target,
+        "pduSessionList": pdu_session_list,
+    });
+
+    log::info!(
+        "[{ue_context_id}] CreateUEContext: context created (ue_id={}, {sessions} session(s) \
+         recorded of {} offered)",
+        ue.id,
+        pdu_session_list.len()
+    );
+    let location = format!("/namf-comm/v1/ue-contexts/{ue_context_id}");
+    match SbiResponse::with_status(201).with_json_body(&response_body) {
+        Ok(resp) => resp.with_header("location", location),
+        Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
+    }
+}
+
+/// POST /namf-comm/v1/ue-contexts/{ueContextId}/release —
+/// Namf_Communication_ReleaseUEContext (TS 29.518 §5.2.2.2.4.1).
+///
+/// A source AMF that received Handover Cancel from the 5G-AN releases the context it
+/// created on this (target) AMF. *"the target AMF shall return '204 No Content' with
+/// an empty content in the POST response"* (`29518-k00.txt:2912-2913`).
+///
+/// `UEContextRelease` has no required member this AMF needs, so a well-formed body is
+/// accepted and the release performed; a malformed one is 400 per §5.2.7.
+fn handle_release_ue_context(ue_context_id: &str, request: &SbiRequest) -> SbiResponse {
+    // An empty body is permitted (the schema requires nothing this AMF consumes), but
+    // a body that is PRESENT and unparseable is a defect and must not be treated as
+    // absent — otherwise a garbled release silently succeeds.
+    if request
+        .http
+        .content
+        .as_deref()
+        .is_some_and(|b| !b.is_empty())
+        && parse_json_body(request).is_none()
+    {
+        return malformed_body();
+    }
+    let Some(ue) = find_ue_by_context_id(ue_context_id) else {
+        return context_not_found(ue_context_id);
+    };
+
+    let ctx = amf_self();
+    {
+        let Ok(guard) = ctx.read() else {
+            return send_error(500, "Internal Server Error", "context lock poisoned", None);
+        };
+        // The RAN UE goes too, or the release would free the NAS state and leave the
+        // NGAP identifier allocated — a context that is released and still occupies
+        // an AMF-UE-NGAP-ID. `amf_ue_remove` already drops this UE's sessions, N1N2
+        // subscriptions and LCS correlation.
+        guard.ran_ue_remove(ue.ran_ue_id);
+        guard.amf_ue_remove(ue.id);
+        // And the LIVE store, which is what `find_ue_by_context_id` resolves through
+        // (#341). Removing from `amf_ue_list` alone would leave the Namf surface still
+        // answering for a context the peer has released — i.e. acting on a UE another
+        // AMF now serves.
+        guard.amf_ue_unpublish(ue.id);
+    }
+
+    log::info!(
+        "[{ue_context_id}] ReleaseUEContext: context released (ue_id={})",
+        ue.id
+    );
+    SbiResponse::no_content()
+}
+
+/// POST /namf-comm/v1/ue-contexts/{ueContextId}/relocate —
+/// Namf_Communication_RelocateUEContext (TS 29.518 §5.2.2.2.5.1).
+///
+/// An initial AMF relocates the UE context to this AMF during EPS-to-5GS handover
+/// with AMF re-allocation. Mandatory: `ueContext`, `targetId`, `sourceToTargetData`,
+/// `forwardRelocationRequest` (`TS29518_Namf_Communication.yaml:3742-3746`).
+///
+/// *"the target AMF shall respond with the status code '201 Created'... together with
+/// a HTTP Location header"* (`29518-k00.txt:2964-2967`), body a
+/// `UeContextRelocatedData` whose only required member is `ueContext` (yaml:3753-3754).
+///
+/// The `forwardRelocationRequest` binary part is REQUIRED and its presence is
+/// enforced, but it is not decoded: it is a GTPv2-C Forward Relocation Request from
+/// the source MME over N26, and this AMF has no N26 leg to interpret it against. See
+/// [`record_transferred_sessions`] for why that ceiling is declared rather than
+/// worked around.
+fn handle_relocate_ue_context(ue_context_id: &str, request: &SbiRequest) -> SbiResponse {
+    let Some(body) = parse_json_body(request) else {
+        return malformed_body();
+    };
+
+    let Some(ue_context) = body.get("ueContext") else {
+        return mandatory_ie_missing("ueContext");
+    };
+    let Some(target_id) = body.get("targetId") else {
+        return mandatory_ie_missing("targetId");
+    };
+    if target_id.get("ranNodeId").is_none() {
+        return mandatory_ie_missing("targetId.ranNodeId");
+    }
+    if target_id.get("tai").is_none() {
+        return mandatory_ie_missing("targetId.tai");
+    }
+    if body.get("sourceToTargetData").is_none() {
+        return mandatory_ie_missing("sourceToTargetData");
+    }
+    // `RefToBinaryData` names a multipart part; a reference with no part behind it is
+    // a defect, and accepting it would mean accepting a relocation whose Forward
+    // Relocation Request never arrived.
+    let Some(fwd_content_id) = body
+        .pointer("/forwardRelocationRequest/contentId")
+        .and_then(Value::as_str)
+    else {
+        return mandatory_ie_missing("forwardRelocationRequest");
+    };
+    if find_binary_part(request, fwd_content_id).is_none() {
+        return mandatory_ie_incorrect(
+            "forwardRelocationRequest.contentId",
+            &format!("no binary part with contentId '{fwd_content_id}'"),
+        );
+    }
+
+    if find_ue_by_context_id(ue_context_id).is_some() {
+        return send_error(
+            403,
+            "Forbidden",
+            &format!("A UE context already exists for '{ue_context_id}'"),
+            Some("CONTEXT_NOT_FOUND"),
+        );
+    }
+
+    let (ue, sessions) = match create_transferred_ue_context(ue_context_id, ue_context) {
+        Ok(created) => created,
+        Err(resp) => return *resp,
+    };
+
+    let ue_sessions = {
+        let ctx = amf_self();
+        let Ok(guard) = ctx.read() else {
+            return send_error(500, "Internal Server Error", "context lock poisoned", None);
+        };
+        guard.sess_list_for_ue(ue.id)
+    };
+    let response_body = json!({
+        "ueContext": build_ue_context_json(&ue, &ue_sessions),
+    });
+
+    log::info!(
+        "[{ue_context_id}] RelocateUEContext: context relocated in (ue_id={}, {sessions} \
+         session(s) recorded)",
+        ue.id
+    );
+    let location = format!("/namf-comm/v1/ue-contexts/{ue_context_id}");
+    match SbiResponse::with_status(201).with_json_body(&response_body) {
+        Ok(resp) => resp.with_header("location", location),
+        Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
+    }
+}
+
+/// POST /namf-comm/v1/ue-contexts/{ueContextId}/cancel-relocate —
+/// Namf_Communication_CancelRelocateUEContext (TS 29.518 §5.2.2.2.6.1).
+///
+/// The initial AMF received a Forward Cancel Request from the source MME and asks
+/// this AMF to release the relocated context. `UeContextCancelRelocateData` requires
+/// `relocationCancelRequest` (`TS29518_Namf_Communication.yaml:3764-3765`), a
+/// `RefToBinaryData`, and `supi` is optional.
+///
+/// *"the target AMF shall return '204 No Content' with an empty content"*
+/// (`29518-k00.txt:3015-3016`).
+fn handle_cancel_relocate_ue_context(ue_context_id: &str, request: &SbiRequest) -> SbiResponse {
+    let Some(body) = parse_json_body(request) else {
+        return malformed_body();
+    };
+    let Some(cancel_content_id) = body
+        .pointer("/relocationCancelRequest/contentId")
+        .and_then(Value::as_str)
+    else {
+        return mandatory_ie_missing("relocationCancelRequest");
+    };
+    if find_binary_part(request, cancel_content_id).is_none() {
+        return mandatory_ie_incorrect(
+            "relocationCancelRequest.contentId",
+            &format!("no binary part with contentId '{cancel_content_id}'"),
+        );
+    }
+
+    // The optional `supi` is honoured as an additional way to name the context, so a
+    // consumer that cancels by SUPI while the resource was created under a GUTI is
+    // still served. Path first: it is the resource identifier.
+    let found = find_ue_by_context_id(ue_context_id).or_else(|| {
+        body.get("supi")
+            .and_then(Value::as_str)
+            .and_then(find_ue_by_context_id)
+    });
+    let Some(ue) = found else {
+        return context_not_found(ue_context_id);
+    };
+
+    let ctx = amf_self();
+    {
+        let Ok(guard) = ctx.read() else {
+            return send_error(500, "Internal Server Error", "context lock poisoned", None);
+        };
+        guard.ran_ue_remove(ue.ran_ue_id);
+        guard.amf_ue_remove(ue.id);
+        // The live store too — same reasoning as `handle_release_ue_context`.
+        guard.amf_ue_unpublish(ue.id);
+    }
+
+    log::info!(
+        "[{ue_context_id}] CancelRelocateUEContext: relocated context released (ue_id={})",
+        ue.id
+    );
+    SbiResponse::no_content()
+}
+
+// ============================================================================
+// AMFStatusChange subscriptions (TS 29.518 §5.2.2.5, #74)
+//
+// `/namf-comm/v1/subscriptions` — a consumer asks to be told when this AMF's
+// availability or GUAMI service changes. §5.2.2.5.1.1 names the AMF planned-removal
+// procedure (TS 23.501 §5.21.2.2) as the reason the service exists, and
+// `sbi_path::notify_amf_status_change` is the producer that reads this collection at
+// exactly that moment — so these are CRUD over a registry something consumes.
+// ============================================================================
+
+/// Rebuild the `SubscriptionData` JSON from a stored subscription.
+fn amf_status_subscription_json(sub: &crate::context::AmfStatusSubscription) -> Value {
+    let mut body = json!({ "amfStatusUri": sub.amf_status_uri });
+    if !sub.guami_list.is_empty() {
+        body["guamiList"] = json!(sub.guami_list);
+    }
+    body
+}
+
+/// Parse a `SubscriptionData` body (TS29518_Namf_Communication.yaml:2426-2438).
+///
+/// `amfStatusUri` is the only required member (yaml:2437-2438). It is additionally
+/// checked to be a usable HTTP URI, because the AMF has to DIAL it later and a
+/// subscription whose callback cannot be parsed is a notification that will never be
+/// delivered — better refused at subscribe time than discovered at removal time.
+fn parse_amf_status_subscription_body(
+    request: &SbiRequest,
+) -> Result<(String, Vec<Value>), Box<SbiResponse>> {
+    let Some(body) = parse_json_body(request) else {
+        return Err(Box::new(malformed_body()));
+    };
+    let Some(amf_status_uri) = body.get("amfStatusUri").and_then(Value::as_str) else {
+        return Err(Box::new(mandatory_ie_missing("amfStatusUri")));
+    };
+    if parse_http_uri(amf_status_uri).is_none() {
+        return Err(Box::new(mandatory_ie_incorrect(
+            "amfStatusUri",
+            "not a valid HTTP URI",
+        )));
+    }
+    // `minItems: 1` when present (yaml:2436): an explicitly empty array is a defect,
+    // and silently treating it as "all GUAMIs" would widen the subscription.
+    let guami_list = match body.get("guamiList") {
+        Some(Value::Array(list)) if list.is_empty() => {
+            return Err(Box::new(mandatory_ie_incorrect(
+                "guamiList",
+                "must contain at least one entry when present",
+            )))
+        }
+        Some(Value::Array(list)) => list.clone(),
+        Some(_) => {
+            return Err(Box::new(mandatory_ie_incorrect(
+                "guamiList",
+                "must be an array of Guami",
+            )))
+        }
+        None => Vec::new(),
+    };
+    Ok((amf_status_uri.to_string(), guami_list))
+}
+
+/// POST /namf-comm/v1/subscriptions — AMFStatusChangeSubscribe (§5.2.2.5.1.2).
+///
+/// *"the AMF shall include a HTTP Location header to provide the location of a newly
+/// created resource (subscription) together with the status code 201"*
+/// (`29518-k00.txt:4570-4573`).
+fn handle_amf_status_subscription_create(request: &SbiRequest) -> SbiResponse {
+    let (amf_status_uri, guami_list) = match parse_amf_status_subscription_body(request) {
+        Ok(parsed) => parsed,
+        Err(resp) => return *resp,
+    };
+
+    let subscription_id = format!("amfstatus-{}", uuid::Uuid::new_v4());
+    let sub = crate::context::AmfStatusSubscription {
+        subscription_id: subscription_id.clone(),
+        amf_status_uri: amf_status_uri.clone(),
+        guami_list,
+    };
+
+    {
+        let ctx = amf_self();
+        let Ok(guard) = ctx.read() else {
+            return send_error(500, "Internal Server Error", "context lock poisoned", None);
+        };
+        if !guard.amf_status_subscription_add(sub.clone()) {
+            return send_error(
+                500,
+                "Internal Server Error",
+                "subscription ID collision",
+                None,
+            );
+        }
+    }
+
+    log::info!(
+        "AMFStatusChange subscription created: id={subscription_id}, \
+         amfStatusUri={amf_status_uri}, {} guami(s)",
+        sub.guami_list.len()
+    );
+    let location = format!("/namf-comm/v1/subscriptions/{subscription_id}");
+    match SbiResponse::with_status(201).with_json_body(&amf_status_subscription_json(&sub)) {
+        Ok(resp) => resp.with_header("location", location),
+        Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
+    }
+}
+
+/// GET /namf-comm/v1/subscriptions/{subscriptionId} — read back one subscription.
+///
+/// NOT a TS 29.518 §5.2.2.5 operation: the spec defines Subscribe (POST), the
+/// complete-replacement Modify (PUT) and UnSubscribe (DELETE) only. Provided because
+/// #74's acceptance criterion asks for create/read/update/delete, and a CRUD
+/// round-trip test needs a read path that goes through the SBI surface rather than
+/// reaching into the AMF's own store — which would assert the test's plumbing instead
+/// of the producer's. Labelled a local read-back so nobody cites it as conformance.
+fn handle_amf_status_subscription_read(subscription_id: &str) -> SbiResponse {
+    let found = amf_self()
+        .read()
+        .ok()
+        .and_then(|guard| guard.amf_status_subscription_find(subscription_id));
+    let Some(sub) = found else {
+        return amf_status_subscription_not_found(subscription_id);
+    };
+    match SbiResponse::ok().with_json_body(&amf_status_subscription_json(&sub)) {
+        Ok(resp) => resp,
+        Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
+    }
+}
+
+/// PUT /namf-comm/v1/subscriptions/{subscriptionId} — AMFStatusChangeSubscribeModfy
+/// (§5.2.2.5.1.3).
+///
+/// *"The update operation shall apply to the whole subscription data (complete
+/// replacement of the existing subscription data by a new subscription data)"*
+/// (`29518-k00.txt:4590-4593`) — so the request body is validated as a full
+/// `SubscriptionData`, not a patch, and members it omits are DROPPED rather than
+/// preserved. *"On success, '200 OK' shall be returned, the content of the PUT
+/// response shall contain the representation of the replaced resource"* (`:4603-4605`).
+///
+/// An unknown subscription is 404, never an upsert: the ID space is the AMF's, so
+/// creating one under a consumer-chosen ID would hand out a resource name the AMF did
+/// not mint.
+fn handle_amf_status_subscription_replace(
+    subscription_id: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
+    let (amf_status_uri, guami_list) = match parse_amf_status_subscription_body(request) {
+        Ok(parsed) => parsed,
+        Err(resp) => return *resp,
+    };
+    let sub = crate::context::AmfStatusSubscription {
+        subscription_id: subscription_id.to_string(),
+        amf_status_uri: amf_status_uri.clone(),
+        guami_list,
+    };
+
+    let replaced = amf_self()
+        .read()
+        .ok()
+        .map(|guard| guard.amf_status_subscription_replace(sub.clone()))
+        .unwrap_or(false);
+    if !replaced {
+        return amf_status_subscription_not_found(subscription_id);
+    }
+
+    log::info!(
+        "AMFStatusChange subscription replaced: id={subscription_id}, \
+         amfStatusUri={amf_status_uri}"
+    );
+    match SbiResponse::ok().with_json_body(&amf_status_subscription_json(&sub)) {
+        Ok(resp) => resp,
+        Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
+    }
+}
+
+/// DELETE /namf-comm/v1/subscriptions/{subscriptionId} — AMFStatusChangeUnSubscribe
+/// (§5.2.2.5.2.1). *"On success, '204 No Content' shall be returned. The response
+/// body shall be empty."* (`29518-k00.txt:4640-4641`).
+fn handle_amf_status_subscription_delete(subscription_id: &str) -> SbiResponse {
+    let removed = amf_self()
+        .read()
+        .ok()
+        .and_then(|guard| guard.amf_status_subscription_remove(subscription_id));
+    if removed.is_none() {
+        return amf_status_subscription_not_found(subscription_id);
+    }
+    log::info!("AMFStatusChange subscription deleted: id={subscription_id}");
+    SbiResponse::no_content()
+}
+
+/// 404 for an unknown AMFStatusChange subscription (TS 29.500 §5.2.7).
+fn amf_status_subscription_not_found(subscription_id: &str) -> SbiResponse {
+    send_error(
+        404,
+        "Not Found",
+        &format!("AMFStatusChange subscription '{subscription_id}' not found"),
+        Some("SUBSCRIPTION_NOT_FOUND"),
+    )
+}
+
+// ============================================================================
 // Namf_MT (TS 29.518 §6.3)
 // ============================================================================
 
@@ -2615,12 +3516,59 @@ fn handle_mt_ue_context_info(ue_context_id: &str, request: &SbiRequest) -> SbiRe
 // Namf_Location (TS 29.518 §6.4)
 // ============================================================================
 
+/// The age, in seconds, of the AMF's stored NGAP location estimate for `ue`.
+///
+/// Clamped to the `AgeOfLocationEstimate` range (TS 29.572: 0..32767).
+fn ngap_location_age_secs(ue: &AmfUe) -> Option<u64> {
+    if ue.ue_location_timestamp == 0 {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Some(now.saturating_sub(ue.ue_location_timestamp).min(32_767))
+}
+
+/// The `ProvidePosInfo` the AMF can answer from NGAP alone: the serving cell and how
+/// old that knowledge is.
+///
+/// This was the WHOLE of `provide-pos-info` before #74. It is retained as the
+/// fallback for a deployment with no reachable LMF, so removing the LMF from a
+/// bring-up degrades to the previous behaviour rather than failing the operation.
+fn ngap_provide_pos_info(ue: &AmfUe) -> Value {
+    let mut body = json!({ "ncgi": ncgi_json(&ue.nr_cgi) });
+    if let Some(age) = ngap_location_age_secs(ue) {
+        body["ageOfLocationEstimate"] = json!(age);
+    }
+    body
+}
+
 /// POST /namf-loc/v1/{ueContextId}/provide-pos-info —
-/// Namf_Location_ProvidePositioningInfo (TS 29.518 §5.5.2.2). No LMF client
-/// path exists in this AMF, so the response carries the location the AMF
-/// knows from NGAP (NCGI + age of the location estimate) per the
-/// ProvidePosInfo shape.
-fn handle_provide_positioning_info(ue_context_id: &str, request: &SbiRequest) -> SbiResponse {
+/// Namf_Location_ProvidePositioningInfo (TS 29.518 §5.5.2.2.1).
+///
+/// The clause is explicit about what this operation is for: *"The ProvidePositioningInfo
+/// service operation shall be invoked by the NF Service Consumer (e.g. GMLC) to request
+/// the current or deferred geodetic and optionally local and/or civic location of the UE.
+/// **The service operation triggers the AMF to invoke the service towards the LMF.**"*
+/// (`29518-k00.txt:6500-6505`), and TS 23.273 §6.1 routes the 5GC-MT-LR through the LMF.
+///
+/// Before #74 the AMF returned its stored NGAP NCGI and carried an in-code admission
+/// that "No LMF client path exists in this AMF" — so a GMLC asking for a position got a
+/// radio-cell identity instead. `lmfd` has served
+/// `POST /nlmf-loc/v1/determine-location` all along (`lmfd/src/main.rs:376-378`), i.e.
+/// the producer existed and had no consumer.
+///
+/// Now the AMF discovers an LMF and invokes `Nlmf_Location_DetermineLocation`, returning
+/// the LMF-derived `locationEstimate` / `ageOfLocationEstimate` / `positioningDataList`.
+/// **The NGAP answer is retained as the fallback** when no LMF is reachable, so a
+/// deployment without one is unaffected. `AMF_NAMF_LOC_LMF=off` forces the fallback.
+///
+/// A runtime env switch rather than the cargo feature the issue suggests: a
+/// feature-gated path is outside `cargo test --workspace`, which is the CI gate, so
+/// the code would ship unexercised. `sbi_path::ue_policy_assoc_enabled` is the in-tree
+/// precedent for the form.
+async fn handle_provide_positioning_info(ue_context_id: &str, request: &SbiRequest) -> SbiResponse {
     let Some(ue) = find_ue_by_context_id(ue_context_id) else {
         return context_not_found(ue_context_id);
     };
@@ -2636,18 +3584,38 @@ fn handle_provide_positioning_info(ue_context_id: &str, request: &SbiRequest) ->
         return mandatory_ie_missing("lcsLocation");
     }
 
-    let mut response_body = json!({
-        "ncgi": ncgi_json(&ue.nr_cgi),
-    });
-    if ue.ue_location_timestamp > 0 {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        response_body["ageOfLocationEstimate"] =
-            json!(now.saturating_sub(ue.ue_location_timestamp).min(32_767));
+    if crate::sbi_path::namf_loc_lmf_enabled() {
+        match crate::sbi_path::call_lmf_determine_location(&ue, &body).await {
+            Ok(mut location_data) => {
+                // The serving cell is added to whatever the LMF computed: it is the
+                // AMF's own knowledge and `ProvidePosInfo` carries `ncgi` alongside
+                // `locationEstimate` (`TS29518_Namf_Location.yaml:373-400`), so a
+                // consumer gets both the position and the cell it was taken in.
+                if let Value::Object(map) = &mut location_data {
+                    map.insert("ncgi".to_string(), ncgi_json(&ue.nr_cgi));
+                }
+                log::info!(
+                    "[{ue_context_id}] ProvidePositioningInfo: LMF-derived position \
+                     (TS 23.273 §6.1)"
+                );
+                return match SbiResponse::ok().with_json_body(&location_data) {
+                    Ok(resp) => resp,
+                    Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
+                };
+            }
+            Err(e) => {
+                // Degrade to the pre-#74 answer rather than fail: a consumer that got a
+                // cell identity before must not start getting a 5xx because an LMF is
+                // absent. The reason is logged so the degradation is visible.
+                log::warn!(
+                    "[{ue_context_id}] ProvidePositioningInfo: LMF DetermineLocation \
+                     unavailable ({e}); answering with the stored NGAP location"
+                );
+            }
+        }
     }
 
+    let response_body = ngap_provide_pos_info(&ue);
     log::info!(
         "[{ue_context_id}] ProvidePositioningInfo: NCGI cell=0x{:09X}",
         ue.nr_cgi.cell_id
@@ -2656,6 +3624,166 @@ fn handle_provide_positioning_info(ue_context_id: &str, request: &SbiRequest) ->
         Ok(resp) => resp,
         Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
     }
+}
+
+/// POST /namf-loc/v1/{ueContextId}/provide-loc-info —
+/// Namf_Location_ProvideLocationInfo (TS 29.518 §5.5.2.4.1), #74.
+///
+/// *"The ProvideLocationInfo service operation allows an NF Service Consumer (e.g. UDM)
+/// to request the Network Provided Location Information (NPLI) of a target UE"*
+/// (`29518-k00.txt:6657-6660`). Distinct from `provide-pos-info`: that one asks the LMF
+/// to POSITION the UE, this one asks the AMF what it already knows about where the UE is
+/// attached — which is why it answers from AMF state and does not involve the LMF.
+///
+/// `RequestLocInfo` has **no required members** (`TS29518_Namf_Location.yaml:552-569`:
+/// `req5gsLoc`, `reqCurrentLoc`, `reqRatType`, `reqTimeZone` are all optional with
+/// `default: false`), so an empty JSON object is a valid request and must not 400.
+/// The response is a `ProvideLocInfo` (`:571-592`).
+///
+/// # `currentLoc` is always `false`, and that is the spec's own answer
+///
+/// §5.5.2.4.1 makes `reqCurrentLoc: true` conditional on machinery this AMF does not
+/// have: for a CM-IDLE UE *"the AMF shall initiate a paging procedure"*, and for a
+/// CM-CONNECTED one *"the AMF shall follow NG-RAN Location reporting procedure... to
+/// trigger a single standalone report by setting 'direct' event type in Location
+/// Reporting Control"* (`:6689-6702`). Neither exists here — there is no
+/// LocationReportingControl anywhere in this tree. The clause then states exactly what
+/// to do in that case: *"if the UE does not respond to the paging, the AMF shall provide
+/// the last known location and set 'currentLoc' attribute to 'false'"*. So the last
+/// known location is returned with `currentLoc: false`, which is a TRUE statement about
+/// what was sent. Claiming `true` would be the defect.
+fn handle_provide_location_info(ue_context_id: &str, request: &SbiRequest) -> SbiResponse {
+    let Some(ue) = find_ue_by_context_id(ue_context_id) else {
+        return context_not_found(ue_context_id);
+    };
+    // A present-but-unparseable body is a defect and must not be read as "no body":
+    // otherwise a garbled request is answered as though it asked for the default.
+    if request
+        .http
+        .content
+        .as_deref()
+        .is_some_and(|b| !b.is_empty())
+        && parse_json_body(request).is_none()
+    {
+        return malformed_body();
+    }
+
+    let mut response_body = json!({
+        // See the doc comment: the AMF cannot obtain a CURRENT location, so it reports
+        // the last known one and says so. This member is what tells the consumer which
+        // of the two it received.
+        "currentLoc": false,
+        "location": nr_location_json(&ue),
+    });
+    if let Some(age) = ngap_location_age_secs(&ue) {
+        response_body["locationAge"] = json!(age);
+    }
+    // `ratType` only when the UE is genuinely attached over NR. `reqRatType` is a
+    // request for it, not a licence to assert one for a UE with no live connection.
+    if ue_ran_context(&ue).is_some() {
+        response_body["ratType"] = json!("NR");
+    }
+    // `timezone` is deliberately OMITTED. The AMF never learns a UE time zone —
+    // `gmm_build.rs` sends `local_time_zone: None` /
+    // `universal_time_and_local_time_zone: None` — so there is no value to report, and
+    // the host's own zone is not the UE's.
+
+    log::info!(
+        "[{ue_context_id}] ProvideLocationInfo: last known location, NCGI cell=0x{:09X} \
+         (currentLoc=false per TS 29.518 §5.5.2.4.1)",
+        ue.nr_cgi.cell_id
+    );
+    match SbiResponse::ok().with_json_body(&response_body) {
+        Ok(resp) => resp,
+        Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
+    }
+}
+
+/// POST /namf-loc/v1/{ueContextId}/cancel-pos-info —
+/// Namf_Location_CancelLocation (TS 29.518 §5.5.2.5.1), #74.
+///
+/// *"invoked by the NF Service Consumer (e.g. GMLC) to cancel reporting periodic or
+/// events triggered location"* (`29518-k00.txt:6720-6722`). `CancelPosInfo` requires
+/// `supi`, `hgmlcCallBackURI` and `ldrReference`
+/// (`TS29518_Namf_Location.yaml:612-615`).
+///
+/// *"On success, AMF responds with '204 No Content'. If the nrppaPeriodicInd IE with the
+/// value true is received, the AMF shall skip the cancel location procedures towards the
+/// UE."* (`:6740-6743`) — both halves are honoured: the LDR cancellation is relayed to
+/// the LMF, except when `nrppaPeriodicInd` is true, in which case the reporting is the
+/// RAN's NRPPa periodic measurement and there is nothing to cancel toward the UE.
+///
+/// The LMF leg is best-effort: the consumer asked THIS AMF to stop reporting, and the
+/// stored correlation is dropped either way. An unreachable LMF is logged, not turned
+/// into a 5xx that would leave the consumer believing its cancellation failed while the
+/// AMF has in fact stopped.
+async fn handle_cancel_location(ue_context_id: &str, request: &SbiRequest) -> SbiResponse {
+    let Some(ue) = find_ue_by_context_id(ue_context_id) else {
+        return context_not_found(ue_context_id);
+    };
+    let Some(body) = parse_json_body(request) else {
+        return malformed_body();
+    };
+
+    let Some(supi) = body.get("supi").and_then(Value::as_str) else {
+        return mandatory_ie_missing("supi");
+    };
+    let Some(hgmlc_callback) = body.get("hgmlcCallBackURI").and_then(Value::as_str) else {
+        return mandatory_ie_missing("hgmlcCallBackURI");
+    };
+    if parse_http_uri(hgmlc_callback).is_none() {
+        return mandatory_ie_incorrect("hgmlcCallBackURI", "not a valid HTTP URI");
+    }
+    let Some(ldr_reference) = body.get("ldrReference").and_then(Value::as_str) else {
+        return mandatory_ie_missing("ldrReference");
+    };
+
+    let nrppa_periodic = body
+        .get("nrppaPeriodicInd")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    // The stored LCS correlation goes regardless: the consumer has cancelled, so the
+    // AMF must not keep routing this UE's uplink positioning to the old LMF. Keyed by
+    // the UE's own context identity, the way `lcs_correlation_set` writes it.
+    let correlation_key = ue.supi.clone().unwrap_or_else(|| supi.to_string());
+    let serving_lmf = {
+        let ctx = amf_self();
+        let Ok(guard) = ctx.read() else {
+            return send_error(500, "Internal Server Error", "context lock poisoned", None);
+        };
+        let record = guard.lcs_correlation_find(&correlation_key);
+        guard.lcs_correlation_remove(&correlation_key);
+        record.and_then(|r| r.serving_lmf_identification)
+    };
+
+    if nrppa_periodic {
+        log::info!(
+            "[{ue_context_id}] CancelLocation: nrppaPeriodicInd=true, so the cancel-location \
+             procedure toward the UE is SKIPPED (TS 29.518 §5.5.2.5.1 step 2a); the LDR \
+             [{ldr_reference}] correlation is dropped"
+        );
+    } else {
+        match crate::sbi_path::call_lmf_cancel_location(
+            &correlation_key,
+            ldr_reference,
+            hgmlc_callback,
+            serving_lmf.as_deref(),
+        )
+        .await
+        {
+            Ok(()) => log::info!(
+                "[{ue_context_id}] CancelLocation: LDR [{ldr_reference}] cancelled at the LMF"
+            ),
+            Err(e) => log::warn!(
+                "[{ue_context_id}] CancelLocation: the LMF could not be told to cancel LDR \
+                 [{ldr_reference}] ({e}); the AMF's own correlation is dropped regardless, so \
+                 this AMF has stopped reporting"
+            ),
+        }
+    }
+
+    SbiResponse::no_content()
 }
 
 // ============================================================================
@@ -3198,6 +4326,11 @@ mod tests {
             nf_id: "n".to_string(),
             event_types: vec!["LOCATION_REPORT".to_string()],
             supi: Some(supi.to_string()),
+            // SUPI-targeted, so the #74 external-identity keys are absent: this test is
+            // about expiry, and adding them would give it a second reason to match.
+            gpsi: None,
+            pei: None,
+            group_id: None,
             any_ue: false,
             expiry: Some(std::time::UNIX_EPOCH), // long expired
         };
@@ -5346,5 +6479,1435 @@ mod tests {
 
         assert!(plmn_id_to_bcd(&json!({ "mcc": "01", "mnc": "01" })).is_none());
         assert!(plmn_id_to_bcd(&json!({ "mcc": "001", "mnc": "0" })).is_none());
+    }
+
+    // ==================================================================
+    // #74: inter-AMF UE-context PRODUCER operations (TS 29.518 §5.2.2.2)
+    //
+    // Every test here takes `crate::test_support::CONTEXT_GUARD` -- the EXISTING
+    // process-wide lock, never a new one. A lock declared inside a `mod tests` is
+    // invisible to siblings, so the next test declares a second, and two locks over
+    // one process-global has hung this suite before.
+    //
+    // Literal keys (SUPI, 5G-TMSI, AMF-UE-NGAP-ID) are DISTINCT per test, because
+    // `amf_context_init` is a one-shot that never clears: a shared SUPI would have
+    // two tests resolve each other's UE, which is the
+    // `test_ue_context_transfer_error_paths` flake class.
+    // ==================================================================
+
+    /// A `UeContextCreateData` with every member §5.2.2.2.3.1 makes mandatory.
+    fn create_ue_context_body(supi: &str, pei: &str) -> Value {
+        json!({
+            "ueContext": {
+                "supi": supi,
+                "pei": pei,
+                "mmContextList": [{ "accessType": "3GPP_ACCESS" }],
+            },
+            "targetId": {
+                "ranNodeId": { "gNbId": { "bitLength": 24, "gNBValue": "000074" } },
+                "tai": { "plmnId": { "mcc": "001", "mnc": "01" }, "tac": "0074" },
+            },
+            "sourceToTargetData": { "ngapIeType": "SRC_TO_TAR_CONTAINER",
+                                    "ngapData": { "contentId": "n2SrcToTar" } },
+            "pduSessionList": [{ "pduSessionId": 5,
+                                 "n2InfoContent": { "ngapData": { "contentId": "n2Sm5" } } }],
+        })
+    }
+
+    /// #74 criterion 1: `PUT /namf-comm/v1/ue-contexts/{id}` (CreateUEContext)
+    /// creates a UE context that this AMF can afterwards RESOLVE.
+    ///
+    /// The router could not reach this operation at all before #74: the `namf-comm`
+    /// `ue-contexts` arm was guarded on `parts.len() >= 5` and a
+    /// `PUT .../ue-contexts/{id}` has FOUR segments, so every conformant
+    /// CreateUEContext fell through to the 404 arm.
+    ///
+    /// **The assertion is positive and on the store, not on the status code.** A
+    /// handler that answers 201 with a `Location` header and records nothing would
+    /// pass a routing test and fail every real handover, so what is asserted is that
+    /// `find_ue_by_context_id` — the resolver the whole Namf surface uses — returns
+    /// the created context afterwards, carrying the SUPI **and** the PEI the peer
+    /// sent. Those values exist nowhere else in the fixture, so they can only have
+    /// come through this handler.
+    ///
+    /// The second half pins the load-bearing detail #341 warns about: the resolver
+    /// reads `ue_store`, not `amf_ue_list`, so a create that only did `amf_ue_add`
+    /// would be correct-but-unreachable. Resolving by SUPI goes through the live
+    /// store and would fail on that mistake.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_ue_context_creates_a_context_this_amf_can_resolve() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        amf_context_init(64, 1024, 4096);
+
+        // A SUPI/PEI pair no sibling uses, so resolving them proves this handler ran.
+        let supi = "imsi-001010000740010";
+        let pei = "imeisv-0000000000740010";
+        let ue_context_id = supi;
+
+        let req = SbiRequest::put(format!("/namf-comm/v1/ue-contexts/{ue_context_id}"))
+            .with_json_body(&create_ue_context_body(supi, pei))
+            .expect("json");
+        let resp = namf_request_handler(req).await;
+
+        assert_eq!(
+            resp.status, 201,
+            "TS 29.518 §5.2.2.2.3.1 step 2a: \"the target AMF shall respond with the \
+             status code '201 Created'\""
+        );
+        assert!(
+            resp.http
+                .get_header("location")
+                .is_some_and(|l| l.contains(ue_context_id)),
+            "and \"together with a HTTP Location header to provide the location of a newly \
+             created resource\""
+        );
+        let body = body_json(&resp);
+        assert_eq!(
+            body["ueContext"]["supi"].as_str(),
+            Some(supi),
+            "the response carries the representation of the created UE Context \
+             (UeContextCreatedData requires `ueContext`)"
+        );
+        assert!(
+            body["targetToSourceData"].is_object(),
+            "UeContextCreatedData also REQUIRES targetToSourceData \
+             (TS29518_Namf_Communication.yaml:3701-3704)"
+        );
+        assert!(body["pduSessionList"].is_array(), "and pduSessionList");
+
+        // The point of the operation: the context EXISTS and is reachable.
+        let resolved = find_ue_by_context_id(ue_context_id).expect(
+            "the created UE context must be resolvable -- a 201 that records \
+                     nothing would pass a routing test and fail every real handover",
+        );
+        assert_eq!(
+            resolved.supi.as_deref(),
+            Some(supi),
+            "and it must carry the SUPI the peer sent: this value exists nowhere else in \
+             the fixture, so it can only have arrived through CreateUEContext"
+        );
+        assert_eq!(
+            resolved.pei.as_deref(),
+            Some(pei),
+            "and the rest of the transferred UeContext with it"
+        );
+        assert_eq!(
+            resolved.amf_ue_context_transfer_state,
+            UeContextTransferState::TransferNewAmf,
+            "the UE is recorded as transferred IN -- the new-AMF side of TS 29.518 §5.2.2.2.1"
+        );
+
+        // A second create under the same identity is a conflict, not a silent
+        // overwrite of a UE this AMF is serving.
+        let req = SbiRequest::put(format!("/namf-comm/v1/ue-contexts/{ue_context_id}"))
+            .with_json_body(&create_ue_context_body(supi, pei))
+            .expect("json");
+        assert_eq!(namf_request_handler(req).await.status, 403);
+    }
+
+    /// CreateUEContext refuses a request missing any of the four members
+    /// `UeContextCreateData` marks `required`
+    /// (`TS29518_Namf_Communication.yaml:3668-3672`).
+    ///
+    /// Paired with the acceptance test above so the two DISCRIMINATE: together they
+    /// show the handler accepts the right bodies rather than accepting everything.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_ue_context_requires_every_mandatory_member() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        amf_context_init(64, 1024, 4096);
+
+        // Distinct from `create_ue_context_creates_a_context_this_amf_can_resolve`,
+        // which leaves its context in the process-global store.
+        let supi = "imsi-001010000740011";
+        let full = create_ue_context_body(supi, "imeisv-0000000000740011");
+
+        for missing in [
+            "ueContext",
+            "targetId",
+            "sourceToTargetData",
+            "pduSessionList",
+        ] {
+            let mut body = full.clone();
+            body.as_object_mut().expect("object").remove(missing);
+            let req = SbiRequest::put(format!("/namf-comm/v1/ue-contexts/{supi}"))
+                .with_json_body(&body)
+                .expect("json");
+            let resp = namf_request_handler(req).await;
+            assert_eq!(
+                resp.status, 400,
+                "a CreateUEContext without `{missing}` must be refused"
+            );
+            assert_eq!(problem_cause(&resp), "MANDATORY_IE_MISSING");
+        }
+
+        // `pduSessionList` has `minItems: 1` (yaml:3653), so an empty array is a
+        // defect and not "no sessions".
+        let mut body = full.clone();
+        body["pduSessionList"] = json!([]);
+        let req = SbiRequest::put(format!("/namf-comm/v1/ue-contexts/{supi}"))
+            .with_json_body(&body)
+            .expect("json");
+        assert_eq!(
+            problem_cause(&namf_request_handler(req).await),
+            "MANDATORY_IE_INCORRECT"
+        );
+
+        // Nothing was created by any of the refusals.
+        assert!(
+            find_ue_by_context_id(supi).is_none(),
+            "a refused CreateUEContext must not have left a half-built context behind"
+        );
+    }
+
+    /// #74 criterion 1: `POST .../{id}/release` (ReleaseUEContext) really releases.
+    ///
+    /// The path reached the router arm before #74 but matched no literal, so it fell
+    /// to `send_method_not_allowed` — a source AMF cancelling a handover got a 405.
+    ///
+    /// The assertion is the TRANSITION, in one test: the context resolves BEFORE and
+    /// does not resolve AFTER. Asserting only the absence afterwards would be
+    /// satisfied by a context that was never created.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn release_ue_context_releases_the_context() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Distinct SUPI per the process-global note at the top of this section.
+        let supi = "imsi-001010000740020";
+        let ue = setup_ue(supi, true, true);
+
+        assert!(
+            find_ue_by_context_id(supi).is_some(),
+            "precondition: the context exists before the release"
+        );
+
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/release"))
+            .with_json_body(&json!({ "ngapCause": { "group": 0, "value": 5 } }))
+            .expect("json");
+        let resp = namf_request_handler(req).await;
+        assert_eq!(
+            resp.status, 204,
+            "TS 29.518 §5.2.2.2.4.1 step 2a: \"the target AMF shall return '204 No \
+             Content' with an empty content\""
+        );
+        assert!(
+            resp.http.content.as_deref().unwrap_or("").is_empty(),
+            "and the content must be empty"
+        );
+
+        assert!(
+            find_ue_by_context_id(supi).is_none(),
+            "after the release the context must NOT resolve. This is the assertion that \
+             fails if the handler removes from `amf_ue_list` only: the resolver reads the \
+             LIVE store (#341), so an unpublished-but-listed UE would still be served"
+        );
+        let ctx = amf_self();
+        assert!(
+            ctx.read()
+                .expect("ctx lock")
+                .ran_ue_find_by_id(ue.ran_ue_id)
+                .is_none(),
+            "and the RAN UE with it, or the release frees the NAS state while the \
+             AMF-UE-NGAP-ID stays allocated"
+        );
+
+        // Releasing an unknown context is 404, never a silent success.
+        let req = SbiRequest::post("/namf-comm/v1/ue-contexts/imsi-001010000740029/release")
+            .with_json_body(&json!({}))
+            .expect("json");
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 404);
+        assert_eq!(problem_cause(&resp), "CONTEXT_NOT_FOUND");
+    }
+
+    /// #74 criterion 1 + the gap PR #390 named: `POST .../{id}/relocate`
+    /// (RelocateUEContext) creates the context AND records the transferred PDU
+    /// sessions.
+    ///
+    /// PR #390 flagged that "the received `sessionContextList` is carried and logged
+    /// but PDU sessions aren't re-established", naming #74's `/relocate` as its home.
+    /// The sessions are RECORDED here, and the ceiling is explicit: their N3 tunnels
+    /// are not moved, because the endpoints would have to come over N26 from the
+    /// source MME and this AMF has no N26 leg (see `record_transferred_sessions`).
+    /// Asserting the session record is asserting exactly what was built — not a
+    /// tunnel move that did not happen.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn relocate_ue_context_creates_the_context_and_records_its_sessions() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        amf_context_init(64, 1024, 4096);
+
+        // Distinct from every sibling in this section.
+        let supi = "imsi-001010000740030";
+        // An smContextRef that appears nowhere else, so finding it on a session proves
+        // it came out of THIS request body.
+        let sm_context_ref = "smctx-relocate-740030";
+
+        let body = json!({
+            "ueContext": {
+                "supi": supi,
+                "mmContextList": [{ "accessType": "3GPP_ACCESS" }],
+                "sessionContextList": [{
+                    "pduSessionId": 7,
+                    "smContextRef": sm_context_ref,
+                    "sNssai": { "sst": 1, "sd": "0000AB" },
+                    "dnn": "internet",
+                    "accessType": "3GPP_ACCESS",
+                }],
+            },
+            "targetId": {
+                "ranNodeId": { "gNbId": { "bitLength": 24, "gNBValue": "000074" } },
+                "tai": { "plmnId": { "mcc": "001", "mnc": "01" }, "tac": "0074" },
+            },
+            "sourceToTargetData": { "ngapIeType": "SRC_TO_TAR_CONTAINER",
+                                    "ngapData": { "contentId": "n2SrcToTar" } },
+            "forwardRelocationRequest": { "contentId": "fwdReloc" },
+        });
+
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/relocate"))
+            .with_json_body(&body)
+            .expect("json")
+            .with_part(SbiPart::with_content(
+                "fwdReloc",
+                "application/vnd.3gpp.ngap",
+                bytes::Bytes::from_static(b"\x01\x02\x03"),
+            ));
+        let resp = namf_request_handler(req).await;
+
+        assert_eq!(
+            resp.status, 201,
+            "TS 29.518 §5.2.2.2.5.1 step 2a: \"the target AMF shall respond with the \
+             status code '201 Created'\""
+        );
+        assert!(
+            resp.http.get_header("location").is_some(),
+            "\"together with a HTTP Location header\""
+        );
+        assert_eq!(
+            body_json(&resp)["ueContext"]["supi"].as_str(),
+            Some(supi),
+            "UeContextRelocatedData requires `ueContext` (yaml:3753-3754)"
+        );
+
+        let resolved = find_ue_by_context_id(supi).expect("the relocated context must resolve");
+        let ctx = amf_self();
+        let sessions = ctx.read().expect("ctx lock").sess_list_for_ue(resolved.id);
+        assert_eq!(
+            sessions.len(),
+            1,
+            "the transferred sessionContextList must be RECORDED against the created \
+             context -- the gap PR #390 named"
+        );
+        assert_eq!(sessions[0].psi, 7);
+        assert_eq!(
+            sessions[0].sm_context_ref.as_deref(),
+            Some(sm_context_ref),
+            "with the SMF reference the peer sent, which exists nowhere else in this fixture"
+        );
+        assert_eq!(sessions[0].dnn.as_deref(), Some("internet"));
+        assert_eq!(sessions[0].s_nssai.sst, 1);
+        assert_eq!(sessions[0].s_nssai.sd, Some(0x0000AB));
+    }
+
+    /// `forwardRelocationRequest` is `required` (yaml:3742-3746) and it is a
+    /// `RefToBinaryData`, so a reference with no multipart part behind it is a
+    /// relocation whose Forward Relocation Request never arrived — refused, not
+    /// accepted-and-ignored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn relocate_ue_context_refuses_a_dangling_forward_relocation_reference() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        amf_context_init(64, 1024, 4096);
+        // Distinct from the accepting sibling above.
+        let supi = "imsi-001010000740031";
+
+        let base = json!({
+            "ueContext": { "supi": supi, "mmContextList": [{ "accessType": "3GPP_ACCESS" }] },
+            "targetId": {
+                "ranNodeId": { "gNbId": { "bitLength": 24, "gNBValue": "000074" } },
+                "tai": { "plmnId": { "mcc": "001", "mnc": "01" }, "tac": "0074" },
+            },
+            "sourceToTargetData": { "ngapData": { "contentId": "n2SrcToTar" } },
+        });
+
+        // Absent entirely.
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/relocate"))
+            .with_json_body(&base)
+            .expect("json");
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem_cause(&resp), "MANDATORY_IE_MISSING");
+
+        // Present, but referencing a part that is not in the request.
+        let mut dangling = base.clone();
+        dangling["forwardRelocationRequest"] = json!({ "contentId": "notThere" });
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/relocate"))
+            .with_json_body(&dangling)
+            .expect("json");
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem_cause(&resp), "MANDATORY_IE_INCORRECT");
+
+        assert!(
+            find_ue_by_context_id(supi).is_none(),
+            "neither refusal may have created a context"
+        );
+    }
+
+    /// #74 criterion 1: `POST .../{id}/cancel-relocate` (CancelRelocateUEContext)
+    /// releases the relocated context.
+    ///
+    /// Asserted as a transition — resolves before, does not resolve after — for the
+    /// same reason as the release test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_relocate_ue_context_releases_the_relocated_context() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Distinct SUPI per the process-global note.
+        let supi = "imsi-001010000740040";
+        let _ue = setup_ue(supi, true, true);
+        assert!(find_ue_by_context_id(supi).is_some(), "precondition");
+
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/cancel-relocate"))
+            .with_json_body(&json!({
+                "supi": supi,
+                "relocationCancelRequest": { "contentId": "cancelReq" },
+            }))
+            .expect("json")
+            .with_part(SbiPart::with_content(
+                "cancelReq",
+                "application/vnd.3gpp.ngap",
+                bytes::Bytes::from_static(b"\x04\x05"),
+            ));
+        let resp = namf_request_handler(req).await;
+        assert_eq!(
+            resp.status, 204,
+            "TS 29.518 §5.2.2.2.6.1 step 2a: \"the target AMF shall return '204 No Content'\""
+        );
+        assert!(
+            find_ue_by_context_id(supi).is_none(),
+            "the relocated context must be gone from the LIVE store, which is what the \
+             Namf surface resolves against"
+        );
+
+        // A `relocationCancelRequest` reference with no part behind it is refused.
+        let other = "imsi-001010000740041";
+        let _other_ue = setup_ue(other, true, true);
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{other}/cancel-relocate"))
+            .with_json_body(&json!({ "relocationCancelRequest": { "contentId": "absent" } }))
+            .expect("json");
+        assert_eq!(
+            problem_cause(&namf_request_handler(req).await),
+            "MANDATORY_IE_INCORRECT"
+        );
+        assert!(
+            find_ue_by_context_id(other).is_some(),
+            "and the refusal must not have released anything"
+        );
+    }
+
+    // ==================================================================
+    // #74 criterion 3: AMFStatusChange subscription CRUD (TS 29.518 §5.2.2.5)
+    // ==================================================================
+
+    /// A full CRUD round trip over `/namf-comm/v1/subscriptions`, which had no router
+    /// arm at all before #74.
+    ///
+    /// The load-bearing assertion is the PUT's effect: §5.2.2.5.1.3 makes the update a
+    /// *complete replacement*, so the test replaces the `amfStatusUri` and reads the
+    /// NEW one back through the SBI surface. That is a positive assertion on state only
+    /// the replace path can produce — a handler that answered 200 and stored nothing
+    /// would return the old URI. The 204s alone would be satisfied by a handler that
+    /// did nothing at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn amf_status_change_subscriptions_round_trip() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        amf_context_init(64, 1024, 4096);
+
+        // URIs unique to this test: the subscription store is process-global, and the
+        // replacement assertion below reads back by value.
+        let first_uri = "http://127.0.0.1:19740/namf-status/74-create";
+        let replaced_uri = "http://127.0.0.1:19740/namf-status/74-replaced";
+
+        let req = SbiRequest::post("/namf-comm/v1/subscriptions")
+            .with_json_body(&json!({
+                "amfStatusUri": first_uri,
+                "guamiList": [{ "plmnId": { "mcc": "001", "mnc": "01" },
+                                "amfId": "020010" }],
+            }))
+            .expect("json");
+        let resp = namf_request_handler(req).await;
+        assert_eq!(
+            resp.status, 201,
+            "TS 29.518 §5.2.2.5.1.2 step 2a: 201 with a Location header"
+        );
+        let location = resp
+            .http
+            .get_header("location")
+            .expect(
+                "\"the AMF shall include a HTTP Location header to provide the location \
+                     of a newly created resource\"",
+            )
+            .to_string();
+        assert_eq!(body_json(&resp)["amfStatusUri"].as_str(), Some(first_uri));
+
+        // READ: the created subscription is retrievable at the URI the AMF handed out.
+        let resp = namf_request_handler(SbiRequest::get(&location)).await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(body_json(&resp)["amfStatusUri"].as_str(), Some(first_uri));
+        assert_eq!(
+            body_json(&resp)["guamiList"][0]["amfId"].as_str(),
+            Some("020010"),
+            "the guamiList round-trips as the consumer sent it"
+        );
+
+        // UPDATE: a complete replacement. The new URI must be what comes back.
+        let resp = namf_request_handler(
+            SbiRequest::put(&location)
+                .with_json_body(&json!({ "amfStatusUri": replaced_uri }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(
+            resp.status, 200,
+            "§5.2.2.5.1.3 step 2a: \"'200 OK' shall be returned, the content of the PUT \
+             response shall contain the representation of the replaced resource\""
+        );
+        let resp = namf_request_handler(SbiRequest::get(&location)).await;
+        assert_eq!(
+            body_json(&resp)["amfStatusUri"].as_str(),
+            Some(replaced_uri),
+            "the replacement must have taken effect in the store, not merely been echoed"
+        );
+        assert!(
+            body_json(&resp)["guamiList"].is_null(),
+            "and it is a COMPLETE replacement (§5.2.2.5.1.3), so the guamiList the first \
+             body carried is DROPPED rather than preserved"
+        );
+
+        // DELETE, then the read must 404.
+        let resp = namf_request_handler(SbiRequest::delete(&location)).await;
+        assert_eq!(
+            resp.status, 204,
+            "§5.2.2.5.2.1 step 2a: \"'204 No Content' shall be returned\""
+        );
+        assert_eq!(
+            namf_request_handler(SbiRequest::get(&location))
+                .await
+                .status,
+            404
+        );
+        assert_eq!(
+            namf_request_handler(SbiRequest::delete(&location))
+                .await
+                .status,
+            404
+        );
+    }
+
+    /// `amfStatusUri` is the only REQUIRED member of `SubscriptionData`
+    /// (yaml:2437-2438), and it must be dialable — a callback the AMF cannot parse is
+    /// a notification that will never be delivered, better refused at subscribe time.
+    /// An unknown subscription is 404 on PUT, never an upsert under a
+    /// consumer-chosen ID.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn amf_status_change_subscription_validation() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        amf_context_init(64, 1024, 4096);
+
+        let resp = namf_request_handler(
+            SbiRequest::post("/namf-comm/v1/subscriptions")
+                .with_json_body(&json!({ "guamiList": [] }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem_cause(&resp), "MANDATORY_IE_MISSING");
+
+        let resp = namf_request_handler(
+            SbiRequest::post("/namf-comm/v1/subscriptions")
+                .with_json_body(&json!({ "amfStatusUri": "not-a-uri" }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(problem_cause(&resp), "MANDATORY_IE_INCORRECT");
+
+        // `guamiList` has `minItems: 1` when present (yaml:2436): an explicitly empty
+        // array must not be read as "all GUAMIs", which would widen the subscription.
+        let resp = namf_request_handler(
+            SbiRequest::post("/namf-comm/v1/subscriptions")
+                .with_json_body(&json!({
+                    "amfStatusUri": "http://127.0.0.1:19741/s",
+                    "guamiList": [],
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(problem_cause(&resp), "MANDATORY_IE_INCORRECT");
+
+        // A PUT to an ID the AMF never minted is 404, not a create.
+        let resp = namf_request_handler(
+            SbiRequest::put("/namf-comm/v1/subscriptions/amfstatus-never-minted-74")
+                .with_json_body(&json!({ "amfStatusUri": "http://127.0.0.1:19741/s" }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 404);
+        assert_eq!(problem_cause(&resp), "SUBSCRIPTION_NOT_FOUND");
+    }
+
+    /// The AMFStatusChange registry is READ by a producer: planned removal POSTs an
+    /// `AmfStatusChangeNotification` to every subscriber (TS 29.518 §5.2.2.5.3, the
+    /// AMF planned-removal procedure §5.2.2.5.1.1 names as this service's purpose).
+    ///
+    /// Without this the CRUD above would be a write-only registry — this tree's most
+    /// common defect. A real in-process `SbiServer` receives the notification, so what
+    /// is asserted is **what a subscriber actually got**: the path it registered and a
+    /// conformant `amfStatusInfoList` carrying `AMF_UNAVAILABLE`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn planned_removal_notifies_every_amf_status_subscriber() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        amf_context_init(64, 1024, 4096);
+
+        // A served GUAMI is a precondition: the notification body's `AmfStatusInfo`
+        // REQUIRES `guamiList` (yaml:2465-2466), so an AMF serving none has nothing
+        // conformant to send and the notifier correctly declines.
+        //
+        // An AMF Region of 0x74 no sibling uses, so the `amfId` asserted below can only
+        // be this test's GUAMI. `served_guami` is PROCESS-GLOBAL and several `ngap_path`
+        // tests set it (`serve_only_local_guami`), so the previous value is saved and
+        // restored: leaving a foreign region behind would flip a sibling's
+        // is-this-GUTI-mine verdict mid-flight, which is the
+        // `reset_sbi_profile_override` failure mode in a different global.
+        let saved_guami = {
+            let ctx = amf_self();
+            let mut guard = ctx.write().expect("ctx lock");
+            let saved = (guard.served_guami.clone(), guard.num_of_served_guami);
+            guard.served_guami = vec![crate::context::Guami {
+                plmn_id: crate::context::PlmnId::new("001", "01"),
+                amf_id: crate::context::AmfId {
+                    region: 0x74,
+                    set: 0x007,
+                    pointer: 0x00,
+                },
+            }];
+            guard.num_of_served_guami = 1;
+            saved
+        };
+
+        let (server, port, mut rx) = start_capture_server().await;
+        // The capture server is plaintext loopback, so this fixture describes a
+        // dev-profile deployment and says so. Deliberately NOT reset afterwards: the
+        // override is PROCESS-WIDE and every loopback-plaintext test in this crate
+        // sets it and leaves it set (PR #390 measured 2 failures in 10 whole-crate runs
+        // from resetting it mid-flight).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        // A path unique to this test, so what arrives can only be this subscription's.
+        let callback_path = "/namf-status/74-planned-removal";
+        let resp = namf_request_handler(
+            SbiRequest::post("/namf-comm/v1/subscriptions")
+                .with_json_body(&json!({
+                    "amfStatusUri": format!("http://127.0.0.1:{port}{callback_path}"),
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+
+        crate::sbi_path::notify_amf_status_change("AMF_UNAVAILABLE").await;
+
+        let (uri, body) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("the subscriber must have been notified before the AMF went away")
+            .expect("notification channel closed");
+        assert!(
+            uri.contains(callback_path),
+            "the notification must go to the amfStatusUri the consumer registered, got {uri}"
+        );
+        let notification: Value = serde_json::from_str(&body).expect("notification is JSON");
+        assert_eq!(
+            notification["amfStatusInfoList"][0]["statusChange"].as_str(),
+            Some("AMF_UNAVAILABLE"),
+            "`StatusChange` is AMF_UNAVAILABLE / AMF_AVAILABLE (yaml:4479-4486) -- a bare \
+             \"UNAVAILABLE\" is not a value of that enum"
+        );
+        assert_eq!(
+            notification["amfStatusInfoList"][0]["guamiList"][0]["amfId"].as_str(),
+            // region 0x74 << 16 | set 0x007 << 6 | pointer 0 (`sbi_path::amf_id_hex`).
+            Some("7401c0"),
+            "and `AmfStatusInfo` REQUIRES guamiList (yaml:2465-2466), carrying the GUAMI \
+             this AMF serves -- rendered the same way the NF profile renders it, so the \
+             two cannot disagree about what this AMF is called"
+        );
+
+        // Restore the process-global GUAMI before the guard drops, for the reason on the
+        // save above.
+        {
+            let ctx = amf_self();
+            let mut guard = ctx.write().expect("ctx lock");
+            guard.served_guami = saved_guami.0;
+            guard.num_of_served_guami = saved_guami.1;
+        }
+        server.stop().await.expect("server stop");
+    }
+
+    // ==================================================================
+    // #74 criterion 4: Namf_EventExposure targeting
+    // ==================================================================
+
+    /// A subscription keyed SOLELY by `gpsi`, by `pei`, or by `groupId` is ACCEPTED.
+    ///
+    /// This was a genuine bug: the guard read `supi`/`anyUE` only and answered
+    /// `MANDATORY_IE_MISSING` for the other three, so a conformant NWDAF/AF targeting
+    /// a UE by GPSI was refused outright. `AmfEventSubscription` offers all five keys
+    /// (`TS29518_Namf_EventExposure.yaml:553`, `:555`, `:577`, `:579`, `:581`) and
+    /// `required` lists none of them (`:589-593`).
+    ///
+    /// Each case asserts 201 **and that the echoed subscription carries the key that
+    /// was sent** — a positive assertion, where `assert_ne!(status, 400)` would also
+    /// be satisfied by a handler that accepted anything. Paired with the
+    /// empty-target rejection below so the two discriminate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_event_subscription_targeted_by_gpsi_pei_or_group_id_is_accepted() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        amf_context_init(64, 1024, 4096);
+
+        // Identities unique to this test: the subscription store is process-global and
+        // `event_subscriptions_matching_ue` now matches on GPSI/PEI, so a shared value
+        // would have this test's subscription pick up a sibling's UE.
+        for (key, value) in [
+            ("gpsi", "msisdn-001010000740500"),
+            ("pei", "imeisv-0000000000740500"),
+            ("groupId", "74000000-group-0500"),
+        ] {
+            let req = SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&json!({
+                    "subscription": {
+                        "eventList": [{ "type": "LOCATION_REPORT" }],
+                        "eventNotifyUri": "http://127.0.0.1:19742/notify",
+                        "notifyCorrelationId": format!("corr-74-{key}"),
+                        "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                        key: value,
+                    }
+                }))
+                .expect("json");
+            let resp = namf_request_handler(req).await;
+            assert_eq!(
+                resp.status, 201,
+                "a subscription targeted solely by `{key}` is conformant (TS 29.518 \
+                 §5.3.2.2) and must be accepted, not refused MANDATORY_IE_MISSING"
+            );
+            assert_eq!(
+                body_json(&resp)["subscription"][key].as_str(),
+                Some(value),
+                "and the created resource must carry the `{key}` the consumer sent, or it \
+                 cannot correlate the subscription with its request"
+            );
+        }
+
+        // The discriminating half: a subscription naming NO target at all is still a
+        // defect, because the AMF would have to guess whose events to report.
+        let req = SbiRequest::post("/namf-evts/v1/subscriptions")
+            .with_json_body(&json!({
+                "subscription": {
+                    "eventList": [{ "type": "LOCATION_REPORT" }],
+                    "eventNotifyUri": "http://127.0.0.1:19742/notify",
+                    "notifyCorrelationId": "corr-74-no-target",
+                    "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                }
+            }))
+            .expect("json");
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem_cause(&resp), "MANDATORY_IE_MISSING");
+    }
+
+    /// A GPSI-targeted subscription against a UE the AMF already knows RESOLVES to
+    /// that UE's SUPI, so it keys exactly the way a SUPI subscription does and the
+    /// existing SUPI-keyed fire points reach it unchanged.
+    ///
+    /// `AmfUe.gpsi` comes from the UDM SDM `am-data` at registration, so this is a
+    /// lookup against real state — a SUPI cannot be converted into a GPSI.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_gpsi_subscription_resolves_to_the_known_ues_supi() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Distinct SUPI/GPSI pair: the resolution below is by value against the
+        // process-global store.
+        let supi = "imsi-001010000740510";
+        let gpsi = "msisdn-001010000740510";
+        let mut ue = setup_ue(supi, true, true);
+        ue.gpsi = Some(gpsi.to_string());
+        {
+            let ctx = amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_update(&ue);
+            // Republish so the GPSI is in the record the resolvers read.
+            guard.amf_ue_publish(&ue, 900_745, 1);
+        }
+
+        let req = SbiRequest::post("/namf-evts/v1/subscriptions")
+            .with_json_body(&json!({
+                "subscription": {
+                    "eventList": [{ "type": "LOCATION_REPORT" }],
+                    "eventNotifyUri": "http://127.0.0.1:19743/notify",
+                    "notifyCorrelationId": "corr-74-gpsi-resolve",
+                    "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                    "gpsi": gpsi,
+                }
+            }))
+            .expect("json");
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 201);
+        let subscription_id = body_json(&resp)["subscriptionId"]
+            .as_str()
+            .expect("subscriptionId")
+            .to_string();
+
+        let ctx = amf_self();
+        let stored = ctx
+            .read()
+            .expect("ctx lock")
+            .event_subscription_find(&subscription_id)
+            .expect("the subscription must be stored");
+        assert_eq!(
+            stored.supi.as_deref(),
+            Some(supi),
+            "the GPSI must have been resolved to the SUPI of the UE that carries it -- the \
+             consumer supplied only the GPSI, so this SUPI can only have come from the \
+             lookup"
+        );
+        assert_eq!(
+            stored.gpsi.as_deref(),
+            Some(gpsi),
+            "and the GPSI is retained, so the echo returns what the consumer sent"
+        );
+
+        // An UNKNOWN gpsi is stored UNRESOLVED rather than refused: §5.3.2.2 does not
+        // condition a subscription on the target being registered, and
+        // `event_subscriptions_matching_ue` matches on the GPSI so it fires once the UE
+        // appears.
+        let req = SbiRequest::post("/namf-evts/v1/subscriptions")
+            .with_json_body(&json!({
+                "subscription": {
+                    "eventList": [{ "type": "LOCATION_REPORT" }],
+                    "eventNotifyUri": "http://127.0.0.1:19743/notify",
+                    "notifyCorrelationId": "corr-74-gpsi-unknown",
+                    "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                    "gpsi": "msisdn-001010000740519",
+                }
+            }))
+            .expect("json");
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 201);
+        let unresolved = ctx
+            .read()
+            .expect("ctx lock")
+            .event_subscription_find(body_json(&resp)["subscriptionId"].as_str().expect("id"))
+            .expect("stored");
+        assert!(
+            unresolved.supi.is_none(),
+            "an unknown GPSI must not be resolved to SOME UE's SUPI"
+        );
+        assert_eq!(unresolved.gpsi.as_deref(), Some("msisdn-001010000740519"));
+    }
+
+    /// A GPSI-targeted subscription really DELIVERS: the notification arrives at the
+    /// subscriber and carries the GPSI that was targeted.
+    ///
+    /// This is the half that would be missed by accepting the key and matching on SUPI
+    /// only — the subscription would be stored and never fire, trading a wrong 400 for
+    /// silent non-delivery. Asserted against a real in-process server, on the GPSI,
+    /// which exists nowhere else in the fixture.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_gpsi_targeted_subscription_receives_a_notification_carrying_that_gpsi() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Distinct identities; the GPSI below is the assertion's subject.
+        let supi = "imsi-001010000740520";
+        let gpsi = "msisdn-001010000740520";
+        let mut ue = setup_ue(supi, true, true);
+        ue.gpsi = Some(gpsi.to_string());
+
+        let (server, port, mut rx) = start_capture_server().await;
+        // Dev profile for plaintext loopback; deliberately not reset (process-wide).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        let notify_path = "/notify/74-gpsi-delivery";
+        let resp = namf_request_handler(
+            SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&json!({
+                    "subscription": {
+                        "eventList": [{ "type": "LOCATION_REPORT" }],
+                        "eventNotifyUri": format!("http://127.0.0.1:{port}{notify_path}"),
+                        "notifyCorrelationId": "corr-74-gpsi-delivery",
+                        "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                        "gpsi": gpsi,
+                    }
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+
+        fire_location_report(&ue);
+
+        let (uri, body) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect(
+                "a GPSI-targeted subscription must RECEIVE its notifications, or \
+                     accepting the key only traded a wrong 400 for silent non-delivery",
+            )
+            .expect("notification channel closed");
+        assert!(
+            uri.contains(notify_path),
+            "delivered to the subscribed URI, got {uri}"
+        );
+        let notification: Value = serde_json::from_str(&body).expect("notification is JSON");
+        assert_eq!(
+            notification["reportList"][0]["gpsi"].as_str(),
+            Some(gpsi),
+            "and the report carries the GPSI (Table 6.2.6.2.5-1: \"shall be present if \
+             available\") -- this value exists nowhere else in the fixture"
+        );
+        assert_eq!(
+            notification["reportList"][0]["type"].as_str(),
+            Some("LOCATION_REPORT")
+        );
+
+        server.stop().await.expect("server stop");
+    }
+
+    // ==================================================================
+    // #74 criterion 5 (the three types with honest sites): a previously
+    // silent event type produces a notification
+    // ==================================================================
+
+    /// `LOSS_OF_CONNECTIVITY` fires, where it was one of nine types accepted at
+    /// subscribe time and never emitted.
+    ///
+    /// TS 29.518 §6.2 names the trigger literally: *"Such condition is identified when
+    /// Mobile Reachable timer expires in the AMF"*, and that expiry is wired in
+    /// `ngap_path::process_reachability_timers`. Driven here through
+    /// `fire_loss_of_connectivity` because the timer sweep is `NgapServer`-bound; the
+    /// production call site is asserted by reverting it and watching this test's
+    /// sibling in `ngap_path` — the emitter is what this test pins.
+    ///
+    /// The assertion is on the delivered body: the subscribed SUPI and the
+    /// `LossOfConnectivityReason` the spec defines for a timer expiry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loss_of_connectivity_delivers_a_notification() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Distinct SUPI: the delivered report is matched on it below.
+        let supi = "imsi-001010000740600";
+        let ue = setup_ue(supi, true, true);
+
+        let (server, port, mut rx) = start_capture_server().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        let notify_path = "/notify/74-loss-of-connectivity";
+        let resp = namf_request_handler(
+            SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&json!({
+                    "subscription": {
+                        "eventList": [{ "type": "LOSS_OF_CONNECTIVITY" }],
+                        "eventNotifyUri": format!("http://127.0.0.1:{port}{notify_path}"),
+                        "notifyCorrelationId": "corr-74-loss",
+                        "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                        "supi": supi,
+                    }
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(
+            resp.status, 201,
+            "LOSS_OF_CONNECTIVITY was already accepted at subscribe time; #74's defect is \
+             that it never fired"
+        );
+
+        fire_loss_of_connectivity(&ue, "MAX_DETECTION_TIME_EXPIRED");
+
+        let (uri, body) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("a LOSS_OF_CONNECTIVITY subscription must produce a notification")
+            .expect("notification channel closed");
+        assert!(uri.contains(notify_path), "got {uri}");
+        let notification: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(
+            notification["reportList"][0]["type"].as_str(),
+            Some("LOSS_OF_CONNECTIVITY")
+        );
+        assert_eq!(
+            notification["reportList"][0]["supi"].as_str(),
+            Some(supi),
+            "for the UE that was subscribed, not whichever UE the store held first"
+        );
+        assert_eq!(
+            notification["reportList"][0]["lossOfConnectReason"].as_str(),
+            Some("MAX_DETECTION_TIME_EXPIRED"),
+            "the `LossOfConnectivityReason` for a mobile-reachable timer expiry \
+             (TS29518_Namf_EventExposure.yaml:1605-1614)"
+        );
+
+        server.stop().await.expect("server stop");
+    }
+
+    /// `CONNECTIVITY_STATE_REPORT` and `ACCESS_TYPE_REPORT` fire, the other two of the
+    /// three silent types #74 leaves closeable here.
+    ///
+    /// Both are asserted on their type-specific report members — `cmInfoList` and
+    /// `accessTypeList` — so a fire point that emitted the right event type with the
+    /// wrong body would fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connectivity_state_and_access_type_reports_deliver_notifications() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Distinct SUPI from the LOSS_OF_CONNECTIVITY test.
+        let supi = "imsi-001010000740610";
+        let ue = setup_ue(supi, true, true);
+
+        let (server, port, mut rx) = start_capture_server().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        let notify_path = "/notify/74-cm-and-access";
+        let resp = namf_request_handler(
+            SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&json!({
+                    "subscription": {
+                        "eventList": [
+                            { "type": "CONNECTIVITY_STATE_REPORT" },
+                            { "type": "ACCESS_TYPE_REPORT" },
+                        ],
+                        "eventNotifyUri": format!("http://127.0.0.1:{port}{notify_path}"),
+                        "notifyCorrelationId": "corr-74-cm-access",
+                        "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                        "supi": supi,
+                    }
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+
+        fire_connectivity_state_report(&ue, true);
+        let (_, body) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("CONNECTIVITY_STATE_REPORT must produce a notification")
+            .expect("channel closed");
+        let cm: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(
+            cm["reportList"][0]["type"].as_str(),
+            Some("CONNECTIVITY_STATE_REPORT")
+        );
+        assert_eq!(
+            cm["reportList"][0]["cmInfoList"][0]["cmState"].as_str(),
+            Some("CONNECTED"),
+            "the CM state is the report's own member, not merely the event type"
+        );
+
+        fire_access_type_report(&ue, "3GPP_ACCESS");
+        let (_, body) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("ACCESS_TYPE_REPORT must produce a notification")
+            .expect("channel closed");
+        let at: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(
+            at["reportList"][0]["type"].as_str(),
+            Some("ACCESS_TYPE_REPORT")
+        );
+        assert_eq!(
+            at["reportList"][0]["accessTypeList"][0].as_str(),
+            Some("3GPP_ACCESS"),
+            "carried in `accessTypeList` (TS29518_Namf_EventExposure.yaml:757-760)"
+        );
+
+        server.stop().await.expect("server stop");
+    }
+
+    // ==================================================================
+    // #74 criteria 6 + 7: Namf_Location routing and the LMF round trip
+    // ==================================================================
+
+    /// #74 criterion 6: `POST /namf-loc/v1/{id}/provide-loc-info`
+    /// (ProvideLocationInfo) is routed and answers a conformant `ProvideLocInfo`.
+    ///
+    /// Unrouted before #74 — the `namf-loc` arm matched `provide-pos-info` only, so a
+    /// UDM asking for NPLI got a 404.
+    ///
+    /// Both halves of the honest answer are pinned: the last known location AND
+    /// `currentLoc: false`. §5.5.2.4.1 makes `currentLoc: true` conditional on a paging
+    /// procedure or an NG-RAN Location Reporting Control round trip, neither of which
+    /// exists in this tree, and the clause's own instruction for that case is *"the AMF
+    /// shall provide the last known location and set 'currentLoc' attribute to
+    /// 'false'"*. A test that asserted only the location would not catch a handler that
+    /// claimed `true`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provide_location_info_is_routed_and_reports_the_last_known_location() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Distinct SUPI; the cell id below is this test's own.
+        let supi = "imsi-001010000740700";
+        let mut ue = setup_ue(supi, true, true);
+        ue.nr_cgi.cell_id = 0x0074_0700;
+        ue.nr_tai.tac = 0x0707;
+        {
+            let ctx = amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_update(&ue);
+            guard.amf_ue_publish(&ue, 900_747, 1);
+        }
+
+        // `RequestLocInfo` has NO required members (yaml:552-569, all four optional
+        // with `default: false`), so an empty object is a valid request.
+        let resp = namf_request_handler(
+            SbiRequest::post(format!("/namf-loc/v1/{supi}/provide-loc-info"))
+                .with_json_body(&json!({}))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(
+            resp.status, 200,
+            "an empty RequestLocInfo is conformant and must not be refused"
+        );
+        let body = body_json(&resp);
+        assert_eq!(
+            body["currentLoc"].as_bool(),
+            Some(false),
+            "§5.5.2.4.1: with no paging and no Location Reporting Control, the AMF \
+             \"shall provide the last known location and set 'currentLoc' attribute to \
+             'false'\" -- claiming `true` would be the defect"
+        );
+        assert_eq!(
+            body["location"]["nrLocation"]["ncgi"]["nrCellId"].as_str(),
+            Some("000740700"),
+            "and the NPLI itself: the cell this AMF holds the UE in, which is this test's \
+             own value"
+        );
+        assert_eq!(
+            body["ratType"].as_str(),
+            Some("NR"),
+            "a CM-CONNECTED UE is attached over NR"
+        );
+        assert!(
+            body["timezone"].is_null(),
+            "`timezone` is OMITTED: the AMF never learns a UE time zone (gmm_build sends \
+             `local_time_zone: None`), and the host's zone is not the UE's"
+        );
+
+        // An unknown UE is 404, not an invented location.
+        let resp = namf_request_handler(
+            SbiRequest::post("/namf-loc/v1/imsi-001010000740709/provide-loc-info")
+                .with_json_body(&json!({}))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 404);
+        assert_eq!(problem_cause(&resp), "CONTEXT_NOT_FOUND");
+    }
+
+    /// #74 criterion 6: `POST /namf-loc/v1/{id}/cancel-pos-info` (CancelLocation) is
+    /// routed, validates `CancelPosInfo`'s three required members, and drops the AMF's
+    /// stored LCS correlation.
+    ///
+    /// The positive assertion is that the correlation is GONE afterwards: the consumer
+    /// cancelled, so this AMF must stop routing the UE's uplink positioning to the old
+    /// LMF. A 204-only assertion would be satisfied by a handler that returned 204 and
+    /// kept reporting.
+    ///
+    /// `nrppaPeriodicInd: true` is exercised because §5.5.2.5.1 step 2a says *"the AMF
+    /// shall skip the cancel location procedures towards the UE"* in that case — with
+    /// no LMF in this fixture, that path is the one that must still answer 204.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_location_is_routed_and_drops_the_lcs_correlation() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Distinct SUPI; the correlation below is keyed on it.
+        let supi = "imsi-001010000740710";
+        let _ue = setup_ue(supi, true, true);
+        {
+            let ctx = amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.lcs_correlation_set(
+                supi,
+                LcsCorrelationRecord {
+                    lcs_correlation_id: "corr-74-0710".to_string(),
+                    serving_lmf_identification: Some("LMF-74-0710".to_string()),
+                },
+            );
+        }
+        assert!(
+            amf_self()
+                .read()
+                .expect("ctx lock")
+                .lcs_correlation_find(supi)
+                .is_some(),
+            "precondition: the AMF holds an LCS correlation for this UE"
+        );
+
+        // `nrppaPeriodicInd: true` -> the cancel toward the UE is skipped, so no LMF is
+        // needed for this leg and the 204 stands on its own.
+        let resp = namf_request_handler(
+            SbiRequest::post(format!("/namf-loc/v1/{supi}/cancel-pos-info"))
+                .with_json_body(&json!({
+                    "supi": supi,
+                    "hgmlcCallBackURI": "http://127.0.0.1:19744/hgmlc",
+                    "ldrReference": "ldr-74-0710",
+                    "nrppaPeriodicInd": true,
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(
+            resp.status, 204,
+            "§5.5.2.5.1 step 2a: \"On success, AMF responds with '204 No Content'\""
+        );
+        assert!(
+            amf_self()
+                .read()
+                .expect("ctx lock")
+                .lcs_correlation_find(supi)
+                .is_none(),
+            "the stored correlation must be DROPPED: the consumer cancelled, so this AMF \
+             must stop routing this UE's positioning to the old LMF"
+        );
+
+        // `CancelPosInfo` requires supi, hgmlcCallBackURI and ldrReference
+        // (TS29518_Namf_Location.yaml:612-615).
+        let other = "imsi-001010000740711";
+        let _other = setup_ue(other, true, true);
+        let full = json!({
+            "supi": other,
+            "hgmlcCallBackURI": "http://127.0.0.1:19744/hgmlc",
+            "ldrReference": "ldr-74-0711",
+        });
+        for missing in ["supi", "hgmlcCallBackURI", "ldrReference"] {
+            let mut body = full.clone();
+            body.as_object_mut().expect("object").remove(missing);
+            let resp = namf_request_handler(
+                SbiRequest::post(format!("/namf-loc/v1/{other}/cancel-pos-info"))
+                    .with_json_body(&body)
+                    .expect("json"),
+            )
+            .await;
+            assert_eq!(resp.status, 400, "a CancelPosInfo without `{missing}`");
+            assert_eq!(problem_cause(&resp), "MANDATORY_IE_MISSING");
+        }
+    }
+
+    /// #74 criterion 7: `provide-pos-info` INVOKES the LMF and returns the
+    /// LMF-derived position.
+    ///
+    /// TS 29.518 §5.5.2.2.1 is explicit — *"The service operation triggers the AMF to
+    /// invoke the service towards the LMF"* — and before #74 the handler returned the
+    /// stored NGAP cell identity while carrying an in-code admission that "No LMF
+    /// client path exists in this AMF". `lmfd` has served
+    /// `/nlmf-loc/v1/determine-location` all along, so the producer existed and had no
+    /// consumer.
+    ///
+    /// A real in-process `SbiServer` stands in for the LMF over real HTTP/2, so the
+    /// assertions are on **what the LMF actually received** (the SUPI, on the
+    /// DetermineLocation path) and on **the position the LMF returned** appearing in
+    /// the AMF's answer. That latitude exists nowhere else in the fixture, so a
+    /// handler that skipped the round trip cannot produce it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provide_positioning_info_drives_the_lmf_and_returns_its_position() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Distinct SUPI; the latitude below is this test's marker value.
+        let supi = "imsi-001010000740720";
+        let mut ue = setup_ue(supi, true, true);
+        ue.nr_cgi.cell_id = 0x0074_0720;
+        {
+            let ctx = amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_update(&ue);
+            guard.amf_ue_publish(&ue, 900_748, 1);
+        }
+
+        // A latitude no other fixture uses, so finding it in the AMF's response proves
+        // the LMF was consulted.
+        let lmf_latitude = 47.740_720_f64;
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let lmf_port = addr.port();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, String)>(8);
+        let lmf = SbiServer::on_listener(
+            SbiServerConfig::new(format!("127.0.0.1:{lmf_port}").parse().expect("addr")),
+            listener,
+        );
+        lmf.start(move |req: SbiRequest| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx
+                    .send((
+                        req.header.uri.clone(),
+                        req.http.content.clone().unwrap_or_default(),
+                    ))
+                    .await;
+                // The shape lmfd's `encode_location_response` produces: a
+                // `LocationDataExt` whose members ProvidePosInfo shares by name
+                // (TS29518_Namf_Location.yaml:369-429).
+                SbiResponse::with_status(200)
+                    .with_json_body(&json!({
+                        "locationEstimate": {
+                            "shape": "POINT",
+                            "point": { "lat": lmf_latitude, "lon": 8.740_720 },
+                        },
+                        "accuracyFulfilmentIndicator": "REQUESTED_ACCURACY_FULFILLED",
+                        "ageOfLocationEstimate": 0,
+                        "positioningDataList": [{
+                            "method": "CELL_ID",
+                            "mode": "CONVENTIONAL",
+                            "usage": "SUCCESS_RESULTS_USED_TO_GENERATE_LOCATION",
+                        }],
+                    }))
+                    .expect("json")
+            }
+        })
+        .await
+        .expect("stand-in LMF start");
+
+        // Plaintext loopback -> dev profile, and deliberately NOT reset (process-wide).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        // No NRF here, so the LMF is reached through the configured fallback -- the
+        // same path a bring-up without an NRF takes.
+        std::env::set_var("LMF_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("LMF_SBI_PORT", lmf_port.to_string());
+
+        let resp = namf_request_handler(
+            SbiRequest::post(format!("/namf-loc/v1/{supi}/provide-pos-info"))
+                .with_json_body(&json!({
+                    "lcsClientType": "EMERGENCY_SERVICES",
+                    "lcsLocation": "CURRENT_LOCATION",
+                    "supportedGADShapes": ["POINT"],
+                }))
+                .expect("json"),
+        )
+        .await;
+
+        std::env::remove_var("LMF_SBI_ADDR");
+        std::env::remove_var("LMF_SBI_PORT");
+
+        assert_eq!(resp.status, 200);
+        let body = body_json(&resp);
+        assert_eq!(
+            body["locationEstimate"]["point"]["lat"].as_f64(),
+            Some(lmf_latitude),
+            "the AMF must return the LMF-DERIVED position. This latitude exists nowhere \
+             else in the fixture, so it can only have arrived over \
+             Nlmf_Location_DetermineLocation -- which had no consumer at all before #74"
+        );
+        assert_eq!(
+            body["positioningDataList"][0]["method"].as_str(),
+            Some("CELL_ID"),
+            "and the LMF's positioning method with it"
+        );
+        assert_eq!(
+            body["ncgi"]["nrCellId"].as_str(),
+            Some("000740720"),
+            "alongside the serving cell, which is the AMF's own knowledge and a \
+             ProvidePosInfo member in its own right (yaml:399-400)"
+        );
+
+        // What the LMF actually received.
+        let (uri, lmf_body) = rx
+            .try_recv()
+            .expect("the LMF must have been invoked (TS 29.518 §5.5.2.2.1)");
+        assert!(
+            uri.contains("/nlmf-loc/v1/determine-location"),
+            "on the DetermineLocation resource lmfd serves, got {uri}"
+        );
+        let input: Value = serde_json::from_str(&lmf_body).expect("InputData is JSON");
+        assert_eq!(
+            input["supi"].as_str(),
+            Some(supi),
+            "carrying the target SUPI, which only the AMF holds"
+        );
+        assert_eq!(
+            input["ncgi"]["nrCellId"].as_str(),
+            Some("000740720"),
+            "and the serving cell, the E-CID starting point only the AMF has"
+        );
+        assert_eq!(
+            input["externalClientType"].as_str(),
+            Some("EMERGENCY_SERVICES"),
+            "and the GMLC's client type carried through, not dropped"
+        );
+
+        lmf.stop().await.expect("LMF stop");
+    }
+
+    /// With no LMF reachable, `provide-pos-info` falls back to the stored NGAP cell —
+    /// the pre-#74 answer — rather than failing.
+    ///
+    /// This is what keeps a deployment without an LMF working: a consumer that used to
+    /// get a cell identity must not start getting a 5xx. `AMF_NAMF_LOC_LMF=off` forces
+    /// the same path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provide_positioning_info_falls_back_to_the_ngap_cell_without_an_lmf() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Distinct SUPI and cell from the LMF-driven sibling.
+        let supi = "imsi-001010000740730";
+        let mut ue = setup_ue(supi, true, true);
+        ue.nr_cgi.cell_id = 0x0074_0730;
+        {
+            let ctx = amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_update(&ue);
+            guard.amf_ue_publish(&ue, 900_749, 1);
+        }
+
+        // The switch, not an absent LMF: asserting the OFF path also asserts the
+        // fallback body, and it does so without depending on nothing listening on a
+        // port this test does not control.
+        std::env::set_var("AMF_NAMF_LOC_LMF", "off");
+        let resp = namf_request_handler(
+            SbiRequest::post(format!("/namf-loc/v1/{supi}/provide-pos-info"))
+                .with_json_body(&json!({
+                    "lcsClientType": "VALUE_ADDED_SERVICES",
+                    "lcsLocation": "CURRENT_OR_LAST_KNOWN_LOCATION",
+                }))
+                .expect("json"),
+        )
+        .await;
+        std::env::remove_var("AMF_NAMF_LOC_LMF");
+
+        assert_eq!(resp.status, 200);
+        let body = body_json(&resp);
+        assert_eq!(
+            body["ncgi"]["nrCellId"].as_str(),
+            Some("000740730"),
+            "the pre-#74 answer is preserved when the LMF leg is off"
+        );
+        assert!(
+            body["locationEstimate"].is_null(),
+            "and no position is invented: the AMF has none without the LMF"
+        );
     }
 }

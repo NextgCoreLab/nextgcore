@@ -540,6 +540,11 @@ pub fn handle_event_subscribe(
         nf_id: String::new(),
         event_types: vec![subscription.event_type.as_str().to_string()],
         supi: None,
+        // This internal entry point takes no target identity at all and keys
+        // `any_ue`, so the #74 targeting members are absent by construction.
+        gpsi: None,
+        pei: None,
+        group_id: None,
         any_ue: true,
         expiry: None,
     };

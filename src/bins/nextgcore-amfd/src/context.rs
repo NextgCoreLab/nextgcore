@@ -614,6 +614,15 @@ pub struct AmfContext {
     /// originating LMF even without an explicit subscription.
     lcs_correlations: RwLock<HashMap<String, LcsCorrelationRecord>>,
 
+    /// AMFStatusChange subscriptions (TS 29.518 §5.2.2.5.1): subscriptionId ->
+    /// the consumer's `amfStatusUri` + GUAMI interest. Drained by
+    /// `sbi_path::notify_amf_status_change` on planned removal.
+    ///
+    /// Separate from `event_subscriptions` because the resource, the lifecycle and
+    /// the notification body are all different: this collection is
+    /// `/namf-comm/v1/subscriptions` and is about the AMF, not about a UE.
+    amf_status_subscriptions: RwLock<HashMap<String, AmfStatusSubscription>>,
+
     /// Network-initiated deregistration queue (WSB-4, TS 23.502 §4.2.2.3.3 /
     /// TS 24.501 §5.5.2.3): deregistrations the Namf_Callback dereg-notify
     /// handler (Nudm_UECM DeregistrationNotification, TS 29.503 §5.3.2.3.2)
@@ -730,10 +739,55 @@ pub struct EventSubscription {
     pub event_types: Vec<String>,
     /// Single-UE subscription filter (`supi`)
     pub supi: Option<String>,
+    /// GPSI target (`gpsi`, `TS29518_Namf_EventExposure.yaml:577`).
+    ///
+    /// A conformant NWDAF/AF may target a UE by its EXTERNAL identity instead of
+    /// its SUPI: `AmfEventSubscription` requires only
+    /// `eventList`/`eventNotifyUri`/`notifyCorrelationId`/`nfId` (yaml:589-593),
+    /// so a GPSI-only subscription is valid and used to be refused
+    /// `MANDATORY_IE_MISSING` (#74 criterion 4). Retained even when `supi` was
+    /// resolved from it, so the echo returns what the consumer sent.
+    pub gpsi: Option<String>,
+    /// PEI target (`pei`, `TS29518_Namf_EventExposure.yaml:579`). Same reasoning
+    /// as `gpsi`: an equipment identity is a permitted target key.
+    pub pei: Option<String>,
+    /// Group target (`groupId`, `TS29518_Namf_EventExposure.yaml:555`).
+    ///
+    /// Stored and echoed so a conformant group subscription is ACCEPTED rather
+    /// than refused. Notifications for it do NOT fire: this AMF has no
+    /// group-membership source (no `internalGroupId` on [`AmfUe`], and the UDM
+    /// SDM `am-data` it reads carries none), so it cannot decide whether a given
+    /// UE belongs to the group. Matching every UE instead would send the
+    /// consumer reports for subscribers it never asked about, which is worse
+    /// than a declared gap.
+    pub group_id: Option<String>,
     /// Any-UE subscription (`anyUE`)
     pub any_ue: bool,
     /// Optional subscription expiry (`expiry`, DateTime)
     pub expiry: Option<std::time::SystemTime>,
+}
+
+/// AMFStatusChange subscription stored in the AMF context (TS 29.518 §5.2.2.5.1,
+/// `TS29518_Namf_Communication.yaml:2426-2438` `SubscriptionData`).
+///
+/// A consumer subscribes so it is told when this AMF's availability or GUAMI
+/// service changes — the AMF planned-removal procedure §5.2.2.5.1.1 names as the
+/// reason this service exists (TS 23.501 §5.21.2.2). Distinct from
+/// [`EventSubscription`], which is per-UE Namf_EventExposure: this one is about
+/// the AMF itself and carries no UE identity at all.
+#[derive(Debug, Clone)]
+pub struct AmfStatusSubscription {
+    /// Subscription ID (assigned by the AMF, returned in the Location header)
+    pub subscription_id: String,
+    /// Callback URI the AMFStatusChangeNotify is POSTed to (`amfStatusUri`, the
+    /// only REQUIRED member — yaml:2437-2438)
+    pub amf_status_uri: String,
+    /// GUAMIs the consumer is interested in (`guamiList`, optional).
+    ///
+    /// Held as the raw JSON the consumer sent, so the PUT complete-replacement of
+    /// §5.2.2.5.1.3 round-trips byte-identically. The AMF does not reinterpret a
+    /// `Guami` it only has to echo.
+    pub guami_list: Vec<serde_json::Value>,
 }
 
 impl AmfContext {
@@ -792,6 +846,7 @@ impl AmfContext {
             positioning_dl_queue: RwLock::new(Vec::new()),
             n1n2_subscriptions: RwLock::new(HashMap::new()),
             lcs_correlations: RwLock::new(HashMap::new()),
+            amf_status_subscriptions: RwLock::new(HashMap::new()),
             network_dereg_queue: RwLock::new(Vec::new()),
         }
     }
@@ -1226,6 +1281,19 @@ impl AmfContext {
         );
     }
 
+    /// Withdraw a UE from the live store, the inverse of
+    /// [`AmfContext::amf_ue_publish`] (#74).
+    ///
+    /// Required by the inter-AMF release operations (`/release`,
+    /// `/cancel-relocate`): `amf_ue_remove` clears `amf_ue_list`, but the derived
+    /// resolvers read `ue_store`, so a release that only removed from the list would
+    /// leave the Namf surface still resolving a context the peer had released. That is
+    /// the #341 defect in reverse — and worse, because acting on a released context
+    /// means acting on a UE another AMF now serves.
+    pub fn amf_ue_unpublish(&self, amf_ue_id: u64) {
+        self.ue_store.remove(amf_ue_id);
+    }
+
     /// Find AMF UE by SUPI.
     ///
     /// **Resolves against the live store (#341), derived rather than indexed.**
@@ -1656,6 +1724,31 @@ impl AmfContext {
         event_type: &str,
         supi: Option<&str>,
     ) -> Vec<EventSubscription> {
+        self.event_subscriptions_matching_ue(event_type, supi, None, None)
+    }
+
+    /// Collect subscriptions matching an event type and any of the UE's identities
+    /// (#74 criterion 4).
+    ///
+    /// [`event_subscriptions_matching`](Self::event_subscriptions_matching) keys on
+    /// the SUPI alone, which is correct only while `supi`/`anyUE` are the only
+    /// targeting keys the producer accepts. Now that a subscription may be keyed by
+    /// `gpsi` or `pei` (`TS29518_Namf_EventExposure.yaml:577`, `:579`), a
+    /// SUPI-only match would store those subscriptions and never fire them —
+    /// trading a wrong 400 for silent non-delivery.
+    ///
+    /// A `gpsi`/`pei` subscription therefore matches on that identity **even when
+    /// its `supi` is still unresolved**, which is what lets a subscription created
+    /// before the UE registered start delivering once it has.
+    ///
+    /// `group_id` is deliberately NOT a match arm: see [`EventSubscription::group_id`].
+    pub fn event_subscriptions_matching_ue(
+        &self,
+        event_type: &str,
+        supi: Option<&str>,
+        gpsi: Option<&str>,
+        pei: Option<&str>,
+    ) -> Vec<EventSubscription> {
         let now = std::time::SystemTime::now();
         self.event_subscriptions
             .read()
@@ -1670,14 +1763,41 @@ impl AmfContext {
                         if !s.event_types.iter().any(|t| t == event_type) {
                             return false;
                         }
-                        // UE filter: any-UE subscriptions match everything;
-                        // single-UE subscriptions must match the SUPI.
-                        s.any_ue || (s.supi.is_some() && s.supi.as_deref() == supi)
+                        // UE filter: any-UE subscriptions match everything; a
+                        // targeted subscription matches on ANY identity it was
+                        // keyed by that the reported UE also carries.
+                        s.any_ue
+                            || (s.supi.is_some() && s.supi.as_deref() == supi)
+                            || (s.gpsi.is_some() && gpsi.is_some() && s.gpsi.as_deref() == gpsi)
+                            || (s.pei.is_some() && pei.is_some() && s.pei.as_deref() == pei)
                     })
                     .cloned()
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Find the live UE whose GPSI is `gpsi` (#74 criterion 4).
+    ///
+    /// `AmfUe.gpsi` is written from the UDM SDM `am-data` at registration
+    /// (`ngap_path.rs` `state.amf_ue.gpsi = am_data.gpsi.clone()`), so this is a
+    /// lookup against real state and never a synthesised mapping — a SUPI cannot
+    /// be converted into a GPSI (see the note on [`AmfUe::gpsi`]).
+    pub fn amf_ue_find_by_gpsi(&self, gpsi: &str) -> Option<AmfUe> {
+        let amf_ue_list = self.amf_ue_list.read().ok()?;
+        amf_ue_list
+            .values()
+            .find(|ue| ue.gpsi.as_deref() == Some(gpsi))
+            .cloned()
+    }
+
+    /// Find the live UE whose PEI is `pei` (#74 criterion 4).
+    pub fn amf_ue_find_by_pei(&self, pei: &str) -> Option<AmfUe> {
+        let amf_ue_list = self.amf_ue_list.read().ok()?;
+        amf_ue_list
+            .values()
+            .find(|ue| ue.pei.as_deref() == Some(pei))
+            .cloned()
     }
 
     /// Remove expired subscriptions; returns how many were removed.
@@ -1698,6 +1818,77 @@ impl AmfContext {
             .read()
             .map(|m| m.len())
             .unwrap_or(0)
+    }
+
+    // ========================================================================
+    // AMFStatusChange subscription management (TS 29.518 §5.2.2.5.1, #74)
+    //
+    // Lock-order rule: every method here takes only the single
+    // `amf_status_subscriptions` lock and never calls another lock-taking
+    // method while holding it. Finders clone out.
+    // ========================================================================
+
+    /// Store an AMFStatusChange subscription. Returns false on ID collision.
+    pub fn amf_status_subscription_add(&self, sub: AmfStatusSubscription) -> bool {
+        if let Ok(mut subs) = self.amf_status_subscriptions.write() {
+            if subs.contains_key(&sub.subscription_id) {
+                return false;
+            }
+            subs.insert(sub.subscription_id.clone(), sub);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Find an AMFStatusChange subscription by ID (clone-out, lock dropped)
+    pub fn amf_status_subscription_find(
+        &self,
+        subscription_id: &str,
+    ) -> Option<AmfStatusSubscription> {
+        self.amf_status_subscriptions
+            .read()
+            .ok()
+            .and_then(|subs| subs.get(subscription_id).cloned())
+    }
+
+    /// Complete replacement of an existing AMFStatusChange subscription
+    /// (§5.2.2.5.1.3 — the PUT "shall apply to the whole subscription data").
+    /// Returns false when the subscription does not exist, so the caller answers
+    /// 404 rather than silently creating one under a consumer-chosen ID.
+    pub fn amf_status_subscription_replace(&self, sub: AmfStatusSubscription) -> bool {
+        if let Ok(mut subs) = self.amf_status_subscriptions.write() {
+            if let std::collections::hash_map::Entry::Occupied(mut e) =
+                subs.entry(sub.subscription_id.clone())
+            {
+                e.insert(sub);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Remove an AMFStatusChange subscription by ID (§5.2.2.5.2.1)
+    pub fn amf_status_subscription_remove(
+        &self,
+        subscription_id: &str,
+    ) -> Option<AmfStatusSubscription> {
+        self.amf_status_subscriptions
+            .write()
+            .ok()
+            .and_then(|mut subs| subs.remove(subscription_id))
+    }
+
+    /// Every stored AMFStatusChange subscription, cloned out.
+    ///
+    /// Read by the planned-removal notifier (`sbi_path::notify_amf_status_change`),
+    /// which is what makes this collection something other than a write-only
+    /// registry.
+    pub fn amf_status_subscriptions_all(&self) -> Vec<AmfStatusSubscription> {
+        self.amf_status_subscriptions
+            .read()
+            .map(|subs| subs.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     // ========================================================================

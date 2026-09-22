@@ -822,7 +822,24 @@ impl AmfApp {
     pub async fn shutdown_async(&mut self) {
         log::info!("Shutting down AMF...");
 
-        // #235: NFDeregister (TS 29.510 5.2.2.2.3) first, so the NRF stops
+        // #74: AMFStatusChangeNotify (TS 29.518 §5.2.2.5.3) BEFORE the NRF
+        // deregistration. §5.2.2.5.1.1 names the AMF planned-removal procedure
+        // (TS 23.501 §5.21.2.2) as the procedure the AMFStatusChange service exists
+        // for, and this is that moment — so this call is what makes
+        // `/namf-comm/v1/subscriptions` a registry something READS rather than a
+        // write-only store.
+        //
+        // Ordered FIRST deliberately: after `deregister_self()` the NRF has already
+        // dropped this profile, so a subscriber notified then learns nothing it could
+        // not have learned from the NRF, and this AMF may be mid-teardown when it
+        // tries. Bounded per subscriber inside the notifier, so a hung subscriber
+        // cannot hold the shutdown open.
+        // `AMF_UNAVAILABLE`, not `UNAVAILABLE`: the `StatusChange` enum is
+        // `AMF_UNAVAILABLE` / `AMF_AVAILABLE`
+        // (`TS29518_Namf_Communication.yaml:4479-4486`).
+        sbi_path::notify_amf_status_change("AMF_UNAVAILABLE").await;
+
+        // #235: NFDeregister (TS 29.510 5.2.2.2.3) next, so the NRF stops
         // handing this profile to consumers instead of waiting out its
         // supervision timer. Only the async path can do it — the sync
         // `shutdown()` above cannot await, and has no caller.

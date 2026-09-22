@@ -157,6 +157,14 @@ pub fn handle_registration_request(
     // Namf_EventExposure: registration-state + location reports (TS 29.518)
     crate::namf_server::fire_registration_state_report(amf_ue, true);
     crate::namf_server::fire_location_report(amf_ue);
+    // #74's ACCESS_TYPE_REPORT is deliberately NOT here. Every `fire_*` call in this
+    // module is in a function whose only callers are in `mod tests` --
+    // `handle_registration_request`, `handle_service_request` and
+    // `handle_deregistration_request` all are, as `ngap_path`'s
+    // `the_live_parser_captures_ue_s1_mode_capability` records for the same module
+    // ("implementing this there would have been a correct fix in an unreachable
+    // place"). The live NAS path is `ngap_path`'s `*_nas` handlers, so that is where
+    // the new emitters went.
 
     // Set UE security capability
     if let Some(ref sec_cap) = request.ue_security_capability {
@@ -290,6 +298,9 @@ pub fn handle_service_request(
     // Namf_EventExposure: the UE became reachable + location update
     crate::namf_server::fire_reachability_report(amf_ue, true);
     crate::namf_server::fire_location_report(amf_ue);
+    // #74's CONNECTIVITY_STATE_REPORT is NOT here either: this function's only
+    // callers are in `mod tests`. See the note in `handle_registration_request`; the
+    // live site is `ngap_path::handle_service_request_nas`.
 
     // Handle PDU session status
     if let Some(psi) = request.pdu_session_status {
