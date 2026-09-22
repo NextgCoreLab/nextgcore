@@ -20,6 +20,8 @@ pub mod service_name {
     pub const NAMF_EVTS: &str = "namf-evts";
     pub const NAMF_MT: &str = "namf-mt";
     pub const NAMF_LOC: &str = "namf-loc";
+    pub const NAMF_MBS_COMM: &str = "namf-mbs-comm";
+    pub const NAMF_MBS_BC: &str = "namf-mbs-bc";
     pub const NAUSF_AUTH: &str = "nausf-auth";
     pub const NUDM_UECM: &str = "nudm-uecm";
     pub const NUDM_SDM: &str = "nudm-sdm";
@@ -280,6 +282,177 @@ impl SbiXact {
 // SBI Path Functions
 // ============================================================================
 
+/// Every Namf service this AMF serves, with the NF types allowed to consume it
+/// (TS 29.510 §6.1.6.2.3 `NFService.allowedNfTypes`).
+///
+/// ONE table, consumed by both [`build_amf_nf_instance`] (the typed self
+/// instance) and [`amf_nf_profile_json`] (the NFProfile PUT to the NRF), so the
+/// two cannot drift. Before #392 the self instance carried `namf-comm` and
+/// `namf-evts` under a comment claiming four services, while the registered
+/// profile carried `namf-comm` alone — and the NRF filters discovery strictly on
+/// `nfServices[].serviceName` (`nrfd/src/nnrf_handler.rs`: a profile that offers
+/// none of the requested services is dropped from the `SearchResult`). So five of
+/// the six services this AMF really routes were undiscoverable.
+///
+/// Each entry is routed by `namf_server::namf_request_handler` with a handler that
+/// does real work; a service answered only by a 404/501 arm is deliberately NOT
+/// listed, because advertising it makes a consumer discover it, dial it and fail
+/// where it would otherwise have found no producer and said so.
+const AMF_SERVICES: &[(nextgcore_sbi::types::SbiServiceType, &[&str])] = &[
+    // TS 29.518 Namf_Communication (TS 23.501 Table 7.2.2-1). UE contexts,
+    // N1N2 message transfer, EBI assignment, and the inter-AMF context transfer.
+    (
+        nextgcore_sbi::types::SbiServiceType::NamfComm,
+        &["SMF", "AUSF", "UDM", "PCF", "NSSF", "LMF", "AMF", "SCP"],
+    ),
+    // TS 29.518 Namf_EventExposure. The DCCF selects an event-exposure producer
+    // by matching `serviceName` against `evts`/`eventexposure`, so an AMF that
+    // does not advertise this is invisible to data collection.
+    (
+        nextgcore_sbi::types::SbiServiceType::NamfEvts,
+        &["NWDAF", "DCCF", "NEF", "SMF", "PCF", "SCP"],
+    ),
+    // TS 29.518 Namf_MT: reachability and domain-selection info, consumed by the
+    // SMSF/UDM for mobile-terminated traffic.
+    (
+        nextgcore_sbi::types::SbiServiceType::NamfMt,
+        &["UDM", "SMSF", "SCP"],
+    ),
+    // TS 29.518 Namf_Location: ProvidePositioningInfo, consumed by the LMF/GMLC.
+    (
+        nextgcore_sbi::types::SbiServiceType::NamfLoc,
+        &["LMF", "GMLC", "SCP"],
+    ),
+    // TS 29.518 Namf_MBSCommunication (TS 23.247 §7.2.5.2): the MB-SMF's N2
+    // message transfer toward the NG-RAN.
+    (
+        nextgcore_sbi::types::SbiServiceType::NamfMbsComm,
+        &["MB_SMF", "SCP"],
+    ),
+    // TS 29.518 Namf_MBSBroadcast (TS 23.247 §7.3.1). #392: `mbsmfd` discovers
+    // the AMF with `service-names=namf-mbs-bc` (`mbsmfd/src/namf_client.rs`), and
+    // because this was absent the NRF returned no AMF and mbsmfd logged "no AMF
+    // advertises namf-mbs-bc" — a correct report of a defect in THIS profile.
+    (
+        nextgcore_sbi::types::SbiServiceType::NamfMbsBc,
+        &["MB_SMF", "SCP"],
+    ),
+];
+
+/// The NF types allowed to consume `service_name`, or an empty slice for a
+/// service this AMF does not serve.
+fn allowed_nf_types_for(service_name: &str) -> &'static [&'static str] {
+    AMF_SERVICES
+        .iter()
+        .find(|(t, _)| t.to_name() == service_name)
+        .map(|(_, allowed)| *allowed)
+        .unwrap_or(&[])
+}
+
+/// Build this AMF's typed self NF instance from [`AMF_SERVICES`].
+fn build_amf_nf_instance(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> NfInstance {
+    let mut nf_instance = NfInstance::new(nf_instance_id, nextgcore_sbi::types::NfType::Amf);
+    nf_instance.ipv4_addresses.push(sbi_addr.to_string());
+    nf_instance.heartbeat_interval = 10;
+
+    for (service_type, _allowed) in AMF_SERVICES {
+        let mut svc = NfService::new(service_type.to_name(), *service_type);
+        svc.versions = vec![api_version::V1.to_string()];
+        svc.port = sbi_port;
+        svc.ip_addresses.push(sbi_addr.to_string());
+        nf_instance.add_service(svc);
+    }
+
+    nf_instance
+}
+
+/// Serialise the AMF's NFProfile for NRF registration (TS 29.510 §6.1.6.2.2).
+///
+/// Split out of [`amf_nrf_register`] so a test can assert what this AMF
+/// advertises without standing up an NRF. Each service carries its own
+/// `ipEndPoints` (without which a consumer that discovers the service has no
+/// port to dial) and `allowedNfTypes`; the NF-level `allowedNfTypes` is the
+/// UNION over the services, since a consumer type barred at NF level can never
+/// reach any service.
+pub fn amf_nf_profile_json(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+) -> serde_json::Value {
+    let services: Vec<serde_json::Value> = AMF_SERVICES
+        .iter()
+        .map(|(service_type, allowed)| {
+            let name = service_type.to_name();
+            serde_json::json!({
+                "serviceInstanceId": format!("{nf_instance_id}-{name}"),
+                "serviceName": name,
+                "versions": [{
+                    "apiVersionInUri": api_version::V1,
+                    "apiFullVersion": api_version::V1_0_0,
+                }],
+                // Issue #63 criterion 2: follows the listener, never hardcoded.
+                "scheme": advertised_sbi_scheme(),
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{
+                    "ipv4Address": sbi_addr,
+                    "port": sbi_port
+                }],
+                "allowedNfTypes": allowed,
+            })
+        })
+        .collect();
+
+    // NF-level union over the per-service sets, de-duplicated and order-stable.
+    let mut nf_allowed: Vec<&str> = Vec::new();
+    for (_, allowed) in AMF_SERVICES {
+        for t in *allowed {
+            if !nf_allowed.contains(t) {
+                nf_allowed.push(t);
+            }
+        }
+    }
+
+    let mut nf_profile = serde_json::json!({
+        "nfInstanceId": nf_instance_id,
+        "nfType": "AMF",
+        "nfStatus": "REGISTERED",
+        "ipv4Addresses": [sbi_addr],
+        "nfServices": services,
+        "allowedNfTypes": nf_allowed,
+        "heartBeatTimer": 10
+    });
+
+    // #92: publish `amfInfo.guamiList` (TS 29.510 §6.1.6.2.4 `AmfInfo`), the GUAMIs
+    // this AMF serves. Without it there is nothing in the AMF's registered profile
+    // that identifies WHICH AMF it is, so a PCF holding a UE's serving-AMF GUAMI has
+    // no way to pick the right instance out of a multi-AMF SearchResult and must fall
+    // back to the first one — the #92 defect, from the other end. The PLMN/AMF-ID are
+    // the configured `served_guami`, i.e. the same values the AMF puts in its
+    // `Nudm_UECM` registration and its `PolicyAssociationRequest`, so the PCF's
+    // client-side check compares like with like.
+    //
+    // Omitted rather than faked when no GUAMI is configured: an `amfInfo` with an
+    // empty `guamiList` would claim this AMF serves nothing, and a PCF would exclude
+    // it from every GUAMI match instead of falling back to it.
+    let guami_list = served_guami_list_json();
+    if !guami_list.is_empty() {
+        if let Some(obj) = nf_profile.as_object_mut() {
+            obj.insert(
+                "amfInfo".to_string(),
+                serde_json::json!({ "guamiList": guami_list }),
+            );
+        }
+    } else {
+        log::warn!(
+            "AMF NRF registration carries no amfInfo.guamiList (no GUAMI configured). A PCF \
+             cannot identify this AMF as a UE's serving AMF and will fall back to whichever \
+             AMF the NRF lists first (#92)."
+        );
+    }
+
+    nf_profile
+}
+
 /// Initialize AMF SBI - build self NF instance and store in SBI context
 pub fn amf_sbi_open() -> SbiResult<()> {
     log::info!("AMF SBI opening...");
@@ -294,22 +467,9 @@ pub fn amf_sbi_open() -> SbiResult<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(7777);
 
-    let mut nf_instance = NfInstance::new(&nf_instance_id, nextgcore_sbi::types::NfType::Amf);
-    nf_instance.ipv4_addresses.push(sbi_addr.clone());
-
-    // Register Namf services: namf-comm, namf-evts, namf-mt, namf-loc
-    let mut comm_service =
-        NfService::new("namf-comm", nextgcore_sbi::types::SbiServiceType::NamfComm);
-    comm_service.versions = vec!["v1".to_string()];
-    comm_service.port = sbi_port;
-    comm_service.ip_addresses.push(sbi_addr.clone());
-    nf_instance.add_service(comm_service);
-
-    let mut evts_service =
-        NfService::new("namf-evts", nextgcore_sbi::types::SbiServiceType::NamfEvts);
-    evts_service.versions = vec!["v1".to_string()];
-    evts_service.port = sbi_port;
-    nf_instance.add_service(evts_service);
+    // From the SHARED table, so the self instance advertises exactly what the
+    // NRF profile does (#392).
+    let nf_instance = build_amf_nf_instance(&nf_instance_id, &sbi_addr, sbi_port);
 
     // Store self NF instance in global SBI context
     let sbi_ctx = global_context();
@@ -367,54 +527,11 @@ pub async fn amf_nrf_register(sbi_addr: &str, sbi_port: u16) -> Result<String, S
         nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf)
             .to_string();
 
-    let mut nf_profile = serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "AMF",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": [{
-            "serviceInstanceId": format!("{nf_instance_id}-namf-comm"),
-            "serviceName": "namf-comm",
-            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-            // Issue #63 criterion 2: follows the listener, never hardcoded.
-            "scheme": advertised_sbi_scheme(),
-            "nfServiceStatus": "REGISTERED",
-            "ipEndPoints": [{
-                "ipv4Address": sbi_addr,
-                "port": sbi_port
-            }]
-        }],
-        "allowedNfTypes": ["SMF", "AUSF", "UDM", "PCF", "NSSF"],
-        "heartBeatTimer": 10
-    });
-
-    // #92: publish `amfInfo.guamiList` (TS 29.510 §6.1.6.2.4 `AmfInfo`), the GUAMIs
-    // this AMF serves. Without it there is nothing in the AMF's registered profile
-    // that identifies WHICH AMF it is, so a PCF holding a UE's serving-AMF GUAMI has
-    // no way to pick the right instance out of a multi-AMF SearchResult and must fall
-    // back to the first one — the #92 defect, from the other end. The PLMN/AMF-ID are
-    // the configured `served_guami`, i.e. the same values the AMF puts in its
-    // `Nudm_UECM` registration and its `PolicyAssociationRequest`, so the PCF's
-    // client-side check compares like with like.
-    //
-    // Omitted rather than faked when no GUAMI is configured: an `amfInfo` with an
-    // empty `guamiList` would claim this AMF serves nothing, and a PCF would exclude
-    // it from every GUAMI match instead of falling back to it.
-    let guami_list = served_guami_list_json();
-    if !guami_list.is_empty() {
-        if let Some(obj) = nf_profile.as_object_mut() {
-            obj.insert(
-                "amfInfo".to_string(),
-                serde_json::json!({ "guamiList": guami_list }),
-            );
-        }
-    } else {
-        log::warn!(
-            "AMF NRF registration carries no amfInfo.guamiList (no GUAMI configured). A PCF \
-             cannot identify this AMF as a UE's serving AMF and will fall back to whichever \
-             AMF the NRF lists first (#92)."
-        );
-    }
+    // #392: built by `amf_nf_profile_json` from the shared `AMF_SERVICES` table,
+    // so the registered profile advertises every Namf service `namf_server`
+    // actually routes. It was an inline literal here advertising `namf-comm`
+    // alone, which made five routed services undiscoverable.
+    let nf_profile = amf_nf_profile_json(&nf_instance_id, sbi_addr, sbi_port);
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");
@@ -428,16 +545,12 @@ pub async fn amf_nrf_register(sbi_addr: &str, sbi_port: u16) -> Result<String, S
         200 | 201 => {
             log::info!("AMF registered with NRF (id={nf_instance_id})");
 
-            // Update self instance in SBI context
-            let mut self_instance =
-                NfInstance::new(&nf_instance_id, nextgcore_sbi::types::NfType::Amf);
-            self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
-            let mut svc =
-                NfService::new("namf-comm", nextgcore_sbi::types::SbiServiceType::NamfComm);
-            svc.port = sbi_port;
-            svc.ip_addresses = vec![sbi_addr.to_string()];
-            self_instance.add_service(svc);
-            sbi_ctx.set_self_instance(self_instance).await;
+            // Refresh the self instance from the SAME table the profile came
+            // from: it used to be rebuilt here with `namf-comm` only, which
+            // silently narrowed what `amf_sbi_open` had published.
+            sbi_ctx
+                .set_self_instance(build_amf_nf_instance(&nf_instance_id, sbi_addr, sbi_port))
+                .await;
 
             Ok(nf_instance_id)
         }
@@ -2724,6 +2837,120 @@ mod tests {
     #[test]
     fn test_nsacf_service_name() {
         assert_eq!(SbiServiceType::NnsacfNsac.service_name(), "nnsacf-nsac");
+    }
+
+    /// The service names present in an NFProfile's `nfServices`, in order.
+    fn advertised_service_names(profile: &serde_json::Value) -> Vec<String> {
+        profile["nfServices"]
+            .as_array()
+            .expect("nfServices is an array")
+            .iter()
+            .map(|s| s["serviceName"].as_str().expect("serviceName").to_string())
+            .collect()
+    }
+
+    /// #392: the registered NFProfile advertises EVERY Namf service
+    /// `namf_server::namf_request_handler` routes — not just `namf-comm`.
+    ///
+    /// Positive assertions on each name, because the NRF filters discovery
+    /// strictly on `nfServices[].serviceName` (`nrfd`'s `nnrf_handler`: a profile
+    /// offering none of the requested services is dropped from the
+    /// `SearchResult`). A service that is routed and working but absent from the
+    /// profile is undiscoverable, and the sharpest case was a live cross-NF
+    /// break: `mbsmfd` discovers the AMF with `service-names=namf-mbs-bc`, so
+    /// MBS broadcast bring-up over discovery could not work at all.
+    ///
+    /// Asserting "more than one service" or "no duplicate id" would pass on an
+    /// AMF advertising the wrong two, so each name is named.
+    #[test]
+    fn the_amf_profile_advertises_every_routed_namf_service() {
+        let profile = amf_nf_profile_json("amf-test-instance", "10.45.0.5", 7777);
+        let names = advertised_service_names(&profile);
+
+        for expected in [
+            service_name::NAMF_COMM,
+            service_name::NAMF_EVTS,
+            service_name::NAMF_MT,
+            service_name::NAMF_LOC,
+            service_name::NAMF_MBS_COMM,
+            service_name::NAMF_MBS_BC,
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "the AMF routes {expected} but does not advertise it; the NRF filters \
+                 discovery on serviceName, so no consumer can find it. Advertised: {names:?}"
+            );
+        }
+
+        // Each service must carry an endpoint of its own: a consumer that
+        // discovers the service otherwise has no port to dial.
+        for svc in profile["nfServices"].as_array().expect("nfServices") {
+            let name = svc["serviceName"].as_str().unwrap_or_default();
+            let eps = svc["ipEndPoints"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name} carries no ipEndPoints"));
+            assert_eq!(
+                eps[0]["port"].as_u64(),
+                Some(7777),
+                "{name} must advertise the listener's port"
+            );
+            assert_eq!(eps[0]["ipv4Address"].as_str(), Some("10.45.0.5"));
+            assert!(
+                svc["allowedNfTypes"]
+                    .as_array()
+                    .is_some_and(|a| !a.is_empty()),
+                "{name} must state which NF types may consume it (TS 29.510 §6.1.6.2.3)"
+            );
+        }
+
+        // `mbsmfd` filters on this exact name; pin it as the wire literal.
+        assert!(
+            names.iter().any(|n| n == "namf-mbs-bc"),
+            "mbsmfd discovers the AMF by the literal `namf-mbs-bc`"
+        );
+
+        // The NF-level allowedNfTypes is the union: a type barred here can never
+        // reach any service, so it must include every per-service consumer.
+        let nf_level: Vec<&str> = profile["allowedNfTypes"]
+            .as_array()
+            .expect("NF-level allowedNfTypes")
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default())
+            .collect();
+        assert!(
+            nf_level.contains(&"MB_SMF"),
+            "MB_SMF consumes namf-mbs-bc, so it cannot be barred at NF level: {nf_level:?}"
+        );
+        assert!(nf_level.contains(&"LMF"), "LMF consumes namf-loc");
+    }
+
+    /// #392: the typed self instance and the registered profile advertise the
+    /// SAME surface, because both are rendered from `AMF_SERVICES`.
+    ///
+    /// The self instance used to be built with `namf-comm` + `namf-evts` under a
+    /// comment claiming four services, while the profile carried `namf-comm`
+    /// alone — three different answers to "what does this AMF serve".
+    #[test]
+    fn the_amf_self_instance_matches_the_registered_profile() {
+        let instance = build_amf_nf_instance("amf-test-instance", "10.45.0.5", 7777);
+        let profile = amf_nf_profile_json("amf-test-instance", "10.45.0.5", 7777);
+
+        let mut from_instance: Vec<String> =
+            instance.services.iter().map(|s| s.name.clone()).collect();
+        let mut from_profile = advertised_service_names(&profile);
+        from_instance.sort();
+        from_profile.sort();
+
+        assert_eq!(
+            from_instance, from_profile,
+            "the self instance and the NRF profile must advertise one surface; they are \
+             two renderings of AMF_SERVICES"
+        );
+        assert_eq!(
+            from_instance.len(),
+            AMF_SERVICES.len(),
+            "every table entry must reach the self instance"
+        );
     }
 
     /// #92: the `amfInfo.guamiList` this AMF publishes to the NRF and the `guami` it

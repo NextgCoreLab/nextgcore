@@ -1224,6 +1224,94 @@ async fn handle_pfcp_session_report(
     }
 }
 
+/// Every Nsmf service this SMF serves, with the NF types allowed to consume it
+/// (TS 29.510 §6.1.6.2.3 `NFService.allowedNfTypes`).
+///
+/// ONE table, consumed by both [`build_smf_nf_instance`] (the typed self
+/// instance) and [`build_smf_nf_profile`] (the NFProfile PUT to the NRF), so the
+/// two cannot drift (#392).
+///
+/// `nsmf-callback` is deliberately absent: a callback is dialled at the absolute
+/// `notificationUri` this SMF handed a peer, never discovered by service name,
+/// and TS 23.501 Table 7.2.3-1 does not list it as an SMF service.
+const SMF_SERVICES: &[(nextgcore_sbi::types::SbiServiceType, &[&str])] = &[
+    // TS 29.502 Nsmf_PDUSession (TS 23.501 Table 7.2.3-1), consumed by the AMF;
+    // SCP is allowed because it proxies on the AMF's behalf.
+    (
+        nextgcore_sbi::types::SbiServiceType::NsmfPdusession,
+        &["AMF", "SCP"],
+    ),
+    // TS 29.508 Nsmf_EventExposure (TS 23.501 Table 7.2.3-1). #392: routed by
+    // `smf_sbi_request_handler` with a real subscription store, but absent from
+    // the registered profile — and the NRF filters discovery on
+    // `nfServices[].serviceName`, so no consumer could find it. The DCCF selects
+    // an event-exposure producer by matching `serviceName` against
+    // `eventexposure`/`evts` (`dccfd/src/coordination.rs`), so an unadvertised
+    // `nsmf-event-exposure` made this SMF invisible to data collection.
+    (
+        nextgcore_sbi::types::SbiServiceType::NsmfEventExposure,
+        &["NWDAF", "DCCF", "NEF", "PCF", "AF", "SCP"],
+    ),
+];
+
+/// Build this SMF's typed self NF instance from [`SMF_SERVICES`].
+fn build_smf_nf_instance(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> NfInstance {
+    let mut self_instance = NfInstance::new(nf_instance_id, nextgcore_sbi::types::NfType::Smf);
+    self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
+    self_instance.heartbeat_interval = 10;
+    for (service_type, _allowed) in SMF_SERVICES {
+        let mut svc = NfService::new(service_type.to_name(), *service_type);
+        svc.port = sbi_port;
+        svc.ip_addresses = vec![sbi_addr.to_string()];
+        self_instance.add_service(svc);
+    }
+    self_instance
+}
+
+/// Build the SMF's NFProfile for NRF registration (TS 29.510 §6.1.6.2.2).
+///
+/// Split out of [`smf_nrf_register`] so a test can assert the advertised service
+/// list without standing up an NRF. Each service carries its own `ipEndPoints`
+/// (without which a consumer that discovers the service has no port to dial) and
+/// `allowedNfTypes`; the NF-level `allowedNfTypes` is the UNION over the
+/// services, since a type barred at NF level can never reach any service.
+fn build_smf_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
+    let services: Vec<serde_json::Value> = SMF_SERVICES
+        .iter()
+        .map(|(service_type, allowed)| {
+            let name = service_type.to_name();
+            serde_json::json!({
+                "serviceInstanceId": format!("{nf_instance_id}-{name}"),
+                "serviceName": name,
+                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+                "scheme": "http",
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
+                "allowedNfTypes": allowed,
+            })
+        })
+        .collect();
+
+    let mut nf_allowed: Vec<&str> = Vec::new();
+    for (_, allowed) in SMF_SERVICES {
+        for t in *allowed {
+            if !nf_allowed.contains(t) {
+                nf_allowed.push(t);
+            }
+        }
+    }
+
+    serde_json::json!({
+        "nfInstanceId": nf_instance_id,
+        "nfType": "SMF",
+        "nfStatus": "REGISTERED",
+        "ipv4Addresses": [sbi_addr],
+        "nfServices": services,
+        "allowedNfTypes": nf_allowed,
+        "heartBeatTimer": 10
+    })
+}
+
 /// Register SMF NF instance with NRF
 ///
 /// Sends PUT /nnrf-nfm/v1/nf-instances/{nfInstanceId} to NRF
@@ -1251,25 +1339,7 @@ async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<
         nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Smf)
             .to_string();
 
-    let nf_profile = serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "SMF",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": [{
-            "serviceInstanceId": format!("{nf_instance_id}-nsmf-pdusession"),
-            "serviceName": "nsmf-pdusession",
-            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-            "scheme": "http",
-            "nfServiceStatus": "REGISTERED",
-            "ipEndPoints": [{
-                "ipv4Address": sbi_addr,
-                "port": sbi_port
-            }]
-        }],
-        "allowedNfTypes": ["AMF"],
-        "heartBeatTimer": 10
-    });
+    let nf_profile = build_smf_nf_profile(&nf_instance_id, sbi_addr, sbi_port);
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");
@@ -1283,18 +1353,11 @@ async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<
         200 | 201 => {
             log::info!("SMF registered with NRF (id={nf_instance_id})");
 
-            // Store self instance in SBI context
-            let mut self_instance =
-                NfInstance::new(&nf_instance_id, nextgcore_sbi::types::NfType::Smf);
-            self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
-            let mut svc = NfService::new(
-                "nsmf-pdusession",
-                nextgcore_sbi::types::SbiServiceType::NsmfPdusession,
-            );
-            svc.port = sbi_port;
-            svc.ip_addresses = vec![sbi_addr.to_string()];
-            self_instance.add_service(svc);
-            sbi_ctx.set_self_instance(self_instance).await;
+            // Store the self instance from the SAME table the profile came from:
+            // it used to be built here with `nsmf-pdusession` alone (#392).
+            sbi_ctx
+                .set_self_instance(build_smf_nf_instance(&nf_instance_id, sbi_addr, sbi_port))
+                .await;
 
             Ok(nf_instance_id)
         }
@@ -6306,6 +6369,94 @@ mod tests {
         // scrapes 172.23.0.4 on, and the port the healthcheck curls. A default that
         // drifted from those would leave the gate polling a closed socket.
         assert_eq!(metrics_addr().port(), 9090);
+    }
+
+    // ------------------------------------------------------------------
+    // NRF profile: one registration, the whole routed surface (#392)
+    // ------------------------------------------------------------------
+
+    /// #392: the registered NFProfile advertises `nsmf-event-exposure` as well as
+    /// `nsmf-pdusession`.
+    ///
+    /// Positive on both names. `nsmf-event-exposure` is routed by
+    /// `smf_sbi_request_handler` against a real subscription store, but was absent
+    /// from the profile — and the NRF filters discovery strictly on
+    /// `nfServices[].serviceName`, so no consumer could find it. The DCCF selects
+    /// an event-exposure producer by matching `serviceName` against
+    /// `eventexposure`/`evts` (`dccfd`'s `coordination.rs`), so this SMF was
+    /// invisible to data collection.
+    #[test]
+    fn the_smf_profile_advertises_both_routed_nsmf_services() {
+        let profile = build_smf_nf_profile("smf-test-instance", "10.45.0.6", 7777);
+        let names: Vec<&str> = profile["nfServices"]
+            .as_array()
+            .expect("nfServices")
+            .iter()
+            .map(|s| s["serviceName"].as_str().expect("serviceName"))
+            .collect();
+
+        assert!(names.contains(&"nsmf-pdusession"), "advertised: {names:?}");
+        assert!(
+            names.contains(&"nsmf-event-exposure"),
+            "the SMF routes nsmf-event-exposure but does not advertise it, so the NRF drops \
+             this SMF from any SearchResult filtered on that service. Advertised: {names:?}"
+        );
+
+        // A callback is dialled at the absolute notificationUri this SMF handed a
+        // peer, never discovered; TS 23.501 Table 7.2.3-1 does not list it.
+        assert!(
+            !names.contains(&"nsmf-callback"),
+            "nsmf-callback is not a discoverable service"
+        );
+
+        for svc in profile["nfServices"].as_array().expect("nfServices") {
+            let name = svc["serviceName"].as_str().unwrap_or_default();
+            let eps = svc["ipEndPoints"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name} carries no ipEndPoints"));
+            assert_eq!(eps[0]["port"].as_u64(), Some(7777), "{name} port");
+            assert!(
+                svc["allowedNfTypes"]
+                    .as_array()
+                    .is_some_and(|a| !a.is_empty()),
+                "{name} must state its allowedNfTypes (TS 29.510 §6.1.6.2.3)"
+            );
+        }
+
+        // DCCF consumes the event feed, so it cannot be barred at NF level.
+        let nf_level: Vec<&str> = profile["allowedNfTypes"]
+            .as_array()
+            .expect("allowedNfTypes")
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default())
+            .collect();
+        assert!(nf_level.contains(&"AMF"), "{nf_level:?}");
+        assert!(nf_level.contains(&"DCCF"), "{nf_level:?}");
+    }
+
+    /// #392: the typed self instance and the registered profile advertise the SAME
+    /// surface, because both render `SMF_SERVICES`.
+    #[test]
+    fn the_smf_self_instance_matches_the_registered_profile() {
+        let instance = build_smf_nf_instance("smf-test-instance", "10.45.0.6", 7777);
+        let profile = build_smf_nf_profile("smf-test-instance", "10.45.0.6", 7777);
+
+        let mut from_instance: Vec<String> =
+            instance.services.iter().map(|s| s.name.clone()).collect();
+        let mut from_profile: Vec<String> = profile["nfServices"]
+            .as_array()
+            .expect("nfServices")
+            .iter()
+            .map(|s| s["serviceName"].as_str().unwrap_or_default().to_string())
+            .collect();
+        from_instance.sort();
+        from_profile.sort();
+
+        assert_eq!(
+            from_instance, from_profile,
+            "the self instance carried nsmf-pdusession alone while the profile is table-driven"
+        );
+        assert_eq!(from_instance.len(), SMF_SERVICES.len());
     }
 
     // ------------------------------------------------------------------

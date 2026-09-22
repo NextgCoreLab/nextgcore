@@ -2820,6 +2820,101 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
     }
 }
 
+/// Every Nnssf service this NSSF serves: the service type, the API version in the
+/// URI, the full version, and the NF types allowed to consume it (TS 29.510
+/// §6.1.6.2.3 `NFService.allowedNfTypes`).
+///
+/// ONE table (#392), consumed by both [`build_nssf_nf_instance`] (the typed self
+/// instance) and [`build_nssf_nf_profile`] (the NFProfile PUT to the NRF).
+///
+/// The per-service version is normative and differs: TS 29.531 defines
+/// Nnssf_NSSelection at v2 and Nnssf_NSSAIAvailability at v1.
+const NSSF_SERVICES: &[(nextgcore_sbi::types::SbiServiceType, &str, &str, &[&str])] = &[
+    // TS 29.531 Nnssf_NSSelection, consumed by the AMF (and the SMF for slice
+    // re-selection); SCP proxies on their behalf.
+    (
+        nextgcore_sbi::types::SbiServiceType::NnssfNsselection,
+        "v2",
+        "2.2.0",
+        &["AMF", "SMF", "SCP"],
+    ),
+    // TS 29.531 Nnssf_NSSAIAvailability: the AMF reports per-TA slice
+    // availability; a peer NSSF subscribes to it.
+    (
+        nextgcore_sbi::types::SbiServiceType::NnssfNssaiavailability,
+        "v1",
+        "1.2.0",
+        &["AMF", "NSSF", "SCP"],
+    ),
+];
+
+/// Build this NSSF's typed self NF instance from [`NSSF_SERVICES`].
+fn build_nssf_nf_instance(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+) -> nextgcore_sbi::context::NfInstance {
+    let mut self_instance =
+        nextgcore_sbi::context::NfInstance::new(nf_instance_id, nextgcore_sbi::types::NfType::Nssf);
+    self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
+    self_instance.heartbeat_interval = 10;
+    for (service_type, uri_version, _full, _allowed) in NSSF_SERVICES {
+        let mut svc = nextgcore_sbi::context::NfService::new(service_type.to_name(), *service_type);
+        svc.versions = vec![uri_version.to_string()];
+        svc.port = sbi_port;
+        svc.ip_addresses = vec![sbi_addr.to_string()];
+        self_instance.add_service(svc);
+    }
+    self_instance
+}
+
+/// Build the NSSF's NFProfile for NRF registration (TS 29.510 §6.1.6.2.2).
+///
+/// Split out of [`register_with_nrf`] so the advertised service list and versions
+/// are assertable without standing up an NRF. Each service carries its own
+/// `ipEndPoints` and `allowedNfTypes`; the NF-level `allowedNfTypes` is the UNION
+/// over the services, since a type barred at NF level can never reach any
+/// service.
+fn build_nssf_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
+    let services: Vec<serde_json::Value> = NSSF_SERVICES
+        .iter()
+        .map(|(service_type, uri_version, full_version, allowed)| {
+            let name = service_type.to_name();
+            serde_json::json!({
+                "serviceInstanceId": format!("{nf_instance_id}-{name}"),
+                "serviceName": name,
+                "versions": [{
+                    "apiVersionInUri": uri_version,
+                    "apiFullVersion": full_version,
+                }],
+                "scheme": "http",
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
+                "allowedNfTypes": allowed,
+            })
+        })
+        .collect();
+
+    let mut nf_allowed: Vec<&str> = Vec::new();
+    for (_, _, _, allowed) in NSSF_SERVICES {
+        for t in *allowed {
+            if !nf_allowed.contains(t) {
+                nf_allowed.push(t);
+            }
+        }
+    }
+
+    serde_json::json!({
+        "nfInstanceId": nf_instance_id,
+        "nfType": "NSSF",
+        "nfStatus": "REGISTERED",
+        "ipv4Addresses": [sbi_addr],
+        "nfServices": services,
+        "allowedNfTypes": nf_allowed,
+        "heartBeatTimer": 10
+    })
+}
+
 /// Register NSSF with NRF (B24.3)
 ///
 /// Returns the NF instance ID so callers can start a heartbeat worker.
@@ -2843,35 +2938,7 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
 
     let nf_instance_id = nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::Nssf).to_string();
 
-    let nf_profile = serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "NSSF",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": [{
-            "serviceInstanceId": format!("{}-nnssf-nsselection", nf_instance_id),
-            "serviceName": "nnssf-nsselection",
-            "versions": [{"apiVersionInUri": "v2", "apiFullVersion": "2.2.0"}],
-            "scheme": "http",
-            "nfServiceStatus": "REGISTERED",
-            "ipEndPoints": [{
-                "ipv4Address": sbi_addr,
-                "port": sbi_port
-            }]
-        }, {
-            "serviceInstanceId": format!("{}-nnssf-nssaiavailability", nf_instance_id),
-            "serviceName": "nnssf-nssaiavailability",
-            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.2.0"}],
-            "scheme": "http",
-            "nfServiceStatus": "REGISTERED",
-            "ipEndPoints": [{
-                "ipv4Address": sbi_addr,
-                "port": sbi_port
-            }]
-        }],
-        "allowedNfTypes": ["AMF", "SCP", "NSSF"],
-        "heartBeatTimer": 10
-    });
+    let nf_profile = build_nssf_nf_profile(&nf_instance_id, sbi_addr, sbi_port);
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");
@@ -2885,29 +2952,11 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
         200 | 201 => {
             log::info!("NSSF registered with NRF successfully (id={nf_instance_id})");
 
-            let mut self_instance = nextgcore_sbi::context::NfInstance::new(
-                &nf_instance_id,
-                nextgcore_sbi::types::NfType::Nssf,
-            );
-            self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
-
-            let mut svc = nextgcore_sbi::context::NfService::new(
-                "nnssf-nsselection",
-                nextgcore_sbi::types::SbiServiceType::NnssfNsselection,
-            );
-            svc.port = sbi_port;
-            svc.ip_addresses = vec![sbi_addr.to_string()];
-            self_instance.add_service(svc);
-
-            let mut svc2 = nextgcore_sbi::context::NfService::new(
-                "nnssf-nssaiavailability",
-                nextgcore_sbi::types::SbiServiceType::NnssfNssaiavailability,
-            );
-            svc2.port = sbi_port;
-            svc2.ip_addresses = vec![sbi_addr.to_string()];
-            self_instance.add_service(svc2);
-
-            sbi_ctx.set_self_instance(self_instance).await;
+            // From the SAME table the profile came from, so the self instance
+            // cannot advertise a different surface or a different version (#392).
+            sbi_ctx
+                .set_self_instance(build_nssf_nf_instance(&nf_instance_id, sbi_addr, sbi_port))
+                .await;
 
             Ok(nf_instance_id)
         }
@@ -3206,6 +3255,80 @@ mod tests {
         assert_eq!(params.get("nf-type").map(String::as_str), Some("AMF"));
         assert_eq!(params.get("j").map(String::as_str), Some(r#"{"sst":1}"#));
         assert_eq!(params.get("empty").map(String::as_str), Some(""));
+    }
+
+    /// #392: the registered NFProfile advertises both Nnssf services at their own
+    /// normative versions, and the typed self instance advertises the SAME surface
+    /// at the SAME versions.
+    ///
+    /// The self instance used to be built with a second hand-written service list
+    /// that carried the default `v1` for BOTH services — so the self instance said
+    /// `nnssf-nsselection` is v1 while the registered profile said v2 (TS 29.531).
+    #[test]
+    fn the_nssf_profile_and_self_instance_advertise_one_surface() {
+        let profile = build_nssf_nf_profile("nssf-test-instance", "10.45.0.15", 7777);
+        let services = profile["nfServices"].as_array().expect("nfServices");
+        let names: Vec<&str> = services
+            .iter()
+            .map(|s| s["serviceName"].as_str().expect("serviceName"))
+            .collect();
+
+        assert!(
+            names.contains(&"nnssf-nsselection"),
+            "advertised: {names:?}"
+        );
+        assert!(
+            names.contains(&"nnssf-nssaiavailability"),
+            "advertised: {names:?}"
+        );
+
+        // The two versions differ; both are pinned per TS 29.531.
+        let selection = services
+            .iter()
+            .find(|s| s["serviceName"] == "nnssf-nsselection")
+            .expect("nnssf-nsselection");
+        assert_eq!(selection["versions"][0]["apiVersionInUri"], "v2");
+        assert_eq!(selection["versions"][0]["apiFullVersion"], "2.2.0");
+        let availability = services
+            .iter()
+            .find(|s| s["serviceName"] == "nnssf-nssaiavailability")
+            .expect("nnssf-nssaiavailability");
+        assert_eq!(availability["versions"][0]["apiVersionInUri"], "v1");
+
+        for svc in services {
+            let name = svc["serviceName"].as_str().unwrap_or_default();
+            let eps = svc["ipEndPoints"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name} carries no ipEndPoints"));
+            assert_eq!(eps[0]["port"].as_u64(), Some(7777), "{name} port");
+            assert!(
+                svc["allowedNfTypes"]
+                    .as_array()
+                    .is_some_and(|a| !a.is_empty()),
+                "{name} must state its allowedNfTypes (TS 29.510 §6.1.6.2.3)"
+            );
+        }
+
+        // The self instance must agree on BOTH the names and the versions.
+        let instance = build_nssf_nf_instance("nssf-test-instance", "10.45.0.15", 7777);
+        let mut from_instance: Vec<String> =
+            instance.services.iter().map(|s| s.name.clone()).collect();
+        let mut from_profile: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        from_instance.sort();
+        from_profile.sort();
+        assert_eq!(from_instance, from_profile);
+        assert_eq!(from_instance.len(), NSSF_SERVICES.len());
+
+        let selection_instance = instance
+            .services
+            .iter()
+            .find(|s| s.name == "nnssf-nsselection")
+            .expect("nnssf-nsselection in the self instance");
+        assert_eq!(
+            selection_instance.versions,
+            vec!["v2".to_string()],
+            "the self instance advertised the default v1 while the profile said v2"
+        );
     }
 
     #[test]

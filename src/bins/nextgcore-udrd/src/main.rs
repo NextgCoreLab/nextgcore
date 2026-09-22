@@ -3960,32 +3960,69 @@ async fn run_event_loop_async(shutdown: Arc<AtomicBool>) -> Result<()> {
     Ok(())
 }
 
+/// Every Nudr service this UDR serves: the service name, the API version it is
+/// defined at, and the NF types allowed to consume it (TS 29.510 §6.1.6.2.3
+/// `NFService.allowedNfTypes`).
+///
+/// ONE table (#392), so the advertised surface is stated in a single place. The
+/// per-service version is normative and differs between the two: TS 29.504
+/// §6.1.1 says "The `<apiVersion>` shall be v2" for **Nudr_DataRepository**,
+/// while `TS29504_Nudr_GroupIDmap.yaml` fixes Nudr_GroupIDmap at
+/// `{apiRoot}/nudr-group-id-map/v1`.
+const UDR_SERVICES: &[(&str, &str, &[&str])] = &[
+    // TS 29.504 Nudr_DataRepository.
+    ("nudr-dr", "v2", &["UDM", "PCF", "AUSF", "NEF", "SCP"]),
+    // TS 29.504 Nudr_GroupIDmap, routed by `handle_group_id_map` since #87.
+    // #392: it was routed and working but absent from the registered profile, and
+    // the NRF filters discovery on `nfServices[].serviceName`, so a UDM or AUSF
+    // resolving a subscriber's NF-group could not find this UDR by service name.
+    ("nudr-group-id-map", "v1", &["UDM", "AUSF", "NRF", "SCP"]),
+];
+
 /// Build the UDR's NFProfile for NRF registration (TS 29.510 §6.1.6.2.2).
 ///
-/// Split out of `register_with_nrf` so the advertised API version can be
-/// asserted without standing up an NRF. **Nudr_DataRepository is v2**
-/// (TS 29.504 §6.1.1, "The `<apiVersion>` shall be v2"), unlike
-/// Nnrf_NFManagement which the UDR consumes at v1.
+/// Split out of `register_with_nrf` so the advertised service list and API
+/// versions can be asserted without standing up an NRF. Each service carries its
+/// own `ipEndPoints` (without which a consumer that discovers the service has no
+/// port to dial) and `allowedNfTypes`; the NF-level `allowedNfTypes` is the UNION
+/// over the services, since a type barred at NF level can never reach any
+/// service.
 fn build_udr_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
+    let services: Vec<serde_json::Value> = UDR_SERVICES
+        .iter()
+        .map(|(name, version, allowed)| {
+            serde_json::json!({
+                "serviceInstanceId": format!("{nf_instance_id}-{name}"),
+                "serviceName": name,
+                // apiFullVersion must agree with the URI version, not lag it.
+                "versions": [{
+                    "apiVersionInUri": version,
+                    "apiFullVersion": format!("{}.0.0", version.trim_start_matches('v')),
+                }],
+                "scheme": "http",
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
+                "allowedNfTypes": allowed,
+            })
+        })
+        .collect();
+
+    let mut nf_allowed: Vec<&str> = Vec::new();
+    for (_, _, allowed) in UDR_SERVICES {
+        for t in *allowed {
+            if !nf_allowed.contains(t) {
+                nf_allowed.push(t);
+            }
+        }
+    }
+
     serde_json::json!({
         "nfInstanceId": nf_instance_id,
         "nfType": "UDR",
         "nfStatus": "REGISTERED",
         "ipv4Addresses": [sbi_addr],
-        "nfServices": [
-            {
-                "serviceInstanceId": format!("{nf_instance_id}-nudr-dr"),
-                "serviceName": "nudr-dr",
-                // TS 29.504 §6.1.1: "The <apiVersion> shall be v2" for
-                // Nudr_DataRepository. Advertising v1 while the PCF already
-                // called v2 meant discovery and the live consumer disagreed.
-                "versions": [{"apiVersionInUri": "v2", "apiFullVersion": "2.0.0"}],
-                "scheme": "http",
-                "nfServiceStatus": "REGISTERED",
-                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-            }
-        ],
-        "allowedNfTypes": ["UDM", "PCF", "AUSF", "SCP"],
+        "nfServices": services,
+        "allowedNfTypes": nf_allowed,
         "heartBeatTimer": 10
     })
 }
@@ -4083,6 +4120,61 @@ mod tests {
         );
         // apiFullVersion must track the URI version rather than lag it.
         assert_eq!(service["versions"][0]["apiFullVersion"], "2.0.0");
+    }
+
+    /// #392: the registered NFProfile advertises `nudr-group-id-map` as well as
+    /// `nudr-dr`, each at its own normative version.
+    ///
+    /// Positive on both names. Nudr_GroupIDmap has been routed by
+    /// `handle_group_id_map` since #87, but was absent from the registered
+    /// profile — and the NRF filters discovery strictly on
+    /// `nfServices[].serviceName`, so a UDM or AUSF resolving a subscriber's
+    /// NF-group could not find this UDR by service name.
+    ///
+    /// The versions differ and both are pinned: TS 29.504 §6.1.1 puts
+    /// Nudr_DataRepository at v2, while `TS29504_Nudr_GroupIDmap.yaml` fixes
+    /// Nudr_GroupIDmap at `{apiRoot}/nudr-group-id-map/v1`. Advertising one
+    /// version for both would break whichever side is enforced.
+    #[test]
+    fn the_udr_profile_advertises_both_routed_nudr_services() {
+        let profile = build_udr_nf_profile("udr-test-instance", "10.45.0.11", 7777);
+        let services = profile["nfServices"].as_array().expect("nfServices");
+        let names: Vec<&str> = services
+            .iter()
+            .map(|s| s["serviceName"].as_str().expect("serviceName"))
+            .collect();
+
+        assert!(names.contains(&"nudr-dr"), "advertised: {names:?}");
+        assert!(
+            names.contains(&"nudr-group-id-map"),
+            "the UDR routes /nudr-group-id-map/v1/nf-group-ids but does not advertise the \
+             service, so the NRF drops this UDR from a SearchResult filtered on it. \
+             Advertised: {names:?}"
+        );
+
+        let group_map = services
+            .iter()
+            .find(|s| s["serviceName"] == "nudr-group-id-map")
+            .expect("nudr-group-id-map must be registered");
+        assert_eq!(
+            group_map["versions"][0]["apiVersionInUri"], "v1",
+            "Nudr_GroupIDmap is v1 (TS29504_Nudr_GroupIDmap.yaml server url), unlike nudr-dr"
+        );
+        assert_eq!(group_map["versions"][0]["apiFullVersion"], "1.0.0");
+
+        for svc in services {
+            let name = svc["serviceName"].as_str().unwrap_or_default();
+            let eps = svc["ipEndPoints"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name} carries no ipEndPoints"));
+            assert_eq!(eps[0]["port"].as_u64(), Some(7777), "{name} port");
+            assert!(
+                svc["allowedNfTypes"]
+                    .as_array()
+                    .is_some_and(|a| !a.is_empty()),
+                "{name} must state its allowedNfTypes (TS 29.510 §6.1.6.2.3)"
+            );
+        }
     }
 
     #[test]

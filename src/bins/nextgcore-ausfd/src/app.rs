@@ -1772,38 +1772,96 @@ async fn send_udm_auth_result(
     Ok(())
 }
 
-/// Build the TS 29.510 NFProfile the AUSF registers with the NRF.
+/// Every Nausf service this AUSF serves, with the NF types allowed to consume it
+/// (TS 29.510 §6.1.6.2.3 `NFService.allowedNfTypes`).
+///
+/// ONE table (#392), consumed by both [`build_ausf_nf_instance`] (the typed self
+/// instance) and [`build_nf_profile`] (the NFProfile PUT to the NRF), so the two
+/// cannot drift.
+const AUSF_SERVICES: &[(nextgcore_sbi::types::SbiServiceType, &[&str])] = &[
+    // TS 29.509 Nausf_UEAuthentication, consumed by the AMF.
+    (
+        nextgcore_sbi::types::SbiServiceType::NausfAuth,
+        &["AMF", "SCP"],
+    ),
+    // TS 29.509 Nausf_SoRProtection. Wave-6 F-03: the UDM discovers the AUSF
+    // holding the latest K_AUSF BY SERVICE NAME (TS 33.501 §6.14.2.1 step 8), so
+    // this must appear in the profile for SoR protection to be reachable at all.
+    (
+        nextgcore_sbi::types::SbiServiceType::NausfSorprotection,
+        &["UDM", "SCP"],
+    ),
+    // TS 29.509 Nausf_UPUProtection, same discovery path.
+    (
+        nextgcore_sbi::types::SbiServiceType::NausfUpuprotection,
+        &["UDM", "SCP"],
+    ),
+];
+
+/// Build this AUSF's typed self NF instance from [`AUSF_SERVICES`].
+fn build_ausf_nf_instance(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+) -> nextgcore_sbi::context::NfInstance {
+    let mut self_instance =
+        nextgcore_sbi::context::NfInstance::new(nf_instance_id, nextgcore_sbi::types::NfType::Ausf);
+    self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
+    self_instance.heartbeat_interval = 10;
+    for (service_type, _allowed) in AUSF_SERVICES {
+        let mut svc = nextgcore_sbi::context::NfService::new(service_type.to_name(), *service_type);
+        svc.port = sbi_port;
+        svc.ip_addresses = vec![sbi_addr.to_string()];
+        self_instance.add_service(svc);
+    }
+    self_instance
+}
+
+/// Build the TS 29.510 §6.1.6.2.2 NFProfile the AUSF registers with the NRF.
 ///
 /// Advertises nausf-auth plus the Wave-6 F-03 producer services
 /// nausf-sorprotection / nausf-upuprotection (TS 29.509), so udmd
 /// discovery-by-service works (TS 33.501 §6.14.2.1 step 8: the UDM selects
-/// the AUSF holding the latest KAUSF). UDM — the consumer of both new
-/// services — is included in allowedNfTypes.
+/// the AUSF holding the latest KAUSF).
+///
+/// #392: rendered from [`AUSF_SERVICES`], with per-service `allowedNfTypes` and an
+/// NF-level union, so the profile and the self instance cannot drift.
 fn build_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
-    let service = |name: &str| {
-        serde_json::json!({
-            "serviceInstanceId": format!("{nf_instance_id}-{name}"),
-            "serviceName": name,
-            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-            "scheme": "http",
-            "nfServiceStatus": "REGISTERED",
-            "ipEndPoints": [{
-                "ipv4Address": sbi_addr,
-                "port": sbi_port
-            }]
+    let services: Vec<serde_json::Value> = AUSF_SERVICES
+        .iter()
+        .map(|(service_type, allowed)| {
+            let name = service_type.to_name();
+            serde_json::json!({
+                "serviceInstanceId": format!("{nf_instance_id}-{name}"),
+                "serviceName": name,
+                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+                "scheme": "http",
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{
+                    "ipv4Address": sbi_addr,
+                    "port": sbi_port
+                }],
+                "allowedNfTypes": allowed,
+            })
         })
-    };
+        .collect();
+
+    let mut nf_allowed: Vec<&str> = Vec::new();
+    for (_, allowed) in AUSF_SERVICES {
+        for t in *allowed {
+            if !nf_allowed.contains(t) {
+                nf_allowed.push(t);
+            }
+        }
+    }
+
     serde_json::json!({
         "nfInstanceId": nf_instance_id,
         "nfType": "AUSF",
         "nfStatus": "REGISTERED",
         "ipv4Addresses": [sbi_addr],
-        "nfServices": [
-            service("nausf-auth"),
-            service("nausf-sorprotection"),
-            service("nausf-upuprotection")
-        ],
-        "allowedNfTypes": ["AMF", "UDM", "SCP"],
+        "nfServices": services,
+        "allowedNfTypes": nf_allowed,
         "heartBeatTimer": 10
     })
 }
@@ -1850,32 +1908,11 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
         200 | 201 => {
             log::info!("AUSF registered with NRF successfully (id={nf_instance_id})");
 
-            // Store self instance
-            let mut self_instance = nextgcore_sbi::context::NfInstance::new(
-                &nf_instance_id,
-                nextgcore_sbi::types::NfType::Ausf,
-            );
-            self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
-            for (name, service_type) in [
-                (
-                    "nausf-auth",
-                    nextgcore_sbi::types::SbiServiceType::NausfAuth,
-                ),
-                (
-                    "nausf-sorprotection",
-                    nextgcore_sbi::types::SbiServiceType::NausfSorprotection,
-                ),
-                (
-                    "nausf-upuprotection",
-                    nextgcore_sbi::types::SbiServiceType::NausfUpuprotection,
-                ),
-            ] {
-                let mut svc = nextgcore_sbi::context::NfService::new(name, service_type);
-                svc.port = sbi_port;
-                svc.ip_addresses = vec![sbi_addr.to_string()];
-                self_instance.add_service(svc);
-            }
-            sbi_ctx.set_self_instance(self_instance).await;
+            // Store the self instance from the SAME table the profile came from:
+            // this was a second hand-written service list (#392).
+            sbi_ctx
+                .set_self_instance(build_ausf_nf_instance(&nf_instance_id, sbi_addr, sbi_port))
+                .await;
 
             // Extract heartbeat interval from response
             if let Some(ref body) = response.http.content {
@@ -3585,7 +3622,44 @@ mod tests {
         for svc in profile["nfServices"].as_array().unwrap() {
             assert_eq!(svc["versions"][0]["apiVersionInUri"], "v1");
             assert_eq!(svc["ipEndPoints"][0]["port"], 7777);
+            // #392: and its own consumer set (TS 29.510 §6.1.6.2.3).
+            let name = svc["serviceName"].as_str().unwrap_or_default();
+            assert!(
+                svc["allowedNfTypes"]
+                    .as_array()
+                    .is_some_and(|a| !a.is_empty()),
+                "{name} must state which NF types may consume it"
+            );
         }
+    }
+
+    /// #392: the typed self instance and the registered profile advertise the SAME
+    /// surface, because both render `AUSF_SERVICES`.
+    ///
+    /// They were two hand-written service lists that happened to agree. A third
+    /// Nausf service added to one and not the other would have been a silent
+    /// divergence, which is the shape #237 recorded for `pcfd`.
+    #[test]
+    fn the_ausf_self_instance_matches_the_registered_profile() {
+        let instance = build_ausf_nf_instance("ausf-test-instance", "10.45.0.16", 7777);
+        let profile = build_nf_profile("ausf-test-instance", "10.45.0.16", 7777);
+
+        let mut from_instance: Vec<String> =
+            instance.services.iter().map(|s| s.name.clone()).collect();
+        let mut from_profile: Vec<String> = profile["nfServices"]
+            .as_array()
+            .expect("nfServices")
+            .iter()
+            .map(|s| s["serviceName"].as_str().unwrap_or_default().to_string())
+            .collect();
+        from_instance.sort();
+        from_profile.sort();
+
+        assert_eq!(from_instance, from_profile);
+        assert_eq!(from_instance.len(), AUSF_SERVICES.len());
+        // The two services the UDM discovers BY NAME must both be present.
+        assert!(from_instance.iter().any(|n| n == "nausf-sorprotection"));
+        assert!(from_instance.iter().any(|n| n == "nausf-upuprotection"));
     }
 
     /// curl-shaped acceptance test for F-03: a real 5G-AKA authentication

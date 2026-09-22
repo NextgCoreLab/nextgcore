@@ -344,6 +344,90 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Every Ndccf service this DCCF serves, with the NF types allowed to consume it
+/// (TS 29.510 §6.1.6.2.3 `NFService.allowedNfTypes`).
+///
+/// ONE table, consumed by both [`build_dccf_nf_instance`] (the typed self
+/// instance) and [`build_dccf_nf_profile`] (the NFProfile PUT to the NRF), so the
+/// two cannot drift (#392).
+const DCCF_SERVICES: &[(nextgcore_sbi::types::SbiServiceType, &[&str])] = &[
+    // TS 29.574 Ndccf_DataManagement (TS 23.288 §8.2).
+    (
+        nextgcore_sbi::types::SbiServiceType::NdccfDatamanagement,
+        &["NWDAF", "AMF", "SMF", "PCF", "NEF", "SCP"],
+    ),
+    // TS 29.574 Ndccf_ContextManagement (TS 23.288 §8.3), served at
+    // `/ndccf-contextdocument/v1/contexts`. #392: routed with a real context
+    // store but absent from the registered profile, and the NRF filters
+    // discovery on `nfServices[].serviceName`, so no consumer could find it.
+    (
+        nextgcore_sbi::types::SbiServiceType::NdccfContextdocument,
+        &["NWDAF", "SCP"],
+    ),
+];
+
+/// Build this DCCF's typed self NF instance from [`DCCF_SERVICES`].
+fn build_dccf_nf_instance(
+    nf_instance_id: &str,
+    sbi_addr: &str,
+    sbi_port: u16,
+) -> nextgcore_sbi::context::NfInstance {
+    let mut self_instance =
+        nextgcore_sbi::context::NfInstance::new(nf_instance_id, nextgcore_sbi::types::NfType::Dccf);
+    self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
+    self_instance.heartbeat_interval = 10;
+    for (service_type, _allowed) in DCCF_SERVICES {
+        let mut svc = nextgcore_sbi::context::NfService::new(service_type.to_name(), *service_type);
+        svc.port = sbi_port;
+        svc.ip_addresses = vec![sbi_addr.to_string()];
+        self_instance.add_service(svc);
+    }
+    self_instance
+}
+
+/// Build the DCCF's NFProfile for NRF registration (TS 29.510 §6.1.6.2.2).
+///
+/// Split out of [`register_with_nrf`] so a test can assert the advertised service
+/// list without standing up an NRF. Each service carries its own `ipEndPoints`
+/// and `allowedNfTypes`; the NF-level `allowedNfTypes` is the UNION over the
+/// services, since a type barred at NF level can never reach any service.
+fn build_dccf_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> serde_json::Value {
+    let services: Vec<serde_json::Value> = DCCF_SERVICES
+        .iter()
+        .map(|(service_type, allowed)| {
+            let name = service_type.to_name();
+            serde_json::json!({
+                "serviceInstanceId": format!("{nf_instance_id}-{name}"),
+                "serviceName": name,
+                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+                "scheme": "http",
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
+                "allowedNfTypes": allowed,
+            })
+        })
+        .collect();
+
+    let mut nf_allowed: Vec<&str> = Vec::new();
+    for (_, allowed) in DCCF_SERVICES {
+        for t in *allowed {
+            if !nf_allowed.contains(t) {
+                nf_allowed.push(t);
+            }
+        }
+    }
+
+    serde_json::json!({
+        "nfInstanceId": nf_instance_id,
+        "nfType": "DCCF",
+        "nfStatus": "REGISTERED",
+        "ipv4Addresses": [sbi_addr],
+        "nfServices": services,
+        "allowedNfTypes": nf_allowed,
+        "heartBeatTimer": 10
+    })
+}
+
 /// Register DCCF with NRF
 async fn register_with_nrf(
     sbi_addr: &str,
@@ -366,22 +450,7 @@ async fn register_with_nrf(
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
 
-    let nf_profile = serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "DCCF",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": [{
-            "serviceInstanceId": format!("{}-ndccf-datamanagement", nf_instance_id),
-            "serviceName": "ndccf-datamanagement",
-            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-            "scheme": "http",
-            "nfServiceStatus": "REGISTERED",
-            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-        }],
-        "allowedNfTypes": ["NWDAF", "AMF", "SMF", "PCF"],
-        "heartBeatTimer": 10
-    });
+    let nf_profile = build_dccf_nf_profile(nf_instance_id, sbi_addr, sbi_port);
 
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
     log::debug!("NRF registration: PUT {path}");
@@ -395,19 +464,11 @@ async fn register_with_nrf(
         200 | 201 => {
             log::info!("DCCF registered with NRF successfully (id={nf_instance_id})");
 
-            let mut self_instance = nextgcore_sbi::context::NfInstance::new(
-                nf_instance_id,
-                nextgcore_sbi::types::NfType::Dccf,
-            );
-            self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
-            let mut svc = nextgcore_sbi::context::NfService::new(
-                "ndccf-datamanagement",
-                nextgcore_sbi::types::SbiServiceType::NdccfDatamanagement,
-            );
-            svc.port = sbi_port;
-            svc.ip_addresses = vec![sbi_addr.to_string()];
-            self_instance.add_service(svc);
-            sbi_ctx.set_self_instance(self_instance).await;
+            // From the SAME table the profile came from: it used to be built here
+            // with `ndccf-datamanagement` alone (#392).
+            sbi_ctx
+                .set_self_instance(build_dccf_nf_instance(nf_instance_id, sbi_addr, sbi_port))
+                .await;
 
             Ok(())
         }
@@ -868,6 +929,72 @@ mod data_management_tests {
             .await
             .expect("consumer server start");
         (server, port, seen)
+    }
+
+    /// #392: the registered NFProfile advertises `ndccf-contextdocument` as well
+    /// as `ndccf-datamanagement`.
+    ///
+    /// Positive on both names. `ndccf-contextdocument` (TS 29.574 §5.3 /
+    /// TS 23.288 §8.3 Ndccf_ContextManagement) is routed against a real context
+    /// store, but was absent from the registered profile — and the NRF filters
+    /// discovery strictly on `nfServices[].serviceName`, so an NWDAF registering
+    /// an analytics context could not find this DCCF by service name.
+    #[test]
+    fn the_dccf_profile_advertises_both_routed_ndccf_services() {
+        let profile = build_dccf_nf_profile("dccf-test-instance", "10.45.0.12", 7813);
+        let names: Vec<&str> = profile["nfServices"]
+            .as_array()
+            .expect("nfServices")
+            .iter()
+            .map(|s| s["serviceName"].as_str().expect("serviceName"))
+            .collect();
+
+        assert!(
+            names.contains(&"ndccf-datamanagement"),
+            "advertised: {names:?}"
+        );
+        assert!(
+            names.contains(&"ndccf-contextdocument"),
+            "the DCCF routes /ndccf-contextdocument/v1/contexts but does not advertise the \
+             service, so the NRF drops this DCCF from a SearchResult filtered on it. \
+             Advertised: {names:?}"
+        );
+
+        for svc in profile["nfServices"].as_array().expect("nfServices") {
+            let name = svc["serviceName"].as_str().unwrap_or_default();
+            let eps = svc["ipEndPoints"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name} carries no ipEndPoints"));
+            assert_eq!(eps[0]["port"].as_u64(), Some(7813), "{name} port");
+            assert!(
+                svc["allowedNfTypes"]
+                    .as_array()
+                    .is_some_and(|a| !a.is_empty()),
+                "{name} must state its allowedNfTypes (TS 29.510 §6.1.6.2.3)"
+            );
+        }
+    }
+
+    /// #392: the typed self instance and the registered profile advertise the SAME
+    /// surface, because both render `DCCF_SERVICES`.
+    #[test]
+    fn the_dccf_self_instance_matches_the_registered_profile() {
+        let instance = build_dccf_nf_instance("dccf-test-instance", "10.45.0.12", 7813);
+        let profile = build_dccf_nf_profile("dccf-test-instance", "10.45.0.12", 7813);
+
+        let mut from_instance: Vec<String> =
+            instance.services.iter().map(|s| s.name.clone()).collect();
+        let mut from_profile: Vec<String> = profile["nfServices"]
+            .as_array()
+            .expect("nfServices")
+            .iter()
+            .map(|s| s["serviceName"].as_str().unwrap_or_default().to_string())
+            .collect();
+        from_instance.sort();
+        from_profile.sort();
+
+        assert_eq!(from_instance, from_profile);
+        assert_eq!(from_instance.len(), DCCF_SERVICES.len());
     }
 
     /// #112 acceptance: a subscription supplying `notificURI` receives its

@@ -2138,4 +2138,140 @@ mod audience_binding_guards {
              nextgcore_sbi::nf_instance_id::nf_instance_id(NfType::X) instead."
         );
     }
+
+    /// Issue #392: each daemon performs **exactly ONE** NF registration.
+    ///
+    /// A daemon with two registration paths PUTs two NFProfiles to
+    /// `/nnrf-nfm/v1/nf-instances/{id}` per startup. Since #187 both carry the
+    /// same `nfInstanceId`, so the second is an idempotent overwrite rather than a
+    /// duplicate entry — which makes the defect SILENT: the profile the NRF serves
+    /// to discovery is whichever PUT landed last, and the two profiles are never
+    /// identical in practice. PR #237 found this for `pcfd` ("each profile missing
+    /// what the other had"); #392 found `bsfd` still doing it and `udmd` carrying a
+    /// dead second registration function.
+    ///
+    /// A source guard rather than a runtime assertion because the second PUT is
+    /// only observable against a live NRF, and the Docker E2E that stands one up is
+    /// `schedule || workflow_dispatch` — so a PR could not see it. Counted per
+    /// crate: a `put_json`/`SbiRequest::put` whose path is
+    /// `/nnrf-nfm/v1/nf-instances/{...}` and whose body is an NF profile.
+    #[test]
+    fn each_daemon_registers_with_the_nrf_exactly_once() {
+        let bins = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("crate is at <root>/libs/nextgcore-sbi")
+            .join("bins");
+        assert!(bins.is_dir(), "expected {} to exist", bins.display());
+
+        // The registration path literal. A PUT to this resource with a profile
+        // body IS an NFRegister (TS 29.510 §5.2.2.2.1); a PATCH to it is a
+        // heartbeat and a DELETE is a deregister, so only PUT is counted.
+        const REG_PATH: &str = "/nnrf-nfm/v1/nf-instances/";
+
+        let mut per_crate: Vec<(String, Vec<String>)> = Vec::new();
+
+        for entry in std::fs::read_dir(&bins).expect("read bins/") {
+            let path = entry.expect("dir entry").path();
+            let crate_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            // nrfd is the NRF: it SERVES this resource rather than registering.
+            if crate_name == "nextgcore-nrfd" {
+                continue;
+            }
+            let src = path.join("src");
+            if !src.is_dir() {
+                continue;
+            }
+            let mut sites = Vec::new();
+            for file in std::fs::read_dir(&src).expect("read src/") {
+                let f = file.expect("file entry").path();
+                if f.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&f).unwrap_or_default();
+                let lines: Vec<&str> = text.lines().collect();
+                for (n, line) in lines.iter().enumerate() {
+                    if !line.contains(REG_PATH) {
+                        continue;
+                    }
+                    // Only a `let <var> = format!(".../nf-instances/{...}")`
+                    // that is then PUT. Look ahead a short window for the PUT so
+                    // doc comments, heartbeat PATCHes and deregister DELETEs on
+                    // the same literal are not counted.
+                    if line.trim_start().starts_with("//") || line.trim_start().starts_with("///") {
+                        continue;
+                    }
+                    let window = lines[n..lines.len().min(n + 12)].join("\n");
+                    let is_put = window.contains(".put_json(")
+                        || window.contains("SbiRequest::put(")
+                        || window.contains("SbiRequest::put(&");
+                    if !is_put {
+                        continue;
+                    }
+                    // A PUT of a *profile*, not of some other resource that
+                    // happens to sit below in the window.
+                    let puts_a_profile = window.contains("nf_profile")
+                        || window.contains("&body")
+                        || window.contains("profile");
+                    if !puts_a_profile {
+                        continue;
+                    }
+                    sites.push(format!(
+                        "{}:{}",
+                        f.file_name().unwrap_or_default().to_string_lossy(),
+                        n + 1
+                    ));
+                }
+            }
+            if !sites.is_empty() {
+                sites.sort();
+                per_crate.push((crate_name, sites));
+            }
+        }
+
+        assert!(
+            !per_crate.is_empty(),
+            "the guard found no NF registration at all, so it is no longer checking anything \
+             — the path literal {REG_PATH:?} has probably moved behind a helper"
+        );
+
+        // POSITIVE: the ten crates #392 names must each still register. A crate
+        // that registers ZERO times would satisfy a "no duplicate" check while
+        // being undiscoverable, which is worse than the defect.
+        for expected in [
+            "nextgcore-amfd",
+            "nextgcore-ausfd",
+            "nextgcore-bsfd",
+            "nextgcore-dccfd",
+            "nextgcore-lmfd",
+            "nextgcore-mbsmfd",
+            "nextgcore-nssfd",
+            "nextgcore-smfd",
+            "nextgcore-udmd",
+            "nextgcore-udrd",
+        ] {
+            assert!(
+                per_crate.iter().any(|(c, _)| c == expected),
+                "{expected} performs NO NRF registration; #392 requires exactly one. \
+                 An NF that never registers is undiscoverable, so this is not an \
+                 improvement over registering twice."
+            );
+        }
+
+        let duplicates: Vec<_> = per_crate
+            .iter()
+            .filter(|(_, sites)| sites.len() > 1)
+            .collect();
+        assert!(
+            duplicates.is_empty(),
+            "these daemons PUT more than one NFProfile to {REG_PATH}{{id}} per startup: \
+             {duplicates:?}. Both PUTs carry the same nfInstanceId since #187, so the second \
+             silently overwrites the first and the profile the NRF serves is decided by \
+             ordering rather than by anyone's intent (#392). Register ONCE, from a single \
+             serialiser fed by one service table, after the SBI listener accepts."
+        );
+    }
 }

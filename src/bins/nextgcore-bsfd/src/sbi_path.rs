@@ -61,6 +61,35 @@ fn parse_uri_host_port(uri_str: &str) -> Result<(String, u16), String> {
     Ok((host.to_string(), port))
 }
 
+/// Every service this BSF serves, with the NF types allowed to consume it
+/// (TS 29.510 §6.1.6.2.3 `NFService.allowedNfTypes`).
+///
+/// ONE table, consumed by [`build_bsf_nf_instance`] here and by
+/// `lib.rs`'s `bsf_nf_profile_json`, so the self instance and the registered
+/// NFProfile cannot disagree (#392).
+///
+/// TS 23.501 §6.2.19 and TS 29.521 define the BSF as a producer of binding
+/// management only; it originates no service request in that role, so this is
+/// the whole advertised surface.
+pub const BSF_SERVICES: &[(SbiServiceType, &[&str])] = &[
+    // TS 29.521 Nbsf_Management. The PCF registers and the AF/NEF/SMF look up
+    // PCF bindings; SCP is allowed because it proxies on their behalf.
+    (
+        SbiServiceType::NbsfManagement,
+        &["PCF", "AF", "NEF", "SMF", "SCP"],
+    ),
+];
+
+/// The NF types allowed to consume `service_name`, or an empty slice for a
+/// service this BSF does not serve.
+pub fn allowed_nf_types_for(service_name: &str) -> &'static [&'static str] {
+    BSF_SERVICES
+        .iter()
+        .find(|(t, _)| t.to_name() == service_name)
+        .map(|(_, allowed)| *allowed)
+        .unwrap_or(&[])
+}
+
 /// Build the BSF NF instance with service information
 fn build_bsf_nf_instance(config: &SbiServerConfig) -> NfInstance {
     // Issue #187: the BSF's self NF instance must carry the SAME nfInstanceId its
@@ -78,74 +107,34 @@ fn build_bsf_nf_instance(config: &SbiServerConfig) -> NfInstance {
         UriScheme::Http
     };
 
-    // nbsf-management service (allowed: PCF, AF)
-    let mut bsf_svc = NfService::new(
-        SbiServiceType::NbsfManagement.to_name(),
-        SbiServiceType::NbsfManagement,
-    );
-    bsf_svc.scheme = scheme;
-    bsf_svc.ip_addresses.push(config.addr.clone());
-    bsf_svc.port = config.port;
-    nf_instance.add_service(bsf_svc);
+    for (service_type, _allowed) in BSF_SERVICES {
+        let mut svc = NfService::new(service_type.to_name(), *service_type);
+        svc.scheme = scheme;
+        svc.ip_addresses.push(config.addr.clone());
+        svc.port = config.port;
+        nf_instance.add_service(svc);
+    }
 
     nf_instance
 }
 
-/// Register BSF NF instance with NRF
-async fn register_with_nrf(nrf_uri: &str, nf_instance: &NfInstance) -> Result<(), String> {
-    let (host, port) = parse_uri_host_port(nrf_uri)?;
-
-    let ctx = global_context();
-    let client = ctx.get_client(&host, port).await;
-
-    let register_path = format!("/nnrf-nfm/v1/nf-instances/{}", nf_instance.id);
-
-    let body = serde_json::json!({
-        "nfInstanceId": nf_instance.id,
-        "nfType": "BSF",
-        "nfStatus": "REGISTERED",
-        "heartBeatTimer": nf_instance.heartbeat_interval,
-        "ipv4Addresses": nf_instance.ipv4_addresses,
-        "nfServices": nf_instance.services.iter().map(|s| {
-            serde_json::json!({
-                "serviceName": s.name,
-                "versions": s.versions.iter().map(|v| {
-                    serde_json::json!({"apiVersionInUri": v, "apiFullVersion": format!("{}.0.0", v)})
-                }).collect::<Vec<_>>(),
-                "scheme": s.scheme.as_str(),
-                "nfServiceStatus": "REGISTERED",
-            })
-        }).collect::<Vec<_>>(),
-    });
-
-    match client.put_json(&register_path, &body).await {
-        Ok(response) => {
-            let status = response.status;
-            if status == 200 || status == 201 {
-                log::info!(
-                    "BSF registered with NRF (id={}, status={})",
-                    nf_instance.id,
-                    status
-                );
-                Ok(())
-            } else {
-                log::warn!(
-                    "NRF registration returned status {}: {:?}",
-                    status,
-                    response.http.content
-                );
-                Ok(())
-            }
-        }
-        Err(e) => {
-            log::warn!("NRF registration failed (BSF will operate standalone): {e}");
-            Ok(())
-        }
-    }
-}
-
-/// Open SBI server and register with NRF
-/// Port of bsf_sbi_open
+/// Open the SBI server context: publish the self NF instance and the NRF URI.
+///
+/// Port of bsf_sbi_open.
+///
+/// #392: this function used to also PUT an NFProfile to the NRF, so every BSF
+/// startup registered TWICE — once here and once from `lib.rs` after the
+/// listener came up. Both now target the same `nfInstanceId` (#187), so the
+/// second was an idempotent overwrite, and the profile the NRF served was
+/// whichever PUT landed last. The two were not equivalent: this one carried no
+/// per-service `ipEndPoints` and no `allowedNfTypes`, so a consumer that
+/// discovered `nbsf-management` from it had no port to dial. Worse, it fired
+/// BEFORE `sbi_server.start()`, advertising an endpoint that would have refused
+/// the first consumer to connect.
+///
+/// Registration therefore happens exactly once, from `lib.rs`'s
+/// `register_with_nrf`, after the listener accepts. This is the same treatment
+/// PR #237 applied to `pcfd`.
 pub fn bsf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
     if SBI_SERVER_RUNNING.load(Ordering::SeqCst) {
         return Err("SBI server already running".to_string());
@@ -155,28 +144,22 @@ pub fn bsf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
 
     log::info!("Opening BSF SBI server on {}:{}", config.addr, config.port);
 
-    // Build and register the BSF NF instance
     let nf_instance = build_bsf_nf_instance(&config);
     let nf_id = nf_instance.id.clone();
     let nrf_uri_clone = config.nrf_uri.clone();
-    let nf_clone = nf_instance.clone();
 
-    // Attempt async registration (only if tokio runtime is available)
     let sbi_ctx = global_context();
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(async move {
-            sbi_ctx.set_self_instance(nf_clone).await;
+            sbi_ctx.set_self_instance(nf_instance).await;
             if let Some(ref nrf_uri) = nrf_uri_clone {
                 sbi_ctx.set_nrf_uri(nrf_uri).await;
-                if let Err(e) = register_with_nrf(nrf_uri, &nf_instance).await {
-                    log::error!("Failed to register BSF with NRF: {e}");
-                }
             } else {
                 log::info!("No NRF URI configured, BSF running in standalone mode");
             }
         });
     } else {
-        log::debug!("No tokio runtime available, skipping async NRF registration");
+        log::debug!("No tokio runtime available, skipping self-instance publication");
     }
 
     log::info!("BSF NF instance built (id={nf_id})");
