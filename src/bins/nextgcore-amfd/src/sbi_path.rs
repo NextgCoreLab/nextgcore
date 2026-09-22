@@ -2117,6 +2117,355 @@ pub async fn call_amf_registration_status_update(
     Ok(())
 }
 
+// ============================================================================
+// Nlmf_Location consumer (#74, TS 29.518 §5.5.2.2 / TS 23.273 §6.1)
+// ============================================================================
+
+/// Whether `provide-pos-info` drives the LMF (default ON).
+///
+/// `AMF_NAMF_LOC_LMF=off` (also `0`/`false`, case-insensitive) restores the pre-#74
+/// answer: the stored NGAP cell identity with no LMF round trip. A runtime env switch
+/// rather than the cargo feature #74 suggests, because a feature-gated branch is
+/// outside `cargo test --workspace` — the CI gate — so it would ship unexercised.
+/// Mirrors [`ue_policy_assoc_enabled`] exactly, including the pure classifier.
+pub fn namf_loc_lmf_enabled() -> bool {
+    namf_loc_lmf_enabled_value(std::env::var("AMF_NAMF_LOC_LMF").ok().as_deref())
+}
+
+/// Pure classifier behind [`namf_loc_lmf_enabled`] (env-free for tests).
+fn namf_loc_lmf_enabled_value(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("off") | Some("0") | Some("false")
+    )
+}
+
+/// Resolve an LMF endpoint: NRF discovery first, then the configured fallback.
+///
+/// Not an arm of [`resolve_nf_endpoint_async`] only because that function's match
+/// enumerates *this crate's* local `SbiServiceType`, which has no LMF variant; the
+/// shape — cache, on-demand discovery, env fallback — is the same and deliberately
+/// so.
+///
+/// `LMF_SBI_ADDR` is the addressless fallback a bring-up with no NRF needs. It is
+/// consulted AFTER discovery and logged when used, so it cannot silently stand in for
+/// discovery in a deployment that has an NRF.
+async fn resolve_lmf_endpoint() -> Option<(String, u16)> {
+    let sbi_ctx = global_context();
+    let service = nextgcore_sbi::types::SbiServiceType::NlmfLoc;
+    let endpoint_from_cache = |instances: Vec<NfInstance>| {
+        let inst = instances.first()?;
+        let svc = inst.find_service(service)?;
+        let host = svc
+            .ip_addresses
+            .first()
+            .or(inst.ipv4_addresses.first())
+            .or(svc.fqdn.as_ref())
+            .or(inst.fqdn.as_ref())?;
+        Some((host.clone(), svc.port))
+    };
+
+    if let Some(ep) = endpoint_from_cache(sbi_ctx.find_nf_instances_by_service(service).await) {
+        return Some(ep);
+    }
+    if amf_nrf_discover("LMF", "nlmf-loc").await.is_ok() {
+        if let Some(ep) = endpoint_from_cache(sbi_ctx.find_nf_instances_by_service(service).await) {
+            return Some(ep);
+        }
+    }
+
+    let host = std::env::var("LMF_SBI_ADDR").ok()?;
+    let port = std::env::var("LMF_SBI_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(7777);
+    log::info!("No LMF discoverable via the NRF; using the configured LMF_SBI_ADDR={host}:{port}");
+    Some((host, port))
+}
+
+/// `Nlmf_Location_DetermineLocation`: POST /nlmf-loc/v1/determine-location
+/// (TS 29.572 §6.1.4.2, driven by TS 29.518 §5.5.2.2.1 / TS 23.273 §6.1).
+///
+/// The AMF is the consumer here. §5.5.2.2.1 is explicit that
+/// `ProvidePositioningInfo` *"triggers the AMF to invoke the service towards the LMF"*
+/// (`29518-k00.txt:6505`), and `lmfd` has served this endpoint all along with no
+/// consumer — `lmfd/src/main.rs:376-378`.
+///
+/// `request_pos_info` is the GMLC's `RequestPosInfo` body, whose relevant members are
+/// carried through rather than reinterpreted: `locationQoS`, `supportedGADShapes` and
+/// `lcsClientType` (as `externalClientType`) are what actually change the LMF's
+/// answer. The SUPI and the serving NCGI come from the AMF's own state — they are what
+/// the AMF knows and the LMF does not.
+///
+/// Returns the LMF's `LocationData` JSON verbatim, because `ProvidePosInfo`
+/// (`TS29518_Namf_Location.yaml:369-429`) and TS 29.572's `LocationData` share
+/// `locationEstimate`, `accuracyFulfilmentIndicator`, `ageOfLocationEstimate`,
+/// `positioningDataList`, `velocityEstimate`, `civicAddress`, `altitude` and
+/// `barometricPressure` by name. Re-encoding member by member would be an
+/// opportunity to drop one.
+pub async fn call_lmf_determine_location(
+    ue: &AmfUe,
+    request_pos_info: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let Some(supi) = ue.supi.as_deref() else {
+        // Without a SUPI the LMF cannot page or address the UE, and inventing one is
+        // not an option. Reported as an error so the caller degrades to the NGAP
+        // answer rather than sending a request that cannot be served.
+        return Err("the UE context carries no SUPI to position".to_string());
+    };
+    let (lmf_host, lmf_port) = resolve_lmf_endpoint().await.ok_or_else(|| {
+        "no LMF endpoint (NRF discovery found none, LMF_SBI_ADDR unset)".to_string()
+    })?;
+
+    let mut input = serde_json::json!({ "supi": supi });
+    // The cell the AMF has the UE in: `InputData.ncgi` (TS 29.572 §6.1.6.2.2). This is
+    // the E-CID starting point for the LMF's solve, and the AMF is the only party
+    // that has it.
+    input["ncgi"] = serde_json::json!({
+        "plmnId": { "mcc": ue.nr_cgi.plmn_id.mcc(), "mnc": ue.nr_cgi.plmn_id.mnc() },
+        "nrCellId": format!("{:09X}", ue.nr_cgi.cell_id & 0xF_FFFF_FFFF),
+    });
+    if let Some(gpsi) = ue.gpsi.as_deref() {
+        input["gpsi"] = serde_json::json!(gpsi);
+    }
+    if let Some(pei) = ue.pei.as_deref() {
+        input["pei"] = serde_json::json!(pei);
+    }
+    // Carried through from the GMLC's request: these are the members that change what
+    // the LMF computes, and dropping them would answer a different question than the
+    // one asked.
+    if let Some(qos) = request_pos_info.get("locationQoS") {
+        input["locationQoS"] = qos.clone();
+    }
+    if let Some(shapes) = request_pos_info.get("supportedGADShapes") {
+        input["supportedGADShapes"] = shapes.clone();
+    }
+    if let Some(client_type) = request_pos_info.get("lcsClientType") {
+        input["externalClientType"] = client_type.clone();
+    }
+    if let Some(priority) = request_pos_info.get("priority") {
+        input["priority"] = priority.clone();
+    }
+    if let Some(corr) = request_pos_info.get("lcsCorrelationId") {
+        input["correlationID"] = corr.clone();
+    }
+
+    let client = crate::attach_oauth2(
+        SbiClient::for_peer(&lmf_host, lmf_port),
+        nextgcore_sbi::types::NfType::Lmf,
+    );
+    let response = client
+        .post_json("/nlmf-loc/v1/determine-location", &input)
+        .await
+        .map_err(|e| format!("DetermineLocation request to {lmf_host}:{lmf_port} failed: {e}"))?;
+
+    // 204 is the LMF accepting a DEFERRED request (TS 29.572 §6.1.4.2.2): there is no
+    // position in it, so it must not be reported as one.
+    if response.status == 204 {
+        return Err("the LMF accepted the request as deferred (204); no position yet".to_string());
+    }
+    if !response.is_success() {
+        return Err(format!(
+            "LMF returned status {} for DetermineLocation",
+            response.status
+        ));
+    }
+    let body = response
+        .http
+        .content
+        .ok_or_else(|| "empty DetermineLocation response".to_string())?;
+    let location: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("malformed DetermineLocation response: {e}"))?;
+    // A 200 with no `locationEstimate` is not a position. Reported as a failure so the
+    // caller degrades rather than answering the GMLC with an empty success.
+    if location.get("locationEstimate").is_none() {
+        return Err("the LMF answered 200 with no locationEstimate".to_string());
+    }
+    Ok(location)
+}
+
+/// `Nlmf_Location_CancelLocation`: POST /nlmf-loc/v1/cancel-location
+/// (TS 29.572 §6.1.4.3), driven by Namf_Location CancelLocation (TS 29.518
+/// §5.5.2.5.1).
+///
+/// `CancelLocData` (lmfd's `nlmf::CancelLocData`) requires `hgmlcCallBackURI` and
+/// `ldrReference`; `lcsCorrelationID` is optional and carried when the AMF holds one.
+pub async fn call_lmf_cancel_location(
+    supi: &str,
+    ldr_reference: &str,
+    hgmlc_callback_uri: &str,
+    serving_lmf_identification: Option<&str>,
+) -> Result<(), String> {
+    let (lmf_host, lmf_port) = resolve_lmf_endpoint().await.ok_or_else(|| {
+        "no LMF endpoint (NRF discovery found none, LMF_SBI_ADDR unset)".to_string()
+    })?;
+
+    let mut body = serde_json::json!({
+        "hgmlcCallBackURI": hgmlc_callback_uri,
+        "ldrReference": ldr_reference,
+    });
+    if let Some(lmf_id) = serving_lmf_identification {
+        body["lcsCorrelationID"] = serde_json::json!(lmf_id);
+    }
+    log::debug!("Cancelling LDR [{ldr_reference}] for [{supi}] at LMF {lmf_host}:{lmf_port}");
+
+    let client = crate::attach_oauth2(
+        SbiClient::for_peer(&lmf_host, lmf_port),
+        nextgcore_sbi::types::NfType::Lmf,
+    );
+    let response = client
+        .post_json("/nlmf-loc/v1/cancel-location", &body)
+        .await
+        .map_err(|e| format!("CancelLocation request to {lmf_host}:{lmf_port} failed: {e}"))?;
+
+    // 403 LOCATION_SESSION_UNKNOWN is the LMF saying the LDR is already gone, which is
+    // the outcome the consumer asked for. Treated as success so a duplicate
+    // cancellation is not reported as a failure.
+    if response.status == 403 {
+        log::debug!(
+            "LMF has no active LDR [{ldr_reference}]; the cancellation is already in effect"
+        );
+        return Ok(());
+    }
+    if !response.is_success() {
+        return Err(format!(
+            "LMF returned status {} for CancelLocation",
+            response.status
+        ));
+    }
+    Ok(())
+}
+
+// ============================================================================
+// AMFStatusChangeNotify (#74, TS 29.518 §5.2.2.5.3)
+// ============================================================================
+
+/// POST an `AmfStatusChangeNotification` to every AMFStatusChange subscriber.
+///
+/// This is what makes `/namf-comm/v1/subscriptions` a registry something READS.
+/// §5.2.2.5.1.1 names the AMF planned-removal procedure (TS 23.501 §5.21.2.2) as the
+/// procedure this service exists for, so the notification is driven from
+/// `AmfApp::shutdown_async` — and sent BEFORE `deregister_self()`, so subscribers hear
+/// it while this AMF can still reach them.
+///
+/// Body: `AmfStatusChangeNotification` requires `amfStatusInfoList`
+/// (`TS29518_Namf_Communication.yaml:2448-2449`), whose `AmfStatusInfo` requires
+/// `guamiList` (`:2465-2466`). A subscriber that named a `guamiList` is told only about
+/// the GUAMIs it asked about, intersected with what this AMF actually serves — sending
+/// it a GUAMI it did not subscribe to would be a different subscription than the one it
+/// created.
+///
+/// Bounded and best-effort: every POST is under a short timeout and a failure is logged,
+/// because this runs on the shutdown path and a hung subscriber must not hold the
+/// process open.
+pub async fn notify_amf_status_change(status_change: &str) {
+    let subscriptions = {
+        let ctx = crate::context::amf_self();
+        let Ok(guard) = ctx.read() else {
+            return;
+        };
+        guard.amf_status_subscriptions_all()
+    };
+    if subscriptions.is_empty() {
+        return;
+    }
+    let served = served_guami_list_json();
+    if served.is_empty() {
+        log::debug!("AMFStatusChangeNotify skipped: this AMF serves no GUAMI to report");
+        return;
+    }
+
+    for sub in subscriptions {
+        // Intersect the subscriber's interest with what this AMF serves. An empty
+        // `guamiList` on the subscription means "all of them" (the member is optional),
+        // which is the only reading that does not invent an interest.
+        let guami_list: Vec<serde_json::Value> = if sub.guami_list.is_empty() {
+            served.clone()
+        } else {
+            served
+                .iter()
+                .filter(|g| sub.guami_list.contains(g))
+                .cloned()
+                .collect()
+        };
+        if guami_list.is_empty() {
+            log::debug!(
+                "AMFStatusChangeNotify skipped for {}: none of its subscribed GUAMIs are served \
+                 by this AMF",
+                sub.subscription_id
+            );
+            continue;
+        }
+        let body = serde_json::json!({
+            "amfStatusInfoList": [{
+                "guamiList": guami_list,
+                "statusChange": status_change,
+            }]
+        });
+        let Some((host, port, path)) = split_absolute_uri(&sub.amf_status_uri) else {
+            log::warn!(
+                "AMFStatusChangeNotify: cannot address amfStatusUri {}",
+                sub.amf_status_uri
+            );
+            continue;
+        };
+        let client = crate::attach_oauth2(
+            SbiClient::for_peer(&host, port),
+            nextgcore_sbi::types::NfType::Nrf,
+        );
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.post_json(&path, &body),
+        )
+        .await
+        {
+            Ok(Ok(resp)) if resp.is_success() => log::info!(
+                "AMFStatusChangeNotify({status_change}) delivered to {}",
+                sub.amf_status_uri
+            ),
+            Ok(Ok(resp)) => log::warn!(
+                "AMFStatusChangeNotify to {} returned {}",
+                sub.amf_status_uri,
+                resp.status
+            ),
+            Ok(Err(e)) => log::warn!(
+                "AMFStatusChangeNotify to {} failed: {e}",
+                sub.amf_status_uri
+            ),
+            Err(_) => log::warn!(
+                "AMFStatusChangeNotify to {} timed out; the shutdown path will not wait longer",
+                sub.amf_status_uri
+            ),
+        }
+    }
+}
+
+/// Split an absolute `http[s]://host[:port]/path` into its dialable parts.
+///
+/// The `amfStatusUri` is a `Uri` supplied by the consumer, so it is absolute; a
+/// relative one cannot be dialled and yields `None` rather than a guessed host.
+fn split_absolute_uri(uri: &str) -> Option<(String, u16, String)> {
+    let (scheme_default_port, rest) = if let Some(rest) = uri.strip_prefix("https://") {
+        (443u16, rest)
+    } else if let Some(rest) = uri.strip_prefix("http://") {
+        (80u16, rest)
+    } else {
+        return None;
+    };
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().ok()?),
+        None => (authority.to_string(), scheme_default_port),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, port, path.to_string()))
+}
+
 /// Base URL (`http://{advertised_sbi_addr}:{port}`) the AMF advertises for its
 /// own SBI server — the same address/port `run()` binds the Namf HTTP/2 server
 /// to and the NRF NFProfile advertises (env `AMF_SBI_ADDR`/`AMF_SBI_PORT`,

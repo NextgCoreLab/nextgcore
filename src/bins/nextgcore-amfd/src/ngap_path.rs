@@ -4317,6 +4317,23 @@ impl NgapServer {
         self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
             s.registration_accept_sent = true;
         });
+        // #74 criterion 5: ACCESS_TYPE_REPORT. TS 29.518 §6.2 has the consumer receive
+        // "the current access type(s) of a UE... and updated access type(s)... when AMF
+        // becomes aware of the access type change of the UE" -- and a Registration
+        // Accept that has egressed is the moment this AMF becomes the UE's serving AMF
+        // over this access.
+        //
+        // Fired HERE and not in `gmm_handler::handle_registration_request`, where the
+        // other `fire_*` calls live: that function's only callers are inside `mod
+        // tests`, as `the_live_parser_captures_ue_s1_mode_capability` records for the
+        // same module. An emitter there would have been correct and unreachable.
+        //
+        // `3GPP_ACCESS` is stated rather than derived because this path IS the 3GPP one:
+        // NGAP is N2 from an NG-RAN. A non-3GPP registration would arrive via an N3IWF,
+        // for which this tree has no daemon at all.
+        if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
+            crate::namf_server::fire_access_type_report(&state.amf_ue, "3GPP_ACCESS");
+        }
         let _ = self.create_ue_policy_association(amf_ue_ngap_id).await;
         Ok(())
     }
@@ -4493,6 +4510,25 @@ impl NgapServer {
         self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
             .await?;
         log::info!("Service Accept sent to UE {amf_ue_ngap_id} (protected)");
+
+        // #74 criterion 5: CONNECTIVITY_STATE_REPORT, the CM-IDLE -> CM-CONNECTED half.
+        // A Service Request is exactly that transition (TS 24.501 §5.6.1), which is the
+        // "connection management state change" TS 29.518 §6.2 says the AMF reports, and
+        // the Service Accept has now egressed so the connection really is up. Its
+        // counterpart (CONNECTED -> IDLE on the N1 release) fires from
+        // `start_reachability_supervision`.
+        //
+        // Distinct from a REACHABILITY_REPORT: reachability is whether the AMF can page
+        // the UE, CM state is whether an N1 connection exists right now, and TS 29.518
+        // gives them separate event types with separate report members (`reachability`
+        // vs `cmInfoList`).
+        //
+        // Fired here rather than in `gmm_handler::handle_service_request` because that
+        // function's only caller is in `mod tests` -- see the note on
+        // `send_registration_accept`.
+        if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
+            crate::namf_server::fire_connectivity_state_report(&state.amf_ue, true);
+        }
 
         // TS 33.501 §6.12.3: reallocate the 5G-GUTI after a service request. This is the
         // moment that matters for identity privacy -- the UE has just used the identity
@@ -6058,6 +6094,15 @@ impl NgapServer {
                      release (TS 24.501 §5.3.7)",
                     config.duration
                 );
+                // #74 criterion 5: CONNECTIVITY_STATE_REPORT for the
+                // CM-CONNECTED -> CM-IDLE half. The N1 signalling connection is gone,
+                // which is the "connection management state change" of TS 29.518 §6.2;
+                // its counterpart (IDLE -> CONNECTED on a Service Request) fires from
+                // `gmm_handler::handle_service_request`. Read from the record rather
+                // than reconstructed, so the report carries the UE's real identities.
+                if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
+                    crate::namf_server::fire_connectivity_state_report(&state.amf_ue, false);
+                }
             }
         }
     }
@@ -6087,6 +6132,21 @@ impl NgapServer {
             };
             match reachability.phase {
                 ReachabilityPhase::MobileReachable => {
+                    // #74 criterion 5: LOSS_OF_CONNECTIVITY. TS 29.518 §6.2 names this
+                    // trigger literally -- "Such condition is identified when Mobile
+                    // Reachable timer expires in the AMF" -- and we are exactly there.
+                    // Fired BEFORE the three branches below, because all three are
+                    // reached by the SAME expiry: whether implicit deregistration is
+                    // configured, disabled, or armed changes what the AMF does next, not
+                    // whether the UE became unreachable. `MAX_DETECTION_TIME_EXPIRED` is
+                    // the TS 29.518 `LossOfConnectivityReason` for a timer expiry
+                    // (TS29518_Namf_EventExposure.yaml:1605-1614).
+                    if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
+                        crate::namf_server::fire_loss_of_connectivity(
+                            &state.amf_ue,
+                            "MAX_DETECTION_TIME_EXPIRED",
+                        );
+                    }
                     let Some(config) = self
                         .timer_configs
                         .get(AmfTimerId::ImplicitDeregistration)
@@ -14913,6 +14973,125 @@ mod tests {
             "and the ambiguity is CLOSED -- the old identity must stop resolving, or the \
              dual-validity window would never end"
         );
+    }
+    /// #74 criterion 5: the mobile-reachable timer expiry FIRES
+    /// `LOSS_OF_CONNECTIVITY` to a subscriber, from the live timer sweep.
+    ///
+    /// The emitter itself is asserted in `namf_server`. This test asserts the
+    /// PRODUCTION SITE — that `process_reachability_timers`, which `poll()` drives on
+    /// every NGAP tick, is what reaches it. The two are separate concerns and this
+    /// tree's most common defect is having the first without the second: an emitter
+    /// that works and is never called.
+    ///
+    /// TS 29.518 §6.2 names this trigger literally: *"Such condition is identified
+    /// when Mobile Reachable timer expires in the AMF"*.
+    ///
+    /// The deadline is set in the past rather than waited on — the timer is minutes
+    /// long by configuration and what is under test is the emission, not the clock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_mobile_reachable_expiry_fires_loss_of_connectivity_to_a_subscriber() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::amf_context_init(64, 1024, 4096);
+
+        // An AMF-UE-NGAP-ID and SUPI no sibling uses: `ue_auth_state` and the event
+        // subscription store are both process-global, and the delivered report is
+        // matched on the SUPI below.
+        let amf_ue_ngap_id = 7_740_800u64;
+        let supi = "imsi-001010000740800";
+
+        // A real in-process notification sink, so what is asserted is what a
+        // subscriber actually received.
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let (tx, mut rx) = mpsc::channel::<String>(8);
+        let sink = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(
+                format!("127.0.0.1:{port}").parse().expect("addr"),
+            ),
+            listener,
+        );
+        sink.start(move |req: nextgcore_sbi::message::SbiRequest| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(req.http.content.clone().unwrap_or_default()).await;
+                nextgcore_sbi::message::SbiResponse::no_content()
+            }
+        })
+        .await
+        .expect("notification sink start");
+        // Plaintext loopback -> Dev profile. Deliberately NOT reset: the override is
+        // PROCESS-WIDE and every loopback-plaintext test in this crate sets and leaves
+        // it (PR #390 measured 2 failures in 10 whole-crate runs from resetting it).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.event_subscription_add(crate::context::EventSubscription {
+                subscription_id: "sub-74-loss-live".to_string(),
+                notify_uri: format!("http://127.0.0.1:{port}/notify/74-loss-live"),
+                notify_correlation_id: "corr-74-loss-live".to_string(),
+                nf_id: "3fa85f64-5717-4562-b3fc-2c963f66afa6".to_string(),
+                event_types: vec!["LOSS_OF_CONNECTIVITY".to_string()],
+                supi: Some(supi.to_string()),
+                gpsi: None,
+                pei: None,
+                group_id: None,
+                any_ue: false,
+                expiry: None,
+            });
+        }
+
+        let mut ngap = test_ngap_server().await;
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 74, 1, false);
+        ue_ctx.registered = true;
+        ue_ctx.amf_ue.supi = Some(supi.to_string());
+        ue_ctx.reachability = Some(Reachability {
+            phase: ReachabilityPhase::MobileReachable,
+            deadline: Instant::now() - Duration::from_secs(1),
+        });
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        // The live sweep `poll()` calls on every tick -- not the emitter directly.
+        ngap.process_reachability_timers()
+            .await
+            .expect("the reachability sweep must run");
+
+        let body = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect(
+                "the mobile-reachable expiry must FIRE LOSS_OF_CONNECTIVITY. The emitter \
+                 working is not enough -- an emitter nothing calls is this tree's most \
+                 common defect",
+            )
+            .expect("notification channel closed");
+        let notification: serde_json::Value =
+            serde_json::from_str(&body).expect("notification is JSON");
+        assert_eq!(
+            notification["reportList"][0]["type"].as_str(),
+            Some("LOSS_OF_CONNECTIVITY")
+        );
+        assert_eq!(
+            notification["reportList"][0]["supi"].as_str(),
+            Some(supi),
+            "for the UE whose timer expired -- this SUPI exists nowhere else in the fixture"
+        );
+        assert_eq!(
+            notification["reportList"][0]["lossOfConnectReason"].as_str(),
+            Some("MAX_DETECTION_TIME_EXPIRED"),
+            "the `LossOfConnectivityReason` TS 29.518 defines for a timer expiry"
+        );
+
+        // Cleanup: the subscription store is process-global and an any-UE-free
+        // subscription left behind would still be scanned by every sibling's fire.
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.event_subscription_remove("sub-74-loss-live");
+        }
+        sink.stop().await.expect("sink stop");
     }
 }
 
