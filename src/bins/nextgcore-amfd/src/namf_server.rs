@@ -688,7 +688,62 @@ fn rfc3339_to_system_time(s: &str) -> Option<std::time::SystemTime> {
 // Namf_EventExposure — subscription resource handlers (TS 29.518 §6.2)
 // ============================================================================
 
-/// Known AMF event types (TS 29.518 AmfEventType)
+/// Event types this AMF accepts a subscription for (TS 29.518 `AmfEventType`,
+/// `TS29518_Namf_EventExposure.yaml:1513-1543`).
+///
+/// A SUBSET of the enumeration's 25 values, by design: the 13 absent ones
+/// (`SUBSCRIPTION_TERMINATION`, `5GS_USER_STATE_REPORT`, the trends and measurement
+/// reports, ...) need state this AMF does not hold, and accepting a subscription it can
+/// never notify is what an event-exposure producer must not do.
+///
+/// # Where each accepted type fires (#397)
+///
+/// Ten of the twelve fire from a live NGAP or SBI path. Before #398 and #397 **none
+/// did**: the three #74 counted as working all fired from `gmm_handler` functions whose
+/// only callers are inside `mod tests`.
+///
+/// | type | production site |
+/// |---|---|
+/// | `LOCATION_REPORT` | `send_registration_accept`, `handle_service_request_nas` |
+/// | `REGISTRATION_STATE_REPORT` | `send_registration_accept` (REGISTERED), `finish_deregistration` (DEREGISTERED) |
+/// | `REACHABILITY_REPORT` | `handle_service_request_nas` |
+/// | `ACCESS_TYPE_REPORT` | `send_registration_accept` |
+/// | `CONNECTIVITY_STATE_REPORT` | `handle_service_request_nas`, `start_reachability_supervision` |
+/// | `LOSS_OF_CONNECTIVITY` | `process_reachability_timers`, `finish_deregistration` |
+/// | `COMMUNICATION_FAILURE_REPORT` | `handle_ue_context_release`, on an unexpected RAN Cause |
+/// | `SUBSCRIPTION_ID_CHANGE` / `_ADDITION` | `handle_create_ue_context`, the §5.2.2.2.3.1 takeover |
+///
+/// # The two that do NOT fire, and why (ceilings, not omissions)
+///
+/// `PRESENCE_IN_AOI_REPORT` and `UES_IN_AREA_REPORT` need an area-of-interest /
+/// presence-area model this AMF does not have in any form. `AmfEventReport.areaList`
+/// (Table 6.2.6.2.5-1, `29518-k00.txt:21923-21940`) must report which subscribed AoI
+/// the UE is *"currently IN / OUT / UNKNOWN"*, and for a PRA identifier naming a set it
+/// must additionally report *"the additional PRA identifier of the actually individual
+/// PRA(s)"* per TS 23.501 §5.6.11. `AmfEventArea`
+/// (`TS29518_Namf_EventExposure.yaml:1011-1024`) is a choice of `PresenceInfo`,
+/// `LadnInfo`, `SliceAreaRestrictionInfo`, `sNssai` or `nsiId` — none of which this AMF
+/// stores or evaluates the UE against. `UES_IN_AREA_REPORT`'s `numberOfUes` (`:778`)
+/// needs the same model plus a per-area count.
+///
+/// They remain ACCEPTED rather than removed from this list, for the reason `group_id`
+/// subscriptions are accepted (#74 criterion 4): the subscription itself is conformant
+/// and refusing it is a wrong 400. What is refused is fabricating the report. Deciding
+/// the presence-area model is feature work in its own right and is filed as **#400**,
+/// with the five open model questions stated.
+///
+/// `TIMEZONE_REPORT` is a THIRD kind of gap: the AMF holds no UE time zone at all.
+/// `gmm_build.rs:983-985` sends `local_time_zone: None`,
+/// `universal_time_and_local_time_zone: None` and `network_daylight_saving_time: None`
+/// in every CONFIGURATION UPDATE COMMAND, and nothing ever parses one in — the time
+/// zone is network-to-UE information (NITZ, TS 22.042), so there is no uplink IE to
+/// learn it from. TS 23.501 §5.6.2 (`23501-k20.txt:11296`) has the AMF *"also provide
+/// the corresponding UE Time Zone"* to the SMF, which confirms the AMF is meant to HOLD
+/// one, but it comes from operator configuration keyed on the serving TAI and this tree
+/// has no such configuration. §6.2's trigger is *"when AMF becomes aware of a time zone change of
+/// the UE"*; with no value there is neither a value to report nor a change to detect.
+/// Reporting the AMF HOST's zone would be a fabrication: the host is wherever the core
+/// runs, not where the UE is.
 const AMF_EVENT_TYPES: &[&str] = &[
     "LOCATION_REPORT",
     "PRESENCE_IN_AOI_REPORT",
@@ -729,6 +784,16 @@ fn subscription_echo_json(sub: &EventSubscription) -> Value {
     }
     if let Some(group_id) = &sub.group_id {
         subscription["groupId"] = json!(group_id);
+    }
+    // #397: the subscription-change callback round-trips too. A consumer that gave
+    // the AMF a separate endpoint for subscription-ID changes must see it back, for
+    // the same reason the GPSI echo exists — it is how the consumer confirms the
+    // created resource matches the request it made.
+    if let Some(uri) = &sub.subs_change_notify_uri {
+        subscription["subsChangeNotifyUri"] = json!(uri);
+    }
+    if let Some(id) = &sub.subs_change_notify_correlation_id {
+        subscription["subsChangeNotifyCorrelationId"] = json!(id);
     }
     if sub.any_ue {
         subscription["anyUE"] = json!(true);
@@ -860,6 +925,31 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         }
     }
 
+    // #397: the subscription-change callback pair (`subsChangeNotifyUri`,
+    // `subsChangeNotifyCorrelationId`, yaml:549-551). Optional, and validated only
+    // for well-formedness — §6.2.6.2.2 makes neither conditional on anything the AMF
+    // can check at subscribe time.
+    //
+    // A present-but-unusable URI is refused rather than stored, because storing it
+    // would produce a subscription whose SUBSCRIPTION_ID_CHANGE notification can
+    // never be delivered, and the consumer would have no way to learn that.
+    let subs_change_notify_uri = subscription
+        .get("subsChangeNotifyUri")
+        .and_then(Value::as_str)
+        .map(String::from);
+    if let Some(uri) = &subs_change_notify_uri {
+        if parse_http_uri(uri).is_none() {
+            return mandatory_ie_incorrect(
+                "subscription.subsChangeNotifyUri",
+                "not a valid HTTP URI",
+            );
+        }
+    }
+    let subs_change_notify_correlation_id = subscription
+        .get("subsChangeNotifyCorrelationId")
+        .and_then(Value::as_str)
+        .map(String::from);
+
     // Optional expiry: AmfEventMode.expiry (options) or top-level expiry
     let expiry_str = subscription
         .pointer("/options/expiry")
@@ -888,6 +978,8 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         group_id,
         any_ue,
         expiry,
+        subs_change_notify_uri,
+        subs_change_notify_correlation_id,
     };
 
     // Immediate reports for events with immediateFlag (current state)
@@ -1348,6 +1440,299 @@ pub fn fire_loss_of_connectivity(ue: &AmfUe, reason: &str) {
         "LOSS_OF_CONNECTIVITY",
         json!({ "lossOfConnectReason": reason }),
     );
+}
+
+/// Fire a `COMMUNICATION_FAILURE_REPORT` for a RAN-detected connection release
+/// (#397).
+///
+/// TS 29.518 §6.2 (`29518-k00.txt:24032-24037`): the consumer receives *"the
+/// Communication failure report of a UE or group of UEs or any UE"*, and
+/// `29518-k00.txt:5126-5131` says when: *"when the AMF becomes aware of a RAN or NAS
+/// failure event. This event implements the 'Communication failure' event in table
+/// 4.15.3.1-1 of TS 23.502, which is an unexpected termination of the
+/// communication."* That table's own row (`23502-k20.txt:28570-28577`) names the
+/// detector and the mechanism: *"This event is detected when RAN or NAS level failure
+/// is detected based on connection release and it identifies RAN/NAS release code"*,
+/// with the AMF as the detecting NF.
+///
+/// A `UEContextReleaseRequest` from the gNB IS that: the RAN, not the AMF, decided to
+/// tear the UE's signalling connection down, and it carries the Cause saying why.
+///
+/// # Why `ranReleaseCode`, and why only for an UNEXPECTED cause
+///
+/// `CommunicationFailure` (Table 6.2.6.2.11-1, `29518-k00.txt:22479-22485`) defines
+/// `ranReleaseCode` as an `NgApCause` holding *"the decimal value of the NG AP cause
+/// code values as specified in TS 38.413"* — group and value, both `required`
+/// (`TS29571_CommonData.yaml:2562-2564`). The NGAP Cause is already decoded into
+/// `UeContextReleaseRequest.cause` by `nextgcore_ngap::parser` and was simply
+/// discarded; it is the real release code, not a placeholder.
+///
+/// `nasReleaseCode` is NOT set: its pattern is `^(MM|SM)-[0-9]{1,3}$`
+/// (`:22465-22477`), a 5GMM/5GSM cause, and a RAN-initiated release carries no NAS
+/// cause at all. Inventing one would report a NAS failure that did not happen.
+///
+/// The caller decides whether the cause is a FAILURE — see
+/// `ngap_path::handle_ue_context_release`. A normal release is not "an unexpected
+/// termination of the communication", so reporting one would tell a consumer a
+/// failure occurred every time a UE went idle.
+pub fn fire_communication_failure(ue: &AmfUe, cause_group: u8, cause_value: i64) {
+    fire_ue_event(
+        ue,
+        "COMMUNICATION_FAILURE_REPORT",
+        json!({
+            "commFailure": {
+                "ranReleaseCode": { "group": cause_group, "value": cause_value },
+            }
+        }),
+    );
+}
+
+/// Fire a `SUBSCRIPTION_ID_CHANGE` or `SUBSCRIPTION_ID_ADDITION` to a
+/// subscription's `subsChangeNotifyUri` (#397).
+///
+/// # These are not subscribable events
+///
+/// TS 29.518 §6.2 says of both that *"This event needs no explicit subscription
+/// form an NF service consumer"* (`29518-k00.txt:24052-24053`, `:24069-24070`). They
+/// are therefore NOT matched against `event_types` the way every other emitter is —
+/// no consumer ever lists them in an `eventList`, so a match would find nothing.
+/// They fire for a subscription whose `subsChangeNotifyUri` is set, whatever that
+/// subscription was for.
+///
+/// # The trigger
+///
+/// Table 6.2.6.2.5-1's `subscriptionId` row (`29518-k00.txt:21886-21911`) gives the
+/// only trigger: the IE *"shall be included when the event notification is for
+/// informing the creation of a subscription Id at the AMF during mobility of a UE
+/// across AMFs"*, with `SUBSCRIPTION_ID_CHANGE` *"when the AMF creates a subscription
+/// Id for a UE specific event subscription"* and `SUBSCRIPTION_ID_ADDITION` *"when
+/// the AMF creates a subscription Id for a group Id specific event subscription"*,
+/// both *"during mobility registration and handover procedures involving an AMF
+/// change"*. §5.2.2.2.3.1 (`:2769-2772`) is where that happens: the target AMF shall
+/// *"for each created event subscription, allocate a new subscription Id... and if
+/// allocated send the new subscription Id to the notification endpoint for informing
+/// the subscription Id creation, along with the notification correlation Id for the
+/// subscription Id change."*
+///
+/// # Shape of the notification
+///
+/// Two members differ from every other emitter, and both are conditional on THIS
+/// being a subscription-ID notification:
+///
+/// - `reportList[].subscriptionId` carries *"the URI of the created subscription
+///   resource at the AMF"* — an absolute URI per §6.2.3.3.2, not the bare ID.
+/// - The correlation ID is `subsChangeNotifyCorrelationId` when the subscription
+///   carried one, and `notifyCorrelationId` otherwise. Table 6.2.6.2.4-1
+///   (`:21795-21833`) makes them mutually exclusive for exactly this case, so this
+///   is not a matter of sending both.
+///
+/// `state.active` is `true` because Table 6.2.6.2.5-1 (`:21878-21881`) requires it:
+/// *"This IE shall be set to 'TRUE' when subscriptionId IE is present."*
+async fn deliver_subscription_id_change(
+    sub: EventSubscription,
+    event_type: &str,
+    subscription_uri: String,
+) -> Result<(), String> {
+    let uri = sub
+        .subs_change_notify_uri
+        .as_deref()
+        .ok_or("no subsChangeNotifyUri")?;
+    let (host, port, path) = parse_http_uri(uri).ok_or_else(|| format!("bad URI {uri}"))?;
+
+    let mut report = json!({
+        "type": event_type,
+        // Required TRUE whenever `subscriptionId` is present (Table 6.2.6.2.5-1).
+        "state": { "active": true },
+        "timeStamp": rfc3339_now(),
+        "subscriptionId": subscription_uri,
+    });
+    // The UE the transferred subscription is for. `supi` is "present if available"
+    // (`:21920`), and here it is: the subscription was created FOR this UE.
+    if let Some(supi) = &sub.supi {
+        report["supi"] = json!(supi);
+    }
+
+    // Exactly one correlation ID, chosen by Table 6.2.6.2.4-1, not both.
+    let mut body = json!({ "reportList": [report] });
+    match &sub.subs_change_notify_correlation_id {
+        Some(id) => body["subsChangeNotifyCorrelationId"] = json!(id),
+        None => body["notifyCorrelationId"] = json!(sub.notify_correlation_id),
+    }
+
+    let response = notify_client(&host, port)
+        .post_json(&path, &body)
+        .await
+        .map_err(|e| format!("subsChange POST to {uri} failed: {e}"))?;
+    if response.is_success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "subsChange POST to {uri} returned {}",
+            response.status
+        ))
+    }
+}
+
+/// Take over a transferred event subscription and tell its consumer the new
+/// subscription ID (TS 29.518 §5.2.2.2.3.1, #397).
+///
+/// Called from `handle_create_ue_context` for each entry of the transferred
+/// `ueContext.eventSubscriptionList` (`TS29518_Namf_Communication.yaml:3050-3053`,
+/// items `ExtAmfEventSubscription` = `AmfEventSubscription` plus additional info,
+/// yaml:4049-4054). §5.2.2.2.3.1 requires the target AMF to *"create event
+/// subscriptions for the UE specific events"* and then notify the consumer of the new
+/// ID — which is the whole reason `SUBSCRIPTION_ID_CHANGE` exists.
+///
+/// # Why the event type is chosen by `groupId`, not by a flag
+///
+/// Table 6.2.6.2.5-1 ties the two types to the two cases §5.2.2.2.3.1 lists: a
+/// UE-specific subscription is case a) and reports `SUBSCRIPTION_ID_CHANGE`; a group
+/// subscription is case b) and reports `SUBSCRIPTION_ID_ADDITION`. `groupId` being
+/// present IS which case this is, so there is nothing else to decide from.
+///
+/// Returns the number of subscriptions created, so the caller can log a count that
+/// reflects what happened rather than what was offered.
+fn take_over_transferred_event_subscriptions(
+    ue_context_id: &str,
+    supi: Option<&str>,
+    ue_context: &Value,
+) -> usize {
+    let Some(list) = ue_context
+        .get("eventSubscriptionList")
+        .and_then(Value::as_array)
+    else {
+        return 0;
+    };
+
+    let ctx = amf_self();
+    let mut created = 0usize;
+    for entry in list {
+        // `eventList`/`eventNotifyUri`/`notifyCorrelationId`/`nfId` are
+        // `AmfEventSubscription`'s required members (yaml:589-593). An entry missing
+        // one is skipped rather than defaulted: a subscription with no notify URI
+        // could never be delivered to, and inventing one would point notifications at
+        // an endpoint the consumer never gave.
+        let Some(notify_uri) = entry.get("eventNotifyUri").and_then(Value::as_str) else {
+            log::warn!(
+                "[{ue_context_id}] transferred event subscription without `eventNotifyUri`: \
+                 skipped (TS29518_Namf_Communication.yaml:589-593 makes it required)"
+            );
+            continue;
+        };
+        let Some(event_types) = entry.get("eventList").and_then(Value::as_array).map(|l| {
+            l.iter()
+                .filter_map(|e| e.get("type").and_then(Value::as_str).map(String::from))
+                .collect::<Vec<_>>()
+        }) else {
+            log::warn!(
+                "[{ue_context_id}] transferred event subscription without `eventList`: skipped"
+            );
+            continue;
+        };
+        if event_types.is_empty() {
+            continue;
+        }
+
+        let group_id = entry
+            .get("groupId")
+            .and_then(Value::as_str)
+            .map(String::from);
+        // A NEW subscription ID, allocated by THIS AMF: that allocation is the event.
+        // The NOTE at `29518-k00.txt:24100` permits reuse "if the mobility is between
+        // AMFs of same AMF Set", but this AMF has no way to tell whether the source was
+        // in its own set — `UeContextCreateData` carries no source GUAMI — so it
+        // allocates, which is the unconditionally-correct branch.
+        let subscription_id = format!("sub-{}", uuid::Uuid::new_v4());
+        let sub = EventSubscription {
+            subscription_id: subscription_id.clone(),
+            notify_uri: notify_uri.to_string(),
+            notify_correlation_id: entry
+                .get("notifyCorrelationId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            nf_id: entry
+                .get("nfId")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            event_types,
+            // The transferred subscription is for THIS UE. The `supi` the source sent
+            // is preferred, but this AMF's own resolution wins when the source omitted
+            // it, because the context it just created is what the reports will be about.
+            supi: entry
+                .get("supi")
+                .and_then(Value::as_str)
+                .map(String::from)
+                .or_else(|| supi.map(String::from)),
+            gpsi: entry.get("gpsi").and_then(Value::as_str).map(String::from),
+            pei: entry.get("pei").and_then(Value::as_str).map(String::from),
+            group_id: group_id.clone(),
+            any_ue: entry.get("anyUE").and_then(Value::as_bool).unwrap_or(false),
+            expiry: entry
+                .pointer("/options/expiry")
+                .and_then(Value::as_str)
+                .and_then(rfc3339_to_system_time),
+            subs_change_notify_uri: entry
+                .get("subsChangeNotifyUri")
+                .and_then(Value::as_str)
+                .map(String::from),
+            subs_change_notify_correlation_id: entry
+                .get("subsChangeNotifyCorrelationId")
+                .and_then(Value::as_str)
+                .map(String::from),
+        };
+
+        let added = ctx
+            .read()
+            .map(|guard| guard.event_subscription_add(sub.clone()))
+            .unwrap_or(false);
+        if !added {
+            log::warn!(
+                "[{ue_context_id}] transferred event subscription {subscription_id} not stored"
+            );
+            continue;
+        }
+        created += 1;
+
+        // §6.2.6.2.5: an ABSOLUTE URI to the created resource, per §6.2.3.3.2.
+        let subscription_uri = format!("/namf-evts/v1/subscriptions/{subscription_id}");
+        // Group subscription -> ADDITION, UE-specific -> CHANGE (Table 6.2.6.2.5-1).
+        let event_type = if group_id.is_some() {
+            "SUBSCRIPTION_ID_ADDITION"
+        } else {
+            "SUBSCRIPTION_ID_CHANGE"
+        };
+
+        // Only when the consumer gave a subscription-change endpoint. §6.2.5.2.1 has
+        // this notification go to `subsChangeNotifyUri`, and a consumer that supplied
+        // none did not ask to be told; posting the ID change to `eventNotifyUri`
+        // instead would send a report for an event type that consumer never subscribed
+        // to, down the channel it uses for the ones it did.
+        if sub.subs_change_notify_uri.is_none() {
+            log::debug!(
+                "[{ue_context_id}] event subscription {subscription_id} created from the \
+                 transferred context; no `subsChangeNotifyUri`, so no {event_type} is sent \
+                 (TS 29.518 §6.2.5.2.1)"
+            );
+            continue;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            log::debug!("{event_type}: no tokio runtime, skipping delivery");
+            continue;
+        };
+        log::info!(
+            "[{ue_context_id}] {event_type}: subscription {subscription_id} created from the \
+             transferred UE context (TS 29.518 §5.2.2.2.3.1)"
+        );
+        handle.spawn(async move {
+            if let Err(e) = deliver_subscription_id_change(sub, event_type, subscription_uri).await
+            {
+                log::warn!("{event_type} delivery failed: {e}");
+            }
+        });
+    }
+    created
 }
 
 // ============================================================================
@@ -3045,9 +3430,21 @@ fn handle_create_ue_context(ue_context_id: &str, request: &SbiRequest) -> SbiRes
         "pduSessionList": pdu_session_list,
     });
 
+    // #397: the event-subscription takeover of §5.2.2.2.3.1. Done AFTER the context is
+    // published, because the subscriptions this creates are keyed to the UE and the
+    // first thing a consumer may do on hearing the new ID is GET the resource.
+    //
+    // Only CreateUEContext, not `/relocate`: §5.2.2.2.5.1's `UeContextRelocateData`
+    // carries a `ueContext` for a DIFFERENT purpose — the N26 EPS interworking case,
+    // where the peer is an MME with no Namf event subscriptions to hand over — and
+    // taking them over there would create subscriptions for a procedure the clause
+    // does not describe.
+    let subscriptions =
+        take_over_transferred_event_subscriptions(ue_context_id, ue.supi.as_deref(), ue_context);
+
     log::info!(
         "[{ue_context_id}] CreateUEContext: context created (ue_id={}, {sessions} session(s) \
-         recorded of {} offered)",
+         recorded of {} offered, {subscriptions} event subscription(s) taken over)",
         ue.id,
         pdu_session_list.len()
     );
@@ -4634,6 +5031,10 @@ mod tests {
             group_id: None,
             any_ue: false,
             expiry: Some(std::time::UNIX_EPOCH), // long expired
+            // No subscription-change callback (#397) for the same reason: this test is
+            // about expiry.
+            subs_change_notify_uri: None,
+            subs_change_notify_correlation_id: None,
         };
         assert!(guard.event_subscription_add(sub));
         // Expired subscriptions never match (other tests may add unrelated
@@ -8669,5 +9070,332 @@ mod tests {
         };
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].ngap_pdu[1], 32);
+    }
+
+    // ==================================================================
+    // #397: SUBSCRIPTION_ID_CHANGE / _ADDITION and the §5.2.2.2.3.1 takeover
+    // ==================================================================
+
+    /// **#397 criterion 2.** CreateUEContext takes over the transferred
+    /// `eventSubscriptionList` and fires `SUBSCRIPTION_ID_CHANGE` to the
+    /// `subsChangeNotifyUri` — a DIFFERENT endpoint from `eventNotifyUri`.
+    ///
+    /// `EventSubscription` had no `subs_change_*` member at all before this, so the two
+    /// types could not be emitted conformantly and were silent. §6.2 says of both that
+    /// they *"need no explicit subscription form an NF service consumer"*
+    /// (`29518-k00.txt:24052`), so no consumer ever lists them in an `eventList` — which
+    /// is why they are NOT matched against `event_types` the way every other emitter is.
+    ///
+    /// # What makes this assert the production site
+    ///
+    /// The subscription arrives ONLY inside the CreateUEContext body and the
+    /// notification arrives at a server this test owns, so the assertion traverses the
+    /// real router arm, the real takeover and a real HTTP POST. Two endpoints are stood
+    /// up, not one: asserting on the `subsChangeNotifyUri` sink proves §6.2.5.2.1's
+    /// routing rule — *"this callback URI shall be the `subsChangeNotifyUri`... Otherwise
+    /// ... the `eventNotifyUri`"* — rather than merely that something was delivered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_ue_context_takes_over_subscriptions_and_fires_subscription_id_change() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        amf_context_init(64, 1024, 4096);
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        // A SUPI and PEI no sibling uses: the subscription store and the UE store are
+        // both process-global, and the delivered report is asserted on this SUPI.
+        let supi = "imsi-001010000397600";
+        let pei = "imeisv-0000000000397600";
+        // TWO sinks. The change notification must arrive at the `subsChange` one and
+        // NOT at the event one -- that distinction is the clause under test.
+        let (change_sink, change_port, mut change_rx) = start_capture_server().await;
+        let (event_sink, event_port, mut event_rx) = start_capture_server().await;
+
+        let mut body = create_ue_context_body(supi, pei);
+        body["ueContext"]["eventSubscriptionList"] = json!([{
+            "eventList": [{ "type": "LOCATION_REPORT" }],
+            "eventNotifyUri": format!("http://127.0.0.1:{event_port}/notify/397-evt"),
+            "notifyCorrelationId": "corr-397-transferred",
+            "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+            "supi": supi,
+            "subsChangeNotifyUri": format!("http://127.0.0.1:{change_port}/notify/397-subs-change"),
+            "subsChangeNotifyCorrelationId": "corr-397-subs-change",
+        }]);
+
+        let resp = namf_request_handler(
+            SbiRequest::put(format!("/namf-comm/v1/ue-contexts/{supi}"))
+                .with_json_body(&body)
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(
+            resp.status, 201,
+            "CreateUEContext must succeed; the takeover runs on the created context"
+        );
+
+        let (uri, posted) = tokio::time::timeout(Duration::from_secs(3), change_rx.recv())
+            .await
+            .expect(
+                "the §5.2.2.2.3.1 takeover must fire SUBSCRIPTION_ID_CHANGE to the \
+                 subsChangeNotifyUri. Before #397 `EventSubscription` had no such member, \
+                 so this event type could not be emitted at all",
+            )
+            .expect("channel closed");
+        assert_eq!(uri, "/notify/397-subs-change");
+        let posted: Value = serde_json::from_str(&posted).expect("notification JSON");
+        let report = &posted["reportList"][0];
+        assert_eq!(
+            report["type"].as_str(),
+            Some("SUBSCRIPTION_ID_CHANGE"),
+            "a UE-specific subscription (no `groupId`) reports CHANGE, not ADDITION \
+             (Table 6.2.6.2.5-1)"
+        );
+        assert_eq!(
+            report["supi"].as_str(),
+            Some(supi),
+            "for the UE whose context was transferred -- this SUPI exists nowhere else"
+        );
+        let subscription_id = report["subscriptionId"]
+            .as_str()
+            .expect("`subscriptionId` is what this notification exists to carry");
+        assert!(
+            subscription_id.starts_with("/namf-evts/v1/subscriptions/sub-"),
+            "§6.2.6.2.5 requires the URI of the created subscription RESOURCE per \
+             §6.2.3.3.2, not the bare id -- got {subscription_id}"
+        );
+        assert_eq!(
+            report["state"]["active"].as_bool(),
+            Some(true),
+            "Table 6.2.6.2.5-1: `state` \"shall be set to 'TRUE' when subscriptionId IE \
+             is present\""
+        );
+        assert_eq!(
+            posted["subsChangeNotifyCorrelationId"].as_str(),
+            Some("corr-397-subs-change"),
+            "the subscription carried a `subsChangeNotifyCorrelationId`, so Table \
+             6.2.6.2.4-1 requires THAT member"
+        );
+        assert!(
+            posted["notifyCorrelationId"].is_null(),
+            "and NOT `notifyCorrelationId`: Table 6.2.6.2.4-1 makes the two mutually \
+             exclusive for a subscription-ID notification, so sending both would be wrong"
+        );
+
+        // The subscription really EXISTS under the id the consumer was just told. A
+        // notification naming an id the AMF did not store would be a promise it cannot
+        // keep -- the consumer's next act is to PATCH or DELETE that resource
+        // (§6.2.3.3.3 defines those two methods on it and no GET, which is why this
+        // reads the store rather than issuing one).
+        let stored_id = subscription_id
+            .rsplit('/')
+            .next()
+            .expect("the URI ends in the id");
+        let stored = {
+            let ctx = amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard
+                .event_subscription_find(stored_id)
+                .expect("the id the consumer was told must resolve to a stored subscription")
+        };
+        assert_eq!(
+            stored.event_types,
+            vec!["LOCATION_REPORT".to_string()],
+            "and it carries the events the SOURCE subscription was for -- the takeover \
+             recreates the subscription, it does not invent a new one"
+        );
+        assert_eq!(
+            stored.supi.as_deref(),
+            Some(supi),
+            "keyed to the transferred UE, so the existing fire points reach it"
+        );
+        assert!(
+            stored
+                .subs_change_notify_uri
+                .as_deref()
+                .is_some_and(|u| u.contains("/notify/397-subs-change")),
+            "and it retains the change endpoint, so a LATER id change reaches the same \
+             consumer"
+        );
+
+        // It is also reachable the way a consumer would next use it: the DELETE
+        // §6.2.3.3.3 defines resolves this id.
+        let resp = namf_request_handler(SbiRequest::delete(format!(
+            "/namf-evts/v1/subscriptions/{stored_id}"
+        )))
+        .await;
+        assert_eq!(
+            resp.status, 204,
+            "the id the consumer was told must resolve to a DELETABLE resource"
+        );
+
+        // Nothing went to the EVENT endpoint: §6.2.5.2.1 routes a subscription-ID
+        // notification to `subsChangeNotifyUri` when one was provided, and posting it to
+        // `eventNotifyUri` as well would send a report for a type the consumer never
+        // subscribed to down the channel it uses for the ones it did.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), event_rx.recv())
+                .await
+                .is_err(),
+            "the SUBSCRIPTION_ID_CHANGE must NOT also go to `eventNotifyUri` \
+             (TS 29.518 §6.2.5.2.1)"
+        );
+
+        // The DELETE above already removed it from the process-global store.
+        change_sink.stop().await.expect("change sink stop");
+        event_sink.stop().await.expect("event sink stop");
+    }
+
+    /// **#397 criterion 2, the other type.** A transferred GROUP subscription reports
+    /// `SUBSCRIPTION_ID_ADDITION`, not `SUBSCRIPTION_ID_CHANGE`.
+    ///
+    /// The discriminating sibling: Table 6.2.6.2.5-1 ties the two types to
+    /// §5.2.2.2.3.1's two cases — a) UE-specific reports CHANGE, b) group reports
+    /// ADDITION. Without this test the emitter could report CHANGE unconditionally and
+    /// its sibling would still pass.
+    ///
+    /// The correlation-ID assertion is the OTHER branch too: this subscription carries
+    /// NO `subsChangeNotifyCorrelationId`, so Table 6.2.6.2.4-1 requires
+    /// `notifyCorrelationId` instead — the exact inverse of the sibling.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transferred_group_subscription_reports_subscription_id_addition() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        amf_context_init(64, 1024, 4096);
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        // Distinct from the CHANGE sibling, for the process-global reason.
+        let supi = "imsi-001010000397700";
+        let pei = "imeisv-0000000000397700";
+        let (change_sink, change_port, mut change_rx) = start_capture_server().await;
+
+        let mut body = create_ue_context_body(supi, pei);
+        body["ueContext"]["eventSubscriptionList"] = json!([{
+            "eventList": [{ "type": "LOCATION_REPORT" }],
+            "eventNotifyUri": "http://127.0.0.1:9/notify/397-grp-evt",
+            "notifyCorrelationId": "corr-397-group",
+            "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+            // `groupId` is what makes this §5.2.2.2.3.1 case b).
+            "groupId": "group-397-700",
+            "subsChangeNotifyUri": format!("http://127.0.0.1:{change_port}/notify/397-grp-change"),
+            // NO `subsChangeNotifyCorrelationId`: the other branch of Table 6.2.6.2.4-1.
+        }]);
+
+        let resp = namf_request_handler(
+            SbiRequest::put(format!("/namf-comm/v1/ue-contexts/{supi}"))
+                .with_json_body(&body)
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+
+        let (_, posted) = tokio::time::timeout(Duration::from_secs(3), change_rx.recv())
+            .await
+            .expect("a transferred group subscription must fire SUBSCRIPTION_ID_ADDITION")
+            .expect("channel closed");
+        let posted: Value = serde_json::from_str(&posted).expect("notification JSON");
+        assert_eq!(
+            posted["reportList"][0]["type"].as_str(),
+            Some("SUBSCRIPTION_ID_ADDITION"),
+            "§5.2.2.2.3.1 case b) -- a group-Id subscription. Reporting CHANGE here \
+             would tell the consumer the wrong thing about what the AMF did"
+        );
+        assert_eq!(
+            posted["notifyCorrelationId"].as_str(),
+            Some("corr-397-group"),
+            "with NO `subsChangeNotifyCorrelationId` on the subscription, Table \
+             6.2.6.2.4-1 requires `notifyCorrelationId` -- the inverse of the sibling"
+        );
+        assert!(
+            posted["subsChangeNotifyCorrelationId"].is_null(),
+            "and not the member the subscription did not carry"
+        );
+
+        let stored_id = posted["reportList"][0]["subscriptionId"]
+            .as_str()
+            .and_then(|u| u.rsplit('/').next().map(String::from))
+            .expect("subscriptionId");
+        {
+            let ctx = amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.event_subscription_remove(&stored_id);
+        }
+        change_sink.stop().await.expect("change sink stop");
+    }
+
+    /// **#397.** A subscription created over the SBI round-trips its
+    /// `subsChangeNotifyUri` / `subsChangeNotifyCorrelationId`, and an unusable one is
+    /// REFUSED rather than stored.
+    ///
+    /// The echo matters for the reason the GPSI echo does (#74 criterion 4): it is how a
+    /// consumer confirms the created resource matches the request it made. The refusal
+    /// matters more — a stored-but-undeliverable change endpoint produces a subscription
+    /// whose SUBSCRIPTION_ID_CHANGE can never arrive, and the consumer would have no way
+    /// to learn that.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_subscription_round_trips_its_subs_change_callback_and_refuses_a_bad_uri() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        amf_context_init(64, 1024, 4096);
+        let supi = "imsi-001010000397800";
+
+        let mut body = subscription_body(
+            supi,
+            "http://127.0.0.1:9/notify/397-echo",
+            "LOCATION_REPORT",
+        );
+        body["subscription"]["subsChangeNotifyUri"] =
+            json!("http://127.0.0.1:9/notify/397-echo-change");
+        body["subscription"]["subsChangeNotifyCorrelationId"] = json!("corr-397-echo-change");
+
+        let resp = namf_request_handler(
+            SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&body)
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let created = body_json(&resp);
+        assert_eq!(
+            created["subscription"]["subsChangeNotifyUri"].as_str(),
+            Some("http://127.0.0.1:9/notify/397-echo-change"),
+            "the echo returns the change endpoint the consumer sent \
+             (TS29518_Namf_EventExposure.yaml:549)"
+        );
+        assert_eq!(
+            created["subscription"]["subsChangeNotifyCorrelationId"].as_str(),
+            Some("corr-397-echo-change"),
+            "and its correlation id (yaml:551)"
+        );
+        let sub_id = created["subscriptionId"]
+            .as_str()
+            .expect("subscriptionId")
+            .to_string();
+
+        // An unusable change URI is refused, not silently stored.
+        let mut bad = subscription_body(
+            "imsi-001010000397801",
+            "http://127.0.0.1:9/notify/397-echo2",
+            "LOCATION_REPORT",
+        );
+        bad["subscription"]["subsChangeNotifyUri"] = json!("not-a-uri");
+        let resp = namf_request_handler(
+            SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&bad)
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(
+            resp.status, 400,
+            "a present-but-unusable `subsChangeNotifyUri` must be refused: storing it \
+             would create a subscription whose SUBSCRIPTION_ID_CHANGE can never be \
+             delivered, and the consumer could not learn that"
+        );
+
+        let _ = namf_request_handler(SbiRequest::delete(format!(
+            "/namf-evts/v1/subscriptions/{sub_id}"
+        )))
+        .await;
     }
 }

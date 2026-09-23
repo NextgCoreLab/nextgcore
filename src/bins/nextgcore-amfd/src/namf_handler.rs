@@ -547,6 +547,10 @@ pub fn handle_event_subscribe(
         group_id: None,
         any_ue: true,
         expiry: None,
+        // No subscription-change callback either (#397): this entry point takes a
+        // single `callback_uri` and has no second endpoint to record.
+        subs_change_notify_uri: None,
+        subs_change_notify_correlation_id: None,
     };
 
     let ctx = amf_self();

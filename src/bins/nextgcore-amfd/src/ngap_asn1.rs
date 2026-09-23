@@ -900,6 +900,41 @@ pub fn extract_ran_ue_ngap_id(data: &[u8]) -> Option<u32> {
     }
 }
 
+/// Extract the Cause from a UE Context Release Request as a
+/// `(group, value)` pair (#397).
+///
+/// Cause is a MANDATORY IE of UEContextReleaseRequest (TS 38.413 §9.2.2.3), and
+/// `nextgcore_ngap::parser::parse_ue_context_release_request` already decodes it and
+/// refuses the message without it — this only surfaces what was decoded and then
+/// discarded, so nothing new is parsed off the wire.
+///
+/// The `(group, value)` shape is the one TS 29.518's `NgApCause`
+/// (`TS29571_CommonData.yaml:2554-2564`) requires, both members mandatory, holding
+/// *"the decimal value of the NG AP cause code values as specified in TS 38.413"*.
+/// The group indices match `ngap_handler::cause_group`, which is the same ordering
+/// `Cause`'s APER CHOICE uses (`nextgcore_asn1c::ngap::cause`).
+pub fn extract_release_request_cause(data: &[u8]) -> Option<(u8, i64)> {
+    use nextgcore_asn1c::ngap::cause::Cause;
+    let cause = match parser::decode_ngap_pdu(data) {
+        Ok(NgapMessage::UeContextReleaseRequest(req)) => req.cause,
+        Ok(_) => {
+            log::warn!("Expected UeContextReleaseRequest");
+            return None;
+        }
+        Err(e) => {
+            log::warn!("Failed to extract UE Context Release Request Cause: {e}");
+            return None;
+        }
+    };
+    Some(match cause {
+        Cause::RadioNetwork(v) => (crate::ngap_handler::cause_group::RADIO_NETWORK, v as i64),
+        Cause::Transport(v) => (crate::ngap_handler::cause_group::TRANSPORT, v as i64),
+        Cause::Nas(v) => (crate::ngap_handler::cause_group::NAS, v as i64),
+        Cause::Protocol(v) => (crate::ngap_handler::cause_group::PROTOCOL, v as i64),
+        Cause::Misc(v) => (crate::ngap_handler::cause_group::MISC, v as i64),
+    })
+}
+
 /// Build a UE Context Release Command with proper ASN.1 APER encoding
 ///
 /// `cause_group`/`cause_value` follow the TS 38.413 Section 9.3.1.2 cause groups

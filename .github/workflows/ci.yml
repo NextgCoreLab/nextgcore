@@ -222,6 +222,27 @@ jobs:
               -t nextgcore-rust/${nf%%d}:latest .
           done
 
+      # Issue #397: the RAN. The builder image above already compiles nr-gnb and
+      # nr-ue out of the sibling nextgsim checkout, but this job never turned them
+      # into images, so no stage here had ever originated a registration -- the
+      # baseline stage below is bring-up plus a /healthz probe.
+      #
+      # The gNB is why this PR deleted its in-process SCTP stand-in: the real one
+      # lives in nextgsim and this repo must not grow a second.
+      - name: "Build the nextgsim gNB + UE images (the REAL RAN, #397)"
+        run: |
+          cd nextgcore/docker/rust
+          test -f binaries/nr-gnb && test -f binaries/nr-ue \
+            || { echo "::error::binaries/nr-gnb or nr-ue missing -- Dockerfile.builder \
+                 tolerates a nextgsim build failure with '|| true', so check the builder \
+                 log for the nextgsim compile"; ls -la binaries/; exit 1; }
+          mkdir -p ../../../nextgsim/binaries
+          cp binaries/nr-gnb binaries/nr-ue ../../../nextgsim/binaries/
+          docker build -f ../../../nextgsim/Dockerfile.gnb-local \
+            -t nextgsim-gnb:latest ../../../nextgsim
+          docker build -f ../../../nextgsim/Dockerfile.ue-local \
+            -t nextgsim-ue:latest ../../../nextgsim
+
       - name: Start core network
         run: |
           cd nextgcore/docker/rust
@@ -241,6 +262,173 @@ jobs:
           curl -sf http://172.23.0.10:7777/healthz || echo "NRF not responding"
           echo "=== AMF health ==="
           curl -sf http://172.23.0.5:7777/healthz || echo "AMF not responding"
+
+      # ====================================================================
+      # Issue #397: the Namf_EventExposure DELIVERY assertion.
+      #
+      # WHY THIS IS HERE AND NOT A UNIT TEST. The three registration-path
+      # emitters fire from `send_registration_accept` AFTER
+      # `send_to_association(..).await?` -- deliberately, because the event is
+      # "the Accept has egressed", not "the Accept was built" (TS 24.501
+      # §5.5.1.2.4: the UE enters 5GMM-REGISTERED on RECEIVING the Accept).
+      # With no NG-RAN association that `?` returns early and the fire point is
+      # never reached, so an in-process test with no transport asserts an
+      # UNREACHABLE site and passes whether the wiring exists or not.
+      #
+      # PR #402's first revision solved that with a synthetic in-process SCTP
+      # peer inside amfd's unit tests. The repository owner refused it, and the
+      # facts back him: the real gNB lives in NextgCoreLab/nextgsim, which this
+      # job already checks out and whose nr-gnb the builder image already
+      # compiles. A second loopback gNB inside nextgcore would duplicate a peer
+      # that exists properly next door. So the coverage lives HERE, against the
+      # real thing, or nowhere.
+      #
+      # WHY IT IS POSITIVE. #187's history is the reason: its first CI assertion
+      # grepped a log for `invalid_client` and passed because the log contained
+      # ZERO token requests. A negative assertion is satisfied by every path
+      # that never arrives. So `namf_event_probe` asserts the notification
+      # BODIES -- the SUPI, `rmInfoList[0].rmState == REGISTERED`, the MCC/MNC/
+      # TAC the gNB reported -- and carries its own negative control (a second
+      # subscription for a SUPI that never registers, which must receive
+      # nothing, so a pass cannot come from an AMF that broadcasts to everyone).
+      #
+      # ORDERING IS LOAD-BEARING. Nothing is delivered to a subscription that
+      # does not exist yet, so the probe prints `SUBSCRIBED` and the gNB/UE are
+      # started only after that line appears. Not a sleep: a sleep that is too
+      # short makes this stage fail for a reason that is not the wiring.
+      #
+      # SCOPE CEILING, stated rather than implied. This asserts the
+      # REGISTRATION fire point (REGISTRATION_STATE_REPORT, LOCATION_REPORT,
+      # ACCESS_TYPE_REPORT). It does NOT assert the SERVICE REQUEST fire point
+      # (REACHABILITY_REPORT + LOCATION_REPORT from
+      # `handle_service_request_nas`), because reaching it needs the UE to go
+      # CM-IDLE and then originate uplink data or answer a page -- nextgsim's
+      # nr-ue triggers a Service Request on a TUN write or on Paging
+      # (nextgsim-ue/src/main.rs), and neither happens unprompted in a compose
+      # bring-up. Driving an idle transition here would need a new control
+      # surface on nr-ue, which is nextgsim work. Tracked as #403.
+      # ====================================================================
+      - name: Start the namf-evts notification sink and SUBSCRIBE (before any UE)
+        run: |
+          cd nextgcore/docker/rust
+          test -f binaries/namf_event_probe \
+            || { echo "::error::binaries/namf_event_probe missing -- the builder did not \
+                 produce it (see Dockerfile.builder)"; exit 1; }
+          # Run the probe inside the SMF container: the AMF POSTs the notification to
+          # the callback URI it was handed, so the sink needs an address on the
+          # 172.23.0.0/24 core network. The SMF is already on it, and port 8397 does
+          # not clash with its own SBI port (7777).
+          docker cp binaries/namf_event_probe nextgcore-smf:/tmp/namf_event_probe
+          docker compose exec -T --user root smf chmod 0755 /tmp/namf_event_probe
+          # mcc/mnc/tac are the DEPLOYED values: nextgsim/config/gnb.yaml carries
+          # `plmn: {mcc: 999, mnc: 70}` and `tac: 1`, matching configs/5gc/amf.yaml's
+          # `tai`. The AMF encodes a TAC <= 0xFFFF as 4 hex digits (TS 29.571), so
+          # tac 1 is "0001". A report assembled from a default `Tai5gs` would say
+          # mcc 000 / mnc 000 / tac 0000 -- which is what makes the assertion
+          # discriminating rather than merely satisfiable.
+          #
+          # The exit code is captured to /tmp/probe.rc because the process is
+          # detached: a detached `exec` discards its status, and a step that cannot
+          # read the probe's verdict would be exactly the green-proving-nothing
+          # outcome this assertion exists to avoid.
+          docker compose exec -T -d smf sh -c \
+            '/tmp/namf_event_probe 172.23.0.5:7777 8397 172.23.0.4 \
+               imsi-999700000000001 imsi-999709999999999 999 70 0001 240 \
+               > /tmp/probe.log 2>&1; echo $? > /tmp/probe.rc'
+          # Wait for the probe's own SUBSCRIBED line, NOT a sleep: the AMF matches a
+          # notification against STORED subscriptions, so a registration that lands
+          # before the subscription exists is delivered to nobody and this stage would
+          # fail for a reason that is not the wiring.
+          for _ in $(seq 1 60); do
+            if docker compose exec -T smf sh -c 'cat /tmp/probe.log 2>/dev/null' \
+                 | grep -qF SUBSCRIBED; then
+              echo "subscriptions are in place:"
+              docker compose exec -T smf sh -c 'cat /tmp/probe.log'
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::the probe never reported SUBSCRIBED, so no registration can be \
+                observed. Its log follows; a subscribe failure means the AMF's \
+                namf-evts POST surface refused the request."
+          docker compose exec -T smf sh -c 'cat /tmp/probe.log 2>/dev/null' || true
+          exit 1
+
+      - name: Register a REAL UE through nextgsim's gNB over N2
+        run: |
+          cd nextgcore/docker/rust
+          docker compose up -d gnb ue
+          # The gNB must associate and answer NG Setup before the UE's Registration
+          # Request can cross N2 at all, so failing here is a RAN problem and is worth
+          # distinguishing from a missing notification below.
+          #
+          # The two grep strings are the EXACT `info!` text nextgsim emits --
+          # "Received NG Setup Response from AMF {}: name={}"
+          # (nextgsim-gnb/src/ngap/task.rs) and "Received Registration Accept: UE is
+          # now {}" (nextgsim-ue/src/nas/mm/orchestrator.rs). Both are `info!` and both
+          # services run at RUST_LOG=info or finer, so neither is filtered out. A
+          # PARAPHRASE here would make this step silently unfalsifiable, which is why
+          # they were read out of nextgsim rather than guessed.
+          #
+          # `docker compose logs` is captured to a FILE and the file is grepped, never
+          # `docker compose logs | grep -q`: under pipefail, grep -q exits on first
+          # match, docker logs dies with SIGPIPE and the pipeline reports failure --
+          # turning a real match into a false negative. e2e-test.sh records the same
+          # rule at the top of the file.
+          for _ in $(seq 1 60); do
+            docker compose logs gnb > /tmp/gnb.log 2>&1 || true
+            if grep -qF 'Received NG Setup Response' /tmp/gnb.log; then break; fi
+            sleep 2
+          done
+          grep -F 'Received NG Setup Response' /tmp/gnb.log \
+            || { echo "::error::nextgsim's gNB never completed NG Setup with the AMF, so \
+                 no UE could register and the delivery assertion below cannot run"; \
+                 tail -60 /tmp/gnb.log; docker compose logs --tail=60 amf; exit 1; }
+          # A POSITIVE check that the UE really registered, so a later "nothing was
+          # delivered" is attributable: either the registration did not happen (this
+          # fails) or it happened and the notification did not (the probe fails).
+          for _ in $(seq 1 60); do
+            docker compose logs ue > /tmp/ue.log 2>&1 || true
+            if grep -qF 'Received Registration Accept' /tmp/ue.log; then break; fi
+            sleep 2
+          done
+          grep -F 'Received Registration Accept' /tmp/ue.log \
+            || { echo "::error::the UE never received a Registration Accept"; \
+                 tail -80 /tmp/ue.log; docker compose logs --tail=80 amf; exit 1; }
+
+      - name: Assert the AMF DELIVERED the registration Namf event notifications
+        run: |
+          cd nextgcore/docker/rust
+          # The probe's own budget is 240s; poll a little past it so a timeout is
+          # reported by the probe (with its diagnostic naming the missing types)
+          # rather than by this loop.
+          for _ in $(seq 1 130); do
+            if docker compose exec -T smf sh -c 'cat /tmp/probe.rc 2>/dev/null' \
+                 | grep -qE '^[0-9]+'; then break; fi
+            sleep 2
+          done
+          docker compose exec -T smf sh -c 'cat /tmp/probe.log' || true
+          RC=$(docker compose exec -T smf sh -c 'cat /tmp/probe.rc 2>/dev/null' | tr -d '\r\n')
+          if [ -z "$RC" ]; then
+            echo "::error::the probe never exited, so its verdict is unknown. A step that \
+                  cannot read the verdict proves nothing, so this fails."
+            docker compose logs --tail=80 amf
+            exit 1
+          fi
+          if [ "$RC" != "0" ]; then
+            # Single-quoted: the diagnostic names Rust code, and a backtick inside a
+            # double-quoted shell string is command substitution.
+            echo '::error::the Namf_EventExposure delivery assertion FAILED. The probe'"'"'s \
+                  own message above names which report or which value was wrong. If \
+                  reports are missing entirely, the #397 emitters placed after \
+                  send_to_association(..).await? in send_registration_accept are not \
+                  firing.'
+            echo "probe exit code: $RC"
+            docker compose logs --tail=120 amf
+            exit 1
+          fi
+          echo "the AMF delivered the registration-path Namf event notifications, \
+                asserted on their bodies, against nextgsim's real gNB"
 
       - name: Collect logs on failure
         if: failure()

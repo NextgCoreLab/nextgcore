@@ -154,17 +154,24 @@ pub fn handle_registration_request(
     amf_ue.nr_cgi = ran_ue.saved_nr_cgi.clone();
     amf_ue.gnb_ostream_id = ran_ue.gnb_ostream_id;
 
-    // Namf_EventExposure: registration-state + location reports (TS 29.518)
-    crate::namf_server::fire_registration_state_report(amf_ue, true);
-    crate::namf_server::fire_location_report(amf_ue);
-    // #74's ACCESS_TYPE_REPORT is deliberately NOT here. Every `fire_*` call in this
-    // module is in a function whose only callers are in `mod tests` --
-    // `handle_registration_request`, `handle_service_request` and
-    // `handle_deregistration_request` all are, as `ngap_path`'s
-    // `the_live_parser_captures_ue_s1_mode_capability` records for the same module
-    // ("implementing this there would have been a correct fix in an unreachable
-    // place"). The live NAS path is `ngap_path`'s `*_nas` handlers, so that is where
-    // the new emitters went.
+    // NO Namf_EventExposure emitter is in this module (#397).
+    //
+    // `REGISTRATION_STATE_REPORT` and `LOCATION_REPORT` used to fire from right here,
+    // and `REACHABILITY_REPORT` from `handle_service_request` -- and #74 counted all
+    // three as the AMF's working event types. They were not: every function in this
+    // module that held a `fire_*` call has only `mod tests` callers, so a conformant
+    // NWDAF subscribing to LOCATION_REPORT received nothing and ZERO of the twelve
+    // declared types fired in production. `ngap_path`'s
+    // `the_live_parser_captures_ue_s1_mode_capability` already recorded the shape of
+    // this for the same module: "implementing this there would have been a correct fix
+    // in an unreachable place."
+    //
+    // They now fire from the live NGAP path, at the moment each event actually occurs:
+    // `ngap_path::send_registration_accept` (REGISTERED + location, once the Accept has
+    // egressed), `handle_service_request_nas` (REACHABLE + location, once the Service
+    // Accept has) and `finish_deregistration` (DEREGISTERED). Adding a production caller
+    // to this module instead would have made the grep look live while leaving the events
+    // attached to a parser no NGAP message reaches.
 
     // Set UE security capability
     if let Some(ref sec_cap) = request.ue_security_capability {
@@ -295,12 +302,10 @@ pub fn handle_service_request(
     amf_ue.nr_cgi = ran_ue.saved_nr_cgi.clone();
     amf_ue.gnb_ostream_id = ran_ue.gnb_ostream_id;
 
-    // Namf_EventExposure: the UE became reachable + location update
-    crate::namf_server::fire_reachability_report(amf_ue, true);
-    crate::namf_server::fire_location_report(amf_ue);
-    // #74's CONNECTIVITY_STATE_REPORT is NOT here either: this function's only
-    // callers are in `mod tests`. See the note in `handle_registration_request`; the
-    // live site is `ngap_path::handle_service_request_nas`.
+    // No Namf_EventExposure emitter here either (#397): this function's only caller is
+    // in `mod tests`. `REACHABILITY_REPORT` and `LOCATION_REPORT` now fire from
+    // `ngap_path::handle_service_request_nas`, once the Service Accept has egressed --
+    // see the note in `handle_registration_request`.
 
     // Handle PDU session status
     if let Some(psi) = request.pdu_session_status {
@@ -364,8 +369,10 @@ pub fn handle_deregistration_request(
         log::debug!("UE switch-off deregistration");
     }
 
-    // Namf_EventExposure: the UE is deregistering (TS 29.518)
-    crate::namf_server::fire_registration_state_report(amf_ue, false);
+    // No Namf_EventExposure emitter here either (#397). The `DEREGISTERED`
+    // `REGISTRATION_STATE_REPORT` that used to fire from this line now fires from
+    // `ngap_path::finish_deregistration`, the common tail of both deregistration
+    // directions -- see the note in `handle_registration_request`.
 
     log::info!(
         "[{}] Deregistration request",
