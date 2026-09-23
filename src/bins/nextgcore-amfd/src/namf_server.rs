@@ -20,9 +20,10 @@ use serde_json::{json, Value};
 use crate::ngap_mcast::Tmgi;
 
 use crate::context::{
-    amf_self, AmfSess, AmfUe, AssignedEbi, EbiArp, EventSubscription, LcsCorrelationRecord, NrCgi,
-    PendingPositioningDl, PlmnId, PositioningDlKind, RanUe, Tai5gs, UeContextTransferState,
-    UeN1N2InfoSubscription, EBI_ASSIGNABLE, NEXTGCORE_INVALID_POOL_ID,
+    amf_self, AmfSess, AmfUe, AssignedEbi, EbiArp, EventArea, EventSubscription,
+    LcsCorrelationRecord, NrCgi, PendingPositioningDl, PlmnId, PositioningDlKind, RanUe, Tai5gs,
+    UeContextTransferState, UeN1N2InfoSubscription, UnsupportedAreaKind, EBI_ASSIGNABLE,
+    NEXTGCORE_INVALID_POOL_ID,
 };
 use crate::namf_handler::{
     self, AccessType, DeregistrationData, DeregistrationReason, N1N2MessageTransferCause,
@@ -712,25 +713,54 @@ fn rfc3339_to_system_time(s: &str) -> Option<std::time::SystemTime> {
 /// | `LOSS_OF_CONNECTIVITY` | `process_reachability_timers`, `finish_deregistration` |
 /// | `COMMUNICATION_FAILURE_REPORT` | `handle_ue_context_release`, on an unexpected RAN Cause |
 /// | `SUBSCRIPTION_ID_CHANGE` / `_ADDITION` | `handle_create_ue_context`, the §5.2.2.2.3.1 takeover |
+/// | `PRESENCE_IN_AOI_REPORT` | `send_registration_accept` (first notification), `handle_handover_notify` (the IN/OUT transition) |
+/// | `UES_IN_AREA_REPORT` | `send_registration_accept`, `handle_handover_notify` |
 ///
-/// # The two that do NOT fire, and why (ceilings, not omissions)
+/// **Eleven of twelve now fire.** #400 closed the two area-scoped ones by finding that
+/// the area does not have to be provisioned: `AmfEvent.areaList` carries it on the
+/// SUBSCRIPTION (*"Identifies the area to be applied"*, `29518-k00.txt:21391`), and
+/// TS 23.501 §5.6.11 says so for the UE-dedicated PRA — *"the subscription ... shall
+/// contain the PRA Identifier(s) and the list(s) of TAs, or NG-RAN Node identifier
+/// and/or cell identifiers composing the Presence Reporting Area(s)"*
+/// (`23501-k20.txt:13633-13636`). The AMF holds a real gNB-sourced TAI, so IN / OUT /
+/// UNKNOWN is a comparison rather than a guess. See
+/// `specs/implement-amfd-presence-area-model-for-aoi-events.md`.
 ///
-/// `PRESENCE_IN_AOI_REPORT` and `UES_IN_AREA_REPORT` need an area-of-interest /
-/// presence-area model this AMF does not have in any form. `AmfEventReport.areaList`
-/// (Table 6.2.6.2.5-1, `29518-k00.txt:21923-21940`) must report which subscribed AoI
-/// the UE is *"currently IN / OUT / UNKNOWN"*, and for a PRA identifier naming a set it
-/// must additionally report *"the additional PRA identifier of the actually individual
-/// PRA(s)"* per TS 23.501 §5.6.11. `AmfEventArea`
-/// (`TS29518_Namf_EventExposure.yaml:1011-1024`) is a choice of `PresenceInfo`,
-/// `LadnInfo`, `SliceAreaRestrictionInfo`, `sNssai` or `nsiId` — none of which this AMF
-/// stores or evaluates the UE against. `UES_IN_AREA_REPORT`'s `numberOfUes` (`:778`)
-/// needs the same model plus a per-area count.
+/// # The residual ceilings on the two area-scoped types
 ///
-/// They remain ACCEPTED rather than removed from this list, for the reason `group_id`
-/// subscriptions are accepted (#74 criterion 4): the subscription itself is conformant
-/// and refusing it is a wrong 400. What is refused is fabricating the report. Deciding
-/// the presence-area model is feature work in its own right and is filed as **#400**,
-/// with the five open model questions stated.
+/// Narrower than the ones #397 recorded, and each is a named OPTIONAL 3GPP feature or a
+/// stated missing input rather than a missing model:
+///
+/// * **Unresolvable areas report `UNKNOWN`, not `OUT_OF_AREA`.** A bare `praId` is the
+///   Core-Network-predefined PRA, *"predefined in the AMF"* and resolved *"based on
+///   local configuration"* (`23501-k20.txt:13624-13632`) which this tree has none of;
+///   `ladnInfo` / `sNssai` / `nsiId` / `sliceAreaRestrictionInfo` need LADN, NS-AoS or
+///   Partially-Allowed-NSSAI state the AMF does not hold; `ecgiList` /
+///   `globalRanNodeIdList` / `globaleNbIdList` describe an access this N2 never carries
+///   or a per-UE RAN-node identity the AMF does not store. `UNKNOWN` is one of the
+///   three verdicts Table 6.2.6.2.5-1 lists (`:21925-21928`), so this is reporting what
+///   is knowable — see `evaluate_presence`, which holds the whole mapping.
+/// * **`APRA` (PRA sets, `:24672-24688`) is not supported**, so `additionalPraId` is
+///   never sent: naming the individual PRAs within a set needs the same local
+///   configuration.
+/// * **`OBGAD`'s `reportingThreshold` (`:21720-21731`) is not honoured** — it is scoped
+///   to UEs subscribed to LCS Broadcast Assistance Types, which this AMF does not track.
+///   Accepted, echoed and logged as ignored.
+/// * **`AIML_CN`'s `uePosCap`/`ueUpPosCap` are omitted**: both are conditional on the
+///   capabilities being *"available in AMF"* (`:22154-22173`) and none are held.
+/// * **`AOIEF`'s filters (`:21630-21707`) are accepted and ignored**, each with its
+///   reason logged at subscribe time.
+/// * **The SERVICE REQUEST is not a fire point**, because
+///   `ngap_asn1::parse_uplink_nas_transport_asn1` discards the
+///   `UserLocationInformation` the NGAP parser decodes as mandatory — so that path
+///   cannot learn a new location and firing there would report an unchanged verdict as
+///   news, which §5.3.1's change rule (`:4895-4897`) forbids. Filed as **#406**, which
+///   also records that `LOCATION_REPORT` reports a STALE TAI from that site today.
+///   Reasoned in full at the `handle_handover_notify` fire point.
+///
+/// Every one of these is ACCEPTED at the subscription surface rather than refused, for
+/// the reason `group_id` records (#74 criterion 4): the subscription is conformant and
+/// refusing it is a wrong 400. What is refused is fabricating a verdict.
 ///
 /// `TIMEZONE_REPORT` is a THIRD kind of gap: the AMF holds no UE time zone at all.
 /// `gmm_build.rs:983-985` sends `local_time_zone: None`,
@@ -759,11 +789,226 @@ const AMF_EVENT_TYPES: &[&str] = &[
     "LOSS_OF_CONNECTIVITY",
 ];
 
+/// Parse a TS 29.571 `Tac` (`TS29571_CommonData.yaml:1340-1348`) into the internal
+/// 24-bit TAC.
+///
+/// *"2 or 3-octet string identifying a tracking area code ... in hexadecimal
+/// representation"*, so 4 or 6 hex digits, most significant first. The inverse of
+/// [`tai_json`]. Returns `None` for anything that does not match the pattern, so a
+/// malformed TAC is REFUSED at subscribe time rather than silently becoming TAC 0 — a
+/// TAC-0 area would compare equal to every UE whose location was never learned.
+fn parse_tac(s: &str) -> Option<u32> {
+    if !matches!(s.len(), 4 | 6) || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(s, 16).ok()
+}
+
+/// Parse a TS 29.571 `PlmnId` (`{"mcc": "\d{3}", "mnc": "\d{2,3}"}`) — the inverse of
+/// [`plmn_id_json`].
+///
+/// Refuses a malformed value rather than defaulting, for the same reason as
+/// [`parse_tac`]: `PlmnId::new` fills missing digits with 0, so a short MCC would
+/// silently become a different network.
+fn parse_plmn_id(v: &Value) -> Option<PlmnId> {
+    let mcc = v.get("mcc").and_then(Value::as_str)?;
+    let mnc = v.get("mnc").and_then(Value::as_str)?;
+    if mcc.len() != 3 || !mcc.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    if !matches!(mnc.len(), 2 | 3) || !mnc.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(PlmnId::new(mcc, mnc))
+}
+
+/// Parse a TS 29.571 `Tai` (`TS29571_CommonData.yaml:2298-2310`; `plmnId` and `tac`
+/// both REQUIRED).
+fn parse_tai(v: &Value) -> Option<Tai5gs> {
+    Some(Tai5gs {
+        plmn_id: parse_plmn_id(v.get("plmnId")?)?,
+        tac: parse_tac(v.get("tac").and_then(Value::as_str)?)?,
+    })
+}
+
+/// Parse a TS 29.571 `Ncgi` (`TS29571_CommonData.yaml:2342-2354`; `plmnId` and
+/// `nrCellId` both REQUIRED).
+///
+/// `NrCellId` is a 36-bit value in 9 hex digits. A cell id of 0 is refused: it is
+/// indistinguishable from the default `NrCgi` that [`ue_ncgi_is_known`] uses to mean
+/// "never learned", so accepting it would make an area that matches every
+/// location-less UE.
+fn parse_ncgi(v: &Value) -> Option<NrCgi> {
+    let nr_cell_id = v.get("nrCellId").and_then(Value::as_str)?;
+    if nr_cell_id.len() != 9 || !nr_cell_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let cell_id = u64::from_str_radix(nr_cell_id, 16).ok()?;
+    if cell_id == 0 {
+        return None;
+    }
+    Some(NrCgi {
+        plmn_id: parse_plmn_id(v.get("plmnId")?)?,
+        cell_id,
+    })
+}
+
+/// Parse one `AmfEventArea` (`TS29518_Namf_EventExposure.yaml:1011-1024`) into an
+/// [`EventArea`] (#400).
+///
+/// `AmfEventArea` is a **choice of five** and this function is where the modelled two
+/// are separated from the three that are not. A non-`presenceInfo` alternative is
+/// RECORDED rather than refused (see [`UnsupportedAreaKind`]): the subscription is
+/// conformant, and it will report `UNKNOWN` for that area.
+///
+/// `praId` is taken from `presence_info_key` when this area came from the `MPRA`
+/// `presenceInfoList` map, whose *"'praId' attribute within the PresenceInfo data type
+/// shall also be the key of the map"* (`29518-k00.txt:21527-21532`).
+///
+/// Returns `None` only for an area object that names NO recognised alternative at all —
+/// an empty `{}`. There is nothing to report presence in for such an entry, and keeping
+/// it would put a contentless `UNKNOWN` in every report.
+fn parse_event_area(v: &Value, presence_info_key: Option<&str>) -> Option<EventArea> {
+    let mut area = EventArea::default();
+
+    // The four alternatives this AMF cannot evaluate, checked first so an area that
+    // names one is recorded as such even if it also carries a stray `presenceInfo`.
+    for (member, kind) in [
+        ("ladnInfo", UnsupportedAreaKind::LadnInfo),
+        (
+            "sliceAreaRestrictionInfo",
+            UnsupportedAreaKind::SliceAreaRestrictionInfo,
+        ),
+        ("sNssai", UnsupportedAreaKind::SNssai),
+        ("nsiId", UnsupportedAreaKind::NsiId),
+    ] {
+        if v.get(member).is_some_and(|m| !m.is_null()) {
+            area.unsupported_kind = Some(kind);
+            break;
+        }
+    }
+
+    // `presenceInfo`, or the bare `PresenceInfo` body when this came from the
+    // `presenceInfoList` map (whose values ARE `PresenceInfo`, not `AmfEventArea`).
+    let presence_info = v.get("presenceInfo").or(if presence_info_key.is_some() {
+        Some(v)
+    } else {
+        None
+    });
+    if let Some(pi) = presence_info {
+        // `presenceInfoList`'s key IS the praId (`:21527-21532`); for an `areaList`
+        // entry it is the member.
+        area.pra_id = presence_info_key
+            .map(String::from)
+            .or_else(|| pi.get("praId").and_then(Value::as_str).map(String::from));
+        if let Some(list) = pi.get("trackingAreaList").and_then(Value::as_array) {
+            area.tracking_area_list = list.iter().filter_map(parse_tai).collect();
+        }
+        if let Some(list) = pi.get("ncgiList").and_then(Value::as_array) {
+            area.ncgi_list = list.iter().filter_map(parse_ncgi).collect();
+        }
+        // `ecgiList` / `globalRanNodeIdList` / `globaleNbIdList` are deliberately NOT
+        // parsed. E-UTRAN cell ids and eNodeB ids describe an EPS access this AMF's N2
+        // never carries (`UserLocationInformation` in `nextgcore-ngap` has exactly one
+        // variant, `Nr`), and the AMF stores no NG-RAN node identity per UE:
+        // `AmfContext::gnb_list` has ZERO production writers, since `gnb_add`'s only
+        // callers are inside `mod tests`. An area of those kinds therefore has no
+        // enumerated element this AMF can compare against, so it falls through to
+        // `is_evaluable() == false` and reports UNKNOWN — the same honest answer as a
+        // bare praId, and for the same reason.
+    }
+
+    if area.unsupported_kind.is_none()
+        && area.pra_id.is_none()
+        && area.tracking_area_list.is_empty()
+        && area.ncgi_list.is_empty()
+    {
+        return None;
+    }
+    Some(area)
+}
+
+/// Collect the subscribed Areas of Interest from one `AmfEvent` (#400).
+///
+/// Reads both containers the spec offers, and enforces their mutual exclusion:
+/// `presenceInfoList`'s own rule is *"When present, the areaList shall be absent"*
+/// (`29518-k00.txt:21534`). When a consumer sends both, `presenceInfoList` wins and the
+/// conflict is logged — choosing the `MPRA` form because it is the one that carries an
+/// explicit praId key per area, so nothing is lost by preferring it.
+///
+/// The map is sorted by key so the area ORDER is deterministic. `areaList`'s order is
+/// the consumer's; a `HashMap`-derived order would make the report's `areaList` vary
+/// run to run, and `EventArea::identity` falls back to the ordinal.
+fn parse_event_areas(event: &Value) -> Vec<EventArea> {
+    if let Some(map) = event.get("presenceInfoList").and_then(Value::as_object) {
+        if event.get("areaList").is_some() {
+            log::warn!(
+                "AmfEvent carries both presenceInfoList and areaList, which \
+                 `29518-k00.txt:21534` forbids (\"When present, the areaList shall be \
+                 absent\"); using presenceInfoList"
+            );
+        }
+        let mut keys: Vec<&String> = map.keys().collect();
+        keys.sort();
+        return keys
+            .into_iter()
+            .filter_map(|k| parse_event_area(&map[k], Some(k)))
+            .collect();
+    }
+    event
+        .get("areaList")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|a| parse_event_area(a, None))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Rebuild the AmfEventSubscription JSON echo from the stored subscription
 fn subscription_echo_json(sub: &EventSubscription) -> Value {
+    // #400: the subscribed areas round-trip on the events they belong to. A consumer
+    // that named an Area of Interest must see it back, for the same reason the GPSI
+    // echo exists — it is how it confirms the created resource matches its request,
+    // and for this type it is also how it confirms the AMF did not silently drop an
+    // area alternative it cannot evaluate.
+    //
+    // Attached to the AREA-SCOPED events only. `areas` is stored per subscription
+    // (see `EventSubscription::areas`), so echoing it on every event would claim the
+    // consumer had put an `areaList` on, say, its `LOCATION_REPORT` when it did not.
+    let area_list: Vec<Value> = sub
+        .areas
+        .iter()
+        // No `presenceState` in the ECHO: that member states the UE's presence
+        // (`29571-k00.txt:5226-5232`), and a subscription echo reports no UE. The
+        // `presenceInfoList` IE makes the same point for its own container — *"The
+        // 'presenceState' attribute within the PresenceInfo data type shall not be
+        // supplied"* (`29518-k00.txt:21530-21532`).
+        .map(|area| {
+            let mut a = event_area_json(area, "");
+            if let Some(pi) = a.get_mut("presenceInfo").and_then(Value::as_object_mut) {
+                pi.remove("presenceState");
+            }
+            a
+        })
+        .collect();
     let mut subscription = json!({
         "eventList": sub.event_types.iter()
-            .map(|t| json!({"type": t}))
+            .map(|t| {
+                let mut event = json!({"type": t});
+                if !area_list.is_empty()
+                    && matches!(t.as_str(), "PRESENCE_IN_AOI_REPORT" | "UES_IN_AREA_REPORT")
+                {
+                    event["areaList"] = json!(area_list);
+                    if let Some(threshold) = sub.reporting_threshold {
+                        if t == "UES_IN_AREA_REPORT" {
+                            event["reportingThreshold"] = json!(threshold);
+                        }
+                    }
+                }
+                event
+            })
             .collect::<Vec<_>>(),
         "eventNotifyUri": sub.notify_uri,
         "notifyCorrelationId": sub.notify_correlation_id,
@@ -843,6 +1088,13 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
 
     let mut event_types = Vec::new();
     let mut immediate_types = Vec::new();
+    // #400: the subscribed Areas of Interest, and the OBGAD threshold. Collected across
+    // every `AmfEvent` in the list rather than per event, because `EventSubscription` is
+    // this tree's one stored unit and the area-scoped types are matched off its
+    // `event_types`. A consumer that named areas on two events in one subscription gets
+    // the union, which is the only reading that reports every area it asked about.
+    let mut areas: Vec<EventArea> = Vec::new();
+    let mut reporting_threshold: Option<i64> = None;
     for event in event_list {
         let Some(event_type) = event.get("type").and_then(Value::as_str) else {
             return mandatory_ie_missing("subscription.eventList[].type");
@@ -859,6 +1111,67 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
             .unwrap_or(false)
         {
             immediate_types.push(event_type.to_string());
+        }
+        areas.extend(parse_event_areas(event));
+        if let Some(t) = event.get("reportingThreshold").and_then(Value::as_i64) {
+            reporting_threshold = Some(t);
+        }
+        // #400: the AOIEF filter IEs (`29518-k00.txt:21630-21707`, feature AOIEF) are
+        // ACCEPTED and logged, never refused — they are optional IEs on a conformant
+        // subscription, and a 400 would be the wrong answer for the reason #74
+        // criterion 4 established for `groupId`. What is refused is pretending to
+        // honour them: `adjustAoIOnRa` needs the UE's Registration Area TA list and
+        // `ranTimingSynchroStatusChange` needs the UE 5GMM capability bit for network
+        // reconnection due to RAN timing synchronisation change, and this AMF holds
+        // neither. Reporting as if they had been applied would give the consumer a
+        // verdict computed by a rule it did not ask for.
+        for (member, why) in [
+            (
+                "adjustAoIOnRa",
+                "needs the UE's Registration Area TA list, which this AMF does not hold \
+                 (TS 29.518 §5.3.1 `:4902-4911`)",
+            ),
+            (
+                "ranTimingSynchroStatusChange",
+                "needs the UE 5GMM capability for network reconnection due to RAN timing \
+                 synchronization status change (TS 23.501 §5.4.4a), which this AMF does \
+                 not parse",
+            ),
+            (
+                "notifyForSupiList",
+                "AOIEF consumer-side filter; this AMF reports every matched UE",
+            ),
+            (
+                "notifyForGroupList",
+                "AOIEF group filter; this AMF has no group-membership source (see \
+                 EventSubscription::group_id)",
+            ),
+            (
+                "notifyForSnssaiDnnList",
+                "AOIEF DNN/S-NSSAI filter; would need per-UE PDU-session DNN matching \
+                 at report time",
+            ),
+        ] {
+            if event.get(member).is_some_and(|m| !m.is_null()) {
+                log::info!(
+                    "Event subscription carries `{member}` (feature AOIEF), which this AMF \
+                     does NOT honour: {why}. The subscription is accepted; the IE is \
+                     ignored."
+                );
+            }
+        }
+        if event
+            .get("uePosCapRequestedInd")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            log::info!(
+                "Event subscription carries `uePosCapRequestedInd` (feature AIML_CN). The \
+                 report's `uePosCap`/`ueUpPosCap` IEs are conditional on the capabilities \
+                 being \"available in AMF\" (`29518-k00.txt:22154-22173`) and this AMF holds \
+                 none, so they are omitted — which is the conformant answer for a \
+                 conditional IE whose condition is false."
+            );
         }
         event_types.push(event_type.to_string());
     }
@@ -980,10 +1293,13 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
         expiry,
         subs_change_notify_uri,
         subs_change_notify_correlation_id,
+        areas,
+        reported_presence: std::collections::HashMap::new(),
+        reporting_threshold,
     };
 
     // Immediate reports for events with immediateFlag (current state)
-    let report_list = build_immediate_reports(&immediate_types, supi.as_deref());
+    let report_list = build_immediate_reports(&immediate_types, supi.as_deref(), &sub);
 
     {
         let Ok(guard) = ctx.read() else {
@@ -1022,39 +1338,116 @@ fn handle_event_subscription_create(request: &SbiRequest) -> SbiResponse {
 }
 
 /// Build immediate event reports for the subscribed UE's current state
-fn build_immediate_reports(immediate_types: &[String], supi: Option<&str>) -> Vec<Value> {
+///
+/// #400: the two area-scoped types are handled BEFORE the SUPI guard below, because
+/// neither needs a targeted UE — `UES_IN_AREA_REPORT` is any-UE by definition
+/// (`29518-k00.txt:5170`) and `PRESENCE_IN_AOI_REPORT` targeting any UE has NOTE 3's
+/// UE-less shape.
+fn build_immediate_reports(
+    immediate_types: &[String],
+    supi: Option<&str>,
+    sub: &EventSubscription,
+) -> Vec<Value> {
+    let mut reports = Vec::new();
+
+    // #400 / TS 29.518 §5.3.1 NOTE 3 (`29518-k00.txt:4960-4971`): *"If the
+    // immediateFlag is set and the AMF can determine the current UE presence state
+    // (IN/OUT/UNKNOWN) in the AoI at the time of the subscription (e.g. when the AoI
+    // comprises TAIs...), the AMF sends an immediate report including the current UE
+    // presence in the AoI."* The AMF CAN determine it here — the areas are in hand and
+    // the UE's TAI is stored — so the immediate report is real rather than deferred.
+    if immediate_types
+        .iter()
+        .any(|t| t == "PRESENCE_IN_AOI_REPORT")
+        && !sub.areas.is_empty()
+    {
+        let ue = supi.and_then(find_ue_by_context_id);
+        match ue {
+            Some(ue) => {
+                let area_list: Vec<Value> = sub
+                    .areas
+                    .iter()
+                    .map(|area| event_area_json(area, evaluate_presence(&ue, area)))
+                    .collect();
+                reports.push(build_event_report(
+                    "PRESENCE_IN_AOI_REPORT",
+                    supi,
+                    json!({ "areaList": area_list }),
+                ));
+            }
+            // No resolvable UE: for an any-UE subscription that IS the NOTE 3 case —
+            // no UE is IN the AoI — and NOTE 3 gives it an explicit shape rather than
+            // an omission (`:22216-22218`).
+            None if sub.any_ue => reports.push(empty_any_ue_aoi_report(sub)),
+            None => {}
+        }
+    }
+
+    // `UES_IN_AREA_REPORT` with immediateFlag: NOTE 8 (`:22188-22189`) — *"For an
+    // Immediate Report, UE Last Known Location is used to count the UEs within the
+    // area"* — which is exactly what `evaluate_presence` reads.
+    if immediate_types.iter().any(|t| t == "UES_IN_AREA_REPORT") && !sub.areas.is_empty() {
+        let ues: Vec<AmfUe> = amf_self()
+            .read()
+            .ok()
+            .map(|guard| {
+                guard
+                    .ue_store()
+                    .snapshot()
+                    .into_iter()
+                    .map(|(_, s)| s.amf_ue.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut total = 0usize;
+        let mut area_list = Vec::new();
+        for area in &sub.areas {
+            total += ues
+                .iter()
+                .filter(|u| evaluate_presence(u, area) == PRESENCE_IN_AREA)
+                .count();
+            area_list.push(event_area_json(area, PRESENCE_IN_AREA));
+        }
+        // No SUPI: NOTE 1 (`:22212`) forbids SUPI/PEI/GPSI for this type.
+        let mut report = build_event_report(
+            "UES_IN_AREA_REPORT",
+            None,
+            json!({ "areaList": area_list, "numberOfUes": total }),
+        );
+        report["anyUe"] = json!(true);
+        reports.push(report);
+    }
+
     let Some(supi) = supi else {
-        return Vec::new();
+        return reports;
     };
     let Some(ue) = find_ue_by_context_id(supi) else {
-        return Vec::new();
+        return reports;
     };
-    immediate_types
-        .iter()
-        .filter_map(|event_type| {
-            let extra = match event_type.as_str() {
-                "LOCATION_REPORT" => json!({ "location": nr_location_json(&ue) }),
-                "REGISTRATION_STATE_REPORT" => json!({
-                    "rmInfoList": [{ "rmState": "REGISTERED", "accessType": "3GPP_ACCESS" }]
-                }),
-                "REACHABILITY_REPORT" => {
-                    let reachable = ue_ran_context(&ue).is_some();
-                    json!({ "reachability": if reachable { "REACHABLE" } else { "UNREACHABLE" } })
-                }
-                "CONNECTIVITY_STATE_REPORT" => {
-                    let connected = ue_ran_context(&ue).is_some();
-                    json!({
-                        "cmInfoList": [{
-                            "cmState": if connected { "CONNECTED" } else { "IDLE" },
-                            "accessType": "3GPP_ACCESS"
-                        }]
-                    })
-                }
-                _ => return None,
-            };
-            Some(build_event_report(event_type, Some(supi), extra))
-        })
-        .collect()
+    reports.extend(immediate_types.iter().filter_map(|event_type| {
+        let extra = match event_type.as_str() {
+            "LOCATION_REPORT" => json!({ "location": nr_location_json(&ue) }),
+            "REGISTRATION_STATE_REPORT" => json!({
+                "rmInfoList": [{ "rmState": "REGISTERED", "accessType": "3GPP_ACCESS" }]
+            }),
+            "REACHABILITY_REPORT" => {
+                let reachable = ue_ran_context(&ue).is_some();
+                json!({ "reachability": if reachable { "REACHABLE" } else { "UNREACHABLE" } })
+            }
+            "CONNECTIVITY_STATE_REPORT" => {
+                let connected = ue_ran_context(&ue).is_some();
+                json!({
+                    "cmInfoList": [{
+                        "cmState": if connected { "CONNECTED" } else { "IDLE" },
+                        "accessType": "3GPP_ACCESS"
+                    }]
+                })
+            }
+            _ => return None,
+        };
+        Some(build_event_report(event_type, Some(supi), extra))
+    }));
+    reports
 }
 
 /// PATCH /namf-evts/v1/subscriptions/{subscriptionId} —
@@ -1487,6 +1880,508 @@ pub fn fire_communication_failure(ue: &AmfUe, cause_group: u8, cause_value: i64)
     );
 }
 
+// ============================================================================
+// #400: the presence-area model — PRESENCE_IN_AOI_REPORT / UES_IN_AREA_REPORT
+// ============================================================================
+
+/// The TS 29.571 `PresenceState` values (`TS29571_CommonData.yaml:1858-1872`).
+///
+/// `INACTIVE` is deliberately NOT produced by this AMF. It means *"the presence
+/// reporting area is inactive in the serving node"* (`:1872`), which TS 23.501
+/// §5.6.11 defines as an explicit overload action: *"In order to prevent overload, the
+/// AMF **may** set the reporting for one or more of the received Presence Reporting
+/// Area(s) to inactive under consideration of the priority configured for each of Core
+/// Network predefined Presence Reporting Area(s)"* (`23501-k20.txt:13646-13653`). It is
+/// a `may`, it is keyed on a per-PRA priority that only local configuration supplies,
+/// and this AMF never deactivates an area — so emitting `INACTIVE` would claim an
+/// overload decision it never took.
+const PRESENCE_IN_AREA: &str = "IN_AREA";
+const PRESENCE_OUT_OF_AREA: &str = "OUT_OF_AREA";
+const PRESENCE_UNKNOWN: &str = "UNKNOWN";
+
+/// Whether the AMF has genuinely learned this UE's TAI.
+///
+/// `Tai5gs::default()` is an all-zero PLMN with TAC 0, which no real gNB reports: the
+/// TAI is written from the InitialUEMessage's own `UserLocationInformation`
+/// (`ngap_path.rs:1586-1589`), so a default means the UE context was created by a path
+/// that never saw a location — e.g. an inter-AMF `CreateUEContext` takeover.
+///
+/// This distinction is what makes `UNKNOWN` honest rather than a hedge: without it the
+/// evaluator would answer `OUT_OF_AREA` for a UE whose location it never learned, which
+/// is a fabricated negative.
+fn ue_tai_is_known(ue: &AmfUe) -> bool {
+    let tai = &ue.nr_tai;
+    let plmn = &tai.plmn_id;
+    let plmn_is_default = plmn.mcc1 == 0
+        && plmn.mcc2 == 0
+        && plmn.mcc3 == 0
+        && plmn.mnc1 == 0
+        && plmn.mnc2 == 0
+        && plmn.mnc3 == 0;
+    !(plmn_is_default && tai.tac == 0)
+}
+
+/// Whether the AMF has genuinely learned this UE's NR cell identity.
+///
+/// **Narrower than [`ue_tai_is_known`], and that asymmetry is real, not an oversight.**
+/// `AmfUe::nr_cgi` has exactly ONE production writer — `handle_handover_notify`
+/// (`ngap_path.rs:7391-7392`). The registration path parses the InitialUEMessage's
+/// `nr_cell_identity` (`ngap_asn1.rs:326`), logs it, and never stores it; the two writes
+/// in `gmm_handler` (`:154`, `:302`) sit in functions whose only callers are inside
+/// `mod tests`, which is the #397 defect.
+///
+/// So a UE that registered but never handed over has a DEFAULT `nr_cgi`, and an
+/// `ncgiList` area must report `UNKNOWN` for it rather than `OUT_OF_AREA`. Reporting
+/// "not in the area" off a field production never wrote is precisely the fabrication
+/// #400 exists to prevent.
+fn ue_ncgi_is_known(ue: &AmfUe) -> bool {
+    ue.nr_cgi.cell_id != 0
+}
+
+/// Two TAIs name the same tracking area when their PLMN and TAC both match.
+fn tai_matches(a: &Tai5gs, b: &Tai5gs) -> bool {
+    a.plmn_id == b.plmn_id && a.tac == b.tac
+}
+
+/// Two NCGIs name the same cell when their PLMN and the 36-bit NR Cell Identity match.
+///
+/// The mask mirrors `ncgi_json`: `NrCellId` is *"36-bit string"*
+/// (`TS29571_CommonData.yaml`), so bits above 36 are not part of the identity and must
+/// not make two equal cells compare unequal.
+fn ncgi_matches(a: &NrCgi, b: &NrCgi) -> bool {
+    a.plmn_id == b.plmn_id && (a.cell_id & 0xF_FFFF_FFFF) == (b.cell_id & 0xF_FFFF_FFFF)
+}
+
+/// Decide a UE's `PresenceState` for one subscribed Area of Interest (#400).
+///
+/// **A pure function, separate from every handler, because this mapping IS the
+/// conformance decision** — the shape #397 used for `is_communication_failure_cause`.
+/// It is also what makes the ceiling testable: each `UNKNOWN` arm below is a stated
+/// limit with a clause behind it, not a default.
+///
+/// # The three verdicts, and where each is sanctioned
+///
+/// `AmfEventReport.areaList` *"represents the specified Area(s) of Interest the UE is
+/// currently IN / OUT / UNKNOWN"* (Table 6.2.6.2.5-1, `29518-k00.txt:21925-21928`), and
+/// §5.3.1's Notification line for the event says the same: *"UE-ID(s), Area identifier,
+/// Presence Status (IN/OUT/UNKNOWN)"* (`:4954-4956`). So all three are first-class
+/// answers; `UNKNOWN` is not an error code.
+///
+/// # Which areas are evaluable, and why the rest are not
+///
+/// | area | verdict | clause |
+/// |---|---|---|
+/// | `trackingAreaList` containing the UE's TAI | `IN_AREA` | `29571-k00.txt:5234-5242` — the TAs *"that constitutes the area"* |
+/// | `trackingAreaList` not containing it | `OUT_OF_AREA` | same |
+/// | `ncgiList` containing the UE's NCGI | `IN_AREA` | `:5253-5259` |
+/// | `ncgiList`, UE NCGI never learned | `UNKNOWN` | see [`ue_ncgi_is_known`] |
+/// | bare `praId`, no enumerated elements | `UNKNOWN` | the Core-Network-predefined form, *"predefined in the AMF"* (`23501-k20.txt:13624-13627`) and resolved *"based on local configuration"* (`:13630-13632`) — configuration this tree does not have, so the AMF cannot know which TAIs the identifier names |
+/// | `ladnInfo` / `sNssai` / `nsiId` / `sliceAreaRestrictionInfo` | `UNKNOWN` | state the AMF does not hold — see [`UnsupportedAreaKind`] |
+/// | any area, UE TAI never learned | `UNKNOWN` | see [`ue_tai_is_known`] |
+///
+/// A TAI list is checked BEFORE an NCGI list when both are present, because the TAI is
+/// the coarser and better-populated fact: it is written on every registration, whereas
+/// the cell identity is written only on a handover. An area that enumerates both and
+/// whose TAI check answers `OUT_OF_AREA` is genuinely outside — the cell cannot be
+/// inside a TA the UE is not in.
+fn evaluate_presence(ue: &AmfUe, area: &EventArea) -> &'static str {
+    if let Some(kind) = area.unsupported_kind {
+        log::debug!(
+            "PRESENCE_IN_AOI_REPORT: area names `{}`, which this AMF holds no state for; \
+             reporting UNKNOWN (TS 29.518 Table 6.2.6.2.5-1 lists UNKNOWN beside IN and OUT)",
+            kind.as_str()
+        );
+        return PRESENCE_UNKNOWN;
+    }
+    if !area.is_evaluable() {
+        // A bare `praId`: the Core-Network-predefined PRA of TS 23.501 §5.6.11, whose
+        // TA/cell membership is "predefined in the AMF" by local configuration this
+        // tree does not have. The identifier is echoed back in the report so the
+        // consumer knows which area the UNKNOWN belongs to.
+        log::debug!(
+            "PRESENCE_IN_AOI_REPORT: praId {:?} names a Core-Network-predefined PRA with no \
+             enumerated elements; this AMF has no local PRA configuration to resolve it \
+             (TS 23.501 §5.6.11, `23501-k20.txt:13630-13632`), so reporting UNKNOWN",
+            area.pra_id
+        );
+        return PRESENCE_UNKNOWN;
+    }
+    if !area.tracking_area_list.is_empty() {
+        if !ue_tai_is_known(ue) {
+            return PRESENCE_UNKNOWN;
+        }
+        return if area
+            .tracking_area_list
+            .iter()
+            .any(|tai| tai_matches(tai, &ue.nr_tai))
+        {
+            PRESENCE_IN_AREA
+        } else {
+            PRESENCE_OUT_OF_AREA
+        };
+    }
+    // NCGI-only area.
+    if !ue_ncgi_is_known(ue) {
+        return PRESENCE_UNKNOWN;
+    }
+    if area
+        .ncgi_list
+        .iter()
+        .any(|ncgi| ncgi_matches(ncgi, &ue.nr_cgi))
+    {
+        PRESENCE_IN_AREA
+    } else {
+        PRESENCE_OUT_OF_AREA
+    }
+}
+
+/// Render one `AmfEventArea` for an `AmfEventReport.areaList` entry, carrying the
+/// verdict (#400).
+///
+/// The area is echoed back in the SAME shape the consumer subscribed with — the
+/// `praId`, the TA list, the cell list — with `presenceState` added, because
+/// `AmfEventArea` in a report is the same type as in a subscription (yaml `:740-744`
+/// and `:604-608` both reference `#/components/schemas/AmfEventArea`) and the consumer
+/// has to be able to tell WHICH of its subscribed areas the verdict answers.
+///
+/// `presenceState` placement follows `PresenceInfo`'s own NOTE: *"If the
+/// additionalPraId IE is not present, this IE shall state the presence information of
+/// the UE for the PRA identified by the praId IE"* (`29571-k00.txt:5274-5276`).
+/// `additionalPraId` is never set here — that is the `APRA` feature, refused below.
+fn event_area_json(area: &EventArea, presence_state: &str) -> Value {
+    let mut presence_info = json!({ "presenceState": presence_state });
+    if let Some(pra_id) = &area.pra_id {
+        presence_info["praId"] = json!(pra_id);
+    }
+    if !area.tracking_area_list.is_empty() {
+        presence_info["trackingAreaList"] = json!(area
+            .tracking_area_list
+            .iter()
+            .map(tai_json)
+            .collect::<Vec<_>>());
+    }
+    if !area.ncgi_list.is_empty() {
+        presence_info["ncgiList"] = json!(area.ncgi_list.iter().map(ncgi_json).collect::<Vec<_>>());
+    }
+    // A non-`presenceInfo` alternative is echoed back under its OWN member name, so
+    // the consumer sees the area it named rather than a `presenceInfo` it never sent.
+    // The verdict still travels in `presenceInfo.presenceState`, which is the only
+    // place `AmfEventArea` has for one — `ladnInfo` has a `presence` member
+    // (yaml:1031) but the other three have none at all.
+    let mut area_json = json!({ "presenceInfo": presence_info });
+    if let Some(kind) = area.unsupported_kind {
+        area_json[kind.as_str()] = json!(null);
+    }
+    area_json
+}
+
+/// Fire a `PRESENCE_IN_AOI_REPORT` for every subscription whose subscribed Area(s) of
+/// Interest this UE's presence has CHANGED in (#400).
+///
+/// # Why this emitter does not go through `fire_ue_event`
+///
+/// Every other emitter fires one identical report to each matching subscriber. This one
+/// cannot: the report's `areaList` is built from the SUBSCRIPTION's own areas, so each
+/// subscriber gets a different body, and §5.3.1's change rule means some subscribers get
+/// nothing at all. So it matches subscriptions itself and builds a report per
+/// subscription.
+///
+/// # The change rule is a `shall`
+///
+/// TS 29.518 §5.3.1: *"In subsequent notifications, the AMF shall only report the UE(s)
+/// whose presence status has changed compared to the previous notification sent by the
+/// AMF"* (`29518-k00.txt:4895-4897`). `event_subscription_record_presence` is the gate,
+/// and it test-and-sets under one lock so two concurrent fire points cannot both see
+/// "changed" for the same key. The FIRST report for a key always counts as a change,
+/// which is what §5.3.1 requires of the first notification: *"the AMF shall report the
+/// current presence status of the target UE(s)"* (`:4879-4882`).
+///
+/// # NOTE 3: the empty any-UE area, and why the status is `IN`
+///
+/// Table 6.2.6.2.5-1 NOTE 3 (`:22216-22218`) is counter-intuitive and implemented
+/// literally: *"When a subscription for 'PRESENCE_IN_AOI_REPORT' event targets any UE
+/// but no UE is 'IN' the AOI when the AMF generates the first notification..., the anyUe
+/// IE shall be present with the value true and IEs indicating UE IDs (Supi, Gpsi, Pei
+/// and ueIdExtList) shall not be present; the areaList IE shall be present including the
+/// subscribed AOI with the Presence Status set to 'IN', i.e. no UE is 'IN' the AOI."*
+/// That is handled by [`fire_empty_any_ue_aoi_report`], not here: this function reports
+/// a UE, and NOTE 3's case is the absence of one.
+///
+/// # What is NOT reported, and why each omission is conformant
+///
+/// * **`uePosCap` / `ueUpPosCap`** — feature `AIML_CN` (`:22154`, `:22166`), and both
+///   are conditional on the capabilities being *"available in AMF"* (`:22161`). This AMF
+///   holds none: `grep -rn 'pos_cap' bins/nextgcore-amfd/src/` finds nothing. Omitting
+///   a conditional IE whose condition is false is the conformant answer.
+/// * **`additionalPraId`** — feature `APRA` (`:24672-24688`), the "Set of Core Network
+///   predefined PRAs" case. It needs the AMF to know the set's individual members,
+///   which is the same local configuration the bare-`praId` arm of
+///   [`evaluate_presence`] lacks. Reporting an invented member PRA would be worse than
+///   the `UNKNOWN` the set's own identifier gets.
+pub fn fire_presence_in_aoi_report(ue: &AmfUe) {
+    let Some(supi) = ue.supi.as_deref() else {
+        // Every presence report identifies its UE (Table 6.2.6.2.5-1 NOTE 1,
+        // `29518-k00.txt:22205-22211`), and the change rule is keyed per UE. A UE with
+        // no SUPI yet (pre-authentication) cannot be reported on either count.
+        return;
+    };
+    let ctx = amf_self();
+    let subs = {
+        let Ok(guard) = ctx.read() else {
+            return;
+        };
+        guard.event_subscriptions_remove_expired();
+        guard.event_subscriptions_matching_ue(
+            "PRESENCE_IN_AOI_REPORT",
+            Some(supi),
+            ue.gpsi.as_deref(),
+            ue.pei.as_deref(),
+        )
+    };
+    if subs.is_empty() {
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        log::debug!("fire_presence_in_aoi_report: no tokio runtime, skipping delivery");
+        return;
+    };
+
+    for sub in subs {
+        if sub.areas.is_empty() {
+            // A PRESENCE_IN_AOI_REPORT subscription with no area names nothing to be
+            // present IN. `areaList` is OPTIONAL on `AmfEvent` (`:21391`) so this is
+            // not a 400, but `areaList` is REQUIRED on the report when the type is
+            // this one (`:21923-21924`) — so there is no conformant report to send.
+            log::debug!(
+                "[{supi}] PRESENCE_IN_AOI_REPORT subscription {} names no areaList / \
+                 presenceInfoList, so there is no Area of Interest to report presence in; \
+                 nothing sent (the report's areaList IE is REQUIRED for this type, \
+                 `29518-k00.txt:21923-21924`)",
+                sub.subscription_id
+            );
+            continue;
+        }
+        // Only areas whose verdict CHANGED go in this notification (§5.3.1
+        // `:4895-4897`). Recording happens here, before the spawn, so the gate is
+        // applied once per (UE, area) even though delivery is asynchronous.
+        let mut changed_areas = Vec::new();
+        {
+            let Ok(guard) = ctx.read() else { continue };
+            for (ordinal, area) in sub.areas.iter().enumerate() {
+                let state = evaluate_presence(ue, area);
+                if guard.event_subscription_record_presence(
+                    &sub.subscription_id,
+                    supi,
+                    &area.identity(ordinal),
+                    state,
+                ) {
+                    changed_areas.push(event_area_json(area, state));
+                }
+            }
+        }
+        if changed_areas.is_empty() {
+            continue;
+        }
+        let mut report = build_event_report(
+            "PRESENCE_IN_AOI_REPORT",
+            Some(supi),
+            json!({ "areaList": changed_areas }),
+        );
+        if let Some(gpsi) = ue.gpsi.as_deref() {
+            report["gpsi"] = json!(gpsi);
+        }
+        if let Some(pei) = ue.pei.as_deref() {
+            report["pei"] = json!(pei);
+        }
+        // `anyUe: true` when this is a bulk subscription and the report is for one of
+        // its UEs: *"This IE shall be included and shall be set to 'true', if the event
+        // subscription is a bulk subscription for number of UEs and the event reported
+        // is for one of those UEs"* (Table 6.2.6.2.5-1, `29518-k00.txt:21911-21915`).
+        if sub.any_ue {
+            report["anyUe"] = json!(true);
+        }
+        let sub_id = sub.subscription_id.clone();
+        handle.spawn(async move {
+            if let Err(e) = deliver_event_notification(sub, report).await {
+                log::warn!("PRESENCE_IN_AOI_REPORT delivery failed (sub={sub_id}): {e}");
+            }
+        });
+    }
+}
+
+/// Build the Table 6.2.6.2.5-1 NOTE 3 report: an any-UE `PRESENCE_IN_AOI_REPORT`
+/// whose Area of Interest currently contains NO UE (#400).
+///
+/// NOTE 3 (`29518-k00.txt:22216-22218`) specifies this shape exactly, and it is
+/// counter-intuitive enough to be worth quoting in full: *"When a subscription for
+/// 'PRESENCE_IN_AOI_REPORT' event targets any UE but no UE is 'IN' the AOI when the AMF
+/// generates the first notification (e.g. for one-time reporting or for the first
+/// notification for continuously reporting), the anyUe IE shall be present with the
+/// value true and IEs indicating UE IDs (Supi, Gpsi, Pei and ueIdExtList) shall not be
+/// present; the areaList IE shall be present including the subscribed AOI with the
+/// Presence Status set to 'IN', i.e. no UE is 'IN' the AOI."*
+///
+/// So the presence status is **`IN_AREA`** even though nobody is in the area: the status
+/// describes what the report is ABOUT (the set of UEs that are IN), and the empty UE-ID
+/// list is what says the set is empty. §5.3.1 gives the consumer's side of the same
+/// rule: *"if no UE is currently 'IN' the Area of Interest (AOI), the AMF shall generate
+/// a report only including the AnyUe indication (without any UE ID) and the subscribed
+/// AOI with the presence status set to 'IN'. The NF consumer should consider other UEs
+/// served by the AMF are 'OUT' of the AOI or with 'UNKNOWN' state"* (`:4884-4893`).
+///
+/// Reported for an any-UE subscription only, because NOTE 3 is conditioned on
+/// *"targets any UE"*. A UE-targeted subscription whose UE is OUT gets a normal
+/// `OUT_OF_AREA` report from [`fire_presence_in_aoi_report`].
+fn empty_any_ue_aoi_report(sub: &EventSubscription) -> Value {
+    let area_list: Vec<Value> = sub
+        .areas
+        .iter()
+        // NOTE 3 says "the subscribed AOI", so every subscribed area is listed —
+        // including one the AMF could not resolve, whose membership being unknown is
+        // also a reason no UE is known to be IN it.
+        .map(|area| event_area_json(area, PRESENCE_IN_AREA))
+        .collect();
+    // `None` for the SUPI, and no gpsi/pei added: NOTE 3 forbids every UE ID here.
+    let mut report = build_event_report(
+        "PRESENCE_IN_AOI_REPORT",
+        None,
+        json!({ "areaList": area_list }),
+    );
+    report["anyUe"] = json!(true);
+    report
+}
+
+/// Fire a `UES_IN_AREA_REPORT` carrying the real number of UEs currently IN each
+/// subscribed area (#400).
+///
+/// # `UE Type: any UE` — the type is not UE-targeted
+///
+/// TS 29.518 §5.3.1 for this event: *"A NF subscribes to this event to receive the
+/// number of UEs in a specific area"*, `UE Type: any UE`, `Input: "ANY_UE", Area
+/// identified in a TA List or cell ID list` (`29518-k00.txt:5143-5176`). The report is
+/// about an AREA, not a subscriber.
+///
+/// # NOTE 1 forbids every UE identity in this report
+///
+/// Table 6.2.6.2.5-1 NOTE 1 (`:22212`): *"SUPI, PEI and GPSI shall not be present in
+/// report for UES_IN_AREA_REPORT event type."* That is why this cannot route through
+/// `fire_ue_event`, which attaches all three — and why `build_event_report` is called
+/// with `None` for the SUPI here.
+///
+/// # The count is DERIVED, not indexed
+///
+/// `numberOfUes` *"Represents the number of UEs in the specified area"* (`:22006-22008`).
+/// It is computed by scanning the live store and evaluating each UE against the area,
+/// rather than maintaining an area→UEs reverse index. #400's own model question 5 asked
+/// for the index; `ue_store`'s module docs record this tree's opposite and better-argued
+/// answer for exactly this trade: *"An index maintained beside a collection that can
+/// disagree with it is the exact shape this tree keeps finding broken — #325, #365 and
+/// #363's own root cause — and deriving makes divergence impossible by construction
+/// rather than by discipline."* `max_num_of_ue` bounds the scan and it runs per EVENT,
+/// not per NGAP message.
+///
+/// # A UE whose location is UNKNOWN is not counted
+///
+/// Only `IN_AREA` counts. A UE the AMF cannot place is neither in nor out, and counting
+/// it either way would make `numberOfUes` a guess — NOTE 8 (`:22188-22189`) is explicit
+/// that the count uses location the AMF has: *"For an Immediate Report, UE Last Known
+/// Location is used to count the UEs within the area."*
+///
+/// # `reportingThreshold` is NOT honoured, and is declared so
+///
+/// `reportingThreshold` is feature `OBGAD` (On-demand broadcast of GNSS assistance
+/// data, `:24813`) and its IE is scoped to *"UEs subscribed to LCS Broadcast Assistance
+/// Type(s)"* (`:21720-21724`) — a per-UE subscription this AMF does not hold, since
+/// nothing here reads an LCS broadcast-assistance subscription. §5.3.1's OBGAD arm makes
+/// the two inseparable: the threshold applies to *"the number of UEs in a specific area
+/// which are subscribed to receive ciphering keys to decipher corresponding LCS
+/// assistance data"* (`:5155-5162`). Honouring the threshold against a count of ALL UEs
+/// would report threshold crossings for a population the consumer did not ask about.
+/// Accepted and logged, never refused: it is an optional IE on a conformant
+/// subscription.
+pub fn fire_ues_in_area_report() {
+    let ctx = amf_self();
+    let subs = {
+        let Ok(guard) = ctx.read() else {
+            return;
+        };
+        guard.event_subscriptions_remove_expired();
+        // Matched with no UE identity at all: this event type is any-UE by definition
+        // (`:5170`), so `event_subscriptions_matching_ue` must match on `any_ue` alone.
+        // A SUPI-targeted subscription for it is not what §5.3.1 describes and is
+        // deliberately not delivered to.
+        guard.event_subscriptions_matching_ue("UES_IN_AREA_REPORT", None, None, None)
+    };
+    if subs.is_empty() {
+        return;
+    }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        log::debug!("fire_ues_in_area_report: no tokio runtime, skipping delivery");
+        return;
+    };
+
+    // One snapshot for every subscription and every area, so all the counts in this
+    // round describe ONE consistent view of the store rather than a moving one.
+    let ues: Vec<AmfUe> = {
+        let Ok(guard) = ctx.read() else { return };
+        guard
+            .ue_store()
+            .snapshot()
+            .into_iter()
+            .map(|(_, state)| state.amf_ue.clone())
+            .collect()
+    };
+
+    for sub in subs {
+        if sub.areas.is_empty() {
+            log::debug!(
+                "UES_IN_AREA_REPORT subscription {} names no area, so there is no area to \
+                 count UEs in; nothing sent",
+                sub.subscription_id
+            );
+            continue;
+        }
+        if let Some(threshold) = sub.reporting_threshold {
+            log::info!(
+                "UES_IN_AREA_REPORT subscription {} carries reportingThreshold={threshold}, \
+                 which this AMF does NOT honour: the IE is feature OBGAD and is scoped to UEs \
+                 subscribed to LCS Broadcast Assistance Types \
+                 (`29518-k00.txt:21720-21724`), a per-UE subscription this AMF does not hold. \
+                 Reporting the unconditional count instead of a threshold crossing.",
+                sub.subscription_id
+            );
+        }
+        let mut area_list = Vec::new();
+        let mut total_in_area = 0usize;
+        for area in &sub.areas {
+            let count = ues
+                .iter()
+                .filter(|ue| evaluate_presence(ue, area) == PRESENCE_IN_AREA)
+                .count();
+            total_in_area += count;
+            area_list.push(event_area_json(area, PRESENCE_IN_AREA));
+        }
+        // No SUPI/GPSI/PEI: NOTE 1 (`:22212`) forbids all three for this type.
+        let mut report = build_event_report(
+            "UES_IN_AREA_REPORT",
+            None,
+            json!({
+                "areaList": area_list,
+                "numberOfUes": total_in_area,
+            }),
+        );
+        // `anyUe` is the honest description of this report's scope — it is about every
+        // UE the AMF serves, which is what the type's `UE Type: any UE` means.
+        report["anyUe"] = json!(true);
+        let sub_id = sub.subscription_id.clone();
+        handle.spawn(async move {
+            if let Err(e) = deliver_event_notification(sub, report).await {
+                log::warn!("UES_IN_AREA_REPORT delivery failed (sub={sub_id}): {e}");
+            }
+        });
+    }
+}
+
 /// Fire a `SUBSCRIPTION_ID_CHANGE` or `SUBSCRIPTION_ID_ADDITION` to a
 /// subscription's `subsChangeNotifyUri` (#397).
 ///
@@ -1681,6 +2576,35 @@ fn take_over_transferred_event_subscriptions(
                 .get("subsChangeNotifyCorrelationId")
                 .and_then(Value::as_str)
                 .map(String::from),
+            // #400: the transferred subscription's Areas of Interest come over with
+            // it. TS 23.501 §5.6.11 requires exactly this: *"Upon change of AMF, the
+            // PRA identifier(s) and if provided, the list(s) of Presence Reporting Area
+            // elements are transferred ... as part of MM Context information to the
+            // target AMF during the mobility procedure"* (`23501-k20.txt:13669-13673`).
+            // Dropping them would leave a stored PRESENCE_IN_AOI_REPORT subscription
+            // with no area to evaluate, which would then report nothing at all.
+            areas: entry
+                .get("eventList")
+                .and_then(Value::as_array)
+                .map(|events| events.iter().flat_map(parse_event_areas).collect())
+                .unwrap_or_default(),
+            // The last-reported presence starts EMPTY at the target AMF, deliberately.
+            // §5.3.1's change rule compares against *"the previous notification sent by
+            // the AMF"* (`29518-k00.txt:4895-4897`) and this AMF has sent none, so its
+            // first report for each area is a first notification and must be sent —
+            // which is what §5.3.1 requires of one (`:4879-4882`). Seeding from the
+            // source's `aoiStateList` (`29518-k00.txt:17097-17106`) would suppress it.
+            // The source AMF's own state is not read here because
+            // `AreaOfInterestEventState`'s map key is a JSON pointer into the source's
+            // `areaList`, which only coincides with this AMF's ordering by luck.
+            reported_presence: std::collections::HashMap::new(),
+            reporting_threshold: entry.get("eventList").and_then(Value::as_array).and_then(
+                |events| {
+                    events
+                        .iter()
+                        .find_map(|e| e.get("reportingThreshold").and_then(Value::as_i64))
+                },
+            ),
         };
 
         let added = ctx
@@ -5035,6 +5959,11 @@ mod tests {
             // about expiry.
             subs_change_notify_uri: None,
             subs_change_notify_correlation_id: None,
+            // #400: no Area of Interest. This fixture subscribes to a
+            // non-area-scoped event type, so there is nothing to be present IN.
+            areas: Vec::new(),
+            reported_presence: std::collections::HashMap::new(),
+            reporting_threshold: None,
         };
         assert!(guard.event_subscription_add(sub));
         // Expired subscriptions never match (other tests may add unrelated
@@ -8246,6 +9175,1063 @@ mod tests {
         );
 
         server.stop().await.expect("server stop");
+    }
+
+    // ==================================================================
+    // #400: the presence-area model
+    //
+    // Every literal below (SUPI, TAC, notify path) is unique to its test: the AMF
+    // context is process-global, so a shared TAC would let one test's UE satisfy
+    // another's area assertion. Two amfd tests once shared `78_001` and failed
+    // ~1 run in 3.
+    // ==================================================================
+
+    /// A TAI-list area that CONTAINS the UE reports `IN_AREA`; one that does not
+    /// reports `OUT_OF_AREA`.
+    ///
+    /// This is #400's core claim, and the contrast area is what makes the assertion
+    /// discriminating: an implementation that answered `IN_AREA` unconditionally — the
+    /// obvious way to make a presence emitter "work" — passes the first half and fails
+    /// the second. Both verdicts are read off the DELIVERED notification's
+    /// `areaList[].presenceInfo.presenceState`, not off the evaluator, so a report
+    /// built correctly and never sent fails too.
+    ///
+    /// REVERT-VERIFIED: inverting the `contains` test in `evaluate_presence` makes this
+    /// fail on the first assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tai_area_reports_in_area_for_a_ue_inside_it_and_out_for_one_outside() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // This test's own SUPI and TAC. The TAC 0x0401 appears in no other test.
+        let supi = "imsi-001010000400100";
+        let mut ue = setup_ue(supi, true, true);
+        ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        ue.nr_tai.tac = 0x0401;
+        {
+            let ctx = amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_update(&ue);
+            guard.amf_ue_publish(&ue, 900_401, 1);
+        }
+
+        let (server, port, mut rx) = start_capture_server().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        // TWO areas in one subscription: the first contains the UE's TAI, the second
+        // deliberately does not. `29518-k00.txt:21393-21397` permits more than one
+        // `AmfEventArea` precisely for a Presence Reporting Area subscription.
+        let resp = namf_request_handler(
+            SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&json!({
+                    "subscription": {
+                        "eventList": [{
+                            "type": "PRESENCE_IN_AOI_REPORT",
+                            "areaList": [
+                                { "presenceInfo": {
+                                    "praId": "400100-inside",
+                                    "trackingAreaList": [
+                                        { "plmnId": {"mcc": "001", "mnc": "01"}, "tac": "0401" }
+                                    ],
+                                }},
+                                { "presenceInfo": {
+                                    "praId": "400100-outside",
+                                    "trackingAreaList": [
+                                        { "plmnId": {"mcc": "001", "mnc": "01"}, "tac": "0FFE" }
+                                    ],
+                                }},
+                            ],
+                        }],
+                        "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/400-tai"),
+                        "notifyCorrelationId": "corr-400-tai",
+                        "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                        "supi": supi,
+                    }
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(
+            resp.status, 201,
+            "a conformant subscription naming an areaList must be ACCEPTED"
+        );
+
+        fire_presence_in_aoi_report(&ue);
+        let (_, body) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("PRESENCE_IN_AOI_REPORT must produce a notification")
+            .expect("channel closed");
+        let v: Value = serde_json::from_str(&body).expect("JSON");
+        let report = &v["reportList"][0];
+        assert_eq!(report["type"].as_str(), Some("PRESENCE_IN_AOI_REPORT"));
+        assert_eq!(
+            report["supi"].as_str(),
+            Some(supi),
+            "the report identifies its own UE (Table 6.2.6.2.5-1 NOTE 1)"
+        );
+
+        // Collected by praId, not read positionally: the areaList order follows the
+        // subscription here, but keying on the identity is what the assertion is
+        // actually about and makes the failure message name the area.
+        let areas = report["areaList"]
+            .as_array()
+            .expect("areaList is REQUIRED for this type (`29518-k00.txt:21923-21924`)");
+        let by_pra: std::collections::HashMap<&str, &str> = areas
+            .iter()
+            .filter_map(|a| {
+                Some((
+                    a["presenceInfo"]["praId"].as_str()?,
+                    a["presenceInfo"]["presenceState"].as_str()?,
+                ))
+            })
+            .collect();
+        assert_eq!(
+            by_pra.get("400100-inside"),
+            Some(&"IN_AREA"),
+            "the UE's TAI 001-01-0401 IS in this area's trackingAreaList, so IN_AREA; got \
+             {areas:?}"
+        );
+        assert_eq!(
+            by_pra.get("400100-outside"),
+            Some(&"OUT_OF_AREA"),
+            "the CONTRAST area names TAC 0FFE, which the UE is not in — an emitter that \
+             always says IN_AREA fails here; got {areas:?}"
+        );
+        // The area is echoed in the report so the consumer can tell which of its
+        // subscribed areas each verdict answers.
+        let inside = areas
+            .iter()
+            .find(|a| a["presenceInfo"]["praId"] == "400100-inside")
+            .expect("the inside area");
+        assert_eq!(
+            inside["presenceInfo"]["trackingAreaList"][0]["tac"].as_str(),
+            Some("0401"),
+            "the report echoes the subscribed area's own TA list"
+        );
+
+        server.stop().await.expect("server stop");
+    }
+
+    /// A `praId` with NO enumerated elements reports `UNKNOWN`, not `OUT_OF_AREA`.
+    ///
+    /// This is the Core-Network-predefined PRA of TS 23.501 §5.6.11: *"predefined in the
+    /// AMF"* (`23501-k20.txt:13624-13627`) and resolved *"based on local configuration"*
+    /// (`:13630-13632`), which this tree has none of. Answering `OUT_OF_AREA` would be a
+    /// fabricated negative — the AMF has no idea which TAIs the identifier names — and
+    /// answering nothing would leave the consumer unable to tell "no opinion" from "never
+    /// evaluated".
+    ///
+    /// The subscription is ACCEPTED (201), which is the other half of the claim: #402
+    /// kept these types accepted because refusing a conformant subscription is a wrong
+    /// 400, and that must still hold.
+    ///
+    /// REVERT-VERIFIED: returning `PRESENCE_OUT_OF_AREA` from the non-evaluable arm of
+    /// `evaluate_presence` makes this fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pra_id_without_enumerated_elements_reports_unknown() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Distinct SUPI and TAC from every sibling.
+        let supi = "imsi-001010000400200";
+        let mut ue = setup_ue(supi, true, true);
+        ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        ue.nr_tai.tac = 0x0402;
+        {
+            let ctx = amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_update(&ue);
+            guard.amf_ue_publish(&ue, 900_402, 1);
+        }
+
+        let (server, port, mut rx) = start_capture_server().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        // 11238660 is in the Core-Network-predefined range (8 388 608 .. 16 777 215,
+        // `29571-k00.txt:5192-5197`) and is the spec's own worked example.
+        let resp = namf_request_handler(
+            SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&json!({
+                    "subscription": {
+                        "eventList": [{
+                            "type": "PRESENCE_IN_AOI_REPORT",
+                            "areaList": [{ "presenceInfo": { "praId": "11238660" } }],
+                        }],
+                        "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/400-pra"),
+                        "notifyCorrelationId": "corr-400-pra",
+                        "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                        "supi": supi,
+                    }
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(
+            resp.status, 201,
+            "a bare-praId subscription is CONFORMANT; refusing it would be a wrong 400 \
+             (#402's reason for keeping the type accepted)"
+        );
+
+        fire_presence_in_aoi_report(&ue);
+        let (_, body) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("an unresolvable area must still be REPORTED, as UNKNOWN")
+            .expect("channel closed");
+        let v: Value = serde_json::from_str(&body).expect("JSON");
+        let area = &v["reportList"][0]["areaList"][0]["presenceInfo"];
+        assert_eq!(
+            area["presenceState"].as_str(),
+            Some("UNKNOWN"),
+            "a CN-predefined PRA this AMF cannot resolve is UNKNOWN, never OUT_OF_AREA \
+             (TS 23.501 §5.6.11; UNKNOWN is listed beside IN and OUT at \
+             `29518-k00.txt:21925-21928`)"
+        );
+        assert_eq!(
+            area["praId"].as_str(),
+            Some("11238660"),
+            "and the praId comes back, or the consumer cannot tell WHICH area is unknown"
+        );
+
+        server.stop().await.expect("server stop");
+    }
+
+    /// A UE whose location the AMF never learned reports `UNKNOWN`, even against a
+    /// perfectly resolvable TAI-list area.
+    ///
+    /// `Tai5gs::default()` is an all-zero PLMN with TAC 0, which no gNB reports — it
+    /// means the UE context was created by a path that never saw a
+    /// `UserLocationInformation` (e.g. an inter-AMF `CreateUEContext` takeover). Without
+    /// the `ue_tai_is_known` guard this UE would be reported `OUT_OF_AREA`, which is a
+    /// fabricated negative about a UE the AMF cannot place.
+    ///
+    /// REVERT-VERIFIED: deleting the `ue_tai_is_known` check from `evaluate_presence`
+    /// turns the verdict into `OUT_OF_AREA` and this fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ue_with_no_learned_location_reports_unknown() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let supi = "imsi-001010000400300";
+        let mut ue = setup_ue(supi, true, true);
+        // Explicitly the DEFAULT TAI: `setup_ue` sets tac 100, so this reverts it to the
+        // "never learned" state the guard is about.
+        ue.nr_tai = Tai5gs::default();
+        {
+            let ctx = amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_update(&ue);
+            guard.amf_ue_publish(&ue, 900_403, 1);
+        }
+
+        let (server, port, mut rx) = start_capture_server().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        let resp = namf_request_handler(
+            SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&json!({
+                    "subscription": {
+                        "eventList": [{
+                            "type": "PRESENCE_IN_AOI_REPORT",
+                            "areaList": [{ "presenceInfo": {
+                                "praId": "400300",
+                                "trackingAreaList": [
+                                    { "plmnId": {"mcc": "001", "mnc": "01"}, "tac": "0403" }
+                                ],
+                            }}],
+                        }],
+                        "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/400-noloc"),
+                        "notifyCorrelationId": "corr-400-noloc",
+                        "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                        "supi": supi,
+                    }
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+
+        fire_presence_in_aoi_report(&ue);
+        let (_, body) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("a location-less UE must still be reported, as UNKNOWN")
+            .expect("channel closed");
+        let v: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(
+            v["reportList"][0]["areaList"][0]["presenceInfo"]["presenceState"].as_str(),
+            Some("UNKNOWN"),
+            "the area is resolvable but the UE is not placeable, so the honest verdict is \
+             UNKNOWN rather than OUT_OF_AREA"
+        );
+
+        server.stop().await.expect("server stop");
+    }
+
+    /// An `ncgiList` area reports `UNKNOWN` for a UE that registered but never handed
+    /// over, because `AmfUe::nr_cgi` has exactly ONE production writer.
+    ///
+    /// This is the narrowest and most easily-missed ceiling in #400, and it is a real
+    /// tree fact rather than a spec one: `handle_initial_ue_message` parses the
+    /// InitialUEMessage's `nr_cell_identity` (`ngap_asn1.rs:326`), logs it, and never
+    /// stores it — only `handle_handover_notify` writes `nr_cgi`
+    /// (`ngap_path.rs:7411-7412`). So an NCGI area over a default `nr_cgi` must not
+    /// claim the UE is outside it.
+    ///
+    /// The contrast is in the same test: with the cell identity present the SAME area
+    /// resolves to a real IN/OUT verdict, so this pins the guard rather than an
+    /// always-UNKNOWN NCGI path.
+    ///
+    /// REVERT-VERIFIED: deleting the `ue_ncgi_is_known` check makes the first assertion
+    /// read `OUT_OF_AREA`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ncgi_area_reports_unknown_until_the_cell_identity_is_learned() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let supi = "imsi-001010000400400";
+        let mut ue = setup_ue(supi, true, true);
+        ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        ue.nr_tai.tac = 0x0404;
+        // The "registered but never handed over" state: `setup_ue` seeds a cell id, so
+        // this reverts it to what the registration path actually leaves behind.
+        ue.nr_cgi = NrCgi::default();
+        {
+            let ctx = amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_update(&ue);
+            guard.amf_ue_publish(&ue, 900_404, 1);
+        }
+
+        let (server, port, mut rx) = start_capture_server().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        let resp = namf_request_handler(
+            SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&json!({
+                    "subscription": {
+                        "eventList": [{
+                            "type": "PRESENCE_IN_AOI_REPORT",
+                            // NCGI-only: no trackingAreaList, so the NCGI arm decides.
+                            "areaList": [{ "presenceInfo": {
+                                "praId": "400400-cells",
+                                "ncgiList": [
+                                    { "plmnId": {"mcc": "001", "mnc": "01"},
+                                      "nrCellId": "000040404" }
+                                ],
+                            }}],
+                        }],
+                        "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/400-ncgi"),
+                        "notifyCorrelationId": "corr-400-ncgi",
+                        "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                        "supi": supi,
+                    }
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+
+        fire_presence_in_aoi_report(&ue);
+        let (_, body) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("must report UNKNOWN rather than nothing")
+            .expect("channel closed");
+        let v: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(
+            v["reportList"][0]["areaList"][0]["presenceInfo"]["presenceState"].as_str(),
+            Some("UNKNOWN"),
+            "`nr_cgi` is written ONLY by handle_handover_notify, so a default cell id \
+             means \"never learned\", not \"not in the area\""
+        );
+
+        // Now give the UE the cell identity a handover would have written. The SAME
+        // area must resolve to a real verdict — this is what proves the UNKNOWN above
+        // is the guard and not an unconditional NCGI answer.
+        ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+        ue.nr_cgi.cell_id = 0x0004_0404;
+        {
+            let ctx = amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_update(&ue);
+            guard.amf_ue_publish(&ue, 900_404, 1);
+        }
+        fire_presence_in_aoi_report(&ue);
+        let (_, body) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("the UNKNOWN->IN_AREA transition must be notified")
+            .expect("channel closed");
+        let v: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(
+            v["reportList"][0]["areaList"][0]["presenceInfo"]["presenceState"].as_str(),
+            Some("IN_AREA"),
+            "with the cell identity learned, the same ncgiList area resolves to IN_AREA"
+        );
+
+        server.stop().await.expect("server stop");
+    }
+
+    /// An UNCHANGED presence state is NOT notified a second time.
+    ///
+    /// TS 29.518 §5.3.1 is a `shall`: *"In subsequent notifications, the AMF shall only
+    /// report the UE(s) whose presence status has changed compared to the previous
+    /// notification sent by the AMF"* (`29518-k00.txt:4895-4897`). Without this gate the
+    /// handover fire point would notify on every relocation inside one area — a
+    /// notification the clause forbids, and the "plausible-but-wrong moment" #400 exists
+    /// to prevent.
+    ///
+    /// Asserted in BOTH directions, because a suppression test alone is satisfied by an
+    /// implementation that never notifies at all: the first fire must arrive, the
+    /// identical second must not, and a real transition after that must arrive again.
+    ///
+    /// REVERT-VERIFIED: deleting the `event_subscription_record_presence` guard in
+    /// `fire_presence_in_aoi_report` makes the middle assertion fail — the duplicate
+    /// arrives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unchanged_presence_state_is_not_notified_again() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let supi = "imsi-001010000400500";
+        let mut ue = setup_ue(supi, true, true);
+        ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        ue.nr_tai.tac = 0x0405;
+        {
+            let ctx = amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_update(&ue);
+            guard.amf_ue_publish(&ue, 900_405, 1);
+        }
+
+        let (server, port, mut rx) = start_capture_server().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        let resp = namf_request_handler(
+            SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&json!({
+                    "subscription": {
+                        "eventList": [{
+                            "type": "PRESENCE_IN_AOI_REPORT",
+                            "areaList": [{ "presenceInfo": {
+                                "praId": "400500",
+                                "trackingAreaList": [
+                                    { "plmnId": {"mcc": "001", "mnc": "01"}, "tac": "0405" }
+                                ],
+                            }}],
+                        }],
+                        "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/400-change"),
+                        "notifyCorrelationId": "corr-400-change",
+                        "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                        "supi": supi,
+                    }
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+
+        // 1. The FIRST notification arrives, carrying the current state. §5.3.1
+        //    `:4879-4882` requires it: "the AMF shall report the current presence status
+        //    of the target UE(s)".
+        fire_presence_in_aoi_report(&ue);
+        let (_, body) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("the FIRST notification must always be sent")
+            .expect("channel closed");
+        let v: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(
+            v["reportList"][0]["areaList"][0]["presenceInfo"]["presenceState"].as_str(),
+            Some("IN_AREA")
+        );
+
+        // 2. Firing again with the UE in the SAME area must send NOTHING. Delivery is
+        //    spawned, so an instantaneous check would pass even with a notification in
+        //    flight — this waits, the way #402's must-not-fire tests do.
+        fire_presence_in_aoi_report(&ue);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), rx.recv())
+                .await
+                .is_err(),
+            "an UNCHANGED presence state must not be notified again (TS 29.518 §5.3.1, \
+             `29518-k00.txt:4895-4897`)"
+        );
+
+        // 3. A REAL transition must still get through, or the gate would be
+        //    indistinguishable from a broken emitter.
+        ue.nr_tai.tac = 0x0FFD;
+        fire_presence_in_aoi_report(&ue);
+        let (_, body) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("a genuine IN->OUT transition must be notified")
+            .expect("channel closed");
+        let v: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(
+            v["reportList"][0]["areaList"][0]["presenceInfo"]["presenceState"].as_str(),
+            Some("OUT_OF_AREA"),
+            "the UE left the area, which is exactly the \"enters or leaves\" trigger \
+             TS 29.518 §6.2 names"
+        );
+
+        server.stop().await.expect("server stop");
+    }
+
+    /// `UES_IN_AREA_REPORT` counts only the UEs INSIDE the area, and carries no UE
+    /// identity at all.
+    ///
+    /// Two independent claims, both pinned here because they share one fixture:
+    ///
+    /// 1. `numberOfUes` *"Represents the number of UEs in the specified area"*
+    ///    (`29518-k00.txt:22006-22008`). Three UEs are published, exactly one of them
+    ///    inside the area, so a count of 3 (the whole store) or 0 both fail — an
+    ///    emitter that returned `snapshot().len()` is caught.
+    /// 2. Table 6.2.6.2.5-1 NOTE 1 (`:22212`): *"SUPI, PEI and GPSI shall not be present
+    ///    in report for UES_IN_AREA_REPORT event type."* This is why the type cannot go
+    ///    through `fire_ue_event`, which attaches all three.
+    ///
+    /// REVERT-VERIFIED: counting `snapshot().len()` makes the `numberOfUes` assertion
+    /// fail; routing through `fire_ue_event` makes the SUPI assertion fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ues_in_area_counts_only_the_ues_inside_the_area_and_names_none_of_them() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // `setup_ue` calls `amf_context_init`, which CLEARS the store — so it must be
+        // called for the first UE before the others are published, and the count below
+        // is over exactly these three.
+        let inside = "imsi-001010000400601";
+        let mut ue_inside = setup_ue(inside, true, true);
+        ue_inside.nr_tai.plmn_id = PlmnId::new("001", "01");
+        ue_inside.nr_tai.tac = 0x0406;
+
+        let mut ue_outside = ue_inside.clone();
+        ue_outside.id = ue_inside.id + 1;
+        ue_outside.supi = Some("imsi-001010000400602".to_string());
+        ue_outside.nr_tai.tac = 0x0FFC; // a TAC the area does not name
+
+        // A third UE with NO learned location: it is neither in nor out, and counting it
+        // either way would make `numberOfUes` a guess.
+        let mut ue_unknown = ue_inside.clone();
+        ue_unknown.id = ue_inside.id + 2;
+        ue_unknown.supi = Some("imsi-001010000400603".to_string());
+        ue_unknown.nr_tai = Tai5gs::default();
+        {
+            let ctx = amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            for (ue, ngap) in [
+                (&ue_inside, 900_4061u32),
+                (&ue_outside, 900_4062),
+                (&ue_unknown, 900_4063),
+            ] {
+                guard.amf_ue_update(ue);
+                guard.amf_ue_publish(ue, ngap, 1);
+            }
+        }
+
+        let (server, port, mut rx) = start_capture_server().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        // `anyUE: true` — the type is any-UE by definition (`:5170`), so this is how a
+        // conformant consumer subscribes to it.
+        let resp = namf_request_handler(
+            SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&json!({
+                    "subscription": {
+                        "eventList": [{
+                            "type": "UES_IN_AREA_REPORT",
+                            "areaList": [{ "presenceInfo": {
+                                "praId": "400600",
+                                "trackingAreaList": [
+                                    { "plmnId": {"mcc": "001", "mnc": "01"}, "tac": "0406" }
+                                ],
+                            }}],
+                            // OBGAD, and NOT honoured — accepted and logged. Present here
+                            // so the test also proves it does not cause a 400.
+                            "reportingThreshold": 99,
+                        }],
+                        "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/400-count"),
+                        "notifyCorrelationId": "corr-400-count",
+                        "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                        "anyUE": true,
+                    }
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(
+            resp.status, 201,
+            "an unhonoured OBGAD reportingThreshold must not turn a conformant \
+             subscription into a 400"
+        );
+
+        fire_ues_in_area_report();
+        let (_, body) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("UES_IN_AREA_REPORT must produce a notification")
+            .expect("channel closed");
+        let v: Value = serde_json::from_str(&body).expect("JSON");
+        let report = &v["reportList"][0];
+        assert_eq!(report["type"].as_str(), Some("UES_IN_AREA_REPORT"));
+        assert_eq!(
+            report["numberOfUes"].as_u64(),
+            Some(1),
+            "exactly ONE of the three published UEs is in TAC 0406; a count of 3 means the \
+             emitter returned the store size and a count of 0 means it evaluated nothing. \
+             Report: {report}"
+        );
+        // NOTE 1 (`:22212`): none of the three UE identities may appear.
+        for member in ["supi", "gpsi", "pei"] {
+            assert!(
+                report.get(member).is_none(),
+                "`{member}` must be ABSENT from a UES_IN_AREA_REPORT (Table 6.2.6.2.5-1 \
+                 NOTE 1, `29518-k00.txt:22212`); report was {report}"
+            );
+        }
+        assert_eq!(
+            report["anyUe"].as_bool(),
+            Some(true),
+            "the report's scope is every UE the AMF serves, which is what `UE Type: any \
+             UE` means"
+        );
+
+        server.stop().await.expect("server stop");
+    }
+
+    /// The Table 6.2.6.2.5-1 NOTE 3 shape: an any-UE AoI with no UE in it reports
+    /// `anyUe: true`, NO UE identity, and presence status **`IN`**.
+    ///
+    /// NOTE 3 (`29518-k00.txt:22216-22218`) is counter-intuitive enough that an
+    /// implementer would naturally write `OUT_OF_AREA` here: *"the areaList IE shall be
+    /// present including the subscribed AOI with the Presence Status set to 'IN', i.e. no
+    /// UE is 'IN' the AOI."* The status describes the set the report is ABOUT; the absent
+    /// UE IDs are what say the set is empty. §5.3.1 `:4884-4893` states the same rule
+    /// from the consumer's side.
+    ///
+    /// Driven through the `immediateFlag` path, which is where NOTE 3's *"first
+    /// notification"* condition lands (`:22216`), and asserted on the SUBSCRIBE
+    /// RESPONSE's own `reportList` — §5.3.2.2.2 delivers an immediate report there.
+    ///
+    /// REVERT-VERIFIED: changing `empty_any_ue_aoi_report`'s status to `OUT_OF_AREA`, or
+    /// dropping its `anyUe`, makes this fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_empty_any_ue_area_reports_the_note_3_shape() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // A fresh context with NO UE at all, which is the "no UE is IN the AOI" case in
+        // its purest form.
+        crate::context::amf_context_init(64, 1024, 4096);
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        let resp = namf_request_handler(
+            SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&json!({
+                    "subscription": {
+                        "eventList": [{
+                            "type": "PRESENCE_IN_AOI_REPORT",
+                            "immediateFlag": true,
+                            "areaList": [{ "presenceInfo": {
+                                "praId": "400700",
+                                "trackingAreaList": [
+                                    { "plmnId": {"mcc": "001", "mnc": "01"}, "tac": "0407" }
+                                ],
+                            }}],
+                        }],
+                        "eventNotifyUri": "http://127.0.0.1:9/notify/400-note3",
+                        "notifyCorrelationId": "corr-400-note3",
+                        "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                        "anyUE": true,
+                    }
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let body = body_json(&resp);
+        let report = &body["reportList"][0];
+        assert_eq!(
+            report["type"].as_str(),
+            Some("PRESENCE_IN_AOI_REPORT"),
+            "an immediateFlag subscription gets its report in the subscribe response; \
+             body was {body}"
+        );
+        assert_eq!(
+            report["anyUe"].as_bool(),
+            Some(true),
+            "NOTE 3: \"the anyUe IE shall be present with the value true\""
+        );
+        for member in ["supi", "gpsi", "pei", "ueIdExtList"] {
+            assert!(
+                report.get(member).is_none(),
+                "NOTE 3: \"IEs indicating UE IDs (Supi, Gpsi, Pei and ueIdExtList) shall \
+                 not be present\" — `{member}` was present in {report}"
+            );
+        }
+        assert_eq!(
+            report["areaList"][0]["presenceInfo"]["presenceState"].as_str(),
+            Some("IN_AREA"),
+            "NOTE 3: \"the areaList IE shall be present including the subscribed AOI with \
+             the Presence Status set to 'IN', i.e. no UE is 'IN' the AOI\" — this reads \
+             backwards but it is what the clause says"
+        );
+        assert_eq!(
+            report["areaList"][0]["presenceInfo"]["praId"].as_str(),
+            Some("400700"),
+            "and it is the SUBSCRIBED AOI that is listed"
+        );
+    }
+
+    /// An `AmfEventArea` alternative this AMF cannot evaluate is ACCEPTED, echoed, and
+    /// reported `UNKNOWN` — not refused, and not silently dropped.
+    ///
+    /// `AmfEventArea` is a choice of five (`TS29518_Namf_EventExposure.yaml:1011-1024`)
+    /// and `ladnInfo` is one this AMF holds no state for: `gmm_build.rs` sends
+    /// `ladn_information: None` in every CONFIGURATION UPDATE COMMAND and nothing ever
+    /// parses or configures a LADN service area. Refusing the subscription would be a
+    /// wrong 400; dropping the area would leave the consumer thinking it was evaluated.
+    ///
+    /// REVERT-VERIFIED: removing the `unsupported_kind` arm from `parse_event_area`
+    /// makes `parse_event_area` return `None` for this area, the report carries an empty
+    /// `areaList`, and the assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unevaluable_area_alternative_is_accepted_and_reported_unknown() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let supi = "imsi-001010000400800";
+        let mut ue = setup_ue(supi, true, true);
+        ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        ue.nr_tai.tac = 0x0408;
+        {
+            let ctx = amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_update(&ue);
+            guard.amf_ue_publish(&ue, 900_408, 1);
+        }
+
+        let (server, port, mut rx) = start_capture_server().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        let resp = namf_request_handler(
+            SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&json!({
+                    "subscription": {
+                        "eventList": [{
+                            "type": "PRESENCE_IN_AOI_REPORT",
+                            "areaList": [
+                                { "ladnInfo": { "ladn": "internet.ladn" } },
+                            ],
+                            // AOIEF filters and the AIML_CN positioning ask: all
+                            // accepted, none honoured. Present so this test also proves
+                            // they do not produce a 400.
+                            "adjustAoIOnRa": true,
+                            "uePosCapRequestedInd": true,
+                        }],
+                        "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/400-ladn"),
+                        "notifyCorrelationId": "corr-400-ladn",
+                        "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                        "supi": supi,
+                    }
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(
+            resp.status, 201,
+            "a LADN-named area, an AOIEF filter and uePosCapRequestedInd are all \
+             conformant; none may be refused"
+        );
+
+        fire_presence_in_aoi_report(&ue);
+        let (_, body) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("an unevaluable area must still be REPORTED, as UNKNOWN")
+            .expect("channel closed");
+        let v: Value = serde_json::from_str(&body).expect("JSON");
+        let report = &v["reportList"][0];
+        assert_eq!(
+            report["areaList"][0]["presenceInfo"]["presenceState"].as_str(),
+            Some("UNKNOWN"),
+            "no LADN service area is held, so the honest verdict is UNKNOWN; report was \
+             {report}"
+        );
+        assert!(
+            report["areaList"][0].get("ladnInfo").is_some(),
+            "the area is echoed back under the member the consumer NAMED, so it can tell \
+             which of its areas went unresolved; report was {report}"
+        );
+        // AIML_CN: the positioning capabilities are omitted because none are held, which
+        // is the conformant answer for a conditional IE whose condition is false.
+        assert!(
+            report.get("uePosCap").is_none() && report.get("ueUpPosCap").is_none(),
+            "uePosCap/ueUpPosCap are conditional on the capabilities being \"available in \
+             AMF\" (`29518-k00.txt:22154-22173`) and this AMF holds none, so they must be \
+             ABSENT rather than invented"
+        );
+
+        server.stop().await.expect("server stop");
+    }
+
+    /// A malformed TAC in a subscribed area is REFUSED at parse time rather than
+    /// silently reinterpreted as a valid one.
+    ///
+    /// A correctness trap rather than a spec citation, and the discriminating case took
+    /// two attempts to get right — the first version used a location-less UE, which
+    /// `ue_tai_is_known` answers `UNKNOWN` for anyway, so it passed with the guard
+    /// removed and proved nothing.
+    ///
+    /// What actually discriminates: `Tac`'s pattern is
+    /// `(^[A-Fa-f0-9]{4}$)|(^[A-Fa-f0-9]{6}$)` (`TS29571_CommonData.yaml:1341-1342`), so
+    /// `"FAB"` is malformed on LENGTH alone while remaining valid hex. A bare
+    /// `from_str_radix` accepts it as `0x0FAB` — and this UE's real, learned TAC is
+    /// `0x0FAB`. So without the length guard the area silently becomes one that CONTAINS
+    /// the UE and the verdict is `IN_AREA`; with it, the element is dropped, the area
+    /// enumerates nothing, and the honest verdict is `UNKNOWN`.
+    ///
+    /// The subscription is still ACCEPTED: a malformed member of an optional IE is not
+    /// grounds for a 400, and the area still gets a verdict rather than vanishing.
+    ///
+    /// REVERT-VERIFIED: replacing `parse_tac`'s body with
+    /// `Some(u32::from_str_radix(s, 16).unwrap_or(0))` makes this report `IN_AREA` and
+    /// the test fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_malformed_tac_does_not_become_a_wildcard_area() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let supi = "imsi-001010000400900";
+        let mut ue = setup_ue(supi, true, true);
+        // A REAL learned location, so `ue_tai_is_known` cannot shadow the guard under
+        // test. TAC 0x0FAB is this test's own, and it is what `"FAB"` would decode to if
+        // the length check were missing.
+        ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        ue.nr_tai.tac = 0x0FAB;
+        {
+            let ctx = amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_update(&ue);
+            guard.amf_ue_publish(&ue, 900_409, 1);
+        }
+
+        let (server, port, mut rx) = start_capture_server().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        let resp = namf_request_handler(
+            SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&json!({
+                    "subscription": {
+                        "eventList": [{
+                            "type": "PRESENCE_IN_AOI_REPORT",
+                            "areaList": [{ "presenceInfo": {
+                                "praId": "400900",
+                                // Valid hex, INVALID length: 3 digits where the pattern
+                                // allows 4 or 6. `from_str_radix` would read it as
+                                // 0x0FAB, which is exactly this UE's TAC.
+                                "trackingAreaList": [
+                                    { "plmnId": {"mcc": "001", "mnc": "01"}, "tac": "FAB" }
+                                ],
+                            }}],
+                        }],
+                        "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/400-badtac"),
+                        "notifyCorrelationId": "corr-400-badtac",
+                        "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                        "supi": supi,
+                    }
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(
+            resp.status, 201,
+            "a malformed member of an OPTIONAL IE is not grounds for a 400"
+        );
+
+        fire_presence_in_aoi_report(&ue);
+        let (_, body) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("the area still gets a verdict rather than vanishing")
+            .expect("channel closed");
+        let v: Value = serde_json::from_str(&body).expect("JSON");
+        assert_eq!(
+            v["reportList"][0]["areaList"][0]["presenceInfo"]["presenceState"].as_str(),
+            Some("UNKNOWN"),
+            "the only element was malformed, so the area enumerates nothing and the honest \
+             verdict is UNKNOWN. A TAC read as 0x0FAB would have matched this UE's real \
+             TAC and wrongly reported IN_AREA."
+        );
+        assert!(
+            v["reportList"][0]["areaList"][0]["presenceInfo"]
+                .get("trackingAreaList")
+                .is_none(),
+            "and the rejected element must not be echoed as though it had been stored"
+        );
+
+        server.stop().await.expect("server stop");
+    }
+
+    /// The `MPRA` `presenceInfoList` map form parses into the same area model, keyed by
+    /// its map key.
+    ///
+    /// `presenceInfoList` is *"Map of PRA Information, the 'praId' attribute within the
+    /// PresenceInfo data type shall also be the key of the map"*
+    /// (`29518-k00.txt:21527-21532`) — the same `PresenceInfo` type in a different
+    /// container. It also carries its own exclusion rule: *"When present, the areaList
+    /// shall be absent"* (`:21534`).
+    ///
+    /// This matters because a consumer supporting MPRA sends areas ONLY this way, so an
+    /// AMF that read `areaList` alone would store no area and report nothing at all for
+    /// a conformant subscription.
+    ///
+    /// REVERT-VERIFIED: removing the `presenceInfoList` branch from `parse_event_areas`
+    /// leaves `areas` empty, no notification is sent, and the recv times out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_mpra_presence_info_list_map_form_is_parsed_and_keyed_by_its_pra_id() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let supi = "imsi-001010000401000";
+        let mut ue = setup_ue(supi, true, true);
+        ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        ue.nr_tai.tac = 0x0410;
+        {
+            let ctx = amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_update(&ue);
+            guard.amf_ue_publish(&ue, 900_410, 1);
+        }
+
+        let (server, port, mut rx) = start_capture_server().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        let resp = namf_request_handler(
+            SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&json!({
+                    "subscription": {
+                        "eventList": [{
+                            "type": "PRESENCE_IN_AOI_REPORT",
+                            // NOTE the absent `presenceState` — the IE forbids it here
+                            // (`:21530-21532`) — and the absent inner `praId`: the MAP KEY
+                            // is the praId.
+                            "presenceInfoList": {
+                                "401000": {
+                                    "trackingAreaList": [
+                                        { "plmnId": {"mcc": "001", "mnc": "01"}, "tac": "0410" }
+                                    ],
+                                },
+                            },
+                        }],
+                        "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/400-mpra"),
+                        "notifyCorrelationId": "corr-400-mpra",
+                        "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                        "supi": supi,
+                    }
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+
+        fire_presence_in_aoi_report(&ue);
+        let (_, body) = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("a presenceInfoList-only subscription must still produce a report")
+            .expect("channel closed");
+        let v: Value = serde_json::from_str(&body).expect("JSON");
+        let area = &v["reportList"][0]["areaList"][0]["presenceInfo"];
+        assert_eq!(
+            area["presenceState"].as_str(),
+            Some("IN_AREA"),
+            "the map's TA list is evaluated exactly like an areaList entry's"
+        );
+        assert_eq!(
+            area["praId"].as_str(),
+            Some("401000"),
+            "the MAP KEY becomes the praId (`29518-k00.txt:21527-21532`)"
+        );
+
+        server.stop().await.expect("server stop");
+    }
+
+    /// The created subscription ECHOES its areas back, without a `presenceState`.
+    ///
+    /// The echo is how a consumer confirms the created resource matches its request —
+    /// the reason the `gpsi` echo exists (#74 criterion 4) — and for this type it is
+    /// also how it confirms the AMF did not silently drop an area. `presenceState` must
+    /// NOT appear: it states the UE's presence (`29571-k00.txt:5226-5232`) and a
+    /// subscription echo reports no UE, which `presenceInfoList`'s own rule makes
+    /// explicit — *"The 'presenceState' attribute within the PresenceInfo data type
+    /// shall not be supplied"* (`29518-k00.txt:21530-21532`).
+    ///
+    /// REVERT-VERIFIED: removing the `presenceState` strip from `subscription_echo_json`
+    /// makes the second assertion fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_subscription_echoes_its_areas_without_a_presence_state() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let supi = "imsi-001010000401100";
+        setup_ue(supi, true, true);
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        let resp = namf_request_handler(
+            SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&json!({
+                    "subscription": {
+                        "eventList": [
+                            { "type": "PRESENCE_IN_AOI_REPORT",
+                              "areaList": [{ "presenceInfo": {
+                                  "praId": "401100",
+                                  "trackingAreaList": [
+                                      { "plmnId": {"mcc": "001", "mnc": "01"}, "tac": "0411" }
+                                  ],
+                              }}],
+                            },
+                            // A non-area-scoped type in the SAME subscription: it must
+                            // NOT gain an areaList it never carried.
+                            { "type": "LOCATION_REPORT" },
+                        ],
+                        "eventNotifyUri": "http://127.0.0.1:9/notify/400-echo",
+                        "notifyCorrelationId": "corr-400-echo",
+                        "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                        "supi": supi,
+                    }
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 201);
+        let body = body_json(&resp);
+        let events = body["subscription"]["eventList"]
+            .as_array()
+            .expect("eventList");
+        let aoi = events
+            .iter()
+            .find(|e| e["type"] == "PRESENCE_IN_AOI_REPORT")
+            .expect("the AoI event");
+        assert_eq!(
+            aoi["areaList"][0]["presenceInfo"]["praId"].as_str(),
+            Some("401100"),
+            "the subscribed area must come back, or the consumer cannot confirm the AMF \
+             stored it; echo was {body}"
+        );
+        assert_eq!(
+            aoi["areaList"][0]["presenceInfo"]["trackingAreaList"][0]["tac"].as_str(),
+            Some("0411"),
+            "including its TA list"
+        );
+        assert!(
+            aoi["areaList"][0]["presenceInfo"]
+                .get("presenceState")
+                .is_none(),
+            "a SUBSCRIPTION echo states no UE presence (`29518-k00.txt:21530-21532`); \
+             echo was {body}"
+        );
+        let loc = events
+            .iter()
+            .find(|e| e["type"] == "LOCATION_REPORT")
+            .expect("the location event");
+        assert!(
+            loc.get("areaList").is_none(),
+            "a non-area-scoped event must not be given an areaList the consumer never \
+             sent; echo was {body}"
+        );
     }
 
     // ==================================================================

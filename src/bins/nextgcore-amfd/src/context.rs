@@ -790,6 +790,133 @@ pub struct LcsCorrelationRecord {
     pub serving_lmf_identification: Option<String>,
 }
 
+/// Which `AmfEventArea` alternative a consumer named that this AMF cannot evaluate
+/// the UE against (#400).
+///
+/// `AmfEventArea` (`TS29518_Namf_EventExposure.yaml:1011-1024`) is a choice of FIVE:
+/// `presenceInfo`, `ladnInfo`, `sliceAreaRestrictionInfo`, `sNssai`, `nsiId`. The
+/// first is modelled ([`EventArea`]); the other four need state this AMF does not
+/// hold, and this enum records WHICH one arrived so the report can answer `UNKNOWN`
+/// for that entry — naming the area it could not resolve — rather than silently
+/// dropping an area the consumer asked about.
+///
+/// Stored rather than refused because the subscription is CONFORMANT: refusing it
+/// would be a wrong 400, the same reasoning `group_id` records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsupportedAreaKind {
+    /// `ladnInfo` — a LADN DNN naming a LADN service area
+    /// (`TS29518_Namf_EventExposure.yaml:1025-1032`). The AMF holds no LADN service
+    /// area at all: `gmm_build.rs` sends `ladn_information: None` in every
+    /// CONFIGURATION UPDATE COMMAND and nothing ever parses or configures one.
+    LadnInfo,
+    /// `sNssai` — the "S-NSSAI-named area" of TS 29.518 §5.3.1
+    /// (`29518-k00.txt:4872-4877`), which requires the AMF to know *"TAIs of the
+    /// Registration Area which support the S-NSSAI (for a partially allowed
+    /// S-NSSAI) ... or the NS-AoS"*. Neither Partially-Allowed-NSSAI nor
+    /// Network-Slice-Area-of-Service state exists in this tree.
+    SNssai,
+    /// `nsiId` — a Network Slice Instance ID
+    /// (`TS29531_Nnssf_NSSelection.yaml`). The AMF receives no NSI ID from the NSSF
+    /// on any path here, so it cannot map one to an area.
+    NsiId,
+    /// `sliceAreaRestrictionInfo` — slice restriction area, the §5.15.17/§5.15.18
+    /// case of TS 23.501. Same missing state as [`Self::SNssai`].
+    SliceAreaRestrictionInfo,
+}
+
+impl UnsupportedAreaKind {
+    /// The `AmfEventArea` member name, for the log line and the report's diagnostic.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::LadnInfo => "ladnInfo",
+            Self::SNssai => "sNssai",
+            Self::NsiId => "nsiId",
+            Self::SliceAreaRestrictionInfo => "sliceAreaRestrictionInfo",
+        }
+    }
+}
+
+/// One subscribed Area of Interest, as an `AmfEventArea` this AMF can hold (#400,
+/// TS 29.518 `AmfEventArea` / TS 29.571 `PresenceInfo`).
+///
+/// # Where the area comes from — the finding that makes #400 implementable
+///
+/// The AMF needs **no provisioned state** for a subscription that enumerates its own
+/// area. `AmfEvent.areaList` is *"array(AmfEventArea)"*, *"Identifies the area to be
+/// applied"* (`29518-k00.txt:21391`), and TS 23.501 §5.6.11 says so explicitly for the
+/// **UE-dedicated** Presence Reporting Area: *"the subscription for UE location change
+/// notification for an 'area of interest' shall contain the PRA Identifier(s) and the
+/// list(s) of TAs, or NG-RAN Node identifier and/or cell identifiers composing the
+/// Presence Reporting Area(s)"* (`23501-k20.txt:13633-13636`).
+///
+/// Only the **Core-Network-predefined** form is configuration-borne — *"predefined in
+/// the AMF"* (`:13624-13627`), resolved *"based on local configuration"* (`:13630`) —
+/// and for that form the subscription *"shall contain the PRA identifier(s)"* and
+/// nothing else (`:13637-13639`). This tree has no such configuration, so an area that
+/// arrives as a bare `praId` is genuinely unresolvable and is reported `UNKNOWN`.
+#[derive(Debug, Clone, Default)]
+pub struct EventArea {
+    /// `PresenceInfo.praId` (`29571-k00.txt:5178-5197`), echoed back verbatim in the
+    /// report.
+    ///
+    /// *"shall be present if the Area of Interest subscribed or reported is a Presence
+    /// Reporting Area or a Set of Core Network predefined Presence Reporting Areas"*.
+    /// Retained even when the area also enumerates its elements, because a report that
+    /// dropped it would not identify WHICH area the verdict belongs to.
+    ///
+    /// The value range distinguishes the two PRA kinds: *"0 to 8 388 607 for
+    /// UE-dedicated PRA, 8 388 608 to 16 777 215 for Core Network predefined PRA"*
+    /// (`:5192-5197`). Held as the string the consumer sent, since the IE is a
+    /// `string` and echoing a reparsed integer could change its form.
+    pub pra_id: Option<String>,
+    /// `PresenceInfo.trackingAreaList` — *"the list of tracking areas that constitutes
+    /// the area. This IE shall be present if the subscription or the event report is
+    /// for tracking UE presence in the tracking areas"* (`29571-k00.txt:5234-5242`).
+    ///
+    /// **This is the evaluable form**, because `AmfUe::nr_tai` is written from the
+    /// InitialUEMessage's own `UserLocationInformation` — a real TAI from a real gNB.
+    pub tracking_area_list: Vec<Tai5gs>,
+    /// `PresenceInfo.ncgiList` — *"the list of NR cell Ids that constitutes the area"*
+    /// (`29571-k00.txt:5253-5259`).
+    ///
+    /// Evaluable, but with a caveat that is load-bearing: `AmfUe::nr_cgi` has exactly
+    /// ONE production writer (`ngap_path::handle_handover_notify`) — the registration
+    /// path logs the InitialUEMessage's cell identity and drops it. So a DEFAULT
+    /// `nr_cgi` means "never learned", not "not in the area", and the evaluator answers
+    /// `UNKNOWN` rather than `OUT_OF_AREA` for it.
+    pub ncgi_list: Vec<NrCgi>,
+    /// Set when the consumer named an `AmfEventArea` alternative this AMF cannot
+    /// evaluate. See [`UnsupportedAreaKind`].
+    pub unsupported_kind: Option<UnsupportedAreaKind>,
+}
+
+impl EventArea {
+    /// Whether this area enumerates elements the AMF can compare a UE against.
+    ///
+    /// False for a bare `praId` (the Core-Network-predefined form, which needs local
+    /// configuration this tree does not have) and for every non-`presenceInfo`
+    /// alternative. Both report `UNKNOWN`.
+    pub fn is_evaluable(&self) -> bool {
+        self.unsupported_kind.is_none()
+            && (!self.tracking_area_list.is_empty() || !self.ncgi_list.is_empty())
+    }
+
+    /// A stable identity for this area within one subscription, used as the key for
+    /// the last-reported presence state that TS 29.518 §5.3.1's change rule needs
+    /// (`29518-k00.txt:4895-4897`).
+    ///
+    /// The `praId` when there is one — the IE exists precisely to name the area — and
+    /// otherwise the ordinal, which is what the `aoiStateList` JSON pointer form does
+    /// (`29518-k00.txt:17097-17106`: the key is *"the JSON pointer to an AmfEventArea
+    /// element in the areaList IE"*).
+    pub fn identity(&self, ordinal: usize) -> String {
+        match &self.pra_id {
+            Some(id) => format!("pra:{id}"),
+            None => format!("areaList/{ordinal}"),
+        }
+    }
+}
+
 /// Namf_EventExposure subscription stored in the AMF context
 /// (TS 29.518 §6.2.6.2.2 AmfEventSubscription)
 #[derive(Debug, Clone)]
@@ -857,6 +984,47 @@ pub struct EventSubscription {
     /// `notifyCorrelationId`. So the two are mutually exclusive on the wire, and
     /// holding both is what lets the emitter pick correctly.
     pub subs_change_notify_correlation_id: Option<String>,
+    /// Subscribed Areas of Interest (#400), from `AmfEvent.areaList`
+    /// (`29518-k00.txt:21391-21397`) or `AmfEvent.presenceInfoList`
+    /// (`:21527-21535`, feature `MPRA` — the same `PresenceInfo` type in a map
+    /// container keyed by `praId`).
+    ///
+    /// Stored on the SUBSCRIPTION rather than per-event because a conformant
+    /// consumer may name several areas in one `AmfEvent` (*"More than one instance
+    /// of AmfEventArea IE shall be used only when the AmfEventArea is provided
+    /// during event subscription for Presence Reporting Area subscription"*,
+    /// `:21393-21397`), and `PRESENCE_IN_AOI_REPORT`'s `areaList` must report EVERY
+    /// subscribed area's verdict (Table 6.2.6.2.5-1, `:21923-21928`).
+    ///
+    /// Empty for every subscription that named no area — which is all of the ten
+    /// event types #397 wired, none of which is area-scoped.
+    pub areas: Vec<EventArea>,
+    /// The presence state last REPORTED per area, keyed by [`EventArea::identity`].
+    ///
+    /// Required by TS 29.518 §5.3.1, which is a **shall**: *"In subsequent
+    /// notifications, the AMF shall only report the UE(s) whose presence status has
+    /// changed compared to the previous notification sent by the AMF"*
+    /// (`29518-k00.txt:4895-4897`). Without this the AMF would notify on every
+    /// relocation WITHIN one area — a notification the clause forbids, and exactly
+    /// the "plausible-but-wrong moment" failure #400 was filed to avoid.
+    ///
+    /// Keyed additionally by SUPI, because one any-UE subscription tracks many UEs
+    /// independently: the map key is `(supi, area identity)`. A single key per area
+    /// would let one UE's transition suppress another's.
+    pub reported_presence: std::collections::HashMap<(String, String), String>,
+    /// `AmfEvent.reportingThreshold` (`29518-k00.txt:21720-21731`), feature `OBGAD`.
+    ///
+    /// **Stored and echoed but NOT honoured**, and the emitter logs that it is not —
+    /// see `namf_server::fire_ues_in_area_report`. The IE is scoped to *"UEs
+    /// subscribed to LCS Broadcast Assistance Type(s)"* (`:21720-21724`), a per-UE
+    /// subscription this AMF does not hold, and §5.3.1's OBGAD arm makes the threshold
+    /// inseparable from that population (`:5155-5162`). Applying it to a count of ALL
+    /// UEs would report threshold crossings for a population the consumer did not ask
+    /// about.
+    ///
+    /// Retained rather than dropped so the subscription echo round-trips what the
+    /// consumer sent, for the reason the `gpsi` echo exists.
+    pub reporting_threshold: Option<i64>,
 }
 
 /// AMFStatusChange subscription stored in the AMF context (TS 29.518 §5.2.2.5.1,
@@ -1801,6 +1969,52 @@ impl AmfContext {
             .write()
             .ok()
             .and_then(|mut subs| subs.remove(subscription_id))
+    }
+
+    /// Record the presence state just REPORTED for `(supi, area)` on one
+    /// subscription, answering whether it was a CHANGE (#400).
+    ///
+    /// This is the gate TS 29.518 §5.3.1's change rule needs: *"In subsequent
+    /// notifications, the AMF shall only report the UE(s) whose presence status has
+    /// changed compared to the previous notification sent by the AMF"*
+    /// (`29518-k00.txt:4895-4897`).
+    ///
+    /// **Test-and-set in one lock acquisition**, deliberately. A caller that read the
+    /// previous value and then wrote the new one would have a window in which two
+    /// concurrent fire points (a registration and a handover for different UEs both
+    /// spawn delivery tasks) could each see "changed" for the same key and notify
+    /// twice — which is the very duplicate the clause forbids.
+    ///
+    /// Returns `true` when the state differs from the last reported one (including
+    /// the first ever report for this key, which §5.3.1 requires: *"the AMF shall
+    /// report the current presence status of the target UE(s)"* for the first
+    /// notification, `:4879-4882`).
+    pub fn event_subscription_record_presence(
+        &self,
+        subscription_id: &str,
+        supi: &str,
+        area_identity: &str,
+        state: &str,
+    ) -> bool {
+        let Ok(mut subs) = self.event_subscriptions.write() else {
+            // A poisoned lock must not turn into a SILENT non-report: the honest
+            // fallback is to treat it as a change, so the consumer hears about the
+            // UE rather than the AMF swallowing the event.
+            return true;
+        };
+        let Some(sub) = subs.get_mut(subscription_id) else {
+            // The subscription was deleted between matching and delivering. Report
+            // nothing further for it.
+            return false;
+        };
+        let key = (supi.to_string(), area_identity.to_string());
+        match sub.reported_presence.get(&key) {
+            Some(prev) if prev == state => false,
+            _ => {
+                sub.reported_presence.insert(key, state.to_string());
+                true
+            }
+        }
     }
 
     /// Find an event-exposure subscription by ID (clone-out, lock dropped)
