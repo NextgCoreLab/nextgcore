@@ -155,19 +155,32 @@ RUN CARGO_TARGET=$(cat /tmp/cargo_target) && \
 # Build nextgsim gNB and UE. The gNB is built WITH `--features kernel-sctp`
 # (scoped to -p nextgsim-gnb, since the feature is defined on that package) so
 # it too can associate over native kernel SCTP; nr-ue needs no kernel feature.
+#
+# `nr-cli` is built too (issue #403). It is nextgsim's OWN CLI client and already a
+# workspace member (nextgsim/Cargo.toml), so this adds no nextgsim code -- it is
+# the control surface the Docker E2E uses to drive a registered UE to CM-IDLE, by
+# issuing `ue-suspend` to the gNB. It has to run INSIDE the gNB container: the CLI
+# server binds 127.0.0.1 (nextgsim-common/src/cli_server.rs) and is discovered
+# through a proc-table file under /tmp/nextgsim.proc-table/, so neither the port
+# nor the table is reachable from another container. nextgsim's own gNB image
+# ships only nr-gnb, hence the copy.
 WORKDIR /build/nextgsim
 RUN CARGO_TARGET=$(cat /tmp/cargo_target) && \
     if [ "$(uname -m)" != "$(echo $CARGO_TARGET | cut -d- -f1)" ]; then \
         cargo build --release --target "$CARGO_TARGET" -p nextgsim-gnb --features kernel-sctp --bin nr-gnb 2>&1 || true; \
         cargo build --release --target "$CARGO_TARGET" --bin nr-ue 2>&1 || true; \
+        cargo build --release --target "$CARGO_TARGET" -p nextgsim-cli --bin nr-cli 2>&1 || true; \
     else \
         cargo build --release -p nextgsim-gnb --features kernel-sctp --bin nr-gnb 2>&1 || true; \
         cargo build --release --bin nr-ue 2>&1 || true; \
+        cargo build --release -p nextgsim-cli --bin nr-cli 2>&1 || true; \
     fi && \
     cp target/*/release/nr-gnb /out/ 2>/dev/null || true && \
     cp target/*/release/nr-ue /out/ 2>/dev/null || true && \
+    cp target/*/release/nr-cli /out/ 2>/dev/null || true && \
     cp target/release/nr-gnb /out/ 2>/dev/null || true && \
-    cp target/release/nr-ue /out/ 2>/dev/null || true
+    cp target/release/nr-ue /out/ 2>/dev/null || true && \
+    cp target/release/nr-cli /out/ 2>/dev/null || true
 
 # Final stage: tiny image with only binaries
 FROM debian:bookworm-slim

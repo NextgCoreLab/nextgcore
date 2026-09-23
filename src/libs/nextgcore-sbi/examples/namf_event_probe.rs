@@ -51,13 +51,43 @@
 //! An example rather than a test: it needs a live AMF and a live NG-RAN, neither of
 //! which exists under `cargo test`.
 //!
+//! # The two fire points, and why they are separate PHASES
+//!
+//! `handle_service_request_nas` has its own pair of emitters (`REACHABILITY_REPORT`
+//! and `LOCATION_REPORT`), and issue #403 is about proving them. They cannot be
+//! folded into the registration assertion above, because `LOCATION_REPORT` fires at
+//! **both** sites — deliberately, since TS 29.518 §6.2's trigger is "when AMF becomes
+//! aware of a location change" and it becomes aware at each. One probe subscribing to
+//! all five types would receive the registration `LOCATION_REPORT` and could not tell
+//! it from the service-request one.
+//!
+//! So the phase is a command-line argument and the caller runs **two processes**: the
+//! `service-request` phase subscribes only after the registration phase has passed,
+//! so every notification it receives was fired after that point.
+//!
+//! `REACHABILITY_REPORT` is what makes the service-request phase discriminating, and
+//! it discriminates hard: `fire_reachability_report` has exactly ONE caller in the
+//! tree (`ngap_path.rs`, inside `handle_service_request_nas`), so a delivered
+//! `REACHABILITY_REPORT` cannot have come from anywhere else.
+//!
+//! Note on a vacuity trap that is deliberately avoided: the AMF can synthesise a
+//! `REACHABILITY_REPORT` from current state for a subscription carrying
+//! `immediateFlag` (`build_immediate_reports`). That would describe the AMF's state
+//! rather than prove the fire point ran. This probe never sets `immediateFlag`, and
+//! immediate reports are returned in the 201 response BODY rather than POSTed to the
+//! callback — and only what the SINK received is ever asserted on.
+//!
 //! # Usage
 //!
 //! ```text
-//! namf_event_probe <amf-host:port> <sink-bind-port> <sink-advertise-host> \
+//! namf_event_probe <phase> <amf-host:port> <sink-bind-port> <sink-advertise-host> \
 //!                  <supi> <control-supi> <expect-mcc> <expect-mnc> <expect-tac-hex> \
 //!                  <timeout-secs>
 //! ```
+//!
+//! `<phase>` is `registration` (`REGISTRATION_STATE_REPORT`, `LOCATION_REPORT`,
+//! `ACCESS_TYPE_REPORT`) or `service-request` (`REACHABILITY_REPORT`,
+//! `LOCATION_REPORT`).
 //!
 //! It prints `SUBSCRIBED` once both subscriptions exist, and only then may the
 //! caller start the gNB and UE — the AMF delivers nothing to a subscription that
@@ -84,6 +114,46 @@ struct Received {
 
 const MAIN_PATH: &str = "/notify/main";
 const CONTROL_PATH: &str = "/notify/control";
+
+/// Which fire point this run asserts.
+///
+/// Separate runs rather than one subscription covering both, because
+/// `LOCATION_REPORT` fires at each site and a single run could not attribute it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// `send_registration_accept` (#397).
+    Registration,
+    /// `handle_service_request_nas` (#403).
+    ServiceRequest,
+}
+
+impl Phase {
+    /// The event types to subscribe to, and no others: subscribing to a type fired
+    /// elsewhere would make a timeout ambiguous about which site failed.
+    fn event_types(self) -> &'static [&'static str] {
+        match self {
+            Phase::Registration => &[
+                "REGISTRATION_STATE_REPORT",
+                "LOCATION_REPORT",
+                "ACCESS_TYPE_REPORT",
+            ],
+            // CONNECTIVITY_STATE_REPORT fires from this site too, but is deliberately
+            // not subscribed: it also fires at the N1 release
+            // (`start_reachability_supervision`), so it adds no discrimination that
+            // REACHABILITY_REPORT -- whose only caller IS this site -- does not give.
+            Phase::ServiceRequest => &["REACHABILITY_REPORT", "LOCATION_REPORT"],
+        }
+    }
+
+    /// `notifyCorrelationId` suffix, so the two phases' subscriptions are
+    /// distinguishable in the AMF's log and a report cannot satisfy the wrong phase.
+    fn correlation_tag(self) -> &'static str {
+        match self {
+            Phase::Registration => "397",
+            Phase::ServiceRequest => "403",
+        }
+    }
+}
 
 fn fail(msg: &str) -> ! {
     eprintln!("::error::{msg}");
@@ -157,24 +227,33 @@ fn expect_str(report: &Value, pointer: &str, want: &str, why: &str) {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 10 {
+    if args.len() != 11 {
         eprintln!(
-            "usage: {} <amf-host:port> <sink-bind-port> <sink-advertise-host> <supi> \
-             <control-supi> <expect-mcc> <expect-mnc> <expect-tac-hex> <timeout-secs>",
+            "usage: {} <registration|service-request> <amf-host:port> <sink-bind-port> \
+             <sink-advertise-host> <supi> <control-supi> <expect-mcc> <expect-mnc> \
+             <expect-tac-hex> <timeout-secs>",
             args[0]
         );
         std::process::exit(2);
     }
-    let amf = &args[1];
-    let sink_port: u16 = args[2].parse().unwrap_or_else(|e| {
+    let phase = match args[1].as_str() {
+        "registration" => Phase::Registration,
+        "service-request" => Phase::ServiceRequest,
+        other => {
+            eprintln!("phase must be `registration` or `service-request`, not {other:?}");
+            std::process::exit(2);
+        }
+    };
+    let amf = &args[2];
+    let sink_port: u16 = args[3].parse().unwrap_or_else(|e| {
         eprintln!("sink-bind-port: {e}");
         std::process::exit(2);
     });
-    let sink_host = &args[3];
-    let supi = &args[4];
-    let control_supi = &args[5];
-    let (expect_mcc, expect_mnc, expect_tac) = (&args[6], &args[7], &args[8]);
-    let timeout_secs: u64 = args[9].parse().unwrap_or_else(|e| {
+    let sink_host = &args[4];
+    let supi = &args[5];
+    let control_supi = &args[6];
+    let (expect_mcc, expect_mnc, expect_tac) = (&args[7], &args[8], &args[9]);
+    let timeout_secs: u64 = args[10].parse().unwrap_or_else(|e| {
         eprintln!("timeout-secs: {e}");
         std::process::exit(2);
     });
@@ -230,23 +309,16 @@ async fn main() {
             .with_request_timeout(Duration::from_secs(10)),
     );
 
-    // The three registration-path types #397 wired, and no others: this probe
-    // asserts the registration fire point, so subscribing to types fired elsewhere
-    // would make a timeout ambiguous about which site failed.
-    let events = [
-        "REGISTRATION_STATE_REPORT",
-        "LOCATION_REPORT",
-        "ACCESS_TYPE_REPORT",
-    ];
-    let main_correlation = "corr-397-e2e-main";
-    let control_correlation = "corr-397-e2e-control";
+    let events = phase.event_types();
+    let main_correlation = &format!("corr-{}-e2e-main", phase.correlation_tag());
+    let control_correlation = &format!("corr-{}-e2e-control", phase.correlation_tag());
 
     let main_id = subscribe(
         &client,
         &format!("http://{sink_host}:{sink_port}{MAIN_PATH}"),
         main_correlation,
         supi,
-        &events,
+        events,
     )
     .await;
     let control_id = subscribe(
@@ -254,7 +326,7 @@ async fn main() {
         &format!("http://{sink_host}:{sink_port}{CONTROL_PATH}"),
         control_correlation,
         control_supi,
-        &events,
+        events,
     )
     .await;
 
@@ -264,8 +336,11 @@ async fn main() {
     // probe would time out for a reason that is not the wiring.
     println!("SUBSCRIBED main={main_id} control={control_id}");
     println!(
-        "waiting up to {timeout_secs}s for the registration of {supi} to deliver {:?}",
-        events
+        "waiting up to {timeout_secs}s for the {} of {supi} to deliver {events:?}",
+        match phase {
+            Phase::Registration => "registration",
+            Phase::ServiceRequest => "Service Request",
+        }
     );
     use std::io::Write;
     let _ = std::io::stdout().flush();
@@ -298,7 +373,7 @@ async fn main() {
         }
         let notification = received.body;
         let correlation = notification["notifyCorrelationId"].as_str();
-        if correlation != Some(main_correlation) {
+        if correlation != Some(main_correlation.as_str()) {
             fail(&format!(
                 "a notification on the main callback carried notifyCorrelationId \
                  {correlation:?}, expected {main_correlation:?} (TS 29.518 §6.2.6.2.4 \
@@ -332,44 +407,86 @@ async fn main() {
             .copied()
             .filter(|t| !collected.contains_key(*t))
             .collect();
+        let (site, what_nothing_means) = match phase {
+            Phase::Registration => (
+                "send_registration_accept",
+                "either the UE never completed registration over N2 (check the \
+                 nextgsim-ue and nextgsim-gnb logs for a Registration Accept) or the \
+                 emitters are not wired at that site",
+            ),
+            Phase::ServiceRequest => (
+                "handle_service_request_nas",
+                "either the UE never completed a Service Request (check the nextgsim-ue \
+                 log for `Sending Service Request` followed by `Service Accept \
+                 received` -- a Service REJECT means the UE came back on an \
+                 InitialUEMessage rather than an UplinkNASTransport, which is the \
+                 cause-#9 arm) or the emitters are not wired at that site",
+            ),
+        };
         fail(&format!(
-            "after {timeout_secs}s the AMF delivered {} of {} registration-path \
-             notifications for {supi}; MISSING {missing:?}.\n\
-             This is the #397 property: those emitters sit AFTER \
-             `send_to_association(..).await?` in `send_registration_accept`, so \
-             nothing arriving means either the UE never completed registration over \
-             N2 (check the nextgsim-ue and nextgsim-gnb logs for a Registration \
-             Accept) or the emitters are not wired at that site.",
+            "after {timeout_secs}s the AMF delivered {} of {} {}-path notifications \
+             for {supi}; MISSING {missing:?}.\n\
+             Those emitters sit AFTER `send_to_association(..).await?` in `{site}`, so \
+             nothing arriving means {what_nothing_means}.",
             collected.len(),
-            events.len()
+            events.len(),
+            args[1],
         ));
     }
 
-    // REGISTRATION_STATE_REPORT.
-    let reg = &collected["REGISTRATION_STATE_REPORT"];
-    expect_str(
-        reg,
-        "/supi",
-        supi,
-        "the report must name the UE that registered, not another UE the AMF serves.",
-    );
-    expect_str(
-        reg,
-        "/rmInfoList/0/rmState",
-        "REGISTERED",
-        "TS 24.501 §5.5.1.2.4: the UE enters 5GMM-REGISTERED on receiving the Accept, \
-         so REGISTERED is the state this moment reports.",
-    );
-    expect_str(
-        reg,
-        "/rmInfoList/0/accessType",
-        "3GPP_ACCESS",
-        "`RmInfo` requires both members (TS29518_Namf_EventExposure.yaml:908-910).",
-    );
+    match phase {
+        Phase::Registration => {
+            // REGISTRATION_STATE_REPORT.
+            let reg = &collected["REGISTRATION_STATE_REPORT"];
+            expect_str(
+                reg,
+                "/supi",
+                supi,
+                "the report must name the UE that registered, not another UE the AMF serves.",
+            );
+            expect_str(
+                reg,
+                "/rmInfoList/0/rmState",
+                "REGISTERED",
+                "TS 24.501 §5.5.1.2.4: the UE enters 5GMM-REGISTERED on receiving the \
+                 Accept, so REGISTERED is the state this moment reports.",
+            );
+            expect_str(
+                reg,
+                "/rmInfoList/0/accessType",
+                "3GPP_ACCESS",
+                "`RmInfo` requires both members (TS29518_Namf_EventExposure.yaml:908-910).",
+            );
+        }
+        Phase::ServiceRequest => {
+            // REACHABILITY_REPORT -- the type that makes this phase discriminating.
+            // `fire_reachability_report` has exactly ONE caller in the tree, inside
+            // `handle_service_request_nas`, so a delivered report cannot have come from
+            // anywhere else. Asserted on its VALUE, not merely its arrival.
+            let reach = &collected["REACHABILITY_REPORT"];
+            expect_str(
+                reach,
+                "/supi",
+                supi,
+                "the report must name the UE whose Service Request was accepted.",
+            );
+            expect_str(
+                reach,
+                "/reachability",
+                "REACHABLE",
+                "TS 29.518 §6.2: a UE that has just completed a Service Request is \
+                 reachable by DEMONSTRATION -- it answered. The emitter passes \
+                 `reachable = true` at this site, so UNREACHABLE here means the value \
+                 is being derived from something other than this moment.",
+            );
+        }
+    }
 
-    // LOCATION_REPORT -- the discriminating assertion. These three values come off
-    // the InitialUEMessage's own `UserLocationInformation`, so a report assembled
-    // from a default `Tai5gs` would say mcc 000 / mnc 000 / tac 0000.
+    // LOCATION_REPORT -- the discriminating assertion, and asserted in BOTH phases
+    // because the emitter deliberately fires at both sites (TS 29.518 §6.2's trigger
+    // is "when AMF becomes aware of a location change", and it becomes aware at each).
+    // These three values come off the NGAP message's own `UserLocationInformation`, so
+    // a report assembled from a default `Tai5gs` would say mcc 000 / mnc 000 / tac 0000.
     let loc = &collected["LOCATION_REPORT"];
     expect_str(
         loc,
@@ -391,13 +508,15 @@ async fn main() {
          a default `Tai5gs` would say 0000.",
     );
 
-    // ACCESS_TYPE_REPORT.
-    expect_str(
-        &collected["ACCESS_TYPE_REPORT"],
-        "/accessTypeList/0",
-        "3GPP_ACCESS",
-        "N2 from an NG-RAN is the 3GPP access, so this registration IS the 3GPP one.",
-    );
+    if phase == Phase::Registration {
+        // ACCESS_TYPE_REPORT.
+        expect_str(
+            &collected["ACCESS_TYPE_REPORT"],
+            "/accessTypeList/0",
+            "3GPP_ACCESS",
+            "N2 from an NG-RAN is the 3GPP access, so this registration IS the 3GPP one.",
+        );
+    }
 
     // The negative control. Checked last so its diagnostic can name what the
     // positive half already proved.
@@ -412,12 +531,21 @@ async fn main() {
         ));
     }
 
-    println!(
-        "PASS: nextgsim's gNB registered {supi} over real N2 and the AMF DELIVERED \
-         REGISTRATION_STATE_REPORT (REGISTERED / 3GPP_ACCESS), LOCATION_REPORT \
-         (mcc {expect_mcc} mnc {expect_mnc} tac {expect_tac}) and ACCESS_TYPE_REPORT \
-         to the subscribed callback, and delivered NOTHING to the control \
-         subscription for {control_supi}"
-    );
+    match phase {
+        Phase::Registration => println!(
+            "PASS: nextgsim's gNB registered {supi} over real N2 and the AMF DELIVERED \
+             REGISTRATION_STATE_REPORT (REGISTERED / 3GPP_ACCESS), LOCATION_REPORT \
+             (mcc {expect_mcc} mnc {expect_mnc} tac {expect_tac}) and ACCESS_TYPE_REPORT \
+             to the subscribed callback, and delivered NOTHING to the control \
+             subscription for {control_supi}"
+        ),
+        Phase::ServiceRequest => println!(
+            "PASS: {supi} went CM-IDLE and came back through a REAL Service Request over \
+             nextgsim's gNB, and the AMF DELIVERED REACHABILITY_REPORT (REACHABLE) and \
+             LOCATION_REPORT (mcc {expect_mcc} mnc {expect_mnc} tac {expect_tac}) from \
+             `handle_service_request_nas` to the subscribed callback, and delivered \
+             NOTHING to the control subscription for {control_supi}"
+        ),
+    }
     let _ = sink.stop().await;
 }

@@ -393,36 +393,57 @@ Three ordering and vacuity constraints had to be established rather than assumed
    whole assertion exists to avoid (#187's first CI attempt, which grepped for the absence of
    `invalid_client` and passed on a log with zero token requests).
 
-### CEILING, stated rather than implied: the SERVICE REQUEST fire point is NOT covered
+### ~~CEILING: the SERVICE REQUEST fire point is NOT covered~~ — **CLOSED by #403**
 
-The E2E asserts the REGISTRATION fire point only. `REACHABILITY_REPORT` +
-`LOCATION_REPORT` from `handle_service_request_nas` are **not proven by any test after this
-change** — the deleted `the_live_service_request_fires_reachability_and_location_reports` was
-their only coverage.
+**Superseded.** `REACHABILITY_REPORT` + `LOCATION_REPORT` from
+`handle_service_request_nas` are now **proven** by a second phase of the same `Docker E2E`
+job, against nextgsim's real gNB and UE. See
+`specs/prove-service-request-namf-fire-point-e2e.md`.
 
-Reaching that site needs the UE to enter CM-IDLE and then either originate uplink data or
-answer a page. nextgsim's `nr-ue` does trigger a Service Request on both (a TUN write while
-idle, and `NasMessage::Paging` — `nextgsim-ue/src/main.rs`), but neither happens unprompted
-in a compose bring-up, and nothing in either repo can drive an idle transition from outside
-the UE process. Building that control surface is nextgsim work, not nextgcore work, which is
-exactly the owner's point restated.
+The reasoning below is kept as the record of what was believed at the time, but **one of its
+claims was false** and it matters which: it asserted that *"nothing in either repo can drive
+an idle transition from outside the UE process"* and that a new `nr-ue` control surface would
+be needed. It looked at the wrong node. nextgsim's **gNB** CLI already has `ue-suspend`,
+which sends an `RRCRelease` carrying a `suspendConfig` (TS 38.331 §5.3.8.3) — RAN-local, so
+the AMF keeps the NGAP UE context, the UE's NAS goes CM-IDLE, and a TUN write brings it back
+through a real Service Request on an `UplinkNASTransport`. **No nextgsim change was
+required.**
 
-Filed as **#403**. Until it lands, the honest statement is: the registration emitters are
-proven live against a real gNB; the service-request emitters are wired at a site the reader
-can verify by inspection and are **unproven by automated test**.
+What the ceiling got right is that `ue-release` would *not* have worked: that one does tell
+the AMF, both sides drop the NGAP context, and the UE returns on an `InitialUEMessage` —
+which `handle_initial_ue_message` answers with Service Reject cause #9 unconditionally. That
+remains a real nextgcore gap, recorded as a ceiling in the #403 spec.
+
+> The E2E asserts the REGISTRATION fire point only. `REACHABILITY_REPORT` +
+> `LOCATION_REPORT` from `handle_service_request_nas` are **not proven by any test after
+> this change** — the deleted
+> `the_live_service_request_fires_reachability_and_location_reports` was their only
+> coverage.
+>
+> Reaching that site needs the UE to enter CM-IDLE and then either originate uplink data or
+> answer a page. nextgsim's `nr-ue` does trigger a Service Request on both (a TUN write
+> while idle, and `NasMessage::Paging` — `nextgsim-ue/src/main.rs`), but neither happens
+> unprompted in a compose bring-up, and nothing in either repo can drive an idle transition
+> from outside the UE process. Building that control surface is nextgsim work, not nextgcore
+> work, which is exactly the owner's point restated.
+>
+> Filed as **#403**. Until it lands, the honest statement is: the registration emitters are
+> proven live against a real gNB; the service-request emitters are wired at a site the
+> reader can verify by inspection and are **unproven by automated test**.
 
 ### Revert-verification: eight changes broken, the NAMED test watched to fail, restored
 
-Recorded as originally performed. The first two rows are struck through because the tests
-that caught them no longer exist — see the ceiling above. They are left in rather than
-deleted, because "this was verified once by a test that has since been removed" is a
-different and weaker claim than "this is verified", and collapsing the two would overstate
-the tree's current coverage.
+Recorded as originally performed. The first two rows no longer name a `cargo test` test,
+because the tests that caught them were deleted with the loopback gNB — but **both are now
+caught by the `Docker E2E` job instead**, so they are no longer weaker claims and the
+strike-through has been lifted (#403 criterion 4). The assertion that catches them is
+stronger than what it replaced: it runs against nextgsim's real gNB rather than a synthetic
+in-process peer.
 
 | reverted | test that failed | discriminating sibling that stayed GREEN |
 |---|---|---|
-| ~~registration emitters removed~~ | ~~`the_live_registration_accept_fires_registration_state_and_location_reports`~~ (DELETED; now the `Docker E2E` probe) | — |
-| ~~service-request emitters removed~~ | ~~`the_live_service_request_fires_reachability_and_location_reports`~~ (DELETED; **not replaced**, #403) | the registration sibling |
+| registration emitters removed | `Docker E2E` → *Assert the AMF DELIVERED the registration Namf event notifications* (`namf_event_probe --phase registration`; replaced the deleted `the_live_registration_accept_fires_registration_state_and_location_reports`) | the service-request phase |
+| service-request emitters removed | `Docker E2E` → *Assert the AMF DELIVERED the SERVICE REQUEST Namf notifications* (`namf_event_probe --phase service-request`, #403; replaced the deleted `the_live_service_request_fires_reachability_and_location_reports`) | the registration phase |
 | deregistration emitters removed | `the_live_deregistration_fires_deregistered_and_loss_of_connectivity` | — |
 | classifier forced to `true` (fire always) | `a_ran_release_for_user_inactivity_fires_no_communication_failure` | `a_ran_release_with_a_failure_cause_...` |
 | comm-failure emitter removed | `a_ran_release_with_a_failure_cause_fires_communication_failure_report` | `..._for_user_inactivity_...` |
