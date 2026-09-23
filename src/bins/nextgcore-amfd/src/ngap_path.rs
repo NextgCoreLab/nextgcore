@@ -4360,11 +4360,31 @@ impl NgapServer {
         // #397's first criterion, and it is why they moved here rather than gaining a
         // production caller: the question is where the EVENT occurs on a live path, not
         // how to reach a particular function.
+        //
+        // #400: PRESENCE_IN_AOI_REPORT and UES_IN_AREA_REPORT join them, read from the
+        // same `get` and so describing the same snapshot.
+        //
+        // This is the FIRST-NOTIFICATION site, which TS 29.518 §5.3.1 requires to carry
+        // the current state rather than waiting for a transition: *"when the event
+        // subscription is targeting a UE or a group of UEs, the AMF shall report the
+        // current presence status of the target UE(s)"* (`29518-k00.txt:4879-4882`).
+        // `amf_ue.nr_tai` was written from the InitialUEMessage's own
+        // `UserLocationInformation` (`:1586-1589`), so the TAI the subscribed areas are
+        // compared against is what the gNB reported for THIS UE, not a default.
+        //
+        // `UES_IN_AREA_REPORT` fires here too, and takes no UE argument: the type is
+        // any-UE by definition (*"UE Type: any UE"*, `:5170`) and its report carries no
+        // UE identity at all (Table 6.2.6.2.5-1 NOTE 1, `:22212`). A UE registering is a
+        // UE entering the AMF's served population, so a per-area count the AMF
+        // previously reported may have changed — the emitter re-derives it from the live
+        // store.
         if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
             crate::namf_server::fire_access_type_report(&state.amf_ue, "3GPP_ACCESS");
             crate::namf_server::fire_registration_state_report(&state.amf_ue, true);
             crate::namf_server::fire_location_report(&state.amf_ue);
+            crate::namf_server::fire_presence_in_aoi_report(&state.amf_ue);
         }
+        crate::namf_server::fire_ues_in_area_report();
         let _ = self.create_ue_policy_association(amf_ue_ngap_id).await;
         Ok(())
     }
@@ -7408,6 +7428,54 @@ impl NgapServer {
                 notify.amf_ue_ngap_id
             );
         }
+
+        // #400: PRESENCE_IN_AOI_REPORT — **the transition site**.
+        //
+        // TS 29.518 §6.2 names the trigger as a transition, not a state: the consumer
+        // receives *"the current present state of a UE in a specific Area of Interest
+        // (AOI), and notification when a specified UE enters or leaves the specified
+        // area"* (`29518-k00.txt:23968-23978`). A handover is the only moment this AMF
+        // observes a UE MOVING: `send_registration_accept` sees a UE's first location and
+        // the Service Request path cannot see a new one at all (see below), so an IN->OUT
+        // or OUT->IN transition is detectable here and nowhere else.
+        //
+        // Fired AFTER the `with_mut` above, deliberately: that closure is what writes the
+        // TARGET's TAI and cell identity, so evaluating before it would compare the
+        // subscribed areas against where the UE USED to be and report the transition
+        // backwards. It is also the only production writer of `amf_ue.nr_cgi`, which is
+        // why an `ncgiList` area can only ever resolve to IN/OUT after a handover —
+        // `namf_server::ue_ncgi_is_known` records that ceiling and reports UNKNOWN
+        // before it.
+        //
+        // The emitter applies §5.3.1's change rule (*"In subsequent notifications, the
+        // AMF shall only report the UE(s) whose presence status has changed compared to
+        // the previous notification sent by the AMF"*, `:4895-4897`), so a relocation
+        // WITHIN one area sends nothing. Without that gate this site would notify on
+        // every handover regardless of whether presence changed, which is the
+        // "plausible-but-wrong moment" #400 was filed to avoid.
+        //
+        // CEILING, stated here because this is the site a reader will ask at: the
+        // SERVICE REQUEST path does NOT fire these. #402 fires `LOCATION_REPORT` from
+        // `handle_service_request_nas`, so symmetry argues for it — but
+        // `ngap_asn1::parse_uplink_nas_transport_asn1` DISCARDS the
+        // `UserLocationInformation` that `nextgcore_ngap::parser` already decodes as a
+        // mandatory IE (`libs/nextgcore-ngap/src/parser.rs:640-663`;
+        // `UplinkNasTransportData` has no field for it). So that path cannot learn a new
+        // location: it would re-evaluate the REGISTRATION's TAI and, on the first
+        // Service Request after a move, report an unchanged verdict as though it were
+        // news. §5.3.1's change rule makes that non-conformant rather than merely
+        // redundant. The parser gap is filed as **#406**; fixing it makes the Service
+        // Request a third genuine location-learning moment for this emitter AND for
+        // #402's `LOCATION_REPORT`, which today reports a stale TAI there. Once #406
+        // lands this site should be revisited: the change rule above makes firing from
+        // the Service Request safe, because an unchanged verdict is suppressed.
+        if let Some(state) = self.ue_auth_state.get(notify.amf_ue_ngap_id) {
+            crate::namf_server::fire_presence_in_aoi_report(&state.amf_ue);
+        }
+        // A relocation can move a UE into or out of a counted area, so the per-area
+        // totals change even though the served population did not.
+        crate::namf_server::fire_ues_in_area_report();
+
         // #70: switch the core-side DL path to the target (TS 23.502 §4.9.1.3.3 step 12,
         // TS 29.502 `HANDOVER_COMPLETE`). Done HERE and not at HandoverRequestAcknowledge
         // because until the UE has arrived the source is still serving it, and switching
@@ -13274,6 +13342,172 @@ mod tests {
         assert_eq!(moved.ran_ue_ngap_id, 22, "serving RAN-UE-NGAP-ID moved");
     }
 
+    /// #400: a HANDOVER that moves the UE out of a subscribed Area of Interest delivers
+    /// a `PRESENCE_IN_AOI_REPORT` carrying `OUT_OF_AREA` — **driven through the
+    /// production NGAP handler, and observed at a real subscriber.**
+    ///
+    /// This is the test #400's criterion 2 asks for: *"a test drives the production path
+    /// and observes the notification at a real subscriber, not the emitter"*. It calls
+    /// `handle_handover_notify` — the live NGAP dispatch target for procedure
+    /// `HandoverNotify` (`ngap_path.rs:1078`) — with a real APER-encoded PDU built by
+    /// `nextgcore_ngap::builder`, and reads the notification off an in-process
+    /// `SbiServer` the AMF POSTs to over real HTTP/2.
+    ///
+    /// Reachable without a stand-in gNB, unlike the registration site: the emitter sits
+    /// after the `with_mut` that writes the target's location and before any outbound
+    /// send, so no SCTP association is needed to reach it. (PR #402's owner refused a
+    /// loopback gNB; the registration fire point is covered by the cross-repo Docker
+    /// E2E instead.)
+    ///
+    /// # Why the transition is asserted rather than the state
+    ///
+    /// The UE starts INSIDE the subscribed area (TAC 0x0412) and the HandoverNotify
+    /// carries TAC 0x0001, which the area does not name. So the verdict must FLIP. The
+    /// first fire (inside) is consumed first, so the assertion is on the transition and
+    /// not merely on "some report arrived" — an emitter wired to the wrong side of the
+    /// location write would report `IN_AREA` again and §5.3.1's change rule would
+    /// suppress it entirely, timing this test out.
+    ///
+    /// REVERT-VERIFIED: deleting the `fire_presence_in_aoi_report` call from
+    /// `handle_handover_notify` makes the recv time out; moving it BEFORE the `with_mut`
+    /// that writes the target location makes it time out too, because the unchanged
+    /// `IN_AREA` verdict is then suppressed by the change rule.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handover_out_of_the_subscribed_area_reports_the_transition() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut server = test_ngap_server().await;
+        // This test's own AMF-UE-NGAP-ID and association ids: #400's sibling tests in
+        // `namf_server` use 900_4xx, and 78_00x is taken by the #70 handover tests
+        // above — two amfd tests once shared 78_001 and failed ~1 run in 3.
+        let (source, target) = (94_001u64, 94_002u64);
+        let amf_ue_ngap_id = 78_400u64;
+        let supi = "imsi-001010000401200";
+        seed_gnb_session(&server, source).await;
+        seed_gnb_session(&server, target).await;
+
+        // The UE is INSIDE the area the subscription will name.
+        let mut state = UeNasContext::new(amf_ue_ngap_id, 41u32, source, false);
+        state.amf_ue.supi = Some(supi.to_string());
+        state.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        state.amf_ue.nr_tai.tac = 0x0412;
+        let ue_snapshot = state.amf_ue.clone();
+        server.ue_auth_state.insert(amf_ue_ngap_id, state);
+        // Published so the Namf surface resolves it the way #341 requires.
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.amf_ue_publish(&ue_snapshot, 41, source);
+        }
+
+        // A real subscriber, over real HTTP/2.
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let sink = nextgcore_sbi::SbiServer::on_listener(
+            nextgcore_sbi::SbiServerConfig::new(format!("127.0.0.1:{port}").parse().expect("addr")),
+            listener,
+        );
+        sink.start(move |req: nextgcore_sbi::SbiRequest| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(req.http.content.clone().unwrap_or_default()).await;
+                nextgcore_sbi::SbiResponse::no_content()
+            }
+        })
+        .await
+        .expect("sink start");
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        let resp = crate::namf_server::namf_request_handler(
+            nextgcore_sbi::SbiRequest::post("/namf-evts/v1/subscriptions")
+                .with_json_body(&serde_json::json!({
+                    "subscription": {
+                        "eventList": [{
+                            "type": "PRESENCE_IN_AOI_REPORT",
+                            "areaList": [{ "presenceInfo": {
+                                "praId": "401200",
+                                // The area the UE is in NOW, and which the handover's
+                                // TAC 0x0001 is NOT in.
+                                "trackingAreaList": [
+                                    { "plmnId": {"mcc": "001", "mnc": "01"}, "tac": "0412" }
+                                ],
+                            }}],
+                        }],
+                        "eventNotifyUri": format!("http://127.0.0.1:{port}/notify/400-ho"),
+                        "notifyCorrelationId": "corr-400-ho",
+                        "nfId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                        "supi": supi,
+                    }
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 201, "the subscription must be created first");
+
+        // Establish the IN_AREA baseline, so what the handover produces is unambiguously
+        // the TRANSITION. Without this the change rule would make the first handover
+        // report indistinguishable from a first notification.
+        crate::namf_server::fire_presence_in_aoi_report(&ue_snapshot);
+        let baseline = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .expect("the baseline IN_AREA report")
+            .expect("channel closed");
+        let baseline: serde_json::Value = serde_json::from_str(&baseline).expect("JSON");
+        assert_eq!(
+            baseline["reportList"][0]["areaList"][0]["presenceInfo"]["presenceState"].as_str(),
+            Some("IN_AREA"),
+            "the UE starts inside the subscribed area"
+        );
+
+        // THE PRODUCTION PATH: a real HandoverNotify PDU through the real handler.
+        // `handover_notify_pdu` carries TAI 001-01 TAC 0x000001, outside the area.
+        server
+            .handle_handover_notify(target, &handover_notify_pdu(amf_ue_ngap_id, 42))
+            .await
+            .expect("handled");
+
+        let body = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .expect(
+                "the handover moved the UE OUT of the subscribed area, so \
+                 handle_handover_notify must deliver a PRESENCE_IN_AOI_REPORT",
+            )
+            .expect("channel closed");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+        let report = &v["reportList"][0];
+        assert_eq!(
+            report["type"].as_str(),
+            Some("PRESENCE_IN_AOI_REPORT"),
+            "body was {v}"
+        );
+        assert_eq!(
+            report["supi"].as_str(),
+            Some(supi),
+            "the report must name THIS UE, not another the AMF serves"
+        );
+        assert_eq!(
+            report["areaList"][0]["presenceInfo"]["presenceState"].as_str(),
+            Some("OUT_OF_AREA"),
+            "the UE handed over from TAC 0412 (inside) to TAC 0001 (outside), which is \
+             the \"leaves the specified area\" trigger TS 29.518 §6.2 names \
+             (`29518-k00.txt:23968-23978`); report was {report}"
+        );
+        assert_eq!(
+            report["areaList"][0]["presenceInfo"]["praId"].as_str(),
+            Some("401200"),
+            "and it identifies WHICH subscribed area was left"
+        );
+        assert_eq!(
+            v["notifyCorrelationId"].as_str(),
+            Some("corr-400-ho"),
+            "a report cannot satisfy this by belonging to somebody else's subscription"
+        );
+
+        sink.stop().await.expect("sink stop");
+    }
+
     /// An intra-gNB notify — arriving on the association already serving the UE — has no
     /// separate source context, so nothing is released.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -15631,6 +15865,11 @@ mod tests {
                 // LOSS_OF_CONNECTIVITY report, not a subscription-ID change.
                 subs_change_notify_uri: None,
                 subs_change_notify_correlation_id: None,
+                // #400: no Area of Interest. This fixture subscribes to a
+                // non-area-scoped event type, so there is nothing to be present IN.
+                areas: Vec::new(),
+                reported_presence: std::collections::HashMap::new(),
+                reporting_threshold: None,
             });
         }
 
@@ -15744,6 +15983,11 @@ mod tests {
                 expiry: None,
                 subs_change_notify_uri: None,
                 subs_change_notify_correlation_id: None,
+                // #400: no Area of Interest. This fixture subscribes to a
+                // non-area-scoped event type, so there is nothing to be present IN.
+                areas: Vec::new(),
+                reported_presence: std::collections::HashMap::new(),
+                reporting_threshold: None,
             });
         }
         (sink, rx)

@@ -551,6 +551,16 @@ pub fn handle_event_subscribe(
         // single `callback_uri` and has no second endpoint to record.
         subs_change_notify_uri: None,
         subs_change_notify_correlation_id: None,
+        // #400: this entry point's `AreaOfInterest` type (below) is NOT the stored
+        // area model. `AmfEventSubscription::area_list` here is only ever `None` — the
+        // struct is constructed in three places, all inside `mod tests` — so
+        // translating it would build a converter for a shape no production caller
+        // produces. The HTTP surface
+        // (`namf_server::handle_event_subscription_create`) is where a real
+        // `AmfEventArea` arrives and is parsed into `context::EventArea`.
+        areas: Vec::new(),
+        reported_presence: std::collections::HashMap::new(),
+        reporting_threshold: None,
     };
 
     let ctx = amf_self();
