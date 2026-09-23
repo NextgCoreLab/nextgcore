@@ -4125,11 +4125,30 @@ fn apply_ue_context_json(ue: &mut AmfUe, ue_context: &Value) -> Option<String> {
 /// `UpdateSMContext` would have to carry are exactly what this tree cannot obtain:
 /// for `/relocate` they come over **N26** from the source MME (§5.2.2.2.5.1: "the NF
 /// Service Consumer shall carry per PDU session the S-NSSAI for serving PLMN, the
-/// MME Control Plane Address and the TEID"), and this AMF has no N26 leg at all —
-/// `gmm_build.rs` advertises `Iwk26::WithoutN26Supported` to every UE for precisely
-/// that reason. Calling the SMF with invented tunnel endpoints would point a live
-/// user plane at an address nobody supplied, which is strictly worse than a
-/// session recorded and a logged omission.
+/// MME Control Plane Address and the TEID"). Calling the SMF with invented tunnel
+/// endpoints would point a live user plane at an address nobody supplied, which is
+/// strictly worse than a session recorded and a logged omission.
+///
+/// # #347 changed the premise but not the conclusion
+///
+/// #398 wrote this ceiling as "this AMF has no N26 leg at all", citing
+/// `gmm_build.rs`'s constant `Iwk26::WithoutN26Supported`. **That premise is now false**:
+/// #347 built the N26 endpoint (`n26_path`) and made `iwk_n26_posture` follow a runtime
+/// switch, so an AMF with the leg enabled advertises `N26Supported`.
+///
+/// The ceiling nevertheless stands, for a reason that is about *direction* rather than
+/// about the interface existing:
+///
+/// - `/relocate` is the **EPS→5GS** direction, where this AMF is the *target* and needs the
+///   MME's control-plane address and TEID per PDU session. Those arrive in a **Forward
+///   Relocation Request** (GTPv2-C type 133), which #347 deliberately split out as **#408**
+///   — its encoder exists in `nextgcore-gtp` but no procedure consumes it.
+/// - #347 implemented the **5GS→EPS idle-mode** direction, where this AMF is the *source*
+///   and supplies endpoints rather than consuming them.
+///
+/// So: the N26 transport and codec now exist, idle-mode context transfer works outbound,
+/// and `/relocate` still cannot move N3 tunnels until **#408** lands the Forward Relocation
+/// consumer.
 fn record_transferred_sessions(ue_id: u64, ue_context: &Value, ue_context_id: &str) -> usize {
     let Some(sessions) = ue_context
         .get("sessionContextList")
@@ -4178,8 +4197,9 @@ fn record_transferred_sessions(ue_id: u64, ue_context: &Value, ue_context_id: &s
             "[{ue_context_id}] {recorded} transferred PDU session(s) RECORDED but their N3 \
              tunnels are NOT re-established: TS 23.502 step 21 needs an \
              Nsmf_PDUSession_UpdateSMContext per SMF carrying the MME control-plane address \
-             and TEID, which arrive over N26 (TS 29.518 §5.2.2.2.5.1) and this AMF has no \
-             N26 leg"
+             and TEID, which arrive in a Forward Relocation Request over N26 (TS 29.518 \
+             §5.2.2.2.5.1). #347 built the N26 endpoint and the 5GS->EPS idle-mode transfer; \
+             the EPS->5GS Forward Relocation consumer this needs is #408."
         );
     }
     recorded

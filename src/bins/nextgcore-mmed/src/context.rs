@@ -1452,6 +1452,26 @@ pub struct MmeContext {
     /// and a second entry is warned about rather than silently ignored.
     pub sgwc_list: Vec<std::net::SocketAddr>,
 
+    /// N26 GTP-C addresses to bind, from `mme.n26.server` (#347).
+    ///
+    /// Separate from [`Self::gtpc_list`] because N26 and S11 are different interfaces with
+    /// different peers: S11 faces the Serving GW, N26 faces an AMF. One socket for both
+    /// would land every Context Request on the socket the SGW-C also uses, leaving the MME
+    /// to infer a peer's role from the message type.
+    ///
+    /// Empty unless configured, and populating it does not by itself bind anything — the
+    /// `MME_N26_INTERWORKING` runtime switch gates that (see [`crate::n26_path`]).
+    pub n26_list: Vec<std::net::SocketAddr>,
+    /// AMF N26 peers, from `mme.n26.client.amf` (#347).
+    ///
+    /// The first is the AMF a Context Request is sent to. There is no AMF selection
+    /// function: TS 23.401 §4.3.19 resolves the old CN node from the GUTI's MME Group ID,
+    /// and doing that properly needs the DNS-based node resolution this tree does not
+    /// implement — so a single configured peer is the honest model, and a second entry is
+    /// warned about rather than silently ignored, the same posture [`Self::sgwc_list`]
+    /// takes.
+    pub amf_n26_list: Vec<std::net::SocketAddr>,
+
     /// SGW list
     pub sgw_list: Vec<u64>,
     /// Current SGW for round-robin

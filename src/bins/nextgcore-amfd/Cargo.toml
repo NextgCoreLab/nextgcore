@@ -43,6 +43,11 @@ zeroize = { workspace = true }
 nextgcore-nas = { workspace = true }
 # ntn-feature-only: bespoke NTN research types (issue #18).
 nextgcore-proto = { workspace = true, optional = true }
+# #347: the N26 leg. GTPv2-C toward an MME (TS 29.274 §7.3.5-§7.3.7). #347 correctly
+# reported that this crate declared NO GTP dependency at all, which is why the two N26
+# F-TEID interface-type constants sitting in smfd were the tree's entire N26 support and
+# had no reader anywhere.
+nextgcore-gtp = { workspace = true }
 nextgcore-ngap = { workspace = true }
 nextgcore-sbi = { workspace = true }
 nextgcore-sctp = { workspace = true }

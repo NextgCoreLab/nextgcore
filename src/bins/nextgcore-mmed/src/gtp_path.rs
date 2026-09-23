@@ -407,6 +407,17 @@ impl GtpcServer {
         self.inner.xact.lock().map(|x| x.outstanding()).unwrap_or(0)
     }
 
+    /// The restart counter this node advertises in Recovery IEs (TS 23.007 §18).
+    ///
+    /// Exposed for the N26 endpoint (#347), which must advertise the **same** value: §18
+    /// makes the counter a property of the *node*, so two interfaces reporting different
+    /// numbers would tell a peer the MME had restarted when it had not. That is not
+    /// hypothetical — [`advance_persistent_restart_counter`] INCREMENTS and persists, so
+    /// having N26 call it again at startup would produce exactly that disagreement.
+    pub fn restart_counter(&self) -> u8 {
+        self.inner.restart_counter
+    }
+
     /// Allocate a GTPv2-C sequence number for an initial message.
     ///
     /// TS 29.274 §7.6 requires a sequence number per outstanding initial message,

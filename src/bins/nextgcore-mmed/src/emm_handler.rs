@@ -562,6 +562,28 @@ pub fn handle_security_mode_complete(
 // TAU Request Handling
 // ============================================================================
 
+/// IEI of the `UE status` IE in TRACKING AREA UPDATE REQUEST.
+///
+/// TS 24.301 Table 8.2.29.1 (`24301-k00.txt:36942`): IEI `6D`, optional, format TLV,
+/// length 3.
+pub const IEI_UE_STATUS: u8 = 0x6D;
+
+/// `5GMM registration status` (`N1 mode reg`) — octet 3, **bit 2** of the UE status IE.
+///
+/// TS 24.501 Table 9.11.3.56.1
+/// (`24501-k00_5_Main-Body_s09_s10.txt:11556-11560`): bit 2 set means *"UE is in
+/// 5GMM-REGISTERED state"*. Bit **1** is `S1 mode reg` (EMM registration status), which
+/// TS 24.301 NOTE 6 (`24301-k00.txt:17076-17077`) says *"is not used by the MME"* — so
+/// masking the wrong bit reads a field the spec tells the MME to ignore, and the N26 leg
+/// would never fire.
+pub const UE_STATUS_N1_MODE_REG_BIT: u8 = 0x02;
+
+/// IEI of the `Old GUTI type` IE in TRACKING AREA UPDATE REQUEST.
+///
+/// TS 24.301 Table 8.2.29.1 (`24301-k00.txt:36702`): IEI `E-`, optional, format TV,
+/// length 1 — a type-1 IE, so the value rides in the low nibble of the same octet.
+pub const IEI_OLD_GUTI_TYPE: u8 = 0xE0;
+
 /// Parsed TAU request data
 #[derive(Debug, Clone, Default)]
 pub struct TauRequestData {
@@ -579,6 +601,36 @@ pub struct TauRequestData {
     pub ue_network_capability: Option<UeNetworkCapability>,
     /// Last visited TAI (optional)
     pub last_visited_tai: Option<EpsTai>,
+    /// Did the UE say it is still registered in 5GMM? (`UE status` IE, `N1 mode reg`).
+    ///
+    /// # This, and NOT the GUTI type, is how the MME knows the TAU came from 5GS
+    ///
+    /// The intuitive discriminator — "the Old GUTI is a *mapped* GUTI" — is wrong, and
+    /// TS 24.301 §5.5.3.2.2 **case z** (`24301-k00.txt:17068-17074`) says so in as many
+    /// words. The UE moving from N1 mode to S1 mode
+    ///
+    /// > shall include a GUTI, mapped from 5G-GUTI [...] in the Old GUTI IE [...] In
+    /// > addition, the UE shall include Old GUTI type IE with GUTI set to **"Native
+    /// > GUTI"**, and the UE shall include a **UE status IE with a 5GMM registration
+    /// > status set to "UE is in 5GMM-REGISTERED state"**.
+    ///
+    /// So an inter-system TAU arrives with `Old GUTI type = Native`, indistinguishable
+    /// from an intra-EPS TAU on that field alone. An implementation keyed on "mapped
+    /// GUTI" would compile, pass a round-trip test, and **never fire** — the
+    /// "correct but unreachable" defect, reached through a wrong premise rather than
+    /// through a missing caller.
+    ///
+    /// `false` when the IE is absent, which is fail-closed: sending a Context Request to
+    /// an AMF for a UE that never claimed a 5GS registration asks a peer about a context
+    /// that does not exist.
+    pub five_gmm_registered: bool,
+    /// The `Old GUTI type` value (`false` = Native, `true` = Mapped), when present.
+    ///
+    /// Recorded but **not** used to route; see [`Self::five_gmm_registered`]. Kept
+    /// because TS 23.401 §4.3.19.3 makes it the discriminator for the *other* mapping —
+    /// a GUTI mapped from a **P-TMSI/RAI**, i.e. an old SGSN — so a reader who finds
+    /// only the UE status check can see this field was considered rather than missed.
+    pub old_guti_type_mapped: Option<bool>,
 }
 
 /// Handle TAU request
@@ -617,6 +669,8 @@ pub fn handle_tau_request(
     // Parse optional IEs
     let mut ue_network_capability = None;
     let mut last_visited_tai = None;
+    let mut five_gmm_registered = false;
+    let mut old_guti_type_mapped = None;
 
     while offset < data.len() {
         let iei = data[offset];
@@ -641,6 +695,37 @@ pub fn handle_tau_request(
                     last_visited_tai = Some(parse_tai(&data[offset..offset + 5]));
                     offset += 5;
                 }
+            }
+            IEI_UE_STATUS => {
+                // UE status (TLV, length 3 => one contents octet). The IE the default
+                // arm below used to walk past, and the one that makes the 5GS→EPS move
+                // visible to the MME at all (#347). See `five_gmm_registered`.
+                if offset < data.len() {
+                    let len = data[offset] as usize;
+                    offset += 1;
+                    if offset + len <= data.len() {
+                        // Octet 3 is the first contents octet. A zero-length contents
+                        // field is not legal (§9.11.3.56 fixes the IE at 3 octets), and
+                        // reads as "not claimed" rather than as an error, for the same
+                        // fail-closed reason the field's doc gives.
+                        five_gmm_registered = data
+                            .get(offset)
+                            .is_some_and(|o| o & UE_STATUS_N1_MODE_REG_BIT != 0);
+                        offset += len;
+                    }
+                }
+            }
+            _ if iei & 0xF0 == IEI_OLD_GUTI_TYPE => {
+                // Old GUTI type: a TYPE 1 IE, so the IEI is the high nibble and the
+                // value is bit 1 of the SAME octet -- there is no length and no
+                // following value octet (TS 24.301 §9.9.3.45, `24301-k00.txt:44831`:
+                // "The GUTI type is a type 1 information element", and Table 9.9.3.45.1
+                // gives 0 = Native GUTI, 1 = Mapped GUTI).
+                //
+                // Matched on the high nibble because the default arm below would
+                // otherwise treat `0xE1` as an unknown type-1 IE and skip it, which is
+                // harmless but loses the value.
+                old_guti_type_mapped = Some(iei & 0x01 != 0);
             }
             _ => {
                 // Skip unknown IE
@@ -669,6 +754,8 @@ pub fn handle_tau_request(
         old_guti,
         ue_network_capability,
         last_visited_tai,
+        five_gmm_registered,
+        old_guti_type_mapped,
     })
 }
 
@@ -886,8 +973,13 @@ fn parse_tai(data: &[u8]) -> EpsTai {
     }
 }
 
-/// Parse UE network capability
-fn parse_ue_network_capability(data: &[u8]) -> UeNetworkCapability {
+/// Parse a UE network capability IE contents field (TS 24.301 §9.9.3.34).
+///
+/// `pub(crate)` for #347: the MM Context an AMF sends over N26 carries the same field
+/// (TS 29.274 Figure 8.38-5, `Length of UE Network Capability` + contents), and decoding
+/// it with a second implementation would be two spellings of one wire fact — the shape
+/// that let #335 and #340 ship wrong tables.
+pub(crate) fn parse_ue_network_capability(data: &[u8]) -> UeNetworkCapability {
     let mut cap = UeNetworkCapability::default();
 
     if !data.is_empty() {
@@ -1137,5 +1229,152 @@ mod tests {
             AuthenticationFailure::Other(26)
         );
         assert!(handle_authentication_failure(&EnbUe::default(), &mut mme_ue, &[]).is_err());
+    }
+
+    /// A minimal TRACKING AREA UPDATE REQUEST body with the given trailing optional IEs.
+    ///
+    /// Layout per TS 24.301 §8.2.29: EPS update type + NAS KSI (1 octet), the Old GUTI as an
+    /// LV EPS mobile identity, then optional IEs.
+    fn tau_body(trailing: &[u8]) -> Vec<u8> {
+        let mut body = vec![0x00]; // update type 0 (TA updating), KSI 0
+        body.push(11); // Old GUTI length
+        body.extend_from_slice(&[
+            0xF6, 0x00, 0xF1, 0x10, 0xAB, 0x9B, 0x6A, 0x12, 0x34, 0x56, 0x78,
+        ]);
+        body.extend_from_slice(trailing);
+        body
+    }
+
+    /// **#347**: a TAU from 5GS is recognised by the UE status IE's `N1 mode reg` bit —
+    /// bit **2** — and NOT by the Old GUTI type.
+    ///
+    /// The assertion the whole N26 leg hangs on. There are two distinct ways to get it wrong,
+    /// both of which compile and both of which leave the procedure permanently dead:
+    ///
+    /// 1. **Masking bit 1.** That is `S1 mode reg`, the EMM registration status, which
+    ///    TS 24.301 NOTE 6 (`24301-k00.txt:17076-17077`) says *"is not used by the MME"*. A UE
+    ///    arriving from 5GS has it CLEAR — it is not EMM-registered — so the branch never fires.
+    /// 2. **Keying on a *mapped* Old GUTI type.** TS 24.301 §5.5.3.2.2 case z
+    ///    (`24301-k00.txt:17068-17074`) has the UE send a GUTI mapped from its 5G-GUTI while
+    ///    typing it *"Native GUTI"*, so the GUTI type is byte-identical to an intra-EPS TAU's
+    ///    and cannot discriminate at all.
+    ///
+    /// Each is checked by asserting what the field does and does **not** imply.
+    #[test]
+    fn a_tau_from_5gs_is_recognised_by_the_ue_status_n1_mode_bit() {
+        assert_eq!(
+            IEI_UE_STATUS, 0x6D,
+            "UE status is IEI 6D, TLV, length 3 (TS 24.301 Table 8.2.29.1, \
+             24301-k00.txt:36942)"
+        );
+        assert_eq!(
+            UE_STATUS_N1_MODE_REG_BIT, 0x02,
+            "'5GMM registration status' (N1 mode reg) is octet 3 BIT 2 (TS 24.501 Table \
+             9.11.3.56.1, 24501-k00_5_Main-Body_s09_s10.txt:11556). Bit 1 is 'S1 mode reg', \
+             which TS 24.301 NOTE 6 says the MME does not use -- masking it would leave the \
+             N26 branch permanently dead."
+        );
+
+        let enb_ue = EnbUe::default();
+
+        // N1 mode reg SET => this TAU came from 5GS.
+        let mut ue = MmeUe::default();
+        let parsed = handle_tau_request(
+            &enb_ue,
+            &mut ue,
+            &tau_body(&[IEI_UE_STATUS, 0x01, UE_STATUS_N1_MODE_REG_BIT]),
+        )
+        .expect("a TAU with a UE status IE must parse");
+        assert!(
+            parsed.five_gmm_registered,
+            "octet 3 bit 2 set means 'UE is in 5GMM-REGISTERED state', which is what tells \
+             the MME to fetch the context over N26"
+        );
+
+        // Only bit 1 set (S1 mode reg) => NOT a 5GS move. This is the case a bit-1 mask would
+        // wrongly treat as one.
+        let mut ue = MmeUe::default();
+        let parsed = handle_tau_request(&enb_ue, &mut ue, &tau_body(&[IEI_UE_STATUS, 0x01, 0x01]))
+            .expect("parses");
+        assert!(
+            !parsed.five_gmm_registered,
+            "bit 1 is 'S1 mode reg' (EMM registration status), NOT the 5GMM one -- a UE that \
+             is merely EMM-registered has not come from 5GS"
+        );
+
+        // Both bits => still a 5GS move; the two are independent.
+        let mut ue = MmeUe::default();
+        let parsed = handle_tau_request(&enb_ue, &mut ue, &tau_body(&[IEI_UE_STATUS, 0x01, 0x03]))
+            .expect("parses");
+        assert!(
+            parsed.five_gmm_registered,
+            "bit 2 is read regardless of bit 1"
+        );
+
+        // No UE status IE => fail closed. Asking an AMF about a UE that never claimed a 5GS
+        // registration would query a context that does not exist.
+        let mut ue = MmeUe::default();
+        let parsed = handle_tau_request(&enb_ue, &mut ue, &tau_body(&[])).expect("parses");
+        assert!(
+            !parsed.five_gmm_registered,
+            "an absent UE status IE reads as 'not 5GMM-registered', the fail-closed answer"
+        );
+        assert!(
+            parsed.old_guti_type_mapped.is_none(),
+            "and an absent Old GUTI type IE is None rather than a default"
+        );
+
+        // A NATIVE Old GUTI type with the 5GMM bit set is exactly §5.5.3.2.2 case z, and must
+        // still route over N26.
+        let mut ue = MmeUe::default();
+        let parsed = handle_tau_request(
+            &enb_ue,
+            &mut ue,
+            &tau_body(&[
+                IEI_OLD_GUTI_TYPE, // type-1 IE, value 0 = Native GUTI
+                IEI_UE_STATUS,
+                0x01,
+                UE_STATUS_N1_MODE_REG_BIT,
+            ]),
+        )
+        .expect("parses");
+        assert_eq!(
+            parsed.old_guti_type_mapped,
+            Some(false),
+            "Old GUTI type 0 is 'Native GUTI' (TS 24.301 Table 9.9.3.45.1)"
+        );
+        assert!(
+            parsed.five_gmm_registered,
+            "a NATIVE Old GUTI type must STILL route over N26 when the UE status says \
+             5GMM-REGISTERED: §5.5.3.2.2 case z requires the UE to type its mapped GUTI as \
+             'Native', so an implementation keyed on a MAPPED type would never fire"
+        );
+
+        // A mapped Old GUTI type without the UE status IE is the SGSN case (TS 23.401
+        // §4.3.19.3) and must NOT route over N26.
+        let mut ue = MmeUe::default();
+        let parsed = handle_tau_request(&enb_ue, &mut ue, &tau_body(&[IEI_OLD_GUTI_TYPE | 0x01]))
+            .expect("parses");
+        assert_eq!(parsed.old_guti_type_mapped, Some(true));
+        assert!(
+            !parsed.five_gmm_registered,
+            "a MAPPED Old GUTI type means the old node was an SGSN (TS 23.401 §4.3.19.3), not \
+             an AMF, so it must not trigger an N26 Context Request"
+        );
+
+        // And the Old GUTI still parses, because the Context Request carries it.
+        let mut ue = MmeUe::default();
+        let parsed = handle_tau_request(
+            &enb_ue,
+            &mut ue,
+            &tau_body(&[IEI_UE_STATUS, 0x01, UE_STATUS_N1_MODE_REG_BIT]),
+        )
+        .expect("parses");
+        let guti = parsed
+            .old_guti
+            .expect("the Old GUTI must parse: it is what the Context Request carries");
+        assert_eq!(guti.mme_gid, 0xAB9B);
+        assert_eq!(guti.mme_code, 0x6A);
+        assert_eq!(guti.m_tmsi, 0x1234_5678);
     }
 }

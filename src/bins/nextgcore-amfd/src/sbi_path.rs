@@ -1407,6 +1407,104 @@ pub async fn call_smf_release_sm_context(
     Ok(())
 }
 
+/// Retrieve a session's **EPS PDN connection** from the SMF for an N26 context transfer
+/// (#347, TS 29.502 §5.2.2.6, TS 23.502 §4.11.1.3.2 steps 5a/5c).
+///
+/// # This endpoint had no AMF caller
+///
+/// #78 built `POST /nsmf-pdusession/v1/sm-contexts/{ref}/retrieve` in smfd and #117 made
+/// it name the assigned EBI, but `grep -rn "sm_context_retrieve\|SmContextRetrieve"` over
+/// `bins/nextgcore-amfd/src` returned **nothing** at `0dc01e4`. The producer existed and
+/// the consumer did not — the "correct but unreachable" shape seen from the other side: a
+/// conformant response nobody ever asked for.
+///
+/// # Why the AMF must ask rather than answer from its own state
+///
+/// TS 23.502 §4.11.1.3.2 step 5c (`23502-k20.txt:22079-22091`) has the **SMF+PGW-C**
+/// return the mapped EPS bearer contexts — *"PGW-C control plane tunnel information of the
+/// PDN connection corresponding to the PDU session, EBI for each EPS bearer, PGW-U tunnel
+/// information for each EPS bearer and EPS QoS parameters for each EPS bearer"*. The AMF
+/// holds none of it: it knows a PDU session's id, DNN and S-NSSAI, and nothing about the
+/// PGW-C's S5/S8 endpoint. TS 29.274 Table 7.3.6-3 NOTE 5 (`29274-j60.txt:20980-20983`)
+/// closes the loop — the source AMF *"shall transparently transfer the MME/SGSN/AMF UE EPS
+/// PDN Connections IE received from the SMF"*.
+///
+/// Returns the decoded `ueEpsPdnConnection` octets. `Ok(None)` means the SMF answered but
+/// the member was absent or an empty string, which TS 29.502 §6.1.6.2.27
+/// (`29502-k00.txt:20360-20366`) makes the legal answer for a request that asked for
+/// something else — the caller treats it as "this session is not transferable" rather than
+/// as a failure.
+pub async fn call_smf_retrieve_sm_context(
+    smf_host: &str,
+    smf_port: u16,
+    sm_context_ref: &str,
+) -> SbiResult<Option<Vec<u8>>> {
+    use base64::Engine as _;
+
+    log::info!("Calling SMF SM Context Retrieve for N26 transfer: ref={sm_context_ref}");
+
+    let client = crate::attach_oauth2(
+        SbiClient::for_peer(smf_host, smf_port),
+        nextgcore_sbi::types::NfType::Smf,
+    );
+
+    // `smContextType: "EPS_PDN_CONNECTION"` asks for exactly the member this leg needs.
+    // §6.1.6.2.27 makes `ueEpsPdnConnection` the answer when the type is absent OR names
+    // the EPS PDN connection, so naming it is redundant against this tree's SMF but correct
+    // against the spec and any other SMF — and it records at the call site which of the
+    // three possible answers this caller expects.
+    let body = serde_json::json!({ "smContextType": "EPS_PDN_CONNECTION" });
+
+    let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/retrieve");
+    let response = client
+        .post_json(&path, &body)
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("SMF retrieve failed: {e}")))?;
+
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "SMF retrieve returned status {}",
+            response.status
+        )));
+    }
+
+    let Some(content) = response.http.content.as_deref() else {
+        return Err(SbiError::RequestFailed(
+            "SMF retrieve answered success with an empty body; SmContextRetrievedData makes              ueEpsPdnConnection a REQUIRED member (TS 29.502 §6.1.6.2.27), so an empty body              is not a conformant answer"
+                .to_string(),
+        ));
+    };
+    let parsed: serde_json::Value = serde_json::from_str(content)
+        .map_err(|e| SbiError::RequestFailed(format!("SMF retrieve body is not JSON: {e}")))?;
+
+    let Some(encoded) = parsed
+        .get("ueEpsPdnConnection")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        log::info!(
+            "SMF retrieve for ref={sm_context_ref} carries no ueEpsPdnConnection: this PDU \
+             session has no EPS PDN connection to transfer, so it is excluded from the \
+             Context Response (TS 23.502 §4.11.1.3.2 step 5a)"
+        );
+        return Ok(None);
+    };
+
+    // `EpsPdnCnxContainer` is an OpenAPI `byte`, i.e. base64 (`29502-k00.txt:24142`).
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|e| {
+            SbiError::RequestFailed(format!("ueEpsPdnConnection is not valid base64: {e}"))
+        })?;
+
+    log::info!(
+        "SMF retrieve for ref={sm_context_ref} returned a {}-octet EPS PDN connection \
+         container",
+        decoded.len()
+    );
+    Ok(Some(decoded))
+}
+
 // ============================================================================
 // AUSF SBI Client Functions
 // ============================================================================

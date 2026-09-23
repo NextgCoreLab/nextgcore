@@ -630,12 +630,39 @@ fn uli_ie(mme_ue: &MmeUe) -> S11BuildResult<Gtp2Ie> {
 }
 
 /// PLMN ID in the 3-octet BCD form GTP-C uses (TS 29.274 §8.21.1).
-fn encode_plmn_bcd(plmn: &crate::context::PlmnId) -> [u8; 3] {
+///
+/// `pub(crate)` for #347: the GUTI IE (§8.47, Figure 8.47-1, `29274-j60.txt:29099-29103`)
+/// opens with the **same** three octets in the same nibble order, so the N26 builder uses
+/// this rather than re-nibbling them. A second copy would be free to disagree about the
+/// two-digit-MNC `1111` filler §8.47 calls out (`29274-j60.txt:29115-29116`), which is
+/// invisible to any test using a three-digit MNC.
+pub(crate) fn encode_plmn_bcd(plmn: &crate::context::PlmnId) -> [u8; 3] {
     [
         (plmn.mcc2 << 4) | plmn.mcc1,
         (plmn.mnc3 << 4) | plmn.mcc3,
         (plmn.mnc2 << 4) | plmn.mnc1,
     ]
+}
+
+/// The inverse of [`encode_plmn_bcd`] (#347).
+///
+/// The N26 leg **parses** a GUTI as well as building one: TS 23.003 §2.10.2.1.3 has the old
+/// AMF reverse-map the GUTI an MME sends, so `n26_build::parse_guti_ie` has to recover the
+/// PLMN to resolve a UE context. Written directly beside its inverse so the two nibble
+/// layouts are one edit apart and cannot drift — `plmn_bcd_round_trips_including_the_two_digit_mnc`
+/// holds them together.
+pub(crate) fn decode_plmn_bcd(octets: &[u8]) -> Option<crate::context::PlmnId> {
+    if octets.len() < 3 {
+        return None;
+    }
+    Some(crate::context::PlmnId {
+        mcc1: octets[0] & 0x0F,
+        mcc2: octets[0] >> 4,
+        mcc3: octets[1] & 0x0F,
+        mnc1: octets[2] & 0x0F,
+        mnc2: octets[2] >> 4,
+        mnc3: octets[1] >> 4,
+    })
 }
 
 /// Build Update Bearer Response (TS 29.274 §7.2.16)

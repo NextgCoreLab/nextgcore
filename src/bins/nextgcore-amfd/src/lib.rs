@@ -15,6 +15,7 @@ pub mod gmm_build;
 pub mod gmm_handler;
 pub mod gmm_sm;
 pub mod metrics;
+pub mod n26_path; // #347: the N26 leg toward an MME (TS 23.502 §4.11.1.3.2)
 pub mod namf_handler;
 pub mod namf_server;
 pub mod nas_security;
@@ -927,6 +928,54 @@ pub async fn run() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Invalid NGAP address '{}': {}", args.ngap_addr, e))?;
     let sctp_backend = ngap_path::SctpBackend::parse(&args.sctp_backend)?;
     app.init_ngap(ngap_addr, sctp_backend).await?;
+
+    // The N26 leg toward an MME (#347), behind the `AMF_N26_INTERWORKING` runtime switch.
+    //
+    // This call is what makes `n26_path::N26Server::handle_context_request` reachable in
+    // production: `n26_open` binds the socket and spawns the receive loop that dispatches to
+    // it. Without this line the whole module would be the "correct but unreachable" defect
+    // this tree keeps growing.
+    //
+    // The address comes from `AMF_N26_ADDR` rather than the YAML, matching how `AMF_SBI_ADDR`
+    // and `AMF_SBI_PORT` are read a few lines below: amfd reads its listeners from the
+    // environment and its *identities* (GUAMI, TAI, PLMN) from the config file, and N26 is a
+    // listener. Default port 2124 rather than TS 29.274 §4.1's 2123, because a combined-core
+    // host runs the SMF's S5/S8 socket on 2123 and two GTPv2-C listeners cannot share it;
+    // an explicit `AMF_N26_PORT` overrides.
+    //
+    // A bind failure is NOT fatal: an AMF whose N26 socket did not come up is still a working
+    // standalone 5GC, and taking the daemon down would turn an interworking misconfiguration
+    // into a total 5G outage. `n26_open` forces the switch back off in that case, so
+    // `iwk_n26_posture` cannot advertise an interface that has no socket.
+    {
+        let n26_bind: Option<SocketAddr> = std::env::var("AMF_N26_ADDR").ok().and_then(|addr| {
+            let port: u16 = std::env::var("AMF_N26_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(2124);
+            match format!("{addr}:{port}").parse() {
+                Ok(sock) => Some(sock),
+                Err(e) => {
+                    log::warn!("Invalid AMF_N26_ADDR '{addr}:{port}': {e}; N26 is not bound");
+                    None
+                }
+            }
+        });
+        // TS 23.007 §18 restart counter. `AMF_RESTART_COUNTER` mirrors mmed's
+        // `MME_RESTART_COUNTER` override; 0 means "not available", which is the truthful
+        // value for an AMF that does not persist one.
+        let restart_counter = std::env::var("AMF_RESTART_COUNTER")
+            .ok()
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(0);
+        if let Err(e) = n26_path::n26_open(n26_bind, restart_counter).await {
+            log::error!(
+                "Failed to open the N26 path: {e}. The AMF continues WITHOUT N26: every UE is \
+                 told IWK N26 = 1 ('interworking without N26 supported') and standalone 5GC \
+                 service is unaffected."
+            );
+        }
+    }
 
     // Start the Namf SBI HTTP/2 server (TS 29.518: namf-comm, namf-evts,
     // namf-mt, namf-loc) on the advertised SBI endpoint

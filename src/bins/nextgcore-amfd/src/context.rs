@@ -1584,6 +1584,86 @@ impl AmfContext {
             .map(|(_, ue)| ue.amf_ue().clone())
     }
 
+    /// Find an AMF UE by the **4G-GUTI** an MME sends over N26 (#347, criterion 5).
+    ///
+    /// TS 23.003 §2.10.2.1.3 (`23003-k00.txt:2545-2551`), in full:
+    ///
+    /// > A new MME attempts to retrieve information regarding the UE, e.g. the IMSI,
+    /// > from the old AMF. In order to find the UE context, the AMF needs to map the
+    /// > GUTI (sent by the MME) to create the 5G-GUTI and compare it with the stored
+    /// > 5G-GUTI.
+    ///
+    /// # Two lookups, because "the stored 5G-GUTI" is stored two ways
+    ///
+    /// 1. **The native 5G-GUTI, mapped forward.** Every live UE's `current_guti` is
+    ///    mapped *into* the EPS space with
+    ///    [`nextgcore_nas::interworking::five_g_guti_to_eps_guti`] and compared. This is
+    ///    the lookup §2.10.2.1.3 describes, and it is the one that matters for a 5GS→EPS
+    ///    move: a UE that registered natively on 5GS and has now walked into E-UTRAN has
+    ///    a native 5G-GUTI and nothing else.
+    /// 2. **A recorded [`AmfUe::mapped_eps_guti`].** #116 stores the 4G-GUTI recovered on
+    ///    an EPS→5GS registration precisely so that identity survives instead of being
+    ///    flattened into `old_guti`. A UE that came *from* EPS and bounces back is found
+    ///    here.
+    ///
+    /// Lookup 1 alone would be incomplete, and **lookup 2 alone would find nothing at
+    /// all** in the common case, because `mapped_eps_guti` is `None` for every natively
+    /// registered UE. #347's criterion 5 asks for "a reader" of that field, and a reader
+    /// that could only ever match a returning UE would satisfy the letter of it while
+    /// leaving the procedure non-functional — the "correct but unreachable" defect
+    /// reached by satisfying a criterion too literally.
+    ///
+    /// # Why the comparison happens in the EPS space
+    ///
+    /// The mapping is a bijection (see
+    /// [`nextgcore_nas::interworking::five_g_guti_to_eps_guti`]), so reverse-mapping the
+    /// incoming GUTI and comparing 5G-GUTIs would be equally correct. Comparing *forward*
+    /// keeps in use the same direction of the mapping the UE itself computed (§2.10.2.1.2,
+    /// "Mapping in the UE"), so an asymmetry could not hide behind two functions agreeing
+    /// with each other — the self-consistency trap #116's own tests call out.
+    ///
+    /// A linear scan, like [`AmfContext::amf_ue_find_by_pending_guti`]: the query cannot
+    /// be indexed, because the stored key is a 5G-GUTI and the query is its image under a
+    /// mapping, so an index would have to be a second copy of every identity kept in step
+    /// with the first.
+    pub fn amf_ue_find_by_mapped_eps_guti(
+        &self,
+        guti: &nextgcore_nas::eps::types::EpsGuti,
+    ) -> Option<AmfUe> {
+        use nextgcore_nas::interworking::five_g_guti_to_eps_guti;
+
+        // A zero M-TMSI never matches: TS 23.003 reserves the all-zeros TMSI, so it is the
+        // unset value and matching it would resolve every default-GUTI UE to one query.
+        // Same guard and same reason as `amf_ue_find_by_pending_guti`.
+        if guti.m_tmsi == 0 {
+            return None;
+        }
+
+        for (_, record) in self.ue_store.snapshot() {
+            let ue = record.amf_ue();
+
+            // 1. The native 5G-GUTI, mapped forward into the EPS space.
+            if ue.current_guti.tmsi != 0 {
+                let mapped = five_g_guti_to_eps_guti(&nextgcore_nas::fiveg::types::FiveGGuti {
+                    plmn_id: crate::gmm_build::to_nextgcore_plmn(&ue.current_guti.plmn_id),
+                    amf_region_id: ue.current_guti.amf_region_id,
+                    amf_set_id: ue.current_guti.amf_set_id,
+                    amf_pointer: ue.current_guti.amf_pointer,
+                    tmsi: ue.current_guti.tmsi,
+                });
+                if &mapped == guti {
+                    return Some(ue.clone());
+                }
+            }
+
+            // 2. A 4G-GUTI this UE arrived with, recorded by #116.
+            if ue.mapped_eps_guti.as_ref() == Some(guti) {
+                return Some(ue.clone());
+            }
+        }
+        None
+    }
+
     /// Find an AMF UE by a 5G-GUTI this AMF issued but the UE has not yet
     /// acknowledged (#352, TS 24.501 §5.4.4.6 b)-1)).
     ///

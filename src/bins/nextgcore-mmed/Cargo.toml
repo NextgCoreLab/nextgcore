@@ -43,6 +43,13 @@ serde_yaml = { workspace = true }
 [dev-dependencies]
 proptest.workspace = true
 nextgcore-asn1c = { workspace = true }
+# #347 strict-peer test: drive amfd's REAL Context Response builder and its REAL mapped EPS
+# security context in-process, so the end-to-end idle-mode TAU-with-N26 test asserts against
+# the bytes the AMF actually emits rather than against a fixture this crate wrote. A
+# hand-rolled Context Response would agree with mmed's parser by construction and could not
+# catch the two drifting — the same reason lmfd, pcfd and udmd already dev-depend on amfd for
+# their strict-peer tests.
+nextgcore-amfd = { path = "../nextgcore-amfd" }
 
 [lints]
 workspace = true
