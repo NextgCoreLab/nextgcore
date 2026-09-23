@@ -297,16 +297,19 @@ jobs:
       # started only after that line appears. Not a sleep: a sleep that is too
       # short makes this stage fail for a reason that is not the wiring.
       #
-      # SCOPE CEILING, stated rather than implied. This asserts the
-      # REGISTRATION fire point (REGISTRATION_STATE_REPORT, LOCATION_REPORT,
-      # ACCESS_TYPE_REPORT). It does NOT assert the SERVICE REQUEST fire point
-      # (REACHABILITY_REPORT + LOCATION_REPORT from
-      # `handle_service_request_nas`), because reaching it needs the UE to go
-      # CM-IDLE and then originate uplink data or answer a page -- nextgsim's
-      # nr-ue triggers a Service Request on a TUN write or on Paging
-      # (nextgsim-ue/src/main.rs), and neither happens unprompted in a compose
-      # bring-up. Driving an idle transition here would need a new control
-      # surface on nr-ue, which is nextgsim work. Tracked as #403.
+      # SCOPE. This stage asserts the REGISTRATION fire point
+      # (REGISTRATION_STATE_REPORT, LOCATION_REPORT, ACCESS_TYPE_REPORT). The
+      # SERVICE REQUEST fire point (REACHABILITY_REPORT + LOCATION_REPORT from
+      # `handle_service_request_nas`) is asserted by the SECOND PHASE below,
+      # added by #403 -- which found that the "no control surface" blocker #403
+      # was filed with is FALSE: `ue-suspend` on nextgsim's own gNB CLI reaches
+      # RRC_INACTIVE, so no nextgsim change was needed.
+      #
+      # TWO PROBE PROCESSES, not one subscribing to five types: LOCATION_REPORT
+      # fires at BOTH sites (deliberately -- TS 29.518 §6.2's trigger is "when
+      # AMF becomes aware of a location change", and it becomes aware at each),
+      # so one probe could not attribute it. The service-request phase subscribes
+      # only after this phase has passed.
       # ====================================================================
       - name: Start the namf-evts notification sink and SUBSCRIBE (before any UE)
         run: |
@@ -332,7 +335,7 @@ jobs:
           # read the probe's verdict would be exactly the green-proving-nothing
           # outcome this assertion exists to avoid.
           docker compose exec -T -d smf sh -c \
-            '/tmp/namf_event_probe 172.23.0.5:7777 8397 172.23.0.4 \
+            '/tmp/namf_event_probe registration 172.23.0.5:7777 8397 172.23.0.4 \
                imsi-999700000000001 imsi-999709999999999 999 70 0001 240 \
                > /tmp/probe.log 2>&1; echo $? > /tmp/probe.rc'
           # Wait for the probe's own SUBSCRIBED line, NOT a sleep: the AMF matches a
@@ -429,6 +432,279 @@ jobs:
           fi
           echo "the AMF delivered the registration-path Namf event notifications, \
                 asserted on their bodies, against nextgsim's real gNB"
+
+      # ====================================================================
+      # Issue #403: the SERVICE REQUEST fire point.
+      #
+      # WHAT #403 GOT WRONG. The issue says there is "no control surface on nr-ue
+      # to request an idle transition from outside the process", and proposes
+      # adding one in nextgsim. It looked at the wrong node: nextgsim's gNB
+      # already has a UDP CLI whose command set (GnbCliCommandType) includes
+      # `ue-suspend`, which is exactly the right lever.
+      #
+      # BLOCKED, and the three steps below are `continue-on-error` BECAUSE OF IT.
+      # A dispatched run proved the lever cannot currently be PULLED:
+      #
+      #   ERROR: No node found with name 'gnb'. Use --dump to list available nodes.
+      #
+      # The gNB uses its OWN CliServer (nextgsim-gnb/src/app/cli_server.rs) which
+      # never calls `register_nodes`, so it writes no /tmp/nextgsim.proc-table/
+      # entry and binds an ephemeral port that nothing can discover. The UE's
+      # CliServer (nextgsim_common) does register. One caller of `register_nodes`
+      # in the whole nextgsim tree, and it is the UE. Filed as nextgsim #197.
+      #
+      # These steps are therefore SHIPPED BUT NON-BLOCKING, deliberately rather
+      # than deleted or left red: every link except the proc-table entry was
+      # verified in that same run (the UE registered, got a PDU session, and the
+      # registration-phase assertion above PASSED). When nextgsim #197 lands they
+      # start proving the fire point with no further change here, and until then
+      # they must not report a nextgsim defect as a nextgcore regression. The
+      # honest status of the SERVICE REQUEST fire point remains UNPROVEN -- see
+      # specs/prove-service-request-namf-fire-point-e2e.md, which states it.
+      #
+      # WHY `ue-suspend` AND NOT `ue-release`. This is the trap, and it is the
+      # obvious first choice. `ue-release` makes the gNB send a
+      # UEContextReleaseRequest, the AMF answers with a Release Command and BOTH
+      # sides delete the NGAP UE context. The UE then returns in RRC_IDLE, so the
+      # gNB sends an InitialUEMessage -- and nextgcore's
+      # `handle_initial_ue_message` has exactly one arm for a Service Request
+      # there: reject with cause #9, unconditionally, with no 5G-S-TMSI lookup.
+      # `handle_service_request_nas` would never run.
+      #
+      # `ue-suspend` is RAN-LOCAL: the gNB sends an RRCRelease CARRYING a
+      # suspendConfig (TS 38.331 §5.3.8.3) and deliberately does NOT tell the AMF,
+      # so the NGAP context survives on both sides. The UE goes RRC_INACTIVE and
+      # its NAS goes CM-IDLE. A TUN write then takes the MO-resume arm
+      # (§5.3.13.2), the Service Request rides the RRCResumeComplete (§5.3.13.4),
+      # and the gNB forwards it as an UplinkNASTransport -- which is the dispatch
+      # path that reaches the fire point with `security_context_available &&
+      # registered` still true.
+      #
+      # WHY THE ASSERTION IS NOT VACUOUS. REACHABILITY_REPORT is the
+      # discriminating type: `fire_reachability_report` has exactly ONE caller in
+      # the whole tree, inside `handle_service_request_nas`. The probe asserts its
+      # VALUE (`reachability == REACHABLE`) and the SUPI, never the absence of an
+      # error, and it keeps the negative control. The AMF can synthesise a
+      # REACHABILITY_REPORT for a subscription carrying `immediateFlag`, which
+      # would describe current state rather than prove the fire point ran -- the
+      # probe never sets that flag, and immediate reports go in the 201 BODY
+      # rather than to the callback the probe asserts on.
+      # ====================================================================
+      - name: "Subscribe the SERVICE REQUEST probe (phase 2, #403)"
+        # Non-blocking until nextgsim #197 lands: nr-cli cannot discover the
+        # gNB. See the block comment above.
+        continue-on-error: true
+        run: |
+          cd nextgcore/docker/rust
+          # Port 8403 and not 8397: the registration probe's sink has exited, but
+          # binding the same port in the same netns while it is in TIME_WAIT would
+          # fail for a reason unrelated to the wiring.
+          #
+          # Started only AFTER the registration assertion passed, which is what makes
+          # this phase attributable: the registration's own LOCATION_REPORT has already
+          # been delivered, so every notification this probe receives was fired later.
+          docker compose exec -T -d smf sh -c \
+            '/tmp/namf_event_probe service-request 172.23.0.5:7777 8403 172.23.0.4 \
+               imsi-999700000000001 imsi-999709999999999 999 70 0001 240 \
+               > /tmp/probe2.log 2>&1; echo $? > /tmp/probe2.rc'
+          for _ in $(seq 1 60); do
+            if docker compose exec -T smf sh -c 'cat /tmp/probe2.log 2>/dev/null' \
+                 | grep -qF SUBSCRIBED; then
+              echo "service-request subscriptions are in place:"
+              docker compose exec -T smf sh -c 'cat /tmp/probe2.log'
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::the service-request probe never reported SUBSCRIBED, so no \
+                Service Request can be observed."
+          docker compose exec -T smf sh -c 'cat /tmp/probe2.log 2>/dev/null' || true
+          exit 1
+
+      - name: "Drive the REAL UE to CM-IDLE and back through a Service Request (#403)"
+        # Non-blocking until nextgsim #197 lands: nr-cli cannot discover the
+        # gNB. See the block comment above.
+        continue-on-error: true
+        run: |
+          cd nextgcore/docker/rust
+          # The PDU session must exist first: the Service Request's Uplink data status
+          # IE names the session with pending uplink data (TS 24.501 §5.6.1.2 /
+          # §9.11.3.44), and the TUN device that carries the trigger IS the session's.
+          # Exact `info!` text from nextgsim-ue/src/main.rs.
+          for _ in $(seq 1 60); do
+            docker compose logs ue > /tmp/ue.log 2>&1 || true
+            if grep -qF 'is now ACTIVE' /tmp/ue.log; then break; fi
+            sleep 2
+          done
+          grep -F 'is now ACTIVE' /tmp/ue.log \
+            || { echo "::error::the UE never activated a PDU session, so it has no TUN \
+                 device to originate uplink data on and cannot trigger a Service \
+                 Request"; tail -60 /tmp/ue.log; exit 1; }
+
+          # nr-cli must run INSIDE the gNB container: the CLI server binds 127.0.0.1
+          # and is discovered through /tmp/nextgsim.proc-table/, so neither is
+          # reachable from outside. Built by Dockerfile.builder; nextgsim's gNB image
+          # ships only nr-gnb.
+          test -f binaries/nr-cli \
+            || { echo "::error::binaries/nr-cli missing -- Dockerfile.builder tolerates a \
+                 nextgsim build failure with '|| true', so check the builder log"; \
+                 ls -la binaries/; exit 1; }
+          docker cp binaries/nr-cli nextgsim-gnb:/tmp/nr-cli
+          docker compose exec -T --user root gnb chmod 0755 /tmp/nr-cli
+
+          # The ue_id is READ from ue-list, never assumed to be 1: it is the gNB's
+          # internal identifier, and hardcoding it would make this step fail for a
+          # reason unrelated to the wiring if allocation ever changed.
+          docker compose exec -T gnb /tmp/nr-cli gnb --exec 'ue-list' > /tmp/uelist.txt 2>&1 \
+            || { echo "::error::nr-cli could not reach the gNB's CLI server"; \
+                 cat /tmp/uelist.txt; exit 1; }
+          cat /tmp/uelist.txt
+          UE_ID=$(grep -oE 'ue_id: [0-9]+' /tmp/uelist.txt | head -1 | grep -oE '[0-9]+')
+          if [ -z "$UE_ID" ]; then
+            echo "::error::the gNB reported no UE contexts, so there is nothing to \
+                  suspend -- the registration above did not leave a RAN UE context"
+            cat /tmp/uelist.txt; exit 1
+          fi
+          echo "suspending gNB UE context ${UE_ID} to RRC_INACTIVE"
+
+          # RRC_INACTIVE, NOT a plain release: see the block comment above. This is
+          # RAN-local, so the AMF keeps the NGAP context and the return leg is an
+          # UplinkNASTransport rather than an InitialUEMessage.
+          docker compose exec -T gnb /tmp/nr-cli gnb --exec "ue-suspend ${UE_ID}" \
+            > /tmp/suspend.txt 2>&1 || true
+          cat /tmp/suspend.txt
+
+          # Both ends must AGREE the suspension happened, and the gNB-side check also
+          # rules out the fallback: `initiate_rrc_suspend` returns None when there is no
+          # AS security context, and the RRC task then RELEASES instead
+          # ("UE[..] could not be suspended; releasing instead") -- which would leave
+          # the UE in RRC_IDLE and silently put us on the cause-#9 path. Asserted
+          # absent rather than assumed.
+          #
+          # Exact `info!` text: "UE[{ue_id}] suspended to RRC_INACTIVE: I-RNTI=..."
+          # (nextgsim-gnb/src/rrc/connection.rs) and "Suspended to RRC_INACTIVE:
+          # I-RNTI=..." (nextgsim-ue/src/rrc/task.rs). The case differs because they
+          # are two statements in two crates; both matched with grep -F.
+          for _ in $(seq 1 30); do
+            docker compose logs gnb > /tmp/gnb.log 2>&1 || true
+            if grep -qF 'suspended to RRC_INACTIVE: I-RNTI=' /tmp/gnb.log; then break; fi
+            sleep 2
+          done
+          if grep -qF 'could not be suspended; releasing instead' /tmp/gnb.log; then
+            echo "::error::the gNB could not suspend the UE and RELEASED it instead, so \
+                  the UE is in RRC_IDLE. Its return leg would be an InitialUEMessage, \
+                  which handle_initial_ue_message rejects with cause #9 -- the fire \
+                  point would never run. This means the AS security context was missing \
+                  (no Initial Context Setup)."
+            tail -80 /tmp/gnb.log; exit 1
+          fi
+          grep -F 'suspended to RRC_INACTIVE: I-RNTI=' /tmp/gnb.log \
+            || { echo "::error::the gNB never reported suspending the UE to RRC_INACTIVE"; \
+                 tail -80 /tmp/gnb.log; exit 1; }
+          for _ in $(seq 1 30); do
+            docker compose logs ue > /tmp/ue.log 2>&1 || true
+            if grep -qF 'Suspended to RRC_INACTIVE: I-RNTI=' /tmp/ue.log; then break; fi
+            sleep 2
+          done
+          grep -F 'Suspended to RRC_INACTIVE: I-RNTI=' /tmp/ue.log \
+            || { echo "::error::the UE never entered RRC_INACTIVE, so its NAS did not go \
+                 CM-IDLE and a later TUN write would not originate a Service Request"; \
+                 tail -80 /tmp/ue.log; exit 1; }
+          # CM-IDLE is the state the fire point's precondition is about (TS 24.501
+          # §5.6.1): `start_service_request` only runs when the UE is registered AND
+          # idle. Exact `info!` from nextgsim-ue/src/main.rs's RrcConnectionRelease arm.
+          grep -F 'RRC connection released' /tmp/ue.log \
+            || { echo "::error::the UE's NAS was never told the RRC connection was gone, \
+                 so it is still CM-CONNECTED and will not start a Service Request"; \
+                 tail -80 /tmp/ue.log; exit 1; }
+          echo "the UE is CM-IDLE (RRC_INACTIVE); originating uplink data on its TUN"
+
+          # THE TRIGGER. A TUN write while registered and idle is what makes nr-ue
+          # originate a real SERVICE REQUEST (TS 24.501 §5.6.1.2); the PSI travels with
+          # it to become the Uplink data status bit.
+          #
+          # 10.45.0.1 is the UPF gateway, and this is the EXACT invocation
+          # docker/rust/e2e-test.sh already uses for the data-plane check -- deliberately
+          # without `-I`. The TUN is created with a /24 netmask around the UE's assigned
+          # address (nextgsim-ue/src/main.rs), and the pool is 10.45.0.0/24, so
+          # 10.45.0.1 is ON-LINK and the kernel routes the packet out of the tunnel
+          # without an explicit interface. Naming an interface that turned out to be
+          # numbered differently would make the ping fail WITHOUT ever writing to the
+          # TUN, leaving the trigger silently un-fired -- the vacuous outcome to avoid.
+          #
+          # `|| true` because the first packets are EXPECTED to be lost: the tunnel is
+          # being re-established by the very procedure they trigger. The assertion is on
+          # the NAS exchange below, never on ICMP -- a ping that succeeded would prove
+          # the data plane, not the fire point.
+          docker compose exec -T ue ping -c 5 -W 5 10.45.0.1 || true
+
+          # POSITIVE, and attributable: the UE must have SENT a Service Request and the
+          # network must have ACCEPTED it. A Service REJECT (the cause-#9 arm) would
+          # leave "Service Accept received" absent, which distinguishes "the UE came
+          # back wrong" from "the emitters are not wired" -- the probe below would then
+          # be the thing that failed, and this named assertion is what stops that being
+          # ambiguous. Exact `info!` from nextgsim-ue/src/nas/mm/orchestrator.rs.
+          for _ in $(seq 1 45); do
+            docker compose logs ue > /tmp/ue.log 2>&1 || true
+            if grep -qF 'Service Accept received' /tmp/ue.log; then break; fi
+            sleep 2
+          done
+          grep -F 'Sending Service Request (' /tmp/ue.log \
+            || { echo "::error::the UE never sent a Service Request after the uplink \
+                 data. It reached CM-IDLE, so either the TUN write did not raise \
+                 UplinkData or the UE did not consider itself registered."; \
+                 tail -100 /tmp/ue.log; exit 1; }
+          grep -F 'Service Accept received' /tmp/ue.log \
+            || { echo "::error::the UE sent a Service Request but never got a Service \
+                 Accept. If the AMF logged a Service REJECT, the UE returned on an \
+                 InitialUEMessage instead of an UplinkNASTransport and \
+                 handle_initial_ue_message took the cause-#9 arm -- the fire point does \
+                 not run on that path."; \
+                 tail -100 /tmp/ue.log; docker compose logs --tail=100 amf; exit 1; }
+          # The AMF's own view of the same moment: this is the line immediately before
+          # the emitters in `handle_service_request_nas`, so it separates "the Accept
+          # egressed but nothing fired" from "the Accept never egressed".
+          docker compose logs amf > /tmp/amf.log 2>&1 || true
+          grep -F 'Service Accept sent to UE' /tmp/amf.log \
+            || { echo "::error::the AMF never logged sending a Service Accept, so \
+                 handle_service_request_nas did not reach the emitters"; \
+                 tail -100 /tmp/amf.log; exit 1; }
+          echo "the UE went CM-IDLE and came back through a real Service Request"
+
+      - name: "Assert the AMF DELIVERED the SERVICE REQUEST Namf notifications (#403)"
+        # Non-blocking until nextgsim #197 lands: nr-cli cannot discover the
+        # gNB. See the block comment above.
+        continue-on-error: true
+        run: |
+          cd nextgcore/docker/rust
+          for _ in $(seq 1 130); do
+            if docker compose exec -T smf sh -c 'cat /tmp/probe2.rc 2>/dev/null' \
+                 | grep -qE '^[0-9]+'; then break; fi
+            sleep 2
+          done
+          docker compose exec -T smf sh -c 'cat /tmp/probe2.log' || true
+          RC=$(docker compose exec -T smf sh -c 'cat /tmp/probe2.rc 2>/dev/null' | tr -d '\r\n')
+          if [ -z "$RC" ]; then
+            echo "::error::the service-request probe never exited, so its verdict is \
+                  unknown. A step that cannot read the verdict proves nothing."
+            docker compose logs --tail=80 amf
+            exit 1
+          fi
+          if [ "$RC" != "0" ]; then
+            echo '::error::the SERVICE REQUEST Namf_EventExposure delivery assertion \
+                  FAILED. The probe'"'"'s own message above names which report or which \
+                  value was wrong. The step before this one already proved the UE went \
+                  CM-IDLE and came back with an ACCEPTED Service Request, so if reports \
+                  are missing entirely the emitters placed after \
+                  send_to_association(..).await? in handle_service_request_nas are not \
+                  firing.'
+            echo "probe exit code: $RC"
+            docker compose logs --tail=120 amf
+            exit 1
+          fi
+          echo "the AMF delivered REACHABILITY_REPORT (REACHABLE) and LOCATION_REPORT \
+                from handle_service_request_nas, asserted on their bodies, against \
+                nextgsim's real gNB and UE"
 
       - name: Collect logs on failure
         if: failure()
