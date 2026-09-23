@@ -307,37 +307,122 @@ incidental.
 would have passed with the wiring deleted. Every test here drives a production function and
 observes the notification at a real in-process `SbiServer`.
 
-**A real SCTP association stands in for the gNB.** The registration and service-request
-emitters fire AFTER `send_to_association(..).await?` — deliberately, since the event is "the
-Accept has egressed", not "the Accept was built". With no association that `?` returns first
-and the fire point is never reached, so a test without a real transport would be asserting an
-unreachable site and could not tell working wiring from deleted wiring.
-`connect_stand_in_gnb` establishes one against the server's own listener, driving both
-endpoints concurrently with `select!` (the client polls its own side inside `connect`; the
-server's `recv` only runs inside `NgapServer::poll`). Handshake budget cut from the 30s
-default to 5s: both peers are in-process on loopback, so a handshake that has not completed
-in 5s is not going to, and the default would turn a transport regression into a 30s stall.
-Cost measured: **0.37s**.
+**The egress-ordering property is proven in the cross-repo Docker E2E, NOT by an
+in-process peer.** The registration and service-request emitters fire AFTER
+`send_to_association(..).await?` — deliberately, since the event is "the Accept has
+egressed", not "the Accept was built". With no association that `?` returns first and the
+fire point is never reached, so a unit test with no transport would be asserting an
+unreachable site and could not tell working wiring from deleted wiring. That is a real
+constraint, and the first revision of PR #402 answered it the wrong way — see the next
+section.
 
 **Reports are collected into a map keyed by type, not read positionally.** The emitters spawn
 one task per subscriber, so several reports fired from one site arrive in non-deterministic
 order; `rx.recv()` positionally would be flaky for a reason unrelated to what is under test.
 
 **Assertions are positive, and on values that exist nowhere else in their fixture.** Each
-test's TAC (`397100`, `397200`), SUPI and NGAP cause value are its own, so a report
-assembled from a default or from a sibling's state fails. The `COMMUNICATION_FAILURE_REPORT`
-value comes off a real APER-encoded PDU through the production decoder, so a hardcoded
-report could not produce it.
+test's SUPI, TAC and NGAP cause value are its own, so a report assembled from a default or
+from a sibling's state fails. The `COMMUNICATION_FAILURE_REPORT` value comes off a real
+APER-encoded PDU through the production decoder, so a hardcoded report could not produce it.
 
 **Every "must not fire" test waits.** Delivery is spawned, so an instantaneous check would
 pass even with a notification in flight. Both use a bounded 600ms wait.
 
+## The in-process stand-in gNB was REMOVED, and why that is the right answer
+
+The first revision of PR #402 met the egress-ordering constraint above with
+`connect_stand_in_gnb`: a helper in amfd's `mod tests` that stood up a real SCTP
+association against the NGAP server's own listener, so two unit tests
+(`the_live_registration_accept_fires_registration_state_and_location_reports`,
+`the_live_service_request_fires_reachability_and_location_reports`) could reach a fire point
+that sits after a transport send.
+
+**The repository owner refused it:** *"i am not supporting loopback gnb. we already have gnb
+in other repo. we can evaluate it with that."* The facts back him, and they are checkable:
+
+* `.github/workflows/ci.yml`'s `Docker E2E` job already checks out
+  `NextgCoreLab/nextgsim`, and `docker/rust/Dockerfile.builder` already compiles its
+  `nr-gnb` (with `--features kernel-sctp`) out of that checkout.
+* `docker/rust/docker-compose.yml` already declares `gnb` and `ue` services on the core
+  network, pointed at the AMF's N2 address.
+
+So an in-process synthetic SCTP peer inside nextgcore duplicated a peer that exists properly
+in the sibling repo, and left this tree owning two RAN implementations. **The helper and both
+tests are deleted.** The other eight event types' unit tests are untouched: none of them
+depends on a transport, because none of their fire points sits behind a transport send.
+
+### Where the coverage went
+
+`src/libs/nextgcore-sbi/examples/namf_event_probe.rs`, driven by three new `Docker E2E` steps
+against nextgsim's REAL gNB and UE. Same pattern as #187/#393's `cca_token_probe`: an example
+rather than a test, because it needs a live AMF and a live NG-RAN and `cargo test` has
+neither; extracted from the builder image into `binaries/` and run inside a container, because
+the AMF POSTs the notification to the callback URI it was handed and that has to be an address
+on the core network.
+
+It asserts, POSITIVELY and on notification BODIES:
+
+| assertion | why it discriminates |
+|---|---|
+| `REGISTRATION_STATE_REPORT.supi` == the registering SUPI | not another UE the AMF serves |
+| `rmInfoList[0].rmState` == `REGISTERED` | TS 24.501 §5.5.1.2.4 — the state the egressed Accept reports |
+| `rmInfoList[0].accessType` == `3GPP_ACCESS` | `RmInfo` requires both members (`TS29518_Namf_EventExposure.yaml:908-910`) |
+| `LOCATION_REPORT` `tai.plmnId.mcc`/`mnc`/`tac` == `999`/`70`/`0001` | the values the gNB reported; a report from a default `Tai5gs` says `000`/`000`/`0000` |
+| `ACCESS_TYPE_REPORT.accessTypeList[0]` == `3GPP_ACCESS` | N2 from an NG-RAN IS the 3GPP access |
+| every notification's `notifyCorrelationId` == this subscription's | a report cannot satisfy it by belonging to somebody else |
+| a control subscription for a SUPI that never registers receives NOTHING | an AMF that broadcast to every subscriber would otherwise pass |
+
+Three ordering and vacuity constraints had to be established rather than assumed:
+
+1. **Something must subscribe first.** Nothing in the compose deployment subscribes to
+   `namf-evts` — checked; the only NF-to-NF Namf subscription surface in use is
+   `namf-comm`'s AMFStatusChange. So the probe creates the subscription itself over the
+   AMF's real `POST /namf-evts/v1/subscriptions`, and prints `SUBSCRIBED`. The gNB and UE
+   are started only after that line appears, **not after a sleep**:
+   `event_subscriptions_matching_ue` matches against STORED subscriptions, so a registration
+   that lands first is delivered to nobody and the stage would fail for a reason that is not
+   the wiring.
+2. **The registration is asserted separately from the delivery.** A middle step requires
+   `NG Setup Response` in the gNB log and `Registration Accept` in the UE log. Without it, a
+   missing notification would be unattributable between "the UE never registered" and "the
+   emitters are not wired".
+3. **The verdict must be readable.** The probe is detached (it must be listening before the
+   UE starts), and a detached `docker compose exec` discards its exit status — so the probe
+   writes its own code to `/tmp/probe.rc` and the final step fails if that file never
+   appears. A step that cannot read the verdict is the green-proving-nothing outcome this
+   whole assertion exists to avoid (#187's first CI attempt, which grepped for the absence of
+   `invalid_client` and passed on a log with zero token requests).
+
+### CEILING, stated rather than implied: the SERVICE REQUEST fire point is NOT covered
+
+The E2E asserts the REGISTRATION fire point only. `REACHABILITY_REPORT` +
+`LOCATION_REPORT` from `handle_service_request_nas` are **not proven by any test after this
+change** — the deleted `the_live_service_request_fires_reachability_and_location_reports` was
+their only coverage.
+
+Reaching that site needs the UE to enter CM-IDLE and then either originate uplink data or
+answer a page. nextgsim's `nr-ue` does trigger a Service Request on both (a TUN write while
+idle, and `NasMessage::Paging` — `nextgsim-ue/src/main.rs`), but neither happens unprompted
+in a compose bring-up, and nothing in either repo can drive an idle transition from outside
+the UE process. Building that control surface is nextgsim work, not nextgcore work, which is
+exactly the owner's point restated.
+
+Filed as **#403**. Until it lands, the honest statement is: the registration emitters are
+proven live against a real gNB; the service-request emitters are wired at a site the reader
+can verify by inspection and are **unproven by automated test**.
+
 ### Revert-verification: eight changes broken, the NAMED test watched to fail, restored
+
+Recorded as originally performed. The first two rows are struck through because the tests
+that caught them no longer exist — see the ceiling above. They are left in rather than
+deleted, because "this was verified once by a test that has since been removed" is a
+different and weaker claim than "this is verified", and collapsing the two would overstate
+the tree's current coverage.
 
 | reverted | test that failed | discriminating sibling that stayed GREEN |
 |---|---|---|
-| registration emitters removed | `the_live_registration_accept_fires_registration_state_and_location_reports` | — |
-| service-request emitters removed | `the_live_service_request_fires_reachability_and_location_reports` | the registration sibling |
+| ~~registration emitters removed~~ | ~~`the_live_registration_accept_fires_registration_state_and_location_reports`~~ (DELETED; now the `Docker E2E` probe) | — |
+| ~~service-request emitters removed~~ | ~~`the_live_service_request_fires_reachability_and_location_reports`~~ (DELETED; **not replaced**, #403) | the registration sibling |
 | deregistration emitters removed | `the_live_deregistration_fires_deregistered_and_loss_of_connectivity` | — |
 | classifier forced to `true` (fire always) | `a_ran_release_for_user_inactivity_fires_no_communication_failure` | `a_ran_release_with_a_failure_cause_...` |
 | comm-failure emitter removed | `a_ran_release_with_a_failure_cause_fires_communication_failure_report` | `..._for_user_inactivity_...` |
@@ -359,47 +444,76 @@ afterwards, because a leftover is still scanned by every sibling's `fire_*`.
 
 `set_sbi_profile_override(Dev)` is set and **deliberately not reset** — the override is
 process-wide and PR #390 measured 2 failures in 10 whole-crate runs from resetting it
-mid-flight. `the_live_registration_accept_...` additionally SAVES AND RESTORES
-`served_guami`, which `serve_only_local_guami` also writes: without a served GUAMI
-`build_initial_context_setup_request_asn1` returns `None` and `send_registration_accept`
-returns before the emitters, so the test would have failed for a reason unrelated to what it
-asserts.
+mid-flight.
 
 ## Verification
 
 `cargo fmt --all -- --check`, `cargo clippy --workspace` (**0 errors**; CI's form) and
-`cargo test --workspace` all pass. **6800 → 6809 tests, zero failures.**
+`cargo test --workspace` all pass. **6835 → 6833 tests, zero failures** — the two deleted
+tests are the whole difference.
 
-The amfd crate suite was looped **10 consecutive times, 557/557 every run**, at loads
-3.67–6.50 on a 48-core box.
+The amfd crate suite was looped **10 consecutive times, 568/568 every run**, at loads
+0.95–3.76 on a 48-core box.
 
-`cargo clippy -p nextgcore-amfd --all-targets` gains 8 `await_holding_lock` warnings, all in
-the new async tests taking `CONTEXT_GUARD` across an await — the identical pattern as the 33
-pre-existing ones in this crate, and outside CI's `--workspace` form.
+The E2E probe was verified locally against a real `nextgcore-amfd` process (release build,
+`NEXTGCORE_SBI_PROFILE=dev`, the deployed `configs/5gc/amf.yaml` rehomed to loopback):
 
-One pre-existing flake observed while taking the baseline, unrelated and present before any
-change: `nextgcore-sgwud` `context::tests::buffer_capacity_honours_the_suggested_packet_count`
-failed on one fail-fast run and passed on rerun and on every `--no-fail-fast` run.
+* the SUBSCRIBE half **works against the production `namf-evts` surface** — it returned 201
+  with a `subscriptionId` for both the main and the control subscription, so the probe is
+  not asserting against a route that answers 404;
+* with no gNB and therefore no registration, the probe **FAILED with exit 1** and named the
+  three missing report types. So the assertion is falsifiable by construction: a run in
+  which the emitters do not deliver is a run in which this step is red.
 
-Production reachability was verified by grep after the change — every `fire_*` call site
-classified as PRODUCTION or TEST by whether a `#[cfg(test)]` precedes it:
+The positive half needs 5G-AKA, and therefore the AUSF/UDM/UDR the compose stack provides,
+so it is proven by the dispatched `Docker E2E` run rather than locally.
+
+Production reachability was re-verified by grep after the deletion — every `fire_*` call
+site, classified PRODUCTION or TEST by whether it sits inside `mod tests`:
 
 ```
-ngap_path.rs:4360  fire_registration_state_report(.., true)      [PRODUCTION]
-ngap_path.rs:4361  fire_location_report                          [PRODUCTION]
-ngap_path.rs:4577  fire_reachability_report(.., true)            [PRODUCTION]
-ngap_path.rs:4578  fire_location_report                          [PRODUCTION]
-ngap_path.rs:4899  fire_registration_state_report(.., false)     [PRODUCTION]
-ngap_path.rs:4900  fire_loss_of_connectivity(.., "DEREGISTERED") [PRODUCTION]
-ngap_path.rs:6225  fire_loss_of_connectivity (timer, #398)       [PRODUCTION]
-ngap_path.rs:8369  fire_communication_failure                    [PRODUCTION]
+ngap_path.rs:4364  fire_access_type_report                       [PRODUCTION]
+ngap_path.rs:4365  fire_registration_state_report(.., true)      [PRODUCTION]
+ngap_path.rs:4366  fire_location_report                          [PRODUCTION]
+ngap_path.rs:4581  fire_connectivity_state_report(.., true)      [PRODUCTION]
+ngap_path.rs:4582  fire_reachability_report(.., true)            [PRODUCTION]
+ngap_path.rs:4583  fire_location_report                          [PRODUCTION]
+ngap_path.rs:4904  fire_registration_state_report(.., false)     [PRODUCTION]
+ngap_path.rs:4905  fire_loss_of_connectivity(.., "DEREGISTERED") [PRODUCTION]
+ngap_path.rs:6317  fire_connectivity_state_report(.., false)     [PRODUCTION]
+ngap_path.rs:6358  fire_loss_of_connectivity (timer, #398)       [PRODUCTION]
+ngap_path.rs:8502  fire_communication_failure                    [PRODUCTION]
 gmm_handler.rs     (none — 1 grep hit, and it is the comment)
 ```
+
+Deleting the two tests removed no production emitter: all eleven sites above survive, and
+the three at `:4364-4366` are precisely the ones the new E2E probe now observes over the
+wire.
 
 ## CI gating
 
 `Docker Build` / `Docker E2E` / `EPC bring-up` are gated to `schedule || workflow_dispatch`
-and SKIP on a PR. This change adds no new cross-NF dependency — the notifications it emits go
-to subscriber URIs a consumer supplied, over the same `notify_client` path #398's three
-emitters already use, and the only new inbound surface is two optional members on an existing
-request body. The overlay bring-up path is untouched.
+and SKIP on a PR. The emitted notifications go to subscriber URIs a consumer supplied, over
+the same `notify_client` path #398's three emitters already use; the only new inbound surface
+is two optional members on an existing request body. The overlay bring-up path is untouched.
+
+**That gating is now load-bearing in a way it was not before, and it cuts against this
+change.** The registration emitters' only remaining proof is the `Docker E2E` probe, which
+**cannot run on a PR**. So a green PR on #402 says nothing about it, and the split recorded
+in `specs/cross-repo-e2e-gating.md` (#349) applies here with one half genuinely empty: there
+is no per-PR in-process equivalent, because building one is the loopback gNB the owner
+refused. The per-PR guarantee for these three types is therefore **inspection plus the
+`fire_*`-site grep above**, and the automated guarantee arrives on the nightly schedule or on
+a dispatch. That is stated rather than papered over.
+
+A dispatch is consequently MANDATORY for any change to these emitters or to the probe, and
+this PR's own dispatch is recorded in its description. Three new steps join the job:
+
+* `Build the nextgsim gNB + UE images (the REAL RAN, #397)` — the builder image already
+  compiled `nr-gnb`/`nr-ue`, but this job never turned them into images, so **no stage here
+  had ever originated a registration**; the baseline stage was bring-up plus `/healthz`. It
+  fails loud if either binary is absent, because `Dockerfile.builder` tolerates a nextgsim
+  compile failure with `|| true` and would otherwise hand this step a silent gap.
+* `Start the namf-evts notification sink and SUBSCRIBE (before any UE)`.
+* `Register a REAL UE through nextgsim's gNB over N2`, then
+  `Assert the AMF DELIVERED the registration Namf event notifications`.

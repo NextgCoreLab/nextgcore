@@ -115,6 +115,28 @@ RUN CARGO_TARGET=$(cat /tmp/cargo_target) && \
         cp target/release/examples/cca_token_probe /out/; \
     fi
 
+# Issue #397: the Namf_EventExposure notification probe, used by the Docker E2E
+# registration stage to assert POSITIVELY that a real registration over N2 makes the
+# AMF DELIVER the registration-path event notifications, with the SUPI and the TAI
+# the gNB actually reported.
+#
+# Same pattern and same reason as cca_token_probe above: those emitters fire AFTER
+# `send_to_association(..).await?` in `send_registration_accept`, so with no NG-RAN
+# association the fire point is unreachable. Only a run with nextgsim's real gNB can
+# tell working wiring from deleted wiring, and `cargo test` has no gNB.
+#
+# The probe must run INSIDE a container because the AMF POSTs the notification to
+# the callback URI it was given, which has to be an address on the core network.
+RUN CARGO_TARGET=$(cat /tmp/cargo_target) && \
+    if [ "$(uname -m)" != "$(echo $CARGO_TARGET | cut -d- -f1)" ]; then \
+        cargo build --release --target "$CARGO_TARGET" -p nextgcore-sbi \
+            --example namf_event_probe 2>&1 && \
+        cp "target/$CARGO_TARGET/release/examples/namf_event_probe" /out/; \
+    else \
+        cargo build --release -p nextgcore-sbi --example namf_event_probe 2>&1 && \
+        cp target/release/examples/namf_event_probe /out/; \
+    fi
+
 # Rebuild amfd WITH the native kernel-SCTP NGAP backend (production
 # remediation T0.2b) so `--sctp-backend kernel` is available at runtime; this
 # overwrites the default (userspace-only) amfd binary in /out. The binary still
