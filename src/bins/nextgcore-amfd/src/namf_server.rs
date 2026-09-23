@@ -138,6 +138,23 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
         }
 
         // --------------------------------------------------------------
+        // Namf_Communication NonUeN2MessageTransfer (TS 29.518 §5.2.2.4.1,
+        // `TS29518_Namf_Communication.yaml:1718`), #396. A CBCF/PWS-IWF hands the
+        // AMF a non-UE-associated N2 container for the NG-RAN; the PWS
+        // information class is the Warning Request Transfer Procedure
+        // (§5.2.2.4.1.3).
+        //   POST /namf-comm/v1/non-ue-n2-messages/transfer
+        // --------------------------------------------------------------
+        "namf-comm"
+            if method == "POST"
+                && parts.len() == 4
+                && parts[2] == "non-ue-n2-messages"
+                && parts[3] == "transfer" =>
+        {
+            handle_non_ue_n2_message_transfer(&request)
+        }
+
+        // --------------------------------------------------------------
         // Namf_Communication AMFStatusChange subscriptions (TS 29.518 §5.2.2.5.1),
         // #74. A consumer subscribes so it is told when this AMF's availability or
         // GUAMI service changes — the AMF planned-removal procedure (TS 23.501
@@ -3931,6 +3948,278 @@ async fn handle_mbs_n2_message_transfer(request: &SbiRequest) -> SbiResponse {
     }
 }
 
+/// `POST /namf-comm/v1/non-ue-n2-messages/transfer` — Namf_Communication
+/// NonUeN2MessageTransfer (TS 29.518 §5.2.2.4.1,
+/// `TS29518_Namf_Communication.yaml:1718`), for the **PWS** N2 information class
+/// (§5.2.2.4.1.3, the Warning Request Transfer Procedure).
+///
+/// ## The AMF forwards; it does not compose
+///
+/// `PwsInformation.pwsContainer` is an `N2InfoContent`
+/// (`TS29518_Namf_Communication.yaml:3283`), described in the OpenAPI as
+/// "Represents a transparent N2 information content to be relayed by AMF"
+/// (`:3251`), and §5.2.2.4.1.3 says three times that the AMF *forwards* the N2
+/// Message Container (`6g_docs/specs/29518-k00.txt:4152`, `:4155`, `:4158`). So
+/// this handler validates the container and relays it verbatim. Decomposing
+/// `messageIdentifier`/`serialNumber`/`warningAreaList` out of the JSON and
+/// re-encoding a fresh WRITE-REPLACE WARNING REQUEST would be *less* conformant,
+/// not more: it would drop every IE the CBCF sent that this build does not model,
+/// including the extensions `WriteReplaceWarningRequestIEs`' `...` admits.
+///
+/// ## The 200 body echoes; it does not collect
+///
+/// §5.2.2.4.1.3 step 2a (`29518-k00.txt:4169`) has the response carry "the
+/// mandatory elements from the Write-Replace-Warning Confirm response (see clause
+/// 9.2.17 in TS 23.041)". `PWSResponseData`'s three mandatory members
+/// (`yaml:3777-3796`) are `ngapMessageType`, `serialNumber` and
+/// `messageIdentifier` — all of them the request's own values. Only the two
+/// OPTIONAL members (`unknownTaiList`, `n2PwsSubMissInd`) are RAN-derived. So the
+/// 200 reports that the AMF *initiated* the transfer and echoes the identifiers;
+/// it is not gated on WRITE-REPLACE WARNING RESPONSEs, which arrive
+/// asynchronously on SCTP in the NGAP task long after this response must be
+/// written, and which TS 29.518 routes through the separate
+/// `non-ue-n2-info-subscriptions` + `n2InfoNotify` surface.
+fn handle_non_ue_n2_message_transfer(request: &SbiRequest) -> SbiResponse {
+    let Some(body) = parse_json_body(request) else {
+        return malformed_body();
+    };
+
+    // `n2Information` is the only required member of N2InformationTransferReqData
+    // (`TS29518_Namf_Communication.yaml:2570`).
+    let Some(n2_information) = body.get("n2Information") else {
+        return mandatory_ie_missing("n2Information");
+    };
+    // `n2InformationClass` is required within N2InfoContainer (`:2707`).
+    let Some(info_class) = n2_information
+        .get("n2InformationClass")
+        .and_then(Value::as_str)
+    else {
+        return mandatory_ie_missing("n2Information.n2InformationClass");
+    };
+
+    // Only PWS is served here. The other classes this service operation carries
+    // (NRPPa for §5.2.2.4.1.2, RAN for the Configuration Transfer and RIM
+    // procedures, TSS for §5.2.2.4.1.7) each need their own transport, and
+    // answering 200 for them would claim a transfer that never happened.
+    if info_class != "PWS" {
+        return send_error(
+            403,
+            "Forbidden",
+            &format!(
+                "n2InformationClass '{info_class}' is not served on this resource; \
+                 only 'PWS' (TS 29.518 §5.2.2.4.1.3) is"
+            ),
+            Some("UNSPECIFIED"),
+        );
+    }
+
+    let Some(pws_info) = n2_information.get("pwsInfo") else {
+        return mandatory_ie_missing("n2Information.pwsInfo");
+    };
+
+    // messageIdentifier, serialNumber and pwsContainer are the three required
+    // members of PwsInformation (`TS29518_Namf_Communication.yaml:3298-3300`).
+    let Some(message_identifier) = pws_info.get("messageIdentifier").and_then(Value::as_u64) else {
+        return mandatory_ie_missing("pwsInfo.messageIdentifier");
+    };
+    let Some(serial_number) = pws_info.get("serialNumber").and_then(Value::as_u64) else {
+        return mandatory_ie_missing("pwsInfo.serialNumber");
+    };
+    let Some(pws_container) = pws_info.get("pwsContainer") else {
+        return mandatory_ie_missing("pwsInfo.pwsContainer");
+    };
+    if message_identifier > u16::MAX as u64 {
+        return mandatory_ie_incorrect("pwsInfo.messageIdentifier", "exceeds Uint16");
+    }
+    if serial_number > u16::MAX as u64 {
+        return mandatory_ie_incorrect("pwsInfo.serialNumber", "exceeds Uint16");
+    }
+
+    // `ngapData` is the only required member of N2InfoContent (`:3261`); it is a
+    // RefToBinaryData, so the bytes ride in a multipart part named by contentId.
+    let Some(content_id) = pws_container
+        .get("ngapData")
+        .and_then(|d| d.get("contentId"))
+        .and_then(Value::as_str)
+    else {
+        return mandatory_ie_missing("pwsInfo.pwsContainer.ngapData.contentId");
+    };
+    let Some(ngap_pdu) = find_binary_part(request, content_id) else {
+        return mandatory_ie_incorrect(
+            "pwsInfo.pwsContainer.ngapData.contentId",
+            "no multipart part carries that contentId",
+        );
+    };
+
+    // Validate the container really is a PWS NGAP PDU before enqueueing it. An
+    // unvalidated relay would forward whatever the consumer sent to every served
+    // gNB, and the gNB would answer an Error Indication the CBCF never sees.
+    // `decode_ngap_pdu` is the real APER decoder, so this also rejects a
+    // truncated or malformed PDU.
+    let decoded = match nextgcore_ngap::parser::decode_ngap_pdu(&ngap_pdu) {
+        Ok(msg) => msg,
+        Err(e) => {
+            return mandatory_ie_incorrect(
+                "pwsInfo.pwsContainer.ngapData",
+                &format!("not a decodable NGAP PDU: {e}"),
+            );
+        }
+    };
+    // TS 38.413 §8.12: the AMF-initiated PWS procedures are WriteReplaceWarning
+    // (51) and PWSCancel (32). The two indications are gNB-initiated, so a
+    // consumer sending one is confused about the direction.
+    let (ngap_message_type, container_mid, container_sn) = match &decoded {
+        nextgcore_ngap::NgapMessage::WriteReplaceWarningRequest(req) => (
+            nextgcore_asn1c::ngap::types::ProcedureCode::WRITE_REPLACE_WARNING.0,
+            req.message_identifier,
+            req.serial_number,
+        ),
+        nextgcore_ngap::NgapMessage::PwsCancelRequest(req) => (
+            nextgcore_asn1c::ngap::types::ProcedureCode::PWS_CANCEL.0,
+            req.message_identifier,
+            req.serial_number,
+        ),
+        other => {
+            return mandatory_ie_incorrect(
+                "pwsInfo.pwsContainer.ngapData",
+                &format!(
+                    "expected a WRITE-REPLACE WARNING REQUEST (procedure 51) or PWS CANCEL \
+                     REQUEST (procedure 32); got {other:?}"
+                ),
+            );
+        }
+    };
+
+    // The JSON identifiers and the ones inside the container must agree: they are
+    // what the CBCF will match the response against (§5.2.2.4.1.3 step 2a), and a
+    // mismatch means one of the two is wrong. Echoing the JSON pair while
+    // broadcasting the container's pair would make the AMF lie in both directions.
+    if container_mid != message_identifier as u16 || container_sn != serial_number as u16 {
+        return mandatory_ie_incorrect(
+            "pwsInfo",
+            &format!(
+                "messageIdentifier/serialNumber ({message_identifier:#06x}/{serial_number:#06x}) \
+                 disagree with the pwsContainer's ({container_mid:#06x}/{container_sn:#06x})"
+            ),
+        );
+    }
+
+    // Targeting selectors, in the precedence §5.2.2.4.1.3 defines
+    // (`29518-k00.txt:4152-4159`). Carried verbatim and resolved by the NGAP
+    // task: `gnb_list` in the context has no production writer, so resolving
+    // here would match nothing (#341's "production reader, test-only writer").
+    let target_gnb_ids: Vec<u32> = body
+        .get("globalRanNodeList")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|node| {
+                    // GNbId.gNBValue is hex (TS 29.571 `GNbId`, pattern
+                    // `^[A-Fa-f0-9]{6,8}$`).
+                    node.get("gNbId")
+                        .and_then(|g| g.get("gNBValue"))
+                        .and_then(Value::as_str)
+                        .and_then(|v| u32::from_str_radix(v, 16).ok())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let target_tais: Vec<(crate::context::PlmnId, u32)> = body
+        .get("taiList")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|tai| {
+                    let plmn = tai.get("plmnId")?;
+                    let mcc = plmn.get("mcc").and_then(Value::as_str)?;
+                    let mnc = plmn.get("mnc").and_then(Value::as_str)?;
+                    // Tac is a 3- or 6-hex-digit string (TS 29.571 `Tac`).
+                    let tac = tai.get("tac").and_then(Value::as_str)?;
+                    let tac = u32::from_str_radix(tac, 16).ok()?;
+                    Some((crate::context::PlmnId::new(mcc, mnc), tac))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let rat_selector = match body.get("ratSelector").and_then(Value::as_str) {
+        Some("NR") => Some(crate::context::PwsRatSelector::Nr),
+        Some("E-UTRA") => Some(crate::context::PwsRatSelector::Eutra),
+        Some(other) => {
+            return mandatory_ie_incorrect(
+                "ratSelector",
+                &format!("'{other}' is not one of NR / E-UTRA"),
+            );
+        }
+        None => None,
+    };
+
+    let ctx = crate::context::amf_self();
+    {
+        let Ok(guard) = ctx.read() else {
+            return send_error(
+                500,
+                "Internal Server Error",
+                "AMF context unavailable",
+                None,
+            );
+        };
+        guard.pws_n2_add(crate::context::PendingPwsN2Transfer {
+            ngap_pdu,
+            message_identifier: message_identifier as u16,
+            serial_number: serial_number as u16,
+            target_gnb_ids: target_gnb_ids.clone(),
+            target_tais: target_tais.clone(),
+            rat_selector,
+        });
+    }
+
+    log::info!(
+        "Namf NonUeN2MessageTransfer (PWS): NGAP procedure {ngap_message_type} enqueued for \
+         relay (message_identifier={message_identifier:#06x} serial_number={serial_number:#06x} \
+         gnb_targets={} tai_targets={} rat={rat_selector:?})",
+        target_gnb_ids.len(),
+        target_tais.len(),
+    );
+
+    // `sendRanResponse: true` asks the AMF to report the per-RAN-node outcome
+    // through the consumer's PWS N2 information subscription. This AMF serves no
+    // `non-ue-n2-info-subscriptions` resource, so that subscription genuinely
+    // cannot exist — which is the exact condition §5.2.2.4.1.3
+    // (`29518-k00.txt:4176-4181`) prescribes `n2PwsSubMissInd: true` for: "the
+    // AMF should include the n2PwsSubMissInd IE with the value 'true' in the
+    // response. When the NF service consumer receives the n2PwsSubMissInd IE set
+    // to 'true', it shall re-create the missing N2 information subscription".
+    // Answering the spec's own signal is the honest ceiling here; fabricating a
+    // per-RAN report would not be.
+    let send_ran_response = pws_info
+        .get("sendRanResponse")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    // `result` is the only required member of N2InformationTransferRspData
+    // (`yaml:3359`). N2_INFO_TRANSFER_INITIATED is exactly what happened: the
+    // transfer was initiated toward the RAN.
+    let mut pws_rsp_data = json!({
+        "ngapMessageType": ngap_message_type,
+        "serialNumber": serial_number,
+        "messageIdentifier": message_identifier,
+    });
+    if send_ran_response {
+        pws_rsp_data["n2PwsSubMissInd"] = Value::Bool(true);
+    }
+    let response_body = json!({
+        "result": "N2_INFO_TRANSFER_INITIATED",
+        "pwsRspData": pws_rsp_data,
+    });
+
+    match SbiResponse::ok().with_json_body(&response_body) {
+        Ok(resp) => resp,
+        Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
+    }
+}
+
 /// `POST /namf-mbs-bc/v1/mbs-contexts` — Namf_MBSBroadcast ContextCreate
 /// (TS 29.518 §5.6, TS 23.247 §7.3.1).
 ///
@@ -3997,6 +4286,18 @@ async fn handle_mbs_context_create(request: &SbiRequest) -> SbiResponse {
 /// `pub(crate)` so both test modules serialize against one lock.
 #[cfg(test)]
 pub(crate) fn dereg_queue_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// #396: shared serialize lock for tests that DESTRUCTIVELY drain the
+/// process-global `pws_n2_queue` — the router-arm tests in this module AND the
+/// NGAP `process_pws_n2_transfers` pump test in `ngap_path`. Declared here beside
+/// the queue's other test lock, module-level and `pub(crate)`, so both test
+/// modules serialize against ONE lock: a second lock declared inside a
+/// `mod tests` is what hung this suite once.
+#[cfg(test)]
+pub(crate) fn pws_queue_test_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
@@ -7909,5 +8210,464 @@ mod tests {
             body["locationEstimate"].is_null(),
             "and no position is invented: the AMF has none without the LMF"
         );
+    }
+    // ========================================================================
+    // #396: NonUeN2MessageTransfer, PWS information class
+    // (TS 29.518 §5.2.2.4.1.3)
+    // ========================================================================
+
+    /// A conformant WRITE-REPLACE WARNING REQUEST container as a CBCF would send
+    /// it: real APER bytes from the NGAP builder, not a placeholder. Returns the
+    /// PDU so a test can assert what the gNB would receive.
+    fn pws_warning_container(message_identifier: u16, serial_number: u16) -> Vec<u8> {
+        nextgcore_ngap::builder::build_write_replace_warning_request(
+            &nextgcore_ngap::types::WriteReplaceWarningRequest {
+                message_identifier,
+                serial_number,
+                warning_area_list: None,
+                repetition_period: 32,
+                number_of_broadcasts_requested: 3,
+                warning_type: None,
+                warning_security_info: None,
+                data_coding_scheme: Some(0x01),
+                warning_message_contents: Some(b"TSUNAMI".to_vec()),
+                concurrent_warning_message_indicator: false,
+                warning_area_coordinates: None,
+            },
+        )
+        .expect("build WRITE-REPLACE WARNING REQUEST")
+    }
+
+    /// A `NonUeN2MessageTransfer` request with the container in a multipart part,
+    /// the shape `N2InfoContent.ngapData` (a `RefToBinaryData`) requires.
+    fn pws_transfer_request(body: Value, container: Vec<u8>) -> SbiRequest {
+        SbiRequest::post("/namf-comm/v1/non-ue-n2-messages/transfer")
+            .with_json_body(&body)
+            .expect("json")
+            .with_part(SbiPart::with_content(
+                "pws-container",
+                "application/vnd.3gpp.ngap",
+                container.into(),
+            ))
+    }
+
+    fn pws_body(message_identifier: u16, serial_number: u16) -> Value {
+        json!({
+            "n2Information": {
+                "n2InformationClass": "PWS",
+                "pwsInfo": {
+                    "messageIdentifier": message_identifier,
+                    "serialNumber": serial_number,
+                    "pwsContainer": {
+                        "ngapData": { "contentId": "pws-container" }
+                    }
+                }
+            }
+        })
+    }
+
+    /// The router arm exists AND the handler enqueues the container for NGAP
+    /// egress, and the 200 body echoes the three mandatory `PWSResponseData`
+    /// members (TS 29.518 §5.2.2.4.1.3 step 2a, `29518-k00.txt:4169`).
+    ///
+    /// Before #396 this URI fell to the `_` arm and answered 404
+    /// RESOURCE_URI_STRUCTURE_NOT_FOUND.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pws_warning_transfer_is_routed_enqueued_and_echoed() {
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _serial = super::pws_queue_test_lock().lock().await;
+        amf_context_init(64, 1024, 4096);
+
+        // Distinct literal identifiers per test: the queue is process-global, so
+        // reusing a pair across tests would let one test drain another's item.
+        let (mid, sn) = (0x1396u16, 0x3396u16);
+        let container = pws_warning_container(mid, sn);
+
+        // Start from a known-empty queue: an earlier test in this process may
+        // have left an item if it failed mid-way.
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            let _ = guard.pws_n2_drain();
+        }
+
+        let resp =
+            namf_request_handler(pws_transfer_request(pws_body(mid, sn), container.clone())).await;
+        assert_eq!(resp.status, 200, "the PWS transfer arm must be routed");
+
+        let body = body_json(&resp);
+        assert_eq!(
+            body["result"].as_str(),
+            Some("N2_INFO_TRANSFER_INITIATED"),
+            "result is the only required member of N2InformationTransferRspData"
+        );
+        // `ngapMessageType` is the NGAP procedure code the AMF relayed:
+        // id-WriteReplaceWarning = 51 (`38413-j30.txt:59115`).
+        assert_eq!(body["pwsRspData"]["ngapMessageType"].as_u64(), Some(51));
+        assert_eq!(
+            body["pwsRspData"]["messageIdentifier"].as_u64(),
+            Some(mid as u64)
+        );
+        assert_eq!(body["pwsRspData"]["serialNumber"].as_u64(), Some(sn as u64));
+        // `sendRanResponse` was absent, so the AMF must NOT volunteer the
+        // "re-create your subscription" signal.
+        assert!(
+            body["pwsRspData"]["n2PwsSubMissInd"].is_null(),
+            "n2PwsSubMissInd is only for sendRanResponse:true (§5.2.2.4.1.3)"
+        );
+
+        // The arm reached the queue the NGAP pump drains -- the "correct but
+        // unreachable" check. And the enqueued bytes are the container VERBATIM:
+        // the AMF forwards, it does not re-encode (`29518-k00.txt:4152`).
+        let ctx = crate::context::amf_self();
+        let pending = {
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.pws_n2_drain()
+        };
+        assert_eq!(pending.len(), 1, "exactly one relay must be queued");
+        assert_eq!(
+            pending[0].ngap_pdu, container,
+            "the relayed PDU must be byte-identical to the CBCF's container"
+        );
+        assert_eq!(pending[0].message_identifier, mid);
+        assert_eq!(pending[0].serial_number, sn);
+        // And that PDU really is procedure 51 with the InitiatingMessage CHOICE
+        // index in byte 0 -- what the gNB would decode.
+        assert_eq!(pending[0].ngap_pdu[0], 0x00);
+        assert_eq!(pending[0].ngap_pdu[1], 51);
+    }
+
+    /// `sendRanResponse: true` gets `n2PwsSubMissInd: true`, because this AMF
+    /// serves no `non-ue-n2-info-subscriptions` resource so the subscription
+    /// genuinely cannot exist. That is the spec's own prescribed answer
+    /// (§5.2.2.4.1.3, `29518-k00.txt:4176-4181`), not a stub.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_ran_response_without_a_subscription_reports_n2_pws_sub_miss_ind() {
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _serial = super::pws_queue_test_lock().lock().await;
+        amf_context_init(64, 1024, 4096);
+
+        let (mid, sn) = (0x2396u16, 0x4396u16);
+        let mut body = pws_body(mid, sn);
+        body["n2Information"]["pwsInfo"]["sendRanResponse"] = Value::Bool(true);
+
+        let resp =
+            namf_request_handler(pws_transfer_request(body, pws_warning_container(mid, sn))).await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            body_json(&resp)["pwsRspData"]["n2PwsSubMissInd"].as_bool(),
+            Some(true),
+            "with no PWS N2 information subscription the AMF must tell the \
+             consumer to re-create it, not fabricate a per-RAN report"
+        );
+
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        let _ = guard.pws_n2_drain();
+    }
+
+    /// A container that is not an AMF-initiated PWS procedure is REFUSED, not
+    /// relayed. TS 38.413 §8.12 makes WriteReplaceWarning (51) and PWSCancel (32)
+    /// AMF-initiated; the two indications are gNB-initiated, so a consumer
+    /// sending one has the direction backwards. Relaying it would earn an Error
+    /// Indication from the gNB that the CBCF never sees.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_non_amf_initiated_pws_container_is_refused_rather_than_relayed() {
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _serial = super::pws_queue_test_lock().lock().await;
+        amf_context_init(64, 1024, 4096);
+
+        // A PWS FAILURE INDICATION (procedure 33) -- gNB->AMF.
+        let wrong_direction = nextgcore_ngap::builder::build_pws_failure_indication(
+            &nextgcore_ngap::types::PwsFailureIndication {
+                failed_cell_list: nextgcore_ngap::types::PwsCellList::Nr(vec![
+                    nextgcore_ngap::types::NrCgi {
+                        plmn_identity: [0x00, 0xF1, 0x10],
+                        nr_cell_identity: 0x396,
+                    },
+                ]),
+                global_ran_node_id: nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId {
+                    plmn_identity: [0x00, 0xF1, 0x10],
+                    gnb_id: 0x396,
+                    gnb_id_len: 32,
+                },
+            },
+        )
+        .expect("build PWS FAILURE INDICATION");
+        assert_eq!(wrong_direction[1], 33, "the fixture must be procedure 33");
+
+        let resp = namf_request_handler(pws_transfer_request(
+            pws_body(0x3396, 0x5396),
+            wrong_direction,
+        ))
+        .await;
+        assert_eq!(resp.status, 400);
+
+        let ctx = crate::context::amf_self();
+        let pending = {
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.pws_n2_drain()
+        };
+        assert!(
+            pending.is_empty(),
+            "a refused container must not reach the NGAP egress queue"
+        );
+    }
+
+    /// An undecodable container is a 400 and is not enqueued. Without this the
+    /// AMF would forward arbitrary bytes to every served gNB.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_undecodable_pws_container_is_refused() {
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _serial = super::pws_queue_test_lock().lock().await;
+        amf_context_init(64, 1024, 4096);
+
+        let resp = namf_request_handler(pws_transfer_request(
+            pws_body(0x4396, 0x6396),
+            vec![0xFF, 0xFF, 0xFF, 0xFF],
+        ))
+        .await;
+        assert_eq!(resp.status, 400);
+
+        let ctx = crate::context::amf_self();
+        let pending = {
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.pws_n2_drain()
+        };
+        assert!(pending.is_empty());
+    }
+
+    /// The JSON identifiers and the container's must agree. A mismatch means one
+    /// of the two is wrong, and echoing one while broadcasting the other would
+    /// make the AMF lie in both directions at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mismatched_identifiers_between_json_and_container_are_refused() {
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _serial = super::pws_queue_test_lock().lock().await;
+        amf_context_init(64, 1024, 4096);
+
+        // JSON says 0x5396/0x7396; the container carries 0x0001/0x0002.
+        let resp = namf_request_handler(pws_transfer_request(
+            pws_body(0x5396, 0x7396),
+            pws_warning_container(0x0001, 0x0002),
+        ))
+        .await;
+        assert_eq!(resp.status, 400);
+
+        let ctx = crate::context::amf_self();
+        let pending = {
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.pws_n2_drain()
+        };
+        assert!(pending.is_empty());
+    }
+
+    /// A non-PWS `n2InformationClass` is refused rather than answered 200. The
+    /// other classes this operation carries (NRPPa, RAN, TSS) each need their own
+    /// transport; a 200 for them would claim a transfer that never happened.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_non_pws_information_class_is_not_served_here() {
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _serial = super::pws_queue_test_lock().lock().await;
+        amf_context_init(64, 1024, 4096);
+
+        let resp = namf_request_handler(pws_transfer_request(
+            json!({
+                "n2Information": {
+                    "n2InformationClass": "NRPPa",
+                    "nrppaInfo": {
+                        "nfId": "6396",
+                        "nrppaPdu": { "ngapData": { "contentId": "pws-container" } }
+                    }
+                }
+            }),
+            pws_warning_container(0x6396, 0x8396),
+        ))
+        .await;
+        assert_eq!(resp.status, 403);
+
+        let ctx = crate::context::amf_self();
+        let pending = {
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.pws_n2_drain()
+        };
+        assert!(pending.is_empty());
+    }
+
+    /// Each mandatory member of the request is enforced with
+    /// MANDATORY_IE_MISSING, not defaulted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn missing_mandatory_pws_members_are_rejected() {
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _serial = super::pws_queue_test_lock().lock().await;
+        amf_context_init(64, 1024, 4096);
+
+        let container = pws_warning_container(0x7396, 0x9396);
+
+        // n2Information absent entirely.
+        let resp = namf_request_handler(pws_transfer_request(json!({}), container.clone())).await;
+        assert_eq!(resp.status, 400);
+
+        // pwsInfo absent.
+        let resp = namf_request_handler(pws_transfer_request(
+            json!({ "n2Information": { "n2InformationClass": "PWS" } }),
+            container.clone(),
+        ))
+        .await;
+        assert_eq!(resp.status, 400);
+
+        // Each of the three required PwsInformation members, dropped in turn.
+        for missing in ["messageIdentifier", "serialNumber", "pwsContainer"] {
+            let mut body = pws_body(0x7396, 0x9396);
+            body["n2Information"]["pwsInfo"]
+                .as_object_mut()
+                .expect("pwsInfo object")
+                .remove(missing);
+            let resp = namf_request_handler(pws_transfer_request(body, container.clone())).await;
+            assert_eq!(
+                resp.status, 400,
+                "a PWS transfer missing {missing} must be refused"
+            );
+        }
+
+        // A contentId naming no part is a 400, not a relay of nothing.
+        let mut body = pws_body(0x7396, 0x9396);
+        body["n2Information"]["pwsInfo"]["pwsContainer"]["ngapData"]["contentId"] =
+            Value::String("no-such-part".into());
+        let resp = namf_request_handler(pws_transfer_request(body, container)).await;
+        assert_eq!(resp.status, 400);
+
+        let ctx = crate::context::amf_self();
+        let pending = {
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.pws_n2_drain()
+        };
+        assert!(pending.is_empty(), "no refused request may be enqueued");
+    }
+
+    /// The targeting selectors survive the JSON boundary into the queue item the
+    /// NGAP pump resolves. `gNBValue` is hex and `tac` is hex (TS 29.571), so a
+    /// decimal parse here would silently target the wrong nodes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn targeting_selectors_survive_the_json_boundary() {
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _serial = super::pws_queue_test_lock().lock().await;
+        amf_context_init(64, 1024, 4096);
+
+        let (mid, sn) = (0x8396u16, 0xA396u16);
+        let mut body = pws_body(mid, sn);
+        body["globalRanNodeList"] = json!([
+            { "plmnId": { "mcc": "001", "mnc": "01" },
+              "gNbId": { "bitLength": 32, "gNBValue": "0000ABCD" } }
+        ]);
+        body["taiList"] = json!([
+            { "plmnId": { "mcc": "001", "mnc": "01" }, "tac": "000074" }
+        ]);
+        body["ratSelector"] = Value::String("NR".into());
+
+        let resp =
+            namf_request_handler(pws_transfer_request(body, pws_warning_container(mid, sn))).await;
+        assert_eq!(resp.status, 200);
+
+        let ctx = crate::context::amf_self();
+        let pending = {
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.pws_n2_drain()
+        };
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].target_gnb_ids,
+            vec![0xABCDu32],
+            "gNBValue is HEX: a decimal parse would target gNB 0"
+        );
+        assert_eq!(
+            pending[0].target_tais,
+            vec![(crate::context::PlmnId::new("001", "01"), 0x74u32)],
+            "tac is HEX: 000074 is 116, not 74"
+        );
+        assert_eq!(
+            pending[0].rat_selector,
+            Some(crate::context::PwsRatSelector::Nr)
+        );
+    }
+
+    /// An unknown `ratSelector` is refused rather than silently ignored: treating
+    /// it as absent would broadcast to every RAT the consumer meant to exclude.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unknown_rat_selector_is_refused() {
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _serial = super::pws_queue_test_lock().lock().await;
+        amf_context_init(64, 1024, 4096);
+
+        let (mid, sn) = (0x9396u16, 0xB396u16);
+        let mut body = pws_body(mid, sn);
+        body["ratSelector"] = Value::String("WLAN".into());
+
+        let resp =
+            namf_request_handler(pws_transfer_request(body, pws_warning_container(mid, sn))).await;
+        assert_eq!(resp.status, 400);
+
+        let ctx = crate::context::amf_self();
+        let pending = {
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.pws_n2_drain()
+        };
+        assert!(pending.is_empty());
+    }
+
+    /// A PWS CANCEL REQUEST container (procedure 32) relays too, and its echoed
+    /// `ngapMessageType` is 32 — not hardcoded 51.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pws_cancel_container_relays_and_echoes_procedure_32() {
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _serial = super::pws_queue_test_lock().lock().await;
+        amf_context_init(64, 1024, 4096);
+
+        let (mid, sn) = (0xA396u16, 0xC396u16);
+        let cancel = nextgcore_ngap::builder::build_pws_cancel_request(
+            &nextgcore_ngap::types::PwsCancelRequest {
+                message_identifier: mid,
+                serial_number: sn,
+                warning_area_list: None,
+                cancel_all_warning_messages: true,
+            },
+        )
+        .expect("build PWS CANCEL REQUEST");
+
+        let resp = namf_request_handler(pws_transfer_request(pws_body(mid, sn), cancel)).await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            body_json(&resp)["pwsRspData"]["ngapMessageType"].as_u64(),
+            Some(32),
+            "ngapMessageType must be the procedure actually relayed"
+        );
+
+        let ctx = crate::context::amf_self();
+        let pending = {
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.pws_n2_drain()
+        };
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].ngap_pdu[1], 32);
     }
 }

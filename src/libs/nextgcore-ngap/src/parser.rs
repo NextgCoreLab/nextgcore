@@ -66,6 +66,19 @@ pub enum NgapMessage {
     UplinkRanStatusTransfer(RanStatusTransfer),
     /// DOWNLINK RAN STATUS TRANSFER (AMF -> gNB, TS 38.413 Section 8.4.8)
     DownlinkRanStatusTransfer(RanStatusTransfer),
+    /// WRITE-REPLACE WARNING REQUEST (AMF -> NG-RAN, TS 38.413 Section 9.2.8.1,
+    /// procedure code 51)
+    WriteReplaceWarningRequest(WriteReplaceWarningRequest),
+    /// WRITE-REPLACE WARNING RESPONSE (NG-RAN -> AMF, Section 9.2.8.2)
+    WriteReplaceWarningResponse(WriteReplaceWarningResponse),
+    /// PWS CANCEL REQUEST (AMF -> NG-RAN, Section 9.2.8.3, procedure code 32)
+    PwsCancelRequest(PwsCancelRequest),
+    /// PWS CANCEL RESPONSE (NG-RAN -> AMF, Section 9.2.8.4)
+    PwsCancelResponse(PwsCancelResponse),
+    /// PWS RESTART INDICATION (NG-RAN -> AMF, Section 9.2.8.5, procedure code 34)
+    PwsRestartIndication(PwsRestartIndication),
+    /// PWS FAILURE INDICATION (NG-RAN -> AMF, Section 9.2.8.6, procedure code 33)
+    PwsFailureIndication(PwsFailureIndication),
     /// Unknown/unsupported message
     Unknown {
         procedure_code: u8,
@@ -199,6 +212,23 @@ fn decode_initiating_message(msg: InitiatingMessage) -> NgapResult<NgapMessage> 
                 ProcedureCode::PATH_SWITCH_REQUEST => Ok(NgapMessage::PathSwitchRequest(
                     parse_path_switch_request(ies)?,
                 )),
+                // PWS (TS 38.413 Section 8.12). Codes pinned in
+                // `nextgcore_asn1c::ngap::types::ProcedureCode`: WriteReplaceWarning
+                // 51, PWSCancel 32, PWSFailureIndication 33, PWSRestartIndication 34.
+                ProcedureCode::WRITE_REPLACE_WARNING => {
+                    Ok(NgapMessage::WriteReplaceWarningRequest(
+                        parse_write_replace_warning_request(ies)?,
+                    ))
+                }
+                ProcedureCode::PWS_CANCEL => Ok(NgapMessage::PwsCancelRequest(
+                    parse_pws_cancel_request(ies)?,
+                )),
+                ProcedureCode::PWS_RESTART_INDICATION => Ok(NgapMessage::PwsRestartIndication(
+                    parse_pws_restart_indication(ies)?,
+                )),
+                ProcedureCode::PWS_FAILURE_INDICATION => Ok(NgapMessage::PwsFailureIndication(
+                    parse_pws_failure_indication(ies)?,
+                )),
                 _ => Ok(NgapMessage::Unknown {
                     procedure_code: msg.procedure_code.0,
                     message_type: "InitiatingMessage",
@@ -285,6 +315,17 @@ fn decode_successful_outcome(msg: SuccessfulOutcome) -> NgapResult<NgapMessage> 
                         parse_path_switch_request_acknowledge(ies)?,
                     ))
                 }
+                // PWS successful outcomes (TS 38.413 Sections 9.2.8.2 / 9.2.8.4).
+                // The two indications have no outcome messages -- they are
+                // class-2 procedures -- so only these two appear here.
+                ProcedureCode::WRITE_REPLACE_WARNING => {
+                    Ok(NgapMessage::WriteReplaceWarningResponse(
+                        parse_write_replace_warning_response(ies)?,
+                    ))
+                }
+                ProcedureCode::PWS_CANCEL => Ok(NgapMessage::PwsCancelResponse(
+                    parse_pws_cancel_response(ies)?,
+                )),
                 ProcedureCode::HANDOVER_PREPARATION => {
                     Ok(NgapMessage::HandoverCommand(parse_handover_command(ies)?))
                 }
@@ -2272,5 +2313,286 @@ fn parse_overload_start(container: ProtocolIeContainer) -> NgapResult<OverloadSt
     }
     Ok(OverloadStart {
         traffic_load_reduction,
+    })
+}
+
+// ============================================================================
+// PWS parsers (TS 38.413 Section 8.12 / Section 9.2.8)
+// ============================================================================
+
+/// Parse a WRITE-REPLACE WARNING REQUEST (TS 38.413 Section 9.2.8.1).
+///
+/// The AMF's production use is validation: TS 29.518 Section 5.2.2.4.1.3 has it
+/// relay the CBCF's container, and it must confirm the container really is this
+/// procedure and recover the identifiers the HTTP response has to echo
+/// (`29518-k00.txt:4169`).
+fn parse_write_replace_warning_request(
+    container: ProtocolIeContainer,
+) -> NgapResult<WriteReplaceWarningRequest> {
+    let mut message_identifier = None;
+    let mut serial_number = None;
+    let mut warning_area_list = None;
+    let mut repetition_period = None;
+    let mut number_of_broadcasts_requested = None;
+    let mut warning_type = None;
+    let mut warning_security_info = None;
+    let mut data_coding_scheme = None;
+    let mut warning_message_contents = None;
+    let mut concurrent_warning_message_indicator = false;
+    let mut warning_area_coordinates = None;
+
+    for field in &container.ies {
+        match field.id.0 {
+            ie::IE_ID_MESSAGE_IDENTIFIER => {
+                message_identifier = Some(ie::decode_message_identifier(field)?)
+            }
+            ie::IE_ID_SERIAL_NUMBER => serial_number = Some(ie::decode_serial_number(field)?),
+            ie::IE_ID_WARNING_AREA_LIST => {
+                warning_area_list = Some(ie::decode_warning_area_list(field)?)
+            }
+            ie::IE_ID_REPETITION_PERIOD => {
+                repetition_period = Some(ie::decode_repetition_period(field)?)
+            }
+            ie::IE_ID_NUMBER_OF_BROADCASTS_REQUESTED => {
+                number_of_broadcasts_requested =
+                    Some(ie::decode_number_of_broadcasts_requested(field)?)
+            }
+            ie::IE_ID_WARNING_TYPE => warning_type = Some(ie::decode_warning_type(field)?),
+            ie::IE_ID_WARNING_SECURITY_INFO => {
+                warning_security_info = Some(ie::decode_warning_security_info(field)?)
+            }
+            ie::IE_ID_DATA_CODING_SCHEME => {
+                data_coding_scheme = Some(ie::decode_data_coding_scheme(field)?)
+            }
+            ie::IE_ID_WARNING_MESSAGE_CONTENTS => {
+                warning_message_contents = Some(ie::decode_warning_message_contents(field)?)
+            }
+            ie::IE_ID_CONCURRENT_WARNING_MESSAGE_IND => {
+                // `ENUMERATED { true, ... }`: presence is the whole signal, so
+                // there is no value to read.
+                concurrent_warning_message_indicator = true
+            }
+            ie::IE_ID_WARNING_AREA_COORDINATES => {
+                warning_area_coordinates = Some(ie::decode_warning_area_coordinates(field)?)
+            }
+            _ => {}
+        }
+    }
+
+    Ok(WriteReplaceWarningRequest {
+        message_identifier: message_identifier.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "MessageIdentifier",
+            ie_id: ie::IE_ID_MESSAGE_IDENTIFIER,
+        })?,
+        serial_number: serial_number.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "SerialNumber",
+            ie_id: ie::IE_ID_SERIAL_NUMBER,
+        })?,
+        warning_area_list,
+        repetition_period: repetition_period.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "RepetitionPeriod",
+            ie_id: ie::IE_ID_REPETITION_PERIOD,
+        })?,
+        number_of_broadcasts_requested: number_of_broadcasts_requested.ok_or(
+            NgapError::MissingMandatoryIe {
+                ie_name: "NumberOfBroadcastsRequested",
+                ie_id: ie::IE_ID_NUMBER_OF_BROADCASTS_REQUESTED,
+            },
+        )?,
+        warning_type,
+        warning_security_info,
+        data_coding_scheme,
+        warning_message_contents,
+        concurrent_warning_message_indicator,
+        warning_area_coordinates,
+    })
+}
+
+/// Parse a WRITE-REPLACE WARNING RESPONSE (TS 38.413 Section 9.2.8.2).
+fn parse_write_replace_warning_response(
+    container: ProtocolIeContainer,
+) -> NgapResult<WriteReplaceWarningResponse> {
+    let mut message_identifier = None;
+    let mut serial_number = None;
+    let mut broadcast_completed_area_list = None;
+    let mut criticality_diagnostics = None;
+
+    for field in &container.ies {
+        match field.id.0 {
+            ie::IE_ID_MESSAGE_IDENTIFIER => {
+                message_identifier = Some(ie::decode_message_identifier(field)?)
+            }
+            ie::IE_ID_SERIAL_NUMBER => serial_number = Some(ie::decode_serial_number(field)?),
+            ie::IE_ID_BROADCAST_COMPLETED_AREA_LIST => {
+                broadcast_completed_area_list =
+                    Some(ie::decode_broadcast_completed_area_list(field)?)
+            }
+            ie::IE_ID_CRITICALITY_DIAGNOSTICS => {
+                criticality_diagnostics = Some(ie::decode_criticality_diagnostics(field)?)
+            }
+            _ => {}
+        }
+    }
+
+    Ok(WriteReplaceWarningResponse {
+        message_identifier: message_identifier.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "MessageIdentifier",
+            ie_id: ie::IE_ID_MESSAGE_IDENTIFIER,
+        })?,
+        serial_number: serial_number.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "SerialNumber",
+            ie_id: ie::IE_ID_SERIAL_NUMBER,
+        })?,
+        broadcast_completed_area_list,
+        criticality_diagnostics,
+    })
+}
+
+/// Parse a PWS CANCEL REQUEST (TS 38.413 Section 9.2.8.3).
+fn parse_pws_cancel_request(container: ProtocolIeContainer) -> NgapResult<PwsCancelRequest> {
+    let mut message_identifier = None;
+    let mut serial_number = None;
+    let mut warning_area_list = None;
+    let mut cancel_all_warning_messages = false;
+
+    for field in &container.ies {
+        match field.id.0 {
+            ie::IE_ID_MESSAGE_IDENTIFIER => {
+                message_identifier = Some(ie::decode_message_identifier(field)?)
+            }
+            ie::IE_ID_SERIAL_NUMBER => serial_number = Some(ie::decode_serial_number(field)?),
+            ie::IE_ID_WARNING_AREA_LIST => {
+                warning_area_list = Some(ie::decode_warning_area_list(field)?)
+            }
+            ie::IE_ID_CANCEL_ALL_WARNING_MESSAGES => cancel_all_warning_messages = true,
+            _ => {}
+        }
+    }
+
+    Ok(PwsCancelRequest {
+        message_identifier: message_identifier.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "MessageIdentifier",
+            ie_id: ie::IE_ID_MESSAGE_IDENTIFIER,
+        })?,
+        serial_number: serial_number.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "SerialNumber",
+            ie_id: ie::IE_ID_SERIAL_NUMBER,
+        })?,
+        warning_area_list,
+        cancel_all_warning_messages,
+    })
+}
+
+/// Parse a PWS CANCEL RESPONSE (TS 38.413 Section 9.2.8.4).
+fn parse_pws_cancel_response(container: ProtocolIeContainer) -> NgapResult<PwsCancelResponse> {
+    let mut message_identifier = None;
+    let mut serial_number = None;
+    let mut broadcast_cancelled_area_list = None;
+    let mut criticality_diagnostics = None;
+
+    for field in &container.ies {
+        match field.id.0 {
+            ie::IE_ID_MESSAGE_IDENTIFIER => {
+                message_identifier = Some(ie::decode_message_identifier(field)?)
+            }
+            ie::IE_ID_SERIAL_NUMBER => serial_number = Some(ie::decode_serial_number(field)?),
+            ie::IE_ID_BROADCAST_CANCELLED_AREA_LIST => {
+                broadcast_cancelled_area_list =
+                    Some(ie::decode_broadcast_cancelled_area_list(field)?)
+            }
+            ie::IE_ID_CRITICALITY_DIAGNOSTICS => {
+                criticality_diagnostics = Some(ie::decode_criticality_diagnostics(field)?)
+            }
+            _ => {}
+        }
+    }
+
+    Ok(PwsCancelResponse {
+        message_identifier: message_identifier.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "MessageIdentifier",
+            ie_id: ie::IE_ID_MESSAGE_IDENTIFIER,
+        })?,
+        serial_number: serial_number.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "SerialNumber",
+            ie_id: ie::IE_ID_SERIAL_NUMBER,
+        })?,
+        broadcast_cancelled_area_list,
+        criticality_diagnostics,
+    })
+}
+
+/// Parse a PWS RESTART INDICATION (TS 38.413 Section 9.2.8.5).
+fn parse_pws_restart_indication(
+    container: ProtocolIeContainer,
+) -> NgapResult<PwsRestartIndication> {
+    let mut cell_list = None;
+    let mut global_ran_node_id = None;
+    let mut tai_list_for_restart = None;
+    let mut emergency_area_id_list_for_restart = Vec::new();
+
+    for field in &container.ies {
+        match field.id.0 {
+            ie::IE_ID_CELL_ID_LIST_FOR_RESTART => {
+                cell_list = Some(ie::decode_pws_cell_list(field)?)
+            }
+            ie::IE_ID_GLOBAL_RAN_NODE_ID => {
+                global_ran_node_id = Some(ie::decode_global_ran_node_id(field)?)
+            }
+            ie::IE_ID_TAI_LIST_FOR_RESTART => {
+                tai_list_for_restart = Some(ie::decode_tai_list_for_restart(field)?)
+            }
+            ie::IE_ID_EMERGENCY_AREA_ID_LIST_FOR_RESTART => {
+                emergency_area_id_list_for_restart =
+                    ie::decode_emergency_area_id_list_for_restart(field)?
+            }
+            _ => {}
+        }
+    }
+
+    Ok(PwsRestartIndication {
+        cell_list: cell_list.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "CellIDListForRestart",
+            ie_id: ie::IE_ID_CELL_ID_LIST_FOR_RESTART,
+        })?,
+        global_ran_node_id: global_ran_node_id.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "GlobalRANNodeID",
+            ie_id: ie::IE_ID_GLOBAL_RAN_NODE_ID,
+        })?,
+        tai_list_for_restart: tai_list_for_restart.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "TAIListForRestart",
+            ie_id: ie::IE_ID_TAI_LIST_FOR_RESTART,
+        })?,
+        emergency_area_id_list_for_restart,
+    })
+}
+
+/// Parse a PWS FAILURE INDICATION (TS 38.413 Section 9.2.8.6).
+fn parse_pws_failure_indication(
+    container: ProtocolIeContainer,
+) -> NgapResult<PwsFailureIndication> {
+    let mut failed_cell_list = None;
+    let mut global_ran_node_id = None;
+
+    for field in &container.ies {
+        match field.id.0 {
+            ie::IE_ID_PWS_FAILED_CELL_ID_LIST => {
+                failed_cell_list = Some(ie::decode_pws_cell_list(field)?)
+            }
+            ie::IE_ID_GLOBAL_RAN_NODE_ID => {
+                global_ran_node_id = Some(ie::decode_global_ran_node_id(field)?)
+            }
+            _ => {}
+        }
+    }
+
+    Ok(PwsFailureIndication {
+        failed_cell_list: failed_cell_list.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "PWSFailedCellIDList",
+            ie_id: ie::IE_ID_PWS_FAILED_CELL_ID_LIST,
+        })?,
+        global_ran_node_id: global_ran_node_id.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "GlobalRANNodeID",
+            ie_id: ie::IE_ID_GLOBAL_RAN_NODE_ID,
+        })?,
     })
 }

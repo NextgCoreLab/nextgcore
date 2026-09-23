@@ -1156,4 +1156,521 @@ mod tests {
             "a RAN status transfer without its transparent container must not decode"
         );
     }
+    // ========================================================================
+    // PWS Procedures (TS 38.413 Section 8.12 / Section 9.2.8)
+    // ========================================================================
+    //
+    // Every assertion here is POSITIVE: the exact procedure code on the wire,
+    // the exact PDU-type CHOICE index, and the recovered value of each IE. A
+    // "decoded without error" assertion would be satisfied by a builder that
+    // emitted the wrong procedure entirely -- which is the #75 / PR #379 bug.
+
+    /// The four PWS procedure codes, pinned to their lines in the vendored
+    /// TS 38.413 text so a future edit cannot silently renumber them:
+    ///
+    /// * `id-PWSCancel             ProcedureCode ::= 32` — `38413-j30.txt:59077`
+    /// * `id-PWSFailureIndication  ProcedureCode ::= 33` — `:59079`
+    /// * `id-PWSRestartIndication  ProcedureCode ::= 34` — `:59081`
+    /// * `id-WriteReplaceWarning   ProcedureCode ::= 51` — `:59115`
+    ///
+    /// Failure is 33 and Restart is 34 — the reverse of the clause order, where
+    /// Restart is Section 9.2.8.5 and Failure is Section 9.2.8.6. This test is
+    /// the guard against reading the codes off the clause order.
+    #[test]
+    fn test_pws_procedure_codes_match_ts38413() {
+        use nextgcore_asn1c::ngap::types::ProcedureCode;
+        assert_eq!(ProcedureCode::PWS_CANCEL.0, 32);
+        assert_eq!(ProcedureCode::PWS_FAILURE_INDICATION.0, 33);
+        assert_eq!(ProcedureCode::PWS_RESTART_INDICATION.0, 34);
+        assert_eq!(ProcedureCode::WRITE_REPLACE_WARNING.0, 51);
+    }
+
+    /// A full ETWS-shaped WRITE-REPLACE WARNING REQUEST with **every** optional
+    /// IE present, round-tripped, plus byte 0 / byte 1 of the encoded PDU.
+    #[test]
+    fn test_write_replace_warning_request_roundtrip_all_ies() {
+        let msg = types::WriteReplaceWarningRequest {
+            message_identifier: 0x1101,
+            serial_number: 0x3000,
+            warning_area_list: Some(types::WarningAreaList::NrCgiList(vec![
+                types::NrCgi {
+                    plmn_identity: [0x02, 0xF8, 0x39],
+                    // 36 bits, with the top nibble set so a 32-bit truncation
+                    // would be visible.
+                    nr_cell_identity: 0x0A_1234_5678,
+                },
+                types::NrCgi {
+                    plmn_identity: [0x02, 0xF8, 0x39],
+                    nr_cell_identity: 0x1,
+                },
+            ])),
+            repetition_period: 32,
+            number_of_broadcasts_requested: 7,
+            warning_type: Some([0x00, 0x40]),
+            warning_security_info: Some([0xA5; 50]),
+            data_coding_scheme: Some(0x01),
+            warning_message_contents: Some(b"EARTHQUAKE".to_vec()),
+            concurrent_warning_message_indicator: true,
+            warning_area_coordinates: Some(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+        };
+
+        let bytes = builder::build_write_replace_warning_request(&msg).unwrap();
+
+        // Byte 0 is the NgapPdu CHOICE index: 0x00 = InitiatingMessage.
+        assert_eq!(
+            bytes[0], 0x00,
+            "byte 0 must be the InitiatingMessage CHOICE index, not the procedure code's high byte"
+        );
+        // Byte 1 is the procedure code: id-WriteReplaceWarning = 51
+        // (`38413-j30.txt:59115`).
+        assert_eq!(bytes[1], 51, "byte 1 must be procedure code 51");
+
+        match parser::decode_ngap_pdu(&bytes).unwrap() {
+            NgapMessage::WriteReplaceWarningRequest(got) => assert_eq!(got, msg),
+            other => panic!("Expected WriteReplaceWarningRequest, got {other:?}"),
+        }
+    }
+
+    /// The minimal conformant request: only the four mandatory IEs.
+    #[test]
+    fn test_write_replace_warning_request_roundtrip_mandatory_only() {
+        let msg = types::WriteReplaceWarningRequest {
+            message_identifier: 0x0000,
+            serial_number: 0xFFFF,
+            warning_area_list: None,
+            repetition_period: 0,
+            number_of_broadcasts_requested: 0,
+            warning_type: None,
+            warning_security_info: None,
+            data_coding_scheme: None,
+            warning_message_contents: None,
+            concurrent_warning_message_indicator: false,
+            warning_area_coordinates: None,
+        };
+
+        let bytes = builder::build_write_replace_warning_request(&msg).unwrap();
+        assert_eq!(bytes[0], 0x00);
+        assert_eq!(bytes[1], 51);
+        match parser::decode_ngap_pdu(&bytes).unwrap() {
+            NgapMessage::WriteReplaceWarningRequest(got) => {
+                assert_eq!(got, msg);
+                // Absent Warning Area List means every cell the node serves
+                // (TS 38.413 Section 8.12.1.2, `38413-j30.txt:9302`).
+                assert!(got.warning_area_list.is_none());
+                assert!(!got.concurrent_warning_message_indicator);
+            }
+            other => panic!("Expected WriteReplaceWarningRequest, got {other:?}"),
+        }
+    }
+
+    /// `RepetitionPeriod ::= INTEGER (0..131071)` (`38413-j30.txt:55881`) — the
+    /// divergence from S1AP's `(0..4095)` that would have broken silently.
+    ///
+    /// 131071 exceeds 65536, so PER takes the length-of-length branch
+    /// (X.691 Section 13.2.6) rather than writing two aligned octets. An
+    /// S1AP-shaped encoder would either reject this value or truncate it.
+    #[test]
+    fn test_write_replace_warning_repetition_period_upper_bound() {
+        for period in [0u32, 4095, 4096, 65535, 65536, 131071] {
+            let msg = types::WriteReplaceWarningRequest {
+                message_identifier: 0x1234,
+                serial_number: 0x5678,
+                warning_area_list: None,
+                repetition_period: period,
+                number_of_broadcasts_requested: 1,
+                warning_type: None,
+                warning_security_info: None,
+                data_coding_scheme: None,
+                warning_message_contents: None,
+                concurrent_warning_message_indicator: false,
+                warning_area_coordinates: None,
+            };
+            let bytes = builder::build_write_replace_warning_request(&msg).unwrap();
+            match parser::decode_ngap_pdu(&bytes).unwrap() {
+                NgapMessage::WriteReplaceWarningRequest(got) => assert_eq!(
+                    got.repetition_period, period,
+                    "RepetitionPeriod {period} did not survive the round trip"
+                ),
+                other => panic!("Expected WriteReplaceWarningRequest, got {other:?}"),
+            }
+        }
+    }
+
+    /// All FOUR root alternatives of `WarningAreaList` (`38413-j30.txt:58760`).
+    /// The S1AP counterpart has three, so a copied CHOICE index would mislabel.
+    #[test]
+    fn test_warning_area_list_all_four_choice_arms_roundtrip() {
+        let tai = types::TaiListItem {
+            tai_plmn: [0x02, 0xF8, 0x39],
+            tai_tac: [0x00, 0x00, 0x01],
+        };
+        let arms = vec![
+            types::WarningAreaList::EutraCgiList(vec![types::EutraCgi {
+                plmn_identity: [0x02, 0xF8, 0x39],
+                // 28 bits, top nibble set.
+                eutra_cell_identity: 0x0ABC_DEF1,
+            }]),
+            types::WarningAreaList::NrCgiList(vec![types::NrCgi {
+                plmn_identity: [0x02, 0xF8, 0x39],
+                nr_cell_identity: 0x0F_FFFF_FFFF,
+            }]),
+            types::WarningAreaList::TaiList(vec![tai.clone(), tai.clone()]),
+            types::WarningAreaList::EmergencyAreaIdList(vec![[0x01, 0x02, 0x03]]),
+        ];
+
+        for arm in arms {
+            let msg = types::WriteReplaceWarningRequest {
+                message_identifier: 1,
+                serial_number: 2,
+                warning_area_list: Some(arm.clone()),
+                repetition_period: 10,
+                number_of_broadcasts_requested: 3,
+                warning_type: None,
+                warning_security_info: None,
+                data_coding_scheme: None,
+                warning_message_contents: None,
+                concurrent_warning_message_indicator: false,
+                warning_area_coordinates: None,
+            };
+            let bytes = builder::build_write_replace_warning_request(&msg).unwrap();
+            match parser::decode_ngap_pdu(&bytes).unwrap() {
+                NgapMessage::WriteReplaceWarningRequest(got) => assert_eq!(
+                    got.warning_area_list,
+                    Some(arm.clone()),
+                    "WarningAreaList arm {arm:?} did not survive the round trip"
+                ),
+                other => panic!("Expected WriteReplaceWarningRequest, got {other:?}"),
+            }
+        }
+    }
+
+    /// WRITE-REPLACE WARNING RESPONSE, and all SIX root alternatives of
+    /// `BroadcastCompletedAreaList` (`38413-j30.txt:45687`) — double the S1AP
+    /// counterpart's three, because TS 38.413 splits each area kind E-UTRA/NR.
+    #[test]
+    fn test_write_replace_warning_response_roundtrip_all_six_area_arms() {
+        let tai = types::TaiListItem {
+            tai_plmn: [0x02, 0xF8, 0x39],
+            tai_tac: [0x00, 0x00, 0x07],
+        };
+        let eutra = types::EutraCgi {
+            plmn_identity: [0x02, 0xF8, 0x39],
+            eutra_cell_identity: 0x0ABC_DEF1,
+        };
+        let nr = types::NrCgi {
+            plmn_identity: [0x02, 0xF8, 0x39],
+            nr_cell_identity: 0x0A_1234_5678,
+        };
+        let arms = vec![
+            types::BroadcastCompletedAreaList::CellIdEutra(vec![eutra]),
+            types::BroadcastCompletedAreaList::TaiEutra(vec![types::TaiBroadcastItem {
+                tai: tai.clone(),
+                completed_cells: vec![eutra, eutra],
+            }]),
+            types::BroadcastCompletedAreaList::EmergencyAreaEutra(vec![
+                types::EmergencyAreaBroadcastItem {
+                    emergency_area_id: [0x0A, 0x0B, 0x0C],
+                    completed_cells: vec![eutra],
+                },
+            ]),
+            types::BroadcastCompletedAreaList::CellIdNr(vec![nr]),
+            types::BroadcastCompletedAreaList::TaiNr(vec![types::TaiBroadcastItem {
+                tai: tai.clone(),
+                completed_cells: vec![nr],
+            }]),
+            types::BroadcastCompletedAreaList::EmergencyAreaNr(vec![
+                types::EmergencyAreaBroadcastItem {
+                    emergency_area_id: [0x01, 0x00, 0xFF],
+                    completed_cells: vec![nr, nr],
+                },
+            ]),
+        ];
+
+        for arm in arms {
+            let msg = types::WriteReplaceWarningResponse {
+                message_identifier: 0x1101,
+                serial_number: 0x3000,
+                broadcast_completed_area_list: Some(arm.clone()),
+                criticality_diagnostics: None,
+            };
+            let bytes = builder::build_write_replace_warning_response(&msg).unwrap();
+
+            // Byte 0 = 0x20 SuccessfulOutcome; byte 1 = procedure code 51.
+            assert_eq!(bytes[0], 0x20, "byte 0 must be the SuccessfulOutcome index");
+            assert_eq!(bytes[1], 51, "byte 1 must be procedure code 51");
+
+            match parser::decode_ngap_pdu(&bytes).unwrap() {
+                NgapMessage::WriteReplaceWarningResponse(got) => {
+                    assert_eq!(got.message_identifier, 0x1101);
+                    assert_eq!(got.serial_number, 0x3000);
+                    assert_eq!(
+                        got.broadcast_completed_area_list,
+                        Some(arm.clone()),
+                        "BroadcastCompletedAreaList arm {arm:?} did not survive"
+                    );
+                }
+                other => panic!("Expected WriteReplaceWarningResponse, got {other:?}"),
+            }
+        }
+    }
+
+    /// PWS CANCEL REQUEST (procedure code 32) round-trip, with the
+    /// Cancel-All indicator present.
+    #[test]
+    fn test_pws_cancel_request_roundtrip() {
+        let msg = types::PwsCancelRequest {
+            message_identifier: 0x1102,
+            serial_number: 0x3001,
+            warning_area_list: Some(types::WarningAreaList::TaiList(vec![types::TaiListItem {
+                tai_plmn: [0x02, 0xF8, 0x39],
+                tai_tac: [0x00, 0x00, 0x02],
+            }])),
+            cancel_all_warning_messages: true,
+        };
+
+        let bytes = builder::build_pws_cancel_request(&msg).unwrap();
+        assert_eq!(bytes[0], 0x00, "byte 0 must be the InitiatingMessage index");
+        // id-PWSCancel = 32 (`38413-j30.txt:59077`).
+        assert_eq!(bytes[1], 32, "byte 1 must be procedure code 32");
+
+        match parser::decode_ngap_pdu(&bytes).unwrap() {
+            NgapMessage::PwsCancelRequest(got) => assert_eq!(got, msg),
+            other => panic!("Expected PwsCancelRequest, got {other:?}"),
+        }
+    }
+
+    /// PWS CANCEL RESPONSE, and all SIX arms of `BroadcastCancelledAreaList`
+    /// (`38413-j30.txt:45662`). Each cancelled item also carries
+    /// `numberOfBroadcasts`, which is what distinguishes these from the
+    /// COMPLETED lists — asserted per item.
+    #[test]
+    fn test_pws_cancel_response_roundtrip_all_six_area_arms() {
+        let tai = types::TaiListItem {
+            tai_plmn: [0x02, 0xF8, 0x39],
+            tai_tac: [0x00, 0x00, 0x09],
+        };
+        let eutra_cell = types::CancelledCellItem {
+            cgi: types::EutraCgi {
+                plmn_identity: [0x02, 0xF8, 0x39],
+                eutra_cell_identity: 0x0ABC_DEF1,
+            },
+            number_of_broadcasts: 4,
+        };
+        let nr_cell = types::CancelledCellItem {
+            cgi: types::NrCgi {
+                plmn_identity: [0x02, 0xF8, 0x39],
+                nr_cell_identity: 0x0A_1234_5678,
+            },
+            number_of_broadcasts: 65535,
+        };
+        let arms = vec![
+            types::BroadcastCancelledAreaList::CellIdEutra(vec![eutra_cell]),
+            types::BroadcastCancelledAreaList::TaiEutra(vec![types::TaiCancelledItem {
+                tai: tai.clone(),
+                cancelled_cells: vec![eutra_cell, eutra_cell],
+            }]),
+            types::BroadcastCancelledAreaList::EmergencyAreaEutra(vec![
+                types::EmergencyAreaCancelledItem {
+                    emergency_area_id: [0x0A, 0x0B, 0x0C],
+                    cancelled_cells: vec![eutra_cell],
+                },
+            ]),
+            types::BroadcastCancelledAreaList::CellIdNr(vec![nr_cell]),
+            types::BroadcastCancelledAreaList::TaiNr(vec![types::TaiCancelledItem {
+                tai: tai.clone(),
+                cancelled_cells: vec![nr_cell],
+            }]),
+            types::BroadcastCancelledAreaList::EmergencyAreaNr(vec![
+                types::EmergencyAreaCancelledItem {
+                    emergency_area_id: [0xFF, 0x00, 0x01],
+                    cancelled_cells: vec![nr_cell, nr_cell],
+                },
+            ]),
+        ];
+
+        for arm in arms {
+            let msg = types::PwsCancelResponse {
+                message_identifier: 0x1102,
+                serial_number: 0x3001,
+                broadcast_cancelled_area_list: Some(arm.clone()),
+                criticality_diagnostics: None,
+            };
+            let bytes = builder::build_pws_cancel_response(&msg).unwrap();
+            assert_eq!(bytes[0], 0x20, "byte 0 must be the SuccessfulOutcome index");
+            assert_eq!(bytes[1], 32, "byte 1 must be procedure code 32");
+
+            match parser::decode_ngap_pdu(&bytes).unwrap() {
+                NgapMessage::PwsCancelResponse(got) => {
+                    assert_eq!(got.message_identifier, 0x1102);
+                    assert_eq!(
+                        got.broadcast_cancelled_area_list,
+                        Some(arm.clone()),
+                        "BroadcastCancelledAreaList arm {arm:?} did not survive"
+                    );
+                }
+                other => panic!("Expected PwsCancelResponse, got {other:?}"),
+            }
+        }
+    }
+
+    /// PWS RESTART INDICATION (procedure code **34**, not 33) round-trip over
+    /// both cell-list arms.
+    #[test]
+    fn test_pws_restart_indication_roundtrip() {
+        let cell_lists = vec![
+            types::PwsCellList::Nr(vec![types::NrCgi {
+                plmn_identity: [0x02, 0xF8, 0x39],
+                nr_cell_identity: 0x0A_1234_5678,
+            }]),
+            types::PwsCellList::Eutra(vec![types::EutraCgi {
+                plmn_identity: [0x02, 0xF8, 0x39],
+                eutra_cell_identity: 0x0ABC_DEF1,
+            }]),
+        ];
+
+        for cell_list in cell_lists {
+            let msg = types::PwsRestartIndication {
+                cell_list: cell_list.clone(),
+                global_ran_node_id: types::GlobalRanNodeId::GlobalGnbId {
+                    plmn_identity: [0x02, 0xF8, 0x39],
+                    gnb_id: 0x1234,
+                    gnb_id_len: 32,
+                },
+                tai_list_for_restart: vec![types::TaiListItem {
+                    tai_plmn: [0x02, 0xF8, 0x39],
+                    tai_tac: [0x00, 0x00, 0x01],
+                }],
+                emergency_area_id_list_for_restart: vec![[0x01, 0x02, 0x03]],
+            };
+
+            let bytes = builder::build_pws_restart_indication(&msg).unwrap();
+            assert_eq!(bytes[0], 0x00, "byte 0 must be the InitiatingMessage index");
+            // id-PWSRestartIndication = 34 (`38413-j30.txt:59081`). NOT 33 --
+            // Failure is 33, despite Restart coming first in clause order.
+            assert_eq!(bytes[1], 34, "byte 1 must be procedure code 34");
+
+            match parser::decode_ngap_pdu(&bytes).unwrap() {
+                NgapMessage::PwsRestartIndication(got) => assert_eq!(got, msg),
+                other => panic!("Expected PwsRestartIndication, got {other:?}"),
+            }
+        }
+    }
+
+    /// The Emergency Area ID List is optional in the Restart Indication
+    /// (range `0..maxnoofEAIforRestart`, `38413-j30.txt:16039`): an empty list
+    /// must omit the IE and still decode to an empty list.
+    #[test]
+    fn test_pws_restart_indication_omits_empty_emergency_area_list() {
+        let msg = types::PwsRestartIndication {
+            cell_list: types::PwsCellList::Nr(vec![types::NrCgi {
+                plmn_identity: [0x02, 0xF8, 0x39],
+                nr_cell_identity: 7,
+            }]),
+            global_ran_node_id: types::GlobalRanNodeId::GlobalGnbId {
+                plmn_identity: [0x02, 0xF8, 0x39],
+                gnb_id: 0x99,
+                gnb_id_len: 22,
+            },
+            tai_list_for_restart: vec![types::TaiListItem {
+                tai_plmn: [0x02, 0xF8, 0x39],
+                tai_tac: [0x00, 0x00, 0x05],
+            }],
+            emergency_area_id_list_for_restart: vec![],
+        };
+        let bytes = builder::build_pws_restart_indication(&msg).unwrap();
+        assert_eq!(bytes[1], 34);
+        match parser::decode_ngap_pdu(&bytes).unwrap() {
+            NgapMessage::PwsRestartIndication(got) => {
+                assert_eq!(got, msg);
+                assert!(got.emergency_area_id_list_for_restart.is_empty());
+            }
+            other => panic!("Expected PwsRestartIndication, got {other:?}"),
+        }
+    }
+
+    /// PWS FAILURE INDICATION (procedure code **33**) round-trip.
+    #[test]
+    fn test_pws_failure_indication_roundtrip() {
+        let msg = types::PwsFailureIndication {
+            failed_cell_list: types::PwsCellList::Nr(vec![
+                types::NrCgi {
+                    plmn_identity: [0x02, 0xF8, 0x39],
+                    nr_cell_identity: 0x0F_FFFF_FFFF,
+                },
+                types::NrCgi {
+                    plmn_identity: [0x02, 0xF8, 0x39],
+                    nr_cell_identity: 0,
+                },
+            ]),
+            global_ran_node_id: types::GlobalRanNodeId::GlobalNgEnbId {
+                plmn_identity: [0x02, 0xF8, 0x39],
+                ng_enb_id: 0xABCDE,
+            },
+        };
+
+        let bytes = builder::build_pws_failure_indication(&msg).unwrap();
+        assert_eq!(bytes[0], 0x00, "byte 0 must be the InitiatingMessage index");
+        // id-PWSFailureIndication = 33 (`38413-j30.txt:59079`).
+        assert_eq!(bytes[1], 33, "byte 1 must be procedure code 33");
+
+        match parser::decode_ngap_pdu(&bytes).unwrap() {
+            NgapMessage::PwsFailureIndication(got) => assert_eq!(got, msg),
+            other => panic!("Expected PwsFailureIndication, got {other:?}"),
+        }
+    }
+
+    /// A WRITE-REPLACE WARNING REQUEST missing a mandatory IE must be rejected,
+    /// not silently defaulted. Built by hand because the builder cannot omit a
+    /// mandatory IE.
+    #[test]
+    fn test_write_replace_warning_request_rejects_missing_mandatory_ie() {
+        use nextgcore_asn1c::ngap::ies::ProtocolIeContainer;
+        use nextgcore_asn1c::ngap::pdu::{InitiatingMessage, InitiatingMessageValue, NgapPdu};
+        use nextgcore_asn1c::ngap::types::{Criticality, ProcedureCode};
+        use nextgcore_asn1c::per::{AperEncode, AperEncoder};
+
+        // Message Identifier and Serial Number only: RepetitionPeriod and
+        // NumberOfBroadcastsRequested are both mandatory (`38413-j30.txt:40917`,
+        // `:40920`) and absent.
+        let mut container = ProtocolIeContainer::new();
+        ie::encode_message_identifier(&mut container, 0x1234).unwrap();
+        ie::encode_serial_number(&mut container, 0x5678).unwrap();
+        let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+            procedure_code: ProcedureCode::WRITE_REPLACE_WARNING,
+            criticality: Criticality::Reject,
+            value: InitiatingMessageValue::Other(container),
+        });
+        let mut encoder = AperEncoder::new();
+        pdu.encode_aper(&mut encoder).unwrap();
+        encoder.align();
+        let bytes = encoder.into_bytes().to_vec();
+
+        assert_eq!(
+            bytes[1], 51,
+            "the hand-built PDU must still be procedure 51"
+        );
+        let err = parser::decode_ngap_pdu(&bytes)
+            .expect_err("a WriteReplaceWarningRequest without RepetitionPeriod must not decode");
+        assert!(
+            format!("{err}").contains("RepetitionPeriod"),
+            "the error must name the missing IE, got: {err}"
+        );
+    }
+
+    /// `WarningMessageContents` is `OCTET STRING (SIZE(1..9600))`
+    /// (`38413-j30.txt:58781`): the encoder must refuse both bounds violations
+    /// rather than emit an out-of-constraint IE.
+    #[test]
+    fn test_warning_message_contents_size_constraint_enforced() {
+        let mut container = nextgcore_asn1c::ngap::ies::ProtocolIeContainer::new();
+        assert!(
+            ie::encode_warning_message_contents(&mut container, &[]).is_err(),
+            "an empty WarningMessageContents violates SIZE(1..9600)"
+        );
+        assert!(
+            ie::encode_warning_message_contents(&mut container, &vec![0u8; 9601]).is_err(),
+            "9601 octets violates SIZE(1..9600)"
+        );
+        assert!(ie::encode_warning_message_contents(&mut container, &vec![0u8; 9600]).is_ok());
+    }
 }

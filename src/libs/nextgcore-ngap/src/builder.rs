@@ -1519,6 +1519,216 @@ pub fn build_multicast_group_paging(
     encode_pdu(&pdu)
 }
 
+// ============================================================================
+// PWS Procedures (TS 38.413 Section 8.12)
+// ============================================================================
+//
+// Procedure codes, quoted from 6g_docs/specs/38413-j30.txt:
+//   id-WriteReplaceWarning  ::= 51  (:59115)
+//   id-PWSCancel            ::= 32  (:59077)
+//   id-PWSFailureIndication ::= 33  (:59079)
+//   id-PWSRestartIndication ::= 34  (:59081)
+//
+// Every builder below goes through `NgapPdu` + `encode_pdu`, so byte 0 carries
+// the PDU-type CHOICE index (0x00 InitiatingMessage / 0x20 SuccessfulOutcome /
+// 0x40 UnsuccessfulOutcome) and byte 1 the procedure code. PR #379 (#75) found
+// the old MBS byte-writer builders opened with `write_u16(procedure_code)`,
+// putting the procedure's high byte where the CHOICE index belongs, so a gNB
+// decoded procedure 0 from 71. Nothing here writes header bytes by hand, and the
+// tests assert bytes[0] and bytes[1] for each of the six messages.
+//
+// IE order follows the ASN.1 declaration order in each `*IEs` information object
+// set, which for these messages is also ascending protocol IE id where the spec
+// allows it to be.
+
+/// Build a WRITE-REPLACE WARNING REQUEST PDU (TS 38.413 Section 9.2.8.1,
+/// procedure code 51).
+///
+/// AMF -> NG-RAN node. In production this AMF **relays** a container the CBCF
+/// supplied rather than composing one (TS 29.518 Section 5.2.2.4.1.3: "The AMF
+/// shall forward the N2 Message Container", `29518-k00.txt:4152`), so this
+/// builder's production role is to let the relay validate and round-trip what it
+/// forwards, and to let a test or simulated CBCF produce a conformant PDU. Same
+/// framing as [`build_uplink_ran_status_transfer`].
+pub fn build_write_replace_warning_request(
+    msg: &WriteReplaceWarningRequest,
+) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    ie::encode_message_identifier(&mut container, msg.message_identifier)?;
+    ie::encode_serial_number(&mut container, msg.serial_number)?;
+    if let Some(ref area) = msg.warning_area_list {
+        ie::encode_warning_area_list(&mut container, area)?;
+    }
+    ie::encode_repetition_period(&mut container, msg.repetition_period)?;
+    ie::encode_number_of_broadcasts_requested(&mut container, msg.number_of_broadcasts_requested)?;
+    if let Some(ref warning_type) = msg.warning_type {
+        ie::encode_warning_type(&mut container, warning_type)?;
+    }
+    if let Some(ref info) = msg.warning_security_info {
+        // Encoded although Section 9.2.8.1 says the receiver ignores it
+        // (`38413-j30.txt:15895-15899`), so a relayed container is byte-exact.
+        ie::encode_warning_security_info(&mut container, info)?;
+    }
+    if let Some(scheme) = msg.data_coding_scheme {
+        ie::encode_data_coding_scheme(&mut container, scheme)?;
+    }
+    if let Some(ref contents) = msg.warning_message_contents {
+        ie::encode_warning_message_contents(&mut container, contents)?;
+    }
+    if msg.concurrent_warning_message_indicator {
+        // Presence IS the signal: `ENUMERATED { true, ... }` has no false value.
+        ie::encode_concurrent_warning_message_ind(&mut container)?;
+    }
+    if let Some(ref coordinates) = msg.warning_area_coordinates {
+        ie::encode_warning_area_coordinates(&mut container, coordinates)?;
+    }
+
+    let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::WRITE_REPLACE_WARNING,
+        criticality: Criticality::Reject,
+        value: InitiatingMessageValue::Other(container),
+    });
+    encode_pdu(&pdu)
+}
+
+/// Build a WRITE-REPLACE WARNING RESPONSE PDU (TS 38.413 Section 9.2.8.2).
+///
+/// NG-RAN node -> AMF in production; provided so a test (or a simulated gNB) can
+/// produce a conformant PDU for the AMF's receive path to consume.
+pub fn build_write_replace_warning_response(
+    msg: &WriteReplaceWarningResponse,
+) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    ie::encode_message_identifier(&mut container, msg.message_identifier)?;
+    ie::encode_serial_number(&mut container, msg.serial_number)?;
+    if let Some(ref area) = msg.broadcast_completed_area_list {
+        ie::encode_broadcast_completed_area_list(&mut container, area)?;
+    }
+    if let Some(ref diag) = msg.criticality_diagnostics {
+        ie::encode_criticality_diagnostics(&mut container, diag)?;
+    }
+
+    let pdu = NgapPdu::SuccessfulOutcome(SuccessfulOutcome {
+        procedure_code: ProcedureCode::WRITE_REPLACE_WARNING,
+        criticality: Criticality::Reject,
+        value: SuccessfulOutcomeValue::Other(container),
+    });
+    encode_pdu(&pdu)
+}
+
+/// Build a PWS CANCEL REQUEST PDU (TS 38.413 Section 9.2.8.3, procedure code 32).
+///
+/// AMF -> NG-RAN node: cancels a broadcast the node may still be running. Like
+/// the warning request, the production path relays the CBCF's container; this
+/// builder validates and round-trips it.
+pub fn build_pws_cancel_request(msg: &PwsCancelRequest) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    ie::encode_message_identifier(&mut container, msg.message_identifier)?;
+    ie::encode_serial_number(&mut container, msg.serial_number)?;
+    if let Some(ref area) = msg.warning_area_list {
+        ie::encode_warning_area_list(&mut container, area)?;
+    }
+    if msg.cancel_all_warning_messages {
+        ie::encode_cancel_all_warning_messages(&mut container)?;
+    }
+
+    let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::PWS_CANCEL,
+        criticality: Criticality::Reject,
+        value: InitiatingMessageValue::Other(container),
+    });
+    encode_pdu(&pdu)
+}
+
+/// Build a PWS CANCEL RESPONSE PDU (TS 38.413 Section 9.2.8.4).
+///
+/// NG-RAN node -> AMF in production; provided for the same reason as
+/// [`build_write_replace_warning_response`].
+pub fn build_pws_cancel_response(msg: &PwsCancelResponse) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    ie::encode_message_identifier(&mut container, msg.message_identifier)?;
+    ie::encode_serial_number(&mut container, msg.serial_number)?;
+    if let Some(ref area) = msg.broadcast_cancelled_area_list {
+        ie::encode_broadcast_cancelled_area_list(&mut container, area)?;
+    }
+    if let Some(ref diag) = msg.criticality_diagnostics {
+        ie::encode_criticality_diagnostics(&mut container, diag)?;
+    }
+
+    let pdu = NgapPdu::SuccessfulOutcome(SuccessfulOutcome {
+        procedure_code: ProcedureCode::PWS_CANCEL,
+        criticality: Criticality::Reject,
+        value: SuccessfulOutcomeValue::Other(container),
+    });
+    encode_pdu(&pdu)
+}
+
+/// Build a PWS RESTART INDICATION PDU (TS 38.413 Section 9.2.8.5, procedure
+/// code **34**).
+///
+/// NG-RAN node -> AMF: PWS information for some or all cells is available for
+/// reloading from the CBC (Section 8.12.3, `38413-j30.txt:9430`). Provided so a
+/// test or simulated gNB can drive the AMF's receive path.
+///
+/// Note 34, not 33: in the alphabetical ASN.1 table Failure is 33 and Restart is
+/// 34, the reverse of the clause order (Restart is Section 9.2.8.5, Failure is
+/// Section 9.2.8.6).
+pub fn build_pws_restart_indication(msg: &PwsRestartIndication) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    ie::encode_pws_cell_list(
+        &mut container,
+        ie::IE_ID_CELL_ID_LIST_FOR_RESTART,
+        &msg.cell_list,
+    )?;
+    ie::encode_global_ran_node_id(&mut container, &msg.global_ran_node_id)?;
+    ie::encode_tai_list_for_restart(&mut container, &msg.tai_list_for_restart)?;
+    if !msg.emergency_area_id_list_for_restart.is_empty() {
+        // Range `0..maxnoofEAIforRestart` (`:16039`), so empty means absent.
+        ie::encode_emergency_area_id_list_for_restart(
+            &mut container,
+            &msg.emergency_area_id_list_for_restart,
+        )?;
+    }
+
+    let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::PWS_RESTART_INDICATION,
+        // Message Type criticality is `ignore` for both indications
+        // (`38413-j30.txt:16008` Restart, `:16076` Failure) -- unlike the
+        // request/response pair, whose Message Type is `reject` (`:15877`).
+        criticality: Criticality::Ignore,
+        value: InitiatingMessageValue::Other(container),
+    });
+    encode_pdu(&pdu)
+}
+
+/// Build a PWS FAILURE INDICATION PDU (TS 38.413 Section 9.2.8.6, procedure
+/// code **33**).
+///
+/// NG-RAN node -> AMF: ongoing PWS operation has failed for one or more cells
+/// (Section 8.12.4, `38413-j30.txt:9455`).
+pub fn build_pws_failure_indication(msg: &PwsFailureIndication) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    ie::encode_pws_cell_list(
+        &mut container,
+        ie::IE_ID_PWS_FAILED_CELL_ID_LIST,
+        &msg.failed_cell_list,
+    )?;
+    ie::encode_global_ran_node_id(&mut container, &msg.global_ran_node_id)?;
+
+    let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::PWS_FAILURE_INDICATION,
+        criticality: Criticality::Ignore,
+        value: InitiatingMessageValue::Other(container),
+    });
+    encode_pdu(&pdu)
+}
+
 #[cfg(test)]
 mod ng_setup_cross_codec {
     //! Cross-codec NG Setup regression guards (E2E NGAP reconciliation).

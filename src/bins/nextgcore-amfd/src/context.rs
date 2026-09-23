@@ -631,6 +631,25 @@ pub struct AmfContext {
     /// by the NGAP server task, mirroring `positioning_dl_queue`. Empty on the
     /// reg/PDU/ping path — only populated when the serving AMF changes.
     network_dereg_queue: RwLock<Vec<PendingNetworkDereg>>,
+
+    /// PWS N2 relay queue (#396, TS 29.518 §5.2.2.4.1.3 / TS 38.413 §8.12):
+    /// warning containers a CBCF/PWS-IWF handed the AMF over
+    /// `POST /namf-comm/v1/non-ue-n2-messages/transfer`, for egress to the
+    /// served NG-RAN nodes.
+    ///
+    /// Same shape and the same reason as `positioning_dl_queue` and
+    /// `network_dereg_queue`: the SCTP associations live in the NGAP server
+    /// task's private `sessions` map, so the SBI handler task cannot send. It
+    /// enqueues here and the NGAP task's per-iteration pump drains and sends.
+    ///
+    /// Targeting is deliberately NOT resolved here. `gnb_list` above has no
+    /// production writer (the NGAP path keeps gNB identity on its own
+    /// `GnbSession.gnb`), so an SBI handler that resolved
+    /// `globalRanNodeList`/`taiList` against it would target an always-empty
+    /// map — the "production reader, test-only writer" defect #341 and #398
+    /// both hit. The selectors are carried verbatim and resolved by the pump
+    /// against the live session map.
+    pws_n2_queue: RwLock<Vec<PendingPwsN2Transfer>>,
 }
 
 /// A positioning payload the LMF asked the AMF to relay downlink (TS 23.273),
@@ -683,6 +702,54 @@ pub struct PendingNetworkDereg {
     /// value to keep this container decoupled from `gmm_build::GmmCause`. The
     /// UDM-triggered path passes `None` per TS 23.502 §4.2.2.3.3.
     pub gmm_cause: Option<u8>,
+}
+
+/// Which RAT the `ratSelector` IE selected (TS 29.518, `RatSelector` at
+/// `TS29518_Namf_Communication.yaml:4613`: `E-UTRA` or `NR`).
+///
+/// §5.2.2.4.1.3 makes it the filter over which attached nodes receive the
+/// container: "the AMF shall forward the N2 Message Container to ng-eNBs or to
+/// gNBs, subject to the value of the ratSelector IE"
+/// (`6g_docs/specs/29518-k00.txt:4155`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PwsRatSelector {
+    /// `NR` — gNBs only
+    Nr,
+    /// `E-UTRA` — ng-eNBs only
+    Eutra,
+}
+
+/// A PWS warning container a CBCF/PWS-IWF asked the AMF to relay to the NG-RAN
+/// (#396, TS 29.518 §5.2.2.4.1.3, TS 38.413 §8.12), enqueued by the Namf SBI
+/// handler task and sent by the NGAP server task.
+///
+/// The container is carried as **already-encoded NGAP PDU bytes**, not a decoded
+/// structure. That is the conformant behaviour, not a shortcut: `pwsContainer`
+/// is an `N2InfoContent`, described in the OpenAPI as "Represents a transparent
+/// N2 information content to be relayed by AMF"
+/// (`TS29518_Namf_Communication.yaml:3251`), and §5.2.2.4.1.3 says three times
+/// that the AMF *forwards* it (`29518-k00.txt:4152`, `:4155`, `:4158`). An AMF
+/// that decomposed the JSON and re-encoded a fresh PDU would silently drop every
+/// IE the CBCF sent that this build does not model — including the extension IEs
+/// the `...` in `WriteReplaceWarningRequestIEs` explicitly admits.
+#[derive(Debug, Clone)]
+pub struct PendingPwsN2Transfer {
+    /// The NGAP PDU to forward, verbatim.
+    pub ngap_pdu: Vec<u8>,
+    /// `messageIdentifier` from `PwsInformation` — retained for logging and for
+    /// correlating the gNB's WRITE-REPLACE WARNING RESPONSE.
+    pub message_identifier: u16,
+    /// `serialNumber` from `PwsInformation`.
+    pub serial_number: u16,
+    /// `globalRanNodeList`, as the gNB IDs the consumer named. Empty means the
+    /// IE was absent, which §5.2.2.4.1.3 defines as "fall through to
+    /// `taiList`/`ratSelector`" rather than "no targets".
+    pub target_gnb_ids: Vec<u32>,
+    /// `taiList`, as (PLMN, TAC) pairs. Only consulted when
+    /// `target_gnb_ids` is empty, per the IE precedence in §5.2.2.4.1.3.
+    pub target_tais: Vec<(PlmnId, u32)>,
+    /// `ratSelector`. `None` means the IE was absent, so no RAT filter applies.
+    pub rat_selector: Option<PwsRatSelector>,
 }
 
 /// Namf_Communication N1N2 message subscription stored per ueContextId
@@ -848,6 +915,7 @@ impl AmfContext {
             lcs_correlations: RwLock::new(HashMap::new()),
             amf_status_subscriptions: RwLock::new(HashMap::new()),
             network_dereg_queue: RwLock::new(Vec::new()),
+            pws_n2_queue: RwLock::new(Vec::new()),
         }
     }
 
@@ -1610,6 +1678,22 @@ impl AmfContext {
     /// server pump).
     pub fn network_dereg_drain(&self) -> Vec<PendingNetworkDereg> {
         match self.network_dereg_queue.write() {
+            Ok(mut q) => std::mem::take(&mut *q),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Enqueue a PWS warning container for NGAP-task egress (#396,
+    /// TS 29.518 §5.2.2.4.1.3).
+    pub fn pws_n2_add(&self, item: PendingPwsN2Transfer) {
+        if let Ok(mut q) = self.pws_n2_queue.write() {
+            q.push(item);
+        }
+    }
+
+    /// Drain all pending PWS warning relays (called by the NGAP server pump).
+    pub fn pws_n2_drain(&self) -> Vec<PendingPwsN2Transfer> {
+        match self.pws_n2_queue.write() {
             Ok(mut q) => std::mem::take(&mut *q),
             Err(_) => Vec::new(),
         }
