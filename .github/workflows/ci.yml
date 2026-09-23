@@ -361,12 +361,26 @@ jobs:
           # The gNB must associate and answer NG Setup before the UE's Registration
           # Request can cross N2 at all, so failing here is a RAN problem and is worth
           # distinguishing from a missing notification below.
+          #
+          # The two grep strings are the EXACT `info!` text nextgsim emits --
+          # "Received NG Setup Response from AMF {}: name={}"
+          # (nextgsim-gnb/src/ngap/task.rs) and "Received Registration Accept: UE is
+          # now {}" (nextgsim-ue/src/nas/mm/orchestrator.rs). Both are `info!` and both
+          # services run at RUST_LOG=info or finer, so neither is filtered out. A
+          # PARAPHRASE here would make this step silently unfalsifiable, which is why
+          # they were read out of nextgsim rather than guessed.
+          #
+          # `docker compose logs` is captured to a FILE and the file is grepped, never
+          # `docker compose logs | grep -q`: under pipefail, grep -q exits on first
+          # match, docker logs dies with SIGPIPE and the pipeline reports failure --
+          # turning a real match into a false negative. e2e-test.sh records the same
+          # rule at the top of the file.
           for _ in $(seq 1 60); do
             docker compose logs gnb > /tmp/gnb.log 2>&1 || true
-            if grep -qF 'NG Setup Response' /tmp/gnb.log; then break; fi
+            if grep -qF 'Received NG Setup Response' /tmp/gnb.log; then break; fi
             sleep 2
           done
-          grep -F 'NG Setup Response' /tmp/gnb.log \
+          grep -F 'Received NG Setup Response' /tmp/gnb.log \
             || { echo "::error::nextgsim's gNB never completed NG Setup with the AMF, so \
                  no UE could register and the delivery assertion below cannot run"; \
                  tail -60 /tmp/gnb.log; docker compose logs --tail=60 amf; exit 1; }
@@ -375,10 +389,10 @@ jobs:
           # fails) or it happened and the notification did not (the probe fails).
           for _ in $(seq 1 60); do
             docker compose logs ue > /tmp/ue.log 2>&1 || true
-            if grep -qF 'Registration Accept' /tmp/ue.log; then break; fi
+            if grep -qF 'Received Registration Accept' /tmp/ue.log; then break; fi
             sleep 2
           done
-          grep -F 'Registration Accept' /tmp/ue.log \
+          grep -F 'Received Registration Accept' /tmp/ue.log \
             || { echo "::error::the UE never received a Registration Accept"; \
                  tail -80 /tmp/ue.log; docker compose logs --tail=80 amf; exit 1; }
 
