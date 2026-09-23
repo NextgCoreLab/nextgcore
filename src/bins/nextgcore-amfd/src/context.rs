@@ -650,6 +650,37 @@ pub struct AmfContext {
     /// both hit. The selectors are carried verbatim and resolved by the pump
     /// against the live session map.
     pws_n2_queue: RwLock<Vec<PendingPwsN2Transfer>>,
+
+    /// Non-UE N2 information subscriptions (#399, TS 29.518 §5.2.2.4.2), keyed
+    /// by the AMF-minted `n2NotifySubscriptionId` — the Document resource's URI
+    /// variable (§6.1.3.10.2, `29518-k00.txt:10111`). A CBCF/PWS-IWF creates one
+    /// over `POST /namf-comm/v1/non-ue-n2-messages/subscriptions` to be told what
+    /// the NG-RAN answered to a warning.
+    ///
+    /// Keyed by subscription id rather than by class because the DELETE resource
+    /// addresses it that way; class lookup is a scan in
+    /// [`Self::non_ue_n2_subscription_find_by_class`], which is exact-class and
+    /// fail-closed so a class that was never stored is never notified.
+    ///
+    /// Distinct from `n1n2_subscriptions` above: that collection is per-UE
+    /// (`/ue-contexts/{id}/n1-n2-messages/subscriptions`), this one is non-UE and
+    /// has no UE to key on. Empty unless a PWS consumer subscribed.
+    non_ue_n2_subscriptions: RwLock<HashMap<String, NonUeN2InfoSubscription>>,
+
+    /// Per-warning record of a PWS transfer that asked for the RAN's response
+    /// (#399, TS 29.518 §5.2.2.4.4.3 item 1), keyed by
+    /// `(messageIdentifier, serialNumber)` — the pair §6.1.6.4.3.3 itself names
+    /// as a warning's identity ("for a message identified by its Serial Number
+    /// and Message Identifier", `29518-k00.txt:19073`).
+    ///
+    /// Needed because a response notification is CONDITIONAL on the originating
+    /// request having asked for one ("If the Send-Write-Replace-Warning
+    /// Indication IE was present ... then the AMF may forward the Broadcast
+    /// Completed Area List IE(s)", `:4465-4468`), and the WRITE-REPLACE WARNING
+    /// RESPONSE that arrives minutes later on SCTP carries no trace of that
+    /// request. Fail-closed: no record means no notification, so the AMF never
+    /// invents a consumer for a warning nobody asked to be told about.
+    pws_response_requests: RwLock<HashMap<(u16, u16), PwsResponseRequest>>,
 }
 
 /// A positioning payload the LMF asked the AMF to relay downlink (TS 23.273),
@@ -750,6 +781,68 @@ pub struct PendingPwsN2Transfer {
     pub target_tais: Vec<(PlmnId, u32)>,
     /// `ratSelector`. `None` means the IE was absent, so no RAT filter applies.
     pub rat_selector: Option<PwsRatSelector>,
+}
+
+/// A non-UE N2 information subscription a consumer (e.g. CBCF/PWS-IWF) created
+/// over `POST /namf-comm/v1/non-ue-n2-messages/subscriptions` (#399, TS 29.518
+/// §5.2.2.4.2, `NonUeN2InfoSubscriptionCreateData` at
+/// `TS29518_Namf_Communication.yaml:2570-2596`).
+///
+/// Note the resource URI: §6.1.3.9.2 (`29518-k00.txt:9962`) makes the collection
+/// `{apiRoot}/namf-comm/<apiVersion>/non-ue-n2-messages/subscriptions` — a
+/// SIBLING of `non-ue-n2-messages/transfer`, not a top-level
+/// `non-ue-n2-info-subscriptions` collection. The latter spelling appears nowhere
+/// in TS 29.518 or its OpenAPI; serving it would expose an endpoint no conformant
+/// consumer ever POSTs to.
+#[derive(Debug, Clone)]
+pub struct NonUeN2InfoSubscription {
+    /// Subscription ID minted by the AMF, returned as `n2NotifySubscriptionId`
+    /// and as the last segment of the `Location` header
+    pub subscription_id: String,
+    /// `n2InformationClass` (mandatory). Stored verbatim; lookups are
+    /// exact-class so a class that was never stored is never notified.
+    pub n2_information_class: String,
+    /// `n2NotifyCallbackUri` (mandatory): where the AMF POSTs the
+    /// `N2InformationNotification`.
+    pub n2_notify_callback_uri: String,
+    /// `nfId` — for a PWS subscription this is "the instance identity of the
+    /// network function (e.g. CBCF or PWS-IWF) creating the subscription ...
+    /// The AMF may use this IE to identify whether the same CBCF/PWS-IWF
+    /// instance has subscribed" (`29518-k00.txt:11876-11886`). When the
+    /// transfer named an `nfId`, only that instance's subscription matches.
+    pub nf_id: Option<String>,
+    /// `notifCorrelationId`: echoed back in the notification so the consumer can
+    /// correlate it to this subscription.
+    pub notif_correlation_id: Option<String>,
+    /// `globalRanNodeList`, as the gNB IDs the consumer restricted itself to.
+    /// Empty means the IE was absent, which the NOTE at
+    /// `29518-k00.txt:11913-11915` defines as "N2 information from all connected
+    /// Access Network node(s)" — NOT "no nodes".
+    pub global_ran_node_gnb_ids: Vec<u32>,
+    /// `anTypeList` (`AccessType` values), stored verbatim for the same
+    /// absent-means-all reason.
+    pub an_type_list: Vec<String>,
+    /// `supportedFeatures`, echoed in the 201 body when the consumer sent it.
+    pub supported_features: Option<String>,
+}
+
+/// A PWS transfer that asked to be told what the RAN answered (#399, TS 29.518
+/// §5.2.2.4.4.3 item 1), recorded when the transfer arrives so the asynchronous
+/// WRITE-REPLACE WARNING RESPONSE / PWS CANCEL RESPONSE can be matched back to it.
+#[derive(Debug, Clone)]
+pub struct PwsResponseRequest {
+    /// `pwsInfo.sendRanResponse`. Only `true` records are stored; a `false` (or
+    /// absent, which defaults to `false` per `yaml:3291-3292`) transfer asked for
+    /// nothing and gets nothing.
+    pub send_ran_response: bool,
+    /// `pwsInfo.nfId` when the transfer named one, so the response goes to the
+    /// subscription belonging to the SAME CBCF/PWS-IWF instance
+    /// (`29518-k00.txt:14747-14760`).
+    pub nf_id: Option<String>,
+    /// The NGAP procedure code of the request (51 WriteReplaceWarning or
+    /// 32 PWSCancel), so a response can be checked against what was asked.
+    /// `u8`, matching `nextgcore_asn1c::ngap::types::ProcedureCode`'s own width.
+    pub procedure_code: u8,
 }
 
 /// Namf_Communication N1N2 message subscription stored per ueContextId
@@ -941,6 +1034,8 @@ impl AmfContext {
             amf_status_subscriptions: RwLock::new(HashMap::new()),
             network_dereg_queue: RwLock::new(Vec::new()),
             pws_n2_queue: RwLock::new(Vec::new()),
+            non_ue_n2_subscriptions: RwLock::new(HashMap::new()),
+            pws_response_requests: RwLock::new(HashMap::new()),
         }
     }
 
@@ -2154,6 +2249,170 @@ impl AmfContext {
             .unwrap_or(0)
     }
 
+    // ========================================================================
+    // Non-UE N2 information subscriptions (#399, TS 29.518 §5.2.2.4.2/§5.2.2.4.3)
+    //
+    // Lock-order rule: these methods only ever take the single
+    // `non_ue_n2_subscriptions` / `pws_response_requests` lock and never call
+    // into other lock-taking methods while holding it. Finders clone out.
+    // ========================================================================
+
+    /// Store a non-UE N2 information subscription. Returns false when the id is
+    /// already taken.
+    pub fn non_ue_n2_subscription_add(&self, sub: NonUeN2InfoSubscription) -> bool {
+        if let Ok(mut subs) = self.non_ue_n2_subscriptions.write() {
+            if subs.contains_key(&sub.subscription_id) {
+                return false;
+            }
+            subs.insert(sub.subscription_id.clone(), sub);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove a non-UE N2 information subscription by id (the NonUeN2InfoUnSubscribe
+    /// DELETE, TS 29.518 §5.2.2.4.3). Returns the removed record, or None when it
+    /// never existed — which the caller answers 404 SUBSCRIPTION_NOT_FOUND for
+    /// (§6.1.3.10.3.1, `29518-k00.txt:10170`).
+    pub fn non_ue_n2_subscription_remove(
+        &self,
+        subscription_id: &str,
+    ) -> Option<NonUeN2InfoSubscription> {
+        self.non_ue_n2_subscriptions
+            .write()
+            .ok()?
+            .remove(subscription_id)
+    }
+
+    /// Find a non-UE N2 information subscription by id (clone-out).
+    pub fn non_ue_n2_subscription_find(
+        &self,
+        subscription_id: &str,
+    ) -> Option<NonUeN2InfoSubscription> {
+        self.non_ue_n2_subscriptions
+            .read()
+            .ok()?
+            .get(subscription_id)
+            .cloned()
+    }
+
+    /// Find the subscription to notify for a received PWS message, given the
+    /// SPECIFIC N2 information class that message belongs to per TS 29.518
+    /// §6.1.6.4.3.3 and, when the originating transfer named one, the `nfId` of
+    /// the consumer that asked.
+    ///
+    /// Tries `specific_class` first, then the umbrella `"PWS"`. That fallback is
+    /// not a loosening: §5.2.2.4.2.2 (`29518-k00.txt:4334`) offers "PWS",
+    /// "PWS-BCAL" and "PWS-RF" as alternatives for the same purpose, and
+    /// §5.2.2.4.1.3's `n2PwsSubMissInd` condition speaks of "the corresponding N2
+    /// information subscription for PWS information" (`:4176`) without narrowing
+    /// to a sub-class. What is deliberately NOT done is crossing the two specific
+    /// classes — a `PWS-RF` subscription never receives a response and a
+    /// `PWS-BCAL` one never receives an indication, because those are disjoint
+    /// message sets and a consumer that asked for one did not ask for the other.
+    ///
+    /// Fail-closed on `nf_id`: when the transfer named an instance, only that
+    /// instance's subscription matches (`:11876-11886`). A subscription that
+    /// stored no `nfId` matches any request, since it made no claim about which
+    /// instance it is. When several match, the lexicographically greatest
+    /// subscription id wins — deterministic, like
+    /// [`Self::n1n2_subscription_find_any_n2`].
+    pub fn non_ue_n2_subscription_find_by_class(
+        &self,
+        specific_class: &str,
+        nf_id: Option<&str>,
+    ) -> Option<NonUeN2InfoSubscription> {
+        let subs = self.non_ue_n2_subscriptions.read().ok()?;
+        for class in [specific_class, "PWS"] {
+            let mut matches: Vec<&NonUeN2InfoSubscription> = subs
+                .values()
+                .filter(|s| {
+                    s.n2_information_class == class
+                        // A subscription that named an nfId only serves that
+                        // instance; one that named none serves anybody.
+                        && match (s.nf_id.as_deref(), nf_id) {
+                            (Some(sub_nf), Some(req_nf)) => sub_nf == req_nf,
+                            (Some(_), None) => false,
+                            (None, _) => true,
+                        }
+                })
+                .collect();
+            if matches.is_empty() {
+                continue;
+            }
+            matches.sort_by(|a, b| a.subscription_id.cmp(&b.subscription_id));
+            return matches.last().map(|s| (*s).clone());
+        }
+        None
+    }
+
+    /// Find a subscription for EXACTLY this class and `nf_id`, with no `"PWS"`
+    /// fallback and no "a subscription without an nfId matches anybody"
+    /// relaxation.
+    ///
+    /// This is the duplicate-detection lookup for §5.2.2.4.2.2 item 2
+    /// (`29518-k00.txt:4351-4356`), which is about "an existing subscription from
+    /// the same NF consumer (identified by the NF instance ID) for notification of
+    /// the same N2 PWS information class". Deliberately NOT
+    /// [`Self::non_ue_n2_subscription_find_by_class`]: that one's fallback and
+    /// relaxation are right for choosing whom to notify and wrong here, where they
+    /// would delete a DIFFERENT consumer's subscription — a `PWS` subscription
+    /// when a `PWS-RF` one was created, or an anonymous subscription when a named
+    /// consumer subscribed.
+    pub fn non_ue_n2_subscription_find_by_class_exact(
+        &self,
+        n2_information_class: &str,
+        nf_id: Option<&str>,
+    ) -> Option<NonUeN2InfoSubscription> {
+        let subs = self.non_ue_n2_subscriptions.read().ok()?;
+        let mut matches: Vec<&NonUeN2InfoSubscription> = subs
+            .values()
+            .filter(|s| {
+                s.n2_information_class == n2_information_class && s.nf_id.as_deref() == nf_id
+            })
+            .collect();
+        matches.sort_by(|a, b| a.subscription_id.cmp(&b.subscription_id));
+        matches.last().map(|s| (*s).clone())
+    }
+
+    /// Number of stored non-UE N2 information subscriptions.
+    pub fn non_ue_n2_subscription_count(&self) -> usize {
+        self.non_ue_n2_subscriptions
+            .read()
+            .map(|s| s.len())
+            .unwrap_or(0)
+    }
+
+    /// Record that a PWS transfer asked for the RAN's response (#399, TS 29.518
+    /// §5.2.2.4.4.3 item 1), keyed by the warning's
+    /// `(messageIdentifier, serialNumber)`. Replaces any earlier record for the
+    /// same pair, which is what "write-REPLACE warning" means for that identity.
+    pub fn pws_response_request_set(
+        &self,
+        message_identifier: u16,
+        serial_number: u16,
+        record: PwsResponseRequest,
+    ) {
+        if let Ok(mut map) = self.pws_response_requests.write() {
+            map.insert((message_identifier, serial_number), record);
+        }
+    }
+
+    /// The `sendRanResponse` record for a warning, if the consumer asked to be
+    /// told. `None` means no notification is owed (clone-out).
+    pub fn pws_response_request_get(
+        &self,
+        message_identifier: u16,
+        serial_number: u16,
+    ) -> Option<PwsResponseRequest> {
+        self.pws_response_requests
+            .read()
+            .ok()?
+            .get(&(message_identifier, serial_number))
+            .cloned()
+    }
+
     /// Record the fallback LCS correlation for a UE (last-writer-wins),
     /// captured from an incoming positioning N1N2MessageTransferReqData
     pub fn lcs_correlation_set(&self, ue_context_id: &str, record: LcsCorrelationRecord) {
@@ -2256,6 +2515,20 @@ pub struct AmfGnb {
     pub gnb_id_presence: bool,
     /// gNB ID (received from gNB)
     pub gnb_id: u32,
+    /// Significant bit length of `gnb_id` (`GNbId ::= BIT STRING (SIZE(22..32))`,
+    /// TS 38.413 §9.3.1.6).
+    ///
+    /// #399: carried because TS 29.571's `GNbId` requires BOTH `bitLength` and
+    /// `gNBValue` (`TS29571_CommonData.yaml:2911-2913`), so rendering a
+    /// conformant `ranNodeId` in an `n2InfoNotify` needs the length. The NG SETUP
+    /// REQUEST decoder has always recovered it
+    /// (`ngap_asn1.rs` -> `NgSetupRequest.gnb_id_len`) but the handler used to
+    /// drop it on the floor, leaving the only alternative to fabricate 22 or 32
+    /// and misidentify any node whose real ID is neither.
+    ///
+    /// 32 until NG Setup completes; a node that never completed NG Setup cannot
+    /// be a notification source.
+    pub gnb_id_len: u8,
     /// PLMN ID (received from gNB)
     pub plmn_id: PlmnId,
     /// gNB state
@@ -2280,6 +2553,7 @@ impl AmfGnb {
             addr: addr.to_string(),
             gnb_id_presence: false,
             gnb_id: 0,
+            gnb_id_len: 32,
             plmn_id: PlmnId::default(),
             state: GnbState::default(),
             max_num_of_ostreams: 0,

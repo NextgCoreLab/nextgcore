@@ -214,7 +214,11 @@ fn encode_plmn_id(plmn_id: &crate::context::PlmnId) -> [u8; 3] {
 }
 
 /// Decode PLMN ID from 3 bytes
-fn decode_plmn_id(bytes: &[u8]) -> crate::context::PlmnId {
+///
+/// `pub(crate)` for #399: the PWS indication path needs the PLMN out of a PDU's
+/// own Global RAN Node ID IE (TS 38.413 §9.3.1.5) to render a TS 29.571
+/// `GlobalRanNodeId` for the notification.
+pub(crate) fn decode_plmn_id(bytes: &[u8]) -> crate::context::PlmnId {
     if bytes.len() < 3 {
         return crate::context::PlmnId::default();
     }

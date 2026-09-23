@@ -1163,6 +1163,53 @@ impl NgapServer {
                 self.handle_mbs_outcome(association_id, procedure_code, data)
                     .await?;
             }
+            Some(51) | Some(32) => {
+                // PWS responses (#399, TS 38.413 §9.2.8.2 / §9.2.8.4):
+                // WRITE-REPLACE WARNING RESPONSE (procedure 51,
+                // `38413-j30.txt:59115`) and PWS CANCEL RESPONSE (32, `:59077`).
+                //
+                // Both are the NG-RAN's answer to an AMF-INITIATED class-1
+                // procedure, so what arrives is a SuccessfulOutcome (0x20). Keying
+                // these on InitiatingMessage instead would leave them falling to
+                // the `_` arm and still earning the Error Indication this arm
+                // exists to stop.
+                if data[0] == 0x20 {
+                    self.handle_pws_response(association_id, procedure_code, data)
+                        .await?;
+                } else {
+                    log::warn!(
+                        "WriteReplaceWarning/PWSCancel initiating messages are AMF->gNB; \
+                         unexpected {procedure_code:?} outcome byte {:#04x} from association \
+                         {association_id}",
+                        data[0]
+                    );
+                }
+            }
+            Some(34) | Some(33) => {
+                // PWS indications (#399, TS 38.413 §9.2.8.5 / §9.2.8.6): PWS
+                // RESTART INDICATION (procedure **34**, `38413-j30.txt:59081`) and
+                // PWS FAILURE INDICATION (**33**, `:59079`).
+                //
+                // Note the ordering trap: the ASN.1 table is alphabetical, so
+                // Failure is 33 and Restart is 34 — the REVERSE of the clause order
+                // (Restart is §9.2.8.5, Failure is §9.2.8.6). Reading the codes off
+                // the clause order swaps them.
+                //
+                // Unlike 51/32 above these are NG-RAN-initiated class-2 procedures,
+                // so they arrive as InitiatingMessage (0x00) and are never
+                // answered on N2.
+                if data[0] == 0x00 {
+                    self.handle_pws_indication(association_id, procedure_code, data)
+                        .await?;
+                } else {
+                    log::warn!(
+                        "PWS Restart/Failure Indication has no outcome messages; unexpected \
+                         {procedure_code:?} outcome byte {:#04x} from association \
+                         {association_id}",
+                        data[0]
+                    );
+                }
+            }
             Some(19) | Some(44) | Some(48) | Some(52) => {
                 // Expected gNB-initiated procedures the AMF accepts without a
                 // response (TS 38.413): NAS Non Delivery Indication (19), UE Radio
@@ -5866,6 +5913,290 @@ impl NgapServer {
             })
             .map(|session| session.association_id)
             .collect()
+    }
+
+    /// Handle a WRITE-REPLACE WARNING RESPONSE (procedure 51) or PWS CANCEL
+    /// RESPONSE (32) from an NG-RAN node and, if the consumer asked to be told,
+    /// deliver it as a NonUeN2InfoNotify (#399, TS 29.518 §5.2.2.4.4.3 item 1).
+    ///
+    /// Three facts have to line up before anything is sent, and each failure is
+    /// logged distinctly, because "nothing happened" is the failure mode that
+    /// hides in a notification path:
+    ///
+    /// 1. the originating transfer set `sendRanResponse: true` — §5.2.2.4.4.3
+    ///    conditions the response notification on the request having asked for it
+    ///    ("If the Send-Write-Replace-Warning Indication IE was present ... then
+    ///    the AMF may forward the Broadcast Completed Area List IE(s)",
+    ///    `29518-k00.txt:4465-4468`), and the RESPONSE PDU carries no trace of
+    ///    that ask, so it is matched by `(messageIdentifier, serialNumber)` —
+    ///    the identity §6.1.6.4.3.3 itself uses (`:19073`);
+    /// 2. a `PWS-BCAL` (or umbrella `PWS`) subscription exists, for the same
+    ///    `nfId` when the transfer named one;
+    /// 3. the association still maps to a known gNB — the responding node's
+    ///    identity can ONLY come from there, because neither response carries a
+    ///    Global RAN Node ID IE (`38413-j30.txt:15916-15939`, `:15968-15993`).
+    ///
+    /// Read from the live `sessions` map, never from `AmfContext::gnb_list`: that
+    /// collection has no production writer, so anything keyed off it would match a
+    /// permanently empty map and look correct while never firing.
+    async fn handle_pws_response(
+        &mut self,
+        association_id: u64,
+        procedure_code: Option<u16>,
+        data: &[u8],
+    ) -> Result<()> {
+        use nextgcore_ngap::{parser::decode_ngap_pdu, NgapMessage};
+
+        // Decoded so the identifiers can be lifted into `pwsInfo` and so the
+        // presence of the area list is known (it drives `bcEmptyAreaList`). The
+        // PDU itself is still forwarded verbatim — this is a read, not a
+        // re-encode.
+        let (message_identifier, serial_number, has_area_list) = match decode_ngap_pdu(data) {
+            Ok(NgapMessage::WriteReplaceWarningResponse(resp)) => (
+                resp.message_identifier,
+                resp.serial_number,
+                resp.broadcast_completed_area_list.is_some(),
+            ),
+            Ok(NgapMessage::PwsCancelResponse(resp)) => (
+                resp.message_identifier,
+                resp.serial_number,
+                resp.broadcast_cancelled_area_list.is_some(),
+            ),
+            Ok(other) => {
+                log::warn!(
+                    "Expected a PWS response for procedure {procedure_code:?} from association \
+                     {association_id}, got {other:?}; dropped"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                log::warn!(
+                    "PWS response (procedure {procedure_code:?}) from association \
+                     {association_id} undecodable, dropped: {e}"
+                );
+                return Ok(());
+            }
+        };
+
+        let (request, subscription) = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            let request = guard.pws_response_request_get(message_identifier, serial_number);
+            // Fail-closed on (1): with no record the consumer either never asked
+            // for the response or this is a warning the AMF did not relay, and
+            // either way notifying would be inventing a recipient.
+            let Some(request) = request else {
+                log::info!(
+                    "PWS response (procedure {procedure_code:?}) from association \
+                     {association_id} for messageIdentifier={message_identifier:#06x} \
+                     serialNumber={serial_number:#06x}: no sendRanResponse request recorded, \
+                     nothing to notify (TS 29.518 §5.2.2.4.4.3)"
+                );
+                return Ok(());
+            };
+            let subscription =
+                guard.non_ue_n2_subscription_find_by_class("PWS-BCAL", request.nf_id.as_deref());
+            (request, subscription)
+        };
+
+        // Fail-closed on (2). This is also the condition the transfer's
+        // `n2PwsSubMissInd: true` warned the consumer about, so reaching here means
+        // the consumer was told and did not act.
+        let Some(sub) = subscription else {
+            log::warn!(
+                "PWS response from association {association_id} \
+                 (messageIdentifier={message_identifier:#06x}) has no PWS-BCAL/PWS \
+                 subscription for nfId {:?}; dropped (the transfer's 200 already carried \
+                 n2PwsSubMissInd:true)",
+                request.nf_id
+            );
+            return Ok(());
+        };
+
+        // Fail-closed on (3), from the live session map.
+        let Some((plmn, gnb_id, gnb_id_len)) =
+            self.sessions
+                .read()
+                .await
+                .get(&association_id)
+                .map(|session| {
+                    (
+                        session.gnb.plmn_id.clone(),
+                        session.gnb.gnb_id,
+                        session.gnb.gnb_id_len,
+                    )
+                })
+        else {
+            log::warn!(
+                "PWS response from association {association_id} has no session; cannot identify \
+                 the responding NG-RAN node, dropped"
+            );
+            return Ok(());
+        };
+        let ran_node_id = crate::namf_server::global_ran_node_id_json(&plmn, gnb_id, gnb_id_len);
+
+        log::info!(
+            "PWS: notifying consumer of a procedure-{} response from gNB {gnb_id:#x} \
+             (messageIdentifier={message_identifier:#06x} serialNumber={serial_number:#06x}, \
+             area list {}, sub={})",
+            procedure_code.unwrap_or(0),
+            if has_area_list {
+                "present"
+            } else {
+                "ABSENT -> bcEmptyAreaList"
+            },
+            sub.subscription_id,
+        );
+        crate::namf_server::send_non_ue_n2_info_notify(
+            sub.n2_notify_callback_uri,
+            sub.subscription_id,
+            sub.n2_information_class,
+            message_identifier,
+            serial_number,
+            ran_node_id,
+            // "If the NG-RAN node(s) have responded WITHOUT the Broadcast
+            // Completed Area List IE then the AMF SHALL include the NG-RAN node
+            // ID(s) in "bcEmptyAreaList"" (`29518-k00.txt:4468-4471`) — a "shall",
+            // unlike the aggregation "may" this path declines.
+            !has_area_list,
+            request.nf_id,
+            sub.notif_correlation_id,
+            data.to_vec(),
+        );
+        Ok(())
+    }
+
+    /// Handle a PWS RESTART INDICATION (procedure 34) or PWS FAILURE INDICATION
+    /// (33) from an NG-RAN node and forward it to a subscribed consumer (#399,
+    /// TS 29.518 §5.2.2.4.4.3 item 2).
+    ///
+    /// Unlike a response this is **unconditional** on any prior request:
+    /// §5.2.2.4.4.3 item 2 (`29518-k00.txt:4490-4493`) is a "shall" — "The AMF
+    /// shall forward the Restart Indication or Failure Indication to the NF Service
+    /// Consumer" — with no originating transfer to correlate to (the NG-RAN raises
+    /// these on its own, e.g. after losing PWS state). So the only gate is a
+    /// subscription existing, because without one there is nowhere to send it.
+    ///
+    /// The class is `PWS-RF`, not `PWS-BCAL` (Table 6.1.6.4.3.3-3,
+    /// `29518-k00.txt:19108-19118`), and the node identity comes from the PDU's own
+    /// mandatory Global RAN Node ID IE (`38413-j30.txt:16031`) rather than from the
+    /// association — that is what the node said about itself.
+    async fn handle_pws_indication(
+        &mut self,
+        association_id: u64,
+        procedure_code: Option<u16>,
+        data: &[u8],
+    ) -> Result<()> {
+        use nextgcore_ngap::{parser::decode_ngap_pdu, NgapMessage};
+
+        let global_ran_node_id = match decode_ngap_pdu(data) {
+            Ok(NgapMessage::PwsRestartIndication(ind)) => {
+                log::info!(
+                    "PWS RESTART INDICATION from association {association_id}: {} TAI(s), {} \
+                     emergency area ID(s) available for reload (TS 38.413 §8.12.3)",
+                    ind.tai_list_for_restart.len(),
+                    ind.emergency_area_id_list_for_restart.len(),
+                );
+                ind.global_ran_node_id
+            }
+            Ok(NgapMessage::PwsFailureIndication(ind)) => {
+                log::warn!(
+                    "PWS FAILURE INDICATION from association {association_id}: PWS operation \
+                     failed for cells (TS 38.413 §8.12.4)"
+                );
+                ind.global_ran_node_id
+            }
+            Ok(other) => {
+                log::warn!(
+                    "Expected a PWS indication for procedure {procedure_code:?} from association \
+                     {association_id}, got {other:?}; dropped"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                log::warn!(
+                    "PWS indication (procedure {procedure_code:?}) from association \
+                     {association_id} undecodable, dropped: {e}"
+                );
+                return Ok(());
+            }
+        };
+
+        // No `nfId` filter: there is no originating transfer to have named one, so
+        // any PWS-RF/PWS subscriber is a legitimate recipient of a node-raised
+        // indication.
+        let subscription = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.non_ue_n2_subscription_find_by_class("PWS-RF", None)
+        };
+        let Some(sub) = subscription else {
+            log::warn!(
+                "PWS indication (procedure {procedure_code:?}) from association \
+                 {association_id} has no PWS-RF/PWS subscription; dropped (no ErrorIndication \
+                 sent -- the indication is a class-2 procedure the AMF never answers)"
+            );
+            return Ok(());
+        };
+
+        let ran_node_id = match &global_ran_node_id {
+            nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId {
+                plmn_identity,
+                gnb_id,
+                gnb_id_len,
+            } => crate::namf_server::global_ran_node_id_json(
+                &crate::ngap_asn1::decode_plmn_id(plmn_identity),
+                *gnb_id,
+                *gnb_id_len,
+            ),
+            nextgcore_ngap::types::GlobalRanNodeId::GlobalNgEnbId {
+                plmn_identity,
+                ng_enb_id,
+            } => {
+                // TS 29.571 `NgeNbId` is a PREFIXED string, not a bare hex value:
+                // `^(MacroNGeNB-[A-Fa-f0-9]{5}|LMacroNGeNB-[A-Fa-f0-9]{6}|SMacroNGeNB-[A-Fa-f0-9]{5})$`
+                // (`TS29571_CommonData.yaml:1458`). TS 38.413 §9.3.1.8's macro form
+                // is 20 bits = 5 nibbles, which is the `MacroNGeNB-` arm.
+                let plmn = crate::ngap_asn1::decode_plmn_id(plmn_identity);
+                serde_json::json!({
+                    "plmnId": { "mcc": plmn.mcc(), "mnc": plmn.mnc() },
+                    "ngeNbId": format!("MacroNGeNB-{ng_enb_id:05X}"),
+                })
+            }
+        };
+
+        // A PWS indication carries no Message Identifier / Serial Number: its IE
+        // tables (`38413-j30.txt:15995`, `:16064`) are the cell list and the Global
+        // RAN Node ID. `PwsInformation` requires both as mandatory members
+        // (`yaml:3298-3300`), so 0/0 is sent — the identifiers for "not about one
+        // specific warning", which is exactly what a node-wide restart or failure
+        // is. The consumer reads the class and the container, per
+        // `29518-k00.txt:19119-19121`: "The Message Type shall be present and
+        // encoded as the first N2 PWS Indication IE ... to enable the receiver to
+        // decode the N2 PWS IEs" — and the Message Type is in the container.
+        log::info!(
+            "PWS: forwarding a procedure-{} indication to consumer (sub={}, class={})",
+            procedure_code.unwrap_or(0),
+            sub.subscription_id,
+            sub.n2_information_class,
+        );
+        crate::namf_server::send_non_ue_n2_info_notify(
+            sub.n2_notify_callback_uri,
+            sub.subscription_id,
+            sub.n2_information_class,
+            0,
+            0,
+            ran_node_id,
+            // `bcEmptyAreaList` is about a RESPONSE that omitted its area list
+            // (§5.2.2.4.4.3 item 1). An indication has no area list to omit, so
+            // setting it here would assert something the spec never scopes to
+            // this event.
+            false,
+            None,
+            sub.notif_correlation_id,
+            data.to_vec(),
+        );
+        Ok(())
     }
 
     async fn process_positioning_downlinks(&mut self) {
@@ -11645,6 +11976,14 @@ mod tests {
         let mut session = GnbSession::new(association_id, association_id, addr);
         session.gnb.gnb_id = gnb_id;
         session.gnb.gnb_id_presence = true;
+        // #399: the gNB's OWN PLMN, which `ngap_handler::handle_ng_setup_request`
+        // populates in production from the NG SETUP REQUEST's Global RAN Node ID
+        // (`gnb.plmn_id = request.plmn_id`). Left at the 000/00 default, this
+        // fixture would not resemble a node a real NG Setup produced — and the PWS
+        // notification's `ranNodeId.plmnId` is read from exactly this field.
+        if let Some((mcc, mnc, _)) = tas.first() {
+            session.gnb.plmn_id = PlmnId::new(mcc, mnc);
+        }
         session.gnb.rat_type = rat_type;
         session.gnb.supported_ta_list = tas
             .iter()
@@ -11871,6 +12210,744 @@ mod tests {
             !remaining.iter().any(|i| i.message_identifier == mid),
             "the pump must consume the queued PWS relay"
         );
+    }
+
+    // ========================================================================
+    // #399: the PWS RECEIVE path -- subscriptions + n2InfoNotify
+    // (TS 29.518 §5.2.2.4.4.3, TS 38.413 §9.2.8.2/.4/.5/.6)
+    // ========================================================================
+
+    /// A capture server standing in for the CBCF's `n2NotifyCallbackUri`, so the
+    /// DELIVERED notification body can be asserted rather than merely the builder's
+    /// output. Returns the server (kept alive by the caller), its callback URI and
+    /// a receiver of `(uri, jsonData)` pairs.
+    async fn start_pws_notify_sink() -> (
+        nextgcore_sbi::server::SbiServer,
+        String,
+        tokio::sync::mpsc::Receiver<(String, String)>,
+    ) {
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let (tx, rx) = tokio::sync::mpsc::channel::<(String, String)>(16);
+        let bind: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(bind),
+            listener,
+        );
+        server
+            .start(move |req: nextgcore_sbi::SbiRequest| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx
+                        .send((
+                            req.header.uri.clone(),
+                            req.http.content.clone().unwrap_or_default(),
+                        ))
+                        .await;
+                    // §5.2.2.4.4.1 step 2a (`29518-k00.txt:4415`): "On success,
+                    // "204 No Content" shall be returned".
+                    nextgcore_sbi::SbiResponse::no_content()
+                }
+            })
+            .await
+            .expect("PWS notify sink start");
+        (server, format!("http://127.0.0.1:{port}/pws-notify"), rx)
+    }
+
+    /// Register a PWS subscription directly on the context, the way the router arm
+    /// does. Returns the minted id.
+    fn add_pws_subscription(
+        class: &str,
+        callback_uri: &str,
+        nf_id: Option<&str>,
+        subscription_id: &str,
+    ) -> String {
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            guard.non_ue_n2_subscription_add(crate::context::NonUeN2InfoSubscription {
+                subscription_id: subscription_id.to_string(),
+                n2_information_class: class.to_string(),
+                n2_notify_callback_uri: callback_uri.to_string(),
+                nf_id: nf_id.map(String::from),
+                notif_correlation_id: Some(format!("corr-{subscription_id}")),
+                global_ran_node_gnb_ids: Vec::new(),
+                an_type_list: Vec::new(),
+                supported_features: None,
+            }),
+            "the test subscription id must be unique"
+        );
+        subscription_id.to_string()
+    }
+
+    /// Drop a subscription by id (the store is process-global).
+    fn drop_pws_subscription(subscription_id: &str) {
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        guard.non_ue_n2_subscription_remove(subscription_id);
+    }
+
+    /// Criterion 2 + criterion 3 + criterion 6, end to end.
+    ///
+    /// A gNB-produced WRITE-REPLACE WARNING RESPONSE goes through the REAL
+    /// `process_ngap_message` dispatch (which had no arm for procedure 51 before
+    /// this and answered `ErrorIndication(AbstractSyntaxErrorReject)` from the `_`
+    /// fallthrough), and the notification that comes out the other side is asserted
+    /// **as delivered over HTTP** to a subscribed consumer's callback.
+    ///
+    /// Positive assertions throughout: the specific RAN's identity and the specific
+    /// outcome values, not "no error occurred".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_write_replace_warning_response_notifies_the_subscribed_consumer() {
+        let _ctx_guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let (_sink, callback_uri, mut rx) = start_pws_notify_sink().await;
+
+        // Distinct literal identifiers: the sendRanResponse map is keyed on the pair
+        // and process-global, so a shared pair would let a sibling test answer.
+        let (mid, sn) = (0x1399u16, 0x2399u16);
+        let nf_id = "cbcf-399-resp";
+        let sub_id = add_pws_subscription("PWS-BCAL", &callback_uri, Some(nf_id), "sub-399-resp");
+
+        // The gNB that answers. Its identity is the ONLY source for `ranNodeId`:
+        // a WRITE-REPLACE WARNING RESPONSE carries no Global RAN Node ID IE
+        // (TS 38.413 §9.2.8.2, `38413-j30.txt:15916-15939`).
+        let association_id = 3991u64;
+        insert_pws_test_gnb(
+            &ngap,
+            association_id,
+            0xABCD,
+            crate::context::RatType::Nr,
+            &[("001", "01", 0x74)],
+        )
+        .await;
+        // `gnb_id_len` is what NG Setup stores (#399); set it as the real handler
+        // would so the rendered `bitLength` is the node's own.
+        ngap.sessions
+            .write()
+            .await
+            .get_mut(&association_id)
+            .expect("session")
+            .gnb
+            .gnb_id_len = 32;
+
+        // The transfer asked for the RAN response (§5.2.2.4.4.3 item 1's condition).
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.pws_response_request_set(
+                mid,
+                sn,
+                crate::context::PwsResponseRequest {
+                    send_ran_response: true,
+                    nf_id: Some(nf_id.to_string()),
+                    procedure_code: 51,
+                },
+            );
+        }
+
+        // A conformant response as the gNB would build it, with a real completed
+        // area list.
+        let pdu = nextgcore_ngap::builder::build_write_replace_warning_response(
+            &nextgcore_ngap::types::WriteReplaceWarningResponse {
+                message_identifier: mid,
+                serial_number: sn,
+                broadcast_completed_area_list: Some(
+                    nextgcore_ngap::types::BroadcastCompletedAreaList::CellIdNr(vec![
+                        nextgcore_ngap::types::NrCgi {
+                            plmn_identity: [0x00, 0xF1, 0x10],
+                            nr_cell_identity: 0x399,
+                        },
+                    ]),
+                ),
+                criticality_diagnostics: None,
+            },
+        )
+        .expect("build WRITE-REPLACE WARNING RESPONSE");
+        // Byte 0 is the PDU-type CHOICE index and byte 1 the procedure code. A
+        // response is a SuccessfulOutcome (0x20) of procedure 51
+        // (`38413-j30.txt:59115`) -- the pair the new dispatch arm keys on.
+        assert_eq!(pdu[0], 0x20, "byte 0 must be the SuccessfulOutcome index");
+        assert_eq!(pdu[1], 51, "byte 1 must be procedure code 51");
+
+        // THE REAL DISPATCH.
+        ngap.process_ngap_message(association_id, &pdu)
+            .await
+            .expect("procedure 51 must dispatch, not error");
+
+        let (uri, body) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the consumer must receive an n2InfoNotify within 5s")
+            .expect("notify channel closed");
+        assert!(
+            uri.ends_with("/pws-notify"),
+            "the notification must go to the subscription's own callback URI, got {uri}"
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).expect("jsonData is JSON");
+
+        assert_eq!(
+            json["n2NotifySubscriptionId"].as_str(),
+            Some(sub_id.as_str())
+        );
+        // §6.1.6.4.3.3 Table 6.1.6.4.3.3-2 puts the two RESPONSES in PWS-BCAL.
+        assert_eq!(
+            json["n2InfoContainer"]["n2InformationClass"].as_str(),
+            Some("PWS-BCAL")
+        );
+        // The RAN's own identifiers, lifted out of the decoded response.
+        assert_eq!(
+            json["n2InfoContainer"]["pwsInfo"]["messageIdentifier"].as_u64(),
+            Some(mid as u64)
+        );
+        assert_eq!(
+            json["n2InfoContainer"]["pwsInfo"]["serialNumber"].as_u64(),
+            Some(sn as u64)
+        );
+        // THIS gNB, not "a gNB": the specific RAN identity the criterion asks for.
+        assert_eq!(
+            json["ranNodeId"]["gNbId"]["gNBValue"].as_str(),
+            Some("0000ABCD"),
+            "the responding node's identity comes from the live session map"
+        );
+        assert_eq!(json["ranNodeId"]["gNbId"]["bitLength"].as_u64(), Some(32));
+        assert_eq!(json["ranNodeId"]["plmnId"]["mcc"].as_str(), Some("001"));
+        // The area list WAS present, so bcEmptyAreaList must be absent: asserting it
+        // would tell the CBCF the broadcast reached nowhere.
+        assert!(
+            json["n2InfoContainer"]["pwsInfo"]["bcEmptyAreaList"].is_null(),
+            "bcEmptyAreaList is only for a response that OMITTED its area list"
+        );
+        assert_eq!(
+            json["notifCorrelationId"].as_str(),
+            Some("corr-sub-399-resp")
+        );
+        assert_eq!(
+            json["n2InfoContainer"]["pwsInfo"]["nfId"].as_str(),
+            Some(nf_id)
+        );
+        // The container reference points at the binary part carrying the gNB's PDU.
+        assert_eq!(
+            json["n2InfoContainer"]["pwsInfo"]["pwsContainer"]["ngapData"]["contentId"].as_str(),
+            Some(crate::namf_server::NON_UE_N2_INFO_NOTIFY_PWS_CONTENT_ID)
+        );
+        assert_eq!(
+            json["n2InfoContainer"]["pwsInfo"]["pwsContainer"]["ngapMessageType"].as_u64(),
+            Some(51)
+        );
+
+        drop_pws_subscription(&sub_id);
+    }
+
+    /// A response that omitted its Broadcast Completed Area List must name the
+    /// responding node in `bcEmptyAreaList` — §5.2.2.4.4.3's imperative
+    /// ("the AMF **shall** include the NG-RAN node ID(s)",
+    /// `29518-k00.txt:4468-4471`), as opposed to the aggregation "may" this path
+    /// declines. A PWS CANCEL RESPONSE (procedure 32) is used, so the other half of
+    /// the shared dispatch arm is exercised too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_response_without_an_area_list_reports_bc_empty_area_list_over_the_wire() {
+        let _ctx_guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let (_sink, callback_uri, mut rx) = start_pws_notify_sink().await;
+
+        let (mid, sn) = (0x3399u16, 0x4399u16);
+        // No nfId on either side: a subscription that named no instance serves any
+        // request, which is the (None, _) arm of the fail-closed match.
+        let sub_id = add_pws_subscription("PWS", &callback_uri, None, "sub-399-empty");
+
+        let association_id = 3992u64;
+        insert_pws_test_gnb(
+            &ngap,
+            association_id,
+            0x777,
+            crate::context::RatType::Nr,
+            &[("001", "01", 0x74)],
+        )
+        .await;
+        ngap.sessions
+            .write()
+            .await
+            .get_mut(&association_id)
+            .expect("session")
+            .gnb
+            .gnb_id_len = 22;
+
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.pws_response_request_set(
+                mid,
+                sn,
+                crate::context::PwsResponseRequest {
+                    send_ran_response: true,
+                    nf_id: None,
+                    procedure_code: 32,
+                },
+            );
+        }
+
+        let pdu = nextgcore_ngap::builder::build_pws_cancel_response(
+            &nextgcore_ngap::types::PwsCancelResponse {
+                message_identifier: mid,
+                serial_number: sn,
+                broadcast_cancelled_area_list: None,
+                criticality_diagnostics: None,
+            },
+        )
+        .expect("build PWS CANCEL RESPONSE");
+        assert_eq!(pdu[0], 0x20);
+        assert_eq!(pdu[1], 32, "id-PWSCancel = 32 (`38413-j30.txt:59077`)");
+
+        ngap.process_ngap_message(association_id, &pdu)
+            .await
+            .expect("procedure 32 must dispatch");
+
+        let (_uri, body) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the consumer must receive an n2InfoNotify")
+            .expect("notify channel closed");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("json");
+
+        // The umbrella PWS subscription's own class is echoed, not PWS-BCAL: the
+        // notification reports which subscription is being served.
+        assert_eq!(
+            json["n2InfoContainer"]["n2InformationClass"].as_str(),
+            Some("PWS")
+        );
+        let empty = &json["n2InfoContainer"]["pwsInfo"]["bcEmptyAreaList"];
+        assert!(
+            empty.is_array() && empty.as_array().map(Vec::len) == Some(1),
+            "the node that answered with no area list must be NAMED, not merely counted: {empty}"
+        );
+        assert_eq!(
+            empty[0]["gNbId"]["gNBValue"].as_str(),
+            Some("000777"),
+            "a 22-bit gNB ID renders as SIX nibbles (TS 29.571 `^[A-Fa-f0-9]{{6,8}}$`)"
+        );
+        assert_eq!(empty[0]["gNbId"]["bitLength"].as_u64(), Some(22));
+        assert_eq!(
+            json["n2InfoContainer"]["pwsInfo"]["pwsContainer"]["ngapMessageType"].as_u64(),
+            Some(32)
+        );
+
+        drop_pws_subscription(&sub_id);
+    }
+
+    /// Both negative halves of the response gate, asserted separately so one guard
+    /// cannot pass the test for the other's reason:
+    ///
+    /// 1. no `sendRanResponse` record -> no notification, even with a subscription.
+    ///    §5.2.2.4.4.3 item 1 conditions the response notify on the request having
+    ///    asked for it.
+    /// 2. a recorded request but NO subscription -> no notification. "no invented
+    ///    consumer", which is criterion 3's second half.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_pws_response_is_not_notified_without_send_ran_response_or_a_subscription() {
+        let _ctx_guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let (_sink, callback_uri, mut rx) = start_pws_notify_sink().await;
+
+        let association_id = 3993u64;
+        insert_pws_test_gnb(
+            &ngap,
+            association_id,
+            0x555,
+            crate::context::RatType::Nr,
+            &[("001", "01", 0x74)],
+        )
+        .await;
+
+        // --- (1) subscription present, no sendRanResponse record ---
+        let (mid1, sn1) = (0x5399u16, 0x6399u16);
+        let sub_id = add_pws_subscription("PWS-BCAL", &callback_uri, None, "sub-399-neg");
+        let pdu1 = nextgcore_ngap::builder::build_write_replace_warning_response(
+            &nextgcore_ngap::types::WriteReplaceWarningResponse {
+                message_identifier: mid1,
+                serial_number: sn1,
+                broadcast_completed_area_list: None,
+                criticality_diagnostics: None,
+            },
+        )
+        .expect("build response");
+        ngap.process_ngap_message(association_id, &pdu1)
+            .await
+            .expect("dispatch");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), rx.recv())
+                .await
+                .is_err(),
+            "a response nobody asked for must NOT be notified, even to a live subscription"
+        );
+        drop_pws_subscription(&sub_id);
+
+        // --- (2) sendRanResponse recorded, no subscription at all ---
+        let (mid2, sn2) = (0x7399u16, 0x8399u16);
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.pws_response_request_set(
+                mid2,
+                sn2,
+                crate::context::PwsResponseRequest {
+                    send_ran_response: true,
+                    nf_id: Some("cbcf-399-absent".to_string()),
+                    procedure_code: 51,
+                },
+            );
+            assert!(
+                guard
+                    .non_ue_n2_subscription_find_by_class("PWS-BCAL", Some("cbcf-399-absent"))
+                    .is_none(),
+                "this half needs the subscription genuinely absent"
+            );
+        }
+        let pdu2 = nextgcore_ngap::builder::build_write_replace_warning_response(
+            &nextgcore_ngap::types::WriteReplaceWarningResponse {
+                message_identifier: mid2,
+                serial_number: sn2,
+                broadcast_completed_area_list: None,
+                criticality_diagnostics: None,
+            },
+        )
+        .expect("build response");
+        ngap.process_ngap_message(association_id, &pdu2)
+            .await
+            .expect("dispatch");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), rx.recv())
+                .await
+                .is_err(),
+            "with no subscription the AMF must not invent a consumer"
+        );
+    }
+
+    /// The two INDICATIONS (procedures 34 and 33) notify on `PWS-RF`, unconditionally
+    /// on any prior request — §5.2.2.4.4.3 item 2 is a "shall" with nothing to
+    /// correlate to (`29518-k00.txt:4490-4493`) — and take `ranNodeId` from the
+    /// PDU's own mandatory Global RAN Node ID IE (`38413-j30.txt:16031`).
+    ///
+    /// The PDU's gNB ID is deliberately DIFFERENT from the session's, so a
+    /// session-derived `ranNodeId` fails this test. That is the distinction between
+    /// the two halves of the receive path: a response has no node ID to read, an
+    /// indication does, and the indication's own word wins.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pws_restart_and_failure_indications_notify_on_pws_rf_with_the_pdus_own_node_id() {
+        let _ctx_guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let (_sink, callback_uri, mut rx) = start_pws_notify_sink().await;
+
+        let sub_id = add_pws_subscription("PWS-RF", &callback_uri, None, "sub-399-ind");
+
+        // Session gNB 0x111; the PDUs claim 0x222.
+        let association_id = 3994u64;
+        insert_pws_test_gnb(
+            &ngap,
+            association_id,
+            0x111,
+            crate::context::RatType::Nr,
+            &[("001", "01", 0x74)],
+        )
+        .await;
+
+        let pdu_node = nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId {
+            plmn_identity: [0x00, 0xF1, 0x10],
+            gnb_id: 0x222,
+            gnb_id_len: 32,
+        };
+
+        // --- PWS RESTART INDICATION, procedure 34 ---
+        let restart = nextgcore_ngap::builder::build_pws_restart_indication(
+            &nextgcore_ngap::types::PwsRestartIndication {
+                cell_list: nextgcore_ngap::types::PwsCellList::Nr(vec![
+                    nextgcore_ngap::types::NrCgi {
+                        plmn_identity: [0x00, 0xF1, 0x10],
+                        nr_cell_identity: 0x399,
+                    },
+                ]),
+                global_ran_node_id: pdu_node.clone(),
+                tai_list_for_restart: vec![nextgcore_ngap::types::TaiListItem {
+                    tai_plmn: [0x00, 0xF1, 0x10],
+                    tai_tac: [0x00, 0x00, 0x74],
+                }],
+                emergency_area_id_list_for_restart: Vec::new(),
+            },
+        )
+        .expect("build PWS RESTART INDICATION");
+        // An indication is an InitiatingMessage (0x00) of procedure **34** -- NOT 33.
+        // The ASN.1 table is alphabetical (Failure 33, Restart 34), the reverse of
+        // the clause order (Restart §9.2.8.5, Failure §9.2.8.6).
+        assert_eq!(restart[0], 0x00, "an indication is an InitiatingMessage");
+        assert_eq!(
+            restart[1], 34,
+            "id-PWSRestartIndication = 34 (`38413-j30.txt:59081`)"
+        );
+
+        ngap.process_ngap_message(association_id, &restart)
+            .await
+            .expect("procedure 34 must dispatch");
+
+        let (_uri, body) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a restart indication must be forwarded (§5.2.2.4.4.3 item 2 is a shall)")
+            .expect("channel closed");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(
+            json["n2InfoContainer"]["n2InformationClass"].as_str(),
+            Some("PWS-RF"),
+            "indications go to PWS-RF (Table 6.1.6.4.3.3-3), never PWS-BCAL"
+        );
+        assert_eq!(
+            json["ranNodeId"]["gNbId"]["gNBValue"].as_str(),
+            Some("00000222"),
+            "the indication's OWN Global RAN Node ID wins over the session's (0x111)"
+        );
+        assert_eq!(
+            json["n2InfoContainer"]["pwsInfo"]["pwsContainer"]["ngapMessageType"].as_u64(),
+            Some(34)
+        );
+        // An indication is not about one warning, so the mandatory PwsInformation
+        // identifiers are 0/0 rather than a fabricated pair.
+        assert_eq!(
+            json["n2InfoContainer"]["pwsInfo"]["messageIdentifier"].as_u64(),
+            Some(0)
+        );
+        assert_eq!(
+            json["n2InfoContainer"]["pwsInfo"]["serialNumber"].as_u64(),
+            Some(0)
+        );
+        // `bcEmptyAreaList` belongs to a RESPONSE that omitted its area list; an
+        // indication has no area list to omit.
+        assert!(json["n2InfoContainer"]["pwsInfo"]["bcEmptyAreaList"].is_null());
+
+        // --- PWS FAILURE INDICATION, procedure 33 ---
+        let failure = nextgcore_ngap::builder::build_pws_failure_indication(
+            &nextgcore_ngap::types::PwsFailureIndication {
+                failed_cell_list: nextgcore_ngap::types::PwsCellList::Nr(vec![
+                    nextgcore_ngap::types::NrCgi {
+                        plmn_identity: [0x00, 0xF1, 0x10],
+                        nr_cell_identity: 0x39A,
+                    },
+                ]),
+                global_ran_node_id: pdu_node,
+            },
+        )
+        .expect("build PWS FAILURE INDICATION");
+        assert_eq!(failure[0], 0x00);
+        assert_eq!(
+            failure[1], 33,
+            "id-PWSFailureIndication = 33 (`38413-j30.txt:59079`)"
+        );
+
+        ngap.process_ngap_message(association_id, &failure)
+            .await
+            .expect("procedure 33 must dispatch");
+
+        let (_uri, body) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a failure indication must be forwarded")
+            .expect("channel closed");
+        let json: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(
+            json["n2InfoContainer"]["pwsInfo"]["pwsContainer"]["ngapMessageType"].as_u64(),
+            Some(33),
+            "33 and 34 must not be swapped -- the alphabetical ASN.1 table inverts the \
+             clause order"
+        );
+        assert_eq!(
+            json["ranNodeId"]["gNbId"]["gNBValue"].as_str(),
+            Some("00000222")
+        );
+
+        drop_pws_subscription(&sub_id);
+    }
+
+    /// An indication with NO `PWS-RF`/`PWS` subscription is dropped and, critically,
+    /// is **not** answered with an Error Indication: the indications are class-2
+    /// NG-RAN-initiated procedures the AMF never answers on N2. Before #399 they
+    /// fell to the `_` fallthrough, which told a conformant gNB the AMF does not
+    /// implement PWS at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_indication_without_a_subscription_is_dropped_not_error_indicated() {
+        let _ctx_guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+
+        let association_id = 3995u64;
+        insert_pws_test_gnb(
+            &ngap,
+            association_id,
+            0x888,
+            crate::context::RatType::Nr,
+            &[("001", "01", 0x74)],
+        )
+        .await;
+
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                guard
+                    .non_ue_n2_subscription_find_by_class("PWS-RF", None)
+                    .is_none(),
+                "this test needs no PWS-RF/PWS subscription registered"
+            );
+        }
+
+        let failure = nextgcore_ngap::builder::build_pws_failure_indication(
+            &nextgcore_ngap::types::PwsFailureIndication {
+                failed_cell_list: nextgcore_ngap::types::PwsCellList::Nr(vec![
+                    nextgcore_ngap::types::NrCgi {
+                        plmn_identity: [0x00, 0xF1, 0x10],
+                        nr_cell_identity: 0x39B,
+                    },
+                ]),
+                global_ran_node_id: nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId {
+                    plmn_identity: [0x00, 0xF1, 0x10],
+                    gnb_id: 0x888,
+                    gnb_id_len: 32,
+                },
+            },
+        )
+        .expect("build PWS FAILURE INDICATION");
+
+        // Reaching the PWS arm at all is the claim: the `_` fallthrough would have
+        // tried to SEND an ErrorIndication on this (synthetic) association.
+        ngap.process_ngap_message(association_id, &failure)
+            .await
+            .expect("an unsubscribed indication must be accepted and dropped, not errored");
+    }
+
+    /// Criterion 2, stated as the property it is: none of the four PWS procedures
+    /// reaches the `_` fallthrough's Error Indication any more, and each is keyed on
+    /// the RIGHT PDU-type byte.
+    ///
+    /// 51/32 arrive as SuccessfulOutcome (0x20) because they answer AMF-initiated
+    /// class-1 procedures; 34/33 arrive as InitiatingMessage (0x00) because the
+    /// indications are NG-RAN-initiated class-2. Keying either pair on the other's
+    /// byte would leave it falling through and still earning the Error Indication.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_four_pws_procedures_no_longer_reach_the_error_indication_fallthrough() {
+        let _ctx_guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+
+        let association_id = 3996u64;
+        insert_pws_test_gnb(
+            &ngap,
+            association_id,
+            0x999,
+            crate::context::RatType::Nr,
+            &[("001", "01", 0x74)],
+        )
+        .await;
+
+        let node = nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId {
+            plmn_identity: [0x00, 0xF1, 0x10],
+            gnb_id: 0x999,
+            gnb_id_len: 32,
+        };
+        let cell = vec![nextgcore_ngap::types::NrCgi {
+            plmn_identity: [0x00, 0xF1, 0x10],
+            nr_cell_identity: 0x399,
+        }];
+
+        // (pdu, expected byte 0, expected procedure code)
+        let fixtures: Vec<(Vec<u8>, u8, u8)> = vec![
+            (
+                nextgcore_ngap::builder::build_write_replace_warning_response(
+                    &nextgcore_ngap::types::WriteReplaceWarningResponse {
+                        message_identifier: 0x9399,
+                        serial_number: 0xA399,
+                        broadcast_completed_area_list: None,
+                        criticality_diagnostics: None,
+                    },
+                )
+                .expect("build"),
+                0x20,
+                51,
+            ),
+            (
+                nextgcore_ngap::builder::build_pws_cancel_response(
+                    &nextgcore_ngap::types::PwsCancelResponse {
+                        message_identifier: 0xB399,
+                        serial_number: 0xC399,
+                        broadcast_cancelled_area_list: None,
+                        criticality_diagnostics: None,
+                    },
+                )
+                .expect("build"),
+                0x20,
+                32,
+            ),
+            (
+                nextgcore_ngap::builder::build_pws_restart_indication(
+                    &nextgcore_ngap::types::PwsRestartIndication {
+                        cell_list: nextgcore_ngap::types::PwsCellList::Nr(cell.clone()),
+                        global_ran_node_id: node.clone(),
+                        tai_list_for_restart: vec![nextgcore_ngap::types::TaiListItem {
+                            tai_plmn: [0x00, 0xF1, 0x10],
+                            tai_tac: [0x00, 0x00, 0x74],
+                        }],
+                        emergency_area_id_list_for_restart: Vec::new(),
+                    },
+                )
+                .expect("build"),
+                0x00,
+                34,
+            ),
+            (
+                nextgcore_ngap::builder::build_pws_failure_indication(
+                    &nextgcore_ngap::types::PwsFailureIndication {
+                        failed_cell_list: nextgcore_ngap::types::PwsCellList::Nr(cell),
+                        global_ran_node_id: node,
+                    },
+                )
+                .expect("build"),
+                0x00,
+                33,
+            ),
+        ];
+
+        for (pdu, expect_byte0, expect_code) in fixtures {
+            assert_eq!(
+                pdu[0], expect_byte0,
+                "procedure {expect_code}: byte 0 carries the PDU-type CHOICE index"
+            );
+            assert_eq!(
+                pdu[1], expect_code,
+                "procedure {expect_code}: byte 1 carries the procedure code"
+            );
+            // The dispatch takes the PWS arm and returns Ok. The `_` fallthrough
+            // would attempt an ErrorIndication send on this synthetic association.
+            ngap.process_ngap_message(association_id, &pdu)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("procedure {expect_code} must dispatch to the PWS arm: {e}")
+                });
+            // And the extractor really reads that code, so the arm matched on the
+            // value the assertions above pinned.
+            assert_eq!(
+                ngap.extract_procedure_code(&pdu),
+                Some(expect_code as u16),
+                "procedure {expect_code} must be extracted from byte 1"
+            );
+        }
     }
 
     /// A relay that matches no connected node is consumed and WARNed, not

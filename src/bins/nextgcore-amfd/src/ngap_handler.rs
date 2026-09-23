@@ -348,6 +348,12 @@ pub fn handle_ng_setup_request(
     // Store gNB ID
     gnb.gnb_id = request.gnb_id;
     gnb.gnb_id_presence = true;
+    // #399: the bit length too, not just the value. `GNbId` in TS 29.571 requires
+    // BOTH `bitLength` and `gNBValue` (`TS29571_CommonData.yaml:2911-2913`), so
+    // the `ranNodeId` of a PWS `n2InfoNotify` cannot be rendered without it. The
+    // NG SETUP REQUEST decoder had always recovered it into
+    // `NgSetupRequest.gnb_id_len`; this handler used to discard it.
+    gnb.gnb_id_len = request.gnb_id_len;
     gnb.plmn_id = request.plmn_id.clone();
 
     // Validate Supported TA List

@@ -155,6 +155,39 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
         }
 
         // --------------------------------------------------------------
+        // Namf_Communication NonUeN2InfoSubscribe / NonUeN2InfoUnSubscribe
+        // (TS 29.518 §5.2.2.4.2 / §5.2.2.4.3), #399. A CBCF/PWS-IWF subscribes so
+        // the AMF tells it what each NG-RAN node answered to a warning.
+        //   POST   /namf-comm/v1/non-ue-n2-messages/subscriptions
+        //   DELETE /namf-comm/v1/non-ue-n2-messages/subscriptions/{n2NotifySubscriptionId}
+        //
+        // The resource URI is the spec's, NOT #399's prose. §6.1.3.9.2
+        // (`29518-k00.txt:9962`) and §6.1.3.10.2 (`:10111`) both put the
+        // collection at `non-ue-n2-messages/subscriptions` — a SIBLING of
+        // `transfer` above — and `grep -n "non-ue-n2"
+        // TS29518_Namf_Communication.yaml` returns exactly those three paths
+        // (`:1718`, `:1921`, `:2123`). The `non-ue-n2-info-subscriptions`
+        // spelling appears nowhere in TS 29.518; serving it would expose an
+        // endpoint no conformant consumer ever calls.
+        //
+        // This arm sits AFTER the transfer arm and is disjoint from it on
+        // `parts[3]`, so neither shadows the other (the shadowing hazard #74
+        // recorded for two `ue-contexts` arms).
+        // --------------------------------------------------------------
+        // `parts.get(3)`, not `parts[3]`: the guard above only proves
+        // `parts.len() >= 3`, so indexing would panic on
+        // `/namf-comm/v1/non-ue-n2-messages`.
+        "namf-comm"
+            if parts[2] == "non-ue-n2-messages" && parts.get(3) == Some(&"subscriptions") =>
+        {
+            match (method, parts.len()) {
+                ("POST", 4) => handle_non_ue_n2_info_subscribe(&request),
+                ("DELETE", 5) => handle_non_ue_n2_info_unsubscribe(parts[4]),
+                _ => send_method_not_allowed(method, path),
+            }
+        }
+
+        // --------------------------------------------------------------
         // Namf_Communication AMFStatusChange subscriptions (TS 29.518 §5.2.2.5.1),
         // #74. A consumer subscribes so it is told when this AMF's availability or
         // GUAMI service changes — the AMF planned-removal procedure (TS 23.501
@@ -1923,6 +1956,187 @@ pub fn send_n2_info_notify(
             Err(e) => log::warn!("N2InfoNotify to {callback_uri} failed: {e}"),
         }
     });
+}
+
+/// Content-Id of the binary PWS part inside a non-UE `n2InfoNotify` multipart
+/// body (referenced from
+/// `n2InfoContainer.pwsInfo.pwsContainer.ngapData.contentId`).
+pub(crate) const NON_UE_N2_INFO_NOTIFY_PWS_CONTENT_ID: &str = "pws";
+
+/// Build the multipart Namf_Communication **NonUeN2InfoNotify** callback POST
+/// (#399, TS 29.518 §5.2.2.4.4, callback `onN2InfoNotify` on
+/// `{$request.body#/n2NotifyCallbackUri}` —
+/// `TS29518_Namf_Communication.yaml:2041-2060`): jsonData is an
+/// `N2InformationNotification` (`yaml:2637-2679`, `n2NotifySubscriptionId`
+/// mandatory) whose `n2InfoContainer` carries the PWS class and a
+/// `PwsInformation`, with the NG-RAN's own PDU as a `binaryDataN2Information`
+/// part.
+///
+/// ## The RAN's bytes go out verbatim
+///
+/// §6.1.6.4.3.3 (`29518-k00.txt:19069-19077`) *permits* the AMF to aggregate the
+/// area lists from several nodes and "transfer the ASN.1 (re-)encoded" result. It
+/// is a "may", and it is declined: re-encoding through a partial model drops every
+/// IE the gNB sent that this build does not represent — the same reasoning that
+/// made the forward relay verbatim in #396/#401, applied in the notification
+/// direction. §5.2.2.4.4.1 (`:4416`) and §5.2.2.4.4.3 (`:4478`) both provide for
+/// "one (or more) NonUEN2InfoNotify request(s)", so one notify per responding node
+/// is conformant.
+///
+/// ## `bcEmptyAreaList` is the one thing the AMF composes
+///
+/// Because the spec orders it in the imperative, not the permissive
+/// (§5.2.2.4.4.3, `:4468-4471`): "If the NG-RAN node(s) have responded **without**
+/// the Broadcast Completed Area List IE then the AMF **shall** include the NG-RAN
+/// node ID(s) in "bcEmptyAreaList" attribute in the request body." Both inputs are
+/// honestly held — whether the list was present comes from decoding the PDU, and
+/// which node answered comes from the SCTP association (a WRITE-REPLACE WARNING
+/// RESPONSE carries no Global RAN Node ID at all, `38413-j30.txt:15916-15939`).
+///
+/// `ran_node_id` is the `GlobalRanNodeId` JSON of the responding node
+/// (`N2InformationNotification.ranNodeId`, `yaml:2659`).
+pub(crate) fn build_non_ue_n2_info_notify_request(
+    path: &str,
+    n2_notify_subscription_id: &str,
+    n2_information_class: &str,
+    message_identifier: u16,
+    serial_number: u16,
+    ran_node_id: &Value,
+    bc_empty_area_list: bool,
+    nf_id: Option<&str>,
+    notif_correlation_id: Option<&str>,
+    ngap_pdu: &[u8],
+) -> Result<SbiRequest, serde_json::Error> {
+    // `messageIdentifier`, `serialNumber` and `pwsContainer` are the three
+    // required members of `PwsInformation` (`yaml:3298-3300`).
+    let mut pws_info = json!({
+        "messageIdentifier": message_identifier,
+        "serialNumber": serial_number,
+        "pwsContainer": {
+            "ngapMessageType": ngap_pdu.get(1).copied().unwrap_or(0),
+            "ngapData": { "contentId": NON_UE_N2_INFO_NOTIFY_PWS_CONTENT_ID },
+        },
+    });
+    if bc_empty_area_list {
+        // `minItems: 1` (`yaml:3287`), so this is only ever set with the node in
+        // it — an empty array would be a schema violation dressed as information.
+        pws_info["bcEmptyAreaList"] = json!([ran_node_id]);
+    }
+    if let Some(nf_id) = nf_id {
+        pws_info["nfId"] = json!(nf_id);
+    }
+    let mut notification = json!({
+        "n2NotifySubscriptionId": n2_notify_subscription_id,
+        "n2InfoContainer": {
+            "n2InformationClass": n2_information_class,
+            "pwsInfo": pws_info,
+        },
+        "ranNodeId": ran_node_id,
+    });
+    if let Some(corr) = notif_correlation_id {
+        notification["notifCorrelationId"] = json!(corr);
+    }
+    Ok(SbiRequest::post(path)
+        .with_json_body(&notification)?
+        .with_part(SbiPart::with_content(
+            NON_UE_N2_INFO_NOTIFY_PWS_CONTENT_ID,
+            nextgcore_sbi::constants::content_type::APPLICATION_NGAP,
+            bytes::Bytes::copy_from_slice(ngap_pdu),
+        )))
+}
+
+/// POST a NonUeN2InfoNotify to a PWS consumer's registered
+/// `n2NotifyCallbackUri` (#399, TS 29.518 §5.2.2.4.4). Fire-and-forget on a
+/// background task with bounded timeouts, exactly like [`send_n2_info_notify`] —
+/// a notify failure is logged and never surfaced toward the gNB, which is not
+/// waiting on it (both the responses and the indications are class-2/terminated
+/// NGAP procedures at this point).
+///
+/// §5.2.2.4.4.1 step 2a (`29518-k00.txt:4415-4417`) makes the success answer
+/// "204 No Content", so any 2xx is accepted and anything else is a WARN.
+#[allow(clippy::too_many_arguments)]
+pub fn send_non_ue_n2_info_notify(
+    callback_uri: String,
+    n2_notify_subscription_id: String,
+    n2_information_class: String,
+    message_identifier: u16,
+    serial_number: u16,
+    ran_node_id: Value,
+    bc_empty_area_list: bool,
+    nf_id: Option<String>,
+    notif_correlation_id: Option<String>,
+    ngap_pdu: Vec<u8>,
+) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        log::debug!("NonUeN2InfoNotify skipped (no tokio runtime)");
+        return;
+    };
+    handle.spawn(async move {
+        let Some((host, port, path)) = parse_http_uri(&callback_uri) else {
+            log::warn!("Invalid n2NotifyCallbackUri: {callback_uri}");
+            return;
+        };
+        let request = match build_non_ue_n2_info_notify_request(
+            &path,
+            &n2_notify_subscription_id,
+            &n2_information_class,
+            message_identifier,
+            serial_number,
+            &ran_node_id,
+            bc_empty_area_list,
+            nf_id.as_deref(),
+            notif_correlation_id.as_deref(),
+            &ngap_pdu,
+        ) {
+            Ok(req) => req,
+            Err(e) => {
+                log::warn!("NonUeN2InfoNotify body build failed: {e}");
+                return;
+            }
+        };
+        let client = notify_client(&host, port);
+        match client.send_request(request).await {
+            Ok(resp) if resp.is_success() => {
+                log::info!(
+                    "NonUeN2InfoNotify ({n2_information_class}) delivered to {callback_uri} \
+                     (sub={n2_notify_subscription_id} \
+                     messageIdentifier={message_identifier:#06x} \
+                     serialNumber={serial_number:#06x})"
+                );
+            }
+            Ok(resp) => {
+                log::warn!(
+                    "NonUeN2InfoNotify to {callback_uri} returned {} \
+                     (sub={n2_notify_subscription_id})",
+                    resp.status
+                );
+            }
+            Err(e) => log::warn!("NonUeN2InfoNotify to {callback_uri} failed: {e}"),
+        }
+    });
+}
+
+/// Render a `GlobalRanNodeId` (TS 29.571, `TS29571_CommonData.yaml:2859-2884`)
+/// for an NG-RAN node the AMF knows by PLMN + gNB ID.
+///
+/// `GNbId` requires BOTH `bitLength` and `gNBValue` (`:2911-2913`), and
+/// `gNBValue` is hex with an even number of nibbles, 6 to 8 characters
+/// (`^[A-Fa-f0-9]{6,8}$`). A 22-to-32-bit ID needs 6 nibbles below 24 bits and 8
+/// at or above, so the width is derived from the bit length rather than fixed —
+/// padding to 8 always would claim a 32-bit ID for a 22-bit node.
+pub(crate) fn global_ran_node_id_json(
+    plmn: &crate::context::PlmnId,
+    gnb_id: u32,
+    gnb_id_len: u8,
+) -> Value {
+    let nibbles = if gnb_id_len > 24 { 8 } else { 6 };
+    json!({
+        "plmnId": { "mcc": plmn.mcc(), "mnc": plmn.mnc() },
+        "gNbId": {
+            "bitLength": gnb_id_len,
+            "gNBValue": format!("{gnb_id:0width$X}", width = nibbles),
+        },
+    })
 }
 
 /// Content-Id of the binary N1 (LPP) part inside an N1MessageNotify multipart
@@ -4345,6 +4559,222 @@ async fn handle_mbs_n2_message_transfer(request: &SbiRequest) -> SbiResponse {
     }
 }
 
+/// The three N2 information classes a PWS consumer may subscribe to
+/// (TS 29.518 §5.2.2.4.2.2, `29518-k00.txt:4334-4336`: "to subscribe for
+/// notifications of N2 PWS information classes ("PWS", "PWS-BCAL" or
+/// "PWS-RF")"), all three of them members of `N2InformationClass`
+/// (`TS29518_Namf_Communication.yaml:4487-4499`).
+///
+/// `PWS-BCAL` carries the two RESPONSES and `PWS-RF` the two INDICATIONS
+/// (Tables 6.1.6.4.3.3-2 / -3, `29518-k00.txt:19055` / `:19108`); plain `PWS` is
+/// the umbrella a consumer may use for both.
+pub(crate) const PWS_N2_INFORMATION_CLASSES: [&str; 3] = ["PWS", "PWS-BCAL", "PWS-RF"];
+
+/// `POST /namf-comm/v1/non-ue-n2-messages/subscriptions` —
+/// Namf_Communication NonUeN2InfoSubscribe (TS 29.518 §5.2.2.4.2, resource
+/// §6.1.3.9, `NonUeN2InfoSubscriptionCreateData` at
+/// `TS29518_Namf_Communication.yaml:2570`), #399.
+///
+/// A CBCF/PWS-IWF creates one of these so the AMF can tell it what each NG-RAN
+/// node answered to a warning (§5.2.2.4.4.3). Until this resource existed, the
+/// transfer handler below had no subscription to find and returned the spec's
+/// `n2PwsSubMissInd: true` unconditionally; that signal is now conditional, which
+/// is what §5.2.2.4.1.3 (`29518-k00.txt:4175-4181`) actually prescribes.
+///
+/// Fail-closed, in the shape [`handle_n1n2_subscription_create`] already uses:
+/// both mandatory members must be present and the callback URI must be one the
+/// AMF can actually POST to, and only the three PWS classes are accepted —
+/// storing a class nothing in this AMF can ever notify would be a subscription
+/// that silently never fires.
+fn handle_non_ue_n2_info_subscribe(request: &SbiRequest) -> SbiResponse {
+    let Some(body) = parse_json_body(request) else {
+        return malformed_body();
+    };
+
+    // `n2InformationClass` and `n2NotifyCallbackUri` are the two required members
+    // (`yaml:2594-2596`; §6.1.6.2.10 marks both "M").
+    let Some(n2_information_class) = body.get("n2InformationClass").and_then(Value::as_str) else {
+        return mandatory_ie_missing("n2InformationClass");
+    };
+    let Some(n2_notify_callback_uri) = body.get("n2NotifyCallbackUri").and_then(Value::as_str)
+    else {
+        return mandatory_ie_missing("n2NotifyCallbackUri");
+    };
+
+    // The AMF must be able to POST the notification there, so an unparseable URI
+    // is rejected now rather than discovered at notify time when the consumer is
+    // no longer listening on an HTTP response.
+    if parse_http_uri(n2_notify_callback_uri).is_none() {
+        return mandatory_ie_incorrect("n2NotifyCallbackUri", "not a valid HTTP URI");
+    }
+
+    // Only the PWS classes are served. The other `N2InformationClass` values
+    // (`SM`, `NRPPa`, `RAN`, `V2X`, `PROSE`, `TSS`, `RSPP`, `A2X`) each need their
+    // own producer; `NRPPa` in particular is already served by the per-UE
+    // `n1-n2-messages/subscriptions` registry, so accepting it here would store a
+    // second subscription that nothing reads.
+    if !PWS_N2_INFORMATION_CLASSES.contains(&n2_information_class) {
+        return send_error(
+            403,
+            "Forbidden",
+            &format!(
+                "n2InformationClass '{n2_information_class}' is not served on this resource; \
+                 only the PWS classes {PWS_N2_INFORMATION_CLASSES:?} (TS 29.518 §5.2.2.4.2.2) are"
+            ),
+            Some("UNSPECIFIED"),
+        );
+    }
+
+    let nf_id = body
+        .get("nfId")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .filter(|s| !s.is_empty());
+
+    // `globalRanNodeList` / `anTypeList` are both conditional, and the NOTE at
+    // `29518-k00.txt:11913-11915` says absence of BOTH means "N2 information from
+    // all connected Access Network node(s) via any access type" — so empty here
+    // means "unrestricted", never "no nodes".
+    let global_ran_node_gnb_ids: Vec<u32> = body
+        .get("globalRanNodeList")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|node| {
+                    // `GNbId.gNBValue` is hex (TS 29.571, pattern
+                    // `^[A-Fa-f0-9]{6,8}$`), same parse as the transfer handler's.
+                    node.get("gNbId")
+                        .and_then(|g| g.get("gNBValue"))
+                        .and_then(Value::as_str)
+                        .and_then(|v| u32::from_str_radix(v, 16).ok())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let an_type_list: Vec<String> = body
+        .get("anTypeList")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let subscription_id = format!("nonuen2sub-{}", uuid::Uuid::new_v4());
+    let sub = crate::context::NonUeN2InfoSubscription {
+        subscription_id: subscription_id.clone(),
+        n2_information_class: n2_information_class.to_string(),
+        n2_notify_callback_uri: n2_notify_callback_uri.to_string(),
+        nf_id: nf_id.clone(),
+        notif_correlation_id: body
+            .get("notifCorrelationId")
+            .and_then(Value::as_str)
+            .map(String::from),
+        global_ran_node_gnb_ids,
+        an_type_list,
+        supported_features: body
+            .get("supportedFeatures")
+            .and_then(Value::as_str)
+            .map(String::from),
+    };
+
+    let ctx = amf_self();
+    let added = {
+        let Ok(guard) = ctx.read() else {
+            return send_error(500, "Internal Server Error", "context lock poisoned", None);
+        };
+        // §5.2.2.4.2.2 item 2 (`29518-k00.txt:4351-4356`): "the AMF may remove any
+        // duplicated subscription, i.e. an existing subscription from the same NF
+        // consumer (identified by the NF instance ID) for notification of the same
+        // N2 PWS information class". Taken, because leaving both would make the
+        // find-by-class tie-break decide which of a consumer's own duplicates
+        // wins. Only done when an nfId identifies the consumer — without one there
+        // is no way to know two subscriptions came from the same instance.
+        if let Some(nf) = nf_id.as_deref() {
+            if let Some(dup) =
+                guard.non_ue_n2_subscription_find_by_class_exact(n2_information_class, Some(nf))
+            {
+                log::info!(
+                    "NonUeN2InfoSubscribe: replacing duplicate subscription {} from nfId {nf} \
+                     for class {n2_information_class} (TS 29.518 §5.2.2.4.2.2)",
+                    dup.subscription_id
+                );
+                guard.non_ue_n2_subscription_remove(&dup.subscription_id);
+            }
+        }
+        guard.non_ue_n2_subscription_add(sub)
+    };
+    if !added {
+        return send_error(
+            500,
+            "Internal Server Error",
+            "subscription ID collision",
+            None,
+        );
+    }
+
+    log::info!(
+        "NonUeN2InfoSubscribe: id={subscription_id} class={n2_information_class} \
+         callback={n2_notify_callback_uri} nfId={nf_id:?}"
+    );
+
+    // `NonUeN2InfoSubscriptionCreatedData` (`yaml:2597-2607`):
+    // `n2NotifySubscriptionId` mandatory, `n2InformationClass` and
+    // `supportedFeatures` optional. The class is echoed so the consumer can
+    // confirm which of the three the AMF actually registered.
+    let mut response_body = json!({
+        "n2NotifySubscriptionId": subscription_id,
+        "n2InformationClass": n2_information_class,
+    });
+    if let Some(features) = body.get("supportedFeatures").and_then(Value::as_str) {
+        response_body["supportedFeatures"] = json!(features);
+    }
+    // §6.1.3.9.3.1's 201 requires the Location header, whose structure is spelled
+    // out at `yaml:1945`:
+    // {apiRoot}/namf-comm/<apiVersion>/non-ue-n2-messages/subscriptions/{n2NotifySubscriptionId}
+    let location = format!("/namf-comm/v1/non-ue-n2-messages/subscriptions/{subscription_id}");
+    match SbiResponse::with_status(201).with_json_body(&response_body) {
+        Ok(resp) => resp.with_header("location", location),
+        Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
+    }
+}
+
+/// `DELETE /namf-comm/v1/non-ue-n2-messages/subscriptions/{n2NotifySubscriptionId}`
+/// — Namf_Communication NonUeN2InfoUnSubscribe (TS 29.518 §5.2.2.4.3, resource
+/// §6.1.3.10), #399.
+///
+/// 204 on success (§5.2.2.4.3.1 step 2, `29518-k00.txt:4378-4380`), or 404 with
+/// cause `SUBSCRIPTION_NOT_FOUND` — the cause §6.1.3.10.3.1's response table
+/// names for this condition (`:10170-10175`), which is NOT the
+/// `CONTEXT_NOT_FOUND` the per-UE unsubscribe uses.
+fn handle_non_ue_n2_info_unsubscribe(subscription_id: &str) -> SbiResponse {
+    let ctx = amf_self();
+    let removed = {
+        let Ok(guard) = ctx.read() else {
+            return send_error(500, "Internal Server Error", "context lock poisoned", None);
+        };
+        guard.non_ue_n2_subscription_remove(subscription_id)
+    };
+    match removed {
+        Some(sub) => {
+            log::info!(
+                "NonUeN2InfoUnSubscribe: removed {subscription_id} (class {})",
+                sub.n2_information_class
+            );
+            SbiResponse::no_content()
+        }
+        None => send_error(
+            404,
+            "Not Found",
+            &format!("Non-UE N2 information subscription '{subscription_id}' not found"),
+            Some("SUBSCRIPTION_NOT_FOUND"),
+        ),
+    }
+}
+
 /// `POST /namf-comm/v1/non-ue-n2-messages/transfer` — Namf_Communication
 /// NonUeN2MessageTransfer (TS 29.518 §5.2.2.4.1,
 /// `TS29518_Namf_Communication.yaml:1718`), for the **PWS** N2 information class
@@ -4581,19 +5011,70 @@ fn handle_non_ue_n2_message_transfer(request: &SbiRequest) -> SbiResponse {
     );
 
     // `sendRanResponse: true` asks the AMF to report the per-RAN-node outcome
-    // through the consumer's PWS N2 information subscription. This AMF serves no
-    // `non-ue-n2-info-subscriptions` resource, so that subscription genuinely
-    // cannot exist — which is the exact condition §5.2.2.4.1.3
-    // (`29518-k00.txt:4176-4181`) prescribes `n2PwsSubMissInd: true` for: "the
-    // AMF should include the n2PwsSubMissInd IE with the value 'true' in the
-    // response. When the NF service consumer receives the n2PwsSubMissInd IE set
-    // to 'true', it shall re-create the missing N2 information subscription".
-    // Answering the spec's own signal is the honest ceiling here; fabricating a
-    // per-RAN report would not be.
+    // through the consumer's PWS N2 information subscription
+    // (`29518-k00.txt:14712-14716`: "This IE shall be present to request the AMF
+    // to send the N2 response information it has received from the RAN nodes to
+    // the NF Service Consumer"). Default is false (`yaml:3291-3292`).
     let send_ran_response = pws_info
         .get("sendRanResponse")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+
+    // `pwsInfo.nfId` identifies WHICH CBCF/PWS-IWF instance asked, so the response
+    // goes to that instance's own subscription when several are deployed
+    // (`29518-k00.txt:14747-14760`).
+    let consumer_nf_id = pws_info
+        .get("nfId")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .filter(|s| !s.is_empty());
+
+    // §5.2.2.4.4.3 item 1 makes the RESPONSE notification conditional on the
+    // originating request having asked for it, and the WRITE-REPLACE WARNING
+    // RESPONSE that arrives minutes later on SCTP carries no trace of that ask
+    // (its IE table is Message Type / Message Identifier / Serial Number / the
+    // optional area list / Criticality Diagnostics — `38413-j30.txt:15916`). So
+    // record it against the warning's identity now. Only `true` is recorded:
+    // fail-closed, so a transfer that asked for nothing can never cause a notify.
+    let matched_subscription = if send_ran_response {
+        let Ok(guard) = ctx.read() else {
+            return send_error(
+                500,
+                "Internal Server Error",
+                "AMF context unavailable",
+                None,
+            );
+        };
+        guard.pws_response_request_set(
+            message_identifier as u16,
+            serial_number as u16,
+            crate::context::PwsResponseRequest {
+                send_ran_response: true,
+                nf_id: consumer_nf_id.clone(),
+                procedure_code: ngap_message_type,
+            },
+        );
+        // §6.1.6.4.3.3 routes the two RESPONSES through the `PWS-BCAL` class
+        // (Table 6.1.6.4.3.3-2, `29518-k00.txt:19055-19062`), with plain `PWS` as
+        // the umbrella.
+        guard
+            .non_ue_n2_subscription_find_by_class("PWS-BCAL", consumer_nf_id.as_deref())
+            .is_some()
+    } else {
+        false
+    };
+
+    // `omcId` asks the AMF to "write the n2Information it has received from the
+    // RAN nodes into trace records on the OMC" (`29518-k00.txt:14735-14742`).
+    // This deployment has no OMC and no trace-record writer, so the IE cannot be
+    // honoured. Said out loud rather than accepted silently: accepting it and not
+    // tracing would be the quieter lie of the two.
+    if let Some(omc_id) = pws_info.get("omcId").and_then(Value::as_str) {
+        log::warn!(
+            "Namf NonUeN2MessageTransfer (PWS): omcId '{omc_id}' received but NOT honoured — \
+             this AMF has no OMC trace-record writer (TS 29.518 §6.1.6.2.x omcId)"
+        );
+    }
 
     // `result` is the only required member of N2InformationTransferRspData
     // (`yaml:3359`). N2_INFO_TRANSFER_INITIATED is exactly what happened: the
@@ -4603,8 +5084,80 @@ fn handle_non_ue_n2_message_transfer(request: &SbiRequest) -> SbiResponse {
         "serialNumber": serial_number,
         "messageIdentifier": message_identifier,
     });
-    if send_ran_response {
+
+    // §5.2.2.4.1.3 (`29518-k00.txt:4175-4181`): "If the sendRanResponse IE with
+    // the value "true" was received in the request, BUT the corresponding N2
+    // information subscription for PWS information from the NF service consumer is
+    // not available in the AMF, the AMF should include the n2PwsSubMissInd IE with
+    // the value "true"". BOTH halves of that condition — which is why this is no
+    // longer unconditional on `sendRanResponse` as it was before #399: the AMF now
+    // serves `non-ue-n2-messages/subscriptions`, so the subscription CAN exist,
+    // and claiming it is missing when it is not would make a conformant consumer
+    // needlessly re-create a live subscription.
+    if send_ran_response && !matched_subscription {
         pws_rsp_data["n2PwsSubMissInd"] = Value::Bool(true);
+    }
+
+    // `unknownTaiList` (§6.1.6.2.46, `yaml:3786-3791`). Scoped to the PWS Cancel
+    // branch: §5.2.2.4.1.3 step 2a (`29518-k00.txt:4169-4173`) hangs the
+    // "optionally the unknown TAI List IE" option off the *Stop-Warning* Confirm
+    // response, not off the Write-Replace-Warning Confirm response.
+    //
+    // What it can honestly carry: the TAIs in `taiList` that this AMF does not
+    // SERVE AT ALL, read from the config-loaded `served_tai` (which, unlike
+    // `gnb_list`, has a real production writer at `lib.rs:520`). It deliberately
+    // does NOT try to report "TAIs no connected node served": that fact lives in
+    // the NGAP pump, which runs after this 200 is already on the wire, and
+    // `unknownTaiList` is a member of the SYNCHRONOUS response body
+    // (`PWSResponseData` has exactly one referent, `N2InformationTransferRspData.
+    // pwsRspData` at `yaml:3348`) — it is absent from `N2InformationNotification`
+    // (`yaml:2637-2679`), so it cannot ride the asynchronous notify either.
+    // Blocking the response on SCTP progress is what §5.2.2.4.1.3's echo
+    // semantics exist to avoid. A TAI the AMF does not serve can never match a
+    // served node, so it is an unknown TAI under any reading, and it IS knowable
+    // here.
+    if ngap_message_type == nextgcore_asn1c::ngap::types::ProcedureCode::PWS_CANCEL.0 {
+        let unknown: Vec<Value> = {
+            let Ok(guard) = ctx.read() else {
+                return send_error(
+                    500,
+                    "Internal Server Error",
+                    "AMF context unavailable",
+                    None,
+                );
+            };
+            target_tais
+                .iter()
+                .filter(|(plmn, tac)| {
+                    guard
+                        .find_served_tai(&crate::context::Tai5gs {
+                            plmn_id: plmn.clone(),
+                            tac: *tac,
+                        })
+                        .is_none()
+                })
+                .map(|(plmn, tac)| {
+                    // TS 29.571 `Tai`: `plmnId` + `tac`, where `Tac` is a 3- or
+                    // 6-hex-digit string. Rendered back in the same 6-digit hex
+                    // form the request's `tac` was parsed from.
+                    json!({
+                        "plmnId": { "mcc": plmn.mcc(), "mnc": plmn.mnc() },
+                        "tac": format!("{tac:06X}"),
+                    })
+                })
+                .collect()
+        };
+        if !unknown.is_empty() {
+            log::info!(
+                "Namf NonUeN2MessageTransfer (PWS Cancel): {} of {} taiList entries name TAIs \
+                 this AMF does not serve; reported as unknownTaiList",
+                unknown.len(),
+                target_tais.len(),
+            );
+            // `minItems: 1` (`yaml:3791`), so the IE is omitted rather than sent
+            // empty when every TAI was served.
+            pws_rsp_data["unknownTaiList"] = Value::Array(unknown);
+        }
     }
     let response_body = json!({
         "result": "N2_INFO_TRANSFER_INITIATED",
@@ -9070,6 +9623,755 @@ mod tests {
         };
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].ngap_pdu[1], 32);
+    }
+
+    // ========================================================================
+    // #399: NonUeN2InfoSubscribe / UnSubscribe and the conditional
+    // n2PwsSubMissInd + unknownTaiList (TS 29.518 §5.2.2.4.2/.3/.4)
+    // ========================================================================
+
+    /// Remove every stored ANONYMOUS (no `nfId`) non-UE N2 subscription. The store
+    /// is process-global, so a test that asserts "no subscription matched" has to
+    /// start from empty or a sibling test's leftover subscription would answer for
+    /// it.
+    ///
+    /// Only the anonymous ones, because `find_by_class_exact(class, None)` matches
+    /// exactly those, and neither lookup can reach an `nfId`-bearing subscription
+    /// without knowing the id — `find_by_class(class, None)` deliberately refuses a
+    /// subscription that named an instance, which is the fail-closed rule under
+    /// test. The two tests that create `nfId`-bearing subscriptions therefore
+    /// remove them by their own minted id, which is also a better assertion: it
+    /// proves the DELETE resource works rather than reaching around it.
+    ///
+    /// Drains by repeated find-and-remove rather than a bulk clear: adding a
+    /// `clear_all` to the context purely for tests would put a production-looking
+    /// API there that no production caller has — the shape that becomes a dead
+    /// method later.
+    fn clear_non_ue_n2_subscriptions() {
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        for class in super::PWS_N2_INFORMATION_CLASSES {
+            while let Some(sub) = guard.non_ue_n2_subscription_find_by_class_exact(class, None) {
+                guard.non_ue_n2_subscription_remove(&sub.subscription_id);
+            }
+        }
+    }
+
+    fn non_ue_n2_subscribe_request(body: Value) -> SbiRequest {
+        SbiRequest::post("/namf-comm/v1/non-ue-n2-messages/subscriptions")
+            .with_json_body(&body)
+            .expect("json")
+    }
+
+    /// Criterion 1. The subscription resource is routed **at the URI TS 29.518
+    /// defines** and returns the 201 + Location + CreatedData §6.1.3.9.3.1
+    /// requires, and the record is findable by class afterwards.
+    ///
+    /// The second half is the load-bearing one: #399's body names the path
+    /// `non-ue-n2-info-subscriptions`, which appears NOWHERE in TS 29.518 or its
+    /// OpenAPI. §6.1.3.9.2 (`29518-k00.txt:9962`) and `yaml:1921` both put the
+    /// collection at `non-ue-n2-messages/subscriptions`. This asserts the wrong
+    /// spelling stays a 404, so it can never quietly start working and leave the
+    /// AMF serving an endpoint no conformant CBCF calls.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_ue_n2_info_subscribe_is_routed_at_the_spec_uri_and_returns_a_location() {
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        amf_context_init(64, 1024, 4096);
+        clear_non_ue_n2_subscriptions();
+
+        let resp = namf_request_handler(non_ue_n2_subscribe_request(json!({
+            "n2InformationClass": "PWS-BCAL",
+            "n2NotifyCallbackUri": "http://127.0.0.1:19399/pws-notify",
+            "nfId": "cbcf-399-0001",
+            "notifCorrelationId": "corr-399",
+        })))
+        .await;
+        assert_eq!(
+            resp.status, 201,
+            "the NonUeN2InfoSubscribe arm must be routed"
+        );
+
+        let body = body_json(&resp);
+        let sub_id = body["n2NotifySubscriptionId"]
+            .as_str()
+            .expect("n2NotifySubscriptionId is mandatory in NonUeN2InfoSubscriptionCreatedData")
+            .to_string();
+        assert_eq!(
+            body["n2InformationClass"].as_str(),
+            Some("PWS-BCAL"),
+            "the registered class is echoed so the consumer can confirm it"
+        );
+        // §6.1.3.9.3.1 requires the Location header, structured per `yaml:1945`.
+        let location = resp
+            .http
+            .get_header("location")
+            .expect("201 must carry a Location header")
+            .clone();
+        assert_eq!(
+            location,
+            format!("/namf-comm/v1/non-ue-n2-messages/subscriptions/{sub_id}"),
+            "Location must be the spec's resource structure, not the issue's"
+        );
+
+        // The arm reached the store the NGAP notify path reads -- the
+        // "correct but unreachable" check, from the writer side.
+        let ctx = crate::context::amf_self();
+        {
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            let stored = guard
+                .non_ue_n2_subscription_find("=none=")
+                .or_else(|| guard.non_ue_n2_subscription_find(&sub_id))
+                .expect("the subscription must be findable by its minted id");
+            assert_eq!(stored.n2_information_class, "PWS-BCAL");
+            assert_eq!(
+                stored.n2_notify_callback_uri,
+                "http://127.0.0.1:19399/pws-notify"
+            );
+            assert_eq!(stored.nf_id.as_deref(), Some("cbcf-399-0001"));
+            assert_eq!(stored.notif_correlation_id.as_deref(), Some("corr-399"));
+            // And findable by the class the notify path looks it up under, for the
+            // same nfId.
+            assert!(
+                guard
+                    .non_ue_n2_subscription_find_by_class("PWS-BCAL", Some("cbcf-399-0001"))
+                    .is_some(),
+                "the notify path's own lookup must find what the router stored"
+            );
+        }
+
+        // The URI #399 asked for is NOT served.
+        let wrong = namf_request_handler(
+            SbiRequest::post("/namf-comm/v1/non-ue-n2-info-subscriptions")
+                .with_json_body(&json!({
+                    "n2InformationClass": "PWS",
+                    "n2NotifyCallbackUri": "http://127.0.0.1:19399/pws-notify",
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(
+            wrong.status, 404,
+            "`non-ue-n2-info-subscriptions` is not a TS 29.518 resource and must stay unrouted"
+        );
+
+        // DELETE round-trips at the Location the 201 advertised, which is the only
+        // proof that header is usable rather than merely present.
+        let deleted = namf_request_handler(SbiRequest::delete(&location)).await;
+        assert_eq!(deleted.status, 204);
+        clear_non_ue_n2_subscriptions();
+    }
+
+    /// Fail-closed validation: each mandatory member enforced, a non-HTTP callback
+    /// refused, and a class this AMF cannot notify refused rather than stored as a
+    /// subscription that silently never fires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_ue_n2_info_subscribe_rejects_half_pairs_and_unservable_classes() {
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        amf_context_init(64, 1024, 4096);
+        clear_non_ue_n2_subscriptions();
+
+        // n2InformationClass absent (M, `yaml:2595`).
+        let resp = namf_request_handler(non_ue_n2_subscribe_request(json!({
+            "n2NotifyCallbackUri": "http://127.0.0.1:19399/x",
+        })))
+        .await;
+        assert_eq!(resp.status, 400);
+
+        // n2NotifyCallbackUri absent (M, `yaml:2596`).
+        let resp = namf_request_handler(non_ue_n2_subscribe_request(json!({
+            "n2InformationClass": "PWS",
+        })))
+        .await;
+        assert_eq!(resp.status, 400);
+
+        // A callback the AMF could never POST to.
+        let resp = namf_request_handler(non_ue_n2_subscribe_request(json!({
+            "n2InformationClass": "PWS",
+            "n2NotifyCallbackUri": "not-a-uri",
+        })))
+        .await;
+        assert_eq!(resp.status, 400);
+
+        // A class with no producer here. NRPPa in particular is already served by
+        // the per-UE `n1-n2-messages/subscriptions` registry, so accepting it would
+        // store a second subscription nothing reads.
+        for class in ["NRPPa", "SM", "TSS", "RAN"] {
+            let resp = namf_request_handler(non_ue_n2_subscribe_request(json!({
+                "n2InformationClass": class,
+                "n2NotifyCallbackUri": "http://127.0.0.1:19399/x",
+            })))
+            .await;
+            assert_eq!(
+                resp.status, 403,
+                "class {class} has no PWS producer and must not be stored"
+            );
+        }
+
+        // Nothing refused reached the store. Asserted per-class rather than as a
+        // count: the store is process-global and a sibling test's `nfId`-bearing
+        // subscription would make a count assertion fail for the wrong reason,
+        // whereas "is this exact class findable" is precisely the claim.
+        let ctx = crate::context::amf_self();
+        {
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            for class in ["NRPPa", "SM", "TSS", "RAN"] {
+                assert!(
+                    guard
+                        .non_ue_n2_subscription_find_by_class_exact(class, None)
+                        .is_none(),
+                    "refused class {class} must not have been stored"
+                );
+            }
+        }
+
+        // All three PWS classes ARE accepted (§5.2.2.4.2.2, `29518-k00.txt:4334`)
+        // and each becomes findable under its own class.
+        for class in super::PWS_N2_INFORMATION_CLASSES {
+            let resp = namf_request_handler(non_ue_n2_subscribe_request(json!({
+                "n2InformationClass": class,
+                "n2NotifyCallbackUri": "http://127.0.0.1:19399/x",
+            })))
+            .await;
+            assert_eq!(resp.status, 201, "class {class} must be accepted");
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                guard
+                    .non_ue_n2_subscription_find_by_class_exact(class, None)
+                    .is_some(),
+                "accepted class {class} must be stored and findable"
+            );
+        }
+        clear_non_ue_n2_subscriptions();
+    }
+
+    /// DELETE is 204 the first time and 404 `SUBSCRIPTION_NOT_FOUND` the second —
+    /// the cause §6.1.3.10.3.1's table names (`29518-k00.txt:10170`), which is NOT
+    /// the `CONTEXT_NOT_FOUND` the per-UE unsubscribe uses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn non_ue_n2_info_unsubscribe_removes_it_and_is_404_the_second_time() {
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        amf_context_init(64, 1024, 4096);
+        clear_non_ue_n2_subscriptions();
+
+        let created = namf_request_handler(non_ue_n2_subscribe_request(json!({
+            "n2InformationClass": "PWS-RF",
+            "n2NotifyCallbackUri": "http://127.0.0.1:19399/rf",
+        })))
+        .await;
+        assert_eq!(created.status, 201);
+        let sub_id = body_json(&created)["n2NotifySubscriptionId"]
+            .as_str()
+            .expect("id")
+            .to_string();
+
+        let path = format!("/namf-comm/v1/non-ue-n2-messages/subscriptions/{sub_id}");
+        let first = namf_request_handler(SbiRequest::delete(&path)).await;
+        assert_eq!(first.status, 204, "§5.2.2.4.3.1 step 2 answers 204");
+
+        let second = namf_request_handler(SbiRequest::delete(&path)).await;
+        assert_eq!(second.status, 404);
+        assert_eq!(
+            body_json(&second)["cause"].as_str(),
+            Some("SUBSCRIPTION_NOT_FOUND"),
+            "§6.1.3.10.3.1 names this cause, not CONTEXT_NOT_FOUND"
+        );
+
+        // And the notify path can no longer find it: an unsubscribed consumer must
+        // stop receiving, which is the whole point of the DELETE.
+        let ctx = crate::context::amf_self();
+        {
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                guard
+                    .non_ue_n2_subscription_find_by_class("PWS-RF", None)
+                    .is_none(),
+                "the removed subscription must not still match a notify lookup"
+            );
+        }
+    }
+
+    /// A `PWS-RF` subscription must NOT answer for a RESPONSE, and a `PWS-BCAL` one
+    /// must NOT answer for an INDICATION. The two classes carry disjoint message
+    /// sets (Tables 6.1.6.4.3.3-2 / -3, `29518-k00.txt:19055` / `:19108`), so
+    /// crossing them would notify a consumer about a class it did not ask for.
+    /// The umbrella `PWS` does answer for both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_two_specific_pws_classes_do_not_answer_for_each_other() {
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        amf_context_init(64, 1024, 4096);
+        clear_non_ue_n2_subscriptions();
+
+        let ctx = crate::context::amf_self();
+
+        // Only PWS-RF subscribed.
+        assert_eq!(
+            namf_request_handler(non_ue_n2_subscribe_request(json!({
+                "n2InformationClass": "PWS-RF",
+                "n2NotifyCallbackUri": "http://127.0.0.1:19399/rf",
+            })))
+            .await
+            .status,
+            201
+        );
+        {
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                guard
+                    .non_ue_n2_subscription_find_by_class("PWS-RF", None)
+                    .is_some(),
+                "an indication finds the PWS-RF subscription"
+            );
+            assert!(
+                guard
+                    .non_ue_n2_subscription_find_by_class("PWS-BCAL", None)
+                    .is_none(),
+                "a RESPONSE must NOT be delivered to a PWS-RF-only subscriber"
+            );
+        }
+        clear_non_ue_n2_subscriptions();
+
+        // The umbrella class answers for both.
+        assert_eq!(
+            namf_request_handler(non_ue_n2_subscribe_request(json!({
+                "n2InformationClass": "PWS",
+                "n2NotifyCallbackUri": "http://127.0.0.1:19399/pws",
+            })))
+            .await
+            .status,
+            201
+        );
+        {
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                guard
+                    .non_ue_n2_subscription_find_by_class("PWS-BCAL", None)
+                    .is_some(),
+                "the umbrella PWS class covers responses (§5.2.2.4.2.2)"
+            );
+            assert!(
+                guard
+                    .non_ue_n2_subscription_find_by_class("PWS-RF", None)
+                    .is_some(),
+                "and indications"
+            );
+        }
+        clear_non_ue_n2_subscriptions();
+    }
+
+    /// Criterion 4. `n2PwsSubMissInd` is `true` only when `sendRanResponse: true`
+    /// **AND** no subscription exists — §5.2.2.4.1.3's actual condition
+    /// (`29518-k00.txt:4175-4181`). Before #399 it was unconditional on
+    /// `sendRanResponse`, which was right when no subscription resource existed and
+    /// becomes a lie the moment one does: a consumer told to "re-create the missing
+    /// N2 information subscription" would needlessly tear down a live one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn n2_pws_sub_miss_ind_is_suppressed_once_a_pws_subscription_exists() {
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _serial = super::pws_queue_test_lock().lock().await;
+        amf_context_init(64, 1024, 4096);
+        clear_non_ue_n2_subscriptions();
+
+        // Distinct literal pair: both the queue and the sendRanResponse map are
+        // process-global and keyed on it.
+        let (mid, sn) = (0xB396u16, 0xD396u16);
+        let nf_id = "cbcf-399-missind";
+
+        let mut body = pws_body(mid, sn);
+        body["n2Information"]["pwsInfo"]["sendRanResponse"] = Value::Bool(true);
+        body["n2Information"]["pwsInfo"]["nfId"] = Value::String(nf_id.into());
+
+        // No subscription yet -> the spec's signal, as #401 shipped it.
+        let resp = namf_request_handler(pws_transfer_request(
+            body.clone(),
+            pws_warning_container(mid, sn),
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            body_json(&resp)["pwsRspData"]["n2PwsSubMissInd"].as_bool(),
+            Some(true),
+            "with no subscription the consumer must be told to create one"
+        );
+
+        // Now subscribe as that same CBCF instance and repeat.
+        let created = namf_request_handler(non_ue_n2_subscribe_request(json!({
+            "n2InformationClass": "PWS-BCAL",
+            "n2NotifyCallbackUri": "http://127.0.0.1:19399/missind",
+            "nfId": nf_id,
+        })))
+        .await;
+        assert_eq!(created.status, 201);
+        let sub_id = body_json(&created)["n2NotifySubscriptionId"]
+            .as_str()
+            .expect("id")
+            .to_string();
+
+        let resp =
+            namf_request_handler(pws_transfer_request(body, pws_warning_container(mid, sn))).await;
+        assert_eq!(resp.status, 200);
+        assert!(
+            body_json(&resp)["pwsRspData"]["n2PwsSubMissInd"].is_null(),
+            "the subscription EXISTS now, so claiming it is missing would make a \
+             conformant consumer tear down a live subscription"
+        );
+
+        let ctx = crate::context::amf_self();
+        {
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            let _ = guard.pws_n2_drain();
+            // The sendRanResponse record the asynchronous notify path reads was
+            // written by this live SBI arm -- reachability, from the writer side.
+            let record = guard
+                .pws_response_request_get(mid, sn)
+                .expect("sendRanResponse:true must be recorded for the response path");
+            assert!(record.send_ran_response);
+            assert_eq!(record.nf_id.as_deref(), Some(nf_id));
+            assert_eq!(record.procedure_code, 51);
+        }
+
+        // Remove through the real DELETE resource: the helper only reaches
+        // anonymous subscriptions, and going through the router also proves the
+        // subscription an `nfId` created is removable.
+        assert_eq!(
+            namf_request_handler(SbiRequest::delete(&format!(
+                "/namf-comm/v1/non-ue-n2-messages/subscriptions/{sub_id}"
+            )))
+            .await
+            .status,
+            204
+        );
+        clear_non_ue_n2_subscriptions();
+    }
+
+    /// A transfer WITHOUT `sendRanResponse` records nothing, so the asynchronous
+    /// response path has nothing to match and cannot notify. Asserted positively
+    /// rather than as "no error occurred": the record's absence is the fail-closed
+    /// gate §5.2.2.4.4.3 item 1 requires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_transfer_without_send_ran_response_records_nothing_to_notify() {
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _serial = super::pws_queue_test_lock().lock().await;
+        amf_context_init(64, 1024, 4096);
+
+        let (mid, sn) = (0xC396u16, 0xE396u16);
+        let resp = namf_request_handler(pws_transfer_request(
+            pws_body(mid, sn),
+            pws_warning_container(mid, sn),
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        let _ = guard.pws_n2_drain();
+        assert!(
+            guard.pws_response_request_get(mid, sn).is_none(),
+            "no sendRanResponse means no record, so no notification is ever owed"
+        );
+    }
+
+    /// Criterion 5, in the only form the spec and the code permit.
+    ///
+    /// `unknownTaiList` reports the `taiList` entries naming TAIs this AMF does not
+    /// SERVE, and only on the PWS Cancel branch — §5.2.2.4.1.3 step 2a
+    /// (`29518-k00.txt:4169-4173`) hangs the "optionally the unknown TAI List IE"
+    /// option off the *Stop-Warning* Confirm response, not off the
+    /// Write-Replace-Warning Confirm one.
+    ///
+    /// It deliberately is NOT "TAIs no connected node served", which #399 asked
+    /// for: that fact lives in the NGAP pump, which runs after this 200 is written,
+    /// and `unknownTaiList` exists only in the SYNCHRONOUS `PWSResponseData`
+    /// (`yaml:3348` is its one referent) — it is absent from
+    /// `N2InformationNotification`, so it cannot ride the async notify either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unknown_tai_list_reports_tais_this_amf_does_not_serve_on_the_cancel_branch() {
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _serial = super::pws_queue_test_lock().lock().await;
+        amf_context_init(64, 1024, 4096);
+
+        // Configure ONE served TAI, the way the config loader does at startup
+        // (`lib.rs:520`) -- unlike `gnb_list`, `served_tai` has a real production
+        // writer, which is what makes this fact honestly knowable here.
+        {
+            let ctx = crate::context::amf_self();
+            let mut guard = ctx.write().unwrap_or_else(|e| e.into_inner());
+            guard.served_tai.clear();
+            guard.num_of_served_tai = 0;
+            let mut served = crate::context::ServedTai::default();
+            served.list0.plmn_id = crate::context::PlmnId::new("001", "01");
+            served.list0.tac = vec![0x74];
+            guard.served_tai.push(served);
+            guard.num_of_served_tai = 1;
+        }
+
+        let (mid, sn) = (0xD396u16, 0xF396u16);
+        let cancel = nextgcore_ngap::builder::build_pws_cancel_request(
+            &nextgcore_ngap::types::PwsCancelRequest {
+                message_identifier: mid,
+                serial_number: sn,
+                warning_area_list: None,
+                cancel_all_warning_messages: false,
+            },
+        )
+        .expect("build PWS CANCEL REQUEST");
+
+        // One served TAI (tac 000074 == 0x74) and one this AMF does not serve.
+        let mut body = pws_body(mid, sn);
+        body["taiList"] = json!([
+            { "plmnId": { "mcc": "001", "mnc": "01" }, "tac": "000074" },
+            { "plmnId": { "mcc": "001", "mnc": "01" }, "tac": "000099" },
+        ]);
+
+        let resp = namf_request_handler(pws_transfer_request(body.clone(), cancel.clone())).await;
+        assert_eq!(resp.status, 200);
+        let unknown = body_json(&resp)["pwsRspData"]["unknownTaiList"].clone();
+        assert_eq!(
+            unknown,
+            json!([{ "plmnId": { "mcc": "001", "mnc": "01" }, "tac": "000099" }]),
+            "exactly the unserved TAI is reported -- not the served one, and not all of them"
+        );
+
+        // The Write-Replace branch carries no unknownTaiList even with the same
+        // unserved TAI, because the spec scopes the IE to Stop-Warning Confirm.
+        let mut wr_body = pws_body(mid, sn);
+        wr_body["taiList"] = body["taiList"].clone();
+        let resp = namf_request_handler(pws_transfer_request(
+            wr_body,
+            pws_warning_container(mid, sn),
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+        assert!(
+            body_json(&resp)["pwsRspData"]["unknownTaiList"].is_null(),
+            "§5.2.2.4.1.3 step 2a offers the unknown TAI List only on the \
+             Stop-Warning Confirm branch"
+        );
+
+        // And when every TAI is served the IE is OMITTED, not sent empty
+        // (`minItems: 1`, `yaml:3791`).
+        let mut all_served = pws_body(mid, sn);
+        all_served["taiList"] =
+            json!([{ "plmnId": { "mcc": "001", "mnc": "01" }, "tac": "000074" }]);
+        let resp = namf_request_handler(pws_transfer_request(all_served, cancel)).await;
+        assert_eq!(resp.status, 200);
+        assert!(body_json(&resp)["pwsRspData"]["unknownTaiList"].is_null());
+
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        let _ = guard.pws_n2_drain();
+    }
+
+    /// The `n2InfoNotify` body the AMF delivers, asserted member by member against
+    /// a **gNB-produced** WRITE-REPLACE WARNING RESPONSE (criterion 6's
+    /// `build_write_replace_warning_response`).
+    ///
+    /// This is the body builder the live producer calls, so the assertions are on
+    /// what a CBCF would actually receive: the class, the RAN's own identifiers,
+    /// the responding node's identity, and the container byte-for-byte.
+    #[test]
+    fn the_n2_info_notify_body_carries_the_rans_own_response_verbatim() {
+        let (mid, sn) = (0xE396u16, 0x1397u16);
+        // A conformant response as the gNB would send it, with a real completed
+        // area list.
+        let pdu = nextgcore_ngap::builder::build_write_replace_warning_response(
+            &nextgcore_ngap::types::WriteReplaceWarningResponse {
+                message_identifier: mid,
+                serial_number: sn,
+                broadcast_completed_area_list: Some(
+                    nextgcore_ngap::types::BroadcastCompletedAreaList::CellIdNr(vec![
+                        nextgcore_ngap::types::NrCgi {
+                            plmn_identity: [0x00, 0xF1, 0x10],
+                            nr_cell_identity: 0x399,
+                        },
+                    ]),
+                ),
+                criticality_diagnostics: None,
+            },
+        )
+        .expect("build WRITE-REPLACE WARNING RESPONSE");
+        // Byte 0 is the PDU-type CHOICE index and byte 1 the procedure code: a
+        // response is a SuccessfulOutcome (0x20) of procedure 51
+        // (`38413-j30.txt:59115`). PR #379's MBS byte-writers were undecodable
+        // because they opened with the procedure code instead.
+        assert_eq!(pdu[0], 0x20, "a response is a SuccessfulOutcome");
+        assert_eq!(pdu[1], 51, "id-WriteReplaceWarning = 51");
+
+        let ran_node_id =
+            super::global_ran_node_id_json(&crate::context::PlmnId::new("001", "01"), 0xABCD, 32);
+        let request = super::build_non_ue_n2_info_notify_request(
+            "/pws-notify",
+            "nonuen2sub-399",
+            "PWS-BCAL",
+            mid,
+            sn,
+            &ran_node_id,
+            false,
+            Some("cbcf-399-0001"),
+            Some("corr-399"),
+            &pdu,
+        )
+        .expect("build NonUeN2InfoNotify");
+
+        let json: Value = serde_json::from_str(
+            request
+                .http
+                .content
+                .as_deref()
+                .expect("the notification must carry a jsonData part"),
+        )
+        .expect("json");
+        assert_eq!(
+            json["n2NotifySubscriptionId"].as_str(),
+            Some("nonuen2sub-399")
+        );
+        // §6.1.6.4.3.3 Table 6.1.6.4.3.3-2 puts the two RESPONSES in PWS-BCAL.
+        assert_eq!(
+            json["n2InfoContainer"]["n2InformationClass"].as_str(),
+            Some("PWS-BCAL")
+        );
+        // The identifiers are the RAN's, lifted out of the decoded response.
+        assert_eq!(
+            json["n2InfoContainer"]["pwsInfo"]["messageIdentifier"].as_u64(),
+            Some(mid as u64)
+        );
+        assert_eq!(
+            json["n2InfoContainer"]["pwsInfo"]["serialNumber"].as_u64(),
+            Some(sn as u64)
+        );
+        assert_eq!(
+            json["n2InfoContainer"]["pwsInfo"]["pwsContainer"]["ngapMessageType"].as_u64(),
+            Some(51),
+            "the container's own procedure code, read off byte 1"
+        );
+        // THIS specific node, not "a node": `GNbId` needs both members
+        // (`TS29571_CommonData.yaml:2911-2913`).
+        assert_eq!(
+            json["ranNodeId"]["gNbId"]["gNBValue"].as_str(),
+            Some("0000ABCD")
+        );
+        assert_eq!(json["ranNodeId"]["gNbId"]["bitLength"].as_u64(), Some(32));
+        assert_eq!(json["ranNodeId"]["plmnId"]["mcc"].as_str(), Some("001"));
+        assert_eq!(json["ranNodeId"]["plmnId"]["mnc"].as_str(), Some("01"));
+        assert_eq!(json["notifCorrelationId"].as_str(), Some("corr-399"));
+        assert_eq!(
+            json["n2InfoContainer"]["pwsInfo"]["nfId"].as_str(),
+            Some("cbcf-399-0001")
+        );
+        // The area list WAS present, so bcEmptyAreaList must be absent -- asserting
+        // it would tell the CBCF the broadcast reached nowhere.
+        assert!(
+            json["n2InfoContainer"]["pwsInfo"]["bcEmptyAreaList"].is_null(),
+            "bcEmptyAreaList is for a response that OMITTED its area list"
+        );
+
+        // And the RAN's PDU rides verbatim: the AMF declines §6.1.6.4.3.3's
+        // re-encode permission (`29518-k00.txt:19069`) because a round trip through
+        // a partial model drops IEs the gNB sent.
+        let part = request
+            .http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some(super::NON_UE_N2_INFO_NOTIFY_PWS_CONTENT_ID))
+            .expect("the binary PWS part must be present");
+        assert_eq!(
+            part.data.as_ref(),
+            pdu.as_slice(),
+            "the notified container must be byte-identical to the gNB's response"
+        );
+    }
+
+    /// A response that omitted its Broadcast Completed Area List gets
+    /// `bcEmptyAreaList` naming the responding node — §5.2.2.4.4.3's imperative
+    /// ("the AMF **shall** include the NG-RAN node ID(s)",
+    /// `29518-k00.txt:4468-4471`), as opposed to the aggregation "may" this path
+    /// declines.
+    #[test]
+    fn a_response_without_an_area_list_reports_bc_empty_area_list() {
+        let (mid, sn) = (0xF396u16, 0x2397u16);
+        let pdu = nextgcore_ngap::builder::build_write_replace_warning_response(
+            &nextgcore_ngap::types::WriteReplaceWarningResponse {
+                message_identifier: mid,
+                serial_number: sn,
+                broadcast_completed_area_list: None,
+                criticality_diagnostics: None,
+            },
+        )
+        .expect("build WRITE-REPLACE WARNING RESPONSE");
+
+        let ran_node_id =
+            super::global_ran_node_id_json(&crate::context::PlmnId::new("001", "01"), 0x1234, 28);
+        let request = super::build_non_ue_n2_info_notify_request(
+            "/pws-notify",
+            "nonuen2sub-399-empty",
+            "PWS-BCAL",
+            mid,
+            sn,
+            &ran_node_id,
+            true,
+            None,
+            None,
+            &pdu,
+        )
+        .expect("build NonUeN2InfoNotify");
+
+        let json: Value = serde_json::from_str(
+            request
+                .http
+                .content
+                .as_deref()
+                .expect("the notification must carry a jsonData part"),
+        )
+        .expect("json");
+        assert_eq!(
+            json["n2InfoContainer"]["pwsInfo"]["bcEmptyAreaList"],
+            json!([ran_node_id]),
+            "the node that answered with no area list must be named, not merely counted"
+        );
+        // A 28-bit gNB ID renders as 8 nibbles; a 22-bit one as 6. Padding to 8
+        // always would claim a 32-bit ID for a narrow node.
+        assert_eq!(
+            json["ranNodeId"]["gNbId"]["gNBValue"].as_str(),
+            Some("00001234")
+        );
+        assert_eq!(json["ranNodeId"]["gNbId"]["bitLength"].as_u64(), Some(28));
+    }
+
+    /// `gNBValue` width follows the bit length (TS 29.571's
+    /// `^[A-Fa-f0-9]{6,8}$`): 6 nibbles at or below 24 bits, 8 above. This is why
+    /// `AmfGnb` had to start carrying `gnb_id_len` — fabricating 22 or 32 would
+    /// misidentify any node whose real ID is neither.
+    #[test]
+    fn global_ran_node_id_renders_the_gnb_id_at_its_real_bit_length() {
+        let plmn = crate::context::PlmnId::new("001", "01");
+        for (len, expected) in [
+            (22u8, "0000AB"),
+            (24, "0000AB"),
+            (25, "000000AB"),
+            (32, "000000AB"),
+        ] {
+            let json = super::global_ran_node_id_json(&plmn, 0xAB, len);
+            assert_eq!(
+                json["gNbId"]["gNBValue"].as_str(),
+                Some(expected),
+                "a {len}-bit gNB ID must render as {} nibbles",
+                expected.len()
+            );
+            assert_eq!(json["gNbId"]["bitLength"].as_u64(), Some(len as u64));
+        }
     }
 
     // ==================================================================
