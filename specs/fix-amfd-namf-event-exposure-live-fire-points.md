@@ -466,7 +466,55 @@ The E2E probe was verified locally against a real `nextgcore-amfd` process (rele
   which the emitters do not deliver is a run in which this step is red.
 
 The positive half needs 5G-AKA, and therefore the AUSF/UDM/UDR the compose stack provides,
-so it is proven by the dispatched `Docker E2E` run rather than locally.
+so it was proven by a dispatched run.
+
+### The dispatched run
+
+<https://github.com/NextgCoreLab/nextgcore/actions/runs/35836705248> (`9d43ba2`,
+`workflow_dispatch`) — **all seven jobs green, `Docker E2E` included.** A PR run cannot say
+this: `Docker E2E` skips on `pull_request`.
+
+The two new middle-step waits matched nextgsim's real log lines, so the registration really
+happened before the delivery was asserted:
+
+```
+nextgsim-gnb | INFO nextgsim_gnb::ngap::task: Received NG Setup Response from AMF 0: name=nextgcore-amf0
+nextgsim-ue  | INFO nextgsim_ue::nas::mm::orchestrator: Received Registration Accept: UE is now
+               MM[RM-REGISTERED, CM-CONNECTED, 5GMM-REGISTERED.NORMAL-SERVICE, U1-UPDATED]
+```
+
+and the probe then reported, in the job log:
+
+```
+SUBSCRIBED main=sub-0669f958-... control=sub-3329b0e3-...
+received REGISTRATION_STATE_REPORT
+received LOCATION_REPORT
+received ACCESS_TYPE_REPORT
+  ok /supi == "imsi-999700000000001"
+  ok /rmInfoList/0/rmState == "REGISTERED"
+  ok /rmInfoList/0/accessType == "3GPP_ACCESS"
+  ok /location/nrLocation/tai/plmnId/mcc == "999"
+  ok /location/nrLocation/tai/plmnId/mnc == "70"
+  ok /location/nrLocation/tai/tac == "0001"
+  ok /accessTypeList/0 == "3GPP_ACCESS"
+PASS: nextgsim's gNB registered imsi-999700000000001 over real N2 and the AMF DELIVERED
+REGISTRATION_STATE_REPORT (REGISTERED / 3GPP_ACCESS), LOCATION_REPORT (mcc 999 mnc 70
+tac 0001) and ACCESS_TYPE_REPORT to the subscribed callback, and delivered NOTHING to the
+control subscription for imsi-999709999999999
+```
+
+So this is a **positive, value-level, end-to-end** result: the `tac 0001` and `mcc 999` came
+off the InitialUEMessage the real gNB sent, not from a default `Tai5gs` (which would have
+read `0000`/`000`), and the control subscription's silence shows the delivery was TARGETED
+rather than broadcast. Combined with the local no-gNB run exiting 1, the assertion is shown
+to distinguish both directions.
+
+The run also caught one real defect before it shipped, which is the case for dispatching:
+the middle step's log greps were originally `NG Setup Response` and `Registration Accept`,
+GUESSED rather than read out of nextgsim. Both were substrings of the real text and would
+have matched — but `NG Setup Response` also appears in a `warn!` about an unexpected PDU
+while waiting for one, so the gate could have been satisfied by a failure. Corrected to the
+exact `info!` text at the emitting line (`9d43ba2`).
 
 Production reachability was re-verified by grep after the deletion — every `fire_*` call
 site, classified PRODUCTION or TEST by whether it sits inside `mod tests`:
@@ -506,8 +554,11 @@ refused. The per-PR guarantee for these three types is therefore **inspection pl
 `fire_*`-site grep above**, and the automated guarantee arrives on the nightly schedule or on
 a dispatch. That is stated rather than papered over.
 
-A dispatch is consequently MANDATORY for any change to these emitters or to the probe, and
-this PR's own dispatch is recorded in its description. Three new steps join the job:
+A dispatch is consequently MANDATORY for any change to these emitters or to the probe. This
+PR's own dispatch is
+<https://github.com/NextgCoreLab/nextgcore/actions/runs/35836705248> — all seven jobs green,
+with the probe's per-value output quoted in the Verification section above. Three new steps
+join the job:
 
 * `Build the nextgsim gNB + UE images (the REAL RAN, #397)` — the builder image already
   compiled `nr-gnb`/`nr-ue`, but this job never turned them into images, so **no stage here
