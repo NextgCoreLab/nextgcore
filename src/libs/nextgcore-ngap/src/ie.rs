@@ -3152,3 +3152,1277 @@ mod criticality_diagnostics_tests {
         );
     }
 }
+
+// ============================================================================
+// PWS IEs (TS 38.413 Section 9.3.1.35-.49, Section 9.3.1.112)
+// ============================================================================
+//
+// Protocol IE identifiers, quoted from 6g_docs/specs/38413-j30.txt:
+//
+//   id-MessageIdentifier            ::= 35   (:59503)
+//   id-SerialNumber                 ::= 95   (:59623)
+//   id-WarningAreaList              ::= 122  (:59675)
+//   id-RepetitionPeriod             ::= 87   (:59607)
+//   id-NumberOfBroadcastsRequested  ::= 47   (:59527)
+//   id-WarningType                  ::= 125  (:59681)
+//   id-WarningSecurityInfo          ::= 124  (:59679)
+//   id-DataCodingScheme             ::= 20   (:59473)
+//   id-WarningMessageContents       ::= 123  (:59677)
+//   id-ConcurrentWarningMessageInd  ::= 17   (:59467)
+//   id-WarningAreaCoordinates       ::= 141  (:59713)
+//   id-BroadcastCompletedAreaList   ::= 13   (:59459)
+//   id-BroadcastCancelledAreaList   ::= 12   (:59457)
+//   id-CancelAllWarningMessages     ::= 14   (:59461)
+
+/// `id-MessageIdentifier` (`38413-j30.txt:59503`)
+pub const IE_ID_MESSAGE_IDENTIFIER: u16 = 35;
+/// `id-SerialNumber` (`:59623`)
+pub const IE_ID_SERIAL_NUMBER: u16 = 95;
+/// `id-WarningAreaList` (`:59675`)
+pub const IE_ID_WARNING_AREA_LIST: u16 = 122;
+/// `id-RepetitionPeriod` (`:59607`)
+pub const IE_ID_REPETITION_PERIOD: u16 = 87;
+/// `id-NumberOfBroadcastsRequested` (`:59527`)
+pub const IE_ID_NUMBER_OF_BROADCASTS_REQUESTED: u16 = 47;
+/// `id-WarningType` (`:59681`)
+pub const IE_ID_WARNING_TYPE: u16 = 125;
+/// `id-WarningSecurityInfo` (`:59679`)
+pub const IE_ID_WARNING_SECURITY_INFO: u16 = 124;
+/// `id-DataCodingScheme` (`:59473`)
+pub const IE_ID_DATA_CODING_SCHEME: u16 = 20;
+/// `id-WarningMessageContents` (`:59677`)
+pub const IE_ID_WARNING_MESSAGE_CONTENTS: u16 = 123;
+/// `id-ConcurrentWarningMessageInd` (`:59467`)
+pub const IE_ID_CONCURRENT_WARNING_MESSAGE_IND: u16 = 17;
+/// `id-WarningAreaCoordinates` (`:59713`)
+pub const IE_ID_WARNING_AREA_COORDINATES: u16 = 141;
+/// `id-BroadcastCompletedAreaList` (`:59459`)
+pub const IE_ID_BROADCAST_COMPLETED_AREA_LIST: u16 = 13;
+/// `id-BroadcastCancelledAreaList` (`:59457`)
+pub const IE_ID_BROADCAST_CANCELLED_AREA_LIST: u16 = 12;
+/// `id-CancelAllWarningMessages` (`:59461`)
+pub const IE_ID_CANCEL_ALL_WARNING_MESSAGES: u16 = 14;
+/// `id-CellIDListForRestart` (`:59465`) — the Restart Indication's cell CHOICE.
+///
+/// **16, not 15**, and the two lists below are 104 and 23, not the 118 and 26 an
+/// adjacent reading of the alphabetical table gives. These four were each quoted
+/// from their own line after three of the first four guesses proved wrong — the
+/// same class of error as #45's NRPPa codes and #75's MBS codes.
+pub const IE_ID_CELL_ID_LIST_FOR_RESTART: u16 = 16;
+/// `id-TAIListForRestart` (`:59641`)
+pub const IE_ID_TAI_LIST_FOR_RESTART: u16 = 104;
+/// `id-EmergencyAreaIDListForRestart` (`:59479`)
+pub const IE_ID_EMERGENCY_AREA_ID_LIST_FOR_RESTART: u16 = 23;
+/// `id-PWSFailedCellIDList` (`:59595`) — the Failure Indication's cell CHOICE
+pub const IE_ID_PWS_FAILED_CELL_ID_LIST: u16 = 81;
+
+/// Upper bound shared by `maxnoofCellIDforWarning`, `maxnoofTAIforWarning`,
+/// `maxnoofEmergencyAreaID`, `maxnoofCellinTAI` and `maxnoofCellinEAI`, all of
+/// which are `INTEGER ::= 65535` (`38413-j30.txt:59227`, `:59351`, `:59249`,
+/// `:59233`, `:59231`).
+const MAX_NO_OF_PWS_AREA_ITEMS: usize = 65535;
+
+/// `maxnoofCellsingNB INTEGER ::= 16384` (`:59239`) — the Restart/Failure
+/// Indication NR cell lists' bound.
+const MAX_NO_OF_CELLS_IN_GNB: usize = 16384;
+/// `maxnoofCellsinngeNB INTEGER ::= 256` (`:59237`) — the E-UTRA counterpart.
+const MAX_NO_OF_CELLS_IN_NG_ENB: usize = 256;
+/// `maxnoofTAIforRestart INTEGER ::= 2048` (`:59349`)
+const MAX_NO_OF_TAI_FOR_RESTART: usize = 2048;
+/// `maxnoofEAIforRestart INTEGER ::= 256` (`:59247`)
+const MAX_NO_OF_EAI_FOR_RESTART: usize = 256;
+
+/// `RepetitionPeriod ::= INTEGER (0..131071)` (`38413-j30.txt:55881`).
+///
+/// **Not** the S1AP `(0..4095)`. The range exceeds 65536, so
+/// `encode_constrained_whole_number` takes the length-of-length branch
+/// (X.691 Section 13.2.6) instead of writing two aligned octets — an S1AP-shaped
+/// encoder here would emit an IE no gNB could decode.
+const REPETITION_PERIOD_CONSTRAINT: nextgcore_asn1c::per::Constraint =
+    nextgcore_asn1c::per::Constraint::new(0, 131071);
+
+/// `NumberOfBroadcastsRequested ::= INTEGER (0..65535)` (`:52606`), and
+/// `NumberOfBroadcasts ::= INTEGER (0..65535)` (`:52604`).
+const NUMBER_OF_BROADCASTS_CONSTRAINT: nextgcore_asn1c::per::Constraint =
+    nextgcore_asn1c::per::Constraint::new(0, 65535);
+
+/// Push an IE built by `f`, aligning and taking the encoder's bytes as the value.
+fn push_pws_ie<F>(
+    container: &mut ProtocolIeContainer,
+    ie_id: u16,
+    criticality: Criticality,
+    f: F,
+) -> NgapResult<()>
+where
+    F: FnOnce(&mut AperEncoder) -> NgapResult<()>,
+{
+    let mut encoder = AperEncoder::new();
+    f(&mut encoder)?;
+    encoder.align();
+    container.push(ProtocolIeField {
+        id: ProtocolIeId(ie_id),
+        criticality,
+        value: encoder.into_bytes().to_vec(),
+    });
+    Ok(())
+}
+
+/// Encode `id-MessageIdentifier`: `MessageIdentifier ::= BIT STRING (SIZE(16))`
+/// (`38413-j30.txt:50676`), criticality `reject` (`:40911`).
+///
+/// A fixed-length BIT STRING of 16 bits carries no length determinant and, being
+/// <= 16 bits, is **not** octet-aligned before its content (X.691 Section 16).
+pub fn encode_message_identifier(
+    container: &mut ProtocolIeContainer,
+    message_identifier: u16,
+) -> NgapResult<()> {
+    push_pws_ie(
+        container,
+        IE_ID_MESSAGE_IDENTIFIER,
+        Criticality::Reject,
+        |encoder| {
+            encoder.write_bits(message_identifier as u64, 16);
+            Ok(())
+        },
+    )
+}
+
+/// Decode `id-MessageIdentifier` (mirror of [`encode_message_identifier`]).
+pub fn decode_message_identifier(field: &ProtocolIeField) -> NgapResult<u16> {
+    let mut decoder = AperDecoder::new(&field.value);
+    Ok(decoder.read_bits(16)? as u16)
+}
+
+/// Encode `id-SerialNumber`: `SerialNumber ::= BIT STRING (SIZE(16))` (`:56301`),
+/// criticality `reject` (`:40914`).
+pub fn encode_serial_number(
+    container: &mut ProtocolIeContainer,
+    serial_number: u16,
+) -> NgapResult<()> {
+    push_pws_ie(
+        container,
+        IE_ID_SERIAL_NUMBER,
+        Criticality::Reject,
+        |encoder| {
+            encoder.write_bits(serial_number as u64, 16);
+            Ok(())
+        },
+    )
+}
+
+/// Decode `id-SerialNumber`.
+pub fn decode_serial_number(field: &ProtocolIeField) -> NgapResult<u16> {
+    let mut decoder = AperDecoder::new(&field.value);
+    Ok(decoder.read_bits(16)? as u16)
+}
+
+/// Encode `id-RepetitionPeriod` (`INTEGER (0..131071)`, `:55881`), criticality
+/// `reject` (`:40917`).
+pub fn encode_repetition_period(
+    container: &mut ProtocolIeContainer,
+    period: u32,
+) -> NgapResult<()> {
+    push_pws_ie(
+        container,
+        IE_ID_REPETITION_PERIOD,
+        Criticality::Reject,
+        |encoder| {
+            encoder
+                .encode_constrained_whole_number(period as i64, &REPETITION_PERIOD_CONSTRAINT)?;
+            Ok(())
+        },
+    )
+}
+
+/// Decode `id-RepetitionPeriod`.
+pub fn decode_repetition_period(field: &ProtocolIeField) -> NgapResult<u32> {
+    let mut decoder = AperDecoder::new(&field.value);
+    Ok(decoder.decode_constrained_whole_number(&REPETITION_PERIOD_CONSTRAINT)? as u32)
+}
+
+/// Encode `id-NumberOfBroadcastsRequested` (`INTEGER (0..65535)`, `:52606`),
+/// criticality `reject` (`:40920`).
+pub fn encode_number_of_broadcasts_requested(
+    container: &mut ProtocolIeContainer,
+    count: u16,
+) -> NgapResult<()> {
+    push_pws_ie(
+        container,
+        IE_ID_NUMBER_OF_BROADCASTS_REQUESTED,
+        Criticality::Reject,
+        |encoder| {
+            encoder
+                .encode_constrained_whole_number(count as i64, &NUMBER_OF_BROADCASTS_CONSTRAINT)?;
+            Ok(())
+        },
+    )
+}
+
+/// Decode `id-NumberOfBroadcastsRequested`.
+pub fn decode_number_of_broadcasts_requested(field: &ProtocolIeField) -> NgapResult<u16> {
+    let mut decoder = AperDecoder::new(&field.value);
+    Ok(decoder.decode_constrained_whole_number(&NUMBER_OF_BROADCASTS_CONSTRAINT)? as u16)
+}
+
+/// Encode `id-WarningType` (`OCTET STRING (SIZE(2))`, `:58785`), criticality
+/// `ignore` (`:40923`).
+pub fn encode_warning_type(
+    container: &mut ProtocolIeContainer,
+    warning_type: &[u8; 2],
+) -> NgapResult<()> {
+    push_pws_ie(
+        container,
+        IE_ID_WARNING_TYPE,
+        Criticality::Ignore,
+        |encoder| {
+            encoder.encode_octet_string(warning_type, Some(2), Some(2))?;
+            Ok(())
+        },
+    )
+}
+
+/// Decode `id-WarningType`.
+pub fn decode_warning_type(field: &ProtocolIeField) -> NgapResult<[u8; 2]> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let bytes = decoder.decode_octet_string(Some(2), Some(2))?;
+    let mut out = [0u8; 2];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+/// Encode `id-WarningSecurityInfo` (`OCTET STRING (SIZE(50))`, `:58783`),
+/// criticality `ignore` (`:40926`).
+///
+/// Section 9.2.8.1's IE table says of this IE: "This IE is not used in the
+/// specification. If received, the IE is ignored." (`:15895-15899`). It is
+/// encoded and decoded anyway so a container the AMF relays survives byte-exact.
+pub fn encode_warning_security_info(
+    container: &mut ProtocolIeContainer,
+    info: &[u8; 50],
+) -> NgapResult<()> {
+    push_pws_ie(
+        container,
+        IE_ID_WARNING_SECURITY_INFO,
+        Criticality::Ignore,
+        |encoder| {
+            encoder.encode_octet_string(info, Some(50), Some(50))?;
+            Ok(())
+        },
+    )
+}
+
+/// Decode `id-WarningSecurityInfo`.
+pub fn decode_warning_security_info(field: &ProtocolIeField) -> NgapResult<[u8; 50]> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let bytes = decoder.decode_octet_string(Some(50), Some(50))?;
+    let mut out = [0u8; 50];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+/// Encode `id-DataCodingScheme` (`BIT STRING (SIZE(8))`, `:47032`, TS 23.038),
+/// criticality `ignore` (`:40929`).
+pub fn encode_data_coding_scheme(
+    container: &mut ProtocolIeContainer,
+    scheme: u8,
+) -> NgapResult<()> {
+    push_pws_ie(
+        container,
+        IE_ID_DATA_CODING_SCHEME,
+        Criticality::Ignore,
+        |encoder| {
+            encoder.write_bits(scheme as u64, 8);
+            Ok(())
+        },
+    )
+}
+
+/// Decode `id-DataCodingScheme`.
+pub fn decode_data_coding_scheme(field: &ProtocolIeField) -> NgapResult<u8> {
+    let mut decoder = AperDecoder::new(&field.value);
+    Ok(decoder.read_bits(8)? as u8)
+}
+
+/// Encode `id-WarningMessageContents` (`OCTET STRING (SIZE(1..9600))`, `:58781`),
+/// criticality `ignore` (`:40932`).
+pub fn encode_warning_message_contents(
+    container: &mut ProtocolIeContainer,
+    contents: &[u8],
+) -> NgapResult<()> {
+    if contents.is_empty() || contents.len() > 9600 {
+        return Err(crate::error::NgapError::InvalidIeValue {
+            ie_name: "WarningMessageContents",
+            reason: format!(
+                "OCTET STRING (SIZE(1..9600)) violated: {} octets",
+                contents.len()
+            ),
+        });
+    }
+    push_pws_ie(
+        container,
+        IE_ID_WARNING_MESSAGE_CONTENTS,
+        Criticality::Ignore,
+        |encoder| {
+            encoder.encode_octet_string(contents, Some(1), Some(9600))?;
+            Ok(())
+        },
+    )
+}
+
+/// Decode `id-WarningMessageContents`.
+pub fn decode_warning_message_contents(field: &ProtocolIeField) -> NgapResult<Vec<u8>> {
+    let mut decoder = AperDecoder::new(&field.value);
+    Ok(decoder.decode_octet_string(Some(1), Some(9600))?)
+}
+
+/// Encode `id-WarningAreaCoordinates` (`OCTET STRING (SIZE(1..1024))`, `:58758`),
+/// criticality `ignore` (`:40938`).
+///
+/// NGAP-only: TS 36.413 has no counterpart, so there is nothing to copy from
+/// `nextgcore-s1ap` here.
+pub fn encode_warning_area_coordinates(
+    container: &mut ProtocolIeContainer,
+    coordinates: &[u8],
+) -> NgapResult<()> {
+    if coordinates.is_empty() || coordinates.len() > 1024 {
+        return Err(crate::error::NgapError::InvalidIeValue {
+            ie_name: "WarningAreaCoordinates",
+            reason: format!(
+                "OCTET STRING (SIZE(1..1024)) violated: {} octets",
+                coordinates.len()
+            ),
+        });
+    }
+    push_pws_ie(
+        container,
+        IE_ID_WARNING_AREA_COORDINATES,
+        Criticality::Ignore,
+        |encoder| {
+            encoder.encode_octet_string(coordinates, Some(1), Some(1024))?;
+            Ok(())
+        },
+    )
+}
+
+/// Decode `id-WarningAreaCoordinates`.
+pub fn decode_warning_area_coordinates(field: &ProtocolIeField) -> NgapResult<Vec<u8>> {
+    let mut decoder = AperDecoder::new(&field.value);
+    Ok(decoder.decode_octet_string(Some(1), Some(1024))?)
+}
+
+/// Encode `id-ConcurrentWarningMessageInd`
+/// (`ENUMERATED { true, ... }`, `:46737`), criticality `reject` (`:40935`).
+///
+/// A single-value extensible ENUMERATED: the extension bit is 0 and the value
+/// index needs no bits (range 1). Presence of the IE *is* the signal, so there is
+/// no "false" to encode — the caller omits the IE instead.
+pub fn encode_concurrent_warning_message_ind(
+    container: &mut ProtocolIeContainer,
+) -> NgapResult<()> {
+    push_pws_ie(
+        container,
+        IE_ID_CONCURRENT_WARNING_MESSAGE_IND,
+        Criticality::Reject,
+        |encoder| {
+            let constraint = nextgcore_asn1c::per::Constraint::extensible(0, 0);
+            encoder.encode_enumerated(0, &constraint)?;
+            Ok(())
+        },
+    )
+}
+
+/// Encode `id-CancelAllWarningMessages` (`ENUMERATED { true, ... }`, `:45892`),
+/// criticality `reject` (`:41023`). Same presence-is-the-signal shape.
+pub fn encode_cancel_all_warning_messages(container: &mut ProtocolIeContainer) -> NgapResult<()> {
+    push_pws_ie(
+        container,
+        IE_ID_CANCEL_ALL_WARNING_MESSAGES,
+        Criticality::Reject,
+        |encoder| {
+            let constraint = nextgcore_asn1c::per::Constraint::extensible(0, 0);
+            encoder.encode_enumerated(0, &constraint)?;
+            Ok(())
+        },
+    )
+}
+
+/// Encode an `NR-CGI` inline: `SEQUENCE { pLMNIdentity, nRCellIdentity,
+/// iE-Extensions OPTIONAL, ... }` (`38413-j30.txt:52457`).
+///
+/// `NRCellIdentity` is `BIT STRING (SIZE(36))` (`:52455`); > 16 bits, so the
+/// content is octet-aligned (X.691 Section 16).
+fn encode_nr_cgi_inline(encoder: &mut AperEncoder, cgi: &NrCgi) -> NgapResult<()> {
+    encoder.write_bit(false); // extension marker
+    encoder.write_bit(false); // no iE-Extensions
+    encoder.encode_octet_string(&cgi.plmn_identity, Some(3), Some(3))?;
+    encoder.align();
+    encoder.write_bits(cgi.nr_cell_identity & 0x0F_FFFF_FFFF, 36);
+    Ok(())
+}
+
+/// Decode an `NR-CGI` inline (mirror of [`encode_nr_cgi_inline`]).
+fn decode_nr_cgi_inline(decoder: &mut AperDecoder) -> NgapResult<NrCgi> {
+    let _ext = decoder.read_bit()?;
+    let _ie_ext = decoder.read_bit()?;
+    let plmn = decoder.decode_octet_string(Some(3), Some(3))?;
+    let mut plmn_identity = [0u8; 3];
+    plmn_identity.copy_from_slice(&plmn);
+    decoder.align();
+    let nr_cell_identity = decoder.read_bits(36)?;
+    Ok(NrCgi {
+        plmn_identity,
+        nr_cell_identity,
+    })
+}
+
+/// Encode an `EUTRA-CGI` inline: `SEQUENCE { pLMNIdentity, eUTRACellIdentity,
+/// iE-Extensions OPTIONAL, ... }` (`:47862`).
+///
+/// `EUTRACellIdentity` is `BIT STRING (SIZE(28))` (`:47860`) — 8 bits narrower
+/// than the NR one, which is why the two CGI kinds need separate codecs even
+/// though they sit in one CHOICE.
+fn encode_eutra_cgi_inline(encoder: &mut AperEncoder, cgi: &EutraCgi) -> NgapResult<()> {
+    encoder.write_bit(false); // extension marker
+    encoder.write_bit(false); // no iE-Extensions
+    encoder.encode_octet_string(&cgi.plmn_identity, Some(3), Some(3))?;
+    encoder.align();
+    encoder.write_bits((cgi.eutra_cell_identity & 0x0FFF_FFFF) as u64, 28);
+    Ok(())
+}
+
+/// Decode an `EUTRA-CGI` inline (mirror of [`encode_eutra_cgi_inline`]).
+fn decode_eutra_cgi_inline(decoder: &mut AperDecoder) -> NgapResult<EutraCgi> {
+    let _ext = decoder.read_bit()?;
+    let _ie_ext = decoder.read_bit()?;
+    let plmn = decoder.decode_octet_string(Some(3), Some(3))?;
+    let mut plmn_identity = [0u8; 3];
+    plmn_identity.copy_from_slice(&plmn);
+    decoder.align();
+    let eutra_cell_identity = decoder.read_bits(28)? as u32;
+    Ok(EutraCgi {
+        plmn_identity,
+        eutra_cell_identity,
+    })
+}
+
+/// Encode a `SEQUENCE (SIZE(1..bound)) OF item` using `f` per item.
+fn encode_pws_seq_of<T, F>(
+    encoder: &mut AperEncoder,
+    items: &[T],
+    bound: usize,
+    ie_name: &'static str,
+    mut f: F,
+) -> NgapResult<()>
+where
+    F: FnMut(&mut AperEncoder, &T) -> NgapResult<()>,
+{
+    if items.is_empty() || items.len() > bound {
+        return Err(crate::error::NgapError::InvalidIeValue {
+            ie_name,
+            reason: format!(
+                "SEQUENCE (SIZE(1..{bound})) violated: {} items",
+                items.len()
+            ),
+        });
+    }
+    encoder.encode_constrained_length(items.len(), 1, bound)?;
+    for item in items {
+        f(encoder, item)?;
+    }
+    Ok(())
+}
+
+/// Decode a `SEQUENCE (SIZE(1..bound)) OF item` using `f` per item.
+fn decode_pws_seq_of<T, F>(decoder: &mut AperDecoder, bound: usize, mut f: F) -> NgapResult<Vec<T>>
+where
+    F: FnMut(&mut AperDecoder) -> NgapResult<T>,
+{
+    let count = decoder.decode_constrained_length(1, bound)?;
+    let mut out = Vec::with_capacity(count.min(64));
+    for _ in 0..count {
+        out.push(f(decoder)?);
+    }
+    Ok(out)
+}
+
+/// Encode `id-WarningAreaList`: the FOUR-alternative extensible CHOICE at
+/// `38413-j30.txt:58760`, criticality `ignore` (`:40916`).
+///
+/// The CHOICE carries `choice-Extensions` as a fifth alternative, so it IS
+/// extensible: an extension bit precedes a 2-bit index over the four root
+/// alternatives. Alternative order is the ASN.1 declaration order.
+pub fn encode_warning_area_list(
+    container: &mut ProtocolIeContainer,
+    area: &WarningAreaList,
+) -> NgapResult<()> {
+    push_pws_ie(
+        container,
+        IE_ID_WARNING_AREA_LIST,
+        Criticality::Ignore,
+        |encoder| {
+            match area {
+                WarningAreaList::EutraCgiList(cells) => {
+                    encoder.encode_choice_index(0, 4, true)?;
+                    encode_pws_seq_of(
+                        encoder,
+                        cells,
+                        MAX_NO_OF_PWS_AREA_ITEMS,
+                        "EUTRA-CGIListForWarning",
+                        encode_eutra_cgi_inline,
+                    )?;
+                }
+                WarningAreaList::NrCgiList(cells) => {
+                    encoder.encode_choice_index(1, 4, true)?;
+                    encode_pws_seq_of(
+                        encoder,
+                        cells,
+                        MAX_NO_OF_PWS_AREA_ITEMS,
+                        "NR-CGIListForWarning",
+                        encode_nr_cgi_inline,
+                    )?;
+                }
+                WarningAreaList::TaiList(tais) => {
+                    encoder.encode_choice_index(2, 4, true)?;
+                    encode_pws_seq_of(
+                        encoder,
+                        tais,
+                        MAX_NO_OF_PWS_AREA_ITEMS,
+                        "TAIListForWarning",
+                        encode_tai_inline,
+                    )?;
+                }
+                WarningAreaList::EmergencyAreaIdList(ids) => {
+                    encoder.encode_choice_index(3, 4, true)?;
+                    encode_pws_seq_of(
+                        encoder,
+                        ids,
+                        MAX_NO_OF_PWS_AREA_ITEMS,
+                        "EmergencyAreaIDList",
+                        |encoder, id| {
+                            encoder.encode_octet_string(id, Some(3), Some(3))?;
+                            Ok(())
+                        },
+                    )?;
+                }
+            }
+            Ok(())
+        },
+    )
+}
+
+/// Decode a 3-octet `EmergencyAreaID` (`OCTET STRING (SIZE(3))`, `:47614`).
+fn decode_emergency_area_id(decoder: &mut AperDecoder) -> NgapResult<[u8; 3]> {
+    let bytes = decoder.decode_octet_string(Some(3), Some(3))?;
+    let mut out = [0u8; 3];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+/// Decode `id-WarningAreaList` (mirror of [`encode_warning_area_list`]).
+pub fn decode_warning_area_list(field: &ProtocolIeField) -> NgapResult<WarningAreaList> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let choice = decoder.decode_choice_index(4, true)?;
+    match choice {
+        0 => Ok(WarningAreaList::EutraCgiList(decode_pws_seq_of(
+            &mut decoder,
+            MAX_NO_OF_PWS_AREA_ITEMS,
+            decode_eutra_cgi_inline,
+        )?)),
+        1 => Ok(WarningAreaList::NrCgiList(decode_pws_seq_of(
+            &mut decoder,
+            MAX_NO_OF_PWS_AREA_ITEMS,
+            decode_nr_cgi_inline,
+        )?)),
+        2 => Ok(WarningAreaList::TaiList(decode_pws_seq_of(
+            &mut decoder,
+            MAX_NO_OF_PWS_AREA_ITEMS,
+            decode_tai_inline,
+        )?)),
+        3 => Ok(WarningAreaList::EmergencyAreaIdList(decode_pws_seq_of(
+            &mut decoder,
+            MAX_NO_OF_PWS_AREA_ITEMS,
+            decode_emergency_area_id,
+        )?)),
+        other => Err(crate::error::NgapError::InvalidIeValue {
+            ie_name: "WarningAreaList",
+            reason: format!("unsupported CHOICE index {other}"),
+        }),
+    }
+}
+
+/// Encode a `TAIBroadcast*-Item`: `SEQUENCE { tAI, completedCellsInTAI-*,
+/// iE-Extensions OPTIONAL, ... }` (`:57027` / `:57049`).
+fn encode_tai_broadcast_item<C, F>(
+    encoder: &mut AperEncoder,
+    item: &TaiBroadcastItem<C>,
+    ie_name: &'static str,
+    f: F,
+) -> NgapResult<()>
+where
+    F: FnMut(&mut AperEncoder, &C) -> NgapResult<()>,
+{
+    encoder.write_bit(false); // extension marker
+    encoder.write_bit(false); // no iE-Extensions
+    encode_tai_inline(encoder, &item.tai)?;
+    encode_pws_seq_of(
+        encoder,
+        &item.completed_cells,
+        MAX_NO_OF_PWS_AREA_ITEMS,
+        ie_name,
+        f,
+    )
+}
+
+/// Decode a `TAIBroadcast*-Item`.
+fn decode_tai_broadcast_item<C, F>(
+    decoder: &mut AperDecoder,
+    f: F,
+) -> NgapResult<TaiBroadcastItem<C>>
+where
+    F: FnMut(&mut AperDecoder) -> NgapResult<C>,
+{
+    let _ext = decoder.read_bit()?;
+    let _ie_ext = decoder.read_bit()?;
+    let tai = decode_tai_inline(decoder)?;
+    let completed_cells = decode_pws_seq_of(decoder, MAX_NO_OF_PWS_AREA_ITEMS, f)?;
+    Ok(TaiBroadcastItem {
+        tai,
+        completed_cells,
+    })
+}
+
+/// Encode an `EmergencyAreaIDBroadcast*-Item`: `SEQUENCE { emergencyAreaID,
+/// completedCellsInEAI-*, iE-Extensions OPTIONAL, ... }` (`:47619` / `:47641`).
+fn encode_emergency_area_broadcast_item<C, F>(
+    encoder: &mut AperEncoder,
+    item: &EmergencyAreaBroadcastItem<C>,
+    ie_name: &'static str,
+    f: F,
+) -> NgapResult<()>
+where
+    F: FnMut(&mut AperEncoder, &C) -> NgapResult<()>,
+{
+    encoder.write_bit(false); // extension marker
+    encoder.write_bit(false); // no iE-Extensions
+    encoder.encode_octet_string(&item.emergency_area_id, Some(3), Some(3))?;
+    encode_pws_seq_of(
+        encoder,
+        &item.completed_cells,
+        MAX_NO_OF_PWS_AREA_ITEMS,
+        ie_name,
+        f,
+    )
+}
+
+/// Decode an `EmergencyAreaIDBroadcast*-Item`.
+fn decode_emergency_area_broadcast_item<C, F>(
+    decoder: &mut AperDecoder,
+    f: F,
+) -> NgapResult<EmergencyAreaBroadcastItem<C>>
+where
+    F: FnMut(&mut AperDecoder) -> NgapResult<C>,
+{
+    let _ext = decoder.read_bit()?;
+    let _ie_ext = decoder.read_bit()?;
+    let emergency_area_id = decode_emergency_area_id(decoder)?;
+    let completed_cells = decode_pws_seq_of(decoder, MAX_NO_OF_PWS_AREA_ITEMS, f)?;
+    Ok(EmergencyAreaBroadcastItem {
+        emergency_area_id,
+        completed_cells,
+    })
+}
+
+/// Encode `id-BroadcastCompletedAreaList`: the SIX-alternative extensible CHOICE
+/// at `38413-j30.txt:45687`, criticality `ignore` (`:40971`).
+///
+/// Six root alternatives (E-UTRA and NR forms of cell / TAI / emergency-area)
+/// against the S1AP counterpart's three, so an extension bit precedes a 3-bit
+/// index. Alternative order is the ASN.1 declaration order.
+pub fn encode_broadcast_completed_area_list(
+    container: &mut ProtocolIeContainer,
+    list: &BroadcastCompletedAreaList,
+) -> NgapResult<()> {
+    push_pws_ie(
+        container,
+        IE_ID_BROADCAST_COMPLETED_AREA_LIST,
+        Criticality::Ignore,
+        |encoder| {
+            match list {
+                BroadcastCompletedAreaList::CellIdEutra(cells) => {
+                    encoder.encode_choice_index(0, 6, true)?;
+                    encode_pws_seq_of(
+                        encoder,
+                        cells,
+                        MAX_NO_OF_PWS_AREA_ITEMS,
+                        "CellIDBroadcastEUTRA",
+                        |encoder, cgi| {
+                            encoder.write_bit(false); // Item extension marker
+                            encoder.write_bit(false); // no iE-Extensions
+                            encode_eutra_cgi_inline(encoder, cgi)
+                        },
+                    )?;
+                }
+                BroadcastCompletedAreaList::TaiEutra(items) => {
+                    encoder.encode_choice_index(1, 6, true)?;
+                    encode_pws_seq_of(
+                        encoder,
+                        items,
+                        MAX_NO_OF_PWS_AREA_ITEMS,
+                        "TAIBroadcastEUTRA",
+                        |encoder, item| {
+                            encode_tai_broadcast_item(
+                                encoder,
+                                item,
+                                "CompletedCellsInTAI-EUTRA",
+                                |encoder, cgi| {
+                                    encoder.write_bit(false);
+                                    encoder.write_bit(false);
+                                    encode_eutra_cgi_inline(encoder, cgi)
+                                },
+                            )
+                        },
+                    )?;
+                }
+                BroadcastCompletedAreaList::EmergencyAreaEutra(items) => {
+                    encoder.encode_choice_index(2, 6, true)?;
+                    encode_pws_seq_of(
+                        encoder,
+                        items,
+                        MAX_NO_OF_PWS_AREA_ITEMS,
+                        "EmergencyAreaIDBroadcastEUTRA",
+                        |encoder, item| {
+                            encode_emergency_area_broadcast_item(
+                                encoder,
+                                item,
+                                "CompletedCellsInEAI-EUTRA",
+                                |encoder, cgi| {
+                                    encoder.write_bit(false);
+                                    encoder.write_bit(false);
+                                    encode_eutra_cgi_inline(encoder, cgi)
+                                },
+                            )
+                        },
+                    )?;
+                }
+                BroadcastCompletedAreaList::CellIdNr(cells) => {
+                    encoder.encode_choice_index(3, 6, true)?;
+                    encode_pws_seq_of(
+                        encoder,
+                        cells,
+                        MAX_NO_OF_PWS_AREA_ITEMS,
+                        "CellIDBroadcastNR",
+                        |encoder, cgi| {
+                            encoder.write_bit(false);
+                            encoder.write_bit(false);
+                            encode_nr_cgi_inline(encoder, cgi)
+                        },
+                    )?;
+                }
+                BroadcastCompletedAreaList::TaiNr(items) => {
+                    encoder.encode_choice_index(4, 6, true)?;
+                    encode_pws_seq_of(
+                        encoder,
+                        items,
+                        MAX_NO_OF_PWS_AREA_ITEMS,
+                        "TAIBroadcastNR",
+                        |encoder, item| {
+                            encode_tai_broadcast_item(
+                                encoder,
+                                item,
+                                "CompletedCellsInTAI-NR",
+                                |encoder, cgi| {
+                                    encoder.write_bit(false);
+                                    encoder.write_bit(false);
+                                    encode_nr_cgi_inline(encoder, cgi)
+                                },
+                            )
+                        },
+                    )?;
+                }
+                BroadcastCompletedAreaList::EmergencyAreaNr(items) => {
+                    encoder.encode_choice_index(5, 6, true)?;
+                    encode_pws_seq_of(
+                        encoder,
+                        items,
+                        MAX_NO_OF_PWS_AREA_ITEMS,
+                        "EmergencyAreaIDBroadcastNR",
+                        |encoder, item| {
+                            encode_emergency_area_broadcast_item(
+                                encoder,
+                                item,
+                                "CompletedCellsInEAI-NR",
+                                |encoder, cgi| {
+                                    encoder.write_bit(false);
+                                    encoder.write_bit(false);
+                                    encode_nr_cgi_inline(encoder, cgi)
+                                },
+                            )
+                        },
+                    )?;
+                }
+            }
+            Ok(())
+        },
+    )
+}
+
+/// Decode `id-BroadcastCompletedAreaList` (mirror of
+/// [`encode_broadcast_completed_area_list`]).
+pub fn decode_broadcast_completed_area_list(
+    field: &ProtocolIeField,
+) -> NgapResult<BroadcastCompletedAreaList> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let choice = decoder.decode_choice_index(6, true)?;
+    let eutra_item = |decoder: &mut AperDecoder| -> NgapResult<EutraCgi> {
+        let _ext = decoder.read_bit()?;
+        let _ie_ext = decoder.read_bit()?;
+        decode_eutra_cgi_inline(decoder)
+    };
+    let nr_item = |decoder: &mut AperDecoder| -> NgapResult<NrCgi> {
+        let _ext = decoder.read_bit()?;
+        let _ie_ext = decoder.read_bit()?;
+        decode_nr_cgi_inline(decoder)
+    };
+    match choice {
+        0 => Ok(BroadcastCompletedAreaList::CellIdEutra(decode_pws_seq_of(
+            &mut decoder,
+            MAX_NO_OF_PWS_AREA_ITEMS,
+            eutra_item,
+        )?)),
+        1 => Ok(BroadcastCompletedAreaList::TaiEutra(decode_pws_seq_of(
+            &mut decoder,
+            MAX_NO_OF_PWS_AREA_ITEMS,
+            |d| decode_tai_broadcast_item(d, eutra_item),
+        )?)),
+        2 => Ok(BroadcastCompletedAreaList::EmergencyAreaEutra(
+            decode_pws_seq_of(&mut decoder, MAX_NO_OF_PWS_AREA_ITEMS, |d| {
+                decode_emergency_area_broadcast_item(d, eutra_item)
+            })?,
+        )),
+        3 => Ok(BroadcastCompletedAreaList::CellIdNr(decode_pws_seq_of(
+            &mut decoder,
+            MAX_NO_OF_PWS_AREA_ITEMS,
+            nr_item,
+        )?)),
+        4 => Ok(BroadcastCompletedAreaList::TaiNr(decode_pws_seq_of(
+            &mut decoder,
+            MAX_NO_OF_PWS_AREA_ITEMS,
+            |d| decode_tai_broadcast_item(d, nr_item),
+        )?)),
+        5 => Ok(BroadcastCompletedAreaList::EmergencyAreaNr(
+            decode_pws_seq_of(&mut decoder, MAX_NO_OF_PWS_AREA_ITEMS, |d| {
+                decode_emergency_area_broadcast_item(d, nr_item)
+            })?,
+        )),
+        other => Err(crate::error::NgapError::InvalidIeValue {
+            ie_name: "BroadcastCompletedAreaList",
+            reason: format!("unsupported CHOICE index {other}"),
+        }),
+    }
+}
+
+/// Encode a `CancelledCells*-Item`: `SEQUENCE { <CGI>, numberOfBroadcasts,
+/// iE-Extensions OPTIONAL, ... }` (`:45947` / `:45969` and friends).
+///
+/// The `numberOfBroadcasts` field is what separates the CANCELLED lists from the
+/// COMPLETED ones: a cancel reports how far the broadcast had got.
+fn encode_cancelled_cell_item<C, F>(
+    encoder: &mut AperEncoder,
+    item: &CancelledCellItem<C>,
+    mut f: F,
+) -> NgapResult<()>
+where
+    F: FnMut(&mut AperEncoder, &C) -> NgapResult<()>,
+{
+    encoder.write_bit(false); // extension marker
+    encoder.write_bit(false); // no iE-Extensions
+    f(encoder, &item.cgi)?;
+    encoder.encode_constrained_whole_number(
+        item.number_of_broadcasts as i64,
+        &NUMBER_OF_BROADCASTS_CONSTRAINT,
+    )?;
+    Ok(())
+}
+
+/// Decode a `CancelledCells*-Item`.
+fn decode_cancelled_cell_item<C, F>(
+    decoder: &mut AperDecoder,
+    mut f: F,
+) -> NgapResult<CancelledCellItem<C>>
+where
+    F: FnMut(&mut AperDecoder) -> NgapResult<C>,
+{
+    let _ext = decoder.read_bit()?;
+    let _ie_ext = decoder.read_bit()?;
+    let cgi = f(decoder)?;
+    let number_of_broadcasts =
+        decoder.decode_constrained_whole_number(&NUMBER_OF_BROADCASTS_CONSTRAINT)? as u16;
+    Ok(CancelledCellItem {
+        cgi,
+        number_of_broadcasts,
+    })
+}
+
+/// Encode `id-BroadcastCancelledAreaList`: the SIX-alternative extensible CHOICE
+/// at `38413-j30.txt:45662`, criticality `ignore` (`:41053`).
+pub fn encode_broadcast_cancelled_area_list(
+    container: &mut ProtocolIeContainer,
+    list: &BroadcastCancelledAreaList,
+) -> NgapResult<()> {
+    push_pws_ie(
+        container,
+        IE_ID_BROADCAST_CANCELLED_AREA_LIST,
+        Criticality::Ignore,
+        |encoder| {
+            match list {
+                BroadcastCancelledAreaList::CellIdEutra(cells) => {
+                    encoder.encode_choice_index(0, 6, true)?;
+                    encode_pws_seq_of(
+                        encoder,
+                        cells,
+                        MAX_NO_OF_PWS_AREA_ITEMS,
+                        "CellIDCancelledEUTRA",
+                        |encoder, item| {
+                            encode_cancelled_cell_item(encoder, item, encode_eutra_cgi_inline)
+                        },
+                    )?;
+                }
+                BroadcastCancelledAreaList::TaiEutra(items) => {
+                    encoder.encode_choice_index(1, 6, true)?;
+                    encode_pws_seq_of(
+                        encoder,
+                        items,
+                        MAX_NO_OF_PWS_AREA_ITEMS,
+                        "TAICancelledEUTRA",
+                        |encoder, item| {
+                            encoder.write_bit(false);
+                            encoder.write_bit(false);
+                            encode_tai_inline(encoder, &item.tai)?;
+                            encode_pws_seq_of(
+                                encoder,
+                                &item.cancelled_cells,
+                                MAX_NO_OF_PWS_AREA_ITEMS,
+                                "CancelledCellsInTAI-EUTRA",
+                                |encoder, cell| {
+                                    encode_cancelled_cell_item(
+                                        encoder,
+                                        cell,
+                                        encode_eutra_cgi_inline,
+                                    )
+                                },
+                            )
+                        },
+                    )?;
+                }
+                BroadcastCancelledAreaList::EmergencyAreaEutra(items) => {
+                    encoder.encode_choice_index(2, 6, true)?;
+                    encode_pws_seq_of(
+                        encoder,
+                        items,
+                        MAX_NO_OF_PWS_AREA_ITEMS,
+                        "EmergencyAreaIDCancelledEUTRA",
+                        |encoder, item| {
+                            encoder.write_bit(false);
+                            encoder.write_bit(false);
+                            encoder.encode_octet_string(
+                                &item.emergency_area_id,
+                                Some(3),
+                                Some(3),
+                            )?;
+                            encode_pws_seq_of(
+                                encoder,
+                                &item.cancelled_cells,
+                                MAX_NO_OF_PWS_AREA_ITEMS,
+                                "CancelledCellsInEAI-EUTRA",
+                                |encoder, cell| {
+                                    encode_cancelled_cell_item(
+                                        encoder,
+                                        cell,
+                                        encode_eutra_cgi_inline,
+                                    )
+                                },
+                            )
+                        },
+                    )?;
+                }
+                BroadcastCancelledAreaList::CellIdNr(cells) => {
+                    encoder.encode_choice_index(3, 6, true)?;
+                    encode_pws_seq_of(
+                        encoder,
+                        cells,
+                        MAX_NO_OF_PWS_AREA_ITEMS,
+                        "CellIDCancelledNR",
+                        |encoder, item| {
+                            encode_cancelled_cell_item(encoder, item, encode_nr_cgi_inline)
+                        },
+                    )?;
+                }
+                BroadcastCancelledAreaList::TaiNr(items) => {
+                    encoder.encode_choice_index(4, 6, true)?;
+                    encode_pws_seq_of(
+                        encoder,
+                        items,
+                        MAX_NO_OF_PWS_AREA_ITEMS,
+                        "TAICancelledNR",
+                        |encoder, item| {
+                            encoder.write_bit(false);
+                            encoder.write_bit(false);
+                            encode_tai_inline(encoder, &item.tai)?;
+                            encode_pws_seq_of(
+                                encoder,
+                                &item.cancelled_cells,
+                                MAX_NO_OF_PWS_AREA_ITEMS,
+                                "CancelledCellsInTAI-NR",
+                                |encoder, cell| {
+                                    encode_cancelled_cell_item(encoder, cell, encode_nr_cgi_inline)
+                                },
+                            )
+                        },
+                    )?;
+                }
+                BroadcastCancelledAreaList::EmergencyAreaNr(items) => {
+                    encoder.encode_choice_index(5, 6, true)?;
+                    encode_pws_seq_of(
+                        encoder,
+                        items,
+                        MAX_NO_OF_PWS_AREA_ITEMS,
+                        "EmergencyAreaIDCancelledNR",
+                        |encoder, item| {
+                            encoder.write_bit(false);
+                            encoder.write_bit(false);
+                            encoder.encode_octet_string(
+                                &item.emergency_area_id,
+                                Some(3),
+                                Some(3),
+                            )?;
+                            encode_pws_seq_of(
+                                encoder,
+                                &item.cancelled_cells,
+                                MAX_NO_OF_PWS_AREA_ITEMS,
+                                "CancelledCellsInEAI-NR",
+                                |encoder, cell| {
+                                    encode_cancelled_cell_item(encoder, cell, encode_nr_cgi_inline)
+                                },
+                            )
+                        },
+                    )?;
+                }
+            }
+            Ok(())
+        },
+    )
+}
+
+/// Decode `id-BroadcastCancelledAreaList` (mirror of
+/// [`encode_broadcast_cancelled_area_list`]).
+pub fn decode_broadcast_cancelled_area_list(
+    field: &ProtocolIeField,
+) -> NgapResult<BroadcastCancelledAreaList> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let choice = decoder.decode_choice_index(6, true)?;
+    match choice {
+        0 => Ok(BroadcastCancelledAreaList::CellIdEutra(decode_pws_seq_of(
+            &mut decoder,
+            MAX_NO_OF_PWS_AREA_ITEMS,
+            |d| decode_cancelled_cell_item(d, decode_eutra_cgi_inline),
+        )?)),
+        1 => Ok(BroadcastCancelledAreaList::TaiEutra(decode_pws_seq_of(
+            &mut decoder,
+            MAX_NO_OF_PWS_AREA_ITEMS,
+            |d| {
+                let _ext = d.read_bit()?;
+                let _ie_ext = d.read_bit()?;
+                let tai = decode_tai_inline(d)?;
+                let cancelled_cells = decode_pws_seq_of(d, MAX_NO_OF_PWS_AREA_ITEMS, |d| {
+                    decode_cancelled_cell_item(d, decode_eutra_cgi_inline)
+                })?;
+                Ok(TaiCancelledItem {
+                    tai,
+                    cancelled_cells,
+                })
+            },
+        )?)),
+        2 => Ok(BroadcastCancelledAreaList::EmergencyAreaEutra(
+            decode_pws_seq_of(&mut decoder, MAX_NO_OF_PWS_AREA_ITEMS, |d| {
+                let _ext = d.read_bit()?;
+                let _ie_ext = d.read_bit()?;
+                let emergency_area_id = decode_emergency_area_id(d)?;
+                let cancelled_cells = decode_pws_seq_of(d, MAX_NO_OF_PWS_AREA_ITEMS, |d| {
+                    decode_cancelled_cell_item(d, decode_eutra_cgi_inline)
+                })?;
+                Ok(EmergencyAreaCancelledItem {
+                    emergency_area_id,
+                    cancelled_cells,
+                })
+            })?,
+        )),
+        3 => Ok(BroadcastCancelledAreaList::CellIdNr(decode_pws_seq_of(
+            &mut decoder,
+            MAX_NO_OF_PWS_AREA_ITEMS,
+            |d| decode_cancelled_cell_item(d, decode_nr_cgi_inline),
+        )?)),
+        4 => Ok(BroadcastCancelledAreaList::TaiNr(decode_pws_seq_of(
+            &mut decoder,
+            MAX_NO_OF_PWS_AREA_ITEMS,
+            |d| {
+                let _ext = d.read_bit()?;
+                let _ie_ext = d.read_bit()?;
+                let tai = decode_tai_inline(d)?;
+                let cancelled_cells = decode_pws_seq_of(d, MAX_NO_OF_PWS_AREA_ITEMS, |d| {
+                    decode_cancelled_cell_item(d, decode_nr_cgi_inline)
+                })?;
+                Ok(TaiCancelledItem {
+                    tai,
+                    cancelled_cells,
+                })
+            },
+        )?)),
+        5 => Ok(BroadcastCancelledAreaList::EmergencyAreaNr(
+            decode_pws_seq_of(&mut decoder, MAX_NO_OF_PWS_AREA_ITEMS, |d| {
+                let _ext = d.read_bit()?;
+                let _ie_ext = d.read_bit()?;
+                let emergency_area_id = decode_emergency_area_id(d)?;
+                let cancelled_cells = decode_pws_seq_of(d, MAX_NO_OF_PWS_AREA_ITEMS, |d| {
+                    decode_cancelled_cell_item(d, decode_nr_cgi_inline)
+                })?;
+                Ok(EmergencyAreaCancelledItem {
+                    emergency_area_id,
+                    cancelled_cells,
+                })
+            })?,
+        )),
+        other => Err(crate::error::NgapError::InvalidIeValue {
+            ie_name: "BroadcastCancelledAreaList",
+            reason: format!("unsupported CHOICE index {other}"),
+        }),
+    }
+}
+
+/// Encode the PWS Restart / Failure Indication cell CHOICE.
+///
+/// Both messages carry `CHOICE { >E-UTRA, >NR }` (Section 9.2.8.5's "CHOICE Cell
+/// List for Restart" at `38413-j30.txt:16006`, Section 9.2.8.6's "CHOICE PWS
+/// Failed Cell List" at `:16075`). Criticality `reject` in both.
+///
+/// The per-arm bounds differ: `maxnoofCellsinngeNB` = 256 for the E-UTRA arm and
+/// `maxnoofCellsingNB` = 16384 for the NR arm (`:16049-16055`), not the 65535 the
+/// warning-area lists use.
+pub fn encode_pws_cell_list(
+    container: &mut ProtocolIeContainer,
+    ie_id: u16,
+    list: &PwsCellList,
+) -> NgapResult<()> {
+    push_pws_ie(container, ie_id, Criticality::Reject, |encoder| {
+        match list {
+            PwsCellList::Eutra(cells) => {
+                encoder.encode_choice_index(0, 2, true)?;
+                encode_pws_seq_of(
+                    encoder,
+                    cells,
+                    MAX_NO_OF_CELLS_IN_NG_ENB,
+                    "PWS E-UTRA cell list",
+                    encode_eutra_cgi_inline,
+                )?;
+            }
+            PwsCellList::Nr(cells) => {
+                encoder.encode_choice_index(1, 2, true)?;
+                encode_pws_seq_of(
+                    encoder,
+                    cells,
+                    MAX_NO_OF_CELLS_IN_GNB,
+                    "PWS NR cell list",
+                    encode_nr_cgi_inline,
+                )?;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Decode the PWS Restart / Failure Indication cell CHOICE.
+pub fn decode_pws_cell_list(field: &ProtocolIeField) -> NgapResult<PwsCellList> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let choice = decoder.decode_choice_index(2, true)?;
+    match choice {
+        0 => Ok(PwsCellList::Eutra(decode_pws_seq_of(
+            &mut decoder,
+            MAX_NO_OF_CELLS_IN_NG_ENB,
+            decode_eutra_cgi_inline,
+        )?)),
+        1 => Ok(PwsCellList::Nr(decode_pws_seq_of(
+            &mut decoder,
+            MAX_NO_OF_CELLS_IN_GNB,
+            decode_nr_cgi_inline,
+        )?)),
+        other => Err(crate::error::NgapError::InvalidIeValue {
+            ie_name: "PWS cell list",
+            reason: format!("unsupported CHOICE index {other}"),
+        }),
+    }
+}
+
+/// Encode `id-TAIListForRestart`: `SEQUENCE (SIZE(1..maxnoofTAIforRestart=2048))
+/// OF TAI` (`38413-j30.txt:57152`), criticality `reject` (`:16034`).
+pub fn encode_tai_list_for_restart(
+    container: &mut ProtocolIeContainer,
+    tais: &[TaiListItem],
+) -> NgapResult<()> {
+    push_pws_ie(
+        container,
+        IE_ID_TAI_LIST_FOR_RESTART,
+        Criticality::Reject,
+        |encoder| {
+            encode_pws_seq_of(
+                encoder,
+                tais,
+                MAX_NO_OF_TAI_FOR_RESTART,
+                "TAIListForRestart",
+                encode_tai_inline,
+            )
+        },
+    )
+}
+
+/// Decode `id-TAIListForRestart`.
+pub fn decode_tai_list_for_restart(field: &ProtocolIeField) -> NgapResult<Vec<TaiListItem>> {
+    let mut decoder = AperDecoder::new(&field.value);
+    decode_pws_seq_of(&mut decoder, MAX_NO_OF_TAI_FOR_RESTART, decode_tai_inline)
+}
+
+/// Encode `id-EmergencyAreaIDListForRestart`:
+/// `SEQUENCE (SIZE(1..maxnoofEAIforRestart=256)) OF EmergencyAreaID` (`:47707`),
+/// criticality `reject` (`:16039`).
+pub fn encode_emergency_area_id_list_for_restart(
+    container: &mut ProtocolIeContainer,
+    ids: &[[u8; 3]],
+) -> NgapResult<()> {
+    push_pws_ie(
+        container,
+        IE_ID_EMERGENCY_AREA_ID_LIST_FOR_RESTART,
+        Criticality::Reject,
+        |encoder| {
+            encode_pws_seq_of(
+                encoder,
+                ids,
+                MAX_NO_OF_EAI_FOR_RESTART,
+                "EmergencyAreaIDListForRestart",
+                |encoder, id| {
+                    encoder.encode_octet_string(id, Some(3), Some(3))?;
+                    Ok(())
+                },
+            )
+        },
+    )
+}
+
+/// Decode `id-EmergencyAreaIDListForRestart`.
+pub fn decode_emergency_area_id_list_for_restart(
+    field: &ProtocolIeField,
+) -> NgapResult<Vec<[u8; 3]>> {
+    let mut decoder = AperDecoder::new(&field.value);
+    decode_pws_seq_of(
+        &mut decoder,
+        MAX_NO_OF_EAI_FOR_RESTART,
+        decode_emergency_area_id,
+    )
+}

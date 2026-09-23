@@ -766,6 +766,11 @@ impl NgapServer {
         // Dormant when none pending.
         self.process_network_deregs().await;
 
+        // Relay any PWS warning containers the Namf non-UE N2 transfer handler
+        // enqueued (#396, TS 29.518 §5.2.2.4.1.3 / TS 38.413 §8.12) to the
+        // NG-RAN nodes the consumer targeted. Dormant when none pending.
+        self.process_pws_n2_transfers().await;
+
         // Process any pending server events
         while let Ok(event) = self.server_event_rx.try_recv() {
             self.handle_server_event(event).await?;
@@ -5653,6 +5658,134 @@ impl NgapServer {
                 );
             }
         }
+    }
+
+    /// Drain the PWS N2 relay queue the Namf `non-ue-n2-messages/transfer`
+    /// handler populated and forward each warning container to the NG-RAN nodes
+    /// the consumer targeted (#396, TS 29.518 §5.2.2.4.1.3, TS 38.413 §8.12).
+    /// This is the (non-test) caller of [`Self::pws_target_associations`].
+    ///
+    /// The container is sent **verbatim**: `pwsContainer` is a transparent
+    /// `N2InfoContent` and §5.2.2.4.1.3 has the AMF *forward* it
+    /// (`6g_docs/specs/29518-k00.txt:4152`). This pump decodes only far enough to
+    /// log which PWS procedure it is relaying — it never re-encodes, because a
+    /// decode/re-encode round trip through a partial model would drop any IE the
+    /// CBCF sent that this build does not know about.
+    async fn process_pws_n2_transfers(&mut self) {
+        let ctx = crate::context::amf_self();
+        let pending = {
+            let Ok(guard) = ctx.read() else {
+                return;
+            };
+            guard.pws_n2_drain()
+        };
+        for item in pending {
+            let targets = self.pws_target_associations(&item).await;
+            if targets.is_empty() {
+                // Fail-loud rather than silently succeeding: a warning message
+                // that reached no RAN node did not go out, and an operator must
+                // be able to see that from the AMF's own logs. The SBI response
+                // was already written by the time we get here (the 200 reports
+                // that the AMF *initiated* the transfer, per §5.2.2.4.1.3 step
+                // 2a), so this is the only place the fact can surface.
+                log::warn!(
+                    "PWS relay: warning message_identifier={:#06x} serial_number={:#06x} \
+                     matched NO connected NG-RAN node (targets: {} gNB IDs, {} TAIs, rat={:?}); \
+                     nothing was broadcast",
+                    item.message_identifier,
+                    item.serial_number,
+                    item.target_gnb_ids.len(),
+                    item.target_tais.len(),
+                    item.rat_selector,
+                );
+                continue;
+            }
+
+            // data[1] is the procedure code (data[0] is the PDU-type CHOICE
+            // index); logged so an operator can tell a WriteReplaceWarning (51)
+            // relay from a PWSCancel (32) one without decoding the PDU.
+            let procedure_code = item.ngap_pdu.get(1).copied().unwrap_or(0);
+            let mut delivered = 0usize;
+            for association_id in targets {
+                match self
+                    .send_to_association(association_id, &item.ngap_pdu)
+                    .await
+                {
+                    Ok(()) => delivered += 1,
+                    Err(e) => log::warn!("PWS relay to association {association_id} failed: {e}"),
+                }
+            }
+            log::info!(
+                "PWS relay: NGAP procedure {procedure_code} ({} B) forwarded to {delivered} \
+                 NG-RAN node(s) (message_identifier={:#06x} serial_number={:#06x})",
+                item.ngap_pdu.len(),
+                item.message_identifier,
+                item.serial_number,
+            );
+        }
+    }
+
+    /// Resolve the SCTP associations a PWS transfer targets, applying the IE
+    /// precedence of TS 29.518 §5.2.2.4.1.3 (`29518-k00.txt:4152-4159`):
+    ///
+    /// 1. `globalRanNodeList` present -> exactly those RAN nodes;
+    /// 2. else `taiList` present -> nodes serving any listed TAI, filtered by
+    ///    `ratSelector`;
+    /// 3. else -> all attached nodes, filtered by `ratSelector`.
+    ///
+    /// Resolved HERE, against the live `sessions` map, and not in the SBI
+    /// handler: `AmfContext::gnb_list` has no production writer, so resolving
+    /// there would match nothing. Returns association IDs (not `&GnbSession`) so
+    /// the read guard is dropped before the `&mut self` sends.
+    async fn pws_target_associations(
+        &self,
+        item: &crate::context::PendingPwsN2Transfer,
+    ) -> Vec<u64> {
+        use crate::context::PwsRatSelector;
+
+        let sessions = self.sessions.read().await;
+        sessions
+            .values()
+            .filter(|session| {
+                // The RAT filter applies to cases 2 and 3. It does NOT apply
+                // when globalRanNodeList named the nodes explicitly: the spec
+                // subordinates the filter to the absence of that IE ("subject to
+                // the value of the ratSelector IE" appears only in the
+                // globalRanNodeList-absent sentences), and the NOTE at
+                // `29518-k00.txt:4160` says the list "only contains RAN nodes of
+                // the same type" anyway.
+                if !item.target_gnb_ids.is_empty() {
+                    return item.target_gnb_ids.contains(&session.gnb.gnb_id);
+                }
+
+                if let Some(rat) = item.rat_selector {
+                    let matches_rat = match rat {
+                        PwsRatSelector::Nr => session.gnb.rat_type == crate::context::RatType::Nr,
+                        PwsRatSelector::Eutra => {
+                            session.gnb.rat_type == crate::context::RatType::Eutra
+                        }
+                    };
+                    if !matches_rat {
+                        return false;
+                    }
+                }
+
+                if item.target_tais.is_empty() {
+                    // Case 3: all attached nodes of the selected RAT.
+                    return true;
+                }
+
+                // Case 2: the node serves at least one listed TAI. A gNB's
+                // SupportedTAList carries a TAC plus the broadcast PLMNs for it
+                // (TS 38.413 §9.3.3.8), so a TAI matches when both halves do.
+                item.target_tais.iter().any(|(plmn, tac)| {
+                    session.gnb.supported_ta_list.iter().any(|ta| {
+                        ta.tac == *tac && ta.bplmn_list.iter().any(|bplmn| bplmn.plmn_id == *plmn)
+                    })
+                })
+            })
+            .map(|session| session.association_id)
+            .collect()
     }
 
     async fn process_positioning_downlinks(&mut self) {
@@ -11315,6 +11448,284 @@ mod tests {
         assert!(
             req.ue_policy_container().is_none(),
             "an SMS container must not reach the PCF's UPDP decoder"
+        );
+    }
+
+    // ========================================================================
+    // #396: PWS N2 relay (TS 29.518 §5.2.2.4.1.3, TS 38.413 §8.12)
+    // ========================================================================
+
+    /// Register a gNB session on `ngap` with a chosen gNB ID, RAT and supported
+    /// TA list, so the targeting resolver has real nodes to select over.
+    async fn insert_pws_test_gnb(
+        ngap: &NgapServer,
+        association_id: u64,
+        gnb_id: u32,
+        rat_type: crate::context::RatType,
+        tas: &[(&str, &str, u32)],
+    ) {
+        let addr: SocketAddr = format!("127.0.0.1:{}", 40000 + association_id)
+            .parse()
+            .expect("addr");
+        let mut session = GnbSession::new(association_id, association_id, addr);
+        session.gnb.gnb_id = gnb_id;
+        session.gnb.gnb_id_presence = true;
+        session.gnb.rat_type = rat_type;
+        session.gnb.supported_ta_list = tas
+            .iter()
+            .map(|(mcc, mnc, tac)| crate::context::SupportedTa {
+                tac: *tac,
+                num_of_bplmn_list: 1,
+                bplmn_list: vec![crate::context::BplmnEntry {
+                    plmn_id: PlmnId::new(mcc, mnc),
+                    num_of_s_nssai: 0,
+                    s_nssai: Vec::new(),
+                }],
+            })
+            .collect();
+        session.gnb.num_of_supported_ta_list = session.gnb.supported_ta_list.len();
+        ngap.sessions.write().await.insert(association_id, session);
+    }
+
+    fn pws_queue_item(
+        ngap_pdu: Vec<u8>,
+        message_identifier: u16,
+        serial_number: u16,
+    ) -> crate::context::PendingPwsN2Transfer {
+        crate::context::PendingPwsN2Transfer {
+            ngap_pdu,
+            message_identifier,
+            serial_number,
+            target_gnb_ids: Vec::new(),
+            target_tais: Vec::new(),
+            rat_selector: None,
+        }
+    }
+
+    /// A conformant WRITE-REPLACE WARNING REQUEST, as the CBCF's container.
+    fn pws_warning_pdu(message_identifier: u16, serial_number: u16) -> Vec<u8> {
+        nextgcore_ngap::builder::build_write_replace_warning_request(
+            &nextgcore_ngap::types::WriteReplaceWarningRequest {
+                message_identifier,
+                serial_number,
+                warning_area_list: None,
+                repetition_period: 32,
+                number_of_broadcasts_requested: 2,
+                warning_type: None,
+                warning_security_info: None,
+                data_coding_scheme: Some(0x01),
+                warning_message_contents: Some(b"FLOOD".to_vec()),
+                concurrent_warning_message_indicator: false,
+                warning_area_coordinates: None,
+            },
+        )
+        .expect("build WRITE-REPLACE WARNING REQUEST")
+    }
+
+    /// The whole point of criterion 3: **assert the encoded NGAP PDU the gNB
+    /// would receive**, and that the pump resolves targets against the live
+    /// session map.
+    ///
+    /// The three selector cases of TS 29.518 §5.2.2.4.1.3
+    /// (`29518-k00.txt:4152-4159`) are asserted against four registered nodes.
+    /// This also pins the fact the SBI handler CANNOT do this resolution:
+    /// `AmfContext::gnb_list` has no production writer, so only the NGAP task's
+    /// `sessions` map knows these nodes exist.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pws_targeting_follows_the_ie_precedence_of_ts29518() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let ngap = test_ngap_server().await;
+
+        // Two gNBs and two ng-eNBs, with distinct TACs.
+        insert_pws_test_gnb(
+            &ngap,
+            3961,
+            0xAAA,
+            crate::context::RatType::Nr,
+            &[("001", "01", 0x74)],
+        )
+        .await;
+        insert_pws_test_gnb(
+            &ngap,
+            3962,
+            0xBBB,
+            crate::context::RatType::Nr,
+            &[("001", "01", 0x75)],
+        )
+        .await;
+        insert_pws_test_gnb(
+            &ngap,
+            3963,
+            0xCCC,
+            crate::context::RatType::Eutra,
+            &[("001", "01", 0x74)],
+        )
+        .await;
+        insert_pws_test_gnb(
+            &ngap,
+            3964,
+            0xDDD,
+            crate::context::RatType::Eutra,
+            &[("002", "02", 0x76)],
+        )
+        .await;
+
+        let pdu = pws_warning_pdu(0x0396, 0x1396);
+
+        // Case 3: no globalRanNodeList, no taiList, no ratSelector -> every
+        // attached node.
+        let all = ngap
+            .pws_target_associations(&pws_queue_item(pdu.clone(), 0x0396, 0x1396))
+            .await;
+        assert_eq!(all.len(), 4, "absent selectors mean ALL attached nodes");
+
+        // Case 3 with ratSelector: NR only.
+        let mut nr_only = pws_queue_item(pdu.clone(), 0x0396, 0x1396);
+        nr_only.rat_selector = Some(crate::context::PwsRatSelector::Nr);
+        let mut got = ngap.pws_target_associations(&nr_only).await;
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec![3961, 3962],
+            "ratSelector NR must exclude the ng-eNBs"
+        );
+
+        // Case 3 with ratSelector: E-UTRA only.
+        let mut eutra_only = pws_queue_item(pdu.clone(), 0x0396, 0x1396);
+        eutra_only.rat_selector = Some(crate::context::PwsRatSelector::Eutra);
+        let mut got = ngap.pws_target_associations(&eutra_only).await;
+        got.sort_unstable();
+        assert_eq!(got, vec![3963, 3964]);
+
+        // Case 2: taiList + ratSelector. TAC 0x74 is served by the NR node 3961
+        // and the E-UTRA node 3963; the NR filter keeps only 3961.
+        let mut by_tai = pws_queue_item(pdu.clone(), 0x0396, 0x1396);
+        by_tai.target_tais = vec![(PlmnId::new("001", "01"), 0x74)];
+        by_tai.rat_selector = Some(crate::context::PwsRatSelector::Nr);
+        assert_eq!(
+            ngap.pws_target_associations(&by_tai).await,
+            vec![3961],
+            "taiList must select on BOTH the TAC and the broadcast PLMN"
+        );
+
+        // A TAI whose TAC matches but whose PLMN does not must NOT match: node
+        // 3964 serves TAC 0x76 under PLMN 002/02 only.
+        let mut wrong_plmn = pws_queue_item(pdu.clone(), 0x0396, 0x1396);
+        wrong_plmn.target_tais = vec![(PlmnId::new("001", "01"), 0x76)];
+        assert!(
+            ngap.pws_target_associations(&wrong_plmn).await.is_empty(),
+            "a TAC match under the wrong PLMN is not a TAI match"
+        );
+
+        // Case 1: globalRanNodeList wins outright, and the RAT filter does NOT
+        // narrow it further -- the NOTE at `29518-k00.txt:4160` says the list
+        // holds nodes of one type already.
+        let mut by_node = pws_queue_item(pdu.clone(), 0x0396, 0x1396);
+        by_node.target_gnb_ids = vec![0xCCC];
+        by_node.rat_selector = Some(crate::context::PwsRatSelector::Nr);
+        assert_eq!(
+            ngap.pws_target_associations(&by_node).await,
+            vec![3963],
+            "an explicitly named node is targeted regardless of ratSelector"
+        );
+
+        // A named node that is not connected yields no target, rather than
+        // falling back to broadcasting to everyone.
+        let mut unknown_node = pws_queue_item(pdu, 0x0396, 0x1396);
+        unknown_node.target_gnb_ids = vec![0xFFF];
+        assert!(
+            ngap.pws_target_associations(&unknown_node).await.is_empty(),
+            "an unknown gNB ID must not silently broadcast to all nodes"
+        );
+    }
+
+    /// The NGAP `process_pws_n2_transfers` pump is the (non-test) caller that
+    /// carries an SBI-enqueued container onto the wire. Enqueuing on the AMF
+    /// context and running the pump drains it and sends to the resolved
+    /// associations.
+    ///
+    /// Serialized on the shared PWS-queue lock (declared beside the queue's other
+    /// test lock in `namf_server`) so it never steals a router-arm test's item.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pws_pump_drains_the_queue_and_relays_the_container_verbatim() {
+        let _serial = crate::namf_server::pws_queue_test_lock().lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+
+        insert_pws_test_gnb(
+            &ngap,
+            3971,
+            0xE01,
+            crate::context::RatType::Nr,
+            &[("001", "01", 0x74)],
+        )
+        .await;
+
+        let (mid, sn) = (0x2396u16, 0x3396u16);
+        let pdu = pws_warning_pdu(mid, sn);
+
+        // Byte 0 / byte 1 of what the gNB would receive: InitiatingMessage
+        // CHOICE index, then procedure code 51 (`38413-j30.txt:59115`).
+        assert_eq!(pdu[0], 0x00, "byte 0 must be the InitiatingMessage index");
+        assert_eq!(pdu[1], 51, "byte 1 must be procedure code 51");
+
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            let _ = guard.pws_n2_drain();
+            guard.pws_n2_add(pws_queue_item(pdu.clone(), mid, sn));
+        }
+
+        // The resolver sees the node before the pump runs.
+        assert_eq!(
+            ngap.pws_target_associations(&pws_queue_item(pdu.clone(), mid, sn))
+                .await,
+            vec![3971]
+        );
+
+        ngap.process_pws_n2_transfers().await;
+
+        // The pump consumed the item -- the observable proof that the SBI arm's
+        // enqueue reaches the NGAP egress path. The SCTP send itself has no peer
+        // in a unit test (the association is synthetic), so it is logged and
+        // skipped; the wire-level delivery is the docker E2E's job.
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        let remaining = guard.pws_n2_drain();
+        assert!(
+            !remaining.iter().any(|i| i.message_identifier == mid),
+            "the pump must consume the queued PWS relay"
+        );
+    }
+
+    /// A relay that matches no connected node is consumed and WARNed, not
+    /// silently dropped and not retried forever. A warning message that reached
+    /// no RAN node did not go out, and that must be visible.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pws_pump_consumes_a_relay_with_no_matching_ran_node() {
+        let _serial = crate::namf_server::pws_queue_test_lock().lock().await;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+
+        // No gNB registered at all.
+        let (mid, sn) = (0x4396u16, 0x5396u16);
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            let _ = guard.pws_n2_drain();
+            guard.pws_n2_add(pws_queue_item(pws_warning_pdu(mid, sn), mid, sn));
+        }
+
+        ngap.process_pws_n2_transfers().await;
+
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !guard
+                .pws_n2_drain()
+                .iter()
+                .any(|i| i.message_identifier == mid),
+            "an untargetable relay must still be consumed"
         );
     }
 

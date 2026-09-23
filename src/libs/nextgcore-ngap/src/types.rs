@@ -337,7 +337,10 @@ pub enum UeNgapIds {
 }
 
 /// Global RAN Node ID
-#[derive(Debug, Clone)]
+///
+/// `PartialEq`/`Eq` so the PWS Restart / Failure Indication types that carry it
+/// can be compared in round-trip tests (TS 38.413 Section 9.2.8.5/.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GlobalRanNodeId {
     /// Global gNB ID
     GlobalGnbId {
@@ -858,7 +861,10 @@ pub struct PduSessionResourceSwitchedItem {
 }
 
 /// TAI List Item for Paging
-#[derive(Debug, Clone)]
+///
+/// Also the `TAI` of the PWS warning-area and restart lists, so it derives
+/// `PartialEq`/`Eq` for round-trip comparison.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaiListItem {
     /// TAI: PLMN Identity
     pub tai_plmn: [u8; 3],
@@ -1191,4 +1197,316 @@ pub struct NasNonDeliveryIndication {
     pub nas_pdu: Vec<u8>,
     /// Cause (mandatory)
     pub cause: Cause,
+}
+
+// ============================================================================
+// PWS Procedures (TS 38.413 Section 8.12 / Section 9.2.8)
+// ============================================================================
+//
+// Public Warning System: ETWS/CMAS warning broadcast. The AMF is the relay
+// between a CBCF/PWS-IWF (over Namf_Communication NonUeN2MessageTransfer,
+// TS 29.518 Section 5.2.2.4.1.3) and the NG-RAN.
+//
+// The four elementary procedures and their codes, quoted from
+// 6g_docs/specs/38413-j30.txt:
+//
+//   id-PWSCancel             ProcedureCode ::= 32   (:59077)
+//   id-PWSFailureIndication  ProcedureCode ::= 33   (:59079)
+//   id-PWSRestartIndication  ProcedureCode ::= 34   (:59081)
+//   id-WriteReplaceWarning   ProcedureCode ::= 51   (:59115)
+//
+// Note the ordering trap: in the (alphabetical) ASN.1 table Failure is 33 and
+// Restart is 34, the OPPOSITE of the clause order (Restart is Section 9.2.8.5,
+// Failure is Section 9.2.8.6). Reading the codes off the clause order swaps them.
+//
+// These types deliberately mirror TS 38.413's IE sets rather than the S1AP ones
+// in `nextgcore-s1ap`, because TS 38.413 diverges in four places that matter on
+// the wire: RepetitionPeriod's range, the E-UTRA/NR split in every area list,
+// the NGAP-only WarningAreaCoordinates IE, and the 36-bit NR cell identity.
+
+/// NR Cell Global Identity (TS 38.413 Section 9.3.1.7, ASN.1 at
+/// `38413-j30.txt:52457`).
+///
+/// `NRCellIdentity` is a `BIT STRING (SIZE(36))` (`:52455`) — NOT the 28 bits of
+/// E-UTRA, which is why the two CGI kinds cannot share one representation even
+/// though they appear in the same CHOICE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NrCgi {
+    /// PLMN Identity (3 octets, TS 23.003 encoding)
+    pub plmn_identity: [u8; 3],
+    /// NR Cell Identity, 36 significant bits (low 36 bits of this value used)
+    pub nr_cell_identity: u64,
+}
+
+/// E-UTRA Cell Global Identity (TS 38.413 Section 9.3.1.9, ASN.1 at
+/// `38413-j30.txt:47862`).
+///
+/// `EUTRACellIdentity` is a `BIT STRING (SIZE(28))` (`:47860`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EutraCgi {
+    /// PLMN Identity (3 octets)
+    pub plmn_identity: [u8; 3],
+    /// E-UTRA Cell Identity, 28 significant bits
+    pub eutra_cell_identity: u32,
+}
+
+/// Warning Area List (TS 38.413 Section 9.3.1.37), ASN.1 CHOICE at
+/// `38413-j30.txt:58760`.
+///
+/// FOUR root alternatives plus `choice-Extensions`, where the S1AP counterpart
+/// (`nextgcore_s1ap::types::WarningAreaList`) has three — the NR cell list is
+/// new in NGAP. The CHOICE index order below is the ASN.1 declaration order and
+/// is what goes on the wire.
+///
+/// Absent from a WRITE-REPLACE WARNING REQUEST means every cell the NG-RAN node
+/// serves (TS 38.413 Section 8.12.1.2, `38413-j30.txt:9302`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WarningAreaList {
+    /// `eUTRA-CGIListForWarning` (CHOICE index 0), `:47883`
+    EutraCgiList(Vec<EutraCgi>),
+    /// `nR-CGIListForWarning` (CHOICE index 1), `:52477`
+    NrCgiList(Vec<NrCgi>),
+    /// `tAIListForWarning` (CHOICE index 2), `:57154`
+    TaiList(Vec<TaiListItem>),
+    /// `emergencyAreaIDList` (CHOICE index 3), `:47704` — 3-octet Emergency Area IDs
+    EmergencyAreaIdList(Vec<[u8; 3]>),
+}
+
+/// One TAI plus the cells within it that completed the broadcast
+/// (`TAIBroadcastEUTRA-Item` / `TAIBroadcastNR-Item`, `:57027` / `:57049`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaiBroadcastItem<C> {
+    /// The tracking area
+    pub tai: TaiListItem,
+    /// `completedCellsInTAI-*`: the cells in that TAI which broadcast
+    pub completed_cells: Vec<C>,
+}
+
+/// One Emergency Area ID plus the cells within it that completed the broadcast
+/// (`EmergencyAreaIDBroadcast*-Item`, `:47619` / `:47641`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmergencyAreaBroadcastItem<C> {
+    /// Emergency Area ID (3 octets, `EmergencyAreaID`, `:47614`)
+    pub emergency_area_id: [u8; 3],
+    /// `completedCellsInEAI-*`
+    pub completed_cells: Vec<C>,
+}
+
+/// Broadcast Completed Area List (TS 38.413 Section 9.3.1.43), ASN.1 CHOICE at
+/// `38413-j30.txt:45687`.
+///
+/// SIX root alternatives against the S1AP counterpart's three: TS 38.413 splits
+/// every area kind into an E-UTRA and an NR form, because an AMF serves both
+/// ng-eNBs and gNBs. CHOICE index order is the declaration order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BroadcastCompletedAreaList {
+    /// `cellIDBroadcastEUTRA` (index 0), `:46309`
+    CellIdEutra(Vec<EutraCgi>),
+    /// `tAIBroadcastEUTRA` (index 1), `:57024`
+    TaiEutra(Vec<TaiBroadcastItem<EutraCgi>>),
+    /// `emergencyAreaIDBroadcastEUTRA` (index 2), `:47616`
+    EmergencyAreaEutra(Vec<EmergencyAreaBroadcastItem<EutraCgi>>),
+    /// `cellIDBroadcastNR` (index 3), `:46329`
+    CellIdNr(Vec<NrCgi>),
+    /// `tAIBroadcastNR` (index 4), `:57046`
+    TaiNr(Vec<TaiBroadcastItem<NrCgi>>),
+    /// `emergencyAreaIDBroadcastNR` (index 5), `:47638`
+    EmergencyAreaNr(Vec<EmergencyAreaBroadcastItem<NrCgi>>),
+}
+
+/// One cell that cancelled a broadcast, with how many times it had already
+/// broadcast (`CellIDCancelled*-Item`, `:46349` / `:46371`).
+///
+/// The `numberOfBroadcasts` field is what distinguishes the CANCELLED area lists
+/// from the COMPLETED ones: a cancel reports progress-at-cancellation, so the
+/// CBC knows how much of the warning actually went out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CancelledCellItem<C> {
+    /// The cell
+    pub cgi: C,
+    /// `NumberOfBroadcasts ::= INTEGER (0..65535)` (`:52604`)
+    pub number_of_broadcasts: u16,
+}
+
+/// One TAI plus its cancelled cells (`TAICancelled*-Item`, `:57068` / `:57090`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaiCancelledItem<C> {
+    /// The tracking area
+    pub tai: TaiListItem,
+    /// `cancelledCellsInTAI-*`
+    pub cancelled_cells: Vec<CancelledCellItem<C>>,
+}
+
+/// One Emergency Area ID plus its cancelled cells
+/// (`EmergencyAreaIDCancelled*-Item`, `:47663` / `:47685`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmergencyAreaCancelledItem<C> {
+    /// Emergency Area ID (3 octets)
+    pub emergency_area_id: [u8; 3],
+    /// `cancelledCellsInEAI-*`
+    pub cancelled_cells: Vec<CancelledCellItem<C>>,
+}
+
+/// Broadcast Cancelled Area List (TS 38.413 Section 9.3.1.44), ASN.1 CHOICE at
+/// `38413-j30.txt:45662`. Six root alternatives, same E-UTRA/NR split as
+/// [`BroadcastCompletedAreaList`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BroadcastCancelledAreaList {
+    /// `cellIDCancelledEUTRA` (index 0), `:46349`
+    CellIdEutra(Vec<CancelledCellItem<EutraCgi>>),
+    /// `tAICancelledEUTRA` (index 1), `:57068`
+    TaiEutra(Vec<TaiCancelledItem<EutraCgi>>),
+    /// `emergencyAreaIDCancelledEUTRA` (index 2), `:47660`
+    EmergencyAreaEutra(Vec<EmergencyAreaCancelledItem<EutraCgi>>),
+    /// `cellIDCancelledNR` (index 3), `:46371`
+    CellIdNr(Vec<CancelledCellItem<NrCgi>>),
+    /// `tAICancelledNR` (index 4), `:57090`
+    TaiNr(Vec<TaiCancelledItem<NrCgi>>),
+    /// `emergencyAreaIDCancelledNR` (index 5), `:47682`
+    EmergencyAreaNr(Vec<EmergencyAreaCancelledItem<NrCgi>>),
+}
+
+/// The cells a PWS Restart Indication or PWS Failure Indication names
+/// (`CHOICE Cell List for Restart`, Section 9.2.8.5, and `CHOICE PWS Failed Cell
+/// List`, Section 9.2.8.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PwsCellList {
+    /// `>E-UTRA` (CHOICE index 0)
+    Eutra(Vec<EutraCgi>),
+    /// `>NR` (CHOICE index 1)
+    Nr(Vec<NrCgi>),
+}
+
+/// WRITE-REPLACE WARNING REQUEST — AMF to NG-RAN node (TS 38.413
+/// Section 9.2.8.1, IE table at `38413-j30.txt:15866`, ASN.1 at `:40897`).
+///
+/// Procedure code 51. Requests the start or overwrite of a warning broadcast.
+///
+/// In production this AMF does not *compose* one of these: TS 29.518
+/// Section 5.2.2.4.1.3 has it FORWARD an opaque container supplied by the CBCF
+/// (`29518-k00.txt:4152`, "The AMF shall forward the N2 Message Container"). The
+/// builder exists so the AMF can validate and round-trip what it relays, and so
+/// a test (or a simulated CBCF) can produce a conformant PDU — the same framing
+/// [`crate::types::RanStatusTransfer`] uses for its uplink leg.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteReplaceWarningRequest {
+    /// Message Identifier (mandatory, `BIT STRING (SIZE(16))`, `:50676`).
+    /// Identifies the warning message source and type (TS 23.041).
+    pub message_identifier: u16,
+    /// Serial Number (mandatory, `BIT STRING (SIZE(16))`, `:56301`)
+    pub serial_number: u16,
+    /// Warning Area List (optional). Absent = every cell the node serves
+    /// (Section 8.12.1.2, `:9302`).
+    pub warning_area_list: Option<WarningAreaList>,
+    /// Repetition Period in seconds (mandatory).
+    ///
+    /// `RepetitionPeriod ::= INTEGER (0..131071)` (`:55881`) — NOT the S1AP
+    /// `0..4095`. The range exceeds 64K, so PER uses the length-of-length form
+    /// rather than two aligned octets; copying the S1AP encoder here would emit
+    /// an undecodable IE.
+    pub repetition_period: u32,
+    /// Number of Broadcasts Requested (mandatory, `INTEGER (0..65535)`,
+    /// `:52606`). 0 means broadcast until explicitly stopped.
+    pub number_of_broadcasts_requested: u16,
+    /// Warning Type (optional, `OCTET STRING (SIZE(2))`, `:58785`) — ETWS only
+    pub warning_type: Option<[u8; 2]>,
+    /// Warning Security Information (optional, `OCTET STRING (SIZE(50))`,
+    /// `:58783`).
+    ///
+    /// Carried but never interpreted: Section 9.2.8.1's own IE table says "This
+    /// IE is not used in the specification. If received, the IE is ignored."
+    /// (`:15895-15899`). Encoded and decoded so a relayed container survives
+    /// byte-exact.
+    pub warning_security_info: Option<[u8; 50]>,
+    /// Data Coding Scheme (optional, `BIT STRING (SIZE(8))`, `:47032`, TS 23.038)
+    pub data_coding_scheme: Option<u8>,
+    /// Warning Message Contents (optional, `OCTET STRING (SIZE(1..9600))`,
+    /// `:58781`)
+    pub warning_message_contents: Option<Vec<u8>>,
+    /// Concurrent Warning Message Indicator (optional, `ENUMERATED { true, ... }`,
+    /// `:46737`). `true` here means the IE is present.
+    pub concurrent_warning_message_indicator: bool,
+    /// Warning Area Coordinates (optional, `OCTET STRING (SIZE(1..1024))`,
+    /// `:58758`). NGAP-only — no S1AP counterpart.
+    pub warning_area_coordinates: Option<Vec<u8>>,
+}
+
+/// WRITE-REPLACE WARNING RESPONSE — NG-RAN node to AMF (TS 38.413
+/// Section 9.2.8.2, IE table at `:15916`, ASN.1 at `:40954`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteReplaceWarningResponse {
+    /// Message Identifier (mandatory) — copied from the request
+    pub message_identifier: u16,
+    /// Serial Number (mandatory) — copied from the request
+    pub serial_number: u16,
+    /// Broadcast Completed Area List (optional): where the warning actually went
+    pub broadcast_completed_area_list: Option<BroadcastCompletedAreaList>,
+    /// Criticality Diagnostics (optional)
+    pub criticality_diagnostics: Option<CriticalityDiagnostics>,
+}
+
+/// PWS CANCEL REQUEST — AMF to NG-RAN node (TS 38.413 Section 9.2.8.3, IE table
+/// at `:15942`, ASN.1 at `:41000`). Procedure code 32.
+///
+/// Cancels a broadcast the NG-RAN node may still be running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PwsCancelRequest {
+    /// Message Identifier (mandatory)
+    pub message_identifier: u16,
+    /// Serial Number (mandatory)
+    pub serial_number: u16,
+    /// Warning Area List (optional). Absent = every cell (Section 8.12.2.2,
+    /// `:9374`).
+    pub warning_area_list: Option<WarningAreaList>,
+    /// Cancel-All Warning Messages Indicator (optional, `ENUMERATED { true, ... }`,
+    /// `:45892`). `true` here means the IE is present.
+    pub cancel_all_warning_messages: bool,
+}
+
+/// PWS CANCEL RESPONSE — NG-RAN node to AMF (TS 38.413 Section 9.2.8.4, IE table
+/// at `:15968`, ASN.1 at `:41036`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PwsCancelResponse {
+    /// Message Identifier (mandatory) — copied from the request
+    pub message_identifier: u16,
+    /// Serial Number (mandatory) — copied from the request
+    pub serial_number: u16,
+    /// Broadcast Cancelled Area List (optional): where cancellation succeeded,
+    /// with each cell's broadcast count at the moment it stopped
+    pub broadcast_cancelled_area_list: Option<BroadcastCancelledAreaList>,
+    /// Criticality Diagnostics (optional)
+    pub criticality_diagnostics: Option<CriticalityDiagnostics>,
+}
+
+/// PWS RESTART INDICATION — NG-RAN node to AMF (TS 38.413 Section 9.2.8.5, IE
+/// table at `:15995`, ASN.1 at `:41082`). Procedure code 34.
+///
+/// Tells the AMF that PWS information for some or all cells is available for
+/// reloading from the CBC (Section 8.12.3, `:9430`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PwsRestartIndication {
+    /// CHOICE Cell List for Restart (mandatory)
+    pub cell_list: PwsCellList,
+    /// Global RAN Node ID (mandatory)
+    pub global_ran_node_id: GlobalRanNodeId,
+    /// TAI List for Restart (mandatory per the IE table's `>TAI` row;
+    /// `EmergencyAreaIDListForRestart`'s range starts at 1 while this one's
+    /// bound is `maxnoofTAIforRestart`)
+    pub tai_list_for_restart: Vec<TaiListItem>,
+    /// Emergency Area ID List for Restart (optional — the IE table gives its
+    /// range as `0..maxnoofEAIforRestart`, so an empty list means absent)
+    pub emergency_area_id_list_for_restart: Vec<[u8; 3]>,
+}
+
+/// PWS FAILURE INDICATION — NG-RAN node to AMF (TS 38.413 Section 9.2.8.6, IE
+/// table at `:16064`, ASN.1 at `:41128`). Procedure code 33.
+///
+/// Tells the AMF that ongoing PWS operation has failed for one or more cells
+/// (Section 8.12.4, `:9455`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PwsFailureIndication {
+    /// CHOICE PWS Failed Cell List (mandatory)
+    pub failed_cell_list: PwsCellList,
+    /// Global RAN Node ID (mandatory)
+    pub global_ran_node_id: GlobalRanNodeId,
 }
