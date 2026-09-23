@@ -15,6 +15,8 @@ pub mod esm_build;
 pub mod esm_handler;
 pub mod fd_path;
 pub mod gtp_path;
+pub mod n26_build;
+pub mod n26_path;
 pub mod nas_dispatch;
 pub mod nas_path;
 pub mod nas_security;
@@ -115,6 +117,23 @@ impl MmeApp {
             return Err(anyhow::anyhow!("GTP path initialization failed: {e}"));
         }
         log::debug!("GTP path initialized");
+
+        // N26 toward an AMF (#347), AFTER S11 so the restart counter can be read from the
+        // installed S11 server rather than advanced a second time (TS 23.007 §18: one
+        // counter per node).
+        //
+        // A bind failure here is NOT fatal, unlike S11's: an MME whose N26 socket did not
+        // come up is still a working standalone EPC, and taking the daemon down would turn
+        // an interworking misconfiguration into a total LTE outage. The inter-system TAU
+        // path then rejects with EMM cause #9, which is what TS 24.301 requires of an MME
+        // without N26 — so the degraded behaviour is the specified one.
+        if let Err(e) = n26_path::n26_open() {
+            log::error!(
+                "Failed to open the N26 path: {e}. The MME continues WITHOUT N26: an \
+                 inter-system TAU from 5GS will be rejected with EMM cause #9, and \
+                 standalone EPC service is unaffected."
+            );
+        }
 
         // Initialize Diameter S6a interface
         if let Err(e) = fd_path::mme_fd_init() {
@@ -303,6 +322,12 @@ impl MmeApp {
         // Close Diameter S6a interface
         fd_path::mme_fd_final();
         log::debug!("Diameter S6a interface closed");
+
+        // Close the N26 path before S11, mirroring the open order in reverse.
+        if let Some(server) = n26_path::server() {
+            server.close();
+            log::debug!("N26 path closed");
+        }
 
         // Close GTP path
         if let Err(e) = gtp_path::gtp_close(&mut self.gtp_state) {

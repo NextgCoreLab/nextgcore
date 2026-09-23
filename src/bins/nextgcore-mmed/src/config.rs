@@ -96,6 +96,28 @@ struct GtpcClientYaml {
     smf: Option<Vec<ServerYaml>>,
 }
 
+/// `mme.n26`: the N26 interface toward an AMF (#347).
+///
+/// Shaped like [`GtpcYaml`] on purpose — `server` is what the MME binds, `client.amf` is
+/// the AMF a Context Request is sent to — so an operator who has configured S11 already
+/// knows this grammar.
+///
+/// Reading these addresses does **not** bind anything: the `MME_N26_INTERWORKING` runtime
+/// switch gates that, so a config carrying an N26 block is still a standalone-EPC
+/// deployment until the switch is set. That ordering is what makes #347's criterion 8
+/// ("standalone EPC unchanged with the switch off") hold even for a config that has been
+/// prepared for interworking.
+#[derive(Debug, Default, Deserialize)]
+struct N26Yaml {
+    server: Option<Vec<ServerYaml>>,
+    client: Option<N26ClientYaml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct N26ClientYaml {
+    amf: Option<Vec<ServerYaml>>,
+}
+
 /// A single `<timer>: { value: <seconds> }` entry under `mme.time`, matching the
 /// nesting the 5GC configs use for `amf.time`.
 #[derive(Debug, Default, Deserialize)]
@@ -126,6 +148,7 @@ struct MmeSection {
     free_diameter: Option<String>,
     s1ap: Option<S1apYaml>,
     gtpc: Option<GtpcYaml>,
+    n26: Option<N26Yaml>,
     gummei: Option<Vec<GummeiYaml>>,
     tai: Option<Vec<TaiYaml>>,
     security: Option<SecurityYaml>,
@@ -261,6 +284,57 @@ fn apply(ctx: &mut MmeContext, mme: MmeSection) {
                 "{} SGW-C peers configured; the first is used for every session because \
                  TS 23.401 §4.3.8.1 SGW selection (DNS by TAI/APN) is not implemented",
                 ctx.sgwc_list.len()
+            );
+        }
+    }
+
+    // N26 bind addresses and the AMF peer (#347). Read unconditionally: whether the
+    // socket is actually bound is the `MME_N26_INTERWORKING` switch's decision, made in
+    // `n26_path::n26_open`, and a config parsed only when the switch is on would be a
+    // second thing to get right at deploy time.
+    if let Some(n26) = mme.n26 {
+        for server in n26.server.unwrap_or_default() {
+            let Some(address) = server.address else {
+                continue;
+            };
+            // Same default port as S11: TS 29.274 §4.1 puts every GTPv2-C interface on
+            // UDP 2123, so an N26 socket on a different port needs an explicit `port:`.
+            // In practice a single host running both wants distinct ports, which is why
+            // this is configurable rather than fixed.
+            let port = server.port.unwrap_or(ctx.gtpc_port);
+            match parse_socket_addr(&address, port) {
+                Some(addr) => {
+                    log::info!("N26 GTP-C server address: {addr}");
+                    ctx.n26_list.push(addr);
+                }
+                None => log::warn!("Ignoring unparsable N26 server address '{address}'"),
+            }
+        }
+        if ctx.n26_list.len() > 1 {
+            log::warn!(
+                "{} N26 server addresses configured; only the first is bound",
+                ctx.n26_list.len()
+            );
+        }
+        for peer in n26.client.and_then(|client| client.amf).unwrap_or_default() {
+            let Some(address) = peer.address else {
+                continue;
+            };
+            let port = peer.port.unwrap_or(ctx.gtpc_port);
+            match parse_socket_addr(&address, port) {
+                Some(addr) => {
+                    log::info!("N26 AMF peer: {addr}");
+                    ctx.amf_n26_list.push(addr);
+                }
+                None => log::warn!("Ignoring unparsable AMF N26 address '{address}'"),
+            }
+        }
+        if ctx.amf_n26_list.len() > 1 {
+            log::warn!(
+                "{} AMF N26 peers configured; the first is used for every Context Request \
+                 because TS 23.401 §4.3.19 old-CN-node resolution (by the GUTI's MME Group \
+                 ID, via DNS) is not implemented",
+                ctx.amf_n26_list.len()
             );
         }
     }

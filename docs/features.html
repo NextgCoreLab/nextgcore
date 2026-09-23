@@ -67,11 +67,12 @@
 <tr><td>NRF registration + OAuth2 enforcement</td><td>NF register w/ load reporting, token validation on inbound SBI</td><td>TS 29.510, TS 33.501 s13.4.1</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>NSACF slice admission (Nnsacf_NSAC)</td><td>Per-S-NSSAI PDU session admission at SM context create</td><td>TS 29.536</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>Gn/Gp GTPv1-C GGSN interworking</td><td>Create/Update/Delete PDP Context, echo; handler module present, no bound GTP-C socket</td><td>TS 29.060, TS 23.401 Annex E</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
-<tr><td>GTPv2-C (S5/S8/N26 interworking)</td><td>gtp_handler/gtp_build message parse+build via state machine, no wire listener</td><td>TS 29.274</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+<tr><td>GTPv2-C S5/S8 (PGW-C role)</td><td>Bound UDP GTP-C listener with live dispatch; Create/Modify/Delete Session, bearer procedures</td><td>TS 29.274</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>N26 interworking &#8212; idle-mode 5GS&#8594;EPS</td><td>AMF answers an MME&#39;s Context Request with the mapped EPS security context (K<sub>ASME</sub>&#39; per TS 33.501 A.14.1) and PDN connections; MME sends Context Request/Acknowledge on an inter-system TAU. Off by default (<code>AMF_N26_INTERWORKING</code> / <code>MME_N26_INTERWORKING</code>). Connected-mode handover (Forward Relocation) not implemented</td><td>TS 23.502 s4.11.1.3.2, TS 29.274 s7.3.5-7.3.7</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>MBS session management</td><td>Multicast session context, UE join/leave; MBSF/MBSTF/N4mb interface stubs</td><td>TS 23.247 (Rel-17)</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
 <tr><td>Rel-17/18 QoS features</td><td>RedCap AMBR reduction, XR 5QI upgrade and QoS-flow binding in session create</td><td>TS 23.501 s5.7</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 </table></div>
-<p class="fm-notes">GTPv1/v2 handlers exist but main.rs binds only SBI HTTP/2 + PFCP UDP sockets; no GTP-C listener wired</p>
+<p class="fm-notes">GTPv1 (Gn/Gp) handlers exist but no GTPv1-C listener is wired. GTPv2-C listeners ARE bound: the SMF&#39;s S5/S8 PGW-C socket, and &#8212; when the runtime switch is set &#8212; the AMF&#39;s N26 socket toward an MME.</p>
 <h3 class="group-heading">UPF</h3>
 <div class="fm-wrap"><table class="fm-table">
 <tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
@@ -297,7 +298,7 @@
 <h3 class="group-heading">EPC (MME / HSS / SGW-C / SGW-U / PCRF)</h3>
 <div class="fm-wrap"><table class="fm-table">
 <tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
-<tr><td>mmed (MME)</td><td>S1AP+NAS-EPS attach/detach/TAU, EMM/ESM handlers, S11 GTP-C, S6a client, SGsAP, SBC</td><td>TS 36.413 / 24.301 / 29.274</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>mmed (MME)</td><td>S1AP+NAS-EPS attach/detach/TAU, EMM/ESM handlers, S11 GTP-C, S6a client, SGsAP, SBC, N26 toward an AMF (idle-mode TAU-with-N26, off by default)</td><td>TS 36.413 / 24.301 / 29.274 / 23.502 s4.11.1.3.2</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>hssd (HSS)</td><td>Diameter S6a AIR/ULR subscriber data, plus Cx and SWx paths</td><td>TS 29.272</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>sgwcd (SGW-C)</td><td>S11 GTP-C session create/modify/delete, S5-C relay, Sxa PFCP to SGW-U</td><td>TS 29.274 / 29.244</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>sgwud (SGW-U)</td><td>Sxa PFCP session control, GTP-U user-plane forwarding</td><td>TS 29.244 / 29.281</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>

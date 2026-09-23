@@ -667,6 +667,18 @@ impl Gtp2AmbrIe {
         buf.put_u32(self.downlink);
     }
 
+    /// Convert to a generic IE, for nesting inside a grouped IE (#347: the APN-AMBR
+    /// is a mandatory member of the PDN Connection, TS 29.274 Table 7.3.6-2).
+    ///
+    /// Delegates to [`Self::encode`] rather than re-emitting the two `u32`s, so there
+    /// is one spelling of the AMBR's wire layout.
+    pub fn to_ie(&self, instance: u8) -> Gtp2Ie {
+        let mut buf = BytesMut::new();
+        self.encode(&mut buf, instance);
+        let mut bytes = buf.freeze();
+        Gtp2Ie::decode(&mut bytes).expect("a just-encoded AMBR IE decodes")
+    }
+
     pub fn decode(value: &Bytes) -> GtpResult<Self> {
         if value.len() < 8 {
             return Err(GtpError::BufferTooShort {
@@ -897,6 +909,12 @@ impl Gtp2ApnIe {
         buf.put_u16(self.apn.len() as u16);
         buf.put_u8(instance & 0x0F);
         buf.put_slice(&self.apn);
+    }
+
+    /// Convert to a generic IE, for nesting inside a grouped IE (#347: the APN is a
+    /// mandatory member of the PDN Connection, TS 29.274 Table 7.3.6-2).
+    pub fn to_ie(&self, instance: u8) -> Gtp2Ie {
+        Gtp2Ie::from_slice(Gtp2IeType::Apn as u8, instance, &self.apn)
     }
 
     pub fn decode(value: &Bytes) -> GtpResult<Self> {
@@ -1333,6 +1351,394 @@ impl Gtp2IndicationIe {
     }
 }
 
+// ============================================================================
+// N26 / S10 composite IEs (#347)
+// ============================================================================
+
+/// `Security Mode` = "EPS Security Context and Quadruplets".
+///
+/// TS 29.274 Table 8.38-1 (`29274-j60.txt:28671`). The value selects which of the
+/// six MM Context IE types (103-108, Table 8.1-1) the octets after it follow, so
+/// getting it wrong makes the receiver read the wrong layout from octet 6 onward.
+pub const MM_CONTEXT_SECURITY_MODE_EPS: u8 = 4;
+
+/// `K_ASME` length in the MM Context (TS 29.274 Figure 8.38-5, octets 14 to 45).
+pub const MM_CONTEXT_KASME_LEN: usize = 32;
+
+/// MM Context IE — **EPS Security Context and Quadruplets** (IE type 107).
+///
+/// TS 29.274 §8.38, Figure 8.38-5 (`29274-j60.txt:28371`). This is the security and
+/// mobility context an old MME or old AMF hands to its successor over
+/// S3/S10/S16/N26.
+///
+/// # Why only this one of the six MM Context variants
+///
+/// Table 8.1-1 (`29274-j60.txt:24528-24546`) makes 103-108 **six distinct IE types**,
+/// not one type with a discriminator — so an implementation needs only the layouts it
+/// can actually reach. On N26 that is exactly one, in **both** directions, and the
+/// spec says so twice:
+///
+/// - old AMF → new MME (`29274-j60.txt:28198-28202`): *"The current EPS Security
+///   Context may be transmitted by the old AMF to the new MME [...] The field 'Number
+///   of Quadruplets' and 'Number of Quintuplets' shall be set to the value '0'."*
+/// - old MME → new AMF (`29274-j60.txt:28190-28193`): *"Authentication Quintuplets
+///   shall not be transmitted to the new MME/AMF [...] The field 'Number of
+///   Quintuplets' shall be set to the value '0'."*
+///
+/// So both vector arrays are empty by specification on this interface, which is why
+/// this type has no quadruplet/quintuplet members: they would be structurally
+/// unreachable. The GSM/UMTS-keyed variants (103-106, 108) exist for S3/S16 toward a
+/// GSM/UMTS SGSN, an interface this core does not have — so they are deliberately
+/// absent rather than stubbed, because an encoder no caller can reach is the
+/// "correct but unreachable" defect this tree keeps growing.
+///
+/// # Layout, octet by octet
+///
+/// Read off Figure 8.38-5 field by field rather than inferred from a neighbour:
+///
+/// | octet(s) | field | vendored line |
+/// |---|---|---|
+/// | 5 | `Security Mode`(3) \| `NHI`(1) \| `DRXI`(1) \| `KSI_ASME`(3) | `:28260` |
+/// | 6 | `Number of Quintuplets`(3) \| `Number of Quadruplet`(3) \| `UAMBRI`(1) \| `OSCI`(1) | `:28262` |
+/// | 7 | `SAMBRI`(1) \| `Used NAS integrity protection algorithm`(3) \| `Used NAS Cipher`(4) | `:28264` |
+/// | 8-10 | `NAS Downlink Count` (24 bits) | `:28266` |
+/// | 11-13 | `NAS Uplink Count` (24 bits) | `:28268` |
+/// | 14-45 | `K_ASME` (32 octets) | `:28270` |
+/// | q | `Length of UE Network Capability`, then contents | `:28294` |
+/// | k+1 | `Length of MS Network Capability`, then contents | `:28299` |
+/// | m+1 | `Length of Mobile Equipment Identity (MEI)`, then contents | `:28304` |
+/// | r+1 | access restriction flags (`ECNA`..`UNA`) | `:28309` |
+///
+/// Octets 1-4 are the generic TLV header (type, length, spare+instance), which
+/// [`Gtp2Ie`] owns — so an offset into this type's *contents* field is the figure's
+/// octet number minus 4. That off-by-four is exactly what a round-trip test cannot
+/// see, which is why `mm_context_encodes_ts29274_figure_8_38_5_field_positions`
+/// asserts absolute contents offsets rather than comparing a decode to an encode.
+///
+/// # What is deliberately not modelled
+///
+/// The Subscribed/Used UE AMBR octets (`j`..`i+7`) and the DRX parameter are gated by
+/// `SAMBRI` / `UAMBRI` / `DRXI`, and the optional tail from octet `s` onward (old EPS
+/// security context, voice-domain preference, UE radio capability, extended access
+/// restriction, APN rate control, core network restrictions) is present *"only if
+/// explicitly specified"*. This type emits `DRXI = 0`, `SAMBRI = 0`, `UAMBRI = 0` and
+/// `OSCI = 0` and omits every corresponding field, which is both legal and truthful:
+/// §8.38 says the old AMF *"shall set [UAMBRI] to 0"* (`:28259`), and `OSCI = 0` is
+/// required here because the old EPS security context *"may be present only in S10
+/// Forward Relocation Request"* (`:28234-28236`) — not in a Context Response over
+/// N26. Emitting them as zeroes-with-meaning would assert values this core does not
+/// hold.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Gtp2MmContextIe {
+    /// `KSI_ASME` (octet 5, bits 3..1) — the eKSI of the (mapped) EPS context.
+    pub ksi_asme: u8,
+    /// `NHI` (octet 5, bit 5). When set, `NH`/`NCC` follow the DRX parameter.
+    ///
+    /// `false` for idle-mode context transfer: `NH` is an AS-level key for
+    /// connected-mode handover, and an idle-mode move has no target eNB to key.
+    pub nhi: bool,
+    /// `Used NAS integrity protection algorithm` (octet 7, bits 6..4).
+    pub used_nas_integrity_algorithm: u8,
+    /// `Used NAS Cipher` (octet 7, bits 4..1). Table 8.38-2 (`29274-j60.txt:28679`).
+    pub used_nas_cipher: u8,
+    /// `NAS Downlink Count` (octets 8-10, 24 bits).
+    pub nas_downlink_count: u32,
+    /// `NAS Uplink Count` (octets 11-13, 24 bits).
+    pub nas_uplink_count: u32,
+    /// `K_ASME` (octets 14-45). On N26 5GS→EPS this is `K_ASME'` derived from
+    /// `K_AMF` per TS 33.501 §8.6.1 / Annex A.14.1, **not** a copied key.
+    pub kasme: [u8; MM_CONTEXT_KASME_LEN],
+    /// `UE Network Capability` contents (TS 24.301 §9.9.3.34).
+    pub ue_network_capability: Vec<u8>,
+    /// `MS Network Capability` contents (TS 24.008 §10.5.5.12).
+    pub ms_network_capability: Vec<u8>,
+    /// `Mobile Equipment Identity` contents (TS 29.274 §8.10 encoding).
+    pub mei: Vec<u8>,
+    /// Access restriction flags octet (`r+1`): `ECNA NBNA HNNA ENA INA GANA GENA UNA`.
+    pub access_restriction: u8,
+}
+
+impl Gtp2MmContextIe {
+    /// Offsets into the IE **contents** field, i.e. the figure's octet number minus
+    /// the 4 octets of TLV header that [`Gtp2Ie`] owns.
+    const OFF_SECURITY_MODE: usize = 0; // figure octet 5
+    const OFF_ALGORITHMS: usize = 2; // figure octet 7
+    const OFF_DL_COUNT: usize = 3; // figure octets 8-10
+    const OFF_UL_COUNT: usize = 6; // figure octets 11-13
+    const OFF_KASME: usize = 9; // figure octets 14-45
+    /// Contents length up to and including `K_ASME`: figure octets 5..=45.
+    const FIXED_LEN: usize = Self::OFF_KASME + MM_CONTEXT_KASME_LEN;
+
+    /// Encode the contents octets (no TLV header).
+    pub fn encode_value(&self, buf: &mut BytesMut) {
+        // Octet 5: Security Mode (3 bits) | NHI (1) | DRXI (1) | KSI_ASME (3).
+        //
+        // DRXI is 0 because §8.38 (`29274-j60.txt:27727-27733`) requires that *"During
+        // 5GS to EPS mobility procedure, the source AMF shall not send 5G DRX parameter
+        // to the target MME"* -- the 5G DRX encoding (TS 24.501 §9.11.3.2A) differs from
+        // the TS 24.008 §10.5.5.6 one this field carries, so sending it would hand the
+        // MME an octet pair it would misread as a different parameter.
+        buf.put_u8(
+            ((MM_CONTEXT_SECURITY_MODE_EPS & 0x07) << 5)
+                | (u8::from(self.nhi) << 4)
+                // DRXI = 0
+                | (self.ksi_asme & 0x07),
+        );
+        // Octet 6: Number of Quintuplets (3) | Number of Quadruplet (3) | UAMBRI (1)
+        // | OSCI (1). All four are zero on N26; the type's doc quotes the two clauses
+        // that require the vector counts to be 0 in each direction.
+        buf.put_u8(0);
+        // Octet 7: SAMBRI (1) | Used NAS integrity protection algorithm (3) |
+        // Used NAS Cipher (4). SAMBRI = 0, so the Subscribed UE AMBR octets are absent.
+        buf.put_u8(
+            ((self.used_nas_integrity_algorithm & 0x07) << 4) | (self.used_nas_cipher & 0x0F),
+        );
+        // Octets 8-10 then 11-13: the two NAS COUNTs, 24 bits each, most significant
+        // octet first. DOWNLINK first (`:28266`) and UPLINK second (`:28268`), in the
+        // figure's order -- transposing them is invisible to a round trip, which is
+        // what `mm_context_encodes_ts29274_figure_8_38_5_field_positions` pins.
+        for count in [self.nas_downlink_count, self.nas_uplink_count] {
+            buf.put_u8((count >> 16) as u8);
+            buf.put_u8((count >> 8) as u8);
+            buf.put_u8(count as u8);
+        }
+        // Octets 14-45: K_ASME.
+        buf.put_slice(&self.kasme);
+        // The Quadruplet and Quintuplet arrays are absent because both counts in octet
+        // 6 are 0 (§8.38: *"shall be set to the value '0' if no Authentication
+        // Quadruplet is included (i.e. octets '46 to g' are absent)"*). The DRX
+        // parameter is absent because DRXI = 0, and NH/NCC because NHI = 0.
+        //
+        // Then the three length-prefixed capability fields. §8.38 says each is absent
+        // when its length is zero, so a zero length octet is the correct encoding of
+        // "not available" rather than a placeholder for one.
+        for field in [
+            &self.ue_network_capability,
+            &self.ms_network_capability,
+            &self.mei,
+        ] {
+            let len = field.len().min(u8::MAX as usize);
+            buf.put_u8(len as u8);
+            buf.put_slice(&field[..len]);
+        }
+        // Octet r+1: the access restriction flags.
+        buf.put_u8(self.access_restriction);
+    }
+
+    /// Convert to a generic IE with the given instance.
+    pub fn to_ie(&self, instance: u8) -> Gtp2Ie {
+        let mut value = BytesMut::new();
+        self.encode_value(&mut value);
+        Gtp2Ie::new(Gtp2IeType::MmContext as u8, instance, value.freeze())
+    }
+
+    /// Decode from an IE contents field.
+    ///
+    /// Rejects a `Security Mode` other than [`MM_CONTEXT_SECURITY_MODE_EPS`] rather
+    /// than reading the octets anyway: the value selects the layout, so parsing a
+    /// GSM-keyed MM Context with this figure's offsets would produce a plausible
+    /// K_ASME from the wrong bytes and a NAS COUNT from a triplet. Refusing names the
+    /// real problem instead of propagating a wrong key into a security context.
+    pub fn decode(value: &Bytes) -> GtpResult<Self> {
+        if value.len() < Self::FIXED_LEN {
+            return Err(GtpError::BufferTooShort {
+                needed: Self::FIXED_LEN,
+                available: value.len(),
+            });
+        }
+        let octet5 = value[Self::OFF_SECURITY_MODE];
+        let security_mode = (octet5 >> 5) & 0x07;
+        if security_mode != MM_CONTEXT_SECURITY_MODE_EPS {
+            return Err(GtpError::InvalidIeType(security_mode));
+        }
+        let octet7 = value[Self::OFF_ALGORITHMS];
+        let count_at = |off: usize| -> u32 {
+            ((value[off] as u32) << 16) | ((value[off + 1] as u32) << 8) | (value[off + 2] as u32)
+        };
+        let mut kasme = [0u8; MM_CONTEXT_KASME_LEN];
+        kasme.copy_from_slice(&value[Self::OFF_KASME..Self::OFF_KASME + MM_CONTEXT_KASME_LEN]);
+
+        // The three length-prefixed capability fields, then the access-restriction
+        // octet. A truncated tail reads as absent rather than as an error: §8.38 makes
+        // every one of them omissible, so a peer that sent fewer octets has sent a
+        // legal shorter IE.
+        let mut off = Self::FIXED_LEN;
+        let mut take_lv = || -> Vec<u8> {
+            let Some(&len) = value.get(off) else {
+                return Vec::new();
+            };
+            off += 1;
+            let len = (len as usize).min(value.len().saturating_sub(off));
+            let out = value[off..off + len].to_vec();
+            off += len;
+            out
+        };
+        let ue_network_capability = take_lv();
+        let ms_network_capability = take_lv();
+        let mei = take_lv();
+        let access_restriction = value.get(off).copied().unwrap_or(0);
+
+        Ok(Self {
+            ksi_asme: octet5 & 0x07,
+            nhi: (octet5 >> 4) & 0x01 != 0,
+            used_nas_integrity_algorithm: (octet7 >> 4) & 0x07,
+            used_nas_cipher: octet7 & 0x0F,
+            nas_downlink_count: count_at(Self::OFF_DL_COUNT),
+            nas_uplink_count: count_at(Self::OFF_UL_COUNT),
+            kasme,
+            ue_network_capability,
+            ms_network_capability,
+            mei,
+            access_restriction,
+        })
+    }
+}
+
+/// PDN Connection grouped IE (IE type 109).
+///
+/// TS 29.274 §8.39 defines the type; its own table is **empty**
+/// (`29274-j60.txt:28819` — the member row is blank, with a NOTE saying *"the usage of
+/// this IE is further detailed for each specific GTP message"*), so the member list
+/// comes from **Table 7.3.6-2** (`29274-j60.txt:20508`), "MME/SGSN/AMF UE EPS PDN
+/// Connections within Context Response". That is also the table TS 29.502 names for
+/// `EpsPdnCnxContainer` (`29502-k00.txt:24142-24149`), so one layout serves both the
+/// N11 container and the N26 wire.
+///
+/// Modelled as a nested-IE bag with instance-keyed accessors, the same shape as
+/// [`Gtp2BearerContextIe`], rather than as a struct of typed members: this tree has
+/// one notion of "a grouped GTPv2 IE" and a second design would be two answers to
+/// "how is a nested IE addressed" — the #335/#340 shape, where several spellings of
+/// one wire fact drifted and only the tested one was right.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Gtp2PdnConnectionIe {
+    /// Nested Information Elements, in Table 7.3.6-2 order.
+    pub ies: Vec<Gtp2Ie>,
+}
+
+impl Gtp2PdnConnectionIe {
+    /// Create an empty PDN Connection.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a nested IE.
+    pub fn add_ie(&mut self, ie: Gtp2Ie) {
+        self.ies.push(ie);
+    }
+
+    /// Get a nested IE by type and instance.
+    pub fn get_ie(&self, ie_type: u8, instance: u8) -> Option<&Gtp2Ie> {
+        self.ies
+            .iter()
+            .find(|ie| ie.ie_type == ie_type && ie.instance == instance)
+    }
+
+    /// The F-TEID Table 7.3.6-3 requires for `SGW S1/S4/S12/S11 IP Address and TEID
+    /// for user plane` **over N26**.
+    ///
+    /// `29274-j60.txt:20906-20915` is explicit: over N26 the SMF, on behalf of the
+    /// source AMF, *"shall set the IP address and TEID to the following values: any
+    /// reserved TEID (e.g. all 0's, or all 1's); IPv4 address set to 0.0.0.0"*.
+    ///
+    /// A named constructor so no call site can reach for a real endpoint here. There is
+    /// no SGW in the 5GC, and the 5GS user plane is anchored at a UPF the MME cannot
+    /// address — so encoding anything else would point an MME's user plane at an
+    /// address the 5GC never allocated for it, which is a live traffic blackhole rather
+    /// than a decode error.
+    ///
+    /// `interface_type` is 1 ("S1-U SGW GTP-U interface") per NOTE 2
+    /// (`29274-j60.txt:20972-20974`): *"The MME shall set the interface type in this IE
+    /// to 1 [...] for S1-U and S11-U bearers. This is done for backwards compatibility
+    /// reasons"*.
+    pub fn n26_reserved_sgw_fteid() -> Gtp2FTeidIe {
+        Gtp2FTeidIe::new_ipv4(1, 0, [0, 0, 0, 0])
+    }
+
+    /// Encode the grouped value octets (concatenated nested IEs).
+    pub fn encode_value(&self, buf: &mut BytesMut) {
+        for ie in &self.ies {
+            ie.encode(buf);
+        }
+    }
+
+    /// Convert to a generic IE with the given instance.
+    ///
+    /// §8.39 (`29274-j60.txt:28802-28806`): *"The PDN Connection IE may be repeated
+    /// within a message when more than one PDN Connection is required to be sent. If
+    /// so, the repeated IEs shall have exactly the same Instance values"* — so a
+    /// multi-session UE yields several IEs all at instance 0, and a caller must not
+    /// number them.
+    pub fn to_ie(&self, instance: u8) -> Gtp2Ie {
+        let mut value = BytesMut::new();
+        self.encode_value(&mut value);
+        Gtp2Ie::new(Gtp2IeType::PdnConnection as u8, instance, value.freeze())
+    }
+
+    /// Decode the nested IEs from a grouped IE value.
+    pub fn decode(value: &Bytes) -> GtpResult<Self> {
+        let mut buf = value.clone();
+        let mut ies = Vec::new();
+        while buf.remaining() > 0 {
+            ies.push(Gtp2Ie::decode(&mut buf)?);
+        }
+        Ok(Self { ies })
+    }
+
+    /// The APN (Table 7.3.6-2, mandatory, `29274-j60.txt:20522`).
+    pub fn apn(&self) -> GtpResult<Gtp2ApnIe> {
+        let ie = self
+            .get_ie(Gtp2IeType::Apn as u8, 0)
+            .ok_or_else(|| GtpError::MissingMandatoryIe("APN in PDN Connection".to_string()))?;
+        Gtp2ApnIe::decode(&ie.value)
+    }
+
+    /// The Linked EPS Bearer ID — the PDN connection's **default** bearer
+    /// (Table 7.3.6-2, mandatory, `29274-j60.txt:20548`).
+    pub fn linked_ebi(&self) -> GtpResult<u8> {
+        let ie = self.get_ie(Gtp2IeType::Ebi as u8, 0).ok_or_else(|| {
+            GtpError::MissingMandatoryIe("Linked EPS Bearer ID in PDN Connection".to_string())
+        })?;
+        Ok(Gtp2EbiIe::decode(&ie.value)?.ebi)
+    }
+
+    /// `PGW S5/S8 IP Address for Control Plane or PMIP` (Table 7.3.6-2, mandatory,
+    /// `29274-j60.txt:20552`).
+    pub fn pgw_s5s8_control_fteid(&self) -> GtpResult<Gtp2FTeidIe> {
+        let ie = self.get_ie(Gtp2IeType::FTeid as u8, 0).ok_or_else(|| {
+            GtpError::MissingMandatoryIe("PGW S5/S8 control F-TEID in PDN Connection".to_string())
+        })?;
+        Gtp2FTeidIe::decode(&ie.value)
+    }
+
+    /// The APN-AMBR (Table 7.3.6-2, mandatory, `29274-j60.txt:20573`).
+    pub fn apn_ambr(&self) -> GtpResult<Gtp2AmbrIe> {
+        let ie = self.get_ie(Gtp2IeType::Ambr as u8, 0).ok_or_else(|| {
+            GtpError::MissingMandatoryIe("APN-AMBR in PDN Connection".to_string())
+        })?;
+        Gtp2AmbrIe::decode(&ie.value)
+    }
+
+    /// The UE's IPv4 address, if the PDN connection has one (Table 7.3.6-2,
+    /// conditional: *"shall not be included if no IPv4 Address is assigned"*,
+    /// `29274-j60.txt:20539`).
+    pub fn ipv4_address(&self) -> Option<[u8; 4]> {
+        let ie = self.get_ie(Gtp2IeType::IpAddress as u8, 0)?;
+        let bytes: [u8; 4] = ie.value.as_ref().try_into().ok()?;
+        Some(bytes)
+    }
+
+    /// Every nested Bearer Context (Table 7.3.6-2, mandatory, `29274-j60.txt:20567`:
+    /// *"Several IEs with this type and instance values may be included as necessary
+    /// to represent a list of Bearers"*).
+    pub fn bearer_contexts(&self) -> GtpResult<Vec<Gtp2BearerContextIe>> {
+        self.ies
+            .iter()
+            .filter(|ie| ie.ie_type == Gtp2IeType::BearerContext as u8)
+            .map(|ie| Gtp2BearerContextIe::decode(&ie.value))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1566,5 +1972,358 @@ mod tests {
 
         // Empty value rejected
         assert!(Gtp2IndicationIe::decode(&Bytes::new()).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // N26 / S10 composite IEs (#347)
+    // ------------------------------------------------------------------
+
+    /// The four IE types this leg newly depends on, pinned to Table 8.1-1 by the
+    /// number.
+    ///
+    /// `MmContext = 107` and `PdnConnection = 109` already existed in this enum, which
+    /// contradicted #347's own gap description — so this test is as much a record that
+    /// they are the RIGHT numbers as that they exist.
+    ///
+    /// | IE | id | `29274-j60.txt` |
+    /// |---|---|---|
+    /// | MM Context (EPS Security Context, Quadruplets and Quintuplets) | 107 | `:24535` |
+    /// | PDN Connection | 109 | `:24547` |
+    /// | Complete Request Message | 116 | `:24568` |
+    /// | GUTI | 117 | `:24571` |
+    #[test]
+    fn gtp2_n26_ie_types_match_ts29274_table_8_1_1() {
+        assert_eq!(
+            Gtp2IeType::MmContext as u8,
+            107,
+            "the EPS-security-context MM Context is IE type 107 (29274-j60.txt:24535); \
+             103-106 and 108 are the GSM/UMTS-keyed variants and are separate types"
+        );
+        assert_eq!(
+            Gtp2IeType::PdnConnection as u8,
+            109,
+            "PDN Connection is IE type 109 (29274-j60.txt:24547)"
+        );
+        assert_eq!(
+            Gtp2IeType::CompleteRequestMessage as u8,
+            116,
+            "Complete Request Message is IE type 116 (29274-j60.txt:24568)"
+        );
+        assert_eq!(
+            Gtp2IeType::Guti as u8,
+            117,
+            "GUTI is IE type 117 (29274-j60.txt:24571)"
+        );
+        // 108 is a DIFFERENT MM Context variant (UMTS Key, Quadruplets and
+        // Quintuplets, `:24541`), so it must not resolve to the one this library
+        // implements -- an alias would let a UMTS-keyed context be parsed with the
+        // EPS figure's offsets.
+        assert!(
+            Gtp2IeType::try_from(108u8).is_err(),
+            "MM Context type 108 is the UMTS-keyed variant and is not implemented, so \
+             it must not silently decode as 107"
+        );
+        assert_eq!(
+            MM_CONTEXT_SECURITY_MODE_EPS, 4,
+            "'EPS Security Context and Quadruplets' is Security Mode 4 \
+             (TS 29.274 Table 8.38-1, 29274-j60.txt:28671)"
+        );
+        assert_eq!(
+            MM_CONTEXT_KASME_LEN, 32,
+            "K_ASME occupies octets 14 to 45 of Figure 8.38-5 = 32 octets"
+        );
+    }
+
+    /// Every field of Figure 8.38-5 at its absolute byte position in the IE contents.
+    ///
+    /// This is the assertion a round trip cannot make. `encode`/`decode` agree with
+    /// each other by construction, so they would agree just as happily with the two
+    /// NAS COUNTs transposed, with `K_ASME` four octets off (the TLV-header
+    /// off-by-four), or with `Security Mode` in the low bits instead of the high. Each
+    /// of those has a distinct byte signature and each is checked here.
+    #[test]
+    fn mm_context_encodes_ts29274_figure_8_38_5_field_positions() {
+        // Distinguishable values: the two COUNTs differ, and K_ASME is a ramp so a
+        // misaligned copy shows up as an offset rather than as zeroes.
+        let mut kasme = [0u8; MM_CONTEXT_KASME_LEN];
+        for (i, b) in kasme.iter_mut().enumerate() {
+            *b = 0xA0 + i as u8;
+        }
+        let ctx = Gtp2MmContextIe {
+            ksi_asme: 0x05,
+            nhi: false,
+            used_nas_integrity_algorithm: 0x02, // 128-EIA2
+            used_nas_cipher: 0x01,              // 128-EEA1
+            nas_downlink_count: 0x00_11_22_33 & 0x00FF_FFFF,
+            nas_uplink_count: 0x00_44_55_66 & 0x00FF_FFFF,
+            kasme,
+            ue_network_capability: vec![0xE0, 0xE1],
+            ms_network_capability: vec![0xF0],
+            mei: vec![0x21, 0x43, 0x65],
+            access_restriction: 0x01, // UNA
+        };
+
+        let mut v = BytesMut::new();
+        ctx.encode_value(&mut v);
+        let v = v.freeze();
+
+        // Figure octet 5 (contents[0]): Security Mode 4 in bits 8..6, NHI clear,
+        // DRXI clear, KSI_ASME 5 in bits 3..1 => 0b100_0_0_101 = 0x85.
+        assert_eq!(
+            v[0], 0x85,
+            "octet 5 is Security Mode(4)<<5 | NHI<<4 | DRXI<<3.. | KSI_ASME \
+             (29274-j60.txt:28260)"
+        );
+        assert_eq!(
+            (v[0] >> 5) & 0x07,
+            MM_CONTEXT_SECURITY_MODE_EPS,
+            "Security Mode occupies the TOP three bits of octet 5, not the bottom"
+        );
+
+        // Figure octet 6 (contents[1]): both vector counts, UAMBRI and OSCI all zero
+        // on N26.
+        assert_eq!(
+            v[1], 0x00,
+            "octet 6 carries Number of Quintuplets | Number of Quadruplet | UAMBRI | \
+             OSCI, all zero over N26 (29274-j60.txt:28190, :28198, :28234)"
+        );
+
+        // Figure octet 7 (contents[2]): SAMBRI clear, integrity alg 2 in bits 7..5,
+        // cipher 1 in bits 4..1 => 0b0_010_0001 = 0x21.
+        assert_eq!(
+            v[2], 0x21,
+            "octet 7 is SAMBRI<<7 | integrity(3 bits)<<4 | cipher(4 bits) \
+             (29274-j60.txt:28264)"
+        );
+
+        // Figure octets 8-10 (contents[3..6]): NAS DOWNLINK count, big-endian 24 bits.
+        assert_eq!(
+            &v[3..6],
+            &[0x11, 0x22, 0x33],
+            "octets 8-10 are the NAS DOWNLINK Count (29274-j60.txt:28266) -- if this \
+             reads 44 55 66 the two counts are transposed, which no round trip sees"
+        );
+        // Figure octets 11-13 (contents[6..9]): NAS UPLINK count.
+        assert_eq!(
+            &v[6..9],
+            &[0x44, 0x55, 0x66],
+            "octets 11-13 are the NAS UPLINK Count (29274-j60.txt:28268)"
+        );
+
+        // Figure octets 14-45 (contents[9..41]): K_ASME, 32 octets.
+        assert_eq!(
+            &v[9..41],
+            &kasme[..],
+            "K_ASME starts at figure octet 14 = contents offset 9 (14 minus the 4 \
+             octets of TLV header + 1 for 1-based octet numbering)"
+        );
+
+        // Then the three length-prefixed capability fields and the restriction octet.
+        assert_eq!(v[41], 2, "Length of UE Network Capability");
+        assert_eq!(&v[42..44], &[0xE0, 0xE1]);
+        assert_eq!(v[44], 1, "Length of MS Network Capability");
+        assert_eq!(v[45], 0xF0);
+        assert_eq!(v[46], 3, "Length of Mobile Equipment Identity");
+        assert_eq!(&v[47..50], &[0x21, 0x43, 0x65]);
+        assert_eq!(v[50], 0x01, "access restriction flags octet (r+1)");
+        assert_eq!(v.len(), 51, "no trailing optional octets are emitted");
+
+        // And the TLV wrapper carries the right type.
+        let ie = ctx.to_ie(0);
+        assert_eq!(ie.ie_type, Gtp2IeType::MmContext as u8);
+        assert_eq!(ie.instance, 0);
+
+        // Round trip, which is necessary but not sufficient.
+        assert_eq!(Gtp2MmContextIe::decode(&ie.value).unwrap(), ctx);
+    }
+
+    /// A 24-bit NAS COUNT must survive its full range, and the top octet must not be
+    /// dropped.
+    #[test]
+    fn mm_context_nas_counts_round_trip_across_the_24_bit_range() {
+        for (dl, ul) in [
+            (0u32, 0u32),
+            (0x00FF_FFFF, 0x00FF_FFFF),
+            (1, 0x00FF_FFFF),
+            (0x00FF_0000, 0x0000_00FF),
+        ] {
+            let ctx = Gtp2MmContextIe {
+                nas_downlink_count: dl,
+                nas_uplink_count: ul,
+                kasme: [0x5A; MM_CONTEXT_KASME_LEN],
+                ..Default::default()
+            };
+            let decoded = Gtp2MmContextIe::decode(&ctx.to_ie(0).value).unwrap();
+            assert_eq!(
+                decoded.nas_downlink_count, dl,
+                "downlink count must survive"
+            );
+            assert_eq!(decoded.nas_uplink_count, ul, "uplink count must survive");
+        }
+    }
+
+    /// A MM Context carrying a different Security Mode is REFUSED, not reinterpreted.
+    #[test]
+    fn mm_context_refuses_a_non_eps_security_mode() {
+        let ctx = Gtp2MmContextIe {
+            kasme: [0x11; MM_CONTEXT_KASME_LEN],
+            ..Default::default()
+        };
+        let mut v = BytesMut::new();
+        ctx.encode_value(&mut v);
+        let mut v = v.to_vec();
+        // Security Mode 3 = "UMTS Key and Quintuplets" (Table 8.38-1,
+        // `29274-j60.txt:28665`), whose octets after 5 follow Figure 8.38-4.
+        v[0] = (v[0] & 0x1F) | (3 << 5);
+        assert!(
+            Gtp2MmContextIe::decode(&Bytes::from(v)).is_err(),
+            "a UMTS-keyed MM Context must NOT be parsed with the EPS figure's offsets: \
+             it would yield a plausible K_ASME from quintuplet bytes"
+        );
+    }
+
+    /// Too short to hold K_ASME is an error, not a zero key.
+    #[test]
+    fn mm_context_refuses_a_truncated_kasme() {
+        // Security Mode 4 in octet 5, then only 8 more octets -- K_ASME cannot fit.
+        let short = Bytes::from(vec![0x80, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(
+            Gtp2MmContextIe::decode(&short).is_err(),
+            "a truncated MM Context must error rather than produce an all-zero K_ASME, \
+             which would be a usable-looking key nobody derived"
+        );
+    }
+
+    /// The PDN Connection's mandatory members, read back through the accessors.
+    #[test]
+    fn pdn_connection_carries_its_table_7_3_6_2_mandatory_members() {
+        let mut bearer = Gtp2BearerContextIe::new();
+        bearer.set_ebi(5);
+        bearer.set_fteid(0, &Gtp2PdnConnectionIe::n26_reserved_sgw_fteid());
+        bearer.set_bearer_qos(&Gtp2BearerQosIe::new(9, 0, 0, 0, 0));
+
+        let mut pdn = Gtp2PdnConnectionIe::new();
+        pdn.add_ie(Gtp2ApnIe::from_string("internet").to_ie(0));
+        pdn.add_ie(Gtp2EbiIe::new(5).to_ie(0));
+        // interface type 7 = S5/S8 PGW GTP-C (TS 29.274 Table 8.22-1).
+        pdn.add_ie(Gtp2FTeidIe::new_ipv4(7, 0x0BAD_C0DE, [10, 45, 0, 1]).to_ie(0));
+        pdn.add_ie(bearer.to_ie(0));
+        pdn.add_ie(Gtp2AmbrIe::new(100_000, 200_000).to_ie(0));
+
+        // Through the wire, not in memory.
+        let ie = pdn.to_ie(0);
+        assert_eq!(ie.ie_type, Gtp2IeType::PdnConnection as u8);
+        let decoded = Gtp2PdnConnectionIe::decode(&ie.value).unwrap();
+
+        assert_eq!(decoded.apn().unwrap().to_string(), "internet");
+        assert_eq!(
+            decoded.linked_ebi().unwrap(),
+            5,
+            "the Linked EPS Bearer ID names the PDN connection's default bearer"
+        );
+        let pgw = decoded.pgw_s5s8_control_fteid().unwrap();
+        assert_eq!(pgw.teid, 0x0BAD_C0DE);
+        assert_eq!(pgw.ipv4_addr, Some([10, 45, 0, 1]));
+        assert_eq!(pgw.interface_type, 7);
+        let ambr = decoded.apn_ambr().unwrap();
+        assert_eq!(ambr.uplink, 100_000);
+        assert_eq!(ambr.downlink, 200_000);
+        let bearers = decoded.bearer_contexts().unwrap();
+        assert_eq!(bearers.len(), 1);
+        assert_eq!(bearers[0].ebi().unwrap(), 5);
+        assert_eq!(bearers[0].bearer_qos().unwrap().unwrap().qci, 9);
+    }
+
+    /// A PDN Connection missing a mandatory member reports WHICH one.
+    #[test]
+    fn pdn_connection_names_the_missing_mandatory_member() {
+        let empty = Gtp2PdnConnectionIe::new();
+        for result in [
+            empty.apn().err().map(|e| e.to_string()),
+            empty.linked_ebi().err().map(|e| e.to_string()),
+            empty.pgw_s5s8_control_fteid().err().map(|e| e.to_string()),
+            empty.apn_ambr().err().map(|e| e.to_string()),
+        ] {
+            let msg = result.expect("a missing mandatory member must be an error");
+            assert!(
+                msg.contains("PDN Connection"),
+                "the error must name where the IE was missing from, got {msg:?}"
+            );
+        }
+        assert!(
+            empty.ipv4_address().is_none(),
+            "an absent IPv4 Address is 'no IPv4 assigned' (Table 7.3.6-2), not an error"
+        );
+    }
+
+    /// Over N26 the SGW user-plane F-TEID is the reserved value, at the byte level.
+    ///
+    /// Table 7.3.6-3 (`29274-j60.txt:20906-20915`) requires a reserved TEID and
+    /// `0.0.0.0`. A real endpoint here would send an MME's user plane to an address the
+    /// 5GC never allocated for it, so this is asserted on the encoded octets rather
+    /// than on the struct.
+    #[test]
+    fn n26_sgw_fteid_is_the_reserved_value_ts29274_table_7_3_6_3_requires() {
+        let fteid = Gtp2PdnConnectionIe::n26_reserved_sgw_fteid();
+        assert_eq!(
+            fteid.teid, 0,
+            "TS 29.274 Table 7.3.6-3: over N26 the SGW user-plane TEID is 'any \
+             reserved TEID (e.g. all 0's, or all 1's)' (29274-j60.txt:20908)"
+        );
+        assert_eq!(
+            fteid.ipv4_addr,
+            Some([0, 0, 0, 0]),
+            "and the IPv4 address is 0.0.0.0 (29274-j60.txt:20912)"
+        );
+        assert_eq!(
+            fteid.interface_type, 1,
+            "interface type 1 = S1-U SGW GTP-U, per NOTE 2 (29274-j60.txt:20972)"
+        );
+
+        // On the wire: flags octet then the 4-octet TEID then the address.
+        let ie = fteid.to_ie(0);
+        assert_eq!(
+            &ie.value[1..5],
+            &[0, 0, 0, 0],
+            "the encoded TEID octets must be zero"
+        );
+        assert_eq!(
+            &ie.value[5..9],
+            &[0, 0, 0, 0],
+            "the encoded IPv4 octets must be 0.0.0.0"
+        );
+    }
+
+    /// A multi-session UE yields several PDN Connection IEs all at the SAME instance.
+    ///
+    /// §8.39 (`29274-j60.txt:28802-28806`) requires it, and numbering them 0,1,2 — the
+    /// intuitive thing — would make a receiver read a list of three different members
+    /// rather than a repeated one.
+    #[test]
+    fn repeated_pdn_connections_share_one_instance_value() {
+        let mut msg_ies = Vec::new();
+        for ebi in [5u8, 6, 7] {
+            let mut pdn = Gtp2PdnConnectionIe::new();
+            pdn.add_ie(Gtp2EbiIe::new(ebi).to_ie(0));
+            msg_ies.push(pdn.to_ie(0));
+        }
+        assert!(
+            msg_ies.iter().all(|ie| ie.instance == 0),
+            "repeated PDN Connection IEs must all carry instance 0 (TS 29.274 §8.39)"
+        );
+        let ebis: Vec<u8> = msg_ies
+            .iter()
+            .map(|ie| {
+                Gtp2PdnConnectionIe::decode(&ie.value)
+                    .unwrap()
+                    .linked_ebi()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            ebis,
+            vec![5, 6, 7],
+            "and each must still be recoverable as its own PDN connection"
+        );
     }
 }

@@ -586,23 +586,43 @@ pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
 
 /// The interworking posture this AMF can honestly advertise (TS 24.501 §9.11.3.5).
 ///
-/// A **constant**, and deliberately not a config knob, which is a stated deviation
-/// from #116's criterion 1 ("set according to configured capability").
+/// # The bit is inverted from the obvious reading, and getting it backwards is silent
 ///
-/// The bit does not mean "interworking supported"; it means *"interworking WITHOUT an
-/// N26 interface is supported"*. So the value follows from one fact: this AMF has no
-/// N26 leg — no GTPv2-C toward an MME, no Forward Relocation, nothing (#62 tracks
-/// building it). Therefore `WithoutN26Supported`, i.e. the bit is SET, and a UE that
-/// supports dual-registration mode may use it (§5.5.1.2.4 case b).
+/// It does **not** mean "interworking supported". TS 24.501 Table 9.11.3.5.1
+/// (`24501-j62.txt:75100`) names it *"Interworking without N26 interface indicator"*:
 ///
-/// A knob was considered and rejected: its only other setting would advertise an N26
-/// interface that does not exist, and a UE believing it would operate in
-/// single-registration mode and expect session continuity on an inter-system move
-/// that this core cannot perform. A configuration option whose non-default value is
-/// always a lie is worse than a constant — and when #62 lands, this function is the
-/// single place that changes.
+/// | bit | means | UE behaviour (§5.5.1.2.4) |
+/// |---|---|---|
+/// | `0` | interworking without N26 **not** supported → the AMF **HAS** N26 | must use single-registration mode |
+/// | `1` | interworking without N26 supported → the AMF has **no** N26 | may use dual-registration mode |
+///
+/// So the switch being **on** yields `Iwk26::N26Supported`, which encodes **0**. Writing
+/// `if enabled() { WithoutN26Supported }` reads more naturally in English and is exactly
+/// backwards — which is why #116 modelled this as an enum rather than a `bool`: at a call
+/// site `WithoutN26Supported` cannot be mistaken for "N26 supported" the way `true` can.
+/// Getting it wrong round-trips clean through every encode/decode test and surfaces only
+/// as a UE expecting session continuity this core cannot provide.
+///
+/// # Why this reads the runtime switch, not a `cfg!` and not a config knob
+///
+/// #347's criterion 6 asks that a UE be told `IWK N26 = 0` *"only when the N26 leg is
+/// actually enabled — and never merely because the code exists"*. A `cfg!(feature = …)`
+/// fails that by construction: with the code compiled in the bit would flip whether or not
+/// a socket was ever bound. [`crate::n26_path::enabled`] is the same switch the socket is
+/// gated on, and `n26_path::n26_open` forces it back **off** when the bind is skipped or
+/// fails — so the bit cannot claim an interface that does not exist.
+///
+/// This supersedes #116's stated deviation ("there is no config knob; this function is a
+/// constant"). The knob #116 rejected was rejected because its non-default value would
+/// always have been a lie; now the non-default value is the truth exactly when the leg is
+/// up.
 fn iwk_n26_posture() -> nextgcore_nas::interworking::Iwk26 {
-    nextgcore_nas::interworking::Iwk26::WithoutN26Supported
+    if crate::n26_path::enabled() {
+        // The AMF HAS N26 => bit CLEAR. Deliberately this way round; see above.
+        nextgcore_nas::interworking::Iwk26::N26Supported
+    } else {
+        nextgcore_nas::interworking::Iwk26::WithoutN26Supported
+    }
 }
 
 /// Convert amfd's nibble-encoded PLMN into the nextgcore-nas digit-array `PlmnId` so the
@@ -2050,23 +2070,57 @@ mod tests {
         );
     }
 
-    /// The posture is the one the absence of an N26 leg dictates.
+    /// The posture follows the runtime switch, in BOTH directions, with the right polarity
+    /// (#347 criterion 6).
     ///
-    /// Separate from the byte test so that when #62 lands and this becomes variable,
-    /// the thing that changes is one assertion with a name that says why.
+    /// Replaces #116's `iwk_n26_posture_says_this_amf_has_no_n26_leg`, which pinned the
+    /// constant. Both states are asserted here and both *encoded bit values*, because the
+    /// mapping is inverted and the only way to catch a flipped implementation is to name
+    /// the byte: `if enabled() { WithoutN26Supported }` is the natural-English reading and
+    /// would pass any test that checked only "the value changes with the switch".
+    ///
+    /// Takes `CONTEXT_GUARD` because the switch is process-global and a sibling test
+    /// reading `iwk_n26_posture` through `build_registration_accept` would otherwise see
+    /// whichever value this test left behind.
     #[test]
-    fn iwk_n26_posture_says_this_amf_has_no_n26_leg() {
+    fn iwk_n26_posture_follows_the_runtime_switch() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Leg UP => the AMF HAS N26 => "interworking without N26 NOT supported" => bit 0.
+        crate::n26_path::set_for_test(true);
+        assert_eq!(
+            iwk_n26_posture(),
+            nextgcore_nas::interworking::Iwk26::N26Supported,
+            "with the N26 leg enabled the AMF HAS N26, so the posture is N26Supported -- \
+             note this is the case that encodes the bit CLEAR, which is the opposite of the \
+             natural-English reading"
+        );
+        assert_eq!(
+            iwk_n26_posture().bit(),
+            0x00,
+            "and it encodes as octet 3 bit 7 CLEAR (TS 24.501 Table 9.11.3.5.1: '0' = \
+             'interworking without N26 interface not supported', i.e. N26 is present)"
+        );
+
+        // Leg DOWN => no N26 => "interworking without N26 supported" => bit 1.
+        crate::n26_path::set_for_test(false);
         assert_eq!(
             iwk_n26_posture(),
             nextgcore_nas::interworking::Iwk26::WithoutN26Supported,
-            "with no GTPv2-C leg toward an MME, the only honest posture is \
-             'interworking without N26 supported' (#62 builds the leg)"
+            "with the leg off the only honest posture is 'interworking without N26 \
+             supported' -- and the code being COMPILED IN must not change that (#347 \
+             criterion 6: 'never merely because the code exists')"
         );
         assert_eq!(
             iwk_n26_posture().bit(),
             0x40,
             "and it encodes as octet 3 bit 7 SET"
         );
+
+        // Left off, which is the default posture every other test in this module expects.
+        crate::n26_path::set_for_test(false);
     }
 
     // ------------------------------------------------------------------

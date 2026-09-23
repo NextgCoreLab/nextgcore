@@ -318,7 +318,12 @@ fn dispatch_emm(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, pdu: &[u8]) {
         emm_type::SECURITY_MODE_COMPLETE => {
             emm_security_mode_complete(ctx, enb_ue, mme_ue_id, body);
         }
-        emm_type::TAU_REQUEST => emm_tau_request(ctx, enb_ue, mme_ue_id, body),
+        // The whole decoded PDU travels alongside the body: an inter-system TAU must be
+        // forwarded to the old AMF **verbatim** in the Complete TAU Request Message IE,
+        // because the AMF integrity-checks those exact octets (TS 29.274 Table 7.3.5-1,
+        // `29274-j60.txt:19759`). Re-encoding the body from the parsed fields would fail
+        // that check and the UE would be refused (#347).
+        emm_type::TAU_REQUEST => emm_tau_request(ctx, enb_ue, mme_ue_id, body, &plain),
         emm_type::EXTENDED_SERVICE_REQUEST => {
             emm_extended_service_request(ctx, enb_ue, mme_ue_id, body);
         }
@@ -818,7 +823,13 @@ fn request_subscription_data(ctx: &MmeContext, mme_ue_id: u64) {
     crate::fd_path::queue_update_location(mme_ue_id, initial_attach);
 }
 
-fn emm_tau_request(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, body: &[u8]) {
+fn emm_tau_request(
+    ctx: &MmeContext,
+    enb_ue: &EnbUe,
+    mme_ue_id: u64,
+    body: &[u8],
+    whole_pdu: &[u8],
+) {
     let mut pool = ctx.mme_ue_pool.write().unwrap();
     let Some(mme_ue) = pool.get_mut(&mme_ue_id) else {
         return;
@@ -842,6 +853,106 @@ fn emm_tau_request(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, body: &[u8]
             return;
         }
     };
+
+    // ------------------------------------------------------------------
+    // Inter-system TAU: the UE has just come from 5GS (#347)
+    // ------------------------------------------------------------------
+    //
+    // The discriminator is the UE status IE's `N1 mode reg` bit, NOT a mapped GUTI —
+    // TS 24.301 §5.5.3.2.2 case z has the UE send a GUTI mapped from its 5G-GUTI while
+    // typing it "Native GUTI", so the GUTI type cannot distinguish this from an
+    // intra-EPS TAU. See `TauRequestData::five_gmm_registered`.
+    //
+    // This branch comes BEFORE the security-context check below, and that ordering is
+    // load-bearing: a UE arriving from 5GS has **no EPS security context here yet** —
+    // §4.4.2.2 (`24301-k00.txt:4450-4462`) has it protect the TAU REQUEST with its
+    // *current 5G* context, which this MME does not hold. So the existing check would
+    // reject every inter-system TAU as implicitly detached, which is exactly what
+    // happens today. Obtaining that context IS this procedure.
+    if parsed.five_gmm_registered {
+        let Some(guti) = parsed.old_guti.as_ref().map(|g| EpsGuti {
+            plmn_id: g.plmn_id.clone(),
+            mme_gid: g.mme_gid,
+            mme_code: g.mme_code,
+            m_tmsi: g.m_tmsi,
+        }) else {
+            // §5.5.3.2.2 case z requires the Old GUTI IE, so a UE claiming a 5GMM
+            // registration without one has given the MME nothing to ask the AMF about.
+            log::warn!(
+                "Inter-system TAU (UE status: 5GMM-REGISTERED) carries no Old GUTI, which \
+                 TS 24.301 §5.5.3.2.2 case z requires; rejecting with EMM cause #9"
+            );
+            if let Err(e) = nas_path::nas_eps_send_tau_reject(
+                enb_ue,
+                mme_ue,
+                EmmCause::UeIdentityCannotBeDerived,
+            ) {
+                log::error!("TAU Reject send failed: {e}");
+            }
+            return;
+        };
+
+        // Released before the N26 send: `send_context_request` reads the context's peer
+        // list and the response path takes the same write lock to install the transferred
+        // context. Holding it across the send would deadlock the moment a response arrived
+        // fast enough, which on a loopback deployment is every time.
+        drop(pool);
+
+        // `ue_validated` is FALSE, and that is a stated ceiling rather than an oversight.
+        //
+        // TS 23.401 §5.3.3.1 step 4 defines UE Validated as "the new MME has validated the
+        // integrity protection of the TAU message", and TS 24.301 §4.4.2.2
+        // (`24301-k00.txt:4452-4462`) says this TAU is protected with the UE's *current 5G
+        // NAS security context*. This MME holds no 5G context and cannot derive one — the
+        // K_AMF lives in the AMF — so it genuinely has not validated the message, and
+        // asserting MSV would ask the AMF to skip a check nobody performed. The AMF does
+        // hold the key, which is why Table 7.3.5-1 has the MME forward the TAU verbatim in
+        // the Complete TAU Request Message IE for the AMF to check instead.
+        match crate::n26_path::send_context_request(
+            ctx, mme_ue_id, enb_ue.id, &guti, whole_pdu, false,
+        ) {
+            Ok(seq) => {
+                log::info!(
+                    "Inter-system TAU from 5GS: Context Request sent to the old AMF \
+                     (seq={seq}). The TAU ACCEPT waits on the Context Response \
+                     (TS 23.502 §4.11.1.3.2 steps 4-6)."
+                );
+                // Nothing more here: the response path continues the procedure. Returning
+                // rather than falling through is what stops the UE getting a TAU ACCEPT
+                // before its context has arrived.
+                return;
+            }
+            Err(e) => {
+                // TS 24.301 (`24301-k00.txt:18854-18858`): *"If the UE initiated the
+                // tracking area updating procedure due to inter-system change from N1 mode
+                // to S1 mode, and the MME does not support N26 interface, the MME shall
+                // send a TRACKING AREA UPDATE REJECT message with EMM cause value #9 'UE
+                // identity cannot be derived by the network'."*
+                //
+                // Cause #9 and not #10 (implicitly detached), which is what the generic
+                // no-context branch below would have sent: #10 tells a UE to re-attach on
+                // EPS as if its EPS registration had lapsed, while #9 says the network
+                // cannot derive the identity it presented — which is the true statement
+                // about a 5G-GUTI this MME cannot resolve.
+                log::info!(
+                    "Inter-system TAU from 5GS cannot be served ({e}); rejecting with EMM \
+                     cause #9 'UE identity cannot be derived by the network', as TS 24.301 \
+                     requires of an MME without a usable N26 interface"
+                );
+                let mut pool = ctx.mme_ue_pool.write().unwrap();
+                if let Some(mme_ue) = pool.get_mut(&mme_ue_id) {
+                    if let Err(e) = nas_path::nas_eps_send_tau_reject(
+                        enb_ue,
+                        mme_ue,
+                        EmmCause::UeIdentityCannotBeDerived,
+                    ) {
+                        log::error!("TAU Reject send failed: {e}");
+                    }
+                }
+                return;
+            }
+        }
+    }
 
     if !mme_ue.security_context_available || mme_ue.imsi_bcd.is_empty() {
         // TS 24.301 §5.5.3.2.5: with no context for the UE the MME rejects with
@@ -887,6 +998,98 @@ fn emm_tau_request(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, body: &[u8]
         .collect();
     if let Err(e) = nas_path::nas_eps_send_tau_accept(mme_ue, enb_ue, false, &bearers) {
         log::error!("[{}] TAU Accept send failed: {e}", mme_ue.imsi_bcd);
+    }
+}
+
+/// Finish an inter-system TAU once the old AMF's context has been installed (#347).
+///
+/// TS 23.502 §4.11.1.3.2 steps 7-14 and 16-18, i.e. TS 23.401 §5.3.3.1 steps 6-12 and
+/// 17-21: the transferred bearers are switched over to this MME's Serving GW with a
+/// **Modify Bearer Request**, and the UE gets its **TAU ACCEPT**.
+///
+/// # Called from the N26 response path, which is reached from a live socket
+///
+/// [`crate::n26_path::handle_context_response`], reached from `N26Server::handle_datagram`,
+/// which the receive thread `N26Server::open` spawns drives — installed by `main.rs` at
+/// startup when the switch is on. Stated here because "correct but unreachable" is this
+/// tree's commonest defect and a reader should not have to trace it.
+///
+/// # Why the accept is sent even if the Modify Bearer send fails
+///
+/// The UE's context, security and bearers are already installed here; the Modify Bearer
+/// Request moves the *user plane*. TS 23.401 §5.3.3.1 sends the TAU ACCEPT at step 20,
+/// after the bearer modification, but a UE left with no answer at all waits out T3430 and
+/// then re-attaches — losing the context that was just transferred at some cost. So a
+/// failed S11 send is logged loudly, naming the consequence (a UE registered on EPS whose
+/// downlink path still points at the old SGW), and the accept goes out.
+pub fn continue_inter_system_tau(ctx: &MmeContext, mme_ue_id: u64, enb_ue_id: u64) {
+    let Some(enb_ue) = ctx.enb_ue_find_by_id(enb_ue_id) else {
+        log::warn!(
+            "the eNB UE context for the inter-system TAU is gone; the transferred context \
+             is installed but no TAU ACCEPT can be sent"
+        );
+        return;
+    };
+
+    // TS 24.301 §5.5.3.2.4: the accept may reallocate the GUTI, and rotating it on
+    // mobility is what keeps the temporary identity temporary (#46). It matters more here
+    // than on an intra-EPS TAU: the UE arrived holding a GUTI *mapped from its 5G-GUTI*,
+    // so leaving it in place would keep an EPS identity that encodes which AMF served it.
+    ctx.allocate_guti(mme_ue_id);
+
+    // Steps 8-11: switch the transferred bearers to this MME's Serving GW. `uli_presence`
+    // is true because the UE has changed tracking area by definition -- that is what a TAU
+    // is -- so the SGW and PGW need the new User Location Information.
+    match gtp_path::send_modify_bearer_request(
+        ctx,
+        enb_ue_id,
+        mme_ue_id,
+        true,
+        crate::s11_build::GtpModifyAction::NoAction,
+    ) {
+        Ok(_) => log::info!(
+            "Inter-system TAU: Modify Bearer Request sent for the transferred bearers \
+             (TS 23.401 §5.3.3.1 steps 8-11)"
+        ),
+        Err(e) => log::error!(
+            "Inter-system TAU: Modify Bearer Request failed: {e}. The UE will be accepted \
+             on EPS with its control-plane context transferred, but its DOWNLINK user plane \
+             still points at the 5GC's UPF -- so downlink traffic is blackholed until a \
+             later bearer procedure repairs it."
+        ),
+    }
+
+    let bearers: Vec<crate::context::MmeBearer> = {
+        let Some(mme_ue) = ctx.mme_ue_find_by_id(mme_ue_id) else {
+            return;
+        };
+        mme_ue
+            .sess_list
+            .iter()
+            .filter_map(|sess_id| ctx.sess_find_by_id(*sess_id))
+            .flat_map(|sess| {
+                sess.bearer_list
+                    .iter()
+                    .filter_map(|id| ctx.bearer_find_by_id(*id))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+
+    let mut pool = ctx.mme_ue_pool.write().unwrap();
+    let Some(mme_ue) = pool.get_mut(&mme_ue_id) else {
+        return;
+    };
+    if let Err(e) = nas_path::nas_eps_send_tau_accept(mme_ue, &enb_ue, false, &bearers) {
+        log::error!("[{}] TAU Accept send failed: {e}", mme_ue.imsi_bcd);
+    } else {
+        log::info!(
+            "[{}] Inter-system TAU COMPLETE: the UE moved from 5GS to EPS with {} \
+             transferred bearer(s) and its mapped EPS security context (TS 23.502 \
+             §4.11.1.3.2)",
+            mme_ue.imsi_bcd,
+            bearers.len()
+        );
     }
 }
 

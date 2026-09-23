@@ -55,6 +55,27 @@ pub enum Gtp2MessageType {
     DeletePdnConnectionSetResponse = 102,
     PgwDownlinkTriggeringNotification = 103,
     PgwDownlinkTriggeringAcknowledge = 104,
+    // ---------------------------------------------------------------------
+    // S3 / S10 / S16 / N26 mobility management (TS 29.274 Table 6.1-1, the
+    // "MME to MME, SGSN to MME, MME to SGSN, SGSN to SGSN, MME to AMF, AMF to
+    // MME (S3/S10/S16/N26)" block). Added by #347 for the N26 leg.
+    //
+    // Every number below is read off its OWN row of Table 6.1-1, not inferred
+    // from a neighbour: #401 found three of four IE ids it had inferred from
+    // adjacent table rows were wrong, and #45 found the NRPPa transport codes
+    // were 5/8/47/50 rather than the 7/45/46 that reading had produced.
+    // `gtp2_n26_message_types_match_ts29274_table_6_1_1` asserts all nine as
+    // literals so the table cannot drift from the spec silently.
+    // ---------------------------------------------------------------------
+    IdentificationRequest = 128,
+    IdentificationResponse = 129,
+    ContextRequest = 130,
+    ContextResponse = 131,
+    ContextAcknowledge = 132,
+    ForwardRelocationRequest = 133,
+    ForwardRelocationResponse = 134,
+    ForwardRelocationCompleteNotification = 135,
+    ForwardRelocationCompleteAcknowledge = 136,
     CreateForwardingTunnelRequest = 160,
     CreateForwardingTunnelResponse = 161,
     SuspendNotification = 162,
@@ -115,6 +136,15 @@ impl TryFrom<u8> for Gtp2MessageType {
             102 => Ok(Self::DeletePdnConnectionSetResponse),
             103 => Ok(Self::PgwDownlinkTriggeringNotification),
             104 => Ok(Self::PgwDownlinkTriggeringAcknowledge),
+            128 => Ok(Self::IdentificationRequest),
+            129 => Ok(Self::IdentificationResponse),
+            130 => Ok(Self::ContextRequest),
+            131 => Ok(Self::ContextResponse),
+            132 => Ok(Self::ContextAcknowledge),
+            133 => Ok(Self::ForwardRelocationRequest),
+            134 => Ok(Self::ForwardRelocationResponse),
+            135 => Ok(Self::ForwardRelocationCompleteNotification),
+            136 => Ok(Self::ForwardRelocationCompleteAcknowledge),
             160 => Ok(Self::CreateForwardingTunnelRequest),
             161 => Ok(Self::CreateForwardingTunnelResponse),
             162 => Ok(Self::SuspendNotification),
@@ -343,6 +373,95 @@ mod tests {
         assert!(!decoded.teid_presence);
         assert_eq!(decoded.teid, None);
         assert_eq!(decoded.sequence_number, 0x123456);
+    }
+
+    /// TS 29.274 Table 6.1-1, the S3/S10/S16/N26 block, by the number rather than
+    /// by a round trip (#347, the #321/#340 guard).
+    ///
+    /// A round trip through `TryFrom` would pass with every value shifted by one, so
+    /// the literals are what pin conformance. Each is quoted with the vendored line it
+    /// was read from, so a reviewer can check the table without trusting this comment:
+    ///
+    /// | type | message | `29274-j60.txt` |
+    /// |---|---|---|
+    /// | 128 | Identification Request | `:2410` |
+    /// | 129 | Identification Response | `:2413` |
+    /// | 130 | Context Request | `:2416` |
+    /// | 131 | Context Response | `:2418` |
+    /// | 132 | Context Acknowledge | `:2420` |
+    /// | 133 | Forward Relocation Request | `:2422` |
+    /// | 134 | Forward Relocation Response | `:2425` |
+    /// | 135 | Forward Relocation Complete Notification | `:2428` |
+    /// | 136 | Forward Relocation Complete Acknowledge | `:2431` |
+    #[test]
+    fn gtp2_n26_message_types_match_ts29274_table_6_1_1() {
+        assert_eq!(Gtp2MessageType::IdentificationRequest as u8, 128);
+        assert_eq!(Gtp2MessageType::IdentificationResponse as u8, 129);
+        assert_eq!(
+            Gtp2MessageType::ContextRequest as u8,
+            130,
+            "Context Request is 130 (29274-j60.txt:2416)"
+        );
+        assert_eq!(
+            Gtp2MessageType::ContextResponse as u8,
+            131,
+            "Context Response is 131 (29274-j60.txt:2418)"
+        );
+        assert_eq!(
+            Gtp2MessageType::ContextAcknowledge as u8,
+            132,
+            "Context Acknowledge is 132 (29274-j60.txt:2420)"
+        );
+        assert_eq!(
+            Gtp2MessageType::ForwardRelocationRequest as u8,
+            133,
+            "Forward Relocation Request is 133 (29274-j60.txt:2422)"
+        );
+        assert_eq!(
+            Gtp2MessageType::ForwardRelocationResponse as u8,
+            134,
+            "Forward Relocation Response is 134 (29274-j60.txt:2425)"
+        );
+        assert_eq!(
+            Gtp2MessageType::ForwardRelocationCompleteNotification as u8,
+            135
+        );
+        assert_eq!(
+            Gtp2MessageType::ForwardRelocationCompleteAcknowledge as u8,
+            136
+        );
+
+        // And the decode direction, so a value cannot be accepted as the wrong
+        // variant: 127 is "For future use" (`:2403`) and 137 is Forward Access
+        // Context Notification, which is S10/S16-only and NOT applicable to N26
+        // (`:2434` shows `-` in the N26 column), so neither is defined here.
+        for (value, expected) in [
+            (128u8, Gtp2MessageType::IdentificationRequest),
+            (129, Gtp2MessageType::IdentificationResponse),
+            (130, Gtp2MessageType::ContextRequest),
+            (131, Gtp2MessageType::ContextResponse),
+            (132, Gtp2MessageType::ContextAcknowledge),
+            (133, Gtp2MessageType::ForwardRelocationRequest),
+            (134, Gtp2MessageType::ForwardRelocationResponse),
+            (135, Gtp2MessageType::ForwardRelocationCompleteNotification),
+            (136, Gtp2MessageType::ForwardRelocationCompleteAcknowledge),
+        ] {
+            assert_eq!(
+                Gtp2MessageType::try_from(value).expect("defined"),
+                expected,
+                "type {value} must decode to the Table 6.1-1 message"
+            );
+        }
+        assert!(
+            Gtp2MessageType::try_from(127u8).is_err(),
+            "127 is 'For future use' (29274-j60.txt:2403), not a message"
+        );
+        assert!(
+            Gtp2MessageType::try_from(137u8).is_err(),
+            "137 (Forward Access Context Notification) is not applicable to N26 \
+             (29274-j60.txt:2434 shows '-' in the N26 column), so this library does \
+             not claim it"
+        );
     }
 
     #[test]
