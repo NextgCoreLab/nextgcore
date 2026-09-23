@@ -832,6 +832,31 @@ pub struct EventSubscription {
     pub any_ue: bool,
     /// Optional subscription expiry (`expiry`, DateTime)
     pub expiry: Option<std::time::SystemTime>,
+    /// Subscription-change notification URI (`subsChangeNotifyUri`,
+    /// `TS29518_Namf_EventExposure.yaml:549`), #397.
+    ///
+    /// A SEPARATE callback from `notify_uri`, and TS 29.518 §6.2.5.2.1
+    /// (`29518-k00.txt:20767-20771`) says which one a given notification goes to:
+    /// *"If the notification is to inform the change (or addition) of subscription
+    /// ID and if the `subsChangeNotifyUri` was provided in the
+    /// AmfEventSubscription, then this callback URI shall be the
+    /// `subsChangeNotifyUri`... Otherwise, this callback URI shall be the
+    /// `eventNotifyUri`"*.
+    ///
+    /// Stored because `SUBSCRIPTION_ID_CHANGE`/`SUBSCRIPTION_ID_ADDITION` are
+    /// delivered to it and nowhere else. Without it the two event types cannot be
+    /// emitted conformantly at all — which is why they were silent.
+    pub subs_change_notify_uri: Option<String>,
+    /// Subscription-change notification correlation ID
+    /// (`subsChangeNotifyCorrelationId`, yaml:551), #397.
+    ///
+    /// Table 6.2.6.2.4-1 (`29518-k00.txt:21820-21833`) makes this the discriminator
+    /// on an `AmfEventNotification`: when the notification informs the creation of
+    /// a new subscription ID and the subscription carried this member, the
+    /// notification carries `subsChangeNotifyCorrelationId`; otherwise it carries
+    /// `notifyCorrelationId`. So the two are mutually exclusive on the wire, and
+    /// holding both is what lets the emitter pick correctly.
+    pub subs_change_notify_correlation_id: Option<String>,
 }
 
 /// AMFStatusChange subscription stored in the AMF context (TS 29.518 §5.2.2.5.1,

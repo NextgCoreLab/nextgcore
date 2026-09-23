@@ -4336,8 +4336,34 @@ impl NgapServer {
         // `3GPP_ACCESS` is stated rather than derived because this path IS the 3GPP one:
         // NGAP is N2 from an NG-RAN. A non-3GPP registration would arrive via an N3IWF,
         // for which this tree has no daemon at all.
+        //
+        // #397: REGISTRATION_STATE_REPORT and LOCATION_REPORT fire from the SAME
+        // moment, for the same reason, and all three are read from one `get` so the
+        // three reports describe one consistent snapshot of the UE.
+        //
+        // `REGISTERED`: TS 29.518 §6.2 (`29518-k00.txt:24000-24008`) has the consumer
+        // receive "the current registration state of a UE... and report for updated
+        // registration state... when AMF becomes aware of a registration state change".
+        // The egressed Registration Accept IS that change (TS 24.501 §5.5.1.2.4: the UE
+        // enters 5GMM-REGISTERED on receiving it) and it is the first moment the AMF can
+        // truthfully say the UE is registered rather than registering.
+        //
+        // LOCATION_REPORT: §6.2 (`:23958-23966`) is "the Last Known Location or the
+        // current Location of a UE... and Updated Location... when AMF becomes aware of
+        // a location change". `amf_ue.nr_tai` was written from the InitialUEMessage's
+        // own `UserLocationInformation` at `:1581`, so the reported TAI is what the gNB
+        // sent for this UE and not a default.
+        //
+        // These two used to fire from `gmm_handler::handle_registration_request`
+        // (`:158-159`), whose only three callers are inside `mod tests` -- so a
+        // conformant NWDAF subscribing to LOCATION_REPORT received nothing. That is
+        // #397's first criterion, and it is why they moved here rather than gaining a
+        // production caller: the question is where the EVENT occurs on a live path, not
+        // how to reach a particular function.
         if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
             crate::namf_server::fire_access_type_report(&state.amf_ue, "3GPP_ACCESS");
+            crate::namf_server::fire_registration_state_report(&state.amf_ue, true);
+            crate::namf_server::fire_location_report(&state.amf_ue);
         }
         let _ = self.create_ue_policy_association(amf_ue_ngap_id).await;
         Ok(())
@@ -4531,8 +4557,30 @@ impl NgapServer {
         // Fired here rather than in `gmm_handler::handle_service_request` because that
         // function's only caller is in `mod tests` -- see the note on
         // `send_registration_accept`.
+        //
+        // #397: REACHABILITY_REPORT and LOCATION_REPORT fire from the same moment.
+        //
+        // `REACHABLE`: §6.2 (`29518-k00.txt:24022-24031`) reports "updated reachability
+        // of a UE... when AMF becomes aware of a reachability change". A UE that has just
+        // completed a Service Request is reachable by demonstration, not by inference --
+        // it answered. That is also a genuine CHANGE: `start_reachability_supervision`
+        // armed the mobile-reachable timer at the previous N1 release precisely because
+        // the AMF could no longer reach it, and this is the transition back.
+        //
+        // LOCATION_REPORT: the UE may have moved while idle, and a Service Request is
+        // where the AMF learns it. Deliberately fired at BOTH this site and
+        // `send_registration_accept` -- §6.2's trigger is "when AMF becomes aware of a
+        // location change of the UE", and the AMF becomes aware at each, so reporting
+        // only one would silently drop the other.
+        //
+        // Both used to fire from `gmm_handler::handle_service_request` (`:299-300`),
+        // whose only caller is inside `mod tests` (#397 criterion 1). Moved rather than
+        // given a production caller, for the reason recorded on
+        // `send_registration_accept`.
         if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
             crate::namf_server::fire_connectivity_state_report(&state.amf_ue, true);
+            crate::namf_server::fire_reachability_report(&state.amf_ue, true);
+            crate::namf_server::fire_location_report(&state.amf_ue);
         }
 
         // TS 33.501 §6.12.3: reallocate the 5G-GUTI after a service request. This is the
@@ -4823,6 +4871,38 @@ impl NgapServer {
             .and_then(|s| s.amf_ue.supi.clone())
         {
             crate::namf_server::release_all_ebis_on_deregistration(&supi);
+        }
+
+        // #397: REGISTRATION_STATE_REPORT `DEREGISTERED`, and LOSS_OF_CONNECTIVITY for
+        // the second trigger §6.2 names.
+        //
+        // Fired HERE, in the common tail, and not in either direction's handler: both
+        // UE-initiated (`handle_deregistration_request_nas`) and network-initiated
+        // deregistration converge on this function, so one call covers both and cannot
+        // drift. It also fires for the UE that switched off -- no Deregistration Accept
+        // is sent to such a UE (TS 24.501 §5.5.2.2.2), but it is just as deregistered,
+        // and a consumer that heard nothing would still believe it registered.
+        //
+        // BEFORE `ue_auth_state.remove`, because that is where the SUPI and location the
+        // reports carry live -- the same ordering constraint #291's EBI release above
+        // records. An emitter after the remove would deliver a report with no identity.
+        //
+        // LOSS_OF_CONNECTIVITY: §6.2 (`29518-k00.txt:24089-24098`) names three triggers,
+        // "when Mobile Reachable timer expires in the AMF..., when the UE detaches and
+        // when AMF deregisters from UDM for an active UE". #398 wired the first;
+        // deregistration is the other two, and both happen here -- the UDM purge runs in
+        // `handle_deregistration_request_nas` just above. `DEREGISTERED` is the
+        // `LossOfConnectivityReason` for exactly that
+        // (`TS29518_Namf_EventExposure.yaml:1610`), distinct from the
+        // `MAX_DETECTION_TIME_EXPIRED` #398 reports for the timer trigger -- so a
+        // consumer can tell the two apart.
+        //
+        // REGISTRATION_STATE_REPORT used to fire `false` from
+        // `gmm_handler::handle_deregistration_request` (`:368`), whose only caller is in
+        // `mod tests` (#397 criterion 1).
+        if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
+            crate::namf_server::fire_registration_state_report(&state.amf_ue, false);
+            crate::namf_server::fire_loss_of_connectivity(&state.amf_ue, "DEREGISTERED");
         }
 
         self.ue_auth_state.remove(amf_ue_ngap_id);
@@ -8399,6 +8479,37 @@ impl NgapServer {
             "UE Context Release: AMF UE NGAP ID={amf_ue_ngap_id:?}, RAN UE NGAP ID={ran_ue_ngap_id:?}"
         );
 
+        // #397: COMMUNICATION_FAILURE_REPORT. This is the AMF becoming aware of a RAN
+        // failure "based on connection release", identifying the "RAN/NAS release code"
+        // -- TS 23.502 table 4.15.3.1-1 (`23502-k20.txt:28570-28577`) names the AMF as
+        // the detecting NF and this as the mechanism, and TS 29.518 §6.2 implements that
+        // table row as this event type (`29518-k00.txt:5126-5131`).
+        //
+        // Fired BEFORE the PDU-session teardown below, because the Cause the gNB sent is
+        // what the report carries and the teardown is the consequence, not the event.
+        //
+        // The Cause was ALREADY being decoded by the parser -- it is a mandatory IE of
+        // UEContextReleaseRequest and the message is refused without it -- and then
+        // discarded. So there is no placeholder here: it is the release code the RAN
+        // actually sent. (#397's own text says "Neither release code is plumbed anywhere
+        // the event could read it"; the ran one was, one call away.)
+        if let (Some(ngap_id), Some((group, value))) = (
+            amf_ue_ngap_id,
+            crate::ngap_asn1::extract_release_request_cause(data),
+        ) {
+            if is_communication_failure_cause(group, value) {
+                if let Some(state) = self.ue_auth_state.get(ngap_id) {
+                    crate::namf_server::fire_communication_failure(&state.amf_ue, group, value);
+                }
+            } else {
+                log::debug!(
+                    "UE Context Release Request cause group={group} value={value} is an expected \
+                     release, so no COMMUNICATION_FAILURE_REPORT (TS 23.502 table 4.15.3.1-1 \
+                     defines the event as an UNEXPECTED termination)"
+                );
+            }
+        }
+
         // Release all PDU sessions at SMF
         let smf_host = std::env::var("SMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
         let smf_port: u16 = std::env::var("SMF_SBI_PORT")
@@ -8986,6 +9097,70 @@ fn uav_geofence_config() -> (f64, f64, f64, f64, f64, f64) {
 /// client when the UTM interface is productionized.
 fn notify_uss_authorization(caa_id: &str, suci: &str) {
     log::info!("[UAV UTM stub] USS authorization accepted (stub): CAA-ID={caa_id}, SUCI={suci}");
+}
+
+/// Whether a UEContextReleaseRequest Cause is a COMMUNICATION FAILURE rather than an
+/// expected release (#397).
+///
+/// TS 23.502 table 4.15.3.1-1 (`23502-k20.txt:28570-28577`) defines the event this
+/// gates as *"an unexpected termination of the communication"* — TS 29.518 §6.2's
+/// wording at `29518-k00.txt:5130-5131`. So the classification is not "did the RAN
+/// release the UE" (it always did, that is why the message arrived) but "was the
+/// release unexpected".
+///
+/// Pure, and separate from the handler, because this mapping IS the conformance
+/// decision and it is what the unit test pins. The same reasoning
+/// `validate_initial_registration_cleartext` is factored out for.
+///
+/// # Why an EXPECTED-cause allowlist rather than a failure list
+///
+/// `CauseRadioNetwork` has 47 values and TS 38.413 §9.3.1.2 adds no "is this a
+/// failure" bit, so either direction is a judgement. The allowlist is the safe one: a
+/// cause nobody classified is reported as a failure, which a consumer can investigate,
+/// whereas the inverse would silently swallow every future failure cause.
+///
+/// The expected causes, all `CauseRadioNetwork`:
+///
+/// - `user-inactivity` (20): the AS release TS 38.300 §9.2.1 performs when a UE has
+///   nothing to send. The single most common reason a gNB releases a UE, and the
+///   normal path into CM-IDLE — `start_reachability_supervision` exists to handle it.
+/// - `successful-handover` (2) and `ngran-generated-reason` (3): a handover completed
+///   or the NG-RAN released for its own housekeeping. The UE has not lost service.
+/// - `5gc-generated-reason` (4): this AMF asked for the release; reporting it as a
+///   failure would have the AMF report its own request back to a consumer.
+/// - `partial-handover` (6), `ho-cancelled` (5), `ue-context-transfer` (35),
+///   `ng-intra-system-handover-triggered` (31), `ng-inter-system-handover-triggered`
+///   (32), `xn-handover-triggered` (33), `redirection` (41): mobility in progress, not
+///   a loss of communication.
+///
+/// Everything else IS a failure, and `radio-connection-with-ue-lost` (21) is the
+/// canonical one: the radio link is gone with no orderly release.
+///
+/// Non-`radioNetwork` groups are all failures. `transport` means the SCTP/GTP path
+/// failed, `protocol` means the peers disagreed on the encoding, and `misc` carries
+/// hardware failure and overload — none of which is an expected release. `nas` is
+/// included deliberately: this is the gNB-INITIATED release, so a NAS cause here is
+/// the RAN attributing the release to a NAS condition it observed, not the AMF's own
+/// orderly deregistration (that path is `release_ue`, which never reaches here).
+fn is_communication_failure_cause(group: u8, value: i64) -> bool {
+    if group != ngap_handler::cause_group::RADIO_NETWORK {
+        return true;
+    }
+    use ngap_handler::radio_network_cause as rn;
+    !matches!(
+        value,
+        rn::SUCCESSFUL_HANDOVER
+            | rn::RELEASE_DUE_TO_NGRAN_GENERATED_REASON
+            | rn::RELEASE_DUE_TO_5GC_GENERATED_REASON
+            | rn::HANDOVER_CANCELLED
+            | rn::PARTIAL_HANDOVER
+            | rn::USER_INACTIVITY
+            | rn::NG_INTRA_SYSTEM_HANDOVER_TRIGGERED
+            | rn::NG_INTER_SYSTEM_HANDOVER_TRIGGERED
+            | rn::XN_HANDOVER_TRIGGERED
+            | rn::UE_CONTEXT_TRANSFER
+            | rn::REDIRECTION
+    )
 }
 
 /// Whether a SUCI belongs to an SNPN onboarding subscription (TS 23.003).
@@ -15452,6 +15627,10 @@ mod tests {
                 group_id: None,
                 any_ue: false,
                 expiry: None,
+                // No subscription-change callback (#397): this subscription is for a
+                // LOSS_OF_CONNECTIVITY report, not a subscription-ID change.
+                subs_change_notify_uri: None,
+                subs_change_notify_correlation_id: None,
             });
         }
 
@@ -15503,6 +15682,729 @@ mod tests {
             guard.event_subscription_remove("sub-74-loss-live");
         }
         sink.stop().await.expect("sink stop");
+    }
+
+    // ------------------------------------------------------------------
+    // #397 — the three pre-existing emitters, at LIVE NGAP sites
+    // ------------------------------------------------------------------
+
+    /// A real in-process notification sink plus a subscription pointed at it (#397).
+    ///
+    /// Factored out because the four #397 live-site tests below each need the same
+    /// three things — an `SbiServer` that records what was POSTed, a stored
+    /// `EventSubscription` naming it, and the Dev SBI profile for plaintext loopback —
+    /// and repeating it four times is where a copy would silently drift into asserting
+    /// something weaker.
+    ///
+    /// Returns the sink (to `stop()`) and the receiver. The caller owns the
+    /// subscription ID and removes it: the store is process-global, so a subscription
+    /// left behind is scanned by every sibling test's `fire_*`.
+    async fn event_sink_for(
+        subscription_id: &str,
+        supi: &str,
+        event_types: &[&str],
+    ) -> (nextgcore_sbi::server::SbiServer, mpsc::Receiver<String>) {
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let (tx, rx) = mpsc::channel::<String>(8);
+        let sink = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(
+                format!("127.0.0.1:{port}").parse().expect("addr"),
+            ),
+            listener,
+        );
+        sink.start(move |req: nextgcore_sbi::message::SbiRequest| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(req.http.content.clone().unwrap_or_default()).await;
+                nextgcore_sbi::message::SbiResponse::no_content()
+            }
+        })
+        .await
+        .expect("notification sink start");
+        // Plaintext loopback -> Dev profile. Deliberately NOT reset afterwards: the
+        // override is PROCESS-WIDE and PR #390 measured 2 failures in 10 whole-crate
+        // runs from resetting it mid-flight.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.event_subscription_add(crate::context::EventSubscription {
+                subscription_id: subscription_id.to_string(),
+                notify_uri: format!("http://127.0.0.1:{port}/notify/{subscription_id}"),
+                notify_correlation_id: format!("corr-{subscription_id}"),
+                nf_id: "3fa85f64-5717-4562-b3fc-2c963f66afa6".to_string(),
+                event_types: event_types.iter().map(|t| t.to_string()).collect(),
+                supi: Some(supi.to_string()),
+                gpsi: None,
+                pei: None,
+                group_id: None,
+                any_ue: false,
+                expiry: None,
+                subs_change_notify_uri: None,
+                subs_change_notify_correlation_id: None,
+            });
+        }
+        (sink, rx)
+    }
+
+    /// Establish a REAL SCTP association against `ngap`'s own listener, standing in for
+    /// a gNB, and return its association id (#397).
+    ///
+    /// Needed because the two registration/service emitters fire AFTER
+    /// `send_to_association(..).await?` — deliberately, since the event is "the Accept
+    /// has egressed", not "the Accept was built. With no association that `?` returns
+    /// first and the fire point is never reached, so a test without a real transport
+    /// would be asserting an unreachable site and could not tell a working wiring from a
+    /// deleted one.
+    ///
+    /// The handshake needs BOTH endpoints driven: `SctpAssociation::connect` polls its
+    /// own side but the server's `recv` loop only runs inside `NgapServer::poll`. So the
+    /// client connect is spawned and the server polled until the association appears.
+    /// Bounded by attempts rather than by wall-clock, so it cannot hang a suite run.
+    ///
+    /// The returned `SctpAssociation` must be held by the caller: dropping it closes the
+    /// association (`impl Drop for SctpAssociation`).
+    async fn connect_stand_in_gnb(ngap: &mut NgapServer) -> (u64, nextgcore_sctp::SctpAssociation) {
+        let server_addr = ngap.local_addr();
+        let config = nextgcore_sctp::SctpConfig {
+            // A SHORT handshake budget. The 30s default would turn a transport
+            // regression into a 30s stall per test; the peers are both in this process
+            // on loopback, so a handshake that has not completed in 5s is not going to.
+            connect_timeout: Duration::from_secs(5),
+            ..Default::default()
+        };
+        let client = tokio::spawn(async move {
+            nextgcore_sctp::SctpAssociation::connect(server_addr, config).await
+        });
+
+        // Drive the server side. The client polls its own side inside `connect`, so both
+        // must run CONCURRENTLY -- `select!` rather than a sequential loop, because
+        // `poll()`'s `recv` awaits for up to SCTP_RECV_TIMEOUT and the handshake needs
+        // several round trips.
+        tokio::pin!(client);
+        let association = loop {
+            tokio::select! {
+                joined = &mut client => {
+                    break joined
+                        .expect("client task")
+                        .expect("stand-in gNB must establish an SCTP association");
+                }
+                // `poll()` also runs the timer sweeps, which is harmless here: the
+                // fixture UE has no armed timer at this point.
+                _ = ngap.poll() => {}
+            }
+        };
+        // One more pass, so a NewAssociation event still queued when the client's
+        // handshake completed is drained into `sessions`.
+        for _ in 0..20 {
+            if !ngap.sessions.read().await.is_empty() {
+                break;
+            }
+            let _ = ngap.poll().await;
+        }
+        let assoc_id = ngap
+            .sessions
+            .read()
+            .await
+            .keys()
+            .copied()
+            .next()
+            .expect("the AMF must have accepted the stand-in gNB's association");
+        (assoc_id, association)
+    }
+
+    /// Collect `n` notifications from the sink and return them keyed by report type.
+    ///
+    /// The emitters spawn one task per subscriber, so several reports fired from one
+    /// site arrive in a NON-DETERMINISTIC order. Asserting `rx.recv()` positionally
+    /// would make these tests flaky for a reason that has nothing to do with what they
+    /// are about; collecting into a map and asserting by type does not.
+    async fn collect_reports(
+        rx: &mut mpsc::Receiver<String>,
+        n: usize,
+        context: &str,
+    ) -> std::collections::HashMap<String, serde_json::Value> {
+        let mut out = std::collections::HashMap::new();
+        for i in 0..n {
+            let body = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("{context}: expected {n} notifications, only {i} arrived")
+                })
+                .expect("notification channel closed");
+            let notification: serde_json::Value =
+                serde_json::from_str(&body).expect("notification is JSON");
+            let report = notification["reportList"][0].clone();
+            let ty = report["type"]
+                .as_str()
+                .expect("every report carries a `type` (Table 6.2.6.2.5-1 marks it M)")
+                .to_string();
+            out.insert(ty, report);
+        }
+        out
+    }
+
+    /// **#397 criterion 1.** `REGISTRATION_STATE_REPORT` and `LOCATION_REPORT` fire
+    /// from the LIVE registration path — `send_registration_accept`, which the NGAP
+    /// receive loop reaches — and reach a real subscriber.
+    ///
+    /// Both used to fire from `gmm_handler::handle_registration_request`, whose only
+    /// three callers are inside `mod tests`, so a conformant NWDAF subscribing to
+    /// `LOCATION_REPORT` received nothing. #74 nevertheless counted them as this AMF's
+    /// working event types. This test is what makes the relocation falsifiable: it
+    /// drives the production function and observes the notification, so deleting the
+    /// `fire_*` calls fails it while an emitter-level test would stay green.
+    ///
+    /// `ACCESS_TYPE_REPORT` is asserted alongside — it fires from the same site, and
+    /// including it proves the three reports are consistent rather than three
+    /// independently-plausible ones.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_live_registration_accept_fires_registration_state_and_location_reports() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::amf_context_init(64, 1024, 4096);
+
+        // An AMF-UE-NGAP-ID, SUPI and TAC no sibling uses: `ue_auth_state` and the
+        // subscription store are both process-global, and the delivered report is
+        // matched on the SUPI and asserted on the TAC.
+        let amf_ue_ngap_id = 7_397_100u64;
+        let supi = "imsi-001010000397100";
+        let tac = 0x39_7100u32;
+        let (sink, mut rx) = event_sink_for(
+            "sub-397-reg-live",
+            supi,
+            &[
+                "REGISTRATION_STATE_REPORT",
+                "LOCATION_REPORT",
+                "ACCESS_TYPE_REPORT",
+            ],
+        )
+        .await;
+
+        // `build_initial_context_setup_request_asn1` returns None with no served GUAMI,
+        // and `send_registration_accept` then returns BEFORE the emitters -- so without
+        // this the test would fail for a reason unrelated to what it asserts. Saved and
+        // restored because `served_guami` is process-global and `serve_only_local_guami`
+        // writes it too.
+        let saved_guami = {
+            let ctx_arc = crate::context::amf_self();
+            let mut ctx = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
+            let saved = ctx.served_guami.clone();
+            ctx.served_guami.clear();
+            ctx.served_guami.push(local_guami());
+            ctx.num_of_served_guami = 1;
+            saved
+        };
+
+        let mut ngap = test_ngap_server().await;
+        // A REAL association: the emitters fire after the ICS has been handed to the
+        // transport, so without one the `?` on that send returns first.
+        let (association_id, _gnb) = connect_stand_in_gnb(&mut ngap).await;
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 397_100, association_id, false);
+        ue_ctx.amf_ue.supi = Some(supi.to_string());
+        ue_ctx.amf_ue.access_type = 1;
+        // The location the gNB reported for this UE, which the InitialUEMessage handler
+        // writes at `:1581`. Asserted below, so a report built from a default would fail.
+        ue_ctx.amf_ue.nr_tai = crate::context::Tai5gs {
+            plmn_id: PlmnId::new("001", "01"),
+            tac,
+        };
+        ue_ctx.amf_ue.allowed_nssai = vec![SNssai { sst: 1, sd: None }];
+        ue_ctx.amf_ue.generate_new_guti();
+        ue_ctx.amf_ue.security_context_available = true;
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        // The PRODUCTION function the NGAP receive loop calls, not the emitter.
+        ngap.send_registration_accept(association_id, amf_ue_ngap_id, 397_100)
+            .await
+            .expect("the live Registration Accept path must complete");
+
+        let reports = collect_reports(
+            &mut rx,
+            3,
+            "the live Registration Accept must fire REGISTRATION_STATE_REPORT, \
+             LOCATION_REPORT and ACCESS_TYPE_REPORT -- an emitter nothing on a live path \
+             calls is this tree's most common defect, and all three used to be in that \
+             state",
+        )
+        .await;
+
+        let reg = reports
+            .get("REGISTRATION_STATE_REPORT")
+            .expect("REGISTRATION_STATE_REPORT must be delivered");
+        assert_eq!(
+            reg["supi"].as_str(),
+            Some(supi),
+            "for the UE that registered -- this SUPI exists nowhere else in the fixture"
+        );
+        assert_eq!(
+            reg["rmInfoList"][0]["rmState"].as_str(),
+            Some("REGISTERED"),
+            "TS 24.501 §5.5.1.2.4: the UE enters 5GMM-REGISTERED on receiving the Accept, \
+             so REGISTERED is the state this moment reports"
+        );
+        assert_eq!(
+            reg["rmInfoList"][0]["accessType"].as_str(),
+            Some("3GPP_ACCESS"),
+            "`RmInfo` requires both members (TS29518_Namf_EventExposure.yaml:908-910)"
+        );
+
+        let loc = reports
+            .get("LOCATION_REPORT")
+            .expect("LOCATION_REPORT must be delivered");
+        assert_eq!(
+            loc["location"]["nrLocation"]["tai"]["tac"].as_str(),
+            Some("397100"),
+            "and it carries the TAC the gNB reported for THIS UE -- a report assembled \
+             from a default `Tai5gs` would say `0000`"
+        );
+
+        assert_eq!(
+            reports
+                .get("ACCESS_TYPE_REPORT")
+                .expect("ACCESS_TYPE_REPORT must be delivered")["accessTypeList"][0]
+                .as_str(),
+            Some("3GPP_ACCESS"),
+            "NGAP is N2 from an NG-RAN, so this registration IS the 3GPP one"
+        );
+
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.event_subscription_remove("sub-397-reg-live");
+        }
+        {
+            let ctx_arc = crate::context::amf_self();
+            let mut ctx = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
+            ctx.num_of_served_guami = saved_guami.len();
+            ctx.served_guami = saved_guami;
+        }
+        sink.stop().await.expect("sink stop");
+    }
+
+    /// **#397 criterion 1.** `REACHABILITY_REPORT` fires from the LIVE Service Request
+    /// path — `handle_service_request_nas` — and reaches a real subscriber.
+    ///
+    /// It used to fire from `gmm_handler::handle_service_request`, whose only caller is
+    /// inside `mod tests`. `LOCATION_REPORT` is asserted alongside because it fires
+    /// from the same site for a different reason (the UE may have moved while idle),
+    /// and asserting only one would let the other be deleted silently.
+    ///
+    /// `REACHABLE` is a demonstrated fact here, not an inference: the UE answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_live_service_request_fires_reachability_and_location_reports() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::amf_context_init(64, 1024, 4096);
+
+        // Distinct from the registration sibling's keys, for the process-global reason.
+        let amf_ue_ngap_id = 7_397_200u64;
+        let supi = "imsi-001010000397200";
+        let tac = 0x39_7200u32;
+        let (sink, mut rx) = event_sink_for(
+            "sub-397-svc-live",
+            supi,
+            &[
+                "REACHABILITY_REPORT",
+                "LOCATION_REPORT",
+                "CONNECTIVITY_STATE_REPORT",
+            ],
+        )
+        .await;
+
+        let mut ngap = test_ngap_server().await;
+        // A REAL association, for the same reason as the registration sibling: the
+        // emitters fire after the Service Accept has egressed.
+        let (association_id, _gnb) = connect_stand_in_gnb(&mut ngap).await;
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 397_200, association_id, false);
+        // `handle_service_request_nas` refuses with 5GMM cause #9 unless BOTH hold
+        // (TS 24.501 §5.6.1.5), so these are what let the test reach the fire point at
+        // all rather than the reject arm.
+        ue_ctx.registered = true;
+        ue_ctx.amf_ue.security_context_available = true;
+        ue_ctx.amf_ue.supi = Some(supi.to_string());
+        ue_ctx.amf_ue.nr_tai = crate::context::Tai5gs {
+            plmn_id: PlmnId::new("001", "01"),
+            tac,
+        };
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        // A SERVICE REQUEST (0x4C), service type 1 in the high nibble of octet 4.
+        let nas = vec![0x7E, 0x00, message_type::SERVICE_REQUEST, 0x10, 0x00, 0x00];
+        // The PRODUCTION handler the NGAP UplinkNASTransport path dispatches to.
+        ngap.handle_service_request_nas(association_id, amf_ue_ngap_id, 397_200, &nas)
+            .await
+            .expect("the live Service Request path must complete");
+
+        let reports = collect_reports(
+            &mut rx,
+            3,
+            "the live Service Request must fire REACHABILITY_REPORT, LOCATION_REPORT and \
+             CONNECTIVITY_STATE_REPORT",
+        )
+        .await;
+
+        let reach = reports
+            .get("REACHABILITY_REPORT")
+            .expect("REACHABILITY_REPORT must be delivered");
+        assert_eq!(
+            reach["supi"].as_str(),
+            Some(supi),
+            "for the UE that answered -- this SUPI exists nowhere else in the fixture"
+        );
+        assert_eq!(
+            reach["reachability"].as_str(),
+            Some("REACHABLE"),
+            "the UE just completed a Service Request, so reachability is demonstrated"
+        );
+
+        assert_eq!(
+            reports
+                .get("LOCATION_REPORT")
+                .expect("LOCATION_REPORT must be delivered")["location"]["nrLocation"]["tai"]
+                ["tac"]
+                .as_str(),
+            Some("397200"),
+            "carrying the TAI this UE is held in, which is this test's own value"
+        );
+        assert_eq!(
+            reports
+                .get("CONNECTIVITY_STATE_REPORT")
+                .expect("CONNECTIVITY_STATE_REPORT must be delivered")["cmInfoList"][0]["cmState"]
+                .as_str(),
+            Some("CONNECTED"),
+            "and the CM state is CONNECTED -- distinct from reachability, which is why \
+             TS 29.518 gives them separate event types"
+        );
+
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.event_subscription_remove("sub-397-svc-live");
+        }
+        sink.stop().await.expect("sink stop");
+    }
+
+    /// **#397 criterion 1.** The `DEREGISTERED` `REGISTRATION_STATE_REPORT` fires from
+    /// `finish_deregistration`, the common tail BOTH deregistration directions reach —
+    /// and so does `LOSS_OF_CONNECTIVITY`, for the second and third triggers §6.2 names
+    /// ("when the UE detaches and when AMF deregisters from UDM for an active UE").
+    ///
+    /// It used to fire from `gmm_handler::handle_deregistration_request`, whose only
+    /// caller is inside `mod tests`.
+    ///
+    /// Driven through `finish_deregistration` rather than either direction's handler,
+    /// because the common tail is where the emitter is and the point is that ONE call
+    /// covers both directions. `#291`'s EBI test uses the same entry point for the same
+    /// reason.
+    ///
+    /// The reason values discriminate: `DEREGISTERED` here versus
+    /// `MAX_DETECTION_TIME_EXPIRED` from the timer sweep, so a consumer can tell a
+    /// detach from an unreachable UE.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_live_deregistration_fires_deregistered_and_loss_of_connectivity() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::amf_context_init(64, 1024, 4096);
+
+        let amf_ue_ngap_id = 7_397_300u64;
+        let supi = "imsi-001010000397300";
+        let (sink, mut rx) = event_sink_for(
+            "sub-397-dereg-live",
+            supi,
+            &["REGISTRATION_STATE_REPORT", "LOSS_OF_CONNECTIVITY"],
+        )
+        .await;
+
+        let mut ngap = test_ngap_server().await;
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 397_300, 1, false);
+        ue_ctx.registered = true;
+        ue_ctx.amf_ue.supi = Some(supi.to_string());
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        // The PRODUCTION common tail. Err is ignored for the same reason as the
+        // registration sibling: there is no real association for the release command.
+        let _ = ngap.finish_deregistration(1, amf_ue_ngap_id, 397_300).await;
+
+        let reports = collect_reports(
+            &mut rx,
+            2,
+            "the live deregistration must fire the DEREGISTERED \
+             REGISTRATION_STATE_REPORT and LOSS_OF_CONNECTIVITY",
+        )
+        .await;
+
+        let reg = reports
+            .get("REGISTRATION_STATE_REPORT")
+            .expect("REGISTRATION_STATE_REPORT must be delivered");
+        assert_eq!(
+            reg["supi"].as_str(),
+            Some(supi),
+            "for the UE that deregistered -- this SUPI exists nowhere else in the fixture"
+        );
+        assert_eq!(
+            reg["rmInfoList"][0]["rmState"].as_str(),
+            Some("DEREGISTERED"),
+            "the state this moment reports. Firing REGISTERED here would be the defect a \
+             plausible-but-wrong site produces"
+        );
+
+        assert_eq!(
+            reports
+                .get("LOSS_OF_CONNECTIVITY")
+                .expect("LOSS_OF_CONNECTIVITY must be delivered")["lossOfConnectReason"]
+                .as_str(),
+            Some("DEREGISTERED"),
+            "the `LossOfConnectivityReason` for a detach \
+             (TS29518_Namf_EventExposure.yaml:1610), NOT the MAX_DETECTION_TIME_EXPIRED \
+             the timer sweep reports -- a consumer has to be able to tell them apart"
+        );
+
+        // The emitter must have run BEFORE the state was dropped, or the reports would
+        // have carried no identity. Asserted as a transition so it cannot pass for a UE
+        // that was never there.
+        assert!(
+            !ngap.ue_auth_state.contains(amf_ue_ngap_id),
+            "and the NAS state is gone afterwards: the emitters read from it, so their \
+             ordering relative to the remove is load-bearing"
+        );
+
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.event_subscription_remove("sub-397-dereg-live");
+        }
+        sink.stop().await.expect("sink stop");
+    }
+
+    /// **#397 criterion 4.** `COMMUNICATION_FAILURE_REPORT` fires from the live
+    /// gNB-initiated `UEContextReleaseRequest` path, carrying the REAL NGAP Cause the
+    /// RAN sent — not a placeholder.
+    ///
+    /// The issue says *"Neither release code is plumbed anywhere the event could read
+    /// it"*. The RAN one was: `nextgcore_ngap::parser::parse_ue_context_release_request`
+    /// decodes Cause as a mandatory IE and refuses the message without it, then the
+    /// value was discarded. So this test builds a REAL UEContextReleaseRequest PDU and
+    /// lets the production decoder recover the cause — asserting on a value that only
+    /// exists on the wire, which a hardcoded report could not produce.
+    ///
+    /// `radio-connection-with-ue-lost` (21) is the canonical unexpected release: the
+    /// radio link is gone with no orderly teardown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ran_release_with_a_failure_cause_fires_communication_failure_report() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::amf_context_init(64, 1024, 4096);
+
+        let amf_ue_ngap_id = 7_397_400u64;
+        let ran_ue_ngap_id = 397_400u32;
+        let supi = "imsi-001010000397400";
+        let (sink, mut rx) =
+            event_sink_for("sub-397-commfail", supi, &["COMMUNICATION_FAILURE_REPORT"]).await;
+
+        let mut ngap = test_ngap_server().await;
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, ran_ue_ngap_id, 1, false);
+        ue_ctx.registered = true;
+        ue_ctx.amf_ue.supi = Some(supi.to_string());
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        // A real APER-encoded UEContextReleaseRequest. The Cause is recovered by the
+        // production decoder from these bytes, so the assertion below cannot be
+        // satisfied by a hardcoded report.
+        let pdu = nextgcore_ngap::builder::build_ue_context_release_request(
+            &nextgcore_ngap::types::UeContextReleaseRequest {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                cause: nextgcore_asn1c::ngap::cause::Cause::RadioNetwork(
+                    nextgcore_asn1c::ngap::cause::CauseRadioNetwork::RadioConnectionWithUeLost,
+                ),
+            },
+        )
+        .expect("encode UEContextReleaseRequest");
+
+        // The PRODUCTION handler procedure code 41 dispatches to.
+        let _ = ngap.handle_ue_context_release(1, &pdu).await;
+
+        let reports = collect_reports(
+            &mut rx,
+            1,
+            "a RAN release with an unexpected cause must fire \
+             COMMUNICATION_FAILURE_REPORT",
+        )
+        .await;
+        let report = reports
+            .get("COMMUNICATION_FAILURE_REPORT")
+            .expect("COMMUNICATION_FAILURE_REPORT must be delivered");
+        assert_eq!(
+            report["supi"].as_str(),
+            Some(supi),
+            "for the UE whose connection the RAN tore down"
+        );
+        assert_eq!(
+            report["commFailure"]["ranReleaseCode"]["group"].as_i64(),
+            Some(0),
+            "`NgApCause.group` is mandatory (TS29571_CommonData.yaml:2562-2564); \
+             radioNetwork is group 0"
+        );
+        assert_eq!(
+            report["commFailure"]["ranReleaseCode"]["value"].as_i64(),
+            Some(21),
+            "and the decimal NGAP cause value TS 38.413 defines -- \
+             radio-connection-with-ue-lost. This came off the encoded PDU through the \
+             production decoder, so a placeholder could not produce it"
+        );
+        assert!(
+            report["commFailure"]["nasReleaseCode"].is_null(),
+            "`nasReleaseCode` is OMITTED: its pattern is `^(MM|SM)-[0-9]{{1,3}}$`, a \
+             5GMM/5GSM cause, and a RAN-initiated release carries none. Inventing one \
+             would report a NAS failure that did not happen"
+        );
+
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.event_subscription_remove("sub-397-commfail");
+        }
+        sink.stop().await.expect("sink stop");
+    }
+
+    /// **#397 criterion 4, the other half.** A NORMAL RAN release fires NOTHING.
+    ///
+    /// The discriminating sibling of the test above, and the one that makes the event
+    /// honest. TS 23.502 table 4.15.3.1-1 defines this event as *"an unexpected
+    /// termination of the communication"*, so reporting `user-inactivity` — the single
+    /// most common reason a gNB releases a UE, and the normal path into CM-IDLE — would
+    /// tell a consumer a failure occurred every time a UE went idle.
+    ///
+    /// Without this test the emitter could be wired to fire unconditionally and its
+    /// sibling would still pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ran_release_for_user_inactivity_fires_no_communication_failure() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::amf_context_init(64, 1024, 4096);
+
+        // Distinct from the failure sibling: both subscriptions live in the same
+        // process-global store, and a shared SUPI would let one test's fire satisfy the
+        // other's assertion.
+        let amf_ue_ngap_id = 7_397_500u64;
+        let ran_ue_ngap_id = 397_500u32;
+        let supi = "imsi-001010000397500";
+        let (sink, mut rx) = event_sink_for(
+            "sub-397-commfail-normal",
+            supi,
+            &["COMMUNICATION_FAILURE_REPORT"],
+        )
+        .await;
+
+        let mut ngap = test_ngap_server().await;
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, ran_ue_ngap_id, 1, false);
+        ue_ctx.registered = true;
+        ue_ctx.amf_ue.supi = Some(supi.to_string());
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        let pdu = nextgcore_ngap::builder::build_ue_context_release_request(
+            &nextgcore_ngap::types::UeContextReleaseRequest {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                cause: nextgcore_asn1c::ngap::cause::Cause::RadioNetwork(
+                    nextgcore_asn1c::ngap::cause::CauseRadioNetwork::UserInactivity,
+                ),
+            },
+        )
+        .expect("encode UEContextReleaseRequest");
+        let _ = ngap.handle_ue_context_release(1, &pdu).await;
+
+        // A bounded wait, not an instantaneous check: delivery is spawned, so asserting
+        // "nothing yet" without waiting would pass even if a notification were on its way.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), rx.recv())
+                .await
+                .is_err(),
+            "user-inactivity is an EXPECTED release (the AS release of TS 38.300 §9.2.1 \
+             and the normal path into CM-IDLE), so no COMMUNICATION_FAILURE_REPORT may \
+             be sent. Firing here would tell a consumer a failure occurred every time a \
+             UE went idle"
+        );
+
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.event_subscription_remove("sub-397-commfail-normal");
+        }
+        sink.stop().await.expect("sink stop");
+    }
+
+    /// **#397.** The expected/unexpected classification itself, at the unit level.
+    ///
+    /// The two live-path tests above cover one cause each; this pins the whole mapping,
+    /// which is the conformance decision. Kept separate because it is a pure function
+    /// and a table assertion here is cheaper and more complete than fifteen NGAP
+    /// round trips.
+    #[test]
+    fn the_release_cause_classification_separates_failures_from_normal_releases() {
+        use ngap_handler::cause_group as g;
+        use ngap_handler::radio_network_cause as rn;
+
+        // Expected releases: no COMMUNICATION_FAILURE_REPORT.
+        for value in [
+            rn::SUCCESSFUL_HANDOVER,
+            rn::RELEASE_DUE_TO_NGRAN_GENERATED_REASON,
+            rn::RELEASE_DUE_TO_5GC_GENERATED_REASON,
+            rn::HANDOVER_CANCELLED,
+            rn::PARTIAL_HANDOVER,
+            rn::USER_INACTIVITY,
+            rn::NG_INTRA_SYSTEM_HANDOVER_TRIGGERED,
+            rn::NG_INTER_SYSTEM_HANDOVER_TRIGGERED,
+            rn::XN_HANDOVER_TRIGGERED,
+            rn::UE_CONTEXT_TRANSFER,
+            rn::REDIRECTION,
+        ] {
+            assert!(
+                !is_communication_failure_cause(g::RADIO_NETWORK, value),
+                "radioNetwork cause {value} is an expected release, not \"an unexpected \
+                 termination of the communication\" (TS 23.502 table 4.15.3.1-1)"
+            );
+        }
+
+        // Radio-network failures.
+        assert!(
+            is_communication_failure_cause(g::RADIO_NETWORK, rn::RADIO_CONNECTION_WITH_UE_LOST),
+            "radio-connection-with-ue-lost is the canonical unexpected release"
+        );
+        assert!(
+            is_communication_failure_cause(
+                g::RADIO_NETWORK,
+                rn::FAILURE_IN_RADIO_INTERFACE_PROCEDURE
+            ),
+            "a failed radio-interface procedure is a failure"
+        );
+
+        // Every non-radioNetwork group is a failure: transport means the path broke,
+        // protocol means the peers disagreed on the encoding, misc carries hardware
+        // failure and overload.
+        for group in [g::TRANSPORT, g::NAS, g::PROTOCOL, g::MISC] {
+            assert!(
+                is_communication_failure_cause(group, 0),
+                "cause group {group} carries no expected-release value, so it must \
+                 classify as a failure"
+            );
+        }
+
+        // An UNKNOWN radioNetwork cause is a failure, which is the direction the
+        // allowlist was chosen for: a future cause nobody classified is reported (and
+        // can be investigated) rather than silently swallowed.
+        assert!(
+            is_communication_failure_cause(g::RADIO_NETWORK, 9_999),
+            "an unclassified cause must default to FAILURE, not to silence"
+        );
     }
 }
 
