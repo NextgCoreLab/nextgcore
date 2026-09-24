@@ -1,7 +1,9 @@
 # Prove the SERVICE REQUEST Namf fire point against nextgsim's real gNB and UE
 
 **Issue:** nextgcore #403 (the ceiling stated by PR #402 / #397)
-**Verified against:** nextgcore `main` @ `0dc01e4`, nextgsim `main` (read-only checkout)
+**Verified against:** nextgcore `main` @ `98603b2`, nextgsim `main` @ `6ec9d47`
+(read-only checkout). Originally written against nextgcore `0dc01e4`; re-dispatched
+after nextgsim PR #198 landed, and the sections below are corrected to that run.
 **Spec basis:** TS 24.501 §5.6.1 (the Service Request procedure), §5.6.1.2 /
 §9.11.3.44 (the Uplink data status IE), §5.6.1.5 (Service Reject cause #9),
 §5.3.7 (the N1 release and the mobile reachable timer); TS 29.518 §6.2
@@ -16,48 +18,109 @@ NCC).
 PR #402), which records the owner's rationale and states this exact ceiling. This
 spec closes it.
 
-## OUTCOME FIRST: the fire point is still UNPROVEN, and here is exactly why
+## OUTCOME FIRST: the fire point is still UNPROVEN, but the blocker has MOVED
 
-A dispatched run
+The first blocker — `nr-cli` could not discover the gNB — is **resolved**. The
+coverage is **still not live**, because a second, distinct nextgsim defect sits behind
+it. Both facts are measured, not reasoned.
+
+### Blocker 1 (discovery): FIXED, and confirmed here
+
+Run
 ([35882746859](https://github.com/NextgCoreLab/nextgcore/actions/runs/35882746859))
-executed all of this against nextgsim's real gNB and UE. The registration phase
-**passed**. The service-request phase **could not run**, for one reason:
+failed with:
 
 ```
 ERROR: No node found with name 'gnb'. Use --dump to list available nodes.
 ```
 
-`nr-cli` cannot discover the gNB, so the `ue-suspend` lever — the whole basis of the
-route below — **cannot be pulled**. The gNB uses its own `CliServer`
-(`nextgsim-gnb/src/app/cli_server.rs:216`) which never calls `register_nodes`, so it
-writes no `/tmp/nextgsim.proc-table/` entry and binds an ephemeral port nothing can
-find. The UE's `CliServer` (`nextgsim_common`) does register. There is **one** caller
-of `register_nodes` in the whole nextgsim tree and it is the UE
-(`nextgsim-ue/src/app/task.rs:81`).
+Filed as **nextgsim #197** and fixed by **nextgsim PR #198** (merged, `6ec9d47`),
+which deleted the gNB's duplicate `CliServer` and converged it onto
+`nextgsim-common`'s registering one. `nextgsim-gnb/src/app/cli_server.rs` no longer
+exists; `nextgsim-gnb/src/app/task.rs:83` now calls `register_nodes`.
 
-Filed as **nextgsim #197**. That is a nextgsim defect, so the three new steps ship
-`continue-on-error: true` rather than red — reporting a sibling repo's defect as a
-nextgcore regression would be worse than stating the ceiling.
+PR #198 also found something the #197 diagnosis had missed, and it is why the obvious
+fix would have failed silently: the two `CliServer` copies framed at **different wire
+versions** (the gNB's hard-coded `3.2.7`; common and `nr-cli` `1.0.0`), and both
+decoders hard-reject a mismatch. Merely adding `register_nodes` to the gNB's own
+server would have published a discoverable port that then dropped every `nr-cli`
+datagram. Both now read `1.0.0` (`nextgsim-common/src/cli_server.rs:27-31`,
+`nextgsim-cli/src/proc_table.rs:24-25`).
+
+Confirmed in run
+**[35957375665](https://github.com/NextgCoreLab/nextgcore/actions/runs/35957375665)**
+against nextgsim `main` @ `6ec9d47`: **no discovery error at all.** The command
+reached the gNB and the gNB answered.
+
+### Blocker 2 (an empty UE registry): the current one, filed as nextgsim #199
+
+What that run got instead, in the same step that had just logged
+`PDU Session 1 is now ACTIVE (IPv4: Some([10, 45, 0, 2]))`:
+
+```
+$ nr-cli gnb --exec 'ue-list'
+ues: []
+```
+
+That is `handle_ue_list` speaking — the gNB's own code, not a discovery failure — so
+discovery, framing, dispatch and the response path all agree. The answer is simply
+**wrong**: that UE exists.
+
+Root cause, read in the read-only checkout. `handle_ue_list` and `handle_ue_suspend`
+both read `GnbCmdHandler.ue_contexts`, borrowed from `AppTask.ue_contexts`
+(`nextgsim-gnb/src/app/task.rs:37`, passed at `:115`). Its only writer,
+`AppTask::update_ue_context` (`:245`), has **no production caller in the whole tree**
+— every call site is a unit test, including PR #198's own
+(`tests/src/gnb_cli_reachability.rs:96`, which seeds the registry by hand). The reason
+is structural: `AppMessage` has two variants and neither carries UE state
+(`nextgsim-gnb/src/tasks.rs:181-186`), and the gNB's single `app_tx.send`
+(`nextgsim-gnb/src/ngap/task.rs:4669`) sends only `StatusType::NgapIsUp`. The real
+contexts live in `RrcTask.ue_manager` (`rrc/task.rs:132`); the App task holds a mirror
+that is never filled.
+
+So `ue-suspend` cannot fire either, and this is the load-bearing consequence:
+`handle_ue_suspend` returns early on the empty map
+(`app/cmd_handler.rs:277-279`) and the dispatch to RRC is gated on
+`!response.is_error` (`app/task.rs:137-152`), so `RrcMessage::SuspendUe` is
+**unreachable in production**. The RRC-side implementation behind it is fine and
+unit-tested; it has no reachable trigger.
+
+Filed as **nextgsim #199**. That is a nextgsim defect, so the three steps keep
+`continue-on-error: true` rather than going red — reporting a sibling repo's defect as
+a nextgcore regression would be worse than stating the ceiling.
+
+### A nextgcore-side hazard this run exposed
+
+Run 35957375665 reported job conclusion **`success`** while the drive step and the
+probe-verdict step both genuinely exited 1. That is `continue-on-error` doing exactly
+what it says, and it means **a green tick on `Docker E2E` does not mean this fire
+point is proven**. The block comment in `ci.yml` now says so explicitly, because the
+next reader's most likely error is trusting the tick. This is the same family as the
+vacuous-green failure #187 recorded.
 
 **So the honest status of the SERVICE REQUEST fire point is: still unproven by
 automated test.** What this change delivers is (a) the complete machinery, which
-self-activates the moment nextgsim #197 lands, with no further nextgcore change; (b) a
+self-activates the moment nextgsim #199 lands, with no further nextgcore change; (b) a
 probe assertion **measured** to fail when the emitters are reverted; and (c) the
-precise, evidenced identification of the one missing link — which is what #403
+precise, evidenced identification of the remaining missing link — which is what #403
 actually asked for when it said "if CM-IDLE genuinely cannot be reached from outside
 without new nextgsim code, that is a legitimate finding: state it precisely".
 
-Note the shape of the correction: #403 claimed the blocker was a missing **`nr-ue`
-control surface**. That was wrong. The real blocker is a missing **proc-table
-registration on the gNB** — a one-caller omission, not a missing feature, and the
-commands it strands (`ue-release`, `ue-suspend`, `ue-list`, `xn-path-switch`,
-`ran-config-update`) already exist and are unit-tested.
+Note the shape of the correction, now twice over. #403 claimed the blocker was a
+missing **`nr-ue` control surface**: wrong. The #403 investigation then named a
+missing **proc-table registration**: right that it blocked, but it was a duplicated
+`CliServer` with a version skew, and fixing it revealed that the lever was gated on a
+**second** unwritten registry. The commands involved (`ue-release`, `ue-suspend`,
+`ue-list`, `xn-path-switch`) all exist and are unit-tested; none of them has ever been
+reachable-and-functional in production.
 
-Everything else in the chain was verified in that run: the gNB completed NG Setup, the
-UE registered, got a PDU session (`PDU session 1 is now ACTIVE`), and the
-registration-phase Namf assertion passed on notification bodies.
+Everything else in the chain was verified in run 35957375665: the gNB completed NG
+Setup, the UE registered, got a PDU session (`PDU Session 1 is now ACTIVE`), the
+registration-phase Namf assertion **passed** on notification bodies, and the
+service-request probe **SUBSCRIBED** successfully. The chain breaks at exactly one
+link, and it is the suspend lever.
 
-## The route, and why it is right once #197 lands
+## The route, and why it is right once #199 lands
 
 #403's central claim is that the work is blocked on new nextgsim code:
 
@@ -142,15 +205,16 @@ Link 14 is the one this issue exists to prove. `has_context` is
 suspension because nextgcore was never told about it — the `ue_auth_state` entry
 is untouched.
 
-## Criterion-by-criterion, re-located at `0dc01e4`
+## Criterion-by-criterion, re-checked at `98603b2` after nextgsim #198
 
-| # | criterion as filed | site at `0dc01e4` | verdict |
+| # | criterion as filed | site | verdict |
 |---|---|---|---|
-| 1 | the `Docker E2E` job drives a registered UE to CM-IDLE and back through a Service Request, against nextgsim's real gNB | no such stage; the job ended at the registration assertion (`ci.yml:399-431`) | **real — machinery implemented, BLOCKED on nextgsim #197.** The step exists and ran; `nr-cli` cannot discover the gNB, so the suspension never happened |
-| 2 | `namf_event_probe` asserts `REACHABILITY_REPORT` DELIVERED with `reachability == "REACHABLE"` and the registering SUPI, plus the same site's `LOCATION_REPORT` TAC — positive, on bodies | the probe subscribed to three registration types only (`namf_event_probe.rs:236-240`) | **real — implemented** |
-| 3 | the assertion is shown able to FAIL with the `handle_service_request_nas` emitters reverted | — | **real — done and MEASURED** (see revert-verification); the one criterion fully discharged against a live probe |
-| 4 | the predecessor spec's ceiling section records the coverage as proven, and the struck-through revert-verification row is restored | ceiling at `:396-412`, struck row at `:425` | **real — but NOT done as asked.** The coverage is not yet proven, so recording it as proven would be false. The ceiling is rewritten to point here and the row stays struck through |
-| — | the issue's stated BLOCKER: "no control surface on `nr-ue`… not expressible today"; needs nextgsim option **A** or **B** | `GnbCliCommandType::UeSuspend` (`nextgsim-gnb/src/tasks.rs:232`) reaches RRC_INACTIVE and the UE's MO-resume arm carries the Service Request — but `nr-cli` cannot reach the gNB at all | **the CONCLUSION was right, the DIAGNOSIS was wrong.** nextgsim work IS required, but it is neither option A nor B: it is a missing `register_nodes` call, filed as **nextgsim #197** |
+| 1 | the `Docker E2E` job drives a registered UE to CM-IDLE and back through a Service Request, against nextgsim's real gNB | steps 11-13 of `docker-e2e` in `ci.yml` | **real — machinery implemented and DISPATCHED, still BLOCKED, now on nextgsim #199.** In run 35957375665 the step reached the gNB (discovery fixed) and got `ues: []`, so the suspension never happened |
+| 2 | `namf_event_probe` asserts `REACHABILITY_REPORT` DELIVERED with `reachability == "REACHABLE"` and the registering SUPI, plus the same site's `LOCATION_REPORT` TAC — positive, on bodies | `namf_event_probe.rs:461-509` | **real — implemented, and it SUBSCRIBED successfully in run 35957375665** |
+| 3 | the assertion is shown able to FAIL with the `handle_service_request_nas` emitters reverted | — | **real — done and MEASURED** (see revert-verification). Independently corroborated in run 35957375665: fed the live AMF with no Service Request reaching the fire point, the probe reported `FAIL … 0 of 2 … MISSING ["REACHABILITY_REPORT", "LOCATION_REPORT"]` and exited 1 |
+| 4 | the predecessor spec's ceiling section records the coverage as proven, and the struck-through revert-verification row is restored | predecessor's ceiling and revert table | **still NOT done as asked, for the same reason.** The coverage is dispatched but does not yet pass, so recording it as proven would be false. The ceiling and the struck row are updated to name #199 and to record what the run *did* establish |
+| — | the issue's stated BLOCKER: "no control surface on `nr-ue`… not expressible today"; needs nextgsim option **A** or **B** | `GnbCliCommandType::UeSuspend` (`nextgsim-gnb/src/tasks.rs:234`) | **the CONCLUSION was right, the DIAGNOSIS was wrong — and so was the follow-up diagnosis.** nextgsim work IS required, but not option A or B. First it was a duplicated `CliServer` with a wire-version skew (#197 → PR #198, fixed); now it is an App-task UE registry with no production writer (#199) |
+| — | the #403 investigation's own claim: "once nextgsim #197 lands, the step should go green with **no further nextgcore change**" | run 35957375665 | **VOID as a prediction, though the nextgcore half held.** #197/#198 landed and no nextgcore change was needed — but the step still fails, on a second nextgsim defect that #197 masked. No nextgcore change is required for #199 either |
 
 The issue's own partial claim that `nr-ue` "has both triggers but no external control
 surface" is **half right**: the triggers exist (`main.rs:354` TUN-data, `:1027`
@@ -160,11 +224,18 @@ UE's TUN**, which the UE image already supports (`iputils-ping` is installed in
 `nextgsim/Dockerfile.ue-local`, and `docker/rust/e2e-test.sh:523` already pings
 through the tunnel).
 
-Links 1–2 are where the run stopped: the command is parsed and dispatched correctly
-**inside** the gNB, but `nr-cli` never gets that far because it cannot find the node.
+**Link 1 is where run 35957375665 stopped**, and it is one link later than the previous
+run managed. The command now reaches the gNB and is parsed, but `handle_ue_suspend`'s
+own guard refuses it: the `ue_contexts` map it validates against is empty in
+production (nextgsim #199), so the parse never becomes a dispatch and link 2
+(`RrcMessage::SuspendUe`) is unreachable. The distinction from the previous failure is
+worth keeping: before, the datagram never arrived; now it arrives and is validly
+rejected by the gNB's own code.
+
 Links 3–14 are verified by inspection, and links 3–4's precondition
 (`reestablishment_security`, set at Initial Context Setup) was confirmed present in the
-run's logs — the gNB completed `InitialContextSetup` for this UE.
+run's logs — the gNB completed `InitialContextSetup` for this UE, and the UE reached
+`PDU Session 1 is now ACTIVE`.
 
 ## What this changes
 
@@ -314,10 +385,19 @@ table in the previous section.
 ## Ceilings, stated rather than implied
 
 0. **The headline one: this does not yet prove the fire point.** Blocked on
-   nextgsim #197 (`nr-cli` cannot discover the gNB). The steps ship
-   `continue-on-error: true` and self-activate when that lands. Restated here rather
-   than left to the top section, because a reader who skims to the ceilings must not
-   come away thinking the coverage exists.
+   **nextgsim #199** (the gNB's App-task UE registry has no production writer, so
+   `ue-list` is empty and `ue-suspend` refuses). The earlier blocker, nextgsim #197
+   (`nr-cli` could not discover the gNB), is **fixed** by nextgsim PR #198 and that fix
+   is confirmed in run 35957375665. The steps keep `continue-on-error: true` and
+   self-activate when #199 lands. Restated here rather than left to the top section,
+   because a reader who skims to the ceilings must not come away thinking the coverage
+   exists.
+
+   **And the trap that goes with it:** because these steps are `continue-on-error`,
+   `Docker E2E` reported conclusion `success` in run 35957375665 while two of them
+   exited 1. A green tick on that job is **not** evidence for this fire point; only the
+   step log is. Remove the tolerance the moment #199 lands, because a step that cannot
+   fail the job is not coverage.
 
 1. **A Service Request in an `InitialUEMessage` is always rejected with cause #9.**
    `handle_initial_ue_message` (`ngap_path.rs:1604`) has no 5G-S-TMSI lookup,
@@ -348,8 +428,12 @@ table in the previous section.
 
 No Rust unit tests are added: the change is to an `example` binary (which has no
 test harness by design — it needs a live AMF and a live NG-RAN) and to CI YAML. The
-existing suite is unchanged at **6833 passing**, before and after. `cargo fmt --all
--- --check` and `cargo clippy --workspace` are clean.
+existing suite was unchanged at **6833 passing** when this spec was first written, and
+at **6898 passing** on the re-dispatch at `98603b2` (the growth is other issues'
+work, not this one's — the re-dispatch pass changes only `ci.yml` comments and this
+spec, so no Rust is touched at all). `cargo fmt --all -- --check` is clean and
+`cargo clippy --workspace` reports only the pre-existing style lints the CI Clippy job
+tolerates by design.
 
 The probe's argument parsing moved from nine positional arguments to a leading
 phase selector plus the existing positional set. It is an `example`, so there is no
