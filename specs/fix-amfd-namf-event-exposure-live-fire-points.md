@@ -395,17 +395,31 @@ Three ordering and vacuity constraints had to be established rather than assumed
 
 ### CEILING: the SERVICE REQUEST fire point is NOT covered — **STILL STANDS** (#403 investigated it)
 
-**Not lifted.** #403 built the whole E2E machinery for it
-(`specs/prove-service-request-namf-fire-point-e2e.md`) and a dispatched run
-([35882746859](https://github.com/NextgCoreLab/nextgcore/actions/runs/35882746859))
-proved it cannot run yet: `nr-cli` cannot discover nextgsim's gNB, because the gNB's
-`CliServer` never calls `register_nodes` and so writes no proc-table entry. Filed as
-**nextgsim #197**; the E2E steps ship `continue-on-error` and self-activate when it lands.
+**Not lifted, and now blocked one link further along.** #403 built the whole E2E machinery
+for it (`specs/prove-service-request-namf-fire-point-e2e.md`). Two dispatched runs:
+
+* [35882746859](https://github.com/NextgCoreLab/nextgcore/actions/runs/35882746859) —
+  `nr-cli` could not discover nextgsim's gNB (a duplicated `CliServer` that never called
+  `register_nodes`, and which also framed at a different wire version). Filed as
+  **nextgsim #197**, **FIXED** by nextgsim PR #198.
+* [35957375665](https://github.com/NextgCoreLab/nextgcore/actions/runs/35957375665), against
+  nextgsim `main` @ `6ec9d47` — discovery works; `nr-cli` reaches the gNB and the gNB
+  answers `ues: []` for a UE that demonstrably exists. The App task's UE registry that
+  `ue-list` and `ue-suspend` both read has **no production writer**, so `ue-suspend` refuses
+  and `RrcMessage::SuspendUe` is unreachable. Filed as **nextgsim #199**.
+
+The E2E steps keep `continue-on-error` and self-activate when #199 lands. **Note the trap
+that comes with that:** run 35957375665 reported job conclusion `success` while two of those
+steps genuinely exited 1, so a green `Docker E2E` tick is not evidence for this fire point —
+only the step log is.
 
 So `REACHABILITY_REPORT` + `LOCATION_REPORT` from `handle_service_request_nas` remain
 **unproven by automated test**. What #403 did establish is that the probe assertion waiting
 for them is **measured** to fail when the emitters are reverted, so the coverage is real the
-moment the lever works.
+moment the lever works — and run 35957375665 corroborated that against the *live* AMF: with
+no Service Request reaching the fire point, the probe reported
+`FAIL … 0 of 2 … MISSING ["REACHABILITY_REPORT", "LOCATION_REPORT"]` and exited 1. The
+assertion is therefore known to bite on a real bring-up, not only against a stand-in.
 
 Two corrections to the reasoning below, both worth keeping straight. Its **conclusion** —
 that nextgsim work is required — turned out to be right. Its **diagnosis** was wrong twice
@@ -413,7 +427,15 @@ over: it asserted *"nothing in either repo can drive an idle transition from out
 process"* and that a new `nr-ue` control surface was the answer. In fact nextgsim's **gNB**
 CLI already has `ue-suspend` (RAN-local, so the AMF keeps the NGAP context and the UE returns
 on an `UplinkNASTransport` — exactly the right lever), and the blocker is not a missing
-feature at all but a missing one-line registration that strands six existing gNB commands.
+feature at all but plumbing around commands that already exist.
+
+That last clause was itself first written as "a missing one-line registration", and the two
+subsequent runs void it. It was never one line and never one defect: PR #198 had to delete a
+duplicated `CliServer` carrying a wire-version skew that would have made the one-line fix
+fail silently, and doing so exposed a second defect (an App-task UE registry with no
+production writer, nextgsim #199) that the first one had masked. The lesson to carry: "the
+blocker is one line" was the third confident diagnosis of this ceiling to be wrong, so the
+next reader should treat any remaining estimate here as unverified until a run says otherwise.
 
 What the ceiling got right is that `ue-release` would *not* have worked: that one does tell
 the AMF, both sides drop the NGAP context, and the UE returns on an `InitialUEMessage` —
@@ -442,17 +464,26 @@ remains a real nextgcore gap, recorded as a ceiling in the #403 spec.
 Recorded as originally performed. The first two rows no longer name a `cargo test` test,
 because the tests that caught them were deleted with the loopback gNB.
 
-#403 asked for both strike-throughs to be lifted. **Only the first is**, because only the
-first is true: the registration assertion has now *executed* against nextgsim's real gNB in a
-dispatched run and would catch that revert today. The service-request row stays struck
-through — its assertion exists and is measured to fail when fed a reverted emitter, but it
-cannot yet run end-to-end (nextgsim #197), and "verified against a stand-in" is a weaker
-claim than "verified", which is the exact distinction this table was built to preserve.
+#403 asked for both strike-throughs to be lifted, and the re-dispatch after nextgsim PR #198
+was expected to lift the second. **It still is not lifted**, and the reason is worth stating
+precisely rather than split the difference: the service-request assertion has still never
+observed a *passing* Service Request, because `ue-suspend` cannot be dispatched (nextgsim
+#199). A row that claims a revert would be caught must mean the assertion runs green when
+wired and red when not; only half of that is demonstrated end-to-end.
+
+What the re-dispatch **did** change, and it is a real upgrade to the evidence, is the
+stand-in caveat. The probe's failure path is no longer stand-in-only: in run
+35957375665 it ran against the **live AMF** on a full compose bring-up, and when no Service
+Request reached the fire point it reported
+`FAIL … 0 of 2 … MISSING ["REACHABILITY_REPORT", "LOCATION_REPORT"]` and exited 1. So the
+"nothing arrives → red" half is now **verified live**. The "wired → green" half, and the
+wrong-value half, remain **stand-in-only**. That is the distinction this table exists to
+preserve, so the row records both halves rather than averaging them into "verified".
 
 | reverted | test that failed | discriminating sibling that stayed GREEN |
 |---|---|---|
-| registration emitters removed | `Docker E2E` → *Assert the AMF DELIVERED the registration Namf event notifications* (`namf_event_probe registration`; replaced the deleted `the_live_registration_accept_fires_registration_state_and_location_reports`). **Executed and green** in run 35882746859 | the service-request phase |
-| ~~service-request emitters removed~~ | ~~`the_live_service_request_fires_reachability_and_location_reports`~~ (DELETED). Replacement built (`namf_event_probe service-request`, #403) and **measured to fail** against a stand-in AMF when the emitters are reverted, but **blocked from running end-to-end** by nextgsim #197 | the registration phase |
+| registration emitters removed | `Docker E2E` → *Assert the AMF DELIVERED the registration Namf event notifications* (`namf_event_probe registration`; replaced the deleted `the_live_registration_accept_fires_registration_state_and_location_reports`). **Executed and green** in runs 35882746859 and 35957375665 | the service-request phase |
+| ~~service-request emitters removed~~ | ~~`the_live_service_request_fires_reachability_and_location_reports`~~ (DELETED). Replacement built (`namf_event_probe service-request`, #403). **Failure path verified LIVE** against the real AMF in run 35957375665 (reported `MISSING ["REACHABILITY_REPORT", "LOCATION_REPORT"]`, exit 1); the **passing** path and the wrong-value path remain measured against a **stand-in** only, because `ue-suspend` cannot be dispatched — **blocked end-to-end** by nextgsim #199 | the registration phase |
 | deregistration emitters removed | `the_live_deregistration_fires_deregistered_and_loss_of_connectivity` | — |
 | classifier forced to `true` (fire always) | `a_ran_release_for_user_inactivity_fires_no_communication_failure` | `a_ran_release_with_a_failure_cause_...` |
 | comm-failure emitter removed | `a_ran_release_with_a_failure_cause_fires_communication_failure_report` | `..._for_user_inactivity_...` |
