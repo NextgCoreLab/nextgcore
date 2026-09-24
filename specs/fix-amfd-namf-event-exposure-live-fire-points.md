@@ -395,8 +395,9 @@ Three ordering and vacuity constraints had to be established rather than assumed
 
 ### CEILING: the SERVICE REQUEST fire point is NOT covered — **STILL STANDS** (#403 investigated it)
 
-**Not lifted, and now blocked one link further along.** #403 built the whole E2E machinery
-for it (`specs/prove-service-request-namf-fire-point-e2e.md`). Two dispatched runs:
+**Not lifted, and now blocked two links further along.** #403 built the whole E2E machinery
+for it (`specs/prove-service-request-namf-fire-point-e2e.md`). Three dispatched runs, three
+distinct nextgsim defects in series:
 
 * [35882746859](https://github.com/NextgCoreLab/nextgcore/actions/runs/35882746859) —
   `nr-cli` could not discover nextgsim's gNB (a duplicated `CliServer` that never called
@@ -405,37 +406,61 @@ for it (`specs/prove-service-request-namf-fire-point-e2e.md`). Two dispatched ru
 * [35957375665](https://github.com/NextgCoreLab/nextgcore/actions/runs/35957375665), against
   nextgsim `main` @ `6ec9d47` — discovery works; `nr-cli` reaches the gNB and the gNB
   answers `ues: []` for a UE that demonstrably exists. The App task's UE registry that
-  `ue-list` and `ue-suspend` both read has **no production writer**, so `ue-suspend` refuses
-  and `RrcMessage::SuspendUe` is unreachable. Filed as **nextgsim #199**.
+  `ue-list` and `ue-suspend` both read had **no production writer**. Filed as
+  **nextgsim #199**, **FIXED** by nextgsim PR #200.
+* [36045644289](https://github.com/NextgCoreLab/nextgcore/actions/runs/36045644289), against
+  nextgsim `main` @ `685e50b` — `ue-list` returns a real UE (`ue_id: 0 / ran_ngap_id: 1 /
+  amf_ngap_id: 2`), `ue-suspend` suspends it with both ends agreeing, the UE's NAS reaches
+  CM-IDLE and a TUN write originates a real Service Request. But the UE cannot **resume**:
+  `initiate_resume` needs an AS security context that `as_security_enabled: false` never
+  creates, so it falls back to RRC_IDLE and the request rides an `InitialUEMessage` carrying
+  a NAS-ciphered payload the AMF cannot unwrap (`Unhandled NAS message type 0xf7`, with a
+  fresh `ran_ue_ngap_id=2`). Filed as **nextgsim #201**.
 
-The E2E steps keep `continue-on-error` and self-activate when #199 lands. **Note the trap
-that comes with that:** run 35957375665 reported job conclusion `success` while two of those
-steps genuinely exited 1, so a green `Docker E2E` tick is not evidence for this fire point —
-only the step log is.
+The E2E steps keep `continue-on-error` and self-activate when #201 lands. **Note the trap
+that comes with that:** runs 35957375665 **and** 36045644289 both reported job conclusion
+`success` while two of those steps genuinely exited 1, with a green tick beside every step in
+`gh run view`, so a green `Docker E2E` tick is not evidence for this fire point — only the
+step's own `PASS:`/`FAIL:` line in `--log` output is.
 
 So `REACHABILITY_REPORT` + `LOCATION_REPORT` from `handle_service_request_nas` remain
 **unproven by automated test**. What #403 did establish is that the probe assertion waiting
 for them is **measured** to fail when the emitters are reverted, so the coverage is real the
-moment the lever works — and run 35957375665 corroborated that against the *live* AMF: with
-no Service Request reaching the fire point, the probe reported
-`FAIL … 0 of 2 … MISSING ["REACHABILITY_REPORT", "LOCATION_REPORT"]` and exited 1. The
-assertion is therefore known to bite on a real bring-up, not only against a stand-in.
+moment the lever works — and runs 35957375665 and 36045644289 corroborated that against the
+*live* AMF: with no Service Request reaching the fire point, the probe reported
+`FAIL: after 240s the AMF delivered 0 of 2 … MISSING ["REACHABILITY_REPORT", "LOCATION_REPORT"]`
+and exited 1. The assertion is therefore known to bite on a real bring-up, twice, not only
+against a stand-in.
 
-Two corrections to the reasoning below, both worth keeping straight. Its **conclusion** —
-that nextgsim work is required — turned out to be right. Its **diagnosis** was wrong twice
-over: it asserted *"nothing in either repo can drive an idle transition from outside the UE
+What run 36045644289 additionally established is that the **drive** side is no longer
+hypothetical: a real UE was suspended to RRC_INACTIVE, its NAS reached CM-IDLE, and a TUN
+write originated a genuine Service Request. The gap is one link wide — the resume — rather
+than the whole lever.
+
+Corrections to the reasoning below, worth keeping straight. Its **conclusion** — that
+nextgsim work is required — turned out to be right, three times over. Its **diagnosis** was
+wrong: it asserted *"nothing in either repo can drive an idle transition from outside the UE
 process"* and that a new `nr-ue` control surface was the answer. In fact nextgsim's **gNB**
-CLI already has `ue-suspend` (RAN-local, so the AMF keeps the NGAP context and the UE returns
-on an `UplinkNASTransport` — exactly the right lever), and the blocker is not a missing
-feature at all but plumbing around commands that already exist.
+CLI already has `ue-suspend` (RAN-local, so the AMF keeps the NGAP context and the UE should
+return on an `UplinkNASTransport` — the right lever, and it now demonstrably drives the UE to
+CM-IDLE), and no `nr-ue` control surface was ever needed. The blocker was never a missing
+feature: it was plumbing around commands that already exist, and then a resume gated on keys
+no shipped config installs.
 
-That last clause was itself first written as "a missing one-line registration", and the two
-subsequent runs void it. It was never one line and never one defect: PR #198 had to delete a
+That last clause was itself first written as "a missing one-line registration", and the three
+subsequent runs void it. It was never one line and never one defect. PR #198 had to delete a
 duplicated `CliServer` carrying a wire-version skew that would have made the one-line fix
-fail silently, and doing so exposed a second defect (an App-task UE registry with no
-production writer, nextgsim #199) that the first one had masked. The lesson to carry: "the
-blocker is one line" was the third confident diagnosis of this ceiling to be wrong, so the
-next reader should treat any remaining estimate here as unverified until a run says otherwise.
+fail silently; doing so exposed a second defect (an App-task UE registry with no production
+writer, nextgsim #199, fixed by PR #200); and fixing *that* exposed a third (the UE's resume
+requires an AS security context that no shipped config creates, nextgsim #201).
+
+The lesson to carry, now with four counts behind it: every confident diagnosis of this
+ceiling has been wrong, and each fix revealed the next defect rather than the finish line.
+Three nextgsim defects in series, each invisible until the one in front of it was fixed, and
+each pass predicting "the step should go green with no further nextgcore change". The next
+reader should treat any remaining estimate here as unverified until a run says otherwise —
+and should read the step's own `PASS:`/`FAIL:` line rather than the job's tick, because these
+steps are `continue-on-error` and the job has reported `success` over a genuine failure twice.
 
 What the ceiling got right is that `ue-release` would *not* have worked: that one does tell
 the AMF, both sides drop the NGAP context, and the UE returns on an `InitialUEMessage` —
@@ -464,26 +489,37 @@ remains a real nextgcore gap, recorded as a ceiling in the #403 spec.
 Recorded as originally performed. The first two rows no longer name a `cargo test` test,
 because the tests that caught them were deleted with the loopback gNB.
 
-#403 asked for both strike-throughs to be lifted, and the re-dispatch after nextgsim PR #198
-was expected to lift the second. **It still is not lifted**, and the reason is worth stating
-precisely rather than split the difference: the service-request assertion has still never
-observed a *passing* Service Request, because `ue-suspend` cannot be dispatched (nextgsim
-#199). A row that claims a revert would be caught must mean the assertion runs green when
+#403 asked for both strike-throughs to be lifted, and the re-dispatches after nextgsim PR
+#198 and then PR #200 were each expected to lift the second. **It still is not lifted**, and
+the reason is worth stating precisely rather than split the difference: the service-request
+assertion has still never observed a *passing* Service Request. `ue-suspend` now works, and
+the UE genuinely reaches CM-IDLE and sends a real Service Request — but it cannot **resume**,
+so the request arrives on an `InitialUEMessage` and never reaches the fire point (nextgsim
+#201). A row that claims a revert would be caught must mean the assertion runs green when
 wired and red when not; only half of that is demonstrated end-to-end.
 
-What the re-dispatch **did** change, and it is a real upgrade to the evidence, is the
-stand-in caveat. The probe's failure path is no longer stand-in-only: in run
-35957375665 it ran against the **live AMF** on a full compose bring-up, and when no Service
+What the re-dispatches **did** change, and it is a real upgrade to the evidence, is the
+stand-in caveat. The probe's failure path is no longer stand-in-only: in runs 35957375665 and
+36045644289 it ran against the **live AMF** on a full compose bring-up, and when no Service
 Request reached the fire point it reported
-`FAIL … 0 of 2 … MISSING ["REACHABILITY_REPORT", "LOCATION_REPORT"]` and exited 1. So the
-"nothing arrives → red" half is now **verified live**. The "wired → green" half, and the
-wrong-value half, remain **stand-in-only**. That is the distinction this table exists to
-preserve, so the row records both halves rather than averaging them into "verified".
+`FAIL: after 240s the AMF delivered 0 of 2 … MISSING ["REACHABILITY_REPORT", "LOCATION_REPORT"]`
+and exited 1. So the "nothing arrives → red" half is now **verified live, twice**. The
+"wired → green" half, and the wrong-value half, remain **stand-in-only**. That is the
+distinction this table exists to preserve, so the row records both halves rather than
+averaging them into "verified".
+
+Run 36045644289 also moved the *drive* side forward without moving the row's verdict. Links
+1–8 of the suspension chain — the CLI lever, the `RRCRelease` carrying a `suspendConfig`,
+both ends entering RRC_INACTIVE, the NAS reaching CM-IDLE, and the TUN write originating a
+real Service Request — are now **verified live** rather than by inspection. Recorded
+separately from the row because it is the part a future reader would otherwise
+re-investigate: the machinery is not merely written, it demonstrably runs. The remaining gap
+is one link wide.
 
 | reverted | test that failed | discriminating sibling that stayed GREEN |
 |---|---|---|
-| registration emitters removed | `Docker E2E` → *Assert the AMF DELIVERED the registration Namf event notifications* (`namf_event_probe registration`; replaced the deleted `the_live_registration_accept_fires_registration_state_and_location_reports`). **Executed and green** in runs 35882746859 and 35957375665 | the service-request phase |
-| ~~service-request emitters removed~~ | ~~`the_live_service_request_fires_reachability_and_location_reports`~~ (DELETED). Replacement built (`namf_event_probe service-request`, #403). **Failure path verified LIVE** against the real AMF in run 35957375665 (reported `MISSING ["REACHABILITY_REPORT", "LOCATION_REPORT"]`, exit 1); the **passing** path and the wrong-value path remain measured against a **stand-in** only, because `ue-suspend` cannot be dispatched — **blocked end-to-end** by nextgsim #199 | the registration phase |
+| registration emitters removed | `Docker E2E` → *Assert the AMF DELIVERED the registration Namf event notifications* (`namf_event_probe registration`; replaced the deleted `the_live_registration_accept_fires_registration_state_and_location_reports`). **Executed and green** in runs 35882746859, 35957375665 and 36045644289 | the service-request phase |
+| ~~service-request emitters removed~~ | ~~`the_live_service_request_fires_reachability_and_location_reports`~~ (DELETED). Replacement built (`namf_event_probe service-request`, #403). **Failure path verified LIVE twice** against the real AMF, in runs 35957375665 and 36045644289 (both reported `MISSING ["REACHABILITY_REPORT", "LOCATION_REPORT"]`, exit 1); the **passing** path and the wrong-value path remain measured against a **stand-in** only. The *drive* half is now live to link 8 — `ue-suspend` dispatches, the UE reaches CM-IDLE and sends a real Service Request — but it cannot **resume**, so the request rides an `InitialUEMessage` and never reaches the fire point: **blocked end-to-end** by nextgsim #201 | the registration phase |
 | deregistration emitters removed | `the_live_deregistration_fires_deregistered_and_loss_of_connectivity` | — |
 | classifier forced to `true` (fire always) | `a_ran_release_for_user_inactivity_fires_no_communication_failure` | `a_ran_release_with_a_failure_cause_...` |
 | comm-failure emitter removed | `a_ran_release_with_a_failure_cause_fires_communication_failure_report` | `..._for_user_inactivity_...` |
