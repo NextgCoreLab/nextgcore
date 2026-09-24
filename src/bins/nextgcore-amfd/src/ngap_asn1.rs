@@ -739,6 +739,21 @@ pub struct UplinkNasTransportData {
     pub ran_ue_ngap_id: u32,
     /// NAS PDU
     pub nas_pdu: Vec<u8>,
+    /// User Location Information, MANDATORY on this message
+    /// (TS 38.413 §9.2.5.3, `38413-j30.txt:14672-14673`: presence `M`).
+    ///
+    /// Kept rather than dropped because this is where the AMF learns that a UE
+    /// which moved while in CM-IDLE is now somewhere else — TS 23.502 §4.2.3.2
+    /// step 2 says the location *"relates to the cell in which the UE is
+    /// camping"* (`23502-k20.txt:6155`), present tense. Before #406 this field
+    /// did not exist, so `handle_service_request_nas`'s `LOCATION_REPORT`
+    /// reported the TAI stored at registration, and #400's presence events
+    /// declined to fire from that site at all for exactly that reason.
+    ///
+    /// Nothing extra is decoded off the wire for this: the NGAP parser already
+    /// decodes the IE and refuses the message without it
+    /// (`libs/nextgcore-ngap/src/parser.rs:660-663`).
+    pub user_location_info: UserLocationInformation,
 }
 
 /// Parse an Uplink NAS Transport message from ASN.1 APER bytes
@@ -770,6 +785,7 @@ pub fn parse_uplink_nas_transport_asn1(data: &[u8]) -> Option<UplinkNasTransport
         amf_ue_ngap_id: msg.amf_ue_ngap_id,
         ran_ue_ngap_id: msg.ran_ue_ngap_id,
         nas_pdu: msg.nas_pdu,
+        user_location_info: msg.user_location_info,
     })
 }
 
