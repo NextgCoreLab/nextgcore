@@ -1634,6 +1634,39 @@ impl NgapServer {
                     plmn_id: initial_ue.plmn_id.clone(),
                     tac: initial_ue.tac,
                 };
+                // #406, the THIRD instance of the class: store the cell identity too.
+                //
+                // `parse_initial_ue_message_asn1` decodes `nr_cell_identity` off the
+                // InitialUEMessage's own `UserLocationInformation`
+                // (`ngap_asn1.rs:357-368`); before this it was LOGGED at `:1602-1607` and
+                // then dropped, so `amf_ue.nr_cgi` had exactly one production writer
+                // (`handle_handover_notify`) and an `ncgiList` Area of Interest could not
+                // resolve for a UE that had never handed over — #400 recorded that as a
+                // ceiling and #407 wrote a test pinning it.
+                //
+                // Worth doing because `ncgi` is not optional in what the AMF reports:
+                // TS 29.571 §5.4.4.9's `NrLocation` makes both `tai` and `ncgi` `M`
+                // (`29571-k00.txt:4674`, `:4689`), so without this half of a mandatory pair
+                // was a default for every UE that had only ever registered.
+                //
+                // `initial_ue.plmn_id` is decoded from `nr_cgi_plmn` (`ngap_asn1.rs:364`),
+                // so it is exactly the right source for `nr_cgi.plmn_id` — that IS the
+                // NR-CGI's PLMN.
+                //
+                // NOTE a PRE-EXISTING inexactness this write inherits rather than
+                // introduces: the `nr_tai` assignment immediately above uses the SAME
+                // value, so the registration path stores the NR-CGI's PLMN as the TAI's
+                // too. The IE carries them separately (`UserLocationInformation::Nr` has
+                // both `nr_cgi_plmn` and `tai_plmn`) and they can differ in a shared-RAN
+                // deployment, but `InitialUeMessageData` keeps only one and discards
+                // `tai_plmn` (`ngap_asn1.rs:357-368`). Not widened here: that is a
+                // different change, nothing in this tree distinguishes the two, and the
+                // three sites that go through `apply_user_location` do read them
+                // separately and get it right.
+                state.amf_ue.nr_cgi = crate::context::NrCgi {
+                    plmn_id: initial_ue.plmn_id.clone(),
+                    cell_id: initial_ue.nr_cell_identity,
+                };
                 state.amf_ue.access_type = 1; // 3GPP access
                 self.ue_auth_state.insert(amf_ue_ngap_id, state);
 
@@ -1701,6 +1734,51 @@ impl NgapServer {
             ul_nas.ran_ue_ngap_id,
             ul_nas.nas_pdu.len()
         );
+
+        // #406: LEARN THE UE'S LOCATION. `UserLocationInformation` is MANDATORY on this
+        // message (TS 38.413 §9.2.5.3, `38413-j30.txt:14672-14673`) precisely because a
+        // UE that moved while in CM-IDLE reports where it now is on the way back up —
+        // TS 23.502 §4.2.3.2 step 2: the location *"relates to the cell in which the UE
+        // is camping"* (`23502-k20.txt:6155`), present tense, the current cell and not
+        // the one it registered from.
+        //
+        // Before this the IE was decoded by the NGAP parser, refused if absent, and then
+        // DISCARDED one assignment short of use: `UplinkNasTransportData` had no field
+        // for it. So `handle_service_request_nas`'s `LOCATION_REPORT` (#402) reported the
+        // TAI written at registration, and #400's presence events declined to fire from
+        // that site rather than report an unchanged verdict as news.
+        //
+        // ORDERING IS LOAD-BEARING, and this is why the write is HERE rather than beside
+        // the SERVICE REQUEST arm of the dispatch below:
+        //
+        // 1. `handle_service_request_nas` reads the UE back out of the store to build the
+        //    Service Accept and to fire its events. A write placed after dispatch would
+        //    leave `fire_location_report` reading the OLD TAI — the same defect, relocated.
+        // 2. The legacy raw-5GSM branch (`epd == 0x2E`) and the MAC-failure branch both
+        //    return early. Each is still an Uplink NAS Transport carrying a mandatory,
+        //    already-validated location, and a UE whose PDU session signalling arrives
+        //    from a new cell has still moved.
+        // 3. The IE's validity does not depend on the NAS payload: it was decoded and
+        //    accepted before `parse_uplink_nas_transport_asn1` returned. Nothing below can
+        //    make it untrue.
+        //
+        // Safe despite the security-decode block's `remove`/`insert` round-trip further
+        // down: that takes the same record out, mutates it and puts it back, so this
+        // field write survives.
+        //
+        // `with_mut` and not `get`: `UeStore::get` returns a CLONE
+        // (`ue_store.rs:113-115`), and this crate has twice had a handler mutate a clone
+        // it then dropped. `None` means the UE is unknown, which the branches below
+        // already answer for — a location for a UE with no context has nowhere to go.
+        self.ue_auth_state.with_mut(ul_nas.amf_ue_ngap_id, |state| {
+            apply_user_location(&mut state.amf_ue, &ul_nas.user_location_info);
+            log::debug!(
+                "UE {} location refreshed from the Uplink NAS Transport (tac={}, nci=0x{:x})",
+                ul_nas.amf_ue_ngap_id,
+                state.amf_ue.nr_tai.tac,
+                state.amf_ue.nr_cgi.cell_id
+            );
+        });
 
         if ul_nas.nas_pdu.len() < 3 {
             return Ok(());
@@ -4640,15 +4718,54 @@ impl NgapServer {
         // location change of the UE", and the AMF becomes aware at each, so reporting
         // only one would silently drop the other.
         //
+        // **#406 made this report HONEST.** Until then it was the sentence above with no
+        // mechanism behind it: `handle_uplink_nas_transport` discarded the
+        // `UserLocationInformation` the NGAP parser decodes as mandatory, so this site
+        // re-reported the TAI stored at REGISTRATION and a UE that moved while idle was
+        // reported at its old location. The refresh now happens in
+        // `handle_uplink_nas_transport` BEFORE this dispatch, which is what makes the
+        // `get` below observe the new value.
+        //
         // Both used to fire from `gmm_handler::handle_service_request` (`:299-300`),
         // whose only caller is inside `mod tests` (#397 criterion 1). Moved rather than
         // given a production caller, for the reason recorded on
         // `send_registration_accept`.
+        //
+        // #400's PRESENCE_IN_AOI_REPORT and UES_IN_AREA_REPORT join them **as of #406**,
+        // and this is the CEILING #400 stated at `handle_handover_notify` being lifted
+        // rather than merely reworded. #400 declined this site for one stated reason: the
+        // Service Request path could not learn a new location, so re-evaluating the
+        // registration's TAI would report an unchanged verdict as news, which TS 29.518
+        // §5.3.1's *"the AMF shall only report the UE(s) whose presence status has changed
+        // compared to the previous notification sent by the AMF"* (`29518-k00.txt:4893-4895`)
+        // forbids. That premise is now false: the TAI and the cell identity are both
+        // refreshed from the message that carried them, so a verdict computed here is a
+        // verdict about where the UE IS.
+        //
+        // And a Service Request is a moment presence genuinely can have changed: the UE was
+        // in CM-IDLE, during which it may have moved across an area boundary without the
+        // AMF hearing anything at all. Firing here is what makes an OUT->IN transition
+        // observable for a UE that moved while idle — before #406 it was observable only
+        // via a handover, i.e. only for a UE that moved while CONNECTED.
+        //
+        // Safe against double-reporting because the emitter applies §5.3.1's change rule
+        // itself (`namf_server::fire_presence_in_aoi_report` ->
+        // `event_subscription_record_presence`): a UE that did NOT cross a boundary sends
+        // nothing from here. So the common case — a Service Request from the same cell the
+        // UE registered in — is silent, which is the outcome the clause requires.
+        //
+        // Read from ONE `get`, so all five reports describe the same snapshot.
         if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
             crate::namf_server::fire_connectivity_state_report(&state.amf_ue, true);
             crate::namf_server::fire_reachability_report(&state.amf_ue, true);
             crate::namf_server::fire_location_report(&state.amf_ue);
+            crate::namf_server::fire_presence_in_aoi_report(&state.amf_ue);
         }
+        // A UE returning from CM-IDLE may have moved into or out of a counted area while
+        // the AMF could not see it, so the per-area totals can change even though the
+        // served population did not. Takes no UE argument: the type is any-UE by
+        // definition and its report carries no UE identity (Table 6.2.6.2.5-1 NOTE 1).
+        crate::namf_server::fire_ues_in_area_report();
 
         // TS 33.501 §6.12.3: reallocate the 5G-GUTI after a service request. This is the
         // moment that matters for identity privacy -- the UE has just used the identity
@@ -7733,17 +7850,12 @@ impl NgapServer {
             // target now that the UE has arrived (TS 23.502 Section 4.9.1.3).
             state.association_id = association_id;
             state.ran_ue_ngap_id = notify.ran_ue_ngap_id;
-            let nextgcore_ngap::types::UserLocationInformation::Nr {
-                nr_cgi_plmn,
-                nr_cell_identity,
-                tai_plmn,
-                tai_tac,
-            } = &notify.user_location_info;
-            state.amf_ue.nr_cgi.plmn_id = plmn_id_from_ngap_bytes(nr_cgi_plmn);
-            state.amf_ue.nr_cgi.cell_id = *nr_cell_identity;
-            state.amf_ue.nr_tai.plmn_id = plmn_id_from_ngap_bytes(tai_plmn);
-            state.amf_ue.nr_tai.tac =
-                ((tai_tac[0] as u32) << 16) | ((tai_tac[1] as u32) << 8) | tai_tac[2] as u32;
+            // #406: was this same unpacking written out inline. Shared with the Uplink NAS
+            // Transport and PathSwitchRequest sites now, so the three cannot reassemble the
+            // big-endian TAC differently. Behaviour here is unchanged — this was the one
+            // site that already did it correctly, and it is the reference the other two
+            // were measured against.
+            apply_user_location(&mut state.amf_ue, &notify.user_location_info);
             log::info!(
                 "UE {} relocated to target gNB (association {association_id})",
                 notify.amf_ue_ngap_id
@@ -7765,18 +7877,16 @@ impl NgapServer {
         // TS 29.518 §6.2 names the trigger as a transition, not a state: the consumer
         // receives *"the current present state of a UE in a specific Area of Interest
         // (AOI), and notification when a specified UE enters or leaves the specified
-        // area"* (`29518-k00.txt:23968-23978`). A handover is the only moment this AMF
-        // observes a UE MOVING: `send_registration_accept` sees a UE's first location and
-        // the Service Request path cannot see a new one at all (see below), so an IN->OUT
-        // or OUT->IN transition is detectable here and nowhere else.
+        // area"* (`29518-k00.txt:23968-23978`). A handover is where this AMF observes a UE
+        // moving while CONNECTED; **#406 added the other half**, the UE that moved while
+        // CM-IDLE, which `handle_service_request_nas` now reports (see the note there).
+        // Until #406 this site was the only one, because the Service Request path could not
+        // learn a new location at all.
         //
         // Fired AFTER the `with_mut` above, deliberately: that closure is what writes the
         // TARGET's TAI and cell identity, so evaluating before it would compare the
         // subscribed areas against where the UE USED to be and report the transition
-        // backwards. It is also the only production writer of `amf_ue.nr_cgi`, which is
-        // why an `ncgiList` area can only ever resolve to IN/OUT after a handover —
-        // `namf_server::ue_ncgi_is_known` records that ceiling and reports UNKNOWN
-        // before it.
+        // backwards.
         //
         // The emitter applies §5.3.1's change rule (*"In subsequent notifications, the
         // AMF shall only report the UE(s) whose presence status has changed compared to
@@ -7785,21 +7895,20 @@ impl NgapServer {
         // every handover regardless of whether presence changed, which is the
         // "plausible-but-wrong moment" #400 was filed to avoid.
         //
-        // CEILING, stated here because this is the site a reader will ask at: the
-        // SERVICE REQUEST path does NOT fire these. #402 fires `LOCATION_REPORT` from
-        // `handle_service_request_nas`, so symmetry argues for it — but
-        // `ngap_asn1::parse_uplink_nas_transport_asn1` DISCARDS the
-        // `UserLocationInformation` that `nextgcore_ngap::parser` already decodes as a
-        // mandatory IE (`libs/nextgcore-ngap/src/parser.rs:640-663`;
-        // `UplinkNasTransportData` has no field for it). So that path cannot learn a new
-        // location: it would re-evaluate the REGISTRATION's TAI and, on the first
-        // Service Request after a move, report an unchanged verdict as though it were
-        // news. §5.3.1's change rule makes that non-conformant rather than merely
-        // redundant. The parser gap is filed as **#406**; fixing it makes the Service
-        // Request a third genuine location-learning moment for this emitter AND for
-        // #402's `LOCATION_REPORT`, which today reports a stale TAI there. Once #406
-        // lands this site should be revisited: the change rule above makes firing from
-        // the Service Request safe, because an unchanged verdict is suppressed.
+        // #400's CEILING HERE — *"the SERVICE REQUEST path does NOT fire these, because
+        // `parse_uplink_nas_transport_asn1` discards the `UserLocationInformation`"* — was
+        // LIFTED by #406 rather than reworded. That parser now keeps the IE and
+        // `handle_uplink_nas_transport` writes both `nr_tai` and `nr_cgi` from it, so the
+        // Service Request is a real location-learning moment and fires these two as well.
+        // The reasoning for firing there is at that site.
+        //
+        // Nor is this still `nr_cgi`'s only production writer. #406 gave it four: this
+        // site, `handle_uplink_nas_transport`, `handle_path_switch_request` (the Xn
+        // handover, which produces no HandoverNotify at all and was silently discarding a
+        // mandatory location) and `handle_initial_ue_message` (which parsed the cell
+        // identity and logged it). `namf_server::ue_ncgi_is_known` still guards a DEFAULT
+        // cell id, but the reason is now "never learned" in general rather than "no
+        // handover yet".
         if let Some(state) = self.ue_auth_state.get(notify.amf_ue_ngap_id) {
             crate::namf_server::fire_presence_in_aoi_report(&state.amf_ue);
         }
@@ -8043,6 +8152,28 @@ impl NgapServer {
                 // target gNB; this is the N3 tunnel/RAN identity update.
                 state.ran_ue_ngap_id = req.ran_ue_ngap_id;
                 state.association_id = association_id;
+
+                // #406, the SECOND instance of the discarded-location class: move the
+                // stored location to the TARGET cell as well as the target association.
+                //
+                // `UserLocationInformation` is MANDATORY on PATH SWITCH REQUEST
+                // (TS 38.413 §9.2.3.8, `38413-j30.txt:13741-13742`), and TS 23.502
+                // §4.9.1.2.2 step 1b says what it is for: the target NG-RAN *"sends an N2
+                // Path Switch Request message to an AMF to inform that the UE has moved to
+                // a new Target cell"* (`23502-k20.txt:17848-17858`). Before this the
+                // handler bound `req` and never read `req.user_location_info` at all.
+                //
+                // This is the arm that matters most after the filed one: an Xn handover
+                // produces NO `HandoverNotify`, so this message is the AMF's ONLY
+                // notification that the UE relocated. Without it a UE that moved by Xn —
+                // the common case, since Xn is preferred wherever the interface exists —
+                // left the stored location untouched, and `nr_cgi`'s single writer was
+                // reachable only via the LESS common handover type.
+                //
+                // Inside the same `with_mut` as the association move, deliberately: the two
+                // describe one event, and a reader must not have to wonder whether the
+                // location and the serving gNB can disagree.
+                apply_user_location(&mut state.amf_ue, &req.user_location_info);
 
                 // #70: the inbound request transfers, kept so each can be relayed to the SMF
                 // AFTER this borrow ends. The switched list is built from the SMF's ANSWERS
@@ -10259,6 +10390,47 @@ fn plmn_id_from_ngap_bytes(bytes: &[u8; 3]) -> PlmnId {
     }
 }
 
+/// Store a UE's location from an NGAP `UserLocationInformation`, refreshing BOTH
+/// the tracking area and the cell identity (#406).
+///
+/// # Why one helper rather than the destructure repeated at each site
+///
+/// Every NGAP message that reports a location reports the same two things, and a
+/// truthful `LOCATION_REPORT` needs both: TS 29.571 §5.4.4.9's `NrLocation` makes
+/// `tai` and `ncgi` each `M` (`29571-k00.txt:4674`, `:4689`). The TAC arrives as
+/// three big-endian octets and has to be reassembled, which is exactly the kind of
+/// expression that ends up subtly different in its fourth copy. Before #406 the
+/// unpacking existed once, inline in `handle_handover_notify`, and the other three
+/// sites either dropped the value or stored half of it.
+///
+/// Callers: `handle_uplink_nas_transport` (the SERVICE REQUEST and every other UL
+/// NAS message), `handle_path_switch_request` (Xn handover) and
+/// `handle_handover_notify` (N2 handover). `handle_initial_ue_message` does not use
+/// it because `parse_initial_ue_message_asn1` has already flattened the IE into
+/// `InitialUeMessageData`'s own fields, so no `UserLocationInformation` survives to
+/// that site.
+///
+/// Takes `&mut AmfUe` rather than the store, so the caller decides the locking: at
+/// every call site this runs inside a `UeStore::with_mut` closure, because
+/// `UeStore::get` hands back a CLONE (`ue_store.rs:113-115`) and a location written
+/// to a dropped clone is the same defect as not writing it at all.
+fn apply_user_location(
+    amf_ue: &mut AmfUe,
+    location: &nextgcore_ngap::types::UserLocationInformation,
+) {
+    let nextgcore_ngap::types::UserLocationInformation::Nr {
+        nr_cgi_plmn,
+        nr_cell_identity,
+        tai_plmn,
+        tai_tac,
+    } = location;
+    amf_ue.nr_cgi.plmn_id = plmn_id_from_ngap_bytes(nr_cgi_plmn);
+    amf_ue.nr_cgi.cell_id = *nr_cell_identity;
+    amf_ue.nr_tai.plmn_id = plmn_id_from_ngap_bytes(tai_plmn);
+    amf_ue.nr_tai.tac =
+        ((tai_tac[0] as u32) << 16) | ((tai_tac[1] as u32) << 8) | tai_tac[2] as u32;
+}
+
 /// The stored Supported TA List a RAN Configuration Update should replace the
 /// existing one with, or `None` to keep what is stored.
 ///
@@ -11932,6 +12104,25 @@ mod tests {
         NgapServer::new("127.0.0.1:0".parse().unwrap(), SctpBackend::Userspace, etx)
             .await
             .expect("NGAP test server")
+    }
+
+    /// An NGAP `UserLocationInformation` for a given TAC and cell identity, in PLMN
+    /// 001/01 (#406).
+    ///
+    /// Exists so a test that is ABOUT something else — the integrity-failure
+    /// exceptions, say — can satisfy the now-mandatory field without a reader
+    /// mistaking its literals for load-bearing ones. Tests that ARE about the
+    /// location build their own, with values chosen to contrast.
+    fn test_user_location(
+        tac: u32,
+        cell_id: u64,
+    ) -> nextgcore_ngap::types::UserLocationInformation {
+        nextgcore_ngap::types::UserLocationInformation::Nr {
+            nr_cgi_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("001", "01")),
+            nr_cell_identity: cell_id,
+            tai_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("001", "01")),
+            tai_tac: [(tac >> 16) as u8, (tac >> 8) as u8, tac as u8],
+        }
     }
 
     /// #91 criterion 7: the UE policy association -- and therefore the PCF's DL MANAGE
@@ -14807,6 +14998,10 @@ mod tests {
             amf_ue_ngap_id,
             ran_ue_ngap_id: 72,
             nas_pdu: Vec::new(),
+            // Not load-bearing here: this test is about the §4.4.4.3 exception, and
+            // `handle_integrity_check_failure` reads no location. The field is mandatory
+            // on the message (#406) so it has to be present.
+            user_location_info: test_user_location(0x000001, 1),
         };
         let plain = [0x7E, 0x00, message_type::SERVICE_REQUEST, 0x00];
         let attempted = ngap
@@ -14883,6 +15078,8 @@ mod tests {
             amf_ue_ngap_id,
             ran_ue_ngap_id: 72,
             nas_pdu: Vec::new(),
+            // Not load-bearing: see the sibling test. Mandatory field (#406).
+            user_location_info: test_user_location(0x000001, 1),
         };
         let plain = [0x7E, 0x00, message_type::UL_NAS_TRANSPORT, 0x00];
         ngap.handle_integrity_check_failure(1, &ul_nas, &plain, 0x02)
@@ -15040,6 +15237,338 @@ mod tests {
         assert_eq!(
             state.amf_ue.current_guti.tmsi, 0x5555_5555,
             "the acknowledged GUTI becomes the current one (TS 33.501 §6.12.3)"
+        );
+    }
+
+    // ---- #406: the AMF learns a location from every message that reports one ----
+
+    /// #406 criteria 1-4: a real `UplinkNASTransport` refreshes BOTH the stored TAI and
+    /// the stored cell identity, and the values are the ones the message carried.
+    ///
+    /// **This is a CONTRAST PAIR, and the contrast is the test.** The UE is seeded with a
+    /// genuine prior location — the TAC and cell a registration would have written — and
+    /// the PDU carries a DIFFERENT one. So an implementation that never applies the
+    /// message's location fails loudly by reading back the registration's value, which is
+    /// exactly the defect #406 was filed for. Asserting only "the field is populated"
+    /// would have passed against the stale value; #407 caught one of its own tests
+    /// passing with its guard deleted because its fixture had no location at all, so this
+    /// fixture has a real, distinct one.
+    ///
+    /// Driven through `handle_uplink_nas_transport` with an APER-encoded PDU, not by
+    /// calling `apply_user_location`: the question is whether the LIVE path applies it,
+    /// and a direct call on the helper would pass even with the production call site
+    /// deleted.
+    ///
+    /// The NAS payload is a CONFIGURATION UPDATE COMPLETE rather than a Service Request,
+    /// deliberately — it makes the location write independent of which 5GMM procedure
+    /// runs, which is the design claim ("placed before the dispatch, not beside the
+    /// SERVICE REQUEST arm"). The sibling test covers the Service Request itself.
+    ///
+    /// REVERT-VERIFIED: deleting the `apply_user_location` call from
+    /// `handle_uplink_nas_transport` makes this FAIL, reading back the registration's
+    /// TAC 0x000401 instead of 0x0A0B0C.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_uplink_nas_transport_refreshes_the_stored_tai_and_cell() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        // 7_406_001 and cell/TAC literals unique to this test: two amfd tests once shared
+        // an AMF-UE-NGAP-ID and failed about one run in three, because the store is keyed
+        // on it and `amf_context_init` does not isolate concurrent tests from each other.
+        let amf_ue_ngap_id = 7_406_001u64;
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 74, 1, false);
+        ue_ctx.registered = true;
+        // WHERE THE UE REGISTERED. Both fields set, so a stale read returns something
+        // plausible rather than a default — a default would make the assertions below
+        // pass for the wrong reason.
+        ue_ctx.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        ue_ctx.amf_ue.nr_tai.tac = 0x000401;
+        ue_ctx.amf_ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+        ue_ctx.amf_ue.nr_cgi.cell_id = 0x0001_1111;
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        // WHERE THE UE NOW IS: a different tracking area and a different cell.
+        let moved_tac = 0x0A0B0Cu32;
+        let moved_cell = 0x0009_9999u64;
+        let ul_pdu = nextgcore_ngap::builder::build_uplink_nas_transport(
+            &nextgcore_ngap::types::UplinkNasTransport {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id: 74,
+                nas_pdu: vec![
+                    0x7E,
+                    security_header::PLAIN_NAS_MESSAGE,
+                    message_type::CONFIGURATION_UPDATE_COMPLETE,
+                ],
+                user_location_info: test_user_location(moved_tac, moved_cell),
+            },
+        )
+        .expect("encode an Uplink NAS Transport");
+        ngap.handle_uplink_nas_transport(1, &ul_pdu)
+            .await
+            .expect("the message must be handled");
+
+        let state = ngap
+            .ue_auth_state
+            .get(amf_ue_ngap_id)
+            .expect("the context survives");
+        // POSITIVE assertions: the stored value EQUALS what the message carried. A
+        // `assert_ne!` against the registration value would also be satisfied by a
+        // handler that wrote garbage.
+        assert_eq!(
+            state.amf_ue.nr_tai.tac, moved_tac,
+            "the TAC the Uplink NAS Transport carried must reach the store; \
+             0x000401 means the registration's TAI was never refreshed (#406)"
+        );
+        assert_eq!(
+            state.amf_ue.nr_cgi.cell_id, moved_cell,
+            "and the cell identity with it — TS 29.571 §5.4.4.9 makes `ncgi` as \
+             mandatory as `tai` in the NrLocation a LOCATION_REPORT carries"
+        );
+        assert_eq!(
+            state.amf_ue.nr_tai.plmn_id,
+            PlmnId::new("001", "01"),
+            "the TAI PLMN comes from the message's own tai_plmn"
+        );
+    }
+
+    /// #406 criterion 5, the one the issue names: a SERVICE REQUEST arriving from a new
+    /// cell leaves the store holding the NEW location by the time the events fire, so
+    /// `LOCATION_REPORT` from `handle_service_request_nas` is no longer stale.
+    ///
+    /// The distinct thing this pins over its sibling is **ORDERING**. The location write
+    /// lives before the NAS dispatch, and `handle_service_request_nas` reads the UE back
+    /// out of the store to build the Service Accept and to fire its five events. If the
+    /// write happened after dispatch the field would still end up correct — so a test
+    /// that only inspected the store at the end would pass — but every event would have
+    /// been fired off the stale value. Asserting the store from INSIDE the procedure is
+    /// not reachable here, so this asserts the observable proxy: the value is already
+    /// correct at the point the procedure returns, and the revert below makes the
+    /// ordering itself falsifiable.
+    ///
+    /// REVERT-VERIFIED twice: (a) deleting the `apply_user_location` call makes this fail
+    /// with the registration's TAC 0x000402; (b) MOVING that call to after the `match
+    /// msg_type` dispatch block makes it fail too, because the Service Request arm then
+    /// runs — and fires — before the location exists.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_service_request_reports_the_location_it_arrived_with_not_the_registration_s() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        // Distinct from the sibling test's 7_406_001 / TAC 0x000401 so the two cannot
+        // pass on each other's state if they interleave.
+        let amf_ue_ngap_id = 7_406_002u64;
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 75, 1, false);
+        // `handle_service_request_nas` refuses without both of these (cause #9), so they
+        // are preconditions rather than decoration.
+        ue_ctx.registered = true;
+        ue_ctx.amf_ue.security_context_available = true;
+        ue_ctx.amf_ue.supi = Some("imsi-001010000406002".to_string());
+        ue_ctx.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        ue_ctx.amf_ue.nr_tai.tac = 0x000402;
+        ue_ctx.amf_ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+        ue_ctx.amf_ue.nr_cgi.cell_id = 0x0002_2222;
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        // A plain SERVICE REQUEST from a cell in a DIFFERENT tracking area: the UE moved
+        // while it was in CM-IDLE, which is the scenario the mandatory IE exists for.
+        let moved_tac = 0x0C0D0Eu32;
+        let moved_cell = 0x0008_8888u64;
+        let ul_pdu = nextgcore_ngap::builder::build_uplink_nas_transport(
+            &nextgcore_ngap::types::UplinkNasTransport {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id: 75,
+                // ngKSI + 5G-S-TMSI-shaped tail; the service-type nibble is read from
+                // byte 3 and the rest is tolerated by the handler.
+                nas_pdu: vec![
+                    0x7E,
+                    security_header::PLAIN_NAS_MESSAGE,
+                    message_type::SERVICE_REQUEST,
+                    0x00,
+                    0x00,
+                ],
+                user_location_info: test_user_location(moved_tac, moved_cell),
+            },
+        )
+        .expect("encode an Uplink NAS Transport");
+        // The Service Accept cannot egress (no live association), and that does not
+        // matter here: the location write happens before dispatch, so it is committed
+        // either way. `handle_uplink_nas_transport` swallows the send failure.
+        let _ = ngap.handle_uplink_nas_transport(1, &ul_pdu).await;
+
+        let state = ngap
+            .ue_auth_state
+            .get(amf_ue_ngap_id)
+            .expect("the context survives a Service Request");
+        assert_eq!(
+            state.amf_ue.nr_tai.tac, moved_tac,
+            "a SERVICE REQUEST is where the AMF learns a UE moved while idle \
+             (TS 23.502 §4.2.3.2 step 2: the location relates to the cell the UE is \
+             CAMPING in). 0x000402 means LOCATION_REPORT still fires off the \
+             registration's TAI, which is the #406 defect"
+        );
+        assert_eq!(
+            state.amf_ue.nr_cgi.cell_id, moved_cell,
+            "the cell identity too, or the ncgi half of NrLocation stays stale"
+        );
+    }
+
+    /// #406, the SECOND instance of the class — not named in the issue, found by grepping
+    /// every NGAP message whose `UserLocationInformation` this tree decodes.
+    ///
+    /// `handle_path_switch_request` bound its decoded request and never read
+    /// `user_location_info`, though the IE is MANDATORY on PATH SWITCH REQUEST
+    /// (TS 38.413 §9.2.3.8) and TS 23.502 §4.9.1.2.2 step 1b says the message exists to
+    /// *"inform that the UE has moved to a new Target cell"*. This is the arm that
+    /// matters most after the filed one: an **Xn** handover produces no `HandoverNotify`
+    /// at all, so this message is the AMF's only notification that the UE relocated.
+    ///
+    /// Contrast pair again: the UE is seeded at the SOURCE cell and the request comes
+    /// from the TARGET. The acknowledge cannot egress (no association) and the SMF cannot
+    /// be reached, which is fine — the location write is inside the `with_mut` that also
+    /// moves the serving association, both of which happen before any of that.
+    ///
+    /// REVERT-VERIFIED: deleting the `apply_user_location` call from the handler's
+    /// `with_mut` makes this FAIL, reading back the source TAC 0x000403.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_path_switch_request_moves_the_stored_location_to_the_target_cell() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        // 7_406_003 / TAC 0x000403: distinct from the two tests above for the same
+        // shared-key reason.
+        let amf_ue_ngap_id = 7_406_003u64;
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 76, 1, false);
+        ue_ctx.registered = true;
+        ue_ctx.amf_ue.supi = Some("imsi-001010000406003".to_string());
+        // THE SOURCE CELL.
+        ue_ctx.amf_ue.nr_tai.plmn_id = PlmnId::new("001", "01");
+        ue_ctx.amf_ue.nr_tai.tac = 0x000403;
+        ue_ctx.amf_ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
+        ue_ctx.amf_ue.nr_cgi.cell_id = 0x0003_3333;
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        // THE TARGET CELL, in a different tracking area.
+        let target_tac = 0x0E0F10u32;
+        let target_cell = 0x0007_7777u64;
+        let pdu = nextgcore_ngap::builder::build_path_switch_request(
+            &nextgcore_ngap::types::PathSwitchRequest {
+                ran_ue_ngap_id: 88,
+                source_amf_ue_ngap_id: amf_ue_ngap_id,
+                user_location_info: test_user_location(target_tac, target_cell),
+                ue_security_capabilities: nextgcore_ngap::types::UeSecurityCapabilities {
+                    nr_encryption_algorithms: 0x8000,
+                    nr_integrity_algorithms: 0x8000,
+                    eutra_encryption_algorithms: 0,
+                    eutra_integrity_algorithms: 0,
+                },
+                pdu_session_list: vec![nextgcore_ngap::types::PduSessionResourceSwitchItem {
+                    pdu_session_id: 1,
+                    transfer: vec![0x00],
+                }],
+                failed_list: None,
+            },
+        )
+        .expect("encode a PathSwitchRequest");
+        // Association 2 is the target's. The acknowledge send fails (no live
+        // association), which the handler logs rather than propagating.
+        let _ = ngap.handle_path_switch_request(2, &pdu).await;
+
+        let state = ngap
+            .ue_auth_state
+            .get(amf_ue_ngap_id)
+            .expect("the UE survives its own path switch");
+        assert_eq!(
+            state.amf_ue.nr_tai.tac, target_tac,
+            "an Xn handover produces no HandoverNotify, so the PATH SWITCH REQUEST is \
+             the AMF's only notice that the UE moved; 0x000403 means it still believes \
+             the UE is at the source"
+        );
+        assert_eq!(
+            state.amf_ue.nr_cgi.cell_id, target_cell,
+            "and the target's cell identity, which is what an ncgiList area resolves \
+             against"
+        );
+        // The serving identity moved too — this is pre-existing behaviour, asserted so a
+        // future edit cannot trade one for the other.
+        assert_eq!(
+            state.ran_ue_ngap_id, 88,
+            "the serving RAN-UE-NGAP-ID moves to the target in the same with_mut"
+        );
+    }
+
+    /// #406 criterion 7, the THIRD instance of the class: registration stores the cell
+    /// identity it already parsed.
+    ///
+    /// `parse_initial_ue_message_asn1` decodes `nr_cell_identity` off the
+    /// InitialUEMessage's own `UserLocationInformation`; `handle_initial_ue_message`
+    /// LOGGED it and dropped it, storing only the TAI. So `amf_ue.nr_cgi` had one
+    /// production writer (`handle_handover_notify`) and an `ncgiList` Area of Interest
+    /// could not resolve for a UE that had never handed over — #400 recorded that as a
+    /// ceiling and #407 wrote a test pinning it.
+    ///
+    /// The contrast here is against `0`, which is what the field held before, and that is
+    /// a real contrast rather than a vacuous one: `NrCgi::default()` IS cell id 0, and
+    /// `namf_server::ue_ncgi_is_known` treats 0 as "never learned". So "not 0, and equal
+    /// to what the message carried" is exactly the distinction that matters.
+    ///
+    /// Driven through the live `handle_initial_ue_message` with an APER-encoded PDU. The
+    /// registration procedure it dispatches into cannot complete here (no association,
+    /// no UDM), which does not matter: the location is stored on the context BEFORE the
+    /// NAS dispatch, for the same reason it is in `handle_uplink_nas_transport`.
+    ///
+    /// REVERT-VERIFIED: removing the `state.amf_ue.nr_cgi = ...` write at the
+    /// registration site makes this FAIL with `cell_id == 0`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_initial_ue_message_stores_the_cell_identity_it_parsed() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        // The AMF-UE-NGAP-ID is ALLOCATED by the handler from `next_gnb_id`, not chosen
+        // by the test, so it is seeded to a value distinct from the sibling tests'
+        // literals for the shared-key reason recorded on them.
+        let allocated = 7_406_004u64;
+        *ngap.next_gnb_id.lock().await = allocated;
+
+        // The cell and tracking area the gNB reports at registration.
+        let reg_tac = 0x00040Fu32;
+        let reg_cell = 0x0006_6666u64;
+        let pdu = nextgcore_ngap::builder::build_initial_ue_message(
+            &nextgcore_ngap::types::InitialUeMessage {
+                ran_ue_ngap_id: 77,
+                // A minimal REGISTRATION REQUEST: enough for the EPD/type gate at the top
+                // of the handler, which is all this test needs to reach past.
+                nas_pdu: vec![
+                    0x7E,
+                    security_header::PLAIN_NAS_MESSAGE,
+                    message_type::REGISTRATION_REQUEST,
+                    0x09,
+                    0x00,
+                ],
+                user_location_info: test_user_location(reg_tac, reg_cell),
+                rrc_establishment_cause: nextgcore_ngap::types::RrcEstablishmentCause::MoSignalling,
+                ue_context_request: Some(true),
+                allowed_nssai: Vec::new(),
+            },
+        )
+        .expect("encode an InitialUEMessage");
+        let _ = ngap.handle_initial_ue_message(1, &pdu).await;
+
+        let state = ngap
+            .ue_auth_state
+            .get(allocated)
+            .expect("registration must create the UE context");
+        assert_eq!(
+            state.amf_ue.nr_cgi.cell_id, reg_cell,
+            "the InitialUEMessage's nr_cell_identity is parsed already; storing it is \
+             what gives `nr_cgi` a writer on the registration path, so an ncgiList area \
+             can resolve without a handover. 0 means it was logged and dropped (#406)"
+        );
+        assert_eq!(
+            state.amf_ue.nr_cgi.plmn_id,
+            PlmnId::new("001", "01"),
+            "the NR-CGI's own PLMN, which need not equal the TAI's"
+        );
+        // The TAI write is pre-existing; asserted so a future edit cannot swap one for
+        // the other and still pass.
+        assert_eq!(
+            state.amf_ue.nr_tai.tac, reg_tac,
+            "the TAI is still stored at registration too"
         );
     }
 

@@ -783,13 +783,15 @@ fn rfc3339_to_system_time(s: &str) -> Option<std::time::SystemTime> {
 ///   capabilities being *"available in AMF"* (`:22154-22173`) and none are held.
 /// * **`AOIEF`'s filters (`:21630-21707`) are accepted and ignored**, each with its
 ///   reason logged at subscribe time.
-/// * **The SERVICE REQUEST is not a fire point**, because
-///   `ngap_asn1::parse_uplink_nas_transport_asn1` discards the
-///   `UserLocationInformation` the NGAP parser decodes as mandatory — so that path
-///   cannot learn a new location and firing there would report an unchanged verdict as
-///   news, which §5.3.1's change rule (`:4895-4897`) forbids. Filed as **#406**, which
-///   also records that `LOCATION_REPORT` reports a STALE TAI from that site today.
-///   Reasoned in full at the `handle_handover_notify` fire point.
+///
+/// **#406 DELETED a fourth entry from this list rather than rewording it.** It read *"the
+/// SERVICE REQUEST is not a fire point, because
+/// `ngap_asn1::parse_uplink_nas_transport_asn1` discards the `UserLocationInformation`
+/// the NGAP parser decodes as mandatory"*. That parser now keeps the IE and
+/// `ngap_path::handle_uplink_nas_transport` writes both `nr_tai` and `nr_cgi` from it, so
+/// the Service Request is a genuine location-learning moment and fires
+/// `PRESENCE_IN_AOI_REPORT` and `UES_IN_AREA_REPORT` alongside the other two sites. The
+/// premise the ceiling rested on stopped being true, so the ceiling is gone.
 ///
 /// Every one of these is ACCEPTED at the subscription surface rather than refused, for
 /// the reason `group_id` records (#74 criterion 4): the subscription is conformant and
@@ -1956,17 +1958,26 @@ fn ue_tai_is_known(ue: &AmfUe) -> bool {
 
 /// Whether the AMF has genuinely learned this UE's NR cell identity.
 ///
-/// **Narrower than [`ue_tai_is_known`], and that asymmetry is real, not an oversight.**
-/// `AmfUe::nr_cgi` has exactly ONE production writer — `handle_handover_notify`
-/// (`ngap_path.rs:7391-7392`). The registration path parses the InitialUEMessage's
-/// `nr_cell_identity` (`ngap_asn1.rs:326`), logs it, and never stores it; the two writes
-/// in `gmm_handler` (`:154`, `:302`) sit in functions whose only callers are inside
-/// `mod tests`, which is the #397 defect.
+/// **The guard survives #406; its REASON changed.** #400 wrote it because
+/// `AmfUe::nr_cgi` had exactly ONE production writer, `handle_handover_notify`, so a
+/// default cell id meant specifically "this UE has not handed over yet". #406 gave it
+/// four writers — `handle_initial_ue_message` (registration), `handle_uplink_nas_transport`
+/// (every UL NAS message, so the Service Request), `handle_path_switch_request` (Xn
+/// handover) and `handle_handover_notify` (N2 handover) — which is every NGAP message this
+/// tree decodes a `UserLocationInformation` off. So the narrow "only after a handover"
+/// ceiling is gone, and an `ncgiList` area now resolves for a UE that merely registered.
 ///
-/// So a UE that registered but never handed over has a DEFAULT `nr_cgi`, and an
-/// `ncgiList` area must report `UNKNOWN` for it rather than `OUT_OF_AREA`. Reporting
-/// "not in the area" off a field production never wrote is precisely the fabrication
-/// #400 exists to prevent.
+/// What is NOT gone is the check itself, and deleting it along with the ceiling would be
+/// the mistake. A default `cell_id` still means *"never learned"* for any UE that entered
+/// the store by some route other than the NGAP path — a test fixture, or an inter-AMF
+/// context transfer via `amf_ue_publish` — and an `ncgiList` area must report `UNKNOWN`
+/// for such a UE rather than `OUT_OF_AREA`. Reporting "not in the area" off an unwritten
+/// field is precisely the fabrication #400 exists to prevent, and that argument never
+/// depended on which procedure had run.
+///
+/// Still narrower than [`ue_tai_is_known`] in one respect: `nr_cgi` is only ever written
+/// alongside `nr_tai`, never instead of it, so a UE with a known cell always has a known
+/// TAI but not the converse.
 fn ue_ncgi_is_known(ue: &AmfUe) -> bool {
     ue.nr_cgi.cell_id != 0
 }
@@ -10039,24 +10050,37 @@ mod tests {
         server.stop().await.expect("server stop");
     }
 
-    /// An `ncgiList` area reports `UNKNOWN` for a UE that registered but never handed
-    /// over, because `AmfUe::nr_cgi` has exactly ONE production writer.
+    /// An `ncgiList` area reports `UNKNOWN` for a UE whose cell identity the AMF never
+    /// learned, rather than `OUT_OF_AREA`.
     ///
-    /// This is the narrowest and most easily-missed ceiling in #400, and it is a real
-    /// tree fact rather than a spec one: `handle_initial_ue_message` parses the
-    /// InitialUEMessage's `nr_cell_identity` (`ngap_asn1.rs:326`), logs it, and never
-    /// stores it — only `handle_handover_notify` writes `nr_cgi`
-    /// (`ngap_path.rs:7411-7412`). So an NCGI area over a default `nr_cgi` must not
-    /// claim the UE is outside it.
+    /// **#406 RENAMED this test and corrected its premise, keeping its assertions.** As
+    /// #400 wrote it, it was named `..._until_the_cell_identity_is_learned` and reasoned
+    /// from a narrower fact: `AmfUe::nr_cgi` had exactly ONE production writer
+    /// (`handle_handover_notify`), because the registration path parsed the
+    /// InitialUEMessage's `nr_cell_identity` and dropped it, so a default cell id meant
+    /// specifically "no handover yet". #406 gave `nr_cgi` four writers — registration,
+    /// the Uplink NAS Transport, the Xn path switch and the N2 handover notify — so that
+    /// reading has stopped being true and the name asserted something false.
+    ///
+    /// What survives is the rule the test actually checks, which never depended on which
+    /// procedure ran: a DEFAULT `cell_id` means the AMF has not learned the cell, and
+    /// reporting "not in the area" off an unwritten field is the fabrication #400 exists
+    /// to prevent. A UE can still reach the store without a cell — a test fixture, or an
+    /// inter-AMF context transfer through `amf_ue_publish` — which is why
+    /// `ue_ncgi_is_known` stays.
+    ///
+    /// Inverted rather than deleted, per the house rule for a test that pins a value a
+    /// change makes obsolete: the fixture is still a UE with a default `nr_cgi`, but it is
+    /// now described as "never learned" rather than "not handed over yet".
     ///
     /// The contrast is in the same test: with the cell identity present the SAME area
     /// resolves to a real IN/OUT verdict, so this pins the guard rather than an
     /// always-UNKNOWN NCGI path.
     ///
-    /// REVERT-VERIFIED: deleting the `ue_ncgi_is_known` check makes the first assertion
-    /// read `OUT_OF_AREA`.
+    /// REVERT-VERIFIED (re-confirmed after the rename): deleting the `ue_ncgi_is_known`
+    /// check makes the first assertion read `OUT_OF_AREA`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_ncgi_area_reports_unknown_until_the_cell_identity_is_learned() {
+    async fn an_ncgi_area_reports_unknown_for_a_ue_whose_cell_was_never_learned() {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -10064,8 +10088,12 @@ mod tests {
         let mut ue = setup_ue(supi, true, true);
         ue.nr_tai.plmn_id = PlmnId::new("001", "01");
         ue.nr_tai.tac = 0x0404;
-        // The "registered but never handed over" state: `setup_ue` seeds a cell id, so
-        // this reverts it to what the registration path actually leaves behind.
+        // A UE with a TAI but NO cell identity. `setup_ue` seeds a cell id, so this
+        // reverts it to the default. #400 described this as "what the registration path
+        // leaves behind"; since #406 registration DOES store a cell, so the state being
+        // modelled is now a UE published into the store by some other route — a fixture,
+        // or an inter-AMF context transfer — which is exactly the case
+        // `ue_ncgi_is_known` still has to answer for.
         ue.nr_cgi = NrCgi::default();
         {
             let ctx = amf_self();
@@ -10112,13 +10140,14 @@ mod tests {
         assert_eq!(
             v["reportList"][0]["areaList"][0]["presenceInfo"]["presenceState"].as_str(),
             Some("UNKNOWN"),
-            "`nr_cgi` is written ONLY by handle_handover_notify, so a default cell id \
-             means \"never learned\", not \"not in the area\""
+            "a default cell id means \"never learned\", not \"not in the area\" — \
+             reporting OUT_OF_AREA off an unwritten field is a fabricated verdict"
         );
 
-        // Now give the UE the cell identity a handover would have written. The SAME
-        // area must resolve to a real verdict — this is what proves the UNKNOWN above
-        // is the guard and not an unconditional NCGI answer.
+        // Now give the UE a cell identity. The SAME area must resolve to a real verdict —
+        // this is what proves the UNKNOWN above is the guard and not an unconditional
+        // NCGI answer. (Since #406 any of registration, an Uplink NAS Transport, an Xn
+        // path switch or an N2 handover notify would have written it.)
         ue.nr_cgi.plmn_id = PlmnId::new("001", "01");
         ue.nr_cgi.cell_id = 0x0004_0404;
         {
