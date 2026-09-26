@@ -442,11 +442,18 @@ jobs:
       # already has a UDP CLI whose command set (GnbCliCommandType) includes
       # `ue-suspend`, which is exactly the right lever.
       #
-      # STILL BLOCKED, and the three steps below stay `continue-on-error` BECAUSE
-      # OF IT -- but the blocker has now MOVED THREE TIMES, and the distinction
-      # matters to anyone reading a red step here. FOUR nextgsim defects, in
-      # series, each one invisible until the one in front of it was fixed. Three
-      # are fixed and confirmed fixed HERE; the fourth is where we now stand.
+      # PROVEN, AND THESE STEPS NOW BLOCK. Run 36270918151 is the first run in which
+      # the whole chain completed: all 14 links are VERIFIED LIVE and the probe
+      # printed PASS:. The `continue-on-error` tolerance is GONE from all three steps
+      # below, which is what closes #403 -- a step that cannot fail the job is not
+      # coverage.
+      #
+      # It took FIVE nextgsim defects, in series, each one invisible until the one in
+      # front of it was fixed, and each fix revealing the next. All five are now fixed
+      # and every one of them was confirmed HERE, by a dispatched run. Kept in full
+      # below because the SHAPE of this investigation is its most useful lesson: four
+      # consecutive passes predicted "green with no further change" and all four were
+      # wrong, for four different reasons.
       #
       # BLOCKER 1 (discovery) -- FIXED. Run 35882746859 returned:
       #
@@ -504,52 +511,45 @@ jobs:
       # the chain is now live to LINK 9 of
       # specs/prove-service-request-namf-fire-point-e2e.md.
       #
-      # BLOCKER 4, which is what stops us today: THE RESUME IS SENT BUT NEVER
-      # COMPLETES. Stated that way deliberately -- which END is at fault is NOT yet
-      # established, and asserting otherwise is how the previous three passes went
-      # wrong. What is measured: there is no `RRC resume complete`, no Service
-      # Accept, and ~2s later the UE establishes a NEW RRC connection, so the core
-      # sees a SECOND InitialUEMessage with a FRESH ran_ue_ngap_id:
+      # BLOCKER 4 (the resume was sent but never COMPLETED) -- FIXED, and it was the
+      # last one. The UE derived its KgNB from the WRONG NAS COUNT: in
+      # `send_security_mode_complete`, `protect_uplink` (which calls
+      # `increment_uplink_count`) ran BEFORE `derive_kgnb_for_as_security`, so a UE
+      # whose Security Mode Complete went out at COUNT 0 derived at COUNT 1. Measured
+      # with the defect restored:
       #
-      #   Parsed Initial UE Message: ran_ue_ngap_id=1, ...   (the registration)
-      #   Parsed Initial UE Message: ran_ue_ngap_id=2, nas_pdu_len=24, ...
-      #   Unhandled NAS message type 0x8b in Initial UE Message
+      #   UE  KgNB [7e,da,8d,ed,...]   (derived at COUNT 1)
+      #   AMF KgNB [53,05,6a,1e,...]   (derived at COUNT 0)
       #
-      # `0x8b` is not a 5GMM type: it is a CIPHERED byte. The UE NAS-protected the
-      # Service Request (correctly, TS 24.501 §4.4.2) and it rode an
-      # InitialUEMessage, where the AMF holds no context to unwrap it with. So the
-      # symptom at the AMF is UNCHANGED from the previous run even though its CAUSE
-      # has moved one link along -- which is precisely how a reader could mistake
-      # this for "#201 did not work". It did work.
+      # TS 33.501 §6.8.1.1.2.2/.3 require the SMComplete's OWN pre-increment COUNT, so
+      # nextgsim was non-conformant and NEXTGCORE WAS ALREADY CORRECT: the AMF commits
+      # the candidate COUNT reconstructed from the received message's SQN octet
+      # (nas_security.rs, `amf_ue.ul_count = candidate`) and derives from that
+      # (ngap_path.rs). KgNB never crosses the air, so nothing on the wire revealed the
+      # skew; it was LATENT until #202 made K_RRCint the key a resumeMAC-I is verified
+      # with -- the first thing ever to compare the two copies. Filed as nextgsim #203,
+      # FIXED by nextgsim PR #204 (merged, 0cb611b).
       #
-      # WHY THE CAUSE IS NOT NAMED HERE, and what was changed so that it will be:
-      # run 36089664496 captured `docker compose logs gnb` BEFORE sending the
-      # trigger and never re-read it, so the last gNB line it holds is the
-      # suspension itself and the gNB's reaction to the resume is simply absent
-      # from the evidence. That was a defect in THIS step's diagnostics, not a
-      # finding about nextgsim, and it is fixed below: the failure branch now greps
-      # the post-resume gNB log and distinguishes "never arrived" from "arrived and
-      # was refused" from "MAC did not match". Filed as nextgsim #203 with the
-      # UE-side half, which IS conclusive, plus a falsifiable K_RRCint hypothesis.
+      # CONFIRMED LIVE in run 36270918151, the first run to complete the chain:
       #
-      # These steps are therefore SHIPPED BUT NON-BLOCKING, deliberately rather
-      # than deleted or left red: every link up to the resume-completion is now
-      # verified LIVE (the UE registered, got a PDU session, was suspended, went
-      # CM-IDLE, sent a real Service Request, and now sends a real
-      # RRCResumeRequest1; the registration-phase assertion above PASSED). Until
-      # the resume completes they must not report a sibling repo's defect as a
-      # nextgcore regression. The honest status of the SERVICE REQUEST fire point
-      # remains UNPROVEN -- see
-      # specs/prove-service-request-namf-fire-point-e2e.md, which states it.
+      #   Service Accept sent to UE 2 (protected)                  (AMF)
+      #   the UE went CM-IDLE and came back through a real Service Request
       #
-      # READING THIS JOB'S RESULT. `continue-on-error` means the JOB goes green
-      # even when these steps exit 1 -- runs 35957375665, 36045644289 AND
-      # 36089664496 all reported `success` with the drive step and the
-      # probe-verdict step having genuinely FAILED, and `gh run view --job` shows a
-      # green tick beside every step in all three. A green tick on this job does
-      # NOT mean the fire point is proven. Open the step logs and find the step's
-      # own PASS:/FAIL: line. That is exactly why the tolerance must come off the
-      # moment the resume completes end to end.
+      # Note WHICH id that is: `2` is the amf_ue_ngap_id that `ue-list` reported BEFORE
+      # the suspension (`amf_ngap_id: 2`). The return leg therefore used the SURVIVING
+      # NGAP context -- the UplinkNASTransport path -- rather than arriving as a fresh
+      # InitialUEMessage on a new id, which is exactly the distinction that separates a
+      # real pass from the cause-#9 arm. In the four previous runs the second
+      # InitialUEMessage and its `Unhandled NAS message type 0x8b` are both ABSENT here.
+      #
+      # READING THIS JOB'S RESULT. A HISTORICAL WARNING, preserved because the trap is
+      # permanent even though this instance of it is gone. While the tolerance was on,
+      # runs 35957375665, 36045644289 AND 36089664496 each reported conclusion
+      # `success` with a GREEN TICK BESIDE EVERY STEP while the drive step and the
+      # probe-verdict step genuinely exited 1: summary views derive from the tolerated
+      # status, not the exit code. The tolerance is now OFF, so a failure here fails the
+      # job -- but if anyone ever re-adds it, the only trustworthy evidence is the
+      # step's own PASS:/FAIL: line in `gh run view --job <id> --log`.
       #
       # WHY `ue-suspend` AND NOT `ue-release`. This is the trap, and it is the
       # obvious first choice. `ue-release` makes the gNB send a
@@ -580,13 +580,11 @@ jobs:
       # rather than to the callback the probe asserts on.
       # ====================================================================
       - name: "Subscribe the SERVICE REQUEST probe (phase 2, #403)"
-        # Non-blocking until the RRC_INACTIVE resume COMPLETES: `ue-suspend` works
-        # (#197/#198 fixed discovery, #199/#200 gave the CLI registry a production
-        # writer), the UE reaches CM-IDLE, sends a real Service Request, and as of
-        # nextgsim #201/#202 now sends a real `RRCResumeRequest1` -- but the resume
-        # does not complete, so the UE re-establishes and the return leg is still an
-        # InitialUEMessage. Filed as nextgsim #203. See the block comment above.
-        continue-on-error: true
+        # BLOCKING as of run 36270918151, which is the first run in which the whole
+        # chain completed and this step printed PASS:. The tolerance came off with the
+        # FIFTH and last link (nextgsim #203/#204). A failure here is now a real
+        # regression, which is the entire point: a step that cannot fail the job is
+        # not coverage. See the block comment above.
         run: |
           cd nextgcore/docker/rust
           # Port 8403 and not 8397: the registration probe's sink has exited, but
@@ -615,13 +613,10 @@ jobs:
           exit 1
 
       - name: "Drive the REAL UE to CM-IDLE and back through a Service Request (#403)"
-        # Non-blocking until the RRC_INACTIVE resume COMPLETES: `ue-suspend` works
-        # (#197/#198 fixed discovery, #199/#200 gave the CLI registry a production
-        # writer), the UE reaches CM-IDLE, sends a real Service Request, and as of
-        # nextgsim #201/#202 now sends a real `RRCResumeRequest1` -- but the resume
-        # does not complete, so the UE re-establishes and the return leg is still an
-        # InitialUEMessage. Filed as nextgsim #203. See the block comment above.
-        continue-on-error: true
+        # BLOCKING as of run 36270918151: the UE was suspended, went CM-IDLE, resumed
+        # from RRC_INACTIVE and the AMF answered `Service Accept sent to UE 2` -- on the
+        # PRE-SUSPENSION amf_ue_ngap_id, which is what proves the return leg took the
+        # UplinkNASTransport path rather than a fresh InitialUEMessage. See above.
         run: |
           cd nextgcore/docker/rust
           # The PDU session must exist first: the Service Request's Uplink data status
@@ -763,21 +758,21 @@ jobs:
                  data. It reached CM-IDLE, so either the TUN write did not raise \
                  UplinkData or the UE did not consider itself registered."; \
                  tail -100 /tmp/ue.log; exit 1; }
-          # THIS IS THE CURRENT FAILURE POINT (run 36089664496). The UE reaches
-          # CM-IDLE, sends a real Service Request, and -- new in that run, because
-          # nextgsim #201/#202 landed -- sends a real `RRCResumeRequest1`
-          # ("resumeMAC-I=0xc698"). What does NOT happen is the resume COMPLETING:
-          # ~2s later the UE re-establishes, so the return leg is still an
-          # InitialUEMessage with a FRESH ran_ue_ngap_id carrying a NAS-ciphered
-          # Service Request the AMF cannot unwrap ("Unhandled NAS message type
-          # 0x8b"). The AMF-side symptom is therefore UNCHANGED while its cause has
-          # moved one link along, which is precisely why the diagnostic below now
-          # captures the gNB's own reaction rather than inferring it from the UE.
+          # THIS WAS THE FAILURE POINT FOR FOUR CONSECUTIVE RUNS, and it PASSED in run
+          # 36270918151 once nextgsim #203/#204 fixed the UE's KgNB COUNT skew. So a
+          # failure here is now a REGRESSION, not the known gap -- and the whole
+          # diagnostic below is retained precisely for that case: it is what will NAME
+          # the arm instead of leaving the next reader to re-derive it. Each grep
+          # separates outcomes with DIFFERENT owners, which is the point; all six
+          # patterns were checked against the real nextgsim log strings rather than
+          # guessed, because a diagnostic that greps for text nobody emits prints
+          # "(nothing)" and misattributes by silence.
           if ! grep -qF 'Service Accept received' /tmp/ue.log; then
             echo "::error::the UE sent a Service Request but never got a Service \
-                  Accept. Expected while the RRC_INACTIVE resume does not complete: \
-                  the UE returned on an InitialUEMessage instead of an \
-                  UplinkNASTransport and the fire point does not run on that path."
+                  Accept. This PASSED in run 36270918151, so it is a REGRESSION: \
+                  either the resume stopped completing (the UE would return on an \
+                  InitialUEMessage, where the fire point does not run) or the AMF \
+                  stopped answering. The output below names which."
             # PRINT the discriminating lines rather than telling a human to find them:
             # the UE log is dominated by per-SIB DEBUG output, so the one `warn!` that
             # names the cause is invisible in a plain `tail`. `warn!` survives
@@ -836,13 +831,10 @@ jobs:
           echo "the UE went CM-IDLE and came back through a real Service Request"
 
       - name: "Assert the AMF DELIVERED the SERVICE REQUEST Namf notifications (#403)"
-        # Non-blocking until the RRC_INACTIVE resume COMPLETES: `ue-suspend` works
-        # (#197/#198 fixed discovery, #199/#200 gave the CLI registry a production
-        # writer), the UE reaches CM-IDLE, sends a real Service Request, and as of
-        # nextgsim #201/#202 now sends a real `RRCResumeRequest1` -- but the resume
-        # does not complete, so the UE re-establishes and the return leg is still an
-        # InitialUEMessage. Filed as nextgsim #203. See the block comment above.
-        continue-on-error: true
+        # BLOCKING as of run 36270918151, which printed all five body assertions green
+        # (SUPI, `reachability == REACHABLE`, mcc 999 / mnc 70 / tac 0001) with NOTHING
+        # delivered to the negative control. This is the assertion #403 exists to make,
+        # and it can now fail the job. See the block comment above.
         run: |
           cd nextgcore/docker/rust
           for _ in $(seq 1 130); do
