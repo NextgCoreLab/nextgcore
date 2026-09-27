@@ -870,6 +870,7 @@ mod tests {
                 transfer: vec![0xDE, 0xAD],
             }],
             source_to_target_container: vec![0x01, 0x02, 0x03, 0x04],
+            direct_forwarding_path_availability: None,
         };
 
         let bytes = builder::build_handover_required(&msg).unwrap();

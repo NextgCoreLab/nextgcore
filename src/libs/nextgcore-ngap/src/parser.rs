@@ -1652,6 +1652,7 @@ fn parse_handover_required(container: ProtocolIeContainer) -> NgapResult<Handove
     let mut target_id = None;
     let mut pdu_session_list = None;
     let mut source_to_target_container = None;
+    let mut direct_forwarding_path_availability = None;
 
     for field in &container.ies {
         match field.id {
@@ -1666,6 +1667,14 @@ fn parse_handover_required(container: ProtocolIeContainer) -> NgapResult<Handove
             }
             _ if field.id.0 == ie::IE_ID_HANDOVER_TYPE => {
                 handover_type = Some(ie::decode_handover_type(field)?);
+            }
+            // #408: the source NG-RAN's own statement about direct forwarding. Before this
+            // arm the IE fell into `handle_unknown_ie` below and was DISCARDED, so the AMF's
+            // inter-system forwarding decision had no input at all -- while mmed has read the
+            // S1AP equivalent since #48. One core, two nodes, and only the EPS one kept it.
+            _ if field.id.0 == ie::IE_ID_DIRECT_FORWARDING_PATH_AVAILABILITY => {
+                direct_forwarding_path_availability =
+                    ie::decode_direct_forwarding_path_availability(field);
             }
             _ if field.id.0 == ie::IE_ID_TARGET_ID => {
                 target_id = Some(ie::decode_target_id(field)?);
@@ -1711,6 +1720,9 @@ fn parse_handover_required(container: ProtocolIeContainer) -> NgapResult<Handove
                 ie_id: ie::IE_ID_SOURCE_TO_TARGET_TRANSPARENT_CONTAINER,
             },
         )?,
+        // Optional, and `None` is a STATEMENT: the IE's single enumerated value means the
+        // path IS available, so its absence means it is not (TS 23.502 §4.11.1.2.1 step 1).
+        direct_forwarding_path_availability,
     })
 }
 

@@ -25,8 +25,9 @@
 use crate::context::{EpsGuti, MmeUe};
 use bytes::{BufMut, Bytes, BytesMut};
 use nextgcore_gtp::v2::{
-    Gtp2CauseIe, Gtp2FTeidIe, Gtp2Header, Gtp2Ie, Gtp2IeType, Gtp2IndicationIe, Gtp2Message,
-    Gtp2MessageType, Gtp2MmContextIe, Gtp2PdnConnectionIe, Gtp2RatTypeIe,
+    Gtp2BearerContextIe, Gtp2CauseIe, Gtp2FTeidIe, Gtp2Header, Gtp2Ie, Gtp2IeType,
+    Gtp2IndicationIe, Gtp2Message, Gtp2MessageType, Gtp2MmContextIe, Gtp2PdnConnectionIe,
+    Gtp2RatTypeIe,
 };
 
 /// F-TEID interface type `S10/N26 MME GTP-C`.
@@ -64,6 +65,21 @@ pub const CAUSE_IMSI_IMEI_NOT_KNOWN: u8 = 92;
 
 /// GTPv2-C cause `Request rejected` (TS 29.274 Table 8.4-1).
 pub const CAUSE_REQUEST_REJECTED: u8 = 94;
+
+/// GTPv2-C cause `Relocation failure` (TS 29.274 Table 8.4-1), #408.
+///
+/// §7.3.2 (`29274-j60.txt:19133-19136`) names it as the Forward Relocation Response's
+/// message-specific cause: *"The relocation has not been accepted by the target MME/SGSN/AMF if
+/// the Cause IE value differs from 'Request accepted'. Possible Cause values are specified in
+/// Table 8.4-1. Message specific cause values are: - 'Relocation failure'."* Specific rather
+/// than the generic `Request rejected`, because it tells the source AMF the relocation itself
+/// failed rather than that the request was malformed — and those lead an operator to different
+/// places.
+///
+/// **81**, read off its own Table 8.4-1 row (`29274-j60.txt:25480`), not counted to from a
+/// neighbour — row 75 is *"Syntactic error in the TFT operation"* and an early draft of this
+/// constant had it (#401's lesson).
+pub const CAUSE_RELOCATION_FAILURE: u8 = 81;
 
 /// Build a **Context Request** (TS 29.274 §7.3.5, message type 130).
 ///
@@ -466,6 +482,245 @@ pub fn transferred_pdn_connection(
     })
 }
 
+// ============================================================================
+// Forward Relocation (#408) — the MME as the TARGET of a 5GS→EPS handover
+// ============================================================================
+
+/// Instance of the `SGW/UPF F-TEID for DL data forwarding` in a Forward Relocation Response's
+/// Bearer Context (Table 7.3.2-2, `29274-j60.txt:19461`).
+///
+/// **2**, and that is the only one of the table's six F-TEID instances applicable to an
+/// inter-system move: instance 0 is the eNB/gNB DL endpoint (*"included during a 4G to 5G
+/// handover"*, i.e. the other direction), 1 and 5 are *"during the intra-EUTRAN HO"*, 3 and 4 are
+/// an SGSN's. Writing the endpoint at the wrong instance would produce a well-formed message the
+/// AMF reads as a different procedure's endpoint.
+pub const FR_INSTANCE_FORWARDING_FTEID: u8 = 2;
+
+/// What an MME learns from a **Forward Relocation Request** (TS 29.274 §7.3.1), #408.
+///
+/// The connected-mode counterpart of [`ContextResponseData`]: the same MM Context and PDN
+/// Connections, plus the handover-only members. The two are separate types rather than one with
+/// optional fields, because Table 7.3.1-1 and Table 7.3.6-1 differ in **presence** as well as
+/// content — the MM Context is **M** here and **C** there — and one type would make that
+/// distinction unrepresentable.
+#[derive(Debug, Clone, Default)]
+pub struct ForwardRelocationRequestData {
+    /// IMSI, BCD-decoded (conditional, `29274-j60.txt:17786`).
+    pub imsi_bcd: Option<String>,
+    /// The source AMF's own control-plane F-TEID (**mandatory**, `:17797`).
+    ///
+    /// Every later message of the procedure is addressed to this TEID, so a request without one
+    /// describes a relocation the MME cannot answer.
+    pub sender_fteid: Option<Gtp2FTeidIe>,
+    /// The UE's MM context, i.e. its mapped EPS security context (**mandatory**, `:17871`).
+    ///
+    /// Mandatory here, unlike §7.3.6's conditional one — so `None` makes the request malformed
+    /// rather than merely unhelpful.
+    pub mm_context: Option<Gtp2MmContextIe>,
+    /// The UE's EPS PDN connections, one per transferable PDU session (`:17801`).
+    pub pdn_connections: Vec<Gtp2PdnConnectionIe>,
+    /// The **Source-to-Target** transparent container (`:17995`), F-Container instance 0.
+    ///
+    /// Relayed into the S1AP HANDOVER REQUEST byte for byte.
+    pub source_to_target_container: Option<Vec<u8>>,
+    /// The Target Identification (`:18029`), naming the target eNB.
+    pub target_identification: Option<Vec<u8>>,
+    /// Whether the source set the **Direct Forwarding Indication** (`:17874`, §8.12 bit 5).
+    ///
+    /// `false` when the Indication IE is absent, which is the normal case from this tree's AMF:
+    /// `amfd::n26_build::forward_relocation_indication` returns `None` and explains why. So
+    /// this MME establishes **no** indirect forwarding tunnel for such a request, and its
+    /// Forward Relocation Response carries no instance-2 F-TEID — which is consistent rather
+    /// than a second ceiling, because Table 7.3.2-2 conditions that IE on forwarding applying.
+    pub direct_forwarding: bool,
+}
+
+/// Parse a **Forward Relocation Request** (TS 29.274 §7.3.1, message type 133), #408.
+///
+/// Strict about both mandatory IEs and tolerant of the conditional ones. A request with no MM
+/// Context is an **error**, not a context with no security: Table 7.3.1-1 marks it **M**
+/// (`29274-j60.txt:17871`), and installing the bearers without it would give the UE bearers it
+/// cannot integrity-protect any NAS message to use.
+pub fn parse_forward_relocation_request(
+    msg: &Gtp2Message,
+) -> Result<ForwardRelocationRequestData, String> {
+    let sender_fteid = msg
+        .get_ie(Gtp2IeType::FTeid as u8, 0)
+        .and_then(|ie| Gtp2FTeidIe::decode(&ie.value).ok());
+    if sender_fteid.is_none() {
+        return Err(
+            "Forward Relocation Request has no Sender's F-TEID for Control Plane, which Table \
+             7.3.1-1 makes MANDATORY (29274-j60.txt:17797); without it no message of this \
+             procedure can be addressed back to the source AMF"
+                .to_string(),
+        );
+    }
+
+    let mm_context = match msg.get_ie(Gtp2IeType::MmContext as u8, 0) {
+        Some(ie) => Some(Gtp2MmContextIe::decode(&ie.value).map_err(|e| {
+            format!(
+                "Forward Relocation Request carries an MM Context this MME cannot decode ({e}); \
+                 it is MANDATORY (29274-j60.txt:17871) so this is an error rather than a \
+                 transfer without security -- typically a Security Mode this build does not \
+                 implement"
+            )
+        })?),
+        None => {
+            return Err(
+                "Forward Relocation Request has no MM Context, which Table 7.3.1-1 makes \
+                 MANDATORY (29274-j60.txt:17871) -- unlike the CONDITIONAL one of a Context \
+                 Response. Installing the bearers without it would give the UE bearers it \
+                 cannot integrity-protect any NAS message to use."
+                    .to_string(),
+            )
+        }
+    };
+
+    let mut pdn_connections = Vec::new();
+    for ie in msg.get_ies(Gtp2IeType::PdnConnection as u8) {
+        match Gtp2PdnConnectionIe::decode(&ie.value) {
+            Ok(pdn) => pdn_connections.push(pdn),
+            Err(e) => log::warn!("N26 Forward Relocation Request PDN Connection unparsable: {e}"),
+        }
+    }
+
+    // §8.12 bit 5 is DFI (`29274-j60.txt:25930-25933`): *"If this bit is set to 1, it shall
+    // indicate that direct data forwarding applies between the source RAN and the target RAN
+    // [...] during an inter-system handover between 5GS and EPS."* An ABSENT Indication IE means
+    // the flag is clear, which is a statement -- Table 7.3.1-1 includes the IE only *"if any one
+    // of the applicable flags [is] set to 1"*.
+    let direct_forwarding = msg
+        .get_ie(Gtp2IeType::Indication as u8, 0)
+        .and_then(|ie| Gtp2IndicationIe::decode(&ie.value).ok())
+        .is_some_and(|ind| ind.dfi);
+
+    Ok(ForwardRelocationRequestData {
+        imsi_bcd: msg
+            .get_ie(Gtp2IeType::Imsi as u8, 0)
+            .map(|ie| bcd_to_string(&ie.value)),
+        sender_fteid,
+        mm_context,
+        pdn_connections,
+        // F-Container instance 0 is the E-UTRAN Transparent Container, i.e. the Source-to-Target
+        // one in this direction. Instance 1 would be UTRAN's and 2 a BSS container.
+        source_to_target_container: msg
+            .get_ie(Gtp2IeType::FContainer as u8, 0)
+            .map(|ie| ie.value.to_vec()),
+        target_identification: msg
+            .get_ie(Gtp2IeType::TargetIdentification as u8, 0)
+            .map(|ie| ie.value.to_vec()),
+        direct_forwarding,
+    })
+}
+
+/// Build a **Forward Relocation Response** (TS 29.274 §7.3.2, message type 134), #408.
+///
+/// # IEs, each against its Table 7.3.2-1 row
+///
+/// | IE | P | line |
+/// |---|---|---|
+/// | Cause (2/0) | **M** | `29274-j60.txt:19145` |
+/// | Sender's F-TEID for Control Plane (87/0) | C — *"If the Cause IE contains the value 'Request accepted'"* | `:19147` |
+/// | List of Set-up Bearers (93/**0**) | C — *"shall contain the EPS bearer [identifiers]"* | `:19167` |
+/// | E-UTRAN Transparent Container (118/0) | C — the **Target-to-Source** container | `:19258` |
+///
+/// # The Bearer Contexts follow Table 7.3.2-2, not Table 7.3.1-3
+///
+/// §7.3.2 (`29274-j60.txt:19396-19397`) says so and says why: *"Bearer Context IE in this
+/// message is specified in Table 7.3.2-2, **the source system shall use this IE for data
+/// forwarding in handover**"*. That is a different member list from the request's — an EBI plus
+/// up to six instance-keyed forwarding F-TEIDs, with no QoS and no PGW endpoint — so reusing
+/// Table 7.3.1-3's shape here would send the AMF a bearer description for the wrong table.
+///
+/// `forwarding_fteid` is `Some` only when this MME actually established an indirect forwarding
+/// tunnel, which it does only when the source asked (DFI set). Table 7.3.2-2 conditions the
+/// instance-2 IE on *"using indirect data forwarding during [...] a 5GS to EPS handover"*
+/// (`:19461-19468`), so offering one unasked would have the source AMF relay an endpoint to a
+/// gNB that was never told to forward.
+pub fn build_forward_relocation_response(
+    sequence_number: u32,
+    amf_teid: u32,
+    cause: u8,
+    local_fteid: Option<&Gtp2FTeidIe>,
+    set_up_bearers: &[(u8, Option<Gtp2FTeidIe>)],
+    target_to_source_container: &[u8],
+) -> Gtp2Message {
+    let header = Gtp2Header::new(
+        Gtp2MessageType::ForwardRelocationResponse as u8,
+        amf_teid,
+        sequence_number,
+    );
+    let mut msg = Gtp2Message::new(header);
+
+    // Cause (M).
+    msg.add_ie(Gtp2CauseIe::new(cause).to_ie(0));
+
+    // Sender's F-TEID (C): only on acceptance, which is what the row conditions it on. Sending
+    // one with a refusal would offer the AMF an endpoint for a procedure just declined.
+    if cause == CAUSE_REQUEST_ACCEPTED {
+        if let Some(fteid) = local_fteid {
+            msg.add_ie(fteid.to_ie(0));
+        }
+    }
+
+    // List of Set-up Bearers (C) at instance 0, one Bearer Context each per Table 7.3.2-2.
+    for (ebi, forwarding_fteid) in set_up_bearers {
+        let mut bearer = Gtp2BearerContextIe::new();
+        bearer.set_ebi(*ebi);
+        if let Some(fteid) = forwarding_fteid {
+            bearer.set_fteid(FR_INSTANCE_FORWARDING_FTEID, fteid);
+        }
+        msg.add_ie(bearer.to_ie(0));
+    }
+
+    // E-UTRAN Transparent Container (C) at instance 0: the Target-to-Source container the target
+    // eNB produced, relayed VERBATIM. TS 38.413 §9.3.1.21 has the AMF pass it straight to the
+    // source gNB, so any re-encoding here would corrupt what the gNB decodes.
+    if !target_to_source_container.is_empty() {
+        msg.add_ie(Gtp2Ie::new(
+            Gtp2IeType::FContainer as u8,
+            0,
+            Bytes::copy_from_slice(target_to_source_container),
+        ));
+    }
+
+    msg
+}
+
+/// Build a **Forward Relocation Complete Notification** (TS 29.274 §7.3.3, type 135), #408.
+///
+/// # Production caller
+///
+/// [`crate::n26_path::notify_forward_relocation_complete`], reached from
+/// `s1ap_handler::handle_handover_notify` — the live S1AP path that fires when the target eNB
+/// reports the UE has arrived. Stated here because a builder with only a test caller is the
+/// "correct but unreachable" defect this tree keeps growing, and the first draft of this
+/// function had exactly that.
+///
+/// Sent by this MME as the **target** once the UE has arrived: §7.3.3 (`29274-j60.txt:19493-19495`)
+/// — *"shall be sent to the source MME/SGSN/AMF to indicate the handover has been successfully
+/// finished"*. TS 23.502 §4.11.1.2.1 step 12d then has the source AMF answer and start the timer
+/// that releases its NG-RAN resources, so an MME that never sends this leaves the source gNB
+/// holding radio resources for a UE that has left.
+///
+/// Table 7.3.3-1 (`:19500`) has **no mandatory IE**: only a conditional `Indication Flags` and a
+/// `Private Extension`. None of the Indication's three flags applies here — ISRAI needs ISR
+/// (an EPS/GPRS idle-mode feature this core does not implement), `Notify Source eNB Indication`
+/// is set only when *"the target MME receives this indication in the Handover Notify from the
+/// target eNodeB"* and S1AP's HandoverNotify carries no such IE, and the IWK-SCEF flag names a
+/// node this core has no interface to. So this is a header and nothing else, which is conformant
+/// rather than incomplete.
+pub fn build_forward_relocation_complete_notification(
+    sequence_number: u32,
+    amf_teid: u32,
+) -> Gtp2Message {
+    Gtp2Message::new(Gtp2Header::new(
+        Gtp2MessageType::ForwardRelocationCompleteNotification as u8,
+        amf_teid,
+        sequence_number,
+    ))
+}
+
 /// Apply a decoded MM Context to a UE's EPS security context (TS 33.501 §8.6.1).
 ///
 /// Takes `&mut MmeUe` so the caller must already hold the pool write lock — the write-back
@@ -764,6 +1019,313 @@ mod tests {
         assert!(
             err.contains("Cause"),
             "the error must name the missing mandatory IE, got {err:?}"
+        );
+    }
+
+    /// **#408**: a Forward Relocation Request with no MM Context is an ERROR, not a transfer
+    /// without security — and neither is one with no Sender's F-TEID.
+    ///
+    /// Both are **M** in Table 7.3.1-1 where §7.3.6's equivalents are merely conditional, and
+    /// that difference is the whole reason `ForwardRelocationRequestData` is a separate type
+    /// from `ContextResponseData` rather than the same one with different optional fields.
+    #[test]
+    fn a_forward_relocation_request_missing_a_mandatory_ie_is_refused() {
+        // No Sender's F-TEID: the request cannot be answered at all.
+        let mut no_fteid = Gtp2Message::new(Gtp2Header::new(
+            Gtp2MessageType::ForwardRelocationRequest as u8,
+            0,
+            1,
+        ));
+        no_fteid.add_ie(
+            Gtp2MmContextIe {
+                kasme: [0x74; 32],
+                ..Default::default()
+            }
+            .to_ie(0),
+        );
+        let err = parse_forward_relocation_request(&no_fteid)
+            .expect_err("no Sender's F-TEID must not parse");
+        assert!(
+            err.contains("Sender's F-TEID"),
+            "the error must name the missing MANDATORY IE (Table 7.3.1-1, \
+             29274-j60.txt:17797), got {err:?}"
+        );
+
+        // No MM Context: mandatory here, unlike in a Context Response.
+        let mut no_mm = Gtp2Message::new(Gtp2Header::new(
+            Gtp2MessageType::ForwardRelocationRequest as u8,
+            0,
+            2,
+        ));
+        no_mm.add_ie(Gtp2FTeidIe::new_ipv4(N26_AMF_GTP_C, 0x408, [10, 4, 8, 1]).to_ie(0));
+        let err =
+            parse_forward_relocation_request(&no_mm).expect_err("no MM Context must not parse");
+        assert!(
+            err.contains("MM Context"),
+            "the error must name the missing MM Context, which Table 7.3.1-1 makes MANDATORY \
+             (29274-j60.txt:17871) -- unlike §7.3.6's CONDITIONAL one. Installing the bearers \
+             without it would give the UE bearers it cannot integrity-protect any NAS message \
+             to use. Got {err:?}"
+        );
+
+        // With both present it parses, so the assertions above are about the IEs rather than
+        // about the parser never succeeding.
+        let mut good = Gtp2Message::new(Gtp2Header::new(
+            Gtp2MessageType::ForwardRelocationRequest as u8,
+            0,
+            3,
+        ));
+        good.add_ie(Gtp2FTeidIe::new_ipv4(N26_AMF_GTP_C, 0x408, [10, 4, 8, 1]).to_ie(0));
+        good.add_ie(
+            Gtp2MmContextIe {
+                kasme: [0x74; 32],
+                ..Default::default()
+            }
+            .to_ie(0),
+        );
+        let data = parse_forward_relocation_request(&good).expect("both mandatory IEs present");
+        assert_eq!(data.sender_fteid.as_ref().map(|f| f.teid), Some(0x408));
+        assert!(data.mm_context.is_some());
+        assert!(
+            !data.direct_forwarding,
+            "an ABSENT Indication IE must read as DFI clear: Table 7.3.1-1 includes the IE only \
+             'if any one of the applicable flags [is] set to 1' (29274-j60.txt:17874), so \
+             absence is the source saying it wants no forwarding"
+        );
+    }
+
+    /// **#408**: the Direct Forwarding Indication is read from §8.12 **bit 5**, and no
+    /// neighbouring flag reads as it.
+    ///
+    /// The Indication IE packs 24 flags into three octets, so an off-by-one bit here reads a
+    /// different flag entirely — `HI` (bit 6), `OI` (bit 4) or `DTF` (bit 7) — each of which
+    /// means something unrelated and each of which a node acts on. A round trip cannot see it.
+    #[test]
+    fn direct_forwarding_indication_is_read_from_ts29274_8_12_bit_5() {
+        fn request_with(indication: Gtp2IndicationIe) -> Gtp2Message {
+            let mut msg = Gtp2Message::new(Gtp2Header::new(
+                Gtp2MessageType::ForwardRelocationRequest as u8,
+                0,
+                1,
+            ));
+            msg.add_ie(Gtp2FTeidIe::new_ipv4(N26_AMF_GTP_C, 0x408, [10, 4, 8, 1]).to_ie(0));
+            msg.add_ie(
+                Gtp2MmContextIe {
+                    kasme: [0x74; 32],
+                    ..Default::default()
+                }
+                .to_ie(0),
+            );
+            let mut value = BytesMut::new();
+            indication.encode(&mut value, 0);
+            let mut bytes = value.freeze();
+            if let Ok(ie) = Gtp2Ie::decode(&mut bytes) {
+                msg.add_ie(ie);
+            }
+            msg
+        }
+
+        // DFI set: direct forwarding applies.
+        let with_dfi = request_with(Gtp2IndicationIe {
+            dfi: true,
+            ..Default::default()
+        });
+        assert!(
+            parse_forward_relocation_request(&with_dfi)
+                .expect("parses")
+                .direct_forwarding,
+            "DFI set must read as direct forwarding applying: §8.12 bit 5 \
+             (29274-j60.txt:25930-25933) says 'If this bit is set to 1, it shall indicate that \
+             direct data forwarding applies between the source RAN and the target RAN [...] \
+             during an inter-system handover between 5GS and EPS'"
+        );
+
+        // The NEIGHBOURING flags must NOT read as DFI. This is the assertion an off-by-one bit
+        // fails, and each neighbour means something a node would act on.
+        for (label, indication) in [
+            (
+                "HI (bit 6, Handover Indication)",
+                Gtp2IndicationIe {
+                    hi: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "OI (bit 4, Operation Indication)",
+                Gtp2IndicationIe {
+                    oi: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "DTF (bit 7, Direct Tunnel Flag)",
+                Gtp2IndicationIe {
+                    dtf: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "MSV (octet 6 bit 1, the flag #347's Context Request uses)",
+                Gtp2IndicationIe {
+                    msv: true,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            assert!(
+                !parse_forward_relocation_request(&request_with(indication))
+                    .expect("parses")
+                    .direct_forwarding,
+                "{label} must NOT read as DFI: the Indication IE packs 24 flags into three \
+                 octets, so an off-by-one bit reads a different flag that means something else \
+                 entirely -- and no round trip can tell them apart"
+            );
+        }
+    }
+
+    /// **#408**: a Forward Relocation Response carries its Table 7.3.2-1 IEs, with the Bearer
+    /// Contexts following **Table 7.3.2-2**, and offers a Sender's F-TEID only on acceptance.
+    #[test]
+    fn forward_relocation_response_carries_its_table_7_3_2_1_ies() {
+        let local = Gtp2FTeidIe::new_ipv4(S10_N26_MME_GTP_C, 0x0408_2001, [10, 4, 8, 2]);
+        let forwarding = Gtp2FTeidIe::new_ipv4(1, 0x0408_2002, [10, 4, 8, 3]);
+
+        let accepted = build_forward_relocation_response(
+            0x408,
+            0x0408_AAAA,
+            CAUSE_REQUEST_ACCEPTED,
+            Some(&local),
+            &[(5, Some(forwarding.clone())), (6, None)],
+            &[0xF4, 0x08],
+        );
+
+        assert_eq!(
+            accepted.header.message_type, 134,
+            "Forward Relocation Response is message type 134 (29274-j60.txt:2425)"
+        );
+        assert_eq!(
+            accepted.header.teid,
+            Some(0x0408_AAAA),
+            "the response must be addressed to the AMF's Sender's F-TEID from the request, or \
+             it lands on no UE context at the source"
+        );
+
+        // Cause (M).
+        let cause = Gtp2CauseIe::decode(
+            &accepted
+                .get_ie(Gtp2IeType::Cause as u8, 0)
+                .expect("Cause is MANDATORY (29274-j60.txt:19145)")
+                .value,
+        )
+        .expect("decodes");
+        assert_eq!(cause.cause, CAUSE_REQUEST_ACCEPTED);
+
+        // Sender's F-TEID (C) at instance 0, present because the Cause is acceptance.
+        let sender = Gtp2FTeidIe::decode(
+            &accepted
+                .get_ie(Gtp2IeType::FTeid as u8, 0)
+                .expect("the Sender's F-TEID is required when accepting (:19147)")
+                .value,
+        )
+        .expect("decodes");
+        assert_eq!(sender.interface_type, S10_N26_MME_GTP_C);
+        assert_eq!(sender.teid, 0x0408_2001);
+
+        // List of Set-up Bearers: Bearer Context at instance 0, Table 7.3.2-2 shape.
+        let bearers = accepted.get_ies(Gtp2IeType::BearerContext as u8);
+        assert_eq!(bearers.len(), 2);
+        assert!(
+            bearers.iter().all(|ie| ie.instance == 0),
+            "the List of Set-up Bearers is Bearer Context at instance 0 \
+             (29274-j60.txt:19167); instance 1 is the UTRAN RAB list and 2 the PFC list, so \
+             numbering them 0,1 would report a bearer as a RAB"
+        );
+        let first = Gtp2BearerContextIe::decode(&bearers[0].value).expect("decodes");
+        assert_eq!(first.ebi().unwrap(), 5);
+        assert_eq!(
+            first
+                .fteid(FR_INSTANCE_FORWARDING_FTEID)
+                .expect("decodes")
+                .expect("the forwarding endpoint must be at instance 2")
+                .teid,
+            0x0408_2002,
+            "the SGW/UPF F-TEID for DL data forwarding is instance 2 (Table 7.3.2-2, \
+             29274-j60.txt:19461). Instance 0 is the eNB/gNB DL endpoint, conditioned on 'a 4G \
+             to 5G handover' -- the OTHER direction."
+        );
+        assert!(
+            first.fteid(0).expect("decodes").is_none(),
+            "and instance 0 must be EMPTY: writing the forwarding endpoint there would have the \
+             source AMF read it as the other direction's eNB endpoint"
+        );
+        let second = Gtp2BearerContextIe::decode(&bearers[1].value).expect("decodes");
+        assert_eq!(second.ebi().unwrap(), 6);
+        assert!(
+            second
+                .fteid(FR_INSTANCE_FORWARDING_FTEID)
+                .expect("decodes")
+                .is_none(),
+            "a bearer set up without forwarding must carry NO instance-2 F-TEID rather than a \
+             zero-valued one the AMF might relay"
+        );
+
+        // Target-to-Source container, F-Container instance 0.
+        assert_eq!(
+            accepted
+                .get_ie(Gtp2IeType::FContainer as u8, 0)
+                .expect("F-Container IE")
+                .value
+                .as_ref(),
+            &[0xF4, 0x08],
+            "the target eNB's Target-to-Source container must travel verbatim: TS 38.413 \
+             §9.3.1.21 has the source AMF relay it straight to the source gNB"
+        );
+
+        // A REFUSAL carries the Cause and NOT a Sender's F-TEID: Table 7.3.2-1 conditions that
+        // IE on 'Request accepted', so offering one with a refusal would hand the AMF an
+        // endpoint for a procedure just declined.
+        let refused = build_forward_relocation_response(
+            0x409,
+            0x0408_AAAA,
+            CAUSE_RELOCATION_FAILURE,
+            Some(&local),
+            &[],
+            &[],
+        );
+        assert!(
+            refused.get_ie(Gtp2IeType::FTeid as u8, 0).is_none(),
+            "a refusal must carry NO Sender's F-TEID: Table 7.3.2-1 conditions it on the Cause \
+             being 'Request accepted' (29274-j60.txt:19147)"
+        );
+        assert!(
+            refused.get_ie(Gtp2IeType::BearerContext as u8, 0).is_none(),
+            "and no set-up bearers either -- nothing was set up"
+        );
+        assert_eq!(
+            Gtp2CauseIe::decode(&refused.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+                .unwrap()
+                .cause,
+            CAUSE_RELOCATION_FAILURE
+        );
+        assert_eq!(
+            CAUSE_RELOCATION_FAILURE, 81,
+            "'Relocation failure' is cause 81, read off its OWN Table 8.4-1 row \
+             (29274-j60.txt:25480). Row 75 is 'Syntactic error in the TFT operation' -- an \
+             early draft of this constant had 75, and reading the row rather than counting to \
+             it is #401's lesson."
+        );
+
+        // The Complete Notification: a header and nothing else, which Table 7.3.3-1 permits.
+        let notify = build_forward_relocation_complete_notification(0x40A, 0x0408_BBBB);
+        assert_eq!(
+            notify.header.message_type, 135,
+            "Forward Relocation Complete Notification is type 135 (29274-j60.txt:2428)"
+        );
+        assert_eq!(notify.header.teid, Some(0x0408_BBBB));
+        assert!(
+            notify.get_ie(Gtp2IeType::Indication as u8, 0).is_none(),
+            "Table 7.3.3-1 has NO mandatory IE and includes the Indication only 'if any of the \
+             flags are set to 1' (29274-j60.txt:19505). None of its three applies to this core."
         );
     }
 

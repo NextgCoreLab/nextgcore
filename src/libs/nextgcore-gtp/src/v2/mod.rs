@@ -30,7 +30,8 @@ pub use ie::{
     Gtp2AmbrIe, Gtp2ApnIe, Gtp2ApnRestrictionIe, Gtp2BearerContextIe, Gtp2BearerQosIe, Gtp2EbiIe,
     Gtp2FTeidIe, Gtp2Ie, Gtp2IeType, Gtp2IndicationIe, Gtp2MmContextIe, Gtp2PaaIe,
     Gtp2PdnConnectionIe, Gtp2PdnTypeIe, Gtp2RatTypeIe, Gtp2RecoveryIe, Gtp2SelectionModeIe,
-    Gtp2ServingNetworkIe, Gtp2UliIe, MM_CONTEXT_KASME_LEN, MM_CONTEXT_SECURITY_MODE_EPS,
+    Gtp2ServingNetworkIe, Gtp2UliIe, MM_CONTEXT_KASME_LEN, MM_CONTEXT_NCC_AT_HANDOVER,
+    MM_CONTEXT_NH_LEN, MM_CONTEXT_SECURITY_MODE_EPS,
 };
 // Note: Gtp2CauseIe is in ie module, types module has a different Gtp2CauseIe
 pub use ie::Gtp2CauseIe;

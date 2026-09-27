@@ -4354,26 +4354,41 @@ fn apply_ue_context_json(ue: &mut AmfUe, ue_context: &Value) -> Option<String> {
 /// endpoints would point a live user plane at an address nobody supplied, which is
 /// strictly worse than a session recorded and a logged omission.
 ///
-/// # #347 changed the premise but not the conclusion
+/// # The premise has changed TWICE, and the current reason is smfd-side
 ///
-/// #398 wrote this ceiling as "this AMF has no N26 leg at all", citing
-/// `gmm_build.rs`'s constant `Iwk26::WithoutN26Supported`. **That premise is now false**:
-/// #347 built the N26 endpoint (`n26_path`) and made `iwk_n26_posture` follow a runtime
-/// switch, so an AMF with the leg enabled advertises `N26Supported`.
+/// #398 wrote this ceiling as "this AMF has no N26 leg at all". #347 falsified that by
+/// building the N26 endpoint, and restated the ceiling as "the Forward Relocation consumer is
+/// #408". **#408 landed that consumer** — `n26_path::handle_forward_relocation_response` and
+/// `n26_build::parse_forward_relocation_response` exist and are reached from the N26 receive
+/// loop — so that restatement is now false too.
 ///
-/// The ceiling nevertheless stands, for a reason that is about *direction* rather than
-/// about the interface existing:
+/// The gap is still open, and the reason is no longer about N26 at all. #408's enumeration
+/// found three things, each pinned:
 ///
-/// - `/relocate` is the **EPS→5GS** direction, where this AMF is the *target* and needs the
-///   MME's control-plane address and TEID per PDU session. Those arrive in a **Forward
-///   Relocation Request** (GTPv2-C type 133), which #347 deliberately split out as **#408**
-///   — its encoder exists in `nextgcore-gtp` but no procedure consumes it.
-/// - #347 implemented the **5GS→EPS idle-mode** direction, where this AMF is the *source*
-///   and supplies endpoints rather than consuming them.
+/// 1. **The clause names a different operation.** TS 23.502 §4.11.1.2.2.2 **step 4**
+///    (`23502-k20.txt:21384-21391`): *"The initial AMF invokes the
+///    **Nsmf_PDUSession_CreateSMContext** service operation (UE EPS PDN Connection, initial
+///    AMF ID, data Forwarding information, Target ID) [...] and indicates HO Preparation
+///    Indication"*. `UpdateSMContext` appears in this direction only at execution step 7
+///    (`:21747-21752`), carrying a *"Handover Complete Indication"* — a completion signal that
+///    carries no endpoints.
+/// 2. **The endpoints do not arrive in the binary part.** TS 29.518 §5.2.2.2.5.1
+///    (`29518-k00.txt:2953-2958`) has *"the NF Service Consumer shall carry per PDU session
+///    [...] the MME Control Plane Address and the TEID **in the request**"* — as members of
+///    `UeContextRelocateData`, put there by the *initial* AMF, which already decoded the
+///    Forward Relocation Request. And that schema (`TS29518_Namf_Communication.yaml:3717-3746`)
+///    has no member for them at all; they ride inside `ueContext`.
+/// 3. **The SMF cannot consume them.** `handle_sm_context_create`
+///    (`smfd/src/main.rs:2941`) reads no `ueEpsPdnConnection`, no `epsBearerContext` and no HO
+///    Preparation Indication. smfd *produces* that container (`build_ue_eps_pdn_connection`,
+///    `main.rs:5706`, from #78) and has never consumed one. So a perfectly-built call from
+///    here would be answered by an SMF that ignores the endpoints — not "correct but
+///    unreachable" but its mirror, **reachable but inert**.
 ///
-/// So: the N26 transport and codec now exist, idle-mode context transfer works outbound,
-/// and `/relocate` still cannot move N3 tunnels until **#408** lands the Forward Relocation
-/// consumer.
+/// So the honest statement: the N26 transport, both codecs, idle-mode context transfer
+/// (#347) and the connected-mode Forward Relocation procedure (#408) all exist, and
+/// `/relocate` still cannot move N3 tunnels because the SMF-side `CreateSMContext` consumer
+/// does not. That is **#415**, which is an smfd-shaped piece of work.
 fn record_transferred_sessions(ue_id: u64, ue_context: &Value, ue_context_id: &str) -> usize {
     let Some(sessions) = ue_context
         .get("sessionContextList")
@@ -4420,11 +4435,14 @@ fn record_transferred_sessions(ue_id: u64, ue_context: &Value, ue_context_id: &s
     if recorded > 0 {
         log::warn!(
             "[{ue_context_id}] {recorded} transferred PDU session(s) RECORDED but their N3 \
-             tunnels are NOT re-established: TS 23.502 step 21 needs an \
-             Nsmf_PDUSession_UpdateSMContext per SMF carrying the MME control-plane address \
-             and TEID, which arrive in a Forward Relocation Request over N26 (TS 29.518 \
-             §5.2.2.2.5.1). #347 built the N26 endpoint and the 5GS->EPS idle-mode transfer; \
-             the EPS->5GS Forward Relocation consumer this needs is #408."
+             tunnels are NOT re-established. The operation this needs is \
+             Nsmf_PDUSession_CreateSMContext with the UE EPS PDN Connection and an HO \
+             Preparation Indication (TS 23.502 §4.11.1.2.2.2 step 4) -- NOT \
+             Nsmf_PDUSession_UpdateSMContext, which in this direction carries only a Handover \
+             Complete Indication (step 7). #347 built the N26 leg and #408 landed the Forward \
+             Relocation consumer, so the endpoints CAN now be decoded; what is missing is that \
+             smfd's handle_sm_context_create reads no ueEpsPdnConnection at all, so the call \
+             would be answered by an SMF that ignores it. That is #415."
         );
     }
     recorded
@@ -4686,11 +4704,19 @@ fn handle_release_ue_context(ue_context_id: &str, request: &SbiRequest) -> SbiRe
 /// a HTTP Location header"* (`29518-k00.txt:2964-2967`), body a
 /// `UeContextRelocatedData` whose only required member is `ueContext` (yaml:3753-3754).
 ///
-/// The `forwardRelocationRequest` binary part is REQUIRED and its presence is
-/// enforced, but it is not decoded: it is a GTPv2-C Forward Relocation Request from
-/// the source MME over N26, and this AMF has no N26 leg to interpret it against. See
-/// [`record_transferred_sessions`] for why that ceiling is declared rather than
-/// worked around.
+/// The `forwardRelocationRequest` binary part is REQUIRED and its presence is enforced, but it
+/// is **not decoded here, and that is now a design choice rather than a ceiling.** #408 built
+/// the Forward Relocation codec, so the bytes *could* be parsed — but §5.2.2.2.5.1
+/// (`29518-k00.txt:2953-2958`) puts what the target needs in the *request's own members*: *"the
+/// NF Service Consumer shall carry per PDU session the S-NSSAI for serving PLMN, the MME
+/// Control Plane Address and the TEID **in the request**"*. The initial AMF has already decoded
+/// the message; this part is the raw original for reference. Re-parsing it here would be a
+/// second reading of one wire fact, which is the #335/#340 shape where several spellings drift
+/// and only the tested one is right.
+///
+/// What this operation still cannot do is re-establish the N3 tunnels — see
+/// [`record_transferred_sessions`], whose reason is now **smfd-side** (#415) rather than about
+/// N26 at all.
 fn handle_relocate_ue_context(ue_context_id: &str, request: &SbiRequest) -> SbiResponse {
     let Some(body) = parse_json_body(request) else {
         return malformed_body();
@@ -8076,6 +8102,28 @@ mod tests {
     /// Through the ROUTER, not by calling the handler directly: the routing arm
     /// is half of criterion 1, and a test that called `handle_assign_ebi` would
     /// pass with the arm absent (a 405, in production).
+    /// # Every caller of this helper must hold `CONTEXT_GUARD` (#408)
+    ///
+    /// This drives the real Namf surface against the **process-global** AMF context and the live
+    /// UE store. Its callers did not take the guard, so a guarded sibling that publishes,
+    /// releases or unpublishes could evict the caller's UE mid-test and the assign would answer
+    /// **404** instead of 200. CI caught exactly that once — *"cycle 2 of eleven must fit",
+    /// left 404, right 200* — while eight local runs and three earlier CI runs of the same
+    /// commit passed — **including a re-run of the byte-identical commit**, which is what
+    /// establishes it as a latent race in the tests rather than a defect in the code under test.
+    /// It predates #408; found while auditing this file and fixed here rather than left to bite
+    /// the next unrelated PR.
+    ///
+    /// **Honesty about the fix:** the race was NOT reproduced locally — 25 runs at
+    /// `--test-threads=16` with the guard removed all passed, so the window is narrower than that
+    /// hammering reaches and this guard is not a *verified* fix for the observed failure. What it
+    /// is, definitely, is the convention these tests were violating: 50 sibling tests in this
+    /// module take `CONTEXT_GUARD` for exactly this state and these seven did not. So this closes
+    /// the only mechanism by which a sibling can evict the UE mid-test, whether or not that was
+    /// the mechanism on the one CI run that failed.
+    ///
+    /// The **existing** guard, never a new lock: #276 showed a second lock over the same
+    /// variables *hangs* the suite rather than merely flaking it.
     fn assign_ebi_request(supi: &str, body: Value) -> SbiResponse {
         let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/assign-ebi"))
             .with_body(body.to_string(), "application/json");
@@ -8104,6 +8152,16 @@ mod tests {
     /// a "just serialise the struct" implementation gets wrong.
     #[test]
     fn assign_ebi_allocates_from_a_per_ue_pool_and_answers_assigned_ebi_data() {
+        // #408: this family reads and writes the PROCESS-GLOBAL AMF context and the live UE
+        // store, and it did NOT take the guard -- so a sibling that publishes, releases or
+        // unpublishes could evict this test's UE mid-run and the assign would 404. CI caught
+        // exactly that once (a 404 where 200 was expected, "cycle 2 of eleven must fit"), while
+        // eight local runs and three earlier CI runs of the same commit passed -- a latent race,
+        // not a defect in the code under test. Taking the EXISTING guard rather than declaring a
+        // new lock: #276 showed a second lock over the same variables HANGS the suite.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let supi = "imsi-001010000000117";
         setup_ue(supi, true, true);
 
@@ -8175,6 +8233,10 @@ mod tests {
     /// hand 5 straight back out.
     #[test]
     fn assign_ebi_releases_before_it_assigns_so_a_freed_ebi_is_reusable() {
+        // #408: the process-global context guard; see the note on `assign_ebi_request`.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let supi = "imsi-001010000000118";
         setup_ue(supi, true, true);
 
@@ -8214,6 +8276,10 @@ mod tests {
     /// what `failedArpList` is for.
     #[test]
     fn assign_ebi_reports_exhaustion_rather_than_inventing_an_ebi() {
+        // #408: the process-global context guard; see the note on `assign_ebi_request`.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let supi = "imsi-001010000000119";
         setup_ue(supi, true, true);
 
@@ -8300,6 +8366,10 @@ mod tests {
     /// that re-attaches on the way to work reaches it inside a week.
     #[test]
     fn twelve_establish_release_cycles_keep_getting_an_ebi_and_twelve_without_release_do_not() {
+        // #408: the process-global context guard; see the note on `assign_ebi_request`.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let supi = "imsi-001010000000291";
         setup_ue(supi, true, true);
 
@@ -8371,6 +8441,10 @@ mod tests {
     /// whose release never arrives leaks one for the life of the process.
     #[test]
     fn deregistration_frees_the_ues_eps_bearer_identities() {
+        // #408: the process-global context guard; see the note on `assign_ebi_request`.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let supi = "imsi-001010000000293";
         setup_ue(supi, true, true);
 
@@ -8424,6 +8498,10 @@ mod tests {
     /// and an unknown UE.
     #[test]
     fn assign_ebi_rejects_a_malformed_request_and_an_unknown_ue() {
+        // #408: the process-global context guard; see the note on `assign_ebi_request`.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let supi = "imsi-001010000000120";
         setup_ue(supi, true, true);
 
@@ -8488,6 +8566,10 @@ mod tests {
     /// would leave the SMF believing an ARP change took effect.
     #[test]
     fn assign_ebi_modifies_a_held_ebi_and_409s_one_it_does_not_hold() {
+        // #408: the process-global context guard; see the note on `assign_ebi_request`.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let supi = "imsi-001010000000121";
         setup_ue(supi, true, true);
 

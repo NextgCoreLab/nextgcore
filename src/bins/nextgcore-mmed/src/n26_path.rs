@@ -194,6 +194,131 @@ pub fn clear_pending_context_requests_for_test() {
     }
 }
 
+/// Where a UE that arrived over N26 came from, so its source AMF can be told it landed (#408).
+///
+/// # Why this exists
+///
+/// The S1AP path that learns the UE arrived (`s1ap_handler::handle_handover_notify`) knows only
+/// the eNB's identifiers. Without this record it cannot tell an N26 arrival from an intra-LTE
+/// one, and TS 23.502 §4.11.1.2.1 step 12d makes the difference load-bearing: the source AMF
+/// starts the timer that releases its NG-RAN resources *on this notification*, so an MME that
+/// stays silent leaves the source gNB holding radio resources for a UE that has left.
+///
+/// Keyed by `mme_ue_id` because that is the identity `handle_handover_notify` resolves to, so
+/// there is one notion of "which UE arrived" rather than two that can disagree.
+#[derive(Debug, Clone, Copy)]
+pub struct ForwardRelocationSource {
+    /// The source AMF's N26 address.
+    pub peer: SocketAddr,
+    /// The TEID from its Sender's F-TEID, which the notification must be addressed to.
+    pub amf_teid: u32,
+}
+
+static FORWARD_RELOCATION_SOURCES: OnceLock<Mutex<HashMap<u64, ForwardRelocationSource>>> =
+    OnceLock::new();
+
+fn forward_relocation_sources() -> &'static Mutex<HashMap<u64, ForwardRelocationSource>> {
+    FORWARD_RELOCATION_SOURCES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_forward_relocation_source(mme_ue_id: u64, source: ForwardRelocationSource) {
+    if let Ok(mut map) = forward_relocation_sources().lock() {
+        map.insert(mme_ue_id, source);
+    }
+}
+
+/// Take this UE's N26 arrival record, if it has one — the decision half of
+/// [`notify_forward_relocation_complete`] (#408).
+///
+/// `Some` means "this UE arrived over N26 from that AMF, and it must be told". `None` means an
+/// intra-LTE handover, which is the common case and reaches the same S1AP handler: S1AP's
+/// HandoverNotify carries nothing about where the UE came from, so this record is the ONLY thing
+/// distinguishing the two.
+///
+/// **Taken, not read.** A UE arrives once. A retained record would have a later handover for the
+/// same UE notify its old source AMF a second time, and each notification starts a fresh
+/// resource-release timer there (TS 23.502 §4.11.1.2.1 step 12d).
+///
+/// Public so the decision can be asserted without a bound socket — a test that could only
+/// observe the send would read `false` for "not an N26 arrival" and `false` for "no socket"
+/// alike, and so could not tell a missing gate from a missing socket.
+pub fn take_forward_relocation_source(mme_ue_id: u64) -> Option<ForwardRelocationSource> {
+    forward_relocation_sources().lock().ok()?.remove(&mme_ue_id)
+}
+
+/// Tell the source AMF that a UE which arrived over N26 has landed (TS 29.274 §7.3.3), #408.
+///
+/// Answers `false` when this UE did not arrive over N26, which is the common case — every
+/// intra-LTE handover reaches here too, and an MME that sent a Forward Relocation Complete
+/// Notification for one would be telling an AMF about a UE it never handed over.
+///
+/// The record is **taken**, not read: a UE arrives once, and a retained record would have a
+/// later handover for the same UE notify an AMF a second time. That is also what makes the
+/// return value meaningful — a second call for one arrival answers `false`.
+///
+/// # Production caller
+///
+/// `s1ap_handler::handle_handover_notify`, reached from the S1AP receive loop's
+/// `HandoverNotify` arm — a live path, not a test-only function.
+pub fn notify_forward_relocation_complete(mme_ue_id: u64) -> bool {
+    // The DECISION, split from the transmission so it is assertable: the send needs a bound
+    // socket a unit harness has none of, and a test that could only observe the send would read
+    // `false` for "not an N26 arrival" and `false` for "no socket" alike -- so it could not tell
+    // a missing gate from a missing socket. `take_forward_relocation_source` answering `Some` IS
+    // the statement "this UE arrived over N26", which is the same decision/transmission split
+    // `inter_system_handover_refusal` and `handle_uplink_ran_status_transfer` already use.
+    let Some(source) = take_forward_relocation_source(mme_ue_id) else {
+        return false;
+    };
+    let Some(server) = server() else {
+        log::warn!(
+            "UE {mme_ue_id} arrived over N26 but the N26 socket is gone, so its source AMF \
+             cannot be told. That AMF will hold the UE's context and its source NG-RAN \
+             resources until its own guard timer expires (TS 23.502 §4.11.1.2.1 step 12d \
+             starts that timer on this notification)."
+        );
+        return false;
+    };
+    let seq = server.alloc_sequence();
+    let notify = n26_build::build_forward_relocation_complete_notification(seq, source.amf_teid);
+    match server.send_request(source.peer, &notify) {
+        Ok(seq) => {
+            log::info!(
+                "N26 Forward Relocation Complete Notification sent to AMF {} (seq={seq}) for UE \
+                 {mme_ue_id}: the UE has arrived on E-UTRAN. TS 23.502 §4.11.1.2.1 step 12d has \
+                 the source AMF answer with a Complete Acknowledge and start the timer that \
+                 releases its NG-RAN resources (step 21).",
+                source.peer
+            );
+            true
+        }
+        Err(e) => {
+            log::error!(
+                "N26 Forward Relocation Complete Notification to {} failed: {e}. The source AMF \
+                 will not learn the UE arrived and will hold its context and source NG-RAN \
+                 resources until its own guard timer expires.",
+                source.peer
+            );
+            false
+        }
+    }
+}
+
+/// Record an N26 arrival without driving one. Test-only; declared beside the map, not in a
+/// `mod tests`, per #308.
+#[cfg(test)]
+pub fn record_forward_relocation_source_for_test(mme_ue_id: u64, source: ForwardRelocationSource) {
+    record_forward_relocation_source(mme_ue_id, source);
+}
+
+/// Drop every N26 arrival record. Declared beside the map, not in a `mod tests`.
+#[cfg(test)]
+pub fn clear_forward_relocation_sources_for_test() {
+    if let Ok(mut map) = forward_relocation_sources().lock() {
+        map.clear();
+    }
+}
+
 impl N26Server {
     /// Bind the N26 socket and start the receive and retransmission loops.
     pub fn open(
@@ -383,6 +508,17 @@ fn handle_datagram(inner: &Arc<N26Inner>, data: &[u8], peer: SocketAddr) {
     if matched.is_some() {
         if msg_type == Gtp2MessageType::ContextResponse as u8 {
             handle_context_response(&msg, seq, peer);
+        } else if msg_type == Gtp2MessageType::ForwardRelocationCompleteAcknowledge as u8 {
+            // #408: the source AMF has confirmed the handover completed, which per
+            // TS 23.401 §5.5.1.2.2 step 15 is what licences the target MME to stop treating
+            // the move as in flight. The context is already installed and the UE is already
+            // being served, so there is nothing to apply -- saying so beats a silent drop.
+            log::info!(
+                "N26 Forward Relocation Complete Acknowledge from AMF {peer} (seq={seq}): the \
+                 source AMF has confirmed the relocation and will release its NG-RAN resources \
+                 (TS 23.502 §4.11.1.2.1 step 12d starts that timer, step 21 sends the release). \
+                 This MME already serves the UE; nothing further is owed on N26."
+            );
         } else {
             log::info!(
                 "N26 triggered message type={msg_type} seq={seq} from {peer} correlated but \
@@ -392,11 +528,257 @@ fn handle_datagram(inner: &Arc<N26Inner>, data: &[u8], peer: SocketAddr) {
         return;
     }
 
+    // #408: Forward Relocation Request (133) is an INITIAL message, so it does not correlate
+    // to an outstanding transaction and is dispatched here. The base at `fd99448` reached the
+    // log below for it, which is what this arm replaces.
+    if msg_type == Gtp2MessageType::ForwardRelocationRequest as u8 {
+        handle_forward_relocation_request(inner, &msg, seq, peer);
+        return;
+    }
+
     log::info!(
         "N26 message type={msg_type} seq={seq} from {peer} matches no outstanding \
-         transaction: either an initial message this MME does not serve (it is the NEW \
-         node in the only N26 procedure it implements) or a late duplicate response"
+         transaction. Implemented: Context Request/Response/Acknowledge as the NEW node \
+         (#347) and Forward Relocation Request (133) as the TARGET of a 5GS-to-EPS handover \
+         (#408). Anything else is either an initial message this MME does not serve or a late \
+         duplicate response."
     );
+}
+
+/// Handle a **Forward Relocation Request** (TS 29.274 §7.3.1, type 133), #408.
+///
+/// This MME is the **target** of a 5GS→EPS connected-mode handover (TS 23.502 §4.11.1.2.1
+/// step 3 over TS 23.401 §5.5.1.2.2 step 4): the source AMF has handed over the UE's mapped EPS
+/// security context and its PDN connections, and the MME must install them and admit the bearers.
+///
+/// # Production reachability
+///
+/// Reached from [`handle_datagram`], driven by the receive thread [`N26Server::open`] spawns,
+/// which [`n26_open`] installs from `main.rs` at startup when the switch is on. Stated here
+/// because "correct but unreachable" is this tree's commonest defect.
+///
+/// # The install is the SAME one #347 built, deliberately
+///
+/// [`install_transferred_context`] is reused unchanged rather than a second installer being
+/// written for the connected-mode case. The UE context an MME must end up holding is the same
+/// whether it arrived via a Context Response or a Forward Relocation Request — same MM Context,
+/// same PDN connections, same write-back discipline (`&mut` under the pool write lock, because
+/// `mme_ue_find_by_id` hands out a CLONE and mutating that is the defect #223/#361 found three
+/// times). A second installer would be two answers to "what does a transferred context become".
+fn handle_forward_relocation_request(
+    inner: &Arc<N26Inner>,
+    msg: &Gtp2Message,
+    seq: u32,
+    peer: SocketAddr,
+) {
+    let data = match n26_build::parse_forward_relocation_request(msg) {
+        Ok(data) => data,
+        Err(e) => {
+            log::error!(
+                "N26 Forward Relocation Request from {peer} (seq={seq}) unusable: {e}. Answering \
+                 'Relocation failure' so the source AMF refuses the preparation rather than \
+                 waiting out its own timer."
+            );
+            // Addressed to the Sender's F-TEID if the message had one; 0 otherwise, which is
+            // the honest value when the very IE that would address the answer is what was
+            // missing.
+            let amf_teid = msg
+                .get_ie(nextgcore_gtp::v2::Gtp2IeType::FTeid as u8, 0)
+                .and_then(|ie| Gtp2FTeidIe::decode(&ie.value).ok())
+                .map(|f| f.teid)
+                .unwrap_or(0);
+            let reject = n26_build::build_forward_relocation_response(
+                seq,
+                amf_teid,
+                crate::n26_build::CAUSE_RELOCATION_FAILURE,
+                None,
+                &[],
+                &[],
+            );
+            send_response_from(inner, peer, &reject);
+            return;
+        }
+    };
+
+    let amf_teid = data.sender_fteid.as_ref().map(|f| f.teid).unwrap_or(0);
+
+    // A UE context to install into. The connected-mode case has no prior eNB UE context for this
+    // UE -- the UE is arriving from NG-RAN -- so one is allocated here, the same way
+    // `s1ap_handler::handle_handover_required` allocates a target context for an intra-LTE move.
+    let ctx = mme_self();
+    let enb_id = match ctx
+        .enb_pool
+        .read()
+        .ok()
+        .and_then(|p| p.keys().copied().min())
+    {
+        Some(id) => id,
+        None => {
+            log::warn!(
+                "N26 Forward Relocation Request from {peer}: no eNB is connected to this MME, so \
+                 there is no target to admit the UE onto. Answering 'Relocation failure' -- the \
+                 alternative is installing a context for a UE that can never be reached, which \
+                 would leak on every refused handover."
+            );
+            let reject = n26_build::build_forward_relocation_response(
+                seq,
+                amf_teid,
+                crate::n26_build::CAUSE_RELOCATION_FAILURE,
+                None,
+                &[],
+                &[],
+            );
+            send_response_from(inner, peer, &reject);
+            return;
+        }
+    };
+    let enb_ue_id = ctx.enb_ue_add(enb_id, crate::context::INVALID_UE_S1AP_ID);
+    let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+
+    // The install, through the production path, with the Forward Relocation data mapped onto the
+    // same shape a Context Response produces. `ContextResponseData`'s fields are exactly what
+    // the installer needs, so this is a projection rather than a conversion with judgement in it.
+    let as_context = ContextResponseData {
+        cause: n26_build::CAUSE_REQUEST_ACCEPTED,
+        imsi_bcd: data.imsi_bcd.clone(),
+        mm_context: data.mm_context.clone(),
+        pdn_connections: data.pdn_connections.clone(),
+        amf_fteid: data.sender_fteid.clone(),
+    };
+
+    if let Err(why) = install_transferred_context(ctx, mme_ue_id, &as_context) {
+        log::error!(
+            "N26 Forward Relocation Request from {peer} could not be installed: {why}. Answering \
+             'Relocation failure' and releasing the contexts allocated for it, rather than \
+             accepting a partial context the UE would arrive onto and find unusable."
+        );
+        // Allocated above and now useless: leaving them would leak a UE and an eNB UE context on
+        // every failed relocation.
+        ctx.mme_ue_remove(mme_ue_id);
+        ctx.enb_ue_remove(enb_ue_id);
+        let reject = n26_build::build_forward_relocation_response(
+            seq,
+            amf_teid,
+            crate::n26_build::CAUSE_RELOCATION_FAILURE,
+            None,
+            &[],
+            &[],
+        );
+        send_response_from(inner, peer, &reject);
+        return;
+    }
+
+    // THE DATA-FORWARDING DECISION on this side (#408 criterion 6), and here it is the source's
+    // to make: §8.12 bit 5's DFI is what says direct forwarding applies, and Table 7.3.2-2
+    // conditions the instance-2 forwarding F-TEID on indirect forwarding APPLYING. This tree's
+    // AMF sets neither, so the response offers no forwarding endpoint -- which is consistent
+    // rather than a second ceiling. The state is NAMED so an operator reading the log knows
+    // which bearers carry no forwarded data and whose decision that was.
+    let bearers: Vec<(u8, Option<Gtp2FTeidIe>)> = {
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id);
+        let mut out = Vec::new();
+        if let Some(mme_ue) = mme_ue {
+            for sess_id in &mme_ue.sess_list {
+                if let Some(sess) = ctx.sess_find_by_id(*sess_id) {
+                    for bearer_id in &sess.bearer_list {
+                        if let Some(bearer) = ctx.bearer_find_by_id(*bearer_id) {
+                            // No forwarding endpoint: see below for why, per bearer.
+                            out.push((bearer.ebi, None));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    };
+
+    if data.direct_forwarding {
+        log::info!(
+            "N26 Forward Relocation Request from {peer} set the Direct Forwarding Indication, so \
+             the source RAN will forward straight to the target eNB and this MME establishes no \
+             indirect tunnel -- Table 7.3.2-2 conditions the instance-2 SGW/UPF forwarding \
+             F-TEID on INDIRECT forwarding (29274-j60.txt:19461-19468), so the response \
+             correctly carries none."
+        );
+    } else {
+        log::info!(
+            "N26 Forward Relocation Request from {peer} carries NO Direct Forwarding Indication, \
+             and this MME does not establish an indirect forwarding tunnel for it either. \
+             Consequence, per bearer {:?}: downlink data in flight at the source NG-RAN is \
+             DISCARDED, not forwarded. This is the SOURCE's decision expressed on the wire -- \
+             Table 7.3.1-1 includes the Indication only 'if any one of the applicable flags [is] \
+             set to 1' (29274-j60.txt:17874), so its absence means the source asked for no \
+             forwarding. Offering an endpoint unasked would have the source relay it to an \
+             NG-RAN that was never told to forward into it.",
+            bearers.iter().map(|(ebi, _)| *ebi).collect::<Vec<_>>()
+        );
+    }
+
+    // The local F-TEID: the address this MME's N26 socket is bound to, so the source AMF's
+    // Forward Relocation Complete Acknowledge reaches where this MME listens. The MME UE id is
+    // the TEID, which is the same identity space `send_context_request` uses.
+    let local_fteid = match inner.local_addr.ip() {
+        std::net::IpAddr::V4(v4) => Some(Gtp2FTeidIe::new_ipv4(
+            n26_build::S10_N26_MME_GTP_C,
+            mme_ue_id as u32,
+            v4.octets(),
+        )),
+        std::net::IpAddr::V6(_) => {
+            log::warn!(
+                "the N26 socket is bound to an IPv6 address; TS 29.274 §8.22 allows it but this \
+                 MME builds an IPv4 F-TEID only, so no Sender's F-TEID is offered and the source \
+                 AMF's Complete Acknowledge will land on TEID 0"
+            );
+            None
+        }
+    };
+
+    // The Target-to-Source container the target eNB produces in its S1AP HANDOVER REQUEST
+    // ACKNOWLEDGE is not available yet -- the eNB has not been asked. Answering with an empty
+    // one is what Table 7.3.2-1 permits (the IE is conditional), and it is what a real MME does
+    // before admission completes. Stating it here rather than fabricating a container: TS 38.413
+    // §9.3.1.21 has the source AMF relay these bytes straight to the source gNB, which WOULD
+    // decode them.
+    log::info!(
+        "N26 Forward Relocation Response to AMF {peer} (seq={seq}): ACCEPTED with {} bearer(s) \
+         set up for UE {mme_ue_id}. The Target-to-Source transparent container is EMPTY because \
+         the target eNB has not yet answered a HANDOVER REQUEST -- Table 7.3.2-1 makes that IE \
+         conditional, and a fabricated container would be decoded by the source gNB.",
+        bearers.len()
+    );
+
+    let response = n26_build::build_forward_relocation_response(
+        seq,
+        amf_teid,
+        n26_build::CAUSE_REQUEST_ACCEPTED,
+        local_fteid.as_ref(),
+        &bearers,
+        &[],
+    );
+    send_response_from(inner, peer, &response);
+
+    // Remember that this UE arrived over N26 and where its source AMF is, so
+    // `notify_forward_relocation_complete` can tell that AMF when the target eNB reports the UE
+    // has landed. Recorded only on the ACCEPT path: a refused relocation produces no arrival, and
+    // a record left behind would have a later intra-LTE handover for a recycled UE id send a
+    // Forward Relocation Complete Notification to an AMF that is not expecting one.
+    record_forward_relocation_source(mme_ue_id, ForwardRelocationSource { peer, amf_teid });
+}
+
+/// Send a triggered message from the receive thread, caching it for retransmission.
+///
+/// The receive thread holds `&Arc<N26Inner>` rather than an `N26Server`, so this is the same
+/// send [`N26Server::send_response`] performs, reached from where the datagram was decoded. One
+/// function rather than two spellings of "cache then send", because a cached response that
+/// differs from the sent one is how a retransmitted request gets a different answer.
+fn send_response_from(inner: &Arc<N26Inner>, peer: SocketAddr, msg: &Gtp2Message) {
+    let encoded = Bytes::from(msg.encode().to_vec());
+    if let Ok(mut xact) = inner.xact.lock() {
+        xact.cache_response(peer, msg.header.sequence_number, encoded.clone());
+    }
+    if let Err(e) = inner.socket.send_to(&encoded, peer) {
+        log::error!("N26 send to {peer} failed: {e}");
+    }
 }
 
 /// Send a **Context Request** to the old AMF for a UE performing an inter-system TAU
@@ -1123,6 +1505,463 @@ mod tests {
             "and no session may be left behind: a UE with a security context and no bearer \
              would complete a TAU and then carry no traffic"
         );
+    }
+
+    /// **#408 criterion 8**: a connected-mode inter-system handover transfers the bearer
+    /// contexts and tunnel endpoints across BOTH daemons, and they are readable from the MME's
+    /// store afterwards.
+    ///
+    /// # Why this drives amfd rather than a fixture
+    ///
+    /// The Forward Relocation Request is built by
+    /// `nextgcore_amfd::n26_build::build_forward_relocation_request`, the **real** producer, from
+    /// a real `AmfUe`, and its MM Context by the real `build_handover_mm_context`. A request
+    /// hand-written in this crate would agree with this crate's parser by construction and could
+    /// not catch the two sides drifting — the strict-peer pattern lmfd, pcfd and udmd already
+    /// use. It is then **encoded and decoded over the wire**, so a framing bug fails here.
+    ///
+    /// # Every assertion is POSITIVE
+    ///
+    /// Not "no error was returned" — a negative assertion is satisfied by every path that never
+    /// arrives, which is the trap that let a dead MBS manager and a caller-less
+    /// `udm_nrf_register` ship. So each of the seven things a connected-mode transfer is *for* is
+    /// read back out of the MME's own pools:
+    ///
+    /// 1. the **IMSI** the AMF held;
+    /// 2. the **K_ASME'**, against an independently computed
+    ///    `kdf_kasme_prime_handover(kamf, dl_count)` — so a zeroed key, a copied `K_AMF`, an
+    ///    FC `0x73` key, and a key from the post-increment COUNT each fail;
+    /// 3. the **`{NH, NCC=2}`** pair the MME must put in its S1 HANDOVER REQUEST — the assertion
+    ///    #347's idle-mode test could not make, because idle mode has no AS keys;
+    /// 4. the **EBI** on a real `MmeBearer`;
+    /// 5. the **PGW-C S5/S8 control-plane TEID** and address on a real `MmeSess`;
+    /// 6. the **APN** and the converted **APN-AMBR**;
+    /// 7. that the bearer is on `sess.bearer_list`, not merely in the pool.
+    #[test]
+    fn a_connected_mode_inter_system_handover_transfers_the_bearer_contexts_to_the_mme() {
+        use nextgcore_gtp::v2::{
+            Gtp2AmbrIe, Gtp2ApnIe, Gtp2FTeidIe, Gtp2Message, Gtp2PdnConnectionIe,
+        };
+
+        let _guard = lock_s11();
+
+        // ---------------- The AMF side: a UE it still serves, in CM-CONNECTED ----------------
+        //
+        // Literal values distinct from every sibling test's, including #347's idle-mode
+        // end-to-end test: the MME context is process-global and keyed by identity, so a shared
+        // IMSI or EBI would let two tests resolve each other's UE. `0x408` prefixes mark these
+        // as this issue's, where #347's used `0x347`.
+        const IMSI: &str = "001010000000408";
+        const EBI: u8 = 8;
+        const PGW_TEID: u32 = 0x0408_0BC1;
+        const APN: &str = "n26hotest";
+        const KAMF: [u8; 32] = [0x74; 32];
+        // The DOWNLINK count, not the uplink one -- that is the whole difference from #347's
+        // test, and passing an uplink value here would make assertion 2 pass for the wrong
+        // reason.
+        const DL_COUNT: u32 = 0x0408;
+        const UL_COUNT: u32 = 0x0409;
+
+        let mut amf_ue = nextgcore_amfd::context::AmfUe::new(0x408_0200, 200);
+        amf_ue.supi = Some(format!("imsi-{IMSI}"));
+        amf_ue.kamf = KAMF;
+        amf_ue.dl_count = DL_COUNT;
+        amf_ue.ul_count = UL_COUNT;
+        amf_ue.nas.amf_ksi = 7;
+        amf_ue.selected_enc_algorithm = 2;
+        amf_ue.selected_int_algorithm = 1;
+
+        // The handover MM Context: FC 0x74 over the DOWNLINK count, with {NH, NCC=2}.
+        let mm_context = nextgcore_amfd::n26_build::build_handover_mm_context(&amf_ue, DL_COUNT);
+
+        // The PDN connection the AMF assembles from what the SMF returned, built through the
+        // library's grouped-IE API -- the same calls `pdn_connection_from_smf_container` makes.
+        // A REAL PGW-C control-plane F-TEID, so assertion 5 is able to fail. (Production sends
+        // the reserved value because this tree's SMF supplies none; that ceiling is asserted
+        // separately in amfd's own tests.)
+        let mut pdn = Gtp2PdnConnectionIe::new();
+        pdn.add_ie(Gtp2ApnIe::from_string(APN).to_ie(0));
+        pdn.add_ie(nextgcore_gtp::v2::Gtp2EbiIe::new(EBI).to_ie(0));
+        // Interface type 7 = S5/S8 PGW GTP-C (TS 29.274 Table 8.22-1).
+        pdn.add_ie(Gtp2FTeidIe::new_ipv4(7, PGW_TEID, [10, 4, 8, 47]).to_ie(0));
+        let mut bearer = nextgcore_gtp::v2::Gtp2BearerContextIe::new();
+        bearer.set_ebi(EBI);
+        bearer.set_bearer_qos(&nextgcore_gtp::v2::Gtp2BearerQosIe::new(9, 0, 0, 0, 0));
+        pdn.add_ie(bearer.to_ie(0));
+        pdn.add_ie(Gtp2AmbrIe::new(3_000, 4_000).to_ie(0));
+
+        // The AMF's REAL Forward Relocation Request builder.
+        let request = nextgcore_amfd::n26_build::build_forward_relocation_request(
+            0x408,
+            Some(IMSI),
+            &Gtp2FTeidIe::new_ipv4(
+                nextgcore_amfd::n26_path::N26_AMF_GTP_C,
+                0x0408_0200,
+                [10, 4, 8, 1],
+            ),
+            &mm_context,
+            std::slice::from_ref(&pdn),
+            &[0xA4, 0x08],
+            &nextgcore_amfd::n26_build::encode_target_identification(
+                nextgcore_amfd::n26_build::TARGET_TYPE_ENODEB,
+                &[0x00, 0xF1, 0x10],
+                &[0, 0, 4, 8],
+            ),
+            &[0x00, 0xF1, 0x10],
+        );
+
+        // ---------------- The wire ----------------
+        //
+        // Encoded and decoded, so this is a transfer over GTPv2-C rather than a struct handed
+        // between two modules. A bug in the message framing fails here.
+        let encoded = request.encode();
+        let mut bytes = bytes::Bytes::from(encoded.to_vec());
+        let on_the_wire =
+            Gtp2Message::decode(&mut bytes).expect("the AMF's Forward Relocation Request decodes");
+        assert_eq!(
+            on_the_wire.header.message_type, 133,
+            "what crossed the wire must be a Forward Relocation Request (TS 29.274 type 133)"
+        );
+
+        // ---------------- The MME side: parse and install ----------------
+        let data = crate::n26_build::parse_forward_relocation_request(&on_the_wire)
+            .expect("the MME must parse the AMF's Forward Relocation Request");
+        assert!(
+            !data.direct_forwarding,
+            "this AMF sets NO Direct Forwarding Indication (#408 criterion 6), so the MME must \
+             read the flag as clear -- and Table 7.3.1-1 omits the whole Indication IE when no \
+             applicable flag is set, so the MME is reading an ABSENT IE as 'no forwarding' \
+             rather than a present-but-zero one"
+        );
+        assert_eq!(
+            data.source_to_target_container.as_deref(),
+            Some(&[0xA4, 0x08][..]),
+            "the gNB's Source-to-Target container must reach the MME byte-for-byte: it goes \
+             straight into the S1AP HANDOVER REQUEST the target eNB decodes"
+        );
+
+        // Project onto the shape the production installer takes -- the same projection
+        // `handle_forward_relocation_request` makes, so this drives the real write-back.
+        let as_context = ContextResponseData {
+            cause: crate::n26_build::CAUSE_REQUEST_ACCEPTED,
+            imsi_bcd: data.imsi_bcd.clone(),
+            mm_context: data.mm_context.clone(),
+            pdn_connections: data.pdn_connections.clone(),
+            amf_fteid: data.sender_fteid.clone(),
+        };
+
+        let ctx = mme_self();
+        ctx.init();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        let enb_ue_id = ctx.enb_ue_add(enb_id, 0x408);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+
+        // Through the PRODUCTION install path, not a test reimplementation of it -- the
+        // write-back is exactly where #223 found smfd mutating a detached clone while the wire
+        // response looked right.
+        install_transferred_context_for_test(ctx, mme_ue_id, &as_context)
+            .expect("the transferred context must install");
+
+        // ---------------- Assertions: read it back OUT of the MME ----------------
+
+        let mme_ue = ctx
+            .mme_ue_find_by_id(mme_ue_id)
+            .expect("the UE must still be in the MME's pool");
+
+        // 1. The IMSI.
+        assert_eq!(
+            mme_ue.imsi_bcd, IMSI,
+            "the transferred IMSI must be readable from the MME's UE context"
+        );
+
+        // 2. The mapped EPS security context, against an INDEPENDENT derivation with FC 0x74.
+        let expected_kasme =
+            nextgcore_crypt::kdf::nextgcore_kdf_kasme_prime_handover(&KAMF, DL_COUNT);
+        assert_eq!(
+            mme_ue.kasme, expected_kasme,
+            "the MME's K_ASME must be K_ASME' = KDF(K_AMF, FC 0x74, DOWNLINK NAS COUNT) per \
+             TS 33.501 Annex A.14.2 -- computed here from K_AMF and the count, not read from \
+             the message, so a zeroed or copied key cannot pass"
+        );
+        assert_ne!(
+            mme_ue.kasme,
+            nextgcore_crypt::kdf::nextgcore_kdf_kasme_prime(&KAMF, DL_COUNT),
+            "and it must NOT be Annex A.14.1's FC 0x73 idle-mode form for the same count: the \
+             two differ only in the FC octet, so this is the assertion a copy-paste fails"
+        );
+        assert_ne!(
+            mme_ue.kasme,
+            nextgcore_crypt::kdf::nextgcore_kdf_kasme_prime_handover(&KAMF, UL_COUNT),
+            "nor derived from the UPLINK count: A.14.2's P0 is the downlink one"
+        );
+        assert_ne!(
+            mme_ue.kasme,
+            nextgcore_crypt::kdf::nextgcore_kdf_kasme_prime_handover(&KAMF, DL_COUNT + 1),
+            "nor from the POST-increment count: TS 33.501 §8.3.2 step 2 derives from the \
+             CURRENT value and increments afterwards, and an off-by-one here gives the UE a \
+             key it cannot reproduce (the nextgsim-#203 defect)"
+        );
+        assert_ne!(mme_ue.kasme, KAMF, "and it must not be K_AMF itself");
+        assert_eq!(
+            mme_ue.nas_eps.mme_ksi.tsc, 1,
+            "TSC = 1 marks the context MAPPED, not native (TS 33.501 §8.6.1)"
+        );
+        assert_eq!(
+            mme_ue.nas_eps.mme_ksi.ksi, 7,
+            "the eKSI value is the ngKSI's"
+        );
+        assert!(
+            mme_ue.security_context_available,
+            "the MME must now hold an established security context"
+        );
+
+        // 3. {NH, NCC=2} -- what the MME puts in its S1 HANDOVER REQUEST so the target eNB can
+        //    compute K_eNB (TS 33.501 §8.3.2 step 4). This is the assertion an idle-mode
+        //    transfer cannot make, and it is read from the decoded MM Context because that is
+        //    where the MME's S1AP path reads it from.
+        let carried = data
+            .mm_context
+            .as_ref()
+            .expect("the MM Context is MANDATORY in a Forward Relocation Request");
+        assert!(
+            carried.nhi,
+            "NHI must be SET: with it clear the MME never reads NH/NCC and would put no AS key \
+             material in the S1 HANDOVER REQUEST"
+        );
+        assert_eq!(
+            carried.ncc, 2,
+            "NCC must be 2: TS 33.501 §8.3.2 step 2 has the source AMF derive NH TWICE \
+             (33501-k20.txt:11370-11375). NCC=1 with the second NH, or NCC=2 with the first, \
+             each makes the UE and the target eNB compute different K_eNB."
+        );
+        let kenb = nextgcore_crypt::kdf::nextgcore_kdf_kenb(&expected_kasme, u32::MAX);
+        let nh1 = nextgcore_crypt::kdf::nextgcore_kdf_nh_enb(&expected_kasme, &kenb);
+        let expected_nh = nextgcore_crypt::kdf::nextgcore_kdf_nh_enb(&expected_kasme, &nh1);
+        assert_eq!(
+            carried.nh,
+            Some(expected_nh),
+            "and the NH must be the SECOND derivation, computed here independently from \
+             K_ASME' over an initial K_eNB keyed with 2^32-1 (TS 33.501 §8.3.2 step 2, NOTE 3 \
+             at 33501-k20.txt:11384-11389 explains the constant)"
+        );
+        assert_ne!(carried.nh, Some(nh1), "specifically NOT the first NH");
+
+        // 5. and 6. The session: APN, the PGW-C's S5/S8 control-plane endpoint, the AMBR.
+        assert_eq!(
+            mme_ue.sess_list.len(),
+            1,
+            "one transferred PDN connection must produce exactly one MME session"
+        );
+        let sess = ctx
+            .sess_find_by_id(mme_ue.sess_list[0])
+            .expect("the session must be in the MME's pool");
+        assert_eq!(sess.apn, APN, "the transferred APN must be readable");
+        assert_eq!(
+            sess.pgw_s5c_teid, PGW_TEID,
+            "the PGW-C's S5/S8 control-plane TEID must be recorded: every later Modify Bearer \
+             or Delete Session for this PDN connection is addressed to it, so a session that \
+             decoded correctly and stored nothing is the #223 defect exactly"
+        );
+        assert_eq!(
+            sess.pgw_s5c_ip.ipv4,
+            Some([10, 4, 8, 47]),
+            "and the PGW-C's address with it"
+        );
+        // TS 29.274 §8.7 AMBR is kbps; MmeSess::ambr is bps.
+        assert_eq!(
+            sess.ambr.uplink, 3_000_000,
+            "the APN-AMBR must be converted from the IE's kbps to the context's bps"
+        );
+        assert_eq!(sess.ambr.downlink, 4_000_000);
+
+        // 4. and 7. The bearer, with its EBI and QoS, ON THE SESSION'S LIST.
+        assert_eq!(
+            sess.bearer_list.len(),
+            1,
+            "the bearer must be on the SESSION's list, not merely in the pool: the S1AP \
+             handover path reads `sess.bearer_list` to build the HANDOVER REQUEST's E-RAB list, \
+             so a bearer missing from the list is one the target eNB is never asked to admit"
+        );
+        let installed = ctx
+            .bearer_find_by_id(sess.bearer_list[0])
+            .expect("the bearer must be in the MME's pool");
+        assert_eq!(
+            installed.ebi, EBI,
+            "the transferred EPS Bearer Identity must be readable from the MME's bearer"
+        );
+        assert_eq!(
+            installed.qos.qci, 9,
+            "and its QCI, which the SMF mapped from the 5QI per TS 23.502 Annex C"
+        );
+
+        // The MME's answer, built by the production builder and read back by amfd's production
+        // parser -- so the response leg is proven across the same seam as the request leg.
+        let response = crate::n26_build::build_forward_relocation_response(
+            0x408,
+            data.sender_fteid.as_ref().map(|f| f.teid).unwrap_or(0),
+            crate::n26_build::CAUSE_REQUEST_ACCEPTED,
+            Some(&Gtp2FTeidIe::new_ipv4(
+                crate::n26_build::S10_N26_MME_GTP_C,
+                mme_ue_id as u32,
+                [10, 4, 8, 2],
+            )),
+            &[(EBI, None)],
+            &[],
+        );
+        let encoded = response.encode();
+        let mut bytes = bytes::Bytes::from(encoded.to_vec());
+        let on_the_wire = Gtp2Message::decode(&mut bytes).expect("the response decodes");
+        let parsed = nextgcore_amfd::n26_build::parse_forward_relocation_response(&on_the_wire)
+            .expect("the AMF must parse the MME's Forward Relocation Response");
+        assert!(parsed.accepted(), "the MME accepted");
+        assert_eq!(
+            parsed.mme_fteid.as_ref().map(|f| f.teid),
+            Some(mme_ue_id as u32),
+            "the AMF must recover the MME's TEID, or its Forward Relocation Complete \
+             Acknowledge lands on no UE context at the MME"
+        );
+        assert_eq!(
+            parsed.set_up_bearers.len(),
+            1,
+            "and the set-up bearer list must cross the wire"
+        );
+        assert_eq!(parsed.set_up_bearers[0].ebi, EBI);
+        assert_eq!(
+            parsed.set_up_bearers[0].forwarding_fteid, None,
+            "with NO forwarding endpoint, because this AMF asked for none -- Table 7.3.2-2 \
+             conditions the instance-2 F-TEID on indirect forwarding APPLYING \
+             (29274-j60.txt:19461-19468), so its absence is the consistent answer rather than \
+             a second ceiling"
+        );
+    }
+
+    /// **#408 criterion 7**: with the switches off, no Forward Relocation is driven and the
+    /// refusal stands.
+    ///
+    /// This is a test rather than a claim about a build CI never performs, which is the whole
+    /// reason the leg is behind a **runtime** switch: the code is compiled in and still declines.
+    #[test]
+    fn with_the_switches_off_no_forward_relocation_is_driven_and_the_refusal_stands() {
+        let _guard = lock_s11();
+        set_for_test(false);
+
+        assert!(
+            !enabled(),
+            "the MME's N26 switch must read as off, which is what the Context Request path reads"
+        );
+
+        // A Forward Relocation Request arriving with the switch off must still PARSE -- parsing
+        // is pure and has no switch -- but nothing about the MME's posture changes, and that is
+        // the point: the gate is at the socket, so with the switch off no datagram ever reaches
+        // the parser in production because no socket is bound.
+        assert!(
+            server().is_none() || !enabled(),
+            "with the switch off either no socket was ever bound, or the switch reads off so \
+             `send_context_request` and the Forward Relocation path both decline"
+        );
+
+        // And the AMF side: its drivability predicate is false in every state that lacks the
+        // switch, which is what keeps `inter_system_handover_refusal` refusing.
+        for socket_bound in [false, true] {
+            for has_peer in [false, true] {
+                assert!(
+                    !nextgcore_amfd::n26_path::is_forward_relocation_drivable(
+                        false,
+                        socket_bound,
+                        has_peer
+                    ),
+                    "with the AMF switch OFF a Forward Relocation must not be drivable \
+                     regardless of socket ({socket_bound}) or peer ({has_peer}): the switch is \
+                     the first conjunct, and #408 criterion 7 requires standalone 5GC to be \
+                     unchanged with it off"
+                );
+            }
+        }
+    }
+
+    /// **#408 criterion 2, and a reachability guard**: the Forward Relocation Complete
+    /// Notification fires for an N26 arrival and **not** for an intra-LTE handover.
+    ///
+    /// # Why this test exists
+    ///
+    /// The first draft of #408 had `build_forward_relocation_complete_notification` with only a
+    /// TEST caller — the "correct but unreachable" defect this tree keeps growing, and it was
+    /// caught by grepping for a production caller rather than by any failing assertion. The
+    /// builder is now driven by `s1ap_handler::handle_handover_notify` through
+    /// [`notify_forward_relocation_complete`], and this test pins the discrimination that makes
+    /// that safe: S1AP's HandoverNotify carries nothing saying where the UE came from, so an
+    /// MME that notified unconditionally would tell an AMF about every intra-LTE handover.
+    ///
+    /// The record is also asserted CONSUMED, because a UE arrives once: a retained record would
+    /// have a later handover for the same UE notify a second time, and TS 23.502 §4.11.1.2.1
+    /// step 12d starts a resource-release timer on each notification.
+    #[test]
+    fn the_complete_notification_fires_only_for_a_ue_that_arrived_over_n26() {
+        let _guard = lock_s11();
+        clear_forward_relocation_sources_for_test();
+
+        // Distinct literal ids: the MME context is process-global, so a shared UE id would let
+        // a sibling test consume this one's record. `0x4082` marks them as this test's.
+        const ARRIVED_OVER_N26: u64 = 0x0408_2001;
+        const INTRA_LTE: u64 = 0x0408_2002;
+
+        record_forward_relocation_source_for_test(
+            ARRIVED_OVER_N26,
+            ForwardRelocationSource {
+                peer: "10.4.8.9:2123".parse().expect("a literal address parses"),
+                amf_teid: 0x0408_5001,
+            },
+        );
+
+        // An intra-LTE handover has no record, so the DECISION is "do not notify". This is the
+        // assertion that matters most: it is the common case, it reaches the same S1AP handler,
+        // and notifying here would tell an AMF about a UE it never handed over.
+        //
+        // Asserted on `take_forward_relocation_source` rather than on
+        // `notify_forward_relocation_complete`, because the latter also answers `false` when
+        // there is simply no bound socket -- so it cannot distinguish a missing GATE from a
+        // missing socket, and a revert that dropped the gate would still pass.
+        assert!(
+            take_forward_relocation_source(INTRA_LTE).is_none(),
+            "a UE that did NOT arrive over N26 must yield NO source record, so no Forward \
+             Relocation Complete Notification is sent: S1AP's HandoverNotify says nothing about \
+             where the UE came from, the record is the only thing distinguishing the two, and \
+             every intra-LTE handover reaches this same site"
+        );
+
+        // The N26 arrival IS recognised, and it names the AMF the notification goes to.
+        let source = take_forward_relocation_source(ARRIVED_OVER_N26).expect(
+            "a UE that arrived over N26 MUST yield its source record, or its source AMF is \
+             never told and holds the source NG-RAN resources until its own timer expires",
+        );
+        assert_eq!(
+            source.amf_teid, 0x0408_5001,
+            "and the record must carry the AMF's TEID: Table 7.3.3-1's notification is \
+             addressed to it, and TEID 0 lands on no UE context at the peer"
+        );
+        assert_eq!(
+            source.peer,
+            "10.4.8.9:2123".parse().expect("a literal address parses"),
+            "and the AMF's address, or the notification goes nowhere"
+        );
+
+        // TAKEN, not read: a second lookup for one arrival finds nothing.
+        assert!(
+            take_forward_relocation_source(ARRIVED_OVER_N26).is_none(),
+            "the record must be CONSUMED by the first notification: a UE arrives once, and a \
+             retained record would have a later handover for the same UE notify its old source \
+             AMF a second time -- each notification starts a fresh resource-release timer at \
+             that AMF (TS 23.502 §4.11.1.2.1 step 12d)"
+        );
+
+        // And the full path declines cleanly for a UE with no record, which is what the S1AP
+        // handler's `if` reads.
+        assert!(
+            !notify_forward_relocation_complete(INTRA_LTE),
+            "the full notifier must answer false for an intra-LTE handover"
+        );
+
+        clear_forward_relocation_sources_for_test();
     }
 
     /// An accepted Context Response with **no MM Context** is refused.
