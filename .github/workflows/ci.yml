@@ -159,31 +159,88 @@ jobs:
           cd nextgcore/docker/rust
           docker build -f Dockerfile.core -t nextgcore-core:latest .
 
+      # The NF lists live in ONE place (#421), because the build and the
+      # verification below must not be able to disagree: a hand-maintained
+      # expected-image list drifts from the built one, and then the check passes
+      # while asserting the wrong set.
+      #
+      # `${nf%%d}` strips the daemon suffix, so `amfd` yields an image named
+      # `amf`. The verification applies the same transform for the same reason.
+      - name: Declare the NF image sets
+        run: |
+          echo 'NF_5GC=amfd ausfd bsfd dccfd eesd lmfd mbsmfd nrfd nsacfd nssfd nwdafd pcfd pind scpd seppd smfd udmd udrd upfd' >> "$GITHUB_ENV"
+          echo 'NF_EPC=mmed sgwcd sgwud hssd pcrfd' >> "$GITHUB_ENV"
+
+      # `set -e` plus NO `|| echo` (#421). Until this change each build ended with
+      # `|| echo "WARN: ${nf} build failed"`, so a failed image printed one line and
+      # the step still exited 0 -- the job went GREEN with images missing, and both
+      # E2E jobs (`needs: docker-build`) then ran against a partial set, surfacing
+      # the loss two jobs downstream as a bring-up failure.
+      #
+      # This is the `|| echo` spelling of the defect PR #414 removed from the rest
+      # of this file; a search for `continue-on-error` does not find it, which is
+      # why it survived that sweep.
+      #
+      # The loop EXITS on the first failure rather than collecting them: 18 further
+      # builds after a failure bury the first error, and the first error is the one
+      # that explains the rest.
       - name: Build 5GC NF images
         run: |
+          set -euo pipefail
           cd nextgcore/docker/rust
-          for nf in amfd ausfd bsfd dccfd eesd lmfd mbsmfd nrfd nsacfd nssfd nwdafd pcfd pind scpd seppd smfd udmd udrd upfd; do
+          for nf in $NF_5GC; do
             echo "Building 5GC nextgcore-${nf}..."
             docker build -f Dockerfile.nf \
               --build-arg CORE_IMAGE=nextgcore-core:latest \
               --build-arg NF_NAME=nextgcore-${nf} \
-              -t nextgcore-rust/${nf%%d}:latest . || echo "WARN: ${nf} build failed"
+              -t nextgcore-rust/${nf%%d}:latest .
           done
 
       - name: Build EPC NF images
         run: |
+          set -euo pipefail
           cd nextgcore/docker/rust
-          for nf in mmed sgwcd sgwud hssd pcrfd; do
+          for nf in $NF_EPC; do
             echo "Building EPC nextgcore-${nf}..."
             docker build -f Dockerfile.nf \
               --build-arg CORE_IMAGE=nextgcore-core:latest \
               --build-arg NF_NAME=nextgcore-${nf} \
-              -t nextgcore-rust/${nf%%d}:latest . || echo "WARN: ${nf} build failed"
+              -t nextgcore-rust/${nf%%d}:latest .
           done
 
-      - name: Verify images
+      # ASSERTS, rather than printing (#421). This step used to be
+      # `docker images | grep nextgcore | sort` with no assertion at all -- a
+      # listing an operator was expected to read, which gates nothing.
+      #
+      # Checked BY NAME against the same lists that drove the builds, not by
+      # count: 24 images where one failed and another was built twice still counts
+      # 24. `docker image inspect` is the check because it fails on a missing
+      # image, where `docker images | grep` would match a substring of a
+      # neighbouring tag.
+      - name: Verify every expected image exists
         run: |
-          echo "Built images:"
+          set -euo pipefail
+          missing=""
+          for nf in $NF_5GC $NF_EPC; do
+            image="nextgcore-rust/${nf%%d}:latest"
+            if ! docker image inspect "$image" >/dev/null 2>&1; then
+              missing="${missing} ${image}"
+            fi
+          done
+          # The base image every NF is built FROM, so its absence would mean the
+          # NF images above are not what they claim to be.
+          if ! docker image inspect nextgcore-core:latest >/dev/null 2>&1; then
+            missing="${missing} nextgcore-core:latest"
+          fi
+          if [ -n "$missing" ]; then
+            echo "::error::MISSING IMAGES:${missing}"
+            echo "A release publishes this image set (#420), so a partial build must"
+            echo "never report success. Built images follow, for comparison:"
+            docker images | grep nextgcore | sort
+            exit 1
+          fi
+          expected=$(( $(echo $NF_5GC | wc -w) + $(echo $NF_EPC | wc -w) + 1 ))
+          echo "All ${expected} expected images present (24 NFs + the core base)."
           docker images | grep nextgcore | sort
 
   docker-e2e:
@@ -253,7 +310,17 @@ jobs:
           docker compose up -d amf smf upf
           sleep 10
 
-      - name: Health check
+      # DIAGNOSTIC, not a gate -- and that is deliberate (#421's sweep looked at
+      # this and left it). The `|| echo` here does not hide a failure the way the
+      # image-build loop's did, because the REAL gate is downstream: the
+      # registration stage below drives a live UE through this AMF and fails if it
+      # does not answer, so a dead NF cannot reach a green job by way of this step.
+      #
+      # Left tolerant on purpose. Bring-up above is sequenced by fixed `sleep`s, so
+      # a hard failure here would turn a slow-starting container into a flake and
+      # report it as an NF defect. The assertion belongs where the behaviour is, and
+      # it is there.
+      - name: Health check (diagnostic; the registration stage below is the gate)
         run: |
           cd nextgcore/docker/rust
           echo "=== Container status ==="
