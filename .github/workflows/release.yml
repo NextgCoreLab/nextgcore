@@ -1,0 +1,280 @@
+# Paired release for nextgcore (#423).
+#
+# nextgcore and nextgsim are ONE SYSTEM UNDER TEST: this repo's `docker-e2e`
+# builds nextgsim's real gNB and UE and registers a live UE over N2. So the unit
+# of release is a PAIR of commits that passed the E2E TOGETHER, and releasing is
+# the PROMOTION of an already-validated pair -- never "tag main and hope".
+#
+# WHY ONE WORKFLOW PER REPO. The default GITHUB_TOKEN cannot write to a
+# different repository, so a single workflow tagging both repos would need a PAT
+# or GitHub App with push rights to both -- a long-lived credential, and PATs
+# expire in a way that breaks releases silently months later. nextgsim carries a
+# sibling of this file that tags itself. The pair is still enforced, because each
+# workflow validates its input against #422's manifest and neither can tag a
+# commit the E2E did not test.
+#
+# WHY DISPATCH ONLY. #422 produces a manifest from every green nightly, so this
+# could cut releases by itself. It deliberately does not: that would tag
+# unreviewed work most days and make the version meaningless. CONSTITUTION.md
+# makes the human the final authority before anything reaches upstream.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release THIS repo as (e.g. 0.2.0). Independent of nextgsim's."
+        required: true
+        type: string
+      validated_run_id:
+        description: "CI run id whose validated-pair.json authorises this release (from a green nightly)."
+        required: true
+        type: string
+      paired_version:
+        description: "The nextgsim version released alongside this one, for the recorded mapping."
+        required: true
+        type: string
+      dry_run:
+        description: "Validate and print everything WITHOUT committing, tagging or publishing."
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Release nextgcore
+    runs-on: ubuntu-latest
+    steps:
+      # Full history: the notes are generated from `git log <prev-tag>..<sha>`,
+      # and the ancestry check needs the graph. A shallow clone has neither.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # The manifest is the AUTHORISATION. Without it this workflow has no
+      # evidence the commit it is about to tag was ever tested against a
+      # nextgsim commit, which is the entire premise of a paired release.
+      - name: Download the validated-pair manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: validated-pair
+          run-id: ${{ inputs.validated_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: manifest
+
+      - name: Validate the manifest and resolve the pair
+        id: pair
+        run: |
+          set -euo pipefail
+          f=manifest/validated-pair.json
+          if [ ! -s "$f" ]; then
+            echo "::error::run ${{ inputs.validated_run_id }} carries no validated-pair.json."
+            echo "That artifact is written only when docker-build, docker-e2e AND"
+            echo "docker-e2e-epc all succeeded (#422), so its absence means this run"
+            echo "did not validate a pair. Refusing to release."
+            exit 1
+          fi
+          cat "$f"
+          core=$(jq -re '.nextgcore_sha' "$f")
+          sim=$(jq -re '.nextgsim_sha' "$f")
+          run_url=$(jq -re '.run_url' "$f")
+          # `jq -re` already fails on null/absent, but an EMPTY string would pass
+          # it and produce a release pointing at nothing.
+          for v in "$core" "$sim"; do
+            if [ -z "$v" ]; then
+              echo "::error::manifest carries an empty sha; refusing."
+              exit 1
+            fi
+          done
+          # The validated sha may have been reverted or force-pushed out since the
+          # nightly ran. Tagging a commit no longer on the branch would publish a
+          # release of code that is not in the history.
+          if ! git merge-base --is-ancestor "$core" HEAD; then
+            echo "::error::validated nextgcore sha ${core} is NOT an ancestor of ${{ github.ref_name }}."
+            echo "It may have been reverted or force-pushed away. Refusing to release it."
+            exit 1
+          fi
+          echo "nextgcore_sha=${core}" >> "$GITHUB_OUTPUT"
+          echo "nextgsim_sha=${sim}" >> "$GITHUB_OUTPUT"
+          echo "run_url=${run_url}" >> "$GITHUB_OUTPUT"
+          echo "Validated pair: nextgcore ${core} / nextgsim ${sim}"
+
+      # A second tag on one pair is not a release. Checked before anything is
+      # written, so a re-dispatch of an already-released pair stops early rather
+      # than failing halfway through with a tag created and no Release published.
+      - name: Refuse to re-release an existing tag
+        run: |
+          set -euo pipefail
+          tag='${{ inputs.version }}'
+          if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            echo "::error::tag ${tag} already exists. A release is not re-runnable;"
+            echo "choose a new version or delete the tag deliberately."
+            exit 1
+          fi
+          echo "tag ${tag} is free."
+
+      - name: Determine the previous tag
+        id: prev
+        run: |
+          set -euo pipefail
+          # Most recent tag by creation date, which is what "since the last
+          # release" means. `--sort=-creatordate` rather than version sort: a
+          # version sort would pick 0.10.0 over 0.9.0 correctly but mis-order any
+          # tag that is not strictly semver, and this repo's history has both.
+          prev=$(git tag --list --sort=-creatordate | head -n 1 || true)
+          if [ -z "$prev" ]; then
+            echo "::error::no previous tag found; cannot scope release notes."
+            exit 1
+          fi
+          echo "tag=${prev}" >> "$GITHUB_OUTPUT"
+          echo "previous tag: ${prev}"
+
+      # Grouped by conventional-commit prefix. 158 fix / 50 feat / 15 docs across
+      # the 347 commits since 0.1.0, and 144 carry a (#NNN) PR number -- so the
+      # grouping is worth doing rather than emitting one flat 347-line list.
+      - name: Generate release notes
+        id: notes
+        run: |
+          set -euo pipefail
+          prev='${{ steps.prev.outputs.tag }}'
+          core='${{ steps.pair.outputs.nextgcore_sha }}'
+          range="${prev}..${core}"
+          count=$(git rev-list --count "$range")
+          # Counted WITHOUT merges, because that is what the grouped lists below
+          # contain (`--no-merges`). Reporting the total would claim 347 commits
+          # above a list of 260 and leave a reader hunting for 87 that were never
+          # missing -- the buckets are verified to sum to exactly this number.
+          listed=$(git log "$range" --format='%s' --no-merges | wc -l)
+          merges=$(( count - listed ))
+          if [ "$count" -eq 0 ]; then
+            echo "::error::no commits in ${range}; an empty release is a mistake, not a release."
+            exit 1
+          fi
+          {
+            echo "## Provenance"
+            echo
+            echo "This release is the promotion of a commit pair that passed the cross-repo"
+            echo "end-to-end test **together** (#422)."
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| nextgcore validated commit | \`${core}\` |"
+            echo "| nextgsim paired commit | \`${{ steps.pair.outputs.nextgsim_sha }}\` |"
+            echo "| nextgsim version | \`${{ inputs.paired_version }}\` |"
+            echo "| validated by | [CI run ${{ inputs.validated_run_id }}](${{ steps.pair.outputs.run_url }}) |"
+            echo
+            echo "**The tag is on the version-bump commit, which is one commit after the"
+            echo "validated sha above.** That bump touches only \`[workspace.package] version\`"
+            echo "in \`src/Cargo.toml\`; the validated code is \`${core}\`."
+            echo
+            echo "### What the validation covered"
+            echo
+            echo "* **5GC:** a real UE registration over N2 through nextgsim's gNB, plus a"
+            echo "  Service Request CM-IDLE cycle with Namf event-delivery assertions."
+            echo "* **EPC:** bring-up **only** — no attach, no GTP-U user-plane forwarding, no"
+            echo "  S5/S8 transaction. See \`specs/epc-e2e-scope.md\`."
+            echo "* **Not covered:** these jobs run nightly or on demand, **not per-PR**, so a"
+            echo "  commit merged between nightlies has not been through them individually."
+            echo
+            echo "## Changes since ${prev}"
+            echo
+            echo "${listed} commits, grouped by type (plus ${merges} merge commits, not listed)."
+            echo
+            for kind in feat fix refactor test docs ci chore; do
+              case "$kind" in
+                feat) heading="Features";;
+                fix) heading="Fixes";;
+                refactor) heading="Refactoring";;
+                test) heading="Tests";;
+                docs) heading="Documentation";;
+                ci) heading="CI";;
+                chore) heading="Chores";;
+              esac
+              body=$(git log "$range" --format='%s' --no-merges \
+                | grep -E "^${kind}(\([^)]*\))?:" || true)
+              if [ -n "$body" ]; then
+                echo "### ${heading}"
+                echo
+                echo "$body" | sed 's/^/* /'
+                echo
+              fi
+            done
+            # Anything whose subject does not start with a known prefix. Emitted
+            # rather than dropped: a commit silently missing from the notes is how
+            # a release under-reports what it contains.
+            other=$(git log "$range" --format='%s' --no-merges \
+              | grep -vE '^(feat|fix|refactor|test|docs|ci|chore)(\([^)]*\))?:' || true)
+            if [ -n "$other" ]; then
+              echo "### Other"
+              echo
+              echo "$other" | sed 's/^/* /'
+              echo
+            fi
+          } > notes.md
+          echo "generated $(wc -l < notes.md) lines of notes for ${count} commits"
+          cat notes.md
+
+      - name: Bump the workspace version
+        id: bump
+        run: |
+          set -euo pipefail
+          version='${{ inputs.version }}'
+          f=src/Cargo.toml
+          # Anchored to the [workspace.package] section's `version` line. Both
+          # repos declare it there and every member crate inherits with
+          # `version.workspace = true`, so this single line releases the whole
+          # workspace.
+          awk -v v="$version" '
+            /^\[workspace\.package\]/ { inpkg=1 }
+            inpkg && /^version = / && !done { print "version = \"" v "\""; done=1; next }
+            { print }
+          ' "$f" > "$f.new"
+          mv "$f.new" "$f"
+          # ASSERT rather than trust the edit. A regex that silently matched
+          # nothing would produce a tag whose declared version is the old one.
+          got=$(awk '/^\[workspace\.package\]/{p=1} p && /^version = /{gsub(/[",]/,"",$3); print $3; exit}' "$f")
+          if [ "$got" != "$version" ]; then
+            echo "::error::version bump did not take: Cargo.toml says '${got}', expected '${version}'"
+            git diff -- "$f" || true
+            exit 1
+          fi
+          echo "src/Cargo.toml now declares ${got}"
+          git diff --stat -- "$f"
+
+      - name: Dry run — stop before writing anything
+        if: ${{ inputs.dry_run }}
+        run: |
+          echo "### DRY RUN — nothing was committed, tagged or published" >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo "Would tag **${{ inputs.version }}** on a bump commit atop \`${{ steps.pair.outputs.nextgcore_sha }}\`," >> "$GITHUB_STEP_SUMMARY"
+          echo "paired with nextgsim \`${{ inputs.paired_version }}\` (\`${{ steps.pair.outputs.nextgsim_sha }}\`)." >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          cat notes.md >> "$GITHUB_STEP_SUMMARY"
+          echo "Every validation above passed. Re-dispatch with dry_run=false to release."
+
+      - name: Commit, tag and publish
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version='${{ inputs.version }}'
+          core='${{ steps.pair.outputs.nextgcore_sha }}'
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/Cargo.toml
+          git commit -m "chore(release): nextgcore ${version}" \
+            -m "Promotes the commit pair validated by CI run ${{ inputs.validated_run_id }}:" \
+            -m "nextgcore ${core}, nextgsim ${{ steps.pair.outputs.nextgsim_sha }} (nextgsim ${{ inputs.paired_version }})." \
+            -m "Spec: specs/paired-release-from-a-validated-pair.md"
+          git tag -a "$version" -m "nextgcore ${version} (paired with nextgsim ${{ inputs.paired_version }})"
+          git push origin HEAD:"${{ github.ref_name }}"
+          git push origin "refs/tags/${version}"
+          gh release create "$version" \
+            --title "nextgcore ${version}" \
+            --notes-file notes.md
+          echo "released ${version}" >> "$GITHUB_STEP_SUMMARY"
