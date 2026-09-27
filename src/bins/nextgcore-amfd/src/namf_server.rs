@@ -8102,6 +8102,28 @@ mod tests {
     /// Through the ROUTER, not by calling the handler directly: the routing arm
     /// is half of criterion 1, and a test that called `handle_assign_ebi` would
     /// pass with the arm absent (a 405, in production).
+    /// # Every caller of this helper must hold `CONTEXT_GUARD` (#408)
+    ///
+    /// This drives the real Namf surface against the **process-global** AMF context and the live
+    /// UE store. Its callers did not take the guard, so a guarded sibling that publishes,
+    /// releases or unpublishes could evict the caller's UE mid-test and the assign would answer
+    /// **404** instead of 200. CI caught exactly that once — *"cycle 2 of eleven must fit",
+    /// left 404, right 200* — while eight local runs and three earlier CI runs of the same
+    /// commit passed — **including a re-run of the byte-identical commit**, which is what
+    /// establishes it as a latent race in the tests rather than a defect in the code under test.
+    /// It predates #408; found while auditing this file and fixed here rather than left to bite
+    /// the next unrelated PR.
+    ///
+    /// **Honesty about the fix:** the race was NOT reproduced locally — 25 runs at
+    /// `--test-threads=16` with the guard removed all passed, so the window is narrower than that
+    /// hammering reaches and this guard is not a *verified* fix for the observed failure. What it
+    /// is, definitely, is the convention these tests were violating: 50 sibling tests in this
+    /// module take `CONTEXT_GUARD` for exactly this state and these seven did not. So this closes
+    /// the only mechanism by which a sibling can evict the UE mid-test, whether or not that was
+    /// the mechanism on the one CI run that failed.
+    ///
+    /// The **existing** guard, never a new lock: #276 showed a second lock over the same
+    /// variables *hangs* the suite rather than merely flaking it.
     fn assign_ebi_request(supi: &str, body: Value) -> SbiResponse {
         let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/assign-ebi"))
             .with_body(body.to_string(), "application/json");
@@ -8130,6 +8152,16 @@ mod tests {
     /// a "just serialise the struct" implementation gets wrong.
     #[test]
     fn assign_ebi_allocates_from_a_per_ue_pool_and_answers_assigned_ebi_data() {
+        // #408: this family reads and writes the PROCESS-GLOBAL AMF context and the live UE
+        // store, and it did NOT take the guard -- so a sibling that publishes, releases or
+        // unpublishes could evict this test's UE mid-run and the assign would 404. CI caught
+        // exactly that once (a 404 where 200 was expected, "cycle 2 of eleven must fit"), while
+        // eight local runs and three earlier CI runs of the same commit passed -- a latent race,
+        // not a defect in the code under test. Taking the EXISTING guard rather than declaring a
+        // new lock: #276 showed a second lock over the same variables HANGS the suite.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let supi = "imsi-001010000000117";
         setup_ue(supi, true, true);
 
@@ -8201,6 +8233,10 @@ mod tests {
     /// hand 5 straight back out.
     #[test]
     fn assign_ebi_releases_before_it_assigns_so_a_freed_ebi_is_reusable() {
+        // #408: the process-global context guard; see the note on `assign_ebi_request`.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let supi = "imsi-001010000000118";
         setup_ue(supi, true, true);
 
@@ -8240,6 +8276,10 @@ mod tests {
     /// what `failedArpList` is for.
     #[test]
     fn assign_ebi_reports_exhaustion_rather_than_inventing_an_ebi() {
+        // #408: the process-global context guard; see the note on `assign_ebi_request`.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let supi = "imsi-001010000000119";
         setup_ue(supi, true, true);
 
@@ -8326,6 +8366,10 @@ mod tests {
     /// that re-attaches on the way to work reaches it inside a week.
     #[test]
     fn twelve_establish_release_cycles_keep_getting_an_ebi_and_twelve_without_release_do_not() {
+        // #408: the process-global context guard; see the note on `assign_ebi_request`.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let supi = "imsi-001010000000291";
         setup_ue(supi, true, true);
 
@@ -8397,6 +8441,10 @@ mod tests {
     /// whose release never arrives leaks one for the life of the process.
     #[test]
     fn deregistration_frees_the_ues_eps_bearer_identities() {
+        // #408: the process-global context guard; see the note on `assign_ebi_request`.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let supi = "imsi-001010000000293";
         setup_ue(supi, true, true);
 
@@ -8450,6 +8498,10 @@ mod tests {
     /// and an unknown UE.
     #[test]
     fn assign_ebi_rejects_a_malformed_request_and_an_unknown_ue() {
+        // #408: the process-global context guard; see the note on `assign_ebi_request`.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let supi = "imsi-001010000000120";
         setup_ue(supi, true, true);
 
@@ -8514,6 +8566,10 @@ mod tests {
     /// would leave the SMF believing an ARP change took effect.
     #[test]
     fn assign_ebi_modifies_a_held_ebi_and_409s_one_it_does_not_hold() {
+        // #408: the process-global context guard; see the note on `assign_ebi_request`.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let supi = "imsi-001010000000121";
         setup_ue(supi, true, true);
 

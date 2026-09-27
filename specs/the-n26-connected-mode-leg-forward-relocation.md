@@ -871,6 +871,39 @@ Both now say what is true and what is not:
 
 ---
 
+## 10b. A pre-existing test flake, found by CI and fixed here
+
+The dispatched run on the final commit **failed** in `Test`:
+`twelve_establish_release_cycles_keep_getting_an_ebi_and_twelve_without_release_do_not`
+answered **404 where 200 was expected** (*"cycle 2 of eleven must fit"*). The test is in
+`namf_server.rs` and this PR touches nothing near the EBI path.
+
+**Established as a flake, not a regression**, by re-dispatching the **byte-identical commit** —
+which passed. Three earlier CI runs of the branch also passed, and the amfd suite passed 8/8
+locally plus 3× at each of `--test-threads=1,2,4,8,16`.
+
+**The cause is a convention violation the audit surfaced.** A 404 means
+`find_ue_by_context_id` no longer resolved the UE, i.e. something removed it from the live
+store mid-test. **Seven** tests in that module read and write the process-global AMF context and
+the live store **without taking `crate::test_support::CONTEXT_GUARD`**, while **50** siblings in
+the same module do — including `release_ue_context_releases_the_context` and
+`cancel_relocate_ue_context_releases_the_relocated_context`, both of which call
+`amf_ue_unpublish`. A guarded test holding the guard does not exclude an unguarded one, so a
+release could evict the EBI test's UE between its cycles.
+
+All seven now take the **existing** guard. Never a new lock: #276 showed a second lock over the
+same variables *hangs* the suite rather than merely flaking it. `assign_ebi_request`, the helper
+they share, carries the full rationale so the next test added there inherits it.
+
+**Honesty about the fix, recorded at the site rather than only here:** the race was **not
+reproduced locally** — 25 runs at `--test-threads=16` with the guard removed all passed, so the
+window is narrower than that hammering reaches and this is not a *verified* fix for the observed
+failure. What it definitely is: closing the only mechanism by which a sibling can evict the UE
+mid-test, and bringing seven tests in line with the convention the other fifty follow. Claiming
+more than that would be the kind of overstatement this tree's ceilings exist to avoid.
+
+---
+
 ## 11. Verification
 
 - `cargo fmt --all -- --check` clean.
