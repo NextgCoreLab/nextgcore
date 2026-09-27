@@ -324,9 +324,550 @@ pub fn record_mapped_eps_bearer(
     }
 }
 
+/// An EPS PDN connection decoded from `SmContextCreateData.ueEpsPdnConnection`
+/// (TS 29.502 §6.1.6.2.2, `EpsPdnCnxContainer`), #415.
+///
+/// This is the **inbound** half of the interworking container. smfd has produced one
+/// since #78 (`main.rs`'s `build_ue_eps_pdn_connection`) and never consumed one, so an
+/// EPS→5GS move (TS 23.502 §4.11.1.2.2.2 step 4) reached an SMF that ignored every
+/// endpoint the MME supplied.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EpsPdnConnection {
+    /// The APN this PDN connection is for.
+    pub apn: String,
+    /// TS 24.301 PDN type: 1 = IPv4, 2 = IPv6, 3 = IPv4v6.
+    pub pdn_type: u8,
+    /// The UE's IPv4 address, when one is assigned.
+    pub ue_ipv4: Option<[u8; 4]>,
+    /// The EPS QCI of the default bearer (TS 24.301 §9.9.4.3).
+    pub qci: u8,
+    /// The Linked EPS Bearer ID — the PDN connection's default bearer.
+    pub linked_ebi: Option<u8>,
+    /// `PGW S5/S8 IP Address and TEID for Control Plane`, as `(teid, ipv4)`.
+    ///
+    /// `None` when the container carries none, which is the case for **every**
+    /// container this tree's own SMF produces — see the type docs on
+    /// [`parse_eps_pdn_connection`].
+    pub pgw_c_control_fteid: Option<(u32, [u8; 4])>,
+    /// Per-bearer user-plane F-TEIDs, as `(ebi, teid, ipv4)`.
+    pub bearer_fteids: Vec<(u8, u32, [u8; 4])>,
+}
+
+/// Decode a `ueEpsPdnConnection` container, accepting **both** formats this tree
+/// has to deal with.
+///
+/// # Two spellings of one container
+///
+/// TS 29.274 Table 7.3.6-3 NOTE 5 expects a conformant Table 7.3.6-2 **grouped IE**,
+/// which is what a real MME sends and what carries the endpoints. But this tree's own
+/// producer emits an ad-hoc **positional** layout instead (`build_ue_eps_pdn_connection`,
+/// `main.rs`, from #78):
+///
+/// ```text
+/// [APN length][APN bytes][PDN type][4 UE address octets][QCI][EBI (optional)]
+/// ```
+///
+/// `amfd/src/n26_path.rs`'s `pdn_connection_from_smf_container` documents that divergence
+/// and works around it by parsing the positional form and rebuilding a real grouped IE —
+/// sending a **reserved** all-zero PGW-C F-TEID because the positional layout *"carries
+/// neither"* that nor the APN-AMBR.
+///
+/// So a consumer that understood only the positional layout would satisfy #415's
+/// criterion 1 against our own producer while **dropping every endpoint a real MME
+/// sends** — the mirror of the defect #415 was filed about. Both are parsed.
+///
+/// # Why the grouped form is tried first
+///
+/// A grouped IE opens with an IE **type** octet (`Apn` = 71, `IpAddress` = 74); the
+/// positional layout opens with an APN **length**, which for a real APN is far below 71
+/// (`"internet"` is 8). Those ranges do not overlap in practice, but the discrimination
+/// is deliberately **not** written as a byte-range ladder over the first octet: nextgsim
+/// #201/#202 was exactly that shape, where a conformant PDU whose leading byte fell in a
+/// neighbouring arm's range was silently routed to the wrong branch. Instead the grouped
+/// decode is **attempted**, and the positional fallback runs only when it yields no APN —
+/// so a container that really is a grouped IE can never be read as the ad-hoc one,
+/// whatever its first octet happens to be.
+pub fn parse_eps_pdn_connection(container: &[u8]) -> Option<EpsPdnConnection> {
+    if container.is_empty() {
+        return None;
+    }
+    parse_grouped_pdn_connection(container).or_else(|| parse_positional_pdn_connection(container))
+}
+
+/// The conformant TS 29.274 Table 7.3.6-2 grouped IE — what a real MME sends.
+fn parse_grouped_pdn_connection(container: &[u8]) -> Option<EpsPdnConnection> {
+    use nextgcore_gtp::v2::Gtp2PdnConnectionIe;
+
+    let value = bytes::Bytes::copy_from_slice(container);
+    let pdn = Gtp2PdnConnectionIe::decode(&value).ok()?;
+    // The APN is mandatory in Table 7.3.6-2, so its absence means this is not a grouped
+    // PDN Connection — which is the signal to fall back rather than an error to report.
+    let apn_bytes = pdn.apn().ok()?.apn;
+    if apn_bytes.is_empty() {
+        return None;
+    }
+    // TS 29.274 §8.6 length-prefixes each APN label (`8"internet"3"com"`), which is how
+    // `Gtp2ApnIe::from_string` wrote it. Decoded back to dotted form so the value stored
+    // on the session is the same spelling every other DNN in this daemon uses.
+    let apn = decode_labelled_apn(&apn_bytes);
+    if apn.is_empty() {
+        return None;
+    }
+
+    let ue_ipv4 = pdn.ipv4_address();
+    let bearers = pdn.bearer_contexts().unwrap_or_default();
+    // The QCI of the default bearer. Table 7.3.6-2 carries QoS per Bearer Context, so it
+    // is read from the bearer the Linked EPS Bearer ID names rather than from the first
+    // in the list -- a multi-bearer PDN connection lists them in no guaranteed order.
+    let linked_ebi = pdn.linked_ebi().ok();
+    let qci = bearers
+        .iter()
+        .find(|b| linked_ebi.is_some_and(|ebi| b.ebi().ok() == Some(ebi)))
+        .or_else(|| bearers.first())
+        .and_then(|b| b.bearer_qos().ok().flatten())
+        .map(|qos| qos.qci)
+        .unwrap_or(0);
+
+    let bearer_fteids = bearers
+        .iter()
+        .filter_map(|b| {
+            let ebi = b.ebi().ok()?;
+            let fteid = b.fteid(0).ok().flatten()?;
+            Some((ebi, fteid.teid, fteid.ipv4_addr?))
+        })
+        .collect();
+
+    Some(EpsPdnConnection {
+        apn,
+        // Table 7.3.6-2 has no PDN Type IE of its own; the UE address is what
+        // discriminates, so an IPv4 address present means IPv4 (1) and its absence
+        // leaves the type unstated (0) rather than guessing IPv6.
+        pdn_type: if ue_ipv4.is_some() { 1 } else { 0 },
+        ue_ipv4,
+        qci,
+        linked_ebi,
+        pgw_c_control_fteid: pdn
+            .pgw_s5s8_control_fteid()
+            .ok()
+            .and_then(|f| Some((f.teid, f.ipv4_addr?))),
+        bearer_fteids,
+    })
+}
+
+/// Turn TS 29.274 §8.6's length-prefixed APN labels back into dotted form.
+///
+/// The inverse of `Gtp2ApnIe::from_string`, which the library has no decoder for. A label
+/// length running past the end of the buffer stops the walk and returns what was read so
+/// far rather than guessing: a truncated APN is a bad APN, and an empty result is what
+/// makes the caller fall through to the positional layout.
+fn decode_labelled_apn(encoded: &[u8]) -> String {
+    let mut labels = Vec::new();
+    let mut off = 0usize;
+    while off < encoded.len() {
+        let len = encoded[off] as usize;
+        if len == 0 || off + 1 + len > encoded.len() {
+            break;
+        }
+        labels.push(String::from_utf8_lossy(&encoded[off + 1..off + 1 + len]).to_string());
+        off += 1 + len;
+    }
+    labels.join(".")
+}
+
+/// #78's positional layout — what this tree's own SMF produces.
+///
+/// Carries no endpoints at all, which is stated at the call site rather than inferred:
+/// a session restored from one of these cannot address the PGW-C.
+fn parse_positional_pdn_connection(container: &[u8]) -> Option<EpsPdnConnection> {
+    let apn_len = *container.first()? as usize;
+    // A length octet longer than the buffer means this is not the layout this function
+    // knows, and guessing would build a session out of the wrong bytes.
+    if container.len() < 1 + apn_len + 1 + 4 + 1 {
+        return None;
+    }
+    let apn = String::from_utf8_lossy(&container[1..1 + apn_len]).to_string();
+    let mut off = 1 + apn_len;
+    let pdn_type = container[off];
+    off += 1;
+    let ue_ipv4: [u8; 4] = container[off..off + 4].try_into().ok()?;
+    off += 4;
+    let qci = container[off];
+    off += 1;
+    // #117 appends the EBI when one was assigned; #78's output stops at the QCI.
+    let linked_ebi = container.get(off).copied();
+
+    Some(EpsPdnConnection {
+        apn,
+        pdn_type,
+        // All-zero is the container's "no address assigned", not an address of 0.0.0.0.
+        ue_ipv4: (ue_ipv4 != [0, 0, 0, 0]).then_some(ue_ipv4),
+        qci,
+        linked_ebi,
+        pgw_c_control_fteid: None,
+        bearer_fteids: Vec::new(),
+    })
+}
+
+/// Which data-forwarding posture an `SmContextCreateData` asks for (#415).
+///
+/// TS 23.502 §4.11.1.2.2.2 step 4: *"Based on configuration and the Direct Forwarding
+/// Flag received from the MME, the initial AMF determines the applicability of data
+/// forwarding and indicates to the SMF whether the direct data forwarding or indirect
+/// data forwarding is applicable."* Step 7 is what makes the answer observable: *"If
+/// neither indirect forwarding nor direct forwarding is applicable, the SMF shall further
+/// include a 'Data forwarding not possible' indication in the N2 SM information
+/// container."*
+///
+/// The two members are `indirectForwardingFlag` and `directForwardingFlag`
+/// (`TS29502_Nsmf_PDUSession.yaml`, `SmContextCreateData`). Note what the issue's
+/// criterion 2 asked for instead — `hoPreparationIndication` — is **not** a member of
+/// this schema at all; it belongs to `PduSessionCreateData` and `HsmfUpdateData`, the
+/// H-SMF (home-routed roaming) bodies. The preparation semantics in *this* direction are
+/// carried by `hoState`; see [`HoPreparation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DataForwarding {
+    /// `indirectForwardingFlag`.
+    pub indirect: bool,
+    /// `directForwardingFlag`.
+    pub direct: bool,
+}
+
+impl DataForwarding {
+    /// Parse both flags from an `SmContextCreateData` body.
+    ///
+    /// Absent means `false` for each: neither member has a schema `default`, and an
+    /// absent flag is the AMF not asserting that forwarding path, which is what `false`
+    /// says.
+    pub fn from_body(body: &serde_json::Value) -> Self {
+        Self {
+            indirect: body
+                .get("indirectForwardingFlag")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            direct: body
+                .get("directForwardingFlag")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        }
+    }
+
+    /// Whether step 7's *"Data forwarding not possible"* indication is owed.
+    ///
+    /// True exactly when **neither** path applies, per the step-7 sentence quoted on
+    /// [`DataForwarding`]. Written as a named method rather than inlined at the call
+    /// site so the negation is stated once: `!indirect && !direct` spelled out at two
+    /// sites is how the two halves of one wire fact drift apart.
+    pub fn not_possible(self) -> bool {
+        !self.indirect && !self.direct
+    }
+}
+
+/// The handover-preparation state an `SmContextCreateData` carries (#415).
+///
+/// TS 29.502 §5.2.2.3.4.1 defines `hoState` on an SM context. `PREPARING` is the value
+/// that means what TS 23.502 step 4 calls the HO Preparation Indication:
+///
+/// > **PREPARING**: a handover is in preparation for the PDU session; SMF is preparing
+/// > the N3 tunnel between the target 5G-AN and UPF, i.e. **the UPF's F-TEID is assigned
+/// > for uplink traffic**
+///
+/// That is step 6's CN Tunnel Info allocation *without* the downlink switch — which is
+/// exactly step 4's parenthetical *"(to avoid switching the UP path)"*. `PREPARED` is
+/// then defined as the target 5G-AN's F-TEID being assigned *"upon handover execution"*,
+/// i.e. the DL switch this path must not perform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HoPreparation {
+    /// `hoState` absent or `NONE` — an ordinary session establishment.
+    #[default]
+    None,
+    /// `hoState: PREPARING` — allocate the uplink CN tunnel, leave the DL path alone.
+    Preparing,
+    /// Any other value (`PREPARED`, `COMPLETED`, `CANCELLED`, or a future extension).
+    ///
+    /// Kept distinct from `None` rather than collapsed into it: those are states of an
+    /// **existing** handover and do not belong on a create, so a create carrying one is
+    /// a peer defect worth naming rather than silently treating as no handover.
+    Other,
+}
+
+impl HoPreparation {
+    /// Parse `hoState` from an `SmContextCreateData` body.
+    pub fn from_body(body: &serde_json::Value) -> Self {
+        match body.get("hoState").and_then(|v| v.as_str()) {
+            Some("PREPARING") => Self::Preparing,
+            Some("NONE") | None => Self::None,
+            // The type is `anyOf [enum, string]` for forward-compatibility, so an
+            // unrecognised value must not fail the session.
+            Some(_) => Self::Other,
+        }
+    }
+
+    /// Whether the user plane must be left untouched for this create.
+    pub fn is_preparing(self) -> bool {
+        matches!(self, Self::Preparing)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- #415: the inbound ueEpsPdnConnection container ----
+
+    /// Build the CONFORMANT TS 29.274 Table 7.3.6-2 grouped IE — what a real MME sends,
+    /// and the only form that carries endpoints at all.
+    fn grouped_container(
+        apn: &str,
+        ue_ipv4: [u8; 4],
+        ebi: u8,
+        qci: u8,
+        pgw_teid: u32,
+        pgw_addr: [u8; 4],
+    ) -> Vec<u8> {
+        use nextgcore_gtp::v2::{
+            Gtp2BearerContextIe, Gtp2BearerQosIe, Gtp2EbiIe, Gtp2FTeidIe, Gtp2Ie, Gtp2IeType,
+            Gtp2PdnConnectionIe,
+        };
+        let mut pdn = Gtp2PdnConnectionIe::new();
+        pdn.add_ie(nextgcore_gtp::v2::Gtp2ApnIe::from_string(apn).to_ie(0));
+        pdn.add_ie(Gtp2Ie::from_slice(Gtp2IeType::IpAddress as u8, 0, &ue_ipv4));
+        pdn.add_ie(Gtp2EbiIe::new(ebi).to_ie(0));
+        // Interface type 7 = S5/S8 PGW GTP-C (TS 29.274 Table 8.22-1).
+        pdn.add_ie(Gtp2FTeidIe::new_ipv4(7, pgw_teid, pgw_addr).to_ie(0));
+        let mut bearer = Gtp2BearerContextIe::new();
+        bearer.set_ebi(ebi);
+        bearer.set_bearer_qos(&Gtp2BearerQosIe::new(qci, 0, 0, 0, 0));
+        pdn.add_ie(bearer.to_ie(0));
+        let mut buf = bytes::BytesMut::new();
+        pdn.encode_value(&mut buf);
+        buf.to_vec()
+    }
+
+    /// Build #78's POSITIONAL layout — what this tree's own SMF produces.
+    fn positional_container(
+        apn: &str,
+        pdn_type: u8,
+        ue_ipv4: [u8; 4],
+        qci: u8,
+        ebi: Option<u8>,
+    ) -> Vec<u8> {
+        let mut buf = vec![apn.len() as u8];
+        buf.extend_from_slice(apn.as_bytes());
+        buf.push(pdn_type);
+        buf.extend_from_slice(&ue_ipv4);
+        buf.push(qci);
+        if let Some(ebi) = ebi {
+            buf.push(ebi);
+        }
+        buf
+    }
+
+    /// The criterion-1 assertion: a conformant container yields every field INCLUDING the
+    /// PGW-C endpoint, which is the whole point of #415 and the one thing the positional
+    /// form cannot carry.
+    ///
+    /// Literal values, asserted field by field rather than as a round trip: a round trip
+    /// passes whether or not the parse reads the right octets.
+    #[test]
+    fn a_conformant_grouped_container_yields_the_pgw_c_endpoint() {
+        const APN: &str = "ims.mnc001.mcc001.gprs";
+        const EBI: u8 = 6;
+        const QCI: u8 = 5;
+        const PGW_TEID: u32 = 0x0415_1234;
+        const PGW_ADDR: [u8; 4] = [10, 41, 5, 7];
+        const UE_ADDR: [u8; 4] = [10, 45, 0, 99];
+
+        let parsed = parse_eps_pdn_connection(&grouped_container(
+            APN, UE_ADDR, EBI, QCI, PGW_TEID, PGW_ADDR,
+        ))
+        .expect("a conformant Table 7.3.6-2 grouped IE must parse");
+
+        assert_eq!(
+            parsed.apn, APN,
+            "the APN's labels must decode to dotted form"
+        );
+        assert_eq!(parsed.ue_ipv4, Some(UE_ADDR));
+        assert_eq!(parsed.linked_ebi, Some(EBI));
+        assert_eq!(
+            parsed.qci, QCI,
+            "the QCI comes from the LINKED bearer's QoS"
+        );
+        assert_eq!(
+            parsed.pgw_c_control_fteid,
+            Some((PGW_TEID, PGW_ADDR)),
+            "the PGW-C S5/S8 control F-TEID is what #415 exists to consume; without it \
+             the session cannot address the PGW-C for a later S5/S8 procedure"
+        );
+    }
+
+    /// #78's positional container yields the five fields it carries, and states the
+    /// ceiling: NO endpoints. Asserted as `None` rather than omitted, because "the
+    /// endpoint is absent" is the fact a later reader needs.
+    #[test]
+    fn the_positional_container_yields_its_fields_and_no_endpoints() {
+        const APN: &str = "internet";
+        const EBI: u8 = 9;
+        const QCI: u8 = 8;
+        const UE_ADDR: [u8; 4] = [10, 45, 1, 77];
+
+        let parsed =
+            parse_eps_pdn_connection(&positional_container(APN, 1, UE_ADDR, QCI, Some(EBI)))
+                .expect("#78's own layout must still parse");
+
+        assert_eq!(parsed.apn, APN);
+        assert_eq!(parsed.pdn_type, 1);
+        assert_eq!(parsed.ue_ipv4, Some(UE_ADDR));
+        assert_eq!(parsed.qci, QCI);
+        assert_eq!(parsed.linked_ebi, Some(EBI));
+        assert_eq!(
+            parsed.pgw_c_control_fteid, None,
+            "#78's positional layout carries no PGW-C F-TEID; amfd's \
+             pdn_connection_from_smf_container sends the RESERVED value for exactly this reason"
+        );
+        assert!(parsed.bearer_fteids.is_empty());
+    }
+
+    /// **The discrimination guard.** A conformant grouped IE must NOT be read as the
+    /// positional layout, and vice versa.
+    ///
+    /// This is the test that fails if the two parses are tried in the wrong order, or if
+    /// the discrimination is written as a byte-range ladder over the first octet. nextgsim
+    /// #201/#202 was that exact defect: a conformant PDU whose leading byte fell inside a
+    /// neighbouring arm's range was silently routed to the wrong branch and the failure
+    /// looked like a peer problem. Asserted as a DIFFERENCE — the same bytes must not
+    /// produce the same reading under both parses — because only that distinguishes real
+    /// discrimination from a parse that happens to succeed.
+    #[test]
+    fn the_two_container_formats_are_not_confused_for_each_other() {
+        const APN: &str = "internet";
+        let grouped = grouped_container(APN, [10, 45, 0, 1], 6, 5, 0x0415_0001, [10, 41, 0, 1]);
+        let positional = positional_container(APN, 1, [10, 45, 0, 2], 8, Some(9));
+
+        // The grouped form opens with an IE TYPE octet (Apn = 71); the positional form
+        // opens with an APN LENGTH (8 for "internet"). Pinned so a future change to either
+        // producer that made the two collide fails here rather than silently.
+        assert_eq!(grouped[0], 71, "a grouped IE opens with the APN IE type");
+        assert_eq!(positional[0], APN.len() as u8);
+
+        let from_grouped = parse_eps_pdn_connection(&grouped).expect("grouped must parse");
+        let from_positional = parse_eps_pdn_connection(&positional).expect("positional must parse");
+
+        // The discriminating fact: only the grouped form yields an endpoint. If the
+        // grouped container were misparsed as positional, this would be None.
+        assert!(
+            from_grouped.pgw_c_control_fteid.is_some(),
+            "the grouped container was read as the positional layout, losing its endpoints"
+        );
+        assert!(from_positional.pgw_c_control_fteid.is_none());
+        // And the two must not agree on the UE address, which is what proves each was read
+        // with its own layout rather than one of them being coerced into the other.
+        assert_ne!(from_grouped.ue_ipv4, from_positional.ue_ipv4);
+    }
+
+    /// A container that is neither format is refused rather than half-read. Guessing would
+    /// build a session out of the wrong bytes.
+    #[test]
+    fn an_unparseable_container_is_refused() {
+        // An APN length octet claiming more bytes than the buffer holds, and not a valid
+        // grouped IE either.
+        assert_eq!(parse_eps_pdn_connection(&[0xFF, 0x01, 0x02]), None);
+        assert_eq!(parse_eps_pdn_connection(&[]), None);
+    }
+
+    /// The APN label decoder is the inverse of `Gtp2ApnIe::from_string`, which the GTP
+    /// library ships without a decoder. A truncated label stops the walk rather than
+    /// reading past the buffer.
+    #[test]
+    fn labelled_apns_decode_to_dotted_form_and_truncation_stops_the_walk() {
+        assert_eq!(
+            decode_labelled_apn(&[8, b'i', b'n', b't', b'e', b'r', b'n', b'e', b't']),
+            "internet"
+        );
+        assert_eq!(
+            decode_labelled_apn(&[3, b'i', b'm', b's', 3, b'c', b'o', b'm']),
+            "ims.com"
+        );
+        // A length octet running past the end: what was read survives, the rest is not
+        // invented.
+        assert_eq!(decode_labelled_apn(&[3, b'i', b'm', b's', 9, b'x']), "ims");
+        assert_eq!(decode_labelled_apn(&[]), "");
+    }
+
+    // ---- #415: the forwarding flags and the handover state ----
+
+    /// Step 7's *"Data forwarding not possible"* indication is owed exactly when NEITHER
+    /// path applies. Asserted across all four combinations, because the interesting value
+    /// is the one where both are absent and a one-sided test would miss it.
+    #[test]
+    fn data_forwarding_not_possible_is_true_only_when_neither_path_applies() {
+        let cases = [
+            (None, None, true),
+            (Some(true), None, false),
+            (None, Some(true), false),
+            (Some(true), Some(true), false),
+            (Some(false), Some(false), true),
+        ];
+        for (indirect, direct, expected_not_possible) in cases {
+            let mut body = serde_json::json!({});
+            if let Some(v) = indirect {
+                body["indirectForwardingFlag"] = serde_json::json!(v);
+            }
+            if let Some(v) = direct {
+                body["directForwardingFlag"] = serde_json::json!(v);
+            }
+            let parsed = DataForwarding::from_body(&body);
+            assert_eq!(
+                parsed.not_possible(),
+                expected_not_possible,
+                "indirect={indirect:?} direct={direct:?} must yield \
+                 not_possible={expected_not_possible} (TS 23.502 §4.11.1.2.2.2 step 7)"
+            );
+            assert_eq!(parsed.indirect, indirect.unwrap_or(false));
+            assert_eq!(parsed.direct, direct.unwrap_or(false));
+        }
+    }
+
+    /// `hoState` is what carries the preparation semantics in this direction — NOT
+    /// `hoPreparationIndication`, which #415's criterion 2 named and which belongs to
+    /// `PduSessionCreateData` / `HsmfUpdateData` (the H-SMF roaming bodies) rather than to
+    /// `SmContextCreateData`.
+    ///
+    /// The last case is the one that matters for that correction: a body carrying ONLY
+    /// `hoPreparationIndication` must NOT be read as a preparation, because no conformant
+    /// AMF sends it here and honouring it would be an arm production can never reach.
+    #[test]
+    fn ho_state_carries_the_preparation_and_ho_preparation_indication_does_not() {
+        assert_eq!(
+            HoPreparation::from_body(&serde_json::json!({ "hoState": "PREPARING" })),
+            HoPreparation::Preparing
+        );
+        assert!(
+            HoPreparation::from_body(&serde_json::json!({ "hoState": "PREPARING" })).is_preparing()
+        );
+        assert_eq!(
+            HoPreparation::from_body(&serde_json::json!({})),
+            HoPreparation::None
+        );
+        assert_eq!(
+            HoPreparation::from_body(&serde_json::json!({ "hoState": "NONE" })),
+            HoPreparation::None
+        );
+        // States of an EXISTING handover: distinct from None so the create path can name
+        // them as a peer defect.
+        for state in ["PREPARED", "COMPLETED", "CANCELLED", "SOME_FUTURE_VALUE"] {
+            assert_eq!(
+                HoPreparation::from_body(&serde_json::json!({ "hoState": state })),
+                HoPreparation::Other,
+                "hoState={state} is not a state a create can be in"
+            );
+        }
+        assert_eq!(
+            HoPreparation::from_body(&serde_json::json!({ "hoPreparationIndication": true })),
+            HoPreparation::None,
+            "hoPreparationIndication is not a member of SmContextCreateData; honouring it \
+             would add an arm no conformant AMF can reach"
+        );
+    }
 
     #[test]
     fn the_leg_is_off_by_default() {

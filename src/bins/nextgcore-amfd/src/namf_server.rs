@@ -4378,17 +4378,51 @@ fn apply_ue_context_json(ue: &mut AmfUe, ue_context: &Value) -> Option<String> {
 ///    `UeContextRelocateData`, put there by the *initial* AMF, which already decoded the
 ///    Forward Relocation Request. And that schema (`TS29518_Namf_Communication.yaml:3717-3746`)
 ///    has no member for them at all; they ride inside `ueContext`.
-/// 3. **The SMF cannot consume them.** `handle_sm_context_create`
-///    (`smfd/src/main.rs:2941`) reads no `ueEpsPdnConnection`, no `epsBearerContext` and no HO
-///    Preparation Indication. smfd *produces* that container (`build_ue_eps_pdn_connection`,
-///    `main.rs:5706`, from #78) and has never consumed one. So a perfectly-built call from
-///    here would be answered by an SMF that ignores the endpoints — not "correct but
-///    unreachable" but its mirror, **reachable but inert**.
+/// 3. **The SMF could not consume them.** This was true until #415 and is now **FIXED**:
+///    `handle_sm_context_create` parses `ueEpsPdnConnection` (both the conformant
+///    TS 29.274 Table 7.3.6-2 grouped IE and #78's positional layout), honours `hoState:
+///    PREPARING` without switching the UP path, stores the PGW-C S5/S8 control-plane
+///    F-TEID on the session, and answers step 7 with the EBI↔QFI mapping and the *"Data
+///    forwarding not possible"* indication. So the call is no longer **reachable but
+///    inert**.
 ///
-/// So the honest statement: the N26 transport, both codecs, idle-mode context transfer
-/// (#347) and the connected-mode Forward Relocation procedure (#408) all exist, and
-/// `/relocate` still cannot move N3 tunnels because the SMF-side `CreateSMContext` consumer
-/// does not. That is **#415**, which is an smfd-shaped piece of work.
+/// # What is actually missing now — and it is NOT in this function
+///
+/// #415's own criterion 5 asked *this* handler to drive that `CreateSMContext`. It does
+/// not, and the reason is structural rather than unfinished work. Four findings, each
+/// pinned at `40070ae`:
+///
+/// 1. **`/relocate` is the *target* AMF's handler.** TS 29.518 §5.2.2.2.5.1
+///    (`29518-k00.txt:2934-2941`) scopes it to an EPS→5GS handover *"**with AMF
+///    re-allocation**, to relocate the UE Context in the target AMF"*.
+/// 2. **By the time it runs, the SM contexts already exist.** TS 23.502 step **8a**
+///    (`23502-k20.txt:21511-21522`) is where `RelocateUEContext` is invoked — *after* step
+///    7 — and its parameter list carries *"SMF+PGW-C ID of each PDU Session, default V-SMF
+///    ID and **SM Context ID of each PDU Session, allocated EBIs** of each PDU Session"*.
+///    Creating contexts here would duplicate what step 4 created.
+/// 3. **This handler cannot make the call.** It is a synchronous `fn`, dispatched
+///    synchronously from the router above. An `Nsmf_PDUSession_CreateSMContext` is an
+///    awaited HTTP call.
+/// 4. **There is no initial-AMF leg to drive it from.** This handler validates that the
+///    `forwardRelocationRequest` part *exists* and never decodes it — this module has zero
+///    GTP imports. More decisively, amfd's N26 dispatcher (`n26_path.rs`'s
+///    `handle_datagram`) handles `EchoRequest`/`EchoResponse`, `ContextRequest`,
+///    `ContextAcknowledge`, `ForwardRelocationResponse`,
+///    `ForwardRelocationCompleteNotification` and `ForwardRelocationCompleteAcknowledge` —
+///    i.e. **the 5GS→EPS direction only**. A `ForwardRelocationRequest` (type 133)
+///    *arriving* is not dispatched at all. `n26_build.rs` already says so for its own
+///    deliberately-absent builder: this AMF is the target only in EPS→5GS.
+///
+/// So the honest statement, and it is a **smaller** claim than the two this comment has
+/// carried before: every piece downstream of the initial AMF now exists — the N26
+/// transport, both codecs, idle-mode context transfer (#347), the connected-mode Forward
+/// Relocation procedure (#408) and the SMF's `CreateSMContext` consumer (#415). What is
+/// missing is the **initial-AMF leg itself**: amfd never receives a
+/// `ForwardRelocationRequest`, so nothing in this tree converts an EPS MM Context into a
+/// 5GS one, resolves the SMF+PGW-C via the NRF by its S5/S8 FQDN (step 3,
+/// `23502-k20.txt:21389-21393`), or calls step 4. That is **#418**, and it is amfd-shaped
+/// work in the *inbound* N26 direction rather than anything this function can do — which
+/// is why this comment names a handler other than itself for the first time.
 fn record_transferred_sessions(ue_id: u64, ue_context: &Value, ue_context_id: &str) -> usize {
     let Some(sessions) = ue_context
         .get("sessionContextList")
@@ -4435,14 +4469,17 @@ fn record_transferred_sessions(ue_id: u64, ue_context: &Value, ue_context_id: &s
     if recorded > 0 {
         log::warn!(
             "[{ue_context_id}] {recorded} transferred PDU session(s) RECORDED but their N3 \
-             tunnels are NOT re-established. The operation this needs is \
-             Nsmf_PDUSession_CreateSMContext with the UE EPS PDN Connection and an HO \
-             Preparation Indication (TS 23.502 §4.11.1.2.2.2 step 4) -- NOT \
-             Nsmf_PDUSession_UpdateSMContext, which in this direction carries only a Handover \
-             Complete Indication (step 7). #347 built the N26 leg and #408 landed the Forward \
-             Relocation consumer, so the endpoints CAN now be decoded; what is missing is that \
-             smfd's handle_sm_context_create reads no ueEpsPdnConnection at all, so the call \
-             would be answered by an SMF that ignores it. That is #415."
+             tunnels are NOT re-established. This is NOT the place that re-establishes them: \
+             TS 29.518 §5.2.2.2.5.1 scopes /relocate to an EPS->5GS handover WITH AMF \
+             re-allocation, and TS 23.502 step 8a invokes it AFTER step 7 carrying the 'SM \
+             Context ID of each PDU Session, allocated EBIs' -- i.e. contexts the INITIAL AMF \
+             already created in step 4. smfd now consumes the UE EPS PDN Connection on \
+             CreateSMContext (#415), so the SMF side is done. What is missing is the \
+             initial-AMF leg: this AMF's N26 dispatcher handles no inbound \
+             ForwardRelocationRequest (type 133) at all, so nothing converts the EPS MM \
+             Context, resolves the SMF+PGW-C through the NRF by its S5/S8 FQDN (step 3), or \
+             calls step 4. That is #418. Until it exists, a UE arriving from EPS reaches \
+             this AMF only through a peer that already did steps 3-8."
         );
     }
     recorded
