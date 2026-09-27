@@ -724,8 +724,9 @@ Each behavioural claim was made to fail, the **named** test watched to fail, and
 | `bearers_without_forwarding` emptied | same |
 | `nas_count_lsb` taken from the post-increment count | same |
 | `DirectForwardingPathAvailability` arm removed from `parse_handover_required` | `handover_required_keeps_the_direct_forwarding_path_availability_ie` |
+| `take_forward_relocation_source` made to answer `Some` for every UE | `the_complete_notification_fires_only_for_a_ue_that_arrived_over_n26` |
 
-### Two revert-verifications found real gaps
+### Three revert-verifications found real gaps
 
 **(1) The truth table was too narrow.** Forcing `socket_bound` to `true` initially **passed
 the whole amfd suite**. The reason is the finding, not a footnote: the first draft's table
@@ -746,6 +747,33 @@ test now writes the **literal `2`** and plants a **decoy at instance 0** (the eN
 Table 7.3.2-2 conditions on a 4G-to-5G handover), so a wrong constant fails on both sides. The
 general lesson, and it applies to every instance-keyed IE in this tree: a test that uses the
 constant under test on both sides of a round trip pins nothing about that constant.
+
+**(3) A builder with only a test caller — caught by grepping, not by a failing test.**
+`build_forward_relocation_complete_notification` existed in **both** crates with no production
+caller at all: the "correct but unreachable" defect this tree keeps growing, and criterion 2
+(*"Complete Notification/Acknowledge complete the procedure, so the source node learns the move
+succeeded and can release"*) was therefore **not** satisfied by having the encoder. Two different
+fixes, because the two crates are in different positions:
+
+- **mmed** IS the target of a 5GS→EPS move, so the builder is now driven from
+  `s1ap_handler::handle_handover_notify` via `n26_path::notify_forward_relocation_complete`. That
+  needed new state (`ForwardRelocationSource`, keyed by `mme_ue_id`) because S1AP's HandoverNotify
+  carries **nothing** saying where the UE came from — so without a record the MME would notify an
+  AMF on every intra-LTE handover. Fired **before** the source-context release, because an N26
+  arrival has no local source eNB context and the `enb_ue_find_by_id` below takes an early exit
+  that would skip the notification.
+- **amfd** is the **source** in the only direction #408 implements: it receives 135 and answers
+  136. It is the target only in EPS→5GS, which needs #415's `CreateSMContext` consumer. So its
+  builder was **deleted** and replaced by a comment recording why a builder there would be
+  unreachable. Deleting beat keeping: an encoder no caller can reach is the defect, not the
+  mitigation.
+
+The guard test then needed its own fix. Asserting on `notify_forward_relocation_complete` could
+not distinguish "not an N26 arrival" from "no bound socket" — both answer `false`, so dropping the
+gate entirely still passed. The decision is now split out as `take_forward_relocation_source` and
+the test asserts on that, which is the same decision/transmission split
+`inter_system_handover_refusal` uses. **General lesson:** when a function's failure paths
+collapse to one return value, a test on that value pins none of them.
 
 **One thing the revert sweep caught in the code rather than the tests.**
 `CAUSE_RELOCATION_FAILURE` was first written as **75**, inferred from §7.3.2's prose position
@@ -837,7 +865,7 @@ Both now say what is true and what is not:
 
 - `cargo fmt --all -- --check` clean.
 - `cargo clippy --workspace` clean (warnings are errors); **no `#[allow]` added**.
-- `cargo test --workspace`: **6902 → 6921** passed, 0 failed. This change adds **19**.
+- `cargo test --workspace`: **6902 → 6922** passed, 0 failed. This change adds **20**.
 - `nextgcore-crypt`, `nextgcore-gtp`, `nextgcore-ngap`, `nextgcore-amfd`, `nextgcore-mmed`
   suites looped **10×** with `head -1 /proc/loadavg` noted each pass, because five of the new
   tests touch process-global context and a pass that only ever ran once proves nothing about

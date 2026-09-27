@@ -487,32 +487,21 @@ pub fn build_forward_relocation_complete_acknowledge(
     msg
 }
 
-/// Build a **Forward Relocation Complete Notification** (TS 29.274 §7.3.3, type 135).
-///
-/// The AMF sends this as the **target** in an EPS→5GS handover: TS 23.502 §4.11.1.2.2.3 step 5
-/// (`23502-k20.txt:21738-21741`) — *"the target AMF knows that the UE has arrived to the target
-/// side and informs the MME by sending a Forward Relocation Complete Notification message"*.
-///
-/// Table 7.3.3-1 (`29274-j60.txt:19500`) has **no mandatory IE at all** — only a conditional
-/// `Indication Flags` and a `Private Extension`. The Indication is *"included if any of the
-/// flags are set to 1"*, and none of the three it lists applies here: ISRAI is *"for inter-RAT
-/// handover and the UE has ISR capability"* (ISR is an EPS/GPRS idle-mode feature this core
-/// does not implement), `Notify Source eNB Indication` is set only when *"the target MME
-/// receives this indication in the Handover Notify from the target eNodeB"* (this node's target
-/// is NG-RAN, and NGAP's HandoverNotify has no such IE), and the IWK-SCEF flag concerns a node
-/// this core has no interface to. So the message is a header and nothing else, which is
-/// conformant rather than incomplete.
-pub fn build_forward_relocation_complete_notification(
-    sequence_number: u32,
-    mme_teid: u32,
-) -> Gtp2Message {
-    let header = Gtp2Header::new(
-        Gtp2MessageType::ForwardRelocationCompleteNotification as u8,
-        mme_teid,
-        sequence_number,
-    );
-    Gtp2Message::new(header)
-}
+// A **Forward Relocation Complete Notification** (type 135) builder is deliberately ABSENT from
+// this module, and the absence is the point.
+//
+// §7.3.3 (`29274-j60.txt:19493-19495`) has the notification sent *"to the source MME/SGSN/AMF"*
+// -- so it is the TARGET's message. This AMF is the **source** in the only direction #408
+// implements (5GS to EPS): it RECEIVES 135 and answers 136, which
+// `build_forward_relocation_complete_acknowledge` above does.
+//
+// The AMF is the target only in EPS to 5GS, and reaching that point needs the preparation of
+// TS 23.502 §4.11.1.2.2.2 steps 4-7 -- an `Nsmf_PDUSession_CreateSMContext` carrying the UE EPS
+// PDN Connection, which smfd does not consume (#415). So a builder here would have NO production
+// caller, and an encoder no caller can reach is the "correct but unreachable" defect this tree
+// keeps growing. mmed has the builder because mmed IS the target of a 5GS-to-EPS move and
+// `s1ap_handler::handle_handover_notify` drives it through
+// `n26_path::notify_forward_relocation_complete`.
 
 /// Encode a `Target Identification` IE body for a target eNB (TS 29.274 §8.51).
 ///
@@ -957,18 +946,19 @@ mod tests {
             "Cause is the ONLY mandatory IE of Table 7.3.4-1 (29274-j60.txt:19554)"
         );
 
-        let notify = build_forward_relocation_complete_notification(5, 0x0408_DDDD);
+        // No Complete NOTIFICATION builder is asserted here, because this module has none: this
+        // AMF is the SOURCE in the direction #408 implements, so it receives 135 and answers
+        // 136. The note above `encode_target_identification` records why a builder here would
+        // have no production caller; mmed's
+        // `forward_relocation_response_carries_its_table_7_3_2_1_ies` covers the one that IS
+        // driven.
+        //
+        // The type number is still pinned, because `handle_datagram` dispatches on it.
         assert_eq!(
-            notify.header.message_type, 135,
-            "Forward Relocation Complete Notification is type 135 (29274-j60.txt:2428)"
-        );
-        assert_eq!(notify.header.teid, Some(0x0408_DDDD));
-        assert!(
-            notify.get_ie(Gtp2IeType::Indication as u8, 0).is_none(),
-            "Table 7.3.3-1 has NO mandatory IE and includes the Indication only 'if any of \
-             the flags are set to 1' (29274-j60.txt:19505). None of its three applies to this \
-             core -- ISRAI needs ISR, Notify-Source-eNB needs a target eNodeB (this node's \
-             target is NG-RAN), and the IWK-SCEF flag names a node with no interface here."
+            Gtp2MessageType::ForwardRelocationCompleteNotification as u8,
+            135,
+            "Forward Relocation Complete Notification is type 135 (29274-j60.txt:2428), and \
+             this AMF must recognise it on receipt even though it never builds one"
         );
     }
 

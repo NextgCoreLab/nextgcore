@@ -1659,6 +1659,30 @@ pub fn handle_handover_notify(
         }
     }
 
+    // #408: if this UE arrived over N26 from a source AMF, that AMF must be told. TS 23.502
+    // §4.11.1.2.1 step 12d has it answer with a Complete Acknowledge and only THEN start the
+    // timer that releases its NG-RAN resources (step 21), so an MME that stays silent leaves
+    // the source gNB holding radio resources for a UE that has left.
+    //
+    // Answers `false` for an intra-LTE handover, which is the common case and reaches here too
+    // -- the record is what distinguishes them, because S1AP's HandoverNotify carries nothing
+    // that says where the UE came from. Fired BEFORE the source-context release below, because
+    // an N26 arrival has no LOCAL source eNB context: its source is an NG-RAN node this MME
+    // never spoke to, so the `enb_ue_find_by_id` below returns None and takes an early exit
+    // that would skip this notification entirely.
+    //
+    // This is also the PRODUCTION caller of
+    // `n26_build::build_forward_relocation_complete_notification`. Without it that builder would
+    // have only a test caller, which is the "correct but unreachable" defect this tree keeps
+    // growing -- and the first draft of #408 had exactly that.
+    if crate::n26_path::notify_forward_relocation_complete(target_ue.mme_ue_id) {
+        log::info!(
+            "UE {} completed a 5GS-to-EPS handover: its source AMF has been notified over N26 \
+             (TS 29.274 §7.3.3)",
+            target_ue.mme_ue_id
+        );
+    }
+
     // Release the source eNB context (TS 36.413 §8.4.3: successful handover)
     let Some(source_ue) = ctx.enb_ue_find_by_id(target_ue.source_ue_id) else {
         return Vec::new();

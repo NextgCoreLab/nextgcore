@@ -194,6 +194,131 @@ pub fn clear_pending_context_requests_for_test() {
     }
 }
 
+/// Where a UE that arrived over N26 came from, so its source AMF can be told it landed (#408).
+///
+/// # Why this exists
+///
+/// The S1AP path that learns the UE arrived (`s1ap_handler::handle_handover_notify`) knows only
+/// the eNB's identifiers. Without this record it cannot tell an N26 arrival from an intra-LTE
+/// one, and TS 23.502 §4.11.1.2.1 step 12d makes the difference load-bearing: the source AMF
+/// starts the timer that releases its NG-RAN resources *on this notification*, so an MME that
+/// stays silent leaves the source gNB holding radio resources for a UE that has left.
+///
+/// Keyed by `mme_ue_id` because that is the identity `handle_handover_notify` resolves to, so
+/// there is one notion of "which UE arrived" rather than two that can disagree.
+#[derive(Debug, Clone, Copy)]
+pub struct ForwardRelocationSource {
+    /// The source AMF's N26 address.
+    pub peer: SocketAddr,
+    /// The TEID from its Sender's F-TEID, which the notification must be addressed to.
+    pub amf_teid: u32,
+}
+
+static FORWARD_RELOCATION_SOURCES: OnceLock<Mutex<HashMap<u64, ForwardRelocationSource>>> =
+    OnceLock::new();
+
+fn forward_relocation_sources() -> &'static Mutex<HashMap<u64, ForwardRelocationSource>> {
+    FORWARD_RELOCATION_SOURCES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_forward_relocation_source(mme_ue_id: u64, source: ForwardRelocationSource) {
+    if let Ok(mut map) = forward_relocation_sources().lock() {
+        map.insert(mme_ue_id, source);
+    }
+}
+
+/// Take this UE's N26 arrival record, if it has one — the decision half of
+/// [`notify_forward_relocation_complete`] (#408).
+///
+/// `Some` means "this UE arrived over N26 from that AMF, and it must be told". `None` means an
+/// intra-LTE handover, which is the common case and reaches the same S1AP handler: S1AP's
+/// HandoverNotify carries nothing about where the UE came from, so this record is the ONLY thing
+/// distinguishing the two.
+///
+/// **Taken, not read.** A UE arrives once. A retained record would have a later handover for the
+/// same UE notify its old source AMF a second time, and each notification starts a fresh
+/// resource-release timer there (TS 23.502 §4.11.1.2.1 step 12d).
+///
+/// Public so the decision can be asserted without a bound socket — a test that could only
+/// observe the send would read `false` for "not an N26 arrival" and `false` for "no socket"
+/// alike, and so could not tell a missing gate from a missing socket.
+pub fn take_forward_relocation_source(mme_ue_id: u64) -> Option<ForwardRelocationSource> {
+    forward_relocation_sources().lock().ok()?.remove(&mme_ue_id)
+}
+
+/// Tell the source AMF that a UE which arrived over N26 has landed (TS 29.274 §7.3.3), #408.
+///
+/// Answers `false` when this UE did not arrive over N26, which is the common case — every
+/// intra-LTE handover reaches here too, and an MME that sent a Forward Relocation Complete
+/// Notification for one would be telling an AMF about a UE it never handed over.
+///
+/// The record is **taken**, not read: a UE arrives once, and a retained record would have a
+/// later handover for the same UE notify an AMF a second time. That is also what makes the
+/// return value meaningful — a second call for one arrival answers `false`.
+///
+/// # Production caller
+///
+/// `s1ap_handler::handle_handover_notify`, reached from the S1AP receive loop's
+/// `HandoverNotify` arm — a live path, not a test-only function.
+pub fn notify_forward_relocation_complete(mme_ue_id: u64) -> bool {
+    // The DECISION, split from the transmission so it is assertable: the send needs a bound
+    // socket a unit harness has none of, and a test that could only observe the send would read
+    // `false` for "not an N26 arrival" and `false` for "no socket" alike -- so it could not tell
+    // a missing gate from a missing socket. `take_forward_relocation_source` answering `Some` IS
+    // the statement "this UE arrived over N26", which is the same decision/transmission split
+    // `inter_system_handover_refusal` and `handle_uplink_ran_status_transfer` already use.
+    let Some(source) = take_forward_relocation_source(mme_ue_id) else {
+        return false;
+    };
+    let Some(server) = server() else {
+        log::warn!(
+            "UE {mme_ue_id} arrived over N26 but the N26 socket is gone, so its source AMF \
+             cannot be told. That AMF will hold the UE's context and its source NG-RAN \
+             resources until its own guard timer expires (TS 23.502 §4.11.1.2.1 step 12d \
+             starts that timer on this notification)."
+        );
+        return false;
+    };
+    let seq = server.alloc_sequence();
+    let notify = n26_build::build_forward_relocation_complete_notification(seq, source.amf_teid);
+    match server.send_request(source.peer, &notify) {
+        Ok(seq) => {
+            log::info!(
+                "N26 Forward Relocation Complete Notification sent to AMF {} (seq={seq}) for UE \
+                 {mme_ue_id}: the UE has arrived on E-UTRAN. TS 23.502 §4.11.1.2.1 step 12d has \
+                 the source AMF answer with a Complete Acknowledge and start the timer that \
+                 releases its NG-RAN resources (step 21).",
+                source.peer
+            );
+            true
+        }
+        Err(e) => {
+            log::error!(
+                "N26 Forward Relocation Complete Notification to {} failed: {e}. The source AMF \
+                 will not learn the UE arrived and will hold its context and source NG-RAN \
+                 resources until its own guard timer expires.",
+                source.peer
+            );
+            false
+        }
+    }
+}
+
+/// Record an N26 arrival without driving one. Test-only; declared beside the map, not in a
+/// `mod tests`, per #308.
+#[cfg(test)]
+pub fn record_forward_relocation_source_for_test(mme_ue_id: u64, source: ForwardRelocationSource) {
+    record_forward_relocation_source(mme_ue_id, source);
+}
+
+/// Drop every N26 arrival record. Declared beside the map, not in a `mod tests`.
+#[cfg(test)]
+pub fn clear_forward_relocation_sources_for_test() {
+    if let Ok(mut map) = forward_relocation_sources().lock() {
+        map.clear();
+    }
+}
+
 impl N26Server {
     /// Bind the N26 socket and start the receive and retransmission loops.
     pub fn open(
@@ -631,6 +756,13 @@ fn handle_forward_relocation_request(
         &[],
     );
     send_response_from(inner, peer, &response);
+
+    // Remember that this UE arrived over N26 and where its source AMF is, so
+    // `notify_forward_relocation_complete` can tell that AMF when the target eNB reports the UE
+    // has landed. Recorded only on the ACCEPT path: a refused relocation produces no arrival, and
+    // a record left behind would have a later intra-LTE handover for a recycled UE id send a
+    // Forward Relocation Complete Notification to an AMF that is not expecting one.
+    record_forward_relocation_source(mme_ue_id, ForwardRelocationSource { peer, amf_teid });
 }
 
 /// Send a triggered message from the receive thread, caching it for retransmission.
@@ -1745,6 +1877,91 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **#408 criterion 2, and a reachability guard**: the Forward Relocation Complete
+    /// Notification fires for an N26 arrival and **not** for an intra-LTE handover.
+    ///
+    /// # Why this test exists
+    ///
+    /// The first draft of #408 had `build_forward_relocation_complete_notification` with only a
+    /// TEST caller — the "correct but unreachable" defect this tree keeps growing, and it was
+    /// caught by grepping for a production caller rather than by any failing assertion. The
+    /// builder is now driven by `s1ap_handler::handle_handover_notify` through
+    /// [`notify_forward_relocation_complete`], and this test pins the discrimination that makes
+    /// that safe: S1AP's HandoverNotify carries nothing saying where the UE came from, so an
+    /// MME that notified unconditionally would tell an AMF about every intra-LTE handover.
+    ///
+    /// The record is also asserted CONSUMED, because a UE arrives once: a retained record would
+    /// have a later handover for the same UE notify a second time, and TS 23.502 §4.11.1.2.1
+    /// step 12d starts a resource-release timer on each notification.
+    #[test]
+    fn the_complete_notification_fires_only_for_a_ue_that_arrived_over_n26() {
+        let _guard = lock_s11();
+        clear_forward_relocation_sources_for_test();
+
+        // Distinct literal ids: the MME context is process-global, so a shared UE id would let
+        // a sibling test consume this one's record. `0x4082` marks them as this test's.
+        const ARRIVED_OVER_N26: u64 = 0x0408_2001;
+        const INTRA_LTE: u64 = 0x0408_2002;
+
+        record_forward_relocation_source_for_test(
+            ARRIVED_OVER_N26,
+            ForwardRelocationSource {
+                peer: "10.4.8.9:2123".parse().expect("a literal address parses"),
+                amf_teid: 0x0408_5001,
+            },
+        );
+
+        // An intra-LTE handover has no record, so the DECISION is "do not notify". This is the
+        // assertion that matters most: it is the common case, it reaches the same S1AP handler,
+        // and notifying here would tell an AMF about a UE it never handed over.
+        //
+        // Asserted on `take_forward_relocation_source` rather than on
+        // `notify_forward_relocation_complete`, because the latter also answers `false` when
+        // there is simply no bound socket -- so it cannot distinguish a missing GATE from a
+        // missing socket, and a revert that dropped the gate would still pass.
+        assert!(
+            take_forward_relocation_source(INTRA_LTE).is_none(),
+            "a UE that did NOT arrive over N26 must yield NO source record, so no Forward \
+             Relocation Complete Notification is sent: S1AP's HandoverNotify says nothing about \
+             where the UE came from, the record is the only thing distinguishing the two, and \
+             every intra-LTE handover reaches this same site"
+        );
+
+        // The N26 arrival IS recognised, and it names the AMF the notification goes to.
+        let source = take_forward_relocation_source(ARRIVED_OVER_N26).expect(
+            "a UE that arrived over N26 MUST yield its source record, or its source AMF is \
+             never told and holds the source NG-RAN resources until its own timer expires",
+        );
+        assert_eq!(
+            source.amf_teid, 0x0408_5001,
+            "and the record must carry the AMF's TEID: Table 7.3.3-1's notification is \
+             addressed to it, and TEID 0 lands on no UE context at the peer"
+        );
+        assert_eq!(
+            source.peer,
+            "10.4.8.9:2123".parse().expect("a literal address parses"),
+            "and the AMF's address, or the notification goes nowhere"
+        );
+
+        // TAKEN, not read: a second lookup for one arrival finds nothing.
+        assert!(
+            take_forward_relocation_source(ARRIVED_OVER_N26).is_none(),
+            "the record must be CONSUMED by the first notification: a UE arrives once, and a \
+             retained record would have a later handover for the same UE notify its old source \
+             AMF a second time -- each notification starts a fresh resource-release timer at \
+             that AMF (TS 23.502 §4.11.1.2.1 step 12d)"
+        );
+
+        // And the full path declines cleanly for a UE with no record, which is what the S1AP
+        // handler's `if` reads.
+        assert!(
+            !notify_forward_relocation_complete(INTRA_LTE),
+            "the full notifier must answer false for an intra-LTE handover"
+        );
+
+        clear_forward_relocation_sources_for_test();
     }
 
     /// An accepted Context Response with **no MM Context** is refused.

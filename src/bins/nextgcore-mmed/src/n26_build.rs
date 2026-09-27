@@ -689,6 +689,14 @@ pub fn build_forward_relocation_response(
 
 /// Build a **Forward Relocation Complete Notification** (TS 29.274 §7.3.3, type 135), #408.
 ///
+/// # Production caller
+///
+/// [`crate::n26_path::notify_forward_relocation_complete`], reached from
+/// `s1ap_handler::handle_handover_notify` — the live S1AP path that fires when the target eNB
+/// reports the UE has arrived. Stated here because a builder with only a test caller is the
+/// "correct but unreachable" defect this tree keeps growing, and the first draft of this
+/// function had exactly that.
+///
 /// Sent by this MME as the **target** once the UE has arrived: §7.3.3 (`29274-j60.txt:19493-19495`)
 /// — *"shall be sent to the source MME/SGSN/AMF to indicate the handover has been successfully
 /// finished"*. TS 23.502 §4.11.1.2.1 step 12d then has the source AMF answer and start the timer
