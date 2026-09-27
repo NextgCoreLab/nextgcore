@@ -336,18 +336,17 @@ fn record_forward_relocation_outcome(amf_ue_ngap_id: u64, outcome: ForwardReloca
     }
 }
 
-/// The outcome recorded for this UE's Forward Relocation preparation, if any.
-///
-/// Read by `ngap_path` to decide what HandoverCommand to build. **Peeked, not taken**, because
-/// the same outcome is consulted again when the Forward Relocation Complete Notification
-/// arrives — the UE's move is not finished at the HandoverCommand.
-pub fn forward_relocation_outcome(amf_ue_ngap_id: u64) -> Option<ForwardRelocationOutcome> {
-    forward_relocation_outcomes()
-        .lock()
-        .ok()?
-        .get(&amf_ue_ngap_id)
-        .cloned()
-}
+// There is deliberately **no public `forward_relocation_outcome(ue)` reader**, and the absence
+// is deliberate rather than an omission. The first draft had one, on the theory that `ngap_path`
+// would consult it when building the HandoverCommand — and it ended up with **zero callers**,
+// because the outcome arrives asynchronously on the N26 receive loop and that is where the
+// HandoverCommand decision is therefore computed (`handle_forward_relocation_response` calls
+// `ngap_path::inter_system_handover_command` directly). A public accessor nothing reads is the
+// same "correct but unreachable" defect as an unreachable encoder, one layer up, so it was
+// removed rather than kept for a caller that may never arrive.
+//
+// The map itself is read by `forward_relocation_mme_teid_for_peer` below, which is what addresses
+// the Forward Relocation Complete Acknowledge.
 
 /// The MME TEID of an accepted relocation toward `peer`, for addressing the Complete
 /// Acknowledge.
@@ -402,15 +401,6 @@ pub fn clear_forward_relocation_state_for_test() {
     if let Ok(mut map) = forward_relocation_outcomes().lock() {
         map.clear();
     }
-}
-
-/// Record an outcome directly. Test-only, for driving the HandoverCommand decision.
-#[cfg(test)]
-pub fn record_forward_relocation_outcome_for_test(
-    amf_ue_ngap_id: u64,
-    outcome: ForwardRelocationOutcome,
-) {
-    record_forward_relocation_outcome(amf_ue_ngap_id, outcome);
 }
 
 /// The AMF's N26 GTPv2-C endpoint.

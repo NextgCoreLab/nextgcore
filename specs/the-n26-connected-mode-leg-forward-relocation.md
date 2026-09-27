@@ -726,7 +726,7 @@ Each behavioural claim was made to fail, the **named** test watched to fail, and
 | `DirectForwardingPathAvailability` arm removed from `parse_handover_required` | `handover_required_keeps_the_direct_forwarding_path_availability_ie` |
 | `take_forward_relocation_source` made to answer `Some` for every UE | `the_complete_notification_fires_only_for_a_ue_that_arrived_over_n26` |
 
-### Three revert-verifications found real gaps
+### Four findings from the revert sweep and the reachability audit
 
 **(1) The truth table was too narrow.** Forcing `socket_bound` to `true` initially **passed
 the whole amfd suite**. The reason is the finding, not a footnote: the first draft's table
@@ -774,6 +774,16 @@ gate entirely still passed. The decision is now split out as `take_forward_reloc
 the test asserts on that, which is the same decision/transmission split
 `inter_system_handover_refusal` uses. **General lesson:** when a function's failure paths
 collapse to one return value, a test on that value pins none of them.
+
+**(4) A public accessor with zero callers, same audit.** The same grep found
+`n26_path::forward_relocation_outcome(ue)` — added on the theory that `ngap_path` would consult it
+when building the HandoverCommand — with **no callers at all**. The outcome arrives
+asynchronously on the N26 receive loop, so that is where the decision is computed
+(`handle_forward_relocation_response` calls `inter_system_handover_command` directly). A public
+accessor nothing reads is the unreachable-encoder defect one layer up, so it was **removed**
+rather than kept for a caller that may never arrive, along with the test helper that existed only
+to feed it. `clippy --all-targets` on both crates now reports no unused item in any file this PR
+touches.
 
 **One thing the revert sweep caught in the code rather than the tests.**
 `CAUSE_RELOCATION_FAILURE` was first written as **75**, inferred from §7.3.2's prose position
