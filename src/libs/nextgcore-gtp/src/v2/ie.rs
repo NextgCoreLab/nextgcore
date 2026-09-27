@@ -1365,6 +1365,23 @@ pub const MM_CONTEXT_SECURITY_MODE_EPS: u8 = 4;
 /// `K_ASME` length in the MM Context (TS 29.274 Figure 8.38-5, octets 14 to 45).
 pub const MM_CONTEXT_KASME_LEN: usize = 32;
 
+/// `NH` length in the MM Context (TS 29.274 Figure 8.38-5, octets `p` to `p+31`).
+///
+/// The Next Hop AS key, present only when `NHI = 1`. Thirty-two octets, the same width as
+/// `K_ASME`, because both are TS 33.220 B.2.0 HMAC-SHA-256 outputs.
+pub const MM_CONTEXT_NH_LEN: usize = 32;
+
+/// `NCC = 2` — the Next hop Chaining Counter a source AMF sends at 5GS→EPS handover.
+///
+/// Not a free choice. TS 33.501 §8.3.2 step 2 (`33501-k20.txt:11370-11375`) is explicit:
+/// *"The source AMF subsequently derives NH **two times** as specified in clause A.4 of
+/// TS 33.401 [10]. The **{NH, NCC=2}** pair is provided to the target MME as a part of UE
+/// security context in the Forward Relocation Request message."* Step 4 then has the target
+/// MME put that pair in its S1 HANDOVER REQUEST, and step 9 has the UE derive the same pair
+/// independently — so an NCC of anything else makes the UE and the eNB compute different
+/// `K_eNB` values, and every AS-protected message after the handover fails.
+pub const MM_CONTEXT_NCC_AT_HANDOVER: u8 = 2;
+
 /// MM Context IE — **EPS Security Context and Quadruplets** (IE type 107).
 ///
 /// TS 29.274 §8.38, Figure 8.38-5 (`29274-j60.txt:28371`). This is the security and
@@ -1404,6 +1421,8 @@ pub const MM_CONTEXT_KASME_LEN: usize = 32;
 /// | 8-10 | `NAS Downlink Count` (24 bits) | `:28266` |
 /// | 11-13 | `NAS Uplink Count` (24 bits) | `:28268` |
 /// | 14-45 | `K_ASME` (32 octets) | `:28270` |
+/// | p..(p+31) | `NH` (32 octets), present iff `NHI = 1` (#408) | `:28278` |
+/// | (p+32) | `Spare`(5) \| `NCC`(3), present iff `NHI = 1` (#408) | `:28280` |
 /// | q | `Length of UE Network Capability`, then contents | `:28294` |
 /// | k+1 | `Length of MS Network Capability`, then contents | `:28299` |
 /// | m+1 | `Length of Mobile Equipment Identity (MEI)`, then contents | `:28304` |
@@ -1418,7 +1437,8 @@ pub const MM_CONTEXT_KASME_LEN: usize = 32;
 /// # What is deliberately not modelled
 ///
 /// The Subscribed/Used UE AMBR octets (`j`..`i+7`) and the DRX parameter are gated by
-/// `SAMBRI` / `UAMBRI` / `DRXI`, and the optional tail from octet `s` onward (old EPS
+/// `SAMBRI` / `UAMBRI` / `DRXI` (`NH`/`NCC` are gated by `NHI` and **are** modelled, since
+/// #408's Forward Relocation Request requires them), and the optional tail from octet `s` onward (old EPS
 /// security context, voice-domain preference, UE radio capability, extended access
 /// restriction, APN rate control, core network restrictions) is present *"only if
 /// explicitly specified"*. This type emits `DRXI = 0`, `SAMBRI = 0`, `UAMBRI = 0` and
@@ -1434,9 +1454,22 @@ pub struct Gtp2MmContextIe {
     pub ksi_asme: u8,
     /// `NHI` (octet 5, bit 5). When set, `NH`/`NCC` follow the DRX parameter.
     ///
-    /// `false` for idle-mode context transfer: `NH` is an AS-level key for
+    /// `false` for idle-mode context transfer (#347): `NH` is an AS-level key for
     /// connected-mode handover, and an idle-mode move has no target eNB to key.
+    ///
+    /// `true` for a **Forward Relocation Request** (#408), where TS 33.501 §8.3.2 step 2
+    /// requires the `{NH, NCC=2}` pair. [`Self::nh`] and [`Self::ncc`] are encoded if and
+    /// only if this is set, which is the figure's own gate.
     pub nhi: bool,
+    /// `NH` (octets `p`..`p+31`), present only when [`Self::nhi`] is set.
+    ///
+    /// The Next Hop AS key the target MME puts in its S1 HANDOVER REQUEST so the target eNB
+    /// can compute `K_eNB` (TS 33.501 §8.3.2 step 4). `None` when `NHI = 0`.
+    pub nh: Option<[u8; MM_CONTEXT_NH_LEN]>,
+    /// `NCC` (octet `p+32`, bits 3..1), present only when [`Self::nhi`] is set.
+    ///
+    /// [`MM_CONTEXT_NCC_AT_HANDOVER`] records why this is `2` and not a free choice.
+    pub ncc: u8,
     /// `Used NAS integrity protection algorithm` (octet 7, bits 6..4).
     pub used_nas_integrity_algorithm: u8,
     /// `Used NAS Cipher` (octet 7, bits 4..1). Table 8.38-2 (`29274-j60.txt:28679`).
@@ -1507,8 +1540,32 @@ impl Gtp2MmContextIe {
         // The Quadruplet and Quintuplet arrays are absent because both counts in octet
         // 6 are 0 (§8.38: *"shall be set to the value '0' if no Authentication
         // Quadruplet is included (i.e. octets '46 to g' are absent)"*). The DRX
-        // parameter is absent because DRXI = 0, and NH/NCC because NHI = 0.
+        // parameter is absent because DRXI = 0.
         //
+        // Octets `p`..`p+31` then `p+32`: NH and NCC, present iff NHI = 1 (#408). Figure
+        // 8.38-5 puts them after the DRX parameter, so emitting them here -- immediately
+        // after K_ASME -- is correct ONLY because all four preceding gates are zero: both
+        // vector counts (§8.38 requires 0 on N26 in either direction, `:28190-28202`) and
+        // DRXI (§8.38 forbids sending the 5G DRX parameter to an MME, `:27727-27733`).
+        //
+        // That invariant is asserted by
+        // `handover_mm_context_encodes_nh_and_ncc_at_figure_8_38_5_positions` rather than
+        // left as a comment: a later change that set SAMBRI or DRXI would silently shift NH
+        // by the gated field's width, and the decoder would read a 32-byte "key" out of
+        // whatever followed.
+        if self.nhi {
+            if let Some(nh) = &self.nh {
+                buf.put_slice(nh);
+            } else {
+                // NHI set with no NH is a caller bug, and the honest encoding is a zero NH
+                // rather than a shorter IE: omitting it while NHI claims it is present
+                // would make every field AFTER it decode from the wrong offset at the peer.
+                buf.put_slice(&[0u8; MM_CONTEXT_NH_LEN]);
+            }
+            // Octet p+32: Spare (5 bits) | NCC (3 bits). The counter is 0..7 -- TS 33.401
+            // §7.2.8.4 chains it modulo 8 -- so masking is the field width, not a clamp.
+            buf.put_u8(self.ncc & 0x07);
+        }
         // Then the three length-prefixed capability fields. §8.38 says each is absent
         // when its length is zero, so a zero length octet is the correct encoding of
         // "not available" rather than a placeholder for one.
@@ -1558,11 +1615,32 @@ impl Gtp2MmContextIe {
         let mut kasme = [0u8; MM_CONTEXT_KASME_LEN];
         kasme.copy_from_slice(&value[Self::OFF_KASME..Self::OFF_KASME + MM_CONTEXT_KASME_LEN]);
 
+        let nhi = (octet5 >> 4) & 0x01 != 0;
+        let mut off = Self::FIXED_LEN;
+
+        // NH and NCC, read iff NHI = 1 -- the figure's own gate (#408). Reading them
+        // unconditionally would consume 33 octets of the capability fields on every
+        // idle-mode MM Context #347 produces, so the gate is what keeps the two forms from
+        // colliding. A truncated tail leaves them absent rather than erroring, for the same
+        // reason the capability fields below tolerate one: a peer that sent fewer octets
+        // sent a legal shorter IE.
+        let mut nh = None;
+        let mut ncc = 0u8;
+        // `>` rather than `>= .. + 1`: the NH occupies `off..off + NH_LEN` and the NCC octet
+        // sits at `off + NH_LEN`, so the buffer must extend PAST that index.
+        if nhi && value.len() > off + MM_CONTEXT_NH_LEN {
+            let mut bytes = [0u8; MM_CONTEXT_NH_LEN];
+            bytes.copy_from_slice(&value[off..off + MM_CONTEXT_NH_LEN]);
+            nh = Some(bytes);
+            off += MM_CONTEXT_NH_LEN;
+            ncc = value[off] & 0x07;
+            off += 1;
+        }
+
         // The three length-prefixed capability fields, then the access-restriction
         // octet. A truncated tail reads as absent rather than as an error: §8.38 makes
         // every one of them omissible, so a peer that sent fewer octets has sent a
         // legal shorter IE.
-        let mut off = Self::FIXED_LEN;
         let mut take_lv = || -> Vec<u8> {
             let Some(&len) = value.get(off) else {
                 return Vec::new();
@@ -1580,7 +1658,9 @@ impl Gtp2MmContextIe {
 
         Ok(Self {
             ksi_asme: octet5 & 0x07,
-            nhi: (octet5 >> 4) & 0x01 != 0,
+            nhi,
+            nh,
+            ncc,
             used_nas_integrity_algorithm: (octet7 >> 4) & 0x07,
             used_nas_cipher: octet7 & 0x0F,
             nas_downlink_count: count_at(Self::OFF_DL_COUNT),
@@ -2034,6 +2114,87 @@ mod tests {
         );
     }
 
+    /// **#408**: the IE ids a Forward Relocation Request/Response newly depends on, each
+    /// read off its OWN Table 8.1-1 row.
+    ///
+    /// #401 found that three of four IE ids it had inferred from adjacent table rows were
+    /// wrong (16 not 15, 104 not 118, 23 not 26), so every number here was read from the row
+    /// whose line is quoted beside it and not from a neighbour. None of these variants is
+    /// added by #408 — all ten already existed — so this test exists to pin values the new
+    /// code now *reads*, which until now nothing did.
+    #[test]
+    fn gtp2_forward_relocation_ie_types_match_ts29274_table_8_1_1() {
+        for (variant, id, line, what) in [
+            (
+                Gtp2IeType::Indication as u8,
+                77u8,
+                "29274-j60.txt:24460",
+                "Indication, which carries the Direct Forwarding Indication flag",
+            ),
+            (
+                Gtp2IeType::FContainer as u8,
+                118,
+                "29274-j60.txt:24569",
+                "F-Container, the Source-to-Target and Target-to-Source transparent containers",
+            ),
+            (
+                Gtp2IeType::FCause as u8,
+                119,
+                "29274-j60.txt:24572",
+                "F-Cause, the S1-AP Cause",
+            ),
+            (
+                Gtp2IeType::PlmnId as u8,
+                120,
+                "29274-j60.txt:24575",
+                "PLMN ID, the Selected PLMN ID",
+            ),
+            (
+                Gtp2IeType::TargetIdentification as u8,
+                121,
+                "29274-j60.txt:24578",
+                "Target Identification",
+            ),
+        ] {
+            assert_eq!(variant, id, "{what} is IE type {id} ({line})");
+            assert_eq!(
+                Gtp2IeType::try_from(id).map(|t| t as u8),
+                Ok(id),
+                "and {id} must decode back to it, or a received {what} falls to the \
+                 unknown-IE path"
+            );
+        }
+
+        // The four ids that are NEIGHBOURS of the five above and mean something else. #401's
+        // defect was reading an id off the wrong row, so the guard is that the adjacent
+        // values do not resolve to these variants.
+        assert_ne!(
+            Gtp2IeType::FContainer as u8,
+            Gtp2IeType::FCause as u8,
+            "F-Container (118) and F-Cause (119) are adjacent rows and distinct types: \
+             confusing them would put an S1-AP cause where a RAN container belongs"
+        );
+        assert_ne!(
+            Gtp2IeType::PlmnId as u8,
+            Gtp2IeType::TargetIdentification as u8,
+            "PLMN ID (120) and Target Identification (121) are adjacent rows"
+        );
+
+        // NCC's value is a security requirement, not an encoding choice, so it is pinned
+        // here beside the ids rather than only where it is written.
+        assert_eq!(
+            MM_CONTEXT_NCC_AT_HANDOVER, 2,
+            "TS 33.501 §8.3.2 step 2 (33501-k20.txt:11370-11375) requires the source AMF to \
+             derive NH twice and send NCC=2; any other value makes the UE and the target eNB \
+             compute different K_eNB"
+        );
+        assert_eq!(
+            MM_CONTEXT_NH_LEN, MM_CONTEXT_KASME_LEN,
+            "NH is 32 octets like K_ASME (Figure 8.38-5, octets p..p+31) -- both are \
+             TS 33.220 B.2.0 HMAC-SHA-256 outputs"
+        );
+    }
+
     /// Every field of Figure 8.38-5 at its absolute byte position in the IE contents.
     ///
     /// This is the assertion a round trip cannot make. `encode`/`decode` agree with
@@ -2051,7 +2212,13 @@ mod tests {
         }
         let ctx = Gtp2MmContextIe {
             ksi_asme: 0x05,
+            // NHI clear, so NH/NCC are absent and the capability fields follow K_ASME
+            // directly. This is #347's idle-mode form; #408's handover form is asserted
+            // separately by `handover_mm_context_encodes_nh_and_ncc_at_figure_8_38_5_positions`,
+            // and the two together are what pin that the gate works in BOTH states.
             nhi: false,
+            nh: None,
+            ncc: 0,
             used_nas_integrity_algorithm: 0x02, // 128-EIA2
             used_nas_cipher: 0x01,              // 128-EEA1
             nas_downlink_count: 0x00_11_22_33 & 0x00FF_FFFF,
@@ -2135,6 +2302,157 @@ mod tests {
 
         // Round trip, which is necessary but not sufficient.
         assert_eq!(Gtp2MmContextIe::decode(&ie.value).unwrap(), ctx);
+    }
+
+    /// **#408**: the handover MM Context carries `{NH, NCC=2}` at its Figure 8.38-5
+    /// positions, and the idle-mode form still does not.
+    ///
+    /// # Why the absolute offsets are the assertion
+    ///
+    /// Figure 8.38-5 orders the optional tail
+    /// `Quadruplets → Quintuplets → DRX parameter → NH → NCC → AMBR octets → capability
+    /// fields`. This encoder puts `NH` immediately after `K_ASME`, which is correct **only
+    /// because** all of the gates before it are zero on N26: both vector counts
+    /// (`29274-j60.txt:28190`, `:28198`) and `DRXI` (`:27727-27733`). A later change that set
+    /// `DRXI` or `SAMBRI` would shift `NH` by the gated field's width, the peer would read a
+    /// 32-byte "key" out of whatever followed, and a round trip would still pass because both
+    /// sides would be shifted identically. So the offsets are checked absolutely, and octets
+    /// 6 and 7 are re-asserted as zero *in this test* to pin the invariant the offsets rest
+    /// on rather than assume it.
+    #[test]
+    fn handover_mm_context_encodes_nh_and_ncc_at_figure_8_38_5_positions() {
+        // Two distinguishable ramps: if NH were copied from K_ASME's bytes, or the two
+        // slices overlapped by an octet, the values differ visibly rather than by alignment.
+        let mut kasme = [0u8; MM_CONTEXT_KASME_LEN];
+        for (i, b) in kasme.iter_mut().enumerate() {
+            *b = 0x40 + i as u8;
+        }
+        let mut nh = [0u8; MM_CONTEXT_NH_LEN];
+        for (i, b) in nh.iter_mut().enumerate() {
+            *b = 0x80 + i as u8;
+        }
+
+        let ctx = Gtp2MmContextIe {
+            ksi_asme: 0x06,
+            nhi: true,
+            nh: Some(nh),
+            ncc: MM_CONTEXT_NCC_AT_HANDOVER,
+            used_nas_integrity_algorithm: 0x01,
+            used_nas_cipher: 0x02,
+            nas_downlink_count: 0x00_AA_BB_CC,
+            nas_uplink_count: 0x00_DD_EE_01,
+            kasme,
+            ue_network_capability: vec![0xE0, 0xE1],
+            ms_network_capability: Vec::new(),
+            mei: Vec::new(),
+            access_restriction: 0,
+        };
+
+        let mut v = BytesMut::new();
+        ctx.encode_value(&mut v);
+        let v = v.freeze();
+
+        // Figure octet 5 (contents[0]): Security Mode 4 in bits 8..6, NHI **SET** in bit 5,
+        // DRXI clear, KSI_ASME 6 => 0b100_1_0_110 = 0x96.
+        assert_eq!(
+            v[0], 0x96,
+            "octet 5 must carry NHI SET in bit 5 alongside Security Mode 4 and KSI_ASME 6 \
+             (29274-j60.txt:28260). NHI is what tells the MME NH/NCC are present at all, so \
+             a clear bit here makes the peer read the capability fields out of the NH."
+        );
+        assert_eq!((v[0] >> 4) & 0x01, 1, "NHI is bit 5 of octet 5");
+
+        // The invariant the offsets below rest on: every gate between K_ASME and NH is zero.
+        assert_eq!(
+            v[1], 0x00,
+            "octet 6's vector counts, UAMBRI and OSCI must all be zero, or the Quadruplet / \
+             Quintuplet arrays would sit between K_ASME and NH and every offset below moves"
+        );
+        assert_eq!(
+            v[2] >> 7,
+            0,
+            "SAMBRI must be clear, or the Subscribed UE AMBR's eight octets precede NH"
+        );
+        assert_eq!(
+            (v[0] >> 3) & 0x01,
+            0,
+            "DRXI must be clear (29274-j60.txt:27727-27733 forbids sending the 5G DRX \
+             parameter to an MME), or its two octets precede NH"
+        );
+
+        // Figure octets 14-45 (contents[9..41]): K_ASME.
+        assert_eq!(&v[9..41], &kasme[..]);
+
+        // Figure octets p..(p+31) = contents[41..73]: NH, immediately after K_ASME because
+        // every gate above is zero.
+        assert_eq!(
+            &v[41..73],
+            &nh[..],
+            "NH occupies the 32 octets directly after K_ASME (figure octets p..p+31, \
+             29274-j60.txt:28278). If this reads K_ASME's ramp the two slices overlap; if it \
+             reads zeroes the NH was dropped and the target eNB cannot compute K_eNB."
+        );
+
+        // Figure octet (p+32) = contents[73]: Spare(5) | NCC(3).
+        assert_eq!(
+            v[73], MM_CONTEXT_NCC_AT_HANDOVER,
+            "NCC occupies the LOW three bits of the octet after NH (29274-j60.txt:28280), so \
+             NCC=2 encodes as 0x02. Writing it shifted (0x10) would have the MME read NCC=0 \
+             and chain K_eNB from the wrong hop."
+        );
+        assert_eq!(
+            v[73] & 0x07,
+            2,
+            "and TS 33.501 §8.3.2 step 2 requires exactly 2: the source AMF derives NH twice \
+             and sends the NH with NCC=2 (33501-k20.txt:11370-11375)"
+        );
+
+        // Then the capability fields, now starting 33 octets later than in the idle-mode
+        // form -- which is the whole reason NHI has to be right.
+        assert_eq!(v[74], 2, "Length of UE Network Capability follows NCC");
+        assert_eq!(&v[75..77], &[0xE0, 0xE1]);
+
+        // Round trip through the real decoder, so the gate is exercised in both directions.
+        let decoded = Gtp2MmContextIe::decode(&ctx.to_ie(0).value).expect("decodes");
+        assert_eq!(decoded, ctx);
+        assert_eq!(
+            decoded.nh,
+            Some(nh),
+            "the MME must recover the NH: it is what goes in the S1 HANDOVER REQUEST so the \
+             target eNB can compute K_eNB (TS 33.501 §8.3.2 step 4)"
+        );
+        assert_eq!(decoded.ncc, 2);
+        assert_eq!(
+            decoded.ue_network_capability,
+            vec![0xE0, 0xE1],
+            "and the capability field after NH/NCC must NOT be read out of the NH's octets"
+        );
+
+        // The gate in its other state: NHI clear means NH/NCC are absent from the wire AND
+        // absent from the decode, so #347's idle-mode form is unaffected by this change.
+        let idle = Gtp2MmContextIe {
+            nhi: false,
+            nh: None,
+            ncc: 0,
+            ..ctx.clone()
+        };
+        let mut iv = BytesMut::new();
+        idle.encode_value(&mut iv);
+        let iv = iv.freeze();
+        assert_eq!(
+            iv.len(),
+            v.len() - (MM_CONTEXT_NH_LEN + 1),
+            "with NHI clear the IE must be exactly 33 octets shorter: an encoder that always \
+             emitted NH would make every idle-mode Context Response 33 octets wrong"
+        );
+        assert_eq!(
+            iv[41], 2,
+            "and the UE Network Capability length must sit directly after K_ASME"
+        );
+        let idle_decoded = Gtp2MmContextIe::decode(&idle.to_ie(0).value).expect("decodes");
+        assert_eq!(idle_decoded.nh, None);
+        assert_eq!(idle_decoded.ncc, 0);
+        assert_eq!(idle_decoded.ue_network_capability, vec![0xE0, 0xE1]);
     }
 
     /// A 24-bit NAS COUNT must survive its full range, and the top octet must not be

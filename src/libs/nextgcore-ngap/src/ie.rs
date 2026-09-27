@@ -1706,6 +1706,45 @@ pub fn encode_target_to_source_container(
     )
 }
 
+/// Encode the **Direct Forwarding Path Availability** IE (TS 38.413 IE id 22), #408.
+///
+/// `DirectForwardingPathAvailability ::= ENUMERATED { direct-path-available, ... }`
+/// (`38413-j30.txt:59477` for the id) — one value, extensible. Criticality `ignore`, which is
+/// what lets an AMF that cannot read it still complete the preparation rather than rejecting
+/// the whole PDU.
+///
+/// The encoder exists so [`decode_direct_forwarding_path_availability`] can be round-tripped
+/// against it: a source gNB is what produces this on the wire, and amfd's handover tests build
+/// the HANDOVER REQUIRED a gNB would send.
+pub fn encode_direct_forwarding_path_availability(
+    container: &mut ProtocolIeContainer,
+    value: nextgcore_asn1c::ngap::ies::DirectForwardingPathAvailability,
+) -> NgapResult<()> {
+    let mut encoder = AperEncoder::new();
+    value.encode_aper(&mut encoder)?;
+    encoder.align();
+    container.push(ProtocolIeField {
+        id: ProtocolIeId(IE_ID_DIRECT_FORWARDING_PATH_AVAILABILITY),
+        criticality: Criticality::Ignore,
+        value: encoder.into_bytes().to_vec(),
+    });
+    Ok(())
+}
+
+/// Decode the **Direct Forwarding Path Availability** IE (TS 38.413 IE id 22), #408.
+///
+/// An IE that is present but *unparseable* answers `None` rather than erroring, and the
+/// distinction is deliberate: the IE's criticality is `ignore`, so a malformed one must not
+/// abort a handover preparation the rest of which is intact. `None` is also what the AMF's
+/// forwarding decision reads as "no direct path", which is the safe direction — it declines
+/// forwarding rather than claiming a path that may not exist.
+pub fn decode_direct_forwarding_path_availability(
+    field: &ProtocolIeField,
+) -> Option<nextgcore_asn1c::ngap::ies::DirectForwardingPathAvailability> {
+    let mut decoder = AperDecoder::new(&field.value);
+    nextgcore_asn1c::ngap::ies::DirectForwardingPathAvailability::decode_aper(&mut decoder).ok()
+}
+
 /// Encode SecurityContext IE
 pub fn encode_security_context(
     container: &mut ProtocolIeContainer,

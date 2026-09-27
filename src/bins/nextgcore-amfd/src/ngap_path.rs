@@ -7370,18 +7370,25 @@ impl NgapServer {
         // forwarded to a gNB as a 5GS→EPS handover the AMF cannot carry out.
         //
         // Declined honestly instead, with local cleanup. `ho-target-not-allowed` is
-        // the accurate cause: the target system is not one this AMF may hand over to,
-        // because it has no N26 leg toward an MME (#62 builds it). Nothing is torn
-        // down for the UE -- it stays registered and served on 5GS, which is the
-        // graceful degradation #116 asks for rather than a hard failure.
+        // the accurate cause: the target system is not one this AMF may hand over to.
+        // Nothing is torn down for the UE -- it stays registered and served on 5GS, which
+        // is the graceful degradation #116 asks for rather than a hard failure.
+        //
+        // #408 made the `fivegs-to-eps` arm CONDITIONAL: when the N26 leg is up, a socket is
+        // bound and a target MME is configured, the preparation is DRIVEN (below) instead of
+        // refused. `eps-to-5gs` stays refused unconditionally --
+        // `inter_system_handover_refusal_with` carries why.
         if let Some((cause, target_system)) = inter_system_handover_refusal(required.handover_type)
         {
             log::warn!(
                 "HandoverRequired with HandoverType={:?} ({target_system}): declining with \
-                 ho-target-not-allowed. This AMF has no inter-system handover leg -- N26 \
-                 toward an MME is not implemented (#62) -- so the preparation is refused \
-                 rather than forwarded to a gNB as if it were intra-5GS. The UE keeps its \
-                 5GS registration and PDU sessions; nothing is released.",
+                 ho-target-not-allowed. A Forward Relocation cannot be driven for this \
+                 preparation -- the N26 switch, a bound N26 socket and a configured target MME \
+                 are all required (see n26_path::is_forward_relocation_drivable), and an \
+                 eps-to-5gs HandoverRequired from a gNB names a procedure whose source is the \
+                 E-UTRAN and so cannot legitimately arrive here. Refusing beats forwarding a \
+                 preparation that will fail. The UE keeps its 5GS registration and PDU \
+                 sessions; nothing is released.",
                 required.handover_type
             );
             let failure = nextgcore_ngap::types::HandoverPreparationFailure {
@@ -7402,6 +7409,17 @@ impl NgapServer {
             {
                 self.send_to_association(association_id, &bytes).await?;
             }
+            return Ok(());
+        }
+
+        // #408: a `fivegs-to-eps` preparation that got past the refusal is one a Forward
+        // Relocation CAN be driven for, so it is routed over N26 rather than resolved against
+        // connected gNBs. It must return here: the target of this handover is an eNB, and
+        // falling through to `find_association_for_target` below would search the gNB table
+        // for it and answer `unknown-target-id` -- the exact mis-cause #116 existed to fix.
+        if required.handover_type == nextgcore_ngap::types::HandoverType::FivegsToEps {
+            self.drive_forward_relocation(association_id, &required)
+                .await?;
             return Ok(());
         }
 
@@ -7567,6 +7585,174 @@ impl NgapServer {
                     self.send_to_association(association_id, &b).await?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Drive a 5GS→EPS handover preparation over N26 (#408, TS 23.502 §4.11.1.2.1 steps 2-3).
+    ///
+    /// Reached only when [`crate::n26_path::forward_relocation_drivable`] answered `true`, i.e.
+    /// the switch is on, a socket is bound and a target MME is configured — so this is the
+    /// "routes when it can" half of #408 criterion 4, and `inter_system_handover_refusal` above
+    /// is the "refuses when it cannot" half.
+    ///
+    /// A failure here answers `HandoverPreparationFailure` rather than leaving the source gNB
+    /// to time out T304, and the cause is still `ho-target-not-allowed`: the honest statement is
+    /// that this AMF could not reach the target system, and blaming the RAN with
+    /// `unknown-target-id` would send an operator to the wrong place.
+    async fn drive_forward_relocation(
+        &mut self,
+        association_id: u64,
+        required: &nextgcore_ngap::types::HandoverRequired,
+    ) -> Result<()> {
+        // The AMF's own UE id. `ue_auth_state` is the NGAP layer's view; `amf_ue.id` is the
+        // store key `n26_path` needs to find the sessions and the security context.
+        let ue_id = self
+            .ue_auth_state
+            .get(required.amf_ue_ngap_id)
+            .map(|s| s.amf_ue.id);
+        let Some(ue_id) = ue_id else {
+            log::warn!(
+                "HandoverRequired (fivegs-to-eps) for unknown UE {}; refusing the preparation \
+                 rather than sending a Forward Relocation Request for a context this AMF does \
+                 not hold",
+                required.amf_ue_ngap_id
+            );
+            self.refuse_inter_system_preparation(
+                association_id,
+                required,
+                nextgcore_asn1c::ngap::cause::CauseRadioNetwork::UnknownLocalUeNgapId,
+            )
+            .await?;
+            return Ok(());
+        };
+
+        // The Target Identification the MME needs, built from the TargetID the gNB chose --
+        // relayed, not invented, because a target this AMF picked would route the preparation
+        // to an eNB the gNB did not select. TS 29.274 §8.51 Target Type 1 is `eNodeB ID`.
+        let target_identification = match &required.target_id {
+            nextgcore_ngap::types::TargetId::TargetGlobalNgEnbId {
+                plmn_identity,
+                ng_enb_id,
+                ..
+            } => crate::n26_build::encode_target_identification(
+                crate::n26_build::TARGET_TYPE_ENODEB,
+                plmn_identity,
+                &ng_enb_id.to_be_bytes(),
+            ),
+            // A `TargetRanNodeId` in a `fivegs-to-eps` preparation is what a gNB sends when it
+            // names the target by its Global RAN Node ID rather than as an ng-eNB. The PLMN and
+            // the node id are still what the MME needs, so the identification is built from
+            // them rather than the preparation being refused over an encoding preference.
+            nextgcore_ngap::types::TargetId::TargetRanNodeId {
+                global_ran_node_id,
+                selected_tai,
+                ..
+            } => {
+                let node_id = match global_ran_node_id {
+                    nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId { gnb_id, .. } => *gnb_id,
+                    nextgcore_ngap::types::GlobalRanNodeId::GlobalNgEnbId { ng_enb_id, .. } => {
+                        *ng_enb_id
+                    }
+                };
+                crate::n26_build::encode_target_identification(
+                    crate::n26_build::TARGET_TYPE_ENODEB,
+                    &selected_tai.tai_plmn,
+                    &node_id.to_be_bytes(),
+                )
+            }
+        };
+
+        // #408 criterion 6, at the site where the input exists. The gNB's own Direct Forwarding
+        // Path Availability is now PARSED (it used to fall into `handle_unknown_ie`), and it is
+        // reported here precisely so the refusal to use it is SPECIFIC rather than silent.
+        match required.direct_forwarding_path_availability {
+            Some(_) => log::warn!(
+                "HandoverRequired (fivegs-to-eps) for UE {}: the source gNB reports \
+                 direct-path-available, and this AMF is NOT using it. Direct forwarding needs \
+                 the forwarding endpoints relayed to the gNB in a HandoverCommandTransfer's \
+                 dLForwardingUP-TNLInformation (TS 38.413 §9.3.4.10, ASN.1 at \
+                 38413-j30.txt:48917), and this tree has no encoder for that structure -- the \
+                 intra-5GS path relays the TARGET gNB's own transfer verbatim, and \
+                 inter-system there is no target gNB to have produced one. So the Direct \
+                 Forwarding Indication stays CLEAR in the Forward Relocation Request and \
+                 downlink data in flight for these bearers is discarded rather than forwarded. \
+                 Claiming forwarding this AMF cannot relay would be worse: the MME would \
+                 establish indirect tunnels through a Serving GW and hold them until its own \
+                 timer expired while the gNB forwarded into nothing.",
+                required.amf_ue_ngap_id
+            ),
+            None => log::info!(
+                "HandoverRequired (fivegs-to-eps) for UE {}: the source gNB reports NO direct \
+                 forwarding path (the Direct Forwarding Path Availability IE is absent, and \
+                 its single enumerated value means presence = available -- TS 23.502 \
+                 §4.11.1.2.1 step 1). Indirect forwarding is not requested either: TS 23.502 \
+                 §4.11.1.2.1 step 10b has the UPF allocate the forwarding tunnel via an \
+                 Nsmf_PDUSession_UpdateSMContext carrying data-forwarding information, and \
+                 this SMF's update handler implements only the hoState machine. Downlink data \
+                 in flight for these bearers is discarded rather than forwarded.",
+                required.amf_ue_ngap_id
+            ),
+        }
+
+        match crate::n26_path::send_forward_relocation_request(
+            required.amf_ue_ngap_id,
+            ue_id,
+            &required.source_to_target_container,
+            &target_identification,
+        )
+        .await
+        {
+            Ok(seq) => {
+                log::info!(
+                    "HandoverRequired (fivegs-to-eps) for UE {}: Forward Relocation Request \
+                     sent over N26 (seq={seq}). The HandoverCommand to the source gNB follows \
+                     when the target MME answers (TS 23.502 §4.11.1.2.1 steps 3-11).",
+                    required.amf_ue_ngap_id
+                );
+                Ok(())
+            }
+            Err(why) => {
+                log::warn!(
+                    "HandoverRequired (fivegs-to-eps) for UE {}: no Forward Relocation Request \
+                     was sent ({why}). The preparation is REFUSED so the source gNB stops \
+                     waiting, rather than left to time out its own T304 -- and the UE keeps \
+                     its 5GS registration and PDU sessions.",
+                    required.amf_ue_ngap_id
+                );
+                self.refuse_inter_system_preparation(
+                    association_id,
+                    required,
+                    nextgcore_asn1c::ngap::cause::CauseRadioNetwork::HoTargetNotAllowed,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Answer a `HandoverPreparationFailure` for an inter-system preparation, with cleanup.
+    ///
+    /// Factored out of the two sites that need it so the local cleanup cannot drift between
+    /// them: the relay target and any per-session transfers left from an earlier preparation are
+    /// dropped BEFORE the failure is sent, so a failed send cannot leave a stale relay target
+    /// that a later Uplink RAN Status Transfer would follow to a gNB this UE is not moving to.
+    async fn refuse_inter_system_preparation(
+        &mut self,
+        association_id: u64,
+        required: &nextgcore_ngap::types::HandoverRequired,
+        cause: nextgcore_asn1c::ngap::cause::CauseRadioNetwork,
+    ) -> Result<()> {
+        let failure = nextgcore_ngap::types::HandoverPreparationFailure {
+            amf_ue_ngap_id: required.amf_ue_ngap_id,
+            ran_ue_ngap_id: required.ran_ue_ngap_id,
+            cause: nextgcore_ngap::types::Cause::RadioNetwork(cause),
+            criticality_diagnostics: None,
+        };
+        self.handover_target_assoc.remove(&required.amf_ue_ngap_id);
+        self.handover_target_transfers
+            .retain(|(ue, _psi), _| *ue != required.amf_ue_ngap_id);
+        if let Ok(bytes) = nextgcore_ngap::builder::build_handover_preparation_failure(&failure) {
+            self.send_to_association(association_id, &bytes).await?;
         }
         Ok(())
     }
@@ -9742,8 +9928,9 @@ fn extract_nas_message_container(nas: &[u8]) -> Option<Vec<u8>> {
 
 /// Should this HandoverRequired be refused because it is an INTER-SYSTEM handover?
 ///
-/// Returns the NGAP cause and a label for the log, or `None` for intra-5GS (which the
-/// AMF does handle).
+/// Returns the NGAP cause and a label for the log, or `None` when the preparation may
+/// **proceed** — which is intra-5GS always, and `fivegs-to-eps` when a Forward Relocation can
+/// actually be driven (#408 criterion 4).
 ///
 /// Split out from `handle_handover_required` so the DECISION is assertable without the
 /// transmission: driving that handler needs an SCTP-connected gNB the unit harness does
@@ -9751,14 +9938,151 @@ fn extract_nas_message_container(nas: &[u8]) -> Option<Vec<u8>> {
 /// `handle_handover_required`"). The same decision/transmission split this tree uses for
 /// #70, #91, #48 and #69.
 ///
+/// # `fivegs-to-eps` is now CONDITIONAL, and the condition is the whole point
+///
+/// #347 refused it unconditionally and said why: *"replacing the refusal with routing before
+/// #408 would forward a preparation the AMF cannot complete, which is strictly worse than the
+/// current honest refusal"*. #408 criterion 4 lifts that **only** where the premise no longer
+/// holds — when the leg is enabled AND a Forward Relocation can actually be driven. That test
+/// is [`crate::n26_path::forward_relocation_drivable`], and it is three conjuncts rather than
+/// one: the switch alone is satisfied by a process whose socket bind FAILED, and a bound socket
+/// alone is satisfied by a process with no MME peer to send to. The function's own doc carries
+/// the enumeration.
+///
+/// # `eps-to-5gs` stays refused unconditionally, and that is not an oversight
+///
+/// A `HandoverRequired` with `HandoverType = eps-to-5gs` arriving from a **gNB** is malformed.
+/// TS 38.413 §9.3.1.22 (`38413-j30.txt:19660-19662`) defines the type as *"which kind of
+/// handover was triggered in the source"*, and an EPS→5GS handover is triggered in the
+/// **E-UTRAN**: it reaches this AMF as a GTPv2-C Forward Relocation Request over N26, or as a
+/// `Namf_Communication_RelocateUEContext` from an initial AMF (TS 23.502 §4.11.1.2.2.2 step 3
+/// and step 8a), and never as an NGAP `HandoverRequired`. So there is no state of this AMF in
+/// which routing it would be right, and refusing is not a ceiling but the correct answer.
+///
+/// # Why this cause
+///
 /// `ho-target-not-allowed` (TS 38.413 CauseRadioNetwork 8) is the accurate cause: the
-/// target system is not one this AMF may hand over to, because it has no N26 leg toward
-/// an MME (#62). Deliberately NOT `unknown-target-id`, which is what the pre-#116 code
-/// ended up answering by falling through to the connected-gNB search -- that cause says
-/// "I do not know that gNB" about a target which is an MME, and it would send an
-/// operator looking for a RAN misconfiguration.
+/// target system is not one this AMF may hand over to. Deliberately NOT `unknown-target-id`,
+/// which is what the pre-#116 code ended up answering by falling through to the connected-gNB
+/// search -- that cause says "I do not know that gNB" about a target which is an MME, and it
+/// would send an operator looking for a RAN misconfiguration.
 fn inter_system_handover_refusal(
     handover_type: nextgcore_ngap::types::HandoverType,
+) -> Option<(
+    nextgcore_asn1c::ngap::cause::CauseRadioNetwork,
+    &'static str,
+)> {
+    inter_system_handover_refusal_with(
+        handover_type,
+        crate::n26_path::forward_relocation_drivable(),
+    )
+}
+
+/// What the HANDOVER COMMAND for a completed 5GS→EPS preparation carries (#408 criterion 6).
+///
+/// Returned as the DECISION rather than being built inline, so it is assertable without an
+/// SCTP-connected gNB — the same decision/transmission split
+/// [`inter_system_handover_refusal`] uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterSystemHandoverCommand {
+    /// The Target-to-Source transparent container, relayed byte for byte.
+    ///
+    /// TS 38.413 §9.3.1.21 (`38413-j30.txt:5952-5955`): for inter-system handover to LTE this
+    /// *"shall be encoded according to the definition of the Target eNB to Source eNB
+    /// Transparent Container IE as specified in TS 36.413"* — an E-UTRAN structure the AMF has
+    /// no business decoding.
+    pub target_to_source_container: Vec<u8>,
+    /// The `PDU Session Resource Handover List`, **always empty** in this direction.
+    ///
+    /// Each item would carry a `HandoverCommandTransfer` whose
+    /// `dLForwardingUP-TNLInformation` is the forwarding endpoint. This tree has no encoder for
+    /// that structure, so the list is empty — which TS 38.413 §9.2.3.2 permits
+    /// (`38413-j30.txt:38763` makes the IE `PRESENCE optional`, criticality `ignore`). The UE
+    /// still gets its bearers: §4.11.1.2.1 step 11 has it correlate QoS flows with the EPS
+    /// Bearer IDs the MME set up, and that correlation does not depend on forwarding.
+    pub forwarding_sessions: Vec<u8>,
+    /// The EBIs handed over **without** data forwarding, for the log that names them.
+    pub bearers_without_forwarding: Vec<u8>,
+    /// The 8 LSB of the downlink NAS COUNT the mapped `K_ASME'` used.
+    ///
+    /// TS 33.501 §8.3.2 step 7 (`33501-k20.txt:11409-11412`) has the AMF put this in the
+    /// HANDOVER COMMAND's `NAS Security Parameters from NG-RAN` IE so the UE can estimate the
+    /// COUNT and derive the same key. **It is computed and reported and not put on the wire**
+    /// — see [`inter_system_handover_command`] for the ceiling.
+    pub nas_count_lsb: u8,
+}
+
+/// Decide the HANDOVER COMMAND for a 5GS→EPS preparation the target MME accepted
+/// (#408 criterion 6, third site).
+///
+/// # The data-forwarding decision, recorded
+///
+/// `forwarding_sessions` is **empty** and `bearers_without_forwarding` names every EBI, so the
+/// caller logs precisely which bearers lose in-flight downlink data. That is the #185 posture:
+/// a node that cannot do something answers with what is true and says which traffic is
+/// affected, rather than claiming success. The two reasons, each pinned:
+///
+/// - **direct forwarding** needs `HandoverCommandTransfer.dLForwardingUP-TNLInformation`
+///   (`38413-j30.txt:48917-48930`), and this tree has no encoder for it;
+/// - **indirect forwarding** needs the UPF-allocated *"Data Forwarding tunnel Info"* of
+///   TS 23.502 §4.11.1.2.1 step 10b-10c, and smfd's `UpdateSMContext` implements only the
+///   `hoState` machine.
+///
+/// So the AMF never sets the Direct Forwarding Indication in the request either
+/// (`n26_build::forward_relocation_indication`), and the two halves of the decision cannot
+/// disagree because each reads the other's reason rather than a duplicated flag.
+///
+/// # Ceiling: the NAS Security Parameters from NG-RAN IE is NOT sent
+///
+/// [`InterSystemHandoverCommand::nas_count_lsb`] is the octet TS 33.501 §8.3.2 step 7 requires
+/// the UE be given, and TS 38.413 §9.2.3.2 makes the IE that carries it `C-iftoEPSUTRA`
+/// (`38413-j30.txt:13181-13184`). §9.3.3.26 (`:29892-29910`) says it *"Refers to the N1 mode to
+/// S1 mode NAS transparent container IE"*, whose value part is a single `Sequence number` octet
+/// (TS 24.501 §9.11.2.7). The value is **computed and logged**; it is not encoded, because
+/// `build_handover_command` has no arm for IE 39 (`id-NASSecurityParametersFromNGRAN`,
+/// `38413-j30.txt:59511`) and adding one is an `nextgcore-ngap` change with its own codec
+/// tests. **Consequence, stated:** a real UE cannot estimate the downlink COUNT from this
+/// command and so cannot derive the same `K_ASME'`, which means the handover's NAS security does
+/// not interoperate even though the MME side is correct. That is the honest ceiling rather than
+/// a plausible octet encoded to look complete.
+pub fn inter_system_handover_command(
+    outcome: &crate::n26_path::ForwardRelocationOutcome,
+) -> Option<InterSystemHandoverCommand> {
+    let crate::n26_path::ForwardRelocationOutcome::Accepted {
+        target_to_source_container,
+        admitted_ebis,
+        dl_count_used,
+        ..
+    } = outcome
+    else {
+        // A refusal produces a HandoverPreparationFailure, not a command.
+        return None;
+    };
+    Some(InterSystemHandoverCommand {
+        target_to_source_container: target_to_source_container.clone(),
+        // Empty, deliberately. See the doc above.
+        forwarding_sessions: Vec::new(),
+        bearers_without_forwarding: admitted_ebis.clone(),
+        // The 8 LSB of the COUNT the key was derived from -- the PRE-increment value, carried
+        // through the pending record rather than re-read, because by now the stored count has
+        // advanced and step 7 asks for the one that WAS used.
+        nas_count_lsb: (*dl_count_used & 0xFF) as u8,
+    })
+}
+
+/// The refusal decision as a pure function of the handover type and whether a Forward
+/// Relocation is drivable (#408 criterion 4).
+///
+/// Separated from [`inter_system_handover_refusal`] so the full truth table can be asserted
+/// without installing a socket: `n26_path::N26_SERVER` is a `OnceLock` that a test cannot
+/// toggle back to empty, so a test driving the real reader could only ever exercise the states
+/// reachable after the first `set`. The revert-verification for this function found that
+/// exact gap — a forced-`true` `socket_bound` conjunct passed the whole amfd suite because no
+/// case distinguished "switch set, bind failed", which is the one real production path where
+/// `enabled()` is true and there is no socket.
+fn inter_system_handover_refusal_with(
+    handover_type: nextgcore_ngap::types::HandoverType,
+    forward_relocation_drivable: bool,
 ) -> Option<(
     nextgcore_asn1c::ngap::cause::CauseRadioNetwork,
     &'static str,
@@ -9766,7 +10090,17 @@ fn inter_system_handover_refusal(
     use nextgcore_ngap::types::HandoverType as Ht;
     let target_system = match handover_type {
         Ht::Intra5gs => return None,
-        Ht::FivegsToEps => "EPS (fivegs-to-eps)",
+        Ht::FivegsToEps => {
+            if forward_relocation_drivable {
+                // The N26 leg is up, a socket is bound and a target MME is configured, so the
+                // preparation CAN be completed: `handle_handover_required` drives a Forward
+                // Relocation Request instead of refusing (#408).
+                return None;
+            }
+            "EPS (fivegs-to-eps)"
+        }
+        // Unconditional: see the doc above. An `eps-to-5gs` HandoverRequired from a gNB names a
+        // procedure whose source is the E-UTRAN, so it cannot legitimately arrive here.
         Ht::EpsTo5gs => "5GS (eps-to-5gs)",
     };
     Some((
@@ -10890,6 +11224,199 @@ mod tests {
             8,
             "ho-target-not-allowed is CauseRadioNetwork 8 (TS 38.413 §9.3.1.2)"
         );
+    }
+
+    /// **#408 criterion 4**: the refusal routes ONLY when a Forward Relocation can actually be
+    /// driven, and still refuses when it cannot.
+    ///
+    /// # Why all eight combinations
+    ///
+    /// The criterion is a conjunction of three conditions, so there are eight states and the
+    /// conjunction is only pinned if every one of them is checked. The first draft of this test
+    /// exercised four — the convenient ones, always with a bound socket — and forcing the
+    /// `socket_bound` conjunct to `true` **passed the whole amfd suite**. That gap is the
+    /// finding, not a footnote: "switch set, bind failed" is a real production path
+    /// (`lib.rs`'s `n26_open` error branch logs and continues), and with the conjunct dropped
+    /// the AMF would route a preparation into a socket that does not exist. Enumerating all
+    /// eight is what makes each row of the revert-verification table true rather than
+    /// aspirational.
+    #[test]
+    fn inter_system_handover_refusal_routes_only_when_a_forward_relocation_can_be_driven() {
+        use nextgcore_asn1c::ngap::cause::CauseRadioNetwork as Cr;
+        use nextgcore_ngap::types::HandoverType as Ht;
+
+        for switch_on in [false, true] {
+            for socket_bound in [false, true] {
+                for has_peer in [false, true] {
+                    let drivable = crate::n26_path::is_forward_relocation_drivable(
+                        switch_on,
+                        socket_bound,
+                        has_peer,
+                    );
+                    let all_three = switch_on && socket_bound && has_peer;
+                    assert_eq!(
+                        drivable, all_three,
+                        "drivability is the CONJUNCTION of all three \
+                         (switch_on={switch_on}, socket_bound={socket_bound}, \
+                         has_peer={has_peer}). Any conjunct silently dropped to `true` makes \
+                         this disagree in exactly the state that conjunct guards."
+                    );
+
+                    // Intra-5GS is never refused, in any of the eight states -- the N26 leg's
+                    // configuration must not affect working N2 handover.
+                    assert_eq!(
+                        inter_system_handover_refusal_with(Ht::Intra5gs, drivable),
+                        None,
+                        "intra-5GS handover must stay accepted regardless of N26 state \
+                         (switch_on={switch_on}, socket_bound={socket_bound}, \
+                         has_peer={has_peer})"
+                    );
+
+                    // fivegs-to-eps: routed iff drivable.
+                    let fivegs = inter_system_handover_refusal_with(Ht::FivegsToEps, drivable);
+                    if all_three {
+                        assert_eq!(
+                            fivegs, None,
+                            "fivegs-to-eps must ROUTE when the switch is on, a socket is bound \
+                             and a target MME is configured: the preparation CAN be completed, \
+                             and refusing it would be the #116 defect in the other direction"
+                        );
+                    } else {
+                        let (cause, label) = fivegs.unwrap_or_else(|| {
+                            panic!(
+                                "fivegs-to-eps must still be REFUSED when a Forward Relocation \
+                                 cannot be driven (switch_on={switch_on}, \
+                                 socket_bound={socket_bound}, has_peer={has_peer}) -- routing \
+                                 it would forward a preparation the AMF cannot complete, which \
+                                 is strictly worse than an honest refusal"
+                            )
+                        });
+                        assert_eq!(cause, Cr::HoTargetNotAllowed);
+                        assert_eq!(label, "EPS (fivegs-to-eps)");
+                    }
+
+                    // eps-to-5gs: refused UNCONDITIONALLY, including when drivable.
+                    //
+                    // Not an oversight. TS 38.413 §9.3.1.22 (38413-j30.txt:19660-19662) defines
+                    // HandoverType as "which kind of handover was triggered in the SOURCE", and
+                    // an EPS-to-5GS handover is triggered in the E-UTRAN -- it reaches this AMF
+                    // as a Forward Relocation Request over N26 or as a RelocateUEContext from an
+                    // initial AMF, never as an NGAP HandoverRequired from a gNB. So there is no
+                    // state in which routing it is right.
+                    let (cause, label) = inter_system_handover_refusal_with(Ht::EpsTo5gs, drivable)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "eps-to-5gs must be refused in ALL eight states, including \
+                                 drivable={drivable}: a HandoverRequired naming it comes from a \
+                                 gNB, and that procedure's source is the E-UTRAN"
+                            )
+                        });
+                    assert_eq!(cause, Cr::HoTargetNotAllowed);
+                    assert_eq!(label, "5GS (eps-to-5gs)");
+                }
+            }
+        }
+    }
+
+    /// **#408 criterion 6**: the HANDOVER COMMAND for an accepted 5GS→EPS preparation declines
+    /// forwarding and names which bearers lose data.
+    ///
+    /// # What this pins that a weaker test would not
+    ///
+    /// The forwarding decision is `Vec::new()` — a value a careless refactor could produce by
+    /// accident — so the assertion that earns its keep is the second one: the bearers are
+    /// **named**, so the site has something specific to log, and the refusal holds **even when
+    /// the MME offered an endpoint**. The gNB's own `direct-path-available` is now parsed
+    /// (#408), and a later change that wired the Direct Forwarding Indication to it without also
+    /// writing a `HandoverCommandTransfer` encoder would fail here.
+    #[test]
+    fn a_5gs_to_eps_handover_command_declines_forwarding_and_says_which_bearers_lose_data() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Literal values distinct from every sibling test's: the AMF context is process-global
+        // and keyed by identity, so a shared UE id would let two tests resolve each other's
+        // state. `0x408` marks these as this issue's.
+        const UE: u64 = 0x0408_4001;
+        const DL_COUNT: u32 = 0x0408_12AB;
+
+        let accepted = crate::n26_path::ForwardRelocationOutcome::Accepted {
+            mme_teid: Some(0x0408_5001),
+            peer: "10.4.8.9:2123".parse().expect("a literal address parses"),
+            target_to_source_container: vec![0xE0, 0xE8],
+            admitted_ebis: vec![5, 6],
+            dl_count_used: DL_COUNT,
+        };
+
+        let command = inter_system_handover_command(&accepted)
+            .expect("an accepted relocation must yield a HandoverCommand decision");
+
+        // The container is relayed byte for byte -- TS 38.413 §9.3.1.21 makes it a TS 36.413
+        // E-UTRAN structure, so any re-encoding here corrupts what the source gNB decodes.
+        assert_eq!(
+            command.target_to_source_container,
+            vec![0xE0, 0xE8],
+            "the Target-to-Source container must be relayed VERBATIM"
+        );
+
+        // THE forwarding decision.
+        assert!(
+            command.forwarding_sessions.is_empty(),
+            "the PDU Session Resource Handover List must be EMPTY: each item would carry a \
+             HandoverCommandTransfer whose dLForwardingUP-TNLInformation (38413-j30.txt:48917) \
+             this tree has no encoder for, and TS 38.413 §9.2.3.2 makes the list \
+             `PRESENCE optional` (:38763) so an empty one is conformant"
+        );
+        assert_eq!(
+            command.bearers_without_forwarding,
+            vec![5, 6],
+            "and every admitted bearer must be NAMED, so the site logs WHICH bearers lose \
+             in-flight downlink data rather than reporting a count. That is the #185 posture: \
+             state what is affected, not merely that something is."
+        );
+
+        // The COUNT the UE would need, computed and reported -- the ceiling is that it is not
+        // encoded, not that it is unknown.
+        assert_eq!(
+            command.nas_count_lsb,
+            (DL_COUNT & 0xFF) as u8,
+            "the 8 LSB of the downlink NAS COUNT used for K_ASME' must be the PRE-increment \
+             value TS 33.501 §8.3.2 step 7 names (33501-k20.txt:11409-11412). It is carried \
+             through the pending record rather than re-read, because by now the stored count \
+             has advanced -- re-reading is the nextgsim-#203 defect."
+        );
+
+        // The forwarding refusal must NOT depend on what the MME offered. An accepted outcome
+        // whose bearers carried endpoints still yields an empty list, because the missing piece
+        // is the AMF's own encoder rather than the MME's answer.
+        let with_offer = crate::n26_path::ForwardRelocationOutcome::Accepted {
+            mme_teid: Some(0x0408_5002),
+            peer: "10.4.8.9:2123".parse().expect("a literal address parses"),
+            target_to_source_container: vec![0xE0, 0xE8],
+            admitted_ebis: vec![7],
+            dl_count_used: DL_COUNT,
+        };
+        let offered = inter_system_handover_command(&with_offer).expect("accepted");
+        assert!(
+            offered.forwarding_sessions.is_empty(),
+            "the refusal to forward must hold regardless of what the target MME offered: the \
+             blocker is this AMF's missing HandoverCommandTransfer encoder, so a change that \
+             wired the Direct Forwarding Indication to the gNB's parsed \
+             direct-path-available without also writing that encoder must fail here"
+        );
+        assert_eq!(offered.bearers_without_forwarding, vec![7]);
+
+        // And a REFUSED relocation yields no command at all -- it produces a
+        // HandoverPreparationFailure, which is a different message.
+        let refused = crate::n26_path::ForwardRelocationOutcome::Refused { cause: 81 };
+        assert!(
+            inter_system_handover_command(&refused).is_none(),
+            "a refused relocation must NOT yield a HandoverCommand: the source gNB gets a \
+             HandoverPreparationFailure, and a command here would tell it to move a UE the \
+             target declined"
+        );
+        let _ = UE;
     }
 
     /// #116 criterion 2: the LIVE parser captures the UE's S1-mode capability.

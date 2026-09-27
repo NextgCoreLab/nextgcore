@@ -15,6 +15,7 @@ pub mod gmm_build;
 pub mod gmm_handler;
 pub mod gmm_sm;
 pub mod metrics;
+pub mod n26_build; // #408: Forward Relocation build/parse (TS 29.274 §7.3.1-§7.3.4)
 pub mod n26_path; // #347: the N26 leg toward an MME (TS 23.502 §4.11.1.3.2)
 pub mod namf_handler;
 pub mod namf_server;
@@ -968,6 +969,27 @@ pub async fn run() -> Result<()> {
             .ok()
             .and_then(|v| v.parse::<u8>().ok())
             .unwrap_or(0);
+        // #408: the target MME peer list. Read BEFORE `n26_open` so
+        // `forward_relocation_drivable()` -- which `ngap_path::handle_handover_required`
+        // consults to decide whether to route a `fivegs-to-eps` preparation or refuse it -- can
+        // never observe a bound socket with an unread peer list. Ordering it after would leave
+        // a window in which the AMF refused a handover it was configured to serve.
+        let mme_peers = n26_path::init_mme_peers_from_env();
+        if mme_peers == 0 {
+            log::info!(
+                "No target MME N26 peer configured ({}): 5GS-to-EPS connected-mode handover \
+                 stays REFUSED with ho-target-not-allowed, because a Forward Relocation Request \
+                 has nowhere to go. Idle-mode context transfer (#347) is unaffected -- it is \
+                 reactive and answers at the address the MME's Context Request came from.",
+                n26_path::N26_MME_ENV_VAR
+            );
+        } else {
+            log::info!(
+                "{mme_peers} target MME N26 peer(s) configured: 5GS-to-EPS connected-mode \
+                 handover will drive a GTPv2-C Forward Relocation Request (TS 23.502 \
+                 §4.11.1.2.1 step 3) once the N26 socket is bound"
+            );
+        }
         if let Err(e) = n26_path::n26_open(n26_bind, restart_counter).await {
             log::error!(
                 "Failed to open the N26 path: {e}. The AMF continues WITHOUT N26: every UE is \

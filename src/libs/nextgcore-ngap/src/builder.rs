@@ -525,6 +525,13 @@ pub fn build_handover_required(msg: &HandoverRequired) -> NgapResult<Vec<u8>> {
     // IE: SourceToTarget-TransparentContainer (mandatory)
     ie::encode_source_to_target_container(&mut container, &msg.source_to_target_container)?;
 
+    // IE: DirectForwardingPathAvailability (optional), #408. Emitted only when present,
+    // because the IE has ONE enumerated value and its ABSENCE is what says "no direct path"
+    // (TS 23.502 §4.11.1.2.1 step 1) -- so there is no "false" to encode.
+    if let Some(availability) = msg.direct_forwarding_path_availability {
+        ie::encode_direct_forwarding_path_availability(&mut container, availability)?;
+    }
+
     let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
         procedure_code: ProcedureCode::HANDOVER_PREPARATION,
         criticality: Criticality::Reject,
@@ -2300,6 +2307,10 @@ mod ng_setup_cross_codec {
                 transfer: vec![0x01],
             }],
             source_to_target_container: vec![0x0A, 0x0B],
+            // Absent, i.e. the source gNB reports NO direct forwarding path. #408's
+            // `handover_required_keeps_the_direct_forwarding_path_availability_ie` covers
+            // the present case; this test's subject is the cancel round trip.
+            direct_forwarding_path_availability: None,
         };
         let bytes = build_handover_required(&req).unwrap();
         assert_eq!(bytes[1], 12);
@@ -2325,6 +2336,101 @@ mod ng_setup_cross_codec {
                 assert_eq!(c.ran_ue_ngap_id, 2);
             }
             other => panic!("expected HandoverCancel, got {other:?}"),
+        }
+    }
+
+    /// **#408**: a HANDOVER REQUIRED carrying **Direct Forwarding Path Availability**
+    /// survives the round trip, and its absence is preserved as absence.
+    ///
+    /// # Why this test exists
+    ///
+    /// The IE id constant (`ie::IE_ID_DIRECT_FORWARDING_PATH_AVAILABILITY = 22`, against
+    /// `38413-j30.txt:59477`) and a full `AperEncode`/`AperDecode` type both already existed,
+    /// and `parse_handover_required` had **no arm for either** — the field fell into
+    /// `handle_unknown_ie` and the value was discarded. So the AMF's entire
+    /// inter-system-forwarding decision had no input, while mmed has read the S1AP equivalent
+    /// since #48.
+    ///
+    /// Both polarities are asserted because `None` is a **statement**, not a default: the IE
+    /// has exactly one enumerated value (`direct-path-available`), so presence means "yes" and
+    /// absence means "no". A parser that always answered `None` would pass a
+    /// present-case-only test in the one direction that matters least.
+    #[test]
+    fn handover_required_keeps_the_direct_forwarding_path_availability_ie() {
+        use nextgcore_asn1c::ngap::ies::DirectForwardingPathAvailability;
+
+        fn required(availability: Option<DirectForwardingPathAvailability>) -> HandoverRequired {
+            HandoverRequired {
+                amf_ue_ngap_id: 0x408,
+                ran_ue_ngap_id: 0x408,
+                // fivegs-to-eps, because this IE only matters for an inter-system move: it is
+                // what TS 23.502 §4.11.1.2.1 step 3 turns into the GTPv2-C Direct Forwarding
+                // Flag of a Forward Relocation Request.
+                handover_type: HandoverType::FivegsToEps,
+                cause: Cause::RadioNetwork(CauseRadioNetwork::HandoverDesirableForRadioReason),
+                target_id: TargetId::TargetRanNodeId {
+                    global_ran_node_id: GlobalRanNodeId::GlobalGnbId {
+                        plmn_identity: [0x00, 0xF1, 0x10],
+                        gnb_id: 0x408,
+                        gnb_id_len: 32,
+                    },
+                    selected_tai: TaiListItem {
+                        tai_plmn: [0x00, 0xF1, 0x10],
+                        tai_tac: [0x00, 0x04, 0x08],
+                    },
+                },
+                pdu_session_list: vec![PduSessionResourceItemHoRqd {
+                    pdu_session_id: 5,
+                    transfer: vec![0x04, 0x08],
+                }],
+                source_to_target_container: vec![0x40, 0x80],
+                direct_forwarding_path_availability: availability,
+            }
+        }
+
+        // Present: the gNB says it HAS a direct path, and the AMF must be able to see that.
+        let with = required(Some(DirectForwardingPathAvailability::DirectPathAvailable));
+        let bytes = build_handover_required(&with).unwrap();
+        match crate::parser::decode_ngap_pdu(&bytes).unwrap() {
+            crate::parser::NgapMessage::HandoverRequired(r) => {
+                assert_eq!(
+                    r.direct_forwarding_path_availability,
+                    Some(DirectForwardingPathAvailability::DirectPathAvailable),
+                    "the source gNB's Direct Forwarding Path Availability must reach the AMF: \
+                     it is the ONLY input the inter-system forwarding decision has, and \
+                     before #408 it was dropped into handle_unknown_ie"
+                );
+                // The rest of the message must be intact, i.e. the new IE did not displace
+                // a mandatory one -- an appended optional IE that shifted the container would
+                // be invisible to an assertion about itself alone.
+                assert_eq!(r.handover_type, HandoverType::FivegsToEps);
+                assert_eq!(r.pdu_session_list.len(), 1);
+                assert_eq!(r.pdu_session_list[0].pdu_session_id, 5);
+                assert_eq!(r.source_to_target_container, vec![0x40, 0x80]);
+            }
+            other => panic!("expected HandoverRequired, got {other:?}"),
+        }
+
+        // Absent: no direct path. The IE must NOT appear on the wire, because the type has no
+        // "unavailable" value to encode -- emitting `direct-path-available` here would invert
+        // the statement.
+        let without = required(None);
+        let bytes_without = build_handover_required(&without).unwrap();
+        assert!(
+            bytes_without.len() < bytes.len(),
+            "with no direct path the IE must be OMITTED, not sent with some default: the \
+             enumeration's only value means the path IS available"
+        );
+        match crate::parser::decode_ngap_pdu(&bytes_without).unwrap() {
+            crate::parser::NgapMessage::HandoverRequired(r) => {
+                assert_eq!(
+                    r.direct_forwarding_path_availability, None,
+                    "and absence must decode as absence, which is what the AMF reads as 'no \
+                     direct forwarding path' (TS 23.502 §4.11.1.2.1 step 1)"
+                );
+                assert_eq!(r.handover_type, HandoverType::FivegsToEps);
+            }
+            other => panic!("expected HandoverRequired, got {other:?}"),
         }
     }
 }

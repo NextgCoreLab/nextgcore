@@ -38,6 +38,13 @@ const FC_FOR_KAMF_PRIME_DERIVATION: u8 = 0x72;
 /// One octet away from `FC_FOR_KAMF_PRIME_DERIVATION` above, and that is the whole
 /// difference between re-keying inside 5GS and crossing into EPS.
 const FC_FOR_KASME_PRIME_IDLE_MOBILITY: u8 = 0x73;
+/// TS 33.501 Annex A.14.2 — K_AMF to K_ASME' for 5GS→EPS **handover** (#408).
+///
+/// One octet away from [`FC_FOR_KASME_PRIME_IDLE_MOBILITY`] above, and the two take the
+/// same key and a same-shaped 4-octet COUNT — so the only thing distinguishing a handover
+/// key from an idle-mode one is this byte. A copy-paste produces a well-formed 32-byte key
+/// no peer can reproduce, which no round trip detects.
+const FC_FOR_KASME_PRIME_HANDOVER: u8 = 0x74;
 const FC_FOR_SOR_MAC_IAUSF_DERIVATION: u8 = 0x77;
 const FC_FOR_SOR_MAC_IUE_DERIVATION: u8 = 0x78;
 const FC_FOR_UPU_MAC_IAUSF_DERIVATION: u8 = 0x7B;
@@ -394,9 +401,10 @@ pub const KAMF_PRIME_DIRECTION_DOWNLINK: u8 = 0x01;
 /// `kasme_prime_matches_ts33501_annex_a_14_1` asserts the two outputs differ for
 /// identical inputs.
 ///
-/// Annex A.14.2 (FC `0x74`, bound to the DOWNLINK count) is the handover counterpart and
-/// is deliberately absent: connected-mode 5GS→EPS handover is #408, and a KDF with no
-/// caller is the dead code this tree keeps growing.
+/// Annex A.14.2 (FC `0x74`, bound to the DOWNLINK count) is the handover counterpart, and
+/// it is [`nextgcore_kdf_kasme_prime_handover`] (#408). Picking the wrong one of the two
+/// yields a key the UE cannot reproduce, with a symptom (MAC failure on the first EPS NAS
+/// message) that points nowhere near either function.
 ///
 /// # Verification ceiling
 ///
@@ -417,6 +425,75 @@ pub fn nextgcore_kdf_kasme_prime(
     params[0].len = 4;
 
     nextgcore_kdf_common(kamf, FC_FOR_KASME_PRIME_IDLE_MOBILITY, &params)
+}
+
+/// TS 33.501 Annex A.14.2: K_ASME' from K_AMF for 5GS→EPS **connected-mode handover**
+/// (FC 0x74).
+///
+/// The mapped EPS security context a source AMF hands to a target MME inside a GTPv2-C
+/// **Forward Relocation Request** (#408). Annex A.14.2 (`33501-k20.txt:17144-17156`) gives
+/// the inputs, read on its own rather than inferred from A.14.1:
+///
+/// ```text
+/// FC  = 0x74
+/// P0  = NAS Downlink COUNT value
+/// L0  = length of NAS Downlink COUNT value (i.e. 0x00 0x04)
+/// KEY = K_AMF
+/// ```
+///
+/// so `S = FC(0x74) || P0(downlink NAS COUNT, 4 octets BE) || L0(0x0004)`.
+///
+/// # The DOWNLINK count, and the moment it is read
+///
+/// TS 33.501 §8.6.1 (`33501-k20.txt:11743-11747`) makes the direction the whole distinction
+/// between this and [`nextgcore_kdf_kasme_prime`]: the key is derived *"from the K_(AMF)
+/// using the 5G NAS Uplink COUNT value derived from the TAU Request message or Attach Request
+/// message **in idle mode mobility** or the 5G NAS **Downlink COUNT value in handovers**"*.
+///
+/// And §8.3.2 step 2 (`33501-k20.txt:11335-11340`) fixes *which* downlink COUNT, in an order
+/// that is load-bearing:
+///
+/// > the source AMF shall derive a K'_(ASME) using the K_(AMF) key and the **current**
+/// > downlink 5G NAS COUNT of the current 5G security context as described in clause 8.6.1
+/// > and **then increments** its stored downlink 5G NAS COUNT value by one.
+///
+/// So the caller passes the COUNT it holds **before** advancing it. Deriving after the
+/// increment produces a key the UE cannot reproduce: §8.3.2 step 7-8 has the AMF send the UE
+/// the *"8 LSB of the downlink NAS COUNT value used in K_(ASME)' derivation in step 2"* and
+/// the UE derive from that estimate, so an off-by-one desynchronises every subsequent EPS NAS
+/// message with a MAC failure that points nowhere near here. The increment itself is not
+/// optional either — a second handover reusing the COUNT would derive the same key twice, and
+/// step 8 requires the UE to check the estimate is *greater than* its stored value.
+///
+/// # Not to be confused with FC 0x73 or FC 0x72
+///
+/// All three take `K_AMF` and a 4-octet NAS COUNT with `L0 = 0x0004`, and differ **only in
+/// the FC octet**: `0x72` (Annex A.13) re-keys within 5GS, `0x73` (A.14.1) crosses into EPS
+/// at idle-mode mobility, `0x74` (A.14.2) crosses into EPS at handover. A copy-pasted
+/// constant yields a perfectly well-formed 32-byte key, and an encode/decode test of the MM
+/// Context carrying it passes.
+/// `kasme_prime_handover_matches_ts33501_annex_a_14_2` asserts the output differs from both
+/// for identical inputs.
+///
+/// # Verification ceiling
+///
+/// As with [`nextgcore_kdf_kasme_prime`] and [`nextgcore_kdf_kamf_prime`], **no published
+/// 3GPP test vector exists for this derivation and none is in this tree.** The golden vectors
+/// in the test were computed by an outside HMAC-SHA256 fed the `S` above straight from Annex
+/// A.14.2's parameter list, so they are independent of this implementation and catch a wrong
+/// FC, a wrong `L0`, a reversed parameter order or a little-endian COUNT. Interop against a
+/// real MME remains the outstanding validation.
+pub fn nextgcore_kdf_kasme_prime_handover(
+    kamf: &[u8; SHA256_DIGEST_SIZE],
+    nas_downlink_count: u32,
+) -> [u8; SHA256_DIGEST_SIZE] {
+    let count_be = nas_downlink_count.to_be_bytes();
+
+    let mut params = [KdfParam::default()];
+    params[0].buf = Some(count_be.to_vec());
+    params[0].len = 4;
+
+    nextgcore_kdf_common(kamf, FC_FOR_KASME_PRIME_HANDOVER, &params)
 }
 
 /// TS 33.501 Annex A.17: SoR-MAC-I_AUSF generation function
@@ -1334,6 +1411,103 @@ mod tests {
             hex(&nextgcore_kdf_kasme_prime(&kamf, 0xFFFF_FFFF)),
             "9c4fee54049380f6056815ca1913de6c80bce522600ae142bf05b324ab14e265",
             "HMAC-SHA256([0x55;32], 0x73 || ffffffff || 0004): the COUNT is four octets, \
+             not the MM Context's three"
+        );
+        assert_eq!(
+            base.len(),
+            SHA256_DIGEST_SIZE,
+            "K_ASME is 32 octets (TS 29.274 Figure 8.38-5, octets 14 to 45)"
+        );
+    }
+
+    /// nextgcore #408: FC 0x74 K_ASME' derivation, TS 33.501 Annex A.14.2.
+    ///
+    /// #408's criterion 3 names the hazard itself: the handover form must be *"asserted to
+    /// differ from the FC 0x73 idle-mode form for identical inputs"*. The two constructions
+    /// are byte-for-byte identical apart from the FC octet — same key, same 4-octet COUNT,
+    /// same `L0 = 0x0004` — so a copy-paste yields a well-formed 32-byte key that every
+    /// round-trip test of the MM Context carrying it accepts, and that no MME can reproduce.
+    #[test]
+    fn kasme_prime_handover_matches_ts33501_annex_a_14_2() {
+        fn hex(bytes: &[u8; SHA256_DIGEST_SIZE]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+        let kamf = [0x55u8; SHA256_DIGEST_SIZE];
+        let other = [0x66u8; SHA256_DIGEST_SIZE];
+
+        let base = nextgcore_kdf_kasme_prime_handover(&kamf, 1);
+
+        // Deterministic.
+        assert_eq!(base, nextgcore_kdf_kasme_prime_handover(&kamf, 1));
+        // The downlink NAS COUNT is load-bearing (Annex A.14.2 P0). Without it every
+        // handover for a given UE would derive the same key, and TS 33.501 §8.3.2 step 8
+        // has the UE REFUSE a COUNT that is not greater than its stored one.
+        assert_ne!(
+            base,
+            nextgcore_kdf_kasme_prime_handover(&kamf, 2),
+            "P0 is the NAS Downlink COUNT; if it were dropped, two handovers for one UE \
+             would derive the same K_ASME' and the second would be refused by the UE"
+        );
+        // The key is load-bearing.
+        assert_ne!(base, nextgcore_kdf_kasme_prime_handover(&other, 1));
+        // A mapped context must not be the identity.
+        assert_ne!(
+            base, kamf,
+            "K_ASME' must not be K_AMF: copying the key would hand the MME one the AMF \
+             still uses for its own 5G NAS"
+        );
+        assert_ne!(base, [0u8; SHA256_DIGEST_SIZE]);
+
+        // THE assertion #408's criterion 3 asks for: FC 0x74 (handover, downlink COUNT) is
+        // not FC 0x73 (idle mode, uplink COUNT) FOR IDENTICAL INPUTS. Both take K_AMF and a
+        // 4-octet COUNT, so passing the same number to both is exactly what a copy-paste
+        // produces -- and the only difference on the wire is one octet of `S`, which no
+        // codec test can see.
+        assert_ne!(
+            base,
+            nextgcore_kdf_kasme_prime(&kamf, 1),
+            "Annex A.14.2 (FC 0x74, handover, DOWNLINK count) must differ from Annex A.14.1 \
+             (FC 0x73, idle mode, UPLINK count) for identical inputs -- they differ only in \
+             the FC octet and no round trip can tell them apart"
+        );
+        // And not FC 0x72 either (Annex A.13, re-keying WITHIN 5GS). Its downlink form takes
+        // DIRECTION = 0x01 with the same COUNT, so this is the other adjacent confusion.
+        assert_ne!(
+            base,
+            nextgcore_kdf_kamf_prime(&kamf, KAMF_PRIME_DIRECTION_DOWNLINK, 1),
+            "Annex A.14.2 (FC 0x74, K_AMF->K_ASME', into EPS at handover) must differ from \
+             Annex A.13 (FC 0x72, K_AMF->K_AMF', within 5GS)"
+        );
+
+        // Golden vectors, computed INDEPENDENTLY of this implementation: an outside
+        // HMAC-SHA256 was fed `S = 0x74 || COUNT(4, big-endian) || 0x0004` with
+        // `KEY = [0x55; 32]`, straight from Annex A.14.2's parameter list, and the digests
+        // pasted here.
+        //
+        // The independence is the point, and it is the difference between this test and
+        // `kamf_prime_matches_its_golden_vectors` above, which pastes a snapshot of its own
+        // output: that pins the construction has not MOVED but cannot say it was ever RIGHT.
+        // These vectors do both -- a wrong FC, a wrong L0, a reversed parameter order, or
+        // `to_ne_bytes()` instead of `to_be_bytes()` each fails here rather than being
+        // blessed.
+        //
+        // COUNT = 0xFFFF_FFFF is included because a 4-octet COUNT truncated to the 3 octets
+        // the MM Context's NAS Downlink Count field carries would still differ from COUNT=1
+        // and so pass every negative assertion above.
+        assert_eq!(
+            hex(&nextgcore_kdf_kasme_prime_handover(&kamf, 1)),
+            "63a36a0268e4d97b55eee4623174b5b3e74048f89a4479b8a751f91d6ea3eec9",
+            "HMAC-SHA256([0x55;32], 0x74 || 00000001 || 0004) per TS 33.501 Annex A.14.2"
+        );
+        assert_eq!(
+            hex(&nextgcore_kdf_kasme_prime_handover(&kamf, 2)),
+            "a7f8dafd5c8877aa1790d9d489fd8bfb07432cea7850f605120dd6cba85f7ead",
+            "HMAC-SHA256([0x55;32], 0x74 || 00000002 || 0004)"
+        );
+        assert_eq!(
+            hex(&nextgcore_kdf_kasme_prime_handover(&kamf, 0xFFFF_FFFF)),
+            "f2d56f2dd0229e7cfa7d75e90c2aaf90efaef8b064da652b5179e55470b02070",
+            "HMAC-SHA256([0x55;32], 0x74 || ffffffff || 0004): the COUNT is four octets, \
              not the MM Context's three"
         );
         assert_eq!(

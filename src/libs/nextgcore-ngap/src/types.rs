@@ -578,6 +578,23 @@ pub struct HandoverRequired {
     pub pdu_session_list: Vec<PduSessionResourceItemHoRqd>,
     /// Source to Target Transparent Container
     pub source_to_target_container: Vec<u8>,
+    /// Direct Forwarding Path Availability (optional, TS 38.413 IE id 22).
+    ///
+    /// The **source NG-RAN's own statement** about whether it can forward user-plane data
+    /// straight to the target RAN. TS 23.502 §4.11.1.2.1 step 1 (`23502-k20.txt:20984-20988`)
+    /// defines it as *"whether direct forwarding is available from the NG-RAN to the
+    /// E-UTRAN [...] based on e.g. the presence of IP connectivity and security
+    /// association(s) between the NG-RAN and the E-UTRAN"*, and step 3 (`:21063-21065`) has
+    /// the AMF set the GTPv2-C Direct Forwarding Flag from it.
+    ///
+    /// **`None` means no direct path**, not "unknown": the IE has a single enumerated value
+    /// (`direct-path-available`), so its *presence* is the whole signal. mmed reads it the
+    /// same way — `s1ap_handler.rs`'s `direct_forwarding_path_availability.is_some()`, with
+    /// #48's comment recording that ABSENT selects indirect forwarding. #408 added it here
+    /// because `parse_handover_required` was dropping it into `handle_unknown_ie`, so the AMF
+    /// was discarding the only input its forwarding decision has.
+    pub direct_forwarding_path_availability:
+        Option<nextgcore_asn1c::ngap::ies::DirectForwardingPathAvailability>,
 }
 
 /// Handover Request - sent by AMF to target gNB (TS 38.413 Section 9.2.3.2)
