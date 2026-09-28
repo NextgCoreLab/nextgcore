@@ -1048,6 +1048,95 @@ impl SxaNode {
             }
         }
     }
+
+    /// Usage-report monitor: send the reports whose trigger is TIME, not traffic
+    /// (TS 29.244 §5.2.2.2).
+    ///
+    /// # The defect this closes
+    ///
+    /// `SgwuUrr::reportable` has always evaluated `PERIODIC` and `TIME_THRESHOLD`
+    /// correctly, and **nothing ever asked it to**. Its only production caller was
+    /// `urr_record`, reached from the GTP-U data path, so the reporting a URR owes
+    /// on a CLOCK was driven by PACKETS: a session provisioned with a
+    /// `measurement_period` and then left idle reported nothing for as long as it
+    /// stayed idle, while the SGW-C believed measurement was running. Silent,
+    /// because the code computing the trigger was right -- only unreachable.
+    ///
+    /// sgwud spawned exactly two background tasks before this one (the receive loop
+    /// and the heartbeat monitor), which is why there was no clock to hang it on.
+    ///
+    /// # Tick interval
+    ///
+    /// One second, and the interval is NOT derived from the URRs' own periods. A
+    /// per-URR timer would be more precise and would need a scheduler keyed by a
+    /// value the CP function can change with any Session Modification; a coarse
+    /// sweep is late by at most one tick, and `reportable` compares against
+    /// `start_time` rather than counting ticks, so lateness does not accumulate
+    /// into drift. TS 29.244 sets no accuracy requirement on the report instant.
+    pub async fn usage_report_monitor(
+        self: Arc<Self>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) {
+        const TICK: std::time::Duration = std::time::Duration::from_secs(1);
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(TICK) => {}
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        return;
+                    }
+                    continue;
+                }
+            }
+            let now = crate::context::now_unix_secs();
+            // One locked pass over every URR, returning only those whose TIME
+            // trigger fired. Volume triggers stay with the data path: a volume
+            // threshold can only be crossed by a packet, and evaluating it here too
+            // would mean two paths racing to report one crossing -- the
+            // double-report defect #267 fixed.
+            let due = sgwu_self().urr_take_time_triggered(now);
+            if due.is_empty() {
+                continue;
+            }
+            // Grouped per session, because a Session Report Request is addressed to
+            // one CP F-SEID. Two URRs of one session that fire on the same tick
+            // belong in ONE request, not two.
+            let mut by_sess: std::collections::BTreeMap<u64, Vec<crate::sxa_build::UsageReport>> =
+                std::collections::BTreeMap::new();
+            for (snapshot, ur_seqn) in due {
+                let report = crate::sxa_handler::usage_report_from(
+                    &snapshot,
+                    ur_seqn,
+                    snapshot.fired_trigger,
+                );
+                by_sess.entry(snapshot.sess_id).or_default().push(report);
+            }
+            for (sess_id, reports) in by_sess {
+                let Some(sess) = sgwu_self().sess_find_by_id(sess_id) else {
+                    // The report was already TAKEN, so its counters are reset and it
+                    // cannot be re-sent. Named rather than dropped silently: this is
+                    // measured usage that will never reach the SGW-C.
+                    log::warn!(
+                        "URR time-trigger fired for session {sess_id} but the session is \
+                         gone; {} report(s) LOST (their counters were already reset)",
+                        reports.len()
+                    );
+                    continue;
+                };
+                let count = reports.len();
+                let report = UserPlaneReport::with_usage_reports(reports);
+                match send_session_report_request(&sess, &report) {
+                    Ok(()) => log::info!(
+                        "Sent {count} time-triggered usage report(s) for session {sess_id} \
+                         (TS 29.244 §5.2.2.2)"
+                    ),
+                    Err(e) => log::error!(
+                        "Time-triggered Session Report (USAR) for session {sess_id} failed: {e}"
+                    ),
+                }
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -1198,6 +1287,19 @@ impl SxaNode {
             return;
         };
         let parsed = modification_from_lib(&req);
+        // BEFORE the modification, not after. Table 7.5.4.1-1 permits a Query URR IE
+        // and a Remove URR IE in one request, and §7.5.4.6 gives the removal no
+        // report of its own -- so a query answered after the handler had already
+        // removed the URR would find nothing and the residual usage would be lost.
+        // Querying first means "report what this rule measured, then change it",
+        // which is the order §5.2.2.3's close-the-counts use case needs.
+        //
+        // The reports are DISCARDED if the modification then fails: a query takes
+        // the counters and resets the period, so the success arm below is the only
+        // place they may be sent. That costs the reset on a failed modification,
+        // which is the lesser harm -- the alternative loses the residual on every
+        // successful remove-with-query, the common case.
+        let queried_urrs = crate::sxa_handler::process_queried_urrs(&sess, &parsed);
         let (result, created_pdrs) =
             crate::sxa_handler::handle_session_modification_request(Some(&sess), 0, &parsed);
         let sess = ctx.sess_find_by_id(sess.id).unwrap_or(sess);
@@ -1213,9 +1315,13 @@ impl SxaNode {
                 .await;
             }
             _ => {
-                let Some(msg) =
-                    sxa_build::build_session_modification_response(&sess, &created_pdrs)
-                else {
+                // Taken before the modification ran (see above) and sent only here,
+                // on the success arm.
+                let Some(msg) = sxa_build::build_session_modification_response(
+                    &sess,
+                    &created_pdrs,
+                    &queried_urrs,
+                ) else {
                     log::error!("Failed to build Session Modification Response");
                     return;
                 };
@@ -1608,6 +1714,9 @@ fn modification_from_lib(
         remove_qers: req.remove_qers.iter().map(|r| r.qer_id).collect(),
         update_urrs: req.update_urrs.iter().map(update_urr_from_lib).collect(),
         remove_urrs: req.remove_urrs.iter().map(|r| r.urr_id).collect(),
+        query_urrs: req.query_urrs.iter().map(|q| q.urr_id).collect(),
+        // PFCPSMReq-Flags bit 3 = QAURR (§8.2.31, `29244-k00.txt:30557`).
+        query_all_urrs: req.pfcp_smreq_flags.is_some_and(|f| f & 0x04 != 0),
         create_bar: None,
         remove_bar: None,
     }

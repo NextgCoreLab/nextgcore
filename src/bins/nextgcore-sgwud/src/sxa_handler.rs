@@ -232,6 +232,16 @@ pub struct SessionModificationRequest {
     pub update_urrs: Vec<UpdateUrrRequest>,
     /// Remove URR list (issue #215)
     pub remove_urrs: Vec<u32>,
+    /// Query URR list (TS 29.244 §7.5.4.10): report these URRs' ONGOING
+    /// measurement now, outside any threshold or period.
+    pub query_urrs: Vec<u32>,
+    /// The PFCPSMReq-Flags **QAURR** bit (§8.2.31 bit 3): query EVERY URR of the
+    /// session.
+    ///
+    /// NOTE 3 (`29244-k00.txt:22672`) makes this and `query_urrs` **exclusive**, so
+    /// the handler refuses a request carrying both rather than guessing which the
+    /// CP function meant.
+    pub query_all_urrs: bool,
     /// Create BAR
     pub create_bar: Option<CreateBarRequest>,
     /// Remove BAR
@@ -564,6 +574,87 @@ pub fn handle_session_modification_request(
     (HandlerResult::Ok, created_pdrs)
 }
 
+/// Answer a Query URR / QAURR request with the named URRs' ONGOING measurement
+/// (TS 29.244 §7.5.4.10, §5.2.2.3).
+///
+/// # Why this is a separate function, called after the modification
+///
+/// The modification handler has 21 early-return sites, each yielding
+/// `(HandlerResult, Vec<CreatedPdr>)`. Threading a third element through all of them
+/// to carry reports would touch every one, and a query answered on a modification
+/// that FAILED would report usage against rules the CP function's request did not
+/// install. So the query runs only once the modification has succeeded, and the
+/// caller composes the two.
+///
+/// # A query TAKES the report
+///
+/// §5.2.2.3's use case is "a chargeable event requiring to **close the counts and
+/// start new counts**", so a query is not a peek: it takes the measurement and
+/// resets the period, exactly as a threshold-triggered report does. Reading without
+/// resetting would double-count the same bytes in the next report.
+///
+/// The trigger reported is IMMER (immediate report), which is what §8.2.42 defines
+/// for a report the CP function asked for rather than one a condition produced.
+pub fn process_queried_urrs(
+    sess: &SgwuSess,
+    req: &SessionModificationRequest,
+) -> Vec<crate::sxa_build::UsageReport> {
+    // NOTE 3 (`29244-k00.txt:22672`): the QAURR flag and the Query URR IE are
+    // EXCLUSIVE. Refused rather than resolved, because either interpretation
+    // silently reports something the CP function did not ask for -- and a query
+    // TAKES the counters, so a wrong guess is unrecoverable.
+    if req.query_all_urrs && !req.query_urrs.is_empty() {
+        log::warn!(
+            "Session Modification carries BOTH the QAURR flag and {} Query URR IE(s), which \
+             TS 29.244 Table 7.5.4.1-1 NOTE 3 makes exclusive; no usage is reported and no \
+             counter is reset",
+            req.query_urrs.len()
+        );
+        return Vec::new();
+    }
+
+    let ctx = sgwu_self();
+    let ids: Vec<u32> = if req.query_all_urrs {
+        ctx.urr_find_for_sess(sess.id)
+            .into_iter()
+            .map(|u| u.urr_id)
+            .collect()
+    } else {
+        req.query_urrs.clone()
+    };
+    if ids.is_empty() {
+        return Vec::new();
+    }
+
+    let mut reports = Vec::new();
+    for urr_id in ids {
+        // `urr_take_report` is the out-of-band taker: it checks and takes under one
+        // guard, like the data path, so a query and a concurrent packet cannot both
+        // take a report from the same counters (#267).
+        let Some((snapshot, ur_seqn)) = ctx.urr_take_report(sess.id, urr_id) else {
+            // A query naming a URR this session does not have. Not an error for the
+            // modification -- the rules it asked to change were applied -- but it is
+            // a CP/UP disagreement about which rules exist, so it is named.
+            log::warn!(
+                "Query URR named URR {urr_id}, which session {} does not have; no report \
+                 for it",
+                sess.id
+            );
+            continue;
+        };
+        let mut trigger = UsageReportTrigger::default();
+        trigger.immediate_report = true;
+        reports.push(usage_report_from(&snapshot, ur_seqn, trigger));
+    }
+    log::info!(
+        "Answered {} queried URR(s) for session {} (qaurr={})",
+        reports.len(),
+        sess.id,
+        req.query_all_urrs
+    );
+    reports
+}
+
 /// Handle Session Deletion Request from SGW-C
 /// Port of sgwu_sxa_handle_session_deletion_request
 pub fn handle_session_deletion_request(sess: Option<&SgwuSess>, _xact_id: u64) -> HandlerResult {
@@ -878,9 +969,18 @@ fn process_remove_urr(sess: &SgwuSess, urr_id: u32) -> Result<(), u8> {
         return Err(pfcp_cause::RULE_CREATION_MODIFICATION_FAILURE);
     };
     if urr.total_bytes > 0 || urr.total_packets > 0 {
+        // Query URR now EXISTS (`process_queried_urrs`), which changes what this
+        // warning means. A CP function that wants the residual can ask for it in the
+        // SAME Session Modification that removes the URR: Table 7.5.4.1-1 permits a
+        // Query URR IE and a Remove URR IE together, and the query runs BEFORE the
+        // removals in this handler, so the report is taken while the rule still
+        // exists. What is still true is that a bare Remove URR reports nothing --
+        // §7.5.4.6 gives the removal no report of its own, so the residual is
+        // discarded unless the CP function asked.
         log::warn!(
-            "Removed URR {urr_id} still held unreported usage: {} bytes / {} packets \
-             (no Query URR support, so no final report is sent — see issue #215)",
+            "Removed URR {urr_id} still held unreported usage: {} bytes / {} packets. \
+             The removal alone sends no report (TS 29.244 §7.5.4.6); to collect it, \
+             carry a Query URR IE for this id in the same Session Modification",
             urr.total_bytes,
             urr.total_packets
         );
@@ -1206,6 +1306,136 @@ mod tests {
 
         let (result, _) = handle_session_modification_request(Some(&sess), 1, &req);
         assert!(matches!(result, HandlerResult::Ok));
+    }
+
+    /// Query URR (TS 29.244 §7.5.4.10): the CP function asks for a URR's ONGOING
+    /// measurement and gets it — with the IMMER trigger, because the report exists
+    /// on CP demand rather than because a condition fired.
+    ///
+    /// `sess_id` is this test's own: `sgwu_self()` is process-global and shared across
+    /// tests, so a shared id lets two tests resolve each other's URRs.
+    #[test]
+    fn a_queried_urr_is_reported_with_immer_and_its_counters_reset() {
+        let sess = SgwuSess {
+            id: 0x4101,
+            sgwu_sxa_seid: 0x4101,
+            sgwc_sxa_f_seid: FSeid::with_ipv4(0x4101, Ipv4Addr::new(10, 0, 0, 1)),
+            ..Default::default()
+        };
+        let ctx = sgwu_self();
+        ctx.urr_install(SgwuUrr {
+            sess_id: sess.id,
+            urr_id: 1,
+            measurement_method: crate::context::measurement_method::VOLUME,
+            // NO reporting trigger set: a query must be answerable even for a URR
+            // whose own conditions would never fire, which is the point of an
+            // on-demand report.
+            ..Default::default()
+        });
+        ctx.urr_record(sess.id, 1, 900, true);
+
+        let req = SessionModificationRequest {
+            query_urrs: vec![1],
+            ..Default::default()
+        };
+        let reports = process_queried_urrs(&sess, &req);
+        assert_eq!(reports.len(), 1, "one query, one report");
+        assert_eq!(reports[0].urr_id, 1);
+        assert_eq!(
+            reports[0].volume.total,
+            Some(900),
+            "the report must carry the measured volume, not zero"
+        );
+        assert!(
+            reports[0].trigger.immediate_report,
+            "IMMER (§8.2.42, octet 5 bit 8): 'an immediate report reported on CP \
+             function demand' -- not PERIO or VOLTH, which would name a condition \
+             that never occurred"
+        );
+
+        // A query TAKES. §5.2.2.3's use case is closing the counts and starting new
+        // ones, so a second query with no traffic between reports ZERO rather than the
+        // same 900 again -- without the reset those bytes would be billed twice.
+        let again = process_queried_urrs(&sess, &req);
+        assert_eq!(again.len(), 1);
+        assert_eq!(
+            again[0].volume.total,
+            Some(0),
+            "the first query reset the period, so the second reports no new volume"
+        );
+    }
+
+    /// QAURR (§8.2.31 bit 3) queries EVERY URR of the session, and NOTE 3 makes it
+    /// exclusive with the Query URR IE — a request carrying both is refused rather
+    /// than resolved, because a query takes the counters and a wrong guess cannot be
+    /// undone.
+    #[test]
+    fn qaurr_queries_every_urr_and_is_refused_alongside_an_explicit_query() {
+        let sess = SgwuSess {
+            id: 0x4102,
+            sgwu_sxa_seid: 0x4102,
+            sgwc_sxa_f_seid: FSeid::with_ipv4(0x4102, Ipv4Addr::new(10, 0, 0, 1)),
+            ..Default::default()
+        };
+        let ctx = sgwu_self();
+        for urr_id in [7u32, 8, 9] {
+            ctx.urr_install(SgwuUrr {
+                sess_id: sess.id,
+                urr_id,
+                measurement_method: crate::context::measurement_method::VOLUME,
+                ..Default::default()
+            });
+            ctx.urr_record(sess.id, urr_id, 100 * u64::from(urr_id), true);
+        }
+
+        // BOTH set: refused -- and the assertion that matters is that NOTHING is
+        // reset, so the CP function can retry with a well-formed request and still
+        // collect its usage.
+        let both = SessionModificationRequest {
+            query_urrs: vec![7],
+            query_all_urrs: true,
+            ..Default::default()
+        };
+        assert!(
+            process_queried_urrs(&sess, &both).is_empty(),
+            "QAURR and Query URR are exclusive (NOTE 3), so neither is honoured"
+        );
+
+        // QAURR alone: every URR of this session.
+        let qaurr = SessionModificationRequest {
+            query_all_urrs: true,
+            ..Default::default()
+        };
+        let reports = process_queried_urrs(&sess, &qaurr);
+        let mut ids: Vec<u32> = reports.iter().map(|r| r.urr_id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![7, 8, 9], "QAURR covers every URR of the session");
+        // URR 7 still carries its full 700, which proves the refused request above
+        // consumed nothing.
+        let seven = reports.iter().find(|r| r.urr_id == 7).expect("urr 7");
+        assert_eq!(
+            seven.volume.total,
+            Some(700),
+            "the refused request must not have consumed URR 7's counters"
+        );
+    }
+
+    /// A query naming a URR the session does not have reports nothing for it and does
+    /// not fail: the rules the modification asked to change were still applied, so
+    /// refusing would be the worse answer. The CP/UP disagreement is logged.
+    #[test]
+    fn a_query_for_an_unknown_urr_reports_nothing_and_does_not_fail() {
+        let sess = SgwuSess {
+            id: 0x4103,
+            sgwu_sxa_seid: 0x4103,
+            sgwc_sxa_f_seid: FSeid::with_ipv4(0x4103, Ipv4Addr::new(10, 0, 0, 1)),
+            ..Default::default()
+        };
+        let req = SessionModificationRequest {
+            query_urrs: vec![99],
+            ..Default::default()
+        };
+        assert!(process_queried_urrs(&sess, &req).is_empty());
     }
 
     #[test]
