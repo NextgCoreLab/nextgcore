@@ -10,7 +10,7 @@ use crate::types::{
     CreatePdr, CreateQer, CreateUrr, CreatedBridgeInfoForTsc, DownlinkDataReport, FSeid, FqCsid,
     GracefulReleasePeriod, LoadControlInformation, NodeId, NodeReportType,
     PfcpAssociationReleaseRequest, PfcpCause, PfcpSessionChangeInfo, PfdPartialFailureInformation,
-    RemoveFar, RemovePdr, RemoveQer, RemoveUrr, ReportType, TscManagementInformation,
+    QueryUrr, RemoveFar, RemovePdr, RemoveQer, RemoveUrr, ReportType, TscManagementInformation,
     UpFunctionFeatures, UpdateFar, UpdatePdr, UpdateQer, UpdateUrr, UsageReportSrr,
     UserPlanePathFailureReport,
 };
@@ -768,6 +768,13 @@ pub struct SessionModificationRequest {
     /// Remove URR(s) (IE type 17). A removal the UP function silently drops keeps
     /// the session measured on a rule the CP function believes is gone.
     pub remove_urrs: Vec<RemoveUrr>,
+    /// Query URR(s) (IE type 77, TS 29.244 §7.5.4.10).
+    ///
+    /// The CP function asking for a URR's ONGOING measurement, outside any
+    /// threshold or period. Unmodelled until now, so a UP function decoded the
+    /// request cleanly with this list empty and answered a query it had not
+    /// noticed -- measured usage the CP function asked for and never received.
+    pub query_urrs: Vec<QueryUrr>,
     pub pfcp_smreq_flags: Option<u8>,
     /// TSC Management Information (IE 199, TS 29.244 §7.5.4.18), #321.
     ///
@@ -801,6 +808,7 @@ impl SessionModificationRequest {
             update_urrs: Vec::new(),
             remove_qers: Vec::new(),
             remove_urrs: Vec::new(),
+            query_urrs: Vec::new(),
             pfcp_smreq_flags: None,
             tsc_management_info: Vec::new(),
         }
@@ -846,6 +854,17 @@ impl SessionModificationRequest {
             let header = IeHeader::new(IeType::RemoveQer as u16, rqer_buf.len() as u16);
             header.encode(buf);
             buf.put_slice(&rqer_buf);
+        }
+
+        // Query URR (IE 77, §7.5.4.10). Encoded as well as decoded so this library
+        // can build the request a CP function sends, not only parse it -- an
+        // asymmetric codec is how one side of a wire format goes untested.
+        for qurr in &self.query_urrs {
+            let mut qurr_buf = BytesMut::new();
+            qurr.encode(&mut qurr_buf);
+            let header = IeHeader::new(IeType::QueryUrr as u16, qurr_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&qurr_buf);
         }
 
         for pdr in &self.create_pdrs {
@@ -1001,6 +1020,10 @@ impl SessionModificationRequest {
                 t if t == IeType::RemoveQer as u16 => {
                     let mut data = ie.data;
                     result.remove_qers.push(RemoveQer::decode(&mut data)?);
+                }
+                t if t == IeType::QueryUrr as u16 => {
+                    let mut data = ie.data;
+                    result.query_urrs.push(QueryUrr::decode(&mut data)?);
                 }
                 t if t == IeType::PfcpSmreqFlags as u16 => {
                     if !ie.data.is_empty() {
@@ -2672,6 +2695,11 @@ mod tests {
 
         msg.remove_qers.push(RemoveQer::new(8));
         msg.remove_urrs.push(RemoveUrr::new(4));
+        // Query URR (IE 77, §7.5.4.10). TWO of them, because §7.5.4.10 is repeatable
+        // and a codec that modelled it as a single value would silently drop the
+        // second -- the shape #321 found for TSC Management Information.
+        msg.query_urrs.push(QueryUrr::new(5));
+        msg.query_urrs.push(QueryUrr::new(6));
 
         let buf = build_message(
             &PfcpMessage::SessionModificationRequest(msg),
@@ -2730,6 +2758,30 @@ mod tests {
         assert_eq!(req.remove_qers[0].qer_id, 8);
         assert_eq!(req.remove_urrs.len(), 1, "Remove URR (IE type 17)");
         assert_eq!(req.remove_urrs[0].urr_id, 4);
+
+        // Query URR (IE type 77): BOTH survive, in order. Unmodelled until #215's
+        // follow-up, so a request carrying them decoded cleanly with the list empty
+        // and the UP function answered a query it never noticed -- measured usage the
+        // CP function asked for and never received.
+        assert_eq!(
+            req.query_urrs.len(),
+            2,
+            "Query URR (IE type 77) is repeatable"
+        );
+        assert_eq!(
+            req.query_urrs.iter().map(|q| q.urr_id).collect::<Vec<_>>(),
+            vec![5, 6],
+            "both queried ids must survive the wire, in order"
+        );
+        // And a Query URR must not be confused for a Remove URR: they are the same
+        // shape (one URR ID) and mean opposite things, so a decoder that matched on
+        // shape rather than IE type would delete what it was asked to report.
+        assert!(
+            !req.remove_urrs
+                .iter()
+                .any(|r| r.urr_id == 5 || r.urr_id == 6),
+            "a queried URR must not decode into the removal list"
+        );
     }
 
     #[test]

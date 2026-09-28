@@ -371,6 +371,14 @@ pub struct UsageReportTrigger {
     /// TEBUR — termination by the UP function, i.e. the final report a session
     /// deletion produces.
     pub termination_report: bool,
+    /// IMMER — *"an immediate report reported on CP function demand"*
+    /// (`29244-k00.txt:31174`), i.e. the answer to a Query URR or the QAURR flag.
+    ///
+    /// Distinct from every other trigger here: the rest say which CONDITION the UP
+    /// function observed, and this one says the CP function asked. A query answered
+    /// with (say) PERIO would tell the SGW-C a measurement period had elapsed when
+    /// none had.
+    pub immediate_report: bool,
 }
 
 /// Usage Reporting Rule installed by the SGW-C (TS 29.244 §5.2.2.1, §7.5.2.4).
@@ -1304,6 +1312,56 @@ impl SgwuContext {
         Some(urr.take_report(trigger, now))
     }
 
+    /// Every URR whose TIME-based trigger has fired, taken in one locked pass.
+    ///
+    /// # Why this exists
+    ///
+    /// `reportable` has always evaluated `PERIODIC` and `TIME_THRESHOLD`
+    /// correctly, and nothing ever asked it to: its only production caller was
+    /// [`Self::urr_record`], which runs from the GTP-U data path. So a URR
+    /// provisioned with a `measurement_period` on a session that went **idle**
+    /// reported nothing, for as long as it stayed idle -- while the CP function
+    /// believed measurement was running. TS 29.244 §5.2.2.2 makes the periodic
+    /// report the UP function's obligation, not the traffic's.
+    ///
+    /// The volume triggers stay OUT of this sweep. A volume threshold can only be
+    /// crossed by a packet, so `urr_record` is where it belongs; evaluating it here
+    /// too would mean two paths racing to report one crossing, which is the
+    /// double-report defect #267 fixed.
+    ///
+    /// # One guard, for the same reason as `urr_record`
+    ///
+    /// The check and the take happen under a single write guard, so this sweep and
+    /// a concurrent data-path packet cannot both take a report from the same
+    /// counters. `take_report` resets the measurement period, so a check that
+    /// dropped the lock before taking would let the second caller take a
+    /// zero-volume report with the next UR-SEQN -- exactly what #267 records.
+    pub fn urr_take_time_triggered(&self, now: u32) -> Vec<(SgwuUrr, u32)> {
+        let Ok(mut urrs) = self.urr_list.write() else {
+            return Vec::new();
+        };
+        let mut taken: Vec<(SgwuUrr, u32)> = Vec::new();
+        for urr in urrs.values_mut() {
+            // Only the time-based reasons. `reportable` returns a bitmask of every
+            // satisfied trigger, so it is filtered rather than re-implemented --
+            // one evaluation of the spec's conditions, not two that can drift.
+            let Some(trigger) = urr.reportable(now) else {
+                continue;
+            };
+            if !trigger.periodic && !trigger.time_threshold {
+                continue;
+            }
+            let mut time_only = UsageReportTrigger::default();
+            time_only.periodic = trigger.periodic;
+            time_only.time_threshold = trigger.time_threshold;
+            taken.push(urr.take_report(time_only, now));
+        }
+        // Sorted so a multi-URR sweep and its assertions do not depend on hash
+        // order, matching `urr_find_for_sess`.
+        taken.sort_by_key(|(u, _)| (u.sess_id, u.urr_id));
+        taken
+    }
+
     /// Take a report for a URR out of band (the deletion path), when there is no
     /// packet and so no race.
     ///
@@ -1539,6 +1597,135 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(idle.reportable(0), None);
+    }
+
+    /// The defect this closes: `reportable` evaluated PERIODIC and TIME_THRESHOLD
+    /// correctly and **nothing asked it to**, because its only production caller was
+    /// the GTP-U data path. So an IDLE session -- no packets at all -- reported
+    /// nothing while the SGW-C believed measurement was running (TS 29.244 §5.2.2.2).
+    ///
+    /// Drives the sweep with ZERO packets recorded, which is the whole point: a test
+    /// that first sent a packet would pass even with the sweep deleted, because
+    /// `urr_record` would have reported.
+    #[test]
+    fn the_sweep_reports_time_triggers_on_a_session_with_no_traffic() {
+        let ctx = SgwuContext::new();
+        // PERIODIC at 30s and a TIME_THRESHOLD at 60s, from t=1000.
+        ctx.urr_install(SgwuUrr {
+            sess_id: 7,
+            urr_id: 1,
+            measurement_method: measurement_method::DURATION,
+            reporting_triggers: reporting_trigger::PERIODIC,
+            measurement_period: Some(30),
+            start_time: 1_000,
+            ..Default::default()
+        });
+        ctx.urr_install(SgwuUrr {
+            sess_id: 7,
+            urr_id: 2,
+            measurement_method: measurement_method::DURATION,
+            reporting_triggers: reporting_trigger::TIME_THRESHOLD,
+            time_threshold: Some(60),
+            start_time: 1_000,
+            ..Default::default()
+        });
+        // A VOLUME-only URR, which must NOT be swept: a volume threshold can only be
+        // crossed by a packet, and reporting it here would race the data path -- the
+        // double-report defect #267 fixed.
+        ctx.urr_install(SgwuUrr {
+            sess_id: 7,
+            urr_id: 3,
+            measurement_method: measurement_method::VOLUME,
+            reporting_triggers: reporting_trigger::VOLUME_THRESHOLD,
+            volume_threshold: Volume {
+                total: Some(1),
+                ..Default::default()
+            },
+            start_time: 1_000,
+            ..Default::default()
+        });
+        // URR 3's volume must be OVER its threshold and UNREPORTED when the sweep
+        // runs, or the exclusion assertion below cannot fail and proves nothing.
+        //
+        // `urr_record` would TAKE the report itself (it checks and takes under one
+        // guard, #267), leaving the delta reset -- so the counter is raised directly
+        // instead. Driving it through the data path is what made the first version of
+        // this test pass with the exclusion DELETED, which a revert round caught.
+        {
+            let mut urrs = ctx.urr_list.write().expect("urr lock");
+            let urr = urrs.get_mut(&(7, 3)).expect("urr 3");
+            urr.total_bytes = 500;
+        }
+        // The premise is asserted rather than assumed: URR 3 is volume-reportable
+        // right now, so anything that filters it out below is doing real work.
+        assert!(
+            ctx.urr_find(7, 3)
+                .expect("urr 3")
+                .reportable(1_010)
+                .is_some_and(|t| t.volume_threshold),
+            "URR 3 must be volume-reportable for the exclusion assertion to mean \
+             anything"
+        );
+
+        // t=1010: neither time trigger is due yet.
+        assert!(
+            ctx.urr_take_time_triggered(1_010).is_empty(),
+            "nothing is due 10s into a 30s period"
+        );
+
+        // t=1035: the 30s period has elapsed, the 60s threshold has not.
+        let due = ctx.urr_take_time_triggered(1_035);
+        assert_eq!(due.len(), 1, "only the periodic URR is due, got {due:?}");
+        assert_eq!(due[0].0.urr_id, 1);
+        assert!(due[0].0.fired_trigger.periodic, "PERIO");
+        assert!(
+            !due[0].0.fired_trigger.volume_threshold,
+            "the sweep must not report a volume trigger"
+        );
+
+        // t=1065: the 60s time threshold is now due too. The periodic URR's period
+        // was RESET by the take above, so it is not due again at 1065 (1065-1035=30
+        // -- exactly at the boundary, so it fires; assert on the SET of ids).
+        let due = ctx.urr_take_time_triggered(1_065);
+        let ids: Vec<u32> = due.iter().map(|(u, _)| u.urr_id).collect();
+        assert!(
+            ids.contains(&2),
+            "the time-threshold URR must fire, got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&3),
+            "URR 3 measures VOLUME and is over its threshold, yet must never be \
+             swept by the timer -- that is the data path's to report (got {ids:?})"
+        );
+    }
+
+    /// The take RESETS the period, so a sweep that ran twice in one period must not
+    /// report twice. Without the reset a 1s tick would report every second.
+    #[test]
+    fn a_swept_report_resets_the_period_so_the_next_tick_is_quiet() {
+        let ctx = SgwuContext::new();
+        ctx.urr_install(SgwuUrr {
+            sess_id: 8,
+            urr_id: 1,
+            measurement_method: measurement_method::DURATION,
+            reporting_triggers: reporting_trigger::PERIODIC,
+            measurement_period: Some(30),
+            start_time: 1_000,
+            ..Default::default()
+        });
+        let first = ctx.urr_take_time_triggered(1_030);
+        assert_eq!(first.len(), 1, "due at exactly one period");
+        // One second later: the period restarted at 1030, so nothing is owed.
+        assert!(
+            ctx.urr_take_time_triggered(1_031).is_empty(),
+            "a second tick inside the same period must report NOTHING, or a 1s \
+             timer would emit a report every second"
+        );
+        // The FIRST report of a URR carries UR-SEQN 0 (`next_ur_seqn` starts at 0 and
+        // post-increments), which is what §8.2.60 wants: the sequence numbers a URR's
+        // reports carry start at zero, so a CP function seeing 0 knows it has the
+        // first report rather than having missed one.
+        assert_eq!(first[0].1, 0, "the first report of a URR carries UR-SEQN 0");
     }
     use super::*;
 

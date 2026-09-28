@@ -61,6 +61,13 @@ pub mod pfcp_ie {
     pub const TIME_OF_FIRST_PACKET: u16 = 69;
     pub const TIME_OF_LAST_PACKET: u16 = 70;
     pub const UR_SEQN: u16 = 104;
+    /// Usage Report within a Session **Modification** Response (TS 29.244 §7.5.5.1).
+    ///
+    /// The carrier for a Query URR's answer. A DIFFERENT IE type from the other two
+    /// even though the contents are identical -- §7.5.5.1, §7.5.5.2 and §7.5.8.3
+    /// each define their own, so sending 79 or 80 in a Modification Response would
+    /// be a report the CP function's decoder does not look for.
+    pub const USAGE_REPORT_SMR: u16 = 78;
     /// Usage Report within a Session Deletion Response (TS 29.244 §7.5.5.2).
     pub const USAGE_REPORT_SDR: u16 = 79;
     /// Usage Report within a Session Report Request (TS 29.244 §7.5.8.3).
@@ -161,6 +168,7 @@ pub fn build_session_establishment_response(
 pub fn build_session_modification_response(
     sess: &SgwuSess,
     created_pdrs: &[CreatedPdr],
+    usage_reports: &[UsageReport],
 ) -> Option<PfcpMessage> {
     let mut msg = PfcpMessage::new(
         pfcp_type::SESSION_MODIFICATION_RESPONSE,
@@ -175,6 +183,14 @@ pub fn build_session_modification_response(
     // Created PDR IEs (for newly created PDRs during modification)
     for created_pdr in created_pdrs {
         build_created_pdr_ie(&mut data, created_pdr);
+    }
+
+    // Usage Report IEs answering a Query URR or the QAURR flag (TS 29.244
+    // §7.5.5.1). IE type 78, not the 79/80 the deletion and report paths use --
+    // each carrier defines its own, so the wrong one is a report the CP function's
+    // decoder never looks for.
+    for usage in usage_reports {
+        build_usage_report_ie(&mut data, usage, pfcp_ie::USAGE_REPORT_SMR);
     }
 
     msg.data = data;
@@ -554,6 +570,14 @@ fn usage_report_trigger_octets(trigger: &UsageReportTrigger) -> [u8; 3] {
         // what the final report at session deletion is.
         flags[2] |= 0x02;
     }
+    if trigger.immediate_report {
+        // IMMER, octet 5 BIT 8 (`29244-k00.txt:31138` bit table, :31174 definition):
+        // "an immediate report reported on CP function demand" -- a Query URR or the
+        // QAURR flag. Bit 8 of octet 5 is 0x80, the high bit of the SAME octet PERIO
+        // and VOLTH occupy; the neighbouring value 0x40 is DROTH, which is the
+        // mis-assignment #267 found for VOLQU in this very function.
+        flags[0] |= 0x80;
+    }
     flags
 }
 
@@ -714,7 +738,7 @@ mod tests {
             ..Default::default()
         };
 
-        let msg = build_session_modification_response(&sess, &[]).unwrap();
+        let msg = build_session_modification_response(&sess, &[], &[]).unwrap();
         assert_eq!(msg.msg_type, pfcp_type::SESSION_MODIFICATION_RESPONSE);
         assert_eq!(msg.seid, 0x2000);
     }
@@ -1118,6 +1142,18 @@ mod tests {
                     ..Default::default()
                 },
                 [0, 0, 0x02],
+            ),
+            (
+                // IMMER, octet 5 BIT 8 = 0x80 (`29244-k00.txt:31138` bit table,
+                // :31174 definition). The neighbouring 0x40 in this same octet is
+                // DROTH -- the exact mis-assignment #267 found for VOLQU here -- so
+                // this case is what stops a query's answer from telling the SGW-C
+                // "dropped downlink traffic threshold reached".
+                UsageReportTrigger {
+                    immediate_report: true,
+                    ..Default::default()
+                },
+                [0x80, 0, 0],
             ),
         ];
         for (trigger, expected) in cases {

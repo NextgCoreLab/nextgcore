@@ -3232,6 +3232,51 @@ impl RemoveUrr {
     }
 }
 
+/// Query URR - grouped IE for Session Modification (TS 29.244 §7.5.4.10).
+///
+/// The CP function asks the UP function to report its **ongoing** measurement for
+/// one URR, without waiting for a threshold or a period to expire — §5.2.2.3 has it
+/// used "when a chargeable event requiring to close the counts and start new counts
+/// occurs". Table 7.5.4.10-1 (`29244-k00.txt:23791-23805`) carries exactly one
+/// mandatory IE, the URR ID.
+///
+/// Structurally identical to [`RemoveUrr`] and kept as its own type rather than an
+/// alias: the two mean opposite things to a UP function, and a single type would let
+/// a query be decoded into a removal. §7.5.4.10's grouped IE is also permitted to
+/// gain members in a later release, which an alias would silently share.
+///
+/// **QAURR is the alternative, not a companion.** NOTE 3
+/// (`29244-k00.txt:22672`) makes the PFCPSMReq-Flags QAURR bit and this IE
+/// *exclusive*: a request either names URRs or asks for all of them.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct QueryUrr {
+    pub urr_id: u32,
+}
+
+impl QueryUrr {
+    pub fn new(urr_id: u32) -> Self {
+        Self { urr_id }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{encode_u32_ie, IeType};
+        encode_u32_ie(buf, IeType::UrrId, self.urr_id);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        use crate::ie::{IeHeader, IeType, RawIe};
+        let mut urr_id = 0u32;
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            if ie.ie_type == IeType::UrrId as u16 && ie.data.len() >= 4 {
+                let mut data = ie.data;
+                urr_id = data.get_u32();
+            }
+        }
+        Ok(Self { urr_id })
+    }
+}
+
 /// Usage Report (Session Report) - grouped IE in Session Report Request
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageReportSrr {

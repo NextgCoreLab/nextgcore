@@ -126,7 +126,13 @@ async fn main() -> Result<()> {
     // detection, a metrics endpoint, and a shutdown that waits to be asked.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let server = tokio::spawn(pfcp.clone().run(shutdown_rx.clone()));
-    let heartbeats = tokio::spawn(pfcp.clone().heartbeat_monitor(shutdown_rx));
+    let heartbeats = tokio::spawn(pfcp.clone().heartbeat_monitor(shutdown_rx.clone()));
+    // The THIRD background task. Until it existed, the reporting a URR owes on a
+    // CLOCK (PERIODIC, TIME_THRESHOLD) was driven by PACKETS: `reportable`
+    // evaluated both correctly and its only production caller was the GTP-U data
+    // path, so an idle session reported nothing for as long as it stayed idle while
+    // the SGW-C believed measurement was running (TS 29.244 §5.2.2.2).
+    let usage_reports = tokio::spawn(pfcp.clone().usage_report_monitor(shutdown_rx));
     match nextgcore_metrics::nes_energy::serve_metrics(
         metrics_addr(),
         std::sync::Arc::new(render_metrics),
@@ -151,6 +157,10 @@ async fn main() -> Result<()> {
     // datagram still being processed.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), heartbeats).await;
+    // Awaited like the other two: a sweep mid-flight holds the URR write guard, and
+    // tearing the context down under it would drop measured usage that has already
+    // been taken from its counters.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), usage_reports).await;
 
     // Cleanup
     gtp_path::gtp_close();
