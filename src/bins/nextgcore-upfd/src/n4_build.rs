@@ -103,6 +103,12 @@ pub mod pfcp_ie {
     pub const REMOVE_FAR: u16 = 16;
     pub const REMOVE_URR: u16 = 17;
     pub const REMOVE_QER: u16 = 18;
+    /// Query URR (TS 29.244 §7.5.4.10): report ONE named URR's ongoing measurement.
+    ///
+    /// The per-URR counterpart of the QAURR flag, which this daemon has honoured
+    /// since #306. NOTE 3 (`29244-k00.txt:22672`) makes the two **exclusive**: a
+    /// request either names URRs or asks for all of them.
+    pub const QUERY_URR: u16 = 77;
     pub const CAUSE: u16 = 19;
     pub const SOURCE_INTERFACE: u16 = 20;
     pub const F_TEID: u16 = 21;

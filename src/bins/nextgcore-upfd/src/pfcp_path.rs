@@ -1577,6 +1577,19 @@ impl PfcpServer {
             .iter()
             .filter_map(|ie| parse_rule_id_u32(&ie.value, pfcp_ie::URR_ID))
             .collect();
+        // Query URR (IE 77, TS 29.244 §7.5.4.10): report these URRs' ongoing
+        // measurement now. The per-URR counterpart of the QAURR flag below, which
+        // this daemon has honoured since #306 while the explicit IE was ignored
+        // outright -- an SMF naming individual URRs got a bare acceptance and no
+        // reports, which is the same defect QAURR had before #306, one level down.
+        //
+        // Parsed with the same helper as the removals so a Query URR whose URR ID
+        // sub-IE is missing or short is counted as malformed below rather than
+        // silently dropped.
+        let queried_urr_ids: Vec<u32> = ParsedIe::find_all_ies(&ies, pfcp_ie::QUERY_URR)
+            .iter()
+            .filter_map(|ie| parse_rule_id_u32(&ie.value, pfcp_ie::URR_ID))
+            .collect();
 
         // A Remove IE whose rule-id sub-IE is missing or short is malformed, and is
         // reported rather than skipped: silently dropping it is the defect #306 is
@@ -1601,6 +1614,11 @@ impl PfcpServer {
                 pfcp_ie::REMOVE_URR,
                 removed_urr_ids.len(),
                 ParsedIe::find_all_ies(&ies, pfcp_ie::REMOVE_URR).len(),
+            ),
+            (
+                pfcp_ie::QUERY_URR,
+                queried_urr_ids.len(),
+                ParsedIe::find_all_ies(&ies, pfcp_ie::QUERY_URR).len(),
             ),
         ] {
             if parsed < total {
@@ -1923,11 +1941,31 @@ impl PfcpServer {
                 UsageReportReason::Termination,
             ));
         }
-        if query_all_urrs {
+        // QAURR and the Query URR IE are EXCLUSIVE -- Table 7.5.4.1-1 NOTE 3
+        // (`29244-k00.txt:22672`). Refused rather than resolved: an immediate report
+        // RESETS the measurement period, so guessing which the SMF meant is
+        // unrecoverable if wrong, whereas refusing lets it retry with a well-formed
+        // request. Neither form is honoured, and no counter is touched.
+        if query_all_urrs && !queried_urr_ids.is_empty() {
+            log::warn!(
+                "Session Modification for SEID {upf_seid:#x} carries BOTH the QAURR flag \
+                 and {} Query URR IE(s), which TS 29.244 Table 7.5.4.1-1 NOTE 3 makes \
+                 exclusive; no usage is reported and no counter is reset",
+                queried_urr_ids.len()
+            );
+        } else if query_all_urrs || !queried_urr_ids.is_empty() {
             let already: std::collections::HashSet<u32> =
                 usage_reports.iter().map(|r| r.urr_id).collect();
+            // `None` means every URR of the session (QAURR); `Some(ids)` means the
+            // ones the Query URR IEs named. One call either way, so the two forms
+            // cannot drift in how they build a report.
+            let only: Option<&[u32]> = if query_all_urrs {
+                None
+            } else {
+                Some(&queried_urr_ids)
+            };
             usage_reports.extend(
-                self.collect_usage_reports(upf_seid, None, UsageReportReason::Immediate)
+                self.collect_usage_reports(upf_seid, only, UsageReportReason::Immediate)
                     .into_iter()
                     // A URR removed by this same message has already reported with
                     // TERMR; reporting it twice would double-count it.
@@ -3420,6 +3458,114 @@ mod tests {
             usage_reports_in(&resp),
             vec![(1, 777)],
             "QAURR must produce a Usage Report per URR"
+        );
+    }
+
+    /// Query URR (IE 77, TS 29.244 §7.5.4.10): report the URRs the SMF NAMED, and
+    /// only those.
+    ///
+    /// QAURR has been honoured since #306 while this IE was ignored outright, so an
+    /// SMF naming individual URRs got a bare acceptance and no reports. A second URR
+    /// is installed so the filter has something to exclude -- with one URR in the
+    /// session, "report the named one" and "report all" are indistinguishable and the
+    /// test would pass against the QAURR path alone.
+    #[tokio::test]
+    async fn a_query_urr_ie_reports_only_the_named_urrs() {
+        let (_server, smf, addr, mut rx, dp, upf_seid) = established_session().await;
+
+        // URR 2 alongside the fixture's URR 1.
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(
+            pfcp_ie::CREATE_URR,
+            &urr_body(2, Some(1_000_000), None, None),
+        );
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+
+        // Distinct volumes, so a report cannot be attributed to the wrong URR.
+        {
+            let session = dp.sessions.find_by_seid(upf_seid).unwrap();
+            let urrs = session.urrs.read().unwrap();
+            urrs.get(&1).unwrap().record(111, true);
+            urrs.get(&2).unwrap().record(222, true);
+        }
+
+        // Query URR 2 only.
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::QUERY_URR, &remove_body_u32(pfcp_ie::URR_ID, 2));
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(
+            usage_reports_in(&resp),
+            vec![(2, 222)],
+            "a Query URR naming URR 2 must report URR 2 and NOT URR 1 -- the whole \
+             point of the per-URR form over QAURR"
+        );
+
+        // THE COUNTERS SURVIVE, and that is upfd's model rather than an oversight.
+        //
+        // THIS DAEMON DIVERGES FROM sgwud DELIBERATELY, and the divergence is
+        // spec-visible, so it is recorded here rather than left for someone to
+        // "align". sgwud's `process_queried_urrs` TAKES the report -- it resets the
+        // measurement period, reading §5.2.2.3's "close the counts and start new
+        // counts" literally -- because sgwud has no harvest and a peek would let the
+        // same bytes be reported again and double-billed.
+        //
+        // upfd is the opposite, because it HAS a harvest: `collect_urr_reports` runs
+        // every 10s and calls `reset_counters` (data_plane.rs:3280), so the harvest
+        // owns the reset. #306 pinned that with its own test -- "an event-driven
+        // report must NOT reset the counters, or the volume it carries disappears
+        // from the next report". Resetting on a query here would destroy volume the
+        // harvest had not yet reported.
+        //
+        // So a second QAURR still carries BOTH URRs' full measurement.
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_u8(pfcp_ie::PFCPSMREQ_FLAGS, pfcpsmreq_flags::QAURR);
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        let mut reports = usage_reports_in(&resp);
+        reports.sort_unstable();
+        assert_eq!(
+            reports,
+            vec![(1, 111), (2, 222)],
+            "both URRs keep their volume: in THIS daemon the 10s harvest owns the \
+             reset (#306), unlike sgwud where a query takes it"
+        );
+    }
+
+    /// NOTE 3 (`29244-k00.txt:22672`) makes QAURR and the Query URR IE **exclusive**.
+    /// Refused rather than resolved, because an immediate report RESETS the
+    /// measurement period and a wrong guess cannot be undone.
+    #[tokio::test]
+    async fn qaurr_and_an_explicit_query_urr_together_are_refused() {
+        let (_server, smf, addr, _rx, dp, upf_seid) = established_session().await;
+        {
+            let session = dp.sessions.find_by_seid(upf_seid).unwrap();
+            let urrs = session.urrs.read().unwrap();
+            urrs.get(&1).unwrap().record(444, true);
+        }
+
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_u8(pfcp_ie::PFCPSMREQ_FLAGS, pfcpsmreq_flags::QAURR);
+        b.add_tlv(pfcp_ie::QUERY_URR, &remove_body_u32(pfcp_ie::URR_ID, 1));
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        // The MODIFICATION still succeeds: the rules it asked to change were applied,
+        // and only the ambiguous query is declined.
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert!(
+            usage_reports_in(&resp).is_empty(),
+            "neither query form is honoured when both are present"
+        );
+
+        // And NOTHING was reset, so a retry still collects the usage. This is the
+        // assertion that makes the refusal safe rather than merely strict.
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_u8(pfcp_ie::PFCPSMREQ_FLAGS, pfcpsmreq_flags::QAURR);
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        assert_eq!(
+            usage_reports_in(&resp),
+            vec![(1, 444)],
+            "the refused request must not have consumed URR 1's counters"
         );
     }
 
