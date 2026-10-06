@@ -874,9 +874,17 @@ mod data_management_tests {
     /// Remove every subscription, so a test's assertions are about its own
     /// subscriptions and not whatever a sibling left behind. The context is
     /// process-global, and `GLOBAL` locks serialise but do not isolate.
+    ///
+    /// Releases each consumer's producer-subscription claim as well, as
+    /// `handle_dm_unsubscribe` does: removing only the consumer record left the
+    /// producer subscription behind, so whichever test took the lock next
+    /// inherited it (`coordination_off_creates_no_producer_subscription` failed
+    /// with a count of 1 when it ran after the coordination test). No remote
+    /// DELETE is sent, since the loopback producer is already stopped by then.
     fn clear_subscriptions() {
         for id in context::dccf_context_subscription_ids() {
             dccf_context_remove_subscription(&id);
+            dccf_context_release_producer_sub(&id);
         }
     }
 
@@ -1390,6 +1398,12 @@ mod data_management_tests {
             nrf.stop().await.expect("stop");
         });
         clear_subscriptions();
+        assert_eq!(
+            dccf_context_producer_sub_count(),
+            0,
+            "clearing must release the producer subscription too, or the next \
+             test inherits it"
+        );
     }
 
     /// #112: with coordination OFF (the default) no producer signalling happens
