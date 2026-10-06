@@ -119,6 +119,15 @@ pub struct SctpEventSubscribe {
 }
 
 /// SCTP send/receive info
+///
+/// `sinfo_assoc_id` is `sctp_assoc_t`, which `<linux/sctp.h>` typedefs as
+/// `__s32` — SIGNED. It was `u32` here until 2026-09-29. The struct size and
+/// every other field's offset are unaffected (it is the trailing member), and
+/// `recv_msg` below reads only `sinfo_ppid`/`sinfo_stream`, so nothing
+/// misbehaved; but a negative association id read through the unsigned type
+/// would have appeared as a huge positive number, and `-1` is exactly what
+/// lksctp reports for a one-to-one socket with no association. nextgsim's
+/// independent transcription of the same kernel struct had it right.
 #[repr(C)]
 #[derive(Debug, Clone, Default)]
 pub struct SctpSndRcvInfo {
@@ -130,7 +139,7 @@ pub struct SctpSndRcvInfo {
     pub sinfo_timetolive: u32,
     pub sinfo_tsn: u32,
     pub sinfo_cumtsn: u32,
-    pub sinfo_assoc_id: u32,
+    pub sinfo_assoc_id: libc::c_int,
 }
 
 /// SCTP RTO info
@@ -597,6 +606,49 @@ mod tests {
     #[test]
     fn test_sctp_initmsg_size() {
         assert_eq!(mem::size_of::<SctpInitmsg>(), 8);
+    }
+
+    /// `SctpSndRcvInfo` is hand-transcribed from `<linux/sctp.h>` and handed to
+    /// `sctp_recvmsg` as a raw pointer, so a field-type mismatch is undetectable
+    /// at compile time and silent at runtime. Pin it against `libc`'s own
+    /// `sctp_sndrcvinfo` rather than against literals: a size-only assertion
+    /// passes with `sinfo_assoc_id` declared `u32` instead of the signed
+    /// `sctp_assoc_t` (`__s32`), which is the defect this test was added for.
+    #[test]
+    fn sndrcvinfo_matches_libc_abi() {
+        assert_eq!(
+            mem::size_of::<SctpSndRcvInfo>(),
+            mem::size_of::<libc::sctp_sndrcvinfo>(),
+            "SctpSndRcvInfo size diverged from the kernel ABI"
+        );
+        assert_eq!(
+            mem::align_of::<SctpSndRcvInfo>(),
+            mem::align_of::<libc::sctp_sndrcvinfo>(),
+            "SctpSndRcvInfo alignment diverged from the kernel ABI"
+        );
+
+        // Assign libc's value THROUGH our field: this fails to compile if the
+        // types differ, which is what a size assertion cannot catch.
+        let reference = libc::sctp_sndrcvinfo {
+            sinfo_stream: 1,
+            sinfo_ssn: 2,
+            sinfo_flags: 3,
+            sinfo_ppid: 4,
+            sinfo_context: 5,
+            sinfo_timetolive: 6,
+            sinfo_tsn: 7,
+            sinfo_cumtsn: 8,
+            sinfo_assoc_id: -1,
+        };
+        let ours = SctpSndRcvInfo {
+            sinfo_assoc_id: reference.sinfo_assoc_id,
+            ..Default::default()
+        };
+        assert_eq!(
+            ours.sinfo_assoc_id, -1,
+            "sinfo_assoc_id must round-trip a negative association id: lksctp \
+             reports -1 for a one-to-one socket with no association"
+        );
     }
 
     #[test]
