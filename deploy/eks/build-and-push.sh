@@ -87,7 +87,7 @@ fi
 
 REGISTRY="${REGISTRY:-${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com}"
 log "registry: ${REGISTRY}"
-log "prefix:   ${REPO_PREFIX}    tag: ${IMAGE_TAG}"
+log "prefix:   ${REPO_PREFIX}    core tag: ${CORE_TAG}    gnb/ue tag: ${SIM_TAG}"
 
 # Fail early and loudly if the binaries are missing, rather than producing
 # images that crash on start. They are build artifacts and no longer tracked in
