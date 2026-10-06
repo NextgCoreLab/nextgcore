@@ -45,6 +45,14 @@ spec:
           volumeMounts:
             {{- include "nextgcore.configMounts" (dict "nf" "pcf" "rewritten" true) | nindent 12 }}
           env:
+            - name: NEXTGCORE_SBI_PROFILE
+              # Issue #63: every NF's outbound SBI calls -- including its own NRF
+              # registration and discovery -- follow the SBI profile, which
+              # defaults to PRODUCTION (mTLS). Without this the NF starts but
+              # cannot load its client certificate, never registers, and is
+              # undiscoverable. The chart mounts none by default, so it opts out
+              # explicitly. Set global.sbiProfile=production once certs exist.
+              value: {{ .Values.global.sbiProfile | default "dev" | quote }}
             - name: RUST_LOG
               value: {{ .Values.global.logLevel }}
       volumes:
