@@ -292,7 +292,12 @@ assert_log_contains "amf" "PDU Session Resource Setup Request sent" \
 assert_log_contains "amf" "PDU Session Resource Setup Response" \
     "AMF received PDU Session Resource Setup Response"
 
-assert_log_contains "amf" "Extracted gNB TEID" \
+# The AMF logs this as "Setup Response PSI=<n>: gNB TEID=0x<8 hex>, addr=..,
+# QFIs=.." since PR #222 (2026-09-07) reordered the fields; before that it read
+# "Extracted gNB TEID=0x..". Match the VALUE, not the sentence, so a further
+# rewording cannot make a working TEID relay look broken -- which is what the
+# stale "Extracted gNB TEID" string did until 2026-10-06.
+assert_log_contains "amf" "gNB TEID=0x[0-9a-f]{8}" \
     "AMF extracted gNB TEID from Setup Response"
 
 assert_log_contains "amf" "Calling SMF SM Context Update" \
