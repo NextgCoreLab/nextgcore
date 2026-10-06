@@ -672,6 +672,8 @@ async fn register_upf_with_nrf(
     match response.status {
         200 | 201 => {
             log::info!("UPF registered with NRF successfully (id={nf_instance_id})");
+            // #434: what a 404 heartbeat re-registers if the NRF loses us.
+            nextgcore_sbi::heartbeat::set_registered_profile(&nf_profile);
             Ok(())
         }
         s => Err(format!("NRF registration returned status {s}")),

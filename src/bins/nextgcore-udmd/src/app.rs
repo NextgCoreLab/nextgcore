@@ -3646,6 +3646,8 @@ pub(crate) async fn register_with_nrf_id(
     match response.status {
         200 | 201 => {
             log::info!("UDM registered with NRF successfully (id={nf_instance_id})");
+            // #434: what a 404 heartbeat re-registers if the NRF loses us.
+            nextgcore_sbi::heartbeat::set_registered_profile(&nf_profile);
             Ok(nf_instance_id.to_string())
         }
         _ => Err(format!(

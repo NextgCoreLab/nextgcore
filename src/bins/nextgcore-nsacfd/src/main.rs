@@ -2429,6 +2429,8 @@ async fn register_with_nrf(
     match response.status {
         200 | 201 => {
             log::info!("NSACF registered with NRF successfully (id={nf_instance_id})");
+            // #434: what a 404 heartbeat re-registers if the NRF loses us.
+            nextgcore_sbi::heartbeat::set_registered_profile(&nf_profile);
 
             let mut self_instance = nextgcore_sbi::context::NfInstance::new(
                 nf_instance_id,

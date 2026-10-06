@@ -532,6 +532,114 @@ pub fn clear_registered_nf_instance_id() {
     }
 }
 
+// ─── Re-registration after the NRF forgets us (#434) ────────────────────────
+//
+// A heartbeat that gets 404 means the NRF no longer holds this NF's profile —
+// an NRF restart, or a registration that landed on an NRF pod a rollout then
+// killed. TS 29.510 §5.2.2.3.2 step 2b defines only the 404 itself; it does not
+// say what the NF does next (§5.2.2.1's "needs not re-register" concerns an NRF
+// Set with SHARED context, which a single in-memory NRF is not). Re-registering
+// is this implementation's choice, made because nothing else restores
+// discoverability: before #434 the NF stayed Ready and undiscoverable until
+// someone restarted it.
+//
+// Each of the 17 registering daemons builds its own profile in its own
+// `register_with_nrf`, so the worker cannot rebuild one. Each daemon instead
+// records the exact profile it PUT, here, and the worker re-PUTs that.
+
+static REGISTERED_PROFILE: std::sync::Mutex<Option<serde_json::Value>> =
+    std::sync::Mutex::new(None);
+
+/// Serialises tests that mutate this process's NRF-registration state: the
+/// pause flag, the registered instance ID and the registered profile.
+///
+/// **A test harness hook, not a product knob**; no NF takes it. `pub` and NOT
+/// `cfg(test)`-gated because the tests that need it live in `nrfd`, where this
+/// crate is a dependency and `cfg(test)` is false. Declared here, beside the
+/// globals it guards, so there is exactly one lock for them; a second lock in a
+/// test module would serialise nothing against the first.
+static REGISTRATION_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`REGISTRATION_STATE_TEST_LOCK`], recovering a poisoned guard so one
+/// failing test does not cascade into every other holder.
+pub fn lock_registration_state_for_test() -> std::sync::MutexGuard<'static, ()> {
+    REGISTRATION_STATE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Record the NFProfile this process just registered, so a heartbeat that finds
+/// the NRF has forgotten it can register the same profile again (#434).
+///
+/// Call it in the registration PUT's success arm with the value that was sent.
+/// Every daemon that spawns the heartbeat worker must call it; a source guard
+/// in this module's tests enforces that, because a daemon that forgot would
+/// silently keep the pre-#434 behaviour.
+pub fn set_registered_profile(profile: &impl serde::Serialize) {
+    let value = match serde_json::to_value(profile) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("could not record registered NF profile: {e}");
+            return;
+        }
+    };
+    match REGISTERED_PROFILE.lock() {
+        Ok(mut slot) => *slot = Some(value),
+        // Same posture as the instance-ID slot: bookkeeping must not take the
+        // process down; the cost is that re-registration is unavailable.
+        Err(e) => log::warn!("could not record registered NF profile: {e}"),
+    }
+}
+
+/// The NFProfile this process last registered, if it recorded one.
+pub fn registered_profile() -> Option<serde_json::Value> {
+    REGISTERED_PROFILE.lock().ok().and_then(|slot| slot.clone())
+}
+
+/// Forget the recorded profile.
+///
+/// **Only for use in tests.** NOT gated behind `cfg(test)`, for the reason
+/// [`clear_registered_nf_instance_id`] gives: `nrfd`'s test needs it, and
+/// `cfg(test)` is false in the dependency build.
+pub fn clear_registered_profile() {
+    if let Ok(mut slot) = REGISTERED_PROFILE.lock() {
+        *slot = None;
+    }
+}
+
+/// Re-register this process's recorded profile under `nf_instance_id`
+/// (`PUT /nnrf-nfm/v1/nf-instances/{id}`, NFRegister, TS 29.510 §5.2.2.2.1).
+///
+/// Refuses a recorded profile whose `nfInstanceId` names a different instance:
+/// the NES resume path re-registers under a new ID, and PUTting a stale profile
+/// would resurrect an instance this process no longer is. Returns the NRF's
+/// status on 200/201.
+pub async fn reregister_self(nf_instance_id: &str) -> Result<u16, String> {
+    let profile =
+        registered_profile().ok_or_else(|| "no registered profile recorded".to_string())?;
+    if let Some(recorded) = profile.get("nfInstanceId").and_then(|v| v.as_str()) {
+        if recorded != nf_instance_id {
+            return Err(format!(
+                "recorded profile is for {recorded}, not {nf_instance_id}; refusing to re-register it"
+            ));
+        }
+    }
+    let ctx = crate::context::global_context();
+    let nrf_uri = ctx
+        .get_nrf_uri()
+        .await
+        .ok_or_else(|| "no NRF URI configured".to_string())?;
+    let (nrf_host, nrf_port) =
+        parse_nrf_host_port(&nrf_uri).ok_or_else(|| format!("invalid NRF URI '{nrf_uri}'"))?;
+    let client = SbiClient::with_host_port(&nrf_host, nrf_port);
+    let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
+    match client.put_json(&path, &profile).await {
+        Ok(resp) if resp.status == 200 || resp.status == 201 => Ok(resp.status),
+        Ok(resp) => Err(format!("NRF returned status {}", resp.status)),
+        Err(e) => Err(format!("NFRegister failed: {e}")),
+    }
+}
+
 /// `DELETE /nnrf-nfm/v1/nf-instances/{nfInstanceId}` — NFDeregister,
 /// TS 29.510 §5.2.2.2.3.
 ///
@@ -725,6 +833,9 @@ where
 
         let interval = tokio::time::Duration::from_secs(interval_secs);
         let mut ticker = tokio::time::interval(interval);
+        // #434: a daemon that never recorded its profile cannot re-register. Say
+        // so once, rather than on every 404 tick.
+        let mut warned_no_profile = false;
         // First tick fires immediately — we want to send the first heartbeat
         // right away to refresh NRF state before the suspension timer
         // (typically 10s) elapses. Subsequent ticks fire every interval.
@@ -789,6 +900,39 @@ where
                         load
                     );
                 }
+                // #434: the NRF no longer holds this profile. Re-register it, or
+                // this NF stays Ready and undiscoverable until restarted.
+                Ok(resp) if resp.status == 404 => {
+                    // Re-checked AFTER the response: an NES deregistration can
+                    // pause the worker while this PATCH is in flight, and its 404
+                    // is then the deregistration working, not a lost profile.
+                    if heartbeat_paused() {
+                        continue;
+                    }
+                    if registered_profile().is_none() {
+                        if !warned_no_profile {
+                            log::warn!(
+                                "Heartbeat got 404 for {nf_instance_id}: the NRF no longer \
+                                 holds this NF, and no registered profile was recorded, so it \
+                                 cannot re-register and will stay undiscoverable"
+                            );
+                            warned_no_profile = true;
+                        }
+                        continue;
+                    }
+                    match reregister_self(&nf_instance_id).await {
+                        Ok(status) => log::info!(
+                            "Heartbeat got 404 for {nf_instance_id}: the NRF had lost this NF; \
+                             re-registered (status={status})"
+                        ),
+                        Err(e) => log::warn!(
+                            "Heartbeat got 404 for {nf_instance_id}; re-registration failed, \
+                             retrying next tick: {e}"
+                        ),
+                    }
+                }
+                // Any other status (a 5xx is an NRF fault, not a lost
+                // registration) keeps the pre-#434 behaviour.
                 Ok(resp) => {
                     log::warn!(
                         "Heartbeat got unexpected status {} for {}",
@@ -1059,6 +1203,79 @@ mod tests {
         set_self_nf_status(crate::context::NfStatus::Registered);
         set_heartbeat_paused(false);
         assert_eq!(build_load_patch(0)[0]["value"], "REGISTERED");
+    }
+
+    /// #434: every daemon that spawns the heartbeat worker also records the
+    /// profile it registered, or a 404 heartbeat cannot re-register it.
+    ///
+    /// A source guard because the failure is otherwise silent: an unwired daemon
+    /// compiles, passes its tests, and only shows its gap after an NRF restart in a
+    /// deployment, logging one warning. Scans `bins/` like
+    /// `each_daemon_registers_with_the_nrf_exactly_once` in `security.rs`, and
+    /// walks subdirectories, since a daemon may register from a nested module.
+    #[test]
+    fn every_heartbeating_daemon_records_its_registered_profile() {
+        fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    rust_sources(&p, out);
+                } else if p.extension().is_some_and(|e| e == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        // A code line, not a comment mentioning the name.
+        fn calls(text: &str, needle: &str) -> bool {
+            text.lines()
+                .any(|l| l.contains(needle) && !l.trim_start().starts_with("//"))
+        }
+
+        let bins = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("crate is at <root>/libs/nextgcore-sbi")
+            .join("bins");
+        assert!(bins.is_dir(), "expected {} to exist", bins.display());
+
+        let mut heartbeating = Vec::new();
+        let mut unwired = Vec::new();
+        for entry in std::fs::read_dir(&bins).expect("read bins/").flatten() {
+            let crate_dir = entry.path();
+            let name = crate_dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let mut files = Vec::new();
+            rust_sources(&crate_dir.join("src"), &mut files);
+            let text: String = files
+                .iter()
+                .map(|f| std::fs::read_to_string(f).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if calls(&text, "spawn_heartbeat_worker") {
+                heartbeating.push(name.clone());
+                if !calls(&text, "set_registered_profile(") {
+                    unwired.push(name);
+                }
+            }
+        }
+        heartbeating.sort();
+        unwired.sort();
+
+        // Positive premise: the scan really found the daemons. A path change that
+        // made it find nothing would otherwise pass vacuously.
+        assert!(
+            heartbeating.len() >= 17,
+            "expected the 17 heartbeating daemons, found {}: {heartbeating:?}",
+            heartbeating.len()
+        );
+        assert!(
+            unwired.is_empty(),
+            "these daemons spawn the heartbeat worker but never call \
+             set_registered_profile, so a 404 heartbeat cannot re-register them (#434): \
+             {unwired:?}"
+        );
     }
 
     #[test]

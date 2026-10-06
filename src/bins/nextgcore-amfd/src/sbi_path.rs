@@ -544,6 +544,8 @@ pub async fn amf_nrf_register(sbi_addr: &str, sbi_port: u16) -> Result<String, S
     match response.status {
         200 | 201 => {
             log::info!("AMF registered with NRF (id={nf_instance_id})");
+            // #434: what a 404 heartbeat re-registers if the NRF loses us.
+            nextgcore_sbi::heartbeat::set_registered_profile(&nf_profile);
 
             // Refresh the self instance from the SAME table the profile came
             // from: it used to be rebuilt here with `namf-comm` only, which

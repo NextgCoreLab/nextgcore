@@ -208,6 +208,8 @@ async fn register_with_nrf(nrf_uri: &str, nf_instance: &NfInstance) -> Result<()
                     nf_instance.id,
                     status
                 );
+                // #434: what a 404 heartbeat re-registers if the NRF loses us.
+                nextgcore_sbi::heartbeat::set_registered_profile(&body);
                 Ok(())
             } else {
                 let msg = format!(

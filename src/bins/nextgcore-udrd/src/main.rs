@@ -4063,6 +4063,8 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
     match response.status {
         200 | 201 => {
             log::info!("UDR registered with NRF successfully (id={nf_instance_id})");
+            // #434: what a 404 heartbeat re-registers if the NRF loses us.
+            nextgcore_sbi::heartbeat::set_registered_profile(&nf_profile);
             Ok(nf_instance_id)
         }
         _ => Err(format!(

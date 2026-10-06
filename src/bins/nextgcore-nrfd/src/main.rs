@@ -4602,11 +4602,14 @@ mod tests {
     /// method, the right URI, and the instance ID it recorded at registration
     /// rather than one passed in. So this drives the client, not the request.
     ///
-    /// `nrfd` touches neither the global SBI context nor the heartbeat statics
-    /// anywhere else, so no guard is needed; the test still restores both.
+    /// Takes `lock_registration_state_for_test`: the #434 re-registration test
+    /// below mutates the same heartbeat statics (pause flag, registered ID), so
+    /// the two must not interleave. The test restores what it mutates.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // a std guard held to serialise globals, by design
     async fn test_shared_deregister_self_removes_the_profile_from_the_real_nrf() {
         use serde_json::json;
+        let _registration_guard = nextgcore_sbi::heartbeat::lock_registration_state_for_test();
 
         let (addr_listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let server = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), addr_listener);
@@ -4700,6 +4703,116 @@ mod tests {
         client.close().await;
         server.stop().await.expect("server stops");
         outcome.expect("deregister test timed out");
+    }
+
+    /// #434: when this NRF loses an NF's profile, the NF's own heartbeat worker
+    /// gets 404 and re-registers it, rather than warning forever while the NF
+    /// stays undiscoverable.
+    ///
+    /// Drives the REAL worker against the REAL handler. The loss is a DELETE
+    /// through the handler, the same state an NRF restart leaves. The assertion
+    /// is on `nf_manager()`, the registry discovery reads, not on a recorded
+    /// request. Also pins the NES carve-out: a paused worker must leave a
+    /// deleted profile deleted, because NES deregisters on purpose.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // a std guard held to serialise globals, by design
+    async fn test_a_404_heartbeat_re_registers_the_lost_profile_with_the_real_nrf() {
+        use nextgcore_sbi::heartbeat as hb;
+        use serde_json::json;
+        let _registration_guard = hb::lock_registration_state_for_test();
+
+        let (addr_listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = SbiServer::on_listener(NextgcoreSbiServerConfig::new(addr), addr_listener);
+        server
+            .start(nrf_sbi_request_handler)
+            .await
+            .expect("SBI server starts");
+
+        let client = nextgcore_sbi::client::SbiClient::with_host_port("127.0.0.1", addr.port());
+        // Distinct ID AND NF type from every other test: nf_manager() is
+        // process-global and the tests run in parallel. An AUSF here once made
+        // the lifecycle test's "no AUSF is registered" discovery see this profile.
+        // No other nrfd test registers or discovers an LMF.
+        let nf_id = "5e9b1c0a-0434-4f6a-8888-0123456789ab";
+        let path = format!("/nnrf-nfm/v1/nf-instances/{nf_id}");
+
+        let body = async {
+            let profile = json!({
+                "nfInstanceId": nf_id,
+                "nfType": "LMF",
+                "nfStatus": "REGISTERED",
+                "heartBeatTimer": 10,
+                "ipv4Addresses": ["10.4.3.4"],
+                "nfServices": [{
+                    "serviceInstanceId": "svc-0",
+                    "serviceName": "nlmf-loc",
+                    "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+                    "scheme": "http",
+                    "ipEndPoints": [{"ipv4Address": "10.4.3.4", "port": 7777}]
+                }]
+            });
+
+            // What a daemon's startup does: register, record the profile in the
+            // success arm, point the global context at the NRF, spawn the worker.
+            let resp = client
+                .put_json(&path, &profile)
+                .await
+                .expect("PUT register");
+            assert_eq!(resp.status, 201);
+            hb::set_registered_profile(&profile);
+            nextgcore_sbi::context::global_context()
+                .set_nrf_uri(format!("http://127.0.0.1:{}", addr.port()))
+                .await;
+            hb::set_heartbeat_paused(false);
+            hb::spawn_heartbeat_worker_with_load(nf_id.to_string(), 1, || 0);
+
+            // The NRF loses the profile.
+            let resp = client.delete(&path).await.expect("DELETE");
+            assert_eq!(resp.status, 204);
+            assert!(
+                nf_manager().get(nf_id).is_none(),
+                "premise: the profile is gone"
+            );
+
+            // The worker's next tick gets 404 and must put it back.
+            let restored = nextgcore_sbi::test_support::poll_until(
+                Duration::from_secs(15),
+                Duration::from_millis(50),
+                || async { nf_manager().get(nf_id).map(|_| ()) },
+            )
+            .await;
+            assert_eq!(
+                restored,
+                Some(()),
+                "a 404 heartbeat must re-register the recorded profile (#434)"
+            );
+            let resp = client.get(&path).await.expect("GET after re-register");
+            assert_eq!(resp.status, 200, "and it must be readable through the API");
+
+            // NES carve-out: paused means deregistered on purpose. A deleted
+            // profile must STAY deleted across several ticks.
+            hb::set_heartbeat_paused(true);
+            let resp = client.delete(&path).await.expect("DELETE while paused");
+            assert_eq!(resp.status, 204);
+            tokio::time::sleep(Duration::from_millis(3500)).await;
+            assert!(
+                nf_manager().get(nf_id).is_none(),
+                "a paused (NES-deregistered) worker must not re-register"
+            );
+        };
+
+        let outcome = tokio::time::timeout(Duration::from_secs(45), body).await;
+
+        // Restore the process-globals this test mutated. Paused stays true until
+        // the profile is cleared, so a tick racing this teardown cannot
+        // re-register.
+        hb::clear_registered_profile();
+        hb::clear_registered_nf_instance_id();
+        hb::set_heartbeat_paused(false);
+        let _ = nf_manager().remove_instance(nf_id);
+        client.close().await;
+        server.stop().await.expect("server stops");
+        outcome.expect("re-registration test timed out");
     }
 
     // -----------------------------------------------------------------
