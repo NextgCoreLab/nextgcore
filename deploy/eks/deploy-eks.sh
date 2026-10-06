@@ -384,12 +384,15 @@ for d in docs:
             caps = sc.get('capabilities', {})
             if 'ALL' in caps.get('drop', []) and caps.get('add'):
                 errors.append(f'{where}/{c["name"]}: drops ALL but adds {caps["add"]}')
-        # Issue #63: these NFs default to the PRODUCTION SBI profile and exit at
-        # startup without /etc/nextgcore/tls/server.crt. The dev opt-out only
-        # works on the NF's OWN container -- it once sat on the busybox
-        # rewrite-advertise-addr init container in ausf/smf/udm, where it did
-        # nothing, and the rollout hung on a CrashLoopBackOff.
-        if kind == 'Deployment' and name in ('amf', 'ausf', 'smf', 'udm'):
+        # Issue #63: every SBI NF defaults to the PRODUCTION SBI profile. amf,
+        # ausf, smf and udm then exit at startup without
+        # /etc/nextgcore/tls/server.crt; udr, pcf, nssf and bsf start but cannot
+        # load client.crt for their own NRF registration, so they are silently
+        # undiscoverable. The dev opt-out only works on the NF's OWN container
+        # -- it once sat on the busybox rewrite-advertise-addr init container in
+        # ausf/smf/udm, and was missing outright from the other four.
+        if kind == 'Deployment' and name in ('amf', 'ausf', 'smf', 'udm',
+                                             'udr', 'pcf', 'nssf', 'bsf'):
             nf = next((c for c in pod.get('containers', []) if c['name'] == name), None)
             has_profile = nf is not None and any(
                 e['name'] == 'NEXTGCORE_SBI_PROFILE' for e in nf.get('env', []))

@@ -86,6 +86,14 @@ spec:
             - containerPort: 7777
               name: sbi
           env:
+            - name: NEXTGCORE_SBI_PROFILE
+              # Issue #63: every NF's outbound SBI calls -- including its own NRF
+              # registration and discovery -- follow the SBI profile, which
+              # defaults to PRODUCTION (mTLS). Without this the NF starts but
+              # cannot load /etc/nextgcore/tls/client.crt, never registers, and
+              # is undiscoverable. These base manifests mount no certificates, so
+              # they opt out explicitly. Remove this once certs are mounted.
+              value: "dev"
             - name: RUST_LOG
               value: info
             - name: RUST_BACKTRACE
