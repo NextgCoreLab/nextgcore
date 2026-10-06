@@ -1944,6 +1944,24 @@ mod tests {
         cc_request_type: u32,
         cc_request_number: u32,
     ) -> DiameterMessage {
+        build_test_ccr_with_ip(
+            session_id,
+            cc_request_type,
+            cc_request_number,
+            std::net::Ipv4Addr::new(10, 45, 0, 2),
+        )
+    }
+
+    /// [`build_test_ccr`] with a caller-chosen Framed-IP-Address. The IP ->
+    /// session map is process-global and every other test CCR carries
+    /// 10.45.0.2, so a test that asserts WHO owns an address must use one no
+    /// sibling sends, or a concurrent test's CCR overwrites the mapping.
+    fn build_test_ccr_with_ip(
+        session_id: &str,
+        cc_request_type: u32,
+        cc_request_number: u32,
+        framed_ip: std::net::Ipv4Addr,
+    ) -> DiameterMessage {
         let mut ccr = nextgcore_diameter::gx::create_ccr(
             session_id,
             "pgw.epc.mnc001.mcc001.3gppnetwork.org",
@@ -1967,10 +1985,7 @@ mod tests {
         );
         ccr.add_avp(sub_id);
         nextgcore_diameter::gx::add_called_station_id(&mut ccr, "internet");
-        nextgcore_diameter::gx::add_framed_ip_address(
-            &mut ccr,
-            std::net::Ipv4Addr::new(10, 45, 0, 2),
-        );
+        nextgcore_diameter::gx::add_framed_ip_address(&mut ccr, framed_ip);
         ccr
     }
 
@@ -2798,27 +2813,31 @@ mod tests {
         crate::context::pcrf_context_init(1024);
         crate::fd_path::pcrf_fd_set_local_identity(local());
         let sid = "gx-iprelease-1";
-        let _ = handle_ccr(&roundtrip(&build_test_ccr(sid, 1, 0)), &local());
+        // An address no other test CCR carries: the mapping is process-global and
+        // the tests run in parallel, so with the shared 10.45.0.2 a sibling's CCR
+        // could re-map it between this test's steps.
+        let ip = std::net::Ipv4Addr::new(10, 45, 7, 1);
+        let _ = handle_ccr(&roundtrip(&build_test_ccr_with_ip(sid, 1, 0, ip)), &local());
         {
             let ctx = pcrf_self();
             assert_eq!(
                 ctx.read()
                     .unwrap()
-                    .find_sid_by_ipv4(&[10, 45, 0, 2])
+                    .find_sid_by_ipv4(&ip.octets())
                     .as_deref(),
                 Some(sid),
                 "the initial CCR installs the mapping"
             );
         }
 
-        let mut update = build_test_ccr(sid, 2, 1);
+        let mut update = build_test_ccr_with_ip(sid, 2, 1, ip);
         add_event_trigger(&mut update, event_trigger::UE_IP_ADDRESS_RELEASE);
         let _ = handle_ccr(&roundtrip(&update), &local());
 
         let ctx = pcrf_self();
         let context = ctx.read().unwrap();
         assert_eq!(
-            context.find_sid_by_ipv4(&[10, 45, 0, 2]),
+            context.find_sid_by_ipv4(&ip.octets()),
             None,
             "a released address must not still resolve to the session"
         );
