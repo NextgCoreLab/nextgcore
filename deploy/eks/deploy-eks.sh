@@ -384,6 +384,21 @@ for d in docs:
             caps = sc.get('capabilities', {})
             if 'ALL' in caps.get('drop', []) and caps.get('add'):
                 errors.append(f'{where}/{c["name"]}: drops ALL but adds {caps["add"]}')
+        # Issue #63: these NFs default to the PRODUCTION SBI profile and exit at
+        # startup without /etc/nextgcore/tls/server.crt. The dev opt-out only
+        # works on the NF's OWN container -- it once sat on the busybox
+        # rewrite-advertise-addr init container in ausf/smf/udm, where it did
+        # nothing, and the rollout hung on a CrashLoopBackOff.
+        if kind == 'Deployment' and name in ('amf', 'ausf', 'smf', 'udm'):
+            nf = next((c for c in pod.get('containers', []) if c['name'] == name), None)
+            has_profile = nf is not None and any(
+                e['name'] == 'NEXTGCORE_SBI_PROFILE' for e in nf.get('env', []))
+            has_tls = nf is not None and any(
+                m.get('mountPath', '').startswith('/etc/nextgcore/tls')
+                for m in nf.get('volumeMounts', []))
+            if not (has_profile or has_tls):
+                errors.append(f'{where}/{name}: no NEXTGCORE_SBI_PROFILE and no TLS mount '
+                              'on the NF container; it will refuse to start')
         for v in pod.get('volumes', []):
             sources = [k for k in v if k != 'name']
             if len(sources) != 1:
