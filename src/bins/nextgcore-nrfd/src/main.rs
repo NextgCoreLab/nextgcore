@@ -4763,7 +4763,12 @@ mod tests {
             nextgcore_sbi::context::global_context()
                 .set_nrf_uri(format!("http://127.0.0.1:{}", addr.port()))
                 .await;
-            hb::set_heartbeat_paused(false);
+            // Start PAUSED. The first tick fires on spawn, so an unpaused worker
+            // can PATCH just after the DELETE below, get its 404, and re-register
+            // before the premise check reads the registry -- the behaviour under
+            // test racing the test's own premise. That failed once under full-
+            // workspace load. Pausing first makes the premise deterministic.
+            hb::set_heartbeat_paused(true);
             hb::spawn_heartbeat_worker_with_load(nf_id.to_string(), 1, || 0);
 
             // The NRF loses the profile.
@@ -4774,7 +4779,19 @@ mod tests {
                 "premise: the profile is gone"
             );
 
-            // The worker's next tick gets 404 and must put it back.
+            // NES carve-out first: paused means deregistered on purpose, so the
+            // deleted profile must STAY deleted across several ticks. A PATCH
+            // already in flight when the pause landed gets its 404 here, which
+            // also exercises the worker's re-check of the pause after the
+            // response arrives.
+            tokio::time::sleep(Duration::from_millis(3500)).await;
+            assert!(
+                nf_manager().get(nf_id).is_none(),
+                "a paused (NES-deregistered) worker must not re-register"
+            );
+
+            // Unpaused, the worker's next tick gets 404 and must put it back.
+            hb::set_heartbeat_paused(false);
             let restored = nextgcore_sbi::test_support::poll_until(
                 Duration::from_secs(15),
                 Duration::from_millis(50),
@@ -4789,16 +4806,9 @@ mod tests {
             let resp = client.get(&path).await.expect("GET after re-register");
             assert_eq!(resp.status, 200, "and it must be readable through the API");
 
-            // NES carve-out: paused means deregistered on purpose. A deleted
-            // profile must STAY deleted across several ticks.
+            // Pause again before teardown, so no tick re-registers while the
+            // globals are restored below.
             hb::set_heartbeat_paused(true);
-            let resp = client.delete(&path).await.expect("DELETE while paused");
-            assert_eq!(resp.status, 204);
-            tokio::time::sleep(Duration::from_millis(3500)).await;
-            assert!(
-                nf_manager().get(nf_id).is_none(),
-                "a paused (NES-deregistered) worker must not re-register"
-            );
         };
 
         let outcome = tokio::time::timeout(Duration::from_secs(45), body).await;
