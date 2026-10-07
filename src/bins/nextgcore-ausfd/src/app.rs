@@ -1907,6 +1907,8 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
     match response.status {
         200 | 201 => {
             log::info!("AUSF registered with NRF successfully (id={nf_instance_id})");
+            // #434: what a 404 heartbeat re-registers if the NRF loses us.
+            nextgcore_sbi::heartbeat::set_registered_profile(&nf_profile);
 
             // Store the self instance from the SAME table the profile came from:
             // this was a second hand-written service list (#392).
