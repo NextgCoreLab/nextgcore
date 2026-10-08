@@ -491,11 +491,52 @@ for dep in prometheus grafana jaeger; do
     || warn "${dep} not ready"
 done
 
+# --- re-resolve peers pinned by IP (#436) ------------------------------------
+#
+# Three dependents resolve a peer's POD IP once, in an init container: the SMF
+# pins the UPF (resolve-upf), the gNB pins the AMF and the UPF, and the UE pins
+# the gNB (resolve-dns). When the peer gets a new pod and the dependent does not
+# -- always the case for gnb/ue when only the core's tag changed, since their
+# apply is then a no-op -- the dependent keeps dialling a dead IP. On devtest1
+# that failed the E2E at NG Setup on a healthy core.
+#
+# So restart a dependent that finished resolving AT OR BEFORE the moment a peer
+# it pins became Ready -- headless DNS returns Ready endpoints only, so until
+# then the lookup still yields the old pod. Creation order is not enough: on
+# devtest1 an SMF and the new UPF were created in the same second and the SMF
+# still pinned the dying UPF. The rule lives in lib/pinned_peers.py with fixture
+# tests. One dependent at a time, each settling before the next resolves
+# against it. The AMF is not here: it re-discovers through the NRF, and since
+# #435 it evicts a dead peer on the first failure.
+PEER_A_JSON="${RENDERED}.peer-a.json"
+PEER_B_JSON="${RENDERED}.peer-b.json"
+restart_if_resolved_before_ready() {
+  local dependent="$1"; shift
+  local peer
+  kubectl get pods -n "${NAMESPACE}" -l "app.kubernetes.io/name=${dependent}" -o json \
+    > "${PEER_A_JSON}" 2>/dev/null || return 0
+  for peer in "$@"; do
+    kubectl get pods -n "${NAMESPACE}" -l "app.kubernetes.io/name=${peer}" -o json \
+      > "${PEER_B_JSON}" 2>/dev/null || continue
+    if [[ "$(python3 "${SCRIPT_DIR}/lib/pinned_peers.py" "${PEER_A_JSON}" "${PEER_B_JSON}")" == restart ]]; then
+      log "${dependent} resolved ${peer} before its current pod was Ready; restarting it to re-resolve"
+      kubectl rollout restart "deployment/${dependent}" -n "${NAMESPACE}" >/dev/null
+      kubectl rollout status "deployment/${dependent}" -n "${NAMESPACE}" --timeout=300s \
+        || warn "${dependent} not ready after the re-resolve restart"
+      return 0
+    fi
+  done
+}
+
+restart_if_resolved_before_ready smf upf
+
 log "waiting for the gNB..."
+restart_if_resolved_before_ready gnb amf upf
 kubectl rollout status deployment/gnb -n "${NAMESPACE}" --timeout=300s \
   || warn "gNB not ready - check the resolve-dns initContainer logs"
 
 log "waiting for the UE..."
+restart_if_resolved_before_ready ue gnb
 kubectl rollout status deployment/ue -n "${NAMESPACE}" --timeout=300s \
   || warn "UE not ready - check the resolve-dns initContainer logs"
 
@@ -508,75 +549,26 @@ kubectl rollout status deployment/ue -n "${NAMESPACE}" --timeout=300s \
 # (a changed tag is a changed spec), but "less likely" is not a check, and an
 # explicit IMAGE_TAG can still be mutable.
 #
-# So assert it directly: every running container's image must be the image the
-# rendered manifests asked for. Compared by spec image reference rather than by
-# resolved digest, because a digest comparison needs an ECR round trip per image
-# and answers a different question -- what we care about here is that no pod is
-# still running a spec we replaced.
-log "verifying running pods match the deployed image tags..."
+# The rules live in lib/verify_images.py, each with a fixture test in
+# lib/test_verify_images.py (#436): pods being replaced are skipped; a pod is
+# judged by its own SPEC image, never by status.image or imageID -- both report
+# an older tag or digest once a node holds a content-identical earlier build;
+# and a replacement on the expected image that is not Ready is reported as a
+# failing rollout, not as stale. What this cannot catch is a MUTABLE tag
+# (IMAGE_TAG=latest) moving underneath an unchanged spec -- hence that warning.
+log "verifying running pods match the deployed images..."
 PODS_JSON="${RENDERED}.pods.json"
-trap 'rm -f "${RENDERED}" "${RENDERED}.tmp" "${PODS_JSON}"' EXIT
+trap 'rm -f "${RENDERED}" "${RENDERED}.tmp" "${PODS_JSON}" "${PEER_A_JSON}" "${PEER_B_JSON}"' EXIT
+
 if kubectl get pods -n "${NAMESPACE}" -o json > "${PODS_JSON}" 2>/dev/null; then
-  # Both inputs are passed as FILES: a heredoc on stdin would override a pipe
-  # (shellcheck SC2259), silently handing the script no pod data at all.
-  python3 - "${RENDERED}" "${PODS_JSON}" <<'PY' || die "image verification failed"
-import json, re, sys, yaml
-
-rendered, pods_json = sys.argv[1], sys.argv[2]
-
-# Wanted image per (kind-owner) container name, taken from the manifests just
-# applied. Keyed by container name because that is what a pod status reports.
-wanted = {}
-for d in yaml.safe_load_all(open(rendered)):
-    if not d or d.get('kind') not in ('Deployment', 'StatefulSet', 'Job'):
-        continue
-    for c in d['spec']['template']['spec'].get('containers', []):
-        wanted.setdefault(c['name'], set()).add(c['image'])
-
-pods = json.load(open(pods_json))
-mismatched, checked = [], 0
-for p in pods.get('items', []):
-    phase = p.get('status', {}).get('phase')
-    if phase not in ('Running', 'Succeeded'):
-        continue
-    pod_name = p['metadata']['name']
-    for cs in p.get('status', {}).get('containerStatuses', []):
-        want = wanted.get(cs['name'])
-        if not want:
-            continue          # not one of ours (sidecar, or renamed)
-        checked += 1
-        # `image` in a pod status is the spec reference as resolved by kubelet;
-        # it can gain a docker.io/ prefix or lose an implicit :latest, so compare
-        # on a normalised suffix rather than requiring string equality.
-        got = cs['image']
-        def norm(ref):
-            ref = re.sub(r'^docker\.io/(library/)?', '', ref)
-            return ref if ':' in ref.rsplit('/', 1)[-1] else ref + ':latest'
-        if norm(got) not in {norm(w) for w in want}:
-            mismatched.append(f'{pod_name}/{cs["name"]}: running {got}, '
-                              f'expected {" or ".join(sorted(want))}')
-
-if mismatched:
-    print('pods are NOT running the images just deployed:', file=sys.stderr)
-    for m in mismatched:
-        print(f'  {m}', file=sys.stderr)
-    print('\nThis is the stale-image failure mode: the apply did not replace '
-          'these pods.\nForce it bottom-up, then re-run this script:\n'
-          '  kubectl rollout restart -n <ns> deploy/udr deploy/udm deploy/ausf '
-          'deploy/pcf deploy/nssf deploy/bsf\n'
-          '  kubectl rollout restart -n <ns> deploy/upf deploy/smf deploy/amf '
-          'deploy/gnb deploy/ue', file=sys.stderr)
-    sys.exit(1)
-
-if not checked:
-    # Not a hard failure: an earlier rollout warn already covered the
-    # not-ready case. But "0 checked" must not read like a clean bill of
-    # health, which a bare success line would.
-    print('  WARNING: no running containers matched a deployed container name, '
-          'so nothing was verified', file=sys.stderr)
-else:
-    print(f'  {checked} running containers all match the deployed image tags')
-PY
+  verify_rc=0
+  python3 "${SCRIPT_DIR}/lib/verify_images.py" "${RENDERED}" "${PODS_JSON}" \
+    || verify_rc=$?
+  case "${verify_rc}" in
+    0) ;;
+    2) die "rollout failing: replacement pods are not Ready (see above)" ;;
+    *) die "image verification failed" ;;
+  esac
 else
   warn "could not list pods; skipped image verification"
 fi

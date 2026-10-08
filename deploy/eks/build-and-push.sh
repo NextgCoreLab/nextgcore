@@ -18,6 +18,7 @@
 #   ./build-and-push.sh                        # infer registry from STS
 #   REGISTRY=<acct>.dkr.ecr.<region>.amazonaws.com ./build-and-push.sh
 #   REPO_PREFIX=nextg IMAGE_TAG=v1 ./build-and-push.sh
+#   FORCE_PUSH=true ./build-and-push.sh        # re-push tags already in ECR
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -127,6 +128,23 @@ ensure_repo() {
   fi
 }
 
+# A clean SHA tag names one commit, so once it is in ECR it must not move
+# (#436). The repos are MUTABLE and image builds are not byte-reproducible, so
+# re-running this script used to re-push every tag with a NEW digest. A pod whose
+# spec did not change (gnb/ue when only the core moved) then kept running the
+# previous digest, which the deploy's digest check correctly reports as stale.
+# Skip an image whose tag already exists, unless the tag is one that is MEANT to
+# move: a -dirty tree, `latest`, or FORCE_PUSH=true.
+PUSHED=0
+SKIPPED=0
+already_pushed() {
+  local repo="${REPO_PREFIX}/$1" tag="$2"
+  [[ "${tag}" != *-dirty && "${tag}" != latest && "${FORCE_PUSH:-false}" != true ]] \
+    || return 1
+  aws ecr describe-images --repository-name "${repo}" --image-ids imageTag="${tag}" \
+    --region "${REGION}" >/dev/null 2>&1
+}
+
 # --- base image ------------------------------------------------------------
 
 # Dockerfile.nf does FROM ${CORE_IMAGE}, so the shared core image (which
@@ -146,6 +164,11 @@ for entry in "${CORE_NFS[@]}"; do
   remote="${REGISTRY}/${REPO_PREFIX}/${nf}:${CORE_TAG}"
 
   ensure_repo "${nf}"
+  if already_pushed "${nf}" "${CORE_TAG}"; then
+    log "${nf}:${CORE_TAG} is already in ECR; not re-pushing (FORCE_PUSH=true to override)"
+    SKIPPED=$((SKIPPED + 1))
+    continue
+  fi
   log "building ${nf} (${bin})"
   # Build context is the repo root so COPY binaries/<bin> resolves.
   docker build \
@@ -158,6 +181,7 @@ for entry in "${CORE_NFS[@]}"; do
 
   log "pushing ${remote}"
   docker push "${remote}" >/dev/null || die "${nf} push failed"
+  PUSHED=$((PUSHED + 1))
 done
 
 # --- simulator -------------------------------------------------------------
@@ -168,6 +192,11 @@ for pair in "gnb:Dockerfile.gnb-local" "ue:Dockerfile.ue-local"; do
   remote="${REGISTRY}/${REPO_PREFIX}/${node}:${SIM_TAG}"
 
   ensure_repo "${node}"
+  if already_pushed "${node}" "${SIM_TAG}"; then
+    log "${node}:${SIM_TAG} is already in ECR; not re-pushing (FORCE_PUSH=true to override)"
+    SKIPPED=$((SKIPPED + 1))
+    continue
+  fi
   log "building ${node}"
   # Context is nextgsim/docker, NOT nextgsim: the Dockerfiles do
   # `COPY binaries/nr-gnb`, and the binaries live in nextgsim/docker/binaries/.
@@ -180,13 +209,14 @@ for pair in "gnb:Dockerfile.gnb-local" "ue:Dockerfile.ue-local"; do
 
   log "pushing ${remote}"
   docker push "${remote}" >/dev/null || die "${node} push failed"
+  PUSHED=$((PUSHED + 1))
 done
 
 # --- summary ---------------------------------------------------------------
 
 cat <<EOF
 
-All 12 images pushed.
+All 12 images are in ECR: ${PUSHED} pushed, ${SKIPPED} already present.
 
   registry:      ${REGISTRY}
   prefix:        ${REPO_PREFIX}
