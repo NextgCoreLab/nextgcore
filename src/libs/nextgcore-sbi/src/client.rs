@@ -739,8 +739,30 @@ impl SbiClient {
             Some(alt) => alt.base_uri(),
             None => primary.clone(),
         };
+        // The endpoint this attempt actually dials, kept for #435's eviction below
+        // (`reselected` moves into `dispatch`).
+        let (target_host, target_port) = match &reselected {
+            Some(alt) => (alt.host.clone(), alt.port),
+            None => (self.config.host.clone(), self.config.port),
+        };
 
         let result = self.dispatch(request, reselected, &target_key).await;
+
+        // #435: a TRANSPORT failure, after any retries, is evidence that a cached
+        // discovery profile naming this endpoint is stale -- the peer pod was
+        // replaced and its old IP is dead. Evict it so the next lookup
+        // re-discovers, instead of dialling the dead IP for the whole
+        // validityPeriod. Deliberately NOT for an error status (the peer answered,
+        // so its profile is right), a TLS error (misconfiguration, not a dead
+        // peer), or OverloadShed (decided locally, returned before dispatch).
+        if matches!(
+            &result,
+            Err(SbiError::ConnectionError(_) | SbiError::Timeout)
+        ) {
+            crate::context::global_context()
+                .evict_nf_instances_at_endpoint(&target_host, target_port)
+                .await;
+        }
 
         // Record what the response reported, whether it was a 503 or a 200: an
         // OCI can ride on ANY response (§6.4.3.2), and a producer signals recovery
@@ -1350,6 +1372,85 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #435, through the real send path: a request to a dead endpoint evicts the
+    /// cached profile naming it from the GLOBAL discovery cache (the one every
+    /// daemon's resolver reads), so the next lookup re-discovers. A request that
+    /// gets an error STATUS from a live peer must evict nothing.
+    ///
+    /// Uses `LMF` and literal IDs no other test in this crate caches; the global
+    /// cache is otherwise untouched by this crate's tests.
+    #[tokio::test]
+    async fn a_transport_failure_evicts_the_cached_profile_but_an_error_status_does_not() {
+        use crate::context::{global_context, NfInstance, NfService};
+        use crate::types::{NfType, SbiServiceType};
+
+        fn cached(id: &str, port: u16) -> NfInstance {
+            let mut inst = NfInstance::new(id, NfType::Lmf);
+            inst.ipv4_addresses = vec!["127.0.0.1".to_string()];
+            let mut svc = NfService::new("nlmf-loc", SbiServiceType::NlmfLoc);
+            svc.port = port;
+            inst.services = vec![svc];
+            inst
+        }
+        let ctx = global_context();
+        let ttl = Duration::from_secs(3600);
+
+        // A dead endpoint: reserve a port, then release it so nothing listens.
+        let dead_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr")
+            .port();
+        // A live peer that answers 503: an error STATUS, not a transport failure.
+        let (server, live) =
+            crate::test_support::sbi_server_on_free_port(|_req: SbiRequest| async {
+                SbiResponse::with_status(503)
+            })
+            .await;
+
+        let dead_id = "lmf-0435-dead";
+        let live_id = "lmf-0435-live";
+        ctx.add_nf_instance_with_validity(cached(dead_id, dead_port), ttl)
+            .await;
+        ctx.add_nf_instance_with_validity(cached(live_id, live.port()), ttl)
+            .await;
+
+        let to_dead = SbiClient::new(
+            SbiClientConfig::new("127.0.0.1", dead_port)
+                .with_connect_timeout(Duration::from_millis(500)),
+        );
+        let err = to_dead
+            .send_request(SbiRequest::get("/nlmf-loc/v1/x"))
+            .await
+            .expect_err("nothing listens on the dead port");
+        assert!(
+            matches!(err, SbiError::ConnectionError(_) | SbiError::Timeout),
+            "premise: a transport failure, got {err:?}"
+        );
+        assert!(
+            ctx.get_nf_instance(dead_id).await.is_none(),
+            "a transport failure must evict the profile naming that endpoint (#435)"
+        );
+
+        let to_live = SbiClient::with_host_port("127.0.0.1", live.port());
+        let resp = to_live
+            .send_request(SbiRequest::get("/nlmf-loc/v1/x"))
+            .await
+            .expect("the live peer answers");
+        assert_eq!(
+            resp.status, 503,
+            "premise: an error status from a live peer"
+        );
+        assert!(
+            ctx.get_nf_instance(live_id).await.is_some(),
+            "a peer that answered, even with 503, keeps its cached profile"
+        );
+
+        ctx.remove_nf_instance(live_id).await;
+        ctx.remove_nf_instance(dead_id).await;
+        server.stop().await.expect("stop");
+    }
 
     #[test]
     fn test_client_config() {

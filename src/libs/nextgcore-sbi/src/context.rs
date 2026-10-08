@@ -293,6 +293,48 @@ impl SbiContext {
         removed
     }
 
+    /// Evict every cached NF instance reachable at `host:port`, because a
+    /// transport attempt to that endpoint just failed (#435).
+    ///
+    /// The endpoint-keyed sibling of [`Self::evict_nf_instance_on_failure`]. The
+    /// SBI client calls it, so callers that only hold `(host, port)` get the
+    /// eviction: by the time a request fails, most of them no longer know which
+    /// cache entry they resolved from. Before #435 only `udmd` evicted, so an AMF
+    /// or AUSF kept dialling a replaced pod's IP for the whole `validityPeriod`
+    /// (3600 s by default).
+    ///
+    /// "Reachable at" mirrors how consumers resolve a cached profile: a service
+    /// on `port` whose own IP or FQDN, or else the instance's IPv4 address or
+    /// FQDN, is `host`. Returns the evicted IDs; an endpoint matching nothing
+    /// (the NRF itself, a notification URI, an env-var fallback) evicts nothing.
+    pub async fn evict_nf_instances_at_endpoint(&self, host: &str, port: u16) -> Vec<String> {
+        let mut instances = self.nf_instances.write().await;
+        let dead: Vec<String> = instances
+            .iter()
+            .filter(|(_, cached)| {
+                let inst = &cached.instance;
+                inst.services.iter().any(|svc| {
+                    svc.port == port
+                        && (svc.ip_addresses.iter().any(|a| a == host)
+                            || svc.fqdn.as_deref() == Some(host)
+                            || inst.ipv4_addresses.iter().any(|a| a == host)
+                            || inst.fqdn.as_deref() == Some(host))
+                })
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &dead {
+            instances.remove(id);
+        }
+        drop(instances);
+        for id in &dead {
+            log::info!(
+                "Evicted NF instance {id} from the discovery cache: {host}:{port} is unreachable"
+            );
+        }
+        dead
+    }
+
     /// Drop every entry past its validity deadline, returning how many went.
     ///
     /// The reads below already ignore expired entries, so this is bookkeeping
@@ -645,6 +687,62 @@ mod tests {
         assert!(
             !ctx.evict_nf_instance_on_failure("never-cached").await,
             "evicting an unknown id must not claim a removal"
+        );
+    }
+
+    /// #435: endpoint-keyed eviction removes exactly the instances a consumer
+    /// would have resolved to `host:port`, and nothing else.
+    #[tokio::test]
+    async fn eviction_by_endpoint_matches_how_consumers_resolve_a_profile() {
+        fn instance(id: &str, ip: &str, svc_ip: Option<&str>, port: u16) -> NfInstance {
+            let mut inst = NfInstance::new(id, NfType::Ausf);
+            inst.ipv4_addresses = vec![ip.to_string()];
+            let mut svc = NfService::new("nausf-auth", SbiServiceType::NausfAuth);
+            svc.port = port;
+            if let Some(a) = svc_ip {
+                svc.ip_addresses = vec![a.to_string()];
+            }
+            inst.services = vec![svc];
+            inst
+        }
+        let ctx = SbiContext::new();
+        let ttl = Duration::from_secs(3600);
+        // Dead endpoint 10.0.0.9:7777, reached two ways a consumer resolves it.
+        ctx.add_nf_instance_with_validity(instance("by-inst-ip", "10.0.0.9", None, 7777), ttl)
+            .await;
+        ctx.add_nf_instance_with_validity(
+            instance("by-svc-ip", "10.9.9.9", Some("10.0.0.9"), 7777),
+            ttl,
+        )
+        .await;
+        // Same IP, different port: a different endpoint, so it must survive.
+        ctx.add_nf_instance_with_validity(instance("other-port", "10.0.0.9", None, 8080), ttl)
+            .await;
+        // A live peer elsewhere.
+        ctx.add_nf_instance_with_validity(instance("live", "10.0.0.20", None, 7777), ttl)
+            .await;
+
+        let mut evicted = ctx.evict_nf_instances_at_endpoint("10.0.0.9", 7777).await;
+        evicted.sort();
+        assert_eq!(
+            evicted,
+            vec!["by-inst-ip".to_string(), "by-svc-ip".to_string()]
+        );
+        assert!(ctx.get_nf_instance("by-inst-ip").await.is_none());
+        assert!(ctx.get_nf_instance("by-svc-ip").await.is_none());
+        assert!(
+            ctx.get_nf_instance("other-port").await.is_some(),
+            "the same IP on another port is a different endpoint"
+        );
+        assert!(
+            ctx.get_nf_instance("live").await.is_some(),
+            "a live peer must survive"
+        );
+        assert!(
+            ctx.evict_nf_instances_at_endpoint("10.0.0.9", 7777)
+                .await
+                .is_empty(),
+            "nothing left at that endpoint to evict"
         );
     }
 
