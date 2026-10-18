@@ -132,7 +132,8 @@ ensure_repo() {
 # (#436). The repos are MUTABLE and image builds are not byte-reproducible, so
 # re-running this script used to re-push every tag with a NEW digest. A pod whose
 # spec did not change (gnb/ue when only the core moved) then kept running the
-# previous digest, which the deploy's digest check correctly reports as stale.
+# previous digest under the same tag -- a move the deploy's spec-based verifier
+# cannot see, so the only defence is not to move the tag.
 # Skip an image whose tag already exists, unless the tag is one that is MEANT to
 # move: a -dirty tree, `latest`, or FORCE_PUSH=true.
 PUSHED=0
