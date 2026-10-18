@@ -3,6 +3,12 @@
 //! This module provides ASN.1 APER encoding for NGAP messages
 //! using the nextgcore-ngap crate. This ensures wire compatibility with
 //! the gNB (nextgsim-gnb) which also uses proper ASN.1 encoding.
+//!
+//! #417 is migrating these builders, one procedure family at a time, onto the
+//! codec generated from the TS 38.413 ASN.1 (`nextgcore-ngap-gen`). Migrated so
+//! far: the NG Setup Response and NG Setup Failure encoders. The NG Setup
+//! Request is still DECODED by the hand-written parser -- see
+//! `generated_decoder_rejects_an_ignorable_unknown_ie_so_parse_stays_hand_written`.
 
 use nextgcore_asn1c::ngap::cause::{
     Cause, CauseMisc, CauseNas, CauseProtocol, CauseRadioNetwork, CauseTransport,
@@ -16,63 +22,66 @@ use nextgcore_ngap::transfer::{
 };
 use nextgcore_ngap::{builder, parser, types::*, NgapMessage};
 
+use nextgcore_ngap_gen::generated as ngap_gen;
+
 use crate::context::AmfContext;
 
 /// Build an NG Setup Response PDU with proper ASN.1 APER encoding
 ///
 /// This is sent by AMF to gNB in response to a successful NG Setup Request.
 /// The message follows 3GPP TS 38.413 Section 9.2.6.2.
+///
+/// #417 stage 2: encoded by the codec GENERATED from the TS 38.413 ASN.1
+/// (`nextgcore-ngap-gen`), not the hand-written `nextgcore-ngap` builder. The
+/// bytes are unchanged -- `ng_setup_generated_matches_hand_written_*` below pins
+/// that against the hand-written encoder over a matrix of contexts.
 pub fn build_ng_setup_response_asn1(ctx: &AmfContext) -> Option<Vec<u8>> {
+    use ngap_gen::{
+        AMFName, AMFPointer, AMFRegionID, AMFSetID, NGSetupResponse, NGSetupResponseProtocolIEs,
+        NGSetupResponseProtocolIEs_Entry as Entry, NGSetupResponseProtocolIEs_EntryValue as Ie,
+        PLMNSupportItem, PLMNSupportList, ProtocolIE_ID, RelativeAMFCapacity, ServedGUAMIItem,
+        ServedGUAMIList, SliceSupportItem, SliceSupportList, GUAMI, NGAP_PDU,
+    };
+
     let amf_name = ctx.amf_name.as_deref().unwrap_or("AMF").to_string();
 
     let served_guami_list = ctx
         .served_guami
         .iter()
         .take(ctx.num_of_served_guami)
-        .map(|guami| {
-            let plmn_bytes = encode_plmn_id(&guami.plmn_id);
-            ServedGuamiItem {
-                guami: Guami {
-                    plmn_identity: plmn_bytes,
-                    amf_region_id: guami.amf_id.region,
-                    amf_set_id: guami.amf_id.set,
-                    amf_pointer: guami.amf_id.pointer,
-                },
-                backup_amf_name: None,
-            }
+        .map(|guami| ServedGUAMIItem {
+            guami: GUAMI {
+                plmn_identity: ngap_gen::PLMNIdentity(encode_plmn_id(&guami.plmn_id).to_vec()),
+                amf_region_id: AMFRegionID(low_bits(u64::from(guami.amf_id.region), 8)),
+                amf_set_id: AMFSetID(low_bits(u64::from(guami.amf_id.set), 10)),
+                amf_pointer: AMFPointer(low_bits(u64::from(guami.amf_id.pointer), 6)),
+                ie_extensions: None,
+            },
+            backup_amf_name: None,
+            ie_extensions: None,
         })
-        .collect();
+        .collect::<Vec<_>>();
 
     let plmn_support_list = ctx
         .plmn_support
         .iter()
         .take(ctx.num_of_plmn_support)
-        .map(|plmn_support| {
-            let plmn_bytes = encode_plmn_id(&plmn_support.plmn_id);
-            let slice_support_list = plmn_support
-                .s_nssai
-                .iter()
-                .take(plmn_support.num_of_s_nssai)
-                .map(|s_nssai| {
-                    let sd = s_nssai.sd.map(|sd_val| {
-                        [
-                            ((sd_val >> 16) & 0xFF) as u8,
-                            ((sd_val >> 8) & 0xFF) as u8,
-                            (sd_val & 0xFF) as u8,
-                        ]
-                    });
-                    SNssai {
-                        sst: s_nssai.sst,
-                        sd,
-                    }
-                })
-                .collect();
-            PlmnSupportItem {
-                plmn_identity: plmn_bytes,
-                slice_support_list,
-            }
+        .map(|plmn_support| PLMNSupportItem {
+            plmn_identity: ngap_gen::PLMNIdentity(encode_plmn_id(&plmn_support.plmn_id).to_vec()),
+            slice_support_list: SliceSupportList(
+                plmn_support
+                    .s_nssai
+                    .iter()
+                    .take(plmn_support.num_of_s_nssai)
+                    .map(|s_nssai| SliceSupportItem {
+                        s_nssai: generated_s_nssai(s_nssai),
+                        ie_extensions: None,
+                    })
+                    .collect(),
+            ),
+            ie_extensions: None,
         })
-        .collect();
+        .collect::<Vec<_>>();
 
     // amfd-09 (TS 38.413 §9.2.6.2): a strict-peer gNB needs a non-empty
     // PLMNSupportList with slice support for load-balancing / slice selection.
@@ -89,14 +98,67 @@ pub fn build_ng_setup_response_asn1(ctx: &AmfContext) -> Option<Vec<u8>> {
         );
     }
 
-    let msg = NgSetupResponse {
-        amf_name,
-        served_guami_list,
-        relative_amf_capacity: ctx.relative_capacity,
-        plmn_support_list,
-    };
+    // The generated encoder enforces NEITHER bound of a SEQUENCE OF's SIZE: it
+    // emits an empty or over-long list the schema forbids, and a peer cannot
+    // decode the result. The hand-written encoder refused these, so refuse them
+    // here: ServedGUAMIList SIZE(1..256), PLMNSupportList SIZE(1..12),
+    // SliceSupportList SIZE(1..1024) (TS 38.413 §9.4, maxnoofServedGUAMIs,
+    // maxnoofPLMNs, maxnoofSliceItems).
+    let sized = |len: usize, max: usize| (1..=max).contains(&len);
+    if !sized(served_guami_list.len(), 256)
+        || !sized(plmn_support_list.len(), 12)
+        || plmn_support_list
+            .iter()
+            .any(|p: &PLMNSupportItem| !sized(p.slice_support_list.0.len(), 1024))
+    {
+        log::error!(
+            "Failed to encode NG Setup Response: ServedGUAMIList ({}), PLMNSupportList ({}) \
+             or a SliceSupportList is outside its SIZE bounds",
+            served_guami_list.len(),
+            plmn_support_list.len()
+        );
+        return None;
+    }
 
-    match builder::build_ng_setup_response(&msg) {
+    // IE order and criticalities as TS 38.413 §9.2.6.2 lists them, and as the
+    // hand-written builder emitted them.
+    let entry = |id: u16, criticality: u8, value: Ie| Entry {
+        id: ProtocolIE_ID(id),
+        criticality: ngap_gen::Criticality(criticality),
+        value,
+    };
+    let reject = ngap_gen::Criticality::REJECT;
+    let ignore = ngap_gen::Criticality::IGNORE;
+    let pdu = NGAP_PDU::SuccessfulOutcome(ngap_gen::SuccessfulOutcome {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_NG_SETUP),
+        criticality: ngap_gen::Criticality(reject),
+        value: ngap_gen::SuccessfulOutcomeValue::Id_NGSetup(NGSetupResponse {
+            protocol_i_es: NGSetupResponseProtocolIEs(vec![
+                entry(
+                    ngap_gen::ID_AMF_NAME,
+                    reject,
+                    Ie::Id_AMFName(AMFName(amf_name)),
+                ),
+                entry(
+                    ngap_gen::ID_SERVED_GUAMI_LIST,
+                    reject,
+                    Ie::Id_ServedGUAMIList(ServedGUAMIList(served_guami_list)),
+                ),
+                entry(
+                    ngap_gen::ID_RELATIVE_AMF_CAPACITY,
+                    ignore,
+                    Ie::Id_RelativeAMFCapacity(RelativeAMFCapacity(ctx.relative_capacity)),
+                ),
+                entry(
+                    ngap_gen::ID_PLMN_SUPPORT_LIST,
+                    reject,
+                    Ie::Id_PLMNSupportList(PLMNSupportList(plmn_support_list)),
+                ),
+            ]),
+        }),
+    });
+
+    match nextgcore_ngap_gen::encode(&pdu) {
         Ok(bytes) => {
             log::debug!(
                 "Built NG Setup Response: {} bytes, hex: {:02x?}",
@@ -116,29 +178,58 @@ pub fn build_ng_setup_response_asn1(ctx: &AmfContext) -> Option<Vec<u8>> {
 ///
 /// This is sent by AMF to gNB when NG Setup fails.
 /// The message follows 3GPP TS 38.413 Section 9.2.6.3.
+///
+/// #417 stage 2: encoded by the generated codec, like the Response above. The
+/// (group, value) -> Cause mapping is still [`build_cause`], shared with the
+/// UE Context Release Command, so both messages clamp an out-of-range value the
+/// same way; only the encoding moved.
 pub fn build_ng_setup_failure_asn1(
     cause_group: u8,
     cause_value: i64,
     time_to_wait: Option<u8>,
 ) -> Vec<u8> {
-    let cause = build_cause(cause_group, cause_value);
-
-    let ttw = time_to_wait.map(|ttw| match ttw {
-        0 => TimeToWait::V1s,
-        1 => TimeToWait::V2s,
-        2 => TimeToWait::V5s,
-        3 => TimeToWait::V10s,
-        4 => TimeToWait::V20s,
-        _ => TimeToWait::V60s,
-    });
-
-    let msg = NgSetupFailure {
-        cause,
-        time_to_wait: ttw,
-        criticality_diagnostics: None,
+    use ngap_gen::{
+        NGSetupFailure, NGSetupFailureProtocolIEs, NGSetupFailureProtocolIEs_Entry as Entry,
+        NGSetupFailureProtocolIEs_EntryValue as Ie, ProtocolIE_ID, NGAP_PDU,
     };
 
-    match builder::build_ng_setup_failure(&msg) {
+    let Some(cause) = generated_cause(build_cause(cause_group, cause_value)) else {
+        // The forked generated codec cannot encode an ENUMERATED value past its
+        // root ("Encode of extended enumerated not yet implemented"), and
+        // radioNetwork 45/46 are extension values. No NG Setup Failure the AMF
+        // sends today carries one -- the handler answers with protocol/semantic-
+        // error or misc/unknown-PLMN-or-SNPN -- but the function takes any
+        // (group, value), so keep the old wire form for these rather than
+        // failing. Remove once the codec encodes extension values.
+        log::debug!("NG Setup Failure cause {cause_group}/{cause_value} is an extension value");
+        return hand_written_ng_setup_failure(cause_group, cause_value, time_to_wait);
+    };
+
+    let ignore = ngap_gen::Criticality::IGNORE;
+    let mut ies = vec![Entry {
+        id: ProtocolIE_ID(ngap_gen::ID_CAUSE),
+        criticality: ngap_gen::Criticality(ignore),
+        value: Ie::Id_Cause(cause),
+    }];
+    // TimeToWait ENUMERATED { v1s, v2s, v5s, v10s, v20s, v60s, ... }: a wire
+    // value above v20s (4) means v60s, as before.
+    if let Some(ttw) = time_to_wait {
+        ies.push(Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_TIME_TO_WAIT),
+            criticality: ngap_gen::Criticality(ignore),
+            value: Ie::Id_TimeToWait(ngap_gen::TimeToWait(ttw.min(ngap_gen::TimeToWait::V60S))),
+        });
+    }
+
+    let pdu = NGAP_PDU::UnsuccessfulOutcome(ngap_gen::UnsuccessfulOutcome {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_NG_SETUP),
+        criticality: ngap_gen::Criticality(ngap_gen::Criticality::REJECT),
+        value: ngap_gen::UnsuccessfulOutcomeValue::Id_NGSetup(NGSetupFailure {
+            protocol_i_es: NGSetupFailureProtocolIEs(ies),
+        }),
+    });
+
+    match nextgcore_ngap_gen::encode(&pdu) {
         Ok(bytes) => {
             log::debug!("Built NG Setup Failure: {} bytes", bytes.len());
             bytes
@@ -148,6 +239,75 @@ pub fn build_ng_setup_failure_asn1(
             Vec::new()
         }
     }
+}
+
+/// The low `n` bits of `value`, most significant first -- the generated
+/// codec's fixed-size BIT STRING. Truncates exactly as the hand-written
+/// encoder's `write_bits` did, so an out-of-range AMF Set ID keeps its wire form.
+fn low_bits(value: u64, n: usize) -> bitvec::vec::BitVec<u8, bitvec::order::Msb0> {
+    (0..n).rev().map(|i| (value >> i) & 1 == 1).collect()
+}
+
+/// An AMF-context S-NSSAI as the generated `S-NSSAI` (TS 38.413 §9.3.1.24).
+fn generated_s_nssai(s_nssai: &crate::context::SNssai) -> ngap_gen::S_NSSAI {
+    ngap_gen::S_NSSAI {
+        sst: ngap_gen::SST(vec![s_nssai.sst]),
+        sd: s_nssai.sd.map(|sd| {
+            ngap_gen::SD(vec![
+                ((sd >> 16) & 0xFF) as u8,
+                ((sd >> 8) & 0xFF) as u8,
+                (sd & 0xFF) as u8,
+            ])
+        }),
+        ie_extensions: None,
+    }
+}
+
+/// The hand-written [`Cause`] as the generated one, carrying each value over as
+/// its wire number -- or `None` when the value lies past the schema's ROOT
+/// enumeration, which the generated codec cannot yet encode. The bounds are the
+/// generated types' own `ub` attributes (TS 38.413 §9.3.1.2 root lists).
+fn generated_cause(cause: Cause) -> Option<ngap_gen::Cause> {
+    let within = |v: u8, root_max: u8| (v <= root_max).then_some(v);
+    Some(match cause {
+        Cause::RadioNetwork(v) => {
+            ngap_gen::Cause::RadioNetwork(ngap_gen::CauseRadioNetwork(within(v as u8, 44)?))
+        }
+        Cause::Transport(v) => {
+            ngap_gen::Cause::Transport(ngap_gen::CauseTransport(within(v as u8, 1)?))
+        }
+        Cause::Nas(v) => ngap_gen::Cause::Nas(ngap_gen::CauseNas(within(v as u8, 3)?)),
+        Cause::Protocol(v) => {
+            ngap_gen::Cause::Protocol(ngap_gen::CauseProtocol(within(v as u8, 6)?))
+        }
+        Cause::Misc(v) => ngap_gen::Cause::Misc(ngap_gen::CauseMisc(within(v as u8, 5)?)),
+    })
+}
+
+/// The hand-written NG Setup Failure encoder, kept ONLY for the extension cause
+/// values [`generated_cause`] cannot carry (see [`build_ng_setup_failure_asn1`]).
+fn hand_written_ng_setup_failure(
+    cause_group: u8,
+    cause_value: i64,
+    time_to_wait: Option<u8>,
+) -> Vec<u8> {
+    let ttw = time_to_wait.map(|ttw| match ttw {
+        0 => TimeToWait::V1s,
+        1 => TimeToWait::V2s,
+        2 => TimeToWait::V5s,
+        3 => TimeToWait::V10s,
+        4 => TimeToWait::V20s,
+        _ => TimeToWait::V60s,
+    });
+    let msg = NgSetupFailure {
+        cause: build_cause(cause_group, cause_value),
+        time_to_wait: ttw,
+        criticality_diagnostics: None,
+    };
+    builder::build_ng_setup_failure(&msg).unwrap_or_else(|e| {
+        log::error!("Failed to encode NG Setup Failure: {e:?}");
+        Vec::new()
+    })
 }
 
 /// Build Cause from group and value
@@ -1154,6 +1314,425 @@ mod tests {
             s_nssai: vec![SNssai { sst: 1, sd: None }],
         });
         ctx
+    }
+
+    /// The hand-written NG Setup encoders exactly as they were before #417
+    /// stage 2 moved the family onto the generated codec -- kept verbatim as the
+    /// ORACLE the generated output is compared against, byte for byte.
+    mod hand_written_oracle {
+        use super::super::*;
+
+        /// Build an NG Setup Response PDU with proper ASN.1 APER encoding
+        ///
+        /// This is sent by AMF to gNB in response to a successful NG Setup Request.
+        /// The message follows 3GPP TS 38.413 Section 9.2.6.2.
+        pub(super) fn hand_written_ng_setup_response(ctx: &AmfContext) -> Option<Vec<u8>> {
+            let amf_name = ctx.amf_name.as_deref().unwrap_or("AMF").to_string();
+
+            let served_guami_list = ctx
+                .served_guami
+                .iter()
+                .take(ctx.num_of_served_guami)
+                .map(|guami| {
+                    let plmn_bytes = encode_plmn_id(&guami.plmn_id);
+                    ServedGuamiItem {
+                        guami: Guami {
+                            plmn_identity: plmn_bytes,
+                            amf_region_id: guami.amf_id.region,
+                            amf_set_id: guami.amf_id.set,
+                            amf_pointer: guami.amf_id.pointer,
+                        },
+                        backup_amf_name: None,
+                    }
+                })
+                .collect();
+
+            let plmn_support_list = ctx
+                .plmn_support
+                .iter()
+                .take(ctx.num_of_plmn_support)
+                .map(|plmn_support| {
+                    let plmn_bytes = encode_plmn_id(&plmn_support.plmn_id);
+                    let slice_support_list = plmn_support
+                        .s_nssai
+                        .iter()
+                        .take(plmn_support.num_of_s_nssai)
+                        .map(|s_nssai| {
+                            let sd = s_nssai.sd.map(|sd_val| {
+                                [
+                                    ((sd_val >> 16) & 0xFF) as u8,
+                                    ((sd_val >> 8) & 0xFF) as u8,
+                                    (sd_val & 0xFF) as u8,
+                                ]
+                            });
+                            SNssai {
+                                sst: s_nssai.sst,
+                                sd,
+                            }
+                        })
+                        .collect();
+                    PlmnSupportItem {
+                        plmn_identity: plmn_bytes,
+                        slice_support_list,
+                    }
+                })
+                .collect();
+
+            // amfd-09 (TS 38.413 §9.2.6.2): a strict-peer gNB needs a non-empty
+            // PLMNSupportList with slice support for load-balancing / slice selection.
+            // An empty list is an AMF misconfiguration; surface it loudly at build time
+            // rather than letting the gNB reject the response on the wire.
+            if ctx.num_of_plmn_support == 0 {
+                log::error!(
+                    "NG Setup Response built with an EMPTY PLMNSupportList \
+                     (num_of_plmn_support=0); check AMF slice configuration"
+                );
+                debug_assert!(
+                    ctx.num_of_plmn_support > 0,
+                    "NGSetupResponse PLMNSupportList must not be empty (TS 38.413 §9.2.6.2)"
+                );
+            }
+
+            let msg = NgSetupResponse {
+                amf_name,
+                served_guami_list,
+                relative_amf_capacity: ctx.relative_capacity,
+                plmn_support_list,
+            };
+
+            match builder::build_ng_setup_response(&msg) {
+                Ok(bytes) => {
+                    log::debug!(
+                        "Built NG Setup Response: {} bytes, hex: {:02x?}",
+                        bytes.len(),
+                        &bytes[..bytes.len().min(32)]
+                    );
+                    Some(bytes)
+                }
+                Err(e) => {
+                    log::error!("Failed to encode NG Setup Response: {e:?}");
+                    None
+                }
+            }
+        }
+
+        /// Build an NG Setup Failure PDU with proper ASN.1 APER encoding
+        ///
+        /// This is sent by AMF to gNB when NG Setup fails.
+        /// The message follows 3GPP TS 38.413 Section 9.2.6.3.
+        pub(super) fn hand_written_ng_setup_failure(
+            cause_group: u8,
+            cause_value: i64,
+            time_to_wait: Option<u8>,
+        ) -> Vec<u8> {
+            let cause = build_cause(cause_group, cause_value);
+
+            let ttw = time_to_wait.map(|ttw| match ttw {
+                0 => TimeToWait::V1s,
+                1 => TimeToWait::V2s,
+                2 => TimeToWait::V5s,
+                3 => TimeToWait::V10s,
+                4 => TimeToWait::V20s,
+                _ => TimeToWait::V60s,
+            });
+
+            let msg = NgSetupFailure {
+                cause,
+                time_to_wait: ttw,
+                criticality_diagnostics: None,
+            };
+
+            match builder::build_ng_setup_failure(&msg) {
+                Ok(bytes) => {
+                    log::debug!("Built NG Setup Failure: {} bytes", bytes.len());
+                    bytes
+                }
+                Err(e) => {
+                    log::error!("Failed to encode NG Setup Failure: {e:?}");
+                    Vec::new()
+                }
+            }
+        }
+    }
+
+    /// A context exercising every field the Response encodes: several GUAMIs
+    /// at the bit-width edges, 2- and 3-digit MNCs, slices with and without SD.
+    fn rich_context() -> AmfContext {
+        let mut ctx = AmfContext::new();
+        ctx.amf_name = Some("nextgcore_amf-0 west".to_string());
+        ctx.relative_capacity = 0;
+        for (plmn, region, set, pointer) in [
+            (PlmnId::new("001", "01"), 0u8, 0u16, 0u8),
+            (PlmnId::new("310", "260"), 255, 1023, 63),
+            (PlmnId::new("999", "70"), 0x5a, 0x2a5, 0x15),
+        ] {
+            ctx.served_guami.push(Guami {
+                plmn_id: plmn,
+                amf_id: AmfId {
+                    region,
+                    set,
+                    pointer,
+                },
+            });
+        }
+        ctx.num_of_served_guami = 3;
+        ctx.plmn_support.push(PlmnSupport {
+            plmn_id: PlmnId::new("001", "01"),
+            num_of_s_nssai: 3,
+            s_nssai: vec![
+                SNssai { sst: 1, sd: None },
+                SNssai {
+                    sst: 2,
+                    sd: Some(0x000001),
+                },
+                SNssai {
+                    sst: 255,
+                    sd: Some(0xffffff),
+                },
+            ],
+        });
+        ctx.plmn_support.push(PlmnSupport {
+            plmn_id: PlmnId::new("310", "260"),
+            num_of_s_nssai: 1,
+            s_nssai: vec![SNssai {
+                sst: 3,
+                sd: Some(0x123456),
+            }],
+        });
+        ctx.num_of_plmn_support = 2;
+        ctx
+    }
+
+    /// #417 stage 2: the generated Response is byte-identical to the
+    /// hand-written one across every shape the AMF context can take.
+    #[test]
+    fn ng_setup_generated_matches_hand_written_response() {
+        let mut cases = vec![create_test_context(), rich_context()];
+
+        let mut no_name = create_test_context();
+        no_name.amf_name = None; // falls back to "AMF"
+        cases.push(no_name);
+
+        // Values wider than their BIT STRING: both encoders keep the low bits.
+        let mut overwide = create_test_context();
+        overwide.served_guami[0].amf_id.set = 1024 + 5;
+        overwide.served_guami[0].amf_id.pointer = 64 + 3;
+        cases.push(overwide);
+
+        // `take(num_of_*)` bounds the lists, not their Vec length.
+        let mut truncated = rich_context();
+        truncated.num_of_served_guami = 2;
+        truncated.plmn_support[0].num_of_s_nssai = 1;
+        cases.push(truncated);
+
+        // An empty ServedGUAMIList violates SIZE(1..256): both refuse.
+        let mut no_guami = create_test_context();
+        no_guami.num_of_served_guami = 0;
+        cases.push(no_guami);
+
+        // Over-long AMF name (SIZE(1..150, ...)): both refuse.
+        let mut long_name = create_test_context();
+        long_name.amf_name = Some("a".repeat(151));
+        cases.push(long_name);
+
+        // An empty PLMNSupportList / SliceSupportList: both refuse. (Built with
+        // a non-zero num_of_plmn_support so the amfd-09 debug_assert is not hit.)
+        let mut no_slices = create_test_context();
+        no_slices.plmn_support[0].num_of_s_nssai = 0;
+        cases.push(no_slices);
+
+        // Upper bounds: 13 PLMNs (SIZE(1..12)) and 257 GUAMIs (SIZE(1..256)).
+        let mut many_plmns = create_test_context();
+        let first = many_plmns.plmn_support[0].clone();
+        many_plmns.plmn_support = vec![first; 13];
+        many_plmns.num_of_plmn_support = 13;
+        cases.push(many_plmns);
+        let mut many_guamis = create_test_context();
+        let first = many_guamis.served_guami[0].clone();
+        many_guamis.served_guami = vec![first; 257];
+        many_guamis.num_of_served_guami = 257;
+        cases.push(many_guamis);
+
+        // At the upper bounds exactly: both encode.
+        let mut at_bounds = create_test_context();
+        let first = at_bounds.plmn_support[0].clone();
+        at_bounds.plmn_support = vec![first; 12];
+        at_bounds.num_of_plmn_support = 12;
+        let first = at_bounds.served_guami[0].clone();
+        at_bounds.served_guami = vec![first; 256];
+        at_bounds.num_of_served_guami = 256;
+        at_bounds.amf_name = Some("a".repeat(150));
+        cases.push(at_bounds);
+
+        for (i, ctx) in cases.iter().enumerate() {
+            assert_eq!(
+                build_ng_setup_response_asn1(ctx),
+                hand_written_oracle::hand_written_ng_setup_response(ctx),
+                "case {i}: generated NG Setup Response differs from hand-written"
+            );
+        }
+        for refused in [5, 6, 7, 8, 9] {
+            assert!(
+                build_ng_setup_response_asn1(&cases[refused]).is_none(),
+                "case {refused}"
+            );
+        }
+        assert!(
+            build_ng_setup_response_asn1(&cases[10]).is_some(),
+            "at bounds"
+        );
+    }
+
+    /// #417 stage 2: the generated Failure is byte-identical to the
+    /// hand-written one for every cause group, in- and out-of-range values
+    /// (including radioNetwork extension values 45/46), and every TimeToWait.
+    #[test]
+    fn ng_setup_generated_matches_hand_written_failure() {
+        let values: [i64; 18] = [
+            -1, 0, 1, 2, 3, 4, 5, 6, 7, 20, 44, 45, 46, 47, 200, 255, 256, 1000,
+        ];
+        let waits = [
+            None,
+            Some(0),
+            Some(1),
+            Some(2),
+            Some(3),
+            Some(4),
+            Some(5),
+            Some(6),
+            Some(255),
+        ];
+        for group in 0u8..=6 {
+            for &value in &values {
+                for &ttw in &waits {
+                    assert_eq!(
+                        build_ng_setup_failure_asn1(group, value, ttw),
+                        hand_written_oracle::hand_written_ng_setup_failure(group, value, ttw),
+                        "group {group} value {value} ttw {ttw:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The fallback emits the same bytes, so equivalence alone cannot show the
+    /// generated codec is actually used. Pin which path each cause takes: every
+    /// ROOT value the AMF can produce goes through the generated codec, and only
+    /// the radioNetwork extension values 45/46 fall back.
+    #[test]
+    fn ng_setup_failure_root_causes_take_the_generated_codec() {
+        for (group, root_max) in [(0u8, 44i64), (1, 1), (2, 3), (3, 6), (4, 5)] {
+            for value in 0..=root_max {
+                assert!(
+                    generated_cause(build_cause(group, value)).is_some(),
+                    "group {group} value {value} must encode through the generated codec"
+                );
+            }
+        }
+        for value in [45, 46] {
+            assert!(
+                generated_cause(build_cause(0, value)).is_none(),
+                "radioNetwork {value}"
+            );
+        }
+        // The two causes the NG Setup handler actually sends (ngap_handler.rs).
+        assert!(
+            generated_cause(build_cause(3, 4)).is_some(),
+            "protocol/semantic-error"
+        );
+        assert!(
+            generated_cause(build_cause(4, 4)).is_some(),
+            "misc/unknown-PLMN-or-SNPN"
+        );
+    }
+
+    /// Golden bytes, so the equivalence above cannot pass by both encoders
+    /// drifting together. Byte 0 is the CHOICE index (1 = successfulOutcome,
+    /// 2 = unsuccessfulOutcome) and byte 1 the procedure code, id-NGSetup = 21.
+    #[test]
+    fn ng_setup_generated_golden_bytes() {
+        let response = build_ng_setup_response_asn1(&create_test_context()).expect("build");
+        assert_eq!(hex(&response), GOLDEN_RESPONSE);
+        assert_eq!(
+            response[0], 0x20,
+            "successfulOutcome CHOICE index in byte 0"
+        );
+        assert_eq!(response[1], 21, "id-NGSetup");
+
+        let failure = build_ng_setup_failure_asn1(4, 4, Some(2));
+        assert_eq!(hex(&failure), GOLDEN_FAILURE);
+        assert_eq!(
+            failure[0], 0x40,
+            "unsuccessfulOutcome CHOICE index in byte 0"
+        );
+        assert_eq!(failure[1], 21, "id-NGSetup");
+    }
+
+    const GOLDEN_RESPONSE: &str =
+        "2015002e0000040001000a0380414d462d5465737400600008000099f90702004000564001ff005000080099f90700000008";
+    const GOLDEN_FAILURE: &str = "4015000d000002000f400188006b400120";
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Why the NG Setup REQUEST is still decoded by the hand-written parser:
+    /// TS 38.413 §10.3.4 requires a receiver to ignore a not-comprehended IE
+    /// marked "ignore" and continue the procedure, and the generated OPEN-type
+    /// decoder instead fails the whole PDU on any IE id outside the schema. An
+    /// AMF on the generated decoder would refuse NG Setup from any gNB newer
+    /// than Rel-17.9 that adds an optional IE. This pins that ceiling; when the
+    /// forked decoder learns to skip unknown ignorable IEs, it fails and the
+    /// parse can move too.
+    #[test]
+    fn generated_decoder_rejects_an_ignorable_unknown_ie_so_parse_stays_hand_written() {
+        let request = nextgcore_ngap::builder::build_ng_setup_request(&NgSetupRequest {
+            global_ran_node_id: GlobalRanNodeId::GlobalGnbId {
+                plmn_identity: [0x99, 0xf9, 0x07],
+                gnb_id: 1,
+                gnb_id_len: 32,
+            },
+            ran_node_name: None,
+            supported_ta_list: vec![SupportedTaItem {
+                tac: [0, 0, 1],
+                broadcast_plmn_list: vec![BroadcastPlmnItem {
+                    plmn_identity: [0x99, 0xf9, 0x07],
+                    tai_slice_support_list: vec![nextgcore_ngap::types::SNssai {
+                        sst: 1,
+                        sd: None,
+                    }],
+                }],
+            }],
+            default_paging_drx: PagingDrx::V128,
+        })
+        .expect("build request");
+        assert!(
+            nextgcore_ngap_gen::decode(&request).is_ok(),
+            "baseline decodes"
+        );
+
+        // Splice in IE id 9999, criticality ignore, a one-octet value. Layout:
+        // [0]=CHOICE, [1]=procedure code, [2]=criticality, [3]=open-type
+        // length (short form), [4]=SEQUENCE extension bit + padding, [5..7]=IE
+        // count, then the IEs.
+        let mut spliced = request.clone();
+        assert!(
+            spliced[3] < 0x7b,
+            "short-form length leaves room for 5 octets"
+        );
+        let count = u16::from_be_bytes([spliced[5], spliced[6]]) + 1;
+        spliced[5..7].copy_from_slice(&count.to_be_bytes());
+        spliced.extend_from_slice(&[0x27, 0x0f, 0x40, 0x01, 0x00]);
+        spliced[3] += 5;
+
+        assert!(
+            parse_ng_setup_request_asn1(&spliced).is_some(),
+            "hand-written parser ignores the unknown ignorable IE (§10.3.4)"
+        );
+        assert!(
+            nextgcore_ngap_gen::decode(&spliced).is_err(),
+            "generated decoder fails the whole PDU on an unknown IE id"
+        );
     }
 
     #[test]

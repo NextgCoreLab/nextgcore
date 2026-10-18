@@ -15,10 +15,17 @@
 //! So a PDU whose byte 0 is not the CHOICE index cannot be produced at all. With
 //! a hand-written codec that is only true while someone keeps asserting it.
 //!
-//! **Stage 1 moves no call sites.** `nextgcore-ngap` and `nextgcore-asn1c`'s
-//! `ngap` module remain the codecs the daemons use. This crate exists so that
-//! later stages can migrate one procedure family at a time against a codec that
-//! is already built and tested in the workspace.
+//! Stage 1 added this crate with no call sites. Stage 2 moved the first family:
+//! amfd's NG Setup Response and NG Setup Failure encoders. Everything else still
+//! goes through `nextgcore-ngap` and `nextgcore-asn1c`'s `ngap` module.
+//!
+//! Two limits of the generated codec that every later family must handle,
+//! found by stage 2's byte-equivalence tests: it does not enforce the SIZE
+//! bounds of a SEQUENCE OF (an empty or over-long list encodes without error),
+//! and it cannot encode an ENUMERATED value past the root (so Cause extension
+//! values such as radioNetwork 45/46 fail to encode). Its decoder also fails
+//! the whole PDU on an IE id outside the schema, where TS 38.413 §10.3.4 says
+//! to ignore a not-comprehended IE marked "ignore".
 
 /// The generated NGAP types. Names follow the ASN.1 with hyphens mapped to
 /// underscores (`NGAP-PDU` is [`generated::NGAP_PDU`]), so the usual naming
