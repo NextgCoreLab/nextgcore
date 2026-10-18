@@ -53,7 +53,7 @@ extern "C" {
         len: libc::size_t,
         from: *mut sockaddr,
         fromlen: *mut socklen_t,
-        sinfo: *mut SctpSndRcvInfo,
+        sinfo: *mut libc::sctp_sndrcvinfo,
         msg_flags: *mut c_int,
     ) -> c_int;
 }
@@ -62,22 +62,20 @@ extern "C" {
 // SCTP Constants
 // ============================================================================
 
-/// SCTP socket option level
+/// SCTP socket option level. `libc` defines `SOL_SCTP` for Android only, not
+/// for Linux, so it stays local; it equals `IPPROTO_SCTP` by definition.
 pub const SOL_SCTP: c_int = 132;
 
-/// SCTP socket options
-pub const SCTP_EVENTS: c_int = 11;
-pub const SCTP_INITMSG: c_int = 2;
-pub const SCTP_NODELAY: c_int = 3;
-pub const SCTP_RTOINFO: c_int = 0;
-pub const SCTP_PEER_ADDR_PARAMS: c_int = 9;
+/// SCTP socket options, re-exported from `libc` rather than transcribed (#209
+/// in nextgsim): one definition, the one `<linux/sctp.h>` is checked against.
+pub use libc::{SCTP_EVENTS, SCTP_INITMSG, SCTP_NODELAY, SCTP_PEER_ADDR_PARAMS, SCTP_RTOINFO};
 
-/// SCTP notification types
+/// SCTP notification types (`enum sctp_sn_type`). Not in `libc`.
 pub const SCTP_ASSOC_CHANGE: u16 = 1;
 pub const SCTP_PEER_ADDR_CHANGE: u16 = 2;
 pub const SCTP_SHUTDOWN_EVENT: u16 = 5;
 
-/// SCTP association change states
+/// SCTP association change states (`enum sctp_sac_state`). Not in `libc`.
 pub const SCTP_COMM_UP: u16 = 0;
 pub const SCTP_COMM_LOST: u16 = 1;
 pub const SCTP_RESTART: u16 = 2;
@@ -87,18 +85,21 @@ pub const SCTP_CANT_STR_ASSOC: u16 = 4;
 // ============================================================================
 // SCTP Structures (matching kernel ABI)
 // ============================================================================
+//
+// `sctp_initmsg` and `sctp_sndrcvinfo` are used straight from `libc`: they were
+// hand-transcribed here until 2026-10-18, and the transcription is what let
+// `sinfo_assoc_id` sit as `u32` instead of the signed `sctp_assoc_t` until
+// #429. The unused `SctpRtoinfo` copy, which carried the same unsigned
+// `srto_assoc_id` defect, was deleted rather than fixed. Only
+// `sctp_event_subscribe` remains local, because `libc` does not define it.
 
-/// SCTP initialization message
-#[repr(C)]
-#[derive(Debug, Clone, Default)]
-pub struct SctpInitmsg {
-    pub sinit_num_ostreams: u16,
-    pub sinit_max_instreams: u16,
-    pub sinit_max_attempts: u16,
-    pub sinit_max_init_timeo: u16,
-}
-
-/// SCTP event subscribe (simplified for common events)
+/// SCTP event subscription (`struct sctp_event_subscribe`, `<linux/sctp.h>`).
+///
+/// Every member is a `__u8` flag. Not in `libc`, so this is the one SCTP struct
+/// still transcribed; `event_subscribe_layout_matches_the_kernel` pins it. The
+/// kernel copies `min(optlen, sizeof(kernel struct))`, so this 14-member form
+/// (through `sctp_send_failure_event_event`) is accepted by older
+/// kernels too.
 #[repr(C)]
 #[derive(Debug, Clone, Default)]
 pub struct SctpEventSubscribe {
@@ -116,40 +117,6 @@ pub struct SctpEventSubscribe {
     pub sctp_assoc_reset_event: u8,
     pub sctp_stream_change_event: u8,
     pub sctp_send_failure_event_event: u8,
-}
-
-/// SCTP send/receive info
-///
-/// `sinfo_assoc_id` is `sctp_assoc_t`, which `<linux/sctp.h>` typedefs as
-/// `__s32` — SIGNED. It was `u32` here until 2026-09-29. The struct size and
-/// every other field's offset are unaffected (it is the trailing member), and
-/// `recv_msg` below reads only `sinfo_ppid`/`sinfo_stream`, so nothing
-/// misbehaved; but a negative association id read through the unsigned type
-/// would have appeared as a huge positive number, and `-1` is exactly what
-/// lksctp reports for a one-to-one socket with no association. nextgsim's
-/// independent transcription of the same kernel struct had it right.
-#[repr(C)]
-#[derive(Debug, Clone, Default)]
-pub struct SctpSndRcvInfo {
-    pub sinfo_stream: u16,
-    pub sinfo_ssn: u16,
-    pub sinfo_flags: u16,
-    pub sinfo_ppid: u32,
-    pub sinfo_context: u32,
-    pub sinfo_timetolive: u32,
-    pub sinfo_tsn: u32,
-    pub sinfo_cumtsn: u32,
-    pub sinfo_assoc_id: libc::c_int,
-}
-
-/// SCTP RTO info
-#[repr(C)]
-#[derive(Debug, Clone, Default)]
-pub struct SctpRtoinfo {
-    pub srto_assoc_id: u32,
-    pub srto_initial: u32,
-    pub srto_max: u32,
-    pub srto_min: u32,
 }
 
 // ============================================================================
@@ -322,7 +289,17 @@ impl KernelSctpSocket {
     /// raw `msg_flags`. `msg_flags & MSG_NOTIFICATION` marks an SCTP event
     /// notification (e.g. shutdown / association change) rather than user data.
     pub fn recv_msg(&self, buf: &mut [u8]) -> Result<(usize, NextgcoreSctpInfo, i32)> {
-        let mut sinfo = SctpSndRcvInfo::default();
+        let mut sinfo = libc::sctp_sndrcvinfo {
+            sinfo_stream: 0,
+            sinfo_ssn: 0,
+            sinfo_flags: 0,
+            sinfo_ppid: 0,
+            sinfo_context: 0,
+            sinfo_timetolive: 0,
+            sinfo_tsn: 0,
+            sinfo_cumtsn: 0,
+            sinfo_assoc_id: 0,
+        };
         let mut msg_flags: c_int = 0;
 
         let received = unsafe {
@@ -332,7 +309,7 @@ impl KernelSctpSocket {
                 buf.len(),
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut sinfo as *mut SctpSndRcvInfo,
+                &mut sinfo as *mut libc::sctp_sndrcvinfo,
                 &mut msg_flags as *mut c_int,
             )
         };
@@ -506,7 +483,7 @@ impl KernelSctpSocket {
         max_attempts: u16,
         max_init_timeo: u16,
     ) -> Result<()> {
-        let initmsg = SctpInitmsg {
+        let initmsg = libc::sctp_initmsg {
             sinit_num_ostreams: num_ostreams,
             sinit_max_instreams: max_instreams,
             sinit_max_attempts: max_attempts,
@@ -519,7 +496,7 @@ impl KernelSctpSocket {
                 SOL_SCTP,
                 SCTP_INITMSG,
                 &initmsg as *const _ as *const c_void,
-                mem::size_of::<SctpInitmsg>() as socklen_t,
+                mem::size_of::<libc::sctp_initmsg>() as socklen_t,
             )
         };
 
@@ -603,51 +580,25 @@ fn sockaddr_to_socketaddr(storage: &libc::sockaddr_storage, len: socklen_t) -> R
 mod tests {
     use super::*;
 
+    /// `SctpEventSubscribe` is the one SCTP struct `libc` lacks, so it is still
+    /// transcribed and handed to `setsockopt` by size: a dropped, reordered or
+    /// widened member shifts every flag after it and silently subscribes the
+    /// wrong events. Pin the size, the alignment and the offsets of the three
+    /// members `set_sctp_events` sets against `<linux/sctp.h>`.
     #[test]
-    fn test_sctp_initmsg_size() {
-        assert_eq!(mem::size_of::<SctpInitmsg>(), 8);
-    }
-
-    /// `SctpSndRcvInfo` is hand-transcribed from `<linux/sctp.h>` and handed to
-    /// `sctp_recvmsg` as a raw pointer, so a field-type mismatch is undetectable
-    /// at compile time and silent at runtime. Pin it against `libc`'s own
-    /// `sctp_sndrcvinfo` rather than against literals: a size-only assertion
-    /// passes with `sinfo_assoc_id` declared `u32` instead of the signed
-    /// `sctp_assoc_t` (`__s32`), which is the defect this test was added for.
-    #[test]
-    fn sndrcvinfo_matches_libc_abi() {
+    fn event_subscribe_layout_matches_the_kernel() {
+        assert_eq!(mem::size_of::<SctpEventSubscribe>(), 14);
+        assert_eq!(mem::align_of::<SctpEventSubscribe>(), 1);
+        assert_eq!(mem::offset_of!(SctpEventSubscribe, sctp_data_io_event), 0);
         assert_eq!(
-            mem::size_of::<SctpSndRcvInfo>(),
-            mem::size_of::<libc::sctp_sndrcvinfo>(),
-            "SctpSndRcvInfo size diverged from the kernel ABI"
+            mem::offset_of!(SctpEventSubscribe, sctp_association_event),
+            1
         );
+        assert_eq!(mem::offset_of!(SctpEventSubscribe, sctp_address_event), 2);
+        assert_eq!(mem::offset_of!(SctpEventSubscribe, sctp_shutdown_event), 5);
         assert_eq!(
-            mem::align_of::<SctpSndRcvInfo>(),
-            mem::align_of::<libc::sctp_sndrcvinfo>(),
-            "SctpSndRcvInfo alignment diverged from the kernel ABI"
-        );
-
-        // Assign libc's value THROUGH our field: this fails to compile if the
-        // types differ, which is what a size assertion cannot catch.
-        let reference = libc::sctp_sndrcvinfo {
-            sinfo_stream: 1,
-            sinfo_ssn: 2,
-            sinfo_flags: 3,
-            sinfo_ppid: 4,
-            sinfo_context: 5,
-            sinfo_timetolive: 6,
-            sinfo_tsn: 7,
-            sinfo_cumtsn: 8,
-            sinfo_assoc_id: -1,
-        };
-        let ours = SctpSndRcvInfo {
-            sinfo_assoc_id: reference.sinfo_assoc_id,
-            ..Default::default()
-        };
-        assert_eq!(
-            ours.sinfo_assoc_id, -1,
-            "sinfo_assoc_id must round-trip a negative association id: lksctp \
-             reports -1 for a one-to-one socket with no association"
+            mem::offset_of!(SctpEventSubscribe, sctp_send_failure_event_event),
+            13
         );
     }
 
