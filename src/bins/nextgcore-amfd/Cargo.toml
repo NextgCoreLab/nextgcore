@@ -49,6 +49,10 @@ nextgcore-proto = { workspace = true, optional = true }
 # had no reader anywhere.
 nextgcore-gtp = { workspace = true }
 nextgcore-ngap = { workspace = true }
+# #417: the NGAP codec generated from TS 38.413, migrating one family at a time.
+nextgcore-ngap-gen = { workspace = true }
+# The generated fixed-size BIT STRINGs are bitvec types (AMF Region/Set/Pointer).
+bitvec = { workspace = true }
 nextgcore-sbi = { workspace = true }
 nextgcore-sctp = { workspace = true }
 nextgcore-app = { workspace = true }
