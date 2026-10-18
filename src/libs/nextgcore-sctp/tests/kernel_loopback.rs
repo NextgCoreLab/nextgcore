@@ -12,8 +12,10 @@
 //!   * the server `send` path reaches the client,
 //!   * client close surfaces as `AssociationClosed`.
 //!
-//! Linux + libsctp only; compiles to nothing elsewhere.
-#![cfg(all(feature = "kernel", target_os = "linux"))]
+//! Linux + libsctp only; compiles to nothing elsewhere. Needs `sctp-proto` as
+//! well as `kernel`, because `KernelSctpServer` reuses the userspace server's
+//! event types and is gated on both (lib.rs).
+#![cfg(all(feature = "kernel", feature = "sctp-proto", target_os = "linux"))]
 
 use std::sync::Arc;
 use std::time::Duration;
