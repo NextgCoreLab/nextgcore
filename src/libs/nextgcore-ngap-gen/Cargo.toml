@@ -1,0 +1,25 @@
+[package]
+name = "nextgcore-ngap-gen"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore NGAP APER codec generated from the TS 38.413 ASN.1 (#417)"
+
+[dependencies]
+asn1-codecs.workspace = true
+asn1_codecs_derive.workspace = true
+bitvec.workspace = true
+# Direct, not transitive: the AperCodec derive expands to `log::` paths inside
+# the generated code, so this crate must name `log` itself. Without it the build
+# fails with ~2,479 E0433s that read as a schema problem and are not.
+log.workspace = true
+
+[build-dependencies]
+asn1-compiler.workspace = true
+
+[dev-dependencies]
+nextgcore-ngap.workspace = true
+
+[lints]
+workspace = true
