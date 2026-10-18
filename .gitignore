@@ -22,3 +22,7 @@ docker/rust/artifacts/
 # silently produces images that do not match the source.
 # deploy/eks/build-and-push.sh checks for these and fails loudly if absent.
 /binaries/
+
+# Python bytecode (deploy/eks/lib tests, #436)
+__pycache__/
+*.pyc
