@@ -51,6 +51,16 @@ use crate::{ReceivedMessage, SctpError, MSG_NOTIFICATION, NEXTGCORE_MAX_SDU_LEN}
 
 type Result<T> = std::result::Result<T, ServerError>;
 
+/// Name the application protocol a server carries, for its log lines, from the
+/// PPID it is configured with (TS 38.412 §7: NGAP 60; TS 36.412 §7: S1AP 18).
+fn protocol_name(ppid: u32) -> &'static str {
+    match ppid {
+        crate::NGAP_PPID => "NGAP",
+        crate::NEXTGCORE_SCTP_S1AP_PPID => "S1AP",
+        _ => "SCTP",
+    }
+}
+
 /// Borrowed-fd shim so a tokio [`AsyncFd`] can track readiness on a descriptor
 /// *without owning* it. The real `OwnedFd` lives in the [`KernelSctpSocket`]
 /// behind an `Arc`; dropping the `AsyncFd` only deregisters from the reactor
@@ -71,7 +81,8 @@ struct Assoc {
     remote: SocketAddr,
 }
 
-/// Native kernel-SCTP NGAP server.
+/// Native kernel-SCTP server, used for NGAP (amfd) and S1AP (mmed S1-MME);
+/// the protocol is selected by [`SctpServerConfig::ppid`].
 pub struct KernelSctpServer {
     listener: Arc<KernelSctpSocket>,
     local_addr: SocketAddr,
@@ -89,7 +100,11 @@ impl KernelSctpServer {
         listener.set_nonblocking(true).map_err(sctp_to_server_err)?;
         let local_addr = listener.local_addr();
 
-        log::info!("Kernel-SCTP NGAP server listening on {local_addr} (native one-to-one SCTP)");
+        log::info!(
+            "Kernel-SCTP {} server listening on {local_addr} (native one-to-one SCTP, PPID {})",
+            protocol_name(config.ppid),
+            config.ppid
+        );
 
         Ok(Self {
             listener: Arc::new(listener),

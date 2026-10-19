@@ -6,6 +6,36 @@ use super::ies::ProtocolIeContainer;
 use super::types::{Criticality, ProcedureCode};
 use crate::per::{AperDecode, AperDecoder, AperEncode, AperEncoder, PerError, PerResult};
 
+/// Encode the body of an S1AP elementary-procedure message value as the open
+/// type's content.
+///
+/// Every S1AP message is defined as an extensible SEQUENCE
+/// `{ protocolIEs ProtocolIE-Container {...}, ... }` (TS 36.413 §9.3.3). Per
+/// X.691 §19.1 an extensible SEQUENCE starts with a single extension bit
+/// (0 = no extension additions present) before its root component, the IE
+/// container. The open-type framing then octet-aligns the content (§11.2).
+fn encode_message_value<V: AperEncode>(value: &V) -> PerResult<Vec<u8>> {
+    let mut value_encoder = AperEncoder::new();
+    // SEQUENCE extension bit: no extension additions present (X.691 §19.1)
+    value_encoder.write_bit(false);
+    value.encode_aper(&mut value_encoder)?;
+    value_encoder.align();
+    Ok(value_encoder.into_bytes().to_vec())
+}
+
+/// Open a decoder over an S1AP message value and consume the extensible
+/// SEQUENCE's extension bit, leaving it positioned at the IE container.
+///
+/// The bit is read and not acted on: S1AP messages carry their later additions
+/// as further ProtocolIE-Container entries, never as SEQUENCE extension
+/// additions, and any such additions would trail the container inside the
+/// already length-bounded open type.
+fn message_value_decoder(value_bytes: &[u8]) -> PerResult<AperDecoder<'_>> {
+    let mut value_decoder = AperDecoder::new(value_bytes);
+    let _ext = value_decoder.read_bit()?;
+    Ok(value_decoder)
+}
+
 /// S1AP-PDU - Top-level PDU for all S1AP messages
 /// ASN.1: S1AP-PDU ::= CHOICE { initiatingMessage, successfulOutcome, unsuccessfulOutcome }
 #[derive(Debug, Clone, PartialEq)]
@@ -94,15 +124,13 @@ pub enum InitiatingMessageValue {
 
 impl AperEncode for InitiatingMessage {
     fn encode_aper(&self, encoder: &mut AperEncoder) -> PerResult<()> {
-        // SEQUENCE with no extension marker in root
+        // InitiatingMessage itself is a non-extensible SEQUENCE (TS 36.413
+        // S1AP-PDU-Descriptions): no extension bit before procedureCode.
         self.procedure_code.encode_aper(encoder)?;
         self.criticality.encode_aper(encoder)?;
 
         // Value is encoded as OPEN TYPE (length + content)
-        let mut value_encoder = AperEncoder::new();
-        self.value.encode_aper(&mut value_encoder)?;
-        value_encoder.align();
-        let value_bytes = value_encoder.into_bytes();
+        let value_bytes = encode_message_value(&self.value)?;
 
         encoder.encode_length_determinant(value_bytes.len())?;
         encoder.write_bytes(&value_bytes);
@@ -119,7 +147,7 @@ impl AperDecode for InitiatingMessage {
         // Decode OPEN TYPE
         let value_len = decoder.decode_length_determinant()?;
         let value_bytes = decoder.read_bytes(value_len)?;
-        let mut value_decoder = AperDecoder::new(&value_bytes);
+        let mut value_decoder = message_value_decoder(&value_bytes)?;
 
         let value = match procedure_code {
             ProcedureCode::S1_SETUP => InitiatingMessageValue::S1SetupRequest(
@@ -241,10 +269,7 @@ impl AperEncode for SuccessfulOutcome {
         self.procedure_code.encode_aper(encoder)?;
         self.criticality.encode_aper(encoder)?;
 
-        let mut value_encoder = AperEncoder::new();
-        self.value.encode_aper(&mut value_encoder)?;
-        value_encoder.align();
-        let value_bytes = value_encoder.into_bytes();
+        let value_bytes = encode_message_value(&self.value)?;
 
         encoder.encode_length_determinant(value_bytes.len())?;
         encoder.write_bytes(&value_bytes);
@@ -260,7 +285,7 @@ impl AperDecode for SuccessfulOutcome {
 
         let value_len = decoder.decode_length_determinant()?;
         let value_bytes = decoder.read_bytes(value_len)?;
-        let mut value_decoder = AperDecoder::new(&value_bytes);
+        let mut value_decoder = message_value_decoder(&value_bytes)?;
 
         let value = match procedure_code {
             ProcedureCode::S1_SETUP => SuccessfulOutcomeValue::S1SetupResponse(
@@ -355,10 +380,7 @@ impl AperEncode for UnsuccessfulOutcome {
         self.procedure_code.encode_aper(encoder)?;
         self.criticality.encode_aper(encoder)?;
 
-        let mut value_encoder = AperEncoder::new();
-        self.value.encode_aper(&mut value_encoder)?;
-        value_encoder.align();
-        let value_bytes = value_encoder.into_bytes();
+        let value_bytes = encode_message_value(&self.value)?;
 
         encoder.encode_length_determinant(value_bytes.len())?;
         encoder.write_bytes(&value_bytes);
@@ -374,7 +396,7 @@ impl AperDecode for UnsuccessfulOutcome {
 
         let value_len = decoder.decode_length_determinant()?;
         let value_bytes = decoder.read_bytes(value_len)?;
-        let mut value_decoder = AperDecoder::new(&value_bytes);
+        let mut value_decoder = message_value_decoder(&value_bytes)?;
 
         let value = match procedure_code {
             ProcedureCode::S1_SETUP => UnsuccessfulOutcomeValue::S1SetupFailure(
