@@ -1897,7 +1897,6 @@ fn parse_path_switch_request_failure(
 ) -> NgapResult<PathSwitchRequestFailure> {
     let mut amf_ue_ngap_id = None;
     let mut ran_ue_ngap_id = None;
-    let mut cause = None;
     let mut released_list = None;
     let mut criticality_diagnostics = None;
 
@@ -1908,9 +1907,6 @@ fn parse_path_switch_request_failure(
             }
             ProtocolIeId::RAN_UE_NGAP_ID => {
                 ran_ue_ngap_id = Some(ie::decode_ran_ue_ngap_id(field)?);
-            }
-            ProtocolIeId::CAUSE => {
-                cause = Some(ie::decode_cause(field)?);
             }
             ProtocolIeId::CRITICALITY_DIAGNOSTICS => {
                 criticality_diagnostics = Some(ie::decode_criticality_diagnostics(field)?);
@@ -1930,10 +1926,6 @@ fn parse_path_switch_request_failure(
         ran_ue_ngap_id: ran_ue_ngap_id.ok_or(NgapError::MissingMandatoryIe {
             ie_name: "RAN-UE-NGAP-ID",
             ie_id: ProtocolIeId::RAN_UE_NGAP_ID.0,
-        })?,
-        cause: cause.ok_or(NgapError::MissingMandatoryIe {
-            ie_name: "Cause",
-            ie_id: ProtocolIeId::CAUSE.0,
         })?,
         released_list,
         criticality_diagnostics,
@@ -2135,7 +2127,7 @@ fn parse_handover_command(container: ProtocolIeContainer) -> NgapResult<Handover
     let mut amf_ue_ngap_id = None;
     let mut ran_ue_ngap_id = None;
     let mut handover_type = None;
-    let mut nas_pdu = None;
+    let mut nas_security_parameters_from_ngran = None;
     let mut pdu_session_list = None;
     let mut release_list = None;
     let mut target_to_source_container = None;
@@ -2148,8 +2140,8 @@ fn parse_handover_command(container: ProtocolIeContainer) -> NgapResult<Handover
             ProtocolIeId::RAN_UE_NGAP_ID => {
                 ran_ue_ngap_id = Some(ie::decode_ran_ue_ngap_id(field)?);
             }
-            ProtocolIeId::NAS_PDU => {
-                nas_pdu = Some(ie::decode_nas_pdu(field)?);
+            _ if field.id.0 == ie::IE_ID_NAS_SECURITY_PARAMETERS_FROM_NGRAN => {
+                nas_security_parameters_from_ngran = Some(ie::decode_raw_octet_ie(field)?);
             }
             _ if field.id.0 == ie::IE_ID_HANDOVER_TYPE => {
                 handover_type = Some(ie::decode_handover_type(field)?);
@@ -2167,7 +2159,7 @@ fn parse_handover_command(container: ProtocolIeContainer) -> NgapResult<Handover
                         .collect(),
                 );
             }
-            _ if field.id.0 == ie::IE_ID_PDU_SESSION_RESOURCE_TO_RELEASE_LIST_REL_CMD => {
+            _ if field.id.0 == ie::IE_ID_PDU_SESSION_RESOURCE_TO_RELEASE_LIST_HO_CMD => {
                 release_list = Some(ie::decode_pdu_session_release_list(field)?);
             }
             _ if field.id.0 == ie::IE_ID_TARGET_TO_SOURCE_TRANSPARENT_CONTAINER => {
@@ -2190,7 +2182,7 @@ fn parse_handover_command(container: ProtocolIeContainer) -> NgapResult<Handover
             ie_name: "HandoverType",
             ie_id: ie::IE_ID_HANDOVER_TYPE,
         })?,
-        nas_pdu,
+        nas_security_parameters_from_ngran,
         pdu_session_list: pdu_session_list.ok_or(NgapError::MissingMandatoryIe {
             ie_name: "PDUSessionResourceHandoverList",
             ie_id: ie::IE_ID_PDU_SESSION_RESOURCE_HANDOVER_LIST,

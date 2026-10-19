@@ -7533,10 +7533,12 @@ pub(crate) mod tests {
                 (0, Reject),
                 (119, Reject),
                 (94, Reject),
-                (38, Reject),
+                // NAS-PDU criticality is now the object set's (ignore) in the
+                // hand-written encoder too; only its IE order still deviates.
+                (38, Ignore),
                 (110, Reject),
             ],
-            "the hand-written encoder's deviations, pinned"
+            "the hand-written encoder's remaining deviation (UE AMBR order), pinned"
         );
     }
 

@@ -69,7 +69,7 @@ proptest! {
             gnb_id_len: 24,
         };
         let mut container = ProtocolIeContainer::new();
-        encode_global_ran_node_id(&mut container, &id).unwrap();
+        encode_global_ran_node_id(&mut container, &id, nextgcore_asn1c::ngap::Criticality::Reject).unwrap();
         let bytes = &container.ies[0].value;
         // 2-bit choice index `00` at the top of octet 0, no extension bit.
         prop_assert_eq!(bytes[0] >> 6, 0u8);
@@ -97,7 +97,7 @@ proptest! {
             gnb_id_len: len,
         };
         let mut container = ProtocolIeContainer::new();
-        encode_global_ran_node_id(&mut container, &id).unwrap();
+        encode_global_ran_node_id(&mut container, &id, nextgcore_asn1c::ngap::Criticality::Reject).unwrap();
         prop_assert_eq!(container.ies[0].value[0] >> 6, 0u8);
         match decode_global_ran_node_id(&container.ies[0]).unwrap() {
             GlobalRanNodeId::GlobalGnbId { gnb_id: decoded, gnb_id_len, .. } => {
@@ -117,7 +117,7 @@ proptest! {
             ng_enb_id,
         };
         let mut container = ProtocolIeContainer::new();
-        encode_global_ran_node_id(&mut container, &id).unwrap();
+        encode_global_ran_node_id(&mut container, &id, nextgcore_asn1c::ngap::Criticality::Reject).unwrap();
         prop_assert_eq!(container.ies[0].value[0] >> 6, 1u8);
         match decode_global_ran_node_id(&container.ies[0]).unwrap() {
             GlobalRanNodeId::GlobalNgEnbId { ng_enb_id: decoded, .. } => {

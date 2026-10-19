@@ -31,7 +31,7 @@ pub fn build_ng_setup_request(msg: &NgSetupRequest) -> NgapResult<Vec<u8>> {
     let mut container = ProtocolIeContainer::new();
 
     // IE: GlobalRANNodeID (mandatory)
-    ie::encode_global_ran_node_id(&mut container, &msg.global_ran_node_id)?;
+    ie::encode_global_ran_node_id(&mut container, &msg.global_ran_node_id, Criticality::Reject)?;
 
     // IE: RANNodeName (optional)
     if let Some(ref name) = msg.ran_node_name {
@@ -113,13 +113,13 @@ pub fn build_initial_ue_message(msg: &InitialUeMessage) -> NgapResult<Vec<u8>> {
     let mut container = ProtocolIeContainer::new();
 
     // IE: RAN-UE-NGAP-ID (mandatory)
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Reject)?;
 
     // IE: NAS-PDU (mandatory)
-    ie::encode_nas_pdu(&mut container, &msg.nas_pdu)?;
+    ie::encode_nas_pdu(&mut container, &msg.nas_pdu, Criticality::Reject)?;
 
     // IE: UserLocationInformation (mandatory)
-    ie::encode_user_location_info(&mut container, &msg.user_location_info)?;
+    ie::encode_user_location_info(&mut container, &msg.user_location_info, Criticality::Reject)?;
 
     // IE: RRCEstablishmentCause (mandatory)
     ie::encode_rrc_establishment_cause(&mut container, msg.rrc_establishment_cause)?;
@@ -149,13 +149,13 @@ pub fn build_downlink_nas_transport(msg: &DownlinkNasTransport) -> NgapResult<Ve
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Reject)?;
 
     // IE: RAN-UE-NGAP-ID (mandatory)
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Reject)?;
 
     // IE: NAS-PDU (mandatory)
-    ie::encode_nas_pdu(&mut container, &msg.nas_pdu)?;
+    ie::encode_nas_pdu(&mut container, &msg.nas_pdu, Criticality::Reject)?;
 
     let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
         procedure_code: ProcedureCode::DOWNLINK_NAS_TRANSPORT,
@@ -171,16 +171,16 @@ pub fn build_uplink_nas_transport(msg: &UplinkNasTransport) -> NgapResult<Vec<u8
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Reject)?;
 
     // IE: RAN-UE-NGAP-ID (mandatory)
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Reject)?;
 
     // IE: NAS-PDU (mandatory)
-    ie::encode_nas_pdu(&mut container, &msg.nas_pdu)?;
+    ie::encode_nas_pdu(&mut container, &msg.nas_pdu, Criticality::Reject)?;
 
     // IE: UserLocationInformation (mandatory)
-    ie::encode_user_location_info(&mut container, &msg.user_location_info)?;
+    ie::encode_user_location_info(&mut container, &msg.user_location_info, Criticality::Ignore)?;
 
     let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
         procedure_code: ProcedureCode::UPLINK_NAS_TRANSPORT,
@@ -202,10 +202,10 @@ pub fn build_initial_context_setup_request(
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Reject)?;
 
     // IE: RAN-UE-NGAP-ID (mandatory)
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Reject)?;
 
     // IE: GUAMI (mandatory)
     ie::encode_guami_ie(&mut container, &msg.guami)?;
@@ -214,14 +214,18 @@ pub fn build_initial_context_setup_request(
     ie::encode_allowed_nssai(&mut container, &msg.allowed_nssai)?;
 
     // IE: UESecurityCapabilities (mandatory)
-    ie::encode_ue_security_capabilities(&mut container, &msg.ue_security_capabilities)?;
+    ie::encode_ue_security_capabilities(
+        &mut container,
+        &msg.ue_security_capabilities,
+        Criticality::Reject,
+    )?;
 
     // IE: SecurityKey (mandatory)
     ie::encode_security_key(&mut container, &msg.security_key)?;
 
     // IE: NAS-PDU (optional)
     if let Some(ref nas_pdu) = msg.nas_pdu {
-        ie::encode_nas_pdu(&mut container, nas_pdu)?;
+        ie::encode_nas_pdu(&mut container, nas_pdu, Criticality::Ignore)?;
     }
 
     // IE: UEAggregateMaximumBitRate (optional)
@@ -245,10 +249,10 @@ pub fn build_initial_context_setup_response(
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Ignore)?;
 
     // IE: RAN-UE-NGAP-ID (mandatory)
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Ignore)?;
 
     let pdu = NgapPdu::SuccessfulOutcome(SuccessfulOutcome {
         procedure_code: ProcedureCode::INITIAL_CONTEXT_SETUP,
@@ -266,10 +270,10 @@ pub fn build_initial_context_setup_failure(
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Ignore)?;
 
     // IE: RAN-UE-NGAP-ID (mandatory)
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Ignore)?;
 
     // IE: Cause (mandatory)
     ie::encode_cause(&mut container, &msg.cause)?;
@@ -294,17 +298,17 @@ pub fn build_pdu_session_resource_setup_request(
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Reject)?;
 
     // IE: RAN-UE-NGAP-ID (mandatory)
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Reject)?;
 
     // IE: PDUSessionResourceSetupListSUReq (mandatory)
     ie::encode_pdu_session_setup_list_su_req(&mut container, &msg.pdu_session_list)?;
 
     // IE: NAS-PDU (optional)
     if let Some(ref nas_pdu) = msg.nas_pdu {
-        ie::encode_nas_pdu(&mut container, nas_pdu)?;
+        ie::encode_nas_pdu(&mut container, nas_pdu, Criticality::Reject)?;
     }
 
     let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
@@ -323,10 +327,10 @@ pub fn build_pdu_session_resource_setup_response(
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Ignore)?;
 
     // IE: RAN-UE-NGAP-ID (mandatory)
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Ignore)?;
 
     // IE: PDUSessionResourceSetupListSURes (optional)
     if !msg.setup_list.is_empty() {
@@ -357,8 +361,8 @@ pub fn build_pdu_session_resource_modify_request(
 ) -> NgapResult<Vec<u8>> {
     let mut container = ProtocolIeContainer::new();
 
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Reject)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Reject)?;
     ie::encode_pdu_session_modify_list_req(&mut container, &msg.pdu_session_list)?;
 
     let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
@@ -376,8 +380,8 @@ pub fn build_pdu_session_resource_modify_response(
 ) -> NgapResult<Vec<u8>> {
     let mut container = ProtocolIeContainer::new();
 
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Ignore)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Ignore)?;
 
     if !msg.modify_list.is_empty() {
         ie::encode_pdu_session_modify_list_res(&mut container, &msg.modify_list)?;
@@ -406,14 +410,19 @@ pub fn build_pdu_session_resource_release_command(
 ) -> NgapResult<Vec<u8>> {
     let mut container = ProtocolIeContainer::new();
 
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Reject)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Reject)?;
 
     if let Some(ref nas_pdu) = msg.nas_pdu {
-        ie::encode_nas_pdu(&mut container, nas_pdu)?;
+        ie::encode_nas_pdu(&mut container, nas_pdu, Criticality::Ignore)?;
     }
 
-    ie::encode_pdu_session_release_list(&mut container, &msg.pdu_session_list)?;
+    ie::encode_pdu_session_release_list(
+        &mut container,
+        ie::IE_ID_PDU_SESSION_RESOURCE_TO_RELEASE_LIST_REL_CMD,
+        Criticality::Reject,
+        &msg.pdu_session_list,
+    )?;
 
     let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
         procedure_code: ProcedureCode::PDU_SESSION_RESOURCE_RELEASE,
@@ -430,8 +439,8 @@ pub fn build_pdu_session_resource_release_response(
 ) -> NgapResult<Vec<u8>> {
     let mut container = ProtocolIeContainer::new();
 
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Ignore)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Ignore)?;
     ie::encode_pdu_session_released_list(&mut container, &msg.released_list)?;
 
     let pdu = NgapPdu::SuccessfulOutcome(SuccessfulOutcome {
@@ -471,10 +480,10 @@ pub fn build_ue_context_release_complete(msg: &UeContextReleaseComplete) -> Ngap
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Ignore)?;
 
     // IE: RAN-UE-NGAP-ID (mandatory)
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Ignore)?;
 
     let pdu = NgapPdu::SuccessfulOutcome(SuccessfulOutcome {
         procedure_code: ProcedureCode::UE_CONTEXT_RELEASE,
@@ -490,10 +499,10 @@ pub fn build_ue_context_release_request(msg: &UeContextReleaseRequest) -> NgapRe
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Reject)?;
 
     // IE: RAN-UE-NGAP-ID (mandatory)
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Reject)?;
 
     // IE: Cause (mandatory)
     ie::encode_cause(&mut container, &msg.cause)?;
@@ -516,10 +525,10 @@ pub fn build_handover_required(msg: &HandoverRequired) -> NgapResult<Vec<u8>> {
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Reject)?;
 
     // IE: RAN-UE-NGAP-ID (mandatory)
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Reject)?;
 
     // IE: HandoverType (mandatory)
     ie::encode_handover_type(&mut container, msg.handover_type)?;
@@ -557,7 +566,7 @@ pub fn build_handover_request(msg: &HandoverRequest) -> NgapResult<Vec<u8>> {
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Reject)?;
 
     // IE: HandoverType (mandatory)
     ie::encode_handover_type(&mut container, msg.handover_type)?;
@@ -569,7 +578,11 @@ pub fn build_handover_request(msg: &HandoverRequest) -> NgapResult<Vec<u8>> {
     ie::encode_ue_ambr(&mut container, &msg.ue_ambr)?;
 
     // IE: UESecurityCapabilities (mandatory)
-    ie::encode_ue_security_capabilities(&mut container, &msg.ue_security_capabilities)?;
+    ie::encode_ue_security_capabilities(
+        &mut container,
+        &msg.ue_security_capabilities,
+        Criticality::Reject,
+    )?;
 
     // IE: SecurityContext (mandatory)
     ie::encode_security_context(&mut container, &msg.security_context)?;
@@ -600,10 +613,10 @@ pub fn build_handover_request_acknowledge(msg: &HandoverRequestAcknowledge) -> N
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Ignore)?;
 
     // IE: RAN-UE-NGAP-ID (mandatory)
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Ignore)?;
 
     // IE: PDUSessionResourceAdmittedList (mandatory)
     ie::encode_pdu_session_admitted_list(&mut container, &msg.admitted_list)?;
@@ -634,7 +647,7 @@ pub fn build_handover_failure(msg: &HandoverFailure) -> NgapResult<Vec<u8>> {
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Ignore)?;
 
     // IE: Cause (mandatory)
     ie::encode_cause(&mut container, &msg.cause)?;
@@ -658,17 +671,17 @@ pub fn build_handover_command(msg: &HandoverCommand) -> NgapResult<Vec<u8>> {
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Reject)?;
 
     // IE: RAN-UE-NGAP-ID (mandatory)
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Reject)?;
 
     // IE: HandoverType (mandatory)
     ie::encode_handover_type(&mut container, msg.handover_type)?;
 
-    // IE: NAS-PDU (optional)
-    if let Some(ref nas_pdu) = msg.nas_pdu {
-        ie::encode_nas_pdu(&mut container, nas_pdu)?;
+    // IE: NASSecurityParametersFromNGRAN (optional; not a NAS-PDU)
+    if let Some(ref params) = msg.nas_security_parameters_from_ngran {
+        ie::encode_nas_security_parameters_from_ngran(&mut container, params)?;
     }
 
     // IE: PDUSessionResourceHandoverList (mandatory)
@@ -676,7 +689,12 @@ pub fn build_handover_command(msg: &HandoverCommand) -> NgapResult<Vec<u8>> {
 
     // IE: PDUSessionResourceToReleaseListHOCmd (optional)
     if let Some(ref release_list) = msg.release_list {
-        ie::encode_pdu_session_release_list(&mut container, release_list)?;
+        ie::encode_pdu_session_release_list(
+            &mut container,
+            ie::IE_ID_PDU_SESSION_RESOURCE_TO_RELEASE_LIST_HO_CMD,
+            Criticality::Ignore,
+            release_list,
+        )?;
     }
 
     // IE: TargetToSource-TransparentContainer (mandatory)
@@ -696,13 +714,13 @@ pub fn build_handover_notify(msg: &HandoverNotify) -> NgapResult<Vec<u8>> {
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Reject)?;
 
     // IE: RAN-UE-NGAP-ID (mandatory)
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Reject)?;
 
     // IE: UserLocationInformation (mandatory)
-    ie::encode_user_location_info(&mut container, &msg.user_location_info)?;
+    ie::encode_user_location_info(&mut container, &msg.user_location_info, Criticality::Ignore)?;
 
     let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
         procedure_code: ProcedureCode::HANDOVER_NOTIFICATION,
@@ -721,10 +739,10 @@ pub fn build_handover_cancel(msg: &HandoverCancel) -> NgapResult<Vec<u8>> {
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Reject)?;
 
     // IE: RAN-UE-NGAP-ID (mandatory)
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Reject)?;
 
     // IE: Cause (mandatory)
     ie::encode_cause(&mut container, &msg.cause)?;
@@ -743,10 +761,10 @@ pub fn build_handover_cancel_acknowledge(msg: &HandoverCancelAcknowledge) -> Nga
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Ignore)?;
 
     // IE: RAN-UE-NGAP-ID (mandatory)
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Ignore)?;
 
     // IE: CriticalityDiagnostics (optional)
     if let Some(ref diag) = msg.criticality_diagnostics {
@@ -899,12 +917,12 @@ pub fn build_error_indication(msg: &ErrorIndication) -> NgapResult<Vec<u8>> {
 
     // IE: AMF-UE-NGAP-ID (optional)
     if let Some(amf_id) = msg.amf_ue_ngap_id {
-        ie::encode_amf_ue_ngap_id(&mut container, amf_id)?;
+        ie::encode_amf_ue_ngap_id(&mut container, amf_id, Criticality::Ignore)?;
     }
 
     // IE: RAN-UE-NGAP-ID (optional)
     if let Some(ran_id) = msg.ran_ue_ngap_id {
-        ie::encode_ran_ue_ngap_id(&mut container, ran_id)?;
+        ie::encode_ran_ue_ngap_id(&mut container, ran_id, Criticality::Ignore)?;
     }
 
     // IE: Cause (optional)
@@ -951,7 +969,7 @@ pub fn build_ran_configuration_update(msg: &RanConfigurationUpdate) -> NgapResul
 
     // IE: GlobalRANNodeID (optional)
     if let Some(ref ran_node_id) = msg.global_ran_node_id {
-        ie::encode_global_ran_node_id(&mut container, ran_node_id)?;
+        ie::encode_global_ran_node_id(&mut container, ran_node_id, Criticality::Ignore)?;
     }
 
     let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
@@ -1131,10 +1149,10 @@ pub fn build_pdu_session_resource_notify(msg: &PduSessionResourceNotify) -> Ngap
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Reject)?;
 
     // IE: RAN-UE-NGAP-ID (mandatory)
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Reject)?;
 
     // IE: PDUSessionResourceNotifyList (optional)
     if !msg.notify_list.is_empty() {
@@ -1177,10 +1195,10 @@ fn ran_status_transfer_container(msg: &RanStatusTransfer) -> NgapResult<Protocol
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory, reject)
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Reject)?;
 
     // IE: RAN-UE-NGAP-ID (mandatory, reject)
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Reject)?;
 
     // IE: RANStatusTransfer-TransparentContainer (mandatory, reject) — relayed
     // verbatim; see `RanStatusTransfer::container`.
@@ -1231,10 +1249,10 @@ pub fn build_pdu_session_resource_modify_indication(
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Reject)?;
 
     // IE: RAN-UE-NGAP-ID (mandatory)
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Reject)?;
 
     // IE: PDUSessionResourceModifyListModInd (mandatory)
     ie::encode_pdu_session_modify_list_mod_ind(&mut container, &msg.modify_list)?;
@@ -1255,10 +1273,10 @@ pub fn build_pdu_session_resource_modify_confirm(
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Ignore)?;
 
     // IE: RAN-UE-NGAP-ID (mandatory)
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Ignore)?;
 
     // IE: PDUSessionResourceModifyListModCfm (optional)
     if !msg.confirm_list.is_empty() {
@@ -1292,13 +1310,13 @@ pub fn build_nas_non_delivery_indication(msg: &NasNonDeliveryIndication) -> Ngap
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Reject)?;
 
     // IE: RAN-UE-NGAP-ID (mandatory)
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Reject)?;
 
     // IE: NAS-PDU (mandatory)
-    ie::encode_nas_pdu(&mut container, &msg.nas_pdu)?;
+    ie::encode_nas_pdu(&mut container, &msg.nas_pdu, Criticality::Ignore)?;
 
     // IE: Cause (mandatory)
     ie::encode_cause(&mut container, &msg.cause)?;
@@ -1321,16 +1339,20 @@ pub fn build_path_switch_request(msg: &PathSwitchRequest) -> NgapResult<Vec<u8>>
     let mut container = ProtocolIeContainer::new();
 
     // IE: RAN-UE-NGAP-ID (mandatory)
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Reject)?;
 
     // IE: SourceAMF-UE-NGAP-ID (mandatory)
     ie::encode_source_amf_ue_ngap_id(&mut container, msg.source_amf_ue_ngap_id)?;
 
     // IE: UserLocationInformation (mandatory)
-    ie::encode_user_location_info(&mut container, &msg.user_location_info)?;
+    ie::encode_user_location_info(&mut container, &msg.user_location_info, Criticality::Ignore)?;
 
     // IE: UESecurityCapabilities (mandatory)
-    ie::encode_ue_security_capabilities(&mut container, &msg.ue_security_capabilities)?;
+    ie::encode_ue_security_capabilities(
+        &mut container,
+        &msg.ue_security_capabilities,
+        Criticality::Ignore,
+    )?;
 
     // IE: PDUSessionResourceToBeSwitchedDLList (mandatory)
     ie::encode_pdu_session_to_be_switched_list(&mut container, &msg.pdu_session_list)?;
@@ -1360,14 +1382,14 @@ pub fn build_path_switch_request_acknowledge(
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Ignore)?;
 
     // IE: RAN-UE-NGAP-ID (mandatory)
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Ignore)?;
 
     // IE: UESecurityCapabilities (optional)
     if let Some(ref caps) = msg.ue_security_capabilities {
-        ie::encode_ue_security_capabilities(&mut container, caps)?;
+        ie::encode_ue_security_capabilities(&mut container, caps, Criticality::Reject)?;
     }
 
     // IE: SecurityContext (mandatory)
@@ -1402,13 +1424,12 @@ pub fn build_path_switch_request_failure(msg: &PathSwitchRequestFailure) -> Ngap
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Ignore)?;
 
     // IE: RAN-UE-NGAP-ID (mandatory)
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Ignore)?;
 
-    // IE: Cause (mandatory)
-    ie::encode_cause(&mut container, &msg.cause)?;
+    // No Cause IE: PathSwitchRequestFailureIEs has none (§9.2.3.10).
 
     // IE: PDUSessionResourceReleasedListPSFail (optional)
     if let Some(ref released) = msg.released_list {
@@ -1438,10 +1459,10 @@ pub fn build_handover_preparation_failure(msg: &HandoverPreparationFailure) -> N
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
-    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id, Criticality::Ignore)?;
 
     // IE: RAN-UE-NGAP-ID (mandatory)
-    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id, Criticality::Ignore)?;
 
     // IE: Cause (mandatory)
     ie::encode_cause(&mut container, &msg.cause)?;
@@ -1483,7 +1504,7 @@ pub fn build_multicast_session_activation_request(
     mbs_session_id: &crate::mbs_transfer::MbsSessionId,
 ) -> NgapResult<Vec<u8>> {
     let mut container = ProtocolIeContainer::new();
-    ie::encode_mbs_session_id(&mut container, mbs_session_id)?;
+    ie::encode_mbs_session_id(&mut container, mbs_session_id, Criticality::Reject)?;
     ie::encode_multicast_session_activation_request_transfer(&mut container, mbs_session_id)?;
 
     let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
@@ -1503,7 +1524,7 @@ pub fn build_multicast_session_deactivation_request(
     mbs_session_id: &crate::mbs_transfer::MbsSessionId,
 ) -> NgapResult<Vec<u8>> {
     let mut container = ProtocolIeContainer::new();
-    ie::encode_mbs_session_id(&mut container, mbs_session_id)?;
+    ie::encode_mbs_session_id(&mut container, mbs_session_id, Criticality::Reject)?;
     ie::encode_multicast_session_deactivation_request_transfer(&mut container, mbs_session_id)?;
 
     let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
@@ -1525,7 +1546,7 @@ pub fn build_multicast_group_paging(
     paging_areas: &[ie::MulticastGroupPagingArea],
 ) -> NgapResult<Vec<u8>> {
     let mut container = ProtocolIeContainer::new();
-    ie::encode_mbs_session_id(&mut container, mbs_session_id)?;
+    ie::encode_mbs_session_id(&mut container, mbs_session_id, Criticality::Ignore)?;
     ie::encode_multicast_group_paging_area_list(&mut container, paging_areas)?;
 
     let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
@@ -1703,7 +1724,7 @@ pub fn build_pws_restart_indication(msg: &PwsRestartIndication) -> NgapResult<Ve
         ie::IE_ID_CELL_ID_LIST_FOR_RESTART,
         &msg.cell_list,
     )?;
-    ie::encode_global_ran_node_id(&mut container, &msg.global_ran_node_id)?;
+    ie::encode_global_ran_node_id(&mut container, &msg.global_ran_node_id, Criticality::Reject)?;
     ie::encode_tai_list_for_restart(&mut container, &msg.tai_list_for_restart)?;
     if !msg.emergency_area_id_list_for_restart.is_empty() {
         // Range `0..maxnoofEAIforRestart` (`:16039`), so empty means absent.
@@ -1737,7 +1758,7 @@ pub fn build_pws_failure_indication(msg: &PwsFailureIndication) -> NgapResult<Ve
         ie::IE_ID_PWS_FAILED_CELL_ID_LIST,
         &msg.failed_cell_list,
     )?;
-    ie::encode_global_ran_node_id(&mut container, &msg.global_ran_node_id)?;
+    ie::encode_global_ran_node_id(&mut container, &msg.global_ran_node_id, Criticality::Reject)?;
 
     let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
         procedure_code: ProcedureCode::PWS_FAILURE_INDICATION,
@@ -2098,7 +2119,6 @@ mod ng_setup_cross_codec {
         let msg = PathSwitchRequestFailure {
             amf_ue_ngap_id: 99,
             ran_ue_ngap_id: 88,
-            cause: Cause::RadioNetwork(CauseRadioNetwork::UnknownLocalUeNgapId),
             released_list: None,
             criticality_diagnostics: None,
         };
@@ -2109,10 +2129,6 @@ mod ng_setup_cross_codec {
             crate::parser::NgapMessage::PathSwitchRequestFailure(f) => {
                 assert_eq!(f.amf_ue_ngap_id, 99);
                 assert_eq!(f.ran_ue_ngap_id, 88);
-                assert!(matches!(
-                    f.cause,
-                    Cause::RadioNetwork(CauseRadioNetwork::UnknownLocalUeNgapId)
-                ));
             }
             other => panic!("expected PathSwitchRequestFailure, got {other:?}"),
         }
@@ -2124,7 +2140,7 @@ mod ng_setup_cross_codec {
             amf_ue_ngap_id: 1,
             ran_ue_ngap_id: 2,
             handover_type: HandoverType::Intra5gs,
-            nas_pdu: Some(vec![0x7e, 0x00]),
+            nas_security_parameters_from_ngran: Some(vec![0x7e, 0x00]),
             pdu_session_list: vec![PduSessionResourceHandoverItem {
                 pdu_session_id: 1,
                 transfer: vec![0xAA, 0xBB],
@@ -2139,7 +2155,10 @@ mod ng_setup_cross_codec {
             crate::parser::NgapMessage::HandoverCommand(c) => {
                 assert_eq!(c.amf_ue_ngap_id, 1);
                 assert_eq!(c.ran_ue_ngap_id, 2);
-                assert_eq!(c.nas_pdu.as_deref(), Some(&[0x7e, 0x00][..]));
+                assert_eq!(
+                    c.nas_security_parameters_from_ngran.as_deref(),
+                    Some(&[0x7e, 0x00][..])
+                );
                 assert_eq!(c.pdu_session_list.len(), 1);
                 assert_eq!(c.target_to_source_container, vec![0x01, 0x02, 0x03, 0x04]);
             }
