@@ -1319,9 +1319,13 @@ impl NgapServer {
             data.len()
         );
 
-        // Parse the NG Setup Request using proper ASN.1 decoding
-        let request = match ngap_asn1::parse_ng_setup_request_asn1(data) {
-            Some(req) => {
+        // Decode with the generated codec, which also sorts any not-comprehended
+        // or missing IEs by criticality (TS 38.413 §10.3.4.2, §10.3.5).
+        let (request, notify) = match ngap_asn1::decode_ng_setup_request_asn1(data) {
+            ngap_asn1::NgSetupRequestDecode::Proceed {
+                request: req,
+                notify,
+            } => {
                 log::info!(
                     "Parsed NG Setup Request: gNB ID={}, PLMN={}{}{}-{}{}{}",
                     req.gnb_id,
@@ -1336,9 +1340,29 @@ impl NgapServer {
                         req.plmn_id.mnc3.to_string()
                     }
                 );
-                req
+                (req, notify)
             }
-            None => {
+            ngap_asn1::NgSetupRequestDecode::Reject(diagnostics) => {
+                // §10.3.4.2 / §10.3.5: an IE marked "reject" that the AMF does not
+                // comprehend, or a missing one: execute none of the request, and
+                // report the IEs in the message for the unsuccessful outcome.
+                log::warn!(
+                    "NG Setup Request from association {association_id} has {} \
+                     not-comprehended or missing IE(s) marked reject; sending NG SETUP FAILURE",
+                    diagnostics.len()
+                );
+                let failure = ngap_asn1::build_ng_setup_failure_with_diagnostics_asn1(
+                    ngap_handler::cause_group::PROTOCOL,
+                    ngap_handler::protocol_cause::ABSTRACT_SYNTAX_ERROR_REJECT,
+                    Some(time_to_wait::V1S),
+                    &diagnostics,
+                );
+                if !failure.is_empty() {
+                    self.send_to_association(association_id, &failure).await?;
+                }
+                return Ok(());
+            }
+            ngap_asn1::NgSetupRequestDecode::Undecodable => {
                 // TS 38.413 §8.7.3: an undecodable / unacceptable NG SETUP
                 // REQUEST must be answered with NG SETUP FAILURE — never a
                 // fabricated request accepted with NG SETUP RESPONSE.
@@ -1379,8 +1403,11 @@ impl NgapServer {
                             association_id
                         );
 
-                        // Build NG Setup Response with proper ASN.1 APER encoding
-                        if let Some(response) = ngap_asn1::build_ng_setup_response_asn1(&ctx) {
+                        // Build NG Setup Response with proper ASN.1 APER encoding,
+                        // reporting any "notify" IEs it ignored (§10.3.4.2).
+                        if let Some(response) =
+                            ngap_asn1::build_ng_setup_response_with_diagnostics_asn1(&ctx, &notify)
+                        {
                             log::debug!(
                                 "Built NG Setup Response: {} bytes, hex: {:02x?}",
                                 response.len(),
@@ -1402,10 +1429,11 @@ impl NgapServer {
 
                         // Build NG Setup Failure with proper ASN.1 encoding and
                         // the real cause group/value from the handler
-                        Some(ngap_asn1::build_ng_setup_failure_asn1(
+                        Some(ngap_asn1::build_ng_setup_failure_with_diagnostics_asn1(
                             cause.group,
                             cause.cause,
                             Some(time_to_wait::V1S),
+                            &notify,
                         ))
                     }
                     _ => None,
@@ -14981,25 +15009,7 @@ mod tests {
         // unconditional push would make `num_of_served_tai` disagree with the vector's
         // length on a re-run — the accumulate-on-a-global hazard that a per-instance
         // context used to hide.
-        {
-            let ctx_arc = crate::context::amf_self();
-            let mut c = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
-            let tai = crate::context::ServedTai {
-                list0: crate::context::Tai0List {
-                    plmn_id: PlmnId::new("999", "70"),
-                    tac: vec![1],
-                },
-                ..Default::default()
-            };
-            if !c
-                .served_tai
-                .iter()
-                .any(|t| t.list0.plmn_id == tai.list0.plmn_id && t.list0.tac == tai.list0.tac)
-            {
-                c.served_tai.push(tai);
-                c.num_of_served_tai = c.served_tai.len();
-            }
-        }
+        serve_tai_999_70_tac_1();
         let (etx, _erx) = mpsc::channel(64);
         std::mem::forget(_erx);
         let mut server =
@@ -15022,6 +15032,95 @@ mod tests {
             "an undecodable NG SETUP REQUEST must not mark NG Setup successful; \
              the old fallback fabricated gnb_id=1/PLMN 999-70 and accepted it"
         );
+    }
+
+    /// Make the global AMF context serve TAI 999/70 TAC 1, the identity the NG
+    /// Setup tests' requests name. Idempotent: the only writer of `served_tai`
+    /// in the process outside the config loader, so a second, unconditional
+    /// push would make `num_of_served_tai` disagree with the vector's length on
+    /// a re-run -- the accumulate-on-a-global hazard.
+    fn serve_tai_999_70_tac_1() {
+        let ctx_arc = crate::context::amf_self();
+        let mut c = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
+        let tai = crate::context::ServedTai {
+            list0: crate::context::Tai0List {
+                plmn_id: PlmnId::new("999", "70"),
+                tac: vec![1],
+            },
+            ..Default::default()
+        };
+        if !c
+            .served_tai
+            .iter()
+            .any(|t| t.list0.plmn_id == tai.list0.plmn_id && t.list0.tac == tai.list0.tac)
+        {
+            c.served_tai.push(tai);
+            c.num_of_served_tai = c.served_tai.len();
+        }
+    }
+
+    /// #417 stage 3, through the handler: TS 38.413 §10.3.4.2 decides whether
+    /// an NG SETUP REQUEST carrying an IE the AMF does not comprehend sets the
+    /// gNB up. "ignore" and "notify" proceed; "reject" executes nothing. The
+    /// served TAI matches, so a refusal here can only be the criticality's.
+    // Holding CONTEXT_GUARD across the awaits is the point: it serialises this
+    // test against every other global-context test for its whole duration.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ng_setup_request_unknown_ie_criticality_decides_the_outcome() {
+        // A successful setup builds the Response, which needs a PLMNSupportList
+        // in the process-global context, and a sibling's `amf_context_final` can
+        // empty that context mid-test: hold the one lock that serialises
+        // global-context tests, and put back exactly what was there.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        serve_tai_999_70_tac_1();
+        let saved = {
+            let ctx_arc = crate::context::amf_self();
+            let mut c = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
+            let saved = (c.plmn_support.len(), c.num_of_plmn_support);
+            c.plmn_support.push(crate::context::PlmnSupport {
+                plmn_id: PlmnId::new("999", "70"),
+                num_of_s_nssai: 1,
+                s_nssai: vec![crate::context::SNssai { sst: 1, sd: None }],
+            });
+            c.num_of_plmn_support = c.plmn_support.len();
+            saved
+        };
+        let (etx, _erx) = mpsc::channel(64);
+        std::mem::forget(_erx);
+        let mut server =
+            NgapServer::new("127.0.0.1:0".parse().unwrap(), SctpBackend::Userspace, etx)
+                .await
+                .expect("NGAP test server");
+        let baseline = ngap_asn1::tests::baseline_request();
+        for (assoc, criticality, expect_setup) in [
+            (9602u64, 0x40u8, true),
+            (9603, 0x80, true),
+            (9604, 0x00, false),
+        ] {
+            seed_gnb_session(&server, assoc).await;
+            let request = ngap_asn1::tests::with_unknown_ie(&baseline, 9999, criticality);
+            // Sending fails (no real association); the outcome is in the session.
+            let _ = server.handle_ng_setup_request(assoc, &request).await;
+            let sessions = server.sessions.read().await;
+            assert_eq!(
+                sessions
+                    .get(&assoc)
+                    .expect("session")
+                    .gnb
+                    .state
+                    .ng_setup_success,
+                expect_setup,
+                "unknown IE with criticality octet {criticality:#04x}"
+            );
+        }
+
+        let ctx_arc = crate::context::amf_self();
+        let mut c = ctx_arc.write().unwrap_or_else(|e| e.into_inner());
+        c.plmn_support.truncate(saved.0);
+        c.num_of_plmn_support = saved.1;
     }
 
     // ---- criterion 8: the MBS builders name the right procedures ----
