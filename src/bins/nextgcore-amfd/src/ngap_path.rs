@@ -8625,19 +8625,59 @@ impl NgapServer {
     /// established and transitions the GMM FSM out of InitialContextSetup; the
     /// NAS-layer Registration Complete then drives the move to Registered. The
     /// ICS-based retransmission timer is cleared since the gNB has the NAS PDU.
+    ///
+    /// Decoded with the generated codec (#417 stage 7), which applies the §10.3.4.2
+    /// rules for a RESPONSE: a not-comprehended "ignore IE and notify sender" IE is
+    /// reported in an Error Indication and the procedure goes on; one marked
+    /// "reject" terminates it unsuccessfully, handled locally -- the UE stays in
+    /// InitialContextSetup and T3550 retransmits the request, as it did for an
+    /// undecodable Response. Both IDs are criticality ignore (§10.3.5): without the
+    /// AMF UE NGAP ID there is no UE to update, without the RAN one nothing is lost.
     async fn handle_initial_context_setup_response(
         &mut self,
         association_id: u64,
         data: &[u8],
     ) -> Result<()> {
-        let Some((amf_ue_ngap_id, ran_ue_ngap_id)) =
-            crate::ngap_asn1::parse_initial_context_setup_response_asn1(data)
-        else {
-            return Ok(());
-        };
+        use crate::ngap_asn1::InitialContextSetupOutcomeDecode::{Decoded, Failed, Undecodable};
+        let (amf_ue_ngap_id, ran_ue_ngap_id) =
+            match crate::ngap_asn1::decode_initial_context_setup_response_asn1(data) {
+                Decoded {
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    error_indication,
+                    ..
+                } => {
+                    // Best effort: the report must not stop the procedure.
+                    if let Some(report) = error_indication {
+                        if let Err(e) = self
+                            .send_criticality_error_indication(association_id, &report)
+                            .await
+                        {
+                            log::warn!("Failed to send ErrorIndication: {e}");
+                        }
+                    }
+                    let Some(amf_ue_ngap_id) = amf_ue_ngap_id else {
+                        log::warn!(
+                            "Initial Context Setup Response without an AMF UE NGAP ID \
+                             (association {association_id}); no UE to update"
+                        );
+                        return Ok(());
+                    };
+                    (amf_ue_ngap_id, ran_ue_ngap_id)
+                }
+                Failed(diagnostics) => {
+                    log::warn!(
+                        "Initial Context Setup Response carries not-comprehended IEs marked \
+                         reject ({diagnostics:?}); the procedure is unsuccessfully terminated \
+                         (TS 38.413 §10.3.4.2), handled locally"
+                    );
+                    return Ok(());
+                }
+                Undecodable => return Ok(()),
+            };
         log::info!(
             "Initial Context Setup Response: amf_ue_ngap_id={amf_ue_ngap_id}, \
-             ran_ue_ngap_id={ran_ue_ngap_id} (association {association_id})"
+             ran_ue_ngap_id={ran_ue_ngap_id:?} (association {association_id})"
         );
 
         let updated = self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
@@ -8661,19 +8701,67 @@ impl NgapServer {
     ///
     /// The gNB could not establish AS-layer security. The registration cannot
     /// complete, so the AMF releases the UE context.
+    ///
+    /// Decoded with the generated codec (#417 stage 7) under the §10.3.4.2 response
+    /// rules, as the Response is. Both IDs are criticality ignore (§10.3.5): without
+    /// the AMF UE NGAP ID there is no UE to release; without the RAN one the
+    /// Release Command takes the RAN UE NGAP ID the AMF stored for that UE.
     async fn handle_initial_context_setup_failure(
         &mut self,
         association_id: u64,
         data: &[u8],
     ) -> Result<()> {
-        let Some((amf_ue_ngap_id, ran_ue_ngap_id)) =
-            crate::ngap_asn1::parse_initial_context_setup_failure_asn1(data)
-        else {
-            return Ok(());
-        };
+        use crate::ngap_asn1::InitialContextSetupOutcomeDecode::{Decoded, Failed, Undecodable};
+        let (amf_ue_ngap_id, ran_ue_ngap_id, cause) =
+            match crate::ngap_asn1::decode_initial_context_setup_failure_asn1(data) {
+                Decoded {
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    cause,
+                    error_indication,
+                } => {
+                    // Best effort: the report must not stop the release.
+                    if let Some(report) = error_indication {
+                        if let Err(e) = self
+                            .send_criticality_error_indication(association_id, &report)
+                            .await
+                        {
+                            log::warn!("Failed to send ErrorIndication: {e}");
+                        }
+                    }
+                    let Some(amf_ue_ngap_id) = amf_ue_ngap_id else {
+                        log::warn!(
+                            "Initial Context Setup Failure without an AMF UE NGAP ID \
+                             (association {association_id}); no UE to release"
+                        );
+                        return Ok(());
+                    };
+                    let stored = self
+                        .ue_auth_state
+                        .with_mut(amf_ue_ngap_id, |state| state.ran_ue_ngap_id);
+                    let Some(ran_ue_ngap_id) = ran_ue_ngap_id.or(stored) else {
+                        log::warn!(
+                            "Initial Context Setup Failure for unknown UE {amf_ue_ngap_id} \
+                             without a RAN UE NGAP ID; nothing to release"
+                        );
+                        return Ok(());
+                    };
+                    (amf_ue_ngap_id, ran_ue_ngap_id, cause)
+                }
+                Failed(diagnostics) => {
+                    log::warn!(
+                        "Initial Context Setup Failure carries not-comprehended IEs marked \
+                         reject ({diagnostics:?}); the procedure is unsuccessfully terminated \
+                         (TS 38.413 §10.3.4.2), handled locally"
+                    );
+                    return Ok(());
+                }
+                Undecodable => return Ok(()),
+            };
         log::warn!(
             "Initial Context Setup Failure: amf_ue_ngap_id={amf_ue_ngap_id}, \
-             ran_ue_ngap_id={ran_ue_ngap_id} (association {association_id}); releasing UE"
+             ran_ue_ngap_id={ran_ue_ngap_id}, cause={cause:?} (association {association_id}); \
+             releasing UE"
         );
 
         // Drop any pending ICS retransmission, then release the NG context.
@@ -12470,8 +12558,15 @@ mod tests {
             },
         )
         .expect("build resp");
-        let parsed = crate::ngap_asn1::parse_initial_context_setup_response_asn1(&resp);
-        assert_eq!(parsed, Some((1, 2)));
+        let parsed = crate::ngap_asn1::decode_initial_context_setup_response_asn1(&resp);
+        assert!(matches!(
+            parsed,
+            crate::ngap_asn1::InitialContextSetupOutcomeDecode::Decoded {
+                amf_ue_ngap_id: Some(1),
+                ran_ue_ngap_id: Some(2),
+                ..
+            }
+        ));
         // Applying the response opens the gate.
         state.initial_context_setup_response_received = true;
         state.gmm_fsm.transition_to_registered();
@@ -19039,6 +19134,151 @@ mod tests {
             guard.event_subscription_remove("sub-397-commfail-normal");
         }
         sink.stop().await.expect("sink stop");
+    }
+
+    // ------------------------------------------------------------------
+    // #417 stage 7 — Initial Context Setup Response/Failure THROUGH DISPATCH
+    // ------------------------------------------------------------------
+
+    /// A UE the AMF has sent an Initial Context Setup Request for: the FSM waits in
+    /// InitialContextSetup and T3550 is armed against the request.
+    fn ue_awaiting_ics(ngap: &mut NgapServer, amf_ue_ngap_id: u64, ran_ue_ngap_id: u32) {
+        let mut state = UeNasContext::new(amf_ue_ngap_id, ran_ue_ngap_id, 1, false);
+        state.initial_context_setup_request_sent = true;
+        state.gmm_fsm.transition_to_initial_context_setup();
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, state);
+        ngap.arm_retx(amf_ue_ngap_id, NasProcTimer::T3550, vec![0x00, 0x0e]);
+    }
+
+    /// `(response received, FSM state, T3550 armed)` for the UE.
+    fn ics_progress(
+        ngap: &NgapServer,
+        amf_ue_ngap_id: u64,
+    ) -> (bool, crate::gmm_sm::GmmState, bool) {
+        let state = ngap.ue_auth_state.get(amf_ue_ngap_id).expect("UE present");
+        (
+            state.initial_context_setup_response_received,
+            state.gmm_fsm.state,
+            state.retx.is_some(),
+        )
+    }
+
+    /// **#417 stage 7.** An ICS Response entering at `process_ngap_message` --
+    /// procedure 14, SuccessfulOutcome -- establishes the context: the response is
+    /// recorded, the FSM leaves InitialContextSetup and T3550 stops. It does so with a
+    /// not-comprehended IE marked ignore or notify, and with no RAN UE NGAP ID (which
+    /// is criticality ignore), all of which the hand-written parser refused or
+    /// reported nothing for; one marked reject terminates the procedure locally and
+    /// leaves the UE waiting, T3550 still armed to retransmit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ics_response_through_dispatch_applies_section_10_3_4() {
+        use crate::gmm_sm::GmmState::{InitialContextSetup, Registered};
+        use crate::ngap_asn1::tests::{
+            ics_outcome_with_raw_ie, ics_outcome_without_ie, ics_response_pdu,
+        };
+        let mut ngap = test_ngap_server().await;
+        let ran = 417_700u32;
+        let cases: [(u64, Vec<u8>, (bool, crate::gmm_sm::GmmState, bool)); 5] = [
+            (
+                7_417_701,
+                ics_response_pdu(7_417_701, ran),
+                (true, Registered, false),
+            ),
+            (
+                7_417_702,
+                ics_outcome_with_raw_ie(&ics_response_pdu(7_417_702, ran), 9999, 1),
+                (true, Registered, false),
+            ),
+            (
+                7_417_703,
+                ics_outcome_with_raw_ie(&ics_response_pdu(7_417_703, ran), 9999, 2),
+                (true, Registered, false),
+            ),
+            (
+                7_417_704,
+                ics_outcome_without_ie(&ics_response_pdu(7_417_704, ran), 85),
+                (true, Registered, false),
+            ),
+            (
+                7_417_705,
+                ics_outcome_with_raw_ie(&ics_response_pdu(7_417_705, ran), 9999, 0),
+                (false, InitialContextSetup, true),
+            ),
+        ];
+        for (amf_ue_ngap_id, pdu, expected) in cases {
+            ue_awaiting_ics(&mut ngap, amf_ue_ngap_id, ran);
+            assert_eq!(
+                (pdu[0], pdu[1]),
+                (0x20, 14),
+                "SuccessfulOutcome of procedure 14"
+            );
+            // The notify case's Error Indication send fails on association 1, which
+            // has no socket; that is best effort and must not stop the procedure.
+            let _ = ngap.process_ngap_message(1, &pdu).await;
+            assert_eq!(
+                ics_progress(&ngap, amf_ue_ngap_id),
+                expected,
+                "UE {amf_ue_ngap_id}"
+            );
+        }
+    }
+
+    /// **#417 stage 7.** An ICS Failure entering at `process_ngap_message` --
+    /// procedure 14, UnsuccessfulOutcome -- releases the UE, including when it omits
+    /// the RAN UE NGAP ID (criticality ignore: the AMF's stored one is used) or
+    /// carries a not-comprehended notify IE; one carrying a reject IE terminates the
+    /// procedure locally and releases nothing, as does one naming no AMF UE NGAP ID.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ics_failure_through_dispatch_releases_the_ue() {
+        use crate::ngap_asn1::tests::{
+            ics_failure_pdu, ics_outcome_with_raw_ie, ics_outcome_without_ie,
+        };
+        let mut ngap = test_ngap_server().await;
+        let ran = 417_800u32;
+        let cause = || {
+            nextgcore_asn1c::ngap::cause::Cause::RadioNetwork(
+                nextgcore_asn1c::ngap::cause::CauseRadioNetwork::Unspecified,
+            )
+        };
+        let cases: [(u64, Vec<u8>, bool); 5] = [
+            (7_417_801, ics_failure_pdu(7_417_801, ran, cause()), true),
+            (
+                7_417_802,
+                ics_outcome_without_ie(&ics_failure_pdu(7_417_802, ran, cause()), 85),
+                true,
+            ),
+            (
+                7_417_803,
+                ics_outcome_with_raw_ie(&ics_failure_pdu(7_417_803, ran, cause()), 9999, 2),
+                true,
+            ),
+            (
+                7_417_804,
+                ics_outcome_with_raw_ie(&ics_failure_pdu(7_417_804, ran, cause()), 9999, 0),
+                false,
+            ),
+            (
+                7_417_805,
+                ics_outcome_without_ie(&ics_failure_pdu(7_417_805, ran, cause()), 10),
+                false,
+            ),
+        ];
+        for (amf_ue_ngap_id, pdu, released) in cases {
+            ue_awaiting_ics(&mut ngap, amf_ue_ngap_id, ran);
+            assert_eq!(
+                (pdu[0], pdu[1]),
+                (0x40, 14),
+                "UnsuccessfulOutcome of procedure 14"
+            );
+            // Only the Release Command send can fail here (association 1 has no
+            // socket); the UE is forgotten before it.
+            let _ = ngap.process_ngap_message(1, &pdu).await;
+            assert_eq!(
+                !ngap.ue_auth_state.contains(amf_ue_ngap_id),
+                released,
+                "UE {amf_ue_ngap_id}"
+            );
+        }
     }
 
     // ------------------------------------------------------------------

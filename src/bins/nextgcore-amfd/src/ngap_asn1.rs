@@ -860,21 +860,6 @@ pub fn build_pdu_session_resource_setup_request_asn1(
     }
 }
 
-/// Convert an AMF-context S-NSSAI (SD packed as a u32) to the nextgcore-ngap wire
-/// S-NSSAI (SD as a 3-byte big-endian array).
-fn amf_snssai_to_ngap(s: &crate::context::SNssai) -> SNssai {
-    SNssai {
-        sst: s.sst,
-        sd: s.sd.map(|sd_val| {
-            [
-                ((sd_val >> 16) & 0xFF) as u8,
-                ((sd_val >> 8) & 0xFF) as u8,
-                (sd_val & 0xFF) as u8,
-            ]
-        }),
-    }
-}
-
 /// Map the 8-bit replayed NAS UE security capability octet (TS 24.501
 /// §9.11.3.54, bit 8 / 0x80 = the null algorithm xEA0/xIA0) onto the 16-bit
 /// NGAP BIT STRING field (TS 38.413 §9.3.1.86). In NGAP the null algorithm is
@@ -887,24 +872,28 @@ fn nas_caps_octet_to_ngap_bits(octet: u8) -> u16 {
     (octet as u16) << 9
 }
 
-/// Build an Initial Context Setup Request with proper ASN.1 APER encoding
-/// (TS 38.413 §8.3.1 / §9.2.2.1).
+/// Build an Initial Context Setup Request (TS 38.413 §8.3.1 / §9.2.2.1) with the
+/// GENERATED codec (#417 stage 7).
 ///
 /// The GUAMI is taken from the AMF's first served GUAMI. The replayed UE
 /// security capabilities and KgNB (the UE Security Key) come from the live
-/// AMF UE security context — nothing is hardcoded. The protected initial
+/// AMF UE security context -- nothing is hardcoded. The protected initial
 /// Registration Accept rides inside the request as the NAS-PDU
 /// (TS 23.502 §4.2.2.2.2 step 16).
 ///
-/// amfd-08 (FLAGGED / blocked on nextgcore-ngap): the OPTIONAL Mobility Restriction
-/// List and Masked IMEISV IEs are not emitted. Both are optional in
-/// TS 38.413 §9.2.2.1, so omitting them is conformant for the non-roaming /
-/// no-forbidden-area case (the matched-sim path). Emitting them requires the
-/// shared `nextgcore_ngap::types::InitialContextSetupRequest` struct + builder to
-/// expose those fields first (an additive shared-lib change, out of this
-/// amfd-only change's scope). Tracked for a follow-up that lands the nextgcore-ngap
-/// fields, then populates MobilityRestrictionList from the UE's roaming/
-/// forbidden-area policy and Masked IMEISV from the 5GMM context.
+/// The IEs go in object-set order with the object set's criticalities (§9.4.1,
+/// `InitialContextSetupRequestIEs`). The hand-written encoder this replaced got
+/// two of those wrong on every production request: it appended the UE AMBR
+/// AFTER the NAS-PDU, where the object set puts it fourth, and it marked the
+/// NAS-PDU "reject" where the object set says "ignore". Every other byte is
+/// unchanged: `initial_context_setup_request_generated_matches_hand_written`.
+///
+/// amfd-08: the OPTIONAL Mobility Restriction List and Masked IMEISV IEs are
+/// not emitted. Both are optional in TS 38.413 §9.2.2.1, so omitting them is
+/// conformant for the non-roaming / no-forbidden-area case. No PDU Session
+/// Resource Setup List is sent either -- sessions are set up afterwards with
+/// their own PDU Session Resource Setup -- so the UE AMBR, which §9.2.2.1 makes
+/// conditional on that list, is sent only when the subscription carries one.
 #[allow(clippy::too_many_arguments)]
 pub fn build_initial_context_setup_request_asn1(
     ctx: &AmfContext,
@@ -916,38 +905,119 @@ pub fn build_initial_context_setup_request_asn1(
     nas_pdu: Option<&[u8]>,
     ue_ambr: Option<(u64, u64)>,
 ) -> Option<Vec<u8>> {
+    use ngap_gen::{
+        InitialContextSetupRequest, InitialContextSetupRequestProtocolIEs,
+        InitialContextSetupRequestProtocolIEs_Entry as Entry,
+        InitialContextSetupRequestProtocolIEs_EntryValue as Ie, ProtocolIE_ID, NGAP_PDU,
+    };
+
     // GUAMI (mandatory): the AMF's first served GUAMI.
     let served = ctx.served_guami.first()?;
-    let guami = Guami {
-        plmn_identity: encode_plmn_id(&served.plmn_id),
-        amf_region_id: served.amf_id.region,
-        amf_set_id: served.amf_id.set,
-        amf_pointer: served.amf_id.pointer,
+
+    let reject = ngap_gen::Criticality(ngap_gen::Criticality::REJECT);
+    let entry = |id: u16, criticality: &ngap_gen::Criticality, value: Ie| Entry {
+        id: ProtocolIE_ID(id),
+        criticality: criticality.clone(),
+        value,
     };
-
-    let allowed: Vec<SNssai> = allowed_nssai.iter().map(amf_snssai_to_ngap).collect();
-
+    let mut ies = vec![
+        entry(
+            ngap_gen::ID_AMF_UE_NGAP_ID,
+            &reject,
+            Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(amf_ue_ngap_id)),
+        ),
+        entry(
+            ngap_gen::ID_RAN_UE_NGAP_ID,
+            &reject,
+            Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(ran_ue_ngap_id)),
+        ),
+    ];
+    // BitRate ::= INTEGER (0..4000000000000, ...) (§9.3.1.4): the generated
+    // encoder refuses a value past the root, as the hand-written one did.
+    if let Some((dl, ul)) = ue_ambr {
+        ies.push(entry(
+            ngap_gen::ID_UE_AGGREGATE_MAXIMUM_BIT_RATE,
+            &reject,
+            Ie::Id_UEAggregateMaximumBitRate(ngap_gen::UEAggregateMaximumBitRate {
+                ue_aggregate_maximum_bit_rate_dl: ngap_gen::BitRate(dl),
+                ue_aggregate_maximum_bit_rate_ul: ngap_gen::BitRate(ul),
+                ie_extensions: None,
+            }),
+        ));
+    }
+    ies.push(entry(
+        ngap_gen::ID_GUAMI,
+        &reject,
+        Ie::Id_GUAMI(ngap_gen::GUAMI {
+            plmn_identity: ngap_gen::PLMNIdentity(encode_plmn_id(&served.plmn_id).to_vec()),
+            amf_region_id: ngap_gen::AMFRegionID(low_bits(u64::from(served.amf_id.region), 8)),
+            amf_set_id: ngap_gen::AMFSetID(low_bits(u64::from(served.amf_id.set), 10)),
+            amf_pointer: ngap_gen::AMFPointer(low_bits(u64::from(served.amf_id.pointer), 6)),
+            ie_extensions: None,
+        }),
+    ));
+    ies.push(entry(
+        ngap_gen::ID_ALLOWED_NSSAI,
+        &reject,
+        Ie::Id_AllowedNSSAI(ngap_gen::AllowedNSSAI(
+            allowed_nssai
+                .iter()
+                .map(|s| ngap_gen::AllowedNSSAI_Item {
+                    s_nssai: generated_s_nssai(s),
+                    ie_extensions: None,
+                })
+                .collect(),
+        )),
+    ));
     // Replayed UE security capabilities (TS 38.413 §9.3.1.86). 5G fields carry
-    // the verbatim NAS algorithm octets; E-UTRA fields carry the EEA/EIA octets.
-    let ue_security_capabilities = UeSecurityCapabilities {
-        nr_encryption_algorithms: nas_caps_octet_to_ngap_bits(ue_security_capability.ea),
-        nr_integrity_algorithms: nas_caps_octet_to_ngap_bits(ue_security_capability.ia),
-        eutra_encryption_algorithms: nas_caps_octet_to_ngap_bits(ue_security_capability.eea),
-        eutra_integrity_algorithms: nas_caps_octet_to_ngap_bits(ue_security_capability.eia),
-    };
+    // the NAS algorithm octets; E-UTRA fields carry the EEA/EIA octets.
+    let algorithms = |octet: u8| low_bits(u64::from(nas_caps_octet_to_ngap_bits(octet)), 16);
+    ies.push(entry(
+        ngap_gen::ID_UE_SECURITY_CAPABILITIES,
+        &reject,
+        Ie::Id_UESecurityCapabilities(ngap_gen::UESecurityCapabilities {
+            n_rencryption_algorithms: ngap_gen::NRencryptionAlgorithms(algorithms(
+                ue_security_capability.ea,
+            )),
+            n_rintegrity_protection_algorithms: ngap_gen::NRintegrityProtectionAlgorithms(
+                algorithms(ue_security_capability.ia),
+            ),
+            eutr_aencryption_algorithms: ngap_gen::EUTRAencryptionAlgorithms(algorithms(
+                ue_security_capability.eea,
+            )),
+            eutr_aintegrity_protection_algorithms: ngap_gen::EUTRAintegrityProtectionAlgorithms(
+                algorithms(ue_security_capability.eia),
+            ),
+            ie_extensions: None,
+        }),
+    ));
+    ies.push(entry(
+        ngap_gen::ID_SECURITY_KEY,
+        &reject,
+        Ie::Id_SecurityKey(ngap_gen::SecurityKey(bitvec::vec::BitVec::<
+            u8,
+            bitvec::order::Msb0,
+        >::from_slice(security_key))),
+    ));
+    if let Some(nas_pdu) = nas_pdu {
+        ies.push(entry(
+            ngap_gen::ID_NAS_PDU,
+            &ngap_gen::Criticality(ngap_gen::Criticality::IGNORE),
+            Ie::Id_NAS_PDU(ngap_gen::NAS_PDU(nas_pdu.to_vec())),
+        ));
+    }
 
-    let msg = InitialContextSetupRequest {
-        amf_ue_ngap_id,
-        ran_ue_ngap_id,
-        guami,
-        allowed_nssai: allowed,
-        ue_security_capabilities,
-        security_key: *security_key,
-        nas_pdu: nas_pdu.map(|p| p.to_vec()),
-        ue_ambr: ue_ambr.map(|(dl, ul)| UeAmbrInfo { dl, ul }),
-    };
-
-    match builder::build_initial_context_setup_request(&msg) {
+    let pdu = NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_INITIAL_CONTEXT_SETUP),
+        criticality: reject,
+        value: ngap_gen::InitiatingMessageValue::Id_InitialContextSetup(
+            InitialContextSetupRequest {
+                protocol_i_es: InitialContextSetupRequestProtocolIEs(ies),
+            },
+        ),
+    });
+    // Never log the PDU or the IE values: the Security Key is in it.
+    match nextgcore_ngap_gen::encode(&pdu) {
         Ok(bytes) => {
             log::debug!(
                 "Built Initial Context Setup Request: {} bytes, amf_ue_ngap_id={amf_ue_ngap_id}, \
@@ -958,47 +1028,199 @@ pub fn build_initial_context_setup_request_asn1(
             );
             Some(bytes)
         }
-        Err(e) => {
-            log::error!("Failed to encode Initial Context Setup Request: {e:?}");
+        Err(_) => {
+            // The error's Debug form names the failing field and may carry its
+            // value; the Security Key must not reach a log.
+            log::error!(
+                "Failed to encode Initial Context Setup Request for amf_ue_ngap_id={amf_ue_ngap_id}"
+            );
             None
         }
     }
 }
 
-/// Decode an Initial Context Setup Response (gNB -> AMF, TS 38.413 §9.2.2.2).
-/// Returns (amf_ue_ngap_id, ran_ue_ngap_id) on success.
-pub fn parse_initial_context_setup_response_asn1(data: &[u8]) -> Option<(u64, u32)> {
-    match parser::decode_ngap_pdu(data) {
-        Ok(NgapMessage::InitialContextSetupResponse(resp)) => {
-            Some((resp.amf_ue_ngap_id, resp.ran_ue_ngap_id))
-        }
-        Ok(other) => {
-            log::warn!("Expected InitialContextSetupResponse, got {other:?}");
-            None
-        }
+/// What an Initial Context Setup Response or Failure decodes to (TS 38.413
+/// §10.3.4.2 / §10.3.5 for a RESPONSE message; every IE in both carries
+/// criticality ignore).
+#[derive(Debug, Clone, PartialEq)]
+pub enum InitialContextSetupOutcomeDecode {
+    /// Decoded. The IDs are `None` when the gNB left them out: they are
+    /// criticality ignore, so their absence does not fail the message (§10.3.5),
+    /// and the handler decides what it can do without them.
+    Decoded {
+        /// The AMF UE NGAP ID the gNB names.
+        amf_ue_ngap_id: Option<u64>,
+        /// The RAN UE NGAP ID the gNB names.
+        ran_ue_ngap_id: Option<u32>,
+        /// The Failure's Cause as `(group, value)`; `None` for a Response, or a
+        /// Failure that left it out.
+        cause: Option<(u8, i64)>,
+        /// The Error Indication reporting not-comprehended IEs marked "ignore IE
+        /// and notify sender", if any (§10.3.4.2).
+        error_indication: Option<CriticalityErrorIndication>,
+    },
+    /// A not-comprehended IE was marked "reject": the procedure is
+    /// "unsuccessfully terminated" and handled locally (§10.3.4.2), with no
+    /// message to the gNB. The IEs are for the log.
+    Failed(Vec<IeDiagnostic>),
+    /// Not decodable, or not the expected message.
+    Undecodable,
+}
+
+/// Decode an Initial Context Setup Response (gNB -> AMF, TS 38.413 §9.2.2.2)
+/// with the GENERATED codec (#417 stage 7), applying §10.3.4.2 for a response.
+///
+/// The hand-written parser this replaced refused the message on a missing ID
+/// and on a not-comprehended IE marked reject, and accepted one marked "ignore
+/// IE and notify sender" without reporting it. Every message it accepted
+/// decodes to the same IDs:
+/// `initial_context_setup_response_generated_decode_matches_hand_written`.
+pub fn decode_initial_context_setup_response_asn1(data: &[u8]) -> InitialContextSetupOutcomeDecode {
+    use ngap_gen::{
+        InitialContextSetupResponseProtocolIEs_EntryValue as Ie, SuccessfulOutcomeValue,
+    };
+    use InitialContextSetupOutcomeDecode::{Decoded, Failed, Undecodable};
+
+    let (pdu, unknown) = match nextgcore_ngap_gen::decode_with_unknown_ies(data) {
+        Ok(decoded) => decoded,
         Err(e) => {
             log::warn!("Failed to decode Initial Context Setup Response: {e:?}");
-            None
+            return Undecodable;
         }
+    };
+    let ngap_gen::NGAP_PDU::SuccessfulOutcome(ngap_gen::SuccessfulOutcome {
+        criticality,
+        value: SuccessfulOutcomeValue::Id_InitialContextSetup(response),
+        ..
+    }) = pdu
+    else {
+        log::warn!("Expected InitialContextSetupResponse");
+        return Undecodable;
+    };
+    let Some((reject, notify)) = classify_unknown_ies(&unknown, "Initial Context Setup Response")
+    else {
+        return Undecodable;
+    };
+    if !reject.is_empty() {
+        return Failed(reject);
+    }
+
+    let mut amf_ue_ngap_id = None;
+    let mut ran_ue_ngap_id = None;
+    for entry in response.protocol_i_es.0 {
+        match entry.value {
+            Ie::Id_AMF_UE_NGAP_ID(v) => amf_ue_ngap_id = Some(v.0),
+            Ie::Id_RAN_UE_NGAP_ID(v) => ran_ue_ngap_id = Some(v.0),
+            // Comprehended, and not used: the AMF's request carries no PDU
+            // Session Resource Setup List, so these lists answer nothing.
+            Ie::Id_PDUSessionResourceSetupListCxtRes(_)
+            | Ie::Id_PDUSessionResourceFailedToSetupListCxtRes(_)
+            | Ie::Id_CriticalityDiagnostics(_) => {}
+        }
+    }
+    Decoded {
+        amf_ue_ngap_id,
+        ran_ue_ngap_id,
+        cause: None,
+        error_indication: ics_error_indication(
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            ngap_gen::TriggeringMessage::SUCCESSFUL_OUTCOME,
+            criticality.0,
+            notify,
+        ),
     }
 }
 
-/// Decode an Initial Context Setup Failure (gNB -> AMF, TS 38.413 §9.2.2.3).
-/// Returns (amf_ue_ngap_id, ran_ue_ngap_id) on success.
-pub fn parse_initial_context_setup_failure_asn1(data: &[u8]) -> Option<(u64, u32)> {
-    match parser::decode_ngap_pdu(data) {
-        Ok(NgapMessage::InitialContextSetupFailure(fail)) => {
-            Some((fail.amf_ue_ngap_id, fail.ran_ue_ngap_id))
-        }
-        Ok(other) => {
-            log::warn!("Expected InitialContextSetupFailure, got {other:?}");
-            None
-        }
+/// Decode an Initial Context Setup Failure (gNB -> AMF, TS 38.413 §9.2.2.3)
+/// with the GENERATED codec (#417 stage 7), applying §10.3.4.2 for a response
+/// (an unsuccessful outcome is a response message too).
+///
+/// As for the Response: the hand-written parser refused a missing ID or a
+/// not-comprehended IE marked reject, accepted a notify one without reporting
+/// it, and every message it accepted decodes to the same IDs and Cause:
+/// `initial_context_setup_failure_generated_decode_matches_hand_written`.
+pub fn decode_initial_context_setup_failure_asn1(data: &[u8]) -> InitialContextSetupOutcomeDecode {
+    use ngap_gen::{
+        InitialContextSetupFailureProtocolIEs_EntryValue as Ie, UnsuccessfulOutcomeValue,
+    };
+    use InitialContextSetupOutcomeDecode::{Decoded, Failed, Undecodable};
+
+    let (pdu, unknown) = match nextgcore_ngap_gen::decode_with_unknown_ies(data) {
+        Ok(decoded) => decoded,
         Err(e) => {
             log::warn!("Failed to decode Initial Context Setup Failure: {e:?}");
-            None
+            return Undecodable;
+        }
+    };
+    let ngap_gen::NGAP_PDU::UnsuccessfulOutcome(ngap_gen::UnsuccessfulOutcome {
+        criticality,
+        value: UnsuccessfulOutcomeValue::Id_InitialContextSetup(failure),
+        ..
+    }) = pdu
+    else {
+        log::warn!("Expected InitialContextSetupFailure");
+        return Undecodable;
+    };
+    let Some((reject, notify)) = classify_unknown_ies(&unknown, "Initial Context Setup Failure")
+    else {
+        return Undecodable;
+    };
+    if !reject.is_empty() {
+        return Failed(reject);
+    }
+
+    let mut amf_ue_ngap_id = None;
+    let mut ran_ue_ngap_id = None;
+    let mut cause = None;
+    for entry in failure.protocol_i_es.0 {
+        match entry.value {
+            Ie::Id_AMF_UE_NGAP_ID(v) => amf_ue_ngap_id = Some(v.0),
+            Ie::Id_RAN_UE_NGAP_ID(v) => ran_ue_ngap_id = Some(v.0),
+            Ie::Id_Cause(c) => cause = cause_pair(&c),
+            // Comprehended, and not used (no PDU Session Resource Setup List
+            // was requested).
+            Ie::Id_PDUSessionResourceFailedToSetupListCxtFail(_)
+            | Ie::Id_CriticalityDiagnostics(_) => {}
         }
     }
+    Decoded {
+        amf_ue_ngap_id,
+        ran_ue_ngap_id,
+        cause,
+        error_indication: ics_error_indication(
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            ngap_gen::TriggeringMessage::UNSUCCESSFUL_OUTCOME,
+            criticality.0,
+            notify,
+        ),
+    }
+}
+
+/// The Error Indication reporting an Initial Context Setup response's "ignore
+/// IE and notify sender" IEs (§10.3.4.2), or `None` when there are none.
+fn ics_error_indication(
+    amf_ue_ngap_id: Option<u64>,
+    ran_ue_ngap_id: Option<u32>,
+    triggering_message: u8,
+    procedure_criticality: u8,
+    notify: Vec<IeDiagnostic>,
+) -> Option<CriticalityErrorIndication> {
+    if notify.is_empty() {
+        return None;
+    }
+    Some(CriticalityErrorIndication {
+        amf_ue_ngap_id,
+        ran_ue_ngap_id,
+        cause_protocol: ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+        procedure: ReportedProcedure {
+            procedure_code: ngap_gen::ID_INITIAL_CONTEXT_SETUP,
+            triggering_message,
+            procedure_criticality,
+        },
+        diagnostics: notify,
+    })
 }
 
 /// The `PDUSessionResourceReleaseCommandTransfer` (TS 38.413 §9.3.4.12) the
@@ -2299,6 +2521,125 @@ pub(crate) mod tests {
     /// compared against.
     mod hand_written_oracle {
         use super::super::*;
+
+        /// Convert an AMF-context S-NSSAI (SD packed as a u32) to the nextgcore-ngap wire
+        /// S-NSSAI (SD as a 3-byte big-endian array).
+        fn amf_snssai_to_ngap(s: &crate::context::SNssai) -> SNssai {
+            SNssai {
+                sst: s.sst,
+                sd: s.sd.map(|sd_val| {
+                    [
+                        ((sd_val >> 16) & 0xFF) as u8,
+                        ((sd_val >> 8) & 0xFF) as u8,
+                        (sd_val & 0xFF) as u8,
+                    ]
+                }),
+            }
+        }
+
+        /// The Initial Context Setup Request encoder and Response/Failure parsers as
+        /// they were before #417 stage 7 moved the family onto the generated codec.
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn hand_written_initial_context_setup_request(
+            ctx: &AmfContext,
+            amf_ue_ngap_id: u64,
+            ran_ue_ngap_id: u32,
+            allowed_nssai: &[crate::context::SNssai],
+            ue_security_capability: &crate::context::UeSecurityCapability,
+            security_key: &[u8; 32],
+            nas_pdu: Option<&[u8]>,
+            ue_ambr: Option<(u64, u64)>,
+        ) -> Option<Vec<u8>> {
+            // GUAMI (mandatory): the AMF's first served GUAMI.
+            let served = ctx.served_guami.first()?;
+            let guami = Guami {
+                plmn_identity: encode_plmn_id(&served.plmn_id),
+                amf_region_id: served.amf_id.region,
+                amf_set_id: served.amf_id.set,
+                amf_pointer: served.amf_id.pointer,
+            };
+
+            let allowed: Vec<SNssai> = allowed_nssai.iter().map(amf_snssai_to_ngap).collect();
+
+            // Replayed UE security capabilities (TS 38.413 §9.3.1.86). 5G fields carry
+            // the verbatim NAS algorithm octets; E-UTRA fields carry the EEA/EIA octets.
+            let ue_security_capabilities = UeSecurityCapabilities {
+                nr_encryption_algorithms: nas_caps_octet_to_ngap_bits(ue_security_capability.ea),
+                nr_integrity_algorithms: nas_caps_octet_to_ngap_bits(ue_security_capability.ia),
+                eutra_encryption_algorithms: nas_caps_octet_to_ngap_bits(
+                    ue_security_capability.eea,
+                ),
+                eutra_integrity_algorithms: nas_caps_octet_to_ngap_bits(ue_security_capability.eia),
+            };
+
+            let msg = InitialContextSetupRequest {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                guami,
+                allowed_nssai: allowed,
+                ue_security_capabilities,
+                security_key: *security_key,
+                nas_pdu: nas_pdu.map(|p| p.to_vec()),
+                ue_ambr: ue_ambr.map(|(dl, ul)| UeAmbrInfo { dl, ul }),
+            };
+
+            match builder::build_initial_context_setup_request(&msg) {
+                Ok(bytes) => {
+                    log::debug!(
+                        "Built Initial Context Setup Request: {} bytes, amf_ue_ngap_id={amf_ue_ngap_id}, \
+                         ran_ue_ngap_id={ran_ue_ngap_id}, allowed_nssai={}, nas_pdu={}",
+                        bytes.len(),
+                        allowed_nssai.len(),
+                        nas_pdu.map(|p| p.len()).unwrap_or(0)
+                    );
+                    Some(bytes)
+                }
+                Err(e) => {
+                    log::error!("Failed to encode Initial Context Setup Request: {e:?}");
+                    None
+                }
+            }
+        }
+
+        /// Decode an Initial Context Setup Response (gNB -> AMF, TS 38.413 §9.2.2.2).
+        /// Returns (amf_ue_ngap_id, ran_ue_ngap_id) on success.
+        pub(crate) fn hand_written_parse_initial_context_setup_response(
+            data: &[u8],
+        ) -> Option<(u64, u32)> {
+            match parser::decode_ngap_pdu(data) {
+                Ok(NgapMessage::InitialContextSetupResponse(resp)) => {
+                    Some((resp.amf_ue_ngap_id, resp.ran_ue_ngap_id))
+                }
+                Ok(other) => {
+                    log::warn!("Expected InitialContextSetupResponse, got {other:?}");
+                    None
+                }
+                Err(e) => {
+                    log::warn!("Failed to decode Initial Context Setup Response: {e:?}");
+                    None
+                }
+            }
+        }
+
+        /// Decode an Initial Context Setup Failure (gNB -> AMF, TS 38.413 §9.2.2.3).
+        /// Returns (amf_ue_ngap_id, ran_ue_ngap_id) on success.
+        pub(crate) fn hand_written_parse_initial_context_setup_failure(
+            data: &[u8],
+        ) -> Option<(u64, u32)> {
+            match parser::decode_ngap_pdu(data) {
+                Ok(NgapMessage::InitialContextSetupFailure(fail)) => {
+                    Some((fail.amf_ue_ngap_id, fail.ran_ue_ngap_id))
+                }
+                Ok(other) => {
+                    log::warn!("Expected InitialContextSetupFailure, got {other:?}");
+                    None
+                }
+                Err(e) => {
+                    log::warn!("Failed to decode Initial Context Setup Failure: {e:?}");
+                    None
+                }
+            }
+        }
 
         /// The PDU Session Resource Setup Request encoder as it was before
         /// #417 stage 6 moved it onto the generated codec.
@@ -3848,9 +4189,18 @@ pub(crate) mod tests {
         )
         .expect("build ICS response");
         assert_eq!(
-            parse_initial_context_setup_response_asn1(&resp),
+            hand_written_oracle::hand_written_parse_initial_context_setup_response(&resp),
             Some((7, 9))
         );
+        assert!(matches!(
+            decode_initial_context_setup_response_asn1(&resp),
+            InitialContextSetupOutcomeDecode::Decoded {
+                amf_ue_ngap_id: Some(7),
+                ran_ue_ngap_id: Some(9),
+                cause: None,
+                error_indication: None,
+            }
+        ));
 
         let fail = builder::build_initial_context_setup_failure(
             &nextgcore_ngap::types::InitialContextSetupFailure {
@@ -3861,9 +4211,18 @@ pub(crate) mod tests {
         )
         .expect("build ICS failure");
         assert_eq!(
-            parse_initial_context_setup_failure_asn1(&fail),
+            hand_written_oracle::hand_written_parse_initial_context_setup_failure(&fail),
             Some((11, 13))
         );
+        assert!(matches!(
+            decode_initial_context_setup_failure_asn1(&fail),
+            InitialContextSetupOutcomeDecode::Decoded {
+                amf_ue_ngap_id: Some(11),
+                ran_ue_ngap_id: Some(13),
+                cause: Some((crate::ngap_handler::cause_group::RADIO_NETWORK, 0)),
+                error_indication: None,
+            }
+        ));
     }
 
     // ====================================================================
@@ -6747,5 +7106,672 @@ pub(crate) mod tests {
         fn into_bytes(self) -> Vec<u8> {
             self.bytes
         }
+    }
+
+    // ====================================================================
+    // #417 stage 7: Initial Context Setup on the generated codec
+    // ====================================================================
+
+    use hand_written_oracle::{
+        hand_written_initial_context_setup_request,
+        hand_written_parse_initial_context_setup_failure,
+        hand_written_parse_initial_context_setup_response,
+    };
+
+    /// `InitialContextSetupRequestIEs` object-set order (`ngap-17.9.asn`) of the
+    /// IEs the AMF sends: AMF/RAN UE NGAP ID, UE AMBR, GUAMI, Allowed NSSAI, UE
+    /// Security Capabilities, Security Key, NAS-PDU.
+    const ICS_REQUEST_ORDER: [u16; 8] = [10, 85, 110, 28, 0, 119, 94, 38];
+
+    /// `BitRate`'s upper bound, INTEGER (0..4000000000000, ...) (§9.3.1.4).
+    const BIT_RATE_MAX: u64 = 4_000_000_000_000;
+
+    /// The hand-written ICS Request with its two wire deviations corrected --
+    /// the IEs put in object-set order and the NAS-PDU marked "ignore" -- done
+    /// with the HAND-WRITTEN PDU layer (nextgcore-asn1c), so the expectation owes
+    /// nothing to the generated codec. Every IE value stays the hand-written
+    /// encoder's own octets.
+    fn hand_written_ics_corrected(bytes: &[u8]) -> Vec<u8> {
+        use nextgcore_asn1c::ngap::{InitiatingMessageValue, NgapPdu};
+        use nextgcore_asn1c::per::{AperDecode, AperDecoder, AperEncode, AperEncoder};
+        let mut pdu = NgapPdu::decode_aper(&mut AperDecoder::new(bytes)).expect("decode");
+        let NgapPdu::InitiatingMessage(ref mut msg) = pdu else {
+            panic!("initiatingMessage");
+        };
+        let InitiatingMessageValue::InitialContextSetupRequest(ref mut container) = msg.value
+        else {
+            panic!("Initial Context Setup Request");
+        };
+        let rank = |id: u16| {
+            ICS_REQUEST_ORDER
+                .iter()
+                .position(|&known| known == id)
+                .expect("an IE the AMF sends")
+        };
+        container.ies.sort_by_key(|field| rank(field.id.0));
+        for field in &mut container.ies {
+            if field.id.0 == ngap_gen::ID_NAS_PDU {
+                field.criticality = nextgcore_asn1c::ngap::Criticality::Ignore;
+            }
+        }
+        let mut encoder = AperEncoder::new();
+        pdu.encode_aper(&mut encoder).expect("encode");
+        encoder.align();
+        encoder.into_bytes().to_vec()
+    }
+
+    /// The IE ids and criticalities of an encoded PDU, read by the hand-written
+    /// PDU layer.
+    fn raw_ies(bytes: &[u8]) -> Vec<(u16, nextgcore_asn1c::ngap::Criticality)> {
+        use nextgcore_asn1c::ngap::NgapPdu;
+        use nextgcore_asn1c::per::{AperDecode, AperDecoder};
+        NgapPdu::decode_aper(&mut AperDecoder::new(bytes))
+            .expect("decode")
+            .protocol_ies()
+            .ies
+            .iter()
+            .map(|field| (field.id.0, field.criticality))
+            .collect()
+    }
+
+    /// One Initial Context Setup Request the AMF can be asked to build.
+    struct IcsCase {
+        ctx: AmfContext,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        allowed: Vec<crate::context::SNssai>,
+        caps: crate::context::UeSecurityCapability,
+        key: [u8; 32],
+        nas: Option<Vec<u8>>,
+        ambr: Option<(u64, u64)>,
+    }
+
+    impl IcsCase {
+        fn build(
+            &self,
+            f: fn(
+                &AmfContext,
+                u64,
+                u32,
+                &[crate::context::SNssai],
+                &crate::context::UeSecurityCapability,
+                &[u8; 32],
+                Option<&[u8]>,
+                Option<(u64, u64)>,
+            ) -> Option<Vec<u8>>,
+        ) -> Option<Vec<u8>> {
+            f(
+                &self.ctx,
+                self.amf_ue_ngap_id,
+                self.ran_ue_ngap_id,
+                &self.allowed,
+                &self.caps,
+                &self.key,
+                self.nas.as_deref(),
+                self.ambr,
+            )
+        }
+
+        /// The case without its key, for a failure message: the Security Key
+        /// never goes into test output.
+        fn describe(&self) -> String {
+            format!(
+                "amf={} ran={} guami={:?} nssai={:?} caps=({:02x},{:02x},{:02x},{:02x}) nas_len={:?} \
+                 ambr={:?}",
+                self.amf_ue_ngap_id,
+                self.ran_ue_ngap_id,
+                self.ctx.served_guami.first().map(|g| (g.amf_id.region, g.amf_id.set, g.amf_id.pointer)),
+                self.allowed,
+                self.caps.ea,
+                self.caps.ia,
+                self.caps.eea,
+                self.caps.eia,
+                self.nas.as_ref().map(Vec::len),
+                self.ambr
+            )
+        }
+    }
+
+    fn ics_baseline() -> IcsCase {
+        IcsCase {
+            ctx: create_test_context(),
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 2,
+            allowed: vec![crate::context::SNssai {
+                sst: 1,
+                sd: Some(0x010203),
+            }],
+            caps: crate::context::UeSecurityCapability {
+                ea: 0xF0,
+                ia: 0xF0,
+                eea: 0xF0,
+                eia: 0x70,
+            },
+            key: core::array::from_fn(|i| i as u8),
+            nas: Some(vec![
+                0x7E, 0x02, 0x11, 0x22, 0x33, 0x44, 0x01, 0x7E, 0x00, 0x42,
+            ]),
+            ambr: Some((1_000_000_000, 500_000_000)),
+        }
+    }
+
+    /// Every field variant the AMF can produce, one dimension at a time from
+    /// the baseline, each with and without the NAS-PDU and UE AMBR.
+    fn ics_cases() -> Vec<IcsCase> {
+        let mut cases = Vec::new();
+        let mut push = |mutate: &dyn Fn(&mut IcsCase)| {
+            for nas in [true, false] {
+                for ambr in [true, false] {
+                    let mut case = ics_baseline();
+                    mutate(&mut case);
+                    if !nas {
+                        case.nas = None;
+                    }
+                    if !ambr {
+                        case.ambr = None;
+                    }
+                    cases.push(case);
+                }
+            }
+        };
+        push(&|_| {});
+        // Every served-GUAMI bit-width edge, 2- and 3-digit MNCs.
+        for guami in rich_context().served_guami {
+            push(&|c| {
+                c.ctx.served_guami = vec![guami.clone()];
+            });
+        }
+        for &amf in &AMF_IDS {
+            for &ran in &RAN_IDS {
+                push(&|c| {
+                    c.amf_ue_ngap_id = amf;
+                    c.ran_ue_ngap_id = ran;
+                });
+            }
+        }
+        // Allowed NSSAI of every length SIZE(1..8) allows, and either side of it.
+        for len in 0..=9usize {
+            push(&|c| {
+                c.allowed = (0..len)
+                    .map(|i| crate::context::SNssai {
+                        sst: i as u8,
+                        sd: (i % 2 == 1).then_some(0xFFFFFF - i as u32),
+                    })
+                    .collect();
+            });
+        }
+        // Every value of each algorithm octet, the others fixed; and the
+        // emergency null-only set (#361).
+        for octet in 0..=255u8 {
+            push(&|c| c.caps.ea = octet);
+            push(&|c| c.caps.ia = octet);
+            push(&|c| c.caps.eea = octet);
+            push(&|c| c.caps.eia = octet);
+        }
+        push(&|c| {
+            c.caps = crate::context::UeSecurityCapability {
+                ea: 0x80,
+                ia: 0x80,
+                eea: 0x80,
+                eia: 0x80,
+            };
+        });
+        for key in [[0u8; 32], [0xFF; 32], [0x80; 32], [0x01; 32]] {
+            push(&|c| c.key = key);
+        }
+        // NAS-PDU lengths at every APER length-determinant form.
+        for len in [0usize, 1, 127, 128, 255, 256, 16_383, 16_384] {
+            push(&|c| c.nas = Some((0..len).map(|i| i as u8).collect()));
+        }
+        // BitRate ::= INTEGER (0..4000000000000, ...) at its length edges, its
+        // bound and past it.
+        for (dl, ul) in [
+            (0u64, 0u64),
+            (1, 255),
+            (256, 65_535),
+            (65_536, 16_777_215),
+            (u32::MAX as u64, 1 << 32),
+            (BIT_RATE_MAX, BIT_RATE_MAX),
+            (BIT_RATE_MAX + 1, 0),
+            (0, BIT_RATE_MAX + 1),
+            (i64::MAX as u64 + 1, 0),
+            (u64::MAX, u64::MAX),
+        ] {
+            push(&|c| c.ambr = Some((dl, ul)));
+        }
+        cases
+    }
+
+    /// #417 stage 7: the generated Initial Context Setup Request is the
+    /// hand-written one with exactly its two wire deviations corrected -- IEs in
+    /// object-set order, NAS-PDU criticality ignore (§9.4.1,
+    /// `InitialContextSetupRequestIEs`) -- across every field variant the AMF
+    /// can produce, and both refuse the same inputs. Where neither deviation
+    /// applies (no NAS-PDU, no UE AMBR) the bytes are identical outright.
+    #[test]
+    fn initial_context_setup_request_generated_matches_hand_written() {
+        let (mut compared, mut refused, mut identical, mut fragmented) = (0, 0, 0, 0);
+        for case in ics_cases() {
+            let generated = case.build(build_initial_context_setup_request_asn1);
+            let oracle = case.build(hand_written_initial_context_setup_request);
+            match (generated, oracle) {
+                (Some(generated), Some(oracle)) => {
+                    assert!(
+                        generated == hand_written_ics_corrected(&oracle),
+                        "differs beyond IE order and NAS-PDU criticality: {}",
+                        case.describe()
+                    );
+                    if case.nas.is_none() && case.ambr.is_none() {
+                        assert!(generated == oracle, "not identical: {}", case.describe());
+                        identical += 1;
+                    }
+                    compared += 1;
+                }
+                (None, None) => refused += 1,
+                // The one deliberate ceiling: the forked codec has no length
+                // determinant past 16,383 octets (X.691 §11.9.3.8 fragmentation),
+                // so a request whose initiatingMessage value needs one -- a
+                // NAS-PDU of ~16 KB -- is refused. The hand-written encoder
+                // fragments it; byte 3 is that outer length's first octet.
+                (None, Some(oracle)) if oracle[3] >= 0xC0 => fragmented += 1,
+                (generated, oracle) => panic!(
+                    "generated {} but hand-written {}: {}",
+                    if generated.is_some() {
+                        "encoded"
+                    } else {
+                        "refused"
+                    },
+                    if oracle.is_some() {
+                        "encoded"
+                    } else {
+                        "refused"
+                    },
+                    case.describe()
+                ),
+            }
+        }
+        assert!(
+            compared > 2000 && identical > 500 && refused > 0 && fragmented > 0,
+            "{compared}/{identical}/{refused}/{fragmented}"
+        );
+    }
+
+    /// The two corrections themselves, on the production shape (NAS-PDU and UE
+    /// AMBR both present): the IE order and criticalities are the object set's,
+    /// and they are NOT the hand-written encoder's.
+    #[test]
+    fn initial_context_setup_request_ie_order_and_criticality_are_the_object_sets() {
+        use nextgcore_asn1c::ngap::Criticality::{Ignore, Reject};
+        let case = ics_baseline();
+        let generated = case
+            .build(build_initial_context_setup_request_asn1)
+            .expect("build");
+        assert_eq!(
+            raw_ies(&generated),
+            vec![
+                (10, Reject),
+                (85, Reject),
+                (110, Reject),
+                (28, Reject),
+                (0, Reject),
+                (119, Reject),
+                (94, Reject),
+                (38, Ignore),
+            ]
+        );
+        let oracle = case
+            .build(hand_written_initial_context_setup_request)
+            .expect("build");
+        assert_eq!(
+            raw_ies(&oracle),
+            vec![
+                (10, Reject),
+                (85, Reject),
+                (28, Reject),
+                (0, Reject),
+                (119, Reject),
+                (94, Reject),
+                (38, Reject),
+                (110, Reject),
+            ],
+            "the hand-written encoder's deviations, pinned"
+        );
+    }
+
+    /// Golden bytes for the production shape, so the generated encoder and the
+    /// corrected oracle cannot drift together. The key is the synthetic
+    /// 0x00..0x1f, not a derived one.
+    #[test]
+    fn initial_context_setup_request_golden_bytes() {
+        let generated = ics_baseline()
+            .build(build_initial_context_setup_request_asn1)
+            .expect("build");
+        let hex: String = generated.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, GOLDEN_ICS_REQUEST);
+        // InitiatingMessage (CHOICE 0), procedure 14, criticality reject.
+        assert_eq!(&generated[..3], &[0x00, 0x0e, 0x00]);
+    }
+
+    const GOLDEN_ICS_REQUEST: &str = "000e0071000008000a00020001005500020002006e000a0c3b9aca00301dcd6500001c00070099f907020040000000050201010203007700091c000e000700038000005e0020000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f0026400b0a7e0211223344017e0042";
+
+    /// The Security Key IE carries the KgNB as its 256 bits, verbatim, and the
+    /// UE Security Capabilities drop the NAS null-algorithm bit (§9.3.1.86).
+    #[test]
+    fn initial_context_setup_request_carries_the_key_and_capabilities() {
+        let case = ics_baseline();
+        let bytes = case
+            .build(build_initial_context_setup_request_asn1)
+            .expect("build");
+        let pdu = nextgcore_ngap_gen::decode(&bytes).expect("decode");
+        let ngap_gen::NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+            value: ngap_gen::InitiatingMessageValue::Id_InitialContextSetup(req),
+            ..
+        }) = pdu
+        else {
+            panic!("Initial Context Setup Request");
+        };
+        use ngap_gen::InitialContextSetupRequestProtocolIEs_EntryValue as Ie;
+        let mut seen_key = false;
+        for entry in req.protocol_i_es.0 {
+            match entry.value {
+                Ie::Id_SecurityKey(key) => {
+                    assert!(key.0.len() == 256 && key.0.as_raw_slice() == case.key);
+                    seen_key = true;
+                }
+                Ie::Id_UESecurityCapabilities(caps) => {
+                    // NAS 0xF0 = xEA0..xEA3 -> NGAP 128-NEA1..3 = 0xE000.
+                    assert_eq!(caps.n_rencryption_algorithms.0.as_raw_slice(), [0xE0, 0x00]);
+                    assert_eq!(
+                        caps.eutr_aintegrity_protection_algorithms.0.as_raw_slice(),
+                        [0xE0, 0x00]
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert!(seen_key);
+    }
+
+    /// An ICS Response or Failure with one more IE: `id`, `criticality`, a
+    /// one-octet value -- spliced with the hand-written PDU layer, so any
+    /// length form works.
+    pub(crate) fn ics_outcome_with_raw_ie(bytes: &[u8], id: u16, criticality: u8) -> Vec<u8> {
+        use nextgcore_asn1c::ngap::{
+            Criticality, NgapPdu, ProtocolIeField, ProtocolIeId, SuccessfulOutcomeValue,
+            UnsuccessfulOutcomeValue,
+        };
+        use nextgcore_asn1c::per::{AperDecode, AperDecoder, AperEncode, AperEncoder};
+        let mut pdu = NgapPdu::decode_aper(&mut AperDecoder::new(bytes)).expect("decode");
+        let container = match pdu {
+            NgapPdu::SuccessfulOutcome(ref mut m) => match m.value {
+                SuccessfulOutcomeValue::InitialContextSetupResponse(ref mut c) => c,
+                _ => panic!("ICS Response"),
+            },
+            NgapPdu::UnsuccessfulOutcome(ref mut m) => match m.value {
+                UnsuccessfulOutcomeValue::InitialContextSetupFailure(ref mut c) => c,
+                _ => panic!("ICS Failure"),
+            },
+            _ => panic!("an outcome"),
+        };
+        container.ies.push(ProtocolIeField {
+            id: ProtocolIeId(id),
+            criticality: match criticality {
+                0 => Criticality::Reject,
+                1 => Criticality::Ignore,
+                _ => Criticality::Notify,
+            },
+            value: vec![0x00],
+        });
+        let mut encoder = AperEncoder::new();
+        pdu.encode_aper(&mut encoder).expect("encode");
+        encoder.align();
+        encoder.into_bytes().to_vec()
+    }
+
+    /// `bytes` with every IE `id` removed, by the hand-written PDU layer.
+    pub(crate) fn ics_outcome_without_ie(bytes: &[u8], id: u16) -> Vec<u8> {
+        use nextgcore_asn1c::ngap::{NgapPdu, SuccessfulOutcomeValue, UnsuccessfulOutcomeValue};
+        use nextgcore_asn1c::per::{AperDecode, AperDecoder, AperEncode, AperEncoder};
+        let mut pdu = NgapPdu::decode_aper(&mut AperDecoder::new(bytes)).expect("decode");
+        match pdu {
+            NgapPdu::SuccessfulOutcome(ref mut m) => {
+                if let SuccessfulOutcomeValue::InitialContextSetupResponse(ref mut c) = m.value {
+                    c.ies.retain(|f| f.id.0 != id);
+                }
+            }
+            NgapPdu::UnsuccessfulOutcome(ref mut m) => {
+                if let UnsuccessfulOutcomeValue::InitialContextSetupFailure(ref mut c) = m.value {
+                    c.ies.retain(|f| f.id.0 != id);
+                }
+            }
+            _ => panic!("an outcome"),
+        }
+        let mut encoder = AperEncoder::new();
+        pdu.encode_aper(&mut encoder).expect("encode");
+        encoder.align();
+        encoder.into_bytes().to_vec()
+    }
+
+    pub(crate) fn ics_response_pdu(amf_ue_ngap_id: u64, ran_ue_ngap_id: u32) -> Vec<u8> {
+        builder::build_initial_context_setup_response(
+            &nextgcore_ngap::types::InitialContextSetupResponse {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+            },
+        )
+        .expect("build ICS Response")
+    }
+
+    pub(crate) fn ics_failure_pdu(
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        cause: Cause,
+    ) -> Vec<u8> {
+        builder::build_initial_context_setup_failure(
+            &nextgcore_ngap::types::InitialContextSetupFailure {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                cause,
+            },
+        )
+        .expect("build ICS Failure")
+    }
+
+    /// #417 stage 7: every ICS Response the hand-written parser accepted decodes
+    /// to the same IDs under the generated codec, at every ID length.
+    #[test]
+    fn initial_context_setup_response_generated_decode_matches_hand_written() {
+        let mut compared = 0;
+        for &amf in &AMF_IDS[..AMF_IDS.len() - 1] {
+            for &ran in &RAN_IDS {
+                let pdu = ics_response_pdu(amf, ran);
+                let old = hand_written_parse_initial_context_setup_response(&pdu);
+                assert_eq!(old, Some((amf, ran)));
+                assert_eq!(
+                    decode_initial_context_setup_response_asn1(&pdu),
+                    InitialContextSetupOutcomeDecode::Decoded {
+                        amf_ue_ngap_id: Some(amf),
+                        ran_ue_ngap_id: Some(ran),
+                        cause: None,
+                        error_indication: None,
+                    }
+                );
+                compared += 1;
+            }
+        }
+        assert_eq!(compared, 88);
+    }
+
+    /// #417 stage 7: every ICS Failure the hand-written parser accepted decodes
+    /// to the same IDs, and to the Cause it carries, for every cause group and
+    /// value the hand-written encoder can produce.
+    #[test]
+    fn initial_context_setup_failure_generated_decode_matches_hand_written() {
+        let mut compared = 0;
+        for group in 0..=4u8 {
+            for value in 0..=50i64 {
+                let cause = build_cause(group, value);
+                for (amf, ran) in [
+                    (0, 0),
+                    (1, 1),
+                    (MAX_AMF_UE_NGAP_ID, u32::MAX),
+                    (65_536, 256),
+                ] {
+                    let pdu = ics_failure_pdu(amf, ran, cause);
+                    assert_eq!(
+                        hand_written_parse_initial_context_setup_failure(&pdu),
+                        Some((amf, ran))
+                    );
+                    let expected_cause = match parser::decode_ngap_pdu(&pdu) {
+                        Ok(NgapMessage::InitialContextSetupFailure(f)) => match f.cause {
+                            Cause::RadioNetwork(v) => {
+                                (crate::ngap_handler::cause_group::RADIO_NETWORK, v as i64)
+                            }
+                            Cause::Transport(v) => {
+                                (crate::ngap_handler::cause_group::TRANSPORT, v as i64)
+                            }
+                            Cause::Nas(v) => (crate::ngap_handler::cause_group::NAS, v as i64),
+                            Cause::Protocol(v) => {
+                                (crate::ngap_handler::cause_group::PROTOCOL, v as i64)
+                            }
+                            Cause::Misc(v) => (crate::ngap_handler::cause_group::MISC, v as i64),
+                        },
+                        other => panic!("hand-written parse: {other:?}"),
+                    };
+                    assert_eq!(
+                        decode_initial_context_setup_failure_asn1(&pdu),
+                        InitialContextSetupOutcomeDecode::Decoded {
+                            amf_ue_ngap_id: Some(amf),
+                            ran_ue_ngap_id: Some(ran),
+                            cause: Some(expected_cause),
+                            error_indication: None,
+                        },
+                        "group {group} value {value}"
+                    );
+                    compared += 1;
+                }
+            }
+        }
+        assert_eq!(compared, 5 * 51 * 4);
+    }
+
+    /// TS 38.413 §10.3.4.2 for the two RESPONSE messages: a not-comprehended IE
+    /// marked ignore is dropped; notify is reported in an Error Indication
+    /// naming procedure 14 and the triggering message; reject terminates the
+    /// procedure, handled locally.
+    #[test]
+    fn initial_context_setup_outcomes_apply_criticality_to_unknown_ies() {
+        let diag = |criticality| IeDiagnostic {
+            ie_id: 9999,
+            criticality,
+            type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+        };
+        let cases: [(
+            Vec<u8>,
+            fn(&[u8]) -> InitialContextSetupOutcomeDecode,
+            u8,
+            Option<(u8, i64)>,
+        ); 2] = [
+            (
+                ics_response_pdu(7, 9),
+                decode_initial_context_setup_response_asn1,
+                ngap_gen::TriggeringMessage::SUCCESSFUL_OUTCOME,
+                None,
+            ),
+            (
+                ics_failure_pdu(7, 9, Cause::RadioNetwork(CauseRadioNetwork::Unspecified)),
+                decode_initial_context_setup_failure_asn1,
+                ngap_gen::TriggeringMessage::UNSUCCESSFUL_OUTCOME,
+                Some((crate::ngap_handler::cause_group::RADIO_NETWORK, 0)),
+            ),
+        ];
+        for (pdu, decode, triggering_message, cause) in cases {
+            // The hand-written parsers, for the record: they refused the reject
+            // case (which comes to the same local handling) and accepted the
+            // other two, reporting nothing.
+            let old = |criticality| {
+                let spliced = ics_outcome_with_raw_ie(&pdu, 9999, criticality);
+                hand_written_parse_initial_context_setup_response(&spliced)
+                    .or(hand_written_parse_initial_context_setup_failure(&spliced))
+            };
+            assert_eq!(old(ngap_gen::Criticality::REJECT), None);
+            assert_eq!(old(ngap_gen::Criticality::IGNORE), Some((7, 9)));
+            assert_eq!(old(ngap_gen::Criticality::NOTIFY), Some((7, 9)));
+            let decoded = |criticality| decode(&ics_outcome_with_raw_ie(&pdu, 9999, criticality));
+            assert_eq!(
+                decoded(ngap_gen::Criticality::IGNORE),
+                InitialContextSetupOutcomeDecode::Decoded {
+                    amf_ue_ngap_id: Some(7),
+                    ran_ue_ngap_id: Some(9),
+                    cause,
+                    error_indication: None,
+                }
+            );
+            assert_eq!(
+                decoded(ngap_gen::Criticality::NOTIFY),
+                InitialContextSetupOutcomeDecode::Decoded {
+                    amf_ue_ngap_id: Some(7),
+                    ran_ue_ngap_id: Some(9),
+                    cause,
+                    error_indication: Some(CriticalityErrorIndication {
+                        amf_ue_ngap_id: Some(7),
+                        ran_ue_ngap_id: Some(9),
+                        cause_protocol:
+                            ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+                        procedure: ReportedProcedure {
+                            procedure_code: ngap_gen::ID_INITIAL_CONTEXT_SETUP,
+                            triggering_message,
+                            procedure_criticality: ngap_gen::Criticality::REJECT,
+                        },
+                        diagnostics: vec![diag(ngap_gen::Criticality::NOTIFY)],
+                    }),
+                }
+            );
+            assert_eq!(
+                decoded(ngap_gen::Criticality::REJECT),
+                InitialContextSetupOutcomeDecode::Failed(vec![diag(ngap_gen::Criticality::REJECT)])
+            );
+        }
+    }
+
+    /// Both IDs are criticality ignore (§10.3.5): a Response or Failure missing
+    /// one still decodes, with that ID `None`, where the hand-written parser
+    /// refused the message.
+    #[test]
+    fn initial_context_setup_outcomes_missing_ids_still_decode() {
+        let response = ics_response_pdu(7, 9);
+        let failure = ics_failure_pdu(7, 9, Cause::Nas(CauseNas::NormalRelease));
+        for (id, amf, ran) in [
+            (ngap_gen::ID_RAN_UE_NGAP_ID, Some(7), None),
+            (ngap_gen::ID_AMF_UE_NGAP_ID, None, Some(9)),
+        ] {
+            let r = ics_outcome_without_ie(&response, id);
+            assert_eq!(hand_written_parse_initial_context_setup_response(&r), None);
+            assert!(matches!(
+                decode_initial_context_setup_response_asn1(&r),
+                InitialContextSetupOutcomeDecode::Decoded { amf_ue_ngap_id, ran_ue_ngap_id, .. }
+                    if amf_ue_ngap_id == amf && ran_ue_ngap_id == ran
+            ));
+            let f = ics_outcome_without_ie(&failure, id);
+            assert_eq!(hand_written_parse_initial_context_setup_failure(&f), None);
+            assert!(matches!(
+                decode_initial_context_setup_failure_asn1(&f),
+                InitialContextSetupOutcomeDecode::Decoded { amf_ue_ngap_id, ran_ue_ngap_id, .. }
+                    if amf_ue_ngap_id == amf && ran_ue_ngap_id == ran
+            ));
+        }
+        // Not the expected message at all.
+        assert_eq!(
+            decode_initial_context_setup_response_asn1(&failure),
+            InitialContextSetupOutcomeDecode::Undecodable
+        );
+        assert_eq!(
+            decode_initial_context_setup_failure_asn1(&response),
+            InitialContextSetupOutcomeDecode::Undecodable
+        );
+        assert_eq!(
+            decode_initial_context_setup_response_asn1(&[0x20, 0x0e]),
+            InitialContextSetupOutcomeDecode::Undecodable
+        );
     }
 }
