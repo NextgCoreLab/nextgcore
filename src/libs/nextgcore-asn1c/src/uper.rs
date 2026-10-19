@@ -2,7 +2,7 @@
 //!
 //! Standalone codepath for protocols that use the UNALIGNED PER variant —
 //! notably LPP (3GPP TS 37.355) and RRC. Kept deliberately SEPARATE from
-//! `per.rs` (which implements Aligned PER / APER for NGAP/S1AP/E1AP/F1AP/XnAP)
+//! `per.rs` (which implements Aligned PER / APER for NGAP/S1AP/NRPPa)
 //! so the aligned path used by every NF's live wire is never touched.
 //!
 //! Wave-3 lmfd-LIB-02a.
