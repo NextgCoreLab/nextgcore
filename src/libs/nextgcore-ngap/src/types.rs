@@ -657,11 +657,12 @@ pub struct HandoverCommand {
     pub ran_ue_ngap_id: u32,
     /// Handover Type
     pub handover_type: HandoverType,
-    /// NAS-PDU (optional)
-    pub nas_pdu: Option<Vec<u8>>,
+    /// NAS Security Parameters from NG-RAN (optional; TS 38.413 §9.3.3.30). The
+    /// Handover Command carries no NAS-PDU IE.
+    pub nas_security_parameters_from_ngran: Option<Vec<u8>>,
     /// PDU Session Resource Handover List
     pub pdu_session_list: Vec<PduSessionResourceHandoverItem>,
-    /// PDU Session Resource To Release List (optional)
+    /// PDU Session Resource To Release List HOCmd (optional)
     pub release_list: Option<Vec<PduSessionResourceReleaseItem>>,
     /// Target to Source Transparent Container
     pub target_to_source_container: Vec<u8>,
@@ -756,8 +757,9 @@ pub struct PathSwitchRequestFailure {
     pub amf_ue_ngap_id: u64,
     /// RAN UE NGAP ID
     pub ran_ue_ngap_id: u32,
-    /// Cause (mandatory)
-    pub cause: Cause,
+    // No Cause: PathSwitchRequestFailureIEs (TS 38.413 §9.2.3.10) has none. The
+    // per-session reason travels in each released item's
+    // PathSwitchRequestUnsuccessfulTransfer.
     /// PDU Session Resource Released List PS Fail (optional)
     pub released_list: Option<Vec<PduSessionResourceReleasedItem>>,
     /// Criticality Diagnostics (optional)
@@ -779,11 +781,13 @@ pub struct Paging {
     pub tai_list: Vec<TaiListItem>,
     /// Paging Priority (optional)
     pub paging_priority: Option<PagingPriority>,
-    /// UE Radio Capability for Paging (optional)
+    /// UE Radio Capability for Paging (optional): the already APER-encoded
+    /// `UERadioCapabilityForPaging` SEQUENCE value, carried verbatim.
     pub ue_radio_capability: Option<Vec<u8>>,
     /// Paging Origin (optional)
     pub paging_origin: Option<PagingOrigin>,
-    /// Assistance Data for Paging (optional)
+    /// Assistance Data for Paging (optional): the already APER-encoded
+    /// `AssistanceDataForPaging` SEQUENCE value, carried verbatim.
     pub assistance_data: Option<Vec<u8>>,
 }
 
