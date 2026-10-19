@@ -128,3 +128,45 @@ fn contained_encodings_are_octet_aligned() {
         pre_emption
     );
 }
+
+/// A contained transfer carrying a protocol IE the schema has no entry for:
+/// [`decode_contained`] fails the whole transfer on it, and
+/// [`decode_contained_with_unknown_ies`] returns the transfer as if the IE were
+/// absent, with the IE's id, criticality and value alongside.
+#[test]
+fn a_contained_transfer_skips_an_unknown_ie_only_when_asked() {
+    use generated::{
+        PDUSessionResourceSetupRequestTransfer as Transfer,
+        PDUSessionResourceSetupRequestTransferProtocolIEs as Ies,
+        PDUSessionResourceSetupRequestTransferProtocolIEs_Entry as Entry,
+        PDUSessionResourceSetupRequestTransferProtocolIEs_EntryValue as Ie,
+    };
+    let transfer = Transfer {
+        protocol_i_es: Ies(vec![Entry {
+            id: generated::ProtocolIE_ID(generated::ID_PDU_SESSION_TYPE),
+            criticality: generated::Criticality(generated::Criticality::REJECT),
+            value: Ie::Id_PDUSessionType(generated::PDUSessionType(
+                generated::PDUSessionType::IPV4,
+            )),
+        }]),
+    };
+    let mut bytes = encode_contained(&transfer).expect("encode");
+    // [0] extension bit and padding, [1..3] the IE count; the IEs are
+    // octet-aligned, so one more appended after the last is well formed: id
+    // 9999, criticality ignore (0x40), a one-octet value.
+    assert_eq!(&bytes[..3], &[0x00, 0x00, 0x01]);
+    bytes[2] = 0x02;
+    bytes.extend_from_slice(&[0x27, 0x0f, 0x40, 0x01, 0xab]);
+
+    assert!(decode_contained::<Transfer>(&bytes).is_err());
+    let (decoded, unknown) = decode_contained_with_unknown_ies::<Transfer>(&bytes).expect("decode");
+    assert_eq!(decoded, transfer);
+    assert_eq!(
+        unknown,
+        vec![UnknownIe {
+            id: 9999,
+            criticality: Some(generated::Criticality::IGNORE),
+            value: vec![0xab],
+        }]
+    );
+}
