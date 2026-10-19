@@ -170,3 +170,70 @@ fn a_contained_transfer_skips_an_unknown_ie_only_when_asked() {
         }]
     );
 }
+
+/// #445: the hand-written `build_ng_setup_failure` now carries Criticality
+/// Diagnostics. The generated codec must decode that PDU, re-encode it byte for
+/// byte, and read back every component -- so the two codecs agree on the IE,
+/// not merely on its presence.
+#[test]
+fn hand_written_ng_setup_failure_with_diagnostics_decodes_and_reencodes_identically() {
+    use generated::{NGSetupFailureProtocolIEs_EntryValue as Ie, UnsuccessfulOutcomeValue};
+    use nextgcore_asn1c::ngap::cause::{Cause, CauseMisc};
+    use nextgcore_asn1c::ngap::types::Criticality;
+    use nextgcore_ngap::builder::build_ng_setup_failure;
+    use nextgcore_ngap::types::{
+        CriticalityDiagnostics, IeCriticalityDiagnostics, NgSetupFailure, TimeToWait, TypeOfError,
+    };
+
+    let bytes = build_ng_setup_failure(&NgSetupFailure {
+        cause: Cause::Misc(CauseMisc::Unspecified),
+        time_to_wait: Some(TimeToWait::V10s),
+        criticality_diagnostics: Some(CriticalityDiagnostics {
+            procedure_code: Some(21),
+            triggering_message: Some(0),
+            procedure_criticality: Some(0),
+            ies: vec![
+                IeCriticalityDiagnostics {
+                    ie_criticality: Criticality::Reject,
+                    ie_id: 27,
+                    type_of_error: TypeOfError::Missing,
+                },
+                IeCriticalityDiagnostics {
+                    ie_criticality: Criticality::Notify,
+                    ie_id: 9999,
+                    type_of_error: TypeOfError::NotUnderstood,
+                },
+            ],
+        }),
+    })
+    .expect("hand-written NG Setup Failure");
+
+    let NGAP_PDU::UnsuccessfulOutcome(outcome) = assert_round_trips(&bytes) else {
+        panic!("NG Setup Failure is an UnsuccessfulOutcome");
+    };
+    let UnsuccessfulOutcomeValue::Id_NGSetup(failure) = outcome.value else {
+        panic!("NG Setup Failure");
+    };
+    let ies = &failure.protocol_i_es.0;
+    assert_eq!(ies.len(), 3, "Cause, TimeToWait, CriticalityDiagnostics");
+    let last = ies.last().expect("IEs");
+    assert_eq!(last.id.0, generated::ID_CRITICALITY_DIAGNOSTICS);
+    assert_eq!(last.criticality.0, generated::Criticality::IGNORE);
+    let Ie::Id_CriticalityDiagnostics(cd) = &last.value else {
+        panic!("Criticality Diagnostics is the last IE");
+    };
+    assert_eq!(cd.procedure_code.as_ref().map(|p| p.0), Some(21));
+    assert_eq!(cd.triggering_message.as_ref().map(|t| t.0), Some(0));
+    assert_eq!(cd.procedure_criticality.as_ref().map(|c| c.0), Some(0));
+    let list = &cd.i_es_criticality_diagnostics.as_ref().expect("IE list").0;
+    assert_eq!(list.len(), 2);
+    assert_eq!(list[0].ie_id.0, 27);
+    assert_eq!(list[0].ie_criticality.0, generated::Criticality::REJECT);
+    assert_eq!(list[0].type_of_error.0, generated::TypeOfError::MISSING);
+    assert_eq!(list[1].ie_id.0, 9999);
+    assert_eq!(list[1].ie_criticality.0, generated::Criticality::NOTIFY);
+    assert_eq!(
+        list[1].type_of_error.0,
+        generated::TypeOfError::NOT_UNDERSTOOD
+    );
+}

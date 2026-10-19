@@ -145,6 +145,75 @@ mod tests {
         }
     }
 
+    /// A Criticality Diagnostics value with every optional component present,
+    /// so a builder that drops any part of it cannot round-trip.
+    fn full_criticality_diagnostics() -> types::CriticalityDiagnostics {
+        use nextgcore_asn1c::ngap::types::Criticality;
+        types::CriticalityDiagnostics {
+            procedure_code: Some(21), // NG Setup
+            triggering_message: Some(0),
+            procedure_criticality: Some(0),
+            ies: vec![
+                types::IeCriticalityDiagnostics {
+                    ie_criticality: Criticality::Reject,
+                    ie_id: 27,
+                    type_of_error: types::TypeOfError::Missing,
+                },
+                types::IeCriticalityDiagnostics {
+                    ie_criticality: Criticality::Notify,
+                    ie_id: 9999,
+                    type_of_error: types::TypeOfError::NotUnderstood,
+                },
+            ],
+        }
+    }
+
+    /// #445: `build_ng_setup_failure` encoded only Cause and TimeToWait and
+    /// silently dropped `criticality_diagnostics`. The IE must reach the wire,
+    /// with and without TimeToWait before it.
+    #[test]
+    fn ng_setup_failure_carries_criticality_diagnostics() {
+        for time_to_wait in [Some(types::TimeToWait::V10s), None] {
+            let msg = types::NgSetupFailure {
+                cause: Cause::Misc(CauseMisc::Unspecified),
+                time_to_wait,
+                criticality_diagnostics: Some(full_criticality_diagnostics()),
+            };
+            let bytes = builder::build_ng_setup_failure(&msg).unwrap();
+            match parser::decode_ngap_pdu(&bytes).unwrap() {
+                NgapMessage::NgSetupFailure(failure) => {
+                    assert_eq!(failure.cause, Cause::Misc(CauseMisc::Unspecified));
+                    assert_eq!(failure.time_to_wait, time_to_wait);
+                    assert_eq!(
+                        failure.criticality_diagnostics,
+                        Some(full_criticality_diagnostics()),
+                        "Criticality Diagnostics must survive the builder (TTW {time_to_wait:?})"
+                    );
+                }
+                other => panic!("Expected NgSetupFailure, got {other:?}"),
+            }
+        }
+    }
+
+    /// Without diagnostics the Failure is byte-for-byte what the builder
+    /// produced before #445 (pinned from main at 5851b09).
+    #[test]
+    fn ng_setup_failure_without_diagnostics_is_unchanged() {
+        let msg = types::NgSetupFailure {
+            cause: Cause::Misc(CauseMisc::Unspecified),
+            time_to_wait: Some(types::TimeToWait::V5s),
+            criticality_diagnostics: None,
+        };
+        let bytes = builder::build_ng_setup_failure(&msg).unwrap();
+        assert_eq!(hex(&bytes), NG_SETUP_FAILURE_PRE_445);
+    }
+
+    const NG_SETUP_FAILURE_PRE_445: &str = "4015000d000002000f40018a006b400120";
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
     #[test]
     fn test_ue_context_release_command_roundtrip() {
         let msg = types::UeContextReleaseCommand {

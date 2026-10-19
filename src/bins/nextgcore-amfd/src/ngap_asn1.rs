@@ -2663,22 +2663,17 @@ pub(crate) mod tests {
             Some(result)
         }
 
-        /// An NG Setup Failure carrying a Criticality Diagnostics IE, assembled
-        /// from the hand-written IE encoders -- the oracle for the stage 3
-        /// diagnostics. Not `builder::build_ng_setup_failure`: that builder
-        /// silently DROPS `NgSetupFailure::criticality_diagnostics` (it encodes
-        /// only Cause and TimeToWait), so it cannot vouch for the IE.
+        /// An NG Setup Failure carrying a Criticality Diagnostics IE, built by
+        /// the hand-written `builder::build_ng_setup_failure` -- the oracle for
+        /// the stage 3 diagnostics. (Until #445 that builder dropped
+        /// `criticality_diagnostics`, and this oracle assembled the PDU from the
+        /// IE encoders instead.)
         pub(super) fn hand_written_ng_setup_failure_with_diagnostics(
             cause_group: u8,
             cause_value: i64,
             diagnostics: &[IeDiagnostic],
         ) -> Vec<u8> {
-            use nextgcore_asn1c::ngap::ies::ProtocolIeContainer;
-            use nextgcore_asn1c::ngap::pdu::{
-                NgapPdu, UnsuccessfulOutcome, UnsuccessfulOutcomeValue,
-            };
-            use nextgcore_asn1c::ngap::types::{Criticality, ProcedureCode};
-            use nextgcore_asn1c::per::{AperEncode, AperEncoder};
+            use nextgcore_asn1c::ngap::types::Criticality;
 
             let ies = diagnostics
                 .iter()
@@ -2695,30 +2690,15 @@ pub(crate) mod tests {
                     },
                 })
                 .collect();
-            let mut container = ProtocolIeContainer::new();
-            nextgcore_ngap::ie::encode_cause(
-                &mut container,
-                &build_cause(cause_group, cause_value),
-            )
-            .expect("cause");
-            nextgcore_ngap::ie::encode_time_to_wait(&mut container, TimeToWait::V1s).expect("ttw");
-            nextgcore_ngap::ie::encode_criticality_diagnostics(
-                &mut container,
-                &CriticalityDiagnostics {
+            builder::build_ng_setup_failure(&NgSetupFailure {
+                cause: build_cause(cause_group, cause_value),
+                time_to_wait: Some(TimeToWait::V1s),
+                criticality_diagnostics: Some(CriticalityDiagnostics {
                     ies,
                     ..Default::default()
-                },
-            )
-            .expect("diagnostics");
-            let pdu = NgapPdu::UnsuccessfulOutcome(UnsuccessfulOutcome {
-                procedure_code: ProcedureCode::NG_SETUP,
-                criticality: Criticality::Reject,
-                value: UnsuccessfulOutcomeValue::NgSetupFailure(container),
-            });
-            let mut encoder = AperEncoder::new();
-            pdu.encode_aper(&mut encoder).expect("encode");
-            encoder.align();
-            encoder.into_bytes().to_vec()
+                }),
+            })
+            .expect("hand-written NG Setup Failure")
         }
 
         /// Build an NG Setup Response PDU with proper ASN.1 APER encoding
