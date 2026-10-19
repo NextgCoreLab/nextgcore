@@ -99,8 +99,12 @@ pub fn build_s1_setup_response(msg: &S1SetupResponse) -> S1apResult<Vec<u8>> {
     // IE: ServedGUMMEIs (mandatory)
     ie::encode_served_gummeis(&mut container, &msg.served_gummeis)?;
 
-    // IE: RelativeMMECapacity (mandatory)
-    ie::encode_relative_mme_capacity(&mut container, msg.relative_mme_capacity)?;
+    // IE: RelativeMMECapacity (mandatory, criticality ignore -- TS 36.413 §9.1.8.5)
+    ie::encode_relative_mme_capacity(
+        &mut container,
+        msg.relative_mme_capacity,
+        Criticality::Ignore,
+    )?;
 
     encode_pdu(&successful(
         ProcedureCode::S1_SETUP,
@@ -744,8 +748,9 @@ pub fn build_handover_command(msg: &HandoverCommand) -> S1apResult<Vec<u8>> {
 pub fn build_handover_preparation_failure(msg: &HandoverPreparationFailure) -> S1apResult<Vec<u8>> {
     let mut container = ProtocolIeContainer::new();
 
-    ie::encode_mme_ue_s1ap_id(&mut container, msg.mme_ue_s1ap_id, Criticality::Reject)?;
-    ie::encode_enb_ue_s1ap_id(&mut container, msg.enb_ue_s1ap_id, Criticality::Reject)?;
+    // Both UE S1AP IDs are criticality ignore in this message (TS 36.413 §9.1.5.3)
+    ie::encode_mme_ue_s1ap_id(&mut container, msg.mme_ue_s1ap_id, Criticality::Ignore)?;
+    ie::encode_enb_ue_s1ap_id(&mut container, msg.enb_ue_s1ap_id, Criticality::Ignore)?;
     ie::encode_cause(&mut container, &msg.cause)?;
 
     encode_pdu(&unsuccessful(
@@ -874,8 +879,9 @@ pub fn build_path_switch_request_acknowledge(
 ) -> S1apResult<Vec<u8>> {
     let mut container = ProtocolIeContainer::new();
 
-    ie::encode_mme_ue_s1ap_id(&mut container, msg.mme_ue_s1ap_id, Criticality::Reject)?;
-    ie::encode_enb_ue_s1ap_id(&mut container, msg.enb_ue_s1ap_id, Criticality::Reject)?;
+    // Both UE S1AP IDs are criticality ignore in this message (TS 36.413 §9.1.5.9)
+    ie::encode_mme_ue_s1ap_id(&mut container, msg.mme_ue_s1ap_id, Criticality::Ignore)?;
+    ie::encode_enb_ue_s1ap_id(&mut container, msg.enb_ue_s1ap_id, Criticality::Ignore)?;
 
     // IE: E-RABToBeSwitchedULList (optional)
     if !msg.erab_switched_ul_list.is_empty() {
@@ -1013,7 +1019,7 @@ pub fn build_mme_configuration_update(msg: &MmeConfigurationUpdate) -> S1apResul
         ie::encode_served_gummeis(&mut container, gummeis)?;
     }
     if let Some(capacity) = msg.relative_mme_capacity {
-        ie::encode_relative_mme_capacity(&mut container, capacity)?;
+        ie::encode_relative_mme_capacity(&mut container, capacity, Criticality::Reject)?;
     }
 
     encode_pdu(&initiating(

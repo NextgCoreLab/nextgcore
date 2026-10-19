@@ -1281,13 +1281,18 @@ pub fn decode_time_to_wait(field: &ProtocolIeField) -> S1apResult<TimeToWait> {
     })
 }
 
+/// RelativeMMECapacity's criticality differs by message (TS 36.413 §9.1.8.5 /
+/// §9.1.8.10 and their ASN.1 object sets):
+/// `ignore` in S1 SETUP RESPONSE, `reject` in MME CONFIGURATION UPDATE, so the
+/// caller states it.
 pub fn encode_relative_mme_capacity(
     container: &mut ProtocolIeContainer,
     capacity: u8,
+    criticality: Criticality,
 ) -> S1apResult<()> {
     container.push(make_ie_field(
         ProtocolIeId::RELATIVE_MME_CAPACITY,
-        Criticality::Reject,
+        criticality,
         &RelativeMmeCapacity(capacity),
     )?);
     Ok(())
