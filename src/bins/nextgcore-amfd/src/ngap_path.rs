@@ -980,8 +980,8 @@ impl NgapServer {
                     // to bound how long it holds the context before deciding the UE is
                     // gone. Before this nothing started either reachability timer, so a
                     // UE that never came back was held forever.
-                    self.start_reachability_supervision(association_id, data)
-                        .await;
+                    self.handle_ue_context_release_complete(association_id, data)
+                        .await?;
                 }
             }
             Some(20) => {
@@ -6755,13 +6755,64 @@ impl NgapServer {
         }
     }
 
+    /// Handle a UE Context Release Complete from a gNB (TS 38.413 §8.3.3.2).
+    ///
+    /// Decoded with the generated codec (#417 stage 4), which applies the §10.3.4.2
+    /// rules for a RESPONSE: a not-comprehended "ignore IE and notify sender" IE is
+    /// reported in an Error Indication and the procedure goes on; one marked "reject"
+    /// terminates the procedure unsuccessfully, handled locally -- the same fallback
+    /// an undecodable Release Complete gets.
+    async fn handle_ue_context_release_complete(
+        &mut self,
+        association_id: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        use crate::ngap_asn1::UeContextReleaseCompleteDecode::{Complete, Failed, Undecodable};
+        let amf_ue_ngap_id = match crate::ngap_asn1::decode_ue_context_release_complete_asn1(data) {
+            Complete {
+                amf_ue_ngap_id,
+                error_indication,
+                ..
+            } => {
+                // Best effort: the report must not stop the supervision below.
+                if let Some(report) = error_indication {
+                    if let Err(e) = self
+                        .send_criticality_error_indication(association_id, &report)
+                        .await
+                    {
+                        log::warn!("Failed to send ErrorIndication: {e}");
+                    }
+                }
+                amf_ue_ngap_id
+            }
+            Failed(diagnostics) => {
+                log::warn!(
+                    "UE Context Release Complete carries not-comprehended IEs marked reject \
+                     ({diagnostics:?}); the release is unsuccessfully terminated (TS 38.413 \
+                     §10.3.4.2), handled locally"
+                );
+                None
+            }
+            Undecodable => None,
+        };
+        // TS 24.501 §5.3.7: the N1 signalling connection is now gone. For a UE that is
+        // still REGISTERED this is the moment the mobile reachable timer starts.
+        self.start_reachability_supervision(association_id, amf_ue_ngap_id)
+            .await;
+        Ok(())
+    }
+
     /// Start mobile-reachable supervision for every registered UE whose N1 connection
     /// this release complete ended (TS 24.501 §5.3.7).
     ///
-    /// The AMF UE NGAP ID is parsed from the message when possible; a Release Complete
-    /// that cannot be parsed falls back to the association's UEs, because the alternative
-    /// -- supervising nobody -- is the defect being fixed.
-    async fn start_reachability_supervision(&mut self, association_id: u64, data: &[u8]) {
+    /// `amf_ue_ngap_id` is the UE the Release Complete names, when it could be used; a
+    /// Release Complete that cannot falls back to the association's UEs, because the
+    /// alternative -- supervising nobody -- is the defect being fixed.
+    async fn start_reachability_supervision(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: Option<u64>,
+    ) {
         let Some(config) = self.timer_configs.get(AmfTimerId::MobileReachable).cloned() else {
             return;
         };
@@ -6769,8 +6820,7 @@ impl NgapServer {
             log::debug!("Mobile reachable timer disabled by configuration; not supervising");
             return;
         }
-        let parsed = crate::ngap_asn1::parse_ue_context_release_complete_asn1(data);
-        let targets: Vec<u64> = match parsed {
+        let targets: Vec<u64> = match amf_ue_ngap_id {
             Some(amf_ue_ngap_id) => vec![amf_ue_ngap_id],
             None => self
                 .ue_auth_state
@@ -7273,6 +7323,29 @@ impl NgapServer {
                 );
             }
             Err(e) => log::error!("Failed to build ErrorIndication: {e}"),
+        }
+        Ok(())
+    }
+
+    /// Send an Error Indication reporting not-comprehended or missing IEs of a received
+    /// message (TS 38.413 §10.3.4.2, §10.3.5), encoded by the generated codec.
+    async fn send_criticality_error_indication(
+        &mut self,
+        association_id: u64,
+        report: &crate::ngap_asn1::CriticalityErrorIndication,
+    ) -> Result<()> {
+        match crate::ngap_asn1::build_criticality_error_indication_asn1(report) {
+            Some(bytes) => {
+                self.send_to_association(association_id, &bytes).await?;
+                log::info!(
+                    "ErrorIndication sent to association {association_id} for procedure {} \
+                     (cause protocol {}, IEs {:?})",
+                    report.procedure.procedure_code,
+                    report.cause_protocol,
+                    report.diagnostics
+                );
+            }
+            None => log::error!("Failed to build criticality ErrorIndication"),
         }
         Ok(())
     }
@@ -9213,11 +9286,42 @@ impl NgapServer {
             data.len()
         );
 
-        // Parse AMF UE NGAP ID and RAN UE NGAP ID from the message
-        // The release request contains: procedure_code(1), criticality(1), length(variable),
-        // then IEs for AMF-UE-NGAP-ID, RAN-UE-NGAP-ID, PDUSessionResourceList, Cause
-        let amf_ue_ngap_id = crate::ngap_asn1::extract_amf_ue_ngap_id(data);
-        let ran_ue_ngap_id = crate::ngap_asn1::extract_ran_ue_ngap_id(data);
+        // #417 stage 4: decoded with the generated codec, which applies TS 38.413
+        // §10.3.4.2/§10.3.5 for a procedure with no response message. A request the AMF
+        // must reject is terminated with an Error Indication and nothing is released;
+        // "ignore IE and notify sender" IEs are reported in one and the release goes on.
+        use crate::ngap_asn1::UeContextReleaseRequestDecode::{Proceed, Reject, Undecodable};
+        let (amf_ue_ngap_id, ran_ue_ngap_id, cause) =
+            match crate::ngap_asn1::decode_ue_context_release_request_asn1(data) {
+                Proceed {
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    cause,
+                    error_indication,
+                } => {
+                    // Best effort: the report must not stop the release it reports on.
+                    if let Some(report) = error_indication {
+                        if let Err(e) = self
+                            .send_criticality_error_indication(association_id, &report)
+                            .await
+                        {
+                            log::warn!("Failed to send ErrorIndication: {e}");
+                        }
+                    }
+                    (Some(amf_ue_ngap_id), Some(ran_ue_ngap_id), cause)
+                }
+                Reject(report) => {
+                    log::warn!(
+                        "UE Context Release Request rejected (TS 38.413 §10.3.4.2/§10.3.5): \
+                         {:?}",
+                        report.diagnostics
+                    );
+                    return self
+                        .send_criticality_error_indication(association_id, &report)
+                        .await;
+                }
+                Undecodable => (None, None, None),
+            };
 
         log::info!(
             "UE Context Release: AMF UE NGAP ID={amf_ue_ngap_id:?}, RAN UE NGAP ID={ran_ue_ngap_id:?}"
@@ -9232,15 +9336,12 @@ impl NgapServer {
         // Fired BEFORE the PDU-session teardown below, because the Cause the gNB sent is
         // what the report carries and the teardown is the consequence, not the event.
         //
-        // The Cause was ALREADY being decoded by the parser -- it is a mandatory IE of
-        // UEContextReleaseRequest and the message is refused without it -- and then
-        // discarded. So there is no placeholder here: it is the release code the RAN
-        // actually sent. (#397's own text says "Neither release code is plumbed anywhere
-        // the event could read it"; the ran one was, one call away.)
-        if let (Some(ngap_id), Some((group, value))) = (
-            amf_ue_ngap_id,
-            crate::ngap_asn1::extract_release_request_cause(data),
-        ) {
+        // The Cause is the release code the RAN actually sent, decoded off the wire, so
+        // there is no placeholder here. (#397's own text says "Neither release code is
+        // plumbed anywhere the event could read it"; the ran one was, one call away.) It
+        // is mandatory with criticality ignore, so a request without one is still
+        // released (TS 38.413 §10.3.5) -- with no release code to report.
+        if let (Some(ngap_id), Some((group, value))) = (amf_ue_ngap_id, cause) {
             if is_communication_failure_cause(group, value) {
                 if let Some(state) = self.ue_auth_state.get(ngap_id) {
                     crate::namf_server::fire_communication_failure(&state.amf_ue, group, value);
@@ -18439,6 +18540,197 @@ mod tests {
             guard.event_subscription_remove("sub-397-commfail");
         }
         sink.stop().await.expect("sink stop");
+    }
+
+    /// **#417 stage 4.** A UE Context Release Request carrying the optional PDU
+    /// Session Resource List reaches the release path. The hand-written parser did not
+    /// comprehend that IE, and as its criticality is reject it refused the whole
+    /// request -- so a conformant gNB releasing a UE with PDU sessions was ignored. The
+    /// COMMUNICATION_FAILURE_REPORT this test waits for is fired from inside the
+    /// release path with the Cause off this PDU, so it only arrives when the
+    /// production handler decoded the request.
+    // Holding CONTEXT_GUARD across the awaits is the point: it serialises this
+    // test against every other global-context test for its whole duration.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ran_release_listing_pdu_sessions_is_acted_on() {
+        use nextgcore_ngap_gen::generated as g;
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::amf_context_init(64, 1024, 4096);
+
+        let amf_ue_ngap_id = 7_417_400u64;
+        let ran_ue_ngap_id = 417_400u32;
+        let supi = "imsi-001010000417400";
+        let (sink, mut rx) = event_sink_for(
+            "sub-417-s4-release",
+            supi,
+            &["COMMUNICATION_FAILURE_REPORT"],
+        )
+        .await;
+
+        let mut ngap = test_ngap_server().await;
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, ran_ue_ngap_id, 1, false);
+        ue_ctx.registered = true;
+        ue_ctx.amf_ue.supi = Some(supi.to_string());
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        let entry = |id: u16, criticality: u8, value| g::UEContextReleaseRequestProtocolIEs_Entry {
+            id: g::ProtocolIE_ID(id),
+            criticality: g::Criticality(criticality),
+            value,
+        };
+        use g::UEContextReleaseRequestProtocolIEs_EntryValue as Ie;
+        let pdu =
+            nextgcore_ngap_gen::encode(&g::NGAP_PDU::InitiatingMessage(g::InitiatingMessage {
+                procedure_code: g::ProcedureCode(g::ID_UE_CONTEXT_RELEASE_REQUEST),
+                criticality: g::Criticality(g::Criticality::IGNORE),
+                value: g::InitiatingMessageValue::Id_UEContextReleaseRequest(
+                    g::UEContextReleaseRequest {
+                        protocol_i_es: g::UEContextReleaseRequestProtocolIEs(vec![
+                            entry(
+                                g::ID_AMF_UE_NGAP_ID,
+                                g::Criticality::REJECT,
+                                Ie::Id_AMF_UE_NGAP_ID(g::AMF_UE_NGAP_ID(amf_ue_ngap_id)),
+                            ),
+                            entry(
+                                g::ID_RAN_UE_NGAP_ID,
+                                g::Criticality::REJECT,
+                                Ie::Id_RAN_UE_NGAP_ID(g::RAN_UE_NGAP_ID(ran_ue_ngap_id)),
+                            ),
+                            entry(
+                                g::ID_PDU_SESSION_RESOURCE_LIST_CXT_REL_REQ,
+                                g::Criticality::REJECT,
+                                Ie::Id_PDUSessionResourceListCxtRelReq(
+                                    g::PDUSessionResourceListCxtRelReq(vec![
+                                        g::PDUSessionResourceItemCxtRelReq {
+                                            pdu_session_id: g::PDUSessionID(5),
+                                            ie_extensions: None,
+                                        },
+                                    ]),
+                                ),
+                            ),
+                            entry(
+                                g::ID_CAUSE,
+                                g::Criticality::IGNORE,
+                                // radio-connection-with-ue-lost
+                                Ie::Id_Cause(g::Cause::RadioNetwork(g::CauseRadioNetwork(21))),
+                            ),
+                        ]),
+                    },
+                ),
+            }))
+            .expect("encode UEContextReleaseRequest");
+        assert!(
+            nextgcore_ngap::parser::decode_ngap_pdu(&pdu).is_err(),
+            "the hand-written parser refuses this request, which is the defect"
+        );
+
+        let _ = ngap.handle_ue_context_release(1, &pdu).await;
+
+        let reports = collect_reports(
+            &mut rx,
+            1,
+            "a RAN release listing its PDU sessions must reach the release path",
+        )
+        .await;
+        let report = reports
+            .get("COMMUNICATION_FAILURE_REPORT")
+            .expect("COMMUNICATION_FAILURE_REPORT must be delivered");
+        assert_eq!(
+            report["commFailure"]["ranReleaseCode"]["value"].as_i64(),
+            Some(21)
+        );
+
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.event_subscription_remove("sub-417-s4-release");
+        }
+        sink.stop().await.expect("sink stop");
+    }
+
+    /// **#417 stage 4.** A UE Context Release Complete listing its released PDU
+    /// sessions supervises the ONE UE it names. The hand-written parser refused it (the
+    /// list is not comprehended there and carries criticality reject), and the handler's
+    /// fallback for an unusable Release Complete supervises every registered UE of the
+    /// association -- so on the old path the other UE below is armed too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_release_complete_listing_pdu_sessions_supervises_only_its_ue() {
+        use nextgcore_ngap_gen::generated as g;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let (named, other) = (7_417_401u64, 7_417_402u64);
+        for (id, ran) in [(named, 41_741u32), (other, 41_742)] {
+            let mut ue_ctx = UeNasContext::new(id, ran, 1, false);
+            ue_ctx.registered = true;
+            ngap.ue_auth_state.insert(id, ue_ctx);
+        }
+
+        use g::UEContextReleaseCompleteProtocolIEs_EntryValue as Ie;
+        let entry =
+            |id: u16, criticality: u8, value| g::UEContextReleaseCompleteProtocolIEs_Entry {
+                id: g::ProtocolIE_ID(id),
+                criticality: g::Criticality(criticality),
+                value,
+            };
+        let pdu =
+            nextgcore_ngap_gen::encode(&g::NGAP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+                procedure_code: g::ProcedureCode(g::ID_UE_CONTEXT_RELEASE),
+                criticality: g::Criticality(g::Criticality::REJECT),
+                value: g::SuccessfulOutcomeValue::Id_UEContextRelease(
+                    g::UEContextReleaseComplete {
+                        protocol_i_es: g::UEContextReleaseCompleteProtocolIEs(vec![
+                            entry(
+                                g::ID_AMF_UE_NGAP_ID,
+                                g::Criticality::IGNORE,
+                                Ie::Id_AMF_UE_NGAP_ID(g::AMF_UE_NGAP_ID(named)),
+                            ),
+                            entry(
+                                g::ID_RAN_UE_NGAP_ID,
+                                g::Criticality::IGNORE,
+                                Ie::Id_RAN_UE_NGAP_ID(g::RAN_UE_NGAP_ID(41_741)),
+                            ),
+                            entry(
+                                g::ID_PDU_SESSION_RESOURCE_LIST_CXT_REL_CPL,
+                                g::Criticality::REJECT,
+                                Ie::Id_PDUSessionResourceListCxtRelCpl(
+                                    g::PDUSessionResourceListCxtRelCpl(vec![
+                                        g::PDUSessionResourceItemCxtRelCpl {
+                                            pdu_session_id: g::PDUSessionID(5),
+                                            ie_extensions: None,
+                                        },
+                                    ]),
+                                ),
+                            ),
+                        ]),
+                    },
+                ),
+            }))
+            .expect("encode UEContextReleaseComplete");
+
+        ngap.handle_ue_context_release_complete(1, &pdu)
+            .await
+            .expect("handled");
+
+        let armed = |id| {
+            ngap.ue_auth_state
+                .get(id)
+                .and_then(|s| s.reachability)
+                .map(|r| r.phase)
+        };
+        assert_eq!(
+            armed(named),
+            Some(ReachabilityPhase::MobileReachable),
+            "the UE the Release Complete names is supervised (TS 24.501 §5.3.7)"
+        );
+        assert_eq!(
+            armed(other),
+            None,
+            "and only that UE: the association-wide fallback is for a Release Complete \
+             that names no usable UE, which this one does"
+        );
     }
 
     /// **#397 criterion 4, the other half.** A NORMAL RAN release fires NOTHING.
