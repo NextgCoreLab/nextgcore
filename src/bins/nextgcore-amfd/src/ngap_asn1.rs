@@ -2432,10 +2432,9 @@ pub struct GnbN3Endpoint {
 /// (`n2_sm_setup_response_transfer_generated_matches_hand_written`).
 ///
 /// It also reads the optional Additional DL QoS Flow per TNL Information as the
-/// list it is (`QosFlowPerTNLInformationList`, §9.3.4.2). The hand-written
-/// decoder read it as a single element, without the list's count or the item's
-/// preamble, and so misread a dual-connectivity gNB's additional tunnel -- the
-/// DL endpoint logged here came out right only because it precedes it.
+/// list it is (`QosFlowPerTNLInformationList`, §9.3.4.2), as the hand-written
+/// codec now does too (#462; it used to read a single element and misread a
+/// dual-connectivity gNB's additional tunnel).
 ///
 /// Neither the fork's encoder nor its decoder octet-aligns a variable-size BIT
 /// STRING of 16 bits or fewer (X.691 §16.11 aligns it whatever its length), so
@@ -3947,7 +3946,7 @@ pub(crate) mod tests {
                     qos_flow_mapping_indication: None,
                 }],
             },
-            additional_dl_qos_flow_per_tnl_information: None,
+            additional_dl_qos_flow_per_tnl_information: Vec::new(),
             security_result: None,
             qos_flow_failed_to_setup_list: Vec::new(),
         };
@@ -6430,12 +6429,15 @@ pub(crate) mod tests {
                 }
             }
         }
-        // GBR flows (5QI 1 conversational voice), optional members off and on.
-        // Not both loss rates: see `packet_loss_rate_carries_its_extension_bit`.
+        // GBR flows (5QI 1 conversational voice), optional members off and on,
+        // loss rates at the root's bounds (#462).
         for (notification, dl_loss, ul_loss) in [
             (false, None, None),
             (true, Some(0), None),
             (true, None, Some(1000)),
+            (true, Some(0), Some(1000)),
+            (false, Some(1000), Some(0)),
+            (true, Some(255), Some(256)),
         ] {
             for rate in [0u64, 64_000, 4_000_000_000_000] {
                 let mut f = non_gbr_flow(1, 1, 2);
@@ -6547,7 +6549,7 @@ pub(crate) mod tests {
         }
         assert_eq!(
             variants.len(),
-            12 + 5 + 4 + 1 + 27 + 4 + 256 + 3 + 60 + 9 + 3 + 3 + 2 + 1
+            12 + 5 + 4 + 1 + 27 + 4 + 256 + 3 + 60 + 18 + 3 + 3 + 2 + 1
         );
 
         let mut too_many = variants[0].clone();
@@ -6579,7 +6581,7 @@ pub(crate) mod tests {
                     })
                     .collect(),
             },
-            additional_dl_qos_flow_per_tnl_information: None,
+            additional_dl_qos_flow_per_tnl_information: Vec::new(),
             security_result: None,
             qos_flow_failed_to_setup_list: Vec::new(),
         }
@@ -6715,12 +6717,12 @@ pub(crate) mod tests {
         .expect("encode")
     }
 
-    /// The Additional DL QoS Flow per TNL Information is a list, and the
-    /// generated decode reads it as one. The hand-written decoder read a single
-    /// element, without the list's count or the item's preamble, so it misread
-    /// the additional tunnel -- a 2-bit address, the second tunnel's address
-    /// octets taken for its TEID, QFI 0 -- and carried on. The DL endpoint the
-    /// AMF logs precedes it, so both give the same one.
+    /// The Additional DL QoS Flow per TNL Information is a list, and both
+    /// decoders read it as one. Until #462 the hand-written decoder read a
+    /// single element, without the list's count or the item's preamble, and
+    /// misread the additional tunnel -- a 2-bit address, the second tunnel's
+    /// address octets taken for its TEID, QFI 0. The DL endpoint the AMF logs
+    /// precedes it, so both always gave the same one.
     #[test]
     fn a_dual_connectivity_setup_response_transfer_reads_its_additional_list() {
         let bytes = dual_connectivity_response_transfer();
@@ -6757,15 +6759,19 @@ pub(crate) mod tests {
         assert_eq!(tunnel.gtp_teid.0, vec![0, 0, 0, 2]);
 
         let old = PduSessionResourceSetupResponseTransfer::decode(&bytes).expect("old decode");
-        let misread = old
-            .additional_dl_qos_flow_per_tnl_information
-            .expect("old additional");
-        let UpTransportLayerInformation::GtpTunnel(ref t) = misread.up_transport_layer_information;
+        assert_eq!(old.additional_dl_qos_flow_per_tnl_information.len(), 1);
+        let UpTransportLayerInformation::GtpTunnel(ref t) =
+            old.additional_dl_qos_flow_per_tnl_information[0].up_transport_layer_information;
+        assert_eq!(t.transport_layer_address.octets, vec![10, 45, 0, 4]);
+        assert_eq!(t.transport_layer_address.bit_len, 32);
+        assert_eq!(t.gtp_teid, [0, 0, 0, 2]);
         assert_eq!(
-            t.transport_layer_address.bit_len, 2,
-            "the old decoder's misread"
+            old.additional_dl_qos_flow_per_tnl_information[0].associated_qos_flow_list[0]
+                .qos_flow_identifier,
+            9
         );
-        assert_eq!(t.gtp_teid, [10, 45, 0, 4], "the old decoder's misread");
+        // And the hand-written encoder produces the generated bytes.
+        assert_eq!(old.encode().expect("old encode"), bytes);
     }
 
     /// The fork's BIT STRING codec octet-aligns a variable-size bit string only
@@ -6796,12 +6802,11 @@ pub(crate) mod tests {
     }
 
     /// PacketLossRate is INTEGER (0..1000, ...) -- extensible, so its encoding
-    /// starts with an extension bit -- and the hand-written transfer codec
-    /// encodes and decodes it as the non-extensible (0..1000). The bit only
-    /// shows when it lands on an octet boundary, as it does for the UL rate
-    /// right after an aligned DL rate: there the generated encoding is one
-    /// octet longer, and the hand-written decoder misreads it. No producer in
-    /// nextgcore sets a loss rate yet (the SMF builds non-GBR flows).
+    /// starts with an extension bit. Until #462 the hand-written transfer codec
+    /// encoded and decoded it as the non-extensible (0..1000); the bit shows
+    /// when it lands on an octet boundary, as it does for the UL rate right
+    /// after an aligned DL rate, where the conformant encoding is one octet
+    /// longer. Now both codecs give the same bytes and read each other's form.
     #[test]
     fn packet_loss_rate_carries_its_extension_bit() {
         use nextgcore_ngap::transfer::GbrQosInformation;
@@ -6820,24 +6825,22 @@ pub(crate) mod tests {
         let old = t.encode().expect("hand-written encode");
         let generated = generated_request_transfer(&t);
         let new = nextgcore_ngap_gen::encode_contained(&generated).expect("generated encode");
-        assert_eq!(new.len(), old.len() + 1);
-        // DL rate 0 then UL rate 1000 = 0x03e8: the generated form puts the UL
-        // rate's extension bit (0) in an octet of its own, then aligns.
+        assert_eq!(new, old);
+        // DL rate 0 then UL rate 1000 = 0x03e8: the UL rate's extension bit (0)
+        // takes an octet of its own, then the value is aligned.
         assert_eq!(
             &new[new.len() - 6..],
             &[0x00, 0x00, 0x00, 0x00, 0x03, 0xe8][..]
         );
-        assert_eq!(&old[old.len() - 5..], &[0x00, 0x00, 0x00, 0x03, 0xe8][..]);
         let back = nextgcore_ngap_gen::decode_contained::<
             ngap_gen::PDUSessionResourceSetupRequestTransfer,
-        >(&new)
+        >(&old)
         .expect("generated decode");
         assert_eq!(back, generated);
-        let misread = PduSessionResourceSetupRequestTransfer::decode(&new).ok();
-        assert_ne!(
-            misread,
-            Some(t),
-            "the hand-written decoder does not read the conformant form back"
+        assert_eq!(
+            PduSessionResourceSetupRequestTransfer::decode(&new).expect("hand-written decode"),
+            t,
+            "the hand-written decoder reads the conformant form back"
         );
     }
 

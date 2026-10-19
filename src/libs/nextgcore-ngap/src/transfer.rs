@@ -545,12 +545,13 @@ impl GbrQosInformation {
             let constraint = Constraint::extensible(0, 0);
             encoder.encode_enumerated(0, &constraint)?;
         }
-        let loss_constraint = Constraint::new(0, 1000);
+        // PacketLossRate ::= INTEGER (0..1000, ...) -- extensible (§9.3.1.83), so
+        // each value starts with its extension bit.
         if let Some(dl) = self.maximum_packet_loss_rate_dl {
-            encoder.encode_constrained_whole_number(dl as i64, &loss_constraint)?;
+            encode_ext_constrained(encoder, dl as i64, 0, 1000)?;
         }
         if let Some(ul) = self.maximum_packet_loss_rate_ul {
-            encoder.encode_constrained_whole_number(ul as i64, &loss_constraint)?;
+            encode_ext_constrained(encoder, ul as i64, 0, 1000)?;
         }
         Ok(())
     }
@@ -569,14 +570,13 @@ impl GbrQosInformation {
             let constraint = Constraint::extensible(0, 0);
             let _notif = decoder.decode_enumerated(&constraint)?;
         }
-        let loss_constraint = Constraint::new(0, 1000);
         let maximum_packet_loss_rate_dl = if dl_present {
-            Some(decoder.decode_constrained_whole_number(&loss_constraint)? as u16)
+            Some(decode_packet_loss_rate(decoder)?)
         } else {
             None
         };
         let maximum_packet_loss_rate_ul = if ul_present {
-            Some(decoder.decode_constrained_whole_number(&loss_constraint)? as u16)
+            Some(decode_packet_loss_rate(decoder)?)
         } else {
             None
         };
@@ -590,6 +590,17 @@ impl GbrQosInformation {
             maximum_packet_loss_rate_ul,
         })
     }
+}
+
+/// PacketLossRate ::= INTEGER (0..1000, ...). The extension range is empty in
+/// TS 38.413, so a value past the root has no meaning here and is refused
+/// rather than truncated into the `u16`.
+fn decode_packet_loss_rate(decoder: &mut AperDecoder) -> NgapResult<u16> {
+    let value = decode_ext_constrained(decoder, 0, 1000)?;
+    u16::try_from(value)
+        .ok()
+        .filter(|v| *v <= 1000)
+        .ok_or_else(|| invalid("PacketLossRate", format!("Value {value} outside 0..1000")))
 }
 
 /// QosFlowLevelQosParameters (TS 38.413 Section 9.3.1.12)
@@ -794,6 +805,48 @@ impl QosFlowPerTnlInformation {
             associated_qos_flow_list,
         })
     }
+}
+
+/// maxnoofMultiConnectivityMinusOne (TS 38.413 §9.4)
+const MAX_MULTI_CONNECTIVITY_MINUS_ONE: usize = 3;
+
+/// Encode a `QosFlowPerTNLInformationList ::= SEQUENCE (SIZE(1..maxnoofMultiConnectivityMinusOne))
+/// OF QosFlowPerTNLInformationItem`, each item the extensible
+/// `SEQUENCE { qosFlowPerTNLInformation, iE-Extensions OPTIONAL, ... }` (§9.3.2.8). It
+/// carries the additional DL tunnels of a dual- or multi-connectivity NG-RAN node.
+fn encode_qos_flow_per_tnl_information_list(
+    encoder: &mut AperEncoder,
+    list: &[QosFlowPerTnlInformation],
+) -> NgapResult<()> {
+    if list.is_empty() || list.len() > MAX_MULTI_CONNECTIVITY_MINUS_ONE {
+        return Err(invalid(
+            "QosFlowPerTNLInformationList",
+            format!(
+                "{} items, outside 1..{MAX_MULTI_CONNECTIVITY_MINUS_ONE}",
+                list.len()
+            ),
+        ));
+    }
+    encoder.encode_constrained_length(list.len(), 1, MAX_MULTI_CONNECTIVITY_MINUS_ONE)?;
+    for item in list {
+        encoder.write_bit(false); // item extension marker
+        encoder.write_bit(false); // no iE-Extensions
+        item.encode(encoder)?;
+    }
+    Ok(())
+}
+
+fn decode_qos_flow_per_tnl_information_list(
+    decoder: &mut AperDecoder,
+) -> NgapResult<Vec<QosFlowPerTnlInformation>> {
+    let count = decoder.decode_constrained_length(1, MAX_MULTI_CONNECTIVITY_MINUS_ONE)?;
+    let mut list = Vec::with_capacity(count);
+    for _ in 0..count {
+        let _ext = decoder.read_bit()?; // item extension marker
+        let _ie_ext = decoder.read_bit()?; // no iE-Extensions
+        list.push(QosFlowPerTnlInformation::decode(decoder)?);
+    }
+    Ok(list)
 }
 
 /// QosFlowItem with cause - entry of QosFlowList (failed/to-release lists)
@@ -1259,8 +1312,9 @@ impl PduSessionResourceSetupRequestTransfer {
 pub struct PduSessionResourceSetupResponseTransfer {
     /// DL QoS Flow per TNL Information (mandatory) - gNB N3 endpoint
     pub dl_qos_flow_per_tnl_information: QosFlowPerTnlInformation,
-    /// Additional DL QoS Flow per TNL Information (optional)
-    pub additional_dl_qos_flow_per_tnl_information: Option<QosFlowPerTnlInformation>,
+    /// Additional DL QoS Flow per TNL Information (optional, empty = absent): a
+    /// `QosFlowPerTNLInformationList` of 1..3 additional tunnels (§9.3.4.2)
+    pub additional_dl_qos_flow_per_tnl_information: Vec<QosFlowPerTnlInformation>,
     /// Security Result (optional)
     pub security_result: Option<SecurityResult>,
     /// QoS Flow Failed To Setup List (optional, empty = absent)
@@ -1271,13 +1325,16 @@ impl PduSessionResourceSetupResponseTransfer {
     pub fn encode(&self) -> NgapResult<Vec<u8>> {
         let mut encoder = AperEncoder::new();
         encoder.write_bit(false); // extension
-        encoder.write_bit(self.additional_dl_qos_flow_per_tnl_information.is_some());
+        encoder.write_bit(!self.additional_dl_qos_flow_per_tnl_information.is_empty());
         encoder.write_bit(self.security_result.is_some());
         encoder.write_bit(!self.qos_flow_failed_to_setup_list.is_empty());
         encoder.write_bit(false); // no iE-Extensions
         self.dl_qos_flow_per_tnl_information.encode(&mut encoder)?;
-        if let Some(ref additional) = self.additional_dl_qos_flow_per_tnl_information {
-            additional.encode(&mut encoder)?;
+        if !self.additional_dl_qos_flow_per_tnl_information.is_empty() {
+            encode_qos_flow_per_tnl_information_list(
+                &mut encoder,
+                &self.additional_dl_qos_flow_per_tnl_information,
+            )?;
         }
         if let Some(ref result) = self.security_result {
             result.encode(&mut encoder)?;
@@ -1298,9 +1355,9 @@ impl PduSessionResourceSetupResponseTransfer {
         let _ie_ext = decoder.read_bit()?;
         let dl_qos_flow_per_tnl_information = QosFlowPerTnlInformation::decode(&mut decoder)?;
         let additional_dl_qos_flow_per_tnl_information = if additional_present {
-            Some(QosFlowPerTnlInformation::decode(&mut decoder)?)
+            decode_qos_flow_per_tnl_information_list(&mut decoder)?
         } else {
-            None
+            Vec::new()
         };
         let security_result = if security_present {
             Some(SecurityResult::decode(&mut decoder)?)
@@ -1552,8 +1609,9 @@ pub struct PduSessionResourceModifyResponseTransfer {
     pub ul_ngu_up_tnl_information: Option<UpTransportLayerInformation>,
     /// QoS Flow Add Or Modify Response List (optional, empty = absent)
     pub qos_flow_add_or_modify_response_list: Vec<QosFlowAddOrModifyResponseItem>,
-    /// Additional DL QoS Flow per TNL Information (optional)
-    pub additional_dl_qos_flow_per_tnl_information: Option<QosFlowPerTnlInformation>,
+    /// Additional DL QoS Flow per TNL Information (optional, empty = absent): a
+    /// `QosFlowPerTNLInformationList` of 1..3 additional tunnels (§9.3.4.4)
+    pub additional_dl_qos_flow_per_tnl_information: Vec<QosFlowPerTnlInformation>,
     /// QoS Flow Failed To Add Or Modify List (optional, empty = absent)
     pub qos_flow_failed_to_add_or_modify_list: Vec<QosFlowWithCauseItem>,
 }
@@ -1565,7 +1623,7 @@ impl PduSessionResourceModifyResponseTransfer {
         encoder.write_bit(self.dl_ngu_up_tnl_information.is_some());
         encoder.write_bit(self.ul_ngu_up_tnl_information.is_some());
         encoder.write_bit(!self.qos_flow_add_or_modify_response_list.is_empty());
-        encoder.write_bit(self.additional_dl_qos_flow_per_tnl_information.is_some());
+        encoder.write_bit(!self.additional_dl_qos_flow_per_tnl_information.is_empty());
         encoder.write_bit(!self.qos_flow_failed_to_add_or_modify_list.is_empty());
         encoder.write_bit(false); // no iE-Extensions
         if let Some(ref dl) = self.dl_ngu_up_tnl_information {
@@ -1584,8 +1642,11 @@ impl PduSessionResourceModifyResponseTransfer {
                 item.encode(&mut encoder)?;
             }
         }
-        if let Some(ref additional) = self.additional_dl_qos_flow_per_tnl_information {
-            additional.encode(&mut encoder)?;
+        if !self.additional_dl_qos_flow_per_tnl_information.is_empty() {
+            encode_qos_flow_per_tnl_information_list(
+                &mut encoder,
+                &self.additional_dl_qos_flow_per_tnl_information,
+            )?;
         }
         if !self.qos_flow_failed_to_add_or_modify_list.is_empty() {
             encode_qos_flow_with_cause_list(
@@ -1627,9 +1688,9 @@ impl PduSessionResourceModifyResponseTransfer {
             Vec::new()
         };
         let additional_dl_qos_flow_per_tnl_information = if additional_present {
-            Some(QosFlowPerTnlInformation::decode(&mut decoder)?)
+            decode_qos_flow_per_tnl_information_list(&mut decoder)?
         } else {
-            None
+            Vec::new()
         };
         let qos_flow_failed_to_add_or_modify_list = if failed_present {
             decode_qos_flow_with_cause_list(&mut decoder)?
@@ -2109,7 +2170,7 @@ mod tests {
                     qos_flow_mapping_indication: None,
                 }],
             },
-            additional_dl_qos_flow_per_tnl_information: None,
+            additional_dl_qos_flow_per_tnl_information: Vec::new(),
             security_result: Some(SecurityResult {
                 integrity_protection_result: ProtectionResult::Performed,
                 confidentiality_protection_result: ProtectionResult::NotPerformed,
@@ -2159,7 +2220,7 @@ mod tests {
             qos_flow_add_or_modify_response_list: vec![QosFlowAddOrModifyResponseItem {
                 qos_flow_identifier: 2,
             }],
-            additional_dl_qos_flow_per_tnl_information: None,
+            additional_dl_qos_flow_per_tnl_information: Vec::new(),
             qos_flow_failed_to_add_or_modify_list: Vec::new(),
         };
         let bytes = transfer.encode().unwrap();
@@ -2221,7 +2282,7 @@ mod tests {
                     qos_flow_mapping_indication: None,
                 }],
             },
-            additional_dl_qos_flow_per_tnl_information: None,
+            additional_dl_qos_flow_per_tnl_information: Vec::new(),
             security_result: None,
             qos_flow_failed_to_setup_list: Vec::new(),
         };
@@ -2374,5 +2435,199 @@ mod tests {
                  did, echoing one for the other would be undetectable on the wire"
             ),
         }
+    }
+
+    /// GBR-QosInformation with every bit rate 0, no Notification Control, and
+    /// both loss rates present (DL 1000, UL 0), derived by hand from X.691:
+    ///
+    /// - preamble: extension 0, notificationControl 0, maximumPacketLossRateDL 1,
+    ///   maximumPacketLossRateUL 1, iE-Extensions 0 -- `00110`;
+    /// - each BitRate ::= INTEGER (0..4000000000000, ...): extension bit 0, then
+    ///   the range (> 64K) takes the length-prefixed form -- the octet count of a
+    ///   value of up to 6 octets as a 3-bit field (1 octet -> `000`), octet
+    ///   alignment, then the value octet `00`. The first rate completes octet 0
+    ///   as `00110 0 00` = 0x30 with its last length bit in octet 1, so it is
+    ///   `30 00 00`; the next three are `00 00` each;
+    /// - PacketLossRate ::= INTEGER (0..1000, ...) is EXTENSIBLE (§9.3.1.83): an
+    ///   extension bit 0, then the 1001-value range takes two aligned octets --
+    ///   `00 03 e8` for 1000 and `00 00 00` for 0.
+    ///
+    /// The non-extensible reading drops each loss rate's extension bit and so
+    /// its padding octet: `03 e8 00 00`, two octets shorter.
+    #[test]
+    fn packet_loss_rate_carries_its_extension_bit() {
+        const GOLDEN: [u8; 15] = [
+            0x30, 0x00, 0x00, // preamble + maximumFlowBitRateDL 0
+            0x00, 0x00, // maximumFlowBitRateUL 0
+            0x00, 0x00, // guaranteedFlowBitRateDL 0
+            0x00, 0x00, // guaranteedFlowBitRateUL 0
+            0x00, 0x03, 0xe8, // maximumPacketLossRateDL: ext 0, pad, 1000
+            0x00, 0x00, 0x00, // maximumPacketLossRateUL: ext 0, pad, 0
+        ];
+        let gbr = GbrQosInformation {
+            maximum_flow_bit_rate_dl: 0,
+            maximum_flow_bit_rate_ul: 0,
+            guaranteed_flow_bit_rate_dl: 0,
+            guaranteed_flow_bit_rate_ul: 0,
+            notification_control: false,
+            maximum_packet_loss_rate_dl: Some(1000),
+            maximum_packet_loss_rate_ul: Some(0),
+        };
+        let mut encoder = AperEncoder::new();
+        gbr.encode(&mut encoder).expect("encode");
+        encoder.align();
+        assert_eq!(encoder.into_bytes().to_vec(), GOLDEN.to_vec());
+        let mut decoder = AperDecoder::new(&GOLDEN);
+        assert_eq!(
+            GbrQosInformation::decode(&mut decoder).expect("decode"),
+            gbr
+        );
+    }
+
+    fn per_tnl(address: [u8; 4], teid: u32, qfi: u8) -> QosFlowPerTnlInformation {
+        QosFlowPerTnlInformation {
+            up_transport_layer_information: UpTransportLayerInformation::GtpTunnel(GtpTunnel {
+                transport_layer_address: TransportLayerAddress::from_ipv4(address),
+                gtp_teid: teid.to_be_bytes(),
+            }),
+            associated_qos_flow_list: vec![AssociatedQosFlowItem {
+                qos_flow_identifier: qfi,
+                qos_flow_mapping_indication: None,
+            }],
+        }
+    }
+
+    /// A dual-connectivity Setup Response Transfer -- DL tunnel 10.45.0.3 /
+    /// 0xdeadbeef and one additional DL tunnel 10.45.0.4 / 2, both carrying QFI 9
+    /// -- derived by hand from X.691:
+    ///
+    /// - octet 0 `40`: transfer preamble (extension 0, additionalDL 1, security 0,
+    ///   failed 0, iE-Extensions 0) `01000`, QosFlowPerTNLInformation preamble
+    ///   `00`, UPTransportLayerInformation CHOICE index 0 of 2 `0`;
+    /// - `03 e0`: GTPTunnel preamble `00`, TransportLayerAddress extension bit `0`,
+    ///   SIZE(1..160) length 32 as the 8-bit field 31 `00011111`, then octet
+    ///   alignment (the string's ub exceeds 16 bits); `0a 2d 00 03`, TEID
+    ///   `de ad be ef` (fixed 4 octets, aligned);
+    /// - `00 09`: AssociatedQosFlowList SIZE(1..64) count 1 as `000000`, item
+    ///   preamble `000`, QFI extension bit `0` and 9 as `001001`;
+    /// - the additional list: SIZE(1..maxnoofMultiConnectivityMinusOne=3) count 1
+    ///   as `00`, QosFlowPerTNLInformationItem preamble `00`, then the same
+    ///   QosFlowPerTNLInformation shape -- `00 07 c0`, `0a 2d 00 04`,
+    ///   `00 00 00 02`, `00 09`.
+    ///
+    /// Reading the list as a single QosFlowPerTNLInformation drops its count and
+    /// the item preamble, which is how the old decoder came to a 2-bit address.
+    const DUAL_CONNECTIVITY_SETUP_RESPONSE: [u8; 26] = [
+        // DL QoS Flow per TNL Information
+        0x40, 0x03, 0xe0, 0x0a, 0x2d, 0x00, 0x03, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x09,
+        // Additional DL QoS Flow per TNL Information, a list of one
+        0x00, 0x07, 0xc0, 0x0a, 0x2d, 0x00, 0x04, 0x00, 0x00, 0x00, 0x02, 0x00, 0x09,
+    ];
+
+    #[test]
+    fn additional_dl_qos_flow_per_tnl_information_is_a_list() {
+        let transfer = PduSessionResourceSetupResponseTransfer {
+            dl_qos_flow_per_tnl_information: per_tnl([10, 45, 0, 3], 0xdead_beef, 9),
+            additional_dl_qos_flow_per_tnl_information: vec![per_tnl([10, 45, 0, 4], 2, 9)],
+            security_result: None,
+            qos_flow_failed_to_setup_list: Vec::new(),
+        };
+        assert_eq!(
+            transfer.encode().expect("encode"),
+            DUAL_CONNECTIVITY_SETUP_RESPONSE.to_vec()
+        );
+        assert_eq!(
+            PduSessionResourceSetupResponseTransfer::decode(&DUAL_CONNECTIVITY_SETUP_RESPONSE)
+                .expect("decode"),
+            transfer
+        );
+    }
+
+    /// 1..3 additional tunnels round-trip on both response transfers; 0 is
+    /// "absent" and 4 exceeds maxnoofMultiConnectivityMinusOne.
+    #[test]
+    fn additional_dl_tunnel_lists_round_trip_and_are_bounded() {
+        for n in 1..=3u8 {
+            let additional: Vec<_> = (0..n)
+                .map(|i| per_tnl([10, 45, 1, i], 0x100 + u32::from(i), 1 + i))
+                .collect();
+            let setup = PduSessionResourceSetupResponseTransfer {
+                dl_qos_flow_per_tnl_information: per_tnl([10, 45, 0, 3], 1, 9),
+                additional_dl_qos_flow_per_tnl_information: additional.clone(),
+                security_result: None,
+                qos_flow_failed_to_setup_list: Vec::new(),
+            };
+            let bytes = setup.encode().expect("encode");
+            assert_eq!(
+                PduSessionResourceSetupResponseTransfer::decode(&bytes).expect("decode"),
+                setup,
+                "{n} additional"
+            );
+            let modify = PduSessionResourceModifyResponseTransfer {
+                additional_dl_qos_flow_per_tnl_information: additional,
+                ..Default::default()
+            };
+            let bytes = modify.encode().expect("encode");
+            assert_eq!(
+                PduSessionResourceModifyResponseTransfer::decode(&bytes).expect("decode"),
+                modify,
+                "{n} additional"
+            );
+        }
+        let too_many = PduSessionResourceSetupResponseTransfer {
+            dl_qos_flow_per_tnl_information: per_tnl([10, 45, 0, 3], 1, 9),
+            additional_dl_qos_flow_per_tnl_information: vec![per_tnl([10, 45, 1, 0], 1, 1); 4],
+            security_result: None,
+            qos_flow_failed_to_setup_list: Vec::new(),
+        };
+        assert!(too_many.encode().is_err());
+    }
+
+    /// Every PacketLossRate in the root, DL and UL, round-trips; the boundary
+    /// values sit on both sides of an octet boundary in the encoding.
+    #[test]
+    fn packet_loss_rates_round_trip_across_the_root() {
+        for dl in [
+            None,
+            Some(0u16),
+            Some(1),
+            Some(255),
+            Some(256),
+            Some(999),
+            Some(1000),
+        ] {
+            for ul in [None, Some(0u16), Some(500), Some(1000)] {
+                for notification_control in [false, true] {
+                    let gbr = GbrQosInformation {
+                        maximum_flow_bit_rate_dl: 64_000,
+                        maximum_flow_bit_rate_ul: 4_000_000_000_000,
+                        guaranteed_flow_bit_rate_dl: 0,
+                        guaranteed_flow_bit_rate_ul: 1,
+                        notification_control,
+                        maximum_packet_loss_rate_dl: dl,
+                        maximum_packet_loss_rate_ul: ul,
+                    };
+                    let mut encoder = AperEncoder::new();
+                    gbr.encode(&mut encoder).expect("encode");
+                    encoder.align();
+                    let bytes = encoder.into_bytes().to_vec();
+                    let mut decoder = AperDecoder::new(&bytes);
+                    assert_eq!(
+                        GbrQosInformation::decode(&mut decoder).expect("decode"),
+                        gbr
+                    );
+                }
+            }
+        }
+        let out_of_root = GbrQosInformation {
+            maximum_flow_bit_rate_dl: 0,
+            maximum_flow_bit_rate_ul: 0,
+            guaranteed_flow_bit_rate_dl: 0,
+            guaranteed_flow_bit_rate_ul: 0,
+            notification_control: false,
+            maximum_packet_loss_rate_dl: Some(1001),
+            maximum_packet_loss_rate_ul: None,
+        };
+        assert!(out_of_root.encode(&mut AperEncoder::new()).is_err());
     }
 }
