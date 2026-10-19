@@ -986,6 +986,49 @@ jobs:
                 from handle_service_request_nas, asserted on their bodies, against \
                 nextgsim's real gNB and UE"
 
+      - name: "Drive a gNB-initiated UE Context Release through the AMF (#451)"
+        # LAST on purpose: `ue-release` tears down the NGAP UE context on both sides,
+        # so nothing after it may need the UE. It is the step the `ue-suspend` block
+        # above deliberately avoided, and for the opposite reason it is wanted here:
+        # it is the only thing in CI that sends the AMF a UEContextReleaseRequest.
+        #
+        # #451: amfd keyed the Request on procedure 41 (UEContextRelease) instead of
+        # 42 (UEContextReleaseRequest), so every gNB-requested release fell to the
+        # unhandled arm, got an Error Indication, and released nothing. Unit tests
+        # called the handler directly and this job never sent a Request, so it hid.
+        #
+        # POSITIVE assertions only: "UE Context Release Command sent to gNB" is logged
+        # by handle_ue_context_release AFTER the Command egresses, and nowhere else.
+        run: |
+          cd nextgcore/docker/rust
+          docker compose exec -T gnb /tmp/nr-cli gnb --exec 'ue-list' > /tmp/uelist2.txt 2>&1 \
+            || { echo "::error::nr-cli could not reach the gNB's CLI server"; \
+                 cat /tmp/uelist2.txt; exit 1; }
+          cat /tmp/uelist2.txt
+          UE_ID=$(grep -oE 'ue_id: [0-9]+' /tmp/uelist2.txt | head -1 | grep -oE '[0-9]+')
+          [ -n "$UE_ID" ] \
+            || { echo "::error::the gNB holds no UE context to release"; exit 1; }
+          docker compose exec -T gnb /tmp/nr-cli gnb --exec "ue-release ${UE_ID}" \
+            > /tmp/release.txt 2>&1 || true
+          cat /tmp/release.txt
+          for _ in $(seq 1 30); do
+            docker compose logs amf > /tmp/amf.log 2>&1 || true
+            if grep -qF 'UE Context Release Command sent to gNB' /tmp/amf.log; then break; fi
+            sleep 2
+          done
+          if grep -qF 'Unhandled NGAP procedure_code=Some(42)' /tmp/amf.log; then
+            echo "::error::the AMF treated UEContextReleaseRequest (42) as an unhandled \
+                  procedure -- the #451 dispatch defect"
+            grep -F 'procedure_code=Some(42)' /tmp/amf.log | tail -5; exit 1
+          fi
+          grep -F 'UE Context Release Request from gNB' /tmp/amf.log \
+            || { echo "::error::the AMF never dispatched the gNB's Release Request"; \
+                 tail -80 /tmp/amf.log; exit 1; }
+          grep -F 'UE Context Release Command sent to gNB' /tmp/amf.log \
+            || { echo "::error::the AMF dispatched the Release Request but never sent a \
+                 Release Command"; tail -80 /tmp/amf.log; exit 1; }
+          echo "a gNB-initiated UE Context Release was dispatched and answered with a Command"
+
       - name: Collect logs on failure
         if: failure()
         run: |

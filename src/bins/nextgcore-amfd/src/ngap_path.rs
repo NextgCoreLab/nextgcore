@@ -965,12 +965,32 @@ impl NgapServer {
                         .await?;
                 }
             }
-            Some(41) => {
-                // UEContextReleaseRequest (procedure code 41)
+            Some(42) => {
+                // UEContextReleaseRequest (procedure code 42, `id-UEContextReleaseRequest`,
+                // TS 38.413 §8.3.2): a class-2 gNB->AMF InitiatingMessage with no outcome.
+                // #451: this used to be keyed on 41, which is UEContextRelease -- so every
+                // conformant Release Request fell to the `_` arm and was answered with an
+                // Error Indication, and nothing was released.
                 if data[0] == 0x00 {
-                    // InitiatingMessage from gNB
                     log::info!("UE Context Release Request from gNB");
                     self.handle_ue_context_release(association_id, data).await?;
+                } else {
+                    log::warn!(
+                        "UEContextReleaseRequest has no outcome messages; unexpected \
+                         outcome byte {:#04x} from association {association_id}",
+                        data[0]
+                    );
+                }
+            }
+            Some(41) => {
+                // UEContextRelease (procedure code 41, `id-UEContextRelease`, TS 38.413
+                // §8.3.3): the Command is AMF->gNB, so what arrives here is the gNB's
+                // SuccessfulOutcome, UEContextReleaseComplete.
+                if data[0] == 0x00 {
+                    log::warn!(
+                        "UEContextReleaseCommand is AMF->gNB; unexpected from association \
+                         {association_id}"
+                    );
                 } else if data[0] == 0x20 {
                     // SuccessfulOutcome = UEContextReleaseComplete from gNB
                     log::info!("UE Context Release Complete from gNB");
@@ -18716,7 +18736,7 @@ mod tests {
         )
         .expect("encode UEContextReleaseRequest");
 
-        // The PRODUCTION handler procedure code 41 dispatches to.
+        // The PRODUCTION handler procedure code 42 dispatches to.
         let _ = ngap.handle_ue_context_release(1, &pdu).await;
 
         let reports = collect_reports(
@@ -19019,6 +19039,219 @@ mod tests {
             guard.event_subscription_remove("sub-397-commfail-normal");
         }
         sink.stop().await.expect("sink stop");
+    }
+
+    // ------------------------------------------------------------------
+    // #451 — UE Context Release Request is procedure 42, not 41
+    // ------------------------------------------------------------------
+
+    /// A Release Request carrying an UNEXPECTED cause, as a conformant gNB encodes it.
+    fn release_request_pdu(amf_ue_ngap_id: u64, ran_ue_ngap_id: u32) -> Vec<u8> {
+        nextgcore_ngap::builder::build_ue_context_release_request(
+            &nextgcore_ngap::types::UeContextReleaseRequest {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                cause: nextgcore_asn1c::ngap::cause::Cause::RadioNetwork(
+                    nextgcore_asn1c::ngap::cause::CauseRadioNetwork::RadioConnectionWithUeLost,
+                ),
+            },
+        )
+        .expect("encode UEContextReleaseRequest")
+    }
+
+    /// **#451.** A gNB's UE Context Release Request reaches the release path THROUGH
+    /// DISPATCH.
+    ///
+    /// Every earlier release test called `handle_ue_context_release` directly, which is
+    /// exactly how the dispatcher keying the Request on 41 went unseen: the handler was
+    /// right and nothing ever routed to it. This one enters at `process_ngap_message`
+    /// with the bytes a gNB sends, and asserts on COMMUNICATION_FAILURE_REPORT, which
+    /// only the release handler fires -- the `_` arm the Request used to land on answers
+    /// with an Error Indication and fires nothing.
+    // The guard is held across awaits ON PURPOSE: the event-subscription store and the
+    // AMF context are process-global, and releasing it mid-test lets a sibling's
+    // subscription see this test's report.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_release_request_on_procedure_42_is_dispatched_to_the_release_path() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::amf_context_init(64, 1024, 4096);
+
+        let amf_ue_ngap_id = 7_451_001u64;
+        let ran_ue_ngap_id = 451_001u32;
+        let supi = "imsi-001010000451001";
+        let (sink, mut rx) =
+            event_sink_for("sub-451-dispatch", supi, &["COMMUNICATION_FAILURE_REPORT"]).await;
+
+        let mut ngap = test_ngap_server().await;
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, ran_ue_ngap_id, 1, false);
+        ue_ctx.registered = true;
+        ue_ctx.amf_ue.supi = Some(supi.to_string());
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        let pdu = release_request_pdu(amf_ue_ngap_id, ran_ue_ngap_id);
+        assert_eq!(
+            (pdu[0], pdu[1]),
+            (0x00, 42),
+            "an InitiatingMessage on id-UEContextReleaseRequest (ngap-17.9.asn), so this \
+             test pins the code a gNB actually sends"
+        );
+
+        // Only the release-command send can fail here (association 1 has no socket);
+        // the dispatch decision has already been made by then.
+        let _ = ngap.process_ngap_message(1, &pdu).await;
+
+        let reports = collect_reports(
+            &mut rx,
+            1,
+            "a Release Request on procedure 42 must be dispatched to the release handler",
+        )
+        .await;
+        let report = reports
+            .get("COMMUNICATION_FAILURE_REPORT")
+            .expect("COMMUNICATION_FAILURE_REPORT must be delivered");
+        assert_eq!(report["supi"].as_str(), Some(supi));
+        assert_eq!(
+            report["commFailure"]["ranReleaseCode"]["value"].as_i64(),
+            Some(21),
+            "carrying the cause decoded from the dispatched bytes"
+        );
+
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.event_subscription_remove("sub-451-dispatch");
+        }
+        sink.stop().await.expect("sink stop");
+    }
+
+    /// **#451, the other direction.** An InitiatingMessage on 41 is a UE Context
+    /// Release COMMAND, which is AMF->gNB. It is not a Release Request and must not be
+    /// treated as one -- neither a real Command nor Request IEs re-labelled 41.
+    ///
+    /// Honest about its strength: this does NOT fail if the old 41 routing is restored,
+    /// because the release decoder already refuses a non-Request PDU. It guards the
+    /// other regression -- a future decoder that ignores the procedure code would turn
+    /// a misdirected Command into a release.
+    // The guard is held across awaits ON PURPOSE: the event-subscription store and the
+    // AMF context are process-global, and releasing it mid-test lets a sibling's
+    // subscription see this test's report.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_initiating_message_on_procedure_41_is_not_a_release_request() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::context::amf_context_init(64, 1024, 4096);
+
+        let amf_ue_ngap_id = 7_451_002u64;
+        let ran_ue_ngap_id = 451_002u32;
+        let supi = "imsi-001010000451002";
+        let (sink, mut rx) = event_sink_for(
+            "sub-451-not-a-request",
+            supi,
+            &["COMMUNICATION_FAILURE_REPORT"],
+        )
+        .await;
+
+        let mut ngap = test_ngap_server().await;
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, ran_ue_ngap_id, 1, false);
+        ue_ctx.registered = true;
+        ue_ctx.amf_ue.supi = Some(supi.to_string());
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        let command = crate::ngap_asn1::build_ue_context_release_command_asn1(
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            ngap_handler::cause_group::RADIO_NETWORK,
+            21,
+        )
+        .expect("encode UEContextReleaseCommand");
+        assert_eq!((command[0], command[1]), (0x00, 41));
+        let mut relabelled = release_request_pdu(amf_ue_ngap_id, ran_ue_ngap_id);
+        relabelled[1] = 41;
+
+        for pdu in [&command, &relabelled] {
+            assert!(
+                ngap.process_ngap_message(1, pdu).await.is_ok(),
+                "a misdirected Command is logged, not an error"
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), rx.recv())
+                .await
+                .is_err(),
+            "no release ran, so no COMMUNICATION_FAILURE_REPORT"
+        );
+        assert!(
+            ngap.ue_auth_state.contains(amf_ue_ngap_id),
+            "and the UE's NAS state is untouched"
+        );
+
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx lock");
+            guard.event_subscription_remove("sub-451-not-a-request");
+        }
+        sink.stop().await.expect("sink stop");
+    }
+
+    /// **#451.** UE Context Release Complete still dispatches on 41, as the
+    /// SuccessfulOutcome of id-UEContextRelease. Splitting the old arm must not have
+    /// moved it: the Complete is what starts mobile-reachable supervision.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_release_complete_on_procedure_41_is_still_dispatched() {
+        use nextgcore_ngap_gen::generated as g;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let (amf_ue_ngap_id, ran_ue_ngap_id) = (7_451_003u64, 451_003u32);
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, ran_ue_ngap_id, 1, false);
+        ue_ctx.registered = true;
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        use g::UEContextReleaseCompleteProtocolIEs_EntryValue as Ie;
+        let entry =
+            |id: u16, criticality: u8, value| g::UEContextReleaseCompleteProtocolIEs_Entry {
+                id: g::ProtocolIE_ID(id),
+                criticality: g::Criticality(criticality),
+                value,
+            };
+        let pdu =
+            nextgcore_ngap_gen::encode(&g::NGAP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+                procedure_code: g::ProcedureCode(g::ID_UE_CONTEXT_RELEASE),
+                criticality: g::Criticality(g::Criticality::REJECT),
+                value: g::SuccessfulOutcomeValue::Id_UEContextRelease(
+                    g::UEContextReleaseComplete {
+                        protocol_i_es: g::UEContextReleaseCompleteProtocolIEs(vec![
+                            entry(
+                                g::ID_AMF_UE_NGAP_ID,
+                                g::Criticality::IGNORE,
+                                Ie::Id_AMF_UE_NGAP_ID(g::AMF_UE_NGAP_ID(amf_ue_ngap_id)),
+                            ),
+                            entry(
+                                g::ID_RAN_UE_NGAP_ID,
+                                g::Criticality::IGNORE,
+                                Ie::Id_RAN_UE_NGAP_ID(g::RAN_UE_NGAP_ID(ran_ue_ngap_id)),
+                            ),
+                        ]),
+                    },
+                ),
+            }))
+            .expect("encode UEContextReleaseComplete");
+        assert_eq!((pdu[0], pdu[1]), (0x20, 41));
+
+        let _ = ngap.process_ngap_message(1, &pdu).await;
+
+        assert_eq!(
+            ngap.ue_auth_state
+                .get(amf_ue_ngap_id)
+                .and_then(|s| s.reachability)
+                .map(|r| r.phase),
+            Some(ReachabilityPhase::MobileReachable),
+            "the Complete reached handle_ue_context_release_complete through dispatch"
+        );
     }
 
     /// **#397.** The expected/unexpected classification itself, at the unit level.
