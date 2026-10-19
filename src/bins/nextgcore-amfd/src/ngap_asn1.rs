@@ -1545,19 +1545,35 @@ pub fn build_paging_asn1(
     }
 }
 
-/// Extract AMF UE NGAP ID from a UE Context Release Request
-pub fn extract_amf_ue_ngap_id(data: &[u8]) -> Option<u64> {
-    match parser::decode_ngap_pdu(data) {
-        Ok(NgapMessage::UeContextReleaseRequest(req)) => Some(req.amf_ue_ngap_id),
-        Ok(_) => {
-            log::warn!("Expected UeContextReleaseRequest");
-            None
-        }
+/// The raw value of the protocol IE `id` in an NGAP PDU of any procedure.
+///
+/// Walks the decoded `ProtocolIE-Container` rather than the procedure's typed
+/// form, so it works for every UE-associated message -- including procedures the
+/// AMF does not handle, which is exactly when the Error Indication path needs the
+/// IDs (#447). `None` when the PDU does not decode or carries no such IE.
+fn find_protocol_ie_value(data: &[u8], id: nextgcore_asn1c::ngap::ProtocolIeId) -> Option<Vec<u8>> {
+    use nextgcore_asn1c::ngap::pdu::NgapPdu;
+    use nextgcore_asn1c::per::{AperDecode, AperDecoder};
+
+    let pdu = match NgapPdu::decode_aper(&mut AperDecoder::new(data)) {
+        Ok(pdu) => pdu,
         Err(e) => {
-            log::warn!("Failed to extract AMF UE NGAP ID: {e}");
-            None
+            log::debug!("NGAP PDU undecodable while looking for IE {}: {e:?}", id.0);
+            return None;
         }
-    }
+    };
+    pdu.protocol_ies().find(id).map(|ie| ie.value.clone())
+}
+
+/// Extract the AMF-UE-NGAP-ID (IE 10) from any UE-associated NGAP PDU.
+pub fn extract_amf_ue_ngap_id(data: &[u8]) -> Option<u64> {
+    use nextgcore_asn1c::ngap::{AmfUeNgapId, ProtocolIeId};
+    use nextgcore_asn1c::per::{AperDecode, AperDecoder};
+
+    let value = find_protocol_ie_value(data, ProtocolIeId::AMF_UE_NGAP_ID)?;
+    AmfUeNgapId::decode_aper(&mut AperDecoder::new(&value))
+        .ok()
+        .map(|id| id.0)
 }
 
 /// Extract the `MBS-SessionID` (IE 299) from any MBS NGAP PDU as a [`crate::ngap_mcast::Tmgi`].
@@ -1613,19 +1629,15 @@ pub fn extract_mbs_session_id(data: &[u8]) -> Option<crate::ngap_mcast::Tmgi> {
     })
 }
 
-/// Extract RAN UE NGAP ID from a UE Context Release Request
+/// Extract the RAN-UE-NGAP-ID (IE 85) from any UE-associated NGAP PDU.
 pub fn extract_ran_ue_ngap_id(data: &[u8]) -> Option<u32> {
-    match parser::decode_ngap_pdu(data) {
-        Ok(NgapMessage::UeContextReleaseRequest(req)) => Some(req.ran_ue_ngap_id),
-        Ok(_) => {
-            log::warn!("Expected UeContextReleaseRequest");
-            None
-        }
-        Err(e) => {
-            log::warn!("Failed to extract RAN UE NGAP ID: {e}");
-            None
-        }
-    }
+    use nextgcore_asn1c::ngap::{ProtocolIeId, RanUeNgapId};
+    use nextgcore_asn1c::per::{AperDecode, AperDecoder};
+
+    let value = find_protocol_ie_value(data, ProtocolIeId::RAN_UE_NGAP_ID)?;
+    RanUeNgapId::decode_aper(&mut AperDecoder::new(&value))
+        .ok()
+        .map(|id| id.0)
 }
 
 /// Build a UE Context Release Command with proper ASN.1 APER encoding
@@ -2524,9 +2536,28 @@ pub(crate) mod tests {
             }
         }
 
+        /// The AMF UE NGAP ID extraction as it was before #447 made the production
+        /// extractor procedure-agnostic. Kept because it is half of what the
+        /// pre-stage-4 Release Request path could read, which stage 4's equivalence
+        /// tests compare against: it only answers for a request the hand-written
+        /// parser accepted.
+        pub(crate) fn hand_written_extract_amf_ue_ngap_id(data: &[u8]) -> Option<u64> {
+            match parser::decode_ngap_pdu(data) {
+                Ok(NgapMessage::UeContextReleaseRequest(req)) => Some(req.amf_ue_ngap_id),
+                _ => None,
+            }
+        }
+
+        /// The RAN UE NGAP ID counterpart of [`hand_written_extract_amf_ue_ngap_id`].
+        pub(crate) fn hand_written_extract_ran_ue_ngap_id(data: &[u8]) -> Option<u32> {
+            match parser::decode_ngap_pdu(data) {
+                Ok(NgapMessage::UeContextReleaseRequest(req)) => Some(req.ran_ue_ngap_id),
+                _ => None,
+            }
+        }
+
         /// The UE Context Release Request Cause extraction as it was before #417
-        /// stage 4. The two ID extractions are unchanged production code
-        /// ([`extract_amf_ue_ngap_id`], [`extract_ran_ue_ngap_id`]).
+        /// stage 4.
         pub(crate) fn hand_written_extract_release_request_cause(data: &[u8]) -> Option<(u8, i64)> {
             let cause = match parser::decode_ngap_pdu(data) {
                 Ok(NgapMessage::UeContextReleaseRequest(req)) => req.cause,
@@ -3892,6 +3923,7 @@ pub(crate) mod tests {
     // ====================================================================
 
     use hand_written_oracle::{
+        hand_written_extract_amf_ue_ngap_id, hand_written_extract_ran_ue_ngap_id,
         hand_written_extract_release_request_cause, hand_written_parse_ue_context_release_complete,
         hand_written_ue_context_release_command,
     };
@@ -4079,8 +4111,8 @@ pub(crate) mod tests {
     /// the handler read, each `None` when the message was refused.
     fn hand_written_request_view(data: &[u8]) -> Option<(u64, u32, Option<(u8, i64)>)> {
         Some((
-            extract_amf_ue_ngap_id(data)?,
-            extract_ran_ue_ngap_id(data)?,
+            hand_written_extract_amf_ue_ngap_id(data)?,
+            hand_written_extract_ran_ue_ngap_id(data)?,
             hand_written_extract_release_request_cause(data),
         ))
     }

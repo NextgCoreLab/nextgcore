@@ -63,6 +63,20 @@ pub enum NgapPdu {
 impl NgapPdu {
     pub const NUM_ALTERNATIVES: usize = 3;
     pub const EXTENSIBLE: bool = true;
+
+    /// The message's `ProtocolIE-Container`, whatever the procedure.
+    ///
+    /// Every NGAP message is `SEQUENCE { protocolIEs ProtocolIE-Container, ... }`
+    /// and every value variant here carries that container raw, so an IE can be
+    /// located by id for any procedure -- including the ones this codec does not
+    /// name, which decode as `Other`.
+    pub fn protocol_ies(&self) -> &ProtocolIeContainer {
+        match self {
+            NgapPdu::InitiatingMessage(m) => m.value.protocol_ies(),
+            NgapPdu::SuccessfulOutcome(m) => m.value.protocol_ies(),
+            NgapPdu::UnsuccessfulOutcome(m) => m.value.protocol_ies(),
+        }
+    }
 }
 
 impl AperEncode for NgapPdu {
@@ -138,6 +152,33 @@ pub enum InitiatingMessageValue {
     UplinkNonUeAssociatedNrppaTransport(ProtocolIeContainer),
     // Generic container for other message types
     Other(ProtocolIeContainer),
+}
+
+impl InitiatingMessageValue {
+    /// The message's `ProtocolIE-Container` (see [`NgapPdu::protocol_ies`]).
+    pub fn protocol_ies(&self) -> &ProtocolIeContainer {
+        match self {
+            InitiatingMessageValue::NgSetupRequest(ies)
+            | InitiatingMessageValue::InitialUeMessage(ies)
+            | InitiatingMessageValue::UplinkNasTransport(ies)
+            | InitiatingMessageValue::DownlinkNasTransport(ies)
+            | InitiatingMessageValue::InitialContextSetupRequest(ies)
+            | InitiatingMessageValue::UeContextReleaseCommand(ies)
+            | InitiatingMessageValue::UeContextReleaseRequest(ies)
+            | InitiatingMessageValue::PduSessionResourceSetupRequest(ies)
+            | InitiatingMessageValue::PduSessionResourceReleaseCommand(ies)
+            | InitiatingMessageValue::HandoverRequired(ies)
+            | InitiatingMessageValue::HandoverRequest(ies)
+            | InitiatingMessageValue::PathSwitchRequest(ies)
+            | InitiatingMessageValue::NgReset(ies)
+            | InitiatingMessageValue::ErrorIndication(ies)
+            | InitiatingMessageValue::DownlinkUeAssociatedNrppaTransport(ies)
+            | InitiatingMessageValue::UplinkUeAssociatedNrppaTransport(ies)
+            | InitiatingMessageValue::DownlinkNonUeAssociatedNrppaTransport(ies)
+            | InitiatingMessageValue::UplinkNonUeAssociatedNrppaTransport(ies)
+            | InitiatingMessageValue::Other(ies) => ies,
+        }
+    }
 }
 
 impl AperEncode for InitiatingMessage {
@@ -264,6 +305,24 @@ pub enum SuccessfulOutcomeValue {
     Other(ProtocolIeContainer),
 }
 
+impl SuccessfulOutcomeValue {
+    /// The message's `ProtocolIE-Container` (see [`NgapPdu::protocol_ies`]).
+    pub fn protocol_ies(&self) -> &ProtocolIeContainer {
+        match self {
+            SuccessfulOutcomeValue::NgSetupResponse(ies)
+            | SuccessfulOutcomeValue::InitialContextSetupResponse(ies)
+            | SuccessfulOutcomeValue::UeContextReleaseComplete(ies)
+            | SuccessfulOutcomeValue::PduSessionResourceSetupResponse(ies)
+            | SuccessfulOutcomeValue::PduSessionResourceReleaseResponse(ies)
+            | SuccessfulOutcomeValue::HandoverCommand(ies)
+            | SuccessfulOutcomeValue::HandoverRequestAcknowledge(ies)
+            | SuccessfulOutcomeValue::PathSwitchRequestAcknowledge(ies)
+            | SuccessfulOutcomeValue::NgResetAcknowledge(ies)
+            | SuccessfulOutcomeValue::Other(ies) => ies,
+        }
+    }
+}
+
 impl AperEncode for SuccessfulOutcome {
     fn encode_aper(&self, encoder: &mut AperEncoder) -> PerResult<()> {
         self.procedure_code.encode_aper(encoder)?;
@@ -342,6 +401,20 @@ pub enum UnsuccessfulOutcomeValue {
     HandoverFailure(ProtocolIeContainer),
     PathSwitchRequestFailure(ProtocolIeContainer),
     Other(ProtocolIeContainer),
+}
+
+impl UnsuccessfulOutcomeValue {
+    /// The message's `ProtocolIE-Container` (see [`NgapPdu::protocol_ies`]).
+    pub fn protocol_ies(&self) -> &ProtocolIeContainer {
+        match self {
+            UnsuccessfulOutcomeValue::NgSetupFailure(ies)
+            | UnsuccessfulOutcomeValue::InitialContextSetupFailure(ies)
+            | UnsuccessfulOutcomeValue::HandoverPreparationFailure(ies)
+            | UnsuccessfulOutcomeValue::HandoverFailure(ies)
+            | UnsuccessfulOutcomeValue::PathSwitchRequestFailure(ies)
+            | UnsuccessfulOutcomeValue::Other(ies) => ies,
+        }
+    }
 }
 
 impl AperEncode for UnsuccessfulOutcome {
