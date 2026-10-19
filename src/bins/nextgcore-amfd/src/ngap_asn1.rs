@@ -15,17 +15,15 @@
 //! Indication where §10.3.4.2 says to -- and the PDU Session Resource Release
 //! pair (stage 5): the Command encoder, whose per-session transfer goes through
 //! [`nextgcore_ngap_gen::encode_contained`], and the Response decoder
-//! ([`decode_pdu_session_resource_release_response_asn1`]).
+//! ([`decode_pdu_session_resource_release_response_asn1`]) -- and the PDU
+//! Session Resource Setup pair (stage 6): the Request encoder, the Response
+//! decoder ([`decode_pdu_session_resource_setup_response_asn1`]), and the
+//! Setup Request / Response transfers
+//! ([`build_n2_sm_setup_request_transfer`],
+//! [`parse_n2_sm_setup_response_transfer`]).
 
 use nextgcore_asn1c::ngap::cause::{
     Cause, CauseMisc, CauseNas, CauseProtocol, CauseRadioNetwork, CauseTransport,
-};
-use nextgcore_ngap::transfer::{
-    AllocationAndRetentionPriority, GtpTunnel, NonDynamic5qiDescriptor,
-    PduSessionResourceSetupRequestTransfer, PduSessionResourceSetupResponseTransfer,
-    PduSessionType, PreEmptionCapability, PreEmptionVulnerability, QosCharacteristics,
-    QosFlowLevelQosParameters, QosFlowSetupRequestItem, TransportLayerAddress,
-    UpTransportLayerInformation,
 };
 use nextgcore_ngap::{builder, parser, types::*, NgapMessage};
 
@@ -766,6 +764,15 @@ pub fn build_downlink_nas_transport_asn1(
 ///
 /// This is sent by AMF to gNB to establish PDU session resources.
 /// The message follows 3GPP TS 38.413 Section 8.2.1.
+///
+/// #417 stage 6: encoded by the generated codec. The N2 SM transfer is the
+/// SMF's, carried as the item's `OCTET STRING (CONTAINING ...)` without being
+/// re-encoded. The bytes are the hand-written encoder's for every request the
+/// AMF sends (no message-level NAS-PDU) --
+/// `pdu_session_resource_setup_request_generated_matches_hand_written` pins it.
+/// A message-level NAS-PDU now goes where §9.4.1 puts it, before the session
+/// list in object-set order; the hand-written encoder appended it after, which
+/// a receiver must treat as an abstract syntax error (§10.3.6).
 pub fn build_pdu_session_resource_setup_request_asn1(
     amf_ue_ngap_id: u64,
     ran_ue_ngap_id: u32,
@@ -775,32 +782,65 @@ pub fn build_pdu_session_resource_setup_request_asn1(
     nas_pdu: Option<&[u8]>,
     n2_sm_transfer: &[u8],
 ) -> Option<Vec<u8>> {
-    let sd = s_nssai_sd.map(|sd_val| {
-        [
-            ((sd_val >> 16) & 0xFF) as u8,
-            ((sd_val >> 8) & 0xFF) as u8,
-            (sd_val & 0xFF) as u8,
-        ]
+    use ngap_gen::{
+        PDUSessionResourceSetupItemSUReq,
+        PDUSessionResourceSetupItemSUReqPDUSessionResourceSetupRequestTransfer as Transfer,
+        PDUSessionResourceSetupRequest, PDUSessionResourceSetupRequestProtocolIEs,
+        PDUSessionResourceSetupRequestProtocolIEs_Entry as Entry,
+        PDUSessionResourceSetupRequestProtocolIEs_EntryValue as Ie, ProtocolIE_ID, NGAP_PDU,
+    };
+
+    let item = PDUSessionResourceSetupItemSUReq {
+        pdu_session_id: ngap_gen::PDUSessionID(pdu_session_id),
+        pdu_session_nas_pdu: None,
+        s_nssai: generated_s_nssai(&crate::context::SNssai {
+            sst: s_nssai_sst,
+            sd: s_nssai_sd,
+        }),
+        pdu_session_resource_setup_request_transfer: Transfer(n2_sm_transfer.to_vec()),
+        ie_extensions: None,
+    };
+
+    let reject = ngap_gen::Criticality(ngap_gen::Criticality::REJECT);
+    // IE order and criticalities as TS 38.413 §9.2.1.1 lists them; the AMF
+    // sends neither the RAN Paging Priority nor a UE AMBR here.
+    let mut ies = vec![
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_AMF_UE_NGAP_ID),
+            criticality: reject.clone(),
+            value: Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(amf_ue_ngap_id)),
+        },
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_RAN_UE_NGAP_ID),
+            criticality: reject.clone(),
+            value: Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(ran_ue_ngap_id)),
+        },
+    ];
+    if let Some(nas_pdu) = nas_pdu {
+        ies.push(Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_NAS_PDU),
+            criticality: reject.clone(),
+            value: Ie::Id_NAS_PDU(ngap_gen::NAS_PDU(nas_pdu.to_vec())),
+        });
+    }
+    ies.push(Entry {
+        id: ProtocolIE_ID(ngap_gen::ID_PDU_SESSION_RESOURCE_SETUP_LIST_SU_REQ),
+        criticality: reject.clone(),
+        value: Ie::Id_PDUSessionResourceSetupListSUReq(ngap_gen::PDUSessionResourceSetupListSUReq(
+            vec![item],
+        )),
+    });
+    let pdu = NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_PDU_SESSION_RESOURCE_SETUP),
+        criticality: reject,
+        value: ngap_gen::InitiatingMessageValue::Id_PDUSessionResourceSetup(
+            PDUSessionResourceSetupRequest {
+                protocol_i_es: PDUSessionResourceSetupRequestProtocolIEs(ies),
+            },
+        ),
     });
 
-    let item = PduSessionResourceSetupItem {
-        pdu_session_id,
-        nas_pdu: None,
-        s_nssai: SNssai {
-            sst: s_nssai_sst,
-            sd,
-        },
-        transfer: n2_sm_transfer.to_vec(),
-    };
-
-    let msg = PduSessionResourceSetupRequest {
-        amf_ue_ngap_id,
-        ran_ue_ngap_id,
-        pdu_session_list: vec![item],
-        nas_pdu: nas_pdu.map(|p| p.to_vec()),
-    };
-
-    match builder::build_pdu_session_resource_setup_request(&msg) {
+    match nextgcore_ngap_gen::encode(&pdu) {
         Ok(bytes) => {
             log::debug!(
                 "Built PDU Session Resource Setup Request: {} bytes, amf_ue_ngap_id={}, psi={}",
@@ -1190,6 +1230,170 @@ pub fn decode_pdu_session_resource_release_response_asn1(
         amf_ue_ngap_id,
         ran_ue_ngap_id,
         released,
+        error_indication,
+    }
+}
+
+/// One session a PDU Session Resource Setup Response reports set up, or
+/// failed to set up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupResponsePduSession {
+    /// The PDU Session ID.
+    pub pdu_session_id: u8,
+    /// The `PDUSessionResourceSetupResponseTransfer` (set up) or
+    /// `PDUSessionResourceSetupUnsuccessfulTransfer` (failed) octets, exactly as
+    /// received: the AMF relays N2 SM information to the SMF opaquely
+    /// (TS 23.502) and never re-encodes it.
+    pub transfer: Vec<u8>,
+}
+
+/// How a received PDU Session Resource Setup Response is to be handled.
+#[derive(Debug)]
+pub enum PduSessionResourceSetupResponseDecode {
+    /// Decoded. Every IE of the response has criticality ignore (§9.2.1.2), so
+    /// a missing one is ignored (§10.3.5) and comes back `None` / empty. When
+    /// `error_indication` is set, the response carried not-comprehended IEs
+    /// marked "ignore IE and notify sender", which §10.3.4.2 reports in an
+    /// Error Indication.
+    Decoded {
+        /// The AMF UE NGAP ID the gNB names.
+        amf_ue_ngap_id: Option<u64>,
+        /// The RAN UE NGAP ID the gNB names.
+        ran_ue_ngap_id: Option<u32>,
+        /// The sessions set up, in the order received.
+        setup: Vec<SetupResponsePduSession>,
+        /// The sessions that failed to set up, in the order received.
+        failed: Vec<SetupResponsePduSession>,
+        /// The Error Indication to send, if any.
+        error_indication: Option<CriticalityErrorIndication>,
+    },
+    /// The response carried a not-comprehended IE marked "reject": the
+    /// procedure is "unsuccessfully terminated" and handled locally
+    /// (§10.3.4.2), with no message to the gNB. The IEs are for the log.
+    Failed(Vec<IeDiagnostic>),
+    /// Not decodable.
+    Undecodable,
+}
+
+/// Decode a PDU Session Resource Setup Response (gNB -> AMF, TS 38.413
+/// §9.2.1.2) with the GENERATED codec (#417 stage 6), applying the §10.3.4.2
+/// and §10.3.5 rules for a RESPONSE message.
+///
+/// The hand-written parser this replaced refused the message on a missing ID
+/// and on any not-comprehended IE marked reject, and ignored one marked notify
+/// without reporting it. Every response it accepted decodes to the same UE and
+/// the same sessions and transfers, in both lists:
+/// `pdu_session_resource_setup_response_generated_decode_matches_hand_written`.
+///
+/// An item of either list carrying an `iE-Extensions` container is refused as
+/// undecodable, for the reason a released item is (stage 5): both extension
+/// object sets are empty in Rel-17, and the forked codec decodes an entry of
+/// such a container as zero bits (nextgsim #218), so whatever it returned for
+/// the rest of the list would be a misparse.
+pub fn decode_pdu_session_resource_setup_response_asn1(
+    data: &[u8],
+) -> PduSessionResourceSetupResponseDecode {
+    use ngap_gen::{
+        PDUSessionResourceSetupResponseProtocolIEs_EntryValue as Ie, SuccessfulOutcomeValue,
+    };
+    use PduSessionResourceSetupResponseDecode::{Decoded, Failed, Undecodable};
+
+    let (pdu, unknown) = match nextgcore_ngap_gen::decode_with_unknown_ies(data) {
+        Ok(decoded) => decoded,
+        Err(e) => {
+            log::warn!("Failed to decode PDU Session Resource Setup Response: {e:?}");
+            return Undecodable;
+        }
+    };
+    let ngap_gen::NGAP_PDU::SuccessfulOutcome(ngap_gen::SuccessfulOutcome {
+        criticality,
+        value: SuccessfulOutcomeValue::Id_PDUSessionResourceSetup(response),
+        ..
+    }) = pdu
+    else {
+        log::warn!("Expected PduSessionResourceSetupResponse");
+        return Undecodable;
+    };
+    // Before the not-comprehended IEs are looked at: the misparse an item's
+    // extension container causes can itself surface as a phantom unknown IE --
+    // an "IE 256 marked reject" read out of the next item's octets, for one.
+    let item_extensions = response
+        .protocol_i_es
+        .0
+        .iter()
+        .any(|entry| match &entry.value {
+            Ie::Id_PDUSessionResourceSetupListSURes(list) => {
+                list.0.iter().any(|item| item.ie_extensions.is_some())
+            }
+            Ie::Id_PDUSessionResourceFailedToSetupListSURes(list) => {
+                list.0.iter().any(|item| item.ie_extensions.is_some())
+            }
+            _ => false,
+        });
+    if item_extensions {
+        log::warn!(
+            "PDU Session Resource Setup Response: a PSI item carries iE-Extensions, which \
+             the codec cannot decode (nextgsim #218)"
+        );
+        return Undecodable;
+    }
+    let Some((reject, notify)) =
+        classify_unknown_ies(&unknown, "PDU Session Resource Setup Response")
+    else {
+        return Undecodable;
+    };
+    if !reject.is_empty() {
+        return Failed(reject);
+    }
+
+    let mut amf_ue_ngap_id = None;
+    let mut ran_ue_ngap_id = None;
+    let mut setup = Vec::new();
+    let mut failed = Vec::new();
+    for entry in response.protocol_i_es.0 {
+        match entry.value {
+            Ie::Id_AMF_UE_NGAP_ID(v) => amf_ue_ngap_id = Some(v.0),
+            Ie::Id_RAN_UE_NGAP_ID(v) => ran_ue_ngap_id = Some(v.0),
+            Ie::Id_PDUSessionResourceSetupListSURes(list) => {
+                for item in list.0 {
+                    setup.push(SetupResponsePduSession {
+                        pdu_session_id: item.pdu_session_id.0,
+                        transfer: item.pdu_session_resource_setup_response_transfer.0,
+                    });
+                }
+            }
+            Ie::Id_PDUSessionResourceFailedToSetupListSURes(list) => {
+                for item in list.0 {
+                    failed.push(SetupResponsePduSession {
+                        pdu_session_id: item.pdu_session_id.0,
+                        transfer: item.pdu_session_resource_setup_unsuccessful_transfer.0,
+                    });
+                }
+            }
+            // Comprehended, and not used by the AMF.
+            Ie::Id_UserLocationInformation(_) | Ie::Id_CriticalityDiagnostics(_) => {}
+        }
+    }
+    let error_indication = if notify.is_empty() {
+        None
+    } else {
+        Some(CriticalityErrorIndication {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            cause_protocol: ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+            procedure: ReportedProcedure {
+                procedure_code: ngap_gen::ID_PDU_SESSION_RESOURCE_SETUP,
+                triggering_message: ngap_gen::TriggeringMessage::SUCCESSFUL_OUTCOME,
+                procedure_criticality: criticality.0,
+            },
+            diagnostics: notify,
+        })
+    };
+    Decoded {
+        amf_ue_ngap_id,
+        ran_ue_ngap_id,
+        setup,
+        failed,
         error_indication,
     }
 }
@@ -1872,9 +2076,17 @@ pub fn build_overload_stop_asn1() -> Option<Vec<u8>> {
 /// Build an APER-encoded PDUSessionResourceSetupRequestTransfer
 /// (TS 38.413 Section 9.3.4.1) carrying the UPF N3 tunnel endpoint.
 ///
-/// Used as the N2 SM information container when the AMF must synthesize
-/// the transfer itself (SMF-unreachable fallback). The normal path forwards
-/// the SMF-produced transfer opaquely.
+/// Nothing in the AMF calls this: the N2 SM information the AMF sends is the
+/// SMF's transfer, relayed opaquely, and there is no SMF-unreachable fallback
+/// that synthesizes one (an unreachable SMF ends in a PDU Session
+/// Establishment Reject). It is kept, encoded by the generated codec (#417
+/// stage 6) through [`nextgcore_ngap_gen::encode_contained`], as the AMF-side
+/// reference for the transfer the SMF builds the same way.
+///
+/// The bytes are the hand-written transfer encoder's for every input --
+/// `n2_sm_setup_request_transfer_generated_matches_hand_written` pins it -- and
+/// it refuses what that encoder refused: a QFI past 63, a 5QI past 255, a
+/// Priority Level ARP outside 1..15.
 pub fn build_n2_sm_setup_request_transfer(
     upf_teid: u32,
     upf_addr: [u8; 4],
@@ -1882,42 +2094,113 @@ pub fn build_n2_sm_setup_request_transfer(
     five_qi: u16,
     arp_priority_level: u8,
 ) -> Option<Vec<u8>> {
-    let transfer = PduSessionResourceSetupRequestTransfer {
-        pdu_session_aggregate_maximum_bit_rate: None,
-        ul_ngu_up_tnl_information: UpTransportLayerInformation::GtpTunnel(GtpTunnel {
-            transport_layer_address: TransportLayerAddress::from_ipv4(upf_addr),
-            gtp_teid: upf_teid.to_be_bytes(),
-        }),
-        data_forwarding_not_possible: false,
-        pdu_session_type: PduSessionType::Ipv4,
-        security_indication: None,
-        network_instance: None,
-        qos_flow_setup_request_list: vec![QosFlowSetupRequestItem {
-            qos_flow_identifier: qfi,
-            qos_flow_level_qos_parameters: QosFlowLevelQosParameters {
-                qos_characteristics: QosCharacteristics::NonDynamic5qi(
-                    NonDynamic5qiDescriptor::new(five_qi),
-                ),
-                allocation_and_retention_priority: AllocationAndRetentionPriority {
-                    priority_level_arp: arp_priority_level,
-                    pre_emption_capability: PreEmptionCapability::ShallNotTriggerPreEmption,
-                    pre_emption_vulnerability: PreEmptionVulnerability::NotPreEmptable,
-                },
-                gbr_qos_information: None,
-                reflective_qos_attribute: false,
-                additional_qos_flow_information: false,
-            },
-            e_rab_id: None,
-        }],
+    use ngap_gen::{
+        PDUSessionResourceSetupRequestTransferProtocolIEs_Entry as Entry,
+        PDUSessionResourceSetupRequestTransferProtocolIEs_EntryValue as Ie, ProtocolIE_ID,
     };
 
-    match transfer.encode() {
+    // FiveQI is INTEGER (0..255, ...) and the generated type a u8, so a 5QI
+    // past 255 cannot be carried; the codec itself refuses a QFI past 63 and a
+    // Priority Level ARP outside 1..15.
+    let Ok(five_qi) = u8::try_from(five_qi) else {
+        log::error!("Failed to encode PDUSessionResourceSetupRequestTransfer: 5QI {five_qi} > 255");
+        return None;
+    };
+    let flow = ngap_gen::QosFlowSetupRequestItem {
+        qos_flow_identifier: ngap_gen::QosFlowIdentifier(qfi),
+        qos_flow_level_qos_parameters: ngap_gen::QosFlowLevelQosParameters {
+            qos_characteristics: ngap_gen::QosCharacteristics::NonDynamic5QI(
+                ngap_gen::NonDynamic5QIDescriptor {
+                    five_qi: ngap_gen::FiveQI(five_qi),
+                    priority_level_qos: None,
+                    averaging_window: None,
+                    maximum_data_burst_volume: None,
+                    ie_extensions: None,
+                },
+            ),
+            allocation_and_retention_priority: ngap_gen::AllocationAndRetentionPriority {
+                priority_level_arp: ngap_gen::PriorityLevelARP(arp_priority_level),
+                pre_emption_capability: ngap_gen::Pre_emptionCapability(
+                    ngap_gen::Pre_emptionCapability::SHALL_NOT_TRIGGER_PRE_EMPTION,
+                ),
+                pre_emption_vulnerability: ngap_gen::Pre_emptionVulnerability(
+                    ngap_gen::Pre_emptionVulnerability::NOT_PRE_EMPTABLE,
+                ),
+                ie_extensions: None,
+            },
+            gbr_qos_information: None,
+            reflective_qos_attribute: None,
+            additional_qos_flow_information: None,
+            ie_extensions: None,
+        },
+        e_rab_id: None,
+        ie_extensions: None,
+    };
+
+    let reject = ngap_gen::Criticality(ngap_gen::Criticality::REJECT);
+    // Object-set order (§9.3.4.1): UL NG-U UP TNL Information, PDU Session
+    // Type, QoS Flow Setup Request List -- the three mandatory IEs, all reject.
+    let ies = vec![
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_UL_NGU_UP_TNL_INFORMATION),
+            criticality: reject.clone(),
+            value: Ie::Id_UL_NGU_UP_TNLInformation(generated_gtp_tunnel(&upf_addr, 32, upf_teid)),
+        },
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_PDU_SESSION_TYPE),
+            criticality: reject.clone(),
+            value: Ie::Id_PDUSessionType(ngap_gen::PDUSessionType(ngap_gen::PDUSessionType::IPV4)),
+        },
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_QOS_FLOW_SETUP_REQUEST_LIST),
+            criticality: reject,
+            value: Ie::Id_QosFlowSetupRequestList(ngap_gen::QosFlowSetupRequestList(vec![flow])),
+        },
+    ];
+    let transfer = ngap_gen::PDUSessionResourceSetupRequestTransfer {
+        protocol_i_es: ngap_gen::PDUSessionResourceSetupRequestTransferProtocolIEs(ies),
+    };
+
+    match nextgcore_ngap_gen::encode_contained(&transfer) {
         Ok(bytes) => Some(bytes),
         Err(e) => {
             log::error!("Failed to encode PDUSessionResourceSetupRequestTransfer: {e:?}");
             None
         }
     }
+}
+
+/// A GTP tunnel endpoint as the generated `UPTransportLayerInformation`
+/// (TS 38.413 §9.3.2.2): the first `bit_len` bits of `address` (32 for IPv4,
+/// 128 for IPv6, 160 for both, TS 38.414 §5.1) and the TEID.
+fn generated_gtp_tunnel(
+    address: &[u8],
+    bit_len: usize,
+    teid: u32,
+) -> ngap_gen::UPTransportLayerInformation {
+    let bits = (0..bit_len)
+        .map(|i| address[i / 8] & (0x80 >> (i % 8)) != 0)
+        .collect();
+    ngap_gen::UPTransportLayerInformation::GTPTunnel(ngap_gen::GTPTunnel {
+        transport_layer_address: ngap_gen::TransportLayerAddress(bits),
+        gtp_teid: ngap_gen::GTP_TEID(teid.to_be_bytes().to_vec()),
+        ie_extensions: None,
+    })
+}
+
+/// A Transport Layer Address's bits as octets, MSB first, the last octet
+/// zero-padded -- the form the hand-written codec returned.
+fn transport_layer_address_octets(address: &ngap_gen::TransportLayerAddress) -> Vec<u8> {
+    address
+        .0
+        .chunks(8)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .enumerate()
+                .fold(0u8, |octet, (i, bit)| octet | (u8::from(*bit) << (7 - i)))
+        })
+        .collect()
 }
 
 /// gNB DL tunnel endpoint extracted from a setup-response transfer
@@ -1933,27 +2216,65 @@ pub struct GnbN3Endpoint {
 
 /// Decode an APER PDUSessionResourceSetupResponseTransfer
 /// (TS 38.413 Section 9.3.4.2) and extract the gNB DL N3 endpoint.
+///
+/// The AMF only logs the result: the transfer is the SMF's, relayed whatever
+/// this says. #417 stage 6 decodes it with the generated codec, skipping
+/// protocol extensions the schema does not know, as the hand-written decoder
+/// did by never reading the extension container. Every transfer that decoder
+/// accepted gives the same endpoint
+/// (`n2_sm_setup_response_transfer_generated_matches_hand_written`).
+///
+/// It also reads the optional Additional DL QoS Flow per TNL Information as the
+/// list it is (`QosFlowPerTNLInformationList`, §9.3.4.2). The hand-written
+/// decoder read it as a single element, without the list's count or the item's
+/// preamble, and so misread a dual-connectivity gNB's additional tunnel -- the
+/// DL endpoint logged here came out right only because it precedes it.
+///
+/// Neither the fork's encoder nor its decoder octet-aligns a variable-size BIT
+/// STRING of 16 bits or fewer (X.691 §16.11 aligns it whatever its length), so
+/// a Transport Layer Address that short is read differently from the
+/// hand-written decoder. No GTP-U endpoint is that short: IPv4 is 32 bits.
+///
+/// A DL tunnel carrying an `iE-Extensions` container is refused: GTPTunnel's
+/// extension object set is empty, so the forked codec reads its entries as
+/// zero bits (nextgsim #218) and the associated QoS flow list after it from
+/// the wrong offset.
 pub fn parse_n2_sm_setup_response_transfer(data: &[u8]) -> Option<GnbN3Endpoint> {
-    let transfer = match PduSessionResourceSetupResponseTransfer::decode(data) {
-        Ok(t) => t,
+    let transfer = match nextgcore_ngap_gen::decode_contained_with_unknown_ies::<
+        ngap_gen::PDUSessionResourceSetupResponseTransfer,
+    >(data)
+    {
+        Ok((t, _unknown)) => t,
         Err(e) => {
             log::warn!("Failed to decode PDUSessionResourceSetupResponseTransfer: {e:?}");
             return None;
         }
     };
 
-    let UpTransportLayerInformation::GtpTunnel(tunnel) = &transfer
-        .dl_qos_flow_per_tnl_information
-        .up_transport_layer_information;
+    let dl = transfer.dl_qos_flow_per_tnl_information;
+    let ngap_gen::UPTransportLayerInformation::GTPTunnel(tunnel) =
+        dl.up_transport_layer_information
+    else {
+        log::warn!("PDUSessionResourceSetupResponseTransfer: DL tunnel is not a GTP tunnel");
+        return None;
+    };
+    if tunnel.ie_extensions.is_some() {
+        log::warn!(
+            "PDUSessionResourceSetupResponseTransfer: DL GTP tunnel carries iE-Extensions, \
+             which the codec cannot decode (nextgsim #218)"
+        );
+        return None;
+    }
+    let teid: [u8; 4] = tunnel.gtp_teid.0.as_slice().try_into().ok()?;
 
     Some(GnbN3Endpoint {
-        teid: u32::from_be_bytes(tunnel.gtp_teid),
-        address: tunnel.transport_layer_address.octets.clone(),
-        qfis: transfer
-            .dl_qos_flow_per_tnl_information
+        teid: u32::from_be_bytes(teid),
+        address: transport_layer_address_octets(&tunnel.transport_layer_address),
+        qfis: dl
             .associated_qos_flow_list
+            .0
             .iter()
-            .map(|f| f.qos_flow_identifier)
+            .map(|f| f.qos_flow_identifier.0)
             .collect(),
     })
 }
@@ -1962,6 +2283,13 @@ pub fn parse_n2_sm_setup_response_transfer(data: &[u8]) -> Option<GnbN3Endpoint>
 pub(crate) mod tests {
     use super::*;
     use crate::context::{AmfId, Guami, PlmnId, PlmnSupport, SNssai};
+    use nextgcore_ngap::transfer::{
+        AllocationAndRetentionPriority, GtpTunnel, NonDynamic5qiDescriptor,
+        PduSessionResourceSetupRequestTransfer, PduSessionResourceSetupResponseTransfer,
+        PduSessionType, PreEmptionCapability, PreEmptionVulnerability, QosCharacteristics,
+        QosFlowLevelQosParameters, QosFlowSetupRequestItem, TransportLayerAddress,
+        UpTransportLayerInformation,
+    };
 
     fn create_test_context() -> AmfContext {
         let mut ctx = AmfContext::new();
@@ -1991,6 +2319,135 @@ pub(crate) mod tests {
     /// compared against.
     mod hand_written_oracle {
         use super::super::*;
+
+        /// The PDU Session Resource Setup Request encoder as it was before
+        /// #417 stage 6 moved it onto the generated codec.
+        pub(crate) fn hand_written_pdu_session_resource_setup_request(
+            amf_ue_ngap_id: u64,
+            ran_ue_ngap_id: u32,
+            pdu_session_id: u8,
+            s_nssai_sst: u8,
+            s_nssai_sd: Option<u32>,
+            nas_pdu: Option<&[u8]>,
+            n2_sm_transfer: &[u8],
+        ) -> Option<Vec<u8>> {
+            let sd = s_nssai_sd.map(|sd_val| {
+                [
+                    ((sd_val >> 16) & 0xFF) as u8,
+                    ((sd_val >> 8) & 0xFF) as u8,
+                    (sd_val & 0xFF) as u8,
+                ]
+            });
+            let item = PduSessionResourceSetupItem {
+                pdu_session_id,
+                nas_pdu: None,
+                s_nssai: SNssai {
+                    sst: s_nssai_sst,
+                    sd,
+                },
+                transfer: n2_sm_transfer.to_vec(),
+            };
+            let msg = PduSessionResourceSetupRequest {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                pdu_session_list: vec![item],
+                nas_pdu: nas_pdu.map(|p| p.to_vec()),
+            };
+            builder::build_pdu_session_resource_setup_request(&msg).ok()
+        }
+
+        /// The PDU Session Resource Setup Response decode as the handler did it
+        /// before #417 stage 6: the UE, the set-up and the failed sessions with
+        /// their transfers, or nothing when the parser refused the message.
+        #[allow(clippy::type_complexity)]
+        pub(crate) fn hand_written_parse_pdu_session_resource_setup_response(
+            data: &[u8],
+        ) -> Option<(u64, u32, Vec<(u8, Vec<u8>)>, Vec<(u8, Vec<u8>)>)> {
+            match parser::decode_ngap_pdu(data) {
+                Ok(NgapMessage::PduSessionResourceSetupResponse(r)) => Some((
+                    r.amf_ue_ngap_id,
+                    r.ran_ue_ngap_id,
+                    r.setup_list
+                        .into_iter()
+                        .map(|i| (i.pdu_session_id, i.transfer))
+                        .collect(),
+                    r.failed_list
+                        .into_iter()
+                        .map(|i| (i.pdu_session_id, i.transfer))
+                        .collect(),
+                )),
+                _ => None,
+            }
+        }
+
+        /// `build_n2_sm_setup_request_transfer` as it was before #417 stage 6.
+        pub(crate) fn hand_written_n2_sm_setup_request_transfer(
+            upf_teid: u32,
+            upf_addr: [u8; 4],
+            qfi: u8,
+            five_qi: u16,
+            arp_priority_level: u8,
+        ) -> Option<Vec<u8>> {
+            use nextgcore_ngap::transfer::{
+                AllocationAndRetentionPriority, GtpTunnel, NonDynamic5qiDescriptor,
+                PduSessionResourceSetupRequestTransfer, PduSessionType, PreEmptionCapability,
+                PreEmptionVulnerability, QosCharacteristics, QosFlowLevelQosParameters,
+                QosFlowSetupRequestItem, TransportLayerAddress, UpTransportLayerInformation,
+            };
+            PduSessionResourceSetupRequestTransfer {
+                pdu_session_aggregate_maximum_bit_rate: None,
+                ul_ngu_up_tnl_information: UpTransportLayerInformation::GtpTunnel(GtpTunnel {
+                    transport_layer_address: TransportLayerAddress::from_ipv4(upf_addr),
+                    gtp_teid: upf_teid.to_be_bytes(),
+                }),
+                data_forwarding_not_possible: false,
+                pdu_session_type: PduSessionType::Ipv4,
+                security_indication: None,
+                network_instance: None,
+                qos_flow_setup_request_list: vec![QosFlowSetupRequestItem {
+                    qos_flow_identifier: qfi,
+                    qos_flow_level_qos_parameters: QosFlowLevelQosParameters {
+                        qos_characteristics: QosCharacteristics::NonDynamic5qi(
+                            NonDynamic5qiDescriptor::new(five_qi),
+                        ),
+                        allocation_and_retention_priority: AllocationAndRetentionPriority {
+                            priority_level_arp: arp_priority_level,
+                            pre_emption_capability: PreEmptionCapability::ShallNotTriggerPreEmption,
+                            pre_emption_vulnerability: PreEmptionVulnerability::NotPreEmptable,
+                        },
+                        gbr_qos_information: None,
+                        reflective_qos_attribute: false,
+                        additional_qos_flow_information: false,
+                    },
+                    e_rab_id: None,
+                }],
+            }
+            .encode()
+            .ok()
+        }
+
+        /// `parse_n2_sm_setup_response_transfer` as it was before #417 stage 6.
+        pub(crate) fn hand_written_parse_n2_sm_setup_response_transfer(
+            data: &[u8],
+        ) -> Option<GnbN3Endpoint> {
+            use nextgcore_ngap::transfer::{
+                PduSessionResourceSetupResponseTransfer, UpTransportLayerInformation,
+            };
+            let transfer = PduSessionResourceSetupResponseTransfer::decode(data).ok()?;
+            let UpTransportLayerInformation::GtpTunnel(tunnel) = &transfer
+                .dl_qos_flow_per_tnl_information
+                .up_transport_layer_information;
+            Some(GnbN3Endpoint {
+                teid: u32::from_be_bytes(tunnel.gtp_teid),
+                address: tunnel.transport_layer_address.octets.clone(),
+                qfis: transfer
+                    .dl_qos_flow_per_tnl_information
+                    .associated_qos_flow_list
+                    .iter()
+                    .map(|f| f.qos_flow_identifier)
+                    .collect(),
+            })
+        }
 
         /// The UE Context Release Command encoder as it was before #417 stage 4
         /// moved it onto the generated codec.
@@ -4480,6 +4937,7 @@ pub(crate) mod tests {
         };
         let container = match &mut msg.value {
             SuccessfulOutcomeValue::PduSessionResourceReleaseResponse(c)
+            | SuccessfulOutcomeValue::PduSessionResourceSetupResponse(c)
             | SuccessfulOutcomeValue::Other(c) => c,
             other => panic!("unexpected {other:?}"),
         };
@@ -4544,5 +5002,1455 @@ pub(crate) mod tests {
             hand_written_parse_pdu_session_resource_release_response(&plain),
             Some((7, 9, vec![(5, vec![0x00]), (6, vec![0x00])]))
         );
+    }
+
+    // ====================================================================
+    // #417 stage 6: the PDU Session Resource Setup pair, and its transfers,
+    // on the generated codec
+    // ====================================================================
+
+    use hand_written_oracle::{
+        hand_written_n2_sm_setup_request_transfer,
+        hand_written_parse_n2_sm_setup_response_transfer,
+        hand_written_parse_pdu_session_resource_setup_response,
+        hand_written_pdu_session_resource_setup_request,
+    };
+
+    /// N2 SM transfers at every length determinant boundary of an unconstrained
+    /// OCTET STRING -- empty, one octet, the short form's 127 and the long
+    /// form's 128, and the longest the fork can carry with an SD (see
+    /// `a_setup_request_past_16k_octets_is_refused`) -- and the transfer the
+    /// SMF actually builds.
+    fn setup_transfers() -> Vec<Vec<u8>> {
+        vec![
+            vec![],
+            vec![0x00],
+            vec![0x5a; 127],
+            vec![0x5b; 128],
+            vec![0x5c; 16_352],
+            build_n2_sm_setup_request_transfer(0x0001_0001, [10, 45, 0, 7], 9, 9, 8)
+                .expect("transfer"),
+        ]
+    }
+
+    /// #417 stage 6: the generated PDU Session Resource Setup Request is byte
+    /// for byte the hand-written one for every request the AMF sends -- no
+    /// message-level NAS-PDU, as the only caller passes `None` -- across every
+    /// PDU Session ID, every SST with and without an SD (24-bit SD extremes,
+    /// and a u32 past 24 bits that both encoders mask), every transfer length
+    /// form, and every UE NGAP ID length; and both refuse the same out-of-range
+    /// AMF UE NGAP IDs.
+    #[test]
+    fn pdu_session_resource_setup_request_generated_matches_hand_written() {
+        let mut compared = 0;
+        let mut refused = 0;
+        let mut check = |amf: u64, ran: u32, psi: u8, sst: u8, sd: Option<u32>, t: &[u8]| {
+            let new =
+                build_pdu_session_resource_setup_request_asn1(amf, ran, psi, sst, sd, None, t);
+            let old =
+                hand_written_pdu_session_resource_setup_request(amf, ran, psi, sst, sd, None, t);
+            assert_eq!(
+                new,
+                old,
+                "AMF {amf} RAN {ran} PSI {psi} SST {sst} SD {sd:?} T {}",
+                t.len()
+            );
+            if new.is_none() {
+                refused += 1;
+            }
+            compared += 1;
+        };
+        let transfer = vec![0x00];
+        for psi in 0..=255u8 {
+            check(42, 1001, psi, 1, None, &transfer);
+        }
+        for sst in 0..=255u8 {
+            for sd in [
+                None,
+                Some(0),
+                Some(0x00_0102),
+                Some(0xff_ffff),
+                Some(u32::MAX),
+            ] {
+                check(42, 1001, 5, sst, sd, &transfer);
+            }
+        }
+        for t in setup_transfers() {
+            check(42, 1001, 5, 1, Some(1), &t);
+        }
+        for amf in AMF_IDS {
+            for ran in RAN_IDS {
+                check(amf, ran, 5, 1, None, &transfer);
+            }
+        }
+        assert_eq!(compared, 256 + 256 * 5 + 6 + 12 * 8);
+        // The out-of-range AMF UE NGAP IDs, with every RAN UE NGAP ID.
+        assert_eq!(refused, 8);
+    }
+
+    /// A message-level NAS-PDU goes where §9.4.1 puts it -- the IEs "in the
+    /// order they appear in object set definitions": AMF UE NGAP ID, RAN UE
+    /// NGAP ID, NAS-PDU, then the session list. The hand-written encoder
+    /// appended it after the list, which a receiver must treat as an abstract
+    /// syntax error (§10.3.6). No caller sends one today, so nothing on the
+    /// wire changes; the IEs themselves are the same either way. (The
+    /// hand-written parser cannot say: it has no arm for a Setup Request.)
+    #[test]
+    fn pdu_session_resource_setup_request_nas_pdu_is_in_object_set_order() {
+        let nas = [0x7e, 0x00, 0x68, 0x01];
+        let transfer = [0x00];
+        let ie_order = |data: &[u8]| -> Vec<u16> {
+            let ngap_gen::NGAP_PDU::InitiatingMessage(msg) =
+                nextgcore_ngap_gen::decode(data).expect("decode")
+            else {
+                panic!("initiatingMessage");
+            };
+            let ngap_gen::InitiatingMessageValue::Id_PDUSessionResourceSetup(req) = msg.value
+            else {
+                panic!("PDU Session Resource Setup Request");
+            };
+            req.protocol_i_es.0.iter().map(|e| e.id.0).collect()
+        };
+        let new = build_pdu_session_resource_setup_request_asn1(
+            42,
+            1001,
+            5,
+            1,
+            None,
+            Some(&nas),
+            &transfer,
+        )
+        .expect("encode");
+        let old = hand_written_pdu_session_resource_setup_request(
+            42,
+            1001,
+            5,
+            1,
+            None,
+            Some(&nas),
+            &transfer,
+        )
+        .expect("encode");
+        assert_eq!(ie_order(&new), vec![10, 85, 38, 74]);
+        assert_eq!(ie_order(&old), vec![10, 85, 74, 38], "the old order");
+        assert_ne!(new, old);
+        // The IEs, keyed by id: the same set either way.
+        let content = |data: &[u8]| {
+            let ngap_gen::NGAP_PDU::InitiatingMessage(msg) =
+                nextgcore_ngap_gen::decode(data).expect("decode")
+            else {
+                panic!("initiatingMessage");
+            };
+            let ngap_gen::InitiatingMessageValue::Id_PDUSessionResourceSetup(req) = msg.value
+            else {
+                panic!("PDU Session Resource Setup Request");
+            };
+            let mut ies = req.protocol_i_es.0;
+            ies.sort_by_key(|e| e.id.0);
+            ies
+        };
+        assert_eq!(content(&new), content(&old));
+        assert!(content(&new).iter().any(|e| matches!(
+            &e.value,
+            ngap_gen::PDUSessionResourceSetupRequestProtocolIEs_EntryValue::Id_NAS_PDU(n)
+                if n.0 == nas
+        )));
+    }
+
+    /// The bytes themselves, so the generated and hand-written encoders cannot
+    /// drift together.
+    #[test]
+    fn pdu_session_resource_setup_request_golden_bytes() {
+        assert_eq!(
+            build_pdu_session_resource_setup_request_asn1(
+                42,
+                1001,
+                5,
+                1,
+                Some(0x00_0102),
+                None,
+                &[0xab, 0xcd]
+            )
+            .expect("encode"),
+            GOLDEN_PDU_SESSION_SETUP_REQUEST
+        );
+    }
+
+    // initiatingMessage, procedure 29, criticality reject, length 31; 3 IEs:
+    // AMF UE NGAP ID 42, RAN UE NGAP ID 1001, then the Setup List SUReq (IE 74,
+    // reject, length 11): count-1 = 0; item preamble (extension, NAS-PDU
+    // absent, iE-Extensions absent) and padding; PSI 5; S-NSSAI preamble
+    // (extension, SD present, iE-Extensions absent) followed unaligned by SST 1
+    // -- 010 0000 0001, padded: 0x40 0x20; SD 00 01 02; the transfer, length 2,
+    // ab cd.
+    const GOLDEN_PDU_SESSION_SETUP_REQUEST: &[u8] = &[
+        0x00, 0x1d, 0x00, 0x1f, 0x00, 0x00, 0x03, 0x00, 0x0a, 0x00, 0x02, 0x00, 0x2a, 0x00, 0x55,
+        0x00, 0x03, 0x40, 0x03, 0xe9, 0x00, 0x4a, 0x00, 0x0b, 0x00, 0x00, 0x05, 0x40, 0x20, 0x00,
+        0x01, 0x02, 0x02, 0xab, 0xcd,
+    ];
+
+    /// A PDU Session Resource Setup Response built by the hand-written encoder;
+    /// an empty list is left out, as that encoder leaves it out.
+    pub(crate) fn setup_response(
+        amf: u64,
+        ran: u32,
+        setup: &[(u8, Vec<u8>)],
+        failed: &[(u8, Vec<u8>)],
+    ) -> Vec<u8> {
+        nextgcore_ngap::builder::build_pdu_session_resource_setup_response(
+            &PduSessionResourceSetupResponse {
+                amf_ue_ngap_id: amf,
+                ran_ue_ngap_id: ran,
+                setup_list: setup
+                    .iter()
+                    .map(|(psi, transfer)| PduSessionResourceSetupResponseItem {
+                        pdu_session_id: *psi,
+                        transfer: transfer.clone(),
+                    })
+                    .collect(),
+                failed_list: failed
+                    .iter()
+                    .map(|(psi, transfer)| PduSessionResourceFailedItem {
+                        pdu_session_id: *psi,
+                        transfer: transfer.clone(),
+                    })
+                    .collect(),
+            },
+        )
+        .expect("encode")
+    }
+
+    /// A PDU Session Resource Setup Response built by the generated encoder
+    /// from `ies`. Every IE of the response has criticality ignore (§9.2.1.2).
+    pub(crate) fn generated_setup_response(
+        ies: Vec<ngap_gen::PDUSessionResourceSetupResponseProtocolIEs_EntryValue>,
+    ) -> Vec<u8> {
+        use ngap_gen::PDUSessionResourceSetupResponseProtocolIEs_EntryValue as Ie;
+        let entries = ies
+            .into_iter()
+            .map(|value| {
+                let id = match &value {
+                    Ie::Id_AMF_UE_NGAP_ID(_) => ngap_gen::ID_AMF_UE_NGAP_ID,
+                    Ie::Id_RAN_UE_NGAP_ID(_) => ngap_gen::ID_RAN_UE_NGAP_ID,
+                    Ie::Id_PDUSessionResourceSetupListSURes(_) => {
+                        ngap_gen::ID_PDU_SESSION_RESOURCE_SETUP_LIST_SU_RES
+                    }
+                    Ie::Id_PDUSessionResourceFailedToSetupListSURes(_) => {
+                        ngap_gen::ID_PDU_SESSION_RESOURCE_FAILED_TO_SETUP_LIST_SU_RES
+                    }
+                    Ie::Id_UserLocationInformation(_) => ngap_gen::ID_USER_LOCATION_INFORMATION,
+                    Ie::Id_CriticalityDiagnostics(_) => ngap_gen::ID_CRITICALITY_DIAGNOSTICS,
+                };
+                ngap_gen::PDUSessionResourceSetupResponseProtocolIEs_Entry {
+                    id: ngap_gen::ProtocolIE_ID(id),
+                    criticality: ngap_gen::Criticality(ngap_gen::Criticality::IGNORE),
+                    value,
+                }
+            })
+            .collect();
+        nextgcore_ngap_gen::encode(&ngap_gen::NGAP_PDU::SuccessfulOutcome(
+            ngap_gen::SuccessfulOutcome {
+                procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_PDU_SESSION_RESOURCE_SETUP),
+                criticality: ngap_gen::Criticality(ngap_gen::Criticality::REJECT),
+                value: ngap_gen::SuccessfulOutcomeValue::Id_PDUSessionResourceSetup(
+                    ngap_gen::PDUSessionResourceSetupResponse {
+                        protocol_i_es: ngap_gen::PDUSessionResourceSetupResponseProtocolIEs(
+                            entries,
+                        ),
+                    },
+                ),
+            },
+        ))
+        .expect("encode")
+    }
+
+    /// The generated set-up list for `setup`.
+    pub(crate) fn generated_setup_list(
+        setup: &[(u8, Vec<u8>)],
+    ) -> ngap_gen::PDUSessionResourceSetupResponseProtocolIEs_EntryValue {
+        ngap_gen::PDUSessionResourceSetupResponseProtocolIEs_EntryValue::Id_PDUSessionResourceSetupListSURes(
+            ngap_gen::PDUSessionResourceSetupListSURes(
+                setup
+                    .iter()
+                    .map(|(psi, transfer)| ngap_gen::PDUSessionResourceSetupItemSURes {
+                        pdu_session_id: ngap_gen::PDUSessionID(*psi),
+                        pdu_session_resource_setup_response_transfer:
+                            ngap_gen::PDUSessionResourceSetupItemSUResPDUSessionResourceSetupResponseTransfer(
+                                transfer.clone(),
+                            ),
+                        ie_extensions: None,
+                    })
+                    .collect(),
+            ),
+        )
+    }
+
+    /// The new decode flattened to what the hand-written path could say. A
+    /// response the old parser accepted always names both IDs, so a missing
+    /// one here is `None` too.
+    #[allow(clippy::type_complexity)]
+    fn generated_setup_response_view(
+        data: &[u8],
+    ) -> Option<(u64, u32, Vec<(u8, Vec<u8>)>, Vec<(u8, Vec<u8>)>)> {
+        match decode_pdu_session_resource_setup_response_asn1(data) {
+            PduSessionResourceSetupResponseDecode::Decoded {
+                amf_ue_ngap_id: Some(amf),
+                ran_ue_ngap_id: Some(ran),
+                setup,
+                failed,
+                ..
+            } => Some((
+                amf,
+                ran,
+                setup
+                    .into_iter()
+                    .map(|r| (r.pdu_session_id, r.transfer))
+                    .collect(),
+                failed
+                    .into_iter()
+                    .map(|r| (r.pdu_session_id, r.transfer))
+                    .collect(),
+            )),
+            _ => None,
+        }
+    }
+
+    /// #417 stage 6: for every Setup Response the hand-written parser accepted
+    /// -- every ID length, set-up and failed lists of 1, 2 and 256 sessions
+    /// alone and together, neither list, every transfer length form, a
+    /// not-comprehended IE marked ignore or notify, and the optional User
+    /// Location Information and Criticality Diagnostics it skipped as unknown
+    /// -- the generated decode names the same UE and the same sessions with the
+    /// same transfer octets; what it refused as malformed, or over a
+    /// not-comprehended IE marked reject, still yields nothing to relay.
+    #[test]
+    fn pdu_session_resource_setup_response_generated_decode_matches_hand_written() {
+        use ngap_gen::PDUSessionResourceSetupResponseProtocolIEs_EntryValue as Ie;
+        let mut corpus = Vec::new();
+        for amf in &AMF_IDS[..AMF_IDS.len() - 1] {
+            for ran in RAN_IDS {
+                corpus.push(setup_response(*amf, ran, &[(5, vec![0x00])], &[]));
+            }
+        }
+        for t in response_transfers() {
+            corpus.push(setup_response(7, 9, &[(3, t.clone())], &[]));
+            corpus.push(setup_response(7, 9, &[], &[(3, t.clone())]));
+            corpus.push(setup_response(
+                7,
+                9,
+                &[(3, t.clone()), (4, vec![0x00])],
+                &[(6, t)],
+            ));
+        }
+        let all: Vec<(u8, Vec<u8>)> = (0..=255u8).map(|psi| (psi, vec![psi])).collect();
+        corpus.push(setup_response(7, 9, &all, &[]));
+        corpus.push(setup_response(7, 9, &[], &all));
+        corpus.push(setup_response(7, 9, &[], &[]));
+        let base = setup_response(7, 9, &[(5, vec![0x00])], &[(6, vec![0x01])]);
+        for criticality in [0x40, 0x80] {
+            corpus.push(with_unknown_ie(&base, 9999, criticality));
+        }
+        corpus.push(generated_setup_response(vec![
+            Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(7)),
+            Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(9)),
+            generated_setup_list(&[(5, vec![0x00])]),
+            Ie::Id_CriticalityDiagnostics(generated_criticality_diagnostics(&[IeDiagnostic {
+                ie_id: 9999,
+                criticality: ngap_gen::Criticality::IGNORE,
+                type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+            }])),
+        ]));
+        for data in &corpus {
+            let old = hand_written_parse_pdu_session_resource_setup_response(data);
+            assert!(
+                old.is_some(),
+                "the corpus holds accepted messages: {data:02x?}"
+            );
+            assert_eq!(generated_setup_response_view(data), old, "{data:02x?}");
+        }
+        assert_eq!(corpus.len(), 11 * 8 + 6 * 3 + 3 + 2 + 1);
+
+        let refused = [
+            base[..base.len() - 1].to_vec(),
+            with_unknown_ie(&base, 9999, 0x00),
+        ];
+        for data in &refused {
+            assert_eq!(
+                hand_written_parse_pdu_session_resource_setup_response(data),
+                None
+            );
+            assert_eq!(generated_setup_response_view(data), None, "{data:02x?}");
+        }
+        assert!(matches!(
+            decode_pdu_session_resource_setup_response_asn1(&refused[1]),
+            PduSessionResourceSetupResponseDecode::Failed(ref d) if d[0].ie_id == 9999
+        ));
+    }
+
+    /// A Setup Response is a response, so §10.3.4.2 reports a "notify" IE in an
+    /// Error Indication -- Procedure Code 29, Triggering Message
+    /// successful-outcome, Procedure Criticality as received -- and both lists
+    /// come through all the same. An "ignore" IE is dropped without a report.
+    #[test]
+    fn a_setup_response_notify_ie_is_reported_in_an_error_indication() {
+        let base = setup_response(7, 9, &[(5, vec![0x00])], &[(6, vec![0x01])]);
+        let PduSessionResourceSetupResponseDecode::Decoded {
+            amf_ue_ngap_id: Some(7),
+            ran_ue_ngap_id: Some(9),
+            setup,
+            failed,
+            error_indication: Some(report),
+        } = decode_pdu_session_resource_setup_response_asn1(&with_unknown_ie(&base, 9999, 0x80))
+        else {
+            panic!("expected Decoded with an Error Indication");
+        };
+        assert_eq!(
+            setup,
+            vec![SetupResponsePduSession {
+                pdu_session_id: 5,
+                transfer: vec![0x00]
+            }]
+        );
+        assert_eq!(
+            failed,
+            vec![SetupResponsePduSession {
+                pdu_session_id: 6,
+                transfer: vec![0x01]
+            }]
+        );
+        assert_eq!(
+            report.procedure,
+            ReportedProcedure {
+                procedure_code: 29,
+                triggering_message: ngap_gen::TriggeringMessage::SUCCESSFUL_OUTCOME,
+                procedure_criticality: ngap_gen::Criticality::REJECT,
+            }
+        );
+        assert_eq!(
+            report.cause_protocol,
+            ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY
+        );
+        assert_eq!(
+            (report.amf_ue_ngap_id, report.ran_ue_ngap_id),
+            (Some(7), Some(9))
+        );
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].ie_id, 9999);
+        assert_eq!(
+            report.diagnostics[0].criticality,
+            ngap_gen::Criticality::NOTIFY
+        );
+        assert!(matches!(
+            decode_pdu_session_resource_setup_response_asn1(&with_unknown_ie(&base, 9999, 0x40)),
+            PduSessionResourceSetupResponseDecode::Decoded {
+                error_indication: None,
+                ..
+            }
+        ));
+    }
+
+    /// Responses the hand-written parser refused although every IE of a Setup
+    /// Response has criticality ignore (§9.2.1.2), so a missing one is ignored
+    /// (§10.3.5): one with no RAN UE NGAP ID still yields its sessions, and one
+    /// with no AMF UE NGAP ID decodes with `None` -- which the handler then
+    /// cannot relay, since that ID is what names the UE.
+    #[test]
+    fn setup_responses_missing_an_id_are_no_longer_refused() {
+        use ngap_gen::PDUSessionResourceSetupResponseProtocolIEs_EntryValue as Ie;
+        let no_ran_id = generated_setup_response(vec![
+            Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(7)),
+            generated_setup_list(&[(5, vec![0x00])]),
+        ]);
+        assert_eq!(
+            hand_written_parse_pdu_session_resource_setup_response(&no_ran_id),
+            None
+        );
+        let PduSessionResourceSetupResponseDecode::Decoded {
+            amf_ue_ngap_id: Some(7),
+            ran_ue_ngap_id: None,
+            setup,
+            error_indication: None,
+            ..
+        } = decode_pdu_session_resource_setup_response_asn1(&no_ran_id)
+        else {
+            panic!("expected Decoded without a RAN UE NGAP ID");
+        };
+        assert_eq!(setup.len(), 1);
+
+        let no_amf_id = generated_setup_response(vec![
+            Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(9)),
+            generated_setup_list(&[(5, vec![0x00])]),
+        ]);
+        assert_eq!(
+            hand_written_parse_pdu_session_resource_setup_response(&no_amf_id),
+            None
+        );
+        assert!(matches!(
+            decode_pdu_session_resource_setup_response_asn1(&no_amf_id),
+            PduSessionResourceSetupResponseDecode::Decoded {
+                amf_ue_ngap_id: None,
+                ran_ue_ngap_id: Some(9),
+                ..
+            }
+        ));
+    }
+
+    /// An item of either list carrying an iE-Extensions container -- one entry,
+    /// id 9, criticality reject -- in its real wire form, followed by a second
+    /// plain item (PSI 6). Both extension object sets are empty, so the forked
+    /// codec decodes the entry as zero bits (nextgsim #218) and the rest of the
+    /// list from the wrong offset; the decode refuses the message instead. The
+    /// hand-written parser never read the presence bit, so it misread the list
+    /// as sessions 5 and 0 and the handler relayed what it said.
+    #[test]
+    fn a_setup_response_item_with_ie_extensions_is_refused_not_misparsed() {
+        let base = setup_response(7, 9, &[(5, vec![0x00])], &[(5, vec![0x00])]);
+        let with_extension = vec![
+            0x01, 0x40, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x09, 0x00, 0x01, 0x00, 0x00, 0x06,
+            0x01, 0x00,
+        ];
+        let plain = vec![0x01, 0x00, 0x05, 0x01, 0x00, 0x00, 0x06, 0x01, 0x00];
+        for id in [
+            ngap_gen::ID_PDU_SESSION_RESOURCE_SETUP_LIST_SU_RES,
+            ngap_gen::ID_PDU_SESSION_RESOURCE_FAILED_TO_SETUP_LIST_SU_RES,
+        ] {
+            let data = with_ie_value(&base, id, with_extension.clone());
+            assert!(
+                matches!(
+                    decode_pdu_session_resource_setup_response_asn1(&data),
+                    PduSessionResourceSetupResponseDecode::Undecodable
+                ),
+                "IE {id}"
+            );
+            let old = hand_written_parse_pdu_session_resource_setup_response(&data).expect("old");
+            let misread = vec![(5, vec![0x00]), (0, vec![])];
+            assert!(
+                old.2 == misread || old.3 == misread,
+                "the old parser's misread: {old:?}"
+            );
+            // The same splice without the extension decodes, so it is the
+            // extension the decode refuses, not the splicing.
+            let ok = with_ie_value(&base, id, plain.clone());
+            assert_eq!(
+                generated_setup_response_view(&ok),
+                hand_written_parse_pdu_session_resource_setup_response(&ok),
+                "IE {id}"
+            );
+            assert!(generated_setup_response_view(&ok).is_some());
+        }
+    }
+
+    /// #417 stage 6: the generated Setup Request Transfer the AMF's builder
+    /// produces is byte for byte the hand-written one across every QFI, every
+    /// 5QI the u16 can carry up to 300, every Priority Level ARP, TEIDs and
+    /// addresses at their extremes; and both refuse the same inputs: a QFI
+    /// past 63, a 5QI past 255, an ARP of 0 or past 15.
+    #[test]
+    fn n2_sm_setup_request_transfer_generated_matches_hand_written() {
+        let mut compared = 0;
+        let mut refused = 0;
+        let mut check = |teid: u32, addr: [u8; 4], qfi: u8, five_qi: u16, arp: u8| {
+            let new = build_n2_sm_setup_request_transfer(teid, addr, qfi, five_qi, arp);
+            let old = hand_written_n2_sm_setup_request_transfer(teid, addr, qfi, five_qi, arp);
+            assert_eq!(
+                new, old,
+                "TEID {teid} addr {addr:?} QFI {qfi} 5QI {five_qi} ARP {arp}"
+            );
+            if new.is_none() {
+                refused += 1;
+            }
+            compared += 1;
+        };
+        for qfi in 0..=255u8 {
+            check(1, [10, 0, 0, 1], qfi, 9, 8);
+        }
+        for five_qi in 0..=300u16 {
+            check(1, [10, 0, 0, 1], 1, five_qi, 8);
+        }
+        for arp in 0..=255u8 {
+            check(1, [10, 0, 0, 1], 1, 9, arp);
+        }
+        for teid in [0, 1, 0xffff, 0x1_0000, u32::MAX] {
+            for addr in [[0; 4], [255; 4], [127, 0, 0, 1]] {
+                check(teid, addr, 63, 255, 15);
+            }
+        }
+        assert_eq!(compared, 256 + 301 + 256 + 15);
+        // QFI 64..=255, 5QI 256..=300, ARP 0 and 16..=255.
+        assert_eq!(refused, 192 + 45 + 1 + 240);
+    }
+
+    /// The hand-written transfer `t` as the generated
+    /// PDUSessionResourceSetupRequestTransfer, member for member -- the
+    /// converter the transfer-codec comparison below runs through.
+    fn generated_request_transfer(
+        t: &PduSessionResourceSetupRequestTransfer,
+    ) -> ngap_gen::PDUSessionResourceSetupRequestTransfer {
+        use nextgcore_ngap::transfer::{
+            Dynamic5qiDescriptor, GbrQosInformation, SecurityIndication,
+        };
+        use ngap_gen::{
+            PDUSessionResourceSetupRequestTransferProtocolIEs_Entry as Entry,
+            PDUSessionResourceSetupRequestTransferProtocolIEs_EntryValue as Ie,
+        };
+        let reject = ngap_gen::Criticality(ngap_gen::Criticality::REJECT);
+        let entry = |id: u16, value: Ie| Entry {
+            id: ngap_gen::ProtocolIE_ID(id),
+            criticality: reject.clone(),
+            value,
+        };
+        let tunnel = |info: &UpTransportLayerInformation| {
+            let UpTransportLayerInformation::GtpTunnel(g) = info;
+            generated_gtp_tunnel(
+                &g.transport_layer_address.octets,
+                g.transport_layer_address.bit_len,
+                u32::from_be_bytes(g.gtp_teid),
+            )
+        };
+        let non_dynamic = |d: &NonDynamic5qiDescriptor| ngap_gen::NonDynamic5QIDescriptor {
+            five_qi: ngap_gen::FiveQI(d.five_qi as u8),
+            priority_level_qos: d.priority_level_qos.map(ngap_gen::PriorityLevelQos),
+            averaging_window: d.averaging_window.map(ngap_gen::AveragingWindow),
+            maximum_data_burst_volume: d
+                .maximum_data_burst_volume
+                .map(ngap_gen::MaximumDataBurstVolume),
+            ie_extensions: None,
+        };
+        let dynamic = |d: &Dynamic5qiDescriptor| ngap_gen::Dynamic5QIDescriptor {
+            priority_level_qos: ngap_gen::PriorityLevelQos(d.priority_level_qos),
+            packet_delay_budget: ngap_gen::PacketDelayBudget(d.packet_delay_budget),
+            packet_error_rate: ngap_gen::PacketErrorRate {
+                per_scalar: ngap_gen::PacketErrorRatePERScalar(d.per_scalar),
+                per_exponent: ngap_gen::PacketErrorRatePERExponent(d.per_exponent),
+                ie_extensions: None,
+            },
+            five_qi: d.five_qi.map(|q| ngap_gen::FiveQI(q as u8)),
+            delay_critical: d.delay_critical.map(|c| ngap_gen::DelayCritical(c as u8)),
+            averaging_window: d.averaging_window.map(ngap_gen::AveragingWindow),
+            maximum_data_burst_volume: d
+                .maximum_data_burst_volume
+                .map(ngap_gen::MaximumDataBurstVolume),
+            ie_extensions: None,
+        };
+        let gbr = |g: &GbrQosInformation| ngap_gen::GBR_QosInformation {
+            maximum_flow_bit_rate_dl: ngap_gen::BitRate(g.maximum_flow_bit_rate_dl),
+            maximum_flow_bit_rate_ul: ngap_gen::BitRate(g.maximum_flow_bit_rate_ul),
+            guaranteed_flow_bit_rate_dl: ngap_gen::BitRate(g.guaranteed_flow_bit_rate_dl),
+            guaranteed_flow_bit_rate_ul: ngap_gen::BitRate(g.guaranteed_flow_bit_rate_ul),
+            notification_control: g
+                .notification_control
+                .then_some(ngap_gen::NotificationControl(
+                    ngap_gen::NotificationControl::NOTIFICATION_REQUESTED,
+                )),
+            maximum_packet_loss_rate_dl: g
+                .maximum_packet_loss_rate_dl
+                .map(ngap_gen::PacketLossRate),
+            maximum_packet_loss_rate_ul: g
+                .maximum_packet_loss_rate_ul
+                .map(ngap_gen::PacketLossRate),
+            ie_extensions: None,
+        };
+        let security = |s: &SecurityIndication| ngap_gen::SecurityIndication {
+            integrity_protection_indication: ngap_gen::IntegrityProtectionIndication(
+                s.integrity_protection_indication as u8,
+            ),
+            confidentiality_protection_indication: ngap_gen::ConfidentialityProtectionIndication(
+                s.confidentiality_protection_indication as u8,
+            ),
+            maximum_integrity_protected_data_rate_ul: s
+                .maximum_integrity_protected_data_rate_ul
+                .map(|r| ngap_gen::MaximumIntegrityProtectedDataRate(r as u8)),
+            ie_extensions: None,
+        };
+        let flows = t
+            .qos_flow_setup_request_list
+            .iter()
+            .map(|f| {
+                let q = &f.qos_flow_level_qos_parameters;
+                let arp = &q.allocation_and_retention_priority;
+                ngap_gen::QosFlowSetupRequestItem {
+                    qos_flow_identifier: ngap_gen::QosFlowIdentifier(f.qos_flow_identifier),
+                    qos_flow_level_qos_parameters: ngap_gen::QosFlowLevelQosParameters {
+                        qos_characteristics: match &q.qos_characteristics {
+                            QosCharacteristics::NonDynamic5qi(d) => {
+                                ngap_gen::QosCharacteristics::NonDynamic5QI(non_dynamic(d))
+                            }
+                            QosCharacteristics::Dynamic5qi(d) => {
+                                ngap_gen::QosCharacteristics::Dynamic5QI(dynamic(d))
+                            }
+                        },
+                        allocation_and_retention_priority:
+                            ngap_gen::AllocationAndRetentionPriority {
+                                priority_level_arp: ngap_gen::PriorityLevelARP(
+                                    arp.priority_level_arp,
+                                ),
+                                pre_emption_capability: ngap_gen::Pre_emptionCapability(
+                                    arp.pre_emption_capability as u8,
+                                ),
+                                pre_emption_vulnerability: ngap_gen::Pre_emptionVulnerability(
+                                    arp.pre_emption_vulnerability as u8,
+                                ),
+                                ie_extensions: None,
+                            },
+                        gbr_qos_information: q.gbr_qos_information.as_ref().map(gbr),
+                        reflective_qos_attribute: q.reflective_qos_attribute.then_some(
+                            ngap_gen::ReflectiveQosAttribute(
+                                ngap_gen::ReflectiveQosAttribute::SUBJECT_TO,
+                            ),
+                        ),
+                        additional_qos_flow_information: q
+                            .additional_qos_flow_information
+                            .then_some(ngap_gen::AdditionalQosFlowInformation(
+                                ngap_gen::AdditionalQosFlowInformation::MORE_LIKELY,
+                            )),
+                        ie_extensions: None,
+                    },
+                    e_rab_id: f.e_rab_id.map(ngap_gen::E_RAB_ID),
+                    ie_extensions: None,
+                }
+            })
+            .collect();
+
+        let mut ies = Vec::new();
+        if let Some(ambr) = t.pdu_session_aggregate_maximum_bit_rate {
+            ies.push(entry(
+                ngap_gen::ID_PDU_SESSION_AGGREGATE_MAXIMUM_BIT_RATE,
+                Ie::Id_PDUSessionAggregateMaximumBitRate(
+                    ngap_gen::PDUSessionAggregateMaximumBitRate {
+                        pdu_session_aggregate_maximum_bit_rate_dl: ngap_gen::BitRate(ambr.dl),
+                        pdu_session_aggregate_maximum_bit_rate_ul: ngap_gen::BitRate(ambr.ul),
+                        ie_extensions: None,
+                    },
+                ),
+            ));
+        }
+        ies.push(entry(
+            ngap_gen::ID_UL_NGU_UP_TNL_INFORMATION,
+            Ie::Id_UL_NGU_UP_TNLInformation(tunnel(&t.ul_ngu_up_tnl_information)),
+        ));
+        if t.data_forwarding_not_possible {
+            ies.push(entry(
+                ngap_gen::ID_DATA_FORWARDING_NOT_POSSIBLE,
+                Ie::Id_DataForwardingNotPossible(ngap_gen::DataForwardingNotPossible(
+                    ngap_gen::DataForwardingNotPossible::DATA_FORWARDING_NOT_POSSIBLE,
+                )),
+            ));
+        }
+        ies.push(entry(
+            ngap_gen::ID_PDU_SESSION_TYPE,
+            Ie::Id_PDUSessionType(ngap_gen::PDUSessionType(t.pdu_session_type as u8)),
+        ));
+        if let Some(s) = &t.security_indication {
+            ies.push(entry(
+                ngap_gen::ID_SECURITY_INDICATION,
+                Ie::Id_SecurityIndication(security(s)),
+            ));
+        }
+        if let Some(n) = t.network_instance {
+            ies.push(entry(
+                ngap_gen::ID_NETWORK_INSTANCE,
+                Ie::Id_NetworkInstance(ngap_gen::NetworkInstance(n)),
+            ));
+        }
+        ies.push(entry(
+            ngap_gen::ID_QOS_FLOW_SETUP_REQUEST_LIST,
+            Ie::Id_QosFlowSetupRequestList(ngap_gen::QosFlowSetupRequestList(flows)),
+        ));
+        ngap_gen::PDUSessionResourceSetupRequestTransfer {
+            protocol_i_es: ngap_gen::PDUSessionResourceSetupRequestTransferProtocolIEs(ies),
+        }
+    }
+
+    /// A non-GBR flow: `qfi`, non-dynamic `five_qi`, ARP `arp`.
+    fn non_gbr_flow(qfi: u8, five_qi: u16, arp: u8) -> QosFlowSetupRequestItem {
+        QosFlowSetupRequestItem {
+            qos_flow_identifier: qfi,
+            qos_flow_level_qos_parameters: QosFlowLevelQosParameters {
+                qos_characteristics: QosCharacteristics::NonDynamic5qi(
+                    NonDynamic5qiDescriptor::new(five_qi),
+                ),
+                allocation_and_retention_priority: AllocationAndRetentionPriority {
+                    priority_level_arp: arp,
+                    pre_emption_capability: PreEmptionCapability::ShallNotTriggerPreEmption,
+                    pre_emption_vulnerability: PreEmptionVulnerability::NotPreEmptable,
+                },
+                gbr_qos_information: None,
+                reflective_qos_attribute: false,
+                additional_qos_flow_information: false,
+            },
+            e_rab_id: None,
+        }
+    }
+
+    /// A UL tunnel of `bit_len` address bits taken from `octets`.
+    fn ul_tunnel(octets: &[u8], bit_len: usize, teid: u32) -> UpTransportLayerInformation {
+        let mut octets = octets[..bit_len.div_ceil(8)].to_vec();
+        if !bit_len.is_multiple_of(8) {
+            let last = octets.len() - 1;
+            octets[last] &= 0xff << (8 - bit_len % 8);
+        }
+        UpTransportLayerInformation::GtpTunnel(GtpTunnel {
+            transport_layer_address: TransportLayerAddress { octets, bit_len },
+            gtp_teid: teid.to_be_bytes(),
+        })
+    }
+
+    /// The Setup Request Transfer variant matrix: UL tunnels with IPv4, IPv6
+    /// and IPv4v6 (160-bit) addresses and the 17/33/159-bit boundaries, every
+    /// PDU Session Type, the optional AMBR / Data Forwarding Not Possible /
+    /// Security Indication / Network Instance at their extremes, and QoS flow
+    /// lists of 1, 2 and 64 flows -- non-GBR over every non-dynamic 5QI, GBR
+    /// with and without its optional members, dynamic 5QI descriptors at their
+    /// bounds, every ARP level and pre-emption combination, reflective QoS,
+    /// additional-flow and E-RAB ID.
+    fn request_transfer_variants() -> Vec<PduSessionResourceSetupRequestTransfer> {
+        use nextgcore_ngap::transfer::{
+            DelayCritical, Dynamic5qiDescriptor, GbrQosInformation,
+            MaximumIntegrityProtectedDataRate, PduSessionAggregateMaximumBitRate,
+            ProtectionIndication, SecurityIndication,
+        };
+        let base = |flows: Vec<QosFlowSetupRequestItem>| PduSessionResourceSetupRequestTransfer {
+            pdu_session_aggregate_maximum_bit_rate: None,
+            ul_ngu_up_tnl_information: ul_tunnel(&[10, 45, 0, 7], 32, 0x0001_0001),
+            data_forwarding_not_possible: false,
+            pdu_session_type: PduSessionType::Ipv4,
+            security_indication: None,
+            network_instance: None,
+            qos_flow_setup_request_list: flows,
+        };
+        let mut v = Vec::new();
+        let v6: Vec<u8> = (0..16).map(|i| 0x20 + i).collect();
+        let dual: Vec<u8> = [10, 45, 0, 7]
+            .into_iter()
+            .chain(v6.iter().copied())
+            .collect();
+        let ones = [0xffu8; 20];
+        for (octets, bits) in [
+            (&[10, 45, 0, 7][..], 32),
+            (&v6[..], 128),
+            (&dual[..], 160),
+            (&ones[..], 17),
+            (&ones[..], 33),
+            (&ones[..], 159),
+        ] {
+            for teid in [0, u32::MAX] {
+                let mut t = base(vec![non_gbr_flow(1, 9, 8)]);
+                t.ul_ngu_up_tnl_information = ul_tunnel(octets, bits, teid);
+                v.push(t);
+            }
+        }
+        for ty in [
+            PduSessionType::Ipv4,
+            PduSessionType::Ipv6,
+            PduSessionType::Ipv4v6,
+            PduSessionType::Ethernet,
+            PduSessionType::Unstructured,
+        ] {
+            let mut t = base(vec![non_gbr_flow(1, 9, 8)]);
+            t.pdu_session_type = ty;
+            v.push(t);
+        }
+        for (dl, ul) in [
+            (0, 0),
+            (1, 1),
+            (1 << 32, 1_000_000_000),
+            (4_000_000_000_000, 4_000_000_000_000),
+        ] {
+            let mut t = base(vec![non_gbr_flow(1, 9, 8)]);
+            t.pdu_session_aggregate_maximum_bit_rate =
+                Some(PduSessionAggregateMaximumBitRate { dl, ul });
+            v.push(t);
+        }
+        let mut t = base(vec![non_gbr_flow(1, 9, 8)]);
+        t.data_forwarding_not_possible = true;
+        v.push(t);
+        let indications = [
+            ProtectionIndication::Required,
+            ProtectionIndication::Preferred,
+            ProtectionIndication::NotNeeded,
+        ];
+        for integrity in indications {
+            for confidentiality in indications {
+                for rate in [
+                    None,
+                    Some(MaximumIntegrityProtectedDataRate::Bitrate64kbs),
+                    Some(MaximumIntegrityProtectedDataRate::MaximumUeRate),
+                ] {
+                    let mut t = base(vec![non_gbr_flow(1, 9, 8)]);
+                    t.security_indication = Some(SecurityIndication {
+                        integrity_protection_indication: integrity,
+                        confidentiality_protection_indication: confidentiality,
+                        maximum_integrity_protected_data_rate_ul: rate,
+                    });
+                    v.push(t);
+                }
+            }
+        }
+        for n in [1, 2, 255, 256] {
+            let mut t = base(vec![non_gbr_flow(1, 9, 8)]);
+            t.network_instance = Some(n);
+            v.push(t);
+        }
+        // Every non-dynamic 5QI, and the optional members at their bounds.
+        for five_qi in 0..=255u16 {
+            v.push(base(vec![non_gbr_flow((five_qi % 64) as u8, five_qi, 1)]));
+        }
+        for (p, w, b) in [(1, 0, 0), (127, 4095, 4095), (64, 2000, 255)] {
+            let mut f = non_gbr_flow(5, 9, 8);
+            f.qos_flow_level_qos_parameters.qos_characteristics =
+                QosCharacteristics::NonDynamic5qi(NonDynamic5qiDescriptor {
+                    five_qi: 9,
+                    priority_level_qos: Some(p),
+                    averaging_window: Some(w),
+                    maximum_data_burst_volume: Some(b),
+                });
+            v.push(base(vec![f]));
+        }
+        // Every ARP level and pre-emption combination.
+        for arp in 1..=15u8 {
+            for cap in [
+                PreEmptionCapability::ShallNotTriggerPreEmption,
+                PreEmptionCapability::MayTriggerPreEmption,
+            ] {
+                for vul in [
+                    PreEmptionVulnerability::NotPreEmptable,
+                    PreEmptionVulnerability::PreEmptable,
+                ] {
+                    let mut f = non_gbr_flow(5, 9, arp);
+                    f.qos_flow_level_qos_parameters
+                        .allocation_and_retention_priority = AllocationAndRetentionPriority {
+                        priority_level_arp: arp,
+                        pre_emption_capability: cap,
+                        pre_emption_vulnerability: vul,
+                    };
+                    v.push(base(vec![f]));
+                }
+            }
+        }
+        // GBR flows (5QI 1 conversational voice), optional members off and on.
+        // Not both loss rates: see `packet_loss_rate_carries_its_extension_bit`.
+        for (notification, dl_loss, ul_loss) in [
+            (false, None, None),
+            (true, Some(0), None),
+            (true, None, Some(1000)),
+        ] {
+            for rate in [0u64, 64_000, 4_000_000_000_000] {
+                let mut f = non_gbr_flow(1, 1, 2);
+                f.qos_flow_level_qos_parameters.gbr_qos_information = Some(GbrQosInformation {
+                    maximum_flow_bit_rate_dl: rate,
+                    maximum_flow_bit_rate_ul: rate,
+                    guaranteed_flow_bit_rate_dl: rate / 2,
+                    guaranteed_flow_bit_rate_ul: rate / 2,
+                    notification_control: notification,
+                    maximum_packet_loss_rate_dl: dl_loss,
+                    maximum_packet_loss_rate_ul: ul_loss,
+                });
+                v.push(base(vec![f]));
+            }
+        }
+        // Dynamic 5QI descriptors at their bounds.
+        for (p, pdb, s, e, q, dc, w, b) in [
+            (1, 0, 0, 0, None, None, None, None),
+            (
+                127,
+                1023,
+                9,
+                9,
+                Some(255),
+                Some(DelayCritical::DelayCritical),
+                Some(4095),
+                Some(4095),
+            ),
+            (
+                20,
+                100,
+                1,
+                6,
+                Some(0),
+                Some(DelayCritical::NonDelayCritical),
+                Some(0),
+                Some(0),
+            ),
+        ] {
+            let mut f = non_gbr_flow(7, 9, 8);
+            f.qos_flow_level_qos_parameters.qos_characteristics =
+                QosCharacteristics::Dynamic5qi(Dynamic5qiDescriptor {
+                    priority_level_qos: p,
+                    packet_delay_budget: pdb,
+                    per_scalar: s,
+                    per_exponent: e,
+                    five_qi: q,
+                    delay_critical: dc,
+                    averaging_window: w,
+                    maximum_data_burst_volume: b,
+                });
+            v.push(base(vec![f]));
+        }
+        // Reflective QoS, additional flow information, E-RAB IDs.
+        for (reflective, additional, erab) in [
+            (true, false, None),
+            (false, true, Some(0)),
+            (true, true, Some(15)),
+        ] {
+            let mut f = non_gbr_flow(3, 9, 8);
+            f.qos_flow_level_qos_parameters.reflective_qos_attribute = reflective;
+            f.qos_flow_level_qos_parameters
+                .additional_qos_flow_information = additional;
+            f.e_rab_id = erab;
+            v.push(base(vec![f]));
+        }
+        // Lists of 2 and of maxnoofQosFlows = 64 flows.
+        v.push(base(vec![non_gbr_flow(1, 9, 8), non_gbr_flow(2, 5, 1)]));
+        v.push(base((0..64u8).map(|q| non_gbr_flow(q, 9, 8)).collect()));
+        // Everything at once.
+        let mut t = base(vec![non_gbr_flow(1, 9, 8), non_gbr_flow(2, 1, 2)]);
+        t.pdu_session_aggregate_maximum_bit_rate = Some(PduSessionAggregateMaximumBitRate {
+            dl: 1_000_000_000,
+            ul: 500_000_000,
+        });
+        t.ul_ngu_up_tnl_information = ul_tunnel(&dual, 160, 0xdead_beef);
+        t.data_forwarding_not_possible = true;
+        t.pdu_session_type = PduSessionType::Ipv4v6;
+        t.security_indication = Some(SecurityIndication {
+            integrity_protection_indication: ProtectionIndication::Required,
+            confidentiality_protection_indication: ProtectionIndication::Preferred,
+            maximum_integrity_protected_data_rate_ul: Some(
+                MaximumIntegrityProtectedDataRate::MaximumUeRate,
+            ),
+        });
+        t.network_instance = Some(17);
+        v.push(t);
+        v
+    }
+
+    /// #417 stage 6: the generated codec encodes every Setup Request Transfer of
+    /// the variant matrix exactly as the hand-written transfer codec does --
+    /// the codec the SMF builds its transfer with -- and decodes the
+    /// hand-written bytes back to the same value. A list of 65 flows, one past
+    /// maxnoofQosFlows, both refuse.
+    #[test]
+    fn setup_request_transfer_codecs_agree_over_the_variant_matrix() {
+        let variants = request_transfer_variants();
+        for t in &variants {
+            let old = t.encode().expect("hand-written encode");
+            let generated = generated_request_transfer(t);
+            let new = nextgcore_ngap_gen::encode_contained(&generated).expect("generated encode");
+            assert_eq!(new, old, "{t:?}");
+            let back = nextgcore_ngap_gen::decode_contained::<
+                ngap_gen::PDUSessionResourceSetupRequestTransfer,
+            >(&old)
+            .expect("generated decode");
+            assert_eq!(back, generated, "{t:?}");
+        }
+        assert_eq!(
+            variants.len(),
+            12 + 5 + 4 + 1 + 27 + 4 + 256 + 3 + 60 + 9 + 3 + 3 + 2 + 1
+        );
+
+        let mut too_many = variants[0].clone();
+        too_many.qos_flow_setup_request_list =
+            (0..65u8).map(|q| non_gbr_flow(q % 64, 9, 8)).collect();
+        assert!(too_many.encode().is_err());
+        assert!(
+            nextgcore_ngap_gen::encode_contained(&generated_request_transfer(&too_many)).is_err()
+        );
+    }
+
+    /// A PDUSessionResourceSetupResponseTransfer from the hand-written codec:
+    /// DL tunnel `bits` bits of `address`, TEID, and the associated `qfis`.
+    fn hand_written_response_transfer(
+        address: &[u8],
+        bits: usize,
+        teid: u32,
+        qfis: &[u8],
+    ) -> PduSessionResourceSetupResponseTransfer {
+        use nextgcore_ngap::transfer::{AssociatedQosFlowItem, QosFlowPerTnlInformation};
+        PduSessionResourceSetupResponseTransfer {
+            dl_qos_flow_per_tnl_information: QosFlowPerTnlInformation {
+                up_transport_layer_information: ul_tunnel(address, bits, teid),
+                associated_qos_flow_list: qfis
+                    .iter()
+                    .map(|&q| AssociatedQosFlowItem {
+                        qos_flow_identifier: q,
+                        qos_flow_mapping_indication: None,
+                    })
+                    .collect(),
+            },
+            additional_dl_qos_flow_per_tnl_information: None,
+            security_result: None,
+            qos_flow_failed_to_setup_list: Vec::new(),
+        }
+    }
+
+    /// #417 stage 6: for every Setup Response Transfer the hand-written decoder
+    /// accepted -- IPv4/IPv6/IPv4v6 and odd-length addresses of more than 16
+    /// bits (see `transport_layer_addresses_of_16_bits_or_fewer_diverge`), TEID extremes,
+    /// 1, 2 and 64 associated flows with and without a mapping indication, a
+    /// Security Result, a failed-flow list with causes -- the generated decode
+    /// gives the same endpoint; garbage stays refused.
+    #[test]
+    fn n2_sm_setup_response_transfer_generated_matches_hand_written() {
+        use nextgcore_ngap::transfer::{
+            AssociatedQosFlowItem, ProtectionResult, QosFlowMappingIndication,
+            QosFlowWithCauseItem, SecurityResult,
+        };
+        let v6: Vec<u8> = (0..16).map(|i| 0x20 + i).collect();
+        let dual: Vec<u8> = [10, 45, 0, 3]
+            .into_iter()
+            .chain(v6.iter().copied())
+            .collect();
+        let ones = [0xffu8; 20];
+        let mut corpus = Vec::new();
+        for (octets, bits) in [
+            (&[10, 45, 0, 3][..], 32),
+            (&v6[..], 128),
+            (&dual[..], 160),
+            (&ones[..], 17),
+            (&ones[..], 33),
+            (&ones[..], 159),
+        ] {
+            for teid in [0, 0xdead_beef, u32::MAX] {
+                corpus.push(hand_written_response_transfer(octets, bits, teid, &[9]));
+            }
+        }
+        corpus.push(hand_written_response_transfer(
+            &[10, 0, 0, 1],
+            32,
+            1,
+            &[1, 2],
+        ));
+        corpus.push(hand_written_response_transfer(
+            &[10, 0, 0, 1],
+            32,
+            1,
+            &(0..64).collect::<Vec<u8>>(),
+        ));
+        for mapping in [QosFlowMappingIndication::Ul, QosFlowMappingIndication::Dl] {
+            let mut t = hand_written_response_transfer(&[10, 0, 0, 1], 32, 1, &[]);
+            t.dl_qos_flow_per_tnl_information.associated_qos_flow_list =
+                vec![AssociatedQosFlowItem {
+                    qos_flow_identifier: 5,
+                    qos_flow_mapping_indication: Some(mapping),
+                }];
+            corpus.push(t);
+        }
+        for (i, c) in [
+            (ProtectionResult::Performed, ProtectionResult::NotPerformed),
+            (ProtectionResult::NotPerformed, ProtectionResult::Performed),
+        ] {
+            let mut t = hand_written_response_transfer(&[10, 0, 0, 1], 32, 1, &[9]);
+            t.security_result = Some(SecurityResult {
+                integrity_protection_result: i,
+                confidentiality_protection_result: c,
+            });
+            t.qos_flow_failed_to_setup_list = vec![
+                QosFlowWithCauseItem {
+                    qos_flow_identifier: 2,
+                    cause: build_cause(0, 46),
+                },
+                QosFlowWithCauseItem {
+                    qos_flow_identifier: 63,
+                    cause: build_cause(1, 0),
+                },
+            ];
+            corpus.push(t);
+        }
+        for t in &corpus {
+            let bytes = t.encode().expect("encode");
+            let old = hand_written_parse_n2_sm_setup_response_transfer(&bytes);
+            assert!(old.is_some(), "the corpus holds accepted transfers: {t:?}");
+            assert_eq!(parse_n2_sm_setup_response_transfer(&bytes), old, "{t:?}");
+        }
+        assert_eq!(corpus.len(), 18 + 2 + 2 + 2);
+        for garbage in [&[][..], &[0x09, 0x00, 0x00][..], &[0xff; 3][..]] {
+            assert_eq!(
+                hand_written_parse_n2_sm_setup_response_transfer(garbage),
+                None
+            );
+            assert_eq!(parse_n2_sm_setup_response_transfer(garbage), None);
+        }
+    }
+
+    /// A conformant Setup Response Transfer from a dual-connectivity gNB: the
+    /// DL tunnel plus one Additional DL QoS Flow per TNL Information, which is a
+    /// `QosFlowPerTNLInformationList` (§9.3.4.2), encoded by the generated codec
+    /// -- as nextgsim's gNB encodes it.
+    fn dual_connectivity_response_transfer() -> Vec<u8> {
+        let per_tnl = |address: [u8; 4], teid: u32, qfi: u8| ngap_gen::QosFlowPerTNLInformation {
+            up_transport_layer_information: generated_gtp_tunnel(&address, 32, teid),
+            associated_qos_flow_list: ngap_gen::AssociatedQosFlowList(vec![
+                ngap_gen::AssociatedQosFlowItem {
+                    qos_flow_identifier: ngap_gen::QosFlowIdentifier(qfi),
+                    qos_flow_mapping_indication: None,
+                    ie_extensions: None,
+                },
+            ]),
+            ie_extensions: None,
+        };
+        nextgcore_ngap_gen::encode_contained(&ngap_gen::PDUSessionResourceSetupResponseTransfer {
+            dl_qos_flow_per_tnl_information: per_tnl([10, 45, 0, 3], 0xdead_beef, 9),
+            additional_dl_qos_flow_per_tnl_information: Some(
+                ngap_gen::QosFlowPerTNLInformationList(vec![
+                    ngap_gen::QosFlowPerTNLInformationItem {
+                        qos_flow_per_tnl_information: per_tnl([10, 45, 0, 4], 0x0000_0002, 9),
+                        ie_extensions: None,
+                    },
+                ]),
+            ),
+            security_result: Some(ngap_gen::SecurityResult {
+                integrity_protection_result: ngap_gen::IntegrityProtectionResult(
+                    ngap_gen::IntegrityProtectionResult::PERFORMED,
+                ),
+                confidentiality_protection_result: ngap_gen::ConfidentialityProtectionResult(
+                    ngap_gen::ConfidentialityProtectionResult::PERFORMED,
+                ),
+                ie_extensions: None,
+            }),
+            qos_flow_failed_to_setup_list: None,
+            ie_extensions: None,
+        })
+        .expect("encode")
+    }
+
+    /// The Additional DL QoS Flow per TNL Information is a list, and the
+    /// generated decode reads it as one. The hand-written decoder read a single
+    /// element, without the list's count or the item's preamble, so it misread
+    /// the additional tunnel -- a 2-bit address, the second tunnel's address
+    /// octets taken for its TEID, QFI 0 -- and carried on. The DL endpoint the
+    /// AMF logs precedes it, so both give the same one.
+    #[test]
+    fn a_dual_connectivity_setup_response_transfer_reads_its_additional_list() {
+        let bytes = dual_connectivity_response_transfer();
+        let endpoint = Some(GnbN3Endpoint {
+            teid: 0xdead_beef,
+            address: vec![10, 45, 0, 3],
+            qfis: vec![9],
+        });
+        assert_eq!(parse_n2_sm_setup_response_transfer(&bytes), endpoint);
+        assert_eq!(
+            hand_written_parse_n2_sm_setup_response_transfer(&bytes),
+            endpoint
+        );
+
+        let generated = nextgcore_ngap_gen::decode_contained::<
+            ngap_gen::PDUSessionResourceSetupResponseTransfer,
+        >(&bytes)
+        .expect("decode");
+        let additional = generated
+            .additional_dl_qos_flow_per_tnl_information
+            .expect("additional")
+            .0;
+        assert_eq!(additional.len(), 1);
+        let ngap_gen::UPTransportLayerInformation::GTPTunnel(ref tunnel) = additional[0]
+            .qos_flow_per_tnl_information
+            .up_transport_layer_information
+        else {
+            panic!("GTP tunnel");
+        };
+        assert_eq!(
+            transport_layer_address_octets(&tunnel.transport_layer_address),
+            vec![10, 45, 0, 4]
+        );
+        assert_eq!(tunnel.gtp_teid.0, vec![0, 0, 0, 2]);
+
+        let old = PduSessionResourceSetupResponseTransfer::decode(&bytes).expect("old decode");
+        let misread = old
+            .additional_dl_qos_flow_per_tnl_information
+            .expect("old additional");
+        let UpTransportLayerInformation::GtpTunnel(ref t) = misread.up_transport_layer_information;
+        assert_eq!(
+            t.transport_layer_address.bit_len, 2,
+            "the old decoder's misread"
+        );
+        assert_eq!(t.gtp_teid, [10, 45, 0, 4], "the old decoder's misread");
+    }
+
+    /// The fork's BIT STRING codec octet-aligns a variable-size bit string only
+    /// when it is longer than 16 bits; X.691 §16.11 aligns it whatever its
+    /// length, as the hand-written codec does. So a Transport Layer Address of
+    /// 16 bits or fewer -- which no GTP-U endpoint is -- encodes differently and
+    /// the generated decoder misreads the hand-written form. Pinned so a fix in
+    /// the fork shows up here; from 17 bits up the two agree (the variant
+    /// matrix above).
+    #[test]
+    fn transport_layer_addresses_of_16_bits_or_fewer_diverge() {
+        for bits in [1usize, 8, 15, 16] {
+            let mut t = request_transfer_variants()[0].clone();
+            t.ul_ngu_up_tnl_information = ul_tunnel(&[0xff; 20], bits, 0);
+            let old = t.encode().expect("hand-written encode");
+            let new = nextgcore_ngap_gen::encode_contained(&generated_request_transfer(&t))
+                .expect("generated encode");
+            assert_ne!(new, old, "{bits} bits");
+            let response = hand_written_response_transfer(&[0xff; 20], bits, 0, &[9])
+                .encode()
+                .expect("encode");
+            assert_ne!(
+                parse_n2_sm_setup_response_transfer(&response),
+                hand_written_parse_n2_sm_setup_response_transfer(&response),
+                "{bits} bits"
+            );
+        }
+    }
+
+    /// PacketLossRate is INTEGER (0..1000, ...) -- extensible, so its encoding
+    /// starts with an extension bit -- and the hand-written transfer codec
+    /// encodes and decodes it as the non-extensible (0..1000). The bit only
+    /// shows when it lands on an octet boundary, as it does for the UL rate
+    /// right after an aligned DL rate: there the generated encoding is one
+    /// octet longer, and the hand-written decoder misreads it. No producer in
+    /// nextgcore sets a loss rate yet (the SMF builds non-GBR flows).
+    #[test]
+    fn packet_loss_rate_carries_its_extension_bit() {
+        use nextgcore_ngap::transfer::GbrQosInformation;
+        let mut f = non_gbr_flow(1, 1, 2);
+        f.qos_flow_level_qos_parameters.gbr_qos_information = Some(GbrQosInformation {
+            maximum_flow_bit_rate_dl: 64_000,
+            maximum_flow_bit_rate_ul: 64_000,
+            guaranteed_flow_bit_rate_dl: 32_000,
+            guaranteed_flow_bit_rate_ul: 32_000,
+            notification_control: true,
+            maximum_packet_loss_rate_dl: Some(0),
+            maximum_packet_loss_rate_ul: Some(1000),
+        });
+        let mut t = request_transfer_variants()[0].clone();
+        t.qos_flow_setup_request_list = vec![f];
+        let old = t.encode().expect("hand-written encode");
+        let generated = generated_request_transfer(&t);
+        let new = nextgcore_ngap_gen::encode_contained(&generated).expect("generated encode");
+        assert_eq!(new.len(), old.len() + 1);
+        // DL rate 0 then UL rate 1000 = 0x03e8: the generated form puts the UL
+        // rate's extension bit (0) in an octet of its own, then aligns.
+        assert_eq!(
+            &new[new.len() - 6..],
+            &[0x00, 0x00, 0x00, 0x00, 0x03, 0xe8][..]
+        );
+        assert_eq!(&old[old.len() - 5..], &[0x00, 0x00, 0x00, 0x03, 0xe8][..]);
+        let back = nextgcore_ngap_gen::decode_contained::<
+            ngap_gen::PDUSessionResourceSetupRequestTransfer,
+        >(&new)
+        .expect("generated decode");
+        assert_eq!(back, generated);
+        let misread = PduSessionResourceSetupRequestTransfer::decode(&new).ok();
+        assert_ne!(
+            misread,
+            Some(t),
+            "the hand-written decoder does not read the conformant form back"
+        );
+    }
+
+    /// The fork encodes no length determinant past 16383 (X.691 §11.9.3.8
+    /// fragmentation is "not yet implemented"), so a Setup Request whose
+    /// initiating-message value -- the transfer plus 31 octets, with an SD --
+    /// would pass 16383 octets is refused, where the hand-written encoder
+    /// fragmented it. No N2 SM transfer is that long: one of 64 fully-specified
+    /// QoS flows is a few kilobytes.
+    #[test]
+    fn a_setup_request_past_16k_octets_is_refused() {
+        let build = |n: usize| {
+            build_pdu_session_resource_setup_request_asn1(
+                42,
+                1001,
+                5,
+                1,
+                Some(1),
+                None,
+                &vec![0; n],
+            )
+        };
+        let old = |n: usize| {
+            hand_written_pdu_session_resource_setup_request(
+                42,
+                1001,
+                5,
+                1,
+                Some(1),
+                None,
+                &vec![0; n],
+            )
+        };
+        assert!(build(16_352).is_some());
+        assert_eq!(build(16_352), old(16_352));
+        assert_eq!(build(16_353), None);
+        assert!(
+            old(16_353).is_some(),
+            "the hand-written encoder fragmented it"
+        );
+    }
+
+    /// A transfer whose iE-Extensions carries an extension the schema does not
+    /// know -- here the MBS Support Indicator (id 309) relabelled 9999 on the
+    /// wire -- decodes to the same endpoint: the hand-written decoder never
+    /// read the extension container, and the generated one skips the unknown
+    /// entry. A DL GTP tunnel carrying iE-Extensions, whose object set is
+    /// empty (nextgsim #218), is refused rather than misparsed.
+    #[test]
+    fn setup_response_transfer_extensions_are_skipped_or_refused() {
+        let mut transfer = nextgcore_ngap_gen::decode_contained::<
+            ngap_gen::PDUSessionResourceSetupResponseTransfer,
+        >(
+            &hand_written_response_transfer(&[10, 45, 0, 3], 32, 7, &[9])
+                .encode()
+                .expect("encode"),
+        )
+        .expect("decode");
+        transfer.ie_extensions = Some(ngap_gen::PDUSessionResourceSetupResponseTransferIE_Extensions(vec![
+            ngap_gen::PDUSessionResourceSetupResponseTransferIE_Extensions_Entry {
+                id: ngap_gen::ProtocolExtensionID(ngap_gen::ID_MBS_SUPPORT_INDICATOR),
+                criticality: ngap_gen::Criticality(ngap_gen::Criticality::IGNORE),
+                extension_value:
+                    ngap_gen::PDUSessionResourceSetupResponseTransferIE_Extensions_EntryExtensionValue::Id_MBS_SupportIndicator(
+                        ngap_gen::MBS_SupportIndicator(ngap_gen::MBS_SupportIndicator::TRUE),
+                    ),
+            },
+        ]));
+        let known = nextgcore_ngap_gen::encode_contained(&transfer).expect("encode");
+        // The extension id is the only 309 (0x0135) on the wire: relabel it.
+        let at = known
+            .windows(2)
+            .rposition(|w| w == [0x01, 0x35])
+            .expect("id 309");
+        let mut unknown = known.clone();
+        unknown[at..at + 2].copy_from_slice(&9999u16.to_be_bytes());
+        let endpoint = Some(GnbN3Endpoint {
+            teid: 7,
+            address: vec![10, 45, 0, 3],
+            qfis: vec![9],
+        });
+        assert_eq!(parse_n2_sm_setup_response_transfer(&known), endpoint);
+        assert_eq!(parse_n2_sm_setup_response_transfer(&unknown), endpoint);
+        assert_eq!(
+            hand_written_parse_n2_sm_setup_response_transfer(&unknown),
+            endpoint
+        );
+        assert!(
+            nextgcore_ngap_gen::decode_contained::<ngap_gen::PDUSessionResourceSetupResponseTransfer>(
+                &unknown
+            )
+            .is_err(),
+            "the default decode fails on the unknown id, so the skip is what decodes it"
+        );
+
+        // A DL GTP tunnel carrying an iE-Extensions container. The forked
+        // codec's own encoding of an entry of the empty object set is the
+        // zero-bit one nextgsim #218 describes, so this is not the real wire
+        // form of any extension -- it sets the presence bit, which is what the
+        // decode refuses on.
+        let mut tunneled = transfer.clone();
+        tunneled.ie_extensions = None;
+        let ngap_gen::UPTransportLayerInformation::GTPTunnel(ref mut tunnel) = tunneled
+            .dl_qos_flow_per_tnl_information
+            .up_transport_layer_information
+        else {
+            panic!("GTP tunnel");
+        };
+        tunnel.ie_extensions = Some(ngap_gen::GTPTunnelIE_Extensions(vec![
+            ngap_gen::GTPTunnelIE_Extensions_Entry {},
+        ]));
+        let extended = nextgcore_ngap_gen::encode_contained(&tunneled).expect("encode");
+        assert_eq!(parse_n2_sm_setup_response_transfer(&extended), None);
+        let plain = hand_written_response_transfer(&[10, 45, 0, 3], 32, 7, &[9])
+            .encode()
+            .expect("encode");
+        assert_eq!(parse_n2_sm_setup_response_transfer(&plain), endpoint);
     }
 }

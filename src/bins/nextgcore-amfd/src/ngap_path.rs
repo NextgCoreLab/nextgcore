@@ -8834,39 +8834,84 @@ impl NgapServer {
         }
     }
 
+    /// Handle a PDU SESSION RESOURCE SETUP RESPONSE (TS 38.413 §8.2.1).
+    ///
+    /// Decoded with the generated codec (#417 stage 6), which applies the
+    /// §10.3.4.2 rules for a RESPONSE: a not-comprehended "ignore IE and notify
+    /// sender" IE is reported in an Error Indication and the transfers are
+    /// relayed all the same; one marked "reject" terminates the procedure
+    /// unsuccessfully, handled locally by relaying nothing -- what an
+    /// undecodable response already got.
     async fn handle_pdu_session_resource_setup_response(
         &mut self,
         association_id: u64,
         data: &[u8],
     ) -> Result<()> {
+        use crate::ngap_asn1::PduSessionResourceSetupResponseDecode::{
+            Decoded, Failed, Undecodable,
+        };
         log::info!(
             "PDU Session Resource Setup Response from association {} ({} bytes)",
             association_id,
             data.len()
         );
 
-        // Decode the APER-encoded PDU Session Resource Setup Response using ASN.1
-        use nextgcore_ngap::{parser::decode_ngap_pdu, NgapMessage};
-
-        let response_data = match decode_ngap_pdu(data) {
-            Ok(NgapMessage::PduSessionResourceSetupResponse(resp)) => resp,
-            Ok(other) => {
-                log::warn!("Expected PduSessionResourceSetupResponse, got {other:?}");
-                return Ok(());
-            }
-            Err(e) => {
-                log::warn!("Failed to decode PDU Session Resource Setup Response: {e:?}");
-                return Ok(());
-            }
+        let (amf_ue_ngap_id, ran_ue_ngap_id, setup, failed) =
+            match crate::ngap_asn1::decode_pdu_session_resource_setup_response_asn1(data) {
+                Decoded {
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    setup,
+                    failed,
+                    error_indication,
+                } => {
+                    // Best effort: the report must not stop the relay below.
+                    if let Some(report) = error_indication {
+                        if let Err(e) = self
+                            .send_criticality_error_indication(association_id, &report)
+                            .await
+                        {
+                            log::warn!("Failed to send ErrorIndication: {e}");
+                        }
+                    }
+                    (amf_ue_ngap_id, ran_ue_ngap_id, setup, failed)
+                }
+                Failed(diagnostics) => {
+                    log::warn!(
+                        "PDU Session Resource Setup Response from association \
+                         {association_id} carries not-comprehended IEs marked reject \
+                         ({diagnostics:?}); the procedure is unsuccessfully terminated \
+                         (TS 38.413 §10.3.4.2), handled locally"
+                    );
+                    return Ok(());
+                }
+                Undecodable => {
+                    log::warn!(
+                        "Failed to decode PDU Session Resource Setup Response from \
+                         association {association_id}"
+                    );
+                    return Ok(());
+                }
+            };
+        // The AMF UE NGAP ID has criticality ignore, so its absence is ignored
+        // (§10.3.5) -- but it is what names the UE whose SM contexts the
+        // transfers belong to, so without it there is nothing to relay them to.
+        let Some(amf_ue_ngap_id) = amf_ue_ngap_id else {
+            log::warn!(
+                "PDU Session Resource Setup Response from association {association_id} \
+                 names no AMF UE NGAP ID; {} set-up and {} failed transfers cannot be \
+                 relayed",
+                setup.len(),
+                failed.len()
+            );
+            return Ok(());
         };
 
         log::info!(
-            "Decoded Setup Response: amf_ue_ngap_id={}, ran_ue_ngap_id={}, \
-             setup={}, failed={}",
-            response_data.amf_ue_ngap_id,
-            response_data.ran_ue_ngap_id,
-            response_data.setup_list.len(),
-            response_data.failed_list.len()
+            "Decoded Setup Response: amf_ue_ngap_id={amf_ue_ngap_id}, \
+             ran_ue_ngap_id={ran_ue_ngap_id:?}, setup={}, failed={}",
+            setup.len(),
+            failed.len()
         );
 
         // TS 38.413 §8.2.1 / TS 23.502 §4.3.2.2.1: EVERY successfully-set-up
@@ -8880,7 +8925,7 @@ impl NgapServer {
         // and the rest left half-open: the gNB believed they were up, the UPF had
         // no downlink FAR for them.
         let mut relayed = 0usize;
-        for item in &response_data.setup_list {
+        for item in &setup {
             // Decode the transfer only to log the endpoint; the bytes relayed to
             // the SMF are the ones received (TS 23.502: opaque to the AMF). A
             // transfer this build cannot parse is still relayed, because the SMF
@@ -8903,7 +8948,7 @@ impl NgapServer {
 
             if self
                 .relay_n2_sm_to_smf(
-                    response_data.amf_ue_ngap_id,
+                    amf_ue_ngap_id,
                     item.pdu_session_id,
                     &item.transfer,
                     "PDUSessionResourceSetupResponse",
@@ -8918,7 +8963,7 @@ impl NgapServer {
         // Unsuccessful Transfer carries the gNB's cause, and the SMF needs it to
         // release the session it thinks it just established — otherwise the
         // session leaks at the SMF and UPF until some other event clears it.
-        for item in &response_data.failed_list {
+        for item in &failed {
             log::warn!(
                 "gNB failed to set up PSI={} ({} bytes of unsuccessful transfer); \
                  relaying the failure to the SMF",
@@ -8926,7 +8971,7 @@ impl NgapServer {
                 item.transfer.len()
             );
             self.relay_n2_sm_to_smf(
-                response_data.amf_ue_ngap_id,
+                amf_ue_ngap_id,
                 item.pdu_session_id,
                 &item.transfer,
                 "PDUSessionResourceSetupResponse (failed-to-setup)",
@@ -8934,18 +8979,18 @@ impl NgapServer {
             .await;
         }
 
-        if response_data.setup_list.is_empty() && response_data.failed_list.is_empty() {
+        if setup.is_empty() && failed.is_empty() {
             log::warn!(
                 "PDU Session Resource Setup Response for UE {} carries neither a \
                  setup nor a failed list",
-                response_data.amf_ue_ngap_id
+                amf_ue_ngap_id
             );
         } else {
             log::info!(
                 "PDU Session Resource Setup Response: relayed {relayed}/{} successful \
                  and {} failed sessions to the SMF",
-                response_data.setup_list.len(),
-                response_data.failed_list.len()
+                setup.len(),
+                failed.len()
             );
         }
 
@@ -15041,6 +15086,69 @@ mod tests {
             vec![
                 ("ref-no-ran".to_string(), vec![0x51]),
                 ("ref-notify".to_string(), vec![0x61]),
+            ],
+            "only the no-RAN-ID and the notify responses relay: {calls:?}"
+        );
+    }
+
+    /// #417 stage 6, at the handler: what the generated Setup Response decode
+    /// changes about what reaches the SMF. A response with no RAN UE NGAP ID
+    /// (criticality ignore, so its absence is ignored, §10.3.5) now relays its
+    /// transfer, where the hand-written parser refused it; one carrying a
+    /// not-comprehended IE marked "notify" relays both its set-up and its
+    /// failed session, the IE reported in an Error Indication; one carrying an
+    /// IE marked "reject" relays nothing -- the procedure is unsuccessfully
+    /// terminated, handled locally (§10.3.4.2) -- and neither does one that
+    /// names no AMF UE NGAP ID.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn setup_responses_relay_per_the_criticality_rules() {
+        use nextgcore_ngap_gen::generated::PDUSessionResourceSetupResponseProtocolIEs_EntryValue as Ie;
+        let (_smf, port, seen) = fake_smf().await;
+        let _env = SmfEnvGuard::set(port);
+
+        let mut server = test_ngap_server().await;
+        let ue = 79_006u64;
+        for (psi, r) in [
+            (5u8, "ref-no-ran"),
+            (6, "ref-notify"),
+            (7, "ref-notify-failed"),
+            (8, "ref-reject"),
+        ] {
+            server.sm_context_refs.insert((ue, psi), r.to_string());
+        }
+
+        let no_ran_id = ngap_asn1::tests::generated_setup_response(vec![
+            Ie::Id_AMF_UE_NGAP_ID(nextgcore_ngap_gen::generated::AMF_UE_NGAP_ID(ue)),
+            ngap_asn1::tests::generated_setup_list(&[(5, vec![0x51])]),
+        ]);
+        let notify = ngap_asn1::tests::with_unknown_ie(
+            &ngap_asn1::tests::setup_response(ue, 1, &[(6, vec![0x61])], &[(7, vec![0x71])]),
+            9999,
+            0x80,
+        );
+        let reject = ngap_asn1::tests::with_unknown_ie(
+            &ngap_asn1::tests::setup_response(ue, 1, &[(8, vec![0x81])], &[]),
+            9999,
+            0x00,
+        );
+        let no_amf_id = ngap_asn1::tests::generated_setup_response(vec![
+            Ie::Id_RAN_UE_NGAP_ID(nextgcore_ngap_gen::generated::RAN_UE_NGAP_ID(1)),
+            ngap_asn1::tests::generated_setup_list(&[(8, vec![0x82])]),
+        ]);
+        for data in [&no_ran_id, &notify, &reject, &no_amf_id] {
+            server
+                .handle_pdu_session_resource_setup_response(9402, data)
+                .await
+                .expect("handled");
+        }
+
+        let calls = seen.lock().expect("seen").clone();
+        assert_eq!(
+            calls,
+            vec![
+                ("ref-no-ran".to_string(), vec![0x51]),
+                ("ref-notify".to_string(), vec![0x61]),
+                ("ref-notify-failed".to_string(), vec![0x71]),
             ],
             "only the no-RAN-ID and the notify responses relay: {calls:?}"
         );
