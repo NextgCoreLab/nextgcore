@@ -113,6 +113,11 @@ Full APER encoder/decoder. NGAP (53 procedure codes, 14+ message values) and S1A
 
 Missing: Many typed NGAP IEs, fragmented length, XnAP/F1AP/E1AP codecs.
 
+The earlier hand-written E1AP/F1AP/XnAP modules were removed (#457): they were not
+ASN.1 PDUs (no PDU CHOICE, open type or ProtocolIE-Container) and had no consumers.
+A future codec should be generated from the 3GPP ASN.1 (TS 38.463 / 38.473 / 38.423)
+with the forked compiler, as `nextgcore-ngap-gen` does for NGAP (#417).
+
 ---
 
 ## Summary: Critical Gaps
