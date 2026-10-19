@@ -81,3 +81,50 @@ fn sim_initial_ue_messages_decode_and_reencode_identically() {
         assert_eq!(bytes[1], 15, "byte 1 is the procedure code");
     }
 }
+
+/// A bare PDUSessionResourceReleaseResponseTransfer -- extension bit and
+/// iE-Extensions presence bit, both 0 -- is the one zero octet, and it decodes
+/// back. The hand-written `nextgcore-ngap` transfer codec agrees.
+#[test]
+fn a_contained_encoding_is_never_empty_and_round_trips() {
+    let bare = generated::PDUSessionResourceReleaseResponseTransfer {
+        ie_extensions: None,
+    };
+    let bytes = encode_contained(&bare).expect("encode");
+    assert_eq!(bytes, [0x00]);
+    assert_eq!(
+        decode_contained::<generated::PDUSessionResourceReleaseResponseTransfer>(&bytes)
+            .expect("decode"),
+        bare
+    );
+    assert_eq!(
+        nextgcore_ngap::transfer::PduSessionResourceReleaseResponseTransfer
+            .encode()
+            .expect("hand-written encode"),
+        bytes
+    );
+}
+
+/// A contained value that is not octet-aligned is padded to the octet: a
+/// PDUSessionResourceReleaseCommandTransfer with Cause nas/normal-release is
+/// 8 bits; radioNetwork/release-due-to-pre-emption, an extension value whose
+/// index travels as a normally small number, 13 -- two octets.
+#[test]
+fn contained_encodings_are_octet_aligned() {
+    use generated::{Cause, CauseNas, CauseRadioNetwork, PDUSessionResourceReleaseCommandTransfer};
+    let normal = PDUSessionResourceReleaseCommandTransfer {
+        cause: Cause::Nas(CauseNas(CauseNas::NORMAL_RELEASE)),
+        ie_extensions: None,
+    };
+    assert_eq!(encode_contained(&normal).expect("encode"), [0x10]);
+    let pre_emption = PDUSessionResourceReleaseCommandTransfer {
+        cause: Cause::RadioNetwork(CauseRadioNetwork(46)),
+        ie_extensions: None,
+    };
+    let bytes = encode_contained(&pre_emption).expect("encode");
+    assert_eq!(bytes.len(), 2);
+    assert_eq!(
+        decode_contained::<PDUSessionResourceReleaseCommandTransfer>(&bytes).expect("decode"),
+        pre_emption
+    );
+}

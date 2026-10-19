@@ -12,17 +12,20 @@
 //! the UE Context Release family (stage 4): the Command encoder and the Request
 //! and Complete decoders ([`decode_ue_context_release_request_asn1`],
 //! [`decode_ue_context_release_complete_asn1`]), which report through an Error
-//! Indication where §10.3.4.2 says to.
+//! Indication where §10.3.4.2 says to -- and the PDU Session Resource Release
+//! pair (stage 5): the Command encoder, whose per-session transfer goes through
+//! [`nextgcore_ngap_gen::encode_contained`], and the Response decoder
+//! ([`decode_pdu_session_resource_release_response_asn1`]).
 
 use nextgcore_asn1c::ngap::cause::{
     Cause, CauseMisc, CauseNas, CauseProtocol, CauseRadioNetwork, CauseTransport,
 };
 use nextgcore_ngap::transfer::{
     AllocationAndRetentionPriority, GtpTunnel, NonDynamic5qiDescriptor,
-    PduSessionResourceReleaseCommandTransfer, PduSessionResourceSetupRequestTransfer,
-    PduSessionResourceSetupResponseTransfer, PduSessionType, PreEmptionCapability,
-    PreEmptionVulnerability, QosCharacteristics, QosFlowLevelQosParameters,
-    QosFlowSetupRequestItem, TransportLayerAddress, UpTransportLayerInformation,
+    PduSessionResourceSetupRequestTransfer, PduSessionResourceSetupResponseTransfer,
+    PduSessionType, PreEmptionCapability, PreEmptionVulnerability, QosCharacteristics,
+    QosFlowLevelQosParameters, QosFlowSetupRequestItem, TransportLayerAddress,
+    UpTransportLayerInformation,
 };
 use nextgcore_ngap::{builder, parser, types::*, NgapMessage};
 
@@ -955,43 +958,93 @@ pub fn parse_initial_context_setup_failure_asn1(data: &[u8]) -> Option<(u64, u32
     }
 }
 
+/// The `PDUSessionResourceReleaseCommandTransfer` (TS 38.413 §9.3.4.12) the
+/// AMF sends for every session it releases: just the Cause, as the contents of
+/// the item's `OCTET STRING (CONTAINING ...)`.
+///
+/// #417 stage 5: encoded by the generated codec through
+/// [`nextgcore_ngap_gen::encode_contained`], the helper the Setup and Modify
+/// transfers will go through as well.
+fn release_command_transfer(cause: Cause) -> Option<Vec<u8>> {
+    let transfer = ngap_gen::PDUSessionResourceReleaseCommandTransfer {
+        cause: generated_cause(cause),
+        ie_extensions: None,
+    };
+    match nextgcore_ngap_gen::encode_contained(&transfer) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            log::error!("Failed to encode PDUSessionResourceReleaseCommandTransfer: {e:?}");
+            None
+        }
+    }
+}
+
 /// Build a PDU Session Resource Release Command with proper ASN.1 APER encoding
 ///
 /// Sent by AMF to gNB to release PDU session resources.
+///
+/// #417 stage 5: encoded by the generated codec, every session's transfer
+/// carrying Cause nas/normal-release as before. The bytes are unchanged --
+/// `pdu_session_resource_release_command_generated_matches_hand_written` pins
+/// that -- and an empty or over-long session list (SIZE(1..256)) is refused,
+/// as the hand-written encoder refused it.
 pub fn build_pdu_session_resource_release_command_asn1(
     amf_ue_ngap_id: u64,
     ran_ue_ngap_id: u32,
     pdu_session_ids: &[u8],
 ) -> Option<Vec<u8>> {
-    // Per-session PDUSessionResourceReleaseCommandTransfer with mandatory Cause
-    // (TS 38.413 Section 9.3.4.11), APER-encoded via nextgcore-ngap::transfer
-    let release_transfer = PduSessionResourceReleaseCommandTransfer {
-        cause: Cause::Nas(CauseNas::NormalRelease),
-    };
-    let transfer_bytes = match release_transfer.encode() {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            log::error!("Failed to encode PDUSessionResourceReleaseCommandTransfer: {e:?}");
-            return None;
-        }
+    use ngap_gen::{
+        PDUSessionResourceReleaseCommand, PDUSessionResourceReleaseCommandProtocolIEs,
+        PDUSessionResourceReleaseCommandProtocolIEs_Entry as Entry,
+        PDUSessionResourceReleaseCommandProtocolIEs_EntryValue as Ie,
+        PDUSessionResourceToReleaseItemRelCmd,
+        PDUSessionResourceToReleaseItemRelCmdPDUSessionResourceReleaseCommandTransfer as Transfer,
+        ProtocolIE_ID, NGAP_PDU,
     };
 
-    let pdu_session_list = pdu_session_ids
+    let transfer = release_command_transfer(Cause::Nas(CauseNas::NormalRelease))?;
+    let items = pdu_session_ids
         .iter()
-        .map(|&psi| PduSessionResourceReleaseItem {
-            pdu_session_id: psi,
-            transfer: transfer_bytes.clone(),
+        .map(|&psi| PDUSessionResourceToReleaseItemRelCmd {
+            pdu_session_id: ngap_gen::PDUSessionID(psi),
+            pdu_session_resource_release_command_transfer: Transfer(transfer.clone()),
+            ie_extensions: None,
         })
         .collect();
 
-    let msg = PduSessionResourceReleaseCommand {
-        amf_ue_ngap_id,
-        ran_ue_ngap_id,
-        nas_pdu: None,
-        pdu_session_list,
-    };
+    let reject = ngap_gen::Criticality(ngap_gen::Criticality::REJECT);
+    // IE order and criticalities as TS 38.413 §9.2.1.3 lists them; the AMF
+    // sends neither the RAN Paging Priority nor a NAS-PDU here.
+    let ies = vec![
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_AMF_UE_NGAP_ID),
+            criticality: reject.clone(),
+            value: Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(amf_ue_ngap_id)),
+        },
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_RAN_UE_NGAP_ID),
+            criticality: reject.clone(),
+            value: Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(ran_ue_ngap_id)),
+        },
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_PDU_SESSION_RESOURCE_TO_RELEASE_LIST_REL_CMD),
+            criticality: reject.clone(),
+            value: Ie::Id_PDUSessionResourceToReleaseListRelCmd(
+                ngap_gen::PDUSessionResourceToReleaseListRelCmd(items),
+            ),
+        },
+    ];
+    let pdu = NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_PDU_SESSION_RESOURCE_RELEASE),
+        criticality: reject,
+        value: ngap_gen::InitiatingMessageValue::Id_PDUSessionResourceRelease(
+            PDUSessionResourceReleaseCommand {
+                protocol_i_es: PDUSessionResourceReleaseCommandProtocolIEs(ies),
+            },
+        ),
+    });
 
-    match builder::build_pdu_session_resource_release_command(&msg) {
+    match nextgcore_ngap_gen::encode(&pdu) {
         Ok(bytes) => {
             log::debug!(
                 "Built PDU Session Resource Release Command: {} bytes, amf_ue_ngap_id={}, psi_count={}",
@@ -1003,6 +1056,141 @@ pub fn build_pdu_session_resource_release_command_asn1(
             log::error!("Failed to encode PDU Session Resource Release Command: {e:?}");
             None
         }
+    }
+}
+
+/// One session a PDU Session Resource Release Response reports released.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleasedPduSession {
+    /// The PDU Session ID.
+    pub pdu_session_id: u8,
+    /// The `PDUSessionResourceReleaseResponseTransfer` octets, exactly as
+    /// received: the AMF relays N2 SM information to the SMF opaquely
+    /// (TS 23.502) and never re-encodes it.
+    pub transfer: Vec<u8>,
+}
+
+/// How a received PDU Session Resource Release Response is to be handled.
+#[derive(Debug)]
+pub enum PduSessionResourceReleaseResponseDecode {
+    /// Decoded. Every IE of the response is mandatory or optional with
+    /// criticality ignore (§9.2.1.4), so a missing one is ignored (§10.3.5)
+    /// and comes back `None` / empty. When `error_indication` is set, the
+    /// response carried not-comprehended IEs marked "ignore IE and notify
+    /// sender", which §10.3.4.2 reports in an Error Indication.
+    Released {
+        /// The AMF UE NGAP ID the gNB names.
+        amf_ue_ngap_id: Option<u64>,
+        /// The RAN UE NGAP ID the gNB names.
+        ran_ue_ngap_id: Option<u32>,
+        /// The sessions released, in the order received.
+        released: Vec<ReleasedPduSession>,
+        /// The Error Indication to send, if any.
+        error_indication: Option<CriticalityErrorIndication>,
+    },
+    /// The response carried a not-comprehended IE marked "reject": the
+    /// procedure is "unsuccessfully terminated" and handled locally
+    /// (§10.3.4.2), with no message to the gNB. The IEs are for the log.
+    Failed(Vec<IeDiagnostic>),
+    /// Not decodable.
+    Undecodable,
+}
+
+/// Decode a PDU Session Resource Release Response (gNB -> AMF, TS 38.413
+/// §9.2.1.4) with the GENERATED codec (#417 stage 5), applying the §10.3.4.2
+/// and §10.3.5 rules for a RESPONSE message.
+///
+/// The hand-written parser this replaced refused the message on a missing ID
+/// and on any not-comprehended IE marked reject, and ignored one marked notify
+/// without reporting it. Every response it accepted decodes to the same UE and
+/// the same sessions and transfers:
+/// `pdu_session_resource_release_response_generated_decode_matches_hand_written`.
+///
+/// A released item carrying an `iE-Extensions` container is refused as
+/// undecodable. Its extension object set is empty in Rel-17, and the forked
+/// codec decodes an entry of such a container as zero bits (nextgsim #218), so
+/// whatever it returned for the item would be a misparse. The hand-written
+/// parser did not look at the presence bit at all and misread the item the
+/// same way; refusing is the only answer that is not silently wrong.
+pub fn decode_pdu_session_resource_release_response_asn1(
+    data: &[u8],
+) -> PduSessionResourceReleaseResponseDecode {
+    use ngap_gen::{
+        PDUSessionResourceReleaseResponseProtocolIEs_EntryValue as Ie, SuccessfulOutcomeValue,
+    };
+    use PduSessionResourceReleaseResponseDecode::{Failed, Released, Undecodable};
+
+    let (pdu, unknown) = match nextgcore_ngap_gen::decode_with_unknown_ies(data) {
+        Ok(decoded) => decoded,
+        Err(e) => {
+            log::warn!("Failed to decode PDU Session Resource Release Response: {e:?}");
+            return Undecodable;
+        }
+    };
+    let ngap_gen::NGAP_PDU::SuccessfulOutcome(ngap_gen::SuccessfulOutcome {
+        criticality,
+        value: SuccessfulOutcomeValue::Id_PDUSessionResourceRelease(response),
+        ..
+    }) = pdu
+    else {
+        log::warn!("Expected PduSessionResourceReleaseResponse");
+        return Undecodable;
+    };
+    let Some((reject, notify)) =
+        classify_unknown_ies(&unknown, "PDU Session Resource Release Response")
+    else {
+        return Undecodable;
+    };
+    if !reject.is_empty() {
+        return Failed(reject);
+    }
+
+    let mut amf_ue_ngap_id = None;
+    let mut ran_ue_ngap_id = None;
+    let mut released = Vec::new();
+    for entry in response.protocol_i_es.0 {
+        match entry.value {
+            Ie::Id_AMF_UE_NGAP_ID(v) => amf_ue_ngap_id = Some(v.0),
+            Ie::Id_RAN_UE_NGAP_ID(v) => ran_ue_ngap_id = Some(v.0),
+            Ie::Id_PDUSessionResourceReleasedListRelRes(list) => {
+                for item in list.0 {
+                    if item.ie_extensions.is_some() {
+                        log::warn!(
+                            "PDU Session Resource Release Response: released PSI item carries \
+                             iE-Extensions, which the codec cannot decode (nextgsim #218)"
+                        );
+                        return Undecodable;
+                    }
+                    released.push(ReleasedPduSession {
+                        pdu_session_id: item.pdu_session_id.0,
+                        transfer: item.pdu_session_resource_release_response_transfer.0,
+                    });
+                }
+            }
+            // Comprehended, and not used by the AMF.
+            Ie::Id_UserLocationInformation(_) | Ie::Id_CriticalityDiagnostics(_) => {}
+        }
+    }
+    let error_indication = if notify.is_empty() {
+        None
+    } else {
+        Some(CriticalityErrorIndication {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            cause_protocol: ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+            procedure: ReportedProcedure {
+                procedure_code: ngap_gen::ID_PDU_SESSION_RESOURCE_RELEASE,
+                triggering_message: ngap_gen::TriggeringMessage::SUCCESSFUL_OUTCOME,
+                procedure_criticality: criticality.0,
+            },
+            diagnostics: notify,
+        })
+    };
+    Released {
+        amf_ue_ngap_id,
+        ran_ue_ngap_id,
+        released,
+        error_indication,
     }
 }
 
@@ -1820,6 +2008,53 @@ pub(crate) mod tests {
                 cause: build_cause(cause_group, cause_value),
             };
             builder::build_ue_context_release_command(&msg).ok()
+        }
+
+        /// The PDU Session Resource Release Command encoder as it was before
+        /// #417 stage 5 moved it onto the generated codec.
+        pub(crate) fn hand_written_pdu_session_resource_release_command(
+            amf_ue_ngap_id: u64,
+            ran_ue_ngap_id: u32,
+            pdu_session_ids: &[u8],
+        ) -> Option<Vec<u8>> {
+            use nextgcore_ngap::transfer::PduSessionResourceReleaseCommandTransfer;
+            let release_transfer = PduSessionResourceReleaseCommandTransfer {
+                cause: Cause::Nas(CauseNas::NormalRelease),
+            };
+            let transfer_bytes = release_transfer.encode().ok()?;
+            let pdu_session_list = pdu_session_ids
+                .iter()
+                .map(|&psi| PduSessionResourceReleaseItem {
+                    pdu_session_id: psi,
+                    transfer: transfer_bytes.clone(),
+                })
+                .collect();
+            let msg = PduSessionResourceReleaseCommand {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                nas_pdu: None,
+                pdu_session_list,
+            };
+            builder::build_pdu_session_resource_release_command(&msg).ok()
+        }
+
+        /// The PDU Session Resource Release Response decode as the handler did
+        /// it before #417 stage 5: the UE, and each released session with its
+        /// transfer, or nothing when the parser refused the message.
+        pub(crate) fn hand_written_parse_pdu_session_resource_release_response(
+            data: &[u8],
+        ) -> Option<(u64, u32, Vec<(u8, Vec<u8>)>)> {
+            match parser::decode_ngap_pdu(data) {
+                Ok(NgapMessage::PduSessionResourceReleaseResponse(r)) => Some((
+                    r.amf_ue_ngap_id,
+                    r.ran_ue_ngap_id,
+                    r.released_list
+                        .into_iter()
+                        .map(|i| (i.pdu_session_id, i.transfer))
+                        .collect(),
+                )),
+                _ => None,
+            }
         }
 
         /// The UE Context Release Complete decoder as it was before #417 stage 4.
@@ -2978,7 +3213,10 @@ pub(crate) mod tests {
                 assert_eq!(cmd.pdu_session_list.len(), 1);
                 let item = &cmd.pdu_session_list[0];
                 assert_eq!(item.pdu_session_id, 5);
-                let transfer = PduSessionResourceReleaseCommandTransfer::decode(&item.transfer)
+                let transfer =
+                    nextgcore_ngap::transfer::PduSessionResourceReleaseCommandTransfer::decode(
+                        &item.transfer,
+                    )
                     .expect("transfer decode");
                 assert_eq!(transfer.cause, Cause::Nas(CauseNas::NormalRelease));
             }
@@ -3801,4 +4039,510 @@ pub(crate) mod tests {
         0x40, 0x02, 0x00, 0x09, 0x00, 0x0f, 0x40, 0x01, 0x62, 0x00, 0x13, 0x40, 0x08, 0x78, 0x2a,
         0x10, 0x00, 0x00, 0x27, 0x0f, 0x00,
     ];
+
+    // ====================================================================
+    // #417 stage 5: the PDU Session Resource Release pair on the generated
+    // codec
+    // ====================================================================
+
+    use hand_written_oracle::{
+        hand_written_parse_pdu_session_resource_release_response,
+        hand_written_pdu_session_resource_release_command,
+    };
+
+    /// PDU Session ID lists at every length boundary of
+    /// PDUSessionResourceToReleaseListRelCmd, SIZE(1..maxnoofPDUSessions = 256),
+    /// and one past each end.
+    fn psi_lists() -> Vec<Vec<u8>> {
+        [0usize, 1, 2, 15, 16, 127, 128, 129, 255, 256, 257]
+            .into_iter()
+            .map(|n| (0..n).map(|i| (i % 256) as u8).collect())
+            .collect()
+    }
+
+    /// #417 stage 5: the generated PDU Session Resource Release Command is byte
+    /// for byte the hand-written one -- every PDU Session ID, every list length
+    /// SIZE(1..256) allows, every UE NGAP ID length -- and both refuse the same
+    /// inputs: an empty or 257-entry list, and an AMF UE NGAP ID past 2^40-1.
+    #[test]
+    fn pdu_session_resource_release_command_generated_matches_hand_written() {
+        let mut compared = 0;
+        let mut refused = 0;
+        let mut check = |amf: u64, ran: u32, psis: &[u8]| {
+            let new = build_pdu_session_resource_release_command_asn1(amf, ran, psis);
+            let old = hand_written_pdu_session_resource_release_command(amf, ran, psis);
+            assert_eq!(new, old, "AMF {amf} RAN {ran} PSIs {psis:?}");
+            if new.is_none() {
+                refused += 1;
+            }
+            compared += 1;
+        };
+        for psi in 0..=255u8 {
+            check(42, 1001, &[psi]);
+        }
+        for psis in psi_lists() {
+            check(42, 1001, &psis);
+        }
+        for amf in AMF_IDS {
+            for ran in RAN_IDS {
+                check(amf, ran, &[5]);
+                check(amf, ran, &[1, 2, 3]);
+            }
+        }
+        assert_eq!(compared, 256 + 11 + 12 * 8 * 2);
+        // The empty and the 257-entry list, and the 16 out-of-range AMF IDs.
+        assert_eq!(refused, 2 + 8 * 2);
+        assert_eq!(
+            build_pdu_session_resource_release_command_asn1(42, 1001, &[]),
+            None
+        );
+        assert_eq!(
+            build_pdu_session_resource_release_command_asn1(42, 1001, &[0; 257]),
+            None
+        );
+    }
+
+    /// The bytes themselves, so the generated and hand-written encoders cannot
+    /// drift together: one session, and two.
+    #[test]
+    fn pdu_session_resource_release_command_golden_bytes() {
+        assert_eq!(
+            build_pdu_session_resource_release_command_asn1(42, 1001, &[5]).expect("encode"),
+            GOLDEN_PDU_SESSION_RELEASE_COMMAND_ONE
+        );
+        assert_eq!(
+            build_pdu_session_resource_release_command_asn1(42, 1001, &[1, 2]).expect("encode"),
+            GOLDEN_PDU_SESSION_RELEASE_COMMAND_TWO
+        );
+    }
+
+    // initiatingMessage, procedure 28, criticality reject, length; 3 IEs:
+    // AMF UE NGAP ID 42, RAN UE NGAP ID 1001, then the To Release list --
+    // count-1, per item the two preamble bits, the PSI, and the transfer
+    // [0x10]: extension and iE-Extensions bits, Cause choice 2 (nas), value 0
+    // (normal-release).
+    const GOLDEN_PDU_SESSION_RELEASE_COMMAND_ONE: &[u8] = &[
+        0x00, 0x1c, 0x00, 0x19, 0x00, 0x00, 0x03, 0x00, 0x0a, 0x00, 0x02, 0x00, 0x2a, 0x00, 0x55,
+        0x00, 0x03, 0x40, 0x03, 0xe9, 0x00, 0x4f, 0x00, 0x05, 0x00, 0x00, 0x05, 0x01, 0x10,
+    ];
+    const GOLDEN_PDU_SESSION_RELEASE_COMMAND_TWO: &[u8] = &[
+        0x00, 0x1c, 0x00, 0x1d, 0x00, 0x00, 0x03, 0x00, 0x0a, 0x00, 0x02, 0x00, 0x2a, 0x00, 0x55,
+        0x00, 0x03, 0x40, 0x03, 0xe9, 0x00, 0x4f, 0x00, 0x09, 0x01, 0x00, 0x01, 0x01, 0x10, 0x00,
+        0x02, 0x01, 0x10,
+    ];
+
+    /// The transfer helper on its own: for every cause the AMF's `build_cause`
+    /// can produce, the generated PDUSessionResourceReleaseCommandTransfer is
+    /// the hand-written one, and it decodes back through
+    /// [`nextgcore_ngap_gen::decode_contained`] to the same Cause -- the round
+    /// trip the Setup and Modify transfers will rely on.
+    #[test]
+    fn release_command_transfer_generated_matches_hand_written() {
+        use nextgcore_ngap::transfer::PduSessionResourceReleaseCommandTransfer;
+        let mut compared = 0;
+        for group in 0..=4u8 {
+            for value in 0..=46i64 {
+                let cause = build_cause(group, value);
+                let new = release_command_transfer(cause).expect("encode");
+                let old = PduSessionResourceReleaseCommandTransfer { cause }
+                    .encode()
+                    .expect("hand-written encode");
+                assert_eq!(new, old, "group {group} value {value}");
+                let back = nextgcore_ngap_gen::decode_contained::<
+                    ngap_gen::PDUSessionResourceReleaseCommandTransfer,
+                >(&new)
+                .expect("decode");
+                assert_eq!(
+                    back.cause,
+                    generated_cause(cause),
+                    "group {group} value {value}"
+                );
+                compared += 1;
+            }
+        }
+        assert_eq!(compared, 5 * 47);
+    }
+
+    /// A PDU Session Resource Release Response built by the hand-written
+    /// encoder.
+    pub(crate) fn release_response(amf: u64, ran: u32, released: &[(u8, Vec<u8>)]) -> Vec<u8> {
+        nextgcore_ngap::builder::build_pdu_session_resource_release_response(
+            &PduSessionResourceReleaseResponse {
+                amf_ue_ngap_id: amf,
+                ran_ue_ngap_id: ran,
+                released_list: released
+                    .iter()
+                    .map(|(psi, transfer)| PduSessionResourceReleasedItem {
+                        pdu_session_id: *psi,
+                        transfer: transfer.clone(),
+                    })
+                    .collect(),
+            },
+        )
+        .expect("encode")
+    }
+
+    /// A PDU Session Resource Release Response built by the generated encoder
+    /// from `ies`. Every IE of the response has criticality ignore (§9.2.1.4).
+    pub(crate) fn generated_release_response(
+        ies: Vec<ngap_gen::PDUSessionResourceReleaseResponseProtocolIEs_EntryValue>,
+    ) -> Vec<u8> {
+        use ngap_gen::PDUSessionResourceReleaseResponseProtocolIEs_EntryValue as Ie;
+        let entries = ies
+            .into_iter()
+            .map(|value| {
+                let id = match &value {
+                    Ie::Id_AMF_UE_NGAP_ID(_) => ngap_gen::ID_AMF_UE_NGAP_ID,
+                    Ie::Id_RAN_UE_NGAP_ID(_) => ngap_gen::ID_RAN_UE_NGAP_ID,
+                    Ie::Id_PDUSessionResourceReleasedListRelRes(_) => {
+                        ngap_gen::ID_PDU_SESSION_RESOURCE_RELEASED_LIST_REL_RES
+                    }
+                    Ie::Id_UserLocationInformation(_) => ngap_gen::ID_USER_LOCATION_INFORMATION,
+                    Ie::Id_CriticalityDiagnostics(_) => ngap_gen::ID_CRITICALITY_DIAGNOSTICS,
+                };
+                ngap_gen::PDUSessionResourceReleaseResponseProtocolIEs_Entry {
+                    id: ngap_gen::ProtocolIE_ID(id),
+                    criticality: ngap_gen::Criticality(ngap_gen::Criticality::IGNORE),
+                    value,
+                }
+            })
+            .collect();
+        nextgcore_ngap_gen::encode(&ngap_gen::NGAP_PDU::SuccessfulOutcome(
+            ngap_gen::SuccessfulOutcome {
+                procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_PDU_SESSION_RESOURCE_RELEASE),
+                criticality: ngap_gen::Criticality(ngap_gen::Criticality::REJECT),
+                value: ngap_gen::SuccessfulOutcomeValue::Id_PDUSessionResourceRelease(
+                    ngap_gen::PDUSessionResourceReleaseResponse {
+                        protocol_i_es: ngap_gen::PDUSessionResourceReleaseResponseProtocolIEs(
+                            entries,
+                        ),
+                    },
+                ),
+            },
+        ))
+        .expect("encode")
+    }
+
+    /// The generated released list for `released`.
+    pub(crate) fn generated_released_list(
+        released: &[(u8, Vec<u8>)],
+    ) -> ngap_gen::PDUSessionResourceReleaseResponseProtocolIEs_EntryValue {
+        ngap_gen::PDUSessionResourceReleaseResponseProtocolIEs_EntryValue::Id_PDUSessionResourceReleasedListRelRes(
+            ngap_gen::PDUSessionResourceReleasedListRelRes(
+                released
+                    .iter()
+                    .map(|(psi, transfer)| ngap_gen::PDUSessionResourceReleasedItemRelRes {
+                        pdu_session_id: ngap_gen::PDUSessionID(*psi),
+                        pdu_session_resource_release_response_transfer:
+                            ngap_gen::PDUSessionResourceReleasedItemRelResPDUSessionResourceReleaseResponseTransfer(
+                                transfer.clone(),
+                            ),
+                        ie_extensions: None,
+                    })
+                    .collect(),
+            ),
+        )
+    }
+
+    /// The new decode flattened to what the hand-written path could say. A
+    /// response the old parser accepted always names both IDs, so a missing
+    /// one here is `None` too.
+    fn generated_response_view(data: &[u8]) -> Option<(u64, u32, Vec<(u8, Vec<u8>)>)> {
+        match decode_pdu_session_resource_release_response_asn1(data) {
+            PduSessionResourceReleaseResponseDecode::Released {
+                amf_ue_ngap_id: Some(amf),
+                ran_ue_ngap_id: Some(ran),
+                released,
+                ..
+            } => Some((
+                amf,
+                ran,
+                released
+                    .into_iter()
+                    .map(|r| (r.pdu_session_id, r.transfer))
+                    .collect(),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Release Response Transfers at every length determinant boundary of an
+    /// unconstrained OCTET STRING -- empty, short form, 127/128, and past the
+    /// one-octet form -- with the genuine one-zero-octet encoding of a bare
+    /// PDUSessionResourceReleaseResponseTransfer among them.
+    fn response_transfers() -> Vec<Vec<u8>> {
+        vec![
+            vec![],
+            vec![0x00],
+            vec![0x31],
+            vec![0xab; 127],
+            vec![0xcd; 128],
+            vec![0xef; 300],
+        ]
+    }
+
+    /// #417 stage 5: for every Release Response the hand-written parser
+    /// accepted -- every ID length, lists of 1, 2 and 256 sessions, every
+    /// transfer length form, a not-comprehended IE marked ignore or notify,
+    /// and the optional User Location Information and Criticality Diagnostics
+    /// it skipped as unknown -- the generated decode names the same UE and the
+    /// same sessions with the same transfer octets; what it refused as
+    /// malformed, or over a not-comprehended IE marked reject, still yields
+    /// nothing to relay.
+    #[test]
+    fn pdu_session_resource_release_response_generated_decode_matches_hand_written() {
+        use ngap_gen::PDUSessionResourceReleaseResponseProtocolIEs_EntryValue as Ie;
+        let mut corpus = Vec::new();
+        for amf in &AMF_IDS[..AMF_IDS.len() - 1] {
+            for ran in RAN_IDS {
+                corpus.push(release_response(*amf, ran, &[(5, vec![0x00])]));
+            }
+        }
+        for transfer in response_transfers() {
+            corpus.push(release_response(7, 9, &[(3, transfer.clone())]));
+            corpus.push(release_response(
+                7,
+                9,
+                &[(3, transfer.clone()), (4, vec![0x00])],
+            ));
+        }
+        let all: Vec<(u8, Vec<u8>)> = (0..=255u8).map(|psi| (psi, vec![psi])).collect();
+        corpus.push(release_response(7, 9, &all));
+        let base = release_response(7, 9, &[(5, vec![0x00])]);
+        for criticality in [0x40, 0x80] {
+            corpus.push(with_unknown_ie(&base, 9999, criticality));
+        }
+        let uli = ngap_gen::UserLocationInformation::UserLocationInformationNR(
+            ngap_gen::UserLocationInformationNR {
+                nr_cgi: ngap_gen::NR_CGI {
+                    plmn_identity: ngap_gen::PLMNIdentity(vec![0x99, 0xf9, 0x07]),
+                    nr_cell_identity: ngap_gen::NRCellIdentity(low_bits(0x12345, 36)),
+                    ie_extensions: None,
+                },
+                tai: ngap_gen::TAI {
+                    plmn_identity: ngap_gen::PLMNIdentity(vec![0x99, 0xf9, 0x07]),
+                    tac: ngap_gen::TAC(vec![0x00, 0x00, 0x01]),
+                    ie_extensions: None,
+                },
+                time_stamp: None,
+                ie_extensions: None,
+            },
+        );
+        corpus.push(generated_release_response(vec![
+            Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(7)),
+            Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(9)),
+            generated_released_list(&[(5, vec![0x00])]),
+            Ie::Id_UserLocationInformation(uli),
+            Ie::Id_CriticalityDiagnostics(generated_criticality_diagnostics(&[IeDiagnostic {
+                ie_id: 9999,
+                criticality: ngap_gen::Criticality::IGNORE,
+                type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+            }])),
+        ]));
+        for data in &corpus {
+            let old = hand_written_parse_pdu_session_resource_release_response(data);
+            assert!(
+                old.is_some(),
+                "the corpus holds accepted messages: {data:02x?}"
+            );
+            assert_eq!(generated_response_view(data), old, "{data:02x?}");
+        }
+        assert_eq!(corpus.len(), 11 * 8 + 6 * 2 + 1 + 2 + 1);
+
+        let refused = [
+            base[..base.len() - 1].to_vec(),
+            with_unknown_ie(&base, 9999, 0x00),
+        ];
+        for data in &refused {
+            assert_eq!(
+                hand_written_parse_pdu_session_resource_release_response(data),
+                None
+            );
+            assert_eq!(generated_response_view(data), None, "{data:02x?}");
+        }
+        assert!(matches!(
+            decode_pdu_session_resource_release_response_asn1(&refused[1]),
+            PduSessionResourceReleaseResponseDecode::Failed(ref d) if d[0].ie_id == 9999
+        ));
+    }
+
+    /// A Release Response is a response, so §10.3.4.2 reports a "notify" IE in
+    /// an Error Indication -- Procedure Code 28, Triggering Message
+    /// successful-outcome, Procedure Criticality as received -- and the
+    /// sessions are released all the same.
+    #[test]
+    fn a_release_response_notify_ie_is_reported_in_an_error_indication() {
+        let data = with_unknown_ie(&release_response(7, 9, &[(5, vec![0x00])]), 9999, 0x80);
+        let PduSessionResourceReleaseResponseDecode::Released {
+            amf_ue_ngap_id: Some(7),
+            ran_ue_ngap_id: Some(9),
+            released,
+            error_indication: Some(report),
+        } = decode_pdu_session_resource_release_response_asn1(&data)
+        else {
+            panic!("expected Released with an Error Indication");
+        };
+        assert_eq!(
+            released,
+            vec![ReleasedPduSession {
+                pdu_session_id: 5,
+                transfer: vec![0x00]
+            }]
+        );
+        assert_eq!(
+            report.procedure,
+            ReportedProcedure {
+                procedure_code: 28,
+                triggering_message: ngap_gen::TriggeringMessage::SUCCESSFUL_OUTCOME,
+                procedure_criticality: ngap_gen::Criticality::REJECT,
+            }
+        );
+        assert_eq!(
+            report.cause_protocol,
+            ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY
+        );
+        assert_eq!(
+            (report.amf_ue_ngap_id, report.ran_ue_ngap_id),
+            (Some(7), Some(9))
+        );
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].ie_id, 9999);
+        assert_eq!(
+            report.diagnostics[0].criticality,
+            ngap_gen::Criticality::NOTIFY
+        );
+        // An "ignore" IE is dropped without a report.
+        let ignored = with_unknown_ie(&release_response(7, 9, &[(5, vec![0x00])]), 9999, 0x40);
+        assert!(matches!(
+            decode_pdu_session_resource_release_response_asn1(&ignored),
+            PduSessionResourceReleaseResponseDecode::Released {
+                error_indication: None,
+                ..
+            }
+        ));
+    }
+
+    /// Responses the hand-written parser refused although every IE of a
+    /// Release Response has criticality ignore (§9.2.1.4), so a missing one is
+    /// ignored (§10.3.5): one with no RAN UE NGAP ID still releases its
+    /// sessions, and one with no AMF UE NGAP ID decodes with `None` -- which
+    /// the handler then cannot relay, since that ID is what names the UE.
+    #[test]
+    fn release_responses_missing_an_id_are_no_longer_refused() {
+        use ngap_gen::PDUSessionResourceReleaseResponseProtocolIEs_EntryValue as Ie;
+        let no_ran_id = generated_release_response(vec![
+            Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(7)),
+            generated_released_list(&[(5, vec![0x00])]),
+        ]);
+        assert_eq!(
+            hand_written_parse_pdu_session_resource_release_response(&no_ran_id),
+            None
+        );
+        let PduSessionResourceReleaseResponseDecode::Released {
+            amf_ue_ngap_id: Some(7),
+            ran_ue_ngap_id: None,
+            released,
+            error_indication: None,
+        } = decode_pdu_session_resource_release_response_asn1(&no_ran_id)
+        else {
+            panic!("expected Released without a RAN UE NGAP ID");
+        };
+        assert_eq!(released.len(), 1);
+
+        let no_amf_id = generated_release_response(vec![
+            Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(9)),
+            generated_released_list(&[(5, vec![0x00])]),
+        ]);
+        assert_eq!(
+            hand_written_parse_pdu_session_resource_release_response(&no_amf_id),
+            None
+        );
+        assert!(matches!(
+            decode_pdu_session_resource_release_response_asn1(&no_amf_id),
+            PduSessionResourceReleaseResponseDecode::Released {
+                amf_ue_ngap_id: None,
+                ran_ue_ngap_id: Some(9),
+                ..
+            }
+        ));
+    }
+
+    /// `base` with the value of its protocol IE `id` replaced by `value`,
+    /// re-encoded by the hand-written PER layer -- for wire forms neither
+    /// encoder produces.
+    fn with_ie_value(base: &[u8], id: u16, value: Vec<u8>) -> Vec<u8> {
+        use nextgcore_asn1c::ngap::pdu::{NgapPdu, SuccessfulOutcomeValue};
+        use nextgcore_asn1c::per::{AperDecode, AperDecoder, AperEncode, AperEncoder};
+        let mut decoder = AperDecoder::new(base);
+        let mut pdu = NgapPdu::decode_aper(&mut decoder).expect("decode");
+        let NgapPdu::SuccessfulOutcome(ref mut msg) = pdu else {
+            panic!("successfulOutcome");
+        };
+        let container = match &mut msg.value {
+            SuccessfulOutcomeValue::PduSessionResourceReleaseResponse(c)
+            | SuccessfulOutcomeValue::Other(c) => c,
+            other => panic!("unexpected {other:?}"),
+        };
+        let field = container
+            .ies
+            .iter_mut()
+            .find(|f| f.id.0 == id)
+            .expect("IE present");
+        field.value = value;
+        let mut encoder = AperEncoder::new();
+        pdu.encode_aper(&mut encoder).expect("encode");
+        encoder.align();
+        encoder.into_bytes().to_vec()
+    }
+
+    /// A released item carrying an iE-Extensions container -- one entry, id 9,
+    /// criticality reject -- in its real wire form, followed by a second plain
+    /// item (PSI 6). Its extension object set is empty, so the forked codec
+    /// decodes the entry as zero bits (nextgsim #218) and reads the rest of the
+    /// list from the wrong offset: here it returns a session 9 the gNB never
+    /// named and drops session 6. The decode refuses the message instead. The
+    /// hand-written parser never read the presence bit, so it misread the list
+    /// as well -- as sessions 5 and 0 -- and the handler relayed what it said.
+    #[test]
+    fn a_released_item_with_ie_extensions_is_refused_not_misparsed() {
+        let base = release_response(7, 9, &[(5, vec![0x00])]);
+        // SIZE(1..256) count-1 = 1. Item 1: extension bit 0, iE-Extensions
+        // present 1, padding; PSI 5; transfer length 1, 0x00; container count-1
+        // = 0 on 16 bits; ProtocolExtensionID 9; criticality reject (00) and
+        // padding; open type length 1, 0x00. Item 2: both bits 0, padding; PSI
+        // 6; transfer length 1, 0x00.
+        let list = vec![
+            0x01, 0x40, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x09, 0x00, 0x01, 0x00, 0x00, 0x06,
+            0x01, 0x00,
+        ];
+        let data = with_ie_value(
+            &base,
+            ngap_gen::ID_PDU_SESSION_RESOURCE_RELEASED_LIST_REL_RES,
+            list,
+        );
+        assert!(matches!(
+            decode_pdu_session_resource_release_response_asn1(&data),
+            PduSessionResourceReleaseResponseDecode::Undecodable
+        ));
+        assert_eq!(
+            hand_written_parse_pdu_session_resource_release_response(&data),
+            Some((7, 9, vec![(5, vec![0x00]), (0, vec![])])),
+            "the old parser's misread"
+        );
+        // The same splice without the extension decodes, so it is the
+        // extension the decode refuses, not the splicing.
+        let plain = with_ie_value(
+            &base,
+            ngap_gen::ID_PDU_SESSION_RESOURCE_RELEASED_LIST_REL_RES,
+            vec![0x01, 0x00, 0x05, 0x01, 0x00, 0x00, 0x06, 0x01, 0x00],
+        );
+        assert_eq!(
+            generated_response_view(&plain),
+            Some((7, 9, vec![(5, vec![0x00]), (6, vec![0x00])]))
+        );
+        assert_eq!(
+            hand_written_parse_pdu_session_resource_release_response(&plain),
+            Some((7, 9, vec![(5, vec![0x00]), (6, vec![0x00])]))
+        );
+    }
 }
