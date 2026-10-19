@@ -772,8 +772,18 @@ mod tests {
         use nextgcore_asn1c::ngap::types::ProcedureCode;
 
         let mut container = ProtocolIeContainer::new();
-        ie::encode_amf_ue_ngap_id(&mut container, 10).unwrap();
-        ie::encode_ran_ue_ngap_id(&mut container, 20).unwrap();
+        ie::encode_amf_ue_ngap_id(
+            &mut container,
+            10,
+            nextgcore_asn1c::ngap::Criticality::Reject,
+        )
+        .unwrap();
+        ie::encode_ran_ue_ngap_id(
+            &mut container,
+            20,
+            nextgcore_asn1c::ngap::Criticality::Reject,
+        )
+        .unwrap();
         let bytes = encode_initiating_pdu(
             ProcedureCode::PDU_SESSION_RESOURCE_MODIFY_INDICATION,
             container,
@@ -893,8 +903,18 @@ mod tests {
         use nextgcore_asn1c::ngap::types::ProcedureCode;
 
         let mut container = ProtocolIeContainer::new();
-        ie::encode_amf_ue_ngap_id(&mut container, 5).unwrap();
-        ie::encode_ran_ue_ngap_id(&mut container, 6).unwrap();
+        ie::encode_amf_ue_ngap_id(
+            &mut container,
+            5,
+            nextgcore_asn1c::ngap::Criticality::Reject,
+        )
+        .unwrap();
+        ie::encode_ran_ue_ngap_id(
+            &mut container,
+            6,
+            nextgcore_asn1c::ngap::Criticality::Reject,
+        )
+        .unwrap();
         ie::encode_cause(
             &mut container,
             &Cause::RadioNetwork(CauseRadioNetwork::RadioConnectionWithUeLost),
@@ -1067,7 +1087,6 @@ mod tests {
         let msg = types::PathSwitchRequestFailure {
             amf_ue_ngap_id: 11,
             ran_ue_ngap_id: 22,
-            cause: Cause::RadioNetwork(CauseRadioNetwork::UnknownPduSessionId),
             released_list: Some(vec![types::PduSessionResourceReleasedItem {
                 pdu_session_id: 1,
                 transfer: vec![0x88],
@@ -1078,10 +1097,6 @@ mod tests {
         let bytes = builder::build_path_switch_request_failure(&msg).unwrap();
         match parser::decode_ngap_pdu(&bytes).unwrap() {
             NgapMessage::PathSwitchRequestFailure(failure) => {
-                assert_eq!(
-                    failure.cause,
-                    Cause::RadioNetwork(CauseRadioNetwork::UnknownPduSessionId)
-                );
                 let released = failure.released_list.expect("released list expected");
                 assert_eq!(released[0].transfer, vec![0x88]);
             }

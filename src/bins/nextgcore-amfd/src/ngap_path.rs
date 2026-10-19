@@ -7946,7 +7946,7 @@ impl NgapServer {
             amf_ue_ngap_id: ack.amf_ue_ngap_id,
             ran_ue_ngap_id,
             handover_type,
-            nas_pdu: None,
+            nas_security_parameters_from_ngran: None,
             pdu_session_list: ack
                 .admitted_list
                 .iter()
@@ -8443,9 +8443,6 @@ impl NgapServer {
             let failure = nextgcore_ngap::types::PathSwitchRequestFailure {
                 amf_ue_ngap_id,
                 ran_ue_ngap_id: req.ran_ue_ngap_id,
-                cause: nextgcore_ngap::types::Cause::RadioNetwork(
-                    nextgcore_asn1c::ngap::cause::CauseRadioNetwork::UnknownLocalUeNgapId,
-                ),
                 released_list: None,
                 criticality_diagnostics: None,
             };
@@ -8579,9 +8576,6 @@ impl NgapServer {
                 let failure = nextgcore_ngap::types::PathSwitchRequestFailure {
                     amf_ue_ngap_id,
                     ran_ue_ngap_id: req.ran_ue_ngap_id,
-                    cause: nextgcore_ngap::types::Cause::Protocol(
-                        nextgcore_asn1c::ngap::cause::CauseProtocol::Unspecified,
-                    ),
                     released_list: None,
                     criticality_diagnostics: None,
                 };

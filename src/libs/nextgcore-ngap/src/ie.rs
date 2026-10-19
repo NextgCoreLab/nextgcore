@@ -87,10 +87,17 @@ pub(crate) fn handle_unknown_ie(field: &ProtocolIeField) -> NgapResult<()> {
 // AMF-UE-NGAP-ID IE
 // ============================================================================
 
-pub fn encode_amf_ue_ngap_id(container: &mut ProtocolIeContainer, id: u64) -> NgapResult<()> {
+/// `criticality` is per message: the AMF-UE-NGAP-ID IE is `reject` in most
+/// initiating messages and `ignore` in most responses and failures (TS 38.413
+/// §9.2 object sets), so the caller passes the value its message's set gives.
+pub fn encode_amf_ue_ngap_id(
+    container: &mut ProtocolIeContainer,
+    id: u64,
+    criticality: Criticality,
+) -> NgapResult<()> {
     container.push(make_ie_field(
         ProtocolIeId::AMF_UE_NGAP_ID,
-        Criticality::Reject,
+        criticality,
         &AmfUeNgapId(id),
     )?);
     Ok(())
@@ -105,10 +112,15 @@ pub fn decode_amf_ue_ngap_id(field: &ProtocolIeField) -> NgapResult<u64> {
 // RAN-UE-NGAP-ID IE
 // ============================================================================
 
-pub fn encode_ran_ue_ngap_id(container: &mut ProtocolIeContainer, id: u32) -> NgapResult<()> {
+/// `criticality` is per message, as for [`encode_amf_ue_ngap_id`].
+pub fn encode_ran_ue_ngap_id(
+    container: &mut ProtocolIeContainer,
+    id: u32,
+    criticality: Criticality,
+) -> NgapResult<()> {
     container.push(make_ie_field(
         ProtocolIeId::RAN_UE_NGAP_ID,
-        Criticality::Reject,
+        criticality,
         &RanUeNgapId(id),
     )?);
     Ok(())
@@ -123,10 +135,17 @@ pub fn decode_ran_ue_ngap_id(field: &ProtocolIeField) -> NgapResult<u32> {
 // NAS-PDU IE
 // ============================================================================
 
-pub fn encode_nas_pdu(container: &mut ProtocolIeContainer, pdu: &[u8]) -> NgapResult<()> {
+/// `criticality` is per message: NAS-PDU is `reject` in DL/UL NAS Transport and
+/// Initial UE Message but `ignore` in e.g. Initial Context Setup Request, PDU
+/// Session Resource Release Command and NAS Non Delivery Indication.
+pub fn encode_nas_pdu(
+    container: &mut ProtocolIeContainer,
+    pdu: &[u8],
+    criticality: Criticality,
+) -> NgapResult<()> {
     container.push(make_ie_field(
         ProtocolIeId::NAS_PDU,
-        Criticality::Reject,
+        criticality,
         &NasPdu(pdu.to_vec()),
     )?);
     Ok(())
@@ -232,6 +251,10 @@ pub const IE_ID_PDU_SESSION_RESOURCE_MODIFY_LIST_MOD_REQ: u16 = 64;
 pub const IE_ID_PDU_SESSION_RESOURCE_MODIFY_LIST_MOD_RES: u16 = 65;
 pub const IE_ID_PDU_SESSION_RESOURCE_FAILED_TO_MODIFY_LIST_MOD_RES: u16 = 54;
 pub const IE_ID_PDU_SESSION_RESOURCE_TO_RELEASE_LIST_REL_CMD: u16 = 79;
+/// id-PDUSessionResourceToReleaseListHOCmd (Handover Command, criticality ignore).
+pub const IE_ID_PDU_SESSION_RESOURCE_TO_RELEASE_LIST_HO_CMD: u16 = 78;
+/// id-NASSecurityParametersFromNGRAN (Handover Command, criticality reject).
+pub const IE_ID_NAS_SECURITY_PARAMETERS_FROM_NGRAN: u16 = 39;
 pub const IE_ID_PDU_SESSION_RESOURCE_RELEASED_LIST_REL_RES: u16 = 70;
 pub const IE_ID_UE_NGAP_IDS: u16 = 114;
 pub const IE_ID_USER_LOCATION_INFORMATION: u16 = 121;
@@ -257,7 +280,9 @@ pub const IE_ID_PDU_SESSION_RESOURCE_SETUP_LIST_HO_REQ: u16 = 73;
 pub const IE_ID_PDU_SESSION_RESOURCE_ADMITTED_LIST: u16 = 53;
 pub const IE_ID_PDU_SESSION_RESOURCE_HANDOVER_LIST: u16 = 59;
 /// TrafficLoadReductionIndication (TS 38.413 §9.3.1.99), carried in OverloadStart.
-pub const IE_ID_TRAFFIC_LOAD_REDUCTION_INDICATION: u16 = 281;
+/// id-AMFTrafficLoadReductionIndication (TS 38.413 §9.3.6). Was 281, which is
+/// id-PduSessionExpectedUEActivityBehaviour.
+pub const IE_ID_TRAFFIC_LOAD_REDUCTION_INDICATION: u16 = 9;
 
 // AMFName / RANNodeName ::= PrintableString (SIZE(1..150, ...)) — TS 38.413 §9.3.3
 const NAME_SIZE_MIN: usize = 1;
@@ -357,6 +382,21 @@ pub fn decode_raw_octet_ie(field: &ProtocolIeField) -> NgapResult<Vec<u8>> {
     Ok(decoder.decode_octet_string(None, None)?)
 }
 
+/// Encode NASSecurityParametersFromNGRAN (`OCTET STRING`, TS 38.413 §9.3.3.30),
+/// the Handover Command IE that carries the NAS security parameters for an
+/// intra-5GC N2 handover with AMF change. It is NOT a NAS-PDU (id 38).
+pub fn encode_nas_security_parameters_from_ngran(
+    container: &mut ProtocolIeContainer,
+    data: &[u8],
+) -> NgapResult<()> {
+    encode_raw_octet_ie(
+        container,
+        IE_ID_NAS_SECURITY_PARAMETERS_FROM_NGRAN,
+        Criticality::Reject,
+        data,
+    )
+}
+
 /// `id-RANStatusTransfer-TransparentContainer` (TS 38.413: `ProtocolIE-ID ::=
 /// 84`, criticality `reject`).
 pub const IE_ID_RAN_STATUS_TRANSFER_TRANSPARENT_CONTAINER: u16 = 84;
@@ -391,17 +431,12 @@ pub fn decode_verbatim_ie(field: &ProtocolIeField) -> Vec<u8> {
 /// Encode a GUAMI to raw bytes for an IE
 pub fn encode_guami_ie(container: &mut ProtocolIeContainer, guami: &Guami) -> NgapResult<()> {
     let mut encoder = AperEncoder::new();
-    // GUAMI is a SEQUENCE: plmnIdentity, amfRegionID, amfSetID, amfPointer
-    // Extension bit (not present)
-    encoder.write_bit(false);
-    // PLMN Identity (3 bytes, fixed)
-    encoder.encode_octet_string(&guami.plmn_identity, Some(3), Some(3))?;
-    // AMF Region ID (8 bits, fixed BIT STRING)
-    encoder.write_bits(guami.amf_region_id as u64, 8);
-    // AMF Set ID (10 bits, fixed BIT STRING)
-    encoder.write_bits(guami.amf_set_id as u64, 10);
-    // AMF Pointer (6 bits, fixed BIT STRING)
-    encoder.write_bits(guami.amf_pointer as u64, 6);
+    // GUAMI ::= SEQUENCE { pLMNIdentity, aMFRegionID, aMFSetID, aMFPointer,
+    // iE-Extensions OPTIONAL, ... }: an extension bit AND an iE-Extensions
+    // presence bit precede the PLMN. This used to write only the extension bit;
+    // the bytes matched solely because both bits are 0 and fall into the padding
+    // before the octet-aligned PLMN.
+    encode_guami_inline(&mut encoder, guami)?;
     encoder.align();
     container.push(ProtocolIeField {
         id: ProtocolIeId(IE_ID_GUAMI),
@@ -413,26 +448,11 @@ pub fn encode_guami_ie(container: &mut ProtocolIeContainer, guami: &Guami) -> Ng
 
 /// Decode GUAMI from an IE field
 pub fn decode_guami_ie(field: &ProtocolIeField) -> NgapResult<Guami> {
+    // Shares the inline decoder, which reads the iE-Extensions presence bit too.
+    // A present extension container is left unread: it follows aMFPointer and
+    // nothing else in this IE value comes after it.
     let mut decoder = AperDecoder::new(&field.value);
-    // Extension bit
-    let _ext = decoder.read_bit()?;
-    // PLMN Identity (3 bytes)
-    let plmn_bytes = decoder.decode_octet_string(Some(3), Some(3))?;
-    let mut plmn_identity = [0u8; 3];
-    plmn_identity.copy_from_slice(&plmn_bytes);
-    // AMF Region ID (8 bits)
-    let amf_region_id = decoder.read_bits(8)? as u8;
-    // AMF Set ID (10 bits)
-    let amf_set_id = decoder.read_bits(10)? as u16;
-    // AMF Pointer (6 bits)
-    let amf_pointer = decoder.read_bits(6)? as u8;
-
-    Ok(Guami {
-        plmn_identity,
-        amf_region_id,
-        amf_set_id,
-        amf_pointer,
-    })
+    decode_guami_inline(&mut decoder)
 }
 
 /// Encode Served GUAMI List IE
@@ -524,9 +544,13 @@ pub fn encode_allowed_nssai(
 }
 
 /// Encode UE Security Capabilities IE
+///
+/// `criticality` is per message: `reject` in Initial Context Setup Request and
+/// Handover Request, `ignore` in Path Switch Request.
 pub fn encode_ue_security_capabilities(
     container: &mut ProtocolIeContainer,
     caps: &UeSecurityCapabilities,
+    criticality: Criticality,
 ) -> NgapResult<()> {
     let mut encoder = AperEncoder::new();
     // UESecurityCapabilities SEQUENCE { nRencryptionAlgorithms, nRintegrityProtectionAlgorithms,
@@ -549,7 +573,7 @@ pub fn encode_ue_security_capabilities(
     encoder.align();
     container.push(ProtocolIeField {
         id: ProtocolIeId(IE_ID_UE_SECURITY_CAPABILITIES),
-        criticality: Criticality::Reject,
+        criticality,
         value: encoder.into_bytes().to_vec(),
     });
     Ok(())
@@ -688,16 +712,20 @@ pub fn decode_traffic_load_reduction(field: &ProtocolIeField) -> NgapResult<u8> 
 }
 
 /// Encode Global RAN Node ID IE
+///
+/// `criticality` is per message: `reject` in NG Setup Request, `ignore` in RAN
+/// Configuration Update.
 pub fn encode_global_ran_node_id(
     container: &mut ProtocolIeContainer,
     id: &GlobalRanNodeId,
+    criticality: Criticality,
 ) -> NgapResult<()> {
     let mut encoder = AperEncoder::new();
     encode_global_ran_node_id_into(&mut encoder, id)?;
     encoder.align();
     container.push(ProtocolIeField {
         id: ProtocolIeId(IE_ID_GLOBAL_RAN_NODE_ID),
-        criticality: Criticality::Reject,
+        criticality,
         value: encoder.into_bytes().to_vec(),
     });
     Ok(())
@@ -940,9 +968,13 @@ pub fn decode_default_paging_drx(field: &ProtocolIeField) -> NgapResult<PagingDr
 }
 
 /// Encode User Location Information IE
+///
+/// `criticality` is per message: `reject` in Initial UE Message, `ignore` in
+/// Uplink NAS Transport, Path Switch Request and the other carriers.
 pub fn encode_user_location_info(
     container: &mut ProtocolIeContainer,
     info: &UserLocationInformation,
+    criticality: Criticality,
 ) -> NgapResult<()> {
     let mut encoder = AperEncoder::new();
     match info {
@@ -976,7 +1008,7 @@ pub fn encode_user_location_info(
     encoder.align();
     container.push(ProtocolIeField {
         id: ProtocolIeId(IE_ID_USER_LOCATION_INFORMATION),
-        criticality: Criticality::Ignore,
+        criticality,
         value: encoder.into_bytes().to_vec(),
     });
     Ok(())
@@ -1346,8 +1378,15 @@ pub fn encode_pdu_session_failed_list(
 }
 
 /// Encode PDU Session Resource to Release List
+///
+/// The same `{ pDUSessionID, transfer }` item list is carried under two IEs:
+/// PDUSessionResourceToReleaseListRelCmd (id 79, `reject`) in PDU Session
+/// Resource Release Command, and PDUSessionResourceToReleaseListHOCmd (id 78,
+/// `ignore`) in Handover Command, so the caller passes both.
 pub fn encode_pdu_session_release_list(
     container: &mut ProtocolIeContainer,
+    ie_id: u16,
+    criticality: Criticality,
     list: &[PduSessionResourceReleaseItem],
 ) -> NgapResult<()> {
     let mut encoder = AperEncoder::new();
@@ -1361,8 +1400,8 @@ pub fn encode_pdu_session_release_list(
     }
     encoder.align();
     container.push(ProtocolIeField {
-        id: ProtocolIeId(IE_ID_PDU_SESSION_RESOURCE_TO_RELEASE_LIST_REL_CMD),
-        criticality: Criticality::Reject,
+        id: ProtocolIeId(ie_id),
+        criticality,
         value: encoder.into_bytes().to_vec(),
     });
     Ok(())
@@ -1494,9 +1533,12 @@ pub const IE_ID_UE_PAGING_IDENTITY: u16 = 115;
 pub const IE_ID_PAGING_DRX: u16 = 50;
 pub const IE_ID_TAI_LIST_FOR_PAGING: u16 = 103;
 pub const IE_ID_PAGING_PRIORITY: u16 = 52;
-pub const IE_ID_UE_RADIO_CAPABILITY_FOR_PAGING: u16 = 119;
-pub const IE_ID_PAGING_ORIGIN: u16 = 64;
-pub const IE_ID_ASSISTANCE_DATA_FOR_PAGING: u16 = 2;
+/// id-UERadioCapabilityForPaging. Was 119, which is id-UESecurityCapabilities.
+pub const IE_ID_UE_RADIO_CAPABILITY_FOR_PAGING: u16 = 118;
+/// id-PagingOrigin. Was 64, which is id-PDUSessionResourceModifyListModReq.
+pub const IE_ID_PAGING_ORIGIN: u16 = 51;
+/// id-AssistanceDataForPaging. Was 2, which is id-AMFOverloadResponse.
+pub const IE_ID_ASSISTANCE_DATA_FOR_PAGING: u16 = 11;
 
 /// Encode TargetID IE
 pub fn encode_target_id(
@@ -1583,16 +1625,20 @@ pub struct MulticastGroupPagingArea {
 ///
 /// The value is the shared `MbsSessionId` APER encoder from `mbs_transfer`, so
 /// the AMF and the MB-SMF cannot drift apart on TMGI layout.
+///
+/// `criticality` is per message: `reject` in the Multicast Session
+/// Activation/Deactivation Requests, `ignore` in Multicast Group Paging.
 pub fn encode_mbs_session_id(
     container: &mut ProtocolIeContainer,
     mbs_session_id: &crate::mbs_transfer::MbsSessionId,
+    criticality: Criticality,
 ) -> NgapResult<()> {
     let mut encoder = AperEncoder::new();
     mbs_session_id.encode(&mut encoder)?;
     encoder.align();
     container.push(ProtocolIeField {
         id: ProtocolIeId(IE_ID_MBS_SESSION_ID),
-        criticality: Criticality::Reject,
+        criticality,
         value: encoder.into_bytes().to_vec(),
     });
     Ok(())
@@ -1757,7 +1803,11 @@ pub fn encode_security_context(
                               // nextHopChainingCount INTEGER (0..7)
     let constraint = nextgcore_asn1c::per::Constraint::new(0, 7);
     encoder.encode_constrained_whole_number(ctx.next_hop_chaining_count as i64, &constraint)?;
-    // nextHopNH BIT STRING (SIZE(256))
+    // nextHopNH SecurityKey ::= BIT STRING (SIZE(256)). A fixed-size BIT STRING
+    // longer than 16 bits is octet-aligned in APER (X.691 §16.10); this used to
+    // be written straight after the 3-bit count, so a conformant peer read every
+    // key octet shifted by three bits.
+    encoder.align();
     for byte in &ctx.next_hop {
         encoder.write_bits(*byte as u64, 8);
     }
@@ -1954,7 +2004,8 @@ pub fn encode_pdu_session_handover_list(
     encode_id_transfer_list_ie(
         container,
         IE_ID_PDU_SESSION_RESOURCE_HANDOVER_LIST,
-        Criticality::Reject,
+        // HandoverCommandIEs: ignore (TS 38.413 §9.2.3.2).
+        Criticality::Ignore,
         list.iter()
             .map(|item| (item.pdu_session_id, item.transfer.as_slice())),
     )
@@ -2102,22 +2153,31 @@ pub fn encode_ue_paging_identity(
             amf_pointer,
             tmsi,
         } => {
-            encoder.encode_choice_index(0, 1, true)?;
-            // FiveG-S-TMSI SEQUENCE { aMFSetID, aMFPointer, fiveG-TMSI, iE-Extensions OPTIONAL }
+            // UEPagingIdentity ::= CHOICE { fiveG-S-TMSI, choice-Extensions } is
+            // NOT extensible: a 1-bit index over two alternatives. (This used to
+            // be written as an extensible one-alternative CHOICE -- the same
+            // single 0 bit, by coincidence.)
+            encoder.encode_choice_index(0, 2, false)?;
+            // FiveG-S-TMSI SEQUENCE { aMFSetID, aMFPointer, fiveG-TMSI, iE-Extensions OPTIONAL, ... }
             encoder.write_bit(false); // extension
             encoder.write_bit(false); // no iE-Extensions
                                       // AMFSetID BIT STRING (SIZE(10))
             encoder.write_bits(*amf_set_id as u64, 10);
             // AMFPointer BIT STRING (SIZE(6))
             encoder.write_bits(*amf_pointer as u64, 6);
-            // FiveG-TMSI BIT STRING (SIZE(32))
+            // FiveG-TMSI ::= OCTET STRING (SIZE(4)): fixed-size and longer than two
+            // octets, so octet-aligned in APER (X.691 §17.6). It used to follow the
+            // pointer unaligned, so a conformant gNB read every Paging's 5G-TMSI
+            // shifted by five bits -- paging a TMSI the UE does not hold.
+            encoder.align();
             encoder.write_bits(*tmsi as u64, 32);
         }
     }
     encoder.align();
     container.push(ProtocolIeField {
         id: ProtocolIeId(IE_ID_UE_PAGING_IDENTITY),
-        criticality: Criticality::Reject,
+        // PagingIEs: every IE is ignore (TS 38.413 §9.2.4.1).
+        criticality: Criticality::Ignore,
         value: encoder.into_bytes().to_vec(),
     });
     Ok(())
@@ -2151,7 +2211,8 @@ pub fn encode_tai_list_for_paging(
     encoder.align();
     container.push(ProtocolIeField {
         id: ProtocolIeId(IE_ID_TAI_LIST_FOR_PAGING),
-        criticality: Criticality::Reject,
+        // PagingIEs: every IE is ignore (TS 38.413 §9.2.4.1).
+        criticality: Criticality::Ignore,
         value: encoder.into_bytes().to_vec(),
     });
     Ok(())
@@ -2175,12 +2236,19 @@ pub fn encode_paging_priority(
     Ok(())
 }
 
-/// Encode UERadioCapabilityForPaging IE
+/// Encode UERadioCapabilityForPaging IE.
+///
+/// `radio_cap` is the **already APER-encoded** `UERadioCapabilityForPaging`
+/// value (`SEQUENCE { uERadioCapabilityForPagingOfNR OPTIONAL,
+/// uERadioCapabilityForPagingOfEUTRA OPTIONAL, iE-Extensions OPTIONAL, ... }`),
+/// placed verbatim. It used to be wrapped as a bare OCTET STRING, which is not
+/// that SEQUENCE: a conformant decoder read the length octet as the SEQUENCE's
+/// presence bitmap and misparsed the rest.
 pub fn encode_ue_radio_capability_for_paging(
     container: &mut ProtocolIeContainer,
     radio_cap: &[u8],
 ) -> NgapResult<()> {
-    encode_raw_octet_ie(
+    encode_verbatim_ie(
         container,
         IE_ID_UE_RADIO_CAPABILITY_FOR_PAGING,
         Criticality::Ignore,
@@ -2206,12 +2274,18 @@ pub fn encode_paging_origin(
     Ok(())
 }
 
-/// Encode AssistanceDataForPaging IE
+/// Encode AssistanceDataForPaging IE.
+///
+/// `assistance` is the **already APER-encoded** `AssistanceDataForPaging` value
+/// (`SEQUENCE { assistanceDataForRecommendedCells OPTIONAL,
+/// pagingAttemptInformation OPTIONAL, iE-Extensions OPTIONAL, ... }`), placed
+/// verbatim -- not wrapped as an OCTET STRING, for the reason given on
+/// [`encode_ue_radio_capability_for_paging`].
 pub fn encode_assistance_data_for_paging(
     container: &mut ProtocolIeContainer,
     assistance: &[u8],
 ) -> NgapResult<()> {
-    encode_raw_octet_ie(
+    encode_verbatim_ie(
         container,
         IE_ID_ASSISTANCE_DATA_FOR_PAGING,
         Criticality::Ignore,
@@ -2296,6 +2370,8 @@ pub fn decode_security_context(field: &ProtocolIeField) -> NgapResult<SecurityCo
     let _ie_ext = decoder.read_bit()?;
     let constraint = nextgcore_asn1c::per::Constraint::new(0, 7);
     let next_hop_chaining_count = decoder.decode_constrained_whole_number(&constraint)? as u8;
+    // Octet-aligned, mirroring `encode_security_context` (X.691 §16.10).
+    decoder.align();
     let mut next_hop = [0u8; 32];
     for byte in next_hop.iter_mut() {
         *byte = decoder.read_bits(8)? as u8;
@@ -2846,7 +2922,8 @@ pub fn encode_pdu_session_switched_list(
     encode_id_transfer_list_ie(
         container,
         IE_ID_PDU_SESSION_RESOURCE_SWITCHED_LIST,
-        Criticality::Reject,
+        // PathSwitchRequestAcknowledgeIEs: ignore (TS 38.413 §9.2.3.9).
+        Criticality::Ignore,
         list.iter()
             .map(|item| (item.pdu_session_id, item.transfer.as_slice())),
     )
@@ -2880,7 +2957,7 @@ mod global_ran_node_id_tests {
             gnb_id_len: 24,
         };
         let mut container = ProtocolIeContainer::new();
-        encode_global_ran_node_id(&mut container, &id).unwrap();
+        encode_global_ran_node_id(&mut container, &id, Criticality::Reject).unwrap();
         let bytes = &container.ies[0].value;
 
         // GlobalRANNodeID CHOICE: globalGNB-ID = index 0 over 4 non-extensible
@@ -2914,7 +2991,7 @@ mod global_ran_node_id_tests {
             ng_enb_id: 0x0ABCD, // 20-bit macroNgENB-ID
         };
         let mut container = ProtocolIeContainer::new();
-        encode_global_ran_node_id(&mut container, &id).unwrap();
+        encode_global_ran_node_id(&mut container, &id, Criticality::Reject).unwrap();
         let bytes = &container.ies[0].value;
         // globalNgENB-ID = index 1: top 2 bits "01" (== 1). With a spurious
         // leading extension bit this would read 0, so this proves it is gone.
