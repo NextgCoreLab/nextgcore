@@ -90,6 +90,11 @@ pub fn build_ng_setup_failure(msg: &NgSetupFailure) -> NgapResult<Vec<u8>> {
         ie::encode_time_to_wait(&mut container, ttw)?;
     }
 
+    // IE: CriticalityDiagnostics (optional, TS 38.413 Section 9.2.6.3)
+    if let Some(ref diag) = msg.criticality_diagnostics {
+        ie::encode_criticality_diagnostics(&mut container, diag)?;
+    }
+
     let pdu = NgapPdu::UnsuccessfulOutcome(UnsuccessfulOutcome {
         procedure_code: ProcedureCode::NG_SETUP,
         criticality: Criticality::Reject,
@@ -122,6 +127,12 @@ pub fn build_initial_ue_message(msg: &InitialUeMessage) -> NgapResult<Vec<u8>> {
     // IE: UEContextRequest (optional)
     if let Some(true) = msg.ue_context_request {
         ie::encode_ue_context_request(&mut container, true)?;
+    }
+
+    // IE: AllowedNSSAI (optional; follows UEContextRequest in the object set).
+    // An empty list means the IE is absent, as the parser reports it.
+    if !msg.allowed_nssai.is_empty() {
+        ie::encode_allowed_nssai(&mut container, &msg.allowed_nssai)?;
     }
 
     let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {

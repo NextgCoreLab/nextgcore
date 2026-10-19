@@ -108,3 +108,56 @@ fn allowed_nssai_does_not_disturb_mandatory_ies() {
         }
     }
 }
+
+/// #445 sweep: `build_initial_ue_message` silently dropped `allowed_nssai`, so a
+/// message decoded from the gNB and rebuilt lost IE 0. Rebuilding each capture
+/// from its decoded form must reproduce the gNB's bytes -- the nextgsim encoder
+/// is the independent oracle -- except for ONE known, separate divergence: the
+/// shared `ie::encode_user_location_info` always writes criticality `ignore`,
+/// which is right in every message but InitialUEMessage, where TS 38.413's
+/// `InitialUEMessage-IEs` gives UserLocationInformation (IE 121) criticality
+/// `reject`. That octet is pinned here so the test fails, and must be updated,
+/// when it is fixed.
+#[test]
+fn rebuilding_a_gnb_initial_ue_message_reproduces_its_bytes() {
+    for capture in [CAPTURE_WITHOUT_ALLOWED_NSSAI, CAPTURE_WITH_ALLOWED_NSSAI] {
+        let expected = unhex(capture);
+        let msg = decode_initial_ue(capture);
+        let rebuilt = nextgcore_ngap::builder::build_initial_ue_message(&msg)
+            .unwrap_or_else(|e| panic!("rebuild failed: {e:?}"));
+        assert_eq!(
+            rebuilt.len(),
+            expected.len(),
+            "rebuilt InitialUEMessage must have the capture's length (IE 0 dropped?)"
+        );
+        let diffs: Vec<(usize, u8, u8)> = expected
+            .iter()
+            .zip(&rebuilt)
+            .enumerate()
+            .filter(|(_, (e, r))| e != r)
+            .map(|(i, (e, r))| (i, *e, *r))
+            .collect();
+        // The ULI field header: id 0x0079 then the criticality octet.
+        let uli = expected
+            .windows(2)
+            .position(|w| w == [0x00, 0x79])
+            .expect("capture carries UserLocationInformation")
+            + 2;
+        assert_eq!(
+            diffs,
+            vec![(uli, 0x00, 0x40)],
+            "only the known ULI criticality octet may differ (reject on the wire, ignore rebuilt)"
+        );
+        assert_eq!(
+            decode_initial_ue(
+                &rebuilt
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            )
+            .allowed_nssai,
+            msg.allowed_nssai,
+            "AllowedNSSAI must survive the rebuild"
+        );
+    }
+}
