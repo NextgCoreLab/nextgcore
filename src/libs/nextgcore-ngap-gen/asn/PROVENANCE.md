@@ -4,7 +4,7 @@
 |---|---|
 | specification | 3GPP TS 38.413 (NGAP), Release 17, V17.9.0 |
 | copied from | `NextgCoreLab/nextgsim` `tools/ngap-17.9.asn` at `67a0d792b5b3990258ca0b3d7517dfdc17359e41` |
-| upstream history | added in nextgsim `77f4b04` (2026-01-04); no later commit touches it -- still byte-identical at `20495c01cf4f970e5d7f8a9d12b1a9cd77dfc13e`, the rev #417 stage 3 pins the compiler to |
+| upstream history | added in nextgsim `77f4b04` (2026-01-04); no later commit touches it -- still byte-identical at `6b97b4b5d913bd7d4619f2fc0128fc46c94050b9`, the rev the compiler is pinned to since nextgsim #218 / PR #219 (previously `20495c0`, before that `67a0d79`) |
 | lines | 12,004 |
 | sha256 | `cac6d7255af905913fb84cf8983ff60d945b5be3afbcb4b1aad46834baa534fd` |
 

@@ -145,16 +145,18 @@ rasn-derive = "0.18"
 # What bounds the cost: the compiler is a build-dependency only, so only
 # asn1-codecs and asn1_codecs_derive link into the artifact. The rev pin means
 # nextgsim's main can move, vendor/ refactors included, without touching this
-# build until someone bumps the rev deliberately. 20495c0 is nextgsim main
-# after #215/#216/#217, the fork fixes #417 stage 3 needs (SEQUENCE OF SIZE
-# enforced on encode, extension ENUMERATED values, opt-in skipping of unknown
-# IEs with their criticality). Unlike the previous pin 67a0d79 -- the nextgsim
-# half of validated pair run 36409112147 -- it is not yet part of a validated
-# pair. The vendor crates are not nextgsim workspace members; cargo finds them
+# build until someone bumps the rev deliberately. 6b97b4b is nextgsim main
+# after #215/#216/#217 (SEQUENCE OF SIZE enforced on encode, extension
+# ENUMERATED values, opt-in skipping of unknown IEs with their criticality,
+# needed from #417 stage 3) and #219 (an entry of an EMPTY extension object set
+# is a real open-type entry, not zero bits -- nextgsim #218 -- which let amfd
+# drop its iE-Extensions refusal guards). Like the previous pin 20495c0, and
+# unlike 67a0d79 -- the nextgsim half of validated pair run 36409112147 -- it
+# is not yet part of a validated pair. The vendor crates are not nextgsim workspace members; cargo finds them
 # by name in the clone.
-asn1-compiler = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "20495c01cf4f970e5d7f8a9d12b1a9cd77dfc13e" }
-asn1-codecs = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "20495c01cf4f970e5d7f8a9d12b1a9cd77dfc13e" }
-asn1_codecs_derive = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "20495c01cf4f970e5d7f8a9d12b1a9cd77dfc13e" }
+asn1-compiler = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "6b97b4b5d913bd7d4619f2fc0128fc46c94050b9" }
+asn1-codecs = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "6b97b4b5d913bd7d4619f2fc0128fc46c94050b9" }
+asn1_codecs_derive = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "6b97b4b5d913bd7d4619f2fc0128fc46c94050b9" }
 bitvec = "1"
 
 # Protocol libraries - using existing Rust crates where available
@@ -248,9 +250,9 @@ dead_code = "allow"
 # codec whose extended-CHOICE encoder still refuses. nextgsim's own Cargo.toml
 # patches the same three crates for the same reason.
 [patch.crates-io]
-asn1-compiler = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "20495c01cf4f970e5d7f8a9d12b1a9cd77dfc13e" }
-asn1-codecs = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "20495c01cf4f970e5d7f8a9d12b1a9cd77dfc13e" }
-asn1_codecs_derive = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "20495c01cf4f970e5d7f8a9d12b1a9cd77dfc13e" }
+asn1-compiler = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "6b97b4b5d913bd7d4619f2fc0128fc46c94050b9" }
+asn1-codecs = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "6b97b4b5d913bd7d4619f2fc0128fc46c94050b9" }
+asn1_codecs_derive = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "6b97b4b5d913bd7d4619f2fc0128fc46c94050b9" }
 
 [profile.release]
 opt-level = 3

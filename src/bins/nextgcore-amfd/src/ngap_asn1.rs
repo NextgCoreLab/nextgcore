@@ -585,10 +585,13 @@ pub fn decode_ng_setup_request_asn1(data: &[u8]) -> NgSetupRequestDecode {
     match global_ran_node_id {
         GlobalRANNodeID::GlobalGNB_ID(gnb) => {
             request.plmn_id = decode_plmn_id(&gnb.plmn_identity.0);
-            let GNB_ID::GNB_ID(bits) = gnb.gnb_id else {
-                log::error!("NG Setup Request: gNB-ID is a choice extension");
-                return Undecodable;
-            };
+            // GNB-ID's choice-Extensions alternative is uninhabited: its
+            // object set is empty, so since nextgsim #218 its value type has no
+            // variants and a choice extension on the wire fails the decode
+            // above (Undecodable) instead of reaching here. A schema that
+            // defines one makes this pattern refutable, and this line stops
+            // compiling, which is where it should be handled.
+            let GNB_ID::GNB_ID(bits) = gnb.gnb_id;
             // SIZE(22..32), so it fits: the decoder enforces the bound.
             request.gnb_id_len = bits.0.len() as u8;
             request.gnb_id = bits
@@ -1146,12 +1149,13 @@ pub enum PduSessionResourceReleaseResponseDecode {
 /// the same sessions and transfers:
 /// `pdu_session_resource_release_response_generated_decode_matches_hand_written`.
 ///
-/// A released item carrying an `iE-Extensions` container is refused as
-/// undecodable. Its extension object set is empty in Rel-17, and the forked
-/// codec decodes an entry of such a container as zero bits (nextgsim #218), so
-/// whatever it returned for the item would be a misparse. The hand-written
-/// parser did not look at the presence bit at all and misread the item the
-/// same way; refusing is the only answer that is not silently wrong.
+/// A released item's `iE-Extensions` entries are not-comprehended IEs like any
+/// other: the item's extension object set is empty in Rel-17, so every entry
+/// is unknown, and since nextgsim #218 the codec skips it as an open type and
+/// reports it with its criticality -- ignore drops it, notify reports it,
+/// reject fails the procedure. (Before #218 such an entry decoded as zero bits
+/// and the rest of the list was misread; the hand-written parser never read
+/// the presence bit and misread it too.)
 pub fn decode_pdu_session_resource_release_response_asn1(
     data: &[u8],
 ) -> PduSessionResourceReleaseResponseDecode {
@@ -1194,13 +1198,6 @@ pub fn decode_pdu_session_resource_release_response_asn1(
             Ie::Id_RAN_UE_NGAP_ID(v) => ran_ue_ngap_id = Some(v.0),
             Ie::Id_PDUSessionResourceReleasedListRelRes(list) => {
                 for item in list.0 {
-                    if item.ie_extensions.is_some() {
-                        log::warn!(
-                            "PDU Session Resource Release Response: released PSI item carries \
-                             iE-Extensions, which the codec cannot decode (nextgsim #218)"
-                        );
-                        return Undecodable;
-                    }
                     released.push(ReleasedPduSession {
                         pdu_session_id: item.pdu_session_id.0,
                         transfer: item.pdu_session_resource_release_response_transfer.0,
@@ -1285,11 +1282,10 @@ pub enum PduSessionResourceSetupResponseDecode {
 /// the same sessions and transfers, in both lists:
 /// `pdu_session_resource_setup_response_generated_decode_matches_hand_written`.
 ///
-/// An item of either list carrying an `iE-Extensions` container is refused as
-/// undecodable, for the reason a released item is (stage 5): both extension
-/// object sets are empty in Rel-17, and the forked codec decodes an entry of
-/// such a container as zero bits (nextgsim #218), so whatever it returned for
-/// the rest of the list would be a misparse.
+/// An item's `iE-Extensions` entries are handled as a released item's are
+/// (stage 5): both extension object sets are empty in Rel-17, so every entry
+/// is a not-comprehended IE, skipped and classified by its criticality since
+/// nextgsim #218.
 pub fn decode_pdu_session_resource_setup_response_asn1(
     data: &[u8],
 ) -> PduSessionResourceSetupResponseDecode {
@@ -1314,29 +1310,6 @@ pub fn decode_pdu_session_resource_setup_response_asn1(
         log::warn!("Expected PduSessionResourceSetupResponse");
         return Undecodable;
     };
-    // Before the not-comprehended IEs are looked at: the misparse an item's
-    // extension container causes can itself surface as a phantom unknown IE --
-    // an "IE 256 marked reject" read out of the next item's octets, for one.
-    let item_extensions = response
-        .protocol_i_es
-        .0
-        .iter()
-        .any(|entry| match &entry.value {
-            Ie::Id_PDUSessionResourceSetupListSURes(list) => {
-                list.0.iter().any(|item| item.ie_extensions.is_some())
-            }
-            Ie::Id_PDUSessionResourceFailedToSetupListSURes(list) => {
-                list.0.iter().any(|item| item.ie_extensions.is_some())
-            }
-            _ => false,
-        });
-    if item_extensions {
-        log::warn!(
-            "PDU Session Resource Setup Response: a PSI item carries iE-Extensions, which \
-             the codec cannot decode (nextgsim #218)"
-        );
-        return Undecodable;
-    }
     let Some((reject, notify)) =
         classify_unknown_ies(&unknown, "PDU Session Resource Setup Response")
     else {
@@ -2247,10 +2220,12 @@ pub struct GnbN3Endpoint {
 /// a Transport Layer Address that short is read differently from the
 /// hand-written decoder. No GTP-U endpoint is that short: IPv4 is 32 bits.
 ///
-/// A DL tunnel carrying an `iE-Extensions` container is refused: GTPTunnel's
-/// extension object set is empty, so the forked codec reads its entries as
-/// zero bits (nextgsim #218) and the associated QoS flow list after it from
-/// the wrong offset.
+/// A DL tunnel's `iE-Extensions` entries are skipped like the transfer's own
+/// unknown extensions: GTPTunnel's extension object set is empty, so every
+/// entry is unknown, and since nextgsim #218 the codec skips it as an open type
+/// instead of reading it as zero bits. Their criticality is not acted on here:
+/// the transfer is the SMF's to interpret, and the AMF relays it opaquely
+/// (TS 23.502), so this parse only feeds the AMF's log.
 pub fn parse_n2_sm_setup_response_transfer(data: &[u8]) -> Option<GnbN3Endpoint> {
     let transfer = match nextgcore_ngap_gen::decode_contained_with_unknown_ies::<
         ngap_gen::PDUSessionResourceSetupResponseTransfer,
@@ -2264,19 +2239,12 @@ pub fn parse_n2_sm_setup_response_transfer(data: &[u8]) -> Option<GnbN3Endpoint>
     };
 
     let dl = transfer.dl_qos_flow_per_tnl_information;
+    // UPTransportLayerInformation's choice-Extensions alternative is
+    // uninhabited (empty object set, nextgsim #218), so a choice extension on
+    // the wire fails the decode above instead of reaching here; a schema that
+    // defines one makes this pattern refutable and stops it compiling.
     let ngap_gen::UPTransportLayerInformation::GTPTunnel(tunnel) =
-        dl.up_transport_layer_information
-    else {
-        log::warn!("PDUSessionResourceSetupResponseTransfer: DL tunnel is not a GTP tunnel");
-        return None;
-    };
-    if tunnel.ie_extensions.is_some() {
-        log::warn!(
-            "PDUSessionResourceSetupResponseTransfer: DL GTP tunnel carries iE-Extensions, \
-             which the codec cannot decode (nextgsim #218)"
-        );
-        return None;
-    }
+        dl.up_transport_layer_information;
     let teid: [u8; 4] = tunnel.gtp_teid.0.as_slice().try_into().ok()?;
 
     Some(GnbN3Endpoint {
@@ -4940,17 +4908,21 @@ pub(crate) mod tests {
     /// re-encoded by the hand-written PER layer -- for wire forms neither
     /// encoder produces.
     fn with_ie_value(base: &[u8], id: u16, value: Vec<u8>) -> Vec<u8> {
-        use nextgcore_asn1c::ngap::pdu::{NgapPdu, SuccessfulOutcomeValue};
+        use nextgcore_asn1c::ngap::pdu::{InitiatingMessageValue, NgapPdu, SuccessfulOutcomeValue};
         use nextgcore_asn1c::per::{AperDecode, AperDecoder, AperEncode, AperEncoder};
         let mut decoder = AperDecoder::new(base);
         let mut pdu = NgapPdu::decode_aper(&mut decoder).expect("decode");
-        let NgapPdu::SuccessfulOutcome(ref mut msg) = pdu else {
-            panic!("successfulOutcome");
-        };
-        let container = match &mut msg.value {
-            SuccessfulOutcomeValue::PduSessionResourceReleaseResponse(c)
-            | SuccessfulOutcomeValue::PduSessionResourceSetupResponse(c)
-            | SuccessfulOutcomeValue::Other(c) => c,
+        let container = match &mut pdu {
+            NgapPdu::SuccessfulOutcome(msg) => match &mut msg.value {
+                SuccessfulOutcomeValue::PduSessionResourceReleaseResponse(c)
+                | SuccessfulOutcomeValue::PduSessionResourceSetupResponse(c)
+                | SuccessfulOutcomeValue::Other(c) => c,
+                other => panic!("unexpected {other:?}"),
+            },
+            NgapPdu::InitiatingMessage(msg) => match &mut msg.value {
+                InitiatingMessageValue::NgSetupRequest(c) => c,
+                other => panic!("unexpected {other:?}"),
+            },
             other => panic!("unexpected {other:?}"),
         };
         let field = container
@@ -4965,47 +4937,124 @@ pub(crate) mod tests {
         encoder.into_bytes().to_vec()
     }
 
-    /// A released item carrying an iE-Extensions container -- one entry, id 9,
-    /// criticality reject -- in its real wire form, followed by a second plain
-    /// item (PSI 6). Its extension object set is empty, so the forked codec
-    /// decodes the entry as zero bits (nextgsim #218) and reads the rest of the
-    /// list from the wrong offset: here it returns a session 9 the gNB never
-    /// named and drops session 6. The decode refuses the message instead. The
-    /// hand-written parser never read the presence bit, so it misread the list
-    /// as well -- as sessions 5 and 0 -- and the handler relayed what it said.
+    /// A PSI item list whose first item (PSI 5) carries an iE-Extensions
+    /// container -- one entry, id 9, of `criticality` -- in its real wire form,
+    /// followed by a plain second item (PSI 6). Shared by the Release (stage 5)
+    /// and Setup (stage 6) Response tests: both items' extension object sets are
+    /// empty in Rel-17, and the two lists share this layout.
+    ///
+    /// SIZE(1..256) count-1 = 1. Item 1: extension bit 0, iE-Extensions present
+    /// 1, padding; PSI 5; transfer length 1, 0x00; container count-1 = 0 on 16
+    /// bits; ProtocolExtensionID 9; criticality in the top two bits, padding;
+    /// open type length 1, 0x00. Item 2: both bits 0, padding; PSI 6; transfer
+    /// length 1, 0x00.
+    fn psi_list_with_item_extension(criticality: u8) -> Vec<u8> {
+        vec![
+            0x01,
+            0x40,
+            0x05,
+            0x01,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x09,
+            criticality << 6,
+            0x01,
+            0x00,
+            0x00,
+            0x06,
+            0x01,
+            0x00,
+        ]
+    }
+
+    /// The same two items with no extension.
+    const PLAIN_PSI_LIST: [u8; 9] = [0x01, 0x00, 0x05, 0x01, 0x00, 0x00, 0x06, 0x01, 0x00];
+
+    /// Since nextgsim #218 a released item's iE-Extensions entry is a
+    /// not-comprehended IE like any other, classified by its criticality per
+    /// TS 38.413 §10.3.4.2 for a response message: ignore relays both sessions,
+    /// notify relays them and reports the IE in an Error Indication, reject
+    /// fails the procedure. Before #218 the codec decoded the entry as zero bits
+    /// and returned a session 9 the gNB never named, so stage 5 refused the
+    /// message; the hand-written parser, which never read the presence bit,
+    /// misread the list as sessions 5 and 0 whatever the criticality.
     #[test]
-    fn a_released_item_with_ie_extensions_is_refused_not_misparsed() {
+    fn a_released_item_extension_is_classified_by_its_criticality() {
+        use PduSessionResourceReleaseResponseDecode::{Failed, Released};
         let base = release_response(7, 9, &[(5, vec![0x00])]);
-        // SIZE(1..256) count-1 = 1. Item 1: extension bit 0, iE-Extensions
-        // present 1, padding; PSI 5; transfer length 1, 0x00; container count-1
-        // = 0 on 16 bits; ProtocolExtensionID 9; criticality reject (00) and
-        // padding; open type length 1, 0x00. Item 2: both bits 0, padding; PSI
-        // 6; transfer length 1, 0x00.
-        let list = vec![
-            0x01, 0x40, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x09, 0x00, 0x01, 0x00, 0x00, 0x06,
-            0x01, 0x00,
+        let splice = |list: Vec<u8>| {
+            with_ie_value(
+                &base,
+                ngap_gen::ID_PDU_SESSION_RESOURCE_RELEASED_LIST_REL_RES,
+                list,
+            )
+        };
+        let both = vec![
+            ReleasedPduSession {
+                pdu_session_id: 5,
+                transfer: vec![0x00],
+            },
+            ReleasedPduSession {
+                pdu_session_id: 6,
+                transfer: vec![0x00],
+            },
         ];
-        let data = with_ie_value(
-            &base,
-            ngap_gen::ID_PDU_SESSION_RESOURCE_RELEASED_LIST_REL_RES,
-            list,
-        );
-        assert!(matches!(
-            decode_pdu_session_resource_release_response_asn1(&data),
-            PduSessionResourceReleaseResponseDecode::Undecodable
-        ));
+        let item_ie = |criticality| IeDiagnostic {
+            ie_id: 9,
+            criticality,
+            type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+        };
+
+        match decode_pdu_session_resource_release_response_asn1(&splice(
+            psi_list_with_item_extension(ngap_gen::Criticality::IGNORE),
+        )) {
+            Released {
+                amf_ue_ngap_id: Some(7),
+                ran_ue_ngap_id: Some(9),
+                released,
+                error_indication: None,
+            } => assert_eq!(released, both),
+            other => panic!("ignore: {other:?}"),
+        }
+        match decode_pdu_session_resource_release_response_asn1(&splice(
+            psi_list_with_item_extension(ngap_gen::Criticality::NOTIFY),
+        )) {
+            Released {
+                released,
+                error_indication: Some(report),
+                ..
+            } => {
+                assert_eq!(released, both);
+                assert_eq!(
+                    report.diagnostics,
+                    vec![item_ie(ngap_gen::Criticality::NOTIFY)]
+                );
+                assert_eq!(
+                    report.cause_protocol,
+                    ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY
+                );
+            }
+            other => panic!("notify: {other:?}"),
+        }
+        match decode_pdu_session_resource_release_response_asn1(&splice(
+            psi_list_with_item_extension(ngap_gen::Criticality::REJECT),
+        )) {
+            Failed(ies) => assert_eq!(ies, vec![item_ie(ngap_gen::Criticality::REJECT)]),
+            other => panic!("reject: {other:?}"),
+        }
+
         assert_eq!(
-            hand_written_parse_pdu_session_resource_release_response(&data),
+            hand_written_parse_pdu_session_resource_release_response(&splice(
+                psi_list_with_item_extension(ngap_gen::Criticality::IGNORE)
+            )),
             Some((7, 9, vec![(5, vec![0x00]), (0, vec![])])),
             "the old parser's misread"
         );
-        // The same splice without the extension decodes, so it is the
-        // extension the decode refuses, not the splicing.
-        let plain = with_ie_value(
-            &base,
-            ngap_gen::ID_PDU_SESSION_RESOURCE_RELEASED_LIST_REL_RES,
-            vec![0x01, 0x00, 0x05, 0x01, 0x00, 0x00, 0x06, 0x01, 0x00],
-        );
+        // The same splice without the extension decodes identically on both
+        // paths, so the splicing itself is sound.
+        let plain = splice(PLAIN_PSI_LIST.to_vec());
         assert_eq!(
             generated_response_view(&plain),
             Some((7, 9, vec![(5, vec![0x00]), (6, vec![0x00])]))
@@ -5507,42 +5556,101 @@ pub(crate) mod tests {
         ));
     }
 
-    /// An item of either list carrying an iE-Extensions container -- one entry,
-    /// id 9, criticality reject -- in its real wire form, followed by a second
-    /// plain item (PSI 6). Both extension object sets are empty, so the forked
-    /// codec decodes the entry as zero bits (nextgsim #218) and the rest of the
-    /// list from the wrong offset; the decode refuses the message instead. The
-    /// hand-written parser never read the presence bit, so it misread the list
-    /// as sessions 5 and 0 and the handler relayed what it said.
+    /// An item of either list carrying an iE-Extensions entry (id 9) is
+    /// classified by its criticality, as a released item's is (stage 5): ignore
+    /// relays both sessions, notify relays them and reports the IE in an Error
+    /// Indication, reject fails the procedure. Before nextgsim #218 the codec
+    /// decoded the entry as zero bits, and the misparse could surface as a
+    /// phantom "IE 256 marked reject" read from the next item, so stage 6
+    /// refused the message ahead of classifying unknown IEs. The hand-written
+    /// parser never read the presence bit and misread the list as sessions 5
+    /// and 0.
     #[test]
-    fn a_setup_response_item_with_ie_extensions_is_refused_not_misparsed() {
+    fn a_setup_response_item_extension_is_classified_by_its_criticality() {
+        use PduSessionResourceSetupResponseDecode::{Decoded, Failed};
         let base = setup_response(7, 9, &[(5, vec![0x00])], &[(5, vec![0x00])]);
-        let with_extension = vec![
-            0x01, 0x40, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x09, 0x00, 0x01, 0x00, 0x00, 0x06,
-            0x01, 0x00,
+        let both = vec![
+            SetupResponsePduSession {
+                pdu_session_id: 5,
+                transfer: vec![0x00],
+            },
+            SetupResponsePduSession {
+                pdu_session_id: 6,
+                transfer: vec![0x00],
+            },
         ];
-        let plain = vec![0x01, 0x00, 0x05, 0x01, 0x00, 0x00, 0x06, 0x01, 0x00];
+        let item_ie = |criticality| IeDiagnostic {
+            ie_id: 9,
+            criticality,
+            type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+        };
         for id in [
             ngap_gen::ID_PDU_SESSION_RESOURCE_SETUP_LIST_SU_RES,
             ngap_gen::ID_PDU_SESSION_RESOURCE_FAILED_TO_SETUP_LIST_SU_RES,
         ] {
-            let data = with_ie_value(&base, id, with_extension.clone());
-            assert!(
-                matches!(
-                    decode_pdu_session_resource_setup_response_asn1(&data),
-                    PduSessionResourceSetupResponseDecode::Undecodable
-                ),
-                "IE {id}"
-            );
-            let old = hand_written_parse_pdu_session_resource_setup_response(&data).expect("old");
+            let in_list =
+                |decoded_setup: &Vec<SetupResponsePduSession>,
+                 decoded_failed: &Vec<SetupResponsePduSession>| {
+                    if id == ngap_gen::ID_PDU_SESSION_RESOURCE_SETUP_LIST_SU_RES {
+                        decoded_setup.clone()
+                    } else {
+                        decoded_failed.clone()
+                    }
+                };
+            let splice =
+                |criticality| with_ie_value(&base, id, psi_list_with_item_extension(criticality));
+
+            match decode_pdu_session_resource_setup_response_asn1(&splice(
+                ngap_gen::Criticality::IGNORE,
+            )) {
+                Decoded {
+                    amf_ue_ngap_id: Some(7),
+                    ran_ue_ngap_id: Some(9),
+                    setup,
+                    failed,
+                    error_indication: None,
+                } => assert_eq!(in_list(&setup, &failed), both, "IE {id}"),
+                other => panic!("ignore, IE {id}: {other:?}"),
+            }
+            match decode_pdu_session_resource_setup_response_asn1(&splice(
+                ngap_gen::Criticality::NOTIFY,
+            )) {
+                Decoded {
+                    setup,
+                    failed,
+                    error_indication: Some(report),
+                    ..
+                } => {
+                    assert_eq!(in_list(&setup, &failed), both, "IE {id}");
+                    assert_eq!(
+                        report.diagnostics,
+                        vec![item_ie(ngap_gen::Criticality::NOTIFY)],
+                        "IE {id}"
+                    );
+                }
+                other => panic!("notify, IE {id}: {other:?}"),
+            }
+            match decode_pdu_session_resource_setup_response_asn1(&splice(
+                ngap_gen::Criticality::REJECT,
+            )) {
+                Failed(ies) => {
+                    assert_eq!(ies, vec![item_ie(ngap_gen::Criticality::REJECT)], "IE {id}")
+                }
+                other => panic!("reject, IE {id}: {other:?}"),
+            }
+
+            let old = hand_written_parse_pdu_session_resource_setup_response(&splice(
+                ngap_gen::Criticality::IGNORE,
+            ))
+            .expect("old");
             let misread = vec![(5, vec![0x00]), (0, vec![])];
             assert!(
                 old.2 == misread || old.3 == misread,
                 "the old parser's misread: {old:?}"
             );
-            // The same splice without the extension decodes, so it is the
-            // extension the decode refuses, not the splicing.
-            let ok = with_ie_value(&base, id, plain.clone());
+            // The same splice without the extension decodes identically on
+            // both paths, so the splicing itself is sound.
+            let ok = with_ie_value(&base, id, PLAIN_PSI_LIST.to_vec());
             assert_eq!(
                 generated_setup_response_view(&ok),
                 hand_written_parse_pdu_session_resource_setup_response(&ok),
@@ -6393,10 +6501,12 @@ pub(crate) mod tests {
     /// know -- here the MBS Support Indicator (id 309) relabelled 9999 on the
     /// wire -- decodes to the same endpoint: the hand-written decoder never
     /// read the extension container, and the generated one skips the unknown
-    /// entry. A DL GTP tunnel carrying iE-Extensions, whose object set is
-    /// empty (nextgsim #218), is refused rather than misparsed.
+    /// entry. So does one whose DL GTP tunnel carries an iE-Extensions entry:
+    /// GTPTunnel's extension object set is empty, and since nextgsim #218 the
+    /// codec skips the entry as an open type instead of reading it as zero bits
+    /// and the associated QoS flow list after it from the wrong offset.
     #[test]
-    fn setup_response_transfer_extensions_are_skipped_or_refused() {
+    fn setup_response_transfer_extensions_are_skipped() {
         let mut transfer = nextgcore_ngap_gen::decode_contained::<
             ngap_gen::PDUSessionResourceSetupResponseTransfer,
         >(
@@ -6442,27 +6552,200 @@ pub(crate) mod tests {
             "the default decode fails on the unknown id, so the skip is what decodes it"
         );
 
-        // A DL GTP tunnel carrying an iE-Extensions container. The forked
-        // codec's own encoding of an entry of the empty object set is the
-        // zero-bit one nextgsim #218 describes, so this is not the real wire
-        // form of any extension -- it sets the presence bit, which is what the
-        // decode refuses on.
-        let mut tunneled = transfer.clone();
-        tunneled.ie_extensions = None;
-        let ngap_gen::UPTransportLayerInformation::GTPTunnel(ref mut tunnel) = tunneled
-            .dl_qos_flow_per_tnl_information
-            .up_transport_layer_information
-        else {
-            panic!("GTP tunnel");
+        // A DL GTP tunnel carrying an iE-Extensions entry, in its real wire
+        // form. GTPTunnel's extension value type has no variants, so no typed
+        // value can carry one: the transfer is written bit by bit, and the
+        // writer is proven against the codec on the same transfer without the
+        // extension, where the two must agree byte for byte.
+        let tunnel_transfer = |extension: Option<&[u8]>| {
+            let mut w = BitWriter::default();
+            w.bits(0, 1); // PDUSessionResourceSetupResponseTransfer: extension bit
+            w.bits(0, 4); // ...its four OPTIONALs absent
+            w.bits(0, 2); // QosFlowPerTNLInformation: extension bit, iE-Extensions absent
+            w.bits(0, 1); // UPTransportLayerInformation: gTPTunnel
+            w.bits(0, 1); // GTPTunnel: extension bit
+            w.bits(u64::from(extension.is_some()), 1); // ...iE-Extensions present
+            w.bits(0, 1); // TransportLayerAddress: SIZE extension bit
+            w.bits(31, 8); // ...length 32, as 32 - 1 over SIZE(1..160)
+            w.align();
+            w.octets(&[10, 45, 0, 3]);
+            w.octets(&7u32.to_be_bytes()); // GTP-TEID, SIZE(4), already aligned
+            if let Some(container) = extension {
+                w.octets(container); // starts and ends octet-aligned
+            }
+            w.bits(0, 6); // AssociatedQosFlowList: count - 1 over SIZE(1..64)
+            w.bits(0, 3); // AssociatedQosFlowItem: extension bit, two OPTIONALs absent
+            w.bits(0, 1); // QosFlowIdentifier: extension bit
+            w.bits(9, 6); // ...QFI 9
+            w.align();
+            w.into_bytes()
         };
-        tunnel.ie_extensions = Some(ngap_gen::GTPTunnelIE_Extensions(vec![
-            ngap_gen::GTPTunnelIE_Extensions_Entry {},
-        ]));
-        let extended = nextgcore_ngap_gen::encode_contained(&tunneled).expect("encode");
-        assert_eq!(parse_n2_sm_setup_response_transfer(&extended), None);
+        let mut no_extension = transfer.clone();
+        no_extension.ie_extensions = None;
+        assert_eq!(
+            tunnel_transfer(None),
+            nextgcore_ngap_gen::encode_contained(&no_extension).expect("encode"),
+            "the bit writer agrees with the codec"
+        );
+        // A one-entry ProtocolExtensionContainer, as the codec encodes it for a
+        // set it does know -- the wire form does not depend on the set -- with
+        // the id relabelled to 9 and the given criticality.
+        let container = |criticality: u8| {
+            let mut bytes = nextgcore_ngap_gen::encode_contained(
+                transfer.ie_extensions.as_ref().expect("the MBS extension"),
+            )
+            .expect("encode");
+            assert_eq!(&bytes[..4], &[0x00, 0x00, 0x01, 0x35], "count - 1, id 309");
+            bytes[2..4].copy_from_slice(&9u16.to_be_bytes());
+            bytes[4] = criticality << 6;
+            bytes
+        };
+        for criticality in [
+            ngap_gen::Criticality::IGNORE,
+            ngap_gen::Criticality::NOTIFY,
+            ngap_gen::Criticality::REJECT,
+        ] {
+            let extended = tunnel_transfer(Some(&container(criticality)));
+            assert_eq!(
+                parse_n2_sm_setup_response_transfer(&extended),
+                endpoint,
+                "criticality {criticality}"
+            );
+            assert!(
+                nextgcore_ngap_gen::decode_contained::<
+                    ngap_gen::PDUSessionResourceSetupResponseTransfer,
+                >(&extended)
+                .is_err(),
+                "the default decode refuses the unknown entry, so the skip is what decodes it"
+            );
+        }
         let plain = hand_written_response_transfer(&[10, 45, 0, 3], 32, 7, &[9])
             .encode()
             .expect("encode");
         assert_eq!(parse_n2_sm_setup_response_transfer(&plain), endpoint);
+    }
+
+    /// A choice extension where the schema defines none -- GNB-ID's and
+    /// UPTransportLayerInformation's choice-Extensions, both with empty object
+    /// sets -- is refused as it was before nextgsim #218, now by the decode
+    /// itself: the alternative's value type has no variants, so the AMF's
+    /// pattern on the other alternative is irrefutable and the refusal cannot
+    /// come from it. Each wire form is written bit by bit, and the writer is
+    /// proven on the same value with the ordinary alternative.
+    #[test]
+    fn an_undefined_choice_extension_is_refused_by_the_decode() {
+        // ProtocolIE-SingleContainer: id 9 on 16 aligned bits, criticality
+        // ignore and padding, open type length 1, 0x00.
+        let single_container = [0x00, 0x09, 0x40, 0x01, 0x00];
+
+        // GlobalRANNodeID of the baseline NG Setup Request.
+        let global_ran_node_id = |choice_extension: bool| {
+            let mut w = BitWriter::default();
+            w.bits(0, 2); // GlobalRANNodeID: globalGNB-ID
+            w.bits(0, 2); // GlobalGNB-ID: extension bit, iE-Extensions absent
+            w.align();
+            w.octets(&[0x99, 0xf9, 0x07]); // PLMNIdentity, SIZE(3)
+            if choice_extension {
+                w.bits(1, 1); // GNB-ID: choice-Extensions
+                w.align();
+                w.octets(&single_container);
+            } else {
+                w.bits(0, 1); // GNB-ID: gNB-ID
+                w.bits(32 - 22, 4); // BIT STRING SIZE(22..32): length 32
+                w.align();
+                w.octets(&1u32.to_be_bytes()); // gNB ID 1
+            }
+            w.into_bytes()
+        };
+        let baseline = baseline_request();
+        let plain = with_ie_value(
+            &baseline,
+            ngap_gen::ID_GLOBAL_RAN_NODE_ID,
+            global_ran_node_id(false),
+        );
+        assert_eq!(plain, baseline, "the bit writer agrees with the encoder");
+        let extended = with_ie_value(
+            &baseline,
+            ngap_gen::ID_GLOBAL_RAN_NODE_ID,
+            global_ran_node_id(true),
+        );
+        assert!(
+            matches!(
+                decode_ng_setup_request_asn1(&extended),
+                NgSetupRequestDecode::Undecodable
+            ),
+            "{:?}",
+            decode_ng_setup_request_asn1(&extended)
+        );
+
+        // A Setup Response Transfer whose DL UPTransportLayerInformation is
+        // a choice extension.
+        let transfer = |choice_extension: bool| {
+            let mut w = BitWriter::default();
+            w.bits(0, 5); // transfer: extension bit, four OPTIONALs absent
+            w.bits(0, 2); // QosFlowPerTNLInformation: extension bit, no iE-Extensions
+            if choice_extension {
+                w.bits(1, 1); // UPTransportLayerInformation: choice-Extensions
+                w.align();
+                w.octets(&single_container);
+            } else {
+                w.bits(0, 1); // UPTransportLayerInformation: gTPTunnel
+                w.bits(0, 2); // GTPTunnel: extension bit, no iE-Extensions
+                w.bits(0, 1); // TransportLayerAddress: SIZE extension bit
+                w.bits(31, 8); // ...length 32
+                w.align();
+                w.octets(&[10, 45, 0, 3]);
+                w.octets(&7u32.to_be_bytes());
+            }
+            w.bits(0, 6); // AssociatedQosFlowList: one item
+            w.bits(0, 4); // item: extension bit, two OPTIONALs absent; QFI extension bit
+            w.bits(9, 6); // QFI 9
+            w.align();
+            w.into_bytes()
+        };
+        assert_eq!(
+            parse_n2_sm_setup_response_transfer(&transfer(false)),
+            Some(GnbN3Endpoint {
+                teid: 7,
+                address: vec![10, 45, 0, 3],
+                qfis: vec![9],
+            })
+        );
+        assert_eq!(parse_n2_sm_setup_response_transfer(&transfer(true)), None);
+    }
+
+    /// An MSB-first bit writer for wire forms no typed value can produce.
+    #[derive(Default)]
+    struct BitWriter {
+        bytes: Vec<u8>,
+        used: u32,
+    }
+
+    impl BitWriter {
+        fn bits(&mut self, value: u64, n: u32) {
+            for i in (0..n).rev() {
+                if self.used.is_multiple_of(8) {
+                    self.bytes.push(0);
+                }
+                if (value >> i) & 1 == 1 {
+                    *self.bytes.last_mut().expect("pushed") |= 0x80 >> (self.used % 8);
+                }
+                self.used += 1;
+            }
+        }
+
+        fn align(&mut self) {
+            self.used = self.used.div_ceil(8) * 8;
+        }
+
+        fn octets(&mut self, octets: &[u8]) {
+            assert_eq!(self.used % 8, 0, "octets() needs an aligned writer");
+            self.bytes.extend_from_slice(octets);
+            self.used += 8 * octets.len() as u32;
+        }
+
+        fn into_bytes(self) -> Vec<u8> {
+            self.bytes
+        }
     }
 }
