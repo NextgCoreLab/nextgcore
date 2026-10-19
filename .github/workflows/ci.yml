@@ -35,6 +35,16 @@ jobs:
       - name: cargo check
         run: cd src && cargo check --workspace
 
+      - name: cargo check (all features, all targets)
+        # The per-feature lines in the test and clippy jobs only cover features
+        # someone remembered to list, and that is how nextgcore-sbi's `http3`
+        # feature stopped compiling unnoticed: a field added to `SbiRequest` was
+        # never set on the HTTP/3 path, and nothing built it. Checking every
+        # feature of every crate makes any gated module that rots fail here. It
+        # is `check`, not `build`, so it does not link (kernel-sctp's libsctp is
+        # not needed) and costs one extra compile of the workspace.
+        run: cd src && cargo check --workspace --all-features --all-targets
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -674,7 +684,11 @@ jobs:
       # WHY `ue-suspend` AND NOT `ue-release`. This is the trap, and it is the
       # obvious first choice. `ue-release` makes the gNB send a
       # UEContextReleaseRequest, the AMF answers with a Release Command and BOTH
-      # sides delete the NGAP UE context. The UE then returns in RRC_IDLE, so the
+      # sides delete the NGAP UE context. (True since #453. Before it, the AMF
+      # routed a Release Request on procedure 41 instead of 42 and answered with
+      # an ERROR INDICATION, releasing nothing -- so this alternative was broken
+      # one step earlier than described here. The Docker E2E's final step now
+      # asserts the release itself.) The UE then returns in RRC_IDLE, so the
       # gNB sends an InitialUEMessage -- and nextgcore's
       # `handle_initial_ue_message` has exactly one arm for a Service Request
       # there: reject with cause #9, unconditionally, with no 5G-S-TMSI lookup.

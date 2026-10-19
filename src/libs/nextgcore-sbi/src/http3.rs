@@ -233,6 +233,14 @@ where
         // evaluation doc); rustls exposes one, but SEPP-over-HTTP/3 has no
         // spec basis yet.
         tls_exporter_secret: None,
+        // Both are identities THIS PROCESS verified (see `SbiRequest`), and the
+        // HTTP/3 listener verifies neither: its rustls config is built
+        // `with_no_client_auth()`, so there is no peer certificate to read an NF
+        // Instance ID from, and it carries no OAuth2 verifier, so no token `sub`
+        // is ever attested. `None` is therefore the only truthful value; the
+        // HTTP/2 server fills them from mTLS and `OAuth2Verifier::authorize`.
+        peer_cert_nf_instance_id: None,
+        oauth2_subject: None,
     };
 
     let sbi_response = handler.handle(sbi_request).await;
