@@ -6,9 +6,9 @@
 //!
 //! #417 is migrating these builders, one procedure family at a time, onto the
 //! codec generated from the TS 38.413 ASN.1 (`nextgcore-ngap-gen`). Migrated so
-//! far: the NG Setup Response and NG Setup Failure encoders. The NG Setup
-//! Request is still DECODED by the hand-written parser -- see
-//! `generated_decoder_rejects_an_ignorable_unknown_ie_so_parse_stays_hand_written`.
+//! far: the whole NG Setup family -- the Response and Failure encoders (stage 2)
+//! and the Request decoder (stage 3), which applies TS 38.413 §10.3.4/§10.3.5 to
+//! not-comprehended and missing IEs ([`decode_ng_setup_request_asn1`]).
 
 use nextgcore_asn1c::ngap::cause::{
     Cause, CauseMisc, CauseNas, CauseProtocol, CauseRadioNetwork, CauseTransport,
@@ -36,6 +36,18 @@ use crate::context::AmfContext;
 /// bytes are unchanged -- `ng_setup_generated_matches_hand_written_*` below pins
 /// that against the hand-written encoder over a matrix of contexts.
 pub fn build_ng_setup_response_asn1(ctx: &AmfContext) -> Option<Vec<u8>> {
+    build_ng_setup_response_with_diagnostics_asn1(ctx, &[])
+}
+
+/// [`build_ng_setup_response_asn1`], additionally reporting `diagnostics` --
+/// not-comprehended IEs of the request marked "ignore IE and notify sender" --
+/// in a Criticality Diagnostics IE, as TS 38.413 §10.3.4.2 requires of the
+/// response message. With no diagnostics the IE is absent and the bytes are
+/// exactly [`build_ng_setup_response_asn1`]'s.
+pub fn build_ng_setup_response_with_diagnostics_asn1(
+    ctx: &AmfContext,
+    diagnostics: &[IeDiagnostic],
+) -> Option<Vec<u8>> {
     use ngap_gen::{
         AMFName, AMFPointer, AMFRegionID, AMFSetID, NGSetupResponse, NGSetupResponseProtocolIEs,
         NGSetupResponseProtocolIEs_Entry as Entry, NGSetupResponseProtocolIEs_EntryValue as Ie,
@@ -98,27 +110,9 @@ pub fn build_ng_setup_response_asn1(ctx: &AmfContext) -> Option<Vec<u8>> {
         );
     }
 
-    // The generated encoder enforces NEITHER bound of a SEQUENCE OF's SIZE: it
-    // emits an empty or over-long list the schema forbids, and a peer cannot
-    // decode the result. The hand-written encoder refused these, so refuse them
-    // here: ServedGUAMIList SIZE(1..256), PLMNSupportList SIZE(1..12),
-    // SliceSupportList SIZE(1..1024) (TS 38.413 §9.4, maxnoofServedGUAMIs,
-    // maxnoofPLMNs, maxnoofSliceItems).
-    let sized = |len: usize, max: usize| (1..=max).contains(&len);
-    if !sized(served_guami_list.len(), 256)
-        || !sized(plmn_support_list.len(), 12)
-        || plmn_support_list
-            .iter()
-            .any(|p: &PLMNSupportItem| !sized(p.slice_support_list.0.len(), 1024))
-    {
-        log::error!(
-            "Failed to encode NG Setup Response: ServedGUAMIList ({}), PLMNSupportList ({}) \
-             or a SliceSupportList is outside its SIZE bounds",
-            served_guami_list.len(),
-            plmn_support_list.len()
-        );
-        return None;
-    }
+    // No SIZE checks here: an empty or over-long ServedGUAMIList,
+    // PLMNSupportList or SliceSupportList is refused by the generated encoder
+    // itself (nextgsim #212), which is the `Err` arm below.
 
     // IE order and criticalities as TS 38.413 §9.2.6.2 lists them, and as the
     // hand-written builder emitted them.
@@ -129,32 +123,40 @@ pub fn build_ng_setup_response_asn1(ctx: &AmfContext) -> Option<Vec<u8>> {
     };
     let reject = ngap_gen::Criticality::REJECT;
     let ignore = ngap_gen::Criticality::IGNORE;
+    let mut ies = vec![
+        entry(
+            ngap_gen::ID_AMF_NAME,
+            reject,
+            Ie::Id_AMFName(AMFName(amf_name)),
+        ),
+        entry(
+            ngap_gen::ID_SERVED_GUAMI_LIST,
+            reject,
+            Ie::Id_ServedGUAMIList(ServedGUAMIList(served_guami_list)),
+        ),
+        entry(
+            ngap_gen::ID_RELATIVE_AMF_CAPACITY,
+            ignore,
+            Ie::Id_RelativeAMFCapacity(RelativeAMFCapacity(ctx.relative_capacity)),
+        ),
+        entry(
+            ngap_gen::ID_PLMN_SUPPORT_LIST,
+            reject,
+            Ie::Id_PLMNSupportList(PLMNSupportList(plmn_support_list)),
+        ),
+    ];
+    if !diagnostics.is_empty() {
+        ies.push(entry(
+            ngap_gen::ID_CRITICALITY_DIAGNOSTICS,
+            ignore,
+            Ie::Id_CriticalityDiagnostics(generated_criticality_diagnostics(diagnostics)),
+        ));
+    }
     let pdu = NGAP_PDU::SuccessfulOutcome(ngap_gen::SuccessfulOutcome {
         procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_NG_SETUP),
         criticality: ngap_gen::Criticality(reject),
         value: ngap_gen::SuccessfulOutcomeValue::Id_NGSetup(NGSetupResponse {
-            protocol_i_es: NGSetupResponseProtocolIEs(vec![
-                entry(
-                    ngap_gen::ID_AMF_NAME,
-                    reject,
-                    Ie::Id_AMFName(AMFName(amf_name)),
-                ),
-                entry(
-                    ngap_gen::ID_SERVED_GUAMI_LIST,
-                    reject,
-                    Ie::Id_ServedGUAMIList(ServedGUAMIList(served_guami_list)),
-                ),
-                entry(
-                    ngap_gen::ID_RELATIVE_AMF_CAPACITY,
-                    ignore,
-                    Ie::Id_RelativeAMFCapacity(RelativeAMFCapacity(ctx.relative_capacity)),
-                ),
-                entry(
-                    ngap_gen::ID_PLMN_SUPPORT_LIST,
-                    reject,
-                    Ie::Id_PLMNSupportList(PLMNSupportList(plmn_support_list)),
-                ),
-            ]),
+            protocol_i_es: NGSetupResponseProtocolIEs(ies),
         }),
     });
 
@@ -182,28 +184,33 @@ pub fn build_ng_setup_response_asn1(ctx: &AmfContext) -> Option<Vec<u8>> {
 /// #417 stage 2: encoded by the generated codec, like the Response above. The
 /// (group, value) -> Cause mapping is still [`build_cause`], shared with the
 /// UE Context Release Command, so both messages clamp an out-of-range value the
-/// same way; only the encoding moved.
+/// same way; only the encoding moved. Every cause, extension values such as
+/// radioNetwork 45/46 included, goes through the generated codec (nextgsim #213).
 pub fn build_ng_setup_failure_asn1(
     cause_group: u8,
     cause_value: i64,
     time_to_wait: Option<u8>,
+) -> Vec<u8> {
+    build_ng_setup_failure_with_diagnostics_asn1(cause_group, cause_value, time_to_wait, &[])
+}
+
+/// [`build_ng_setup_failure_asn1`], additionally reporting `diagnostics` in a
+/// Criticality Diagnostics IE -- the not-comprehended or missing IEs that made
+/// the AMF reject the request (TS 38.413 §10.3.4.2, §10.3.5), or the
+/// "ignore IE and notify sender" ones it is answering. With no diagnostics the
+/// IE is absent and the bytes are exactly [`build_ng_setup_failure_asn1`]'s.
+pub fn build_ng_setup_failure_with_diagnostics_asn1(
+    cause_group: u8,
+    cause_value: i64,
+    time_to_wait: Option<u8>,
+    diagnostics: &[IeDiagnostic],
 ) -> Vec<u8> {
     use ngap_gen::{
         NGSetupFailure, NGSetupFailureProtocolIEs, NGSetupFailureProtocolIEs_Entry as Entry,
         NGSetupFailureProtocolIEs_EntryValue as Ie, ProtocolIE_ID, NGAP_PDU,
     };
 
-    let Some(cause) = generated_cause(build_cause(cause_group, cause_value)) else {
-        // The forked generated codec cannot encode an ENUMERATED value past its
-        // root ("Encode of extended enumerated not yet implemented"), and
-        // radioNetwork 45/46 are extension values. No NG Setup Failure the AMF
-        // sends today carries one -- the handler answers with protocol/semantic-
-        // error or misc/unknown-PLMN-or-SNPN -- but the function takes any
-        // (group, value), so keep the old wire form for these rather than
-        // failing. Remove once the codec encodes extension values.
-        log::debug!("NG Setup Failure cause {cause_group}/{cause_value} is an extension value");
-        return hand_written_ng_setup_failure(cause_group, cause_value, time_to_wait);
-    };
+    let cause = generated_cause(build_cause(cause_group, cause_value));
 
     let ignore = ngap_gen::Criticality::IGNORE;
     let mut ies = vec![Entry {
@@ -218,6 +225,15 @@ pub fn build_ng_setup_failure_asn1(
             id: ProtocolIE_ID(ngap_gen::ID_TIME_TO_WAIT),
             criticality: ngap_gen::Criticality(ignore),
             value: Ie::Id_TimeToWait(ngap_gen::TimeToWait(ttw.min(ngap_gen::TimeToWait::V60S))),
+        });
+    }
+    // IE order as TS 38.413 §9.2.6.3 lists it: Cause, Time to Wait, Criticality
+    // Diagnostics.
+    if !diagnostics.is_empty() {
+        ies.push(Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_CRITICALITY_DIAGNOSTICS),
+            criticality: ngap_gen::Criticality(ignore),
+            value: Ie::Id_CriticalityDiagnostics(generated_criticality_diagnostics(diagnostics)),
         });
     }
 
@@ -264,50 +280,63 @@ fn generated_s_nssai(s_nssai: &crate::context::SNssai) -> ngap_gen::S_NSSAI {
 }
 
 /// The hand-written [`Cause`] as the generated one, carrying each value over as
-/// its wire number -- or `None` when the value lies past the schema's ROOT
-/// enumeration, which the generated codec cannot yet encode. The bounds are the
-/// generated types' own `ub` attributes (TS 38.413 §9.3.1.2 root lists).
-fn generated_cause(cause: Cause) -> Option<ngap_gen::Cause> {
-    let within = |v: u8, root_max: u8| (v <= root_max).then_some(v);
-    Some(match cause {
+/// its wire number. Extension values (radioNetwork 45/46) encode past the root
+/// like any other (nextgsim #213), so the mapping is total.
+fn generated_cause(cause: Cause) -> ngap_gen::Cause {
+    match cause {
         Cause::RadioNetwork(v) => {
-            ngap_gen::Cause::RadioNetwork(ngap_gen::CauseRadioNetwork(within(v as u8, 44)?))
+            ngap_gen::Cause::RadioNetwork(ngap_gen::CauseRadioNetwork(v as u8))
         }
-        Cause::Transport(v) => {
-            ngap_gen::Cause::Transport(ngap_gen::CauseTransport(within(v as u8, 1)?))
-        }
-        Cause::Nas(v) => ngap_gen::Cause::Nas(ngap_gen::CauseNas(within(v as u8, 3)?)),
-        Cause::Protocol(v) => {
-            ngap_gen::Cause::Protocol(ngap_gen::CauseProtocol(within(v as u8, 6)?))
-        }
-        Cause::Misc(v) => ngap_gen::Cause::Misc(ngap_gen::CauseMisc(within(v as u8, 5)?)),
-    })
+        Cause::Transport(v) => ngap_gen::Cause::Transport(ngap_gen::CauseTransport(v as u8)),
+        Cause::Nas(v) => ngap_gen::Cause::Nas(ngap_gen::CauseNas(v as u8)),
+        Cause::Protocol(v) => ngap_gen::Cause::Protocol(ngap_gen::CauseProtocol(v as u8)),
+        Cause::Misc(v) => ngap_gen::Cause::Misc(ngap_gen::CauseMisc(v as u8)),
+    }
 }
 
-/// The hand-written NG Setup Failure encoder, kept ONLY for the extension cause
-/// values [`generated_cause`] cannot carry (see [`build_ng_setup_failure_asn1`]).
-fn hand_written_ng_setup_failure(
-    cause_group: u8,
-    cause_value: i64,
-    time_to_wait: Option<u8>,
-) -> Vec<u8> {
-    let ttw = time_to_wait.map(|ttw| match ttw {
-        0 => TimeToWait::V1s,
-        1 => TimeToWait::V2s,
-        2 => TimeToWait::V5s,
-        3 => TimeToWait::V10s,
-        4 => TimeToWait::V20s,
-        _ => TimeToWait::V60s,
-    });
-    let msg = NgSetupFailure {
-        cause: build_cause(cause_group, cause_value),
-        time_to_wait: ttw,
-        criticality_diagnostics: None,
-    };
-    builder::build_ng_setup_failure(&msg).unwrap_or_else(|e| {
-        log::error!("Failed to encode NG Setup Failure: {e:?}");
-        Vec::new()
-    })
+/// One entry of a Criticality Diagnostics IE (TS 38.413 §9.3.1.3): an IE of a
+/// received message that was not comprehended or was missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IeDiagnostic {
+    /// The ProtocolIE-ID of the offending IE.
+    pub ie_id: u16,
+    /// Its criticality as a `Criticality` index ([`ngap_gen::Criticality`]):
+    /// 0 = reject, 2 = notify. "ignore" is never reported (§9.3.1.3).
+    pub criticality: u8,
+    /// [`ngap_gen::TypeOfError`]: 0 = not-understood, 1 = missing.
+    pub type_of_error: u8,
+}
+
+/// maxnoofErrors (TS 38.413 §9.4): at most this many IEs per Criticality
+/// Diagnostics IE.
+const MAX_NOOF_ERRORS: usize = 256;
+
+/// `diagnostics` as the generated Criticality Diagnostics IE. Only the
+/// Information Element Criticality Diagnostics list is filled: Procedure Code
+/// and Triggering Message are for an Error Indication, "not within the response
+/// message of the same procedure that caused the error" (§9.3.1.3). Truncated
+/// to maxnoofErrors, which the SIZE of the list would otherwise refuse.
+fn generated_criticality_diagnostics(
+    diagnostics: &[IeDiagnostic],
+) -> ngap_gen::CriticalityDiagnostics {
+    ngap_gen::CriticalityDiagnostics {
+        procedure_code: None,
+        triggering_message: None,
+        procedure_criticality: None,
+        i_es_criticality_diagnostics: Some(ngap_gen::CriticalityDiagnostics_IE_List(
+            diagnostics
+                .iter()
+                .take(MAX_NOOF_ERRORS)
+                .map(|d| ngap_gen::CriticalityDiagnostics_IE_Item {
+                    ie_criticality: ngap_gen::Criticality(d.criticality),
+                    ie_id: ngap_gen::ProtocolIE_ID(d.ie_id),
+                    type_of_error: ngap_gen::TypeOfError(d.type_of_error),
+                    ie_extensions: None,
+                })
+                .collect(),
+        )),
+        ie_extensions: None,
+    }
 }
 
 /// Build Cause from group and value
@@ -393,88 +422,203 @@ pub(crate) fn decode_plmn_id(bytes: &[u8]) -> crate::context::PlmnId {
     }
 }
 
-/// Decode an NG Setup Request from ASN.1 APER bytes
-pub fn parse_ng_setup_request_asn1(data: &[u8]) -> Option<crate::ngap_handler::NgSetupRequest> {
-    let decoded = match parser::decode_ngap_pdu(data) {
-        Ok(msg) => msg,
+/// How a received NG Setup Request is to be answered.
+#[derive(Debug)]
+pub enum NgSetupRequestDecode {
+    /// Decoded; run the procedure. `notify` lists the not-comprehended IEs
+    /// marked "ignore IE and notify sender", which the answer -- Response or
+    /// Failure -- must report in its Criticality Diagnostics (§10.3.4.2).
+    Proceed {
+        /// The request, as the NG Setup handler consumes it.
+        request: crate::ngap_handler::NgSetupRequest,
+        /// IEs to report as ignored.
+        notify: Vec<IeDiagnostic>,
+    },
+    /// A not-comprehended IE marked "reject" (§10.3.4.2), or a missing IE
+    /// whose criticality is "reject" (§10.3.5): none of the request may be
+    /// executed, and NG Setup Failure reports these IEs.
+    Reject(Vec<IeDiagnostic>),
+    /// Not decodable, or naming something amfd cannot represent (a RAN node
+    /// other than a gNB or ng-eNB, a PagingDRX extension value).
+    Undecodable,
+}
+
+/// Decode an NG Setup Request (TS 38.413 §9.2.6.1) with the GENERATED codec
+/// (#417 stage 3), applying the criticality rules of §10.3.4.2 and §10.3.5.
+///
+/// The hand-written parser this replaced ignored a not-comprehended IE marked
+/// "ignore" or "notify" alike, and turned one marked "reject" -- or a missing
+/// mandatory IE -- into an undecodable request answered with
+/// protocol/semantic-error. Now: "ignore" is ignored; "notify" proceeds and is
+/// reported; "reject" and a missing GlobalRANNodeID or SupportedTAList (both
+/// criticality reject, §9.2.6.1) reject the request with those IEs listed.
+/// Everything the old parser produced from a request it accepted is produced
+/// identically -- `ng_setup_request_generated_decode_matches_hand_written`.
+pub fn decode_ng_setup_request_asn1(data: &[u8]) -> NgSetupRequestDecode {
+    use ngap_gen::{
+        GlobalRANNodeID, InitiatingMessageValue, NGSetupRequestProtocolIEs_EntryValue as Ie,
+        GNB_ID, NGAP_PDU,
+    };
+    use NgSetupRequestDecode::{Proceed, Reject, Undecodable};
+
+    let (pdu, unknown) = match nextgcore_ngap_gen::decode_with_unknown_ies(data) {
+        Ok(decoded) => decoded,
         Err(e) => {
             log::error!("Failed to decode NGAP PDU: {e:?}");
-            return None;
+            return Undecodable;
         }
     };
-
-    let req = match decoded {
-        NgapMessage::NgSetupRequest(r) => r,
-        _ => {
-            log::error!("Expected NgSetupRequest");
-            return None;
-        }
+    let NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+        value: InitiatingMessageValue::Id_NGSetup(req),
+        ..
+    }) = pdu
+    else {
+        log::error!("Expected NgSetupRequest");
+        return Undecodable;
     };
 
-    let mut result = crate::ngap_handler::NgSetupRequest::default();
-    result.global_ran_node_id_present = true;
-
-    match &req.global_ran_node_id {
-        GlobalRanNodeId::GlobalGnbId {
-            plmn_identity,
-            gnb_id,
-            gnb_id_len,
-        } => {
-            result.plmn_id = decode_plmn_id(plmn_identity);
-            result.gnb_id = *gnb_id;
-            result.gnb_id_len = *gnb_id_len;
-        }
-        GlobalRanNodeId::GlobalNgEnbId { plmn_identity, .. } => {
-            result.plmn_id = decode_plmn_id(plmn_identity);
+    let mut reject = Vec::new();
+    let mut notify = Vec::new();
+    for ie in &unknown {
+        let Ok(ie_id) = u16::try_from(ie.id) else {
+            log::error!("NG Setup Request IE id {} is outside ProtocolIE-ID", ie.id);
+            return Undecodable;
+        };
+        // A container that carried no criticality cannot have marked the IE
+        // ignorable, so it is not.
+        let criticality = ie.criticality.unwrap_or(ngap_gen::Criticality::REJECT);
+        let diagnostic = IeDiagnostic {
+            ie_id,
+            criticality,
+            type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+        };
+        match criticality {
+            ngap_gen::Criticality::IGNORE => {
+                log::debug!("NG Setup Request: ignoring not-comprehended IE {ie_id}");
+            }
+            ngap_gen::Criticality::NOTIFY => {
+                log::warn!(
+                    "NG Setup Request: ignoring not-comprehended IE {ie_id}, and reporting it"
+                );
+                notify.push(diagnostic);
+            }
+            _ => {
+                log::warn!("NG Setup Request: not-comprehended IE {ie_id} is marked reject");
+                reject.push(diagnostic);
+            }
         }
     }
 
-    if let Some(name) = req.ran_node_name {
-        result.ran_node_name = Some(name);
+    let mut global_ran_node_id = None;
+    let mut ran_node_name = None;
+    let mut supported_ta_list = None;
+    // DefaultPagingDRX is mandatory but criticality ignore (§9.2.6.1); absent,
+    // it defaults as the hand-written parser defaulted it.
+    let mut default_paging_drx = ngap_gen::PagingDRX::V128;
+    for entry in req.protocol_i_es.0 {
+        match entry.value {
+            Ie::Id_GlobalRANNodeID(v) => global_ran_node_id = Some(v),
+            Ie::Id_RANNodeName(v) => ran_node_name = Some(v.0),
+            Ie::Id_SupportedTAList(v) => supported_ta_list = Some(v),
+            Ie::Id_DefaultPagingDRX(v) => default_paging_drx = v.0,
+            // Comprehended, and not used by the AMF.
+            Ie::Id_UERetentionInformation(_)
+            | Ie::Id_NB_IoT_DefaultPagingDRX(_)
+            | Ie::Id_Extended_RANNodeName(_) => {}
+        }
+    }
+    let missing = |ie_id: u16| IeDiagnostic {
+        ie_id,
+        criticality: ngap_gen::Criticality::REJECT,
+        type_of_error: ngap_gen::TypeOfError::MISSING,
+    };
+    if global_ran_node_id.is_none() {
+        reject.push(missing(ngap_gen::ID_GLOBAL_RAN_NODE_ID));
+    }
+    if supported_ta_list.is_none() {
+        reject.push(missing(ngap_gen::ID_SUPPORTED_TA_LIST));
+    }
+    let (Some(global_ran_node_id), Some(supported_ta_list)) =
+        (global_ran_node_id, supported_ta_list)
+    else {
+        return Reject(reject);
+    };
+    if !reject.is_empty() {
+        return Reject(reject);
     }
 
-    result.supported_ta_list = req
-        .supported_ta_list
+    let mut request = crate::ngap_handler::NgSetupRequest {
+        global_ran_node_id_present: true,
+        ran_node_name,
+        ..Default::default()
+    };
+    match global_ran_node_id {
+        GlobalRANNodeID::GlobalGNB_ID(gnb) => {
+            request.plmn_id = decode_plmn_id(&gnb.plmn_identity.0);
+            let GNB_ID::GNB_ID(bits) = gnb.gnb_id else {
+                log::error!("NG Setup Request: gNB-ID is a choice extension");
+                return Undecodable;
+            };
+            // SIZE(22..32), so it fits: the decoder enforces the bound.
+            request.gnb_id_len = bits.0.len() as u8;
+            request.gnb_id = bits
+                .0
+                .iter()
+                .fold(0u32, |id, bit| (id << 1) | u32::from(*bit));
+        }
+        GlobalRANNodeID::GlobalNgENB_ID(ng_enb) => {
+            request.plmn_id = decode_plmn_id(&ng_enb.plmn_identity.0);
+        }
+        other => {
+            log::error!("NG Setup Request from an unsupported RAN node type: {other:?}");
+            return Undecodable;
+        }
+    }
+
+    // TAC SIZE(3), SST SIZE(1), SD SIZE(3): the decoder enforces each bound.
+    let octets = |bytes: &[u8]| bytes.iter().fold(0u32, |v, b| (v << 8) | u32::from(*b));
+    request.supported_ta_list = supported_ta_list
+        .0
         .iter()
-        .map(|ta_item| {
-            let tac = ((ta_item.tac[0] as u32) << 16)
-                | ((ta_item.tac[1] as u32) << 8)
-                | (ta_item.tac[2] as u32);
-
-            let bplmn_list: Vec<crate::context::BplmnEntry> = ta_item
+        .map(|ta| {
+            let bplmn_list: Vec<crate::context::BplmnEntry> = ta
                 .broadcast_plmn_list
+                .0
                 .iter()
                 .map(|bp| {
-                    let plmn_id = decode_plmn_id(&bp.plmn_identity);
                     let s_nssai: Vec<crate::context::SNssai> = bp
                         .tai_slice_support_list
+                        .0
                         .iter()
-                        .map(|slice| crate::context::SNssai {
-                            sst: slice.sst,
-                            sd: slice.sd.map(|sd| {
-                                ((sd[0] as u32) << 16) | ((sd[1] as u32) << 8) | (sd[2] as u32)
-                            }),
+                        .map(|item| crate::context::SNssai {
+                            sst: octets(&item.s_nssai.sst.0) as u8,
+                            sd: item.s_nssai.sd.as_ref().map(|sd| octets(&sd.0)),
                         })
                         .collect();
                     crate::context::BplmnEntry {
-                        plmn_id,
+                        plmn_id: decode_plmn_id(&bp.plmn_identity.0),
                         num_of_s_nssai: s_nssai.len(),
                         s_nssai,
                     }
                 })
                 .collect();
-
             crate::context::SupportedTa {
-                tac,
+                tac: octets(&ta.tac.0),
                 num_of_bplmn_list: bplmn_list.len(),
                 bplmn_list,
             }
         })
         .collect();
 
-    result.default_paging_drx = req.default_paging_drx as u8;
+    // PagingDRX is extensible; an extension value is one the hand-written
+    // parser refused, and the AMF has no representation for it.
+    if default_paging_drx > ngap_gen::PagingDRX::V256 {
+        log::error!("NG Setup Request: PagingDRX extension value {default_paging_drx}");
+        return Undecodable;
+    }
+    request.default_paging_drx = default_paging_drx;
 
-    Some(result)
+    Proceed { request, notify }
 }
 
 /// Parsed Initial UE Message data
@@ -1290,7 +1434,7 @@ pub fn parse_n2_sm_setup_response_transfer(data: &[u8]) -> Option<GnbN3Endpoint>
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::context::{AmfId, Guami, PlmnId, PlmnSupport, SNssai};
 
@@ -1317,10 +1461,158 @@ mod tests {
     }
 
     /// The hand-written NG Setup encoders exactly as they were before #417
-    /// stage 2 moved the family onto the generated codec -- kept verbatim as the
-    /// ORACLE the generated output is compared against, byte for byte.
+    /// stage 2 moved the family onto the generated codec, and the decoder as it
+    /// was before stage 3 -- kept verbatim as the ORACLE the generated output is
+    /// compared against.
     mod hand_written_oracle {
         use super::super::*;
+
+        /// The NG Setup Request decoder as it was before #417 stage 3 moved it
+        /// onto the generated codec.
+        pub(super) fn hand_written_parse_ng_setup_request(
+            data: &[u8],
+        ) -> Option<crate::ngap_handler::NgSetupRequest> {
+            let decoded = match parser::decode_ngap_pdu(data) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    log::error!("Failed to decode NGAP PDU: {e:?}");
+                    return None;
+                }
+            };
+
+            let req = match decoded {
+                NgapMessage::NgSetupRequest(r) => r,
+                _ => {
+                    log::error!("Expected NgSetupRequest");
+                    return None;
+                }
+            };
+
+            let mut result = crate::ngap_handler::NgSetupRequest::default();
+            result.global_ran_node_id_present = true;
+
+            match &req.global_ran_node_id {
+                GlobalRanNodeId::GlobalGnbId {
+                    plmn_identity,
+                    gnb_id,
+                    gnb_id_len,
+                } => {
+                    result.plmn_id = decode_plmn_id(plmn_identity);
+                    result.gnb_id = *gnb_id;
+                    result.gnb_id_len = *gnb_id_len;
+                }
+                GlobalRanNodeId::GlobalNgEnbId { plmn_identity, .. } => {
+                    result.plmn_id = decode_plmn_id(plmn_identity);
+                }
+            }
+
+            if let Some(name) = req.ran_node_name {
+                result.ran_node_name = Some(name);
+            }
+
+            result.supported_ta_list = req
+                .supported_ta_list
+                .iter()
+                .map(|ta_item| {
+                    let tac = ((ta_item.tac[0] as u32) << 16)
+                        | ((ta_item.tac[1] as u32) << 8)
+                        | (ta_item.tac[2] as u32);
+
+                    let bplmn_list: Vec<crate::context::BplmnEntry> = ta_item
+                        .broadcast_plmn_list
+                        .iter()
+                        .map(|bp| {
+                            let plmn_id = decode_plmn_id(&bp.plmn_identity);
+                            let s_nssai: Vec<crate::context::SNssai> = bp
+                                .tai_slice_support_list
+                                .iter()
+                                .map(|slice| crate::context::SNssai {
+                                    sst: slice.sst,
+                                    sd: slice.sd.map(|sd| {
+                                        ((sd[0] as u32) << 16)
+                                            | ((sd[1] as u32) << 8)
+                                            | (sd[2] as u32)
+                                    }),
+                                })
+                                .collect();
+                            crate::context::BplmnEntry {
+                                plmn_id,
+                                num_of_s_nssai: s_nssai.len(),
+                                s_nssai,
+                            }
+                        })
+                        .collect();
+
+                    crate::context::SupportedTa {
+                        tac,
+                        num_of_bplmn_list: bplmn_list.len(),
+                        bplmn_list,
+                    }
+                })
+                .collect();
+
+            result.default_paging_drx = req.default_paging_drx as u8;
+
+            Some(result)
+        }
+
+        /// An NG Setup Failure carrying a Criticality Diagnostics IE, assembled
+        /// from the hand-written IE encoders -- the oracle for the stage 3
+        /// diagnostics. Not `builder::build_ng_setup_failure`: that builder
+        /// silently DROPS `NgSetupFailure::criticality_diagnostics` (it encodes
+        /// only Cause and TimeToWait), so it cannot vouch for the IE.
+        pub(super) fn hand_written_ng_setup_failure_with_diagnostics(
+            cause_group: u8,
+            cause_value: i64,
+            diagnostics: &[IeDiagnostic],
+        ) -> Vec<u8> {
+            use nextgcore_asn1c::ngap::ies::ProtocolIeContainer;
+            use nextgcore_asn1c::ngap::pdu::{
+                NgapPdu, UnsuccessfulOutcome, UnsuccessfulOutcomeValue,
+            };
+            use nextgcore_asn1c::ngap::types::{Criticality, ProcedureCode};
+            use nextgcore_asn1c::per::{AperEncode, AperEncoder};
+
+            let ies = diagnostics
+                .iter()
+                .map(|d| IeCriticalityDiagnostics {
+                    ie_criticality: match d.criticality {
+                        0 => Criticality::Reject,
+                        1 => Criticality::Ignore,
+                        _ => Criticality::Notify,
+                    },
+                    ie_id: d.ie_id,
+                    type_of_error: match d.type_of_error {
+                        0 => TypeOfError::NotUnderstood,
+                        _ => TypeOfError::Missing,
+                    },
+                })
+                .collect();
+            let mut container = ProtocolIeContainer::new();
+            nextgcore_ngap::ie::encode_cause(
+                &mut container,
+                &build_cause(cause_group, cause_value),
+            )
+            .expect("cause");
+            nextgcore_ngap::ie::encode_time_to_wait(&mut container, TimeToWait::V1s).expect("ttw");
+            nextgcore_ngap::ie::encode_criticality_diagnostics(
+                &mut container,
+                &CriticalityDiagnostics {
+                    ies,
+                    ..Default::default()
+                },
+            )
+            .expect("diagnostics");
+            let pdu = NgapPdu::UnsuccessfulOutcome(UnsuccessfulOutcome {
+                procedure_code: ProcedureCode::NG_SETUP,
+                criticality: Criticality::Reject,
+                value: UnsuccessfulOutcomeValue::NgSetupFailure(container),
+            });
+            let mut encoder = AperEncoder::new();
+            pdu.encode_aper(&mut encoder).expect("encode");
+            encoder.align();
+            encoder.into_bytes().to_vec()
+        }
 
         /// Build an NG Setup Response PDU with proper ASN.1 APER encoding
         ///
@@ -1615,35 +1907,46 @@ mod tests {
         }
     }
 
-    /// The fallback emits the same bytes, so equivalence alone cannot show the
-    /// generated codec is actually used. Pin which path each cause takes: every
-    /// ROOT value the AMF can produce goes through the generated codec, and only
-    /// the radioNetwork extension values 45/46 fall back.
+    /// Every cause the AMF can produce -- radioNetwork extension values 45/46
+    /// included -- is encoded by the generated codec and decodes back to the
+    /// same (group, wire value). Stage 2 sent 45/46 to a hand-written fallback,
+    /// which emitted the same bytes and so was invisible to the equivalence
+    /// test; with the fallback deleted there is one path, and this pins that it
+    /// carries every value.
     #[test]
-    fn ng_setup_failure_root_causes_take_the_generated_codec() {
-        for (group, root_max) in [(0u8, 44i64), (1, 1), (2, 3), (3, 6), (4, 5)] {
-            for value in 0..=root_max {
-                assert!(
-                    generated_cause(build_cause(group, value)).is_some(),
-                    "group {group} value {value} must encode through the generated codec"
-                );
+    fn ng_setup_failure_every_cause_takes_the_generated_codec() {
+        use ngap_gen::{NGSetupFailureProtocolIEs_EntryValue as Ie, UnsuccessfulOutcomeValue};
+        for (group, last) in [(0u8, 46i64), (1, 1), (2, 3), (3, 6), (4, 5)] {
+            for value in 0..=last {
+                let bytes = build_ng_setup_failure_asn1(group, value, None);
+                let pdu = nextgcore_ngap_gen::decode(&bytes)
+                    .unwrap_or_else(|e| panic!("group {group} value {value}: {e:?}"));
+                let ngap_gen::NGAP_PDU::UnsuccessfulOutcome(outcome) = pdu else {
+                    panic!("group {group} value {value}: not an unsuccessfulOutcome");
+                };
+                let UnsuccessfulOutcomeValue::Id_NGSetup(failure) = outcome.value else {
+                    panic!("group {group} value {value}: not NG Setup Failure");
+                };
+                let cause = failure
+                    .protocol_i_es
+                    .0
+                    .iter()
+                    .find_map(|e| match &e.value {
+                        Ie::Id_Cause(c) => Some(c.clone()),
+                        _ => None,
+                    })
+                    .expect("Cause IE");
+                let decoded = match cause {
+                    ngap_gen::Cause::RadioNetwork(c) => (0, c.0),
+                    ngap_gen::Cause::Transport(c) => (1, c.0),
+                    ngap_gen::Cause::Nas(c) => (2, c.0),
+                    ngap_gen::Cause::Protocol(c) => (3, c.0),
+                    ngap_gen::Cause::Misc(c) => (4, c.0),
+                    other => panic!("group {group} value {value}: {other:?}"),
+                };
+                assert_eq!(decoded, (group, value as u8), "group {group} value {value}");
             }
         }
-        for value in [45, 46] {
-            assert!(
-                generated_cause(build_cause(0, value)).is_none(),
-                "radioNetwork {value}"
-            );
-        }
-        // The two causes the NG Setup handler actually sends (ngap_handler.rs).
-        assert!(
-            generated_cause(build_cause(3, 4)).is_some(),
-            "protocol/semantic-error"
-        );
-        assert!(
-            generated_cause(build_cause(4, 4)).is_some(),
-            "misc/unknown-PLMN-or-SNPN"
-        );
     }
 
     /// Golden bytes, so the equivalence above cannot pass by both encoders
@@ -1676,17 +1979,9 @@ mod tests {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// Why the NG Setup REQUEST is still decoded by the hand-written parser:
-    /// TS 38.413 §10.3.4 requires a receiver to ignore a not-comprehended IE
-    /// marked "ignore" and continue the procedure, and the generated OPEN-type
-    /// decoder instead fails the whole PDU on any IE id outside the schema. An
-    /// AMF on the generated decoder would refuse NG Setup from any gNB newer
-    /// than Rel-17.9 that adds an optional IE. This pins that ceiling; when the
-    /// forked decoder learns to skip unknown ignorable IEs, it fails and the
-    /// parse can move too.
-    #[test]
-    fn generated_decoder_rejects_an_ignorable_unknown_ie_so_parse_stays_hand_written() {
-        let request = nextgcore_ngap::builder::build_ng_setup_request(&NgSetupRequest {
+    /// A well-formed NG Setup Request from a gNB serving TAC 1 in 999/70.
+    fn baseline_request_ies() -> NgSetupRequest {
+        NgSetupRequest {
             global_ran_node_id: GlobalRanNodeId::GlobalGnbId {
                 plmn_identity: [0x99, 0xf9, 0x07],
                 gnb_id: 1,
@@ -1704,35 +1999,341 @@ mod tests {
                 }],
             }],
             default_paging_drx: PagingDrx::V128,
-        })
-        .expect("build request");
-        assert!(
-            nextgcore_ngap_gen::decode(&request).is_ok(),
-            "baseline decodes"
-        );
+        }
+    }
 
-        // Splice in IE id 9999, criticality ignore, a one-octet value. Layout:
-        // [0]=CHOICE, [1]=procedure code, [2]=criticality, [3]=open-type
-        // length (short form), [4]=SEQUENCE extension bit + padding, [5..7]=IE
-        // count, then the IEs.
-        let mut spliced = request.clone();
+    pub(crate) fn baseline_request() -> Vec<u8> {
+        nextgcore_ngap::builder::build_ng_setup_request(&baseline_request_ies()).expect("build")
+    }
+
+    /// `request` with one more protocol IE appended: `id`, criticality octet
+    /// (0x00 reject, 0x40 ignore, 0x80 notify), a one-octet value. Layout:
+    /// [0]=CHOICE, [1]=procedure code, [2]=criticality, [3]=open-type length
+    /// (short form), [4]=SEQUENCE extension bit + padding, [5..7]=IE count,
+    /// then the IEs.
+    pub(crate) fn with_unknown_ie(request: &[u8], id: u16, criticality: u8) -> Vec<u8> {
+        let mut spliced = request.to_vec();
         assert!(
             spliced[3] < 0x7b,
             "short-form length leaves room for 5 octets"
         );
         let count = u16::from_be_bytes([spliced[5], spliced[6]]) + 1;
         spliced[5..7].copy_from_slice(&count.to_be_bytes());
-        spliced.extend_from_slice(&[0x27, 0x0f, 0x40, 0x01, 0x00]);
+        let [hi, lo] = id.to_be_bytes();
+        spliced.extend_from_slice(&[hi, lo, criticality, 0x01, 0x00]);
         spliced[3] += 5;
+        spliced
+    }
 
-        assert!(
-            parse_ng_setup_request_asn1(&spliced).is_some(),
-            "hand-written parser ignores the unknown ignorable IE (§10.3.4)"
+    /// `request` with the protocol IE `id` removed, re-encoded by the
+    /// generated codec.
+    fn without_ie(request: &[u8], id: u16) -> Vec<u8> {
+        let mut pdu = nextgcore_ngap_gen::decode(request).expect("decode");
+        let ngap_gen::NGAP_PDU::InitiatingMessage(ref mut msg) = pdu else {
+            panic!("initiatingMessage");
+        };
+        let ngap_gen::InitiatingMessageValue::Id_NGSetup(ref mut req) = msg.value else {
+            panic!("NG Setup Request");
+        };
+        req.protocol_i_es.0.retain(|e| e.id.0 != id);
+        nextgcore_ngap_gen::encode(&pdu).expect("encode")
+    }
+
+    /// The decode outcome flattened to what the hand-written parser could say:
+    /// a request, or nothing. A `Reject` never comes out of a request the old
+    /// parser accepted, so it is a test failure here.
+    fn proceed_or_none(data: &[u8]) -> Option<crate::ngap_handler::NgSetupRequest> {
+        match decode_ng_setup_request_asn1(data) {
+            NgSetupRequestDecode::Proceed { request, notify } => {
+                assert!(notify.is_empty(), "no IE to report in {data:02x?}");
+                Some(request)
+            }
+            NgSetupRequestDecode::Undecodable => None,
+            NgSetupRequestDecode::Reject(d) => panic!("unexpected Reject({d:?}) for {data:02x?}"),
+        }
+    }
+
+    /// #417 stage 3: the generated decode yields exactly what the hand-written
+    /// parser yielded, request for request, and refuses what it refused.
+    #[test]
+    fn ng_setup_request_generated_decode_matches_hand_written() {
+        let mut requests = Vec::new();
+        for (gnb_id, gnb_id_len) in [
+            (0u32, 22u8),
+            (0x3f_ffff, 22),
+            (0x1_2345, 25),
+            (u32::MAX, 32),
+        ] {
+            let mut ies = baseline_request_ies();
+            ies.global_ran_node_id = GlobalRanNodeId::GlobalGnbId {
+                plmn_identity: [0x13, 0x00, 0x62],
+                gnb_id,
+                gnb_id_len,
+            };
+            requests.push(ies);
+        }
+        let mut ng_enb = baseline_request_ies();
+        ng_enb.global_ran_node_id = GlobalRanNodeId::GlobalNgEnbId {
+            plmn_identity: [0x00, 0xf1, 0x10],
+            ng_enb_id: 0xabcde,
+        };
+        requests.push(ng_enb);
+        for drx in [
+            PagingDrx::V32,
+            PagingDrx::V64,
+            PagingDrx::V128,
+            PagingDrx::V256,
+        ] {
+            let mut ies = baseline_request_ies();
+            ies.default_paging_drx = drx;
+            ies.ran_node_name = Some("gnb-west 1".to_string());
+            requests.push(ies);
+        }
+        let mut rich = baseline_request_ies();
+        rich.ran_node_name = Some("x".repeat(150));
+        rich.supported_ta_list = (0..3u8)
+            .map(|t| SupportedTaItem {
+                tac: [t, 0xff, 0x10],
+                broadcast_plmn_list: vec![
+                    BroadcastPlmnItem {
+                        plmn_identity: [0x99, 0xf9, 0x07],
+                        tai_slice_support_list: vec![
+                            nextgcore_ngap::types::SNssai { sst: 1, sd: None },
+                            nextgcore_ngap::types::SNssai {
+                                sst: 255,
+                                sd: Some([0x00, 0x00, 0x01]),
+                            },
+                        ],
+                    },
+                    BroadcastPlmnItem {
+                        plmn_identity: [0x13, 0x00, 0x62],
+                        tai_slice_support_list: vec![nextgcore_ngap::types::SNssai {
+                            sst: 2,
+                            sd: Some([0xff, 0xff, 0xff]),
+                        }],
+                    },
+                ],
+            })
+            .collect();
+        requests.push(rich);
+
+        let mut inputs: Vec<Vec<u8>> = requests
+            .iter()
+            .map(|r| nextgcore_ngap::builder::build_ng_setup_request(r).expect("build"))
+            .collect();
+        // Refused by both: garbage, a truncation, and a PDU that is not a request.
+        inputs.push(vec![0x00, 0x15, 0x00, 0x01, 0xff]);
+        let baseline = baseline_request();
+        inputs.push(baseline[..baseline.len() - 1].to_vec());
+        inputs.push(build_ng_setup_response_asn1(&create_test_context()).expect("response"));
+        inputs.push(Vec::new());
+
+        for (i, data) in inputs.iter().enumerate() {
+            assert_eq!(
+                format!("{:?}", proceed_or_none(data)),
+                format!(
+                    "{:?}",
+                    hand_written_oracle::hand_written_parse_ng_setup_request(data)
+                ),
+                "input {i}: {data:02x?}"
+            );
+        }
+        for (i, data) in inputs.iter().enumerate().take(requests.len()) {
+            assert!(proceed_or_none(data).is_some(), "request {i} decodes");
+        }
+    }
+
+    /// §10.3.4.2 "Ignore IE": a not-comprehended IE marked ignore is dropped,
+    /// and the procedure runs on the rest as if it had not been sent.
+    #[test]
+    fn ng_setup_request_unknown_ignore_ie_proceeds_silently() {
+        let baseline = baseline_request();
+        let spliced = with_unknown_ie(&baseline, 9999, 0x40);
+        let NgSetupRequestDecode::Proceed { request, notify } =
+            decode_ng_setup_request_asn1(&spliced)
+        else {
+            panic!("an ignorable unknown IE must not stop the procedure");
+        };
+        assert!(notify.is_empty(), "ignore is not reported: {notify:?}");
+        assert_eq!(
+            format!("{request:?}"),
+            format!("{:?}", proceed_or_none(&baseline).expect("baseline")),
         );
-        assert!(
-            nextgcore_ngap_gen::decode(&spliced).is_err(),
-            "generated decoder fails the whole PDU on an unknown IE id"
+    }
+
+    /// §10.3.4.2 "Ignore IE and Notify Sender": the procedure runs, and the IE
+    /// is handed back to be reported as not understood.
+    #[test]
+    fn ng_setup_request_unknown_notify_ie_proceeds_and_is_reported() {
+        let baseline = baseline_request();
+        let spliced = with_unknown_ie(&baseline, 9999, 0x80);
+        let NgSetupRequestDecode::Proceed { request, notify } =
+            decode_ng_setup_request_asn1(&spliced)
+        else {
+            panic!("a notify unknown IE must not stop the procedure");
+        };
+        assert_eq!(
+            notify,
+            vec![IeDiagnostic {
+                ie_id: 9999,
+                criticality: ngap_gen::Criticality::NOTIFY,
+                type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+            }]
         );
+        assert_eq!(
+            format!("{request:?}"),
+            format!("{:?}", proceed_or_none(&baseline).expect("baseline")),
+        );
+    }
+
+    /// §10.3.4.2 "Reject IE": none of the request is executed, and the IE is
+    /// reported -- alongside a notify IE, which does not soften it.
+    #[test]
+    fn ng_setup_request_unknown_reject_ie_rejects_the_request() {
+        let baseline = baseline_request();
+        let spliced = with_unknown_ie(&baseline, 9999, 0x00);
+        let reject_9999 = IeDiagnostic {
+            ie_id: 9999,
+            criticality: ngap_gen::Criticality::REJECT,
+            type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+        };
+        assert!(
+            matches!(decode_ng_setup_request_asn1(&spliced), NgSetupRequestDecode::Reject(ref d) if *d == [reject_9999]),
+            "{:?}",
+            decode_ng_setup_request_asn1(&spliced)
+        );
+        let both = with_unknown_ie(&with_unknown_ie(&baseline, 9998, 0x80), 9999, 0x00);
+        assert!(
+            matches!(decode_ng_setup_request_asn1(&both), NgSetupRequestDecode::Reject(ref d) if *d == [reject_9999]),
+            "{:?}",
+            decode_ng_setup_request_asn1(&both)
+        );
+    }
+
+    /// §10.3.5: GlobalRANNodeID and SupportedTAList are criticality reject
+    /// (§9.2.6.1), so either one missing rejects the request, reported as
+    /// missing. DefaultPagingDRX is criticality ignore: absent, it defaults.
+    #[test]
+    fn ng_setup_request_missing_mandatory_ie_is_rejected_as_missing() {
+        let baseline = baseline_request();
+        for id in [
+            ngap_gen::ID_GLOBAL_RAN_NODE_ID,
+            ngap_gen::ID_SUPPORTED_TA_LIST,
+        ] {
+            let data = without_ie(&baseline, id);
+            let expected = vec![IeDiagnostic {
+                ie_id: id,
+                criticality: ngap_gen::Criticality::REJECT,
+                type_of_error: ngap_gen::TypeOfError::MISSING,
+            }];
+            assert!(
+                matches!(decode_ng_setup_request_asn1(&data), NgSetupRequestDecode::Reject(ref d) if *d == expected),
+                "IE {id}: {:?}",
+                decode_ng_setup_request_asn1(&data)
+            );
+        }
+        let no_drx = without_ie(&baseline, ngap_gen::ID_DEFAULT_PAGING_DRX);
+        let request = proceed_or_none(&no_drx).expect("DefaultPagingDRX absent still proceeds");
+        assert_eq!(request.default_paging_drx, ngap_gen::PagingDRX::V128);
+    }
+
+    fn reject_and_missing() -> Vec<IeDiagnostic> {
+        vec![
+            IeDiagnostic {
+                ie_id: 9999,
+                criticality: ngap_gen::Criticality::REJECT,
+                type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+            },
+            IeDiagnostic {
+                ie_id: ngap_gen::ID_SUPPORTED_TA_LIST,
+                criticality: ngap_gen::Criticality::REJECT,
+                type_of_error: ngap_gen::TypeOfError::MISSING,
+            },
+            IeDiagnostic {
+                ie_id: 9998,
+                criticality: ngap_gen::Criticality::NOTIFY,
+                type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+            },
+        ]
+    }
+
+    /// The Failure's Criticality Diagnostics IE is the one the hand-written
+    /// encoder would have built, byte for byte, and without diagnostics the
+    /// Failure is unchanged.
+    #[test]
+    fn ng_setup_failure_diagnostics_match_hand_written() {
+        let all = reject_and_missing();
+        for diagnostics in [&all[..1], &all[..]] {
+            assert_eq!(
+                build_ng_setup_failure_with_diagnostics_asn1(
+                    3,
+                    crate::ngap_handler::protocol_cause::ABSTRACT_SYNTAX_ERROR_REJECT,
+                    Some(0),
+                    diagnostics,
+                ),
+                hand_written_oracle::hand_written_ng_setup_failure_with_diagnostics(
+                    3,
+                    crate::ngap_handler::protocol_cause::ABSTRACT_SYNTAX_ERROR_REJECT,
+                    diagnostics,
+                ),
+                "{diagnostics:?}"
+            );
+        }
+        assert_eq!(
+            build_ng_setup_failure_with_diagnostics_asn1(4, 4, Some(2), &[]),
+            build_ng_setup_failure_asn1(4, 4, Some(2)),
+        );
+    }
+
+    /// The Response reports notify IEs in Criticality Diagnostics (id 19,
+    /// criticality ignore), which a peer on either codec decodes; without them
+    /// the bytes are the stage 2 Response's; and the list is cut at
+    /// maxnoofErrors rather than refused.
+    #[test]
+    fn ng_setup_response_reports_notify_ies_in_criticality_diagnostics() {
+        use ngap_gen::{NGSetupResponseProtocolIEs_EntryValue as Ie, SuccessfulOutcomeValue};
+        let ctx = create_test_context();
+        assert_eq!(
+            build_ng_setup_response_with_diagnostics_asn1(&ctx, &[]),
+            build_ng_setup_response_asn1(&ctx)
+        );
+        let notify = vec![reject_and_missing()[2]];
+        let many = vec![notify[0]; 300];
+        for (diagnostics, reported) in [(&notify, 1usize), (&many, 256)] {
+            let bytes =
+                build_ng_setup_response_with_diagnostics_asn1(&ctx, diagnostics).expect("build");
+            assert!(
+                matches!(
+                    parser::decode_ngap_pdu(&bytes),
+                    Ok(NgapMessage::NgSetupResponse(_))
+                ),
+                "the hand-written decoder still reads the Response"
+            );
+            let ngap_gen::NGAP_PDU::SuccessfulOutcome(outcome) =
+                nextgcore_ngap_gen::decode(&bytes).expect("decode")
+            else {
+                panic!("successfulOutcome");
+            };
+            let SuccessfulOutcomeValue::Id_NGSetup(response) = outcome.value else {
+                panic!("NG Setup Response");
+            };
+            let last = response.protocol_i_es.0.last().expect("IEs");
+            assert_eq!(last.id.0, ngap_gen::ID_CRITICALITY_DIAGNOSTICS, "last IE");
+            assert_eq!(last.criticality.0, ngap_gen::Criticality::IGNORE);
+            let Ie::Id_CriticalityDiagnostics(cd) = &last.value else {
+                panic!("Criticality Diagnostics");
+            };
+            assert_eq!(cd.procedure_code, None);
+            assert_eq!(cd.triggering_message, None);
+            let list = &cd.i_es_criticality_diagnostics.as_ref().expect("IE list").0;
+            assert_eq!(list.len(), reported);
+            assert_eq!(list[0].ie_id.0, 9998);
+            assert_eq!(list[0].ie_criticality.0, ngap_gen::Criticality::NOTIFY);
+            assert_eq!(
+                list[0].type_of_error.0,
+                ngap_gen::TypeOfError::NOT_UNDERSTOOD
+            );
+        }
     }
 
     #[test]
