@@ -8,7 +8,11 @@
 //! codec generated from the TS 38.413 ASN.1 (`nextgcore-ngap-gen`). Migrated so
 //! far: the whole NG Setup family -- the Response and Failure encoders (stage 2)
 //! and the Request decoder (stage 3), which applies TS 38.413 §10.3.4/§10.3.5 to
-//! not-comprehended and missing IEs ([`decode_ng_setup_request_asn1`]).
+//! not-comprehended and missing IEs ([`decode_ng_setup_request_asn1`]) -- and
+//! the UE Context Release family (stage 4): the Command encoder and the Request
+//! and Complete decoders ([`decode_ue_context_release_request_asn1`],
+//! [`decode_ue_context_release_complete_asn1`]), which report through an Error
+//! Indication where §10.3.4.2 says to.
 
 use nextgcore_asn1c::ngap::cause::{
     Cause, CauseMisc, CauseNas, CauseProtocol, CauseRadioNetwork, CauseTransport,
@@ -319,10 +323,22 @@ const MAX_NOOF_ERRORS: usize = 256;
 fn generated_criticality_diagnostics(
     diagnostics: &[IeDiagnostic],
 ) -> ngap_gen::CriticalityDiagnostics {
+    generated_criticality_diagnostics_for(None, diagnostics)
+}
+
+/// [`generated_criticality_diagnostics`], with Procedure Code, Triggering
+/// Message and Procedure Criticality filled from `procedure` when the report
+/// travels in an Error Indication (§10.3.4.2: "the Procedure Code IE, the
+/// Triggering Message IE, Procedure Criticality IE, and the Information Element
+/// Criticality Diagnostics IE shall be included").
+fn generated_criticality_diagnostics_for(
+    procedure: Option<&ReportedProcedure>,
+    diagnostics: &[IeDiagnostic],
+) -> ngap_gen::CriticalityDiagnostics {
     ngap_gen::CriticalityDiagnostics {
-        procedure_code: None,
-        triggering_message: None,
-        procedure_criticality: None,
+        procedure_code: procedure.map(|p| ngap_gen::ProcedureCode(p.procedure_code)),
+        triggering_message: procedure.map(|p| ngap_gen::TriggeringMessage(p.triggering_message)),
+        procedure_criticality: procedure.map(|p| ngap_gen::Criticality(p.procedure_criticality)),
         i_es_criticality_diagnostics: Some(ngap_gen::CriticalityDiagnostics_IE_List(
             diagnostics
                 .iter()
@@ -337,6 +353,47 @@ fn generated_criticality_diagnostics(
         )),
         ie_extensions: None,
     }
+}
+
+/// Sort the not-comprehended IEs [`nextgcore_ngap_gen::decode_with_unknown_ies`]
+/// skipped by their criticality (TS 38.413 §10.3.4.2): "ignore" ones are
+/// dropped, and the "reject" and "ignore IE and notify sender" ones come back as
+/// `(reject, notify)` diagnostics. `None` when an IE id is outside ProtocolIE-ID,
+/// which no well-formed container can carry. `message` names the PDU in logs.
+fn classify_unknown_ies(
+    unknown: &[nextgcore_ngap_gen::UnknownIe],
+    message: &str,
+) -> Option<(Vec<IeDiagnostic>, Vec<IeDiagnostic>)> {
+    let mut reject = Vec::new();
+    let mut notify = Vec::new();
+    for ie in unknown {
+        let Ok(ie_id) = u16::try_from(ie.id) else {
+            log::error!("{message} IE id {} is outside ProtocolIE-ID", ie.id);
+            return None;
+        };
+        // A container that carried no criticality cannot have marked the IE
+        // ignorable, so it is not.
+        let criticality = ie.criticality.unwrap_or(ngap_gen::Criticality::REJECT);
+        let diagnostic = IeDiagnostic {
+            ie_id,
+            criticality,
+            type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+        };
+        match criticality {
+            ngap_gen::Criticality::IGNORE => {
+                log::debug!("{message}: ignoring not-comprehended IE {ie_id}");
+            }
+            ngap_gen::Criticality::NOTIFY => {
+                log::warn!("{message}: ignoring not-comprehended IE {ie_id}, and reporting it");
+                notify.push(diagnostic);
+            }
+            _ => {
+                log::warn!("{message}: not-comprehended IE {ie_id} is marked reject");
+                reject.push(diagnostic);
+            }
+        }
+    }
+    Some((reject, notify))
 }
 
 /// Build Cause from group and value
@@ -477,37 +534,9 @@ pub fn decode_ng_setup_request_asn1(data: &[u8]) -> NgSetupRequestDecode {
         return Undecodable;
     };
 
-    let mut reject = Vec::new();
-    let mut notify = Vec::new();
-    for ie in &unknown {
-        let Ok(ie_id) = u16::try_from(ie.id) else {
-            log::error!("NG Setup Request IE id {} is outside ProtocolIE-ID", ie.id);
-            return Undecodable;
-        };
-        // A container that carried no criticality cannot have marked the IE
-        // ignorable, so it is not.
-        let criticality = ie.criticality.unwrap_or(ngap_gen::Criticality::REJECT);
-        let diagnostic = IeDiagnostic {
-            ie_id,
-            criticality,
-            type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
-        };
-        match criticality {
-            ngap_gen::Criticality::IGNORE => {
-                log::debug!("NG Setup Request: ignoring not-comprehended IE {ie_id}");
-            }
-            ngap_gen::Criticality::NOTIFY => {
-                log::warn!(
-                    "NG Setup Request: ignoring not-comprehended IE {ie_id}, and reporting it"
-                );
-                notify.push(diagnostic);
-            }
-            _ => {
-                log::warn!("NG Setup Request: not-comprehended IE {ie_id} is marked reject");
-                reject.push(diagnostic);
-            }
-        }
-    }
+    let Some((mut reject, notify)) = classify_unknown_ies(&unknown, "NG Setup Request") else {
+        return Undecodable;
+    };
 
     let mut global_ran_node_id = None;
     let mut ran_node_name = None;
@@ -908,23 +937,6 @@ pub fn parse_initial_context_setup_response_asn1(data: &[u8]) -> Option<(u64, u3
     }
 }
 
-/// Decode a UE Context Release Complete (gNB -> AMF, TS 38.413 §9.2.5.5).
-/// Returns the AMF UE NGAP ID it names, so the AMF can act on the ONE UE whose N1
-/// connection ended rather than on every UE of the association.
-pub fn parse_ue_context_release_complete_asn1(data: &[u8]) -> Option<u64> {
-    match parser::decode_ngap_pdu(data) {
-        Ok(NgapMessage::UeContextReleaseComplete(complete)) => Some(complete.amf_ue_ngap_id),
-        Ok(other) => {
-            log::warn!("Expected UeContextReleaseComplete, got {other:?}");
-            None
-        }
-        Err(e) => {
-            log::warn!("Failed to decode UE Context Release Complete: {e:?}");
-            None
-        }
-    }
-}
-
 /// Decode an Initial Context Setup Failure (gNB -> AMF, TS 38.413 §9.2.2.3).
 /// Returns (amf_ue_ngap_id, ran_ue_ngap_id) on success.
 pub fn parse_initial_context_setup_failure_asn1(data: &[u8]) -> Option<(u64, u32)> {
@@ -1224,60 +1236,58 @@ pub fn extract_ran_ue_ngap_id(data: &[u8]) -> Option<u32> {
     }
 }
 
-/// Extract the Cause from a UE Context Release Request as a
-/// `(group, value)` pair (#397).
-///
-/// Cause is a MANDATORY IE of UEContextReleaseRequest (TS 38.413 §9.2.2.3), and
-/// `nextgcore_ngap::parser::parse_ue_context_release_request` already decodes it and
-/// refuses the message without it — this only surfaces what was decoded and then
-/// discarded, so nothing new is parsed off the wire.
-///
-/// The `(group, value)` shape is the one TS 29.518's `NgApCause`
-/// (`TS29571_CommonData.yaml:2554-2564`) requires, both members mandatory, holding
-/// *"the decimal value of the NG AP cause code values as specified in TS 38.413"*.
-/// The group indices match `ngap_handler::cause_group`, which is the same ordering
-/// `Cause`'s APER CHOICE uses (`nextgcore_asn1c::ngap::cause`).
-pub fn extract_release_request_cause(data: &[u8]) -> Option<(u8, i64)> {
-    use nextgcore_asn1c::ngap::cause::Cause;
-    let cause = match parser::decode_ngap_pdu(data) {
-        Ok(NgapMessage::UeContextReleaseRequest(req)) => req.cause,
-        Ok(_) => {
-            log::warn!("Expected UeContextReleaseRequest");
-            return None;
-        }
-        Err(e) => {
-            log::warn!("Failed to extract UE Context Release Request Cause: {e}");
-            return None;
-        }
-    };
-    Some(match cause {
-        Cause::RadioNetwork(v) => (crate::ngap_handler::cause_group::RADIO_NETWORK, v as i64),
-        Cause::Transport(v) => (crate::ngap_handler::cause_group::TRANSPORT, v as i64),
-        Cause::Nas(v) => (crate::ngap_handler::cause_group::NAS, v as i64),
-        Cause::Protocol(v) => (crate::ngap_handler::cause_group::PROTOCOL, v as i64),
-        Cause::Misc(v) => (crate::ngap_handler::cause_group::MISC, v as i64),
-    })
-}
-
 /// Build a UE Context Release Command with proper ASN.1 APER encoding
 ///
 /// `cause_group`/`cause_value` follow the TS 38.413 Section 9.3.1.2 cause groups
 /// (0=RadioNetwork, 1=Transport, 2=NAS, 3=Protocol, 4=Misc).
+///
+/// #417 stage 4: encoded by the generated codec. The (group, value) -> Cause
+/// mapping is still [`build_cause`], shared with NG Setup Failure, so an
+/// out-of-range value clamps exactly as before; the bytes are unchanged --
+/// `ue_context_release_command_generated_matches_hand_written` pins that.
 pub fn build_ue_context_release_command_asn1(
     amf_ue_ngap_id: u64,
     ran_ue_ngap_id: u32,
     cause_group: u8,
     cause_value: i64,
 ) -> Option<Vec<u8>> {
-    let msg = UeContextReleaseCommand {
-        ue_ngap_ids: UeNgapIds::Pair {
-            amf_ue_ngap_id,
-            ran_ue_ngap_id,
-        },
-        cause: build_cause(cause_group, cause_value),
+    use ngap_gen::{
+        ProtocolIE_ID, UEContextReleaseCommand, UEContextReleaseCommandProtocolIEs,
+        UEContextReleaseCommandProtocolIEs_Entry as Entry,
+        UEContextReleaseCommandProtocolIEs_EntryValue as Ie, NGAP_PDU,
     };
 
-    match builder::build_ue_context_release_command(&msg) {
+    // AMF-UE-NGAP-ID is INTEGER (0..2^40-1): the generated encoder refuses a
+    // larger value, as the hand-written one did.
+
+    // IE order and criticalities as TS 38.413 §9.2.2.5 lists them.
+    let ies = vec![
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_UE_NGAP_I_DS),
+            criticality: ngap_gen::Criticality(ngap_gen::Criticality::REJECT),
+            value: Ie::Id_UE_NGAP_IDs(ngap_gen::UE_NGAP_IDs::UE_NGAP_ID_pair(
+                ngap_gen::UE_NGAP_ID_pair {
+                    amf_ue_ngap_id: ngap_gen::AMF_UE_NGAP_ID(amf_ue_ngap_id),
+                    ran_ue_ngap_id: ngap_gen::RAN_UE_NGAP_ID(ran_ue_ngap_id),
+                    ie_extensions: None,
+                },
+            )),
+        },
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_CAUSE),
+            criticality: ngap_gen::Criticality(ngap_gen::Criticality::IGNORE),
+            value: Ie::Id_Cause(generated_cause(build_cause(cause_group, cause_value))),
+        },
+    ];
+    let pdu = NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_UE_CONTEXT_RELEASE),
+        criticality: ngap_gen::Criticality(ngap_gen::Criticality::REJECT),
+        value: ngap_gen::InitiatingMessageValue::Id_UEContextRelease(UEContextReleaseCommand {
+            protocol_i_es: UEContextReleaseCommandProtocolIEs(ies),
+        }),
+    });
+
+    match nextgcore_ngap_gen::encode(&pdu) {
         Ok(bytes) => {
             log::debug!(
                 "Built UE Context Release Command: {} bytes, AMF UE NGAP ID={}, RAN UE NGAP ID={}",
@@ -1288,9 +1298,336 @@ pub fn build_ue_context_release_command_asn1(
             Some(bytes)
         }
         Err(e) => {
-            log::error!("Failed to encode UE Context Release Command: {e}");
+            log::error!("Failed to encode UE Context Release Command: {e:?}");
             None
         }
+    }
+}
+
+/// The procedure a criticality report is about, as an Error Indication's
+/// Criticality Diagnostics names it (TS 38.413 §9.3.1.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportedProcedure {
+    /// The Procedure Code of the message that caused the error.
+    pub procedure_code: u8,
+    /// [`ngap_gen::TriggeringMessage`]: 0 = initiating, 1 = successful outcome.
+    pub triggering_message: u8,
+    /// The procedure criticality the message was received with.
+    pub procedure_criticality: u8,
+}
+
+/// An ERROR INDICATION (TS 38.413 §9.2.6.13) reporting not-comprehended or
+/// missing IEs of a received message, for the procedures whose criticality
+/// handling has to go through the Error Indication procedure (§10.3.4.2,
+/// §10.3.5): a message with no response to carry the report, or a response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CriticalityErrorIndication {
+    /// The UE's AMF UE NGAP ID, when the message carried a comprehended one.
+    pub amf_ue_ngap_id: Option<u64>,
+    /// The UE's RAN UE NGAP ID, when the message carried a comprehended one.
+    pub ran_ue_ngap_id: Option<u32>,
+    /// [`ngap_gen::CauseProtocol`]: abstract-syntax-error-reject when the
+    /// procedure was terminated, abstract-syntax-error-ignore-and-notify when
+    /// it went on.
+    pub cause_protocol: u8,
+    /// The procedure the report is about.
+    pub procedure: ReportedProcedure,
+    /// The IEs reported.
+    pub diagnostics: Vec<IeDiagnostic>,
+}
+
+/// Encode a [`CriticalityErrorIndication`] with the generated codec. IE order
+/// as TS 38.413 §9.2.6.13 lists it: AMF UE NGAP ID, RAN UE NGAP ID, Cause,
+/// Criticality Diagnostics.
+pub fn build_criticality_error_indication_asn1(
+    report: &CriticalityErrorIndication,
+) -> Option<Vec<u8>> {
+    use ngap_gen::{
+        ErrorIndication, ErrorIndicationProtocolIEs, ErrorIndicationProtocolIEs_Entry as Entry,
+        ErrorIndicationProtocolIEs_EntryValue as Ie, ProtocolIE_ID, NGAP_PDU,
+    };
+
+    let ignore = ngap_gen::Criticality(ngap_gen::Criticality::IGNORE);
+    let mut ies = Vec::new();
+    if let Some(id) = report.amf_ue_ngap_id {
+        ies.push(Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_AMF_UE_NGAP_ID),
+            criticality: ignore.clone(),
+            value: Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(id)),
+        });
+    }
+    if let Some(id) = report.ran_ue_ngap_id {
+        ies.push(Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_RAN_UE_NGAP_ID),
+            criticality: ignore.clone(),
+            value: Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(id)),
+        });
+    }
+    ies.push(Entry {
+        id: ProtocolIE_ID(ngap_gen::ID_CAUSE),
+        criticality: ignore.clone(),
+        value: Ie::Id_Cause(ngap_gen::Cause::Protocol(ngap_gen::CauseProtocol(
+            report.cause_protocol,
+        ))),
+    });
+    ies.push(Entry {
+        id: ProtocolIE_ID(ngap_gen::ID_CRITICALITY_DIAGNOSTICS),
+        criticality: ignore,
+        value: Ie::Id_CriticalityDiagnostics(generated_criticality_diagnostics_for(
+            Some(&report.procedure),
+            &report.diagnostics,
+        )),
+    });
+    let pdu = NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_ERROR_INDICATION),
+        criticality: ngap_gen::Criticality(ngap_gen::Criticality::IGNORE),
+        value: ngap_gen::InitiatingMessageValue::Id_ErrorIndication(ErrorIndication {
+            protocol_i_es: ErrorIndicationProtocolIEs(ies),
+        }),
+    });
+    match nextgcore_ngap_gen::encode(&pdu) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            log::error!("Failed to encode Error Indication: {e:?}");
+            None
+        }
+    }
+}
+
+/// A generated [`ngap_gen::Cause`] as the `(group, value)` pair TS 29.518's
+/// `NgApCause` carries, with the group indices of `ngap_handler::cause_group`.
+/// `None` for a choice extension, which has no group.
+fn cause_pair(cause: &ngap_gen::Cause) -> Option<(u8, i64)> {
+    use crate::ngap_handler::cause_group;
+    Some(match cause {
+        ngap_gen::Cause::RadioNetwork(v) => (cause_group::RADIO_NETWORK, i64::from(v.0)),
+        ngap_gen::Cause::Transport(v) => (cause_group::TRANSPORT, i64::from(v.0)),
+        ngap_gen::Cause::Nas(v) => (cause_group::NAS, i64::from(v.0)),
+        ngap_gen::Cause::Protocol(v) => (cause_group::PROTOCOL, i64::from(v.0)),
+        ngap_gen::Cause::Misc(v) => (cause_group::MISC, i64::from(v.0)),
+        ngap_gen::Cause::Choice_Extensions(_) => return None,
+    })
+}
+
+/// How a received UE Context Release Request is to be handled.
+#[derive(Debug)]
+pub enum UeContextReleaseRequestDecode {
+    /// Decoded; run the procedure. When `error_indication` is set, the request
+    /// carried not-comprehended IEs marked "ignore IE and notify sender", which
+    /// -- the procedure having no response message -- are reported in an
+    /// Error Indication (§10.3.4.2).
+    Proceed {
+        /// The UE's AMF UE NGAP ID.
+        amf_ue_ngap_id: u64,
+        /// The UE's RAN UE NGAP ID.
+        ran_ue_ngap_id: u32,
+        /// The Cause as `(group, value)`. `None` when it is absent -- it is
+        /// mandatory with criticality ignore (§9.2.2.4), so its absence is
+        /// ignored (§10.3.5) -- or a choice extension.
+        cause: Option<(u8, i64)>,
+        /// The Error Indication to send, if any.
+        error_indication: Option<CriticalityErrorIndication>,
+    },
+    /// A not-comprehended IE marked "reject", or a missing AMF or RAN UE NGAP
+    /// ID (both criticality reject): none of the request may be executed, and
+    /// -- the procedure having no unsuccessful outcome -- the procedure is
+    /// terminated with an Error Indication (§10.3.4.2, §10.3.5).
+    Reject(CriticalityErrorIndication),
+    /// Not decodable.
+    Undecodable,
+}
+
+/// Decode a UE Context Release Request (TS 38.413 §9.2.2.4) with the
+/// GENERATED codec (#417 stage 4), applying §10.3.4.2 and §10.3.5 for a
+/// procedure with no response message.
+///
+/// The hand-written parser this replaced ignored a not-comprehended IE marked
+/// "ignore" or "notify" alike, and refused the request outright -- so nothing
+/// was released and nothing told the gNB -- on an IE marked "reject", on a
+/// missing IE, and on the optional PDU Session Resource List, which it did not
+/// comprehend and which carries criticality reject. Every request it accepted
+/// decodes identically: `ue_context_release_request_generated_decode_matches_hand_written`.
+pub fn decode_ue_context_release_request_asn1(data: &[u8]) -> UeContextReleaseRequestDecode {
+    use ngap_gen::{InitiatingMessageValue, UEContextReleaseRequestProtocolIEs_EntryValue as Ie};
+    use UeContextReleaseRequestDecode::{Proceed, Reject, Undecodable};
+
+    let (pdu, unknown) = match nextgcore_ngap_gen::decode_with_unknown_ies(data) {
+        Ok(decoded) => decoded,
+        Err(e) => {
+            log::warn!("Failed to decode UE Context Release Request: {e:?}");
+            return Undecodable;
+        }
+    };
+    let ngap_gen::NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+        criticality,
+        value: InitiatingMessageValue::Id_UEContextReleaseRequest(req),
+        ..
+    }) = pdu
+    else {
+        log::warn!("Expected UeContextReleaseRequest");
+        return Undecodable;
+    };
+    let Some((mut reject, notify)) = classify_unknown_ies(&unknown, "UE Context Release Request")
+    else {
+        return Undecodable;
+    };
+
+    let mut amf_ue_ngap_id = None;
+    let mut ran_ue_ngap_id = None;
+    let mut cause = None;
+    for entry in req.protocol_i_es.0 {
+        match entry.value {
+            Ie::Id_AMF_UE_NGAP_ID(v) => amf_ue_ngap_id = Some(v.0),
+            Ie::Id_RAN_UE_NGAP_ID(v) => ran_ue_ngap_id = Some(v.0),
+            Ie::Id_Cause(v) => cause = cause_pair(&v),
+            // Comprehended. The AMF releases every PDU session of the UE, so
+            // which ones the gNB asked for does not change what it does.
+            Ie::Id_PDUSessionResourceListCxtRelReq(_) => {}
+        }
+    }
+    let missing = |ie_id: u16| IeDiagnostic {
+        ie_id,
+        criticality: ngap_gen::Criticality::REJECT,
+        type_of_error: ngap_gen::TypeOfError::MISSING,
+    };
+    if amf_ue_ngap_id.is_none() {
+        reject.push(missing(ngap_gen::ID_AMF_UE_NGAP_ID));
+    }
+    if ran_ue_ngap_id.is_none() {
+        reject.push(missing(ngap_gen::ID_RAN_UE_NGAP_ID));
+    }
+
+    let report = |cause_protocol: u8, diagnostics: Vec<IeDiagnostic>| CriticalityErrorIndication {
+        amf_ue_ngap_id,
+        ran_ue_ngap_id,
+        cause_protocol,
+        procedure: ReportedProcedure {
+            procedure_code: ngap_gen::ID_UE_CONTEXT_RELEASE_REQUEST,
+            triggering_message: ngap_gen::TriggeringMessage::INITIATING_MESSAGE,
+            procedure_criticality: criticality.0,
+        },
+        diagnostics,
+    };
+    let (Some(amf_ue_ngap_id), Some(ran_ue_ngap_id), true) =
+        (amf_ue_ngap_id, ran_ue_ngap_id, reject.is_empty())
+    else {
+        return Reject(report(
+            ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
+            reject,
+        ));
+    };
+    if cause.is_none() {
+        log::warn!("UE Context Release Request carries no usable Cause; releasing anyway");
+    }
+    let error_indication = (!notify.is_empty()).then(|| {
+        report(
+            ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+            notify,
+        )
+    });
+    Proceed {
+        amf_ue_ngap_id,
+        ran_ue_ngap_id,
+        cause,
+        error_indication,
+    }
+}
+
+/// How a received UE Context Release Complete is to be handled.
+#[derive(Debug)]
+pub enum UeContextReleaseCompleteDecode {
+    /// Decoded. Both IDs are mandatory with criticality ignore (§9.2.2.6), so
+    /// a missing one is ignored (§10.3.5) and comes back `None`. When
+    /// `error_indication` is set, the response carried not-comprehended IEs
+    /// marked "ignore IE and notify sender", reported in an Error Indication
+    /// (§10.3.4.2).
+    Complete {
+        /// The AMF UE NGAP ID the gNB names.
+        amf_ue_ngap_id: Option<u64>,
+        /// The RAN UE NGAP ID the gNB names.
+        ran_ue_ngap_id: Option<u32>,
+        /// The Error Indication to send, if any.
+        error_indication: Option<CriticalityErrorIndication>,
+    },
+    /// The response carried a not-comprehended IE marked "reject": the
+    /// procedure is "unsuccessfully terminated" and handled locally
+    /// (§10.3.4.2), with no message to the gNB. The IEs are for the log.
+    Failed(Vec<IeDiagnostic>),
+    /// Not decodable.
+    Undecodable,
+}
+
+/// Decode a UE Context Release Complete (gNB -> AMF, TS 38.413 §9.2.2.6) with
+/// the GENERATED codec (#417 stage 4), applying the §10.3.4.2 rules for a
+/// RESPONSE message.
+///
+/// The hand-written parser this replaced refused the message on a missing ID,
+/// on an IE marked "reject" it did not comprehend, and on the optional PDU
+/// Session Resource List, which it did not comprehend and which carries
+/// criticality reject -- each of which made the AMF fall back to supervising
+/// every UE of the association. Every message it accepted decodes identically:
+/// `ue_context_release_complete_generated_decode_matches_hand_written`.
+pub fn decode_ue_context_release_complete_asn1(data: &[u8]) -> UeContextReleaseCompleteDecode {
+    use ngap_gen::{SuccessfulOutcomeValue, UEContextReleaseCompleteProtocolIEs_EntryValue as Ie};
+    use UeContextReleaseCompleteDecode::{Complete, Failed, Undecodable};
+
+    let (pdu, unknown) = match nextgcore_ngap_gen::decode_with_unknown_ies(data) {
+        Ok(decoded) => decoded,
+        Err(e) => {
+            log::warn!("Failed to decode UE Context Release Complete: {e:?}");
+            return Undecodable;
+        }
+    };
+    let ngap_gen::NGAP_PDU::SuccessfulOutcome(ngap_gen::SuccessfulOutcome {
+        criticality,
+        value: SuccessfulOutcomeValue::Id_UEContextRelease(complete),
+        ..
+    }) = pdu
+    else {
+        log::warn!("Expected UeContextReleaseComplete");
+        return Undecodable;
+    };
+    let Some((reject, notify)) = classify_unknown_ies(&unknown, "UE Context Release Complete")
+    else {
+        return Undecodable;
+    };
+    if !reject.is_empty() {
+        return Failed(reject);
+    }
+
+    let mut amf_ue_ngap_id = None;
+    let mut ran_ue_ngap_id = None;
+    for entry in complete.protocol_i_es.0 {
+        match entry.value {
+            Ie::Id_AMF_UE_NGAP_ID(v) => amf_ue_ngap_id = Some(v.0),
+            Ie::Id_RAN_UE_NGAP_ID(v) => ran_ue_ngap_id = Some(v.0),
+            // Comprehended, and not used by the AMF.
+            Ie::Id_UserLocationInformation(_)
+            | Ie::Id_InfoOnRecommendedCellsAndRANNodesForPaging(_)
+            | Ie::Id_PDUSessionResourceListCxtRelCpl(_)
+            | Ie::Id_CriticalityDiagnostics(_)
+            | Ie::Id_PagingAssisDataforCEcapabUE(_) => {}
+        }
+    }
+    let error_indication = if notify.is_empty() {
+        None
+    } else {
+        Some(CriticalityErrorIndication {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            cause_protocol: ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+            procedure: ReportedProcedure {
+                procedure_code: ngap_gen::ID_UE_CONTEXT_RELEASE,
+                triggering_message: ngap_gen::TriggeringMessage::SUCCESSFUL_OUTCOME,
+                procedure_criticality: criticality.0,
+            },
+            diagnostics: notify,
+        })
+    };
+    Complete {
+        amf_ue_ngap_id,
+        ran_ue_ngap_id,
+        error_indication,
     }
 }
 
@@ -1466,6 +1803,53 @@ pub(crate) mod tests {
     /// compared against.
     mod hand_written_oracle {
         use super::super::*;
+
+        /// The UE Context Release Command encoder as it was before #417 stage 4
+        /// moved it onto the generated codec.
+        pub(crate) fn hand_written_ue_context_release_command(
+            amf_ue_ngap_id: u64,
+            ran_ue_ngap_id: u32,
+            cause_group: u8,
+            cause_value: i64,
+        ) -> Option<Vec<u8>> {
+            let msg = UeContextReleaseCommand {
+                ue_ngap_ids: UeNgapIds::Pair {
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                },
+                cause: build_cause(cause_group, cause_value),
+            };
+            builder::build_ue_context_release_command(&msg).ok()
+        }
+
+        /// The UE Context Release Complete decoder as it was before #417 stage 4.
+        pub(crate) fn hand_written_parse_ue_context_release_complete(data: &[u8]) -> Option<u64> {
+            match parser::decode_ngap_pdu(data) {
+                Ok(NgapMessage::UeContextReleaseComplete(complete)) => {
+                    Some(complete.amf_ue_ngap_id)
+                }
+                _ => None,
+            }
+        }
+
+        /// The UE Context Release Request Cause extraction as it was before #417
+        /// stage 4. The two ID extractions are unchanged production code
+        /// ([`extract_amf_ue_ngap_id`], [`extract_ran_ue_ngap_id`]).
+        pub(crate) fn hand_written_extract_release_request_cause(data: &[u8]) -> Option<(u8, i64)> {
+            let cause = match parser::decode_ngap_pdu(data) {
+                Ok(NgapMessage::UeContextReleaseRequest(req)) => req.cause,
+                _ => return None,
+            };
+            Some(match cause {
+                Cause::RadioNetwork(v) => {
+                    (crate::ngap_handler::cause_group::RADIO_NETWORK, v as i64)
+                }
+                Cause::Transport(v) => (crate::ngap_handler::cause_group::TRANSPORT, v as i64),
+                Cause::Nas(v) => (crate::ngap_handler::cause_group::NAS, v as i64),
+                Cause::Protocol(v) => (crate::ngap_handler::cause_group::PROTOCOL, v as i64),
+                Cause::Misc(v) => (crate::ngap_handler::cause_group::MISC, v as i64),
+            })
+        }
 
         /// The NG Setup Request decoder as it was before #417 stage 3 moved it
         /// onto the generated codec.
@@ -2807,4 +3191,614 @@ pub(crate) mod tests {
             Some((11, 13))
         );
     }
+
+    // ====================================================================
+    // #417 stage 4: the UE Context Release family on the generated codec
+    // ====================================================================
+
+    use hand_written_oracle::{
+        hand_written_extract_release_request_cause, hand_written_parse_ue_context_release_complete,
+        hand_written_ue_context_release_command,
+    };
+
+    /// The upper bound of AMF-UE-NGAP-ID, INTEGER (0..1099511627775) (TS 38.413
+    /// §9.3.3.1).
+    const MAX_AMF_UE_NGAP_ID: u64 = (1 << 40) - 1;
+
+    /// AMF UE NGAP IDs at every APER length boundary of INTEGER (0..2^40-1),
+    /// and past the upper bound.
+    const AMF_IDS: [u64; 12] = [
+        0,
+        1,
+        255,
+        256,
+        65_535,
+        65_536,
+        16_777_215,
+        16_777_216,
+        u32::MAX as u64,
+        1 << 32,
+        MAX_AMF_UE_NGAP_ID,
+        MAX_AMF_UE_NGAP_ID + 1,
+    ];
+
+    /// RAN UE NGAP IDs at every APER length boundary of INTEGER (0..2^32-1).
+    const RAN_IDS: [u32; 8] = [0, 1, 255, 256, 65_535, 65_536, 16_777_216, u32::MAX];
+
+    /// #417 stage 4: the generated UE Context Release Command is byte for byte
+    /// the hand-written one -- every cause group and value the AMF can be
+    /// handed (out-of-range ones included, which both clamp through
+    /// `build_cause`), and every ID length -- and both refuse the same
+    /// out-of-range AMF UE NGAP ID.
+    #[test]
+    fn ue_context_release_command_generated_matches_hand_written() {
+        let mut compared = 0;
+        for group in 0..=5u8 {
+            for value in -1..=1000i64 {
+                assert_eq!(
+                    build_ue_context_release_command_asn1(42, 1001, group, value),
+                    hand_written_ue_context_release_command(42, 1001, group, value),
+                    "group {group} value {value}"
+                );
+                compared += 1;
+            }
+        }
+        for amf in AMF_IDS {
+            for ran in RAN_IDS {
+                for (group, value) in [(2u8, 0i64), (0, 20), (0, 46), (3, 1), (4, 0)] {
+                    assert_eq!(
+                        build_ue_context_release_command_asn1(amf, ran, group, value),
+                        hand_written_ue_context_release_command(amf, ran, group, value),
+                        "AMF {amf} RAN {ran} group {group} value {value}"
+                    );
+                    compared += 1;
+                }
+            }
+        }
+        assert_eq!(compared, 6 * 1002 + 12 * 8 * 5);
+        assert_eq!(
+            build_ue_context_release_command_asn1(MAX_AMF_UE_NGAP_ID + 1, 1, 2, 0),
+            None,
+            "an AMF UE NGAP ID past 2^40-1 is refused, as before"
+        );
+    }
+
+    /// The bytes themselves, so the generated and hand-written encoders cannot
+    /// drift together: NAS normal-release, and radioNetwork 46
+    /// (release-due-to-pre-emption), an extension value (nextgsim #213).
+    #[test]
+    fn ue_context_release_command_golden_bytes() {
+        assert_eq!(
+            build_ue_context_release_command_asn1(42, 1001, 2, 0).expect("encode"),
+            GOLDEN_RELEASE_COMMAND_NAS_NORMAL
+        );
+        assert_eq!(
+            build_ue_context_release_command_asn1(42, 1001, 0, 46).expect("encode"),
+            GOLDEN_RELEASE_COMMAND_PRE_EMPTION
+        );
+    }
+
+    const GOLDEN_RELEASE_COMMAND_NAS_NORMAL: &[u8] = &[
+        0x00, 0x29, 0x00, 0x11, 0x00, 0x00, 0x02, 0x00, 0x72, 0x00, 0x05, 0x00, 0x2a, 0x40, 0x03,
+        0xe9, 0x00, 0x0f, 0x40, 0x01, 0x40,
+    ];
+    const GOLDEN_RELEASE_COMMAND_PRE_EMPTION: &[u8] = &[
+        0x00, 0x29, 0x00, 0x12, 0x00, 0x00, 0x02, 0x00, 0x72, 0x00, 0x05, 0x00, 0x2a, 0x40, 0x03,
+        0xe9, 0x00, 0x0f, 0x40, 0x02, 0x10, 0x20,
+    ];
+
+    /// A UE Context Release Request built by the hand-written encoder.
+    fn release_request(amf: u64, ran: u32, group: u8, value: i64) -> Vec<u8> {
+        nextgcore_ngap::builder::build_ue_context_release_request(&UeContextReleaseRequest {
+            amf_ue_ngap_id: amf,
+            ran_ue_ngap_id: ran,
+            cause: build_cause(group, value),
+        })
+        .expect("encode")
+    }
+
+    /// A UE Context Release Complete built by the hand-written encoder.
+    fn release_complete(amf: u64, ran: u32) -> Vec<u8> {
+        nextgcore_ngap::builder::build_ue_context_release_complete(&UeContextReleaseComplete {
+            amf_ue_ngap_id: amf,
+            ran_ue_ngap_id: ran,
+        })
+        .expect("encode")
+    }
+
+    /// A UE Context Release Request built by the generated encoder from `ies`.
+    fn generated_release_request(
+        ies: Vec<ngap_gen::UEContextReleaseRequestProtocolIEs_EntryValue>,
+    ) -> Vec<u8> {
+        use ngap_gen::UEContextReleaseRequestProtocolIEs_EntryValue as Ie;
+        let entries = ies
+            .into_iter()
+            .map(|value| {
+                let (id, criticality) = match &value {
+                    Ie::Id_AMF_UE_NGAP_ID(_) => (ngap_gen::ID_AMF_UE_NGAP_ID, 0),
+                    Ie::Id_RAN_UE_NGAP_ID(_) => (ngap_gen::ID_RAN_UE_NGAP_ID, 0),
+                    Ie::Id_PDUSessionResourceListCxtRelReq(_) => {
+                        (ngap_gen::ID_PDU_SESSION_RESOURCE_LIST_CXT_REL_REQ, 0)
+                    }
+                    Ie::Id_Cause(_) => (ngap_gen::ID_CAUSE, 1),
+                };
+                ngap_gen::UEContextReleaseRequestProtocolIEs_Entry {
+                    id: ngap_gen::ProtocolIE_ID(id),
+                    criticality: ngap_gen::Criticality(criticality),
+                    value,
+                }
+            })
+            .collect();
+        nextgcore_ngap_gen::encode(&ngap_gen::NGAP_PDU::InitiatingMessage(
+            ngap_gen::InitiatingMessage {
+                procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_UE_CONTEXT_RELEASE_REQUEST),
+                criticality: ngap_gen::Criticality(ngap_gen::Criticality::IGNORE),
+                value: ngap_gen::InitiatingMessageValue::Id_UEContextReleaseRequest(
+                    ngap_gen::UEContextReleaseRequest {
+                        protocol_i_es: ngap_gen::UEContextReleaseRequestProtocolIEs(entries),
+                    },
+                ),
+            },
+        ))
+        .expect("encode")
+    }
+
+    /// A UE Context Release Complete built by the generated encoder from `ies`.
+    fn generated_release_complete(
+        ies: Vec<ngap_gen::UEContextReleaseCompleteProtocolIEs_EntryValue>,
+    ) -> Vec<u8> {
+        use ngap_gen::UEContextReleaseCompleteProtocolIEs_EntryValue as Ie;
+        let entries = ies
+            .into_iter()
+            .map(|value| {
+                let (id, criticality) = match &value {
+                    Ie::Id_AMF_UE_NGAP_ID(_) => (ngap_gen::ID_AMF_UE_NGAP_ID, 1),
+                    Ie::Id_RAN_UE_NGAP_ID(_) => (ngap_gen::ID_RAN_UE_NGAP_ID, 1),
+                    Ie::Id_PDUSessionResourceListCxtRelCpl(_) => {
+                        (ngap_gen::ID_PDU_SESSION_RESOURCE_LIST_CXT_REL_CPL, 0)
+                    }
+                    other => panic!("not used by these tests: {other:?}"),
+                };
+                ngap_gen::UEContextReleaseCompleteProtocolIEs_Entry {
+                    id: ngap_gen::ProtocolIE_ID(id),
+                    criticality: ngap_gen::Criticality(criticality),
+                    value,
+                }
+            })
+            .collect();
+        nextgcore_ngap_gen::encode(&ngap_gen::NGAP_PDU::SuccessfulOutcome(
+            ngap_gen::SuccessfulOutcome {
+                procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_UE_CONTEXT_RELEASE),
+                criticality: ngap_gen::Criticality(ngap_gen::Criticality::REJECT),
+                value: ngap_gen::SuccessfulOutcomeValue::Id_UEContextRelease(
+                    ngap_gen::UEContextReleaseComplete {
+                        protocol_i_es: ngap_gen::UEContextReleaseCompleteProtocolIEs(entries),
+                    },
+                ),
+            },
+        ))
+        .expect("encode")
+    }
+
+    /// What the hand-written Release Request path could say: the three things
+    /// the handler read, each `None` when the message was refused.
+    fn hand_written_request_view(data: &[u8]) -> Option<(u64, u32, Option<(u8, i64)>)> {
+        Some((
+            extract_amf_ue_ngap_id(data)?,
+            extract_ran_ue_ngap_id(data)?,
+            hand_written_extract_release_request_cause(data),
+        ))
+    }
+
+    /// The new decode flattened to the same view. A `Reject` never comes out
+    /// of a request the old parser accepted, so it is a failure here.
+    fn generated_request_view(data: &[u8]) -> Option<(u64, u32, Option<(u8, i64)>)> {
+        match decode_ue_context_release_request_asn1(data) {
+            UeContextReleaseRequestDecode::Proceed {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                cause,
+                ..
+            } => Some((amf_ue_ngap_id, ran_ue_ngap_id, cause)),
+            UeContextReleaseRequestDecode::Undecodable => None,
+            UeContextReleaseRequestDecode::Reject(r) => {
+                panic!("unexpected Reject({r:?}) for {data:02x?}")
+            }
+        }
+    }
+
+    /// The request corpus both decoders are compared over: every ID length,
+    /// every cause the AMF's `build_cause` can produce (extension values
+    /// included), and requests carrying a not-comprehended IE marked ignore or
+    /// notify, which the old parser accepted.
+    fn release_request_corpus() -> Vec<Vec<u8>> {
+        let mut corpus = Vec::new();
+        for amf in &AMF_IDS[..AMF_IDS.len() - 1] {
+            for ran in RAN_IDS {
+                corpus.push(release_request(*amf, ran, 0, 21));
+            }
+        }
+        for group in 0..=4u8 {
+            for value in 0..=50i64 {
+                corpus.push(release_request(7, 9, group, value));
+            }
+        }
+        let base = release_request(7, 9, 0, 21);
+        for criticality in [0x40, 0x80] {
+            corpus.push(with_unknown_ie(&base, 9999, criticality));
+        }
+        corpus
+    }
+
+    /// #417 stage 4: for every request the hand-written path accepted, the
+    /// generated decode yields the same AMF UE NGAP ID, RAN UE NGAP ID and
+    /// Cause; and what it refused as malformed is still undecodable.
+    #[test]
+    fn ue_context_release_request_generated_decode_matches_hand_written() {
+        let corpus = release_request_corpus();
+        for data in &corpus {
+            let old = hand_written_request_view(data);
+            assert!(
+                old.is_some(),
+                "the corpus holds accepted requests: {data:02x?}"
+            );
+            assert_eq!(generated_request_view(data), old, "{data:02x?}");
+        }
+        assert_eq!(corpus.len(), 11 * 8 + 5 * 51 + 2);
+
+        // Malformed: truncated, and an empty buffer.
+        let base = release_request(7, 9, 0, 21);
+        for data in [&base[..base.len() - 1], &base[..4], &[][..]] {
+            assert_eq!(hand_written_request_view(data), None);
+            assert_eq!(generated_request_view(data), None, "{data:02x?}");
+        }
+    }
+
+    /// Release Request has no response message, so a not-comprehended IE
+    /// marked "ignore IE and notify sender" is reported in an Error Indication
+    /// carrying the Procedure Code, Triggering Message, Procedure Criticality
+    /// and the IE (§10.3.4.2) -- and the release goes on.
+    #[test]
+    fn a_release_request_notify_ie_is_reported_in_an_error_indication() {
+        let data = with_unknown_ie(&release_request(7, 9, 0, 21), 9999, 0x80);
+        let UeContextReleaseRequestDecode::Proceed {
+            amf_ue_ngap_id: 7,
+            ran_ue_ngap_id: 9,
+            cause: Some((0, 21)),
+            error_indication: Some(report),
+        } = decode_ue_context_release_request_asn1(&data)
+        else {
+            panic!("expected Proceed with an Error Indication");
+        };
+        assert_eq!(
+            report,
+            CriticalityErrorIndication {
+                amf_ue_ngap_id: Some(7),
+                ran_ue_ngap_id: Some(9),
+                cause_protocol: ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+                procedure: ReportedProcedure {
+                    procedure_code: 42,
+                    triggering_message: ngap_gen::TriggeringMessage::INITIATING_MESSAGE,
+                    procedure_criticality: ngap_gen::Criticality::IGNORE,
+                },
+                diagnostics: vec![IeDiagnostic {
+                    ie_id: 9999,
+                    criticality: ngap_gen::Criticality::NOTIFY,
+                    type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+                }],
+            }
+        );
+        // And "ignore" is ignored, with nothing to report.
+        let ignored = with_unknown_ie(&release_request(7, 9, 0, 21), 9999, 0x40);
+        assert!(matches!(
+            decode_ue_context_release_request_asn1(&ignored),
+            UeContextReleaseRequestDecode::Proceed {
+                error_indication: None,
+                ..
+            }
+        ));
+    }
+
+    /// A not-comprehended IE marked "reject", and a missing AMF or RAN UE NGAP
+    /// ID, terminate the procedure with an Error Indication (§10.3.4.2,
+    /// §10.3.5): the hand-written path refused all three silently, releasing
+    /// nothing and telling the gNB nothing.
+    #[test]
+    fn a_release_request_the_amf_must_reject_ends_in_an_error_indication() {
+        use ngap_gen::UEContextReleaseRequestProtocolIEs_EntryValue as Ie;
+        let reject_procedure = ReportedProcedure {
+            procedure_code: 42,
+            triggering_message: ngap_gen::TriggeringMessage::INITIATING_MESSAGE,
+            procedure_criticality: ngap_gen::Criticality::IGNORE,
+        };
+
+        let unknown_reject = with_unknown_ie(&release_request(7, 9, 0, 21), 9999, 0x00);
+        assert_eq!(hand_written_request_view(&unknown_reject), None);
+        let UeContextReleaseRequestDecode::Reject(report) =
+            decode_ue_context_release_request_asn1(&unknown_reject)
+        else {
+            panic!("expected Reject");
+        };
+        assert_eq!(
+            report,
+            CriticalityErrorIndication {
+                amf_ue_ngap_id: Some(7),
+                ran_ue_ngap_id: Some(9),
+                cause_protocol: ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
+                procedure: reject_procedure,
+                diagnostics: vec![IeDiagnostic {
+                    ie_id: 9999,
+                    criticality: ngap_gen::Criticality::REJECT,
+                    type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+                }],
+            }
+        );
+
+        let no_amf_id = generated_release_request(vec![
+            Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(9)),
+            Ie::Id_Cause(ngap_gen::Cause::Nas(ngap_gen::CauseNas(0))),
+        ]);
+        assert_eq!(hand_written_request_view(&no_amf_id), None);
+        let UeContextReleaseRequestDecode::Reject(report) =
+            decode_ue_context_release_request_asn1(&no_amf_id)
+        else {
+            panic!("expected Reject");
+        };
+        assert_eq!(
+            report,
+            CriticalityErrorIndication {
+                amf_ue_ngap_id: None,
+                ran_ue_ngap_id: Some(9),
+                cause_protocol: ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
+                procedure: reject_procedure,
+                diagnostics: vec![IeDiagnostic {
+                    ie_id: ngap_gen::ID_AMF_UE_NGAP_ID,
+                    criticality: ngap_gen::Criticality::REJECT,
+                    type_of_error: ngap_gen::TypeOfError::MISSING,
+                }],
+            }
+        );
+
+        let no_ran_id = generated_release_request(vec![
+            Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(7)),
+            Ie::Id_Cause(ngap_gen::Cause::Nas(ngap_gen::CauseNas(0))),
+        ]);
+        let UeContextReleaseRequestDecode::Reject(report) =
+            decode_ue_context_release_request_asn1(&no_ran_id)
+        else {
+            panic!("expected Reject");
+        };
+        assert_eq!(report.amf_ue_ngap_id, Some(7));
+        assert_eq!(report.ran_ue_ngap_id, None);
+        assert_eq!(report.diagnostics[0].ie_id, ngap_gen::ID_RAN_UE_NGAP_ID);
+        assert_eq!(
+            report.diagnostics[0].type_of_error,
+            ngap_gen::TypeOfError::MISSING
+        );
+    }
+
+    /// Two requests the hand-written parser refused that the AMF must act on:
+    /// one without a Cause (mandatory, criticality ignore -- its absence is
+    /// ignored, §10.3.5), and one carrying the optional PDU Session Resource
+    /// List, which the old parser did not comprehend and, its criticality
+    /// being reject, refused the whole request over.
+    #[test]
+    fn release_requests_the_old_parser_refused_are_now_released() {
+        use ngap_gen::UEContextReleaseRequestProtocolIEs_EntryValue as Ie;
+        let no_cause = generated_release_request(vec![
+            Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(7)),
+            Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(9)),
+        ]);
+        assert_eq!(hand_written_request_view(&no_cause), None);
+        assert_eq!(generated_request_view(&no_cause), Some((7, 9, None)));
+
+        let with_sessions = generated_release_request(vec![
+            Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(7)),
+            Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(9)),
+            Ie::Id_PDUSessionResourceListCxtRelReq(ngap_gen::PDUSessionResourceListCxtRelReq(
+                vec![ngap_gen::PDUSessionResourceItemCxtRelReq {
+                    pdu_session_id: ngap_gen::PDUSessionID(5),
+                    ie_extensions: None,
+                }],
+            )),
+            Ie::Id_Cause(ngap_gen::Cause::RadioNetwork(ngap_gen::CauseRadioNetwork(
+                21,
+            ))),
+        ]);
+        assert_eq!(hand_written_request_view(&with_sessions), None);
+        assert_eq!(
+            generated_request_view(&with_sessions),
+            Some((7, 9, Some((0, 21))))
+        );
+    }
+
+    /// The new Release Complete decode flattened to what the hand-written
+    /// parser could say: the AMF UE NGAP ID, or nothing.
+    fn generated_complete_view(data: &[u8]) -> Option<u64> {
+        match decode_ue_context_release_complete_asn1(data) {
+            UeContextReleaseCompleteDecode::Complete { amf_ue_ngap_id, .. } => amf_ue_ngap_id,
+            UeContextReleaseCompleteDecode::Failed(_)
+            | UeContextReleaseCompleteDecode::Undecodable => None,
+        }
+    }
+
+    /// #417 stage 4: for every Release Complete the hand-written parser
+    /// accepted, the generated decode names the same UE; what it refused as
+    /// malformed, or over a not-comprehended IE marked reject, still names none.
+    #[test]
+    fn ue_context_release_complete_generated_decode_matches_hand_written() {
+        let mut corpus = Vec::new();
+        for amf in &AMF_IDS[..AMF_IDS.len() - 1] {
+            for ran in RAN_IDS {
+                corpus.push(release_complete(*amf, ran));
+            }
+        }
+        let base = release_complete(7, 9);
+        for criticality in [0x40, 0x80] {
+            corpus.push(with_unknown_ie(&base, 9999, criticality));
+        }
+        for data in &corpus {
+            let old = hand_written_parse_ue_context_release_complete(data);
+            assert!(
+                old.is_some(),
+                "the corpus holds accepted messages: {data:02x?}"
+            );
+            assert_eq!(generated_complete_view(data), old, "{data:02x?}");
+        }
+        let refused = [
+            base[..base.len() - 1].to_vec(),
+            with_unknown_ie(&base, 9999, 0x00),
+        ];
+        for data in &refused {
+            assert_eq!(hand_written_parse_ue_context_release_complete(data), None);
+            assert_eq!(generated_complete_view(data), None, "{data:02x?}");
+        }
+        assert!(matches!(
+            decode_ue_context_release_complete_asn1(&refused[1]),
+            UeContextReleaseCompleteDecode::Failed(ref d) if d[0].ie_id == 9999
+        ));
+    }
+
+    /// A Release Complete is a response, so §10.3.4.2 reports a "notify" IE in
+    /// an Error Indication -- Triggering Message successful-outcome, Procedure
+    /// Criticality reject -- and names the UE all the same.
+    #[test]
+    fn a_release_complete_notify_ie_is_reported_in_an_error_indication() {
+        let data = with_unknown_ie(&release_complete(7, 9), 9999, 0x80);
+        let UeContextReleaseCompleteDecode::Complete {
+            amf_ue_ngap_id: Some(7),
+            ran_ue_ngap_id: Some(9),
+            error_indication: Some(report),
+        } = decode_ue_context_release_complete_asn1(&data)
+        else {
+            panic!("expected Complete with an Error Indication");
+        };
+        assert_eq!(
+            report.procedure,
+            ReportedProcedure {
+                procedure_code: 41,
+                triggering_message: ngap_gen::TriggeringMessage::SUCCESSFUL_OUTCOME,
+                procedure_criticality: ngap_gen::Criticality::REJECT,
+            }
+        );
+        assert_eq!(
+            report.cause_protocol,
+            ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY
+        );
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].ie_id, 9999);
+    }
+
+    /// Two Release Completes the hand-written parser refused -- one missing the
+    /// RAN UE NGAP ID (criticality ignore, so its absence is ignored), one
+    /// carrying the optional PDU Session Resource List (criticality reject, not
+    /// comprehended by the old parser) -- now name their UE.
+    #[test]
+    fn release_completes_the_old_parser_refused_now_name_their_ue() {
+        use ngap_gen::UEContextReleaseCompleteProtocolIEs_EntryValue as Ie;
+        let no_ran_id =
+            generated_release_complete(vec![Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(7))]);
+        assert_eq!(
+            hand_written_parse_ue_context_release_complete(&no_ran_id),
+            None
+        );
+        assert!(matches!(
+            decode_ue_context_release_complete_asn1(&no_ran_id),
+            UeContextReleaseCompleteDecode::Complete {
+                amf_ue_ngap_id: Some(7),
+                ran_ue_ngap_id: None,
+                error_indication: None,
+            }
+        ));
+
+        let with_sessions = generated_release_complete(vec![
+            Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(7)),
+            Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(9)),
+            Ie::Id_PDUSessionResourceListCxtRelCpl(ngap_gen::PDUSessionResourceListCxtRelCpl(
+                vec![ngap_gen::PDUSessionResourceItemCxtRelCpl {
+                    pdu_session_id: ngap_gen::PDUSessionID(5),
+                    ie_extensions: None,
+                }],
+            )),
+        ]);
+        assert_eq!(
+            hand_written_parse_ue_context_release_complete(&with_sessions),
+            None
+        );
+        assert_eq!(generated_complete_view(&with_sessions), Some(7));
+    }
+
+    /// The criticality Error Indication decodes, under the generated codec and
+    /// the hand-written parser alike, to exactly what was reported: both IDs,
+    /// the protocol Cause, and Criticality Diagnostics with all four members
+    /// §10.3.4.2 requires for an Error Indication.
+    #[test]
+    fn the_criticality_error_indication_carries_the_whole_report() {
+        let report = CriticalityErrorIndication {
+            amf_ue_ngap_id: Some(7),
+            ran_ue_ngap_id: Some(9),
+            cause_protocol: ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
+            procedure: ReportedProcedure {
+                procedure_code: 42,
+                triggering_message: ngap_gen::TriggeringMessage::INITIATING_MESSAGE,
+                procedure_criticality: ngap_gen::Criticality::IGNORE,
+            },
+            diagnostics: vec![IeDiagnostic {
+                ie_id: 9999,
+                criticality: ngap_gen::Criticality::REJECT,
+                type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+            }],
+        };
+        let bytes = build_criticality_error_indication_asn1(&report).expect("encode");
+        assert_eq!(bytes, GOLDEN_CRITICALITY_ERROR_INDICATION);
+
+        let ngap_gen::NGAP_PDU::InitiatingMessage(msg) =
+            nextgcore_ngap_gen::decode(&bytes).expect("generated decode")
+        else {
+            panic!("initiatingMessage");
+        };
+        assert_eq!(msg.procedure_code.0, ngap_gen::ID_ERROR_INDICATION);
+        let ngap_gen::InitiatingMessageValue::Id_ErrorIndication(ei) = msg.value else {
+            panic!("ErrorIndication");
+        };
+        let mut diagnostics = None;
+        for entry in ei.protocol_i_es.0 {
+            if let ngap_gen::ErrorIndicationProtocolIEs_EntryValue::Id_CriticalityDiagnostics(d) =
+                entry.value
+            {
+                diagnostics = Some(d);
+            }
+        }
+        let d = diagnostics.expect("Criticality Diagnostics");
+        assert_eq!(d.procedure_code.map(|p| p.0), Some(42));
+        assert_eq!(
+            d.triggering_message.map(|t| t.0),
+            Some(ngap_gen::TriggeringMessage::INITIATING_MESSAGE)
+        );
+        assert_eq!(
+            d.procedure_criticality.map(|c| c.0),
+            Some(ngap_gen::Criticality::IGNORE)
+        );
+        let items = d.i_es_criticality_diagnostics.expect("IE list").0;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].ie_id.0, 9999);
+
+        match parser::decode_ngap_pdu(&bytes).expect("hand-written decode") {
+            NgapMessage::ErrorIndication(ei) => {
+                assert_eq!(ei.amf_ue_ngap_id, Some(7));
+                assert_eq!(ei.ran_ue_ngap_id, Some(9));
+                assert_eq!(
+                    ei.cause,
+                    Some(Cause::Protocol(CauseProtocol::AbstractSyntaxErrorReject))
+                );
+            }
+            other => panic!("Expected ErrorIndication, got {other:?}"),
+        }
+    }
+
+    const GOLDEN_CRITICALITY_ERROR_INDICATION: &[u8] = &[
+        0x00, 0x09, 0x40, 0x20, 0x00, 0x00, 0x04, 0x00, 0x0a, 0x40, 0x02, 0x00, 0x07, 0x00, 0x55,
+        0x40, 0x02, 0x00, 0x09, 0x00, 0x0f, 0x40, 0x01, 0x62, 0x00, 0x13, 0x40, 0x08, 0x78, 0x2a,
+        0x10, 0x00, 0x00, 0x27, 0x0f, 0x00,
+    ];
 }
