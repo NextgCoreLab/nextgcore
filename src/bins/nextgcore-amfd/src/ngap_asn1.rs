@@ -5438,9 +5438,11 @@ pub(crate) mod tests {
 
     /// N2 SM transfers at every length determinant boundary of an unconstrained
     /// OCTET STRING -- empty, one octet, the short form's 127 and the long
-    /// form's 128, and the longest the fork can carry with an SD (see
-    /// `a_setup_request_past_16k_octets_is_refused`) -- and the transfer the
-    /// SMF actually builds.
+    /// form's 128, the longest whose Setup Request still needs no fragmented
+    /// outer length with an SD, and the first that does (X.691 §11.9.3.8,
+    /// encodable since nextgsim #223; see
+    /// `a_setup_request_past_16k_octets_matches_the_hand_written_fragmenting_encoder`)
+    /// -- and the transfer the SMF actually builds.
     fn setup_transfers() -> Vec<Vec<u8>> {
         vec![
             vec![],
@@ -5448,6 +5450,7 @@ pub(crate) mod tests {
             vec![0x5a; 127],
             vec![0x5b; 128],
             vec![0x5c; 16_352],
+            vec![0x5d; 16_353],
             build_n2_sm_setup_request_transfer(0x0001_0001, [10, 45, 0, 7], 9, 9, 8)
                 .expect("transfer"),
         ]
@@ -5503,7 +5506,7 @@ pub(crate) mod tests {
                 check(amf, ran, 5, 1, None, &transfer);
             }
         }
-        assert_eq!(compared, 256 + 256 * 5 + 6 + 12 * 8);
+        assert_eq!(compared, 256 + 256 * 5 + 7 + 12 * 8);
         // The out-of-range AMF UE NGAP IDs, with every RAN UE NGAP ID.
         assert_eq!(refused, 8);
     }
@@ -5682,6 +5685,27 @@ pub(crate) mod tests {
             },
         ))
         .expect("encode")
+    }
+
+    /// The generated failed-to-set-up list for `failed`.
+    pub(crate) fn generated_failed_list(
+        failed: &[(u8, Vec<u8>)],
+    ) -> ngap_gen::PDUSessionResourceSetupResponseProtocolIEs_EntryValue {
+        ngap_gen::PDUSessionResourceSetupResponseProtocolIEs_EntryValue::Id_PDUSessionResourceFailedToSetupListSURes(
+            ngap_gen::PDUSessionResourceFailedToSetupListSURes(
+                failed
+                    .iter()
+                    .map(|(psi, transfer)| ngap_gen::PDUSessionResourceFailedToSetupItemSURes {
+                        pdu_session_id: ngap_gen::PDUSessionID(*psi),
+                        pdu_session_resource_setup_unsuccessful_transfer:
+                            ngap_gen::PDUSessionResourceFailedToSetupItemSUResPDUSessionResourceSetupUnsuccessfulTransfer(
+                                transfer.clone(),
+                            ),
+                        ie_extensions: None,
+                    })
+                    .collect(),
+            ),
+        )
     }
 
     /// The generated set-up list for `setup`.
@@ -6817,43 +6841,117 @@ pub(crate) mod tests {
         );
     }
 
-    /// The fork encodes no length determinant past 16383 (X.691 §11.9.3.8
-    /// fragmentation is "not yet implemented"), so a Setup Request whose
-    /// initiating-message value -- the transfer plus 31 octets, with an SD --
-    /// would pass 16383 octets is refused, where the hand-written encoder
-    /// fragmented it. No N2 SM transfer is that long: one of 64 fully-specified
-    /// QoS flows is a few kilobytes.
+    /// Past 16,383 octets an APER length determinant is fragmented (X.691
+    /// §11.9.3.8): 16K/32K/48K/64K pieces, then the remainder with its own
+    /// determinant. The hand-written encoder always fragmented; the fork has
+    /// since nextgsim #223 (#222), so the 16,383-octet ceiling stage 6 had to
+    /// accept is gone and the generated Setup Request is byte for byte the
+    /// hand-written one on both sides of the boundary -- the transfer alone
+    /// fragmenting (16,384+) and the outer initiating-message value
+    /// fragmenting (16,353+, the transfer plus 31 octets with an SD) -- across
+    /// one, two, three and four 16K fragments and a non-zero remainder past
+    /// 64K. Each also decodes back, through the generated decoder, to the
+    /// transfer it carried. Before #223 every length here but 16,352 was
+    /// refused.
     #[test]
-    fn a_setup_request_past_16k_octets_is_refused() {
-        let build = |n: usize| {
-            build_pdu_session_resource_setup_request_asn1(
+    fn a_setup_request_past_16k_octets_matches_the_hand_written_fragmenting_encoder() {
+        for n in [
+            16_352, 16_353, 16_383, 16_384, 16_385, 20_000, 32_767, 32_768, 49_152, 65_535, 65_536,
+            70_000,
+        ] {
+            let transfer: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+            let generated = build_pdu_session_resource_setup_request_asn1(
                 42,
                 1001,
                 5,
                 1,
                 Some(1),
                 None,
-                &vec![0; n],
+                &transfer,
             )
-        };
-        let old = |n: usize| {
-            hand_written_pdu_session_resource_setup_request(
+            .unwrap_or_else(|| panic!("generated refused a {n}-octet transfer"));
+            let oracle = hand_written_pdu_session_resource_setup_request(
                 42,
                 1001,
                 5,
                 1,
                 Some(1),
                 None,
-                &vec![0; n],
+                &transfer,
             )
-        };
-        assert!(build(16_352).is_some());
-        assert_eq!(build(16_352), old(16_352));
-        assert_eq!(build(16_353), None);
-        assert!(
-            old(16_353).is_some(),
-            "the hand-written encoder fragmented it"
-        );
+            .expect("the hand-written encoder fragments");
+            assert!(generated == oracle, "{n}-octet transfer: bytes differ");
+            if n > 16_352 {
+                // The outer initiating-message length is itself fragmented:
+                // byte 3 is its first octet, 0b11 + multiplier.
+                assert!(generated[3] >= 0xC0, "{n}: outer length not fragmented");
+            }
+            let ngap_gen::NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+                value: ngap_gen::InitiatingMessageValue::Id_PDUSessionResourceSetup(request),
+                ..
+            }) = nextgcore_ngap_gen::decode(&generated).expect("generated decode")
+            else {
+                panic!("{n}: not a Setup Request");
+            };
+            let carried = request
+                .protocol_i_es
+                .0
+                .into_iter()
+                .find_map(|ie| match ie.value {
+                    ngap_gen::PDUSessionResourceSetupRequestProtocolIEs_EntryValue::Id_PDUSessionResourceSetupListSUReq(
+                        list,
+                    ) => Some(list.0[0].pdu_session_resource_setup_request_transfer.0.clone()),
+                    _ => None,
+                })
+                .expect("setup list");
+            assert!(carried == transfer, "{n}: transfer not decoded back intact");
+        }
+    }
+
+    /// The decode side of the same boundary: a Setup Response whose transfers
+    /// pass 16,383 octets -- set-up and failed lists, a fragmented transfer
+    /// and a fragmented outer length -- decodes through the generated decoder
+    /// to exactly what the hand-written parser reads, whether the hand-written
+    /// or the generated encoder framed it. Before nextgsim #223 the fork read
+    /// the next fragment header as content (#222), so a fragmented open type
+    /// decoded without error to corrupted octets.
+    #[test]
+    fn a_setup_response_past_16k_octets_decodes_as_the_hand_written_parser_reads_it() {
+        for n in [
+            16_383, 16_384, 16_385, 20_000, 32_768, 49_152, 65_536, 70_000,
+        ] {
+            let t: Vec<u8> = (0..n).map(|i| (i % 241) as u8).collect();
+            let expected = Some((7, 9, vec![(3, t.clone())], vec![(6, t.clone())]));
+            let hand_built = setup_response(7, 9, &[(3, t.clone())], &[(6, t.clone())]);
+            assert_eq!(
+                hand_written_parse_pdu_session_resource_setup_response(&hand_built),
+                expected,
+                "{n}: the oracle reads its own framing"
+            );
+            assert!(
+                generated_setup_response_view(&hand_built) == expected,
+                "{n}: generated decode of the hand-written framing differs"
+            );
+            let generated_built = generated_setup_response(vec![
+                ngap_gen::PDUSessionResourceSetupResponseProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(
+                    ngap_gen::AMF_UE_NGAP_ID(7),
+                ),
+                ngap_gen::PDUSessionResourceSetupResponseProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(
+                    ngap_gen::RAN_UE_NGAP_ID(9),
+                ),
+                generated_setup_list(&[(3, t.clone())]),
+                generated_failed_list(&[(6, t.clone())]),
+            ]);
+            // The two framings are not byte-identical at ANY length: the
+            // hand-written builder marks both UE NGAP IDs criticality reject,
+            // where §9.2.1.2 gives every IE of this message criticality
+            // ignore. amfd only decodes this message, so the point here is
+            // that both framings decode alike past 16K.
+            assert!(
+                generated_setup_response_view(&generated_built) == expected,
+                "{n}: generated decode of the generated framing differs"
+            );
+        }
     }
 
     /// A transfer whose iE-Extensions carries an extension the schema does not
@@ -7365,15 +7463,16 @@ pub(crate) mod tests {
                         assert!(generated == oracle, "not identical: {}", case.describe());
                         identical += 1;
                     }
+                    // A NAS-PDU of ~16 KB fragments the outer initiatingMessage
+                    // length (X.691 §11.9.3.8; byte 3 is its first octet). Since
+                    // nextgsim #223 the generated encoder fragments it too, so
+                    // these are compared byte for byte like every other case.
+                    if oracle[3] >= 0xC0 {
+                        fragmented += 1;
+                    }
                     compared += 1;
                 }
                 (None, None) => refused += 1,
-                // The one deliberate ceiling: the forked codec has no length
-                // determinant past 16,383 octets (X.691 §11.9.3.8 fragmentation),
-                // so a request whose initiatingMessage value needs one -- a
-                // NAS-PDU of ~16 KB -- is refused. The hand-written encoder
-                // fragments it; byte 3 is that outer length's first octet.
-                (None, Some(oracle)) if oracle[3] >= 0xC0 => fragmented += 1,
                 (generated, oracle) => panic!(
                     "generated {} but hand-written {}: {}",
                     if generated.is_some() {
