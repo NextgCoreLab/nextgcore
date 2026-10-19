@@ -1235,23 +1235,39 @@ impl NgapServer {
                 log::warn!(
                     "Unhandled NGAP procedure_code={procedure_code:?} from association {association_id}; emitting ErrorIndication"
                 );
-                let cause = match procedure_code {
-                    Some(_) => nextgcore_ngap::types::Cause::Protocol(
-                        nextgcore_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
-                    ),
-                    None => nextgcore_ngap::types::Cause::Protocol(
-                        nextgcore_asn1c::ngap::cause::CauseProtocol::TransferSyntaxError,
-                    ),
-                };
-                // Best-effort: include the UE NGAP IDs if they can be located.
-                let amf_ue_ngap_id = crate::ngap_asn1::extract_amf_ue_ngap_id(data);
-                let ran_ue_ngap_id = crate::ngap_asn1::extract_ran_ue_ngap_id(data);
+                let (amf_ue_ngap_id, ran_ue_ngap_id, cause) =
+                    Self::unhandled_procedure_error_indication(procedure_code, data);
                 self.send_error_indication(association_id, amf_ue_ngap_id, ran_ue_ngap_id, cause)
                     .await?;
             }
         }
 
         Ok(())
+    }
+
+    /// The Error Indication answering a PDU for a procedure the AMF does not handle
+    /// (TS 38.413 §10.3): abstract-syntax-error-reject when the procedure code was
+    /// read, transfer-syntax-error when it was not, and -- for a UE-associated
+    /// message -- the AMF and RAN UE NGAP IDs it carries (§9.2.7.1), located by IE
+    /// id whatever the procedure (#447). Pure, so the IDs are testable without an
+    /// outbound capture.
+    fn unhandled_procedure_error_indication(
+        procedure_code: Option<u16>,
+        data: &[u8],
+    ) -> (Option<u64>, Option<u32>, nextgcore_ngap::types::Cause) {
+        let cause = match procedure_code {
+            Some(_) => nextgcore_ngap::types::Cause::Protocol(
+                nextgcore_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
+            ),
+            None => nextgcore_ngap::types::Cause::Protocol(
+                nextgcore_asn1c::ngap::cause::CauseProtocol::TransferSyntaxError,
+            ),
+        };
+        (
+            crate::ngap_asn1::extract_amf_ue_ngap_id(data),
+            crate::ngap_asn1::extract_ran_ue_ngap_id(data),
+            cause,
+        )
     }
 
     /// Extract procedure code from NGAP message
@@ -19067,6 +19083,157 @@ mod tests {
         assert!(
             is_communication_failure_cause(g::RADIO_NETWORK, 9_999),
             "an unclassified cause must default to FAILURE, not to silence"
+        );
+    }
+
+    // ---- #447: the unhandled-procedure Error Indication carries the UE's IDs ----
+
+    /// A UE Context Modification Response (procedure 40) -- a UE-associated message
+    /// the dispatcher has no arm for -- carrying AMF-UE-NGAP-ID (IE 10) and
+    /// RAN-UE-NGAP-ID (IE 85).
+    fn ue_context_modification_response(amf_ue_ngap_id: u64, ran_ue_ngap_id: u32) -> Vec<u8> {
+        use nextgcore_ngap_gen::generated as g;
+        let entry = |id: u16, value| g::UEContextModificationResponseProtocolIEs_Entry {
+            id: g::ProtocolIE_ID(id),
+            criticality: g::Criticality(g::Criticality::IGNORE),
+            value,
+        };
+        type Ie = g::UEContextModificationResponseProtocolIEs_EntryValue;
+        nextgcore_ngap_gen::encode(&g::NGAP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+            procedure_code: g::ProcedureCode(g::ID_UE_CONTEXT_MODIFICATION),
+            criticality: g::Criticality(g::Criticality::REJECT),
+            value: g::SuccessfulOutcomeValue::Id_UEContextModification(
+                g::UEContextModificationResponse {
+                    protocol_i_es: g::UEContextModificationResponseProtocolIEs(vec![
+                        entry(
+                            g::ID_AMF_UE_NGAP_ID,
+                            Ie::Id_AMF_UE_NGAP_ID(g::AMF_UE_NGAP_ID(amf_ue_ngap_id)),
+                        ),
+                        entry(
+                            g::ID_RAN_UE_NGAP_ID,
+                            Ie::Id_RAN_UE_NGAP_ID(g::RAN_UE_NGAP_ID(ran_ue_ngap_id)),
+                        ),
+                    ]),
+                },
+            ),
+        }))
+        .expect("encode UEContextModificationResponse")
+    }
+
+    fn abstract_syntax_error_reject() -> nextgcore_ngap::types::Cause {
+        nextgcore_ngap::types::Cause::Protocol(
+            nextgcore_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
+        )
+    }
+
+    /// **#447.** An unhandled UE-associated procedure yields an Error Indication
+    /// carrying both of the UE's NGAP IDs, at every APER length the IDs can take.
+    /// Before, the extractors decoded only a UE Context Release Request, so every
+    /// Error Indication from this path went out with neither ID.
+    ///
+    /// Asserted on the encoded Error Indication -- built by the same
+    /// `build_error_indication` `send_error_indication` uses and decoded back --
+    /// because amfd's test server has no outbound capture to observe the send.
+    #[test]
+    fn an_unhandled_ue_associated_procedure_reports_both_ue_ids() {
+        for (amf, ran) in [
+            (0u64, 0u32),
+            (255, 255),
+            (256, 256),
+            (65_535, 65_536),
+            (16_777_216, 16_777_216),
+            ((1u64 << 40) - 1, u32::MAX),
+        ] {
+            let pdu = ue_context_modification_response(amf, ran);
+            let (amf_id, ran_id, cause) = NgapServer::unhandled_procedure_error_indication(
+                Some(nextgcore_ngap_gen::generated::ID_UE_CONTEXT_MODIFICATION as u16),
+                &pdu,
+            );
+            assert_eq!(
+                (amf_id, ran_id),
+                (Some(amf), Some(ran)),
+                "IDs for {amf}/{ran}"
+            );
+            assert_eq!(cause, abstract_syntax_error_reject());
+
+            let bytes = nextgcore_ngap::builder::build_error_indication(
+                &nextgcore_ngap::types::ErrorIndication {
+                    amf_ue_ngap_id: amf_id,
+                    ran_ue_ngap_id: ran_id,
+                    cause: Some(cause),
+                    criticality_diagnostics: None,
+                },
+            )
+            .expect("build ErrorIndication");
+            match nextgcore_ngap::parser::decode_ngap_pdu(&bytes) {
+                Ok(nextgcore_ngap::parser::NgapMessage::ErrorIndication(ei)) => {
+                    assert_eq!(ei.amf_ue_ngap_id, Some(amf), "AMF-UE-NGAP-ID on the wire");
+                    assert_eq!(ei.ran_ue_ngap_id, Some(ran), "RAN-UE-NGAP-ID on the wire");
+                }
+                other => panic!("expected an ErrorIndication, got {other:?}"),
+            }
+        }
+    }
+
+    /// **#447.** The IDs are found by IE id, not by the procedure's typed form, so a
+    /// procedure code this codec has never heard of still yields them.
+    #[test]
+    fn a_procedure_unknown_to_the_codec_still_reports_its_ue_ids() {
+        let mut pdu = ue_context_modification_response(4_470_001, 447);
+        // Byte 1 is the procedure code (the CHOICE index and criticality share
+        // byte 0 / byte 2); 200 is outside every NGAP release.
+        assert_eq!(
+            pdu[1],
+            nextgcore_ngap_gen::generated::ID_UE_CONTEXT_MODIFICATION
+        );
+        pdu[1] = 200;
+        let (amf_id, ran_id, _) = NgapServer::unhandled_procedure_error_indication(Some(200), &pdu);
+        assert_eq!((amf_id, ran_id), (Some(4_470_001), Some(447)));
+    }
+
+    /// **#447.** A non-UE-associated PDU yields neither ID: an Error Indication sent
+    /// without UE IDs is itself non-UE-associated (TS 38.413 §9.2.7.1).
+    #[test]
+    fn a_non_ue_associated_procedure_reports_no_ue_ids() {
+        let pdu = nextgcore_ngap::builder::build_error_indication(
+            &nextgcore_ngap::types::ErrorIndication {
+                amf_ue_ngap_id: None,
+                ran_ue_ngap_id: None,
+                cause: Some(abstract_syntax_error_reject()),
+                criticality_diagnostics: None,
+            },
+        )
+        .expect("build non-UE-associated ErrorIndication");
+        let (amf_id, ran_id, _) = NgapServer::unhandled_procedure_error_indication(Some(15), &pdu);
+        assert_eq!((amf_id, ran_id), (None, None));
+    }
+
+    /// **#447.** Malformed input yields neither ID and does not panic: every strict
+    /// prefix of a valid UE-associated PDU, plus inputs that are not NGAP at all. A
+    /// PDU whose procedure code could not be read is answered with
+    /// transfer-syntax-error, as before.
+    #[test]
+    fn malformed_input_reports_no_ue_ids_and_does_not_panic() {
+        let pdu = ue_context_modification_response(4_470_002, 448);
+        for len in 0..pdu.len() {
+            let (amf_id, ran_id, _) =
+                NgapServer::unhandled_procedure_error_indication(Some(40), &pdu[..len]);
+            assert_eq!((amf_id, ran_id), (None, None), "prefix of {len} octets");
+        }
+        for junk in [
+            &[0xFFu8; 16][..],
+            &[0x00; 3],
+            &[0x40, 0x28, 0x00, 0xFF, 0xFF],
+        ] {
+            let (amf_id, ran_id, _) = NgapServer::unhandled_procedure_error_indication(None, junk);
+            assert_eq!((amf_id, ran_id), (None, None), "junk {junk:02x?}");
+        }
+        let (_, _, cause) = NgapServer::unhandled_procedure_error_indication(None, &[0xFF; 4]);
+        assert_eq!(
+            cause,
+            nextgcore_ngap::types::Cause::Protocol(
+                nextgcore_asn1c::ngap::cause::CauseProtocol::TransferSyntaxError,
+            )
         );
     }
 }
