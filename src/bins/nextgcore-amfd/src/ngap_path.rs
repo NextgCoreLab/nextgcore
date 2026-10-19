@@ -9018,37 +9018,77 @@ impl NgapServer {
     /// Secondary RAT usage / release confirmation. It used to be dropped with
     /// "session cleanup already done" — which assumed the AMF's own bookkeeping
     /// was the whole story and left the SMF without the gNB's confirmation.
+    ///
+    /// Decoded with the generated codec (#417 stage 5), which applies the §10.3.4.2
+    /// rules for a RESPONSE: a not-comprehended "ignore IE and notify sender" IE is
+    /// reported in an Error Indication and the transfers are relayed all the same;
+    /// one marked "reject" terminates the procedure unsuccessfully, handled locally
+    /// by relaying nothing -- what an undecodable response already got.
     async fn handle_pdu_session_resource_release_response(
         &mut self,
         association_id: u64,
         data: &[u8],
     ) -> Result<()> {
-        let resp = match nextgcore_ngap::parser::decode_ngap_pdu(data) {
-            Ok(nextgcore_ngap::NgapMessage::PduSessionResourceReleaseResponse(r)) => r,
-            Ok(other) => {
-                log::warn!("Expected PduSessionResourceReleaseResponse, got {other:?}");
-                return Ok(());
-            }
-            Err(e) => {
-                log::warn!(
-                    "Failed to decode PDU Session Resource Release Response from \
-                     association {association_id}: {e:?}"
-                );
-                return Ok(());
-            }
+        use crate::ngap_asn1::PduSessionResourceReleaseResponseDecode::{
+            Failed, Released, Undecodable,
+        };
+        let (amf_ue_ngap_id, released) =
+            match crate::ngap_asn1::decode_pdu_session_resource_release_response_asn1(data) {
+                Released {
+                    amf_ue_ngap_id,
+                    released,
+                    error_indication,
+                    ..
+                } => {
+                    // Best effort: the report must not stop the relay below.
+                    if let Some(report) = error_indication {
+                        if let Err(e) = self
+                            .send_criticality_error_indication(association_id, &report)
+                            .await
+                        {
+                            log::warn!("Failed to send ErrorIndication: {e}");
+                        }
+                    }
+                    (amf_ue_ngap_id, released)
+                }
+                Failed(diagnostics) => {
+                    log::warn!(
+                        "PDU Session Resource Release Response from association \
+                         {association_id} carries not-comprehended IEs marked reject \
+                         ({diagnostics:?}); the procedure is unsuccessfully terminated \
+                         (TS 38.413 §10.3.4.2), handled locally"
+                    );
+                    return Ok(());
+                }
+                Undecodable => {
+                    log::warn!(
+                        "Failed to decode PDU Session Resource Release Response from \
+                         association {association_id}"
+                    );
+                    return Ok(());
+                }
+            };
+        // The AMF UE NGAP ID has criticality ignore, so its absence is ignored
+        // (§10.3.5) -- but it is what names the UE whose SM contexts the
+        // transfers belong to, so without it there is nothing to relay them to.
+        let Some(amf_ue_ngap_id) = amf_ue_ngap_id else {
+            log::warn!(
+                "PDU Session Resource Release Response from association {association_id} \
+                 names no AMF UE NGAP ID; {} released transfers cannot be relayed",
+                released.len()
+            );
+            return Ok(());
         };
 
         log::info!(
             "PDU Session Resource Release Response from association {association_id}: \
-             UE {}, released={}",
-            resp.amf_ue_ngap_id,
-            resp.released_list.len()
+             UE {amf_ue_ngap_id}, released={}",
+            released.len()
         );
 
-        for item in &resp.released_list {
-            // An empty transfer is legitimate here: the Release Response Transfer
-            // is optional per session, so relaying nothing is correct rather than
-            // an error to report.
+        for item in &released {
+            // An empty transfer is tolerated here: nothing in it to relay, so
+            // relaying nothing is correct rather than an error to report.
             if item.transfer.is_empty() {
                 log::debug!(
                     "Released PSI={} carries no Release Response Transfer; nothing \
@@ -9058,7 +9098,7 @@ impl NgapServer {
                 continue;
             }
             self.relay_n2_sm_to_smf(
-                resp.amf_ue_ngap_id,
+                amf_ue_ngap_id,
                 item.pdu_session_id,
                 &item.transfer,
                 "PDUSessionResourceReleaseResponse",
@@ -14947,6 +14987,62 @@ mod tests {
             ],
             "each procedure must relay its own container against its own SM \
              context ref, and the empty release transfer must relay nothing: {calls:?}"
+        );
+    }
+
+    /// #417 stage 5, at the handler: what the generated Release Response decode
+    /// changes about what reaches the SMF. A response with no RAN UE NGAP ID
+    /// (criticality ignore, so its absence is ignored, §10.3.5) now relays its
+    /// transfer, where the hand-written parser refused it; one carrying a
+    /// not-comprehended IE marked "notify" relays too, the IE reported in an
+    /// Error Indication; one carrying an IE marked "reject" relays nothing --
+    /// the procedure is unsuccessfully terminated, handled locally
+    /// (§10.3.4.2) -- and neither does one that names no AMF UE NGAP ID.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn release_responses_relay_per_the_criticality_rules() {
+        use nextgcore_ngap_gen::generated::PDUSessionResourceReleaseResponseProtocolIEs_EntryValue as Ie;
+        let (_smf, port, seen) = fake_smf().await;
+        let _env = SmfEnvGuard::set(port);
+
+        let mut server = test_ngap_server().await;
+        let ue = 79_005u64;
+        for (psi, r) in [(5u8, "ref-no-ran"), (6, "ref-notify"), (7, "ref-reject")] {
+            server.sm_context_refs.insert((ue, psi), r.to_string());
+        }
+
+        let no_ran_id = ngap_asn1::tests::generated_release_response(vec![
+            Ie::Id_AMF_UE_NGAP_ID(nextgcore_ngap_gen::generated::AMF_UE_NGAP_ID(ue)),
+            ngap_asn1::tests::generated_released_list(&[(5, vec![0x51])]),
+        ]);
+        let notify = ngap_asn1::tests::with_unknown_ie(
+            &ngap_asn1::tests::release_response(ue, 1, &[(6, vec![0x61])]),
+            9999,
+            0x80,
+        );
+        let reject = ngap_asn1::tests::with_unknown_ie(
+            &ngap_asn1::tests::release_response(ue, 1, &[(7, vec![0x71])]),
+            9999,
+            0x00,
+        );
+        let no_amf_id = ngap_asn1::tests::generated_release_response(vec![
+            Ie::Id_RAN_UE_NGAP_ID(nextgcore_ngap_gen::generated::RAN_UE_NGAP_ID(1)),
+            ngap_asn1::tests::generated_released_list(&[(7, vec![0x72])]),
+        ]);
+        for data in [&no_ran_id, &notify, &reject, &no_amf_id] {
+            server
+                .handle_pdu_session_resource_release_response(9401, data)
+                .await
+                .expect("handled");
+        }
+
+        let calls = seen.lock().expect("seen").clone();
+        assert_eq!(
+            calls,
+            vec![
+                ("ref-no-ran".to_string(), vec![0x51]),
+                ("ref-notify".to_string(), vec![0x61]),
+            ],
+            "only the no-RAN-ID and the notify responses relay: {calls:?}"
         );
     }
 
