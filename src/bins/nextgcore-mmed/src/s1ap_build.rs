@@ -19,8 +19,7 @@ use nextgcore_s1ap::{
     ErabToBeModifiedItem, ErabToBeSetupItem, ErrorIndication, EutranCgi, GbrQosInformation,
     InitialContextSetupRequest, KillRequest, OverloadAction, OverloadStart, OverloadStop, Paging,
     PagingDrx, S1apResult, STmsi, Tai, TimeToWait, UeAmbr, UeContextModificationRequest,
-    UeContextReleaseCommand, UePagingId, UeS1apIds, UeSecurityCapabilities, WarningAreaList,
-    WriteReplaceWarningRequest,
+    UePagingId, UeS1apIds, UeSecurityCapabilities, WarningAreaList, WriteReplaceWarningRequest,
 };
 
 // ============================================================================
@@ -506,10 +505,12 @@ pub fn build_ue_context_release_command(
         None => UeS1apIds::MmeOnly { mme_ue_s1ap_id },
     };
 
-    builder::build_ue_context_release_command(&UeContextReleaseCommand {
-        ue_s1ap_ids,
-        cause: cause_to_s1ap(cause_group, cause_value),
-    })
+    // Generated codec (#514 stage 5).
+    crate::s1ap_gen::build_ue_context_release_command(
+        &ue_s1ap_ids,
+        cause_to_s1ap(cause_group, cause_value),
+    )
+    .map_err(gen_err)
 }
 
 // ============================================================================
