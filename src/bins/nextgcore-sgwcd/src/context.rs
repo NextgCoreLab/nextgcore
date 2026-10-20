@@ -464,6 +464,8 @@ pub struct SgwcContext {
     /// The address this SGW-C advertises as its PFCP Node ID on Sxa (#387), from
     /// `sgwc.pfcp.server[0].address`.
     pfcp_node_ip: RwLock<Option<Ipv4Addr>>,
+    /// `sgwc.gtpc.server[0].address` (#482): the S11/S5-C address from the config.
+    gtpc_server_ip: RwLock<Option<Ipv4Addr>>,
     /// The SGW-U peers from `sgwc.pfcp.client.sgwu` (#387), in file order.
     sgwu_peers: RwLock<Vec<std::net::SocketAddr>>,
 
@@ -506,6 +508,7 @@ impl SgwcContext {
             pgw_s5c_peer: RwLock::new(None),
             gtpu_addr: RwLock::new(None),
             pfcp_node_ip: RwLock::new(None),
+            gtpc_server_ip: RwLock::new(None),
             sgwu_peers: RwLock::new(Vec::new()),
             max_num_of_ue: 0,
             max_num_of_sess: 0,
@@ -662,6 +665,18 @@ impl SgwcContext {
     /// required to store (TS 29.244 §6.2.6.2.2).
     pub fn pfcp_node_ip(&self) -> Option<Ipv4Addr> {
         self.pfcp_node_ip.read().ok().and_then(|a| *a)
+    }
+
+    /// Set the S11/S5-C address read from `sgwc.gtpc.server` (#482).
+    pub fn set_gtpc_server_ip(&self, addr: Option<Ipv4Addr>) {
+        if let Ok(mut a) = self.gtpc_server_ip.write() {
+            *a = addr;
+        }
+    }
+
+    /// The S11/S5-C address from `sgwc.gtpc.server[0]`, if configured.
+    pub fn gtpc_server_ip(&self) -> Option<Ipv4Addr> {
+        self.gtpc_server_ip.read().ok().and_then(|a| *a)
     }
 
     /// Set the SGW-U peers read from `sgwc.pfcp.client.sgwu` (#387).
@@ -1198,7 +1213,8 @@ pub fn sgwc_self() -> Arc<SgwcContext> {
 /// own. It guards, together:
 ///
 /// - the **scalar address slots** on [`SGWC_CONTEXT`] — `s11_addr`, `gtpu_addr`,
-///   `s5c_addr`, `pgw_s5c_peer`, and (since #387) `pfcp_node_ip` and `sgwu_peers`.
+///   `s5c_addr`, `pgw_s5c_peer`, (since #387) `pfcp_node_ip` and `sgwu_peers`, and
+///   (since #482) `gtpc_server_ip`.
 ///   Unlike the UE/session/bearer maps (which tests keep apart with unique IMSIs)
 ///   these hold exactly one value for the whole process, so whoever wrote one last
 ///   owns every sibling's answer. `sgwu_peers` is read by EVERY Sxa send — the

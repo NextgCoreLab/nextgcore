@@ -2,6 +2,7 @@
 //!
 //! Port of src/sgwu - SGWU context, state machines, and event handling
 
+pub mod config;
 pub mod context;
 pub mod event;
 pub mod gtp_path;
@@ -84,6 +85,13 @@ async fn main() -> Result<()> {
     )
     .ok();
     log::info!("NextGCore SGWU starting...");
+
+    // The configuration file (#482). Read before the PFCP and GTP-U sockets open,
+    // because the Node ID and the advertised GTP-U address are fixed at open.
+    match config::config_path_from_args(std::env::args()) {
+        Some(path) => config::install(config::load(&path)),
+        None => log::info!("No -c configuration file given; using the environment and defaults"),
+    }
 
     // Initialize context
     context::sgwu_context_init(1024);

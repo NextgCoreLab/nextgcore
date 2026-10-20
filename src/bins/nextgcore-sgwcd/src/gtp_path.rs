@@ -392,6 +392,26 @@ pub(crate) fn clear_s11_server_for_test() {
     }
 }
 
+/// The S11 address to advertise and the GTP-U address to put in F-TEIDs.
+///
+/// S11: the bound address when specific; otherwise `SGWC_S11_ADVERTISE`, then the
+/// config's `sgwc.gtpc.server` address (#482). GTP-U: `SGWC_GTPU_ADVERTISE`, else
+/// the S11 address ONLY when it came from the bind or the environment — never from
+/// the YAML control-plane address, which names the SGW-C, not the SGW-U.
+fn advertised_addresses(
+    bound: IpAddr,
+    env_s11: Option<Ipv4Addr>,
+    yaml_gtpc: Option<Ipv4Addr>,
+    env_gtpu: Option<Ipv4Addr>,
+) -> (Option<Ipv4Addr>, Option<Ipv4Addr>) {
+    let from_bind_or_env = match bound {
+        IpAddr::V4(v4) if !v4.is_unspecified() => Some(v4),
+        _ => env_s11,
+    };
+    let s11 = from_bind_or_env.or(yaml_gtpc);
+    (s11, env_gtpu.or(from_bind_or_env))
+}
+
 /// Open the S11 GTP-C server socket
 /// Port of sgwc_gtp_open
 pub fn gtp_open() -> Result<(), String> {
@@ -422,20 +442,19 @@ pub fn gtp_open() -> Result<(), String> {
     let ctx = sgwc_self();
     // Advertised control-plane address: the bound address unless wildcard,
     // then SGWC_S11_ADVERTISE
-    let advertised = match server.local_addr().ip() {
-        IpAddr::V4(v4) if !v4.is_unspecified() => Some(v4),
-        _ => std::env::var("SGWC_S11_ADVERTISE")
-            .ok()
-            .and_then(|v| v.parse::<Ipv4Addr>().ok()),
-    };
-    ctx.set_s11_address(advertised);
-    // User-plane endpoints advertised in F-TEIDs live on the SGW-U
-    ctx.set_gtpu_address(
-        std::env::var("SGWC_GTPU_ADVERTISE")
+    let env_ip = |name: &str| {
+        std::env::var(name)
             .ok()
             .and_then(|v| v.parse::<Ipv4Addr>().ok())
-            .or(advertised),
+    };
+    let (advertised, gtpu) = advertised_addresses(
+        server.local_addr().ip(),
+        env_ip("SGWC_S11_ADVERTISE"),
+        ctx.gtpc_server_ip(),
+        env_ip("SGWC_GTPU_ADVERTISE"),
     );
+    ctx.set_s11_address(advertised);
+    ctx.set_gtpu_address(gtpu);
 
     // ---- S5/S8 (#52) ----
     //
@@ -776,6 +795,18 @@ fn handle_datagram(inner: &Arc<GtpcInner>, data: &[u8], peer: SocketAddr) {
         // `s5c_handler` into the receive path at last: it had no production caller, so
         // no PGW response could ever be acted on.
         t if t == T::CreateSessionResponse as u8 => {
+            // TS 29.274 §7.6: the response completes the request, so its T3/N3
+            // retransmission stops. This arm never completed the transaction, so
+            // the S5-C Create Session Request kept being retransmitted every T3
+            // after the PGW had answered (#482).
+            if let Ok(mut xact) = inner.xact.lock() {
+                if xact.match_response(seq, msg_type).is_none() {
+                    log::debug!(
+                        "S5/S8 Create Session Response seq={seq} from {peer} completes no \
+                         outstanding transaction (late duplicate?)"
+                    );
+                }
+            }
             dispatch_s5c_create_session_response(&msg, peer);
         }
         // PGW-INITIATED bearer procedures (TS 29.274 §7.2.3, §7.2.15, §7.2.9.2).
@@ -3301,6 +3332,74 @@ mod tests {
         assert!(ue.sess_ids.is_empty());
 
         server.close();
+    }
+
+    /// #482, TS 29.274 §7.6: a Create Session Response completes the request, so
+    /// the S5-C Create Session Request is not retransmitted after it. The arm never
+    /// completed the transaction, and T3 kept firing every period at a PGW that had
+    /// already answered.
+    #[test]
+    fn a_create_session_response_stops_the_requests_retransmission() {
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let server = test_server(&ambient, 50, 3);
+        let pgw = client();
+        let pgw_addr = pgw.local_addr().unwrap();
+
+        let seq = server.alloc_sequence();
+        let request = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+            Gtp2MessageType::CreateSessionRequest as u8,
+            0,
+            seq,
+        ));
+        server.send_request(pgw_addr, &request, 0).unwrap();
+        let mut buf = [0u8; 2048];
+        pgw.recv_from(&mut buf).expect("the initial request");
+
+        // The PGW answers (a reject is still an answer).
+        let mut response = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+            Gtp2MessageType::CreateSessionResponse as u8,
+            0,
+            seq,
+        ));
+        response.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Cause as u8, 0, &[109, 0]));
+        pgw.send_to(&response.encode(), server.local_addr())
+            .unwrap();
+
+        // Several T3 periods later, nothing more has arrived.
+        pgw.set_read_timeout(Some(Duration::from_millis(400)))
+            .unwrap();
+        assert!(
+            pgw.recv_from(&mut buf).is_err(),
+            "the request must not be retransmitted after its response"
+        );
+        assert_eq!(server.inner.xact.lock().unwrap().outstanding(), 0);
+
+        server.close();
+    }
+
+    /// #482: which addresses go where.
+    #[test]
+    fn s11_and_gtpu_advertisement_rules() {
+        let wild = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let yaml = Some(Ipv4Addr::new(172, 24, 0, 3));
+        let env = Some(Ipv4Addr::new(10, 0, 0, 3));
+        let gtpu = Some(Ipv4Addr::new(172, 24, 0, 6));
+        // Wildcard bind, nothing else: the YAML address is the S11 address but is
+        // NOT used for GTP-U (it names the SGW-C, not the SGW-U).
+        assert_eq!(advertised_addresses(wild, None, yaml, None), (yaml, None));
+        // The environment wins over the file, and still feeds the GTP-U fallback.
+        assert_eq!(advertised_addresses(wild, env, yaml, None), (env, env));
+        // A specific bind is used for both, as before.
+        let bound = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3));
+        assert_eq!(
+            advertised_addresses(bound, None, yaml, None),
+            (
+                Some(Ipv4Addr::new(127, 0, 0, 3)),
+                Some(Ipv4Addr::new(127, 0, 0, 3))
+            )
+        );
+        // An explicit GTP-U address always wins.
+        assert_eq!(advertised_addresses(wild, None, yaml, gtpu), (yaml, gtpu));
     }
 
     #[test]

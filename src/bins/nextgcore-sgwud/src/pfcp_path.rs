@@ -1735,10 +1735,15 @@ pub async fn pfcp_open() -> Result<Arc<SxaNode>, String> {
         .unwrap_or_else(|_| format!("0.0.0.0:{PFCP_PORT}"))
         .parse()
         .map_err(|e| format!("PFCP_BIND_ADDR is not a socket address: {e}"))?;
-    let local_ip: Ipv4Addr = std::env::var("PFCP_NODE_IP")
-        .unwrap_or_else(|_| "127.0.0.1".to_string())
-        .parse()
-        .map_err(|e| format!("PFCP_NODE_IP is not an IPv4 address: {e}"))?;
+    // The Node ID: PFCP_NODE_IP, then `sgwu.pfcp.server[0].address` (#482), then
+    // loopback, which a remote SGW-C cannot use as the association identifier it
+    // stores (TS 29.244 §6.2.6.2.2).
+    let local_ip = crate::config::resolve_ipv4(
+        std::env::var("PFCP_NODE_IP").ok(),
+        crate::config::config().pfcp_ip,
+        Ipv4Addr::LOCALHOST,
+    )
+    .map_err(|e| format!("PFCP_NODE_IP: {e}"))?;
     SxaNode::open(bind, local_ip)
         .await
         .map_err(|e| format!("failed to bind PFCP socket on {bind}: {e}"))
