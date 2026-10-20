@@ -31,7 +31,13 @@ struct SgwuSection {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct LoggerSection {
+    level: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct SgwuYaml {
+    logger: Option<LoggerSection>,
     sgwu: Option<SgwuSection>,
 }
 
@@ -42,6 +48,8 @@ pub struct SgwuConfig {
     pub pfcp_ip: Option<Ipv4Addr>,
     /// `sgwu.gtpu.server[0].address`: the S1-U/S5-U address put in F-TEIDs.
     pub gtpu_ip: Option<Ipv4Addr>,
+    /// `logger.level`: the default log filter when `RUST_LOG` is unset (#500).
+    pub log_level: Option<String>,
 }
 
 static CONFIG: OnceLock<SgwuConfig> = OnceLock::new();
@@ -68,6 +76,35 @@ pub fn config_path_from_args<I: IntoIterator<Item = String>>(args: I) -> Option<
         }
     }
     None
+}
+
+/// The value of `-l <level>` / `--log-level <level>` / `--log-level=<level>`.
+pub fn log_level_from_args<I: IntoIterator<Item = String>>(args: I) -> Option<String> {
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "-l" || arg == "--log-level" {
+            return args.next();
+        }
+        if let Some(level) = arg.strip_prefix("--log-level=") {
+            return Some(level.to_string());
+        }
+    }
+    None
+}
+
+/// The default log filter (#500): `--log-level`, then the file's `logger.level`,
+/// then `info` -- the level every other NF starts at. `RUST_LOG`, when set, still
+/// overrides it (`env_logger`'s `default_filter_or`). Read silently, because it
+/// runs before the logger exists; [`load`] reports any problem with the file.
+pub fn default_log_level(cli: Option<String>, path: Option<&str>) -> String {
+    cli.or_else(|| {
+        let content = std::fs::read_to_string(path?).ok()?;
+        serde_yaml::from_str::<SgwuYaml>(&content)
+            .ok()?
+            .logger?
+            .level
+    })
+    .unwrap_or_else(|| "info".to_string())
 }
 
 /// Parse `path`. A missing or unparsable file yields the default and a warning
@@ -108,6 +145,7 @@ fn parse(content: &str) -> Result<SgwuConfig, serde_yaml::Error> {
     Ok(SgwuConfig {
         pfcp_ip: first_ipv4(section.pfcp, "pfcp"),
         gtpu_ip: first_ipv4(section.gtpu, "gtpu"),
+        log_level: yaml.logger.and_then(|l| l.level),
     })
 }
 
@@ -139,6 +177,50 @@ mod tests {
         .unwrap();
         assert_eq!(config.pfcp_ip, Some(Ipv4Addr::new(172, 24, 0, 6)));
         assert_eq!(config.gtpu_ip, Some(Ipv4Addr::new(172, 24, 0, 6)));
+        assert_eq!(config.log_level.as_deref(), Some("info"));
+    }
+
+    /// #500: with no RUST_LOG, sgwud starts at `--log-level`, else the file's
+    /// `logger.level`, else info -- never env_logger's error-only default.
+    #[test]
+    fn the_default_log_level_is_cli_then_file_then_info() {
+        let dir = std::env::temp_dir().join(format!("sgwud-500-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let debug = dir.join("debug.yaml");
+        std::fs::write(&debug, "logger:\n  level: debug\n").unwrap();
+        let bare = dir.join("bare.yaml");
+        std::fs::write(&bare, "sgwu: {}\n").unwrap();
+        let debug = debug.to_str().unwrap();
+
+        assert_eq!(default_log_level(None, None), "info");
+        assert_eq!(
+            default_log_level(None, Some(bare.to_str().unwrap())),
+            "info"
+        );
+        assert_eq!(
+            default_log_level(None, Some("/nonexistent/sgwu.yaml")),
+            "info"
+        );
+        assert_eq!(default_log_level(None, Some(debug)), "debug");
+        assert_eq!(
+            default_log_level(Some("trace".into()), Some(debug)),
+            "trace"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn log_level_is_taken_from_the_arguments() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            log_level_from_args(args(&["sgwud", "-l", "warn"])).as_deref(),
+            Some("warn")
+        );
+        assert_eq!(
+            log_level_from_args(args(&["sgwud", "-c", "x", "--log-level=debug"])).as_deref(),
+            Some("debug")
+        );
+        assert_eq!(log_level_from_args(args(&["sgwud", "-c", "x"])), None);
     }
 
     #[test]
