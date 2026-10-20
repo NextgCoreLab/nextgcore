@@ -245,6 +245,23 @@ fn may_be_sent_unprotected(message_type: u8) -> bool {
     )
 }
 
+/// The plain EMM message inside an integrity-protected (not ciphered) NAS PDU,
+/// when it is one TS 24.301 §4.4.4.3 lets the MME process without a secure
+/// exchange. `None` for a ciphered PDU (its body cannot be read), a truncated
+/// one, or a message outside that list.
+///
+/// Layout (§9.1): octet 1 security header type + PD, octets 2–5 MAC, octet 6
+/// sequence number, then the plain NAS message.
+fn unverifiable_but_processable(security_header_type: u8, pdu: &[u8]) -> Option<Vec<u8>> {
+    // Header types 1 and 3 are integrity protected only; 2 and 4 are ciphered.
+    if !matches!(security_header_type, 1 | 3) || pdu.len() < 8 {
+        return None;
+    }
+    let plain = &pdu[6..];
+    (plain[0] == NAS_PROTOCOL_DISCRIMINATOR_EMM && may_be_sent_unprotected(plain[1]))
+        .then(|| plain.to_vec())
+}
+
 fn dispatch_emm(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, pdu: &[u8]) {
     let security_header_type = pdu[0] >> 4;
 
@@ -427,6 +444,24 @@ fn decode_protected(
     // a context-less UE with the security header still attached, so without
     // this guard the header bytes would be misread as the message body.
     if !mme_ue.security_context_available {
+        // TS 24.301 §4.4.4.3: ATTACH REQUEST and the other listed messages are
+        // processed even without a secure exchange, because a UE can send them
+        // protected with an EPS security context the network no longer holds
+        // (e.g. it kept its context after an ATTACH REJECT). The MAC cannot be
+        // verified, so the plain message is taken from behind the header and
+        // processed as having failed the integrity check: for an ATTACH REQUEST
+        // the MME then authenticates before going further, which the attach
+        // path always does (#481). A ciphered message cannot be read without the
+        // context and is still discarded.
+        if let Some(plain) = unverifiable_but_processable(security_header_type, pdu) {
+            log::warn!(
+                "[{}] Security-protected NAS message type {:#04x} from a UE with no security \
+                 context: processed without integrity verification (TS 24.301 4.4.4.3)",
+                mme_ue.imsi_bcd,
+                plain[1]
+            );
+            return Some(plain);
+        }
         log::warn!(
             "[{}] Security-protected NAS (header type {security_header_type}) from a UE with no \
              security context; discarded",
@@ -441,6 +476,22 @@ fn decode_protected(
     // The decode reports that as an error; the flag is cleared as well so it
     // cannot leak into the next message on this context.
     let mac_failed = std::mem::take(&mut mme_ue.mac_failed);
+    // TS 24.301 §4.4.4.3: an ATTACH REQUEST that fails the integrity check is
+    // still processed, and the MME authenticates the subscriber before going any
+    // further (the attach path always does). Every other failing message is
+    // discarded as before.
+    if mac_failed {
+        if let Some(plain) = unverifiable_but_processable(security_header_type, pdu)
+            .filter(|plain| plain[1] == emm_type::ATTACH_REQUEST)
+        {
+            log::warn!(
+                "[{}] ATTACH REQUEST failed the NAS integrity check: processed, and the \
+                 subscriber will be re-authenticated (TS 24.301 4.4.4.3)",
+                mme_ue.imsi_bcd
+            );
+            return Some(plain);
+        }
+    }
     if let Err(e) = decoded {
         log::warn!(
             "[{}] NAS security decode failed: {e} (mac_failed={mac_failed})",
@@ -2330,8 +2381,13 @@ mod tests {
         );
     }
 
+    /// #481, TS 24.301 §4.4.4.3: a UE that kept its EPS security context after
+    /// the network dropped it re-attaches integrity protected. The MAC cannot be
+    /// verified, but ATTACH REQUEST is on the list the MME processes anyway; the
+    /// attach path then authenticates. It used to be silently discarded, and the
+    /// UE was never answered on any T3411 retry.
     #[test]
-    fn test_protected_message_without_a_security_context_is_discarded() {
+    fn test_protected_attach_without_a_security_context_is_processed() {
         let ctx = test_ctx();
         let enb_ue_id = enb_with_connection(&ctx);
         // Integrity-protected header (type 1) wrapping an Attach Request.
@@ -2343,14 +2399,67 @@ mod tests {
 
         nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &pdu));
 
+        let mme_ue_id = ctx
+            .mme_ue_find_by_imsi(TEST_IMSI)
+            .expect("the protected Attach Request must be processed (TS 24.301 4.4.4.3)");
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert_eq!(mme_ue.nas_eps.type_, MmeEpsType::AttachRequest);
         assert!(
-            ctx.mme_ue_find_by_imsi(TEST_IMSI).is_none(),
-            "a protected message must not be parsed without a security context"
+            !mme_ue.security_context_available,
+            "processing it must not invent a security context"
         );
     }
 
+    /// A CIPHERED message cannot be read without the context, so it is still
+    /// discarded even when it is an ATTACH REQUEST.
     #[test]
-    fn test_mac_failure_discards_the_message_and_clears_the_flag() {
+    fn test_ciphered_message_without_a_security_context_is_discarded() {
+        let ctx = test_ctx();
+        let enb_ue_id = enb_with_connection(&ctx);
+        let mut pdu = vec![0x27, 0xde, 0xad, 0xbe, 0xef, 0x01];
+        pdu.extend_from_slice(&attach_request(
+            &imsi_identity(),
+            &pdn_connectivity_request(1, false),
+        ));
+
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &pdu));
+
+        assert!(ctx.mme_ue_find_by_imsi(TEST_IMSI).is_none());
+    }
+
+    /// Only the §4.4.4.3 list, only integrity-protected headers, only whole PDUs.
+    #[test]
+    fn test_unverifiable_but_processable_is_limited_to_the_exempt_list() {
+        let attach = attach_request(&imsi_identity(), &pdn_connectivity_request(1, false));
+        let mut prot = vec![0x17, 0, 0, 0, 0, 1];
+        prot.extend_from_slice(&attach);
+        assert_eq!(unverifiable_but_processable(1, &prot), Some(attach.clone()));
+        assert_eq!(unverifiable_but_processable(3, &prot), Some(attach.clone()));
+        assert_eq!(unverifiable_but_processable(2, &prot), None, "ciphered");
+        assert_eq!(
+            unverifiable_but_processable(4, &prot),
+            None,
+            "ciphered, new context"
+        );
+        // ATTACH COMPLETE is not on the list.
+        let mut complete = vec![0x17, 0, 0, 0, 0, 1];
+        complete.extend_from_slice(&[
+            NAS_PROTOCOL_DISCRIMINATOR_EMM,
+            NasEpsMessageType::AttachComplete as u8,
+            0,
+            0,
+        ]);
+        assert_eq!(unverifiable_but_processable(1, &complete), None);
+        // A protected ESM message is never exempt by this route.
+        let mut esm = vec![0x17, 0, 0, 0, 0, 1];
+        esm.extend_from_slice(&pdn_connectivity_request(1, false));
+        assert_eq!(unverifiable_but_processable(1, &esm), None);
+        // Truncated.
+        assert_eq!(unverifiable_but_processable(1, &prot[..7]), None);
+    }
+
+    #[test]
+    fn test_mac_failure_on_attach_processes_it_and_clears_the_flag() {
         let ctx = test_ctx();
         let enb_ue_id = enb_with_connection(&ctx);
         let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
@@ -2371,8 +2480,15 @@ mod tests {
 
         nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &pdu));
 
+        // TS 24.301 §4.4.4.3: an ATTACH REQUEST that fails the integrity check is
+        // processed, and the MME authenticates before going further (#481).
+        assert_eq!(
+            ctx.mme_ue_find_by_imsi(TEST_IMSI),
+            Some(mme_ue_id),
+            "a MAC-failed Attach Request must still be processed"
+        );
         let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
-        assert!(mme_ue.imsi_bcd.is_empty(), "the message must be discarded");
+        assert_eq!(mme_ue.nas_eps.type_, MmeEpsType::AttachRequest);
         assert!(
             !mme_ue.mac_failed,
             "the failure flag must not leak into the next message"
@@ -2942,8 +3058,10 @@ mod tests {
         let mme_ue_id = ue_with_vector(&ctx, enb_ue_id);
         nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &authentication_response()));
 
-        // A PDN CONNECTIVITY REQUEST whose body is shorter than its mandatory
-        // IEs: protected and verified, but the ESM handler refuses it.
+        // A PDN CONNECTIVITY REQUEST with no body at all, so not even the
+        // mandatory PDN type / request type octet: protected and verified, but
+        // the ESM handler refuses it. (A single octet is a VALID minimal request,
+        // TS 24.301 Table 8.3.20.1 -- this test used to call that malformed, #481.)
         let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
         let malformed = protect_uplink(
             &mme_ue,
@@ -2952,7 +3070,6 @@ mod tests {
                 NAS_PROTOCOL_DISCRIMINATOR_ESM,
                 7, // procedure transaction identity
                 EsmMessageType::PdnConnectivityRequest as u8,
-                0x11, // one octet where two are mandatory
             ],
         );
         nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &malformed));
