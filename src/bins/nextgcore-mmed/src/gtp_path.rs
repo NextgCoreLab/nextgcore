@@ -533,8 +533,8 @@ pub(crate) fn advance_persistent_restart_counter(path: &std::path::Path) -> u8 {
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
-            log::error!(
-                "Cannot read restart counter file {}: {e}; restarting the count at 1, so peers \
+            log::warn!(
+                "Cannot read restart counter file {} (set MME_RESTART_COUNTER_FILE to a writable path): {e}; restarting the count at 1, so peers \
                  may not detect this MME restart",
                 path.display()
             );
@@ -550,8 +550,8 @@ pub(crate) fn advance_persistent_restart_counter(path: &std::path::Path) -> u8 {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             if let Err(e) = std::fs::create_dir_all(parent) {
-                log::error!(
-                    "Cannot create {} for the restart counter: {e}",
+                log::warn!(
+                    "Cannot create {} for the restart counter (set MME_RESTART_COUNTER_FILE to a writable path): {e}",
                     parent.display()
                 );
             }
@@ -564,8 +564,8 @@ pub(crate) fn advance_persistent_restart_counter(path: &std::path::Path) -> u8 {
             "Local GTP-C restart counter advanced to {next} (persisted at {})",
             path.display()
         ),
-        Err(e) => log::error!(
-            "Cannot persist restart counter to {}: {e}; the next start will not advance it and \
+        Err(e) => log::warn!(
+            "Cannot persist restart counter to {} (set MME_RESTART_COUNTER_FILE to a writable path): {e}; the next start will not advance it and \
              peers will not detect that restart",
             path.display()
         ),
