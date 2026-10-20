@@ -1998,10 +1998,13 @@ pub fn decode_pdu_session_resource_setup_response_asn1(
     }
 }
 
-/// Build a PDU Session Resource Modify Request with proper ASN.1 APER encoding
+/// Build a PDU Session Resource Modify Request (AMF -> gNB, TS 38.413
+/// §9.2.1.5) with the GENERATED codec (#417).
 ///
-/// Sent by AMF to gNB to modify PDU session resources (e.g., QoS changes).
-/// The message follows 3GPP TS 38.413 Section 8.2.3.
+/// Sent to modify PDU session resources (e.g. a QoS change the SMF decided).
+/// IE order and criticalities are the PDUSessionResourceModifyRequestIEs object
+/// set's; the AMF sends no RAN Paging Priority. The bytes are the hand-written
+/// encoder's: `pdu_session_resource_modify_request_generated_matches_hand_written`.
 pub fn build_pdu_session_resource_modify_request_asn1(
     amf_ue_ngap_id: u64,
     ran_ue_ngap_id: u32,
@@ -2009,19 +2012,50 @@ pub fn build_pdu_session_resource_modify_request_asn1(
     nas_pdu: Option<&[u8]>,
     n2_sm_transfer: &[u8],
 ) -> Option<Vec<u8>> {
-    let item = PduSessionResourceModifyItem {
-        pdu_session_id,
-        nas_pdu: nas_pdu.map(|p| p.to_vec()),
-        transfer: n2_sm_transfer.to_vec(),
+    use ngap_gen::{
+        PDUSessionResourceModifyItemModReq,
+        PDUSessionResourceModifyItemModReqPDUSessionResourceModifyRequestTransfer as Transfer,
+        PDUSessionResourceModifyRequest, PDUSessionResourceModifyRequestProtocolIEs,
+        PDUSessionResourceModifyRequestProtocolIEs_Entry as Entry,
+        PDUSessionResourceModifyRequestProtocolIEs_EntryValue as Ie, ProtocolIE_ID, NGAP_PDU,
     };
 
-    let msg = PduSessionResourceModifyRequest {
-        amf_ue_ngap_id,
-        ran_ue_ngap_id,
-        pdu_session_list: vec![item],
+    let reject = ngap_gen::Criticality(ngap_gen::Criticality::REJECT);
+    let item = PDUSessionResourceModifyItemModReq {
+        pdu_session_id: ngap_gen::PDUSessionID(pdu_session_id),
+        nas_pdu: nas_pdu.map(|p| ngap_gen::NAS_PDU(p.to_vec())),
+        pdu_session_resource_modify_request_transfer: Transfer(n2_sm_transfer.to_vec()),
+        ie_extensions: None,
     };
-
-    match builder::build_pdu_session_resource_modify_request(&msg) {
+    let ies = vec![
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_AMF_UE_NGAP_ID),
+            criticality: reject.clone(),
+            value: Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(amf_ue_ngap_id)),
+        },
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_RAN_UE_NGAP_ID),
+            criticality: reject.clone(),
+            value: Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(ran_ue_ngap_id)),
+        },
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_PDU_SESSION_RESOURCE_MODIFY_LIST_MOD_REQ),
+            criticality: reject.clone(),
+            value: Ie::Id_PDUSessionResourceModifyListModReq(
+                ngap_gen::PDUSessionResourceModifyListModReq(vec![item]),
+            ),
+        },
+    ];
+    let pdu = NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_PDU_SESSION_RESOURCE_MODIFY),
+        criticality: reject,
+        value: ngap_gen::InitiatingMessageValue::Id_PDUSessionResourceModify(
+            PDUSessionResourceModifyRequest {
+                protocol_i_es: PDUSessionResourceModifyRequestProtocolIEs(ies),
+            },
+        ),
+    });
+    match nextgcore_ngap_gen::encode(&pdu) {
         Ok(bytes) => {
             log::debug!(
                 "Built PDU Session Resource Modify Request: {} bytes, amf_ue_ngap_id={}, psi={}",
@@ -2033,6 +2067,378 @@ pub fn build_pdu_session_resource_modify_request_asn1(
         }
         Err(e) => {
             log::error!("Failed to encode PDU Session Resource Modify Request: {e:?}");
+            None
+        }
+    }
+}
+
+/// One PDU session of a Modify-family message, with its N2 SM transfer octets
+/// exactly as received or as the SMF built them: the AMF relays N2 SM
+/// information opaquely (TS 23.502) and never re-encodes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModifyPduSession {
+    /// The PDU Session ID.
+    pub pdu_session_id: u8,
+    /// The transfer octets.
+    pub transfer: Vec<u8>,
+}
+
+/// How a received PDU Session Resource Modify Response is to be handled.
+#[derive(Debug)]
+pub enum PduSessionResourceModifyResponseDecode {
+    /// Decoded. Every IE of the response has criticality ignore (§9.2.1.6), so
+    /// a missing one is ignored (§10.3.5). When `error_indication` is set, the
+    /// response carried not-comprehended IEs marked "ignore IE and notify
+    /// sender", reported in an Error Indication (§10.3.4.2).
+    Decoded {
+        /// The AMF UE NGAP ID the gNB names.
+        amf_ue_ngap_id: Option<u64>,
+        /// The RAN UE NGAP ID the gNB names.
+        ran_ue_ngap_id: Option<u32>,
+        /// Modified sessions with their PDUSessionResourceModifyResponseTransfer.
+        modified: Vec<ModifyPduSession>,
+        /// Sessions that failed to modify, with their
+        /// PDUSessionResourceModifyUnsuccessfulTransfer.
+        failed: Vec<ModifyPduSession>,
+        /// The Error Indication to send, if any.
+        error_indication: Option<CriticalityErrorIndication>,
+    },
+    /// A not-comprehended IE marked "reject": the procedure is unsuccessfully
+    /// terminated and handled locally (§10.3.4.2), with no message to the gNB.
+    Failed(Vec<IeDiagnostic>),
+    /// Not decodable.
+    Undecodable,
+}
+
+/// Decode a PDU Session Resource Modify Response (gNB -> AMF, TS 38.413
+/// §9.2.1.6) with the GENERATED codec (#417), applying the §10.3.4.2 and
+/// §10.3.5 rules for a RESPONSE message.
+///
+/// Every response the hand-written parser accepted decodes to the same UE and
+/// sessions: `pdu_session_resource_modify_response_generated_decode_matches_hand_written`.
+pub fn decode_pdu_session_resource_modify_response_asn1(
+    data: &[u8],
+) -> PduSessionResourceModifyResponseDecode {
+    use ngap_gen::{
+        PDUSessionResourceModifyResponseProtocolIEs_EntryValue as Ie, SuccessfulOutcomeValue,
+    };
+    use PduSessionResourceModifyResponseDecode::{Decoded, Failed, Undecodable};
+
+    let (pdu, unknown) = match nextgcore_ngap_gen::decode_with_unknown_ies(data) {
+        Ok(decoded) => decoded,
+        Err(e) => {
+            log::warn!("Failed to decode PDU Session Resource Modify Response: {e:?}");
+            return Undecodable;
+        }
+    };
+    let ngap_gen::NGAP_PDU::SuccessfulOutcome(ngap_gen::SuccessfulOutcome {
+        criticality,
+        value: SuccessfulOutcomeValue::Id_PDUSessionResourceModify(response),
+        ..
+    }) = pdu
+    else {
+        log::warn!("Expected PduSessionResourceModifyResponse");
+        return Undecodable;
+    };
+    let Some((reject, notify)) =
+        classify_unknown_ies(&unknown, "PDU Session Resource Modify Response")
+    else {
+        return Undecodable;
+    };
+    if !reject.is_empty() {
+        return Failed(reject);
+    }
+
+    let mut amf_ue_ngap_id = None;
+    let mut ran_ue_ngap_id = None;
+    let mut modified = Vec::new();
+    let mut failed = Vec::new();
+    for entry in response.protocol_i_es.0 {
+        match entry.value {
+            Ie::Id_AMF_UE_NGAP_ID(v) => amf_ue_ngap_id = Some(v.0),
+            Ie::Id_RAN_UE_NGAP_ID(v) => ran_ue_ngap_id = Some(v.0),
+            Ie::Id_PDUSessionResourceModifyListModRes(list) => {
+                for item in list.0 {
+                    modified.push(ModifyPduSession {
+                        pdu_session_id: item.pdu_session_id.0,
+                        transfer: item.pdu_session_resource_modify_response_transfer.0,
+                    });
+                }
+            }
+            Ie::Id_PDUSessionResourceFailedToModifyListModRes(list) => {
+                for item in list.0 {
+                    failed.push(ModifyPduSession {
+                        pdu_session_id: item.pdu_session_id.0,
+                        transfer: item.pdu_session_resource_modify_unsuccessful_transfer.0,
+                    });
+                }
+            }
+            // Comprehended, and not used by the AMF.
+            Ie::Id_UserLocationInformation(_) | Ie::Id_CriticalityDiagnostics(_) => {}
+        }
+    }
+    let error_indication = if notify.is_empty() {
+        None
+    } else {
+        Some(CriticalityErrorIndication {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            cause_protocol: ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+            procedure: ReportedProcedure {
+                procedure_code: ngap_gen::ID_PDU_SESSION_RESOURCE_MODIFY,
+                triggering_message: ngap_gen::TriggeringMessage::SUCCESSFUL_OUTCOME,
+                procedure_criticality: criticality.0,
+            },
+            diagnostics: notify,
+        })
+    };
+    Decoded {
+        amf_ue_ngap_id,
+        ran_ue_ngap_id,
+        modified,
+        failed,
+        error_indication,
+    }
+}
+
+/// How a received PDU Session Resource Modify Indication is to be handled.
+/// The procedure is class 1 (§8.2.4): its response is the PDU Session Resource
+/// Modify Confirm, and it has no unsuccessful outcome.
+#[derive(Debug)]
+pub enum PduSessionResourceModifyIndicationDecode {
+    /// Decoded; relay each session to the SMF and answer with a Modify Confirm.
+    /// `notify` lists not-comprehended "ignore IE and notify sender" IEs, which
+    /// §10.3.4.2 reports in the Criticality Diagnostics of the response.
+    Proceed {
+        /// The AMF UE NGAP ID.
+        amf_ue_ngap_id: u64,
+        /// The RAN UE NGAP ID.
+        ran_ue_ngap_id: u32,
+        /// The sessions with their PDUSessionResourceModifyIndicationTransfer.
+        sessions: Vec<ModifyPduSession>,
+        /// IEs to report in the Confirm's Criticality Diagnostics.
+        notify: Vec<IeDiagnostic>,
+    },
+    /// A not-comprehended IE marked "reject", or a missing mandatory IE whose
+    /// criticality is reject: the procedure is not executed. With no
+    /// unsuccessful outcome to carry it, §10.3.4.2 reports it in an Error
+    /// Indication.
+    Reject(CriticalityErrorIndication),
+    /// Not decodable.
+    Undecodable,
+}
+
+/// Decode a PDU Session Resource Modify Indication (gNB -> AMF, TS 38.413
+/// §9.2.1.7) with the GENERATED codec (#417), applying §10.3.4.2 and §10.3.5.
+///
+/// Every indication the hand-written parser accepted decodes to the same UE and
+/// sessions: `pdu_session_resource_modify_indication_generated_decode_matches_hand_written`.
+pub fn decode_pdu_session_resource_modify_indication_asn1(
+    data: &[u8],
+) -> PduSessionResourceModifyIndicationDecode {
+    use ngap_gen::{
+        InitiatingMessageValue, PDUSessionResourceModifyIndicationProtocolIEs_EntryValue as Ie,
+    };
+    use PduSessionResourceModifyIndicationDecode::{Proceed, Reject, Undecodable};
+
+    let (pdu, unknown) = match nextgcore_ngap_gen::decode_with_unknown_ies(data) {
+        Ok(decoded) => decoded,
+        Err(e) => {
+            log::warn!("Failed to decode PDU Session Resource Modify Indication: {e:?}");
+            return Undecodable;
+        }
+    };
+    let ngap_gen::NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+        criticality,
+        value: InitiatingMessageValue::Id_PDUSessionResourceModifyIndication(msg),
+        ..
+    }) = pdu
+    else {
+        log::warn!("Expected PduSessionResourceModifyIndication");
+        return Undecodable;
+    };
+    let Some((mut reject, notify)) =
+        classify_unknown_ies(&unknown, "PDU Session Resource Modify Indication")
+    else {
+        return Undecodable;
+    };
+
+    let mut amf_ue_ngap_id = None;
+    let mut ran_ue_ngap_id = None;
+    let mut sessions = None;
+    for entry in msg.protocol_i_es.0 {
+        match entry.value {
+            Ie::Id_AMF_UE_NGAP_ID(v) => amf_ue_ngap_id = Some(v.0),
+            Ie::Id_RAN_UE_NGAP_ID(v) => ran_ue_ngap_id = Some(v.0),
+            Ie::Id_PDUSessionResourceModifyListModInd(list) => {
+                sessions = Some(
+                    list.0
+                        .into_iter()
+                        .map(|item| ModifyPduSession {
+                            pdu_session_id: item.pdu_session_id.0,
+                            transfer: item.pdu_session_resource_modify_indication_transfer.0,
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+            // Comprehended, and not used by the AMF.
+            Ie::Id_UserLocationInformation(_) => {}
+        }
+    }
+    // All three are mandatory with criticality reject (§9.2.1.7, §10.3.5).
+    if amf_ue_ngap_id.is_none() {
+        reject.push(missing_ie(ngap_gen::ID_AMF_UE_NGAP_ID));
+    }
+    if ran_ue_ngap_id.is_none() {
+        reject.push(missing_ie(ngap_gen::ID_RAN_UE_NGAP_ID));
+    }
+    if sessions.is_none() {
+        reject.push(missing_ie(
+            ngap_gen::ID_PDU_SESSION_RESOURCE_MODIFY_LIST_MOD_IND,
+        ));
+    }
+    let (Some(amf_ue_ngap_id), Some(ran_ue_ngap_id), Some(sessions), true) =
+        (amf_ue_ngap_id, ran_ue_ngap_id, sessions, reject.is_empty())
+    else {
+        return Reject(CriticalityErrorIndication {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            cause_protocol: ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
+            procedure: ReportedProcedure {
+                procedure_code: ngap_gen::ID_PDU_SESSION_RESOURCE_MODIFY_INDICATION,
+                triggering_message: ngap_gen::TriggeringMessage::INITIATING_MESSAGE,
+                procedure_criticality: criticality.0,
+            },
+            diagnostics: reject,
+        });
+    };
+    Proceed {
+        amf_ue_ngap_id,
+        ran_ue_ngap_id,
+        sessions,
+        notify,
+    }
+}
+
+/// Build a PDU Session Resource Modify Confirm (AMF -> gNB, TS 38.413
+/// §9.2.1.8) with the GENERATED codec: the response to a Modify Indication
+/// (§8.2.4.2). `confirmed` carries the SMF's
+/// PDUSessionResourceModifyConfirmTransfer per session, `failed` its
+/// PDUSessionResourceModifyIndicationUnsuccessfulTransfer, and `notify` the
+/// not-comprehended IEs §10.3.4.2 reports in the Criticality Diagnostics.
+/// Every IE has criticality ignore (PDUSessionResourceModifyConfirmIEs); an
+/// empty list is left out, as both lists are optional.
+pub fn build_pdu_session_resource_modify_confirm_asn1(
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+    confirmed: &[ModifyPduSession],
+    failed: &[ModifyPduSession],
+    notify: &[IeDiagnostic],
+) -> Option<Vec<u8>> {
+    use ngap_gen::{
+        PDUSessionResourceFailedToModifyItemModCfm,
+        PDUSessionResourceFailedToModifyItemModCfmPDUSessionResourceModifyIndicationUnsuccessfulTransfer as FailedTransfer,
+        PDUSessionResourceModifyConfirm, PDUSessionResourceModifyConfirmProtocolIEs,
+        PDUSessionResourceModifyConfirmProtocolIEs_Entry as Entry,
+        PDUSessionResourceModifyConfirmProtocolIEs_EntryValue as Ie,
+        PDUSessionResourceModifyItemModCfm,
+        PDUSessionResourceModifyItemModCfmPDUSessionResourceModifyConfirmTransfer as CfmTransfer,
+        ProtocolIE_ID, NGAP_PDU,
+    };
+
+    let ignore = ngap_gen::Criticality(ngap_gen::Criticality::IGNORE);
+    let mut ies = vec![
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_AMF_UE_NGAP_ID),
+            criticality: ignore.clone(),
+            value: Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(amf_ue_ngap_id)),
+        },
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_RAN_UE_NGAP_ID),
+            criticality: ignore.clone(),
+            value: Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(ran_ue_ngap_id)),
+        },
+    ];
+    if !confirmed.is_empty() {
+        ies.push(Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_PDU_SESSION_RESOURCE_MODIFY_LIST_MOD_CFM),
+            criticality: ignore.clone(),
+            value: Ie::Id_PDUSessionResourceModifyListModCfm(
+                ngap_gen::PDUSessionResourceModifyListModCfm(
+                    confirmed
+                        .iter()
+                        .map(|s| PDUSessionResourceModifyItemModCfm {
+                            pdu_session_id: ngap_gen::PDUSessionID(s.pdu_session_id),
+                            pdu_session_resource_modify_confirm_transfer: CfmTransfer(
+                                s.transfer.clone(),
+                            ),
+                            ie_extensions: None,
+                        })
+                        .collect(),
+                ),
+            ),
+        });
+    }
+    if !failed.is_empty() {
+        ies.push(Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_PDU_SESSION_RESOURCE_FAILED_TO_MODIFY_LIST_MOD_CFM),
+            criticality: ignore.clone(),
+            value: Ie::Id_PDUSessionResourceFailedToModifyListModCfm(
+                ngap_gen::PDUSessionResourceFailedToModifyListModCfm(
+                    failed
+                        .iter()
+                        .map(|s| PDUSessionResourceFailedToModifyItemModCfm {
+                            pdu_session_id: ngap_gen::PDUSessionID(s.pdu_session_id),
+                            pdu_session_resource_modify_indication_unsuccessful_transfer:
+                                FailedTransfer(s.transfer.clone()),
+                            ie_extensions: None,
+                        })
+                        .collect(),
+                ),
+            ),
+        });
+    }
+    if !notify.is_empty() {
+        ies.push(Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_CRITICALITY_DIAGNOSTICS),
+            criticality: ignore,
+            value: Ie::Id_CriticalityDiagnostics(generated_criticality_diagnostics(notify)),
+        });
+    }
+    let pdu = NGAP_PDU::SuccessfulOutcome(ngap_gen::SuccessfulOutcome {
+        procedure_code: ngap_gen::ProcedureCode(
+            ngap_gen::ID_PDU_SESSION_RESOURCE_MODIFY_INDICATION,
+        ),
+        criticality: ngap_gen::Criticality(ngap_gen::Criticality::REJECT),
+        value: ngap_gen::SuccessfulOutcomeValue::Id_PDUSessionResourceModifyIndication(
+            PDUSessionResourceModifyConfirm {
+                protocol_i_es: PDUSessionResourceModifyConfirmProtocolIEs(ies),
+            },
+        ),
+    });
+    match nextgcore_ngap_gen::encode(&pdu) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            log::error!("Failed to encode PDU Session Resource Modify Confirm: {e:?}");
+            None
+        }
+    }
+}
+
+/// A PDUSessionResourceModifyIndicationUnsuccessfulTransfer (§9.3.4.21) with
+/// `cause`, for a session the SMF could not answer: the gNB is told the
+/// modification failed rather than left without a Confirm entry.
+pub fn modify_indication_unsuccessful_transfer(cause: Cause) -> Option<Vec<u8>> {
+    let transfer = ngap_gen::PDUSessionResourceModifyIndicationUnsuccessfulTransfer {
+        cause: generated_cause(cause),
+        ie_extensions: None,
+    };
+    match nextgcore_ngap_gen::encode_contained(&transfer) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            log::error!(
+                "Failed to encode PDUSessionResourceModifyIndicationUnsuccessfulTransfer: {e:?}"
+            );
             None
         }
     }
@@ -9678,5 +10084,497 @@ pub(crate) mod tests {
             decode_uplink_nas_transport_asn1(&with_unknown_ie(base, 9999, 0x00)),
             NasTransportDecode::Reject(_)
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // #417 / #525: the PDU Session Resource Modify family
+    // ------------------------------------------------------------------
+
+    fn modify_response_bytes(
+        amf: u64,
+        ran: u32,
+        modified: &[(u8, Vec<u8>)],
+        failed: &[(u8, Vec<u8>)],
+    ) -> Vec<u8> {
+        nextgcore_ngap::builder::build_pdu_session_resource_modify_response(
+            &PduSessionResourceModifyResponse {
+                amf_ue_ngap_id: amf,
+                ran_ue_ngap_id: ran,
+                modify_list: modified
+                    .iter()
+                    .map(|(psi, t)| PduSessionResourceModifyResponseItem {
+                        pdu_session_id: *psi,
+                        transfer: t.clone(),
+                    })
+                    .collect(),
+                failed_list: failed
+                    .iter()
+                    .map(|(psi, t)| PduSessionResourceFailedItem {
+                        pdu_session_id: *psi,
+                        transfer: t.clone(),
+                    })
+                    .collect(),
+            },
+        )
+        .expect("build Modify Response")
+    }
+
+    /// A Modify Indication built by the hand-written builder (a gNB stand-in).
+    pub(crate) fn modify_indication_bytes(
+        amf: u64,
+        ran: u32,
+        sessions: &[(u8, Vec<u8>)],
+    ) -> Vec<u8> {
+        nextgcore_ngap::builder::build_pdu_session_resource_modify_indication(
+            &PduSessionResourceModifyIndication {
+                amf_ue_ngap_id: amf,
+                ran_ue_ngap_id: ran,
+                modify_list: sessions
+                    .iter()
+                    .map(|(psi, t)| PduSessionResourceModifyIndicationItem {
+                        pdu_session_id: *psi,
+                        transfer: t.clone(),
+                    })
+                    .collect(),
+            },
+        )
+        .expect("build Modify Indication")
+    }
+
+    /// The Modify Request the hand-written encoder produced before #417 moved it.
+    fn hand_written_modify_request(
+        amf: u64,
+        ran: u32,
+        psi: u8,
+        nas: Option<&[u8]>,
+        transfer: &[u8],
+    ) -> Option<Vec<u8>> {
+        nextgcore_ngap::builder::build_pdu_session_resource_modify_request(
+            &PduSessionResourceModifyRequest {
+                amf_ue_ngap_id: amf,
+                ran_ue_ngap_id: ran,
+                pdu_session_list: vec![PduSessionResourceModifyItem {
+                    pdu_session_id: psi,
+                    nas_pdu: nas.map(<[u8]>::to_vec),
+                    transfer: transfer.to_vec(),
+                }],
+            },
+        )
+        .ok()
+    }
+
+    /// The generated Modify Request is byte for byte the hand-written one: every
+    /// PSI, every ID length, NAS-PDU absent or at each length form, and each
+    /// transfer length form; both refuse the out-of-range AMF UE NGAP ID.
+    #[test]
+    fn pdu_session_resource_modify_request_generated_matches_hand_written() {
+        let nas_forms: [Option<Vec<u8>>; 5] = [
+            None,
+            Some(vec![0x7e]),
+            Some(vec![0x7e; 127]),
+            Some(vec![0x7e; 128]),
+            Some(vec![0x7e; 16_384]),
+        ];
+        let mut compared = 0;
+        let mut refused = 0;
+        let mut check = |amf: u64, ran: u32, psi: u8, nas: Option<&[u8]>, t: &[u8]| {
+            let new = build_pdu_session_resource_modify_request_asn1(amf, ran, psi, nas, t);
+            let old = hand_written_modify_request(amf, ran, psi, nas, t);
+            assert_eq!(
+                new,
+                old,
+                "amf={amf} ran={ran} psi={psi} nas={:?}",
+                nas.map(<[u8]>::len)
+            );
+            if new.is_some() {
+                compared += 1;
+            } else {
+                refused += 1;
+            }
+        };
+        for amf in AMF_IDS {
+            for ran in RAN_IDS {
+                check(amf, ran, 5, None, &[0x00]);
+            }
+        }
+        for psi in 0..=255u8 {
+            check(1, 1, psi, Some(&[0x7e, 0x00]), &[psi]);
+        }
+        for nas in &nas_forms {
+            for t in response_transfers() {
+                check(7, 9, 5, nas.as_deref(), &t);
+            }
+        }
+        assert_eq!(
+            refused,
+            RAN_IDS.len(),
+            "only the out-of-range AMF UE NGAP ID is refused"
+        );
+        assert!(compared > 300, "{compared}");
+    }
+
+    /// A Modify Request derived by hand from X.691 (APER) and TS 38.413:
+    /// `00` initiatingMessage, `1a` procedure 26, `00` reject, `18` open-type
+    /// length 24; `00 00 03` SEQUENCE preamble + 3 IEs; AMF-UE-NGAP-ID (10,
+    /// reject) `00 01`; RAN-UE-NGAP-ID (85, reject) `00 01`;
+    /// PDUSessionResourceModifyListModReq (64, reject): count-1 `00`, item
+    /// preamble (no NAS-PDU, no extensions) `00`, PSI `05`, transfer `01 aa`.
+    #[test]
+    fn a_modify_request_matches_hand_derived_octets() {
+        assert_eq!(
+            build_pdu_session_resource_modify_request_asn1(1, 1, 5, None, &[0xaa]).unwrap(),
+            [
+                0x00, 0x1a, 0x00, 0x18, 0x00, 0x00, 0x03, //
+                0x00, 0x0a, 0x00, 0x02, 0x00, 0x01, //
+                0x00, 0x55, 0x00, 0x02, 0x00, 0x01, //
+                0x00, 0x40, 0x00, 0x05, 0x00, 0x00, 0x05, 0x01, 0xaa,
+            ]
+        );
+    }
+
+    /// `(amf, ran, modified, failed)` from the hand-written Modify Response parser.
+    #[allow(clippy::type_complexity)]
+    fn hand_written_modify_response_view(
+        data: &[u8],
+    ) -> Option<(u64, u32, Vec<(u8, Vec<u8>)>, Vec<(u8, Vec<u8>)>)> {
+        match parser::decode_ngap_pdu(data) {
+            Ok(NgapMessage::PduSessionResourceModifyResponse(r)) => Some((
+                r.amf_ue_ngap_id,
+                r.ran_ue_ngap_id,
+                r.modify_list
+                    .into_iter()
+                    .map(|i| (i.pdu_session_id, i.transfer))
+                    .collect(),
+                r.failed_list
+                    .into_iter()
+                    .map(|i| (i.pdu_session_id, i.transfer))
+                    .collect(),
+            )),
+            _ => None,
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn generated_modify_response_view(
+        data: &[u8],
+    ) -> Option<(u64, u32, Vec<(u8, Vec<u8>)>, Vec<(u8, Vec<u8>)>)> {
+        match decode_pdu_session_resource_modify_response_asn1(data) {
+            PduSessionResourceModifyResponseDecode::Decoded {
+                amf_ue_ngap_id: Some(amf),
+                ran_ue_ngap_id: Some(ran),
+                modified,
+                failed,
+                error_indication: None,
+            } => Some((
+                amf,
+                ran,
+                modified
+                    .into_iter()
+                    .map(|s| (s.pdu_session_id, s.transfer))
+                    .collect(),
+                failed
+                    .into_iter()
+                    .map(|s| (s.pdu_session_id, s.transfer))
+                    .collect(),
+            )),
+            _ => None,
+        }
+    }
+
+    /// Every Modify Response the hand-written parser accepted decodes to the
+    /// same UE and sessions, in both lists.
+    #[test]
+    fn pdu_session_resource_modify_response_generated_decode_matches_hand_written() {
+        let mut corpus = Vec::new();
+        for amf in &AMF_IDS[..AMF_IDS.len() - 1] {
+            for ran in RAN_IDS {
+                corpus.push(modify_response_bytes(*amf, ran, &[(5, vec![0x00])], &[]));
+            }
+        }
+        for t in response_transfers() {
+            corpus.push(modify_response_bytes(7, 9, &[(3, t.clone())], &[]));
+            corpus.push(modify_response_bytes(7, 9, &[], &[(4, t.clone())]));
+            corpus.push(modify_response_bytes(7, 9, &[(3, t.clone())], &[(4, t)]));
+        }
+        let all: Vec<(u8, Vec<u8>)> = (0..=255u8).map(|psi| (psi, vec![psi])).collect();
+        corpus.push(modify_response_bytes(7, 9, &all, &[]));
+        corpus.push(modify_response_bytes(7, 9, &[], &all));
+        for data in &corpus {
+            let old = hand_written_modify_response_view(data);
+            assert!(
+                old.is_some(),
+                "the corpus holds accepted messages: {data:02x?}"
+            );
+            assert_eq!(generated_modify_response_view(data), old, "{data:02x?}");
+        }
+    }
+
+    /// §10.3.4.2 for the Modify Response (a response message): "notify" is
+    /// reported in an Error Indication (procedure 26, successful-outcome) and
+    /// the sessions are still decoded; "reject" is handled locally.
+    #[test]
+    fn modify_response_unknown_ies_follow_the_response_rules() {
+        let base = modify_response_bytes(7, 9, &[(5, vec![0x00])], &[]);
+        let PduSessionResourceModifyResponseDecode::Decoded {
+            modified,
+            error_indication: Some(report),
+            ..
+        } = decode_pdu_session_resource_modify_response_asn1(&with_unknown_ie(&base, 9999, 0x80))
+        else {
+            panic!("expected Decoded with an Error Indication");
+        };
+        assert_eq!(modified.len(), 1);
+        assert_eq!(
+            report.procedure,
+            ReportedProcedure {
+                procedure_code: ngap_gen::ID_PDU_SESSION_RESOURCE_MODIFY,
+                triggering_message: ngap_gen::TriggeringMessage::SUCCESSFUL_OUTCOME,
+                procedure_criticality: ngap_gen::Criticality::REJECT,
+            }
+        );
+        assert_eq!(report.diagnostics[0].ie_id, 9999);
+        assert!(matches!(
+            decode_pdu_session_resource_modify_response_asn1(&with_unknown_ie(&base, 9999, 0x40)),
+            PduSessionResourceModifyResponseDecode::Decoded {
+                error_indication: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            decode_pdu_session_resource_modify_response_asn1(&with_unknown_ie(&base, 9999, 0x00)),
+            PduSessionResourceModifyResponseDecode::Failed(ref d) if d[0].ie_id == 9999
+        ));
+    }
+
+    /// Every Modify Indication the hand-written parser accepted decodes to the
+    /// same UE and sessions.
+    #[test]
+    fn pdu_session_resource_modify_indication_generated_decode_matches_hand_written() {
+        let mut corpus = Vec::new();
+        for amf in &AMF_IDS[..AMF_IDS.len() - 1] {
+            for ran in RAN_IDS {
+                corpus.push(modify_indication_bytes(*amf, ran, &[(5, vec![0x00])]));
+            }
+        }
+        for t in response_transfers() {
+            corpus.push(modify_indication_bytes(7, 9, &[(3, t)]));
+        }
+        let all: Vec<(u8, Vec<u8>)> = (0..=255u8).map(|psi| (psi, vec![psi])).collect();
+        corpus.push(modify_indication_bytes(7, 9, &all));
+        for data in &corpus {
+            let Ok(NgapMessage::PduSessionResourceModifyIndication(old)) =
+                parser::decode_ngap_pdu(data)
+            else {
+                panic!("the corpus holds accepted messages: {data:02x?}");
+            };
+            let PduSessionResourceModifyIndicationDecode::Proceed {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                sessions,
+                notify,
+            } = decode_pdu_session_resource_modify_indication_asn1(data)
+            else {
+                panic!("generated decode refused {data:02x?}");
+            };
+            assert!(notify.is_empty());
+            assert_eq!(
+                (amf_ue_ngap_id, ran_ue_ngap_id),
+                (old.amf_ue_ngap_id, old.ran_ue_ngap_id)
+            );
+            let old: Vec<(u8, Vec<u8>)> = old
+                .modify_list
+                .into_iter()
+                .map(|i| (i.pdu_session_id, i.transfer))
+                .collect();
+            let new: Vec<(u8, Vec<u8>)> = sessions
+                .into_iter()
+                .map(|s| (s.pdu_session_id, s.transfer))
+                .collect();
+            assert_eq!(new, old);
+        }
+    }
+
+    /// §10.3.4.2 / §10.3.5 for the Modify Indication (class 1, no unsuccessful
+    /// outcome): "notify" proceeds and is carried to the Confirm; "reject" or a
+    /// missing mandatory IE is reported in an Error Indication (procedure 27,
+    /// initiating-message) and the procedure is not run.
+    #[test]
+    fn modify_indication_unknown_and_missing_ies_follow_the_class_1_rules() {
+        use PduSessionResourceModifyIndicationDecode::{Proceed, Reject};
+        let base = modify_indication_bytes(7, 9, &[(5, vec![0x00])]);
+        let Proceed {
+            notify, sessions, ..
+        } = decode_pdu_session_resource_modify_indication_asn1(&with_unknown_ie(&base, 9999, 0x80))
+        else {
+            panic!("a notify IE must not stop the procedure");
+        };
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(notify.len(), 1);
+        assert_eq!(notify[0].ie_id, 9999);
+        assert_eq!(notify[0].criticality, ngap_gen::Criticality::NOTIFY);
+
+        let Reject(report) =
+            decode_pdu_session_resource_modify_indication_asn1(&with_unknown_ie(&base, 9999, 0x00))
+        else {
+            panic!("a reject IE stops the procedure");
+        };
+        assert_eq!(
+            report.procedure,
+            ReportedProcedure {
+                procedure_code: ngap_gen::ID_PDU_SESSION_RESOURCE_MODIFY_INDICATION,
+                triggering_message: ngap_gen::TriggeringMessage::INITIATING_MESSAGE,
+                procedure_criticality: ngap_gen::Criticality::REJECT,
+            }
+        );
+        assert_eq!(
+            report.cause_protocol,
+            ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT
+        );
+
+        // The same indication with its AMF UE NGAP ID removed, re-encoded.
+        let mut pdu = nextgcore_ngap_gen::decode(&base).expect("decode");
+        let ngap_gen::NGAP_PDU::InitiatingMessage(ref mut msg) = pdu else {
+            panic!("initiatingMessage");
+        };
+        let ngap_gen::InitiatingMessageValue::Id_PDUSessionResourceModifyIndication(ref mut ind) =
+            msg.value
+        else {
+            panic!("Modify Indication");
+        };
+        ind.protocol_i_es
+            .0
+            .retain(|e| e.id.0 != ngap_gen::ID_AMF_UE_NGAP_ID);
+        let no_amf_id = nextgcore_ngap_gen::encode(&pdu).expect("encode");
+        let Reject(missing) = decode_pdu_session_resource_modify_indication_asn1(&no_amf_id) else {
+            panic!("a missing AMF UE NGAP ID (criticality reject) stops the procedure");
+        };
+        assert_eq!(
+            missing.diagnostics,
+            vec![IeDiagnostic {
+                ie_id: ngap_gen::ID_AMF_UE_NGAP_ID,
+                criticality: ngap_gen::Criticality::REJECT,
+                type_of_error: ngap_gen::TypeOfError::MISSING,
+            }]
+        );
+        assert_eq!(
+            (missing.amf_ue_ngap_id, missing.ran_ue_ngap_id),
+            (None, Some(9))
+        );
+    }
+
+    /// A Modify Confirm derived by hand: `20` successfulOutcome, `1b`
+    /// procedure 27, `00` reject, `18` length 24; `00 00 03`; AMF-UE-NGAP-ID
+    /// (10, ignore `40`) `00 01`; RAN-UE-NGAP-ID (85, ignore) `00 01`;
+    /// PDUSessionResourceModifyListModCfm (62, ignore): count-1 `00`, item
+    /// preamble `00`, PSI `05`, transfer `01 bb`.
+    #[test]
+    fn a_modify_confirm_matches_hand_derived_octets() {
+        let confirmed = [ModifyPduSession {
+            pdu_session_id: 5,
+            transfer: vec![0xbb],
+        }];
+        assert_eq!(
+            build_pdu_session_resource_modify_confirm_asn1(1, 1, &confirmed, &[], &[]).unwrap(),
+            [
+                0x20, 0x1b, 0x00, 0x18, 0x00, 0x00, 0x03, //
+                0x00, 0x0a, 0x40, 0x02, 0x00, 0x01, //
+                0x00, 0x55, 0x40, 0x02, 0x00, 0x01, //
+                0x00, 0x3e, 0x40, 0x05, 0x00, 0x00, 0x05, 0x01, 0xbb,
+            ]
+        );
+    }
+
+    /// The Confirm carries both lists and, for a "notify" IE of the indication,
+    /// the Criticality Diagnostics (§10.3.4.2: in the response, not an Error
+    /// Indication); it decodes back to what was put in.
+    #[test]
+    fn a_modify_confirm_carries_both_lists_and_the_notify_diagnostics() {
+        use ngap_gen::PDUSessionResourceModifyConfirmProtocolIEs_EntryValue as Ie;
+        let notify = [IeDiagnostic {
+            ie_id: 9999,
+            criticality: ngap_gen::Criticality::NOTIFY,
+            type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+        }];
+        let bytes = build_pdu_session_resource_modify_confirm_asn1(
+            7,
+            9,
+            &[ModifyPduSession {
+                pdu_session_id: 2,
+                transfer: vec![0x21],
+            }],
+            &[ModifyPduSession {
+                pdu_session_id: 3,
+                transfer: vec![0x31, 0x32],
+            }],
+            &notify,
+        )
+        .unwrap();
+        let ngap_gen::NGAP_PDU::SuccessfulOutcome(out) =
+            nextgcore_ngap_gen::decode(&bytes).unwrap()
+        else {
+            panic!("successfulOutcome");
+        };
+        let ngap_gen::SuccessfulOutcomeValue::Id_PDUSessionResourceModifyIndication(cfm) =
+            out.value
+        else {
+            panic!("Modify Confirm");
+        };
+        let ids: Vec<u16> = cfm.protocol_i_es.0.iter().map(|e| e.id.0).collect();
+        assert_eq!(ids, vec![10, 85, 62, 131, 19], "object-set order");
+        let mut saw_diag = false;
+        for e in cfm.protocol_i_es.0 {
+            assert_eq!(e.criticality.0, ngap_gen::Criticality::IGNORE);
+            match e.value {
+                Ie::Id_PDUSessionResourceModifyListModCfm(l) => {
+                    assert_eq!(l.0[0].pdu_session_id.0, 2);
+                    assert_eq!(
+                        l.0[0].pdu_session_resource_modify_confirm_transfer.0,
+                        vec![0x21]
+                    );
+                }
+                Ie::Id_PDUSessionResourceFailedToModifyListModCfm(l) => {
+                    assert_eq!(l.0[0].pdu_session_id.0, 3);
+                    assert_eq!(
+                        l.0[0]
+                            .pdu_session_resource_modify_indication_unsuccessful_transfer
+                            .0,
+                        vec![0x31, 0x32]
+                    );
+                }
+                Ie::Id_CriticalityDiagnostics(d) => {
+                    saw_diag = true;
+                    assert!(d.procedure_code.is_none(), "§9.3.1.3: not in a response");
+                    assert_eq!(d.i_es_criticality_diagnostics.unwrap().0[0].ie_id.0, 9999);
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_diag);
+        // Neither list present when there is nothing to put in it.
+        let empty = build_pdu_session_resource_modify_confirm_asn1(7, 9, &[], &[], &[]).unwrap();
+        let ngap_gen::NGAP_PDU::SuccessfulOutcome(out) =
+            nextgcore_ngap_gen::decode(&empty).unwrap()
+        else {
+            panic!("successfulOutcome");
+        };
+        let ngap_gen::SuccessfulOutcomeValue::Id_PDUSessionResourceModifyIndication(cfm) =
+            out.value
+        else {
+            panic!("Modify Confirm");
+        };
+        assert_eq!(cfm.protocol_i_es.0.len(), 2);
+    }
+
+    /// The Unsuccessful Transfer the AMF builds for a session the SMF did not
+    /// answer, derived by hand: SEQUENCE preamble `00` (extension, no
+    /// iE-Extensions), Cause CHOICE index 4 (misc, 3 bits `100`), misc
+    /// ENUMERATED extension bit `0` + index 5 unspecified (`101`): `0010 0010 1`
+    /// -> `22 80`.
+    #[test]
+    fn the_amf_built_modify_indication_unsuccessful_transfer_matches_hand_derived_octets() {
+        assert_eq!(
+            modify_indication_unsuccessful_transfer(Cause::Misc(CauseMisc::Unspecified)).unwrap(),
+            [0x22, 0x80]
+        );
     }
 }
