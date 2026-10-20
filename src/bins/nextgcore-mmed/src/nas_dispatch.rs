@@ -2131,15 +2131,11 @@ fn send_s11_create_session(
 
 /// Send ESM INFORMATION REQUEST, arming T3489's retransmission buffer.
 fn send_esm_information_request(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue: &MmeUe, bearer_id: u64) {
-    let mut pool = ctx.bearer_pool.write().unwrap();
-    let Some(bearer) = pool.get_mut(&bearer_id) else {
-        return;
-    };
     log::info!(
         "[{}] Requesting ESM information (APN/PCO) from the UE",
         mme_ue.imsi_bcd
     );
-    if let Err(e) = nas_path::nas_eps_send_esm_information_request(bearer, mme_ue, enb_ue) {
+    if let Err(e) = nas_path::nas_eps_send_esm_information_request(ctx, bearer_id, mme_ue, enb_ue) {
         log::error!(
             "[{}] ESM Information Request send failed: {e}",
             mme_ue.imsi_bcd

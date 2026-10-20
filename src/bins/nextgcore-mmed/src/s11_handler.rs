@@ -482,10 +482,9 @@ fn reject_create_session(
     let esm_cause = esm_cause_enum(esm_cause_from_gtp(gtp_cause));
 
     {
-        let Ok(pool) = ctx.mme_ue_pool.read() else {
-            return;
-        };
-        let Some(mme_ue) = pool.get(&mme_ue_id) else {
+        // A snapshot, not a pool guard: a standalone PDN CONNECTIVITY REJECT is
+        // protected under the live context, which takes the pool's write lock (#497).
+        let Some(mme_ue) = ctx.mme_ue_find_by_id(mme_ue_id) else {
             return;
         };
         log::warn!(
@@ -494,7 +493,7 @@ fn reject_create_session(
             nas_action
         );
         if let Err(e) = crate::nas_path::nas_eps_send_pdn_connectivity_reject(
-            ctx, &sess, mme_ue, &enb_ue, esm_cause, nas_action,
+            ctx, &sess, &mme_ue, &enb_ue, esm_cause, nas_action,
         ) {
             log::error!("PDN Connectivity / Attach Reject send failed: {e}");
         }
