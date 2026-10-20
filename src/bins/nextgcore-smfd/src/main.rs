@@ -33,6 +33,7 @@ mod binding;
 mod context;
 mod easdf; // #114: EASDF selection + DNS-context lifecycle (TS 23.501 §5.6.7)
 mod eps_iwk; // #117: 5GS↔EPS interworking, EBI assignment over Namf_Communication
+mod eps_to_5gs; // #475: EPS→5GS handover over N26, the PGW-C+SMF side (TS 23.502 §4.11.1.2.2)
 mod event;
 mod event_exposure; // #79: Nsmf_EventExposure resource model + notification
 mod gn_build;
@@ -1301,7 +1302,7 @@ fn build_smf_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> 
         }
     }
 
-    serde_json::json!({
+    let mut profile = serde_json::json!({
         "nfInstanceId": nf_instance_id,
         "nfType": "SMF",
         "nfStatus": "REGISTERED",
@@ -1309,7 +1310,28 @@ fn build_smf_nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16) -> 
         "nfServices": services,
         "allowedNfTypes": nf_allowed,
         "heartBeatTimer": 10
-    })
+    });
+    // #475: a PGW-C+SMF advertises its S5/S8 FQDN, because an initial AMF in an EPS→5GS
+    // handover discovers it by exactly that (TS 23.502 §4.11.1.2.2.2 step 3: *"the
+    // Nnrf_NFDiscovery_Request including the FQDN for the S5/S8 interface of the
+    // SMF+PGW-C"*), which the NRF matches against `smfInfo.pgwFqdn` (TS 29.510). Only when
+    // `SMF_PGW_FQDN` is configured: without it this SMF is not a PGW-C anyone can name.
+    //
+    // `sNssaiSmfInfoList` is REQUIRED in `SmfInfo`, so it is present: the interworking
+    // S-NSSAI with the wildcard DNN (`WildcardDnn`, TS 29.571), since this SMF serves any
+    // DNN and naming one would hide it from discovery for every other.
+    if let Some(fqdn) = udm::configured_pgw_fqdn() {
+        let snssai = eps_iwk::interworking_snssai();
+        let mut s = serde_json::json!({ "sst": snssai.sst });
+        if let Some(sd) = snssai.sd {
+            s["sd"] = serde_json::json!(format!("{sd:06x}"));
+        }
+        profile["smfInfo"] = serde_json::json!({
+            "sNssaiSmfInfoList": [{ "sNssai": s, "dnnSmfInfoList": [{ "dnn": "*" }] }],
+            "pgwFqdn": fqdn,
+        });
+    }
+    profile
 }
 
 /// Register SMF NF instance with NRF
@@ -2515,6 +2537,62 @@ async fn pfcp_session_modify(
     }
 }
 
+/// Send a PFCP Session Modification Request built from `params` and return the response
+/// body on `REQUEST_ACCEPTED` (#475).
+///
+/// The same transaction, cause handling and #193 reconciliation as
+/// [`pfcp_session_modify`], for callers whose modification is not "activate FAR 2".
+async fn pfcp_modify_with(
+    smf_n4_seid: u64,
+    upf_seid: u64,
+    params: &n4_build::SessionModificationParams,
+) -> Result<Vec<u8>> {
+    let client = pfcp_path::client_for_session(smf_n4_seid)
+        .ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
+    if !client.is_associated().await {
+        anyhow::bail!("no established PFCP association with {}", client.peer());
+    }
+    let payload = n4_build::build_session_modification_request(params);
+    let (resp_type, resp_body) = client
+        .request(
+            pfcp_path::pfcp_message_type::SESSION_MODIFICATION_REQUEST,
+            Some(upf_seid),
+            &payload,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("PFCP Session Modification failed: {e}"))?;
+    if resp_type != pfcp_path::pfcp_message_type::SESSION_MODIFICATION_RESPONSE {
+        anyhow::bail!("unexpected PFCP response type {resp_type} to Session Modification");
+    }
+    match pfcp_path::parse_cause(&resp_body) {
+        Some(pfcp_path::pfcp_cause::REQUEST_ACCEPTED) => Ok(resp_body.to_vec()),
+        Some(cause) => {
+            if restoration::cause_means_session_gone(cause) {
+                restoration::reconcile_session_not_found(upf_seid).await;
+            }
+            anyhow::bail!(
+                "PFCP Session Modification rejected: cause {cause} ({})",
+                pfcp_path::cause_name(cause)
+            )
+        }
+        None => anyhow::bail!("PFCP Session Modification Response missing mandatory Cause IE"),
+    }
+}
+
+/// The F-TEID the UPF allocated in the first Created PDR of a session-level response
+/// (TS 29.244 §7.5.3.2 / §7.5.5.2, Created PDR IE 8 → F-TEID IE 21), #475.
+///
+/// F-TEID's V4 flag is bit 1 (§8.2.3), unlike F-SEID's bit 2 — see the establishment parser.
+fn parse_created_pdr_fteid(body: &[u8]) -> Option<(u32, [u8; 4])> {
+    let created = pfcp_path::find_ie(body, 8)?;
+    let fteid = pfcp_path::find_ie(created, 21)?;
+    if fteid.len() < 9 || fteid[0] & 0x01 == 0 {
+        return None;
+    }
+    let teid = u32::from_be_bytes(fteid[1..5].try_into().ok()?);
+    (teid != 0).then_some((teid, [fteid[5], fteid[6], fteid[7], fteid[8]]))
+}
+
 /// Send PFCP Session Deletion Request to UPF
 async fn pfcp_session_delete(smf_n4_seid: u64, upf_seid: u64) -> Result<()> {
     let client = pfcp_path::client_for_session(smf_n4_seid)
@@ -2684,6 +2762,7 @@ fn build_setup_request_transfer(
             gtp_teid: upf_teid.to_be_bytes(),
         }),
         data_forwarding_not_possible: false,
+        direct_forwarding_path_availability: false,
         pdu_session_type: PduSessionType::Ipv4,
         security_indication: None,
         network_instance: None,
@@ -2954,6 +3033,16 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         },
         None => return problem_400("MANDATORY_IE_MISSING", "SmContextCreateData body required"),
     };
+
+    // ---- #475: EPS→5GS handover preparation using N26 (TS 29.502 §5.2.2.2.3) ----
+    // Before the mandatory-IE validation, because that validation is for an ESTABLISHMENT:
+    // TS 29.502 Table 6.1.6.2.2-1 exempts `pduSessionId`, `dnn` and `sNssai` *"during an EPS
+    // to 5GS Idle mode mobility or handover using the N26 interface"*, and a handover has no
+    // UE-originated N1 message. Validating it as an establishment rejected every conformant
+    // initial AMF with 400.
+    if eps_to_5gs::is_handover_create(&req_body) {
+        return eps_to_5gs::handle_create(&req_body).await;
+    }
 
     // ---- Strict mandatory/conditional IE validation (smfd-06) ----
     // Reject genuinely-missing mandatory IEs up front with the correct
@@ -3961,75 +4050,18 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     // (PDUSessionResourceSetupRequestTransfer) are carried as multipart/related
     // binary parts (5gnas + ngap) referenced by RefToBinaryData, per TS 29.502
     // §6.1.2.2.2 / §6.1.2.4.
-    let mut response_body = serde_json::json!({
+    let response_body = serde_json::json!({
         "smContextRef": sm_context_ref,
         "pduSessionId": pdu_session_id,
         "upCnxState": "ACTIVATING",
         "n2SmInfoType": "PDU_RES_SETUP_REQ"
     });
 
-    // ---- #415: step 7's response members for an EPS→5GS preparation ----
-    //
-    // TS 23.502 §4.11.1.2.2.2 step 7 has the SMF answer with *"allocated EBIs, N2 SM
-    // Information (QoS Profile(s), EPS Bearer Setup List, Mapping between EBI(s) and
-    // QFI(s), CN Tunnel-Info, cause code)"*. The N2 container above already carries the
-    // QoS profile and the CN Tunnel Info (`build_setup_request_transfer` encodes the UPF
-    // TEID and address); what step 7 adds for the interworking case is the EBI↔QFI
-    // mapping and the echoed handover state.
-    //
-    // Emitted ONLY for a preparation. On an ordinary create there is no handover, and a
-    // response member describing one would tell the AMF a handover is in progress.
-    if ho_preparation.is_preparing() {
-        let obj = response_body
-            .as_object_mut()
-            .expect("json! built an object");
-        // Echoed so the AMF can see the SMF honoured the preparation rather than treating
-        // it as an ordinary create. §5.2.2.3.4.1's PREPARING is the state the session is
-        // now in: uplink tunnel allocated, downlink untouched.
-        obj.insert("hoState".to_string(), serde_json::json!("PREPARING"));
-        // The mapping between the EBI the container named and the QFI this create
-        // allocated. Both halves have to be present for the entry to mean anything, so an
-        // absent EBI omits the member rather than emitting a half mapping.
-        if let Some(ebi) = eps_pdn_connection.as_ref().and_then(|p| p.linked_ebi) {
-            obj.insert(
-                "epsBearerInfo".to_string(),
-                serde_json::json!([{
-                    "ebi": ebi,
-                    "dlAmbr": "0 bps",
-                    "pgwS8uFteid": "",
-                }]),
-            );
-            obj.insert(
-                "ebiQfiMapping".to_string(),
-                serde_json::json!([{ "ebi": ebi, "qfi": qfi }]),
-            );
-            log::info!(
-                "[{supi}] step 7 response for PDU session {pdu_session_id}: EBI {ebi} maps \
-                 onto QFI {qfi}, CN Tunnel Info UPF TEID 0x{upf_teid:08x}"
-            );
-        } else {
-            log::warn!(
-                "[{supi}] step 7 response for PDU session {pdu_session_id} carries NO EBI↔QFI \
-                 mapping: the ueEpsPdnConnection named no Linked EPS Bearer ID, so there is no \
-                 EPS bearer identity to map QFI {qfi} onto and the target NG-RAN cannot relate \
-                 this flow to the bearer the UE arrived on"
-            );
-        }
-        // Step 7: *"If neither indirect forwarding nor direct forwarding is applicable, the
-        // SMF shall further include a 'Data forwarding not possible' indication"*. This is
-        // the FIRST reader either forwarding field has ever had.
-        if data_forwarding.not_possible() {
-            obj.insert(
-                "dataForwardingNotPossible".to_string(),
-                serde_json::json!(true),
-            );
-            log::info!(
-                "[{supi}] PDU session {pdu_session_id}: neither indirect nor direct data \
-                 forwarding is applicable, so the response carries the 'Data forwarding not \
-                 possible' indication (TS 23.502 §4.11.1.2.2.2 step 7)"
-            );
-        }
-    }
+    // #475: step 7's response for an EPS→5GS preparation is built by
+    // `eps_to_5gs::handle_create`, which a PREPARING create with a PDN connection is routed
+    // to before this establishment path runs. #415 used to decorate THIS response with
+    // `ebiQfiMapping`/`epsBearerInfo`, members TS 29.502 does not define, on a session it
+    // had just established afresh rather than found.
 
     let location = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}");
 
@@ -4052,8 +4084,19 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
 /// The SMF-side N4 SEID for an SM context reference. Must match the
 /// derivation used at session establishment (it is the SEID the UPF
 /// addresses us by, and — issue #20 — the session→UPF binding key).
+///
+/// #475: an SM context created by an EPS→5GS handover inherits an N4 session established
+/// for its PDN connection over S5/S8, under the session's own SEID; that SEID is recorded
+/// in `SmfContext::cp_n4_seids` and takes precedence over the derivation. The guard is
+/// taken and dropped inside, so callers must not hold a `cp_n4_seids` write guard.
 fn smf_n4_seid_for(sm_context_ref: &str) -> u64 {
-    (sm_context_ref.parse::<u64>().unwrap_or(1)) | 0x1000
+    let inherited = smf_self().read().ok().and_then(|ctx| {
+        ctx.cp_n4_seids
+            .read()
+            .ok()
+            .and_then(|m| m.get(sm_context_ref).copied())
+    });
+    inherited.unwrap_or_else(|| (sm_context_ref.parse::<u64>().unwrap_or(1)) | 0x1000)
 }
 
 fn lookup_upf_seid(sm_context_ref: &str) -> Option<u64> {
@@ -4340,6 +4383,16 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
         if let Some(n1) = resolve_binary_ref(request, &req_body["n1SmMsg"]) {
             return handle_n1_sm_message(sm_context_ref, &n1).await;
         }
+    }
+
+    // #475 / TS 29.502 §5.2.2.3.4.3-4: a conformant COMPLETED or CANCELLED carries NO N2 SM
+    // information -- the state machine is `hoState`. Dispatching on `n2SmInfoType` alone sent
+    // both into the `upCnxState` arm below, which answered `upCnxState: ACTIVATED` and never
+    // switched the downlink or released what the preparation reserved.
+    match eps_to_5gs::bare_ho_state(&req_body) {
+        Some("COMPLETED") => return eps_to_5gs::handle_completed(sm_context_ref, None).await,
+        Some("CANCELLED") => return eps_to_5gs::handle_cancelled(sm_context_ref).await,
+        _ => {}
     }
 
     match n2_sm_info_type {
@@ -4687,74 +4740,34 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             // UE has actually moved (HANDOVER_COMPLETE / PATH_SWITCH_REQ) the source
             // gNB is still serving it, and re-pointing the UPF now would black-hole
             // downlink traffic for the whole handover-execution window.
+            //
+            // #475: the target's DL N3 endpoint is RECORDED here (TS 29.502 §5.2.2.3.4.2
+            // step 3), because a conformant COMPLETED carries none: without it the switch
+            // at execution has nowhere to go.
             log::info!(
                 "SM Context Update (HANDOVER_REQ_ACK, hoState={ho_state}) for \
                  ref={sm_context_ref}: prepared, DL tunnel still on the source gNB"
             );
-            let response_body = serde_json::json!({ "hoState": "PREPARED" });
-            SbiResponse::with_status(200).with_body(response_body.to_string(), "application/json")
+            match resolve_binary_ref(request, &req_body["n2SmInfo"]) {
+                Some(transfer) => eps_to_5gs::handle_prepared(sm_context_ref, &transfer),
+                None => {
+                    let response_body = serde_json::json!({ "hoState": "PREPARED" });
+                    SbiResponse::with_status(200)
+                        .with_body(response_body.to_string(), "application/json")
+                }
+            }
         }
         "HANDOVER_COMPLETE" => {
-            // The UE is on the target. If the request carries the target's DL
-            // endpoint, switch the UPF to it; the transfer container is the same
-            // shape a path switch uses (TS 38.413 §9.3.4.8).
-            let switched = match resolve_binary_ref(request, &req_body["n2SmInfo"])
+            // The UE is on the target. A consumer that relays the target's DL endpoint here
+            // (the transfer container is the same shape a path switch uses, TS 38.413
+            // §9.3.4.8) has it honoured; otherwise the endpoint recorded at PREPARED is used
+            // (#475), which is what a conformant COMPLETED relies on.
+            let endpoint = resolve_binary_ref(request, &req_body["n2SmInfo"])
                 .and_then(|b| decode_path_switch_dl_endpoint(&b))
-            {
-                Some((gnb_teid, gnb_addr, _qfi)) => match lookup_upf_seid(sm_context_ref) {
-                    Some(upf_seid) => {
-                        // Same call the PATH_SWITCH_REQ arm uses: one DL-switch
-                        // path, so a handover completion and a path switch cannot
-                        // drift apart.
-                        match pfcp_session_modify(
-                            smf_n4_seid_for(sm_context_ref),
-                            upf_seid,
-                            gnb_teid,
-                            gnb_addr,
-                        )
-                        .await
-                        {
-                            Ok(()) => true,
-                            Err(e) => {
-                                log::warn!(
-                                    "DL FAR switch to the target gNB failed after handover \
-                                     completion: {e}"
-                                );
-                                return SbiResponse::with_status(504);
-                            }
-                        }
-                    }
-                    None => false,
-                },
-                None => false,
-            };
-            if !switched {
-                // Stated rather than silently returned as success: a completed
-                // handover whose DL tunnel was not switched leaves downlink traffic
-                // pointed at the source gNB, and an operator reading a bare 200
-                // would have no way to know.
-                log::warn!(
-                    "SM Context Update (HANDOVER_COMPLETE) for ref={sm_context_ref} carried no \
-                     decodable target DL F-TEID: the UPF still points at the previous gNB"
-                );
-            }
-            log::info!(
-                "SM Context Update (HANDOVER_COMPLETE, hoState={ho_state}) for \
-                 ref={sm_context_ref}: DL tunnel switched={switched}"
-            );
-            let response_body = serde_json::json!({ "hoState": "COMPLETED" });
-            SbiResponse::with_status(200).with_body(response_body.to_string(), "application/json")
+                .map(|(teid, addr, _qfi)| (teid, addr));
+            eps_to_5gs::handle_completed(sm_context_ref, endpoint).await
         }
-        "HANDOVER_CANCEL" => {
-            // Abandoned. Nothing to undo: neither PREPARING nor PREPARED changed the
-            // user plane, which is exactly why they do not.
-            log::info!(
-                "SM Context Update (HANDOVER_CANCEL, hoState={ho_state}) for \
-                 ref={sm_context_ref}: handover abandoned, session retained"
-            );
-            let response_body = serde_json::json!({ "hoState": "CANCELLED" });
-            SbiResponse::with_status(200).with_body(response_body.to_string(), "application/json")
-        }
+        "HANDOVER_CANCEL" => eps_to_5gs::handle_cancelled(sm_context_ref).await,
 
         other => {
             log::warn!("SM Context Update: unsupported n2SmInfoType '{other}'");
@@ -5698,7 +5711,11 @@ async fn handle_sm_context_release(
             if let Ok(mut sessions) = ctx.pfcp_sessions.write() {
                 sessions.remove(sm_context_ref);
             }
-            // Issue #191: after the write guard drops (see `SmfContext::persist`).
+            // #475: and the inherited N4 SEID, if this context came from EPS.
+            if let Ok(mut seids) = ctx.cp_n4_seids.write() {
+                seids.remove(sm_context_ref);
+            }
+            // Issue #191: after the write guards drop (see `SmfContext::persist`).
             ctx.persist();
         }
     } else {
@@ -8416,189 +8433,10 @@ mod tests {
         amf.stop().await.expect("stop");
     }
 
-    /// #415 criteria 1-4, 6 and 7, end to end through the production handler: an
-    /// EPS→5GS preparation lands on a session whose N3/S5-S8 endpoints are READABLE FROM
-    /// THE SMF'S OWN SESSION STORE afterwards.
-    ///
-    /// This is the test the issue asks for, and it is what makes the whole change more
-    /// than a parser: before it, every `ueEpsPdnConnection` member arriving on a create
-    /// was discarded, so the call was **reachable but inert**. Positive assertions on
-    /// literal values read back out of the store — not "no error", which an inert handler
-    /// also satisfies.
-    ///
-    /// The container is the CONFORMANT grouped IE, because that is the only form that
-    /// carries the PGW-C endpoint at all (#78's positional one does not), so it is the
-    /// only form that can make the endpoint assertion able to fail.
-    ///
-    /// Lock order (see `pfcp_path::N4_TEST_LOCK`): switch locks first, N4 last.
-    #[tokio::test]
-    async fn an_eps_to_5gs_preparation_stores_the_endpoints_and_leaves_the_dl_path_alone() {
-        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
-        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-        let upf = pfcp_path::stand_in::associated_upf().await;
-        eps_iwk::set_for_test(true);
-        smf_context_init(64, 256, 512);
-
-        // Literals distinct from every sibling test's: this context is process-global and
-        // keyed by identity, so a shared SUPI or EBI lets two tests resolve each other's
-        // session. `0x415` marks them as this test's.
-        let supi = "imsi-001010000000415";
-        let psi = 12u8;
-        const APN: &str = "ims.mnc001.mcc001.gprs";
-        const EBI: u8 = 7;
-        const QCI: u8 = 5;
-        const PGW_TEID: u32 = 0x0415_BEEF;
-        const PGW_ADDR: [u8; 4] = [10, 41, 5, 15];
-        const UE_ADDR: [u8; 4] = [10, 45, 4, 15];
-
-        // The conformant Table 7.3.6-2 grouped IE an MME sends, built through the GTP
-        // library's own API so the bytes are a real encoding rather than a hand-rolled
-        // guess at one.
-        let container = {
-            use nextgcore_gtp::v2::{
-                Gtp2ApnIe, Gtp2BearerContextIe, Gtp2BearerQosIe, Gtp2EbiIe, Gtp2FTeidIe, Gtp2Ie,
-                Gtp2IeType, Gtp2PdnConnectionIe,
-            };
-            let mut pdn = Gtp2PdnConnectionIe::new();
-            pdn.add_ie(Gtp2ApnIe::from_string(APN).to_ie(0));
-            pdn.add_ie(Gtp2Ie::from_slice(Gtp2IeType::IpAddress as u8, 0, &UE_ADDR));
-            pdn.add_ie(Gtp2EbiIe::new(EBI).to_ie(0));
-            // Interface type 7 = S5/S8 PGW GTP-C (TS 29.274 Table 8.22-1).
-            pdn.add_ie(Gtp2FTeidIe::new_ipv4(7, PGW_TEID, PGW_ADDR).to_ie(0));
-            let mut bearer = Gtp2BearerContextIe::new();
-            bearer.set_ebi(EBI);
-            bearer.set_bearer_qos(&Gtp2BearerQosIe::new(QCI, 0, 0, 0, 0));
-            pdn.add_ie(bearer.to_ie(0));
-            let mut buf = bytes::BytesMut::new();
-            pdn.encode_value(&mut buf);
-            buf.to_vec()
-        };
-
-        // A create carrying step 4's three members: the container, the preparation state
-        // and NEITHER forwarding flag -- which is the case step 7 owes the "Data
-        // forwarding not possible" indication for.
-        let mut request = create_request(
-            supi,
-            psi,
-            &n1(
-                psi,
-                1,
-                gsm_build::message_type::PDU_SESSION_ESTABLISHMENT_REQUEST,
-                &[0x91, 0x00],
-            ),
-        );
-        {
-            use base64::Engine as _;
-            let mut body: serde_json::Value =
-                serde_json::from_str(request.http.content.as_deref().expect("body")).expect("json");
-            body["ueEpsPdnConnection"] =
-                serde_json::json!(base64::engine::general_purpose::STANDARD.encode(&container));
-            body["hoState"] = serde_json::json!("PREPARING");
-            body["epsInterworkingInd"] = serde_json::json!("WITH_N26");
-            request.http.content = Some(body.to_string());
-        }
-
-        let resp = handle_sm_context_create(&request).await;
-        assert_eq!(
-            resp.status, 201,
-            "the preparation must reach the success path"
-        );
-        assert!(
-            upf.seen()
-                .contains(&pfcp_path::pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST),
-            "the 201 must have been earned on the N4 wire -- step 6 allocates the CN \
-             Tunnel Info at the UPF"
-        );
-
-        // ---- criterion 3 + 4: step 7's response members ----
-        let body: serde_json::Value =
-            serde_json::from_str(resp.http.content.as_deref().expect("JSON root")).expect("json");
-        assert_eq!(
-            body["hoState"], "PREPARING",
-            "the response must echo the preparation state (TS 29.502 §5.2.2.3.4.1)"
-        );
-        assert_eq!(
-            body["ebiQfiMapping"][0]["ebi"], EBI,
-            "step 7 requires the mapping between EBI(s) and QFI(s); the EBI is the one \
-             the container named, got {body}"
-        );
-        let mapped_qfi = body["ebiQfiMapping"][0]["qfi"]
-            .as_u64()
-            .unwrap_or_else(|| panic!("the mapping must name a QFI, got {body}"));
-        assert!(
-            mapped_qfi > 0,
-            "the QFI must be the one this create allocated, not a placeholder"
-        );
-        assert_eq!(
-            body["dataForwardingNotPossible"], true,
-            "neither forwarding flag was set, so step 7 owes the 'Data forwarding not \
-             possible' indication, got {body}"
-        );
-
-        // ---- criterion 6: the endpoints are readable FROM THE SMF'S OWN STORE ----
-        //
-        // The assertion the issue asks for, and the one an inert handler fails: these
-        // values exist on the session only because the container was parsed and stored.
-        let sess = {
-            let ctx = smf_self();
-            let guard = ctx.read().expect("context");
-            let ue = guard
-                .ue_find_by_supi(supi)
-                .expect("the UE must be registered");
-            let sess_id = *ue.sess_ids.first().expect("one session");
-            guard
-                .sess_find_by_id(sess_id)
-                .expect("the session must exist")
-        };
-        assert_eq!(
-            sess.sgw_s5c_teid, PGW_TEID,
-            "the PGW-C S5/S8 control-plane TEID the MME supplied must be stored, or a \
-             later S5/S8 procedure has nowhere to go"
-        );
-        assert_eq!(
-            sess.sgw_s5c_ip.ipv4,
-            Some(std::net::Ipv4Addr::from(PGW_ADDR)),
-            "the PGW-C S5/S8 control-plane address must be stored"
-        );
-        assert!(
-            sess.epc,
-            "a session that arrived from EPS is an EPC-peered session, which is what the \
-             EPC-facing paths branch on"
-        );
-
-        // ---- criterion 2 + 4: the forwarding indications, and the UP path ----
-        assert!(
-            sess.handover.data_forwarding_not_possible,
-            "neither forwarding path applies, so the session must record it -- this field \
-             had no production writer and no reader before #415"
-        );
-        assert!(
-            !sess.handover.indirect_data_forwarding,
-            "indirectForwardingFlag was absent, so indirect forwarding must not be claimed"
-        );
-        assert!(
-            !sess.handover.prepared,
-            "PREPARING is not PREPARED: no target has been heard from, so claiming the \
-             target's DL endpoint is installed would be a lie (TS 29.502 §5.2.2.3.4.1)"
-        );
-        // The UP path was NOT switched: a PREPARING create allocates the uplink tunnel and
-        // nothing else. Asserted from the stand-in's own record rather than a log line --
-        // a Session Modification is what a DL switch would look like on the wire.
-        assert!(
-            !upf.seen()
-                .contains(&pfcp_path::pfcp_message_type::SESSION_MODIFICATION_REQUEST),
-            "hoState=PREPARING must not switch the downlink path (TS 23.502 \
-             §4.11.1.2.2.2 step 4, 'to avoid switching the UP path'); a Session \
-             Modification on the N4 wire is what that switch looks like"
-        );
-
-        eps_iwk::set_for_test(false);
-    }
-
     /// #415 criterion 7: with the interworking leg OFF, a create carrying a container
     /// behaves exactly as one without it.
     ///
-    /// The pair to the test above. Standalone 5GC and standalone EPC must be unchanged,
+    /// Standalone 5GC and standalone EPC must be unchanged,
     /// and the way to show that is that the response carries none of step 7's members.
     #[tokio::test]
     async fn a_container_on_a_create_changes_nothing_when_the_leg_is_off() {

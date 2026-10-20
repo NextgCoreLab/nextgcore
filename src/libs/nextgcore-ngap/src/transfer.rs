@@ -29,6 +29,9 @@ const IE_ID_PDU_SESSION_TYPE: u16 = 134;
 const IE_ID_SECURITY_INDICATION: u16 = 138;
 const IE_ID_NETWORK_INSTANCE: u16 = 129;
 const IE_ID_QOS_FLOW_SETUP_REQUEST_LIST: u16 = 136;
+/// id-DirectForwardingPathAvailability (TS 38.413 §9.4); criticality `ignore` in
+/// `PDUSessionResourceSetupRequestTransferIEs`.
+const IE_ID_DIRECT_FORWARDING_PATH_AVAILABILITY: u16 = 22;
 const IE_ID_UL_NGU_UP_TNL_MODIFY_LIST: u16 = 140;
 const IE_ID_QOS_FLOW_ADD_OR_MODIFY_REQUEST_LIST: u16 = 135;
 const IE_ID_QOS_FLOW_TO_RELEASE_LIST: u16 = 137;
@@ -1301,6 +1304,12 @@ pub struct PduSessionResourceSetupRequestTransfer {
     pub network_instance: Option<u16>,
     /// QoS Flow Setup Request List (mandatory)
     pub qos_flow_setup_request_list: Vec<QosFlowSetupRequestItem>,
+    /// Direct Forwarding Path Availability (optional flag, IE 22, criticality `ignore`).
+    ///
+    /// TS 29.502 §5.2.2.2.3 step 2a: in an EPS→5GS handover over N26, *"if the SMF was
+    /// indicated in step 1 that direct data forwarding is applicable, the SMF shall include
+    /// an indication that a direct forwarding path is available in the N2 SM information"*.
+    pub direct_forwarding_path_availability: bool,
 }
 
 impl PduSessionResourceSetupRequestTransfer {
@@ -1370,6 +1379,20 @@ impl PduSessionResourceSetupRequestTransfer {
                 Ok(())
             },
         )?;
+        // Object-set order (§9.4.1): after QosFlowSetupRequestList.
+        if self.direct_forwarding_path_availability {
+            push_transfer_ie(
+                &mut container,
+                IE_ID_DIRECT_FORWARDING_PATH_AVAILABILITY,
+                Criticality::Ignore,
+                |enc| {
+                    // DirectForwardingPathAvailability ::= ENUMERATED { direct-path-available, ... }
+                    let constraint = Constraint::extensible(0, 0);
+                    enc.encode_enumerated(0, &constraint)?;
+                    Ok(())
+                },
+            )?;
+        }
         encode_container(&container)
     }
 
@@ -1382,9 +1405,15 @@ impl PduSessionResourceSetupRequestTransfer {
         let mut security_indication = None;
         let mut network_instance = None;
         let mut qos_flow_list = None;
+        let mut direct_forwarding_path_availability = false;
         for field in &container.ies {
             let mut decoder = AperDecoder::new(&field.value);
             match field.id.0 {
+                IE_ID_DIRECT_FORWARDING_PATH_AVAILABILITY => {
+                    let constraint = Constraint::extensible(0, 0);
+                    let _val = decoder.decode_enumerated(&constraint)?;
+                    direct_forwarding_path_availability = true;
+                }
                 IE_ID_PDU_SESSION_AGGREGATE_MAXIMUM_BIT_RATE => {
                     ambr = Some(PduSessionAggregateMaximumBitRate::decode(&mut decoder)?);
                 }
@@ -1443,6 +1472,7 @@ impl PduSessionResourceSetupRequestTransfer {
                 ie_name: "QosFlowSetupRequestList",
                 ie_id: IE_ID_QOS_FLOW_SETUP_REQUEST_LIST,
             })?,
+            direct_forwarding_path_availability,
         })
     }
 }
@@ -1519,6 +1549,219 @@ impl PduSessionResourceSetupResponseTransfer {
             additional_dl_qos_flow_per_tnl_information,
             security_result,
             qos_flow_failed_to_setup_list,
+        })
+    }
+}
+
+// ============================================================================
+// Handover Request Acknowledge Transfer (TS 38.413 Section 9.3.4.11)
+// ============================================================================
+
+/// `QosFlowItemWithDataForwarding` (§9.3.4.11): a QoS flow the target NG-RAN set up, and
+/// whether it accepted data forwarding for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QosFlowItemWithDataForwarding {
+    /// QoS Flow Identifier (0..63)
+    pub qos_flow_identifier: u8,
+    /// `dataForwardingAccepted ENUMERATED { data-forwarding-accepted, ... } OPTIONAL`
+    pub data_forwarding_accepted: bool,
+}
+
+impl QosFlowItemWithDataForwarding {
+    fn encode(&self, encoder: &mut AperEncoder) -> NgapResult<()> {
+        encoder.write_bit(false); // extension
+        encoder.write_bit(self.data_forwarding_accepted);
+        encoder.write_bit(false); // no iE-Extensions
+        encode_qfi(encoder, self.qos_flow_identifier)?;
+        if self.data_forwarding_accepted {
+            encoder.encode_enumerated(0, &Constraint::extensible(0, 0))?;
+        }
+        Ok(())
+    }
+
+    fn decode(decoder: &mut AperDecoder) -> NgapResult<Self> {
+        let ext = decoder.read_bit()?;
+        let accepted_present = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
+        let qos_flow_identifier = decode_qfi(decoder)?;
+        if accepted_present {
+            let _ = decoder.decode_enumerated(&Constraint::extensible(0, 0))?;
+        }
+        finish_extensible_sequence(decoder, ext, ie_ext)?;
+        Ok(Self {
+            qos_flow_identifier,
+            data_forwarding_accepted: accepted_present,
+        })
+    }
+}
+
+/// `DataForwardingResponseDRBItem` (§9.3.4.11): per-DRB forwarding tunnels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataForwardingResponseDrbItem {
+    /// `DRB-ID ::= INTEGER (1..32, ...)`
+    pub drb_id: u8,
+    pub dl_forwarding_up_tnl_information: Option<UpTransportLayerInformation>,
+    pub ul_forwarding_up_tnl_information: Option<UpTransportLayerInformation>,
+}
+
+impl DataForwardingResponseDrbItem {
+    fn encode(&self, encoder: &mut AperEncoder) -> NgapResult<()> {
+        encoder.write_bit(false); // extension
+        encoder.write_bit(self.dl_forwarding_up_tnl_information.is_some());
+        encoder.write_bit(self.ul_forwarding_up_tnl_information.is_some());
+        encoder.write_bit(false); // no iE-Extensions
+        encode_ext_constrained(encoder, i64::from(self.drb_id), 1, 32)?;
+        if let Some(ref t) = self.dl_forwarding_up_tnl_information {
+            t.encode(encoder)?;
+        }
+        if let Some(ref t) = self.ul_forwarding_up_tnl_information {
+            t.encode(encoder)?;
+        }
+        Ok(())
+    }
+
+    fn decode(decoder: &mut AperDecoder) -> NgapResult<Self> {
+        let ext = decoder.read_bit()?;
+        let dl_present = decoder.read_bit()?;
+        let ul_present = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
+        let drb_id = decode_ext_constrained(decoder, 1, 32)? as u8;
+        let dl_forwarding_up_tnl_information = if dl_present {
+            Some(UpTransportLayerInformation::decode(decoder)?)
+        } else {
+            None
+        };
+        let ul_forwarding_up_tnl_information = if ul_present {
+            Some(UpTransportLayerInformation::decode(decoder)?)
+        } else {
+            None
+        };
+        finish_extensible_sequence(decoder, ext, ie_ext)?;
+        Ok(Self {
+            drb_id,
+            dl_forwarding_up_tnl_information,
+            ul_forwarding_up_tnl_information,
+        })
+    }
+}
+
+/// maxnoofDRBs (TS 38.413 §9.4)
+const MAX_NO_OF_DRBS: usize = 32;
+
+/// `HandoverRequestAcknowledgeTransfer` (TS 38.413 §9.3.4.11) — built by the target NG-RAN,
+/// relayed by the AMF in the PREPARED `UpdateSMContext` (TS 29.502 §5.2.2.3.4.2 step 3),
+/// consumed by the SMF.
+///
+/// The SMF reads it for the target's **downlink** N3 endpoint, which the UPF is switched to
+/// at handover execution, and for which QoS flows the target accepted (TS 23.502
+/// §4.11.1.2.2.2 step 12: *"The EPS Bearer Setup list ... is generated based on the list of
+/// accepted QFI(s)"*).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HandoverRequestAcknowledgeTransfer {
+    /// `dL-NGU-UP-TNLInformation` (mandatory) — the target's DL N3 endpoint.
+    pub dl_ngu_up_tnl_information: UpTransportLayerInformation,
+    /// `dLForwardingUP-TNLInformation` (optional).
+    pub dl_forwarding_up_tnl_information: Option<UpTransportLayerInformation>,
+    /// `securityResult` (optional).
+    pub security_result: Option<SecurityResult>,
+    /// `qosFlowSetupResponseList` (mandatory, 1..64).
+    pub qos_flow_setup_response_list: Vec<QosFlowItemWithDataForwarding>,
+    /// `qosFlowFailedToSetupList` (optional, empty = absent).
+    pub qos_flow_failed_to_setup_list: Vec<QosFlowWithCauseItem>,
+    /// `dataForwardingResponseDRBList` (optional, empty = absent).
+    pub data_forwarding_response_drb_list: Vec<DataForwardingResponseDrbItem>,
+}
+
+impl HandoverRequestAcknowledgeTransfer {
+    pub fn encode(&self) -> NgapResult<Vec<u8>> {
+        if self.qos_flow_setup_response_list.is_empty() {
+            return Err(invalid(
+                "HandoverRequestAcknowledgeTransfer",
+                "qosFlowSetupResponseList is SIZE(1..maxnoofQosFlows)".to_string(),
+            ));
+        }
+        let mut encoder = AperEncoder::new();
+        encoder.write_bit(false); // extension
+        encoder.write_bit(self.dl_forwarding_up_tnl_information.is_some());
+        encoder.write_bit(self.security_result.is_some());
+        encoder.write_bit(!self.qos_flow_failed_to_setup_list.is_empty());
+        encoder.write_bit(!self.data_forwarding_response_drb_list.is_empty());
+        encoder.write_bit(false); // no iE-Extensions
+        self.dl_ngu_up_tnl_information.encode(&mut encoder)?;
+        if let Some(ref t) = self.dl_forwarding_up_tnl_information {
+            t.encode(&mut encoder)?;
+        }
+        if let Some(ref r) = self.security_result {
+            r.encode(&mut encoder)?;
+        }
+        encoder.encode_constrained_length(self.qos_flow_setup_response_list.len(), 1, 64)?;
+        for item in &self.qos_flow_setup_response_list {
+            item.encode(&mut encoder)?;
+        }
+        if !self.qos_flow_failed_to_setup_list.is_empty() {
+            encode_qos_flow_with_cause_list(&mut encoder, &self.qos_flow_failed_to_setup_list)?;
+        }
+        if !self.data_forwarding_response_drb_list.is_empty() {
+            encoder.encode_constrained_length(
+                self.data_forwarding_response_drb_list.len(),
+                1,
+                MAX_NO_OF_DRBS,
+            )?;
+            for item in &self.data_forwarding_response_drb_list {
+                item.encode(&mut encoder)?;
+            }
+        }
+        encoder.align();
+        Ok(encoder.into_bytes().to_vec())
+    }
+
+    pub fn decode(data: &[u8]) -> NgapResult<Self> {
+        let mut decoder = AperDecoder::new(data);
+        let ext = decoder.read_bit()?;
+        let dl_forwarding_present = decoder.read_bit()?;
+        let security_present = decoder.read_bit()?;
+        let failed_present = decoder.read_bit()?;
+        let drb_present = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
+        let dl_ngu_up_tnl_information = UpTransportLayerInformation::decode(&mut decoder)?;
+        let dl_forwarding_up_tnl_information = if dl_forwarding_present {
+            Some(UpTransportLayerInformation::decode(&mut decoder)?)
+        } else {
+            None
+        };
+        let security_result = if security_present {
+            Some(SecurityResult::decode(&mut decoder)?)
+        } else {
+            None
+        };
+        let count = decoder.decode_constrained_length(1, 64)?;
+        let mut qos_flow_setup_response_list = Vec::with_capacity(count);
+        for _ in 0..count {
+            qos_flow_setup_response_list.push(QosFlowItemWithDataForwarding::decode(&mut decoder)?);
+        }
+        let qos_flow_failed_to_setup_list = if failed_present {
+            decode_qos_flow_with_cause_list(&mut decoder)?
+        } else {
+            Vec::new()
+        };
+        let data_forwarding_response_drb_list = if drb_present {
+            let count = decoder.decode_constrained_length(1, MAX_NO_OF_DRBS)?;
+            let mut list = Vec::with_capacity(count);
+            for _ in 0..count {
+                list.push(DataForwardingResponseDrbItem::decode(&mut decoder)?);
+            }
+            list
+        } else {
+            Vec::new()
+        };
+        finish_extensible_sequence(&mut decoder, ext, ie_ext)?;
+        Ok(Self {
+            dl_ngu_up_tnl_information,
+            dl_forwarding_up_tnl_information,
+            security_result,
+            qos_flow_setup_response_list,
+            qos_flow_failed_to_setup_list,
+            data_forwarding_response_drb_list,
         })
     }
 }
@@ -2222,6 +2465,7 @@ mod tests {
             }),
             ul_ngu_up_tnl_information: sample_tunnel(),
             data_forwarding_not_possible: false,
+            direct_forwarding_path_availability: false,
             pdu_session_type: PduSessionType::Ipv4,
             security_indication: Some(SecurityIndication {
                 integrity_protection_indication: ProtectionIndication::NotNeeded,
@@ -2247,6 +2491,7 @@ mod tests {
             pdu_session_aggregate_maximum_bit_rate: None,
             ul_ngu_up_tnl_information: sample_tunnel(),
             data_forwarding_not_possible: true,
+            direct_forwarding_path_availability: false,
             pdu_session_type: PduSessionType::Ipv4v6,
             security_indication: None,
             network_instance: Some(7),
@@ -2487,6 +2732,7 @@ mod tests {
                 }),
                 ul_ngu_up_tnl_information: sample_tunnel(),
                 data_forwarding_not_possible: false,
+                direct_forwarding_path_availability: false,
                 pdu_session_type: PduSessionType::Ipv4,
                 security_indication: None,
                 network_instance: None,
@@ -2919,5 +3165,135 @@ mod tests {
         let bytes = [0x10, 0x09, 0x80, 0x03, 0x2D, 0xC6, 0xC0];
         let mut decoder = AperDecoder::new(&bytes);
         assert!(NonDynamic5qiDescriptor::decode(&mut decoder).is_err());
+    }
+
+    // ---- #475: HandoverRequestAcknowledgeTransfer, DirectForwardingPathAvailability ----
+
+    fn ipv4_tunnel(addr: [u8; 4], teid: u32) -> UpTransportLayerInformation {
+        UpTransportLayerInformation::GtpTunnel(GtpTunnel {
+            transport_layer_address: TransportLayerAddress::from_ipv4(addr),
+            gtp_teid: teid.to_be_bytes(),
+        })
+    }
+
+    /// The smallest HandoverRequestAcknowledgeTransfer, derived bit by bit from X.691
+    /// (APER) and TS 38.413 §9.3.4.11, not captured from the encoder:
+    ///
+    /// ```text
+    /// SEQUENCE ext 0 | 5 OPTIONAL bits 00000            -> 0 00000
+    /// dL-NGU: CHOICE (2 alts, not extensible) idx 0      -> 0
+    ///   GTPTunnel ext 0 | iE-Extensions 0                -> 0 0
+    ///   TransportLayerAddress ext 0 | len-1 in 8 bits 31 -> 0 00011111 | pad to octet
+    ///   address 0A 01 02 03 | GTP-TEID SIZE(4) 0000ABCD
+    /// qosFlowSetupResponseList: count-1 in 6 bits        -> 000000
+    ///   item ext 0 | dataForwardingAccepted 0 | ext 0    -> 0 0 0
+    ///   QFI ext 0 | 6 bits = 5                           -> 0 000101
+    /// ```
+    ///
+    /// Octets 1-3: `00000000 00000111 11000000` = `00 07 C0`.
+    #[test]
+    fn handover_request_acknowledge_transfer_golden_bytes() {
+        let transfer = HandoverRequestAcknowledgeTransfer {
+            dl_ngu_up_tnl_information: ipv4_tunnel([10, 1, 2, 3], 0xABCD),
+            dl_forwarding_up_tnl_information: None,
+            security_result: None,
+            qos_flow_setup_response_list: vec![QosFlowItemWithDataForwarding {
+                qos_flow_identifier: 5,
+                data_forwarding_accepted: false,
+            }],
+            qos_flow_failed_to_setup_list: Vec::new(),
+            data_forwarding_response_drb_list: Vec::new(),
+        };
+        let golden = [
+            0x00, 0x07, 0xC0, 0x0A, 0x01, 0x02, 0x03, 0x00, 0x00, 0xAB, 0xCD, 0x00, 0x05,
+        ];
+        assert_eq!(transfer.encode().unwrap(), golden);
+        assert_eq!(
+            HandoverRequestAcknowledgeTransfer::decode(&golden).unwrap(),
+            transfer
+        );
+    }
+
+    /// Every optional member present round-trips, and a decoder that left one unread would
+    /// fail on the trailing members.
+    #[test]
+    fn handover_request_acknowledge_transfer_round_trips_every_member() {
+        let transfer = HandoverRequestAcknowledgeTransfer {
+            dl_ngu_up_tnl_information: ipv4_tunnel([10, 1, 2, 3], 0xABCD),
+            dl_forwarding_up_tnl_information: Some(ipv4_tunnel([10, 9, 9, 9], 7)),
+            security_result: Some(SecurityResult {
+                integrity_protection_result: ProtectionResult::Performed,
+                confidentiality_protection_result: ProtectionResult::NotPerformed,
+            }),
+            qos_flow_setup_response_list: vec![
+                QosFlowItemWithDataForwarding {
+                    qos_flow_identifier: 5,
+                    data_forwarding_accepted: true,
+                },
+                QosFlowItemWithDataForwarding {
+                    qos_flow_identifier: 63,
+                    data_forwarding_accepted: false,
+                },
+            ],
+            qos_flow_failed_to_setup_list: vec![QosFlowWithCauseItem {
+                qos_flow_identifier: 6,
+                cause: Cause::RadioNetwork(
+                    nextgcore_asn1c::ngap::cause::CauseRadioNetwork::Unspecified,
+                ),
+            }],
+            data_forwarding_response_drb_list: vec![DataForwardingResponseDrbItem {
+                drb_id: 32,
+                dl_forwarding_up_tnl_information: Some(ipv4_tunnel([10, 8, 8, 8], 9)),
+                ul_forwarding_up_tnl_information: None,
+            }],
+        };
+        let bytes = transfer.encode().unwrap();
+        assert_eq!(
+            HandoverRequestAcknowledgeTransfer::decode(&bytes).unwrap(),
+            transfer
+        );
+    }
+
+    /// DirectForwardingPathAvailability rides IE 22 with criticality ignore, after the QoS
+    /// flow list (object-set order), and round-trips.
+    #[test]
+    fn setup_request_transfer_carries_direct_forwarding_path_availability() {
+        let mut transfer = PduSessionResourceSetupRequestTransfer {
+            pdu_session_aggregate_maximum_bit_rate: None,
+            ul_ngu_up_tnl_information: ipv4_tunnel([10, 45, 0, 1], 0x1289),
+            data_forwarding_not_possible: false,
+            pdu_session_type: PduSessionType::Ipv4,
+            security_indication: None,
+            network_instance: None,
+            qos_flow_setup_request_list: vec![QosFlowSetupRequestItem {
+                qos_flow_identifier: 5,
+                qos_flow_level_qos_parameters: QosFlowLevelQosParameters {
+                    qos_characteristics: QosCharacteristics::NonDynamic5qi(
+                        NonDynamic5qiDescriptor::new(9),
+                    ),
+                    allocation_and_retention_priority: AllocationAndRetentionPriority {
+                        priority_level_arp: 8,
+                        pre_emption_capability: PreEmptionCapability::ShallNotTriggerPreEmption,
+                        pre_emption_vulnerability: PreEmptionVulnerability::NotPreEmptable,
+                    },
+                    gbr_qos_information: None,
+                    reflective_qos_attribute: false,
+                    additional_qos_flow_information: false,
+                },
+                e_rab_id: Some(5),
+            }],
+            direct_forwarding_path_availability: false,
+        };
+        let without = transfer.encode().unwrap();
+        transfer.direct_forwarding_path_availability = true;
+        let with = transfer.encode().unwrap();
+        // The container count goes from 3 to 4, and the last field is `00 16 40 01 00`:
+        // id 22, criticality ignore (01 -> 0x40), open-type length 1, the one-bit ENUMERATED
+        // (ext 0, no root bits) padded to an octet.
+        assert_eq!(&with[with.len() - 5..], &[0x00, 0x16, 0x40, 0x01, 0x00]);
+        assert_eq!(with.len(), without.len() + 5);
+        let decoded = PduSessionResourceSetupRequestTransfer::decode(&with).unwrap();
+        assert!(decoded.direct_forwarding_path_availability);
+        assert_eq!(decoded, transfer);
     }
 }

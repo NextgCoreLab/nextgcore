@@ -3279,7 +3279,10 @@ fn hex_to_16bytes(hex_str: &str) -> Result<[u8; 16], String> {
 static PGW_DISCOVERY_NRF_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 /// Test-only: point [`discover_smf_by_pgw`] at `uri` (`None` restores the global NRF).
-#[cfg(test)]
+///
+/// Not `#[cfg(test)]`: smfd's strict-peer EPS→5GS test drives this AMF as a dev-dependency
+/// (#475), and `cfg(test)` items are invisible across crates. Production never calls it, so
+/// the override stays `None` and the global NRF is used.
 pub fn set_pgw_discovery_nrf_for_test(uri: Option<String>) {
     *PGW_DISCOVERY_NRF_OVERRIDE
         .lock()

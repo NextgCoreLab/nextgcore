@@ -2043,10 +2043,11 @@ fn profile_matches(doc: &serde_json::Value, status: &str, query: &DiscoveryQuery
     }
 
     // dnn: when the profile advertises DNNs (SMF/UPF/BSF info), the requested
-    // DNN must be among them.
+    // DNN must be among them. `*` is TS 29.571's `WildcardDnn`, which TS 29.510's
+    // `DnnSmfInfoItem.dnn` accepts and which serves every DNN (#475).
     if let Some(ref dnn) = query.dnn {
         let dnns = advertised_dnns(doc);
-        if !dnns.is_empty() && !dnns.iter().any(|d| d == dnn) {
+        if !dnns.is_empty() && !dnns.iter().any(|d| d == dnn || d == "*") {
             return false;
         }
     }
@@ -2313,6 +2314,35 @@ mod tests {
                 }]
             }
         })
+    }
+
+    /// #475: `*` is TS 29.571's `WildcardDnn`, which `DnnSmfInfoItem.dnn` accepts, so an
+    /// SMF advertising it is discoverable by any DNN — and one advertising named DNNs is
+    /// still discoverable only by those.
+    #[test]
+    fn a_wildcard_dnn_serves_every_dnn_and_a_named_one_only_itself() {
+        let query = |dnn: &str| DiscoveryQuery {
+            target_nf_type: "SMF".to_string(),
+            requester_nf_type: "AMF".to_string(),
+            dnn: Some(dnn.to_string()),
+            ..Default::default()
+        };
+        let mut wildcard = full_profile_doc("nf-wild", "SMF");
+        wildcard["smfInfo"]["sNssaiSmfInfoList"][0]["dnnSmfInfoList"] =
+            serde_json::json!([{ "dnn": "*" }]);
+        assert!(profile_matches(&wildcard, "REGISTERED", &query("internet")));
+        assert!(profile_matches(
+            &wildcard,
+            "REGISTERED",
+            &query("anything.else")
+        ));
+        let named = full_profile_doc("nf-named", "SMF");
+        assert!(profile_matches(&named, "REGISTERED", &query("ims")));
+        assert!(!profile_matches(
+            &named,
+            "REGISTERED",
+            &query("anything.else")
+        ));
     }
 
     #[test]

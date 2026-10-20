@@ -608,6 +608,167 @@ impl HoPreparation {
     }
 }
 
+// ============================================================================
+// #475: the EPS PDN connection's 5GS identity, and the EPS→5GS handover create
+// ============================================================================
+
+/// (e)PCO container identifiers this crate reads or writes for 5GS interworking
+/// (TS 24.008 Table 10.5.154). The same 16-bit value means different things per direction,
+/// which is why the two directions are separate namespaces here.
+pub mod pco_container {
+    /// MS to network: *"PDU session ID"* — the PSI the UE allocated for this PDN connection.
+    pub const MS_PDU_SESSION_ID: u16 = 0x001A;
+    /// Network to MS: S-NSSAI, followed by the PLMN ID it relates to.
+    pub const NW_S_NSSAI: u16 = 0x001B;
+    /// Network to MS: the QoS rules for the QoS flow corresponding to the EPS bearer.
+    pub const NW_QOS_RULES: u16 = 0x001C;
+    /// Network to MS: the Session-AMBR of the PDU session corresponding to the PDN connection.
+    pub const NW_SESSION_AMBR: u16 = 0x001D;
+    /// Network to MS: the QoS flow descriptions for the QoS flow corresponding to the bearer.
+    pub const NW_QOS_FLOW_DESCRIPTIONS: u16 = 0x001F;
+}
+
+/// Walk an (e)PCO value (TS 24.008 §10.5.6.3, TS 24.301 §9.9.4.26) and return the contents
+/// of the first container with `container_id`.
+///
+/// Octet 1 is `ext | spare | configuration protocol`; protocol/container entries follow as
+/// `id (2) | length | contents`. The ePCO is the same structure with a **two**-octet length
+/// (TS 24.301 §9.9.4.26: *"the length of container identifier contents ... 2 octets"*),
+/// selected by `extended`. A length running past the buffer ends the walk with `None`
+/// rather than reading the next IE as contents.
+pub fn pco_container(pco: &[u8], extended: bool, container_id: u16) -> Option<Vec<u8>> {
+    let mut off = 1usize; // skip the configuration-protocol octet
+    let len_size = if extended { 2 } else { 1 };
+    while off + 2 + len_size <= pco.len() {
+        let id = u16::from_be_bytes([pco[off], pco[off + 1]]);
+        let len = if extended {
+            u16::from_be_bytes([pco[off + 2], pco[off + 3]]) as usize
+        } else {
+            pco[off + 2] as usize
+        };
+        let start = off + 2 + len_size;
+        let end = start.checked_add(len)?;
+        if end > pco.len() {
+            return None;
+        }
+        if id == container_id {
+            return Some(pco[start..end].to_vec());
+        }
+        off = end;
+    }
+    None
+}
+
+/// The PDU session ID a UE sent for a PDN connection, from its PCO or ePCO (#475).
+///
+/// TS 24.301 §6.5.1.2: a UE supporting N1 mode *"shall allocate a PDU session ID ...
+/// associate the PDU session ID with the PDN connection that is being established, and
+/// include the PDU session ID in the Protocol configuration options IE or the Extended
+/// protocol configuration options IE"*. TS 24.008 codes the contents as the PDU session
+/// identity of TS 24.007 §11.2.3.1b — one octet, 1..15 for an allocated identity. Any other
+/// value is not an identity this SMF can use, and is answered as "none was sent".
+pub fn pdu_session_id_from_pco(pco: Option<&[u8]>, epco: Option<&[u8]>) -> Option<u8> {
+    let from = |value: &[u8], extended: bool| {
+        pco_container(value, extended, pco_container::MS_PDU_SESSION_ID)
+            .filter(|c| c.len() == 1)
+            .map(|c| c[0])
+            .filter(|psi| (1..=15).contains(psi))
+    };
+    epco.and_then(|e| from(e, true))
+        .or_else(|| pco.and_then(|p| from(p, false)))
+}
+
+/// The S-NSSAI this PGW-C+SMF assigns to a PDN connection the UE can move to 5GS (#475).
+///
+/// TS 23.502 §4.11.1.1: *"the PGW-C+SMF ... selects an S-NSSAI ... and provides it to the UE
+/// in the PCO"*. Configured with `SMF_IWK_SNSSAI` as `sst` or `sst:sd` (SD six hex digits),
+/// defaulting to SST 1 — the eMBB slice — because a PDN connection reaching this SMF from EPS
+/// carries no S-NSSAI of its own to inherit.
+pub fn interworking_snssai() -> crate::context::SNssai {
+    std::env::var("SMF_IWK_SNSSAI")
+        .ok()
+        .and_then(|v| {
+            let mut it = v.trim().splitn(2, ':');
+            let sst = it.next()?.parse::<u8>().ok()?;
+            let sd = match it.next() {
+                Some(sd) => Some(
+                    u32::from_str_radix(sd, 16)
+                        .ok()
+                        .filter(|&v| v <= 0xFF_FFFF)?,
+                ),
+                None => None,
+            };
+            Some(crate::context::SNssai { sst, sd })
+        })
+        .unwrap_or(crate::context::SNssai { sst: 1, sd: None })
+}
+
+/// Build the network-to-MS PCO carrying the mapped 5GS parameters of a PDN connection
+/// (#475): S-NSSAI with its PLMN, Session-AMBR, and the QoS rule and QoS flow description of
+/// the QoS flow the default EPS bearer maps onto.
+///
+/// TS 23.502 §4.11.1.1 has the PGW-C+SMF provide these at PDN connection establishment so a
+/// later move to 5GS has them; §4.11.1.2.2.2 names *"mapped 5GS parameters were not provided
+/// to the UE"* as a reason continuity is not supported. Each container's contents are the
+/// value part (no IEI, no length) of the TS 24.501 IE TS 24.008 Table 10.5.154 names.
+///
+/// Octet 1 is `0x80`: extension bit set, configuration protocol 0 (PPP with IP PDP type),
+/// which is the only protocol TS 24.008 defines. `extended` selects the ePCO form, whose
+/// container lengths are two octets (TS 24.301 §9.9.4.26); it is answered in whichever form
+/// the UE used.
+pub fn build_mapped_5gs_pco(
+    snssai: &crate::context::SNssai,
+    plmn: [u8; 3],
+    ambr_dl_bps: u64,
+    ambr_ul_bps: u64,
+    flow: &crate::context::SmfBearer,
+    extended: bool,
+) -> Vec<u8> {
+    let mut out = vec![0x80];
+    let mut push = |id: u16, contents: &[u8]| {
+        out.extend_from_slice(&id.to_be_bytes());
+        if extended {
+            out.extend_from_slice(&(contents.len() as u16).to_be_bytes());
+        } else {
+            out.push(contents.len() as u8);
+        }
+        out.extend_from_slice(contents);
+    };
+    let mut snssai_contents = crate::gsm_build::encode_snssai(snssai);
+    snssai_contents.extend_from_slice(&plmn);
+    push(pco_container::NW_S_NSSAI, &snssai_contents);
+    // `encode_session_ambr` writes the TS 24.501 IE's length octet first; the PCO wants the
+    // value part only.
+    let ambr = crate::gsm_build::encode_session_ambr(ambr_dl_bps, ambr_ul_bps);
+    push(pco_container::NW_SESSION_AMBR, &ambr[1..]);
+    let rules =
+        crate::gsm_build::encode_qos_rules(&[crate::gsm_build::encode_default_qos_rule(flow)]);
+    push(pco_container::NW_QOS_RULES, &rules);
+    let descriptions = crate::gsm_build::encode_qos_flow_descriptions(&[
+        crate::gsm_build::encode_default_qos_flow_description(flow),
+    ]);
+    push(pco_container::NW_QOS_FLOW_DESCRIPTIONS, &descriptions);
+    out
+}
+
+/// TS 29.571 `ArpPriorityLevel`/`PreemptionCapability`/`PreemptionVulnerability` from an EPS
+/// bearer's ARP as TS 29.274 §8.15 codes it (#475).
+///
+/// In the Bearer QoS IE the PCI and PVI bits are *disable* flags: PCI = 1 means
+/// *"shall not trigger pre-emption"*, PVI = 1 means *"not pre-emptable"* (TS 29.274 §8.15,
+/// TS 29.212 §5.3.46/5.3.47). Inverting them would let a bearer configured as protected be
+/// pre-empted after the move, which is why the mapping is written once here.
+pub fn ebi_arp_mapping(ebi: u8, qos: &crate::context::Qos) -> serde_json::Value {
+    serde_json::json!({
+        "epsBearerId": ebi,
+        "arp": {
+            "priorityLevel": qos.arp_priority_level.clamp(1, 15),
+            "preemptCap": if qos.arp_preempt_cap { "NOT_PREEMPT" } else { "MAY_PREEMPT" },
+            "preemptVuln": if qos.arp_preempt_vuln { "NOT_PREEMPTABLE" } else { "PREEMPTABLE" },
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

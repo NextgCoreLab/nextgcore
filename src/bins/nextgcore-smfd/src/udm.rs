@@ -358,7 +358,7 @@ impl EpsInterworkingInd {
 /// (see `eps_iwk`'s note on why the interworking leg is a runtime switch and not a
 /// cargo feature). Blank is treated as unset so an empty value in a compose file does
 /// not register an empty FQDN.
-fn configured_pgw_fqdn() -> Option<String> {
+pub(crate) fn configured_pgw_fqdn() -> Option<String> {
     std::env::var("SMF_PGW_FQDN")
         .ok()
         .map(|s| s.trim().to_string())

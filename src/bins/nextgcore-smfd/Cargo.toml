@@ -51,6 +51,12 @@ base64.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# #475 strict-peer test: drive amfd's REAL N26 → NGAP EPS→5GS handover path against this
+# SMF's REAL SBI handlers, so the two sides of TS 23.502 §4.11.1.2.2 cannot drift — the same
+# dev-only edge lmfd, pcfd, udmd and mmed already have. Not linked into the binary.
+nextgcore-amfd = { path = "../nextgcore-amfd" }
+# The generated NGAP codec decodes the HandoverRequest the AMF builds with it (#417).
+nextgcore-ngap-gen = { path = "../../libs/nextgcore-ngap-gen" }
 proptest.workspace = true
 p256 = { workspace = true, features = ["ecdsa"] }
 

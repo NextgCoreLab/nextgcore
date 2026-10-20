@@ -1456,6 +1456,38 @@ async fn create_session(
     // The bearer is created through `bearer_add` (not a literal) so it gets a context-minted
     // id and is linked into `sess.bearer_ids`; the locally built `bearer` then carries that id
     // forward, because `build_create_session_response` and the modification path both read it.
+    // #475: the PDN connection's 5GS identity. A UE that may later move to 5GS allocated a
+    // PDU session ID for this PDN connection and sent it in the (e)PCO (TS 24.301
+    // §6.5.1.2); this PGW-C+SMF answers with the mapped 5GS parameters (TS 23.502
+    // §4.11.1.1) and keeps both, so an EPS→5GS handover over N26 can find "the corresponding
+    // PDU Session based on EPS Bearer Context(s)" (§4.11.1.2.2.2 step 4). The QoS flow the
+    // default bearer maps onto is identified by the EBI, the same QFI this session's N4 PDRs
+    // were installed with above.
+    bearer.qfi = bc.ebi;
+    let eps_psi = crate::eps_iwk::pdu_session_id_from_pco(req.pco.as_deref(), req.epco.as_deref());
+    let mapped_pco = eps_psi.map(|psi| {
+        sess.eps_psi = Some(psi);
+        sess.s_nssai = crate::eps_iwk::interworking_snssai();
+        let extended = req.epco.is_some();
+        let pco = crate::eps_iwk::build_mapped_5gs_pco(
+            &sess.s_nssai,
+            req.serving_network.unwrap_or_default(),
+            sess.session_ambr.downlink,
+            sess.session_ambr.uplink,
+            &bearer,
+            extended,
+        );
+        log::info!(
+            "S5/S8 Create Session Request from {peer}: the UE allocated PDU session ID {psi} for \
+             APN '{apn}'; answering with its mapped 5GS parameters (S-NSSAI SST {} SD {:?}, QFI \
+             {}) in the {}",
+            sess.s_nssai.sst,
+            sess.s_nssai.sd,
+            bearer.qfi,
+            if extended { "ePCO" } else { "PCO" }
+        );
+        (pco, extended)
+    });
     if let Ok(ctx) = context.read() {
         match ctx.bearer_add(sess.id) {
             Some(stored) => {
@@ -1487,14 +1519,23 @@ async fn create_session(
         std::net::IpAddr::V4(v4) => Some(v4),
         std::net::IpAddr::V6(_) => None,
     };
+    // #475: when the UE allocated a PDU session ID, its (e)PCO is ANSWERED with the mapped
+    // 5GS parameters rather than echoed: a container identifier means something different in
+    // each direction (TS 24.008 Table 10.5.154 -- 001AH is "PDU session ID" from the MS and
+    // "reserved" towards it), so an echo is not an answer.
+    let (pco, epco) = match mapped_pco.as_ref() {
+        Some((mapped, true)) => (req.pco.as_deref(), Some(mapped.as_slice())),
+        Some((mapped, false)) => (Some(mapped.as_slice()), req.epco.as_deref()),
+        None => (req.pco.as_deref(), req.epco.as_deref()),
+    };
     let response = crate::gtp_build::build_create_session_response(
         &sess,
         std::slice::from_ref(&bearer),
         local_ipv4,
         None,
-        req.pco.as_deref(),
+        pco,
         req.apco.as_deref(),
-        req.epco.as_deref(),
+        epco,
         true,
         true,
     );
