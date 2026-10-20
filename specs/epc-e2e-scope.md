@@ -1,5 +1,11 @@
 # The EPC E2E stage asserts bring-up, and says what it does not assert
 
+> **Superseded by #303 (2026-10-20).** Option A landed: nextgsim #186 built a
+> production-level LTE eNB and UE, and the EPC stage now asserts a real attach
+> (default EPS bearer on the same EBI at UE and MME) and a 20-packet 0%-loss ping
+> through S1-U/SGW-U/S5-U/PGW-U, in the nightly job. The option D reasoning
+> below is kept as the record of why the stage was bring-up-only until then.
+
 **Issues:** nextgcore #328 (the decision), #303 (the stage)
 **Verified against:** nextgcore `main` @ `bfcee3e`
 
