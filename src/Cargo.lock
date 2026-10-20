@@ -2756,6 +2756,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextgcore-lpp-gen"
+version = "0.1.0"
+dependencies = [
+ "asn1-codecs",
+ "asn1-compiler",
+ "asn1_codecs_derive",
+ "bitvec",
+ "log",
+ "nextgcore-asn1c",
+]
+
+[[package]]
 name = "nextgcore-mbsmfd"
 version = "0.1.0"
 dependencies = [
@@ -2905,6 +2917,18 @@ dependencies = [
  "time",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "nextgcore-nrppa-gen"
+version = "0.1.0"
+dependencies = [
+ "asn1-codecs",
+ "asn1-compiler",
+ "asn1_codecs_derive",
+ "bitvec",
+ "log",
+ "nextgcore-asn1c",
 ]
 
 [[package]]
