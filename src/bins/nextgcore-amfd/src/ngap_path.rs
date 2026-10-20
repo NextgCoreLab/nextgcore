@@ -1608,19 +1608,22 @@ impl NgapServer {
     ///
     /// Releases the affected UE contexts and responds with NG Reset Acknowledge.
     async fn handle_ng_reset(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
+        use crate::ngap_asn1::NgResetDecode;
         use nextgcore_ngap::types::ResetType;
-        use nextgcore_ngap::{parser::decode_ngap_pdu, NgapMessage};
 
-        let reset = match decode_ngap_pdu(data) {
-            Ok(NgapMessage::NgReset(reset)) => reset,
-            Ok(other) => {
-                log::warn!("Expected NgReset, got {other:?}");
+        // #417: the GENERATED codec, with TS 38.413 §10.3.4.2 applied.
+        let (reset, notify) = match ngap_asn1::decode_ng_reset_asn1(data) {
+            NgResetDecode::Proceed { reset, notify } => (reset, notify),
+            NgResetDecode::Reject(report) => {
+                // No unsuccessful outcome exists for NG Reset, so the procedure
+                // is terminated with an Error Indication and nothing is reset.
+                log::warn!("NG Reset from association {association_id} rejected: {report:?}");
+                if let Some(ei) = ngap_asn1::build_criticality_error_indication_asn1(&report) {
+                    self.send_to_association(association_id, &ei).await?;
+                }
                 return Ok(());
             }
-            Err(e) => {
-                log::warn!("Failed to decode NG Reset: {e:?}");
-                return Ok(());
-            }
+            NgResetDecode::Undecodable => return Ok(()),
         };
 
         let gnb_pool_id = self
@@ -1671,7 +1674,7 @@ impl NgapServer {
         // Release the affected UE contexts and get the list to echo in the Ack
         let ack_connections = ngap_handler::handle_ng_reset(gnb_pool_id, &reset);
 
-        if let Some(ack) = ngap_asn1::build_ng_reset_acknowledge_asn1(ack_connections) {
+        if let Some(ack) = ngap_asn1::build_ng_reset_acknowledge_asn1(ack_connections, &notify) {
             self.send_to_association(association_id, &ack).await?;
             log::info!("NG Reset Acknowledge sent to association {association_id}");
         } else {
@@ -20055,6 +20058,39 @@ mod tests {
             "a whole-interface reset must free the emergency contexts of every UE it \
              drops; the retain-based arm removed their NAS state and left the emergency \
              entries behind"
+        );
+    }
+
+    /// #417: an NG Reset reaches the reset logic through `process_ngap_message`,
+    /// and one carrying a not-comprehended IE marked "reject" executes nothing
+    /// (TS 38.413 §10.3.4.2) -- while the same reset without that IE does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ng_reset_with_a_reject_ie_resets_nothing() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let assoc = 417u64;
+        seed_gnb_session(&ngap, assoc).await;
+        let ue = 7_417_001u64;
+        register_emergency_ue(&mut ngap, assoc, ue);
+
+        let whole = nextgcore_ngap::builder::build_ng_reset(&nextgcore_ngap::types::NgReset {
+            cause: nextgcore_ngap::types::Cause::Misc(
+                nextgcore_asn1c::ngap::cause::CauseMisc::Unspecified,
+            ),
+            reset_type: nextgcore_ngap::types::ResetType::NgInterface,
+        })
+        .expect("build NG Reset");
+        let rejected = crate::ngap_asn1::tests::with_unknown_ie(&whole, 9999, 0x00);
+        let _ = ngap.process_ngap_message(assoc, &rejected).await;
+        assert!(
+            ngap.emergency.emergency_context(ue).is_some(),
+            "a reset carrying a reject IE must not be executed"
+        );
+
+        let _ = ngap.process_ngap_message(assoc, &whole).await;
+        assert!(
+            ngap.emergency.emergency_context(ue).is_none(),
+            "the same reset without the IE must reach the reset logic"
         );
     }
 
