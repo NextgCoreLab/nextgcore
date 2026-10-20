@@ -1966,6 +1966,26 @@ impl AmfContext {
         self.sess_list.read().map(|l| l.len()).unwrap_or(0)
     }
 
+    /// Move every session of a UE to a new owning id (#518).
+    ///
+    /// A CM-IDLE UE returning with a Service Request gets a fresh AMF-UE-NGAP-ID
+    /// (TS 38.413 §8.6.1), and the NGAP layer keys its sessions by that id, so
+    /// without this the UE's PDU sessions would be orphaned under the old one.
+    /// Returns how many sessions moved.
+    pub fn sess_rekey_ue(&self, old_amf_ue_id: u64, new_amf_ue_id: u64) -> usize {
+        let Ok(mut sess_list) = self.sess_list.write() else {
+            return 0;
+        };
+        let mut moved = 0;
+        for sess in sess_list.values_mut() {
+            if sess.amf_ue_id == old_amf_ue_id {
+                sess.amf_ue_id = new_amf_ue_id;
+                moved += 1;
+            }
+        }
+        moved
+    }
+
     /// Get sessions for an AMF UE
     pub fn sess_list_for_ue(&self, amf_ue_id: u64) -> Vec<AmfSess> {
         let sess_list = self.sess_list.read().unwrap();
@@ -4208,6 +4228,11 @@ pub struct PagingContext {
     pub pending_n1: Option<Vec<u8>>,
     /// Pending N2 info to deliver after paging response
     pub pending_n2: Option<Vec<u8>>,
+    /// Whether `pending_n2` is a PDU Session Resource Release Command transfer
+    /// rather than a Setup Request transfer. Only a setup transfer may ride the
+    /// Service Request's Initial Context Setup (TS 38.413 §9.2.2.1); a paged
+    /// release is answered after it with its own Release Command (#518).
+    pub pending_n2_release: bool,
     /// PDU session ID that triggered paging
     pub pdu_session_id: Option<u8>,
     /// The UE's registration area as (PLMN, TAC) pairs: the TAIs PAGING is sent
@@ -4249,6 +4274,7 @@ impl Default for PagingContext {
             max_retransmit: 4,
             pending_n1: None,
             pending_n2: None,
+            pending_n2_release: false,
             pdu_session_id: None,
             tai_list: Vec::new(),
             last_sent: None,

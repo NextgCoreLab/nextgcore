@@ -3956,6 +3956,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     dnn: dnn.clone(),
                     qfi,
                     five_qi: decision.def_five_qi,
+                    arp_priority_level: decision.arp_priority_level,
                     ambr_ul_bps: decision.sess_ambr_ul_bps,
                     ambr_dl_bps: decision.sess_ambr_dl_bps,
                     sm_context_status_uri: sm_context_status_uri.clone(),
@@ -4106,6 +4107,53 @@ fn lookup_upf_seid(sm_context_ref: &str) -> Option<u64> {
             .ok()
             .and_then(|sessions| sessions.get(sm_context_ref).copied())
     })
+}
+
+/// Answer `upCnxState: ACTIVATING` (#518, TS 29.502 §5.2.2.3.2.2): rebuild the
+/// session's PDUSessionResourceSetupRequestTransfer from what establishment
+/// recorded and return it as `n2SmInfo` with `n2SmInfoType: PDU_RES_SETUP_REQ`.
+///
+/// 500 SYSTEM_FAILURE when establishment recorded no UPF uplink endpoint or no
+/// policy binding: there is nothing conformant to activate, and the AMF reports
+/// the session as not re-activated in the Service Accept (TS 24.501 §5.6.1.4.1).
+fn activation_response(sm_context_ref: &str) -> SbiResponse {
+    use nextgcore_sbi::constants::content_type;
+    use nextgcore_sbi::message::SbiPart;
+    let (Some((upf_teid, upf_addr)), Some(binding)) = (
+        lookup_upf_ul_endpoint(sm_context_ref),
+        lookup_policy_binding(sm_context_ref),
+    ) else {
+        log::warn!("UP activation for ref={sm_context_ref}: no recorded UPF endpoint or binding");
+        return problem_response(500, "SYSTEM_FAILURE", "No user plane recorded to activate");
+    };
+    let n2 = match build_setup_request_transfer(
+        upf_teid,
+        upf_addr,
+        binding.qfi,
+        u16::from(binding.five_qi),
+        binding.arp_priority_level,
+    ) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            log::error!("UP activation for ref={sm_context_ref}: transfer encode failed: {e:?}");
+            return problem_response(500, "SYSTEM_FAILURE", "N2 SM information encode failed");
+        }
+    };
+    log::info!(
+        "UP activation for ref={sm_context_ref}: PDU_RES_SETUP_REQ with UPF N3 TEID {upf_teid:#x}"
+    );
+    let body = serde_json::json!({
+        "upCnxState": "ACTIVATING",
+        "n2SmInfoType": "PDU_RES_SETUP_REQ",
+        "n2SmInfo": { "contentId": "n2SmInfo" },
+    });
+    SbiResponse::with_status(200)
+        .with_body(body.to_string(), content_type::APPLICATION_JSON)
+        .with_part(SbiPart::with_content(
+            "n2SmInfo",
+            content_type::APPLICATION_NGAP,
+            bytes::Bytes::copy_from_slice(&n2),
+        ))
 }
 
 /// The UPF's N3 uplink endpoint for an SM context, if establishment recorded one (#70).
@@ -4705,6 +4753,17 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                 let response_body = serde_json::json!({ "upCnxState": "DEACTIVATED" });
                 return SbiResponse::with_status(200)
                     .with_body(response_body.to_string(), "application/json");
+            }
+            if up_cnx_state == "ACTIVATING" {
+                // #518 / TS 29.502 §5.2.2.3.2.2, TS 23.502 §4.2.3.2 step 4-5: the AMF
+                // re-activates the user plane of a session whose UE came back from
+                // CM-IDLE. The SMF answers ACTIVATING with the N2 SM information the
+                // gNB needs (the same PDUSessionResourceSetupRequestTransfer as at
+                // establishment: UPF N3 uplink endpoint + default QoS flow); the DL
+                // FAR is re-activated when the gNB's PDU_RES_SETUP_RSP comes back.
+                // Before #518 this fell to the default below and answered ACTIVATED
+                // with no N2 at all, so the AMF had nothing to put in the ICS.
+                return activation_response(sm_context_ref);
             }
             // Default: treat as activation confirmation
             let response_body = serde_json::json!({ "upCnxState": "ACTIVATED" });
@@ -7885,6 +7944,7 @@ mod tests {
                         dnn: "internet".to_string(),
                         qfi: 1,
                         five_qi: 9,
+                        arp_priority_level: 8,
                         ambr_ul_bps: 100_000_000,
                         ambr_dl_bps: 100_000_000,
                         // No AMF callback URI: nothing to notify, and no
@@ -11522,6 +11582,84 @@ mod path_switch_ack_tests {
             decoded.ul_ngu_up_tnl_information.is_none(),
             "and it says 'no uplink change' rather than naming a tunnel the UPF does not serve"
         );
+    }
+
+    /// #518: `upCnxState: ACTIVATING` is answered with the session's setup transfer
+    /// rebuilt from what establishment recorded -- the UPF N3 uplink endpoint and the
+    /// default flow's QFI / 5QI / ARP -- so the AMF can put it in the Service
+    /// Request's Initial Context Setup. Before #518 the SMF answered ACTIVATED with
+    /// no N2 part, and the returning UE's user plane never came back.
+    #[tokio::test]
+    async fn an_activating_update_returns_the_sessions_setup_transfer() {
+        use nextgcore_ngap::transfer::{
+            PduSessionResourceSetupRequestTransfer, UpTransportLayerInformation,
+        };
+        let r = "act-518-ref";
+        {
+            let ctx = smf_self();
+            let ctx = ctx.read().expect("ctx");
+            ctx.upf_ul_endpoints
+                .write()
+                .expect("w")
+                .insert(r.to_string(), (0x0005_0007, [10, 45, 0, 9]));
+            let mut b = context::PolicyBinding::snapshot_default();
+            b.qfi = 5;
+            b.five_qi = 7;
+            b.arp_priority_level = 3;
+            ctx.policy_bindings
+                .write()
+                .expect("w")
+                .insert(r.to_string(), b);
+        }
+        let resp = activation_response(r);
+        assert_eq!(resp.status, 200);
+        let boundary = nextgcore_sbi::multipart::generate_boundary();
+        let body = nextgcore_sbi::multipart::encode(
+            resp.http.content.as_deref(),
+            &resp.http.parts,
+            &boundary,
+        );
+        let ct = nextgcore_sbi::multipart::content_type_with_boundary(&boundary);
+        let decoded = nextgcore_sbi::multipart::decode(&ct, &body).expect("multipart");
+        let root: serde_json::Value =
+            serde_json::from_str(decoded.json.as_deref().unwrap()).unwrap();
+        assert_eq!(root["upCnxState"], "ACTIVATING");
+        assert_eq!(root["n2SmInfoType"], "PDU_RES_SETUP_REQ");
+        let n2 = decoded
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n2SmInfo"))
+            .expect("n2SmInfo part");
+        assert_eq!(
+            n2.data.as_ref(),
+            build_setup_request_transfer(0x0005_0007, [10, 45, 0, 9], 5, 7, 3).unwrap()
+        );
+        let t = PduSessionResourceSetupRequestTransfer::decode(&n2.data).expect("decode");
+        let UpTransportLayerInformation::GtpTunnel(tun) = &t.ul_ngu_up_tnl_information;
+        assert_eq!(u32::from_be_bytes(tun.gtp_teid), 0x0005_0007);
+        assert_eq!(t.qos_flow_setup_request_list[0].qos_flow_identifier, 5);
+
+        // A context with no recorded user plane has nothing to activate.
+        assert_eq!(activation_response("act-518-none").status, 500);
+
+        // And it is what the /modify dispatcher answers for `upCnxState: ACTIVATING`.
+        let req = nextgcore_sbi::message::SbiRequest::post(format!(
+            "/nsmf-pdusession/v1/sm-contexts/{r}/modify"
+        ))
+        .with_body(
+            serde_json::json!({ "upCnxState": "ACTIVATING" }).to_string(),
+            "application/json",
+        );
+        let routed = handle_sm_context_update(r, &req).await;
+        assert_eq!(routed.status, 200);
+        let routed_root: serde_json::Value =
+            serde_json::from_str(routed.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(routed_root["upCnxState"], "ACTIVATING");
+        assert!(routed
+            .http
+            .parts
+            .iter()
+            .any(|p| p.content_id.as_deref() == Some("n2SmInfo")));
     }
 
     /// The UPF uplink endpoint recorded at establishment is what the acknowledge reads.

@@ -373,6 +373,7 @@ pub fn handle_n1_n2_message_transfer(
                             sess,
                             req_data.n1_message.clone(),
                             n2_info.ngap_data.clone(),
+                            false,
                             req_data.pdu_session_id,
                             req_data.n1n2_failure_txf_notif_uri.as_deref(),
                         );
@@ -401,6 +402,7 @@ pub fn handle_n1_n2_message_transfer(
                             sess,
                             req_data.n1_message.clone(),
                             n2_info.ngap_data.clone(),
+                            true,
                             req_data.pdu_session_id,
                             req_data.n1n2_failure_txf_notif_uri.as_deref(),
                         );
@@ -419,6 +421,27 @@ pub fn handle_n1_n2_message_transfer(
             _ => {
                 log::warn!("Unhandled NGAP IE type: {:?}", n2_info.ngap_ie_type);
             }
+        }
+    }
+
+    // N1-only transfer to a CM-IDLE UE (TS 23.502 §4.2.3.3 step 3a, TS 29.518
+    // §5.2.2.3.1): the AMF pages and answers ATTEMPTING_TO_REACH_UE, and the N1
+    // is delivered once the UE's Service Request arrives (#518). Before #518 this
+    // case fell through with N1_N2_TRANSFER_INITIATED and the message was lost.
+    if req_data.n2_info.is_none() && req_data.n1_message.is_some() && cm_idle {
+        if req_data.skip_ind {
+            cause = N1N2MessageTransferCause::N1MsgNotTransferred;
+        } else {
+            cause = N1N2MessageTransferCause::AttemptingToReachUe;
+            initiate_paging_for_idle_ue(
+                amf_ue,
+                sess,
+                req_data.n1_message.clone(),
+                None,
+                false,
+                req_data.pdu_session_id,
+                req_data.n1n2_failure_txf_notif_uri.as_deref(),
+            );
         }
     }
 
@@ -668,6 +691,7 @@ fn initiate_paging_for_idle_ue(
     sess: &mut AmfSess,
     pending_n1: Option<Vec<u8>>,
     pending_n2: Option<Vec<u8>>,
+    pending_n2_release: bool,
     pdu_session_id: Option<u8>,
     failure_notify_uri: Option<&str>,
 ) {
@@ -692,6 +716,7 @@ fn initiate_paging_for_idle_ue(
         max_retransmit: 4,
         pending_n1,
         pending_n2,
+        pending_n2_release,
         pdu_session_id,
         // The registration area this AMF assigned: the single TAI the
         // Registration Accept's TAI list carries (`gmm_build`, list type 00).
@@ -795,6 +820,42 @@ mod tests {
             result.unwrap_err(),
             NamfHandlerError::MissingField(_)
         ));
+    }
+
+    /// #518 / TS 23.502 §4.2.3.3 step 3a: an N1-only transfer to a CM-IDLE UE pages
+    /// it and keeps the N1 for delivery after the Service Request. Before #518 the
+    /// N1-only case fell through as N1_N2_TRANSFER_INITIATED and nothing was sent.
+    #[test]
+    fn an_n1_only_transfer_to_an_idle_ue_pages_and_keeps_the_n1() {
+        let mut ue = create_test_ue();
+        ue.id = 5_180_001;
+        let mut sess = create_test_sess();
+        let n1 = vec![0x2E, 0x01, 0x01, 0xCB];
+        let req = N1N2MessageTransferReqData {
+            pdu_session_id: Some(1),
+            n1_message: Some(n1.clone()),
+            n2_info: None,
+            ..Default::default()
+        };
+        let rsp = handle_n1_n2_message_transfer(&ue, &mut sess, None, true, &req).expect("ok");
+        assert_eq!(rsp.cause, N1N2MessageTransferCause::AttemptingToReachUe);
+        let paged = crate::context::amf_self()
+            .read()
+            .unwrap()
+            .paging_find(5_180_001)
+            .expect("the UE is paged");
+        assert_eq!(paged.pending_n1, Some(n1));
+        assert!(paged.pending_n2.is_none() && !paged.pending_n2_release);
+
+        // CM-CONNECTED: no page.
+        ue.id = 5_180_002;
+        let rsp = handle_n1_n2_message_transfer(&ue, &mut sess, None, false, &req).expect("ok");
+        assert_eq!(rsp.cause, N1N2MessageTransferCause::N1N2TransferInitiated);
+        assert!(crate::context::amf_self()
+            .read()
+            .unwrap()
+            .paging_find(5_180_002)
+            .is_none());
     }
 
     #[test]
