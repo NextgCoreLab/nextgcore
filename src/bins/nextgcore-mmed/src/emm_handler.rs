@@ -553,9 +553,29 @@ pub fn handle_security_mode_complete(
     }
 
     mme_ue.security_context_available = true;
+    take_security_context_into_use(mme_ue);
     log::info!("Security mode complete for IMSI[{}]", mme_ue.imsi_bcd);
 
     Ok(imeisv)
+}
+
+/// Derive the AS base key now that the NAS security context is in use (#480).
+///
+/// TS 33.401 §7.2.6.2 / Annex A.3: K_eNB = KDF(K_ASME, FC 0x11, uplink NAS COUNT
+/// of the SECURITY MODE COMPLETE that took the context into use) — 0 for a fresh
+/// context. `ul_count` already holds that COUNT: the dispatcher verified this
+/// message against it before calling the handler. The INITIAL CONTEXT SETUP's
+/// Security Key (TS 36.413 §9.2.1.41) is `kenb`; before this nothing assigned it
+/// outside N26, so the eNB received zeros and the UE's AS SMC MAC-I check failed
+/// (§7.2.4.5).
+///
+/// The NH chain restarts from this K_eNB: NCC 0, and the first NH is derived from
+/// K_eNB as sync input (Annex A.4), which is what `next_hop_advance` does when
+/// `nhcc == 0`.
+fn take_security_context_into_use(mme_ue: &mut MmeUe) {
+    mme_ue.kenb = nextgcore_crypt::kdf::nextgcore_kdf_kenb(&mme_ue.kasme, mme_ue.ul_count);
+    mme_ue.nhcc = 0;
+    mme_ue.nh = [0; 32];
 }
 
 // ============================================================================

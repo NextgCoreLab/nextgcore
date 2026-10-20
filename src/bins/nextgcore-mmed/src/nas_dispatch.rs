@@ -2703,6 +2703,56 @@ mod tests {
         assert_released_after_attach_reject(&ctx, enb_ue_id);
     }
 
+    /// #480, TS 33.401 Annex A.3: SECURITY MODE COMPLETE takes the NAS context
+    /// into use, and K_eNB = HMAC-SHA256(K_ASME, 0x11 || UL NAS COUNT || 0x0004)
+    /// with the COUNT of that SECURITY MODE COMPLETE. The expected keys were
+    /// computed with an independent HMAC-SHA256, not with nextgcore-crypt. Before,
+    /// nothing derived K_eNB, and the INITIAL CONTEXT SETUP carried zeros.
+    #[test]
+    fn security_mode_complete_derives_kenb_from_its_ul_count() {
+        for (kasme, sqn, expected) in [
+            (
+                core::array::from_fn::<u8, 32, _>(|i| i as u8),
+                0u8,
+                "e6267359de012d9bda173d1b6fae57dec0e04e01cfcf57cb33a7573f142b8b95",
+            ),
+            (
+                [0x5a; 32],
+                3u8,
+                "4bc069d9dea0c817703932ee49453db68b557317a08fd587cde7714b840d97ec",
+            ),
+        ] {
+            let ctx = test_ctx();
+            let enb_ue_id = enb_with_connection(&ctx);
+            let mme_ue_id = ue_with_vector(&ctx, enb_ue_id);
+            nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &authentication_response()));
+            {
+                let mut pool = ctx.mme_ue_pool.write().unwrap();
+                let mme_ue = pool.get_mut(&mme_ue_id).unwrap();
+                mme_ue.kasme = kasme;
+                mme_ue.nhcc = 5; // stale chain from an earlier context
+                mme_ue.nh = [0xee; 32];
+            }
+            let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+            let complete = protect_uplink(
+                &mme_ue,
+                sqn,
+                &[
+                    NAS_PROTOCOL_DISCRIMINATOR_EMM,
+                    NasEpsMessageType::SecurityModeComplete as u8,
+                ],
+            );
+            nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &complete));
+
+            let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+            assert!(mme_ue.security_context_available);
+            let hex: String = mme_ue.kenb.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(hex, expected, "K_eNB for UL NAS COUNT {sqn}");
+            assert_eq!(mme_ue.nhcc, 0, "the NH chain restarts from the new K_eNB");
+            assert_eq!(mme_ue.nh, [0; 32]);
+        }
+    }
+
     #[test]
     fn test_protected_uplink_round_trip_completes_the_security_procedure() {
         let ctx = test_ctx();
