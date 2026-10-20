@@ -2426,9 +2426,9 @@ pub struct GnbN3Endpoint {
 ///
 /// The AMF only logs the result: the transfer is the SMF's, relayed whatever
 /// this says. #417 stage 6 decodes it with the generated codec, skipping
-/// protocol extensions the schema does not know, as the hand-written decoder
-/// did by never reading the extension container. Every transfer that decoder
-/// accepted gives the same endpoint
+/// protocol extensions the schema does not know; the hand-written decoder
+/// consumes them too since #469 (it used to read past the extension
+/// container). Every transfer that decoder accepted gives the same endpoint
 /// (`n2_sm_setup_response_transfer_generated_matches_hand_written`).
 ///
 /// It also reads the optional Additional DL QoS Flow per TNL Information as the
@@ -2436,10 +2436,10 @@ pub struct GnbN3Endpoint {
 /// codec now does too (#462; it used to read a single element and misread a
 /// dual-connectivity gNB's additional tunnel).
 ///
-/// Neither the fork's encoder nor its decoder octet-aligns a variable-size BIT
-/// STRING of 16 bits or fewer (X.691 §16.11 aligns it whatever its length), so
-/// a Transport Layer Address that short is read differently from the
-/// hand-written decoder. No GTP-U endpoint is that short: IPv4 is 32 bits.
+/// Since nextgsim #226 the fork octet-aligns a variable-size BIT STRING
+/// whatever its length (X.691 §16.11), as the hand-written codec does, so the
+/// two read a Transport Layer Address of any length the same way, 16 bits or
+/// fewer included (`transport_layer_addresses_of_16_bits_or_fewer_agree`).
 ///
 /// A DL tunnel's `iE-Extensions` entries are skipped like the transfer's own
 /// unknown extensions: GTPTunnel's extension object set is empty, so every
@@ -6599,7 +6599,7 @@ pub(crate) mod tests {
 
     /// #417 stage 6: for every Setup Response Transfer the hand-written decoder
     /// accepted -- IPv4/IPv6/IPv4v6 and odd-length addresses of more than 16
-    /// bits (see `transport_layer_addresses_of_16_bits_or_fewer_diverge`), TEID extremes,
+    /// bits (shorter ones: `transport_layer_addresses_of_16_bits_or_fewer_agree`), TEID extremes,
     /// 1, 2 and 64 associated flows with and without a mapping indication, a
     /// Security Result, a failed-flow list with causes -- the generated decode
     /// gives the same endpoint; garbage stays refused.
@@ -6784,27 +6784,28 @@ pub(crate) mod tests {
         assert_eq!(old.encode().expect("old encode"), bytes);
     }
 
-    /// The fork's BIT STRING codec octet-aligns a variable-size bit string only
-    /// when it is longer than 16 bits; X.691 §16.11 aligns it whatever its
-    /// length, as the hand-written codec does. So a Transport Layer Address of
-    /// 16 bits or fewer -- which no GTP-U endpoint is -- encodes differently and
-    /// the generated decoder misreads the hand-written form. Pinned so a fix in
-    /// the fork shows up here; from 17 bits up the two agree (the variant
-    /// matrix above).
+    /// X.691 §16.11 octet-aligns a variable-size BIT STRING whatever its
+    /// length, as the hand-written codec does. The fork used to align only
+    /// strings longer than 16 bits, so a Transport Layer Address of 16 bits or
+    /// fewer encoded differently and was misread; since nextgsim #226 (PR #227)
+    /// both codecs give the same bytes and the same endpoint. From 17 bits up
+    /// the variant matrix above covers it.
     #[test]
-    fn transport_layer_addresses_of_16_bits_or_fewer_diverge() {
+    fn transport_layer_addresses_of_16_bits_or_fewer_agree() {
         for bits in [1usize, 8, 15, 16] {
             let mut t = request_transfer_variants()[0].clone();
             t.ul_ngu_up_tnl_information = ul_tunnel(&[0xff; 20], bits, 0);
             let old = t.encode().expect("hand-written encode");
             let new = nextgcore_ngap_gen::encode_contained(&generated_request_transfer(&t))
                 .expect("generated encode");
-            assert_ne!(new, old, "{bits} bits");
+            assert_eq!(new, old, "{bits} bits");
             let response = hand_written_response_transfer(&[0xff; 20], bits, 0, &[9])
                 .encode()
                 .expect("encode");
-            assert_ne!(
-                parse_n2_sm_setup_response_transfer(&response),
+            let parsed = parse_n2_sm_setup_response_transfer(&response);
+            assert!(parsed.is_some(), "{bits} bits");
+            assert_eq!(
+                parsed,
                 hand_written_parse_n2_sm_setup_response_transfer(&response),
                 "{bits} bits"
             );

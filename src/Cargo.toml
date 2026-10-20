@@ -148,21 +148,24 @@ rasn-derive = "0.18"
 # What bounds the cost: the compiler is a build-dependency only, so only
 # asn1-codecs and asn1_codecs_derive link into the artifact. The rev pin means
 # nextgsim's main can move, vendor/ refactors included, without touching this
-# build until someone bumps the rev deliberately. fbc8284 is nextgsim main
+# build until someone bumps the rev deliberately. aa3dc2b is nextgsim main
 # after #215/#216/#217 (SEQUENCE OF SIZE enforced on encode, extension
 # ENUMERATED values, opt-in skipping of unknown IEs with their criticality,
 # needed from #417 stage 3), #219 (an entry of an EMPTY extension object set
 # is a real open-type entry, not zero bits -- nextgsim #218 -- which let amfd
 # drop its iE-Extensions refusal guards) and #223 (X.691 §11.9.3.8 length
 # fragmentation on encode and decode -- nextgsim #222 -- which lifts the
-# 16,383-octet ceiling #417 stages 6 and 7 had to accept). Like the previous
-# pins 6b97b4b and 20495c0, and
+# 16,383-octet ceiling #417 stages 6 and 7 had to accept) and #227 (APER
+# octet-aligns variable-size BIT STRING and OCTET STRING content whatever its
+# length, X.691 §16.11/§17.8 -- nextgsim #226 -- so TransportLayerAddresses of
+# 16 bits or fewer match the hand-written codec). Like the previous pins
+# fbc8284, 6b97b4b and 20495c0, and
 # unlike 67a0d79 -- the nextgsim half of validated pair run 36409112147 -- it
 # is not yet part of a validated pair. The vendor crates are not nextgsim workspace members; cargo finds them
 # by name in the clone.
-asn1-compiler = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "fbc82842450589b487db1a6fabb899f3eed19046" }
-asn1-codecs = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "fbc82842450589b487db1a6fabb899f3eed19046" }
-asn1_codecs_derive = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "fbc82842450589b487db1a6fabb899f3eed19046" }
+asn1-compiler = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "aa3dc2b5c605f603c46addea42af6c7e374242c6" }
+asn1-codecs = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "aa3dc2b5c605f603c46addea42af6c7e374242c6" }
+asn1_codecs_derive = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "aa3dc2b5c605f603c46addea42af6c7e374242c6" }
 bitvec = "1"
 
 # Protocol libraries - using existing Rust crates where available
@@ -256,9 +259,9 @@ dead_code = "allow"
 # codec whose extended-CHOICE encoder still refuses. nextgsim's own Cargo.toml
 # patches the same three crates for the same reason.
 [patch.crates-io]
-asn1-compiler = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "fbc82842450589b487db1a6fabb899f3eed19046" }
-asn1-codecs = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "fbc82842450589b487db1a6fabb899f3eed19046" }
-asn1_codecs_derive = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "fbc82842450589b487db1a6fabb899f3eed19046" }
+asn1-compiler = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "aa3dc2b5c605f603c46addea42af6c7e374242c6" }
+asn1-codecs = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "aa3dc2b5c605f603c46addea42af6c7e374242c6" }
+asn1_codecs_derive = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "aa3dc2b5c605f603c46addea42af6c7e374242c6" }
 # sctp-proto 0.6.0 patched to carry any SCTP PPID verbatim (#467; same patch as
 # nextgsim #220): upstream (0.6.0 and 0.10.7 alike) maps every non-WebRTC PPID to
 # `Unknown`, which goes on the wire as 58, so NGAP 60 and S1AP 18 were rewritten.
