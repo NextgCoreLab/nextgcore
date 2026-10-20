@@ -203,12 +203,16 @@ pub fn build_forward_relocation_request(
 
     // E-UTRAN Transparent Container (C) at instance 0: the gNB's Source-to-Target container,
     // relayed verbatim. The AMF does not decode it (§9.3.1.29 is an NG-RAN structure).
+    //
+    // #476: as an F-Container (TS 29.274 §8.48, Figure 8.48-1) — octet 5 is
+    // `Spare | Container Type`, the container starts at octet 6, and Table 7.3.1-1 requires
+    // Container Type 3 for the E-UTRAN Transparent Container. Writing the container as the
+    // whole IE value made a conformant MME read its first octet as the Container Type.
     if !source_to_target_container.is_empty() {
-        msg.add_ie(Gtp2Ie::from_slice(
-            Gtp2IeType::FContainer as u8,
-            0,
-            source_to_target_container,
-        ));
+        let mut value = Vec::with_capacity(1 + source_to_target_container.len());
+        value.push(crate::n26_eps_to_5gs::F_CONTAINER_TYPE_EUTRAN);
+        value.extend_from_slice(source_to_target_container);
+        msg.add_ie(Gtp2Ie::from_slice(Gtp2IeType::FContainer as u8, 0, &value));
     }
 
     // Target Identification (C) at instance 0.
@@ -416,9 +420,17 @@ pub fn parse_forward_relocation_response(
     // F-Container instance 0 is the E-UTRAN Transparent Container, i.e. the Target-to-Source
     // one in this direction (`:19258`). Instance 1 would be UTRAN's and instance 2 a BSS
     // container -- neither reachable from this core.
-    let target_to_source_container = msg
-        .get_ie(Gtp2IeType::FContainer as u8, 0)
-        .map(|ie| ie.value.to_vec());
+    //
+    // #476: the IE is an F-Container (§8.48): the Container Type octet is stripped and checked
+    // rather than relayed, or the source gNB would receive a spurious leading `0x03`. A
+    // container of another type, or with no container field, is `None` — not an E-UTRAN
+    // Transparent Container, so there is nothing to give the source gNB.
+    let target_to_source_container = msg.get_ie(Gtp2IeType::FContainer as u8, 0).and_then(|ie| {
+        let (&type_octet, container) = ie.value.split_first()?;
+        (type_octet & 0x0F == crate::n26_eps_to_5gs::F_CONTAINER_TYPE_EUTRAN
+            && !container.is_empty())
+        .then(|| container.to_vec())
+    });
 
     // `List of Set-up Bearers` is Bearer Context at instance 0 (`:19167`). Instance 1 is
     // `List of Set-up RABs` and 2 `List of Set-up PFCs`, both UTRAN/GERAN, and 3 is the SCEF
@@ -686,9 +698,10 @@ mod tests {
             .expect("F-Container IE");
         assert_eq!(
             container.value.as_ref(),
-            &[0xAA, 0xBB],
-            "the gNB's Source-to-Target container must travel byte-for-byte: it is an NG-RAN \
-             structure the AMF has no business re-encoding"
+            &[0x03, 0xAA, 0xBB],
+            "TS 29.274 Figure 8.48-1: Container Type 3 (Table 7.3.1-1) in octet 5, then the \
+             gNB's Source-to-Target container byte-for-byte: it is an NG-RAN structure the AMF \
+             has no business re-encoding"
         );
 
         // Target Identification and Selected PLMN ID.
@@ -814,7 +827,7 @@ mod tests {
         msg.add_ie(Gtp2Ie::from_slice(
             Gtp2IeType::FContainer as u8,
             0,
-            &[0xCC, 0xDD],
+            &[0x03, 0xCC, 0xDD],
         ));
         msg.add_ie(with_forwarding.to_ie(0));
         msg.add_ie(without.to_ie(0));

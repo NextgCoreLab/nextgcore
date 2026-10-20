@@ -336,14 +336,10 @@ fn record_forward_relocation_outcome(amf_ue_ngap_id: u64, outcome: ForwardReloca
     }
 }
 
-// There is deliberately **no public `forward_relocation_outcome(ue)` reader**, and the absence
-// is deliberate rather than an omission. The first draft had one, on the theory that `ngap_path`
-// would consult it when building the HandoverCommand — and it ended up with **zero callers**,
-// because the outcome arrives asynchronously on the N26 receive loop and that is where the
-// HandoverCommand decision is therefore computed (`handle_forward_relocation_response` calls
-// `ngap_path::inter_system_handover_command` directly). A public accessor nothing reads is the
-// same "correct but unreachable" defect as an unreachable encoder, one layer up, so it was
-// removed rather than kept for a caller that may never arrive.
+// There is deliberately **no public `forward_relocation_outcome(ue)` reader**: the outcome is
+// handed to the NGAP layer as a [`FivegsToEpsAnswer`] on a queue (#476), because the N26 receive
+// loop is where it arrives and the NGAP server is what owns the source gNB's association. A
+// reader polled by `ngap_path` would be a second, racier route to the same fact.
 //
 // The map itself is read by `forward_relocation_mme_teid_for_peer` below, which is what addresses
 // the Forward Relocation Complete Acknowledge.
@@ -461,6 +457,39 @@ impl std::fmt::Debug for EpsToFivegsPreparation {
             .field("sessions", &self.sessions.len())
             .finish_non_exhaustive()
     }
+}
+
+/// A 5GS→EPS preparation the target MME has answered, waiting for the NGAP layer to send the
+/// HANDOVER COMMAND or the HANDOVER PREPARATION FAILURE to the source gNB (#476).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FivegsToEpsAnswer {
+    /// The UE, as the NGAP layer names it.
+    pub amf_ue_ngap_id: u64,
+    /// What the target MME concluded.
+    pub outcome: ForwardRelocationOutcome,
+}
+
+/// Answers waiting for the NGAP layer, drained by `ngap_path`'s poll loop — the same hand-off
+/// as [`EPS_TO_5GS_PREPARATIONS`], for the same reason: the N26 receive loop does not own the
+/// SCTP association the source gNB is on.
+static FIVEGS_TO_EPS_ANSWERS: std::sync::Mutex<Vec<FivegsToEpsAnswer>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Queue a 5GS→EPS answer for the NGAP layer.
+pub fn enqueue_fivegs_to_eps_answer(answer: FivegsToEpsAnswer) {
+    FIVEGS_TO_EPS_ANSWERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(answer);
+}
+
+/// Take every queued 5GS→EPS answer.
+pub fn drain_fivegs_to_eps_answers() -> Vec<FivegsToEpsAnswer> {
+    std::mem::take(
+        &mut *FIVEGS_TO_EPS_ANSWERS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    )
 }
 
 /// Preparations waiting for the NGAP layer, drained by `ngap_path`'s poll loop.
@@ -972,10 +1001,37 @@ impl N26Server {
                 data.cause,
                 pending.amf_ue_ngap_id
             );
-            record_forward_relocation_outcome(
-                pending.amf_ue_ngap_id,
-                ForwardRelocationOutcome::Refused { cause: data.cause },
+            let outcome = ForwardRelocationOutcome::Refused { cause: data.cause };
+            record_forward_relocation_outcome(pending.amf_ue_ngap_id, outcome.clone());
+            // #476: the source gNB is told, rather than left to time out its T304.
+            enqueue_fivegs_to_eps_answer(FivegsToEpsAnswer {
+                amf_ue_ngap_id: pending.amf_ue_ngap_id,
+                outcome,
+            });
+            return;
+        }
+
+        // Table 7.3.2-1: the E-UTRAN Transparent Container is present when the relocation is
+        // accepted toward E-UTRAN, and the HANDOVER COMMAND cannot be built without it
+        // (§9.2.3.2 makes Target to Source Transparent Container mandatory). An accept without
+        // one — or with one of the wrong Container Type — cannot complete, so the source gNB is
+        // answered with a preparation failure. The MME is not told: this core has no Relocation
+        // Cancel, so it releases what it reserved on its own timer.
+        if data.target_to_source_container.is_none() {
+            log::warn!(
+                "N26 Forward Relocation Response from {peer} (seq={seq}) accepted UE {} but \
+                 carried no E-UTRAN Transparent Container (Container Type 3): the HandoverCommand \
+                 has nothing to carry, so the preparation is refused to the source gNB",
+                pending.amf_ue_ngap_id
             );
+            let outcome = ForwardRelocationOutcome::Refused {
+                cause: crate::n26_eps_to_5gs::CAUSE_CONDITIONAL_IE_MISSING,
+            };
+            record_forward_relocation_outcome(pending.amf_ue_ngap_id, outcome.clone());
+            enqueue_fivegs_to_eps_answer(FivegsToEpsAnswer {
+                amf_ue_ngap_id: pending.amf_ue_ngap_id,
+                outcome,
+            });
             return;
         }
 
@@ -1048,30 +1104,14 @@ impl N26Server {
             dl_count_used: pending.dl_count_used,
         };
 
-        // The HandoverCommand decision, computed HERE because this is where the target's answer
-        // lands. `ngap_path::inter_system_handover_command` owns the decision and this is its
-        // production caller -- the transmission itself needs the NGAP server's SCTP
-        // association, which `ngap_path` holds.
-        if let Some(command) = crate::ngap_path::inter_system_handover_command(&outcome) {
-            log::info!(
-                "N26 Forward Relocation for UE {}: the HandoverCommand to the source gNB \
-                 carries a {}-octet target-to-source container and an EMPTY PDU Session \
-                 Resource Handover List. Bearers handed over WITHOUT data forwarding: {:?} -- \
-                 downlink data in flight at the source gNB for those is DISCARDED. \
-                 Additionally, the 8 LSB of the downlink NAS COUNT used for K_ASME' is \
-                 {:#04x} and is NOT put on the wire: TS 33.501 §8.3.2 step 7 carries it in the \
-                 NAS Security Parameters from NG-RAN IE (TS 38.413 §9.3.3.26), for which \
-                 build_handover_command has no arm. CONSEQUENCE: a real UE cannot estimate the \
-                 COUNT and so cannot derive the same K_ASME', so this handover's NAS security \
-                 does not interoperate even though the MME side is correct.",
-                pending.amf_ue_ngap_id,
-                command.target_to_source_container.len(),
-                command.bearers_without_forwarding,
-                command.nas_count_lsb
-            );
-        }
-
-        record_forward_relocation_outcome(pending.amf_ue_ngap_id, outcome);
+        // #476: the HandoverCommand is SENT by the NGAP layer, which owns the source gNB's
+        // association; this used to compute the decision and only log it, so the source gNB
+        // never received a command and the UE never moved.
+        record_forward_relocation_outcome(pending.amf_ue_ngap_id, outcome.clone());
+        enqueue_fivegs_to_eps_answer(FivegsToEpsAnswer {
+            amf_ue_ngap_id: pending.amf_ue_ngap_id,
+            outcome,
+        });
     }
 
     /// Handle a **Forward Relocation Complete Notification** (TS 29.274 §7.3.3, type 135) and
