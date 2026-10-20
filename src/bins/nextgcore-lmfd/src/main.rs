@@ -5638,43 +5638,18 @@ lmf:
         msg.encode().expect("encode sidelink-ranging lpp").to_vec()
     }
 
-    /// Encode an NRPPa E-CID Measurement Report (serving cell + TA + RSRP).
+    /// Encode an NRPPa E-CID Measurement Report (serving cell + TA + RSRP), on the
+    /// generated codec.
     fn build_nrppa_ecid_report() -> Vec<u8> {
-        use nextgcore_asn1c::nrppa::ies::{
-            ECidMeasurementResult, MeasuredResults, MeasuredResultsValue, NgRanCell, NgRanCgi,
-            PlmnIdentity, ResultRsrpEutraItem, Tac, UeMeasurementId,
-        };
-        use nextgcore_asn1c::nrppa::pdu::build_ecid_measurement_report;
-        use nextgcore_asn1c::nrppa::types::NrppaTransactionId;
-        let e_cid = ECidMeasurementResult {
-            serving_cell_id: NgRanCgi {
-                plmn_identity: PlmnIdentity([0x02, 0xF8, 0x39]),
-                ng_ran_cell: NgRanCell::NrCellId(0x000000001),
-            },
-            serving_cell_tac: Tac([0x00, 0x12, 0x34]),
-            ng_ran_access_point_position: None,
-            measured_results: Some(MeasuredResults {
-                values: vec![
-                    MeasuredResultsValue::ValueTimingAdvanceType1(500),
-                    MeasuredResultsValue::ResultRsrp(vec![ResultRsrpEutraItem {
-                        pci_eutra: 42,
-                        earfcn: 1850,
-                        value_rsrp_eutra: 60,
-                    }]),
-                ],
-            }),
-        };
-        build_ecid_measurement_report(
-            NrppaTransactionId(1),
-            UeMeasurementId(42),
-            UeMeasurementId(7),
-            &e_cid,
-            None,
+        use crate::nrppa_uplink::test_support::{ecid_report, nr_cgi, rsrp, ta1};
+        ecid_report(
+            1,
+            42,
+            7,
+            nr_cgi([0x02, 0xF8, 0x39], 0x000000001),
+            [0x00, 0x12, 0x34],
+            Some(vec![ta1(500), rsrp(&[60])]),
         )
-        .expect("build NRPPa E-CID report")
-        .encode()
-        .expect("NrppaPdu::encode")
-        .to_vec()
     }
 
     /// Build an inbound notify `SbiRequest` (jsonData root + one binary part).
@@ -6853,14 +6828,7 @@ mod positioning_chain_strict_peer {
     /// handler, which queues it toward the serving gNB.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_an_erroneous_nrppa_report_is_answered_with_an_error_indication_via_real_amfd() {
-        use nextgcore_asn1c::nrppa::ies::{
-            ECidMeasurementResult, MeasuredResults, MeasuredResultsValue, NgRanCell, NgRanCgi,
-            PlmnIdentity, ProtocolIeField, ResultRsrpEutraItem, Tac, UeMeasurementId,
-        };
-        use nextgcore_asn1c::nrppa::pdu::{
-            build_ecid_measurement_report, InitiatingMessageValue, NrppaPdu,
-        };
-        use nextgcore_asn1c::nrppa::types::{Criticality, NrppaTransactionId, ProtocolIeId};
+        use crate::nrppa_uplink::test_support::{ecid_report, nr_cgi, rsrp, splice_ie};
         use nextgcore_nrppa_gen::generated as gen;
 
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
@@ -6907,41 +6875,19 @@ mod positioning_chain_strict_peer {
             (corr, req.request_id)
         };
 
-        // A valid report plus one unknown IE marked reject.
-        let mut pdu = build_ecid_measurement_report(
-            NrppaTransactionId(77),
-            UeMeasurementId(1),
-            UeMeasurementId(5),
-            &ECidMeasurementResult {
-                serving_cell_id: NgRanCgi {
-                    plmn_identity: PlmnIdentity([0x02, 0xf8, 0x39]),
-                    ng_ran_cell: NgRanCell::NrCellId(1),
-                },
-                serving_cell_tac: Tac([0x00, 0x00, 0x01]),
-                ng_ran_access_point_position: None,
-                measured_results: Some(MeasuredResults {
-                    values: vec![MeasuredResultsValue::ResultRsrp(vec![
-                        ResultRsrpEutraItem {
-                            pci_eutra: 1,
-                            earfcn: 1850,
-                            value_rsrp_eutra: 60,
-                        },
-                    ])],
-                }),
-            },
-            None,
-        )
-        .unwrap();
-        if let NrppaPdu::InitiatingMessage(m) = &mut pdu {
-            if let InitiatingMessageValue::ECidMeasurementReport(c) = &mut m.value {
-                c.push(ProtocolIeField {
-                    id: ProtocolIeId(9999),
-                    criticality: Criticality::Reject,
-                    value: vec![0x00],
-                });
-            }
-        }
-        let nrppa = pdu.encode().unwrap().to_vec();
+        // A valid report plus one unknown IE marked reject (criticality 0).
+        let nrppa = splice_ie(
+            &ecid_report(
+                77,
+                1,
+                5,
+                nr_cgi([0x02, 0xf8, 0x39], 1),
+                [0x00, 0x00, 0x01],
+                Some(vec![rsrp(&[60])]),
+            ),
+            9999,
+            0,
+        );
 
         let json = format!(
             "{{\"n2NotifySubscriptionId\":\"sub-515\",\

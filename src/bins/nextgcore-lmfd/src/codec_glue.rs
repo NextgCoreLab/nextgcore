@@ -6,9 +6,10 @@
 //!
 //! Two public adapter functions:
 //!
-//! - [`nrppa_ecid_report_to_measurements`] — E-CID Measurement Report
-//!   (procedure code 4): serving-cell `NgRanCgi` → `nr_cgi`; `measured_results`
-//!   CHOICE → `timing_advance`, `aoa`, `rsrp`, `rsrq`.
+//! - [`decode_nrppa_ecid_report`] — E-CID Measurement Report (procedure code 4),
+//!   decoded and adapted by [`crate::nrppa_uplink`] on the generated NRPPa codec:
+//!   serving-cell NG-RAN-CGI → `nr_cgi`; measuredResults CHOICE →
+//!   `timing_advance`, `aoa`, `rsrp`, `rsrq`.
 //!
 //! - [`lpp_multi_rtt_provide_to_measurements`] — ProvideLocationInformation →
 //!   nr-Multi-RTT list: `nr_ue_rx_tx_time_diff` k0..k5 CHOICE → `rtt_ns`
@@ -31,10 +32,6 @@ use nextgcore_asn1c::lpp::nr_dl_tdoa::NrRstd;
 use nextgcore_asn1c::lpp::requested_measurements;
 use nextgcore_asn1c::lpp::sidelink_ranging::SidelinkRangingMethod;
 use nextgcore_asn1c::lpp::types::{Initiator, LppTransactionId, TransactionNumber};
-#[cfg(test)]
-use nextgcore_asn1c::nrppa::ies::{MeasuredResultsValue, NgRanCell};
-#[cfg(test)]
-use nextgcore_asn1c::nrppa::pdu::{parse_ecid_measurement_report, NrppaPdu};
 
 /// Encode an LMF-initiated LPP `RequestLocationInformation` (TS 37.355 §6.2,
 /// message body c1 index 4) requesting E-CID measurements (rsrpReq + rsrqReq),
@@ -428,18 +425,6 @@ const TC_NS: f64 = 1_000_000_000.0 / (480_000.0 * 4_096.0);
 // Private helpers
 // ---------------------------------------------------------------------------
 
-/// Format an `NgRanCgi` as `"<plmn-6hex>-<cellid-9hex>"` for NR cells, or
-/// `"<plmn-6hex>-e<cellid-7hex>"` for E-UTRA cells.
-#[cfg(test)]
-fn ng_ran_cgi_to_string(cgi: &nextgcore_asn1c::nrppa::ies::NgRanCgi) -> String {
-    let p = &cgi.plmn_identity.0;
-    let plmn = format!("{:02x}{:02x}{:02x}", p[0], p[1], p[2]);
-    match cgi.ng_ran_cell {
-        NgRanCell::NrCellId(id) => format!("{plmn}-{id:09x}"),
-        NgRanCell::EutraCellId(id) => format!("{plmn}-e{id:07x}"),
-    }
-}
-
 /// Convert an NR-UE-Rx-Tx-TimeDiff k0..k5 CHOICE value to nanoseconds as an
 /// unsigned magnitude `v × 2^n × T_c`, used by the Multi-RTT path for ranging.
 ///
@@ -491,89 +476,6 @@ fn nrrstd_to_signed_ns(rstd: &NrRstd) -> f64 {
 // NRPPa E-CID adapter
 // ---------------------------------------------------------------------------
 
-/// Adapt a decoded NRPPa APER PDU carrying an E-CID Measurement Report
-/// (TS 38.455 §8.6, procedure code 4) into a flat list of
-/// [`CellMeasurement`]s suitable for [`crate::LmfContext::measurement_report`].
-///
-/// The serving cell's `NgRanCgi` is used as `nr_cgi`.  The `measured_results`
-/// CHOICE variants are folded into the single serving-cell entry:
-///
-/// | CHOICE variant               | `CellMeasurement` field | Notes                         |
-/// |------------------------------|-------------------------|-------------------------------|
-/// | `ValueAngleOfArrival(deg)`   | `aoa`                   | 0..719 degrees; first wins    |
-/// | `ValueTimingAdvanceType1/2`  | `timing_advance`        | 0..7690 TA units; first wins  |
-/// | `ResultRsrp(items)`          | `rsrp`                  | best item, value − 140 → dBm  |
-/// | `ResultRsrq(items)`          | `rsrq`                  | best item raw 0..34 index     |
-///
-/// Returns an empty `Vec` on decode failure or when `measured_results` is absent.
-#[cfg(test)]
-pub fn nrppa_ecid_report_to_measurements(pdu: &NrppaPdu) -> Vec<CellMeasurement> {
-    let report = match parse_ecid_measurement_report(pdu) {
-        Ok(r) => r,
-        Err(e) => {
-            log::warn!("nrppa_ecid_report_to_measurements: E-CID parse failed: {e}");
-            return vec![];
-        }
-    };
-    let result = &report.e_cid_measurement_result;
-    let nr_cgi = ng_ran_cgi_to_string(&result.serving_cell_id);
-
-    let mut rsrp: Option<i16> = None;
-    let mut rsrq: Option<i16> = None;
-    let mut timing_advance: Option<u32> = None;
-    let mut aoa: Option<f64> = None;
-
-    if let Some(measured) = &result.measured_results {
-        for value in &measured.values {
-            match value {
-                MeasuredResultsValue::ValueAngleOfArrival(deg) => {
-                    aoa.get_or_insert(*deg as f64);
-                }
-                MeasuredResultsValue::ValueTimingAdvanceType1(ta)
-                | MeasuredResultsValue::ValueTimingAdvanceType2(ta) => {
-                    timing_advance.get_or_insert(*ta as u32);
-                }
-                MeasuredResultsValue::ResultRsrp(items) => {
-                    // Take the strongest (highest-index) item.
-                    // value_rsrp_eutra 0..97 → −140..−43 dBm (1 dBm steps).
-                    if let Some(best) = items.iter().max_by_key(|i| i.value_rsrp_eutra) {
-                        let dbm = best.value_rsrp_eutra as i16 - 140;
-                        rsrp = Some(rsrp.map_or(dbm, |cur: i16| cur.max(dbm)));
-                    }
-                }
-                MeasuredResultsValue::ResultRsrq(items) => {
-                    // Take the strongest RSRQ item; raw 0..34 index; first list wins.
-                    if let Some(best) = items.iter().max_by_key(|i| i.value_rsrq_eutra) {
-                        rsrq.get_or_insert(best.value_rsrq_eutra as i16);
-                    }
-                }
-            }
-        }
-    }
-
-    vec![CellMeasurement {
-        nr_cgi,
-        rsrp,
-        rsrq,
-        timing_advance,
-        aoa,
-        rtt_ns: None,
-        rstd_ns: None,
-    }]
-}
-
-/// Extract the LMF correlation request-id from a decoded NRPPa E-CID report.
-///
-/// The `lmf-UE-Measurement-ID` IE (TS 38.455 §9.2.13) is the ID originally
-/// assigned by the LMF when initiating the positioning procedure.  Returns
-/// `None` if the PDU is not an E-CID measurement report.
-#[cfg(test)]
-pub fn extract_nrppa_request_id(pdu: &NrppaPdu) -> Option<u64> {
-    parse_ecid_measurement_report(pdu)
-        .ok()
-        .map(|r| u64::from(r.lmf_ue_measurement_id.0))
-}
-
 /// Decode raw NRPPa APER bytes and adapt the E-CID measurements.
 ///
 /// Returns `(lmf_request_id, Vec<CellMeasurement>)` on success, or an `Err`
@@ -593,17 +495,6 @@ pub fn decode_nrppa_ecid_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasuremen
     }
 }
 
-/// The pre-#515 hand-written decode, kept as the oracle for the generated one.
-#[cfg(test)]
-pub fn decode_nrppa_ecid_report_hand_written(
-    bytes: &[u8],
-) -> Result<(u64, Vec<CellMeasurement>), String> {
-    let pdu = NrppaPdu::decode(bytes).map_err(|e| format!("NRPPa APER decode: {e}"))?;
-    let request_id = extract_nrppa_request_id(&pdu)
-        .ok_or_else(|| "PDU is not an E-CID measurement report".to_string())?;
-    Ok((request_id, nrppa_ecid_report_to_measurements(&pdu)))
-}
-
 // ---------------------------------------------------------------------------
 // LPP E-CID adapter (A4)
 // ---------------------------------------------------------------------------
@@ -614,7 +505,7 @@ pub fn decode_nrppa_ecid_report_hand_written(
 /// | PDU field                    | `CellMeasurement` | scaling (value tables)          |
 /// |------------------------------|-------------------|---------------------------------|
 /// | `phys_cell_id` (0..503)      | `nr_cgi`          | `"pci-<n>"` (matches the Multi-RTT / DL-TDOA adapters, so one seeded registry serves all methods) |
-/// | `rsrp_result` (0..97)        | `rsrp`            | `v − 140` → −140..−43 dBm (E-UTRA RSRP-Range, TS 36.133 §9.1.4; same convention as [`nrppa_ecid_report_to_measurements`]) |
+/// | `rsrp_result` (0..97)        | `rsrp`            | `v − 140` → −140..−43 dBm (E-UTRA RSRP-Range, TS 36.133 §9.1.4; same convention as the NRPPa E-CID adapter in [`crate::nrppa_uplink`]) |
 /// | `rsrq_result` (0..34)        | `rsrq`            | raw 0..34 index (E-UTRA RSRQ-Range, TS 36.133 §9.1.7; same as the NRPPa adapter) |
 /// | `ue_rx_tx_time_diff` (0..4095) | `timing_advance` | raw UE Rx−Tx time-difference units — the E-CID ranging term `solve_ecid`'s TA ring consumes |
 fn measured_results_element_to_cell(elem: &MeasuredResultsElement) -> CellMeasurement {
@@ -934,10 +825,10 @@ pub fn decode_lpp_sidelink_ranging(bytes: &[u8]) -> Result<(u64, Vec<SidelinkRan
 mod tests {
     use super::{
         build_lpp_ecid_request, decode_lpp_ecid_report, decode_lpp_provide_report,
-        decode_nrppa_ecid_report, extract_lpp_request_id, extract_nrppa_request_id,
-        lpp_dl_tdoa_provide_to_measurements, lpp_multi_rtt_provide_to_measurements,
-        nrppa_ecid_report_to_measurements, nrrstd_to_ns, nrrstd_to_signed_ns, TC_NS,
+        decode_nrppa_ecid_report, extract_lpp_request_id, lpp_dl_tdoa_provide_to_measurements,
+        lpp_multi_rtt_provide_to_measurements, nrrstd_to_ns, nrrstd_to_signed_ns, TC_NS,
     };
+    use crate::nrppa_uplink::test_support::{aoa, ecid_report, nr_cgi, rsrp, ta1};
     use nextgcore_asn1c::lpp::ecid::{ProvideLocationInformation, ProvideLocationInformationR9};
     use nextgcore_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
     use nextgcore_asn1c::lpp::nr_dl_tdoa::{NrRstd, NrSlot, NrTimeStamp, NrTimingQuality};
@@ -946,12 +837,6 @@ mod tests {
         NrMultiRttSignalMeasurementInformation, NrUeRxTxTimeDiff,
     };
     use nextgcore_asn1c::lpp::types::{Initiator, LppTransactionId, TransactionNumber};
-    use nextgcore_asn1c::nrppa::ies::{
-        ECidMeasurementResult, MeasuredResults, MeasuredResultsValue, NgRanCell, NgRanCgi,
-        PlmnIdentity, ResultRsrpEutraItem, Tac, UeMeasurementId,
-    };
-    use nextgcore_asn1c::nrppa::pdu::{build_ecid_measurement_report, NrppaPdu};
-    use nextgcore_asn1c::nrppa::types::NrppaTransactionId;
 
     /// The LMF-initiated LPP RequestLocationInformation round-trips: encode ->
     /// decode -> it is a RequestLocationInformation carrying the E-CID request,
@@ -1146,67 +1031,31 @@ mod tests {
         }
     }
 
-    /// NRPPa E-CID round-trip: build → APER encode → decode → adapt.
+    /// NRPPa E-CID: generated encode → `decode_nrppa_ecid_report` → adapt.
     ///
-    /// Checks NR-CGI formatting, TA, AoA, and best-RSRP extraction.
+    /// Checks NR-CGI formatting, TA, AoA, best-RSRP extraction and the request id.
     #[test]
     fn rt_nrppa_ecid_report_to_measurements() {
-        // Serving cell: PLMN 02:F8:39, NR Cell ID 1 (36-bit).
-        let e_cid = ECidMeasurementResult {
-            serving_cell_id: NgRanCgi {
-                plmn_identity: PlmnIdentity([0x02, 0xF8, 0x39]),
-                ng_ran_cell: NgRanCell::NrCellId(0x000000001),
-            },
-            serving_cell_tac: Tac([0x00, 0x12, 0x34]),
-            ng_ran_access_point_position: None,
-            measured_results: Some(MeasuredResults {
-                values: vec![
-                    MeasuredResultsValue::ValueTimingAdvanceType1(500),
-                    MeasuredResultsValue::ValueAngleOfArrival(90),
-                    // Two RSRP items; value 60 should beat 55.
-                    MeasuredResultsValue::ResultRsrp(vec![
-                        ResultRsrpEutraItem {
-                            pci_eutra: 42,
-                            earfcn: 1850,
-                            value_rsrp_eutra: 60,
-                        },
-                        ResultRsrpEutraItem {
-                            pci_eutra: 43,
-                            earfcn: 1850,
-                            value_rsrp_eutra: 55,
-                        },
-                    ]),
-                ],
-            }),
-        };
-
-        let pdu = build_ecid_measurement_report(
-            NrppaTransactionId(1),
-            UeMeasurementId(42), // lmf_ue_measurement_id → correlation key
-            UeMeasurementId(7),
-            &e_cid,
-            None,
-        )
-        .expect("build_ecid_measurement_report");
-
-        // APER round-trip.
-        let encoded = pdu.encode().expect("NrppaPdu::encode");
-        let decoded = NrppaPdu::decode(&encoded).expect("NrppaPdu::decode");
-
-        // extract_nrppa_request_id reads lmf_ue_measurement_id (42).
-        assert_eq!(extract_nrppa_request_id(&decoded), Some(42));
-
-        let cells = nrppa_ecid_report_to_measurements(&decoded);
+        let bytes = ecid_report(
+            1,
+            42,
+            7,
+            nr_cgi([0x02, 0xF8, 0x39], 0x000000001),
+            [0x00, 0x12, 0x34],
+            Some(vec![ta1(500), aoa(90), rsrp(&[60, 55])]),
+        );
+        let (request_id, cells) = decode_nrppa_ecid_report(&bytes).unwrap();
+        assert_eq!(
+            request_id, 42,
+            "lmf-UE-Measurement-ID is the correlation key"
+        );
         assert_eq!(cells.len(), 1, "one serving-cell entry");
-
         let c = &cells[0];
-        // PLMN 02:F8:39 → "02f839"; NR Cell ID 1 → 9-digit hex "000000001".
         assert_eq!(c.nr_cgi, "02f839-000000001");
         assert_eq!(c.timing_advance, Some(500));
         assert_eq!(c.aoa, Some(90.0));
-        // Best RSRP: value_rsrp_eutra=60 → 60 − 140 = −80 dBm.
+        // Best RSRP item = 60 → 60 − 140 = −80 dBm.
         assert_eq!(c.rsrp, Some(-80));
-        assert_eq!(c.rtt_ns, None);
     }
 
     /// LPP Multi-RTT round-trip: build → UPER encode → decode → adapt.
@@ -1462,29 +1311,18 @@ mod tests {
         assert!(decode_lpp_provide_report(&[0xde, 0xad, 0xbe, 0xef]).is_err());
     }
 
-    /// `decode_nrppa_ecid_report`: thin wrapper returns same request-id and CGI
-    /// as calling the adapter function directly.
+    /// `decode_nrppa_ecid_report` on a report with no measured results: the id and
+    /// the serving cell, nothing else.
     #[test]
     fn decode_nrppa_ecid_report_wrapper() {
-        let e_cid = ECidMeasurementResult {
-            serving_cell_id: NgRanCgi {
-                plmn_identity: PlmnIdentity([0x00, 0xF1, 0x10]),
-                ng_ran_cell: NgRanCell::NrCellId(0x000000002),
-            },
-            serving_cell_tac: Tac([0x00, 0x00, 0x01]),
-            ng_ran_access_point_position: None,
-            measured_results: None,
-        };
-        let pdu = build_ecid_measurement_report(
-            NrppaTransactionId(0),
-            UeMeasurementId(9),
-            UeMeasurementId(1),
-            &e_cid,
+        let bytes = ecid_report(
+            0,
+            9,
+            1,
+            nr_cgi([0x00, 0xF1, 0x10], 0x000000002),
+            [0x00, 0x00, 0x01],
             None,
-        )
-        .unwrap();
-        let bytes = pdu.encode().unwrap();
-
+        );
         let (req_id, cells) = decode_nrppa_ecid_report(&bytes).unwrap();
         assert_eq!(req_id, 9);
         assert_eq!(cells.len(), 1);
