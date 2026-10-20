@@ -438,16 +438,14 @@ fn setup_response_item_extensions_are_consumed() {
     }
 }
 
-/// MaximumDataBurstVolume across the root boundary: the hand-written bytes
-/// decode in the generated codec to the same value, and root values re-encode
-/// identically. Two fork limits stop the generated side short of the full
-/// range, so the top of 4096..2000000 is pinned by a hand-derived golden in the
-/// hand-written crate instead: the generated type is a u16 sized from the root,
-/// and the generated encoder refuses any extensible INTEGER past its root
-/// ("greater than upper bound") rather than encoding it as an extension.
+/// MaximumDataBurstVolume across the root boundary and the whole extension
+/// range: the hand-written bytes decode in the generated codec to the same value
+/// and re-encode identically. Since nextgsim #235 the generated type is a u32
+/// sized from the extension range and the generated encoder writes a value past
+/// the root as an extension (X.691 §12.1), so the comparison runs to 2000000.
 #[test]
 fn maximum_data_burst_volume_agrees_across_the_root_boundary() {
-    for v in [0u32, 4095, 4096, 4097, 65535] {
+    for v in [0u32, 4095, 4096, 4097, 65535, 65536, 2_000_000] {
         let descriptor = NonDynamic5qiDescriptor {
             five_qi: 9,
             priority_level_qos: None,
@@ -458,23 +456,18 @@ fn maximum_data_burst_volume_agrees_across_the_root_boundary() {
         let old = hand.encode().expect("hand-written encode");
         let mut generated = decode_contained::<g::PDUSessionResourceSetupRequestTransfer>(&old)
             .expect("generated decode");
-        if v <= 4095 {
-            assert_eq!(
-                encode_contained(&generated).expect("encode"),
-                old,
-                "MDBV {v}"
-            );
-        }
+        assert_eq!(
+            encode_contained(&generated).expect("encode"),
+            old,
+            "MDBV {v}"
+        );
         let g::QosCharacteristics::NonDynamic5QI(d) = &g_setup_flows(&mut generated)[0]
             .qos_flow_level_qos_parameters
             .qos_characteristics
         else {
             panic!("non-dynamic 5QI");
         };
-        assert_eq!(
-            d.maximum_data_burst_volume.as_ref().map(|m| u32::from(m.0)),
-            Some(v)
-        );
+        assert_eq!(d.maximum_data_burst_volume.as_ref().map(|m| m.0), Some(v));
         assert_eq!(
             PduSessionResourceSetupRequestTransfer::decode(&old).expect("decode"),
             hand
