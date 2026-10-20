@@ -273,6 +273,11 @@ use nextgcore_gtp::v2::{
 pub mod f_teid_interface {
     /// S1-U eNodeB GTP-U
     pub const S1U_ENB_GTP_U: u8 = 0;
+    /// S1-U SGW GTP-U interface (TS 29.274 §8.22 value 1): the SGW's uplink endpoint
+    /// in a Create Session Response's Bearer Context created (Table 7.2.2-2).
+    pub const S1U_SGW_GTP_U: u8 = 1;
+    /// S5/S8 PGW GTP-U interface (TS 29.274 §8.22 value 5).
+    pub const S5_S8_PGW_GTP_U: u8 = 5;
     /// eNodeB/gNodeB GTP-U interface for DL data forwarding.
     ///
     /// #48: this constant said **4**, which TS 29.274 §8.22 defines as "S5/S8 SGW

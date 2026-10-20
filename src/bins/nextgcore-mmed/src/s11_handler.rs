@@ -363,6 +363,16 @@ fn apply_create_session_response(
     ctx.set_sgw_s11_teid_for_ue(mme_ue_id, data.sgw_s11_teid);
 
     for bearer in &data.bearer_contexts {
+        // TS 29.274 §8.4 / Table 7.2.2-2: a bearer context's own Cause says whether
+        // THAT bearer was created. One that was not has no usable S1-U endpoint.
+        if bearer.cause != 16 {
+            log::warn!(
+                "S11 Create Session Response: EBI {} not created (bearer cause {})",
+                bearer.ebi,
+                bearer.cause
+            );
+            continue;
+        }
         if !ctx.set_sgw_s1u_for_bearer(
             mme_ue_id,
             bearer.ebi,
@@ -620,13 +630,57 @@ fn continue_attach(
         return;
     };
 
+    // TS 23.401 §5.3.2.1 step 17: the Initial Context Setup tells the eNB where the
+    // SGW's S1-U endpoint is. A default bearer the SGW gave no S1-U F-TEID for cannot
+    // be set up, so the attach is refused here rather than sent with TEID 0 (#495).
+    if bearer.sgw_s1u_teid == 0 {
+        log::error!(
+            "[{}] Create Session Response gave EBI {} no S1-U SGW F-TEID; the default \
+             bearer cannot be set up, attach rejected",
+            mme_ue.imsi_bcd,
+            bearer.ebi
+        );
+        reject_attach_after_create(ctx, &sess, mme_ue, &enb_ue);
+        return;
+    }
+
     match crate::nas_path::nas_eps_send_attach_accept(mme_ue, &enb_ue, &sess, &bearer) {
         Ok(()) => log::info!(
             "[{}] Attach Accept sent in an Initial Context Setup Request (EBI {})",
             mme_ue.imsi_bcd,
             bearer.ebi
         ),
-        Err(e) => log::error!("[{}] Attach Accept failed: {e:?}", mme_ue.imsi_bcd),
+        Err(e) => {
+            // The accept is only armed for retransmission once the Initial Context
+            // Setup carrying it was built (#495), so a failure here leaves nothing
+            // half-sent; the UE is answered instead of waiting out T3410.
+            log::error!(
+                "[{}] Attach Accept failed: {e:?}; attach rejected",
+                mme_ue.imsi_bcd
+            );
+            reject_attach_after_create(ctx, &sess, mme_ue, &enb_ue);
+        }
+    }
+}
+
+/// Answer an attach whose session was created but whose Attach Accept cannot be
+/// delivered: ATTACH REJECT #19 carrying PDN CONNECTIVITY REJECT with ESM cause #38
+/// (network failure), and the S1 release #473 attaches to every ATTACH REJECT.
+fn reject_attach_after_create(
+    ctx: &crate::context::MmeContext,
+    sess: &crate::context::MmeSess,
+    mme_ue: &crate::context::MmeUe,
+    enb_ue: &crate::context::EnbUe,
+) {
+    if let Err(e) = crate::nas_path::nas_eps_send_pdn_connectivity_reject(
+        ctx,
+        sess,
+        mme_ue,
+        enb_ue,
+        crate::esm_build::EsmCause::NetworkFailure,
+        crate::nas_path::GtpCreateAction::InAttachRequest,
+    ) {
+        log::error!("[{}] Attach Reject send failed: {e}", mme_ue.imsi_bcd);
     }
 }
 
@@ -936,6 +990,15 @@ pub fn handle_create_session_response(data: &[u8]) -> S11Result<CreateSessionRes
                 ie_type::EPCO => {
                     result.epco = Some(value.to_vec());
                 }
+                // Bearer Contexts created (M, instance 0; Table 7.2.2-2). Instance 1
+                // is "Bearer Contexts marked for removal", which this MME never asks
+                // for. Not parsed before #495, so the default bearer kept SGW S1-U
+                // TEID 0 and the Initial Context Setup could not be built.
+                ie_type::BEARER_CONTEXT if instance == 0 => {
+                    if let Some(bearer) = parse_created_bearer(value) {
+                        result.bearer_contexts.push(bearer);
+                    }
+                }
                 _ => {}
             }
             offset += 4 + length as usize;
@@ -949,6 +1012,69 @@ pub fn handle_create_session_response(data: &[u8]) -> S11Result<CreateSessionRes
     }
 
     Ok(result)
+}
+
+/// Parse one Bearer Context created of a Create Session Response
+/// (TS 29.274 Table 7.2.2-2): EBI (M), Cause (M), S1-U SGW F-TEID (C, instance 0),
+/// S5/S8-U PGW F-TEID (C, instance 2) and Bearer QoS (C, instance 0).
+///
+/// The F-TEIDs are keyed by instance AND checked against their interface type
+/// (§8.22: 1 = S1-U SGW GTP-U, 5 = S5/S8 PGW GTP-U), as the CIDFT parser does, so a
+/// contradictory pair is ignored rather than installed as the wrong tunnel. A
+/// bearer context without an EBI is unusable and is dropped.
+fn parse_created_bearer(value: &[u8]) -> Option<BearerContextCreated> {
+    use crate::s11_build::f_teid_interface as iface;
+
+    let mut bearer = BearerContextCreated::default();
+    let mut have_ebi = false;
+    let mut offset = 0;
+    while offset < value.len() {
+        let Some((ie_t, length, instance, inner)) = parse_ie_header(&value[offset..]) else {
+            break;
+        };
+        match ie_t {
+            ie_type::EBI => {
+                if let Some(ebi) = parse_ebi(inner) {
+                    bearer.ebi = ebi;
+                    have_ebi = true;
+                }
+            }
+            ie_type::CAUSE => {
+                if let Some(cause) = parse_cause(inner) {
+                    bearer.cause = cause;
+                }
+            }
+            ie_type::F_TEID => {
+                if let Some((iface_type, teid, ipv4, _)) = parse_f_teid(inner) {
+                    match (instance, iface_type) {
+                        (0, iface::S1U_SGW_GTP_U) => {
+                            bearer.sgw_s1u_teid = teid;
+                            bearer.sgw_s1u_ipv4 = ipv4;
+                        }
+                        (2, iface::S5_S8_PGW_GTP_U) => {
+                            bearer.pgw_s5u_teid = teid;
+                            bearer.pgw_s5u_ipv4 = ipv4;
+                        }
+                        (other, t) => log::debug!(
+                            "Create Session Response bearer F-TEID at instance {other} with \
+                             interface type {t} ignored: not an endpoint this MME uses"
+                        ),
+                    }
+                }
+            }
+            ie_type::BEARER_QOS => {
+                if let Some((qci, prio, pec, pev, ..)) = parse_bearer_qos(inner) {
+                    bearer.qci = qci;
+                    bearer.arp_priority = prio;
+                    bearer.arp_pec = pec;
+                    bearer.arp_pev = pev;
+                }
+            }
+            _ => {}
+        }
+        offset += 4 + length as usize;
+    }
+    have_ebi.then_some(bearer)
 }
 
 /// Handle Modify Bearer Response
@@ -1534,6 +1660,126 @@ mod tests {
             }
         }
         (mme_ue_id, enb_ue_id, sess_id, bearer_id, local_teid)
+    }
+
+    /// Bearer Contexts created, parsed from octets derived BY HAND from TS 29.274
+    /// (§5.1 header, Table 7.2.2-2, §8.4 Cause, §8.8 EBI, §8.22 F-TEID) rather than
+    /// from any encoder in this tree (#495). Before #495 the IE was skipped, so the
+    /// default bearer kept SGW S1-U TEID 0.
+    #[test]
+    fn bearer_contexts_created_parse_from_hand_derived_octets() {
+        #[rustfmt::skip]
+        let wire: &[u8] = &[
+            // GTPv2 header: v2, T=1; type 33 Create Session Response; length 42
+            // (8 octets of TEID/seq/spare + 34 of IEs); TEID 4; sequence 3.
+            0x48, 0x21, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00,
+            // Cause (2), length 2, instance 0: 16 "Request accepted", flags 0.
+            0x02, 0x00, 0x02, 0x00, 0x10, 0x00,
+            // Bearer Context (93), length 24, instance 0 = "created":
+            0x5d, 0x00, 0x18, 0x00,
+            //   EBI (73), length 1, instance 0: EBI 5.
+            0x49, 0x00, 0x01, 0x00, 0x05,
+            //   Cause (2): 16.
+            0x02, 0x00, 0x02, 0x00, 0x10, 0x00,
+            //   F-TEID (87), length 9, instance 0: V4 | interface 1 (S1-U SGW
+            //   GTP-U), TEID 0xaabbccdd, 10.0.0.5.
+            0x57, 0x00, 0x09, 0x00, 0x81, 0xaa, 0xbb, 0xcc, 0xdd, 0x0a, 0x00, 0x00, 0x05,
+        ];
+        let parsed = handle_create_session_response(wire).expect("parses");
+        assert_eq!(parsed.cause, 16);
+        assert_eq!(
+            parsed.bearer_contexts.len(),
+            1,
+            "the bearer context must be parsed"
+        );
+        let b = &parsed.bearer_contexts[0];
+        assert_eq!(b.ebi, 5);
+        assert_eq!(b.cause, 16);
+        assert_eq!(b.sgw_s1u_teid, 0xaabb_ccdd);
+        assert_eq!(b.sgw_s1u_ipv4, Some([10, 0, 0, 5]));
+    }
+
+    /// The same IE as the Serving GW actually emits it: built with nextgcore-gtp's
+    /// `Gtp2BearerContextIe`, the encoder sgwcd's `build_create_session_response`
+    /// uses, so the two sides of S11 cannot drift apart unnoticed (#495). Also
+    /// checks the S5/S8-U PGW F-TEID (instance 2) and Bearer QoS, and that an
+    /// F-TEID whose interface type contradicts its instance is ignored.
+    #[test]
+    fn bearer_contexts_created_parse_as_sgwcd_encodes_them() {
+        use nextgcore_gtp::v2::header::{Gtp2Header, Gtp2MessageType};
+        use nextgcore_gtp::v2::ie::{
+            Gtp2BearerContextIe, Gtp2BearerQosIe, Gtp2CauseIe, Gtp2FTeidIe,
+        };
+        use nextgcore_gtp::v2::message::Gtp2Message;
+
+        let mut msg = Gtp2Message::new(Gtp2Header::new(
+            Gtp2MessageType::CreateSessionResponse as u8,
+            7,
+            9,
+        ));
+        msg.add_ie(Gtp2CauseIe::new(16).to_ie(0));
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(6);
+        bc.set_cause(&Gtp2CauseIe::new(16));
+        bc.set_fteid(0, &Gtp2FTeidIe::new_ipv4(1, 0x0102_0304, [192, 0, 2, 1]));
+        bc.set_fteid(2, &Gtp2FTeidIe::new_ipv4(5, 0x0506_0708, [192, 0, 2, 2]));
+        // Instance 0 again but interface type 5: contradictory, must not overwrite.
+        bc.set_fteid(0, &Gtp2FTeidIe::new_ipv4(5, 0xdead_beef, [198, 51, 100, 9]));
+        bc.set_bearer_qos(&Gtp2BearerQosIe::new(9, 0, 0, 0, 0));
+        msg.add_bearer_context(0, &bc);
+
+        let wire = msg.encode();
+        let parsed = handle_create_session_response(&wire).expect("parses");
+        assert_eq!(parsed.bearer_contexts.len(), 1);
+        let b = &parsed.bearer_contexts[0];
+        assert_eq!(b.ebi, 6);
+        assert_eq!(
+            b.sgw_s1u_teid, 0x0102_0304,
+            "instance 0 interface 1 is the S1-U SGW"
+        );
+        assert_eq!(b.sgw_s1u_ipv4, Some([192, 0, 2, 1]));
+        assert_eq!(b.pgw_s5u_teid, 0x0506_0708);
+        assert_eq!(b.pgw_s5u_ipv4, Some([192, 0, 2, 2]));
+        assert_eq!(b.qci, 9);
+    }
+
+    /// A default bearer the SGW gave no S1-U F-TEID cannot be set up: the attach is
+    /// refused and the ATTACH ACCEPT is NOT armed in T3450, so it can never be
+    /// retransmitted bare over Downlink NAS Transport (#495).
+    #[test]
+    fn an_attach_without_an_s1u_endpoint_is_rejected_not_half_sent() {
+        let _guard = crate::gtp_path::lock_s11();
+        crate::gtp_path::clear_pending_creates_for_test();
+
+        let (mme_ue_id, enb_ue_id, sess_id, bearer_id, local_teid) = seed_global_ue(5);
+        let ctx = crate::context::mme_self();
+        crate::gtp_path::record_pending_create_for_test(
+            4251,
+            crate::gtp_path::PendingCreate {
+                create_action: GtpCreateAction::AttachRequest,
+                enb_ue_id,
+                sess_id,
+            },
+        );
+        let mut response = accepted_response(5, [10, 45, 0, 9]);
+        response.bearer_contexts[0].sgw_s1u_teid = 0;
+        response.bearer_contexts[0].sgw_s1u_ipv4 = None;
+        apply_create_session_response(
+            &response,
+            local_teid,
+            4251,
+            "127.0.0.1:2123".parse().unwrap(),
+        );
+
+        let ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert!(
+            ue.t3450.pkbuf.is_none(),
+            "no ATTACH ACCEPT may be armed for retransmission when its Initial Context \
+             Setup could not be built"
+        );
+
+        release_global_ue(mme_ue_id, sess_id, bearer_id);
+        crate::gtp_path::clear_pending_creates_for_test();
     }
 
     /// Release what `seed_global_ue` added, so the shared global context does not

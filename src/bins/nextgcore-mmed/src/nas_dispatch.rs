@@ -559,6 +559,15 @@ fn emm_attach_request(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, body: &[
         }
     };
 
+    // A new attach: neither its ATTACH COMPLETE nor its step-23 Modify Bearer
+    // Request has happened yet (#495).
+    if let Ok(mut pool) = ctx.mme_ue_pool.write() {
+        if let Some(ue) = pool.get_mut(&mme_ue_id) {
+            ue.attach_completed = false;
+            ue.attach_modify_bearer_sent = false;
+        }
+    }
+
     // TS 24.301 §9.9.3.11 attach type 3 is an EMERGENCY attach. Recorded on the
     // context so the rest of the stack can tell one from a normal attach (#46).
     //
@@ -654,6 +663,7 @@ fn emm_attach_complete(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, body: &
                 // TS 24.301 §5.5.1.2.4: the attach procedure completed, so T3450
                 // stops and the stored ATTACH ACCEPT is discarded (issue #45).
                 mme_ue.t3450.stop();
+                mme_ue.attach_completed = true;
                 esm_message
             }
             Err(e) => {
@@ -666,6 +676,60 @@ fn emm_attach_complete(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, body: &
     // TS 24.301 §5.5.1.2.4: the ESM container carries ACTIVATE DEFAULT EPS
     // BEARER CONTEXT ACCEPT, which belongs to the ESM entity.
     forward_to_esm(ctx, enb_ue, mme_ue_id, &esm_message);
+
+    modify_bearer_after_attach(ctx, enb_ue.id, mme_ue_id);
+}
+
+/// TS 23.401 §5.3.2.1 step 23: once BOTH the Initial Context Setup Response (step
+/// 20, which carried the eNB's S1-U F-TEID) and the ATTACH COMPLETE (step 22) have
+/// arrived, send the Serving GW a Modify Bearer Request with the eNB's address and
+/// TEID, so downlink user-plane data can flow. Called from both arrival points; it
+/// acts once, on whichever comes second (#495).
+///
+/// Before #495 nothing on the attach path sent it, so the SGW never learned the
+/// eNB's downlink tunnel and an attached UE had an uplink-only user plane.
+pub fn modify_bearer_after_attach(ctx: &MmeContext, enb_ue_id: u64, mme_ue_id: u64) {
+    let ready = {
+        let Ok(pool) = ctx.mme_ue_pool.read() else {
+            return;
+        };
+        let Some(ue) = pool.get(&mme_ue_id) else {
+            return;
+        };
+        ue.attach_completed && !ue.attach_modify_bearer_sent
+    };
+    if !ready {
+        return;
+    }
+    // Step 20 is in when every bearer of the UE has the eNB's S1-U TEID.
+    let bearers = gtp_path::bearers_of_ue(ctx, mme_ue_id);
+    if bearers.is_empty() || bearers.iter().any(|b| b.enb_s1u_teid == 0) {
+        return;
+    }
+    if let Ok(mut pool) = ctx.mme_ue_pool.write() {
+        if let Some(ue) = pool.get_mut(&mme_ue_id) {
+            if ue.attach_modify_bearer_sent {
+                return;
+            }
+            ue.attach_modify_bearer_sent = true;
+        }
+    }
+    match gtp_path::send_modify_bearer_request(
+        ctx,
+        enb_ue_id,
+        mme_ue_id,
+        false,
+        crate::s11_build::GtpModifyAction::NoAction,
+    ) {
+        Ok(_) => log::info!(
+            "Attach: Modify Bearer Request sent with the eNB S1-U F-TEID (TS 23.401 §5.3.2.1 \
+             step 23)"
+        ),
+        Err(e) => log::error!(
+            "Attach: Modify Bearer Request failed: {e}. The UE is attached, but the SGW has \
+             no downlink tunnel to the eNB, so downlink user-plane data is dropped"
+        ),
+    }
 }
 
 fn emm_identity_response(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, body: &[u8]) {
@@ -2167,6 +2231,179 @@ mod tests {
         assert!(
             csfb_context_modification(&enb_ue, 8).is_none(),
             "a packet-services request must not put the eNB into CS fallback"
+        );
+    }
+
+    /// TS 23.401 §5.3.2.1 step 23 (#495): the Modify Bearer Request goes out only
+    /// once BOTH the ATTACH COMPLETE and the Initial Context Setup Response (the
+    /// eNB's S1-U TEID) are in, whichever comes second, and only once.
+    #[test]
+    fn the_attach_modify_bearer_waits_for_both_attach_complete_and_ics_response() {
+        let ctx = test_ctx();
+        let enb_ue_id = enb_with_connection(&ctx);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+        let sess_id = ctx.sess_add(mme_ue_id, 1);
+        let bearer_id = ctx.bearer_add(sess_id, mme_ue_id);
+        if let Some(b) = ctx.bearer_pool.write().unwrap().get_mut(&bearer_id) {
+            b.ebi = 5;
+        }
+        ctx.sess_pool
+            .write()
+            .unwrap()
+            .get_mut(&sess_id)
+            .unwrap()
+            .bearer_list
+            .push(bearer_id);
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&mme_ue_id)
+            .unwrap()
+            .sess_list
+            .push(sess_id);
+        let sent = |ctx: &MmeContext| {
+            ctx.mme_ue_find_by_id(mme_ue_id)
+                .unwrap()
+                .attach_modify_bearer_sent
+        };
+
+        // Neither in: nothing.
+        modify_bearer_after_attach(&ctx, enb_ue_id, mme_ue_id);
+        assert!(!sent(&ctx));
+
+        // ICS response only (eNB TEID known, no ATTACH COMPLETE): still nothing.
+        if let Some(b) = ctx.bearer_pool.write().unwrap().get_mut(&bearer_id) {
+            b.enb_s1u_teid = 0x0a0b_0c0d;
+        }
+        modify_bearer_after_attach(&ctx, enb_ue_id, mme_ue_id);
+        assert!(!sent(&ctx), "step 23 needs the ATTACH COMPLETE too");
+
+        // Both in: sent (the S11 send itself fails here, no socket; the decision is
+        // what is under test).
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&mme_ue_id)
+            .unwrap()
+            .attach_completed = true;
+        modify_bearer_after_attach(&ctx, enb_ue_id, mme_ue_id);
+        assert!(
+            sent(&ctx),
+            "both arrived: the Modify Bearer Request must be sent"
+        );
+    }
+
+    /// And with the ATTACH COMPLETE in but no eNB S1-U TEID yet, it waits for the
+    /// Initial Context Setup Response, then fires from the response handler.
+    #[test]
+    fn the_ics_response_triggers_the_attach_modify_bearer_when_it_arrives_second() {
+        let ctx = test_ctx();
+        let enb_ue_id = enb_with_connection(&ctx);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+        let sess_id = ctx.sess_add(mme_ue_id, 1);
+        let bearer_id = ctx.bearer_add(sess_id, mme_ue_id);
+        if let Some(b) = ctx.bearer_pool.write().unwrap().get_mut(&bearer_id) {
+            b.ebi = 5;
+        }
+        ctx.sess_pool
+            .write()
+            .unwrap()
+            .get_mut(&sess_id)
+            .unwrap()
+            .bearer_list
+            .push(bearer_id);
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&mme_ue_id)
+            .unwrap()
+            .sess_list
+            .push(sess_id);
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&mme_ue_id)
+            .unwrap()
+            .attach_completed = true;
+        modify_bearer_after_attach(&ctx, enb_ue_id, mme_ue_id);
+        assert!(
+            !ctx.mme_ue_find_by_id(mme_ue_id)
+                .unwrap()
+                .attach_modify_bearer_sent,
+            "no eNB S1-U TEID yet"
+        );
+
+        // Linked as the attach path links them (an S1 connection serving this UE).
+        ctx.enb_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&enb_ue_id)
+            .unwrap()
+            .mme_ue_id = mme_ue_id;
+        let enb_ue = ctx.enb_ue_find_by_id(enb_ue_id).unwrap();
+        let enb_id = enb_ue.enb_id;
+        crate::s1ap_handler::handle_initial_context_setup_response(
+            &ctx,
+            enb_id,
+            &nextgcore_s1ap::InitialContextSetupResponse {
+                mme_ue_s1ap_id: enb_ue.mme_ue_s1ap_id,
+                enb_ue_s1ap_id: enb_ue.enb_ue_s1ap_id,
+                erab_setup_list: vec![nextgcore_s1ap::ErabSetupItem {
+                    erab_id: 5,
+                    transport_layer_address: vec![10, 0, 0, 7],
+                    gtp_teid: 0x1122_3344,
+                }],
+                erab_failed_list: vec![],
+            },
+        );
+        assert!(
+            ctx.mme_ue_find_by_id(mme_ue_id)
+                .unwrap()
+                .attach_modify_bearer_sent,
+            "the ICS response arriving second must send the step-23 Modify Bearer Request"
+        );
+    }
+
+    /// ATTACH COMPLETE arriving second (ICS response already in) records the
+    /// completion AND sends the step-23 Modify Bearer Request (#495).
+    #[test]
+    fn attach_complete_arriving_second_sends_the_attach_modify_bearer() {
+        let ctx = test_ctx();
+        let enb_ue_id = enb_with_connection(&ctx);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+        let sess_id = ctx.sess_add(mme_ue_id, 1);
+        let bearer_id = ctx.bearer_add(sess_id, mme_ue_id);
+        if let Some(b) = ctx.bearer_pool.write().unwrap().get_mut(&bearer_id) {
+            b.ebi = 5;
+            b.enb_s1u_teid = 0x1122_3344; // the ICS response is already in
+        }
+        ctx.sess_pool
+            .write()
+            .unwrap()
+            .get_mut(&sess_id)
+            .unwrap()
+            .bearer_list
+            .push(bearer_id);
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&mme_ue_id)
+            .unwrap()
+            .sess_list
+            .push(sess_id);
+        let enb_ue = ctx.enb_ue_find_by_id(enb_ue_id).unwrap();
+
+        // ESM message container (TS 24.301 §8.2.2): length 3, then ACTIVATE DEFAULT
+        // EPS BEARER CONTEXT ACCEPT for EBI 5 -- octet 1 0x52, PTI 0, type 0xc2.
+        let body = [0x00, 0x03, 0x52, 0x00, 0xc2];
+        emm_attach_complete(&ctx, &enb_ue, mme_ue_id, &body);
+
+        let ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert!(ue.attach_completed, "ATTACH COMPLETE must be recorded");
+        assert!(
+            ue.attach_modify_bearer_sent,
+            "with the ICS response already in, ATTACH COMPLETE must send the step-23 \
+             Modify Bearer Request"
         );
     }
 

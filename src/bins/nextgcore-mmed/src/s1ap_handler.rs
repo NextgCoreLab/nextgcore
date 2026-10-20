@@ -2050,6 +2050,9 @@ pub fn handle_initial_context_setup_response(
         }
     }
     log_erab_failures(enb_id, &msg.erab_failed_list);
+
+    // TS 23.401 §5.3.2.1 step 23 needs this response AND the ATTACH COMPLETE (#495).
+    crate::nas_dispatch::modify_bearer_after_attach(ctx, enb_ue_id, enb_ue.mme_ue_id);
 }
 
 fn handle_erab_setup_response(
