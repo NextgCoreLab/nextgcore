@@ -1544,6 +1544,10 @@ pub struct PolicyBinding {
     pub qfi: u8,
     /// Authorized default 5QI
     pub five_qi: u8,
+    /// ARP priority level of the default QoS flow, as authorised at establishment.
+    /// Kept so a re-activation (`upCnxState: ACTIVATING`, TS 29.502 §5.2.2.3.2.2)
+    /// can rebuild the same PDUSessionResourceSetupRequestTransfer (#518).
+    pub arp_priority_level: u8,
     /// Authorized session AMBR (bps)
     pub ambr_ul_bps: u64,
     pub ambr_dl_bps: u64,
@@ -1611,6 +1615,9 @@ impl PolicyBinding {
             dnn: String::new(),
             qfi: 0,
             five_qi: 0,
+            // TS 23.501 §5.7.2.2's lowest ordinary priority: what an absent value
+            // in an older snapshot most plausibly was.
+            arp_priority_level: 8,
             ambr_ul_bps: 0,
             ambr_dl_bps: 0,
             sm_context_status_uri: None,

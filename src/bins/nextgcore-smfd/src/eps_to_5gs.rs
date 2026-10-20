@@ -442,6 +442,7 @@ pub(crate) async fn handle_create(body: &serde_json::Value) -> SbiResponse {
                         dnn: dnn.clone(),
                         qfi: default_bearer.ebi,
                         five_qi: default_bearer.qos.index,
+                        arp_priority_level: default_bearer.qos.arp_priority_level,
                         ambr_ul_bps: sess.session_ambr.uplink,
                         ambr_dl_bps: sess.session_ambr.downlink,
                         sm_context_status_uri: sess.sm_context_status_uri.clone(),
