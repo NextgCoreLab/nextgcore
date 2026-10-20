@@ -116,3 +116,76 @@ async fn kernel_sctp_loopback_ngap_roundtrip() {
         other => panic!("expected AssociationClosed, got {other:?}"),
     }
 }
+
+/// #510: a message larger than the server's receive buffer arrives from the
+/// kernel in pieces, MSG_EOR set only on the last (RFC 6458 §8.1.20). The read
+/// loop must deliver it as ONE message, under the first piece's stream and PPID
+/// -- not as three "messages" a codec then fails on.
+///
+/// The read buffer is `max(max_message_size, NEXTGCORE_MAX_SDU_LEN)`; with
+/// `max_message_size` 1024 that is 8192 octets, so a 20000-octet message comes up
+/// as at least three partial deliveries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_larger_than_the_receive_buffer_is_reassembled() {
+    let bind = "127.0.0.1:0".parse().unwrap();
+    let config = SctpServerConfig {
+        max_message_size: 1024,
+        ..SctpServerConfig::default()
+    };
+    let mut server = KernelSctpServer::bind(bind, config)
+        .await
+        .expect("kernel SCTP server bind");
+    let server_addr = server.local_addr();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    server.set_event_sender(tx);
+
+    let client = tokio::task::spawn_blocking(move || {
+        KernelSctpSocket::client(server_addr, None).expect("kernel SCTP client connect")
+    })
+    .await
+    .unwrap();
+    let client = Arc::new(client);
+    let assoc_id = match next_event(&mut rx).await {
+        ServerEvent::NewAssociation { association_id, .. } => association_id,
+        other => panic!("expected NewAssociation, got {other:?}"),
+    };
+
+    // Distinct octets at every position, so a reordering or a dropped piece shows.
+    let big: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+    {
+        let c = Arc::clone(&client);
+        let payload = big.clone();
+        tokio::task::spawn_blocking(move || c.send(&payload, NGAP_PPID, 0).expect("client send"))
+            .await
+            .unwrap();
+    }
+    // A second, small message right behind it must stay a separate message.
+    {
+        let c = Arc::clone(&client);
+        tokio::task::spawn_blocking(move || c.send(b"tail", NGAP_PPID, 0).expect("client send"))
+            .await
+            .unwrap();
+    }
+    match next_event(&mut rx).await {
+        ServerEvent::DataReceived {
+            association_id,
+            message,
+        } => {
+            assert_eq!(association_id, assoc_id);
+            assert_eq!(message.data.len(), big.len(), "delivered as one message");
+            assert_eq!(&message.data[..], &big[..], "reassembled in order");
+            assert_eq!(message.ppid, NGAP_PPID, "the first piece's PPID");
+        }
+        other => panic!("expected DataReceived, got {other:?}"),
+    }
+    match next_event(&mut rx).await {
+        ServerEvent::DataReceived { message, .. } => {
+            assert_eq!(
+                &message.data[..],
+                b"tail",
+                "the next message is not merged in"
+            );
+        }
+        other => panic!("expected DataReceived, got {other:?}"),
+    }
+}
