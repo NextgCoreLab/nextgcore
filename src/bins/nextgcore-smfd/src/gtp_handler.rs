@@ -1440,6 +1440,48 @@ async fn create_session(
     bearer.pgw_s5u_addr = Some(std::net::Ipv4Addr::from(n4.upf_addr));
     sess.upf_n4_seid = n4.upf_seid;
 
+    // #303: point the PGW-U's DOWNLINK at the SGW's S5/S8-U F-TEID, which this very
+    // request carried (Bearer Context, F-TEID instance 2; TS 29.274 Table 7.2.1-2).
+    //
+    // The establishment above is the 5G-shaped one: its downlink FAR is BUFF with no
+    // Outer Header Creation, because on N3 the gNB's endpoint arrives later and the
+    // SM Context Update activates it. On S5/S8 the far end is already known, and
+    // nothing else would ever send it: the SGW-C does not follow an initial attach
+    // with an S5 Modify Bearer, so the FAR stayed BUFF for the session's life and the
+    // PGW-U answered every downlink packet into a buffer -- "No gNB address provided,
+    // using default 127.0.0.1". TS 23.401 §5.3.2.1 step 15 has the PGW forward
+    // downlink to the SGW from Create Session onward, so it is activated HERE, before
+    // the response claims the session exists.
+    if let (teid, Some(addr)) = (bearer.sgw_s5u_teid, bearer.sgw_s5u_ip.ipv4) {
+        if teid != 0 {
+            if let Err(e) =
+                crate::pfcp_session_modify(sess.smf_n4_seid, n4.upf_seid, teid, addr.octets()).await
+            {
+                log::error!(
+                    "S5/S8 Create Session Request from {peer}: the PGW-U downlink toward the \
+                     SGW S5/S8-U endpoint {addr} TEID 0x{teid:08x} was not activated ({e}); \
+                     refusing rather than accepting a session that cannot carry downlink"
+                );
+                if let Err(e) = crate::pfcp_session_delete(sess.smf_n4_seid, n4.upf_seid).await {
+                    log::warn!("and the half-provisioned N4 session was not deleted: {e}");
+                }
+                release_and_reject(
+                    server,
+                    &context,
+                    ue_ipv4,
+                    peer,
+                    sequence_number,
+                    Gtp2Cause::RemotePeerNotResponding,
+                )
+                .await;
+                return;
+            }
+            log::info!(
+                "S5/S8: PGW-U downlink activated toward SGW S5/S8-U {addr} TEID 0x{teid:08x}"
+            );
+        }
+    }
+
     // STORE what this exchange settled (#223).
     //
     // `sess_add_by_apn` returns a CLONE — `context.rs` inserts into `sess_list` and hands
@@ -2344,6 +2386,87 @@ mod tests {
         let sess = session_for_teid(Some(advertised))
             .expect("the established session must be findable by the TEID it advertised");
         (server, sgw, sess)
+    }
+
+    /// #303: a Create Session Request activates the PGW-U's downlink toward the SGW's
+    /// S5/S8-U F-TEID the request carried, before the response is sent.
+    ///
+    /// The fixture's Bearer Context names the SGW S5/S8-U endpoint TEID 0x0505_0505 at
+    /// 127.0.0.1 (instance 2). Before #303 the establishment left the downlink FAR at
+    /// BUFF and nothing ever activated it, because an initial attach is not followed by an
+    /// S5 Modify Bearer -- so the real EPC's first ping went 100% lost at the PGW-U. The
+    /// N4 Session Modification must carry Outer Header Creation GTP-U/UDP/IPv4
+    /// (description 0x0100) to exactly that TEID and address.
+    #[tokio::test]
+    async fn a_create_session_activates_the_downlink_toward_the_sgw_s5u_endpoint() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        upf.clear_seen();
+        // IMSI ...0x37 and SGW TEID 0x3700_0001 are this test's alone.
+        let (server, _sgw, _sess) = establish_over_the_wire(3, 0x37, 0x3700_0001).await;
+
+        let mut expected = vec![0x01, 0x00]; // GTP-U/UDP/IPv4
+        expected.extend_from_slice(&0x0505_0505u32.to_be_bytes());
+        expected.extend_from_slice(&[127, 0, 0, 1]);
+        let mods = upf.modification_bodies();
+        assert!(
+            mods.iter().any(|body| body
+                .windows(expected.len())
+                .any(|w| w == expected.as_slice())),
+            "an N4 Session Modification must point the downlink FAR at the SGW S5/S8-U \
+             F-TEID 0x05050505 @ 127.0.0.1; {} modification(s) were sent",
+            mods.len()
+        );
+        server.close();
+    }
+
+    /// #303: the Create Session Response carries the PGW-U's S5/S8-U F-TEID at
+    /// instance 2 of Bearer Context Created (TS 29.274 Table 7.2.2-2), not instance 0,
+    /// which is the S1-U SGW F-TEID's slot.
+    #[tokio::test]
+    async fn the_response_carries_the_pgw_s5u_fteid_at_instance_2() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        crate::context::smf_context_init(64, 256, 512);
+        let server = crate::gtp_path::S5S8Server::open("127.0.0.1:0".parse().unwrap(), 3)
+            .await
+            .expect("bind");
+        let sgw = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind sgw");
+        let mut csr = s5c_csr(0x78, 0x3800_0001, [10, 99, 99, 99]);
+        let imsi_pos = csr
+            .windows(8)
+            .position(|w| w == [0x09, 0x91, 0x07, 0x00, 0x00, 0x00, 0x00, 0x01])
+            .expect("fixture IMSI");
+        csr[imsi_pos + 7] = 0x38;
+        sgw.send_to(&csr, server.local_addr())
+            .await
+            .expect("send csr");
+        let mut buf = vec![0u8; 4096];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), sgw.recv_from(&mut buf))
+                .await
+                .expect("the PGW-C must answer")
+                .expect("recv");
+        let mut bytes = bytes::Bytes::copy_from_slice(&buf[..len]);
+        let resp = nextgcore_gtp::v2::Gtp2Message::decode(&mut bytes).expect("decode");
+        let bc = resp
+            .bearer_context(0)
+            .expect("bearer context decodes")
+            .expect("Bearer Context Created present");
+        let pgw_u = bc
+            .fteid(2)
+            .ok()
+            .flatten()
+            .expect("the S5/S8-U PGW F-TEID must be at instance 2");
+        assert_eq!(pgw_u.teid, upf.upf_teid, "the PGW-U TEID the UPF allocated");
+        assert_eq!(pgw_u.ipv4_addr, Some(upf.upf_ip), "and the PGW-U's address");
+        assert!(
+            bc.fteid(0).ok().flatten().is_none(),
+            "instance 0 is the S1-U SGW F-TEID; the PGW must not put its endpoint there"
+        );
+        server.close();
     }
 
     /// #223: a Create Session Request STORES what it settled.
