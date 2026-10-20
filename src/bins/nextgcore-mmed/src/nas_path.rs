@@ -843,9 +843,34 @@ pub fn nas_eps_send_pdn_connectivity_reject(
         );
     }
 
-    let esm_message = esm_build::build_pdn_connectivity_reject(esm_cause);
+    let esm_message = protect_esm(
+        ctx,
+        mme_ue.id,
+        &esm_build::build_pdn_connectivity_reject(esm_cause),
+    )?;
 
     nas_eps_send_to_downlink_nas_transport(enb_ue, esm_message)
+}
+
+/// Integrity-protect and cipher a downlink ESM message under the UE's LIVE EPS
+/// security context (#497).
+///
+/// The ESM builders produce the plain message; until #497 they wrote a
+/// placeholder "integrity protected and ciphered" header with MAC 0 and sequence
+/// number 0 over a plaintext body, which a UE in an established security context
+/// must discard (TS 24.301 §4.4.4.2). The ESM handlers work on a snapshot of the
+/// UE (`mme_ue_find_by_id` clones), so the protection is applied to the pool's
+/// context: that is what advances the downlink NAS COUNT (§4.4.3.1), so the next
+/// message cannot reuse it. The caller must not hold an `mme_ue_pool` guard.
+pub fn protect_esm(ctx: &MmeContext, mme_ue_id: u64, plain: &[u8]) -> NasResult<Vec<u8>> {
+    let mut pool = ctx.mme_ue_pool.write().map_err(|_| NasError::UeNotFound)?;
+    let mme_ue = pool.get_mut(&mme_ue_id).ok_or(NasError::UeNotFound)?;
+    nas_security::nas_eps_security_encode(
+        mme_ue,
+        SecurityHeaderType::IntegrityProtectedAndCiphered,
+        plain,
+    )
+    .ok_or(NasError::BuildFailed)
 }
 
 /// Send ESM information request message
@@ -859,7 +884,8 @@ pub fn nas_eps_send_pdn_connectivity_reject(
 /// * `Ok(())` - Message sent successfully
 /// * `Err(NasError)` - On error
 pub fn nas_eps_send_esm_information_request(
-    bearer: &mut MmeBearer,
+    ctx: &MmeContext,
+    bearer_id: u64,
     mme_ue: &MmeUe,
     enb_ue: &EnbUe,
 ) -> NasResult<()> {
@@ -873,18 +899,24 @@ pub fn nas_eps_send_esm_information_request(
         return Err(NasError::EnbUeNotFound);
     }
 
-    // Use stored message if available (retransmission)
-    let esm_message = if let Some(ref pkbuf) = bearer.t3489.pkbuf {
-        pkbuf.clone()
-    } else {
-        // Use PTI from session or default to 0
-        esm_build::build_esm_information_request(0)
+    // T3489 keeps the PLAIN message (#497): each (re)transmission is protected
+    // afresh, under the next downlink NAS COUNT, rather than replaying one. The
+    // bearer guard is released before `protect_esm` takes the UE pool's, so the
+    // two locks are never nested.
+    let plain = {
+        let mut pool = ctx
+            .bearer_pool
+            .write()
+            .map_err(|_| NasError::InvalidParameter)?;
+        let bearer = pool.get_mut(&bearer_id).ok_or(NasError::InvalidParameter)?;
+        bearer
+            .t3489
+            .pkbuf
+            .get_or_insert_with(|| esm_build::build_esm_information_request(0))
+            .clone()
     };
 
-    // Store for retransmission (T3489)
-    bearer.t3489.pkbuf = Some(esm_message.clone());
-
-    nas_eps_send_to_downlink_nas_transport(enb_ue, esm_message)
+    nas_eps_send_to_downlink_nas_transport(enb_ue, protect_esm(ctx, mme_ue.id, &plain)?)
 }
 
 /// Send activate default bearer context request message
@@ -900,6 +932,7 @@ pub fn nas_eps_send_esm_information_request(
 /// * `Ok(())` - Message sent successfully
 /// * `Err(NasError)` - On error
 pub fn nas_eps_send_activate_default_bearer_context_request(
+    ctx: &MmeContext,
     bearer: &MmeBearer,
     sess: &MmeSess,
     mme_ue: &MmeUe,
@@ -916,7 +949,11 @@ pub fn nas_eps_send_activate_default_bearer_context_request(
         return Err(NasError::EnbUeNotFound);
     }
 
-    let esm_message = esm_build::build_activate_default_bearer_context_request(sess, create_action);
+    let esm_message = protect_esm(
+        ctx,
+        mme_ue.id,
+        &esm_build::build_activate_default_bearer_context_request(sess, create_action),
+    )?;
 
     // Build S1AP E-RAB setup request (APER via nextgcore-s1ap). The ESM message
     // is carried inside it, so transmit the PDU (issue #42).
@@ -937,6 +974,7 @@ pub fn nas_eps_send_activate_default_bearer_context_request(
 /// * `Ok(())` - Message sent successfully
 /// * `Err(NasError)` - On error
 pub fn nas_eps_send_activate_dedicated_bearer_context_request(
+    ctx: &MmeContext,
     bearer: &MmeBearer,
     mme_ue: &MmeUe,
     enb_ue: &EnbUe,
@@ -951,7 +989,11 @@ pub fn nas_eps_send_activate_dedicated_bearer_context_request(
         return Err(NasError::EnbUeNotFound);
     }
 
-    let esm_message = esm_build::build_activate_dedicated_bearer_context_request(bearer);
+    let esm_message = protect_esm(
+        ctx,
+        mme_ue.id,
+        &esm_build::build_activate_dedicated_bearer_context_request(bearer),
+    )?;
 
     // Build S1AP E-RAB setup request (APER via nextgcore-s1ap). The ESM message
     // is carried inside it, so transmit the PDU (issue #42).
@@ -974,6 +1016,7 @@ pub fn nas_eps_send_activate_dedicated_bearer_context_request(
 /// * `Ok(())` - Message sent successfully
 /// * `Err(NasError)` - On error
 pub fn nas_eps_send_modify_bearer_context_request(
+    ctx: &MmeContext,
     bearer: &MmeBearer,
     mme_ue: &MmeUe,
     enb_ue: &EnbUe,
@@ -990,8 +1033,11 @@ pub fn nas_eps_send_modify_bearer_context_request(
         return Err(NasError::EnbUeNotFound);
     }
 
-    let esm_message =
-        esm_build::build_modify_bearer_context_request(bearer, qos_presence, tft_presence);
+    let esm_message = protect_esm(
+        ctx,
+        mme_ue.id,
+        &esm_build::build_modify_bearer_context_request(bearer, qos_presence, tft_presence),
+    )?;
 
     if qos_presence {
         // Build S1AP E-RAB modify request (APER via nextgcore-s1ap). The ESM
@@ -1015,6 +1061,7 @@ pub fn nas_eps_send_modify_bearer_context_request(
 /// * `Ok(())` - Message sent successfully
 /// * `Err(NasError)` - On error
 pub fn nas_eps_send_deactivate_bearer_context_request(
+    ctx: &MmeContext,
     bearer: &MmeBearer,
     mme_ue: &MmeUe,
     enb_ue: &EnbUe,
@@ -1029,8 +1076,11 @@ pub fn nas_eps_send_deactivate_bearer_context_request(
         return Err(NasError::EnbUeNotFound);
     }
 
-    let esm_message =
-        esm_build::build_deactivate_bearer_context_request(bearer, EsmCause::RegularDeactivation);
+    let esm_message = protect_esm(
+        ctx,
+        mme_ue.id,
+        &esm_build::build_deactivate_bearer_context_request(bearer, EsmCause::RegularDeactivation),
+    )?;
 
     // Build S1AP E-RAB release command (APER via nextgcore-s1ap). The ESM
     // message is carried inside it, so transmit the PDU (issue #42).
@@ -1058,6 +1108,7 @@ pub fn nas_eps_send_deactivate_bearer_context_request(
 /// * `Ok(())` - Message sent successfully
 /// * `Err(NasError)` - On error
 pub fn nas_eps_send_bearer_resource_allocation_reject(
+    ctx: &MmeContext,
     mme_ue: &MmeUe,
     enb_ue: &EnbUe,
     pti: u8,
@@ -1078,7 +1129,11 @@ pub fn nas_eps_send_bearer_resource_allocation_reject(
         return Err(NasError::InvalidParameter);
     }
 
-    let esm_message = esm_build::build_bearer_resource_allocation_reject(pti, esm_cause);
+    let esm_message = protect_esm(
+        ctx,
+        mme_ue.id,
+        &esm_build::build_bearer_resource_allocation_reject(pti, esm_cause),
+    )?;
 
     nas_eps_send_to_downlink_nas_transport(enb_ue, esm_message)
 }
@@ -1095,6 +1150,7 @@ pub fn nas_eps_send_bearer_resource_allocation_reject(
 /// * `Ok(())` - Message sent successfully
 /// * `Err(NasError)` - On error
 pub fn nas_eps_send_bearer_resource_modification_reject(
+    ctx: &MmeContext,
     mme_ue: &MmeUe,
     enb_ue: &EnbUe,
     pti: u8,
@@ -1115,7 +1171,11 @@ pub fn nas_eps_send_bearer_resource_modification_reject(
         return Err(NasError::InvalidParameter);
     }
 
-    let esm_message = esm_build::build_bearer_resource_modification_reject(pti, esm_cause);
+    let esm_message = protect_esm(
+        ctx,
+        mme_ue.id,
+        &esm_build::build_bearer_resource_modification_reject(pti, esm_cause),
+    )?;
 
     nas_eps_send_to_downlink_nas_transport(enb_ue, esm_message)
 }
@@ -1189,6 +1249,70 @@ mod tests {
             t3412_from(720, 1800),
             3600,
             "a subscribed timer must not silently become the old hardcoded value"
+        );
+    }
+
+    /// #497: a standalone downlink ESM message leaves the MME protected under the
+    /// UE's LIVE EPS security context. Checked independently of
+    /// `nas_eps_security_encode`: the MAC is recomputed straight from TS 33.401
+    /// Annex B.2.3 (128-EIA2: AES-CMAC over COUNT || BEARER || DIRECTION || 0^26 ||
+    /// SN || ciphered message) and the body deciphered from Annex B.1.3 (128-EEA2:
+    /// AES-CTR, counter COUNT || BEARER || DIRECTION || 0^90), both with
+    /// `nextgcore_crypt` directly, downlink direction 1, NAS bearer 0 (TS 24.301
+    /// §4.4.3.1). Two messages in a row prove the pool's downlink COUNT advances,
+    /// which a snapshot of the UE could not do.
+    #[test]
+    fn standalone_esm_is_protected_under_the_live_context() {
+        let ctx = MmeContext::new();
+        let id = ctx.mme_ue_add(1);
+        let (k_int, k_enc) = ([0x11u8; 16], [0x22u8; 16]);
+        {
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            let ue = pool.get_mut(&id).unwrap();
+            ue.selected_int_algorithm = 2;
+            ue.selected_enc_algorithm = 2;
+            ue.knas_int = k_int;
+            ue.knas_enc = k_enc;
+            ue.dl_count = 0x0000_0102; // overflow 1, SN 2
+        }
+        let plain = esm_build::build_esm_information_request(0);
+        for (n, expected_count) in [0x0000_0102u32, 0x0000_0103].into_iter().enumerate() {
+            let secured = protect_esm(&ctx, id, &plain).expect("protects");
+            // Security header type 2 (integrity protected and ciphered), PD 7.
+            assert_eq!(secured[0], 0x27, "message {n}");
+            assert_eq!(
+                secured[5], expected_count as u8,
+                "NAS sequence number, message {n}"
+            );
+            assert_ne!(
+                &secured[6..],
+                &plain[..],
+                "the body is ciphered, message {n}"
+            );
+
+            let mut block = expected_count.to_be_bytes().to_vec();
+            block.extend_from_slice(&[1 << 2, 0, 0, 0]); // BEARER 0, DIRECTION 1 (downlink)
+            block.extend_from_slice(&secured[5..]); // SN || ciphered message
+            let mac = nextgcore_crypt::aes_cmac::aes_cmac_calculate(&k_int, &block);
+            assert_eq!(&secured[1..5], &mac[..4], "MAC verifies, message {n}");
+
+            let mut iv = [0u8; 16];
+            iv[..4].copy_from_slice(&expected_count.to_be_bytes());
+            iv[4] = 1 << 2;
+            let mut deciphered = vec![0u8; secured.len() - 6];
+            nextgcore_crypt::aes::aes_ctr128_encrypt(
+                &k_enc,
+                &mut iv,
+                &secured[6..],
+                &mut deciphered,
+            )
+            .expect("EEA2");
+            assert_eq!(deciphered, plain, "body deciphers, message {n}");
+        }
+        assert_eq!(
+            ctx.mme_ue_pool.read().unwrap().get(&id).unwrap().dl_count,
+            0x0000_0104,
+            "the live context's downlink COUNT advanced once per message"
         );
     }
 
