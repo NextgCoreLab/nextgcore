@@ -112,7 +112,7 @@ fn hand_written_s1_setup_messages_agree_with_the_generated_codec() {
     ] {
         for ttw in [None, Some(TimeToWait::V1s), Some(TimeToWait::V60s)] {
             let bytes = build_s1_setup_failure(&S1SetupFailure {
-                cause: cause.clone(),
+                cause,
                 time_to_wait: ttw,
             })
             .unwrap();
