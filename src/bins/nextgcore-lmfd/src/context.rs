@@ -228,6 +228,10 @@ pub struct PositioningSession {
     pub request_id: u64,
     /// Session creation instant (timeout bookkeeping).
     pub created_at: std::time::Instant,
+    /// Where this session's NRPPa leg went (#515): the serving AMF and UE context
+    /// the E-CID Measurement Initiation was relayed through, so an ERROR
+    /// INDICATION for the gNB's report can go back the same way.
+    pub nrppa_peer: Option<NrppaPeer>,
     /// One-shot completion channel to the awaiting DetermineLocation handler.
     sender: Option<tokio::sync::oneshot::Sender<PositioningOutcome>>,
 }
@@ -240,6 +244,14 @@ pub struct PositioningSessionInfo {
     pub lpp_transaction: u8,
     pub supi: Option<String>,
     pub request_id: u64,
+    pub nrppa_peer: Option<NrppaPeer>,
+}
+
+/// The serving AMF and UE context an NRPPa exchange is relayed through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NrppaPeer {
+    pub amf: crate::namf_client::DiscoveredAmf,
+    pub ue_context_id: String,
 }
 
 /// LMF Context
@@ -792,6 +804,7 @@ impl LmfContext {
             supi,
             request_id,
             created_at: std::time::Instant::now(),
+            nrppa_peer: None,
             sender: Some(tx),
         };
         if let Ok(mut s) = self.positioning_sessions.write() {
@@ -878,7 +891,17 @@ impl LmfContext {
                 lpp_transaction: s.lpp_transaction,
                 supi: s.supi.clone(),
                 request_id: s.request_id,
+                nrppa_peer: s.nrppa_peer.clone(),
             })
+    }
+
+    /// Record where a session's NRPPa leg was relayed (#515).
+    pub fn positioning_session_set_nrppa_peer(&self, corr: &str, peer: NrppaPeer) {
+        if let Ok(mut sessions) = self.positioning_sessions.write() {
+            if let Some(session) = sessions.get_mut(corr) {
+                session.nrppa_peer = Some(peer);
+            }
+        }
     }
 
     /// Look up the `lcsCorrelationId` of the newest session that used LPP
