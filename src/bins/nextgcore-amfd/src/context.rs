@@ -2110,6 +2110,69 @@ impl AmfContext {
         expired
     }
 
+    /// One pass of the paging procedure (TS 24.501 §5.6.2.2.1 / §5.6.2.2.2).
+    ///
+    /// A context never sent is due now. A sent one is due again once T3513 has run
+    /// for `t3513`: while `retransmit_count < max_retransmit` the paging is
+    /// retransmitted and T3513 restarted; on the expiry after the last attempt the
+    /// context is removed and returned as expired. Marks `last_sent` on every
+    /// context it returns in `send`, so the caller transmits and nothing else.
+    pub fn paging_take_due(&self, t3513: std::time::Duration) -> PagingDue {
+        let mut due = PagingDue::default();
+        let now = std::time::Instant::now();
+        let Ok(mut paging_map) = self.paging_map.write() else {
+            return due;
+        };
+        let mut expired_ids = Vec::new();
+        for (id, ctx) in paging_map.iter_mut() {
+            match ctx.last_sent {
+                None => {
+                    ctx.last_sent = Some(now);
+                    due.send.push(ctx.clone());
+                }
+                Some(sent) if now.duration_since(sent) >= t3513 => {
+                    if ctx.retransmit_count < ctx.max_retransmit {
+                        ctx.retransmit_count += 1;
+                        ctx.last_sent = Some(now);
+                        due.send.push(ctx.clone());
+                    } else {
+                        expired_ids.push(*id);
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+        for id in expired_ids {
+            if let Some(ctx) = paging_map.remove(&id) {
+                log::warn!(
+                    "[UE NGAP ID: {id}] T3513 expired after {} retransmissions: paging abandoned",
+                    ctx.retransmit_count
+                );
+                due.expired.push(ctx);
+            }
+        }
+        due
+    }
+
+    /// Remove and return the paging context for the UE identified by this
+    /// 5G-S-TMSI (AMF Set ID, AMF Pointer, 5G-TMSI) -- how a Service Request
+    /// answering the page identifies the UE (TS 24.501 §5.6.1.2).
+    pub fn paging_take_by_s_tmsi(
+        &self,
+        amf_set_id: u16,
+        amf_pointer: u8,
+        tmsi: u32,
+    ) -> Option<PagingContext> {
+        let mut paging_map = self.paging_map.write().ok()?;
+        let id = paging_map
+            .iter()
+            .find(|(_, c)| {
+                c.tmsi == tmsi && c.amf_set_id == amf_set_id && c.amf_pointer == amf_pointer
+            })
+            .map(|(id, _)| *id)?;
+        paging_map.remove(&id)
+    }
+
     /// Get number of active paging entries
     pub fn paging_count(&self) -> usize {
         self.paging_map.read().map(|m| m.len()).unwrap_or(0)
@@ -4147,6 +4210,29 @@ pub struct PagingContext {
     pub pending_n2: Option<Vec<u8>>,
     /// PDU session ID that triggered paging
     pub pdu_session_id: Option<u8>,
+    /// The UE's registration area as (PLMN, TAC) pairs: the TAIs PAGING is sent
+    /// for (TS 38.413 §8.5.1). Empty means "the single `plmn_id`/`tac` above".
+    pub tai_list: Vec<(PlmnId, u32)>,
+    /// When PAGING last went out; `None` until the first transmission. T3513
+    /// (TS 24.501 §5.6.2.2.1) runs from this instant.
+    pub last_sent: Option<std::time::Instant>,
+    /// The consumer's n1n2FailureTxfNotifURI, notified on final T3513 expiry
+    /// (TS 23.502 §4.2.3.3 step 4c, TS 29.518 §5.2.2.3.1).
+    pub failure_notify_uri: Option<String>,
+    /// The N1N2 transfer resource the notification names (n1n2MsgDataUri).
+    pub n1n2_msg_data_uri: String,
+    /// SUPI of the paged UE, used to clear the session's paging state.
+    pub supi: Option<String>,
+}
+
+/// What one paging pump pass decided (TS 24.501 §5.6.2.2.1 / §5.6.2.2.2).
+#[derive(Debug, Default)]
+pub struct PagingDue {
+    /// Contexts whose PAGING must go out now: first transmissions, and
+    /// retransmissions on T3513 expiry while attempts remain.
+    pub send: Vec<PagingContext>,
+    /// Contexts whose final T3513 expired: paging is abandoned.
+    pub expired: Vec<PagingContext>,
 }
 
 impl Default for PagingContext {
@@ -4164,6 +4250,22 @@ impl Default for PagingContext {
             pending_n1: None,
             pending_n2: None,
             pdu_session_id: None,
+            tai_list: Vec::new(),
+            last_sent: None,
+            failure_notify_uri: None,
+            n1n2_msg_data_uri: String::new(),
+            supi: None,
+        }
+    }
+}
+
+impl PagingContext {
+    /// The TAIs to page in: the registration area, or the single stored TAI.
+    pub fn paging_tais(&self) -> Vec<(PlmnId, u32)> {
+        if self.tai_list.is_empty() {
+            vec![(self.plmn_id.clone(), self.tac)]
+        } else {
+            self.tai_list.clone()
         }
     }
 }
@@ -4950,12 +5052,16 @@ mod tests {
              a new site must either use the helper or this count must be raised \
              deliberately"
         );
-        // Positive: the chain is seeded once, where KgNB is derived.
+        // Positive: the chain is seeded where KgNB is derived -- the two places an
+        // AS security context is established: the registration's Initial Context
+        // Setup, and (#512) the one answering a CM-IDLE Service Request, which
+        // derives a fresh KgNB from that message's uplink NAS COUNT and so restarts
+        // the {NH, NCC} chain at NCC 0 (TS 33.501 §6.9.2.1, Annex A.9/A.10).
         assert_eq!(
             src.matches("init_next_hop_chain()").count(),
-            1,
-            "the forward-security chain must be seeded exactly once, at \
-             AS-security-context establishment"
+            2,
+            "the forward-security chain must be seeded exactly at AS-security-context \
+             establishment: registration ICS and the CM-IDLE Service Request ICS"
         );
         // Negative, and the reason the positives above are not enough on their
         // own: the defective form conveyed the stored pair unchanged.

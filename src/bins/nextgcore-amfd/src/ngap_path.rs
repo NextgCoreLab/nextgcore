@@ -376,6 +376,70 @@ fn integrity_failure_action(msg_type: u8, has_context: bool) -> IntegrityFailure
 
 /// Whether NAS-based 5G-GUTI reallocation (the UE Configuration Update procedure) is
 /// enabled. Off unless `AMF_GUTI_REALLOCATION` is set to a truthy value.
+/// T3513, the paging timer (TS 24.501 §5.6.2.2.1, Table 10.2.2: "network
+/// dependent"). 5 s unless `AMF_T3513_SECS` overrides it; `AMF_T3513_MILLIS`
+/// exists so tests can run the full retransmission ladder quickly.
+fn paging_t3513() -> Duration {
+    if let Some(ms) = std::env::var("AMF_T3513_MILLIS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    let secs = std::env::var("AMF_T3513_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(5);
+    Duration::from_secs(secs)
+}
+
+/// The plain SERVICE REQUEST inside an initial NAS message, if that is what it is:
+/// either sent plain, or integrity protected (security header type 1, TS 24.501
+/// §9.3.1) with the plain message after the 6-octet MAC/SQN header.
+fn initial_service_request_plain(nas: &[u8]) -> Option<Vec<u8>> {
+    match nas.get(1).copied()? {
+        security_header::PLAIN_NAS_MESSAGE
+            if nas.get(2) == Some(&message_type::SERVICE_REQUEST) =>
+        {
+            Some(nas.to_vec())
+        }
+        0x01 if nas.len() >= 10 && nas[7] == 0x7E && nas[9] == message_type::SERVICE_REQUEST => {
+            Some(nas[7..].to_vec())
+        }
+        _ => None,
+    }
+}
+
+/// The 5G-S-TMSI a SERVICE REQUEST identifies the UE with (TS 24.501 §8.2.16:
+/// a 5GS mobile identity LV-E after the ngKSI/service-type octet; §9.11.3.4:
+/// type 0b100, AMF Set ID 10 bits, AMF Pointer 6 bits, 5G-TMSI 32 bits).
+/// Returns (AMF Set ID, AMF Pointer, 5G-TMSI).
+fn service_request_s_tmsi(plain: &[u8]) -> Option<(u16, u8, u32)> {
+    let len = u16::from_be_bytes([*plain.get(4)?, *plain.get(5)?]) as usize;
+    let id = plain.get(6..6 + len)?;
+    if len != 7 || id[0] & 0x07 != 0x04 {
+        return None;
+    }
+    let amf_set_id = (u16::from(id[1]) << 2) | u16::from(id[2] >> 6);
+    let amf_pointer = id[2] & 0x3F;
+    let tmsi = u32::from_be_bytes([id[3], id[4], id[5], id[6]]);
+    Some((amf_set_id, amf_pointer, tmsi))
+}
+
+/// Clear the paging state the N1N2 transfer set on the paged PDU session
+/// (`AmfSess::store_paging_info`), once paging has ended either way.
+fn clear_session_paging(paging: &crate::context::PagingContext) {
+    let Some(psi) = paging.pdu_session_id else {
+        return;
+    };
+    let ctx = crate::context::amf_self();
+    let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+    if let Some(mut sess) = guard.sess_find_by_psi(paging.amf_ue_ngap_id, psi) {
+        sess.clear_paging_info();
+        guard.sess_update(&sess);
+    }
+}
+
 fn guti_reallocation_enabled() -> bool {
     std::env::var("AMF_GUTI_REALLOCATION")
         .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes" | "on"))
@@ -454,6 +518,10 @@ pub struct UeNasContext {
     /// Running reachability supervision (TS 24.501 §5.3.7). `None` while the UE has a
     /// live N1 signalling connection: a UE the AMF can reach needs no supervision.
     reachability: Option<Reachability>,
+    /// CM-IDLE (TS 23.501 §5.3.3.2.2): the N1 signalling connection was released
+    /// (UE Context Release Complete) and the UE has not come back with a Service
+    /// Request. Independent of `reachability`, whose timer can be disabled.
+    cm_idle: bool,
     /// UDM SDM subscription ID (from Nudm_SDM_Subscribe)
     sdm_subscription_id: Option<String>,
     /// PCF AM policy association ID (from Npcf_AMPolicyControl_Create)
@@ -506,6 +574,8 @@ impl UeNasContext {
             amf_ue.use_nextgcore_nas_security,
         );
         ctx.suci = amf_ue.suci.clone().unwrap_or_default();
+        // A record published without a RAN UE context has no N1 connection.
+        ctx.cm_idle = amf_ue.ran_ue_id == crate::context::NEXTGCORE_INVALID_POOL_ID;
         ctx.amf_ue = amf_ue;
         ctx.registered = true;
         ctx
@@ -523,6 +593,12 @@ impl crate::ue_store::UeIdentity for UeNasContext {
 }
 
 impl UeNasContext {
+    /// CM-IDLE: the N1 connection was released (set at UE Context Release
+    /// Complete, cleared when the UE comes back with a Service Request).
+    pub(crate) fn is_cm_idle(&self) -> bool {
+        self.cm_idle
+    }
+
     /// Create a per-UE NAS context. `use_nextgcore_nas_security` is the Wave-6
     /// H9 runtime canary applied to the fresh `AmfUe`: the production caller
     /// passes `crate::context::nas_security_canary()` (the process-wide setting,
@@ -555,6 +631,7 @@ impl UeNasContext {
             initial_context_setup_response_received: false,
             registration_accept_sent: false,
             ue_policy_container: None,
+            cm_idle: false,
         }
     }
 }
@@ -780,6 +857,11 @@ impl NgapServer {
         // enqueued (#396, TS 29.518 §5.2.2.4.1.3 / TS 38.413 §8.12) to the
         // NG-RAN nodes the consumer targeted. Dormant when none pending.
         self.process_pws_n2_transfers().await;
+
+        // Page every CM-IDLE UE a Namf N1N2MessageTransfer queued (#512, TS 23.502
+        // §4.2.3.3): PAGING to the gNBs serving its registration area, T3513
+        // retransmission, and the failure notification on final expiry.
+        self.process_paging().await;
 
         // Send the HandoverRequest for every EPS→5GS handover the N26 leg prepared
         // (#418, TS 23.502 §4.11.1.2.2.2 step 9). Dormant when none is queued.
@@ -1729,6 +1811,22 @@ impl NgapServer {
             return Ok(());
         }
         let msg_type = nas[2];
+
+        // A SERVICE REQUEST in an Initial UE Message is a UE coming back from
+        // CM-IDLE -- possibly answering a page (#512). It is sent integrity
+        // protected (TS 24.501 §4.4.6), so its message type is inside the security
+        // header, not at octet 3; recognised here before the plain dispatch.
+        if let Some(plain_sr) = initial_service_request_plain(&nas) {
+            return self
+                .handle_idle_service_request(
+                    association_id,
+                    amf_ue_ngap_id,
+                    &initial_ue,
+                    &nas,
+                    &plain_sr,
+                )
+                .await;
+        }
 
         match msg_type {
             message_type::REGISTRATION_REQUEST => {
@@ -4767,6 +4865,199 @@ impl NgapServer {
     }
 
     /// Handle Service Request (TS 24.501 Section 5.6.1)
+    /// A SERVICE REQUEST from a UE in CM-IDLE (TS 23.502 §4.2.3.2), arriving in an
+    /// Initial UE Message with fresh NGAP IDs -- the response to a page (§4.2.3.3)
+    /// or a UE-initiated return.
+    ///
+    /// The UE is found by the 5G-S-TMSI it presents, the message is integrity
+    /// checked under that UE's stored NAS security context (TS 24.501 §4.4.4.3),
+    /// and the UE's record moves to the new AMF-UE-NGAP-ID. The Service Accept then
+    /// rides an INITIAL CONTEXT SETUP REQUEST with a fresh K_gNB (TS 23.502
+    /// §4.2.3.2 step 12, TS 33.501 Annex A.9 over this message's uplink NAS COUNT),
+    /// which also carries any N2 SM information the paging context held. Only an
+    /// integrity-checked response stops T3513 (TS 24.501 §5.6.2.2.1): an unknown
+    /// identity, an unprotected message or a failed MAC is answered with SERVICE
+    /// REJECT #9 and the page keeps running.
+    async fn handle_idle_service_request(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        initial_ue: &crate::ngap_asn1::InitialUeMessageData,
+        nas: &[u8],
+        plain: &[u8],
+    ) -> Result<()> {
+        let ran_ue_ngap_id = initial_ue.ran_ue_ngap_id;
+        let resolved = service_request_s_tmsi(plain).and_then(|(set, ptr, tmsi)| {
+            self.ue_auth_state.snapshot().into_iter().find(|(_, st)| {
+                st.registered
+                    && st.amf_ue.current_guti.amf_set_id == set
+                    && st.amf_ue.current_guti.amf_pointer == ptr
+                    && st.amf_ue.current_guti.tmsi == tmsi
+            })
+        });
+        let Some((old_id, mut state)) = resolved else {
+            return self
+                .reject_idle_service_request(
+                    association_id,
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    "no UE holds the presented 5G-S-TMSI",
+                )
+                .await;
+        };
+        if nas[1] == security_header::PLAIN_NAS_MESSAGE {
+            return self
+                .reject_idle_service_request(
+                    association_id,
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    "not integrity protected",
+                )
+                .await;
+        }
+        let decoded = nas_security::nas_5gs_security_decode(&mut state.amf_ue, nas[1], nas);
+        let mac_failed = std::mem::take(&mut state.amf_ue.mac_failed);
+        if decoded.is_err() || mac_failed {
+            return self
+                .reject_idle_service_request(
+                    association_id,
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    "integrity check failed",
+                )
+                .await;
+        }
+
+        // The UE is back: its record moves to the new NGAP IDs and leaves CM-IDLE.
+        self.ue_auth_state.remove(old_id);
+        state.ran_ue_ngap_id = ran_ue_ngap_id;
+        state.association_id = association_id;
+        state.reachability = None;
+        state.cm_idle = false;
+        state.amf_ue.nr_tai = crate::context::Tai5gs {
+            plmn_id: initial_ue.plmn_id.clone(),
+            tac: initial_ue.tac,
+        };
+        state.amf_ue.nr_cgi = crate::context::NrCgi {
+            plmn_id: initial_ue.plmn_id.clone(),
+            cell_id: initial_ue.nr_cell_identity,
+        };
+
+        // Answering a page stops T3513 and hands over what was waiting.
+        let paging = {
+            let g = &state.amf_ue.current_guti;
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.paging_take_by_s_tmsi(g.amf_set_id, g.amf_pointer, g.tmsi)
+        };
+        let mut sessions = Vec::new();
+        if let Some(p) = &paging {
+            clear_session_paging(p);
+            if let (Some(psi), Some(transfer)) = (p.pdu_session_id, p.pending_n2.clone()) {
+                let s_nssai = {
+                    let ctx = crate::context::amf_self();
+                    let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+                    guard
+                        .sess_find_by_psi(p.amf_ue_ngap_id, psi)
+                        .map(|s| s.s_nssai)
+                };
+                match s_nssai {
+                    Some(s_nssai) => sessions.push(crate::ngap_asn1::CxtReqSession {
+                        pdu_session_id: psi,
+                        s_nssai,
+                        transfer,
+                    }),
+                    None => log::warn!(
+                        "Paged PDU session {psi} of UE {old_id} no longer exists; its N2 SM information is dropped"
+                    ),
+                }
+            }
+        }
+
+        let kgnb = nextgcore_crypt::kdf::nextgcore_kdf_kgnb_and_kn3iwf(
+            &state.amf_ue.kamf,
+            state.amf_ue.ul_count,
+            if state.amf_ue.access_type == 0 {
+                ACCESS_TYPE_3GPP
+            } else {
+                state.amf_ue.access_type
+            },
+        );
+        state.amf_ue.kgnb = kgnb;
+        state.amf_ue.init_next_hop_chain();
+        state.initial_context_setup_request_sent = true;
+        state.initial_context_setup_response_received = false;
+        let accept = gmm_build::build_service_accept(&state.amf_ue).unwrap_or_default();
+        let allowed_nssai = state.amf_ue.allowed_nssai.clone();
+        let ue_security_capability = state.amf_ue.ue_security_capability.clone();
+        let ue_ambr = (state.amf_ue.ue_ambr.downlink > 0 || state.amf_ue.ue_ambr.uplink > 0)
+            .then_some((state.amf_ue.ue_ambr.downlink, state.amf_ue.ue_ambr.uplink));
+        self.ue_auth_state.insert(amf_ue_ngap_id, state);
+
+        let Some(protected) = self.protect_nas(amf_ue_ngap_id, &accept) else {
+            return Ok(());
+        };
+        let ics = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            crate::ngap_asn1::build_initial_context_setup_request_with_sessions_asn1(
+                &guard,
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                &allowed_nssai,
+                &ue_security_capability,
+                &kgnb,
+                Some(&protected),
+                ue_ambr,
+                &sessions,
+            )
+        };
+        let Some(ics) = ics else {
+            log::error!("Failed to build Initial Context Setup Request for the Service Request of UE {amf_ue_ngap_id}");
+            return Ok(());
+        };
+        self.send_to_association(association_id, &ics).await?;
+        log::info!(
+            "Service Request from CM-IDLE: UE {old_id} -> {amf_ue_ngap_id}, Service Accept in \
+             Initial Context Setup with {} paged PDU session(s){}",
+            sessions.len(),
+            if paging.is_some() {
+                " (page answered, T3513 stopped)"
+            } else {
+                ""
+            }
+        );
+        // The same CM-IDLE -> CM-CONNECTED reports `handle_service_request_nas`
+        // fires, for the same reasons recorded there.
+        if let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) {
+            crate::namf_server::fire_connectivity_state_report(&state.amf_ue, true);
+            crate::namf_server::fire_reachability_report(&state.amf_ue, true);
+            crate::namf_server::fire_location_report(&state.amf_ue);
+            crate::namf_server::fire_presence_in_aoi_report(&state.amf_ue);
+        }
+        crate::namf_server::fire_ues_in_area_report();
+        Ok(())
+    }
+
+    /// SERVICE REJECT #9 for a CM-IDLE Service Request the AMF cannot accept
+    /// (TS 24.501 §5.6.1.5): the UE re-registers.
+    async fn reject_idle_service_request(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        why: &str,
+    ) -> Result<()> {
+        log::warn!("Service Request in Initial UE Message rejected (#9): {why}");
+        let reject = gmm_build::build_service_reject(
+            &AmfUe::default(),
+            GmmCause::UeIdentityCannotBeDerivedByTheNetwork,
+        );
+        self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
+            .await?;
+        Ok(())
+    }
+
     async fn handle_service_request_nas(
         &mut self,
         association_id: u64,
@@ -6903,8 +7194,18 @@ impl NgapServer {
             }
             Undecodable => None,
         };
-        // TS 24.501 §5.3.7: the N1 signalling connection is now gone. For a UE that is
-        // still REGISTERED this is the moment the mobile reachable timer starts.
+        // The N1 signalling connection is gone: a registered UE is now CM-IDLE, which
+        // is what makes a later N1N2 transfer page it (#512). Marked whether or not
+        // the mobile reachable timer below is enabled.
+        if let Some(id) = amf_ue_ngap_id {
+            self.ue_auth_state.with_mut(id, |s| {
+                if s.registered {
+                    s.cm_idle = true;
+                }
+            });
+        }
+        // TS 24.501 §5.3.7: for a UE that is still REGISTERED this is the moment the
+        // mobile reachable timer starts.
         self.start_reachability_supervision(association_id, amf_ue_ngap_id)
             .await;
         Ok(())
@@ -10450,42 +10751,117 @@ impl NgapServer {
     ///
     /// This is called when the AMF needs to page a UE in CM-IDLE state,
     /// e.g., when downlink data notification is received from SMF.
-    pub async fn send_paging(
-        &mut self,
-        amf_set_id: u16,
-        amf_pointer: u8,
-        tmsi: u32,
-        plmn_id: &crate::context::PlmnId,
-        tac: u32,
-    ) -> Result<()> {
-        let paging_bytes = match crate::ngap_asn1::build_paging_asn1(
-            amf_set_id,
-            amf_pointer,
-            tmsi,
-            plmn_id,
+    /// The associations of the gNBs serving at least one of these TAIs: a TAI
+    /// matches a gNB's SupportedTAList entry when both its TAC and one of that
+    /// entry's broadcast PLMNs match (TS 38.413 §9.3.3.8). Paging goes only to
+    /// these (TS 38.413 §8.5.1, TS 23.502 §4.2.3.3 step 4b).
+    async fn paging_target_associations(&self, tais: &[(crate::context::PlmnId, u32)]) -> Vec<u64> {
+        self.sessions
+            .read()
+            .await
+            .values()
+            .filter(|session| {
+                tais.iter().any(|(plmn, tac)| {
+                    session.gnb.supported_ta_list.iter().any(|ta| {
+                        ta.tac == *tac && ta.bplmn_list.iter().any(|b| b.plmn_id == *plmn)
+                    })
+                })
+            })
+            .map(|session| session.association_id)
+            .collect()
+    }
+
+    /// Send the NGAP PAGING for one paging context to every gNB serving the
+    /// UE's registration area. Returns how many associations it went out on.
+    pub async fn send_paging(&mut self, paging: &crate::context::PagingContext) -> Result<usize> {
+        let tais = paging.paging_tais();
+        // The PAGING's TAI List for Paging names the registration area. This AMF
+        // assigns a one-TAI registration area (`gmm_build`), so it is that TAI.
+        let (plmn_id, tac) = tais
+            .first()
+            .cloned()
+            .unwrap_or((paging.plmn_id.clone(), paging.tac));
+        let Some(paging_bytes) = crate::ngap_asn1::build_paging_asn1(
+            paging.amf_set_id,
+            paging.amf_pointer,
+            paging.tmsi,
+            &plmn_id,
             tac,
-        ) {
-            Some(bytes) => bytes,
-            None => {
-                log::error!("Failed to build Paging message");
-                return Err(anyhow::anyhow!("Failed to build Paging message"));
-            }
+        ) else {
+            log::error!("Failed to build Paging message");
+            return Err(anyhow::anyhow!("Failed to build Paging message"));
         };
 
-        // Send to all connected gNBs (in production, filter by TAI match)
-        let association_ids: Vec<u64> = self.sessions.read().await.keys().copied().collect();
-        let gnb_count = association_ids.len();
-
-        for assoc_id in association_ids {
-            if let Err(e) = self.send_to_association(assoc_id, &paging_bytes).await {
-                log::warn!("Failed to send Paging to association {assoc_id}: {e}");
+        let targets = self.paging_target_associations(&tais).await;
+        let mut sent = 0usize;
+        for assoc_id in &targets {
+            match self.send_to_association(*assoc_id, &paging_bytes).await {
+                Ok(()) => sent += 1,
+                Err(e) => log::warn!("Failed to send Paging to association {assoc_id}: {e}"),
             }
         }
-
         log::info!(
-            "Paging sent to {gnb_count} gNBs: amf_set_id={amf_set_id}, tmsi=0x{tmsi:08x}, tac={tac}"
+            "Paging sent to {sent}/{} gNB(s) serving the registration area: \
+             5G-S-TMSI=({}, {}, 0x{:08x}), attempt {}",
+            targets.len(),
+            paging.amf_set_id,
+            paging.amf_pointer,
+            paging.tmsi,
+            u32::from(paging.retransmit_count) + 1
         );
-        Ok(())
+        Ok(sent)
+    }
+
+    /// The paging pump (#512): transmit due PAGINGs and abandon expired ones.
+    ///
+    /// TS 24.501 §5.6.2.2.1 starts T3513 when paging starts; §5.6.2.2.2 has the
+    /// network retransmit on T3513 expiry and restart it, a bounded number of
+    /// times. On the last expiry, TS 23.502 §4.2.3.3 step 4c: the AMF tells the
+    /// requester with Namf_Communication_N1N2TransferFailureNotification, cause
+    /// UE_NOT_RESPONDING (TS 29.518 Table 6.1.6.3.x / §6.1.6.2.8).
+    async fn process_paging(&mut self) {
+        self.process_paging_with(paging_t3513()).await;
+    }
+
+    /// [`Self::process_paging`] with T3513 supplied, so a test can run the whole
+    /// retransmission ladder without sleeping.
+    async fn process_paging_with(&mut self, t3513: Duration) {
+        let due = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.paging_take_due(t3513)
+        };
+        for paging in &due.send {
+            if let Err(e) = self.send_paging(paging).await {
+                log::warn!("Paging for UE {} not sent: {e}", paging.amf_ue_ngap_id);
+            }
+        }
+        for paging in due.expired {
+            self.paging_abandoned(&paging);
+        }
+    }
+
+    /// Final T3513 expiry: notify the requester and clear the session's paging
+    /// state, so a later transfer is not refused as "paging ongoing".
+    fn paging_abandoned(&self, paging: &crate::context::PagingContext) {
+        if let Some(uri) = &paging.failure_notify_uri {
+            crate::namf_server::send_n1n2_failure_notification(
+                uri.clone(),
+                "UE_NOT_RESPONDING",
+                paging.n1n2_msg_data_uri.clone(),
+            );
+        }
+        clear_session_paging(paging);
+        log::warn!(
+            "Paging abandoned for UE {}: no response after {} attempt(s){}",
+            paging.amf_ue_ngap_id,
+            u32::from(paging.retransmit_count) + 1,
+            if paging.failure_notify_uri.is_some() {
+                ", requester notified (UE_NOT_RESPONDING)"
+            } else {
+                ""
+            }
+        );
     }
 
     /// Send message to a gNB by association ID
@@ -13907,6 +14283,413 @@ mod tests {
     // ========================================================================
     // #396: PWS N2 relay (TS 29.518 §5.2.2.4.1.3, TS 38.413 §8.12)
     // ========================================================================
+
+    // ---- #512: paging and the CM-IDLE Service Request ---------------------------
+
+    /// A SERVICE REQUEST, integrity protected (security header type 1) around the
+    /// plain message: EPD, SHT 0, type 0x4C, ngKSI/service type, then the 5GS
+    /// mobile identity LV-E holding a 5G-S-TMSI (TS 24.501 §8.2.16 / §9.11.3.4),
+    /// octets derived by hand: AMF Set ID 0x155 = 01 0101 0101 and AMF Pointer
+    /// 0x2A = 10 1010 give `55 6A`; type octet 0xF4.
+    ///
+    /// Each test pages a DIFFERENT 5G-TMSI: the paging map and the UE store are
+    /// process-global, and a Service Request resolves by 5G-S-TMSI, so a shared
+    /// identity would let one test answer another's page.
+    fn protected_service_request(mac: [u8; 4], tmsi: u32) -> Vec<u8> {
+        let mut nas = vec![0x7E, 0x01];
+        nas.extend_from_slice(&mac);
+        nas.push(0x00); // SQN
+        nas.extend_from_slice(&[0x7E, 0x00, 0x4C, 0x01, 0x00, 0x07, 0xF4, 0x55, 0x6A]);
+        nas.extend_from_slice(&tmsi.to_be_bytes());
+        nas
+    }
+
+    #[test]
+    fn the_service_request_s_tmsi_is_read_from_its_5gs_mobile_identity() {
+        let nas = protected_service_request([0; 4], 0xDEAD_BEEF);
+        let plain =
+            initial_service_request_plain(&nas).expect("an integrity-protected SR is recognised");
+        assert_eq!(plain[2], message_type::SERVICE_REQUEST);
+        assert_eq!(
+            service_request_s_tmsi(&plain),
+            Some((0x155, 0x2A, 0xDEAD_BEEF))
+        );
+        // A plain one is recognised too; a REGISTRATION REQUEST is not.
+        assert!(initial_service_request_plain(&plain).is_some());
+        assert!(initial_service_request_plain(&[0x7E, 0x00, 0x41, 0x09]).is_none());
+        // Anything but the 5G-S-TMSI type is not an identity this path can resolve.
+        let mut wrong_type = plain.clone();
+        wrong_type[6] = 0xF2;
+        assert_eq!(service_request_s_tmsi(&wrong_type), None);
+    }
+
+    fn paged_ue(amf_ue_ngap_id: u64, max_retransmit: u8) -> crate::context::PagingContext {
+        crate::context::PagingContext {
+            amf_ue_ngap_id,
+            // The NGAP ID doubles as the 5G-TMSI: unique per test by construction.
+            tmsi: amf_ue_ngap_id as u32,
+            amf_set_id: 0x155,
+            amf_pointer: 0x2A,
+            plmn_id: PlmnId::new("001", "01"),
+            tac: 0x74,
+            max_retransmit,
+            tai_list: vec![(PlmnId::new("001", "01"), 0x74)],
+            ..Default::default()
+        }
+    }
+
+    /// TS 38.413 §8.5.1 / TS 23.502 §4.2.3.3 step 4b: PAGING goes to the NG-RAN
+    /// nodes serving the UE's registration area, not to every connected gNB.
+    #[tokio::test]
+    async fn paging_goes_only_to_the_gnbs_serving_the_registration_area() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let ngap = test_ngap_server().await;
+        insert_pws_test_gnb(
+            &ngap,
+            5121,
+            0x5121,
+            crate::context::RatType::Nr,
+            &[("001", "01", 0x74)],
+        )
+        .await;
+        insert_pws_test_gnb(
+            &ngap,
+            5122,
+            0x5122,
+            crate::context::RatType::Nr,
+            &[("001", "01", 0x75)],
+        )
+        .await;
+        insert_pws_test_gnb(
+            &ngap,
+            5123,
+            0x5123,
+            crate::context::RatType::Nr,
+            &[("002", "02", 0x74)],
+        )
+        .await;
+        let tais = paged_ue(1, 0).paging_tais();
+        assert_eq!(
+            ngap.paging_target_associations(&tais).await,
+            vec![5121],
+            "only the gNB whose SupportedTAList holds (001-01, TAC 0x74): a TAC match in \
+             another PLMN is a different TAI"
+        );
+    }
+
+    /// TS 24.501 §5.6.2.2.1 / §5.6.2.2.2: PAGING at once, a retransmission on each
+    /// T3513 expiry while attempts remain, then abandonment -- which clears the
+    /// session's paging state so the next transfer is not refused as ongoing.
+    #[tokio::test]
+    async fn t3513_retransmits_the_paging_then_abandons_it() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let ue_id = 5_120_001u64;
+        let sess = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap();
+            let mut sess = guard.sess_add(ue_id, 5).expect("session");
+            sess.store_paging_info("/namf-comm/v1/ue-contexts/x/n1-n2-messages", None);
+            guard.sess_update(&sess);
+            sess
+        };
+        assert!(sess.paging.ongoing);
+        let mut paging = paged_ue(ue_id, 2);
+        paging.pdu_session_id = Some(5);
+        crate::context::amf_self()
+            .read()
+            .unwrap()
+            .paging_add(paging);
+        let attempts = || {
+            crate::context::amf_self()
+                .read()
+                .unwrap()
+                .paging_find(ue_id)
+                .map(|p| (p.last_sent.is_some(), p.retransmit_count))
+        };
+
+        // A long T3513 sends only the initial PAGING, then nothing until expiry.
+        ngap.process_paging_with(Duration::from_secs(3600)).await;
+        assert_eq!(
+            attempts(),
+            Some((true, 0)),
+            "the first PAGING goes out at once"
+        );
+        ngap.process_paging_with(Duration::from_secs(3600)).await;
+        assert_eq!(
+            attempts(),
+            Some((true, 0)),
+            "nothing more before T3513 expires"
+        );
+
+        // Zero T3513: each pass is an expiry.
+        ngap.process_paging_with(Duration::ZERO).await;
+        assert_eq!(attempts(), Some((true, 1)));
+        ngap.process_paging_with(Duration::ZERO).await;
+        assert_eq!(attempts(), Some((true, 2)));
+        ngap.process_paging_with(Duration::ZERO).await;
+        assert_eq!(
+            attempts(),
+            None,
+            "after the last attempt the page is abandoned"
+        );
+        let after = crate::context::amf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_psi(ue_id, 5)
+            .expect("session");
+        assert!(
+            !after.paging.ongoing,
+            "abandonment clears the session's paging state"
+        );
+    }
+
+    /// A registered UE in CM-IDLE, as the release left it, with NIA0 so the test
+    /// can build a protected Service Request without a key schedule.
+    fn idle_registered_ue(old_id: u64) -> UeNasContext {
+        let mut ue = UeNasContext::new(old_id, 51, 1, false);
+        ue.registered = true;
+        ue.amf_ue.security_context_available = true;
+        ue.amf_ue.current_guti.amf_set_id = 0x155;
+        ue.amf_ue.current_guti.amf_pointer = 0x2A;
+        ue.amf_ue.current_guti.tmsi = old_id as u32;
+        ue.reachability = Some(Reachability {
+            phase: ReachabilityPhase::MobileReachable,
+            deadline: Instant::now() + Duration::from_secs(3600),
+        });
+        ue.cm_idle = true;
+        ue
+    }
+
+    fn service_request_initial_ue(nas: Vec<u8>) -> Vec<u8> {
+        nextgcore_ngap::builder::build_initial_ue_message(
+            &nextgcore_ngap::types::InitialUeMessage {
+                ran_ue_ngap_id: 512,
+                nas_pdu: nas,
+                user_location_info: test_user_location(0x74, 0x0005_1200),
+                rrc_establishment_cause: nextgcore_ngap::types::RrcEstablishmentCause::MtAccess,
+                ue_context_request: None,
+                allowed_nssai: Vec::new(),
+            },
+        )
+        .expect("encode an InitialUEMessage")
+    }
+
+    /// TS 23.502 §4.2.3.2 / §4.2.3.3: the page is answered by a Service Request in a
+    /// fresh Initial UE Message. The UE is found by its 5G-S-TMSI, leaves CM-IDLE
+    /// under the new NGAP ID, T3513 stops (the paging context is consumed) and the
+    /// paged session's state is cleared. Before #512 this Initial UE Message was
+    /// always answered SERVICE REJECT #9 and the UE context stayed where it was.
+    #[tokio::test]
+    async fn a_service_request_answering_the_page_moves_the_ue_and_stops_t3513() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let old_id = 5_120_101u64;
+        let new_id = 5_120_102u64;
+        *ngap.next_gnb_id.lock().await = new_id;
+        ngap.ue_auth_state
+            .insert(old_id, idle_registered_ue(old_id));
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap();
+            let mut sess = guard.sess_add(old_id, 5).expect("session");
+            sess.store_paging_info("/namf-comm/v1/ue-contexts/x/n1-n2-messages", None);
+            guard.sess_update(&sess);
+            let mut paging = paged_ue(old_id, 4);
+            paging.pdu_session_id = Some(5);
+            paging.pending_n2 = Some(vec![0x00, 0x00, 0x00]);
+            guard.paging_add(paging);
+        }
+
+        let pdu = service_request_initial_ue(protected_service_request([0; 4], old_id as u32));
+        // The ICS itself cannot egress here (no association, and no served GUAMI in
+        // the test process); its content is pinned by
+        // `the_initial_context_setup_carries_the_paged_session`. What is asserted is
+        // everything the AMF decides before the send.
+        let _ = ngap.handle_initial_ue_message(1, &pdu).await;
+
+        assert!(
+            ngap.ue_auth_state.get(old_id).is_none(),
+            "the old record is gone"
+        );
+        let moved = ngap
+            .ue_auth_state
+            .get(new_id)
+            .expect("the UE moved to the new NGAP ID");
+        assert!(!moved.is_cm_idle(), "the UE is CM-CONNECTED again");
+        assert_eq!(moved.ran_ue_ngap_id, 512);
+        assert!(moved.initial_context_setup_request_sent);
+        assert_eq!(
+            moved.amf_ue.nr_tai.tac, 0x74,
+            "the location it came back from"
+        );
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap();
+        assert!(
+            guard.paging_find(old_id).is_none(),
+            "answering the page stops T3513"
+        );
+        assert!(!guard.sess_find_by_psi(old_id, 5).unwrap().paging.ongoing);
+    }
+
+    /// TS 24.501 §5.6.2.2.1: only an integrity-checked response stops T3513. A
+    /// Service Request whose MAC fails is rejected (#9), the UE stays where it was,
+    /// and the page keeps running.
+    #[tokio::test]
+    async fn a_service_request_failing_its_integrity_check_keeps_the_page_running() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let old_id = 5_120_201u64;
+        let mut ue = idle_registered_ue(old_id);
+        ue.amf_ue.selected_int_algorithm = 2; // NIA2: the zero MAC below is wrong
+        ue.amf_ue.knas_int = [0x11; 16];
+        ngap.ue_auth_state.insert(old_id, ue);
+        crate::context::amf_self()
+            .read()
+            .unwrap()
+            .paging_add(paged_ue(old_id, 4));
+
+        let pdu = service_request_initial_ue(protected_service_request([0; 4], old_id as u32));
+        let _ = ngap.handle_initial_ue_message(1, &pdu).await;
+
+        let kept = ngap
+            .ue_auth_state
+            .get(old_id)
+            .expect("the UE stays where it was");
+        assert!(kept.is_cm_idle(), "still CM-IDLE");
+        assert!(
+            crate::context::amf_self()
+                .read()
+                .unwrap()
+                .paging_find(old_id)
+                .is_some(),
+            "T3513 keeps running after a response that failed its integrity check"
+        );
+    }
+
+    /// The N1 release is what makes a registered UE CM-IDLE, and so pageable: a
+    /// UE CONTEXT RELEASE COMPLETE marks it whether or not the mobile reachable
+    /// timer is enabled, and an N1N2 transfer for it then pages (#512). Before,
+    /// the Namf side judged "idle" by the NAS security flag, which a registered
+    /// idle UE still has, so it was never paged.
+    #[tokio::test]
+    async fn the_n1_release_makes_a_registered_ue_cm_idle() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let id = 5_120_301u64;
+        let mut ue = UeNasContext::new(id, 53, 1, false);
+        ue.registered = true;
+        ngap.ue_auth_state.insert(id, ue);
+        assert!(!ngap.ue_auth_state.get(id).unwrap().is_cm_idle());
+        let pdu = nextgcore_ngap::builder::build_ue_context_release_complete(
+            &nextgcore_ngap::types::UeContextReleaseComplete {
+                amf_ue_ngap_id: id,
+                ran_ue_ngap_id: 53,
+            },
+        )
+        .expect("encode");
+        let _ = ngap.handle_ue_context_release_complete(1, &pdu).await;
+        assert!(ngap.ue_auth_state.get(id).unwrap().is_cm_idle());
+    }
+
+    /// The paged N2 SM information rides the Initial Context Setup Request as a
+    /// PDUSessionResourceSetupListCxtReq item (id 71, reject), right after the GUAMI
+    /// (InitialContextSetupRequestIEs order); with no sessions the builder is the
+    /// pre-#512 one byte for byte.
+    #[test]
+    fn the_initial_context_setup_carries_the_paged_session() {
+        // A local context with one served GUAMI: the builder needs it, and the
+        // process-global one may have none in a test run.
+        let mut guard = crate::context::AmfContext::new();
+        guard.num_of_served_guami = 1;
+        guard.served_guami.push(crate::context::Guami {
+            plmn_id: PlmnId::new("001", "01"),
+            amf_id: crate::context::AmfId {
+                region: 2,
+                set: 1,
+                pointer: 0,
+            },
+        });
+        let caps = crate::context::UeSecurityCapability {
+            ea: 0xE0,
+            ia: 0xE0,
+            eea: 0xE0,
+            eia: 0xE0,
+        };
+        let key = [0x5A; 32];
+        // Allowed NSSAI is SIZE(1..8): the encoder refuses an empty list.
+        let nssai = [crate::context::SNssai { sst: 1, sd: None }];
+        let plain = crate::ngap_asn1::build_initial_context_setup_request_asn1(
+            &guard,
+            9,
+            10,
+            &nssai,
+            &caps,
+            &key,
+            Some(&[0x7E, 0x00, 0x4E]),
+            None,
+        )
+        .expect("ics");
+        let none = crate::ngap_asn1::build_initial_context_setup_request_with_sessions_asn1(
+            &guard,
+            9,
+            10,
+            &nssai,
+            &caps,
+            &key,
+            Some(&[0x7E, 0x00, 0x4E]),
+            None,
+            &[],
+        )
+        .expect("ics");
+        assert_eq!(plain, none, "no sessions: unchanged bytes");
+        let with = crate::ngap_asn1::build_initial_context_setup_request_with_sessions_asn1(
+            &guard,
+            9,
+            10,
+            &nssai,
+            &caps,
+            &key,
+            Some(&[0x7E, 0x00, 0x4E]),
+            None,
+            &[crate::ngap_asn1::CxtReqSession {
+                pdu_session_id: 5,
+                s_nssai: crate::context::SNssai { sst: 1, sd: None },
+                transfer: vec![0xAB, 0xCD],
+            }],
+        )
+        .expect("ics");
+        let nextgcore_ngap_gen::NGAP_PDU::InitiatingMessage(msg) =
+            nextgcore_ngap_gen::decode(&with).expect("decodes")
+        else {
+            panic!("an initiating message");
+        };
+        let nextgcore_ngap_gen::generated::InitiatingMessageValue::Id_InitialContextSetup(req) =
+            msg.value
+        else {
+            panic!("an Initial Context Setup Request");
+        };
+        let ids: Vec<u16> = req.protocol_i_es.0.iter().map(|e| e.id.0).collect();
+        let at = ids
+            .iter()
+            .position(|id| *id == 71)
+            .expect("the session list is present");
+        assert_eq!(
+            ids[at - 1],
+            nextgcore_ngap_gen::generated::ID_GUAMI,
+            "right after the GUAMI: {ids:?}"
+        );
+        let nextgcore_ngap_gen::generated::InitialContextSetupRequestProtocolIEs_EntryValue::Id_PDUSessionResourceSetupListCxtReq(list) =
+            &req.protocol_i_es.0[at].value
+        else {
+            panic!("the session list value");
+        };
+        assert_eq!(list.0[0].pdu_session_id.0, 5);
+        assert_eq!(
+            list.0[0].pdu_session_resource_setup_request_transfer.0,
+            vec![0xAB, 0xCD]
+        );
+    }
 
     /// Register a gNB session on `ngap` with a chosen gNB ID, RAT and supported
     /// TA list, so the targeting resolver has real nodes to select over.

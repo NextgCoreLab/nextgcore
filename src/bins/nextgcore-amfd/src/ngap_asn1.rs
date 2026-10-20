@@ -943,6 +943,45 @@ pub fn build_initial_context_setup_request_asn1(
     nas_pdu: Option<&[u8]>,
     ue_ambr: Option<(u64, u64)>,
 ) -> Option<Vec<u8>> {
+    build_initial_context_setup_request_with_sessions_asn1(
+        ctx,
+        amf_ue_ngap_id,
+        ran_ue_ngap_id,
+        allowed_nssai,
+        ue_security_capability,
+        security_key,
+        nas_pdu,
+        ue_ambr,
+        &[],
+    )
+}
+
+/// One PDU session to set up inside an Initial Context Setup Request
+/// (TS 38.413 §9.2.2.1, PDUSessionResourceSetupItemCxtReq): its ID, S-NSSAI and
+/// the PDUSessionResourceSetupRequestTransfer the SMF supplied, relayed as is.
+#[derive(Debug, Clone)]
+pub struct CxtReqSession {
+    pub pdu_session_id: u8,
+    pub s_nssai: crate::context::SNssai,
+    pub transfer: Vec<u8>,
+}
+
+/// [`build_initial_context_setup_request_asn1`] plus a PDU Session Resource
+/// Setup Request List, as the Service Request answering a page needs (TS 23.502
+/// §4.2.3.2 step 12: the N2 Request carries the N2 SM information). An empty
+/// `sessions` omits the IE, so the original builder is exactly this with `&[]`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_initial_context_setup_request_with_sessions_asn1(
+    ctx: &AmfContext,
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+    allowed_nssai: &[crate::context::SNssai],
+    ue_security_capability: &crate::context::UeSecurityCapability,
+    security_key: &[u8; 32],
+    nas_pdu: Option<&[u8]>,
+    ue_ambr: Option<(u64, u64)>,
+    sessions: &[CxtReqSession],
+) -> Option<Vec<u8>> {
     use ngap_gen::{
         InitialContextSetupRequest, InitialContextSetupRequestProtocolIEs,
         InitialContextSetupRequestProtocolIEs_Entry as Entry,
@@ -1002,6 +1041,30 @@ pub fn build_initial_context_setup_request_asn1(
             ie_extensions: None,
         }),
     ));
+    // PDUSessionResourceSetupListCxtReq (id 71, reject): object-set position
+    // right after the GUAMI (InitialContextSetupRequestIEs, TS 38.413 §9.4.4).
+    if !sessions.is_empty() {
+        let items = sessions
+            .iter()
+            .map(|s| ngap_gen::PDUSessionResourceSetupItemCxtReq {
+                pdu_session_id: ngap_gen::PDUSessionID(s.pdu_session_id),
+                nas_pdu: None,
+                s_nssai: generated_s_nssai(&s.s_nssai),
+                pdu_session_resource_setup_request_transfer:
+                    ngap_gen::PDUSessionResourceSetupItemCxtReqPDUSessionResourceSetupRequestTransfer(
+                        s.transfer.clone(),
+                    ),
+                ie_extensions: None,
+            })
+            .collect();
+        ies.push(entry(
+            ngap_gen::ID_PDU_SESSION_RESOURCE_SETUP_LIST_CXT_REQ,
+            &reject,
+            Ie::Id_PDUSessionResourceSetupListCxtReq(ngap_gen::PDUSessionResourceSetupListCxtReq(
+                items,
+            )),
+        ));
+    }
     ies.push(entry(
         ngap_gen::ID_ALLOWED_NSSAI,
         &reject,

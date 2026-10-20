@@ -387,6 +387,25 @@ pub(crate) fn find_ue_by_context_id(ue_context_id: &str) -> Option<AmfUe> {
     }
 }
 
+/// CM-IDLE as the NGAP layer knows it: the N1 signalling connection was released
+/// and mobile-reachable supervision runs until the UE comes back (TS 24.501
+/// §5.3.7) -- the record the paging procedure (#512) acts on.
+fn ue_cm_idle(ue: &AmfUe) -> bool {
+    let ctx = amf_self();
+    let Ok(guard) = ctx.read() else {
+        return false;
+    };
+    match guard.ue_store().get(ue.id) {
+        Some(state) => state.is_cm_idle(),
+        // No NGAP record at all: no N1 connection can exist, unless a RAN UE
+        // context in the AMF pool says otherwise.
+        None => {
+            drop(guard);
+            ue_ran_context(ue).is_none()
+        }
+    }
+}
+
 /// CM state check: the UE is CM-CONNECTED when it has a live RAN UE context
 fn ue_ran_context(ue: &AmfUe) -> Option<RanUe> {
     if ue.ran_ue_id == NEXTGCORE_INVALID_POOL_ID {
@@ -3533,8 +3552,13 @@ pub fn handle_n1_n2_message_transfer_request(
         skip_ind,
     };
 
-    let result =
-        namf_handler::handle_n1_n2_message_transfer(&ue, &mut sess, ran_ue.as_ref(), &req_data);
+    let result = namf_handler::handle_n1_n2_message_transfer(
+        &ue,
+        &mut sess,
+        ran_ue.as_ref(),
+        ue_cm_idle(&ue),
+        &req_data,
+    );
 
     // Persist any session mutations (paging state, release flags)
     {
