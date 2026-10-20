@@ -331,9 +331,10 @@ pub fn nas_eps_send_attach_accept(
     nas_eps_send_to_enb(mme_ue, enb_ue, s1ap_message)
 }
 
-/// Send attach reject message
+/// Send attach reject message, then release the UE's S1 connection
 ///
 /// # Arguments
+/// * `ctx` - MME context (the release marks the eNB UE context)
 /// * `enb_ue` - eNB UE context
 /// * `mme_ue` - MME UE context
 /// * `emm_cause` - EMM cause code
@@ -343,6 +344,7 @@ pub fn nas_eps_send_attach_accept(
 /// * `Ok(())` - Message sent successfully
 /// * `Err(NasError)` - On error
 pub fn nas_eps_send_attach_reject(
+    ctx: &MmeContext,
     enb_ue: &EnbUe,
     mme_ue: &MmeUe,
     emm_cause: EmmCause,
@@ -370,7 +372,27 @@ pub fn nas_eps_send_attach_reject(
     // Build EMM attach reject
     let emm_message = emm_build::build_attach_reject(emm_cause, esm_message.as_deref());
 
-    nas_eps_send_to_downlink_nas_transport(enb_ue, emm_message)
+    let sent = nas_eps_send_to_downlink_nas_transport(enb_ue, emm_message);
+
+    // TS 24.301 §5.3.1.2.1: releasing the NAS signalling connection is the
+    // network's job, and a rejected UE does not release it itself. For the causes
+    // of §5.3.1.2.1 a) (#11-#15, #25, #31, #35, #42, #78) the UE starts T3440 for
+    // the explicit purpose of letting the network release it; for the rest
+    // (e.g. #17, abnormal case d of §5.5.1.2.6) it starts T3411 and retries, and a
+    // release after the reject is not an abnormal case for it (case b only covers
+    // a release BEFORE the reject arrives). So the MME releases after every
+    // Attach Reject (TS 23.401 §5.3.5 MME-initiated S1 release, TS 36.413 §8.3.3),
+    // as the AMF does after a Registration Reject (`reject_and_release`, #359) --
+    // otherwise the UE stays RRC-connected and the eNB UE context is held for a
+    // deregistered UE until the RAN gives up on it.
+    //
+    // Ordering: both PDUs go through the one S1AP send queue, so the Downlink NAS
+    // Transport carrying the reject is on the wire before the release command.
+    // The release runs whether or not the reject was queued, because the release
+    // is the part that must happen (the same reasoning as #359).
+    nas_dispatch::release_ue_context_with_cause(ctx, enb_ue, s1ap_build::nas_cause::NORMAL_RELEASE);
+
+    sent
 }
 
 /// Send identity request message
@@ -785,6 +807,7 @@ pub fn nas_eps_send_cs_service_notification(mme_ue: &mut MmeUe, enb_ue: &EnbUe) 
 /// * `Ok(())` - Message sent successfully
 /// * `Err(NasError)` - On error
 pub fn nas_eps_send_pdn_connectivity_reject(
+    ctx: &MmeContext,
     _sess: &MmeSess,
     mme_ue: &MmeUe,
     enb_ue: &EnbUe,
@@ -803,7 +826,13 @@ pub fn nas_eps_send_pdn_connectivity_reject(
 
     if create_action == GtpCreateAction::InAttachRequest {
         // During attach, send attach reject with piggybacked PDN connectivity reject
-        return nas_eps_send_attach_reject(enb_ue, mme_ue, EmmCause::EsmFailure, Some(esm_cause));
+        return nas_eps_send_attach_reject(
+            ctx,
+            enb_ue,
+            mme_ue,
+            EmmCause::EsmFailure,
+            Some(esm_cause),
+        );
     }
 
     let esm_message = esm_build::build_pdn_connectivity_reject(esm_cause);
