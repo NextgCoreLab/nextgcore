@@ -1,23 +1,10 @@
-//! Cross-codec checks: every NRPPa PDU lmfd builds with the hand-written
-//! `nextgcore-asn1c::nrppa` codec must decode under this generated codec and
-//! re-encode to the same octets, and hand-derived X.691 octets pin both.
+//! Golden checks: hand-derived X.691 octets for NRPPa messages lmfd exchanges
+//! decode under this generated codec and re-encode to the same octets. Until #515
+//! deleted it, nextgcore-asn1c's hand-written NRPPa codec was cross-checked here
+//! too; both codecs produced these octets.
 
 use super::*;
-use nextgcore_asn1c::nrppa::ies::{
-    ECidMeasurementResult, MeasurementPeriodicity, MeasurementQuantities,
-    MeasurementQuantitiesItem, MeasurementQuantitiesValue, NgRanAccessPointPosition, NgRanCell,
-    NgRanCgi, PlmnIdentity, ReportCharacteristics, Tac, UeMeasurementId,
-};
-use nextgcore_asn1c::nrppa::pdu::{
-    build_ecid_measurement_initiation_request, build_ecid_measurement_report,
-    build_trp_information_request, build_trp_information_response,
-};
-use nextgcore_asn1c::nrppa::trp::{
-    GeographicalCoordinates, TrpId, TrpInformation, TrpInformationTypeItem,
-    TrpInformationTypeResponseItem, TrpInformationTypeResponseList, TrpPositionDefinitionType,
-    TrpPositionDirect, TrpPositionDirectAccuracy,
-};
-use nextgcore_asn1c::nrppa::types::NrppaTransactionId;
+use generated as nrppa;
 
 /// Decode `bytes` with the generated codec and re-encode; the octets must not move.
 fn assert_round_trips(label: &str, bytes: &[u8]) -> NRPPA_PDU {
@@ -25,17 +12,9 @@ fn assert_round_trips(label: &str, bytes: &[u8]) -> NRPPA_PDU {
     let again = encode(&pdu).unwrap_or_else(|e| panic!("{label}: generated encode failed: {e:?}"));
     assert_eq!(
         again, bytes,
-        "{label}: generated re-encode differs from the hand-written octets"
+        "{label}: generated re-encode differs from the golden octets"
     );
     pdu
-}
-
-fn rsrp() -> MeasurementQuantities {
-    MeasurementQuantities {
-        items: vec![MeasurementQuantitiesItem {
-            measurement_quantities_value: MeasurementQuantitiesValue::Rsrp,
-        }],
-    }
 }
 
 /// TS 38.455 E-CIDMeasurementInitiationRequest, derived by hand from X.691:
@@ -61,142 +40,19 @@ const ECID_INITIATION_REQUEST: [u8; 34] = [
 ];
 
 #[test]
-fn ecid_measurement_initiation_request_matches_x691_in_both_codecs() {
-    let hand = build_ecid_measurement_initiation_request(
-        NrppaTransactionId(7),
-        UeMeasurementId(3),
-        ReportCharacteristics::Periodic,
-        Some(MeasurementPeriodicity::Ms1024),
-        &rsrp(),
-    )
-    .unwrap()
-    .encode()
-    .unwrap();
-    assert_eq!(
-        &hand[..],
-        &ECID_INITIATION_REQUEST[..],
-        "hand-written codec"
-    );
-    assert_round_trips("E-CID initiation request", &ECID_INITIATION_REQUEST);
-}
-
-#[test]
-fn ecid_measurement_initiation_request_variants_agree() {
-    let periodicities = [
-        None,
-        Some(MeasurementPeriodicity::Ms120),
-        Some(MeasurementPeriodicity::Ms1024),
-        Some(MeasurementPeriodicity::Min60),
-    ];
-    for tx in [0u16, 1, 255, 256, 32767] {
-        for meas in [1u16, 15] {
-            for &per in &periodicities {
-                for rc in [
-                    ReportCharacteristics::OnDemand,
-                    ReportCharacteristics::Periodic,
-                ] {
-                    let hand = build_ecid_measurement_initiation_request(
-                        NrppaTransactionId(tx),
-                        UeMeasurementId(meas),
-                        rc,
-                        per,
-                        &rsrp(),
-                    )
-                    .unwrap()
-                    .encode()
-                    .unwrap();
-                    assert_round_trips(&format!("tx {tx} meas {meas} {per:?} {rc:?}"), &hand);
-                }
-            }
-        }
-    }
-}
-
-fn sample_result(cell: u64) -> ECidMeasurementResult {
-    ECidMeasurementResult {
-        serving_cell_id: NgRanCgi {
-            plmn_identity: PlmnIdentity([0x99, 0xf9, 0x07]),
-            ng_ran_cell: NgRanCell::NrCellId(cell),
-        },
-        serving_cell_tac: Tac::from_u24(7),
-        ng_ran_access_point_position: None,
-        measured_results: None,
-    }
-}
-
-#[test]
-fn ecid_measurement_report_agrees() {
-    for cell in [0u64, 1, 0x1_2345_6789, (1u64 << 36) - 1] {
-        let hand = build_ecid_measurement_report(
-            NrppaTransactionId(9),
-            UeMeasurementId(3),
-            UeMeasurementId(5),
-            &sample_result(cell),
-            None,
-        )
-        .unwrap()
-        .encode()
-        .unwrap();
-        assert_round_trips(&format!("E-CID report cell {cell:#x}"), &hand);
-    }
-}
-
-#[test]
-fn trp_information_request_agrees() {
-    let types = vec![
-        TrpInformationTypeItem::NrPci,
-        TrpInformationTypeItem::Arfcn,
-        TrpInformationTypeItem::GeoCoord,
-    ];
-    for trps in [
-        None,
-        Some(vec![TrpId(1)]),
-        Some(vec![TrpId(1), TrpId(2), TrpId(65535)]),
-    ] {
-        let hand =
-            build_trp_information_request(NrppaTransactionId(3), trps.clone(), types.clone())
-                .unwrap()
-                .encode()
-                .unwrap();
-        assert_round_trips(&format!("TRP request {trps:?}"), &hand);
-    }
-}
-
-#[test]
-fn trp_information_response_agrees() {
-    let position = NgRanAccessPointPosition {
-        latitude_sign_south: true,
-        latitude: 8_388_607,
-        longitude: -8_388_608,
-        direction_of_altitude_depth: true,
-        altitude: 32_767,
-        uncertainty_semi_major: 127,
-        uncertainty_semi_minor: 0,
-        orientation_of_major_axis: 179,
-        uncertainty_altitude: 1,
-        confidence: 100,
+fn ecid_measurement_initiation_request_matches_x691() {
+    let nrppa::NRPPA_PDU::InitiatingMessage(m) =
+        assert_round_trips("E-CID initiation request", &ECID_INITIATION_REQUEST)
+    else {
+        panic!("not an initiating message");
     };
-    let info = |id: u16| TrpInformation {
-        trp_id: TrpId(id),
-        response_list: TrpInformationTypeResponseList {
-            items: vec![
-                TrpInformationTypeResponseItem::PciNr(1007),
-                TrpInformationTypeResponseItem::Arfcn(3_279_165),
-                TrpInformationTypeResponseItem::GeographicalCoordinates(GeographicalCoordinates {
-                    position_definition_type: TrpPositionDefinitionType::Direct(
-                        TrpPositionDirect {
-                            accuracy: TrpPositionDirectAccuracy::TrpPosition(position),
-                        },
-                    ),
-                }),
-            ],
-        },
+    assert_eq!(m.procedure_code.0, nrppa::ID_E_CID_MEASUREMENT_INITIATION);
+    assert_eq!(m.nrppatransaction_id.0, 7);
+    let nrppa::InitiatingMessageValue::Id_e_CIDMeasurementInitiation(req) = m.value else {
+        panic!("not an E-CID Measurement Initiation Request");
     };
-    let hand = build_trp_information_response(NrppaTransactionId(3), vec![info(1), info(65535)])
-        .unwrap()
-        .encode()
-        .unwrap();
-    assert_round_trips("TRP response", &hand);
+    let ids: Vec<u16> = req.protocol_i_es.0.iter().map(|ie| ie.id.0).collect();
+    assert_eq!(ids, vec![2, 3, 4, 5]);
 }
 
 /// TS 38.455 TRPInformationRequest (no TRPList; types nrPCI, geoCoord), derived
@@ -234,44 +90,34 @@ const TRP_INFORMATION_RESPONSE: [u8; 22] = [
 ];
 
 #[test]
-fn trp_information_request_matches_x691_in_both_codecs() {
-    let hand = build_trp_information_request(
-        NrppaTransactionId(3),
-        None,
-        vec![
-            TrpInformationTypeItem::NrPci,
-            TrpInformationTypeItem::GeoCoord,
-        ],
-    )
-    .unwrap()
-    .encode()
-    .unwrap();
-    assert_eq!(
-        &hand[..],
-        &TRP_INFORMATION_REQUEST[..],
-        "hand-written codec"
-    );
-    assert_round_trips("TRP request golden", &TRP_INFORMATION_REQUEST);
+fn trp_information_request_matches_x691() {
+    let nrppa::NRPPA_PDU::InitiatingMessage(m) =
+        assert_round_trips("TRP request golden", &TRP_INFORMATION_REQUEST)
+    else {
+        panic!("not an initiating message");
+    };
+    assert_eq!(m.procedure_code.0, nrppa::ID_T_RP_INFORMATION_EXCHANGE);
 }
 
 #[test]
-fn trp_information_response_matches_x691_in_both_codecs() {
-    let hand = build_trp_information_response(
-        NrppaTransactionId(3),
-        vec![TrpInformation {
-            trp_id: TrpId(1),
-            response_list: TrpInformationTypeResponseList {
-                items: vec![TrpInformationTypeResponseItem::PciNr(17)],
-            },
-        }],
-    )
-    .unwrap()
-    .encode()
-    .unwrap();
-    assert_eq!(
-        &hand[..],
-        &TRP_INFORMATION_RESPONSE[..],
-        "hand-written codec"
-    );
-    assert_round_trips("TRP response golden", &TRP_INFORMATION_RESPONSE);
+fn trp_information_response_matches_x691() {
+    let nrppa::NRPPA_PDU::SuccessfulOutcome(m) =
+        assert_round_trips("TRP response golden", &TRP_INFORMATION_RESPONSE)
+    else {
+        panic!("not a successful outcome");
+    };
+    let nrppa::SuccessfulOutcomeValue::Id_tRPInformationExchange(resp) = m.value else {
+        panic!("not a TRP Information Response");
+    };
+    let nrppa::TRPInformationResponseProtocolIEs_EntryValue::Id_TRPInformationListTRPResp(list) =
+        &resp.protocol_i_es.0[0].value
+    else {
+        panic!("not the TRP information list");
+    };
+    let item = &list.0[0].trp_information;
+    assert_eq!(item.trp_id.0, 1);
+    assert!(matches!(
+        &item.trp_information_type_response_list.0[0],
+        nrppa::TRPInformationTypeResponseItem::PCI_NR(p) if p.0 == 17
+    ));
 }

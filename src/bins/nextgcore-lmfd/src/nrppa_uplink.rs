@@ -269,5 +269,185 @@ fn build_error_indication(txn: u16, cause: u8, diags: &[Diag]) -> Result<Vec<u8>
     nextgcore_nrppa_gen::encode(&pdu).map_err(|e| format!("NRPPa ERROR INDICATION encode: {e:?}"))
 }
 
+/// Test builders on the generated codec, the reference now that the hand-written
+/// NRPPa codec is gone (#515): E-CID Measurement Reports, and splicing an IE into
+/// (or out of) one, which the generated encoder cannot do for an unknown id.
+#[cfg(test)]
+pub mod test_support {
+    use super::nrppa;
+    use bitvec::prelude::*;
+
+    pub fn nr_cgi(plmn: [u8; 3], cell: u64) -> nrppa::NG_RAN_CGI {
+        let mut bits: BitVec<u8, Msb0> = BitVec::new();
+        for i in (0..36).rev() {
+            bits.push((cell >> i) & 1 == 1);
+        }
+        nrppa::NG_RAN_CGI {
+            plmn_identity: nrppa::PLMN_Identity(plmn.to_vec()),
+            ng_ra_ncell: nrppa::NG_RANCell::NR_CellID(nrppa::NRCellIdentifier(bits)),
+            ie_extensions: None,
+        }
+    }
+
+    pub fn eutra_cgi(plmn: [u8; 3], cell: u32) -> nrppa::NG_RAN_CGI {
+        let mut bits: BitVec<u8, Msb0> = BitVec::new();
+        for i in (0..28).rev() {
+            bits.push((cell >> i) & 1 == 1);
+        }
+        nrppa::NG_RAN_CGI {
+            plmn_identity: nrppa::PLMN_Identity(plmn.to_vec()),
+            ng_ra_ncell: nrppa::NG_RANCell::EUTRA_CellID(nrppa::EUTRACellIdentifier(bits)),
+            ie_extensions: None,
+        }
+    }
+
+    pub fn rsrp(values: &[u8]) -> nrppa::MeasuredResultsValue {
+        nrppa::MeasuredResultsValue::ResultRSRP_EUTRA(nrppa::ResultRSRP_EUTRA(
+            values
+                .iter()
+                .map(|v| nrppa::ResultRSRP_EUTRA_Item {
+                    pci_eutra: nrppa::PCI_EUTRA(42),
+                    earfcn: nrppa::EARFCN(1850),
+                    cgi_eutra: None,
+                    value_rsrp_eutra: nrppa::ValueRSRP_EUTRA(*v),
+                    ie_extensions: None,
+                })
+                .collect(),
+        ))
+    }
+
+    pub fn rsrq(values: &[u8]) -> nrppa::MeasuredResultsValue {
+        nrppa::MeasuredResultsValue::ResultRSRQ_EUTRA(nrppa::ResultRSRQ_EUTRA(
+            values
+                .iter()
+                .map(|v| nrppa::ResultRSRQ_EUTRA_Item {
+                    pci_eutra: nrppa::PCI_EUTRA(42),
+                    earfcn: nrppa::EARFCN(1850),
+                    cgi_utra: None,
+                    value_rsrq_eutra: nrppa::ValueRSRQ_EUTRA(*v),
+                    ie_extensions: None,
+                })
+                .collect(),
+        ))
+    }
+
+    pub fn ta1(v: u16) -> nrppa::MeasuredResultsValue {
+        nrppa::MeasuredResultsValue::ValueTimingAdvanceType1_EUTRA(
+            nrppa::MeasuredResultsValue_valueTimingAdvanceType1_EUTRA(v),
+        )
+    }
+
+    pub fn ta2(v: u16) -> nrppa::MeasuredResultsValue {
+        nrppa::MeasuredResultsValue::ValueTimingAdvanceType2_EUTRA(
+            nrppa::MeasuredResultsValue_valueTimingAdvanceType2_EUTRA(v),
+        )
+    }
+
+    pub fn aoa(v: u16) -> nrppa::MeasuredResultsValue {
+        nrppa::MeasuredResultsValue::ValueAngleOfArrival_EUTRA(
+            nrppa::MeasuredResultsValue_valueAngleOfArrival_EUTRA(v),
+        )
+    }
+
+    /// An E-CID Measurement Report (TS 38.455 §9.1.2.4), IEs in object-set order.
+    pub fn ecid_report(
+        txn: u16,
+        lmf: u16,
+        ran: u16,
+        cgi: nrppa::NG_RAN_CGI,
+        tac: [u8; 3],
+        measured: Option<Vec<nrppa::MeasuredResultsValue>>,
+    ) -> Vec<u8> {
+        use nrppa::E_CIDMeasurementReportProtocolIEs_EntryValue as V;
+        let entry =
+            |id: u16, criticality: u8, value: V| nrppa::E_CIDMeasurementReportProtocolIEs_Entry {
+                id: nrppa::ProtocolIE_ID(id),
+                criticality: nrppa::Criticality(criticality),
+                value,
+            };
+        let ies = vec![
+            entry(
+                nrppa::ID_LMF_UE_MEASUREMENT_ID,
+                super::REJECT,
+                V::Id_LMF_UE_Measurement_ID(nrppa::UE_Measurement_ID(lmf)),
+            ),
+            entry(
+                nrppa::ID_RAN_UE_MEASUREMENT_ID,
+                super::REJECT,
+                V::Id_RAN_UE_Measurement_ID(nrppa::UE_Measurement_ID(ran)),
+            ),
+            entry(
+                nrppa::ID_E_CID_MEASUREMENT_RESULT,
+                super::IGNORE,
+                V::Id_E_CID_MeasurementResult(nrppa::E_CID_MeasurementResult {
+                    serving_cell_id: cgi,
+                    serving_cell_tac: nrppa::TAC(tac.to_vec()),
+                    ng_ran_access_point_position: None,
+                    measured_results: measured.map(nrppa::MeasuredResults),
+                    ie_extensions: None,
+                }),
+            ),
+        ];
+        let pdu = nrppa::NRPPA_PDU::InitiatingMessage(nrppa::InitiatingMessage {
+            procedure_code: nrppa::ProcedureCode(nrppa::ID_E_CID_MEASUREMENT_REPORT),
+            criticality: nrppa::Criticality(super::IGNORE),
+            nrppatransaction_id: nrppa::NRPPATransactionID(txn),
+            value: nrppa::InitiatingMessageValue::Id_e_CIDMeasurementReport(
+                nrppa::E_CIDMeasurementReport {
+                    protocol_i_es: nrppa::E_CIDMeasurementReportProtocolIEs(ies),
+                },
+            ),
+        });
+        nextgcore_nrppa_gen::encode(&pdu).expect("generated encode")
+    }
+
+    /// Split an initiating-message PDU whose open type and IEs are each shorter
+    /// than 128 octets (one-octet APER lengths) into its 5-octet header and IEs.
+    fn split(bytes: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
+        assert!(bytes[5] < 0x80 && usize::from(bytes[5]) == bytes.len() - 6);
+        let value = &bytes[6..];
+        let count = usize::from(u16::from_be_bytes([value[1], value[2]]));
+        let mut ies = Vec::with_capacity(count);
+        let mut at = 3;
+        for _ in 0..count {
+            let len = usize::from(value[at + 3]);
+            assert!(len < 0x80, "test PDUs keep IE values under 128 octets");
+            ies.push(value[at..at + 4 + len].to_vec());
+            at += 4 + len;
+        }
+        assert_eq!(at, value.len());
+        (bytes[..5].to_vec(), ies)
+    }
+
+    fn join(header: &[u8], ies: &[Vec<u8>]) -> Vec<u8> {
+        let mut value = vec![0x00];
+        value.extend_from_slice(&(ies.len() as u16).to_be_bytes());
+        for ie in ies {
+            value.extend_from_slice(ie);
+        }
+        let mut out = header.to_vec();
+        out.push(u8::try_from(value.len()).expect("short PDU"));
+        out.extend(value);
+        out
+    }
+
+    /// Append a ProtocolIE-Field with `id` and `criticality` (0 reject, 1 ignore,
+    /// 2 notify) and a one-octet value: id (2 octets), criticality in the top two
+    /// bits of an octet, an open-type length of 1, the value.
+    pub fn splice_ie(bytes: &[u8], id: u16, criticality: u8) -> Vec<u8> {
+        let (header, mut ies) = split(bytes);
+        let [hi, lo] = id.to_be_bytes();
+        ies.push(vec![hi, lo, criticality << 6, 0x01, 0x00]);
+        join(&header, &ies)
+    }
+
+    /// Remove the ProtocolIE-Field with `id`.
+    pub fn drop_ie(bytes: &[u8], id: u16) -> Vec<u8> {
+        let (header, mut ies) = split(bytes);
+        ies.retain(|ie| u16::from_be_bytes([ie[0], ie[1]]) != id);
+        join(&header, &ies)
+    }
+}
+
 #[cfg(test)]
 mod tests;
