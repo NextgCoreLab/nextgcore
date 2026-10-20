@@ -3087,6 +3087,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextgcore-s1ap-gen"
+version = "0.1.0"
+dependencies = [
+ "asn1-codecs",
+ "asn1-compiler",
+ "asn1_codecs_derive",
+ "bitvec",
+ "log",
+ "nextgcore-asn1c",
+ "nextgcore-s1ap",
+]
+
+[[package]]
 name = "nextgcore-sbi"
 version = "0.1.0"
 dependencies = [
