@@ -340,6 +340,7 @@ fn apply_create_session_response(
             data.cause,
             esm_cause_from_gtp(data.cause)
         );
+        reject_create_session(ctx, local_teid, sequence_number, data.cause);
         return;
     }
 
@@ -413,6 +414,114 @@ fn apply_create_session_response(
     }
 }
 
+/// Answer the UE when the SGW/PGW refused its session (#492).
+///
+/// The rejection used to be logged and dropped, so the UE waited out T3410 (15 s)
+/// and retried into the same failure. TS 24.301 §5.5.1.2.5 / §6.5.1.4 and TS 23.401
+/// §5.3.2.1: when the default bearer cannot be established during an attach, the MME
+/// sends ATTACH REJECT with EMM cause #19 "ESM failure" and the PDN CONNECTIVITY
+/// REJECT (the mapped ESM cause) in the ESM container — `nas_eps_send_attach_reject`
+/// then releases the UE context (#473). A standalone PDN connectivity request is
+/// answered with PDN CONNECTIVITY REJECT on its own, and its session is discarded.
+///
+/// The pending-create record is taken here as on the accepted path, so a late
+/// duplicate response cannot trigger a second answer.
+fn reject_create_session(
+    ctx: &crate::context::MmeContext,
+    local_teid: u32,
+    sequence_number: u32,
+    gtp_cause: u8,
+) {
+    use crate::nas_path::GtpCreateAction as NasCreateAction;
+    use crate::s11_build::GtpCreateAction;
+
+    let Some(pending) = crate::gtp_path::take_pending_create(sequence_number) else {
+        log::debug!(
+            "rejected S11 Create Session Response (seq={sequence_number}) has no pending create \
+             record; nothing to answer"
+        );
+        return;
+    };
+    let Some(mme_ue_id) = ctx.mme_ue_find_by_s11_local_teid(local_teid) else {
+        log::warn!("rejected Create Session Response for local TEID {local_teid:#x} matches no UE");
+        return;
+    };
+    let nas_action = match pending.create_action {
+        GtpCreateAction::AttachRequest => NasCreateAction::InAttachRequest,
+        GtpCreateAction::UplinkNasTransport => NasCreateAction::InPdnConnectivity,
+        other => {
+            // A TAU or a path switch owns its own failure handling; neither is
+            // answered with an ESM reject.
+            log::warn!(
+                "Create Session for create action {other:?} rejected (GTP cause {gtp_cause}); \
+                 that procedure handles the failure itself"
+            );
+            return;
+        }
+    };
+    let (Some(enb_ue), Some(sess)) = (
+        ctx.enb_ue_find_by_id(pending.enb_ue_id),
+        ctx.sess_find_by_id(pending.sess_id),
+    ) else {
+        log::warn!(
+            "rejected Create Session Response: the UE's S1 connection or session is gone, so the \
+             reject has nowhere to go"
+        );
+        return;
+    };
+    let esm_cause = esm_cause_enum(esm_cause_from_gtp(gtp_cause));
+
+    {
+        let Ok(pool) = ctx.mme_ue_pool.read() else {
+            return;
+        };
+        let Some(mme_ue) = pool.get(&mme_ue_id) else {
+            return;
+        };
+        log::warn!(
+            "[{}] answering the refused PDN connection with ESM cause {esm_cause:?} ({:?})",
+            mme_ue.imsi_bcd,
+            nas_action
+        );
+        if let Err(e) = crate::nas_path::nas_eps_send_pdn_connectivity_reject(
+            ctx, &sess, mme_ue, &enb_ue, esm_cause, nas_action,
+        ) {
+            log::error!("PDN Connectivity / Attach Reject send failed: {e}");
+        }
+    }
+
+    if nas_action == NasCreateAction::InPdnConnectivity {
+        // The refused standalone PDN connection must not linger as a session.
+        for bearer_id in &sess.bearer_list {
+            ctx.bearer_remove(*bearer_id);
+        }
+        ctx.sess_remove(sess.id);
+        if let Some(mme_ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
+            mme_ue.sess_list.retain(|id| *id != sess.id);
+        }
+    }
+}
+
+/// The ESM cause value from `esm_cause_from_gtp` as the NAS builder's enum.
+fn esm_cause_enum(value: u8) -> crate::esm_build::EsmCause {
+    use crate::esm_build::EsmCause as C;
+    match value {
+        esm_cause::OPERATOR_DETERMINED_BARRING => C::OperatorDeterminedBarring,
+        esm_cause::INSUFFICIENT_RESOURCES => C::InsufficientResources,
+        esm_cause::MISSING_OR_UNKNOWN_APN => C::MissingOrUnknownApn,
+        esm_cause::USER_AUTHENTICATION_FAILED => C::UserAuthenticationFailed,
+        esm_cause::REQUEST_REJECTED_BY_SERVING_GW_OR_PDN_GW => C::RequestRejectedByGw,
+        esm_cause::SERVICE_OPTION_NOT_SUPPORTED => C::ServiceOptionNotSupported,
+        esm_cause::REGULAR_DEACTIVATION => C::RegularDeactivation,
+        esm_cause::SEMANTIC_ERROR_IN_THE_TFT_OPERATION => C::SemanticErrorInTftOperation,
+        esm_cause::SYNTACTICAL_ERROR_IN_THE_TFT_OPERATION => C::SyntacticalErrorInTftOperation,
+        esm_cause::INVALID_EPS_BEARER_IDENTITY => C::InvalidEpsBearerIdentity,
+        esm_cause::SEMANTIC_ERRORS_IN_PACKET_FILTERS => C::SemanticErrorsInPacketFilters,
+        esm_cause::SYNTACTICAL_ERROR_IN_PACKET_FILTERS => C::SyntacticalErrorsInPacketFilters,
+        _ => C::NetworkFailure,
+    }
+}
+
 /// Store the PDN Address Allocation the PGW granted on the session (#329).
 ///
 /// The PDN type is taken from the response rather than from what the UE requested:
@@ -422,12 +531,15 @@ fn apply_create_session_response(
 fn store_paa(ctx: &crate::context::MmeContext, sess_id: u64, data: &CreateSessionResponseData) {
     use crate::esm_build::PdnType;
 
+    // GTPv2 code points (TS 29.274 §8.14 / §8.34): Non-IP is 4 and Ethernet 5 —
+    // not ESM's 5 and 6, which this used to read, so a Non-IP grant was stored as
+    // Ethernet and an Ethernet one dropped as undefined.
     let pdn_type = match data.paa_pdn_type {
         1 => PdnType::Ipv4,
         2 => PdnType::Ipv6,
         3 => PdnType::Ipv4v6,
-        5 => PdnType::NonIp,
-        6 => PdnType::Ethernet,
+        4 => PdnType::NonIp,
+        5 => PdnType::Ethernet,
         other => {
             log::warn!(
                 "S11 Create Session Response carried PDN type {other}, which TS 29.274 §8.14 \
@@ -1493,6 +1605,131 @@ mod tests {
         );
         assert_eq!(sess.paa.pdn_type, crate::esm_build::PdnType::Ipv4);
 
+        release_global_ue(mme_ue_id, sess_id, bearer_id);
+        crate::gtp_path::clear_pending_creates_for_test();
+    }
+
+    /// #492: a REJECTED Create Session Response for an attach must answer the UE:
+    /// ATTACH REJECT #19 with the mapped ESM cause, then the S1 release (#473). It
+    /// used to be logged and dropped, leaving the UE to wait out T3410.
+    ///
+    /// Observed through the eNB UE context the reject path releases (the S1AP send
+    /// queue is once-per-process and not a reliable observable here, see below).
+    #[test]
+    fn a_rejected_attach_create_session_is_answered_with_attach_reject() {
+        let _guard = crate::gtp_path::lock_s11();
+        crate::gtp_path::clear_pending_creates_for_test();
+
+        let (mme_ue_id, enb_ue_id, sess_id, bearer_id, local_teid) = seed_global_ue(5);
+        let ctx = crate::context::mme_self();
+        crate::gtp_path::record_pending_create_for_test(
+            4250,
+            crate::gtp_path::PendingCreate {
+                create_action: GtpCreateAction::AttachRequest,
+                enb_ue_id,
+                sess_id,
+            },
+        );
+
+        let rejected = CreateSessionResponseData {
+            cause: 109, // Mandatory/Conditional IE missing, as smfd answered "No PAA"
+            ..Default::default()
+        };
+        apply_create_session_response(
+            &rejected,
+            local_teid,
+            4250,
+            "127.0.0.1:2123".parse().unwrap(),
+        );
+
+        let enb_ue = ctx.enb_ue_find_by_id(enb_ue_id).expect("eNB UE");
+        assert_eq!(
+            enb_ue.ue_ctx_rel_action,
+            crate::context::UeCtxRelAction::UeContextRemove,
+            "the ATTACH REJECT path must run and release the UE"
+        );
+        assert!(
+            crate::gtp_path::take_pending_create(4250).is_none(),
+            "the pending record is consumed, so a duplicate cannot answer twice"
+        );
+        assert_eq!(
+            esm_cause_enum(esm_cause_from_gtp(109)),
+            crate::esm_build::EsmCause::NetworkFailure
+        );
+
+        release_global_ue(mme_ue_id, sess_id, bearer_id);
+        crate::gtp_path::clear_pending_creates_for_test();
+    }
+
+    /// #492: a rejected standalone PDN connectivity is answered with PDN CONNECTIVITY
+    /// REJECT, without releasing the UE, and its session does not linger.
+    #[test]
+    fn a_rejected_standalone_create_session_discards_its_session() {
+        let _guard = crate::gtp_path::lock_s11();
+        crate::gtp_path::clear_pending_creates_for_test();
+
+        let (mme_ue_id, enb_ue_id, sess_id, bearer_id, local_teid) = seed_global_ue(6);
+        let ctx = crate::context::mme_self();
+        crate::gtp_path::record_pending_create_for_test(
+            4251,
+            crate::gtp_path::PendingCreate {
+                create_action: GtpCreateAction::UplinkNasTransport,
+                enb_ue_id,
+                sess_id,
+            },
+        );
+
+        let rejected = CreateSessionResponseData {
+            cause: 78, // Missing or unknown APN
+            ..Default::default()
+        };
+        apply_create_session_response(
+            &rejected,
+            local_teid,
+            4251,
+            "127.0.0.1:2123".parse().unwrap(),
+        );
+
+        assert!(
+            ctx.sess_find_by_id(sess_id).is_none(),
+            "the refused session is discarded"
+        );
+        assert_ne!(
+            ctx.enb_ue_find_by_id(enb_ue_id).unwrap().ue_ctx_rel_action,
+            crate::context::UeCtxRelAction::UeContextRemove,
+            "a standalone reject does not release the UE"
+        );
+
+        release_global_ue(mme_ue_id, sess_id, bearer_id);
+        crate::gtp_path::clear_pending_creates_for_test();
+    }
+
+    /// GTPv2 PDN type code points (TS 29.274 §8.14): Non-IP 4, Ethernet 5.
+    #[test]
+    fn a_non_ip_grant_is_stored_as_non_ip() {
+        let _guard = crate::gtp_path::lock_s11();
+        crate::gtp_path::clear_pending_creates_for_test();
+        let (mme_ue_id, enb_ue_id, sess_id, bearer_id, local_teid) = seed_global_ue(5);
+        crate::gtp_path::record_pending_create_for_test(
+            4252,
+            crate::gtp_path::PendingCreate {
+                create_action: GtpCreateAction::UplinkNasTransport,
+                enb_ue_id,
+                sess_id,
+            },
+        );
+        let mut data = accepted_response(5, [0; 4]);
+        data.paa_pdn_type = 4;
+        data.paa_ipv4 = None;
+        apply_create_session_response(&data, local_teid, 4252, "127.0.0.1:2123".parse().unwrap());
+        assert_eq!(
+            crate::context::mme_self()
+                .sess_find_by_id(sess_id)
+                .unwrap()
+                .paa
+                .pdn_type,
+            crate::esm_build::PdnType::NonIp
+        );
         release_global_ue(mme_ue_id, sess_id, bearer_id);
         crate::gtp_path::clear_pending_creates_for_test();
     }
