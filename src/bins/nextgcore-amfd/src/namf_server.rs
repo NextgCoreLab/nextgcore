@@ -4338,91 +4338,20 @@ fn apply_ue_context_json(ue: &mut AmfUe, ue_context: &Value) -> Option<String> {
     supi
 }
 
-/// Record the PDU sessions a source AMF transferred, and say plainly which part of
-/// the handover is NOT being completed.
+/// Record the PDU sessions a peer AMF transferred, with the SM context reference each
+/// already has at its SMF.
 ///
-/// TS 29.518 §5.2.2.2.3.1 has the source AMF carry a `pduSessionList`, and
-/// TS 23.502 step 21 then has the target AMF drive `Nsmf_PDUSession_UpdateSMContext`
-/// per SMF to move the N3 tunnels. PR #390 named this as the gap neither #352 nor
-/// #74 claimed, and it lands here.
+/// TS 29.518 §5.2.2.2.3.1 (CreateUEContext) and §5.2.2.2.5.1 (RelocateUEContext) both have the
+/// consumer carry the sessions the UE holds, and for RelocateUEContext TS 23.502
+/// §4.11.1.2.2.2 step 8a names what arrives: *"SM Context ID of each PDU Session, allocated
+/// EBIs of each PDU Session"* — contexts the **initial** AMF created at step 4. So the
+/// sessions are recorded against the UE with those references, which is what any later
+/// `Nsmf_PDUSession_UpdateSMContext` for them must address. Calling `CreateSMContext` here
+/// would create a second context for a session that already has one.
 ///
-/// **It is recorded, not moved, and the reason is structural.** The endpoints an
-/// `UpdateSMContext` would have to carry are exactly what this tree cannot obtain:
-/// for `/relocate` they come over **N26** from the source MME (§5.2.2.2.5.1: "the NF
-/// Service Consumer shall carry per PDU session the S-NSSAI for serving PLMN, the
-/// MME Control Plane Address and the TEID"). Calling the SMF with invented tunnel
-/// endpoints would point a live user plane at an address nobody supplied, which is
-/// strictly worse than a session recorded and a logged omission.
-///
-/// # The premise has changed TWICE, and the current reason is smfd-side
-///
-/// #398 wrote this ceiling as "this AMF has no N26 leg at all". #347 falsified that by
-/// building the N26 endpoint, and restated the ceiling as "the Forward Relocation consumer is
-/// #408". **#408 landed that consumer** — `n26_path::handle_forward_relocation_response` and
-/// `n26_build::parse_forward_relocation_response` exist and are reached from the N26 receive
-/// loop — so that restatement is now false too.
-///
-/// The gap is still open, and the reason is no longer about N26 at all. #408's enumeration
-/// found three things, each pinned:
-///
-/// 1. **The clause names a different operation.** TS 23.502 §4.11.1.2.2.2 **step 4**
-///    (`23502-k20.txt:21384-21391`): *"The initial AMF invokes the
-///    **Nsmf_PDUSession_CreateSMContext** service operation (UE EPS PDN Connection, initial
-///    AMF ID, data Forwarding information, Target ID) [...] and indicates HO Preparation
-///    Indication"*. `UpdateSMContext` appears in this direction only at execution step 7
-///    (`:21747-21752`), carrying a *"Handover Complete Indication"* — a completion signal that
-///    carries no endpoints.
-/// 2. **The endpoints do not arrive in the binary part.** TS 29.518 §5.2.2.2.5.1
-///    (`29518-k00.txt:2953-2958`) has *"the NF Service Consumer shall carry per PDU session
-///    [...] the MME Control Plane Address and the TEID **in the request**"* — as members of
-///    `UeContextRelocateData`, put there by the *initial* AMF, which already decoded the
-///    Forward Relocation Request. And that schema (`TS29518_Namf_Communication.yaml:3717-3746`)
-///    has no member for them at all; they ride inside `ueContext`.
-/// 3. **The SMF could not consume them.** This was true until #415 and is now **FIXED**:
-///    `handle_sm_context_create` parses `ueEpsPdnConnection` (both the conformant
-///    TS 29.274 Table 7.3.6-2 grouped IE and #78's positional layout), honours `hoState:
-///    PREPARING` without switching the UP path, stores the PGW-C S5/S8 control-plane
-///    F-TEID on the session, and answers step 7 with the EBI↔QFI mapping and the *"Data
-///    forwarding not possible"* indication. So the call is no longer **reachable but
-///    inert**.
-///
-/// # What is actually missing now — and it is NOT in this function
-///
-/// #415's own criterion 5 asked *this* handler to drive that `CreateSMContext`. It does
-/// not, and the reason is structural rather than unfinished work. Four findings, each
-/// pinned at `40070ae`:
-///
-/// 1. **`/relocate` is the *target* AMF's handler.** TS 29.518 §5.2.2.2.5.1
-///    (`29518-k00.txt:2934-2941`) scopes it to an EPS→5GS handover *"**with AMF
-///    re-allocation**, to relocate the UE Context in the target AMF"*.
-/// 2. **By the time it runs, the SM contexts already exist.** TS 23.502 step **8a**
-///    (`23502-k20.txt:21511-21522`) is where `RelocateUEContext` is invoked — *after* step
-///    7 — and its parameter list carries *"SMF+PGW-C ID of each PDU Session, default V-SMF
-///    ID and **SM Context ID of each PDU Session, allocated EBIs** of each PDU Session"*.
-///    Creating contexts here would duplicate what step 4 created.
-/// 3. **This handler cannot make the call.** It is a synchronous `fn`, dispatched
-///    synchronously from the router above. An `Nsmf_PDUSession_CreateSMContext` is an
-///    awaited HTTP call.
-/// 4. **There is no initial-AMF leg to drive it from.** This handler validates that the
-///    `forwardRelocationRequest` part *exists* and never decodes it — this module has zero
-///    GTP imports. More decisively, amfd's N26 dispatcher (`n26_path.rs`'s
-///    `handle_datagram`) handles `EchoRequest`/`EchoResponse`, `ContextRequest`,
-///    `ContextAcknowledge`, `ForwardRelocationResponse`,
-///    `ForwardRelocationCompleteNotification` and `ForwardRelocationCompleteAcknowledge` —
-///    i.e. **the 5GS→EPS direction only**. A `ForwardRelocationRequest` (type 133)
-///    *arriving* is not dispatched at all. `n26_build.rs` already says so for its own
-///    deliberately-absent builder: this AMF is the target only in EPS→5GS.
-///
-/// So the honest statement, and it is a **smaller** claim than the two this comment has
-/// carried before: every piece downstream of the initial AMF now exists — the N26
-/// transport, both codecs, idle-mode context transfer (#347), the connected-mode Forward
-/// Relocation procedure (#408) and the SMF's `CreateSMContext` consumer (#415). What is
-/// missing is the **initial-AMF leg itself**: amfd never receives a
-/// `ForwardRelocationRequest`, so nothing in this tree converts an EPS MM Context into a
-/// 5GS one, resolves the SMF+PGW-C via the NRF by its S5/S8 FQDN (step 3,
-/// `23502-k20.txt:21389-21393`), or calls step 4. That is **#418**, and it is amfd-shaped
-/// work in the *inbound* N26 direction rather than anything this function can do — which
-/// is why this comment names a handler other than itself for the first time.
+/// When this AMF is itself the initial AMF of an EPS→5GS handover — no AMF re-allocation,
+/// TS 23.502 NOTE 3 — steps 3-14 run in `n26_path::handle_forward_relocation_request` and
+/// `ngap_path`'s EPS→5GS handover path (#418), and this function is not involved.
 fn record_transferred_sessions(ue_id: u64, ue_context: &Value, ue_context_id: &str) -> usize {
     let Some(sessions) = ue_context
         .get("sessionContextList")
@@ -4467,19 +4396,9 @@ fn record_transferred_sessions(ue_id: u64, ue_context: &Value, ue_context_id: &s
         recorded += 1;
     }
     if recorded > 0 {
-        log::warn!(
-            "[{ue_context_id}] {recorded} transferred PDU session(s) RECORDED but their N3 \
-             tunnels are NOT re-established. This is NOT the place that re-establishes them: \
-             TS 29.518 §5.2.2.2.5.1 scopes /relocate to an EPS->5GS handover WITH AMF \
-             re-allocation, and TS 23.502 step 8a invokes it AFTER step 7 carrying the 'SM \
-             Context ID of each PDU Session, allocated EBIs' -- i.e. contexts the INITIAL AMF \
-             already created in step 4. smfd now consumes the UE EPS PDN Connection on \
-             CreateSMContext (#415), so the SMF side is done. What is missing is the \
-             initial-AMF leg: this AMF's N26 dispatcher handles no inbound \
-             ForwardRelocationRequest (type 133) at all, so nothing converts the EPS MM \
-             Context, resolves the SMF+PGW-C through the NRF by its S5/S8 FQDN (step 3), or \
-             calls step 4. That is #418. Until it exists, a UE arriving from EPS reaches \
-             this AMF only through a peer that already did steps 3-8."
+        log::info!(
+            "[{ue_context_id}] {recorded} transferred PDU session(s) recorded with the SM \
+             context reference each holds at its SMF"
         );
     }
     recorded
@@ -4751,9 +4670,8 @@ fn handle_release_ue_context(ue_context_id: &str, request: &SbiRequest) -> SbiRe
 /// second reading of one wire fact, which is the #335/#340 shape where several spellings drift
 /// and only the tested one is right.
 ///
-/// What this operation still cannot do is re-establish the N3 tunnels — see
-/// [`record_transferred_sessions`], whose reason is now **smfd-side** (#415) rather than about
-/// N26 at all.
+/// The transferred sessions are recorded with their SM context references by
+/// [`record_transferred_sessions`].
 fn handle_relocate_ue_context(ue_context_id: &str, request: &SbiRequest) -> SbiResponse {
     let Some(body) = parse_json_body(request) else {
         return malformed_body();
@@ -9064,11 +8982,9 @@ mod tests {
     ///
     /// PR #390 flagged that "the received `sessionContextList` is carried and logged
     /// but PDU sessions aren't re-established", naming #74's `/relocate` as its home.
-    /// The sessions are RECORDED here, and the ceiling is explicit: their N3 tunnels
-    /// are not moved, because the endpoints would have to come over N26 from the
-    /// source MME and this AMF has no N26 leg (see `record_transferred_sessions`).
-    /// Asserting the session record is asserting exactly what was built — not a
-    /// tunnel move that did not happen.
+    /// The sessions are RECORDED here with the SM context references the initial AMF
+    /// created (TS 23.502 step 8a); asserting the record is asserting exactly what this
+    /// operation does.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn relocate_ue_context_creates_the_context_and_records_its_sessions() {
         let _guard = crate::test_support::CONTEXT_GUARD

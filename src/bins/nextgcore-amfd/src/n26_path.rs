@@ -403,6 +403,124 @@ pub fn clear_forward_relocation_state_for_test() {
     }
 }
 
+// ============================================================================
+// EPS→5GS preparations handed from the N26 leg to the NGAP layer (#418)
+// ============================================================================
+
+/// One PDN connection prepared at its SMF+PGW-C (TS 23.502 §4.11.1.2.2.2 steps 4-7).
+#[derive(Debug, Clone)]
+pub struct EpsHoSession {
+    /// The SMF+PGW-C's `nsmf-pdusession` endpoint, resolved by its S5/S8 FQDN (step 3).
+    /// Kept per session: different PDN connections may anchor on different SMFs, and every
+    /// later Update must reach the one that holds this context.
+    pub smf: (String, u16),
+    /// The PDN connection's default bearer, from the MME.
+    pub linked_ebi: u8,
+    /// The PDN connection's APN-AMBR from the MME, (uplink, downlink) kbps.
+    pub apn_ambr_kbps: Option<(u32, u32)>,
+    /// What the SMF answered (step 7).
+    pub created: crate::sbi_path::EpsHandoverCreated,
+}
+
+/// An EPS→5GS handover the N26 leg prepared up to step 7, waiting for the NGAP layer to send
+/// the HandoverRequest (step 9).
+pub struct EpsToFivegsPreparation {
+    /// The N26 server the request arrived on, which step 14's response leaves from.
+    pub server: Arc<N26Server>,
+    /// The request's sequence number: the response must echo it (TS 29.274 §7.6).
+    pub seq: u32,
+    /// The MME's N26 address.
+    pub mme_peer: SocketAddr,
+    /// The MME's control-plane TEID, from its Sender's F-TEID.
+    pub mme_teid: u32,
+    /// `imsi-<digits>`, when the request carried an IMSI.
+    pub supi: Option<String>,
+    /// `imeisv-<digits>`, from the MM Context's MEI.
+    pub pei: Option<String>,
+    /// The EPS security context as received.
+    pub security: crate::n26_eps_to_5gs::EpsSecurityContext,
+    /// The mapped 5G security context (TS 33.501 §8.4.2 step 3).
+    pub mapped: crate::n26_eps_to_5gs::MappedSecurity,
+    /// The target gNB.
+    pub target: crate::n26_eps_to_5gs::TargetGnb,
+    /// The Source to Target transparent container, without its F-Container type octet.
+    pub source_to_target_container: Vec<u8>,
+    /// The PDN connections that were prepared.
+    pub sessions: Vec<EpsHoSession>,
+}
+
+impl std::fmt::Debug for EpsToFivegsPreparation {
+    // Hand-written so the mapped keys never reach a log line through `{:?}`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EpsToFivegsPreparation")
+            .field("seq", &self.seq)
+            .field("mme_peer", &self.mme_peer)
+            .field("mme_teid", &self.mme_teid)
+            .field("supi", &self.supi)
+            .field("target", &self.target)
+            .field("sessions", &self.sessions.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Preparations waiting for the NGAP layer, drained by `ngap_path`'s poll loop.
+///
+/// A queue rather than a call into `ngap_path` because the NGAP server is a single receive
+/// loop that owns the SCTP associations; this is the same hand-off shape the PWS and
+/// positioning relays use. Declared beside its reader and writer, not in a `mod tests`
+/// (#308); tests that touch it hold [`crate::test_support::CONTEXT_GUARD`].
+static EPS_TO_5GS_PREPARATIONS: std::sync::Mutex<Vec<EpsToFivegsPreparation>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Queue a prepared EPS→5GS handover for the NGAP layer.
+pub fn enqueue_eps_to_5gs_preparation(prep: EpsToFivegsPreparation) {
+    log::info!(
+        "N26 EPS→5GS (seq={}): {} PDU session(s) prepared; handing to the NGAP layer for the \
+         HandoverRequest to gNB {:#x} (TS 23.502 §4.11.1.2.2.2 step 9)",
+        prep.seq,
+        prep.sessions.len(),
+        prep.target.gnb_id
+    );
+    EPS_TO_5GS_PREPARATIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(prep);
+}
+
+/// Take every queued preparation.
+pub fn drain_eps_to_5gs_preparations() -> Vec<EpsToFivegsPreparation> {
+    std::mem::take(
+        &mut *EPS_TO_5GS_PREPARATIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    )
+}
+
+impl N26Server {
+    /// Send `msg` to `peer` from this server's socket (#418): step 14's Forward Relocation
+    /// Response and the Complete Notification leave from the NGAP layer, which holds the
+    /// preparation's server handle.
+    pub async fn send_to_mme(&self, peer: SocketAddr, msg: &Gtp2Message) {
+        self.send(peer, msg).await;
+    }
+
+    /// Allocate a sequence number for an AMF-initiated message (the Complete Notification).
+    pub async fn alloc_sequence(&self) -> u32 {
+        self.xact.lock().await.alloc_sequence()
+    }
+
+    /// This AMF's own N26 control-plane F-TEID for a UE context, `None` for an IPv6 bind
+    /// (TS 29.274 §8.22 allows one; this AMF builds IPv4 F-TEIDs only).
+    pub fn local_fteid(&self, teid: u32) -> Option<Gtp2FTeidIe> {
+        match self.local_addr.ip() {
+            std::net::IpAddr::V4(v4) => {
+                Some(Gtp2FTeidIe::new_ipv4(N26_AMF_GTP_C, teid, v4.octets()))
+            }
+            std::net::IpAddr::V6(_) => None,
+        }
+    }
+}
+
 /// The AMF's N26 GTPv2-C endpoint.
 pub struct N26Server {
     socket: UdpSocket,
@@ -486,7 +604,7 @@ impl N26Server {
         }
     }
 
-    async fn handle_datagram(&self, data: &[u8], peer: SocketAddr) {
+    async fn handle_datagram(self: &Arc<Self>, data: &[u8], peer: SocketAddr) {
         let mut bytes = bytes::Bytes::copy_from_slice(data);
         let msg = match Gtp2Message::decode(&mut bytes) {
             Ok(m) => m,
@@ -533,6 +651,17 @@ impl N26Server {
             return;
         }
 
+        // #418: an INBOUND Forward Relocation Request is the EPS→5GS direction, with this
+        // AMF as the target (TS 23.502 §4.11.1.2.2.2 step 3). Before #418 it fell to the
+        // catch-all below, which told the operator it would arrive by
+        // Namf_Communication_RelocateUEContext instead -- true only with AMF re-allocation,
+        // where a DIFFERENT initial AMF has already run steps 3-8.
+        if msg_type == Gtp2MessageType::ForwardRelocationRequest as u8 {
+            self.handle_forward_relocation_request(&msg, seq, peer)
+                .await;
+            return;
+        }
+
         // #408: Forward Relocation. The base at `fd99448` logged that types 133-136 were
         // unhandled and named the wrong issue (#404); these two arms are what that log was
         // waiting for.
@@ -565,11 +694,237 @@ impl N26Server {
         log::info!(
             "N26 message type={msg_type} seq={seq} from {peer} is not a procedure this AMF \
              serves. Implemented: Context Request (130) as the old node (#347), and Forward \
-             Relocation Response / Complete Notification / Complete Acknowledge (134/135/136) \
-             (#408). A Forward Relocation REQUEST (133) arriving here would be the EPS→5GS \
-             direction, which reaches this AMF through the initial AMF's \
-             Namf_Communication_RelocateUEContext rather than over N26 (TS 29.518 §5.2.2.2.5.1)."
+             Relocation Request (133) as the EPS→5GS target (#418), and Forward Relocation \
+             Response / Complete Notification / Complete Acknowledge (134/135/136) (#408)."
         );
+    }
+
+    /// Handle an inbound **Forward Relocation Request** (TS 29.274 §7.3.1, type 133): the
+    /// EPS→5GS handover preparation with this AMF as the initial and target AMF (#418,
+    /// TS 23.502 §4.11.1.2.2.2 steps 3-7).
+    ///
+    /// | step | what this does |
+    /// |---|---|
+    /// | 3 | decode the request; map the EPS security context to a mapped 5G one (TS 33.501 §8.4.2 step 3); resolve each PDN connection's SMF+PGW-C via the NRF by its S5/S8 FQDN |
+    /// | 4 | `Nsmf_PDUSession_CreateSMContext` per PDN connection, with `ueEpsPdnConnection`, `hoState: PREPARING`, the Target ID and the forwarding flags |
+    /// | 7 | keep each answer's PDU session ID, S-NSSAI, SM context reference, allocated EBIs and N2 SM information |
+    ///
+    /// Steps 9-14 need the target gNB's NG association, which only the NGAP layer holds, so
+    /// the prepared handover is queued for it ([`enqueue_eps_to_5gs_preparation`]); that is
+    /// where the HandoverRequest goes out and where step 14's Forward Relocation Response is
+    /// sent once the gNB answers. Every path that does NOT reach the queue answers the MME
+    /// here, with a refusal: a request this AMF accepted and never answered would leave the
+    /// MME waiting out its own timer while the source eNB holds the UE.
+    ///
+    /// # Production reachability
+    ///
+    /// Reached from [`Self::handle_datagram`], driven by the receive loop [`Self::open`]
+    /// spawns, which [`n26_open`] installs at startup when the switch is on.
+    async fn handle_forward_relocation_request(
+        self: &Arc<Self>,
+        msg: &Gtp2Message,
+        seq: u32,
+        peer: SocketAddr,
+    ) {
+        use crate::n26_eps_to_5gs as eps;
+
+        let request = match eps::parse_eps_to_5gs_forward_relocation_request(msg) {
+            Ok(r) => r,
+            Err(refusal) => {
+                // Answered at the MME's TEID when its F-TEID decoded, so the refusal lands on
+                // the MME's UE context rather than TEID 0.
+                let mme_teid = msg
+                    .get_ie(Gtp2IeType::FTeid as u8, 0)
+                    .and_then(|ie| Gtp2FTeidIe::decode(&ie.value).ok())
+                    .map(|f| f.teid)
+                    .unwrap_or(0);
+                log::warn!(
+                    "N26 Forward Relocation Request from MME {peer} (seq={seq}) refused with \
+                     cause {}: {}",
+                    refusal.cause,
+                    refusal.reason
+                );
+                self.send(
+                    peer,
+                    &eps::build_forward_relocation_response_refusal(seq, mme_teid, refusal.cause),
+                )
+                .await;
+                return;
+            }
+        };
+        let mme_teid = request.mme_fteid.teid;
+        let refuse =
+            |cause: u8| eps::build_forward_relocation_response_refusal(seq, mme_teid, cause);
+
+        // Step 3: the mapped 5G security context, with the AMF's configured algorithm
+        // preference -- the same masks the Security Mode Command path selects from.
+        let (nia_mask, nea_mask, served_guami) = {
+            let ctx = amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            (
+                crate::ngap_path::algorithm_order_to_mask(&guard.integrity_order, 0x0E),
+                crate::ngap_path::algorithm_order_to_mask(&guard.ciphering_order, 0x0F),
+                guard.served_guami.first().cloned(),
+            )
+        };
+        let mapped = match eps::map_eps_security_context(
+            &request.security,
+            None,
+            nia_mask,
+            nea_mask,
+            |alg, key, count, message| {
+                crate::nas_security::nas_mac_calculate(alg, key, count, 1, 1, message)
+            },
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!(
+                    "N26 Forward Relocation Request from MME {peer} (seq={seq}): the EPS \
+                     security context cannot be mapped ({e}); refusing with 'Relocation \
+                     failure'"
+                );
+                self.send(peer, &refuse(eps::CAUSE_RELOCATION_FAILURE))
+                    .await;
+                return;
+            }
+        };
+
+        let target = request.target;
+        let target_plmn = crate::ngap_asn1::decode_plmn_id(&target.plmn_bcd);
+        let target_id = serde_json::json!({
+            "ranNodeId": {
+                "plmnId": { "mcc": target_plmn.mcc(), "mnc": target_plmn.mnc() },
+                "gNbId": {
+                    "bitLength": target.gnb_id_len,
+                    "gNBValue": format!("{:0width$x}", target.gnb_id,
+                        width = usize::from(target.gnb_id_len).div_ceil(4)),
+                },
+            },
+            "tai": {
+                "plmnId": { "mcc": target_plmn.mcc(), "mnc": target_plmn.mnc() },
+                "tac": format!("{:06x}", target.tac),
+            },
+        });
+        let supi = request.imsi.as_ref().map(|d| format!("imsi-{d}"));
+        let pei = (!request.security.mei.is_empty())
+            .then(|| format!("imeisv-{}", eps::tbcd_to_digits(&request.security.mei)));
+        let serving_nf_id = nextgcore_sbi::context::global_context()
+            .get_self_instance()
+            .await
+            .map(|inst| inst.id);
+
+        // Data forwarding (step 4: "Based on configuration and the Direct Forwarding Flag
+        // received from the MME, the initial AMF determines the applicability of data
+        // forwarding"). NEITHER is claimed, whatever the MME offered: forwarding needs the
+        // target gNB's forwarding tunnels relayed back to the MME in the EPS Bearer Setup
+        // List, which needs the HandoverRequestAcknowledgeTransfer's data-forwarding members
+        // decoded -- and this AMF relays that transfer opaquely to the SMF. So the SMF is
+        // told forwarding is not possible (it then sends the gNB "Data forwarding not
+        // possible", step 7), and downlink data in flight at the source eNB is discarded.
+        if request.direct_forwarding {
+            log::info!(
+                "N26 Forward Relocation Request (seq={seq}): MME {peer} offers DIRECT data \
+                 forwarding (DFI=1). Not used: this AMF does not decode the target gNB's \
+                 forwarding tunnels, so it cannot return them to the MME; the SMF is told \
+                 forwarding is not possible and in-flight downlink data at the source eNB is \
+                 discarded."
+            );
+        }
+
+        // Steps 3-7, one PDN connection at a time.
+        let mut sessions = Vec::new();
+        for pdn in &request.pdn_connections {
+            let pgw_ip = pdn
+                .pgw_c_fteid
+                .as_ref()
+                .and_then(|f| f.ipv4_addr)
+                .filter(|a| *a != [0, 0, 0, 0]);
+            let (smf_host, smf_port) =
+                match crate::sbi_path::discover_smf_by_pgw(pdn.pgw_node_name.as_deref(), pgw_ip)
+                    .await
+                {
+                    Ok(ep) => ep,
+                    Err(e) => {
+                        // Step 3: "If the initial AMF cannot retrieve the address of the
+                        // corresponding SMF for a PDN connection, it will not move the PDN
+                        // connection to 5GS."
+                        log::warn!(
+                            "N26 EPS→5GS (seq={seq}): the PDN connection for APN {:?} (linked \
+                             EBI {}) is NOT moved -- its SMF+PGW-C cannot be resolved: {e} \
+                             (TS 23.502 §4.11.1.2.2.2 step 3)",
+                            pdn.apn,
+                            pdn.linked_ebi
+                        );
+                        continue;
+                    }
+                };
+            let create = crate::sbi_path::EpsHandoverCreate {
+                supi: supi.clone(),
+                pei: pei.clone(),
+                serving_nf_id: serving_nf_id.clone(),
+                guami: served_guami.as_ref().map(crate::sbi_path::guami_json),
+                serving_plmn: served_guami
+                    .as_ref()
+                    .map(|g| (g.plmn_id.mcc(), g.plmn_id.mnc())),
+                ue_eps_pdn_connection: pdn.contents.clone(),
+                target_id: target_id.clone(),
+                direct_forwarding: false,
+                indirect_forwarding: false,
+            };
+            match crate::sbi_path::call_smf_create_sm_context_eps_handover(
+                &smf_host, smf_port, &create,
+            )
+            .await
+            {
+                Ok(created) => {
+                    log::info!(
+                        "N26 EPS→5GS (seq={seq}): APN {:?} (linked EBI {}) prepared on SMF \
+                         {smf_host}:{smf_port} as PDU session {} (ref={}, EBIs {:?})",
+                        pdn.apn,
+                        pdn.linked_ebi,
+                        created.pdu_session_id,
+                        created.sm_context_ref,
+                        created.allocated_ebis
+                    );
+                    sessions.push(EpsHoSession {
+                        smf: (smf_host, smf_port),
+                        linked_ebi: pdn.linked_ebi,
+                        apn_ambr_kbps: pdn.apn_ambr_kbps,
+                        created,
+                    });
+                }
+                Err(e) => log::warn!(
+                    "N26 EPS→5GS (seq={seq}): the PDN connection for APN {:?} is NOT moved -- \
+                     the SMF refused or failed CreateSMContext: {e}",
+                    pdn.apn
+                ),
+            }
+        }
+
+        if sessions.is_empty() {
+            log::warn!(
+                "N26 Forward Relocation Request from MME {peer} (seq={seq}): no PDN connection \
+                 could be prepared in 5GS, so there is nothing to hand over; refusing with \
+                 'Relocation failure'. The UE stays on EPS."
+            );
+            self.send(peer, &refuse(eps::CAUSE_RELOCATION_FAILURE))
+                .await;
+            return;
+        }
+
+        enqueue_eps_to_5gs_preparation(EpsToFivegsPreparation {
+            server: Arc::clone(self),
+            seq,
+            mme_peer: peer,
+            mme_teid,
+            supi,
+            pei,
+            security: request.security,
+            mapped,
+            target,
+            source_to_target_container: request.source_to_target_container,
+            sessions,
+        });
     }
 
     /// Handle a **Forward Relocation Response** (TS 29.274 §7.3.2, type 134), #408.

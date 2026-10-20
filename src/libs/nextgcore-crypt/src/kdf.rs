@@ -45,6 +45,13 @@ const FC_FOR_KASME_PRIME_IDLE_MOBILITY: u8 = 0x73;
 /// key from an idle-mode one is this byte. A copy-paste produces a well-formed 32-byte key
 /// no peer can reproduce, which no round trip detects.
 const FC_FOR_KASME_PRIME_HANDOVER: u8 = 0x74;
+/// TS 33.501 Annex A.15.2 — K_ASME to K_AMF' for EPS→5GS **handover** (#418).
+///
+/// The inverse direction of [`FC_FOR_KASME_PRIME_HANDOVER`]: the target AMF maps the EPS
+/// security context a source MME sent in a Forward Relocation Request into a 5G one. It is
+/// keyed by `K_ASME` and bound to the **NH** the MME sent, not to a NAS COUNT, which is
+/// what separates it from A.15.1's idle-mode FC `0x75`.
+const FC_FOR_KAMF_PRIME_FROM_KASME_HANDOVER: u8 = 0x76;
 const FC_FOR_SOR_MAC_IAUSF_DERIVATION: u8 = 0x77;
 const FC_FOR_SOR_MAC_IUE_DERIVATION: u8 = 0x78;
 const FC_FOR_UPU_MAC_IAUSF_DERIVATION: u8 = 0x7B;
@@ -494,6 +501,48 @@ pub fn nextgcore_kdf_kasme_prime_handover(
     params[0].len = 4;
 
     nextgcore_kdf_common(kamf, FC_FOR_KASME_PRIME_HANDOVER, &params)
+}
+
+/// TS 33.501 Annex A.15.2: K_AMF' from K_ASME for EPS→5GS **handover** (FC 0x76), #418.
+///
+/// The target AMF of an EPS→5GS handover over N26 maps the EPS security context the source
+/// MME put in the Forward Relocation Request into a mapped 5G one. TS 33.501 §8.4.2 step 3
+/// (`33501-k20.txt:11497-11501`): *"The target AMF shall derive a mapped K_(AMF)' key from
+/// the received K_(ASME) and the NH value in the EPS security context received from the
+/// source MME as described in clause 8.6.2"*, and Annex A.15.2 (`:17176-17188`) gives the
+/// inputs:
+///
+/// ```text
+/// FC  = 0x76
+/// P0  = NH value
+/// L0  = length of NH value (i.e. 0x00 0x20)
+/// KEY = K_ASME
+/// ```
+///
+/// so `S = FC(0x76) || P0(NH, 32 octets) || L0(0x0020)`.
+///
+/// # The NH, not a COUNT
+///
+/// Every other interworking derivation in this module binds to a 4-octet NAS COUNT; this
+/// one binds to the 32-octet NH. A.15.1 (FC `0x75`, idle mode) is the COUNT-bound sibling
+/// and is deliberately not implemented here: this tree has no EPS→5GS idle-mode
+/// registration consumer for it, and an unreachable derivation is the "correct but
+/// unreachable" defect this crate keeps being asked not to grow.
+///
+/// # Verification
+///
+/// The test pins golden vectors computed by an **independent** HMAC-SHA256 fed the `S`
+/// above, so a wrong FC, a wrong `L0`, or a truncated NH fails it rather than agreeing with
+/// itself. No published 3GPP vector exists for this FC.
+pub fn nextgcore_kdf_kamf_prime_from_kasme_handover(
+    kasme: &[u8; SHA256_DIGEST_SIZE],
+    nh: &[u8; SHA256_DIGEST_SIZE],
+) -> [u8; SHA256_DIGEST_SIZE] {
+    let mut params = [KdfParam::default()];
+    params[0].buf = Some(nh.to_vec());
+    params[0].len = SHA256_DIGEST_SIZE as u16;
+
+    nextgcore_kdf_common(kasme, FC_FOR_KAMF_PRIME_FROM_KASME_HANDOVER, &params)
 }
 
 /// TS 33.501 Annex A.17: SoR-MAC-I_AUSF generation function
@@ -1417,6 +1466,40 @@ mod tests {
             base.len(),
             SHA256_DIGEST_SIZE,
             "K_ASME is 32 octets (TS 29.274 Figure 8.38-5, octets 14 to 45)"
+        );
+    }
+
+    /// nextgcore #418: FC 0x76 K_AMF' from K_ASME, TS 33.501 Annex A.15.2.
+    ///
+    /// Golden vectors computed by an independent HMAC-SHA256 over
+    /// `S = 0x76 || NH(32) || 0x0020` with `KEY = [0x55; 32]` -- Annex A.15.2's parameter
+    /// list, not this implementation -- so a wrong FC, a wrong L0 or a dropped NH fails.
+    #[test]
+    fn kamf_prime_from_kasme_handover_matches_ts33501_annex_a_15_2() {
+        fn hex(bytes: &[u8; SHA256_DIGEST_SIZE]) -> String {
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+        let kasme = [0x55u8; SHA256_DIGEST_SIZE];
+        assert_eq!(
+            hex(&nextgcore_kdf_kamf_prime_from_kasme_handover(
+                &kasme,
+                &[0x11; 32]
+            )),
+            "bd96b31d2133d578e1a8faea57669d9ab86a441f6c8c303c8c60eb4e7e29558c",
+            "FC 0x76, P0 = NH, L0 = 0x0020, KEY = K_ASME (Annex A.15.2)"
+        );
+        assert_eq!(
+            hex(&nextgcore_kdf_kamf_prime_from_kasme_handover(
+                &kasme,
+                &[0x22; 32]
+            )),
+            "d4677ca0608a24d3dc94997d9b07e83aa5e720cc955e6ab09646fcaafa0a88e5",
+            "the NH is load-bearing: a different NH is a different K_AMF'"
+        );
+        // The mapped key is not the EPS key it came from.
+        assert_ne!(
+            nextgcore_kdf_kamf_prime_from_kasme_handover(&kasme, &[0x11; 32]),
+            kasme
         );
     }
 

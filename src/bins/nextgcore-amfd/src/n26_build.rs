@@ -487,21 +487,11 @@ pub fn build_forward_relocation_complete_acknowledge(
     msg
 }
 
-// A **Forward Relocation Complete Notification** (type 135) builder is deliberately ABSENT from
-// this module, and the absence is the point.
-//
-// §7.3.3 (`29274-j60.txt:19493-19495`) has the notification sent *"to the source MME/SGSN/AMF"*
-// -- so it is the TARGET's message. This AMF is the **source** in the only direction #408
-// implements (5GS to EPS): it RECEIVES 135 and answers 136, which
-// `build_forward_relocation_complete_acknowledge` above does.
-//
-// The AMF is the target only in EPS to 5GS, and reaching that point needs the preparation of
-// TS 23.502 §4.11.1.2.2.2 steps 4-7 -- an `Nsmf_PDUSession_CreateSMContext` carrying the UE EPS
-// PDN Connection, which smfd does not consume (#415). So a builder here would have NO production
-// caller, and an encoder no caller can reach is the "correct but unreachable" defect this tree
-// keeps growing. mmed has the builder because mmed IS the target of a 5GS-to-EPS move and
-// `s1ap_handler::handle_handover_notify` drives it through
-// `n26_path::notify_forward_relocation_complete`.
+// The **Forward Relocation Complete Notification** (type 135) is the TARGET's message
+// (§7.3.3, `29274-j60.txt:19493-19495`: sent *"to the source MME/SGSN/AMF"*), so it is not
+// built here: this module is the AMF as SOURCE (5GS to EPS), which RECEIVES 135 and answers
+// 136 above. The AMF is the target in EPS to 5GS (#418), and that builder lives with the rest
+// of that direction in `crate::n26_eps_to_5gs`.
 
 /// Encode a `Target Identification` IE body for a target eNB (TS 29.274 §8.51).
 ///

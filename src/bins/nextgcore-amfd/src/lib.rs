@@ -16,6 +16,7 @@ pub mod gmm_handler;
 pub mod gmm_sm;
 pub mod metrics;
 pub mod n26_build; // #408: Forward Relocation build/parse (TS 29.274 §7.3.1-§7.3.4)
+pub mod n26_eps_to_5gs; // #418: EPS→5GS handover, AMF as target (TS 23.502 §4.11.1.2.2)
 pub mod n26_path; // #347: the N26 leg toward an MME (TS 23.502 §4.11.1.3.2)
 pub mod namf_handler;
 pub mod namf_server;

@@ -637,6 +637,15 @@ pub struct NgapServer {
     /// and before #70 nothing kept it: HandoverNotify mutated in-memory serving state and
     /// told the SMF nothing at all.
     handover_target_transfers: HashMap<(u64, u8), Vec<u8>>,
+    /// EPS→5GS handovers in flight, keyed by the AMF UE NGAP ID allocated for the
+    /// arriving UE (#418).
+    ///
+    /// Set when the HandoverRequest goes to the target gNB (TS 23.502 §4.11.1.2.2.2 step 9)
+    /// and taken when the procedure ends: at HandoverFailure, or at HandoverNotify once the
+    /// Forward Relocation Complete Notification has gone to the MME. It is what tells the
+    /// HandoverRequestAcknowledge handler that the answer goes to an MME over N26 rather
+    /// than to a source gNB as a HandoverCommand.
+    eps_ho_in_flight: HashMap<u64, EpsHoInFlight>,
     /// GMM procedure timer configuration (T3550/T3560/T3570/T3522)
     timer_configs: AmfTimerConfigs,
     /// Emergency services state (TS 23.167, TS 24.501 §5.5.1.2). Held by the server so
@@ -701,6 +710,7 @@ impl NgapServer {
             sm_context_refs: HashMap::new(),
             handover_target_assoc: HashMap::new(),
             handover_target_transfers: HashMap::new(),
+            eps_ho_in_flight: HashMap::new(),
             emergency: crate::emergency::EmergencyHandler::new(),
             ngap_overload_declared: false,
             timer_configs: {
@@ -770,6 +780,10 @@ impl NgapServer {
         // enqueued (#396, TS 29.518 §5.2.2.4.1.3 / TS 38.413 §8.12) to the
         // NG-RAN nodes the consumer targeted. Dormant when none pending.
         self.process_pws_n2_transfers().await;
+
+        // Send the HandoverRequest for every EPS→5GS handover the N26 leg prepared
+        // (#418, TS 23.502 §4.11.1.2.2.2 step 9). Dormant when none is queued.
+        self.process_eps_to_5gs_preparations().await;
 
         // Process any pending server events
         while let Ok(event) = self.server_event_rx.try_recv() {
@@ -7920,6 +7934,14 @@ impl NgapServer {
             ack.admitted_list.len()
         );
 
+        // #418: an EPS→5GS handover's acknowledge is answered to the MME over N26 (step 14),
+        // not to a source gNB -- there is none; the UE is arriving from E-UTRAN.
+        if self.eps_ho_in_flight.contains_key(&ack.amf_ue_ngap_id) {
+            self.complete_eps_to_5gs_preparation(association_id, &ack)
+                .await;
+            return Ok(());
+        }
+
         // Resolve the source gNB association for this UE. The source is the gNB
         // that issued the original HandoverRequired (its NG association is the
         // one currently holding the UE auth state).
@@ -8107,6 +8129,18 @@ impl NgapServer {
             failure.amf_ue_ngap_id,
             failure.cause
         );
+        // #418: the target gNB refused an EPS→5GS handover. TS 23.502 §4.11.1.2.2.2 step 14:
+        // "In the case of Handover Failure in step 10, the target AMF provides to the MME the
+        // failure related information".
+        if let Some(in_flight) = self.eps_ho_in_flight.remove(&failure.amf_ue_ngap_id) {
+            self.abandon_eps_to_5gs_handover(
+                failure.amf_ue_ngap_id,
+                in_flight,
+                "the target gNB answered HandoverFailure",
+            )
+            .await;
+            return Ok(());
+        }
         // The target refused the UE, so there is no longer anywhere to relay a RAN
         // status transfer to. Dropped first and unconditionally: a stale entry
         // would misroute the NEXT handover's status transfer for this UE to a gNB
@@ -8239,6 +8273,21 @@ impl NgapServer {
         // totals change even though the served population did not.
         crate::namf_server::fire_ues_in_area_report();
 
+        // #418: an EPS→5GS handover completes toward the MME, not a source gNB
+        // (TS 23.502 §4.11.1.2.2.3): the SMFs are told the handover completed and the source
+        // MME gets the Forward Relocation Complete Notification. There is no source NG-RAN
+        // context to release -- the source was an eNB, released by the MME.
+        if let Some(in_flight) = self.eps_ho_in_flight.remove(&notify.amf_ue_ngap_id) {
+            let sessions_relayed = self
+                .finish_eps_to_5gs_handover(notify.amf_ue_ngap_id, in_flight)
+                .await;
+            return Ok(HandoverCompletion {
+                sessions_relayed,
+                source_context: None,
+                source_release_sent: false,
+            });
+        }
+
         // #70: switch the core-side DL path to the target (TS 23.502 §4.9.1.3.3 step 12,
         // TS 29.502 `HANDOVER_COMPLETE`). Done HERE and not at HandoverRequestAcknowledge
         // because until the UE has arrived the source is still serving it, and switching
@@ -8352,6 +8401,565 @@ pub struct HandoverCompletion {
     pub source_context: Option<(u64, u32)>,
     /// Whether the release command actually reached the source association.
     pub source_release_sent: bool,
+}
+
+/// An EPS→5GS handover between the HandoverRequest and its completion (#418).
+pub(crate) struct EpsHoInFlight {
+    /// The N26 server step 14's response and the Complete Notification leave from.
+    server: Arc<crate::n26_path::N26Server>,
+    /// The Forward Relocation Request's sequence number, echoed by the response.
+    seq: u32,
+    /// The MME's N26 address and control-plane TEID.
+    mme_peer: SocketAddr,
+    mme_teid: u32,
+    /// The PDN connections prepared at their SMFs.
+    sessions: Vec<crate::n26_path::EpsHoSession>,
+}
+
+/// Where an EPS→5GS HandoverRequest went, or why it did not (#418).
+///
+/// The decision is returned so it can be asserted without a connected gNB; the send
+/// itself is a property of the SCTP association.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EpsHandoverStart {
+    /// The HandoverRequest was built for the target association.
+    Requested {
+        /// The AMF UE NGAP ID allocated for the arriving UE.
+        amf_ue_ngap_id: u64,
+        /// The target gNB's association.
+        target_association: u64,
+    },
+    /// Refused to the MME with this cause.
+    Refused {
+        /// GTPv2-C cause.
+        cause: u8,
+    },
+}
+
+/// The connected gNB a Forward Relocation Request's Target Identification names (#418).
+///
+/// Matched on the **whole** Global gNB ID — PLMN, gNB ID and its bit length — because a gNB
+/// ID is only unique within its PLMN and at its own length: TS 38.413 §9.3.1.6 makes the
+/// length part of the identity, and two gNBs with IDs 0x01 at 22 and at 32 bits are
+/// different nodes.
+pub(crate) fn eps_handover_target_association(
+    sessions: &HashMap<u64, GnbSession>,
+    target: &crate::n26_eps_to_5gs::TargetGnb,
+) -> Option<u64> {
+    let plmn = crate::ngap_asn1::decode_plmn_id(&target.plmn_bcd);
+    sessions
+        .iter()
+        .find(|(_, s)| {
+            s.gnb.gnb_id_presence
+                && s.gnb.gnb_id == target.gnb_id
+                && s.gnb.gnb_id_len == target.gnb_id_len
+                && s.gnb.plmn_id == plmn
+        })
+        .map(|(assoc, _)| *assoc)
+}
+
+/// Seed the arriving UE's context from an EPS→5GS preparation (#418).
+///
+/// The mapped 5G security context of TS 33.501 §8.4.2 step 3, field by field: K_AMF' and
+/// its NAS keys, the ngKSI (value from the eKSI, type **mapped**, §8.6.2), 5G NAS COUNTs of
+/// 0 with the downlink advanced once for the NAS Container, the selected 5G algorithms, the
+/// UE's security capabilities, and the stored `{NCC = 1, NH}` pair of step 4. Plus the
+/// identities the MME sent and the location the target gNB serves, so the UE is addressable
+/// and resolvable by SUPI before it registers.
+pub(crate) fn seed_eps_to_5gs_ue(ue: &mut AmfUe, prep: &crate::n26_path::EpsToFivegsPreparation) {
+    let m = &prep.mapped;
+    ue.supi = prep.supi.clone();
+    ue.pei = prep.pei.clone();
+    ue.kamf = m.kamf;
+    ue.knas_int = m.knas_int;
+    ue.knas_enc = m.knas_enc;
+    ue.ul_count = 0;
+    ue.dl_count = m.dl_count;
+    ue.selected_int_algorithm = m.nia;
+    ue.selected_enc_algorithm = m.nea;
+    ue.nas.amf_ksi = m.ngksi;
+    // TSC = 1: "mapped security context" (TS 24.501 §9.11.3.32), §8.6.2.
+    ue.nas.amf_tsc = 1;
+    ue.security_context_available = true;
+    ue.ue_security_capability = crate::context::UeSecurityCapability {
+        ea: m.ue_5g_caps.0,
+        ia: m.ue_5g_caps.1,
+        eea: m.ue_eps_caps.0,
+        eia: m.ue_eps_caps.1,
+    };
+    ue.ue_network_capability = crate::context::UeNetworkCapability {
+        eea: m.ue_eps_caps.0,
+        eia: m.ue_eps_caps.1,
+    };
+    ue.nhcc = crate::n26_eps_to_5gs::STORED_NCC_AFTER_HANDOVER_REQUEST;
+    ue.nh = m.stored_nh;
+    ue.nr_tai = crate::context::Tai5gs {
+        plmn_id: crate::ngap_asn1::decode_plmn_id(&prep.target.plmn_bcd),
+        tac: prep.target.tac,
+    };
+    // Step 7: "The AMF stores also the allocated EBI(s) associated to the PDU Session ID."
+    ue.assigned_ebis = prep
+        .sessions
+        .iter()
+        .flat_map(|sess| {
+            let psi = sess.created.pdu_session_id;
+            let with_arp: Vec<crate::context::AssignedEbi> = sess
+                .created
+                .allocated_ebi_arps
+                .iter()
+                .map(|(ebi, arp)| crate::context::AssignedEbi {
+                    ebi: *ebi,
+                    pdu_session_id: psi,
+                    arp: arp.clone(),
+                })
+                .collect();
+            if !with_arp.is_empty() {
+                return with_arp;
+            }
+            // This tree's SMF answers with `ebiQfiMapping` and no ARP. The EBI is still the
+            // SMF's allocation and is stored; the ARP is the lowest priority, non-pre-empting
+            // one, which claims nothing the SMF did not grant.
+            sess.created
+                .allocated_ebis
+                .iter()
+                .map(|ebi| crate::context::AssignedEbi {
+                    ebi: *ebi,
+                    pdu_session_id: psi,
+                    arp: crate::context::EbiArp {
+                        priority_level: 15,
+                        preempt_cap: "NOT_PREEMPT".to_string(),
+                        preempt_vuln: "NOT_PREEMPTABLE".to_string(),
+                    },
+                })
+                .collect()
+        })
+        .collect();
+    let ue_ambr = crate::n26_eps_to_5gs::ue_ambr_bps(
+        &prep
+            .sessions
+            .iter()
+            .filter_map(|s| s.apn_ambr_kbps)
+            .collect::<Vec<_>>(),
+        prep.security.subscribed_ue_ambr_kbps,
+    );
+    if let Some((dl, ul)) = ue_ambr {
+        ue.ue_ambr = crate::context::Bitrate {
+            downlink: dl,
+            uplink: ul,
+        };
+    }
+}
+
+impl NgapServer {
+    /// Send the HandoverRequest for each EPS→5GS handover the N26 leg prepared (#418).
+    async fn process_eps_to_5gs_preparations(&mut self) {
+        for prep in crate::n26_path::drain_eps_to_5gs_preparations() {
+            let _ = self.start_eps_to_5gs_handover(prep).await;
+        }
+    }
+
+    /// TS 23.502 §4.11.1.2.2.2 step 9: the HandoverRequest to the target gNB (#418).
+    ///
+    /// Allocates the AMF UE NGAP ID, seeds the UE context with the mapped 5G security
+    /// context and the prepared sessions, and sends the HandoverRequest. Every failure
+    /// answers the MME with `Relocation failure` and tells each SMF the preparation is
+    /// CANCELLED, so neither is left holding state for a handover that will not happen.
+    pub(crate) async fn start_eps_to_5gs_handover(
+        &mut self,
+        prep: crate::n26_path::EpsToFivegsPreparation,
+    ) -> EpsHandoverStart {
+        let seq = prep.seq;
+        let (amf_ue_ngap_id, target_assoc, bytes) =
+            match self.prepare_eps_to_5gs_handover_request(prep).await {
+                Ok(prepared) => prepared,
+                Err(refused) => return refused,
+            };
+        match self.send_to_association(target_assoc, &bytes).await {
+            Ok(()) => {
+                log::info!(
+                    "EPS→5GS (seq={seq}): HandoverRequest sent to target gNB association \
+                     {target_assoc} for UE {amf_ue_ngap_id} (NCC 0 with the temporary K_gNB, \
+                     NSCI and NASC included -- TS 33.501 §8.4.2 step 4)"
+                );
+                EpsHandoverStart::Requested {
+                    amf_ue_ngap_id,
+                    target_association: target_assoc,
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "EPS→5GS (seq={seq}): the HandoverRequest could not be sent to association \
+                     {target_assoc}: {e}; refusing the relocation"
+                );
+                match self.eps_ho_in_flight.remove(&amf_ue_ngap_id) {
+                    Some(in_flight) => {
+                        self.abandon_eps_to_5gs_handover(amf_ue_ngap_id, in_flight, "send failed")
+                            .await
+                    }
+                    None => EpsHandoverStart::Refused {
+                        cause: crate::n26_eps_to_5gs::CAUSE_RELOCATION_FAILURE,
+                    },
+                }
+            }
+        }
+    }
+
+    /// Everything step 9 decides before the send: the target association, the AMF UE NGAP
+    /// ID, the seeded UE context, the recorded sessions and the HandoverRequest bytes (#418).
+    ///
+    /// Split from the send so the decision is assertable without a connected gNB. On `Ok`
+    /// the UE, its sessions and the in-flight record are installed; on `Err` the MME has
+    /// already been refused and the SMFs told CANCELLED.
+    pub(crate) async fn prepare_eps_to_5gs_handover_request(
+        &mut self,
+        prep: crate::n26_path::EpsToFivegsPreparation,
+    ) -> std::result::Result<(u64, u64, Vec<u8>), EpsHandoverStart> {
+        let target_assoc = {
+            let sessions = self.sessions.read().await;
+            eps_handover_target_association(&sessions, &prep.target)
+        };
+        let amf_ue_ngap_id = crate::context::amf_self()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .next_amf_ue_ngap_id();
+        let in_flight = EpsHoInFlight {
+            server: Arc::clone(&prep.server),
+            seq: prep.seq,
+            mme_peer: prep.mme_peer,
+            mme_teid: prep.mme_teid,
+            sessions: prep.sessions.clone(),
+        };
+        let Some(target_assoc) = target_assoc else {
+            log::warn!(
+                "EPS→5GS (seq={}): target gNB {:#x}/{} bits is not connected to this AMF; \
+                 refusing the relocation",
+                prep.seq,
+                prep.target.gnb_id,
+                prep.target.gnb_id_len
+            );
+            return Err(self
+                .abandon_eps_to_5gs_handover(amf_ue_ngap_id, in_flight, "no such target gNB")
+                .await);
+        };
+
+        let mut state = UeNasContext::new(
+            amf_ue_ngap_id,
+            0,
+            target_assoc,
+            crate::context::nas_security_canary(),
+        );
+        seed_eps_to_5gs_ue(&mut state.amf_ue, &prep);
+        let default_nssai = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard
+                .plmn_support
+                .first()
+                .and_then(|p| p.s_nssai.first().cloned())
+        };
+        let sessions: Vec<crate::ngap_asn1::HandoverRequestSession> = prep
+            .sessions
+            .iter()
+            .filter_map(|sess| {
+                let s_nssai = sess
+                    .created
+                    .s_nssai
+                    .map(|(sst, sd)| crate::context::SNssai { sst, sd })
+                    .or_else(|| default_nssai.clone())?;
+                Some(crate::ngap_asn1::HandoverRequestSession {
+                    pdu_session_id: sess.created.pdu_session_id,
+                    s_nssai,
+                    transfer: sess.created.n2_sm_info.clone(),
+                })
+            })
+            .collect();
+        let mut allowed_nssai: Vec<crate::context::SNssai> = Vec::new();
+        for sess in &sessions {
+            if !allowed_nssai
+                .iter()
+                .any(|s| s.sst == sess.s_nssai.sst && s.sd == sess.s_nssai.sd)
+            {
+                allowed_nssai.push(sess.s_nssai.clone());
+            }
+        }
+        state.amf_ue.allowed_nssai = allowed_nssai.clone();
+        let ue_ambr = (state.amf_ue.ue_ambr.downlink, state.amf_ue.ue_ambr.uplink);
+        if sessions.is_empty() || ue_ambr == (0, 0) {
+            log::warn!(
+                "EPS→5GS (seq={}): the HandoverRequest cannot carry its mandatory IEs (no \
+                 S-NSSAI for any session, or no UE-AMBR from the MME); refusing the relocation",
+                prep.seq
+            );
+            return Err(self
+                .abandon_eps_to_5gs_handover(
+                    amf_ue_ngap_id,
+                    in_flight,
+                    "unbuildable HandoverRequest",
+                )
+                .await);
+        }
+
+        let request = crate::ngap_asn1::EpsToFivegsHandoverRequest {
+            amf_ue_ngap_id,
+            ue_ambr_bps: ue_ambr,
+            ue_security_capability: state.amf_ue.ue_security_capability.clone(),
+            next_hop: prep.mapped.temporary_kgnb,
+            nas_container: prep.mapped.nas_container.to_vec(),
+            sessions,
+            allowed_nssai,
+            source_to_target_container: prep.source_to_target_container.clone(),
+        };
+        let bytes = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            crate::ngap_asn1::build_eps_to_5gs_handover_request_asn1(&guard, &request)
+        };
+        let Some(bytes) = bytes else {
+            return Err(self
+                .abandon_eps_to_5gs_handover(
+                    amf_ue_ngap_id,
+                    in_flight,
+                    "HandoverRequest encode failed",
+                )
+                .await);
+        };
+
+        // The UE and its sessions exist from here on: the target gNB may answer at once.
+        for sess in &prep.sessions {
+            self.sm_context_refs.insert(
+                (amf_ue_ngap_id, sess.created.pdu_session_id),
+                sess.created.sm_context_ref.clone(),
+            );
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(mut amf_sess) = guard.sess_add(amf_ue_ngap_id, sess.created.pdu_session_id)
+            {
+                amf_sess.sm_context_ref = Some(sess.created.sm_context_ref.clone());
+                if let Some((sst, sd)) = sess.created.s_nssai {
+                    amf_sess.s_nssai.sst = sst;
+                    amf_sess.s_nssai.sd = sd;
+                }
+                guard.sess_update(&amf_sess);
+            }
+        }
+        self.ue_auth_state.insert(amf_ue_ngap_id, state);
+        self.eps_ho_in_flight.insert(amf_ue_ngap_id, in_flight);
+
+        Ok((amf_ue_ngap_id, target_assoc, bytes))
+    }
+
+    /// Steps 10-14: the target gNB admitted the UE; tell each SMF (step 11) and answer the
+    /// MME with the Forward Relocation Response (step 14), #418.
+    ///
+    /// Returns the EBIs the response reported as set up, for assertion.
+    pub(crate) async fn complete_eps_to_5gs_preparation(
+        &mut self,
+        association_id: u64,
+        ack: &nextgcore_ngap::types::HandoverRequestAcknowledge,
+    ) -> Vec<u8> {
+        let Some(in_flight) = self.eps_ho_in_flight.get(&ack.amf_ue_ngap_id) else {
+            return Vec::new();
+        };
+        let server = Arc::clone(&in_flight.server);
+        let (seq, mme_peer, mme_teid) = (in_flight.seq, in_flight.mme_peer, in_flight.mme_teid);
+        let sessions = in_flight.sessions.clone();
+        // The gNB's RAN UE NGAP ID is learned here, which is what makes the UE addressable
+        // at the target.
+        let _ = self.ue_auth_state.with_mut(ack.amf_ue_ngap_id, |state| {
+            state.ran_ue_ngap_id = ack.ran_ue_ngap_id;
+            state.association_id = association_id;
+        });
+
+        let mut bearers = Vec::new();
+        for sess in &sessions {
+            let psi = sess.created.pdu_session_id;
+            let (host, port) = (&sess.smf.0, sess.smf.1);
+            match ack.admitted_list.iter().find(|a| a.pdu_session_id == psi) {
+                Some(admitted) => {
+                    // Step 11: the N2 SM response, the target's
+                    // HandoverRequestAcknowledgeTransfer, relayed opaquely.
+                    match crate::sbi_path::call_smf_update_sm_context_ho_state(
+                        host,
+                        port,
+                        &sess.created.sm_context_ref,
+                        "PREPARED",
+                        Some(("HANDOVER_REQ_ACK", &admitted.transfer)),
+                    )
+                    .await
+                    {
+                        Ok(elements) => {
+                            let from_smf: Vec<_> = elements
+                                .iter()
+                                .filter_map(|e| {
+                                    crate::n26_eps_to_5gs::bearer_context_from_container(e)
+                                })
+                                .collect();
+                            if from_smf.is_empty() {
+                                // No EPS Bearer Setup List element from the SMF: the
+                                // bearers it allocated EBIs for are the ones moved.
+                                let ebis = if sess.created.allocated_ebis.is_empty() {
+                                    vec![sess.linked_ebi]
+                                } else {
+                                    sess.created.allocated_ebis.clone()
+                                };
+                                bearers.extend(
+                                    ebis.into_iter()
+                                        .map(crate::n26_eps_to_5gs::bearer_context_for_ebi),
+                                );
+                            } else {
+                                bearers.extend(from_smf);
+                            }
+                        }
+                        Err(e) => log::warn!(
+                            "EPS→5GS (seq={seq}): SMF {host}:{port} did not take PDU session \
+                             {psi}'s target tunnel ({e}); its bearers are NOT reported as set up"
+                        ),
+                    }
+                }
+                None => {
+                    log::warn!(
+                        "EPS→5GS (seq={seq}): the target gNB did not admit PDU session {psi}; \
+                         its SMF is told the handover is CANCELLED for it"
+                    );
+                    let _ = crate::sbi_path::call_smf_update_sm_context_ho_state(
+                        host,
+                        port,
+                        &sess.created.sm_context_ref,
+                        "CANCELLED",
+                        None,
+                    )
+                    .await;
+                }
+            }
+        }
+
+        let ebis: Vec<u8> = bearers.iter().filter_map(|b| b.ebi().ok()).collect();
+        let amf_fteid = server.local_fteid(ack.amf_ue_ngap_id as u32);
+        let (Some(amf_fteid), false) = (amf_fteid, bearers.is_empty()) else {
+            log::warn!(
+                "EPS→5GS (seq={seq}): no bearer could be moved, or this AMF has no IPv4 N26 \
+                 F-TEID to give; refusing the relocation"
+            );
+            if let Some(in_flight) = self.eps_ho_in_flight.remove(&ack.amf_ue_ngap_id) {
+                self.abandon_eps_to_5gs_handover(ack.amf_ue_ngap_id, in_flight, "nothing moved")
+                    .await;
+            }
+            return Vec::new();
+        };
+        let response = crate::n26_eps_to_5gs::build_eps_to_5gs_forward_relocation_response(
+            seq,
+            mme_teid,
+            &amf_fteid,
+            &bearers,
+            &ack.target_to_source_container,
+        );
+        server.send_to_mme(mme_peer, &response).await;
+        log::info!(
+            "EPS→5GS (seq={seq}): Forward Relocation Response ACCEPTED to MME {mme_peer} for UE \
+             {}: bearers {ebis:?} set up, target-to-source container {} octets \
+             (TS 23.502 §4.11.1.2.2.2 step 14)",
+            ack.amf_ue_ngap_id,
+            ack.target_to_source_container.len()
+        );
+        ebis
+    }
+
+    /// The execution phase's AMF half (TS 23.502 §4.11.1.2.2.3): the UE arrived.
+    ///
+    /// Each SMF is told the handover COMPLETED (step 7, *"Handover Complete indication for
+    /// PDU Session ID"*), and the source MME gets the Forward Relocation Complete
+    /// Notification (step 5) that lets it release the source side. Returns how many SMFs
+    /// accepted.
+    async fn finish_eps_to_5gs_handover(
+        &mut self,
+        amf_ue_ngap_id: u64,
+        in_flight: EpsHoInFlight,
+    ) -> usize {
+        let mut completed = 0usize;
+        for sess in &in_flight.sessions {
+            match crate::sbi_path::call_smf_update_sm_context_ho_state(
+                &sess.smf.0,
+                sess.smf.1,
+                &sess.created.sm_context_ref,
+                "COMPLETED",
+                None,
+            )
+            .await
+            {
+                Ok(_) => completed += 1,
+                Err(e) => log::warn!(
+                    "EPS→5GS: SMF did not accept COMPLETED for PDU session {}: {e}",
+                    sess.created.pdu_session_id
+                ),
+            }
+        }
+        let seq = in_flight.server.alloc_sequence().await;
+        let notification = crate::n26_eps_to_5gs::build_forward_relocation_complete_notification(
+            seq,
+            in_flight.mme_teid,
+        );
+        in_flight
+            .server
+            .send_to_mme(in_flight.mme_peer, &notification)
+            .await;
+        log::info!(
+            "EPS→5GS: UE {amf_ue_ngap_id} arrived on 5GS; Forward Relocation Complete \
+             Notification sent to MME {} (seq={seq}), {completed} SMF(s) completed",
+            in_flight.mme_peer
+        );
+        completed
+    }
+
+    /// End an EPS→5GS handover that will not complete: refuse to the MME, cancel at each
+    /// SMF, and forget the UE (#418). TS 33.501 §8.4.2: *"If the handover is not completed
+    /// successfully, the new mapped 5G security context cannot be used in the future. In
+    /// this case, the AMF shall delete the new mapped 5G security context."*
+    async fn abandon_eps_to_5gs_handover(
+        &mut self,
+        amf_ue_ngap_id: u64,
+        in_flight: EpsHoInFlight,
+        why: &str,
+    ) -> EpsHandoverStart {
+        let cause = crate::n26_eps_to_5gs::CAUSE_RELOCATION_FAILURE;
+        let refusal = crate::n26_eps_to_5gs::build_forward_relocation_response_refusal(
+            in_flight.seq,
+            in_flight.mme_teid,
+            cause,
+        );
+        in_flight
+            .server
+            .send_to_mme(in_flight.mme_peer, &refusal)
+            .await;
+        for sess in &in_flight.sessions {
+            let _ = crate::sbi_path::call_smf_update_sm_context_ho_state(
+                &sess.smf.0,
+                sess.smf.1,
+                &sess.created.sm_context_ref,
+                "CANCELLED",
+                None,
+            )
+            .await;
+            self.sm_context_refs
+                .remove(&(amf_ue_ngap_id, sess.created.pdu_session_id));
+        }
+        // The mapped security context is deleted with the UE.
+        self.ue_auth_state.remove(amf_ue_ngap_id);
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            for sess in guard.sess_list_for_ue(amf_ue_ngap_id) {
+                guard.sess_remove(sess.id);
+            }
+        }
+        log::warn!(
+            "EPS→5GS (seq={}): relocation REFUSED to MME {} with 'Relocation failure' ({why}); \
+             {} SMF preparation(s) cancelled and the mapped 5G security context deleted",
+            in_flight.seq,
+            in_flight.mme_peer,
+            in_flight.sessions.len()
+        );
+        EpsHandoverStart::Refused { cause }
+    }
 }
 
 impl NgapServer {
@@ -10978,7 +11586,7 @@ fn serving_network_name_for_ue(amf_ue: &crate::context::AmfUe) -> String {
 /// Convert a wire-format security capability octet (bit 8 = algorithm 0,
 /// TS 24.501 Section 9.11.3.54) into the bit-N = algorithm-N mask used by
 /// the algorithm selection helpers
-fn wire_caps_to_mask(wire: u8) -> u8 {
+pub(crate) fn wire_caps_to_mask(wire: u8) -> u8 {
     let mut mask = 0u8;
     for n in 0..8 {
         if wire & (0x80 >> n) != 0 {
@@ -19737,5 +20345,668 @@ mod ntn_retx_tests {
             NasProcTimer::T3550.ntn_compensated(&no_ta, base, None),
             base
         );
+    }
+}
+
+/// #418: the EPS→5GS handover over N26 with this AMF as target, end to end.
+#[cfg(test)]
+mod eps_to_5gs_tests {
+    use super::*;
+    use nextgcore_gtp::v2::{
+        Gtp2AmbrIe, Gtp2ApnIe, Gtp2BearerContextIe, Gtp2BearerQosIe, Gtp2CauseIe, Gtp2EbiIe,
+        Gtp2FTeidIe, Gtp2Header, Gtp2Ie, Gtp2IeType, Gtp2IndicationIe, Gtp2Message,
+        Gtp2MessageType, Gtp2PdnConnectionIe,
+    };
+    use nextgcore_sbi::message::{SbiPart, SbiRequest, SbiResponse};
+    use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+    use std::time::Duration;
+
+    const PGW_FQDN: &str = "pgw1.epc.test";
+    const MME_TEID: u32 = 0xCAFE_0418;
+    const SEQ: u32 = 0x0418;
+    const GNB_ID: u32 = 0x1A2;
+
+    type Captured = (String, String, Vec<SbiPart>);
+
+    /// A stand-in SMF+PGW-C: answers the EPS→5GS create with step 7's members and every
+    /// modify with its `hoState`, and records each request.
+    async fn start_smf() -> (SbiServer, u16, mpsc::Receiver<Captured>) {
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let (tx, rx) = mpsc::channel(16);
+        let server = SbiServer::on_listener(
+            SbiServerConfig::new(format!("127.0.0.1:{port}").parse().unwrap()),
+            listener,
+        );
+        server
+            .start(move |req: SbiRequest| {
+                let tx = tx.clone();
+                async move {
+                    let uri = req.header.uri.clone();
+                    let body = req.http.content.clone().unwrap_or_default();
+                    let _ = tx
+                        .send((uri.clone(), body.clone(), req.http.parts.clone()))
+                        .await;
+                    if uri.ends_with("/sm-contexts") {
+                        return SbiResponse::with_status(201)
+                            .with_header(
+                                "location",
+                                "http://127.0.0.1/nsmf-pdusession/v1/sm-contexts/418",
+                            )
+                            .with_body(
+                                serde_json::json!({
+                                    "pduSessionId": 5,
+                                    "sNssai": { "sst": 1, "sd": "000001" },
+                                    "hoState": "PREPARING",
+                                    "n2SmInfo": { "contentId": "n2SmInfo" },
+                                    "n2SmInfoType": "PDU_RES_SETUP_REQ",
+                                    "allocatedEbiList": [{ "epsBearerId": 5,
+                                        "arp": { "priorityLevel": 8, "preemptCap": "NOT_PREEMPT",
+                                                 "preemptVuln": "NOT_PREEMPTABLE" } }],
+                                })
+                                .to_string(),
+                                "application/json",
+                            )
+                            .with_part(SbiPart::with_content(
+                                "n2SmInfo",
+                                "application/vnd.3gpp.ngap",
+                                bytes::Bytes::from_static(&[0xDE, 0xAD, 0xBE, 0xEF]),
+                            ));
+                    }
+                    let ho_state = serde_json::from_str::<serde_json::Value>(&body)
+                        .ok()
+                        .and_then(|v| v["hoState"].as_str().map(str::to_string))
+                        .unwrap_or_default();
+                    SbiResponse::with_status(200).with_body(
+                        serde_json::json!({ "hoState": ho_state }).to_string(),
+                        "application/json",
+                    )
+                }
+            })
+            .await
+            .expect("SMF stand-in");
+        (server, port, rx)
+    }
+
+    /// A stand-in NRF that knows one SMF, declaring `declared_pgw` as its PGW-C FQDN.
+    async fn start_nrf(
+        smf_port: u16,
+        declared_pgw: &'static str,
+    ) -> (SbiServer, u16, mpsc::Receiver<String>) {
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let port = addr.port();
+        let (tx, rx) = mpsc::channel(8);
+        let server = SbiServer::on_listener(
+            SbiServerConfig::new(format!("127.0.0.1:{port}").parse().unwrap()),
+            listener,
+        );
+        server
+            .start(move |req: SbiRequest| {
+                let tx = tx.clone();
+                async move {
+                    // The query as the NRF received it: `target-nf-type=SMF&pgw=...`.
+                    let mut query: Vec<String> = req
+                        .http
+                        .params
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect();
+                    query.sort();
+                    let _ = tx.send(query.join("&")).await;
+                    SbiResponse::with_status(200).with_body(
+                        serde_json::json!({ "nfInstances": [{
+                            "nfInstanceId": "smf-pgw-418",
+                            "nfType": "SMF",
+                            "nfStatus": "REGISTERED",
+                            "smfInfo": { "pgwFqdn": declared_pgw },
+                            "nfServices": [{ "serviceName": "nsmf-pdusession",
+                                "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": smf_port }] }],
+                        }]})
+                        .to_string(),
+                        "application/json",
+                    )
+                }
+            })
+            .await
+            .expect("NRF stand-in");
+        (server, port, rx)
+    }
+
+    /// The MME's PDN Connection IE contents (Table 7.3.1-2), with the S5/S8 FQDN.
+    fn pdn_connection_contents() -> Vec<u8> {
+        let mut pdn = Gtp2PdnConnectionIe::new();
+        pdn.add_ie(Gtp2ApnIe::from_string("internet").to_ie(0));
+        pdn.add_ie(Gtp2EbiIe::new(5).to_ie(0));
+        pdn.add_ie(Gtp2FTeidIe::new_ipv4(7, 0x55, [10, 45, 0, 1]).to_ie(0));
+        let mut fqdn = Vec::new();
+        for label in PGW_FQDN.split('.') {
+            fqdn.push(label.len() as u8);
+            fqdn.extend_from_slice(label.as_bytes());
+        }
+        pdn.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Fqdn as u8, 0, &fqdn));
+        let mut bearer = Gtp2BearerContextIe::new();
+        bearer.set_ebi(5);
+        bearer.set_bearer_qos(&Gtp2BearerQosIe::new(9, 0, 0, 0, 0));
+        pdn.add_ie(bearer.to_ie(0));
+        pdn.add_ie(Gtp2AmbrIe::new(50_000, 100_000).to_ie(0));
+        let mut v = bytes::BytesMut::new();
+        pdn.encode_value(&mut v);
+        v.to_vec()
+    }
+
+    /// A Figure 8.38-5 MM Context: KSI 3, EIA2/EEA1, K_ASME, NH with NCC 2.
+    fn mm_context_contents() -> Vec<u8> {
+        let mut v = vec![(4 << 5) | 0x10 | 0x03, 0x00, (2 << 4) | 1];
+        v.extend_from_slice(&[0, 0, 7, 0, 0, 9]);
+        v.extend_from_slice(&[0xA5; 32]);
+        v.extend_from_slice(&[0x5C; 32]);
+        v.push(0x02);
+        v.extend_from_slice(&[2, 0xF0, 0x70, 0, 0, 0]);
+        v
+    }
+
+    /// A conformant EPS→5GS Forward Relocation Request (TS 29.274 Table 7.3.1-1), the
+    /// datagram an MME sends.
+    fn forward_relocation_request(mme_addr: [u8; 4]) -> Vec<u8> {
+        let mut msg = Gtp2Message::new(Gtp2Header::new(
+            Gtp2MessageType::ForwardRelocationRequest as u8,
+            0,
+            SEQ,
+        ));
+        msg.add_ie(Gtp2Ie::from_slice(
+            Gtp2IeType::Imsi as u8,
+            0,
+            &crate::n26_path::string_to_bcd("001010000004180"),
+        ));
+        // Interface type 12: "S10/N26 MME GTP-C" (Table 8.22-1).
+        msg.add_ie(Gtp2FTeidIe::new_ipv4(12, MME_TEID, mme_addr).to_ie(0));
+        msg.add_ie(Gtp2Ie::from_slice(
+            Gtp2IeType::MmContext as u8,
+            0,
+            &mm_context_contents(),
+        ));
+        msg.add_ie(Gtp2Ie::from_slice(
+            Gtp2IeType::PdnConnection as u8,
+            0,
+            &pdn_connection_contents(),
+        ));
+        msg.add_ie(Gtp2Ie::from_slice(
+            Gtp2IeType::FContainer as u8,
+            0,
+            &[3, 0x40, 0x41, 0x42],
+        ));
+        let plmn = crate::n26_build::encode_plmn_bcd(&PlmnId::new("999", "70"));
+        let mut target = vec![5, plmn[0], plmn[1], plmn[2], 22];
+        target.extend_from_slice(&GNB_ID.to_be_bytes());
+        target.extend_from_slice(&[0x00, 0x00, 0x01]);
+        msg.add_ie(Gtp2Ie::from_slice(
+            Gtp2IeType::TargetIdentification as u8,
+            0,
+            &target,
+        ));
+        msg.add_ie(
+            Gtp2IndicationIe {
+                dfi: true,
+                ..Gtp2IndicationIe::new()
+            }
+            .to_ie(0),
+        );
+        msg.encode().to_vec()
+    }
+
+    async fn recv_gtp(mme: &tokio::net::UdpSocket) -> Gtp2Message {
+        let mut buf = vec![0u8; 4096];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(5), mme.recv_from(&mut buf))
+            .await
+            .expect("the MME must hear from the AMF")
+            .expect("recv");
+        let mut bytes = bytes::Bytes::copy_from_slice(&buf[..len]);
+        Gtp2Message::decode(&mut bytes).expect("a GTPv2-C message")
+    }
+
+    async fn recv_smf(rx: &mut mpsc::Receiver<Captured>) -> Captured {
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the SMF must be called")
+            .expect("open")
+    }
+
+    async fn drained_preparation() -> crate::n26_path::EpsToFivegsPreparation {
+        for _ in 0..100 {
+            if let Some(prep) = crate::n26_path::drain_eps_to_5gs_preparations().pop() {
+                return prep;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the prepared handover must reach the NGAP queue");
+    }
+
+    fn serve_guami_999_70() -> Vec<crate::context::Guami> {
+        let ctx = crate::context::amf_self();
+        let mut guard = ctx.write().unwrap_or_else(|e| e.into_inner());
+        let previous = guard.served_guami.clone();
+        guard.served_guami = vec![crate::context::Guami {
+            plmn_id: PlmnId::new("999", "70"),
+            amf_id: crate::context::AmfId {
+                region: 2,
+                set: 1,
+                pointer: 0,
+            },
+        }];
+        previous
+    }
+
+    fn restore_guami(previous: Vec<crate::context::Guami>) {
+        let ctx = crate::context::amf_self();
+        ctx.write().unwrap_or_else(|e| e.into_inner()).served_guami = previous;
+    }
+
+    /// **#418 criterion 7**, and every other criterion on the way: a real type-133
+    /// datagram into the AMF's N26 socket drives the NRF by the S5/S8 FQDN (3), the SMF's
+    /// CreateSMContext with the container (4), the stored EBIs and session (5), the
+    /// HandoverRequest to the target gNB, the SMF's PREPARED update and the Forward
+    /// Relocation Response to the MME (1), then on HandoverNotify the SMF's COMPLETED and
+    /// the Complete Notification. Asserted on what the stand-in SMF and the MME socket
+    /// RECEIVED, not on log lines.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    // CONTEXT_GUARD is held across the awaits on purpose: the AMF context, the NRF
+    // override and the preparation queue are process-global, and the whole exchange must
+    // run without a sibling test touching them.
+    #[allow(clippy::await_holding_lock)]
+    async fn an_eps_to_5gs_forward_relocation_request_runs_end_to_end() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_support::init_context();
+        // The stand-ins are loopback plaintext peers, i.e. a dev-profile deployment; the
+        // same explicit statement the other SBI-calling tests in this crate make.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _ = crate::n26_path::drain_eps_to_5gs_preparations();
+        let previous_guami = serve_guami_999_70();
+
+        let (_smf, smf_port, mut smf_rx) = start_smf().await;
+        let (_nrf, nrf_port, mut nrf_rx) = start_nrf(smf_port, PGW_FQDN).await;
+        crate::sbi_path::set_pgw_discovery_nrf_for_test(Some(format!(
+            "http://127.0.0.1:{nrf_port}"
+        )));
+
+        let n26 = crate::n26_path::N26Server::open("127.0.0.1:0".parse().unwrap(), 1)
+            .await
+            .expect("N26 socket");
+        let mme = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        mme.send_to(
+            &forward_relocation_request([127, 0, 0, 1]),
+            n26.local_addr(),
+        )
+        .await
+        .unwrap();
+
+        // Step 3: the NRF is asked by the PGW-C's S5/S8 FQDN.
+        let nrf_query = tokio::time::timeout(Duration::from_secs(5), nrf_rx.recv())
+            .await
+            .expect("the NRF must be asked")
+            .unwrap();
+        assert!(
+            nrf_query.contains("target-nf-type=SMF") && nrf_query.contains("pgw=pgw1.epc.test"),
+            "step 3: Nnrf_NFDiscovery_Request including the FQDN for the S5/S8 interface, got \
+             {nrf_query}"
+        );
+
+        // Step 4: CreateSMContext with the MME's PDN connection, unaltered.
+        let (uri, body, parts) = recv_smf(&mut smf_rx).await;
+        assert!(uri.ends_with("/nsmf-pdusession/v1/sm-contexts"), "{uri}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        use base64::Engine as _;
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(
+                    body["ueEpsPdnConnection"]
+                        .as_str()
+                        .expect("ueEpsPdnConnection")
+                )
+                .unwrap(),
+            pdn_connection_contents(),
+            "the SMF receives the MME's PDN Connection IE byte for byte"
+        );
+        assert_eq!(body["hoState"], "PREPARING");
+        assert_eq!(body["supi"], "imsi-001010000004180");
+        assert_eq!(body["targetId"]["ranNodeId"]["gNbId"]["bitLength"], 22);
+        assert_eq!(
+            body["targetId"]["ranNodeId"]["gNbId"]["gNBValue"], "0001a2",
+            "22 bits render as 6 hex digits"
+        );
+        assert_eq!(body["targetId"]["tai"]["tac"], "000001");
+        assert!(body.get("pduSessionId").is_none() && body.get("n1SmMsg").is_none());
+        assert!(parts.is_empty());
+
+        // Steps 7-9: the preparation reaches the NGAP layer; the target gNB is resolved.
+        let prep = drained_preparation().await;
+        let mut ngap = NgapServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            SctpBackend::Userspace,
+            mpsc::channel(64).0,
+        )
+        .await
+        .unwrap();
+        const ASSOC: u64 = 0x418;
+        let mut session = GnbSession::new(ASSOC, ASSOC, "127.0.0.1:38412".parse().unwrap());
+        session.gnb.gnb_id = GNB_ID;
+        session.gnb.gnb_id_len = 22;
+        session.gnb.gnb_id_presence = true;
+        session.gnb.plmn_id = PlmnId::new("999", "70");
+        ngap.sessions.write().await.insert(ASSOC, session);
+
+        let (amf_ue_ngap_id, target, request) = ngap
+            .prepare_eps_to_5gs_handover_request(prep)
+            .await
+            .expect("the HandoverRequest is prepared");
+        assert_eq!(target, ASSOC, "the gNB the Target Identification names");
+        let hr = match nextgcore_ngap_gen::decode(&request).unwrap() {
+            nextgcore_ngap_gen::NGAP_PDU::InitiatingMessage(m) => m,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(hr.procedure_code.0, 13, "HandoverResourceAllocation");
+        let nextgcore_ngap_gen::generated::InitiatingMessageValue::Id_HandoverResourceAllocation(
+            req,
+        ) = hr.value
+        else {
+            panic!("HandoverRequest expected");
+        };
+        let s2t = req.protocol_i_es.0.iter().find_map(|ie| match &ie.value {
+            nextgcore_ngap_gen::generated::HandoverRequestProtocolIEs_EntryValue::Id_SourceToTarget_TransparentContainer(c) => Some(c.0.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            s2t,
+            Some(vec![0x40, 0x41, 0x42]),
+            "the MME's container reaches the gNB without its F-Container type octet (§8.48)"
+        );
+        let transfer = req.protocol_i_es.0.iter().find_map(|ie| match &ie.value {
+            nextgcore_ngap_gen::generated::HandoverRequestProtocolIEs_EntryValue::Id_PDUSessionResourceSetupListHOReq(l) => {
+                l.0.first().map(|item| (item.pdu_session_id.0, item.handover_request_transfer.0.clone()))
+            }
+            _ => None,
+        });
+        assert_eq!(
+            transfer,
+            Some((5, vec![0xDE, 0xAD, 0xBE, 0xEF])),
+            "PDU session 5 carries the SMF's step-7 N2 SM information"
+        );
+
+        // Criterion 2 and 5: the arriving UE holds the mapped context and the step-7 EBIs.
+        let ue = ngap
+            .ue_auth_state
+            .get(amf_ue_ngap_id)
+            .expect("the UE context");
+        assert_eq!(
+            ue.amf_ue.kamf,
+            nextgcore_crypt::kdf::nextgcore_kdf_kamf_prime_from_kasme_handover(
+                &[0xA5; 32],
+                &[0x5C; 32]
+            ),
+            "K_AMF' = KDF(K_ASME, FC 0x76, NH)"
+        );
+        assert_eq!(
+            (ue.amf_ue.nas.amf_ksi, ue.amf_ue.nas.amf_tsc),
+            (3, 1),
+            "mapped ngKSI"
+        );
+        assert_eq!(
+            ue.amf_ue.nhcc, 1,
+            "the stored {{NCC=1, NH}} of §8.4.2 step 4"
+        );
+        assert_eq!(ue.amf_ue.supi.as_deref(), Some("imsi-001010000004180"));
+        assert_eq!(
+            ue.amf_ue
+                .assigned_ebis
+                .iter()
+                .map(|e| (e.ebi, e.pdu_session_id, e.arp.priority_level))
+                .collect::<Vec<_>>(),
+            vec![(5, 5, 8)],
+            "step 7: 'The AMF stores also the allocated EBI(s) associated to the PDU Session ID'"
+        );
+        assert_eq!(
+            ngap.sm_context_refs
+                .get(&(amf_ue_ngap_id, 5))
+                .map(String::as_str),
+            Some("418")
+        );
+        let stored_sessions = crate::context::amf_self()
+            .read()
+            .unwrap()
+            .sess_list_for_ue(amf_ue_ngap_id);
+        assert_eq!(stored_sessions.len(), 1);
+        assert_eq!(stored_sessions[0].sm_context_ref.as_deref(), Some("418"));
+        assert_eq!(stored_sessions[0].s_nssai.sd, Some(1));
+
+        // Steps 10-14: the gNB admits the UE.
+        let ack = nextgcore_ngap::builder::build_handover_request_acknowledge(
+            &nextgcore_ngap::types::HandoverRequestAcknowledge {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id: 77,
+                admitted_list: vec![nextgcore_ngap::types::PduSessionResourceAdmittedItemHoAck {
+                    pdu_session_id: 5,
+                    transfer: vec![0x00, 0x03, 0xE0, 0x0A],
+                }],
+                failed_list: None,
+                target_to_source_container: vec![0xC0, 0xFE],
+            },
+        )
+        .unwrap();
+        ngap.handle_handover_request_acknowledge(ASSOC, &ack)
+            .await
+            .unwrap();
+
+        let (uri, body, parts) = recv_smf(&mut smf_rx).await;
+        assert!(uri.ends_with("/sm-contexts/418/modify"), "{uri}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["hoState"], "PREPARED", "step 11");
+        assert_eq!(body["n2SmInfoType"], "HANDOVER_REQ_ACK");
+        assert_eq!(
+            parts[0].data.as_ref(),
+            &[0x00, 0x03, 0xE0, 0x0A],
+            "the gNB's transfer, opaque"
+        );
+
+        let response = recv_gtp(&mme).await;
+        assert_eq!(
+            response.header.message_type, 134,
+            "Forward Relocation Response"
+        );
+        assert_eq!(response.header.sequence_number, SEQ, "echoes the request");
+        assert_eq!(
+            response.header.teid,
+            Some(MME_TEID),
+            "addressed to the MME's context"
+        );
+        let cause =
+            Gtp2CauseIe::decode(&response.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+                .unwrap();
+        assert_eq!(cause.cause, 16, "Request accepted");
+        assert_eq!(
+            response
+                .get_ie(Gtp2IeType::FContainer as u8, 0)
+                .unwrap()
+                .value
+                .as_ref(),
+            &[3, 0xC0, 0xFE],
+            "the gNB's Target-to-Source container, Container Type 3"
+        );
+        let sender =
+            Gtp2FTeidIe::decode(&response.get_ie(Gtp2IeType::FTeid as u8, 0).unwrap().value)
+                .unwrap();
+        assert_eq!(sender.teid, amf_ue_ngap_id as u32);
+        let set_up: Vec<u8> = response
+            .get_ies(Gtp2IeType::BearerContext as u8)
+            .iter()
+            .map(|ie| {
+                Gtp2BearerContextIe::decode(&ie.value)
+                    .unwrap()
+                    .ebi()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(set_up, vec![5], "the EPS Bearer Setup List");
+        assert_eq!(
+            ngap.ue_auth_state
+                .get(amf_ue_ngap_id)
+                .unwrap()
+                .ran_ue_ngap_id,
+            77,
+            "the target's RAN UE NGAP ID is learned from the acknowledge"
+        );
+
+        // Execution: the UE arrives.
+        let notify = nextgcore_ngap::builder::build_handover_notify(
+            &nextgcore_ngap::types::HandoverNotify {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id: 77,
+                user_location_info: nextgcore_ngap::types::UserLocationInformation::Nr {
+                    nr_cgi_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("999", "70")),
+                    nr_cell_identity: 0x1A2001,
+                    tai_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("999", "70")),
+                    tai_tac: [0, 0, 1],
+                },
+            },
+        )
+        .unwrap();
+        let completion = ngap.handle_handover_notify(ASSOC, &notify).await.unwrap();
+        assert_eq!(completion.sessions_relayed, 1);
+        assert_eq!(
+            completion.source_context, None,
+            "the source was an eNB, not a gNB"
+        );
+        let (uri, body, _) = recv_smf(&mut smf_rx).await;
+        assert!(uri.ends_with("/sm-contexts/418/modify"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["hoState"],
+            "COMPLETED"
+        );
+        let complete = recv_gtp(&mme).await;
+        assert_eq!(
+            complete.header.message_type, 135,
+            "Forward Relocation Complete Notification"
+        );
+        assert_eq!(complete.header.teid, Some(MME_TEID));
+        assert!(!ngap.eps_ho_in_flight.contains_key(&amf_ue_ngap_id));
+
+        crate::sbi_path::set_pgw_discovery_nrf_for_test(None);
+        ngap.ue_auth_state.remove(amf_ue_ngap_id);
+        restore_guami(previous_guami);
+    }
+
+    /// Step 3's rule: a PDN connection whose SMF cannot be identified is not moved, and a
+    /// request that moves nothing is refused to the MME rather than accepted empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    // CONTEXT_GUARD is held across the awaits on purpose: the AMF context, the NRF
+    // override and the preparation queue are process-global, and the whole exchange must
+    // run without a sibling test touching them.
+    #[allow(clippy::await_holding_lock)]
+    async fn a_pdn_connection_whose_smf_cannot_be_resolved_is_not_moved() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_support::init_context();
+        // The stand-ins are loopback plaintext peers, i.e. a dev-profile deployment; the
+        // same explicit statement the other SBI-calling tests in this crate make.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _ = crate::n26_path::drain_eps_to_5gs_preparations();
+        let previous_guami = serve_guami_999_70();
+
+        let (_smf, smf_port, mut smf_rx) = start_smf().await;
+        // The only SMF the NRF knows declares a DIFFERENT PGW-C.
+        let (_nrf, nrf_port, _nrf_rx) = start_nrf(smf_port, "pgw9.epc.test").await;
+        crate::sbi_path::set_pgw_discovery_nrf_for_test(Some(format!(
+            "http://127.0.0.1:{nrf_port}"
+        )));
+        let n26 = crate::n26_path::N26Server::open("127.0.0.1:0".parse().unwrap(), 1)
+            .await
+            .unwrap();
+        let mme = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        mme.send_to(
+            &forward_relocation_request([127, 0, 0, 1]),
+            n26.local_addr(),
+        )
+        .await
+        .unwrap();
+
+        let response = recv_gtp(&mme).await;
+        assert_eq!(response.header.message_type, 134);
+        assert_eq!(response.header.teid, Some(MME_TEID));
+        let cause =
+            Gtp2CauseIe::decode(&response.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+                .unwrap();
+        assert_eq!(cause.cause, 81, "Relocation failure");
+        assert!(response.get_ie(Gtp2IeType::FContainer as u8, 0).is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), smf_rx.recv())
+                .await
+                .is_err(),
+            "no SMF that does not declare this PGW-C may be asked to take the session"
+        );
+        assert!(crate::n26_path::drain_eps_to_5gs_preparations().is_empty());
+
+        crate::sbi_path::set_pgw_discovery_nrf_for_test(None);
+        restore_guami(previous_guami);
+    }
+
+    /// A target gNB this AMF has no association with: refused to the MME, and the SMF told
+    /// the preparation is CANCELLED, so neither holds state for a handover that cannot run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    // CONTEXT_GUARD is held across the awaits on purpose: the AMF context, the NRF
+    // override and the preparation queue are process-global, and the whole exchange must
+    // run without a sibling test touching them.
+    #[allow(clippy::await_holding_lock)]
+    async fn an_unknown_target_gnb_refuses_and_cancels_at_the_smf() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_support::init_context();
+        // The stand-ins are loopback plaintext peers, i.e. a dev-profile deployment; the
+        // same explicit statement the other SBI-calling tests in this crate make.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _ = crate::n26_path::drain_eps_to_5gs_preparations();
+        let previous_guami = serve_guami_999_70();
+
+        let (_smf, smf_port, mut smf_rx) = start_smf().await;
+        let (_nrf, nrf_port, _nrf_rx) = start_nrf(smf_port, PGW_FQDN).await;
+        crate::sbi_path::set_pgw_discovery_nrf_for_test(Some(format!(
+            "http://127.0.0.1:{nrf_port}"
+        )));
+        let n26 = crate::n26_path::N26Server::open("127.0.0.1:0".parse().unwrap(), 1)
+            .await
+            .unwrap();
+        let mme = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        mme.send_to(
+            &forward_relocation_request([127, 0, 0, 1]),
+            n26.local_addr(),
+        )
+        .await
+        .unwrap();
+        let _create = recv_smf(&mut smf_rx).await;
+        let prep = drained_preparation().await;
+
+        let mut ngap = NgapServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            SctpBackend::Userspace,
+            mpsc::channel(64).0,
+        )
+        .await
+        .unwrap();
+        // No gNB session at all.
+        let outcome = ngap.start_eps_to_5gs_handover(prep).await;
+        assert_eq!(outcome, EpsHandoverStart::Refused { cause: 81 });
+        let response = recv_gtp(&mme).await;
+        assert_eq!(response.header.message_type, 134);
+        let (uri, body, _) = recv_smf(&mut smf_rx).await;
+        assert!(uri.ends_with("/sm-contexts/418/modify"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["hoState"],
+            "CANCELLED"
+        );
+        assert!(ngap.eps_ho_in_flight.is_empty());
+
+        crate::sbi_path::set_pgw_discovery_nrf_for_test(None);
+        restore_guami(previous_guami);
     }
 }
