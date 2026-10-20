@@ -1990,22 +1990,14 @@ mod tests {
             "the encoded Activate Default Bearer Context Request must carry the \
              PGW-allocated address; found none in {esm:02x?}"
         );
-        // This module writes the EPS bearer identity as a WHOLE octet followed by the
-        // protocol discriminator (`esm_build.rs:559-560`), rather than packing both into
-        // octet 1 as TS 24.301 §9.3.1 does. That spelling is this build's existing
-        // convention across every ESM builder and is not #329's to change; the
-        // assertion follows the code's actual layout rather than the spec's, and says so.
+        // Octet 1 packs the EPS bearer identity (bits 8-5) with PD 2 (bits 4-1),
+        // TS 24.301 §9.3.1. Until #496 every ESM builder wrote them as two
+        // octets and this test pinned that layout; it now pins the spec's.
         assert_eq!(
             esm.first().copied(),
-            Some(7),
-            "the message must name the bearer the MME actually created, not a \
-             fabricated EBI 5"
-        );
-        assert_eq!(
-            esm.get(1).copied(),
-            Some(crate::emm_build::NAS_PROTOCOL_DISCRIMINATOR_ESM),
-            "and the octet after it is the ESM discriminator, which is what makes the \
-             first one the bearer identity rather than a coincidence"
+            Some(0x72),
+            "octet 1 must name the bearer the MME actually created (EBI 7, not a \
+             fabricated 5) packed with the ESM discriminator"
         );
 
         release_global_ue(mme_ue_id, sess_id, bearer_id);
