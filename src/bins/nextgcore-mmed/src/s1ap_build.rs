@@ -18,9 +18,9 @@ use nextgcore_s1ap::{
     ErabLevelQosParameters, ErabModifyRequest, ErabReleaseCommand, ErabSetupRequest,
     ErabToBeModifiedItem, ErabToBeSetupItem, ErrorIndication, EutranCgi, GbrQosInformation,
     InitialContextSetupRequest, KillRequest, OverloadAction, OverloadStart, OverloadStop, Paging,
-    PagingDrx, S1apResult, STmsi, Tai,
-    TimeToWait, UeAmbr, UeContextModificationRequest, UeContextReleaseCommand, UePagingId,
-    UeS1apIds, UeSecurityCapabilities, WarningAreaList, WriteReplaceWarningRequest,
+    PagingDrx, S1apResult, STmsi, Tai, TimeToWait, UeAmbr, UeContextModificationRequest,
+    UeContextReleaseCommand, UePagingId, UeS1apIds, UeSecurityCapabilities, WarningAreaList,
+    WriteReplaceWarningRequest,
 };
 
 // ============================================================================

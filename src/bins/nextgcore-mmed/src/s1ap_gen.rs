@@ -48,7 +48,7 @@ pub struct DiagnosedIe {
 }
 
 /// Outcome of decoding an S1 SETUP REQUEST with TS 36.413 §10.3.4 / §10.3.5.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum SetupRequestDecode {
     /// Proceed with the procedure. `notify` lists unknown IEs marked
     /// ignore-and-notify, to be reported in the response's Criticality
@@ -159,8 +159,12 @@ pub fn decode_s1_setup_request(bytes: &[u8]) -> SetupRequestDecode {
                     v.0.into_iter()
                         .filter_map(|item| {
                             let tac = u16::from_be_bytes(item.tac.0.as_slice().try_into().ok()?);
-                            let broadcast_plmns =
-                                item.broadcast_plm_ns.0.iter().filter_map(|p| plmn(&p.0)).collect();
+                            let broadcast_plmns = item
+                                .broadcast_plm_ns
+                                .0
+                                .iter()
+                                .filter_map(|p| plmn(&p.0))
+                                .collect();
                             Some(SupportedTaItem {
                                 tac,
                                 broadcast_plmns,
@@ -271,7 +275,11 @@ pub fn build_s1_setup_response(
         });
     };
     if let Some(name) = mme_name {
-        push(ID_MME_NAME, IGNORE, V::Id_MMEname(g::MMEname(name.to_owned())));
+        push(
+            ID_MME_NAME,
+            IGNORE,
+            V::Id_MMEname(g::MMEname(name.to_owned())),
+        );
     }
     push(
         ID_SERVED_GUMMEIS,
@@ -281,7 +289,7 @@ pub fn build_s1_setup_response(
                 .iter()
                 .map(|s| g::ServedGUMMEIsItem {
                     served_plm_ns: g::ServedPLMNs(
-                        s.plmns.iter().map(|p| g::PLMNidentity(p.to_vec())).collect(),
+                        s.plmns.iter().map(|p| g::TBCD_STRING(p.to_vec())).collect(),
                     ),
                     served_group_i_ds: g::ServedGroupIDs(
                         s.group_ids
@@ -381,7 +389,7 @@ pub fn build_s1_setup_request(req: &S1SetupRequest) -> Result<Vec<u8>, asn1_code
         id: g::ProtocolIE_ID(ID_GLOBAL_ENB_ID),
         criticality: g::Criticality(REJECT),
         value: V::Id_Global_ENB_ID(g::Global_ENB_ID {
-            plm_nidentity: g::PLMNidentity(req.global_enb_id.plmn_identity.to_vec()),
+            plm_nidentity: g::TBCD_STRING(req.global_enb_id.plmn_identity.to_vec()),
             enb_id,
             ie_extensions: None,
         }),
@@ -402,7 +410,10 @@ pub fn build_s1_setup_request(req: &S1SetupRequest) -> Result<Vec<u8>, asn1_code
                 .map(|ta| g::SupportedTAs_Item {
                     tac: g::TAC(ta.tac.to_be_bytes().to_vec()),
                     broadcast_plm_ns: g::BPLMNs(
-                        ta.broadcast_plmns.iter().map(|p| g::PLMNidentity(p.to_vec())).collect(),
+                        ta.broadcast_plmns
+                            .iter()
+                            .map(|p| g::TBCD_STRING(p.to_vec()))
+                            .collect(),
                     ),
                     ie_extensions: None,
                 })

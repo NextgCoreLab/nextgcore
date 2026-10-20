@@ -64,7 +64,10 @@ fn the_setup_response_is_the_x691_golden() {
         num_of_mme_code: 1,
         mme_code: vec![1],
     }];
-    assert_eq!(hex(&s1ap_build::build_setup_response(&ctx).unwrap()), S1_SETUP_RESPONSE);
+    assert_eq!(
+        hex(&s1ap_build::build_setup_response(&ctx).unwrap()),
+        S1_SETUP_RESPONSE
+    );
 }
 
 #[test]
@@ -143,7 +146,12 @@ fn requests() -> Vec<S1SetupRequest> {
     ] {
         for name in [None, Some("e".to_string()), Some("e".repeat(150))] {
             for tas in [1usize, 2, 256] {
-                for drx in [PagingDrx::V32, PagingDrx::V64, PagingDrx::V128, PagingDrx::V256] {
+                for drx in [
+                    PagingDrx::V32,
+                    PagingDrx::V64,
+                    PagingDrx::V128,
+                    PagingDrx::V256,
+                ] {
                     out.push(S1SetupRequest {
                         global_enb_id: GlobalEnbId {
                             plmn_identity: PLMN,
@@ -181,14 +189,18 @@ fn the_request_decodes_as_the_hand_written_parser_reads_it() {
             panic!("generated decode refused {req:?}")
         };
         assert!(notify.is_empty());
-        assert!(same_request(&request, req), "generated read {request:?} for {req:?}");
+        assert!(
+            same_request(&request, req),
+            "generated read {request:?} for {req:?}"
+        );
         let S1apMessage::S1SetupRequest(old) = decode_s1ap_pdu(&hand).unwrap() else {
             panic!("hand-written parser misread {req:?}")
         };
         assert!(same_request(&old, &request));
     }
     // nextgsim's eNB request, the X.691 golden.
-    let SetupRequestDecode::Proceed { request, .. } = decode_s1_setup_request(&unhex(S1_SETUP_REQUEST))
+    let SetupRequestDecode::Proceed { request, .. } =
+        decode_s1_setup_request(&unhex(S1_SETUP_REQUEST))
     else {
         panic!("golden refused")
     };
@@ -207,14 +219,14 @@ fn splice(request: &[u8], id: u16, criticality: u8, value: u8) -> Vec<u8> {
     assert_eq!(body.len(), len);
     // body: ext 0 + pad (00) | count (2 octets) | IEs
     let count = u16::from_be_bytes([body[1], body[2]]) + 1;
-    let ie = [
-        (id >> 8) as u8,
-        id as u8,
-        criticality << 6,
-        0x01,
-        value,
+    let ie = [(id >> 8) as u8, id as u8, criticality << 6, 0x01, value];
+    let mut out = vec![
+        0x00,
+        0x11,
+        0x00,
+        u8::try_from(len + ie.len()).unwrap(),
+        body[0],
     ];
-    let mut out = vec![0x00, 0x11, 0x00, u8::try_from(len + ie.len()).unwrap(), body[0]];
     out.extend_from_slice(&count.to_be_bytes());
     out.extend_from_slice(&ie);
     out.extend_from_slice(&body[3..]);
@@ -246,13 +258,17 @@ fn unknown_ies_are_handled_by_criticality() {
         }]
     );
     // reject: the procedure is terminated.
+    let SetupRequestDecode::Reject(ies) = decode_s1_setup_request(&splice(&base, 9999, REJECT, 0))
+    else {
+        panic!("reject proceeded")
+    };
     assert_eq!(
-        decode_s1_setup_request(&splice(&base, 9999, REJECT, 0)),
-        SetupRequestDecode::Reject(vec![DiagnosedIe {
+        ies,
+        vec![DiagnosedIe {
             criticality: REJECT,
             id: 9999,
             type_of_error: g::TypeOfError::NOT_UNDERSTOOD
-        }])
+        }]
     );
 }
 
@@ -263,17 +279,24 @@ fn a_missing_mandatory_ie_is_reported_as_missing() {
     req.enb_name = None;
     let full = build_s1_setup_request(&req).unwrap();
     let pdu = nextgcore_s1ap_gen::decode(&full).unwrap();
-    let g::S1AP_PDU::InitiatingMessage(mut msg) = pdu else { panic!() };
-    let g::InitiatingMessageValue::Id_S1Setup(ref mut v) = msg.value else { panic!() };
+    let g::S1AP_PDU::InitiatingMessage(mut msg) = pdu else {
+        panic!()
+    };
+    let g::InitiatingMessageValue::Id_S1Setup(ref mut v) = msg.value else {
+        panic!()
+    };
     v.protocol_i_es.0.retain(|ie| ie.id.0 != ID_GLOBAL_ENB_ID);
     let bytes = nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(msg)).unwrap();
+    let SetupRequestDecode::Reject(ies) = decode_s1_setup_request(&bytes) else {
+        panic!("a request without Global-ENB-ID proceeded")
+    };
     assert_eq!(
-        decode_s1_setup_request(&bytes),
-        SetupRequestDecode::Reject(vec![DiagnosedIe {
+        ies,
+        vec![DiagnosedIe {
             criticality: REJECT,
             id: ID_GLOBAL_ENB_ID,
             type_of_error: g::TypeOfError::MISSING
-        }])
+        }]
     );
 }
 
@@ -306,12 +329,21 @@ fn shipped_request() -> S1SetupRequest {
 fn a_reject_ie_through_the_handler_gets_s1_setup_failure_with_diagnostics() {
     let ctx = served_ctx();
     let enb = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
-    let request = splice(&build_s1_setup_request(&shipped_request()).unwrap(), 9999, REJECT, 0);
+    let request = splice(
+        &build_s1_setup_request(&shipped_request()).unwrap(),
+        9999,
+        REJECT,
+        0,
+    );
     let out = handle_s1ap_message(&ctx, enb, &request);
     assert_eq!(out.len(), 1);
     let pdu = nextgcore_s1ap_gen::decode(&out[0].pdu).unwrap();
-    let g::S1AP_PDU::UnsuccessfulOutcome(f) = pdu else { panic!("not a failure: {pdu:?}") };
-    let g::UnsuccessfulOutcomeValue::Id_S1Setup(f) = f.value else { panic!() };
+    let g::S1AP_PDU::UnsuccessfulOutcome(f) = pdu else {
+        panic!("not a failure: {pdu:?}")
+    };
+    let g::UnsuccessfulOutcomeValue::Id_S1Setup(f) = f.value else {
+        panic!()
+    };
     let mut saw_cause = false;
     let mut saw_diag = false;
     for ie in f.protocol_i_es.0 {
@@ -338,17 +370,30 @@ fn a_reject_ie_through_the_handler_gets_s1_setup_failure_with_diagnostics() {
 fn a_notify_ie_through_the_handler_is_reported_in_the_response() {
     let ctx = served_ctx();
     let enb = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
-    let request = splice(&build_s1_setup_request(&shipped_request()).unwrap(), 9999, NOTIFY, 0);
+    let request = splice(
+        &build_s1_setup_request(&shipped_request()).unwrap(),
+        9999,
+        NOTIFY,
+        0,
+    );
     let out = handle_s1ap_message(&ctx, enb, &request);
     assert_eq!(out.len(), 1);
     let pdu = nextgcore_s1ap_gen::decode(&out[0].pdu).unwrap();
-    let g::S1AP_PDU::SuccessfulOutcome(r) = pdu else { panic!("not a response: {pdu:?}") };
-    let g::SuccessfulOutcomeValue::Id_S1Setup(r) = r.value else { panic!() };
+    let g::S1AP_PDU::SuccessfulOutcome(r) = pdu else {
+        panic!("not a response: {pdu:?}")
+    };
+    let g::SuccessfulOutcomeValue::Id_S1Setup(r) = r.value else {
+        panic!()
+    };
     let diag = r.protocol_i_es.0.into_iter().find_map(|ie| match ie.value {
         g::S1SetupResponseProtocolIEs_EntryValue::Id_CriticalityDiagnostics(d) => Some(d),
         _ => None,
     });
-    let ies = diag.expect("no diagnostics").i_es_criticality_diagnostics.unwrap().0;
+    let ies = diag
+        .expect("no diagnostics")
+        .i_es_criticality_diagnostics
+        .unwrap()
+        .0;
     assert_eq!((ies[0].ie_id.0, ies[0].ie_criticality.0), (9999, NOTIFY));
     assert!(ctx.enb_find_by_id(enb).unwrap().state.s1_setup_success);
 }
