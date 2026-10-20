@@ -112,7 +112,7 @@ fn initial_ue_messages() -> Vec<InitialUeMessage> {
                         tai: tai(u16::try_from(len % 0x1_0000).unwrap()),
                         eutran_cgi: cgi(0x0FFF_FFFF & enb.wrapping_mul(7)),
                         rrc_establishment_cause: cause,
-                        s_tmsi: s_tmsi.clone(),
+                        s_tmsi,
                     });
                 }
             }
