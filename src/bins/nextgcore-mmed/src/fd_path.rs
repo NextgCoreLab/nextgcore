@@ -1145,6 +1145,7 @@ async fn run_authentication_information(ctx: &'static crate::context::MmeContext
             // TS 24.301 §5.5.1.2.5: the network could not authenticate the UE,
             // so the attach is rejected rather than left outstanding.
             if let Err(e) = crate::nas_path::nas_eps_send_attach_reject(
+                ctx,
                 &enb_ue,
                 mme_ue,
                 EmmCause::NetworkFailure,
@@ -1174,7 +1175,7 @@ async fn run_authentication_information(ctx: &'static crate::context::MmeContext
                 mme_ue.imsi_bcd
             );
             if let Err(e) =
-                crate::nas_path::nas_eps_send_attach_reject(&enb_ue, mme_ue, cause, None)
+                crate::nas_path::nas_eps_send_attach_reject(ctx, &enb_ue, mme_ue, cause, None)
             {
                 log::error!("Attach Reject send failed: {e}");
             }
@@ -1226,7 +1227,7 @@ async fn run_update_location(
             Ok(ula) => ula,
             Err(e) => {
                 log::error!("[{}] S6a ULR failed: {e}", mme_ue.imsi_bcd);
-                reject_attach(&enb_ue, mme_ue, EmmCause::NetworkFailure);
+                reject_attach(ctx, &enb_ue, mme_ue, EmmCause::NetworkFailure);
                 return;
             }
         };
@@ -1249,7 +1250,7 @@ async fn run_update_location(
                     "[{}] HSS refused location update: {cause:?}",
                     mme_ue.imsi_bcd
                 );
-                reject_attach(&enb_ue, mme_ue, cause);
+                reject_attach(ctx, &enb_ue, mme_ue, cause);
             }
             Err(e) => log::error!("[{}] ULA rejected: {e:?}", mme_ue.imsi_bcd),
         }
@@ -1284,6 +1285,7 @@ async fn run_update_location(
                     // cause #19, with the ESM cause piggybacked so the UE learns
                     // which APN was refused.
                     if let Err(e) = crate::nas_path::nas_eps_send_attach_reject(
+                        ctx,
                         &enb_ue,
                         mme_ue,
                         EmmCause::EsmFailure,
@@ -1299,7 +1301,12 @@ async fn run_update_location(
 
 /// Tell the UE its attach failed, when there is still an S1 connection to say it
 /// on.
-fn reject_attach(enb_ue: &Option<crate::context::EnbUe>, mme_ue: &mut MmeUe, cause: EmmCause) {
+fn reject_attach(
+    ctx: &crate::context::MmeContext,
+    enb_ue: &Option<crate::context::EnbUe>,
+    mme_ue: &mut MmeUe,
+    cause: EmmCause,
+) {
     let Some(enb_ue) = enb_ue else {
         log::warn!(
             "[{}] cannot send Attach Reject: no S1 connection",
@@ -1307,7 +1314,7 @@ fn reject_attach(enb_ue: &Option<crate::context::EnbUe>, mme_ue: &mut MmeUe, cau
         );
         return;
     };
-    if let Err(e) = crate::nas_path::nas_eps_send_attach_reject(enb_ue, mme_ue, cause, None) {
+    if let Err(e) = crate::nas_path::nas_eps_send_attach_reject(ctx, enb_ue, mme_ue, cause, None) {
         log::error!("Attach Reject send failed: {e}");
     }
 }

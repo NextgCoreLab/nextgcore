@@ -480,6 +480,7 @@ fn emm_attach_request(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, body: &[
                 // TS 24.301 §5.5.1.2.5: reject an Attach Request the MME cannot
                 // parse rather than leaving the UE waiting on T3410.
                 if let Err(e) = nas_path::nas_eps_send_attach_reject(
+                    ctx,
                     enb_ue,
                     mme_ue,
                     EmmCause::InvalidMandatoryInformation,
@@ -658,6 +659,7 @@ fn emm_authentication_response(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64,
                     mme_ue.imsi_bcd
                 );
                 if let Err(e) = nas_path::nas_eps_send_attach_reject(
+                    ctx,
                     enb_ue,
                     mme_ue,
                     EmmCause::UeSecurityCapabilitiesMismatch,
@@ -1388,17 +1390,26 @@ fn index_imsi(ctx: &MmeContext, mme_ue_id: u64, imsi_bcd: &str) {
 /// `s1ap_handler::handle_ue_context_release_complete` turns into the local
 /// teardown — so the contexts are not dropped here.
 pub(crate) fn release_ue_context(ctx: &MmeContext, enb_ue: &EnbUe) {
+    release_ue_context_with_cause(ctx, enb_ue, nas_cause::DETACH);
+}
+
+/// [`release_ue_context`] with an explicit S1AP NAS cause (TS 36.413 §9.2.1.3).
+///
+/// Takes only the `enb_ue_pool` lock, briefly, so it is safe to call while the
+/// caller holds an `mme_ue_pool` guard: no path holds `enb_ue_pool` while
+/// waiting on `mme_ue_pool`.
+pub(crate) fn release_ue_context_with_cause(ctx: &MmeContext, enb_ue: &EnbUe, cause: i64) {
     if let Some(stored) = ctx.enb_ue_pool.write().unwrap().get_mut(&enb_ue.id) {
         stored.ue_ctx_rel_action = UeCtxRelAction::UeContextRemove;
         stored.relcause.group = S1apCauseGroup::Nas;
-        stored.relcause.cause = nas_cause::DETACH;
+        stored.relcause.cause = cause;
     }
 
     match s1ap_build::build_ue_context_release_command(
         Some(enb_ue.enb_ue_s1ap_id),
         enb_ue.mme_ue_s1ap_id,
         S1apCauseGroup::Nas,
-        nas_cause::DETACH,
+        cause,
     ) {
         Ok(pdu) => {
             s1ap_path::s1ap_send_pdu(enb_ue.enb_id, pdu);
@@ -1553,7 +1564,7 @@ pub fn handle_esm_message(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue: &MmeUe, esm:
                         }
                     };
                     if let Err(e) = nas_path::nas_eps_send_pdn_connectivity_reject(
-                        &sess, mme_ue, enb_ue, esm_cause, gtp_action,
+                        ctx, &sess, mme_ue, enb_ue, esm_cause, gtp_action,
                     ) {
                         log::error!("PDN Connectivity Reject send failed: {e}");
                     }
@@ -2228,6 +2239,24 @@ mod tests {
         let mme_ue_id = ctx.enb_ue_find_by_id(enb_ue_id).unwrap().mme_ue_id;
         let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
         assert!(mme_ue.t3470.pkbuf.is_none());
+        assert_released_after_attach_reject(&ctx, enb_ue_id);
+    }
+
+    /// TS 24.301 5.3.1.2.1: after an Attach Reject the MME releases the S1 UE
+    /// context with NAS cause normal-release -- the UE does not release it itself.
+    fn assert_released_after_attach_reject(ctx: &MmeContext, enb_ue_id: u64) {
+        let enb_ue = ctx.enb_ue_find_by_id(enb_ue_id).unwrap();
+        assert_eq!(
+            enb_ue.ue_ctx_rel_action,
+            UeCtxRelAction::UeContextRemove,
+            "an Attach Reject must be followed by a UE Context Release Command"
+        );
+        assert_eq!(enb_ue.relcause.group, S1apCauseGroup::Nas);
+        assert_eq!(
+            enb_ue.relcause.cause,
+            nas_cause::NORMAL_RELEASE,
+            "the release after a reject is a normal release, not a detach"
+        );
     }
 
     #[test]
@@ -2445,6 +2474,7 @@ mod tests {
             mme_ue.t3460.pkbuf.is_none(),
             "no Security Mode Command may go out; the attach is rejected instead"
         );
+        assert_released_after_attach_reject(&ctx, enb_ue_id);
     }
 
     #[test]
