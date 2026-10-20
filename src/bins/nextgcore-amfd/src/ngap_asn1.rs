@@ -2329,6 +2329,11 @@ pub fn decode_uplink_nas_transport_asn1(data: &[u8]) -> NasTransportDecode<Uplin
 ///
 /// Sent by AMF to gNBs to page a UE in CM-IDLE state.
 /// The message follows 3GPP TS 38.413 Section 8.7.2.
+///
+/// #417 Paging stage: encoded by the codec GENERATED from the TS 38.413 ASN.1
+/// ([`build_paging_generated`]), not the hand-written `nextgcore-ngap` builder.
+/// The bytes are unchanged -- `paging_generated_matches_hand_written` pins that
+/// against the hand-written encoder.
 pub fn build_paging_asn1(
     amf_set_id: u16,
     amf_pointer: u8,
@@ -2336,8 +2341,6 @@ pub fn build_paging_asn1(
     plmn_id: &crate::context::PlmnId,
     tac: u32,
 ) -> Option<Vec<u8>> {
-    let plmn_bytes = encode_plmn_id(plmn_id);
-
     let msg = Paging {
         ue_paging_identity: UePagingIdentity::FiveGSTmsi {
             amf_set_id,
@@ -2345,7 +2348,7 @@ pub fn build_paging_asn1(
             tmsi,
         },
         tai_list: vec![TaiListItem {
-            tai_plmn: plmn_bytes,
+            tai_plmn: encode_plmn_id(plmn_id),
             tai_tac: [(tac >> 16) as u8, (tac >> 8) as u8, tac as u8],
         }],
         paging_drx: None,
@@ -2354,18 +2357,131 @@ pub fn build_paging_asn1(
         paging_origin: None,
         assistance_data: None,
     };
+    let bytes = build_paging_generated(&msg)?;
+    log::debug!(
+        "Built Paging: {} bytes, amf_set_id={amf_set_id}, tmsi=0x{tmsi:08x}, tac={tac}",
+        bytes.len()
+    );
+    Some(bytes)
+}
 
-    match builder::build_paging(&msg) {
-        Ok(bytes) => {
-            log::debug!(
-                "Built Paging: {} bytes, amf_set_id={}, tmsi=0x{:08x}, tac={}",
-                bytes.len(),
-                amf_set_id,
-                tmsi,
-                tac
-            );
-            Some(bytes)
-        }
+/// A Paging PDU (TS 38.413 §9.2.4.1) built with the generated codec, from the
+/// same [`Paging`] the hand-written builder takes.
+///
+/// IE order and criticalities are the `PagingIEs` object set's: every IE is
+/// criticality ignore, and the procedure itself is ignore (§9.2.4.1).
+///
+/// `ue_radio_capability` and `assistance_data` are already APER-encoded
+/// `UERadioCapabilityForPaging` / `AssistanceDataForPaging` SEQUENCE values,
+/// as the hand-written builder takes them. They are decoded into their
+/// generated types and re-encoded, so a value that is not a well-formed
+/// encoding of its type is refused (`None`) here, where the hand-written
+/// builder copied whatever bytes it was given onto the wire verbatim.
+pub fn build_paging_generated(msg: &Paging) -> Option<Vec<u8>> {
+    use ngap_gen::{
+        PagingProtocolIEs, PagingProtocolIEs_Entry as Entry, PagingProtocolIEs_EntryValue as Ie,
+        ProtocolIE_ID, NGAP_PDU,
+    };
+
+    let UePagingIdentity::FiveGSTmsi {
+        amf_set_id,
+        amf_pointer,
+        tmsi,
+    } = &msg.ue_paging_identity;
+    let identity = ngap_gen::UEPagingIdentity::FiveG_S_TMSI(ngap_gen::FiveG_S_TMSI {
+        amf_set_id: ngap_gen::AMFSetID(low_bits(u64::from(*amf_set_id), 10)),
+        amf_pointer: ngap_gen::AMFPointer(low_bits(u64::from(*amf_pointer), 6)),
+        five_g_tmsi: ngap_gen::FiveG_TMSI(tmsi.to_be_bytes().to_vec()),
+        ie_extensions: None,
+    });
+
+    let tai_list = ngap_gen::TAIListForPaging(
+        msg.tai_list
+            .iter()
+            .map(|tai| ngap_gen::TAIListForPagingItem {
+                tai: ngap_gen::TAI {
+                    plmn_identity: ngap_gen::PLMNIdentity(tai.tai_plmn.to_vec()),
+                    tac: ngap_gen::TAC(tai.tai_tac.to_vec()),
+                    ie_extensions: None,
+                },
+                ie_extensions: None,
+            })
+            .collect(),
+    );
+
+    let entry = |id: u16, value: Ie| Entry {
+        id: ProtocolIE_ID(id),
+        criticality: ngap_gen::Criticality(ngap_gen::Criticality::IGNORE),
+        value,
+    };
+    let mut ies = vec![entry(
+        ngap_gen::ID_UE_PAGING_IDENTITY,
+        Ie::Id_UEPagingIdentity(identity),
+    )];
+    if let Some(drx) = msg.paging_drx {
+        ies.push(entry(
+            ngap_gen::ID_PAGING_DRX,
+            Ie::Id_PagingDRX(ngap_gen::PagingDRX(drx as u8)),
+        ));
+    }
+    ies.push(entry(
+        ngap_gen::ID_TAI_LIST_FOR_PAGING,
+        Ie::Id_TAIListForPaging(tai_list),
+    ));
+    if let Some(priority) = msg.paging_priority {
+        // `PagingPriority` names priolevel1..8 with discriminants 1..8; the
+        // ENUMERATED root numbers them 0..7.
+        ies.push(entry(
+            ngap_gen::ID_PAGING_PRIORITY,
+            Ie::Id_PagingPriority(ngap_gen::PagingPriority(priority as u8 - 1)),
+        ));
+    }
+    if let Some(radio_cap) = &msg.ue_radio_capability {
+        let value = match nextgcore_ngap_gen::decode_contained::<ngap_gen::UERadioCapabilityForPaging>(
+            radio_cap,
+        ) {
+            Ok(value) => value,
+            Err(e) => {
+                log::error!("Paging: UERadioCapabilityForPaging is not a valid encoding: {e:?}");
+                return None;
+            }
+        };
+        ies.push(entry(
+            ngap_gen::ID_UE_RADIO_CAPABILITY_FOR_PAGING,
+            Ie::Id_UERadioCapabilityForPaging(value),
+        ));
+    }
+    if let Some(origin) = msg.paging_origin {
+        ies.push(entry(
+            ngap_gen::ID_PAGING_ORIGIN,
+            Ie::Id_PagingOrigin(ngap_gen::PagingOrigin(origin as u8)),
+        ));
+    }
+    if let Some(assistance) = &msg.assistance_data {
+        let value = match nextgcore_ngap_gen::decode_contained::<ngap_gen::AssistanceDataForPaging>(
+            assistance,
+        ) {
+            Ok(value) => value,
+            Err(e) => {
+                log::error!("Paging: AssistanceDataForPaging is not a valid encoding: {e:?}");
+                return None;
+            }
+        };
+        ies.push(entry(
+            ngap_gen::ID_ASSISTANCE_DATA_FOR_PAGING,
+            Ie::Id_AssistanceDataForPaging(value),
+        ));
+    }
+
+    let pdu = NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_PAGING),
+        criticality: ngap_gen::Criticality(ngap_gen::Criticality::IGNORE),
+        value: ngap_gen::InitiatingMessageValue::Id_Paging(ngap_gen::Paging {
+            protocol_i_es: PagingProtocolIEs(ies),
+        }),
+    });
+    match nextgcore_ngap_gen::encode(&pdu) {
+        Ok(bytes) => Some(bytes),
         Err(e) => {
             log::error!("Failed to encode Paging: {e:?}");
             None
@@ -3963,6 +4079,202 @@ pub(crate) mod tests {
                 "RAN node name of length {len}"
             );
         }
+    }
+
+    /// The Paging matrix: every field the hand-written `Paging` carries, one
+    /// varied at a time against a 5G-S-TMSI baseline.
+    fn paging_cases() -> Vec<Paging> {
+        let tai = |n: u8| TaiListItem {
+            tai_plmn: [0x00, 0xf1, 0x10],
+            tai_tac: [0x00, n, 0x01],
+        };
+        let base = || Paging {
+            ue_paging_identity: UePagingIdentity::FiveGSTmsi {
+                amf_set_id: 0x001,
+                amf_pointer: 0x01,
+                tmsi: 0x1234_5678,
+            },
+            paging_drx: None,
+            tai_list: vec![tai(0)],
+            paging_priority: None,
+            ue_radio_capability: None,
+            paging_origin: None,
+            assistance_data: None,
+        };
+        let mut cases = vec![base()];
+        // 5G-S-TMSI at its bit-width edges, and wider than its BIT STRINGs
+        // (both encoders keep the low bits).
+        for (set, pointer, tmsi) in [
+            (0u16, 0u8, 0u32),
+            (1023, 63, u32::MAX),
+            (0x2a5, 0x15, 0x8000_0001),
+            (1024 + 5, 64 + 3, 0x0102_0304),
+        ] {
+            let mut c = base();
+            c.ue_paging_identity = UePagingIdentity::FiveGSTmsi {
+                amf_set_id: set,
+                amf_pointer: pointer,
+                tmsi,
+            };
+            cases.push(c);
+        }
+        // TAIListForPaging SIZE(1..16): every length, plus 0 and 17 (refused).
+        for n in 0..=17u8 {
+            let mut c = base();
+            c.tai_list = (0..n).map(tai).collect();
+            cases.push(c);
+        }
+        for drx in [
+            PagingDrx::V32,
+            PagingDrx::V64,
+            PagingDrx::V128,
+            PagingDrx::V256,
+        ] {
+            let mut c = base();
+            c.paging_drx = Some(drx);
+            cases.push(c);
+        }
+        for priority in [
+            PagingPriority::Priolevel1,
+            PagingPriority::Priolevel2,
+            PagingPriority::Priolevel3,
+            PagingPriority::Priolevel4,
+            PagingPriority::Priolevel5,
+            PagingPriority::Priolevel6,
+            PagingPriority::Priolevel7,
+            PagingPriority::Priolevel8,
+        ] {
+            let mut c = base();
+            c.paging_priority = Some(priority);
+            cases.push(c);
+        }
+        // UERadioCapabilityForPaging SEQUENCE values: none, NR only, E-UTRA
+        // only, both (ext bit 0, presence bits, then each OCTET STRING).
+        for radio_cap in [
+            vec![0x00],
+            vec![0x40, 0x02, 0x01, 0x02],
+            vec![0x20, 0x01, 0xaa],
+            vec![0x60, 0x02, 0x01, 0x02, 0x03, 0x0a, 0x0b, 0x0c],
+        ] {
+            let mut c = base();
+            c.ue_radio_capability = Some(radio_cap);
+            cases.push(c);
+        }
+        let mut origin = base();
+        origin.paging_origin = Some(PagingOrigin::Non3gpp);
+        cases.push(origin);
+        // AssistanceDataForPaging {}: ext bit 0, three absent optionals.
+        let mut assistance = base();
+        assistance.assistance_data = Some(vec![0x00]);
+        cases.push(assistance);
+        // Everything at once, at the 16-TAI bound.
+        let mut all = base();
+        all.paging_drx = Some(PagingDrx::V256);
+        all.tai_list = (0..16).map(tai).collect();
+        all.paging_priority = Some(PagingPriority::Priolevel8);
+        all.ue_radio_capability = Some(vec![0x40, 0x02, 0x01, 0x02]);
+        all.paging_origin = Some(PagingOrigin::Non3gpp);
+        all.assistance_data = Some(vec![0x00]);
+        cases.push(all);
+        cases
+    }
+
+    /// #417 Paging stage: the generated Paging is byte-identical to the
+    /// hand-written one across the whole matrix, and both refuse the same
+    /// inputs (an empty or 17-entry TAI list).
+    #[test]
+    fn paging_generated_matches_hand_written() {
+        let cases = paging_cases();
+        let mut refused = 0;
+        for (i, msg) in cases.iter().enumerate() {
+            let generated = build_paging_generated(msg);
+            let hand_written = builder::build_paging(msg).ok();
+            assert_eq!(generated, hand_written, "case {i}: {msg:?}");
+            refused += usize::from(generated.is_none());
+        }
+        assert_eq!(refused, 2, "exactly the 0- and 17-TAI lists are refused");
+    }
+
+    /// The production Paging, worked out by hand from X.691 (APER):
+    /// `00` initiatingMessage, `18` procedure 24, `40` ignore, `19` length 25;
+    /// `00` extension bit, `00 02` two IEs. UEPagingIdentity (115, ignore,
+    /// 7 octets): CHOICE index 0, FiveG-S-TMSI extension and presence bits,
+    /// AMF Set ID 0000000001, AMF Pointer 000001, pad -- `00 08 20` -- then the
+    /// octet-aligned 5G-TMSI `12 34 56 78`. TAIListForPaging (103, ignore,
+    /// 7 octets): count-1 = 0 in 4 bits, item and TAI extension and presence
+    /// bits -- `00` -- PLMN 001/01 `00 f1 10`, TAC 1 `00 00 01`.
+    #[test]
+    fn paging_production_shape_is_the_hand_derived_golden() {
+        let bytes =
+            build_paging_asn1(1, 1, 0x1234_5678, &PlmnId::new("001", "01"), 1).expect("paging");
+        assert_eq!(
+            bytes,
+            [
+                0x00, 0x18, 0x40, 0x19, 0x00, 0x00, 0x02, // PDU, Paging, 2 IEs
+                0x00, 0x73, 0x40, 0x07, 0x00, 0x08, 0x20, 0x12, 0x34, 0x56, 0x78, 0x00, 0x67, 0x40,
+                0x07, 0x00, 0x00, 0xf1, 0x10, 0x00, 0x00, 0x01,
+            ]
+        );
+    }
+
+    /// PagingPriority: priolevel N is ENUMERATED index N-1 (TS 38.413
+    /// §9.3.1.78). Both encoders must put priolevel1 on the wire as index 0 and
+    /// priolevel8 as index 7, which the generated decoder reads back by name.
+    #[test]
+    fn paging_priority_levels_are_root_indices_0_to_7() {
+        for (priority, index) in [
+            (
+                PagingPriority::Priolevel1,
+                ngap_gen::PagingPriority::PRIOLEVEL1,
+            ),
+            (
+                PagingPriority::Priolevel2,
+                ngap_gen::PagingPriority::PRIOLEVEL2,
+            ),
+            (
+                PagingPriority::Priolevel8,
+                ngap_gen::PagingPriority::PRIOLEVEL8,
+            ),
+        ] {
+            let mut msg = paging_cases().remove(0);
+            msg.paging_priority = Some(priority);
+            for (who, bytes) in [
+                (
+                    "generated",
+                    build_paging_generated(&msg).expect("generated"),
+                ),
+                (
+                    "hand-written",
+                    builder::build_paging(&msg).expect("hand-written"),
+                ),
+            ] {
+                let ngap_gen::NGAP_PDU::InitiatingMessage(init) =
+                    nextgcore_ngap_gen::decode(&bytes).expect("decode")
+                else {
+                    panic!("{who}: not an initiating message");
+                };
+                let ngap_gen::InitiatingMessageValue::Id_Paging(paging) = init.value else {
+                    panic!("{who}: not a Paging");
+                };
+                let got = paging.protocol_i_es.0.iter().find_map(|e| match &e.value {
+                    ngap_gen::PagingProtocolIEs_EntryValue::Id_PagingPriority(p) => Some(p.0),
+                    _ => None,
+                });
+                assert_eq!(got, Some(index), "{who}: {priority:?}");
+            }
+        }
+    }
+
+    /// A UERadioCapabilityForPaging that is not a valid encoding of its type
+    /// is refused by the generated builder, where the hand-written one copied
+    /// the bytes onto the wire verbatim.
+    #[test]
+    fn paging_refuses_a_malformed_radio_capability() {
+        let mut msg = paging_cases().remove(0);
+        // Presence bit for the NR member set, then nothing: truncated.
+        msg.ue_radio_capability = Some(vec![0x40]);
+        assert!(build_paging_generated(&msg).is_none());
+        assert!(builder::build_paging(&msg).is_ok());
     }
 
     /// #417 stage 2: the generated Failure is byte-identical to the
