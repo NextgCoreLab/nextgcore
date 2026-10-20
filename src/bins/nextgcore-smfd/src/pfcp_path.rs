@@ -1204,6 +1204,10 @@ pub(crate) mod stand_in {
         }
     }
 
+    /// The F-TEID the stand-in allocates for a PDR CREATED by a Session Modification (#475),
+    /// distinct from the establishment's so a test can tell the two tunnels apart.
+    pub(crate) const N3_STAND_IN_TEID: u32 = 0x0000_3475;
+
     /// Flat TLV encoder for the response IEs the SMF's establishment parser reads.
     fn tlv(ie_type: u16, value: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(4 + value.len());
@@ -1366,15 +1370,33 @@ pub(crate) mod stand_in {
                         h.sequence_number,
                         &establishment_response_body(upf_seid, upf_teid, upf_ip),
                     )),
-                    pfcp_message_type::SESSION_MODIFICATION_REQUEST => Some(encode_wire_message(
-                        pfcp_message_type::SESSION_MODIFICATION_RESPONSE,
-                        Some(h.seid),
-                        h.sequence_number,
-                        &tlv(
-                            19,
-                            &[answered_cause.load(std::sync::atomic::Ordering::SeqCst)],
-                        ),
-                    )),
+                    pfcp_message_type::SESSION_MODIFICATION_REQUEST => {
+                        let cause = answered_cause.load(std::sync::atomic::Ordering::SeqCst);
+                        let mut body = tlv(19, &[cause]);
+                        // #475: a modification that CREATES a PDR whose F-TEID the UP
+                        // function chooses is answered with a Created PDR carrying the
+                        // allocated F-TEID (TS 29.244 §7.5.5.2), as the establishment is.
+                        let req_body = &buf[h.body_offset..len];
+                        if cause == pfcp_cause::REQUEST_ACCEPTED {
+                            if let Some(pdr_id) = find_ie(req_body, 1)
+                                .and_then(|pdr| find_ie(pdr, 56))
+                                .filter(|v| v.len() >= 2)
+                            {
+                                let mut f_teid = vec![0x01];
+                                f_teid.extend_from_slice(&N3_STAND_IN_TEID.to_be_bytes());
+                                f_teid.extend_from_slice(&upf_ip);
+                                let mut created = tlv(56, &pdr_id[..2]);
+                                created.extend_from_slice(&tlv(21, &f_teid));
+                                body.extend_from_slice(&tlv(8, &created));
+                            }
+                        }
+                        Some(encode_wire_message(
+                            pfcp_message_type::SESSION_MODIFICATION_RESPONSE,
+                            Some(h.seid),
+                            h.sequence_number,
+                            &body,
+                        ))
+                    }
                     pfcp_message_type::SESSION_DELETION_REQUEST => Some(encode_wire_message(
                         pfcp_message_type::SESSION_DELETION_RESPONSE,
                         Some(h.seid),

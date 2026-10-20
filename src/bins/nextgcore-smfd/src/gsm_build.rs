@@ -452,14 +452,19 @@ pub fn encode_qos_flow_descriptions(descriptions: &[QosFlowDescription]) -> Vec<
 fn encode_single_qos_flow_description(desc: &QosFlowDescription) -> Vec<u8> {
     let mut buffer = BytesMut::with_capacity(32);
 
-    // QFI
-    buffer.put_u8(desc.identifier);
-
-    // Operation code (3 bits) + spare (1 bit) + E bit (1 bit) + num params (3 bits)
-    let num_params = desc.params.len().min(7) as u8;
-    let second_byte =
-        ((desc.code & 0x07) << 5) | (if desc.e_bit { 0x08 } else { 0 }) | (num_params & 0x07);
-    buffer.put_u8(second_byte);
+    // TS 24.501 Figure 9.11.4.12.2 — three octets before the parameters list:
+    //   octet 4: spare(2) | QFI (6 bits)
+    //   octet 5: operation code (bits 8-6) | spare (5 bits)
+    //   octet 6: spare | E (bit 7) | number of parameters (6 bits)
+    //
+    // #475: this used to pack the operation code, E and a 3-bit parameter count into ONE
+    // octet, so every QoS flow description this SMF sent (the XR-flow accept's 0x79 IE)
+    // was two octets of the wrong shape: a conformant UE read the parameter count from the
+    // first parameter's identifier.
+    buffer.put_u8(desc.identifier & 0x3F);
+    buffer.put_u8((desc.code & 0x07) << 5);
+    let num_params = desc.params.len().min(63) as u8;
+    buffer.put_u8((if desc.e_bit { 0x40 } else { 0 }) | (num_params & 0x3F));
 
     // Parameters
     if desc.e_bit {
@@ -1167,7 +1172,7 @@ pub fn build_gsm_status(sess: &SmfSess, cause: GsmCause) -> Vec<u8> {
 // ============================================================================
 
 /// Encode session AMBR to NAS format
-fn encode_session_ambr(downlink: u64, uplink: u64) -> Vec<u8> {
+pub(crate) fn encode_session_ambr(downlink: u64, uplink: u64) -> Vec<u8> {
     let mut data = Vec::with_capacity(6);
 
     // Length
@@ -1221,7 +1226,7 @@ fn encode_ambr_value(bitrate: u64) -> Vec<u8> {
 }
 
 /// Encode S-NSSAI to NAS format
-fn encode_snssai(snssai: &crate::context::SNssai) -> Vec<u8> {
+pub(crate) fn encode_snssai(snssai: &crate::context::SNssai) -> Vec<u8> {
     let mut data = Vec::with_capacity(5);
 
     // SST (mandatory)
@@ -1403,9 +1408,20 @@ mod tests {
         let desc = encode_default_qos_flow_description(&bearer);
         let encoded = encode_qos_flow_descriptions(&[desc]);
 
-        // Should have: QFI (1) + operation code byte (1) + params
-        assert!(encoded.len() >= 2);
-        assert_eq!(encoded[0], 1); // QFI
+        // TS 24.501 Figure 9.11.4.12.2: QFI | operation code | E + number of parameters,
+        // then each parameter as identifier | length | contents. The default description
+        // carries one parameter, the 5QI.
+        assert_eq!(
+            encoded,
+            [
+                1,
+                qos_flow_description_code::CREATE_NEW_QOS_FLOW_DESCRIPTION << 5,
+                0x41,
+                qos_flow_param_id::FIVE_QI,
+                1,
+                bearer.qos.index
+            ]
+        );
     }
 
     #[test]

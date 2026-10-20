@@ -973,6 +973,17 @@ pub struct HandoverInfo {
     pub remote_dl_teid: u32,
     /// Remote DL IP for indirect forwarding
     pub remote_dl_ip: IpAddr,
+    /// #475: this SM context was created by an EPS→5GS handover over N26 (TS 23.502
+    /// §4.11.1.2.2), i.e. from a PDN connection this PGW-C+SMF already served over S5/S8.
+    /// The execution phase then has EPS resources to release, which a 5GS-internal N2
+    /// handover does not.
+    pub eps_to_5gs: bool,
+    /// #475: whether the target NG-RAN's DL N3 endpoint (`gnb_n3_teid`/`gnb_n3_ip`) was
+    /// learned from the PREPARED update's HandoverRequestAcknowledgeTransfer.
+    pub target_dl_known: bool,
+    /// #475: the PDR this handover created for the N3 uplink at step 6, removed again on
+    /// CANCELLED.
+    pub n3_ul_pdr_id: Option<u16>,
 }
 
 /// Charging info
@@ -1184,6 +1195,11 @@ pub struct SmfSess {
     pub mbs_session_id: Option<String>,
     /// RedCap UE flag (reduced QoS for RedCap devices)
     pub is_redcap_ue: bool,
+    /// #475: the PDU session ID the UE allocated for this PDN connection and sent in the
+    /// PDN CONNECTIVITY REQUEST's (e)PCO, container 001AH (TS 24.008 §10.5.6.3, TS 24.301
+    /// §6.5.1.2). `None` means the UE gave none, which is what TS 23.502 §4.11.1.2.2.2
+    /// names as the case where *"session continuity from EPS to 5GS is not supported"*.
+    pub eps_psi: Option<u8>,
 }
 
 impl SmfSess {
@@ -1268,6 +1284,7 @@ impl SmfSess {
             is_mbs_session: false,
             mbs_session_id: None,
             is_redcap_ue: false,
+            eps_psi: None,
         }
     }
 
@@ -1715,6 +1732,18 @@ pub struct SmfContext {
     /// wants exactly the SEID.
     pub upf_ul_endpoints: RwLock<HashMap<String, (u32, [u8; 4])>>,
 
+    /// The SMF-side N4 SEID per SM context, for contexts whose N4 session existed BEFORE
+    /// the SM context did (#475).
+    ///
+    /// Every other SM context's N4 SEID is derived from its reference
+    /// (`main.rs`'s `smf_n4_seid_for`), because the create establishes the N4 session with
+    /// that derived SEID. An EPS→5GS handover is the exception: the PFCP session was
+    /// established for the PDN connection over S5/S8, with the session's own `smf_n4_seid`,
+    /// and the UPF addresses its reports to that F-SEID. Re-deriving it from the new
+    /// reference would point every later modification and release at a session the UPF
+    /// does not have. Persisted with the session map for the same reason that map is.
+    pub cp_n4_seids: RwLock<HashMap<String, u64>>,
+
     /// SM policy bindings: sm_context_ref -> PCF policy association + GSM FSM
     pub policy_bindings: RwLock<HashMap<String, PolicyBinding>>,
 
@@ -1837,6 +1866,7 @@ impl SmfContext {
             initialized: AtomicBool::new(false),
             pfcp_sessions: RwLock::new(HashMap::new()),
             upf_ul_endpoints: RwLock::new(HashMap::new()),
+            cp_n4_seids: RwLock::new(HashMap::new()),
             unrestorable_sessions: RwLock::new(Vec::new()),
             policy_bindings: RwLock::new(HashMap::new()),
             upf_recovery_time_stamps: RwLock::new(HashMap::new()),
@@ -1952,6 +1982,11 @@ impl SmfContext {
             .read()
             .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
             .unwrap_or_default();
+        let cp_n4_seids: std::collections::BTreeMap<String, u64> = self
+            .cp_n4_seids
+            .read()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
+            .unwrap_or_default();
         // Ascending already (see `Ipv4Pool::allocated_addrs`), and as strings so
         // the file is readable by an operator diagnosing a double assignment.
         let ipv4_allocations: Vec<String> = self
@@ -1970,6 +2005,7 @@ impl SmfContext {
             "policyBindings": policy_bindings,
             "ipv4Allocations": ipv4_allocations,
             "upfRecoveryTimeStamps": upf_rts,
+            "cpN4Seids": cp_n4_seids,
         })
     }
 
@@ -2074,6 +2110,13 @@ impl SmfContext {
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default();
 
+        // #475: absent in every snapshot written before it existed, which is exactly the
+        // set with no EPS→5GS-migrated contexts in it, so an empty default is correct.
+        let cp_n4_seids: HashMap<String, u64> = doc
+            .get("cpN4Seids")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
         let n_sessions = pfcp_sessions.len();
         let n_bindings = policy_bindings.len();
         let n_rts = upf_rts.len();
@@ -2087,6 +2130,9 @@ impl SmfContext {
         }
         if let Ok(mut map) = self.upf_recovery_time_stamps.write() {
             map.extend(upf_rts);
+        }
+        if let Ok(mut map) = self.cp_n4_seids.write() {
+            map.extend(cp_n4_seids);
         }
         let mut n_addrs = 0usize;
         for addr in &ipv4_allocations {
@@ -2331,6 +2377,19 @@ impl SmfContext {
         imsi_hash
             .get(imsi)
             .and_then(|&id| smf_ue_list.get(&id).cloned())
+    }
+
+    /// Find a UE by its IMSI digits, as the S5/S8 path renders them in `imsi_bcd` (#475).
+    ///
+    /// The SBI side names a UE by SUPI (`imsi-<digits>`) and the S5/S8 side by the IMSI IE's
+    /// BCD octets; an EPS→5GS handover is where the two meet, so the comparison is on the
+    /// decoded digits rather than on either encoding.
+    pub fn ue_find_by_imsi_bcd(&self, digits: &str) -> Option<SmfUe> {
+        let smf_ue_list = self.smf_ue_list.read().ok()?;
+        smf_ue_list
+            .values()
+            .find(|ue| ue.imsi_bcd == digits)
+            .cloned()
     }
 
     /// Find UE by ID

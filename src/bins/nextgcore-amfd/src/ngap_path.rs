@@ -8962,6 +8962,82 @@ impl NgapServer {
     }
 }
 
+/// In-process strict-peer harness for the EPS→5GS handover (#475).
+///
+/// Not gated behind `#[cfg(test)]` for the reason `crate::test_support` is not: a peer
+/// crate (smfd) drives this AMF's REAL N26 → NGAP path against its own REAL handlers as a
+/// dev-dependency, and `cfg(test)` items are invisible across crates. Each method is a thin
+/// door onto the production method of the same purpose — nothing here re-implements the AMF.
+impl NgapServer {
+    /// Register a target gNB association, as NG Setup would have, so a Target
+    /// Identification naming it resolves.
+    pub async fn harness_add_target_gnb(
+        &self,
+        association_id: u64,
+        gnb_id: u32,
+        gnb_id_len: u8,
+        plmn: PlmnId,
+    ) {
+        let mut session = GnbSession::new(
+            association_id,
+            association_id,
+            "127.0.0.1:38412".parse().expect("literal address"),
+        );
+        session.gnb.gnb_id = gnb_id;
+        session.gnb.gnb_id_len = gnb_id_len;
+        session.gnb.gnb_id_presence = true;
+        session.gnb.plmn_id = plmn;
+        self.sessions.write().await.insert(association_id, session);
+    }
+
+    /// TS 23.502 §4.11.1.2.2.2 steps 8-9: turn a drained N26 preparation into the NGAP
+    /// HANDOVER REQUEST for the target. Returns `(AMF UE NGAP ID, target association, PDU)`.
+    pub async fn harness_prepare_eps_to_5gs(
+        &mut self,
+        prep: crate::n26_path::EpsToFivegsPreparation,
+    ) -> Result<(u64, u64, Vec<u8>)> {
+        self.prepare_eps_to_5gs_handover_request(prep)
+            .await
+            .map_err(|refused| anyhow::anyhow!("EPS→5GS preparation refused: {refused:?}"))
+    }
+
+    /// Step 7's stored EBIs for the arriving UE: `(EBI, PDU session ID, ARP)`.
+    pub fn harness_assigned_ebis(
+        &self,
+        amf_ue_ngap_id: u64,
+    ) -> Vec<(u8, u8, crate::context::EbiArp)> {
+        self.ue_auth_state
+            .get(amf_ue_ngap_id)
+            .map(|ue| {
+                ue.amf_ue
+                    .assigned_ebis
+                    .iter()
+                    .map(|e| (e.ebi, e.pdu_session_id, e.arp.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Steps 10-14: deliver the target's HANDOVER REQUEST ACKNOWLEDGE.
+    pub async fn harness_handover_request_acknowledge(
+        &mut self,
+        association_id: u64,
+        pdu: &[u8],
+    ) -> Result<()> {
+        self.handle_handover_request_acknowledge(association_id, pdu)
+            .await
+    }
+
+    /// Execution: deliver the target's HANDOVER NOTIFY.
+    pub async fn harness_handover_notify(
+        &mut self,
+        association_id: u64,
+        pdu: &[u8],
+    ) -> Result<HandoverCompletion> {
+        self.handle_handover_notify(association_id, pdu).await
+    }
+}
+
 impl NgapServer {
     /// Handle a HandoverCancel from the source gNB (TS 38.413 Section 8.4.5).
     /// The AMF acknowledges with a HandoverCancelAcknowledge.
