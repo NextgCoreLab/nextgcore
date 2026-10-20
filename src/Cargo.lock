@@ -2745,6 +2745,7 @@ dependencies = [
  "nextgcore-asn1c",
  "nextgcore-core",
  "nextgcore-metrics",
+ "nextgcore-nrppa-gen",
  "nextgcore-sbi",
  "p256",
  "proptest",

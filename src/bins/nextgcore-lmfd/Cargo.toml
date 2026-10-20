@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 nextgcore-asn1c = { workspace = true }
+nextgcore-nrppa-gen = { workspace = true }
 nextgcore-core = { workspace = true }
 nextgcore-sbi = { workspace = true }
 nextgcore-metrics = { workspace = true }
