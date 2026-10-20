@@ -18,7 +18,7 @@ use nextgcore_s1ap::{
     ErabLevelQosParameters, ErabModifyRequest, ErabReleaseCommand, ErabSetupRequest,
     ErabToBeModifiedItem, ErabToBeSetupItem, ErrorIndication, EutranCgi, GbrQosInformation,
     InitialContextSetupRequest, KillRequest, OverloadAction, OverloadStart, OverloadStop, Paging,
-    PagingDrx, S1SetupFailure, S1SetupResponse, S1apResult, STmsi, ServedGummeiItem, Tai,
+    PagingDrx, S1apResult, STmsi, Tai,
     TimeToWait, UeAmbr, UeContextModificationRequest, UeContextReleaseCommand, UePagingId,
     UeS1apIds, UeSecurityCapabilities, WarningAreaList, WriteReplaceWarningRequest,
 };
@@ -314,32 +314,97 @@ pub fn imsi_bcd_to_tbcd(imsi_bcd: &str) -> Vec<u8> {
 // S1 Setup (§8.7.3)
 // ============================================================================
 
-/// Build S1 Setup Response from the MME context configuration
+/// The served GUMMEIs of the MME context, in [`crate::s1ap_gen`]'s terms.
+fn served_gummeis(ctx: &MmeContext) -> Vec<crate::s1ap_gen::ServedGummei> {
+    ctx.served_gummei
+        .iter()
+        .map(|gummei| crate::s1ap_gen::ServedGummei {
+            plmns: gummei.plmn_id.iter().map(encode_plmn_id).collect(),
+            group_ids: gummei.mme_gid.clone(),
+            codes: gummei.mme_code.clone(),
+        })
+        .collect()
+}
+
+fn gen_err(e: asn1_codecs::PerCodecError) -> nextgcore_s1ap::S1apError {
+    nextgcore_s1ap::S1apError::AsnError(e.to_string())
+}
+
+/// Build S1 Setup Response from the MME context configuration (generated
+/// codec, #514).
 pub fn build_setup_response(ctx: &MmeContext) -> S1apResult<Vec<u8>> {
+    build_setup_response_with_diagnostics(ctx, &[])
+}
+
+/// Build S1 Setup Response, reporting `notify` (unknown ignore-and-notify IEs
+/// of the request) in its Criticality Diagnostics (TS 36.413 §10.3.4.2).
+pub fn build_setup_response_with_diagnostics(
+    ctx: &MmeContext,
+    notify: &[crate::s1ap_gen::DiagnosedIe],
+) -> S1apResult<Vec<u8>> {
+    crate::s1ap_gen::build_s1_setup_response(
+        ctx.mme_name.as_deref(),
+        &served_gummeis(ctx),
+        ctx.relative_capacity,
+        notify,
+    )
+    .map_err(gen_err)
+}
+
+/// Build S1 Setup Failure (generated codec, #514)
+pub fn build_setup_failure(
+    cause_group: S1apCauseGroup,
+    cause_value: i64,
+    time_to_wait: Option<TimeToWait>,
+) -> S1apResult<Vec<u8>> {
+    build_setup_failure_with_diagnostics(cause_group, cause_value, time_to_wait, &[])
+}
+
+/// Build S1 Setup Failure carrying `reject` in its Criticality Diagnostics
+/// (TS 36.413 §10.3.4.2).
+pub fn build_setup_failure_with_diagnostics(
+    cause_group: S1apCauseGroup,
+    cause_value: i64,
+    time_to_wait: Option<TimeToWait>,
+    reject: &[crate::s1ap_gen::DiagnosedIe],
+) -> S1apResult<Vec<u8>> {
+    crate::s1ap_gen::build_s1_setup_failure(
+        cause_to_s1ap(cause_group, cause_value),
+        time_to_wait,
+        reject,
+    )
+    .map_err(gen_err)
+}
+
+/// The pre-#514 hand-written S1 Setup Response, kept as the byte-equivalence
+/// oracle for the generated one.
+#[cfg(test)]
+pub(crate) fn hand_written_build_setup_response(ctx: &MmeContext) -> S1apResult<Vec<u8>> {
     let served_gummeis = ctx
         .served_gummei
         .iter()
-        .map(|gummei| ServedGummeiItem {
+        .map(|gummei| nextgcore_s1ap::ServedGummeiItem {
             served_plmns: gummei.plmn_id.iter().map(encode_plmn_id).collect(),
             served_group_ids: gummei.mme_gid.clone(),
             served_mmec_codes: gummei.mme_code.clone(),
         })
         .collect();
 
-    builder::build_s1_setup_response(&S1SetupResponse {
+    builder::build_s1_setup_response(&nextgcore_s1ap::S1SetupResponse {
         mme_name: ctx.mme_name.clone(),
         served_gummeis,
         relative_mme_capacity: ctx.relative_capacity,
     })
 }
 
-/// Build S1 Setup Failure
-pub fn build_setup_failure(
+/// The pre-#514 hand-written S1 Setup Failure, kept as the oracle.
+#[cfg(test)]
+pub(crate) fn hand_written_build_setup_failure(
     cause_group: S1apCauseGroup,
     cause_value: i64,
     time_to_wait: Option<TimeToWait>,
 ) -> S1apResult<Vec<u8>> {
-    builder::build_s1_setup_failure(&S1SetupFailure {
+    builder::build_s1_setup_failure(&nextgcore_s1ap::S1SetupFailure {
         cause: cause_to_s1ap(cause_group, cause_value),
         time_to_wait,
     })
