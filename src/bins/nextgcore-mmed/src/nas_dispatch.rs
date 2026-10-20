@@ -1589,10 +1589,19 @@ pub fn handle_esm_message(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue: &MmeUe, esm:
                         return;
                     }
 
-                    // #329: send the Create Session Request. Before this, the branch
-                    // logged "not implemented (#51)" — and #51 had shipped the sender,
-                    // the transaction layer and the transport, leaving only this call
-                    // site, which fell between #51's and #46's scopes.
+                    // TS 23.401 §5.3.2.1: in an initial attach the Create Session
+                    // Request is step 12, after the Update Location Answer (step 11)
+                    // — it is built from the subscription the ULA returns (#479).
+                    // Before, it was sent from here, ahead of the ULR, with no IMSI
+                    // and no subscribed APN to pair with. The attach path now
+                    // activates once both the request and the subscription exist.
+                    if create_action == CreateAction::InAttachRequest {
+                        activate_attach_pdn(ctx, mme_ue.id);
+                        return;
+                    }
+                    // #329: send the Create Session Request for a standalone PDN
+                    // connectivity request (or TAU), which already has the
+                    // subscription.
                     send_s11_create_session(ctx, enb_ue.id, sess_id, create_action, mme_ue);
                 }
                 Err(e) => {
@@ -1667,6 +1676,11 @@ pub fn handle_esm_message(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue: &MmeUe, esm:
                         MmeEpsType::TauRequest => CreateAction::InTauRequest,
                         _ => CreateAction::InPdnConnectivityRequest,
                     };
+                    // As above: an attach's session is activated after the ULA.
+                    if create_action == CreateAction::InAttachRequest {
+                        activate_attach_pdn(ctx, mme_ue.id);
+                        return;
+                    }
                     send_s11_create_session(ctx, enb_ue.id, sess_id, create_action, mme_ue);
                 }
                 Err(e) => log::warn!(
@@ -1909,6 +1923,102 @@ fn locate_session(ctx: &MmeContext, mme_ue_id: u64, pti: u8, ebi: u8) -> Option<
 /// A failure is logged and NOT propagated to the UE as a reject. TS 23.401 has the MME
 /// wait for the SGW; the ESM procedure is still open and its T3485/T3489 timers govern
 /// what happens when no answer arrives, so synthesising a reject here would race them.
+/// Activate the attach's PDN connection: pair the UE's PDN CONNECTIVITY REQUEST
+/// with the subscribed APNs and send the S11 Create Session Request for the
+/// chosen one (TS 23.401 §5.3.2.1 steps 11–12, #479).
+///
+/// Called from both halves that have to be present — the ULA (subscription) and
+/// the UE's request (and its ESM INFORMATION RESPONSE when the APN was withheld)
+/// — in whichever order they arrive; it does nothing until both are there, and
+/// nothing a second time once the session is activated.
+pub(crate) fn activate_attach_pdn(ctx: &MmeContext, mme_ue_id: u64) {
+    let Some(mme_ue) = ctx.mme_ue_find_by_id(mme_ue_id) else {
+        return;
+    };
+    let sessions: Vec<crate::context::MmeSess> = mme_ue
+        .sess_list
+        .iter()
+        .filter_map(|id| ctx.sess_find_by_id(*id))
+        .collect();
+    // Subscribed sessions carry `session` (materialised from the ULA); the UE's
+    // request is the session with a PTI and no subscription behind it.
+    if !sessions.iter().any(|sess| sess.session.is_some()) {
+        return; // the ULA has not arrived yet
+    }
+    if sessions
+        .iter()
+        .any(|sess| sess.session.is_some() && sess.pti != 0)
+    {
+        return; // already activated: a subscribed session holds the UE's PTI
+    }
+    let Some(requested) = sessions
+        .iter()
+        .find(|sess| sess.pti != 0 && sess.session.is_none())
+        .cloned()
+    else {
+        return; // the UE's PDN CONNECTIVITY REQUEST has not been processed yet
+    };
+    let requested_bearer = requested.bearer_list.first().copied();
+    if let Some(bearer) = requested_bearer.and_then(|id| ctx.bearer_find_by_id(id)) {
+        if bearer.t3489.pkbuf.is_some() {
+            return; // still waiting for the ESM INFORMATION RESPONSE (APN/PCO)
+        }
+    }
+
+    let enb_ue = ctx
+        .enb_ue_find_by_id(mme_ue.enb_ue_id)
+        .filter(|enb_ue| enb_ue.id != 0);
+
+    match crate::s6a_handler::reconcile_requested_apn(ctx, mme_ue_id) {
+        Ok(chosen_id) => {
+            // The UE's request options travel with it onto the subscribed session,
+            // which is what the Create Session Request and the ESM accept use.
+            if let Some(sess) = ctx.sess_pool.write().unwrap().get_mut(&chosen_id) {
+                sess.ue_request_type = requested.ue_request_type;
+                sess.ue_pco = requested.ue_pco.clone();
+                sess.ue_epco = requested.ue_epco.clone();
+            }
+            if chosen_id != requested.id {
+                if let Some(bearer_id) = requested_bearer {
+                    discard_session(ctx, mme_ue_id, requested.id, bearer_id);
+                }
+            }
+            let Some(enb_ue) = enb_ue else {
+                log::warn!(
+                    "[{}] no S1 connection to activate the PDN connection on",
+                    mme_ue.imsi_bcd
+                );
+                return;
+            };
+            send_s11_create_session(
+                ctx,
+                enb_ue.id,
+                chosen_id,
+                CreateAction::InAttachRequest,
+                &mme_ue,
+            );
+        }
+        Err(esm_cause) => {
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            if let (Some(enb_ue), Some(mme_ue)) = (enb_ue, pool.get_mut(&mme_ue_id)) {
+                log::warn!("[{}] rejecting the attach: {esm_cause:?}", mme_ue.imsi_bcd);
+                // TS 24.301 §5.5.1.2.5: an ESM failure during attach is EMM cause
+                // #19, with the ESM cause piggybacked so the UE learns which APN
+                // was refused.
+                if let Err(e) = nas_path::nas_eps_send_attach_reject(
+                    ctx,
+                    &enb_ue,
+                    mme_ue,
+                    EmmCause::EsmFailure,
+                    Some(esm_cause),
+                ) {
+                    log::error!("Attach Reject send failed: {e}");
+                }
+            }
+        }
+    }
+}
+
 fn send_s11_create_session(
     ctx: &MmeContext,
     enb_ue_id: u64,
@@ -3171,8 +3281,46 @@ mod tests {
 
         nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &protected));
 
-        // The CSR must be on the wire.
+        // #479, TS 23.401 §5.3.2.1: the Create Session Request is step 12, AFTER
+        // the Update Location Answer (step 11) — it is built from the
+        // subscription. Nothing may reach the SGW-C before it.
+        peer.set_read_timeout(Some(std::time::Duration::from_millis(300)))
+            .expect("peer timeout");
         let mut buf = [0u8; 4096];
+        assert!(
+            peer.recv_from(&mut buf).is_err(),
+            "no Create Session Request may be sent before the ULA (#479)"
+        );
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .expect("peer timeout");
+
+        // The ULA arrives through the real continuation, subscribing APN
+        // `internet`.
+        crate::fd_path::on_update_location_answer(
+            &ctx,
+            mme_ue_id,
+            Ok(crate::fd_path::UlaMessage {
+                result_code: 2001,
+                subscription_data: crate::fd_path::SubscriptionData {
+                    ambr_uplink: 100_000_000,
+                    ambr_downlink: 200_000_000,
+                    apn_configs: vec![crate::fd_path::ApnConfiguration {
+                        context_identifier: 1,
+                        service_selection: "internet".to_string(),
+                        pdn_type: 0, // IPv4
+                        qci: 9,
+                        arp_priority_level: 8,
+                        ambr_uplink: 50_000_000,
+                        ambr_downlink: 100_000_000,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        );
+
+        // The CSR must now be on the wire.
         let (len, _) = peer
             .recv_from(&mut buf)
             .expect("a Create Session Request must reach the SGW-C");
@@ -3183,6 +3331,29 @@ mod tests {
             crate::s11_build::message_type::CREATE_SESSION_REQUEST,
             "the NAS path must send a Create Session Request, not some other message"
         );
+
+        // #479: the IMSI IE carries the subscriber's TBCD octets (TS 29.274 §8.3),
+        // not fifteen zeros.
+        let imsi_bcd = ctx.mme_ue_find_by_id(mme_ue_id).unwrap().imsi_bcd;
+        let imsi = received
+            .get_ie(Gtp2IeType::Imsi as u8, 0)
+            .expect("IMSI is mandatory");
+        assert_eq!(
+            imsi.value.as_ref(),
+            crate::n26_build::string_to_bcd(&imsi_bcd).as_slice(),
+            "the IMSI must be TBCD-encoded from {imsi_bcd}"
+        );
+        assert!(imsi.value.iter().any(|b| *b != 0));
+
+        // #479: PAA present, requesting dynamic IPv4 allocation (§8.14).
+        let paa = received
+            .get_ie(Gtp2IeType::Paa as u8, 0)
+            .expect("PAA must be present for an E-UTRAN initial attach");
+        assert_eq!(paa.value.as_ref(), &[1u8, 0, 0, 0, 0]);
+
+        // The subscribed APN, paired with the UE's request.
+        let apn = received.get_ie(Gtp2IeType::Apn as u8, 0).expect("APN");
+        assert_eq!(apn.value.as_ref(), b"\x08internet");
 
         // The Sender F-TEID must carry a REAL S11 TEID. Before #329 `mme_s11_teid` was
         // never assigned, so this was 0 and no response could be attributed to a UE.
