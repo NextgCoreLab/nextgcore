@@ -1169,57 +1169,6 @@ pub async fn call_smf_create_sm_context(
     })
 }
 
-/// Call SMF to update SM context (POST /nsmf-pdusession/v1/sm-contexts/{ref}/modify)
-///
-/// Used to send gNB TEID back to SMF after PDU Session Resource Setup Response.
-pub async fn call_smf_update_sm_context(
-    smf_host: &str,
-    smf_port: u16,
-    sm_context_ref: &str,
-    n2_sm_info: &[u8],
-) -> SbiResult<()> {
-    log::info!(
-        "Calling SMF SM Context Update: ref={}, n2_info_len={}",
-        sm_context_ref,
-        n2_sm_info.len()
-    );
-
-    let client = crate::attach_oauth2(
-        SbiClient::for_peer(smf_host, smf_port),
-        nextgcore_sbi::types::NfType::Smf,
-    );
-
-    // N2 SM transfer (gNB DL F-TEID) carried as a multipart/related ngap binary
-    // part referenced by RefToBinaryData (smfd-02).
-    let body = serde_json::json!({
-        "n2SmInfo": { "contentId": "n2SmInfo" },
-        "n2SmInfoType": "PDU_RES_SETUP_RSP"
-    });
-
-    let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify");
-    let request = SbiRequest::post(&path)
-        .with_body(body.to_string(), content_type::APPLICATION_JSON)
-        .with_part(SbiPart::with_content(
-            "n2SmInfo",
-            content_type::APPLICATION_NGAP,
-            bytes::Bytes::copy_from_slice(n2_sm_info),
-        ));
-    let response = client
-        .send_request(request)
-        .await
-        .map_err(|e| SbiError::RequestFailed(format!("SMF update failed: {e}")))?;
-
-    if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "SMF update returned status {}",
-            response.status
-        )));
-    }
-
-    log::info!("SMF SM Context Updated: ref={sm_context_ref}");
-    Ok(())
-}
-
 /// Ask the SMF to re-activate a session's user plane (#518): Nsmf_PDUSession_
 /// UpdateSMContext with `upCnxState: ACTIVATING` (TS 29.502 §5.2.2.3.2.2, TS 23.502
 /// §4.2.3.2 step 4). Returns the `n2SmInfo` the SMF answers with -- the
@@ -1269,16 +1218,21 @@ pub struct SmContextUpdateResponse {
     pub n1_sm_msg: Vec<u8>,
     /// N2 SM Information (updated QoS/tunnel info for gNB) - optional
     pub n2_sm_info: Vec<u8>,
+    /// The `n2SmInfoType` the SMF gave its N2 SM information (TS 29.502
+    /// §6.1.6.3.12), e.g. `PDU_RES_MOD_CFM` or `PDU_RES_MOD_IND_FAIL`.
+    pub n2_sm_info_type: Option<String>,
 }
 
 /// Call SMF to update SM context with N1 SM info (UE-initiated modification)
 ///
 /// Call the SMF with an N2 SM transfer and return what it answers (#70).
 ///
-/// Generalises [`call_smf_update_sm_context`], which hardcodes
-/// `n2SmInfoType: "PDU_RES_SETUP_RSP"` and DISCARDS the response body. Both are wrong for
-/// mobility: a path switch is `PATH_SWITCH_REQ`, and the whole point of the exchange is the
-/// `PathSwitchRequestAcknowledgeTransfer` the SMF puts in its answer
+/// Every N2 SM container the AMF relays goes through here with its own
+/// `n2SmInfoType` (#525): the removed `call_smf_update_sm_context` labelled all
+/// of them `PDU_RES_SETUP_RSP`, so the SMF decoded a Modify Response, a Notify or
+/// a Release Response as a Setup Response Transfer. The answer is returned
+/// because some exchanges exist for it, e.g. the
+/// `PathSwitchRequestAcknowledgeTransfer` or the Modify Confirm Transfer
 /// (TS 29.502 §5.2.2.3.3). Before #70 the AMF never made this call at all and echoed the
 /// gNB's own request transfer back to it instead.
 ///
@@ -1340,9 +1294,11 @@ pub async fn call_smf_update_sm_context_n2(
          answered n2_len={}",
         n2_sm_info.len()
     );
+    let n2_sm_info_type = response_body["n2SmInfoType"].as_str().map(str::to_owned);
     Ok(SmContextUpdateResponse {
         n1_sm_msg: Vec::new(),
         n2_sm_info,
+        n2_sm_info_type,
     })
 }
 
@@ -1409,9 +1365,11 @@ pub async fn call_smf_update_sm_context_with_n1(
         n2_sm_info.len()
     );
 
+    let n2_sm_info_type = response_body["n2SmInfoType"].as_str().map(str::to_owned);
     Ok(SmContextUpdateResponse {
         n1_sm_msg,
         n2_sm_info,
+        n2_sm_info_type,
     })
 }
 
