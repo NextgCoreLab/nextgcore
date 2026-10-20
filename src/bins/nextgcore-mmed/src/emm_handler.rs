@@ -253,7 +253,7 @@ pub fn handle_attach_request(
     mme_ue.ue_network_capability.uia = ue_network_capability.uia;
 
     if let Some(ref imsi_str) = imsi {
-        mme_ue.imsi_bcd = imsi_str.clone();
+        mme_ue.set_imsi(imsi_str);
     }
 
     // Copy TAI and E-CGI from eNB UE
@@ -482,7 +482,7 @@ pub fn handle_identity_response(
         1 => {
             // IMSI
             let imsi = decode_imsi(identity_data)?;
-            mme_ue.imsi_bcd = imsi.clone();
+            mme_ue.set_imsi(&imsi);
             log::info!("Identity response: IMSI[{imsi}]");
             Ok(Some(imsi))
         }

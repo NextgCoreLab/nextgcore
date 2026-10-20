@@ -1256,6 +1256,23 @@ pub struct MmeUe {
     pub emergency_attach: bool,
 }
 
+impl MmeUe {
+    /// Record the IMSI in both forms the context carries: `imsi_bcd` (digits, for
+    /// logs and indexing) and `imsi`/`imsi_len` (TBCD octets, TS 29.274 §8.3 /
+    /// TS 29.002, which is what goes on the wire in S11 and S6a). `imsi_len` is
+    /// the OCTET count. Before #479 only the digits were stored and `imsi_len`
+    /// was set to the digit count, so the S11 Create Session Request carried
+    /// fifteen zero octets as the IMSI.
+    pub fn set_imsi(&mut self, imsi_bcd: &str) {
+        self.imsi_bcd = imsi_bcd.to_string();
+        let tbcd = crate::n26_build::string_to_bcd(imsi_bcd);
+        let len = tbcd.len().min(self.imsi.len());
+        self.imsi = [0; NEXTGCORE_MAX_IMSI_LEN];
+        self.imsi[..len].copy_from_slice(&tbcd[..len]);
+        self.imsi_len = len;
+    }
+}
+
 // ============================================================================
 // MME Session Context
 // ============================================================================
@@ -2141,8 +2158,7 @@ impl MmeContext {
     /// Set IMSI for MME UE
     pub fn mme_ue_set_imsi(&self, id: u64, imsi_bcd: &str) -> bool {
         if let Some(ue) = self.mme_ue_pool.write().unwrap().get_mut(&id) {
-            ue.imsi_bcd = imsi_bcd.to_string();
-            ue.imsi_len = imsi_bcd.len().min(NEXTGCORE_MAX_IMSI_LEN);
+            ue.set_imsi(imsi_bcd);
             self.imsi_ue_hash
                 .write()
                 .unwrap()
@@ -2506,6 +2522,20 @@ pub fn mme_context_final() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #479: the IMSI is stored as TBCD octets (TS 29.274 §8.3) with `imsi_len`
+    /// the octet count, so S11 carries the subscriber rather than zeros.
+    #[test]
+    fn set_imsi_stores_tbcd_octets() {
+        let mut ue = MmeUe::default();
+        ue.set_imsi("999700000000001");
+        assert_eq!(ue.imsi_bcd, "999700000000001");
+        assert_eq!(ue.imsi_len, 8);
+        assert_eq!(
+            &ue.imsi[..8],
+            &[0x99, 0x79, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF1]
+        );
+    }
 
     /// A context with one served GUMMEI, built the way configuration builds it —
     /// `served_gummei` is set at construction rather than mutated afterwards, which is

@@ -265,8 +265,8 @@ pub type S11BuildResult<T> = Result<T, S11BuildError>;
 use bytes::BytesMut;
 use nextgcore_gtp::v2::{
     Gtp2AmbrIe, Gtp2ApnIe, Gtp2BearerContextIe, Gtp2BearerQosIe, Gtp2CauseIe, Gtp2FTeidIe,
-    Gtp2Header, Gtp2Ie, Gtp2IeType, Gtp2IndicationIe, Gtp2Message, Gtp2PdnTypeIe, Gtp2RatTypeIe,
-    Gtp2SelectionModeIe,
+    Gtp2Header, Gtp2Ie, Gtp2IeType, Gtp2IndicationIe, Gtp2Message, Gtp2PaaIe, Gtp2PdnTypeIe,
+    Gtp2RatTypeIe, Gtp2SelectionModeIe,
 };
 
 /// F-TEID interface types (TS 29.274 §8.22 Table 8.22-1).
@@ -458,10 +458,18 @@ pub fn build_create_session_request(
     // Selection Mode (C)
     msg.add_ie(typed_ie(|buf| Gtp2SelectionModeIe::new(0).encode(buf, 0))?);
 
-    // PDN Type (C)
+    // PDN Type (C). GTPv2's code points are not ESM's: TS 29.274 §8.34 has Non-IP
+    // = 4 and Ethernet = 5, where TS 24.301 §9.9.4.10 has 5 and 6.
+    let gtp_pdn_type = gtp_pdn_type(sess.ue_request_pdn_type);
     msg.add_ie(typed_ie(|buf| {
-        Gtp2PdnTypeIe::new(sess.ue_request_pdn_type as u8).encode(buf, 0)
+        Gtp2PdnTypeIe::new(gtp_pdn_type).encode(buf, 0)
     })?);
+
+    // PAA (C, TS 29.274 Table 7.2.1-1, §8.14): present for an E-UTRAN initial
+    // attach. No static address is held, so this requests DYNAMIC allocation:
+    // the address octets are zero and the PGW allocates (TS 23.401 §5.3.2.1
+    // step 12). Without it a conformant PGW rejects with cause 109 (#479).
+    msg.add_ie(create_session_paa(gtp_pdn_type).to_ie(0));
 
     // APN-AMBR (C)
     msg.add_ie(typed_ie(|buf| {
@@ -492,6 +500,35 @@ pub fn build_create_session_request(
     }
 
     Ok(msg)
+}
+
+/// The GTPv2 PDN Type (TS 29.274 §8.34 / Table 8.14-1) for an ESM PDN type
+/// (TS 24.301 §9.9.4.10). The IP values coincide; Non-IP and Ethernet do not.
+pub fn gtp_pdn_type(pdn_type: crate::esm_build::PdnType) -> u8 {
+    use crate::esm_build::PdnType;
+    match pdn_type {
+        PdnType::Ipv4 => 1,
+        PdnType::Ipv6 => 2,
+        PdnType::Ipv4v6 => 3,
+        PdnType::NonIp => 4,
+        PdnType::Ethernet => 5,
+    }
+}
+
+/// A PAA asking the PGW for dynamic allocation: the PDN type with every address
+/// octet zero, and no address at all for Non-IP / Ethernet (§8.14).
+fn create_session_paa(gtp_pdn_type: u8) -> Gtp2PaaIe {
+    match gtp_pdn_type {
+        1 => Gtp2PaaIe::ipv4([0; 4]),
+        2 => Gtp2PaaIe::ipv6(64, [0; 16]),
+        3 => Gtp2PaaIe::ipv4v6([0; 4], 64, [0; 16]),
+        other => Gtp2PaaIe {
+            pdn_type: other,
+            ipv4_addr: None,
+            ipv6_prefix_len: None,
+            ipv6_addr: None,
+        },
+    }
 }
 
 /// Build Modify Bearer Request (TS 29.274 §7.2.7)
@@ -986,5 +1023,35 @@ mod tests {
             decoded.oi,
             "Operation Indication must be SET, which the hand-rolled octets never were"
         );
+    }
+
+    /// #479: GTPv2 and ESM disagree on Non-IP / Ethernet code points.
+    #[test]
+    fn gtp_pdn_type_maps_esm_values() {
+        use crate::esm_build::PdnType;
+        assert_eq!(gtp_pdn_type(PdnType::Ipv4), 1);
+        assert_eq!(gtp_pdn_type(PdnType::Ipv6), 2);
+        assert_eq!(gtp_pdn_type(PdnType::Ipv4v6), 3);
+        assert_eq!(gtp_pdn_type(PdnType::NonIp), 4);
+        assert_eq!(gtp_pdn_type(PdnType::Ethernet), 5);
+    }
+
+    /// #479: a dynamic-allocation PAA per TS 29.274 §8.14 — zero addresses,
+    /// /64 for IPv6, none at all for Non-IP.
+    #[test]
+    fn create_session_paa_requests_dynamic_allocation() {
+        let value = |p: Gtp2PaaIe| {
+            let mut b = BytesMut::new();
+            p.encode_value(&mut b);
+            b.to_vec()
+        };
+        assert_eq!(value(create_session_paa(1)), [1, 0, 0, 0, 0]);
+        let mut v6 = vec![2, 64];
+        v6.extend([0u8; 16]);
+        assert_eq!(value(create_session_paa(2)), v6);
+        let mut v46 = vec![3, 64];
+        v46.extend([0u8; 20]);
+        assert_eq!(value(create_session_paa(3)), v46);
+        assert_eq!(value(create_session_paa(4)), [4]);
     }
 }

@@ -1016,11 +1016,7 @@ fn install_transferred_context(
             .ok_or_else(|| format!("UE {mme_ue_id} is gone"))?;
         n26_build::apply_mm_context(mme_ue, mm_context);
         if let Some(imsi) = &data.imsi_bcd {
-            mme_ue.imsi_bcd = imsi.clone();
-            let encoded = n26_build::string_to_bcd(imsi);
-            let len = encoded.len().min(mme_ue.imsi.len());
-            mme_ue.imsi[..len].copy_from_slice(&encoded[..len]);
-            mme_ue.imsi_len = len;
+            mme_ue.set_imsi(imsi);
         }
         if let Some(mei) = (!mm_context.mei.is_empty()).then_some(&mm_context.mei) {
             let len = mei.len().min(mme_ue.imeisv.len());

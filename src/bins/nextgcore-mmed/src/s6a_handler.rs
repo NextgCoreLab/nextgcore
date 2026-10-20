@@ -486,14 +486,24 @@ fn process_apn_configurations(mme_ue: &mut MmeUe, apn_configs: &[ApnConfiguratio
 /// links run in both directions (`mme_ue.sess_list`, `sess.bearer_list`), so this
 /// takes that lock itself.
 ///
-/// Idempotent: a UE that already has sessions is left alone, so a retransmitted
-/// procedure cannot double-allocate. Returns how many sessions the UE has.
+/// Idempotent: a UE that already has SUBSCRIBED sessions is left alone, so a
+/// retransmitted procedure cannot double-allocate. The session the UE's own PDN
+/// CONNECTIVITY REQUEST created does not count: it exists before the ULA in every
+/// attach, and treating it as "already has sessions" left nothing to pair it with,
+/// so every attach was rejected #19 (#479). Returns how many subscribed sessions
+/// the UE has.
 pub fn materialise_subscribed_sessions(ctx: &crate::context::MmeContext, mme_ue_id: u64) -> usize {
     let Some(mme_ue) = ctx.mme_ue_find_by_id(mme_ue_id) else {
         return 0;
     };
-    if !mme_ue.sess_list.is_empty() {
-        return mme_ue.sess_list.len();
+    let subscribed = mme_ue
+        .sess_list
+        .iter()
+        .filter_map(|id| ctx.sess_find_by_id(*id))
+        .filter(|sess| sess.session.is_some())
+        .count();
+    if subscribed != 0 {
+        return subscribed;
     }
 
     let mut created = 0;
@@ -1056,6 +1066,32 @@ mod tests {
             mme_ue.sess_list.push(requested);
         }
         (ctx, mme_ue_id)
+    }
+
+    /// #479: in an attach the UE's own PDN CONNECTIVITY REQUEST session exists
+    /// BEFORE the ULA. It must not count as "already has sessions", or nothing is
+    /// materialised to pair it with and every attach is rejected #19.
+    #[test]
+    fn materialise_ignores_the_ues_own_request_session() {
+        let ctx = crate::context::MmeContext::new();
+        ctx.init();
+        let mme_ue_id = ctx.mme_ue_add(1);
+        let requested = ctx.sess_add(mme_ue_id, 7);
+        {
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            let mme_ue = pool.get_mut(&mme_ue_id).unwrap();
+            mme_ue.sess_list.push(requested);
+            mme_ue.session = vec![crate::context::SessionData {
+                name: "internet".to_string(),
+                ..Default::default()
+            }];
+        }
+
+        assert_eq!(materialise_subscribed_sessions(&ctx, mme_ue_id), 1);
+        let chosen = reconcile_requested_apn(&ctx, mme_ue_id).expect("subscribed APN");
+        assert_ne!(chosen, requested);
+        // And a second call is still idempotent.
+        assert_eq!(materialise_subscribed_sessions(&ctx, mme_ue_id), 1);
     }
 
     #[test]
