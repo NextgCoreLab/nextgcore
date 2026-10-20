@@ -25,7 +25,20 @@ use thiserror::Error;
 use tokio::{net::UdpSocket, sync::mpsc, time::timeout};
 use tracing::{debug, info, trace, warn};
 
-use crate::{ReceivedMessage, NGAP_PPID};
+use crate::ReceivedMessage;
+
+/// The PPID to report for a received chunk: the one the peer sent, verbatim.
+///
+/// PPID 0 means "not specified by the upper layer" (RFC 9260 §3.3.1); only then
+/// is the server's configured PPID substituted, as [`SctpServerConfig::ppid`]
+/// documents. Before #467 every received chunk was reported as NGAP_PPID, so
+/// the PPID a peer actually sent was never visible.
+fn received_ppid(ppi: PayloadProtocolIdentifier, configured: u32) -> u32 {
+    match u32::from(ppi) {
+        0 => configured,
+        ppid => ppid,
+    }
+}
 
 /// Server errors
 #[derive(Debug, Error)]
@@ -370,6 +383,7 @@ impl SctpServer {
 
     /// Check for and handle received data
     fn check_for_data(&mut self, handle: AssociationHandle) -> Result<()> {
+        let configured_ppid = self.config.ppid;
         if let Some(managed) = self.associations.get_mut(&handle) {
             // First, accept any new streams
             while let Some(mut stream) = managed.association.accept_stream() {
@@ -381,10 +395,7 @@ impl SctpServer {
                     if total_len > 0 {
                         let mut buf = vec![0u8; total_len];
                         if chunks.read(&mut buf).is_ok() {
-                            let ppid = match chunks.ppi {
-                                PayloadProtocolIdentifier::Unknown => NGAP_PPID,
-                                _ => NGAP_PPID, // Default to NGAP for 5G
-                            };
+                            let ppid = received_ppid(chunks.ppi, configured_ppid);
 
                             let message = ReceivedMessage {
                                 stream_id,
@@ -420,10 +431,7 @@ impl SctpServer {
                         if total_len > 0 {
                             let mut buf = vec![0u8; total_len];
                             if chunks.read(&mut buf).is_ok() {
-                                let ppid = match chunks.ppi {
-                                    PayloadProtocolIdentifier::Unknown => NGAP_PPID,
-                                    _ => NGAP_PPID,
-                                };
+                                let ppid = received_ppid(chunks.ppi, configured_ppid);
 
                                 let message = ReceivedMessage {
                                     stream_id,
@@ -520,15 +528,30 @@ impl SctpServer {
         Ok(())
     }
 
-    /// Send data to a specific association
+    /// Send data to a specific association with the server's configured PPID
+    /// ([`SctpServerConfig::ppid`]: NGAP 60 by default, S1AP 18 for S1-MME).
     pub async fn send(&mut self, association_id: u64, stream_id: u16, data: &[u8]) -> Result<()> {
+        let ppid = self.config.ppid;
+        self.send_with_ppid(association_id, stream_id, data, ppid)
+            .await
+    }
+
+    /// Send data to a specific association with an explicit PPID, which goes on
+    /// the wire verbatim (#467).
+    pub async fn send_with_ppid(
+        &mut self,
+        association_id: u64,
+        stream_id: u16,
+        data: &[u8],
+        ppid: u32,
+    ) -> Result<()> {
         let handle = self
             .id_to_handle
             .get(&association_id)
             .ok_or(ServerError::AssociationNotFound(association_id))?;
 
         if let Some(managed) = self.associations.get_mut(handle) {
-            let ppi = PayloadProtocolIdentifier::from(NGAP_PPID);
+            let ppi = PayloadProtocolIdentifier::from(ppid);
 
             // Try to get an existing stream first, fall back to opening a new one
             let mut stream = match managed.association.stream(stream_id) {
@@ -636,6 +659,28 @@ impl Drop for SctpServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn received_ppid_is_verbatim_and_zero_takes_the_configured_one() {
+        use sctp_proto::PayloadProtocolIdentifier as P;
+        // NGAP and S1AP arrive as themselves, whatever the server is configured for.
+        assert_eq!(
+            received_ppid(P::from(60), crate::NEXTGCORE_SCTP_S1AP_PPID),
+            60
+        );
+        assert_eq!(received_ppid(P::from(18), crate::NGAP_PPID), 18);
+        // An unexpected PPID is reported, not rewritten.
+        assert_eq!(received_ppid(P::from(58), crate::NGAP_PPID), 58);
+        // PPID 0 (unspecified, RFC 9260 §3.3.1) takes the configured PPID.
+        assert_eq!(
+            received_ppid(P::from(0), crate::NGAP_PPID),
+            crate::NGAP_PPID
+        );
+        assert_eq!(
+            received_ppid(P::from(0), crate::NEXTGCORE_SCTP_S1AP_PPID),
+            crate::NEXTGCORE_SCTP_S1AP_PPID
+        );
+    }
 
     #[test]
     fn test_server_config_default() {
