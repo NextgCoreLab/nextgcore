@@ -17,7 +17,10 @@ members = [
     "libs/nextgcore-sctp",
     "libs/nextgcore-ngap",
     "libs/nextgcore-ngap-gen",
+    "libs/nextgcore-lpp-gen",
+    "libs/nextgcore-nrppa-gen",
     "libs/nextgcore-s1ap",
+    "libs/nextgcore-s1ap-gen",
     "libs/nextgcore-dbi",
     "libs/nextgcore-app",
     "libs/nextgcore-metrics",
@@ -217,7 +220,10 @@ nextgcore-diameter = { path = "libs/nextgcore-diameter" }
 nextgcore-sctp = { path = "libs/nextgcore-sctp" }
 nextgcore-ngap = { path = "libs/nextgcore-ngap" }
 nextgcore-ngap-gen = { path = "libs/nextgcore-ngap-gen" }
+nextgcore-lpp-gen = { path = "libs/nextgcore-lpp-gen" }
+nextgcore-nrppa-gen = { path = "libs/nextgcore-nrppa-gen" }
 nextgcore-s1ap = { path = "libs/nextgcore-s1ap" }
+nextgcore-s1ap-gen = { path = "libs/nextgcore-s1ap-gen" }
 nextgcore-dbi = { path = "libs/nextgcore-dbi" }
 nextgcore-app = { path = "libs/nextgcore-app" }
 nextgcore-metrics = { path = "libs/nextgcore-metrics" }
