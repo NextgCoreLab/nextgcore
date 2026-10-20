@@ -603,9 +603,14 @@ pub fn parse_forward_relocation_request(
         pdn_connections,
         // F-Container instance 0 is the E-UTRAN Transparent Container, i.e. the Source-to-Target
         // one in this direction. Instance 1 would be UTRAN's and 2 a BSS container.
+        //
+        // #476: an F-Container (TS 29.274 §8.48, Figure 8.48-1) is `Spare | Container Type`
+        // in octet 5 and the container from octet 6; Table 7.3.1-1 requires Container Type 3
+        // here. The type octet is stripped and checked, not relayed to the target eNB as the
+        // first octet of its transparent container.
         source_to_target_container: msg
             .get_ie(Gtp2IeType::FContainer as u8, 0)
-            .map(|ie| ie.value.to_vec()),
+            .and_then(|ie| strip_eutran_container_type(&ie.value)),
         target_identification: msg
             .get_ie(Gtp2IeType::TargetIdentification as u8, 0)
             .map(|ie| ie.value.to_vec()),
@@ -676,15 +681,32 @@ pub fn build_forward_relocation_response(
     // E-UTRAN Transparent Container (C) at instance 0: the Target-to-Source container the target
     // eNB produced, relayed VERBATIM. TS 38.413 §9.3.1.21 has the AMF pass it straight to the
     // source gNB, so any re-encoding here would corrupt what the gNB decodes.
+    //
+    // #476: written as an F-Container (§8.48) of Container Type 3 (Table 7.3.2-1), not as the
+    // bare container.
     if !target_to_source_container.is_empty() {
+        let mut value = Vec::with_capacity(1 + target_to_source_container.len());
+        value.push(F_CONTAINER_TYPE_EUTRAN);
+        value.extend_from_slice(target_to_source_container);
         msg.add_ie(Gtp2Ie::new(
             Gtp2IeType::FContainer as u8,
             0,
-            Bytes::copy_from_slice(target_to_source_container),
+            Bytes::from(value),
         ));
     }
 
     msg
+}
+
+/// TS 29.274 Table 7.3.1-1 / 7.3.2-1: Container Type 3, the E-UTRAN Transparent Container.
+pub const F_CONTAINER_TYPE_EUTRAN: u8 = 3;
+
+/// The container of an F-Container (§8.48) whose Container Type is the E-UTRAN Transparent
+/// Container (#476); `None` for another type or an empty container field.
+pub fn strip_eutran_container_type(value: &[u8]) -> Option<Vec<u8>> {
+    let (&type_octet, container) = value.split_first()?;
+    (type_octet & 0x0F == F_CONTAINER_TYPE_EUTRAN && !container.is_empty())
+        .then(|| container.to_vec())
 }
 
 /// Build a **Forward Relocation Complete Notification** (TS 29.274 §7.3.3, type 135), #408.
@@ -779,6 +801,53 @@ pub fn apply_mm_context(mme_ue: &mut MmeUe, ctx: &Gtp2MmContextIe) {
 
 #[cfg(test)]
 mod tests {
+    /// #476, strict peer: the Forward Relocation Response this MME builds is read by amfd's
+    /// REAL parser with the F-Container's Container Type octet stripped — so the source gNB gets
+    /// the target eNB's container byte for byte, without a spurious leading `0x03`.
+    #[test]
+    fn amfd_reads_the_target_to_source_container_without_its_type_octet() {
+        let response =
+            build_forward_relocation_response(7, 0x0476, 16, None, &[(5, None)], &[0xF4, 0x08]);
+        // TS 29.274 Figure 8.48-1: octet 5 is Spare | Container Type (3), the container from 6.
+        assert_eq!(
+            response
+                .get_ie(Gtp2IeType::FContainer as u8, 0)
+                .unwrap()
+                .value
+                .as_ref(),
+            &[0x03, 0xF4, 0x08]
+        );
+        let mut wire = bytes::Bytes::from(response.encode().to_vec());
+        let decoded = Gtp2Message::decode(&mut wire).unwrap();
+        let parsed =
+            nextgcore_amfd::n26_build::parse_forward_relocation_response(&decoded).unwrap();
+        assert_eq!(
+            parsed.target_to_source_container.as_deref(),
+            Some(&[0xF4, 0x08][..])
+        );
+    }
+
+    #[test]
+    fn only_a_type_3_f_container_with_contents_is_an_eutran_container() {
+        assert_eq!(
+            strip_eutran_container_type(&[0x03, 0xAA, 0xBB]),
+            Some(vec![0xAA, 0xBB])
+        );
+        // The spare high nibble does not change the type.
+        assert_eq!(strip_eutran_container_type(&[0xF3, 0xAA]), Some(vec![0xAA]));
+        assert_eq!(
+            strip_eutran_container_type(&[0x01, 0xAA]),
+            None,
+            "UTRAN, not E-UTRAN"
+        );
+        assert_eq!(
+            strip_eutran_container_type(&[0x03]),
+            None,
+            "no container field"
+        );
+        assert_eq!(strip_eutran_container_type(&[]), None);
+    }
+
     use super::*;
     use crate::context::PlmnId;
 
@@ -1276,7 +1345,7 @@ mod tests {
                 .expect("F-Container IE")
                 .value
                 .as_ref(),
-            &[0xF4, 0x08],
+            &[0x03, 0xF4, 0x08],
             "the target eNB's Target-to-Source container must travel verbatim: TS 38.413 \
              §9.3.1.21 has the source AMF relay it straight to the source gNB"
         );

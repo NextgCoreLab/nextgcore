@@ -1075,6 +1075,78 @@ pub struct EpsToFivegsHandoverRequest {
     pub source_to_target_container: Vec<u8>,
 }
 
+/// The HANDOVER COMMAND for a 5GS→EPS handover the target MME accepted (TS 38.413 §9.2.3.2,
+/// TS 23.502 §4.11.1.2.1 step 11), #476.
+///
+/// | IE | value | why |
+/// |---|---|---|
+/// | Handover Type | `fivegs-to-eps` | §9.3.1.22 |
+/// | NAS Security Parameters from NG-RAN | the 8 LSB of the DL NAS COUNT used for K_ASME' | `C-iftoEPS`; TS 33.501 §8.3.2 step 7 — the value part of TS 24.501 §9.11.2.7, one Sequence number octet |
+/// | Target to Source Transparent Container | the target eNB's, relayed verbatim | §9.3.1.21: a TS 36.413 structure the AMF does not decode |
+///
+/// No PDU Session Resource Handover List: it carries forwarding tunnels
+/// (`HandoverCommandTransfer`), and this AMF requests no data forwarding toward EPS — the
+/// IE is `optional`, and leaving it out is what tells the gNB nothing is forwarded.
+pub fn build_fivegs_to_eps_handover_command_asn1(
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+    nas_count_lsb: u8,
+    target_to_source_container: &[u8],
+) -> Option<Vec<u8>> {
+    use ngap_gen::{
+        HandoverCommand, HandoverCommandProtocolIEs, HandoverCommandProtocolIEs_Entry as Entry,
+        HandoverCommandProtocolIEs_EntryValue as Ie, ProtocolIE_ID, NGAP_PDU,
+    };
+    let reject = ngap_gen::Criticality(ngap_gen::Criticality::REJECT);
+    let entry = |id: u16, value: Ie| Entry {
+        id: ProtocolIE_ID(id),
+        criticality: reject.clone(),
+        value,
+    };
+    let ies = vec![
+        entry(
+            ngap_gen::ID_AMF_UE_NGAP_ID,
+            Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(amf_ue_ngap_id)),
+        ),
+        entry(
+            ngap_gen::ID_RAN_UE_NGAP_ID,
+            Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(ran_ue_ngap_id)),
+        ),
+        entry(
+            ngap_gen::ID_HANDOVER_TYPE,
+            Ie::Id_HandoverType(ngap_gen::HandoverType(
+                ngap_gen::HandoverType::FIVEGS_TO_EPS,
+            )),
+        ),
+        entry(
+            ngap_gen::ID_NAS_SECURITY_PARAMETERS_FROM_NGRAN,
+            Ie::Id_NASSecurityParametersFromNGRAN(ngap_gen::NASSecurityParametersFromNGRAN(vec![
+                nas_count_lsb,
+            ])),
+        ),
+        entry(
+            ngap_gen::ID_TARGET_TO_SOURCE_TRANSPARENT_CONTAINER,
+            Ie::Id_TargetToSource_TransparentContainer(
+                ngap_gen::TargetToSource_TransparentContainer(target_to_source_container.to_vec()),
+            ),
+        ),
+    ];
+    let pdu = NGAP_PDU::SuccessfulOutcome(ngap_gen::SuccessfulOutcome {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_HANDOVER_PREPARATION),
+        criticality: reject.clone(),
+        value: ngap_gen::SuccessfulOutcomeValue::Id_HandoverPreparation(HandoverCommand {
+            protocol_i_es: HandoverCommandProtocolIEs(ies),
+        }),
+    });
+    match nextgcore_ngap_gen::encode(&pdu) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            log::error!("Failed to encode the 5GS→EPS HandoverCommand: {e:?}");
+            None
+        }
+    }
+}
+
 /// Build an **EPS→5GS HandoverRequest** (TS 38.413 §8.4.2 / §9.2.3.4) with the GENERATED
 /// codec (#418).
 ///

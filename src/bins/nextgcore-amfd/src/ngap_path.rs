@@ -785,6 +785,10 @@ impl NgapServer {
         // (#418, TS 23.502 §4.11.1.2.2.2 step 9). Dormant when none is queued.
         self.process_eps_to_5gs_preparations().await;
 
+        // Send the HandoverCommand (or HandoverPreparationFailure) for every 5GS→EPS
+        // preparation the target MME answered (#476, TS 23.502 §4.11.1.2.1 step 11).
+        self.process_fivegs_to_eps_answers().await;
+
         // Process any pending server events
         while let Ok(event) = self.server_event_rx.try_recv() {
             self.handle_server_event(event).await?;
@@ -8552,6 +8556,92 @@ pub(crate) fn seed_eps_to_5gs_ue(ue: &mut AmfUe, prep: &crate::n26_path::EpsToFi
 
 impl NgapServer {
     /// Send the HandoverRequest for each EPS→5GS handover the N26 leg prepared (#418).
+    async fn process_fivegs_to_eps_answers(&mut self) {
+        for answer in crate::n26_path::drain_fivegs_to_eps_answers() {
+            if let Some((association_id, pdu)) = self.fivegs_to_eps_answer_pdu(&answer) {
+                if let Err(e) = self.send_to_association(association_id, &pdu).await {
+                    log::warn!(
+                        "5GS→EPS: the answer for UE {} could not be sent to association \
+                         {association_id}: {e}",
+                        answer.amf_ue_ngap_id
+                    );
+                }
+            }
+        }
+    }
+
+    /// TS 23.502 §4.11.1.2.1 step 11 (#476): the PDU the source gNB gets for a 5GS→EPS
+    /// preparation the target MME answered, and the association it goes to.
+    ///
+    /// Accepted → HANDOVER COMMAND (TS 38.413 §9.2.3.2) with the target eNB's container and
+    /// the NAS Security Parameters from NG-RAN TS 33.501 §8.3.2 step 7 requires. Refused →
+    /// HANDOVER PREPARATION FAILURE, `ho-failure-in-target-5GC-ngran-node-or-target-system`
+    /// (§9.3.1.2): the target system said no, which is that cause's meaning. `None` when the
+    /// UE is no longer known to this AMF — there is no source to answer.
+    pub(crate) fn fivegs_to_eps_answer_pdu(
+        &mut self,
+        answer: &crate::n26_path::FivegsToEpsAnswer,
+    ) -> Option<(u64, Vec<u8>)> {
+        let Some((ran_ue_ngap_id, association_id)) = self
+            .ue_auth_state
+            .get(answer.amf_ue_ngap_id)
+            .map(|state| (state.ran_ue_ngap_id, state.association_id))
+        else {
+            log::warn!(
+                "5GS→EPS: the target MME answered for UE {}, which this AMF no longer holds; \
+                 nothing is sent",
+                answer.amf_ue_ngap_id
+            );
+            return None;
+        };
+        // The relay target and any per-session transfers of the preparation are done with
+        // either way.
+        self.handover_target_assoc.remove(&answer.amf_ue_ngap_id);
+        self.handover_target_transfers
+            .retain(|(ue, _psi), _| *ue != answer.amf_ue_ngap_id);
+        match inter_system_handover_command(&answer.outcome) {
+            Some(command) => {
+                let pdu = crate::ngap_asn1::build_fivegs_to_eps_handover_command_asn1(
+                    answer.amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    command.nas_count_lsb,
+                    &command.target_to_source_container,
+                )?;
+                log::info!(
+                    "5GS→EPS: HandoverCommand to the source gNB (association {association_id}) \
+                     for UE {}: {}-octet target-to-source container, NAS Security Parameters \
+                     from NG-RAN = DL COUNT LSB {:#04x}; bearers {:?} move WITHOUT data \
+                     forwarding (none was requested)",
+                    answer.amf_ue_ngap_id,
+                    command.target_to_source_container.len(),
+                    command.nas_count_lsb,
+                    command.bearers_without_forwarding
+                );
+                Some((association_id, pdu))
+            }
+            None => {
+                let failure = nextgcore_ngap::types::HandoverPreparationFailure {
+                    amf_ue_ngap_id: answer.amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                        nextgcore_asn1c::ngap::cause::CauseRadioNetwork::HoFailureInTarget5gcNgranNodeOrTargetSystem,
+                    ),
+                    criticality_diagnostics: None,
+                };
+                let pdu =
+                    nextgcore_ngap::builder::build_handover_preparation_failure(&failure).ok()?;
+                log::warn!(
+                    "5GS→EPS: the target refused UE {}'s relocation ({:?}); \
+                     HandoverPreparationFailure to the source gNB (association \
+                     {association_id}), the UE stays on 5GS",
+                    answer.amf_ue_ngap_id,
+                    answer.outcome
+                );
+                Some((association_id, pdu))
+            }
+        }
+    }
+
     async fn process_eps_to_5gs_preparations(&mut self) {
         for prep in crate::n26_path::drain_eps_to_5gs_preparations() {
             let _ = self.start_eps_to_5gs_handover(prep).await;
@@ -11023,8 +11113,7 @@ pub struct InterSystemHandoverCommand {
     ///
     /// TS 33.501 §8.3.2 step 7 (`33501-k20.txt:11409-11412`) has the AMF put this in the
     /// HANDOVER COMMAND's `NAS Security Parameters from NG-RAN` IE so the UE can estimate the
-    /// COUNT and derive the same key. **It is computed and reported and not put on the wire**
-    /// — see [`inter_system_handover_command`] for the ceiling.
+    /// COUNT and derive the same key; `build_fivegs_to_eps_handover_command_asn1` does (#476).
     pub nas_count_lsb: u8,
 }
 
@@ -11048,19 +11137,14 @@ pub struct InterSystemHandoverCommand {
 /// (`n26_build::forward_relocation_indication`), and the two halves of the decision cannot
 /// disagree because each reads the other's reason rather than a duplicated flag.
 ///
-/// # Ceiling: the NAS Security Parameters from NG-RAN IE is NOT sent
+/// # The NAS Security Parameters from NG-RAN IE
 ///
 /// [`InterSystemHandoverCommand::nas_count_lsb`] is the octet TS 33.501 §8.3.2 step 7 requires
-/// the UE be given, and TS 38.413 §9.2.3.2 makes the IE that carries it `C-iftoEPSUTRA`
-/// (`38413-j30.txt:13181-13184`). §9.3.3.26 (`:29892-29910`) says it *"Refers to the N1 mode to
-/// S1 mode NAS transparent container IE"*, whose value part is a single `Sequence number` octet
-/// (TS 24.501 §9.11.2.7). The value is **computed and logged**; it is not encoded, because
-/// `build_handover_command` has no arm for IE 39 (`id-NASSecurityParametersFromNGRAN`,
-/// `38413-j30.txt:59511`) and adding one is an `nextgcore-ngap` change with its own codec
-/// tests. **Consequence, stated:** a real UE cannot estimate the downlink COUNT from this
-/// command and so cannot derive the same `K_ASME'`, which means the handover's NAS security does
-/// not interoperate even though the MME side is correct. That is the honest ceiling rather than
-/// a plausible octet encoded to look complete.
+/// the UE be given. TS 38.413 §9.2.3.2 makes the IE that carries it `C-iftoEPSUTRA`, and
+/// §9.3.3.26 says it *"Refers to the N1 mode to S1 mode NAS transparent container IE"*, whose
+/// value part is a single `Sequence number` octet (TS 24.501 §9.11.2.7).
+/// `build_fivegs_to_eps_handover_command_asn1` puts it on the wire (#476); before that it was
+/// computed and only logged, so a real UE could not derive the same `K_ASME'`.
 pub fn inter_system_handover_command(
     outcome: &crate::n26_path::ForwardRelocationOutcome,
 ) -> Option<InterSystemHandoverCommand> {
@@ -21084,5 +21168,161 @@ mod eps_to_5gs_tests {
 
         crate::sbi_path::set_pgw_discovery_nrf_for_test(None);
         restore_guami(previous_guami);
+    }
+}
+
+/// #476: the 5GS→EPS HANDOVER COMMAND reaches the source gNB, through N26 and the NGAP layer.
+#[cfg(test)]
+mod fivegs_to_eps_tests {
+    use super::*;
+    use nextgcore_gtp::v2::{
+        Gtp2BearerContextIe, Gtp2CauseIe, Gtp2FTeidIe, Gtp2Header, Gtp2Ie, Gtp2IeType, Gtp2Message,
+        Gtp2MessageType,
+    };
+    use std::time::Duration;
+
+    const UE: u64 = 1;
+    const RAN_UE: u32 = 42;
+    const SOURCE_ASSOC: u64 = 0x476;
+
+    /// A Forward Relocation Response (TS 29.274 §7.3.2) as an MME sends it.
+    fn response(seq: u32, cause: u8, f_container: Option<&[u8]>) -> Vec<u8> {
+        let mut msg = Gtp2Message::new(Gtp2Header::new(
+            Gtp2MessageType::ForwardRelocationResponse as u8,
+            0x0476_AAAA,
+            seq,
+        ));
+        msg.add_ie(Gtp2CauseIe::new(cause).to_ie(0));
+        if cause == 16 {
+            msg.add_ie(Gtp2FTeidIe::new_ipv4(12, 0x0476_BBBB, [127, 0, 0, 1]).to_ie(0));
+            let mut bearer = Gtp2BearerContextIe::new();
+            bearer.set_ebi(5);
+            msg.add_ie(bearer.to_ie(0));
+        }
+        if let Some(value) = f_container {
+            msg.add_ie(Gtp2Ie::from_slice(Gtp2IeType::FContainer as u8, 0, value));
+        }
+        msg.encode().to_vec()
+    }
+
+    /// Drive one Forward Relocation Response datagram into a real N26 socket and return the
+    /// PDU the NGAP layer would send to the source gNB, with its association.
+    async fn answer_for(f_container: Option<&[u8]>, cause: u8, seq: u32) -> (u64, Vec<u8>) {
+        crate::n26_path::clear_forward_relocation_state_for_test();
+        let _ = crate::n26_path::drain_fivegs_to_eps_answers();
+        crate::n26_path::record_pending_forward_relocation_for_test(
+            seq,
+            crate::n26_path::PendingForwardRelocation {
+                amf_ue_ngap_id: UE,
+                dl_count_used: 0x1234_56AB,
+            },
+        );
+        let n26 = crate::n26_path::N26Server::open("127.0.0.1:0".parse().unwrap(), 1)
+            .await
+            .expect("N26");
+        let mme = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        mme.send_to(&response(seq, cause, f_container), n26.local_addr())
+            .await
+            .unwrap();
+        let mut answers = Vec::new();
+        for _ in 0..100 {
+            answers = crate::n26_path::drain_fivegs_to_eps_answers();
+            if !answers.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            answers.len(),
+            1,
+            "the N26 leg hands exactly one answer to the NGAP layer"
+        );
+        let mut ngap = NgapServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            SctpBackend::Userspace,
+            mpsc::channel(64).0,
+        )
+        .await
+        .unwrap();
+        ngap.ue_auth_state
+            .insert(UE, UeNasContext::new(UE, RAN_UE, SOURCE_ASSOC, false));
+        ngap.fivegs_to_eps_answer_pdu(&answers[0])
+            .expect("the source gNB is answered")
+    }
+
+    /// TS 38.413 §9.2.3.2, derived octet by octet (APER, X.691) — not captured from the
+    /// encoder:
+    ///
+    /// ```text
+    /// 20          NGAP-PDU CHOICE ext 0, index 1 (successfulOutcome) in 2 bits
+    /// 0C          procedureCode 12, id-HandoverPreparation
+    /// 00          criticality reject (2 bits), padded
+    /// 21          open-type length 33
+    /// 00 00 05    HandoverCommand ext 0 (padded) | protocolIEs count 5
+    /// 00 0A 00 02 00 01        AMF-UE-NGAP-ID 1: 3-bit length-1 = 0, then 01
+    /// 00 55 00 02 00 2A        RAN-UE-NGAP-ID 42: 2-bit length-1 = 0, then 2A
+    /// 00 1D 00 01 20           HandoverType ext 0 | fivegs-to-eps = 1 in 2 bits
+    /// 00 27 00 02 01 AB        NASSecurityParametersFromNGRAN: length 1, 0xAB (COUNT LSB)
+    /// 00 6A 00 03 02 C0 FE     TargetToSource container: length 2, C0 FE
+    /// ```
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn an_accepted_5gs_to_eps_relocation_sends_the_handover_command() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_support::init_context();
+        let (assoc, pdu) = answer_for(Some(&[0x03, 0xC0, 0xFE]), 16, 0x4761).await;
+        assert_eq!(assoc, SOURCE_ASSOC, "to the source gNB's association");
+        assert_eq!(
+            pdu,
+            [
+                0x20, 0x0C, 0x00, 0x21, 0x00, 0x00, 0x05, 0x00, 0x0A, 0x00, 0x02, 0x00, 0x01, 0x00,
+                0x55, 0x00, 0x02, 0x00, 0x2A, 0x00, 0x1D, 0x00, 0x01, 0x20, 0x00, 0x27, 0x00, 0x02,
+                0x01, 0xAB, 0x00, 0x6A, 0x00, 0x03, 0x02, 0xC0, 0xFE,
+            ],
+            "the HandoverCommand, with the Container Type octet stripped from the container"
+        );
+        // And the generated codec reads it as a fivegs-to-eps HandoverCommand.
+        let nextgcore_ngap_gen::NGAP_PDU::SuccessfulOutcome(out) =
+            nextgcore_ngap_gen::decode(&pdu).unwrap()
+        else {
+            panic!("a successful outcome");
+        };
+        assert_eq!(
+            out.procedure_code.0,
+            nextgcore_ngap_gen::generated::ID_HANDOVER_PREPARATION
+        );
+    }
+
+    /// A refusal, and an accept whose F-Container is not Container Type 3, each answer the
+    /// source gNB with a HANDOVER PREPARATION FAILURE rather than leaving it on T304.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_refused_or_malformed_relocation_answers_a_preparation_failure() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_support::init_context();
+        for (cause, container, seq) in [
+            (64u8, None, 0x4762u32),
+            (16, Some(&[0x01, 0xC0, 0xFE][..]), 0x4763),
+            (16, Some(&[0x03][..]), 0x4764),
+        ] {
+            let (assoc, pdu) = answer_for(container, cause, seq).await;
+            assert_eq!(assoc, SOURCE_ASSOC);
+            match nextgcore_ngap::parser::decode_ngap_pdu(&pdu).unwrap() {
+                nextgcore_ngap::NgapMessage::HandoverPreparationFailure(f) => {
+                    assert_eq!((f.amf_ue_ngap_id, f.ran_ue_ngap_id), (UE, RAN_UE));
+                    assert_eq!(
+                        f.cause,
+                        nextgcore_ngap::types::Cause::RadioNetwork(
+                            nextgcore_asn1c::ngap::cause::CauseRadioNetwork::HoFailureInTarget5gcNgranNodeOrTargetSystem
+                        )
+                    );
+                }
+                other => panic!("cause {cause}, container {container:?}: {other:?}"),
+            }
+        }
     }
 }
