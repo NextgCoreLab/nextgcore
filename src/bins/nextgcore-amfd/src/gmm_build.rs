@@ -743,6 +743,24 @@ pub fn build_service_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
     Some(nextgcore_msg::build_5gmm_message(&msg).to_vec())
 }
 
+/// SERVICE ACCEPT for a Service Request from CM-IDLE (#518, TS 24.501 §8.2.17):
+/// `pdu_session_status` is the AMF's view after the request's local releases
+/// (included when the UE sent its own), `reactivation_result` has bit n set for a
+/// PSI whose user plane could not be re-activated (§9.11.3.42, included when the
+/// UE sent an Uplink data status).
+pub fn build_service_accept_for_sessions(
+    pdu_session_status: Option<u16>,
+    reactivation_result: Option<u16>,
+) -> Vec<u8> {
+    let msg = nextgcore_msg::FiveGmmMessage::ServiceAccept(nextgcore_msg::ServiceAccept {
+        pdu_session_status: pdu_session_status.map(|psi| PduSessionStatus { length: 2, psi }),
+        pdu_session_reactivation_result: reactivation_result,
+        eap_message: None,
+        t3448_value: None,
+    });
+    nextgcore_msg::build_5gmm_message(&msg).to_vec()
+}
+
 /// Build Service Reject message (TS 24.501 Section 8.2.18).
 ///
 /// nas-06 Phase 2 (Tier C): encoded via nextgcore-nas. Byte-identical to the prior hand-
@@ -1930,6 +1948,22 @@ mod tests {
         assert_eq!(msg[0], NEXTGCORE_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
         assert_eq!(msg[2], message_type::SERVICE_REJECT);
         assert_eq!(msg[3], GmmCause::Congestion as u8);
+    }
+
+    /// #518: TS 24.501 §8.2.17 SERVICE ACCEPT with PDU session status (IEI 0x50,
+    /// §9.11.3.44) and PDU session reactivation result (IEI 0x26, §9.11.3.42),
+    /// derived by hand: header 7E 00 4E (Service accept, Table 9.7.1); PSI 5 active = bit 5 of octet 3 -> 20 00;
+    /// PSI 9 failed = bit 1 of octet 4 -> 00 02.
+    #[test]
+    fn a_service_accept_reports_session_status_and_reactivation_result() {
+        assert_eq!(
+            build_service_accept_for_sessions(Some(1 << 5), Some(1 << 9)),
+            vec![0x7E, 0x00, 0x4E, 0x50, 0x02, 0x20, 0x00, 0x26, 0x02, 0x00, 0x02]
+        );
+        assert_eq!(
+            build_service_accept_for_sessions(None, None),
+            vec![0x7E, 0x00, 0x4E]
+        );
     }
 
     #[test]
