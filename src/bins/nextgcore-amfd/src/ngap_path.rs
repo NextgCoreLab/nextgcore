@@ -88,6 +88,18 @@ impl SctpBackend {
 // (there is never a collection of these), so the userspace/kernel size delta is
 // irrelevant — boxing the proven userspace variant would only add indirection.
 #[allow(clippy::large_enum_variant)]
+/// What [`NgapServer::modify_indication_answer`] decided to send back for a
+/// PDU Session Resource Modify Indication (TS 38.413 §8.2.4, §10.3.4.2).
+#[derive(Debug)]
+enum ModifyIndicationAnswer {
+    /// The PDU Session Resource Modify Confirm to send.
+    Confirm(Vec<u8>),
+    /// The procedure was rejected: report it in an Error Indication.
+    ErrorIndication(crate::ngap_asn1::CriticalityErrorIndication),
+    /// Undecodable, or the Confirm could not be built: nothing to send.
+    Nothing,
+}
+
 enum NgapTransport {
     Userspace(SctpServer),
     #[cfg(feature = "kernel-sctp")]
@@ -8856,6 +8868,11 @@ impl NgapServer {
                 .relay_n2_sm_to_smf(
                     notify.amf_ue_ngap_id,
                     pdu_session_id,
+                    // #525: the target's HandoverRequestAcknowledgeTransfer, which the
+                    // SMF's HANDOVER_COMPLETE arm decodes for the target DL tunnel; it
+                    // used to go out as PDU_RES_SETUP_RSP and be decoded as a Setup
+                    // Response Transfer, a different structure.
+                    "HANDOVER_COMPLETE",
                     &transfer,
                     "HandoverNotify",
                 )
@@ -10219,10 +10236,56 @@ impl NgapServer {
         }
     }
 
+    /// Relay an N2 SM container with `n2_sm_info_type` and return the SMF's
+    /// answer as `(n2SmInfoType, n2SmInfo)`; `None` when there is no SM context
+    /// or the SMF call fails. Unlike [`Self::relay_n2_sm_to_smf_for_answer`], the
+    /// answer's type comes back too, because a Modify Indication's answer is
+    /// either a Confirm Transfer or an Unsuccessful Transfer (#525).
+    async fn relay_n2_sm_to_smf_with_answer(
+        &self,
+        amf_ue_ngap_id: u64,
+        pdu_session_id: u8,
+        n2_sm_info_type: &str,
+        transfer: &[u8],
+        context: &str,
+    ) -> Option<(Option<String>, Vec<u8>)> {
+        let Some(sm_context_ref) = self
+            .sm_context_refs
+            .get(&(amf_ue_ngap_id, pdu_session_id))
+            .cloned()
+        else {
+            log::error!(
+                "{context}: no SM context ref stored for UE {amf_ue_ngap_id} PSI \
+                 {pdu_session_id}"
+            );
+            return None;
+        };
+        let (host, port) = Self::smf_sbi_target();
+        match crate::sbi_path::call_smf_update_sm_context_n2(
+            &host,
+            port,
+            &sm_context_ref,
+            n2_sm_info_type,
+            transfer,
+        )
+        .await
+        {
+            Ok(resp) => Some((resp.n2_sm_info_type, resp.n2_sm_info)),
+            Err(e) => {
+                log::warn!(
+                    "{context}: SMF update ({n2_sm_info_type}) for UE {amf_ue_ngap_id} PSI \
+                     {pdu_session_id} (ref={sm_context_ref}) failed: {e}"
+                );
+                None
+            }
+        }
+    }
+
     async fn relay_n2_sm_to_smf(
         &self,
         amf_ue_ngap_id: u64,
         pdu_session_id: u8,
+        n2_sm_info_type: &str,
         transfer: &[u8],
         context: &str,
     ) -> bool {
@@ -10245,10 +10308,17 @@ impl NgapServer {
         let (host, port) = Self::smf_sbi_target();
         // The container is forwarded opaquely: the AMF never re-encodes N2 SM
         // information (TS 23.502).
-        match crate::sbi_path::call_smf_update_sm_context(&host, port, &sm_context_ref, transfer)
-            .await
+        // Each container with its own n2SmInfoType (TS 29.502 §6.1.6.3.12, #525).
+        match crate::sbi_path::call_smf_update_sm_context_n2(
+            &host,
+            port,
+            &sm_context_ref,
+            n2_sm_info_type,
+            transfer,
+        )
+        .await
         {
-            Ok(()) => {
+            Ok(_) => {
                 log::info!(
                     "{context}: relayed {} N2 SM bytes for UE {amf_ue_ngap_id} PSI \
                      {pdu_session_id} to SMF ref={sm_context_ref}",
@@ -10382,6 +10452,7 @@ impl NgapServer {
                 .relay_n2_sm_to_smf(
                     amf_ue_ngap_id,
                     item.pdu_session_id,
+                    "PDU_RES_SETUP_RSP",
                     &item.transfer,
                     "PDUSessionResourceSetupResponse",
                 )
@@ -10405,6 +10476,7 @@ impl NgapServer {
             self.relay_n2_sm_to_smf(
                 amf_ue_ngap_id,
                 item.pdu_session_id,
+                "PDU_RES_SETUP_FAIL",
                 &item.transfer,
                 "PDUSessionResourceSetupResponse (failed-to-setup)",
             )
@@ -10432,55 +10504,96 @@ impl NgapServer {
     /// Handle a PDU SESSION RESOURCE MODIFY RESPONSE (TS 38.413 §8.2.2).
     ///
     /// Each modified session carries an N2 SM Modify Response Transfer the SMF
-    /// must see to complete the modification. This used to log
-    /// "Modification confirmed by gNB - no further action needed" and drop it, so
-    /// the SMF's modification never completed: it kept the pre-modification QoS
-    /// while the gNB had already applied the new one.
+    /// must see to complete the modification, and each failed one a Modify
+    /// Unsuccessful Transfer; each is relayed with its own n2SmInfoType
+    /// (`PDU_RES_MOD_RSP` / `PDU_RES_MOD_FAIL`, #525) -- both used to reach the
+    /// SMF labelled `PDU_RES_SETUP_RSP`.
+    ///
+    /// Decoded with the generated codec (#417), which applies the §10.3.4.2 rules
+    /// for a RESPONSE: "ignore IE and notify sender" is reported in an Error
+    /// Indication and the transfers are relayed all the same; "reject"
+    /// terminates the procedure unsuccessfully, handled locally.
     async fn handle_pdu_session_resource_modify_response(
         &mut self,
         association_id: u64,
         data: &[u8],
     ) -> Result<()> {
-        let resp = match nextgcore_ngap::parser::decode_ngap_pdu(data) {
-            Ok(nextgcore_ngap::NgapMessage::PduSessionResourceModifyResponse(r)) => r,
-            Ok(other) => {
-                log::warn!("Expected PduSessionResourceModifyResponse, got {other:?}");
-                return Ok(());
-            }
-            Err(e) => {
-                log::warn!(
-                    "Failed to decode PDU Session Resource Modify Response from \
-                     association {association_id}: {e:?}"
-                );
-                return Ok(());
-            }
+        use crate::ngap_asn1::PduSessionResourceModifyResponseDecode::{
+            Decoded, Failed, Undecodable,
+        };
+        let (amf_ue_ngap_id, modified, failed) =
+            match crate::ngap_asn1::decode_pdu_session_resource_modify_response_asn1(data) {
+                Decoded {
+                    amf_ue_ngap_id,
+                    modified,
+                    failed,
+                    error_indication,
+                    ..
+                } => {
+                    if let Some(report) = error_indication {
+                        if let Err(e) = self
+                            .send_criticality_error_indication(association_id, &report)
+                            .await
+                        {
+                            log::warn!("Failed to send ErrorIndication: {e}");
+                        }
+                    }
+                    (amf_ue_ngap_id, modified, failed)
+                }
+                Failed(diagnostics) => {
+                    log::warn!(
+                        "PDU Session Resource Modify Response from association \
+                         {association_id} carries not-comprehended IEs marked reject \
+                         ({diagnostics:?}); the procedure is unsuccessfully terminated \
+                         (TS 38.413 §10.3.4.2), handled locally"
+                    );
+                    return Ok(());
+                }
+                Undecodable => {
+                    log::warn!(
+                        "Failed to decode PDU Session Resource Modify Response from \
+                         association {association_id}"
+                    );
+                    return Ok(());
+                }
+            };
+        // Criticality ignore, so its absence is ignored (§10.3.5) -- but it names
+        // the UE whose SM contexts the transfers belong to.
+        let Some(amf_ue_ngap_id) = amf_ue_ngap_id else {
+            log::warn!(
+                "PDU Session Resource Modify Response from association {association_id} \
+                 names no AMF UE NGAP ID; {} transfers cannot be relayed",
+                modified.len() + failed.len()
+            );
+            return Ok(());
         };
 
         log::info!(
             "PDU Session Resource Modify Response from association {association_id}: \
-             UE {}, modified={}, failed={}",
-            resp.amf_ue_ngap_id,
-            resp.modify_list.len(),
-            resp.failed_list.len()
+             UE {amf_ue_ngap_id}, modified={}, failed={}",
+            modified.len(),
+            failed.len()
         );
 
-        for item in &resp.modify_list {
+        for item in &modified {
             self.relay_n2_sm_to_smf(
-                resp.amf_ue_ngap_id,
+                amf_ue_ngap_id,
                 item.pdu_session_id,
+                "PDU_RES_MOD_RSP",
                 &item.transfer,
                 "PDUSessionResourceModifyResponse",
             )
             .await;
         }
-        for item in &resp.failed_list {
+        for item in &failed {
             log::warn!(
                 "gNB failed to modify PSI={}; relaying the failure to the SMF",
                 item.pdu_session_id
             );
             self.relay_n2_sm_to_smf(
-                resp.amf_ue_ngap_id,
+                amf_ue_ngap_id,
                 item.pdu_session_id,
+                "PDU_RES_MOD_FAIL",
                 &item.transfer,
                 "PDUSessionResourceModifyResponse (failed-to-modify)",
             )
@@ -10577,6 +10690,7 @@ impl NgapServer {
             self.relay_n2_sm_to_smf(
                 amf_ue_ngap_id,
                 item.pdu_session_id,
+                "PDU_RES_REL_RSP",
                 &item.transfer,
                 "PDUSessionResourceReleaseResponse",
             )
@@ -10587,45 +10701,140 @@ impl NgapServer {
 
     /// Handle a PDU SESSION RESOURCE MODIFY INDICATION (TS 38.413 §8.2.4).
     ///
-    /// A gNB-initiated modification request. The per-session Modify Indication
-    /// Transfer must reach the SMF, which owns the decision.
+    /// A gNB-initiated modification (TS 23.502 §4.3.3.2, AN-initiated). Class 1:
+    /// the AMF must answer with a PDU SESSION RESOURCE MODIFY CONFIRM. Each
+    /// session's Modify Indication Transfer goes to the SMF as `PDU_RES_MOD_IND`,
+    /// and the SMF's answer -- a Modify Confirm Transfer (`PDU_RES_MOD_CFM`) or a
+    /// Modify Indication Unsuccessful Transfer (`PDU_RES_MOD_IND_FAIL`) -- goes
+    /// back in the Confirm's modified or failed list. Before #525 the indication
+    /// was relayed labelled `PDU_RES_SETUP_RSP` and never answered at all.
+    ///
+    /// Decoded with the generated codec (#417) under §10.3.4.2: "notify" IEs are
+    /// reported in the Confirm's Criticality Diagnostics; "reject", or a missing
+    /// mandatory IE, stops the procedure with an Error Indication (there is no
+    /// unsuccessful outcome).
     async fn handle_pdu_session_resource_modify_indication(
         &mut self,
         association_id: u64,
         data: &[u8],
     ) -> Result<()> {
-        let ind = match nextgcore_ngap::parser::decode_ngap_pdu(data) {
-            Ok(nextgcore_ngap::NgapMessage::PduSessionResourceModifyIndication(i)) => i,
-            Ok(other) => {
-                log::warn!("Expected PduSessionResourceModifyIndication, got {other:?}");
-                return Ok(());
-            }
-            Err(e) => {
-                log::warn!(
-                    "Failed to decode PDU Session Resource Modify Indication from \
-                     association {association_id}: {e:?}"
+        match self.modify_indication_answer(data).await {
+            ModifyIndicationAnswer::Confirm(bytes) => {
+                self.send_to_association(association_id, &bytes).await?;
+                log::info!(
+                    "PDU Session Resource Modify Confirm sent to association {association_id}"
                 );
-                return Ok(());
+                Ok(())
             }
+            ModifyIndicationAnswer::ErrorIndication(report) => {
+                self.send_criticality_error_indication(association_id, &report)
+                    .await
+            }
+            ModifyIndicationAnswer::Nothing => Ok(()),
+        }
+    }
+
+    /// The answer to a PDU Session Resource Modify Indication: relay each
+    /// session to the SMF and build the Modify Confirm from what it says. Split
+    /// from the handler so the Confirm's content is testable without a gNB to
+    /// send it to.
+    async fn modify_indication_answer(&mut self, data: &[u8]) -> ModifyIndicationAnswer {
+        use crate::ngap_asn1::PduSessionResourceModifyIndicationDecode::{
+            Proceed, Reject, Undecodable,
         };
+        let (amf_ue_ngap_id, ran_ue_ngap_id, sessions, notify) =
+            match crate::ngap_asn1::decode_pdu_session_resource_modify_indication_asn1(data) {
+                Proceed {
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    sessions,
+                    notify,
+                } => (amf_ue_ngap_id, ran_ue_ngap_id, sessions, notify),
+                Reject(report) => return ModifyIndicationAnswer::ErrorIndication(report),
+                Undecodable => {
+                    log::warn!("Failed to decode PDU Session Resource Modify Indication");
+                    return ModifyIndicationAnswer::Nothing;
+                }
+            };
 
         log::info!(
-            "PDU Session Resource Modify Indication from association {association_id}: \
-             UE {}, {} sessions",
-            ind.amf_ue_ngap_id,
-            ind.modify_list.len()
+            "PDU Session Resource Modify Indication: UE {amf_ue_ngap_id}, {} sessions",
+            sessions.len()
         );
 
-        for item in &ind.modify_list {
-            self.relay_n2_sm_to_smf(
-                ind.amf_ue_ngap_id,
-                item.pdu_session_id,
-                &item.transfer,
-                "PDUSessionResourceModifyIndication",
-            )
-            .await;
+        let mut confirmed = Vec::new();
+        let mut failed = Vec::new();
+        for item in &sessions {
+            match self
+                .relay_n2_sm_to_smf_with_answer(
+                    amf_ue_ngap_id,
+                    item.pdu_session_id,
+                    "PDU_RES_MOD_IND",
+                    &item.transfer,
+                    "PDUSessionResourceModifyIndication",
+                )
+                .await
+            {
+                Some((Some(t), n2)) if t == "PDU_RES_MOD_CFM" && !n2.is_empty() => {
+                    confirmed.push(crate::ngap_asn1::ModifyPduSession {
+                        pdu_session_id: item.pdu_session_id,
+                        transfer: n2,
+                    });
+                }
+                Some((Some(t), n2)) if t == "PDU_RES_MOD_IND_FAIL" && !n2.is_empty() => {
+                    failed.push(crate::ngap_asn1::ModifyPduSession {
+                        pdu_session_id: item.pdu_session_id,
+                        transfer: n2,
+                    });
+                }
+                other => {
+                    // No usable answer (no SM context, SMF unreachable or refusing,
+                    // or no transfer): the gNB is told this session's modification
+                    // failed rather than left without an entry for it.
+                    log::warn!(
+                        "PDUSessionResourceModifyIndication: no Modify Confirm Transfer \
+                         from the SMF for UE {amf_ue_ngap_id} PSI {} ({:?}); reporting it \
+                         failed",
+                        item.pdu_session_id,
+                        other.as_ref().map(|(t, n2)| (t.clone(), n2.len()))
+                    );
+                    if let Some(transfer) =
+                        crate::ngap_asn1::modify_indication_unsuccessful_transfer(
+                            nextgcore_ngap::types::Cause::Misc(
+                                nextgcore_asn1c::ngap::cause::CauseMisc::Unspecified,
+                            ),
+                        )
+                    {
+                        failed.push(crate::ngap_asn1::ModifyPduSession {
+                            pdu_session_id: item.pdu_session_id,
+                            transfer,
+                        });
+                    }
+                }
+            }
         }
-        Ok(())
+
+        match crate::ngap_asn1::build_pdu_session_resource_modify_confirm_asn1(
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            &confirmed,
+            &failed,
+            &notify,
+        ) {
+            Some(bytes) => {
+                log::info!(
+                    "PDU Session Resource Modify Confirm for UE {amf_ue_ngap_id}: \
+                     confirmed={}, failed={}",
+                    confirmed.len(),
+                    failed.len()
+                );
+                ModifyIndicationAnswer::Confirm(bytes)
+            }
+            None => {
+                log::error!("Failed to build PDU Session Resource Modify Confirm");
+                ModifyIndicationAnswer::Nothing
+            }
+        }
     }
 
     /// Handle a PDU SESSION RESOURCE NOTIFY (TS 38.413 §8.2.5).
@@ -10665,6 +10874,7 @@ impl NgapServer {
             self.relay_n2_sm_to_smf(
                 notify.amf_ue_ngap_id,
                 item.pdu_session_id,
+                "PDU_RES_NTY",
                 &item.transfer,
                 "PDUSessionResourceNotify",
             )
@@ -10674,6 +10884,7 @@ impl NgapServer {
             self.relay_n2_sm_to_smf(
                 notify.amf_ue_ngap_id,
                 item.pdu_session_id,
+                "PDU_RES_NTY_REL",
                 &item.transfer,
                 "PDUSessionResourceNotify (released)",
             )
@@ -16573,6 +16784,313 @@ mod tests {
         (server, addr.port(), seen)
     }
 
+    /// One N2 SM relay as [`fake_smf_typed`] saw it: the SM context ref, the
+    /// `n2SmInfoType`, and the `n2SmInfo` octets.
+    type TypedRelay = (String, String, Vec<u8>);
+
+    /// The Modify Confirm Transfer octets [`fake_smf_typed`] answers a
+    /// `PDU_RES_MOD_IND` with, so a test can find them in the Confirm.
+    const FAKE_MOD_CFM_TRANSFER: [u8; 3] = [0xc0, 0xff, 0xee];
+    /// ... and the Unsuccessful Transfer octets it answers for `ref-ind-fail`.
+    const FAKE_MOD_IND_FAIL_TRANSFER: [u8; 2] = [0x0f, 0xa1];
+
+    /// A fake SMF recording each N2 SM relay with its `n2SmInfoType` (#525), and
+    /// answering `PDU_RES_MOD_IND` as an SMF does: `PDU_RES_MOD_CFM` with a
+    /// Confirm Transfer, or `PDU_RES_MOD_IND_FAIL` for the ref `ref-ind-fail`.
+    /// Every other request gets `204 No Content`.
+    async fn fake_smf_typed() -> (
+        nextgcore_sbi::server::SbiServer,
+        u16,
+        Arc<std::sync::Mutex<Vec<TypedRelay>>>,
+    ) {
+        use base64::Engine as _;
+        use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+        use nextgcore_sbi::server::{SbiServer as NSbiServer, SbiServerConfig as NSbiCfg};
+
+        let seen: Arc<std::sync::Mutex<Vec<TypedRelay>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let (addr_listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = NSbiServer::on_listener(NSbiCfg::new(addr), addr_listener);
+        server
+            .start(move |req: SReq| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    let sm_ref = req
+                        .header
+                        .uri
+                        .split("/sm-contexts/")
+                        .nth(1)
+                        .and_then(|rest| rest.split('/').next())
+                        .unwrap_or_default()
+                        .to_string();
+                    let body: serde_json::Value = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|c| serde_json::from_str(c).ok())
+                        .unwrap_or_default();
+                    let n2_type = body["n2SmInfoType"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    let n2 = req
+                        .http
+                        .parts
+                        .iter()
+                        .find(|p| p.content_id.as_deref() == Some("n2SmInfo"))
+                        .map(|p| p.data.to_vec())
+                        .unwrap_or_default();
+                    sink.lock()
+                        .expect("sink")
+                        .push((sm_ref.clone(), n2_type.clone(), n2));
+                    if n2_type != "PDU_RES_MOD_IND" {
+                        return SResp::no_content();
+                    }
+                    let (answer_type, transfer) = if sm_ref == "ref-ind-fail" {
+                        ("PDU_RES_MOD_IND_FAIL", &FAKE_MOD_IND_FAIL_TRANSFER[..])
+                    } else {
+                        ("PDU_RES_MOD_CFM", &FAKE_MOD_CFM_TRANSFER[..])
+                    };
+                    let answer = serde_json::json!({
+                        "n2SmInfoType": answer_type,
+                        "n2SmInfo": base64::engine::general_purpose::STANDARD.encode(transfer),
+                    });
+                    SResp::with_status(200).with_body(answer.to_string(), "application/json")
+                }
+            })
+            .await
+            .expect("fake SMF starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (server, addr.port(), seen)
+    }
+
+    /// #525: every N2 SM container reaches the SMF labelled with ITS OWN
+    /// `n2SmInfoType` (TS 29.502 §6.1.6.3.12). Before, all of them went out as
+    /// `PDU_RES_SETUP_RSP`, so the SMF decoded a Modify Response, a Notify or a
+    /// Release Response as a Setup Response Transfer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn every_n2_sm_container_is_relayed_with_its_own_n2_sm_info_type() {
+        let (_smf, port, seen) = fake_smf_typed().await;
+        let _env = SmfEnvGuard::set(port);
+
+        let mut server = test_ngap_server().await;
+        let ue = 79_525u64;
+        for (psi, r) in [
+            (1u8, "ref-setup-fail"),
+            (2, "ref-mod"),
+            (3, "ref-mod-fail"),
+            (4, "ref-rel"),
+            (5, "ref-nty"),
+            (6, "ref-nty-rel"),
+        ] {
+            server.sm_context_refs.insert((ue, psi), r.to_string());
+        }
+        use nextgcore_ngap::{builder as b, types as t};
+
+        let setup =
+            b::build_pdu_session_resource_setup_response(&t::PduSessionResourceSetupResponse {
+                amf_ue_ngap_id: ue,
+                ran_ue_ngap_id: 1,
+                setup_list: vec![],
+                failed_list: vec![t::PduSessionResourceFailedItem {
+                    pdu_session_id: 1,
+                    transfer: vec![0x11],
+                }],
+            })
+            .expect("setup response");
+        server
+            .handle_pdu_session_resource_setup_response(9525, &setup)
+            .await
+            .expect("handled");
+
+        let modify =
+            b::build_pdu_session_resource_modify_response(&t::PduSessionResourceModifyResponse {
+                amf_ue_ngap_id: ue,
+                ran_ue_ngap_id: 1,
+                modify_list: vec![t::PduSessionResourceModifyResponseItem {
+                    pdu_session_id: 2,
+                    transfer: vec![0x21],
+                }],
+                failed_list: vec![t::PduSessionResourceFailedItem {
+                    pdu_session_id: 3,
+                    transfer: vec![0x31],
+                }],
+            })
+            .expect("modify response");
+        server
+            .handle_pdu_session_resource_modify_response(9525, &modify)
+            .await
+            .expect("handled");
+
+        let release =
+            b::build_pdu_session_resource_release_response(&t::PduSessionResourceReleaseResponse {
+                amf_ue_ngap_id: ue,
+                ran_ue_ngap_id: 1,
+                released_list: vec![t::PduSessionResourceReleasedItem {
+                    pdu_session_id: 4,
+                    transfer: vec![0x41],
+                }],
+            })
+            .expect("release response");
+        server
+            .handle_pdu_session_resource_release_response(9525, &release)
+            .await
+            .expect("handled");
+
+        let notify = b::build_pdu_session_resource_notify(&t::PduSessionResourceNotify {
+            amf_ue_ngap_id: ue,
+            ran_ue_ngap_id: 1,
+            notify_list: vec![t::PduSessionResourceNotifyItem {
+                pdu_session_id: 5,
+                transfer: vec![0x51],
+            }],
+            released_list: vec![t::PduSessionResourceReleasedItem {
+                pdu_session_id: 6,
+                transfer: vec![0x61],
+            }],
+        })
+        .expect("notify");
+        server
+            .handle_pdu_session_resource_notify(9525, &notify)
+            .await
+            .expect("handled");
+
+        let calls = seen.lock().expect("seen").clone();
+        let typed: Vec<(&str, &str)> = calls
+            .iter()
+            .map(|(r, ty, _)| (r.as_str(), ty.as_str()))
+            .collect();
+        assert_eq!(
+            typed,
+            vec![
+                ("ref-setup-fail", "PDU_RES_SETUP_FAIL"),
+                ("ref-mod", "PDU_RES_MOD_RSP"),
+                ("ref-mod-fail", "PDU_RES_MOD_FAIL"),
+                ("ref-rel", "PDU_RES_REL_RSP"),
+                ("ref-nty", "PDU_RES_NTY"),
+                ("ref-nty-rel", "PDU_RES_NTY_REL"),
+            ],
+            "{calls:?}"
+        );
+    }
+
+    /// #525 / TS 38.413 §8.2.4: a Modify Indication is answered with a Modify
+    /// Confirm carrying, per session, the SMF's Confirm Transfer (modified list)
+    /// or its Unsuccessful Transfer (failed list); a session the SMF has no
+    /// context for is reported failed with an Unsuccessful Transfer the AMF
+    /// builds. Before #525 the AMF never answered at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_modify_indication_is_answered_with_a_modify_confirm() {
+        use nextgcore_ngap_gen::generated as ngap_gen_t;
+        use ngap_gen_t::{
+            PDUSessionResourceModifyConfirmProtocolIEs_EntryValue as Ie, SuccessfulOutcomeValue,
+        };
+
+        let (_smf, port, seen) = fake_smf_typed().await;
+        let _env = SmfEnvGuard::set(port);
+        let mut server = test_ngap_server().await;
+        let ue = 79_526u64;
+        server
+            .sm_context_refs
+            .insert((ue, 2), "ref-ind-ok".to_string());
+        server
+            .sm_context_refs
+            .insert((ue, 3), "ref-ind-fail".to_string());
+        // PSI 4: no SM context at all.
+
+        let indication = crate::ngap_asn1::tests::modify_indication_bytes(
+            ue,
+            7,
+            &[(2, vec![0x21]), (3, vec![0x31]), (4, vec![0x41])],
+        );
+        let ModifyIndicationAnswer::Confirm(bytes) =
+            server.modify_indication_answer(&indication).await
+        else {
+            panic!("a Modify Indication must be answered with a Modify Confirm");
+        };
+
+        let relayed: Vec<(String, String, Vec<u8>)> = seen.lock().expect("seen").clone();
+        assert_eq!(
+            relayed,
+            vec![
+                (
+                    "ref-ind-ok".to_string(),
+                    "PDU_RES_MOD_IND".to_string(),
+                    vec![0x21]
+                ),
+                (
+                    "ref-ind-fail".to_string(),
+                    "PDU_RES_MOD_IND".to_string(),
+                    vec![0x31]
+                ),
+            ]
+        );
+
+        let pdu = nextgcore_ngap_gen::decode(&bytes).expect("the Confirm decodes");
+        let nextgcore_ngap_gen::NGAP_PDU::SuccessfulOutcome(out) = pdu else {
+            panic!("a Modify Confirm is a successful outcome");
+        };
+        assert_eq!(
+            out.procedure_code.0,
+            ngap_gen_t::ID_PDU_SESSION_RESOURCE_MODIFY_INDICATION
+        );
+        let SuccessfulOutcomeValue::Id_PDUSessionResourceModifyIndication(confirm) = out.value
+        else {
+            panic!("not a PDU Session Resource Modify Confirm");
+        };
+        let mut ids = (None, None);
+        let mut modified = Vec::new();
+        let mut failed = Vec::new();
+        for e in confirm.protocol_i_es.0 {
+            match e.value {
+                Ie::Id_AMF_UE_NGAP_ID(v) => ids.0 = Some(v.0),
+                Ie::Id_RAN_UE_NGAP_ID(v) => ids.1 = Some(v.0),
+                Ie::Id_PDUSessionResourceModifyListModCfm(l) => {
+                    modified =
+                        l.0.into_iter()
+                            .map(|i| {
+                                (
+                                    i.pdu_session_id.0,
+                                    i.pdu_session_resource_modify_confirm_transfer.0,
+                                )
+                            })
+                            .collect()
+                }
+                Ie::Id_PDUSessionResourceFailedToModifyListModCfm(l) => {
+                    failed =
+                        l.0.into_iter()
+                            .map(|i| {
+                                (
+                                    i.pdu_session_id.0,
+                                    i.pdu_session_resource_modify_indication_unsuccessful_transfer
+                                        .0,
+                                )
+                            })
+                            .collect()
+                }
+                Ie::Id_CriticalityDiagnostics(_) => panic!("nothing to report"),
+            }
+        }
+        assert_eq!(ids, (Some(ue), Some(7)));
+        assert_eq!(modified, vec![(2, FAKE_MOD_CFM_TRANSFER.to_vec())]);
+        let own_failure = crate::ngap_asn1::modify_indication_unsuccessful_transfer(
+            nextgcore_ngap::types::Cause::Misc(
+                nextgcore_asn1c::ngap::cause::CauseMisc::Unspecified,
+            ),
+        )
+        .expect("unsuccessful transfer");
+        assert_eq!(
+            failed,
+            vec![(3, FAKE_MOD_IND_FAIL_TRANSFER.to_vec()), (4, own_failure),]
+        );
+    }
+
     /// A fake SMF that answers `Nsmf_PDUSession_CreateSMContext` with a body
     /// `call_smf_create_sm_context` can parse.
     ///
@@ -17218,10 +17736,9 @@ mod tests {
             },
         )
         .expect("build modify indication");
-        server
-            .handle_pdu_session_resource_modify_indication(9401, &indication)
-            .await
-            .expect("handled");
+        // Class 1 since #525: the handler now answers with a Modify Confirm, and
+        // this test's association does not exist, so drive the answer directly.
+        let _ = server.modify_indication_answer(&indication).await;
 
         let calls = seen.lock().expect("seen").clone();
         assert_eq!(
