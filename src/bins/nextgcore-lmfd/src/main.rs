@@ -6965,7 +6965,7 @@ mod positioning_chain_strict_peer {
                 .read()
                 .unwrap()
                 .report_find(request_id)
-                .map_or(true, |r| r.cell_measurements.is_empty()),
+                .is_none_or(|r| r.cell_measurements.is_empty()),
             "a report TS 38.413 §10.3.4.2 says to reject must contribute no measurement"
         );
 
