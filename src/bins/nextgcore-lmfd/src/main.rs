@@ -31,9 +31,10 @@ mod context;
 mod namf_client;
 mod nlmf;
 mod nrppa_downlink; // #103: LMF-initiated NRPPa toward NG-RAN
-                    // lmfd-08: real multilateration solvers (ECID / Multi-RTT / TDOA / AoA).
-                    // Wired into `context::compute_location`; solve_tdoa remains available for
-                    // lmfd-05/06 (NRPPa TDOA) but is not yet called (dead_code = "allow").
+mod nrppa_uplink; // #515: E-CID Measurement Report on the generated codec, TS 38.455 §10
+                  // lmfd-08: real multilateration solvers (ECID / Multi-RTT / TDOA / AoA).
+                  // Wired into `context::compute_location`; solve_tdoa remains available for
+                  // lmfd-05/06 (NRPPa TDOA) but is not yet called (dead_code = "allow").
 mod positioning;
 mod site_config; // #103: cell/TRP coordinates from configuration
 
@@ -920,6 +921,15 @@ async fn initiate_positioning(
     if nrppa_downlink::enabled() {
         match nrppa_downlink::build_ecid_measurement_initiation(NRPPA_UE_MEASUREMENT_ID) {
             Ok((nrppa_txn, nrppa_pdu)) => {
+                if let Ok(context) = lmf_self().read() {
+                    context.positioning_session_set_nrppa_peer(
+                        &corr,
+                        crate::context::NrppaPeer {
+                            amf: amf.clone(),
+                            ue_context_id: target.to_string(),
+                        },
+                    );
+                }
                 let outcome =
                     namf_client::send_n2_nrppa_transfer(&amf, target, &corr, &lmf_id, nrppa_pdu)
                         .await;
@@ -2674,6 +2684,41 @@ fn resolve_notify_session(lcs_correlation_id: Option<&str>, lpp_txn: Option<u8>)
     None
 }
 
+/// Send an NRPPa ERROR INDICATION to the gNB that sent an erroneous report
+/// (#515, TS 38.455 §10), through the AMF and UE context the session's NRPPa leg
+/// used. Best effort: a session with no NRPPa leg recorded (the report arrived
+/// unsolicited, or the session is gone) has nowhere to send it, which is logged.
+async fn send_nrppa_error_indication(lcs_correlation_id: Option<&str>, pdu: Vec<u8>) {
+    let peer = lcs_correlation_id.and_then(|corr| {
+        lmf_self()
+            .read()
+            .ok()
+            .and_then(|c| c.positioning_session_find(corr))
+            .and_then(|info| info.nrppa_peer)
+    });
+    let Some(peer) = peer else {
+        log::warn!(
+            "NRPPa ERROR INDICATION not sent: no NRPPa leg recorded for lcsCorrelationId \
+             {lcs_correlation_id:?}"
+        );
+        return;
+    };
+    let lmf_id = lmf_self()
+        .read()
+        .ok()
+        .and_then(|c| c.nf_instance_id())
+        .unwrap_or_else(|| "nextgcore-lmf".to_string());
+    let outcome = namf_client::send_n2_nrppa_transfer(
+        &peer.amf,
+        &peer.ue_context_id,
+        lcs_correlation_id.unwrap_or_default(),
+        &lmf_id,
+        pdu,
+    )
+    .await;
+    log::info!("NRPPa ERROR INDICATION toward the serving gNB: {outcome:?}");
+}
+
 /// Callback: `POST /nlmf-loc/v1/notify/n1` — Namf_Communication N1MessageNotify
 /// (A4; TS 29.518 §5.2.2.4, TS29518_Namf_Communication.yaml:1540-1596). The AMF
 /// relays an uplink LPP N1 message (TS 23.273 §6.11.2) as `multipart/related`:
@@ -2867,16 +2912,33 @@ async fn handle_n2_info_notify(request: &SbiRequest) -> SbiResponse {
     };
 
     // Correlation is by lcsCorrelationId, so the embedded lmf-UE-Measurement-ID
-    // is not consulted for routing (only the measurements are used).
-    let cells = match codec_glue::decode_nrppa_ecid_report(&nrppa_bytes) {
-        Ok((_embedded_id, cells)) => cells,
+    // is not consulted for routing (only the measurements are used). TS 38.455 §10
+    // (via TS 38.413 §10.3.4.2): a report carrying a reject IE, or missing a
+    // reject IE, is not used; a notify or reject finding goes back to the gNB in
+    // an NRPPa ERROR INDICATION, relayed the way the measurement was requested.
+    let (cells, error_indication) = match crate::nrppa_uplink::decode_ecid_report(&nrppa_bytes) {
+        Ok(crate::nrppa_uplink::EcidReportOutcome::Accepted {
+            cells,
+            error_indication,
+            ..
+        }) => (cells, error_indication),
+        Ok(crate::nrppa_uplink::EcidReportOutcome::Rejected {
+            error_indication,
+            reason,
+        }) => {
+            log::warn!("N2InfoNotify NRPPa report not used (request_id {request_id}): {reason}");
+            (Vec::new(), Some(error_indication))
+        }
         Err(e) => {
             log::warn!(
                 "N2InfoNotify NRPPa decode failed for session (request_id {request_id}): {e}"
             );
-            Vec::new()
+            (Vec::new(), None)
         }
     };
+    if let Some(ei) = error_indication {
+        send_nrppa_error_indication(lcs_correlation_id, ei).await;
+    }
     if let Ok(context) = lmf_self().read() {
         context.measurement_report(request_id, cells);
     }
@@ -6777,6 +6839,167 @@ mod positioning_chain_strict_peer {
             .await;
 
         (amf_server, nrf_server, tap_rx)
+    }
+
+    // =======================================================================
+    // #515 — an erroneous NRPPa E-CID report is answered with an NRPPa ERROR
+    // INDICATION that reaches amfd's REAL Namf consumer and is queued for the gNB.
+    // =======================================================================
+
+    /// TS 38.455 §10 / TS 38.413 §10.3.4.2: the gNB's E-CID Measurement Report
+    /// carries an unknown IE marked reject. lmfd's real N2 notify handler must
+    /// not use the report, and must send an ERROR INDICATION back through the
+    /// AMF and UE context its NRPPa leg went through -- here amfd's real
+    /// handler, which queues it toward the serving gNB.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_an_erroneous_nrppa_report_is_answered_with_an_error_indication_via_real_amfd() {
+        use nextgcore_asn1c::nrppa::ies::{
+            ECidMeasurementResult, MeasuredResults, MeasuredResultsValue, NgRanCell, NgRanCgi,
+            PlmnIdentity, ProtocolIeField, ResultRsrpEutraItem, Tac, UeMeasurementId,
+        };
+        use nextgcore_asn1c::nrppa::pdu::{
+            build_ecid_measurement_report, InitiatingMessageValue, NrppaPdu,
+        };
+        use nextgcore_asn1c::nrppa::types::{Criticality, NrppaTransactionId, ProtocolIeId};
+        use nextgcore_nrppa_gen::generated as gen;
+
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _serial = chain_lock().lock().await;
+        lmf_context_init(1024);
+        prime_lmf_self();
+        let supi = "imsi-001010000000751";
+        seed_amf_connected_ue(supi);
+
+        // amfd's real Namf consumer behind a loopback server.
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        server
+            .start(|req: SbiRequest| async move { nextgcore_amfd::namf_request_handler(req).await })
+            .await
+            .expect("amf server start");
+
+        let lmf = lmf_self();
+        let (corr, request_id) = {
+            let guard = lmf.read().unwrap();
+            let req = guard
+                .measurement_request(
+                    0,
+                    PositioningMethod::Ecid,
+                    None,
+                    None,
+                    PositioningQos::BestEffort,
+                )
+                .expect("measurement request");
+            let (corr, _rx) =
+                guard.positioning_session_register(Some(supi.to_string()), 199, req.request_id);
+            guard.positioning_session_set_nrppa_peer(
+                &corr,
+                crate::context::NrppaPeer {
+                    amf: namf_client::DiscoveredAmf {
+                        host: "127.0.0.1".to_string(),
+                        port: addr.port(),
+                        scheme: "http".to_string(),
+                        nf_instance_id: Some("amf-strict-peer".to_string()),
+                    },
+                    ue_context_id: supi.to_string(),
+                },
+            );
+            (corr, req.request_id)
+        };
+
+        // A valid report plus one unknown IE marked reject.
+        let mut pdu = build_ecid_measurement_report(
+            NrppaTransactionId(77),
+            UeMeasurementId(1),
+            UeMeasurementId(5),
+            &ECidMeasurementResult {
+                serving_cell_id: NgRanCgi {
+                    plmn_identity: PlmnIdentity([0x02, 0xf8, 0x39]),
+                    ng_ran_cell: NgRanCell::NrCellId(1),
+                },
+                serving_cell_tac: Tac([0x00, 0x00, 0x01]),
+                ng_ran_access_point_position: None,
+                measured_results: Some(MeasuredResults {
+                    values: vec![MeasuredResultsValue::ResultRsrp(vec![
+                        ResultRsrpEutraItem {
+                            pci_eutra: 1,
+                            earfcn: 1850,
+                            value_rsrp_eutra: 60,
+                        },
+                    ])],
+                }),
+            },
+            None,
+        )
+        .unwrap();
+        if let NrppaPdu::InitiatingMessage(m) = &mut pdu {
+            if let InitiatingMessageValue::ECidMeasurementReport(c) = &mut m.value {
+                c.push(ProtocolIeField {
+                    id: ProtocolIeId(9999),
+                    criticality: Criticality::Reject,
+                    value: vec![0x00],
+                });
+            }
+        }
+        let nrppa = pdu.encode().unwrap().to_vec();
+
+        let json = format!(
+            "{{\"n2NotifySubscriptionId\":\"sub-515\",\
+             \"n2InfoContainer\":{{\"n2InformationClass\":\"NRPPa\",\
+             \"nrppaInfo\":{{\"nrppaPdu\":{{\"ngapIeType\":\"NRPPA_PDU\",\
+             \"ngapData\":{{\"contentId\":\"nrppa\"}}}}}}}},\
+             \"lcsCorrelationId\":\"{corr}\"}}"
+        );
+        let mut req = SbiRequest::post("/nlmf-loc/v1/notify/n2");
+        req.http.set_content(json);
+        req.http
+            .add_part(nextgcore_sbi::message::SbiPart::with_content(
+                "nrppa",
+                "application/vnd.3gpp.ngap",
+                bytes::Bytes::from(nrppa),
+            ));
+        let resp = handle_n2_info_notify(&req).await;
+        assert_eq!(resp.status, 204);
+        assert!(
+            lmf_self()
+                .read()
+                .unwrap()
+                .report_find(request_id)
+                .map_or(true, |r| r.cell_measurements.is_empty()),
+            "a report TS 38.413 §10.3.4.2 says to reject must contribute no measurement"
+        );
+
+        // amfd queued exactly one NRPPa PDU toward the gNB: our ERROR INDICATION.
+        let queued: Vec<Vec<u8>> = amf_self()
+            .read()
+            .unwrap()
+            .positioning_dl_drain()
+            .into_iter()
+            .filter_map(|d| match d.kind {
+                PositioningDlKind::NrppaToGnb { nrppa_pdu, .. } => Some(nrppa_pdu),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(queued.len(), 1, "one ERROR INDICATION, relayed by amfd");
+        let gen::NRPPA_PDU::InitiatingMessage(m) =
+            nextgcore_nrppa_gen::decode(&queued[0]).expect("a valid NRPPa PDU")
+        else {
+            panic!("not an initiating message");
+        };
+        assert_eq!(m.procedure_code.0, gen::ID_ERROR_INDICATION);
+        assert_eq!(
+            m.nrppatransaction_id.0, 77,
+            "it answers the report's transaction"
+        );
+        let gen::InitiatingMessageValue::Id_errorIndication(ei) = m.value else {
+            panic!("not an ERROR INDICATION");
+        };
+        assert!(ei.protocol_i_es.0.iter().any(|ie| matches!(
+            &ie.value,
+            gen::ErrorIndicationProtocolIEs_EntryValue::Id_Cause(gen::Cause::Protocol(c))
+                if c.0 == gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT
+        )));
+        let _ = server.stop().await;
     }
 
     // =======================================================================

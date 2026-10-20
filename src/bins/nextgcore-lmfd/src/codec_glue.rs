@@ -31,7 +31,9 @@ use nextgcore_asn1c::lpp::nr_dl_tdoa::NrRstd;
 use nextgcore_asn1c::lpp::requested_measurements;
 use nextgcore_asn1c::lpp::sidelink_ranging::SidelinkRangingMethod;
 use nextgcore_asn1c::lpp::types::{Initiator, LppTransactionId, TransactionNumber};
+#[cfg(test)]
 use nextgcore_asn1c::nrppa::ies::{MeasuredResultsValue, NgRanCell};
+#[cfg(test)]
 use nextgcore_asn1c::nrppa::pdu::{parse_ecid_measurement_report, NrppaPdu};
 
 /// Encode an LMF-initiated LPP `RequestLocationInformation` (TS 37.355 §6.2,
@@ -428,6 +430,7 @@ const TC_NS: f64 = 1_000_000_000.0 / (480_000.0 * 4_096.0);
 
 /// Format an `NgRanCgi` as `"<plmn-6hex>-<cellid-9hex>"` for NR cells, or
 /// `"<plmn-6hex>-e<cellid-7hex>"` for E-UTRA cells.
+#[cfg(test)]
 fn ng_ran_cgi_to_string(cgi: &nextgcore_asn1c::nrppa::ies::NgRanCgi) -> String {
     let p = &cgi.plmn_identity.0;
     let plmn = format!("{:02x}{:02x}{:02x}", p[0], p[1], p[2]);
@@ -503,6 +506,7 @@ fn nrrstd_to_signed_ns(rstd: &NrRstd) -> f64 {
 /// | `ResultRsrq(items)`          | `rsrq`                  | best item raw 0..34 index     |
 ///
 /// Returns an empty `Vec` on decode failure or when `measured_results` is absent.
+#[cfg(test)]
 pub fn nrppa_ecid_report_to_measurements(pdu: &NrppaPdu) -> Vec<CellMeasurement> {
     let report = match parse_ecid_measurement_report(pdu) {
         Ok(r) => r,
@@ -563,6 +567,7 @@ pub fn nrppa_ecid_report_to_measurements(pdu: &NrppaPdu) -> Vec<CellMeasurement>
 /// The `lmf-UE-Measurement-ID` IE (TS 38.455 §9.2.13) is the ID originally
 /// assigned by the LMF when initiating the positioning procedure.  Returns
 /// `None` if the PDU is not an E-CID measurement report.
+#[cfg(test)]
 pub fn extract_nrppa_request_id(pdu: &NrppaPdu) -> Option<u64> {
     parse_ecid_measurement_report(pdu)
         .ok()
@@ -573,7 +578,26 @@ pub fn extract_nrppa_request_id(pdu: &NrppaPdu) -> Option<u64> {
 ///
 /// Returns `(lmf_request_id, Vec<CellMeasurement>)` on success, or an `Err`
 /// description.  Used by `handle_nrppa_binary_report` in `main.rs`.
+///
+/// Decoded with the generated NRPPa codec (#515 stage 3); a report TS 38.413
+/// §10.3.4.2 says to reject is an `Err`. Callers that can answer the gNB use
+/// [`crate::nrppa_uplink::decode_ecid_report`] for the ERROR INDICATION too.
 pub fn decode_nrppa_ecid_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasurement>), String> {
+    match crate::nrppa_uplink::decode_ecid_report(bytes)? {
+        crate::nrppa_uplink::EcidReportOutcome::Accepted {
+            lmf_measurement_id,
+            cells,
+            ..
+        } => Ok((lmf_measurement_id, cells)),
+        crate::nrppa_uplink::EcidReportOutcome::Rejected { reason, .. } => Err(reason),
+    }
+}
+
+/// The pre-#515 hand-written decode, kept as the oracle for the generated one.
+#[cfg(test)]
+pub fn decode_nrppa_ecid_report_hand_written(
+    bytes: &[u8],
+) -> Result<(u64, Vec<CellMeasurement>), String> {
     let pdu = NrppaPdu::decode(bytes).map_err(|e| format!("NRPPa APER decode: {e}"))?;
     let request_id = extract_nrppa_request_id(&pdu)
         .ok_or_else(|| "PDU is not an E-CID measurement report".to_string())?;
