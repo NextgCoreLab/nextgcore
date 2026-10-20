@@ -932,9 +932,17 @@ pub fn build_initial_context_setup_request_asn1(
             Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(ran_ue_ngap_id)),
         ),
     ];
-    // BitRate ::= INTEGER (0..4000000000000, ...) (§9.3.1.4): the generated
-    // encoder refuses a value past the root, as the hand-written one did.
+    // BitRate ::= INTEGER (0..4000000000000, ...) (§9.3.1.4). Since nextgsim
+    // #235 the codec encodes a value past the root as an extension value --
+    // valid ASN.1, but the extension marker is for later releases and none
+    // defines a bit rate past 4 Tbit/s. Refuse it here, as before.
     if let Some((dl, ul)) = ue_ambr {
+        if dl > MAX_BIT_RATE || ul > MAX_BIT_RATE {
+            log::error!(
+                "Failed to encode InitialContextSetupRequest: UE AMBR {dl}/{ul} past {MAX_BIT_RATE}"
+            );
+            return None;
+        }
         ies.push(entry(
             ngap_gen::ID_UE_AGGREGATE_MAXIMUM_BIT_RATE,
             &reject,
@@ -1220,9 +1228,16 @@ pub fn build_eps_to_5gs_handover_request_asn1(
         entry(
             ngap_gen::ID_UE_AGGREGATE_MAXIMUM_BIT_RATE,
             &reject,
+            // Derived from the EPS APN-AMBRs, whose sum can pass what §9.3.1.4
+            // defines; clamp rather than refuse the handover, and never let
+            // the codec emit an undefined extension value (nextgsim #235).
             Ie::Id_UEAggregateMaximumBitRate(ngap_gen::UEAggregateMaximumBitRate {
-                ue_aggregate_maximum_bit_rate_dl: ngap_gen::BitRate(request.ue_ambr_bps.0),
-                ue_aggregate_maximum_bit_rate_ul: ngap_gen::BitRate(request.ue_ambr_bps.1),
+                ue_aggregate_maximum_bit_rate_dl: ngap_gen::BitRate(
+                    request.ue_ambr_bps.0.min(MAX_BIT_RATE),
+                ),
+                ue_aggregate_maximum_bit_rate_ul: ngap_gen::BitRate(
+                    request.ue_ambr_bps.1.min(MAX_BIT_RATE),
+                ),
                 ie_extensions: None,
             }),
         ),
@@ -2569,6 +2584,13 @@ pub fn build_overload_stop_asn1() -> Option<Vec<u8>> {
     }
 }
 
+/// The largest QoS Flow Identifier: a QFI is six bits (TS 23.501 §5.7.1.1).
+pub const MAX_QFI: u8 = 63;
+
+/// The largest Bit Rate TS 38.413 §9.3.1.4 defines (bit/s): BitRate is
+/// INTEGER (0..4000000000000, ...), and no release defines an extension value.
+pub const MAX_BIT_RATE: u64 = 4_000_000_000_000;
+
 /// Build an APER-encoded PDUSessionResourceSetupRequestTransfer
 /// (TS 38.413 Section 9.3.4.1) carrying the UPF N3 tunnel endpoint.
 ///
@@ -2595,9 +2617,19 @@ pub fn build_n2_sm_setup_request_transfer(
         PDUSessionResourceSetupRequestTransferProtocolIEs_EntryValue as Ie, ProtocolIE_ID,
     };
 
+    // A QFI is six bits (TS 23.501 §5.7.1.1). QosFlowIdentifier is
+    // INTEGER (0..63, ...), so since nextgsim #235 the codec encodes 64..255 as
+    // an extension value instead of refusing it -- conformant ASN.1, but not a
+    // QFI any 5GS node can hold. Refuse it here, as the hand-written encoder did.
+    if qfi > MAX_QFI {
+        log::error!(
+            "Failed to encode PDUSessionResourceSetupRequestTransfer: QFI {qfi} > {MAX_QFI}"
+        );
+        return None;
+    }
     // FiveQI is INTEGER (0..255, ...) and the generated type a u8, so a 5QI
-    // past 255 cannot be carried; the codec itself refuses a QFI past 63 and a
-    // Priority Level ARP outside 1..15.
+    // past 255 cannot be carried; the codec itself refuses a Priority Level ARP
+    // outside 1..15.
     let Ok(five_qi) = u8::try_from(five_qi) else {
         log::error!("Failed to encode PDUSessionResourceSetupRequestTransfer: 5QI {five_qi} > 255");
         return None;
@@ -6337,6 +6369,15 @@ pub(crate) mod tests {
     /// 5QI the u16 can carry up to 300, every Priority Level ARP, TEIDs and
     /// addresses at their extremes; and both refuse the same inputs: a QFI
     /// past 63, a 5QI past 255, an ARP of 0 or past 15.
+    /// A QFI is six bits (TS 23.501 §5.7.1.1). QosFlowIdentifier is
+    /// INTEGER (0..63, ...), so the generated codec would encode 64 as an
+    /// extension value; the builder must refuse it before the codec sees it.
+    #[test]
+    fn a_qfi_past_63_is_refused_although_the_codec_could_extend_it() {
+        assert!(build_n2_sm_setup_request_transfer(1, [10, 0, 0, 1], MAX_QFI, 9, 8).is_some());
+        assert!(build_n2_sm_setup_request_transfer(1, [10, 0, 0, 1], MAX_QFI + 1, 9, 8).is_none());
+    }
+
     #[test]
     fn n2_sm_setup_request_transfer_generated_matches_hand_written() {
         let mut compared = 0;
@@ -6403,14 +6444,9 @@ pub(crate) mod tests {
             five_qi: ngap_gen::FiveQI(d.five_qi as u8),
             priority_level_qos: d.priority_level_qos.map(ngap_gen::PriorityLevelQos),
             averaging_window: d.averaging_window.map(ngap_gen::AveragingWindow),
-            // The generated type is sized from the root (0..4095) as u16, so it
-            // cannot carry the 4096..2000000 extension range; this matrix stays
-            // inside u16.
-            maximum_data_burst_volume: d.maximum_data_burst_volume.map(|v| {
-                ngap_gen::MaximumDataBurstVolume(
-                    u16::try_from(v).expect("MDBV fits the generated u16"),
-                )
-            }),
+            maximum_data_burst_volume: d
+                .maximum_data_burst_volume
+                .map(ngap_gen::MaximumDataBurstVolume),
             ie_extensions: None,
         };
         let dynamic = |d: &Dynamic5qiDescriptor| ngap_gen::Dynamic5QIDescriptor {
@@ -6424,14 +6460,9 @@ pub(crate) mod tests {
             five_qi: d.five_qi.map(|q| ngap_gen::FiveQI(q as u8)),
             delay_critical: d.delay_critical.map(|c| ngap_gen::DelayCritical(c as u8)),
             averaging_window: d.averaging_window.map(ngap_gen::AveragingWindow),
-            // The generated type is sized from the root (0..4095) as u16, so it
-            // cannot carry the 4096..2000000 extension range; this matrix stays
-            // inside u16.
-            maximum_data_burst_volume: d.maximum_data_burst_volume.map(|v| {
-                ngap_gen::MaximumDataBurstVolume(
-                    u16::try_from(v).expect("MDBV fits the generated u16"),
-                )
-            }),
+            maximum_data_burst_volume: d
+                .maximum_data_burst_volume
+                .map(ngap_gen::MaximumDataBurstVolume),
             ie_extensions: None,
         };
         let gbr = |g: &GbrQosInformation| ngap_gen::GBR_QosInformation {
@@ -8179,6 +8210,59 @@ pub(crate) mod tests {
             decode_initial_context_setup_response_asn1(&[0x20, 0x0e]),
             InitialContextSetupOutcomeDecode::Undecodable
         );
+    }
+
+    /// A UE AMBR past what §9.3.1.4 defines is clamped in the EPS→5GS
+    /// HandoverRequest (the sum of EPS APN-AMBRs can pass it), never emitted as
+    /// a BitRate extension value: the bytes equal those for exactly the bound.
+    #[test]
+    fn the_eps_to_5gs_handover_request_clamps_the_ue_ambr_to_the_bit_rate_bound() {
+        let ctx = create_test_context();
+        let request = |ambr| EpsToFivegsHandoverRequest {
+            amf_ue_ngap_id: 7,
+            ue_ambr_bps: ambr,
+            ue_security_capability: crate::context::UeSecurityCapability {
+                ea: 0xE0,
+                ia: 0x60,
+                eea: 0xF0,
+                eia: 0x70,
+            },
+            next_hop: [0; 32],
+            nas_container: vec![0; 8],
+            sessions: vec![HandoverRequestSession {
+                pdu_session_id: 5,
+                s_nssai: SNssai { sst: 1, sd: None },
+                transfer: vec![0x00, 0x00, 0x04, 0x00, 0x82, 0x00, 0x0A],
+            }],
+            allowed_nssai: vec![SNssai { sst: 1, sd: None }],
+            source_to_target_container: vec![0x40],
+        };
+        let at_bound =
+            build_eps_to_5gs_handover_request_asn1(&ctx, &request((MAX_BIT_RATE, MAX_BIT_RATE)))
+                .expect("encodes at the bound");
+        let past =
+            build_eps_to_5gs_handover_request_asn1(&ctx, &request((MAX_BIT_RATE + 1, u64::MAX)))
+                .expect("clamped, so it still encodes");
+        assert_eq!(past, at_bound);
+    }
+
+    /// The Initial Context Setup Request refuses a UE AMBR past the bound
+    /// rather than letting the codec extend it.
+    #[test]
+    fn initial_context_setup_request_refuses_a_ue_ambr_past_the_bit_rate_bound() {
+        let mut case = ics_baseline();
+        case.ambr = Some((MAX_BIT_RATE, MAX_BIT_RATE));
+        assert!(case
+            .build(build_initial_context_setup_request_asn1)
+            .is_some());
+        case.ambr = Some((MAX_BIT_RATE + 1, 0));
+        assert!(case
+            .build(build_initial_context_setup_request_asn1)
+            .is_none());
+        case.ambr = Some((0, MAX_BIT_RATE + 1));
+        assert!(case
+            .build(build_initial_context_setup_request_asn1)
+            .is_none());
     }
 
     /// #418: the EPS→5GS HandoverRequest, against TS 38.413 §9.2.3.4 and TS 33.501 §8.4.2
