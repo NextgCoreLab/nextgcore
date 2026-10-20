@@ -112,7 +112,8 @@ fn the_production_builder_sends_the_generated_bytes() {
         tac: 1,
     };
     let bytes =
-        crate::s1ap_build::build_paging(&mme_ue, CnDomain::Ps, &[tai.clone()], None).unwrap();
+        crate::s1ap_build::build_paging(&mme_ue, CnDomain::Ps, std::slice::from_ref(&tai), None)
+            .unwrap();
     let expected = build_paging(&Paging {
         ue_identity_index: crate::s1ap_build::ue_identity_index_from_imsi(&mme_ue.imsi_bcd),
         ue_paging_id: UePagingId::Imsi(crate::s1ap_build::imsi_bcd_to_tbcd(&mme_ue.imsi_bcd)),
