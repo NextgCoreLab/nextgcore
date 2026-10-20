@@ -167,6 +167,14 @@ services:
       # Bare address: the SGW-C appends the fixed GTPv2-C port 2123
       # (TS 29.274 §4.1).
       SGWC_PGW_S5C: "172.24.0.4"
+      # #303: the GTP-U address the SGW-C puts in the S1-U and S5/S8-U F-TEIDs it
+      # hands the MME and the PGW (TS 29.274 §8.22). It must be the SGW-U's
+      # address -- the node that actually terminates GTP-U -- not the SGW-C's.
+      # Since #482/#489 `sgwc.gtpc.server` sets the S11 address ONLY (it names the
+      # SGW-C), so without this every Create Session Request is refused with
+      # "No GTP-U address configured" (GTP cause 76). The first real attach (#303)
+      # is what surfaced it; bring-up never sent a Create Session.
+      SGWC_GTPU_ADVERTISE: "172.24.0.6"
     command: ["-c", "/etc/nextgcore/sgwc.yaml"]
     volumes:
       - ./configs/epc/sgwc.yaml:/etc/nextgcore/sgwc.yaml:ro
@@ -415,6 +423,17 @@ services:
       - NET_ADMIN
     devices:
       - /dev/net/tun:/dev/net/tun
+    # LOOSE reverse-path filtering (RFC 3704 §2.4). The container's only route is the
+    # default via eth0, so under the kernel's default STRICT mode a reply from the
+    # PGW-U's SGi address arriving on lteuetun5 fails the reverse-path check and is
+    # dropped before ICMP sees it -- every echo reply reached the TUN and the ping
+    # still reported 100% loss (/proc/net/snmp: Icmp InMsgs 0). Loose mode accepts a
+    # source reachable via ANY interface. The effective value is max(all, iface) and
+    # lteuetun5 inherits `default`, so both are set. /proc/sys is read-only at run
+    # time, so it has to be set here, at container start.
+    sysctls:
+      - net.ipv4.conf.all.rp_filter=2
+      - net.ipv4.conf.default.rp_filter=2
     depends_on:
       enb:
         condition: service_started
