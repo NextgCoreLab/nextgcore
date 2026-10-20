@@ -26,6 +26,7 @@ pub mod paging;
 pub mod s11_build;
 pub mod s11_handler;
 pub mod s1ap_build;
+pub mod s1ap_gen;
 pub mod s1ap_handler;
 pub mod s1ap_path;
 pub mod s6a_handler;
