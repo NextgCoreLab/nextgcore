@@ -10,7 +10,9 @@
 //! SETUP FAILURE encodes. Stage 3 is NAS transport (§8.6.2): the INITIAL UE
 //! MESSAGE and UPLINK NAS TRANSPORT decodes and the DOWNLINK NAS TRANSPORT
 //! encode. Stage 4 is Initial Context Setup (§8.3.1): the INITIAL CONTEXT SETUP
-//! REQUEST encode and the RESPONSE / FAILURE decodes.
+//! REQUEST encode and the RESPONSE / FAILURE decodes. Stage 5 is UE Context
+//! Release (§8.3.2, §8.3.3): the UE CONTEXT RELEASE COMMAND encode and the
+//! REQUEST / COMPLETE decodes.
 
 use bitvec::prelude::{BitVec, Msb0};
 use nextgcore_s1ap::{
@@ -1041,6 +1043,159 @@ pub fn is_outcome(bytes: &[u8], successful: bool, procedure_code: u8) -> bool {
         && bytes[1] == procedure_code
 }
 
+// ============================================================================
+// UE Context Release (TS 36.413 §8.3.2, §8.3.3) -- stage 5
+// ============================================================================
+
+/// `id-UEContextRelease` (Class 1: Command, Complete).
+pub const PROC_UE_CONTEXT_RELEASE: u8 = 23;
+/// `id-UEContextReleaseRequest` (Class 2).
+pub const PROC_UE_CONTEXT_RELEASE_REQUEST: u8 = 18;
+
+const ID_UE_S1AP_IDS: u16 = 99;
+
+/// Encode a UE CONTEXT RELEASE COMMAND (TS 36.413 §9.1.4.6) with the generated
+/// codec: UE-S1AP-IDs reject, Cause ignore; procedure criticality reject.
+pub fn build_ue_context_release_command(
+    ids: &nextgcore_s1ap::UeS1apIds,
+    cause: Cause,
+) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    use g::UEContextReleaseCommandProtocolIEs_EntryValue as V;
+    let ue_ids = match *ids {
+        nextgcore_s1ap::UeS1apIds::Pair {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id,
+        } => g::UE_S1AP_IDs::UE_S1AP_ID_pair(g::UE_S1AP_ID_pair {
+            mme_ue_s1ap_id: g::MME_UE_S1AP_ID(mme_ue_s1ap_id),
+            enb_ue_s1ap_id: g::ENB_UE_S1AP_ID(enb_ue_s1ap_id),
+            ie_extensions: None,
+        }),
+        nextgcore_s1ap::UeS1apIds::MmeOnly { mme_ue_s1ap_id } => {
+            g::UE_S1AP_IDs::MME_UE_S1AP_ID(g::MME_UE_S1AP_ID(mme_ue_s1ap_id))
+        }
+    };
+    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+        procedure_code: g::ProcedureCode(PROC_UE_CONTEXT_RELEASE),
+        criticality: g::Criticality(REJECT),
+        value: g::InitiatingMessageValue::Id_UEContextRelease(g::UEContextReleaseCommand {
+            protocol_i_es: g::UEContextReleaseCommandProtocolIEs(vec![
+                g::UEContextReleaseCommandProtocolIEs_Entry {
+                    id: g::ProtocolIE_ID(ID_UE_S1AP_IDS),
+                    criticality: g::Criticality(REJECT),
+                    value: V::Id_UE_S1AP_IDs(ue_ids),
+                },
+                g::UEContextReleaseCommandProtocolIEs_Entry {
+                    id: g::ProtocolIE_ID(ID_CAUSE),
+                    criticality: g::Criticality(IGNORE),
+                    value: V::Id_Cause(generated_cause(cause)),
+                },
+            ]),
+        }),
+    }))
+}
+
+/// Decode a UE CONTEXT RELEASE REQUEST (TS 36.413 §9.1.4.5), the initiating
+/// message of a Class 2 procedure, with §10.3.4.2 / §10.3.5.
+///
+/// MME-UE-S1AP-ID and eNB-UE-S1AP-ID are `reject`: missing, the request is
+/// not run. Cause is `ignore`: missing, it reads as radioNetwork / unspecified.
+/// GW Context Release Indication and the Secondary RAT report are understood
+/// and not used by this MME.
+pub fn decode_ue_context_release_request(
+    bytes: &[u8],
+) -> Class2Decode<nextgcore_s1ap::UeContextReleaseRequest> {
+    let Ok((pdu, unknown)) = nextgcore_s1ap_gen::decode_with_unknown_ies(bytes) else {
+        return Class2Decode::Undecodable;
+    };
+    let g::S1AP_PDU::InitiatingMessage(msg) = pdu else {
+        return Class2Decode::Undecodable;
+    };
+    let g::InitiatingMessageValue::Id_UEContextReleaseRequest(m) = msg.value else {
+        return Class2Decode::Undecodable;
+    };
+    let (mut reject, notify) = classify_unknown(&unknown);
+    let (mut mme_id, mut enb_id, mut cause) = (None, None, None);
+    use g::UEContextReleaseRequestProtocolIEs_EntryValue as V;
+    for ie in m.protocol_i_es.0 {
+        match ie.value {
+            V::Id_MME_UE_S1AP_ID(v) => mme_id = Some(v.0),
+            V::Id_eNB_UE_S1AP_ID(v) => enb_id = Some(v.0),
+            V::Id_Cause(c) => cause = hand_written_cause(&c),
+            _ => {}
+        }
+    }
+    missing(&mut reject, mme_id.is_some(), ID_MME_UE_S1AP_ID);
+    missing(&mut reject, enb_id.is_some(), ID_ENB_UE_S1AP_ID);
+    if !reject.is_empty() {
+        return Class2Decode::Reject {
+            ies: reject,
+            enb_ue_s1ap_id: enb_id,
+            mme_ue_s1ap_id: mme_id,
+        };
+    }
+    let (Some(mme_ue_s1ap_id), Some(enb_ue_s1ap_id)) = (mme_id, enb_id) else {
+        return Class2Decode::Undecodable;
+    };
+    Class2Decode::Proceed {
+        msg: nextgcore_s1ap::UeContextReleaseRequest {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id,
+            cause: cause.unwrap_or(Cause::RadioNetwork(
+                nextgcore_s1ap::CauseRadioNetwork::Unspecified,
+            )),
+        },
+        notify,
+    }
+}
+
+/// A UE CONTEXT RELEASE COMPLETE whose UE S1AP IDs, both criticality
+/// `ignore`, may be missing (§10.3.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseComplete {
+    /// MME-UE-S1AP-ID, if present.
+    pub mme_ue_s1ap_id: Option<u32>,
+    /// eNB-UE-S1AP-ID, if present.
+    pub enb_ue_s1ap_id: Option<u32>,
+}
+
+/// Decode a UE CONTEXT RELEASE COMPLETE (TS 36.413 §9.1.4.7), a response
+/// message: an unknown `reject` IE fails the procedure locally. A complete
+/// that carries neither UE S1AP ID identifies no UE and is `Undecodable`.
+pub fn decode_ue_context_release_complete(bytes: &[u8]) -> ResponseDecode<ReleaseComplete> {
+    let Ok((pdu, unknown)) = nextgcore_s1ap_gen::decode_with_unknown_ies(bytes) else {
+        return ResponseDecode::Undecodable;
+    };
+    let g::S1AP_PDU::SuccessfulOutcome(msg) = pdu else {
+        return ResponseDecode::Undecodable;
+    };
+    let g::SuccessfulOutcomeValue::Id_UEContextRelease(c) = msg.value else {
+        return ResponseDecode::Undecodable;
+    };
+    let (reject, notify) = classify_unknown(&unknown);
+    if !reject.is_empty() {
+        return ResponseDecode::Failed(reject);
+    }
+    let (mut mme, mut enb) = (None, None);
+    use g::UEContextReleaseCompleteProtocolIEs_EntryValue as V;
+    for ie in c.protocol_i_es.0 {
+        match ie.value {
+            V::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
+            V::Id_eNB_UE_S1AP_ID(v) => enb = Some(v.0),
+            _ => {}
+        }
+    }
+    if mme.is_none() && enb.is_none() {
+        return ResponseDecode::Undecodable;
+    }
+    ResponseDecode::Decoded {
+        msg: ReleaseComplete {
+            mme_ue_s1ap_id: mme,
+            enb_ue_s1ap_id: enb,
+        },
+        notify,
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -1049,3 +1204,6 @@ mod nas_tests;
 
 #[cfg(test)]
 mod ics_tests;
+
+#[cfg(test)]
+mod release_tests;

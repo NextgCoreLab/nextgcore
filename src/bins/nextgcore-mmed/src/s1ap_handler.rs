@@ -311,6 +311,72 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
             Class2Decode::Undecodable => {}
         }
     }
+    // UE Context Release is decoded with the generated codec (#514 stage 5).
+    // The Request is a Class 2 initiating message; the Complete is a response.
+    if crate::s1ap_gen::is_initiating(data, crate::s1ap_gen::PROC_UE_CONTEXT_RELEASE_REQUEST) {
+        use crate::s1ap_gen::Class2Decode;
+        match crate::s1ap_gen::decode_ue_context_release_request(data) {
+            Class2Decode::Proceed { msg, notify } => {
+                let mut out = class2_notify(
+                    enb_id,
+                    crate::s1ap_gen::PROC_UE_CONTEXT_RELEASE_REQUEST,
+                    Some(msg.enb_ue_s1ap_id),
+                    Some(msg.mme_ue_s1ap_id),
+                    &notify,
+                );
+                out.extend(handle_ue_context_release_request(ctx, enb_id, &msg));
+                return out;
+            }
+            Class2Decode::Reject {
+                ies,
+                enb_ue_s1ap_id,
+                mme_ue_s1ap_id,
+            } => {
+                return class2_reject(
+                    enb_id,
+                    crate::s1ap_gen::PROC_UE_CONTEXT_RELEASE_REQUEST,
+                    enb_ue_s1ap_id,
+                    mme_ue_s1ap_id,
+                    &ies,
+                );
+            }
+            Class2Decode::Undecodable => {}
+        }
+    }
+    if crate::s1ap_gen::is_outcome(data, true, crate::s1ap_gen::PROC_UE_CONTEXT_RELEASE) {
+        use crate::s1ap_gen::ResponseDecode;
+        match crate::s1ap_gen::decode_ue_context_release_complete(data) {
+            ResponseDecode::Decoded { msg, notify } => {
+                let out = if notify.is_empty() {
+                    Vec::new()
+                } else {
+                    error_indication_with_diagnostics(
+                        enb_id,
+                        msg.enb_ue_s1ap_id,
+                        msg.mme_ue_s1ap_id,
+                        S1apCauseGroup::Protocol,
+                        protocol_cause::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+                        Some(crate::s1ap_gen::error_indication_diagnostics_for(
+                            crate::s1ap_gen::PROC_UE_CONTEXT_RELEASE,
+                            nextgcore_s1ap::triggering_message::SUCCESSFUL_OUTCOME,
+                            0,
+                            &notify,
+                        )),
+                    )
+                };
+                handle_release_complete(ctx, enb_id, &msg);
+                return out;
+            }
+            ResponseDecode::Failed(ies) => {
+                log::error!(
+                    "UE Context Release Complete from eNB {enb_id} carries a reject IE \
+                     (TS 36.413 §10.3.4.2); handled locally: {ies:?}"
+                );
+                return Vec::new();
+            }
+            ResponseDecode::Undecodable => {}
+        }
+    }
     let message = match decode_s1ap_pdu(data) {
         Ok(message) => message,
         Err(e) => {
@@ -1194,6 +1260,38 @@ pub fn handle_ue_context_release_complete(
     };
     release_s1_connection(ctx, enb_ue_id);
     log::debug!("UE Context released: mme_ue_s1ap_id={}", msg.mme_ue_s1ap_id);
+}
+
+/// Handle a UE Context Release Complete decoded by the generated codec (#514
+/// stage 5). Both UE S1AP IDs are criticality `ignore` (§10.3.5): with no
+/// MME-UE-S1AP-ID the UE is found by its eNB-UE-S1AP-ID on this association.
+pub fn handle_release_complete(
+    ctx: &MmeContext,
+    enb_id: u64,
+    msg: &crate::s1ap_gen::ReleaseComplete,
+) {
+    let enb_ue_id = msg
+        .mme_ue_s1ap_id
+        .and_then(|id| ctx.enb_ue_find_by_mme_ue_s1ap_id(id))
+        .or_else(|| {
+            let id = msg.enb_ue_s1ap_id?;
+            ctx.enb_ue_pool
+                .read()
+                .unwrap()
+                .iter()
+                .find(|(_, ue)| ue.enb_id == enb_id && ue.enb_ue_s1ap_id == id)
+                .map(|(pool_id, _)| *pool_id)
+        });
+    let Some(enb_ue_id) = enb_ue_id else {
+        log::warn!(
+            "UE Context Release Complete for unknown UE (mme_ue_s1ap_id={:?}, enb_ue_s1ap_id={:?})",
+            msg.mme_ue_s1ap_id,
+            msg.enb_ue_s1ap_id
+        );
+        return;
+    };
+    release_s1_connection(ctx, enb_ue_id);
+    log::debug!("UE Context released: {msg:?}");
 }
 
 // ============================================================================
