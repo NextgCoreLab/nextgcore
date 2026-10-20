@@ -1439,7 +1439,11 @@ fn dispatch_s5c_create_session_response(msg: &Gtp2Message, peer: SocketAddr) {
         &[],
         cause,
         pgw_c.map(|ft| ft.teid).unwrap_or(0),
-        pgw_u.map(|ft| ft.teid).unwrap_or(0),
+        pgw_u.as_ref().map(|ft| ft.teid).unwrap_or(0),
+        pgw_u
+            .as_ref()
+            .and_then(|ft| ft.ipv4_addr)
+            .map(std::net::Ipv4Addr::from),
     ) {
         crate::s5c_handler::HandlerResult::Error(cause) => {
             log::error!(
@@ -2738,6 +2742,59 @@ mod tests {
         assert_eq!(
             sess.sgwu_sxa_seid, 0x0000_0000_5555_0001,
             "the UP F-SEID from the response is what later requests are addressed by"
+        );
+
+        server.close();
+    }
+
+    /// #303: the uplink FAR sent to the SGW-U forwards to the PGW-U's S5/S8-U F-TEID --
+    /// its ADDRESS as well as its TEID.
+    ///
+    /// The S5/S8 Create Session Response's Bearer Context carries the PGW-U endpoint at
+    /// F-TEID instance 2 (TS 29.274 Table 7.2.2-2). Only the TEID used to be stored, and
+    /// `outer_header_creation` (rightly) builds no header without an address, so the
+    /// SGW-U got an uplink FAR with no Outer Header Creation and dropped every uplink
+    /// G-PDU ("FAR has no outer header creation"). The stand-in PGW answers with TEID
+    /// 0x0BEE_F002 at 127.0.0.1, so both halves are asserted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_uplink_far_forwards_to_the_pgw_s5u_address_and_teid() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_ACCEPTED,
+            Duration::ZERO,
+        )
+        .await;
+        let _pgw = with_stand_in_pgw().await;
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let sock = client();
+        let imsi = [0x31, 0x31, 0x31, 0x31, 0x31, 0x31, 0x59];
+
+        sock.send_to(&csr(0x5407, &imsi).encode(), server.local_addr())
+            .unwrap();
+        let _ = recv_s11(&sock).await.expect("create session response");
+
+        let seen = sgwu.seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let establishment = seen
+            .iter()
+            .find(|(t, _, _)| *t == 50)
+            .map(|(_, _, body)| body.clone())
+            .expect("a Session Establishment Request must have reached the SGW-U");
+        let mut body = Bytes::copy_from_slice(&establishment);
+        let decoded = nextgcore_pfcp::message::SessionEstablishmentRequest::decode(&mut body)
+            .expect("decodable establishment");
+        let headers: Vec<_> = decoded
+            .create_fars
+            .iter()
+            .filter_map(|f| f.forwarding_parameters.as_ref())
+            .filter_map(|fp| fp.outer_header_creation.as_ref())
+            .map(|ohc| (ohc.teid, ohc.ipv4_addr))
+            .collect();
+        assert!(
+            headers.contains(&(Some(0x0BEE_F002), Some([127, 0, 0, 1]))),
+            "the uplink FAR must tunnel to the PGW-U's S5/S8-U F-TEID (TEID 0x0BEE_F002 at \
+             127.0.0.1); FARs carried {headers:?}"
         );
 
         server.close();
