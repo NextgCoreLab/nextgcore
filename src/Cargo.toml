@@ -1,5 +1,8 @@
 [workspace]
 resolver = "2"
+# The patched sctp-proto (#467) is a [patch.crates-io] path crate, not a member;
+# excluded so its own tests and lints are not counted as this workspace's.
+exclude = ["vendor/sctp-proto"]
 
 members = [
     # Library crates (mirrors lib/)
@@ -256,6 +259,13 @@ dead_code = "allow"
 asn1-compiler = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "fbc82842450589b487db1a6fabb899f3eed19046" }
 asn1-codecs = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "fbc82842450589b487db1a6fabb899f3eed19046" }
 asn1_codecs_derive = { git = "https://github.com/NextgCoreLab/nextgsim.git", rev = "fbc82842450589b487db1a6fabb899f3eed19046" }
+# sctp-proto 0.6.0 patched to carry any SCTP PPID verbatim (#467; same patch as
+# nextgsim #220): upstream (0.6.0 and 0.10.7 alike) maps every non-WebRTC PPID to
+# `Unknown`, which goes on the wire as 58, so NGAP 60 and S1AP 18 were rewritten.
+# nextgcore is the crate's single home; nextgsim consumes it from here by rev
+# rather than keeping a second copy. See vendor/sctp-proto/HOME.md and
+# vendor/sctp-proto/NEXTGSIM-PATCH.md.
+sctp-proto = { path = "vendor/sctp-proto" }
 
 [profile.release]
 opt-level = 3
