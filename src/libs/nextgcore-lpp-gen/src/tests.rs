@@ -317,7 +317,7 @@ fn nr_provide_messages() -> Vec<LppMessage> {
                                         nr_phys_cell_id: Some(123),
                                         nr_arfcn: Some(640_000),
                                         nr_time_stamp: timestamp(),
-                                        nr_rstd: rstd.clone(),
+                                        nr_rstd: rstd,
                                         nr_timing_quality: NrTimingQuality {
                                             timing_quality_value: 12,
                                             timing_quality_resolution: 2,

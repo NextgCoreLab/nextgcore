@@ -185,7 +185,7 @@ fn trp_information_response_agrees() {
                 TrpInformationTypeResponseItem::GeographicalCoordinates(GeographicalCoordinates {
                     position_definition_type: TrpPositionDefinitionType::Direct(
                         TrpPositionDirect {
-                            accuracy: TrpPositionDirectAccuracy::TrpPosition(position.clone()),
+                            accuracy: TrpPositionDirectAccuracy::TrpPosition(position),
                         },
                     ),
                 }),
