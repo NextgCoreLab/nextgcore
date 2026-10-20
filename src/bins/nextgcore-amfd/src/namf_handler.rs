@@ -331,6 +331,7 @@ pub fn handle_n1_n2_message_transfer(
     amf_ue: &AmfUe,
     sess: &mut AmfSess,
     ran_ue: Option<&RanUe>,
+    cm_idle: bool,
     req_data: &N1N2MessageTransferReqData,
 ) -> NamfHandlerResult<N1N2MessageTransferRspData> {
     log::debug!(
@@ -361,7 +362,10 @@ pub fn handle_n1_n2_message_transfer(
                     }
                 } else {
                     // No N1 message - network triggered service request
-                    if !amf_ue.security_context_available {
+                    // CM-IDLE (TS 23.501 §5.3.3.2.2), as the NGAP layer tracks it --
+                    // NOT the security flag, which a registered idle UE still has (its
+                    // NAS security context outlives the N1 connection).
+                    if cm_idle {
                         // UE is idle, need to page (TS 23.502 4.2.3.3)
                         cause = N1N2MessageTransferCause::AttemptingToReachUe;
                         initiate_paging_for_idle_ue(
@@ -387,7 +391,7 @@ pub fn handle_n1_n2_message_transfer(
             }
             NgapIeType::PduResRelCmd => {
                 // PDU session release
-                if !amf_ue.security_context_available {
+                if cm_idle {
                     if req_data.skip_ind {
                         cause = N1N2MessageTransferCause::N1MsgNotTransferred;
                     } else {
@@ -689,20 +693,28 @@ fn initiate_paging_for_idle_ue(
         pending_n1,
         pending_n2,
         pdu_session_id,
+        // The registration area this AMF assigned: the single TAI the
+        // Registration Accept's TAI list carries (`gmm_build`, list type 00).
+        tai_list: vec![(amf_ue.nr_tai.plmn_id.clone(), amf_ue.nr_tai.tac)],
+        last_sent: None,
+        failure_notify_uri: failure_notify_uri.map(str::to_string),
+        n1n2_msg_data_uri: format!(
+            "/namf-comm/v1/ue-contexts/{}/n1-n2-messages",
+            amf_ue.supi.as_deref().unwrap_or("unknown")
+        ),
+        supi: amf_ue.supi.clone(),
     };
 
-    // Store paging context in AMF global context
+    // Mark session as paging ongoing; keep the consumer's failure-notify
+    // URI so a paging timeout can trigger N1N2MsgTxfrFailureNotification
+    let location = paging_ctx.n1n2_msg_data_uri.clone();
+
+    // Store paging context in AMF global context. The NGAP server's paging pump
+    // (`NgapServer::process_paging`) sends the PAGING and runs T3513.
     let ctx = amf_self();
     if let Ok(context) = ctx.read() {
         context.paging_add(paging_ctx);
     }
-
-    // Mark session as paging ongoing; keep the consumer's failure-notify
-    // URI so a paging timeout can trigger N1N2MsgTxfrFailureNotification
-    let location = format!(
-        "/namf-comm/v1/ue-contexts/{}/n1-n2-messages",
-        amf_ue.supi.as_deref().unwrap_or("unknown")
-    );
     sess.store_paging_info(&location, failure_notify_uri);
 
     log::info!(
@@ -777,7 +789,7 @@ mod tests {
         let mut sess = create_test_sess();
         let req = N1N2MessageTransferReqData::default();
 
-        let result = handle_n1_n2_message_transfer(&ue, &mut sess, None, &req);
+        let result = handle_n1_n2_message_transfer(&ue, &mut sess, None, false, &req);
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
@@ -799,7 +811,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = handle_n1_n2_message_transfer(&ue, &mut sess, None, &req);
+        let result = handle_n1_n2_message_transfer(&ue, &mut sess, None, false, &req);
         assert!(result.is_ok());
         let rsp = result.unwrap();
         assert_eq!(rsp.cause, N1N2MessageTransferCause::N1N2TransferInitiated);
@@ -975,7 +987,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = handle_n1_n2_message_transfer(&ue, &mut sess, None, &req);
+        let result = handle_n1_n2_message_transfer(&ue, &mut sess, None, true, &req);
         assert!(result.is_ok());
         let rsp = result.unwrap();
         assert_eq!(rsp.cause, N1N2MessageTransferCause::AttemptingToReachUe);
