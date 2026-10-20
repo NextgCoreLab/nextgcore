@@ -75,7 +75,16 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
+    // Default to `logger.level` / `--log-level` / info like the other NFs, not
+    // env_logger's error-only default (#500); RUST_LOG still overrides.
+    let config_path = config::config_path_from_args(std::env::args());
+    let level = config::default_log_level(
+        config::log_level_from_args(std::env::args()),
+        config_path.as_deref(),
+    );
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level))
+        .format_timestamp_millis()
+        .init();
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = nextgcore_metrics::otel::init_otel(
         nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
@@ -88,7 +97,7 @@ async fn main() -> Result<()> {
 
     // The configuration file (#482). Read before the PFCP and GTP-U sockets open,
     // because the Node ID and the advertised GTP-U address are fixed at open.
-    match config::config_path_from_args(std::env::args()) {
+    match config_path {
         Some(path) => config::install(config::load(&path)),
         None => log::info!("No -c configuration file given; using the environment and defaults"),
     }
