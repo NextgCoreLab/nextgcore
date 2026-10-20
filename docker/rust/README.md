@@ -68,34 +68,27 @@ docker compose -f docker-compose-epc.yml up -d
 docker compose -f docker-compose-epc.yml logs -f
 ```
 
-> **Scope of the EPC stage — it is bring-up, not an attach.** Unlike the 5G
-> stack, which completes a real UE registration, PDU session and data-plane
-> ping, the EPC deployment asserts that the seven NFs run healthy, that **both**
-> PFCP associations in the chain came up — Sxa (SGW-C ↔ SGW-U) and Sxb (PGW-C ↔
-> PGW-U, asserted from both ends) — and that the PGW-C's S5/S8 GTP-C socket is
-> serving.
+> **Scope of the EPC stage — a real LTE attach and a 0%-loss ping (#303).**
+> The compose file now carries nextgsim's LTE eNB (`enb`, 172.24.0.50) and UE
+> (`lte-ue`), built from nextgsim's `Dockerfile.enb-local` /
+> `Dockerfile.lte-ue-local` (nextgsim #186). The nightly stage first asserts what
+> it always did — the seven NFs healthy, both PFCP associations (Sxa SGW-C ↔
+> SGW-U, Sxb PGW-C ↔ PGW-U, from both ends) and the PGW-C's S5/S8 socket
+> serving — and then `epc-attach-check.sh`:
 >
-> The whole chain `MME → SGW-C → SGW-U → PGW-C → PGW-U` is now **deployed**:
-> issue #380 added the PGW-C and PGW-U, which are `nextgcore-smfd` and
-> `nextgcore-upfd` in their EPC roles (TS 23.401 §4.2.1's single-gateway option,
-> realised over a combined Sxa/Sxb interface per TS 29.244 §5.2.6 — the same
-> binaries, a different config and network). They are dedicated instances on the
-> `epc` network rather than the 5GC's `smf`/`upf`, because the two Docker
-> networks have no route between them, because the S5-U F-TEID must carry an
-> address the SGW-U can actually reach, and because TS 29.244 §6.2.6 scopes a
-> PFCP association to one CP/UP function pair. See `specs/epc-pgw-container.md`.
+> 1. S1 Setup accepted by the MME;
+> 2. the UE at EMM-REGISTERED with its default EPS bearer activated on the
+>    **same EBI** at the UE and the MME, and a non-zero PDN address;
+> 3. 20 ICMP echoes from the bearer's TUN to the PGW-U SGi address
+>    `10.45.0.1` with 0% loss — UE → eNB → S1-U → SGW-U → S5-U → PGW-U and back.
 >
-> Two things it still does **not** exercise, and why:
->
-> | Not exercised | Reason |
-> |---|---|
-> | UE attach (S1AP + LTE NAS) | Neither repo ships an LTE eNB or UE simulator — no S1AP (TS 36.413) and no EMM/ESM (TS 24.301) UE side — and there is no `enb`/`ue` service here. The MME's attach chain is complete in code and every hop it ends at is now deployed; only the originator is missing. |
-> | GTP-U user-plane forwarding, and any S5/S8 *transaction* | Both need an attach to originate a Create Session Request first, so there is no 0%-loss claim and no asserted Create Session Response. The PGW-C's socket is bound and its Sxb association is up — every precondition for anchoring a session — but nothing sends one. |
->
-> Building the eNB/UE simulator is tracked as option A in nextgcore #328 and as
-> nextgsim #186; the full reasoning is in `specs/epc-e2e-scope.md`. A green EPC
-> stage means the network came up and associated end to end — not that a
-> subscriber attached.
+> The subscriber (IMSI 999700000000001, TS 35.208 K/OPc, APN `internet`) is
+> seeded by the same `docs/assets/webui/mongo-init.js` the 5G compose uses. The
+> `lte-ue` service needs `NET_ADMIN` and `/dev/net/tun` for the bearer's TUN;
+> the eNB needs only the host `sctp` module (S1-MME is an outbound kernel SCTP
+> association). Not exercised: dedicated bearers, handover, paging, and egress
+> beyond the PGW-U. History: `specs/epc-e2e-scope.md` (#328) and
+> `specs/epc-pgw-container.md` (#380).
 
 ### Deploy Full Stack (5GC + EPC)
 

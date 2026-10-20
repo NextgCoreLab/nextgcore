@@ -152,6 +152,20 @@ RUN CARGO_TARGET=$(cat /tmp/cargo_target) && \
         cp target/release/nextgcore-amfd /out/nextgcore-amfd; \
     fi
 
+# Rebuild mmed WITH kernel SCTP (#303). Unlike amfd, mmed offers NO userspace
+# S1-MME backend (s1ap_path.rs): built without `kernel-sctp` it starts, binds
+# nothing on 36412 and logs that S1-MME is absent. The default build above is
+# exactly that, so until this step the EPC containers had an MME no eNB could
+# reach -- invisible while the EPC stage asserted bring-up only.
+RUN CARGO_TARGET=$(cat /tmp/cargo_target) && \
+    if [ "$(uname -m)" != "$(echo $CARGO_TARGET | cut -d- -f1)" ]; then \
+        cargo build --release --target "$CARGO_TARGET" -p nextgcore-mmed --features kernel-sctp 2>&1 && \
+        cp "target/$CARGO_TARGET/release/nextgcore-mmed" /out/nextgcore-mmed; \
+    else \
+        cargo build --release -p nextgcore-mmed --features kernel-sctp 2>&1 && \
+        cp target/release/nextgcore-mmed /out/nextgcore-mmed; \
+    fi
+
 # Build nextgsim gNB and UE. The gNB is built WITH `--features kernel-sctp`
 # (scoped to -p nextgsim-gnb, since the feature is defined on that package) so
 # it too can associate over native kernel SCTP; nr-ue needs no kernel feature.
@@ -181,6 +195,22 @@ RUN CARGO_TARGET=$(cat /tmp/cargo_target) && \
     cp target/release/nr-gnb /out/ 2>/dev/null || true && \
     cp target/release/nr-ue /out/ 2>/dev/null || true && \
     cp target/release/nr-cli /out/ 2>/dev/null || true
+
+# The LTE eNB and UE (nextgsim #186), for the EPC stage (#303). Strict, unlike
+# the NR block above: the EPC stage is meaningless without them, so a failed
+# build must fail here rather than surface as a missing image two jobs later.
+# lte-enb needs kernel SCTP (S1-MME has no userspace path in nextgsim-enb);
+# lte-ue talks RLS only and has no such feature.
+RUN CARGO_TARGET=$(cat /tmp/cargo_target) && \
+    if [ "$(uname -m)" != "$(echo $CARGO_TARGET | cut -d- -f1)" ]; then \
+        cargo build --release --target "$CARGO_TARGET" -p nextgsim-enb --features kernel-sctp --bin lte-enb && \
+        cargo build --release --target "$CARGO_TARGET" -p nextgsim-lte-ue --bin lte-ue && \
+        cp "target/$CARGO_TARGET/release/lte-enb" "target/$CARGO_TARGET/release/lte-ue" /out/; \
+    else \
+        cargo build --release -p nextgsim-enb --features kernel-sctp --bin lte-enb && \
+        cargo build --release -p nextgsim-lte-ue --bin lte-ue && \
+        cp target/release/lte-enb target/release/lte-ue /out/; \
+    fi
 
 # Final stage: tiny image with only binaries
 FROM debian:bookworm-slim

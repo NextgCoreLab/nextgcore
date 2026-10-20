@@ -1,5 +1,6 @@
 # NextGCore EPC (LTE) Deployment
-# Deploys the 7 EPC NFs: MME, SGW-C, SGW-U, PGW-C, PGW-U, HSS, PCRF
+# Deploys the 7 EPC NFs: MME, SGW-C, SGW-U, PGW-C, PGW-U, HSS, PCRF,
+# plus nextgsim's LTE eNB and UE (#303) for the attach + ping stage
 #
 # Network: 172.24.0.0/24 (separate from 5GC at 172.23.0.0/24)
 #
@@ -93,6 +94,12 @@ services:
       MONGO_INITDB_DATABASE: nextgcore
     volumes:
       - mongodb_epc_data:/data/db
+      # #303: the same seed the 5G compose mounts. It provisions IMSI
+      # 999700000000001 with TS 35.208 K/OPc and APN "internet", which is the
+      # subscriber nextgsim's LTE UE (config/lte-ue.yaml) attaches as. One seed
+      # for both stacks, so the EPC and 5GC test subscribers cannot drift apart.
+      # Runs only on an empty volume, so `down -v` between runs reseeds it.
+      - ../../docs/assets/webui/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
     networks:
       epc:
         ipv4_address: 172.24.0.2
@@ -362,6 +369,54 @@ services:
     privileged: true
     depends_on:
       sgwc:
+        condition: service_started
+
+  # ==========================================================================
+  # E-UTRAN (#303): nextgsim's LTE eNB and UE (nextgsim #186), so the EPC stage
+  # can assert a real attach and a 0%-loss ping instead of bring-up only.
+  # Images come from nextgsim's Dockerfile.enb-local / Dockerfile.lte-ue-local;
+  # both bake configs that already target this network (MME .5, eNB .50), and
+  # every value below is an explicit override (NEXTGSIM_*) so the contract is
+  # visible here rather than only inside the image.
+  # ==========================================================================
+  enb:
+    image: nextgsim-lte-enb:latest
+    container_name: nextgsim-lte-enb
+    <<: *common
+    environment:
+      <<: *common-env
+      NEXTGSIM_ENB_MME_ADDR: 172.24.0.5
+      NEXTGSIM_ENB_IP: 172.24.0.50
+      NEXTGSIM_ENB_GTP_IP: 172.24.0.50
+    networks:
+      epc:
+        ipv4_address: 172.24.0.50
+    # S1-MME is an OUTBOUND kernel SCTP association from the eNB, so it needs
+    # no privileges -- only the host's `sctp` module, which mme's own listener
+    # needs too.
+    depends_on:
+      mme:
+        condition: service_started
+
+  lte-ue:
+    image: nextgsim-lte-ue:latest
+    container_name: nextgsim-lte-ue
+    <<: *common
+    environment:
+      <<: *common-env
+      NEXTGSIM_UE_ENB_ADDR: 172.24.0.50
+      NEXTGSIM_UE_IMSI: "999700000000001"
+    networks:
+      epc:
+        ipv4_address: 172.24.0.60
+    # The default bearer's PDN address goes on a TUN (lteuetun5), which is what
+    # lets the stage ping THROUGH the bearer rather than merely observe it.
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    depends_on:
+      enb:
         condition: service_started
 
 networks:

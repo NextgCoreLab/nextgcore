@@ -1213,21 +1213,20 @@ jobs:
           cd nextgcore/docker/rust
           docker compose -f docker-compose.yml -f docker-compose.oauth2.yml down -v
 
-  # NOT an end-to-end attach, and named so deliberately (#328). Nothing in either
-  # repo speaks S1AP or LTE NAS on the UE side, so no UE attach can be
-  # originated. This stage asserts bring-up and PFCP association health, which is
-  # the largest honest claim available today, and catches the
-  # compose-drifts-from-the-binaries defect class.
+  # The EPC end-to-end stage (#303). Until nextgsim #186 it could assert only
+  # bring-up and PFCP association health (#328, option D), because nothing spoke
+  # S1AP or LTE NAS on the UE side. It still asserts all of that first -- the
+  # compose-drifts-from-the-binaries defect class -- and then a real attach.
   #
   # #380 closed one of the three gaps this comment used to list: the S5/S8 leg now
   # HAS a container to reach, so the chain MME -> SGW-C -> SGW-U -> PGW-C -> PGW-U
   # is deployed and both of its PFCP associations (Sxa and Sxb) are asserted below.
-  # The remaining gap is the originator.
-  #
-  # Option A (an LTE eNB + UE simulator in nextgsim) is what would make this a
-  # true mirror of the 5G stage. See specs/epc-e2e-scope.md.
+  # #303 closed the last one, the originator: nextgsim's LTE eNB and UE (nextgsim
+  # #186, option A of #328) now drive a real attach through that chain, and the
+  # stage asserts it plus a 0%-loss ping -- the true mirror of the 5G stage that
+  # specs/epc-e2e-scope.md said option A would make it.
   docker-e2e-epc:
-    name: EPC bring-up (no attach; see specs/epc-e2e-scope.md)
+    name: EPC E2E (LTE attach + 0%-loss ping)
     runs-on: ubuntu-latest
     needs: docker-build
     steps:
@@ -1273,6 +1272,24 @@ jobs:
           docker cp builder:/out/. binaries/
           docker rm builder
           docker build -f Dockerfile.core -t nextgcore-core:latest .
+
+      # #303: nextgsim's LTE eNB and UE (nextgsim #186). The builder image above
+      # already compiled lte-enb (kernel SCTP) and lte-ue from the SAME nextgsim
+      # sha this job asserted, so the images are built from those binaries with
+      # nextgsim's own Dockerfiles -- the same pattern the 5G stage uses for the
+      # gNB and UE.
+      - name: Build the LTE eNB and UE images
+        run: |
+          set -euo pipefail
+          cd nextgcore/docker/rust
+          test -f binaries/lte-enb && test -f binaries/lte-ue \
+            || { echo "::error::binaries/lte-enb or lte-ue missing -- Dockerfile.builder did not build them"; exit 1; }
+          mkdir -p ../../../nextgsim/binaries
+          cp binaries/lte-enb binaries/lte-ue ../../../nextgsim/binaries/
+          docker build -f ../../../nextgsim/Dockerfile.enb-local \
+            -t nextgsim-lte-enb:latest ../../../nextgsim
+          docker build -f ../../../nextgsim/Dockerfile.lte-ue-local \
+            -t nextgsim-lte-ue:latest ../../../nextgsim
 
       - name: Build EPC NF images
         run: |
@@ -1413,45 +1430,45 @@ jobs:
           done
           exit $rc
 
-      # Stated where an operator reads it, not only in the spec: a green stage
-      # here must not be mistaken for a working EPC attach.
-      - name: State what this stage does NOT assert
+      # #303, #59 criterion 8: the stage now ASSERTS an attach and a user plane,
+      # where it used to state that it could not. The RAN starts only after every
+      # gate above passed, so a failure below is an attach or forwarding failure,
+      # not a bring-up one.
+      - name: Start the LTE eNB and UE
+        run: |
+          cd nextgcore/docker/rust
+          docker compose -f docker-compose-epc.yml up -d enb
+          docker compose -f docker-compose-epc.yml up -d lte-ue
+
+      # S1 Setup -> EMM-REGISTERED with the default EPS bearer active on BOTH ends
+      # (same EBI) -> a 0%-loss ping from the bearer's TUN to the PGW-U's SGi
+      # address, crossing UE -> eNB -> S1-U -> SGW-U -> S5-U -> PGW-U and back.
+      # One script, so a local `docker run` harness asserts exactly what CI does.
+      - name: Assert LTE attach and a 0%-loss ping through the default bearer
+        run: |
+          cd nextgcore/docker/rust
+          ./epc-attach-check.sh 10.45.0.1 20
+
+      - name: State the stage's scope
         if: always()
         run: |
           cat <<'NOTE'
-          === EPC bring-up stage: scope (see nextgcore specs/epc-e2e-scope.md, #328,
-              and specs/epc-pgw-container.md, #380) ===
-          ASSERTED: all seven EPC NFs run and report healthy; BOTH PFCP associations in
-                    the chain came up, each read from the daemons' own live metrics
-                    rather than from a timer --
-                      * Sxa: SGW-C <-> SGW-U   (sgwu_pfcp_associations >= 1)
-                      * Sxb: PGW-C <-> PGW-U   (smf_n4_associations >= 1 AND
-                                                upf_pfcp_associations >= 1)
-                    and the PGW-C's S5/S8 GTP-C socket is serving
-                    (smf_s5s8_bound == 1), so a Create Session Request relayed by the
-                    SGW-C has a bound socket to reach.
-
-          NOT ASSERTED, and why:
-            * No UE attach. Neither repo has an LTE eNB or UE simulator -- no S1AP
-              (TS 36.413) and no EMM/ESM (TS 24.301) UE side exists, and the compose
-              file has no enb/ue service. The MME's attach chain IS complete in code
-              (s1ap_handler.rs -> nas_dispatch -> s11_handler.rs), and as of #380 the
-              S5/S8 hop it ends at is now DEPLOYED as well; only the originator is
-              missing. Tracked as option A in #328 / nextgsim #186.
-            * No GTP-U user-plane forwarding, and so no 0%-loss claim: that needs an
-              attach to establish a bearer first.
-            * No S5/S8 TRANSACTION. The PGW-C's socket is bound and its Sxb
-              association is up, which is every precondition for anchoring a session
-              -- but nothing here sends a Create Session Request, because only an
-              attach originates one. This is the ceiling #380 leaves in place, and it
-              is the same ceiling as the first bullet, not a second gap.
+          === EPC E2E stage: scope (nextgcore #303, #59 criterion 8; specs/epc-e2e-scope.md) ===
+          ASSERTED: all seven EPC NFs healthy; Sxa and Sxb PFCP associations up and
+                    the PGW-C S5/S8 socket serving (from the daemons' own metrics);
+                    S1 Setup accepted; a real LTE UE (nextgsim) attached to
+                    EMM-REGISTERED with its default EPS bearer activated on the same
+                    EBI at the UE and the MME; and 20 ICMP echoes from the bearer's
+                    PDN address to the PGW-U SGi address with 0% loss.
+          NOT ASSERTED: dedicated bearers, handover, idle-mode/paging, internet
+                    egress beyond the PGW-U, and the IPv6 PDN type.
           NOTE
 
       - name: Collect logs on failure
         if: failure()
         run: |
           cd nextgcore/docker/rust
-          docker compose -f docker-compose-epc.yml logs --tail=50
+          docker compose -f docker-compose-epc.yml logs --tail=80
 
       - name: Teardown
         if: always()
@@ -1477,10 +1494,10 @@ jobs:
   #
   # SCOPE IS PART OF THE RECORD. The manifest states what was NOT validated as
   # well as what was: the heavy jobs are nightly/dispatch rather than per-PR, and
-  # `docker-e2e-epc` is bring-up WITHOUT an attach (specs/epc-e2e-scope.md). A
-  # release note derived from a manifest that implied an EPC attach had passed
-  # would be the #414 defect at release scale -- a green tick meaning more than
-  # it should.
+  # `docker-e2e-epc` asserts an LTE attach and a 0%-loss default-bearer ping but
+  # NOT dedicated bearers, handover or paging (#303). A release note claiming
+  # more than the manifest's `scope` would be the #414 defect at release scale --
+  # a green tick meaning more than it should.
   # ====================================================================
   record-validated-pair:
     name: Record the validated commit pair
@@ -1512,7 +1529,7 @@ jobs:
             "validated_by": ["docker-build", "docker-e2e", "docker-e2e-epc"],
             "scope": {
               "5gc_e2e": "Real UE registration over N2 through nextgsim's gNB, plus a Service Request CM-IDLE cycle with Namf event delivery assertions (#397, #403).",
-              "epc_e2e": "Bring-up ONLY -- no attach, no GTP-U forwarding, no S5/S8 transaction. See specs/epc-e2e-scope.md.",
+              "epc_e2e": "Real LTE attach through nextgsim's eNB and UE to EMM-REGISTERED with the default EPS bearer, and a 20-packet 0%-loss ping through S1-U/SGW-U/S5-U/PGW-U (#303). Not dedicated bearers, handover or paging.",
               "not_validated": "These jobs run nightly or on dispatch, NOT per-PR. A commit on main between nightlies has not been through this."
             }
           }
