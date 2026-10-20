@@ -145,6 +145,22 @@ fn main() -> Result<()> {
         log::debug!("Configuration file not found: {}", args.config);
     }
 
+    // Open the subscriber store (#478). Every S6a/Cx/SWx answer that needs
+    // subscriber data reads it through nextgcore-dbi, and until this call the
+    // store was never opened: `--db-uri` and the YAML `db_uri` were parsed and
+    // then ignored, so every AIR was answered 5012 "Database not initialized".
+    // TS 29.272 §5.2.3.1.3 has the HSS answer AIR from the subscriber data it
+    // holds; 5012 is for a genuine internal failure, not a store never opened.
+    // An HSS that cannot reach its store cannot answer anything, so this is
+    // fatal rather than a warning.
+    let db_uri = resolve_db_uri(args.db_uri.as_deref(), &args.config)
+        .context("no subscriber store configured: pass --db-uri or set db_uri in the config")?;
+    open_subscriber_store(
+        &db_uri,
+        STORE_CONNECT_ATTEMPTS,
+        std::time::Duration::from_secs(2),
+    )?;
+
     // Initialize HSS state machine
     let mut hss_sm = HssSmContext::new();
     hss_sm.init(false); // use_mongodb_change_stream = false by default
@@ -325,6 +341,56 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// How many times startup tries to reach MongoDB before giving up. Each attempt
+/// already waits for the driver's server-selection timeout, so a store that
+/// starts a little after the HSS (as in docker compose) is still found.
+const STORE_CONNECT_ATTEMPTS: u32 = 5;
+
+/// The subscriber-store URI: `--db-uri` wins over the config file's top-level
+/// `db_uri` (the key the shipped `docker/rust/configs/epc/hss.yaml` uses), the
+/// same CLI-over-YAML precedence as the Diameter identity flags. `None` when
+/// neither names one, or when the config is absent or carries no `db_uri`.
+fn resolve_db_uri(cli: Option<&str>, config_path: &str) -> Option<String> {
+    if let Some(uri) = cli.filter(|u| !u.is_empty()) {
+        return Some(uri.to_string());
+    }
+    #[derive(serde::Deserialize)]
+    struct TopLevel {
+        db_uri: Option<String>,
+    }
+    let content = std::fs::read_to_string(config_path).ok()?;
+    serde_yaml::from_str::<TopLevel>(&content)
+        .ok()?
+        .db_uri
+        .filter(|u| !u.is_empty())
+}
+
+/// Open nextgcore-dbi's subscriber collection, retrying only the "server not
+/// reachable yet" failure. A malformed URI fails on the first attempt.
+fn open_subscriber_store(db_uri: &str, attempts: u32, backoff: std::time::Duration) -> Result<()> {
+    let mut attempt = 1;
+    loop {
+        match nextgcore_dbi::nextgcore_dbi_init(db_uri) {
+            Ok(()) => {
+                log::info!("Subscriber store opened");
+                return Ok(());
+            }
+            Err(nextgcore_dbi::mongoc::DbiError::Retry) if attempt < attempts => {
+                log::warn!(
+                    "Subscriber store not reachable (attempt {attempt}/{attempts}); retrying"
+                );
+                attempt += 1;
+                std::thread::sleep(backoff);
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "cannot open the subscriber store after {attempt} attempt(s): {e}"
+                ))
+            }
+        }
+    }
+}
+
 /// Initialize logging based on command line arguments
 fn init_logging(args: &Args) -> Result<()> {
     let mut builder = env_logger::Builder::new();
@@ -482,11 +548,81 @@ fn cleanup(hss_sm: &mut HssSmContext) {
 
     hss_context_final();
     log::info!("HSS context finalized");
+
+    nextgcore_dbi::nextgcore_dbi_final();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A config file unique to the calling test, removed when the guard drops.
+    struct TempConfig(std::path::PathBuf);
+    impl Drop for TempConfig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    fn write_config(body: &str) -> (TempConfig, String) {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("hssd-test-{}-{n}.yaml", std::process::id()));
+        std::fs::write(&path, body).unwrap();
+        let s = path.to_str().unwrap().to_string();
+        (TempConfig(path), s)
+    }
+
+    /// #478: the shipped config's top-level `db_uri` is what hssd opens.
+    #[test]
+    fn db_uri_comes_from_the_config_file() {
+        let (_d, path) = write_config("db_uri: mongodb://mongodb:27017/nextgcore\nhss: {}\n");
+        assert_eq!(
+            resolve_db_uri(None, &path).as_deref(),
+            Some("mongodb://mongodb:27017/nextgcore")
+        );
+    }
+
+    #[test]
+    fn cli_db_uri_overrides_the_config_file() {
+        let (_d, path) = write_config("db_uri: mongodb://from-yaml:27017/x\n");
+        assert_eq!(
+            resolve_db_uri(Some("mongodb://from-cli:27017/y"), &path).as_deref(),
+            Some("mongodb://from-cli:27017/y")
+        );
+    }
+
+    #[test]
+    fn no_db_uri_anywhere_is_none() {
+        let (_d, path) = write_config("hss: {}\n");
+        assert_eq!(resolve_db_uri(None, &path), None);
+        assert_eq!(resolve_db_uri(Some(""), "/nonexistent/hss.yaml"), None);
+    }
+
+    /// A malformed URI is a configuration error: refused on the first attempt,
+    /// never retried as if the server were merely slow to start.
+    #[test]
+    fn a_malformed_store_uri_fails_without_retrying() {
+        let start = std::time::Instant::now();
+        let err = open_subscriber_store("not-a-mongodb-uri", 5, std::time::Duration::from_secs(5))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("after 1 attempt(s)"), "{err}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// An unreachable store is retried, then startup fails rather than serving
+    /// 5012 for every AIR.
+    #[test]
+    fn an_unreachable_store_is_retried_then_fatal() {
+        let err = open_subscriber_store(
+            "mongodb://127.0.0.1:1/nextgcore?serverSelectionTimeoutMS=100&connectTimeoutMS=100",
+            2,
+            std::time::Duration::from_millis(10),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("after 2 attempt(s)"), "{err}");
+    }
 
     #[test]
     fn test_args_default() {
