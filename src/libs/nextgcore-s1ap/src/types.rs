@@ -5,6 +5,7 @@
 pub use nextgcore_asn1c::s1ap::cause::{
     Cause, CauseMisc, CauseNas, CauseProtocol, CauseRadioNetwork, CauseTransport,
 };
+pub use nextgcore_asn1c::s1ap::types::Criticality;
 
 // ============================================================================
 // S1 Setup (TS 36.413 §9.1.8.4-9.1.8.6)
@@ -1329,4 +1330,10 @@ pub enum RrcEstablishmentCause {
     MtAccess = 2,
     MoSignalling = 3,
     MoData = 4,
+    /// delay-tolerantAccess, an extension value (TS 36.413 §9.2.1.3a)
+    DelayTolerantAccess = 5,
+    /// mo-VoiceCall, an extension value
+    MoVoiceCall = 6,
+    /// mo-ExceptionData, an extension value
+    MoExceptionData = 7,
 }
