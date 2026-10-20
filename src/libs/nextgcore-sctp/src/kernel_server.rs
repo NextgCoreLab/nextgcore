@@ -47,7 +47,7 @@ use crate::kernel::{
     SCTP_SHUTDOWN_EVENT,
 };
 use crate::server::{SctpServerConfig, ServerError, ServerEvent};
-use crate::{ReceivedMessage, SctpError, MSG_NOTIFICATION, NEXTGCORE_MAX_SDU_LEN};
+use crate::{ReceivedMessage, SctpError, MSG_EOR, MSG_NOTIFICATION, NEXTGCORE_MAX_SDU_LEN};
 
 type Result<T> = std::result::Result<T, ServerError>;
 
@@ -289,6 +289,12 @@ async fn read_loop(
     recv_cap: usize,
     ppid: u32,
 ) {
+    // A message larger than the receive buffer arrives in pieces: every piece but
+    // the last has MSG_EOR clear (RFC 6458 §8.1.20 / §5.3.4). They are gathered
+    // here, under the FIRST piece's stream and PPID, and delivered as one message
+    // only when MSG_EOR arrives (#510). Bounded so a peer cannot grow it at will.
+    let reassembly_cap = reassembly_limit(recv_cap);
+    let mut partial: Option<(Vec<u8>, crate::NextgcoreSctpInfo)> = None;
     loop {
         let mut ready = match afd.readable().await {
             Ok(g) => g,
@@ -321,6 +327,27 @@ async fn read_loop(
                     continue;
                 }
                 buf.truncate(n);
+                let (data, info) = match partial.take() {
+                    Some((mut acc, first)) => {
+                        acc.extend_from_slice(&buf);
+                        (acc, first)
+                    }
+                    None => (buf, info),
+                };
+                if flags & MSG_EOR == 0 {
+                    if data.len() > reassembly_cap {
+                        emit_closed(
+                            &tx,
+                            &associations,
+                            id,
+                            &format!("message exceeds the {reassembly_cap}-octet reassembly limit"),
+                        );
+                        return;
+                    }
+                    // More of this message to come.
+                    partial = Some((data, info));
+                    continue;
+                }
                 // An inbound PPID of 0 means the peer did not stamp one; fall
                 // back to the association's configured application protocol.
                 let ppid = if info.ppid == 0 { ppid } else { info.ppid };
@@ -328,7 +355,7 @@ async fn read_loop(
                     association_id: id,
                     message: ReceivedMessage {
                         stream_id: info.stream_no,
-                        data: Bytes::from(buf),
+                        data: Bytes::from(data),
                         ppid,
                     },
                 });
@@ -340,6 +367,13 @@ async fn read_loop(
             Err(_would_block) => { /* readiness cleared; await again */ }
         }
     }
+}
+
+/// The largest message the read loop will reassemble from partial deliveries: 16
+/// receive buffers, and never less than 1 MiB -- comfortably above any NGAP or
+/// S1AP PDU, while still a hard stop for a peer that never sends MSG_EOR.
+fn reassembly_limit(recv_cap: usize) -> usize {
+    recv_cap.saturating_mul(16).max(1 << 20)
 }
 
 /// Emit an `AssociationClosed` event and drop the association from the registry.
