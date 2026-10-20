@@ -1305,13 +1305,21 @@ pub fn build_create_session_response(
         // Charging ID
         bc_builder = bc_builder.add_charging_id(sess.charging.id);
 
-        // PGW S5U F-TEID
+        // PGW user-plane F-TEID, at the instance TS 29.274 Table 7.2.2-2 assigns its
+        // interface: S5/S8-U PGW is instance 2 and S2b-U PGW instance 4. Instance 0 is
+        // the S1-U SGW F-TEID's slot, which is where this used to be written -- so an
+        // SGW-C reading instance 2 (as sgwcd does, per the table) found no PGW-U
+        // endpoint and provisioned an uplink that forwarded nowhere (#303).
+        let pgw_u_instance = match sess.gtp_rat_type {
+            gtp2_rat_type::WLAN => 4,
+            _ => 2,
+        };
         if let Some(addr) = bearer.pgw_s5u_addr {
             let f_teid = FTeid::new_ipv4(bearer_f_teid_interface, bearer.pgw_s5u_teid, addr);
-            bc_builder = bc_builder.add_f_teid(&f_teid, 0);
+            bc_builder = bc_builder.add_f_teid(&f_teid, pgw_u_instance);
         } else if let Some(addr) = bearer.pgw_s5u_addr6 {
             let f_teid = FTeid::new_ipv6(bearer_f_teid_interface, bearer.pgw_s5u_teid, addr);
-            bc_builder = bc_builder.add_f_teid(&f_teid, 0);
+            bc_builder = bc_builder.add_f_teid(&f_teid, pgw_u_instance);
         }
 
         builder = bc_builder.end();

@@ -35,6 +35,7 @@ pub fn handle_create_session_response(
     session_cause: u8,
     pgw_s5c_teid: u32,
     pgw_s5u_teid: u32,
+    pgw_s5u_addr: Option<std::net::Ipv4Addr>,
 ) -> HandlerResult {
     log::info!("Create Session Response");
 
@@ -75,11 +76,25 @@ pub fn handle_create_session_response(
     if let Some(bearer) = ctx.default_bearer_in_sess(sess.id) {
         if let Some(mut ul_tunnel) = ctx.ul_tunnel_in_bearer(bearer.id) {
             ul_tunnel.remote_teid = pgw_s5u_teid;
+            // The PGW-U's ADDRESS as well as its TEID (TS 29.274 §8.22: an F-TEID is
+            // both). The uplink FAR's Outer Header Creation needs a destination, and
+            // `sxa_build::outer_header_creation` correctly refuses to invent one, so with
+            // only the TEID stored the SGW-U was provisioned with an uplink FAR that
+            // forwards to nowhere: every uplink G-PDU failed "FAR has no outer header
+            // creation". Bring-up never sent a packet, so only the first real attach's
+            // ping showed it.
+            if let Some(addr) = pgw_s5u_addr {
+                ul_tunnel.remote_ip = crate::context::IpAddr {
+                    ipv4: Some(addr),
+                    ipv6: None,
+                };
+            }
             ctx.tunnel_update(&ul_tunnel);
             log::info!(
-                "    SGW_S5U_TEID[{}] PGW_S5U_TEID[{}]",
+                "    SGW_S5U_TEID[{}] PGW_S5U_TEID[{}] PGW_S5U_ADDR[{:?}]",
                 ul_tunnel.local_teid,
-                ul_tunnel.remote_teid
+                ul_tunnel.remote_teid,
+                ul_tunnel.remote_ip.ipv4
             );
         }
     }
@@ -456,8 +471,15 @@ mod tests {
 
     #[test]
     fn test_create_session_response_no_sess() {
-        let result =
-            handle_create_session_response(None, 1, &[], gtp_cause::REQUEST_ACCEPTED, 100, 200);
+        let result = handle_create_session_response(
+            None,
+            1,
+            &[],
+            gtp_cause::REQUEST_ACCEPTED,
+            100,
+            200,
+            None,
+        );
         matches!(result, HandlerResult::Error(gtp_cause::CONTEXT_NOT_FOUND));
     }
 

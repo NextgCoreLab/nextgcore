@@ -411,6 +411,7 @@ mod tests {
             s11_handler::gtp_cause::REQUEST_ACCEPTED,
             100,
             200,
+            None,
         );
         matches!(
             result,
