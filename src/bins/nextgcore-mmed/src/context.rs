@@ -1254,6 +1254,17 @@ pub struct MmeUe {
     /// normal one. What it does NOT mean is that emergency bearer services are
     /// implemented — see `emm_handler`'s emergency branch for the boundary.
     pub emergency_attach: bool,
+
+    /// The current attach's ATTACH COMPLETE has arrived (TS 23.401 §5.3.2.1 step 22).
+    ///
+    /// Step 23 sends the Modify Bearer Request only once BOTH this and the Initial
+    /// Context Setup Response (step 20, the eNB's S1-U F-TEID) are in, in whichever
+    /// order they arrive (#495). Reset at every ATTACH REQUEST.
+    pub attach_completed: bool,
+
+    /// The current attach's step-23 Modify Bearer Request has been sent, so a
+    /// duplicate ATTACH COMPLETE or ICS response does not send a second (#495).
+    pub attach_modify_bearer_sent: bool,
 }
 
 impl MmeUe {

@@ -1230,7 +1230,7 @@ fn bearers_of_session(
 }
 
 /// Every bearer of every session of one UE, in EBI order.
-fn bearers_of_ue(ctx: &MmeContext, mme_ue_id: u64) -> Vec<crate::context::MmeBearer> {
+pub(crate) fn bearers_of_ue(ctx: &MmeContext, mme_ue_id: u64) -> Vec<crate::context::MmeBearer> {
     let Some(mme_ue) = ctx.mme_ue_find_by_id(mme_ue_id) else {
         return Vec::new();
     };

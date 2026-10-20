@@ -309,14 +309,6 @@ pub fn nas_eps_send_attach_accept(
     )
     .ok_or(NasError::BuildFailed)?;
 
-    // Store for retransmission and arm T3450 (issue #45): storing the buffer
-    // without starting the timer is what left procedures outstanding forever.
-    mme_ue.t3450.pkbuf = Some(secured_message.clone());
-    mme_ue.t3450.start(nas_timer::T3450_DURATION);
-
-    // Clear UE radio capability as per TS24.301
-    mme_ue.ue_radio_capability.clear();
-
     // Build S1AP initial context setup request (APER via nextgcore-s1ap). The
     // Attach Accept NAS message travels inside this PDU, so the PDU — not the
     // bare NAS message — is what goes to the eNB (issue #42).
@@ -326,7 +318,23 @@ pub fn nas_eps_send_attach_accept(
         std::slice::from_ref(default_bearer),
         Some(&secured_message),
     )
-    .map_err(|_| NasError::BuildFailed)?;
+    .map_err(|e| {
+        log::error!(
+            "[{}] Initial Context Setup Request build failed: {e:?}",
+            mme_ue.imsi_bcd
+        );
+        NasError::BuildFailed
+    })?;
+
+    // Store for retransmission and arm T3450 (issue #45) only now that the Initial
+    // Context Setup carrying the accept exists (#495). Arming it first left a bare
+    // ATTACH ACCEPT to be retransmitted over Downlink NAS Transport -- no E-RAB, no
+    // AS security -- whenever the build failed.
+    mme_ue.t3450.pkbuf = Some(secured_message);
+    mme_ue.t3450.start(nas_timer::T3450_DURATION);
+
+    // Clear UE radio capability as per TS24.301
+    mme_ue.ue_radio_capability.clear();
 
     nas_eps_send_to_enb(mme_ue, enb_ue, s1ap_message)
 }
