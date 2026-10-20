@@ -82,6 +82,95 @@ pub(crate) fn invalid(ie_name: &'static str, reason: String) -> NgapError {
 }
 
 // ============================================================================
+// Extension handling, shared with mbs_transfer.rs
+// ============================================================================
+
+/// maxProtocolExtensions INTEGER ::= 65535 (NGAP-Containers)
+pub(crate) const MAX_PROTOCOL_EXTENSIONS: usize = 65535;
+
+/// Skip the extension additions of an extensible SEQUENCE whose extension bit
+/// was set (X.691 §18.8/§18.9): a normally-small length holding the number of
+/// additions minus 1, an n-bit presence bitmap, then each present addition
+/// wrapped as an open type. Truncation anywhere inside is an error
+/// (fail-closed); the addition *content* is version-bracket data and is
+/// skippable by definition.
+pub(crate) fn skip_extension_additions(decoder: &mut AperDecoder) -> NgapResult<()> {
+    let count = decoder.decode_normally_small_non_negative()? as usize + 1;
+    let mut present = Vec::with_capacity(count);
+    for _ in 0..count {
+        present.push(decoder.read_bit()?);
+    }
+    for is_present in present {
+        if is_present {
+            loop {
+                let (len, fragmented) = decoder.decode_length_fragment()?;
+                let _skipped = decoder.read_bytes(len)?;
+                if !fragmented {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Encode a `ProtocolExtensionContainer {{...}}`:
+/// `SEQUENCE (SIZE(1..maxProtocolExtensions)) OF ProtocolExtensionField`
+/// where `ProtocolExtensionField ::= SEQUENCE { id, criticality,
+/// extensionValue }` shares its wire shape with ProtocolIE-Field.
+pub(crate) fn encode_extension_container(
+    encoder: &mut AperEncoder,
+    fields: &[ProtocolIeField],
+) -> NgapResult<()> {
+    encoder.encode_constrained_length(fields.len(), 1, MAX_PROTOCOL_EXTENSIONS)?;
+    for field in fields {
+        field.encode_aper(encoder)?;
+    }
+    Ok(())
+}
+
+/// Decode a `ProtocolExtensionContainer` into its raw fields.
+pub(crate) fn decode_extension_container(
+    decoder: &mut AperDecoder,
+) -> NgapResult<Vec<ProtocolIeField>> {
+    let count = decoder.decode_constrained_length(1, MAX_PROTOCOL_EXTENSIONS)?;
+    let mut fields = Vec::with_capacity(count);
+    for _ in 0..count {
+        fields.push(ProtocolIeField::decode_aper(decoder)?);
+    }
+    Ok(fields)
+}
+
+/// Decode an iE-Extensions container in which no extension IE is
+/// comprehended: unknown ignore/notify extensions are skipped, unknown
+/// reject extensions fail the decode (TS 38.413 §10.3.4).
+pub(crate) fn decode_unknown_extensions_only(decoder: &mut AperDecoder) -> NgapResult<()> {
+    for field in decode_extension_container(decoder)? {
+        crate::ie::handle_unknown_ie(&field)?;
+    }
+    Ok(())
+}
+
+/// Finish decoding an extensible SEQUENCE once its root members are read
+/// (X.691 §19.6, §19.7): the optional `iE-Extensions` container is the last
+/// root member, and extension additions follow the root when the extension
+/// bit was set. Neither may be left unread, or every member after this
+/// SEQUENCE is decoded from the wrong bits (#469).
+pub(crate) fn finish_extensible_sequence(
+    decoder: &mut AperDecoder,
+    extended: bool,
+    ie_extensions_present: bool,
+) -> NgapResult<()> {
+    if ie_extensions_present {
+        decode_unknown_extensions_only(decoder)?;
+    }
+    if extended {
+        skip_extension_additions(decoder)?;
+    }
+    Ok(())
+}
+
+// ============================================================================
 // Transport layer types
 // ============================================================================
 
@@ -193,12 +282,13 @@ impl UpTransportLayerInformation {
                 format!("Unsupported choice index: {choice}"),
             ));
         }
-        let _ext = decoder.read_bit()?;
-        let _ie_ext = decoder.read_bit()?;
+        let ext = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
         let transport_layer_address = TransportLayerAddress::decode(decoder)?;
         let teid_bytes = decoder.decode_octet_string(Some(4), Some(4))?;
         let mut gtp_teid = [0u8; 4];
         gtp_teid.copy_from_slice(&teid_bytes);
+        finish_extensible_sequence(decoder, ext, ie_ext)?;
         Ok(UpTransportLayerInformation::GtpTunnel(GtpTunnel {
             transport_layer_address,
             gtp_teid,
@@ -221,9 +311,10 @@ fn decode_additional_ul_ngu_up_tnl_information(
     let count = decoder.decode_constrained_length(1, 3)?;
     let mut list = Vec::with_capacity(count);
     for _ in 0..count {
-        let _ext = decoder.read_bit()?; // item extension marker
-        let _ie_ext = decoder.read_bit()?; // no iE-Extensions
+        let ext = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
         list.push(UpTransportLayerInformation::decode(decoder)?);
+        finish_extensible_sequence(decoder, ext, ie_ext)?;
     }
     Ok(list)
 }
@@ -231,6 +322,41 @@ fn decode_additional_ul_ngu_up_tnl_information(
 // ============================================================================
 // QoS types
 // ============================================================================
+
+/// MaximumDataBurstVolume ::= INTEGER (0..4095, ..., 4096..2000000)
+/// (TS 38.413 §9.3.1.83). The extension range is not PER-visible, so a value
+/// past the root is the extension bit followed by an unconstrained whole
+/// number (X.691 §12.1, §12.2.6).
+const MAX_DATA_BURST_VOLUME_ROOT: u32 = 4095;
+const MAX_DATA_BURST_VOLUME: u32 = 2_000_000;
+
+fn encode_maximum_data_burst_volume(encoder: &mut AperEncoder, value: u32) -> NgapResult<()> {
+    if value <= MAX_DATA_BURST_VOLUME_ROOT {
+        return encode_ext_constrained(encoder, i64::from(value), 0, 4095);
+    }
+    if value > MAX_DATA_BURST_VOLUME {
+        return Err(invalid(
+            "MaximumDataBurstVolume",
+            format!("Value {value} outside 0..{MAX_DATA_BURST_VOLUME}"),
+        ));
+    }
+    encoder.write_bit(true);
+    encoder.encode_unconstrained_whole_number(i64::from(value))?;
+    Ok(())
+}
+
+fn decode_maximum_data_burst_volume(decoder: &mut AperDecoder) -> NgapResult<u32> {
+    let value = decode_ext_constrained(decoder, 0, 4095)?;
+    u32::try_from(value)
+        .ok()
+        .filter(|v| *v <= MAX_DATA_BURST_VOLUME)
+        .ok_or_else(|| {
+            invalid(
+                "MaximumDataBurstVolume",
+                format!("Value {value} outside 0..{MAX_DATA_BURST_VOLUME}"),
+            )
+        })
+}
 
 /// NonDynamic5QIDescriptor (TS 38.413 Section 9.3.1.28)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,8 +367,8 @@ pub struct NonDynamic5qiDescriptor {
     pub priority_level_qos: Option<u8>,
     /// Averaging Window in ms (0..4095, optional)
     pub averaging_window: Option<u16>,
-    /// Maximum Data Burst Volume in bytes (0..4095, optional)
-    pub maximum_data_burst_volume: Option<u16>,
+    /// Maximum Data Burst Volume in bytes (0..4095, extension 4096..2000000, optional)
+    pub maximum_data_burst_volume: Option<u32>,
 }
 
 impl NonDynamic5qiDescriptor {
@@ -269,17 +395,17 @@ impl NonDynamic5qiDescriptor {
             encode_ext_constrained(encoder, w as i64, 0, 4095)?;
         }
         if let Some(v) = self.maximum_data_burst_volume {
-            encode_ext_constrained(encoder, v as i64, 0, 4095)?;
+            encode_maximum_data_burst_volume(encoder, v)?;
         }
         Ok(())
     }
 
     fn decode(decoder: &mut AperDecoder) -> NgapResult<Self> {
-        let _ext = decoder.read_bit()?;
+        let ext = decoder.read_bit()?;
         let prio_present = decoder.read_bit()?;
         let avg_present = decoder.read_bit()?;
         let burst_present = decoder.read_bit()?;
-        let _ie_ext = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
         let five_qi = decode_ext_constrained(decoder, 0, 255)? as u16;
         let priority_level_qos = if prio_present {
             Some(decode_ext_constrained(decoder, 1, 127)? as u8)
@@ -292,10 +418,11 @@ impl NonDynamic5qiDescriptor {
             None
         };
         let maximum_data_burst_volume = if burst_present {
-            Some(decode_ext_constrained(decoder, 0, 4095)? as u16)
+            Some(decode_maximum_data_burst_volume(decoder)?)
         } else {
             None
         };
+        finish_extensible_sequence(decoder, ext, ie_ext)?;
         Ok(Self {
             five_qi,
             priority_level_qos,
@@ -330,8 +457,8 @@ pub struct Dynamic5qiDescriptor {
     pub delay_critical: Option<DelayCritical>,
     /// Averaging Window (conditional)
     pub averaging_window: Option<u16>,
-    /// Maximum Data Burst Volume (conditional)
-    pub maximum_data_burst_volume: Option<u16>,
+    /// Maximum Data Burst Volume in bytes (0..4095, extension 4096..2000000, conditional)
+    pub maximum_data_burst_volume: Option<u32>,
 }
 
 impl Dynamic5qiDescriptor {
@@ -360,24 +487,25 @@ impl Dynamic5qiDescriptor {
             encode_ext_constrained(encoder, w as i64, 0, 4095)?;
         }
         if let Some(v) = self.maximum_data_burst_volume {
-            encode_ext_constrained(encoder, v as i64, 0, 4095)?;
+            encode_maximum_data_burst_volume(encoder, v)?;
         }
         Ok(())
     }
 
     fn decode(decoder: &mut AperDecoder) -> NgapResult<Self> {
-        let _ext = decoder.read_bit()?;
+        let ext = decoder.read_bit()?;
         let five_qi_present = decoder.read_bit()?;
         let dc_present = decoder.read_bit()?;
         let avg_present = decoder.read_bit()?;
         let burst_present = decoder.read_bit()?;
-        let _ie_ext = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
         let priority_level_qos = decode_ext_constrained(decoder, 1, 127)? as u8;
         let packet_delay_budget = decode_ext_constrained(decoder, 0, 1023)? as u16;
-        let _per_ext = decoder.read_bit()?;
-        let _per_ie_ext = decoder.read_bit()?;
+        let per_ext = decoder.read_bit()?;
+        let per_ie_ext = decoder.read_bit()?;
         let per_scalar = decode_ext_constrained(decoder, 0, 9)? as u8;
         let per_exponent = decode_ext_constrained(decoder, 0, 9)? as u8;
+        finish_extensible_sequence(decoder, per_ext, per_ie_ext)?;
         let five_qi = if five_qi_present {
             Some(decode_ext_constrained(decoder, 0, 255)? as u16)
         } else {
@@ -399,10 +527,11 @@ impl Dynamic5qiDescriptor {
             None
         };
         let maximum_data_burst_volume = if burst_present {
-            Some(decode_ext_constrained(decoder, 0, 4095)? as u16)
+            Some(decode_maximum_data_burst_volume(decoder)?)
         } else {
             None
         };
+        finish_extensible_sequence(decoder, ext, ie_ext)?;
         Ok(Self {
             priority_level_qos,
             packet_delay_budget,
@@ -494,8 +623,8 @@ impl AllocationAndRetentionPriority {
     }
 
     fn decode(decoder: &mut AperDecoder) -> NgapResult<Self> {
-        let _ext = decoder.read_bit()?;
-        let _ie_ext = decoder.read_bit()?;
+        let ext = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
         let constraint = Constraint::new(1, 15);
         let priority_level_arp = decoder.decode_constrained_whole_number(&constraint)? as u8;
         let two = Constraint::extensible(0, 1);
@@ -507,6 +636,7 @@ impl AllocationAndRetentionPriority {
             0 => PreEmptionVulnerability::NotPreEmptable,
             _ => PreEmptionVulnerability::PreEmptable,
         };
+        finish_extensible_sequence(decoder, ext, ie_ext)?;
         Ok(Self {
             priority_level_arp,
             pre_emption_capability,
@@ -557,11 +687,11 @@ impl GbrQosInformation {
     }
 
     fn decode(decoder: &mut AperDecoder) -> NgapResult<Self> {
-        let _ext = decoder.read_bit()?;
+        let ext = decoder.read_bit()?;
         let notif_present = decoder.read_bit()?;
         let dl_present = decoder.read_bit()?;
         let ul_present = decoder.read_bit()?;
-        let _ie_ext = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
         let maximum_flow_bit_rate_dl = decode_bit_rate(decoder)?;
         let maximum_flow_bit_rate_ul = decode_bit_rate(decoder)?;
         let guaranteed_flow_bit_rate_dl = decode_bit_rate(decoder)?;
@@ -580,6 +710,7 @@ impl GbrQosInformation {
         } else {
             None
         };
+        finish_extensible_sequence(decoder, ext, ie_ext)?;
         Ok(Self {
             maximum_flow_bit_rate_dl,
             maximum_flow_bit_rate_ul,
@@ -638,11 +769,11 @@ impl QosFlowLevelQosParameters {
     }
 
     pub(crate) fn decode(decoder: &mut AperDecoder) -> NgapResult<Self> {
-        let _ext = decoder.read_bit()?;
+        let ext = decoder.read_bit()?;
         let gbr_present = decoder.read_bit()?;
         let reflective_present = decoder.read_bit()?;
         let additional_present = decoder.read_bit()?;
-        let _ie_ext = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
         let qos_characteristics = QosCharacteristics::decode(decoder)?;
         let allocation_and_retention_priority = AllocationAndRetentionPriority::decode(decoder)?;
         let gbr_qos_information = if gbr_present {
@@ -657,6 +788,7 @@ impl QosFlowLevelQosParameters {
         if additional_present {
             let _val = decoder.decode_enumerated(&single)?;
         }
+        finish_extensible_sequence(decoder, ext, ie_ext)?;
         Ok(Self {
             qos_characteristics,
             allocation_and_retention_priority,
@@ -699,9 +831,9 @@ impl QosFlowSetupRequestItem {
     }
 
     fn decode(decoder: &mut AperDecoder) -> NgapResult<Self> {
-        let _ext = decoder.read_bit()?;
+        let ext = decoder.read_bit()?;
         let erab_present = decoder.read_bit()?;
-        let _ie_ext = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
         let qos_flow_identifier = decode_qfi(decoder)?;
         let qos_flow_level_qos_parameters = QosFlowLevelQosParameters::decode(decoder)?;
         let e_rab_id = if erab_present {
@@ -709,6 +841,7 @@ impl QosFlowSetupRequestItem {
         } else {
             None
         };
+        finish_extensible_sequence(decoder, ext, ie_ext)?;
         Ok(Self {
             qos_flow_identifier,
             qos_flow_level_qos_parameters,
@@ -746,9 +879,9 @@ impl AssociatedQosFlowItem {
     }
 
     fn decode(decoder: &mut AperDecoder) -> NgapResult<Self> {
-        let _ext = decoder.read_bit()?;
+        let ext = decoder.read_bit()?;
         let mapping_present = decoder.read_bit()?;
-        let _ie_ext = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
         let qos_flow_identifier = decode_qfi(decoder)?;
         let qos_flow_mapping_indication = if mapping_present {
             let constraint = Constraint::extensible(0, 1);
@@ -765,6 +898,7 @@ impl AssociatedQosFlowItem {
         } else {
             None
         };
+        finish_extensible_sequence(decoder, ext, ie_ext)?;
         Ok(Self {
             qos_flow_identifier,
             qos_flow_mapping_indication,
@@ -792,14 +926,15 @@ impl QosFlowPerTnlInformation {
     }
 
     fn decode(decoder: &mut AperDecoder) -> NgapResult<Self> {
-        let _ext = decoder.read_bit()?;
-        let _ie_ext = decoder.read_bit()?;
+        let ext = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
         let up_transport_layer_information = UpTransportLayerInformation::decode(decoder)?;
         let count = decoder.decode_constrained_length(1, 64)?;
         let mut associated_qos_flow_list = Vec::with_capacity(count);
         for _ in 0..count {
             associated_qos_flow_list.push(AssociatedQosFlowItem::decode(decoder)?);
         }
+        finish_extensible_sequence(decoder, ext, ie_ext)?;
         Ok(Self {
             up_transport_layer_information,
             associated_qos_flow_list,
@@ -842,9 +977,10 @@ fn decode_qos_flow_per_tnl_information_list(
     let count = decoder.decode_constrained_length(1, MAX_MULTI_CONNECTIVITY_MINUS_ONE)?;
     let mut list = Vec::with_capacity(count);
     for _ in 0..count {
-        let _ext = decoder.read_bit()?; // item extension marker
-        let _ie_ext = decoder.read_bit()?; // no iE-Extensions
+        let ext = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
         list.push(QosFlowPerTnlInformation::decode(decoder)?);
+        finish_extensible_sequence(decoder, ext, ie_ext)?;
     }
     Ok(list)
 }
@@ -866,10 +1002,11 @@ impl QosFlowWithCauseItem {
     }
 
     fn decode(decoder: &mut AperDecoder) -> NgapResult<Self> {
-        let _ext = decoder.read_bit()?;
-        let _ie_ext = decoder.read_bit()?;
+        let ext = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
         let qos_flow_identifier = decode_qfi(decoder)?;
         let cause = Cause::decode_aper(decoder)?;
+        finish_extensible_sequence(decoder, ext, ie_ext)?;
         Ok(Self {
             qos_flow_identifier,
             cause,
@@ -948,9 +1085,9 @@ impl SecurityIndication {
     }
 
     fn decode(decoder: &mut AperDecoder) -> NgapResult<Self> {
-        let _ext = decoder.read_bit()?;
+        let ext = decoder.read_bit()?;
         let rate_present = decoder.read_bit()?;
-        let _ie_ext = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
         let constraint = Constraint::extensible(0, 2);
         let decode_indication = |v: i64| -> NgapResult<ProtectionIndication> {
             match v {
@@ -980,6 +1117,7 @@ impl SecurityIndication {
         } else {
             None
         };
+        finish_extensible_sequence(decoder, ext, ie_ext)?;
         Ok(Self {
             integrity_protection_indication: integrity,
             confidentiality_protection_indication: confidentiality,
@@ -1014,8 +1152,8 @@ impl SecurityResult {
     }
 
     fn decode(decoder: &mut AperDecoder) -> NgapResult<Self> {
-        let _ext = decoder.read_bit()?;
-        let _ie_ext = decoder.read_bit()?;
+        let ext = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
         let constraint = Constraint::extensible(0, 1);
         let decode_result = |v: i64| -> NgapResult<ProtectionResult> {
             match v {
@@ -1029,6 +1167,7 @@ impl SecurityResult {
         };
         let integrity = decode_result(decoder.decode_enumerated(&constraint)?)?;
         let confidentiality = decode_result(decoder.decode_enumerated(&constraint)?)?;
+        finish_extensible_sequence(decoder, ext, ie_ext)?;
         Ok(Self {
             integrity_protection_result: integrity,
             confidentiality_protection_result: confidentiality,
@@ -1085,10 +1224,11 @@ impl PduSessionAggregateMaximumBitRate {
     }
 
     fn decode(decoder: &mut AperDecoder) -> NgapResult<Self> {
-        let _ext = decoder.read_bit()?;
-        let _ie_ext = decoder.read_bit()?;
+        let ext = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
         let dl = decode_bit_rate(decoder)?;
         let ul = decode_bit_rate(decoder)?;
+        finish_extensible_sequence(decoder, ext, ie_ext)?;
         Ok(Self { dl, ul })
     }
 }
@@ -1131,9 +1271,13 @@ fn encode_container(container: &ProtocolIeContainer) -> NgapResult<Vec<u8>> {
 
 fn decode_container(data: &[u8]) -> NgapResult<ProtocolIeContainer> {
     let mut decoder = AperDecoder::new(data);
-    // Consume the outer SEQUENCE extension-presence bit (see encode_container).
-    let _ext = decoder.read_bit()?;
-    Ok(ProtocolIeContainer::decode_aper(&mut decoder)?)
+    // The outer SEQUENCE extension-presence bit (see encode_container). Its
+    // only root member is the mandatory container, so there is no iE-Extensions
+    // bit; extension additions, if flagged, follow the container.
+    let ext = decoder.read_bit()?;
+    let container = ProtocolIeContainer::decode_aper(&mut decoder)?;
+    finish_extensible_sequence(&mut decoder, ext, false)?;
+    Ok(container)
 }
 
 // ============================================================================
@@ -1348,11 +1492,11 @@ impl PduSessionResourceSetupResponseTransfer {
 
     pub fn decode(data: &[u8]) -> NgapResult<Self> {
         let mut decoder = AperDecoder::new(data);
-        let _ext = decoder.read_bit()?;
+        let ext = decoder.read_bit()?;
         let additional_present = decoder.read_bit()?;
         let security_present = decoder.read_bit()?;
         let failed_present = decoder.read_bit()?;
-        let _ie_ext = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
         let dl_qos_flow_per_tnl_information = QosFlowPerTnlInformation::decode(&mut decoder)?;
         let additional_dl_qos_flow_per_tnl_information = if additional_present {
             decode_qos_flow_per_tnl_information_list(&mut decoder)?
@@ -1369,6 +1513,7 @@ impl PduSessionResourceSetupResponseTransfer {
         } else {
             Vec::new()
         };
+        finish_extensible_sequence(&mut decoder, ext, ie_ext)?;
         Ok(Self {
             dl_qos_flow_per_tnl_information,
             additional_dl_qos_flow_per_tnl_information,
@@ -1399,10 +1544,11 @@ impl UlNguUpTnlModifyItem {
     }
 
     fn decode(decoder: &mut AperDecoder) -> NgapResult<Self> {
-        let _ext = decoder.read_bit()?;
-        let _ie_ext = decoder.read_bit()?;
+        let ext = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
         let ul_ngu_up_tnl_information = UpTransportLayerInformation::decode(decoder)?;
         let dl_ngu_up_tnl_information = UpTransportLayerInformation::decode(decoder)?;
+        finish_extensible_sequence(decoder, ext, ie_ext)?;
         Ok(Self {
             ul_ngu_up_tnl_information,
             dl_ngu_up_tnl_information,
@@ -1435,10 +1581,10 @@ impl QosFlowAddOrModifyRequestItem {
     }
 
     fn decode(decoder: &mut AperDecoder) -> NgapResult<Self> {
-        let _ext = decoder.read_bit()?;
+        let ext = decoder.read_bit()?;
         let params_present = decoder.read_bit()?;
         let erab_present = decoder.read_bit()?;
-        let _ie_ext = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
         let qos_flow_identifier = decode_qfi(decoder)?;
         let qos_flow_level_qos_parameters = if params_present {
             Some(QosFlowLevelQosParameters::decode(decoder)?)
@@ -1450,6 +1596,7 @@ impl QosFlowAddOrModifyRequestItem {
         } else {
             None
         };
+        finish_extensible_sequence(decoder, ext, ie_ext)?;
         Ok(Self {
             qos_flow_identifier,
             qos_flow_level_qos_parameters,
@@ -1591,9 +1738,10 @@ impl QosFlowAddOrModifyResponseItem {
     }
 
     fn decode(decoder: &mut AperDecoder) -> NgapResult<Self> {
-        let _ext = decoder.read_bit()?;
-        let _ie_ext = decoder.read_bit()?;
+        let ext = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
         let qos_flow_identifier = decode_qfi(decoder)?;
+        finish_extensible_sequence(decoder, ext, ie_ext)?;
         Ok(Self {
             qos_flow_identifier,
         })
@@ -1660,13 +1808,13 @@ impl PduSessionResourceModifyResponseTransfer {
 
     pub fn decode(data: &[u8]) -> NgapResult<Self> {
         let mut decoder = AperDecoder::new(data);
-        let _ext = decoder.read_bit()?;
+        let ext = decoder.read_bit()?;
         let dl_present = decoder.read_bit()?;
         let ul_present = decoder.read_bit()?;
         let response_present = decoder.read_bit()?;
         let additional_present = decoder.read_bit()?;
         let failed_present = decoder.read_bit()?;
-        let _ie_ext = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
         let dl_ngu_up_tnl_information = if dl_present {
             Some(UpTransportLayerInformation::decode(&mut decoder)?)
         } else {
@@ -1697,6 +1845,7 @@ impl PduSessionResourceModifyResponseTransfer {
         } else {
             Vec::new()
         };
+        finish_extensible_sequence(&mut decoder, ext, ie_ext)?;
         Ok(Self {
             dl_ngu_up_tnl_information,
             ul_ngu_up_tnl_information,
@@ -1730,9 +1879,10 @@ impl PduSessionResourceReleaseCommandTransfer {
 
     pub fn decode(data: &[u8]) -> NgapResult<Self> {
         let mut decoder = AperDecoder::new(data);
-        let _ext = decoder.read_bit()?;
-        let _ie_ext = decoder.read_bit()?;
+        let ext = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
         let cause = Cause::decode_aper(&mut decoder)?;
+        finish_extensible_sequence(&mut decoder, ext, ie_ext)?;
         Ok(Self { cause })
     }
 }
@@ -1755,8 +1905,9 @@ impl PduSessionResourceReleaseResponseTransfer {
 
     pub fn decode(data: &[u8]) -> NgapResult<Self> {
         let mut decoder = AperDecoder::new(data);
-        let _ext = decoder.read_bit()?;
-        let _ie_ext = decoder.read_bit()?;
+        let ext = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
+        finish_extensible_sequence(&mut decoder, ext, ie_ext)?;
         Ok(Self)
     }
 }
@@ -1785,10 +1936,10 @@ impl PathSwitchRequestTransfer {
         // SEQUENCE preamble: extension marker + 3 optional-field present bits
         // (dL-NGU-TNLInformationReused, userPlaneSecurityInformation,
         // iE-Extensions). The DL tunnel and accepted list are mandatory.
-        let _ext = decoder.read_bit()?;
+        let ext = decoder.read_bit()?;
         let reused_present = decoder.read_bit()?;
         let security_present = decoder.read_bit()?;
-        let _ie_ext = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
 
         let dl_ngu_up_tnl_information = UpTransportLayerInformation::decode(&mut decoder)?;
 
@@ -1808,11 +1959,13 @@ impl PathSwitchRequestTransfer {
         let mut qos_flow_accepted_list = Vec::with_capacity(count);
         for _ in 0..count {
             // QosFlowAcceptedItem ::= SEQUENCE { qosFlowIdentifier, iE-Ext OPT }
-            let _item_ext = decoder.read_bit()?;
-            let _item_ie_ext = decoder.read_bit()?;
+            let item_ext = decoder.read_bit()?;
+            let item_ie_ext = decoder.read_bit()?;
             qos_flow_accepted_list.push(decode_qfi(&mut decoder)?);
+            finish_extensible_sequence(&mut decoder, item_ext, item_ie_ext)?;
         }
 
+        finish_extensible_sequence(&mut decoder, ext, ie_ext)?;
         Ok(Self {
             dl_ngu_up_tnl_information,
             qos_flow_accepted_list,
@@ -1892,12 +2045,12 @@ impl PathSwitchRequestAcknowledgeTransfer {
 
     pub fn decode(data: &[u8]) -> NgapResult<Self> {
         let mut decoder = AperDecoder::new(data);
-        let _ext = decoder.read_bit()?;
+        let ext = decoder.read_bit()?;
         let tnl_present = decoder.read_bit()?;
         let si_present = decoder.read_bit()?;
         let sr_present = decoder.read_bit()?;
         let release_present = decoder.read_bit()?;
-        let _ie_ext = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
 
         let ul_ngu_up_tnl_information = if tnl_present {
             Some(UpTransportLayerInformation::decode(&mut decoder)?)
@@ -1925,6 +2078,7 @@ impl PathSwitchRequestAcknowledgeTransfer {
             Vec::new()
         };
 
+        finish_extensible_sequence(&mut decoder, ext, ie_ext)?;
         Ok(Self {
             ul_ngu_up_tnl_information,
             security_indication,
@@ -2629,5 +2783,141 @@ mod tests {
             maximum_packet_loss_rate_ul: None,
         };
         assert!(out_of_root.encode(&mut AperEncoder::new()).is_err());
+    }
+
+    // ------------------------------------------------------------------------
+    // #469: iE-Extensions and extension additions are consumed, not skipped
+    // past. Every octet below is derived by hand from X.691, not from an
+    // encoder, and each case ends with a 0x2A sentinel octet: a decoder that
+    // leaves the extension unread lands on the wrong bits and does not find it.
+    // ------------------------------------------------------------------------
+
+    /// Decode an ARP from `bytes`, then require the sentinel octet and nothing else.
+    fn decode_arp_then_sentinel(bytes: &[u8]) -> NgapResult<AllocationAndRetentionPriority> {
+        let mut decoder = AperDecoder::new(bytes);
+        let arp = AllocationAndRetentionPriority::decode(&mut decoder)?;
+        decoder.align();
+        assert_eq!(decoder.read_bits(8).expect("sentinel"), 0x2A, "sentinel");
+        assert_eq!(decoder.remaining_bits(), 0, "trailing bits");
+        Ok(arp)
+    }
+
+    fn arp_level_1() -> AllocationAndRetentionPriority {
+        AllocationAndRetentionPriority {
+            priority_level_arp: 1,
+            pre_emption_capability: PreEmptionCapability::ShallNotTriggerPreEmption,
+            pre_emption_vulnerability: PreEmptionVulnerability::NotPreEmptable,
+        }
+    }
+
+    // ARP with an iE-Extensions container holding one unknown extension
+    // (id 999, one-octet value 0x00):
+    //   ext 0, iE-Extensions present 1                       01
+    //   priorityLevelARP 1 -> 0 in 4 bits (range 15)          0000
+    //   pre-emptionCapability: ext 0, index 0                 00
+    //   pre-emptionVulnerability: ext 0, index 0              00   -> 10 bits, pad -> 40 00
+    //   container count-1 = 0, two-octet aligned (ub 65535)   00 00
+    //   id 999, two-octet aligned (range 65536)               03 E7
+    //   criticality, 2 bits, then pad: ignore=01 -> 40, reject=00 -> 00
+    //   open type: length 1, value 00                         01 00
+    const ARP_WITH_IGNORE_EXTENSION: [u8; 10] =
+        [0x40, 0x00, 0x00, 0x00, 0x03, 0xE7, 0x40, 0x01, 0x00, 0x2A];
+    const ARP_WITH_NOTIFY_EXTENSION: [u8; 10] =
+        [0x40, 0x00, 0x00, 0x00, 0x03, 0xE7, 0x80, 0x01, 0x00, 0x2A];
+    const ARP_WITH_REJECT_EXTENSION: [u8; 10] =
+        [0x40, 0x00, 0x00, 0x00, 0x03, 0xE7, 0x00, 0x01, 0x00, 0x2A];
+
+    #[test]
+    fn an_ignorable_ie_extension_is_consumed() {
+        assert_eq!(
+            decode_arp_then_sentinel(&ARP_WITH_IGNORE_EXTENSION).expect("decode"),
+            arp_level_1()
+        );
+        assert_eq!(
+            decode_arp_then_sentinel(&ARP_WITH_NOTIFY_EXTENSION).expect("decode"),
+            arp_level_1()
+        );
+    }
+
+    #[test]
+    fn a_reject_ie_extension_that_is_not_comprehended_fails_the_decode() {
+        let mut decoder = AperDecoder::new(&ARP_WITH_REJECT_EXTENSION);
+        match AllocationAndRetentionPriority::decode(&mut decoder) {
+            Err(NgapError::IeNotComprehended { ie_id, .. }) => assert_eq!(ie_id, 999),
+            other => panic!("expected IeNotComprehended(999), got {other:?}"),
+        }
+    }
+
+    // ARP with the SEQUENCE extension bit set and one extension addition:
+    //   ext 1, iE-Extensions 0, then the same 8 root bits     10 00000000
+    //   normally-small count-1 = 0: 0 + 000000                0000000
+    //   presence bitmap: 1                                    1    -> 18 bits, pad -> 80 00 40
+    //   open type: length 1, value 00                         01 00
+    const ARP_WITH_EXTENSION_ADDITION: [u8; 6] = [0x80, 0x00, 0x40, 0x01, 0x00, 0x2A];
+
+    #[test]
+    fn extension_additions_are_consumed() {
+        assert_eq!(
+            decode_arp_then_sentinel(&ARP_WITH_EXTENSION_ADDITION).expect("decode"),
+            arp_level_1()
+        );
+    }
+
+    #[test]
+    fn a_sequence_without_extensions_still_decodes_exactly() {
+        // ext 0, iE-Ext 0, then the 8 root bits: 10 bits, pad -> 00 00
+        assert_eq!(
+            decode_arp_then_sentinel(&[0x00, 0x00, 0x2A]).expect("decode"),
+            arp_level_1()
+        );
+    }
+
+    // NonDynamic5QIDescriptor { fiveQI 9, maximumDataBurstVolume v }:
+    //   ext 0, priority 0, averaging 0, MDBV 1, iE-Ext 0      00010
+    //   fiveQI ext 0, then one-octet aligned (range 256)      0 -> pad -> 10, 09
+    //   MDBV root (0..4095): ext 0, two-octet aligned         00, 0F FF
+    //   MDBV extension: ext 1, then an unconstrained whole
+    //   number: aligned length octet + minimal 2's complement 80, 02 10 00 / 80, 03 1E 84 80
+    fn mdbv_descriptor(v: u32) -> NonDynamic5qiDescriptor {
+        NonDynamic5qiDescriptor {
+            five_qi: 9,
+            priority_level_qos: None,
+            averaging_window: None,
+            maximum_data_burst_volume: Some(v),
+        }
+    }
+
+    fn encode_descriptor(d: &NonDynamic5qiDescriptor) -> NgapResult<Vec<u8>> {
+        let mut encoder = AperEncoder::new();
+        d.encode(&mut encoder)?;
+        encoder.align();
+        Ok(encoder.into_bytes().to_vec())
+    }
+
+    #[test]
+    fn maximum_data_burst_volume_encodes_its_extension_range() {
+        for (v, golden) in [
+            (0u32, vec![0x10, 0x09, 0x00, 0x00, 0x00]),
+            (4095, vec![0x10, 0x09, 0x00, 0x0F, 0xFF]),
+            (4096, vec![0x10, 0x09, 0x80, 0x02, 0x10, 0x00]),
+            (2_000_000, vec![0x10, 0x09, 0x80, 0x03, 0x1E, 0x84, 0x80]),
+        ] {
+            let d = mdbv_descriptor(v);
+            assert_eq!(encode_descriptor(&d).expect("encode"), golden, "MDBV {v}");
+            let mut decoder = AperDecoder::new(&golden);
+            assert_eq!(
+                NonDynamic5qiDescriptor::decode(&mut decoder).expect("decode"),
+                d
+            );
+        }
+    }
+
+    #[test]
+    fn maximum_data_burst_volume_past_the_extension_range_is_refused() {
+        assert!(encode_descriptor(&mdbv_descriptor(2_000_001)).is_err());
+        // 3000000 = 0x2DC6C0 as an extension value
+        let bytes = [0x10, 0x09, 0x80, 0x03, 0x2D, 0xC6, 0xC0];
+        let mut decoder = AperDecoder::new(&bytes);
+        assert!(NonDynamic5qiDescriptor::decode(&mut decoder).is_err());
     }
 }

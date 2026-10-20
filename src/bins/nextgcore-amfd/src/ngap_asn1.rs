@@ -6113,9 +6113,14 @@ pub(crate) mod tests {
             five_qi: ngap_gen::FiveQI(d.five_qi as u8),
             priority_level_qos: d.priority_level_qos.map(ngap_gen::PriorityLevelQos),
             averaging_window: d.averaging_window.map(ngap_gen::AveragingWindow),
-            maximum_data_burst_volume: d
-                .maximum_data_burst_volume
-                .map(ngap_gen::MaximumDataBurstVolume),
+            // The generated type is sized from the root (0..4095) as u16, so it
+            // cannot carry the 4096..2000000 extension range; this matrix stays
+            // inside u16.
+            maximum_data_burst_volume: d.maximum_data_burst_volume.map(|v| {
+                ngap_gen::MaximumDataBurstVolume(
+                    u16::try_from(v).expect("MDBV fits the generated u16"),
+                )
+            }),
             ie_extensions: None,
         };
         let dynamic = |d: &Dynamic5qiDescriptor| ngap_gen::Dynamic5QIDescriptor {
@@ -6129,9 +6134,14 @@ pub(crate) mod tests {
             five_qi: d.five_qi.map(|q| ngap_gen::FiveQI(q as u8)),
             delay_critical: d.delay_critical.map(|c| ngap_gen::DelayCritical(c as u8)),
             averaging_window: d.averaging_window.map(ngap_gen::AveragingWindow),
-            maximum_data_burst_volume: d
-                .maximum_data_burst_volume
-                .map(ngap_gen::MaximumDataBurstVolume),
+            // The generated type is sized from the root (0..4095) as u16, so it
+            // cannot carry the 4096..2000000 extension range; this matrix stays
+            // inside u16.
+            maximum_data_burst_volume: d.maximum_data_burst_volume.map(|v| {
+                ngap_gen::MaximumDataBurstVolume(
+                    u16::try_from(v).expect("MDBV fits the generated u16"),
+                )
+            }),
             ie_extensions: None,
         };
         let gbr = |g: &GbrQosInformation| ngap_gen::GBR_QosInformation {

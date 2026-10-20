@@ -51,8 +51,10 @@ use nextgcore_asn1c::per::{AperDecode, AperDecoder, AperEncode, AperEncoder, Con
 
 use crate::error::NgapResult;
 use crate::transfer::{
-    decode_ext_constrained, decode_qfi, encode_ext_constrained, encode_qfi, invalid,
-    QosFlowLevelQosParameters, TransportLayerAddress, UpTransportLayerInformation,
+    decode_ext_constrained, decode_extension_container, decode_qfi, decode_unknown_extensions_only,
+    encode_ext_constrained, encode_extension_container, encode_qfi, invalid,
+    skip_extension_additions, QosFlowLevelQosParameters, TransportLayerAddress,
+    UpTransportLayerInformation,
 };
 use crate::types::{CriticalityDiagnostics, IeCriticalityDiagnostics, TypeOfError};
 
@@ -66,73 +68,9 @@ pub const MAX_MBS_QOS_FLOWS: usize = 64;
 /// maxnoofSupportedTAIforMBS INTEGER ::= 256 (38413-j30.txt:59343)
 pub const MAX_TAI_MBS_SUPPORT: usize = 256;
 
-/// maxProtocolExtensions INTEGER ::= 65535 (NGAP-Containers)
-const MAX_PROTOCOL_EXTENSIONS: usize = 65535;
-
 // ============================================================================
 // Shared helpers
 // ============================================================================
-
-/// Skip the extension additions of an extensible SEQUENCE whose extension bit
-/// was set (X.691 §18.8/§18.9): a normally-small length holding the number of
-/// additions minus 1, an n-bit presence bitmap, then each present addition
-/// wrapped as an open type. Truncation anywhere inside is an error
-/// (fail-closed); the addition *content* is version-bracket data and is
-/// skippable by definition.
-fn skip_extension_additions(decoder: &mut AperDecoder) -> NgapResult<()> {
-    let count = decoder.decode_normally_small_non_negative()? as usize + 1;
-    let mut present = Vec::with_capacity(count);
-    for _ in 0..count {
-        present.push(decoder.read_bit()?);
-    }
-    for is_present in present {
-        if is_present {
-            loop {
-                let (len, fragmented) = decoder.decode_length_fragment()?;
-                let _skipped = decoder.read_bytes(len)?;
-                if !fragmented {
-                    break;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Encode a `ProtocolExtensionContainer {{...}}`:
-/// `SEQUENCE (SIZE(1..maxProtocolExtensions)) OF ProtocolExtensionField`
-/// where `ProtocolExtensionField ::= SEQUENCE { id, criticality,
-/// extensionValue }` shares its wire shape with ProtocolIE-Field.
-fn encode_extension_container(
-    encoder: &mut AperEncoder,
-    fields: &[ProtocolIeField],
-) -> NgapResult<()> {
-    encoder.encode_constrained_length(fields.len(), 1, MAX_PROTOCOL_EXTENSIONS)?;
-    for field in fields {
-        field.encode_aper(encoder)?;
-    }
-    Ok(())
-}
-
-/// Decode a `ProtocolExtensionContainer` into its raw fields.
-fn decode_extension_container(decoder: &mut AperDecoder) -> NgapResult<Vec<ProtocolIeField>> {
-    let count = decoder.decode_constrained_length(1, MAX_PROTOCOL_EXTENSIONS)?;
-    let mut fields = Vec::with_capacity(count);
-    for _ in 0..count {
-        fields.push(ProtocolIeField::decode_aper(decoder)?);
-    }
-    Ok(fields)
-}
-
-/// Decode an iE-Extensions container in which no extension IE is
-/// comprehended: unknown ignore/notify extensions are skipped, unknown
-/// reject extensions fail the decode (TS 38.413 §10.3.4).
-fn decode_unknown_extensions_only(decoder: &mut AperDecoder) -> NgapResult<()> {
-    for field in decode_extension_container(decoder)? {
-        crate::ie::handle_unknown_ie(&field)?;
-    }
-    Ok(())
-}
 
 /// Encode `MBS-AreaSessionID ::= INTEGER (0..65535, ...)` (§9.3.1.207)
 fn encode_mbs_area_session_id(encoder: &mut AperEncoder, value: u16) -> NgapResult<()> {
