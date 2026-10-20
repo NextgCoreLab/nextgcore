@@ -3921,6 +3921,50 @@ pub(crate) mod tests {
         );
     }
 
+    /// AMFName is `PrintableString (SIZE(1..150, ...))`. X.691 §30.5.7 aligns
+    /// its content by the type's upper bound, not by the value's length, so a
+    /// one-character name is `00 00 41`, not `00 20 80`. The fork aligned by
+    /// value length until nextgsim #246 (PR #247); every length 1..=150 must
+    /// now agree with the hand-written encoder, which always aligned correctly.
+    #[test]
+    fn ng_setup_response_amf_name_of_every_length_matches_hand_written() {
+        for len in 1..=150usize {
+            let mut ctx = create_test_context();
+            // Printable characters across the PrintableString alphabet.
+            let alphabet = b"AZaz09 '()+,-./:=?";
+            let name: String = (0..len)
+                .map(|i| alphabet[i % alphabet.len()] as char)
+                .collect();
+            ctx.amf_name = Some(name);
+            assert_eq!(
+                build_ng_setup_response_asn1(&ctx),
+                hand_written_oracle::hand_written_ng_setup_response(&ctx),
+                "AMF name of length {len}"
+            );
+        }
+    }
+
+    /// RANNodeName is `PrintableString (SIZE(1..150, ...))`: the generated
+    /// decode must read every length the hand-written encoder writes (#246).
+    #[test]
+    fn ng_setup_request_ran_node_name_of_every_length_matches_hand_written() {
+        for len in 1..=150usize {
+            let mut ies = baseline_request_ies();
+            ies.ran_node_name = Some("g".repeat(len));
+            let data = nextgcore_ngap::builder::build_ng_setup_request(&ies).expect("build");
+            let generated = proceed_or_none(&data);
+            assert!(generated.is_some(), "RAN node name of length {len} decodes");
+            assert_eq!(
+                format!("{generated:?}"),
+                format!(
+                    "{:?}",
+                    hand_written_oracle::hand_written_parse_ng_setup_request(&data)
+                ),
+                "RAN node name of length {len}"
+            );
+        }
+    }
+
     /// #417 stage 2: the generated Failure is byte-identical to the
     /// hand-written one for every cause group, in- and out-of-range values
     /// (including radioNetwork extension values 45/46), and every TimeToWait.
