@@ -2456,8 +2456,19 @@ fn encode_ng_connection_list_inline(
     encoder: &mut AperEncoder,
     connections: &[UeAssociatedLogicalNgConnectionItem],
 ) -> NgapResult<()> {
-    // SEQUENCE (SIZE (1..maxnoofNGConnectionsToReset=65536)) OF item
-    encoder.encode_constrained_length(connections.len(), 1, 65536)?;
+    // SEQUENCE (SIZE (1..maxnoofNGConnectionsToReset=65536)) OF item. The
+    // upper bound is 64K, not below it, so X.691 §11.9.4.2 puts the count in
+    // a general length determinant -- one octet for 1..127 items -- not the
+    // two-octet constrained form §11.9.4.1 keeps for ub < 64K (#417). Lists
+    // past 16383 items would need §11.9.3.8 fragmentation, which this
+    // engine's determinant does not do; refuse them rather than mis-encode.
+    if connections.is_empty() || connections.len() > 16383 {
+        return Err(crate::NgapError::InvalidIeValue {
+            ie_name: "UE-associatedLogicalNG-connectionList",
+            reason: format!("{} items is outside 1..16383", connections.len()),
+        });
+    }
+    encoder.encode_length_determinant(connections.len())?;
     for item in connections {
         // SEQUENCE { aMF-UE-NGAP-ID OPTIONAL, rAN-UE-NGAP-ID OPTIONAL, iE-Extensions OPTIONAL }
         encoder.write_bit(false); // extension
@@ -2478,7 +2489,14 @@ fn encode_ng_connection_list_inline(
 fn decode_ng_connection_list_inline(
     decoder: &mut AperDecoder,
 ) -> NgapResult<Vec<UeAssociatedLogicalNgConnectionItem>> {
-    let count = decoder.decode_constrained_length(1, 65536)?;
+    // General length determinant: ub = 64K (X.691 §11.9.4.2), see the encoder.
+    let count = decoder.decode_length_determinant()?;
+    if count == 0 {
+        return Err(crate::NgapError::InvalidIeValue {
+            ie_name: "UE-associatedLogicalNG-connectionList",
+            reason: "empty list".into(),
+        });
+    }
     let mut result = Vec::with_capacity(count.min(1024));
     for _ in 0..count {
         let _ext = decoder.read_bit()?;

@@ -3448,19 +3448,174 @@ pub fn decode_ue_context_release_complete_asn1(data: &[u8]) -> UeContextReleaseC
     }
 }
 
-/// Build an NG Reset Acknowledge with proper ASN.1 APER encoding
+/// How a received NG Reset is to be handled.
+#[derive(Debug)]
+pub enum NgResetDecode {
+    /// Decoded; run the procedure and answer with an NG Reset Acknowledge.
+    /// `notify` lists the not-comprehended IEs marked "ignore IE and notify
+    /// sender", which -- NG Reset having a response message -- go in the
+    /// Acknowledge's Criticality Diagnostics (§10.3.4.2).
+    Proceed {
+        /// The reset, as the handler consumes it. A missing or choice-extension
+        /// Cause (mandatory, criticality ignore, §9.2.6.11) is ignored per
+        /// §10.3.5 and comes back as misc/unspecified.
+        reset: NgReset,
+        /// Diagnostics for the Acknowledge.
+        notify: Vec<IeDiagnostic>,
+    },
+    /// A not-comprehended IE marked "reject", or a missing Reset Type
+    /// (criticality reject): none of the reset may be executed, and -- the
+    /// procedure having no unsuccessful outcome -- it is terminated with an
+    /// Error Indication (§10.3.4.2, §10.3.5).
+    Reject(CriticalityErrorIndication),
+    /// Not decodable.
+    Undecodable,
+}
+
+/// Decode an NG Reset (TS 38.413 §9.2.6.11) with the GENERATED codec (#417),
+/// applying §10.3.4.2 and §10.3.5.
 ///
-/// `connections` echoes the UE-associated logical NG-connection list of a
-/// partial NG Reset (TS 38.413 Section 8.7.4.2.2); `None` for a full reset.
-pub fn build_ng_reset_acknowledge_asn1(
-    connections: Option<Vec<UeAssociatedLogicalNgConnectionItem>>,
-) -> Option<Vec<u8>> {
-    let msg = NgResetAcknowledge {
-        connections,
-        criticality_diagnostics: None,
+/// The hand-written parser this replaced refused the whole message on any
+/// not-comprehended IE, whatever its criticality, so the gNB's reset was never
+/// executed and never acknowledged. Every reset it accepted decodes
+/// identically: `ng_reset_generated_decode_matches_hand_written`.
+pub fn decode_ng_reset_asn1(data: &[u8]) -> NgResetDecode {
+    use ngap_gen::{InitiatingMessageValue, NGResetProtocolIEs_EntryValue as Ie};
+    use NgResetDecode::{Proceed, Reject, Undecodable};
+
+    let (pdu, unknown) = match nextgcore_ngap_gen::decode_with_unknown_ies(data) {
+        Ok(decoded) => decoded,
+        Err(e) => {
+            log::warn!("Failed to decode NG Reset: {e:?}");
+            return Undecodable;
+        }
+    };
+    let ngap_gen::NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+        criticality,
+        value: InitiatingMessageValue::Id_NGReset(reset),
+        ..
+    }) = pdu
+    else {
+        log::warn!("Expected NGReset");
+        return Undecodable;
+    };
+    let Some((mut reject, notify)) = classify_unknown_ies(&unknown, "NG Reset") else {
+        return Undecodable;
     };
 
-    match builder::build_ng_reset_acknowledge(&msg) {
+    let mut cause = None;
+    let mut reset_type = None;
+    for entry in reset.protocol_i_es.0 {
+        match entry.value {
+            Ie::Id_Cause(v) => cause = cause_pair(&v),
+            Ie::Id_ResetType(v) => {
+                reset_type = Some(match v {
+                    ngap_gen::ResetType::NG_Interface(_) => ResetType::NgInterface,
+                    ngap_gen::ResetType::PartOfNG_Interface(list) => ResetType::PartOfNgInterface(
+                        list.0
+                            .into_iter()
+                            .map(|item| UeAssociatedLogicalNgConnectionItem {
+                                amf_ue_ngap_id: item.amf_ue_ngap_id.map(|id| id.0),
+                                ran_ue_ngap_id: item.ran_ue_ngap_id.map(|id| id.0),
+                            })
+                            .collect(),
+                    ),
+                    // The choice extension's object set is empty, so its open
+                    // type cannot be decoded and never gets here.
+                    ngap_gen::ResetType::Choice_Extensions(_) => {
+                        log::warn!("NG Reset Type is a choice extension");
+                        return Undecodable;
+                    }
+                })
+            }
+        }
+    }
+    if reset_type.is_none() {
+        reject.push(IeDiagnostic {
+            ie_id: ngap_gen::ID_RESET_TYPE,
+            criticality: ngap_gen::Criticality::REJECT,
+            type_of_error: ngap_gen::TypeOfError::MISSING,
+        });
+    }
+    let (Some(reset_type), true) = (reset_type, reject.is_empty()) else {
+        return Reject(CriticalityErrorIndication {
+            amf_ue_ngap_id: None,
+            ran_ue_ngap_id: None,
+            cause_protocol: ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
+            procedure: ReportedProcedure {
+                procedure_code: ngap_gen::ID_NG_RESET,
+                triggering_message: ngap_gen::TriggeringMessage::INITIATING_MESSAGE,
+                procedure_criticality: criticality.0,
+            },
+            diagnostics: reject,
+        });
+    };
+    let cause = match cause {
+        Some((group, value)) => build_cause(group, value),
+        None => {
+            log::warn!("NG Reset carries no usable Cause; resetting anyway");
+            Cause::Misc(CauseMisc::Unspecified)
+        }
+    };
+    Proceed {
+        reset: NgReset { cause, reset_type },
+        notify,
+    }
+}
+
+/// Build an NG Reset Acknowledge (TS 38.413 §9.2.6.12) with the GENERATED
+/// codec (#417).
+///
+/// `connections` echoes the UE-associated logical NG-connection list of a
+/// partial NG Reset (§8.7.4.2.2); `None` for a full reset. `notify` is the
+/// reset's "ignore IE and notify sender" IEs, reported in the Criticality
+/// Diagnostics (§10.3.4.2); empty for none. Byte-identical to the hand-written
+/// builder it replaced: `ng_reset_acknowledge_generated_matches_hand_written`.
+pub fn build_ng_reset_acknowledge_asn1(
+    connections: Option<Vec<UeAssociatedLogicalNgConnectionItem>>,
+    notify: &[IeDiagnostic],
+) -> Option<Vec<u8>> {
+    use ngap_gen::{
+        NGResetAcknowledge, NGResetAcknowledgeProtocolIEs,
+        NGResetAcknowledgeProtocolIEs_Entry as Entry,
+        NGResetAcknowledgeProtocolIEs_EntryValue as Ie, ProtocolIE_ID, NGAP_PDU,
+    };
+
+    let ignore = ngap_gen::Criticality(ngap_gen::Criticality::IGNORE);
+    let mut ies = Vec::new();
+    if let Some(connections) = connections {
+        ies.push(Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_UE_ASSOCIATED_LOGICAL_NG_CONNECTION_LIST),
+            criticality: ignore.clone(),
+            value: Ie::Id_UE_associatedLogicalNG_connectionList(
+                ngap_gen::UE_associatedLogicalNG_connectionList(
+                    connections
+                        .into_iter()
+                        .map(|item| ngap_gen::UE_associatedLogicalNG_connectionItem {
+                            amf_ue_ngap_id: item.amf_ue_ngap_id.map(ngap_gen::AMF_UE_NGAP_ID),
+                            ran_ue_ngap_id: item.ran_ue_ngap_id.map(ngap_gen::RAN_UE_NGAP_ID),
+                            ie_extensions: None,
+                        })
+                        .collect(),
+                ),
+            ),
+        });
+    }
+    if !notify.is_empty() {
+        ies.push(Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_CRITICALITY_DIAGNOSTICS),
+            criticality: ignore,
+            value: Ie::Id_CriticalityDiagnostics(generated_criticality_diagnostics(notify)),
+        });
+    }
+    let pdu = NGAP_PDU::SuccessfulOutcome(ngap_gen::SuccessfulOutcome {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_NG_RESET),
+        criticality: ngap_gen::Criticality(ngap_gen::Criticality::REJECT),
+        value: ngap_gen::SuccessfulOutcomeValue::Id_NGReset(NGResetAcknowledge {
+            protocol_i_es: NGResetAcknowledgeProtocolIEs(ies),
+        }),
+    });
+    match nextgcore_ngap_gen::encode(&pdu) {
         Ok(bytes) => {
             log::debug!("Built NG Reset Acknowledge: {} bytes", bytes.len());
             Some(bytes)
@@ -5356,7 +5511,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_build_ng_reset_acknowledge_full_roundtrip() {
-        let bytes = build_ng_reset_acknowledge_asn1(None).expect("build");
+        let bytes = build_ng_reset_acknowledge_asn1(None, &[]).expect("build");
         match parser::decode_ngap_pdu(&bytes).expect("decode") {
             NgapMessage::NgResetAcknowledge(ack) => {
                 assert!(ack.connections.is_none());
@@ -5377,13 +5532,249 @@ pub(crate) mod tests {
                 ran_ue_ngap_id: None,
             },
         ];
-        let bytes = build_ng_reset_acknowledge_asn1(Some(connections.clone())).expect("build");
+        let bytes = build_ng_reset_acknowledge_asn1(Some(connections.clone()), &[]).expect("build");
         match parser::decode_ngap_pdu(&bytes).expect("decode") {
             NgapMessage::NgResetAcknowledge(ack) => {
                 assert_eq!(ack.connections, Some(connections));
             }
             other => panic!("Expected NgResetAcknowledge, got {other:?}"),
         }
+    }
+
+    /// The NG Resets the equivalence tests sweep: both reset types, connection
+    /// lists of 1, 2 and 16 items, every presence combination of the two
+    /// optional IDs, and IDs at the edges of their ranges, under a Cause from
+    /// every group.
+    fn ng_reset_matrix() -> Vec<NgReset> {
+        let causes = [
+            Cause::RadioNetwork(CauseRadioNetwork::Unspecified),
+            Cause::Transport(CauseTransport::TransportResourceUnavailable),
+            Cause::Nas(CauseNas::NormalRelease),
+            Cause::Protocol(CauseProtocol::SemanticError),
+            Cause::Misc(CauseMisc::OmIntervention),
+        ];
+        let ids: [(Option<u64>, Option<u32>); 5] = [
+            (Some(0), Some(0)),
+            (Some((1u64 << 40) - 1), Some(u32::MAX)),
+            (Some(7), None),
+            (None, Some(70)),
+            (Some(256), Some(65_536)),
+        ];
+        let mut out = Vec::new();
+        for cause in causes {
+            out.push(NgReset {
+                cause,
+                reset_type: ResetType::NgInterface,
+            });
+            for (amf, ran) in ids {
+                out.push(NgReset {
+                    cause,
+                    reset_type: ResetType::PartOfNgInterface(vec![
+                        UeAssociatedLogicalNgConnectionItem {
+                            amf_ue_ngap_id: amf,
+                            ran_ue_ngap_id: ran,
+                        },
+                    ]),
+                });
+            }
+            out.push(NgReset {
+                cause,
+                reset_type: ResetType::PartOfNgInterface(
+                    ids.iter()
+                        .take(2)
+                        .map(|&(amf, ran)| UeAssociatedLogicalNgConnectionItem {
+                            amf_ue_ngap_id: amf,
+                            ran_ue_ngap_id: ran,
+                        })
+                        .collect(),
+                ),
+            });
+            out.push(NgReset {
+                cause,
+                reset_type: ResetType::PartOfNgInterface(
+                    (0..16)
+                        .map(|i| UeAssociatedLogicalNgConnectionItem {
+                            amf_ue_ngap_id: Some(1000 + i),
+                            ran_ue_ngap_id: (i % 2 == 0).then_some(i as u32),
+                        })
+                        .collect(),
+                ),
+            });
+        }
+        out
+    }
+
+    /// #417: every NG Reset the hand-written parser accepted decodes, through
+    /// the generated codec, to the same reset -- with nothing to report.
+    #[test]
+    fn ng_reset_generated_decode_matches_hand_written() {
+        let matrix = ng_reset_matrix();
+        assert_eq!(matrix.len(), 40);
+        for reset in matrix {
+            let bytes = builder::build_ng_reset(&reset).expect("hand-written build");
+            let NgapMessage::NgReset(old) = parser::decode_ngap_pdu(&bytes).expect("old decode")
+            else {
+                panic!("old parser: not an NG Reset");
+            };
+            let NgResetDecode::Proceed { reset: new, notify } = decode_ng_reset_asn1(&bytes) else {
+                panic!("generated decode did not proceed for {reset:?}");
+            };
+            assert!(notify.is_empty());
+            assert_eq!(new.reset_type, old.reset_type, "{bytes:02x?}");
+            assert_eq!(format!("{:?}", new.cause), format!("{:?}", old.cause));
+        }
+    }
+
+    /// #417: the generated NG Reset Acknowledge is byte-identical to the
+    /// hand-written builder for every connection list the matrix holds, and for
+    /// a full reset.
+    #[test]
+    fn ng_reset_acknowledge_generated_matches_hand_written() {
+        for reset in ng_reset_matrix() {
+            let connections = match reset.reset_type {
+                ResetType::NgInterface => None,
+                ResetType::PartOfNgInterface(items) => Some(items),
+            };
+            let old = builder::build_ng_reset_acknowledge(&NgResetAcknowledge {
+                connections: connections.clone(),
+                criticality_diagnostics: None,
+            })
+            .expect("hand-written build");
+            let new = build_ng_reset_acknowledge_asn1(connections, &[]).expect("generated build");
+            assert_eq!(new, old);
+        }
+    }
+
+    /// The full-reset Acknowledge, derived from X.691 by hand: successfulOutcome
+    /// (CHOICE index 1 of 3, extensible: `0 01` + pad = 0x20), procedure code
+    /// 20, criticality reject (0x00), a 3-octet open type holding the SEQUENCE
+    /// extension bit (0, padded) and an empty IE container (count 0x0000).
+    #[test]
+    fn ng_reset_acknowledge_golden_bytes() {
+        assert_eq!(
+            build_ng_reset_acknowledge_asn1(None, &[]).expect("build"),
+            [0x20, 0x14, 0x00, 0x03, 0x00, 0x00, 0x00]
+        );
+    }
+
+    /// The partial forms, derived from X.691 by hand. The connection list is
+    /// SIZE (1..maxnoofNGConnectionsToReset = 65536); its upper bound is 64K,
+    /// so §11.9.4.2 encodes the count as a general length determinant (`01`
+    /// for one item), not the two-octet constrained count (`00 00`) the
+    /// hand-written codec wrote before #417 -- which made the AMF misread a
+    /// conformant gNB's partial NG Reset and send a non-conformant Acknowledge.
+    /// The item: `60` = extension bit 0, AMF and RAN UE NGAP ID present, no
+    /// iE-Extensions, then each ID as a 1-octet length-in-bits field (all zero)
+    /// and its aligned value octet `00`.
+    #[test]
+    fn ng_reset_partial_golden_bytes() {
+        let item = UeAssociatedLogicalNgConnectionItem {
+            amf_ue_ngap_id: Some(0),
+            ran_ue_ngap_id: Some(0),
+        };
+        // ResetType = partOfNG-Interface (CHOICE 1 of 3, no extension marker:
+        // `01` + pad = 0x40), count 1, the item.
+        let reset = builder::build_ng_reset(&NgReset {
+            cause: Cause::RadioNetwork(CauseRadioNetwork::Unspecified),
+            reset_type: ResetType::PartOfNgInterface(vec![item.clone()]),
+        })
+        .expect("build");
+        assert_eq!(
+            reset,
+            [
+                0x00, 0x14, 0x00, 0x13, 0x00, 0x00, 0x02, // header, 2 IEs
+                0x00, 0x0f, 0x40, 0x02, 0x00, 0x00, // Cause radioNetwork/unspecified
+                0x00, 0x58, 0x00, 0x06, 0x40, 0x01, 0x60, 0x00, 0x00, 0x00, // ResetType
+            ]
+        );
+        assert!(matches!(
+            decode_ng_reset_asn1(&reset),
+            NgResetDecode::Proceed { reset: NgReset { reset_type: ResetType::PartOfNgInterface(ref l), .. }, .. }
+                if *l == vec![item.clone()]
+        ));
+        assert_eq!(
+            build_ng_reset_acknowledge_asn1(Some(vec![item]), &[]).expect("ack"),
+            [
+                0x20, 0x14, 0x00, 0x0c, 0x00, 0x00, 0x01, // header, 1 IE
+                0x00, 0x6f, 0x40, 0x05, 0x01, 0x60, 0x00, 0x00, 0x00, // the list
+            ]
+        );
+    }
+
+    /// §10.3.4.2 for NG Reset: an unknown "ignore" IE is dropped, a "notify"
+    /// one is reported in the Acknowledge, a "reject" one -- or a missing
+    /// Reset Type -- terminates the procedure with an Error Indication.
+    #[test]
+    fn ng_reset_unknown_and_missing_ies_follow_their_criticality() {
+        let base = builder::build_ng_reset(&NgReset {
+            cause: Cause::Misc(CauseMisc::Unspecified),
+            reset_type: ResetType::NgInterface,
+        })
+        .expect("build");
+
+        let ignored = with_unknown_ie(&base, 9999, 0x40);
+        assert!(matches!(
+            decode_ng_reset_asn1(&ignored),
+            NgResetDecode::Proceed { ref notify, .. } if notify.is_empty()
+        ));
+
+        let notified = with_unknown_ie(&base, 9999, 0x80);
+        let NgResetDecode::Proceed { notify, .. } = decode_ng_reset_asn1(&notified) else {
+            panic!("notify must proceed");
+        };
+        assert_eq!(notify.len(), 1);
+        assert_eq!(notify[0].ie_id, 9999);
+        // ... and the Acknowledge carries it.
+        let ack = build_ng_reset_acknowledge_asn1(None, &notify).expect("ack");
+        let ngap_gen::NGAP_PDU::SuccessfulOutcome(out) = nextgcore_ngap_gen::decode(&ack).unwrap()
+        else {
+            panic!("successfulOutcome");
+        };
+        let ngap_gen::SuccessfulOutcomeValue::Id_NGReset(ack) = out.value else {
+            panic!("NG Reset Acknowledge");
+        };
+        let diag = ack
+            .protocol_i_es
+            .0
+            .iter()
+            .find_map(|e| match &e.value {
+                ngap_gen::NGResetAcknowledgeProtocolIEs_EntryValue::Id_CriticalityDiagnostics(
+                    d,
+                ) => Some(d.clone()),
+                _ => None,
+            })
+            .expect("Criticality Diagnostics");
+        let item = &diag.i_es_criticality_diagnostics.unwrap().0[0];
+        assert_eq!(item.ie_id.0, 9999);
+        assert_eq!(item.ie_criticality.0, ngap_gen::Criticality::NOTIFY);
+
+        let rejected = with_unknown_ie(&base, 9999, 0x00);
+        let NgResetDecode::Reject(report) = decode_ng_reset_asn1(&rejected) else {
+            panic!("reject must terminate the procedure");
+        };
+        assert_eq!(report.procedure.procedure_code, ngap_gen::ID_NG_RESET);
+        assert_eq!(report.diagnostics[0].ie_id, 9999);
+
+        // Reset Type removed: mandatory with criticality reject.
+        let mut pdu = nextgcore_ngap_gen::decode(&base).expect("decode");
+        let ngap_gen::NGAP_PDU::InitiatingMessage(ref mut msg) = pdu else {
+            panic!("initiatingMessage");
+        };
+        let ngap_gen::InitiatingMessageValue::Id_NGReset(ref mut req) = msg.value else {
+            panic!("NG Reset");
+        };
+        req.protocol_i_es
+            .0
+            .retain(|e| e.id.0 != ngap_gen::ID_RESET_TYPE);
+        let no_type = nextgcore_ngap_gen::encode(&pdu).expect("encode");
+        let NgResetDecode::Reject(report) = decode_ng_reset_asn1(&no_type) else {
+            panic!("a missing Reset Type must reject");
+        };
+        assert_eq!(report.diagnostics[0].ie_id, ngap_gen::ID_RESET_TYPE);
+        assert_eq!(
+            report.diagnostics[0].type_of_error,
+            ngap_gen::TypeOfError::MISSING
+        );
     }
 
     #[test]
