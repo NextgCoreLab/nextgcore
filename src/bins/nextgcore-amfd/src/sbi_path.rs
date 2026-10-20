@@ -3266,6 +3266,481 @@ fn hex_to_16bytes(hex_str: &str) -> Result<[u8; 16], String> {
 }
 
 // ============================================================================
+// EPS→5GS handover over N26: the initial AMF's SMF leg (#418, TS 23.502 §4.11.1.2.2.2)
+// ============================================================================
+
+/// The NRF this module's PGW-keyed SMF discovery asks, when a test has redirected it.
+///
+/// Declared beside the function that reads it, not in a `mod tests` (#308): the global SBI
+/// context's NRF URI is shared by every discovery in the process, so pointing IT at a test
+/// stub would redirect every other test's NRF lookups too. This override is read by
+/// [`discover_smf_by_pgw`] alone. Callers that set it hold
+/// [`crate::test_support::CONTEXT_GUARD`].
+static PGW_DISCOVERY_NRF_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Test-only: point [`discover_smf_by_pgw`] at `uri` (`None` restores the global NRF).
+#[cfg(test)]
+pub fn set_pgw_discovery_nrf_for_test(uri: Option<String>) {
+    *PGW_DISCOVERY_NRF_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = uri;
+}
+
+/// Normalise an FQDN for comparison: case-insensitive (RFC 4343) and without a trailing
+/// root dot, so `PGW.Example.` and `pgw.example` name the same node.
+fn normalise_fqdn(fqdn: &str) -> String {
+    fqdn.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Does this SMF profile declare the PGW-C the PDN connection names?
+///
+/// `smfInfo.pgwFqdn`, `smfInfo.pgwFqdnList` and `smfInfo.pgwIpAddrList`
+/// (`TS29510_Nnrf_NFManagement.yaml:2822-2845`), in `smfInfo` and in every `smfInfoList`
+/// entry. Checked here as well as asked of the NRF, for the reason `peer_amf_from_nrf`
+/// re-checks the GUAMI: this tree's own nrfd does not filter on the `pgw` parameter, so it
+/// answers with every SMF, and TS 23.502 step 3 is explicit that a PDN connection whose SMF
+/// cannot be identified is **not moved** — picking an arbitrary SMF would move it onto one
+/// that holds no context for it.
+pub fn smf_profile_serves_pgw(
+    profile: &serde_json::Value,
+    pgw_fqdn: Option<&str>,
+    pgw_ipv4: Option<[u8; 4]>,
+) -> bool {
+    let wanted_fqdn = pgw_fqdn.map(normalise_fqdn);
+    let wanted_ip = pgw_ipv4.map(|o| std::net::Ipv4Addr::from(o).to_string());
+    let mut infos: Vec<&serde_json::Value> = Vec::new();
+    if let Some(info) = profile.get("smfInfo") {
+        infos.push(info);
+    }
+    if let Some(map) = profile.get("smfInfoList").and_then(|v| v.as_object()) {
+        infos.extend(map.values());
+    }
+    infos.iter().any(|info| {
+        let fqdn_match = wanted_fqdn.as_ref().is_some_and(|want| {
+            info.get("pgwFqdn")
+                .and_then(|v| v.as_str())
+                .is_some_and(|f| normalise_fqdn(f) == *want)
+                || info
+                    .get("pgwFqdnList")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|l| {
+                        l.iter()
+                            .filter_map(|v| v.as_str())
+                            .any(|f| normalise_fqdn(f) == *want)
+                    })
+        });
+        let ip_match = wanted_ip.as_ref().is_some_and(|want| {
+            info.get("pgwIpAddrList")
+                .and_then(|v| v.as_array())
+                .is_some_and(|l| {
+                    l.iter()
+                        .any(|a| a.get("ipv4Addr").and_then(|v| v.as_str()) == Some(want.as_str()))
+                })
+        });
+        fqdn_match || ip_match
+    })
+}
+
+/// The `nsmf-pdusession` endpoint of one discovered SMF profile.
+fn nsmf_pdusession_endpoint(inst: &serde_json::Value) -> Option<(String, u16)> {
+    let svc = inst
+        .get("nfServices")
+        .and_then(|v| v.as_array())
+        .and_then(|services| {
+            services.iter().find(|s| {
+                s.get("serviceName")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|n| n.eq_ignore_ascii_case(service_name::NSMF_PDUSESSION))
+            })
+        });
+    let endpoint = svc
+        .and_then(|s| s.get("ipEndPoints"))
+        .and_then(|v| v.as_array())
+        .and_then(|e| e.first());
+    let port = endpoint
+        .and_then(|e| e.get("port"))
+        .and_then(|v| v.as_u64())
+        .and_then(|p| u16::try_from(p).ok())
+        .unwrap_or(7777);
+    let host = endpoint
+        .and_then(|e| e.get("ipv4Address"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            inst.get("ipv4Addresses")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            inst.get("fqdn")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })?;
+    Some((host, port))
+}
+
+/// Resolve the SMF+PGW-C of one PDN connection through the NRF (TS 23.502 §4.11.1.2.2.2
+/// step 3, `23502-k20.txt:21389-21393`).
+///
+/// *"The initial AMF queries the (PLMN level) NRF in serving PLMN by issuing the
+/// Nnrf_NFDiscovery_Request including the FQDN for the S5/S8 interface of the SMF+PGW-C and
+/// the NRF provides the IP address or FQDN of the N11/N16 interface of the SMF+PGW-C."*
+///
+/// The query carries `pgw` (the FQDN) when the MME sent a PGW node name, and `pgw-ip` (the
+/// S5/S8 control-plane address) otherwise — both are TS 29.510 discovery parameters for
+/// exactly this (`TS29510_Nnrf_NFDiscovery.yaml:274-284`). The FQDN is the clause's choice
+/// and is preferred; the address keeps a request from an MME that omitted the conditional
+/// PGW node name resolvable rather than refused for want of an optional IE.
+///
+/// **Fails closed.** No NRF, no answer, or no profile that declares this PGW-C means `Err`,
+/// and the caller does not move the PDN connection — step 3's own rule (*"If the initial AMF
+/// cannot retrieve the address of the corresponding SMF for a PDN connection, it will not
+/// move the PDN connection to 5GS"*). There is deliberately no `SMF_SBI_ADDR` fallback: the
+/// SMF must be the one that holds this PDN connection, and "an SMF" is not that.
+pub async fn discover_smf_by_pgw(
+    pgw_fqdn: Option<&str>,
+    pgw_ipv4: Option<[u8; 4]>,
+) -> Result<(String, u16), String> {
+    let override_uri = PGW_DISCOVERY_NRF_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let nrf_uri = match override_uri {
+        Some(uri) => uri,
+        None => global_context()
+            .get_nrf_uri()
+            .await
+            .ok_or_else(|| "no NRF is configured, so no SMF+PGW-C can be resolved".to_string())?,
+    };
+    let (nrf_host, nrf_port) =
+        parse_host_port(&nrf_uri).ok_or_else(|| format!("NRF URI {nrf_uri:?} is unusable"))?;
+
+    let query = match (pgw_fqdn, pgw_ipv4) {
+        (Some(fqdn), _) => format!(
+            "pgw={}",
+            nextgcore_sbi::uri_encode::encode_query_value(fqdn)
+        ),
+        (None, Some(ip)) => format!(
+            "pgw-ip={}",
+            nextgcore_sbi::uri_encode::encode_query_value(
+                &serde_json::json!({ "ipv4Addr": std::net::Ipv4Addr::from(ip).to_string() })
+                    .to_string()
+            )
+        ),
+        (None, None) => {
+            return Err(
+                "the PDN connection names neither a PGW node name nor a PGW-C S5/S8 address, \
+                 so there is nothing to give the NRF"
+                    .to_string(),
+            )
+        }
+    };
+    let path = format!(
+        "/nnrf-disc/v1/nf-instances?target-nf-type=SMF&requester-nf-type=AMF\
+         &service-names={}&{query}",
+        service_name::NSMF_PDUSESSION
+    );
+    let client = SbiClient::for_peer(&nrf_host, nrf_port);
+    let response = client
+        .get(&path)
+        .await
+        .map_err(|e| format!("NRF discovery failed: {e}"))?;
+    if response.status != 200 {
+        return Err(format!("NRF discovery answered {}", response.status));
+    }
+    let json: serde_json::Value =
+        serde_json::from_str(response.http.content.as_deref().unwrap_or(""))
+            .map_err(|e| format!("NRF discovery answer is not JSON: {e}"))?;
+    let instances = json
+        .get("nfInstances")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for inst in &instances {
+        if !smf_profile_serves_pgw(inst, pgw_fqdn, pgw_ipv4) {
+            continue;
+        }
+        if let Some(ep) = nsmf_pdusession_endpoint(inst) {
+            return Ok(ep);
+        }
+    }
+    Err(format!(
+        "no discovered SMF declares PGW-C {} in smfInfo ({} candidate(s) examined)",
+        pgw_fqdn
+            .map(str::to_string)
+            .or_else(|| pgw_ipv4.map(|o| std::net::Ipv4Addr::from(o).to_string()))
+            .unwrap_or_default(),
+        instances.len()
+    ))
+}
+
+/// What an EPS→5GS `Nsmf_PDUSession_CreateSMContext` sends (TS 23.502 step 4).
+#[derive(Debug, Clone, Default)]
+pub struct EpsHandoverCreate {
+    /// `supi`.
+    pub supi: Option<String>,
+    /// `pei`, when the MM Context carried a MEI.
+    pub pei: Option<String>,
+    /// `servingNfId` — the initial AMF ID (step 4: *"initial AMF ID"*).
+    pub serving_nf_id: Option<String>,
+    /// `guami`.
+    pub guami: Option<serde_json::Value>,
+    /// `servingNetwork` as (mcc, mnc).
+    pub serving_plmn: Option<(String, String)>,
+    /// `ueEpsPdnConnection` — the MME's PDN Connection IE contents.
+    pub ue_eps_pdn_connection: Vec<u8>,
+    /// `targetId` — TS 29.571 `NgRanTargetId` (step 4: *"Target ID corresponds to Target ID
+    /// provided by the MME"*).
+    pub target_id: serde_json::Value,
+    /// `directForwardingFlag`.
+    pub direct_forwarding: bool,
+    /// `indirectForwardingFlag`.
+    pub indirect_forwarding: bool,
+}
+
+/// Build the `SmContextCreateData` for an EPS→5GS handover preparation.
+///
+/// Members TS 29.502 Table 6.1.6.2.2-1 conditions on the procedure, and why each is or is not
+/// here:
+///
+/// - **`pduSessionId`, `dnn`, `sNssai` absent**: each row reads *"This IE shall be present,
+///   except during an EPS to 5GS Idle mode mobility or handover using the N26 interface"* —
+///   the AMF does not know them; the SMF finds the PDU session *"based on EPS Bearer
+///   Context(s)"* (step 4).
+/// - **No `n1SmMsg`**: there is no UE-originated PDU Session Establishment Request in a
+///   handover.
+/// - **`ueEpsPdnConnection`, `hoState: PREPARING`, `targetId`, forwarding flags**: step 4's
+///   parameter list, with `PREPARING` as the *"HO Preparation Indication (to avoid switching
+///   the UP path)"*.
+pub fn build_eps_handover_create_request(create: &EpsHandoverCreate) -> SbiRequest {
+    let mut body = serde_json::json!({
+        "anType": "3GPP_ACCESS",
+        "ratType": "NR",
+        "hoState": "PREPARING",
+        "ueEpsPdnConnection":
+            base64::engine::general_purpose::STANDARD.encode(&create.ue_eps_pdn_connection),
+        "targetId": create.target_id,
+        "directForwardingFlag": create.direct_forwarding,
+        "indirectForwardingFlag": create.indirect_forwarding,
+    });
+    let obj = body.as_object_mut().expect("json! built an object");
+    if let Some(supi) = &create.supi {
+        obj.insert("supi".to_string(), serde_json::json!(supi));
+    }
+    if let Some(pei) = &create.pei {
+        obj.insert("pei".to_string(), serde_json::json!(pei));
+    }
+    if let Some(nf) = &create.serving_nf_id {
+        obj.insert("servingNfId".to_string(), serde_json::json!(nf));
+    }
+    if let Some(guami) = &create.guami {
+        obj.insert("guami".to_string(), guami.clone());
+    }
+    if let Some((mcc, mnc)) = &create.serving_plmn {
+        obj.insert(
+            "servingNetwork".to_string(),
+            serde_json::json!({ "mcc": mcc, "mnc": mnc }),
+        );
+    }
+    SbiRequest::post("/nsmf-pdusession/v1/sm-contexts")
+        .with_body(body.to_string(), content_type::APPLICATION_JSON)
+}
+
+/// What the SMF+PGW-C answers at step 7 (TS 23.502 `23502-k20.txt:21430-21436`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EpsHandoverCreated {
+    /// The SMF-chosen SM context reference.
+    pub sm_context_ref: String,
+    /// `pduSessionId` — the PDU session the SMF matched the PDN connection to.
+    pub pdu_session_id: u8,
+    /// `sNssai` as (sst, sd).
+    pub s_nssai: Option<(u8, Option<u32>)>,
+    /// The N2 SM Information (`PDUSessionResourceSetupRequestTransfer`), which the target
+    /// gNB receives in the HandoverRequest.
+    pub n2_sm_info: Vec<u8>,
+    /// `allocatedEbiList` EBIs, falling back to this tree's SMF's `ebiQfiMapping` when the
+    /// conformant member is absent.
+    pub allocated_ebis: Vec<u8>,
+    /// `allocatedEbiList` as (EBI, ARP) pairs — the ARP is `required` in `EbiArpMapping`, so
+    /// a conformant SMF always states it. Empty when only the `ebiQfiMapping` fallback was
+    /// present, which carries no ARP.
+    pub allocated_ebi_arps: Vec<(u8, crate::context::EbiArp)>,
+    /// The EBI↔QFI mapping, when the SMF returned one.
+    pub ebi_qfi: Vec<(u8, u8)>,
+}
+
+/// Parse an `SmContextCreatedData` answering an EPS→5GS create.
+pub fn parse_eps_handover_created(response: &SbiResponse) -> Result<EpsHandoverCreated, String> {
+    let root: serde_json::Value = serde_json::from_str(
+        response
+            .http
+            .content
+            .as_deref()
+            .ok_or("SMF answered with no body")?,
+    )
+    .map_err(|e| format!("SmContextCreatedData is not JSON: {e}"))?;
+    let sm_context_ref = response
+        .http
+        .headers
+        .get("location")
+        .and_then(|loc| loc.rsplit('/').next().map(str::to_string))
+        .or_else(|| root["smContextRef"].as_str().map(str::to_string))
+        .ok_or("SmContextCreatedData carries neither a Location nor an smContextRef")?;
+    // TS 29.502: `pduSessionId` "shall be present ... during an EPS to 5GS handover", and
+    // without it the AMF cannot name the session in the HandoverRequest.
+    let pdu_session_id = root["pduSessionId"]
+        .as_u64()
+        .and_then(|v| u8::try_from(v).ok())
+        .filter(|v| (1..=15).contains(v))
+        .ok_or("SmContextCreatedData has no pduSessionId (1..15)")?;
+    let n2_sm_info = extract_binary_ref(response, &root, "n2SmInfo")
+        .filter(|b| !b.is_empty())
+        .ok_or("SmContextCreatedData has no n2SmInfo for the target gNB")?;
+    let s_nssai = root["sNssai"]["sst"].as_u64().map(|sst| {
+        (
+            sst as u8,
+            root["sNssai"]["sd"]
+                .as_str()
+                .and_then(|sd| u32::from_str_radix(sd, 16).ok()),
+        )
+    });
+    let allocated_ebi_arps: Vec<(u8, crate::context::EbiArp)> = root["allocatedEbiList"]
+        .as_array()
+        .map(|l| {
+            l.iter()
+                .filter_map(|m| {
+                    let ebi = u8::try_from(m["epsBearerId"].as_u64()?).ok()?;
+                    let arp = &m["arp"];
+                    Some((
+                        ebi,
+                        crate::context::EbiArp {
+                            priority_level: u8::try_from(arp["priorityLevel"].as_u64()?).ok()?,
+                            preempt_cap: arp["preemptCap"].as_str()?.to_string(),
+                            preempt_vuln: arp["preemptVuln"].as_str()?.to_string(),
+                        },
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut allocated_ebis: Vec<u8> = allocated_ebi_arps.iter().map(|(ebi, _)| *ebi).collect();
+    let ebi_qfi: Vec<(u8, u8)> = root["ebiQfiMapping"]
+        .as_array()
+        .map(|l| {
+            l.iter()
+                .filter_map(|m| {
+                    Some((
+                        u8::try_from(m["ebi"].as_u64()?).ok()?,
+                        u8::try_from(m["qfi"].as_u64()?).ok()?,
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if allocated_ebis.is_empty() {
+        allocated_ebis = ebi_qfi.iter().map(|(ebi, _)| *ebi).collect();
+    }
+    Ok(EpsHandoverCreated {
+        sm_context_ref,
+        pdu_session_id,
+        s_nssai,
+        n2_sm_info,
+        allocated_ebis,
+        allocated_ebi_arps,
+        ebi_qfi,
+    })
+}
+
+/// `Nsmf_PDUSession_CreateSMContext` for an EPS→5GS handover preparation (step 4).
+pub async fn call_smf_create_sm_context_eps_handover(
+    smf_host: &str,
+    smf_port: u16,
+    create: &EpsHandoverCreate,
+) -> Result<EpsHandoverCreated, String> {
+    let client = crate::attach_oauth2(
+        SbiClient::for_peer(smf_host, smf_port),
+        nextgcore_sbi::types::NfType::Smf,
+    );
+    let response = client
+        .send_request(build_eps_handover_create_request(create))
+        .await
+        .map_err(|e| format!("CreateSMContext to {smf_host}:{smf_port} failed: {e}"))?;
+    if !response.is_success() {
+        return Err(format!(
+            "CreateSMContext to {smf_host}:{smf_port} answered {}",
+            response.status
+        ));
+    }
+    parse_eps_handover_created(&response)
+}
+
+/// `Nsmf_PDUSession_UpdateSMContext` driving the handover state machine of an EPS→5GS
+/// session (TS 29.502 §5.2.2.3.4): step 11's `PREPARED` with the target's
+/// `HandoverRequestAcknowledgeTransfer`, the execution phase's `COMPLETED`, or `CANCELLED`
+/// when the target refused.
+///
+/// Returns the response's `epsBearerSetup` elements (step 13: *"The data forwarding
+/// information is included in the EPS Bearer Setup List"*), which step 14 carries to the MME.
+pub async fn call_smf_update_sm_context_ho_state(
+    smf_host: &str,
+    smf_port: u16,
+    sm_context_ref: &str,
+    ho_state: &str,
+    n2: Option<(&str, &[u8])>,
+) -> Result<Vec<Vec<u8>>, String> {
+    let client = crate::attach_oauth2(
+        SbiClient::for_peer(smf_host, smf_port),
+        nextgcore_sbi::types::NfType::Smf,
+    );
+    let mut body = serde_json::json!({ "hoState": ho_state });
+    if ho_state == "CANCELLED" {
+        body["cause"] = serde_json::json!("HO_FAILURE");
+    }
+    let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify");
+    let mut request = SbiRequest::post(&path);
+    if let Some((info_type, transfer)) = n2 {
+        body["n2SmInfo"] = serde_json::json!({ "contentId": "n2SmInfo" });
+        body["n2SmInfoType"] = serde_json::json!(info_type);
+        request = request
+            .with_body(body.to_string(), content_type::APPLICATION_JSON)
+            .with_part(SbiPart::with_content(
+                "n2SmInfo",
+                content_type::APPLICATION_NGAP,
+                bytes::Bytes::copy_from_slice(transfer),
+            ));
+    } else {
+        request = request.with_body(body.to_string(), content_type::APPLICATION_JSON);
+    }
+    let response = client
+        .send_request(request)
+        .await
+        .map_err(|e| format!("UpdateSMContext ({ho_state}) failed: {e}"))?;
+    if !response.is_success() {
+        return Err(format!(
+            "UpdateSMContext ({ho_state}) answered {}",
+            response.status
+        ));
+    }
+    let root: serde_json::Value = response
+        .http
+        .content
+        .as_deref()
+        .and_then(|c| serde_json::from_str(c).ok())
+        .unwrap_or(serde_json::Value::Null);
+    Ok(root["epsBearerSetup"]
+        .as_array()
+        .map(|l| {
+            l.iter()
+                .filter_map(|v| v.as_str())
+                .filter_map(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -4621,5 +5096,145 @@ mod tests {
         );
 
         server.stop().await.expect("server stop");
+    }
+}
+
+#[cfg(test)]
+mod eps_handover_sbi_tests {
+    use super::*;
+
+    /// Step 3's SMF selection is by the PGW-C the PDN connection names, verified against the
+    /// profile rather than trusted to the NRF's filtering.
+    #[test]
+    fn an_smf_profile_serves_a_pgw_only_when_it_declares_it() {
+        let profile = serde_json::json!({
+            "nfType": "SMF",
+            "smfInfo": { "pgwFqdn": "PGW1.EPC.Example." },
+            "smfInfoList": { "a": { "pgwFqdnList": ["pgw2.epc.example"],
+                                    "pgwIpAddrList": [{ "ipv4Addr": "10.9.9.9" }] } },
+        });
+        assert!(
+            smf_profile_serves_pgw(&profile, Some("pgw1.epc.example"), None),
+            "FQDNs compare case-insensitively and without the root dot"
+        );
+        assert!(
+            smf_profile_serves_pgw(&profile, Some("pgw2.epc.example."), None),
+            "pgwFqdnList in an smfInfoList entry counts"
+        );
+        assert!(smf_profile_serves_pgw(&profile, None, Some([10, 9, 9, 9])));
+        assert!(
+            !smf_profile_serves_pgw(&profile, Some("pgw3.epc.example"), None),
+            "an SMF that declares other PGW-Cs must not be chosen (step 3: not moved)"
+        );
+        assert!(
+            !smf_profile_serves_pgw(
+                &serde_json::json!({ "nfType": "SMF" }),
+                Some("pgw1.epc.example"),
+                Some([10, 9, 9, 9])
+            ),
+            "an SMF that declares no PGW-C serves none"
+        );
+    }
+
+    /// The EPS→5GS create carries step 4's members and omits the ones TS 29.502 conditions
+    /// away for a handover over N26.
+    #[test]
+    fn the_eps_to_5gs_create_request_follows_ts29502_table_6_1_6_2_2_1() {
+        let create = EpsHandoverCreate {
+            supi: Some("imsi-001010000004180".to_string()),
+            serving_nf_id: Some("amf-418".to_string()),
+            ue_eps_pdn_connection: vec![0x47, 0x00, 0x09, 0x00],
+            target_id: serde_json::json!({ "tai": { "tac": "000001" } }),
+            ..Default::default()
+        };
+        let request = build_eps_handover_create_request(&create);
+        let body: serde_json::Value =
+            serde_json::from_str(request.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body["hoState"], "PREPARING",
+            "step 4's HO Preparation Indication"
+        );
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(body["ueEpsPdnConnection"].as_str().unwrap())
+                .unwrap(),
+            vec![0x47, 0x00, 0x09, 0x00],
+            "the MME's PDN Connection contents, forwarded byte for byte"
+        );
+        assert_eq!(body["targetId"]["tai"]["tac"], "000001");
+        assert_eq!(body["supi"], "imsi-001010000004180");
+        assert_eq!(body["servingNfId"], "amf-418", "step 4's 'initial AMF ID'");
+        assert_eq!(body["directForwardingFlag"], false);
+        assert_eq!(body["indirectForwardingFlag"], false);
+        for absent in ["pduSessionId", "dnn", "sNssai", "n1SmMsg"] {
+            assert!(
+                body.get(absent).is_none(),
+                "{absent}: 'shall be present, except during an EPS to 5GS Idle mode mobility \
+                 or handover using the N26 interface' -- so it must be absent here"
+            );
+        }
+        assert!(
+            request.http.parts.is_empty(),
+            "no N1 container in a handover"
+        );
+    }
+
+    /// Step 7's answer: the conformant `allocatedEbiList` with its ARP, and this tree's
+    /// SMF's `ebiQfiMapping` fallback.
+    #[test]
+    fn the_step_7_answer_yields_the_session_its_n2_info_and_its_ebis() {
+        let conformant = SbiResponse::with_status(201)
+            .with_header("location", "http://smf/nsmf-pdusession/v1/sm-contexts/77")
+            .with_body(
+                serde_json::json!({
+                    "pduSessionId": 5,
+                    "sNssai": { "sst": 1, "sd": "000001" },
+                    "n2SmInfo": { "contentId": "n2SmInfo" },
+                    "allocatedEbiList": [{ "epsBearerId": 6,
+                        "arp": { "priorityLevel": 9, "preemptCap": "MAY_PREEMPT",
+                                 "preemptVuln": "PREEMPTABLE" } }],
+                })
+                .to_string(),
+                content_type::APPLICATION_JSON,
+            )
+            .with_part(SbiPart::with_content(
+                "n2SmInfo",
+                content_type::APPLICATION_NGAP,
+                bytes::Bytes::from_static(&[0xAA, 0xBB]),
+            ));
+        let created = parse_eps_handover_created(&conformant).unwrap();
+        assert_eq!(created.sm_context_ref, "77");
+        assert_eq!(created.pdu_session_id, 5);
+        assert_eq!(created.s_nssai, Some((1, Some(1))));
+        assert_eq!(created.n2_sm_info, vec![0xAA, 0xBB]);
+        assert_eq!(created.allocated_ebis, vec![6]);
+        assert_eq!(created.allocated_ebi_arps[0].1.priority_level, 9);
+
+        let this_tree = SbiResponse::with_status(201)
+            .with_body(
+                serde_json::json!({
+                    "smContextRef": "3", "pduSessionId": 1,
+                    "n2SmInfo": { "contentId": "n2SmInfo" },
+                    "ebiQfiMapping": [{ "ebi": 5, "qfi": 1 }],
+                })
+                .to_string(),
+                content_type::APPLICATION_JSON,
+            )
+            .with_part(SbiPart::with_content(
+                "n2SmInfo",
+                content_type::APPLICATION_NGAP,
+                bytes::Bytes::from_static(&[0x01]),
+            ));
+        let created = parse_eps_handover_created(&this_tree).unwrap();
+        assert_eq!(created.allocated_ebis, vec![5]);
+        assert_eq!(created.ebi_qfi, vec![(5, 1)]);
+        assert!(created.allocated_ebi_arps.is_empty());
+
+        // No pduSessionId: the AMF cannot name the session to the gNB.
+        let no_psi = SbiResponse::with_status(201).with_body(
+            r#"{"smContextRef":"1"}"#.to_string(),
+            content_type::APPLICATION_JSON,
+        );
+        assert!(parse_eps_handover_created(&no_psi).is_err());
     }
 }

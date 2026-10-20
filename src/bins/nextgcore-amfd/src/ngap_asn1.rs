@@ -1039,6 +1039,223 @@ pub fn build_initial_context_setup_request_asn1(
     }
 }
 
+/// One PDU session a HandoverRequest asks the target gNB to set up.
+#[derive(Debug, Clone)]
+pub struct HandoverRequestSession {
+    /// PDU Session ID.
+    pub pdu_session_id: u8,
+    /// The S-NSSAI associated with the session's N2 SM information (TS 23.502
+    /// §4.11.1.2.2.2 step 9 / NOTE 4).
+    pub s_nssai: crate::context::SNssai,
+    /// The SMF's `PDUSessionResourceSetupRequestTransfer`, carried opaquely as the
+    /// `handoverRequestTransfer` (an OCTET STRING CONTAINING it, §9.3.4.1).
+    pub transfer: Vec<u8>,
+}
+
+/// What an **EPS→5GS** HandoverRequest carries (TS 38.413 §9.2.3.4, TS 33.501 §8.4.2
+/// step 4).
+#[derive(Debug, Clone)]
+pub struct EpsToFivegsHandoverRequest {
+    /// AMF UE NGAP ID the target AMF allocated for the arriving UE.
+    pub amf_ue_ngap_id: u64,
+    /// UE-AMBR (downlink, uplink) in bps.
+    pub ue_ambr_bps: (u64, u64),
+    /// UE security capabilities as TS 24.501 §9.11.3.54 octets (5G-EA, 5G-IA, EEA, EIA).
+    pub ue_security_capability: crate::context::UeSecurityCapability,
+    /// The NH the gNB derives K_gNB from: the **temporary K_gNB**, with NCC = 0
+    /// (§8.4.2 step 4: "the {NCC=0, NH=derived temporary K_(gNB)}").
+    pub next_hop: [u8; 32],
+    /// The S1 mode to N1 mode NAS transparent container value part, carried as `NASC`.
+    pub nas_container: Vec<u8>,
+    /// The PDU sessions to set up.
+    pub sessions: Vec<HandoverRequestSession>,
+    /// Allowed NSSAI.
+    pub allowed_nssai: Vec<crate::context::SNssai>,
+    /// The Source to Target transparent container the MME relayed from the source eNB.
+    pub source_to_target_container: Vec<u8>,
+}
+
+/// Build an **EPS→5GS HandoverRequest** (TS 38.413 §8.4.2 / §9.2.3.4) with the GENERATED
+/// codec (#418).
+///
+/// The IEs go in object-set order with the object set's criticalities
+/// (`HandoverRequestIEs`, §9.4.1). Against TS 33.501 §8.4.2 step 4, which fixes what an
+/// EPS→5GS one must carry beyond an intra-5GS HandoverRequest:
+///
+/// | IE | value | why |
+/// |---|---|---|
+/// | Handover Type | `eps-to-5gs` | §9.3.1.22 |
+/// | Security Context | NCC = **0**, NH = the temporary K_gNB | step 4: "{NCC=0, NH=derived temporary K_(gNB)}" |
+/// | New Security Context Indicator | `true` | step 4: "the New Security Context Indicator (NSCI)" — the gNB then sets keySetChangeIndicator |
+/// | NASC | the S1 mode to N1 mode NAS transparent container | step 4: "The target AMF sends the NAS Container created in step 3" |
+///
+/// The Cause is `handover-desirable-for-radio-reason`: the source eNB's S1AP cause reaches
+/// the MME, not this AMF, and that NGAP value is the generic reason a handover was started.
+///
+/// Built here rather than by `nextgcore-ngap`'s hand-written `build_handover_request`, which
+/// has no NASC or NSCI members: #417's direction is that new NGAP paths use the generated
+/// codec, and adding two fields to a hand-written encoder #417 is retiring would be the
+/// wrong direction. Never logs the PDU: the Security Context carries key material.
+pub fn build_eps_to_5gs_handover_request_asn1(
+    ctx: &AmfContext,
+    request: &EpsToFivegsHandoverRequest,
+) -> Option<Vec<u8>> {
+    use ngap_gen::{
+        HandoverRequest, HandoverRequestProtocolIEs, HandoverRequestProtocolIEs_Entry as Entry,
+        HandoverRequestProtocolIEs_EntryValue as Ie, ProtocolIE_ID, NGAP_PDU,
+    };
+    let served = ctx.served_guami.first()?;
+    let reject = ngap_gen::Criticality(ngap_gen::Criticality::REJECT);
+    let ignore = ngap_gen::Criticality(ngap_gen::Criticality::IGNORE);
+    let entry = |id: u16, criticality: &ngap_gen::Criticality, value: Ie| Entry {
+        id: ProtocolIE_ID(id),
+        criticality: criticality.clone(),
+        value,
+    };
+    let algorithms = |octet: u8| low_bits(u64::from(nas_caps_octet_to_ngap_bits(octet)), 16);
+    let caps = &request.ue_security_capability;
+    let sessions: Vec<ngap_gen::PDUSessionResourceSetupItemHOReq> = request
+        .sessions
+        .iter()
+        .map(|sess| ngap_gen::PDUSessionResourceSetupItemHOReq {
+            pdu_session_id: ngap_gen::PDUSessionID(sess.pdu_session_id),
+            s_nssai: generated_s_nssai(&sess.s_nssai),
+            handover_request_transfer:
+                ngap_gen::PDUSessionResourceSetupItemHOReqHandoverRequestTransfer(
+                    sess.transfer.clone(),
+                ),
+            ie_extensions: None,
+        })
+        .collect();
+    let ies = vec![
+        entry(
+            ngap_gen::ID_AMF_UE_NGAP_ID,
+            &reject,
+            Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(request.amf_ue_ngap_id)),
+        ),
+        entry(
+            ngap_gen::ID_HANDOVER_TYPE,
+            &reject,
+            Ie::Id_HandoverType(ngap_gen::HandoverType(ngap_gen::HandoverType::EPS_TO_5GS)),
+        ),
+        entry(
+            ngap_gen::ID_CAUSE,
+            &ignore,
+            Ie::Id_Cause(generated_cause(Cause::RadioNetwork(
+                CauseRadioNetwork::HandoverDesirableForRadioReason,
+            ))),
+        ),
+        entry(
+            ngap_gen::ID_UE_AGGREGATE_MAXIMUM_BIT_RATE,
+            &reject,
+            Ie::Id_UEAggregateMaximumBitRate(ngap_gen::UEAggregateMaximumBitRate {
+                ue_aggregate_maximum_bit_rate_dl: ngap_gen::BitRate(request.ue_ambr_bps.0),
+                ue_aggregate_maximum_bit_rate_ul: ngap_gen::BitRate(request.ue_ambr_bps.1),
+                ie_extensions: None,
+            }),
+        ),
+        entry(
+            ngap_gen::ID_UE_SECURITY_CAPABILITIES,
+            &reject,
+            Ie::Id_UESecurityCapabilities(ngap_gen::UESecurityCapabilities {
+                n_rencryption_algorithms: ngap_gen::NRencryptionAlgorithms(algorithms(caps.ea)),
+                n_rintegrity_protection_algorithms: ngap_gen::NRintegrityProtectionAlgorithms(
+                    algorithms(caps.ia),
+                ),
+                eutr_aencryption_algorithms: ngap_gen::EUTRAencryptionAlgorithms(algorithms(
+                    caps.eea,
+                )),
+                eutr_aintegrity_protection_algorithms: ngap_gen::EUTRAintegrityProtectionAlgorithms(
+                    algorithms(caps.eia),
+                ),
+                ie_extensions: None,
+            }),
+        ),
+        entry(
+            ngap_gen::ID_SECURITY_CONTEXT,
+            &reject,
+            Ie::Id_SecurityContext(ngap_gen::SecurityContext {
+                next_hop_chaining_count: ngap_gen::NextHopChainingCount(0),
+                next_hop_nh: ngap_gen::SecurityKey(
+                    bitvec::vec::BitVec::<u8, bitvec::order::Msb0>::from_slice(&request.next_hop),
+                ),
+                ie_extensions: None,
+            }),
+        ),
+        entry(
+            ngap_gen::ID_NEW_SECURITY_CONTEXT_IND,
+            &reject,
+            Ie::Id_NewSecurityContextInd(ngap_gen::NewSecurityContextInd(
+                ngap_gen::NewSecurityContextInd::TRUE,
+            )),
+        ),
+        entry(
+            ngap_gen::ID_NASC,
+            &reject,
+            Ie::Id_NASC(ngap_gen::NAS_PDU(request.nas_container.clone())),
+        ),
+        entry(
+            ngap_gen::ID_PDU_SESSION_RESOURCE_SETUP_LIST_HO_REQ,
+            &reject,
+            Ie::Id_PDUSessionResourceSetupListHOReq(ngap_gen::PDUSessionResourceSetupListHOReq(
+                sessions,
+            )),
+        ),
+        entry(
+            ngap_gen::ID_ALLOWED_NSSAI,
+            &reject,
+            Ie::Id_AllowedNSSAI(ngap_gen::AllowedNSSAI(
+                request
+                    .allowed_nssai
+                    .iter()
+                    .map(|s| ngap_gen::AllowedNSSAI_Item {
+                        s_nssai: generated_s_nssai(s),
+                        ie_extensions: None,
+                    })
+                    .collect(),
+            )),
+        ),
+        entry(
+            ngap_gen::ID_SOURCE_TO_TARGET_TRANSPARENT_CONTAINER,
+            &reject,
+            Ie::Id_SourceToTarget_TransparentContainer(
+                ngap_gen::SourceToTarget_TransparentContainer(
+                    request.source_to_target_container.clone(),
+                ),
+            ),
+        ),
+        entry(
+            ngap_gen::ID_GUAMI,
+            &reject,
+            Ie::Id_GUAMI(ngap_gen::GUAMI {
+                plmn_identity: ngap_gen::PLMNIdentity(encode_plmn_id(&served.plmn_id).to_vec()),
+                amf_region_id: ngap_gen::AMFRegionID(low_bits(u64::from(served.amf_id.region), 8)),
+                amf_set_id: ngap_gen::AMFSetID(low_bits(u64::from(served.amf_id.set), 10)),
+                amf_pointer: ngap_gen::AMFPointer(low_bits(u64::from(served.amf_id.pointer), 6)),
+                ie_extensions: None,
+            }),
+        ),
+    ];
+    let pdu = NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_HANDOVER_RESOURCE_ALLOCATION),
+        criticality: reject,
+        value: ngap_gen::InitiatingMessageValue::Id_HandoverResourceAllocation(HandoverRequest {
+            protocol_i_es: HandoverRequestProtocolIEs(ies),
+        }),
+    });
+    match nextgcore_ngap_gen::encode(&pdu) {
+        Ok(bytes) => Some(bytes),
+        Err(_) => {
+            // The error's Debug form may name a failing value; the NH must not reach a log.
+            log::error!(
+                "Failed to encode the EPS→5GS HandoverRequest for amf_ue_ngap_id={}",
+                request.amf_ue_ngap_id
+            );
+            None
+        }
+    }
+}
+
 /// What an Initial Context Setup Response or Failure decodes to (TS 38.413
 /// §10.3.4.2 / §10.3.5 for a RESPONSE message; every IE in both carries
 /// criticality ignore).
@@ -7887,6 +8104,152 @@ pub(crate) mod tests {
         assert_eq!(
             decode_initial_context_setup_response_asn1(&[0x20, 0x0e]),
             InitialContextSetupOutcomeDecode::Undecodable
+        );
+    }
+
+    /// #418: the EPS→5GS HandoverRequest, against TS 38.413 §9.2.3.4 and TS 33.501 §8.4.2
+    /// step 4, decoded by an INDEPENDENT codec — `nextgcore-ngap`'s hand-written parser —
+    /// for every IE it models, and by the generated decoder for the two it has no member
+    /// for (NSCI and NASC). An encoder checked only against its own decoder proves nothing
+    /// about the wire (the S1AP lesson of #455).
+    #[test]
+    fn the_eps_to_5gs_handover_request_carries_ts33501_8_4_2_step_4() {
+        let ctx = create_test_context();
+        let request = EpsToFivegsHandoverRequest {
+            amf_ue_ngap_id: 0x418,
+            ue_ambr_bps: (100_000_000, 50_000_000),
+            ue_security_capability: crate::context::UeSecurityCapability {
+                ea: 0xE0,
+                ia: 0x60,
+                eea: 0xF0,
+                eia: 0x70,
+            },
+            next_hop: [0x7A; 32],
+            nas_container: vec![0x01, 0x02, 0x03, 0x04, 0x22, 0x2B, 0x00, 0x00],
+            sessions: vec![HandoverRequestSession {
+                pdu_session_id: 5,
+                s_nssai: SNssai {
+                    sst: 1,
+                    sd: Some(1),
+                },
+                transfer: vec![0x00, 0x00, 0x04, 0x00, 0x82, 0x00, 0x0A],
+            }],
+            allowed_nssai: vec![SNssai {
+                sst: 1,
+                sd: Some(1),
+            }],
+            source_to_target_container: vec![0x40, 0x41, 0x42],
+        };
+        let bytes = build_eps_to_5gs_handover_request_asn1(&ctx, &request).expect("encodes");
+        // NGAP-PDU CHOICE initiatingMessage (index 0, extension bit 0), procedure code 13
+        // (id-HandoverResourceAllocation), criticality reject (0).
+        assert_eq!(&bytes[..3], &[0x00, 0x0D, 0x00]);
+
+        // The independent half: `nextgcore-ngap`'s hand-written ENCODER, fed the same
+        // fields, must produce exactly these bytes once the two IEs it has no member for
+        // (NSCI, id 41; NASC, id 37) are taken out of the generated PDU. The hand-written
+        // parser cannot be the oracle here: it correctly refuses NSCI, a not-comprehended
+        // IE marked reject (TS 38.413 §10.3.4).
+        let hand_written = builder::build_handover_request(&HandoverRequest {
+            amf_ue_ngap_id: 0x418,
+            handover_type: HandoverType::EpsTo5gs,
+            cause: Cause::RadioNetwork(CauseRadioNetwork::HandoverDesirableForRadioReason),
+            ue_ambr: UeAmbrInfo {
+                dl: 100_000_000,
+                ul: 50_000_000,
+            },
+            ue_security_capabilities: UeSecurityCapabilities {
+                nr_encryption_algorithms: nas_caps_octet_to_ngap_bits(0xE0),
+                nr_integrity_algorithms: nas_caps_octet_to_ngap_bits(0x60),
+                eutra_encryption_algorithms: nas_caps_octet_to_ngap_bits(0xF0),
+                eutra_integrity_algorithms: nas_caps_octet_to_ngap_bits(0x70),
+            },
+            security_context: SecurityContext {
+                next_hop_chaining_count: 0,
+                next_hop: [0x7A; 32],
+            },
+            pdu_session_list: vec![PduSessionResourceSetupItemHoReq {
+                pdu_session_id: 5,
+                s_nssai: nextgcore_ngap::types::SNssai {
+                    sst: 1,
+                    sd: Some([0, 0, 1]),
+                },
+                transfer: vec![0x00, 0x00, 0x04, 0x00, 0x82, 0x00, 0x0A],
+            }],
+            allowed_nssai: vec![nextgcore_ngap::types::SNssai {
+                sst: 1,
+                sd: Some([0, 0, 1]),
+            }],
+            source_to_target_container: vec![0x40, 0x41, 0x42],
+            guami: nextgcore_ngap::types::Guami {
+                plmn_identity: encode_plmn_id(&PlmnId::new("999", "70")),
+                amf_region_id: 2,
+                amf_set_id: 1,
+                amf_pointer: 0,
+            },
+        })
+        .expect("hand-written encode");
+        let mut stripped = nextgcore_ngap_gen::decode(&bytes).expect("generated decode");
+        if let ngap_gen::NGAP_PDU::InitiatingMessage(ref mut init) = stripped {
+            if let ngap_gen::InitiatingMessageValue::Id_HandoverResourceAllocation(ref mut req) =
+                init.value
+            {
+                req.protocol_i_es.0.retain(|ie| {
+                    ie.id.0 != ngap_gen::ID_NEW_SECURITY_CONTEXT_IND && ie.id.0 != ngap_gen::ID_NASC
+                });
+            }
+        }
+        assert_eq!(
+            nextgcore_ngap_gen::encode(&stripped).expect("re-encode"),
+            hand_written,
+            "every IE both encoders model -- type, cause, UE-AMBR, capabilities, NCC 0 and the \
+             NH, the session and its transfer, NSSAI, container, GUAMI -- is byte-identical to \
+             the independent hand-written encoder"
+        );
+        // The hand-written parser reads the stripped form, naming the values §8.4.2 step 4
+        // fixes.
+        let hr = match parser::decode_ngap_pdu(&hand_written) {
+            Ok(NgapMessage::HandoverRequest(hr)) => hr,
+            other => panic!("hand-written parse: {other:?}"),
+        };
+        assert_eq!(hr.handover_type as u8, 2, "eps-to-5gs (§9.3.1.22)");
+        assert_eq!(
+            hr.security_context.next_hop_chaining_count, 0,
+            "§8.4.2 step 4: NCC = 0"
+        );
+
+        // The two IEs the hand-written types lack, through the generated decoder.
+        let pdu = nextgcore_ngap_gen::decode(&bytes).expect("generated decode");
+        let ngap_gen::NGAP_PDU::InitiatingMessage(init) = pdu else {
+            panic!("initiating message expected");
+        };
+        let ngap_gen::InitiatingMessageValue::Id_HandoverResourceAllocation(req) = init.value
+        else {
+            panic!("HandoverRequest expected");
+        };
+        let mut nsci = false;
+        let mut nasc = None;
+        for ie in req.protocol_i_es.0 {
+            match ie.value {
+                ngap_gen::HandoverRequestProtocolIEs_EntryValue::Id_NewSecurityContextInd(v) => {
+                    nsci = v.0 == ngap_gen::NewSecurityContextInd::TRUE;
+                    assert_eq!(ie.criticality.0, ngap_gen::Criticality::REJECT);
+                }
+                ngap_gen::HandoverRequestProtocolIEs_EntryValue::Id_NASC(v) => {
+                    assert_eq!(ie.criticality.0, ngap_gen::Criticality::REJECT);
+                    nasc = Some(v.0);
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            nsci,
+            "§8.4.2 step 4: the New Security Context Indicator is sent"
+        );
+        assert_eq!(
+            nasc,
+            Some(vec![0x01, 0x02, 0x03, 0x04, 0x22, 0x2B, 0x00, 0x00]),
+            "§8.4.2 step 4: the NAS Container goes to the gNB as NASC"
         );
     }
 }
