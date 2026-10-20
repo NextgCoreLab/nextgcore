@@ -1252,6 +1252,13 @@ pub fn decode_cause(field: &ProtocolIeField) -> S1apResult<Cause> {
     decode_ie_value(&field.value)
 }
 
+/// Decode a standalone APER-encoded `Cause` value. #514 uses it to turn a Cause
+/// decoded by the generated codec into this crate's type with exactly the old
+/// parser's mapping, until the deletion pass retires both.
+pub fn decode_cause_aper(bytes: &[u8]) -> S1apResult<Cause> {
+    decode_ie_value(bytes)
+}
+
 pub fn encode_time_to_wait(container: &mut ProtocolIeContainer, ttw: TimeToWait) -> S1apResult<()> {
     let asn_ttw = match ttw {
         TimeToWait::V1s => nextgcore_asn1c::s1ap::ies::TimeToWait::V1s,

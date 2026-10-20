@@ -473,7 +473,7 @@ pub fn build_initial_context_setup_request(
         })
         .collect();
 
-    builder::build_initial_context_setup_request(&InitialContextSetupRequest {
+    let req = InitialContextSetupRequest {
         mme_ue_s1ap_id: enb_ue.mme_ue_s1ap_id,
         enb_ue_s1ap_id: enb_ue.enb_ue_s1ap_id,
         ue_ambr: UeAmbr {
@@ -483,7 +483,8 @@ pub fn build_initial_context_setup_request(
         erab_list,
         ue_security_capabilities: ue_security_capabilities_from(mme_ue),
         security_key: mme_ue.kenb,
-    })
+    };
+    crate::s1ap_gen::build_initial_context_setup_request(&req).map_err(gen_err)
 }
 
 // ============================================================================
