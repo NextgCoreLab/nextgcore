@@ -13,7 +13,7 @@ use crate::context::{
 use crate::sbc_message::SbcPwsData;
 use nextgcore_s1ap::{
     builder, AllocationRetentionPriority, Cause, CauseMisc, CauseNas, CauseProtocol,
-    CauseRadioNetwork, CauseTransport, CnDomain, CsFallbackIndicator, DlNasTransport,
+    CauseRadioNetwork, CauseTransport, CnDomain, CsFallbackIndicator,
     EnbConfigurationUpdateAcknowledge, EnbConfigurationUpdateFailure, ErabItem,
     ErabLevelQosParameters, ErabModifyRequest, ErabReleaseCommand, ErabSetupRequest,
     ErabToBeModifiedItem, ErabToBeSetupItem, ErrorIndication, EutranCgi, GbrQosInformation,
@@ -425,7 +425,18 @@ pub fn build_downlink_nas_transport_with_ids(
     mme_ue_s1ap_id: u32,
     nas_pdu: &[u8],
 ) -> S1apResult<Vec<u8>> {
-    builder::build_downlink_nas_transport(&DlNasTransport {
+    crate::s1ap_gen::build_downlink_nas_transport(enb_ue_s1ap_id, mme_ue_s1ap_id, nas_pdu)
+        .map_err(gen_err)
+}
+
+/// The pre-#514 hand-written DOWNLINK NAS TRANSPORT, kept as the oracle.
+#[cfg(test)]
+pub(crate) fn hand_written_build_downlink_nas_transport(
+    enb_ue_s1ap_id: u32,
+    mme_ue_s1ap_id: u32,
+    nas_pdu: &[u8],
+) -> S1apResult<Vec<u8>> {
+    builder::build_downlink_nas_transport(&nextgcore_s1ap::DlNasTransport {
         mme_ue_s1ap_id,
         enb_ue_s1ap_id,
         nas_pdu: nas_pdu.to_vec(),
