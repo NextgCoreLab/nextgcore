@@ -25,12 +25,12 @@ fn hex(b: &[u8]) -> String {
 /// `00 07 00` initiatingMessage, procedure 7, criticality reject; open-type
 /// length `1a` (26). Value: `00` SEQUENCE ext bit + pad, `00 03` three IEs.
 /// IE 0 `00 00 | 00 | 02 | 00 01` (reject; MME-UE-S1AP-ID 1-octet length `00`
-/// + pad, then `01`); IE 8 `00 08 | 00 | 02 | 00 01` likewise.
-/// IE 33 `00 21 | 40 | 07` (ignore): E-RABList SIZE(1..256), count-1 = 0 in
-/// one aligned octet `00`; item IE 35 `00 23 | 40 | 02` (ignore), E-RABItem:
-/// SEQUENCE ext 0, iE-Extensions absent 0, E-RAB-ID (0..15, ...) ext 0 +
-/// `0101`, Cause CHOICE ext 0 + nas `010`, CauseNas ext 0 + detach `10`, pad
-/// `00`: `0000 1010 | 0100 1000` = `0a 48`.
+/// and pad, then `01`); IE 8 `00 08 | 00 | 02 | 00 01` likewise. IE 33
+/// `00 21 | 40 | 07` (ignore): E-RABList SIZE(1..256), count-1 = 0 in one
+/// aligned octet `00`; item IE 35 `00 23 | 40 | 02` (ignore), E-RABItem:
+/// SEQUENCE ext 0, iE-Extensions absent 0, E-RAB-ID (0..15, ...) ext 0 and
+/// `0101`, Cause CHOICE ext 0 and nas `010`, CauseNas ext 0 and detach `10`,
+/// pad `00`: `0000 1010 | 0100 1000` = `0a 48`.
 const RELEASE_COMMAND: &str = "0007001a0000030000000200010008000200010021400700002340020a48";
 
 fn qos(qci: u8, gbr: bool) -> ErabLevelQosParameters {
