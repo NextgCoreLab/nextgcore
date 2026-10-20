@@ -96,6 +96,11 @@ services:
     networks:
       epc:
         ipv4_address: 172.24.0.2
+        # hss.yaml and pcrf.yaml name the store `mongodb:27017`, the 5G
+        # compose's service name. Without this alias that host does not
+        # resolve here, which went unnoticed while hssd never opened its
+        # store (#478); now that it does, startup fails without it.
+        aliases: [mongodb]
     healthcheck:
       test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
       interval: 10s
