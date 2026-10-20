@@ -1562,6 +1562,14 @@ pub fn encode_rrc_establishment_cause(
     container: &mut ProtocolIeContainer,
     cause: RrcEstablishmentCause,
 ) -> S1apResult<()> {
+    // This hand-written encoder has no ENUMERATED extension encoding; refuse the
+    // extension values rather than write them as root values (#514).
+    if cause as i64 > RrcEstablishmentCause::MoData as i64 {
+        return Err(S1apError::InvalidIeValue {
+            ie_name: "RRC-Establishment-Cause",
+            reason: "extension values are not encodable by the hand-written codec".into(),
+        });
+    }
     push_ie(
         container,
         ProtocolIeId::RRC_ESTABLISHMENT_CAUSE,

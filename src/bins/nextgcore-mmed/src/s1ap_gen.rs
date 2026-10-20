@@ -5,13 +5,16 @@
 //! hand-written code as a byte-equivalence oracle in its tests until the final
 //! deletion pass.
 //!
-//! Stage 2 (this module's first contents) is the S1 Setup family (TS 36.413
-//! §8.7.3): the S1 SETUP REQUEST decode, with §10.3.4 / §10.3.5 handling, and
-//! the S1 SETUP RESPONSE / S1 SETUP FAILURE encodes.
+//! Stage 2 is the S1 Setup family (TS 36.413 §8.7.3): the S1 SETUP REQUEST
+//! decode, with §10.3.4 / §10.3.5 handling, and the S1 SETUP RESPONSE / S1
+//! SETUP FAILURE encodes. Stage 3 is NAS transport (§8.6.2): the INITIAL UE
+//! MESSAGE and UPLINK NAS TRANSPORT decodes and the DOWNLINK NAS TRANSPORT
+//! encode.
 
 use bitvec::prelude::{BitVec, Msb0};
 use nextgcore_s1ap::{
-    Cause, EnbId, GlobalEnbId, PagingDrx, S1SetupRequest, SupportedTaItem, TimeToWait,
+    Cause, EnbId, EutranCgi, GlobalEnbId, InitialUeMessage, PagingDrx, RrcEstablishmentCause,
+    S1SetupRequest, STmsi, SupportedTaItem, Tai, TimeToWait,
 };
 use nextgcore_s1ap_gen::generated as g;
 use nextgcore_s1ap_gen::UnknownIe;
@@ -440,5 +443,311 @@ pub fn is_s1_setup_request(bytes: &[u8]) -> bool {
     bytes.len() >= 2 && bytes[0] == 0x00 && bytes[1] == PROC_S1_SETUP
 }
 
+// ============================================================================
+// NAS transport (TS 36.413 §8.6.2) -- stage 3
+// ============================================================================
+
+/// `id-initialUEMessage`, `id-downlinkNASTransport`, `id-uplinkNASTransport`.
+pub const PROC_INITIAL_UE_MESSAGE: u8 = 12;
+/// `id-downlinkNASTransport`.
+pub const PROC_DOWNLINK_NAS_TRANSPORT: u8 = 11;
+/// `id-uplinkNASTransport`.
+pub const PROC_UPLINK_NAS_TRANSPORT: u8 = 13;
+
+const ID_MME_UE_S1AP_ID: u16 = 0;
+const ID_ENB_UE_S1AP_ID: u16 = 8;
+const ID_NAS_PDU: u16 = 26;
+const ID_TAI: u16 = 67;
+const ID_EUTRAN_CGI: u16 = 100;
+const ID_S_TMSI: u16 = 96;
+
+/// Outcome of decoding a UE-associated initiating message of a Class 2
+/// procedure (no response message) under TS 36.413 §10.3.4.2 / §10.3.5.
+#[derive(Debug, Clone)]
+pub enum Class2Decode<T> {
+    /// Run the procedure. `notify` lists unknown ignore-and-notify IEs, to be
+    /// reported in an ERROR INDICATION (no response message exists).
+    Proceed {
+        /// The message.
+        msg: T,
+        /// IEs to report.
+        notify: Vec<DiagnosedIe>,
+    },
+    /// Do not run the procedure; answer with an ERROR INDICATION naming `ies`,
+    /// carrying whichever UE S1AP IDs could be read.
+    Reject {
+        /// IEs to report.
+        ies: Vec<DiagnosedIe>,
+        /// eNB-UE-S1AP-ID, if read.
+        enb_ue_s1ap_id: Option<u32>,
+        /// MME-UE-S1AP-ID, if read.
+        mme_ue_s1ap_id: Option<u32>,
+    },
+    /// Not decodable (transfer syntax error).
+    Undecodable,
+}
+
+/// An UPLINK NAS TRANSPORT whose ignore-criticality location IEs may be
+/// missing (§10.3.5: a missing `ignore` IE is ignored).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UplinkNas {
+    /// MME-UE-S1AP-ID.
+    pub mme_ue_s1ap_id: u32,
+    /// eNB-UE-S1AP-ID.
+    pub enb_ue_s1ap_id: u32,
+    /// The NAS-PDU.
+    pub nas_pdu: Vec<u8>,
+    /// EUTRAN-CGI, if present.
+    pub eutran_cgi: Option<EutranCgi>,
+    /// TAI, if present.
+    pub tai: Option<Tai>,
+}
+
+fn tai_from(v: &g::TAI) -> Option<Tai> {
+    Some(Tai {
+        plmn_identity: plmn(&v.plm_nidentity.0)?,
+        tac: u16::from_be_bytes(v.tac.0.as_slice().try_into().ok()?),
+    })
+}
+
+fn cgi_from(v: &g::EUTRAN_CGI) -> Option<EutranCgi> {
+    Some(EutranCgi {
+        plmn_identity: plmn(&v.plm_nidentity.0)?,
+        cell_identity: bits_to_u32(&v.cell_id.0),
+    })
+}
+
+fn rrc_cause_from(v: u8) -> RrcEstablishmentCause {
+    match v {
+        g::RRC_Establishment_Cause::EMERGENCY => RrcEstablishmentCause::Emergency,
+        g::RRC_Establishment_Cause::HIGH_PRIORITY_ACCESS => {
+            RrcEstablishmentCause::HighPriorityAccess
+        }
+        g::RRC_Establishment_Cause::MT_ACCESS => RrcEstablishmentCause::MtAccess,
+        g::RRC_Establishment_Cause::MO_DATA => RrcEstablishmentCause::MoData,
+        g::RRC_Establishment_Cause::DELAY_TOLERANT_ACCESS => {
+            RrcEstablishmentCause::DelayTolerantAccess
+        }
+        g::RRC_Establishment_Cause::MO_VOICE_CALL => RrcEstablishmentCause::MoVoiceCall,
+        g::RRC_Establishment_Cause::MO_EXCEPTION_DATA => RrcEstablishmentCause::MoExceptionData,
+        _ => RrcEstablishmentCause::MoSignalling,
+    }
+}
+
+fn missing(reject: &mut Vec<DiagnosedIe>, present: bool, id: u16) {
+    if !present && !reject.iter().any(|d| d.id == id) {
+        reject.push(DiagnosedIe {
+            criticality: REJECT,
+            id,
+            type_of_error: g::TypeOfError::MISSING,
+        });
+    }
+}
+
+fn not_understood(reject: &mut Vec<DiagnosedIe>, id: u16) {
+    reject.push(DiagnosedIe {
+        criticality: REJECT,
+        id,
+        type_of_error: g::TypeOfError::NOT_UNDERSTOOD,
+    });
+}
+
+/// Decode an INITIAL UE MESSAGE (TS 36.413 §9.1.7.1) with §10.3.4.2 / §10.3.5.
+///
+/// Mandatory `reject` IEs (eNB-UE-S1AP-ID, NAS-PDU, TAI) missing or not
+/// understood reject the message. A missing EUTRAN-CGI or RRC Establishment
+/// Cause (both `ignore`) is ignored: the cell identity is then 0 and the cause
+/// mo-Signalling, since the handler's type has no "absent".
+pub fn decode_initial_ue_message(bytes: &[u8]) -> Class2Decode<InitialUeMessage> {
+    let Ok((pdu, unknown)) = nextgcore_s1ap_gen::decode_with_unknown_ies(bytes) else {
+        return Class2Decode::Undecodable;
+    };
+    let g::S1AP_PDU::InitiatingMessage(msg) = pdu else {
+        return Class2Decode::Undecodable;
+    };
+    let g::InitiatingMessageValue::Id_initialUEMessage(m) = msg.value else {
+        return Class2Decode::Undecodable;
+    };
+    let (mut reject, notify) = classify_unknown(&unknown);
+    let (mut enb_ue_id, mut nas, mut tai, mut cgi, mut cause, mut s_tmsi) =
+        (None, None, None, None, None, None);
+    use g::InitialUEMessageProtocolIEs_EntryValue as V;
+    for ie in m.protocol_i_es.0 {
+        match ie.value {
+            V::Id_eNB_UE_S1AP_ID(v) => enb_ue_id = Some(v.0),
+            V::Id_NAS_PDU(v) => nas = Some(v.0),
+            V::Id_TAI(v) => match tai_from(&v) {
+                Some(t) => tai = Some(t),
+                None => not_understood(&mut reject, ID_TAI),
+            },
+            V::Id_EUTRAN_CGI(v) => cgi = cgi_from(&v),
+            V::Id_RRC_Establishment_Cause(v) => cause = Some(rrc_cause_from(v.0)),
+            V::Id_S_TMSI(v) => match (v.mmec.0.first(), <[u8; 4]>::try_from(v.m_tmsi.0.as_slice()))
+            {
+                (Some(mmec), Ok(m_tmsi)) => {
+                    s_tmsi = Some(STmsi {
+                        mmec: *mmec,
+                        m_tmsi: u32::from_be_bytes(m_tmsi),
+                    });
+                }
+                _ => not_understood(&mut reject, ID_S_TMSI),
+            },
+            // GUMMEI, CSG, cell access mode, relay, coverage, NB-IoT, IAB, ...:
+            // understood, not used by this MME.
+            _ => {}
+        }
+    }
+    missing(&mut reject, enb_ue_id.is_some(), ID_ENB_UE_S1AP_ID);
+    missing(&mut reject, nas.is_some(), ID_NAS_PDU);
+    missing(&mut reject, tai.is_some(), ID_TAI);
+    if !reject.is_empty() {
+        return Class2Decode::Reject {
+            ies: reject,
+            enb_ue_s1ap_id: enb_ue_id,
+            mme_ue_s1ap_id: None,
+        };
+    }
+    let (Some(enb_ue_s1ap_id), Some(nas_pdu), Some(tai)) = (enb_ue_id, nas, tai) else {
+        return Class2Decode::Undecodable;
+    };
+    let eutran_cgi = cgi.unwrap_or(EutranCgi {
+        plmn_identity: tai.plmn_identity,
+        cell_identity: 0,
+    });
+    Class2Decode::Proceed {
+        msg: InitialUeMessage {
+            enb_ue_s1ap_id,
+            nas_pdu,
+            tai,
+            eutran_cgi,
+            rrc_establishment_cause: cause.unwrap_or(RrcEstablishmentCause::MoSignalling),
+            s_tmsi,
+        },
+        notify,
+    }
+}
+
+/// Decode an UPLINK NAS TRANSPORT (TS 36.413 §9.1.7.3) with §10.3.4.2 /
+/// §10.3.5. EUTRAN-CGI and TAI are `ignore`: missing, they are `None` and the
+/// stored location is left as it is.
+pub fn decode_uplink_nas_transport(bytes: &[u8]) -> Class2Decode<UplinkNas> {
+    let Ok((pdu, unknown)) = nextgcore_s1ap_gen::decode_with_unknown_ies(bytes) else {
+        return Class2Decode::Undecodable;
+    };
+    let g::S1AP_PDU::InitiatingMessage(msg) = pdu else {
+        return Class2Decode::Undecodable;
+    };
+    let g::InitiatingMessageValue::Id_uplinkNASTransport(m) = msg.value else {
+        return Class2Decode::Undecodable;
+    };
+    let (mut reject, notify) = classify_unknown(&unknown);
+    let (mut mme_id, mut enb_id, mut nas, mut cgi, mut tai) = (None, None, None, None, None);
+    use g::UplinkNASTransportProtocolIEs_EntryValue as V;
+    for ie in m.protocol_i_es.0 {
+        match ie.value {
+            V::Id_MME_UE_S1AP_ID(v) => mme_id = Some(v.0),
+            V::Id_eNB_UE_S1AP_ID(v) => enb_id = Some(v.0),
+            V::Id_NAS_PDU(v) => nas = Some(v.0),
+            V::Id_EUTRAN_CGI(v) => cgi = cgi_from(&v),
+            V::Id_TAI(v) => tai = tai_from(&v),
+            _ => {}
+        }
+    }
+    missing(&mut reject, mme_id.is_some(), ID_MME_UE_S1AP_ID);
+    missing(&mut reject, enb_id.is_some(), ID_ENB_UE_S1AP_ID);
+    missing(&mut reject, nas.is_some(), ID_NAS_PDU);
+    if !reject.is_empty() {
+        return Class2Decode::Reject {
+            ies: reject,
+            enb_ue_s1ap_id: enb_id,
+            mme_ue_s1ap_id: mme_id,
+        };
+    }
+    let (Some(mme_ue_s1ap_id), Some(enb_ue_s1ap_id), Some(nas_pdu)) = (mme_id, enb_id, nas) else {
+        return Class2Decode::Undecodable;
+    };
+    Class2Decode::Proceed {
+        msg: UplinkNas {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id,
+            nas_pdu,
+            eutran_cgi: cgi,
+            tai,
+        },
+        notify,
+    }
+}
+
+/// Criticality Diagnostics in the hand-written type, for the ERROR INDICATION
+/// (still built by the hand-written codec until its own stage).
+pub fn error_indication_diagnostics(
+    procedure_code: u8,
+    ies: &[DiagnosedIe],
+) -> nextgcore_s1ap::CriticalityDiagnostics {
+    nextgcore_s1ap::CriticalityDiagnostics {
+        procedure_code: Some(procedure_code),
+        triggering_message: Some(nextgcore_s1ap::triggering_message::INITIATING_MESSAGE),
+        procedure_criticality: Some(IGNORE),
+        ies: ies
+            .iter()
+            .take(256)
+            .map(|d| nextgcore_s1ap::IeCriticalityDiagnostics {
+                ie_criticality: match d.criticality {
+                    IGNORE => nextgcore_s1ap::Criticality::Ignore,
+                    NOTIFY => nextgcore_s1ap::Criticality::Notify,
+                    _ => nextgcore_s1ap::Criticality::Reject,
+                },
+                ie_id: d.id,
+                type_of_error: if d.type_of_error == g::TypeOfError::MISSING {
+                    nextgcore_s1ap::TypeOfError::Missing
+                } else {
+                    nextgcore_s1ap::TypeOfError::NotUnderstood
+                },
+            })
+            .collect(),
+    }
+}
+
+/// Encode a DOWNLINK NAS TRANSPORT (TS 36.413 §9.1.7.2) with the generated
+/// codec: MME-UE-S1AP-ID reject, eNB-UE-S1AP-ID reject, NAS-PDU reject. Unlike
+/// the hand-written encoder, a NAS-PDU past 16 KB is carried (X.691 §11.9.3.8).
+pub fn build_downlink_nas_transport(
+    enb_ue_s1ap_id: u32,
+    mme_ue_s1ap_id: u32,
+    nas_pdu: &[u8],
+) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    use g::DownlinkNASTransportProtocolIEs_EntryValue as V;
+    let ie = |id: u16, value: V| g::DownlinkNASTransportProtocolIEs_Entry {
+        id: g::ProtocolIE_ID(id),
+        criticality: g::Criticality(REJECT),
+        value,
+    };
+    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+        procedure_code: g::ProcedureCode(PROC_DOWNLINK_NAS_TRANSPORT),
+        criticality: g::Criticality(IGNORE),
+        value: g::InitiatingMessageValue::Id_downlinkNASTransport(g::DownlinkNASTransport {
+            protocol_i_es: g::DownlinkNASTransportProtocolIEs(vec![
+                ie(
+                    ID_MME_UE_S1AP_ID,
+                    V::Id_MME_UE_S1AP_ID(g::MME_UE_S1AP_ID(mme_ue_s1ap_id)),
+                ),
+                ie(
+                    ID_ENB_UE_S1AP_ID,
+                    V::Id_eNB_UE_S1AP_ID(g::ENB_UE_S1AP_ID(enb_ue_s1ap_id)),
+                ),
+                ie(ID_NAS_PDU, V::Id_NAS_PDU(g::NAS_PDU(nas_pdu.to_vec()))),
+            ]),
+        }),
+    }))
+}
+
+/// Whether `bytes` is an initiating message of `procedure_code`.
+pub fn is_initiating(bytes: &[u8], procedure_code: u8) -> bool {
+    bytes.len() >= 2 && bytes[0] == 0x00 && bytes[1] == procedure_code
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod nas_tests;

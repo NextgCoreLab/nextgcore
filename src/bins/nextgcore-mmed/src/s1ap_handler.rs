@@ -154,6 +154,94 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
             crate::s1ap_gen::SetupRequestDecode::Undecodable => {}
         }
     }
+    // NAS transport is decoded with the generated codec (#514 stage 3).
+    // Both are Class 2 (no response message): §10.3.4.2 answers `notify` and
+    // `reject` IEs with an ERROR INDICATION.
+    if crate::s1ap_gen::is_initiating(data, crate::s1ap_gen::PROC_INITIAL_UE_MESSAGE) {
+        use crate::s1ap_gen::Class2Decode;
+        match crate::s1ap_gen::decode_initial_ue_message(data) {
+            Class2Decode::Proceed { msg, notify } => {
+                let mut out = class2_notify(
+                    enb_id,
+                    crate::s1ap_gen::PROC_INITIAL_UE_MESSAGE,
+                    Some(msg.enb_ue_s1ap_id),
+                    None,
+                    &notify,
+                );
+                if let Some(enb_ue_id) = handle_initial_ue_message(ctx, enb_id, &msg) {
+                    nas_dispatch::nas_eps_handle_uplink(
+                        ctx,
+                        nas_dispatch::UplinkNas {
+                            enb_ue_id,
+                            nas_pdu: &msg.nas_pdu,
+                            s_tmsi: msg.s_tmsi.as_ref().map(|s| (s.mmec, s.m_tmsi)),
+                        },
+                    );
+                }
+                return std::mem::take(&mut out);
+            }
+            Class2Decode::Reject {
+                ies,
+                enb_ue_s1ap_id,
+                mme_ue_s1ap_id,
+            } => {
+                return class2_reject(
+                    enb_id,
+                    crate::s1ap_gen::PROC_INITIAL_UE_MESSAGE,
+                    enb_ue_s1ap_id,
+                    mme_ue_s1ap_id,
+                    &ies,
+                );
+            }
+            Class2Decode::Undecodable => {}
+        }
+    }
+    if crate::s1ap_gen::is_initiating(data, crate::s1ap_gen::PROC_UPLINK_NAS_TRANSPORT) {
+        use crate::s1ap_gen::Class2Decode;
+        match crate::s1ap_gen::decode_uplink_nas_transport(data) {
+            Class2Decode::Proceed { msg, notify } => {
+                let mut out = class2_notify(
+                    enb_id,
+                    crate::s1ap_gen::PROC_UPLINK_NAS_TRANSPORT,
+                    Some(msg.enb_ue_s1ap_id),
+                    Some(msg.mme_ue_s1ap_id),
+                    &notify,
+                );
+                match handle_uplink_nas(ctx, enb_id, &msg) {
+                    Some(enb_ue_id) => nas_dispatch::nas_eps_handle_uplink(
+                        ctx,
+                        nas_dispatch::UplinkNas {
+                            enb_ue_id,
+                            nas_pdu: &msg.nas_pdu,
+                            s_tmsi: None,
+                        },
+                    ),
+                    None => out.extend(error_indication(
+                        enb_id,
+                        Some(msg.enb_ue_s1ap_id),
+                        Some(msg.mme_ue_s1ap_id),
+                        S1apCauseGroup::RadioNetwork,
+                        radio_network_cause::UNKNOWN_MME_UE_S1AP_ID,
+                    )),
+                }
+                return out;
+            }
+            Class2Decode::Reject {
+                ies,
+                enb_ue_s1ap_id,
+                mme_ue_s1ap_id,
+            } => {
+                return class2_reject(
+                    enb_id,
+                    crate::s1ap_gen::PROC_UPLINK_NAS_TRANSPORT,
+                    enb_ue_s1ap_id,
+                    mme_ue_s1ap_id,
+                    &ies,
+                );
+            }
+            Class2Decode::Undecodable => {}
+        }
+    }
     let message = match decode_s1ap_pdu(data) {
         Ok(message) => message,
         Err(e) => {
@@ -393,6 +481,60 @@ fn error_indication(
 /// Error Indication carrying Criticality Diagnostics (TS 36.413 §9.2.1.21), so the
 /// peer learns which procedure and which IEs were at fault rather than only that
 /// something was rejected.
+/// TS 36.413 §10.3.4.2 for an initiating message of a Class 2 procedure: the
+/// procedure runs, and `notify` IEs are reported in an ERROR INDICATION.
+fn class2_notify(
+    enb_id: u64,
+    procedure_code: u8,
+    enb_ue_s1ap_id: Option<u32>,
+    mme_ue_s1ap_id: Option<u32>,
+    notify: &[crate::s1ap_gen::DiagnosedIe],
+) -> Vec<S1apSend> {
+    if notify.is_empty() {
+        return Vec::new();
+    }
+    error_indication_with_diagnostics(
+        enb_id,
+        enb_ue_s1ap_id,
+        mme_ue_s1ap_id,
+        S1apCauseGroup::Protocol,
+        protocol_cause::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+        Some(crate::s1ap_gen::error_indication_diagnostics(
+            procedure_code,
+            notify,
+        )),
+    )
+}
+
+/// TS 36.413 §10.3.4.2 / §10.3.5 for an initiating message of a Class 2
+/// procedure: the procedure is not run, and the offending IEs are reported in
+/// an ERROR INDICATION.
+fn class2_reject(
+    enb_id: u64,
+    procedure_code: u8,
+    enb_ue_s1ap_id: Option<u32>,
+    mme_ue_s1ap_id: Option<u32>,
+    ies: &[crate::s1ap_gen::DiagnosedIe],
+) -> Vec<S1apSend> {
+    log::error!(
+        "S1AP procedure {procedure_code} from eNB {enb_id} not run (TS 36.413 §10.3.4/§10.3.5): {ies:?}"
+    );
+    // §10.3.4.2 / §10.3.5 name no cause; abstract-syntax-error-reject is the
+    // §9.2.1.3 value for an IE the receiver rejected, missing ones included
+    // (the diagnostics' TypeOfError says which).
+    error_indication_with_diagnostics(
+        enb_id,
+        enb_ue_s1ap_id,
+        mme_ue_s1ap_id,
+        S1apCauseGroup::Protocol,
+        protocol_cause::ABSTRACT_SYNTAX_ERROR_REJECT,
+        Some(crate::s1ap_gen::error_indication_diagnostics(
+            procedure_code,
+            ies,
+        )),
+    )
+}
+
 fn error_indication_with_diagnostics(
     enb_id: u64,
     enb_ue_s1ap_id: Option<u32>,
@@ -756,6 +898,27 @@ pub fn handle_uplink_nas_transport(
     enb_id: u64,
     msg: &UlNasTransport,
 ) -> Option<u64> {
+    handle_uplink_nas(
+        ctx,
+        enb_id,
+        &crate::s1ap_gen::UplinkNas {
+            mme_ue_s1ap_id: msg.mme_ue_s1ap_id,
+            enb_ue_s1ap_id: msg.enb_ue_s1ap_id,
+            nas_pdu: msg.nas_pdu.clone(),
+            eutran_cgi: Some(msg.eutran_cgi.clone()),
+            tai: Some(msg.tai.clone()),
+        },
+    )
+}
+
+/// Handle an UPLINK NAS TRANSPORT whose `ignore`-criticality location IEs may
+/// be missing (TS 36.413 §10.3.5): a missing TAI or EUTRAN-CGI leaves the
+/// stored location as it is.
+pub fn handle_uplink_nas(
+    ctx: &MmeContext,
+    enb_id: u64,
+    msg: &crate::s1ap_gen::UplinkNas,
+) -> Option<u64> {
     let enb_ue_id = ctx.enb_ue_find_by_mme_ue_s1ap_id(msg.mme_ue_s1ap_id)?;
     let enb_ue = ctx.enb_ue_find_by_id(enb_ue_id)?;
     if enb_ue.enb_id != enb_id {
@@ -765,9 +928,14 @@ pub fn handle_uplink_nas_transport(
         );
     }
 
-    let tai = tai_from_s1ap(&msg.tai);
-    let e_cgi = ecgi_from_s1ap(&msg.eutran_cgi);
-    update_ue_location(ctx, enb_ue.mme_ue_id, &tai, &e_cgi);
+    if let (Some(tai), Some(cgi)) = (&msg.tai, &msg.eutran_cgi) {
+        update_ue_location(
+            ctx,
+            enb_ue.mme_ue_id,
+            &tai_from_s1ap(tai),
+            &ecgi_from_s1ap(cgi),
+        );
+    }
 
     log::debug!(
         "Uplink NAS Transport: mme_ue_s1ap_id={} nas_len={}",
