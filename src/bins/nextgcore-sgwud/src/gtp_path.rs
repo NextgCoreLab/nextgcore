@@ -257,11 +257,15 @@ pub fn gtp_open() -> Result<(), String> {
     // Advertise the bound address in allocated F-TEIDs, unless a distinct
     // advertise address is configured (e.g. behind NAT or wildcard bind)
     let ctx = sgwu_self();
+    // Wildcard bind: SGWU_GTPU_ADVERTISE, then `sgwu.gtpu.server[0].address`
+    // (#482). The SGW-U IS the user-plane node, so its configured GTP-U address is
+    // the right one to put in F-TEIDs.
     let advertised = match server.local_addr().ip() {
         IpAddr::V4(v4) if !v4.is_unspecified() => Some(v4),
         _ => std::env::var("SGWU_GTPU_ADVERTISE")
             .ok()
-            .and_then(|v| v.parse::<Ipv4Addr>().ok()),
+            .and_then(|v| v.parse::<Ipv4Addr>().ok())
+            .or(crate::config::config().gtpu_ip),
     };
     ctx.set_gtpu_address(advertised);
 

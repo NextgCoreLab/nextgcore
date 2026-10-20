@@ -68,23 +68,17 @@ struct PfcpYaml {
     client: Option<PfcpClientYaml>,
 }
 
-/// `sgwc.gtpc.server`: present in the shipped config and deliberately NOT applied.
+/// `sgwc.gtpc.server`: the S11/S5-C GTP-C address (#482).
 ///
-/// It is declared here so this loader accepts the file as written rather than
-/// rejecting an unknown key, and so the omission is recorded at the site instead of
-/// looking like an oversight.
-///
-/// Reading it is a separate change with its own hazard: `gtp_path::gtp_open` derives
-/// `ctx.set_gtpu_address` from the S11 advertised address when `SGWC_GTPU_ADVERTISE`
-/// is unset, and the SGW's user-plane endpoints live on the **SGW-U** (172.24.0.6),
-/// not on the SGW-C (172.24.0.3). So applying `gtpc.server` here would silently
-/// start advertising 172.24.0.3 in S1-U/S5-U F-TEIDs, replacing today's loud "No
-/// GTP-U address configured" with a wrong address that fails invisibly, because
-/// GTP-U is unacknowledged. That decision needs the SGW-U's address too, which this
-/// file does not carry, so it is filed rather than guessed.
+/// Applied as the ADVERTISED control-plane address when the socket is bound to a
+/// wildcard (the default) and `SGWC_S11_ADVERTISE` is unset. It is deliberately NOT
+/// used as the GTP-U fallback: `gtp_path::gtp_open` falls back to the S11 address
+/// for GTP-U only when that address came from the bind or the environment. The
+/// SGW's user-plane endpoints live on the SGW-U (172.24.0.6 in the shipped compose),
+/// not here (172.24.0.3), so a YAML control-plane address in F-TEIDs would be a wrong
+/// address that fails invisibly, GTP-U being unacknowledged.
 #[derive(Debug, Default, Deserialize)]
 struct GtpcYaml {
-    #[allow(dead_code)]
     server: Option<Vec<AddrEntry>>,
 }
 
@@ -125,6 +119,8 @@ pub struct SgwcConfig {
     /// function to hold associations with several UP functions. Only the first is
     /// used — see [`SgwcConfig::sgwu_peer`].
     pub sgwu_peers: Vec<SocketAddr>,
+    /// The S11/S5-C address from `sgwc.gtpc.server[0].address` (#482).
+    pub gtpc_server_ip: Option<Ipv4Addr>,
 }
 
 impl SgwcConfig {
@@ -184,8 +180,21 @@ pub fn load_config(path: &str) -> SgwcConfig {
 fn resolve(sgwc: SgwcSection) -> SgwcConfig {
     let mut config = SgwcConfig::default();
 
-    // `gtpc` is accepted and not applied; see `GtpcYaml`.
-    let _ = sgwc.gtpc;
+    // The S11/S5-C address (#482); see `GtpcYaml` for why it is not a GTP-U address.
+    if let Some(address) = sgwc
+        .gtpc
+        .and_then(|g| g.server)
+        .and_then(|servers| servers.into_iter().next())
+        .and_then(|s| s.address)
+    {
+        match address.parse::<Ipv4Addr>() {
+            Ok(ip) => config.gtpc_server_ip = Some(ip),
+            Err(_) => log::warn!(
+                "sgwc.gtpc.server address '{address}' is not an IPv4 address; the S11 address \
+                 is left to the bind or SGWC_S11_ADVERTISE"
+            ),
+        }
+    }
 
     let Some(pfcp) = sgwc.pfcp else {
         return config;
@@ -285,6 +294,10 @@ pub fn apply(ctx: &SgwcContext, config: &SgwcConfig) {
         ),
     }
     ctx.set_sgwu_peers(config.sgwu_peers.clone());
+    if let Some(ip) = config.gtpc_server_ip {
+        log::info!("S11/S5-C GTP-C address: {ip}");
+    }
+    ctx.set_gtpc_server_ip(config.gtpc_server_ip);
 }
 
 // ============================================================================
@@ -326,6 +339,14 @@ mod tests {
             Some(Ipv4Addr::new(172, 24, 0, 3)),
             "sgwc.pfcp.server[0] is what the Association Setup Request advertises as Node ID"
         );
+    }
+
+    /// #482: `sgwc.gtpc.server` is read as the S11/S5-C address (it was declared and
+    /// deliberately ignored).
+    #[test]
+    fn the_shipped_config_resolves_the_gtpc_address() {
+        let config = load_config(SHIPPED_CONFIG);
+        assert_eq!(config.gtpc_server_ip, Some(Ipv4Addr::new(172, 24, 0, 3)));
     }
 
     /// An explicit `ip:port` and an explicit `port:` key both work, so a deployment can

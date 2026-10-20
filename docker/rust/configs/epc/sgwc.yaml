@@ -12,11 +12,10 @@ global:
     peer: 64
 
 sgwc:
-  # S11/S5-C GTP-C. Declared here and NOT read by the daemon: `gtp_path::gtp_open`
-  # binds `SGWC_S11_BIND` (default 0.0.0.0:2123) and derives the advertised address
-  # from what it bound. Reading this key would also feed `set_gtpu_address`, and the
-  # SGW's user-plane endpoints live on the SGW-U (172.24.0.6), not here — so it is
-  # left unread deliberately rather than by oversight. See `config.rs`'s `GtpcYaml`.
+  # S11/S5-C GTP-C (#482). Read by `config.rs` as the advertised S11/S5-C address
+  # when the socket binds the wildcard and SGWC_S11_ADVERTISE is unset. It is NOT
+  # used as the GTP-U address: user-plane endpoints live on the SGW-U (172.24.0.6),
+  # and SGWC_GTPU_ADVERTISE names that explicitly.
   gtpc:
     server:
       - address: 172.24.0.3
