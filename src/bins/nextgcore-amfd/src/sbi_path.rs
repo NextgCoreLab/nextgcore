@@ -1220,6 +1220,49 @@ pub async fn call_smf_update_sm_context(
     Ok(())
 }
 
+/// Ask the SMF to re-activate a session's user plane (#518): Nsmf_PDUSession_
+/// UpdateSMContext with `upCnxState: ACTIVATING` (TS 29.502 §5.2.2.3.2.2, TS 23.502
+/// §4.2.3.2 step 4). Returns the `n2SmInfo` the SMF answers with -- the
+/// PDUSessionResourceSetupRequestTransfer for the Initial Context Setup -- or an
+/// error when the SMF refuses or answers with no N2 SM information, which the
+/// caller reports in the Service Accept as a failed re-activation.
+pub async fn call_smf_activate_up_connection(
+    smf_host: &str,
+    smf_port: u16,
+    sm_context_ref: &str,
+) -> SbiResult<Vec<u8>> {
+    let client = crate::attach_oauth2(
+        SbiClient::for_peer(smf_host, smf_port),
+        nextgcore_sbi::types::NfType::Smf,
+    );
+    let body = serde_json::json!({ "upCnxState": "ACTIVATING" });
+    let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify");
+    let request =
+        SbiRequest::post(&path).with_body(body.to_string(), content_type::APPLICATION_JSON);
+    let response = client
+        .send_request(request)
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("SMF UP activation failed: {e}")))?;
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "SMF UP activation returned status {}",
+            response.status
+        )));
+    }
+    let response_body: serde_json::Value = response
+        .http
+        .content
+        .as_deref()
+        .and_then(|c| serde_json::from_str(c).ok())
+        .unwrap_or(serde_json::Value::Null);
+    match extract_binary_ref(&response, &response_body, "n2SmInfo") {
+        Some(n2) if !n2.is_empty() => Ok(n2),
+        _ => Err(SbiError::RequestFailed(
+            "SMF UP activation answered with no N2 SM information".to_string(),
+        )),
+    }
+}
+
 /// SM Context Update response from SMF (with optional N1/N2 info)
 pub struct SmContextUpdateResponse {
     /// N1 SM message (NAS PDU Session Modification Command) - optional

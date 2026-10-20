@@ -4917,16 +4917,41 @@ impl NgapServer {
         }
         let decoded = nas_security::nas_5gs_security_decode(&mut state.amf_ue, nas[1], nas);
         let mac_failed = std::mem::take(&mut state.amf_ue.mac_failed);
-        if decoded.is_err() || mac_failed {
-            return self
-                .reject_idle_service_request(
-                    association_id,
-                    amf_ue_ngap_id,
-                    ran_ue_ngap_id,
-                    "integrity check failed",
-                )
-                .await;
-        }
+        let decoded_sr = match decoded {
+            Ok(plain) if !mac_failed => plain,
+            _ => {
+                return self
+                    .reject_idle_service_request(
+                        association_id,
+                        amf_ue_ngap_id,
+                        ran_ue_ngap_id,
+                        "integrity check failed",
+                    )
+                    .await;
+            }
+        };
+        // The Service Request's own octets (the security header stripped), and its
+        // NAS message container deciphered under the context that just verified it:
+        // TS 24.501 §4.4.6 ciphers the container's value part in an initial message.
+        let _ = decoded_sr;
+        let (enc_alg, knas_enc, ul_count, access_type) = (
+            state.amf_ue.selected_enc_algorithm,
+            state.amf_ue.knas_enc,
+            state.amf_ue.ul_count,
+            state.amf_ue.access_type,
+        );
+        let sr_ies = service_request_session_ies(plain, &|value: &mut Vec<u8>| {
+            if enc_alg != 0 {
+                nas_security::nas_encrypt(
+                    enc_alg,
+                    &knas_enc,
+                    ul_count,
+                    access_type,
+                    nas_security::direction::UPLINK,
+                    value,
+                );
+            }
+        });
 
         // The UE is back: its record moves to the new NGAP IDs and leaves CM-IDLE.
         self.ue_auth_state.remove(old_id);
@@ -4953,7 +4978,9 @@ impl NgapServer {
         let mut sessions = Vec::new();
         if let Some(p) = &paging {
             clear_session_paging(p);
-            if let (Some(psi), Some(transfer)) = (p.pdu_session_id, p.pending_n2.clone()) {
+            if p.pending_n2_release {
+                // A paged release is sent after the ICS as its own Release Command.
+            } else if let (Some(psi), Some(transfer)) = (p.pdu_session_id, p.pending_n2.clone()) {
                 let s_nssai = {
                     let ctx = crate::context::amf_self();
                     let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
@@ -4974,6 +5001,105 @@ impl NgapServer {
             }
         }
 
+        // The UE's PDU sessions are keyed by its AMF-UE-NGAP-ID; move them to the
+        // new one, or every later lookup (and this one) misses them (#518).
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.sess_rekey_ue(old_id, amf_ue_ngap_id);
+        }
+        let moved: Vec<(u8, String)> = self
+            .sm_context_refs
+            .iter()
+            .filter(|((ue, _), _)| *ue == old_id)
+            .map(|((_, psi), r)| (*psi, r.clone()))
+            .collect();
+        for (psi, r) in moved {
+            self.sm_context_refs.remove(&(old_id, psi));
+            self.sm_context_refs.insert((amf_ue_ngap_id, psi), r);
+        }
+
+        // TS 24.501 §5.6.1.4.1 / TS 23.502 §4.2.3.2 steps 4-12: release what the UE
+        // no longer has, re-activate what it has uplink data for (#518).
+        let held: Vec<(u8, Option<String>, crate::context::SNssai)> = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard
+                .sess_list_for_ue(amf_ue_ngap_id)
+                .into_iter()
+                .map(|s| {
+                    let r = self
+                        .sm_context_refs
+                        .get(&(amf_ue_ngap_id, s.psi))
+                        .cloned()
+                        .or(s.sm_context_ref.clone());
+                    (s.psi, r, s.s_nssai)
+                })
+                .collect()
+        };
+        let already: Vec<u8> = sessions.iter().map(|s| s.pdu_session_id).collect();
+        let plan = plan_service_request_sessions(
+            &held.iter().map(|(psi, _, _)| *psi).collect::<Vec<_>>(),
+            sr_ies,
+            &already,
+        );
+        let (smf_host, smf_port) = Self::smf_sbi_target();
+        for psi in &plan.release {
+            let sm_ref = held
+                .iter()
+                .find(|(p, _, _)| p == psi)
+                .and_then(|(_, r, _)| r.clone());
+            if let Some(r) = sm_ref {
+                if let Err(e) =
+                    crate::sbi_path::call_smf_release_sm_context(&smf_host, smf_port, &r).await
+                {
+                    log::warn!(
+                        "UE {amf_ue_ngap_id}: SMF release of PSI {psi} (inactive at the UE) failed: {e}"
+                    );
+                }
+            }
+            self.sm_context_refs.remove(&(amf_ue_ngap_id, *psi));
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(sess) = guard.sess_find_by_psi(amf_ue_ngap_id, *psi) {
+                guard.sess_remove(sess.id);
+            }
+            log::info!("UE {amf_ue_ngap_id}: PSI {psi} released, the UE reports it inactive");
+        }
+        let mut reactivation_failed: u16 = 0;
+        for psi in &plan.activate {
+            let found = held.iter().find(|(p, _, _)| p == psi).cloned();
+            let transfer = match &found {
+                Some((_, Some(r), _)) => {
+                    match crate::sbi_path::call_smf_activate_up_connection(&smf_host, smf_port, r)
+                        .await
+                    {
+                        Ok(t) => Some(t),
+                        Err(e) => {
+                            log::warn!("UE {amf_ue_ngap_id}: PSI {psi} UP activation failed: {e}");
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+            match (transfer, found) {
+                (Some(transfer), Some((_, _, s_nssai))) => {
+                    sessions.push(crate::ngap_asn1::CxtReqSession {
+                        pdu_session_id: *psi,
+                        s_nssai,
+                        transfer,
+                    })
+                }
+                _ => reactivation_failed |= 1 << psi,
+            }
+        }
+        let remaining: u16 = held
+            .iter()
+            .map(|(p, _, _)| *p)
+            .filter(|p| !plan.release.contains(p))
+            .fold(0, |m, p| m | (1 << p));
+
         let kgnb = nextgcore_crypt::kdf::nextgcore_kdf_kgnb_and_kn3iwf(
             &state.amf_ue.kamf,
             state.amf_ue.ul_count,
@@ -4987,7 +5113,12 @@ impl NgapServer {
         state.amf_ue.init_next_hop_chain();
         state.initial_context_setup_request_sent = true;
         state.initial_context_setup_response_received = false;
-        let accept = gmm_build::build_service_accept(&state.amf_ue).unwrap_or_default();
+        // TS 24.501 §8.2.17: PDU session status when the UE sent one; the
+        // re-activation result when it asked for re-activation (§5.6.1.4.1).
+        let accept = gmm_build::build_service_accept_for_sessions(
+            sr_ies.pdu_session_status.map(|_| remaining),
+            sr_ies.uplink_data_status.map(|_| reactivation_failed),
+        );
         let allowed_nssai = state.amf_ue.allowed_nssai.clone();
         let ue_security_capability = state.amf_ue.ue_security_capability.clone();
         let ue_ambr = (state.amf_ue.ue_ambr.downlink > 0 || state.amf_ue.ue_ambr.uplink > 0)
@@ -5017,9 +5148,18 @@ impl NgapServer {
             return Ok(());
         };
         self.send_to_association(association_id, &ics).await?;
+        if let Some(p) = &paging {
+            self.deliver_paged_after_service_request(
+                association_id,
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                p,
+            )
+            .await?;
+        }
         log::info!(
             "Service Request from CM-IDLE: UE {old_id} -> {amf_ue_ngap_id}, Service Accept in \
-             Initial Context Setup with {} paged PDU session(s){}",
+             Initial Context Setup with {} PDU session(s){}",
             sessions.len(),
             if paging.is_some() {
                 " (page answered, T3513 stopped)"
@@ -5036,6 +5176,51 @@ impl NgapServer {
             crate::namf_server::fire_presence_in_aoi_report(&state.amf_ue);
         }
         crate::namf_server::fire_ues_in_area_report();
+        Ok(())
+    }
+
+    /// What a page held that does not ride the Service Request's ICS (#518, TS
+    /// 23.502 §4.2.3.3 step 5): an N1 message goes down in a DOWNLINK NAS TRANSPORT
+    /// (5GSM payload, TS 24.501 §8.2.11), and a paged release is answered with its
+    /// own PDU SESSION RESOURCE RELEASE COMMAND.
+    async fn deliver_paged_after_service_request(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        paging: &crate::context::PagingContext,
+    ) -> Result<()> {
+        if paging.pending_n2_release {
+            if let Some(psi) = paging.pdu_session_id {
+                match crate::ngap_asn1::build_pdu_session_resource_release_command_asn1(
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    &[psi],
+                ) {
+                    Some(cmd) => self.send_to_association(association_id, &cmd).await?,
+                    None => log::error!(
+                        "UE {amf_ue_ngap_id}: paged release of PSI {psi} did not encode"
+                    ),
+                }
+            }
+        }
+        if let Some(n1) = &paging.pending_n1 {
+            let plain = gmm_build::build_dl_nas_transport(
+                paging.pdu_session_id,
+                payload_container_type::N1_SM_INFORMATION,
+                n1,
+                None,
+                None,
+            )
+            .unwrap_or_default();
+            if let Some(protected) = self.protect_nas(amf_ue_ngap_id, &plain) {
+                self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
+                    .await?;
+                log::info!(
+                    "UE {amf_ue_ngap_id}: paged N1 message delivered after the Service Request"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -11425,6 +11610,81 @@ fn is_snpn_onboarding_suci(suci: &str) -> bool {
 }
 
 /// Parse a plain Registration Request NAS PDU
+/// The session IEs of a SERVICE REQUEST (#518): Uplink data status (TS 24.501
+/// §9.11.3.57) and PDU session status (§9.11.3.44), as PSI bitmaps (bit n = PSI n).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ServiceRequestSessionIes {
+    pub uplink_data_status: Option<u16>,
+    pub pdu_session_status: Option<u16>,
+}
+
+/// Read them from a decoded SERVICE REQUEST. A UE in CM-IDLE sends these
+/// non-cleartext IEs only inside the NAS message container (TS 24.501 §4.4.6), so
+/// the container's full message wins when it is present.
+pub(crate) fn service_request_session_ies(
+    plain: &[u8],
+    decipher_container: &dyn Fn(&mut Vec<u8>),
+) -> ServiceRequestSessionIes {
+    use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+    let parse = |bytes: &[u8]| match parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(bytes)) {
+        Ok(FiveGmmMessage::ServiceRequest(sr)) => Some(sr),
+        _ => None,
+    };
+    let Some(outer) = parse(plain) else {
+        return ServiceRequestSessionIes::default();
+    };
+    let sr = outer
+        .nas_message_container
+        .as_ref()
+        .and_then(|c| {
+            let mut value = c.data.clone();
+            decipher_container(&mut value);
+            parse(&value)
+        })
+        .unwrap_or(outer);
+    ServiceRequestSessionIes {
+        uplink_data_status: sr.uplink_data_status.map(|u| u.psi),
+        pdu_session_status: sr.pdu_session_status.map(|p| p.psi),
+    }
+}
+
+/// What a Service Request asks of the AMF's sessions (#518).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ServiceRequestSessionPlan {
+    /// Held by the AMF but reported inactive by the UE: released locally and at
+    /// the SMF (TS 24.501 §5.6.1.4.1).
+    pub release: Vec<u8>,
+    /// In the Uplink data status: user plane to re-activate (TS 23.502 §4.2.3.2
+    /// step 4). PSIs the AMF does not hold are kept so they are reported as
+    /// failed re-activations.
+    pub activate: Vec<u8>,
+}
+
+/// Decide the plan from the PSIs the AMF holds, the request's IEs, and the PSIs
+/// the page already carries (which need no second activation).
+pub(crate) fn plan_service_request_sessions(
+    held: &[u8],
+    ies: ServiceRequestSessionIes,
+    already: &[u8],
+) -> ServiceRequestSessionPlan {
+    let mut plan = ServiceRequestSessionPlan::default();
+    if let Some(status) = ies.pdu_session_status {
+        for &psi in held {
+            if status & (1 << psi) == 0 && !already.contains(&psi) {
+                plan.release.push(psi);
+            }
+        }
+    }
+    if let Some(status) = ies.uplink_data_status {
+        for psi in 1..=15u8 {
+            if status & (1 << psi) != 0 && !already.contains(&psi) && !plan.release.contains(&psi) {
+                plan.activate.push(psi);
+            }
+        }
+    }
+    plan
+}
+
 /// Extract the value of the NAS message container IE (IEI 0x71, TLV-E format:
 /// IEI(1) | length(2, big-endian) | value) from a 5GMM plain message body such
 /// as Security Mode Complete (TS 24.501 Section 9.11.3.33). Returns the
@@ -14529,7 +14789,219 @@ mod tests {
             guard.paging_find(old_id).is_none(),
             "answering the page stops T3513"
         );
-        assert!(!guard.sess_find_by_psi(old_id, 5).unwrap().paging.ongoing);
+        assert!(
+            guard.sess_find_by_psi(old_id, 5).is_none(),
+            "#518: the session moved with the UE to its new NGAP ID"
+        );
+        assert!(!guard.sess_find_by_psi(new_id, 5).unwrap().paging.ongoing);
+    }
+
+    /// #518: a SERVICE REQUEST's session IEs are read from the full message in its
+    /// NAS message container (TS 24.501 §4.4.6), octets derived by hand: Uplink data
+    /// status 40 02 20 00 = PSI 5 (§9.11.3.57); PDU session status 50 02 60 00 = PSI
+    /// 5 and 6 (§9.11.3.44).
+    #[test]
+    fn the_service_request_session_ies_come_from_its_nas_message_container() {
+        let inner = [
+            0x7E, 0x00, 0x4C, 0x01, 0x00, 0x07, 0xF4, 0x55, 0x6A, 0x00, 0x00, 0x00, 0x01, 0x40,
+            0x02, 0x20, 0x00, 0x50, 0x02, 0x60, 0x00,
+        ];
+        let mut outer = vec![
+            0x7E, 0x00, 0x4C, 0x01, 0x00, 0x07, 0xF4, 0x55, 0x6A, 0, 0, 0, 1,
+        ];
+        outer.extend_from_slice(&[0x71, 0x00, inner.len() as u8]);
+        outer.extend_from_slice(&inner);
+        assert_eq!(
+            service_request_session_ies(&outer, &|_| {}),
+            ServiceRequestSessionIes {
+                uplink_data_status: Some(1 << 5),
+                pdu_session_status: Some((1 << 5) | (1 << 6)),
+            }
+        );
+        // TS 24.501 §4.4.6: with a non-null NEA the container's value is ciphered;
+        // it is read only through the decipher the caller supplies.
+        let key = [0x2Bu8; 16];
+        let mut ciphered = inner.to_vec();
+        nas_security::nas_encrypt(
+            2,
+            &key,
+            7,
+            0,
+            nas_security::direction::UPLINK,
+            &mut ciphered,
+        );
+        assert_ne!(ciphered, inner.to_vec());
+        let mut outer_c = vec![
+            0x7E, 0x00, 0x4C, 0x01, 0x00, 0x07, 0xF4, 0x55, 0x6A, 0, 0, 0, 1,
+        ];
+        outer_c.extend_from_slice(&[0x71, 0x00, ciphered.len() as u8]);
+        outer_c.extend_from_slice(&ciphered);
+        let decipher = |v: &mut Vec<u8>| {
+            nas_security::nas_encrypt(2, &key, 7, 0, nas_security::direction::UPLINK, v)
+        };
+        assert_eq!(
+            service_request_session_ies(&outer_c, &decipher).uplink_data_status,
+            Some(1 << 5)
+        );
+        assert_eq!(
+            service_request_session_ies(&outer_c, &|_| {}),
+            ServiceRequestSessionIes::default(),
+            "a ciphered container read as plaintext yields nothing, not garbage"
+        );
+        // Without a container the outer message's own IEs are read; none here.
+        assert_eq!(
+            service_request_session_ies(&inner[..13], &|_| {}),
+            ServiceRequestSessionIes::default()
+        );
+    }
+
+    /// #518, TS 24.501 §5.6.1.4.1: sessions the UE reports inactive are released;
+    /// the Uplink data status asks for re-activation, including PSIs the AMF does
+    /// not hold (reported as failures); sessions the page already carries are left
+    /// alone.
+    #[test]
+    fn the_service_request_plan_releases_inactive_and_activates_uplink_sessions() {
+        let ies = ServiceRequestSessionIes {
+            uplink_data_status: Some((1 << 5) | (1 << 9)),
+            pdu_session_status: Some((1 << 5) | (1 << 7)),
+        };
+        let plan = plan_service_request_sessions(&[5, 6, 7], ies, &[7]);
+        assert_eq!(plan.release, vec![6]);
+        assert_eq!(plan.activate, vec![5, 9]);
+        // No PDU session status IE: nothing is released.
+        let plan = plan_service_request_sessions(
+            &[5, 6],
+            ServiceRequestSessionIes {
+                uplink_data_status: None,
+                pdu_session_status: None,
+            },
+            &[],
+        );
+        assert_eq!(plan, ServiceRequestSessionPlan::default());
+    }
+
+    /// A fake SMF for the Service Request's session handling (#518): `/modify` with
+    /// `upCnxState: ACTIVATING` is answered with an N2 SM transfer, `/release` with
+    /// 204; every request is recorded as (path, JSON body).
+    async fn fake_activating_smf() -> (
+        nextgcore_sbi::server::SbiServer,
+        u16,
+        Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    ) {
+        use base64::Engine as _;
+        use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+        use nextgcore_sbi::server::{SbiServer as NSbiServer, SbiServerConfig as NSbiCfg};
+        let seen: Arc<std::sync::Mutex<Vec<(String, String)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = NSbiServer::on_listener(NSbiCfg::new(addr), listener);
+        server
+            .start(move |req: SReq| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    let uri = req.header.uri.clone();
+                    let body = req.http.content.clone().unwrap_or_default();
+                    sink.lock().expect("sink").push((uri.clone(), body.clone()));
+                    if uri.ends_with("/modify") && body.contains("ACTIVATING") {
+                        let n2 =
+                            base64::engine::general_purpose::STANDARD.encode([0xA5, 0x18, 0x05]);
+                        SResp::with_status(200).with_body(
+                            serde_json::json!({
+                                "upCnxState": "ACTIVATING",
+                                "n2SmInfoType": "PDU_RES_SETUP_REQ",
+                                "n2SmInfo": n2,
+                            })
+                            .to_string(),
+                            "application/json",
+                        )
+                    } else {
+                        SResp::no_content()
+                    }
+                }
+            })
+            .await
+            .expect("fake SMF starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (server, addr.port(), seen)
+    }
+
+    /// #518 through the real path: a CM-IDLE UE holding PSI 5 and 6 sends a
+    /// Service Request whose NAS message container reports only PSI 5 active and
+    /// asks for PSI 5's user plane. The AMF releases PSI 6 at the SMF and locally,
+    /// asks the SMF to activate PSI 5 (`upCnxState: ACTIVATING`, TS 29.502
+    /// §5.2.2.3.2.2), and keeps PSI 5 under the UE's new NGAP ID. Before #518 the
+    /// Uplink data status and PDU session status were never read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_service_request_releases_inactive_sessions_and_activates_its_uplink_ones() {
+        let (_smf, port, seen) = fake_activating_smf().await;
+        let _env = SmfEnvGuard::set(port);
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let old_id = 5_180_101u64;
+        let new_id = 5_180_102u64;
+        *ngap.next_gnb_id.lock().await = new_id;
+        ngap.ue_auth_state
+            .insert(old_id, idle_registered_ue(old_id));
+        ngap.sm_context_refs
+            .insert((old_id, 5), "ref-518-keep".to_string());
+        ngap.sm_context_refs
+            .insert((old_id, 6), "ref-518-drop".to_string());
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap();
+            guard.sess_add(old_id, 5).expect("PSI 5");
+            guard.sess_add(old_id, 6).expect("PSI 6");
+        }
+        let tmsi = old_id as u32;
+        let mut inner = vec![0x7E, 0x00, 0x4C, 0x01, 0x00, 0x07, 0xF4, 0x55, 0x6A];
+        inner.extend_from_slice(&tmsi.to_be_bytes());
+        inner.extend_from_slice(&[0x40, 0x02, 0x20, 0x00, 0x50, 0x02, 0x20, 0x00]);
+        let mut nas = protected_service_request([0; 4], tmsi);
+        nas.extend_from_slice(&[0x71, 0x00, inner.len() as u8]);
+        nas.extend_from_slice(&inner);
+        let _ = ngap
+            .handle_initial_ue_message(1, &service_request_initial_ue(nas))
+            .await;
+
+        let calls = seen.lock().unwrap().clone();
+        assert!(
+            calls
+                .iter()
+                .any(|(uri, _)| uri.contains("/sm-contexts/ref-518-drop/release")),
+            "PSI 6, inactive at the UE, is released at the SMF: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(
+                |(uri, body)| uri.contains("/sm-contexts/ref-518-keep/modify")
+                    && body.contains("ACTIVATING")
+            ),
+            "PSI 5's user plane is activated: {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|(uri, _)| uri.contains("ref-518-keep/release")),
+            "the active session is not released"
+        );
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap();
+        assert!(
+            guard.sess_find_by_psi(new_id, 5).is_some(),
+            "PSI 5 moved with the UE"
+        );
+        assert!(
+            guard.sess_find_by_psi(new_id, 6).is_none(),
+            "PSI 6 released locally"
+        );
+        assert!(guard.sess_find_by_psi(old_id, 5).is_none());
+        assert!(ngap.sm_context_refs.contains_key(&(new_id, 5)));
+        assert!(!ngap.sm_context_refs.contains_key(&(new_id, 6)));
     }
 
     /// TS 24.501 §5.6.2.2.1: only an integrity-checked response stops T3513. A
