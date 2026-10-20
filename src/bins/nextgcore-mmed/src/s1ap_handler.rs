@@ -125,6 +125,35 @@ pub const HANDOVER_PREPARATION_SUPERVISION: std::time::Duration =
 /// Decode an incoming S1AP PDU from `enb_id` and dispatch it to the matching
 /// procedure handler. Returns the PDUs to transmit in response.
 pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1apSend> {
+    // S1 Setup is decoded with the generated codec, which applies TS 36.413
+    // §10.3.4 / §10.3.5 to unknown and missing IEs (#514 stage 2).
+    if crate::s1ap_gen::is_s1_setup_request(data) {
+        match crate::s1ap_gen::decode_s1_setup_request(data) {
+            crate::s1ap_gen::SetupRequestDecode::Proceed { request, notify } => {
+                return handle_s1_setup_request_reporting(ctx, enb_id, &request, &notify);
+            }
+            crate::s1ap_gen::SetupRequestDecode::Reject(ies) => {
+                log::error!(
+                    "S1 Setup Request from eNB {enb_id} rejected (TS 36.413 §10.3.4/§10.3.5): {ies:?}"
+                );
+                return match s1ap_build::build_setup_failure_with_diagnostics(
+                    S1apCauseGroup::Protocol,
+                    protocol_cause::ABSTRACT_SYNTAX_ERROR_REJECT,
+                    None,
+                    &ies,
+                ) {
+                    Ok(pdu) => S1apSend::to_origin(enb_id, pdu),
+                    Err(e) => {
+                        log::error!("Failed to build S1 Setup Failure: {e}");
+                        Vec::new()
+                    }
+                };
+            }
+            // Fall through: the generic path below answers a PDU that does not
+            // decode with an Error Indication (transfer syntax error).
+            crate::s1ap_gen::SetupRequestDecode::Undecodable => {}
+        }
+    }
     let message = match decode_s1ap_pdu(data) {
         Ok(message) => message,
         Err(e) => {
@@ -398,6 +427,18 @@ pub fn handle_s1_setup_request(
     enb_id: u64,
     msg: &S1SetupRequest,
 ) -> Vec<S1apSend> {
+    handle_s1_setup_request_reporting(ctx, enb_id, msg, &[])
+}
+
+/// Handle an S1 SETUP REQUEST, reporting `notify` (its unknown
+/// ignore-and-notify IEs) in the response's Criticality Diagnostics
+/// (TS 36.413 §10.3.4.2).
+pub fn handle_s1_setup_request_reporting(
+    ctx: &MmeContext,
+    enb_id: u64,
+    msg: &S1SetupRequest,
+    notify: &[crate::s1ap_gen::DiagnosedIe],
+) -> Vec<S1apSend> {
     let enb_id_value = match msg.global_enb_id.enb_id {
         EnbId::Macro(id) => id,
         EnbId::Home(id) => id,
@@ -477,7 +518,7 @@ pub fn handle_s1_setup_request(
         msg.enb_name.as_deref().unwrap_or("unnamed")
     );
 
-    match s1ap_build::build_setup_response(ctx) {
+    match s1ap_build::build_setup_response_with_diagnostics(ctx, notify) {
         Ok(pdu) => S1apSend::to_origin(enb_id, pdu),
         Err(e) => {
             log::error!("Failed to build S1 Setup Response: {e}");

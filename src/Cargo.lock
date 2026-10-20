@@ -2815,6 +2815,8 @@ name = "nextgcore-mmed"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "asn1-codecs",
+ "bitvec",
  "bytes",
  "clap",
  "ctrlc",
@@ -2830,6 +2832,7 @@ dependencies = [
  "nextgcore-metrics",
  "nextgcore-nas",
  "nextgcore-s1ap",
+ "nextgcore-s1ap-gen",
  "nextgcore-sctp",
  "proptest",
  "serde",
