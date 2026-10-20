@@ -90,6 +90,26 @@ fn fteid_from_tunnel(interface_type: u8, tunnel: &SgwcTunnel) -> Result<Gtp2FTei
 }
 
 /// Build the PAA IE from session state, if an address has been allocated
+/// The PAA for the S5/S8 Create Session Request (#491): an allocated one if the
+/// session holds it, else the MME's request, else a dynamic-allocation request for
+/// the requested PDN type. `None` only when not even a PDN type is known.
+fn s5c_create_session_paa(sess: &SgwcSess) -> Option<Gtp2PaaIe> {
+    paa_ie(sess)
+        .or_else(|| sess.requested_paa.clone())
+        .or_else(|| match sess.paa.pdn_type {
+            1 => Some(Gtp2PaaIe::ipv4([0; 4])),
+            2 => Some(Gtp2PaaIe::ipv6(64, [0; 16])),
+            3 => Some(Gtp2PaaIe::ipv4v6([0; 4], 64, [0; 16])),
+            4 | 5 => Some(Gtp2PaaIe {
+                pdn_type: sess.paa.pdn_type,
+                ipv4_addr: None,
+                ipv6_prefix_len: None,
+                ipv6_addr: None,
+            }),
+            _ => None,
+        })
+}
+
 fn paa_ie(sess: &SgwcSess) -> Option<Gtp2PaaIe> {
     match (sess.paa.pdn_type, sess.paa.ipv4_addr, sess.paa.ipv6_addr) {
         (1, Some(v4), _) => Some(Gtp2PaaIe::ipv4(v4.octets())),
@@ -561,8 +581,13 @@ pub fn build_s5c_create_session_request(
         msg.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::decode(&mut b).map_err(|e| e.to_string())?);
     }
 
-    // PAA (C, instance 0)
-    if let Some(paa) = paa_ie(sess) {
+    // PAA (C, instance 0). TS 29.274 Table 7.2.1-1: "shall be included on the S5/S8,
+    // S4/S11 and S2a/S2b interfaces for the E-UTRAN initial attach" and UE-requested
+    // PDN connectivity (#491). Without it smfd (PGW-C) rejects with cause 109. The
+    // session's own PAA is set only from the PGW's answer (#52), so at this point it
+    // is normally empty: relay the MME's request, or, if the MME sent none, request
+    // dynamic allocation for the requested PDN type (zero address, §8.14).
+    if let Some(paa) = s5c_create_session_paa(sess) {
         msg.add_ie(paa.to_ie(0));
     }
 
@@ -1026,6 +1051,35 @@ mod tests {
         assert_eq!(qos.pl, 8);
         let s5u = bc.fteid(2).unwrap().unwrap();
         assert_eq!(s5u.interface_type, f_teid_interface::S5_S8_SGW_GTP_U);
+    }
+
+    /// #491, TS 29.274 Table 7.2.1-1: the S5/S8 Create Session Request carries a
+    /// PAA for an E-UTRAN initial attach. The MME's request is relayed verbatim;
+    /// absent one, a dynamic-allocation PAA for the requested PDN type is sent. The
+    /// session's own PAA stays unset — only the PGW allocates (#52).
+    #[test]
+    fn test_s5c_create_session_request_carries_a_paa() {
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let paa_of = |sess: &SgwcSess| {
+            let decoded = round_trip(&build_s5c_create_session_request(sess, 13).unwrap());
+            decoded
+                .get_ie(Gtp2IeType::Paa as u8, 0)
+                .map(|ie| ie.value.to_vec())
+        };
+
+        // The MME's request, relayed.
+        let (_, mut sess) = provision(&ambient, &[0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x16]);
+        sess.paa = Default::default();
+        sess.paa.pdn_type = 1;
+        sess.requested_paa = Some(Gtp2PaaIe::ipv4([0; 4]));
+        assert_eq!(paa_of(&sess), Some(vec![1, 0, 0, 0, 0]));
+
+        // No PAA from the MME: dynamic allocation for the requested type.
+        sess.requested_paa = None;
+        sess.paa.pdn_type = 3;
+        let mut v46 = vec![3, 64];
+        v46.extend([0u8; 20]);
+        assert_eq!(paa_of(&sess), Some(v46));
     }
 
     #[test]

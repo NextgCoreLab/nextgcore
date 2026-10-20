@@ -1191,9 +1191,10 @@ fn dispatch_create_session_request(server: &GtpcServer, msg: &Gtp2Message, peer:
     if parsed.paa.is_some() {
         log::debug!(
             "Create Session Request carries a PAA; it is a REQUEST and is not applied — the PGW \
-             allocates the PDN address (TS 23.401 §5.3.2.1)"
+             allocates the PDN address (TS 23.401 §5.3.2.1) — but it is relayed on S5/S8 (#491)"
         );
     }
+    sess.requested_paa = parsed.paa.clone();
     if let Some(ref ambr) = parsed.ambr {
         sess.ambr_ul = ambr.uplink;
         sess.ambr_dl = ambr.downlink;
@@ -2145,6 +2146,10 @@ mod tests {
             0,
             &[8, b'i', b'n', b't', b'e', b'r', b'n', b'e', b't'],
         ));
+        // PDN Type IPv4 and a dynamic-allocation PAA, as nextgcore's mmed sends them
+        // since #479 (TS 29.274 Table 7.2.1-1, §8.14).
+        msg.add_ie(Gtp2Ie::from_slice(Gtp2IeType::PdnType as u8, 0, &[1]));
+        msg.add_ie(Gtp2PaaIe::ipv4([0; 4]).to_ie(0));
         let mut bc = Gtp2BearerContextIe::new();
         bc.set_ebi(5);
         bc.set_bearer_qos(&Gtp2BearerQosIe::new(9, 1000, 2000, 0, 0));
@@ -2564,6 +2569,8 @@ mod tests {
             ),
             (Gtp2IeType::ServingNetwork as u8, "Serving Network"),
             (Gtp2IeType::Uli as u8, "User Location Information"),
+            // #491, Table 7.2.1-1: conditional, present for an E-UTRAN initial attach.
+            (Gtp2IeType::Paa as u8, "PDN Address Allocation"),
         ] {
             assert!(
                 relayed.get_ie(ie_type, 0).is_some(),
