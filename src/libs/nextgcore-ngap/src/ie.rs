@@ -2224,9 +2224,12 @@ pub fn encode_paging_priority(
     priority: PagingPriority,
 ) -> NgapResult<()> {
     let mut encoder = AperEncoder::new();
-    // PagingPriority ::= ENUMERATED { priolevel1, ..., priolevel8, ... }
+    // PagingPriority ::= ENUMERATED { priolevel1, ..., priolevel8, ... }: the
+    // root numbers priolevel1..8 as 0..7, while `PagingPriority`'s
+    // discriminants are 1..8. Encoding the discriminant sent priolevel1 as
+    // priolevel2, and priolevel8 (8) fell outside the root.
     let constraint = nextgcore_asn1c::per::Constraint::extensible(0, 7);
-    encoder.encode_enumerated(priority as i64, &constraint)?;
+    encoder.encode_enumerated(priority as i64 - 1, &constraint)?;
     encoder.align();
     container.push(ProtocolIeField {
         id: ProtocolIeId(IE_ID_PAGING_PRIORITY),
