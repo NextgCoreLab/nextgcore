@@ -164,8 +164,11 @@ pub fn handle_pdn_connectivity_request(
         return Err(EsmError::NoSecurityContext);
     }
 
-    // Minimum length check: request type (1) + PDN type (1)
-    if data.len() < 2 {
+    // Minimum length: one octet. TS 24.301 Table 8.3.20.1 packs PDN type (high
+    // nibble) and request type (low nibble) into a SINGLE octet; everything after
+    // it is optional. The old check required two and rejected a minimal request
+    // such as `02 01 D0 11` (#481).
+    if data.is_empty() {
         return Err(EsmError::InvalidMessage(
             "PDN connectivity request too short".to_string(),
         ));
@@ -919,6 +922,48 @@ fn esm_cause_from_u8(value: u8) -> EsmCause {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #481: `02 01 D0 11` -- PD 2, PTI 1, PDN CONNECTIVITY REQUEST, then ONE
+    /// octet holding PDN type IPv4 (high nibble 1) and request type initial (1),
+    /// TS 24.301 Table 8.3.20.1. No optional IEs. The handler is given the body
+    /// after the message type, which is that single octet.
+    #[test]
+    fn a_minimal_pdn_connectivity_request_is_accepted() {
+        let wire = [0x02u8, 0x01, 0xD0, 0x11];
+        let mme_ue = MmeUe {
+            security_context_available: true,
+            ..Default::default()
+        };
+        let parsed = handle_pdn_connectivity_request(
+            &EnbUe::default(),
+            &mme_ue,
+            &MmeSess::default(),
+            &MmeBearer::default(),
+            &wire[3..],
+            CreateAction::InAttachRequest,
+        )
+        .expect("a one-octet PDN CONNECTIVITY REQUEST body is valid");
+        assert_eq!(parsed.request_type, 1);
+        assert_eq!(parsed.pdn_type, PdnType::Ipv4);
+        assert!(parsed.apn.is_none());
+    }
+
+    #[test]
+    fn an_empty_pdn_connectivity_request_body_is_refused() {
+        let mme_ue = MmeUe {
+            security_context_available: true,
+            ..Default::default()
+        };
+        assert!(handle_pdn_connectivity_request(
+            &EnbUe::default(),
+            &mme_ue,
+            &MmeSess::default(),
+            &MmeBearer::default(),
+            &[],
+            CreateAction::InAttachRequest,
+        )
+        .is_err());
+    }
 
     #[test]
     fn test_esm_error_display() {
