@@ -25,7 +25,10 @@
 use nextgcore_asn1c::ngap::cause::{
     Cause, CauseMisc, CauseNas, CauseProtocol, CauseRadioNetwork, CauseTransport,
 };
-use nextgcore_ngap::{builder, parser, types::*, NgapMessage};
+use nextgcore_ngap::{builder, types::*};
+// Only the hand-written oracles the tests compare the generated decoders with.
+#[cfg(test)]
+use nextgcore_ngap::{parser, NgapMessage};
 
 use nextgcore_ngap_gen::generated as ngap_gen;
 
@@ -673,8 +676,10 @@ pub struct InitialUeMessageData {
     pub ue_context_request: bool,
 }
 
-/// Parse an Initial UE Message from ASN.1 APER bytes
-pub fn parse_initial_ue_message_asn1(data: &[u8]) -> Option<InitialUeMessageData> {
+/// Parse an Initial UE Message with the HAND-WRITTEN codec: the pre-#417
+/// path, kept as the oracle `decode_initial_ue_message_asn1` is checked against.
+#[cfg(test)]
+pub(crate) fn parse_initial_ue_message_asn1(data: &[u8]) -> Option<InitialUeMessageData> {
     let decoded = match parser::decode_ngap_pdu(data) {
         Ok(msg) => msg,
         Err(e) => {
@@ -739,13 +744,46 @@ pub fn build_downlink_nas_transport_asn1(
     ran_ue_ngap_id: u32,
     nas_pdu: &[u8],
 ) -> Option<Vec<u8>> {
-    let msg = DownlinkNasTransport {
-        amf_ue_ngap_id,
-        ran_ue_ngap_id,
-        nas_pdu: nas_pdu.to_vec(),
+    use ngap_gen::{
+        DownlinkNASTransport, DownlinkNASTransportProtocolIEs,
+        DownlinkNASTransportProtocolIEs_Entry as Entry,
+        DownlinkNASTransportProtocolIEs_EntryValue as Ie, ProtocolIE_ID, NGAP_PDU,
     };
 
-    match builder::build_downlink_nas_transport(&msg) {
+    // IE order and criticalities as TS 38.413 §9.2.5.2 lists them. The
+    // generated encoder refuses an AMF UE NGAP ID past 2^40-1, as the
+    // hand-written one did, and fragments a NAS-PDU of 16K octets or more
+    // (X.691 §11.9.3.8, nextgsim #222).
+    let ie = |id: u16, criticality: u8, value: Ie| Entry {
+        id: ProtocolIE_ID(id),
+        criticality: ngap_gen::Criticality(criticality),
+        value,
+    };
+    let pdu = NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_DOWNLINK_NAS_TRANSPORT),
+        criticality: ngap_gen::Criticality(ngap_gen::Criticality::IGNORE),
+        value: ngap_gen::InitiatingMessageValue::Id_DownlinkNASTransport(DownlinkNASTransport {
+            protocol_i_es: DownlinkNASTransportProtocolIEs(vec![
+                ie(
+                    ngap_gen::ID_AMF_UE_NGAP_ID,
+                    ngap_gen::Criticality::REJECT,
+                    Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(amf_ue_ngap_id)),
+                ),
+                ie(
+                    ngap_gen::ID_RAN_UE_NGAP_ID,
+                    ngap_gen::Criticality::REJECT,
+                    Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(ran_ue_ngap_id)),
+                ),
+                ie(
+                    ngap_gen::ID_NAS_PDU,
+                    ngap_gen::Criticality::REJECT,
+                    Ie::Id_NAS_PDU(ngap_gen::NAS_PDU(nas_pdu.to_vec())),
+                ),
+            ]),
+        }),
+    });
+
+    match nextgcore_ngap_gen::encode(&pdu) {
         Ok(bytes) => {
             log::debug!(
                 "Built Downlink NAS Transport: {} bytes, amf_ue_ngap_id={}, ran_ue_ngap_id={}, nas_pdu_len={}",
@@ -1958,13 +1996,21 @@ pub struct UplinkNasTransportData {
     /// declined to fire from that site at all for exactly that reason.
     ///
     /// Nothing extra is decoded off the wire for this: the NGAP parser already
-    /// decodes the IE and refuses the message without it
-    /// (`libs/nextgcore-ngap/src/parser.rs:660-663`).
-    pub user_location_info: UserLocationInformation,
+    /// decodes the IE.
+    ///
+    /// `None` when the gNB omitted it -- it is mandatory with criticality
+    /// ignore (TS 38.413 §9.2.5.3), so its absence is ignored (§10.3.5) and the
+    /// NAS is still delivered -- or when it is not an NR location, which this
+    /// AMF has no representation for. The hand-written parser refused the whole
+    /// message in both cases, dropping the NAS PDU it carried.
+    pub user_location_info: Option<UserLocationInformation>,
 }
 
-/// Parse an Uplink NAS Transport message from ASN.1 APER bytes
-pub fn parse_uplink_nas_transport_asn1(data: &[u8]) -> Option<UplinkNasTransportData> {
+/// Parse an Uplink NAS Transport with the HAND-WRITTEN codec: the pre-#417
+/// path, kept as the oracle `decode_uplink_nas_transport_asn1` is checked
+/// against.
+#[cfg(test)]
+pub(crate) fn parse_uplink_nas_transport_asn1(data: &[u8]) -> Option<UplinkNasTransportData> {
     let decoded = match parser::decode_ngap_pdu(data) {
         Ok(msg) => msg,
         Err(e) => {
@@ -1992,8 +2038,291 @@ pub fn parse_uplink_nas_transport_asn1(data: &[u8]) -> Option<UplinkNasTransport
         amf_ue_ngap_id: msg.amf_ue_ngap_id,
         ran_ue_ngap_id: msg.ran_ue_ngap_id,
         nas_pdu: msg.nas_pdu,
-        user_location_info: msg.user_location_info,
+        user_location_info: Some(msg.user_location_info),
     })
+}
+
+/// A generated NR [`ngap_gen::UserLocationInformation`] as the hand-written
+/// one. `None` for an E-UTRA, N3IWF or choice-extension location, which this
+/// AMF has no representation for, or for a field of the wrong size.
+fn hand_written_user_location(
+    uli: &ngap_gen::UserLocationInformation,
+) -> Option<UserLocationInformation> {
+    let ngap_gen::UserLocationInformation::UserLocationInformationNR(nr) = uli else {
+        return None;
+    };
+    let nr_cgi_plmn: [u8; 3] = nr.nr_cgi.plmn_identity.0.as_slice().try_into().ok()?;
+    let tai_plmn: [u8; 3] = nr.tai.plmn_identity.0.as_slice().try_into().ok()?;
+    let tai_tac: [u8; 3] = nr.tai.tac.0.as_slice().try_into().ok()?;
+    let bits = &nr.nr_cgi.nr_cell_identity.0;
+    if bits.len() != 36 {
+        return None;
+    }
+    let nr_cell_identity = bits.iter().fold(0u64, |acc, b| (acc << 1) | u64::from(*b));
+    Some(UserLocationInformation::Nr {
+        nr_cgi_plmn,
+        nr_cell_identity,
+        tai_plmn,
+        tai_tac,
+    })
+}
+
+/// How a received NAS transport message (Initial UE Message, Uplink NAS
+/// Transport) is to be handled. Both are class 2 procedures with no response
+/// message, so TS 38.413 §10.3.4.2 reports through an Error Indication.
+#[derive(Debug)]
+pub enum NasTransportDecode<T> {
+    /// Decoded; deliver the NAS. When `error_indication` is set, the message
+    /// carried not-comprehended IEs marked "ignore IE and notify sender",
+    /// reported in an Error Indication while the procedure goes on.
+    Proceed {
+        /// The decoded message.
+        message: T,
+        /// The Error Indication to send, if any.
+        error_indication: Option<CriticalityErrorIndication>,
+    },
+    /// A not-comprehended IE marked "reject", or a missing mandatory IE whose
+    /// criticality is reject: none of the message is executed and the
+    /// procedure is terminated with an Error Indication (§10.3.4.2, §10.3.5).
+    Reject(CriticalityErrorIndication),
+    /// Not decodable, or not something this AMF can act on.
+    Undecodable,
+}
+
+fn missing_ie(ie_id: u16) -> IeDiagnostic {
+    IeDiagnostic {
+        ie_id,
+        criticality: ngap_gen::Criticality::REJECT,
+        type_of_error: ngap_gen::TypeOfError::MISSING,
+    }
+}
+
+/// Decode an Initial UE Message (TS 38.413 §9.2.5.1) with the GENERATED codec
+/// (#417), applying §10.3.4.2 and §10.3.5.
+///
+/// The hand-written parser this replaced comprehended only RAN UE NGAP ID,
+/// NAS-PDU, User Location Information, RRC Establishment Cause, UE Context
+/// Request and Allowed NSSAI. Every other IE of the message that is marked
+/// "reject" -- 5G-S-TMSI, IAB Node Indication, CE-mode-B Support Indicator,
+/// NPN Access Information -- it treated as not comprehended and refused the
+/// whole message, dropping the UE's registration or service request without
+/// telling the gNB. Those are comprehended here. Every message it accepted
+/// decodes identically: `initial_ue_message_generated_decode_matches_hand_written`.
+pub fn decode_initial_ue_message_asn1(data: &[u8]) -> NasTransportDecode<InitialUeMessageData> {
+    use ngap_gen::{InitialUEMessageProtocolIEs_EntryValue as Ie, InitiatingMessageValue};
+    use NasTransportDecode::{Proceed, Reject, Undecodable};
+
+    let (pdu, unknown) = match nextgcore_ngap_gen::decode_with_unknown_ies(data) {
+        Ok(decoded) => decoded,
+        Err(e) => {
+            log::error!("Failed to decode Initial UE Message: {e:?}");
+            return Undecodable;
+        }
+    };
+    let ngap_gen::NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+        criticality,
+        value: InitiatingMessageValue::Id_InitialUEMessage(msg),
+        ..
+    }) = pdu
+    else {
+        log::error!("Expected InitialUEMessage");
+        return Undecodable;
+    };
+    let Some((mut reject, notify)) = classify_unknown_ies(&unknown, "Initial UE Message") else {
+        return Undecodable;
+    };
+
+    let mut ran_ue_ngap_id = None;
+    let mut nas_pdu = None;
+    let mut uli = None;
+    // Mandatory with criticality ignore: absent is ignored (§10.3.5), and the
+    // hand-written parser defaulted it the same way.
+    let mut rrc_establishment_cause = RrcEstablishmentCause::default() as u8;
+    let mut ue_context_request = false;
+    for entry in msg.protocol_i_es.0 {
+        match entry.value {
+            Ie::Id_RAN_UE_NGAP_ID(v) => ran_ue_ngap_id = Some(v.0),
+            Ie::Id_NAS_PDU(v) => nas_pdu = Some(v.0),
+            Ie::Id_UserLocationInformation(v) => uli = Some(v),
+            // Carried as its wire value, extension values included: the
+            // hand-written parser read mo-ExceptionData (11) as notAvailable.
+            Ie::Id_RRCEstablishmentCause(v) => rrc_establishment_cause = v.0,
+            Ie::Id_UEContextRequest(_) => ue_context_request = true,
+            // Comprehended; the AMF takes the UE's identity and slices from
+            // the NAS message it carries.
+            _ => {}
+        }
+    }
+    if ran_ue_ngap_id.is_none() {
+        reject.push(missing_ie(ngap_gen::ID_RAN_UE_NGAP_ID));
+    }
+    if nas_pdu.is_none() {
+        reject.push(missing_ie(ngap_gen::ID_NAS_PDU));
+    }
+    if uli.is_none() {
+        reject.push(missing_ie(ngap_gen::ID_USER_LOCATION_INFORMATION));
+    }
+    let report = |cause_protocol: u8, diagnostics: Vec<IeDiagnostic>| CriticalityErrorIndication {
+        amf_ue_ngap_id: None,
+        ran_ue_ngap_id,
+        cause_protocol,
+        procedure: ReportedProcedure {
+            procedure_code: ngap_gen::ID_INITIAL_UE_MESSAGE,
+            triggering_message: ngap_gen::TriggeringMessage::INITIATING_MESSAGE,
+            procedure_criticality: criticality.0,
+        },
+        diagnostics,
+    };
+    let (Some(ran_ue_ngap_id), Some(nas_pdu), Some(uli), true) =
+        (ran_ue_ngap_id, nas_pdu, uli, reject.is_empty())
+    else {
+        return Reject(report(
+            ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
+            reject,
+        ));
+    };
+    let Some(UserLocationInformation::Nr {
+        nr_cgi_plmn,
+        nr_cell_identity,
+        tai_tac,
+        ..
+    }) = hand_written_user_location(&uli)
+    else {
+        log::error!("Initial UE Message: only an NR User Location Information is supported");
+        return Undecodable;
+    };
+    let plmn_id = decode_plmn_id(&nr_cgi_plmn);
+    let tac = (u32::from(tai_tac[0]) << 16) | (u32::from(tai_tac[1]) << 8) | u32::from(tai_tac[2]);
+    log::info!(
+        "Decoded Initial UE Message: ran_ue_ngap_id={ran_ue_ngap_id}, nas_pdu_len={}, nci=0x{nr_cell_identity:x}, tac={tac}, cause={rrc_establishment_cause}",
+        nas_pdu.len()
+    );
+    let error_indication = (!notify.is_empty()).then(|| {
+        report(
+            ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+            notify,
+        )
+    });
+    Proceed {
+        message: InitialUeMessageData {
+            ran_ue_ngap_id,
+            nas_pdu,
+            plmn_id,
+            nr_cell_identity,
+            tac,
+            rrc_establishment_cause,
+            ue_context_request,
+        },
+        error_indication,
+    }
+}
+
+/// Decode an Uplink NAS Transport (TS 38.413 §9.2.5.3) with the GENERATED
+/// codec (#417), applying §10.3.4.2 and §10.3.5.
+///
+/// The hand-written parser this replaced refused the message -- dropping the
+/// NAS PDU -- when User Location Information was absent (it is mandatory with
+/// criticality ignore, so its absence is to be ignored), when it was not an NR
+/// location, and on the W-AGF / TNGF / TWIF Identity Information IEs, which it
+/// did not comprehend and which carry criticality reject. Every message it
+/// accepted decodes identically:
+/// `uplink_nas_transport_generated_decode_matches_hand_written`.
+pub fn decode_uplink_nas_transport_asn1(data: &[u8]) -> NasTransportDecode<UplinkNasTransportData> {
+    use ngap_gen::{InitiatingMessageValue, UplinkNASTransportProtocolIEs_EntryValue as Ie};
+    use NasTransportDecode::{Proceed, Reject, Undecodable};
+
+    let (pdu, unknown) = match nextgcore_ngap_gen::decode_with_unknown_ies(data) {
+        Ok(decoded) => decoded,
+        Err(e) => {
+            log::error!("Failed to decode Uplink NAS Transport: {e:?}");
+            return Undecodable;
+        }
+    };
+    let ngap_gen::NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+        criticality,
+        value: InitiatingMessageValue::Id_UplinkNASTransport(msg),
+        ..
+    }) = pdu
+    else {
+        log::error!("Expected UplinkNASTransport");
+        return Undecodable;
+    };
+    let Some((mut reject, notify)) = classify_unknown_ies(&unknown, "Uplink NAS Transport") else {
+        return Undecodable;
+    };
+
+    let mut amf_ue_ngap_id = None;
+    let mut ran_ue_ngap_id = None;
+    let mut nas_pdu = None;
+    let mut user_location_info = None;
+    for entry in msg.protocol_i_es.0 {
+        match entry.value {
+            Ie::Id_AMF_UE_NGAP_ID(v) => amf_ue_ngap_id = Some(v.0),
+            Ie::Id_RAN_UE_NGAP_ID(v) => ran_ue_ngap_id = Some(v.0),
+            Ie::Id_NAS_PDU(v) => nas_pdu = Some(v.0),
+            Ie::Id_UserLocationInformation(v) => {
+                user_location_info = hand_written_user_location(&v);
+                if user_location_info.is_none() {
+                    log::warn!(
+                        "Uplink NAS Transport: not an NR User Location Information; \
+                         delivering the NAS without a location"
+                    );
+                }
+            }
+            // Comprehended: the non-3GPP interworking identities, which this
+            // AMF (3GPP access only) has no use for.
+            Ie::Id_W_AGFIdentityInformation(_)
+            | Ie::Id_TNGFIdentityInformation(_)
+            | Ie::Id_TWIFIdentityInformation(_) => {}
+        }
+    }
+    if amf_ue_ngap_id.is_none() {
+        reject.push(missing_ie(ngap_gen::ID_AMF_UE_NGAP_ID));
+    }
+    if ran_ue_ngap_id.is_none() {
+        reject.push(missing_ie(ngap_gen::ID_RAN_UE_NGAP_ID));
+    }
+    if nas_pdu.is_none() {
+        reject.push(missing_ie(ngap_gen::ID_NAS_PDU));
+    }
+    let report = |cause_protocol: u8, diagnostics: Vec<IeDiagnostic>| CriticalityErrorIndication {
+        amf_ue_ngap_id,
+        ran_ue_ngap_id,
+        cause_protocol,
+        procedure: ReportedProcedure {
+            procedure_code: ngap_gen::ID_UPLINK_NAS_TRANSPORT,
+            triggering_message: ngap_gen::TriggeringMessage::INITIATING_MESSAGE,
+            procedure_criticality: criticality.0,
+        },
+        diagnostics,
+    };
+    let (Some(amf_ue_ngap_id), Some(ran_ue_ngap_id), Some(nas_pdu), true) =
+        (amf_ue_ngap_id, ran_ue_ngap_id, nas_pdu, reject.is_empty())
+    else {
+        return Reject(report(
+            ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
+            reject,
+        ));
+    };
+    log::info!(
+        "Decoded Uplink NAS Transport: amf_ue_ngap_id={amf_ue_ngap_id}, ran_ue_ngap_id={ran_ue_ngap_id}, nas_pdu_len={}",
+        nas_pdu.len()
+    );
+    let error_indication = (!notify.is_empty()).then(|| {
+        report(
+            ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+            notify,
+        )
+    });
+    Proceed {
+        message: UplinkNasTransportData {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            nas_pdu,
+            user_location_info,
+        },
+        error_indication,
+    }
 }
 
 /// Build a Paging message with proper ASN.1 APER encoding
@@ -8409,5 +8738,526 @@ pub(crate) mod tests {
             Some(vec![0x01, 0x02, 0x03, 0x04, 0x22, 0x2B, 0x00, 0x00]),
             "§8.4.2 step 4: the NAS Container goes to the gNB as NASC"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // #417: the NAS transport family on the generated codec.
+    // ------------------------------------------------------------------
+
+    use nextgcore_ngap::types::{
+        InitialUeMessage as HwInitialUe, RrcEstablishmentCause as HwCause, SNssai as HwSNssai,
+        UplinkNasTransport as HwUplinkNas, UserLocationInformation as HwUli,
+    };
+
+    fn nas_uli(plmn: [u8; 3], nci: u64, tac: u32) -> HwUli {
+        HwUli::Nr {
+            nr_cgi_plmn: plmn,
+            nr_cell_identity: nci,
+            tai_plmn: plmn,
+            tai_tac: [(tac >> 16) as u8, (tac >> 8) as u8, tac as u8],
+        }
+    }
+
+    fn rrc_cause(v: u8) -> HwCause {
+        use HwCause::*;
+        [
+            Emergency,
+            HighPriorityAccess,
+            MtAccess,
+            MoSignalling,
+            MoData,
+            MoVoiceCall,
+            MoVideoCall,
+            MoSms,
+            MpsPriorityAccess,
+            McsPriorityAccess,
+            NotAvailable,
+        ][usize::from(v)]
+    }
+
+    /// Initial UE Messages the hand-written encoder builds, varied one field at
+    /// a time around a baseline: every RAN UE NGAP ID length, NAS-PDU length
+    /// forms, both MNC lengths, NR cell identity and TAC edges, every RRC
+    /// Establishment Cause, UE Context Request on and off, Allowed NSSAI of 0, 1
+    /// and 3 slices with and without an SD.
+    pub(crate) fn initial_ue_corpus() -> Vec<Vec<u8>> {
+        let base = HwInitialUe {
+            ran_ue_ngap_id: 77,
+            nas_pdu: vec![0x7e, 0x00, 0x41, 0x09, 0x00],
+            user_location_info: nas_uli([0x00, 0xf1, 0x10], 0x0006_6666, 0x00040f),
+            rrc_establishment_cause: HwCause::MoSignalling,
+            ue_context_request: None,
+            allowed_nssai: Vec::new(),
+        };
+        // The baseline first: the criticality tests edit `corpus[0]`.
+        let mut variants = vec![base.clone()];
+        for ran in [0u32, 1, 255, 256, 65_535, 65_536, 16_777_216, u32::MAX] {
+            variants.push(HwInitialUe {
+                ran_ue_ngap_id: ran,
+                ..base.clone()
+            });
+        }
+        for len in [1usize, 2, 127, 128, 255, 256, 1_000, 16_383] {
+            variants.push(HwInitialUe {
+                nas_pdu: vec![0x7e; len],
+                ..base.clone()
+            });
+        }
+        for plmn in [
+            [0x00, 0xf1, 0x10],
+            [0x13, 0x00, 0x14],
+            [0x99, 0xf9, 0x07],
+            [0xff, 0xff, 0xff],
+        ] {
+            variants.push(HwInitialUe {
+                user_location_info: nas_uli(plmn, 1, 1),
+                ..base.clone()
+            });
+        }
+        for (nci, tac) in [
+            (0u64, 0u32),
+            (1, 1),
+            ((1 << 36) - 1, 0xff_ffff),
+            (0x8_0000_0001, 0x80_0001),
+        ] {
+            variants.push(HwInitialUe {
+                user_location_info: nas_uli([0x00, 0xf1, 0x10], nci, tac),
+                ..base.clone()
+            });
+        }
+        for v in 0..=10 {
+            variants.push(HwInitialUe {
+                rrc_establishment_cause: rrc_cause(v),
+                ..base.clone()
+            });
+        }
+        variants.push(HwInitialUe {
+            ue_context_request: Some(true),
+            ..base.clone()
+        });
+        let slice = |sst: u8, sd: Option<[u8; 3]>| HwSNssai { sst, sd };
+        for nssai in [
+            vec![slice(1, None)],
+            vec![
+                slice(1, Some([0, 0, 1])),
+                slice(2, None),
+                slice(255, Some([0xff; 3])),
+            ],
+        ] {
+            variants.push(HwInitialUe {
+                allowed_nssai: nssai,
+                ..base.clone()
+            });
+        }
+        variants
+            .iter()
+            .map(|m| nextgcore_ngap::builder::build_initial_ue_message(m).expect("build"))
+            .collect()
+    }
+
+    /// The generated decode flattened to what the hand-written parser could
+    /// say. A `Reject` or a report never comes out of a message the old parser
+    /// accepted, so either is a test failure here.
+    fn generated_initial_ue_view(data: &[u8]) -> Option<String> {
+        match decode_initial_ue_message_asn1(data) {
+            NasTransportDecode::Proceed {
+                message,
+                error_indication: None,
+            } => Some(format!("{message:?}")),
+            NasTransportDecode::Undecodable => None,
+            other => panic!("unexpected {other:?} for {data:02x?}"),
+        }
+    }
+
+    #[test]
+    fn initial_ue_message_generated_decode_matches_hand_written() {
+        let corpus = initial_ue_corpus();
+        assert_eq!(corpus.len(), 1 + 8 + 8 + 4 + 4 + 11 + 1 + 2);
+        for data in &corpus {
+            let old = parse_initial_ue_message_asn1(data).map(|m| format!("{m:?}"));
+            assert!(
+                old.is_some(),
+                "the corpus holds accepted messages: {data:02x?}"
+            );
+            assert_eq!(generated_initial_ue_view(data), old, "{data:02x?}");
+        }
+        // Every truncation of a valid message, and junk, is refused by both.
+        let base = &corpus[0];
+        for cut in 0..base.len() {
+            let data = &base[..cut];
+            assert!(parse_initial_ue_message_asn1(data).is_none(), "{data:02x?}");
+            assert_eq!(generated_initial_ue_view(data), None, "{data:02x?}");
+        }
+    }
+
+    /// Uplink NAS Transports the hand-written encoder builds: AMF and RAN UE
+    /// NGAP ID lengths, NAS-PDU length forms, and location edges.
+    fn uplink_nas_corpus() -> Vec<Vec<u8>> {
+        let base = HwUplinkNas {
+            amf_ue_ngap_id: 9,
+            ran_ue_ngap_id: 77,
+            nas_pdu: vec![0x7e, 0x02, 0x11, 0x22, 0x33, 0x44, 0x01, 0x7e, 0x00, 0x67],
+            user_location_info: nas_uli([0x00, 0xf1, 0x10], 0x0006_6666, 0x00040f),
+        };
+        let mut variants = vec![base.clone()];
+        for amf in [0u64, 1, 255, 256, 65_536, (1 << 32) + 7, (1 << 40) - 1] {
+            variants.push(HwUplinkNas {
+                amf_ue_ngap_id: amf,
+                ..base.clone()
+            });
+        }
+        for ran in [0u32, 256, 65_536, u32::MAX] {
+            variants.push(HwUplinkNas {
+                ran_ue_ngap_id: ran,
+                ..base.clone()
+            });
+        }
+        for len in [1usize, 127, 128, 16_383] {
+            variants.push(HwUplinkNas {
+                nas_pdu: vec![0x7e; len],
+                ..base.clone()
+            });
+        }
+        for (nci, tac) in [(0u64, 0u32), ((1 << 36) - 1, 0xff_ffff)] {
+            variants.push(HwUplinkNas {
+                user_location_info: nas_uli([0x13, 0x00, 0x14], nci, tac),
+                ..base.clone()
+            });
+        }
+        variants
+            .iter()
+            .map(|m| nextgcore_ngap::builder::build_uplink_nas_transport(m).expect("build"))
+            .collect()
+    }
+
+    fn generated_uplink_nas_view(data: &[u8]) -> Option<String> {
+        match decode_uplink_nas_transport_asn1(data) {
+            NasTransportDecode::Proceed {
+                message,
+                error_indication: None,
+            } => Some(format!("{message:?}")),
+            NasTransportDecode::Undecodable => None,
+            other => panic!("unexpected {other:?} for {data:02x?}"),
+        }
+    }
+
+    #[test]
+    fn uplink_nas_transport_generated_decode_matches_hand_written() {
+        let corpus = uplink_nas_corpus();
+        assert_eq!(corpus.len(), 1 + 7 + 4 + 4 + 2);
+        for data in &corpus {
+            let old = parse_uplink_nas_transport_asn1(data).map(|m| format!("{m:?}"));
+            assert!(
+                old.is_some(),
+                "the corpus holds accepted messages: {data:02x?}"
+            );
+            assert_eq!(generated_uplink_nas_view(data), old, "{data:02x?}");
+        }
+        let base = &corpus[0];
+        for cut in 0..base.len() {
+            let data = &base[..cut];
+            assert!(
+                parse_uplink_nas_transport_asn1(data).is_none(),
+                "{data:02x?}"
+            );
+            assert_eq!(generated_uplink_nas_view(data), None, "{data:02x?}");
+        }
+    }
+
+    /// The generated Downlink NAS Transport is the hand-written one byte for
+    /// byte: every AMF and RAN UE NGAP ID length, and NAS-PDU lengths across
+    /// every length-determinant form, past 16K into fragmentation (X.691
+    /// §11.9.3.8). Both refuse an AMF UE NGAP ID past 2^40-1.
+    #[test]
+    fn downlink_nas_transport_generated_matches_hand_written() {
+        let hand_written = |amf: u64, ran: u32, nas: &[u8]| {
+            nextgcore_ngap::builder::build_downlink_nas_transport(&DownlinkNasTransport {
+                amf_ue_ngap_id: amf,
+                ran_ue_ngap_id: ran,
+                nas_pdu: nas.to_vec(),
+            })
+            .ok()
+        };
+        let mut compared = 0;
+        let nas = [0x7e, 0x00, 0x42];
+        for amf in [
+            0u64,
+            1,
+            255,
+            256,
+            65_535,
+            65_536,
+            (1 << 24),
+            (1 << 32),
+            (1 << 40) - 1,
+            1 << 40,
+        ] {
+            for ran in [0u32, 1, 255, 256, 65_536, u32::MAX] {
+                assert_eq!(
+                    build_downlink_nas_transport_asn1(amf, ran, &nas),
+                    hand_written(amf, ran, &nas),
+                    "amf={amf} ran={ran}"
+                );
+                compared += 1;
+            }
+        }
+        for len in [
+            0usize, 1, 127, 128, 255, 256, 16_383, 16_384, 16_385, 32_768, 49_152, 65_536, 70_000,
+        ] {
+            let nas = vec![0xa5; len];
+            let new = build_downlink_nas_transport_asn1(7, 9, &nas);
+            assert!(new.is_some(), "len={len}");
+            assert_eq!(new, hand_written(7, 9, &nas), "len={len}");
+            compared += 1;
+        }
+        assert_eq!(compared, 10 * 6 + 13);
+        assert_eq!(build_downlink_nas_transport_asn1(1 << 40, 1, &[0x7e]), None);
+    }
+
+    /// Pinned from X.691 by hand: initiatingMessage (00), procedure code 4,
+    /// criticality ignore (40), value length 22; the SEQUENCE extension bit and
+    /// IE count 3; AMF-UE-NGAP-ID 10 (reject) = 1 in a 3-bit length plus one
+    /// octet; RAN-UE-NGAP-ID 85 (reject) = 2 in a 2-bit length plus one octet;
+    /// NAS-PDU 38 (reject) = length 2, 7e 00.
+    #[test]
+    fn downlink_nas_transport_golden_bytes() {
+        assert_eq!(
+            build_downlink_nas_transport_asn1(1, 2, &[0x7e, 0x00]).expect("encode"),
+            [
+                0x00, 0x04, 0x40, 0x16, 0x00, 0x00, 0x03, 0x00, 0x0a, 0x00, 0x02, 0x00, 0x01, 0x00,
+                0x55, 0x00, 0x02, 0x00, 0x02, 0x00, 0x26, 0x00, 0x03, 0x02, 0x7e, 0x00,
+            ]
+        );
+    }
+
+    /// The baseline Initial UE Message re-encoded with `edit` applied to its
+    /// generated IE list.
+    pub(crate) fn initial_ue_edited(
+        edit: impl FnOnce(&mut Vec<ngap_gen::InitialUEMessageProtocolIEs_Entry>),
+    ) -> Vec<u8> {
+        let mut pdu = nextgcore_ngap_gen::decode(&initial_ue_corpus()[0]).expect("decode");
+        let ngap_gen::NGAP_PDU::InitiatingMessage(ref mut msg) = pdu else {
+            panic!("initiatingMessage");
+        };
+        let ngap_gen::InitiatingMessageValue::Id_InitialUEMessage(ref mut m) = msg.value else {
+            panic!("InitialUEMessage");
+        };
+        edit(&mut m.protocol_i_es.0);
+        nextgcore_ngap_gen::encode(&pdu).expect("encode")
+    }
+
+    /// The hand-written parser refused an Initial UE Message carrying a
+    /// 5G-S-TMSI -- the IE a gNB includes for a UE resuming from CM-IDLE with
+    /// its 5G-S-TMSI (TS 38.413 §9.2.5.1) -- because it did not comprehend the
+    /// IE and its criticality is reject. The generated decode comprehends it.
+    #[test]
+    fn an_initial_ue_message_with_a_5g_s_tmsi_is_decoded() {
+        use bitvec::prelude::*;
+        let data = initial_ue_edited(|ies| {
+            ies.push(ngap_gen::InitialUEMessageProtocolIEs_Entry {
+                id: ngap_gen::ProtocolIE_ID(ngap_gen::ID_FIVE_G_S_TMSI),
+                criticality: ngap_gen::Criticality(ngap_gen::Criticality::REJECT),
+                value: ngap_gen::InitialUEMessageProtocolIEs_EntryValue::Id_FiveG_S_TMSI(
+                    ngap_gen::FiveG_S_TMSI {
+                        amf_set_id: ngap_gen::AMFSetID(bitvec![u8, Msb0; 0; 10]),
+                        amf_pointer: ngap_gen::AMFPointer(bitvec![u8, Msb0; 0; 6]),
+                        five_g_tmsi: ngap_gen::FiveG_TMSI(vec![0x12, 0x34, 0x56, 0x78]),
+                        ie_extensions: None,
+                    },
+                ),
+            })
+        });
+        assert!(
+            parse_initial_ue_message_asn1(&data).is_none(),
+            "the oracle refuses it: that is the defect"
+        );
+        let NasTransportDecode::Proceed {
+            message,
+            error_indication: None,
+        } = decode_initial_ue_message_asn1(&data)
+        else {
+            panic!("a 5G-S-TMSI must not stop the Initial UE Message");
+        };
+        assert_eq!(message.ran_ue_ngap_id, 77);
+        assert_eq!(message.nas_pdu, [0x7e, 0x00, 0x41, 0x09, 0x00]);
+    }
+
+    /// §10.3.4.2 and §10.3.5 for the Initial UE Message, a procedure with no
+    /// response message: "ignore" is dropped; "notify" proceeds and reports
+    /// procedure 15 in an Error Indication; "reject", or a missing NAS-PDU or
+    /// User Location Information (both criticality reject), terminates it with
+    /// one; a missing RRC Establishment Cause (criticality ignore) is ignored.
+    #[test]
+    fn initial_ue_message_criticality_handling() {
+        let base = &initial_ue_corpus()[0];
+        let report = |cause_protocol, diagnostics| CriticalityErrorIndication {
+            amf_ue_ngap_id: None,
+            ran_ue_ngap_id: Some(77),
+            cause_protocol,
+            procedure: ReportedProcedure {
+                procedure_code: 15,
+                triggering_message: ngap_gen::TriggeringMessage::INITIATING_MESSAGE,
+                procedure_criticality: ngap_gen::Criticality::IGNORE,
+            },
+            diagnostics,
+        };
+        let not_understood = |criticality| {
+            vec![IeDiagnostic {
+                ie_id: 9999,
+                criticality,
+                type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+            }]
+        };
+
+        assert!(matches!(
+            decode_initial_ue_message_asn1(&with_unknown_ie(base, 9999, 0x40)),
+            NasTransportDecode::Proceed {
+                error_indication: None,
+                ..
+            }
+        ));
+        let NasTransportDecode::Proceed {
+            message,
+            error_indication: Some(r),
+        } = decode_initial_ue_message_asn1(&with_unknown_ie(base, 9999, 0x80))
+        else {
+            panic!("notify proceeds with a report");
+        };
+        assert_eq!(message.ran_ue_ngap_id, 77);
+        assert_eq!(
+            r,
+            report(
+                ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+                not_understood(ngap_gen::Criticality::NOTIFY)
+            )
+        );
+        let NasTransportDecode::Reject(r) =
+            decode_initial_ue_message_asn1(&with_unknown_ie(base, 9999, 0x00))
+        else {
+            panic!("reject terminates the procedure");
+        };
+        assert_eq!(
+            r,
+            report(
+                ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
+                not_understood(ngap_gen::Criticality::REJECT)
+            )
+        );
+
+        for missing in [ngap_gen::ID_NAS_PDU, ngap_gen::ID_USER_LOCATION_INFORMATION] {
+            let data = initial_ue_edited(|ies| ies.retain(|e| e.id.0 != missing));
+            let NasTransportDecode::Reject(r) = decode_initial_ue_message_asn1(&data) else {
+                panic!("missing IE {missing} is rejected");
+            };
+            assert_eq!(
+                r.diagnostics,
+                [IeDiagnostic {
+                    ie_id: missing,
+                    criticality: ngap_gen::Criticality::REJECT,
+                    type_of_error: ngap_gen::TypeOfError::MISSING,
+                }]
+            );
+        }
+        let data =
+            initial_ue_edited(|ies| ies.retain(|e| e.id.0 != ngap_gen::ID_RRC_ESTABLISHMENT_CAUSE));
+        let NasTransportDecode::Proceed {
+            message,
+            error_indication: None,
+        } = decode_initial_ue_message_asn1(&data)
+        else {
+            panic!("a missing RRC Establishment Cause is ignored");
+        };
+        assert_eq!(
+            message.rrc_establishment_cause,
+            ngap_gen::RRCEstablishmentCause::MO_SIGNALLING
+        );
+    }
+
+    /// RRC Establishment Cause is carried as its wire value, extension values
+    /// included: mo-ExceptionData (11, Rel-15) is not folded into notAvailable
+    /// as the hand-written parser folded it.
+    #[test]
+    fn an_extension_rrc_establishment_cause_is_kept() {
+        let data = initial_ue_edited(|ies| {
+            for e in ies.iter_mut() {
+                if let ngap_gen::InitialUEMessageProtocolIEs_EntryValue::Id_RRCEstablishmentCause(
+                    c,
+                ) = &mut e.value
+                {
+                    c.0 = ngap_gen::RRCEstablishmentCause::MO_EXCEPTION_DATA;
+                }
+            }
+        });
+        let NasTransportDecode::Proceed { message, .. } = decode_initial_ue_message_asn1(&data)
+        else {
+            panic!("decodes");
+        };
+        assert_eq!(message.rrc_establishment_cause, 11);
+        assert_eq!(
+            parse_initial_ue_message_asn1(&data).map(|m| m.rrc_establishment_cause),
+            Some(10),
+            "the oracle folded it into notAvailable"
+        );
+    }
+
+    /// §10.3.4.2 and §10.3.5 for the Uplink NAS Transport. Its User Location
+    /// Information is mandatory with criticality IGNORE, so a message without
+    /// one delivers its NAS -- the hand-written parser refused it.
+    #[test]
+    fn uplink_nas_transport_criticality_handling() {
+        let base = &uplink_nas_corpus()[0];
+        let edited = |edit: &dyn Fn(&mut Vec<ngap_gen::UplinkNASTransportProtocolIEs_Entry>)| {
+            let mut pdu = nextgcore_ngap_gen::decode(base).expect("decode");
+            let ngap_gen::NGAP_PDU::InitiatingMessage(ref mut msg) = pdu else {
+                panic!("initiatingMessage");
+            };
+            let ngap_gen::InitiatingMessageValue::Id_UplinkNASTransport(ref mut m) = msg.value
+            else {
+                panic!("UplinkNASTransport");
+            };
+            edit(&mut m.protocol_i_es.0);
+            nextgcore_ngap_gen::encode(&pdu).expect("encode")
+        };
+
+        let no_uli =
+            edited(&|ies| ies.retain(|e| e.id.0 != ngap_gen::ID_USER_LOCATION_INFORMATION));
+        assert!(
+            parse_uplink_nas_transport_asn1(&no_uli).is_none(),
+            "the oracle refuses it"
+        );
+        let NasTransportDecode::Proceed {
+            message,
+            error_indication: None,
+        } = decode_uplink_nas_transport_asn1(&no_uli)
+        else {
+            panic!("a missing User Location Information is ignored");
+        };
+        assert!(message.user_location_info.is_none());
+        assert_eq!(message.nas_pdu.len(), 10);
+
+        let NasTransportDecode::Reject(r) = decode_uplink_nas_transport_asn1(&edited(&|ies| {
+            ies.retain(|e| e.id.0 != ngap_gen::ID_NAS_PDU)
+        })) else {
+            panic!("a missing NAS-PDU is rejected");
+        };
+        assert_eq!((r.amf_ue_ngap_id, r.ran_ue_ngap_id), (Some(9), Some(77)));
+        assert_eq!(r.procedure.procedure_code, 46);
+        assert_eq!(r.diagnostics[0].ie_id, ngap_gen::ID_NAS_PDU);
+
+        let NasTransportDecode::Proceed {
+            error_indication: Some(r),
+            ..
+        } = decode_uplink_nas_transport_asn1(&with_unknown_ie(base, 9999, 0x80))
+        else {
+            panic!("notify proceeds with a report");
+        };
+        assert_eq!(
+            r.cause_protocol,
+            ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY
+        );
+        assert!(matches!(
+            decode_uplink_nas_transport_asn1(&with_unknown_ie(base, 9999, 0x00)),
+            NasTransportDecode::Reject(_)
+        ));
     }
 }

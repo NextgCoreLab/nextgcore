@@ -1673,9 +1673,35 @@ impl NgapServer {
             data.len()
         );
 
-        let initial_ue = match crate::ngap_asn1::parse_initial_ue_message_asn1(data) {
-            Some(msg) => msg,
-            None => {
+        // §10.3.4.2/§10.3.5 for a procedure with no response message: a message the
+        // AMF must reject is terminated with an Error Indication; "ignore IE and
+        // notify sender" IEs are reported in one and the NAS is still delivered.
+        let initial_ue = match crate::ngap_asn1::decode_initial_ue_message_asn1(data) {
+            crate::ngap_asn1::NasTransportDecode::Proceed {
+                message,
+                error_indication,
+            } => {
+                // Best effort: the report must not stop the procedure it reports on.
+                if let Some(report) = error_indication {
+                    if let Err(e) = self
+                        .send_criticality_error_indication(association_id, &report)
+                        .await
+                    {
+                        log::warn!("Failed to send ErrorIndication: {e}");
+                    }
+                }
+                message
+            }
+            crate::ngap_asn1::NasTransportDecode::Reject(report) => {
+                log::warn!(
+                    "Initial UE Message rejected (TS 38.413 §10.3.4.2/§10.3.5): {:?}",
+                    report.diagnostics
+                );
+                return self
+                    .send_criticality_error_indication(association_id, &report)
+                    .await;
+            }
+            crate::ngap_asn1::NasTransportDecode::Undecodable => {
                 log::error!("Failed to parse Initial UE Message");
                 return Ok(());
             }
@@ -1802,9 +1828,32 @@ impl NgapServer {
         association_id: u64,
         data: &[u8],
     ) -> Result<()> {
-        let ul_nas = match crate::ngap_asn1::parse_uplink_nas_transport_asn1(data) {
-            Some(msg) => msg,
-            None => {
+        // §10.3.4.2/§10.3.5, as for the Initial UE Message.
+        let ul_nas = match crate::ngap_asn1::decode_uplink_nas_transport_asn1(data) {
+            crate::ngap_asn1::NasTransportDecode::Proceed {
+                message,
+                error_indication,
+            } => {
+                if let Some(report) = error_indication {
+                    if let Err(e) = self
+                        .send_criticality_error_indication(association_id, &report)
+                        .await
+                    {
+                        log::warn!("Failed to send ErrorIndication: {e}");
+                    }
+                }
+                message
+            }
+            crate::ngap_asn1::NasTransportDecode::Reject(report) => {
+                log::warn!(
+                    "Uplink NAS Transport rejected (TS 38.413 §10.3.4.2/§10.3.5): {:?}",
+                    report.diagnostics
+                );
+                return self
+                    .send_criticality_error_indication(association_id, &report)
+                    .await;
+            }
+            crate::ngap_asn1::NasTransportDecode::Undecodable => {
                 log::error!("Failed to parse Uplink NAS Transport");
                 return Ok(());
             }
@@ -1852,8 +1901,13 @@ impl NgapServer {
         // (`ue_store.rs:113-115`), and this crate has twice had a handler mutate a clone
         // it then dropped. `None` means the UE is unknown, which the branches below
         // already answer for — a location for a UE with no context has nowhere to go.
+        // An absent or non-NR location (now delivered rather than refused) leaves the
+        // stored one in place.
         self.ue_auth_state.with_mut(ul_nas.amf_ue_ngap_id, |state| {
-            apply_user_location(&mut state.amf_ue, &ul_nas.user_location_info);
+            let Some(location) = &ul_nas.user_location_info else {
+                return;
+            };
+            apply_user_location(&mut state.amf_ue, location);
             log::debug!(
                 "UE {} location refreshed from the Uplink NAS Transport (tac={}, nci=0x{:x})",
                 ul_nas.amf_ue_ngap_id,
@@ -16825,7 +16879,7 @@ mod tests {
             // Not load-bearing here: this test is about the §4.4.4.3 exception, and
             // `handle_integrity_check_failure` reads no location. The field is mandatory
             // on the message (#406) so it has to be present.
-            user_location_info: test_user_location(0x000001, 1),
+            user_location_info: Some(test_user_location(0x000001, 1)),
         };
         let plain = [0x7E, 0x00, message_type::SERVICE_REQUEST, 0x00];
         let attempted = ngap
@@ -16903,7 +16957,7 @@ mod tests {
             ran_ue_ngap_id: 72,
             nas_pdu: Vec::new(),
             // Not load-bearing: see the sibling test. Mandatory field (#406).
-            user_location_info: test_user_location(0x000001, 1),
+            user_location_info: Some(test_user_location(0x000001, 1)),
         };
         let plain = [0x7E, 0x00, message_type::UL_NAS_TRANSPORT, 0x00];
         ngap.handle_integrity_check_failure(1, &ul_nas, &plain, 0x02)
@@ -17339,6 +17393,61 @@ mod tests {
     ///
     /// REVERT-VERIFIED: removing the `state.amf_ue.nr_cgi = ...` write at the
     /// registration site makes this FAIL with `cell_id == 0`.
+    /// #417: the Initial UE Message is decoded with the generated codec and
+    /// TS 38.413 §10.3.4.2 applies, through the real dispatch. A message the AMF
+    /// must reject (a not-comprehended IE marked "reject") creates no UE context
+    /// -- it is terminated with an Error Indication -- while one carrying a
+    /// 5G-S-TMSI, which the hand-written parser refused outright, now starts
+    /// the registration. The UE context is the observable: the handler
+    /// allocates it from `next_gnb_id` before the NAS dispatch.
+    ///
+    /// REVERT-VERIFIED: routing the handler back to the hand-written parser
+    /// fails the 5G-S-TMSI half; treating `Reject` as `Proceed` fails the other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn initial_ue_message_criticality_is_applied_through_dispatch() {
+        use bitvec::prelude::*;
+        use nextgcore_ngap_gen::generated as ngap_gen;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+
+        let rejected = 7_417_101u64;
+        *ngap.next_gnb_id.lock().await = rejected;
+        let base = crate::ngap_asn1::tests::initial_ue_corpus().remove(0);
+        let pdu = crate::ngap_asn1::tests::with_unknown_ie(&base, 9999, 0x00);
+        let _ = ngap.process_ngap_message(1, &pdu).await;
+        assert!(
+            ngap.ue_auth_state.get(rejected).is_none(),
+            "a not-comprehended IE marked reject terminates the procedure"
+        );
+        assert_eq!(
+            *ngap.next_gnb_id.lock().await,
+            rejected,
+            "no AMF UE NGAP ID was allocated"
+        );
+
+        let accepted = 7_417_102u64;
+        *ngap.next_gnb_id.lock().await = accepted;
+        let pdu = crate::ngap_asn1::tests::initial_ue_edited(|ies| {
+            ies.push(ngap_gen::InitialUEMessageProtocolIEs_Entry {
+                id: ngap_gen::ProtocolIE_ID(ngap_gen::ID_FIVE_G_S_TMSI),
+                criticality: ngap_gen::Criticality(ngap_gen::Criticality::REJECT),
+                value: ngap_gen::InitialUEMessageProtocolIEs_EntryValue::Id_FiveG_S_TMSI(
+                    ngap_gen::FiveG_S_TMSI {
+                        amf_set_id: ngap_gen::AMFSetID(bitvec![u8, Msb0; 0; 10]),
+                        amf_pointer: ngap_gen::AMFPointer(bitvec![u8, Msb0; 0; 6]),
+                        five_g_tmsi: ngap_gen::FiveG_TMSI(vec![0x12, 0x34, 0x56, 0x78]),
+                        ie_extensions: None,
+                    },
+                ),
+            })
+        });
+        let _ = ngap.process_ngap_message(1, &pdu).await;
+        assert!(
+            ngap.ue_auth_state.get(accepted).is_some(),
+            "an Initial UE Message carrying a 5G-S-TMSI starts the procedure"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_initial_ue_message_stores_the_cell_identity_it_parsed() {
         crate::context::amf_context_init(64, 1024, 4096);
