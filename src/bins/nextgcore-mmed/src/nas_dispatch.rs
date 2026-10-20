@@ -462,6 +462,21 @@ fn decode_protected(
             );
             return Some(plain);
         }
+        if matches!(security_header_type, 2 | 4) {
+            // TS 24.301 §4.4.5: a UE ciphers only once the secure exchange is
+            // established for THIS NAS signalling connection. With no context here
+            // this connection has not run a SECURITY MODE CONTROL, so the UE is
+            // ciphering with a context the network no longer holds (e.g. kept after
+            // an ATTACH REJECT, #488). The body cannot be read; naming the cause
+            // makes the UE-side fault visible instead of a bare discard.
+            log::warn!(
+                "[{}] CIPHERED NAS message (header type {security_header_type}) from a UE with \
+                 no security context; discarded: a UE must not cipher before the secure \
+                 exchange is established on this NAS signalling connection (TS 24.301 4.4.5)",
+                mme_ue.imsi_bcd
+            );
+            return None;
+        }
         log::warn!(
             "[{}] Security-protected NAS (header type {security_header_type}) from a UE with no \
              security context; discarded",
@@ -2448,6 +2463,91 @@ mod tests {
             ctx.mme_ue_find_by_id(first_mme_ue).is_none(),
             "the stale context must be implicitly detached"
         );
+    }
+
+    /// #488's scenario through the real NAS path: a UE that received ATTACH REJECT
+    /// keeps its EPS security context (TS 24.301 §5.5.1.2.5) and re-attaches on a
+    /// NEW NAS signalling connection. The MME implicitly detached the old context
+    /// (§5.5.1.2.4), so it holds no security context, and the UE's AUTHENTICATION
+    /// RESPONSE arrives integrity protected with the context the network no longer
+    /// has. §4.4.4.3 lists AUTHENTICATION RESPONSE among the messages processed
+    /// without a secure exchange, and NOTE 3 names exactly this case ("protected
+    /// with an EPS security context that is no longer available in the network").
+    /// The MME must authenticate and proceed to the SECURITY MODE COMMAND.
+    fn reattach_to_a_fresh_context(ctx: &MmeContext) -> (u64, u64) {
+        let first_enb_ue = enb_with_connection(ctx);
+        let attach = attach_request(&imsi_identity(), &pdn_connectivity_request(1, false));
+        nas_eps_handle_uplink(ctx, uplink(first_enb_ue, &attach));
+        let first_mme_ue = ctx.mme_ue_find_by_imsi(TEST_IMSI).unwrap();
+        {
+            // The first attach had taken a context into use.
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            pool.get_mut(&first_mme_ue)
+                .unwrap()
+                .security_context_available = true;
+        }
+
+        let enb_id = ctx.enb_ue_find_by_id(first_enb_ue).unwrap().enb_id;
+        let second_enb_ue = ctx.enb_ue_add(enb_id, 102);
+        nas_eps_handle_uplink(ctx, uplink(second_enb_ue, &attach));
+        let mme_ue_id = ctx.mme_ue_find_by_imsi(TEST_IMSI).unwrap();
+        assert_ne!(
+            mme_ue_id, first_mme_ue,
+            "the old context is implicitly detached"
+        );
+        {
+            // A fresh vector for the re-attach, as the AIA would deliver.
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            let mme_ue = pool.get_mut(&mme_ue_id).unwrap();
+            assert!(!mme_ue.security_context_available);
+            mme_ue.xres[..8].copy_from_slice(&[0xaa; 8]);
+            mme_ue.xres_len = 8;
+            mme_ue.rand = [0x11; 16];
+            mme_ue.autn = [0x22; 16];
+            mme_ue.kasme = [0x44; 32];
+        }
+        (second_enb_ue, mme_ue_id)
+    }
+
+    #[test]
+    fn test_reattach_auth_response_protected_with_the_old_context_is_processed() {
+        let ctx = test_ctx();
+        let (enb_ue_id, mme_ue_id) = reattach_to_a_fresh_context(&ctx);
+
+        // Integrity protected (header type 1) with a MAC the MME cannot verify.
+        let mut pdu = vec![0x17, 0xde, 0xad, 0xbe, 0xef, 0x03];
+        pdu.extend_from_slice(&authentication_response());
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &pdu));
+
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert_eq!(
+            protected_message_type(&mme_ue.t3460.pkbuf),
+            Some(NasEpsMessageType::SecurityModeCommand as u8),
+            "authentication must complete and the SECURITY MODE COMMAND go out"
+        );
+    }
+
+    /// The same re-attach with the AUTHENTICATION RESPONSE CIPHERED (header type 2).
+    /// TS 24.301 §4.4.5: the UE starts ciphering "when the secure exchange of NAS
+    /// messages has been established for a NAS signalling connection", and the
+    /// re-attach is a NEW connection — the MME released the old one after the
+    /// ATTACH REJECT (#473). A ciphered message here is a UE fault, and its body is
+    /// unreadable without the context, so it is discarded and no procedure runs.
+    #[test]
+    fn test_reattach_auth_response_ciphered_with_the_old_context_is_discarded() {
+        let ctx = test_ctx();
+        let (enb_ue_id, mme_ue_id) = reattach_to_a_fresh_context(&ctx);
+
+        let mut pdu = vec![0x27, 0xde, 0xad, 0xbe, 0xef, 0x03];
+        pdu.extend_from_slice(&authentication_response());
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &pdu));
+
+        let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert_ne!(
+            protected_message_type(&mme_ue.t3460.pkbuf),
+            Some(NasEpsMessageType::SecurityModeCommand as u8)
+        );
+        assert!(!mme_ue.security_context_available);
     }
 
     #[test]
