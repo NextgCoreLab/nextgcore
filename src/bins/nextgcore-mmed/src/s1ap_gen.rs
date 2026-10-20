@@ -12,7 +12,9 @@
 //! encode. Stage 4 is Initial Context Setup (§8.3.1): the INITIAL CONTEXT SETUP
 //! REQUEST encode and the RESPONSE / FAILURE decodes. Stage 5 is UE Context
 //! Release (§8.3.2, §8.3.3): the UE CONTEXT RELEASE COMMAND encode and the
-//! REQUEST / COMPLETE decodes.
+//! REQUEST / COMPLETE decodes. Stage 6 is E-RAB management (§8.2.1-§8.2.3):
+//! the E-RAB SETUP / MODIFY REQUEST and E-RAB RELEASE COMMAND encodes and their
+//! responses' decodes.
 
 use bitvec::prelude::{BitVec, Msb0};
 use nextgcore_s1ap::{
@@ -786,6 +788,31 @@ fn bits_to_bytes(bits: &BitVec<u8, Msb0>) -> Vec<u8> {
     bits.clone().into_vec()
 }
 
+/// E-RAB Level QoS Parameters (TS 36.413 §9.2.1.15) in the generated type.
+fn erab_qos(q: &nextgcore_s1ap::ErabLevelQosParameters) -> g::E_RABLevelQoSParameters {
+    g::E_RABLevelQoSParameters {
+        qci: g::QCI(q.qci),
+        allocation_retention_priority: g::AllocationAndRetentionPriority {
+            priority_level: g::PriorityLevel(q.arp.priority_level),
+            pre_emption_capability: g::Pre_emptionCapability(u8::from(
+                q.arp.pre_emption_capability,
+            )),
+            pre_emption_vulnerability: g::Pre_emptionVulnerability(u8::from(
+                q.arp.pre_emption_vulnerability,
+            )),
+            ie_extensions: None,
+        },
+        gbr_qos_information: q.gbr_qos_info.as_ref().map(|gbr| g::GBR_QosInformation {
+            e_rab_maximum_bitrate_dl: g::BitRate(gbr.erab_max_bitrate_dl),
+            e_rab_maximum_bitrate_ul: g::BitRate(gbr.erab_max_bitrate_ul),
+            e_rab_guaranteed_bitrate_dl: g::BitRate(gbr.erab_guaranteed_bitrate_dl),
+            e_rab_guaranteed_bitrate_ul: g::BitRate(gbr.erab_guaranteed_bitrate_ul),
+            ie_extensions: None,
+        }),
+        ie_extensions: None,
+    }
+}
+
 /// Encode an INITIAL CONTEXT SETUP REQUEST (TS 36.413 §9.1.4.1) with the
 /// generated codec. IE order follows `InitialContextSetupRequestIEs`, every IE
 /// criticality reject; each E-RAB item is criticality reject.
@@ -807,33 +834,7 @@ pub fn build_initial_context_setup_request(
             value: g::E_RABToBeSetupListCtxtSUReq_EntryValue::Id_E_RABToBeSetupItemCtxtSUReq(
                 g::E_RABToBeSetupItemCtxtSUReq {
                     e_rab_id: g::E_RAB_ID(e.erab_id),
-                    e_ra_blevel_qo_s_parameters: g::E_RABLevelQoSParameters {
-                        qci: g::QCI(e.erab_qos.qci),
-                        allocation_retention_priority: g::AllocationAndRetentionPriority {
-                            priority_level: g::PriorityLevel(e.erab_qos.arp.priority_level),
-                            pre_emption_capability: g::Pre_emptionCapability(u8::from(
-                                e.erab_qos.arp.pre_emption_capability,
-                            )),
-                            pre_emption_vulnerability: g::Pre_emptionVulnerability(u8::from(
-                                e.erab_qos.arp.pre_emption_vulnerability,
-                            )),
-                            ie_extensions: None,
-                        },
-                        gbr_qos_information: e.erab_qos.gbr_qos_info.as_ref().map(|gbr| {
-                            g::GBR_QosInformation {
-                                e_rab_maximum_bitrate_dl: g::BitRate(gbr.erab_max_bitrate_dl),
-                                e_rab_maximum_bitrate_ul: g::BitRate(gbr.erab_max_bitrate_ul),
-                                e_rab_guaranteed_bitrate_dl: g::BitRate(
-                                    gbr.erab_guaranteed_bitrate_dl,
-                                ),
-                                e_rab_guaranteed_bitrate_ul: g::BitRate(
-                                    gbr.erab_guaranteed_bitrate_ul,
-                                ),
-                                ie_extensions: None,
-                            }
-                        }),
-                        ie_extensions: None,
-                    },
+                    e_ra_blevel_qo_s_parameters: erab_qos(&e.erab_qos),
                     transport_layer_address: g::TransportLayerAddress(bytes_to_bits(
                         &e.transport_layer_address,
                     )),
@@ -1196,6 +1197,395 @@ pub fn decode_ue_context_release_complete(bytes: &[u8]) -> ResponseDecode<Releas
     }
 }
 
+// ============================================================================
+// E-RAB management (TS 36.413 §8.2.1-§8.2.3) -- stage 6
+// ============================================================================
+
+/// `id-E-RABSetup`.
+pub const PROC_E_RAB_SETUP: u8 = 5;
+/// `id-E-RABModify`.
+pub const PROC_E_RAB_MODIFY: u8 = 6;
+/// `id-E-RABRelease`.
+pub const PROC_E_RAB_RELEASE: u8 = 7;
+
+const ID_ERAB_TO_BE_SETUP_LIST_BEARER_SU_REQ: u16 = 16;
+const ID_ERAB_TO_BE_SETUP_ITEM_BEARER_SU_REQ: u16 = 17;
+const ID_ERAB_TO_BE_MODIFIED_LIST_BEARER_MOD_REQ: u16 = 30;
+const ID_ERAB_TO_BE_MODIFIED_ITEM_BEARER_MOD_REQ: u16 = 36;
+const ID_ERAB_TO_BE_RELEASED_LIST: u16 = 33;
+const ID_ERAB_ITEM: u16 = 35;
+
+fn ambr(a: &nextgcore_s1ap::UeAmbr) -> g::UEAggregateMaximumBitrate {
+    g::UEAggregateMaximumBitrate {
+        u_eaggregate_maximum_bit_rate_dl: g::BitRate(a.dl),
+        u_eaggregate_maximum_bit_rate_ul: g::BitRate(a.ul),
+        ie_extensions: None,
+    }
+}
+
+fn erab_list(items: &[nextgcore_s1ap::ErabItem]) -> g::E_RABList {
+    g::E_RABList(
+        items
+            .iter()
+            .map(|i| g::E_RABList_Entry {
+                id: g::ProtocolIE_ID(ID_ERAB_ITEM),
+                criticality: g::Criticality(IGNORE),
+                value: g::E_RABList_EntryValue::Id_E_RABItem(g::E_RABItem {
+                    e_rab_id: g::E_RAB_ID(i.erab_id),
+                    cause: generated_cause(i.cause),
+                    ie_extensions: None,
+                }),
+            })
+            .collect(),
+    )
+}
+
+/// Encode an E-RAB SETUP REQUEST (TS 36.413 §9.1.3.1): every IE and item
+/// criticality reject; procedure criticality reject.
+pub fn build_erab_setup_request(
+    req: &nextgcore_s1ap::ErabSetupRequest,
+) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    use g::E_RABSetupRequestProtocolIEs_EntryValue as V;
+    let ie = |id: u16, value: V| g::E_RABSetupRequestProtocolIEs_Entry {
+        id: g::ProtocolIE_ID(id),
+        criticality: g::Criticality(REJECT),
+        value,
+    };
+    let items = req
+        .erab_list
+        .iter()
+        .map(|e| g::E_RABToBeSetupListBearerSUReq_Entry {
+            id: g::ProtocolIE_ID(ID_ERAB_TO_BE_SETUP_ITEM_BEARER_SU_REQ),
+            criticality: g::Criticality(REJECT),
+            value: g::E_RABToBeSetupListBearerSUReq_EntryValue::Id_E_RABToBeSetupItemBearerSUReq(
+                g::E_RABToBeSetupItemBearerSUReq {
+                    e_rab_id: g::E_RAB_ID(e.erab_id),
+                    e_ra_blevel_qo_s_parameters: erab_qos(&e.erab_qos),
+                    transport_layer_address: g::TransportLayerAddress(bytes_to_bits(
+                        &e.transport_layer_address,
+                    )),
+                    gtp_teid: g::GTP_TEID(e.gtp_teid.to_be_bytes().to_vec()),
+                    // NAS-PDU is mandatory in an E-RAB SETUP item.
+                    nas_pdu: g::NAS_PDU(e.nas_pdu.clone().unwrap_or_default()),
+                    ie_extensions: None,
+                },
+            ),
+        })
+        .collect();
+    let mut ies = vec![
+        ie(
+            ID_MME_UE_S1AP_ID,
+            V::Id_MME_UE_S1AP_ID(g::MME_UE_S1AP_ID(req.mme_ue_s1ap_id)),
+        ),
+        ie(
+            ID_ENB_UE_S1AP_ID,
+            V::Id_eNB_UE_S1AP_ID(g::ENB_UE_S1AP_ID(req.enb_ue_s1ap_id)),
+        ),
+    ];
+    if let Some(a) = &req.ue_ambr {
+        ies.push(ie(ID_UE_AMBR, V::Id_uEaggregateMaximumBitrate(ambr(a))));
+    }
+    ies.push(ie(
+        ID_ERAB_TO_BE_SETUP_LIST_BEARER_SU_REQ,
+        V::Id_E_RABToBeSetupListBearerSUReq(g::E_RABToBeSetupListBearerSUReq(items)),
+    ));
+    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+        procedure_code: g::ProcedureCode(PROC_E_RAB_SETUP),
+        criticality: g::Criticality(REJECT),
+        value: g::InitiatingMessageValue::Id_E_RABSetup(g::E_RABSetupRequest {
+            protocol_i_es: g::E_RABSetupRequestProtocolIEs(ies),
+        }),
+    }))
+}
+
+/// Encode an E-RAB MODIFY REQUEST (TS 36.413 §9.1.3.3): every IE and item
+/// criticality reject; procedure criticality reject.
+pub fn build_erab_modify_request(
+    req: &nextgcore_s1ap::ErabModifyRequest,
+) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    use g::E_RABModifyRequestProtocolIEs_EntryValue as V;
+    let ie = |id: u16, value: V| g::E_RABModifyRequestProtocolIEs_Entry {
+        id: g::ProtocolIE_ID(id),
+        criticality: g::Criticality(REJECT),
+        value,
+    };
+    let items = req
+        .erab_list
+        .iter()
+        .map(|e| g::E_RABToBeModifiedListBearerModReq_Entry {
+            id: g::ProtocolIE_ID(ID_ERAB_TO_BE_MODIFIED_ITEM_BEARER_MOD_REQ),
+            criticality: g::Criticality(REJECT),
+            value:
+                g::E_RABToBeModifiedListBearerModReq_EntryValue::Id_E_RABToBeModifiedItemBearerModReq(
+                    g::E_RABToBeModifiedItemBearerModReq {
+                        e_rab_id: g::E_RAB_ID(e.erab_id),
+                        e_rab_level_qo_s_parameters: erab_qos(&e.erab_qos),
+                        nas_pdu: g::NAS_PDU(e.nas_pdu.clone()),
+                        ie_extensions: None,
+                    },
+                ),
+        })
+        .collect();
+    let mut ies = vec![
+        ie(
+            ID_MME_UE_S1AP_ID,
+            V::Id_MME_UE_S1AP_ID(g::MME_UE_S1AP_ID(req.mme_ue_s1ap_id)),
+        ),
+        ie(
+            ID_ENB_UE_S1AP_ID,
+            V::Id_eNB_UE_S1AP_ID(g::ENB_UE_S1AP_ID(req.enb_ue_s1ap_id)),
+        ),
+    ];
+    if let Some(a) = &req.ue_ambr {
+        ies.push(ie(ID_UE_AMBR, V::Id_uEaggregateMaximumBitrate(ambr(a))));
+    }
+    ies.push(ie(
+        ID_ERAB_TO_BE_MODIFIED_LIST_BEARER_MOD_REQ,
+        V::Id_E_RABToBeModifiedListBearerModReq(g::E_RABToBeModifiedListBearerModReq(items)),
+    ));
+    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+        procedure_code: g::ProcedureCode(PROC_E_RAB_MODIFY),
+        criticality: g::Criticality(REJECT),
+        value: g::InitiatingMessageValue::Id_E_RABModify(g::E_RABModifyRequest {
+            protocol_i_es: g::E_RABModifyRequestProtocolIEs(ies),
+        }),
+    }))
+}
+
+/// Encode an E-RAB RELEASE COMMAND (TS 36.413 §9.1.3.5): the UE IDs and
+/// UE-AMBR reject, E-RABToBeReleasedList and NAS-PDU ignore (each E-RAB item
+/// ignore); procedure criticality reject.
+pub fn build_erab_release_command(
+    cmd: &nextgcore_s1ap::ErabReleaseCommand,
+) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    use g::E_RABReleaseCommandProtocolIEs_EntryValue as V;
+    let ie = |id: u16, criticality: u8, value: V| g::E_RABReleaseCommandProtocolIEs_Entry {
+        id: g::ProtocolIE_ID(id),
+        criticality: g::Criticality(criticality),
+        value,
+    };
+    let mut ies = vec![
+        ie(
+            ID_MME_UE_S1AP_ID,
+            REJECT,
+            V::Id_MME_UE_S1AP_ID(g::MME_UE_S1AP_ID(cmd.mme_ue_s1ap_id)),
+        ),
+        ie(
+            ID_ENB_UE_S1AP_ID,
+            REJECT,
+            V::Id_eNB_UE_S1AP_ID(g::ENB_UE_S1AP_ID(cmd.enb_ue_s1ap_id)),
+        ),
+    ];
+    if let Some(a) = &cmd.ue_ambr {
+        ies.push(ie(
+            ID_UE_AMBR,
+            REJECT,
+            V::Id_uEaggregateMaximumBitrate(ambr(a)),
+        ));
+    }
+    ies.push(ie(
+        ID_ERAB_TO_BE_RELEASED_LIST,
+        IGNORE,
+        V::Id_E_RABToBeReleasedList(erab_list(&cmd.erab_list)),
+    ));
+    if let Some(nas) = &cmd.nas_pdu {
+        ies.push(ie(
+            ID_NAS_PDU,
+            IGNORE,
+            V::Id_NAS_PDU(g::NAS_PDU(nas.clone())),
+        ));
+    }
+    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+        procedure_code: g::ProcedureCode(PROC_E_RAB_RELEASE),
+        criticality: g::Criticality(REJECT),
+        value: g::InitiatingMessageValue::Id_E_RABRelease(g::E_RABReleaseCommand {
+            protocol_i_es: g::E_RABReleaseCommandProtocolIEs(ies),
+        }),
+    }))
+}
+
+fn failed_items(list: g::E_RABList) -> Option<Vec<nextgcore_s1ap::ErabFailedItem>> {
+    list.0
+        .into_iter()
+        .map(|entry| {
+            let g::E_RABList_EntryValue::Id_E_RABItem(item) = entry.value;
+            Some(nextgcore_s1ap::ErabFailedItem {
+                erab_id: item.e_rab_id.0,
+                cause: hand_written_cause(&item.cause)?,
+            })
+        })
+        .collect()
+}
+
+/// The successful outcome of `procedure_code` with its unknown IEs, or `None`
+/// if `bytes` is not one.
+fn successful_outcome(bytes: &[u8]) -> Option<(g::SuccessfulOutcomeValue, Vec<UnknownIe>)> {
+    let (pdu, unknown) = nextgcore_s1ap_gen::decode_with_unknown_ies(bytes).ok()?;
+    let g::S1AP_PDU::SuccessfulOutcome(msg) = pdu else {
+        return None;
+    };
+    Some((msg.value, unknown))
+}
+
+/// Decode an E-RAB SETUP RESPONSE (TS 36.413 §9.1.3.2), a response message:
+/// every IE is `ignore`; one naming no MME-UE-S1AP-ID is `Undecodable`.
+pub fn decode_erab_setup_response(
+    bytes: &[u8],
+) -> ResponseDecode<nextgcore_s1ap::ErabSetupResponse> {
+    let Some((g::SuccessfulOutcomeValue::Id_E_RABSetup(rsp), unknown)) = successful_outcome(bytes)
+    else {
+        return ResponseDecode::Undecodable;
+    };
+    let (reject, notify) = classify_unknown(&unknown);
+    if !reject.is_empty() {
+        return ResponseDecode::Failed(reject);
+    }
+    let (mut mme, mut enb, mut setup, mut failed) = (None, 0, Vec::new(), Vec::new());
+    use g::E_RABSetupResponseProtocolIEs_EntryValue as V;
+    for ie in rsp.protocol_i_es.0 {
+        match ie.value {
+            V::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
+            V::Id_eNB_UE_S1AP_ID(v) => enb = v.0,
+            V::Id_E_RABSetupListBearerSURes(list) => {
+                for entry in list.0 {
+                    let g::E_RABSetupListBearerSURes_EntryValue::Id_E_RABSetupItemBearerSURes(item) =
+                        entry.value;
+                    let Ok(teid) = <[u8; 4]>::try_from(item.gtp_teid.0.as_slice()) else {
+                        return ResponseDecode::Undecodable;
+                    };
+                    setup.push(nextgcore_s1ap::ErabSetupItem {
+                        erab_id: item.e_rab_id.0,
+                        transport_layer_address: bits_to_bytes(&item.transport_layer_address.0),
+                        gtp_teid: u32::from_be_bytes(teid),
+                    });
+                }
+            }
+            V::Id_E_RABFailedToSetupListBearerSURes(list) => match failed_items(list) {
+                Some(items) => failed = items,
+                None => return ResponseDecode::Undecodable,
+            },
+            _ => {}
+        }
+    }
+    let Some(mme_ue_s1ap_id) = mme else {
+        return ResponseDecode::Undecodable;
+    };
+    ResponseDecode::Decoded {
+        msg: nextgcore_s1ap::ErabSetupResponse {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id: enb,
+            erab_setup_list: setup,
+            erab_failed_list: failed,
+        },
+        notify,
+    }
+}
+
+/// Decode an E-RAB MODIFY RESPONSE (TS 36.413 §9.1.3.4), with the rules of
+/// [`decode_erab_setup_response`].
+pub fn decode_erab_modify_response(
+    bytes: &[u8],
+) -> ResponseDecode<nextgcore_s1ap::ErabModifyResponse> {
+    let Some((g::SuccessfulOutcomeValue::Id_E_RABModify(rsp), unknown)) = successful_outcome(bytes)
+    else {
+        return ResponseDecode::Undecodable;
+    };
+    let (reject, notify) = classify_unknown(&unknown);
+    if !reject.is_empty() {
+        return ResponseDecode::Failed(reject);
+    }
+    let (mut mme, mut enb, mut modified, mut failed) = (None, 0, Vec::new(), Vec::new());
+    use g::E_RABModifyResponseProtocolIEs_EntryValue as V;
+    for ie in rsp.protocol_i_es.0 {
+        match ie.value {
+            V::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
+            V::Id_eNB_UE_S1AP_ID(v) => enb = v.0,
+            V::Id_E_RABModifyListBearerModRes(list) => {
+                modified = list
+                    .0
+                    .into_iter()
+                    .map(|entry| {
+                        let g::E_RABModifyListBearerModRes_EntryValue::Id_E_RABModifyItemBearerModRes(
+                            item,
+                        ) = entry.value;
+                        item.e_rab_id.0
+                    })
+                    .collect();
+            }
+            V::Id_E_RABFailedToModifyList(list) => match failed_items(list) {
+                Some(items) => failed = items,
+                None => return ResponseDecode::Undecodable,
+            },
+            _ => {}
+        }
+    }
+    let Some(mme_ue_s1ap_id) = mme else {
+        return ResponseDecode::Undecodable;
+    };
+    ResponseDecode::Decoded {
+        msg: nextgcore_s1ap::ErabModifyResponse {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id: enb,
+            erab_modify_list: modified,
+            erab_failed_list: failed,
+        },
+        notify,
+    }
+}
+
+/// Decode an E-RAB RELEASE RESPONSE (TS 36.413 §9.1.3.6), with the rules of
+/// [`decode_erab_setup_response`].
+pub fn decode_erab_release_response(
+    bytes: &[u8],
+) -> ResponseDecode<nextgcore_s1ap::ErabReleaseResponse> {
+    let Some((g::SuccessfulOutcomeValue::Id_E_RABRelease(rsp), unknown)) =
+        successful_outcome(bytes)
+    else {
+        return ResponseDecode::Undecodable;
+    };
+    let (reject, notify) = classify_unknown(&unknown);
+    if !reject.is_empty() {
+        return ResponseDecode::Failed(reject);
+    }
+    let (mut mme, mut enb, mut released, mut failed) = (None, 0, Vec::new(), Vec::new());
+    use g::E_RABReleaseResponseProtocolIEs_EntryValue as V;
+    for ie in rsp.protocol_i_es.0 {
+        match ie.value {
+            V::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
+            V::Id_eNB_UE_S1AP_ID(v) => enb = v.0,
+            V::Id_E_RABReleaseListBearerRelComp(list) => {
+                released = list
+                    .0
+                    .into_iter()
+                    .map(|entry| {
+                        let g::E_RABReleaseListBearerRelComp_EntryValue::Id_E_RABReleaseItemBearerRelComp(
+                            item,
+                        ) = entry.value;
+                        item.e_rab_id.0
+                    })
+                    .collect();
+            }
+            V::Id_E_RABFailedToReleaseList(list) => match failed_items(list) {
+                Some(items) => failed = items,
+                None => return ResponseDecode::Undecodable,
+            },
+            _ => {}
+        }
+    }
+    let Some(mme_ue_s1ap_id) = mme else {
+        return ResponseDecode::Undecodable;
+    };
+    ResponseDecode::Decoded {
+        msg: nextgcore_s1ap::ErabReleaseResponse {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id: enb,
+            erab_release_list: released,
+            erab_failed_list: failed,
+        },
+        notify,
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -1207,3 +1597,6 @@ mod ics_tests;
 
 #[cfg(test)]
 mod release_tests;
+
+#[cfg(test)]
+mod erab_tests;

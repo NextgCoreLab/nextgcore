@@ -377,6 +377,84 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
             ResponseDecode::Undecodable => {}
         }
     }
+    // E-RAB responses are decoded with the generated codec (#514 stage 6).
+    // Response messages: a `reject` IE is handled locally, `notify` IEs are
+    // reported in an ERROR INDICATION.
+    for (proc_code, name) in [
+        (crate::s1ap_gen::PROC_E_RAB_SETUP, "E-RAB Setup Response"),
+        (crate::s1ap_gen::PROC_E_RAB_MODIFY, "E-RAB Modify Response"),
+        (
+            crate::s1ap_gen::PROC_E_RAB_RELEASE,
+            "E-RAB Release Response",
+        ),
+    ] {
+        if !crate::s1ap_gen::is_outcome(data, true, proc_code) {
+            continue;
+        }
+        use crate::s1ap_gen::ResponseDecode;
+        let report = |mme: u32, enb: u32, notify: &[crate::s1ap_gen::DiagnosedIe]| {
+            if notify.is_empty() {
+                return Vec::new();
+            }
+            error_indication_with_diagnostics(
+                enb_id,
+                Some(enb),
+                Some(mme),
+                S1apCauseGroup::Protocol,
+                protocol_cause::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+                Some(crate::s1ap_gen::error_indication_diagnostics_for(
+                    proc_code,
+                    nextgcore_s1ap::triggering_message::SUCCESSFUL_OUTCOME,
+                    0,
+                    notify,
+                )),
+            )
+        };
+        let failed = |ies: Vec<crate::s1ap_gen::DiagnosedIe>| {
+            log::error!(
+                "{name} from eNB {enb_id} carries a reject IE (TS 36.413 §10.3.4.2); \
+                 handled locally: {ies:?}"
+            );
+            Vec::new()
+        };
+        match proc_code {
+            crate::s1ap_gen::PROC_E_RAB_SETUP => {
+                match crate::s1ap_gen::decode_erab_setup_response(data) {
+                    ResponseDecode::Decoded { msg, notify } => {
+                        let out = report(msg.mme_ue_s1ap_id, msg.enb_ue_s1ap_id, &notify);
+                        handle_erab_setup_response(
+                            ctx,
+                            enb_id,
+                            msg.mme_ue_s1ap_id,
+                            &msg.erab_setup_list,
+                        );
+                        log_erab_failures(enb_id, &msg.erab_failed_list);
+                        return out;
+                    }
+                    ResponseDecode::Failed(ies) => return failed(ies),
+                    ResponseDecode::Undecodable => {}
+                }
+            }
+            crate::s1ap_gen::PROC_E_RAB_MODIFY => {
+                match crate::s1ap_gen::decode_erab_modify_response(data) {
+                    ResponseDecode::Decoded { msg, notify } => {
+                        log_erab_failures(enb_id, &msg.erab_failed_list);
+                        return report(msg.mme_ue_s1ap_id, msg.enb_ue_s1ap_id, &notify);
+                    }
+                    ResponseDecode::Failed(ies) => return failed(ies),
+                    ResponseDecode::Undecodable => {}
+                }
+            }
+            _ => match crate::s1ap_gen::decode_erab_release_response(data) {
+                ResponseDecode::Decoded { msg, notify } => {
+                    log_erab_failures(enb_id, &msg.erab_failed_list);
+                    return report(msg.mme_ue_s1ap_id, msg.enb_ue_s1ap_id, &notify);
+                }
+                ResponseDecode::Failed(ies) => return failed(ies),
+                ResponseDecode::Undecodable => {}
+            },
+        }
+    }
     let message = match decode_s1ap_pdu(data) {
         Ok(message) => message,
         Err(e) => {
