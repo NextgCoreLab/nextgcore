@@ -2933,7 +2933,6 @@ dependencies = [
  "asn1_codecs_derive",
  "bitvec",
  "log",
- "nextgcore-asn1c",
 ]
 
 [[package]]

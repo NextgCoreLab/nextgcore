@@ -474,3 +474,161 @@ fn maximum_data_burst_volume_agrees_across_the_root_boundary() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// #525: the AN-initiated modification transfers the SMF now builds and parses
+// ---------------------------------------------------------------------------
+
+/// PDUSessionResourceModifyIndicationTransfer (§9.3.4.20), 0..=3 additional DL
+/// tunnels and 1..=3 flows on the primary: both codecs agree byte for byte and
+/// each decodes the other's.
+#[test]
+fn modify_indication_transfers_agree() {
+    use nextgcore_ngap::transfer::PduSessionResourceModifyIndicationTransfer;
+    for n in 0..=3u8 {
+        for flows in 1..=3u8 {
+            let mut primary = per_tnl([10, 45, 1, 1], 0xabcd, 1);
+            let mut g_primary = g_per_tnl([10, 45, 1, 1], 0xabcd, 1);
+            for qfi in 2..=flows {
+                primary
+                    .associated_qos_flow_list
+                    .push(AssociatedQosFlowItem {
+                        qos_flow_identifier: qfi,
+                        qos_flow_mapping_indication: None,
+                    });
+                g_primary
+                    .associated_qos_flow_list
+                    .0
+                    .push(g::AssociatedQosFlowItem {
+                        qos_flow_identifier: g::QosFlowIdentifier(qfi),
+                        qos_flow_mapping_indication: None,
+                        ie_extensions: None,
+                    });
+            }
+            let additional: Vec<_> = (0..n)
+                .map(|i| ([10, 45, 3, i], 0x300 + u32::from(i), 20 + i))
+                .collect();
+            let hand = PduSessionResourceModifyIndicationTransfer {
+                dl_qos_flow_per_tnl_information: primary,
+                additional_dl_qos_flow_per_tnl_information: additional
+                    .iter()
+                    .map(|&(a, t, q)| per_tnl(a, t, q))
+                    .collect(),
+            };
+            let generated = g::PDUSessionResourceModifyIndicationTransfer {
+                dl_qos_flow_per_tnl_information: g_primary,
+                additional_dl_qos_flow_per_tnl_information: g_list(
+                    additional
+                        .iter()
+                        .map(|&(a, t, q)| g_per_tnl(a, t, q))
+                        .collect(),
+                ),
+                ie_extensions: None,
+            };
+            let old = hand.encode().expect("hand-written encode");
+            let new = encode_contained(&generated).expect("generated encode");
+            assert_eq!(old, new, "{n} additional, {flows} flows");
+            assert_eq!(
+                PduSessionResourceModifyIndicationTransfer::decode(&new).expect("decode"),
+                hand
+            );
+            assert_eq!(
+                decode_contained::<g::PDUSessionResourceModifyIndicationTransfer>(&old)
+                    .expect("generated decode"),
+                generated
+            );
+        }
+    }
+}
+
+/// PDUSessionResourceModifyConfirmTransfer (§9.3.4.19): 1, 2 and 64 confirmed
+/// flows (QFIs 0 and 63 at the edges), with and without a failed-to-modify list.
+#[test]
+fn modify_confirm_transfers_agree() {
+    use nextgcore_asn1c::ngap::cause::{Cause, CauseRadioNetwork};
+    use nextgcore_ngap::transfer::{PduSessionResourceModifyConfirmTransfer, QosFlowWithCauseItem};
+    let flow_sets: [Vec<u8>; 4] = [vec![1], vec![0, 63], (0..64).collect(), vec![9]];
+    for (i, flows) in flow_sets.iter().enumerate() {
+        for with_failed in [false, true] {
+            let hand = PduSessionResourceModifyConfirmTransfer {
+                qos_flow_modify_confirm_list: flows.clone(),
+                ul_ngu_up_tnl_information: tunnel([10, 45, 0, 7], 0x1234),
+                qos_flow_failed_to_modify_list: if with_failed {
+                    vec![QosFlowWithCauseItem {
+                        qos_flow_identifier: 5,
+                        cause: Cause::RadioNetwork(CauseRadioNetwork::Unspecified),
+                    }]
+                } else {
+                    Vec::new()
+                },
+            };
+            let generated = g::PDUSessionResourceModifyConfirmTransfer {
+                qos_flow_modify_confirm_list: g::QosFlowModifyConfirmList(
+                    flows
+                        .iter()
+                        .map(|&q| g::QosFlowModifyConfirmItem {
+                            qos_flow_identifier: g::QosFlowIdentifier(q),
+                            ie_extensions: None,
+                        })
+                        .collect(),
+                ),
+                ulngu_up_tnl_information: g_tunnel([10, 45, 0, 7], 0x1234),
+                additional_ng_uuptnl_information: None,
+                qos_flow_failed_to_modify_list: with_failed.then(|| {
+                    g::QosFlowListWithCause(vec![g::QosFlowWithCauseItem {
+                        qos_flow_identifier: g::QosFlowIdentifier(5),
+                        cause: g::Cause::RadioNetwork(g::CauseRadioNetwork(
+                            CauseRadioNetwork::Unspecified as u8,
+                        )),
+                        ie_extensions: None,
+                    }])
+                }),
+                ie_extensions: None,
+            };
+            let old = hand.encode().expect("hand-written encode");
+            let new = encode_contained(&generated).expect("generated encode");
+            assert_eq!(old, new, "set {i}, failed {with_failed}");
+            assert_eq!(
+                PduSessionResourceModifyConfirmTransfer::decode(&new).expect("decode"),
+                hand
+            );
+        }
+    }
+    // An empty or over-long confirm list is refused, as SIZE(1..maxnoofQosFlows) requires.
+    for flows in [Vec::new(), (0..65).map(|q| q % 64).collect::<Vec<u8>>()] {
+        let hand = PduSessionResourceModifyConfirmTransfer {
+            qos_flow_modify_confirm_list: flows,
+            ul_ngu_up_tnl_information: tunnel([10, 45, 0, 7], 1),
+            qos_flow_failed_to_modify_list: Vec::new(),
+        };
+        assert!(hand.encode().is_err());
+    }
+}
+
+/// PDUSessionResourceModifyIndicationUnsuccessfulTransfer (§9.3.4.21) for every
+/// misc cause value.
+#[test]
+fn modify_indication_unsuccessful_transfers_agree() {
+    use nextgcore_asn1c::ngap::cause::{Cause, CauseMisc};
+    use nextgcore_ngap::transfer::PduSessionResourceModifyIndicationUnsuccessfulTransfer;
+    for v in 0..=5i64 {
+        let misc = CauseMisc::try_from(v).expect("misc cause");
+        let hand = PduSessionResourceModifyIndicationUnsuccessfulTransfer {
+            cause: Cause::Misc(misc),
+        };
+        let generated = g::PDUSessionResourceModifyIndicationUnsuccessfulTransfer {
+            cause: g::Cause::Misc(g::CauseMisc(v as u8)),
+            ie_extensions: None,
+        };
+        let old = hand.encode().expect("hand-written encode");
+        assert_eq!(
+            old,
+            encode_contained(&generated).expect("generated encode"),
+            "misc {v}"
+        );
+        assert_eq!(
+            PduSessionResourceModifyIndicationUnsuccessfulTransfer::decode(&old).expect("decode"),
+            hand
+        );
+    }
+}

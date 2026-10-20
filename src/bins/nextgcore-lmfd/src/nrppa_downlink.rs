@@ -2,9 +2,10 @@
 //!
 //! # What was missing
 //!
-//! `nextgcore-asn1c` has had `build_ecid_measurement_initiation_request` (procedure
-//! code 2) and `build_trp_information_request` (procedure code 16) since the NRPPa
+//! `nextgcore-asn1c` had `build_ecid_measurement_initiation_request` (procedure
+//! code 2) and `build_trp_information_request` (procedure code 16) since its NRPPa
 //! codec landed. **Nothing outside that library's own tests ever called them.**
+//! (#515 replaced that codec with the generated `nextgcore-nrppa-gen`.)
 //! `namf_client` could build an LPP N1 transfer and nothing else, so this LMF never
 //! spoke NRPPa on the downlink at all: E-CID and TRP measurements could never be
 //! solicited from a gNB, and interop with third-party NG-RAN was impossible.
@@ -32,8 +33,12 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-use nextgcore_asn1c::nrppa::NrppaTransactionId;
 use nextgcore_nrppa_gen::generated as nrppa;
+
+/// An NRPPa transaction id (`NRPPATransactionID ::= INTEGER (0..32767)`, TS 38.455
+/// §9.2.4), as handed to callers for correlation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NrppaTransactionId(pub u16);
 
 /// Is the NRPPa downlink enabled for this process?
 static NRPPA_DOWNLINK_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -253,7 +258,6 @@ fn encode_trp_information_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nextgcore_asn1c::nrppa::{InitiatingMessageValue, NrppaPdu, ProcedureCode};
 
     /// #103 criterion 3, the E-CID half: the emitted PDU decodes to the expected
     /// PROCEDURE CODE, which is what the criterion asks for — not merely that some
@@ -261,22 +265,21 @@ mod tests {
     #[test]
     fn the_ecid_initiation_pdu_decodes_to_procedure_code_2() {
         let (txn, bytes) = build_ecid_measurement_initiation(3).expect("encode");
-        let decoded = NrppaPdu::decode(&bytes).expect("the emitted PDU must decode");
-        match decoded {
-            NrppaPdu::InitiatingMessage(m) => {
+        match nextgcore_nrppa_gen::decode(&bytes).expect("the emitted PDU must decode") {
+            nrppa::NRPPA_PDU::InitiatingMessage(m) => {
                 assert_eq!(
-                    m.procedure_code,
-                    ProcedureCode::E_CID_MEASUREMENT_INITIATION,
+                    m.procedure_code.0,
+                    nrppa::ID_E_CID_MEASUREMENT_INITIATION,
                     "TS 38.455 §8.2.1.2 procedure code 2"
                 );
                 assert_eq!(
-                    m.nrppa_transaction_id, txn,
+                    m.nrppatransaction_id.0, txn.0,
                     "the transaction id the caller was handed must be the one on the wire, or \
                      the uplink reply cannot be correlated"
                 );
                 assert!(matches!(
                     m.value,
-                    InitiatingMessageValue::ECidMeasurementInitiationRequest(_)
+                    nrppa::InitiatingMessageValue::Id_e_CIDMeasurementInitiation(_)
                 ));
             }
             other => panic!("expected an initiating message, got {other:?}"),
@@ -287,14 +290,13 @@ mod tests {
     #[test]
     fn the_trp_information_pdu_decodes_to_procedure_code_16() {
         let (txn, bytes) = build_trp_information(&[1, 2]).expect("encode");
-        let decoded = NrppaPdu::decode(&bytes).expect("the emitted PDU must decode");
-        match decoded {
-            NrppaPdu::InitiatingMessage(m) => {
-                assert_eq!(m.procedure_code, ProcedureCode::TRP_INFORMATION_EXCHANGE);
-                assert_eq!(m.nrppa_transaction_id, txn);
+        match nextgcore_nrppa_gen::decode(&bytes).expect("the emitted PDU must decode") {
+            nrppa::NRPPA_PDU::InitiatingMessage(m) => {
+                assert_eq!(m.procedure_code.0, nrppa::ID_T_RP_INFORMATION_EXCHANGE);
+                assert_eq!(m.nrppatransaction_id.0, txn.0);
                 assert!(matches!(
                     m.value,
-                    InitiatingMessageValue::TrpInformationRequest(_)
+                    nrppa::InitiatingMessageValue::Id_tRPInformationExchange(_)
                 ));
             }
             other => panic!("expected an initiating message, got {other:?}"),
@@ -308,72 +310,12 @@ mod tests {
     fn no_trp_ids_asks_for_all_of_them_and_differs_from_a_filtered_request() {
         let (_, all) = build_trp_information(&[]).expect("encode");
         let (_, filtered) = build_trp_information(&[7]).expect("encode");
-        assert!(NrppaPdu::decode(&all).is_ok());
-        assert!(NrppaPdu::decode(&filtered).is_ok());
+        assert!(nextgcore_nrppa_gen::decode(&all).is_ok());
+        assert!(nextgcore_nrppa_gen::decode(&filtered).is_ok());
         assert_ne!(
             all, filtered,
             "omitting id-TRPList and sending one must not encode identically"
         );
-    }
-
-    /// The pre-#515 builders, verbatim, kept as the byte oracle for the generated
-    /// encoders (#515 stage 2). They call `nextgcore-asn1c`'s hand-written NRPPa
-    /// codec, which the stage 1 cross-checks pinned to hand-derived X.691 octets.
-    mod oracle {
-        use nextgcore_asn1c::nrppa::{
-            build_ecid_measurement_initiation_request, build_trp_information_request,
-            MeasurementQuantities, MeasurementQuantitiesItem, MeasurementQuantitiesValue,
-            NrppaTransactionId, ReportCharacteristics, TrpId, TrpInformationTypeItem,
-            UeMeasurementId,
-        };
-
-        pub fn ecid(txn: NrppaTransactionId, meas: u16) -> Vec<u8> {
-            let quantities = MeasurementQuantities {
-                items: vec![
-                    MeasurementQuantitiesItem {
-                        measurement_quantities_value: MeasurementQuantitiesValue::CellId,
-                    },
-                    MeasurementQuantitiesItem {
-                        measurement_quantities_value:
-                            MeasurementQuantitiesValue::TimingAdvanceType1,
-                    },
-                    MeasurementQuantitiesItem {
-                        measurement_quantities_value: MeasurementQuantitiesValue::Rsrp,
-                    },
-                ],
-            };
-            build_ecid_measurement_initiation_request(
-                txn,
-                UeMeasurementId(meas),
-                ReportCharacteristics::OnDemand,
-                None,
-                &quantities,
-            )
-            .unwrap()
-            .encode()
-            .unwrap()
-            .to_vec()
-        }
-
-        pub fn trp(txn: NrppaTransactionId, trp_ids: &[u16]) -> Vec<u8> {
-            let list = if trp_ids.is_empty() {
-                None
-            } else {
-                Some(trp_ids.iter().map(|id| TrpId(*id)).collect())
-            };
-            build_trp_information_request(
-                txn,
-                list,
-                vec![
-                    TrpInformationTypeItem::NrPci,
-                    TrpInformationTypeItem::GeoCoord,
-                ],
-            )
-            .unwrap()
-            .encode()
-            .unwrap()
-            .to_vec()
-        }
     }
 
     /// The production E-CID request, derived by hand from X.691 / TS 38.455
@@ -407,10 +349,6 @@ mod tests {
     fn the_production_ecid_request_matches_x691() {
         let bytes = encode_ecid_measurement_initiation(NrppaTransactionId(0), 3).unwrap();
         assert_eq!(bytes, PRODUCTION_ECID_REQUEST);
-        assert_eq!(
-            oracle::ecid(NrppaTransactionId(0), 3),
-            PRODUCTION_ECID_REQUEST
-        );
     }
 
     #[test]
@@ -419,24 +357,38 @@ mod tests {
         assert_eq!(bytes, PRODUCTION_TRP_REQUEST);
     }
 
-    /// Every LMF-UE-Measurement-ID the IE can carry (root 1..15 and the extension
-    /// 16..256) at every transaction-id edge encodes identically to the oracle.
+    /// The measurement-id and transaction-id edges, each against octets derived
+    /// by hand: the root maximum 15 (`0 1110` in 4 bits), the first extension
+    /// value 16 (X.691 §12.1: extension bit 1, then an unconstrained integer --
+    /// length 1, value 0x10 -- so the IE value grows to three octets), and the
+    /// largest transaction id. #515 stage 2 showed the generated encoder equal to
+    /// the deleted hand-written one for every id 1..=256 at seven transaction ids.
     #[test]
-    fn ecid_request_is_byte_identical_to_the_hand_written_encoder() {
-        let mut n = 0;
-        for txn in [0u16, 1, 127, 128, 255, 256, 32767] {
-            for meas in 1u16..=256 {
-                let generated =
-                    encode_ecid_measurement_initiation(NrppaTransactionId(txn), meas).unwrap();
-                assert_eq!(
-                    generated,
-                    oracle::ecid(NrppaTransactionId(txn), meas),
-                    "txn {txn} measurement id {meas}"
-                );
-                n += 1;
-            }
-        }
-        assert_eq!(n, 7 * 256);
+    fn ecid_request_edges_match_x691() {
+        let mut root_max = PRODUCTION_ECID_REQUEST.to_vec();
+        root_max[13] = 0x70;
+        assert_eq!(
+            encode_ecid_measurement_initiation(NrppaTransactionId(0), 15).unwrap(),
+            root_max
+        );
+
+        let first_extension: Vec<u8> = [
+            &[0x00, 0x02, 0x00, 0x00, 0x00, 0x23, 0x00, 0x00, 0x03][..],
+            &[0x00, 0x02, 0x00, 0x03, 0x80, 0x01, 0x10],
+            &PRODUCTION_ECID_REQUEST[14..],
+        ]
+        .concat();
+        assert_eq!(
+            encode_ecid_measurement_initiation(NrppaTransactionId(0), 16).unwrap(),
+            first_extension
+        );
+
+        let mut last_txn = PRODUCTION_ECID_REQUEST.to_vec();
+        last_txn[3..5].copy_from_slice(&[0x7f, 0xff]);
+        assert_eq!(
+            encode_ecid_measurement_initiation(NrppaTransactionId(32767), 3).unwrap(),
+            last_txn
+        );
     }
 
     /// A measurement id outside the IE's range is refused, not truncated.
@@ -446,30 +398,56 @@ mod tests {
         assert!(encode_ecid_measurement_initiation(NrppaTransactionId(0), 257).is_err());
     }
 
-    /// Every TRP-list shape -- absent, one id at each edge, several, the extension
-    /// of TRP-ID (1..65535, ...) excluded since u16 tops out at the root bound --
-    /// encodes identically to the oracle.
+    /// A TRP request naming one TRP, derived by hand: the OPTIONAL id-TRPList
+    /// (47, ignore) carries SIZE(1..65535) count-1 = 0 (2-octet aligned), then
+    /// the TRPItem (ext 0, no iE-Extensions, TRP-ID ext 0, pad) and TRP-ID 1 as
+    /// 1..65535 (2-octet aligned) -- five octets -- ahead of the information-type
+    /// list of [`PRODUCTION_TRP_REQUEST`].
     #[test]
-    fn trp_request_is_byte_identical_to_the_hand_written_encoder() {
-        let lists: Vec<Vec<u16>> = vec![
-            vec![],
-            vec![1],
+    fn a_trp_request_naming_one_trp_matches_x691() {
+        let expected: Vec<u8> = [
+            &[0x00, 0x10, 0x00, 0x00, 0x03, 0x1b, 0x00, 0x00, 0x02][..],
+            &[0x00, 0x2f, 0x40, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00],
+            &PRODUCTION_TRP_REQUEST[9..],
+        ]
+        .concat();
+        assert_eq!(
+            encode_trp_information_request(NrppaTransactionId(3), &[1]).unwrap(),
+            expected
+        );
+    }
+
+    /// Every TRP-list shape the encoder takes round-trips: the ids decode back.
+    #[test]
+    fn trp_lists_round_trip_through_the_generated_codec() {
+        for list in [
+            vec![1u16],
             vec![255],
             vec![256],
             vec![65535],
-            vec![1, 2, 3],
-            (1..=64).collect(),
             (1..=300).collect(),
-        ];
-        for txn in [0u16, 255, 256, 32767] {
-            for list in &lists {
-                assert_eq!(
-                    encode_trp_information_request(NrppaTransactionId(txn), list).unwrap(),
-                    oracle::trp(NrppaTransactionId(txn), list),
-                    "txn {txn} list of {}",
-                    list.len()
-                );
-            }
+        ] {
+            let bytes = encode_trp_information_request(NrppaTransactionId(7), &list).unwrap();
+            let nrppa::NRPPA_PDU::InitiatingMessage(m) =
+                nextgcore_nrppa_gen::decode(&bytes).unwrap()
+            else {
+                panic!("not an initiating message");
+            };
+            let nrppa::InitiatingMessageValue::Id_tRPInformationExchange(req) = m.value else {
+                panic!("not a TRP Information Request");
+            };
+            let ids: Vec<u16> = req
+                .protocol_i_es
+                .0
+                .iter()
+                .find_map(|ie| match &ie.value {
+                    nrppa::TRPInformationRequestProtocolIEs_EntryValue::Id_TRPList(l) => {
+                        Some(l.0.iter().map(|t| t.trp_id.0).collect())
+                    }
+                    _ => None,
+                })
+                .expect("the TRP list");
+            assert_eq!(ids, list);
         }
     }
 

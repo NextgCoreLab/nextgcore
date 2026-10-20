@@ -2845,6 +2845,139 @@ fn decode_setup_response_dl_endpoint(data: &[u8]) -> Option<(u32, [u8; 4], u8)> 
     Some((teid, addr, qfi))
 }
 
+/// The SMF side of an AN-initiated PDU session modification (#525, TS 23.502
+/// §4.3.3.2 steps 1-3): decode the PDUSessionResourceModifyIndicationTransfer
+/// (TS 38.413 §9.3.4.20), switch the UPF's DL FAR to the reported endpoint, and
+/// answer `PDU_RES_MOD_CFM` with a PDUSessionResourceModifyConfirmTransfer
+/// (§9.3.4.19) confirming the reported QoS flows and re-stating the UPF's UL N3
+/// endpoint. Any step that cannot be carried out is answered
+/// `PDU_RES_MOD_IND_FAIL` with a PDUSessionResourceModifyIndicationUnsuccessfulTransfer
+/// (§9.3.4.21) naming why.
+async fn an_initiated_modification(sm_context_ref: &str, n2_bytes: &[u8]) -> SbiResponse {
+    use nextgcore_asn1c::ngap::cause::{Cause, CauseMisc, CauseProtocol, CauseTransport};
+    use nextgcore_ngap::transfer::{
+        GtpTunnel, PduSessionResourceModifyConfirmTransfer,
+        PduSessionResourceModifyIndicationTransfer,
+        PduSessionResourceModifyIndicationUnsuccessfulTransfer, TransportLayerAddress,
+        UpTransportLayerInformation,
+    };
+
+    let fail = |cause: Cause, why: &str| -> SbiResponse {
+        log::warn!(
+            "PDU_RES_MOD_IND for ref={sm_context_ref}: {why}; answering PDU_RES_MOD_IND_FAIL"
+        );
+        match (PduSessionResourceModifyIndicationUnsuccessfulTransfer { cause }).encode() {
+            Ok(bytes) => sbi_response_with_n2(
+                serde_json::json!({ "n2SmInfoType": "PDU_RES_MOD_IND_FAIL" }),
+                &bytes,
+            ),
+            Err(e) => {
+                log::error!("Failed to encode ModifyIndicationUnsuccessfulTransfer: {e:?}");
+                nextgcore_sbi::server::send_internal_error(
+                    "could not build the Modify Indication Unsuccessful Transfer",
+                )
+            }
+        }
+    };
+
+    let indication = match PduSessionResourceModifyIndicationTransfer::decode(n2_bytes) {
+        Ok(t) => t,
+        Err(e) => {
+            return fail(
+                Cause::Protocol(CauseProtocol::AbstractSyntaxErrorFalselyConstructedMessage),
+                &format!("undecodable Modify Indication Transfer ({e:?})"),
+            )
+        }
+    };
+    let UpTransportLayerInformation::GtpTunnel(tunnel) = &indication
+        .dl_qos_flow_per_tnl_information
+        .up_transport_layer_information;
+    let teid = u32::from_be_bytes(tunnel.gtp_teid);
+    let Some(addr) = ipv4_from_octets(&tunnel.transport_layer_address.octets) else {
+        return fail(
+            Cause::Transport(CauseTransport::Unspecified),
+            "the DL endpoint is not an IPv4 address",
+        );
+    };
+    let qfis: Vec<u8> = indication
+        .dl_qos_flow_per_tnl_information
+        .associated_qos_flow_list
+        .iter()
+        .map(|f| f.qos_flow_identifier)
+        .collect();
+    if !indication
+        .additional_dl_qos_flow_per_tnl_information
+        .is_empty()
+    {
+        log::warn!(
+            "PDU_RES_MOD_IND for ref={sm_context_ref}: {} additional DL tunnels are not \
+             installed at the UPF (dual connectivity is not supported); only the primary \
+             tunnel's flows are confirmed",
+            indication.additional_dl_qos_flow_per_tnl_information.len()
+        );
+    }
+    let Some(upf_seid) = lookup_upf_seid(sm_context_ref) else {
+        return fail(
+            Cause::Misc(CauseMisc::Unspecified),
+            "no N4 session for this context",
+        );
+    };
+    let Some((ul_teid, ul_addr)) = lookup_upf_ul_endpoint(sm_context_ref) else {
+        return fail(
+            Cause::Misc(CauseMisc::Unspecified),
+            "no recorded UPF uplink endpoint to confirm",
+        );
+    };
+    if let Err(e) = pfcp_session_modify(smf_n4_seid_for(sm_context_ref), upf_seid, teid, addr).await
+    {
+        return fail(
+            Cause::Transport(CauseTransport::TransportResourceUnavailable),
+            &format!("PFCP Session Modification failed ({e})"),
+        );
+    }
+    log::info!(
+        "PDU_RES_MOD_IND for ref={sm_context_ref}: DL FAR switched to gNB TEID=0x{teid:08x} \
+         addr={}.{}.{}.{}, confirming QFIs {qfis:?}",
+        addr[0],
+        addr[1],
+        addr[2],
+        addr[3]
+    );
+    let confirm = PduSessionResourceModifyConfirmTransfer {
+        qos_flow_modify_confirm_list: qfis,
+        ul_ngu_up_tnl_information: UpTransportLayerInformation::GtpTunnel(GtpTunnel {
+            transport_layer_address: TransportLayerAddress::from_ipv4(ul_addr),
+            gtp_teid: ul_teid.to_be_bytes(),
+        }),
+        qos_flow_failed_to_modify_list: Vec::new(),
+    };
+    match confirm.encode() {
+        Ok(bytes) => sbi_response_with_n2(
+            serde_json::json!({ "n2SmInfoType": "PDU_RES_MOD_CFM" }),
+            &bytes,
+        ),
+        Err(e) => fail(
+            Cause::Misc(CauseMisc::Unspecified),
+            &format!("could not encode the Modify Confirm Transfer ({e:?})"),
+        ),
+    }
+}
+
+/// A 200 SmContextUpdatedData answer carrying `n2_sm_info` as the multipart
+/// `n2SmInfo` binary part referenced from the JSON (TS 29.502 §6.1.6.2.3).
+fn sbi_response_with_n2(mut json_root: serde_json::Value, n2_sm_info: &[u8]) -> SbiResponse {
+    use nextgcore_sbi::constants::content_type;
+    use nextgcore_sbi::message::SbiPart;
+    json_root["n2SmInfo"] = serde_json::json!({ "contentId": "n2SmInfo" });
+    SbiResponse::with_status(200)
+        .with_body(json_root.to_string(), content_type::APPLICATION_JSON)
+        .with_part(SbiPart::with_content(
+            "n2SmInfo",
+            content_type::APPLICATION_NGAP,
+            bytes::Bytes::copy_from_slice(n2_sm_info),
+        ))
+}
+
 /// Extract the target-gNB DL GTP-U endpoint from a real-APER
 /// `PathSwitchRequestTransfer` (TS 38.413 §9.3.4.8) during an Xn handover.
 fn decode_path_switch_dl_endpoint(data: &[u8]) -> Option<(u32, [u8; 4], u8)> {
@@ -4828,6 +4961,60 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
         }
         "HANDOVER_CANCEL" => eps_to_5gs::handle_cancelled(sm_context_ref).await,
 
+        // #525 / TS 23.502 §4.3.3.2 (AN-initiated modification), TS 38.413 §8.2.4:
+        // the NG-RAN reports a (new) DL N3 endpoint for the session's QoS flows. The
+        // SMF re-points the UPF's DL FAR and answers with a Modify Confirm Transfer
+        // (`PDU_RES_MOD_CFM`), which the AMF puts in the PDU Session Resource Modify
+        // Confirm; when it cannot, it answers `PDU_RES_MOD_IND_FAIL` with a Modify
+        // Indication Unsuccessful Transfer, so the gNB is told rather than left
+        // waiting. Before #525 this type never arrived: the AMF relayed the
+        // indication labelled PDU_RES_SETUP_RSP.
+        "PDU_RES_MOD_IND" => {
+            let Some(n2_bytes) = resolve_binary_ref(request, &req_body["n2SmInfo"]) else {
+                return problem_400("N2_SM_ERROR", "n2SmInfo missing or not valid base64");
+            };
+            an_initiated_modification(sm_context_ref, &n2_bytes).await
+        }
+
+        // The gNB could not carry out a modification the SMF requested
+        // (TS 38.413 §8.2.2.3): the session keeps its previous configuration.
+        "PDU_RES_MOD_FAIL" => {
+            log::warn!(
+                "SM Context Update (PDU_RES_MOD_FAIL): the NG-RAN failed to modify \
+                 ref={sm_context_ref}; the previous QoS stays in force"
+            );
+            SbiResponse::with_status(200)
+                .with_body(serde_json::json!({}).to_string(), "application/json")
+        }
+
+        // QoS notification control (TS 38.413 §8.2.5, TS 23.501 §5.7.2.4): the
+        // NG-RAN reports a GBR flow's QoS as no longer, or again, fulfilled.
+        "PDU_RES_NTY" => {
+            log::info!(
+                "SM Context Update (PDU_RES_NTY): QoS notification for ref={sm_context_ref}"
+            );
+            SbiResponse::with_status(200)
+                .with_body(serde_json::json!({}).to_string(), "application/json")
+        }
+
+        // The NG-RAN released the session's resources on its side (TS 38.413
+        // §8.2.5, PDU Session Resource Released List): there is no N3 path any more,
+        // so downlink is buffered again, as for an AN resource failure.
+        "PDU_RES_NTY_REL" => {
+            log::warn!(
+                "SM Context Update (PDU_RES_NTY_REL): the NG-RAN released ref={sm_context_ref}"
+            );
+            if let Some(upf_seid) = lookup_upf_seid(sm_context_ref) {
+                if let Err(e) =
+                    pfcp_deactivate_dl_far(smf_n4_seid_for(sm_context_ref), upf_seid).await
+                {
+                    log::warn!("DL FAR deactivation after NG-RAN release failed: {e}");
+                }
+            }
+            let response_body = serde_json::json!({ "upCnxState": "DEACTIVATED" });
+            SbiResponse::with_status(200).with_body(response_body.to_string(), "application/json")
+        }
+
         other => {
             log::warn!("SM Context Update: unsupported n2SmInfoType '{other}'");
             problem_400("N2_SM_ERROR", &format!("unsupported n2SmInfoType {other}"))
@@ -6581,6 +6768,154 @@ async fn handle_amf_status_change(sm_context_ref: &str) -> SbiResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ------------------------------------------------------------------
+    // #525: AN-initiated modification (PDU_RES_MOD_IND -> PDU_RES_MOD_CFM)
+    // ------------------------------------------------------------------
+
+    fn seed_session(sm_context_ref: &str, upf_seid: Option<u64>, ul: Option<(u32, [u8; 4])>) {
+        let smf = smf_self();
+        let ctx = smf.read().expect("smf context");
+        if let Some(seid) = upf_seid {
+            ctx.pfcp_sessions
+                .write()
+                .expect("pfcp sessions")
+                .insert(sm_context_ref.to_string(), seid);
+        }
+        if let Some(ep) = ul {
+            ctx.upf_ul_endpoints
+                .write()
+                .expect("ul endpoints")
+                .insert(sm_context_ref.to_string(), ep);
+        }
+    }
+
+    fn unseed_session(sm_context_ref: &str) {
+        let smf = smf_self();
+        let ctx = smf.read().expect("smf context");
+        ctx.pfcp_sessions
+            .write()
+            .expect("pfcp")
+            .remove(sm_context_ref);
+        ctx.upf_ul_endpoints
+            .write()
+            .expect("ul")
+            .remove(sm_context_ref);
+    }
+
+    fn indication(dl: [u8; 4], teid: u32, qfis: &[u8]) -> Vec<u8> {
+        use nextgcore_ngap::transfer::{
+            AssociatedQosFlowItem, GtpTunnel, PduSessionResourceModifyIndicationTransfer,
+            QosFlowPerTnlInformation, TransportLayerAddress, UpTransportLayerInformation,
+        };
+        PduSessionResourceModifyIndicationTransfer {
+            dl_qos_flow_per_tnl_information: QosFlowPerTnlInformation {
+                up_transport_layer_information: UpTransportLayerInformation::GtpTunnel(GtpTunnel {
+                    transport_layer_address: TransportLayerAddress::from_ipv4(dl),
+                    gtp_teid: teid.to_be_bytes(),
+                }),
+                associated_qos_flow_list: qfis
+                    .iter()
+                    .map(|&q| AssociatedQosFlowItem {
+                        qos_flow_identifier: q,
+                        qos_flow_mapping_indication: None,
+                    })
+                    .collect(),
+            },
+            additional_dl_qos_flow_per_tnl_information: Vec::new(),
+        }
+        .encode()
+        .expect("encode Modify Indication Transfer")
+    }
+
+    fn answer(resp: &SbiResponse) -> (String, Vec<u8>) {
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).expect("json");
+        let part = resp
+            .http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n2SmInfo"))
+            .expect("n2SmInfo part");
+        (
+            body["n2SmInfoType"]
+                .as_str()
+                .expect("n2SmInfoType")
+                .to_string(),
+            part.data.to_vec(),
+        )
+    }
+
+    /// TS 23.502 §4.3.3.2: the SMF switches the UPF's DL FAR to the endpoint the
+    /// NG-RAN reports and answers PDU_RES_MOD_CFM with a Modify Confirm Transfer
+    /// confirming the reported flows and re-stating the UPF's UL N3 endpoint.
+    #[tokio::test]
+    async fn an_initiated_modification_switches_the_dl_far_and_confirms() {
+        use nextgcore_ngap::transfer::{
+            PduSessionResourceModifyConfirmTransfer, UpTransportLayerInformation,
+        };
+        let upf = pfcp_path::stand_in::install_stand_in_upf().await;
+        upf.client.associate().await.expect("association");
+        upf.clear_seen();
+        let r = "525-mod-ind-ok";
+        seed_session(r, Some(upf.upf_seid), Some((upf.upf_teid, upf.upf_ip)));
+
+        let resp = an_initiated_modification(r, &indication([10, 1, 2, 3], 0xabcd, &[1, 2])).await;
+        unseed_session(r);
+        let (ty, n2) = answer(&resp);
+        assert_eq!(ty, "PDU_RES_MOD_CFM");
+        let confirm = PduSessionResourceModifyConfirmTransfer::decode(&n2).expect("decode");
+        assert_eq!(confirm.qos_flow_modify_confirm_list, vec![1, 2]);
+        let UpTransportLayerInformation::GtpTunnel(ul) = confirm.ul_ngu_up_tnl_information;
+        assert_eq!(u32::from_be_bytes(ul.gtp_teid), upf.upf_teid);
+        assert_eq!(ul.transport_layer_address.octets, upf.upf_ip.to_vec());
+
+        let bodies = upf.modification_bodies();
+        assert_eq!(bodies.len(), 1, "exactly one Session Modification");
+        let body = &bodies[0];
+        let has = |needle: &[u8]| body.windows(needle.len()).any(|w| w == needle);
+        assert!(
+            has(&[0x00, 0x00, 0xab, 0xcd, 10, 1, 2, 3]),
+            "the DL FAR's Outer Header Creation carries the reported endpoint: {body:02x?}"
+        );
+    }
+
+    /// No N4 session, or an undecodable transfer: the SMF answers
+    /// PDU_RES_MOD_IND_FAIL with a Modify Indication Unsuccessful Transfer naming
+    /// why, and sends nothing to the UPF.
+    #[tokio::test]
+    async fn an_initiated_modification_it_cannot_carry_out_is_answered_ind_fail() {
+        use nextgcore_asn1c::ngap::cause::{Cause, CauseMisc, CauseProtocol};
+        use nextgcore_ngap::transfer::PduSessionResourceModifyIndicationUnsuccessfulTransfer as Unsuccessful;
+        let upf = pfcp_path::stand_in::install_stand_in_upf().await;
+        upf.client.associate().await.expect("association");
+        upf.clear_seen();
+
+        let resp = an_initiated_modification(
+            "525-no-n4-session",
+            &indication([10, 1, 2, 3], 0xabcd, &[1]),
+        )
+        .await;
+        let (ty, n2) = answer(&resp);
+        assert_eq!(ty, "PDU_RES_MOD_IND_FAIL");
+        assert_eq!(
+            Unsuccessful::decode(&n2).expect("decode").cause,
+            Cause::Misc(CauseMisc::Unspecified)
+        );
+
+        let resp = an_initiated_modification("525-garbage", &[0xff]).await;
+        let (ty, n2) = answer(&resp);
+        assert_eq!(ty, "PDU_RES_MOD_IND_FAIL");
+        assert_eq!(
+            Unsuccessful::decode(&n2).expect("decode").cause,
+            Cause::Protocol(CauseProtocol::AbstractSyntaxErrorFalselyConstructedMessage)
+        );
+        assert!(
+            upf.modification_bodies().is_empty(),
+            "nothing reaches the UPF"
+        );
+    }
 
     // ------------------------------------------------------------------
     // #380: the Prometheus endpoint the EPC readiness gate polls

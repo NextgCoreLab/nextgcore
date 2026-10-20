@@ -1,64 +1,43 @@
-//! #515 stage 3: the generated E-CID Measurement Report decode against the
-//! pre-change hand-written one, and TS 38.413 §10 applied to it.
+//! #515: the E-CID Measurement Report decode on the generated codec, pinned to
+//! hand-derived X.691 octets and expected measurements, and TS 38.413 §10 applied.
+//! (Until the hand-written NRPPa codec was deleted it was the oracle here; stage 3
+//! showed both decoders agree on 140 report shapes.)
 
+use super::test_support::*;
 use super::*;
-use nextgcore_asn1c::nrppa::ies::ProtocolIeField;
-use nextgcore_asn1c::nrppa::ies::{
-    ECidMeasurementResult, MeasuredResults, MeasuredResultsValue, NgRanCell, NgRanCgi,
-    PlmnIdentity, ResultRsrpEutraItem, ResultRsrqEutraItem, Tac, UeMeasurementId,
-};
-use nextgcore_asn1c::nrppa::pdu::{
-    build_ecid_measurement_report, InitiatingMessageValue, NrppaPdu,
-};
-use nextgcore_asn1c::nrppa::types::{Criticality, NrppaTransactionId, ProtocolIeId};
 
-fn result(cell: NgRanCell, values: Option<Vec<MeasuredResultsValue>>) -> ECidMeasurementResult {
-    ECidMeasurementResult {
-        serving_cell_id: NgRanCgi {
-            plmn_identity: PlmnIdentity([0x02, 0xf8, 0x39]),
-            ng_ran_cell: cell,
-        },
-        serving_cell_tac: Tac([0x00, 0x12, 0x34]),
-        ng_ran_access_point_position: None,
-        measured_results: values.map(|values| MeasuredResults { values }),
-    }
-}
+const PLMN: [u8; 3] = [0x02, 0xf8, 0x39];
+const TAC: [u8; 3] = [0x00, 0x12, 0x34];
 
-fn report(lmf: u16, ran: u16, r: &ECidMeasurementResult) -> NrppaPdu {
-    build_ecid_measurement_report(
-        NrppaTransactionId(9),
-        UeMeasurementId(lmf),
-        UeMeasurementId(ran),
-        r,
-        None,
-    )
-    .unwrap()
-}
+/// E-CID Measurement Report, derived by hand from X.691 / TS 38.455: transaction
+/// 9, LMF measurement id 3, RAN measurement id 5, serving cell NR 1 in PLMN
+/// 02 f8 39, TAC 00 12 34, one RSRP item (PCI 42, EARFCN 1850, value 60).
+///
+/// ```text
+/// 00 04 40 00 09 27     initiatingMessage, procedure 4, ignore, transaction 9, length 39
+///  00 00 03             ext 0 + pad; 3 IEs
+///  00 02 00 01 10       LMF-UE-Measurement-ID, reject; ext 0, 3-1 in 4 bits
+///  00 06 00 01 20       RAN-UE-Measurement-ID, reject; ext 0, 5-1
+///  00 07 40 16          E-CID-MeasurementResult, ignore; 22 octets:
+///   20                  ext 0, opts 0 1 0 (measuredResults); NG-RAN-CGI ext 0, opt 0; pad
+///   02 f8 39            pLMN-Identity (SIZE 3, aligned)
+///   40 00 00 00 00 10   NG-RANCell index 1 of 3, pad; NRCellIdentifier 36 bits = 1, pad
+///   00 12 34            servingCellTAC
+///   01 80               SIZE(1..64) 0 (6 bits); CHOICE resultRSRP-EUTRA 3 of 6 (3 bits);
+///                       SIZE(1..9) 0 (4 bits); item ext 0, opts 0 0
+///   00 00 2a            pCI-EUTRA 42: INTEGER (0..503, ...), so ext 0 + pad, then
+///                       2-octet aligned
+///   20 07 3a            EARFCN ext 0, octet count-1 = 1 (2 bits), pad; 1850
+///   3c                  valueRSRP-EUTRA ext 0, 60 in 7 bits
+/// ```
+const ECID_REPORT: [u8; 45] = [
+    0x00, 0x04, 0x40, 0x00, 0x09, 0x27, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x01, 0x10, 0x00, 0x06,
+    0x00, 0x01, 0x20, 0x00, 0x07, 0x40, 0x16, 0x20, 0x02, 0xf8, 0x39, 0x40, 0x00, 0x00, 0x00, 0x00,
+    0x10, 0x00, 0x12, 0x34, 0x01, 0x80, 0x00, 0x00, 0x2a, 0x20, 0x07, 0x3a, 0x3c,
+];
 
-fn rsrp(values: &[u8]) -> MeasuredResultsValue {
-    MeasuredResultsValue::ResultRsrp(
-        values
-            .iter()
-            .map(|v| ResultRsrpEutraItem {
-                pci_eutra: 42,
-                earfcn: 1850,
-                value_rsrp_eutra: *v,
-            })
-            .collect(),
-    )
-}
-
-fn rsrq(values: &[u8]) -> MeasuredResultsValue {
-    MeasuredResultsValue::ResultRsrq(
-        values
-            .iter()
-            .map(|v| ResultRsrqEutraItem {
-                pci_eutra: 42,
-                earfcn: 1850,
-                value_rsrq_eutra: *v,
-            })
-            .collect(),
-    )
+fn report() -> Vec<u8> {
+    ecid_report(9, 3, 5, nr_cgi(PLMN, 1), TAC, Some(vec![rsrp(&[60])]))
 }
 
 fn accepted(bytes: &[u8]) -> (u64, Vec<CellMeasurement>, Option<Vec<u8>>) {
@@ -72,71 +51,75 @@ fn accepted(bytes: &[u8]) -> (u64, Vec<CellMeasurement>, Option<Vec<u8>>) {
     }
 }
 
-/// Every report shape the hand-written decoder accepted decodes to the same
-/// measurement id and cells, with no ERROR INDICATION.
 #[test]
-fn accepted_reports_match_the_hand_written_decode() {
-    let cells = [
-        NgRanCell::NrCellId(0),
-        NgRanCell::NrCellId(1),
-        NgRanCell::NrCellId((1u64 << 36) - 1),
-        NgRanCell::EutraCellId(0),
-        NgRanCell::EutraCellId((1u32 << 28) - 1),
-    ];
-    let measured = [
-        None,
-        Some(vec![MeasuredResultsValue::ValueTimingAdvanceType1(0)]),
-        Some(vec![MeasuredResultsValue::ValueTimingAdvanceType2(7690)]),
-        Some(vec![MeasuredResultsValue::ValueAngleOfArrival(719)]),
-        Some(vec![rsrp(&[0]), rsrp(&[97, 60])]),
-        Some(vec![rsrq(&[34, 3]), rsrq(&[20])]),
+fn the_report_encodes_to_the_hand_derived_octets_and_decodes() {
+    assert_eq!(report(), ECID_REPORT);
+    let (id, cells, ei) = accepted(&ECID_REPORT);
+    assert_eq!(id, 3);
+    assert!(ei.is_none());
+    assert_eq!(cells.len(), 1);
+    assert_eq!(cells[0].nr_cgi, "02f839-000000001");
+    assert_eq!(cells[0].rsrp, Some(-80), "value 60 -> 60 - 140 dBm");
+    assert_eq!(
+        (cells[0].rsrq, cells[0].timing_advance, cells[0].aoa),
+        (None, None, None)
+    );
+}
+
+/// The adapter: serving-cell spelling and each measured quantity's mapping,
+/// over the edges of every value range.
+#[test]
+fn measured_results_map_to_cell_measurements() {
+    let cell = |cgi, measured| {
+        let (_, cells, _) = accepted(&ecid_report(1, 15, 7, cgi, TAC, measured));
+        cells.into_iter().next().expect("one serving-cell entry")
+    };
+    assert_eq!(cell(nr_cgi(PLMN, 0), None).nr_cgi, "02f839-000000000");
+    assert_eq!(
+        cell(nr_cgi(PLMN, (1 << 36) - 1), None).nr_cgi,
+        "02f839-fffffffff"
+    );
+    assert_eq!(cell(eutra_cgi(PLMN, 0), None).nr_cgi, "02f839-e0000000");
+    assert_eq!(
+        cell(eutra_cgi(PLMN, (1 << 28) - 1), None).nr_cgi,
+        "02f839-efffffff"
+    );
+
+    let c = cell(nr_cgi(PLMN, 1), Some(vec![ta1(0)]));
+    assert_eq!(c.timing_advance, Some(0));
+    let c = cell(nr_cgi(PLMN, 1), Some(vec![ta2(7690)]));
+    assert_eq!(c.timing_advance, Some(7690));
+    let c = cell(nr_cgi(PLMN, 1), Some(vec![aoa(719)]));
+    assert_eq!(c.aoa, Some(719.0));
+    // RSRP: strongest item of each list, strongest list wins; 0..97 -> -140..-43.
+    let c = cell(nr_cgi(PLMN, 1), Some(vec![rsrp(&[0]), rsrp(&[97, 60])]));
+    assert_eq!(c.rsrp, Some(-43));
+    // RSRQ: strongest item of the FIRST list.
+    let c = cell(nr_cgi(PLMN, 1), Some(vec![rsrq(&[3, 34]), rsrq(&[20])]));
+    assert_eq!(c.rsrq, Some(34));
+    // TA: the first TA value wins; everything together.
+    let c = cell(
+        nr_cgi(PLMN, 1),
         Some(vec![
-            MeasuredResultsValue::ValueTimingAdvanceType1(500),
-            MeasuredResultsValue::ValueTimingAdvanceType2(9),
-            MeasuredResultsValue::ValueAngleOfArrival(90),
+            ta1(500),
+            ta2(9),
+            aoa(90),
             rsrp(&[60, 55]),
             rsrq(&[10]),
         ]),
-    ];
-    let mut n = 0;
-    for cell in &cells {
-        for m in &measured {
-            for (lmf, ran) in [(1u16, 1u16), (15, 7), (16, 256), (200, 3)] {
-                let bytes = report(lmf, ran, &result(*cell, m.clone()))
-                    .encode()
-                    .unwrap();
-                let (id, got, ei) = accepted(&bytes);
-                let (want_id, want) =
-                    crate::codec_glue::decode_nrppa_ecid_report_hand_written(&bytes).unwrap();
-                assert_eq!(id, want_id);
-                assert_eq!(format!("{got:?}"), format!("{want:?}"), "{cell:?} {m:?}");
-                assert!(ei.is_none());
-                n += 1;
-            }
-        }
-    }
-    assert_eq!(n, 5 * 7 * 4);
+    );
+    assert_eq!(
+        (c.timing_advance, c.aoa, c.rsrp, c.rsrq),
+        (Some(500), Some(90.0), Some(-80), Some(10))
+    );
 }
 
-/// Splice one extra IE with `id` and `criticality` into a valid report.
-fn with_unknown_ie(id: u16, criticality: Criticality) -> Vec<u8> {
-    let mut pdu = report(
-        3,
-        5,
-        &result(NgRanCell::NrCellId(1), Some(vec![rsrp(&[60])])),
-    );
-    let NrppaPdu::InitiatingMessage(m) = &mut pdu else {
-        unreachable!()
-    };
-    let InitiatingMessageValue::ECidMeasurementReport(c) = &mut m.value else {
-        unreachable!()
-    };
-    c.push(ProtocolIeField {
-        id: ProtocolIeId(id),
-        criticality,
-        value: vec![0x00],
-    });
-    pdu.encode().unwrap().to_vec()
+#[test]
+fn extension_range_measurement_ids_decode() {
+    for (lmf, ran) in [(16u16, 256u16), (200, 3)] {
+        let (id, _, _) = accepted(&ecid_report(1, lmf, ran, nr_cgi(PLMN, 1), TAC, None));
+        assert_eq!(id, u64::from(lmf));
+    }
 }
 
 fn parse_ei(bytes: &[u8]) -> (u8, Vec<(u8, u16, u8)>, u16) {
@@ -186,15 +169,14 @@ fn parse_ei(bytes: &[u8]) -> (u8, Vec<(u8, u16, u8)>, u16) {
 
 #[test]
 fn an_unknown_ignore_ie_is_dropped_silently() {
-    let (id, cells, ei) = accepted(&with_unknown_ie(9999, Criticality::Ignore));
-    assert_eq!(id, 3);
-    assert_eq!(cells.len(), 1);
+    let (id, cells, ei) = accepted(&splice_ie(&report(), 9999, IGNORE));
+    assert_eq!((id, cells.len()), (3, 1));
     assert!(ei.is_none());
 }
 
 #[test]
 fn an_unknown_notify_ie_is_processed_and_reported() {
-    let (id, cells, ei) = accepted(&with_unknown_ie(9999, Criticality::Notify));
+    let (id, cells, ei) = accepted(&splice_ie(&report(), 9999, NOTIFY));
     assert_eq!((id, cells.len()), (3, 1));
     let (cause, list, txn) = parse_ei(&ei.expect("an ERROR INDICATION"));
     assert_eq!(
@@ -210,7 +192,7 @@ fn an_unknown_notify_ie_is_processed_and_reported() {
 
 #[test]
 fn an_unknown_reject_ie_rejects_the_report_and_is_reported() {
-    let outcome = decode_ecid_report(&with_unknown_ie(9999, Criticality::Reject)).unwrap();
+    let outcome = decode_ecid_report(&splice_ie(&report(), 9999, REJECT)).unwrap();
     let EcidReportOutcome::Rejected {
         error_indication, ..
     } = outcome
@@ -223,31 +205,6 @@ fn an_unknown_reject_ie_rejects_the_report_and_is_reported() {
         list,
         vec![(REJECT, 9999, nrppa::TypeOfError::NOT_UNDERSTOOD)]
     );
-    // The hand-written decoder, for comparison, accepted it as if the IE were absent.
-    assert!(
-        crate::codec_glue::decode_nrppa_ecid_report_hand_written(&with_unknown_ie(
-            9999,
-            Criticality::Reject
-        ))
-        .is_ok()
-    );
-}
-
-/// Drop the IE with `id` from a valid report.
-fn without_ie(id: u16) -> Vec<u8> {
-    let mut pdu = report(
-        3,
-        5,
-        &result(NgRanCell::NrCellId(1), Some(vec![rsrp(&[60])])),
-    );
-    let NrppaPdu::InitiatingMessage(m) = &mut pdu else {
-        unreachable!()
-    };
-    let InitiatingMessageValue::ECidMeasurementReport(c) = &mut m.value else {
-        unreachable!()
-    };
-    c.ies.retain(|f| f.id.0 != id);
-    pdu.encode().unwrap().to_vec()
 }
 
 #[test]
@@ -258,7 +215,7 @@ fn a_missing_measurement_id_rejects_the_report_and_is_reported_missing() {
     ] {
         let EcidReportOutcome::Rejected {
             error_indication, ..
-        } = decode_ecid_report(&without_ie(id)).unwrap()
+        } = decode_ecid_report(&drop_ie(&report(), id)).unwrap()
         else {
             panic!("a missing reject IE {id} must reject the report");
         };
@@ -270,7 +227,7 @@ fn a_missing_measurement_id_rejects_the_report_and_is_reported_missing() {
 
 #[test]
 fn a_missing_measurement_result_is_ignored() {
-    let (id, cells, ei) = accepted(&without_ie(nrppa::ID_E_CID_MEASUREMENT_RESULT));
+    let (id, cells, ei) = accepted(&drop_ie(&report(), nrppa::ID_E_CID_MEASUREMENT_RESULT));
     assert_eq!(id, 3);
     assert!(cells.is_empty(), "nothing to measure from");
     assert!(ei.is_none(), "criticality ignore: no report");

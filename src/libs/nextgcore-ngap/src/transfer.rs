@@ -2130,6 +2130,169 @@ impl PduSessionResourceReleaseCommandTransfer {
     }
 }
 
+// ============================================================================
+// AN-initiated PDU session modification (TS 38.413 §8.2.4; #525)
+// ============================================================================
+
+/// maxnoofQosFlows (TS 38.413 §9.4)
+const MAX_NOOF_QOS_FLOWS: usize = 64;
+
+/// PDUSessionResourceModifyIndicationTransfer (TS 38.413 §9.3.4.20) - built by
+/// the gNB, consumed by the SMF: the NG-RAN's (new) DL N3 endpoint and the QoS
+/// flows it carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PduSessionResourceModifyIndicationTransfer {
+    /// DL QoS Flow per TNL Information (mandatory)
+    pub dl_qos_flow_per_tnl_information: QosFlowPerTnlInformation,
+    /// Additional DL QoS Flow per TNL Information (optional, empty = absent),
+    /// 1..maxnoofMultiConnectivityMinusOne.
+    pub additional_dl_qos_flow_per_tnl_information: Vec<QosFlowPerTnlInformation>,
+}
+
+impl PduSessionResourceModifyIndicationTransfer {
+    pub fn encode(&self) -> NgapResult<Vec<u8>> {
+        let mut encoder = AperEncoder::new();
+        encoder.write_bit(false); // extension
+        encoder.write_bit(!self.additional_dl_qos_flow_per_tnl_information.is_empty());
+        encoder.write_bit(false); // no iE-Extensions
+        self.dl_qos_flow_per_tnl_information.encode(&mut encoder)?;
+        if !self.additional_dl_qos_flow_per_tnl_information.is_empty() {
+            encode_qos_flow_per_tnl_information_list(
+                &mut encoder,
+                &self.additional_dl_qos_flow_per_tnl_information,
+            )?;
+        }
+        encoder.align();
+        Ok(encoder.into_bytes().to_vec())
+    }
+
+    pub fn decode(data: &[u8]) -> NgapResult<Self> {
+        let mut decoder = AperDecoder::new(data);
+        let ext = decoder.read_bit()?;
+        let additional_present = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
+        let dl_qos_flow_per_tnl_information = QosFlowPerTnlInformation::decode(&mut decoder)?;
+        let additional_dl_qos_flow_per_tnl_information = if additional_present {
+            decode_qos_flow_per_tnl_information_list(&mut decoder)?
+        } else {
+            Vec::new()
+        };
+        finish_extensible_sequence(&mut decoder, ext, ie_ext)?;
+        Ok(Self {
+            dl_qos_flow_per_tnl_information,
+            additional_dl_qos_flow_per_tnl_information,
+        })
+    }
+}
+
+/// PDUSessionResourceModifyConfirmTransfer (TS 38.413 §9.3.4.19) - built by the
+/// SMF, consumed by the gNB: the QoS flows the core confirms, the UPF's UL N3
+/// endpoint, and the flows it could not modify. `additionalNG-UUPTNLInformation`
+/// is never sent (this SMF allocates no additional UL tunnels).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PduSessionResourceModifyConfirmTransfer {
+    /// QoS Flow Modify Confirm List (mandatory, 1..maxnoofQosFlows): QFIs.
+    pub qos_flow_modify_confirm_list: Vec<u8>,
+    /// UL NG-U UP TNL Information (mandatory)
+    pub ul_ngu_up_tnl_information: UpTransportLayerInformation,
+    /// QoS Flow Failed To Modify List (optional, empty = absent)
+    pub qos_flow_failed_to_modify_list: Vec<QosFlowWithCauseItem>,
+}
+
+impl PduSessionResourceModifyConfirmTransfer {
+    pub fn encode(&self) -> NgapResult<Vec<u8>> {
+        let flows = &self.qos_flow_modify_confirm_list;
+        if flows.is_empty() || flows.len() > MAX_NOOF_QOS_FLOWS {
+            return Err(invalid(
+                "QosFlowModifyConfirmList",
+                format!("{} items, outside 1..{MAX_NOOF_QOS_FLOWS}", flows.len()),
+            ));
+        }
+        let mut encoder = AperEncoder::new();
+        encoder.write_bit(false); // extension
+        encoder.write_bit(false); // additionalNG-UUPTNLInformation absent
+        encoder.write_bit(!self.qos_flow_failed_to_modify_list.is_empty());
+        encoder.write_bit(false); // no iE-Extensions
+        encoder.encode_constrained_length(flows.len(), 1, MAX_NOOF_QOS_FLOWS)?;
+        for &qfi in flows {
+            // QosFlowModifyConfirmItem ::= SEQUENCE { qosFlowIdentifier,
+            // iE-Extensions OPTIONAL, ... }
+            encoder.write_bit(false); // extension
+            encoder.write_bit(false); // no iE-Extensions
+            encode_qfi(&mut encoder, qfi)?;
+        }
+        self.ul_ngu_up_tnl_information.encode(&mut encoder)?;
+        if !self.qos_flow_failed_to_modify_list.is_empty() {
+            encode_qos_flow_with_cause_list(&mut encoder, &self.qos_flow_failed_to_modify_list)?;
+        }
+        encoder.align();
+        Ok(encoder.into_bytes().to_vec())
+    }
+
+    pub fn decode(data: &[u8]) -> NgapResult<Self> {
+        let mut decoder = AperDecoder::new(data);
+        let ext = decoder.read_bit()?;
+        let additional_present = decoder.read_bit()?;
+        let failed_present = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
+        let count = decoder.decode_constrained_length(1, MAX_NOOF_QOS_FLOWS)?;
+        let mut qos_flow_modify_confirm_list = Vec::with_capacity(count);
+        for _ in 0..count {
+            let item_ext = decoder.read_bit()?;
+            let item_ie_ext = decoder.read_bit()?;
+            qos_flow_modify_confirm_list.push(decode_qfi(&mut decoder)?);
+            finish_extensible_sequence(&mut decoder, item_ext, item_ie_ext)?;
+        }
+        let ul_ngu_up_tnl_information = UpTransportLayerInformation::decode(&mut decoder)?;
+        if additional_present {
+            return Err(invalid(
+                "PDUSessionResourceModifyConfirmTransfer",
+                "additionalNG-UUPTNLInformation is not supported".to_string(),
+            ));
+        }
+        let qos_flow_failed_to_modify_list = if failed_present {
+            decode_qos_flow_with_cause_list(&mut decoder)?
+        } else {
+            Vec::new()
+        };
+        finish_extensible_sequence(&mut decoder, ext, ie_ext)?;
+        Ok(Self {
+            qos_flow_modify_confirm_list,
+            ul_ngu_up_tnl_information,
+            qos_flow_failed_to_modify_list,
+        })
+    }
+}
+
+/// PDUSessionResourceModifyIndicationUnsuccessfulTransfer (TS 38.413
+/// §9.3.4.21) - built by the SMF when it cannot carry out an AN-initiated
+/// modification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PduSessionResourceModifyIndicationUnsuccessfulTransfer {
+    /// Cause (mandatory)
+    pub cause: Cause,
+}
+
+impl PduSessionResourceModifyIndicationUnsuccessfulTransfer {
+    pub fn encode(&self) -> NgapResult<Vec<u8>> {
+        let mut encoder = AperEncoder::new();
+        encoder.write_bit(false); // extension
+        encoder.write_bit(false); // no iE-Extensions
+        self.cause.encode_aper(&mut encoder)?;
+        encoder.align();
+        Ok(encoder.into_bytes().to_vec())
+    }
+
+    pub fn decode(data: &[u8]) -> NgapResult<Self> {
+        let mut decoder = AperDecoder::new(data);
+        let ext = decoder.read_bit()?;
+        let ie_ext = decoder.read_bit()?;
+        let cause = Cause::decode_aper(&mut decoder)?;
+        finish_extensible_sequence(&mut decoder, ext, ie_ext)?;
+        Ok(Self { cause })
+    }
+}
+
 /// PDUSessionResourceReleaseResponseTransfer - built by gNB, consumed by SMF
 ///
 /// The Rel-15 type carries only optional iE-Extensions, so the structure is
