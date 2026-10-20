@@ -225,6 +225,11 @@ pub struct SgwcSess {
     pub session: SessionConfig,
     /// PDN Address Allocation
     pub paa: Paa,
+    /// The PAA the MME's S11 Create Session Request carried (#491). A REQUEST,
+    /// never applied to `paa` (#52 criterion 5: only the PGW allocates), but relayed
+    /// on S5/S8, where TS 29.274 Table 7.2.1-1 requires a PAA for an E-UTRAN initial
+    /// attach.
+    pub requested_paa: Option<nextgcore_gtp::v2::Gtp2PaaIe>,
     /// APN-AMBR uplink (bps, TS 29.274 Section 8.7)
     pub ambr_ul: u32,
     /// APN-AMBR downlink (bps)
@@ -255,6 +260,7 @@ impl SgwcSess {
             pgw_addr: None,
             session: SessionConfig::default(),
             paa: Paa::default(),
+            requested_paa: None,
             ambr_ul: 0,
             ambr_dl: 0,
             bearer_ids: Vec::new(),
