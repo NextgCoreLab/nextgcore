@@ -196,6 +196,75 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
             Class2Decode::Undecodable => {}
         }
     }
+    // Initial Context Setup responses are decoded with the generated codec
+    // (#514 stage 4). They are response messages: §10.3.4.2 handles a `reject`
+    // IE locally (nothing sent) and reports `notify` IEs in an ERROR INDICATION.
+    for successful in [true, false] {
+        if !crate::s1ap_gen::is_outcome(
+            data,
+            successful,
+            crate::s1ap_gen::PROC_INITIAL_CONTEXT_SETUP,
+        ) {
+            continue;
+        }
+        use crate::s1ap_gen::ResponseDecode;
+        let trigger = if successful {
+            nextgcore_s1ap::triggering_message::SUCCESSFUL_OUTCOME
+        } else {
+            nextgcore_s1ap::triggering_message::UNSUCCESSFUL_OUTCOME
+        };
+        let report = |mme: u32, enb: u32, notify: &[crate::s1ap_gen::DiagnosedIe]| {
+            if notify.is_empty() {
+                return Vec::new();
+            }
+            error_indication_with_diagnostics(
+                enb_id,
+                Some(enb),
+                Some(mme),
+                S1apCauseGroup::Protocol,
+                protocol_cause::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+                Some(crate::s1ap_gen::error_indication_diagnostics_for(
+                    crate::s1ap_gen::PROC_INITIAL_CONTEXT_SETUP,
+                    trigger,
+                    0,
+                    notify,
+                )),
+            )
+        };
+        if successful {
+            match crate::s1ap_gen::decode_initial_context_setup_response(data) {
+                ResponseDecode::Decoded { msg, notify } => {
+                    let out = report(msg.mme_ue_s1ap_id, msg.enb_ue_s1ap_id, &notify);
+                    handle_initial_context_setup_response(ctx, enb_id, &msg);
+                    return out;
+                }
+                ResponseDecode::Failed(ies) => {
+                    log::error!(
+                        "Initial Context Setup Response from eNB {enb_id} carries a reject IE \
+                         (TS 36.413 §10.3.4.2); procedure unsuccessfully terminated: {ies:?}"
+                    );
+                    return Vec::new();
+                }
+                ResponseDecode::Undecodable => {}
+            }
+        } else {
+            match crate::s1ap_gen::decode_initial_context_setup_failure(data) {
+                ResponseDecode::Decoded { msg, notify } => {
+                    let mut out = report(msg.mme_ue_s1ap_id, msg.enb_ue_s1ap_id, &notify);
+                    out.extend(handle_initial_context_setup_failure(ctx, enb_id, &msg));
+                    return out;
+                }
+                ResponseDecode::Failed(ies) => {
+                    log::error!(
+                        "Initial Context Setup Failure from eNB {enb_id} carries a reject IE \
+                         (TS 36.413 §10.3.4.2); handled locally: {ies:?}"
+                    );
+                    return Vec::new();
+                }
+                ResponseDecode::Undecodable => {}
+            }
+        }
+    }
     if crate::s1ap_gen::is_initiating(data, crate::s1ap_gen::PROC_UPLINK_NAS_TRANSPORT) {
         use crate::s1ap_gen::Class2Decode;
         match crate::s1ap_gen::decode_uplink_nas_transport(data) {

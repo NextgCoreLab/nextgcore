@@ -9,7 +9,8 @@
 //! decode, with §10.3.4 / §10.3.5 handling, and the S1 SETUP RESPONSE / S1
 //! SETUP FAILURE encodes. Stage 3 is NAS transport (§8.6.2): the INITIAL UE
 //! MESSAGE and UPLINK NAS TRANSPORT decodes and the DOWNLINK NAS TRANSPORT
-//! encode.
+//! encode. Stage 4 is Initial Context Setup (§8.3.1): the INITIAL CONTEXT SETUP
+//! REQUEST encode and the RESPONSE / FAILURE decodes.
 
 use bitvec::prelude::{BitVec, Msb0};
 use nextgcore_s1ap::{
@@ -684,10 +685,26 @@ pub fn error_indication_diagnostics(
     procedure_code: u8,
     ies: &[DiagnosedIe],
 ) -> nextgcore_s1ap::CriticalityDiagnostics {
+    error_indication_diagnostics_for(
+        procedure_code,
+        nextgcore_s1ap::triggering_message::INITIATING_MESSAGE,
+        IGNORE,
+        ies,
+    )
+}
+
+/// [`error_indication_diagnostics`] for any triggering message and procedure
+/// criticality.
+pub fn error_indication_diagnostics_for(
+    procedure_code: u8,
+    triggering_message: u8,
+    procedure_criticality: u8,
+    ies: &[DiagnosedIe],
+) -> nextgcore_s1ap::CriticalityDiagnostics {
     nextgcore_s1ap::CriticalityDiagnostics {
         procedure_code: Some(procedure_code),
-        triggering_message: Some(nextgcore_s1ap::triggering_message::INITIATING_MESSAGE),
-        procedure_criticality: Some(IGNORE),
+        triggering_message: Some(triggering_message),
+        procedure_criticality: Some(procedure_criticality),
         ies: ies
             .iter()
             .take(256)
@@ -746,8 +763,289 @@ pub fn is_initiating(bytes: &[u8], procedure_code: u8) -> bool {
     bytes.len() >= 2 && bytes[0] == 0x00 && bytes[1] == procedure_code
 }
 
+// ============================================================================
+// Initial Context Setup (TS 36.413 §8.3.1) -- stage 4
+// ============================================================================
+
+/// `id-InitialContextSetup`.
+pub const PROC_INITIAL_CONTEXT_SETUP: u8 = 9;
+
+const ID_UE_AMBR: u16 = 66;
+const ID_ERAB_TO_BE_SETUP_LIST_CTXT_SU_REQ: u16 = 24;
+const ID_ERAB_TO_BE_SETUP_ITEM_CTXT_SU_REQ: u16 = 52;
+const ID_UE_SECURITY_CAPABILITIES: u16 = 107;
+const ID_SECURITY_KEY: u16 = 73;
+
+fn bytes_to_bits(bytes: &[u8]) -> BitVec<u8, Msb0> {
+    BitVec::from_slice(bytes)
+}
+
+fn bits_to_bytes(bits: &BitVec<u8, Msb0>) -> Vec<u8> {
+    bits.clone().into_vec()
+}
+
+/// Encode an INITIAL CONTEXT SETUP REQUEST (TS 36.413 §9.1.4.1) with the
+/// generated codec. IE order follows `InitialContextSetupRequestIEs`, every IE
+/// criticality reject; each E-RAB item is criticality reject.
+pub fn build_initial_context_setup_request(
+    req: &nextgcore_s1ap::InitialContextSetupRequest,
+) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    use g::InitialContextSetupRequestProtocolIEs_EntryValue as V;
+    let ie = |id: u16, value: V| g::InitialContextSetupRequestProtocolIEs_Entry {
+        id: g::ProtocolIE_ID(id),
+        criticality: g::Criticality(REJECT),
+        value,
+    };
+    let erabs = req
+        .erab_list
+        .iter()
+        .map(|e| g::E_RABToBeSetupListCtxtSUReq_Entry {
+            id: g::ProtocolIE_ID(ID_ERAB_TO_BE_SETUP_ITEM_CTXT_SU_REQ),
+            criticality: g::Criticality(REJECT),
+            value: g::E_RABToBeSetupListCtxtSUReq_EntryValue::Id_E_RABToBeSetupItemCtxtSUReq(
+                g::E_RABToBeSetupItemCtxtSUReq {
+                    e_rab_id: g::E_RAB_ID(e.erab_id),
+                    e_ra_blevel_qo_s_parameters: g::E_RABLevelQoSParameters {
+                        qci: g::QCI(e.erab_qos.qci),
+                        allocation_retention_priority: g::AllocationAndRetentionPriority {
+                            priority_level: g::PriorityLevel(e.erab_qos.arp.priority_level),
+                            pre_emption_capability: g::Pre_emptionCapability(u8::from(
+                                e.erab_qos.arp.pre_emption_capability,
+                            )),
+                            pre_emption_vulnerability: g::Pre_emptionVulnerability(u8::from(
+                                e.erab_qos.arp.pre_emption_vulnerability,
+                            )),
+                            ie_extensions: None,
+                        },
+                        gbr_qos_information: e.erab_qos.gbr_qos_info.as_ref().map(|gbr| {
+                            g::GBR_QosInformation {
+                                e_rab_maximum_bitrate_dl: g::BitRate(gbr.erab_max_bitrate_dl),
+                                e_rab_maximum_bitrate_ul: g::BitRate(gbr.erab_max_bitrate_ul),
+                                e_rab_guaranteed_bitrate_dl: g::BitRate(
+                                    gbr.erab_guaranteed_bitrate_dl,
+                                ),
+                                e_rab_guaranteed_bitrate_ul: g::BitRate(
+                                    gbr.erab_guaranteed_bitrate_ul,
+                                ),
+                                ie_extensions: None,
+                            }
+                        }),
+                        ie_extensions: None,
+                    },
+                    transport_layer_address: g::TransportLayerAddress(bytes_to_bits(
+                        &e.transport_layer_address,
+                    )),
+                    gtp_teid: g::GTP_TEID(e.gtp_teid.to_be_bytes().to_vec()),
+                    nas_pdu: e.nas_pdu.as_ref().map(|n| g::NAS_PDU(n.clone())),
+                    ie_extensions: None,
+                },
+            ),
+        })
+        .collect();
+    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+        procedure_code: g::ProcedureCode(PROC_INITIAL_CONTEXT_SETUP),
+        criticality: g::Criticality(REJECT),
+        value: g::InitiatingMessageValue::Id_InitialContextSetup(g::InitialContextSetupRequest {
+            protocol_i_es: g::InitialContextSetupRequestProtocolIEs(vec![
+                ie(
+                    ID_MME_UE_S1AP_ID,
+                    V::Id_MME_UE_S1AP_ID(g::MME_UE_S1AP_ID(req.mme_ue_s1ap_id)),
+                ),
+                ie(
+                    ID_ENB_UE_S1AP_ID,
+                    V::Id_eNB_UE_S1AP_ID(g::ENB_UE_S1AP_ID(req.enb_ue_s1ap_id)),
+                ),
+                ie(
+                    ID_UE_AMBR,
+                    V::Id_uEaggregateMaximumBitrate(g::UEAggregateMaximumBitrate {
+                        u_eaggregate_maximum_bit_rate_dl: g::BitRate(req.ue_ambr.dl),
+                        u_eaggregate_maximum_bit_rate_ul: g::BitRate(req.ue_ambr.ul),
+                        ie_extensions: None,
+                    }),
+                ),
+                ie(
+                    ID_ERAB_TO_BE_SETUP_LIST_CTXT_SU_REQ,
+                    V::Id_E_RABToBeSetupListCtxtSUReq(g::E_RABToBeSetupListCtxtSUReq(erabs)),
+                ),
+                ie(
+                    ID_UE_SECURITY_CAPABILITIES,
+                    V::Id_UESecurityCapabilities(g::UESecurityCapabilities {
+                        encryption_algorithms: g::EncryptionAlgorithms(bytes_to_bits(
+                            &req.ue_security_capabilities
+                                .encryption_algorithms
+                                .to_be_bytes(),
+                        )),
+                        integrity_protection_algorithms: g::IntegrityProtectionAlgorithms(
+                            bytes_to_bits(
+                                &req.ue_security_capabilities
+                                    .integrity_algorithms
+                                    .to_be_bytes(),
+                            ),
+                        ),
+                        ie_extensions: None,
+                    }),
+                ),
+                ie(
+                    ID_SECURITY_KEY,
+                    V::Id_SecurityKey(g::SecurityKey(bytes_to_bits(&req.security_key))),
+                ),
+            ]),
+        }),
+    }))
+}
+
+/// The hand-written `Cause` for a generated one, through the old parser's own
+/// mapping (`nextgcore_s1ap::ie::decode_cause_aper`), so values outside the
+/// hand-written enums fall back exactly as before.
+fn hand_written_cause(cause: &g::Cause) -> Option<Cause> {
+    use asn1_codecs::aper::AperCodec;
+    let mut data = asn1_codecs::PerCodecData::new_aper();
+    cause.aper_encode(&mut data).ok()?;
+    nextgcore_s1ap::ie::decode_cause_aper(&data.into_bytes()).ok()
+}
+
+/// Outcome of decoding a response message (TS 36.413 §10.3.4.2 / §10.3.5).
+#[derive(Debug, Clone)]
+pub enum ResponseDecode<T> {
+    /// Act on the response; report `notify` IEs in an ERROR INDICATION.
+    Decoded {
+        /// The response.
+        msg: T,
+        /// IEs to report.
+        notify: Vec<DiagnosedIe>,
+    },
+    /// An unknown `reject` IE: the procedure is unsuccessfully terminated and
+    /// handled locally; nothing is sent.
+    Failed(Vec<DiagnosedIe>),
+    /// Not decodable, or the UE it concerns cannot be identified.
+    Undecodable,
+}
+
+/// Decode an INITIAL CONTEXT SETUP RESPONSE (TS 36.413 §9.1.4.2). Every IE is
+/// criticality ignore, so a missing one is ignored; a response that names no
+/// MME-UE-S1AP-ID concerns no UE we can find, and is `Undecodable`.
+pub fn decode_initial_context_setup_response(
+    bytes: &[u8],
+) -> ResponseDecode<nextgcore_s1ap::InitialContextSetupResponse> {
+    let Ok((pdu, unknown)) = nextgcore_s1ap_gen::decode_with_unknown_ies(bytes) else {
+        return ResponseDecode::Undecodable;
+    };
+    let g::S1AP_PDU::SuccessfulOutcome(msg) = pdu else {
+        return ResponseDecode::Undecodable;
+    };
+    let g::SuccessfulOutcomeValue::Id_InitialContextSetup(rsp) = msg.value else {
+        return ResponseDecode::Undecodable;
+    };
+    let (reject, notify) = classify_unknown(&unknown);
+    if !reject.is_empty() {
+        return ResponseDecode::Failed(reject);
+    }
+    let (mut mme, mut enb, mut setup, mut failed) = (None, 0, Vec::new(), Vec::new());
+    use g::InitialContextSetupResponseProtocolIEs_EntryValue as V;
+    for ie in rsp.protocol_i_es.0 {
+        match ie.value {
+            V::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
+            V::Id_eNB_UE_S1AP_ID(v) => enb = v.0,
+            V::Id_E_RABSetupListCtxtSURes(list) => {
+                for entry in list.0 {
+                    let g::E_RABSetupListCtxtSURes_EntryValue::Id_E_RABSetupItemCtxtSURes(item) =
+                        entry.value;
+                    let Ok(teid) = <[u8; 4]>::try_from(item.gtp_teid.0.as_slice()) else {
+                        return ResponseDecode::Undecodable;
+                    };
+                    setup.push(nextgcore_s1ap::ErabSetupItem {
+                        erab_id: item.e_rab_id.0,
+                        transport_layer_address: bits_to_bytes(&item.transport_layer_address.0),
+                        gtp_teid: u32::from_be_bytes(teid),
+                    });
+                }
+            }
+            V::Id_E_RABFailedToSetupListCtxtSURes(list) => {
+                for entry in list.0 {
+                    let g::E_RABList_EntryValue::Id_E_RABItem(item) = entry.value;
+                    let Some(cause) = hand_written_cause(&item.cause) else {
+                        return ResponseDecode::Undecodable;
+                    };
+                    failed.push(nextgcore_s1ap::ErabFailedItem {
+                        erab_id: item.e_rab_id.0,
+                        cause,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(mme_ue_s1ap_id) = mme else {
+        return ResponseDecode::Undecodable;
+    };
+    ResponseDecode::Decoded {
+        msg: nextgcore_s1ap::InitialContextSetupResponse {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id: enb,
+            erab_setup_list: setup,
+            erab_failed_list: failed,
+        },
+        notify,
+    }
+}
+
+/// Decode an INITIAL CONTEXT SETUP FAILURE (TS 36.413 §9.1.4.3), with the same
+/// rules as [`decode_initial_context_setup_response`]. A missing Cause
+/// (criticality ignore) is read as radioNetwork / unspecified.
+pub fn decode_initial_context_setup_failure(
+    bytes: &[u8],
+) -> ResponseDecode<nextgcore_s1ap::InitialContextSetupFailure> {
+    let Ok((pdu, unknown)) = nextgcore_s1ap_gen::decode_with_unknown_ies(bytes) else {
+        return ResponseDecode::Undecodable;
+    };
+    let g::S1AP_PDU::UnsuccessfulOutcome(msg) = pdu else {
+        return ResponseDecode::Undecodable;
+    };
+    let g::UnsuccessfulOutcomeValue::Id_InitialContextSetup(f) = msg.value else {
+        return ResponseDecode::Undecodable;
+    };
+    let (reject, notify) = classify_unknown(&unknown);
+    if !reject.is_empty() {
+        return ResponseDecode::Failed(reject);
+    }
+    let (mut mme, mut enb, mut cause) = (None, 0, None);
+    use g::InitialContextSetupFailureProtocolIEs_EntryValue as V;
+    for ie in f.protocol_i_es.0 {
+        match ie.value {
+            V::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
+            V::Id_eNB_UE_S1AP_ID(v) => enb = v.0,
+            V::Id_Cause(c) => cause = hand_written_cause(&c),
+            _ => {}
+        }
+    }
+    let Some(mme_ue_s1ap_id) = mme else {
+        return ResponseDecode::Undecodable;
+    };
+    ResponseDecode::Decoded {
+        msg: nextgcore_s1ap::InitialContextSetupFailure {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id: enb,
+            cause: cause.unwrap_or(Cause::RadioNetwork(
+                nextgcore_s1ap::CauseRadioNetwork::Unspecified,
+            )),
+        },
+        notify,
+    }
+}
+
+/// Whether `bytes` is a successful (`0x20`) or unsuccessful (`0x40`) outcome of
+/// `procedure_code`: the CHOICE index sits in bits 7..6 after the extension bit.
+pub fn is_outcome(bytes: &[u8], successful: bool, procedure_code: u8) -> bool {
+    bytes.len() >= 2
+        && bytes[0] == if successful { 0x20 } else { 0x40 }
+        && bytes[1] == procedure_code
+}
+
 #[cfg(test)]
 mod tests;
 
 #[cfg(test)]
 mod nas_tests;
+
+#[cfg(test)]
+mod ics_tests;
