@@ -601,13 +601,15 @@ pub fn build_paging(
         UePagingId::Imsi(imsi_bcd_to_tbcd(&mme_ue.imsi_bcd))
     };
 
-    builder::build_paging(&Paging {
+    // Generated codec (#514 stage 7).
+    crate::s1ap_gen::build_paging(&Paging {
         ue_identity_index: ue_identity_index_from_imsi(&mme_ue.imsi_bcd),
         ue_paging_id,
         paging_drx,
         cn_domain,
         tai_list: tai_list.iter().map(tai_to_s1ap).collect(),
     })
+    .map_err(gen_err)
 }
 
 // ============================================================================
