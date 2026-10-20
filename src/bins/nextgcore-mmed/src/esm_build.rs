@@ -12,6 +12,16 @@ use crate::emm_build::{NasBuffer, SecurityHeaderType, NAS_PROTOCOL_DISCRIMINATOR
 /// NAS Protocol Discriminator for ESM
 pub const NAS_PROTOCOL_DISCRIMINATOR_ESM: u8 = 0x02;
 
+/// Octet 1 of an ESM message: the EPS bearer identity in bits 8-5 and the
+/// protocol discriminator in bits 4-1 (TS 24.301 §9.3.1, TS 24.007 §11.2.3.1.5).
+///
+/// One octet, not two: writing the EBI and the PD as separate octets (#496)
+/// shifted every ESM message mmed sent by one octet, so a conformant UE read
+/// PD 5 and refused it.
+pub fn esm_header_octet(ebi: u8) -> u8 {
+    ((ebi & 0x0f) << 4) | NAS_PROTOCOL_DISCRIMINATOR_ESM
+}
+
 /// Procedure Transaction Identity - Unassigned
 pub const PTI_UNASSIGNED: u8 = 0;
 
@@ -496,8 +506,7 @@ pub fn build_pdn_connectivity_reject_with_params(
     }
 
     // ESM header
-    buf.write_u8(0); // EPS bearer identity (0 for this message)
-    buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_ESM);
+    buf.write_u8(esm_header_octet(0)); // octet 1: EBI | PD (TS 24.301 §9.3.1)
     buf.write_u8(pti);
     buf.write_u8(EsmMessageType::PdnConnectivityReject as u8);
 
@@ -529,8 +538,7 @@ pub fn build_esm_information_request(pti: u8) -> Vec<u8> {
     buf.write_u8(0); // Sequence number placeholder
 
     // ESM header
-    buf.write_u8(0); // EPS bearer identity
-    buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_ESM);
+    buf.write_u8(esm_header_octet(0)); // octet 1: EBI | PD (TS 24.301 §9.3.1)
     buf.write_u8(pti);
     buf.write_u8(EsmMessageType::EsmInformationRequest as u8);
 
@@ -556,8 +564,7 @@ pub fn build_activate_default_bearer_context_request_with_params(
     }
 
     // ESM header
-    buf.write_u8(bearer.ebi); // EPS bearer identity
-    buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_ESM);
+    buf.write_u8(esm_header_octet(bearer.ebi)); // octet 1: EBI | PD (TS 24.301 §9.3.1)
     buf.write_u8(sess.pti);
     buf.write_u8(EsmMessageType::ActivateDefaultEpsBearerContextRequest as u8);
 
@@ -677,8 +684,7 @@ pub fn build_activate_dedicated_bearer_context_request_with_params(
     buf.write_u8(0); // Sequence number placeholder
 
     // ESM header
-    buf.write_u8(bearer.ebi); // EPS bearer identity
-    buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_ESM);
+    buf.write_u8(esm_header_octet(bearer.ebi)); // octet 1: EBI | PD (TS 24.301 §9.3.1)
     buf.write_u8(PTI_UNASSIGNED); // PTI is unassigned for dedicated bearer
     buf.write_u8(EsmMessageType::ActivateDedicatedEpsBearerContextRequest as u8);
 
@@ -729,8 +735,7 @@ pub fn build_modify_bearer_context_request_with_params(
     buf.write_u8(0); // Sequence number placeholder
 
     // ESM header
-    buf.write_u8(bearer.ebi); // EPS bearer identity
-    buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_ESM);
+    buf.write_u8(esm_header_octet(bearer.ebi)); // octet 1: EBI | PD (TS 24.301 §9.3.1)
     buf.write_u8(pti);
     buf.write_u8(EsmMessageType::ModifyEpsBearerContextRequest as u8);
 
@@ -787,8 +792,7 @@ pub fn build_deactivate_bearer_context_request_with_params(
     buf.write_u8(0); // Sequence number placeholder
 
     // ESM header
-    buf.write_u8(ebi); // EPS bearer identity
-    buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_ESM);
+    buf.write_u8(esm_header_octet(ebi)); // octet 1: EBI | PD (TS 24.301 §9.3.1)
     buf.write_u8(pti);
     buf.write_u8(EsmMessageType::DeactivateEpsBearerContextRequest as u8);
 
@@ -816,8 +820,7 @@ pub fn build_bearer_resource_allocation_reject(pti: u8, esm_cause: EsmCause) -> 
     buf.write_u8(0); // Sequence number placeholder
 
     // ESM header
-    buf.write_u8(0); // EPS bearer identity (0 for this message)
-    buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_ESM);
+    buf.write_u8(esm_header_octet(0)); // octet 1: EBI | PD (TS 24.301 §9.3.1)
     buf.write_u8(pti);
     buf.write_u8(EsmMessageType::BearerResourceAllocationReject as u8);
 
@@ -840,8 +843,7 @@ pub fn build_bearer_resource_modification_reject(pti: u8, esm_cause: EsmCause) -
     buf.write_u8(0); // Sequence number placeholder
 
     // ESM header
-    buf.write_u8(0); // EPS bearer identity (0 for this message)
-    buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_ESM);
+    buf.write_u8(esm_header_octet(0)); // octet 1: EBI | PD (TS 24.301 §9.3.1)
     buf.write_u8(pti);
     buf.write_u8(EsmMessageType::BearerResourceModificationReject as u8);
 
@@ -864,8 +866,7 @@ pub fn build_pdn_disconnect_reject(pti: u8, esm_cause: EsmCause) -> Vec<u8> {
     buf.write_u8(0); // Sequence number placeholder
 
     // ESM header
-    buf.write_u8(0); // EPS bearer identity
-    buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_ESM);
+    buf.write_u8(esm_header_octet(0)); // octet 1: EBI | PD (TS 24.301 §9.3.1)
     buf.write_u8(pti);
     buf.write_u8(EsmMessageType::PdnDisconnectReject as u8);
 
@@ -888,8 +889,7 @@ pub fn build_esm_status(ebi: u8, pti: u8, esm_cause: EsmCause) -> Vec<u8> {
     buf.write_u8(0); // Sequence number placeholder
 
     // ESM header
-    buf.write_u8(ebi); // EPS bearer identity
-    buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_ESM);
+    buf.write_u8(esm_header_octet(ebi)); // octet 1: EBI | PD (TS 24.301 §9.3.1)
     buf.write_u8(pti);
     buf.write_u8(EsmMessageType::EsmStatus as u8);
 
@@ -1002,11 +1002,10 @@ mod tests {
         );
 
         // Without security header (in attach request)
-        assert_eq!(msg[0], 0); // EBI
-        assert_eq!(msg[1], NAS_PROTOCOL_DISCRIMINATOR_ESM);
-        assert_eq!(msg[2], 1); // PTI
-        assert_eq!(msg[3], EsmMessageType::PdnConnectivityReject as u8);
-        assert_eq!(msg[4], EsmCause::MissingOrUnknownApn as u8);
+        assert_eq!(msg[0], 0x02); // octet 1: EBI 0 | PD 2, one octet (TS 24.301 §9.3.1)
+        assert_eq!(msg[1], 1); // PTI
+        assert_eq!(msg[2], EsmMessageType::PdnConnectivityReject as u8);
+        assert_eq!(msg[3], EsmCause::MissingOrUnknownApn as u8);
     }
 
     #[test]
@@ -1017,11 +1016,10 @@ mod tests {
         assert!(msg.len() > 6);
         // Check ESM header after security header
         let esm_start = 6; // After security header
-        assert_eq!(msg[esm_start], 0); // EBI
-        assert_eq!(msg[esm_start + 1], NAS_PROTOCOL_DISCRIMINATOR_ESM);
-        assert_eq!(msg[esm_start + 2], 5); // PTI
+        assert_eq!(msg[esm_start], 0x02); // octet 1: EBI 0 | PD 2, one octet (TS 24.301 §9.3.1)
+        assert_eq!(msg[esm_start + 1], 5); // PTI
         assert_eq!(
-            msg[esm_start + 3],
+            msg[esm_start + 2],
             EsmMessageType::EsmInformationRequest as u8
         );
     }
@@ -1037,14 +1035,13 @@ mod tests {
         // With security header
         assert!(msg.len() > 6);
         let esm_start = 6;
-        assert_eq!(msg[esm_start], 5); // EBI
-        assert_eq!(msg[esm_start + 1], NAS_PROTOCOL_DISCRIMINATOR_ESM);
-        assert_eq!(msg[esm_start + 2], 1); // PTI
+        assert_eq!(msg[esm_start], 0x52); // octet 1: EBI 5 | PD 2, one octet (TS 24.301 §9.3.1)
+        assert_eq!(msg[esm_start + 1], 1); // PTI
         assert_eq!(
-            msg[esm_start + 3],
+            msg[esm_start + 2],
             EsmMessageType::DeactivateEpsBearerContextRequest as u8
         );
-        assert_eq!(msg[esm_start + 4], EsmCause::RegularDeactivation as u8);
+        assert_eq!(msg[esm_start + 3], EsmCause::RegularDeactivation as u8);
     }
 
     #[test]
@@ -1055,14 +1052,13 @@ mod tests {
         );
 
         let esm_start = 6;
-        assert_eq!(msg[esm_start], 0); // EBI
-        assert_eq!(msg[esm_start + 1], NAS_PROTOCOL_DISCRIMINATOR_ESM);
-        assert_eq!(msg[esm_start + 2], 3); // PTI
+        assert_eq!(msg[esm_start], 0x02); // octet 1: EBI 0 | PD 2, one octet (TS 24.301 §9.3.1)
+        assert_eq!(msg[esm_start + 1], 3); // PTI
         assert_eq!(
-            msg[esm_start + 3],
+            msg[esm_start + 2],
             EsmMessageType::BearerResourceAllocationReject as u8
         );
-        assert_eq!(msg[esm_start + 4], EsmCause::NetworkFailure as u8);
+        assert_eq!(msg[esm_start + 3], EsmCause::NetworkFailure as u8);
     }
 
     #[test]
@@ -1073,16 +1069,59 @@ mod tests {
         );
 
         let esm_start = 6;
-        assert_eq!(msg[esm_start], 0); // EBI
-        assert_eq!(msg[esm_start + 1], NAS_PROTOCOL_DISCRIMINATOR_ESM);
-        assert_eq!(msg[esm_start + 2], 4); // PTI
+        assert_eq!(msg[esm_start], 0x02); // octet 1: EBI 0 | PD 2, one octet (TS 24.301 §9.3.1)
+        assert_eq!(msg[esm_start + 1], 4); // PTI
         assert_eq!(
-            msg[esm_start + 3],
+            msg[esm_start + 2],
             EsmMessageType::BearerResourceModificationReject as u8
         );
         assert_eq!(
-            msg[esm_start + 4],
+            msg[esm_start + 3],
             EsmCause::ServiceOptionNotSupported as u8
         );
+    }
+
+    /// Golden bytes derived by hand from TS 24.301 rather than from this
+    /// module (#496): octet 1 carries the EPS bearer identity in bits 8-5 and
+    /// PD 2 in bits 4-1, then PTI, then the message type (§9.3.1, §8.3.18,
+    /// §8.3.12). A builder that wrote EBI and PD as two octets fails these.
+    #[test]
+    fn esm_messages_match_hand_derived_ts_24_301_octets() {
+        // PDN CONNECTIVITY REJECT, plain (in ATTACH REQUEST): EBI 0, PTI 1,
+        // type 0xd1, ESM cause #27 = 0x1b.
+        let reject = build_pdn_connectivity_reject_with_params(
+            1,
+            EsmCause::MissingOrUnknownApn,
+            CreateAction::InAttachRequest,
+        );
+        assert_eq!(&reject[..4], &[0x02, 0x01, 0xd1, 0x1b]);
+
+        // DEACTIVATE EPS BEARER CONTEXT REQUEST for EBI 5, PTI 1, cause #36
+        // = 0x24, after the 6-octet security header.
+        let deact = build_deactivate_bearer_context_request_with_params(
+            5,
+            1,
+            EsmCause::RegularDeactivation,
+        );
+        assert_eq!(&deact[6..10], &[0x52, 0x01, 0xcd, 0x24]);
+    }
+
+    /// Cross-decode with nextgcore-nas's independent EPS ESM header codec,
+    /// which packs octet 1 per TS 24.301 §9.3.1 (#496).
+    #[test]
+    fn esm_messages_decode_with_the_independent_eps_header_codec() {
+        use bytes::Bytes;
+        use nextgcore_nas::eps::EpsNasEsmHeader;
+
+        let deact = build_deactivate_bearer_context_request_with_params(
+            5,
+            1,
+            EsmCause::RegularDeactivation,
+        );
+        let mut esm = Bytes::copy_from_slice(&deact[6..]);
+        let hdr = EpsNasEsmHeader::decode(&mut esm).expect("ESM header decodes");
+        assert_eq!(hdr.eps_bearer_identity, 5);
+        assert_eq!(hdr.protocol_discriminator, NAS_PROTOCOL_DISCRIMINATOR_ESM);
+        assert_eq!(hdr.procedure_transaction_identity, 1);
     }
 }
