@@ -22,10 +22,10 @@
 //! ([`build_n2_sm_setup_request_transfer`],
 //! [`parse_n2_sm_setup_response_transfer`]).
 
-use nextgcore_asn1c::ngap::cause::{
+use nextgcore_ngap::types::*;
+use nextgcore_ngap::types::{
     Cause, CauseMisc, CauseNas, CauseProtocol, CauseRadioNetwork, CauseTransport,
 };
-use nextgcore_ngap::types::*;
 // Only the hand-written oracles the tests compare the generated codec with:
 // since #417's Overload stage no production builder here is hand-written.
 #[cfg(test)]
@@ -4037,13 +4037,9 @@ pub fn hand_written_diagnostics(report: &CriticalityErrorIndication) -> Critical
             .iter()
             .map(|ie| IeCriticalityDiagnostics {
                 ie_criticality: match ie.criticality {
-                    ngap_gen::Criticality::REJECT => {
-                        nextgcore_asn1c::ngap::types::Criticality::Reject
-                    }
-                    ngap_gen::Criticality::IGNORE => {
-                        nextgcore_asn1c::ngap::types::Criticality::Ignore
-                    }
-                    _ => nextgcore_asn1c::ngap::types::Criticality::Notify,
+                    ngap_gen::Criticality::REJECT => nextgcore_ngap::types::Criticality::Reject,
+                    ngap_gen::Criticality::IGNORE => nextgcore_ngap::types::Criticality::Ignore,
+                    _ => nextgcore_ngap::types::Criticality::Notify,
                 },
                 ie_id: ie.ie_id,
                 type_of_error: if ie.type_of_error == ngap_gen::TypeOfError::MISSING {
@@ -4102,9 +4098,11 @@ pub fn decode_handover_required_asn1(data: &[u8]) -> NasTransportDecode<Handover
                     return NasTransportDecode::Undecodable;
                 }
             },
-            Ie::Id_DirectForwardingPathAvailability(_) => direct = Some(
-                nextgcore_asn1c::ngap::ies::DirectForwardingPathAvailability::DirectPathAvailable,
-            ),
+            Ie::Id_DirectForwardingPathAvailability(_) => {
+                direct = Some(
+                    nextgcore_ngap::types::DirectForwardingPathAvailability::DirectPathAvailable,
+                )
+            }
             Ie::Id_PDUSessionResourceListHORqd(v) => {
                 sessions = Some(
                     v.0.iter()
@@ -13794,7 +13792,7 @@ mod handover_required_tests {
                 .collect(),
             source_to_target_container: vec![0xAB; 5],
             direct_forwarding_path_availability: direct.then_some(
-                nextgcore_asn1c::ngap::ies::DirectForwardingPathAvailability::DirectPathAvailable,
+                nextgcore_ngap::types::DirectForwardingPathAvailability::DirectPathAvailable,
             ),
         }
     }
@@ -13998,7 +13996,7 @@ mod handover_required_tests {
         );
         assert_eq!(
             hand_written_diagnostics(&report).ies[0].ie_criticality,
-            nextgcore_asn1c::ngap::types::Criticality::Notify
+            nextgcore_ngap::types::Criticality::Notify
         );
         // reject: rejected, naming the IE and both UE ids.
         let NasTransportDecode::Reject(report) =
@@ -14012,7 +14010,7 @@ mod handover_required_tests {
         assert_eq!(diag.ies[0].ie_id, 9999);
         assert_eq!(
             diag.ies[0].ie_criticality,
-            nextgcore_asn1c::ngap::types::Criticality::Reject
+            nextgcore_ngap::types::Criticality::Reject
         );
         assert_eq!(diag.ies[0].type_of_error, TypeOfError::NotUnderstood);
         assert_eq!(diag.procedure_code, Some(ngap_gen::ID_HANDOVER_PREPARATION));
@@ -14833,7 +14831,7 @@ mod path_switch_tests {
                         triggering_message: None,
                         procedure_criticality: None,
                         ies: vec![IeCriticalityDiagnostics {
-                            ie_criticality: nextgcore_asn1c::ngap::types::Criticality::Reject,
+                            ie_criticality: nextgcore_ngap::types::Criticality::Reject,
                             ie_id: 9999,
                             type_of_error: TypeOfError::NotUnderstood,
                         }],
@@ -15053,7 +15051,7 @@ mod ran_configuration_update_tests {
                     triggering_message: None,
                     procedure_criticality: None,
                     ies: vec![IeCriticalityDiagnostics {
-                        ie_criticality: nextgcore_asn1c::ngap::types::Criticality::Notify,
+                        ie_criticality: nextgcore_ngap::types::Criticality::Notify,
                         ie_id: 9999,
                         type_of_error: TypeOfError::NotUnderstood,
                     }],
@@ -15093,8 +15091,7 @@ mod ran_configuration_update_tests {
                                 triggering_message: None,
                                 procedure_criticality: None,
                                 ies: vec![IeCriticalityDiagnostics {
-                                    ie_criticality:
-                                        nextgcore_asn1c::ngap::types::Criticality::Reject,
+                                    ie_criticality: nextgcore_ngap::types::Criticality::Reject,
                                     ie_id: 9999,
                                     type_of_error: TypeOfError::NotUnderstood,
                                 }],

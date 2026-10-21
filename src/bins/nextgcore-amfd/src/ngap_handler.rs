@@ -768,7 +768,7 @@ mod tests {
 
     #[test]
     fn test_handle_ng_reset_full_interface_releases_all_gnb_ues() {
-        use nextgcore_asn1c::ngap::cause::{Cause, CauseMisc};
+        use nextgcore_ngap::types::{Cause, CauseMisc};
 
         let gnb_pool_id = 987_001u64;
         let ctx = crate::context::amf_self();
@@ -794,7 +794,7 @@ mod tests {
 
     #[test]
     fn test_handle_ng_reset_partial_releases_listed_ues_only() {
-        use nextgcore_asn1c::ngap::cause::{Cause, CauseRadioNetwork};
+        use nextgcore_ngap::types::{Cause, CauseRadioNetwork};
 
         let gnb_pool_id = 987_002u64;
         let ctx = crate::context::amf_self();
