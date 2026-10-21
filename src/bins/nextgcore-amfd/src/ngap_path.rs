@@ -820,6 +820,20 @@ impl NgapServer {
             backend.label()
         );
 
+        // What `new` needs from the AMF context, read under ONE guard that is dropped
+        // at the end of this statement (#645). A guard taken inside the struct
+        // expression below would be a temporary of it, alive until the whole
+        // expression ends; a second `read()` there is a recursive read, which
+        // deadlocks as soon as a writer queues between the two.
+        //
+        // The reachability timers derive from the CONFIGURED T3512
+        // (`amf.time.t3512.value`), per TS 24.501 §5.3.7.
+        let (ue_auth_state, t3512_secs) = {
+            let handle = crate::context::amf_self();
+            let ctx = handle.read().unwrap_or_else(|e| e.into_inner());
+            (ctx.ue_store(), ctx.t3512_value)
+        };
+
         Ok(Self {
             transport,
             bind_addr: local_addr,
@@ -830,10 +844,7 @@ impl NgapServer {
             forced_amf_ue_ngap_id: None,
             event_tx,
             server_event_rx,
-            ue_auth_state: crate::context::amf_self()
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .ue_store(),
+            ue_auth_state,
             sm_context_refs: HashMap::new(),
             handover_target_assoc: HashMap::new(),
             handover_target_transfers: HashMap::new(),
@@ -844,10 +855,6 @@ impl NgapServer {
                 // Reachability timers derive from the CONFIGURED T3512
                 // (`amf.time.t3512.value`), per TS 24.501 §5.3.7, with
                 // AMF_MOBILE_REACHABLE_SECS / AMF_IMPLICIT_DEREG_SECS as overrides.
-                let t3512_secs = crate::context::amf_self()
-                    .read()
-                    .map(|ctx| ctx.t3512_value)
-                    .unwrap_or(540);
                 let configs = AmfTimerConfigs::default().with_reachability_from(t3512_secs);
                 #[cfg(feature = "ntn")]
                 let configs = {
@@ -15718,6 +15725,51 @@ mod tests {
         NgapServer::new("127.0.0.1:0".parse().unwrap(), SctpBackend::Userspace, etx)
             .await
             .expect("NGAP test server")
+    }
+
+    /// #645: building an NgapServer must never take the AMF context lock while it
+    /// already holds it. `new` used to keep the `ue_store()` read guard alive as a
+    /// temporary of its struct expression and then read the context again for T3512.
+    /// `std::sync::RwLock` queues new readers behind a waiting writer, so a writer
+    /// arriving in between deadlocked the AMF. A thread looping on `write()` makes that
+    /// window near certain; every build must still finish.
+    #[test]
+    fn building_an_ngap_server_completes_while_a_writer_contends_for_the_context() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        crate::context::amf_context_init(64, 1024, 4096);
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    drop(crate::context::amf_self().write());
+                }
+            })
+        };
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                for _ in 0..200 {
+                    drop(test_ngap_server().await);
+                }
+            });
+            let _ = done_tx.send(());
+        });
+
+        let finished = done_rx.recv_timeout(Duration::from_secs(30));
+        stop.store(true, Ordering::Relaxed);
+        assert!(
+            finished.is_ok(),
+            "NgapServer::new deadlocked: it re-took the context read lock behind a waiting \
+             writer"
+        );
+        writer.join().unwrap();
     }
 
     /// An NGAP `UserLocationInformation` for a given TAC and cell identity, in PLMN
