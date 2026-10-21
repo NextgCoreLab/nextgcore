@@ -259,8 +259,7 @@ fn test_miot_slice_qos() {
     let miot_slice = SNssai::new(sst::MIOT, Some(0xABCDEF));
     let session_result = establish_pdu_session_in_slice(&miot_slice, "iot-platform");
 
-    if session_result.is_ok() {
-        let session = session_result.unwrap();
+    if let Ok(session) = session_result {
         // MIoT typically uses 5QI 79 or similar non-GBR
         assert!(session.default_5qi >= 69, "MIoT should use non-GBR 5QI");
     }

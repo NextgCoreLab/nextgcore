@@ -1022,7 +1022,7 @@ hss:
         let mut ctx = HssContext::new();
         ctx.init(1024, 4096);
 
-        let idx = ctx.imsi_add("123456789012345").unwrap();
+        let _idx = ctx.imsi_add("123456789012345").unwrap();
         assert_eq!(ctx.imsi_count(), 1);
 
         let imsi = ctx.imsi_find_by_id("123456789012345");

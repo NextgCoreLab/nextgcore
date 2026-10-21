@@ -3182,6 +3182,37 @@ pub async fn call_pcf_ue_policy_delete(
     Ok(())
 }
 
+/// Npcf_AMPolicyControl_Delete: DELETE
+/// /npcf-am-policy-control/v1/policies/{polAssoId} (TS 29.507 §4.2.4, the
+/// AMF-initiated AM Policy Association Termination of TS 23.502 §4.16.3.2).
+pub async fn call_pcf_am_policy_delete(
+    pcf_host: &str,
+    pcf_port: u16,
+    pol_asso_id: &str,
+) -> SbiResult<()> {
+    let client = crate::attach_oauth2(
+        SbiClient::for_peer(pcf_host, pcf_port),
+        nextgcore_sbi::types::NfType::Pcf,
+    );
+
+    let response = client
+        .delete(&format!(
+            "/npcf-am-policy-control/v1/policies/{pol_asso_id}"
+        ))
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("AM policy delete failed: {e}")))?;
+
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "AM policy delete returned status {}",
+            response.status
+        )));
+    }
+
+    log::info!("Npcf_AMPolicyControl_Delete OK (polAssoId={pol_asso_id})");
+    Ok(())
+}
+
 /// Result of an Nnsacf UE-admission query (TS 29.536).
 #[derive(Debug, Clone)]
 pub struct NsacfUeAdmissionResult {

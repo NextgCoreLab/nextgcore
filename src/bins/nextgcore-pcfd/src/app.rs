@@ -4510,6 +4510,7 @@ mod tests {
     /// the SEAM: what is asserted is the bounding arithmetic and which value bounds
     /// which, not the DB read itself.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn the_authorised_ambr_is_bounded_by_the_reported_subscribed_ambr() {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
@@ -4579,6 +4580,7 @@ mod tests {
     /// `npcf_handler::pcf_npcf_smpolicycontrol_handle_create`, a dead C port with no
     /// callers, so on the live path it was neither written nor read.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn a_create_stores_the_reported_subscribed_ambr_and_a_later_update_bounds_by_it() {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
@@ -4646,6 +4648,7 @@ mod tests {
     /// resolve exactly as well with the UE-SM present as absent, so this asserts the
     /// resolution happened.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn the_se_ambr_ch_arm_reads_the_sessions_real_supi() {
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()

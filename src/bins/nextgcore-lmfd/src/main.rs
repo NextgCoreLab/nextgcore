@@ -6428,7 +6428,6 @@ mod positioning_chain_strict_peer {
     use nextgcore_amfd::context::{amf_self, PositioningDlKind, NEXTGCORE_INVALID_POOL_ID};
     use nextgcore_sbi::multipart;
     use nextgcore_sbi::server::SbiServerConfig;
-    use std::net::SocketAddr;
 
     /// Serialize the strict-peer tests among themselves: they share the
     /// process-global AMF context (`amf_self`), the shared SBI NRF URI, and the
