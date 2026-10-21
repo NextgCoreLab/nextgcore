@@ -24,8 +24,9 @@ edit cannot change the schema; the vendored tokenizer would otherwise read
 
 ## Known limitation
 
-The forked asn1-compiler does not generate SEQUENCE extension additions
-(nextgsim #253), and every NR positioning method in LPP (nr-DL-TDOA,
-nr-Multi-RTT, nr-ECID, sidelink ranging) is carried in an addition group of the
-r9 IEs. Until that is fixed this crate represents only the root (LTE-era)
-content; `src/tests.rs` pins the limitation.
+Resolved. The forked asn1-compiler did not generate SEQUENCE extension
+additions (nextgsim #253), and every NR positioning method in LPP (nr-DL-TDOA,
+nr-Multi-RTT, nr-ECID) is carried in an addition group of the r9 IEs, so this
+crate once represented only the root (LTE-era) content. nextgsim #256 fixed
+it; nextgcore picked it up in #536, and the compiler now lives in
+NextgCoreLab/asn1-codegen (v0.1.0), where it is pinned.
