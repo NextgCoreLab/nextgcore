@@ -367,10 +367,19 @@ impl NgapMcastContext {
     }
 
     /// Find MBS session by TMGI
+    ///
+    /// Lock order is `sessions` THEN `tmgi_index`, the order
+    /// [`Self::session_create`] and [`Self::session_remove`] take their write
+    /// guards in (#586). Taking `tmgi_index` first here was an ABBA deadlock: a
+    /// create holding `sessions` (write) waited on `tmgi_index` while this held
+    /// `tmgi_index` (read) and waited on `sessions`, wedging both threads for
+    /// good. That was the amfd `mbs` test hang, and the same wedge awaits an AMF
+    /// serving a ContextCreate concurrently with any TMGI lookup.
     pub fn session_find_by_tmgi(&self, tmgi: &Tmgi) -> Option<NgapMbsSession> {
+        let sessions = self.sessions.read().ok()?;
         let tmgi_index = self.tmgi_index.read().ok()?;
         let session_id = tmgi_index.get(tmgi)?;
-        self.sessions.read().ok()?.get(session_id).cloned()
+        sessions.get(session_id).cloned()
     }
 
     /// Build multicast group paging message for a set of TACs
@@ -693,6 +702,62 @@ pub(crate) mod tests {
 
         let bad_tmgi = Tmgi::new(0x999999, [0x00, 0x00, 0x00]);
         assert!(ctx.session_find_by_tmgi(&bad_tmgi).is_none());
+    }
+
+    /// #586: a TMGI lookup racing a create/remove must not deadlock. Before the
+    /// lookup took `sessions` before `tmgi_index` (the writers' order), this
+    /// wedged within milliseconds; the watchdog turns that wedge into a failure
+    /// instead of a hung test binary. The context is a local one, not the
+    /// process-global store, so nothing else can perturb it.
+    ///
+    /// The readers look up a TMGI that stays present throughout, so every lookup
+    /// takes BOTH locks -- a miss returns after the first and could never invert.
+    #[test]
+    fn a_tmgi_lookup_racing_a_create_does_not_deadlock() {
+        use std::sync::{mpsc, Arc};
+
+        const ROUNDS: u32 = 50_000;
+        const READERS: usize = 3;
+        let ctx = Arc::new(NgapMcastContext::new());
+        let resident = Tmgi::new(0xFF_FFFF, [0x00, 0xF1, 0x10]);
+        ctx.session_create(resident.clone(), 1, None, vec![1])
+            .expect("resident session");
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+
+        let mut workers = Vec::new();
+        {
+            let ctx = Arc::clone(&ctx);
+            let done = done_tx.clone();
+            workers.push(std::thread::spawn(move || {
+                for i in 0..ROUNDS {
+                    let tmgi = Tmgi::new(i, [0x00, 0xF1, 0x10]);
+                    let s = ctx.session_create(tmgi, 1, None, vec![1]).expect("create");
+                    ctx.session_remove(s.mbs_session_id).expect("remove");
+                }
+                let _ = done.send(());
+            }));
+        }
+        for _ in 0..READERS {
+            let ctx = Arc::clone(&ctx);
+            let done = done_tx.clone();
+            let resident = resident.clone();
+            workers.push(std::thread::spawn(move || {
+                for _ in 0..ROUNDS {
+                    assert!(ctx.session_find_by_tmgi(&resident).is_some());
+                }
+                let _ = done.send(());
+            }));
+        }
+
+        for _ in 0..workers.len() {
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("create/remove vs find_by_tmgi deadlocked (lock-order inversion)");
+        }
+        for w in workers {
+            w.join().expect("worker");
+        }
+        assert_eq!(ctx.session_count(), 1, "only the resident session remains");
     }
 
     #[test]

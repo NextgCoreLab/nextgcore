@@ -151,6 +151,9 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 struct MetricsSources {
     associated: Arc<AtomicBool>,
     sessions: Arc<std::sync::atomic::AtomicUsize>,
+    /// The forwarding data plane whose `stats` are rendered as the
+    /// `upf_dataplane_*_total` counters (#581). The same `Arc` the forwarding task runs.
+    data_plane: Arc<DataPlane>,
 }
 
 static METRICS_SOURCES: std::sync::OnceLock<MetricsSources> = std::sync::OnceLock::new();
@@ -186,7 +189,13 @@ fn render_metrics() -> String {
         // session; reporting zero is accurate rather than a placeholder.
         None => (0, 0),
     };
-    format!(
+    // #581: the user-plane counters. Before install there is no data plane and no
+    // packet has been forwarded, so a zeroed set is the accurate rendering.
+    let dataplane = match METRICS_SOURCES.get() {
+        Some(src) => src.data_plane.stats.render_prometheus(),
+        None => data_plane::DataPlaneStats::default().render_prometheus(),
+    };
+    let mut body = format!(
         "# HELP upf_pfcp_associations Associated CP peers on N4/Sxb (0 or 1: TS 29.244 6.2.6 scopes an association to one CP/UP function pair)\n\
          # TYPE upf_pfcp_associations gauge\n\
          upf_pfcp_associations {associations}\n\
@@ -196,7 +205,9 @@ fn render_metrics() -> String {
          # HELP upf_up 1 when the UPF runtime is serving\n\
          # TYPE upf_up gauge\n\
          upf_up 1\n"
-    )
+    );
+    body.push_str(&dataplane);
+    body
 }
 
 #[tokio::main]
@@ -353,13 +364,9 @@ async fn main() -> Result<()> {
     // in the registration itself is 0, which is correct at start-up.
     upf_self().set_session_gauge(pfcp_server.session_count_handle());
 
-    // #380: the Prometheus endpoint. Installed from the SAME handles the load gauge uses,
-    // so the metric and the NRF `/load` report can never disagree about how many sessions
-    // this UPF holds.
-    let _ = METRICS_SOURCES.set(MetricsSources {
-        associated: pfcp_server.associated_handle(),
-        sessions: pfcp_server.session_count_handle(),
-    });
+    // #380: the Prometheus endpoint. Its sources (installed below, once the data plane
+    // is shared) are the SAME handles the load gauge uses, so the metric and the NRF
+    // `/load` report can never disagree about how many sessions this UPF holds.
     // Non-fatal when the port is busy, matching `sgwud`: a UPF that cannot expose metrics
     // still forwards packets, and refusing to start would turn an observability problem
     // into a user-plane outage. A readiness gate then fails on the absent metric, which is
@@ -373,6 +380,15 @@ async fn main() -> Result<()> {
 
     // Run data plane (if enabled)
     let data_plane = Arc::new(data_plane);
+
+    // Installed once the data plane is shared (#581), so `/metrics` reads the counters
+    // of the very `DataPlane` the forwarding task below increments. A scrape before this
+    // point renders honest zeros.
+    let _ = METRICS_SOURCES.set(MetricsSources {
+        associated: pfcp_server.associated_handle(),
+        sessions: pfcp_server.session_count_handle(),
+        data_plane: data_plane.clone(),
+    });
 
     // Let the PFCP server read final URR counters on session deletion
     pfcp_server.set_data_plane(data_plane.clone());
@@ -1421,6 +1437,9 @@ mod tests {
             "upf_pfcp_associations 0",
             "upf_pfcp_sessions 0",
             "upf_up 1",
+            "# TYPE upf_dataplane_ul_packets_total counter",
+            "upf_dataplane_ul_packets_total 0",
+            "upf_dataplane_dl_packets_total 0",
         ] {
             assert!(
                 body.contains(expected),
@@ -1430,9 +1449,15 @@ mod tests {
 
         let associated = Arc::new(AtomicBool::new(true));
         let sessions = Arc::new(std::sync::atomic::AtomicUsize::new(7));
+        // #581: the data-plane counters come from the installed `DataPlane`, not a copy.
+        let dp = Arc::new(DataPlane::new(Arc::new(AtomicBool::new(false))));
+        dp.stats.ul_packets.store(20, Ordering::Relaxed);
+        dp.stats.ul_bytes.store(1680, Ordering::Relaxed);
+        dp.stats.dl_packets.store(19, Ordering::Relaxed);
         let _ = METRICS_SOURCES.set(MetricsSources {
             associated: associated.clone(),
             sessions,
+            data_plane: dp.clone(),
         });
         let body = render_metrics();
         assert!(
@@ -1450,6 +1475,24 @@ mod tests {
         assert!(
             render_metrics().contains("upf_pfcp_associations 0"),
             "the render must re-read the handle on every scrape"
+        );
+
+        let body = render_metrics();
+        for expected in [
+            "upf_dataplane_ul_packets_total 20",
+            "upf_dataplane_ul_bytes_total 1680",
+            "upf_dataplane_dl_packets_total 19",
+        ] {
+            assert!(
+                body.contains(expected),
+                "missing {expected} after install, in:\n{body}"
+            );
+        }
+        // Live, like the association: the next forwarded packet is in the next scrape.
+        dp.stats.dl_packets.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            render_metrics().contains("upf_dataplane_dl_packets_total 20"),
+            "the data-plane counters must be re-read on every scrape"
         );
     }
 

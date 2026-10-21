@@ -771,6 +771,9 @@ mod tests {
         use nextgcore_ngap::types::{Cause, CauseMisc};
 
         let gnb_pool_id = 987_001u64;
+        // Initialise the process-global context rather than relying on a sibling
+        // test having done so: run alone, `ran_ue_add` had no pool (#586).
+        crate::test_support::init_context();
         let ctx = crate::context::amf_self();
         let (ue_a, ue_b) = {
             let context = ctx.read().unwrap();
@@ -797,6 +800,9 @@ mod tests {
         use nextgcore_ngap::types::{Cause, CauseRadioNetwork};
 
         let gnb_pool_id = 987_002u64;
+        // Initialise the process-global context rather than relying on a sibling
+        // test having done so: run alone, `ran_ue_add` had no pool (#586).
+        crate::test_support::init_context();
         let ctx = crate::context::amf_self();
         let (target, untouched) = {
             let context = ctx.read().unwrap();

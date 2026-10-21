@@ -555,6 +555,9 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
                 D::Proceed { msg, notify } => {
                     return handle_handover_required_reporting(ctx, enb_id, &msg, &notify);
                 }
+                D::ToFivegs { msg, notify } => {
+                    return handle_handover_required_to_5gs(ctx, enb_id, &msg, &notify);
+                }
                 D::UnsupportedTarget {
                     mme_ue_s1ap_id,
                     enb_ue_s1ap_id,
@@ -745,6 +748,93 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
                 };
             }
             Class2Decode::Undecodable => {}
+        }
+    }
+    // #584: E-RAB Release Indication, E-RAB Modification Indication and the
+    // Location Reporting indications. Class 2 initiating messages (and E-RAB
+    // Modification Indication, Class 1 with no failure message) whose reject
+    // IEs are missing are answered with ERROR INDICATION (§10.3.4.2).
+    {
+        use crate::s1ap_gen::Class2Decode;
+        macro_rules! class2 {
+            ($decode:expr, $proc:expr, |$msg:ident, $notify:ident| $body:expr) => {
+                match $decode {
+                    Class2Decode::Proceed {
+                        msg: $msg,
+                        notify: $notify,
+                    } => return $body,
+                    Class2Decode::Reject {
+                        ies,
+                        enb_ue_s1ap_id,
+                        mme_ue_s1ap_id,
+                    } => {
+                        return class2_reject(enb_id, $proc, enb_ue_s1ap_id, mme_ue_s1ap_id, &ies);
+                    }
+                    Class2Decode::Undecodable => {}
+                }
+            };
+        }
+        if crate::s1ap_gen::is_initiating(data, crate::s1ap_gen::PROC_E_RAB_RELEASE_INDICATION) {
+            class2!(
+                crate::s1ap_gen::decode_erab_release_indication(data),
+                crate::s1ap_gen::PROC_E_RAB_RELEASE_INDICATION,
+                |msg, notify| {
+                    let mut out = class2_notify(
+                        enb_id,
+                        crate::s1ap_gen::PROC_E_RAB_RELEASE_INDICATION,
+                        Some(msg.enb_ue_s1ap_id),
+                        Some(msg.mme_ue_s1ap_id),
+                        &notify,
+                    );
+                    out.extend(handle_erab_release_indication(ctx, enb_id, &msg).0);
+                    out
+                }
+            );
+        }
+        if crate::s1ap_gen::is_initiating(data, crate::s1ap_gen::PROC_E_RAB_MODIFICATION_INDICATION)
+        {
+            class2!(
+                crate::s1ap_gen::decode_erab_modification_indication(data),
+                crate::s1ap_gen::PROC_E_RAB_MODIFICATION_INDICATION,
+                |msg, notify| handle_erab_modification_indication(ctx, enb_id, &msg, &notify)
+            );
+        }
+        if crate::s1ap_gen::is_initiating(data, crate::s1ap_gen::PROC_LOCATION_REPORT) {
+            class2!(
+                crate::s1ap_gen::decode_location_report(data),
+                crate::s1ap_gen::PROC_LOCATION_REPORT,
+                |msg, notify| {
+                    let mut out = class2_notify(
+                        enb_id,
+                        crate::s1ap_gen::PROC_LOCATION_REPORT,
+                        Some(msg.enb_ue_s1ap_id),
+                        Some(msg.mme_ue_s1ap_id),
+                        &notify,
+                    );
+                    out.extend(handle_location_report(ctx, enb_id, &msg));
+                    out
+                }
+            );
+        }
+        if crate::s1ap_gen::is_initiating(
+            data,
+            crate::s1ap_gen::PROC_LOCATION_REPORTING_FAILURE_INDICATION,
+        ) {
+            class2!(
+                crate::s1ap_gen::decode_location_reporting_failure_indication(data),
+                crate::s1ap_gen::PROC_LOCATION_REPORTING_FAILURE_INDICATION,
+                |msg, notify| {
+                    let mut out = class2_notify(
+                        enb_id,
+                        crate::s1ap_gen::PROC_LOCATION_REPORTING_FAILURE_INDICATION,
+                        Some(msg.enb_ue_s1ap_id),
+                        Some(msg.mme_ue_s1ap_id),
+                        &notify,
+                    );
+                    out.extend(handle_location_reporting_failure(ctx, enb_id, &msg));
+                    out
+                }
+            );
         }
     }
     // The rest of mmed's S1AP (#514 stage 12) is decoded with the generated
@@ -2260,6 +2350,265 @@ pub fn handle_handover_required_reporting(
     }
 }
 
+// ============================================================================
+// EPS→5GS handover, the MME as SOURCE (#584, TS 23.502 §4.11.1.2.2)
+// ============================================================================
+
+/// Handle a HANDOVER REQUIRED towards a gNB (TS 23.502 §4.11.1.2.2.2 steps
+/// 1-3): build the Forward Relocation Request for the target AMF over N26 --
+/// the UE's EPS security context with a fresh {NH, NCC} pair (TS 33.501 §8.4.2
+/// step 2), its PDN connections, the source eNB's Source to Target container
+/// as an F-Container of type 3 and the gNB as Target Identification type 5 --
+/// and send it. Nothing goes back to the eNB until the AMF answers: the
+/// HANDOVER COMMAND is built from its Forward Relocation Response
+/// ([`eps_to_5gs_handover_command`]).
+///
+/// HANDOVER PREPARATION FAILURE when it cannot be prepared: the Handover Type
+/// is not eps-to-5gs, N26 is off or unconfigured (unknown-targetID, as before
+/// #584), the UE is unknown, or it has no bearer to move (TS 29.274 §7.3.1:
+/// the source "shall not proceed ... if the UE does not have any EPS bearer
+/// context(s)").
+pub fn handle_handover_required_to_5gs(
+    ctx: &MmeContext,
+    enb_id: u64,
+    msg: &crate::s1ap_gen::HandoverRequiredTo5gs,
+    notify: &[crate::s1ap_gen::DiagnosedIe],
+) -> Vec<S1apSend> {
+    let fail = |cause: i64| {
+        handover_preparation_failure(
+            enb_id,
+            msg.mme_ue_s1ap_id,
+            msg.enb_ue_s1ap_id,
+            cause,
+            notify,
+        )
+    };
+    if msg.handover_type != S1apHandoverType::EpsTo5gs {
+        log::warn!(
+            "Handover Required from eNB {enb_id} names a gNB target with Handover Type {:?}, \
+             not eps-to-5gs",
+            msg.handover_type
+        );
+        return fail(radio_network_cause::UNKNOWN_TARGET_ID);
+    }
+    if !crate::n26_path::enabled() {
+        log::warn!(
+            "Handover Required from eNB {enb_id} to gNB {:#x}: N26 interworking is off, so this \
+             MME cannot reach a 5GS target",
+            msg.target.gnb_id
+        );
+        return fail(radio_network_cause::UNKNOWN_TARGET_ID);
+    }
+    let Some(source_ue) = ctx
+        .enb_ue_find_by_mme_ue_s1ap_id(msg.mme_ue_s1ap_id)
+        .and_then(|id| ctx.enb_ue_find_by_id(id))
+        .filter(|ue| ue.enb_id == enb_id)
+    else {
+        return fail(radio_network_cause::UNKNOWN_MME_UE_S1AP_ID);
+    };
+    let mme_ue_id = source_ue.mme_ue_id;
+    let Some(mme_ue_before) = ctx.mme_ue_find_by_id(mme_ue_id) else {
+        return fail(radio_network_cause::UNKNOWN_MME_UE_S1AP_ID);
+    };
+    let pdn_connections: Vec<_> = mme_ue_before
+        .sess_list
+        .iter()
+        .filter_map(|sess_id| ctx.sess_find_by_id(*sess_id))
+        .filter_map(|sess| {
+            let mut bearers: Vec<_> = sess
+                .bearer_list
+                .iter()
+                .filter_map(|id| ctx.bearer_find_by_id(*id))
+                .collect();
+            bearers.sort_by_key(|b| b.ebi);
+            crate::n26_build::handover_pdn_connection(&sess, &bearers)
+        })
+        .collect();
+    if pdn_connections.is_empty() {
+        return fail(radio_network_cause::UNKNOWN_E_RAB_ID);
+    }
+    let Some((ncc, nh)) = next_hop_advance(ctx, mme_ue_id) else {
+        return fail(radio_network_cause::UNSPECIFIED);
+    };
+    let Some(mme_ue) = ctx.mme_ue_find_by_id(mme_ue_id) else {
+        return fail(radio_network_cause::UNSPECIFIED);
+    };
+    let mm_context = crate::n26_build::handover_mm_context(&mme_ue, nh, ncc);
+    let sent =
+        crate::n26_path::send_eps_to_5gs_relocation(ctx, mme_ue_id, source_ue.id, |seq, fteid| {
+            crate::n26_build::build_eps_to_5gs_forward_relocation_request(
+                seq,
+                &mme_ue.imsi_bcd,
+                fteid,
+                &mm_context,
+                &pdn_connections,
+                &msg.source_to_target_container,
+                &msg.target,
+                msg.direct_forwarding,
+            )
+        });
+    if let Err(e) = sent {
+        log::error!(
+            "Handover Required from eNB {enb_id} to gNB {:#x}: no Forward Relocation Request \
+             sent ({e})",
+            msg.target.gnb_id
+        );
+        return fail(radio_network_cause::UNKNOWN_TARGET_ID);
+    }
+    if let Some(source) = ctx.enb_ue_pool.write().unwrap().get_mut(&source_ue.id) {
+        source.handover_type = crate::context::HandoverType::EpsTo5gs;
+        source.handover_required_notify = notify.to_vec();
+        source.direct_forwarding_available = msg.direct_forwarding;
+    }
+    Vec::new()
+}
+
+/// The HANDOVER COMMAND an accepted EPS→5GS Forward Relocation Response gets
+/// (TS 23.502 §4.11.1.2.2.3 steps 1-2, TS 23.401 §5.5.1.2.2 step 9): Handover
+/// Type eps-to-5gs, the target NG-RAN's Target to Source container verbatim,
+/// and every bearer the AMF did not list as set up in E-RABs to Release
+/// (partial-handover). No E-RABs Subject to Data Forwarding: this MME sets up
+/// no indirect forwarding tunnel for the move, and the AMF's response offers
+/// no forwarding endpoint. Empty (the caller then fails the preparation) when
+/// the source context is gone or the response has no container.
+pub fn eps_to_5gs_handover_command(
+    ctx: &MmeContext,
+    record: &crate::n26_path::EpsTo5gsRelocation,
+    response: &crate::n26_build::EpsTo5gsRelocationResponse,
+) -> Vec<S1apSend> {
+    let Some(source_ue) = ctx.enb_ue_find_by_id(record.source_enb_ue_id) else {
+        log::warn!(
+            "Forward Relocation Response for UE {}: its source eNB UE context is gone",
+            record.mme_ue_id
+        );
+        return Vec::new();
+    };
+    let Some(container) = response.target_to_source_container.clone() else {
+        log::error!(
+            "Forward Relocation Response for UE {} accepted with no E-UTRAN Transparent \
+             Container: there is no Target to Source container for the HANDOVER COMMAND",
+            record.mme_ue_id
+        );
+        return Vec::new();
+    };
+    let erab_to_release_list = match &response.set_up_ebis {
+        Some(set_up) => ue_bearers(ctx, record.mme_ue_id)
+            .iter()
+            .filter(|b| !set_up.contains(&b.ebi))
+            .map(|b| nextgcore_s1ap::ErabItem {
+                erab_id: b.ebi,
+                cause: Cause::RadioNetwork(CauseRadioNetwork::PartialHandover),
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let command = HandoverCommand {
+        mme_ue_s1ap_id: source_ue.mme_ue_s1ap_id,
+        enb_ue_s1ap_id: source_ue.enb_ue_s1ap_id,
+        handover_type: S1apHandoverType::EpsTo5gs,
+        erab_subject_to_forwarding_list: Vec::new(),
+        erab_to_release_list,
+        target_to_source_container: container,
+    };
+    match crate::s1ap_gen::build_handover_command(&command, &source_ue.handover_required_notify) {
+        Ok(pdu) => vec![S1apSend {
+            enb_id: source_ue.enb_id,
+            pdu,
+        }],
+        Err(e) => {
+            log::error!("Failed to build Handover Command: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// The HANDOVER PREPARATION FAILURE for an EPS→5GS relocation the target
+/// refused or never answered (ho-failure-in-target-EPC-eNB-or-target-system).
+pub fn eps_to_5gs_preparation_failed(
+    ctx: &MmeContext,
+    record: &crate::n26_path::EpsTo5gsRelocation,
+) -> Vec<S1apSend> {
+    let Some(source_ue) = ctx.enb_ue_find_by_id(record.source_enb_ue_id) else {
+        return Vec::new();
+    };
+    if let Some(source) = ctx.enb_ue_pool.write().unwrap().get_mut(&source_ue.id) {
+        source.handover_type = Default::default();
+    }
+    handover_preparation_failure(
+        source_ue.enb_id,
+        source_ue.mme_ue_s1ap_id,
+        source_ue.enb_ue_s1ap_id,
+        radio_network_cause::HO_FAILURE_IN_TARGET_EPC_ENB_OR_TARGET_SYSTEM,
+        &source_ue.handover_required_notify,
+    )
+}
+
+/// Release the source side once the UE is in NG-RAN (TS 23.502
+/// §4.11.1.2.2.3 step 13 = TS 23.401 §5.5.1.2.2 steps 19-20): the source
+/// Serving GW's sessions are deleted with Operation Indication NOT set (the
+/// SMF+PGW-C keeps them as PDU sessions), the source eNB gets UE CONTEXT
+/// RELEASE COMMAND (successful-handover), and the MME's EPS context for the
+/// UE -- now served by the AMF -- is removed.
+pub fn release_after_eps_to_5gs(
+    ctx: &MmeContext,
+    record: &crate::n26_path::EpsTo5gsRelocation,
+) -> Vec<S1apSend> {
+    let mme_ue = ctx.mme_ue_find_by_id(record.mme_ue_id);
+    if let Some(mme_ue) = &mme_ue {
+        for sess_id in &mme_ue.sess_list {
+            if let Err(e) = crate::gtp_path::send_delete_session_request(
+                ctx,
+                Some(record.source_enb_ue_id),
+                mme_ue.sgw_ue_id,
+                *sess_id,
+                crate::s11_build::GtpDeleteAction::InEpsTo5gsHandover,
+            ) {
+                log::warn!(
+                    "[{}] EPS to 5GS handover complete, but the source Serving GW session {} \
+                     was not deleted: {e:?}",
+                    mme_ue.imsi_bcd,
+                    sess_id
+                );
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(source_ue) = ctx.enb_ue_find_by_id(record.source_enb_ue_id) {
+        if let Some(source) = ctx.enb_ue_pool.write().unwrap().get_mut(&source_ue.id) {
+            source.ue_ctx_rel_action = UeCtxRelAction::UeContextRemove;
+        }
+        match s1ap_build::build_ue_context_release_command(
+            Some(source_ue.enb_ue_s1ap_id),
+            source_ue.mme_ue_s1ap_id,
+            S1apCauseGroup::RadioNetwork,
+            radio_network_cause::SUCCESSFUL_HANDOVER,
+        ) {
+            Ok(pdu) => out.push(S1apSend {
+                enb_id: source_ue.enb_id,
+                pdu,
+            }),
+            Err(e) => log::error!("Failed to build UE Context Release Command: {e}"),
+        }
+    }
+    if let Some(mme_ue) = mme_ue {
+        for sess_id in &mme_ue.sess_list {
+            if let Some(sess) = ctx.sess_find_by_id(*sess_id) {
+                for bearer_id in &sess.bearer_list {
+                    ctx.bearer_remove(*bearer_id);
+                }
+            }
+            ctx.sess_remove(*sess_id);
+        }
+        ctx.mme_ue_remove(record.mme_ue_id);
+        log::info!(
+            "[{}] EPS to 5GS handover complete: the UE is served by the AMF; its EPS context \
+             is released",
+            mme_ue.imsi_bcd
+        );
+    }
+    out
+}
+
 fn handover_preparation_failure(
     enb_id: u64,
     mme_ue_s1ap_id: u32,
@@ -2817,6 +3166,17 @@ pub fn handle_handover_cancel_reporting(
         );
     };
 
+    // #584: a cancelled EPS to 5GS preparation must not be finished by a late
+    // Forward Relocation Response (TS 23.502 §4.11.1.2.3).
+    if let Some(source) = ctx.enb_ue_find_by_id(source_ue_id) {
+        if crate::n26_path::cancel_eps_to_5gs_relocation(source.mme_ue_id) {
+            log::info!(
+                "Handover Cancel: the EPS to 5GS relocation of UE {} is abandoned; the target                  AMF is not told (this core has no Relocation Cancel Request), and its                  preparation lapses on its own supervision",
+                source.mme_ue_id
+            );
+        }
+    }
+
     let target_ue_id = {
         let mut pool = ctx.enb_ue_pool.write().unwrap();
         match pool.get_mut(&source_ue_id) {
@@ -2986,16 +3346,20 @@ pub fn handle_path_switch_request(
     enb_id: u64,
     msg: &PathSwitchRequest,
 ) -> Vec<S1apSend> {
-    handle_path_switch_request_reporting(ctx, enb_id, msg, &[])
+    handle_path_switch_request_reporting(ctx, enb_id, &msg.into(), &[])
 }
 
 /// [`handle_path_switch_request`], reporting `notify` (unknown
 /// ignore-and-notify IEs of the PATH SWITCH REQUEST) in the acknowledge's
 /// Criticality Diagnostics (TS 36.413 §10.3.4.2).
+///
+/// EUTRAN-CGI, TAI and UE Security Capabilities are `ignore` (§9.1.5.8), so
+/// any of them may be absent (§10.3.5, #584): a missing location leaves the
+/// stored one as it is, and missing capabilities leave nothing to compare.
 pub fn handle_path_switch_request_reporting(
     ctx: &MmeContext,
     enb_id: u64,
-    msg: &PathSwitchRequest,
+    msg: &crate::s1ap_gen::PathSwitchRequestAt,
     notify: &[crate::s1ap_gen::DiagnosedIe],
 ) -> Vec<S1apSend> {
     let Some(enb_ue_id) = ctx.enb_ue_find_by_mme_ue_s1ap_id(msg.source_mme_ue_s1ap_id) else {
@@ -3007,8 +3371,8 @@ pub fn handle_path_switch_request_reporting(
         );
     };
 
-    let tai = tai_from_s1ap(&msg.tai);
-    let e_cgi = ecgi_from_s1ap(&msg.eutran_cgi);
+    let tai = msg.tai.as_ref().map(tai_from_s1ap);
+    let e_cgi = msg.eutran_cgi.as_ref().map(ecgi_from_s1ap);
 
     // Re-anchor the eNB UE context on the new eNB
     let mme_ue_id = {
@@ -3023,8 +3387,12 @@ pub fn handle_path_switch_request_reporting(
         };
         enb_ue.enb_ue_s1ap_id = msg.enb_ue_s1ap_id;
         enb_ue.enb_id = enb_id;
-        enb_ue.saved.tai = tai.clone();
-        enb_ue.saved.e_cgi = e_cgi.clone();
+        if let Some(tai) = &tai {
+            enb_ue.saved.tai = tai.clone();
+        }
+        if let Some(e_cgi) = &e_cgi {
+            enb_ue.saved.e_cgi = e_cgi.clone();
+        }
         enb_ue.mme_ue_id
     };
 
@@ -3039,19 +3407,39 @@ pub fn handle_path_switch_request_reporting(
 
     // TS 33.401 §7.2.4.3.2: verify the replayed UE security capabilities
     let expected = ue_security_capabilities_from(&mme_ue);
-    if msg.ue_security_capabilities != expected {
-        log::warn!(
+    match msg.ue_security_capabilities {
+        Some(got) if got != expected => log::warn!(
             "[{}] Path Switch Request: UE security capabilities mismatch \
              (got enc=0x{:04x}/int=0x{:04x}, expected enc=0x{:04x}/int=0x{:04x})",
             mme_ue.imsi_bcd,
-            msg.ue_security_capabilities.encryption_algorithms,
-            msg.ue_security_capabilities.integrity_algorithms,
+            got.encryption_algorithms,
+            got.integrity_algorithms,
             expected.encryption_algorithms,
             expected.integrity_algorithms
-        );
+        ),
+        Some(_) => {}
+        None => log::info!(
+            "[{}] Path Switch Request carries no UE Security Capabilities (criticality \
+             ignore, TS 36.413 §10.3.5): nothing to compare with the stored ones",
+            mme_ue.imsi_bcd
+        ),
     }
 
-    update_ue_location(ctx, mme_ue_id, &tai, &e_cgi);
+    match (&tai, &e_cgi) {
+        (Some(tai), Some(e_cgi)) => update_ue_location(ctx, mme_ue_id, tai, e_cgi),
+        _ => {
+            // A partial or absent location is applied field by field: the IE
+            // that is present is current, the one that is missing is not news.
+            if let Some(mme_ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
+                if let Some(tai) = &tai {
+                    mme_ue.tai = tai.clone();
+                }
+                if let Some(e_cgi) = &e_cgi {
+                    mme_ue.e_cgi = e_cgi.clone();
+                }
+            }
+        }
+    }
 
     // Switch the downlink endpoints to the new eNB
     for item in &msg.erab_switched_dl_list {
@@ -3126,6 +3514,375 @@ fn path_switch_failure(
             Vec::new()
         }
     }
+}
+
+// ============================================================================
+// E-RAB Release Indication, E-RAB Modification Indication, Location Reporting
+// (TS 36.413 §8.2.3.2, §8.2.4, §8.11) -- #584
+// ============================================================================
+
+/// The eNB UE context and MME UE id an indication names, if the UE S1AP ID
+/// pair is one this MME holds for that eNB (TS 36.413 §10.6: an unknown or
+/// inconsistent pair is answered with ERROR INDICATION).
+fn ue_by_pair(
+    ctx: &MmeContext,
+    enb_id: u64,
+    mme_ue_s1ap_id: u32,
+    enb_ue_s1ap_id: u32,
+) -> Result<crate::context::EnbUe, Vec<S1apSend>> {
+    let found = ctx
+        .enb_ue_find_by_mme_ue_s1ap_id(mme_ue_s1ap_id)
+        .and_then(|id| ctx.enb_ue_find_by_id(id));
+    match found {
+        Some(ue) if ue.enb_ue_s1ap_id == enb_ue_s1ap_id && ue.enb_id == enb_id => Ok(ue),
+        Some(_) => Err(error_indication(
+            enb_id,
+            Some(enb_ue_s1ap_id),
+            Some(mme_ue_s1ap_id),
+            S1apCauseGroup::RadioNetwork,
+            radio_network_cause::UNKNOWN_PAIR_UE_S1AP_ID,
+        )),
+        None => Err(error_indication(
+            enb_id,
+            Some(enb_ue_s1ap_id),
+            Some(mme_ue_s1ap_id),
+            S1apCauseGroup::RadioNetwork,
+            radio_network_cause::UNKNOWN_MME_UE_S1AP_ID,
+        )),
+    }
+}
+
+fn store_location(
+    ctx: &MmeContext,
+    enb_ue_id: u64,
+    mme_ue_id: u64,
+    tai: Option<&nextgcore_s1ap::Tai>,
+    cgi: Option<&nextgcore_s1ap::EutranCgi>,
+) {
+    let tai = tai.map(tai_from_s1ap);
+    let e_cgi = cgi.map(ecgi_from_s1ap);
+    if let Some(enb_ue) = ctx.enb_ue_pool.write().unwrap().get_mut(&enb_ue_id) {
+        if let Some(tai) = &tai {
+            enb_ue.saved.tai = tai.clone();
+        }
+        if let Some(e_cgi) = &e_cgi {
+            enb_ue.saved.e_cgi = e_cgi.clone();
+        }
+    }
+    if let Some(mme_ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
+        if let Some(tai) = tai {
+            mme_ue.tai = tai;
+        }
+        if let Some(e_cgi) = e_cgi {
+            mme_ue.e_cgi = e_cgi;
+        }
+        mme_ue.ue_location_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+    }
+}
+
+/// Handle an E-RAB RELEASE INDICATION (TS 36.413 §8.2.3.2): the eNB has
+/// already released the E-RABs, so nothing is answered on S1. Each released
+/// **dedicated** bearer is marked `released_by_enb` and, per PDN connection,
+/// deleted towards the core with a Delete Bearer Command (TS 23.401 §5.4.4.2
+/// step 2); the Delete Bearer Request that follows is answered without NAS
+/// signalling (step 7 is omitted for an eNB-triggered release).
+///
+/// A **default** bearer is not released this way: §5.4.4.2 "deactivates
+/// dedicated bearers. Default bearers are not affected", and the eNB "is not
+/// expected" to release non-GBR bearers except in error situations. It is
+/// logged and kept; tearing the PDN connection down is the UE's or MME's
+/// PDN disconnection procedure (§5.10.3), not this one.
+///
+/// Returns what this MME transmits on S1 (only ERROR INDICATIONs); the
+/// returned EBIs are the bearers a Delete Bearer Command was built for.
+pub fn handle_erab_release_indication(
+    ctx: &MmeContext,
+    enb_id: u64,
+    msg: &crate::s1ap_gen::ErabReleaseIndication,
+) -> (Vec<S1apSend>, Vec<u8>) {
+    let enb_ue = match ue_by_pair(ctx, enb_id, msg.mme_ue_s1ap_id, msg.enb_ue_s1ap_id) {
+        Ok(ue) => ue,
+        Err(out) => return (out, Vec::new()),
+    };
+    let mme_ue_id = enb_ue.mme_ue_id;
+    if let Some((tai, cgi)) = &msg.location {
+        store_location(ctx, enb_ue.id, mme_ue_id, Some(tai), Some(cgi));
+    }
+    // Group the released dedicated bearers by PDN connection: one Delete
+    // Bearer Command per PDN connection (§5.4.4.2 step 2).
+    let mut per_sess: std::collections::BTreeMap<u64, Vec<u8>> = Default::default();
+    for item in &msg.released {
+        let Some(bearer_id) = ctx.bearer_find_by_ebi(mme_ue_id, item.erab_id) else {
+            log::warn!(
+                "E-RAB Release Indication from eNB {enb_id} names E-RAB {} the UE does not \
+                 hold; ignored",
+                item.erab_id
+            );
+            continue;
+        };
+        let Some(bearer) = ctx.bearer_find_by_id(bearer_id) else {
+            continue;
+        };
+        let is_default = ctx.sess_find_by_id(bearer.sess_id).and_then(|sess| {
+            sess.bearer_list
+                .iter()
+                .filter_map(|id| ctx.bearer_find_by_id(*id))
+                .map(|b| b.ebi)
+                .min()
+        }) == Some(bearer.ebi);
+        if is_default {
+            log::warn!(
+                "E-RAB Release Indication from eNB {enb_id} releases E-RAB {}, the DEFAULT bearer \
+                 of its PDN connection (cause {:?}). TS 23.401 §5.4.4.2 releases dedicated bearers \
+                 only, so the PDN connection is kept; it ends by PDN disconnection (§5.10.3)",
+                item.erab_id,
+                item.cause
+            );
+            continue;
+        }
+        if let Some(b) = ctx.bearer_pool.write().unwrap().get_mut(&bearer_id) {
+            b.released_by_enb = true;
+            // The radio side is gone: there is no eNB S1-U endpoint to send to.
+            b.enb_s1u_teid = 0;
+            b.enb_s1u_ip = Default::default();
+        }
+        per_sess
+            .entry(bearer.sess_id)
+            .or_default()
+            .push(item.erab_id);
+    }
+    let mut commanded = Vec::new();
+    for ebis in per_sess.values() {
+        match crate::gtp_path::send_delete_bearer_command(ctx, mme_ue_id, ebis) {
+            Ok(seq) => log::info!(
+                "E-RAB Release Indication: Delete Bearer Command (seq={seq}) for EBIs {ebis:?} \
+                 sent to the Serving GW (TS 23.401 §5.4.4.2 step 2)"
+            ),
+            Err(e) => log::error!(
+                "E-RAB Release Indication: Delete Bearer Command for EBIs {ebis:?} not sent: {e}. \
+                 The bearers stay marked released by the eNB, so a later Delete Bearer Request \
+                 for them is still answered."
+            ),
+        }
+        commanded.extend_from_slice(ebis);
+    }
+    (Vec::new(), commanded)
+}
+
+/// Handle an E-RAB MODIFICATION INDICATION (TS 36.413 §8.2.4, TS 23.401
+/// §5.4.7): store each E-RAB's new downlink endpoint, ask the Serving GW to
+/// switch it with a Modify Bearer Request, and confirm once it answers (step
+/// 5). E-RABs the UE does not hold are confirmed as failed, unknown-E-RAB-ID.
+///
+/// When no Modify Bearer Request can be sent (no Serving GW path), the confirm
+/// goes now, with every E-RAB in the failed list: the core did not switch
+/// them, and §5.4.7 step 5 has the confirm say so.
+pub fn handle_erab_modification_indication(
+    ctx: &MmeContext,
+    enb_id: u64,
+    msg: &crate::s1ap_gen::ErabModificationIndication,
+    notify: &[crate::s1ap_gen::DiagnosedIe],
+) -> Vec<S1apSend> {
+    let enb_ue = match ue_by_pair(ctx, enb_id, msg.mme_ue_s1ap_id, msg.enb_ue_s1ap_id) {
+        Ok(ue) => ue,
+        Err(out) => return out,
+    };
+    let mme_ue_id = enb_ue.mme_ue_id;
+    if let Some((tai, cgi)) = &msg.location {
+        store_location(ctx, enb_ue.id, mme_ue_id, Some(tai), Some(cgi));
+    }
+    let mut confirm = crate::s1ap_gen::ErabModificationConfirm {
+        mme_ue_s1ap_id: msg.mme_ue_s1ap_id,
+        enb_ue_s1ap_id: msg.enb_ue_s1ap_id,
+        ..Default::default()
+    };
+    let mut ebis = Vec::new();
+    for item in &msg.to_be_modified {
+        match ctx.bearer_find_by_ebi(mme_ue_id, item.erab_id) {
+            Some(bearer_id) => {
+                if let Some(b) = ctx.bearer_pool.write().unwrap().get_mut(&bearer_id) {
+                    b.enb_s1u_teid = item.gtp_teid;
+                    b.enb_s1u_ip = transport_address_to_ip(&item.transport_layer_address);
+                }
+                ebis.push(item.erab_id);
+            }
+            None => confirm.failed.push(nextgcore_s1ap::ErabItem {
+                erab_id: item.erab_id,
+                cause: Cause::RadioNetwork(CauseRadioNetwork::UnknownERabId),
+            }),
+        }
+    }
+    confirm.modified = ebis.clone();
+    if ebis.is_empty() {
+        return erab_modification_confirm_now(enb_id, &confirm, notify);
+    }
+    let pending = crate::gtp_path::PendingErabModification {
+        enb_id,
+        confirm: confirm.clone(),
+        notify: notify.to_vec(),
+    };
+    match crate::gtp_path::send_modify_bearer_request_for_erab_modification(
+        ctx, mme_ue_id, &ebis, pending,
+    ) {
+        Ok(seq) => {
+            log::info!(
+                "E-RAB Modification Indication: Modify Bearer Request (seq={seq}) for EBIs \
+                 {ebis:?}; the confirm waits for its response (TS 23.401 §5.4.7 steps 2-5)"
+            );
+            Vec::new()
+        }
+        Err(e) => {
+            log::error!(
+                "E-RAB Modification Indication: Modify Bearer Request for EBIs {ebis:?} not \
+                 sent ({e}); confirming them as failed"
+            );
+            erab_modification_confirm_now(
+                enb_id,
+                &switch_failed(
+                    confirm,
+                    Cause::Transport(nextgcore_s1ap::CauseTransport::Unspecified),
+                ),
+                notify,
+            )
+        }
+    }
+}
+
+/// Move every "modified" E-RAB of `confirm` into its failed list with `cause`.
+fn switch_failed(
+    mut confirm: crate::s1ap_gen::ErabModificationConfirm,
+    cause: Cause,
+) -> crate::s1ap_gen::ErabModificationConfirm {
+    for erab_id in std::mem::take(&mut confirm.modified) {
+        confirm
+            .failed
+            .push(nextgcore_s1ap::ErabItem { erab_id, cause });
+    }
+    confirm
+}
+
+fn erab_modification_confirm_now(
+    enb_id: u64,
+    confirm: &crate::s1ap_gen::ErabModificationConfirm,
+    notify: &[crate::s1ap_gen::DiagnosedIe],
+) -> Vec<S1apSend> {
+    match crate::s1ap_gen::build_erab_modification_confirm(confirm, notify) {
+        Ok(pdu) => S1apSend::to_origin(enb_id, pdu),
+        Err(e) => {
+            log::error!("Failed to build E-RAB Modification Confirm: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// The E-RAB MODIFICATION CONFIRM a parked modification gets once the Modify
+/// Bearer Response arrives with GTP `cause` (TS 23.401 §5.4.7 step 5): the
+/// E-RABs as modified on "Request accepted" (16), else all failed.
+pub fn erab_modification_confirm(
+    pending: crate::gtp_path::PendingErabModification,
+    cause: u8,
+) -> Option<S1apSend> {
+    let confirm = if cause == crate::s11_build::GtpCause::RequestAccepted as u8 {
+        pending.confirm
+    } else {
+        log::warn!(
+            "Modify Bearer Response cause {cause} refused the E-RAB modification; the confirm \
+             lists every E-RAB as failed to modify"
+        );
+        switch_failed(
+            pending.confirm,
+            Cause::Misc(nextgcore_s1ap::CauseMisc::Unspecified),
+        )
+    };
+    erab_modification_confirm_now(pending.enb_id, &confirm, &pending.notify)
+        .into_iter()
+        .next()
+}
+
+/// Start (`start = true`, change-of-serve-cell) or stop
+/// (stop-change-of-serve-cell) location reporting for `mme_ue_id` at its
+/// serving eNB: the LOCATION REPORTING CONTROL (TS 36.413 §8.11.1). `None` when
+/// the UE has no S1 connection.
+pub fn location_reporting_control(
+    ctx: &MmeContext,
+    mme_ue_id: u64,
+    start: bool,
+) -> Option<S1apSend> {
+    let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id)?;
+    let enb_ue = ctx.enb_ue_find_by_id(mme_ue.enb_ue_id)?;
+    let event = if start {
+        nextgcore_s1ap_gen::generated::EventType::CHANGE_OF_SERVE_CELL
+    } else {
+        nextgcore_s1ap_gen::generated::EventType::STOP_CHANGE_OF_SERVE_CELL
+    };
+    let pdu = crate::s1ap_gen::build_location_reporting_control(
+        enb_ue.mme_ue_s1ap_id,
+        enb_ue.enb_ue_s1ap_id,
+        event,
+    )
+    .map_err(|e| log::error!("Failed to build Location Reporting Control: {e}"))
+    .ok()?;
+    if let Some(ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
+        ue.location_reporting_active = start;
+    }
+    Some(S1apSend {
+        enb_id: enb_ue.enb_id,
+        pdu,
+    })
+}
+
+/// Handle a LOCATION REPORT (TS 36.413 §8.11.3): the reported cell and TA
+/// become the UE's stored location.
+pub fn handle_location_report(
+    ctx: &MmeContext,
+    enb_id: u64,
+    msg: &crate::s1ap_gen::LocationReport,
+) -> Vec<S1apSend> {
+    let enb_ue = match ue_by_pair(ctx, enb_id, msg.mme_ue_s1ap_id, msg.enb_ue_s1ap_id) {
+        Ok(ue) => ue,
+        Err(out) => return out,
+    };
+    store_location(
+        ctx,
+        enb_ue.id,
+        enb_ue.mme_ue_id,
+        msg.tai.as_ref(),
+        msg.eutran_cgi.as_ref(),
+    );
+    log::info!(
+        "Location Report from eNB {enb_id} for UE {} (event type {:?}): TAI {:?}, ECGI {:?}",
+        enb_ue.mme_ue_id,
+        msg.event_type,
+        msg.tai,
+        msg.eutran_cgi
+    );
+    Vec::new()
+}
+
+/// Handle a LOCATION REPORTING FAILURE INDICATION (TS 36.413 §8.11.2): the
+/// eNB cannot report, so reporting is no longer active for the UE.
+pub fn handle_location_reporting_failure(
+    ctx: &MmeContext,
+    enb_id: u64,
+    msg: &crate::s1ap_gen::LocationReportingFailure,
+) -> Vec<S1apSend> {
+    let enb_ue = match ue_by_pair(ctx, enb_id, msg.mme_ue_s1ap_id, msg.enb_ue_s1ap_id) {
+        Ok(ue) => ue,
+        Err(out) => return out,
+    };
+    if let Some(ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&enb_ue.mme_ue_id) {
+        ue.location_reporting_active = false;
+    }
+    log::warn!(
+        "Location Reporting Failure Indication from eNB {enb_id} for UE {} (cause {:?}): \
+         location reporting is no longer active",
+        enb_ue.mme_ue_id,
+        msg.cause
+    );
+    Vec::new()
 }
 
 // ============================================================================

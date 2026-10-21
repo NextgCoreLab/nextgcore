@@ -319,6 +319,240 @@ pub fn clear_forward_relocation_sources_for_test() {
     }
 }
 
+// ============================================================================
+// EPS→5GS handover, the MME as SOURCE (#584, TS 23.502 §4.11.1.2.2)
+// ============================================================================
+
+/// An EPS→5GS relocation this MME started as the **source** (#584).
+///
+/// The S1AP side that started it (HANDOVER REQUIRED) and the N26 side that
+/// finishes it (Forward Relocation Response, then Forward Relocation Complete
+/// Notification) meet only through this record: the N26 messages carry only
+/// this MME's TEID, so without it a response could not be tied to the source
+/// eNB UE context its HANDOVER COMMAND must go to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EpsTo5gsRelocation {
+    /// The UE being handed over.
+    pub mme_ue_id: u64,
+    /// Its source eNB UE context, which the HANDOVER COMMAND (or PREPARATION
+    /// FAILURE) and later the UE CONTEXT RELEASE COMMAND go to.
+    pub source_enb_ue_id: u64,
+    /// Sequence number of the Forward Relocation Request.
+    pub sequence: u32,
+    /// The target AMF's N26 address.
+    pub amf_peer: SocketAddr,
+    /// The target AMF's N26 TEID, known once its response accepted.
+    pub amf_teid: Option<u32>,
+}
+
+/// Keyed by this MME's N26 TEID for the relocation, which is the header TEID
+/// of every message the AMF sends back for it (TS 29.274 §5.5.1).
+static EPS_TO_5GS_RELOCATIONS: OnceLock<Mutex<HashMap<u32, EpsTo5gsRelocation>>> = OnceLock::new();
+
+fn eps_to_5gs_relocations() -> &'static Mutex<HashMap<u32, EpsTo5gsRelocation>> {
+    EPS_TO_5GS_RELOCATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The N26 TEID this MME uses for `mme_ue_id`'s relocation: the UE's pool id,
+/// the identity space `handle_forward_relocation_request` already uses.
+pub fn eps_to_5gs_local_teid(mme_ue_id: u64) -> u32 {
+    mme_ue_id as u32
+}
+
+/// The relocation in flight for `mme_ue_id`, if any.
+pub fn eps_to_5gs_relocation(mme_ue_id: u64) -> Option<EpsTo5gsRelocation> {
+    eps_to_5gs_relocations()
+        .lock()
+        .ok()?
+        .get(&eps_to_5gs_local_teid(mme_ue_id))
+        .copied()
+}
+
+/// Drop `mme_ue_id`'s relocation (HANDOVER CANCEL from the source eNB, TS
+/// 23.502 §4.11.1.2.3), so a late Forward Relocation Response cannot send a
+/// HANDOVER COMMAND for a handover the eNB gave up. Returns whether one was in
+/// flight.
+pub fn cancel_eps_to_5gs_relocation(mme_ue_id: u64) -> bool {
+    eps_to_5gs_relocations()
+        .lock()
+        .ok()
+        .and_then(|mut m| m.remove(&eps_to_5gs_local_teid(mme_ue_id)))
+        .is_some()
+}
+
+/// Drop every relocation record. Test-only; declared beside the map. Callers
+/// hold [`crate::gtp_path::S11_TEST_LOCK`].
+#[cfg(test)]
+pub fn clear_eps_to_5gs_relocations_for_test() {
+    if let Ok(mut map) = eps_to_5gs_relocations().lock() {
+        map.clear();
+    }
+}
+
+/// Send the Forward Relocation Request of an EPS→5GS handover (TS 23.502
+/// §4.11.1.2.2.2 step 3) to the configured AMF and record the relocation.
+///
+/// `build` gets the sequence number and this MME's Sender's F-TEID and returns
+/// the message. Every reason nothing was sent is an `Err` naming it, so the
+/// caller answers the source eNB with HANDOVER PREPARATION FAILURE rather than
+/// leaving it waiting out TS1RELOCprep.
+pub fn send_eps_to_5gs_relocation<F>(
+    ctx: &MmeContext,
+    mme_ue_id: u64,
+    source_enb_ue_id: u64,
+    build: F,
+) -> Result<u32, String>
+where
+    F: FnOnce(u32, &Gtp2FTeidIe) -> Gtp2Message,
+{
+    if !enabled() {
+        return Err(format!(
+            "N26 interworking is off ({N26_ENV_VAR} unset): this MME has no interface to a 5GS \
+             target"
+        ));
+    }
+    let server = server().ok_or_else(|| {
+        "no N26 socket bound: mme.n26.server is unset or the bind failed".to_string()
+    })?;
+    let peer = *ctx
+        .amf_n26_list
+        .first()
+        .ok_or_else(|| "no AMF N26 peer configured (mme.n26.client.amf)".to_string())?;
+    let std::net::IpAddr::V4(v4) = server.local_addr().ip() else {
+        return Err(
+            "the N26 socket is bound to an IPv6 address; this MME builds an IPv4 F-TEID only"
+                .to_string(),
+        );
+    };
+    let local_teid = eps_to_5gs_local_teid(mme_ue_id);
+    let seq = server.alloc_sequence();
+    let fteid = Gtp2FTeidIe::new_ipv4(n26_build::S10_N26_MME_GTP_C, local_teid, v4.octets());
+    let msg = build(seq, &fteid);
+    // Recorded BEFORE the send (#359): the response can race the return.
+    if let Ok(mut map) = eps_to_5gs_relocations().lock() {
+        map.insert(
+            local_teid,
+            EpsTo5gsRelocation {
+                mme_ue_id,
+                source_enb_ue_id,
+                sequence: seq,
+                amf_peer: peer,
+                amf_teid: None,
+            },
+        );
+    }
+    match server.send_request(peer, &msg) {
+        Ok(seq) => {
+            log::info!(
+                "N26 Forward Relocation Request sent to AMF {peer} (seq={seq}) for UE \
+                 {mme_ue_id}: EPS to 5GS handover, this MME is the source (TS 23.502 \
+                 §4.11.1.2.2.2 step 3)"
+            );
+            Ok(seq)
+        }
+        Err(e) => {
+            cancel_eps_to_5gs_relocation(mme_ue_id);
+            Err(e)
+        }
+    }
+}
+
+/// Act on a Forward Relocation Response to an EPS→5GS Forward Relocation
+/// Request (TS 23.502 §4.11.1.2.2.2 step 14): the S1AP PDUs to send, which are
+/// the HANDOVER COMMAND to the source eNB on acceptance and a HANDOVER
+/// PREPARATION FAILURE otherwise. Empty when the response is for no relocation
+/// this MME has in flight (a late or stray response).
+pub fn handle_eps_to_5gs_relocation_response(
+    ctx: &MmeContext,
+    msg: &Gtp2Message,
+) -> Vec<crate::s1ap_handler::S1apSend> {
+    let teid = msg.header.teid.unwrap_or(0);
+    let record = eps_to_5gs_relocations()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&teid).copied())
+        .filter(|r| r.sequence == msg.header.sequence_number);
+    let Some(record) = record else {
+        log::info!(
+            "N26 Forward Relocation Response (TEID {teid:#x}, seq={}) matches no EPS to 5GS \
+             relocation in flight; not acted on",
+            msg.header.sequence_number
+        );
+        return Vec::new();
+    };
+    let response = match n26_build::parse_eps_to_5gs_forward_relocation_response(msg) {
+        Ok(r) => r,
+        Err(e) => {
+            log::error!("N26 Forward Relocation Response unusable: {e}");
+            cancel_eps_to_5gs_relocation(record.mme_ue_id);
+            return crate::s1ap_handler::eps_to_5gs_preparation_failed(ctx, &record);
+        }
+    };
+    if response.cause != n26_build::CAUSE_REQUEST_ACCEPTED {
+        log::warn!(
+            "N26 Forward Relocation Response from AMF {} REFUSED the EPS to 5GS handover of UE \
+             {} (cause {})",
+            record.amf_peer,
+            record.mme_ue_id,
+            response.cause
+        );
+        cancel_eps_to_5gs_relocation(record.mme_ue_id);
+        return crate::s1ap_handler::eps_to_5gs_preparation_failed(ctx, &record);
+    }
+    let out = crate::s1ap_handler::eps_to_5gs_handover_command(ctx, &record, &response);
+    if out.is_empty() {
+        cancel_eps_to_5gs_relocation(record.mme_ue_id);
+        return crate::s1ap_handler::eps_to_5gs_preparation_failed(ctx, &record);
+    }
+    if let Ok(mut map) = eps_to_5gs_relocations().lock() {
+        if let Some(r) = map.get_mut(&teid) {
+            r.amf_teid = response.amf_teid;
+        }
+    }
+    out
+}
+
+/// Act on a Forward Relocation Complete Notification from the target AMF (TS
+/// 23.502 §4.11.1.2.2.3 steps 5-6, 13): the UE has arrived in NG-RAN. Returns
+/// the Forward Relocation Complete Acknowledge to answer with and the S1AP
+/// PDUs to send (the source eNB's UE CONTEXT RELEASE COMMAND); `None` when the
+/// notification is for no relocation this MME has in flight.
+///
+/// The record is TAKEN: the UE arrives once, and a retransmitted notification
+/// is answered from the transaction layer's response cache.
+pub fn complete_eps_to_5gs_relocation(
+    ctx: &MmeContext,
+    msg: &Gtp2Message,
+) -> Option<(Gtp2Message, Vec<crate::s1ap_handler::S1apSend>)> {
+    let teid = msg.header.teid.unwrap_or(0);
+    let record = eps_to_5gs_relocations().lock().ok()?.remove(&teid)?;
+    let ack = n26_build::build_forward_relocation_complete_acknowledge(
+        msg.header.sequence_number,
+        record.amf_teid.unwrap_or(0),
+        n26_build::CAUSE_REQUEST_ACCEPTED,
+    );
+    let release = crate::s1ap_handler::release_after_eps_to_5gs(ctx, &record);
+    Some((ack, release))
+}
+
+/// A Forward Relocation Request whose transaction ran out of retransmissions
+/// (N3): the AMF never answered, so the source eNB is told the preparation
+/// failed rather than left to its own timer.
+fn abandon_eps_to_5gs_relocation_by_seq(seq: u32) {
+    let record = eps_to_5gs_relocations().lock().ok().and_then(|mut m| {
+        let teid = m
+            .iter()
+            .find(|(_, r)| r.sequence == seq)
+            .map(|(teid, _)| *teid)?;
+        m.remove(&teid)
+    });
+    if let Some(record) = record {
+        for send in crate::s1ap_handler::eps_to_5gs_preparation_failed(mme_self(), &record) {
+            crate::s1ap_path::s1ap_send(send);
+        }
+    }
+}
+
 impl N26Server {
     /// Bind the N26 socket and start the receive and retransmission loops.
     pub fn open(
@@ -401,6 +635,12 @@ impl N26Server {
                             // resume a procedure the MME has already given up on, and the UE
                             // would get a TAU ACCEPT long after it stopped waiting.
                             take_pending_context_request(xact.sequence_number);
+                            // #584: an EPS to 5GS Forward Relocation Request nobody
+                            // answered fails the source eNB's preparation.
+                            if xact.message_type == Gtp2MessageType::ForwardRelocationRequest as u8
+                            {
+                                abandon_eps_to_5gs_relocation_by_seq(xact.sequence_number);
+                            }
                         }
                     }
                 })
@@ -508,6 +748,11 @@ fn handle_datagram(inner: &Arc<N26Inner>, data: &[u8], peer: SocketAddr) {
     if matched.is_some() {
         if msg_type == Gtp2MessageType::ContextResponse as u8 {
             handle_context_response(&msg, seq, peer);
+        } else if msg_type == Gtp2MessageType::ForwardRelocationResponse as u8 {
+            // #584: this MME is the SOURCE of an EPS to 5GS handover.
+            for send in handle_eps_to_5gs_relocation_response(mme_self(), &msg) {
+                crate::s1ap_path::s1ap_send(send);
+            }
         } else if msg_type == Gtp2MessageType::ForwardRelocationCompleteAcknowledge as u8 {
             // #408: the source AMF has confirmed the handover completed, which per
             // TS 23.401 §5.5.1.2.2 step 15 is what licences the target MME to stop treating
@@ -533,6 +778,24 @@ fn handle_datagram(inner: &Arc<N26Inner>, data: &[u8], peer: SocketAddr) {
     // log below for it, which is what this arm replaces.
     if msg_type == Gtp2MessageType::ForwardRelocationRequest as u8 {
         handle_forward_relocation_request(inner, &msg, seq, peer);
+        return;
+    }
+
+    // #584: the target AMF reports the UE arrived in NG-RAN (an initial message).
+    if msg_type == Gtp2MessageType::ForwardRelocationCompleteNotification as u8 {
+        match complete_eps_to_5gs_relocation(mme_self(), &msg) {
+            Some((ack, release)) => {
+                send_response_from(inner, peer, &ack);
+                for send in release {
+                    crate::s1ap_path::s1ap_send(send);
+                }
+            }
+            None => log::info!(
+                "N26 Forward Relocation Complete Notification (TEID {:#x}, seq={seq}) from \
+                 {peer} matches no EPS to 5GS relocation in flight",
+                msg.header.teid.unwrap_or(0)
+            ),
+        }
         return;
     }
 

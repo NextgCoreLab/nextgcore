@@ -2769,6 +2769,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextgcore-lte-rrc-gen"
+version = "0.1.0"
+dependencies = [
+ "asn1-codecs",
+ "asn1-compiler",
+ "asn1_codecs_derive",
+ "bitvec",
+ "log",
+]
+
+[[package]]
 name = "nextgcore-mbsmfd"
 version = "0.1.0"
 dependencies = [
@@ -2896,6 +2907,17 @@ dependencies = [
  "log",
  "nextgcore-asn1c",
  "nextgcore-ngap",
+]
+
+[[package]]
+name = "nextgcore-nr-rrc-gen"
+version = "0.1.0"
+dependencies = [
+ "asn1-codecs",
+ "asn1-compiler",
+ "asn1_codecs_derive",
+ "bitvec",
+ "log",
 ]
 
 [[package]]
@@ -3344,7 +3366,10 @@ dependencies = [
  "log",
  "nextgcore-amfd",
  "nextgcore-core",
+ "nextgcore-lte-rrc-gen",
  "nextgcore-metrics",
+ "nextgcore-ngap-gen",
+ "nextgcore-nr-rrc-gen",
  "nextgcore-sbi",
  "serde",
  "serde_json",

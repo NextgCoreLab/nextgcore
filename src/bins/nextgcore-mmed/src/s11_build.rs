@@ -32,6 +32,7 @@ pub mod message_type {
     pub const RELEASE_ACCESS_BEARERS_RESPONSE: u8 = 171;
     pub const DOWNLINK_DATA_NOTIFICATION: u8 = 176;
     pub const DOWNLINK_DATA_NOTIFICATION_ACK: u8 = 177;
+    pub const DELETE_BEARER_COMMAND: u8 = 66;
     pub const BEARER_RESOURCE_COMMAND: u8 = 68;
     pub const BEARER_RESOURCE_FAILURE_INDICATION: u8 = 69;
 }
@@ -52,6 +53,7 @@ pub mod ie_type {
     pub const MSISDN: u8 = 76;
     pub const INDICATION: u8 = 77;
     pub const PCO: u8 = 78;
+    pub const CHANGE_REPORTING_ACTION: u8 = 131;
     pub const PAA: u8 = 79;
     pub const BEARER_QOS: u8 = 80;
     pub const FLOW_QOS: u8 = 81;
@@ -172,6 +174,11 @@ pub enum GtpDeleteAction {
     SendReleaseWithS1RemoveAndUnlink,
     HandlePdnConnectivityRequest,
     InPathSwitchRequest,
+    /// The UE left for 5GS over N26 (#584, TS 23.502 §4.11.1.2.2.3 step 13 /
+    /// TS 23.401 §5.5.1.2.2 step 19): the Serving GW releases its own state
+    /// only, because the SMF+PGW-C keeps the PDN connection as a PDU session.
+    /// So Operation Indication is NOT set.
+    InEpsTo5gsHandover,
 }
 
 /// Modify bearer action types
@@ -348,7 +355,7 @@ fn sender_fteid(mme_ue: &MmeUe, local: std::net::SocketAddr) -> S11BuildResult<G
 }
 
 /// The Bearer QoS IE for a bearer's subscribed QoS (TS 29.274 §8.15).
-fn bearer_qos(bearer: &MmeBearer) -> Gtp2BearerQosIe {
+pub(crate) fn bearer_qos(bearer: &MmeBearer) -> Gtp2BearerQosIe {
     let mut qos = Gtp2BearerQosIe::new(
         bearer.qos.qci,
         bearer.qos.mbr.uplink,
@@ -617,10 +624,48 @@ pub fn build_delete_session_request(
     // Indication (C, §8.12): Operation Indication. Hand-encoded as
     // `[0x00, 0x08, 0x00]` before #51, which puts the bit in the SECOND content
     // octet and therefore left OI unset; the library IE puts it where §8.12 does.
+    //
+    // #584: an EPS→5GS handover is the exception. TS 23.401 §5.5.1.2.2 step 19
+    // has the source MME release the source Serving GW "with the Operation
+    // Indication flag not set, that indicates to the S-GW that the S-GW shall
+    // not initiate a delete procedure towards the PDN GW" -- the PDN connection
+    // now lives on as a PDU session at the SMF+PGW-C.
     let mut indication = Gtp2IndicationIe::default();
-    indication.oi = true;
+    indication.oi = _action != GtpDeleteAction::InEpsTo5gsHandover;
     msg.add_ie(typed_ie(|buf| indication.encode(buf, 0))?);
 
+    Ok(msg)
+}
+
+/// Build a Delete Bearer Command (TS 29.274 §7.2.17.1) for the dedicated
+/// bearers `ebis` of one PDN connection, which the eNB released (#584, TS
+/// 23.401 §5.4.4.2 step 2).
+///
+/// Table 7.2.17.1-1: Bearer Contexts (M, one per bearer, each the EBI), User
+/// Location Information (C: the MME includes it when it has it).
+pub fn build_delete_bearer_command(
+    mme_ue: &MmeUe,
+    sgw_ue: &SgwUe,
+    ebis: &[u8],
+    sequence_number: u32,
+) -> S11BuildResult<Gtp2Message> {
+    if ebis.is_empty() {
+        return Err(S11BuildError::MissingRequiredField(
+            "Delete Bearer Command requires at least one Bearer Context (Table 7.2.17.1-1)"
+                .to_string(),
+        ));
+    }
+    let mut msg = new_message(
+        message_type::DELETE_BEARER_COMMAND,
+        sgw_ue.sgw_s11_teid,
+        sequence_number,
+    );
+    for ebi in ebis {
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(*ebi);
+        msg.add_bearer_context(0, &bc);
+    }
+    msg.add_ie(uli_ie(mme_ue)?);
     Ok(msg)
 }
 
@@ -752,6 +797,32 @@ pub fn build_delete_bearer_response(
     bc.set_ebi(bearer.ebi);
     bc.set_cause(&Gtp2CauseIe::new(cause_value as u8));
     msg.add_bearer_context(0, &bc);
+    Ok(msg)
+}
+
+/// Build a Delete Bearer Response (TS 29.274 §7.2.10.2) accepting the deletion
+/// of `ebis` -- one Bearer Context per EBI, each with its own Cause -- for the
+/// Delete Bearer Request at `sequence_number` (#584).
+pub fn build_delete_bearer_response_for_ebis(
+    sgw_s11_teid: u32,
+    ebis: &[u8],
+    cause_value: GtpCause,
+    sequence_number: u32,
+) -> S11BuildResult<Gtp2Message> {
+    let mut msg = new_message(
+        message_type::DELETE_BEARER_RESPONSE,
+        sgw_s11_teid,
+        sequence_number,
+    );
+    msg.add_ie(typed_ie(|buf| {
+        Gtp2CauseIe::new(cause_value as u8).encode(buf, 0)
+    })?);
+    for ebi in ebis {
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(*ebi);
+        bc.set_cause(&Gtp2CauseIe::new(cause_value as u8));
+        msg.add_bearer_context(0, &bc);
+    }
     Ok(msg)
 }
 

@@ -138,7 +138,10 @@ fn the_request_decodes_as_the_hand_written_parser_reads_it() {
                     panic!("{mme} {enb} {n}");
                 };
                 assert!(notify.is_empty());
-                assert_eq!(format!("{msg:?}"), format!("{old:?}"));
+                assert_eq!(
+                    format!("{msg:?}"),
+                    format!("{:?}", PathSwitchRequestAt::from(&old))
+                );
             }
         }
     }

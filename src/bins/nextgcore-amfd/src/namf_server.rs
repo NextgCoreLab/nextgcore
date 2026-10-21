@@ -8133,6 +8133,53 @@ mod tests {
         assert!(!queued[0].reregistration_required);
     }
 
+    /// #580: REREGISTRATION_REQUIRED through the real router -> 204 and one
+    /// network-initiated dereg enqueued with reregistration_required=true and no
+    /// 5GMM cause (the UE ignores it under "re-registration required",
+    /// TS 24.501 §5.5.2.3.2). Before #580 this enqueued `false`, so the
+    /// DEREGISTRATION REQUEST said "re-registration not required".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reregistration_required_dereg_notify_asks_the_ue_to_re_register() {
+        let _serial = dereg_queue_test_lock().lock().await;
+        let supi = "imsi-001010000070406";
+        let ue = setup_ue(supi, true, true);
+
+        let body = json!({ "deregReason": "REREGISTRATION_REQUIRED", "accessType": "3GPP_ACCESS" });
+        let req = SbiRequest::post(format!("/namf-callback/v1/{supi}/dereg-notify"))
+            .with_json_body(&body)
+            .expect("json");
+        assert_eq!(namf_request_handler(req).await.status, 204);
+
+        let queued = drain_network_deregs_for(ue.id);
+        assert_eq!(queued.len(), 1, "exactly one dereg event enqueued");
+        assert_eq!(queued[0].amf_ue_ngap_id, ue.id);
+        assert!(
+            queued[0].reregistration_required,
+            "REREGISTRATION_REQUIRED must ask the UE to re-register"
+        );
+        assert_eq!(queued[0].gmm_cause, None);
+    }
+
+    /// #580: every TS 29.503 reason the AMF parses, mapped to whether the UE is
+    /// asked to re-register. Exactly the two re-registration reasons say yes.
+    #[test]
+    fn only_the_two_re_registration_reasons_ask_the_ue_to_re_register() {
+        use crate::namf_handler::dereg_reason_requires_reregistration as rereg;
+        let table = [
+            ("UE_INITIAL_REGISTRATION", true),
+            ("REREGISTRATION_REQUIRED", true),
+            ("UE_REGISTRATION_AREA_CHANGE", false),
+            ("SUBSCRIPTION_WITHDRAWN", false),
+            ("5GS_TO_EPS_MOBILITY", false),
+            ("5GS_TO_EPS_MOBILITY_UE_INITIAL_REGISTRATION", false),
+            ("SMF_CONTEXT_TRANSFERRED", false),
+        ];
+        for (wire, expected) in table {
+            let reason = parse_dereg_reason(wire).expect("a TS 29.503 reason the AMF parses");
+            assert_eq!(rereg(reason), expected, "{wire}");
+        }
+    }
+
     /// Unknown SUPI -> 404 CONTEXT_NOT_FOUND.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_dereg_notify_callback_404_unknown_supi() {

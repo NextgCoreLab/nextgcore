@@ -201,6 +201,12 @@ fn send_to_sgwc(ctx: &MmeContext, msg: &Gtp2Message, data: u64) -> GtpPathResult
         .map_err(GtpPathError::SocketError)
 }
 
+/// Send a triggered message to the Serving GW at `peer` (#584: the Delete
+/// Bearer Response for an eNB-released bearer).
+pub fn send_response_to_sgwc(peer: SocketAddr, msg: &Gtp2Message) -> GtpPathResult<()> {
+    send_response_to(peer, msg)
+}
+
 /// Send `msg` as a triggered message, echoing the request's sequence number.
 fn send_response_to(peer: SocketAddr, msg: &Gtp2Message) -> GtpPathResult<()> {
     let server = server().ok_or_else(|| {
@@ -1201,6 +1207,107 @@ pub fn send_bearer_resource_command(
         local_teid: mme_ue.mme_s11_teid,
         ..Default::default()
     })
+}
+
+// ============================================================================
+// E-UTRAN initiated E-RAB modification (#584, TS 23.401 §5.4.7)
+// ============================================================================
+
+/// An E-RAB MODIFICATION CONFIRM waiting for the Modify Bearer Response that
+/// decides it (TS 23.401 §5.4.7 steps 2-5).
+///
+/// The confirm reports, per E-RAB, whether the core switched it (step 5), and
+/// only the Serving GW's answer says so. Keyed by the Modify Bearer Request's
+/// sequence number and TAKEN by the response, the shape `PENDING_CREATES` has
+/// and for the same reasons.
+#[derive(Debug, Clone)]
+pub struct PendingErabModification {
+    /// eNB pool id the confirm goes to.
+    pub enb_id: u64,
+    /// The confirm as it reads if the Serving GW accepts.
+    pub confirm: crate::s1ap_gen::ErabModificationConfirm,
+    /// `notify` IEs of the indication, for the confirm's diagnostics.
+    pub notify: Vec<crate::s1ap_gen::DiagnosedIe>,
+}
+
+static PENDING_ERAB_MODIFICATIONS: OnceLock<Mutex<HashMap<u32, PendingErabModification>>> =
+    OnceLock::new();
+
+fn pending_erab_modifications() -> &'static Mutex<HashMap<u32, PendingErabModification>> {
+    PENDING_ERAB_MODIFICATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Take the pending E-RAB modification the Modify Bearer Request at `seq` was
+/// sent for, if any.
+pub fn take_pending_erab_modification(seq: u32) -> Option<PendingErabModification> {
+    pending_erab_modifications().lock().ok()?.remove(&seq)
+}
+
+/// Record a pending E-RAB modification without sending. Test-only; declared
+/// beside the map, callers hold [`S11_TEST_LOCK`].
+#[cfg(test)]
+pub(crate) fn record_pending_erab_modification_for_test(
+    seq: u32,
+    pending: PendingErabModification,
+) {
+    if let Ok(mut map) = pending_erab_modifications().lock() {
+        map.insert(seq, pending);
+    }
+}
+
+/// Send the Modify Bearer Request of an E-UTRAN initiated E-RAB modification
+/// (TS 23.401 §5.4.7 step 2) for the bearers `ebis` of `mme_ue_id`, whose eNB
+/// endpoints the caller has already stored, and park `pending` until the
+/// response arrives. Returns the request's sequence number.
+pub fn send_modify_bearer_request_for_erab_modification(
+    ctx: &MmeContext,
+    mme_ue_id: u64,
+    ebis: &[u8],
+    pending: PendingErabModification,
+) -> GtpPathResult<u32> {
+    let mme_ue = ctx
+        .mme_ue_find_by_id(mme_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let sgw_ue = ctx
+        .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let bearers: Vec<crate::context::MmeBearer> = bearers_of_ue(ctx, mme_ue_id)
+        .into_iter()
+        .filter(|b| ebis.contains(&b.ebi))
+        .collect();
+    let bearer_refs: Vec<&crate::context::MmeBearer> = bearers.iter().collect();
+    let seq = sequence()?;
+    let msg = s11_build::build_modify_bearer_request(&mme_ue, &sgw_ue, &bearer_refs, true, seq)
+        .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
+    // Recorded before the send (the #359 lesson): a response can race the
+    // return of `send_to`.
+    if let Ok(mut map) = pending_erab_modifications().lock() {
+        map.insert(seq, pending);
+    }
+    if let Err(e) = send_to_sgwc(ctx, &msg, ctx.next_pool_id()) {
+        take_pending_erab_modification(seq);
+        return Err(e);
+    }
+    Ok(seq)
+}
+
+/// Send a Delete Bearer Command (TS 29.274 §7.2.17.1) for dedicated bearers the
+/// eNB released (#584, TS 23.401 §5.4.4.2 step 2). Returns the sequence number.
+pub fn send_delete_bearer_command(
+    ctx: &MmeContext,
+    mme_ue_id: u64,
+    ebis: &[u8],
+) -> GtpPathResult<u32> {
+    let mme_ue = ctx
+        .mme_ue_find_by_id(mme_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let sgw_ue = ctx
+        .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let seq = sequence()?;
+    let msg = s11_build::build_delete_bearer_command(&mme_ue, &sgw_ue, ebis, seq)
+        .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
+    send_to_sgwc(ctx, &msg, ctx.next_pool_id() | GTP_CMD_XACT_ID_FLAG)
 }
 
 /// A sequence number from the transaction layer for an initial message.

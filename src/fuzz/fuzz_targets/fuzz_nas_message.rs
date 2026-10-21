@@ -1,406 +1,130 @@
 //! NAS Message Fuzzer
 //!
-//! Fuzzes the NAS (Non-Access Stratum) message parser to find potential
-//! crashes, panics, or memory safety issues.
-//!
-//! Supports both 5G NAS (5GMM/5GSM) and EPS NAS (EMM/ESM).
+//! Exercises the real `nextgcore_nas` decoders (5GS NAS, TS 24.501, and EPS NAS,
+//! TS 24.301: every message body and the plain/security headers) against
+//! arbitrary bytes. The first byte selects the decoder, the rest is its input.
+//! Before #587 this target carried its own hand-written parser and called nothing
+//! in `nextgcore_nas`. No decoder may panic; malformed input is `Err`.
 //!
 //! Run with: cargo +nightly fuzz run fuzz_nas_message
 
 #![no_main]
 
+use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
+use nextgcore_nas::{eps, fiveg};
+
+type Decoder = fn(&mut Bytes) -> bool;
+
+const FIVEG: &[Decoder] = &[
+    |b| fiveg::RegistrationRequest::decode(b).is_ok(),
+    |b| fiveg::RegistrationAccept::decode(b).is_ok(),
+    |b| fiveg::RegistrationReject::decode(b).is_ok(),
+    |b| fiveg::RegistrationComplete::decode(b).is_ok(),
+    |b| fiveg::DeregistrationRequestFromUe::decode(b).is_ok(),
+    |b| fiveg::DeregistrationRequestToUe::decode(b).is_ok(),
+    |b| fiveg::ServiceRequest::decode(b).is_ok(),
+    |b| fiveg::ServiceAccept::decode(b).is_ok(),
+    |b| fiveg::ServiceReject::decode(b).is_ok(),
+    |b| fiveg::AuthenticationRequest::decode(b).is_ok(),
+    |b| fiveg::AuthenticationResponse::decode(b).is_ok(),
+    |b| fiveg::AuthenticationReject::decode(b).is_ok(),
+    |b| fiveg::AuthenticationFailure::decode(b).is_ok(),
+    |b| fiveg::AuthenticationResult::decode(b).is_ok(),
+    |b| fiveg::IdentityRequest::decode(b).is_ok(),
+    |b| fiveg::IdentityResponse::decode(b).is_ok(),
+    |b| fiveg::SecurityModeCommand::decode(b).is_ok(),
+    |b| fiveg::SecurityModeComplete::decode(b).is_ok(),
+    |b| fiveg::SecurityModeReject::decode(b).is_ok(),
+    |b| fiveg::FiveGmmStatus::decode(b).is_ok(),
+    |b| fiveg::UlNasTransport::decode(b).is_ok(),
+    |b| fiveg::DlNasTransport::decode(b).is_ok(),
+    |b| fiveg::ConfigurationUpdateCommand::decode(b).is_ok(),
+    |b| fiveg::Notification::decode(b).is_ok(),
+    |b| fiveg::NotificationResponse::decode(b).is_ok(),
+    |b| fiveg::ControlPlaneServiceRequest::decode(b).is_ok(),
+    |b| fiveg::NetworkSliceSpecificAuthenticationCommand::decode(b).is_ok(),
+    |b| fiveg::NetworkSliceSpecificAuthenticationComplete::decode(b).is_ok(),
+    |b| fiveg::NetworkSliceSpecificAuthenticationResult::decode(b).is_ok(),
+    |b| fiveg::PduSessionEstablishmentRequest::decode(b).is_ok(),
+    |b| fiveg::PduSessionEstablishmentAccept::decode(b).is_ok(),
+    |b| fiveg::PduSessionEstablishmentReject::decode(b).is_ok(),
+    |b| fiveg::PduSessionModificationRequest::decode(b).is_ok(),
+    |b| fiveg::PduSessionModificationCommand::decode(b).is_ok(),
+    |b| fiveg::PduSessionModificationReject::decode(b).is_ok(),
+    |b| fiveg::PduSessionModificationCommandReject::decode(b).is_ok(),
+    |b| fiveg::PduSessionReleaseRequest::decode(b).is_ok(),
+    |b| fiveg::PduSessionReleaseReject::decode(b).is_ok(),
+    |b| fiveg::PduSessionReleaseCommand::decode(b).is_ok(),
+    |b| fiveg::PduSessionReleaseComplete::decode(b).is_ok(),
+    |b| fiveg::FiveGsmStatus::decode(b).is_ok(),
+    |b| fiveg::PduSessionAuthenticationCommand::decode(b).is_ok(),
+    |b| fiveg::PduSessionAuthenticationComplete::decode(b).is_ok(),
+    |b| fiveg::PduSessionAuthenticationResult::decode(b).is_ok(),
+    |b| fiveg::RemoteUeReport::decode(b).is_ok(),
+    |b| fiveg::RemoteUeReportResponse::decode(b).is_ok(),
+    |b| fiveg::FiveGsNasHeader::decode(b).is_ok(),
+    |b| fiveg::FiveGsNasSmHeader::decode(b).is_ok(),
+    |b| fiveg::FiveGsNasSecurityHeader::decode(b).is_ok(),
+];
+
+const EPS: &[Decoder] = &[
+    |b| eps::AttachRequest::decode(b).is_ok(),
+    |b| eps::AttachAccept::decode(b).is_ok(),
+    |b| eps::AttachComplete::decode(b).is_ok(),
+    |b| eps::AttachReject::decode(b).is_ok(),
+    |b| eps::DetachRequest::decode(b).is_ok(),
+    |b| eps::TrackingAreaUpdateRequest::decode(b).is_ok(),
+    |b| eps::TrackingAreaUpdateAccept::decode(b).is_ok(),
+    |b| eps::TrackingAreaUpdateReject::decode(b).is_ok(),
+    |b| eps::EpsAuthenticationRequest::decode(b).is_ok(),
+    |b| eps::EpsAuthenticationResponse::decode(b).is_ok(),
+    |b| eps::EpsAuthenticationFailure::decode(b).is_ok(),
+    |b| eps::EpsSecurityModeCommand::decode(b).is_ok(),
+    |b| eps::EpsSecurityModeComplete::decode(b).is_ok(),
+    |b| eps::EpsSecurityModeReject::decode(b).is_ok(),
+    |b| eps::EpsIdentityRequest::decode(b).is_ok(),
+    |b| eps::EpsIdentityResponse::decode(b).is_ok(),
+    |b| eps::EmmStatus::decode(b).is_ok(),
+    |b| eps::EpsServiceRequest::decode(b).is_ok(),
+    |b| eps::ExtendedServiceRequest::decode(b).is_ok(),
+    |b| eps::EpsServiceReject::decode(b).is_ok(),
+    |b| eps::GutiReallocationCommand::decode(b).is_ok(),
+    |b| eps::EmmInformation::decode(b).is_ok(),
+    |b| eps::EpsDownlinkNasTransport::decode(b).is_ok(),
+    |b| eps::EpsUplinkNasTransport::decode(b).is_ok(),
+    |b| eps::CsServiceNotification::decode(b).is_ok(),
+    |b| eps::PdnConnectivityRequest::decode(b).is_ok(),
+    |b| eps::PdnConnectivityReject::decode(b).is_ok(),
+    |b| eps::PdnDisconnectRequest::decode(b).is_ok(),
+    |b| eps::PdnDisconnectReject::decode(b).is_ok(),
+    |b| eps::ActivateDefaultEpsBearerContextRequest::decode(b).is_ok(),
+    |b| eps::ActivateDefaultEpsBearerContextReject::decode(b).is_ok(),
+    |b| eps::BearerResourceAllocationRequest::decode(b).is_ok(),
+    |b| eps::BearerResourceAllocationReject::decode(b).is_ok(),
+    |b| eps::BearerResourceModificationRequest::decode(b).is_ok(),
+    |b| eps::BearerResourceModificationReject::decode(b).is_ok(),
+    |b| eps::ActivateDedicatedEpsBearerContextRequest::decode(b).is_ok(),
+    |b| eps::ActivateDedicatedEpsBearerContextReject::decode(b).is_ok(),
+    |b| eps::ModifyEpsBearerContextRequest::decode(b).is_ok(),
+    |b| eps::ModifyEpsBearerContextAccept::decode(b).is_ok(),
+    |b| eps::ModifyEpsBearerContextReject::decode(b).is_ok(),
+    |b| eps::DeactivateEpsBearerContextRequest::decode(b).is_ok(),
+    |b| eps::EsmInformationResponse::decode(b).is_ok(),
+    |b| eps::EsmStatus::decode(b).is_ok(),
+    |b| eps::EpsNasEmmHeader::decode(b).is_ok(),
+    |b| eps::EpsNasEsmHeader::decode(b).is_ok(),
+    |b| eps::EpsNasSecurityHeader::decode(b).is_ok(),
+];
 
 fuzz_target!(|data: &[u8]| {
-    // Try parsing as 5G NAS
-    let _ = parse_5gs_nas_message(data);
-
-    // Try parsing as EPS NAS
-    let _ = parse_eps_nas_message(data);
-});
-
-/// Extended Protocol Discriminator values
-mod epd {
-    pub const FIVEGMM: u8 = 0x7E;  // 5G Mobility Management
-    pub const FIVEGSM: u8 = 0x2E;  // 5G Session Management
-    pub const EMM: u8 = 0x07;      // EPS Mobility Management
-    pub const ESM: u8 = 0x02;      // EPS Session Management
-}
-
-/// Parse 5G NAS message (3GPP TS 24.501)
-fn parse_5gs_nas_message(data: &[u8]) -> Result<Nas5gsMessage, &'static str> {
-    if data.len() < 3 {
-        return Err("Too short for 5GS NAS");
-    }
-
-    // Byte 0: Extended Protocol Discriminator
-    let epd = data[0];
-
-    match epd {
-        epd::FIVEGMM => parse_5gmm_message(data),
-        epd::FIVEGSM => parse_5gsm_message(data),
-        _ => Err("Unknown 5GS protocol discriminator"),
-    }
-}
-
-/// Parse 5GMM message
-fn parse_5gmm_message(data: &[u8]) -> Result<Nas5gsMessage, &'static str> {
-    if data.len() < 3 {
-        return Err("Too short for 5GMM message");
-    }
-
-    // Byte 1: Security header type (4 bits) + Spare (4 bits)
-    let security_header_type = (data[1] >> 4) & 0x0F;
-
-    // Check if this is a security protected message
-    if security_header_type != 0 {
-        // Security protected message
-        if data.len() < 7 {
-            return Err("Too short for security protected message");
-        }
-
-        // Bytes 2-5: Message Authentication Code
-        let mac = u32::from_be_bytes([data[2], data[3], data[4], data[5]]);
-
-        // Byte 6: Sequence Number
-        let seq_num = data[6];
-
-        // The rest is the protected NAS message
-        if data.len() > 7 {
-            // Recursively parse the inner message (would be decrypted in real impl)
-            return Ok(Nas5gsMessage {
-                epd: data[0],
-                security_header_type,
-                message_type: 0, // Unknown until decrypted
-                ies: Vec::new(),
-            });
-        }
-
-        return Err("Empty protected message");
-    }
-
-    // Plain NAS message
-    // Byte 2: Message Type
-    if data.len() < 3 {
-        return Err("Missing message type");
-    }
-    let message_type = data[2];
-
-    // Parse IEs from byte 3 onwards
-    let ies = parse_5gmm_ies(message_type, &data[3..]);
-
-    Ok(Nas5gsMessage {
-        epd: data[0],
-        security_header_type,
-        message_type,
-        ies,
-    })
-}
-
-/// Parse 5GSM message
-fn parse_5gsm_message(data: &[u8]) -> Result<Nas5gsMessage, &'static str> {
-    if data.len() < 4 {
-        return Err("Too short for 5GSM message");
-    }
-
-    // Byte 1: PDU Session ID
-    let pdu_session_id = data[1];
-
-    // Byte 2: PTI (Procedure Transaction Identity)
-    let pti = data[2];
-
-    // Byte 3: Message Type
-    let message_type = data[3];
-
-    // Parse IEs from byte 4 onwards
-    let ies = parse_5gsm_ies(message_type, &data[4..]);
-
-    Ok(Nas5gsMessage {
-        epd: data[0],
-        security_header_type: 0,
-        message_type,
-        ies,
-    })
-}
-
-/// 5GS NAS Message structure
-struct Nas5gsMessage {
-    epd: u8,
-    security_header_type: u8,
-    message_type: u8,
-    ies: Vec<(u8, Vec<u8>)>,
-}
-
-/// Parse 5GMM IEs (Type-Length-Value format)
-fn parse_5gmm_ies(msg_type: u8, data: &[u8]) -> Vec<(u8, Vec<u8>)> {
-    let mut ies = Vec::new();
-    let mut offset = 0;
-
-    while offset < data.len() {
-        // Type 1 IE (TV, 1 byte total) or Type 3/4/6 IE (TLV/TLV-E)
-        let iei = data[offset];
-        offset += 1;
-
-        // Check if this is a Type 1 IE (4-bit IEI in high nibble)
-        let ie_format = get_5gmm_ie_format(msg_type, iei);
-
-        match ie_format {
-            IeFormat::Type1 => {
-                // Value is in low nibble
-                ies.push((iei >> 4, vec![iei & 0x0F]));
-            }
-            IeFormat::Type3(len) => {
-                // Fixed length, no length field
-                if offset + len > data.len() {
-                    break;
-                }
-                ies.push((iei, data[offset..offset + len].to_vec()));
-                offset += len;
-            }
-            IeFormat::Type4 => {
-                // Variable length, 1-byte length field
-                if offset >= data.len() {
-                    break;
-                }
-                let len = data[offset] as usize;
-                offset += 1;
-                if offset + len > data.len() {
-                    break;
-                }
-                ies.push((iei, data[offset..offset + len].to_vec()));
-                offset += len;
-            }
-            IeFormat::Type6 => {
-                // Variable length, 2-byte length field
-                if offset + 2 > data.len() {
-                    break;
-                }
-                let len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
-                offset += 2;
-                if offset + len > data.len() {
-                    break;
-                }
-                ies.push((iei, data[offset..offset + len].to_vec()));
-                offset += len;
-            }
-            IeFormat::Unknown => {
-                // Try TLV-E format
-                if offset + 2 <= data.len() {
-                    let len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
-                    offset += 2;
-                    if offset + len <= data.len() {
-                        ies.push((iei, data[offset..offset + len].to_vec()));
-                        offset += len;
-                    } else {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
-        }
-    }
-
-    ies
-}
-
-/// Parse 5GSM IEs
-fn parse_5gsm_ies(msg_type: u8, data: &[u8]) -> Vec<(u8, Vec<u8>)> {
-    // Similar structure to 5GMM
-    parse_5gmm_ies(msg_type, data)
-}
-
-/// IE Format types
-enum IeFormat {
-    Type1,       // TV, 1 byte total (4-bit IEI + 4-bit value)
-    Type3(usize), // TV, fixed length
-    Type4,       // TLV, 1-byte length
-    Type6,       // TLV-E, 2-byte length
-    Unknown,
-}
-
-/// Determine IE format based on message type and IEI
-fn get_5gmm_ie_format(_msg_type: u8, iei: u8) -> IeFormat {
-    // Simplified - in real implementation, this would be message-specific
-    match iei >> 4 {
-        0x0..=0x7 => IeFormat::Unknown, // Likely mandatory IEs
-        0x8 | 0x9 => IeFormat::Type1,
-        0xA..=0xD => IeFormat::Type4,
-        0xE | 0xF => IeFormat::Type6,
-        _ => IeFormat::Unknown,
-    }
-}
-
-/// Parse EPS NAS message (3GPP TS 24.301)
-fn parse_eps_nas_message(data: &[u8]) -> Result<EpsNasMessage, &'static str> {
-    if data.len() < 2 {
-        return Err("Too short for EPS NAS");
-    }
-
-    // Byte 0: Security header type (4 bits) + Protocol discriminator (4 bits)
-    let security_header_type = (data[0] >> 4) & 0x0F;
-    let protocol_discriminator = data[0] & 0x0F;
-
-    match protocol_discriminator {
-        epd::EMM => parse_emm_message(data),
-        epd::ESM => parse_esm_message(data),
-        _ => Err("Unknown EPS protocol discriminator"),
-    }
-}
-
-/// Parse EMM message
-fn parse_emm_message(data: &[u8]) -> Result<EpsNasMessage, &'static str> {
-    if data.len() < 2 {
-        return Err("Too short for EMM message");
-    }
-
-    let security_header_type = (data[0] >> 4) & 0x0F;
-
-    // Security protected message
-    if security_header_type != 0 {
-        if data.len() < 6 {
-            return Err("Too short for security protected EMM");
-        }
-        return Ok(EpsNasMessage {
-            protocol_discriminator: data[0] & 0x0F,
-            security_header_type,
-            message_type: 0,
-            ies: Vec::new(),
-        });
-    }
-
-    // Plain NAS message
-    let message_type = data[1];
-    let ies = parse_emm_ies(message_type, &data[2..]);
-
-    Ok(EpsNasMessage {
-        protocol_discriminator: data[0] & 0x0F,
-        security_header_type,
-        message_type,
-        ies,
-    })
-}
-
-/// Parse ESM message
-fn parse_esm_message(data: &[u8]) -> Result<EpsNasMessage, &'static str> {
-    if data.len() < 3 {
-        return Err("Too short for ESM message");
-    }
-
-    // Byte 0: EPS bearer identity (4) + Protocol discriminator (4)
-    let _bearer_id = (data[0] >> 4) & 0x0F;
-
-    // Byte 1: PTI
-    let _pti = data[1];
-
-    // Byte 2: Message Type
-    let message_type = data[2];
-
-    let ies = parse_esm_ies(message_type, &data[3..]);
-
-    Ok(EpsNasMessage {
-        protocol_discriminator: data[0] & 0x0F,
-        security_header_type: 0,
-        message_type,
-        ies,
-    })
-}
-
-/// EPS NAS Message structure
-struct EpsNasMessage {
-    protocol_discriminator: u8,
-    security_header_type: u8,
-    message_type: u8,
-    ies: Vec<(u8, Vec<u8>)>,
-}
-
-/// Parse EMM IEs
-fn parse_emm_ies(msg_type: u8, data: &[u8]) -> Vec<(u8, Vec<u8>)> {
-    parse_eps_nas_ies(data)
-}
-
-/// Parse ESM IEs
-fn parse_esm_ies(msg_type: u8, data: &[u8]) -> Vec<(u8, Vec<u8>)> {
-    parse_eps_nas_ies(data)
-}
-
-/// Generic EPS NAS IE parser
-fn parse_eps_nas_ies(data: &[u8]) -> Vec<(u8, Vec<u8>)> {
-    let mut ies = Vec::new();
-    let mut offset = 0;
-
-    while offset < data.len() {
-        let iei = data[offset];
-        offset += 1;
-
-        // Heuristic: high nibble patterns indicate different IE types
-        if (iei & 0xF0) == 0xF0 || (iei & 0xF0) == 0xE0 {
-            // Type 1 TV (4-bit IEI + 4-bit value)
-            ies.push((iei >> 4, vec![iei & 0x0F]));
-        } else if (iei & 0xF0) >= 0xA0 {
-            // Type 4 TLV
-            if offset >= data.len() {
-                break;
-            }
-            let len = data[offset] as usize;
-            offset += 1;
-            if offset + len > data.len() {
-                break;
-            }
-            ies.push((iei, data[offset..offset + len].to_vec()));
-            offset += len;
+    if let Some((&sel, body)) = data.split_first() {
+        let sel = sel as usize % (FIVEG.len() + EPS.len());
+        let decode = if sel < FIVEG.len() {
+            FIVEG[sel]
         } else {
-            // Type 6 TLV-E or Type 3 TV
-            if offset + 2 <= data.len() {
-                let len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
-                offset += 2;
-                if len > 0 && offset + len <= data.len() {
-                    ies.push((iei, data[offset..offset + len].to_vec()));
-                    offset += len;
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
+            EPS[sel - FIVEG.len()]
+        };
+        let _ = decode(&mut Bytes::copy_from_slice(body));
     }
-
-    ies
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_5gmm_empty() {
-        assert!(parse_5gs_nas_message(&[]).is_err());
-    }
-
-    #[test]
-    fn test_5gmm_registration_request() {
-        // Minimal Registration Request
-        let data = [
-            0x7E, // EPD: 5GMM
-            0x00, // Security header: plain
-            0x41, // Message type: Registration Request
-        ];
-        assert!(parse_5gs_nas_message(&data).is_ok());
-    }
-
-    #[test]
-    fn test_emm_empty() {
-        assert!(parse_eps_nas_message(&[]).is_err());
-    }
-
-    #[test]
-    fn test_emm_attach_request() {
-        // Minimal Attach Request
-        let data = [
-            0x07, // Security: plain + EMM
-            0x41, // Message type: Attach Request
-        ];
-        assert!(parse_eps_nas_message(&data).is_ok());
-    }
-}
+});

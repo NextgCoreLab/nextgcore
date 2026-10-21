@@ -16365,6 +16365,13 @@ mod tests {
         String,
         tokio::sync::mpsc::Receiver<(String, String)>,
     ) {
+        // The sink serves PLAINTEXT loopback, so the AMF's notify client must dial
+        // it under the dev profile. Declared here, by the fixture that needs it
+        // (#586): the default profile is Production, whose client dials https with
+        // a client certificate from /etc/nextgcore/tls, so a test relying on some
+        // sibling having set the override failed whenever it ran alone. Left set
+        // for the reason `a_foreign_guti_fetches_the_ue_context_from_the_old_amf` documents.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let port = addr.port();
         let (tx, rx) = tokio::sync::mpsc::channel::<(String, String)>(16);
