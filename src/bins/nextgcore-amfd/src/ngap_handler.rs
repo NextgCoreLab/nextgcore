@@ -433,55 +433,66 @@ pub fn handle_ng_reset(
         reset.cause
     );
 
+    // The SMF release is collected under the read guard and sent after it is
+    // dropped. Calling anything that takes the AMF context lock while this guard is
+    // held is a recursive read: std's RwLock queues new readers behind a waiting
+    // writer, so it deadlocks the AMF as soon as any writer arrives in between.
     let amf_ctx = crate::context::amf_self();
-    let Ok(context) = amf_ctx.read() else {
-        log::error!("AMF context lock poisoned while handling NG Reset");
-        return None;
+    let (sm_context_refs, ack) = {
+        let Ok(context) = amf_ctx.read() else {
+            log::error!("AMF context lock poisoned while handling NG Reset");
+            return None;
+        };
+
+        match &reset.reset_type {
+            ResetType::NgInterface => {
+                // Release every UE-associated logical NG-connection on this gNB
+                let affected = context.ran_ue_list_for_gnb(gnb_pool_id);
+                log::info!(
+                    "NG Reset (NG interface): releasing {} UE context(s)",
+                    affected.len()
+                );
+                let refs: Vec<String> = affected
+                    .iter()
+                    .flat_map(|ran_ue| sm_context_refs_for_ue(&context, ran_ue.amf_ue_id))
+                    .collect();
+                context.ran_ue_remove_all_for_gnb(gnb_pool_id);
+                (refs, None)
+            }
+            ResetType::PartOfNgInterface(connections) => {
+                log::info!(
+                    "NG Reset (part of NG interface): {} connection(s) listed",
+                    connections.len()
+                );
+                let mut refs = Vec::new();
+                for item in connections {
+                    let ran_ue = item
+                        .amf_ue_ngap_id
+                        .and_then(|id| context.ran_ue_find_by_amf_ue_ngap_id(id))
+                        .or_else(|| {
+                            item.ran_ue_ngap_id.and_then(|id| {
+                                context.ran_ue_find_by_ran_ue_ngap_id(gnb_pool_id, id as u64)
+                            })
+                        });
+                    if let Some(ran_ue) = ran_ue {
+                        refs.extend(sm_context_refs_for_ue(&context, ran_ue.amf_ue_id));
+                        context.ran_ue_remove(ran_ue.id);
+                    } else {
+                        log::warn!(
+                            "NG Reset: no UE context for AMF-UE-NGAP-ID={:?}, RAN-UE-NGAP-ID={:?}",
+                            item.amf_ue_ngap_id,
+                            item.ran_ue_ngap_id
+                        );
+                    }
+                }
+                // Echo the received list in the acknowledge (Section 8.7.4.2.2)
+                (refs, Some(connections.clone()))
+            }
+        }
     };
 
-    match &reset.reset_type {
-        ResetType::NgInterface => {
-            // Release every UE-associated logical NG-connection on this gNB
-            let affected = context.ran_ue_list_for_gnb(gnb_pool_id);
-            log::info!(
-                "NG Reset (NG interface): releasing {} UE context(s)",
-                affected.len()
-            );
-            for ran_ue in &affected {
-                trigger_smf_session_release_for_ue(ran_ue.amf_ue_id);
-            }
-            context.ran_ue_remove_all_for_gnb(gnb_pool_id);
-            None
-        }
-        ResetType::PartOfNgInterface(connections) => {
-            log::info!(
-                "NG Reset (part of NG interface): {} connection(s) listed",
-                connections.len()
-            );
-            for item in connections {
-                let ran_ue = item
-                    .amf_ue_ngap_id
-                    .and_then(|id| context.ran_ue_find_by_amf_ue_ngap_id(id))
-                    .or_else(|| {
-                        item.ran_ue_ngap_id.and_then(|id| {
-                            context.ran_ue_find_by_ran_ue_ngap_id(gnb_pool_id, id as u64)
-                        })
-                    });
-                if let Some(ran_ue) = ran_ue {
-                    trigger_smf_session_release_for_ue(ran_ue.amf_ue_id);
-                    context.ran_ue_remove(ran_ue.id);
-                } else {
-                    log::warn!(
-                        "NG Reset: no UE context for AMF-UE-NGAP-ID={:?}, RAN-UE-NGAP-ID={:?}",
-                        item.amf_ue_ngap_id,
-                        item.ran_ue_ngap_id
-                    );
-                }
-            }
-            // Echo the received list in the acknowledge (Section 8.7.4.2.2)
-            Some(connections.clone())
-        }
-    }
+    release_smf_sm_contexts(sm_context_refs);
+    ack
 }
 
 // ============================================================================
@@ -575,13 +586,25 @@ pub fn parse_cause(group: u8, value: i64) -> NgapCause {
     }
 }
 
-/// Fire-and-forget: release all SMF PDU sessions for the given AMF UE.
+/// The SMF SM context refs of the AMF UE's sessions that have a live SMF context.
 ///
-/// Called after UE Context Release to clean up Nsmf_PDUSession contexts.
-/// Sessions without an sm_context_ref are silently skipped.
-fn trigger_smf_session_release_for_ue(amf_ue_id: u64) {
-    let amf_ctx = crate::context::amf_self();
+/// Reads through the caller's guard: it must not take the AMF context lock itself
+/// (see `handle_ng_reset`).
+fn sm_context_refs_for_ue(ctx: &crate::context::AmfContext, amf_ue_id: u64) -> Vec<String> {
+    ctx.sess_list_for_ue(amf_ue_id)
+        .into_iter()
+        .filter_map(|sess| sess.sm_context_ref)
+        .collect()
+}
 
+/// Fire-and-forget: release the given SMF SM contexts (Nsmf_PDUSession_Release).
+///
+/// Called after a UE context release to clean up its Nsmf_PDUSession contexts.
+/// Called with no AMF context guard held.
+fn release_smf_sm_contexts(sm_context_refs: Vec<String>) {
+    if sm_context_refs.is_empty() {
+        return;
+    }
     // Resolve SMF endpoint first; if unavailable, nothing to do.
     let (smf_host, smf_port) = match sbi_path::resolve_smf_endpoint() {
         Ok(ep) => ep,
@@ -591,19 +614,7 @@ fn trigger_smf_session_release_for_ue(amf_ue_id: u64) {
         }
     };
 
-    let sessions = {
-        let ctx = match amf_ctx.read() {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        // Collect sm_context_ref for sessions that have a live SMF context
-        ctx.sess_list_for_ue(amf_ue_id)
-            .into_iter()
-            .filter_map(|sess| sess.sm_context_ref.clone())
-            .collect::<Vec<_>>()
-    };
-
-    for sm_context_ref in sessions {
+    for sm_context_ref in sm_context_refs {
         let host = smf_host.clone();
         let port = smf_port;
         tokio::spawn(async move {
@@ -829,5 +840,68 @@ mod tests {
 
         // Cleanup so other tests using the global context are unaffected
         context.ran_ue_remove(untouched.id);
+    }
+
+    /// An NG Reset must never take the AMF context lock while it already holds it.
+    ///
+    /// `std::sync::RwLock` queues new readers behind a waiting writer, so a second
+    /// `read()` on a thread that already holds one deadlocks as soon as any other
+    /// thread asks for `write()` in between. Before this fix `handle_ng_reset` held a
+    /// read guard and, per affected UE, called the SMF release helper, which took a
+    /// second read guard. A writer hammering the context here makes that window
+    /// near certain; the reset must still finish every round.
+    #[test]
+    fn an_ng_reset_completes_while_a_writer_contends_for_the_context() {
+        use nextgcore_ngap::types::{Cause, CauseMisc};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let _env = crate::test_support::SMF_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // The release helper only reaches the context when an SMF resolves.
+        std::env::set_var("SMF_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("SMF_SBI_PORT", "9");
+        crate::test_support::init_context();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    drop(crate::context::amf_self().write());
+                }
+            })
+        };
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let gnb_pool_id = 987_003u64;
+            let reset = NgReset {
+                cause: Cause::Misc(CauseMisc::HardwareFailure),
+                reset_type: ResetType::NgInterface,
+            };
+            for round in 0..500u64 {
+                {
+                    let ctx = crate::context::amf_self();
+                    let context = ctx.read().unwrap();
+                    for i in 0..4 {
+                        context.ran_ue_add(gnb_pool_id, round * 4 + i).unwrap();
+                    }
+                }
+                handle_ng_reset(gnb_pool_id, &reset);
+            }
+            let _ = done_tx.send(());
+        });
+
+        let finished = done_rx.recv_timeout(std::time::Duration::from_secs(30));
+        stop.store(true, Ordering::Relaxed);
+        std::env::remove_var("SMF_SBI_ADDR");
+        std::env::remove_var("SMF_SBI_PORT");
+        assert!(
+            finished.is_ok(),
+            "handle_ng_reset deadlocked: it re-took the context read lock behind a waiting writer"
+        );
+        writer.join().unwrap();
     }
 }
