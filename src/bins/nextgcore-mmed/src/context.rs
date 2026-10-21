@@ -1343,6 +1343,12 @@ pub struct MmeSess {
     pub pgw_pco: Vec<u8>,
     /// PGW Extended PCO
     pub pgw_epco: Vec<u8>,
+    /// The PDN GW's last Change Reporting Action for this PDN connection
+    /// (TS 29.274 §8.61), from the Create Session Response, a Modify Bearer
+    /// Response or a Change Notification Response (#593). It says which
+    /// location changes this PDN GW is told about with a Change Notification
+    /// Request (TS 23.401 §5.9.2).
+    pub change_reporting_action: Option<u8>,
 }
 
 // ============================================================================

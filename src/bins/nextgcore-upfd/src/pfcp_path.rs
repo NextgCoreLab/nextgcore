@@ -1634,12 +1634,64 @@ impl PfcpServer {
         // Update X carries the same IE set as Create X (Table 7.5.4.2-1 vs
         // 7.5.2.2-1 and siblings), so the establishment path's parsers are reused
         // rather than duplicated.
-        let created_pdrs = parse_rule_list(
+        let mut created_pdrs = parse_rule_list(
             &ies,
             pfcp_ie::CREATE_PDR,
             crate::n4_build::parse_create_pdr,
             &mut failure,
         );
+        // #583: a PDR created mid-session whose F-TEID the UP function is to choose (CH,
+        // or a zero TEID as this tree's SMF signals it) gets one now, exactly as at
+        // establishment, and the response carries it in a Created PDR (TS 29.244
+        // §7.5.5.2). Before this the modification answered no Created PDR at all, so the
+        // N3 uplink of an EPS→5GS handover and every indirect forwarding tunnel had no
+        // F-TEID. PDRs sharing a CHOOSE ID share the TEID (§5.5.3). The allocated value is
+        // written back into the parsed PDR, so the data plane detects on it.
+        let mut allocated_pdrs = Vec::new();
+        {
+            let mut by_choose_id: HashMap<u8, u32> = HashMap::new();
+            let local_ipv4 = match &self.local_node_id {
+                NodeId::Ipv4(addr) => Some(*addr),
+                _ => None,
+            };
+            for pdr in created_pdrs.iter_mut() {
+                let Some(fteid) = pdr.pdi.local_f_teid.as_mut() else {
+                    continue;
+                };
+                if !(fteid.ch || fteid.teid == 0) {
+                    continue;
+                }
+                let teid = match (fteid.chid, fteid.choose_id) {
+                    (true, Some(id)) => {
+                        *by_choose_id.entry(id).or_insert_with(|| self.alloc_teid())
+                    }
+                    _ => self.alloc_teid(),
+                };
+                *fteid = crate::n4_build::ParsedFTeid {
+                    teid,
+                    ipv4: local_ipv4,
+                    ipv6: None,
+                    ch: false,
+                    chid: false,
+                    choose_id: None,
+                };
+                log::debug!(
+                    "PDR {}: allocated F-TEID {teid:#x} in a modification",
+                    pdr.pdr_id
+                );
+                allocated_pdrs.push(CreatedPdr {
+                    pdr_id: pdr.pdr_id,
+                    local_f_teid: Some(FTeid {
+                        teid,
+                        ipv4: local_ipv4,
+                        ipv6: None,
+                        choose: false,
+                        choose_id: None,
+                    }),
+                    ue_ip_address: None,
+                });
+            }
+        }
         let updated_pdrs = parse_rule_list(
             &ies,
             pfcp_ie::UPDATE_PDR,
@@ -1669,7 +1721,20 @@ impl PfcpServer {
         // Creation on the message names, from a Create or an Update alike. Creates
         // are considered first so an Update in the same message wins, which is the
         // order §7.5.4 applies them in.
-        for far in created_fars.iter().chain(mod_fars.iter()) {
+        //
+        // #583: except a FAR created together with an ACCESS-source PDR that uses it --
+        // a tunnel relaying toward the access side (indirect data forwarding), whose
+        // endpoint is its own and not the session's downlink.
+        let relay_fars: std::collections::HashSet<u32> = created_pdrs
+            .iter()
+            .filter(|p| p.pdi.source_interface == 0)
+            .filter_map(|p| p.far_id)
+            .collect();
+        for far in created_fars
+            .iter()
+            .filter(|f| !relay_fars.contains(&f.far_id))
+            .chain(mod_fars.iter())
+        {
             if let Some(ohc) = far
                 .forwarding_parameters
                 .as_ref()
@@ -1986,7 +2051,7 @@ impl PfcpServer {
             }
             None => build_session_modification_response_full(
                 pfcp_type::SESSION_MODIFICATION_RESPONSE,
-                &[], // No created PDRs for modification
+                &allocated_pdrs,
                 &usage_reports,
                 // #321: echo the TSC configuration this session now holds, so the SMF
                 // can tell an applied modification from a merely accepted one. Empty
@@ -3045,6 +3110,75 @@ mod tests {
                 Some((urr_id, total))
             })
             .collect()
+    }
+
+    /// #583: a forwarding tunnel created mid-session -- an Access-source PDR whose F-TEID
+    /// the UPF chooses (zero TEID, this tree's SMF's spelling) and a FAR back toward the
+    /// access side. The response must carry the allocated F-TEID in a Created PDR, the
+    /// data plane must route that TEID to the session and detect the PDR on it, and the
+    /// FAR's endpoint must not move the session's own DL tunnel.
+    #[tokio::test]
+    async fn a_modification_allocates_the_f_teid_of_a_pdr_it_creates() {
+        let (server, smf, addr, mut rx, dp, upf_seid) = established_session().await;
+        let dl_before = server.sessions.read().await[&upf_seid].dl_teid;
+
+        let mut pdi = crate::n4_build::PfcpMessageBuilder::new();
+        pdi.add_u8(pfcp_ie::SOURCE_INTERFACE, 0);
+        pdi.add_tlv(pfcp_ie::F_TEID, &[0x00, 0, 0, 0, 0]); // TEID 0: the UPF chooses
+        let mut pdr = crate::n4_build::PfcpMessageBuilder::new();
+        pdr.add_pdr_id(0x55);
+        pdr.add_u32(pfcp_ie::PRECEDENCE, 10);
+        pdr.add_tlv(pfcp_ie::PDI, &pdi.build());
+        pdr.add_u8(pfcp_ie::OUTER_HEADER_REMOVAL, 0);
+        pdr.add_u32(pfcp_ie::FAR_ID, 0x50);
+        pdr.add_u32(pfcp_ie::QER_ID, 0x55);
+        let mut fp = crate::n4_build::PfcpMessageBuilder::new();
+        fp.add_u8(pfcp_ie::DESTINATION_INTERFACE, 0);
+        fp.add_tlv(
+            pfcp_ie::OUTER_HEADER_CREATION,
+            &[0x01, 0x00, 0x00, 0x00, 0x0F, 0x0D, 127, 58, 3, 1],
+        );
+        let mut far = crate::n4_build::PfcpMessageBuilder::new();
+        far.add_u32(pfcp_ie::FAR_ID, 0x50);
+        far.add_u16(pfcp_ie::APPLY_ACTION, 0x02);
+        far.add_tlv(pfcp_ie::FORWARDING_PARAMETERS, &fp.build());
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr.build());
+        b.add_tlv(pfcp_ie::CREATE_FAR, &far.build());
+        b.add_tlv(pfcp_ie::CREATE_QER, &qer_body(0x55, 5));
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+
+        let (_, body) = ParsedPfcpHeader::parse(&resp).unwrap();
+        let ies = ParsedIe::parse_all(body);
+        let created = ParsedIe::find_ie(&ies, pfcp_ie::CREATED_PDR)
+            .expect("a Created PDR for the PDR whose F-TEID the UPF chose");
+        let inner = ParsedIe::parse_all(&created.value);
+        let id = ParsedIe::find_ie(&inner, pfcp_ie::PDR_ID).unwrap();
+        assert_eq!(id.value[..], [0x00, 0x55]);
+        let fteid = crate::n4_build::ParsedFTeid::parse(
+            &ParsedIe::find_ie(&inner, pfcp_ie::F_TEID).unwrap().value,
+        )
+        .unwrap();
+        assert_ne!(fteid.teid, 0);
+        assert!(fteid.ipv4.is_some(), "the UPF's GTP-U address");
+
+        apply_next(&mut rx, &dp).await;
+        let session = dp
+            .sessions
+            .find_by_ul_teid(fteid.teid)
+            .expect("the allocated TEID routes to the session");
+        assert_eq!(session.upf_seid, upf_seid);
+        assert_eq!(
+            session.pdr_teids.read().unwrap().get(&0x55),
+            Some(&fteid.teid),
+            "the PDR detects on the tunnel allocated for it"
+        );
+        assert_eq!(
+            server.sessions.read().await[&upf_seid].dl_teid,
+            dl_before,
+            "a relay FAR's endpoint is not the session's downlink tunnel"
+        );
     }
 
     /// Criterion 1: provisioning charging mid-session is the normal way it is added,
