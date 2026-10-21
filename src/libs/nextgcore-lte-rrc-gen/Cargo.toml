@@ -1,0 +1,21 @@
+[package]
+name = "nextgcore-lte-rrc-gen"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore E-UTRA RRC UPER codec generated from the TS 36.331 ASN.1 (#585)"
+
+[dependencies]
+asn1-codecs.workspace = true
+asn1_codecs_derive.workspace = true
+bitvec.workspace = true
+# Direct, not transitive: the UperCodec derive expands to `log::` paths inside
+# the generated code, so this crate must name `log` itself.
+log.workspace = true
+
+[build-dependencies]
+asn1-compiler.workspace = true
+
+[lints]
+workspace = true
