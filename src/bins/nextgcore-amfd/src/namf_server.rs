@@ -249,6 +249,16 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
             handle_dereg_notify_callback(parts[2], &request)
         }
 
+        // Namf_Callback: Nsmf_PDUSession SmContextStatusNotification (#540,
+        // TS 29.502 §5.2.2.6), POSTed to the smContextStatusUri the AMF gave at
+        // CreateSMContext. A RELEASED status drops the AMF's session record.
+        //   POST /namf-callback/v1/{supi}/sm-context-status/{psi}
+        "namf-callback"
+            if parts.len() == 5 && parts[3] == "sm-context-status" && method == "POST" =>
+        {
+            handle_sm_context_status_callback(parts[2], parts[4], &request)
+        }
+
         // --------------------------------------------------------------
         // Namf_Callback: Npcf_UEPolicyControl update/terminate notification
         // (#92, TS 29.525 §4.2.4). The PCF POSTs a `PolicyUpdate` to
@@ -523,6 +533,30 @@ fn handle_dereg_notify_callback(supi: &str, request: &SbiRequest) -> SbiResponse
 /// AMF DELETE a 404 at deregistration and, worse, report a live UE-policy
 /// association that does not exist.
 ///
+/// SmContextStatusNotification (TS 29.502 §6.1.6.2.6) for PDU session `psi` of
+/// `supi` (#540): acknowledged with 204; a `RELEASED` resource status removes
+/// the AMF's record of the session.
+fn handle_sm_context_status_callback(supi: &str, psi: &str, request: &SbiRequest) -> SbiResponse {
+    let state = parse_json_body(request)
+        .and_then(|b| {
+            b.pointer("/statusInfo/resourceStatus")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    log::info!("[{supi}] SM context status for PSI {psi}: {state}");
+    if state == "RELEASED" {
+        if let (Ok(psi), Some(ue)) = (psi.parse::<u8>(), find_ue_by_context_id(supi)) {
+            if let Ok(guard) = amf_self().read() {
+                if let Some(sess) = guard.sess_find_by_psi(ue.id, psi) {
+                    guard.sess_remove(sess.id);
+                }
+            }
+        }
+    }
+    SbiResponse::with_status(204)
+}
+
 /// Fail-soft rather than fail-closed, unlike `dereg-notify`: a malformed body is
 /// logged and still 204'd. TS 29.500 §5.2.7's fail-closed rule protects a producer
 /// from acting on a request it did not understand, and this route acts on nothing —
@@ -3358,11 +3392,6 @@ fn try_ue_policy_relay(
 
     let failure_uri = body.get("n1n2FailureTxfNotifURI").and_then(Value::as_str);
 
-    // The N1 downlink needs a live NAS signalling connection (CM-CONNECTED).
-    if ue_ran_context(ue).is_none() {
-        return Some(ue_not_reachable_error(ue_context_id, failure_uri));
-    }
-
     let Some(updp_pdu) = body
         .pointer("/n1MessageContainer/n1MessageContent/contentId")
         .and_then(Value::as_str)
@@ -3373,6 +3402,36 @@ fn try_ue_policy_relay(
             "no binary part for the UPDP payload",
         ));
     };
+
+    // The N1 downlink needs a NAS signalling connection. A CM-IDLE UE is paged
+    // and the UPDP is delivered after its Service Request (#540, TS 23.502
+    // §4.2.3.3 step 3a, TS 29.518 §5.2.2.3.1: 202 ATTEMPTING_TO_REACH_UE);
+    // before this the PCF got 504 and the policy never reached the UE.
+    if ue_ran_context(ue).is_none() {
+        // Paging needs a registered UE whose NGAP record says CM-IDLE (it holds
+        // the 5G-S-TMSI and registration area); a UE with no such record cannot
+        // be paged and stays UE_NOT_REACHABLE.
+        let registered_idle = amf_self()
+            .read()
+            .ok()
+            .and_then(|g| g.ue_store().get(ue.id))
+            .is_some_and(|state| state.is_cm_idle());
+        if !registered_idle {
+            return Some(ue_not_reachable_error(ue_context_id, failure_uri));
+        }
+        let location = crate::namf_handler::page_idle_ue_for_n1(
+            ue,
+            updp_pdu,
+            crate::gmm_handler::payload_container_type::UE_POLICY_CONTAINER,
+            failure_uri,
+        );
+        log::info!("[{ue_context_id}] UE policy: UE is CM-IDLE, paging it for the UPDP");
+        let body = json!({ "cause": "ATTEMPTING_TO_REACH_UE" });
+        return Some(match SbiResponse::with_status(202).with_json_body(&body) {
+            Ok(resp) => resp.with_header("location", location),
+            Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
+        });
+    }
 
     if let Ok(context) = amf_self().read() {
         context.positioning_dl_add(PendingPositioningDl {
@@ -6852,6 +6911,53 @@ mod tests {
     /// idle UE to connected mid-test — the known
     /// `test_ue_context_transfer_error_paths` flake class). The HTTP routing
     /// into the relay is covered by the connected-UE test above.
+    /// #540 / TS 23.502 §4.2.3.3 step 3a: a UPDP for a REGISTERED UE that is
+    /// CM-IDLE pages it (202 ATTEMPTING_TO_REACH_UE) and queues the policy for
+    /// delivery in a UE policy container after the Service Request -- before
+    /// this the PCF got 504 and the policy never reached the UE.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_n1n2_updp_to_a_registered_idle_ue_pages_it() {
+        let _serial = updp_queue_test_lock().lock().await;
+        amf_context_init(64, 1024, 4096);
+        let supi = "imsi-001010000540002";
+        let mut ue = AmfUe::new(987_540, NEXTGCORE_INVALID_POOL_ID);
+        ue.supi = Some(supi.to_string());
+        ue.ran_ue_id = NEXTGCORE_INVALID_POOL_ID;
+        amf_self().read().unwrap().amf_ue_publish(&ue, 1, 1);
+        let body = json!({
+            "n1MessageContainer": {
+                "n1MessageClass": "UPDP",
+                "n1MessageContent": { "contentId": "updp-pdu" }
+            }
+        });
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
+            .with_json_body(&body)
+            .expect("json")
+            .with_part(SbiPart::with_content(
+                "updp-pdu",
+                "application/vnd.3gpp.5gnas",
+                bytes::Bytes::from_static(&[0x80, 0x01, 0x00]),
+            ));
+        let resp = try_ue_policy_relay(supi, &ue, &req, &body).expect("a UE-policy relay");
+        assert_eq!(resp.status, 202);
+        assert_eq!(
+            body_json(&resp)["cause"].as_str(),
+            Some("ATTEMPTING_TO_REACH_UE")
+        );
+        let paged = amf_self()
+            .read()
+            .unwrap()
+            .paging_find(ue.id)
+            .expect("paging queued");
+        assert_eq!(paged.pending_n1.as_deref(), Some(&[0x80, 0x01, 0x00][..]));
+        assert_eq!(
+            paged.pending_n1_container_type,
+            crate::gmm_handler::payload_container_type::UE_POLICY_CONTAINER
+        );
+        amf_self().read().unwrap().paging_remove(ue.id);
+        amf_self().read().unwrap().amf_ue_unpublish(ue.id);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_n1n2_updp_to_idle_ue_504_not_fake_200() {
         // This test drives production code against a loopback PLAINTEXT peer, i.e.

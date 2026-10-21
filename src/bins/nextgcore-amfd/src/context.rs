@@ -2001,6 +2001,16 @@ impl AmfContext {
     // ========================================================================
 
     /// Initiate paging for a UE in CM-IDLE state
+    /// Set the payload container type a queued paging context's pending N1 is
+    /// delivered in (#540). No-op when no paging is queued for the UE.
+    pub fn paging_set_n1_container_type(&self, amf_ue_ngap_id: u64, container_type: u8) {
+        if let Ok(mut paging_map) = self.paging_map.write() {
+            if let Some(ctx) = paging_map.get_mut(&amf_ue_ngap_id) {
+                ctx.pending_n1_container_type = container_type;
+            }
+        }
+    }
+
     pub fn paging_add(&self, ctx: PagingContext) -> bool {
         if let Ok(mut paging_map) = self.paging_map.write() {
             let id = ctx.amf_ue_ngap_id;
@@ -4226,6 +4236,10 @@ pub struct PagingContext {
     pub max_retransmit: u8,
     /// Pending N1 message to deliver after paging response
     pub pending_n1: Option<Vec<u8>>,
+    /// Payload container type `pending_n1` is delivered in (TS 24.501 Table
+    /// 9.11.3.40.1): N1 SM information (0x01) for a session's N1, UE policy
+    /// container (0x05) for a paged UE-policy delivery (#540).
+    pub pending_n1_container_type: u8,
     /// Pending N2 info to deliver after paging response
     pub pending_n2: Option<Vec<u8>>,
     /// Whether `pending_n2` is a PDU Session Resource Release Command transfer
@@ -4273,6 +4287,8 @@ impl Default for PagingContext {
             retransmit_count: 0,
             max_retransmit: 4,
             pending_n1: None,
+            pending_n1_container_type:
+                crate::gmm_handler::payload_container_type::N1_SM_INFORMATION,
             pending_n2: None,
             pending_n2_release: false,
             pdu_session_id: None,

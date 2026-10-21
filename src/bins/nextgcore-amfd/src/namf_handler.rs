@@ -370,7 +370,7 @@ pub fn handle_n1_n2_message_transfer(
                         cause = N1N2MessageTransferCause::AttemptingToReachUe;
                         initiate_paging_for_idle_ue(
                             amf_ue,
-                            sess,
+                            Some(sess),
                             req_data.n1_message.clone(),
                             n2_info.ngap_data.clone(),
                             false,
@@ -399,7 +399,7 @@ pub fn handle_n1_n2_message_transfer(
                         cause = N1N2MessageTransferCause::AttemptingToReachUe;
                         initiate_paging_for_idle_ue(
                             amf_ue,
-                            sess,
+                            Some(sess),
                             req_data.n1_message.clone(),
                             n2_info.ngap_data.clone(),
                             true,
@@ -435,7 +435,7 @@ pub fn handle_n1_n2_message_transfer(
             cause = N1N2MessageTransferCause::AttemptingToReachUe;
             initiate_paging_for_idle_ue(
                 amf_ue,
-                sess,
+                Some(sess),
                 req_data.n1_message.clone(),
                 None,
                 false,
@@ -686,9 +686,10 @@ pub fn send_event_notification(
 /// Creates a PagingContext, stores it in the AMF context paging map,
 /// and marks the session paging as ongoing. The NGAP Paging message
 /// will be sent by the event loop timer when it processes paging entries.
+#[allow(clippy::too_many_arguments)]
 fn initiate_paging_for_idle_ue(
     amf_ue: &AmfUe,
-    sess: &mut AmfSess,
+    sess: Option<&mut AmfSess>,
     pending_n1: Option<Vec<u8>>,
     pending_n2: Option<Vec<u8>>,
     pending_n2_release: bool,
@@ -715,6 +716,7 @@ fn initiate_paging_for_idle_ue(
         retransmit_count: 0,
         max_retransmit: 4,
         pending_n1,
+        pending_n1_container_type: crate::gmm_handler::payload_container_type::N1_SM_INFORMATION,
         pending_n2,
         pending_n2_release,
         pdu_session_id,
@@ -740,7 +742,9 @@ fn initiate_paging_for_idle_ue(
     if let Ok(context) = ctx.read() {
         context.paging_add(paging_ctx);
     }
-    sess.store_paging_info(&location, failure_notify_uri);
+    if let Some(sess) = sess {
+        sess.store_paging_info(&location, failure_notify_uri);
+    }
 
     log::info!(
         "[{}] Paging initiated: TMSI=0x{:08x}, TAC={}, PSI={:?}",
@@ -749,6 +753,37 @@ fn initiate_paging_for_idle_ue(
         tac,
         pdu_session_id
     );
+}
+
+/// Page a CM-IDLE UE for an N1 message that belongs to no PDU session -- a
+/// UE-policy (UPDP) delivery from the PCF (#540, TS 23.502 §4.2.3.3 step 3a) --
+/// and keep it for delivery, in `container_type`, once the Service Request
+/// arrives. Returns the N1N2 transfer resource the 202 Location names.
+pub fn page_idle_ue_for_n1(
+    amf_ue: &AmfUe,
+    n1: Vec<u8>,
+    container_type: u8,
+    failure_notify_uri: Option<&str>,
+) -> String {
+    initiate_paging_for_idle_ue(
+        amf_ue,
+        None,
+        Some(n1),
+        None,
+        false,
+        None,
+        failure_notify_uri,
+    );
+    // The context was just queued with the default container type; set the one
+    // this N1 travels in.
+    let ctx = amf_self();
+    if let Ok(context) = ctx.read() {
+        context.paging_set_n1_container_type(amf_ue.id, container_type);
+    }
+    format!(
+        "/namf-comm/v1/ue-contexts/{}/n1-n2-messages",
+        amf_ue.supi.as_deref().unwrap_or("unknown")
+    )
 }
 
 /// Handle event unsubscribe (Namf_EventExposure_Unsubscribe)

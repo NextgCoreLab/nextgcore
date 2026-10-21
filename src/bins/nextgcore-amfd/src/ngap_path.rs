@@ -438,6 +438,30 @@ fn service_request_s_tmsi(plain: &[u8]) -> Option<(u16, u8, u32)> {
     Some((amf_set_id, amf_pointer, tmsi))
 }
 
+/// Record PDU session `psi` of `amf_ue_ngap_id` in the AMF context's session
+/// store -- where the Namf N1N2MessageTransfer handler and the Service Request's
+/// re-activation find it (#540) -- unless it is already there.
+fn record_amf_session(
+    amf_ue_ngap_id: u64,
+    psi: u8,
+    sm_context_ref: &str,
+    sst: u8,
+    sd: Option<u32>,
+) {
+    let ctx = crate::context::amf_self();
+    let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+    let sess = match guard.sess_find_by_psi(amf_ue_ngap_id, psi) {
+        Some(sess) => Some(sess),
+        None => guard.sess_add(amf_ue_ngap_id, psi),
+    };
+    if let Some(mut sess) = sess {
+        sess.sm_context_ref = Some(sm_context_ref.to_string());
+        sess.s_nssai.sst = sst;
+        sess.s_nssai.sd = sd;
+        guard.sess_update(&sess);
+    }
+}
+
 /// Clear the paging state the N1N2 transfer set on the paged PDU session
 /// (`AmfSess::store_paging_info`), once paging has ended either way.
 fn clear_session_paging(paging: &crate::context::PagingContext) {
@@ -5053,11 +5077,26 @@ impl NgapServer {
                 .collect()
         };
         let already: Vec<u8> = sessions.iter().map(|s| s.pdu_session_id).collect();
-        let plan = plan_service_request_sessions(
+        let mut plan = plan_service_request_sessions(
             &held.iter().map(|(psi, _, _)| *psi).collect::<Vec<_>>(),
             sr_ies,
             &already,
         );
+        // #540 / TS 23.502 §4.2.3.3 step 6: a page for a PDU session whose N1N2
+        // transfer brought no N2 SM transfer -- smfd's Downlink Data Report
+        // paging names the session and the IE type only -- is re-activated like
+        // an uplink-data session (§4.2.3.2 step 4, upCnxState ACTIVATING), so the
+        // ICS carries it and the buffered downlink is delivered.
+        if let Some(p) = &paging {
+            if let (Some(psi), false) = (p.pdu_session_id, p.pending_n2_release) {
+                if !already.contains(&psi)
+                    && !plan.activate.contains(&psi)
+                    && held.iter().any(|(h, _, _)| *h == psi)
+                {
+                    plan.activate.push(psi);
+                }
+            }
+        }
         let (smf_host, smf_port) = Self::smf_sbi_target();
         for psi in &plan.release {
             let sm_ref = held
@@ -5222,7 +5261,7 @@ impl NgapServer {
         if let Some(n1) = &paging.pending_n1 {
             let plain = gmm_build::build_dl_nas_transport(
                 paging.pdu_session_id,
-                payload_container_type::N1_SM_INFORMATION,
+                paging.pending_n1_container_type,
                 n1,
                 None,
                 None,
@@ -6224,6 +6263,12 @@ impl NgapServer {
                         // PSI and must not be reconstructed from one.
                         self.sm_context_refs
                             .insert((amf_ue_ngap_id, psi), resp.sm_context_ref.clone());
+                        // #540: also the AmfSess the Namf N1N2MessageTransfer handler
+                        // and the Service Request's re-activation look the session up
+                        // in. Before this only `sm_context_refs` was written, so every
+                        // N1N2 transfer from the SMF -- the paging request included --
+                        // answered 404 and an idle UE could never be reached.
+                        record_amf_session(amf_ue_ngap_id, psi, &resp.sm_context_ref, sst, sd);
 
                         // #356: record the emergency PDU session against the UE's
                         // emergency context. Before this `assign_emergency_pdu_session`
@@ -7398,17 +7443,57 @@ impl NgapServer {
         // is what makes a later N1N2 transfer page it (#512). Marked whether or not
         // the mobile reachable timer below is enabled.
         if let Some(id) = amf_ue_ngap_id {
-            self.ue_auth_state.with_mut(id, |s| {
-                if s.registered {
-                    s.cm_idle = true;
-                }
-            });
+            let went_idle = self
+                .ue_auth_state
+                .with_mut(id, |s| {
+                    if s.registered {
+                        s.cm_idle = true;
+                    }
+                    s.registered
+                })
+                .unwrap_or(false);
+            // #540 / TS 23.502 §4.2.6 step 5: the AN release ends the user plane of
+            // every PDU session the UE keeps, so the SMF has the UPF buffer
+            // downlink data (and report it, which is what pages the UE) instead
+            // of forwarding it to the released gNB F-TEID.
+            if went_idle {
+                self.deactivate_up_connections(id).await;
+            }
         }
         // TS 24.501 §5.3.7: for a UE that is still REGISTERED this is the moment the
         // mobile reachable timer starts.
         self.start_reachability_supervision(association_id, amf_ue_ngap_id)
             .await;
         Ok(())
+    }
+
+    /// Nsmf_PDUSession_UpdateSMContext with `upCnxState: DEACTIVATED` for every
+    /// PDU session of `amf_ue_ngap_id` (TS 23.502 §4.2.6 step 5, TS 29.502
+    /// §5.2.2.3.2.2), once its AN release is complete (#540). Best effort: a
+    /// failed deactivation is logged and the others still go.
+    async fn deactivate_up_connections(&mut self, amf_ue_ngap_id: u64) {
+        let refs: Vec<(u8, String)> = self
+            .sm_context_refs
+            .iter()
+            .filter(|((ue, _), _)| *ue == amf_ue_ngap_id)
+            .map(|((_, psi), r)| (*psi, r.clone()))
+            .collect();
+        if refs.is_empty() {
+            return;
+        }
+        let (smf_host, smf_port) = Self::smf_sbi_target();
+        for (psi, sm_ref) in refs {
+            match crate::sbi_path::call_smf_deactivate_up_connection(&smf_host, smf_port, &sm_ref)
+                .await
+            {
+                Ok(()) => {
+                    log::info!("UE {amf_ue_ngap_id}: PSI {psi} user plane deactivated (AN release)")
+                }
+                Err(e) => {
+                    log::warn!("UE {amf_ue_ngap_id}: PSI {psi} user-plane deactivation failed: {e}")
+                }
+            }
+        }
     }
 
     /// Start mobile-reachable supervision for every registered UE whose N1 connection
@@ -10013,14 +10098,17 @@ impl NgapServer {
         data: &[u8],
     ) -> Result<()> {
         use crate::ngap_asn1::InitialContextSetupOutcomeDecode::{Decoded, Failed, Undecodable};
+        let ics_setup_sessions: Vec<(u8, Vec<u8>)>;
         let (amf_ue_ngap_id, ran_ue_ngap_id) =
             match crate::ngap_asn1::decode_initial_context_setup_response_asn1(data) {
                 Decoded {
                     amf_ue_ngap_id,
                     ran_ue_ngap_id,
                     error_indication,
+                    setup_sessions,
                     ..
                 } => {
+                    ics_setup_sessions = setup_sessions;
                     // Best effort: the report must not stop the procedure.
                     if let Some(report) = error_indication {
                         if let Err(e) = self
@@ -10053,6 +10141,20 @@ impl NgapServer {
             "Initial Context Setup Response: amf_ue_ngap_id={amf_ue_ngap_id}, \
              ran_ue_ngap_id={ran_ue_ngap_id:?} (association {association_id})"
         );
+        // #540: each set-up session's Setup Response Transfer carries the gNB's
+        // downlink tunnel; the SMF must have it to move the UPF's downlink FAR off
+        // BUFF (TS 23.502 §4.2.3.2 steps 12-14). Before this an ICS that carried
+        // sessions -- a Service Request's re-activation -- left the UPF buffering.
+        for (psi, transfer) in &ics_setup_sessions {
+            self.relay_n2_sm_to_smf(
+                amf_ue_ngap_id,
+                *psi,
+                "PDU_RES_SETUP_RSP",
+                transfer,
+                "InitialContextSetupResponse",
+            )
+            .await;
+        }
 
         let updated = self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
             state.initial_context_setup_response_received = true;
@@ -10093,6 +10195,7 @@ impl NgapServer {
                     ran_ue_ngap_id,
                     cause,
                     error_indication,
+                    ..
                 } => {
                     // Best effort: the report must not stop the release.
                     if let Some(report) = error_indication {
@@ -11165,6 +11268,26 @@ impl NgapServer {
         if sm_context_refs.is_empty() {
             log::debug!("No PDU sessions to release for UE context release");
         }
+        // #540 / TS 23.502 §4.2.6: an AN release keeps a REGISTERED UE's PDU
+        // sessions -- only their user plane is deactivated, at Release Complete
+        // (`deactivate_up_connections`), so downlink data is buffered and pages
+        // the UE. Releasing them here left nothing for paging or the Service
+        // Request to bring back. An unregistered UE has no use for them.
+        let keeps_sessions = amf_ue_ngap_id
+            .and_then(|id| self.ue_auth_state.get(id))
+            .is_some_and(|s| s.registered);
+        let sm_context_refs = if keeps_sessions {
+            if !sm_context_refs.is_empty() {
+                log::info!(
+                    "AN release of a registered UE: keeping {} PDU session(s), their user \
+                     plane is deactivated at Release Complete (TS 23.502 §4.2.6)",
+                    sm_context_refs.len()
+                );
+            }
+            Vec::new()
+        } else {
+            sm_context_refs
+        };
         for (psi, sm_context_ref) in &sm_context_refs {
             log::info!("Releasing SMF SM Context: PSI={psi}, ref={sm_context_ref}");
             match crate::sbi_path::call_smf_release_sm_context(&smf_host, smf_port, sm_context_ref)
@@ -20043,6 +20166,27 @@ mod tests {
             1,
             "releasing a context must not rewrite history: total_emergency_count is \
              cumulative by design"
+        );
+    }
+
+    /// #540: a PDU session established over NAS is recorded in the AMF context's
+    /// session store -- where the Namf N1N2MessageTransfer handler and the Service
+    /// Request's re-activation look it up -- and recording it again only refreshes it.
+    #[test]
+    fn an_established_session_is_recorded_for_the_namf_side() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let ue = 7_540_001u64;
+        record_amf_session(ue, 5, "smctx-540", 1, Some(0x010203));
+        record_amf_session(ue, 5, "smctx-540b", 1, Some(0x010203));
+        let guard = crate::context::amf_self();
+        let guard = guard.read().unwrap();
+        let sess = guard.sess_find_by_psi(ue, 5).expect("recorded");
+        assert_eq!(sess.sm_context_ref.as_deref(), Some("smctx-540b"));
+        assert_eq!((sess.s_nssai.sst, sess.s_nssai.sd), (1, Some(0x010203)));
+        guard.sess_remove(sess.id);
+        assert!(
+            guard.sess_find_by_psi(ue, 5).is_none(),
+            "exactly one record"
         );
     }
 

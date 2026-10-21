@@ -1039,6 +1039,15 @@ fn build_create_sm_context_request(
     // absent SUPI surfaces as a refused session rather than a phantom subscriber.
     if let Some(supi) = &identity.supi {
         obj.insert("supi".to_string(), serde_json::json!(supi));
+        // #540: `smContextStatusUri` is mandatory in SmContextCreateData (TS
+        // 29.502 §6.1.6.2.2). Without it the SMF had no address for this AMF:
+        // status notifications were skipped and -- what #540 found -- a
+        // Downlink Data Report could not page the UE ("no serving-AMF callback
+        // URI"), because the SMF reaches Namf through this callback root.
+        obj.insert(
+            "smContextStatusUri".to_string(),
+            serde_json::json!(sm_context_status_uri(supi, pdu_session_id)),
+        );
     }
     if let Some(pei) = &identity.pei {
         obj.insert("pei".to_string(), serde_json::json!(pei));
@@ -1167,6 +1176,35 @@ pub async fn call_smf_create_sm_context(
         n2_sm_info,
         sm_context_ref,
     })
+}
+
+/// Ask the SMF to deactivate a session's user plane on AN release (#540):
+/// Nsmf_PDUSession_UpdateSMContext with `upCnxState: DEACTIVATED` (TS 29.502
+/// §5.2.2.3.2.2, TS 23.502 §4.2.6 step 5).
+pub async fn call_smf_deactivate_up_connection(
+    smf_host: &str,
+    smf_port: u16,
+    sm_context_ref: &str,
+) -> SbiResult<()> {
+    let client = crate::attach_oauth2(
+        SbiClient::for_peer(smf_host, smf_port),
+        nextgcore_sbi::types::NfType::Smf,
+    );
+    let body = serde_json::json!({ "upCnxState": "DEACTIVATED" });
+    let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify");
+    let request =
+        SbiRequest::post(&path).with_body(body.to_string(), content_type::APPLICATION_JSON);
+    let response = client
+        .send_request(request)
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("SMF UP deactivation failed: {e}")))?;
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "SMF UP deactivation returned status {}",
+            response.status
+        )));
+    }
+    Ok(())
 }
 
 /// Ask the SMF to re-activate a session's user plane (#518): Nsmf_PDUSession_
@@ -2614,6 +2652,16 @@ pub fn advertised_sbi_scheme() -> &'static str {
     } else {
         "http"
     }
+}
+
+/// The absolute `smContextStatusUri` the AMF gives the SMF for PDU session
+/// `psi` of `supi` (#540, TS 29.502 §5.2.2.2.1). Routed by `namf_server` at
+/// `POST /namf-callback/v1/{supi}/sm-context-status/{psi}`.
+pub fn sm_context_status_uri(supi: &str, psi: u8) -> String {
+    format!(
+        "{}/namf-callback/v1/{supi}/sm-context-status/{psi}",
+        advertised_sbi_base()
+    )
 }
 
 /// The absolute Nudm_UECM `deregCallbackUri` the AMF registers for `supi`
