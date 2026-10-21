@@ -55,6 +55,12 @@ pub mod test_support {
     /// test_ue_context_transfer_error_paths`).
     pub static CONTEXT_GUARD: Mutex<()> = Mutex::new(());
 
+    /// Serialises tests that set the SMF endpoint environment variables
+    /// (`SMF_SBI_ADDR` / `SMF_SBI_PORT`). The process environment is global, so the
+    /// lock lives here beside the other shared-state guards rather than in one
+    /// module's `mod tests`.
+    pub static SMF_ENV_LOCK: Mutex<()> = Mutex::new(());
+
     /// Initialize the process-global AMF context for in-process strict-peer
     /// tests (wraps [`crate::context::amf_context_init`] with test capacities).
     pub fn init_context() {
