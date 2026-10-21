@@ -22771,6 +22771,63 @@ mod tests {
             [0x00, 0x09, 0x40, 0x08, 0x00, 0x00, 0x01, 0x00, 0x0F, 0x40, 0x01, 0x66]
         );
     }
+
+    /// **#417.** A gNB's Multicast Session Activation Response, through
+    /// `process_ngap_message`, completes the activation of the session its
+    /// `MBS-SessionID` names -- with the TMGI's MBS Service ID first, as
+    /// TS 23.003 §30.2 orders it. The control: the same response with the
+    /// halves the other way round (what the hand-written codec sent and read)
+    /// names no session the AMF holds, and changes nothing.
+    #[tokio::test]
+    async fn an_mbs_activation_response_completes_the_session_it_names() {
+        use crate::ngap_mcast::{MbsSessionState, McastTransportInfo, Tmgi};
+        let mut server = test_ngap_server().await;
+        let assoc = 9417u64;
+        seed_gnb_session(&server, assoc).await;
+        let mcast = crate::context::amf_mcast();
+        // Process-global store: a TMGI no other test uses.
+        let tmgi = Tmgi::new(0x41_7008, [0x13, 0xF0, 0x41]);
+        let session = mcast
+            .session_create(tmgi.clone(), 1, None, vec![1])
+            .expect("session");
+        let sid = session.mbs_session_id;
+        let transport = McastTransportInfo {
+            dl_teid: 0x4170,
+            transport_addr: std::net::Ipv4Addr::new(10, 41, 7, 8),
+        };
+        assert_eq!(
+            mcast
+                .session_activate(sid, transport, &[assoc as u32])
+                .len(),
+            1
+        );
+        let state = || mcast.session_find(sid).expect("session").state;
+        assert_eq!(state(), MbsSessionState::Activating);
+
+        let swapped = Tmgi {
+            mbs_service_id: tmgi.plmn_id,
+            plmn_id: tmgi.mbs_service_id,
+        };
+        server
+            .process_ngap_message(
+                assoc,
+                &crate::ngap_mcast::tests::activation_response(&swapped),
+            )
+            .await
+            .expect("an MBS outcome is never answered");
+        assert_eq!(
+            state(),
+            MbsSessionState::Activating,
+            "control: the octets the other way round name another session"
+        );
+
+        server
+            .process_ngap_message(assoc, &crate::ngap_mcast::tests::activation_response(&tmgi))
+            .await
+            .expect("an MBS outcome is never answered");
+        assert_eq!(state(), MbsSessionState::Active);
+        mcast.session_remove(sid);
+    }
 }
 
 #[cfg(all(test, feature = "ntn"))]

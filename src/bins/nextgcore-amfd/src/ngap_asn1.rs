@@ -2975,57 +2975,67 @@ pub fn extract_amf_ue_ngap_id(data: &[u8]) -> Option<u64> {
         .map(|id| id.0)
 }
 
-/// Extract the `MBS-SessionID` (IE 299) from any MBS NGAP PDU as a [`crate::ngap_mcast::Tmgi`].
+/// Extract the `MBS-SessionID` (IE 299) from an MBS outcome as a
+/// [`crate::ngap_mcast::Tmgi`], with the GENERATED codec (#417): the response
+/// or failure of Broadcast Session Setup (68) or of Multicast Session
+/// Activation (71), Deactivation (72) or Update (73) -- every outcome the RAN
+/// can send for a procedure the AMF initiates.
 ///
-/// Every MBS message carries it, and it is what identifies the session: one gNB
-/// can hold several MBS sessions, so the SCTP association alone does not.
-///
-/// The IE is located by walking the decoded `ProtocolIE-Container` rather than
-/// by byte offset, because the container is APER and the preceding IEs are
-/// variable-length. MBS procedures are absent from the generated
-/// `*Value` enums, so they arrive as the `Other` variant -- which is also how
-/// the builders encode them.
+/// Every MBS message carries the IE, and it is what identifies the session: one
+/// gNB can hold several MBS sessions, so the SCTP association alone does not.
+/// Not-comprehended IEs are skipped: these are responses, whose criticality
+/// handling is local (TS 38.413 §10.3.4.2).
 pub fn extract_mbs_session_id(data: &[u8]) -> Option<crate::ngap_mcast::Tmgi> {
-    use nextgcore_asn1c::ngap::pdu::{
-        InitiatingMessageValue, NgapPdu, SuccessfulOutcomeValue, UnsuccessfulOutcomeValue,
+    macro_rules! session_id {
+        ($msg:expr, $ie:ident) => {
+            $msg.protocol_i_es.0.iter().find_map(|e| match &e.value {
+                ngap_gen::$ie::Id_MBS_SessionID(id) => Some(id.clone()),
+                _ => None,
+            })
+        };
+    }
+
+    let (pdu, _) = match nextgcore_ngap_gen::decode_with_unknown_ies(data) {
+        Ok(decoded) => decoded,
+        Err(e) => {
+            log::warn!("Failed to decode an MBS outcome: {e:?}");
+            return None;
+        }
     };
-    use nextgcore_asn1c::per::{AperDecode, AperDecoder};
-
-    let mut decoder = AperDecoder::new(data);
-    let pdu = NgapPdu::decode_aper(&mut decoder).ok()?;
-    let ies = match pdu {
-        NgapPdu::InitiatingMessage(m) => match m.value {
-            InitiatingMessageValue::Other(ies) => ies,
-            _ => return None,
+    let id = match pdu {
+        ngap_gen::NGAP_PDU::SuccessfulOutcome(m) => match m.value {
+            ngap_gen::SuccessfulOutcomeValue::Id_BroadcastSessionSetup(r) => {
+                session_id!(r, BroadcastSessionSetupResponseProtocolIEs_EntryValue)
+            }
+            ngap_gen::SuccessfulOutcomeValue::Id_MulticastSessionActivation(r) => {
+                session_id!(r, MulticastSessionActivationResponseProtocolIEs_EntryValue)
+            }
+            ngap_gen::SuccessfulOutcomeValue::Id_MulticastSessionDeactivation(r) => {
+                session_id!(
+                    r,
+                    MulticastSessionDeactivationResponseProtocolIEs_EntryValue
+                )
+            }
+            ngap_gen::SuccessfulOutcomeValue::Id_MulticastSessionUpdate(r) => {
+                session_id!(r, MulticastSessionUpdateResponseProtocolIEs_EntryValue)
+            }
+            _ => None,
         },
-        NgapPdu::SuccessfulOutcome(m) => match m.value {
-            SuccessfulOutcomeValue::Other(ies) => ies,
-            _ => return None,
+        ngap_gen::NGAP_PDU::UnsuccessfulOutcome(m) => match m.value {
+            ngap_gen::UnsuccessfulOutcomeValue::Id_BroadcastSessionSetup(f) => {
+                session_id!(f, BroadcastSessionSetupFailureProtocolIEs_EntryValue)
+            }
+            ngap_gen::UnsuccessfulOutcomeValue::Id_MulticastSessionActivation(f) => {
+                session_id!(f, MulticastSessionActivationFailureProtocolIEs_EntryValue)
+            }
+            ngap_gen::UnsuccessfulOutcomeValue::Id_MulticastSessionUpdate(f) => {
+                session_id!(f, MulticastSessionUpdateFailureProtocolIEs_EntryValue)
+            }
+            _ => None,
         },
-        NgapPdu::UnsuccessfulOutcome(m) => match m.value {
-            UnsuccessfulOutcomeValue::Other(ies) => ies,
-            _ => return None,
-        },
-    };
-
-    let field = ies
-        .ies
-        .iter()
-        .find(|ie| ie.id.0 == nextgcore_ngap::ie::IE_ID_MBS_SESSION_ID)?;
-
-    // MBS-SessionID ::= SEQUENCE { pLMNIdentity OCTET STRING (SIZE(3)),
-    //   mBS-ServiceID OCTET STRING (SIZE(3)), ... } plus an optional NID,
-    // matching `MbsSessionId::encode`'s preamble.
-    let mut ie_decoder = AperDecoder::new(&field.value);
-    let _ext = ie_decoder.read_bit().ok()?;
-    let _nid_present = ie_decoder.read_bit().ok()?;
-    let plmn = ie_decoder.decode_octet_string(Some(3), Some(3)).ok()?;
-    let service = ie_decoder.decode_octet_string(Some(3), Some(3)).ok()?;
-
-    Some(crate::ngap_mcast::Tmgi {
-        plmn_id: plmn.try_into().ok()?,
-        mbs_service_id: service.try_into().ok()?,
-    })
+        ngap_gen::NGAP_PDU::InitiatingMessage(_) => None,
+    }?;
+    crate::ngap_mcast::tmgi_from_generated(&id)
 }
 
 /// Extract the RAN-UE-NGAP-ID (IE 85) from any UE-associated NGAP PDU.
