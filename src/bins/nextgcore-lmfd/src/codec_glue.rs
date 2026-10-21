@@ -22,9 +22,9 @@
 //! [`decode_lpp_multi_rtt_report`] — are used by the inbound SBI handlers in
 //! `main.rs`.
 
+pub use crate::sidelink_epdu::SidelinkRangingMethod;
 use crate::CellMeasurement;
 use nextgcore_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
-use nextgcore_asn1c::lpp::sidelink_ranging::SidelinkRangingMethod;
 use nextgcore_lpp_gen::generated as lpp;
 
 // ---------------------------------------------------------------------------
@@ -886,13 +886,26 @@ pub struct SidelinkRange {
     pub measurement_count: u16,
 }
 
-/// Adapt a decoded LPP `ProvideLocationInformation` carrying a sidelink ranging
-/// report (addition group 4) into [`SidelinkRange`]s.
+impl SidelinkRange {
+    fn from_result(result: &crate::sidelink_epdu::SidelinkRangingResult) -> Self {
+        Self {
+            peer_layer2_id: result.peer_layer2_id,
+            range_m: f64::from(result.range_cm) / 100.0,
+            accuracy_m: f64::from(result.accuracy_cm) / 100.0,
+            method: result.method,
+            measurement_count: result.measurement_count,
+        }
+    }
+}
+
+/// Adapt the legacy (pre-#542) sidelink ranging report that nextgsim's UE carried
+/// in an invented fourth addition group of `ProvideLocationInformation-r9-IEs`.
 ///
-/// Returns an empty `Vec` when the message is not a `ProvideLocationInformation` or
-/// carries no report — which is every message a UE without sidelink ranging sends,
-/// so an empty result is the normal case and not an error.
-pub fn lpp_sidelink_ranging_to_ranges(msg: &LppMessage) -> Vec<SidelinkRange> {
+/// Kept only for the transition: nextgsim's sender moves to the EPDU after this
+/// decoder ships, and the next change removes this path with the hand-written LPP
+/// codec it needs (#515).
+fn legacy_group4_ranges(msg: &LppMessage) -> Vec<SidelinkRange> {
+    use nextgcore_asn1c::lpp::sidelink_ranging::SidelinkRangingMethod as Legacy;
     let prov = match msg.message_body.as_ref() {
         Some(LppMessageBody::C1(MessageBodyC1::ProvideLocationInformation(p))) => p,
         _ => return vec![],
@@ -903,29 +916,52 @@ pub fn lpp_sidelink_ranging_to_ranges(msg: &LppMessage) -> Vec<SidelinkRange> {
     report
         .results
         .iter()
-        .map(|result| SidelinkRange {
-            peer_layer2_id: result.peer_layer2_id,
-            range_m: result.range_m(),
-            accuracy_m: result.accuracy_m(),
-            method: result.method,
-            measurement_count: result.measurement_count,
+        .map(|r| {
+            SidelinkRange::from_result(&crate::sidelink_epdu::SidelinkRangingResult {
+                peer_layer2_id: r.peer_layer2_id,
+                range_cm: r.range_cm,
+                accuracy_cm: r.accuracy_cm,
+                method: match r.method {
+                    Legacy::Rtt => SidelinkRangingMethod::Rtt,
+                    Legacy::CarrierPhase => SidelinkRangingMethod::CarrierPhase,
+                },
+                measurement_count: r.measurement_count,
+            })
         })
         .collect()
 }
 
 /// Decode raw LPP UPER bytes and adapt any sidelink ranging report.
 ///
+/// The report rides in `epdu-ProvideLocationInformation` (TS 37.355 §6.5.7) under
+/// nextg's non-standard EPDU identifier; see [`crate::sidelink_epdu`]. The message
+/// is decoded with the generated codec. An empty `Vec` is the normal answer for a
+/// UE that does no sidelink ranging.
+///
 /// Separate from [`decode_lpp_provide_report`] because the two answer different
 /// questions: that one produces cell measurements a solver consumes, this one
-/// produces ranges to peer UEs that no solver can consume. A single function
-/// returning both would invite a caller to treat one as the other.
+/// produces ranges to peer UEs that no solver can consume.
 pub fn decode_lpp_sidelink_ranging(bytes: &[u8]) -> Result<(u64, Vec<SidelinkRange>), String> {
-    let msg = LppMessage::decode(bytes).map_err(|e| format!("LPP UPER decode: {e}"))?;
-    let request_id = msg
-        .transaction_id
-        .as_ref()
-        .map_or(0, |t| u64::from(t.transaction_number.0));
-    Ok((request_id, lpp_sidelink_ranging_to_ranges(&msg)))
+    let msg = decode_lpp(bytes)?;
+    let request_id = extract_lpp_request_id(&msg).unwrap_or(0);
+    if let Some(ies) = provide_location_r9(&msg) {
+        if let Some(report) = crate::sidelink_epdu::report_in(ies) {
+            let report = report?;
+            return Ok((
+                request_id,
+                report
+                    .results
+                    .iter()
+                    .map(SidelinkRange::from_result)
+                    .collect(),
+            ));
+        }
+    }
+    // Transition only: a sender that still uses the legacy fourth group.
+    let ranges = LppMessage::decode(bytes)
+        .map(|m| legacy_group4_ranges(&m))
+        .unwrap_or_default();
+    Ok((request_id, ranges))
 }
 
 // ---------------------------------------------------------------------------
