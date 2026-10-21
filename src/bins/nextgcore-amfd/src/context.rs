@@ -3423,6 +3423,16 @@ pub struct AmfUe {
     pub ran_ue_holding_id: u64,
     /// UE Radio Capability
     pub ue_radio_capability: Vec<u8>,
+    /// RACS (#570): the UE set the RACS bit of its 5GMM capability IE
+    /// (TS 24.501 §9.11.3.1 octet 4 bit 8), so the AMF may give it an ID.
+    pub racs_supported: bool,
+    /// RACS (#570): the UE's UE radio capability ID, in TS 24.501 §9.11.3.68
+    /// value-octet form (the bytes NGAP carries), presented by the UE or assigned
+    /// by the UCMF.
+    pub ue_radio_capability_id: Option<Vec<u8>>,
+    /// RACS (#570): the UE already holds `ue_radio_capability_id` (it presented it,
+    /// or the AMF sent it), so it need not be sent again.
+    pub ue_radio_capability_id_known_to_ue: bool,
     /// Handover info
     pub handover: HandoverInfo,
     /// Data change subscription
@@ -3981,6 +3991,9 @@ impl AmfUe {
             ran_ue_id,
             ran_ue_holding_id: NEXTGCORE_INVALID_POOL_ID,
             ue_radio_capability: Vec::new(),
+            racs_supported: false,
+            ue_radio_capability_id: None,
+            ue_radio_capability_id_known_to_ue: false,
             handover: HandoverInfo::default(),
             data_change_subscription: DataChangeSubscription::default(),
             explicit_de_registered: ExplicitDeRegistered::default(),

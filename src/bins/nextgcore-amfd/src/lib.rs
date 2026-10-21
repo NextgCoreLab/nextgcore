@@ -27,6 +27,7 @@ pub mod ngap_mcast; // MBS: NGAP multicast session procedures (TS 38.413 / TS 23
 pub mod ngap_path;
 pub mod ngap_sm;
 pub mod positioning; // LCS: LMF positioning relay (NRPPa N2 / LPP N1) — TS 23.273
+pub mod racs; // #570: RACS on the AMF (TS 23.501 §5.4.4.1a, TS 29.673)
 pub mod sbi_path;
 pub mod snpn; // Rel-16: SNPN authentication (TS 23.501 §5.30)
 pub mod timer;
@@ -1047,8 +1048,10 @@ pub async fn run() -> Result<()> {
     log::info!("Namf SBI HTTP/2 server listening on {sbi_sock}");
 
     // Register with NRF (if configured)
+    let mut amf_nf_instance_id = String::new();
     match sbi_path::amf_nrf_register(&sbi_addr, sbi_port).await {
         Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
+            amf_nf_instance_id = nf_instance_id.clone();
             // G2-2: PATCH a real NFProfile "/load" gauge to NRF each heartbeat
             // (registered UEs vs configured capacity; TS 29.510 §5.2.2.3.2).
             nextgcore_sbi::heartbeat::spawn_heartbeat_worker_with_load(nf_instance_id, 5, || {
@@ -1070,6 +1073,26 @@ pub async fn run() -> Result<()> {
     if let Err(e) = sbi_path::amf_nrf_discover("SMF", "nsmf-pdusession").await {
         log::warn!("SMF discovery failed (will retry on demand): {e}");
     }
+
+    // #570: subscribe to the UCMF's dictionary notifications (TS 29.673 §5.2.2.4),
+    // so deleted or out-of-version UE radio capability IDs are not put in NGAP and
+    // UEs holding them are told. In the background, with retries: the UCMF may come
+    // up after the AMF, and a deployment without one (no RACS) just logs.
+    tokio::spawn(async move {
+        for attempt in 1..=30u32 {
+            match racs::ucmf_subscribe(&amf_nf_instance_id).await {
+                Ok(()) => {
+                    log::info!("Subscribed to UCMF dictionary notifications");
+                    return;
+                }
+                Err(e) if attempt == 30 => {
+                    log::info!("No UCMF subscription (RACS notifications unavailable): {e}");
+                }
+                Err(e) => log::debug!("UCMF subscription attempt {attempt} failed: {e}"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        }
+    });
 
     log::info!("NextGCore AMF ready");
 
