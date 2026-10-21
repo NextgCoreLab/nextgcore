@@ -21,7 +21,9 @@
 //! encodes. Stage 9 is Reset and Error Indication (§8.7.1, §8.7.2): the RESET
 //! and ERROR INDICATION decodes and the RESET ACKNOWLEDGE and ERROR INDICATION
 //! encodes. Stage 10 is Path Switch (§8.4.4): the PATH SWITCH REQUEST decode
-//! and its ACKNOWLEDGE / FAILURE encodes.
+//! and its ACKNOWLEDGE / FAILURE encodes. Stage 8b is the rest of handover
+//! preparation (§8.4.1, §8.4.2): the HANDOVER REQUIRED and HANDOVER REQUEST
+//! ACKNOWLEDGE decodes and the HANDOVER REQUEST and HANDOVER COMMAND encodes.
 
 use bitvec::prelude::{BitVec, Msb0};
 use nextgcore_s1ap::{
@@ -1706,29 +1708,7 @@ const ID_ENB_STATUS_TRANSFER_CONTAINER: u16 = 90;
 pub fn build_handover_preparation_failure(
     msg: &nextgcore_s1ap::HandoverPreparationFailure,
 ) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
-    use g::HandoverPreparationFailureProtocolIEs_EntryValue as V;
-    let ie = |id: u16, value: V| g::HandoverPreparationFailureProtocolIEs_Entry {
-        id: g::ProtocolIE_ID(id),
-        criticality: g::Criticality(IGNORE),
-        value,
-    };
-    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::UnsuccessfulOutcome(g::UnsuccessfulOutcome {
-        procedure_code: g::ProcedureCode(PROC_HANDOVER_PREPARATION),
-        criticality: g::Criticality(REJECT),
-        value: g::UnsuccessfulOutcomeValue::Id_HandoverPreparation(g::HandoverPreparationFailure {
-            protocol_i_es: g::HandoverPreparationFailureProtocolIEs(vec![
-                ie(
-                    ID_MME_UE_S1AP_ID,
-                    V::Id_MME_UE_S1AP_ID(g::MME_UE_S1AP_ID(msg.mme_ue_s1ap_id)),
-                ),
-                ie(
-                    ID_ENB_UE_S1AP_ID,
-                    V::Id_eNB_UE_S1AP_ID(g::ENB_UE_S1AP_ID(msg.enb_ue_s1ap_id)),
-                ),
-                ie(ID_CAUSE, V::Id_Cause(generated_cause(msg.cause))),
-            ]),
-        }),
-    }))
+    build_handover_preparation_failure_with_diagnostics(msg, &[])
 }
 
 /// Encode a HANDOVER CANCEL ACKNOWLEDGE (TS 36.413 §9.1.5.11): every IE
@@ -2025,6 +2005,576 @@ pub fn decode_handover_failure(bytes: &[u8]) -> ResponseDecode<nextgcore_s1ap::H
         },
         notify,
     }
+}
+
+// ============================================================================
+// Handover, part 2 (TS 36.413 §8.4.1, §8.4.2) -- stage 8b
+// ============================================================================
+
+const ID_HANDOVER_TYPE: u16 = 1;
+const ID_TARGET_ID: u16 = 4;
+const ID_ERAB_SUBJECT_TO_DATA_FORWARDING_LIST: u16 = 12;
+const ID_ERAB_TO_RELEASE_LIST_HO_CMD: u16 = 13;
+const ID_ERAB_DATA_FORWARDING_ITEM: u16 = 14;
+const ID_ERAB_ADMITTED_LIST: u16 = 18;
+const ID_ERAB_FAILED_TO_SETUP_LIST_HO_REQ_ACK: u16 = 19;
+const ID_ERAB_ADMITTED_ITEM: u16 = 20;
+const ID_ERAB_TO_BE_SETUP_ITEM_HO_REQ: u16 = 27;
+const ID_ERAB_TO_BE_SETUP_LIST_HO_REQ: u16 = 53;
+const ID_DIRECT_FORWARDING_PATH_AVAILABILITY: u16 = 79;
+const ID_SOURCE_TO_TARGET_CONTAINER: u16 = 104;
+const ID_TARGET_TO_SOURCE_CONTAINER: u16 = 123;
+
+/// Outcome of decoding a HANDOVER REQUIRED (TS 36.413 §9.1.5.1), the
+/// initiating message of a Class 1 procedure with both a response (HANDOVER
+/// COMMAND) and a failure (HANDOVER PREPARATION FAILURE).
+#[derive(Debug, Clone)]
+pub enum HandoverRequiredDecode {
+    /// Run the procedure. `notify` IEs go in the HANDOVER COMMAND's (or the
+    /// HANDOVER PREPARATION FAILURE's) Criticality Diagnostics (§10.3.4.2).
+    Proceed {
+        /// The message, in the handler's existing type.
+        msg: nextgcore_s1ap::HandoverRequired,
+        /// IEs to report.
+        notify: Vec<DiagnosedIe>,
+    },
+    /// The Target ID is well formed but names a target the handler's type
+    /// cannot represent (an NG-RAN node, or a short / long macro eNB ID): the
+    /// MME answers HANDOVER PREPARATION FAILURE, unknown-targetID.
+    UnsupportedTarget {
+        /// MME-UE-S1AP-ID.
+        mme_ue_s1ap_id: u32,
+        /// eNB-UE-S1AP-ID.
+        enb_ue_s1ap_id: u32,
+    },
+    /// A `reject` IE is missing or not understood: answer HANDOVER PREPARATION
+    /// FAILURE naming `ies` (§10.3.4.2 / §10.3.5).
+    Reject {
+        /// IEs to report.
+        ies: Vec<DiagnosedIe>,
+        /// eNB-UE-S1AP-ID, if read.
+        enb_ue_s1ap_id: Option<u32>,
+        /// MME-UE-S1AP-ID, if read.
+        mme_ue_s1ap_id: Option<u32>,
+    },
+    /// Not decodable (transfer syntax error).
+    Undecodable,
+}
+
+fn handover_type_from(v: u8) -> Option<nextgcore_s1ap::HandoverType> {
+    use nextgcore_s1ap::HandoverType as H;
+    Some(match v {
+        g::HandoverType::INTRALTE => H::IntraLte,
+        g::HandoverType::LTETOUTRAN => H::LteToUtran,
+        g::HandoverType::LTETOGERAN => H::LteToGeran,
+        g::HandoverType::UTRANTOLTE => H::UtranToLte,
+        g::HandoverType::GERANTOLTE => H::GeranToLte,
+        g::HandoverType::EPS_TO_5GS => H::EpsTo5gs,
+        g::HandoverType::FIVEGS_TO_EPS => H::FiveGsToEps,
+        _ => return None,
+    })
+}
+
+fn handover_type_to(t: nextgcore_s1ap::HandoverType) -> g::HandoverType {
+    g::HandoverType(t as u8)
+}
+
+fn u16_from(bytes: &[u8]) -> Option<u16> {
+    Some(u16::from_be_bytes(bytes.try_into().ok()?))
+}
+
+/// The handler's `TargetId` for a generated one; `Err(())` for a well-formed
+/// target the handler's type has no variant for, `Ok(None)` for a malformed
+/// one.
+fn target_id_from(t: &g::TargetID) -> Result<Option<nextgcore_s1ap::TargetId>, ()> {
+    use nextgcore_s1ap::TargetId as T;
+    Ok(match t {
+        g::TargetID::TargeteNB_ID(v) => {
+            let enb_id = match &v.global_enb_id.enb_id {
+                g::ENB_ID::MacroENB_ID(b) => EnbId::Macro(bits_to_u32(&b.0)),
+                g::ENB_ID::HomeENB_ID(b) => EnbId::Home(bits_to_u32(&b.0)),
+                _ => return Err(()),
+            };
+            let (Some(plmn_identity), Some(selected_tai)) = (
+                plmn(&v.global_enb_id.plm_nidentity.0),
+                tai_from(&v.selected_tai),
+            ) else {
+                return Ok(None);
+            };
+            Some(T::TargetEnbId {
+                global_enb_id: GlobalEnbId {
+                    plmn_identity,
+                    enb_id,
+                },
+                selected_tai,
+            })
+        }
+        g::TargetID::TargetRNC_ID(v) => {
+            let (Some(plmn_identity), Some(lac)) =
+                (plmn(&v.lai.plm_nidentity.0), u16_from(&v.lai.lac.0))
+            else {
+                return Ok(None);
+            };
+            Some(T::TargetRncId {
+                plmn_identity,
+                lac,
+                rac: v.rac.as_ref().and_then(|r| r.0.first().copied()),
+                // The hand-written parser let an Extended RNC-ID replace the
+                // RNC-ID (TS 36.413 §9.2.1.6); kept.
+                rnc_id: v.extended_rnc_id.as_ref().map_or(v.rnc_id.0, |e| e.0),
+            })
+        }
+        g::TargetID::CGI(v) => {
+            let (Some(plmn_identity), Some(lac), Some(ci)) = (
+                plmn(&v.plm_nidentity.0),
+                u16_from(&v.lac.0),
+                u16_from(&v.ci.0),
+            ) else {
+                return Ok(None);
+            };
+            Some(T::Cgi {
+                plmn_identity,
+                lac,
+                ci,
+                rac: v.rac.as_ref().and_then(|r| r.0.first().copied()),
+            })
+        }
+        g::TargetID::TargetgNgRanNode_ID(_) => return Err(()),
+    })
+}
+
+/// Decode a HANDOVER REQUIRED (TS 36.413 §9.1.5.1) with §10.3.4.2 / §10.3.5.
+///
+/// The UE IDs, Handover Type, Target ID and Source-to-Target container are
+/// `reject`; a missing Cause (`ignore`) reads as radioNetwork / unspecified;
+/// Direct Forwarding Path Availability is optional `ignore`. The SRVCC, CSG and
+/// secondary-container IEs are understood but not acted on, as before.
+pub fn decode_handover_required(bytes: &[u8]) -> HandoverRequiredDecode {
+    let Ok((pdu, unknown)) = nextgcore_s1ap_gen::decode_with_unknown_ies(bytes) else {
+        return HandoverRequiredDecode::Undecodable;
+    };
+    let g::S1AP_PDU::InitiatingMessage(msg) = pdu else {
+        return HandoverRequiredDecode::Undecodable;
+    };
+    let g::InitiatingMessageValue::Id_HandoverPreparation(m) = msg.value else {
+        return HandoverRequiredDecode::Undecodable;
+    };
+    let (mut reject, notify) = classify_unknown(&unknown);
+    let (mut mme, mut enb, mut ho_type, mut cause, mut target, mut direct, mut container) =
+        (None, None, None, None, None, None, None);
+    let mut unsupported_target = false;
+    use g::HandoverRequiredProtocolIEs_EntryValue as V;
+    for ie in m.protocol_i_es.0 {
+        match ie.value {
+            V::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
+            V::Id_eNB_UE_S1AP_ID(v) => enb = Some(v.0),
+            V::Id_HandoverType(v) => match handover_type_from(v.0) {
+                Some(t) => ho_type = Some(t),
+                None => not_understood(&mut reject, ID_HANDOVER_TYPE),
+            },
+            V::Id_Cause(c) => cause = hand_written_cause(&c),
+            V::Id_TargetID(t) => match target_id_from(&t) {
+                Ok(Some(t)) => target = Some(t),
+                Ok(None) => not_understood(&mut reject, ID_TARGET_ID),
+                Err(()) => unsupported_target = true,
+            },
+            V::Id_Direct_Forwarding_Path_Availability(v) => {
+                // An unknown extension value of an `ignore` IE is ignored.
+                if v.0 == g::Direct_Forwarding_Path_Availability::DIRECT_PATH_AVAILABLE {
+                    direct =
+                        Some(nextgcore_s1ap::DirectForwardingPathAvailability::DirectPathAvailable);
+                }
+            }
+            V::Id_Source_ToTarget_TransparentContainer(c) => container = Some(c.0),
+            _ => {}
+        }
+    }
+    missing(&mut reject, mme.is_some(), ID_MME_UE_S1AP_ID);
+    missing(&mut reject, enb.is_some(), ID_ENB_UE_S1AP_ID);
+    missing(&mut reject, ho_type.is_some(), ID_HANDOVER_TYPE);
+    missing(
+        &mut reject,
+        target.is_some() || unsupported_target,
+        ID_TARGET_ID,
+    );
+    missing(
+        &mut reject,
+        container.is_some(),
+        ID_SOURCE_TO_TARGET_CONTAINER,
+    );
+    if !reject.is_empty() {
+        return HandoverRequiredDecode::Reject {
+            ies: reject,
+            enb_ue_s1ap_id: enb,
+            mme_ue_s1ap_id: mme,
+        };
+    }
+    let (Some(mme_ue_s1ap_id), Some(enb_ue_s1ap_id), Some(handover_type), Some(container)) =
+        (mme, enb, ho_type, container)
+    else {
+        return HandoverRequiredDecode::Undecodable;
+    };
+    let Some(target_id) = target else {
+        return HandoverRequiredDecode::UnsupportedTarget {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id,
+        };
+    };
+    HandoverRequiredDecode::Proceed {
+        msg: nextgcore_s1ap::HandoverRequired {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id,
+            handover_type,
+            cause: cause.unwrap_or(Cause::RadioNetwork(
+                nextgcore_s1ap::CauseRadioNetwork::Unspecified,
+            )),
+            target_id,
+            direct_forwarding_path_availability: direct,
+            source_to_target_container: container,
+        },
+        notify,
+    }
+}
+
+/// Encode a HANDOVER PREPARATION FAILURE (TS 36.413 §9.1.5.3) carrying, when
+/// `reject` is non-empty, the HANDOVER REQUIRED's IEs that caused it.
+pub fn build_handover_preparation_failure_with_diagnostics(
+    msg: &nextgcore_s1ap::HandoverPreparationFailure,
+    reject: &[DiagnosedIe],
+) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    use g::HandoverPreparationFailureProtocolIEs_EntryValue as V;
+    let ie = |id: u16, value: V| g::HandoverPreparationFailureProtocolIEs_Entry {
+        id: g::ProtocolIE_ID(id),
+        criticality: g::Criticality(IGNORE),
+        value,
+    };
+    let mut ies = vec![
+        ie(
+            ID_MME_UE_S1AP_ID,
+            V::Id_MME_UE_S1AP_ID(g::MME_UE_S1AP_ID(msg.mme_ue_s1ap_id)),
+        ),
+        ie(
+            ID_ENB_UE_S1AP_ID,
+            V::Id_eNB_UE_S1AP_ID(g::ENB_UE_S1AP_ID(msg.enb_ue_s1ap_id)),
+        ),
+        ie(ID_CAUSE, V::Id_Cause(generated_cause(msg.cause))),
+    ];
+    if !reject.is_empty() {
+        ies.push(ie(
+            ID_CRITICALITY_DIAGNOSTICS,
+            V::Id_CriticalityDiagnostics(diagnostics_for(
+                PROC_HANDOVER_PREPARATION,
+                g::TriggeringMessage::INITIATING_MESSAGE,
+                REJECT,
+                reject,
+            )),
+        ));
+    }
+    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::UnsuccessfulOutcome(g::UnsuccessfulOutcome {
+        procedure_code: g::ProcedureCode(PROC_HANDOVER_PREPARATION),
+        criticality: g::Criticality(REJECT),
+        value: g::UnsuccessfulOutcomeValue::Id_HandoverPreparation(g::HandoverPreparationFailure {
+            protocol_i_es: g::HandoverPreparationFailureProtocolIEs(ies),
+        }),
+    }))
+}
+
+fn teid(bytes: &[u8]) -> Option<u32> {
+    Some(u32::from_be_bytes(bytes.try_into().ok()?))
+}
+
+fn transport(addr: &[u8]) -> g::TransportLayerAddress {
+    g::TransportLayerAddress(bytes_to_bits(addr))
+}
+
+fn gtp_teid(t: u32) -> g::GTP_TEID {
+    g::GTP_TEID(t.to_be_bytes().to_vec())
+}
+
+/// Encode a HANDOVER REQUEST (TS 36.413 §9.1.5.4). IE order follows
+/// `HandoverRequestIEs`; Cause is `ignore`, every other IE and each E-RAB item
+/// `reject`; procedure criticality reject.
+pub fn build_handover_request(
+    msg: &nextgcore_s1ap::HandoverRequest,
+) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    use g::HandoverRequestProtocolIEs_EntryValue as V;
+    let ie = |id: u16, criticality: u8, value: V| g::HandoverRequestProtocolIEs_Entry {
+        id: g::ProtocolIE_ID(id),
+        criticality: g::Criticality(criticality),
+        value,
+    };
+    let erabs = msg
+        .erab_list
+        .iter()
+        .map(|e| g::E_RABToBeSetupListHOReq_Entry {
+            id: g::ProtocolIE_ID(ID_ERAB_TO_BE_SETUP_ITEM_HO_REQ),
+            criticality: g::Criticality(REJECT),
+            value: g::E_RABToBeSetupListHOReq_EntryValue::Id_E_RABToBeSetupItemHOReq(
+                g::E_RABToBeSetupItemHOReq {
+                    e_rab_id: g::E_RAB_ID(e.erab_id),
+                    transport_layer_address: transport(&e.transport_layer_address),
+                    gtp_teid: gtp_teid(e.gtp_teid),
+                    e_ra_blevel_qos_parameters: erab_qos(&e.erab_qos),
+                    ie_extensions: None,
+                },
+            ),
+        })
+        .collect();
+    let sec = &msg.ue_security_capabilities;
+    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+        procedure_code: g::ProcedureCode(PROC_HANDOVER_RESOURCE_ALLOCATION),
+        criticality: g::Criticality(REJECT),
+        value: g::InitiatingMessageValue::Id_HandoverResourceAllocation(g::HandoverRequest {
+            protocol_i_es: g::HandoverRequestProtocolIEs(vec![
+                ie(
+                    ID_MME_UE_S1AP_ID,
+                    REJECT,
+                    V::Id_MME_UE_S1AP_ID(g::MME_UE_S1AP_ID(msg.mme_ue_s1ap_id)),
+                ),
+                ie(
+                    ID_HANDOVER_TYPE,
+                    REJECT,
+                    V::Id_HandoverType(handover_type_to(msg.handover_type)),
+                ),
+                ie(ID_CAUSE, IGNORE, V::Id_Cause(generated_cause(msg.cause))),
+                ie(
+                    ID_UE_AMBR,
+                    REJECT,
+                    V::Id_uEaggregateMaximumBitrate(ambr(&msg.ue_ambr)),
+                ),
+                ie(
+                    ID_ERAB_TO_BE_SETUP_LIST_HO_REQ,
+                    REJECT,
+                    V::Id_E_RABToBeSetupListHOReq(g::E_RABToBeSetupListHOReq(erabs)),
+                ),
+                ie(
+                    ID_SOURCE_TO_TARGET_CONTAINER,
+                    REJECT,
+                    V::Id_Source_ToTarget_TransparentContainer(
+                        g::Source_ToTarget_TransparentContainer(
+                            msg.source_to_target_container.clone(),
+                        ),
+                    ),
+                ),
+                ie(
+                    ID_UE_SECURITY_CAPABILITIES,
+                    REJECT,
+                    V::Id_UESecurityCapabilities(g::UESecurityCapabilities {
+                        encryption_algorithms: g::EncryptionAlgorithms(bytes_to_bits(
+                            &sec.encryption_algorithms.to_be_bytes(),
+                        )),
+                        integrity_protection_algorithms: g::IntegrityProtectionAlgorithms(
+                            bytes_to_bits(&sec.integrity_algorithms.to_be_bytes()),
+                        ),
+                        ie_extensions: None,
+                    }),
+                ),
+                ie(
+                    ID_SECURITY_CONTEXT,
+                    REJECT,
+                    V::Id_SecurityContext(g::SecurityContext {
+                        next_hop_chaining_count: g::SecurityContextNextHopChainingCount(
+                            msg.security_context.next_hop_chaining_count,
+                        ),
+                        next_hop_parameter: g::SecurityKey(bytes_to_bits(
+                            &msg.security_context.next_hop_parameter,
+                        )),
+                        ie_extensions: None,
+                    }),
+                ),
+            ]),
+        }),
+    }))
+}
+
+/// Decode a HANDOVER REQUEST ACKNOWLEDGE (TS 36.413 §9.1.5.5), a response
+/// message. The Target-to-Source container is `reject`: missing, the response
+/// is handled locally (`Failed`). The other IEs are `ignore`: a missing E-RAB
+/// Admitted List reads as empty; a missing UE S1AP ID, which the handler needs
+/// to address the target, is `Undecodable`.
+pub fn decode_handover_request_acknowledge(
+    bytes: &[u8],
+) -> ResponseDecode<nextgcore_s1ap::HandoverRequestAcknowledge> {
+    let Some((g::SuccessfulOutcomeValue::Id_HandoverResourceAllocation(ack), unknown)) =
+        successful_outcome(bytes)
+    else {
+        return ResponseDecode::Undecodable;
+    };
+    let (mut reject, notify) = classify_unknown(&unknown);
+    let (mut mme, mut enb, mut admitted, mut failed, mut container) =
+        (None, None, None, None, None);
+    use g::HandoverRequestAcknowledgeProtocolIEs_EntryValue as V;
+    for ie in ack.protocol_i_es.0 {
+        match ie.value {
+            V::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
+            V::Id_eNB_UE_S1AP_ID(v) => enb = Some(v.0),
+            V::Id_E_RABAdmittedList(l) => {
+                let mut items = Vec::new();
+                for entry in l.0 {
+                    let g::E_RABAdmittedList_EntryValue::Id_E_RABAdmittedItem(i) = entry.value;
+                    let Some(t) = teid(&i.gtp_teid.0) else {
+                        return ResponseDecode::Undecodable;
+                    };
+                    items.push(nextgcore_s1ap::ErabAdmittedItem {
+                        erab_id: i.e_rab_id.0,
+                        transport_layer_address: bits_to_bytes(&i.transport_layer_address.0),
+                        gtp_teid: t,
+                        dl_transport_layer_address: i
+                            .dl_transport_layer_address
+                            .as_ref()
+                            .map(|a| bits_to_bytes(&a.0)),
+                        dl_gtp_teid: i.dl_g_tp_teid.as_ref().and_then(|t| teid(&t.0)),
+                        ul_transport_layer_address: i
+                            .ul_transport_layer_address
+                            .as_ref()
+                            .map(|a| bits_to_bytes(&a.0)),
+                        ul_gtp_teid: i.ul_gtp_teid.as_ref().and_then(|t| teid(&t.0)),
+                    });
+                }
+                admitted = Some(items);
+            }
+            V::Id_E_RABFailedToSetupListHOReqAck(l) => {
+                failed = Some(
+                    l.0.into_iter()
+                        .map(|entry| {
+                            let g::E_RABFailedtoSetupListHOReqAck_EntryValue::Id_E_RABFailedtoSetupItemHOReqAck(i) =
+                                entry.value;
+                            nextgcore_s1ap::ErabFailedItem {
+                                erab_id: i.e_rab_id.0,
+                                cause: hand_written_cause(&i.cause).unwrap_or(Cause::RadioNetwork(
+                                    nextgcore_s1ap::CauseRadioNetwork::Unspecified,
+                                )),
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+            V::Id_Target_ToSource_TransparentContainer(c) => container = Some(c.0),
+            _ => {}
+        }
+    }
+    missing(
+        &mut reject,
+        container.is_some(),
+        ID_TARGET_TO_SOURCE_CONTAINER,
+    );
+    if !reject.is_empty() {
+        return ResponseDecode::Failed(reject);
+    }
+    let (Some(mme_ue_s1ap_id), Some(enb_ue_s1ap_id), Some(target_to_source_container)) =
+        (mme, enb, container)
+    else {
+        return ResponseDecode::Undecodable;
+    };
+    ResponseDecode::Decoded {
+        msg: nextgcore_s1ap::HandoverRequestAcknowledge {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id,
+            erab_admitted_list: admitted.unwrap_or_default(),
+            erab_failed_list: failed.unwrap_or_default(),
+            target_to_source_container,
+        },
+        notify,
+    }
+}
+
+/// Encode a HANDOVER COMMAND (TS 36.413 §9.1.5.2). The UE IDs, Handover Type
+/// and Target-to-Source container are `reject`; the forwarding and release
+/// lists (and each of their items) `ignore`; procedure criticality reject.
+/// `notify` IEs of the HANDOVER REQUIRED go in its Criticality Diagnostics
+/// (§10.3.4.2).
+pub fn build_handover_command(
+    msg: &nextgcore_s1ap::HandoverCommand,
+    notify: &[DiagnosedIe],
+) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    use g::HandoverCommandProtocolIEs_EntryValue as V;
+    let ie = |id: u16, criticality: u8, value: V| g::HandoverCommandProtocolIEs_Entry {
+        id: g::ProtocolIE_ID(id),
+        criticality: g::Criticality(criticality),
+        value,
+    };
+    let mut ies = vec![
+        ie(
+            ID_MME_UE_S1AP_ID,
+            REJECT,
+            V::Id_MME_UE_S1AP_ID(g::MME_UE_S1AP_ID(msg.mme_ue_s1ap_id)),
+        ),
+        ie(
+            ID_ENB_UE_S1AP_ID,
+            REJECT,
+            V::Id_eNB_UE_S1AP_ID(g::ENB_UE_S1AP_ID(msg.enb_ue_s1ap_id)),
+        ),
+        ie(
+            ID_HANDOVER_TYPE,
+            REJECT,
+            V::Id_HandoverType(handover_type_to(msg.handover_type)),
+        ),
+    ];
+    if !msg.erab_subject_to_forwarding_list.is_empty() {
+        ies.push(ie(
+            ID_ERAB_SUBJECT_TO_DATA_FORWARDING_LIST,
+            IGNORE,
+            V::Id_E_RABSubjecttoDataForwardingList(g::E_RABSubjecttoDataForwardingList(
+                msg.erab_subject_to_forwarding_list
+                    .iter()
+                    .map(|f| g::E_RABSubjecttoDataForwardingList_Entry {
+                        id: g::ProtocolIE_ID(ID_ERAB_DATA_FORWARDING_ITEM),
+                        criticality: g::Criticality(IGNORE),
+                        value:
+                            g::E_RABSubjecttoDataForwardingList_EntryValue::Id_E_RABDataForwardingItem(
+                                g::E_RABDataForwardingItem {
+                                    e_rab_id: g::E_RAB_ID(f.erab_id),
+                                    dl_transport_layer_address: f
+                                        .dl_transport_layer_address
+                                        .as_deref()
+                                        .map(transport),
+                                    dl_g_tp_teid: f.dl_gtp_teid.map(gtp_teid),
+                                    ul_transport_layer_address: f
+                                        .ul_transport_layer_address
+                                        .as_deref()
+                                        .map(transport),
+                                    ul_gtp_teid: f.ul_gtp_teid.map(gtp_teid),
+                                    ie_extensions: None,
+                                },
+                            ),
+                    })
+                    .collect(),
+            )),
+        ));
+    }
+    if !msg.erab_to_release_list.is_empty() {
+        ies.push(ie(
+            ID_ERAB_TO_RELEASE_LIST_HO_CMD,
+            IGNORE,
+            V::Id_E_RABtoReleaseListHOCmd(erab_list(&msg.erab_to_release_list)),
+        ));
+    }
+    ies.push(ie(
+        ID_TARGET_TO_SOURCE_CONTAINER,
+        REJECT,
+        V::Id_Target_ToSource_TransparentContainer(g::Target_ToSource_TransparentContainer(
+            msg.target_to_source_container.clone(),
+        )),
+    ));
+    if !notify.is_empty() {
+        ies.push(ie(
+            ID_CRITICALITY_DIAGNOSTICS,
+            IGNORE,
+            V::Id_CriticalityDiagnostics(diagnostics_for(
+                PROC_HANDOVER_PREPARATION,
+                g::TriggeringMessage::INITIATING_MESSAGE,
+                REJECT,
+                notify,
+            )),
+        ));
+    }
+    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+        procedure_code: g::ProcedureCode(PROC_HANDOVER_PREPARATION),
+        criticality: g::Criticality(REJECT),
+        value: g::SuccessfulOutcomeValue::Id_HandoverPreparation(g::HandoverCommand {
+            protocol_i_es: g::HandoverCommandProtocolIEs(ies),
+        }),
+    }))
 }
 
 // ============================================================================
@@ -2556,3 +3106,6 @@ mod reset_tests;
 
 #[cfg(test)]
 mod path_switch_tests;
+
+#[cfg(test)]
+mod handover2_tests;

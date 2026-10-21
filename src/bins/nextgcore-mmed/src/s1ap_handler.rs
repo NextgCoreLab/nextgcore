@@ -17,7 +17,7 @@ use crate::s1ap_build::{
     radio_network_cause, tai_from_s1ap, transport_address_to_ip, ue_security_capabilities_from,
 };
 use nextgcore_s1ap::{
-    builder, decode_s1ap_pdu, BroadcastCancelledAreaList, BroadcastCompletedAreaList, Cause,
+    decode_s1ap_pdu, BroadcastCancelledAreaList, BroadcastCompletedAreaList, Cause,
     CauseRadioNetwork, CriticalityDiagnostics, EnbConfigurationUpdate, EnbId, EnbStatusTransfer,
     ErabDataForwardingItem, ErabSwitchedItem, ErabToBeSetupItemHoReq, ErrorIndication,
     HandoverCancel, HandoverCancelAcknowledge, HandoverCommand, HandoverFailure, HandoverNotify,
@@ -543,6 +543,102 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
                     );
                 }
                 Class2Decode::Undecodable => {}
+            }
+        }
+        // Handover, part 2 (#514 stage 8b). HANDOVER REQUIRED is Class 1 with
+        // both a response and a failure: `notify` IEs go in the HANDOVER
+        // COMMAND (or the HANDOVER PREPARATION FAILURE), a missing or not
+        // understood `reject` IE is answered by HANDOVER PREPARATION FAILURE.
+        if crate::s1ap_gen::is_initiating(data, crate::s1ap_gen::PROC_HANDOVER_PREPARATION) {
+            use crate::s1ap_gen::HandoverRequiredDecode as D;
+            match crate::s1ap_gen::decode_handover_required(data) {
+                D::Proceed { msg, notify } => {
+                    return handle_handover_required_reporting(ctx, enb_id, &msg, &notify);
+                }
+                D::UnsupportedTarget {
+                    mme_ue_s1ap_id,
+                    enb_ue_s1ap_id,
+                } => {
+                    log::warn!(
+                        "Handover Required from eNB {enb_id} names a target this MME cannot \
+                         serve (NG-RAN node or short/long macro eNB ID)"
+                    );
+                    return handover_preparation_failure(
+                        enb_id,
+                        mme_ue_s1ap_id,
+                        enb_ue_s1ap_id,
+                        radio_network_cause::UNKNOWN_TARGET_ID,
+                        &[],
+                    );
+                }
+                D::Reject {
+                    ies,
+                    enb_ue_s1ap_id,
+                    mme_ue_s1ap_id,
+                } => {
+                    log::error!(
+                        "Handover Required from eNB {enb_id} rejected (TS 36.413 §10.3.4/§10.3.5): {ies:?}"
+                    );
+                    let failure = HandoverPreparationFailure {
+                        mme_ue_s1ap_id: mme_ue_s1ap_id.unwrap_or(0),
+                        enb_ue_s1ap_id: enb_ue_s1ap_id.unwrap_or(0),
+                        cause: s1ap_build::cause_to_s1ap(
+                            S1apCauseGroup::Protocol,
+                            protocol_cause::ABSTRACT_SYNTAX_ERROR_REJECT,
+                        ),
+                    };
+                    return match crate::s1ap_gen::build_handover_preparation_failure_with_diagnostics(
+                        &failure, &ies,
+                    ) {
+                        Ok(pdu) => S1apSend::to_origin(enb_id, pdu),
+                        Err(e) => {
+                            log::error!("Failed to build Handover Preparation Failure: {e}");
+                            Vec::new()
+                        }
+                    };
+                }
+                D::Undecodable => {}
+            }
+        }
+        // HANDOVER REQUEST ACKNOWLEDGE is a response: a `reject` IE (or the
+        // missing Target-to-Source container) is handled locally; `notify` IEs
+        // are reported by ERROR INDICATION.
+        if crate::s1ap_gen::is_outcome(
+            data,
+            true,
+            crate::s1ap_gen::PROC_HANDOVER_RESOURCE_ALLOCATION,
+        ) {
+            match crate::s1ap_gen::decode_handover_request_acknowledge(data) {
+                ResponseDecode::Decoded { msg, notify } => {
+                    let mut out = if notify.is_empty() {
+                        Vec::new()
+                    } else {
+                        error_indication_with_diagnostics(
+                            enb_id,
+                            Some(msg.enb_ue_s1ap_id),
+                            Some(msg.mme_ue_s1ap_id),
+                            S1apCauseGroup::Protocol,
+                            protocol_cause::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+                            Some(crate::s1ap_gen::error_indication_diagnostics_for(
+                                crate::s1ap_gen::PROC_HANDOVER_RESOURCE_ALLOCATION,
+                                nextgcore_s1ap::triggering_message::SUCCESSFUL_OUTCOME,
+                                0,
+                                &notify,
+                            )),
+                        )
+                    };
+                    out.extend(handle_handover_request_acknowledge(ctx, enb_id, &msg));
+                    return out;
+                }
+                ResponseDecode::Failed(ies) => {
+                    log::error!(
+                        "Handover Request Acknowledge from eNB {enb_id} carries a reject IE or \
+                         lacks one (TS 36.413 §10.3.4.2/§10.3.5); handled locally, the \
+                         preparation supervision releases the target: {ies:?}"
+                    );
+                    return Vec::new();
+                }
+                ResponseDecode::Undecodable => {}
             }
         }
         if crate::s1ap_gen::is_outcome(
@@ -1719,12 +1815,27 @@ pub fn handle_handover_required(
     enb_id: u64,
     msg: &HandoverRequired,
 ) -> Vec<S1apSend> {
+    handle_handover_required_reporting(ctx, enb_id, msg, &[])
+}
+
+/// [`handle_handover_required`] for a HANDOVER REQUIRED decoded with the
+/// generated codec (#514 stage 8b): `notify` IEs (TS 36.413 §10.3.4.2) are
+/// reported in the Criticality Diagnostics of whichever answer the source eNB
+/// gets -- the HANDOVER COMMAND (kept on the source context until it is built)
+/// or the HANDOVER PREPARATION FAILURE.
+pub fn handle_handover_required_reporting(
+    ctx: &MmeContext,
+    enb_id: u64,
+    msg: &HandoverRequired,
+    notify: &[crate::s1ap_gen::DiagnosedIe],
+) -> Vec<S1apSend> {
     let Some(source_ue_id) = ctx.enb_ue_find_by_mme_ue_s1ap_id(msg.mme_ue_s1ap_id) else {
         return handover_preparation_failure(
             enb_id,
             msg.mme_ue_s1ap_id,
             msg.enb_ue_s1ap_id,
             radio_network_cause::UNKNOWN_MME_UE_S1AP_ID,
+            notify,
         );
     };
     let Some(source_ue) = ctx.enb_ue_find_by_id(source_ue_id) else {
@@ -1733,6 +1844,7 @@ pub fn handle_handover_required(
             msg.mme_ue_s1ap_id,
             msg.enb_ue_s1ap_id,
             radio_network_cause::UNKNOWN_MME_UE_S1AP_ID,
+            notify,
         );
     };
 
@@ -1753,6 +1865,7 @@ pub fn handle_handover_required(
             msg.mme_ue_s1ap_id,
             msg.enb_ue_s1ap_id,
             radio_network_cause::UNKNOWN_TARGET_ID,
+            notify,
         );
     };
 
@@ -1762,6 +1875,7 @@ pub fn handle_handover_required(
             msg.mme_ue_s1ap_id,
             msg.enb_ue_s1ap_id,
             radio_network_cause::UNKNOWN_MME_UE_S1AP_ID,
+            notify,
         );
     };
 
@@ -1779,6 +1893,7 @@ pub fn handle_handover_required(
             source.target_ue_id = target_ue_id;
             source.handover_type = ho_type_from_s1ap(msg.handover_type);
             source.direct_forwarding_available = direct_forwarding_available;
+            source.handover_required_notify = notify.to_vec();
         }
         if let Some(target) = pool.get_mut(&target_ue_id) {
             target.source_ue_id = source_ue_id;
@@ -1795,6 +1910,7 @@ pub fn handle_handover_required(
                 msg.mme_ue_s1ap_id,
                 msg.enb_ue_s1ap_id,
                 radio_network_cause::UNSPECIFIED,
+                notify,
             );
         }
     };
@@ -1806,6 +1922,7 @@ pub fn handle_handover_required(
             msg.mme_ue_s1ap_id,
             msg.enb_ue_s1ap_id,
             radio_network_cause::UNSPECIFIED,
+            notify,
         );
     };
 
@@ -1824,6 +1941,7 @@ pub fn handle_handover_required(
             msg.mme_ue_s1ap_id,
             msg.enb_ue_s1ap_id,
             radio_network_cause::UNKNOWN_E_RAB_ID,
+            notify,
         );
     }
 
@@ -1844,7 +1962,7 @@ pub fn handle_handover_required(
         },
     };
 
-    match builder::build_handover_request(&request) {
+    match crate::s1ap_gen::build_handover_request(&request) {
         Ok(pdu) => vec![S1apSend {
             enb_id: target_enb_pool_id,
             pdu,
@@ -1856,6 +1974,7 @@ pub fn handle_handover_required(
                 msg.mme_ue_s1ap_id,
                 msg.enb_ue_s1ap_id,
                 radio_network_cause::UNSPECIFIED,
+                notify,
             )
         }
     }
@@ -1866,13 +1985,14 @@ fn handover_preparation_failure(
     mme_ue_s1ap_id: u32,
     enb_ue_s1ap_id: u32,
     cause_value: i64,
+    notify: &[crate::s1ap_gen::DiagnosedIe],
 ) -> Vec<S1apSend> {
     let failure = HandoverPreparationFailure {
         mme_ue_s1ap_id,
         enb_ue_s1ap_id,
         cause: s1ap_build::cause_to_s1ap(S1apCauseGroup::RadioNetwork, cause_value),
     };
-    match crate::s1ap_gen::build_handover_preparation_failure(&failure) {
+    match crate::s1ap_gen::build_handover_preparation_failure_with_diagnostics(&failure, notify) {
         Ok(pdu) => S1apSend::to_origin(enb_id, pdu),
         Err(e) => {
             log::error!("Failed to build Handover Preparation Failure: {e}");
@@ -2053,7 +2173,7 @@ pub(crate) fn build_handover_command_pdu(
         target_to_source_container: ack.target_to_source_container.clone(),
     };
 
-    match builder::build_handover_command(&command) {
+    match crate::s1ap_gen::build_handover_command(&command, &source_ue.handover_required_notify) {
         Ok(pdu) => Some(S1apSend {
             enb_id: source_ue.enb_id,
             pdu,
@@ -2897,6 +3017,7 @@ pub fn s1ap_cause(cause: &Cause) -> S1apCause {
 mod tests {
     use super::*;
     use crate::context::{Bitrate, MmeUe, PlmnId, ServedGummei};
+    use nextgcore_s1ap::builder;
     use nextgcore_s1ap::{
         CauseRadioNetwork, GlobalEnbId, STmsi, SupportedTaItem, UeAssociatedLogicalS1Connection,
         UeSecurityCapabilities,
