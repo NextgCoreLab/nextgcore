@@ -583,6 +583,37 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
             }
         }
     }
+    // Reset and Error Indication are decoded with the generated codec (#514
+    // stage 9).
+    if crate::s1ap_gen::is_initiating(data, crate::s1ap_gen::PROC_RESET) {
+        use crate::s1ap_gen::Class2Decode;
+        // Class 1 with a response: `notify` IEs go in the acknowledge; a
+        // `reject` IE or a missing ResetType stops the procedure, reported by
+        // ERROR INDICATION since RESET has no failure message.
+        match crate::s1ap_gen::decode_reset(data) {
+            Class2Decode::Proceed { msg, notify } => {
+                return handle_reset_reporting(ctx, enb_id, &msg, &notify);
+            }
+            Class2Decode::Reject { ies, .. } => {
+                return class2_reject(enb_id, crate::s1ap_gen::PROC_RESET, None, None, &ies);
+            }
+            Class2Decode::Undecodable => {}
+        }
+    }
+    if crate::s1ap_gen::is_initiating(data, crate::s1ap_gen::PROC_ERROR_INDICATION) {
+        // Every IE is optional and ignore. An ERROR INDICATION is never answered
+        // with another (TS 36.413 §10.1: no ping-pong), so unknown IEs are only
+        // logged, whatever their criticality.
+        if let Some((msg, unknown)) = crate::s1ap_gen::decode_error_indication(data) {
+            if !unknown.is_empty() {
+                log::warn!(
+                    "Error Indication from eNB {enb_id} carries unknown IEs, not answered: {unknown:?}"
+                );
+            }
+            handle_error_indication(ctx, enb_id, &msg);
+            return Vec::new();
+        }
+    }
     let message = match decode_s1ap_pdu(data) {
         Ok(message) => message,
         Err(e) => {
@@ -1507,6 +1538,18 @@ pub fn handle_release_complete(
 /// Handle Reset: clear the affected UE-associated logical S1 connections and
 /// answer with Reset Acknowledge (echoing the partial connection list).
 pub fn handle_reset(ctx: &MmeContext, enb_id: u64, msg: &Reset) -> Vec<S1apSend> {
+    handle_reset_reporting(ctx, enb_id, msg, &[])
+}
+
+/// [`handle_reset`], reporting `notify` (unknown ignore-and-notify IEs of the
+/// RESET, a Class 1 initiating message) in the acknowledge's Criticality
+/// Diagnostics (TS 36.413 §10.3.4.2).
+pub fn handle_reset_reporting(
+    ctx: &MmeContext,
+    enb_id: u64,
+    msg: &Reset,
+    notify: &[crate::s1ap_gen::DiagnosedIe],
+) -> Vec<S1apSend> {
     log::warn!("Reset from eNB {enb_id}: cause={:?}", msg.cause);
 
     let acked_connections = match &msg.reset_type {
@@ -1542,9 +1585,12 @@ pub fn handle_reset(ctx: &MmeContext, enb_id: u64, msg: &Reset) -> Vec<S1apSend>
         }
     };
 
-    match builder::build_reset_acknowledge(&ResetAcknowledge {
-        ue_associated_connections: acked_connections,
-    }) {
+    match crate::s1ap_gen::build_reset_acknowledge(
+        &ResetAcknowledge {
+            ue_associated_connections: acked_connections,
+        },
+        notify,
+    ) {
         Ok(pdu) => S1apSend::to_origin(enb_id, pdu),
         Err(e) => {
             log::error!("Failed to build Reset Acknowledge: {e}");

@@ -26,6 +26,11 @@ use std::time::Duration;
 mod broadcast_exposure; // #104: Nlmf_Broadcast + Nlmf_DataExposure
 mod codec_glue;
 mod context;
+#[cfg(test)]
+mod lpp_equivalence_tests;
+// #515: the pre-migration LPP code, kept as the equivalence oracle.
+#[cfg(test)]
+mod lpp_oracle;
 // A2: lmfd → AMF Namf_Communication client leg (NRF discovery of the serving
 // AMF, N1N2MessageSubscribe registration, multipart N1N2MessageTransfer POST).
 mod namf_client;

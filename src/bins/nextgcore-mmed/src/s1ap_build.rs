@@ -774,12 +774,14 @@ pub fn build_error_indication(
     cause_value: i64,
     criticality_diagnostics: Option<nextgcore_s1ap::CriticalityDiagnostics>,
 ) -> S1apResult<Vec<u8>> {
-    builder::build_error_indication(&ErrorIndication {
+    // Generated codec (#514 stage 9).
+    crate::s1ap_gen::build_error_indication(&ErrorIndication {
         mme_ue_s1ap_id,
         enb_ue_s1ap_id,
         cause: Some(cause_to_s1ap(cause_group, cause_value)),
         criticality_diagnostics,
     })
+    .map_err(gen_err)
 }
 
 // ============================================================================

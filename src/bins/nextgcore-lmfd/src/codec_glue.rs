@@ -23,15 +23,118 @@
 //! `main.rs`.
 
 use crate::CellMeasurement;
-use nextgcore_asn1c::lpp::ecid::{
-    EcidRequestLocationInformation, MeasuredResultsElement, RequestLocationInformation,
-    RequestLocationInformationR9,
-};
 use nextgcore_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
-use nextgcore_asn1c::lpp::nr_dl_tdoa::NrRstd;
-use nextgcore_asn1c::lpp::requested_measurements;
 use nextgcore_asn1c::lpp::sidelink_ranging::SidelinkRangingMethod;
-use nextgcore_asn1c::lpp::types::{Initiator, LppTransactionId, TransactionNumber};
+use nextgcore_lpp_gen::generated as lpp;
+
+// ---------------------------------------------------------------------------
+// Generated-codec envelope helpers (#515)
+// ---------------------------------------------------------------------------
+
+/// An `LPP-TransactionID` (TS 37.355 §6.2) on the generated codec.
+fn transaction(initiator: u8, number: u8) -> lpp::LPP_TransactionID {
+    lpp::LPP_TransactionID {
+        initiator: lpp::Initiator(initiator),
+        transaction_number: lpp::TransactionNumber(number),
+    }
+}
+
+/// An `LPP-Message` carrying one c1 body, with no sequence number or
+/// acknowledgement (this LMF does not run the LPP reliable-transport sublayer).
+fn message(
+    transaction_id: lpp::LPP_TransactionID,
+    end_transaction: bool,
+    body: lpp::LPP_MessageBody_c1,
+) -> lpp::LPP_Message {
+    lpp::LPP_Message {
+        transaction_id: Some(transaction_id),
+        end_transaction: lpp::LPP_MessageEndTransaction(end_transaction),
+        sequence_number: None,
+        acknowledgement: None,
+        lpp_message_body: Some(lpp::LPP_MessageBody::C1(body)),
+    }
+}
+
+/// UPER-encode a generated `LPP-Message`, naming what failed.
+fn encode(msg: &lpp::LPP_Message, what: &str) -> Result<Vec<u8>, String> {
+    nextgcore_lpp_gen::encode(msg).map_err(|e| format!("LPP {what} encode: {e:?}"))
+}
+
+/// UPER-decode one `LPP-Message` with the generated codec.
+pub fn decode_lpp(bytes: &[u8]) -> Result<lpp::LPP_Message, String> {
+    nextgcore_lpp_gen::decode(bytes).map_err(|e| format!("LPP UPER decode: {e:?}"))
+}
+
+/// A `BIT STRING` from flags, bit 0 first (the `requestedMeasurements` layout).
+fn bits(flags: &[bool]) -> bitvec::vec::BitVec<u8, bitvec::order::Msb0> {
+    flags.iter().copied().collect()
+}
+
+/// The c1 body of a decoded message, if it has one.
+fn c1(msg: &lpp::LPP_Message) -> Option<&lpp::LPP_MessageBody_c1> {
+    match msg.lpp_message_body.as_ref() {
+        Some(lpp::LPP_MessageBody::C1(body)) => Some(body),
+        _ => None,
+    }
+}
+
+/// The r9 IEs of a `ProvideLocationInformation`, if the message is one.
+fn provide_location_r9(msg: &lpp::LPP_Message) -> Option<&lpp::ProvideLocationInformation_r9_IEs> {
+    match c1(msg)? {
+        lpp::LPP_MessageBody_c1::ProvideLocationInformation(p) => match &p.critical_extensions {
+            lpp::ProvideLocationInformationCriticalExtensions::C1(
+                lpp::ProvideLocationInformationCriticalExtensions_c1::ProvideLocationInformation_r9(
+                    ies,
+                ),
+            ) => Some(ies),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// A `RequestLocationInformation` with the given r9 IEs, initiated by this LMF.
+fn request_location(
+    transaction_number: u8,
+    ies: lpp::RequestLocationInformation_r9_IEs,
+) -> lpp::LPP_Message {
+    message(
+        transaction(lpp::Initiator::LOCATION_SERVER, transaction_number),
+        false,
+        lpp::LPP_MessageBody_c1::RequestLocationInformation(lpp::RequestLocationInformation {
+            critical_extensions: lpp::RequestLocationInformationCriticalExtensions::C1(
+                lpp::RequestLocationInformationCriticalExtensions_c1::RequestLocationInformation_r9(
+                    ies,
+                ),
+            ),
+        }),
+    )
+}
+
+/// Empty r9 IEs for a `RequestLocationInformation`.
+fn empty_request_ies() -> lpp::RequestLocationInformation_r9_IEs {
+    lpp::RequestLocationInformation_r9_IEs {
+        common_i_es_request_location_information: None,
+        a_gnss_request_location_information: None,
+        otdoa_request_location_information: None,
+        ecid_request_location_information: None,
+        epdu_request_location_information: None,
+        extensions: Default::default(),
+    }
+}
+
+/// The E-CID request body: requestedMeasurements bit0 = rsrpReq, bit1 = rsrqReq
+/// (TS 37.355 §6.5.3 `ECID-RequestLocationInformation`).
+fn ecid_request_ies() -> lpp::RequestLocationInformation_r9_IEs {
+    lpp::RequestLocationInformation_r9_IEs {
+        ecid_request_location_information: Some(lpp::ECID_RequestLocationInformation {
+            requested_measurements: lpp::ECID_RequestLocationInformationRequestedMeasurements(
+                bits(&[true, true]),
+            ),
+        }),
+        ..empty_request_ies()
+    }
+}
 
 /// Encode an LMF-initiated LPP `RequestLocationInformation` (TS 37.355 §6.2,
 /// message body c1 index 4) requesting E-CID measurements (rsrpReq + rsrqReq),
@@ -40,30 +143,10 @@ use nextgcore_asn1c::lpp::types::{Initiator, LppTransactionId, TransactionNumber
 /// `ProvideLocationInformation` response (TS 37.355 §6.1, initiator =
 /// locationServer). Returns the UPER-encoded PDU.
 pub fn build_lpp_ecid_request(transaction_number: u8) -> Result<Vec<u8>, String> {
-    let msg = LppMessage {
-        transaction_id: Some(LppTransactionId {
-            initiator: Initiator::LocationServer,
-            transaction_number: TransactionNumber(transaction_number),
-        }),
-        end_transaction: false,
-        sequence_number: None,
-        acknowledgement: None,
-        message_body: Some(LppMessageBody::C1(
-            MessageBodyC1::RequestLocationInformation(RequestLocationInformation {
-                ies: RequestLocationInformationR9 {
-                    // requestedMeasurements: bit0 = rsrpReq, bit1 = rsrqReq.
-                    ecid: Some(EcidRequestLocationInformation {
-                        requested_measurements: requested_measurements(&[true, true]),
-                    }),
-                    nr_multi_rtt: None,
-                    nr_dl_tdoa: None,
-                },
-            }),
-        )),
-    };
-    msg.encode()
-        .map(|b| b.to_vec())
-        .map_err(|e| format!("LPP RequestLocationInformation encode: {e}"))
+    encode(
+        &request_location(transaction_number, ecid_request_ies()),
+        "RequestLocationInformation",
+    )
 }
 
 /// Which LPP positioning method an LMF-initiated request asks for (#103).
@@ -110,31 +193,35 @@ impl LppMethod {
 /// Returns the transaction number to answer on, so the response correlates: an
 /// assistance-data response on the wrong transaction is one the UE discards.
 pub fn decode_lpp_request_assistance_data(bytes: &[u8]) -> Result<u8, String> {
-    let msg = LppMessage::decode(bytes).map_err(|e| format!("LPP decode: {e}"))?;
+    let msg = decode_lpp(bytes).map_err(|e| e.replace("LPP UPER decode", "LPP decode"))?;
     let txn = msg
         .transaction_id
         .as_ref()
         .map(|t| t.transaction_number.0)
         .ok_or_else(|| "LPP message carries no transactionID to answer on".to_string())?;
-    match &msg.message_body {
-        Some(LppMessageBody::C1(MessageBodyC1::RequestAssistanceData(_))) => Ok(txn),
-        Some(LppMessageBody::C1(other)) => Err(format!(
+    match c1(&msg) {
+        Some(lpp::LPP_MessageBody_c1::RequestAssistanceData(_)) => Ok(txn),
+        Some(other) => Err(format!(
             "LPP body is {}, not RequestAssistanceData",
             body_name(other)
         )),
-        _ => Err("LPP message carries no c1 body".to_string()),
+        None => Err("LPP message carries no c1 body".to_string()),
     }
 }
 
 /// A body's name, for an error message that says what arrived instead.
-fn body_name(body: &MessageBodyC1) -> &'static str {
+fn body_name(body: &lpp::LPP_MessageBody_c1) -> &'static str {
+    use lpp::LPP_MessageBody_c1 as B;
     match body {
-        MessageBodyC1::RequestCapabilities(_) => "RequestCapabilities",
-        MessageBodyC1::ProvideCapabilities(_) => "ProvideCapabilities",
-        MessageBodyC1::RequestAssistanceData(_) => "RequestAssistanceData",
-        MessageBodyC1::ProvideAssistanceData(_) => "ProvideAssistanceData",
-        MessageBodyC1::RequestLocationInformation(_) => "RequestLocationInformation",
-        MessageBodyC1::ProvideLocationInformation(_) => "ProvideLocationInformation",
+        B::RequestCapabilities(_) => "RequestCapabilities",
+        B::ProvideCapabilities(_) => "ProvideCapabilities",
+        B::RequestAssistanceData(_) => "RequestAssistanceData",
+        B::ProvideAssistanceData(_) => "ProvideAssistanceData",
+        B::RequestLocationInformation(_) => "RequestLocationInformation",
+        B::ProvideLocationInformation(_) => "ProvideLocationInformation",
+        B::Abort(_) => "Abort",
+        B::Error(_) => "Error",
+        _ => "a spare c1 body",
     }
 }
 
@@ -162,19 +249,16 @@ pub fn build_lpp_provide_assistance_data(
     lon_deg: f64,
     uncertainty_m: f64,
 ) -> Result<Vec<u8>, String> {
-    use nextgcore_asn1c::lpp::a_gnss::common::{AGnssProvideAssistanceData, GnssCommonAssistData};
-    use nextgcore_asn1c::lpp::a_gnss::reference_location::{
-        AltitudeDirection, EllipsoidPointWithAltitudeAndUncertaintyEllipsoid,
-        GnssReferenceLocation, LatitudeSign,
-    };
+    use lpp::EllipsoidPointWithAltitudeAndUncertaintyEllipsoidAltitudeDirection as AltitudeDirection;
+    use lpp::EllipsoidPointWithAltitudeAndUncertaintyEllipsoidLatitudeSign as LatitudeSign;
 
     // TS 23.032 §6.1 magnitude-and-sign, as the GAD encoders in `nlmf` already do
     // for the northbound body. Reused rather than re-derived so the two cannot
     // disagree about the same coordinate.
     let (sign, degrees_latitude) = if lat_deg < 0.0 {
-        (LatitudeSign::South, lat_deg.abs())
+        (LatitudeSign::SOUTH, lat_deg.abs())
     } else {
-        (LatitudeSign::North, lat_deg)
+        (LatitudeSign::NORTH, lat_deg)
     };
     let degrees_latitude =
         ((degrees_latitude.min(90.0) / 90.0) * f64::from(1u32 << 23)).round() as u32;
@@ -182,98 +266,109 @@ pub fn build_lpp_provide_assistance_data(
     let degrees_longitude =
         ((lon_deg.clamp(-180.0, 180.0) / 360.0) * f64::from(1u32 << 24)).round() as i32;
     let degrees_longitude = degrees_longitude.clamp(-(1i32 << 23), (1i32 << 23) - 1);
+    let uncertainty = crate::nlmf::encode_gad_uncertainty(uncertainty_m);
 
-    let three_d_location = EllipsoidPointWithAltitudeAndUncertaintyEllipsoid {
-        latitude_sign: sign,
-        degrees_latitude,
-        degrees_longitude,
-        altitude_direction: AltitudeDirection::Height,
+    let three_dlocation = lpp::EllipsoidPointWithAltitudeAndUncertaintyEllipsoid {
+        latitude_sign: LatitudeSign(sign),
+        degrees_latitude: lpp::EllipsoidPointWithAltitudeAndUncertaintyEllipsoidDegreesLatitude(
+            degrees_latitude,
+        ),
+        degrees_longitude: lpp::EllipsoidPointWithAltitudeAndUncertaintyEllipsoidDegreesLongitude(
+            degrees_longitude,
+        ),
+        altitude_direction: AltitudeDirection(AltitudeDirection::HEIGHT),
         // Altitude 0 with a MAXIMAL altitude uncertainty: the registry's coordinates
         // are 2-D in every deployment this build supports, so claiming a height would
         // be claiming knowledge. A large uncertainty says "unknown" in the only
         // vocabulary the IE has.
-        altitude: 0,
-        uncertainty_semi_major: crate::nlmf::encode_gad_uncertainty(uncertainty_m),
-        uncertainty_semi_minor: crate::nlmf::encode_gad_uncertainty(uncertainty_m),
+        altitude: lpp::EllipsoidPointWithAltitudeAndUncertaintyEllipsoidAltitude(0),
+        uncertainty_semi_major:
+            lpp::EllipsoidPointWithAltitudeAndUncertaintyEllipsoidUncertaintySemiMajor(uncertainty),
+        uncertainty_semi_minor:
+            lpp::EllipsoidPointWithAltitudeAndUncertaintyEllipsoidUncertaintySemiMinor(uncertainty),
         // A circular uncertainty region, so the major-axis orientation is arbitrary.
-        orientation_major_axis: 0,
-        uncertainty_altitude: 127,
+        orientation_major_axis:
+            lpp::EllipsoidPointWithAltitudeAndUncertaintyEllipsoidOrientationMajorAxis(0),
+        uncertainty_altitude:
+            lpp::EllipsoidPointWithAltitudeAndUncertaintyEllipsoidUncertaintyAltitude(127),
         // 68% — one standard deviation, the convention the northbound encoder uses.
-        confidence: 68,
+        confidence: lpp::EllipsoidPointWithAltitudeAndUncertaintyEllipsoidConfidence(68),
     };
 
-    let msg = LppMessage {
-        transaction_id: Some(LppTransactionId {
-            // The LMF answers on the UE's transaction, so the initiator is the UE
-            // that opened it. Sending `LocationServer` here would open a SECOND
-            // transaction and leave the UE's request unanswered.
-            initiator: Initiator::TargetDevice,
-            transaction_number: TransactionNumber(transaction_number),
+    let ies = lpp::ProvideAssistanceData_r9_IEs {
+        common_i_es_provide_assistance_data: None,
+        a_gnss_provide_assistance_data: Some(lpp::A_GNSS_ProvideAssistanceData {
+            gnss_common_assist_data: Some(lpp::GNSS_CommonAssistData {
+                gnss_reference_time: None,
+                gnss_reference_location: Some(lpp::GNSS_ReferenceLocation { three_dlocation }),
+                gnss_ionospheric_model: None,
+                gnss_earth_orientation_parameters: None,
+                extensions: Default::default(),
+            }),
+            gnss_generic_assist_data: None,
+            gnss_error: None,
+            extensions: Default::default(),
         }),
-        // The assistance data completes the exchange the UE opened.
-        end_transaction: true,
-        sequence_number: None,
-        acknowledgement: None,
-        message_body: Some(LppMessageBody::C1(MessageBodyC1::ProvideAssistanceData(
-            nextgcore_asn1c::lpp::a_gnss::body::ProvideAssistanceData {
-                ies: nextgcore_asn1c::lpp::a_gnss::body::ProvideAssistanceDataR9 {
-                    a_gnss: Some(AGnssProvideAssistanceData {
-                        gnss_common_assist_data: Some(GnssCommonAssistData {
-                            gnss_reference_time: None,
-                            gnss_reference_location: Some(GnssReferenceLocation {
-                                three_d_location,
-                            }),
-                            gnss_ionospheric_model: None,
-                            gnss_earth_orientation_parameters: None,
-                        }),
-                        gnss_generic_assist_data: None,
-                    }),
-                },
-            },
-        ))),
+        otdoa_provide_assistance_data: None,
+        epdu_provide_assistance_data: None,
+        extensions: Default::default(),
     };
-    msg.encode()
-        .map(|b| b.to_vec())
-        .map_err(|e| format!("LPP ProvideAssistanceData encode: {e}"))
+    let msg = message(
+        // The LMF answers on the UE's transaction, so the initiator is the UE that
+        // opened it. Sending `locationServer` here would open a SECOND transaction
+        // and leave the UE's request unanswered.
+        transaction(lpp::Initiator::TARGET_DEVICE, transaction_number),
+        // The assistance data completes the exchange the UE opened.
+        true,
+        lpp::LPP_MessageBody_c1::ProvideAssistanceData(lpp::ProvideAssistanceData {
+            critical_extensions: lpp::ProvideAssistanceDataCriticalExtensions::C1(
+                lpp::ProvideAssistanceDataCriticalExtensions_c1::ProvideAssistanceData_r9(ies),
+            ),
+        }),
+    );
+    encode(&msg, "ProvideAssistanceData")
 }
 
 /// What this LMF knows about a UE's LPP positioning capabilities (#103).
 ///
-/// # Why three values and not a set of booleans
-///
-/// The tree's `ProvideCapabilitiesR9` models exactly two members — `common` and
-/// `ecid` — so **the wire cannot currently tell this LMF that a UE supports
-/// Multi-RTT or DL-TDOA**. A capability model with a bit per method would therefore
-/// have one bit that is always false and two that can never be set, which reads as
-/// "the UE does not support them" when the truth is "this build cannot ask".
-///
-/// Three values keep that distinction visible: [`Self::Unknown`] means no exchange
-/// happened (or the codec cannot represent the answer), which is not the same as
-/// [`Self::EcidOnly`].
+/// Three values rather than a bit per method: [`Self::Unknown`] means no exchange
+/// happened (or the report names nothing this LMF can request), which is not the
+/// same as [`Self::EcidOnly`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UeLppCapability {
     /// No capability exchange, or one this build cannot interpret.
     #[default]
     Unknown,
-    /// The UE reported E-CID capabilities and nothing this build recognises beyond
-    /// them. The only value a `ProvideCapabilities` decode can currently produce.
+    /// The UE reported E-CID capabilities and no NR high-accuracy method.
     EcidOnly,
-    /// The UE reported support for a high-accuracy method. **Not reachable from the
-    /// wire in this build** — `ProvideCapabilitiesR9` has no member for it — and
-    /// present so the selection logic is written against the real question rather
-    /// than around a missing one.
+    /// The UE reported NR Multi-RTT or NR DL-TDOA capabilities (TS 37.355 §6.5.10,
+    /// Rel-16 extension additions of `ProvideCapabilities-r9-IEs`). Reachable from
+    /// the wire since the generated codec carries extension additions (#515).
     AdvancedMethods,
 }
 
-/// Classify a decoded LPP `ProvideCapabilities` (#103).
+/// Classify a decoded LPP `ProvideCapabilities` (#103, TS 37.355 §6.3).
 ///
-/// Returns [`UeLppCapability::EcidOnly`] when the UE reported E-CID capabilities,
-/// and `Unknown` otherwise — including for a report carrying only `common` IEs,
-/// which says nothing about method support.
-pub fn classify_ue_capability(
-    caps: &nextgcore_asn1c::lpp::capabilities::ProvideCapabilities,
-) -> UeLppCapability {
-    if caps.ies.ecid.is_some() {
+/// On the generated codec the Rel-16 NR capability members are visible:
+/// `nr-Multi-RTT-ProvideCapabilities-r16` or `nr-DL-TDOA-ProvideCapabilities-r16`
+/// ⇒ [`UeLppCapability::AdvancedMethods`]; otherwise E-CID capabilities ⇒
+/// [`UeLppCapability::EcidOnly`]; a report carrying neither (only `common` IEs, or
+/// another method) says nothing this LMF can request and stays `Unknown`.
+pub fn classify_ue_capability(caps: &lpp::ProvideCapabilities) -> UeLppCapability {
+    let ies = match &caps.critical_extensions {
+        lpp::ProvideCapabilitiesCriticalExtensions::C1(
+            lpp::ProvideCapabilitiesCriticalExtensions_c1::ProvideCapabilities_r9(ies),
+        ) => ies,
+        _ => return UeLppCapability::Unknown,
+    };
+    if ies
+        .extensions
+        .nr_multi_rtt_provide_capabilities_r16
+        .is_some()
+        || ies.extensions.nr_dl_tdoa_provide_capabilities_r16.is_some()
+    {
+        UeLppCapability::AdvancedMethods
+    } else if ies.ecid_provide_capabilities.is_some() {
         UeLppCapability::EcidOnly
     } else {
         UeLppCapability::Unknown
@@ -336,81 +431,84 @@ pub fn select_lpp_method(
 
 /// Encode an LMF-initiated `RequestLocationInformation` for `method` (#103).
 ///
-/// Before this, every network-initiated request was E-CID with `nr_multi_rtt` and
-/// `nr_dl_tdoa` hardcoded `None`, so the requested LCS QoS could never influence
-/// what was measured. The library already had encoders and decoders for all three
-/// bodies; nothing selected between them.
-///
 /// One body per request rather than several at once: TS 37.355 permits a request to
 /// ask for more than one, but this LMF's report decoders each key on their own body
 /// and a combined request would make "which method answered" ambiguous — a
 /// distinction the response's `positioningMethod` has to state.
+///
+/// The NR bodies are Rel-16 extension additions of `RequestLocationInformation-r9-IEs`
+/// (TS 37.355 §6.2), which the generated codec carries since nextgsim #253.
 pub fn build_lpp_request(method: LppMethod, transaction_number: u8) -> Result<Vec<u8>, String> {
     let ies = match method {
-        LppMethod::Ecid => RequestLocationInformationR9 {
-            // requestedMeasurements: bit0 = rsrpReq, bit1 = rsrqReq.
-            ecid: Some(EcidRequestLocationInformation {
-                requested_measurements: requested_measurements(&[true, true]),
-            }),
-            nr_multi_rtt: None,
-            nr_dl_tdoa: None,
-        },
-        LppMethod::MultiRtt => RequestLocationInformationR9 {
-            ecid: None,
-            nr_multi_rtt: Some(
-                nextgcore_asn1c::lpp::nr_multi_rtt::NrMultiRttRequestLocationInformation {
+        LppMethod::Ecid => ecid_request_ies(),
+        LppMethod::MultiRtt => {
+            let mut ies = empty_request_ies();
+            ies.extensions.nr_multi_rtt_request_location_information_r16 =
+                Some(lpp::NR_Multi_RTT_RequestLocationInformation_r16 {
                     // The Rx-Tx time difference IS the ranging observable, so a
-                    // Multi-RTT request that did not ask for it would return
-                    // RSRP the E-CID path already gets.
-                    rx_tx_time_diff_measurement_info_request: true,
+                    // Multi-RTT request that did not ask for it would return RSRP
+                    // the E-CID path already gets.
+                    nr_ue_rx_tx_time_diff_measurement_info_request_r16: Some(
+                        lpp::NR_Multi_RTT_RequestLocationInformation_r16Nr_UE_RxTxTimeDiffMeasurementInfoRequest_r16(
+                            lpp::NR_Multi_RTT_RequestLocationInformation_r16Nr_UE_RxTxTimeDiffMeasurementInfoRequest_r16::TRUE,
+                        ),
+                    ),
                     // bit0 = prsrsrpReq: the PRS RSRP accompanies each range and is
                     // what the solver weights by.
-                    requested_measurements: requested_measurements(&[true]),
+                    nr_requested_measurements_r16:
+                        lpp::NR_Multi_RTT_RequestLocationInformation_r16Nr_RequestedMeasurements_r16(
+                            bits(&[true]),
+                        ),
                     // This LMF provides no PRS assistance data, so it must not claim
                     // availability -- a UE told assistance is available and given
                     // none reports nothing.
-                    assistance_availability: false,
-                    report_config: nextgcore_asn1c::lpp::nr_multi_rtt::NrMultiRttReportConfig {
-                        // Up to 4 measurements per TRP; trilateration needs >=3
-                        // TRPs and more samples per TRP only helps.
-                        max_dl_prs_rx_tx_time_diff_meas_per_trp: Some(4),
-                        timing_reporting_granularity_factor: None,
+                    nr_assistance_availability_r16:
+                        lpp::NR_Multi_RTT_RequestLocationInformation_r16Nr_AssistanceAvailability_r16(
+                            false,
+                        ),
+                    nr_multi_rtt_report_config_r16: lpp::NR_Multi_RTT_ReportConfig_r16 {
+                        // Up to 4 measurements per TRP; trilateration needs >=3 TRPs
+                        // and more samples per TRP only helps.
+                        max_dl_prs_rx_tx_time_diff_meas_per_trp_r16: Some(
+                            lpp::NR_Multi_RTT_ReportConfig_r16MaxDL_PRS_RxTxTimeDiffMeasPerTRP_r16(4),
+                        ),
+                        timing_reporting_granularity_factor_r16: None,
                     },
-                    additional_paths: false,
-                },
-            ),
-            nr_dl_tdoa: None,
-        },
-        LppMethod::DlTdoa => RequestLocationInformationR9 {
-            ecid: None,
-            nr_multi_rtt: None,
-            nr_dl_tdoa: Some(
-                nextgcore_asn1c::lpp::nr_dl_tdoa::NrDlTdoaRequestLocationInformation {
+                    additional_paths_r16: None,
+                    extensions: Default::default(),
+                });
+            ies
+        }
+        LppMethod::DlTdoa => {
+            let mut ies = empty_request_ies();
+            ies.extensions.nr_dl_tdoa_request_location_information_r16 =
+                Some(lpp::NR_DL_TDOA_RequestLocationInformation_r16 {
                     // The RSTD is the observable; without it there is nothing to
                     // multilaterate.
-                    rstd_measurement_info_request: true,
-                    requested_measurements: requested_measurements(&[true]),
-                    assistance_availability: false,
-                    additional_paths: false,
-                },
-            ),
-        },
+                    nr_dl_prs_rstd_measurement_info_request_r16: Some(
+                        lpp::NR_DL_TDOA_RequestLocationInformation_r16Nr_DL_PRS_RstdMeasurementInfoRequest_r16(
+                            lpp::NR_DL_TDOA_RequestLocationInformation_r16Nr_DL_PRS_RstdMeasurementInfoRequest_r16::TRUE,
+                        ),
+                    ),
+                    nr_requested_measurements_r16:
+                        lpp::NR_DL_TDOA_RequestLocationInformation_r16Nr_RequestedMeasurements_r16(
+                            bits(&[true]),
+                        ),
+                    nr_assistance_availability_r16:
+                        lpp::NR_DL_TDOA_RequestLocationInformation_r16Nr_AssistanceAvailability_r16(
+                            false,
+                        ),
+                    nr_dl_tdoa_report_config_r16: None,
+                    additional_paths_r16: None,
+                    extensions: Default::default(),
+                });
+            ies
+        }
     };
-    let msg = LppMessage {
-        transaction_id: Some(LppTransactionId {
-            initiator: Initiator::LocationServer,
-            transaction_number: TransactionNumber(transaction_number),
-        }),
-        end_transaction: false,
-        sequence_number: None,
-        acknowledgement: None,
-        message_body: Some(LppMessageBody::C1(
-            MessageBodyC1::RequestLocationInformation(RequestLocationInformation { ies }),
-        )),
-    };
-    msg.encode()
-        .map(|b| b.to_vec())
-        .map_err(|e| format!("LPP RequestLocationInformation ({method:?}) encode: {e}"))
+    encode(
+        &request_location(transaction_number, ies),
+        &format!("RequestLocationInformation ({method:?})"),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -425,8 +523,22 @@ const TC_NS: f64 = 1_000_000_000.0 / (480_000.0 * 4_096.0);
 // Private helpers
 // ---------------------------------------------------------------------------
 
-/// Convert an NR-UE-Rx-Tx-TimeDiff k0..k5 CHOICE value to nanoseconds as an
-/// unsigned magnitude `v × 2^n × T_c`, used by the Multi-RTT path for ranging.
+/// An NR-RSTD or NR-UE-Rx-Tx-TimeDiff report value: the reported integer `v` and
+/// its granularity exponent `k`, meaning `v × 2^k × T_c`. Rel-16 arms are k0..k5;
+/// the Rel-18 extension arms kMinus6..kMinus1 report finer steps (k = −6..−1).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct TimeReport {
+    pub v: u32,
+    pub k: i8,
+}
+
+/// `2^k` for a signed exponent.
+fn pow2(k: i8) -> f64 {
+    2f64.powi(i32::from(k))
+}
+
+/// Convert an NR-UE-Rx-Tx-TimeDiff report to nanoseconds as an unsigned magnitude
+/// `v × 2^k × T_c`, used by the Multi-RTT path for ranging.
 ///
 /// NOTE: per TS 38.133 §10.1.25 the UE Rx–Tx time difference is itself a SIGNED
 /// quantity with the same per-arm midpoint offset as NR-RSTD; treating it as an
@@ -434,42 +546,68 @@ const TC_NS: f64 = 1_000_000_000.0 / (480_000.0 * 4_096.0);
 /// (RTT = UE-Rx-Tx + gNB-Rx-Tx) and is left unchanged to avoid regressing the
 /// committed Multi-RTT path — revisit alongside a proper two-sided RTT model.
 /// The DL-TDOA path uses the spec-correct signed converter [`nrrstd_to_signed_ns`].
-fn nrrstd_to_ns(rstd: &NrRstd) -> u64 {
-    let (val, shift): (f64, u32) = match rstd {
-        NrRstd::K0(v) => (*v as f64, 0),
-        NrRstd::K1(v) => (*v as f64, 1),
-        NrRstd::K2(v) => (*v as f64, 2),
-        NrRstd::K3(v) => (*v as f64, 3),
-        NrRstd::K4(v) => (*v as f64, 4),
-        NrRstd::K5(v) => (*v as f64, 5),
-    };
-    (val * (1u64 << shift) as f64 * TC_NS) as u64
+pub(crate) fn nrrstd_to_ns(r: TimeReport) -> u64 {
+    (f64::from(r.v) * pow2(r.k) * TC_NS) as u64
 }
 
-/// Convert an NR-RSTD k0..k5 CHOICE value to SIGNED nanoseconds (TS 37.355
-/// §6.5.10, mapping table TS 38.133 §10.1.23).
+/// Convert an NR-RSTD report to SIGNED nanoseconds (TS 37.355 §6.5.10, mapping
+/// table TS 38.133 §10.1.23).
 ///
-/// NR-RSTD is a *signed* reference-signal time difference relative to the
-/// DL-PRS reference TRP, but is encoded as an unsigned `INTEGER(0..maxK)` whose
-/// sign is carried by a per-arm midpoint offset. The signed value is
+/// NR-RSTD is a *signed* reference-signal time difference relative to the DL-PRS
+/// reference TRP, but is encoded as an unsigned `INTEGER(0..maxK)` whose sign is
+/// carried by a per-arm midpoint offset. The signed value is
 /// `(v × 2^k − 985024) × T_c`: the offset 985024 is the LTE RSTD span
-/// (15391·Ts) scaled to `T_c = Ts/64`, so `v = 985024/2^k` decodes to exactly
-/// 0 ns (the reference TRP) and the range spans ≈ ±501 µs.
-///
-/// The exact ±1-LSB bin convention is defined by the TS 38.133 quantization
-/// table (not bundled in the local `specs/`); two independent spec derivations
-/// agreed on this formula to within one code, and it is validated here by
-/// synthetic round-trip recovery rather than a golden vector.
-fn nrrstd_to_signed_ns(rstd: &NrRstd) -> f64 {
-    let (val, shift): (i64, u32) = match rstd {
-        NrRstd::K0(v) => (*v as i64, 0),
-        NrRstd::K1(v) => (*v as i64, 1),
-        NrRstd::K2(v) => (*v as i64, 2),
-        NrRstd::K3(v) => (*v as i64, 3),
-        NrRstd::K4(v) => (*v as i64, 4),
-        NrRstd::K5(v) => (*v as i64, 5),
+/// (15391·Ts) scaled to `T_c = Ts/64`, so `v = 985024/2^k` decodes to exactly 0 ns
+/// (the reference TRP) and the range spans ≈ ±501 µs. The Rel-18 kMinus arms keep
+/// the same midpoint at their finer step.
+pub(crate) fn nrrstd_to_signed_ns(r: TimeReport) -> f64 {
+    (f64::from(r.v) * pow2(r.k) - 985_024.0) * TC_NS
+}
+
+/// Widen a k-arm's reported integer: the arms are `u16` or `u32` depending on
+/// their range, and the conversion formula wants one type.
+fn wide<T: Into<u32>>(v: T) -> u32 {
+    v.into()
+}
+
+/// The (v, k) of a Multi-RTT UE Rx-Tx time difference.
+fn rx_tx_report(d: &lpp::NR_Multi_RTT_MeasElement_r16Nr_UE_RxTxTimeDiff_r16) -> TimeReport {
+    use lpp::NR_Multi_RTT_MeasElement_r16Nr_UE_RxTxTimeDiff_r16 as D;
+    let (v, k): (u32, i8) = match d {
+        D::K0_r16(x) => (wide(x.0), 0),
+        D::K1_r16(x) => (wide(x.0), 1),
+        D::K2_r16(x) => (wide(x.0), 2),
+        D::K3_r16(x) => (wide(x.0), 3),
+        D::K4_r16(x) => (wide(x.0), 4),
+        D::K5_r16(x) => (wide(x.0), 5),
+        D::KMinus6_r18(x) => (wide(x.0), -6),
+        D::KMinus5_r18(x) => (wide(x.0), -5),
+        D::KMinus4_r18(x) => (wide(x.0), -4),
+        D::KMinus3_r18(x) => (wide(x.0), -3),
+        D::KMinus2_r18(x) => (wide(x.0), -2),
+        D::KMinus1_r18(x) => (wide(x.0), -1),
     };
-    ((val << shift) - 985_024) as f64 * TC_NS
+    TimeReport { v, k }
+}
+
+/// The (v, k) of a DL-TDOA RSTD.
+fn rstd_report(d: &lpp::NR_DL_TDOA_MeasElement_r16Nr_RSTD_r16) -> TimeReport {
+    use lpp::NR_DL_TDOA_MeasElement_r16Nr_RSTD_r16 as D;
+    let (v, k): (u32, i8) = match d {
+        D::K0_r16(x) => (wide(x.0), 0),
+        D::K1_r16(x) => (wide(x.0), 1),
+        D::K2_r16(x) => (wide(x.0), 2),
+        D::K3_r16(x) => (wide(x.0), 3),
+        D::K4_r16(x) => (wide(x.0), 4),
+        D::K5_r16(x) => (wide(x.0), 5),
+        D::KMinus6_r18(x) => (wide(x.0), -6),
+        D::KMinus5_r18(x) => (wide(x.0), -5),
+        D::KMinus4_r18(x) => (wide(x.0), -4),
+        D::KMinus3_r18(x) => (wide(x.0), -3),
+        D::KMinus2_r18(x) => (wide(x.0), -2),
+        D::KMinus1_r18(x) => (wide(x.0), -1),
+    };
+    TimeReport { v, k }
 }
 
 // ---------------------------------------------------------------------------
@@ -508,21 +646,21 @@ pub fn decode_nrppa_ecid_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasuremen
 /// | `rsrp_result` (0..97)        | `rsrp`            | `v − 140` → −140..−43 dBm (E-UTRA RSRP-Range, TS 36.133 §9.1.4; same convention as the NRPPa E-CID adapter in [`crate::nrppa_uplink`]) |
 /// | `rsrq_result` (0..34)        | `rsrq`            | raw 0..34 index (E-UTRA RSRQ-Range, TS 36.133 §9.1.7; same as the NRPPa adapter) |
 /// | `ue_rx_tx_time_diff` (0..4095) | `timing_advance` | raw UE Rx−Tx time-difference units — the E-CID ranging term `solve_ecid`'s TA ring consumes |
-fn measured_results_element_to_cell(elem: &MeasuredResultsElement) -> CellMeasurement {
+fn measured_results_element_to_cell(elem: &lpp::MeasuredResultsElement) -> CellMeasurement {
     CellMeasurement {
-        nr_cgi: format!("pci-{}", elem.phys_cell_id),
-        rsrp: elem.rsrp_result.map(|v| i16::from(v) - 140),
-        rsrq: elem.rsrq_result.map(i16::from),
-        timing_advance: elem.ue_rx_tx_time_diff.map(u32::from),
+        nr_cgi: format!("pci-{}", elem.phys_cell_id.0),
+        rsrp: elem.rsrp_result.as_ref().map(|v| i16::from(v.0) - 140),
+        rsrq: elem.rsrq_result.as_ref().map(|v| i16::from(v.0)),
+        timing_advance: elem.ue_rx_tx_time_diff.as_ref().map(|v| u32::from(v.0)),
         aoa: None,
         rtt_ns: None,
         rstd_ns: None,
     }
 }
 
-/// Adapt a decoded LPP UPER PDU carrying a `ProvideLocationInformation` →
-/// `ecid-ProvideLocationInformation` → `ECID-SignalMeasurementInformation`
-/// (TS 37.355 §6.5.3) into [`CellMeasurement`]s.
+/// Adapt a decoded LPP `ProvideLocationInformation` → `ecid-ProvideLocationInformation`
+/// → `ECID-SignalMeasurementInformation` (TS 37.355 §6.5.3) into
+/// [`CellMeasurement`]s.
 ///
 /// The `primaryCellMeasuredResults` (serving cell) is emitted first, then each
 /// `measuredResultsList` element, so `try_real_solve`'s ECID branch (serving =
@@ -530,30 +668,22 @@ fn measured_results_element_to_cell(elem: &MeasuredResultsElement) -> CellMeasur
 /// serving cell.
 ///
 /// Returns an empty `Vec` when the message is not a `ProvideLocationInformation`,
-/// carries no `ecid` body, or the `ecid` body carries only an `ECID-Error`
-/// (no `signal_measurement_information`).
-pub fn lpp_ecid_provide_to_measurements(msg: &LppMessage) -> Vec<CellMeasurement> {
-    let prov = match msg.message_body.as_ref() {
-        Some(LppMessageBody::C1(MessageBodyC1::ProvideLocationInformation(p))) => p,
-        _ => return vec![],
+/// carries no `ecid` body, or the `ecid` body carries only an `ECID-Error`.
+pub fn lpp_ecid_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMeasurement> {
+    let Some(sig) = provide_location_r9(msg)
+        .and_then(|ies| ies.ecid_provide_location_information.as_ref())
+        .and_then(|e| e.ecid_signal_measurement_information.as_ref())
+    else {
+        return vec![];
     };
-    let sig = match prov
-        .ies
-        .ecid
-        .as_ref()
-        .and_then(|e| e.signal_measurement_information.as_ref())
-    {
-        Some(s) => s,
-        None => return vec![],
-    };
-
     let mut out = Vec::with_capacity(
-        sig.measured_results_list.len() + usize::from(sig.primary_cell_measured_results.is_some()),
+        sig.measured_results_list.0.len()
+            + usize::from(sig.primary_cell_measured_results.is_some()),
     );
     if let Some(primary) = sig.primary_cell_measured_results.as_ref() {
         out.push(measured_results_element_to_cell(primary));
     }
-    for elem in &sig.measured_results_list {
+    for elem in &sig.measured_results_list.0 {
         out.push(measured_results_element_to_cell(elem));
     }
     out
@@ -562,7 +692,7 @@ pub fn lpp_ecid_provide_to_measurements(msg: &LppMessage) -> Vec<CellMeasurement
 /// Decode raw LPP UPER bytes and adapt E-CID `ProvideLocationInformation`
 /// measurements. `request_id` is the LPP transaction number (0 when absent).
 pub fn decode_lpp_ecid_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasurement>), String> {
-    let msg = LppMessage::decode(bytes).map_err(|e| format!("LPP UPER decode: {e}"))?;
+    let msg = decode_lpp(bytes)?;
     let request_id = extract_lpp_request_id(&msg).unwrap_or(0);
     Ok((request_id, lpp_ecid_provide_to_measurements(&msg)))
 }
@@ -571,57 +701,48 @@ pub fn decode_lpp_ecid_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasurement>
 // LPP Multi-RTT adapter
 // ---------------------------------------------------------------------------
 
-/// Adapt a decoded LPP UPER PDU carrying a `ProvideLocationInformation` →
-/// `nr-Multi-RTT` measurement list (TS 37.355 §6.5.10) into
-/// [`CellMeasurement`]s.
-///
-/// Each `NrMultiRttMeasElement` produces one entry:
+/// Adapt a decoded LPP `ProvideLocationInformation` → `nr-Multi-RTT` measurement
+/// list (TS 37.355 §6.5.10) into [`CellMeasurement`]s.
 ///
 /// | PDU field                       | `CellMeasurement` field | Notes                            |
 /// |---------------------------------|-------------------------|----------------------------------|
-/// | `nr_phys_cell_id` (NR PCI)      | `nr_cgi`                | `"pci-<n>"`; `"prs-<id>"` fallback |
-/// | `nr_ue_rx_tx_time_diff` k0..k5  | `rtt_ns`                | v × 2^k × T_c nanoseconds        |
-/// | `nr_dl_prs_rsrp_result`          | `rsrp`                  | 0..127 → −140..−13 dBm           |
+/// | `nr-PhysCellID` (NR PCI)        | `nr_cgi`                | `"pci-<n>"`; `"prs-<id>"` fallback |
+/// | `nr-UE-RxTxTimeDiff` k-arm      | `rtt_ns`                | v × 2^k × T_c nanoseconds        |
+/// | `nr-DL-PRS-RSRP-Result`         | `rsrp`                  | 0..126 → −140..−14 dBm           |
 ///
-/// NR-DL-TDOA is DEFERRED; `CellMeasurement` carries no TDOA/RSTD field.
-///
-/// Returns an empty `Vec` when the message is not a
-/// `ProvideLocationInformation`, carries no `nr-Multi-RTT` body, or when
-/// `signal_measurement_information` is absent.
-pub fn lpp_multi_rtt_provide_to_measurements(msg: &LppMessage) -> Vec<CellMeasurement> {
-    let prov = match msg.message_body.as_ref() {
-        Some(LppMessageBody::C1(MessageBodyC1::ProvideLocationInformation(p))) => p,
-        _ => return vec![],
+/// Returns an empty `Vec` when the message is not a `ProvideLocationInformation`,
+/// carries no `nr-Multi-RTT` body, or its signal measurement information is absent.
+pub fn lpp_multi_rtt_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMeasurement> {
+    let Some(sig) = provide_location_r9(msg)
+        .and_then(|ies| {
+            ies.extensions
+                .nr_multi_rtt_provide_location_information_r16
+                .as_ref()
+        })
+        .and_then(|m| m.nr_multi_rtt_signal_measurement_information_r16.as_ref())
+    else {
+        return vec![];
     };
-    let sig_info = match prov
-        .ies
-        .nr_multi_rtt
-        .as_ref()
-        .and_then(|m| m.signal_measurement_information.as_ref())
-    {
-        Some(s) => s,
-        None => return vec![],
-    };
-
-    sig_info
-        .meas_list
-        .items
+    sig.nr_multi_rtt_meas_list_r16
+        .0
         .iter()
         .map(|elem| {
             // Use NR PCI as CGI key when present; fall back to DL-PRS-ID.
-            let nr_cgi = match elem.nr_phys_cell_id {
-                Some(pci) => format!("pci-{pci}"),
-                None => format!("prs-{}", elem.dl_prs_id),
+            let nr_cgi = match &elem.nr_phys_cell_id_r16 {
+                Some(pci) => format!("pci-{}", pci.0),
+                None => format!("prs-{}", elem.dl_prs_id_r16.0),
             };
-            // nr_dl_prs_rsrp_result 0..127 → −140..−13 dBm (TS 37.355 §6.5.10).
-            let rsrp = elem.nr_dl_prs_rsrp_result.map(|v| v as i16 - 140);
+            let rsrp = elem
+                .nr_dl_prs_rsrp_result_r16
+                .as_ref()
+                .map(|v| i16::from(v.0) - 140);
             CellMeasurement {
                 nr_cgi,
                 rsrp,
                 rsrq: None,
                 timing_advance: None,
                 aoa: None,
-                rtt_ns: Some(nrrstd_to_ns(&elem.nr_ue_rx_tx_time_diff)),
+                rtt_ns: Some(nrrstd_to_ns(rx_tx_report(&elem.nr_ue_rx_tx_time_diff_r16))),
                 rstd_ns: None,
             }
         })
@@ -633,7 +754,7 @@ pub fn lpp_multi_rtt_provide_to_measurements(msg: &LppMessage) -> Vec<CellMeasur
 /// The `transactionID.transactionNumber` (0..255) correlates the UE's
 /// `ProvideLocationInformation` with the LMF's `RequestLocationInformation`.
 /// Returns `None` when the message carries no `transactionID`.
-pub fn extract_lpp_request_id(msg: &LppMessage) -> Option<u64> {
+pub fn extract_lpp_request_id(msg: &lpp::LPP_Message) -> Option<u64> {
     msg.transaction_id
         .as_ref()
         .map(|t| u64::from(t.transaction_number.0))
@@ -641,11 +762,10 @@ pub fn extract_lpp_request_id(msg: &LppMessage) -> Option<u64> {
 
 /// Decode raw LPP UPER bytes and adapt nr-Multi-RTT measurements.
 ///
-/// Returns `(request_id, Vec<CellMeasurement>)` on success, or an `Err`
-/// description.  `request_id` is the LPP transaction number (0 when absent).
-/// Used by `handle_lpp_binary_report` in `main.rs`.
+/// Returns `(request_id, Vec<CellMeasurement>)`; `request_id` is the LPP
+/// transaction number (0 when absent). Used by `handle_lpp_binary_report`.
 pub fn decode_lpp_multi_rtt_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasurement>), String> {
-    let msg = LppMessage::decode(bytes).map_err(|e| format!("LPP UPER decode: {e}"))?;
+    let msg = decode_lpp(bytes)?;
     let request_id = extract_lpp_request_id(&msg).unwrap_or(0);
     Ok((request_id, lpp_multi_rtt_provide_to_measurements(&msg)))
 }
@@ -653,34 +773,29 @@ pub fn decode_lpp_multi_rtt_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasure
 /// Adapt a UE NR-DL-TDOA `ProvideLocationInformation` (TS 37.355 §6.5.10) to a
 /// flat [`CellMeasurement`] list for [`crate::LmfContext::measurement_report`].
 ///
-/// The reference TRP (`dl-PRS-ReferenceInfo`) is emitted first with `rstd_ns =
-/// 0` (RSTD is defined relative to it); each `NR-DL-TDOA-MeasElement` then
-/// contributes one entry whose `rstd_ns` is the SIGNED time difference vs that
-/// reference (see [`nrrstd_to_signed_ns`]). The CGI key is `"pci-<n>"` (NR PCI)
-/// when present, else `"prs-<id>"` (DL-PRS-ID). `compute_location` feeds these
-/// to the TDOA solver (reference first).
+/// The reference TRP (`dl-PRS-ReferenceInfo`) is emitted first with `rstd_ns = 0`
+/// (RSTD is defined relative to it); each `NR-DL-TDOA-MeasElement` then contributes
+/// one entry whose `rstd_ns` is the SIGNED time difference vs that reference (see
+/// [`nrrstd_to_signed_ns`]). The CGI key is `"pci-<n>"` (NR PCI) when present, else
+/// `"prs-<id>"` (DL-PRS-ID).
 ///
-/// Returns an empty `Vec` when the message is not a `ProvideLocationInformation`
-/// or carries no `nr-DL-TDOA` signal-measurement information.
-pub fn lpp_dl_tdoa_provide_to_measurements(msg: &LppMessage) -> Vec<CellMeasurement> {
-    let prov = match msg.message_body.as_ref() {
-        Some(LppMessageBody::C1(MessageBodyC1::ProvideLocationInformation(p))) => p,
-        _ => return vec![],
+/// Returns an empty `Vec` when the message is not a `ProvideLocationInformation` or
+/// carries no `nr-DL-TDOA` signal-measurement information.
+pub fn lpp_dl_tdoa_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMeasurement> {
+    let Some(sig) = provide_location_r9(msg)
+        .and_then(|ies| {
+            ies.extensions
+                .nr_dl_tdoa_provide_location_information_r16
+                .as_ref()
+        })
+        .and_then(|m| m.nr_dl_tdoa_signal_measurement_information_r16.as_ref())
+    else {
+        return vec![];
     };
-    let sig_info = match prov
-        .ies
-        .nr_dl_tdoa
-        .as_ref()
-        .and_then(|m| m.signal_measurement_information.as_ref())
-    {
-        Some(s) => s,
-        None => return vec![],
-    };
-
-    let mut out = Vec::with_capacity(sig_info.meas_list.items.len() + 1);
+    let mut out = Vec::with_capacity(sig.nr_dl_tdoa_meas_list_r16.0.len() + 1);
     // Reference TRP: RSTD ≡ 0 by definition.
     out.push(CellMeasurement {
-        nr_cgi: format!("prs-{}", sig_info.dl_prs_reference_info.dl_prs_id),
+        nr_cgi: format!("prs-{}", sig.dl_prs_reference_info_r16.dl_prs_id_r16.0),
         rsrp: None,
         rsrq: None,
         timing_advance: None,
@@ -688,13 +803,15 @@ pub fn lpp_dl_tdoa_provide_to_measurements(msg: &LppMessage) -> Vec<CellMeasurem
         rtt_ns: None,
         rstd_ns: Some(0.0),
     });
-    for elem in &sig_info.meas_list.items {
-        let nr_cgi = match elem.nr_phys_cell_id {
-            Some(pci) => format!("pci-{pci}"),
-            None => format!("prs-{}", elem.dl_prs_id),
+    for elem in &sig.nr_dl_tdoa_meas_list_r16.0 {
+        let nr_cgi = match &elem.nr_phys_cell_id_r16 {
+            Some(pci) => format!("pci-{}", pci.0),
+            None => format!("prs-{}", elem.dl_prs_id_r16.0),
         };
-        // nr_dl_prs_rsrp_result 0..127 → −140..−13 dBm (TS 37.355 §6.5.10).
-        let rsrp = elem.nr_dl_prs_rsrp_result.map(|v| v as i16 - 140);
+        let rsrp = elem
+            .nr_dl_prs_rsrp_result_r16
+            .as_ref()
+            .map(|v| i16::from(v.0) - 140);
         out.push(CellMeasurement {
             nr_cgi,
             rsrp,
@@ -702,51 +819,42 @@ pub fn lpp_dl_tdoa_provide_to_measurements(msg: &LppMessage) -> Vec<CellMeasurem
             timing_advance: None,
             aoa: None,
             rtt_ns: None,
-            rstd_ns: Some(nrrstd_to_signed_ns(&elem.nr_rstd)),
+            rstd_ns: Some(nrrstd_to_signed_ns(rstd_report(&elem.nr_rstd_r16))),
         });
     }
     out
 }
 
 /// Decode raw LPP UPER bytes and adapt NR-DL-TDOA measurements.
-///
-/// Returns `(request_id, Vec<CellMeasurement>)`; `request_id` is the LPP
-/// transaction number (0 when absent).
 pub fn decode_lpp_dl_tdoa_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasurement>), String> {
-    let msg = LppMessage::decode(bytes).map_err(|e| format!("LPP UPER decode: {e}"))?;
+    let msg = decode_lpp(bytes)?;
     let request_id = extract_lpp_request_id(&msg).unwrap_or(0);
     Ok((request_id, lpp_dl_tdoa_provide_to_measurements(&msg)))
 }
 
-/// Decode a UE-provided LPP `ProvideLocationInformation` (TS 37.355 §6.2) once
-/// and route it through the available signal-measurement adapters, returning
-/// the first non-empty [`CellMeasurement`] set.
+/// Decode a UE-provided LPP `ProvideLocationInformation` (TS 37.355 §6.2) once and
+/// route it through the available signal-measurement adapters, returning the first
+/// non-empty [`CellMeasurement`] set: nr-E-CID, then nr-Multi-RTT, then nr-DL-TDOA.
 ///
-/// A5: this is the single decode entry point for the LPP PDU carried in a
-/// `binaryDataLppMessage` multipart part on the MO-LR `DetermineLocation`
-/// path, and (A4) for the uplink LPP `ProvideLocationInformation` delivered by
-/// the N1MessageNotify callback. The message is decoded ONCE (avoiding the
-/// repeated `LppMessage::decode` of the per-adapter wrappers) and its body is
-/// tried against nr-E-CID (A4), then nr-Multi-RTT, then nr-DL-TDOA — the first
-/// non-empty measurement set wins. `request_id` is the LPP
-/// `transactionID.transactionNumber` (0 when absent). Returns an `Err` only when
-/// the bytes are not a decodable `LppMessage`; a decodable message with no
-/// recognised measurements yields an empty vector (the caller maps that to a
-/// no-fix outcome / 400 MANDATORY_IE_MISSING).
+/// This is the single decode entry point for the LPP PDU carried in a
+/// `binaryDataLppMessage` multipart part on the MO-LR `DetermineLocation` path, and
+/// for the uplink LPP `ProvideLocationInformation` delivered by the N1MessageNotify
+/// callback. `request_id` is the LPP `transactionID.transactionNumber` (0 when
+/// absent). Returns an `Err` only when the bytes are not a decodable
+/// `LPP-Message`; a decodable message with no recognised measurements yields an
+/// empty vector (the caller maps that to a no-fix outcome).
 pub fn decode_lpp_provide_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasurement>), String> {
-    let msg = LppMessage::decode(bytes).map_err(|e| format!("LPP UPER decode: {e}"))?;
+    let msg = decode_lpp(bytes)?;
     let request_id = extract_lpp_request_id(&msg).unwrap_or(0);
-    let cells = {
-        let ecid = lpp_ecid_provide_to_measurements(&msg);
-        if !ecid.is_empty() {
-            ecid
+    let ecid = lpp_ecid_provide_to_measurements(&msg);
+    let cells = if !ecid.is_empty() {
+        ecid
+    } else {
+        let multi_rtt = lpp_multi_rtt_provide_to_measurements(&msg);
+        if multi_rtt.is_empty() {
+            lpp_dl_tdoa_provide_to_measurements(&msg)
         } else {
-            let multi_rtt = lpp_multi_rtt_provide_to_measurements(&msg);
-            if multi_rtt.is_empty() {
-                lpp_dl_tdoa_provide_to_measurements(&msg)
-            } else {
-                multi_rtt
-            }
+            multi_rtt
         }
     };
     Ok((request_id, cells))
@@ -813,7 +921,10 @@ pub fn lpp_sidelink_ranging_to_ranges(msg: &LppMessage) -> Vec<SidelinkRange> {
 /// returning both would invite a caller to treat one as the other.
 pub fn decode_lpp_sidelink_ranging(bytes: &[u8]) -> Result<(u64, Vec<SidelinkRange>), String> {
     let msg = LppMessage::decode(bytes).map_err(|e| format!("LPP UPER decode: {e}"))?;
-    let request_id = extract_lpp_request_id(&msg).unwrap_or(0);
+    let request_id = msg
+        .transaction_id
+        .as_ref()
+        .map_or(0, |t| u64::from(t.transaction_number.0));
     Ok((request_id, lpp_sidelink_ranging_to_ranges(&msg)))
 }
 
@@ -826,8 +937,18 @@ mod tests {
     use super::{
         build_lpp_ecid_request, decode_lpp_ecid_report, decode_lpp_provide_report,
         decode_nrppa_ecid_report, extract_lpp_request_id, lpp_dl_tdoa_provide_to_measurements,
-        lpp_multi_rtt_provide_to_measurements, nrrstd_to_ns, nrrstd_to_signed_ns, TC_NS,
+        lpp_multi_rtt_provide_to_measurements, nrrstd_to_ns, nrrstd_to_signed_ns, TimeReport,
+        TC_NS,
     };
+
+    /// A hand-written test message on the generated codec, through the wire: the
+    /// hand-written encoder is the test fixture builder, the generated decoder is
+    /// what production uses (#515).
+    fn to_gen(
+        m: &nextgcore_asn1c::lpp::message::LppMessage,
+    ) -> nextgcore_lpp_gen::generated::LPP_Message {
+        super::decode_lpp(&m.encode().expect("hand encode")).expect("generated decode")
+    }
     use crate::nrppa_uplink::test_support::{aoa, ecid_report, nr_cgi, rsrp, ta1};
     use nextgcore_asn1c::lpp::ecid::{ProvideLocationInformation, ProvideLocationInformationR9};
     use nextgcore_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
@@ -845,7 +966,7 @@ mod tests {
     fn lpp_ecid_request_roundtrips() {
         let bytes = build_lpp_ecid_request(7).expect("encode LPP request");
         let decoded = LppMessage::decode(&bytes).expect("decode LPP request");
-        assert_eq!(extract_lpp_request_id(&decoded), Some(7));
+        assert_eq!(extract_lpp_request_id(&to_gen(&decoded)), Some(7));
         assert!(matches!(
             decoded.message_body,
             Some(LppMessageBody::C1(
@@ -1007,17 +1128,17 @@ mod tests {
     #[test]
     fn nrrstd_k_to_ns_unit_values() {
         // K0(1) → 1 × 1 × 0.5086 ≈ 0 ns (truncated)
-        assert_eq!(nrrstd_to_ns(&NrRstd::K0(1)), 0);
+        assert_eq!(nrrstd_to_ns(TimeReport { v: 1, k: 0 }), 0);
         // K1(1) → 1 × 2 × 0.5086 ≈ 1 ns
-        assert_eq!(nrrstd_to_ns(&NrRstd::K1(1)), 1);
+        assert_eq!(nrrstd_to_ns(TimeReport { v: 1, k: 1 }), 1);
         // K2(1) → 1 × 4 × 0.5086 ≈ 2 ns
-        assert_eq!(nrrstd_to_ns(&NrRstd::K2(1)), 2);
+        assert_eq!(nrrstd_to_ns(TimeReport { v: 1, k: 2 }), 2);
         // K3(1) → 1 × 8 × 0.5086 ≈ 4 ns
-        assert_eq!(nrrstd_to_ns(&NrRstd::K3(1)), 4);
+        assert_eq!(nrrstd_to_ns(TimeReport { v: 1, k: 3 }), 4);
         // K4(1) → 1 × 16 × 0.5086 ≈ 8 ns
-        assert_eq!(nrrstd_to_ns(&NrRstd::K4(1)), 8);
+        assert_eq!(nrrstd_to_ns(TimeReport { v: 1, k: 4 }), 8);
         // K5(1) → 1 × 32 × 0.5086 ≈ 16 ns
-        assert_eq!(nrrstd_to_ns(&NrRstd::K5(1)), 16);
+        assert_eq!(nrrstd_to_ns(TimeReport { v: 1, k: 5 }), 16);
     }
 
     // Helper: a minimal NrTimeStamp (required in NrMultiRttMeasElement).
@@ -1126,9 +1247,9 @@ mod tests {
         let encoded = msg.encode().expect("LppMessage::encode");
         let decoded = LppMessage::decode(&encoded).expect("LppMessage::decode");
 
-        assert_eq!(extract_lpp_request_id(&decoded), Some(7));
+        assert_eq!(extract_lpp_request_id(&to_gen(&decoded)), Some(7));
 
-        let cells = lpp_multi_rtt_provide_to_measurements(&decoded);
+        let cells = lpp_multi_rtt_provide_to_measurements(&to_gen(&decoded));
         assert_eq!(cells.len(), 2);
 
         // Cell 0: PCI present → "pci-123"; K2(300_000) → ~610_351 ns.
@@ -1160,15 +1281,15 @@ mod tests {
     #[test]
     fn nrrstd_signed_endpoints() {
         // Per-arm zero point 985024/2^k decodes to exactly 0 ns (reference TRP).
-        assert_eq!(nrrstd_to_signed_ns(&NrRstd::K0(985_024)), 0.0);
-        assert_eq!(nrrstd_to_signed_ns(&NrRstd::K2(246_256)), 0.0); // 985024/4
-        assert_eq!(nrrstd_to_signed_ns(&NrRstd::K5(30_782)), 0.0); // 985024/32
-                                                                   // One k0 code = ±T_c around the midpoint (sign carried by the offset).
-        assert!((nrrstd_to_signed_ns(&NrRstd::K0(985_025)) - TC_NS).abs() < 1e-9);
-        assert!((nrrstd_to_signed_ns(&NrRstd::K0(985_023)) + TC_NS).abs() < 1e-9);
+        assert_eq!(nrrstd_to_signed_ns(TimeReport { v: 985_024, k: 0 }), 0.0);
+        assert_eq!(nrrstd_to_signed_ns(TimeReport { v: 246_256, k: 2 }), 0.0); // 985024/4
+        assert_eq!(nrrstd_to_signed_ns(TimeReport { v: 30_782, k: 5 }), 0.0); // 985024/32
+                                                                              // One k0 code = ±T_c around the midpoint (sign carried by the offset).
+        assert!((nrrstd_to_signed_ns(TimeReport { v: 985_025, k: 0 }) - TC_NS).abs() < 1e-9);
+        assert!((nrrstd_to_signed_ns(TimeReport { v: 985_023, k: 0 }) + TC_NS).abs() < 1e-9);
         // Endpoints span ≈ ±501 µs.
-        assert!((nrrstd_to_signed_ns(&NrRstd::K0(0)) + 985_024.0 * TC_NS).abs() < 1e-6);
-        assert!(nrrstd_to_signed_ns(&NrRstd::K0(1_970_049)) > 500_000.0);
+        assert!((nrrstd_to_signed_ns(TimeReport { v: 0, k: 0 }) + 985_024.0 * TC_NS).abs() < 1e-6);
+        assert!(nrrstd_to_signed_ns(TimeReport { v: 1_970_049, k: 0 }) > 500_000.0);
     }
 
     /// LPP NR-DL-TDOA round-trip: build → UPER encode → decode → adapt.
@@ -1221,9 +1342,9 @@ mod tests {
 
         let encoded = msg.encode().expect("LppMessage::encode");
         let decoded = LppMessage::decode(&encoded).expect("LppMessage::decode");
-        assert_eq!(extract_lpp_request_id(&decoded), Some(9));
+        assert_eq!(extract_lpp_request_id(&to_gen(&decoded)), Some(9));
 
-        let cells = lpp_dl_tdoa_provide_to_measurements(&decoded);
+        let cells = lpp_dl_tdoa_provide_to_measurements(&to_gen(&decoded));
         assert_eq!(cells.len(), 2, "reference + 1 measurement element");
         // Reference TRP first, RSTD 0.
         assert_eq!(cells[0].nr_cgi, "prs-3");

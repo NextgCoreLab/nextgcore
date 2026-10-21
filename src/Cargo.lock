@@ -2745,6 +2745,7 @@ dependencies = [
  "nextgcore-app",
  "nextgcore-asn1c",
  "nextgcore-core",
+ "nextgcore-lpp-gen",
  "nextgcore-metrics",
  "nextgcore-nrppa-gen",
  "nextgcore-sbi",
