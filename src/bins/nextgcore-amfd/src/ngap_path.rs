@@ -8115,7 +8115,7 @@ impl NgapServer {
             self.handover_target_assoc.remove(&required.amf_ue_ngap_id);
             self.handover_target_transfers
                 .retain(|(ue, _psi), _| *ue != required.amf_ue_ngap_id);
-            if let Ok(bytes) = nextgcore_ngap::builder::build_handover_preparation_failure(&failure)
+            if let Some(bytes) = crate::ngap_asn1::build_handover_preparation_failure_asn1(&failure)
             {
                 self.send_to_association(association_id, &bytes).await?;
             }
@@ -8152,7 +8152,7 @@ impl NgapServer {
                 ),
                 criticality_diagnostics: None,
             };
-            if let Ok(bytes) = nextgcore_ngap::builder::build_handover_preparation_failure(&failure)
+            if let Some(bytes) = crate::ngap_asn1::build_handover_preparation_failure_asn1(&failure)
             {
                 self.send_to_association(association_id, &bytes).await?;
             }
@@ -8181,7 +8181,7 @@ impl NgapServer {
                 ),
                 criticality_diagnostics: None,
             };
-            if let Ok(bytes) = nextgcore_ngap::builder::build_handover_preparation_failure(&failure)
+            if let Some(bytes) = crate::ngap_asn1::build_handover_preparation_failure_asn1(&failure)
             {
                 self.send_to_association(association_id, &bytes).await?;
             }
@@ -8290,7 +8290,7 @@ impl NgapServer {
                     ),
                     criticality_diagnostics: None,
                 };
-                if let Ok(b) = nextgcore_ngap::builder::build_handover_preparation_failure(&failure)
+                if let Some(b) = crate::ngap_asn1::build_handover_preparation_failure_asn1(&failure)
                 {
                     self.send_to_association(association_id, &b).await?;
                 }
@@ -8461,7 +8461,7 @@ impl NgapServer {
         self.handover_target_assoc.remove(&required.amf_ue_ngap_id);
         self.handover_target_transfers
             .retain(|(ue, _psi), _| *ue != required.amf_ue_ngap_id);
-        if let Ok(bytes) = nextgcore_ngap::builder::build_handover_preparation_failure(&failure) {
+        if let Some(bytes) = crate::ngap_asn1::build_handover_preparation_failure_asn1(&failure) {
             self.send_to_association(association_id, &bytes).await?;
         }
         Ok(())
@@ -8672,16 +8672,27 @@ impl NgapServer {
     /// Resource allocation failed at the target; relay a
     /// HandoverPreparationFailure to the source gNB so it aborts T304.
     async fn handle_handover_failure(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
-        let failure = match nextgcore_ngap::parser::decode_ngap_pdu(data) {
-            Ok(nextgcore_ngap::NgapMessage::HandoverFailure(f)) => f,
-            Ok(other) => {
-                log::warn!("Expected HandoverFailure, decoded {other:?}");
+        // #417: the GENERATED codec, TS 38.413 §10.3.4.2 for a response.
+        let failure = match crate::ngap_asn1::decode_handover_failure_asn1(data) {
+            crate::ngap_asn1::NasTransportDecode::Proceed {
+                message,
+                error_indication,
+            } => {
+                if let Some(report) = error_indication {
+                    if let Some(ei) =
+                        crate::ngap_asn1::build_criticality_error_indication_asn1(&report)
+                    {
+                        self.send_to_association(association_id, &ei).await?;
+                    }
+                }
+                message
+            }
+            crate::ngap_asn1::NasTransportDecode::Reject(report) => {
+                // A response: local error handling only (§10.3.4.2).
+                log::warn!("HandoverFailure from association {association_id} not comprehended: {report:?}");
                 return Ok(());
             }
-            Err(e) => {
-                log::error!("Failed to decode HandoverFailure: {e}");
-                return Ok(());
-            }
+            crate::ngap_asn1::NasTransportDecode::Undecodable => return Ok(()),
         };
         log::warn!(
             "HandoverFailure from association {association_id} (amf_ue_ngap_id={}, cause={:?})",
@@ -8717,8 +8728,8 @@ impl NgapServer {
                 cause: failure.cause,
                 criticality_diagnostics: None,
             };
-            if let Ok(bytes) =
-                nextgcore_ngap::builder::build_handover_preparation_failure(&prep_failure)
+            if let Some(bytes) =
+                crate::ngap_asn1::build_handover_preparation_failure_asn1(&prep_failure)
             {
                 self.send_to_association(source_assoc, &bytes).await?;
             }
@@ -8734,15 +8745,37 @@ impl NgapServer {
         association_id: u64,
         data: &[u8],
     ) -> Result<HandoverCompletion> {
-        let notify = match nextgcore_ngap::parser::decode_ngap_pdu(data) {
-            Ok(nextgcore_ngap::NgapMessage::HandoverNotify(n)) => n,
-            Ok(other) => {
-                log::warn!("Expected HandoverNotify, decoded {other:?}");
+        // #417: the GENERATED codec, TS 38.413 §10.3.4.2 for a procedure with no
+        // response. `user_location_info` is `None` when the ULI -- criticality
+        // ignore -- is absent or not NR; the serving location then stays as it was.
+        let notify = match crate::ngap_asn1::decode_handover_notify_asn1(data) {
+            crate::ngap_asn1::NasTransportDecode::Proceed {
+                message: (amf_ue_ngap_id, ran_ue_ngap_id, user_location_info),
+                error_indication,
+            } => {
+                if let Some(report) = error_indication {
+                    if let Some(ei) =
+                        crate::ngap_asn1::build_criticality_error_indication_asn1(&report)
+                    {
+                        self.send_to_association(association_id, &ei).await?;
+                    }
+                }
+                HandoverNotifyDecoded {
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    user_location_info,
+                }
+            }
+            crate::ngap_asn1::NasTransportDecode::Reject(report) => {
+                log::warn!("HandoverNotify from association {association_id} rejected: {report:?}");
+                if let Some(ei) = crate::ngap_asn1::build_criticality_error_indication_asn1(&report)
+                {
+                    self.send_to_association(association_id, &ei).await?;
+                }
                 return Ok(HandoverCompletion::default());
             }
-            Err(e) => {
-                log::error!("Failed to decode HandoverNotify: {e}");
-                return Ok(HandoverCompletion::default());
+            crate::ngap_asn1::NasTransportDecode::Undecodable => {
+                return Ok(HandoverCompletion::default())
             }
         };
         log::info!(
@@ -8771,7 +8804,9 @@ impl NgapServer {
             // big-endian TAC differently. Behaviour here is unchanged — this was the one
             // site that already did it correctly, and it is the reference the other two
             // were measured against.
-            apply_user_location(&mut state.amf_ue, &notify.user_location_info);
+            if let Some(location) = &notify.user_location_info {
+                apply_user_location(&mut state.amf_ue, location);
+            }
             log::info!(
                 "UE {} relocated to target gNB (association {association_id})",
                 notify.amf_ue_ngap_id
@@ -9188,8 +9223,7 @@ impl NgapServer {
                     ),
                     criticality_diagnostics: None,
                 };
-                let pdu =
-                    nextgcore_ngap::builder::build_handover_preparation_failure(&failure).ok()?;
+                let pdu = crate::ngap_asn1::build_handover_preparation_failure_asn1(&failure)?;
                 log::warn!(
                     "5GS→EPS: the target refused UE {}'s relocation ({:?}); \
                      HandoverPreparationFailure to the source gNB (association \
@@ -9692,20 +9726,33 @@ impl NgapServer {
     /// Handle a HandoverCancel from the source gNB (TS 38.413 Section 8.4.5).
     /// The AMF acknowledges with a HandoverCancelAcknowledge.
     async fn handle_handover_cancel(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
-        let cancel = match nextgcore_ngap::parser::decode_ngap_pdu(data) {
-            Ok(nextgcore_ngap::NgapMessage::HandoverCancel(c)) => c,
-            Ok(other) => {
-                log::warn!("Expected HandoverCancel, decoded {other:?}");
+        // #417: the GENERATED codec, TS 38.413 §10.3.4.2: Handover Cancel has a
+        // response and no unsuccessful outcome, so "notify" IEs go in the
+        // Acknowledge and "reject" ones (or missing UE IDs) end it with an
+        // Error Indication.
+        let (cancel, notify) = match crate::ngap_asn1::decode_handover_cancel_asn1(data) {
+            crate::ngap_asn1::NasTransportDecode::Proceed {
+                message,
+                error_indication,
+            } => (
+                message,
+                error_indication.map(|r| r.diagnostics).unwrap_or_default(),
+            ),
+            crate::ngap_asn1::NasTransportDecode::Reject(report) => {
+                log::warn!("HandoverCancel from association {association_id} rejected: {report:?}");
+                if let Some(ei) = crate::ngap_asn1::build_criticality_error_indication_asn1(&report)
+                {
+                    self.send_to_association(association_id, &ei).await?;
+                }
                 return Ok(());
             }
-            Err(e) => {
-                log::error!("Failed to decode HandoverCancel: {e}");
+            crate::ngap_asn1::NasTransportDecode::Undecodable => {
                 self.send_error_indication(
                     association_id,
                     None,
                     None,
                     nextgcore_ngap::types::Cause::Protocol(
-                        nextgcore_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
+                        nextgcore_asn1c::ngap::cause::CauseProtocol::TransferSyntaxError,
                     ),
                 )
                 .await?;
@@ -9721,20 +9768,19 @@ impl NgapServer {
         // Dropped BEFORE the acknowledgement is sent, so a failed ack cannot leave
         // a stale relay target behind.
         self.handover_target_assoc.remove(&cancel.amf_ue_ngap_id);
-        let ack = nextgcore_ngap::types::HandoverCancelAcknowledge {
-            amf_ue_ngap_id: cancel.amf_ue_ngap_id,
-            ran_ue_ngap_id: cancel.ran_ue_ngap_id,
-            criticality_diagnostics: None,
-        };
-        match nextgcore_ngap::builder::build_handover_cancel_acknowledge(&ack) {
-            Ok(bytes) => {
+        match crate::ngap_asn1::build_handover_cancel_acknowledge_asn1(
+            cancel.amf_ue_ngap_id,
+            cancel.ran_ue_ngap_id,
+            &notify,
+        ) {
+            Some(bytes) => {
                 self.send_to_association(association_id, &bytes).await?;
                 log::info!(
                     "HandoverCancelAcknowledge sent for UE {}",
                     cancel.amf_ue_ngap_id
                 );
             }
-            Err(e) => log::error!("Failed to build HandoverCancelAcknowledge: {e}"),
+            None => log::error!("Failed to build HandoverCancelAcknowledge"),
         }
         Ok(())
     }
@@ -12752,6 +12798,14 @@ fn plmn_id_from_ngap_bytes(bytes: &[u8; 3]) -> PlmnId {
 /// every call site this runs inside a `UeStore::with_mut` closure, because
 /// `UeStore::get` hands back a CLONE (`ue_store.rs:113-115`) and a location written
 /// to a dropped clone is the same defect as not writing it at all.
+/// A HANDOVER NOTIFY as the generated decoder hands it over (#417): the User
+/// Location Information is criticality ignore, so it may be absent.
+struct HandoverNotifyDecoded {
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+    user_location_info: Option<nextgcore_ngap::types::UserLocationInformation>,
+}
+
 fn apply_user_location(
     amf_ue: &mut AmfUe,
     location: &nextgcore_ngap::types::UserLocationInformation,
