@@ -1329,18 +1329,62 @@ pub async fn call_smf_update_sm_context_n2(
         .and_then(|c| serde_json::from_str(c).ok())
         .unwrap_or(serde_json::Value::Null);
     let n2_sm_info = extract_binary_ref(&response, &response_body, "n2SmInfo").unwrap_or_default();
+    // #582: an answer may carry an N1 SM container too -- a PDU Session Release Command
+    // for a session the NG-RAN reported released (TS 23.502 §4.3.4.2 step 3a). It was
+    // dropped here, so the AMF could never deliver it.
+    let n1_sm_msg = extract_binary_ref(&response, &response_body, "n1SmMsg").unwrap_or_default();
 
     log::info!(
         "SMF SM Context Updated ({n2_sm_info_type}): ref={sm_context_ref}, \
-         answered n2_len={}",
+         answered n1_len={} n2_len={}",
+        n1_sm_msg.len(),
         n2_sm_info.len()
     );
     let n2_sm_info_type = response_body["n2SmInfoType"].as_str().map(str::to_owned);
     Ok(SmContextUpdateResponse {
-        n1_sm_msg: Vec::new(),
+        n1_sm_msg,
         n2_sm_info,
         n2_sm_info_type,
     })
+}
+
+/// #582: relay a UE's 5GSM message that answers an SMF procedure -- a PDU Session
+/// Release Complete (TS 23.502 §4.3.4.2 step 10) -- as an UpdateSMContext carrying ONLY
+/// the N1 container (TS 29.502 §5.2.2.3.2), which the SMF dispatches on the 5GSM type.
+pub async fn call_smf_update_sm_context_n1_only(
+    smf_host: &str,
+    smf_port: u16,
+    sm_context_ref: &str,
+    n1_sm_msg: &[u8],
+) -> SbiResult<()> {
+    let client = crate::attach_oauth2(
+        SbiClient::for_peer(smf_host, smf_port),
+        nextgcore_sbi::types::NfType::Smf,
+    );
+    let body = serde_json::json!({ "n1SmMsg": { "contentId": "n1SmMsg" } });
+    let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify");
+    let request = SbiRequest::post(&path)
+        .with_body(body.to_string(), content_type::APPLICATION_JSON)
+        .with_part(SbiPart::with_content(
+            "n1SmMsg",
+            content_type::APPLICATION_5GNAS,
+            bytes::Bytes::copy_from_slice(n1_sm_msg),
+        ));
+    let response = client
+        .send_request(request)
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("SMF update (N1) failed: {e}")))?;
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "SMF update (N1) returned status {}",
+            response.status
+        )));
+    }
+    log::info!(
+        "SMF SM Context Updated (N1 only): ref={sm_context_ref}, status {}",
+        response.status
+    );
+    Ok(())
 }
 
 /// Sends POST /nsmf-pdusession/v1/sm-contexts/{ref}/modify with N1 SM info
@@ -5066,6 +5110,81 @@ mod tests {
             .await
             .expect("start stub PCF");
         (server, port)
+    }
+
+    /// #582: the SMF's answer to a PDU_RES_NTY_REL carries the PDU Session Release Command
+    /// as its `n1SmMsg` part, and `call_smf_update_sm_context_n2` must return it (it always
+    /// returned an empty N1); the UE's Release Complete is relayed with ONLY an N1
+    /// container, so the SMF dispatches it on the 5GSM type.
+    #[tokio::test]
+    async fn an_smf_answers_n1_is_returned_and_a_release_complete_goes_n1_only() {
+        use nextgcore_sbi::message::{SbiPart, SbiRequest, SbiResponse};
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        const RELEASE_COMMAND: [u8; 5] = [0x2E, 1, 0, 0xD3, 36];
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let sink = seen.clone();
+        let reservation = nsacf_reserved_port();
+        let port = reservation.port();
+        let (listener, addr) = reservation.into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(move |req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    let body: serde_json::Value = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|c| serde_json::from_str(c).ok())
+                        .unwrap_or_default();
+                    let ty = body["n2SmInfoType"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    sink.lock().unwrap().push(body);
+                    if ty == "PDU_RES_NTY_REL" {
+                        SbiResponse::with_status(200)
+                            .with_body(
+                                serde_json::json!({ "n1SmMsg": { "contentId": "n1SmMsg" } })
+                                    .to_string(),
+                                content_type::APPLICATION_JSON,
+                            )
+                            .with_part(SbiPart::with_content(
+                                "n1SmMsg",
+                                content_type::APPLICATION_5GNAS,
+                                bytes::Bytes::from_static(&RELEASE_COMMAND),
+                            ))
+                    } else {
+                        SbiResponse::with_status(204)
+                    }
+                }
+            })
+            .await
+            .expect("fake SMF");
+
+        let resp =
+            call_smf_update_sm_context_n2("127.0.0.1", port, "7", "PDU_RES_NTY_REL", &[0x00])
+                .await
+                .expect("update");
+        assert_eq!(
+            resp.n1_sm_msg, RELEASE_COMMAND,
+            "the Release Command reaches the AMF"
+        );
+        call_smf_update_sm_context_n1_only("127.0.0.1", port, "7", &[0x2E, 1, 0, 0xD4])
+            .await
+            .expect("release complete");
+        let bodies = seen.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[1]["n1SmMsg"]["contentId"], "n1SmMsg");
+        assert!(
+            bodies[1].get("n2SmInfoType").is_none(),
+            "no n2SmInfoType, so the SMF takes the N1 path: {}",
+            bodies[1]
+        );
+        server.stop().await.expect("server stop");
     }
 
     /// call_pcf_ue_policy_create sends a schema-exact PolicyAssociationRequest

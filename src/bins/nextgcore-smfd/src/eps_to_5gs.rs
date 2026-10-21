@@ -138,7 +138,7 @@ fn find_eps_session(supi: &str, pdn: &eps_iwk::EpsPdnConnection) -> Option<SmfSe
 }
 
 /// The EPS bearers of a session, default first.
-fn session_bearers(sess: &SmfSess) -> Vec<context::SmfBearer> {
+pub(crate) fn session_bearers(sess: &SmfSess) -> Vec<context::SmfBearer> {
     let handle = smf_self();
     let Ok(ctx) = handle.read() else {
         return Vec::new();
@@ -249,7 +249,7 @@ async fn pfcp_switch_to_ngran(
     ue_ip: Option<[u8; 4]>,
     dedicated_dl: &[(u8, Vec<String>)],
 ) -> anyhow::Result<()> {
-    use crate::n4_build::{PdrParams, SessionModificationParams};
+    use crate::n4_build::SessionModificationParams;
     let params = SessionModificationParams {
         update_fars_activate: vec![(
             DL_FAR_ID,
@@ -260,24 +260,41 @@ async fn pfcp_switch_to_ngran(
         remove_pdr_ids: vec![S5U_UL_PDR_ID],
         create_pdrs: dedicated_dl
             .iter()
-            .map(|(ebi, filters)| PdrParams {
-                pdr_id: DEDICATED_DL_PDR_BASE + u16::from(*ebi),
-                precedence: DEDICATED_DL_PRECEDENCE,
-                source_interface: 1, // Core
-                ue_ip_address: ue_ip.map(|ip| (Some(ip), None, false)),
-                sdf_filters: filters.clone(),
-                far_id: Some(DL_FAR_ID),
-                qer_id: Some(u32::from(DEDICATED_RULE_BASE + ebi)),
-                qfi: Some(*ebi),
-                urr_ids: vec![crate::SESSION_URR_ID],
-                ..Default::default()
-            })
+            .map(|(ebi, filters)| dedicated_dl_pdr(*ebi, filters, ue_ip, DL_FAR_ID))
             .collect(),
         ..Default::default()
     };
     crate::pfcp_modify_with(smf_n4_seid, upf_seid, &params)
         .await
         .map(|_| ())
+}
+
+/// A dedicated bearer's downlink PDR (`0x30 + EBI`): its TFT's downlink filters, its QER
+/// (QFI = EBI), forwarding through `far_id` -- FAR 2 at execution, or (#582) the FAR of the
+/// additional NG-U tunnel a split PDU session carries it on.
+pub(crate) fn dedicated_dl_pdr(
+    ebi: u8,
+    filters: &[String],
+    ue_ip: Option<[u8; 4]>,
+    far_id: u32,
+) -> crate::n4_build::PdrParams {
+    crate::n4_build::PdrParams {
+        pdr_id: dedicated_dl_pdr_id(ebi),
+        precedence: DEDICATED_DL_PRECEDENCE,
+        source_interface: 1, // Core
+        ue_ip_address: ue_ip.map(|ip| (Some(ip), None, false)),
+        sdf_filters: filters.to_vec(),
+        far_id: Some(far_id),
+        qer_id: Some(u32::from(DEDICATED_RULE_BASE + ebi)),
+        qfi: Some(ebi),
+        urr_ids: vec![crate::SESSION_URR_ID],
+        ..Default::default()
+    }
+}
+
+/// The id of a dedicated bearer's downlink PDR.
+pub(crate) fn dedicated_dl_pdr_id(ebi: u8) -> u16 {
+    DEDICATED_DL_PDR_BASE + u16::from(ebi)
 }
 
 /// CANCELLED: remove what the preparation installed -- the N3 uplink PDR step 6 created,
@@ -389,7 +406,7 @@ fn dedicated_qer(bearer: &context::SmfBearer) -> crate::n4_build::QerParams {
 }
 
 /// The downlink SDF filters of a bearer's TFT (its packet filters that apply downlink).
-fn downlink_filters(bearer: &context::SmfBearer) -> Vec<String> {
+pub(crate) fn downlink_filters(bearer: &context::SmfBearer) -> Vec<String> {
     let handle = smf_self();
     let Ok(ctx) = handle.read() else {
         return Vec::new();
@@ -2213,7 +2230,7 @@ mod tests {
         let _upf =
             crate::pfcp_path::stand_in::real_upf((local, 0).into(), (upf_ip, 8805).into()).await;
         crate::context::smf_context_init(64, 256, 512);
-        std::env::set_var("SMF_INDIRECT_FORWARDING_TIMER_MS", "1500");
+        std::env::set_var("SMF_INDIRECT_FORWARDING_TIMER_MS", "2500");
         let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;
         let ue = smf_self()
             .read()
@@ -2358,8 +2375,36 @@ mod tests {
         eprintln!("DL ICMP: TEID {:#x} QFI {:?}", default.0, default.1);
         assert_eq!((default.0, default.1), (N3_DL, Some(5)));
 
+        // 3b. #582: dual connectivity -- the dedicated flow moves to a secondary node's
+        // tunnel; the UPF sends it there and keeps the default flow on the master's.
+        const SN_DL: u32 = 0x0000_B002;
+        let resp = crate::an_initiated_modification(
+            &reference,
+            &split_indication(
+                ((N3_DL, local.octets()), &[5]),
+                &[((SN_DL, local.octets()), &[DEDICATED_EBI])],
+            ),
+        )
+        .await;
+        assert_eq!(resp.status, 200, "PDU_RES_MOD_CFM from the real UPF path");
+        exec(format!("echo nextg-582 > /dev/udp/{ue}/5000"));
+        let split = recv_gpdu(&gnb, Duration::from_secs(3))
+            .await
+            .expect("the dedicated flow's downlink reaches the SN tunnel");
+        eprintln!(
+            "DC: DL UDP from 10.45.0.1: TEID {:#x} QFI {:?}",
+            split.0, split.1
+        );
+        assert_eq!((split.0, split.1), (SN_DL, Some(DEDICATED_EBI)));
+        exec(format!("ping -c 1 -W 1 {ue} || true"));
+        let master = recv_gpdu(&gnb, Duration::from_secs(3))
+            .await
+            .expect("the default flow stays on the MN tunnel");
+        eprintln!("DC: DL ICMP: TEID {:#x} QFI {:?}", master.0, master.1);
+        assert_eq!((master.0, master.1), (N3_DL, Some(5)));
+
         // 4. The forwarding tunnels go when the timer expires.
-        tokio::time::sleep(Duration::from_millis(2500)).await;
+        tokio::time::sleep(Duration::from_millis(2600)).await;
         let (_, teid, _) = forwarding[0];
         sgw.send_to(
             &gpdu(teid, &ipv4_udp([198, 51, 100, 7], ue.octets()), None),
@@ -2373,6 +2418,185 @@ mod tests {
         );
         eprintln!("after the timer: nothing relayed");
         std::env::remove_var("SMF_INDIRECT_FORWARDING_TIMER_MS");
+        s5.close();
+    }
+
+    /// A PDUSessionResourceModifyIndicationTransfer (TS 38.413 §9.3.4.20, generated
+    /// codec): the primary DL tunnel and the Additional DL QoS Flow per TNL Information of
+    /// a split PDU session, each `((TEID, IPv4), QFIs)`.
+    fn split_indication(
+        primary: ((u32, [u8; 4]), &[u8]),
+        additional: &[((u32, [u8; 4]), &[u8])],
+    ) -> Vec<u8> {
+        use nextgcore_ngap_gen::generated as g;
+        let per_tnl = |(tunnel, qfis): ((u32, [u8; 4]), &[u8])| g::QosFlowPerTNLInformation {
+            up_transport_layer_information: crate::n2_transfer::gtp_tunnel(tunnel),
+            associated_qos_flow_list: g::AssociatedQosFlowList(
+                qfis.iter()
+                    .map(|&q| g::AssociatedQosFlowItem {
+                        qos_flow_identifier: g::QosFlowIdentifier(q),
+                        qos_flow_mapping_indication: None,
+                        ie_extensions: None,
+                    })
+                    .collect(),
+            ),
+            ie_extensions: None,
+        };
+        nextgcore_ngap_gen::encode_contained(&g::PDUSessionResourceModifyIndicationTransfer {
+            dl_qos_flow_per_tnl_information: per_tnl(primary),
+            additional_dl_qos_flow_per_tnl_information: (!additional.is_empty()).then(|| {
+                g::QosFlowPerTNLInformationList(
+                    additional
+                        .iter()
+                        .map(|&a| g::QosFlowPerTNLInformationItem {
+                            qos_flow_per_tnl_information: per_tnl(a),
+                            ie_extensions: None,
+                        })
+                        .collect(),
+                )
+            }),
+            ie_extensions: None,
+        })
+        .unwrap()
+    }
+
+    /// An EPS→5GS-moved session with its default flow (QFI 5) and dedicated GBR flow
+    /// (QFI 6, DL PDR 0x36), executed toward `GNB_DL`; returns its SM context reference.
+    async fn moved_session_with_a_dedicated_flow(pgw_c: (u32, [u8; 4])) -> String {
+        use base64::Engine as _;
+        seed_dedicated_gbr_bearer(pgw_c.0);
+        let created = handle_create(&serde_json::json!({
+            "supi": format!("imsi-{IMSI}"),
+            "hoState": "PREPARING",
+            "ueEpsPdnConnection": base64::engine::general_purpose::STANDARD.encode(pdn_connection(pgw_c)),
+        }))
+        .await;
+        assert_eq!(created.status, 201);
+        let reference =
+            serde_json::from_str::<serde_json::Value>(created.http.content.as_deref().unwrap())
+                .unwrap()["smContextRef"]
+                .as_str()
+                .unwrap()
+                .to_string();
+        assert_eq!(
+            handle_prepared(&reference, &ho_ack_transfer()).await.status,
+            200
+        );
+        assert_eq!(handle_completed(&reference, None).await.status, 200);
+        reference
+    }
+
+    /// #582, TS 38.413 §8.2.5.2: a Modify Indication for a split PDU session (dual
+    /// connectivity) installs the additional NG-U tunnel at the UPF -- a FAR of its own, the
+    /// flows it carries re-pointed at it -- and the Modify Confirm Transfer confirms those
+    /// flows, gives the tunnel's (UL, DL) pair, and fails a QFI the session has no flow for.
+    /// A later indication with the primary tunnel only takes the flows back and removes the
+    /// tunnel's FAR.
+    #[tokio::test]
+    async fn a_split_pdu_session_installs_and_confirms_its_additional_tunnel() {
+        use nextgcore_ngap_gen::generated as g;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        crate::context::smf_context_init(64, 256, 512);
+        let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;
+        let reference = moved_session_with_a_dedicated_flow(pgw_c).await;
+        upf.clear_seen();
+
+        const MN: (u32, [u8; 4]) = (0x0000_A001, [10, 1, 2, 3]);
+        const SN: (u32, [u8; 4]) = (0x0000_B002, [10, 7, 7, 7]);
+        let resp = crate::an_initiated_modification(
+            &reference,
+            &split_indication((MN, &[5]), &[(SN, &[DEDICATED_EBI, 9])]),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let root: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(root["n2SmInfoType"], "PDU_RES_MOD_CFM");
+        let confirm: g::PDUSessionResourceModifyConfirmTransfer =
+            nextgcore_ngap_gen::decode_contained::<g::PDUSessionResourceModifyConfirmTransfer>(
+                &resp.http.parts[0].data,
+            )
+            .unwrap();
+        let confirmed: Vec<u8> = confirm
+            .qos_flow_modify_confirm_list
+            .0
+            .iter()
+            .map(|f| f.qos_flow_identifier.0)
+            .collect();
+        assert_eq!(confirmed, vec![5, DEDICATED_EBI]);
+        let pairs = confirm
+            .additional_ng_uuptnl_information
+            .expect("the SN tunnel's pair")
+            .0;
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(
+            pairs[0].dl_ngu_up_tnl_information,
+            crate::n2_transfer::gtp_tunnel(SN),
+            "the pair names the additional DL tunnel"
+        );
+        assert_eq!(
+            pairs[0].ul_ngu_up_tnl_information,
+            crate::n2_transfer::gtp_tunnel((
+                crate::pfcp_path::stand_in::N3_STAND_IN_TEID,
+                upf.upf_ip
+            )),
+            "with the session's N3 uplink"
+        );
+        let failed = confirm.qos_flow_failed_to_modify_list.expect("QFI 9").0;
+        assert_eq!(
+            (failed.len(), failed[0].qos_flow_identifier.0),
+            (1, 9),
+            "a QFI the session has no flow for"
+        );
+
+        let ohc = |(teid, addr): (u32, [u8; 4])| {
+            let mut v = vec![0x01, 0x00];
+            v.extend_from_slice(&teid.to_be_bytes());
+            v.extend_from_slice(&addr);
+            v
+        };
+        let mods = upf.modification_bodies();
+        assert_eq!(mods.len(), 1, "one N4 Session Modification");
+        assert!(
+            n4_has(&mods[0], 10, &ohc(MN)),
+            "Update FAR 2 → the MN tunnel"
+        );
+        assert!(
+            n4_has(&mods[0], 3, &[0x00, 0x6C, 0x00, 0x04, 0, 0, 0, 0x71])
+                && n4_has(&mods[0], 3, &ohc(SN)),
+            "Create FAR 0x71 → the SN tunnel"
+        );
+        assert!(
+            n4_has(&mods[0], 15, &[0x00, 0x38, 0x00, 0x02, 0x00, 0x36])
+                && n4_has(&mods[0], 1, &[0x00, 0x6C, 0x00, 0x04, 0, 0, 0, 0x71]),
+            "the dedicated flow's DL PDR 0x36 re-created on FAR 0x71"
+        );
+
+        // Back to one tunnel.
+        upf.clear_seen();
+        let resp = crate::an_initiated_modification(
+            &reference,
+            &split_indication((MN, &[5, DEDICATED_EBI]), &[]),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+        let confirm: g::PDUSessionResourceModifyConfirmTransfer =
+            nextgcore_ngap_gen::decode_contained::<g::PDUSessionResourceModifyConfirmTransfer>(
+                &resp.http.parts[0].data,
+            )
+            .unwrap();
+        assert!(confirm.additional_ng_uuptnl_information.is_none());
+        let mods = upf.modification_bodies();
+        assert!(
+            n4_has(&mods[0], 16, &[0x00, 0x6C, 0x00, 0x04, 0, 0, 0, 0x71]),
+            "Remove FAR 0x71"
+        );
+        assert!(
+            n4_has(&mods[0], 1, &[0x00, 0x6C, 0x00, 0x04, 0, 0, 0, 2])
+                && !n4_has(&mods[0], 3, &[0x00, 0x6C]),
+            "PDR 0x36 back on FAR 2, no tunnel FAR created"
+        );
         s5.close();
     }
 
