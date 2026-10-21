@@ -9,17 +9,6 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use nextgcore_asn1c::ngap::cause::{Cause, CauseTransport};
-use nextgcore_ngap::mbs_transfer::{
-    MbsDistributionReleaseRequestTransfer, MbsDistributionSetupRequestTransfer,
-    MbsDistributionSetupResponseTransfer, MbsDistributionSetupUnsuccessfulTransfer,
-    MbsQosFlowsToBeSetupItem, MbsSessionId as NgapMbsSessionId,
-    MbsSessionStatus as NgapMbsSessionStatus, SharedNguMulticastTnlInformation,
-};
-use nextgcore_ngap::transfer::{
-    AllocationAndRetentionPriority, NonDynamic5qiDescriptor, PreEmptionCapability,
-    PreEmptionVulnerability, QosCharacteristics, QosFlowLevelQosParameters, TransportLayerAddress,
-};
 use nextgcore_sbi::constants::content_type::APPLICATION_NGAP;
 use nextgcore_sbi::context::global_context;
 use nextgcore_sbi::message::{SbiPart, SbiRequest, SbiResponse};
@@ -33,6 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod context;
+mod n2_mbs_transfer; // #417: the N2 MBS SM transfers, on the generated NGAP codec
 mod n4mb;
 mod namf_client;
 mod subscription;
@@ -1402,9 +1392,9 @@ fn plmn_bcd(mcc: &str, mnc: &str) -> [u8; 3] {
     [(m2 << 4) | m1, (n3 << 4) | m3, (n2 << 4) | n1]
 }
 
-/// The NGAP-side TMGI ([`NgapMbsSessionId`]) for an internal [`Tmgi`].
-fn ngap_session_id_from(tmgi: &Tmgi) -> NgapMbsSessionId {
-    NgapMbsSessionId::new(
+/// The NGAP-side TMGI (PLMN identity BCD, MBS Service ID) for an internal [`Tmgi`].
+fn ngap_session_id_from(tmgi: &Tmgi) -> n2_mbs_transfer::NgapTmgi {
+    (
         plmn_bcd(&tmgi.plmn_id.mcc, &tmgi.plmn_id.mnc),
         tmgi.mbs_service_id,
     )
@@ -1412,9 +1402,8 @@ fn ngap_session_id_from(tmgi: &Tmgi) -> NgapMbsSessionId {
 
 /// TMGI-match validation (G1-2 step 3): the TMGI inside the decoded NGAP
 /// transfer container must equal `req.mbsSessionId.tmgi`.
-fn transfer_tmgi_matches(container: &NgapMbsSessionId, tmgi: &Tmgi) -> bool {
-    container.mbs_service_id == tmgi.mbs_service_id
-        && container.plmn_identity == plmn_bcd(&tmgi.plmn_id.mcc, &tmgi.plmn_id.mnc)
+fn transfer_tmgi_matches(container: &n2_mbs_transfer::NgapTmgi, tmgi: &Tmgi) -> bool {
+    *container == ngap_session_id_from(tmgi)
 }
 
 /// Resolve `n2MbsSmInfo.ngapData.contentId` against the inbound multipart
@@ -1520,13 +1509,7 @@ fn amf_shared_delivery_setup(tmgi: &Tmgi, ran_node_key: Option<&str>) -> SbiResp
         None => {
             // N4mb/establishment failure: a real Unsuccessful Transfer with a
             // real Cause instead of the old silent JSON 200. [G1-2 step 5]
-            let fail = MbsDistributionSetupUnsuccessfulTransfer {
-                mbs_session_id: ngap_tmgi,
-                mbs_area_session_id: None,
-                cause: Cause::Transport(CauseTransport::TransportResourceUnavailable),
-                criticality_diagnostics: None,
-            };
-            return match fail.encode() {
+            return match n2_mbs_transfer::setup_unsuccessful_transfer(ngap_tmgi) {
                 Ok(bytes) => {
                     log::warn!(
                         "ContextUpdate AMF setup failed for TMGI {:02x?}: N4mb start unavailable",
@@ -1544,41 +1527,19 @@ fn amf_shared_delivery_setup(tmgi: &Tmgi, ran_node_key: Option<&str>) -> SbiResp
 
     // Shared NG-U Multicast TNL Information (TS 38.413 §9.3.2.16) from the
     // session's real N4mb transport: llSsm dst/src + the common GTP TEID.
-    let tnl = SharedNguMulticastTnlInformation {
-        ip_multicast_address: TransportLayerAddress::from_ipv4(
-            n4mb.ll_ssm_dst.unwrap_or(upf_addr).octets(),
-        ),
-        ip_source_address: TransportLayerAddress::from_ipv4(
-            n4mb.ll_ssm_src.unwrap_or(upf_addr).octets(),
-        ),
-        gtp_teid: n4mb.dl_teid.to_be_bytes(),
+    let tunnel = n2_mbs_transfer::SharedMulticastTunnel {
+        multicast_address: n4mb.ll_ssm_dst.unwrap_or(upf_addr).octets(),
+        source_address: n4mb.ll_ssm_src.unwrap_or(upf_addr).octets(),
+        teid: n4mb.dl_teid,
     };
     // Single QoS flow derived from the session model (default QFI 1 / 5QI 9
     // when the create carried no mbsServiceInfo) — documented minimal scope.
-    let qos_flow = MbsQosFlowsToBeSetupItem {
-        mbs_qos_flow_identifier: session.qfi.min(63),
-        mbs_qos_flow_level_qos_parameters: QosFlowLevelQosParameters {
-            qos_characteristics: QosCharacteristics::NonDynamic5qi(NonDynamic5qiDescriptor::new(
-                session.fiveqi as u16,
-            )),
-            allocation_and_retention_priority: AllocationAndRetentionPriority {
-                priority_level_arp: 8,
-                pre_emption_capability: PreEmptionCapability::ShallNotTriggerPreEmption,
-                pre_emption_vulnerability: PreEmptionVulnerability::NotPreEmptable,
-            },
-            gbr_qos_information: None,
-            reflective_qos_attribute: false,
-            additional_qos_flow_information: false,
-        },
-    };
-    let rsp_transfer = MbsDistributionSetupResponseTransfer {
-        mbs_session_id: ngap_tmgi,
-        mbs_area_session_id: None,
-        shared_ngu_multicast_tnl_information: Some(tnl),
-        mbs_qos_flows_to_be_setup_list: vec![qos_flow],
-        mbs_session_status: NgapMbsSessionStatus::Activated,
-    };
-    match rsp_transfer.encode() {
+    match n2_mbs_transfer::setup_response_transfer(
+        ngap_tmgi,
+        tunnel,
+        session.qfi.min(63),
+        session.fiveqi,
+    ) {
         Ok(bytes) => {
             log::info!(
                 "ContextUpdate AMF setup (TMGI {:02x?}): cTeid={:#010x}, llSsm dst={:?}",
@@ -1643,7 +1604,7 @@ async fn handle_context_update_amf(
         // Establishment of shared delivery toward the RAN node
         // (TS 23.247 §7.2.1.4): decode the Setup Request Transfer (§9.3.5.7).
         types::NgapIeType::MbsDisSetupReq => {
-            let transfer = match MbsDistributionSetupRequestTransfer::decode(&part.data) {
+            let transfer_tmgi = match n2_mbs_transfer::parse_setup_request_tmgi(&part.data) {
                 Ok(t) => t,
                 Err(e) => {
                     return send_bad_request(
@@ -1652,7 +1613,7 @@ async fn handle_context_update_amf(
                     )
                 }
             };
-            if !transfer_tmgi_matches(&transfer.mbs_session_id, tmgi) {
+            if !transfer_tmgi_matches(&transfer_tmgi, tmgi) {
                 return send_bad_request(
                     "TMGI in N2 container does not match mbsSessionId.tmgi",
                     Some("INVALID_MSG_FORMAT"),
@@ -1664,7 +1625,7 @@ async fn handle_context_update_amf(
         // §7.2.2.4): decode the Release Request Transfer (§9.3.5.10),
         // release the shared transport, 204 (spec 2b: nothing to return).
         types::NgapIeType::MbsDisRelReq => {
-            let transfer = match MbsDistributionReleaseRequestTransfer::decode(&part.data) {
+            let transfer_tmgi = match n2_mbs_transfer::parse_release_request_tmgi(&part.data) {
                 Ok(t) => t,
                 Err(e) => {
                     return send_bad_request(
@@ -1673,7 +1634,7 @@ async fn handle_context_update_amf(
                     )
                 }
             };
-            if !transfer_tmgi_matches(&transfer.mbs_session_id, tmgi) {
+            if !transfer_tmgi_matches(&transfer_tmgi, tmgi) {
                 return send_bad_request(
                     "TMGI in N2 container does not match mbsSessionId.tmgi",
                     Some("INVALID_MSG_FORMAT"),
@@ -2397,6 +2358,12 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // #417: the hand-written MBS transfer decoder, a dev-dependency, as an independent
+    // reader of what the generated codec now builds (n2_mbs_transfer/oracle_tests.rs
+    // pins the bytes themselves).
+    use nextgcore_ngap::mbs_transfer::{
+        MbsDistributionSetupResponseTransfer, MbsSessionStatus as NgapMbsSessionStatus,
+    };
 
     #[test]
     fn test_args_default() {
