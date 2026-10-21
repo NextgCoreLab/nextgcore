@@ -23,7 +23,7 @@ use nextgcore_sctp::{
     NextgcoreSctpInfo, SctpServer, SctpServerConfig, ServerEvent, NEXTGCORE_NGAP_SCTP_PORT,
 };
 
-use crate::context::{AmfGnb, AmfUe, Guti5gs, PlmnId, SNssai, SupportedTa, UeSecurityCapability};
+use crate::context::{AmfGnb, AmfUe, Guti5gs, PlmnId, SNssai, UeSecurityCapability};
 use crate::event::AmfEvent;
 use crate::gmm_build::{self, message_type, mobile_identity_type, security_header, GmmCause};
 use crate::gmm_handler::payload_container_type;
@@ -33,6 +33,7 @@ use crate::ngap_asn1;
 use crate::ngap_handler::{self, time_to_wait, NgapHandlerResult};
 use crate::ngap_sm::NgapFsm;
 use crate::timer::{AmfTimerConfigs, AmfTimerId};
+use nextgcore_ngap_gen::generated as ngap_gen;
 
 // ============================================================================
 // Constants
@@ -1175,9 +1176,9 @@ impl NgapServer {
                     association_id,
                     None,
                     None,
-                    nextgcore_ngap::types::Cause::Protocol(
-                        nextgcore_asn1c::ngap::cause::CauseProtocol::MessageNotCompatibleWithReceiverState,
-                    ),
+                    ngap_gen::Cause::Protocol(ngap_gen::CauseProtocol(
+                        ngap_gen::CauseProtocol::MESSAGE_NOT_COMPATIBLE_WITH_RECEIVER_STATE,
+                    )),
                 )
                 .await?;
             }
@@ -1418,15 +1419,11 @@ impl NgapServer {
     fn unhandled_procedure_error_indication(
         procedure_code: Option<u16>,
         data: &[u8],
-    ) -> (Option<u64>, Option<u32>, nextgcore_ngap::types::Cause) {
-        let cause = match procedure_code {
-            Some(_) => nextgcore_ngap::types::Cause::Protocol(
-                nextgcore_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
-            ),
-            None => nextgcore_ngap::types::Cause::Protocol(
-                nextgcore_asn1c::ngap::cause::CauseProtocol::TransferSyntaxError,
-            ),
-        };
+    ) -> (Option<u64>, Option<u32>, ngap_gen::Cause) {
+        let cause = ngap_gen::Cause::Protocol(ngap_gen::CauseProtocol(match procedure_code {
+            Some(_) => ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
+            None => ngap_gen::CauseProtocol::TRANSFER_SYNTAX_ERROR,
+        }));
         (
             crate::ngap_asn1::extract_amf_ue_ngap_id(data),
             crate::ngap_asn1::extract_ran_ue_ngap_id(data),
@@ -8048,23 +8045,21 @@ impl NgapServer {
         association_id: u64,
         amf_ue_ngap_id: Option<u64>,
         ran_ue_ngap_id: Option<u32>,
-        cause: nextgcore_ngap::types::Cause,
+        cause: ngap_gen::Cause,
     ) -> Result<()> {
-        let msg = nextgcore_ngap::types::ErrorIndication {
+        match crate::ngap_asn1::build_error_indication_generated(
             amf_ue_ngap_id,
             ran_ue_ngap_id,
-            cause: Some(cause),
-            criticality_diagnostics: None,
-        };
-        match nextgcore_ngap::builder::build_error_indication(&msg) {
-            Ok(bytes) => {
+            cause,
+        ) {
+            Some(bytes) => {
                 self.send_to_association(association_id, &bytes).await?;
                 log::info!(
                     "ErrorIndication sent to association {association_id} \
                      (amf_ue_ngap_id={amf_ue_ngap_id:?}, ran_ue_ngap_id={ran_ue_ngap_id:?})"
                 );
             }
-            Err(e) => log::error!("Failed to build ErrorIndication: {e}"),
+            None => log::error!("Failed to build ErrorIndication"),
         }
         Ok(())
     }
@@ -8094,25 +8089,30 @@ impl NgapServer {
 
     /// Handle an inbound ErrorIndication from a gNB (TS 38.413 Section 8.7.5).
     /// The AMF never replies; it logs the reported cause/diagnostics for the
-    /// affected UE association so operators can trace the protocol error.
+    /// affected UE association so operators can trace the protocol error. An
+    /// error in the indication itself gets local handling only -- here, a log
+    /// line -- never an Error Indication back (§10.6).
     async fn handle_error_indication(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
-        match nextgcore_ngap::parser::decode_ngap_pdu(data) {
-            Ok(nextgcore_ngap::NgapMessage::ErrorIndication(ei)) => {
-                log::warn!(
-                    "ErrorIndication from association {association_id}: \
-                     amf_ue_ngap_id={:?}, ran_ue_ngap_id={:?}, cause={:?}",
-                    ei.amf_ue_ngap_id,
-                    ei.ran_ue_ngap_id,
-                    ei.cause
-                );
-            }
-            Ok(other) => {
-                log::warn!("Expected ErrorIndication, decoded {other:?}");
-            }
-            Err(e) => {
-                log::error!("Failed to decode ErrorIndication: {e}");
-            }
+        let Some(ei) = crate::ngap_asn1::decode_error_indication_asn1(data) else {
+            log::error!("Failed to decode ErrorIndication from association {association_id}");
+            return Ok(());
+        };
+        if ei.cause.is_none() && ei.criticality_diagnostics.is_none() {
+            // §8.7.5.2: "shall contain at least either the Cause IE or the
+            // Criticality Diagnostics IE".
+            log::warn!(
+                "ErrorIndication from association {association_id} carries neither a Cause \
+                 nor Criticality Diagnostics"
+            );
         }
+        log::warn!(
+            "ErrorIndication from association {association_id}: \
+             amf_ue_ngap_id={:?}, ran_ue_ngap_id={:?}, cause={:?}, criticality_diagnostics={:?}",
+            ei.amf_ue_ngap_id,
+            ei.ran_ue_ngap_id,
+            ei.cause,
+            ei.criticality_diagnostics
+        );
         Ok(())
     }
 
@@ -8220,9 +8220,9 @@ impl NgapServer {
                     association_id,
                     None,
                     None,
-                    nextgcore_ngap::types::Cause::Protocol(
-                        nextgcore_asn1c::ngap::cause::CauseProtocol::TransferSyntaxError,
-                    ),
+                    ngap_gen::Cause::Protocol(ngap_gen::CauseProtocol(
+                        ngap_gen::CauseProtocol::TRANSFER_SYNTAX_ERROR,
+                    )),
                 )
                 .await?;
                 return Ok(());
@@ -9943,9 +9943,9 @@ impl NgapServer {
                     association_id,
                     None,
                     None,
-                    nextgcore_ngap::types::Cause::Protocol(
-                        nextgcore_asn1c::ngap::cause::CauseProtocol::TransferSyntaxError,
-                    ),
+                    ngap_gen::Cause::Protocol(ngap_gen::CauseProtocol(
+                        ngap_gen::CauseProtocol::TRANSFER_SYNTAX_ERROR,
+                    )),
                 )
                 .await?;
                 return Ok(());
@@ -10020,9 +10020,9 @@ impl NgapServer {
                     association_id,
                     None,
                     None,
-                    nextgcore_ngap::types::Cause::Protocol(
-                        nextgcore_asn1c::ngap::cause::CauseProtocol::TransferSyntaxError,
-                    ),
+                    ngap_gen::Cause::Protocol(ngap_gen::CauseProtocol(
+                        ngap_gen::CauseProtocol::TRANSFER_SYNTAX_ERROR,
+                    )),
                 )
                 .await?;
                 return Ok(());
@@ -17528,7 +17528,7 @@ mod tests {
         session.gnb.gnb_id = 4242;
         // Pre-existing configuration from NG Setup, so a later update is
         // observably a REPLACEMENT rather than a first write.
-        session.gnb.supported_ta_list = vec![SupportedTa {
+        session.gnb.supported_ta_list = vec![crate::context::SupportedTa {
             tac: 0x00_0001,
             num_of_bplmn_list: 1,
             bplmn_list: vec![crate::context::BplmnEntry {
@@ -22605,10 +22605,10 @@ mod tests {
         .expect("encode UEContextModificationResponse")
     }
 
-    fn abstract_syntax_error_reject() -> nextgcore_ngap::types::Cause {
-        nextgcore_ngap::types::Cause::Protocol(
-            nextgcore_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
-        )
+    fn abstract_syntax_error_reject() -> ngap_gen::Cause {
+        ngap_gen::Cause::Protocol(ngap_gen::CauseProtocol(
+            ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
+        ))
     }
 
     /// **#447.** An unhandled UE-associated procedure yields an Error Indication
@@ -22617,7 +22617,8 @@ mod tests {
     /// Error Indication from this path went out with neither ID.
     ///
     /// Asserted on the encoded Error Indication -- built by the same
-    /// `build_error_indication` `send_error_indication` uses and decoded back --
+    /// `build_error_indication_generated` `send_error_indication` uses and
+    /// decoded back --
     /// because amfd's test server has no outbound capture to observe the send.
     #[test]
     fn an_unhandled_ue_associated_procedure_reports_both_ue_ids() {
@@ -22641,22 +22642,12 @@ mod tests {
             );
             assert_eq!(cause, abstract_syntax_error_reject());
 
-            let bytes = nextgcore_ngap::builder::build_error_indication(
-                &nextgcore_ngap::types::ErrorIndication {
-                    amf_ue_ngap_id: amf_id,
-                    ran_ue_ngap_id: ran_id,
-                    cause: Some(cause),
-                    criticality_diagnostics: None,
-                },
-            )
-            .expect("build ErrorIndication");
-            match nextgcore_ngap::parser::decode_ngap_pdu(&bytes) {
-                Ok(nextgcore_ngap::parser::NgapMessage::ErrorIndication(ei)) => {
-                    assert_eq!(ei.amf_ue_ngap_id, Some(amf), "AMF-UE-NGAP-ID on the wire");
-                    assert_eq!(ei.ran_ue_ngap_id, Some(ran), "RAN-UE-NGAP-ID on the wire");
-                }
-                other => panic!("expected an ErrorIndication, got {other:?}"),
-            }
+            let bytes = crate::ngap_asn1::build_error_indication_generated(amf_id, ran_id, cause)
+                .expect("build ErrorIndication");
+            let ei =
+                crate::ngap_asn1::decode_error_indication_asn1(&bytes).expect("an ErrorIndication");
+            assert_eq!(ei.amf_ue_ngap_id, Some(amf), "AMF-UE-NGAP-ID on the wire");
+            assert_eq!(ei.ran_ue_ngap_id, Some(ran), "RAN-UE-NGAP-ID on the wire");
         }
     }
 
@@ -22680,13 +22671,10 @@ mod tests {
     /// without UE IDs is itself non-UE-associated (TS 38.413 §9.2.7.1).
     #[test]
     fn a_non_ue_associated_procedure_reports_no_ue_ids() {
-        let pdu = nextgcore_ngap::builder::build_error_indication(
-            &nextgcore_ngap::types::ErrorIndication {
-                amf_ue_ngap_id: None,
-                ran_ue_ngap_id: None,
-                cause: Some(abstract_syntax_error_reject()),
-                criticality_diagnostics: None,
-            },
+        let pdu = crate::ngap_asn1::build_error_indication_generated(
+            None,
+            None,
+            abstract_syntax_error_reject(),
         )
         .expect("build non-UE-associated ErrorIndication");
         let (amf_id, ran_id, _) = NgapServer::unhandled_procedure_error_indication(Some(15), &pdu);
@@ -22716,9 +22704,71 @@ mod tests {
         let (_, _, cause) = NgapServer::unhandled_procedure_error_indication(None, &[0xFF; 4]);
         assert_eq!(
             cause,
-            nextgcore_ngap::types::Cause::Protocol(
-                nextgcore_asn1c::ngap::cause::CauseProtocol::TransferSyntaxError,
+            ngap_gen::Cause::Protocol(ngap_gen::CauseProtocol(
+                ngap_gen::CauseProtocol::TRANSFER_SYNTAX_ERROR,
+            ))
+        );
+    }
+
+    /// **#417.** A gNB's Error Indication is never answered (TS 38.413 §8.7.5),
+    /// and an error in one gets local handling only (§10.6): a valid one, one
+    /// with a not-comprehended reject IE, one with neither Cause nor
+    /// diagnostics, and an undecodable one all leave N2 untouched. The control
+    /// leg shows the server DOES try to send -- and fails, having no live
+    /// association -- when a procedure is answered with an Error Indication.
+    #[tokio::test]
+    async fn an_error_indication_from_the_gnb_is_never_answered() {
+        let mut server = test_ngap_server().await;
+        let overload_start = [
+            0x00u8,
+            proc_code::OVERLOAD_START as u8,
+            0x40,
+            0x03,
+            0x00,
+            0x00,
+            0x00,
+        ];
+        assert!(
+            server
+                .process_ngap_message(1, &overload_start)
+                .await
+                .is_err(),
+            "control: an Overload Start from a gNB is answered with an Error Indication"
+        );
+
+        let ei = crate::ngap_asn1::build_error_indication_generated(
+            Some(1),
+            Some(2),
+            abstract_syntax_error_reject(),
+        )
+        .expect("build");
+        let with_reject_ie = crate::ngap_asn1::tests::with_unknown_ie(&ei, 4_000, 0x00);
+        let empty = [0x00u8, 0x09, 0x40, 0x03, 0x00, 0x00, 0x00];
+        let undecodable = [0x00u8, 0x09, 0x40, 0x05, 0x00, 0x00, 0x03, 0xFF];
+        for pdu in [&ei[..], &with_reject_ie, &empty, &undecodable] {
+            server
+                .process_ngap_message(1, pdu)
+                .await
+                .unwrap_or_else(|e| panic!("{pdu:02x?} attempted a send: {e}"));
+        }
+    }
+
+    /// **#417.** The Error Indication answering an Overload Start from a gNB
+    /// (a procedure that only runs AMF to gNB) is the generated
+    /// message-not-compatible-with-receiver-state one, byte for byte as derived
+    /// in `ngap_asn1::error_indication_tests`.
+    #[test]
+    fn the_wrong_direction_error_indication_is_message_not_compatible() {
+        assert_eq!(
+            crate::ngap_asn1::build_error_indication_generated(
+                None,
+                None,
+                ngap_gen::Cause::Protocol(ngap_gen::CauseProtocol(
+                    ngap_gen::CauseProtocol::MESSAGE_NOT_COMPATIBLE_WITH_RECEIVER_STATE,
+                )),
             )
+            .expect("build"),
+            [0x00, 0x09, 0x40, 0x08, 0x00, 0x00, 0x01, 0x00, 0x0F, 0x40, 0x01, 0x66]
         );
     }
 }

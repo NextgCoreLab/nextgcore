@@ -3145,6 +3145,42 @@ pub struct CriticalityErrorIndication {
 pub fn build_criticality_error_indication_asn1(
     report: &CriticalityErrorIndication,
 ) -> Option<Vec<u8>> {
+    encode_error_indication(
+        report.amf_ue_ngap_id,
+        report.ran_ue_ngap_id,
+        Some(ngap_gen::Cause::Protocol(ngap_gen::CauseProtocol(
+            report.cause_protocol,
+        ))),
+        Some(generated_criticality_diagnostics_for(
+            Some(&report.procedure),
+            &report.diagnostics,
+        )),
+    )
+}
+
+/// Build an ERROR INDICATION (TS 38.413 §9.2.6.13) that carries `cause` and no
+/// Criticality Diagnostics, with the GENERATED codec (#417): the report of a
+/// message the AMF could not decode, or of one in the wrong direction or state
+/// (§10.2, §10.4). The UE NGAP IDs go in when known, so the gNB can correlate
+/// the indication with the UE association (§8.7.5.2). Byte-identical to the
+/// hand-written builder: `error_indication_generated_matches_hand_written`.
+pub fn build_error_indication_generated(
+    amf_ue_ngap_id: Option<u64>,
+    ran_ue_ngap_id: Option<u32>,
+    cause: ngap_gen::Cause,
+) -> Option<Vec<u8>> {
+    encode_error_indication(amf_ue_ngap_id, ran_ue_ngap_id, Some(cause), None)
+}
+
+/// Encode an ERROR INDICATION. IE order as TS 38.413 §9.2.6.13 lists it: AMF UE
+/// NGAP ID, RAN UE NGAP ID, Cause, Criticality Diagnostics; every IE is
+/// criticality ignore.
+fn encode_error_indication(
+    amf_ue_ngap_id: Option<u64>,
+    ran_ue_ngap_id: Option<u32>,
+    cause: Option<ngap_gen::Cause>,
+    diagnostics: Option<ngap_gen::CriticalityDiagnostics>,
+) -> Option<Vec<u8>> {
     use ngap_gen::{
         ErrorIndication, ErrorIndicationProtocolIEs, ErrorIndicationProtocolIEs_Entry as Entry,
         ErrorIndicationProtocolIEs_EntryValue as Ie, ProtocolIE_ID, NGAP_PDU,
@@ -3152,35 +3188,34 @@ pub fn build_criticality_error_indication_asn1(
 
     let ignore = ngap_gen::Criticality(ngap_gen::Criticality::IGNORE);
     let mut ies = Vec::new();
-    if let Some(id) = report.amf_ue_ngap_id {
+    if let Some(id) = amf_ue_ngap_id {
         ies.push(Entry {
             id: ProtocolIE_ID(ngap_gen::ID_AMF_UE_NGAP_ID),
             criticality: ignore.clone(),
             value: Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(id)),
         });
     }
-    if let Some(id) = report.ran_ue_ngap_id {
+    if let Some(id) = ran_ue_ngap_id {
         ies.push(Entry {
             id: ProtocolIE_ID(ngap_gen::ID_RAN_UE_NGAP_ID),
             criticality: ignore.clone(),
             value: Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(id)),
         });
     }
-    ies.push(Entry {
-        id: ProtocolIE_ID(ngap_gen::ID_CAUSE),
-        criticality: ignore.clone(),
-        value: Ie::Id_Cause(ngap_gen::Cause::Protocol(ngap_gen::CauseProtocol(
-            report.cause_protocol,
-        ))),
-    });
-    ies.push(Entry {
-        id: ProtocolIE_ID(ngap_gen::ID_CRITICALITY_DIAGNOSTICS),
-        criticality: ignore,
-        value: Ie::Id_CriticalityDiagnostics(generated_criticality_diagnostics_for(
-            Some(&report.procedure),
-            &report.diagnostics,
-        )),
-    });
+    if let Some(cause) = cause {
+        ies.push(Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_CAUSE),
+            criticality: ignore.clone(),
+            value: Ie::Id_Cause(cause),
+        });
+    }
+    if let Some(diagnostics) = diagnostics {
+        ies.push(Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_CRITICALITY_DIAGNOSTICS),
+            criticality: ignore,
+            value: Ie::Id_CriticalityDiagnostics(diagnostics),
+        });
+    }
     let pdu = NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
         procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_ERROR_INDICATION),
         criticality: ngap_gen::Criticality(ngap_gen::Criticality::IGNORE),
@@ -3195,6 +3230,49 @@ pub fn build_criticality_error_indication_asn1(
             None
         }
     }
+}
+
+/// The IEs of a received ERROR INDICATION (TS 38.413 §9.2.6.13), all optional.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ErrorIndicationReceived {
+    /// The AMF UE NGAP ID, when the indication is UE-associated.
+    pub amf_ue_ngap_id: Option<u64>,
+    /// The RAN UE NGAP ID, when the indication is UE-associated.
+    pub ran_ue_ngap_id: Option<u32>,
+    /// The Cause.
+    pub cause: Option<ngap_gen::Cause>,
+    /// The Criticality Diagnostics.
+    pub criticality_diagnostics: Option<ngap_gen::CriticalityDiagnostics>,
+}
+
+/// Decode an ERROR INDICATION with the GENERATED codec (#417). `None` when it
+/// does not decode. Not-comprehended IEs are skipped whatever their criticality
+/// and nothing about them is reported: an error in an Error Indication "shall
+/// not trigger the Error Indication procedure in the receiving Node but local
+/// error handling" (§10.6), so the caller only logs.
+pub fn decode_error_indication_asn1(data: &[u8]) -> Option<ErrorIndicationReceived> {
+    use ngap_gen::ErrorIndicationProtocolIEs_EntryValue as Ie;
+
+    let (_, ies, _, _) = decode_initiating(data, "Error Indication", |value| match value {
+        ngap_gen::InitiatingMessageValue::Id_ErrorIndication(ei) => Some(ei.protocol_i_es.0),
+        _ => None,
+    })?;
+    let mut received = ErrorIndicationReceived {
+        amf_ue_ngap_id: None,
+        ran_ue_ngap_id: None,
+        cause: None,
+        criticality_diagnostics: None,
+    };
+    for ie in ies {
+        match ie.value {
+            Ie::Id_AMF_UE_NGAP_ID(v) => received.amf_ue_ngap_id = Some(v.0),
+            Ie::Id_RAN_UE_NGAP_ID(v) => received.ran_ue_ngap_id = Some(v.0),
+            Ie::Id_Cause(v) => received.cause = Some(v),
+            Ie::Id_CriticalityDiagnostics(v) => received.criticality_diagnostics = Some(v),
+            _ => {}
+        }
+    }
+    Some(received)
 }
 
 /// A generated [`ngap_gen::Cause`] as the `(group, value)` pair TS 29.518's
@@ -14376,5 +14454,246 @@ mod ran_configuration_update_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod error_indication_tests {
+    //! #417: ERROR INDICATION, built and decoded by the generated codec.
+    use super::tests::with_unknown_ie;
+    use super::*;
+
+    /// Every Cause value the hand-written codec has, in every group.
+    fn every_hand_written_cause() -> Vec<Cause> {
+        let mut causes = Vec::new();
+        for v in 0..=255i64 {
+            if let Ok(c) = CauseRadioNetwork::try_from(v) {
+                causes.push(Cause::RadioNetwork(c));
+            }
+            if let Ok(c) = CauseProtocol::try_from(v) {
+                causes.push(Cause::Protocol(c));
+            }
+            if let Ok(c) = CauseMisc::try_from(v) {
+                causes.push(Cause::Misc(c));
+            }
+        }
+        causes.extend([
+            Cause::Transport(CauseTransport::TransportResourceUnavailable),
+            Cause::Transport(CauseTransport::Unspecified),
+            Cause::Nas(CauseNas::NormalRelease),
+            Cause::Nas(CauseNas::AuthenticationFailure),
+            Cause::Nas(CauseNas::Deregister),
+            Cause::Nas(CauseNas::Unspecified),
+            Cause::Nas(CauseNas::UeNotInPlmnServingArea),
+        ]);
+        causes
+    }
+
+    const AMF_IDS: [Option<u64>; 5] = [None, Some(0), Some(255), Some(65_536), Some((1 << 40) - 1)];
+    const RAN_IDS: [Option<u32>; 4] = [None, Some(0), Some(256), Some(u32::MAX)];
+
+    /// Oracle: the generated builder is byte-identical to the hand-written one
+    /// for every Cause and both UE NGAP IDs at each APER length, present or not.
+    #[test]
+    fn error_indication_generated_matches_hand_written() {
+        let causes = every_hand_written_cause();
+        assert!(causes.len() > 60, "{} causes", causes.len());
+        for cause in causes {
+            for amf in AMF_IDS {
+                for ran in RAN_IDS {
+                    let hand_written = builder::build_error_indication(&ErrorIndication {
+                        amf_ue_ngap_id: amf,
+                        ran_ue_ngap_id: ran,
+                        cause: Some(cause),
+                        criticality_diagnostics: None,
+                    })
+                    .expect("hand-written");
+                    let generated =
+                        build_error_indication_generated(amf, ran, generated_cause(cause))
+                            .expect("generated");
+                    assert_eq!(generated, hand_written, "{cause:?} {amf:?} {ran:?}");
+                }
+            }
+        }
+    }
+
+    /// Oracle: on every PDU the hand-written parser decodes as an Error
+    /// Indication, the generated decode yields the same IDs, Cause and
+    /// Criticality Diagnostics -- including the diagnostics-only report
+    /// `build_criticality_error_indication_asn1` sends.
+    #[test]
+    fn error_indication_generated_decode_matches_hand_written() {
+        let mut pdus = Vec::new();
+        for cause in every_hand_written_cause() {
+            for amf in AMF_IDS {
+                for ran in RAN_IDS {
+                    pdus.push(
+                        build_error_indication_generated(amf, ran, generated_cause(cause))
+                            .expect("build"),
+                    );
+                }
+            }
+        }
+        for (amf, ran) in [(None, None), (Some(7), Some(8))] {
+            for cause_protocol in [
+                ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
+                ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+            ] {
+                pdus.push(
+                    build_criticality_error_indication_asn1(&CriticalityErrorIndication {
+                        amf_ue_ngap_id: amf,
+                        ran_ue_ngap_id: ran,
+                        cause_protocol,
+                        procedure: ReportedProcedure {
+                            procedure_code: ngap_gen::ID_UE_CONTEXT_RELEASE_REQUEST,
+                            triggering_message: 0,
+                            procedure_criticality: ngap_gen::Criticality::IGNORE,
+                        },
+                        diagnostics: vec![
+                            IeDiagnostic {
+                                ie_id: 4_000,
+                                criticality: ngap_gen::Criticality::REJECT,
+                                type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+                            },
+                            IeDiagnostic {
+                                ie_id: ngap_gen::ID_CAUSE,
+                                criticality: ngap_gen::Criticality::IGNORE,
+                                type_of_error: ngap_gen::TypeOfError::MISSING,
+                            },
+                        ],
+                    })
+                    .expect("build"),
+                );
+            }
+        }
+        pdus.push(encode_error_indication(None, None, None, None).expect("empty"));
+        for pdu in pdus {
+            let Ok(NgapMessage::ErrorIndication(oracle)) = parser::decode_ngap_pdu(&pdu) else {
+                panic!("hand-written parser refused {pdu:02x?}");
+            };
+            let generated = decode_error_indication_asn1(&pdu).expect("generated");
+            assert_eq!(
+                generated.amf_ue_ngap_id, oracle.amf_ue_ngap_id,
+                "{pdu:02x?}"
+            );
+            assert_eq!(
+                generated.ran_ue_ngap_id, oracle.ran_ue_ngap_id,
+                "{pdu:02x?}"
+            );
+            assert_eq!(
+                generated.cause,
+                oracle.cause.map(generated_cause),
+                "{pdu:02x?}"
+            );
+            assert_eq!(
+                generated.criticality_diagnostics,
+                oracle
+                    .criticality_diagnostics
+                    .as_ref()
+                    .map(generated_diagnostics_from),
+                "{pdu:02x?}"
+            );
+        }
+    }
+
+    /// TS 38.413 §9.2.6.13, derived by hand (X.691 ALIGNED): initiatingMessage
+    /// `00`, procedureCode 9 `09`, criticality ignore `40`, open-type length 20;
+    /// extension bit + 3 IEs `00 00 03`; AMF-UE-NGAP-ID 10 ignore, length 2,
+    /// one-octet length determinant 0 then `01`; RAN-UE-NGAP-ID 85 ignore,
+    /// length 2, `00 02`; Cause 15 ignore, length 1: the Cause CHOICE has six
+    /// alternatives and no extension marker (its extension is the
+    /// choice-Extensions alternative), so protocol is index 3 in three bits
+    /// (`011`), then CauseProtocol's extension bit 0 and transfer-syntax-error 0
+    /// of 7 in three bits (`000`), padded: `0110 0000` = `60`.
+    const UE_ERROR_INDICATION: [u8; 24] = [
+        0x00, 0x09, 0x40, 0x14, 0x00, 0x00, 0x03, 0x00, 0x0A, 0x40, 0x02, 0x00, 0x01, 0x00, 0x55,
+        0x40, 0x02, 0x00, 0x02, 0x00, 0x0F, 0x40, 0x01, 0x60,
+    ];
+
+    /// Non-UE-associated, message-not-compatible-with-receiver-state (3):
+    /// `011 0 011 0` = `66`; 1 IE, open-type length 8.
+    const NON_UE_ERROR_INDICATION: [u8; 12] = [
+        0x00, 0x09, 0x40, 0x08, 0x00, 0x00, 0x01, 0x00, 0x0F, 0x40, 0x01, 0x66,
+    ];
+
+    fn protocol(v: u8) -> ngap_gen::Cause {
+        ngap_gen::Cause::Protocol(ngap_gen::CauseProtocol(v))
+    }
+
+    #[test]
+    fn error_indication_golden_bytes() {
+        assert_eq!(
+            build_error_indication_generated(
+                Some(1),
+                Some(2),
+                protocol(ngap_gen::CauseProtocol::TRANSFER_SYNTAX_ERROR)
+            )
+            .expect("build"),
+            UE_ERROR_INDICATION
+        );
+        assert_eq!(
+            build_error_indication_generated(
+                None,
+                None,
+                protocol(ngap_gen::CauseProtocol::MESSAGE_NOT_COMPATIBLE_WITH_RECEIVER_STATE)
+            )
+            .expect("build"),
+            NON_UE_ERROR_INDICATION
+        );
+        assert_eq!(
+            decode_error_indication_asn1(&UE_ERROR_INDICATION),
+            Some(ErrorIndicationReceived {
+                amf_ue_ngap_id: Some(1),
+                ran_ue_ngap_id: Some(2),
+                cause: Some(protocol(ngap_gen::CauseProtocol::TRANSFER_SYNTAX_ERROR)),
+                criticality_diagnostics: None,
+            })
+        );
+    }
+
+    /// §10.6: a not-comprehended IE in an Error Indication -- even one marked
+    /// reject -- gets local handling, so the rest of the indication still
+    /// decodes and nothing is reported back.
+    #[test]
+    fn a_not_comprehended_ie_in_an_error_indication_is_skipped() {
+        for criticality in [
+            ngap_gen::Criticality::REJECT,
+            ngap_gen::Criticality::IGNORE,
+            ngap_gen::Criticality::NOTIFY,
+        ] {
+            let spliced = with_unknown_ie(&UE_ERROR_INDICATION, 4_000, criticality << 6);
+            assert_eq!(
+                decode_error_indication_asn1(&spliced),
+                decode_error_indication_asn1(&UE_ERROR_INDICATION),
+                "criticality {criticality}"
+            );
+        }
+    }
+
+    /// An indication with neither Cause nor Criticality Diagnostics breaks
+    /// §8.7.5.2 but still decodes, so the handler can log it; truncations and a
+    /// different message do not decode.
+    #[test]
+    fn error_indication_decode_edges() {
+        let empty = encode_error_indication(None, None, None, None).expect("empty");
+        assert_eq!(empty, [0x00, 0x09, 0x40, 0x03, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            decode_error_indication_asn1(&empty),
+            Some(ErrorIndicationReceived {
+                amf_ue_ngap_id: None,
+                ran_ue_ngap_id: None,
+                cause: None,
+                criticality_diagnostics: None,
+            })
+        );
+        for len in 0..UE_ERROR_INDICATION.len() {
+            assert_eq!(
+                decode_error_indication_asn1(&UE_ERROR_INDICATION[..len]),
+                None,
+                "prefix of {len}"
+            );
+        }
+        let ack = build_ran_configuration_update_acknowledge_generated(&[]).expect("ack");
+        assert_eq!(decode_error_indication_asn1(&ack), None);
     }
 }
