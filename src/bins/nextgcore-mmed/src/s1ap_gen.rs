@@ -14,7 +14,11 @@
 //! Release (§8.3.2, §8.3.3): the UE CONTEXT RELEASE COMMAND encode and the
 //! REQUEST / COMPLETE decodes. Stage 6 is E-RAB management (§8.2.1-§8.2.3):
 //! the E-RAB SETUP / MODIFY REQUEST and E-RAB RELEASE COMMAND encodes and their
-//! responses' decodes. Stage 7 is Paging (§8.5): the PAGING encode.
+//! responses' decodes. Stage 7 is Paging (§8.5): the PAGING encode. Stage 8a
+//! is the handover family's simpler half (§8.4): HANDOVER NOTIFY, HANDOVER
+//! CANCEL, HANDOVER FAILURE and ENB STATUS TRANSFER decodes, and HANDOVER
+//! PREPARATION FAILURE, HANDOVER CANCEL ACKNOWLEDGE and MME STATUS TRANSFER
+//! encodes.
 
 use bitvec::prelude::{BitVec, Msb0};
 use nextgcore_s1ap::{
@@ -228,12 +232,26 @@ pub fn decode_s1_setup_request(bytes: &[u8]) -> SetupRequestDecode {
 /// initiating-message, criticality reject) naming `ies` (§9.2.1.21). The
 /// IE list is capped at its SIZE(1..maxnoofErrors = 256).
 fn diagnostics(ies: &[DiagnosedIe]) -> g::CriticalityDiagnostics {
+    diagnostics_for(
+        PROC_S1_SETUP,
+        g::TriggeringMessage::INITIATING_MESSAGE,
+        REJECT,
+        ies,
+    )
+}
+
+/// Criticality Diagnostics (§9.2.1.21) for any procedure, triggering message
+/// and procedure criticality.
+fn diagnostics_for(
+    procedure_code: u8,
+    triggering_message: u8,
+    procedure_criticality: u8,
+    ies: &[DiagnosedIe],
+) -> g::CriticalityDiagnostics {
     g::CriticalityDiagnostics {
-        procedure_code: Some(g::ProcedureCode(PROC_S1_SETUP)),
-        triggering_message: Some(g::TriggeringMessage(
-            g::TriggeringMessage::INITIATING_MESSAGE,
-        )),
-        procedure_criticality: Some(g::Criticality(REJECT)),
+        procedure_code: Some(g::ProcedureCode(procedure_code)),
+        triggering_message: Some(g::TriggeringMessage(triggering_message)),
+        procedure_criticality: Some(g::Criticality(procedure_criticality)),
         i_es_criticality_diagnostics: (!ies.is_empty()).then(|| {
             g::CriticalityDiagnostics_IE_List(
                 ies.iter()
@@ -1661,6 +1679,351 @@ pub fn build_paging(msg: &nextgcore_s1ap::Paging) -> Result<Vec<u8>, asn1_codecs
     }))
 }
 
+// ============================================================================
+// Handover, part 1 (TS 36.413 §8.4.1-§8.4.7) -- stage 8a
+// ============================================================================
+
+/// `id-HandoverPreparation`.
+pub const PROC_HANDOVER_PREPARATION: u8 = 0;
+/// `id-HandoverResourceAllocation`.
+pub const PROC_HANDOVER_RESOURCE_ALLOCATION: u8 = 1;
+/// `id-HandoverNotification`.
+pub const PROC_HANDOVER_NOTIFICATION: u8 = 2;
+/// `id-HandoverCancel`.
+pub const PROC_HANDOVER_CANCEL: u8 = 4;
+/// `id-eNBStatusTransfer`.
+pub const PROC_ENB_STATUS_TRANSFER: u8 = 24;
+/// `id-MMEStatusTransfer`.
+pub const PROC_MME_STATUS_TRANSFER: u8 = 25;
+
+const ID_ENB_STATUS_TRANSFER_CONTAINER: u16 = 90;
+
+/// Encode a HANDOVER PREPARATION FAILURE (TS 36.413 §9.1.5.3): every IE
+/// criticality ignore; procedure criticality reject.
+pub fn build_handover_preparation_failure(
+    msg: &nextgcore_s1ap::HandoverPreparationFailure,
+) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    use g::HandoverPreparationFailureProtocolIEs_EntryValue as V;
+    let ie = |id: u16, value: V| g::HandoverPreparationFailureProtocolIEs_Entry {
+        id: g::ProtocolIE_ID(id),
+        criticality: g::Criticality(IGNORE),
+        value,
+    };
+    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::UnsuccessfulOutcome(g::UnsuccessfulOutcome {
+        procedure_code: g::ProcedureCode(PROC_HANDOVER_PREPARATION),
+        criticality: g::Criticality(REJECT),
+        value: g::UnsuccessfulOutcomeValue::Id_HandoverPreparation(g::HandoverPreparationFailure {
+            protocol_i_es: g::HandoverPreparationFailureProtocolIEs(vec![
+                ie(
+                    ID_MME_UE_S1AP_ID,
+                    V::Id_MME_UE_S1AP_ID(g::MME_UE_S1AP_ID(msg.mme_ue_s1ap_id)),
+                ),
+                ie(
+                    ID_ENB_UE_S1AP_ID,
+                    V::Id_eNB_UE_S1AP_ID(g::ENB_UE_S1AP_ID(msg.enb_ue_s1ap_id)),
+                ),
+                ie(ID_CAUSE, V::Id_Cause(generated_cause(msg.cause))),
+            ]),
+        }),
+    }))
+}
+
+/// Encode a HANDOVER CANCEL ACKNOWLEDGE (TS 36.413 §9.1.5.11): every IE
+/// criticality ignore; procedure criticality reject. `notify` IEs of the
+/// HANDOVER CANCEL are reported in its Criticality Diagnostics (§10.3.4.2).
+pub fn build_handover_cancel_acknowledge(
+    msg: &nextgcore_s1ap::HandoverCancelAcknowledge,
+    notify: &[DiagnosedIe],
+) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    use g::HandoverCancelAcknowledgeProtocolIEs_EntryValue as V;
+    let ie = |id: u16, value: V| g::HandoverCancelAcknowledgeProtocolIEs_Entry {
+        id: g::ProtocolIE_ID(id),
+        criticality: g::Criticality(IGNORE),
+        value,
+    };
+    let mut ies = vec![
+        ie(
+            ID_MME_UE_S1AP_ID,
+            V::Id_MME_UE_S1AP_ID(g::MME_UE_S1AP_ID(msg.mme_ue_s1ap_id)),
+        ),
+        ie(
+            ID_ENB_UE_S1AP_ID,
+            V::Id_eNB_UE_S1AP_ID(g::ENB_UE_S1AP_ID(msg.enb_ue_s1ap_id)),
+        ),
+    ];
+    if !notify.is_empty() {
+        ies.push(ie(
+            ID_CRITICALITY_DIAGNOSTICS,
+            V::Id_CriticalityDiagnostics(diagnostics_for(
+                PROC_HANDOVER_CANCEL,
+                g::TriggeringMessage::INITIATING_MESSAGE,
+                REJECT,
+                notify,
+            )),
+        ));
+    }
+    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+        procedure_code: g::ProcedureCode(PROC_HANDOVER_CANCEL),
+        criticality: g::Criticality(REJECT),
+        value: g::SuccessfulOutcomeValue::Id_HandoverCancel(g::HandoverCancelAcknowledge {
+            protocol_i_es: g::HandoverCancelAcknowledgeProtocolIEs(ies),
+        }),
+    }))
+}
+
+/// The `ENB-StatusTransfer-TransparentContainer` the hand-written type holds
+/// as raw APER, as the generated value.
+fn status_container_from(
+    raw: &[u8],
+) -> Result<g::ENB_StatusTransfer_TransparentContainer, asn1_codecs::PerCodecError> {
+    use asn1_codecs::aper::AperCodec;
+    let mut data = asn1_codecs::PerCodecData::from_slice_aper(raw);
+    g::ENB_StatusTransfer_TransparentContainer::aper_decode(&mut data)
+}
+
+/// The generated container as the raw APER the hand-written type holds.
+fn status_container_raw(c: &g::ENB_StatusTransfer_TransparentContainer) -> Option<Vec<u8>> {
+    use asn1_codecs::aper::AperCodec;
+    let mut data = asn1_codecs::PerCodecData::new_aper();
+    c.aper_encode(&mut data).ok()?;
+    Some(data.into_bytes())
+}
+
+/// Encode an MME STATUS TRANSFER (TS 36.413 §9.1.5.7): every IE criticality
+/// reject; procedure criticality ignore. The container is relayed as received.
+pub fn build_mme_status_transfer(
+    msg: &nextgcore_s1ap::MmeStatusTransfer,
+) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    use g::MMEStatusTransferProtocolIEs_EntryValue as V;
+    let ie = |id: u16, value: V| g::MMEStatusTransferProtocolIEs_Entry {
+        id: g::ProtocolIE_ID(id),
+        criticality: g::Criticality(REJECT),
+        value,
+    };
+    let container = status_container_from(&msg.status_transfer_container)?;
+    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+        procedure_code: g::ProcedureCode(PROC_MME_STATUS_TRANSFER),
+        criticality: g::Criticality(IGNORE),
+        value: g::InitiatingMessageValue::Id_MMEStatusTransfer(g::MMEStatusTransfer {
+            protocol_i_es: g::MMEStatusTransferProtocolIEs(vec![
+                ie(
+                    ID_MME_UE_S1AP_ID,
+                    V::Id_MME_UE_S1AP_ID(g::MME_UE_S1AP_ID(msg.mme_ue_s1ap_id)),
+                ),
+                ie(
+                    ID_ENB_UE_S1AP_ID,
+                    V::Id_eNB_UE_S1AP_ID(g::ENB_UE_S1AP_ID(msg.enb_ue_s1ap_id)),
+                ),
+                ie(
+                    ID_ENB_STATUS_TRANSFER_CONTAINER,
+                    V::Id_eNB_StatusTransfer_TransparentContainer(container),
+                ),
+            ]),
+        }),
+    }))
+}
+
+/// Decode an ENB STATUS TRANSFER (TS 36.413 §9.1.5.6), the initiating message
+/// of a Class 2 procedure: all three IEs are `reject`, so any missing one
+/// means the message is not acted on.
+pub fn decode_enb_status_transfer(bytes: &[u8]) -> Class2Decode<nextgcore_s1ap::EnbStatusTransfer> {
+    let Ok((pdu, unknown)) = nextgcore_s1ap_gen::decode_with_unknown_ies(bytes) else {
+        return Class2Decode::Undecodable;
+    };
+    let g::S1AP_PDU::InitiatingMessage(msg) = pdu else {
+        return Class2Decode::Undecodable;
+    };
+    let g::InitiatingMessageValue::Id_eNBStatusTransfer(m) = msg.value else {
+        return Class2Decode::Undecodable;
+    };
+    let (mut reject, notify) = classify_unknown(&unknown);
+    let (mut mme, mut enb, mut container) = (None, None, None);
+    use g::ENBStatusTransferProtocolIEs_EntryValue as V;
+    for ie in m.protocol_i_es.0 {
+        match ie.value {
+            V::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
+            V::Id_eNB_UE_S1AP_ID(v) => enb = Some(v.0),
+            V::Id_eNB_StatusTransfer_TransparentContainer(c) => match status_container_raw(&c) {
+                Some(raw) => container = Some(raw),
+                None => not_understood(&mut reject, ID_ENB_STATUS_TRANSFER_CONTAINER),
+            },
+        }
+    }
+    missing(&mut reject, mme.is_some(), ID_MME_UE_S1AP_ID);
+    missing(&mut reject, enb.is_some(), ID_ENB_UE_S1AP_ID);
+    missing(
+        &mut reject,
+        container.is_some(),
+        ID_ENB_STATUS_TRANSFER_CONTAINER,
+    );
+    if !reject.is_empty() {
+        return Class2Decode::Reject {
+            ies: reject,
+            enb_ue_s1ap_id: enb,
+            mme_ue_s1ap_id: mme,
+        };
+    }
+    let (Some(mme_ue_s1ap_id), Some(enb_ue_s1ap_id), Some(status_transfer_container)) =
+        (mme, enb, container)
+    else {
+        return Class2Decode::Undecodable;
+    };
+    Class2Decode::Proceed {
+        msg: nextgcore_s1ap::EnbStatusTransfer {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id,
+            status_transfer_container,
+        },
+        notify,
+    }
+}
+
+/// A HANDOVER NOTIFY whose `ignore` location IEs may be missing (§10.3.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoverNotifyAt {
+    /// MME-UE-S1AP-ID.
+    pub mme_ue_s1ap_id: u32,
+    /// eNB-UE-S1AP-ID.
+    pub enb_ue_s1ap_id: u32,
+    /// EUTRAN-CGI and TAI, when both are present.
+    pub location: Option<(Tai, EutranCgi)>,
+}
+
+/// Decode a HANDOVER NOTIFY (TS 36.413 §9.1.5.10), the initiating message of a
+/// Class 2 procedure. The UE IDs are `reject`; EUTRAN-CGI and TAI are `ignore`,
+/// so without both the notify still completes the handover.
+pub fn decode_handover_notify(bytes: &[u8]) -> Class2Decode<HandoverNotifyAt> {
+    let Ok((pdu, unknown)) = nextgcore_s1ap_gen::decode_with_unknown_ies(bytes) else {
+        return Class2Decode::Undecodable;
+    };
+    let g::S1AP_PDU::InitiatingMessage(msg) = pdu else {
+        return Class2Decode::Undecodable;
+    };
+    let g::InitiatingMessageValue::Id_HandoverNotification(m) = msg.value else {
+        return Class2Decode::Undecodable;
+    };
+    let (mut reject, notify) = classify_unknown(&unknown);
+    let (mut mme, mut enb, mut cgi, mut tai) = (None, None, None, None);
+    use g::HandoverNotifyProtocolIEs_EntryValue as V;
+    for ie in m.protocol_i_es.0 {
+        match ie.value {
+            V::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
+            V::Id_eNB_UE_S1AP_ID(v) => enb = Some(v.0),
+            V::Id_EUTRAN_CGI(v) => cgi = cgi_from(&v),
+            V::Id_TAI(v) => tai = tai_from(&v),
+            _ => {}
+        }
+    }
+    missing(&mut reject, mme.is_some(), ID_MME_UE_S1AP_ID);
+    missing(&mut reject, enb.is_some(), ID_ENB_UE_S1AP_ID);
+    if !reject.is_empty() {
+        return Class2Decode::Reject {
+            ies: reject,
+            enb_ue_s1ap_id: enb,
+            mme_ue_s1ap_id: mme,
+        };
+    }
+    let (Some(mme_ue_s1ap_id), Some(enb_ue_s1ap_id)) = (mme, enb) else {
+        return Class2Decode::Undecodable;
+    };
+    Class2Decode::Proceed {
+        msg: HandoverNotifyAt {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id,
+            location: tai.zip(cgi),
+        },
+        notify,
+    }
+}
+
+/// Decode a HANDOVER CANCEL (TS 36.413 §9.1.5.10), the initiating message of a
+/// Class 1 procedure. The UE IDs are `reject`; a missing Cause (`ignore`) reads
+/// as radioNetwork / unspecified. `notify` IEs go in the acknowledge.
+pub fn decode_handover_cancel(bytes: &[u8]) -> Class2Decode<nextgcore_s1ap::HandoverCancel> {
+    let Ok((pdu, unknown)) = nextgcore_s1ap_gen::decode_with_unknown_ies(bytes) else {
+        return Class2Decode::Undecodable;
+    };
+    let g::S1AP_PDU::InitiatingMessage(msg) = pdu else {
+        return Class2Decode::Undecodable;
+    };
+    let g::InitiatingMessageValue::Id_HandoverCancel(m) = msg.value else {
+        return Class2Decode::Undecodable;
+    };
+    let (mut reject, notify) = classify_unknown(&unknown);
+    let (mut mme, mut enb, mut cause) = (None, None, None);
+    use g::HandoverCancelProtocolIEs_EntryValue as V;
+    for ie in m.protocol_i_es.0 {
+        match ie.value {
+            V::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
+            V::Id_eNB_UE_S1AP_ID(v) => enb = Some(v.0),
+            V::Id_Cause(c) => cause = hand_written_cause(&c),
+        }
+    }
+    missing(&mut reject, mme.is_some(), ID_MME_UE_S1AP_ID);
+    missing(&mut reject, enb.is_some(), ID_ENB_UE_S1AP_ID);
+    if !reject.is_empty() {
+        return Class2Decode::Reject {
+            ies: reject,
+            enb_ue_s1ap_id: enb,
+            mme_ue_s1ap_id: mme,
+        };
+    }
+    let (Some(mme_ue_s1ap_id), Some(enb_ue_s1ap_id)) = (mme, enb) else {
+        return Class2Decode::Undecodable;
+    };
+    Class2Decode::Proceed {
+        msg: nextgcore_s1ap::HandoverCancel {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id,
+            cause: cause.unwrap_or(Cause::RadioNetwork(
+                nextgcore_s1ap::CauseRadioNetwork::Unspecified,
+            )),
+        },
+        notify,
+    }
+}
+
+/// Decode a HANDOVER FAILURE (TS 36.413 §9.1.5.5), the unsuccessful outcome
+/// of Handover Resource Allocation: a response message. Its IEs are `ignore`;
+/// one naming no MME-UE-S1AP-ID is `Undecodable`, a missing Cause reads as
+/// radioNetwork / unspecified.
+pub fn decode_handover_failure(bytes: &[u8]) -> ResponseDecode<nextgcore_s1ap::HandoverFailure> {
+    let Ok((pdu, unknown)) = nextgcore_s1ap_gen::decode_with_unknown_ies(bytes) else {
+        return ResponseDecode::Undecodable;
+    };
+    let g::S1AP_PDU::UnsuccessfulOutcome(msg) = pdu else {
+        return ResponseDecode::Undecodable;
+    };
+    let g::UnsuccessfulOutcomeValue::Id_HandoverResourceAllocation(f) = msg.value else {
+        return ResponseDecode::Undecodable;
+    };
+    let (reject, notify) = classify_unknown(&unknown);
+    if !reject.is_empty() {
+        return ResponseDecode::Failed(reject);
+    }
+    let (mut mme, mut cause) = (None, None);
+    use g::HandoverFailureProtocolIEs_EntryValue as V;
+    for ie in f.protocol_i_es.0 {
+        match ie.value {
+            V::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
+            V::Id_Cause(c) => cause = hand_written_cause(&c),
+            _ => {}
+        }
+    }
+    let Some(mme_ue_s1ap_id) = mme else {
+        return ResponseDecode::Undecodable;
+    };
+    ResponseDecode::Decoded {
+        msg: nextgcore_s1ap::HandoverFailure {
+            mme_ue_s1ap_id,
+            cause: cause.unwrap_or(Cause::RadioNetwork(
+                nextgcore_s1ap::CauseRadioNetwork::Unspecified,
+            )),
+        },
+        notify,
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -1678,3 +2041,6 @@ mod erab_tests;
 
 #[cfg(test)]
 mod paging_tests;
+
+#[cfg(test)]
+pub(crate) mod handover_tests;
