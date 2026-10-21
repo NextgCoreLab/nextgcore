@@ -22,10 +22,11 @@
 #                  callback (nextgcore #580): the UE re-registers PROMPTLY -- no
 #                  T3510 expiry (nextgsim #265) -- re-establishes its PDU session
 #                  (nextgsim #272) and pings 20/20.
-#   all            The four above, in that order. Paging runs FIRST on purpose:
-#                  after any Service Request from CM-IDLE a later page is
-#                  answered 404 by the AMF (nextgcore #648), so until that is
-#                  fixed paging is asserted on a UE that has not yet re-keyed.
+#   all            paging, idle-uplink, paging AGAIN, deregister, network-rereg.
+#                  The second paging round runs after idle-uplink on purpose: a
+#                  Service Request from CM-IDLE moves the UE to a new AMF UE NGAP
+#                  ID, and before nextgcore #648 every later page was answered 404
+#                  by the AMF, so only a page AFTER a Service Request covers it.
 #
 # Each scenario prints exactly one `PASS: <scenario>` or `FAIL: <scenario> -- <why>`
 # line and exits non-zero on FAIL. Every assertion is POSITIVE: a line only
@@ -300,6 +301,8 @@ case "${1:-}" in
         install_cli
         scenario_paging
         scenario_idle_uplink
+        # #648: a page after the UE's Service Request from CM-IDLE.
+        scenario_paging
         scenario_deregister
         scenario_network_rereg
         ;;
