@@ -636,22 +636,43 @@ impl SbiClient {
     /// the sender is still ready, and otherwise (re)connects that slot. Only the
     /// chosen slot's mutex is held across the connect, so concurrent requests
     /// routed to other slots are not blocked during connection establishment.
-    async fn get_connection(&self) -> SbiResult<SendRequest<Full<Bytes>>> {
+    async fn get_connection(&self) -> SbiResult<(usize, SendRequest<Full<Bytes>>)> {
         let slot = self.next_slot.fetch_add(1, Ordering::Relaxed) % self.pool.len();
         let mut conn_guard = self.pool[slot].lock().await;
 
         if let Some(ref state) = *conn_guard {
             if state.sender.is_ready() {
-                return Ok(state.sender.clone());
+                return Ok((slot, state.sender.clone()));
             }
         }
 
         // Slot empty or its connection is no longer usable — (re)connect it.
+        let sender = self.redial_slot_locked(&mut conn_guard).await?;
+        Ok((slot, sender))
+    }
+
+    /// Dial a fresh connection into an already-locked pool slot.
+    async fn redial_slot_locked(
+        &self,
+        conn_guard: &mut Option<ConnectionState>,
+    ) -> SbiResult<SendRequest<Full<Bytes>>> {
         let sender = self.connect().await?;
         *conn_guard = Some(ConnectionState {
             sender: sender.clone(),
         });
         Ok(sender)
+    }
+
+    /// Replace pool slot `slot`'s connection with a fresh one, unless another
+    /// request already did so (its sender is ready again).
+    async fn redial_slot(&self, slot: usize) -> SbiResult<SendRequest<Full<Bytes>>> {
+        let mut conn_guard = self.pool[slot].lock().await;
+        if let Some(ref state) = *conn_guard {
+            if state.sender.is_ready() {
+                return Ok(state.sender.clone());
+            }
+        }
+        self.redial_slot_locked(&mut conn_guard).await
     }
 
     /// Send an SBI request and receive a response.
@@ -1052,10 +1073,17 @@ impl SbiClient {
         request: &SbiRequest,
         target: Option<&ConnectTarget>,
     ) -> SbiResult<SbiResponse> {
-        let mut sender = match target {
-            None => self.get_connection().await?,
-            Some(t) => self.connect_to(t).await?,
+        let (pooled_slot, mut sender) = match target {
+            None => {
+                let (slot, sender) = self.get_connection().await?;
+                (Some(slot), sender)
+            }
+            Some(t) => (None, self.connect_to(t).await?),
         };
+        #[cfg(test)]
+        if pooled_slot.is_some() {
+            test_hooks::before_pooled_send();
+        }
 
         // Build the URI
         let uri_str = if request.header.uri.starts_with("http") {
@@ -1152,14 +1180,41 @@ impl SbiClient {
             .body(body)
             .map_err(|e| SbiError::ClientError(e.to_string()))?;
 
-        // Send the request with timeout
-        let response = tokio::time::timeout(
-            self.config.request_timeout,
-            sender.send_request(http_request),
-        )
-        .await
-        .map_err(|_| SbiError::Timeout)?
-        .map_err(|e| SbiError::HyperError(e.to_string()))?;
+        // Send the request with timeout.
+        //
+        // A pooled connection can be dead even though it looked ready a moment
+        // ago: its driver task runs on the tokio runtime that dialled it, and if
+        // that runtime is shutting down (every `#[tokio::test]` owns one; the
+        // client cache is process-wide) the driver vanishes between the
+        // `is_ready()` check and this send ("dispatch task is gone").
+        // `try_send_request` hands the request back when hyper never queued it
+        // on the wire, so it is safe to redial and send it once more: no
+        // request is ever transmitted twice, which keeps non-idempotent
+        // methods (POST/PATCH) correct. A request that was handed to the
+        // connection and then failed is NOT retried here — that is the
+        // sbi-05 RetryPolicy's call, as before.
+        let deadline = tokio::time::Instant::now() + self.config.request_timeout;
+        let first = tokio::time::timeout_at(deadline, sender.try_send_request(http_request))
+            .await
+            .map_err(|_| SbiError::Timeout)?;
+        let response = match first {
+            Ok(response) => response,
+            Err(mut err) => match (pooled_slot, (err.error().to_string(), err.take_message())) {
+                (Some(slot), (_, Some(unsent))) => {
+                    log::debug!(
+                        "pooled SBI connection to {} was dead before the request \
+                         was sent; redialling slot {slot} and sending once",
+                        self.config.base_uri()
+                    );
+                    let mut fresh = self.redial_slot(slot).await?;
+                    tokio::time::timeout_at(deadline, fresh.send_request(unsent))
+                        .await
+                        .map_err(|_| SbiError::Timeout)?
+                        .map_err(|e| SbiError::HyperError(e.to_string()))?
+                }
+                (_, (reason, _)) => return Err(SbiError::HyperError(reason)),
+            },
+        };
 
         // Convert to SbiResponse
         self.convert_response(response).await
@@ -1367,6 +1422,29 @@ fn is_retryable_status(status: u16) -> bool {
 /// caller falls back to its base backoff.
 fn parse_retry_after(value: &str) -> Option<Duration> {
     value.trim().parse::<u64>().ok().map(Duration::from_secs)
+}
+
+/// Test-only seam between picking a pooled connection and sending on it, so a
+/// test can kill the connection's driver runtime inside that window
+/// deterministically instead of racing a runtime shutdown.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static BEFORE_POOLED_SEND: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    /// Run `hook` once, on this thread, right before the next pooled send.
+    pub(crate) fn set_before_pooled_send(hook: impl FnOnce() + 'static) {
+        BEFORE_POOLED_SEND.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn before_pooled_send() {
+        if let Some(hook) = BEFORE_POOLED_SEND.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2612,6 +2690,128 @@ mod tests {
             observed[1].as_deref(),
             Some("bl=nf-set; nfset=set1.smfset.5gc.mnc012.mcc345"),
             "the binding learned from the first response must be conveyed back"
+        );
+    }
+
+    // --- A cached client outliving the runtime that drove its connection ---
+
+    /// An HTTP/2 echo server on its OWN thread and runtime, so it outlives any
+    /// client-side runtime a test creates and drops.
+    fn serve_on_own_runtime() -> std::net::SocketAddr {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                tx.send(listener.local_addr().unwrap()).unwrap();
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    tokio::spawn(async move {
+                        let io = hyper_util::rt::TokioIo::new(stream);
+                        let svc =
+                            hyper::service::service_fn(|_req: hyper::Request<Incoming>| async {
+                                Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                                    http_body_util::Full::new(bytes::Bytes::from_static(b"{}")),
+                                ))
+                            });
+                        let _ = hyper::server::conn::http2::Builder::new(
+                            hyper_util::rt::TokioExecutor::new(),
+                        )
+                        .serve_connection(io, svc)
+                        .await;
+                    });
+                }
+            });
+        });
+        rx.recv().unwrap()
+    }
+
+    /// The SBI client cache (`SbiContext::get_client`) is process-wide, but a
+    /// pooled HTTP/2 connection is driven by a task spawned on whichever tokio
+    /// runtime first dialled it. When that runtime is dropped — every
+    /// `#[tokio::test]` has its own — the driver dies with it, and the cached
+    /// sender must not be handed to the next runtime's request as if usable.
+    #[test]
+    fn a_connection_whose_driver_runtime_died_is_redialled_not_reused() {
+        let addr = serve_on_own_runtime();
+        // One pooled connection, so every round lands on the slot the
+        // previous round's (now dead) runtime dialled.
+        let client = Arc::new(SbiClient::new(
+            SbiClientConfig::new(&addr.ip().to_string(), addr.port()).with_pool_size(1),
+        ));
+
+        for round in 0..3 {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let c = client.clone();
+            let res = rt.block_on(async move { c.send_request(SbiRequest::get("/x")).await });
+            assert!(
+                res.is_ok(),
+                "round {round}: request on a fresh runtime failed: {:?}",
+                res.err()
+            );
+            drop(rt);
+        }
+    }
+
+    /// The race the previous test cannot hit by itself: the pooled sender is
+    /// READY when picked (its driver runtime is alive), and that runtime dies
+    /// before the request is handed over. The seam in `send_once` lets the test
+    /// kill the runtime exactly there. Without the unsent-request redial the
+    /// send fails with hyper's "dispatch task is gone"; with it the request is
+    /// sent exactly once on a fresh connection.
+    #[test]
+    fn a_driver_dying_between_ready_check_and_send_is_redialled_once() {
+        let addr = serve_on_own_runtime();
+        let client = Arc::new(SbiClient::new(
+            SbiClientConfig::new(&addr.ip().to_string(), addr.port()).with_pool_size(1),
+        ));
+
+        // Runtime A dials the only pooled connection; its driver lives on A.
+        let (kill_tx, kill_rx) = std::sync::mpsc::channel::<()>();
+        let (dead_tx, dead_rx) = std::sync::mpsc::channel::<()>();
+        let (dialled_tx, dialled_rx) = std::sync::mpsc::channel::<()>();
+        let ca = client.clone();
+        let a = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move { ca.send_request(SbiRequest::get("/a")).await })
+                .expect("runtime A's own request");
+            dialled_tx.send(()).unwrap();
+            kill_rx.recv().unwrap();
+            drop(rt);
+            dead_tx.send(()).unwrap();
+        });
+        dialled_rx.recv().unwrap();
+
+        // Runtime B picks that (still ready) connection; the hook then kills A.
+        test_hooks::set_before_pooled_send(move || {
+            kill_tx.send(()).unwrap();
+            dead_rx.recv().unwrap();
+        });
+        let rt_b = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let cb = client.clone();
+        let res = rt_b.block_on(async move { cb.send_request(SbiRequest::get("/b")).await });
+        a.join().unwrap();
+        assert!(
+            res.is_ok(),
+            "a request whose pooled connection died before it was sent must be \
+             redialled and sent once: {:?}",
+            res.err()
         );
     }
 }
