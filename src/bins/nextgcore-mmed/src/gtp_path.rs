@@ -649,9 +649,13 @@ fn handle_datagram(inner: &Arc<GtpcInner>, data: &[u8], peer: SocketAddr) {
     // dispatching is what makes the response correlated rather than merely received:
     // an unmatched response is one this MME did not ask for, and acting on it would
     // let a stray datagram mutate session state.
+    //
+    // #591: a Command (Delete Bearer / Bearer Resource / Modify Bearer Command) is
+    // closed by its triggered message, which may itself be a Request (TS 29.274
+    // §7.6), and only the peer the Command went to can close it.
     let matched = {
         match inner.xact.lock() {
-            Ok(mut xact) => xact.match_response(seq, msg_type),
+            Ok(mut xact) => xact.match_response_from(peer, seq, msg_type),
             Err(_) => None,
         }
     };
@@ -674,7 +678,39 @@ fn handle_datagram(inner: &Arc<GtpcInner>, data: &[u8], peer: SocketAddr) {
     if let Ok(mut states) = inner.peer_state.lock() {
         states.entry(peer).or_insert(GtpPeerState::Active);
     }
+
+    // A retransmitted request is answered with the response already sent for it
+    // (TS 29.274 §7.6) rather than processed again. This matters for a triggered
+    // Delete Bearer Request (#591): the first copy closed the Command and deleted
+    // the bearers, so processing a retransmission again finds nothing and answers
+    // nothing, and the Serving GW would run out its N3.
+    if let Some(cached) = cached_response_for(inner, peer, seq, msg_type) {
+        log::debug!("S11 duplicate request type={msg_type} seq={seq} from {peer}: cached response");
+        if let Err(e) = inner.socket.send_to(&cached, peer) {
+            log::error!("S11 cached response to {peer} failed: {e}");
+        }
+        return;
+    }
     crate::s11_handler::dispatch_initial(data, msg_type, seq, peer);
+}
+
+/// The response this MME already sent for request `msg_type` at (`peer`, `seq`),
+/// if one is cached and it answers that request.
+///
+/// The type check is needed because a sequence number does not name one
+/// transaction on its own: a triggered Request echoes the MME's Command sequence
+/// number, while the Serving GW's own requests use its sequence space (TS 29.274
+/// §7.6), so the same (peer, number) can belong to a Delete Bearer Request and,
+/// seconds later, to an unrelated Downlink Data Notification.
+fn cached_response_for(
+    inner: &Arc<GtpcInner>,
+    peer: SocketAddr,
+    seq: u32,
+    msg_type: u8,
+) -> Option<Bytes> {
+    let expected = nextgcore_gtp::v2::xact::triggered_message_type(msg_type)?;
+    let cached = inner.xact.lock().ok()?.lookup_cached_response(peer, seq)?;
+    (cached.get(1) == Some(&expected)).then_some(cached)
 }
 
 /// Bind the S11 socket from configuration and install it process-wide (#51).
@@ -1678,6 +1714,165 @@ mod tests {
             "an exhausted transaction must not stay outstanding forever"
         );
 
+        server.close();
+    }
+
+    /// Wait until `server` has no outstanding transaction, or two seconds pass.
+    fn wait_until_idle(server: &GtpcServer) {
+        for _ in 0..200 {
+            if server.outstanding() == 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// #591: a Command is closed by its triggered message (TS 29.274 §7.6), so the
+    /// MME stops retransmitting it once the Serving GW has answered. Before #591
+    /// `match_response` knew no Command, so every one below ran out its N3 and
+    /// marked the path failed although the SGW had answered.
+    #[test]
+    fn a_command_stops_retransmitting_once_its_triggered_message_arrives() {
+        let _guard = lock_s11();
+        use s11_build::message_type as mt;
+        for (command, triggered) in [
+            (mt::DELETE_BEARER_COMMAND, mt::DELETE_BEARER_REQUEST),
+            (
+                mt::DELETE_BEARER_COMMAND,
+                mt::DELETE_BEARER_FAILURE_INDICATION,
+            ),
+            (mt::BEARER_RESOURCE_COMMAND, mt::CREATE_BEARER_REQUEST),
+            (mt::BEARER_RESOURCE_COMMAND, mt::UPDATE_BEARER_REQUEST),
+            (mt::BEARER_RESOURCE_COMMAND, mt::DELETE_BEARER_REQUEST),
+            (
+                mt::BEARER_RESOURCE_COMMAND,
+                mt::BEARER_RESOURCE_FAILURE_INDICATION,
+            ),
+            (mt::MODIFY_BEARER_COMMAND, mt::UPDATE_BEARER_REQUEST),
+            (
+                mt::MODIFY_BEARER_COMMAND,
+                mt::MODIFY_BEARER_FAILURE_INDICATION,
+            ),
+        ] {
+            let (server, peer, peer_addr) = spawn_server_and_peer(Gtp2XactConfig {
+                t3_response: Duration::from_millis(150),
+                n3_requests: 2,
+                response_hold: Duration::from_secs(1),
+            });
+            let seq = server.alloc_sequence();
+            let cmd = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(command, 0x99, seq));
+            server.send_request(peer_addr, &cmd, 1).expect("send");
+
+            let mut buf = [0u8; 4096];
+            let (_, from) = peer
+                .recv_from(&mut buf)
+                .expect("the SGW receives the Command");
+            // The triggered message carries the Command's sequence number.
+            let answer = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(triggered, 0x99, seq));
+            peer.send_to(&answer.encode(), from)
+                .expect("the SGW answers");
+            wait_until_idle(&server);
+            assert_eq!(
+                server.outstanding(),
+                0,
+                "type {triggered} must close Command type {command}"
+            );
+
+            // Nothing more arrives: no retransmission of the Command.
+            peer.set_read_timeout(Some(Duration::from_millis(450)))
+                .expect("timeout");
+            let mut retransmitted = 0;
+            while let Ok((len, _)) = peer.recv_from(&mut buf) {
+                if buf[..len].get(1) == Some(&command) {
+                    retransmitted += 1;
+                }
+            }
+            assert_eq!(retransmitted, 0, "Command type {command} retransmitted");
+            assert_ne!(server.peer_state(peer_addr), GtpPeerState::Failed);
+            server.close();
+        }
+    }
+
+    /// The triggered message must come from the peer the Command went to: the
+    /// same sequence number from anyone else closes nothing.
+    #[test]
+    fn a_triggered_message_from_another_peer_does_not_close_the_command() {
+        let _guard = lock_s11();
+        let (server, peer, peer_addr) = spawn_server_and_peer(Gtp2XactConfig::default());
+        let seq = server.alloc_sequence();
+        let cmd = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+            s11_build::message_type::DELETE_BEARER_COMMAND,
+            0x99,
+            seq,
+        ));
+        server.send_request(peer_addr, &cmd, 1).expect("send");
+        let mut buf = [0u8; 4096];
+        peer.recv_from(&mut buf)
+            .expect("the SGW receives the Command");
+
+        let stranger = UdpSocket::bind("127.0.0.1:0").expect("bind");
+        let answer = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+            s11_build::message_type::DELETE_BEARER_REQUEST,
+            0x99,
+            seq,
+        ));
+        stranger
+            .send_to(&answer.encode(), server.local_addr())
+            .expect("send");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(server.outstanding(), 1);
+        server.close();
+    }
+
+    /// #591: a retransmitted request is answered with the response already sent
+    /// for it, and only a request of the type that response answers is: a
+    /// triggered Request reuses the MME's sequence number, so the same (peer,
+    /// number) may later name a Serving GW request of another type.
+    #[test]
+    fn a_retransmitted_request_gets_the_cached_response_of_its_own_type() {
+        let _guard = lock_s11();
+        let (server, peer, peer_addr) = spawn_server_and_peer(Gtp2XactConfig::default());
+        let rsp = s11_build::build_delete_bearer_response_for_ebis(
+            0x99,
+            &[6],
+            GtpCause::RequestAccepted,
+            0x77,
+        )
+        .expect("build");
+        server.send_response(peer_addr, &rsp).expect("send");
+        let mut buf = [0u8; 4096];
+        let (len, _) = peer.recv_from(&mut buf).expect("first response");
+        let first = buf[..len].to_vec();
+
+        // The Serving GW retransmits the Delete Bearer Request: same answer.
+        let dbr = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+            s11_build::message_type::DELETE_BEARER_REQUEST,
+            0x55,
+            0x77,
+        ));
+        peer.send_to(&dbr.encode(), server.local_addr())
+            .expect("send");
+        let (len, _) = peer.recv_from(&mut buf).expect("cached response");
+        assert_eq!(&buf[..len], first.as_slice());
+
+        // A Downlink Data Notification at the same number is not answered with it.
+        let ddn = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+            s11_build::message_type::DOWNLINK_DATA_NOTIFICATION,
+            0x55,
+            0x77,
+        ));
+        peer.set_read_timeout(Some(Duration::from_millis(300)))
+            .expect("timeout");
+        peer.send_to(&ddn.encode(), server.local_addr())
+            .expect("send");
+        if let Ok((len, _)) = peer.recv_from(&mut buf) {
+            assert_ne!(
+                buf.get(1),
+                Some(&s11_build::message_type::DELETE_BEARER_RESPONSE),
+                "a DDN must not be answered with a Delete Bearer Response ({:02x?})",
+                &buf[..len]
+            );
+        }
         server.close();
     }
 
