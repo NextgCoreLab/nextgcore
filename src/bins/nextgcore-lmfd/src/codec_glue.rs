@@ -94,7 +94,10 @@ fn provide_location_r9(msg: &lpp::LPP_Message) -> Option<&lpp::ProvideLocationIn
 }
 
 /// A `RequestLocationInformation` with the given r9 IEs, initiated by this LMF.
-fn request_location(transaction_number: u8, ies: lpp::RequestLocationInformation_r9_IEs) -> lpp::LPP_Message {
+fn request_location(
+    transaction_number: u8,
+    ies: lpp::RequestLocationInformation_r9_IEs,
+) -> lpp::LPP_Message {
     message(
         transaction(lpp::Initiator::LOCATION_SERVER, transaction_number),
         false,
@@ -125,9 +128,9 @@ fn empty_request_ies() -> lpp::RequestLocationInformation_r9_IEs {
 fn ecid_request_ies() -> lpp::RequestLocationInformation_r9_IEs {
     lpp::RequestLocationInformation_r9_IEs {
         ecid_request_location_information: Some(lpp::ECID_RequestLocationInformation {
-            requested_measurements: lpp::ECID_RequestLocationInformationRequestedMeasurements(bits(
-                &[true, true],
-            )),
+            requested_measurements: lpp::ECID_RequestLocationInformationRequestedMeasurements(
+                bits(&[true, true]),
+            ),
         }),
         ..empty_request_ies()
     }
@@ -174,7 +177,6 @@ impl LppMethod {
         }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // #103: MO-LR assistance data (TS 37.355 §5.2, TS 23.273 §6.2)
@@ -281,9 +283,9 @@ pub fn build_lpp_provide_assistance_data(
         // vocabulary the IE has.
         altitude: lpp::EllipsoidPointWithAltitudeAndUncertaintyEllipsoidAltitude(0),
         uncertainty_semi_major:
-            lpp::EllipsoidPointWithAltitudeAndUncertaintyEllipsoidUncertaintySemiMajor(uncertainty.into()),
+            lpp::EllipsoidPointWithAltitudeAndUncertaintyEllipsoidUncertaintySemiMajor(uncertainty),
         uncertainty_semi_minor:
-            lpp::EllipsoidPointWithAltitudeAndUncertaintyEllipsoidUncertaintySemiMinor(uncertainty.into()),
+            lpp::EllipsoidPointWithAltitudeAndUncertaintyEllipsoidUncertaintySemiMinor(uncertainty),
         // A circular uncertainty region, so the major-axis orientation is arbitrary.
         orientation_major_axis:
             lpp::EllipsoidPointWithAltitudeAndUncertaintyEllipsoidOrientationMajorAxis(0),
@@ -359,7 +361,10 @@ pub fn classify_ue_capability(caps: &lpp::ProvideCapabilities) -> UeLppCapabilit
         ) => ies,
         _ => return UeLppCapability::Unknown,
     };
-    if ies.extensions.nr_multi_rtt_provide_capabilities_r16.is_some()
+    if ies
+        .extensions
+        .nr_multi_rtt_provide_capabilities_r16
+        .is_some()
         || ies.extensions.nr_dl_tdoa_provide_capabilities_r16.is_some()
     {
         UeLppCapability::AdvancedMethods
@@ -559,22 +564,28 @@ pub(crate) fn nrrstd_to_signed_ns(r: TimeReport) -> f64 {
     (f64::from(r.v) * pow2(r.k) - 985_024.0) * TC_NS
 }
 
+/// Widen a k-arm's reported integer: the arms are `u16` or `u32` depending on
+/// their range, and the conversion formula wants one type.
+fn wide<T: Into<u32>>(v: T) -> u32 {
+    v.into()
+}
+
 /// The (v, k) of a Multi-RTT UE Rx-Tx time difference.
 fn rx_tx_report(d: &lpp::NR_Multi_RTT_MeasElement_r16Nr_UE_RxTxTimeDiff_r16) -> TimeReport {
     use lpp::NR_Multi_RTT_MeasElement_r16Nr_UE_RxTxTimeDiff_r16 as D;
     let (v, k): (u32, i8) = match d {
-        D::K0_r16(x) => (u32::from(x.0), 0),
-        D::K1_r16(x) => (u32::from(x.0), 1),
-        D::K2_r16(x) => (u32::from(x.0), 2),
-        D::K3_r16(x) => (u32::from(x.0), 3),
-        D::K4_r16(x) => (u32::from(x.0), 4),
-        D::K5_r16(x) => (u32::from(x.0), 5),
-        D::KMinus6_r18(x) => (u32::from(x.0), -6),
-        D::KMinus5_r18(x) => (u32::from(x.0), -5),
-        D::KMinus4_r18(x) => (u32::from(x.0), -4),
-        D::KMinus3_r18(x) => (u32::from(x.0), -3),
-        D::KMinus2_r18(x) => (u32::from(x.0), -2),
-        D::KMinus1_r18(x) => (u32::from(x.0), -1),
+        D::K0_r16(x) => (wide(x.0), 0),
+        D::K1_r16(x) => (wide(x.0), 1),
+        D::K2_r16(x) => (wide(x.0), 2),
+        D::K3_r16(x) => (wide(x.0), 3),
+        D::K4_r16(x) => (wide(x.0), 4),
+        D::K5_r16(x) => (wide(x.0), 5),
+        D::KMinus6_r18(x) => (wide(x.0), -6),
+        D::KMinus5_r18(x) => (wide(x.0), -5),
+        D::KMinus4_r18(x) => (wide(x.0), -4),
+        D::KMinus3_r18(x) => (wide(x.0), -3),
+        D::KMinus2_r18(x) => (wide(x.0), -2),
+        D::KMinus1_r18(x) => (wide(x.0), -1),
     };
     TimeReport { v, k }
 }
@@ -583,18 +594,18 @@ fn rx_tx_report(d: &lpp::NR_Multi_RTT_MeasElement_r16Nr_UE_RxTxTimeDiff_r16) -> 
 fn rstd_report(d: &lpp::NR_DL_TDOA_MeasElement_r16Nr_RSTD_r16) -> TimeReport {
     use lpp::NR_DL_TDOA_MeasElement_r16Nr_RSTD_r16 as D;
     let (v, k): (u32, i8) = match d {
-        D::K0_r16(x) => (u32::from(x.0), 0),
-        D::K1_r16(x) => (u32::from(x.0), 1),
-        D::K2_r16(x) => (u32::from(x.0), 2),
-        D::K3_r16(x) => (u32::from(x.0), 3),
-        D::K4_r16(x) => (u32::from(x.0), 4),
-        D::K5_r16(x) => (u32::from(x.0), 5),
-        D::KMinus6_r18(x) => (u32::from(x.0), -6),
-        D::KMinus5_r18(x) => (u32::from(x.0), -5),
-        D::KMinus4_r18(x) => (u32::from(x.0), -4),
-        D::KMinus3_r18(x) => (u32::from(x.0), -3),
-        D::KMinus2_r18(x) => (u32::from(x.0), -2),
-        D::KMinus1_r18(x) => (u32::from(x.0), -1),
+        D::K0_r16(x) => (wide(x.0), 0),
+        D::K1_r16(x) => (wide(x.0), 1),
+        D::K2_r16(x) => (wide(x.0), 2),
+        D::K3_r16(x) => (wide(x.0), 3),
+        D::K4_r16(x) => (wide(x.0), 4),
+        D::K5_r16(x) => (wide(x.0), 5),
+        D::KMinus6_r18(x) => (wide(x.0), -6),
+        D::KMinus5_r18(x) => (wide(x.0), -5),
+        D::KMinus4_r18(x) => (wide(x.0), -4),
+        D::KMinus3_r18(x) => (wide(x.0), -3),
+        D::KMinus2_r18(x) => (wide(x.0), -2),
+        D::KMinus1_r18(x) => (wide(x.0), -1),
     };
     TimeReport { v, k }
 }
@@ -666,7 +677,8 @@ pub fn lpp_ecid_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMeasu
         return vec![];
     };
     let mut out = Vec::with_capacity(
-        sig.measured_results_list.0.len() + usize::from(sig.primary_cell_measured_results.is_some()),
+        sig.measured_results_list.0.len()
+            + usize::from(sig.primary_cell_measured_results.is_some()),
     );
     if let Some(primary) = sig.primary_cell_measured_results.as_ref() {
         out.push(measured_results_element_to_cell(primary));
@@ -702,7 +714,11 @@ pub fn decode_lpp_ecid_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasurement>
 /// carries no `nr-Multi-RTT` body, or its signal measurement information is absent.
 pub fn lpp_multi_rtt_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMeasurement> {
     let Some(sig) = provide_location_r9(msg)
-        .and_then(|ies| ies.extensions.nr_multi_rtt_provide_location_information_r16.as_ref())
+        .and_then(|ies| {
+            ies.extensions
+                .nr_multi_rtt_provide_location_information_r16
+                .as_ref()
+        })
         .and_then(|m| m.nr_multi_rtt_signal_measurement_information_r16.as_ref())
     else {
         return vec![];
@@ -767,7 +783,11 @@ pub fn decode_lpp_multi_rtt_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasure
 /// carries no `nr-DL-TDOA` signal-measurement information.
 pub fn lpp_dl_tdoa_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMeasurement> {
     let Some(sig) = provide_location_r9(msg)
-        .and_then(|ies| ies.extensions.nr_dl_tdoa_provide_location_information_r16.as_ref())
+        .and_then(|ies| {
+            ies.extensions
+                .nr_dl_tdoa_provide_location_information_r16
+                .as_ref()
+        })
         .and_then(|m| m.nr_dl_tdoa_signal_measurement_information_r16.as_ref())
     else {
         return vec![];
@@ -917,7 +937,8 @@ mod tests {
     use super::{
         build_lpp_ecid_request, decode_lpp_ecid_report, decode_lpp_provide_report,
         decode_nrppa_ecid_report, extract_lpp_request_id, lpp_dl_tdoa_provide_to_measurements,
-        lpp_multi_rtt_provide_to_measurements, nrrstd_to_ns, nrrstd_to_signed_ns, TimeReport, TC_NS,
+        lpp_multi_rtt_provide_to_measurements, nrrstd_to_ns, nrrstd_to_signed_ns, TimeReport,
+        TC_NS,
     };
 
     /// A hand-written test message on the generated codec, through the wire: the
@@ -1263,7 +1284,7 @@ mod tests {
         assert_eq!(nrrstd_to_signed_ns(TimeReport { v: 985_024, k: 0 }), 0.0);
         assert_eq!(nrrstd_to_signed_ns(TimeReport { v: 246_256, k: 2 }), 0.0); // 985024/4
         assert_eq!(nrrstd_to_signed_ns(TimeReport { v: 30_782, k: 5 }), 0.0); // 985024/32
-                                                                   // One k0 code = ±T_c around the midpoint (sign carried by the offset).
+                                                                              // One k0 code = ±T_c around the midpoint (sign carried by the offset).
         assert!((nrrstd_to_signed_ns(TimeReport { v: 985_025, k: 0 }) - TC_NS).abs() < 1e-9);
         assert!((nrrstd_to_signed_ns(TimeReport { v: 985_023, k: 0 }) + TC_NS).abs() < 1e-9);
         // Endpoints span ≈ ±501 µs.
