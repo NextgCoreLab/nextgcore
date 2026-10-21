@@ -8405,7 +8405,8 @@ impl NgapServer {
             },
         };
 
-        match nextgcore_ngap::builder::build_handover_request(&ho_request) {
+        // #417: the GENERATED codec.
+        match crate::ngap_asn1::build_handover_request_generated(&ho_request).ok_or(()) {
             Ok(bytes) => {
                 self.send_to_association(target_assoc, &bytes).await?;
                 log::info!(
@@ -8414,8 +8415,8 @@ impl NgapServer {
                     required.amf_ue_ngap_id
                 );
             }
-            Err(e) => {
-                log::error!("Failed to build HandoverRequest: {e}");
+            Err(()) => {
+                log::error!("Failed to build HandoverRequest");
                 let failure = nextgcore_ngap::types::HandoverPreparationFailure {
                     amf_ue_ngap_id: required.amf_ue_ngap_id,
                     ran_ue_ngap_id: required.ran_ue_ngap_id,
@@ -8609,16 +8610,30 @@ impl NgapServer {
         association_id: u64,
         data: &[u8],
     ) -> Result<()> {
-        let ack = match nextgcore_ngap::parser::decode_ngap_pdu(data) {
-            Ok(nextgcore_ngap::NgapMessage::HandoverRequestAcknowledge(a)) => a,
-            Ok(other) => {
-                log::warn!("Expected HandoverRequestAcknowledge, decoded {other:?}");
+        // #417: the GENERATED codec, TS 38.413 §10.3.4.2 for a response.
+        let ack = match crate::ngap_asn1::decode_handover_request_acknowledge_asn1(data) {
+            crate::ngap_asn1::NasTransportDecode::Proceed {
+                message,
+                error_indication,
+            } => {
+                if let Some(report) = error_indication {
+                    if let Some(ei) =
+                        crate::ngap_asn1::build_criticality_error_indication_asn1(&report)
+                    {
+                        self.send_to_association(association_id, &ei).await?;
+                    }
+                }
+                message
+            }
+            crate::ngap_asn1::NasTransportDecode::Reject(report) => {
+                // A response: local error handling only (§10.3.4.2).
+                log::warn!(
+                    "HandoverRequestAcknowledge from association {association_id} \
+                     not comprehended: {report:?}"
+                );
                 return Ok(());
             }
-            Err(e) => {
-                log::error!("Failed to decode HandoverRequestAcknowledge: {e}");
-                return Ok(());
-            }
+            crate::ngap_asn1::NasTransportDecode::Undecodable => return Ok(()),
         };
         log::info!(
             "HandoverRequestAcknowledge from association {association_id} \
@@ -8673,7 +8688,7 @@ impl NgapServer {
             release_list: None,
             target_to_source_container: ack.target_to_source_container.clone(),
         };
-        match nextgcore_ngap::builder::build_handover_command(&command) {
+        match crate::ngap_asn1::build_handover_command_generated(&command).ok_or(()) {
             Ok(bytes) => {
                 self.send_to_association(source_assoc, &bytes).await?;
                 log::info!(
@@ -8699,7 +8714,7 @@ impl NgapServer {
                     );
                 }
             }
-            Err(e) => log::error!("Failed to build HandoverCommand: {e}"),
+            Err(()) => log::error!("Failed to build HandoverCommand"),
         }
         Ok(())
     }
@@ -8725,16 +8740,27 @@ impl NgapServer {
         association_id: u64,
         data: &[u8],
     ) -> Result<Option<u64>> {
-        let transfer = match nextgcore_ngap::parser::decode_ngap_pdu(data) {
-            Ok(nextgcore_ngap::NgapMessage::UplinkRanStatusTransfer(t)) => t,
-            Ok(other) => {
-                log::warn!("Expected UplinkRanStatusTransfer, decoded {other:?}");
+        // #417: the GENERATED codec, TS 38.413 §10.3.4.2 for a Class 2
+        // message with no response.
+        let transfer = match crate::ngap_asn1::decode_uplink_ran_status_transfer_asn1(data) {
+            crate::ngap_asn1::NasTransportDecode::Proceed {
+                message,
+                error_indication,
+            } => {
+                if let Some(report) = error_indication {
+                    self.send_criticality_error_indication(association_id, &report)
+                        .await?;
+                }
+                message
+            }
+            crate::ngap_asn1::NasTransportDecode::Reject(report) => {
+                self.send_criticality_error_indication(association_id, &report)
+                    .await?;
                 return Ok(None);
             }
-            Err(e) => {
+            crate::ngap_asn1::NasTransportDecode::Undecodable => {
                 log::warn!(
-                    "Failed to decode UplinkRANStatusTransfer from association \
-                     {association_id}: {e}"
+                    "Failed to decode UplinkRANStatusTransfer from association {association_id}"
                 );
                 return Ok(None);
             }
@@ -8767,12 +8793,7 @@ impl NgapServer {
         // handover — see handle_handover_required). If target-side id allocation
         // is ever added, this is the site that has to substitute it, and sending
         // the source's id would then point the target at the wrong UE.
-        let downlink = nextgcore_ngap::types::RanStatusTransfer {
-            amf_ue_ngap_id: transfer.amf_ue_ngap_id,
-            ran_ue_ngap_id: transfer.ran_ue_ngap_id,
-            container: transfer.container.clone(),
-        };
-        match nextgcore_ngap::builder::build_downlink_ran_status_transfer(&downlink) {
+        match crate::ngap_asn1::build_downlink_ran_status_transfer_generated(&transfer).ok_or(()) {
             Ok(bytes) => {
                 // A failed send to the TARGET is not a reason to abort handling of
                 // the SOURCE's association, so it is logged rather than propagated.
@@ -8787,17 +8808,18 @@ impl NgapServer {
                     );
                 } else {
                     log::info!(
-                        "Relayed RAN status ({} container bytes) for UE {} from association \
+                        "Relayed RAN status ({} DRBs) for UE {} from association \
                          {association_id} to handover target {target_assoc}",
-                        transfer.container.len(),
+                        transfer
+                            .container
+                            .dr_bs_subject_to_status_transfer_list
+                            .0
+                            .len(),
                         transfer.amf_ue_ngap_id
                     );
                 }
             }
-            Err(e) => {
-                log::error!("Failed to build DownlinkRANStatusTransfer: {e}");
-                return Ok(None);
-            }
+            Err(()) => return Ok(None),
         }
         Ok(Some(target_assoc))
     }
@@ -17673,7 +17695,12 @@ mod tests {
             &nextgcore_ngap::types::RanStatusTransfer {
                 amf_ue_ngap_id,
                 ran_ue_ngap_id,
-                container: vec![0x00, 0x11, 0x22, 0x33, 0x44],
+                // A valid RANStatusTransfer-TransparentContainer (one DRB, 12-bit
+                // COUNTs): since #417 the AMF decodes it (§9.3.1.31 is a
+                // SEQUENCE) instead of relaying opaque octets.
+                container: vec![
+                    0x00, 0x00, 0x00, 0x01, 0x23, 0x00, 0x45, 0x00, 0x04, 0x56, 0x00, 0x78,
+                ],
             },
         )
         .expect("build UplinkRANStatusTransfer")
