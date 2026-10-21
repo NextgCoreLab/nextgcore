@@ -1,0 +1,31 @@
+[package]
+name = "nextgcore-ucmfd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore UCMF (UE radio Capability Management Function, TS 23.501 5.4.4.1a / TS 29.673 / TS 29.675)"
+
+[[bin]]
+name = "nextgcore-ucmfd"
+path = "src/main.rs"
+
+[dependencies]
+nextgcore-core = { workspace = true }
+nextgcore-sbi = { workspace = true }
+nextgcore-metrics = { workspace = true }
+log.workspace = true
+env_logger.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_yaml.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+ctrlc.workspace = true
+base64.workspace = true
+bytes.workspace = true
+chrono = "0.4"
+
+[lints]
+workspace = true
