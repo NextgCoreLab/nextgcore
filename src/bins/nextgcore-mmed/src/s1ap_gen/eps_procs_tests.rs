@@ -1024,6 +1024,39 @@ fn an_eps_to_5gs_handover_runs_against_the_amfs_own_n26_codec() {
         "a cancelled handover gets no HANDOVER COMMAND"
     );
 
+    // #592: and the AMF is told (TS 23.502 §4.11.1.2.3 step 2). amfd's own parser
+    // reads the Relocation Cancel Request; the AMF had not answered, so mmed has no
+    // AMF TEID and the header TEID is 0 (TS 29.274 §5.5.2).
+    let rcr = recv_fresh(&amf_sock, &mut seen);
+    assert_eq!(rcr.header.message_type, 139, "Relocation Cancel Request");
+    let parsed = amf::parse_relocation_cancel_request(&rcr);
+    assert_eq!(parsed.imsi.as_deref(), Some("001010123456789"));
+    assert_eq!(parsed.amf_teid, 0);
+    // amfd's Relocation Cancel Response closes mmed's request.
+    let n26 = crate::n26_path::server().expect("installed");
+    let before = n26.outstanding();
+    amf_sock
+        .send_to(
+            &amf::build_relocation_cancel_response(
+                rcr.header.sequence_number,
+                crate::n26_path::eps_to_5gs_local_teid(mme_ue_id),
+                16,
+            )
+            .encode(),
+            n26.local_addr(),
+        )
+        .unwrap();
+    for _ in 0..200 {
+        if n26.outstanding() < before {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        n26.outstanding() < before,
+        "the Relocation Cancel Response closes the request"
+    );
+
     crate::n26_path::set_for_test(false);
 }
 
@@ -1071,5 +1104,178 @@ fn a_delete_bearer_request_names_its_dedicated_ebis_or_its_linked_ebi() {
     assert_eq!(
         crate::s11_handler::delete_bearer_request_ebis(&encode(&[(0, 5)])),
         vec![5]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #593: a Location Report reaches the PDN GW that asked (TS 23.401 §5.9.2)
+// ---------------------------------------------------------------------------
+
+/// `ue_with_bearers` plus an SGW S11 context and an IMSI, so a Change
+/// Notification Request can be built. Returns (mme_ue_id, mme, enb, sess_id).
+fn ue_with_sgw(ctx: &MmeContext, enb_id: u64) -> (u64, u32, u32, u64) {
+    let (_, mme_ue_id, mme, enb, _) = ue_with_bearers(ctx, enb_id);
+    let sgw_ue_id = ctx.sgw_ue_add(1);
+    ctx.sgw_ue_pool
+        .write()
+        .unwrap()
+        .get_mut(&sgw_ue_id)
+        .unwrap()
+        .sgw_s11_teid = 0x5911;
+    let sess_id = {
+        let mut pool = ctx.mme_ue_pool.write().unwrap();
+        let ue = pool.get_mut(&mme_ue_id).unwrap();
+        ue.sgw_ue_id = sgw_ue_id;
+        ue.imsi[..8].copy_from_slice(&[0x00, 0x01, 0x01, 0x21, 0x43, 0x65, 0x87, 0xF9]);
+        ue.imsi_len = 8;
+        ue.rat_type = 6;
+        ue.sess_list[0]
+    };
+    (mme_ue_id, mme, enb, sess_id)
+}
+
+fn change_notifications_built() -> Vec<nextgcore_gtp::v2::Gtp2Message> {
+    crate::gtp_path::CHANGE_NOTIFICATIONS_BUILT
+        .lock()
+        .unwrap()
+        .drain(..)
+        .collect()
+}
+
+#[test]
+fn a_location_report_is_forwarded_to_the_pdn_gw_that_asked() {
+    use nextgcore_gtp::v2::Gtp2IeType as T;
+    let _guard = crate::gtp_path::lock_s11();
+    let (ctx, enb_id) = setup();
+    let (mme_ue_id, mme, enb, sess_id) = ue_with_sgw(&ctx, enb_id);
+    change_notifications_built();
+
+    // No Change Reporting Action: the report is stored, nothing is sent.
+    assert!(handle_s1ap_message(&ctx, enb_id, &location_report(mme, enb)).is_empty());
+    assert!(change_notifications_built().is_empty());
+
+    // The PDN GW asks for ECGI reporting (Create Session Response).
+    let lrc = crate::s11_handler::apply_change_reporting_action(
+        &ctx,
+        mme_ue_id,
+        &[sess_id],
+        Some(crate::s11_handler::change_reporting_action::START_REPORTING_ECGI),
+    );
+    assert!(lrc.is_some(), "the eNB is asked to report");
+    assert_eq!(
+        ctx.sess_find_by_id(sess_id)
+            .unwrap()
+            .change_reporting_action,
+        Some(4)
+    );
+
+    // Same cell again: no change, nothing sent.
+    assert!(handle_s1ap_message(&ctx, enb_id, &location_report(mme, enb)).is_empty());
+    assert!(change_notifications_built().is_empty());
+
+    // A new cell: one Change Notification Request for that PDN connection.
+    ctx.mme_ue_pool
+        .write()
+        .unwrap()
+        .get_mut(&mme_ue_id)
+        .unwrap()
+        .e_cgi
+        .cell_id = 0x77;
+    assert!(handle_s1ap_message(&ctx, enb_id, &location_report(mme, enb)).is_empty());
+    let built = change_notifications_built();
+    assert_eq!(built.len(), 1);
+    let cnr = &built[0];
+    assert_eq!(cnr.header.message_type, 38);
+    assert_eq!(cnr.header.teid, Some(0x5911));
+    assert_eq!(
+        cnr.get_ie(T::Imsi as u8, 0).unwrap().value.as_ref(),
+        &[0x00, 0x01, 0x01, 0x21, 0x43, 0x65, 0x87, 0xF9]
+    );
+    assert_eq!(
+        cnr.get_ie(T::RatType as u8, 0).unwrap().value.as_ref(),
+        &[6]
+    );
+    let uli = cnr.get_ie(T::Uli as u8, 0).unwrap().value.clone();
+    assert_eq!(uli[0], 0x18, "TAI and ECGI present");
+    assert_eq!(&uli[4..6], &0x0102u16.to_be_bytes(), "the reported TAC");
+    assert_eq!(&uli[9..13], &0xABCDEu32.to_be_bytes(), "the reported cell");
+    assert_eq!(
+        cnr.get_ie(T::Ebi as u8, 0).unwrap().value.as_ref(),
+        &[5],
+        "LBI: the default bearer"
+    );
+    assert_eq!(
+        cnr.get_ie(74, 0).unwrap().value.as_ref(),
+        &[10, 0, 0, 4],
+        "the PGW S5/S8-C address names the PDN connection"
+    );
+}
+
+#[test]
+fn only_the_change_the_pdn_gw_asked_for_is_reported() {
+    use crate::s11_handler::{change_reporting_action as a, sessions_to_notify};
+    let (ctx, enb_id) = setup();
+    let (mme_ue_id, _, _, sess_id) = ue_with_sgw(&ctx, enb_id);
+    let set = |action: Option<u8>| {
+        ctx.sess_pool
+            .write()
+            .unwrap()
+            .get_mut(&sess_id)
+            .unwrap()
+            .change_reporting_action = action;
+    };
+    // (action, tai_changed, ecgi_changed, notified)
+    for (action, tai, ecgi, notified) in [
+        (None, true, true, false),
+        (Some(a::STOP_REPORTING), true, true, false),
+        (Some(a::START_REPORTING_ECGI), false, true, true),
+        (Some(a::START_REPORTING_ECGI), true, false, false),
+        (Some(a::START_REPORTING_TAI), true, false, true),
+        (Some(a::START_REPORTING_TAI), false, true, false),
+        (Some(a::START_REPORTING_TAI_AND_ECGI), false, true, true),
+        (Some(a::START_REPORTING_TAI_AND_ECGI), true, false, true),
+        (Some(a::START_REPORTING_TAI_AND_ECGI), false, false, false),
+        (Some(1), true, true, false),
+    ] {
+        set(action);
+        assert_eq!(
+            !sessions_to_notify(&ctx, mme_ue_id, tai, ecgi).is_empty(),
+            notified,
+            "action {action:?} tai {tai} ecgi {ecgi}"
+        );
+    }
+}
+
+/// A "stop" from one PDN GW does not stop the eNB reporting another still
+/// wants.
+#[test]
+fn a_stop_from_one_pdn_gw_keeps_reporting_for_another() {
+    use crate::s11_handler::{apply_change_reporting_action, change_reporting_action as a};
+    let (ctx, enb_id) = setup();
+    let (mme_ue_id, _, _, sess_a) = ue_with_sgw(&ctx, enb_id);
+    let sess_b = ctx.sess_add(mme_ue_id, 2);
+    ctx.mme_ue_pool
+        .write()
+        .unwrap()
+        .get_mut(&mme_ue_id)
+        .unwrap()
+        .sess_list
+        .push(sess_b);
+    assert!(apply_change_reporting_action(
+        &ctx,
+        mme_ue_id,
+        &[sess_a, sess_b],
+        Some(a::START_REPORTING_ECGI)
+    )
+    .is_some());
+    assert!(
+        apply_change_reporting_action(&ctx, mme_ue_id, &[sess_a], Some(a::STOP_REPORTING))
+            .is_none(),
+        "session B still wants ECGI changes"
+    );
+    assert!(
+        apply_change_reporting_action(&ctx, mme_ue_id, &[sess_b], Some(a::STOP_REPORTING))
+            .is_some(),
+        "the last stop stops the eNB"
     );
 }

@@ -984,6 +984,11 @@ pub struct HandoverInfo {
     /// #475: the PDR this handover created for the N3 uplink at step 6, removed again on
     /// CANCELLED.
     pub n3_ul_pdr_id: Option<u16>,
+    /// #583: the AMF indicated direct data forwarding (TS 29.502 `directForwardingFlag`).
+    pub direct_data_forwarding: bool,
+    /// #583: the EPS bearers whose indirect forwarding tunnel this handover installed at the
+    /// UPF (TS 23.502 §4.11.1.2.2.2 step 12), released by the step-14 timer or on CANCELLED.
+    pub forwarding_ebis: Vec<u8>,
 }
 
 /// Charging info
@@ -1043,6 +1048,9 @@ pub struct SmfSess {
     pub sm_data: SmData,
     /// EPC or 5GC mode
     pub epc: bool,
+    /// #582: the FARs this SMF created for the additional NG-U tunnels of a split PDU
+    /// session (dual connectivity, TS 38.413 §8.2.5), replaced on the next indication.
+    pub dc_tunnel_fars: Vec<u32>,
     /// SBI features
     pub smpolicycontrol_features: u64,
     /// SMF N4 TEID
@@ -1209,6 +1217,7 @@ impl SmfSess {
             index,
             sm_data: SmData::default(),
             epc: false,
+            dc_tunnel_fars: Vec::new(),
             smpolicycontrol_features: 0,
             smf_n4_teid: 0,
             sgw_s5c_teid: 0,

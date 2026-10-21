@@ -869,6 +869,45 @@ pub fn build_forward_relocation_response_refusal(
     msg
 }
 
+/// A decoded **Relocation Cancel Request** (TS 29.274 §7.3.16, type 139), #592.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelocationCancel {
+    /// The UE's IMSI digits (Table 7.3.16-1: present unless an emergency UICC-less UE).
+    pub imsi: Option<String>,
+    /// The header TEID: this AMF's N26 TEID when the MME had it from the Forward
+    /// Relocation Response, else 0 (§5.5.2).
+    pub amf_teid: u32,
+}
+
+/// Decode a Relocation Cancel Request (#592). Nothing in Table 7.3.16-1 is mandatory,
+/// so this cannot fail on content; the caller decides what an IMSI-less one names.
+pub fn parse_relocation_cancel_request(msg: &Gtp2Message) -> RelocationCancel {
+    let imsi = msg
+        .get_ie(Gtp2IeType::Imsi as u8, 0)
+        .map(|ie| tbcd_to_digits(&ie.value))
+        .filter(|d| !d.is_empty());
+    RelocationCancel {
+        imsi,
+        amf_teid: msg.header.teid.unwrap_or(0),
+    }
+}
+
+/// Build a **Relocation Cancel Response** (TS 29.274 §7.3.17, type 140), #592: the Cause
+/// alone (Table 7.3.17-1), addressed to the MME's TEID when this AMF has it, else 0 (§5.5.2).
+pub fn build_relocation_cancel_response(
+    sequence_number: u32,
+    mme_teid: u32,
+    cause: u8,
+) -> Gtp2Message {
+    let mut msg = Gtp2Message::new(Gtp2Header::new(
+        Gtp2MessageType::RelocationCancelResponse as u8,
+        mme_teid,
+        sequence_number,
+    ));
+    msg.add_ie(Gtp2CauseIe::new(cause).to_ie(0));
+    msg
+}
+
 /// Build a **Forward Relocation Complete Notification** (§7.3.3, type 135) to the source MME.
 ///
 /// Table 7.3.3-1 has no mandatory IE, and none of the Indication's three flags applies to an

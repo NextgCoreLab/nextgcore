@@ -24,7 +24,6 @@ arbitrary = { version = "1", features = ["derive"] }
 nextgcore-pfcp = { path = "../libs/nextgcore-pfcp" }
 nextgcore-gtp = { path = "../libs/nextgcore-gtp" }
 nextgcore-nas = { path = "../libs/nextgcore-nas" }
-nextgcore-ngap = { path = "../libs/nextgcore-ngap" }
 nextgcore-ngap-gen = { path = "../libs/nextgcore-ngap-gen" }
 nextgcore-s1ap-gen = { path = "../libs/nextgcore-s1ap-gen" }
 nextgcore-nrppa-gen = { path = "../libs/nextgcore-nrppa-gen" }

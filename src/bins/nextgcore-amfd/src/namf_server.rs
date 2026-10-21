@@ -8101,7 +8101,8 @@ mod tests {
 
     /// A known SUPI + a full DeregistrationData (UE_INITIAL_REGISTRATION,
     /// 3GPP_ACCESS) POSTed through the real router -> 204 and exactly one
-    /// network-initiated dereg enqueued with reregistration_required=true.
+    /// deregistration enqueued, LOCAL (#602): a new AMF serves the UE, so no
+    /// DEREGISTRATION REQUEST is to be sent (TS 23.502 §4.2.2.2.2 step 14d).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_dereg_notify_callback_204_enqueues_event() {
         let _serial = dereg_queue_test_lock().lock().await;
@@ -8118,11 +8119,15 @@ mod tests {
         let queued = drain_network_deregs_for(ue.id);
         assert_eq!(queued.len(), 1, "exactly one dereg event enqueued");
         assert_eq!(queued[0].amf_ue_ngap_id, ue.id);
-        assert!(queued[0].reregistration_required);
+        assert!(
+            queued[0].local,
+            "UE_INITIAL_REGISTRATION is a local deregistration (#602)"
+        );
+        assert!(!queued[0].reregistration_required);
         assert_eq!(queued[0].gmm_cause, None);
     }
 
-    /// SUBSCRIPTION_WITHDRAWN -> reregistration_required=false.
+    /// SUBSCRIPTION_WITHDRAWN -> reregistration_required=false, and signalled.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_dereg_notify_callback_subscription_withdrawn_no_rereg() {
         let _serial = dereg_queue_test_lock().lock().await;
@@ -8138,6 +8143,7 @@ mod tests {
         let queued = drain_network_deregs_for(ue.id);
         assert_eq!(queued.len(), 1);
         assert!(!queued[0].reregistration_required);
+        assert!(!queued[0].local, "the UE is still told it is deregistered");
     }
 
     /// #580: REREGISTRATION_REQUIRED through the real router -> 204 and one
@@ -8164,26 +8170,31 @@ mod tests {
             queued[0].reregistration_required,
             "REREGISTRATION_REQUIRED must ask the UE to re-register"
         );
+        assert!(!queued[0].local, "which takes a DEREGISTRATION REQUEST");
         assert_eq!(queued[0].gmm_cause, None);
     }
 
-    /// #580: every TS 29.503 reason the AMF parses, mapped to whether the UE is
-    /// asked to re-register. Exactly the two re-registration reasons say yes.
+    /// #580 / #602: every TS 29.503 reason the AMF parses, mapped to what the AMF
+    /// does with it: ask the UE to re-register, deregister it LOCALLY without any NAS,
+    /// or send a plain network-initiated DEREGISTRATION REQUEST.
     #[test]
-    fn only_the_two_re_registration_reasons_ask_the_ue_to_re_register() {
+    fn each_dereg_reason_maps_to_reregister_local_or_signalled() {
+        use crate::namf_handler::dereg_reason_is_local as local;
         use crate::namf_handler::dereg_reason_requires_reregistration as rereg;
+        // (wire reason, re-registration required, local)
         let table = [
-            ("UE_INITIAL_REGISTRATION", true),
-            ("REREGISTRATION_REQUIRED", true),
-            ("UE_REGISTRATION_AREA_CHANGE", false),
-            ("SUBSCRIPTION_WITHDRAWN", false),
-            ("5GS_TO_EPS_MOBILITY", false),
-            ("5GS_TO_EPS_MOBILITY_UE_INITIAL_REGISTRATION", false),
-            ("SMF_CONTEXT_TRANSFERRED", false),
+            ("UE_INITIAL_REGISTRATION", false, true),
+            ("REREGISTRATION_REQUIRED", true, false),
+            ("UE_REGISTRATION_AREA_CHANGE", false, false),
+            ("SUBSCRIPTION_WITHDRAWN", false, false),
+            ("5GS_TO_EPS_MOBILITY", false, false),
+            ("5GS_TO_EPS_MOBILITY_UE_INITIAL_REGISTRATION", false, false),
+            ("SMF_CONTEXT_TRANSFERRED", false, false),
         ];
-        for (wire, expected) in table {
+        for (wire, expected_rereg, expected_local) in table {
             let reason = parse_dereg_reason(wire).expect("a TS 29.503 reason the AMF parses");
-            assert_eq!(rereg(reason), expected, "{wire}");
+            assert_eq!(rereg(reason), expected_rereg, "{wire}: re-registration");
+            assert_eq!(local(reason), expected_local, "{wire}: local");
         }
     }
 

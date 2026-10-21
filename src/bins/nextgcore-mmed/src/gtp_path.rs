@@ -1327,6 +1327,114 @@ pub fn send_modify_bearer_request_for_erab_modification(
     Ok(seq)
 }
 
+// ============================================================================
+// Location change reporting (#593, TS 23.401 §5.9.2)
+// ============================================================================
+
+/// Change Notification Requests waiting for their response, keyed by S11
+/// sequence number: the PDN connection each one reported, so the response's
+/// Change Reporting Action lands on the right one. Taken by the response, the
+/// shape `PENDING_ERAB_MODIFICATIONS` has.
+static PENDING_CHANGE_NOTIFICATIONS: OnceLock<Mutex<HashMap<u32, u64>>> = OnceLock::new();
+
+fn pending_change_notifications() -> &'static Mutex<HashMap<u32, u64>> {
+    PENDING_CHANGE_NOTIFICATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Take the session the Change Notification Request at `seq` reported.
+pub fn take_pending_change_notification(seq: u32) -> Option<u64> {
+    pending_change_notifications().lock().ok()?.remove(&seq)
+}
+
+/// Change Notification Requests built for sending, newest last. Test-only;
+/// declared beside the map it shadows, callers hold [`S11_TEST_LOCK`]. A test of
+/// the S1 side cannot install the process-wide S11 server (a `OnceLock` owned by
+/// `nas_dispatch`'s test), so this is how it sees what the handler sent.
+#[cfg(test)]
+pub(crate) static CHANGE_NOTIFICATIONS_BUILT: Mutex<Vec<Gtp2Message>> = Mutex::new(Vec::new());
+
+/// Build the Change Notification Request for PDN connection `sess_id` of
+/// `mme_ue_id` (TS 29.274 §7.3.14), numbered `seq`.
+pub fn change_notification_request(
+    ctx: &MmeContext,
+    mme_ue_id: u64,
+    sess_id: u64,
+    seq: u32,
+) -> GtpPathResult<Gtp2Message> {
+    let mme_ue = ctx
+        .mme_ue_find_by_id(mme_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let sgw_ue = ctx
+        .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let sess = ctx
+        .sess_find_by_id(sess_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let lbi = default_bearer_ebi(ctx, &sess).ok_or_else(|| {
+        GtpPathError::InvalidState(format!("session {sess_id} has no default bearer"))
+    })?;
+    let msg = s11_build::build_change_notification_request(&mme_ue, &sgw_ue, &sess, lbi, seq)
+        .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
+    #[cfg(test)]
+    if let Ok(mut built) = CHANGE_NOTIFICATIONS_BUILT.lock() {
+        built.push(msg.clone());
+    }
+    Ok(msg)
+}
+
+/// Send the Change Notification Request for `sess_id` on `server` to `peer`
+/// and park the session until the response (#593). Returns the sequence number.
+pub fn send_change_notification_on(
+    server: &GtpcServer,
+    peer: SocketAddr,
+    ctx: &MmeContext,
+    mme_ue_id: u64,
+    sess_id: u64,
+) -> GtpPathResult<u32> {
+    let seq = server.alloc_sequence();
+    let msg = change_notification_request(ctx, mme_ue_id, sess_id, seq)?;
+    // Recorded before the send (the #359 lesson): a response can race the
+    // return of `send_to`.
+    if let Ok(mut map) = pending_change_notifications().lock() {
+        map.insert(seq, sess_id);
+    }
+    if let Err(e) = server.send_request(peer, &msg, sess_id) {
+        take_pending_change_notification(seq);
+        return Err(GtpPathError::SocketError(e));
+    }
+    Ok(seq)
+}
+
+/// Tell each PDN GW that asked for it where the UE now is (TS 23.401 §5.9.2):
+/// one Change Notification Request per PDN connection in `sess_ids`, to the
+/// configured Serving GW. Failures are logged per PDN connection.
+pub fn send_change_notifications(ctx: &MmeContext, mme_ue_id: u64, sess_ids: &[u64]) {
+    for sess_id in sess_ids {
+        let sent = match (server(), ctx.sgwc_list.first()) {
+            (Some(server), Some(peer)) => {
+                send_change_notification_on(server, *peer, ctx, mme_ue_id, *sess_id)
+            }
+            _ => {
+                // Still built, so a test of the S1 side sees what would go out.
+                change_notification_request(ctx, mme_ue_id, *sess_id, 0).and(Err(
+                    GtpPathError::SocketError(
+                        "no S11 socket bound or no Serving GW peer configured".to_string(),
+                    ),
+                ))
+            }
+        };
+        match sent {
+            Ok(seq) => log::info!(
+                "S11 Change Notification Request seq={seq} for UE {mme_ue_id} session {sess_id}"
+            ),
+            Err(e) => log::error!(
+                "S11 Change Notification Request for UE {mme_ue_id} session {sess_id} not sent: \
+                 {e:?}"
+            ),
+        }
+    }
+}
+
 /// Send a Delete Bearer Command (TS 29.274 §7.2.17.1) for dedicated bearers the
 /// eNB released (#584, TS 23.401 §5.4.4.2 step 2). Returns the sequence number.
 pub fn send_delete_bearer_command(

@@ -1859,7 +1859,7 @@ mod tests {
             // The delete must retract it, at the TS 29.514 §4.2.5 custom operation
             // rather than as an HTTP DELETE.
             seen.lock().unwrap_or_else(|e| e.into_inner()).clear();
-            let deleted = tsctsf_sbi_request_handler(SbiRequest::delete(&format!(
+            let deleted = tsctsf_sbi_request_handler(SbiRequest::delete(format!(
                 "/ntsctsf-time-synchronization/v1/configuration/{config_id}"
             )))
             .await;
@@ -2125,7 +2125,7 @@ mod tests {
         assert_eq!(body["configId"], serde_json::json!(config_id));
 
         // The stored record actually changed, not just the response.
-        let fetched = block_on(tsctsf_sbi_request_handler(SbiRequest::get(&format!(
+        let fetched = block_on(tsctsf_sbi_request_handler(SbiRequest::get(format!(
             "/ntsctsf-time-synchronization/v1/configuration/{config_id}"
         ))));
         assert_eq!(fetched.status, 200);
@@ -2237,6 +2237,7 @@ mod tests {
     /// URI with the updated body — asserted by observing the HTTP request, not a
     /// log line.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn a_config_update_notifies_the_registered_target() {
         let _g = lock_globals();
         reset_context();
@@ -2287,6 +2288,7 @@ mod tests {
     /// #113 criterion 3: subscribe → notify → unsubscribe. CapsNotify reaches the
     /// subscriber while it is subscribed, and stops when it is not.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn caps_subscribe_notify_unsubscribe() {
         let _g = lock_globals();
         reset_context();
@@ -2318,7 +2320,7 @@ mod tests {
         );
 
         // The subscription resource exists.
-        let fetched = tsctsf_sbi_request_handler(SbiRequest::get(&format!(
+        let fetched = tsctsf_sbi_request_handler(SbiRequest::get(format!(
             "/ntsctsf-time-synchronization/v1/subscriptions/{subscription_id}"
         )))
         .await;
@@ -2351,7 +2353,7 @@ mod tests {
         );
 
         // Unsubscribe, and the fan-out stops.
-        let removed = tsctsf_sbi_request_handler(SbiRequest::delete(&format!(
+        let removed = tsctsf_sbi_request_handler(SbiRequest::delete(format!(
             "/ntsctsf-time-synchronization/v1/subscriptions/{subscription_id}"
         )))
         .await;
@@ -2373,7 +2375,7 @@ mod tests {
         assert!(seen.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
 
         // And a second unsubscribe is 404, not another 204.
-        let again = tsctsf_sbi_request_handler(SbiRequest::delete(&format!(
+        let again = tsctsf_sbi_request_handler(SbiRequest::delete(format!(
             "/ntsctsf-time-synchronization/v1/subscriptions/{subscription_id}"
         )))
         .await;
@@ -2423,7 +2425,7 @@ mod tests {
             serde_json::from_str(created.http.content.as_deref().expect("body")).expect("json");
         let config_id = body["configId"].as_str().expect("configId").to_string();
 
-        let fetched = block_on(tsctsf_sbi_request_handler(SbiRequest::get(&format!(
+        let fetched = block_on(tsctsf_sbi_request_handler(SbiRequest::get(format!(
             "/ntsctsf-asti/v1/configurations/{config_id}"
         ))));
         assert_eq!(fetched.status, 200);
@@ -2446,11 +2448,11 @@ mod tests {
             "an update must not clear what it did not mention"
         );
 
-        let deleted = block_on(tsctsf_sbi_request_handler(SbiRequest::delete(&format!(
+        let deleted = block_on(tsctsf_sbi_request_handler(SbiRequest::delete(format!(
             "/ntsctsf-asti/v1/configurations/{config_id}"
         ))));
         assert_eq!(deleted.status, 204);
-        let gone = block_on(tsctsf_sbi_request_handler(SbiRequest::get(&format!(
+        let gone = block_on(tsctsf_sbi_request_handler(SbiRequest::get(format!(
             "/ntsctsf-asti/v1/configurations/{config_id}"
         ))));
         assert_eq!(gone.status, 404);
@@ -2476,6 +2478,7 @@ mod tests {
     /// #113 criterion 4: `Ntsctsf_QoSandTSCAssistance` has routes and handlers,
     /// and Notify reaches a subscriber on an Update.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn qos_tsc_create_read_update_notifies_and_delete() {
         let _g = lock_globals();
         reset_context();
@@ -2503,7 +2506,7 @@ mod tests {
             .expect("Transaction Reference ID")
             .to_string();
 
-        let fetched = tsctsf_sbi_request_handler(SbiRequest::get(&format!(
+        let fetched = tsctsf_sbi_request_handler(SbiRequest::get(format!(
             "/ntsctsf-qos-tsctsf/v1/tsc-qos-requests/{transaction_id}"
         )))
         .await;
@@ -2547,12 +2550,12 @@ mod tests {
             serde_json::json!(2000)
         );
 
-        let deleted = tsctsf_sbi_request_handler(SbiRequest::delete(&format!(
+        let deleted = tsctsf_sbi_request_handler(SbiRequest::delete(format!(
             "/ntsctsf-qos-tsctsf/v1/tsc-qos-requests/{transaction_id}"
         )))
         .await;
         assert_eq!(deleted.status, 204);
-        let gone = tsctsf_sbi_request_handler(SbiRequest::get(&format!(
+        let gone = tsctsf_sbi_request_handler(SbiRequest::get(format!(
             "/ntsctsf-qos-tsctsf/v1/tsc-qos-requests/{transaction_id}"
         )))
         .await;

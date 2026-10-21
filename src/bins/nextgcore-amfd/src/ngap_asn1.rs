@@ -3096,6 +3096,23 @@ pub fn build_ue_context_release_command_asn1(
     cause_group: u8,
     cause_value: i64,
 ) -> Option<Vec<u8>> {
+    build_ue_context_release_command_ids_asn1(
+        amf_ue_ngap_id,
+        Some(ran_ue_ngap_id),
+        cause_group,
+        cause_value,
+    )
+}
+
+/// [`build_ue_context_release_command_asn1`] with the RAN UE NGAP ID optional (#592): a
+/// target gNB that has not yet acknowledged a HandoverRequest has given no RAN UE NGAP ID,
+/// and TS 38.413 §9.3.3.x `UE NGAP IDs` then carries the AMF UE NGAP ID alone.
+pub fn build_ue_context_release_command_ids_asn1(
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: Option<u32>,
+    cause_group: u8,
+    cause_value: i64,
+) -> Option<Vec<u8>> {
     use ngap_gen::{
         ProtocolIE_ID, UEContextReleaseCommand, UEContextReleaseCommandProtocolIEs,
         UEContextReleaseCommandProtocolIEs_Entry as Entry,
@@ -3110,13 +3127,18 @@ pub fn build_ue_context_release_command_asn1(
         Entry {
             id: ProtocolIE_ID(ngap_gen::ID_UE_NGAP_I_DS),
             criticality: ngap_gen::Criticality(ngap_gen::Criticality::REJECT),
-            value: Ie::Id_UE_NGAP_IDs(ngap_gen::UE_NGAP_IDs::UE_NGAP_ID_pair(
-                ngap_gen::UE_NGAP_ID_pair {
-                    amf_ue_ngap_id: ngap_gen::AMF_UE_NGAP_ID(amf_ue_ngap_id),
-                    ran_ue_ngap_id: ngap_gen::RAN_UE_NGAP_ID(ran_ue_ngap_id),
-                    ie_extensions: None,
-                },
-            )),
+            value: Ie::Id_UE_NGAP_IDs(match ran_ue_ngap_id {
+                Some(ran_ue_ngap_id) => {
+                    ngap_gen::UE_NGAP_IDs::UE_NGAP_ID_pair(ngap_gen::UE_NGAP_ID_pair {
+                        amf_ue_ngap_id: ngap_gen::AMF_UE_NGAP_ID(amf_ue_ngap_id),
+                        ran_ue_ngap_id: ngap_gen::RAN_UE_NGAP_ID(ran_ue_ngap_id),
+                        ie_extensions: None,
+                    })
+                }
+                None => {
+                    ngap_gen::UE_NGAP_IDs::AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(amf_ue_ngap_id))
+                }
+            }),
         },
         Entry {
             id: ProtocolIE_ID(ngap_gen::ID_CAUSE),
@@ -3135,7 +3157,7 @@ pub fn build_ue_context_release_command_asn1(
     match nextgcore_ngap_gen::encode(&pdu) {
         Ok(bytes) => {
             log::debug!(
-                "Built UE Context Release Command: {} bytes, AMF UE NGAP ID={}, RAN UE NGAP ID={}",
+                "Built UE Context Release Command: {} bytes, AMF UE NGAP ID={}, RAN UE NGAP ID={:?}",
                 bytes.len(),
                 amf_ue_ngap_id,
                 ran_ue_ngap_id

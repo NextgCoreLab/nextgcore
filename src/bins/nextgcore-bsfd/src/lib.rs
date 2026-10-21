@@ -2869,10 +2869,7 @@ mod tests {
             .map(|(t, _)| t.to_name().to_string())
             .collect();
         assert_eq!(from_profile, from_table);
-        assert_eq!(
-            crate::sbi_path::allowed_nf_types_for("nbsf-management").contains(&"PCF"),
-            true
-        );
+        assert!(crate::sbi_path::allowed_nf_types_for("nbsf-management").contains(&"PCF"));
         // A service this BSF does not serve has no consumers, rather than all.
         assert!(crate::sbi_path::allowed_nf_types_for("npcf-smpolicycontrol").is_empty());
     }

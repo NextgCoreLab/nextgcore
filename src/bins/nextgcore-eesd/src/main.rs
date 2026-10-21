@@ -5863,7 +5863,7 @@ mod tests {
         assert_eq!(created.eas_id, "eas1.example.com");
 
         // Read the individual resource.
-        let req = SbiRequest::get(&format!("/eees-eel-acr/v1/subscriptions/{id}"))
+        let req = SbiRequest::get(format!("/eees-eel-acr/v1/subscriptions/{id}"))
             .with_header("Authorization", bearer(&sk, "k1", auth::SCOPE_EEL_ACR));
         let resp = block_on(ees_sbi_request_handler(req));
         assert_eq!(resp.status, 200);
@@ -5909,7 +5909,7 @@ mod tests {
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 400);
 
         // The yaml defines only GET on the individual resource.
-        let req = SbiRequest::delete(&format!("/eees-eel-acr/v1/subscriptions/{id}"))
+        let req = SbiRequest::delete(format!("/eees-eel-acr/v1/subscriptions/{id}"))
             .with_header("Authorization", bearer(&sk, "k1", auth::SCOPE_EEL_ACR));
         assert_eq!(block_on(ees_sbi_request_handler(req)).status, 405);
         auth::clear_auth_jwks();

@@ -231,7 +231,7 @@ proptest! {
         }
         .encode()
         .unwrap();
-        prop_assert_eq!(modify_confirm_transfer(&q, ul).unwrap(), old);
+        prop_assert_eq!(modify_confirm_transfer(&q, ul, &[], &[]).unwrap(), old);
     }
 
     #[test]
@@ -288,7 +288,19 @@ proptest! {
                     .map(|f| f.qos_flow_identifier)
                     .collect(),
             ),
-            additional_dl_tunnels: old.additional_dl_qos_flow_per_tnl_information.len(),
+            additional: old
+                .additional_dl_qos_flow_per_tnl_information
+                .iter()
+                .map(|a| {
+                    hw_endpoint(
+                        &a.up_transport_layer_information,
+                        a.associated_qos_flow_list
+                            .iter()
+                            .map(|f| f.qos_flow_identifier)
+                            .collect(),
+                    )
+                })
+                .collect(),
         };
         prop_assert_eq!(parse_modify_indication_transfer(&bytes).unwrap(), expected);
     }
@@ -323,7 +335,7 @@ proptest! {
                 .map(|f| f.qos_flow_identifier)
                 .collect(),
         );
-        prop_assert_eq!(parse_handover_request_acknowledge_transfer(&bytes).unwrap(), old);
+        prop_assert_eq!(parse_handover_request_acknowledge_transfer(&bytes).unwrap().dl, old);
     }
 
     /// The hand-written codec has no PathSwitchRequestTransfer encoder (the SMF
@@ -362,7 +374,7 @@ proptest! {
         prop_assert_eq!(modify.encode().unwrap(), hw_modify_request(ambr, &q).unwrap());
 
         let confirm = hw::PduSessionResourceModifyConfirmTransfer::decode(
-            &modify_confirm_transfer(&q, ul).unwrap(),
+            &modify_confirm_transfer(&q, ul, &[], &[]).unwrap(),
         )
         .unwrap();
         prop_assert_eq!(confirm.qos_flow_modify_confirm_list, q);
@@ -597,8 +609,8 @@ fn out_of_range_values_are_refused_as_before() {
     assert!(setup_request_transfer(&with(&|f| f.five_qi = 256)).is_err());
     assert!(modify_request_transfer(None, &[64]).is_err());
     assert!(hw_modify_request(None, &[64]).is_err());
-    assert!(modify_confirm_transfer(&[], (1, [10, 0, 0, 1])).is_err());
-    assert!(modify_confirm_transfer(&[64], (1, [10, 0, 0, 1])).is_err());
+    assert!(modify_confirm_transfer(&[], (1, [10, 0, 0, 1]), &[], &[]).is_err());
+    assert!(modify_confirm_transfer(&[64], (1, [10, 0, 0, 1]), &[], &[]).is_err());
 }
 
 /// A Setup Response Transfer whose iE-Extensions carry one entry with an id the

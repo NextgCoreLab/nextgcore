@@ -3167,13 +3167,24 @@ pub fn handle_handover_cancel_reporting(
     };
 
     // #584: a cancelled EPS to 5GS preparation must not be finished by a late
-    // Forward Relocation Response (TS 23.502 §4.11.1.2.3).
+    // Forward Relocation Response (TS 23.502 §4.11.1.2.3). #592: and the target
+    // AMF is told, with a Relocation Cancel Request (step 2), so it releases the
+    // target NG-RAN resources and the SM contexts it prepared.
     if let Some(source) = ctx.enb_ue_find_by_id(source_ue_id) {
-        if crate::n26_path::cancel_eps_to_5gs_relocation(source.mme_ue_id) {
-            log::info!(
-                "Handover Cancel: the EPS to 5GS relocation of UE {} is abandoned; the target                  AMF is not told (this core has no Relocation Cancel Request), and its                  preparation lapses on its own supervision",
-                source.mme_ue_id
-            );
+        if let Some(record) = crate::n26_path::take_eps_to_5gs_relocation(source.mme_ue_id) {
+            match crate::n26_path::send_relocation_cancel(ctx, &record) {
+                Ok(_) => log::info!(
+                    "Handover Cancel: the EPS to 5GS relocation of UE {} is abandoned and the \
+                     target AMF {} told",
+                    source.mme_ue_id,
+                    record.amf_peer
+                ),
+                Err(e) => log::warn!(
+                    "Handover Cancel: the EPS to 5GS relocation of UE {} is abandoned, but the \
+                     Relocation Cancel Request could not be sent: {e}",
+                    source.mme_ue_id
+                ),
+            }
         }
     }
 
@@ -3845,6 +3856,9 @@ pub fn handle_location_report(
         Ok(ue) => ue,
         Err(out) => return out,
     };
+    let before = ctx
+        .mme_ue_find_by_id(enb_ue.mme_ue_id)
+        .map(|ue| (ue.tai, ue.e_cgi));
     store_location(
         ctx,
         enb_ue.id,
@@ -3859,6 +3873,24 @@ pub fn handle_location_report(
         msg.tai,
         msg.eutran_cgi
     );
+    // #593, TS 23.401 §5.9.2: a PDN GW that asked for location change reporting
+    // is told with a Change Notification Request, via the Serving GW.
+    let after = ctx
+        .mme_ue_find_by_id(enb_ue.mme_ue_id)
+        .map(|ue| (ue.tai, ue.e_cgi));
+    if let (Some((tai0, cgi0)), Some((tai1, cgi1))) = (before, after) {
+        let tai_changed = tai0 != tai1;
+        let ecgi_changed = cgi0.plmn_id != cgi1.plmn_id || cgi0.cell_id != cgi1.cell_id;
+        let notify = crate::s11_handler::sessions_to_notify(
+            ctx,
+            enb_ue.mme_ue_id,
+            tai_changed,
+            ecgi_changed,
+        );
+        if !notify.is_empty() {
+            crate::gtp_path::send_change_notifications(ctx, enb_ue.mme_ue_id, &notify);
+        }
+    }
     Vec::new()
 }
 
