@@ -9947,20 +9947,45 @@ impl NgapServer {
     /// and replies with PathSwitchRequestAcknowledge; on any inconsistency it
     /// replies with PathSwitchRequestFailure (TS 38.413 Section 9.2.3.12).
     async fn handle_path_switch_request(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
-        let req = match nextgcore_ngap::parser::decode_ngap_pdu(data) {
-            Ok(nextgcore_ngap::NgapMessage::PathSwitchRequest(r)) => r,
-            Ok(other) => {
-                log::warn!("Expected PathSwitchRequest, decoded {other:?}");
+        // #417: the GENERATED codec, TS 38.413 §10.3.4.2 / §10.3.5 for a Class 1
+        // initiating message.
+        let (req, notify) = match crate::ngap_asn1::decode_path_switch_request_asn1(data) {
+            crate::ngap_asn1::PathSwitchRequestDecode::Proceed { request, notify } => {
+                (request, notify)
+            }
+            crate::ngap_asn1::PathSwitchRequestDecode::Reject { sessions, report } => {
+                log::warn!(
+                    "PathSwitchRequest from association {association_id} rejected: {report:?}"
+                );
+                let failure = match (report.amf_ue_ngap_id, report.ran_ue_ngap_id) {
+                    (Some(amf), Some(ran)) => path_switch_failure(
+                        amf,
+                        ran,
+                        &sessions,
+                        nextgcore_ngap::types::Cause::Protocol(
+                            nextgcore_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
+                        ),
+                        &report.diagnostics,
+                    ),
+                    _ => None,
+                };
+                match failure {
+                    Some(bytes) => self.send_to_association(association_id, &bytes).await?,
+                    // No UE ids or no sessions: the Failure cannot be built.
+                    None => {
+                        self.send_criticality_error_indication(association_id, &report)
+                            .await?
+                    }
+                }
                 return Ok(());
             }
-            Err(e) => {
-                log::error!("Failed to decode PathSwitchRequest: {e}");
+            crate::ngap_asn1::PathSwitchRequestDecode::Undecodable => {
                 self.send_error_indication(
                     association_id,
                     None,
                     None,
                     nextgcore_ngap::types::Cause::Protocol(
-                        nextgcore_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
+                        nextgcore_asn1c::ngap::cause::CauseProtocol::TransferSyntaxError,
                     ),
                 )
                 .await?;
@@ -9968,22 +9993,29 @@ impl NgapServer {
             }
         };
         let amf_ue_ngap_id = req.source_amf_ue_ngap_id;
+        let requested: Vec<u8> = req
+            .pdu_session_list
+            .iter()
+            .map(|p| p.pdu_session_id)
+            .collect();
         log::info!(
             "PathSwitchRequest (amf_ue_ngap_id={amf_ue_ngap_id}, new ran_ue_ngap_id={})",
             req.ran_ue_ngap_id
         );
 
-        // Unknown UE → PathSwitchRequestFailure with unknown-local-UE cause.
+        // Unknown UE → PathSwitchRequestFailure releasing every session it named,
+        // cause unknown-local-UE-NGAP-ID (the list is mandatory, §9.2.3.10).
         if !self.ue_auth_state.contains(amf_ue_ngap_id) {
             log::warn!("PathSwitchRequest for unknown UE {amf_ue_ngap_id}; failing");
-            let failure = nextgcore_ngap::types::PathSwitchRequestFailure {
+            if let Some(bytes) = path_switch_failure(
                 amf_ue_ngap_id,
-                ran_ue_ngap_id: req.ran_ue_ngap_id,
-                released_list: None,
-                criticality_diagnostics: None,
-            };
-            if let Ok(bytes) = nextgcore_ngap::builder::build_path_switch_request_failure(&failure)
-            {
+                req.ran_ue_ngap_id,
+                &requested,
+                nextgcore_ngap::types::Cause::RadioNetwork(
+                    nextgcore_asn1c::ngap::cause::CauseRadioNetwork::UnknownLocalUeNgapId,
+                ),
+                &[],
+            ) {
                 self.send_to_association(association_id, &bytes).await?;
             }
             return Ok(());
@@ -10029,7 +10061,10 @@ impl NgapServer {
                 // Inside the same `with_mut` as the association move, deliberately: the two
                 // describe one event, and a reader must not have to wonder whether the
                 // location and the serving gNB can disagree.
-                apply_user_location(&mut state.amf_ue, &req.user_location_info);
+                // Criticality ignore: a request without it keeps the stored location.
+                if let Some(uli) = &req.user_location_info {
+                    apply_user_location(&mut state.amf_ue, uli);
+                }
 
                 // #70: the inbound request transfers, kept so each can be relayed to the SMF
                 // AFTER this borrow ends. The switched list is built from the SMF's ANSWERS
@@ -10086,37 +10121,56 @@ impl NgapServer {
             allowed_nssai
         };
 
-        let ack = nextgcore_ngap::types::PathSwitchRequestAcknowledge {
-            amf_ue_ngap_id,
-            ran_ue_ngap_id: req.ran_ue_ngap_id,
-            ue_security_capabilities: Some(ue_caps),
-            security_context: nextgcore_ngap::types::SecurityContext {
-                next_hop_chaining_count: ncc,
-                next_hop: nh,
-            },
-            switched_list,
-            released_list: None,
-            allowed_nssai: allowed_for_ack,
-        };
-        match nextgcore_ngap::builder::build_path_switch_request_acknowledge(&ack) {
-            Ok(bytes) => {
+        // A session the SMF did not switch is RELEASED (§8.4.4.2: "PDU Session
+        // Resource Released List"), not silently dropped.
+        let not_switched: Vec<u8> = requested
+            .iter()
+            .copied()
+            .filter(|psi| !switched_list.iter().any(|s| s.pdu_session_id == *psi))
+            .collect();
+        let unswitched_cause = nextgcore_ngap::types::Cause::Misc(
+            nextgcore_asn1c::ngap::cause::CauseMisc::Unspecified,
+        );
+        let ack_bytes = (!switched_list.is_empty())
+            .then(|| {
+                let ack = nextgcore_ngap::types::PathSwitchRequestAcknowledge {
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id: req.ran_ue_ngap_id,
+                    ue_security_capabilities: Some(ue_caps),
+                    security_context: nextgcore_ngap::types::SecurityContext {
+                        next_hop_chaining_count: ncc,
+                        next_hop: nh,
+                    },
+                    switched_list,
+                    released_list: released_items(&not_switched, unswitched_cause),
+                    allowed_nssai: allowed_for_ack,
+                };
+                crate::ngap_asn1::build_path_switch_request_acknowledge_generated(&ack, &notify)
+            })
+            .flatten();
+        match ack_bytes {
+            Some(bytes) => {
                 self.send_to_association(association_id, &bytes).await?;
                 log::info!(
                     "PathSwitchRequestAcknowledge sent for UE {amf_ue_ngap_id} \
-                     (new ran_ue_ngap_id={}, NCC={ncc})",
-                    req.ran_ue_ngap_id
+                     (new ran_ue_ngap_id={}, NCC={ncc}, {} released)",
+                    req.ran_ue_ngap_id,
+                    not_switched.len()
                 );
             }
-            Err(e) => {
-                log::error!("Failed to build PathSwitchRequestAcknowledge: {e}");
-                let failure = nextgcore_ngap::types::PathSwitchRequestFailure {
+            None => {
+                // Nothing switched (or the acknowledge did not encode): §8.4.4.3,
+                // PATH SWITCH REQUEST FAILURE releasing every requested session.
+                log::warn!(
+                    "PathSwitchRequest for UE {amf_ue_ngap_id}: no session switched; failing"
+                );
+                if let Some(b) = path_switch_failure(
                     amf_ue_ngap_id,
-                    ran_ue_ngap_id: req.ran_ue_ngap_id,
-                    released_list: None,
-                    criticality_diagnostics: None,
-                };
-                if let Ok(b) = nextgcore_ngap::builder::build_path_switch_request_failure(&failure)
-                {
+                    req.ran_ue_ngap_id,
+                    &requested,
+                    unswitched_cause,
+                    &notify,
+                ) {
                     self.send_to_association(association_id, &b).await?;
                 }
             }
@@ -12998,6 +13052,43 @@ struct HandoverNotifyDecoded {
     amf_ue_ngap_id: u64,
     ran_ue_ngap_id: u32,
     user_location_info: Option<nextgcore_ngap::types::UserLocationInformation>,
+}
+
+/// The released-list items for `sessions`, each a PathSwitchRequestUnsuccessfulTransfer
+/// carrying `cause` (TS 38.413 §9.3.4.11). `None` when there is nothing to release.
+fn released_items(
+    sessions: &[u8],
+    cause: nextgcore_ngap::types::Cause,
+) -> Option<Vec<nextgcore_ngap::types::PduSessionResourceReleasedItem>> {
+    let transfer = crate::ngap_asn1::path_switch_unsuccessful_transfer(cause)?;
+    (!sessions.is_empty()).then(|| {
+        sessions
+            .iter()
+            .map(
+                |psi| nextgcore_ngap::types::PduSessionResourceReleasedItem {
+                    pdu_session_id: *psi,
+                    transfer: transfer.clone(),
+                },
+            )
+            .collect()
+    })
+}
+
+/// A PATH SWITCH REQUEST FAILURE releasing `sessions` with `cause`; `None`
+/// when there is no session to name (the released list is mandatory).
+fn path_switch_failure(
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+    sessions: &[u8],
+    cause: nextgcore_ngap::types::Cause,
+    diagnostics: &[crate::ngap_asn1::IeDiagnostic],
+) -> Option<Vec<u8>> {
+    crate::ngap_asn1::build_path_switch_request_failure_generated(
+        amf_ue_ngap_id,
+        ran_ue_ngap_id,
+        &released_items(sessions, cause)?,
+        diagnostics,
+    )
 }
 
 fn apply_user_location(
@@ -18796,8 +18887,9 @@ mod tests {
     ///
     /// That is the defect stated as a test. Before #70 the same conditions produced a
     /// switched list containing the gNB's own `PathSwitchRequestTransfer`, which tells the
-    /// target to send uplink traffic to itself. An empty list makes the gNB release the
-    /// session, which is the honest outcome when the core cannot confirm the switch.
+    /// target to send uplink traffic to itself. With nothing switched the AMF now answers
+    /// PATH SWITCH REQUEST FAILURE releasing the session (§8.4.4.3, #417) -- an empty
+    /// switched list is SIZE(1..) and was undecodable.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_path_switch_with_no_smf_answer_switches_nothing_rather_than_echoing() {
         let mut server = test_ngap_server().await;
