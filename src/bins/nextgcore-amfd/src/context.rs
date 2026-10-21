@@ -4559,6 +4559,18 @@ impl Default for AmfSess {
 static GLOBAL_AMF_CONTEXT: std::sync::OnceLock<Arc<RwLock<AmfContext>>> =
     std::sync::OnceLock::new();
 
+/// Serialises the tests that run `NgapServer::process_reachability_timers` (#600 wave,
+/// red main on fbedaf4).
+///
+/// The sweep walks the WHOLE `ue_store` of this global context, not just the UE a test
+/// inserted, so two sweeping tests running at once advance, re-arm or deregister each
+/// other's UEs: one test's sweep read a sibling's expired mobile-reachable timer and wrote
+/// a fresh implicit-deregistration deadline over the expired one the sibling had just set,
+/// and the sibling's UE was never deregistered. Declared beside the global it guards, so
+/// there is one lock for it rather than one per test module.
+#[cfg(test)]
+pub(crate) static REACHABILITY_SWEEP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Get the global AMF context
 pub fn amf_self() -> Arc<RwLock<AmfContext>> {
     GLOBAL_AMF_CONTEXT
