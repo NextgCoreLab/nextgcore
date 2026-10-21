@@ -574,6 +574,51 @@ fn gmm_deregistration_accept_to_ue() {
     roundtrip_5gmm(FiveGmmMessage::DeregistrationAcceptToUe);
 }
 
+/// SERVICE REQUEST octet 4 carries ngKSI in bits 1-4 and Service type in bits 5-8
+/// (TS 24.501 Table 8.2.16.1.1 lists ngKSI first; §8.1: the first IE of a
+/// half-octet run occupies bits 1-4). Hand-derived; #537.
+#[test]
+fn gmm_service_request_half_octet_order_golden() {
+    let s_tmsi = || {
+        MobileIdentity::FiveGSTmsi(FiveGSTmsi {
+            amf_set_id: 1,
+            amf_pointer: 0,
+            tmsi: 0x1234_5678,
+        })
+    };
+    // ngKSI: TSC 0, key set 0 -> 0x0; service type: mobile terminated services (2).
+    // 5G-S-TMSI (§9.11.3.4): LV-E 00 07 | F4 (spare 1111, type 100) | AMF Set ID 1
+    // and AMF Pointer 0 -> 00 40 | 5G-TMSI 12 34 56 78.
+    let mt = ServiceRequest {
+        ngksi: KeySetIdentifier::new(0, 0),
+        service_type: ServiceType::MobileTerminatedServices,
+        s_tmsi: s_tmsi(),
+        ..Default::default()
+    };
+    let golden_mt: &[u8] = &[0x20, 0x00, 0x07, 0xF4, 0x00, 0x40, 0x12, 0x34, 0x56, 0x78];
+    let mut buf = BytesMut::new();
+    mt.encode(&mut buf);
+    assert_eq!(&buf[..], golden_mt);
+    assert_eq!(
+        ServiceRequest::decode(&mut Bytes::copy_from_slice(golden_mt)).unwrap(),
+        mt
+    );
+
+    // ngKSI: TSC 1 (mapped), key set 3 -> 0xB; service type: data (1) -> 0x1B.
+    let data = ServiceRequest {
+        ngksi: KeySetIdentifier::new(1, 3),
+        service_type: ServiceType::Data,
+        s_tmsi: s_tmsi(),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    data.encode(&mut buf);
+    assert_eq!(buf[0], 0x1B);
+    let decoded = ServiceRequest::decode(&mut Bytes::copy_from_slice(&buf)).unwrap();
+    assert_eq!(decoded.service_type, ServiceType::Data);
+    assert_eq!(decoded.ngksi, KeySetIdentifier::new(1, 3));
+}
+
 #[test]
 fn gmm_service_request() {
     roundtrip_5gmm(FiveGmmMessage::ServiceRequest(ServiceRequest {
