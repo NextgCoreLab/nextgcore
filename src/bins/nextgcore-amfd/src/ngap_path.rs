@@ -6934,9 +6934,35 @@ impl NgapServer {
                     .await?;
                 log::info!("PDU Session Resource Release Command sent to gNB: PSI={psi}");
             }
-            // PDU Session Release Complete
+            // PDU Session Release Complete (TS 24.501 Table 9.7.1: 0xD4; 0xD6 is 5GSM
+            // STATUS). #582: relayed to the SMF (TS 23.502 §4.3.4.2 step 10), which
+            // removes the SM context and notifies RELEASED -- the end of a release the
+            // SMF started, e.g. for a session the NG-RAN reported released.
+            0xD4 => {
+                log::info!("PDU Session Release Complete from UE: PSI={psi}, PTI={pti}");
+                match self.sm_context_refs.get(&(amf_ue_ngap_id, psi)).cloned() {
+                    Some(sm_context_ref) => {
+                        if let Err(e) = crate::sbi_path::call_smf_update_sm_context_n1_only(
+                            &smf_host,
+                            smf_port,
+                            &sm_context_ref,
+                            sm_pdu,
+                        )
+                        .await
+                        {
+                            log::warn!(
+                                "PDU Session Release Complete for PSI={psi}: SMF update failed: {e}"
+                            );
+                        }
+                    }
+                    None => log::info!(
+                        "PDU Session Release Complete for UE {amf_ue_ngap_id} PSI {psi}: no SM \
+                         context left (released already)"
+                    ),
+                }
+            }
             0xD6 => {
-                log::info!("PDU Session Release Complete from UE: PSI={psi}");
+                log::info!("5GSM STATUS from UE: PSI={psi}");
             }
             other => {
                 log::warn!("Unhandled 5GSM message type 0x{other:02x}");
@@ -11826,14 +11852,63 @@ impl NgapServer {
             .await;
         }
         for item in &notify.released_list {
-            self.relay_n2_sm_to_smf(
-                notify.amf_ue_ngap_id,
-                item.pdu_session_id,
+            // #582, TS 23.502 §4.3.4.2 step 1d -> 3a -> 4: when the SMF releases the
+            // session the NG-RAN reported released, its answer carries the PDU Session
+            // Release Command and no N2 resource release (the NG-RAN's resources are
+            // already gone), so the AMF "transmits the NAS message ... to the UE".
+            let Some(sm_context_ref) = self
+                .sm_context_refs
+                .get(&(notify.amf_ue_ngap_id, item.pdu_session_id))
+                .cloned()
+            else {
+                log::error!(
+                    "PDUSessionResourceNotify (released): no SM context ref stored for UE {} \
+                     PSI {}",
+                    notify.amf_ue_ngap_id,
+                    item.pdu_session_id
+                );
+                continue;
+            };
+            let (host, port) = Self::smf_sbi_target();
+            match crate::sbi_path::call_smf_update_sm_context_n2(
+                &host,
+                port,
+                &sm_context_ref,
                 "PDU_RES_NTY_REL",
                 &item.transfer,
-                "PDUSessionResourceNotify (released)",
             )
-            .await;
+            .await
+            {
+                Ok(resp) if !resp.n1_sm_msg.is_empty() => {
+                    log::info!(
+                        "PDUSessionResourceNotify (released): SMF ref={sm_context_ref} \
+                         releases UE {} PSI {}; relaying its {}-byte N1 SM to the UE",
+                        notify.amf_ue_ngap_id,
+                        item.pdu_session_id,
+                        resp.n1_sm_msg.len()
+                    );
+                    self.send_n1_sm_to_ue(
+                        association_id,
+                        notify.amf_ue_ngap_id,
+                        notify.ran_ue_ngap_id,
+                        item.pdu_session_id,
+                        &resp.n1_sm_msg,
+                    )
+                    .await?;
+                }
+                Ok(_) => log::info!(
+                    "PDUSessionResourceNotify (released): relayed to SMF ref={sm_context_ref} \
+                     for UE {} PSI {}",
+                    notify.amf_ue_ngap_id,
+                    item.pdu_session_id
+                ),
+                Err(e) => log::warn!(
+                    "PDUSessionResourceNotify (released): SMF update for UE {} PSI {} \
+                     (ref={sm_context_ref}) failed: {e}",
+                    notify.amf_ue_ngap_id,
+                    item.pdu_session_id
+                ),
+            }
         }
         Ok(())
     }

@@ -394,11 +394,17 @@ pub(crate) fn modify_request_transfer(
 }
 
 /// `PDUSessionResourceModifyConfirmTransfer` (TS 38.413 §9.3.4.19): the QoS
-/// flows the core confirms and the UPF's UL N3 endpoint. No additional UL
-/// tunnels (this SMF allocates none) and no failed flows.
+/// flows the core confirms and the UPF's UL N3 endpoint.
+///
+/// #582: for a split PDU session (dual connectivity) `additional` carries one
+/// `(UL, DL)` pair per additional NG-U tunnel the SMF installed -- the Additional
+/// NG-U UP TNL Information of §8.2.5.2 -- and `failed` the QoS flows it could not
+/// move, each with cause radioNetwork / unknown-qos-flow-id (spelled `unkown-` in the ASN.1).
 pub(crate) fn modify_confirm_transfer(
     qfis: &[u8],
     ul_tunnel: (u32, [u8; 4]),
+    additional: &[((u32, [u8; 4]), (u32, [u8; 4]))],
+    failed: &[u8],
 ) -> Result<Vec<u8>, TransferError> {
     const WHAT: &str = "PDUSessionResourceModifyConfirmTransfer";
     let items = qfis
@@ -410,13 +416,37 @@ pub(crate) fn modify_confirm_transfer(
             })
         })
         .collect::<Result<Vec<_>, TransferError>>()?;
+    let failed = failed
+        .iter()
+        .map(|&q| {
+            Ok(g::QosFlowWithCauseItem {
+                qos_flow_identifier: qfi(WHAT, q)?,
+                cause: g::Cause::RadioNetwork(g::CauseRadioNetwork(
+                    g::CauseRadioNetwork::UNKOWN_QOS_FLOW_ID,
+                )),
+                ie_extensions: None,
+            })
+        })
+        .collect::<Result<Vec<_>, TransferError>>()?;
     encode(
         WHAT,
         &g::PDUSessionResourceModifyConfirmTransfer {
             qos_flow_modify_confirm_list: g::QosFlowModifyConfirmList(items),
             ulngu_up_tnl_information: gtp_tunnel(ul_tunnel),
-            additional_ng_uuptnl_information: None,
-            qos_flow_failed_to_modify_list: None,
+            additional_ng_uuptnl_information: (!additional.is_empty()).then(|| {
+                g::UPTransportLayerInformationPairList(
+                    additional
+                        .iter()
+                        .map(|&(ul, dl)| g::UPTransportLayerInformationPairItem {
+                            ul_ngu_up_tnl_information: gtp_tunnel(ul),
+                            dl_ngu_up_tnl_information: gtp_tunnel(dl),
+                            ie_extensions: None,
+                        })
+                        .collect(),
+                )
+            }),
+            qos_flow_failed_to_modify_list: (!failed.is_empty())
+                .then_some(g::QosFlowListWithCause(failed)),
             ie_extensions: None,
         },
     )
@@ -529,9 +559,10 @@ pub(crate) fn parse_setup_response_transfer(bytes: &[u8]) -> Result<DlEndpoint, 
 pub(crate) struct ModifyIndication {
     /// The NG-RAN's (new) DL N3 endpoint and the flows on it.
     pub dl: DlEndpoint,
-    /// How many Additional DL QoS Flow per TNL Information items came too
-    /// (dual connectivity, which this SMF does not install).
-    pub additional_dl_tunnels: usize,
+    /// #582: the Additional DL QoS Flow per TNL Information -- the secondary
+    /// node's NG-U tunnels of a split PDU session (dual connectivity), each with
+    /// the QoS flows it carries.
+    pub additional: Vec<DlEndpoint>,
 }
 
 /// `PDUSessionResourceModifyIndicationTransfer` (TS 38.413 §9.3.4.20).
@@ -549,9 +580,22 @@ pub(crate) fn parse_modify_indication_transfer(
         .collect();
     Ok(ModifyIndication {
         dl: endpoint(WHAT, dl.up_transport_layer_information, qfis)?,
-        additional_dl_tunnels: t
+        additional: t
             .additional_dl_qos_flow_per_tnl_information
-            .map_or(0, |l| l.0.len()),
+            .map(|l| l.0)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|item| {
+                let item = item.qos_flow_per_tnl_information;
+                let qfis = item
+                    .associated_qos_flow_list
+                    .0
+                    .iter()
+                    .map(|f| f.qos_flow_identifier.0)
+                    .collect();
+                endpoint(WHAT, item.up_transport_layer_information, qfis)
+            })
+            .collect::<Result<_, _>>()?,
     })
 }
 
@@ -574,6 +618,23 @@ pub(crate) fn parse_path_switch_request_transfer(
         .map(|f| f.qos_flow_identifier.0)
         .collect();
     endpoint(WHAT, t.dl_ngu_up_tnl_information, qfis)
+}
+
+/// `PDUSessionResourceNotifyReleasedTransfer` (TS 38.413 §9.3.4.13): why the
+/// NG-RAN released the session, rendered for the log (`group / value`).
+pub(crate) fn parse_notify_released_transfer(bytes: &[u8]) -> Result<String, TransferError> {
+    let t = decode::<g::PDUSessionResourceNotifyReleasedTransfer>(
+        "PDUSessionResourceNotifyReleasedTransfer",
+        bytes,
+    )?;
+    Ok(match t.cause {
+        g::Cause::RadioNetwork(c) => format!("radioNetwork / {}", c.0),
+        g::Cause::Transport(c) => format!("transport / {}", c.0),
+        g::Cause::Nas(c) => format!("nas / {}", c.0),
+        g::Cause::Protocol(c) => format!("protocol / {}", c.0),
+        g::Cause::Misc(c) => format!("misc / {}", c.0),
+        other => format!("{other:?}"),
+    })
 }
 
 /// What the SMF reads from a `HandoverRequestAcknowledgeTransfer`.
