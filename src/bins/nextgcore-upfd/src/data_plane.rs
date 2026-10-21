@@ -2178,6 +2178,76 @@ pub struct DataPlaneStats {
     pub oversize_packets: AtomicU64,
 }
 
+/// How often the forwarding loop logs [`DataPlaneStats::summary`] (#581).
+pub const STATS_LOG_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+
+impl DataPlaneStats {
+    /// One-line summary for the periodic "Data plane stats" log (#581).
+    pub fn summary(&self) -> String {
+        format!(
+            "UL={} pkts/{} B, DL={} pkts/{} B, dropped={} (spoofed={}, oversize={})",
+            self.ul_packets.load(Ordering::Relaxed),
+            self.ul_bytes.load(Ordering::Relaxed),
+            self.dl_packets.load(Ordering::Relaxed),
+            self.dl_bytes.load(Ordering::Relaxed),
+            self.dropped_packets.load(Ordering::Relaxed),
+            self.spoofed_packets.load(Ordering::Relaxed),
+            self.oversize_packets.load(Ordering::Relaxed),
+        )
+    }
+
+    /// The forwarding counters in Prometheus text format (#581), appended to the
+    /// UPF's `/metrics` body. Counters, not gauges: they only ever grow for the life
+    /// of the process. Read on every scrape, so they are as live as the atomics.
+    pub fn render_prometheus(&self) -> String {
+        let families: [(&str, &str, &AtomicU64); 7] = [
+            (
+                "upf_dataplane_ul_packets_total",
+                "Uplink G-PDUs decapsulated and written to the TUN (N3/S5-U to N6/SGi)",
+                &self.ul_packets,
+            ),
+            (
+                "upf_dataplane_ul_bytes_total",
+                "Inner IP bytes of the uplink packets written to the TUN",
+                &self.ul_bytes,
+            ),
+            (
+                "upf_dataplane_dl_packets_total",
+                "Downlink packets read from the TUN and sent as G-PDUs",
+                &self.dl_packets,
+            ),
+            (
+                "upf_dataplane_dl_bytes_total",
+                "Inner IP bytes of the downlink packets sent as G-PDUs",
+                &self.dl_bytes,
+            ),
+            (
+                "upf_dataplane_dropped_packets_total",
+                "User-plane packets dropped by the data plane, any cause",
+                &self.dropped_packets,
+            ),
+            (
+                "upf_dataplane_spoofed_packets_total",
+                "Uplink G-PDUs dropped by source-address validation (TS 23.501 5.6.1)",
+                &self.spoofed_packets,
+            ),
+            (
+                "upf_dataplane_oversize_packets_total",
+                "Packets dropped for exceeding the TUN MTU",
+                &self.oversize_packets,
+            ),
+        ];
+        let mut out = String::new();
+        for (name, help, v) in families {
+            out.push_str(&format!(
+                "# HELP {name} {help}\n# TYPE {name} counter\n{name} {}\n",
+                v.load(Ordering::Relaxed)
+            ));
+        }
+        out
+    }
+}
+
 impl Default for DataPlaneStats {
     fn default() -> Self {
         Self {
@@ -2382,6 +2452,16 @@ impl DataPlane {
         let gtpu_send = gtpu_clone.clone();
         let shutdown_proc_ul = shutdown.clone();
 
+        // #581: ONE interval, created outside the loop. The loop used to arm a fresh
+        // `sleep(30 s)` on every iteration, so any packet inside 30 s restarted it: the
+        // stats line was printed only after 30 s of silence, and a UPF carrying traffic
+        // never logged its counters (the last line seen was the idle `UL=0, DL=0`).
+        let mut stats_tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + STATS_LOG_INTERVAL,
+            STATS_LOG_INTERVAL,
+        );
+        stats_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             if shutdown_proc_ul.load(Ordering::Relaxed) {
                 break;
@@ -2399,10 +2479,8 @@ impl DataPlane {
                 }
 
                 // Periodic stats logging
-                _ = tokio::time::sleep(tokio::time::Duration::from_secs(30)) => {
-                    let ul = stats.ul_packets.load(Ordering::Relaxed);
-                    let dl = stats.dl_packets.load(Ordering::Relaxed);
-                    log::info!("Data plane stats: UL={ul} pkts, DL={dl} pkts");
+                _ = stats_tick.tick() => {
+                    log::info!("Data plane stats: {}", stats.summary());
                 }
             }
         }
@@ -4701,6 +4779,99 @@ mod tests {
         pkt[10..12].copy_from_slice(&[0, 0]);
         let csum = ipv4_header_checksum(&pkt[..20]);
         pkt[10..12].copy_from_slice(&csum.to_be_bytes());
+    }
+
+    // ==================================================================
+    // #581: the forwarding counters are what the stats log and /metrics show
+    // ==================================================================
+
+    /// #581: packets forwarded through the TUN path show up in the stats summary the
+    /// periodic log prints and in the Prometheus counters `/metrics` serves.
+    ///
+    /// Driven through the real `handle_uplink_packet` (writable fd, so the packet takes
+    /// the TUN-write success branch) and `handle_downlink_packet` (a real gNB socket, and
+    /// the G-PDU is received there), then asserted on the rendered text, which is what
+    /// an operator and a scraper read.
+    #[tokio::test]
+    async fn tun_path_traffic_is_reported_in_the_stats_summary_and_metrics() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let dp = DataPlane::new(shutdown);
+        let upf_sock = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dp = DataPlane {
+            gtpu_socket: Some(Arc::new(upf_sock)),
+            ..dp
+        };
+        let gnb_sock = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gnb_addr = gnb_sock.local_addr().unwrap();
+        let ue_ip = Ipv4Addr::new(10, 45, 0, 2);
+        dp.add_session_from_pfcp(
+            0x58,
+            0x1058,
+            ue_ip,
+            0x581,
+            0x582,
+            gnb_addr,
+            Some(1),
+            Some(9),
+        );
+        // Send downlink to the test gNB socket's ephemeral port, not 2152.
+        let session = dp.sessions.find_by_ue_ip(ue_ip).unwrap();
+        for far in session.fars.write().unwrap().values_mut() {
+            far.ohc_addr = None;
+        }
+        assert!(dp
+            .stats
+            .summary()
+            .starts_with("UL=0 pkts/0 B, DL=0 pkts/0 B"));
+
+        let sink = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("/dev/null must be writable");
+        let tun_fd = std::os::unix::io::AsRawFd::as_raw_fd(&sink);
+        let mut ul = make_ipv4_udp_packet(ue_ip.octets(), [10, 45, 0, 1], 1234, 53);
+        finalize_ipv4(&mut ul);
+        let ul_len = ul.len();
+        let gpdu = encapsulate_dl_gpdu(&ul, 0x581, None);
+        for _ in 0..3 {
+            dp.handle_uplink_packet(&gpdu, gnb_addr, tun_fd).await;
+        }
+
+        let mut dl = make_ipv4_udp_packet([10, 45, 0, 1], ue_ip.octets(), 53, 1234);
+        finalize_ipv4(&mut dl);
+        let dl_len = dl.len();
+        let gtpu = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+        dp.handle_downlink_packet(&dl, &gtpu).await;
+        let mut buf = [0u8; 2048];
+        let (n, _) = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            gnb_sock.recv_from(&mut buf),
+        )
+        .await
+        .expect("the downlink G-PDU must reach the gNB")
+        .unwrap();
+        assert!(n > dl_len, "a G-PDU, not the bare inner packet");
+
+        let summary = dp.stats.summary();
+        assert!(
+            summary.starts_with(&format!(
+                "UL=3 pkts/{} B, DL=1 pkts/{} B, dropped=0",
+                3 * ul_len,
+                dl_len
+            )),
+            "{summary}"
+        );
+        let prom = dp.stats.render_prometheus();
+        for expected in [
+            "# TYPE upf_dataplane_ul_packets_total counter".to_string(),
+            "upf_dataplane_ul_packets_total 3".to_string(),
+            format!("upf_dataplane_ul_bytes_total {}", 3 * ul_len),
+            "upf_dataplane_dl_packets_total 1".to_string(),
+            format!("upf_dataplane_dl_bytes_total {dl_len}"),
+            "upf_dataplane_dropped_packets_total 0".to_string(),
+        ] {
+            assert!(prom.contains(&expected), "missing {expected} in:\n{prom}");
+        }
     }
 
     // ==================================================================
