@@ -17869,6 +17869,61 @@ mod tests {
         assert!(ue, "and the UE Policy Association; saw {seen:?}");
     }
 
+    /// #637: an NG Reset through the live NGAP task releases the SM context of every
+    /// UE it drops at the SMF. The release used to resolve the SMF with the sync
+    /// resolver, whose `Handle::block_on` panics inside the runtime, so a reset that
+    /// dropped a UE with a PDU session panicked the NGAP task instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ng_reset_releases_the_dropped_ues_sessions_at_the_smf() {
+        let (_nf, port, seen) = recording_nf().await;
+        let _env = SmfEnvGuard::set(port);
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let assoc = 637_001u64;
+        seed_gnb_session(&ngap, assoc).await;
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            // `seed_gnb_session` makes the session's gNB pool id its association id.
+            let ran_ue = guard.ran_ue_add(assoc, 637).expect("ran_ue_add");
+            let amf_ue = guard.amf_ue_add(ran_ue.id).expect("amf_ue_add");
+            guard.amf_ue_associate_ran_ue(amf_ue.id, ran_ue.id);
+            let mut sess = guard.sess_add(amf_ue.id, 5).expect("sess_add");
+            sess.sm_context_ref = Some("smctx-637".to_string());
+            guard.sess_update(&sess);
+        }
+
+        let whole = nextgcore_ngap::builder::build_ng_reset(&nextgcore_ngap::types::NgReset {
+            cause: nextgcore_ngap::types::Cause::Transport(
+                nextgcore_ngap::types::CauseTransport::TransportResourceUnavailable,
+            ),
+            reset_type: nextgcore_ngap::types::ResetType::NgInterface,
+        })
+        .expect("build NG Reset");
+        // Result discarded: the NG Reset Acknowledge cannot be sent over this fixture's
+        // transport; the release is spawned before that send.
+        let _ = ngap.handle_ng_reset(assoc, &whole).await;
+
+        let mut released = false;
+        for _ in 0..200 {
+            if seen
+                .lock()
+                .expect("seen")
+                .iter()
+                .any(|s| s == "POST /nsmf-pdusession/v1/sm-contexts/smctx-637/release")
+            {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let seen = seen.lock().expect("seen").clone();
+        assert!(
+            released,
+            "the reset UE's SM context must be released at the SMF; saw {seen:?}"
+        );
+    }
+
     /// An NF stand-in that answers 204 to everything and records `"METHOD uri"`.
     async fn recording_nf() -> (
         nextgcore_sbi::server::SbiServer,
