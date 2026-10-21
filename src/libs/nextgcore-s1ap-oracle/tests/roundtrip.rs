@@ -8,13 +8,14 @@
 //!     covered by the symmetric APER primitives validated in nextgcore-asn1c.
 
 use nextgcore_asn1c::per::{AperEncode, AperEncoder};
-use nextgcore_asn1c::s1ap::ies::ProtocolIeContainer;
-use nextgcore_asn1c::s1ap::pdu::{
+use nextgcore_s1ap::types::*;
+use nextgcore_s1ap_oracle::asn1::ies::ProtocolIeContainer;
+use nextgcore_s1ap_oracle::asn1::pdu::{
     InitiatingMessage, InitiatingMessageValue, S1apPdu, SuccessfulOutcome, SuccessfulOutcomeValue,
     UnsuccessfulOutcome, UnsuccessfulOutcomeValue,
 };
-use nextgcore_asn1c::s1ap::types::{Criticality, ProcedureCode};
-use nextgcore_s1ap::*;
+use nextgcore_s1ap_oracle::asn1::types::{Criticality, ProcedureCode};
+use nextgcore_s1ap_oracle::*;
 use proptest::prelude::*;
 
 const PLMN: [u8; 3] = [0x00, 0xF1, 0x10];
@@ -1275,7 +1276,7 @@ fn enb_configuration_update_acknowledge_roundtrip() {
             triggering_message: Some(triggering_message::INITIATING_MESSAGE),
             procedure_criticality: Some(0),
             ies: vec![IeCriticalityDiagnostics {
-                ie_criticality: Criticality::Reject,
+                ie_criticality: nextgcore_s1ap::Criticality::Reject,
                 ie_id: 64,
                 type_of_error: TypeOfError::NotUnderstood,
             }],
@@ -2000,7 +2001,8 @@ fn optional_only_messages_accept_empty_container() {
 fn strict_reject_partially_populated_message() {
     // InitialUEMessage with only the eNB-UE-S1AP-ID (missing NAS-PDU, TAI, ...)
     let mut container = ProtocolIeContainer::new();
-    nextgcore_s1ap::ie::encode_enb_ue_s1ap_id(&mut container, 1, Criticality::Reject).unwrap();
+    nextgcore_s1ap_oracle::ie::encode_enb_ue_s1ap_id(&mut container, 1, Criticality::Reject)
+        .unwrap();
     let bytes = encode_raw_pdu(&S1apPdu::InitiatingMessage(InitiatingMessage {
         procedure_code: ProcedureCode::INITIAL_UE_MESSAGE,
         criticality: Criticality::Ignore,
@@ -2011,7 +2013,7 @@ fn strict_reject_partially_populated_message() {
 
     // UEContextReleaseCommand with cause but no UE-S1AP-IDs
     let mut container = ProtocolIeContainer::new();
-    nextgcore_s1ap::ie::encode_cause(&mut container, &sample_cause()).unwrap();
+    nextgcore_s1ap_oracle::ie::encode_cause(&mut container, &sample_cause()).unwrap();
     let bytes = encode_raw_pdu(&S1apPdu::InitiatingMessage(InitiatingMessage {
         procedure_code: ProcedureCode::UE_CONTEXT_RELEASE,
         criticality: Criticality::Reject,
@@ -2115,12 +2117,12 @@ fn error_indication_criticality_diagnostics_roundtrip() {
         procedure_criticality: Some(0),
         ies: vec![
             IeCriticalityDiagnostics {
-                ie_criticality: nextgcore_asn1c::s1ap::types::Criticality::Reject,
+                ie_criticality: nextgcore_s1ap::Criticality::Reject,
                 ie_id: 8,
                 type_of_error: TypeOfError::Missing,
             },
             IeCriticalityDiagnostics {
-                ie_criticality: nextgcore_asn1c::s1ap::types::Criticality::Ignore,
+                ie_criticality: nextgcore_s1ap::Criticality::Ignore,
                 ie_id: 100,
                 type_of_error: TypeOfError::NotUnderstood,
             },

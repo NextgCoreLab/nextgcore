@@ -920,14 +920,168 @@ pub fn build_initial_context_setup_request(
     }))
 }
 
-/// The hand-written `Cause` for a generated one, through the old parser's own
-/// mapping (`nextgcore_s1ap::ie::decode_cause_aper`), so values outside the
-/// hand-written enums fall back exactly as before.
-fn hand_written_cause(cause: &g::Cause) -> Option<Cause> {
-    use asn1_codecs::aper::AperCodec;
-    let mut data = asn1_codecs::PerCodecData::new_aper();
-    cause.aper_encode(&mut data).ok()?;
-    nextgcore_s1ap::ie::decode_cause_aper(&data.into_bytes()).ok()
+/// The domain `Cause` for a generated one. A value the domain enums do not
+/// define (a later release's addition) maps to `None`, which is how the
+/// hand-written decoder this replaced treated it (#514 stage 13).
+fn domain_cause(cause: &g::Cause) -> Option<Cause> {
+    use nextgcore_s1ap::{CauseMisc, CauseNas, CauseProtocol, CauseRadioNetwork, CauseTransport};
+    Some(match cause {
+        g::Cause::RadioNetwork(v) => {
+            Cause::RadioNetwork(CauseRadioNetwork::try_from(i64::from(v.0)).ok()?)
+        }
+        g::Cause::Transport(v) => Cause::Transport(CauseTransport::try_from(i64::from(v.0)).ok()?),
+        g::Cause::Nas(v) => Cause::Nas(CauseNas::try_from(i64::from(v.0)).ok()?),
+        g::Cause::Protocol(v) => Cause::Protocol(CauseProtocol::try_from(i64::from(v.0)).ok()?),
+        g::Cause::Misc(v) => Cause::Misc(CauseMisc::try_from(i64::from(v.0)).ok()?),
+    })
+}
+
+// ============================================================================
+// PDUs no family decode took (#514 stage 13)
+// ============================================================================
+
+/// What an S1AP PDU is when none of the generated message decodes took it.
+///
+/// This replaced the hand-written `decode_s1ap_pdu` fallback: the generated
+/// family decodes above own every message mmed implements, so a PDU reaching
+/// here is either malformed, a message only the MME sends, or a procedure mmed
+/// does not implement. Only the S1AP-PDU header is read (X.691 §23 CHOICE,
+/// §13 INTEGER, §14 ENUMERATED, §10.2 open type), never a message value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unmatched {
+    /// The S1AP-PDU header itself does not decode (TS 36.413 §10.2).
+    TransferSyntaxError,
+    /// A message of a procedure mmed implements whose value did not decode.
+    Undecodable {
+        procedure_code: u8,
+        triggering_message: u8,
+    },
+    /// A message only the MME originates, received from an eNB.
+    MmeOriginated { procedure_code: u8 },
+    /// A procedure code mmed does not comprehend (TS 36.413 §10.3.4.1), with
+    /// the criticality the sender marked it with (0 reject, 1 ignore, 2 notify).
+    UnknownProcedure {
+        procedure_code: u8,
+        triggering_message: u8,
+        criticality: u8,
+    },
+}
+
+/// Procedure codes mmed implements in some direction.
+const IMPLEMENTED_PROCEDURES: &[u8] = &[
+    PROC_HANDOVER_PREPARATION,
+    PROC_HANDOVER_RESOURCE_ALLOCATION,
+    PROC_HANDOVER_NOTIFICATION,
+    PROC_PATH_SWITCH_REQUEST,
+    PROC_HANDOVER_CANCEL,
+    PROC_E_RAB_SETUP,
+    PROC_E_RAB_MODIFY,
+    PROC_E_RAB_RELEASE,
+    PROC_INITIAL_CONTEXT_SETUP,
+    PROC_PAGING,
+    PROC_DOWNLINK_NAS_TRANSPORT,
+    PROC_INITIAL_UE_MESSAGE,
+    PROC_UPLINK_NAS_TRANSPORT,
+    PROC_RESET,
+    PROC_ERROR_INDICATION,
+    PROC_NAS_NON_DELIVERY_INDICATION,
+    PROC_S1_SETUP,
+    PROC_UE_CONTEXT_RELEASE_REQUEST,
+    PROC_UE_CONTEXT_MODIFICATION,
+    PROC_UE_CAPABILITY_INFO_INDICATION,
+    PROC_UE_CONTEXT_RELEASE,
+    PROC_ENB_STATUS_TRANSFER,
+    PROC_MME_STATUS_TRANSFER,
+    PROC_ENB_CONFIGURATION_UPDATE,
+    PROC_MME_CONFIGURATION_UPDATE,
+    PROC_OVERLOAD_START,
+    PROC_OVERLOAD_STOP,
+    PROC_WRITE_REPLACE_WARNING,
+    PROC_KILL,
+];
+
+/// `(triggering message, procedure code)` of every message only the MME sends.
+const MME_ORIGINATED: &[(u8, u8)] = &[
+    (0, PROC_DOWNLINK_NAS_TRANSPORT),
+    (0, PROC_INITIAL_CONTEXT_SETUP),
+    (0, PROC_UE_CONTEXT_RELEASE),
+    (0, PROC_E_RAB_SETUP),
+    (0, PROC_E_RAB_MODIFY),
+    (0, PROC_E_RAB_RELEASE),
+    (0, PROC_PAGING),
+    (0, PROC_HANDOVER_RESOURCE_ALLOCATION),
+    (0, PROC_MME_STATUS_TRANSFER),
+    (0, PROC_MME_CONFIGURATION_UPDATE),
+    (0, PROC_UE_CONTEXT_MODIFICATION),
+    (0, PROC_OVERLOAD_START),
+    (0, PROC_OVERLOAD_STOP),
+    (0, PROC_WRITE_REPLACE_WARNING),
+    (0, PROC_KILL),
+    (1, PROC_S1_SETUP),
+    (1, PROC_HANDOVER_PREPARATION),
+    (1, PROC_PATH_SWITCH_REQUEST),
+    (1, PROC_HANDOVER_CANCEL),
+    (1, PROC_ENB_CONFIGURATION_UPDATE),
+    (2, PROC_S1_SETUP),
+    (2, PROC_HANDOVER_PREPARATION),
+    (2, PROC_PATH_SWITCH_REQUEST),
+    (2, PROC_ENB_CONFIGURATION_UPDATE),
+];
+
+/// Reads the S1AP-PDU header: `(triggering message, procedure code,
+/// criticality)` when the CHOICE index, the two header fields and the open
+/// type's length all decode and the length matches the bytes that follow.
+pub fn pdu_header(bytes: &[u8]) -> Option<(u8, u8, u8)> {
+    // Octet 0: extension bit 0, then the 2-bit CHOICE index, then padding.
+    let first = *bytes.first()?;
+    if first & 0x80 != 0 || first & 0x1f != 0 {
+        return None;
+    }
+    let triggering_message = (first >> 5) & 0x03;
+    if triggering_message > 2 {
+        return None;
+    }
+    // Octet 1: ProcedureCode INTEGER (0..255), one aligned octet.
+    let procedure_code = *bytes.get(1)?;
+    // Octet 2: Criticality ENUMERATED {reject, ignore, notify} in 2 bits.
+    let crit = *bytes.get(2)?;
+    if crit & 0x3f != 0 || (crit >> 6) > 2 {
+        return None;
+    }
+    // Octet 3..: the open type's length determinant (X.691 §11.9.3.6/7).
+    let rest = bytes.get(3..)?;
+    let (len, header) = match *rest.first()? {
+        b if b & 0x80 == 0 => (usize::from(b), 1),
+        b if b & 0xc0 == 0x80 => (usize::from(b & 0x3f) << 8 | usize::from(*rest.get(1)?), 2),
+        // Fragmented values are not reassembled here; a value that large is
+        // not a header question, so say only that the header decodes.
+        _ => return Some((triggering_message, procedure_code, crit >> 6)),
+    };
+    if rest.len() != header + len {
+        return None;
+    }
+    Some((triggering_message, procedure_code, crit >> 6))
+}
+
+/// Classifies a PDU none of the generated message decodes took.
+pub fn classify_unmatched(bytes: &[u8]) -> Unmatched {
+    let Some((triggering_message, procedure_code, criticality)) = pdu_header(bytes) else {
+        return Unmatched::TransferSyntaxError;
+    };
+    if MME_ORIGINATED.contains(&(triggering_message, procedure_code)) {
+        Unmatched::MmeOriginated { procedure_code }
+    } else if IMPLEMENTED_PROCEDURES.contains(&procedure_code) {
+        Unmatched::Undecodable {
+            procedure_code,
+            triggering_message,
+        }
+    } else {
+        Unmatched::UnknownProcedure {
+            procedure_code,
+            triggering_message,
+            criticality,
+        }
+    }
 }
 
 /// Outcome of decoding a response message (TS 36.413 §10.3.4.2 / §10.3.5).
@@ -989,7 +1143,7 @@ pub fn decode_initial_context_setup_response(
             V::Id_E_RABFailedToSetupListCtxtSURes(list) => {
                 for entry in list.0 {
                     let g::E_RABList_EntryValue::Id_E_RABItem(item) = entry.value;
-                    let Some(cause) = hand_written_cause(&item.cause) else {
+                    let Some(cause) = domain_cause(&item.cause) else {
                         return ResponseDecode::Undecodable;
                     };
                     failed.push(nextgcore_s1ap::ErabFailedItem {
@@ -1040,7 +1194,7 @@ pub fn decode_initial_context_setup_failure(
         match ie.value {
             V::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
             V::Id_eNB_UE_S1AP_ID(v) => enb = v.0,
-            V::Id_Cause(c) => cause = hand_written_cause(&c),
+            V::Id_Cause(c) => cause = domain_cause(&c),
             _ => {}
         }
     }
@@ -1144,7 +1298,7 @@ pub fn decode_ue_context_release_request(
         match ie.value {
             V::Id_MME_UE_S1AP_ID(v) => mme_id = Some(v.0),
             V::Id_eNB_UE_S1AP_ID(v) => enb_id = Some(v.0),
-            V::Id_Cause(c) => cause = hand_written_cause(&c),
+            V::Id_Cause(c) => cause = domain_cause(&c),
             _ => {}
         }
     }
@@ -1434,7 +1588,7 @@ fn failed_items(list: g::E_RABList) -> Option<Vec<nextgcore_s1ap::ErabFailedItem
             let g::E_RABList_EntryValue::Id_E_RABItem(item) = entry.value;
             Some(nextgcore_s1ap::ErabFailedItem {
                 erab_id: item.e_rab_id.0,
-                cause: hand_written_cause(&item.cause)?,
+                cause: domain_cause(&item.cause)?,
             })
         })
         .collect()
@@ -1939,7 +2093,7 @@ pub fn decode_handover_cancel(bytes: &[u8]) -> Class2Decode<nextgcore_s1ap::Hand
         match ie.value {
             V::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
             V::Id_eNB_UE_S1AP_ID(v) => enb = Some(v.0),
-            V::Id_Cause(c) => cause = hand_written_cause(&c),
+            V::Id_Cause(c) => cause = domain_cause(&c),
         }
     }
     missing(&mut reject, mme.is_some(), ID_MME_UE_S1AP_ID);
@@ -1989,7 +2143,7 @@ pub fn decode_handover_failure(bytes: &[u8]) -> ResponseDecode<nextgcore_s1ap::H
     for ie in f.protocol_i_es.0 {
         match ie.value {
             V::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
-            V::Id_Cause(c) => cause = hand_written_cause(&c),
+            V::Id_Cause(c) => cause = domain_cause(&c),
             _ => {}
         }
     }
@@ -2172,7 +2326,7 @@ pub fn decode_handover_required(bytes: &[u8]) -> HandoverRequiredDecode {
                 Some(t) => ho_type = Some(t),
                 None => not_understood(&mut reject, ID_HANDOVER_TYPE),
             },
-            V::Id_Cause(c) => cause = hand_written_cause(&c),
+            V::Id_Cause(c) => cause = domain_cause(&c),
             V::Id_TargetID(t) => match target_id_from(&t) {
                 Ok(Some(t)) => target = Some(t),
                 Ok(None) => not_understood(&mut reject, ID_TARGET_ID),
@@ -2441,7 +2595,7 @@ pub fn decode_handover_request_acknowledge(
                                 entry.value;
                             nextgcore_s1ap::ErabFailedItem {
                                 erab_id: i.e_rab_id.0,
-                                cause: hand_written_cause(&i.cause).unwrap_or(Cause::RadioNetwork(
+                                cause: domain_cause(&i.cause).unwrap_or(Cause::RadioNetwork(
                                     nextgcore_s1ap::CauseRadioNetwork::Unspecified,
                                 )),
                             }
@@ -2720,7 +2874,7 @@ pub fn decode_error_indication(
         match ie.value {
             V::Id_MME_UE_S1AP_ID(v) => out.mme_ue_s1ap_id = Some(v.0),
             V::Id_eNB_UE_S1AP_ID(v) => out.enb_ue_s1ap_id = Some(v.0),
-            V::Id_Cause(c) => out.cause = hand_written_cause(&c),
+            V::Id_Cause(c) => out.cause = domain_cause(&c),
             V::Id_CriticalityDiagnostics(d) => {
                 out.criticality_diagnostics = Some(hand_written_diagnostics(&d));
             }
@@ -2748,7 +2902,7 @@ pub fn decode_reset(bytes: &[u8]) -> Class2Decode<nextgcore_s1ap::Reset> {
     use g::ResetProtocolIEs_EntryValue as V;
     for ie in m.protocol_i_es.0 {
         match ie.value {
-            V::Id_Cause(c) => cause = hand_written_cause(&c),
+            V::Id_Cause(c) => cause = domain_cause(&c),
             V::Id_ResetType(t) => {
                 reset_type = Some(match t {
                     g::ResetType::S1_Interface(_) => nextgcore_s1ap::ResetType::S1Interface,
@@ -3583,7 +3737,7 @@ pub fn decode_nas_non_delivery_indication(
             V::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
             V::Id_eNB_UE_S1AP_ID(v) => enb = Some(v.0),
             V::Id_NAS_PDU(v) => nas = Some(v.0),
-            V::Id_Cause(c) => cause = hand_written_cause(&c),
+            V::Id_Cause(c) => cause = domain_cause(&c),
         }
     }
     missing(&mut reject, mme.is_some(), ID_MME_UE_S1AP_ID);
@@ -3733,7 +3887,7 @@ pub fn decode_mme_configuration_update_failure(
     use g::MMEConfigurationUpdateFailureProtocolIEs_EntryValue as V;
     for ie in f.protocol_i_es.0 {
         match ie.value {
-            V::Id_Cause(c) => cause = hand_written_cause(&c),
+            V::Id_Cause(c) => cause = domain_cause(&c),
             V::Id_TimeToWait(t) => time_to_wait = time_to_wait_from(t.0),
             V::Id_CriticalityDiagnostics(d) => diag = Some(hand_written_diagnostics(&d)),
         }
@@ -3819,7 +3973,7 @@ pub fn decode_ue_context_modification_failure(
         match ie.value {
             V::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
             V::Id_eNB_UE_S1AP_ID(v) => enb = Some(v.0),
-            V::Id_Cause(c) => cause = hand_written_cause(&c),
+            V::Id_Cause(c) => cause = domain_cause(&c),
             V::Id_CriticalityDiagnostics(d) => diag = Some(hand_written_diagnostics(&d)),
         }
     }
@@ -4057,3 +4211,6 @@ mod rest_tests;
 
 #[cfg(test)]
 mod handover2_tests;
+
+#[cfg(test)]
+mod unmatched_tests;

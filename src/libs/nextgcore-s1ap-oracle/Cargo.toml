@@ -1,0 +1,18 @@
+[package]
+name = "nextgcore-s1ap-oracle"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "TEST-ONLY: the hand-written S1AP codec kept as an equivalence oracle (#514)"
+publish = false
+
+[dependencies]
+nextgcore-s1ap = { workspace = true }
+nextgcore-asn1c = { workspace = true }
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

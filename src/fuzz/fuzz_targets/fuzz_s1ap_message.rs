@@ -3,9 +3,10 @@
 //! Fuzzes the S1AP (S1 Application Protocol) message parser to find potential
 //! crashes, panics, or memory safety issues.
 //!
-//! Exercises `nextgcore_s1ap::parser::decode_s1ap_pdu` against arbitrary bytes.
-//! The harness must never panic — the parser is expected to return `Err` on
-//! malformed input, not abort.
+//! Exercises the generated S1AP codec (`nextgcore_s1ap_gen`, which mmed decodes
+//! every S1AP PDU with since #514) against arbitrary bytes: both the strict
+//! decode and the decode that skips unknown IEs. The harness must never panic —
+//! the codec is expected to return `Err` on malformed input, not abort.
 //!
 //! Run with: cargo +nightly fuzz run fuzz_s1ap_message
 
@@ -14,8 +15,11 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    // Exercise the top-level S1AP PDU decoder.
     // A well-formed decoder must never panic on arbitrary byte input —
-    // it should return Err(...) for invalid PDUs.
-    let _ = nextgcore_s1ap::parser::decode_s1ap_pdu(data);
+    // it should return Err(...) for invalid PDUs. A PDU that decodes must
+    // also re-encode without panicking.
+    if let Ok(pdu) = nextgcore_s1ap_gen::decode(data) {
+        let _ = nextgcore_s1ap_gen::encode(&pdu);
+    }
+    let _ = nextgcore_s1ap_gen::decode_with_unknown_ies(data);
 });

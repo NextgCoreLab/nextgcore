@@ -17,7 +17,7 @@ nextgcore-pfcp = { path = "../libs/nextgcore-pfcp" }
 nextgcore-gtp = { path = "../libs/nextgcore-gtp" }
 nextgcore-nas = { path = "../libs/nextgcore-nas" }
 nextgcore-ngap = { path = "../libs/nextgcore-ngap" }
-nextgcore-s1ap = { path = "../libs/nextgcore-s1ap" }
+nextgcore-s1ap-gen = { path = "../libs/nextgcore-s1ap-gen" }
 nextgcore-diameter = { path = "../libs/nextgcore-diameter" }
 
 # Workspace members used for fuzzing
