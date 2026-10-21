@@ -76,6 +76,8 @@ pub enum Gtp2MessageType {
     ForwardRelocationResponse = 134,
     ForwardRelocationCompleteNotification = 135,
     ForwardRelocationCompleteAcknowledge = 136,
+    RelocationCancelRequest = 139,
+    RelocationCancelResponse = 140,
     CreateForwardingTunnelRequest = 160,
     CreateForwardingTunnelResponse = 161,
     SuspendNotification = 162,
@@ -145,6 +147,8 @@ impl TryFrom<u8> for Gtp2MessageType {
             134 => Ok(Self::ForwardRelocationResponse),
             135 => Ok(Self::ForwardRelocationCompleteNotification),
             136 => Ok(Self::ForwardRelocationCompleteAcknowledge),
+            139 => Ok(Self::RelocationCancelRequest),
+            140 => Ok(Self::RelocationCancelResponse),
             160 => Ok(Self::CreateForwardingTunnelRequest),
             161 => Ok(Self::CreateForwardingTunnelResponse),
             162 => Ok(Self::SuspendNotification),
@@ -393,6 +397,8 @@ mod tests {
     /// | 134 | Forward Relocation Response | `:2425` |
     /// | 135 | Forward Relocation Complete Notification | `:2428` |
     /// | 136 | Forward Relocation Complete Acknowledge | `:2431` |
+    /// | 139 | Relocation Cancel Request (#592) | `:2440` |
+    /// | 140 | Relocation Cancel Response (#592) | `:2443` |
     #[test]
     fn gtp2_n26_message_types_match_ts29274_table_6_1_1() {
         assert_eq!(Gtp2MessageType::IdentificationRequest as u8, 128);
@@ -445,6 +451,8 @@ mod tests {
             (134, Gtp2MessageType::ForwardRelocationResponse),
             (135, Gtp2MessageType::ForwardRelocationCompleteNotification),
             (136, Gtp2MessageType::ForwardRelocationCompleteAcknowledge),
+            (139, Gtp2MessageType::RelocationCancelRequest),
+            (140, Gtp2MessageType::RelocationCancelResponse),
         ] {
             assert_eq!(
                 Gtp2MessageType::try_from(value).expect("defined"),

@@ -143,6 +143,8 @@ pub fn triggered_message_types(initial_type: u8) -> &'static [u8] {
         x if x == T::DeleteBearerCommand as u8 => {
             types!(DeleteBearerRequest, DeleteBearerFailureIndication)
         }
+        // #592: N26/S10/S3 handover cancel (TS 29.274 §7.3.16-7.3.17).
+        x if x == T::RelocationCancelRequest as u8 => types!(RelocationCancelResponse),
         x if x == T::BearerResourceCommand as u8 => types!(
             CreateBearerRequest,
             UpdateBearerRequest,
@@ -470,6 +472,11 @@ mod tests {
         assert_eq!(
             triggered_message_type(T::ReleaseAccessBearersRequest as u8),
             Some(T::ReleaseAccessBearersResponse as u8)
+        );
+        assert_eq!(
+            triggered_message_type(T::RelocationCancelRequest as u8),
+            Some(T::RelocationCancelResponse as u8),
+            "#592: the Relocation Cancel Response closes the request"
         );
         // A response type has no triggered message
         assert_eq!(triggered_message_type(T::CreateSessionResponse as u8), None);
