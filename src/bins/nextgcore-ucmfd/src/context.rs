@@ -65,6 +65,50 @@ impl Capabilities {
             && agrees(&self.cap_eps, &stored.cap_eps)
     }
 
+    /// Fill what this capability lacks from what it has (TS 23.501 §5.4.4.1a, #585):
+    /// the other format by transcoding between TS 38.331 and TS 36.331, then each
+    /// format's UE radio capability for paging by deriving it from the full
+    /// capability. Never overwrites bytes that were provided, and leaves a part
+    /// absent when the bytes cannot be read as the format they claim to be (the
+    /// failure is logged; Resolve then reports the format as not stored).
+    pub fn complete(&mut self) {
+        let log_err = |what: &str, e: crate::rac::RacError| {
+            log::warn!("UE radio capability: {what} not derived: {e}");
+        };
+        if self.cap_eps.is_none() {
+            if let Some(nr) = &self.cap_5gs {
+                match crate::rac::transcode_5gs_to_eps(nr) {
+                    Ok(eps) => self.cap_eps = Some(eps),
+                    Err(e) => log_err("EPS format (TS 36.331)", e),
+                }
+            }
+        }
+        if self.cap_5gs.is_none() {
+            if let Some(eps) = &self.cap_eps {
+                match crate::rac::transcode_eps_to_5gs(eps) {
+                    Ok(nr) => self.cap_5gs = Some(nr),
+                    Err(e) => log_err("5GS format (TS 38.331)", e),
+                }
+            }
+        }
+        if self.paging_5gs.is_none() {
+            if let Some(nr) = &self.cap_5gs {
+                match crate::rac::derive_paging_5gs(nr) {
+                    Ok(p) => self.paging_5gs = Some(p),
+                    Err(e) => log_err("5GS capability for paging", e),
+                }
+            }
+        }
+        if self.paging_eps.is_none() {
+            if let Some(eps) = &self.cap_eps {
+                match crate::rac::derive_paging_eps(eps) {
+                    Ok(p) => self.paging_eps = Some(p),
+                    Err(e) => log_err("EPS capability for paging", e),
+                }
+            }
+        }
+    }
+
     /// Fill formats `stored` lacks from `self` (never overwrite stored bytes).
     fn fill_missing_into(&self, stored: &mut Capabilities) {
         for (p, s) in [
@@ -124,9 +168,9 @@ pub enum ResolveError {
     NotFound,
     /// `OUT_DATED_VERSION_ID_IN_RAC_ID` (TS 23.501 §5.4.4.1a).
     OutdatedVersionId,
-    /// The entry exists but not in the requested format, and this UCMF does not
-    /// transcode between TS 36.331 and TS 38.331 (see the module gaps note in
-    /// `main.rs`).
+    /// The entry exists but not in the requested format, and the format it has
+    /// could not be transcoded to it (#585: the stored bytes are not a valid
+    /// TS 36.331 / TS 38.331 capability, or carry no RAT the other format holds).
     FormatNotStored,
 }
 
@@ -284,6 +328,7 @@ impl Ucmf {
             if let Some(e) = self.entries.get_mut(&entry_id) {
                 e.plmn_id = Some(id);
                 caps.fill_missing_into(&mut e.caps);
+                e.caps.complete();
             }
             self.persist();
             return Ok((entry_id, id, None));
@@ -294,6 +339,8 @@ impl Ucmf {
         }
         let id = self.allocate_plmn_id()?;
         let entry_id = self.allocate_entry_id();
+        let mut caps = caps;
+        caps.complete();
         self.entries.insert(
             entry_id,
             DicEntry {
@@ -502,11 +549,7 @@ impl Ucmf {
         now: DateTime<Utc>,
     ) -> Option<
         Result<
-            (
-                Provisioning,
-                Vec<(String, &'static str)>,
-                Option<Notification>,
-            ),
+            (Provisioning, Vec<(String, &'static str)>, Vec<Notification>),
             Vec<(String, &'static str)>,
         >,
     > {
@@ -527,8 +570,15 @@ impl Ucmf {
         };
         self.provisionings.insert(prov.id.clone(), prov.clone());
         self.persist();
-        let note = self.creation_notification(now);
-        Some(Ok((prov, failed, note)))
+        // The replaced entries are gone, and with them any PLMN-assigned ID an Assign
+        // had added to one: those IDs no longer resolve, so subscribers are told
+        // before they are told about the new entries (#585).
+        let notes = self
+            .plmn_id_deletion_notification(&removed, now)
+            .into_iter()
+            .chain(self.creation_notification(now))
+            .collect();
+        Some(Ok((prov, failed, notes)))
     }
 
     /// TS 29.675 §5.2.2.3 (PATCH, RFC 7396): merge `RacsDataPatch.racsConfigs`
@@ -542,11 +592,7 @@ impl Ucmf {
         now: DateTime<Utc>,
     ) -> Option<
         Result<
-            (
-                Provisioning,
-                Vec<(String, &'static str)>,
-                Option<Notification>,
-            ),
+            (Provisioning, Vec<(String, &'static str)>, Vec<Notification>),
             Vec<(String, &'static str)>,
         >,
     > {
@@ -570,14 +616,50 @@ impl Ucmf {
         self.replace_provisioning(id, &merged, current.supp_feat, now)
     }
 
-    /// TS 29.675 §5.2.2.4. `false` when no such resource.
-    pub fn delete_provisioning(&mut self, id: &str) -> bool {
-        if self.provisionings.remove(id).is_none() {
-            return false;
-        }
-        let _ = self.take_entries_of(id);
+    /// TS 29.675 §4.2.4: remove the resource and its dictionary entries. `None`
+    /// when no such resource; otherwise the notification to send, if any (#585).
+    ///
+    /// TS 29.673 can only notify the deletion of PLMN-assigned IDs
+    /// (`DELETION_OF_PLMN_ASSIGNED_IDS`, Table 6.1.6.3.3-1). A provisioned entry
+    /// has one whenever an Assign matched it, and that ID stops resolving with the
+    /// entry, so it is notified. For the manufacturer-assigned IDs themselves
+    /// TS 29.673 V20.0.0 defines no event type. TS 23.502 §5.2.18.3.5 lists a
+    /// "deletion" notification, but the stage 3 has no way to carry one. Inventing
+    /// an `eventType` no AMF understands would tell nobody anything, so none is
+    /// sent; a subscriber that resolves such an ID gets `404`.
+    pub fn delete_provisioning(
+        &mut self,
+        id: &str,
+        now: DateTime<Utc>,
+    ) -> Option<Option<Notification>> {
+        self.provisionings.remove(id)?;
+        let removed = self.take_entries_of(id);
         self.persist();
-        true
+        Some(self.plmn_id_deletion_notification(&removed, now))
+    }
+
+    /// `DELETION_OF_PLMN_ASSIGNED_IDS` for the PLMN-assigned IDs of `removed`, or
+    /// `None` when they had none.
+    fn plmn_id_deletion_notification(
+        &mut self,
+        removed: &[DicEntry],
+        now: DateTime<Utc>,
+    ) -> Option<Notification> {
+        let deleted: Vec<String> = removed
+            .iter()
+            .filter_map(|e| e.plmn_id.map(|i| i.to_nucmf()))
+            .collect();
+        if deleted.is_empty() {
+            return None;
+        }
+        self.notification(
+            now,
+            json!({
+                "dicEntryId": self.highest_entry_id(),
+                "eventType": "DELETION_OF_PLMN_ASSIGNED_IDS",
+                "manAssOpRequestlist": { "plmnAssiUeRadioCapId": deleted },
+            }),
+        )
     }
 
     fn take_entries_of(&mut self, prov_id: &str) -> Vec<DicEntry> {
@@ -609,7 +691,7 @@ impl Ucmf {
                 failed.push((racs_key.clone(), RACS_OTHER_REASON));
                 continue;
             };
-            let Some((tacs, caps)) = parse_racs_configuration(config) else {
+            let Some((tacs, mut caps)) = parse_racs_configuration(config) else {
                 failed.push((racs_key.clone(), RACS_OTHER_REASON));
                 continue;
             };
@@ -617,6 +699,7 @@ impl Ucmf {
                 failed.push((racs_key.clone(), RACS_ID_DUPLICATED));
                 continue;
             }
+            caps.complete();
             let entry_id = self.allocate_entry_id();
             self.entries.insert(
                 entry_id,
@@ -1086,9 +1169,9 @@ mod tests {
         let (eid, plmn, _) = u.assign("35123456", caps(&[0x0a, 0x0b]), now()).unwrap();
         assert_eq!(u.entry(eid).unwrap().man_id, Some(man));
         assert_eq!(u.entry(eid).unwrap().plmn_id, Some(plmn));
-        assert!(u.delete_provisioning(&prov.id));
+        assert!(u.delete_provisioning(&prov.id, now()).is_some());
         assert!(u.resolve(&man, None).is_err());
-        assert!(!u.delete_provisioning(&prov.id));
+        assert!(u.delete_provisioning(&prov.id, now()).is_none());
     }
 
     #[test]
@@ -1112,6 +1195,142 @@ mod tests {
         assert!(u.patch_provisioning(&pid, &remove, now()).unwrap().is_err());
         assert!(u.resolve(&man, None).is_ok());
         assert!(u.patch_provisioning("nope", &remove, now()).is_none());
+    }
+
+    // ----------------------------------------------------------------- #585
+
+    use crate::rac::tests::{cap_5gs, cap_eps};
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// TS 23.501 §5.4.4.1a, Mode of operation B: the AMF sends the TS 38.331 format
+    /// only, and the UCMF holds the TS 36.331 format and both paging capabilities.
+    #[test]
+    fn a_5gs_assign_is_transcoded_to_eps_and_both_paging_capabilities_derived() {
+        let mut u = Ucmf::new(1, ModeOfOperation::B);
+        let nr = cap_5gs();
+        let (_, id, _) = u.assign("35123456", caps(&nr), now()).unwrap();
+        let e = u
+            .resolve(&id, Some(RacFormat::Eps))
+            .expect("an EPS resolve of a 5GS-only assign must succeed: the UCMF transcodes");
+        assert_eq!(
+            e.caps.cap_5gs.as_deref(),
+            Some(&nr[..]),
+            "the provided bytes are kept"
+        );
+        assert_eq!(
+            e.caps.cap_eps,
+            Some(crate::rac::transcode_5gs_to_eps(&nr).unwrap())
+        );
+        assert_eq!(
+            e.caps.paging_5gs,
+            Some(crate::rac::derive_paging_5gs(&nr).unwrap())
+        );
+        assert!(e.caps.paging_eps.is_some());
+
+        // The same capability again matches the entry (the comparison is on the
+        // provided format), so no second ID.
+        let (_, again, _) = u.assign("35123456", caps(&nr), now()).unwrap();
+        assert_eq!(again, id);
+    }
+
+    #[test]
+    fn a_paging_capability_the_amf_provided_is_not_replaced() {
+        let mut u = Ucmf::new(1, ModeOfOperation::B);
+        let mut c = caps(&cap_5gs());
+        c.paging_5gs = Some(vec![0x42]);
+        let (_, id, _) = u.assign("35123456", c, now()).unwrap();
+        assert_eq!(
+            u.resolve(&id, None).unwrap().caps.paging_5gs,
+            Some(vec![0x42])
+        );
+    }
+
+    #[test]
+    fn an_eps_only_provisioning_resolves_in_5gs_format() {
+        let mut u = Ucmf::new(1, ModeOfOperation::B);
+        let eps = cap_eps(false);
+        let mut m = Map::new();
+        m.insert(
+            MAN.into(),
+            json!({"imeiTacs": ["35123456"], "racsParamEps": hex(&eps)}),
+        );
+        let (prov, failed, _) = u.create_provisioning(&m, None, now());
+        assert!(prov.is_some() && failed.is_empty());
+        let man = RacsId::from_digit_str(MAN).unwrap();
+        let e = u.resolve(&man, Some(RacFormat::FiveGs)).unwrap();
+        assert_eq!(
+            e.caps.cap_5gs,
+            Some(crate::rac::transcode_eps_to_5gs(&eps).unwrap())
+        );
+        assert_eq!(
+            e.caps.paging_eps,
+            Some(crate::rac::derive_paging_eps(&eps).unwrap())
+        );
+    }
+
+    /// TS 29.675 §4.2.4 removes the entries; TS 29.673 notifies what it can express of
+    /// that, the PLMN-assigned IDs that went with them.
+    #[test]
+    fn deleting_a_provisioning_notifies_the_plmn_assigned_ids_it_removed() {
+        let mut u = Ucmf::new(1, ModeOfOperation::B);
+        u.subscribe(None, "http://amf/n".into(), None, now());
+        let (prov, _, _) = u.create_provisioning(&racs(MAN, "0a0b"), None, now());
+        let pid = prov.unwrap().id;
+        // An AMF assigns over the provisioned entry: it now also has a PLMN ID.
+        let (_, plmn, _) = u.assign("35123456", caps(&[0x0a, 0x0b]), now()).unwrap();
+
+        let note = u
+            .delete_provisioning(&pid, now())
+            .expect("the provisioning exists")
+            .expect("the PLMN-assigned ID went with the entry, so it is notified");
+        assert_eq!(note.uris, ["http://amf/n"]);
+        assert_eq!(note.body["eventType"], "DELETION_OF_PLMN_ASSIGNED_IDS");
+        assert_eq!(
+            note.body["manAssOpRequestlist"]["plmnAssiUeRadioCapId"],
+            json!([plmn.to_nucmf()])
+        );
+        assert_eq!(u.resolve(&plmn, None), Err(ResolveError::NotFound));
+    }
+
+    #[test]
+    fn deleting_a_provisioning_no_one_assigned_over_notifies_nothing() {
+        // TS 29.673 has no event for manufacturer-assigned IDs (see
+        // `delete_provisioning`), so a subscriber is not sent an invented one.
+        let mut u = Ucmf::new(1, ModeOfOperation::B);
+        u.subscribe(None, "http://amf/n".into(), None, now());
+        let (prov, _, _) = u.create_provisioning(&racs(MAN, "0a0b"), None, now());
+        assert_eq!(u.delete_provisioning(&prov.unwrap().id, now()), Some(None));
+    }
+
+    #[test]
+    fn replacing_a_provisioning_notifies_the_deleted_plmn_id_before_the_creation() {
+        let mut u = Ucmf::new(1, ModeOfOperation::B);
+        u.subscribe(None, "http://amf/n".into(), None, now());
+        let (prov, _, _) = u.create_provisioning(&racs(MAN, "0a0b"), None, now());
+        let pid = prov.unwrap().id;
+        let (_, plmn, _) = u.assign("35123456", caps(&[0x0a, 0x0b]), now()).unwrap();
+        let (_, _, notes) = u
+            .replace_provisioning(&pid, &racs(MAN, "0c"), None, now())
+            .unwrap()
+            .unwrap();
+        let events: Vec<&str> = notes
+            .iter()
+            .map(|n| n.body["eventType"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            events,
+            [
+                "DELETION_OF_PLMN_ASSIGNED_IDS",
+                "CREATION_OF_DICTIONARY_ENTRY"
+            ]
+        );
+        assert_eq!(
+            notes[0].body["manAssOpRequestlist"]["plmnAssiUeRadioCapId"],
+            json!([plmn.to_nucmf()])
+        );
     }
 
     #[test]

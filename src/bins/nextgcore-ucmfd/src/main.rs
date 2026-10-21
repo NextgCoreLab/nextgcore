@@ -16,18 +16,26 @@
 //! RAN side (base64 of the TS 24.501 §9.11.3.68 IE, `67 LL` included); see
 //! [`racs_id`].
 //!
+//! Every dictionary entry is completed on creation (#585, [`rac`]): the format
+//! it lacks is transcoded between TS 38.331 and TS 36.331, and the UE Radio
+//! Capability for Paging of each format is derived from the full capability, as
+//! TS 23.501 §5.4.4.1a requires of a UCMF in Mode of operation B. A format that
+//! cannot be derived (the bytes are not a valid capability) stays absent, and a
+//! request for it is answered `404 NO_DICTIONARY_ENTRY_FOUND` with a detail
+//! saying so.
+//!
 //! **Gaps, stated rather than hidden:**
-//! - No transcoding between TS 36.331 and TS 38.331 formats. TS 23.501 requires
-//!   it of a UCMF serving a PLMN with RACS in both EPS and 5GS in Mode of
-//!   Operation B; this UCMF answers a request for a format it does not hold
-//!   with `404 NO_DICTIONARY_ENTRY_FOUND` and a detail saying so.
-//! - No generation of UE Radio Capability for Paging from the full capability;
-//!   paging capabilities are stored and returned only as provided.
+//! - Deleting a provisioning notifies the deletion of the PLMN-assigned IDs it
+//!   took with it (`DELETION_OF_PLMN_ASSIGNED_IDS`). TS 29.673 has no event type
+//!   for deleted manufacturer-assigned IDs, so their deletion is not notified
+//!   (see `Ucmf::delete_provisioning`).
 //! - `racsParamEps` / `racsParam5Gs` (TS 29.122 `RacsConfiguration`) are taken
-//!   as hexadecimal octet strings; the TS 29.122 OpenAPI was not available to
-//!   confirm their encoding.
+//!   as hexadecimal octet strings. The TS 29.122 OpenAPI
+//!   (`TS29122_RacsParameterProvisioning.yaml`) types them as plain `string`
+//!   with no format, so the encoding is still this UCMF's choice.
 
 mod context;
+mod rac;
 mod racs_id;
 
 use anyhow::{Context as _, Result};
@@ -523,7 +531,7 @@ fn handle(
                 "GET" => (get_provisioning(&u, id), Vec::new()),
                 "PUT" => replace_provisioning(&mut u, id, request, now),
                 "PATCH" => patch_provisioning(&mut u, id, request, now),
-                "DELETE" => (delete_provisioning(&mut u, id), Vec::new()),
+                "DELETE" => delete_provisioning(&mut u, id, now),
                 _ => (
                     send_method_not_allowed(method, "provisionings/{provisioningId}"),
                     Vec::new(),
@@ -568,7 +576,7 @@ fn resolve_error(e: ResolveError) -> SbiResponse {
             Some("OUT_DATED_VERSION_ID_IN_RAC_ID"),
         ),
         ResolveError::FormatNotStored => send_not_found(
-            "The dictionary entry does not hold the requested RAC format and this UCMF does not transcode",
+            "The dictionary entry does not hold the requested RAC format, and the format it holds could not be transcoded to it",
             Some("NO_DICTIONARY_ENTRY_FOUND"),
         ),
     }
@@ -970,7 +978,7 @@ type ProvisioningOutcome = Option<
         (
             context::Provisioning,
             Vec<(String, &'static str)>,
-            Option<Notification>,
+            Vec<Notification>,
         ),
         Vec<(String, &'static str)>,
     >,
@@ -986,11 +994,11 @@ fn provisioning_update_response(
             Vec::new(),
         ),
         Some(Err(failed)) => (all_failed(&failed), Vec::new()),
-        Some(Ok((p, failed, note))) => (
+        Some(Ok((p, failed, notes))) => (
             SbiResponse::ok()
                 .with_json_body(&racs_data_body(&p, &failed))
                 .unwrap_or_else(|e| send_internal_error(&format!("encoding RacsData: {e}"))),
-            note.into_iter().collect(),
+            notes,
         ),
     }
 }
@@ -1024,11 +1032,17 @@ fn patch_provisioning(
 }
 
 /// TS 29.675 §5.2.2.4: `DELETE /provisionings/{id}`.
-fn delete_provisioning(u: &mut Ucmf, id: &str) -> SbiResponse {
-    if u.delete_provisioning(id) {
-        SbiResponse::no_content()
-    } else {
-        send_not_found(&format!("No provisioning {id}"), Some("RESOURCE_NOT_FOUND"))
+fn delete_provisioning(
+    u: &mut Ucmf,
+    id: &str,
+    now: DateTime<Utc>,
+) -> (SbiResponse, Vec<Notification>) {
+    match u.delete_provisioning(id, now) {
+        Some(note) => (SbiResponse::no_content(), note.into_iter().collect()),
+        None => (
+            send_not_found(&format!("No provisioning {id}"), Some("RESOURCE_NOT_FOUND")),
+            Vec::new(),
+        ),
     }
 }
 
@@ -1194,6 +1208,86 @@ mod tests {
         let (r, _) = handle(&u, &req("GET", "/nucmf-uecm/v1/dic-entries/1"), now());
         assert_eq!(r.status, 200);
         assert_eq!(body(&r)["plmnAssiUeRadioCapId"], id);
+    }
+
+    /// #585 over the API: a 5GS-only Assign resolves in EPS format, with the S1AP
+    /// capability and the EPS paging capability as binary parts.
+    #[test]
+    fn an_eps_resolve_of_a_5gs_assign_returns_the_transcoded_capability() {
+        let u = ucmf();
+        let nr = crate::rac::tests::cap_5gs();
+        let (r, _) = handle(&u, &assign_request("35123456", &nr), now());
+        assert_eq!(r.status, 201);
+        let id = body(&r)["plmnAssiUeRadioCapId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (r, _) = handle(&u, &resolve_request(&id, Some("EPS")), now());
+        assert_eq!(r.status, 200, "{:?}", body(&r));
+        let data = body(&r);
+        assert_eq!(
+            data["ueRadioCapabilityEPS"]["contentId"],
+            "ueRadioCapabilityEPS"
+        );
+        assert_eq!(
+            data["ueRadioCapEPSForPaging"]["contentId"],
+            "ueRadioCapEPSForPaging"
+        );
+        let part = |name: &str| {
+            r.http
+                .parts
+                .iter()
+                .find(|p| p.content_id.as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("no {name} part"))
+        };
+        assert_eq!(
+            part("ueRadioCapabilityEPS").content_type.as_deref(),
+            Some(CONTENT_S1AP)
+        );
+        assert_eq!(
+            &part("ueRadioCapabilityEPS").data[..],
+            &crate::rac::transcode_5gs_to_eps(&nr).unwrap()[..]
+        );
+        assert_eq!(
+            &part("ueRadioCapEPSForPaging").data[..],
+            &crate::rac::derive_paging_eps(&crate::rac::transcode_5gs_to_eps(&nr).unwrap())
+                .unwrap()[..]
+        );
+    }
+
+    #[test]
+    fn deleting_a_provisioning_over_the_api_returns_the_deletion_notification() {
+        let u = ucmf();
+        let (r, _) = handle(
+            &u,
+            &with_json(
+                req("POST", "/nucmf-uecm/v1/subscriptions"),
+                json!({"ucmfNotificationUri": "http://amf:7777/racs-notify"}),
+            ),
+            now(),
+        );
+        assert_eq!(r.status, 201);
+        let create = with_json(
+            req("POST", "/nucmf-provisioning/v1/provisionings"),
+            provisioning_body("0a0b"),
+        );
+        assert_eq!(handle(&u, &create, now()).0.status, 201);
+        assert_eq!(
+            handle(&u, &assign_request("35123456", &[0x0a, 0x0b]), now())
+                .0
+                .status,
+            201,
+            "the Assign matches the provisioned entry"
+        );
+        let (r, notes) = handle(
+            &u,
+            &req("DELETE", "/nucmf-provisioning/v1/provisionings/1"),
+            now(),
+        );
+        assert_eq!(r.status, 204);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].uris, ["http://amf:7777/racs-notify"]);
+        assert_eq!(notes[0].body["eventType"], "DELETION_OF_PLMN_ASSIGNED_IDS");
     }
 
     fn cause(r: &SbiResponse) -> Value {
