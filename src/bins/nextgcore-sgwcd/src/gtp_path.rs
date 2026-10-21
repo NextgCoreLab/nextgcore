@@ -295,6 +295,16 @@ impl GtpcServer {
         }
     }
 
+    /// Whether the MME's Command at (`mme_peer`, `mme_seq`) is already relayed and
+    /// waiting for its triggered message (#606).
+    fn command_relay_in_flight(&self, mme_peer: SocketAddr, mme_seq: u32) -> bool {
+        self.inner.command_relays.lock().is_ok_and(|relays| {
+            relays
+                .values()
+                .any(|r| r.mme_peer == mme_peer && r.mme_seq == mme_seq)
+        })
+    }
+
     /// Forget a relayed Command, returning what was recorded for it.
     fn take_command_relay(&self, pgw_peer: SocketAddr, s5c_seq: u32) -> Option<CommandRelay> {
         self.inner
@@ -745,6 +755,8 @@ fn handle_datagram(inner: &Arc<GtpcInner>, data: &[u8], peer: SocketAddr) {
             || t == T::CreateIndirectDataForwardingTunnelRequest as u8
             || t == T::DeleteIndirectDataForwardingTunnelRequest as u8
             || t == T::BearerResourceCommand as u8
+            || t == T::DeleteBearerCommand as u8
+            || t == T::ModifyBearerCommand as u8
     );
     if is_request {
         let cached = inner
@@ -793,6 +805,14 @@ fn handle_datagram(inner: &Arc<GtpcInner>, data: &[u8], peer: SocketAddr) {
         }
         t if t == T::BearerResourceCommand as u8 => {
             dispatch_bearer_resource_command(&server, &msg, peer);
+        }
+        // #606: TS 23.401 §5.4.4.2 step 2 / §5.4.2.2: the MME's Delete Bearer Command
+        // and Modify Bearer Command go to the PGW like the Bearer Resource Command.
+        t if t == T::DeleteBearerCommand as u8 => {
+            dispatch_bearer_command(&server, &msg, peer, BearerCommand::DeleteBearer);
+        }
+        t if t == T::ModifyBearerCommand as u8 => {
+            dispatch_bearer_command(&server, &msg, peer, BearerCommand::ModifyBearer);
         }
         t if t == T::DownlinkDataNotificationAcknowledge as u8 => {
             let matched = inner
@@ -2000,6 +2020,165 @@ fn has_forwarding_tunnel(ctx: &crate::context::SgwcContext, bearer_id: u64) -> b
     })
 }
 
+/// The two Commands #606 relays besides the Bearer Resource Command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BearerCommand {
+    /// Delete Bearer Command (TS 29.274 §7.2.17.1).
+    DeleteBearer,
+    /// Modify Bearer Command (TS 29.274 §7.2.14.1).
+    ModifyBearer,
+}
+
+impl BearerCommand {
+    fn name(self) -> &'static str {
+        match self {
+            Self::DeleteBearer => "Delete Bearer Command",
+            Self::ModifyBearer => "Modify Bearer Command",
+        }
+    }
+
+    /// The Failure Indication that answers it when it cannot be carried.
+    fn failure(self) -> Gtp2MessageType {
+        match self {
+            Self::DeleteBearer => Gtp2MessageType::DeleteBearerFailureIndication,
+            Self::ModifyBearer => Gtp2MessageType::ModifyBearerFailureIndication,
+        }
+    }
+}
+
+/// Relay a Delete Bearer Command or a Modify Bearer Command from the MME to the PGW
+/// (#606).
+///
+/// Both carry their bearers in Bearer Context IEs (Tables 7.2.17.1-1 and 7.2.14.1-1,
+/// mandatory). The first bearer names the PDN connection: the dedicated bearers being
+/// deleted, or the default bearer whose APN-AMBR is modified. The Command goes to that
+/// connection's PGW S5/S8-C TEID, renumbered into this node's S5-C space and recorded as a
+/// [`CommandRelay`] (#591), so the PGW's triggered Delete/Update Bearer Request or Failure
+/// Indication reaches the MME under the MME's number. Anything that stops the relay is
+/// answered with the Command's Failure Indication.
+fn dispatch_bearer_command(
+    server: &GtpcServer,
+    msg: &Gtp2Message,
+    peer: SocketAddr,
+    command: BearerCommand,
+) {
+    let seq = msg.header.sequence_number;
+    let ue = ue_from_header(msg);
+    let teid = ue.as_ref().map(|u| u.mme_s11_teid).unwrap_or(0);
+    let ebi = msg
+        .get_ies(Gtp2IeType::BearerContext as u8)
+        .into_iter()
+        .filter(|ie| ie.instance == 0)
+        .find_map(|ie| Gtp2BearerContextIe::decode(&ie.value).ok()?.ebi().ok());
+    let Some(ebi) = ebi else {
+        send_reject(
+            server,
+            peer,
+            command.failure(),
+            teid,
+            seq,
+            IeError::missing_mandatory(Gtp2IeType::BearerContext),
+        );
+        return;
+    };
+    let ctx = sgwc_self();
+    let sess = ue
+        .as_ref()
+        .and_then(|u| ctx.bearer_find_by_ue_ebi(u.id, ebi))
+        .and_then(|b| ctx.sess_find_by_id(b.sess_id));
+    let Some(sess) = sess else {
+        log::warn!(
+            "{} from {peer} (seq={seq}) names EBI {ebi}, which no PDN connection of this UE holds",
+            command.name()
+        );
+        send_cause_response(
+            server,
+            peer,
+            command.failure(),
+            teid,
+            seq,
+            gtp_cause::CONTEXT_NOT_FOUND,
+        );
+        return;
+    };
+    let Some(pgw_peer) = ctx.pgw_s5c_peer() else {
+        log::info!(
+            "{} cannot be forwarded: no PGW S5/S8 peer configured",
+            command.name()
+        );
+        send_cause_response(
+            server,
+            peer,
+            command.failure(),
+            teid,
+            seq,
+            gtp_cause::SERVICE_NOT_SUPPORTED,
+        );
+        return;
+    };
+    relay_command_to_pgw(
+        server,
+        msg,
+        peer,
+        pgw_peer,
+        sess.pgw_s5c_teid,
+        teid,
+        command.name(),
+        command.failure(),
+    );
+}
+
+/// Send a Command on to the PGW (#591, #606): re-addressed to `pgw_teid`, renumbered
+/// into this node's S5-C space, and recorded so its triggered message returns to the MME
+/// under the MME's number. A retransmission of a Command already in flight is not
+/// relayed again: the S5-C transaction retransmits on its own, and a second relay would
+/// be a second Command at the PGW.
+#[allow(clippy::too_many_arguments)]
+fn relay_command_to_pgw(
+    server: &GtpcServer,
+    msg: &Gtp2Message,
+    mme_peer: SocketAddr,
+    pgw_peer: SocketAddr,
+    pgw_teid: u32,
+    mme_teid: u32,
+    name: &str,
+    failure: Gtp2MessageType,
+) {
+    let mme_seq = msg.header.sequence_number;
+    if server.command_relay_in_flight(mme_peer, mme_seq) {
+        log::debug!("{name} seq={mme_seq} from {mme_peer} is already relayed; not relayed again");
+        return;
+    }
+    let mut relayed = msg.clone();
+    relayed.header.teid = Some(pgw_teid);
+    let s5c_seq = server.alloc_sequence();
+    relayed.header.sequence_number = s5c_seq;
+    log::info!("Relaying {name} to PGW {pgw_peer} (S5-C TEID {pgw_teid:#x}, seq {s5c_seq})");
+    // Remembered before the send, so a triggered message that races the return of
+    // `send_to` still finds it.
+    server.record_command_relay(
+        pgw_peer,
+        s5c_seq,
+        CommandRelay {
+            mme_peer,
+            mme_seq,
+            mme_teid,
+        },
+    );
+    if let Err(e) = server.send_request(pgw_peer, &relayed, 0) {
+        server.take_command_relay(pgw_peer, s5c_seq);
+        log::error!("{name} relay to {pgw_peer} failed: {e}");
+        send_cause_response(
+            server,
+            mme_peer,
+            failure,
+            mme_teid,
+            mme_seq,
+            gtp_cause::REMOTE_PEER_NOT_RESPONDING,
+        );
+    }
+}
+
 fn dispatch_bearer_resource_command(server: &GtpcServer, msg: &Gtp2Message, peer: SocketAddr) {
     let seq = msg.header.sequence_number;
     let ue = ue_from_header(msg);
@@ -2037,9 +2216,6 @@ fn dispatch_bearer_resource_command(server: &GtpcServer, msg: &Gtp2Message, peer
             let ctx = sgwc_self();
             match ctx.pgw_s5c_peer() {
                 Some(pgw_peer) => {
-                    let mut relayed = msg.clone();
-                    // Re-addressed to the PGW's control TEID and this node's own
-                    // sequence space, because the SGW-C is the initiator on the S5-C leg.
                     // The linked bearer names the PDN connection, so the session it
                     // belongs to is the one whose PGW TEID this command must be
                     // addressed to. First-of-list would pick the wrong PDN for a
@@ -2054,36 +2230,16 @@ fn dispatch_bearer_resource_command(server: &GtpcServer, msg: &Gtp2Message, peer
                         })
                         .map(|s| s.pgw_s5c_teid)
                         .unwrap_or(0);
-                    relayed.header.teid = Some(pgw_teid);
-                    let s5c_seq = server.alloc_sequence();
-                    relayed.header.sequence_number = s5c_seq;
-                    log::info!(
-                        "Relaying Bearer Resource Command to PGW {pgw_peer} (S5-C TEID \
-                         {pgw_teid:#x}, seq {s5c_seq})"
-                    );
-                    // #591: remembered before the send, so a triggered message that
-                    // races the return of `send_to` still finds it.
-                    server.record_command_relay(
+                    relay_command_to_pgw(
+                        server,
+                        msg,
+                        peer,
                         pgw_peer,
-                        s5c_seq,
-                        CommandRelay {
-                            mme_peer: peer,
-                            mme_seq: seq,
-                            mme_teid: teid,
-                        },
+                        pgw_teid,
+                        teid,
+                        "Bearer Resource Command",
+                        Gtp2MessageType::BearerResourceFailureIndication,
                     );
-                    if let Err(e) = server.send_request(pgw_peer, &relayed, 0) {
-                        server.take_command_relay(pgw_peer, s5c_seq);
-                        log::error!("Bearer Resource Command relay to {pgw_peer} failed: {e}");
-                        send_cause_response(
-                            server,
-                            peer,
-                            Gtp2MessageType::BearerResourceFailureIndication,
-                            teid,
-                            seq,
-                            gtp_cause::REMOTE_PEER_NOT_RESPONDING,
-                        );
-                    }
                 }
                 None => {
                     // Still the honest answer when there is no anchor to ask.
@@ -3567,6 +3723,130 @@ mod tests {
         bearer.ebi = 5;
         ctx.bearer_update(&bearer);
         (ue.id, ue.sgw_s11_teid, sess.sgw_s5c_teid)
+    }
+
+    /// A Command with one Bearer Context naming `ebi`, as the MME sends it.
+    fn bearer_command(t: Gtp2MessageType, s11_teid: u32, seq: u32, ebi: u8) -> Gtp2Message {
+        let mut msg = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(t as u8, s11_teid, seq));
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(ebi);
+        msg.add_bearer_context(0, &bc);
+        msg
+    }
+
+    /// #606: the MME's Delete Bearer Command and Modify Bearer Command reach the PGW of
+    /// the PDN connection their bearer belongs to, and the PGW's answer (the triggered
+    /// Delete Bearer Request, or a Failure Indication) reaches the MME under the MME's
+    /// number. A retransmitted Command is not relayed twice. Before #606 both Commands
+    /// fell to "[DROP] Unhandled GTPv2-C message type", so mmed's Delete Bearer Command
+    /// for an eNB-released bearer (#584) reached no PGW.
+    #[test]
+    fn delete_and_modify_bearer_commands_are_relayed_to_the_pgw() {
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let server = test_server(&ambient, 400, 3);
+        let mme = client();
+        let pgw = client();
+        sgwc_self().set_pgw_s5c_peer(Some(pgw.local_addr().unwrap()));
+        let (ue_id, s11_teid, s5c_teid) =
+            ue_with_pgw_session(mme.local_addr().unwrap(), b"001010606000001");
+        // A dedicated bearer 6 in the same PDN connection.
+        let ctx = sgwc_self();
+        let sess_id = ctx.bearer_find_by_ue_ebi(ue_id, 5).unwrap().sess_id;
+        let mut dedicated = ctx.bearer_add(sess_id).unwrap();
+        dedicated.ebi = 6;
+        ctx.bearer_update(&dedicated);
+
+        for (command, ebi, answer) in [
+            (
+                Gtp2MessageType::DeleteBearerCommand,
+                6,
+                Gtp2MessageType::DeleteBearerRequest,
+            ),
+            (
+                Gtp2MessageType::ModifyBearerCommand,
+                5,
+                Gtp2MessageType::ModifyBearerFailureIndication,
+            ),
+        ] {
+            let mme_seq = 0x0006_0600 + ebi as u32;
+            let cmd = bearer_command(command, s11_teid, mme_seq, ebi);
+            mme.send_to(&cmd.encode(), server.local_addr()).unwrap();
+            let relayed = recv_msg(&pgw);
+            assert_eq!(relayed.header.message_type, command as u8);
+            assert_eq!(
+                relayed.header.teid,
+                Some(0x0000_5c5c),
+                "addressed to the PDN connection's PGW S5/S8-C TEID"
+            );
+            let s5c_seq = relayed.header.sequence_number;
+            // The MME retransmits before the PGW answers: not relayed again.
+            mme.send_to(&cmd.encode(), server.local_addr()).unwrap();
+            pgw.set_read_timeout(Some(Duration::from_millis(250)))
+                .unwrap();
+            let mut buf = [0u8; 2048];
+            assert!(pgw.recv_from(&mut buf).is_err(), "relayed once");
+            pgw.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+
+            let mut rsp = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+                answer as u8,
+                s5c_teid,
+                s5c_seq,
+            ));
+            rsp.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Ebi as u8, 1, &[ebi]));
+            pgw.send_to(&rsp.encode(), server.local_addr()).unwrap();
+            let at_mme = recv_msg(&mme);
+            assert_eq!(at_mme.header.message_type, answer as u8);
+            assert_eq!(at_mme.header.sequence_number, mme_seq);
+            assert_eq!(at_mme.header.teid, Some(0x0000_0591));
+            if answer == Gtp2MessageType::DeleteBearerRequest {
+                let mut done = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+                    Gtp2MessageType::DeleteBearerResponse as u8,
+                    s11_teid,
+                    mme_seq,
+                ));
+                done.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Cause as u8, 0, &[16, 0]));
+                mme.send_to(&done.encode(), server.local_addr()).unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            assert!(server.inner.command_relays.lock().unwrap().is_empty());
+        }
+
+        // A bearer the UE does not hold, and no PGW at all: the Failure Indication.
+        let unknown = bearer_command(
+            Gtp2MessageType::DeleteBearerCommand,
+            s11_teid,
+            0x0606_0009,
+            9,
+        );
+        mme.send_to(&unknown.encode(), server.local_addr()).unwrap();
+        let fi = recv_msg(&mme);
+        assert_eq!(
+            fi.header.message_type,
+            Gtp2MessageType::DeleteBearerFailureIndication as u8
+        );
+        assert_eq!(
+            fi.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value[0],
+            gtp_cause::CONTEXT_NOT_FOUND
+        );
+        sgwc_self().set_pgw_s5c_peer(None);
+        let no_pgw = bearer_command(
+            Gtp2MessageType::ModifyBearerCommand,
+            s11_teid,
+            0x0606_000A,
+            5,
+        );
+        mme.send_to(&no_pgw.encode(), server.local_addr()).unwrap();
+        let fi = recv_msg(&mme);
+        assert_eq!(
+            fi.header.message_type,
+            Gtp2MessageType::ModifyBearerFailureIndication as u8
+        );
+        assert_eq!(
+            fi.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value[0],
+            gtp_cause::SERVICE_NOT_SUPPORTED
+        );
+        sgwc_self().ue_remove(ue_id);
+        server.close();
     }
 
     /// #591, TS 29.274 §7.6: a Bearer Resource Command relayed to the PGW is

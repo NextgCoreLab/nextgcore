@@ -911,6 +911,11 @@ impl NgapServer {
         // (#418, TS 23.502 §4.11.1.2.2.2 step 9). Dormant when none is queued.
         self.process_eps_to_5gs_preparations().await;
 
+        // Release every EPS→5GS preparation the source MME cancelled (#592, TS 23.502
+        // §4.11.1.2.3). AFTER the preparations, so a cancel for one queued in this same tick
+        // finds it.
+        self.process_eps_to_5gs_cancels().await;
+
         // Send the HandoverCommand (or HandoverPreparationFailure) for every 5GS→EPS
         // preparation the target MME answered (#476, TS 23.502 §4.11.1.2.1 step 11).
         self.process_fivegs_to_eps_answers().await;
@@ -9619,6 +9624,25 @@ pub(crate) struct EpsHoInFlight {
     mme_teid: u32,
     /// The PDN connections prepared at their SMFs.
     sessions: Vec<crate::n26_path::EpsHoSession>,
+    /// The Forward Relocation Request has been answered (accepted) and the target gNB's
+    /// RAN UE NGAP ID learned from its acknowledge (#592).
+    answered: bool,
+}
+
+/// What a Relocation Cancel Request did (#592), returned for assertion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EpsHandoverCancel {
+    /// The preparation was released.
+    Released {
+        /// The arriving UE's AMF UE NGAP ID.
+        amf_ue_ngap_id: u64,
+        /// The UE Context Release Command and the target association it went to.
+        release: Option<(u64, Vec<u8>)>,
+        /// SM contexts the SMFs were told are CANCELLED.
+        sessions_cancelled: usize,
+    },
+    /// No preparation matched; answered "IMSI/IMEI not known".
+    Unknown,
 }
 
 /// Where an EPS→5GS HandoverRequest went, or why it did not (#418).
@@ -9842,6 +9866,146 @@ impl NgapServer {
         }
     }
 
+    async fn process_eps_to_5gs_cancels(&mut self) {
+        for cancel in crate::n26_path::drain_eps_to_5gs_cancels() {
+            let _ = self.cancel_eps_to_5gs_handover(cancel).await;
+        }
+    }
+
+    /// TS 23.502 §4.11.1.2.3 steps 3-5 with this AMF as target (#592): the source MME
+    /// cancelled an EPS→5GS handover.
+    ///
+    /// - step 3: UE CONTEXT RELEASE COMMAND (handover-cancelled) to the target gNB, by AMF
+    ///   UE NGAP ID alone if the gNB has not acknowledged yet;
+    /// - the Forward Relocation Request, if still unanswered, is refused, so the MME's
+    ///   transaction closes rather than retransmitting into a new preparation;
+    /// - step 4b: each SMF is told `hoState` CANCELLED (`HO_CANCEL`);
+    /// - the UE context, its sessions and the mapped security context are deleted;
+    /// - step 5: Relocation Cancel Response, "Request accepted".
+    ///
+    /// A cancel naming no preparation is answered "IMSI/IMEI not known" (§7.3.17).
+    pub(crate) async fn cancel_eps_to_5gs_handover(
+        &mut self,
+        cancel: crate::n26_path::EpsToFivegsCancel,
+    ) -> EpsHandoverCancel {
+        let found = self.eps_ho_in_flight.keys().copied().find(|id| {
+            let by_supi = cancel.supi.is_some()
+                && self
+                    .ue_auth_state
+                    .get(*id)
+                    .is_some_and(|s| s.amf_ue.supi == cancel.supi);
+            let by_teid = cancel.amf_teid != 0 && *id as u32 == cancel.amf_teid;
+            by_supi || by_teid
+        });
+        let Some(amf_ue_ngap_id) = found else {
+            log::warn!(
+                "EPS→5GS: Relocation Cancel Request (seq={}) from MME {} names no preparation \
+                 here ({:?}, TEID {:#x}); answering 'IMSI/IMEI not known'",
+                cancel.seq,
+                cancel.mme_peer,
+                cancel.supi,
+                cancel.amf_teid
+            );
+            cancel
+                .server
+                .send_to_mme(
+                    cancel.mme_peer,
+                    &crate::n26_eps_to_5gs::build_relocation_cancel_response(
+                        cancel.seq,
+                        0,
+                        crate::n26_path::CAUSE_IMSI_IMEI_NOT_KNOWN,
+                    ),
+                )
+                .await;
+            return EpsHandoverCancel::Unknown;
+        };
+        let Some(in_flight) = self.eps_ho_in_flight.remove(&amf_ue_ngap_id) else {
+            return EpsHandoverCancel::Unknown;
+        };
+
+        // Step 3.
+        let release = self.ue_auth_state.get(amf_ue_ngap_id).and_then(|state| {
+            let ran = in_flight.answered.then_some(state.ran_ue_ngap_id);
+            crate::ngap_asn1::build_ue_context_release_command_ids_asn1(
+                amf_ue_ngap_id,
+                ran,
+                0, // RadioNetwork
+                5, // handover-cancelled (TS 38.413 §9.3.1.2)
+            )
+            .map(|pdu| (state.association_id, pdu))
+        });
+        if let Some((association_id, pdu)) = &release {
+            if let Err(e) = self.send_to_association(*association_id, pdu).await {
+                log::warn!(
+                    "EPS→5GS: the UE Context Release Command for cancelled UE {amf_ue_ngap_id} \
+                     could not be sent to association {association_id}: {e}"
+                );
+            }
+        }
+        if !in_flight.answered {
+            in_flight
+                .server
+                .send_to_mme(
+                    in_flight.mme_peer,
+                    &crate::n26_eps_to_5gs::build_forward_relocation_response_refusal(
+                        in_flight.seq,
+                        in_flight.mme_teid,
+                        crate::n26_eps_to_5gs::CAUSE_RELOCATION_FAILURE,
+                    ),
+                )
+                .await;
+        }
+        // Step 4b.
+        for sess in &in_flight.sessions {
+            if let Err(e) = crate::sbi_path::call_smf_cancel_sm_context_handover(
+                &sess.smf.0,
+                sess.smf.1,
+                &sess.created.sm_context_ref,
+            )
+            .await
+            {
+                log::warn!(
+                    "EPS→5GS: SMF {}:{} did not confirm the cancel of SM context {}: {e}",
+                    sess.smf.0,
+                    sess.smf.1,
+                    sess.created.sm_context_ref
+                );
+            }
+            self.sm_context_refs
+                .remove(&(amf_ue_ngap_id, sess.created.pdu_session_id));
+        }
+        self.ue_auth_state.remove(amf_ue_ngap_id);
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            for sess in guard.sess_list_for_ue(amf_ue_ngap_id) {
+                guard.sess_remove(sess.id);
+            }
+        }
+        // Step 5.
+        in_flight
+            .server
+            .send_to_mme(
+                in_flight.mme_peer,
+                &crate::n26_eps_to_5gs::build_relocation_cancel_response(
+                    cancel.seq,
+                    in_flight.mme_teid,
+                    crate::n26_eps_to_5gs::CAUSE_REQUEST_ACCEPTED,
+                ),
+            )
+            .await;
+        log::info!(
+            "EPS→5GS: the MME cancelled UE {amf_ue_ngap_id}'s handover; target gNB released, \
+             {} SM context(s) cancelled, Relocation Cancel Response sent",
+            in_flight.sessions.len()
+        );
+        EpsHandoverCancel::Released {
+            amf_ue_ngap_id,
+            release,
+            sessions_cancelled: in_flight.sessions.len(),
+        }
+    }
+
     async fn process_eps_to_5gs_preparations(&mut self) {
         for prep in crate::n26_path::drain_eps_to_5gs_preparations() {
             let _ = self.start_eps_to_5gs_handover(prep).await;
@@ -9918,6 +10082,7 @@ impl NgapServer {
             mme_peer: prep.mme_peer,
             mme_teid: prep.mme_teid,
             sessions: prep.sessions.clone(),
+            answered: false,
         };
         let Some(target_assoc) = target_assoc else {
             log::warn!(
@@ -10144,6 +10309,9 @@ impl NgapServer {
             &ack.target_to_source_container,
         );
         server.send_to_mme(mme_peer, &response).await;
+        if let Some(in_flight) = self.eps_ho_in_flight.get_mut(&ack.amf_ue_ngap_id) {
+            in_flight.answered = true;
+        }
         log::info!(
             "EPS→5GS (seq={seq}): Forward Relocation Response ACCEPTED to MME {mme_peer} for UE \
              {}: bearers {ebis:?} set up, target-to-source container {} octets \
@@ -24186,6 +24354,402 @@ mod eps_to_5gs_tests {
             "CANCELLED"
         );
         assert!(ngap.eps_ho_in_flight.is_empty());
+
+        crate::sbi_path::set_pgw_discovery_nrf_for_test(None);
+        restore_guami(previous_guami);
+    }
+
+    // ---- #592: Relocation Cancel (TS 23.502 §4.11.1.2.3) ----
+
+    /// A Relocation Cancel Request datagram (TS 29.274 Table 7.3.16-1), as an MME sends it.
+    fn relocation_cancel_request(seq: u32, amf_teid: u32, imsi: &str) -> Vec<u8> {
+        let mut msg = Gtp2Message::new(Gtp2Header::new(
+            Gtp2MessageType::RelocationCancelRequest as u8,
+            amf_teid,
+            seq,
+        ));
+        msg.add_ie(Gtp2Ie::from_slice(
+            Gtp2IeType::Imsi as u8,
+            0,
+            &crate::n26_path::string_to_bcd(imsi),
+        ));
+        msg.encode().to_vec()
+    }
+
+    async fn drained_cancel() -> crate::n26_path::EpsToFivegsCancel {
+        for _ in 0..100 {
+            if let Some(cancel) = crate::n26_path::drain_eps_to_5gs_cancels().pop() {
+                return cancel;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the cancel must reach the NGAP queue");
+    }
+
+    /// The UE NGAP IDs and the radio-network cause of a UE CONTEXT RELEASE COMMAND.
+    fn release_ids_and_cause(pdu: &[u8]) -> (nextgcore_ngap_gen::generated::UE_NGAP_IDs, u8) {
+        use nextgcore_ngap_gen::generated as g;
+        let g::NGAP_PDU::InitiatingMessage(m) = nextgcore_ngap_gen::decode(pdu).unwrap() else {
+            panic!("initiating message expected");
+        };
+        let g::InitiatingMessageValue::Id_UEContextRelease(cmd) = m.value else {
+            panic!("UE Context Release Command expected");
+        };
+        let mut ids = None;
+        let mut cause = None;
+        for ie in cmd.protocol_i_es.0 {
+            match ie.value {
+                g::UEContextReleaseCommandProtocolIEs_EntryValue::Id_UE_NGAP_IDs(v) => {
+                    ids = Some(v)
+                }
+                g::UEContextReleaseCommandProtocolIEs_EntryValue::Id_Cause(
+                    g::Cause::RadioNetwork(c),
+                ) => cause = Some(c.0),
+                _ => {}
+            }
+        }
+        (ids.unwrap(), cause.expect("a radio network cause"))
+    }
+
+    /// Runs a real Forward Relocation Request into the AMF up to the prepared HandoverRequest,
+    /// with the target gNB as association `ASSOC`.
+    async fn prepared_handover() -> (
+        Arc<crate::n26_path::N26Server>,
+        tokio::net::UdpSocket,
+        NgapServer,
+        u64,
+        mpsc::Receiver<Captured>,
+        SbiServer,
+        SbiServer,
+    ) {
+        let (smf, smf_port, mut smf_rx) = start_smf().await;
+        let (nrf, nrf_port, _nrf_rx) = start_nrf(smf_port, PGW_FQDN).await;
+        crate::sbi_path::set_pgw_discovery_nrf_for_test(Some(format!(
+            "http://127.0.0.1:{nrf_port}"
+        )));
+        let n26 = crate::n26_path::N26Server::open("127.0.0.1:0".parse().unwrap(), 1)
+            .await
+            .unwrap();
+        let mme = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        mme.send_to(
+            &forward_relocation_request([127, 0, 0, 1]),
+            n26.local_addr(),
+        )
+        .await
+        .unwrap();
+        let _create = recv_smf(&mut smf_rx).await;
+        let prep = drained_preparation().await;
+        let mut ngap = NgapServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            SctpBackend::Userspace,
+            mpsc::channel(64).0,
+        )
+        .await
+        .unwrap();
+        let mut session = GnbSession::new(
+            CANCEL_ASSOC,
+            CANCEL_ASSOC,
+            "127.0.0.1:38412".parse().unwrap(),
+        );
+        session.gnb.gnb_id = GNB_ID;
+        session.gnb.gnb_id_len = 22;
+        session.gnb.gnb_id_presence = true;
+        session.gnb.plmn_id = PlmnId::new("999", "70");
+        ngap.sessions.write().await.insert(CANCEL_ASSOC, session);
+        let (amf_ue_ngap_id, _, _) = ngap
+            .prepare_eps_to_5gs_handover_request(prep)
+            .await
+            .expect("prepared");
+        (n26, mme, ngap, amf_ue_ngap_id, smf_rx, smf, nrf)
+    }
+
+    const CANCEL_ASSOC: u64 = 0x592;
+
+    /// **#592**, cancel after the target gNB acknowledged (the MME holds the AMF's TEID): a
+    /// real type-139 datagram releases the target gNB's UE context (step 3), cancels the SM
+    /// context at the SMF (4b), deletes the UE, and is answered "Request accepted" (5). The
+    /// Forward Relocation Request was already answered, so it is not answered again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_relocation_cancel_after_the_acknowledge_releases_target_and_sm_context() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_support::init_context();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _ = crate::n26_path::drain_eps_to_5gs_preparations();
+        let _ = crate::n26_path::drain_eps_to_5gs_cancels();
+        let previous_guami = serve_guami_999_70();
+        let (n26, mme, mut ngap, amf_ue_ngap_id, mut smf_rx, _smf, _nrf) =
+            prepared_handover().await;
+
+        let ack = nextgcore_ngap::builder::build_handover_request_acknowledge(
+            &nextgcore_ngap::types::HandoverRequestAcknowledge {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id: 77,
+                admitted_list: vec![nextgcore_ngap::types::PduSessionResourceAdmittedItemHoAck {
+                    pdu_session_id: 5,
+                    transfer: vec![0x00, 0x03, 0xE0, 0x0A],
+                }],
+                failed_list: None,
+                target_to_source_container: vec![0xC0, 0xFE],
+            },
+        )
+        .unwrap();
+        ngap.handle_handover_request_acknowledge(CANCEL_ASSOC, &ack)
+            .await
+            .unwrap();
+        let _prepared = recv_smf(&mut smf_rx).await;
+        assert_eq!(recv_gtp(&mme).await.header.message_type, 134);
+
+        mme.send_to(
+            &relocation_cancel_request(0x5920, amf_ue_ngap_id as u32, "001010000004180"),
+            n26.local_addr(),
+        )
+        .await
+        .unwrap();
+        let cancel = drained_cancel().await;
+        assert_eq!(cancel.supi.as_deref(), Some("imsi-001010000004180"));
+        let outcome = ngap.cancel_eps_to_5gs_handover(cancel).await;
+        let EpsHandoverCancel::Released {
+            release: Some((association, pdu)),
+            sessions_cancelled,
+            ..
+        } = outcome
+        else {
+            panic!("released expected: {outcome:?}");
+        };
+        assert_eq!(
+            association, CANCEL_ASSOC,
+            "the release goes to the target gNB"
+        );
+        assert_eq!(sessions_cancelled, 1);
+        let (ids, cause) = release_ids_and_cause(&pdu);
+        assert_eq!(
+            ids,
+            nextgcore_ngap_gen::generated::UE_NGAP_IDs::UE_NGAP_ID_pair(
+                nextgcore_ngap_gen::generated::UE_NGAP_ID_pair {
+                    amf_ue_ngap_id: nextgcore_ngap_gen::generated::AMF_UE_NGAP_ID(amf_ue_ngap_id),
+                    ran_ue_ngap_id: nextgcore_ngap_gen::generated::RAN_UE_NGAP_ID(77),
+                    ie_extensions: None,
+                }
+            ),
+            "the gNB's RAN UE NGAP ID is known from its acknowledge"
+        );
+        assert_eq!(cause, 5, "handover-cancelled");
+
+        let (uri, body, _) = recv_smf(&mut smf_rx).await;
+        assert!(uri.ends_with("/sm-contexts/418/modify"), "{uri}");
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["hoState"], "CANCELLED");
+        assert_eq!(body["cause"], "HO_CANCEL");
+
+        let response = recv_gtp(&mme).await;
+        assert_eq!(
+            response.header.message_type, 140,
+            "Relocation Cancel Response"
+        );
+        assert_eq!(response.header.sequence_number, 0x5920);
+        assert_eq!(response.header.teid, Some(MME_TEID));
+        assert_eq!(
+            Gtp2CauseIe::decode(&response.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+                .unwrap()
+                .cause,
+            16
+        );
+        assert!(ngap.eps_ho_in_flight.is_empty());
+        assert!(ngap.ue_auth_state.get(amf_ue_ngap_id).is_none());
+        assert!(!ngap.sm_context_refs.contains_key(&(amf_ue_ngap_id, 5)));
+        assert!(crate::context::amf_self()
+            .read()
+            .unwrap()
+            .sess_list_for_ue(amf_ue_ngap_id)
+            .is_empty());
+
+        crate::sbi_path::set_pgw_discovery_nrf_for_test(None);
+        restore_guami(previous_guami);
+    }
+
+    /// **#592**, cancel before the target gNB answered: the release names the UE by AMF UE
+    /// NGAP ID alone, and the still-unanswered Forward Relocation Request is refused before
+    /// the Relocation Cancel Response, so the MME's request transaction closes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_relocation_cancel_before_the_acknowledge_also_answers_the_request() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_support::init_context();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _ = crate::n26_path::drain_eps_to_5gs_preparations();
+        let _ = crate::n26_path::drain_eps_to_5gs_cancels();
+        let previous_guami = serve_guami_999_70();
+        let (n26, mme, mut ngap, amf_ue_ngap_id, mut smf_rx, _smf, _nrf) =
+            prepared_handover().await;
+
+        mme.send_to(
+            &relocation_cancel_request(0x5921, 0, "001010000004180"),
+            n26.local_addr(),
+        )
+        .await
+        .unwrap();
+        let outcome = ngap
+            .cancel_eps_to_5gs_handover(drained_cancel().await)
+            .await;
+        let EpsHandoverCancel::Released {
+            release: Some((_, pdu)),
+            ..
+        } = outcome
+        else {
+            panic!("released expected: {outcome:?}");
+        };
+        assert_eq!(
+            release_ids_and_cause(&pdu).0,
+            nextgcore_ngap_gen::generated::UE_NGAP_IDs::AMF_UE_NGAP_ID(
+                nextgcore_ngap_gen::generated::AMF_UE_NGAP_ID(amf_ue_ngap_id)
+            )
+        );
+        let refusal = recv_gtp(&mme).await;
+        assert_eq!(refusal.header.message_type, 134);
+        assert_eq!(refusal.header.sequence_number, SEQ);
+        let (_, body, _) = recv_smf(&mut smf_rx).await;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["cause"],
+            "HO_CANCEL"
+        );
+        let response = recv_gtp(&mme).await;
+        assert_eq!(response.header.message_type, 140);
+        assert_eq!(response.header.teid, Some(MME_TEID));
+        assert!(ngap.eps_ho_in_flight.is_empty());
+
+        crate::sbi_path::set_pgw_discovery_nrf_for_test(None);
+        restore_guami(previous_guami);
+    }
+
+    /// A cancel naming nothing this AMF prepares is answered "IMSI/IMEI not known" (§7.3.17),
+    /// at TEID 0 since this AMF has no MME TEID for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_relocation_cancel_for_an_unknown_ue_is_answered_imsi_not_known() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_support::init_context();
+        let _ = crate::n26_path::drain_eps_to_5gs_cancels();
+        let n26 = crate::n26_path::N26Server::open("127.0.0.1:0".parse().unwrap(), 1)
+            .await
+            .unwrap();
+        let mme = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        mme.send_to(
+            &relocation_cancel_request(0x5922, 0, "001019999999999"),
+            n26.local_addr(),
+        )
+        .await
+        .unwrap();
+        let mut ngap = NgapServer::new(
+            "127.0.0.1:0".parse().unwrap(),
+            SctpBackend::Userspace,
+            mpsc::channel(64).0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ngap.cancel_eps_to_5gs_handover(drained_cancel().await)
+                .await,
+            EpsHandoverCancel::Unknown
+        );
+        let response = recv_gtp(&mme).await;
+        assert_eq!(response.header.message_type, 140);
+        assert_eq!(response.header.sequence_number, 0x5922);
+        assert_eq!(response.header.teid, Some(0));
+        assert_eq!(
+            Gtp2CauseIe::decode(&response.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+                .unwrap()
+                .cause,
+            96,
+            "IMSI/IMEI not known (TS 29.274 Table 8.4-1)"
+        );
+    }
+
+    /// A cancel that arrives while the preparation is still at its SMFs marks it, and the
+    /// N26 leg then abandons it instead of handing it to the NGAP layer: the SMF is told
+    /// CANCELLED and the Forward Relocation Request refused (#592).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(clippy::await_holding_lock)]
+    async fn a_cancel_during_the_smf_round_trips_abandons_the_preparation() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_support::init_context();
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _ = crate::n26_path::drain_eps_to_5gs_preparations();
+        let _ = crate::n26_path::drain_eps_to_5gs_cancels();
+        let previous_guami = serve_guami_999_70();
+        let (_smf, smf_port, mut smf_rx) = start_smf().await;
+        let (_nrf, nrf_port, _nrf_rx) = start_nrf(smf_port, PGW_FQDN).await;
+        crate::sbi_path::set_pgw_discovery_nrf_for_test(Some(format!(
+            "http://127.0.0.1:{nrf_port}"
+        )));
+        let n26 = crate::n26_path::N26Server::open("127.0.0.1:0".parse().unwrap(), 1)
+            .await
+            .unwrap();
+        let mme = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        mme.send_to(
+            &forward_relocation_request([127, 0, 0, 1]),
+            n26.local_addr(),
+        )
+        .await
+        .unwrap();
+        let _create = recv_smf(&mut smf_rx).await;
+        let prep = drained_preparation().await;
+        let supi = prep.supi.clone().expect("supi");
+
+        // The N26 leg's state while the SMF round trips run.
+        let in_progress = crate::n26_path::PreparationGuard::start(Some(&supi), MME_TEID);
+        let routed = crate::n26_path::route_relocation_cancel(crate::n26_path::EpsToFivegsCancel {
+            server: Arc::clone(&prep.server),
+            seq: 0x5923,
+            mme_peer: mme.local_addr().unwrap(),
+            supi: Some(supi.clone()),
+            amf_teid: 0,
+        });
+        assert_eq!(
+            routed,
+            crate::n26_path::CancelOnN26::MarkedInProgress { mme_teid: MME_TEID }
+        );
+        assert_eq!(
+            crate::n26_path::preparation_in_progress_for_test(&supi),
+            Some((MME_TEID, true))
+        );
+        assert!(crate::n26_path::drain_eps_to_5gs_cancels().is_empty());
+        let server = Arc::clone(&prep.server);
+        let cancelled = crate::n26_path::hand_over_unless_cancelled(prep)
+            .expect("a cancelled preparation is not handed over");
+        assert!(crate::n26_path::drain_eps_to_5gs_preparations().is_empty());
+        drop(in_progress);
+        server.abandon_cancelled_preparation(cancelled).await;
+        let (uri, body, _) = recv_smf(&mut smf_rx).await;
+        assert!(uri.ends_with("/sm-contexts/418/modify"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["hoState"],
+            "CANCELLED"
+        );
+        let refusal = recv_gtp(&mme).await;
+        assert_eq!(refusal.header.message_type, 134);
+        assert_eq!(refusal.header.sequence_number, SEQ);
+
+        // With nothing in progress the cancel goes to the NGAP layer instead.
+        assert_eq!(
+            crate::n26_path::route_relocation_cancel(crate::n26_path::EpsToFivegsCancel {
+                server: Arc::clone(&n26),
+                seq: 0x5924,
+                mme_peer: mme.local_addr().unwrap(),
+                supi: Some(supi),
+                amf_teid: 0,
+            }),
+            crate::n26_path::CancelOnN26::Queued
+        );
+        assert_eq!(crate::n26_path::drain_eps_to_5gs_cancels().len(), 1);
 
         crate::sbi_path::set_pgw_discovery_nrf_for_test(None);
         restore_guami(previous_guami);

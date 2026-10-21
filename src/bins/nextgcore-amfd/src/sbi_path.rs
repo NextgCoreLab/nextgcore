@@ -3776,13 +3776,44 @@ pub async fn call_smf_update_sm_context_ho_state(
     ho_state: &str,
     n2: Option<(&str, &[u8])>,
 ) -> Result<Vec<Vec<u8>>, String> {
+    let cause = (ho_state == "CANCELLED").then_some("HO_FAILURE");
+    update_sm_context_ho_state(smf_host, smf_port, sm_context_ref, ho_state, cause, n2).await
+}
+
+/// Tell the SMF an EPS→5GS handover the source cancelled is CANCELLED (#592, TS 23.502
+/// §4.11.1.2.3 step 4b; TS 29.502 §5.2.2.3.8.4 applies §5.2.2.3.4.4): `hoState` CANCELLED
+/// with cause `HO_CANCEL` (a cancel, where `HO_FAILURE` is §5.2.2.3.8.5's target refusal).
+pub async fn call_smf_cancel_sm_context_handover(
+    smf_host: &str,
+    smf_port: u16,
+    sm_context_ref: &str,
+) -> Result<Vec<Vec<u8>>, String> {
+    update_sm_context_ho_state(
+        smf_host,
+        smf_port,
+        sm_context_ref,
+        "CANCELLED",
+        Some("HO_CANCEL"),
+        None,
+    )
+    .await
+}
+
+async fn update_sm_context_ho_state(
+    smf_host: &str,
+    smf_port: u16,
+    sm_context_ref: &str,
+    ho_state: &str,
+    cause: Option<&str>,
+    n2: Option<(&str, &[u8])>,
+) -> Result<Vec<Vec<u8>>, String> {
     let client = crate::attach_oauth2(
         SbiClient::for_peer(smf_host, smf_port),
         nextgcore_sbi::types::NfType::Smf,
     );
     let mut body = serde_json::json!({ "hoState": ho_state });
-    if ho_state == "CANCELLED" {
-        body["cause"] = serde_json::json!("HO_FAILURE");
+    if let Some(cause) = cause {
+        body["cause"] = serde_json::json!(cause);
     }
     let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify");
     let mut request = SbiRequest::post(&path);

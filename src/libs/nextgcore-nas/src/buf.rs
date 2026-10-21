@@ -9,6 +9,46 @@
 use crate::error::{NasError, NasResult};
 use bytes::{Buf, Bytes};
 
+/// The declared-length rule of a fixed-layout IE (#613).
+///
+/// A length below the IE's minimum makes it syntactically incorrect, and the
+/// decoder must not borrow octets of the next IE to fill its fields (TS 24.501
+/// §7.5 / §7.7.1, TS 24.301 §7.5 / §7.7.1). Whether octets beyond the known
+/// fields are an error depends on the IE's own definition, so each call site
+/// cites the clause that picks the rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IeLen {
+    /// The definition fixes the length ("a length of N octets"). Any other
+    /// declared length is an erroneous IE.
+    Exact(usize),
+    /// The definition gives a minimum and marks the octets after it optional or
+    /// spare, so later releases may add fields. Octets beyond the known ones are
+    /// skipped inside the IE, never read as the next IE.
+    AtLeast(usize),
+    /// The definition bounds the value part on both sides (e.g. RES is 4 to 16
+    /// octets) and nothing may follow it.
+    Between(usize, usize),
+}
+
+impl IeLen {
+    /// Check a declared value-part length against the rule.
+    pub(crate) fn check(self, len: usize) -> NasResult<()> {
+        let bad = |expected| {
+            Err(NasError::InvalidIeLength {
+                expected,
+                actual: len,
+            })
+        };
+        match self {
+            Self::Exact(n) if len != n => bad(n),
+            Self::AtLeast(n) if len < n => bad(n),
+            Self::Between(min, _) if len < min => bad(min),
+            Self::Between(_, max) if len > max => bad(max),
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Bounds-checked counterparts of the `bytes::Buf` getters.
 pub(crate) trait NasBuf: Buf {
     /// Fail unless at least `n` bytes remain.
@@ -73,6 +113,25 @@ pub(crate) trait NasBuf: Buf {
     fn read_bytes(&mut self, n: usize) -> NasResult<Bytes> {
         self.need(n)?;
         Ok(self.copy_to_bytes(n))
+    }
+
+    /// Read an LV value part (1-octet length): check the declared length
+    /// against `rule`, then return exactly that many octets. The caller decodes
+    /// its fields inside the returned buffer, so the IE consumes its own length
+    /// and no more, whatever the fields need.
+    #[inline]
+    fn read_lv(&mut self, rule: IeLen) -> NasResult<Bytes> {
+        let len = self.read_u8()? as usize;
+        rule.check(len)?;
+        self.read_bytes(len)
+    }
+
+    /// [`read_lv`](Self::read_lv) for an LV-E value part (2-octet length).
+    #[inline]
+    fn read_lv_e(&mut self, rule: IeLen) -> NasResult<Bytes> {
+        let len = self.read_u16()? as usize;
+        rule.check(len)?;
+        self.read_bytes(len)
     }
 
     /// Discard exactly `n` bytes.

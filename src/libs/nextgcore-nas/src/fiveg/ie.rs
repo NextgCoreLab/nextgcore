@@ -2,7 +2,7 @@
 //!
 //! Based on 3GPP TS 24.501 Section 9.11
 
-use crate::buf::NasBuf;
+use crate::buf::{IeLen, NasBuf};
 use crate::common::types::*;
 use crate::error::{NasError, NasResult};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -42,19 +42,12 @@ impl FiveGmmCapability {
 
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
-        if buf.remaining() < 2 {
-            return Err(NasError::BufferTooShort {
-                expected: 2,
-                actual: buf.remaining(),
-            });
-        }
-        let length = buf.read_u8()?;
-        let byte = buf.read_u8()?;
-        let additional = if length > 1 {
-            buf.read_bytes((length - 1) as usize)?.to_vec()
-        } else {
-            Vec::new()
-        };
+        // §9.11.3.1: 3 to 15 octets, octets 4-15 optional, so it grows by
+        // release: at least octet 3, the rest kept as `additional`.
+        let mut ie = buf.read_lv(IeLen::AtLeast(1))?;
+        let length = ie.len() as u8;
+        let byte = ie.read_u8()?;
+        let additional = ie.to_vec();
 
         Ok(Self {
             length,
@@ -151,18 +144,11 @@ impl PduSessionStatus {
 
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
-        if buf.remaining() < 3 {
-            return Err(NasError::BufferTooShort {
-                expected: 3,
-                actual: buf.remaining(),
-            });
-        }
-        let length = buf.read_u8()?;
-        let psi = buf.read_u16_le()?;
-        // Skip any additional bytes
-        if length > 2 {
-            buf.skip((length - 2) as usize)?;
-        }
+        // §9.11.3.44: 4 to 34 octets; octets 5-34 are spare "if included", so a
+        // longer IE is skipped inside its length. Below 2 the bitmap is missing.
+        let mut ie = buf.read_lv(IeLen::AtLeast(2))?;
+        let length = ie.len() as u8;
+        let psi = ie.read_u16_le()?;
         Ok(Self { length, psi })
     }
 }
@@ -186,17 +172,11 @@ impl UplinkDataStatus {
 
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
-        if buf.remaining() < 3 {
-            return Err(NasError::BufferTooShort {
-                expected: 3,
-                actual: buf.remaining(),
-            });
-        }
-        let length = buf.read_u8()?;
-        let psi = buf.read_u16_le()?;
-        if length > 2 {
-            buf.skip((length - 2) as usize)?;
-        }
+        // §9.11.3.57: 4 to 34 octets; octets 5-34 are spare "if included", so a
+        // longer IE is skipped inside its length. Below 2 the bitmap is missing.
+        let mut ie = buf.read_lv(IeLen::AtLeast(2))?;
+        let length = ie.len() as u8;
+        let psi = ie.read_u16_le()?;
         Ok(Self { length, psi })
     }
 }
@@ -220,17 +200,11 @@ impl AllowedPduSessionStatus {
 
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
-        if buf.remaining() < 3 {
-            return Err(NasError::BufferTooShort {
-                expected: 3,
-                actual: buf.remaining(),
-            });
-        }
-        let length = buf.read_u8()?;
-        let psi = buf.read_u16_le()?;
-        if length > 2 {
-            buf.skip((length - 2) as usize)?;
-        }
+        // §9.11.3.13: 4 to 34 octets; octets 5-34 are spare "if included", so a
+        // longer IE is skipped inside its length. Below 2 the bitmap is missing.
+        let mut ie = buf.read_lv(IeLen::AtLeast(2))?;
+        let length = ie.len() as u8;
+        let psi = ie.read_u16_le()?;
         Ok(Self { length, psi })
     }
 }
@@ -668,20 +642,13 @@ impl SessionAmbr {
     }
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
-        if buf.remaining() < 7 {
-            return Err(NasError::BufferTooShort {
-                expected: 7,
-                actual: buf.remaining(),
-            });
-        }
-        let length = buf.read_u8()?;
-        let dl_unit = buf.read_u8()?;
-        let dl_value = buf.read_u16()?;
-        let ul_unit = buf.read_u8()?;
-        let ul_value = buf.read_u16()?;
-        if length > 6 {
-            buf.skip((length - 6) as usize)?;
-        }
+        // §9.11.4.14: "a length of 8 octets", i.e. exactly 6 value octets.
+        let mut ie = buf.read_lv(IeLen::Exact(6))?;
+        let length = ie.len() as u8;
+        let dl_unit = ie.read_u8()?;
+        let dl_value = ie.read_u16()?;
+        let ul_unit = ie.read_u8()?;
+        let ul_value = ie.read_u16()?;
         Ok(Self {
             length,
             dl_unit,
@@ -708,25 +675,11 @@ impl PduAddress {
     }
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
-        if buf.remaining() < 2 {
-            return Err(NasError::BufferTooShort {
-                expected: 2,
-                actual: buf.remaining(),
-            });
-        }
-        let length = buf.read_u8()? as usize;
-        if buf.remaining() < length {
-            return Err(NasError::BufferTooShort {
-                expected: length,
-                actual: buf.remaining(),
-            });
-        }
-        let pdu_session_type = buf.read_u8()? & 0x07;
-        let address = if length > 1 {
-            buf.read_bytes(length - 1)?.to_vec()
-        } else {
-            Vec::new()
-        };
+        // §9.11.4.10: 7 to 31 octets, so at least the type octet and an IPv4
+        // address. The address length depends on the type, so it is kept whole.
+        let mut ie = buf.read_lv(IeLen::AtLeast(5))?;
+        let pdu_session_type = ie.read_u8()? & 0x07;
+        let address = ie.to_vec();
         Ok(Self {
             pdu_session_type,
             address,
@@ -758,18 +711,11 @@ impl AiMlCapability {
     }
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
-        if buf.remaining() < 4 {
-            return Err(NasError::BufferTooShort {
-                expected: 4,
-                actual: buf.remaining(),
-            });
-        }
-        let length = buf.read_u8()? as usize;
-        let capability_flags = buf.read_u8()?;
-        let max_model_size_kb = buf.read_u16()?;
-        if length > 3 {
-            buf.skip(length - 3)?;
-        }
+        // No 3GPP definition (6G prototype): the fixed fields must be present,
+        // and octets after them are skipped inside the IE, as before (#613).
+        let mut ie = buf.read_lv(IeLen::AtLeast(3))?;
+        let capability_flags = ie.read_u8()?;
+        let max_model_size_kb = ie.read_u16()?;
         Ok(Self {
             capability_flags,
             max_model_size_kb,
@@ -797,19 +743,12 @@ impl IsacParameter {
     }
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
-        if buf.remaining() < 4 {
-            return Err(NasError::BufferTooShort {
-                expected: 4,
-                actual: buf.remaining(),
-            });
-        }
-        let length = buf.read_u8()? as usize;
-        let mode_flags = buf.read_u8()?;
-        let sensing_resolution = buf.read_u8()?;
-        let max_sensing_range = buf.read_u8()?;
-        if length > 3 {
-            buf.skip(length - 3)?;
-        }
+        // No 3GPP definition (6G prototype): the fixed fields must be present,
+        // and octets after them are skipped inside the IE, as before (#613).
+        let mut ie = buf.read_lv(IeLen::AtLeast(3))?;
+        let mode_flags = ie.read_u8()?;
+        let sensing_resolution = ie.read_u8()?;
+        let max_sensing_range = ie.read_u8()?;
         Ok(Self {
             mode_flags,
             sensing_resolution,
@@ -835,18 +774,11 @@ impl SemanticCommParameter {
     }
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
-        if buf.remaining() < 3 {
-            return Err(NasError::BufferTooShort {
-                expected: 3,
-                actual: buf.remaining(),
-            });
-        }
-        let length = buf.read_u8()? as usize;
-        let capability_flags = buf.read_u8()?;
-        let codec_type = buf.read_u8()?;
-        if length > 2 {
-            buf.skip(length - 2)?;
-        }
+        // No 3GPP definition (6G prototype): the fixed fields must be present,
+        // and octets after them are skipped inside the IE, as before (#613).
+        let mut ie = buf.read_lv(IeLen::AtLeast(2))?;
+        let capability_flags = ie.read_u8()?;
+        let codec_type = ie.read_u8()?;
         Ok(Self {
             capability_flags,
             codec_type,
@@ -874,19 +806,12 @@ impl SubThzBandParameter {
     }
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
-        if buf.remaining() < 5 {
-            return Err(NasError::BufferTooShort {
-                expected: 5,
-                actual: buf.remaining(),
-            });
-        }
-        let length = buf.read_u8()? as usize;
-        let band_flags = buf.read_u8()?;
-        let max_bandwidth_mhz = buf.read_u16()?;
-        let beam_tracking_interval_ms = buf.read_u8()?;
-        if length > 4 {
-            buf.skip(length - 4)?;
-        }
+        // No 3GPP definition (6G prototype): the fixed fields must be present,
+        // and octets after them are skipped inside the IE, as before (#613).
+        let mut ie = buf.read_lv(IeLen::AtLeast(4))?;
+        let band_flags = ie.read_u8()?;
+        let max_bandwidth_mhz = ie.read_u16()?;
+        let beam_tracking_interval_ms = ie.read_u8()?;
         Ok(Self {
             band_flags,
             max_bandwidth_mhz,
@@ -912,18 +837,11 @@ impl NtnTimingAdvance {
     }
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
-        if buf.remaining() < 6 {
-            return Err(NasError::BufferTooShort {
-                expected: 6,
-                actual: buf.remaining(),
-            });
-        }
-        let length = buf.read_u8()? as usize;
-        let timing_advance = buf.read_u32()?;
-        let flags = buf.read_u8()?;
-        if length > 5 {
-            buf.skip(length - 5)?;
-        }
+        // No 3GPP definition (6G prototype): the fixed fields must be present,
+        // and octets after them are skipped inside the IE, as before (#613).
+        let mut ie = buf.read_lv(IeLen::AtLeast(5))?;
+        let timing_advance = ie.read_u32()?;
+        let flags = ie.read_u8()?;
         Ok(Self {
             timing_advance,
             ta_valid: (flags & 0x01) != 0,
@@ -951,19 +869,12 @@ impl NtnAccessBarring {
     }
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
-        if buf.remaining() < 6 {
-            return Err(NasError::BufferTooShort {
-                expected: 6,
-                actual: buf.remaining(),
-            });
-        }
-        let length = buf.read_u8()? as usize;
-        let barring_factor = buf.read_u8()?;
-        let barring_time_seconds = buf.read_u16()?;
-        let ac_barring_flags = buf.read_u16()?;
-        if length > 5 {
-            buf.skip(length - 5)?;
-        }
+        // No 3GPP definition (6G prototype): the fixed fields must be present,
+        // and octets after them are skipped inside the IE, as before (#613).
+        let mut ie = buf.read_lv(IeLen::AtLeast(5))?;
+        let barring_factor = ie.read_u8()?;
+        let barring_time_seconds = ie.read_u16()?;
+        let ac_barring_flags = ie.read_u16()?;
         Ok(Self {
             barring_factor,
             barring_time_seconds,
