@@ -2061,6 +2061,16 @@ mod tests {
     /// wrongly-positioned IE passes a sloppy test.
     #[test]
     fn registration_accept_carries_iwk_n26_only_for_an_s1_mode_ue() {
+        // The IWK N26 bit follows the process-global N26 switch, which
+        // `iwk_n26_posture_follows_the_runtime_switch` and the N26 tests flip under
+        // CONTEXT_GUARD. Reading it unlocked let this test see a sibling's value
+        // (0x00 instead of 0x40) under parallel load. Take the same guard and pin the
+        // switch off -- the posture this test asserts -- rather than add a second lock
+        // over the same global, which #276 showed hangs the suite.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::n26_path::set_for_test(false);
         let mut ue = create_test_amf_ue();
         ue.access_type = 1;
         ue.next_guti.tmsi = 0; // omit the GUTI IE, to keep the expected image short
