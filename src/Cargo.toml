@@ -57,6 +57,8 @@ members = [
     "bins/nextgcore-dccfd",
     "bins/nextgcore-easdfd",
     "bins/nextgcore-tsctsf",
+    # Rel-16 RACS (TS 23.501 5.4.4.1a)
+    "bins/nextgcore-ucmfd",
 
     # WebUI
     "bins/nextgcore-webui",
