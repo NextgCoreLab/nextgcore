@@ -12155,6 +12155,10 @@ mod handover_required_tests {
             report.procedure.procedure_code,
             ngap_gen::ID_HANDOVER_PREPARATION
         );
+        assert_eq!(
+            hand_written_diagnostics(&report).ies[0].ie_criticality,
+            nextgcore_asn1c::ngap::types::Criticality::Notify
+        );
         // reject: rejected, naming the IE and both UE ids.
         let NasTransportDecode::Reject(report) =
             decode_handover_required_asn1(&with_unknown_ie(&base, 9999, 0x00))
@@ -12165,6 +12169,12 @@ mod handover_required_tests {
         assert_eq!(report.ran_ue_ngap_id, Some(7));
         let diag = hand_written_diagnostics(&report);
         assert_eq!(diag.ies[0].ie_id, 9999);
+        assert_eq!(
+            diag.ies[0].ie_criticality,
+            nextgcore_asn1c::ngap::types::Criticality::Reject
+        );
+        assert_eq!(diag.ies[0].type_of_error, TypeOfError::NotUnderstood);
+        assert_eq!(diag.procedure_code, Some(ngap_gen::ID_HANDOVER_PREPARATION));
         // A missing mandatory reject IE is rejected as Missing; a missing Cause
         // (criticality ignore) is misc/unspecified.
         for id in [
