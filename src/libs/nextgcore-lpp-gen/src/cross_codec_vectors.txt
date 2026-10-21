@@ -1,0 +1,27 @@
+EXACT	ecid 0/0	92132809230000001928218000000C9418000000C9418000000C94
+EXACT	ecid 42/1850	92132809230A81CE9928218540E74C9418540E74C9418540E74C94
+EXACT	ecid 503/65535	92132809237DFFFFD92821BEFFFFEC941BEFFFFEC941BEFFFFEC94
+EXACT	ecid n 0 meas [true]	9001200820
+EXACT	ecid n 0 meas [true, false, true]	90012008A8
+EXACT	ecid n 0 meas [true, true, true, true, true, true, true, true]	90012009FFC0
+EXACT	ecid n 127 meas [true]	90FE200820
+EXACT	ecid n 127 meas [true, false, true]	90FE2008A8
+EXACT	ecid n 127 meas [true, true, true, true, true, true, true, true]	90FE2009FFC0
+EXACT	ecid n 1 meas [true]	9002200820
+EXACT	ecid n 1 meas [true, false, true]	90022008A8
+EXACT	ecid n 1 meas [true, true, true, true, true, true, true, true]	90022009FFC0
+EXACT	ecid n 255 meas [true]	91FE200820
+EXACT	ecid n 255 meas [true, false, true]	91FE2008A8
+EXACT	ecid n 255 meas [true, true, true, true, true, true, true, true]	91FE2009FFC0
+EXACT	minimal	00
+EXACT	ProvideCapabilities	9203084898
+EXACT	ProvideLocationInformation	920F28090018540E74C940
+EXACT	RequestCapabilities	92020048
+EXACT	RequestLocationInformation	9001200930
+VALUE	nr-dl-tdoa request n 0 meas [true]	900020800A042230
+VALUE	nr-dl-tdoa request n 0 meas [true, false, true]	900020800A0422AC
+VALUE	nr-dl-tdoa request n 255 meas [true]	91FE20800A042830
+VALUE	nr-dl-tdoa request n 255 meas [true, false, true]	91FE20800A0428AC
+VALUE	nr provide	921328800A282801401440A3D93880080A3DD78AC400000C5400
+VALUE	nr provide	921328800A282801401440A3D93880080A3DD78AC5E8480C5400
+VALUE	nr provide	921B28800A24880051028F64E2001493E04051EEBC5662A0
