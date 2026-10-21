@@ -3682,6 +3682,392 @@ pub fn build_overload_stop_asn1() -> Option<Vec<u8>> {
     }
 }
 
+/// The hand-written Cause a generated one maps to; misc/unspecified for a
+/// choice extension, which has no group.
+fn hand_written_cause(cause: &ngap_gen::Cause) -> Cause {
+    match cause_pair(cause) {
+        Some((group, value)) => build_cause(group, value),
+        None => Cause::Misc(CauseMisc::Unspecified),
+    }
+}
+
+/// The [`CriticalityErrorIndication`] reporting `diagnostics` of a received
+/// handover-family message.
+fn handover_report(
+    procedure_code: u8,
+    triggering_message: u8,
+    procedure_criticality: u8,
+    ids: (Option<u64>, Option<u32>),
+    cause_protocol: u8,
+    diagnostics: Vec<IeDiagnostic>,
+) -> CriticalityErrorIndication {
+    CriticalityErrorIndication {
+        amf_ue_ngap_id: ids.0,
+        ran_ue_ngap_id: ids.1,
+        cause_protocol,
+        procedure: ReportedProcedure {
+            procedure_code,
+            triggering_message,
+            procedure_criticality,
+        },
+        diagnostics,
+    }
+}
+
+/// Decode a HANDOVER CANCEL (TS 38.413 §9.2.3.8) with the GENERATED codec
+/// (#417), applying §10.3.4.2/§10.3.5. Both UE NGAP IDs are mandatory with
+/// criticality reject; Cause is criticality ignore. The procedure has a
+/// response (HANDOVER CANCEL ACKNOWLEDGE) and no unsuccessful outcome: a
+/// "notify" IE comes back in `error_indication` for the caller to report in
+/// the Acknowledge's Criticality Diagnostics, and a "reject" one terminates
+/// the procedure with an Error Indication.
+pub fn decode_handover_cancel_asn1(data: &[u8]) -> NasTransportDecode<HandoverCancel> {
+    use ngap_gen::HandoverCancelProtocolIEs_EntryValue as Ie;
+    let Some((criticality, ies, mut reject, notify)) =
+        decode_initiating(data, "Handover Cancel", |v| match v {
+            ngap_gen::InitiatingMessageValue::Id_HandoverCancel(m) => Some(m.protocol_i_es.0),
+            _ => None,
+        })
+    else {
+        return NasTransportDecode::Undecodable;
+    };
+    let (mut amf, mut ran, mut cause) = (None, None, None);
+    for entry in ies {
+        match entry.value {
+            Ie::Id_AMF_UE_NGAP_ID(v) => amf = Some(v.0),
+            Ie::Id_RAN_UE_NGAP_ID(v) => ran = Some(v.0),
+            Ie::Id_Cause(v) => cause = Some(hand_written_cause(&v)),
+        }
+    }
+    if amf.is_none() {
+        reject.push(missing_ie(ngap_gen::ID_AMF_UE_NGAP_ID));
+    }
+    if ran.is_none() {
+        reject.push(missing_ie(ngap_gen::ID_RAN_UE_NGAP_ID));
+    }
+    let report = |cause_protocol, diagnostics| {
+        handover_report(
+            ngap_gen::ID_HANDOVER_CANCEL,
+            ngap_gen::TriggeringMessage::INITIATING_MESSAGE,
+            criticality,
+            (amf, ran),
+            cause_protocol,
+            diagnostics,
+        )
+    };
+    let (Some(amf_ue_ngap_id), Some(ran_ue_ngap_id), true) = (amf, ran, reject.is_empty()) else {
+        return NasTransportDecode::Reject(report(
+            ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
+            reject,
+        ));
+    };
+    NasTransportDecode::Proceed {
+        message: HandoverCancel {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            cause: cause.unwrap_or(Cause::Misc(CauseMisc::Unspecified)),
+        },
+        error_indication: (!notify.is_empty()).then(|| {
+            report(
+                ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+                notify,
+            )
+        }),
+    }
+}
+
+/// Decode a HANDOVER NOTIFY (TS 38.413 §9.2.3.7) with the GENERATED codec
+/// (#417), applying §10.3.4.2/§10.3.5 for a procedure with no response: both
+/// UE NGAP IDs are criticality reject, so their absence -- like a
+/// not-comprehended "reject" IE -- terminates it with an Error Indication;
+/// User Location Information is criticality ignore, so an absent or
+/// non-NR one is ignored and comes back as `None`.
+pub fn decode_handover_notify_asn1(
+    data: &[u8],
+) -> NasTransportDecode<(u64, u32, Option<UserLocationInformation>)> {
+    use ngap_gen::HandoverNotifyProtocolIEs_EntryValue as Ie;
+    let Some((criticality, ies, mut reject, notify)) =
+        decode_initiating(data, "Handover Notify", |v| match v {
+            ngap_gen::InitiatingMessageValue::Id_HandoverNotification(m) => Some(m.protocol_i_es.0),
+            _ => None,
+        })
+    else {
+        return NasTransportDecode::Undecodable;
+    };
+    let (mut amf, mut ran, mut uli) = (None, None, None);
+    for entry in ies {
+        match entry.value {
+            Ie::Id_AMF_UE_NGAP_ID(v) => amf = Some(v.0),
+            Ie::Id_RAN_UE_NGAP_ID(v) => ran = Some(v.0),
+            Ie::Id_UserLocationInformation(v) => uli = hand_written_user_location(&v),
+            // Comprehended; the AMF does not act on it.
+            Ie::Id_NotifySourceNGRANNode(_) => {}
+        }
+    }
+    if amf.is_none() {
+        reject.push(missing_ie(ngap_gen::ID_AMF_UE_NGAP_ID));
+    }
+    if ran.is_none() {
+        reject.push(missing_ie(ngap_gen::ID_RAN_UE_NGAP_ID));
+    }
+    let report = |cause_protocol, diagnostics| {
+        handover_report(
+            ngap_gen::ID_HANDOVER_NOTIFICATION,
+            ngap_gen::TriggeringMessage::INITIATING_MESSAGE,
+            criticality,
+            (amf, ran),
+            cause_protocol,
+            diagnostics,
+        )
+    };
+    let (Some(amf_ue_ngap_id), Some(ran_ue_ngap_id), true) = (amf, ran, reject.is_empty()) else {
+        return NasTransportDecode::Reject(report(
+            ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
+            reject,
+        ));
+    };
+    NasTransportDecode::Proceed {
+        message: (amf_ue_ngap_id, ran_ue_ngap_id, uli),
+        error_indication: (!notify.is_empty()).then(|| {
+            report(
+                ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+                notify,
+            )
+        }),
+    }
+}
+
+/// Decode a HANDOVER FAILURE (TS 38.413 §9.2.3.4) with the GENERATED codec
+/// (#417). It is the unsuccessful outcome of Handover Resource Allocation, a
+/// response: a not-comprehended "reject" IE means local error handling only
+/// (§10.3.4.2), returned as `Reject` for the caller to drop; a "notify" one is
+/// reported in an Error Indication. Every IE is criticality ignore, so a
+/// missing AMF UE NGAP ID makes the failure unattributable (`Undecodable`)
+/// and a missing Cause is misc/unspecified.
+pub fn decode_handover_failure_asn1(data: &[u8]) -> NasTransportDecode<HandoverFailure> {
+    use ngap_gen::HandoverFailureProtocolIEs_EntryValue as Ie;
+    let (pdu, unknown) = match nextgcore_ngap_gen::decode_with_unknown_ies(data) {
+        Ok(decoded) => decoded,
+        Err(e) => {
+            log::warn!("Failed to decode Handover Failure: {e:?}");
+            return NasTransportDecode::Undecodable;
+        }
+    };
+    let ngap_gen::NGAP_PDU::UnsuccessfulOutcome(ngap_gen::UnsuccessfulOutcome {
+        criticality,
+        value: ngap_gen::UnsuccessfulOutcomeValue::Id_HandoverResourceAllocation(failure),
+        ..
+    }) = pdu
+    else {
+        log::warn!("Expected HandoverFailure");
+        return NasTransportDecode::Undecodable;
+    };
+    let Some((reject, notify)) = classify_unknown_ies(&unknown, "Handover Failure") else {
+        return NasTransportDecode::Undecodable;
+    };
+    let (mut amf, mut cause) = (None, None);
+    for entry in failure.protocol_i_es.0 {
+        match entry.value {
+            Ie::Id_AMF_UE_NGAP_ID(v) => amf = Some(v.0),
+            Ie::Id_Cause(v) => cause = Some(hand_written_cause(&v)),
+            Ie::Id_CriticalityDiagnostics(_)
+            | Ie::Id_TargettoSource_Failure_TransparentContainer(_) => {}
+        }
+    }
+    let report = |cause_protocol, diagnostics| {
+        handover_report(
+            ngap_gen::ID_HANDOVER_RESOURCE_ALLOCATION,
+            ngap_gen::TriggeringMessage::UNSUCCESSFUL_OUTCOME,
+            criticality.0,
+            (amf, None),
+            cause_protocol,
+            diagnostics,
+        )
+    };
+    if !reject.is_empty() {
+        return NasTransportDecode::Reject(report(
+            ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
+            reject,
+        ));
+    }
+    let Some(amf_ue_ngap_id) = amf else {
+        log::warn!("Handover Failure carries no AMF UE NGAP ID");
+        return NasTransportDecode::Undecodable;
+    };
+    NasTransportDecode::Proceed {
+        message: HandoverFailure {
+            amf_ue_ngap_id,
+            cause: cause.unwrap_or(Cause::Misc(CauseMisc::Unspecified)),
+            criticality_diagnostics: None,
+        },
+        error_indication: (!notify.is_empty()).then(|| {
+            report(
+                ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+                notify,
+            )
+        }),
+    }
+}
+
+/// Decode an initiating message with unknown-IE skipping: its procedure
+/// criticality, its IE entries (extracted by `pick`), and its not-comprehended
+/// IEs sorted into `(reject, notify)`. `None` when it does not decode or is not
+/// the message `pick` selects.
+fn decode_initiating<E>(
+    data: &[u8],
+    message: &str,
+    pick: impl FnOnce(ngap_gen::InitiatingMessageValue) -> Option<Vec<E>>,
+) -> Option<(u8, Vec<E>, Vec<IeDiagnostic>, Vec<IeDiagnostic>)> {
+    let (pdu, unknown) = match nextgcore_ngap_gen::decode_with_unknown_ies(data) {
+        Ok(decoded) => decoded,
+        Err(e) => {
+            log::warn!("Failed to decode {message}: {e:?}");
+            return None;
+        }
+    };
+    let ngap_gen::NGAP_PDU::InitiatingMessage(msg) = pdu else {
+        log::warn!("Expected {message}");
+        return None;
+    };
+    let criticality = msg.criticality.0;
+    let Some(ies) = pick(msg.value) else {
+        log::warn!("Expected {message}");
+        return None;
+    };
+    let (reject, notify) = classify_unknown_ies(&unknown, message)?;
+    Some((criticality, ies, reject, notify))
+}
+
+/// A hand-written Criticality Diagnostics as the generated IE, field for field.
+fn generated_diagnostics_from(diag: &CriticalityDiagnostics) -> ngap_gen::CriticalityDiagnostics {
+    ngap_gen::CriticalityDiagnostics {
+        procedure_code: diag.procedure_code.map(ngap_gen::ProcedureCode),
+        triggering_message: diag.triggering_message.map(ngap_gen::TriggeringMessage),
+        procedure_criticality: diag.procedure_criticality.map(ngap_gen::Criticality),
+        i_es_criticality_diagnostics: (!diag.ies.is_empty()).then(|| {
+            ngap_gen::CriticalityDiagnostics_IE_List(
+                diag.ies
+                    .iter()
+                    .map(|ie| ngap_gen::CriticalityDiagnostics_IE_Item {
+                        ie_criticality: ngap_gen::Criticality(ie.ie_criticality as u8),
+                        ie_id: ngap_gen::ProtocolIE_ID(ie.ie_id),
+                        type_of_error: ngap_gen::TypeOfError(match ie.type_of_error {
+                            TypeOfError::NotUnderstood => ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+                            TypeOfError::Missing => ngap_gen::TypeOfError::MISSING,
+                        }),
+                        ie_extensions: None,
+                    })
+                    .collect(),
+            )
+        }),
+        ie_extensions: None,
+    }
+}
+
+/// Build a HANDOVER PREPARATION FAILURE (TS 38.413 §9.2.3.6) with the
+/// GENERATED codec (#417). Every IE is criticality ignore. Byte-identical to
+/// the hand-written builder: `handover_preparation_failure_generated_matches_hand_written`.
+pub fn build_handover_preparation_failure_asn1(
+    msg: &HandoverPreparationFailure,
+) -> Option<Vec<u8>> {
+    use ngap_gen::{
+        HandoverPreparationFailureProtocolIEs_Entry as Entry,
+        HandoverPreparationFailureProtocolIEs_EntryValue as Ie, ProtocolIE_ID,
+    };
+    let ignore = || ngap_gen::Criticality(ngap_gen::Criticality::IGNORE);
+    let mut ies = vec![
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_AMF_UE_NGAP_ID),
+            criticality: ignore(),
+            value: Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(msg.amf_ue_ngap_id)),
+        },
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_RAN_UE_NGAP_ID),
+            criticality: ignore(),
+            value: Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(msg.ran_ue_ngap_id)),
+        },
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_CAUSE),
+            criticality: ignore(),
+            value: Ie::Id_Cause(generated_cause(msg.cause)),
+        },
+    ];
+    if let Some(diag) = &msg.criticality_diagnostics {
+        ies.push(Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_CRITICALITY_DIAGNOSTICS),
+            criticality: ignore(),
+            value: Ie::Id_CriticalityDiagnostics(generated_diagnostics_from(diag)),
+        });
+    }
+    let pdu = ngap_gen::NGAP_PDU::UnsuccessfulOutcome(ngap_gen::UnsuccessfulOutcome {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_HANDOVER_PREPARATION),
+        criticality: ngap_gen::Criticality(ngap_gen::Criticality::REJECT),
+        value: ngap_gen::UnsuccessfulOutcomeValue::Id_HandoverPreparation(
+            ngap_gen::HandoverPreparationFailure {
+                protocol_i_es: ngap_gen::HandoverPreparationFailureProtocolIEs(ies),
+            },
+        ),
+    });
+    match nextgcore_ngap_gen::encode(&pdu) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            log::error!("Failed to encode Handover Preparation Failure: {e:?}");
+            None
+        }
+    }
+}
+
+/// Build a HANDOVER CANCEL ACKNOWLEDGE (TS 38.413 §9.2.3.9) with the GENERATED
+/// codec (#417), reporting `notify` -- the Cancel's "ignore IE and notify
+/// sender" IEs -- in Criticality Diagnostics (§10.3.4.2). Every IE is
+/// criticality ignore.
+pub fn build_handover_cancel_acknowledge_asn1(
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+    notify: &[IeDiagnostic],
+) -> Option<Vec<u8>> {
+    use ngap_gen::{
+        HandoverCancelAcknowledgeProtocolIEs_Entry as Entry,
+        HandoverCancelAcknowledgeProtocolIEs_EntryValue as Ie, ProtocolIE_ID,
+    };
+    let ignore = || ngap_gen::Criticality(ngap_gen::Criticality::IGNORE);
+    let mut ies = vec![
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_AMF_UE_NGAP_ID),
+            criticality: ignore(),
+            value: Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(amf_ue_ngap_id)),
+        },
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_RAN_UE_NGAP_ID),
+            criticality: ignore(),
+            value: Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(ran_ue_ngap_id)),
+        },
+    ];
+    if !notify.is_empty() {
+        ies.push(Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_CRITICALITY_DIAGNOSTICS),
+            criticality: ignore(),
+            value: Ie::Id_CriticalityDiagnostics(generated_criticality_diagnostics(notify)),
+        });
+    }
+    let pdu = ngap_gen::NGAP_PDU::SuccessfulOutcome(ngap_gen::SuccessfulOutcome {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_HANDOVER_CANCEL),
+        criticality: ngap_gen::Criticality(ngap_gen::Criticality::REJECT),
+        value: ngap_gen::SuccessfulOutcomeValue::Id_HandoverCancel(
+            ngap_gen::HandoverCancelAcknowledge {
+                protocol_i_es: ngap_gen::HandoverCancelAcknowledgeProtocolIEs(ies),
+            },
+        ),
+    });
+    match nextgcore_ngap_gen::encode(&pdu) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            log::error!("Failed to encode Handover Cancel Acknowledge: {e:?}");
+            None
+        }
+    }
+}
+
 /// The largest QoS Flow Identifier: a QFI is six bits (TS 23.501 §5.7.1.1).
 pub const MAX_QFI: u8 = 63;
 
@@ -5846,6 +6232,240 @@ pub(crate) mod tests {
             build_overload_stop_asn1().expect("stop"),
             [0x00, 0x17, 0x00, 0x03, 0x00, 0x00, 0x00]
         );
+    }
+
+    fn ho_causes() -> Vec<Cause> {
+        vec![
+            Cause::RadioNetwork(CauseRadioNetwork::Unspecified),
+            Cause::RadioNetwork(CauseRadioNetwork::HoTargetNotAllowed),
+            Cause::Transport(CauseTransport::TransportResourceUnavailable),
+            Cause::Nas(CauseNas::NormalRelease),
+            Cause::Protocol(CauseProtocol::SemanticError),
+            Cause::Misc(CauseMisc::Unspecified),
+        ]
+    }
+
+    const HO_IDS: [(u64, u32); 4] = [(0, 0), ((1 << 40) - 1, u32::MAX), (256, 65_536), (7, 70)];
+
+    /// #417: HANDOVER PREPARATION FAILURE and HANDOVER CANCEL ACKNOWLEDGE are
+    /// byte-identical to the hand-written builders over every ID edge and Cause
+    /// group.
+    #[test]
+    fn handover_preparation_failure_generated_matches_hand_written() {
+        for (amf, ran) in HO_IDS {
+            for cause in ho_causes() {
+                let msg = HandoverPreparationFailure {
+                    amf_ue_ngap_id: amf,
+                    ran_ue_ngap_id: ran,
+                    cause,
+                    criticality_diagnostics: None,
+                };
+                let old = builder::build_handover_preparation_failure(&msg).expect("hand-written");
+                assert_eq!(
+                    build_handover_preparation_failure_asn1(&msg).expect("generated"),
+                    old
+                );
+            }
+            let old = builder::build_handover_cancel_acknowledge(&HandoverCancelAcknowledge {
+                amf_ue_ngap_id: amf,
+                ran_ue_ngap_id: ran,
+                criticality_diagnostics: None,
+            })
+            .expect("hand-written");
+            assert_eq!(
+                build_handover_cancel_acknowledge_asn1(amf, ran, &[]).expect("generated"),
+                old
+            );
+        }
+    }
+
+    /// #417: HANDOVER CANCEL, HANDOVER NOTIFY and HANDOVER FAILURE decode,
+    /// through the generated codec, to what the hand-written parser read.
+    #[test]
+    fn handover_messages_generated_decode_matches_hand_written() {
+        let uli = UserLocationInformation::Nr {
+            nr_cgi_plmn: [0x99, 0xf9, 0x07],
+            nr_cell_identity: 0x0_0000_0010,
+            tai_plmn: [0x99, 0xf9, 0x07],
+            tai_tac: [0x00, 0x00, 0x01],
+        };
+        for (amf, ran) in HO_IDS {
+            for cause in ho_causes() {
+                let bytes = builder::build_handover_cancel(&HandoverCancel {
+                    amf_ue_ngap_id: amf,
+                    ran_ue_ngap_id: ran,
+                    cause,
+                })
+                .expect("build");
+                let NgapMessage::HandoverCancel(old) = parser::decode_ngap_pdu(&bytes).unwrap()
+                else {
+                    panic!("old: not a cancel");
+                };
+                let NasTransportDecode::Proceed {
+                    message,
+                    error_indication: None,
+                } = decode_handover_cancel_asn1(&bytes)
+                else {
+                    panic!("cancel did not proceed");
+                };
+                assert_eq!(
+                    (message.amf_ue_ngap_id, message.ran_ue_ngap_id),
+                    (old.amf_ue_ngap_id, old.ran_ue_ngap_id)
+                );
+                assert_eq!(format!("{:?}", message.cause), format!("{:?}", old.cause));
+
+                let bytes = builder::build_handover_failure(&HandoverFailure {
+                    amf_ue_ngap_id: amf,
+                    cause,
+                    criticality_diagnostics: None,
+                })
+                .expect("build");
+                let NgapMessage::HandoverFailure(old) = parser::decode_ngap_pdu(&bytes).unwrap()
+                else {
+                    panic!("old: not a failure");
+                };
+                let NasTransportDecode::Proceed {
+                    message,
+                    error_indication: None,
+                } = decode_handover_failure_asn1(&bytes)
+                else {
+                    panic!("failure did not proceed");
+                };
+                assert_eq!(message.amf_ue_ngap_id, old.amf_ue_ngap_id);
+                assert_eq!(format!("{:?}", message.cause), format!("{:?}", old.cause));
+            }
+            let bytes = builder::build_handover_notify(&HandoverNotify {
+                amf_ue_ngap_id: amf,
+                ran_ue_ngap_id: ran,
+                user_location_info: uli.clone(),
+            })
+            .expect("build");
+            let NgapMessage::HandoverNotify(old) = parser::decode_ngap_pdu(&bytes).unwrap() else {
+                panic!("old: not a notify");
+            };
+            let NasTransportDecode::Proceed {
+                message: (a, r, l),
+                error_indication: None,
+            } = decode_handover_notify_asn1(&bytes)
+            else {
+                panic!("notify did not proceed");
+            };
+            assert_eq!((a, r), (old.amf_ue_ngap_id, old.ran_ue_ngap_id));
+            assert_eq!(
+                format!("{l:?}"),
+                format!("{:?}", Some(old.user_location_info))
+            );
+        }
+    }
+
+    /// HANDOVER PREPARATION FAILURE and HANDOVER CANCEL ACKNOWLEDGE, derived
+    /// from X.691 by hand for AMF UE NGAP ID 1, RAN UE NGAP ID 2, Cause
+    /// radioNetwork/unspecified.
+    ///
+    /// Failure: unsuccessfulOutcome (CHOICE 2 of 3, extensible: `0 10` + pad =
+    /// 0x40), procedure code 12, criticality reject, then 3 IEs, each
+    /// criticality ignore (0x40): AMF UE NGAP ID 10 = `00 0a 40 02 00 01`
+    /// (INTEGER 0..2^40-1: 3-bit octet count 0 + pad, value 01), RAN UE NGAP ID
+    /// 85 = `00 55 40 02 00 02`, Cause 15 = `00 0f 40 02 00 00`.
+    /// Cancel Ack: successfulOutcome (0x20), procedure code 10, reject, two IEs.
+    #[test]
+    fn handover_failure_and_cancel_ack_golden_bytes() {
+        let failure = build_handover_preparation_failure_asn1(&HandoverPreparationFailure {
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 2,
+            cause: Cause::RadioNetwork(CauseRadioNetwork::Unspecified),
+            criticality_diagnostics: None,
+        })
+        .expect("build");
+        assert_eq!(
+            failure,
+            [
+                0x40, 0x0c, 0x00, 0x15, 0x00, 0x00, 0x03, //
+                0x00, 0x0a, 0x40, 0x02, 0x00, 0x01, //
+                0x00, 0x55, 0x40, 0x02, 0x00, 0x02, //
+                0x00, 0x0f, 0x40, 0x02, 0x00, 0x00,
+            ]
+        );
+        assert_eq!(
+            build_handover_cancel_acknowledge_asn1(1, 2, &[]).expect("build"),
+            [
+                0x20, 0x0a, 0x00, 0x0f, 0x00, 0x00, 0x02, //
+                0x00, 0x0a, 0x40, 0x02, 0x00, 0x01, //
+                0x00, 0x55, 0x40, 0x02, 0x00, 0x02,
+            ]
+        );
+    }
+
+    /// §10.3.4.2 for the three received messages: Cancel (response, no
+    /// unsuccessful outcome) and Notify (no response) are terminated by a
+    /// "reject" IE and report "notify" ones; Failure (a response) only reports
+    /// "notify" ones and leaves a "reject" one to local handling.
+    #[test]
+    fn handover_messages_follow_unknown_ie_criticality() {
+        let cancel = builder::build_handover_cancel(&HandoverCancel {
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 2,
+            cause: Cause::Misc(CauseMisc::Unspecified),
+        })
+        .unwrap();
+        assert!(matches!(
+            decode_handover_cancel_asn1(&with_unknown_ie(&cancel, 9999, 0x00)),
+            NasTransportDecode::Reject(ref r) if r.procedure.procedure_code == ngap_gen::ID_HANDOVER_CANCEL
+        ));
+        let NasTransportDecode::Proceed {
+            error_indication: Some(report),
+            ..
+        } = decode_handover_cancel_asn1(&with_unknown_ie(&cancel, 9999, 0x80))
+        else {
+            panic!("notify must proceed and be reported");
+        };
+        // ... in the Acknowledge.
+        let ack = build_handover_cancel_acknowledge_asn1(1, 2, &report.diagnostics).unwrap();
+        assert!(
+            ack.windows(2).any(|w| w == [0x00, 0x13]),
+            "Criticality Diagnostics IE 19"
+        );
+
+        let notify = builder::build_handover_notify(&HandoverNotify {
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 2,
+            user_location_info: UserLocationInformation::Nr {
+                nr_cgi_plmn: [0x99, 0xf9, 0x07],
+                nr_cell_identity: 1,
+                tai_plmn: [0x99, 0xf9, 0x07],
+                tai_tac: [0, 0, 1],
+            },
+        })
+        .unwrap();
+        assert!(matches!(
+            decode_handover_notify_asn1(&with_unknown_ie(&notify, 9999, 0x00)),
+            NasTransportDecode::Reject(_)
+        ));
+        assert!(matches!(
+            decode_handover_notify_asn1(&with_unknown_ie(&notify, 9999, 0x80)),
+            NasTransportDecode::Proceed {
+                error_indication: Some(_),
+                ..
+            }
+        ));
+
+        let failure = builder::build_handover_failure(&HandoverFailure {
+            amf_ue_ngap_id: 1,
+            cause: Cause::Misc(CauseMisc::Unspecified),
+            criticality_diagnostics: None,
+        })
+        .unwrap();
+        assert!(matches!(
+            decode_handover_failure_asn1(&with_unknown_ie(&failure, 9999, 0x00)),
+            NasTransportDecode::Reject(_)
+        ));
+        assert!(matches!(
+            decode_handover_failure_asn1(&with_unknown_ie(&failure, 9999, 0x40)),
+            NasTransportDecode::Proceed {
+                error_indication: None,
+                ..
+            }
+        ));
     }
 
     #[test]
