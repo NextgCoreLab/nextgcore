@@ -183,6 +183,16 @@ pub mod apply_action {
 /// Maximum packets buffered per FAR while the action is BUFF
 pub const MAX_BUFFERED_PACKETS: usize = 64;
 
+/// Serialises every test that sets `SGWU_MAX_BUFFERED_PACKETS` or reads it through
+/// [`buffer_capacity`] (#635).
+///
+/// Declared beside the read, not in a `mod tests`: a lock private to one test module
+/// cannot be taken by a reader in another, and that is how
+/// `buffer_capacity_honours_the_suggested_packet_count` once read the `2` a `gtp_path`
+/// test had set under a lock only that module could see.
+#[cfg(test)]
+pub(crate) static MAX_BUFFERED_PACKETS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Buffer cap for a FAR, honouring a BAR's DL Buffering Suggested Packet Count
 /// when the CP function provided one (TS 29.244 §8.2.48) and otherwise the
 /// local default, which `SGWU_MAX_BUFFERED_PACKETS` can override.
@@ -2008,6 +2018,9 @@ mod tests {
     /// overrides the local default. The hardcoded 64 ignored it entirely.
     #[test]
     fn buffer_capacity_honours_the_suggested_packet_count() {
+        let _env = MAX_BUFFERED_PACKETS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert_eq!(buffer_capacity(Some(200)), 200);
         // Zero is not a request for a zero-length buffer.
         assert_eq!(buffer_capacity(Some(0)), MAX_BUFFERED_PACKETS);
