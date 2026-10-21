@@ -445,7 +445,7 @@ fn the_handover_required_is_handled_by_criticality() {
 }
 
 #[test]
-fn an_ng_ran_target_is_an_unsupported_target_not_a_decode_error() {
+fn a_gnb_target_is_an_eps_to_5gs_handover_not_a_decode_error() {
     let Ok(g::S1AP_PDU::InitiatingMessage(mut msg)) = nextgcore_s1ap_gen::decode(&small_required())
     else {
         panic!("decode");
@@ -476,14 +476,14 @@ fn an_ng_ran_target_is_an_unsupported_target_not_a_decode_error() {
     let bytes = nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(msg)).unwrap();
     // The hand-written parser refused the whole message.
     assert!(decode_s1ap_pdu(&bytes).is_err());
+    // #584: a gNB target is an EPS to 5GS handover, prepared over N26.
     assert!(matches!(
         decode_handover_required(&bytes),
-        HandoverRequiredDecode::UnsupportedTarget {
-            mme_ue_s1ap_id: 0xFFFF_FFFF,
-            enb_ue_s1ap_id: 0xFF_FFFF
-        }
+        HandoverRequiredDecode::ToFivegs { msg, .. }
+            if msg.mme_ue_s1ap_id == 0xFFFF_FFFF && msg.enb_ue_s1ap_id == 0xFF_FFFF
     ));
-    // Through the handler: HANDOVER PREPARATION FAILURE, unknown-targetID.
+    // Through the handler: HANDOVER PREPARATION FAILURE, unknown-targetID (this
+    // message's Handover Type is intralte, and the UE is unknown).
     let ctx = MmeContext::new();
     let enb = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
     let out = handle_s1ap_message(&ctx, enb, &bytes);

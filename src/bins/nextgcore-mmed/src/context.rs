@@ -1103,6 +1103,10 @@ pub struct MmeUe {
     pub e_cgi: ECgi,
     /// UE location timestamp
     pub ue_location_timestamp: u64,
+    /// The MME has asked the serving eNB to report every change of serving
+    /// cell (LOCATION REPORTING CONTROL, change-of-serve-cell, #584), because
+    /// the PDN GW asked for ECGI change reporting (TS 29.274 §8.61).
+    pub location_reporting_active: bool,
     /// Last visited PLMN ID
     pub last_visited_plmn_id: PlmnId,
 
@@ -1409,6 +1413,12 @@ pub struct MmeBearer {
     pub qos: Qos,
     /// TFT (Traffic Flow Template)
     pub tft: Vec<u8>,
+    /// The eNB released this bearer's E-RAB (E-RAB RELEASE INDICATION, #584)
+    /// and the MME has asked the Serving GW to delete it with a Delete Bearer
+    /// Command (TS 23.401 §5.4.4.2 step 2). The Delete Bearer Request that
+    /// follows (step 6) is then answered without NAS signalling (step 7 is
+    /// omitted when the eNB triggered the release).
+    pub released_by_enb: bool,
 
     /// T3489 timer
     pub t3489: TimerWithRetry,

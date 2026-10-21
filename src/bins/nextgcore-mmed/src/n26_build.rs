@@ -743,6 +743,238 @@ pub fn build_forward_relocation_complete_notification(
     ))
 }
 
+// ============================================================================
+// EPS→5GS handover, the MME as SOURCE (#584, TS 23.502 §4.11.1.2.2)
+// ============================================================================
+
+/// `Target Type` = `gNodeB ID` (TS 29.274 Table 8.51-1): the target of an EPS
+/// to 5GS handover (§8.51.7).
+pub const TARGET_TYPE_GNODEB: u8 = 5;
+
+/// F-TEID interface type `S5/S8 PGW GTP-C` (TS 29.274 Table 8.22-1).
+pub const S5S8_PGW_GTP_C: u8 = 7;
+/// F-TEID interface type `S5/S8 PGW GTP-U` (TS 29.274 Table 8.22-1).
+pub const S5S8_PGW_GTP_U: u8 = 5;
+
+/// The NG-RAN node a HANDOVER REQUIRED names (TS 36.413 §9.2.1.6,
+/// TargetNgRanNode-ID), restricted to a gNB: the only NG-RAN target Table
+/// 8.51-1 gives an EPS to 5GS handover besides an ng-eNB, which this core's
+/// AMF does not resolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GnbTarget {
+    /// PLMN of the Global gNB ID, TBCD (the same octets S1AP and GTPv2-C use).
+    pub plmn: [u8; 3],
+    /// gNB ID, right-aligned.
+    pub gnb_id: u32,
+    /// gNB ID length in bits, 22..=32.
+    pub gnb_id_len: u8,
+    /// Selected 5GS TAC.
+    pub tac: [u8; 3],
+}
+
+/// Encode a Target Identification for a gNodeB (TS 29.274 §8.51.7, Figure
+/// 8.51.7-1): Target Type 5, MCC/MNC, spare | gNodeB ID Length, the gNodeB ID
+/// in four octets ("Bit 1 of Octet 13 is the least significant bit"), 5GS TAC.
+pub fn encode_gnb_target_identification(target: &GnbTarget) -> Gtp2Ie {
+    let mut v = BytesMut::with_capacity(12);
+    v.put_u8(TARGET_TYPE_GNODEB);
+    v.put_slice(&target.plmn);
+    v.put_u8(target.gnb_id_len & 0x3F);
+    v.put_u32(target.gnb_id);
+    v.put_slice(&target.tac);
+    Gtp2Ie::new(Gtp2IeType::TargetIdentification as u8, 0, v.freeze())
+}
+
+/// The UE's EPS security context as the MM Context of an EPS→5GS Forward
+/// Relocation Request (TS 29.274 §8.38 Figure 8.38-5, Security Mode 4).
+///
+/// TS 33.501 §8.4.2 step 2: the source MME sends "K_ASME, eKSI, UE EPS
+/// security capabilities, selected EPS NAS algorithm identifiers, uplink and
+/// downlink EPS NAS COUNTs, {NH, NCC} pair"; the target AMF derives K_AMF'
+/// from K_ASME and the NH (§8.6.2), so `nh`/`ncc` are required and NHI is set.
+pub fn handover_mm_context(mme_ue: &MmeUe, nh: [u8; 32], ncc: u8) -> Gtp2MmContextIe {
+    let cap = &mme_ue.ue_network_capability;
+    let mut ue_network_capability = vec![cap.eea, cap.eia, cap.uea, cap.uia];
+    ue_network_capability.truncate(usize::from(cap.length).clamp(2, 4));
+    let mut kasme = [0u8; 32];
+    kasme.copy_from_slice(&mme_ue.kasme[..32]);
+    Gtp2MmContextIe {
+        ksi_asme: mme_ue.nas_eps.mme_ksi.ksi,
+        nhi: true,
+        nh: Some(nh),
+        ncc,
+        used_nas_integrity_algorithm: mme_ue.selected_int_algorithm,
+        used_nas_cipher: mme_ue.selected_enc_algorithm,
+        nas_downlink_count: mme_ue.dl_count & 0x00FF_FFFF,
+        nas_uplink_count: mme_ue.ul_count & 0x00FF_FFFF,
+        kasme,
+        ue_network_capability,
+        ms_network_capability: Vec::new(),
+        mei: mme_ue.imeisv[..mme_ue.imeisv_len.min(mme_ue.imeisv.len())].to_vec(),
+        access_restriction: 0,
+    }
+}
+
+/// One PDN connection as `MME/SGSN/AMF UE EPS PDN Connections` (TS 29.274
+/// Table 7.3.1-2): APN, the UE's IPv4 address when it has one, the Linked EBI,
+/// the SMF+PGW-C's S5/S8 control F-TEID, the APN-AMBR (kbps) and one Bearer
+/// Context per bearer (EBI, the UPF+PGW-U's S5/S8 user-plane F-TEID at
+/// instance 1, Bearer QoS) -- the parts TS 23.502 §4.11.1.2.2.2 step 3 names.
+pub fn handover_pdn_connection(
+    sess: &crate::context::MmeSess,
+    bearers: &[crate::context::MmeBearer],
+) -> Option<Gtp2PdnConnectionIe> {
+    let linked_ebi = bearers.iter().map(|b| b.ebi).min()?;
+    let mut pdn = Gtp2PdnConnectionIe::new();
+    pdn.add_ie(nextgcore_gtp::v2::Gtp2ApnIe::from_string(&sess.apn).to_ie(0));
+    if sess.paa.addr != [0; 4] {
+        pdn.add_ie(Gtp2Ie::new(
+            Gtp2IeType::IpAddress as u8,
+            0,
+            Bytes::copy_from_slice(&sess.paa.addr),
+        ));
+    }
+    pdn.add_ie(nextgcore_gtp::v2::Gtp2EbiIe::new(linked_ebi).to_ie(0));
+    if let Some(v4) = sess.pgw_s5c_ip.ipv4 {
+        pdn.add_ie(Gtp2FTeidIe::new_ipv4(S5S8_PGW_GTP_C, sess.pgw_s5c_teid, v4).to_ie(0));
+    }
+    pdn.add_ie(
+        nextgcore_gtp::v2::Gtp2AmbrIe::new(
+            u32::try_from(sess.ambr.uplink / 1000).unwrap_or(u32::MAX),
+            u32::try_from(sess.ambr.downlink / 1000).unwrap_or(u32::MAX),
+        )
+        .to_ie(0),
+    );
+    for bearer in bearers {
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(bearer.ebi);
+        if let Some(v4) = bearer.pgw_s5u_ip.ipv4 {
+            bc.set_fteid(
+                1,
+                &Gtp2FTeidIe::new_ipv4(S5S8_PGW_GTP_U, bearer.pgw_s5u_teid, v4),
+            );
+        }
+        bc.set_bearer_qos(&crate::s11_build::bearer_qos(bearer));
+        pdn.add_ie(bc.to_ie(0));
+    }
+    Some(pdn)
+}
+
+/// Build the **Forward Relocation Request** of an EPS→5GS handover (TS 29.274
+/// §7.3.1, Table 7.3.1-1's EPS to 5GS rows; TS 23.502 §4.11.1.2.2.2 step 3).
+///
+/// The header TEID is 0: the MME does not know the AMF's N26 TEID yet.
+#[allow(clippy::too_many_arguments)]
+pub fn build_eps_to_5gs_forward_relocation_request(
+    sequence_number: u32,
+    imsi_bcd: &str,
+    sender_fteid: &Gtp2FTeidIe,
+    mm_context: &Gtp2MmContextIe,
+    pdn_connections: &[Gtp2PdnConnectionIe],
+    source_to_target_container: &[u8],
+    target: &GnbTarget,
+    direct_forwarding: bool,
+) -> Gtp2Message {
+    let mut msg = Gtp2Message::new(Gtp2Header::new(
+        Gtp2MessageType::ForwardRelocationRequest as u8,
+        0,
+        sequence_number,
+    ));
+    if !imsi_bcd.is_empty() {
+        msg.add_ie(Gtp2Ie::new(
+            Gtp2IeType::Imsi as u8,
+            0,
+            Bytes::from(string_to_bcd(imsi_bcd)),
+        ));
+    }
+    msg.add_ie(sender_fteid.to_ie(0));
+    for pdn in pdn_connections {
+        msg.add_ie(pdn.to_ie(0));
+    }
+    msg.add_ie(mm_context.to_ie(0));
+    // Indication (C): included only "if any one of the applicable flags is set
+    // to 1"; DFI is the one this procedure has.
+    if direct_forwarding {
+        let indication = Gtp2IndicationIe {
+            dfi: true,
+            ..Gtp2IndicationIe::new()
+        };
+        msg.add_ie(indication.to_ie(0));
+    }
+    let mut container = Vec::with_capacity(1 + source_to_target_container.len());
+    container.push(F_CONTAINER_TYPE_EUTRAN);
+    container.extend_from_slice(source_to_target_container);
+    msg.add_ie(Gtp2Ie::new(
+        Gtp2IeType::FContainer as u8,
+        0,
+        Bytes::from(container),
+    ));
+    msg.add_ie(encode_gnb_target_identification(target));
+    msg
+}
+
+/// What the target AMF answered in a Forward Relocation Response (TS 29.274
+/// §7.3.2) to an EPS→5GS Forward Relocation Request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpsTo5gsRelocationResponse {
+    /// Cause (M).
+    pub cause: u8,
+    /// The AMF's N26 TEID (Sender's F-TEID, C on acceptance).
+    pub amf_teid: Option<u32>,
+    /// EBIs of the List of Set-up Bearers, `None` when the list is absent.
+    pub set_up_ebis: Option<Vec<u8>>,
+    /// The NG-RAN Target-to-Source container, Container Type octet removed.
+    pub target_to_source_container: Option<Vec<u8>>,
+}
+
+/// Parse a Forward Relocation Response to an EPS→5GS Forward Relocation Request.
+pub fn parse_eps_to_5gs_forward_relocation_response(
+    msg: &Gtp2Message,
+) -> Result<EpsTo5gsRelocationResponse, String> {
+    let cause = msg
+        .get_ie(Gtp2IeType::Cause as u8, 0)
+        .and_then(|ie| ie.value.first().copied())
+        .ok_or("Forward Relocation Response has no Cause (Table 7.3.2-1, M)")?;
+    let amf_teid = msg
+        .get_ie(Gtp2IeType::FTeid as u8, 0)
+        .and_then(|ie| Gtp2FTeidIe::decode(&ie.value).ok())
+        .map(|f| f.teid);
+    let bearers: Vec<u8> = msg
+        .get_ies(Gtp2IeType::BearerContext as u8)
+        .into_iter()
+        .filter(|ie| ie.instance == 0)
+        .filter_map(|ie| Gtp2BearerContextIe::decode(&ie.value).ok())
+        .filter_map(|b| b.ebi().ok())
+        .collect();
+    let set_up_ebis = (!bearers.is_empty()).then_some(bearers);
+    let target_to_source_container = msg
+        .get_ie(Gtp2IeType::FContainer as u8, 0)
+        .and_then(|ie| strip_eutran_container_type(&ie.value));
+    Ok(EpsTo5gsRelocationResponse {
+        cause,
+        amf_teid,
+        set_up_ebis,
+        target_to_source_container,
+    })
+}
+
+/// Build a **Forward Relocation Complete Acknowledge** (TS 29.274 §7.3.4,
+/// type 136): the source MME's answer to the target AMF's Forward Relocation
+/// Complete Notification (TS 23.502 §4.11.1.2.2.3 step 6). Cause (M).
+pub fn build_forward_relocation_complete_acknowledge(
+    sequence_number: u32,
+    amf_teid: u32,
+    cause: u8,
+) -> Gtp2Message {
+    let mut msg = Gtp2Message::new(Gtp2Header::new(
+        Gtp2MessageType::ForwardRelocationCompleteAcknowledge as u8,
+        amf_teid,
+        sequence_number,
+    ));
+    msg.add_ie(Gtp2CauseIe::new(cause).to_ie(0));
+    msg
+}
+
 /// Apply a decoded MM Context to a UE's EPS security context (TS 33.501 §8.6.1).
 ///
 /// Takes `&mut MmeUe` so the caller must already hold the pool write lock — the write-back
