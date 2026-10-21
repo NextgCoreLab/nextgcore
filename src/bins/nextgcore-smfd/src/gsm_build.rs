@@ -832,6 +832,17 @@ pub fn write_mapped_eps_bearer_contexts(
 }
 
 /// Build PDU Session Establishment Accept message
+/// The Selected SSC mode to send in a PDU SESSION ESTABLISHMENT ACCEPT: the UE's
+/// requested mode when it is a defined value (1-3, TS 24.501 §9.11.4.16), else
+/// SSC mode 1. 0 is not an SSC mode value. #537.
+pub(crate) fn selected_ssc_mode(ue_ssc_mode: u8) -> u8 {
+    if (1..=3).contains(&ue_ssc_mode) {
+        ue_ssc_mode
+    } else {
+        1
+    }
+}
+
 pub fn build_pdu_session_establishment_accept(
     sess: &SmfSess,
     qos_flow: &SmfBearer,
@@ -842,8 +853,12 @@ pub fn build_pdu_session_establishment_accept(
         message_type::PDU_SESSION_ESTABLISHMENT_ACCEPT,
     );
 
-    // Selected PDU session type (mandatory)
-    // SSC mode (3 bits) + PDU session type (3 bits)
+    // Selected PDU session type (bits 1-4) + Selected SSC mode (bits 5-8): Table
+    // 8.3.2.1.1 lists the PDU session type first, and §8.1 puts the first IE of a
+    // half-octet run in bits 1-4. SSC mode 0 is not a value (§9.11.4.16), so the
+    // UE's requested mode is echoed if it is 1-3 (it was validated on the request)
+    // and SSC mode 1, the only mode every subscription admits, otherwise. #537.
+    let ssc_mode = selected_ssc_mode(sess.ue_ssc_mode);
     let session_type = match sess.session_type {
         crate::context::PduSessionType::Ipv4 => pdu_session_type::IPV4,
         crate::context::PduSessionType::Ipv6 => pdu_session_type::IPV6,
@@ -851,7 +866,7 @@ pub fn build_pdu_session_establishment_accept(
         crate::context::PduSessionType::Unstructured => pdu_session_type::UNSTRUCTURED,
         crate::context::PduSessionType::Ethernet => pdu_session_type::ETHERNET,
     };
-    builder.write_u8(session_type);
+    builder.write_u8((ssc_mode << 4) | (session_type & 0x0F));
 
     // Authorized QoS rules (mandatory)
     let default_rule = encode_default_qos_rule(qos_flow);
@@ -1043,7 +1058,12 @@ pub fn build_pdu_session_establishment_accept_extended(
         message_type::PDU_SESSION_ESTABLISHMENT_ACCEPT,
     );
 
-    // Selected PDU session type (mandatory)
+    // Selected PDU session type (bits 1-4) + Selected SSC mode (bits 5-8): Table
+    // 8.3.2.1.1 lists the PDU session type first, and §8.1 puts the first IE of a
+    // half-octet run in bits 1-4. SSC mode 0 is not a value (§9.11.4.16), so the
+    // UE's requested mode is echoed if it is 1-3 (it was validated on the request)
+    // and SSC mode 1, the only mode every subscription admits, otherwise. #537.
+    let ssc_mode = selected_ssc_mode(sess.ue_ssc_mode);
     let session_type = match sess.session_type {
         crate::context::PduSessionType::Ipv4 => pdu_session_type::IPV4,
         crate::context::PduSessionType::Ipv6 => pdu_session_type::IPV6,
@@ -1051,7 +1071,7 @@ pub fn build_pdu_session_establishment_accept_extended(
         crate::context::PduSessionType::Unstructured => pdu_session_type::UNSTRUCTURED,
         crate::context::PduSessionType::Ethernet => pdu_session_type::ETHERNET,
     };
-    builder.write_u8(session_type);
+    builder.write_u8((ssc_mode << 4) | (session_type & 0x0F));
 
     // Authorized QoS rules (mandatory)
     let default_rule = encode_default_qos_rule(qos_flow);
@@ -1475,6 +1495,20 @@ mod tests {
     }
 
     #[test]
+    fn the_accept_carries_the_selected_ssc_mode_in_bits_5_to_8() {
+        // SSC mode 0 is not a value (TS 24.501 §9.11.4.16): a UE that requested
+        // none, or an out-of-range value, is given SSC mode 1.
+        assert_eq!(selected_ssc_mode(0), 1);
+        assert_eq!(selected_ssc_mode(4), 1);
+        assert_eq!(selected_ssc_mode(2), 2);
+        let mut sess = create_test_sess();
+        sess.ue_ssc_mode = 2;
+        let msg = build_pdu_session_establishment_accept(&sess, &create_test_bearer()).unwrap();
+        // SSC mode 2 (bits 5-8) | IPv4 (1) -> 0x21.
+        assert_eq!(msg[4], 0x21);
+    }
+
+    #[test]
     fn test_build_pdu_session_establishment_accept() {
         let sess = create_test_sess();
         let bearer = create_test_bearer();
@@ -1488,7 +1522,9 @@ mod tests {
         assert_eq!(msg[1], 5); // PSI
         assert_eq!(msg[2], 1); // PTI
         assert_eq!(msg[3], message_type::PDU_SESSION_ESTABLISHMENT_ACCEPT);
-        assert_eq!(msg[4], pdu_session_type::IPV4);
+        // Selected SSC mode 1 (bits 5-8) | PDU session type IPv4 = 1 (bits 1-4),
+        // hand-derived from TS 24.501 Table 8.3.2.1.1, §8.1, §9.11.4.16. #537.
+        assert_eq!(msg[4], 0x11);
     }
 
     #[test]
@@ -1713,7 +1749,9 @@ mod tests {
         assert!(msg.len() > 4);
         assert_eq!(msg[0], NEXTGCORE_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM);
         assert_eq!(msg[3], message_type::PDU_SESSION_ESTABLISHMENT_ACCEPT);
-        assert_eq!(msg[4], pdu_session_type::IPV4);
+        // Selected SSC mode 1 (bits 5-8) | PDU session type IPv4 = 1 (bits 1-4),
+        // hand-derived from TS 24.501 Table 8.3.2.1.1, §8.1, §9.11.4.16. #537.
+        assert_eq!(msg[4], 0x11);
     }
 
     #[test]

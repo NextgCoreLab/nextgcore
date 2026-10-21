@@ -422,6 +422,14 @@ fn initial_service_request_plain(nas: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// The Service type of a plain SERVICE REQUEST (TS 24.501 §9.11.3.50). Octet 4
+/// carries two half-octet IEs; Table 8.2.16.1.1 lists ngKSI first and §8.1 puts
+/// the first of a half-octet run in bits 1-4, so ngKSI is bits 1-4 and Service
+/// type bits 5-8 (0x20 = mobile terminated services, ngKSI 0). #537.
+fn service_request_service_type(plain: &[u8]) -> Option<u8> {
+    plain.get(3).map(|octet| (octet >> 4) & 0x0F)
+}
+
 /// The 5G-S-TMSI a SERVICE REQUEST identifies the UE with (TS 24.501 §8.2.16:
 /// a 5GS mobile identity LV-E after the ngKSI/service-type octet; §9.11.3.4:
 /// type 0b100, AMF Set ID 10 bits, AMF Pointer 6 bits, 5G-TMSI 32 bits).
@@ -5304,7 +5312,7 @@ impl NgapServer {
         ran_ue_ngap_id: u32,
         nas: &[u8],
     ) -> Result<()> {
-        let service_type = nas.get(3).map(|b| (b >> 4) & 0x0F).unwrap_or(0);
+        let service_type = service_request_service_type(nas).unwrap_or(0);
         log::info!("Service Request from UE {amf_ue_ngap_id}: service_type={service_type}");
 
         let has_context = self
@@ -14950,9 +14958,47 @@ mod tests {
         let mut nas = vec![0x7E, 0x01];
         nas.extend_from_slice(&mac);
         nas.push(0x00); // SQN
-        nas.extend_from_slice(&[0x7E, 0x00, 0x4C, 0x01, 0x00, 0x07, 0xF4, 0x55, 0x6A]);
+                        // 0x20: service type "mobile terminated services" (2) in bits 5-8, ngKSI 0
+                        // in bits 1-4 (TS 24.501 Table 8.2.16.1.1, §8.1) -- the paged UE's answer.
+        nas.extend_from_slice(&[0x7E, 0x00, 0x4C, 0x20, 0x00, 0x07, 0xF4, 0x55, 0x6A]);
         nas.extend_from_slice(&tmsi.to_be_bytes());
         nas
+    }
+
+    #[test]
+    fn the_service_type_is_read_from_bits_5_to_8_and_ngksi_from_bits_1_to_4() {
+        // Hand-derived (TS 24.501 Table 8.2.16.1.1, §8.1, §9.11.3.50): mobile
+        // terminated services (2) with ngKSI 0 is 0x20; data (1) with TSC 1 / key
+        // set 3 (ngKSI 0xB) is 0x1B.
+        assert_eq!(
+            service_request_service_type(&[0x7E, 0x00, 0x4C, 0x20]),
+            Some(2)
+        );
+        assert_eq!(
+            service_request_service_type(&[0x7E, 0x00, 0x4C, 0x1B]),
+            Some(1)
+        );
+        assert_eq!(service_request_service_type(&[0x7E, 0x00, 0x4C]), None);
+        // The shared NAS codec agrees on the same octet.
+        let mut buf = bytes::BytesMut::new();
+        nextgcore_nas::fiveg::ServiceRequest {
+            ngksi: nextgcore_nas::common::types::KeySetIdentifier::new(0, 0),
+            service_type: nextgcore_nas::fiveg::ServiceType::MobileTerminatedServices,
+            s_tmsi: nextgcore_nas::fiveg::MobileIdentity::FiveGSTmsi(
+                nextgcore_nas::fiveg::FiveGSTmsi {
+                    amf_set_id: 1,
+                    amf_pointer: 0,
+                    tmsi: 1,
+                },
+            ),
+            ..Default::default()
+        }
+        .encode(&mut buf);
+        assert_eq!(buf[0], 0x20);
+        // The paging fixture below carries a conformant paged-SR octet.
+        let plain = initial_service_request_plain(&protected_service_request([0; 4], 1))
+            .expect("recognised");
+        assert_eq!(service_request_service_type(&plain), Some(2));
     }
 
     #[test]
