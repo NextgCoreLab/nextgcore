@@ -2841,14 +2841,6 @@ async fn an_initiated_modification(sm_context_ref: &str, n2_bytes: &[u8]) -> Sbi
         );
     };
     let qfis = indication.dl.qfis.clone();
-    if indication.additional_dl_tunnels > 0 {
-        log::warn!(
-            "PDU_RES_MOD_IND for ref={sm_context_ref}: {} additional DL tunnels are not \
-             installed at the UPF (dual connectivity is not supported); only the primary \
-             tunnel's flows are confirmed",
-            indication.additional_dl_tunnels
-        );
-    }
     let Some(upf_seid) = lookup_upf_seid(sm_context_ref) else {
         return fail(SmfCause::MiscUnspecified, "no N4 session for this context");
     };
@@ -2858,6 +2850,23 @@ async fn an_initiated_modification(sm_context_ref: &str, n2_bytes: &[u8]) -> Sbi
             "no recorded UPF uplink endpoint to confirm",
         );
     };
+    let sess = smf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| ctx.sess_find_by_sm_context_ref(sm_context_ref));
+    let split = !indication.additional.is_empty()
+        || sess.as_ref().is_some_and(|s| !s.dc_tunnel_fars.is_empty());
+    if split {
+        return split_pdu_session_modification(
+            sm_context_ref,
+            upf_seid,
+            (ul_teid, ul_addr),
+            &indication,
+            sess,
+        )
+        .await
+        .unwrap_or_else(|(cause, why)| fail(cause, &why));
+    }
     if let Err(e) = pfcp_session_modify(smf_n4_seid_for(sm_context_ref), upf_seid, teid, addr).await
     {
         return fail(
@@ -2873,7 +2882,7 @@ async fn an_initiated_modification(sm_context_ref: &str, n2_bytes: &[u8]) -> Sbi
         addr[2],
         addr[3]
     );
-    match n2_transfer::modify_confirm_transfer(&qfis, (ul_teid, ul_addr)) {
+    match n2_transfer::modify_confirm_transfer(&qfis, (ul_teid, ul_addr), &[], &[]) {
         Ok(bytes) => sbi_response_with_n2(
             serde_json::json!({ "n2SmInfoType": "PDU_RES_MOD_CFM" }),
             &bytes,
@@ -2883,6 +2892,172 @@ async fn an_initiated_modification(sm_context_ref: &str, n2_bytes: &[u8]) -> Sbi
             &format!("could not encode the Modify Confirm Transfer ({e})"),
         ),
     }
+}
+
+/// FAR id of the `n`-th (1-based) additional NG-U tunnel of a split PDU session (#582).
+const DC_TUNNEL_FAR_BASE: u32 = 0x70;
+
+/// #582, TS 38.413 §8.2.5.2 / TS 23.502 §4.3.3.2: a Modify Indication for a split PDU
+/// session (dual connectivity) -- the primary DL tunnel and the Additional DL QoS Flow per
+/// TNL Information, each carrying some of the session's QoS flows.
+///
+/// At the UPF, in ONE modification:
+/// - FAR 2 (the default flow's) is pointed at whichever tunnel carries the default QFI;
+/// - each other tunnel that carries a flow gets a FAR of its own (`0x70 + n`), replacing
+///   the ones the previous indication created;
+/// - each dedicated flow's DL PDR (`0x30 + EBI`, #583) is re-created on its tunnel's FAR.
+///
+/// The Confirm Transfer confirms every flow it placed, gives one `(UL, DL)` Additional
+/// NG-U UP TNL pair per additional tunnel (the session's one N3 uplink, which the UPF
+/// tells flows apart on by QFI), and lists a QFI the session has no flow for as failed
+/// (radioNetwork / unknown-qos-flow-id).
+async fn split_pdu_session_modification(
+    sm_context_ref: &str,
+    upf_seid: u64,
+    ul: (u32, [u8; 4]),
+    indication: &n2_transfer::ModifyIndication,
+    sess: Option<context::SmfSess>,
+) -> std::result::Result<SbiResponse, (n2_transfer::SmfCause, String)> {
+    use n2_transfer::SmfCause;
+    let mut tunnels = vec![(
+        indication.dl.teid,
+        ipv4_of(&indication.dl),
+        &indication.dl.qfis,
+    )];
+    for t in &indication.additional {
+        tunnels.push((t.teid, ipv4_of(t), &t.qfis));
+    }
+    let tunnels: Vec<(u32, [u8; 4], &Vec<u8>)> = tunnels
+        .into_iter()
+        .map(|(teid, addr, qfis)| addr.map(|a| (teid, a, qfis)))
+        .collect::<Option<_>>()
+        .ok_or((
+            SmfCause::TransportUnspecified,
+            "an additional DL endpoint is not an IPv4 address".to_string(),
+        ))?;
+
+    // The session's flows at the UPF: the default one (PDR 2 / FAR 2) and each dedicated
+    // flow with a downlink PDR of its own.
+    let default_qfi = lookup_policy_binding(sm_context_ref).map(|b| b.qfi);
+    let dedicated: Vec<(u8, Vec<String>)> = sess
+        .as_ref()
+        .map(|s| {
+            eps_to_5gs::session_bearers(s)
+                .iter()
+                .filter(|b| Some(b.ebi) != default_qfi)
+                .filter_map(|b| {
+                    let f = eps_to_5gs::downlink_filters(b);
+                    (!f.is_empty()).then_some((b.ebi, f))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut default_tunnel = None;
+    let mut placed: Vec<(u8, usize)> = Vec::new(); // (dedicated QFI, tunnel index)
+    let mut confirmed = Vec::new();
+    let mut failed = Vec::new();
+    for (i, (_, _, qfis)) in tunnels.iter().enumerate() {
+        for &q in qfis.iter() {
+            if confirmed.contains(&q) || failed.contains(&q) {
+                continue;
+            }
+            if Some(q) == default_qfi {
+                default_tunnel = Some(i);
+                confirmed.push(q);
+            } else if dedicated.iter().any(|(e, _)| *e == q) {
+                placed.push((q, i));
+                confirmed.push(q);
+            } else {
+                failed.push(q);
+            }
+        }
+    }
+    let default_tunnel = default_tunnel.unwrap_or(0);
+    let far_of = |i: usize| -> u32 {
+        if i == default_tunnel {
+            2
+        } else {
+            DC_TUNNEL_FAR_BASE + i as u32
+        }
+    };
+    let mut new_fars: Vec<u32> = placed
+        .iter()
+        .map(|&(_, i)| far_of(i))
+        .filter(|&f| f != 2)
+        .collect();
+    new_fars.sort_unstable();
+    new_fars.dedup();
+
+    let ue_ip = sess.as_ref().and_then(|s| s.ipv4_addr).map(|a| a.octets());
+    let ohc = |i: usize| Some((0x0100u16, tunnels[i].0, Some(tunnels[i].1), None));
+    let params = n4_build::SessionModificationParams {
+        update_fars_activate: vec![(2, 0, ohc(default_tunnel), false)],
+        remove_far_ids: sess
+            .as_ref()
+            .map(|s| s.dc_tunnel_fars.clone())
+            .unwrap_or_default(),
+        create_fars: new_fars
+            .iter()
+            .map(|&far| n4_build::FarParams {
+                far_id: far,
+                apply_action: n4_build::apply_action::FORW,
+                destination_interface: Some(0),
+                outer_header_creation: ohc((far - DC_TUNNEL_FAR_BASE) as usize),
+                network_instance: None,
+            })
+            .collect(),
+        remove_pdr_ids: dedicated
+            .iter()
+            .map(|(e, _)| eps_to_5gs::dedicated_dl_pdr_id(*e))
+            .collect(),
+        create_pdrs: dedicated
+            .iter()
+            .map(|(e, filters)| {
+                let far = placed
+                    .iter()
+                    .find(|(q, _)| q == e)
+                    .map_or(2, |&(_, i)| far_of(i));
+                eps_to_5gs::dedicated_dl_pdr(*e, filters, ue_ip, far)
+            })
+            .collect(),
+        ..Default::default()
+    };
+    pfcp_modify_with(smf_n4_seid_for(sm_context_ref), upf_seid, &params)
+        .await
+        .map_err(|e| {
+            (
+                SmfCause::TransportResourceUnavailable,
+                format!("PFCP Session Modification failed ({e})"),
+            )
+        })?;
+    if let Some(mut s) = sess {
+        s.dc_tunnel_fars = new_fars.clone();
+        if let Ok(ctx) = smf_self().read() {
+            ctx.sess_update(&s);
+        }
+    }
+    log::info!(
+        "PDU_RES_MOD_IND for ref={sm_context_ref}: split PDU session over {} NG-U tunnel(s); \
+         default flow on tunnel {default_tunnel}, dedicated flows {placed:?}, tunnel FARs \
+         {new_fars:?}, confirmed {confirmed:?}, failed {failed:?}",
+        tunnels.len()
+    );
+    let pairs: Vec<_> = tunnels[1..]
+        .iter()
+        .map(|&(teid, a, _)| (ul, (teid, a)))
+        .collect();
+    let bytes =
+        n2_transfer::modify_confirm_transfer(&confirmed, ul, &pairs, &failed).map_err(|e| {
+            (
+                SmfCause::MiscUnspecified,
+                format!("could not encode the Modify Confirm Transfer ({e})"),
+            )
+        })?;
+    Ok(sbi_response_with_n2(
+        serde_json::json!({ "n2SmInfoType": "PDU_RES_MOD_CFM" }),
+        &bytes,
+    ))
 }
 
 /// A 200 SmContextUpdatedData answer carrying `n2_sm_info` as the multipart
@@ -4908,21 +5083,11 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
         }
 
         // The NG-RAN released the session's resources on its side (TS 38.413
-        // §8.2.5, PDU Session Resource Released List): there is no N3 path any more,
-        // so downlink is buffered again, as for an AN resource failure.
+        // §8.3.5, PDU Session Resource Released List). #582: the SMF releases the PDU
+        // session (TS 23.502 §4.3.4.2 step 1d) rather than only pausing it.
         "PDU_RES_NTY_REL" => {
-            log::warn!(
-                "SM Context Update (PDU_RES_NTY_REL): the NG-RAN released ref={sm_context_ref}"
-            );
-            if let Some(upf_seid) = lookup_upf_seid(sm_context_ref) {
-                if let Err(e) =
-                    pfcp_deactivate_dl_far(smf_n4_seid_for(sm_context_ref), upf_seid).await
-                {
-                    log::warn!("DL FAR deactivation after NG-RAN release failed: {e}");
-                }
-            }
-            let response_body = serde_json::json!({ "upCnxState": "DEACTIVATED" });
-            SbiResponse::with_status(200).with_body(response_body.to_string(), "application/json")
+            let n2_bytes = resolve_binary_ref(request, &req_body["n2SmInfo"]);
+            ran_released_session(sm_context_ref, n2_bytes.as_deref()).await
         }
 
         other => {
@@ -5507,6 +5672,61 @@ async fn handle_n1_sm_message(sm_context_ref: &str, n1: &[u8]) -> SbiResponse {
             )
         }
     }
+}
+
+/// #582, TS 23.502 §4.3.4.2: the NG-RAN reported the session released (step 1d), and
+/// the SMF releases the PDU session -- NOTE 3 leaves keeping it deactivated to the SMF,
+/// and a session whose access resources the RAN has dropped is released here.
+///
+/// - **Step 2**: the N4 session is deleted at the UPF (and the PCF association), so no
+///   downlink is buffered for a session that is going away.
+/// - **Step 3a**: the answer to this UpdateSMContext carries the N1 PDU Session Release
+///   Command (cause #36, regular deactivation) and NO N2 resource release request: the
+///   NG-RAN's resources are already gone (*"N2 SM Resource Release request is included if
+///   the PDU Session Release is initiated by the UE"*). T3592 guards the command.
+/// - The context lives until the UE's PDU Session Release Complete (step 9-11), which the
+///   existing `/modify` N1 path turns into the context removal and the RELEASED status
+///   notification to the AMF.
+async fn ran_released_session(sm_context_ref: &str, n2: Option<&[u8]>) -> SbiResponse {
+    let cause = match n2.map(n2_transfer::parse_notify_released_transfer) {
+        Some(Ok(cause)) => cause,
+        Some(Err(e)) => format!("undecodable Notify Released Transfer ({e})"),
+        None => "no Notify Released Transfer".to_string(),
+    };
+    let Some(binding) = lookup_policy_binding(sm_context_ref) else {
+        log::warn!("PDU_RES_NTY_REL for unknown SM context ref={sm_context_ref}");
+        return problem_404("CONTEXT_NOT_FOUND", "no such SM context");
+    };
+    log::warn!(
+        "SM Context Update (PDU_RES_NTY_REL): the NG-RAN released ref={sm_context_ref} \
+         (PSI {}, cause {cause}); releasing the PDU session (TS 23.502 §4.3.4.2 step 1d)",
+        binding.psi
+    );
+    release_user_plane(sm_context_ref).await;
+    if let Ok(ctx) = smf_self().read() {
+        if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
+            sess.up_cnx_state = context::UpCnxState::Deactivated;
+            ctx.sess_update(&sess);
+        }
+    }
+    let n1_cmd = policy::build_release_command(
+        binding.psi,
+        0, // network-initiated: no procedure transaction (TS 24.501 §6.3.3.2)
+        policy::gsm_cause::REGULAR_DEACTIVATION,
+    );
+    arm_gsm_timer(
+        sm_context_ref,
+        timer::SmfTimerId::T3592,
+        &n1_cmd,
+        &binding.supi,
+        binding.psi,
+        binding.sm_context_status_uri.as_deref(),
+    );
+    sbi_response_with_n1(
+        200,
+        serde_json::json!({ "upCnxState": "DEACTIVATED" }),
+        &n1_cmd,
+    )
 }
 
 /// Release the user-plane resources for an SM context without removing the
@@ -9899,6 +10119,107 @@ mod tests {
             .lock()
             .expect("timers")
             .contains_key(reference));
+    }
+
+    /// #582, TS 23.502 §4.3.4.2 step 1d: a session the NG-RAN reports released in a PDU
+    /// Session Resource Notify is RELEASED, through the real `/modify` dispatch -- the N4
+    /// session is deleted at the UPF (step 2), the answer carries the PDU Session Release
+    /// Command and no N2 resource release (step 3a), T3592 supervises it, and the UE's
+    /// Release Complete removes the context.
+    #[tokio::test]
+    async fn a_session_the_ran_reports_released_is_released() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = pfcp_path::stand_in::associated_upf().await;
+        let reference = "582-nty-rel";
+        seed_binding(reference, 5);
+        seed_session(
+            reference,
+            Some(upf.upf_seid),
+            Some((upf.upf_teid, upf.upf_ip)),
+        );
+
+        let released = nextgcore_ngap_gen::encode_contained(
+            &nextgcore_ngap_gen::generated::PDUSessionResourceNotifyReleasedTransfer {
+                cause: nextgcore_ngap_gen::generated::Cause::Transport(
+                    nextgcore_ngap_gen::generated::CauseTransport(
+                        nextgcore_ngap_gen::generated::CauseTransport::TRANSPORT_RESOURCE_UNAVAILABLE,
+                    ),
+                ),
+                ie_extensions: None,
+            },
+        )
+        .unwrap();
+        let body = serde_json::json!({
+            "n2SmInfo": { "contentId": "n2SmInfo" },
+            "n2SmInfoType": "PDU_RES_NTY_REL",
+        });
+        let mut request = SbiRequest::post(format!(
+            "/nsmf-pdusession/v1/sm-contexts/{reference}/modify"
+        ));
+        request.http.content = Some(body.to_string());
+        request
+            .http
+            .parts
+            .push(nextgcore_sbi::message::SbiPart::with_content(
+                "n2SmInfo",
+                nextgcore_sbi::constants::content_type::APPLICATION_NGAP,
+                bytes::Bytes::copy_from_slice(&released),
+            ));
+        let resp = handle_sm_context_update(reference, &request).await;
+        assert_eq!(resp.status, 200);
+
+        assert!(
+            upf.seen()
+                .contains(&pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST),
+            "step 2: the N4 session is released at the UPF, not paused: {:?}",
+            upf.seen()
+        );
+        let n1_part = resp
+            .http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n1SmMsg"))
+            .expect("step 3a: the PDU Session Release Command");
+        assert_eq!(
+            n1_part.data[..4],
+            [
+                0x2E,
+                5,
+                0,
+                gsm_build::message_type::PDU_SESSION_RELEASE_COMMAND
+            ],
+            "5GSM, PSI 5, PTI 0 (network-initiated), RELEASE COMMAND"
+        );
+        assert_eq!(n1_part.data[4], policy::gsm_cause::REGULAR_DEACTIVATION);
+        assert!(
+            resp.http
+                .parts
+                .iter()
+                .all(|p| p.content_id.as_deref() != Some("n2SmInfo")),
+            "no N2 resource release: the NG-RAN's resources are already gone"
+        );
+        assert!(gsm_procedure_timers()
+            .lock()
+            .expect("timers")
+            .contains_key(reference));
+
+        // Steps 9-11: the UE's PDU Session Release Complete ends it.
+        let complete = n1(
+            5,
+            0,
+            gsm_build::message_type::PDU_SESSION_RELEASE_COMPLETE,
+            &[],
+        );
+        assert_eq!(handle_n1_sm_message(reference, &complete).await.status, 204);
+        assert!(
+            lookup_policy_binding(reference).is_none(),
+            "the SM context is gone"
+        );
+        assert!(!gsm_procedure_timers()
+            .lock()
+            .expect("timers")
+            .contains_key(reference));
+        unseed_session(reference);
     }
 
     #[tokio::test]

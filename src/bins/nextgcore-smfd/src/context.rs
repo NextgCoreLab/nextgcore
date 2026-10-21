@@ -1048,6 +1048,9 @@ pub struct SmfSess {
     pub sm_data: SmData,
     /// EPC or 5GC mode
     pub epc: bool,
+    /// #582: the FARs this SMF created for the additional NG-U tunnels of a split PDU
+    /// session (dual connectivity, TS 38.413 §8.2.5), replaced on the next indication.
+    pub dc_tunnel_fars: Vec<u32>,
     /// SBI features
     pub smpolicycontrol_features: u64,
     /// SMF N4 TEID
@@ -1214,6 +1217,7 @@ impl SmfSess {
             index,
             sm_data: SmData::default(),
             epc: false,
+            dc_tunnel_fars: Vec::new(),
             smpolicycontrol_features: 0,
             smf_n4_teid: 0,
             sgw_s5c_teid: 0,

@@ -34,6 +34,9 @@ pub mod gsm_cause {
     pub const USER_AUTHENTICATION_OR_AUTHORIZATION_FAILED: u8 = 29;
     #[allow(dead_code)]
     pub const REQUEST_REJECTED_UNSPECIFIED: u8 = 31;
+    /// #36 Regular deactivation (TS 24.501 §9.11.4.2): the network releases the
+    /// session in the ordinary course -- here, because the NG-RAN released it (#582).
+    pub const REGULAR_DEACTIVATION: u8 = 36;
     pub const NETWORK_FAILURE: u8 = 38;
     pub const PDU_SESSION_TYPE_IPV4_ONLY_ALLOWED: u8 = 50;
     /// #67 Insufficient resources for specific slice (TS 24.501 §9.11.4.2).
