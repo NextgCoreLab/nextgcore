@@ -614,43 +614,6 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
             return Vec::new();
         }
     }
-    // Path Switch is decoded with the generated codec (#514 stage 10). Class 1
-    // with both a response and a failure: `notify` IEs go in the acknowledge,
-    // a `reject` IE or a missing reject IE is answered by PATH SWITCH REQUEST
-    // FAILURE naming it.
-    if crate::s1ap_gen::is_initiating(data, crate::s1ap_gen::PROC_PATH_SWITCH_REQUEST) {
-        use crate::s1ap_gen::Class2Decode;
-        match crate::s1ap_gen::decode_path_switch_request(data) {
-            Class2Decode::Proceed { msg, notify } => {
-                return handle_path_switch_request_reporting(ctx, enb_id, &msg, &notify);
-            }
-            Class2Decode::Reject {
-                ies,
-                enb_ue_s1ap_id,
-                mme_ue_s1ap_id,
-            } => {
-                log::error!(
-                    "Path Switch Request from eNB {enb_id} rejected (TS 36.413 §10.3.4/§10.3.5): {ies:?}"
-                );
-                let failure = nextgcore_s1ap::PathSwitchRequestFailure {
-                    mme_ue_s1ap_id: mme_ue_s1ap_id.unwrap_or(0),
-                    enb_ue_s1ap_id: enb_ue_s1ap_id.unwrap_or(0),
-                    cause: s1ap_build::cause_to_s1ap(
-                        S1apCauseGroup::Protocol,
-                        protocol_cause::ABSTRACT_SYNTAX_ERROR_REJECT,
-                    ),
-                };
-                return match crate::s1ap_gen::build_path_switch_request_failure(&failure, &ies) {
-                    Ok(pdu) => S1apSend::to_origin(enb_id, pdu),
-                    Err(e) => {
-                        log::error!("Failed to build Path Switch Request Failure: {e}");
-                        Vec::new()
-                    }
-                };
-            }
-            Class2Decode::Undecodable => {}
-        }
-    }
     let message = match decode_s1ap_pdu(data) {
         Ok(message) => message,
         Err(e) => {
@@ -2586,18 +2549,6 @@ pub fn handle_path_switch_request(
     enb_id: u64,
     msg: &PathSwitchRequest,
 ) -> Vec<S1apSend> {
-    handle_path_switch_request_reporting(ctx, enb_id, msg, &[])
-}
-
-/// [`handle_path_switch_request`], reporting `notify` (unknown
-/// ignore-and-notify IEs of the PATH SWITCH REQUEST) in the acknowledge's
-/// Criticality Diagnostics (TS 36.413 §10.3.4.2).
-pub fn handle_path_switch_request_reporting(
-    ctx: &MmeContext,
-    enb_id: u64,
-    msg: &PathSwitchRequest,
-    notify: &[crate::s1ap_gen::DiagnosedIe],
-) -> Vec<S1apSend> {
     let Some(enb_ue_id) = ctx.enb_ue_find_by_mme_ue_s1ap_id(msg.source_mme_ue_s1ap_id) else {
         return path_switch_failure(
             enb_id,
@@ -2699,7 +2650,7 @@ pub fn handle_path_switch_request_reporting(
         },
     };
 
-    match crate::s1ap_gen::build_path_switch_request_acknowledge(&ack, notify) {
+    match builder::build_path_switch_request_acknowledge(&ack) {
         Ok(pdu) => S1apSend::to_origin(enb_id, pdu),
         Err(e) => {
             log::error!("Failed to build Path Switch Request Acknowledge: {e}");
@@ -2719,7 +2670,7 @@ fn path_switch_failure(
         enb_ue_s1ap_id,
         cause: s1ap_build::cause_to_s1ap(S1apCauseGroup::RadioNetwork, cause_value),
     };
-    match crate::s1ap_gen::build_path_switch_request_failure(&failure, &[]) {
+    match builder::build_path_switch_request_failure(&failure) {
         Ok(pdu) => S1apSend::to_origin(enb_id, pdu),
         Err(e) => {
             log::error!("Failed to build Path Switch Request Failure: {e}");

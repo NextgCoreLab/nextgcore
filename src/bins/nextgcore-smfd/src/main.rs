@@ -4233,6 +4233,17 @@ fn smf_n4_seid_for(sm_context_ref: &str) -> u64 {
     inherited.unwrap_or_else(|| (sm_context_ref.parse::<u64>().unwrap_or(1)) | 0x1000)
 }
 
+/// Record a session's user-plane connection state (#540). The Downlink Data
+/// Report handler reads it to decide whether to page.
+fn mark_up_cnx_state(sm_context_ref: &str, state: context::UpCnxState) {
+    if let Ok(ctx) = smf_self().read() {
+        if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
+            sess.up_cnx_state = state;
+            ctx.sess_update(&sess);
+        }
+    }
+}
+
 fn lookup_upf_seid(sm_context_ref: &str) -> Option<u64> {
     smf_self().read().ok().and_then(|ctx| {
         ctx.pfcp_sessions
@@ -4582,6 +4593,9 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
         // new DL F-TEID that the UPF must forward to, but in different APER
         // transfer containers (TS 38.413 §9.3.4.2 vs §9.3.4.8).
         "PDU_RES_SETUP_RSP" | "PATH_SWITCH_REQ" => {
+            // #540: the gNB holds the session's user plane again -- after
+            // establishment, a Service Request re-activation or a path switch.
+            mark_up_cnx_state(sm_context_ref, context::UpCnxState::Activated);
             // N2 SM transfer: multipart ngap part (RefToBinaryData) or legacy
             // base64 string — `resolve_binary_ref` accepts both.
             let Some(n2_bytes) = resolve_binary_ref(request, &req_body["n2SmInfo"]) else {
@@ -4883,6 +4897,10 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                         return SbiResponse::with_status(504);
                     }
                 }
+                // #540: record it. The Downlink Data Report handler pages only for a
+                // session whose UP connection is DEACTIVATED (TS 29.244 §7.5.8.2), and
+                // nothing set that state, so buffered downlink data never paged the UE.
+                mark_up_cnx_state(sm_context_ref, context::UpCnxState::Deactivated);
                 let response_body = serde_json::json!({ "upCnxState": "DEACTIVATED" });
                 return SbiResponse::with_status(200)
                     .with_body(response_body.to_string(), "application/json");
@@ -5237,7 +5255,32 @@ async fn trigger_network_initiated_service_request(seid: u64, qfi: Option<u8>) {
     let Some((sm_context_ref, supi, psi, amf_uri, up_deactivated)) = ({
         let handle = smf_self();
         handle.read().ok().and_then(|ctx| {
-            let sess = ctx.sess_find_by_seid(seid)?;
+            // #540: the SEID the UPF echoes is the F-SEID the PFCP session was
+            // established with, `smf_n4_seid_for(ref)` -- not the session's own
+            // `smf_n4_seid`, which is all `sess_find_by_seid` indexes. Without this
+            // fallback every Downlink Data Report "matched no SM context" and an
+            // idle UE was never paged for buffered downlink data.
+            // The derivation of `smf_n4_seid_for`, against the guard already held
+            // (calling it would re-take `smf_self()` under this read guard).
+            let inherited = ctx
+                .cp_n4_seids
+                .read()
+                .ok()
+                .map(|m| m.clone())
+                .unwrap_or_default();
+            let pfcp_seid = |r: &str| {
+                inherited
+                    .get(r)
+                    .copied()
+                    .unwrap_or_else(|| r.parse::<u64>().unwrap_or(1) | 0x1000)
+            };
+            let sess = ctx.sess_find_by_seid(seid).or_else(|| {
+                ctx.sess_find_by(|s| {
+                    s.sm_context_ref
+                        .as_deref()
+                        .is_some_and(|r| pfcp_seid(r) == seid)
+                })
+            })?;
             let reference = sess.sm_context_ref.clone()?;
             let binding = ctx
                 .policy_bindings
@@ -10361,6 +10404,32 @@ mod tests {
     /// Register a session in the context list the way the create handler now does,
     /// and return its `smContextRef` — minted by the session itself, so a test can
     /// never assert against a reference the context does not hold.
+    /// #540: `upCnxState: DEACTIVATED` (the AMF's AN release, TS 23.502 §4.2.6
+    /// step 5) records the session as DEACTIVATED -- the state the Downlink Data
+    /// Report handler requires before it pages the UE -- and a later
+    /// PDU_RES_SETUP_RSP marks it ACTIVATED again.
+    #[tokio::test]
+    async fn an_up_deactivation_is_recorded_for_the_downlink_data_report() {
+        let reference = seed_registered_session("imsi-999700000540001", 1, "internet");
+        let req = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts/x/modify").with_body(
+            serde_json::json!({ "upCnxState": "DEACTIVATED" }).to_string(),
+            "application/json",
+        );
+        let resp = handle_sm_context_update(&reference, &req).await;
+        assert_eq!(resp.status, 200);
+        let state = |r: &str| {
+            smf_self()
+                .read()
+                .unwrap()
+                .sess_find_by_sm_context_ref(r)
+                .expect("session")
+                .up_cnx_state
+        };
+        assert_eq!(state(&reference), context::UpCnxState::Deactivated);
+        mark_up_cnx_state(&reference, context::UpCnxState::Activated);
+        assert_eq!(state(&reference), context::UpCnxState::Activated);
+    }
+
     fn seed_registered_session(supi: &str, psi: u8, dnn: &str) -> String {
         smf_context_init(64, 256, 512);
         let ctx = smf_self();

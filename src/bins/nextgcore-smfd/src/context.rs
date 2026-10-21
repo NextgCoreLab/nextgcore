@@ -2600,6 +2600,12 @@ impl SmfContext {
             .and_then(|&id| sess_list.get(&id).cloned())
     }
 
+    /// Find the session whose SM context reference satisfies `matches` (#540).
+    pub fn sess_find_by(&self, matches: impl Fn(&SmfSess) -> bool) -> Option<SmfSess> {
+        let sess_list = self.sess_list.read().ok()?;
+        sess_list.values().find(|s| matches(s)).cloned()
+    }
+
     /// Find session by APN (EPC)
     pub fn sess_find_by_apn(&self, smf_ue_id: u64, apn: &str, rat_type: u8) -> Option<SmfSess> {
         let sess_list = self.sess_list.read().ok()?;
