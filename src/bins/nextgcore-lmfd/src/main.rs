@@ -41,6 +41,7 @@ mod nrppa_uplink; // #515: E-CID Measurement Report on the generated codec, TS 3
                   // Wired into `context::compute_location`; solve_tdoa remains available for
                   // lmfd-05/06 (NRPPa TDOA) but is not yet called (dead_code = "allow").
 mod positioning;
+mod sidelink_epdu; // #542: sidelink ranging in an LPP EPDU (TS 37.355 §6.5.7)
 mod site_config; // #103: cell/TRP coordinates from configuration
 
 pub use context::*;
@@ -5596,9 +5597,36 @@ lmf:
         }
     }
 
+    /// The same golden report as [`sender_golden_report`], as the EPDU body type.
+    fn epdu_golden_report() -> crate::sidelink_epdu::SidelinkRangingReport {
+        use crate::sidelink_epdu::{
+            SidelinkRangingMethod, SidelinkRangingReport, SidelinkRangingResult,
+        };
+        SidelinkRangingReport {
+            results: vec![SidelinkRangingResult {
+                peer_layer2_id: 0x00A5_A5A5,
+                range_cm: 5_000,
+                accuracy_cm: 1,
+                method: SidelinkRangingMethod::CarrierPhase,
+                measurement_count: 3,
+            }],
+        }
+    }
+
+    // Transition (#542): a UE that still sends the legacy fourth-group report is
+    // still read until nextgsim's sender has moved to the EPDU.
+    #[test]
+    fn test_legacy_group4_sidelink_report_is_still_read_during_the_transition() {
+        let (_, ranges) =
+            codec_glue::decode_lpp_sidelink_ranging(&build_legacy_group4_sidelink_lpp(9))
+                .expect("decodes");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].peer_layer2_id, 0x00A5_A5A5);
+    }
+
     /// An uplink LPP `ProvideLocationInformation` carrying the sidelink ranging
     /// report in addition group 4, plus the E-CID body a real UE sends alongside it.
-    fn build_sidelink_ranging_lpp(txn: u8) -> Vec<u8> {
+    fn build_legacy_group4_sidelink_lpp(txn: u8) -> Vec<u8> {
         use nextgcore_asn1c::lpp::ecid::{
             EcidProvideLocationInformation, EcidSignalMeasurementInformation,
             MeasuredResultsElement, ProvideLocationInformation, ProvideLocationInformationR9,
@@ -5823,7 +5851,7 @@ lmf:
             "precondition: the LMF holds no ranges for this UE"
         );
 
-        let lpp = build_sidelink_ranging_lpp(181);
+        let lpp = crate::sidelink_epdu::build_message(181, &epdu_golden_report());
         let notify = nextgcore_amfd::namf_server::build_n1_message_notify_request(
             namf_client::N1_NOTIFY_PATH,
             Some("sub-sidelink"),
@@ -5847,7 +5875,7 @@ lmf:
         assert!((range.accuracy_m - 0.01).abs() < 0.0001, "1 cm");
         assert_eq!(
             range.method,
-            nextgcore_asn1c::lpp::sidelink_ranging::SidelinkRangingMethod::CarrierPhase,
+            crate::sidelink_epdu::SidelinkRangingMethod::CarrierPhase,
             "the method the UE reported, not one this LMF inferred"
         );
         assert_eq!(range.measurement_count, 3);
@@ -5879,7 +5907,7 @@ lmf:
         }
 
         // txn 250 matches no session, and a fresh correlation matches none either.
-        let lpp = build_sidelink_ranging_lpp(250);
+        let lpp = crate::sidelink_epdu::build_message(250, &epdu_golden_report());
         let json = format!(
             "{{\"n1MessageContainer\":{{\"n1MessageClass\":\"LPP\",\
              \"n1MessageContent\":{{\"contentId\":\"n1-lpp\"}}}},\
@@ -5920,7 +5948,7 @@ lmf:
                     peer_layer2_id: 1,
                     range_m: 12.0,
                     accuracy_m: 1.0,
-                    method: nextgcore_asn1c::lpp::sidelink_ranging::SidelinkRangingMethod::Rtt,
+                    method: crate::sidelink_epdu::SidelinkRangingMethod::Rtt,
                     measurement_count: 1,
                 }],
             );
