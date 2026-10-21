@@ -25,10 +25,11 @@
 use nextgcore_asn1c::ngap::cause::{
     Cause, CauseMisc, CauseNas, CauseProtocol, CauseRadioNetwork, CauseTransport,
 };
-use nextgcore_ngap::{builder, types::*};
-// Only the hand-written oracles the tests compare the generated decoders with.
+use nextgcore_ngap::types::*;
+// Only the hand-written oracles the tests compare the generated codec with:
+// since #417's Overload stage no production builder here is hand-written.
 #[cfg(test)]
-use nextgcore_ngap::{parser, NgapMessage};
+use nextgcore_ngap::{builder, parser, NgapMessage};
 
 use nextgcore_ngap_gen::generated as ngap_gen;
 
@@ -3627,13 +3628,32 @@ pub fn build_ng_reset_acknowledge_asn1(
     }
 }
 
-/// Build an AMF-initiated OverloadStart (TS 38.413 Section 9.2.6.10) carrying a
-/// percentage traffic-load reduction request (1..99).
+/// Build an AMF-initiated OVERLOAD START (TS 38.413 §9.2.6.10) carrying a
+/// percentage traffic-load reduction request, with the GENERATED codec (#417).
+///
+/// AMF Traffic Load Reduction Indication is INTEGER (1..99), criticality
+/// ignore; `reduce_percent` is clamped into that range, as the hand-written
+/// builder did. Byte-identical to it over 0..=255:
+/// `overload_generated_matches_hand_written`.
 pub fn build_overload_start_asn1(reduce_percent: u8) -> Option<Vec<u8>> {
-    let msg = OverloadStart {
-        traffic_load_reduction: Some(reduce_percent.clamp(1, 99)),
+    use ngap_gen::{
+        OverloadStart, OverloadStartProtocolIEs, OverloadStartProtocolIEs_Entry as Entry,
+        OverloadStartProtocolIEs_EntryValue as Ie, ProtocolIE_ID, NGAP_PDU,
     };
-    match builder::build_overload_start(&msg) {
+    let pdu = NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_OVERLOAD_START),
+        criticality: ngap_gen::Criticality(ngap_gen::Criticality::IGNORE),
+        value: ngap_gen::InitiatingMessageValue::Id_OverloadStart(OverloadStart {
+            protocol_i_es: OverloadStartProtocolIEs(vec![Entry {
+                id: ProtocolIE_ID(ngap_gen::ID_AMF_TRAFFIC_LOAD_REDUCTION_INDICATION),
+                criticality: ngap_gen::Criticality(ngap_gen::Criticality::IGNORE),
+                value: Ie::Id_AMFTrafficLoadReductionIndication(
+                    ngap_gen::TrafficLoadReductionIndication(reduce_percent.clamp(1, 99)),
+                ),
+            }]),
+        }),
+    });
+    match nextgcore_ngap_gen::encode(&pdu) {
         Ok(bytes) => Some(bytes),
         Err(e) => {
             log::error!("Failed to encode OverloadStart: {e:?}");
@@ -3642,9 +3662,18 @@ pub fn build_overload_start_asn1(reduce_percent: u8) -> Option<Vec<u8>> {
     }
 }
 
-/// Build an AMF-initiated OverloadStop (TS 38.413 Section 9.2.6.11).
+/// Build an AMF-initiated OVERLOAD STOP (TS 38.413 §9.2.6.11), with the
+/// GENERATED codec (#417). OverloadStopIEs is an empty, extensible object set,
+/// so the message is an empty IE container under procedure criticality reject.
 pub fn build_overload_stop_asn1() -> Option<Vec<u8>> {
-    match builder::build_overload_stop(&OverloadStop {}) {
+    let pdu = ngap_gen::NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_OVERLOAD_STOP),
+        criticality: ngap_gen::Criticality(ngap_gen::Criticality::REJECT),
+        value: ngap_gen::InitiatingMessageValue::Id_OverloadStop(ngap_gen::OverloadStop {
+            protocol_i_es: ngap_gen::OverloadStopProtocolIEs(Vec::new()),
+        }),
+    });
+    match nextgcore_ngap_gen::encode(&pdu) {
         Ok(bytes) => Some(bytes),
         Err(e) => {
             log::error!("Failed to encode OverloadStop: {e:?}");
@@ -5774,6 +5803,48 @@ pub(crate) mod tests {
         assert_eq!(
             report.diagnostics[0].type_of_error,
             ngap_gen::TypeOfError::MISSING
+        );
+    }
+
+    /// #417: the generated OVERLOAD START is byte-identical to the
+    /// hand-written builder for every input percentage (clamped to 1..99 by
+    /// both), and OVERLOAD STOP is too.
+    #[test]
+    fn overload_generated_matches_hand_written() {
+        for percent in 0..=u8::MAX {
+            let old = builder::build_overload_start(&OverloadStart {
+                traffic_load_reduction: Some(percent.clamp(1, 99)),
+            })
+            .expect("hand-written build");
+            assert_eq!(
+                build_overload_start_asn1(percent).expect("generated"),
+                old,
+                "{percent}"
+            );
+        }
+        let old = builder::build_overload_stop(&OverloadStop {}).expect("hand-written build");
+        assert_eq!(build_overload_stop_asn1().expect("generated"), old);
+    }
+
+    /// Both messages, derived from X.691 by hand.
+    ///
+    /// OVERLOAD START, 40%: initiatingMessage (0x00), procedure code 22 (0x16),
+    /// criticality ignore (0x40), an 8-octet open type: SEQUENCE extension bit
+    /// (0, padded), IE count 1 (00 01), then IE id 9 (00 09), criticality
+    /// ignore (0x40), a 1-octet value: TrafficLoadReductionIndication
+    /// INTEGER (1..99) holds 40 - 1 = 39 in 7 bits, `0100111` + pad = 0x4e.
+    ///
+    /// OVERLOAD STOP: procedure code 23 (0x17), criticality reject (0x00), a
+    /// 3-octet open type holding the extension bit and an empty container.
+    #[test]
+    fn overload_golden_bytes() {
+        assert_eq!(
+            build_overload_start_asn1(40).expect("start"),
+            [0x00, 0x16, 0x40, 0x08, 0x00, 0x00, 0x01, 0x00, 0x09, 0x40, 0x01, 0x4e]
+        );
+        assert_eq!(
+            build_overload_stop_asn1().expect("stop"),
+            [0x00, 0x17, 0x00, 0x03, 0x00, 0x00, 0x00]
         );
     }
 
