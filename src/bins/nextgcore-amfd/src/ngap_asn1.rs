@@ -4174,6 +4174,536 @@ pub fn decode_handover_failure_asn1(data: &[u8]) -> NasTransportDecode<HandoverF
     }
 }
 
+/// A hand-written S-NSSAI (TS 38.413 §9.3.1.24) as the generated one.
+fn generated_s_nssai_from(s_nssai: &SNssai) -> ngap_gen::S_NSSAI {
+    ngap_gen::S_NSSAI {
+        sst: ngap_gen::SST(vec![s_nssai.sst]),
+        sd: s_nssai.sd.map(|sd| ngap_gen::SD(sd.to_vec())),
+        ie_extensions: None,
+    }
+}
+
+/// A hand-written [`HandoverType`] as the generated ENUMERATED (§9.3.1.22).
+fn generated_handover_type(handover_type: HandoverType) -> ngap_gen::HandoverType {
+    ngap_gen::HandoverType(match handover_type {
+        HandoverType::Intra5gs => ngap_gen::HandoverType::INTRA5GS,
+        HandoverType::FivegsToEps => ngap_gen::HandoverType::FIVEGS_TO_EPS,
+        HandoverType::EpsTo5gs => ngap_gen::HandoverType::EPS_TO_5GS,
+    })
+}
+
+/// Build an N2 **HANDOVER REQUEST** (TS 38.413 §9.2.3.4) with the GENERATED
+/// codec (#417) from the same [`HandoverRequest`] the hand-written builder
+/// takes. The IEs go in `HandoverRequestIEs` object-set order with its
+/// criticalities (Cause ignore, every other IE this AMF sends reject).
+///
+/// A UE AMBR past §9.3.1.4's 4,000,000,000,000 bit/s is refused rather than
+/// sent as an undefined extension value -- the hand-written encoder refused
+/// it too. Never logs the PDU: the Security Context carries the NH.
+pub fn build_handover_request_generated(msg: &HandoverRequest) -> Option<Vec<u8>> {
+    use ngap_gen::{
+        HandoverRequestProtocolIEs_Entry as Entry, HandoverRequestProtocolIEs_EntryValue as Ie,
+        ProtocolIE_ID,
+    };
+    if msg.ue_ambr.dl > MAX_BIT_RATE || msg.ue_ambr.ul > MAX_BIT_RATE {
+        log::error!(
+            "HandoverRequest for amf_ue_ngap_id={}: UE AMBR past TS 38.413 §9.3.1.4's bound",
+            msg.amf_ue_ngap_id
+        );
+        return None;
+    }
+    let reject = || ngap_gen::Criticality(ngap_gen::Criticality::REJECT);
+    let entry = |id: u16, criticality: ngap_gen::Criticality, value: Ie| Entry {
+        id: ProtocolIE_ID(id),
+        criticality,
+        value,
+    };
+    let caps = &msg.ue_security_capabilities;
+    let ies = vec![
+        entry(
+            ngap_gen::ID_AMF_UE_NGAP_ID,
+            reject(),
+            Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(msg.amf_ue_ngap_id)),
+        ),
+        entry(
+            ngap_gen::ID_HANDOVER_TYPE,
+            reject(),
+            Ie::Id_HandoverType(generated_handover_type(msg.handover_type)),
+        ),
+        entry(
+            ngap_gen::ID_CAUSE,
+            ngap_gen::Criticality(ngap_gen::Criticality::IGNORE),
+            Ie::Id_Cause(generated_cause(msg.cause)),
+        ),
+        entry(
+            ngap_gen::ID_UE_AGGREGATE_MAXIMUM_BIT_RATE,
+            reject(),
+            Ie::Id_UEAggregateMaximumBitRate(ngap_gen::UEAggregateMaximumBitRate {
+                ue_aggregate_maximum_bit_rate_dl: ngap_gen::BitRate(msg.ue_ambr.dl),
+                ue_aggregate_maximum_bit_rate_ul: ngap_gen::BitRate(msg.ue_ambr.ul),
+                ie_extensions: None,
+            }),
+        ),
+        entry(
+            ngap_gen::ID_UE_SECURITY_CAPABILITIES,
+            reject(),
+            Ie::Id_UESecurityCapabilities(ngap_gen::UESecurityCapabilities {
+                n_rencryption_algorithms: ngap_gen::NRencryptionAlgorithms(low_bits(
+                    u64::from(caps.nr_encryption_algorithms),
+                    16,
+                )),
+                n_rintegrity_protection_algorithms: ngap_gen::NRintegrityProtectionAlgorithms(
+                    low_bits(u64::from(caps.nr_integrity_algorithms), 16),
+                ),
+                eutr_aencryption_algorithms: ngap_gen::EUTRAencryptionAlgorithms(low_bits(
+                    u64::from(caps.eutra_encryption_algorithms),
+                    16,
+                )),
+                eutr_aintegrity_protection_algorithms: ngap_gen::EUTRAintegrityProtectionAlgorithms(
+                    low_bits(u64::from(caps.eutra_integrity_algorithms), 16),
+                ),
+                ie_extensions: None,
+            }),
+        ),
+        entry(
+            ngap_gen::ID_SECURITY_CONTEXT,
+            reject(),
+            Ie::Id_SecurityContext(ngap_gen::SecurityContext {
+                next_hop_chaining_count: ngap_gen::NextHopChainingCount(
+                    msg.security_context.next_hop_chaining_count,
+                ),
+                next_hop_nh: ngap_gen::SecurityKey(
+                    bitvec::vec::BitVec::<u8, bitvec::order::Msb0>::from_slice(
+                        &msg.security_context.next_hop,
+                    ),
+                ),
+                ie_extensions: None,
+            }),
+        ),
+        entry(
+            ngap_gen::ID_PDU_SESSION_RESOURCE_SETUP_LIST_HO_REQ,
+            reject(),
+            Ie::Id_PDUSessionResourceSetupListHOReq(ngap_gen::PDUSessionResourceSetupListHOReq(
+                msg.pdu_session_list
+                    .iter()
+                    .map(|sess| ngap_gen::PDUSessionResourceSetupItemHOReq {
+                        pdu_session_id: ngap_gen::PDUSessionID(sess.pdu_session_id),
+                        s_nssai: generated_s_nssai_from(&sess.s_nssai),
+                        handover_request_transfer:
+                            ngap_gen::PDUSessionResourceSetupItemHOReqHandoverRequestTransfer(
+                                sess.transfer.clone(),
+                            ),
+                        ie_extensions: None,
+                    })
+                    .collect(),
+            )),
+        ),
+        entry(
+            ngap_gen::ID_ALLOWED_NSSAI,
+            reject(),
+            Ie::Id_AllowedNSSAI(ngap_gen::AllowedNSSAI(
+                msg.allowed_nssai
+                    .iter()
+                    .map(|s| ngap_gen::AllowedNSSAI_Item {
+                        s_nssai: generated_s_nssai_from(s),
+                        ie_extensions: None,
+                    })
+                    .collect(),
+            )),
+        ),
+        entry(
+            ngap_gen::ID_SOURCE_TO_TARGET_TRANSPARENT_CONTAINER,
+            reject(),
+            Ie::Id_SourceToTarget_TransparentContainer(
+                ngap_gen::SourceToTarget_TransparentContainer(
+                    msg.source_to_target_container.clone(),
+                ),
+            ),
+        ),
+        entry(
+            ngap_gen::ID_GUAMI,
+            reject(),
+            Ie::Id_GUAMI(ngap_gen::GUAMI {
+                plmn_identity: ngap_gen::PLMNIdentity(msg.guami.plmn_identity.to_vec()),
+                amf_region_id: ngap_gen::AMFRegionID(low_bits(
+                    u64::from(msg.guami.amf_region_id),
+                    8,
+                )),
+                amf_set_id: ngap_gen::AMFSetID(low_bits(u64::from(msg.guami.amf_set_id), 10)),
+                amf_pointer: ngap_gen::AMFPointer(low_bits(u64::from(msg.guami.amf_pointer), 6)),
+                ie_extensions: None,
+            }),
+        ),
+    ];
+    let pdu = ngap_gen::NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_HANDOVER_RESOURCE_ALLOCATION),
+        criticality: reject(),
+        value: ngap_gen::InitiatingMessageValue::Id_HandoverResourceAllocation(
+            ngap_gen::HandoverRequest {
+                protocol_i_es: ngap_gen::HandoverRequestProtocolIEs(ies),
+            },
+        ),
+    });
+    match nextgcore_ngap_gen::encode(&pdu) {
+        Ok(bytes) => Some(bytes),
+        Err(_) => {
+            // The error's Debug form may name a failing value; the NH must not reach a log.
+            log::error!(
+                "Failed to encode the HandoverRequest for amf_ue_ngap_id={}",
+                msg.amf_ue_ngap_id
+            );
+            None
+        }
+    }
+}
+
+/// Decode a HANDOVER REQUEST ACKNOWLEDGE (TS 38.413 §9.2.3.5) with the
+/// GENERATED codec (#417). It is the successful outcome of Handover Resource
+/// Allocation, a response (§10.3.4.2): a not-comprehended "reject" IE, or the
+/// missing Target to Source Transparent Container (the one mandatory IE with
+/// criticality reject, §10.3.5), means local error handling only, returned as
+/// `Reject` for the caller to drop; a "notify" IE is reported in an Error
+/// Indication. The other IEs are criticality ignore: a missing AMF UE NGAP ID
+/// makes the acknowledge unattributable (`Undecodable`), a missing RAN UE
+/// NGAP ID or admitted list is tolerated (0 / empty).
+pub fn decode_handover_request_acknowledge_asn1(
+    data: &[u8],
+) -> NasTransportDecode<HandoverRequestAcknowledge> {
+    use ngap_gen::HandoverRequestAcknowledgeProtocolIEs_EntryValue as Ie;
+    let (pdu, unknown) = match nextgcore_ngap_gen::decode_with_unknown_ies(data) {
+        Ok(decoded) => decoded,
+        Err(e) => {
+            log::warn!("Failed to decode Handover Request Acknowledge: {e:?}");
+            return NasTransportDecode::Undecodable;
+        }
+    };
+    let ngap_gen::NGAP_PDU::SuccessfulOutcome(ngap_gen::SuccessfulOutcome {
+        criticality,
+        value: ngap_gen::SuccessfulOutcomeValue::Id_HandoverResourceAllocation(ack),
+        ..
+    }) = pdu
+    else {
+        log::warn!("Expected HandoverRequestAcknowledge");
+        return NasTransportDecode::Undecodable;
+    };
+    let Some((mut reject, notify)) = classify_unknown_ies(&unknown, "Handover Request Acknowledge")
+    else {
+        return NasTransportDecode::Undecodable;
+    };
+    let (mut amf, mut ran, mut admitted, mut failed, mut container) =
+        (None, None, None, None, None);
+    for entry in ack.protocol_i_es.0 {
+        match entry.value {
+            Ie::Id_AMF_UE_NGAP_ID(v) => amf = Some(v.0),
+            Ie::Id_RAN_UE_NGAP_ID(v) => ran = Some(v.0),
+            Ie::Id_PDUSessionResourceAdmittedList(v) => {
+                admitted = Some(
+                    v.0.into_iter()
+                        .map(|item| PduSessionResourceAdmittedItemHoAck {
+                            pdu_session_id: item.pdu_session_id.0,
+                            transfer: item.handover_request_acknowledge_transfer.0,
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            }
+            Ie::Id_PDUSessionResourceFailedToSetupListHOAck(v) => {
+                failed = Some(
+                    v.0.into_iter()
+                        .map(|item| PduSessionResourceFailedItem {
+                            pdu_session_id: item.pdu_session_id.0,
+                            transfer: item.handover_resource_allocation_unsuccessful_transfer.0,
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            }
+            Ie::Id_TargetToSource_TransparentContainer(v) => container = Some(v.0),
+            // Comprehended; the AMF does not act on them.
+            Ie::Id_CriticalityDiagnostics(_)
+            | Ie::Id_NPN_AccessInformation(_)
+            | Ie::Id_RedCapIndication(_) => {}
+        }
+    }
+    if container.is_none() {
+        reject.push(missing_ie(
+            ngap_gen::ID_TARGET_TO_SOURCE_TRANSPARENT_CONTAINER,
+        ));
+    }
+    let report = |cause_protocol, diagnostics| {
+        handover_report(
+            ngap_gen::ID_HANDOVER_RESOURCE_ALLOCATION,
+            ngap_gen::TriggeringMessage::SUCCESSFUL_OUTCOME,
+            criticality.0,
+            (amf, ran),
+            cause_protocol,
+            diagnostics,
+        )
+    };
+    if !reject.is_empty() {
+        return NasTransportDecode::Reject(report(
+            ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
+            reject,
+        ));
+    }
+    let (Some(amf_ue_ngap_id), Some(target_to_source_container)) = (amf, container) else {
+        log::warn!("Handover Request Acknowledge carries no AMF UE NGAP ID");
+        return NasTransportDecode::Undecodable;
+    };
+    NasTransportDecode::Proceed {
+        message: HandoverRequestAcknowledge {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id: ran.unwrap_or(0),
+            admitted_list: admitted.unwrap_or_default(),
+            failed_list: failed,
+            target_to_source_container,
+        },
+        error_indication: (!notify.is_empty()).then(|| {
+            report(
+                ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+                notify,
+            )
+        }),
+    }
+}
+
+/// Build an N2 **HANDOVER COMMAND** (TS 38.413 §9.2.3.2) with the GENERATED
+/// codec (#417) from the same [`HandoverCommand`] the hand-written builder
+/// takes, in `HandoverCommandIEs` object-set order with its criticalities.
+///
+/// The PDU Session Resource Handover List and the To Release List are
+/// `optional` with SIZE(1..maxnoofPDUSessions): an empty one is left out
+/// rather than encoded as a zero-length list no peer can decode (the
+/// hand-written encoder wrote it).
+pub fn build_handover_command_generated(msg: &HandoverCommand) -> Option<Vec<u8>> {
+    use ngap_gen::{
+        HandoverCommandProtocolIEs_Entry as Entry, HandoverCommandProtocolIEs_EntryValue as Ie,
+        ProtocolIE_ID,
+    };
+    let reject = || ngap_gen::Criticality(ngap_gen::Criticality::REJECT);
+    let ignore = || ngap_gen::Criticality(ngap_gen::Criticality::IGNORE);
+    let entry = |id: u16, criticality: ngap_gen::Criticality, value: Ie| Entry {
+        id: ProtocolIE_ID(id),
+        criticality,
+        value,
+    };
+    let mut ies = vec![
+        entry(
+            ngap_gen::ID_AMF_UE_NGAP_ID,
+            reject(),
+            Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(msg.amf_ue_ngap_id)),
+        ),
+        entry(
+            ngap_gen::ID_RAN_UE_NGAP_ID,
+            reject(),
+            Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(msg.ran_ue_ngap_id)),
+        ),
+        entry(
+            ngap_gen::ID_HANDOVER_TYPE,
+            reject(),
+            Ie::Id_HandoverType(generated_handover_type(msg.handover_type)),
+        ),
+    ];
+    if let Some(params) = &msg.nas_security_parameters_from_ngran {
+        ies.push(entry(
+            ngap_gen::ID_NAS_SECURITY_PARAMETERS_FROM_NGRAN,
+            reject(),
+            Ie::Id_NASSecurityParametersFromNGRAN(ngap_gen::NASSecurityParametersFromNGRAN(
+                params.clone(),
+            )),
+        ));
+    }
+    if !msg.pdu_session_list.is_empty() {
+        ies.push(entry(
+            ngap_gen::ID_PDU_SESSION_RESOURCE_HANDOVER_LIST,
+            ignore(),
+            Ie::Id_PDUSessionResourceHandoverList(ngap_gen::PDUSessionResourceHandoverList(
+                msg.pdu_session_list
+                    .iter()
+                    .map(|item| ngap_gen::PDUSessionResourceHandoverItem {
+                        pdu_session_id: ngap_gen::PDUSessionID(item.pdu_session_id),
+                        handover_command_transfer:
+                            ngap_gen::PDUSessionResourceHandoverItemHandoverCommandTransfer(
+                                item.transfer.clone(),
+                            ),
+                        ie_extensions: None,
+                    })
+                    .collect(),
+            )),
+        ));
+    }
+    if let Some(release) = msg.release_list.as_ref().filter(|r| !r.is_empty()) {
+        ies.push(entry(
+            ngap_gen::ID_PDU_SESSION_RESOURCE_TO_RELEASE_LIST_HO_CMD,
+            ignore(),
+            Ie::Id_PDUSessionResourceToReleaseListHOCmd(
+                ngap_gen::PDUSessionResourceToReleaseListHOCmd(
+                    release
+                        .iter()
+                        .map(|item| ngap_gen::PDUSessionResourceToReleaseItemHOCmd {
+                            pdu_session_id: ngap_gen::PDUSessionID(item.pdu_session_id),
+                            handover_preparation_unsuccessful_transfer:
+                                ngap_gen::PDUSessionResourceToReleaseItemHOCmdHandoverPreparationUnsuccessfulTransfer(
+                                    item.transfer.clone(),
+                                ),
+                            ie_extensions: None,
+                        })
+                        .collect(),
+                ),
+            ),
+        ));
+    }
+    ies.push(entry(
+        ngap_gen::ID_TARGET_TO_SOURCE_TRANSPARENT_CONTAINER,
+        reject(),
+        Ie::Id_TargetToSource_TransparentContainer(ngap_gen::TargetToSource_TransparentContainer(
+            msg.target_to_source_container.clone(),
+        )),
+    ));
+    let pdu = ngap_gen::NGAP_PDU::SuccessfulOutcome(ngap_gen::SuccessfulOutcome {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_HANDOVER_PREPARATION),
+        criticality: reject(),
+        value: ngap_gen::SuccessfulOutcomeValue::Id_HandoverPreparation(
+            ngap_gen::HandoverCommand {
+                protocol_i_es: ngap_gen::HandoverCommandProtocolIEs(ies),
+            },
+        ),
+    });
+    match nextgcore_ngap_gen::encode(&pdu) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            log::error!("Failed to encode the HandoverCommand: {e:?}");
+            None
+        }
+    }
+}
+
+/// An UPLINK RAN STATUS TRANSFER as the AMF relays it (TS 38.413 §8.4.6 /
+/// §8.4.7): the UE ids and the decoded RANStatusTransfer-TransparentContainer
+/// (§9.3.1.31), carried as the generated value so the DOWNLINK RAN STATUS
+/// TRANSFER re-encodes exactly what arrived.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RanStatusRelay {
+    /// AMF UE NGAP ID.
+    pub amf_ue_ngap_id: u64,
+    /// The source gNB's RAN UE NGAP ID (reused at the target).
+    pub ran_ue_ngap_id: u32,
+    /// The PDCP SN/HFN status container.
+    pub container: ngap_gen::RANStatusTransfer_TransparentContainer,
+}
+
+/// Decode an UPLINK RAN STATUS TRANSFER (TS 38.413 §9.2.3.13) with the
+/// GENERATED codec (#417). A Class 2 initiating message with no response
+/// (§10.3.4.2): a not-comprehended "reject" IE, or a missing one of its three
+/// mandatory criticality-reject IEs (§10.3.5), terminates the procedure with
+/// an Error Indication (`Reject`); a "notify" IE is reported in one while the
+/// relay goes on.
+pub fn decode_uplink_ran_status_transfer_asn1(data: &[u8]) -> NasTransportDecode<RanStatusRelay> {
+    use ngap_gen::UplinkRANStatusTransferProtocolIEs_EntryValue as Ie;
+    let Some((criticality, ies, mut reject, notify)) =
+        decode_initiating(data, "Uplink RAN Status Transfer", |v| match v {
+            ngap_gen::InitiatingMessageValue::Id_UplinkRANStatusTransfer(m) => {
+                Some(m.protocol_i_es.0)
+            }
+            _ => None,
+        })
+    else {
+        return NasTransportDecode::Undecodable;
+    };
+    let (mut amf, mut ran, mut container) = (None, None, None);
+    for entry in ies {
+        match entry.value {
+            Ie::Id_AMF_UE_NGAP_ID(v) => amf = Some(v.0),
+            Ie::Id_RAN_UE_NGAP_ID(v) => ran = Some(v.0),
+            Ie::Id_RANStatusTransfer_TransparentContainer(v) => container = Some(v),
+        }
+    }
+    for (present, id) in [
+        (amf.is_some(), ngap_gen::ID_AMF_UE_NGAP_ID),
+        (ran.is_some(), ngap_gen::ID_RAN_UE_NGAP_ID),
+        (
+            container.is_some(),
+            ngap_gen::ID_RAN_STATUS_TRANSFER_TRANSPARENT_CONTAINER,
+        ),
+    ] {
+        if !present {
+            reject.push(missing_ie(id));
+        }
+    }
+    let report = |cause_protocol, diagnostics| {
+        handover_report(
+            ngap_gen::ID_UPLINK_RAN_STATUS_TRANSFER,
+            ngap_gen::TriggeringMessage::INITIATING_MESSAGE,
+            criticality,
+            (amf, ran),
+            cause_protocol,
+            diagnostics,
+        )
+    };
+    let (Some(amf_ue_ngap_id), Some(ran_ue_ngap_id), Some(container), true) =
+        (amf, ran, container, reject.is_empty())
+    else {
+        return NasTransportDecode::Reject(report(
+            ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
+            reject,
+        ));
+    };
+    NasTransportDecode::Proceed {
+        message: RanStatusRelay {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            container,
+        },
+        error_indication: (!notify.is_empty()).then(|| {
+            report(
+                ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+                notify,
+            )
+        }),
+    }
+}
+
+/// Build a DOWNLINK RAN STATUS TRANSFER (TS 38.413 §9.2.3.14) with the
+/// GENERATED codec (#417): the three mandatory IEs, all criticality reject,
+/// with the relayed container.
+pub fn build_downlink_ran_status_transfer_generated(relay: &RanStatusRelay) -> Option<Vec<u8>> {
+    use ngap_gen::{
+        DownlinkRANStatusTransferProtocolIEs_Entry as Entry,
+        DownlinkRANStatusTransferProtocolIEs_EntryValue as Ie, ProtocolIE_ID,
+    };
+    let reject = || ngap_gen::Criticality(ngap_gen::Criticality::REJECT);
+    let ies = vec![
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_AMF_UE_NGAP_ID),
+            criticality: reject(),
+            value: Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(relay.amf_ue_ngap_id)),
+        },
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_RAN_UE_NGAP_ID),
+            criticality: reject(),
+            value: Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(relay.ran_ue_ngap_id)),
+        },
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_RAN_STATUS_TRANSFER_TRANSPARENT_CONTAINER),
+            criticality: reject(),
+            value: Ie::Id_RANStatusTransfer_TransparentContainer(relay.container.clone()),
+        },
+    ];
+    let pdu = ngap_gen::NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_DOWNLINK_RAN_STATUS_TRANSFER),
+        criticality: ngap_gen::Criticality(ngap_gen::Criticality::IGNORE),
+        value: ngap_gen::InitiatingMessageValue::Id_DownlinkRANStatusTransfer(
+            ngap_gen::DownlinkRANStatusTransfer {
+                protocol_i_es: ngap_gen::DownlinkRANStatusTransferProtocolIEs(ies),
+            },
+        ),
+    });
+    match nextgcore_ngap_gen::encode(&pdu) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            log::error!("Failed to encode the DownlinkRANStatusTransfer: {e:?}");
+            None
+        }
+    }
+}
 /// Decode an initiating message with unknown-IE skipping: its procedure
 /// criticality, its IE entries (extracted by `pick`), and its not-comprehended
 /// IEs sorted into `(reject, notify)`. `None` when it does not decode or is not
@@ -12197,5 +12727,532 @@ mod handover_required_tests {
             generated(&without(&base, ngap_gen::ID_CAUSE)).cause,
             Cause::Misc(CauseMisc::Unspecified)
         );
+    }
+}
+
+#[cfg(test)]
+mod handover_3b_ii_tests {
+    //! #417 handover part 3b (ii): Handover Request / Command encode, Handover
+    //! Request Acknowledge decode, UL/DL RAN Status Transfer, via the generated codec.
+    use super::tests::with_unknown_ie;
+    use super::*;
+
+    fn request(
+        handover_type: HandoverType,
+        sessions: u8,
+        nssai: &[SNssai],
+        ncc: u8,
+        ambr: u64,
+    ) -> HandoverRequest {
+        HandoverRequest {
+            amf_ue_ngap_id: 0x1_0000_0001,
+            handover_type,
+            cause: Cause::RadioNetwork(CauseRadioNetwork::HandoverDesirableForRadioReason),
+            ue_ambr: UeAmbrInfo {
+                dl: ambr,
+                ul: ambr / 2 + 1,
+            },
+            ue_security_capabilities: UeSecurityCapabilities {
+                nr_encryption_algorithms: 0xE000,
+                nr_integrity_algorithms: 0x6000,
+                eutra_encryption_algorithms: 0xF000,
+                eutra_integrity_algorithms: 0x7000,
+            },
+            security_context: SecurityContext {
+                next_hop_chaining_count: ncc,
+                next_hop: [ncc ^ 0x5A; 32],
+            },
+            pdu_session_list: (1..=sessions)
+                .map(|psi| PduSessionResourceSetupItemHoReq {
+                    pdu_session_id: psi,
+                    s_nssai: nssai[usize::from(psi) % nssai.len()].clone(),
+                    transfer: vec![0x00, psi, 0x10],
+                })
+                .collect(),
+            allowed_nssai: nssai.to_vec(),
+            source_to_target_container: vec![0x40, 0x41, sessions],
+            guami: Guami {
+                plmn_identity: [0x99, 0xF9, 0x07],
+                amf_region_id: 0xCA,
+                amf_set_id: 0x3FF,
+                amf_pointer: 0x3F,
+            },
+        }
+    }
+
+    /// The Handover Request is byte-identical to the hand-written encoder over
+    /// handover types, 1..4 sessions, S-NSSAI with and without SD, every NCC
+    /// and the UE AMBR bounds.
+    #[test]
+    fn handover_request_generated_matches_hand_written() {
+        let nssais = [
+            vec![SNssai { sst: 1, sd: None }],
+            vec![
+                SNssai {
+                    sst: 1,
+                    sd: Some([0, 0, 1]),
+                },
+                SNssai {
+                    sst: 2,
+                    sd: Some([0xFF, 0xFF, 0xFE]),
+                },
+                SNssai { sst: 255, sd: None },
+            ],
+        ];
+        let mut cases = 0;
+        for handover_type in [HandoverType::Intra5gs, HandoverType::EpsTo5gs] {
+            for sessions in 1..=4 {
+                for nssai in &nssais {
+                    for ncc in 0..=7 {
+                        for ambr in [1, 1_000_000_000, MAX_BIT_RATE] {
+                            let msg = request(handover_type, sessions, nssai, ncc, ambr);
+                            let hand = builder::build_handover_request(&msg).expect("hand-written");
+                            assert_eq!(
+                                build_handover_request_generated(&msg).as_deref(),
+                                Some(hand.as_slice()),
+                                "{handover_type:?} sessions={sessions} ncc={ncc} ambr={ambr}"
+                            );
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 2 * 4 * 2 * 8 * 3);
+        // Past §9.3.1.4's bound: refused, not sent as an undefined extension value.
+        let over = request(HandoverType::Intra5gs, 1, &nssais[0], 0, MAX_BIT_RATE + 1);
+        assert_eq!(build_handover_request_generated(&over), None);
+    }
+
+    fn command(sessions: u8, release: u8, nas: bool) -> HandoverCommand {
+        HandoverCommand {
+            amf_ue_ngap_id: 0x1_0000_0001,
+            ran_ue_ngap_id: 0x7,
+            handover_type: HandoverType::Intra5gs,
+            nas_security_parameters_from_ngran: nas.then(|| vec![0x2A]),
+            pdu_session_list: (1..=sessions)
+                .map(|psi| PduSessionResourceHandoverItem {
+                    pdu_session_id: psi,
+                    transfer: vec![0x00, psi],
+                })
+                .collect(),
+            release_list: (release > 0).then(|| {
+                (10..10 + release)
+                    .map(|psi| PduSessionResourceReleaseItem {
+                        pdu_session_id: psi,
+                        transfer: vec![0x00, psi, 0x01],
+                    })
+                    .collect()
+            }),
+            target_to_source_container: vec![0xAB; 6],
+        }
+    }
+
+    /// The Handover Command is byte-identical to the hand-written encoder
+    /// whenever its handover list is non-empty; an empty one is left out (the
+    /// IE is optional with SIZE(1..)), where the hand-written encoder wrote a
+    /// zero-length list.
+    #[test]
+    fn handover_command_generated_matches_hand_written() {
+        for sessions in 1..=4 {
+            for release in 0..=2 {
+                for nas in [false, true] {
+                    let msg = command(sessions, release, nas);
+                    let hand = builder::build_handover_command(&msg).expect("hand-written");
+                    assert_eq!(
+                        build_handover_command_generated(&msg).as_deref(),
+                        Some(hand.as_slice()),
+                        "sessions={sessions} release={release} nas={nas}"
+                    );
+                }
+            }
+        }
+        let empty = build_handover_command_generated(&command(0, 0, false)).expect("encodes");
+        let ngap_gen::NGAP_PDU::SuccessfulOutcome(ngap_gen::SuccessfulOutcome {
+            value: ngap_gen::SuccessfulOutcomeValue::Id_HandoverPreparation(cmd),
+            ..
+        }) = nextgcore_ngap_gen::decode(&empty).expect("decodes")
+        else {
+            panic!("HandoverCommand");
+        };
+        assert!(cmd
+            .protocol_i_es
+            .0
+            .iter()
+            .all(|e| e.id.0 != ngap_gen::ID_PDU_SESSION_RESOURCE_HANDOVER_LIST));
+    }
+
+    fn ack(admitted: u8, failed: u8) -> HandoverRequestAcknowledge {
+        HandoverRequestAcknowledge {
+            amf_ue_ngap_id: 0x1_0000_0001,
+            ran_ue_ngap_id: 9,
+            admitted_list: (1..=admitted)
+                .map(|psi| PduSessionResourceAdmittedItemHoAck {
+                    pdu_session_id: psi,
+                    transfer: vec![0x00, psi],
+                })
+                .collect(),
+            failed_list: (failed > 0).then(|| {
+                (20..20 + failed)
+                    .map(|psi| PduSessionResourceFailedItem {
+                        pdu_session_id: psi,
+                        transfer: vec![0x00, psi, 0x02],
+                    })
+                    .collect()
+            }),
+            target_to_source_container: vec![0xCD; 3],
+        }
+    }
+
+    fn ack_view(a: &HandoverRequestAcknowledge) -> String {
+        format!(
+            "{} {} {:?} {:?} {:?}",
+            a.amf_ue_ngap_id,
+            a.ran_ue_ngap_id,
+            a.admitted_list
+                .iter()
+                .map(|s| (s.pdu_session_id, s.transfer.clone()))
+                .collect::<Vec<_>>(),
+            a.failed_list.as_ref().map(|l| l
+                .iter()
+                .map(|s| (s.pdu_session_id, s.transfer.clone()))
+                .collect::<Vec<_>>()),
+            a.target_to_source_container,
+        )
+    }
+
+    fn decoded_ack(data: &[u8]) -> HandoverRequestAcknowledge {
+        match decode_handover_request_acknowledge_asn1(data) {
+            NasTransportDecode::Proceed {
+                message,
+                error_indication: None,
+            } => message,
+            other => panic!("expected a clean decode, got {other:?}"),
+        }
+    }
+
+    /// Every Handover Request Acknowledge the hand-written parser accepts
+    /// decodes to the same values: 1..4 admitted, 0..3 failed sessions.
+    #[test]
+    fn handover_request_acknowledge_generated_decode_matches_hand_written() {
+        for admitted in 1..=4 {
+            for failed in 0..=3 {
+                let bytes = builder::build_handover_request_acknowledge(&ack(admitted, failed))
+                    .expect("build");
+                let Ok(NgapMessage::HandoverRequestAcknowledge(hand)) =
+                    parser::decode_ngap_pdu(&bytes)
+                else {
+                    panic!("hand-written parser refused admitted={admitted} failed={failed}");
+                };
+                assert_eq!(ack_view(&decoded_ack(&bytes)), ack_view(&hand));
+            }
+        }
+    }
+
+    fn ack_without(bytes: &[u8], id: u16) -> Vec<u8> {
+        let mut pdu = nextgcore_ngap_gen::decode(bytes).expect("decode");
+        let ngap_gen::NGAP_PDU::SuccessfulOutcome(ref mut msg) = pdu else {
+            panic!("successfulOutcome");
+        };
+        let ngap_gen::SuccessfulOutcomeValue::Id_HandoverResourceAllocation(ref mut a) = msg.value
+        else {
+            panic!("Handover Request Acknowledge");
+        };
+        a.protocol_i_es.0.retain(|e| e.id.0 != id);
+        nextgcore_ngap_gen::encode(&pdu).expect("encode")
+    }
+
+    /// TS 38.413 §10.3.4.2 / §10.3.5 for a response message.
+    #[test]
+    fn handover_request_acknowledge_follows_ie_criticality() {
+        let base = builder::build_handover_request_acknowledge(&ack(1, 0)).expect("build");
+        assert!(matches!(
+            decode_handover_request_acknowledge_asn1(&with_unknown_ie(&base, 9999, 0x40)),
+            NasTransportDecode::Proceed {
+                error_indication: None,
+                ..
+            }
+        ));
+        let NasTransportDecode::Proceed {
+            error_indication: Some(report),
+            ..
+        } = decode_handover_request_acknowledge_asn1(&with_unknown_ie(&base, 9999, 0x80))
+        else {
+            panic!("notify must proceed and be reported");
+        };
+        assert_eq!(report.diagnostics[0].ie_id, 9999);
+        assert_eq!(
+            report.procedure.triggering_message,
+            ngap_gen::TriggeringMessage::SUCCESSFUL_OUTCOME
+        );
+        assert_eq!(
+            report.procedure.procedure_code,
+            ngap_gen::ID_HANDOVER_RESOURCE_ALLOCATION
+        );
+        let NasTransportDecode::Reject(report) =
+            decode_handover_request_acknowledge_asn1(&with_unknown_ie(&base, 9999, 0x00))
+        else {
+            panic!("reject must be handled locally");
+        };
+        assert_eq!(report.amf_ue_ngap_id, Some(0x1_0000_0001));
+        // The one mandatory criticality-reject IE missing: local handling, as Missing.
+        let NasTransportDecode::Reject(r) = decode_handover_request_acknowledge_asn1(&ack_without(
+            &base,
+            ngap_gen::ID_TARGET_TO_SOURCE_TRANSPARENT_CONTAINER,
+        )) else {
+            panic!("missing Target to Source container must reject");
+        };
+        assert_eq!(
+            r.diagnostics[0].ie_id,
+            ngap_gen::ID_TARGET_TO_SOURCE_TRANSPARENT_CONTAINER
+        );
+        assert_eq!(
+            r.diagnostics[0].type_of_error,
+            ngap_gen::TypeOfError::MISSING
+        );
+        // Criticality ignore: a missing AMF id is unattributable; a missing RAN
+        // id or admitted list is tolerated.
+        assert!(matches!(
+            decode_handover_request_acknowledge_asn1(&ack_without(
+                &base,
+                ngap_gen::ID_AMF_UE_NGAP_ID
+            )),
+            NasTransportDecode::Undecodable
+        ));
+        assert_eq!(
+            decoded_ack(&ack_without(&base, ngap_gen::ID_RAN_UE_NGAP_ID)).ran_ue_ngap_id,
+            0
+        );
+        assert!(decoded_ack(&ack_without(
+            &base,
+            ngap_gen::ID_PDU_SESSION_RESOURCE_ADMITTED_LIST
+        ))
+        .admitted_list
+        .is_empty());
+    }
+
+    /// One DRB (id 1), UL COUNT SN 0x123 / HFN 0x45, DL COUNT SN 0x456 / HFN 0x78,
+    /// derived by hand from X.691 (APER):
+    ///
+    /// | bits | field |
+    /// |---|---|
+    /// | `0` `0` | container ext bit, iE-Extensions absent |
+    /// | `00000` | list count 1 in SIZE(1..32): 5-bit constrained whole number |
+    /// | `0` `0` | item ext bit, iE-Extension absent |
+    /// | `0` `00000` | DRB-ID (1..32, ...): ext bit, 5-bit value 1-1 |
+    /// | `00` | DRBStatusUL CHOICE (3 alternatives): dRBStatusUL12 |
+    /// | `0` `00` | DRBStatusUL12 ext bit, both optionals absent |
+    /// | `0` `0` | COUNTValueForPDCP-SN12 ext bit, iE-Extensions absent |
+    /// | pad, `01 23` | pDCP-SN12 (0..4095): two-octet aligned |
+    /// | `00` pad, `45` | hFN (0..1048575): 2-bit octet count 1, aligned octet |
+    /// | `00` `0` `0` `0` `0` pad | DRBStatusDL CHOICE, DL12 ext + optional, COUNT ext + optional |
+    /// | `04 56`, `00`, `78` | DL SN, octet count, HFN |
+    const RAN_STATUS_CONTAINER: [u8; 12] = [
+        0x00, 0x00, 0x00, 0x01, 0x23, 0x00, 0x45, 0x00, 0x04, 0x56, 0x00, 0x78,
+    ];
+
+    /// The whole DOWNLINK RAN STATUS TRANSFER for AMF UE NGAP ID 1, RAN UE NGAP
+    /// ID 2 and that container, derived by hand: CHOICE initiatingMessage `000`
+    /// + pad; procedure code 7; criticality ignore `01` + pad; open type length
+    /// 31; SEQUENCE ext bit + pad; IE count 3 (two-octet aligned); then each
+    /// ProtocolIE-Field: id (two octets), criticality reject `00` + pad, open
+    /// type length, value -- AMF-UE-NGAP-ID 1 (3-bit octet count 0, pad, `01`),
+    /// RAN-UE-NGAP-ID 2 (2-bit octet count 0, pad, `02`), the container.
+    const DOWNLINK_RAN_STATUS: [u8; 35] = [
+        0x00, 0x07, 0x40, 0x1F, 0x00, 0x00, 0x03, 0x00, 0x0A, 0x00, 0x02, 0x00, 0x01, 0x00, 0x55,
+        0x00, 0x02, 0x00, 0x02, 0x00, 0x54, 0x00, 0x0C, 0x00, 0x00, 0x00, 0x01, 0x23, 0x00, 0x45,
+        0x00, 0x04, 0x56, 0x00, 0x78,
+    ];
+
+    fn uplink(container: &[u8]) -> Vec<u8> {
+        builder::build_uplink_ran_status_transfer(&RanStatusTransfer {
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 2,
+            container: container.to_vec(),
+        })
+        .expect("build")
+    }
+
+    fn relay(data: &[u8]) -> RanStatusRelay {
+        match decode_uplink_ran_status_transfer_asn1(data) {
+            NasTransportDecode::Proceed {
+                message,
+                error_indication: None,
+            } => message,
+            other => panic!("expected a clean decode, got {other:?}"),
+        }
+    }
+
+    /// The relayed DOWNLINK RAN STATUS TRANSFER equals the hand-derived octets
+    /// and the hand-written encoder's verbatim relay of the same container.
+    #[test]
+    fn ran_status_relay_matches_hand_derived_and_hand_written() {
+        let relayed = relay(&uplink(&RAN_STATUS_CONTAINER));
+        assert_eq!(relayed.amf_ue_ngap_id, 1);
+        assert_eq!(relayed.ran_ue_ngap_id, 2);
+        let item = &relayed.container.dr_bs_subject_to_status_transfer_list.0[0];
+        assert_eq!(item.drb_id.0, 1);
+        let downlink = build_downlink_ran_status_transfer_generated(&relayed).expect("encodes");
+        assert_eq!(downlink, DOWNLINK_RAN_STATUS);
+        let hand = builder::build_downlink_ran_status_transfer(&RanStatusTransfer {
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 2,
+            container: RAN_STATUS_CONTAINER.to_vec(),
+        })
+        .expect("hand-written");
+        assert_eq!(downlink, hand);
+    }
+
+    /// Byte-identical relays across 1..32 DRBs, 12- and 18-bit COUNTs, with and
+    /// without a receive-status bitmap -- each container encoded by the
+    /// generated codec and relayed verbatim by the hand-written encoder.
+    #[test]
+    fn ran_status_relay_matches_hand_written_across_containers() {
+        let mut cases = 0;
+        for drbs in [1u8, 2, 7, 32] {
+            for sn18 in [false, true] {
+                for bitmap in [false, true] {
+                    let items =
+                        (1..=drbs)
+                            .map(|drb| ngap_gen::DRBsSubjectToStatusTransferItem {
+                                drb_id: ngap_gen::DRB_ID(drb),
+                                drb_status_ul: if sn18 {
+                                    ngap_gen::DRBStatusUL::DRBStatusUL18(ngap_gen::DRBStatusUL18 {
+                                        ul_count_value: ngap_gen::COUNTValueForPDCP_SN18 {
+                                            pdcp_sn18: ngap_gen::COUNTValueForPDCP_SN18PDCP_SN18(
+                                                262_143,
+                                            ),
+                                            hfn_pdcp_sn18:
+                                                ngap_gen::COUNTValueForPDCP_SN18HFN_PDCP_SN18(
+                                                    u16::from(drb) * 500,
+                                                ),
+                                            ie_extensions: None,
+                                        },
+                                        receive_status_of_ul_pdcp_sd_us: bitmap.then(|| {
+                                            ngap_gen::DRBStatusUL18ReceiveStatusOfUL_PDCP_SDUs(
+                                                low_bits(0x15, 5),
+                                            )
+                                        }),
+                                        ie_extension: None,
+                                    })
+                                } else {
+                                    ngap_gen::DRBStatusUL::DRBStatusUL12(ngap_gen::DRBStatusUL12 {
+                                        ul_count_value: ngap_gen::COUNTValueForPDCP_SN12 {
+                                            pdcp_sn12: ngap_gen::COUNTValueForPDCP_SN12PDCP_SN12(
+                                                u16::from(drb),
+                                            ),
+                                            hfn_pdcp_sn12:
+                                                ngap_gen::COUNTValueForPDCP_SN12HFN_PDCP_SN12(
+                                                    1_048_575,
+                                                ),
+                                            ie_extensions: None,
+                                        },
+                                        receive_status_of_ul_pdcp_sd_us: bitmap.then(|| {
+                                            ngap_gen::DRBStatusUL12ReceiveStatusOfUL_PDCP_SDUs(
+                                                low_bits(0x1, 1),
+                                            )
+                                        }),
+                                        ie_extension: None,
+                                    })
+                                },
+                                drb_status_dl: ngap_gen::DRBStatusDL::DRBStatusDL12(
+                                    ngap_gen::DRBStatusDL12 {
+                                        dl_count_value: ngap_gen::COUNTValueForPDCP_SN12 {
+                                            pdcp_sn12: ngap_gen::COUNTValueForPDCP_SN12PDCP_SN12(0),
+                                            hfn_pdcp_sn12:
+                                                ngap_gen::COUNTValueForPDCP_SN12HFN_PDCP_SN12(0),
+                                            ie_extensions: None,
+                                        },
+                                        ie_extension: None,
+                                    },
+                                ),
+                                ie_extension: None,
+                            })
+                            .collect();
+                    let container = ngap_gen::RANStatusTransfer_TransparentContainer {
+                        dr_bs_subject_to_status_transfer_list:
+                            ngap_gen::DRBsSubjectToStatusTransferList(items),
+                        ie_extensions: None,
+                    };
+                    let bytes = nextgcore_ngap_gen::encode_contained(&container).expect("encode");
+                    let relayed = relay(&uplink(&bytes));
+                    assert_eq!(relayed.container, container);
+                    let hand = builder::build_downlink_ran_status_transfer(&RanStatusTransfer {
+                        amf_ue_ngap_id: 1,
+                        ran_ue_ngap_id: 2,
+                        container: bytes,
+                    })
+                    .expect("hand-written");
+                    assert_eq!(
+                        build_downlink_ran_status_transfer_generated(&relayed).expect("encodes"),
+                        hand,
+                        "drbs={drbs} sn18={sn18} bitmap={bitmap}"
+                    );
+                    cases += 1;
+                }
+            }
+        }
+        assert_eq!(cases, 16);
+    }
+
+    fn uplink_without(bytes: &[u8], id: u16) -> Vec<u8> {
+        let mut pdu = nextgcore_ngap_gen::decode(bytes).expect("decode");
+        let ngap_gen::NGAP_PDU::InitiatingMessage(ref mut msg) = pdu else {
+            panic!("initiatingMessage");
+        };
+        let ngap_gen::InitiatingMessageValue::Id_UplinkRANStatusTransfer(ref mut t) = msg.value
+        else {
+            panic!("Uplink RAN Status Transfer");
+        };
+        t.protocol_i_es.0.retain(|e| e.id.0 != id);
+        nextgcore_ngap_gen::encode(&pdu).expect("encode")
+    }
+
+    /// TS 38.413 §10.3.4.2 / §10.3.5 for a Class 2 message with no response.
+    #[test]
+    fn uplink_ran_status_transfer_follows_ie_criticality() {
+        let base = uplink(&RAN_STATUS_CONTAINER);
+        assert!(matches!(
+            decode_uplink_ran_status_transfer_asn1(&with_unknown_ie(&base, 9999, 0x40)),
+            NasTransportDecode::Proceed {
+                error_indication: None,
+                ..
+            }
+        ));
+        let NasTransportDecode::Proceed {
+            error_indication: Some(report),
+            ..
+        } = decode_uplink_ran_status_transfer_asn1(&with_unknown_ie(&base, 9999, 0x80))
+        else {
+            panic!("notify must proceed and be reported");
+        };
+        assert_eq!(
+            report.procedure.procedure_code,
+            ngap_gen::ID_UPLINK_RAN_STATUS_TRANSFER
+        );
+        assert!(matches!(
+            decode_uplink_ran_status_transfer_asn1(&with_unknown_ie(&base, 9999, 0x00)),
+            NasTransportDecode::Reject(_)
+        ));
+        for id in [
+            ngap_gen::ID_AMF_UE_NGAP_ID,
+            ngap_gen::ID_RAN_UE_NGAP_ID,
+            ngap_gen::ID_RAN_STATUS_TRANSFER_TRANSPARENT_CONTAINER,
+        ] {
+            let NasTransportDecode::Reject(r) =
+                decode_uplink_ran_status_transfer_asn1(&uplink_without(&base, id))
+            else {
+                panic!("missing {id} must reject");
+            };
+            assert_eq!(r.diagnostics[0].ie_id, id);
+            assert_eq!(
+                r.diagnostics[0].type_of_error,
+                ngap_gen::TypeOfError::MISSING
+            );
+        }
+        assert!(matches!(
+            decode_uplink_ran_status_transfer_asn1(&[0x00, 0x31]),
+            NasTransportDecode::Undecodable
+        ));
     }
 }
