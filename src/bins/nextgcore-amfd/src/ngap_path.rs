@@ -5976,6 +5976,18 @@ impl NgapServer {
         amf_ue_ngap_id: u64,
         ran_ue_ngap_id: u32,
     ) -> Result<()> {
+        self.deregistered_ue_cleanup(amf_ue_ngap_id);
+        // Cause: NAS deregister (TS 38.413 Section 9.3.1.2, CauseNas value 2)
+        self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 2)
+            .await
+    }
+
+    /// The per-UE teardown every deregistration shares, short of the N2 release:
+    /// the UE Policy Association, the EPS bearer identities, the deregistration
+    /// event reports, and the NAS state. Split out of [`Self::finish_deregistration`]
+    /// for [`Self::local_deregistration`] (#602), which must not send an N2 release
+    /// for a UE with no N2 connection.
+    fn deregistered_ue_cleanup(&mut self, amf_ue_ngap_id: u64) {
         // Npcf_UEPolicyControl_Delete (TS 29.525 §4.2.4) — Wave-6 E7: delete
         // the UE Policy Association created at registration. Fire-and-forget
         // on a background task: a PCF hiccup must never delay or fail the NG
@@ -6060,9 +6072,86 @@ impl NgapServer {
         }
 
         self.ue_auth_state.remove(amf_ue_ngap_id);
-        // Cause: NAS deregister (TS 38.413 Section 9.3.1.2, CauseNas value 2)
-        self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 2)
+    }
+
+    /// LOCAL deregistration (#602): the old AMF's side of TS 23.502 §4.2.2.2.2 step
+    /// 14d, for a Nudm_UECM_DeregistrationNotification with `UE_INITIAL_REGISTRATION`.
+    ///
+    /// A new AMF now serves the UE, so NO NAS message is sent: the UE belongs to the new
+    /// AMF, and a DEREGISTRATION REQUEST that reached it would deregister it there. In
+    /// order:
+    /// 1. Nsmf_PDUSession_ReleaseSMContext for every PDU session (step 14d, "the SMF(s)
+    ///    shall release the PDU Session on getting this notification").
+    /// 2. AMF-initiated AM Policy Association Termination (§4.16.3.2) and, in
+    ///    [`Self::deregistered_ue_cleanup`], the UE Policy Association Termination
+    ///    (§4.16.13.1).
+    /// 3. A UE Context Release Command when the UE still has an N2 context here
+    ///    (TS 38.413 §8.3.3; CauseNas "deregister"). None for a CM-IDLE UE: it has no
+    ///    N2 connection to release.
+    /// 4. The UE context itself: the NAS state, and the global RAN UE and AMF UE
+    ///    entries, as the implicit deregistration removes them.
+    ///
+    /// No Nudm_UECM_Deregistration: the UDM already records the NEW AMF as serving,
+    /// and that is what it notified us about.
+    async fn local_deregistration(&mut self, amf_ue_ngap_id: u64) -> Result<()> {
+        let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) else {
+            return Err(anyhow::anyhow!("UE {amf_ue_ngap_id} not found"));
+        };
+        log::info!(
+            "[{}] Local deregistration of UE {amf_ue_ngap_id}: a new AMF serves it \
+             (UE_INITIAL_REGISTRATION, TS 23.502 §4.2.2.2.2 step 14d); no NAS is sent",
+            state.amf_ue.supi.as_deref().unwrap_or("unknown")
+        );
+
+        self.release_all_pdu_sessions(amf_ue_ngap_id).await;
+
+        if let Some(pol_asso_id) = state.policy_association_id.clone() {
+            let (pcf_host, pcf_port) = crate::sbi_path::resolve_nf_endpoint_async(
+                crate::sbi_path::SbiServiceType::NpcfAmPolicyControl,
+            )
             .await
+            .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
+            if let Err(e) =
+                crate::sbi_path::call_pcf_am_policy_delete(&pcf_host, pcf_port, &pol_asso_id).await
+            {
+                log::warn!("Npcf_AMPolicyControl_Delete({pol_asso_id}) failed: {e}");
+            }
+        }
+
+        self.deregistered_ue_cleanup(amf_ue_ngap_id);
+        if state.cm_idle {
+            self.forget_ue(amf_ue_ngap_id);
+        } else if let Err(e) = self
+            .release_ue(
+                state.association_id,
+                amf_ue_ngap_id,
+                state.ran_ue_ngap_id,
+                // Cause: NAS deregister (TS 38.413 Section 9.3.1.2, CauseNas value 2)
+                2,
+            )
+            .await
+        {
+            // Best effort: the decision to drop the UE is already made and half
+            // applied (`release_ue` forgot it before sending), so a lost gNB must not
+            // leave the global RAN UE / AMF UE entries behind as well.
+            log::warn!("UE Context Release Command for UE {amf_ue_ngap_id} not sent: {e}");
+        }
+
+        let handle = crate::context::amf_self();
+        if let Ok(ctx) = handle.read() {
+            let ran_ue = ctx.ran_ue_find_by_amf_ue_ngap_id(amf_ue_ngap_id);
+            if let Some(ran_ue) = &ran_ue {
+                ctx.ran_ue_remove(ran_ue.id);
+            }
+            // The AMF UE: the RAN UE's back-reference when there is one, else the UE's
+            // own id -- for an NGAP-registered UE the two are the AMF UE NGAP ID.
+            let amf_ue_id = ran_ue
+                .map(|r| r.amf_ue_id)
+                .filter(|id| *id != crate::context::NEXTGCORE_INVALID_POOL_ID)
+                .unwrap_or(state.amf_ue.id);
+            ctx.amf_ue_remove(amf_ue_id);
+        }
+        Ok(())
     }
 
     /// Network-initiated Deregistration Request (TS 24.501 Section 5.5.2.3).
@@ -6883,6 +6972,15 @@ impl NgapServer {
             guard.network_dereg_drain()
         };
         for item in pending {
+            if item.local {
+                if let Err(e) = self.local_deregistration(item.amf_ue_ngap_id).await {
+                    log::warn!(
+                        "Local deregistration for UE {} failed: {e}",
+                        item.amf_ue_ngap_id
+                    );
+                }
+                continue;
+            }
             let gmm_cause = item.gmm_cause.map(GmmCause::from);
             if let Err(e) = self
                 .send_network_initiated_deregistration(
@@ -17151,6 +17249,7 @@ mod tests {
                 amf_ue_ngap_id,
                 reregistration_required: true,
                 gmm_cause: None,
+                local: false,
             });
         }
 
@@ -17164,6 +17263,121 @@ mod tests {
             !remaining.iter().any(|d| d.amf_ue_ngap_id == amf_ue_ngap_id),
             "pump must consume the queued network-initiated dereg"
         );
+    }
+
+    /// #602: a Nudm_UECM_DeregistrationNotification with `UE_INITIAL_REGISTRATION` is a
+    /// LOCAL deregistration, driven from the Namf callback through the NGAP task's pump:
+    /// the SM context is released at the SMF, the AM policy association is deleted at
+    /// the PCF, and the UE context is gone -- NAS state, RAN UE and AMF UE alike.
+    ///
+    /// The network-initiated path this replaces leaves the context in place (it waits
+    /// for the Deregistration Accept the UE would send to the DEREGISTRATION REQUEST)
+    /// and tells neither NF anything, so every assertion below fails on it. The UE is
+    /// CM-IDLE, so no N2 release is due either; that NO NAS reaches the UE is shown over
+    /// real binaries in the PR (this fixture has no gNB association to observe).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_ue_initial_registration_dereg_notify_deregisters_the_ue_locally() {
+        let _serial = crate::namf_server::dereg_queue_test_lock().lock().await;
+        let (_nf, port, seen) = recording_nf().await;
+        let _env = SmfEnvGuard::set(port);
+        std::env::set_var("PCF_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("PCF_SBI_PORT", port.to_string());
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+
+        let supi = "imsi-001010000602001";
+        let ctx = crate::context::amf_self();
+        let (key, amf_ue_id) = {
+            let guard = ctx.read().expect("ctx lock");
+            let ran_ue = guard.ran_ue_add(900_602, 602).expect("ran_ue_add");
+            let amf_ue = guard.amf_ue_add(ran_ue.id).expect("amf_ue_add");
+            guard.amf_ue_associate_ran_ue(amf_ue.id, ran_ue.id);
+            let mut sess = guard.sess_add(amf_ue.id, 5).expect("sess_add");
+            sess.sm_context_ref = Some("smctx-602".to_string());
+            guard.sess_update(&sess);
+            (ran_ue.amf_ue_ngap_id, amf_ue.id)
+        };
+        let mut ue_ctx = UeNasContext::new(key, 602, 1, false);
+        ue_ctx.registered = true;
+        ue_ctx.cm_idle = true;
+        ue_ctx.amf_ue.supi = Some(supi.to_string());
+        ue_ctx.policy_association_id = Some("am-pol-602".to_string());
+        ngap.ue_auth_state.insert(key, ue_ctx);
+
+        let resp = crate::namf_server::namf_request_handler(
+            nextgcore_sbi::message::SbiRequest::post(format!(
+                "/namf-callback/v1/{supi}/dereg-notify"
+            ))
+            .with_json_body(&serde_json::json!({
+                "deregReason": "UE_INITIAL_REGISTRATION",
+                "accessType": "3GPP_ACCESS",
+            }))
+            .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 204);
+        ngap.process_network_deregs().await;
+        std::env::remove_var("PCF_SBI_ADDR");
+        std::env::remove_var("PCF_SBI_PORT");
+
+        let seen = seen.lock().expect("seen").clone();
+        assert!(
+            seen.contains(&"POST /nsmf-pdusession/v1/sm-contexts/smctx-602/release".to_string()),
+            "TS 23.502 §4.2.2.2.2 step 14d: Nsmf_PDUSession_ReleaseSMContext towards the \
+             SMF; saw {seen:?}"
+        );
+        assert!(
+            seen.contains(&"DELETE /npcf-am-policy-control/v1/policies/am-pol-602".to_string()),
+            "and the AM Policy Association Termination (§4.16.3.2); saw {seen:?}"
+        );
+        assert!(
+            !ngap.ue_auth_state.contains(key),
+            "the old AMF removes the UE context instead of waiting for a Deregistration \
+             Accept"
+        );
+        let guard = ctx.read().expect("ctx lock");
+        assert!(
+            guard.ran_ue_find_by_amf_ue_ngap_id(key).is_none(),
+            "the RAN UE goes with it"
+        );
+        assert!(
+            guard.amf_ue_find_by_id(amf_ue_id).is_none(),
+            "and the AMF UE"
+        );
+    }
+
+    /// An NF stand-in that answers 204 to everything and records `"METHOD uri"`.
+    async fn recording_nf() -> (
+        nextgcore_sbi::server::SbiServer,
+        u16,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+        use nextgcore_sbi::server::{SbiServer as NSbiServer, SbiServerConfig as NSbiCfg};
+
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let (addr_listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = NSbiServer::on_listener(NSbiCfg::new(addr), addr_listener);
+        server
+            .start(move |req: SReq| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    sink.lock()
+                        .expect("sink")
+                        .push(format!("{} {}", req.header.method, req.header.uri));
+                    SResp::no_content()
+                }
+            })
+            .await
+            .expect("stand-in NF starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (server, addr.port(), seen)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

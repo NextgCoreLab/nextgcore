@@ -497,28 +497,45 @@ pub fn handle_sm_context_status(
 ///   The reason exists to say exactly that, so the UE is told to re-register
 ///   (#580: it used to be sent "re-registration not required", leaving the UE
 ///   deregistered instead of re-registered).
-/// - `UE_INITIAL_REGISTRATION`: unchanged from WSB-4, which asks the UE to
-///   re-register.
+/// - `UE_INITIAL_REGISTRATION` is NOT here: it is a local deregistration with no
+///   NAS message at all (#602, see [`dereg_reason_is_local`]).
 ///
 /// No 5GMM cause is set for these: with "re-registration required" the UE
 /// ignores the 5GMM cause IE (TS 24.501 §5.5.2.3.2).
 pub fn dereg_reason_requires_reregistration(reason: DeregistrationReason) -> bool {
-    matches!(
-        reason,
-        DeregistrationReason::UeInitialRegistration | DeregistrationReason::ReregistrationRequired
-    )
+    matches!(reason, DeregistrationReason::ReregistrationRequired)
+}
+
+/// Whether a Nudm_UECM DeregistrationNotification reason makes this AMF deregister
+/// the UE LOCALLY, sending it no NAS message (#602).
+///
+/// `UE_INITIAL_REGISTRATION` (TS 29.503 Table 6.2.6.3.3-1): "the deregistration in
+/// the old AMF is due to a new AMF serving the UE during an initial registration".
+/// TS 23.502 §4.2.2.2.2 step 14d has the old AMF remove the UE context and release
+/// the SM contexts at the SMF(s) (and, per §4.16.3.2 / §4.16.13.1, its policy
+/// associations). Neither clause has it signal the UE, which now belongs to the new
+/// AMF. A DEREGISTRATION REQUEST that still reached the UE over a live N2 context
+/// would make it deregister from the NEW AMF and register again, which can loop.
+///
+/// Operator decision (2026-10-21, on #602): local deregistration.
+pub fn dereg_reason_is_local(reason: DeregistrationReason) -> bool {
+    matches!(reason, DeregistrationReason::UeInitialRegistration)
 }
 
 /// Handle a Nudm_UECM DeregistrationNotification (TS 29.503 §5.3.2.3.2).
 ///
 /// WSB-4: this now has a real effect. When the notification targets 3GPP
-/// access it enqueues a network-initiated deregistration onto the AMF context
-/// queue; the NGAP server task drains it and sends the protected
-/// DEREGISTRATION REQUEST (TS 24.501 §5.5.2.3) + arms T3522
-/// (`ngap_path::send_network_initiated_deregistration`). PDU-session release,
-/// UDM unsubscribe, AM-policy termination and the NG UE-context release follow
-/// on the Deregistration Accept / T3522 exhaustion inside the GMM state
-/// machine, exactly like the UE-initiated path.
+/// access it enqueues a deregistration onto the AMF context queue, which the
+/// NGAP server task drains (`ngap_path::process_network_deregs`):
+///
+/// - a LOCAL one for `UE_INITIAL_REGISTRATION` (#602, [`dereg_reason_is_local`]):
+///   no NAS; SM contexts, AM and UE policy associations and any live N2 context
+///   are released and the UE context is removed
+///   (`ngap_path::local_deregistration`);
+/// - otherwise a network-initiated one: the protected DEREGISTRATION REQUEST
+///   (TS 24.501 §5.5.2.3) + T3522
+///   (`ngap_path::send_network_initiated_deregistration`), with the teardown on
+///   the Deregistration Accept / T3522 exhaustion.
 ///
 /// `reregistration_required` (TS 23.502 §4.2.2.3.3 step 2, TS 24.501 §5.5.2.3.1):
 /// see [`dereg_reason_requires_reregistration`] for which reasons set it.
@@ -541,6 +558,7 @@ pub fn handle_dereg_notify(amf_ue: &AmfUe, data: &DeregistrationData) -> NamfHan
         return Ok(());
     }
 
+    let local = dereg_reason_is_local(data.dereg_reason);
     let reregistration_required = dereg_reason_requires_reregistration(data.dereg_reason);
 
     if let Ok(context) = crate::context::amf_self().read() {
@@ -548,11 +566,13 @@ pub fn handle_dereg_notify(amf_ue: &AmfUe, data: &DeregistrationData) -> NamfHan
             amf_ue_ngap_id: amf_ue.id,
             reregistration_required,
             gmm_cause: None,
+            local,
         });
     }
     log::info!(
-        "[{}] Network-initiated deregistration enqueued (reregistration_required={})",
+        "[{}] {} deregistration enqueued (reregistration_required={})",
         amf_ue.supi.as_deref().unwrap_or("unknown"),
+        if local { "Local" } else { "Network-initiated" },
         reregistration_required
     );
 
