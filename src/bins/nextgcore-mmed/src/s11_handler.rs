@@ -1348,7 +1348,7 @@ fn apply_indirect_forwarding_response(
         erab_to_release_list: pending.erab_to_release_list,
         target_to_source_container: pending.target_to_source_container,
     };
-    match nextgcore_s1ap::builder::build_handover_command(&command) {
+    match crate::s1ap_gen::build_handover_command(&command, &source_ue.handover_required_notify) {
         Ok(pdu) => {
             log::info!(
                 "Indirect forwarding tunnels ready; sending the deferred Handover Command to \

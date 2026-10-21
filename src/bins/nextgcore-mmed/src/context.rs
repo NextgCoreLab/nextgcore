@@ -793,6 +793,13 @@ pub struct EnbUe {
     /// where the command goes out immediately.
     pub pending_handover_command: Option<PendingHandoverCommand>,
 
+    /// Unknown ignore-and-notify IEs of this (source) context's last HANDOVER
+    /// REQUIRED, to be reported in the HANDOVER COMMAND's Criticality
+    /// Diagnostics (TS 36.413 §10.3.4.2, #514 stage 8b). The command may be
+    /// built later than the request is decoded (indirect forwarding waits for
+    /// the CIDFT response), so they are kept here rather than passed along.
+    pub handover_required_notify: Vec<crate::s1ap_gen::DiagnosedIe>,
+
     /// Deadline for a handover preparation this context is the TARGET of.
     ///
     /// Set when `handle_handover_required` allocates the target context; cleared on
