@@ -1285,8 +1285,8 @@ impl SecurityModeCommand {
             buf.put_u8(0xE0 | (imeisv_req & 0x0F)); // IEI E- (half-byte)
         }
         if let Some(ref eps_algs) = self.selected_eps_nas_security_algorithms {
+            // TV, 2 (§8.2.25: §9.11.3.25 is type 3, no length octet; #629).
             buf.put_u8(0x57); // IEI
-            buf.put_u8(1); // Length
             buf.put_u8(eps_algs.encode());
         }
         if let Some(info) = self.additional_5g_security_information {
@@ -1329,12 +1329,10 @@ impl SecurityModeCommand {
                     msg.imeisv_request = Some(iei & 0x0F);
                 }
                 0x57 => {
+                    // TV, 2 (§8.2.25.4, §9.11.3.25): IEI then the value octet.
                     buf.skip(1)?;
-                    if buf.remaining() >= 2 {
-                        let _len = buf.read_u8()?;
-                        msg.selected_eps_nas_security_algorithms =
-                            Some(SecurityAlgorithms::decode(buf.read_u8()?));
-                    }
+                    msg.selected_eps_nas_security_algorithms =
+                        Some(SecurityAlgorithms::decode(buf.read_u8()?));
                 }
                 0x36 => {
                     // §9.11.3.12: "a length of 3 octets", one value octet.
@@ -1482,13 +1480,13 @@ impl UlNasTransport {
         buf.put_u8(self.payload_container_type as u8 & 0x0F);
         self.payload_container.encode(buf);
         if let Some(psi) = self.pdu_session_id {
+            // TV, 2 (§9.11.3.41 is type 3, no length octet; #629).
             buf.put_u8(0x12); // IEI
-            buf.put_u8(1); // Length
             buf.put_u8(psi);
         }
         if let Some(old_psi) = self.old_pdu_session_id {
+            // TV, 2 (§9.11.3.41).
             buf.put_u8(0x59); // IEI
-            buf.put_u8(1); // Length
             buf.put_u8(old_psi);
         }
         if let Some(ref rt) = self.request_type {
@@ -1537,18 +1535,14 @@ impl UlNasTransport {
             let iei_type = if iei >= 0x80 { iei & 0xF0 } else { iei };
             match iei_type {
                 0x12 => {
+                    // PDU session ID, TV 2 (§9.11.3.41).
                     buf.skip(1)?;
-                    if buf.remaining() >= 2 {
-                        let _len = buf.read_u8()?;
-                        msg.pdu_session_id = Some(buf.read_u8()?);
-                    }
+                    msg.pdu_session_id = Some(buf.read_u8()?);
                 }
                 0x59 => {
+                    // Old PDU session ID, TV 2 (§9.11.3.41).
                     buf.skip(1)?;
-                    if buf.remaining() >= 2 {
-                        let _len = buf.read_u8()?;
-                        msg.old_pdu_session_id = Some(buf.read_u8()?);
-                    }
+                    msg.old_pdu_session_id = Some(buf.read_u8()?);
                 }
                 0x80 => {
                     buf.skip(1)?;
@@ -1600,8 +1594,8 @@ impl DlNasTransport {
         buf.put_u8(self.payload_container_type as u8 & 0x0F);
         self.payload_container.encode(buf);
         if let Some(psi) = self.pdu_session_id {
+            // TV, 2 (§9.11.3.41 is type 3, no length octet; #629).
             buf.put_u8(0x12); // IEI
-            buf.put_u8(1); // Length
             buf.put_u8(psi);
         }
         if let Some(ref info) = self.additional_information {
@@ -1651,11 +1645,9 @@ impl DlNasTransport {
             let iei = buf.peek_u8()?;
             match iei {
                 0x12 => {
+                    // PDU session ID, TV 2 (§9.11.3.41).
                     buf.skip(1)?;
-                    if buf.remaining() >= 2 {
-                        let _len = buf.read_u8()?;
-                        msg.pdu_session_id = Some(buf.read_u8()?);
-                    }
+                    msg.pdu_session_id = Some(buf.read_u8()?);
                 }
                 0x24 => {
                     buf.skip(1)?;

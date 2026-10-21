@@ -202,6 +202,38 @@ pub enum EpsMobileIdentity {
     Imei(EpsImei),
     /// GUTI
     Guti(EpsGuti),
+    /// TMSI/P-TMSI/M-TMSI. Not an EPS mobile identity (§9.9.3.12 has no type
+    /// 4): it is the TS 24.008 §10.5.1.4 Mobile identity that the Extended
+    /// Service Request's M-TMSI carries (TS 24.301 §8.2.15). Decoded only by
+    /// [`EpsMobileIdentity::decode_mobile_identity`].
+    Tmsi(EpsTmsi),
+}
+
+/// TMSI/P-TMSI/M-TMSI as a TS 24.008 §10.5.1.4 Mobile identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EpsTmsi {
+    /// The 4-octet TMSI, most significant octet first.
+    pub tmsi: u32,
+}
+
+impl EpsTmsi {
+    /// Encode as LV: length 5, octet 3 = "1111" + even + type 100, then the TMSI.
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(5);
+        buf.put_u8(0xF0 | EpsMobileIdentityType::Tmsi as u8);
+        buf.put_u32(self.tmsi);
+    }
+
+    /// Decode the value part (`length` octets, starting at octet 3).
+    pub fn decode(buf: &mut Bytes, length: usize) -> NasResult<Self> {
+        // TS 24.008 §10.5.1.4: the TMSI is 4 octets after octet 3, so exactly
+        // 5 value octets.
+        IeLen::Exact(5).check(length)?;
+        let _type_byte = buf.read_u8()?;
+        Ok(Self {
+            tmsi: buf.read_u32()?,
+        })
+    }
 }
 
 impl Default for EpsMobileIdentity {
@@ -362,6 +394,24 @@ impl EpsMobileIdentity {
             Self::Imsi(imsi) => imsi.encode(buf),
             Self::Imei(imei) => imei.encode(buf),
             Self::Guti(guti) => guti.encode(buf),
+            Self::Tmsi(tmsi) => tmsi.encode(buf),
+        }
+    }
+
+    /// Decode a TS 24.008 §10.5.1.4 Mobile identity (LV), as the Extended
+    /// Service Request's M-TMSI is (TS 24.301 §8.2.15, "Mobile identity
+    /// 9.9.2.3", LV 6). It differs from [`decode`](Self::decode) in accepting
+    /// type 4 (TMSI/P-TMSI/M-TMSI) and not the EPS-only GUTI (#629).
+    pub fn decode_mobile_identity(buf: &mut Bytes) -> NasResult<Self> {
+        let mut ie = buf.read_lv(IeLen::AtLeast(1))?;
+        let length = ie.len();
+        let buf = &mut ie;
+        let id_type = buf.peek_u8()? & 0x07;
+        match id_type {
+            1 => Ok(Self::Imsi(EpsImsi::decode(buf, length)?)),
+            2 => Ok(Self::Imei(EpsImei::decode(buf, length)?)),
+            4 => Ok(Self::Tmsi(EpsTmsi::decode(buf, length)?)),
+            _ => Err(NasError::InvalidMobileIdentityType(id_type)),
         }
     }
 

@@ -18133,8 +18133,7 @@ mod tests {
     /// serialize on this. Same reasoning as `CONTEXT_GUARD`: the alternative is a
     /// race that shows up as an unrelated test seeing the wrong SMF port.
     fn smf_env_test_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        &crate::test_support::SMF_ENV_LOCK
     }
 
     /// A fake SMF that records every Nsmf_PDUSession_UpdateSMContext it receives
