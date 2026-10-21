@@ -4,6 +4,7 @@
 
 use super::header::*;
 use super::types::*;
+use crate::buf::NasBuf;
 use crate::common::types::*;
 use crate::error::{NasError, NasResult};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -106,7 +107,7 @@ impl AttachRequest {
             });
         }
 
-        let first_byte = buf.get_u8();
+        let first_byte = buf.read_u8()?;
         let eps_attach_type = EpsAttachType::decode(first_byte & 0x0F);
         let nas_key_set_identifier = KeySetIdentifier::decode((first_byte >> 4) & 0x0F);
         let eps_mobile_identity = EpsMobileIdentity::decode(buf)?;
@@ -124,39 +125,39 @@ impl AttachRequest {
 
         // Decode optional IEs (TS 24.301 Table 8.2.4.1)
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x19 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 3 {
                         let mut sig = [0u8; 3];
-                        buf.copy_to_slice(&mut sig);
+                        buf.read_into(&mut sig)?;
                         msg.old_p_tmsi_signature = Some(sig);
                     }
                 }
                 0x50 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.additional_guti = Some(EpsMobileIdentity::decode(buf)?);
                 }
                 0x52 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.last_visited_tai = Some(EpsTai::decode(buf)?);
                 }
                 0x5C => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
                         let mut drx = [0u8; 2];
-                        buf.copy_to_slice(&mut drx);
+                        buf.read_into(&mut drx)?;
                         msg.drx_parameter = Some(drx);
                     }
                 }
                 _ => {
                     // Skip unknown TLV IE
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
+                        let len = buf.read_u8()? as usize;
                         if buf.remaining() >= len {
-                            buf.advance(len);
+                            buf.skip(len)?;
                         }
                     }
                 }
@@ -247,8 +248,8 @@ impl AttachAccept {
             });
         }
 
-        let eps_attach_result = EpsAttachResult::decode(buf.get_u8());
-        let t3412_value = GprsTimer::decode(buf.get_u8());
+        let eps_attach_result = EpsAttachResult::decode(buf.read_u8()?);
+        let t3412_value = GprsTimer::decode(buf.read_u8()?);
         let tai_list = EpsTaiList::decode(buf)?;
         let esm_message_container = EsmMessageContainer::decode(buf)?;
 
@@ -262,49 +263,49 @@ impl AttachAccept {
 
         // Decode optional IEs (TS 24.301 Table 8.2.1.1)
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x50 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.guti = Some(EpsMobileIdentity::decode(buf)?);
                 }
                 0x13 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 5 {
-                        msg.lai = Some(buf.copy_to_bytes(5).to_vec());
+                        msg.lai = Some(buf.read_bytes(5)?.to_vec());
                     }
                 }
                 0x23 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        let len = buf.get_u8() as usize;
+                        let len = buf.read_u8()? as usize;
                         if buf.remaining() >= len {
-                            msg.ms_identity = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.ms_identity = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
                 0x53 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        msg.emm_cause = Some(buf.get_u8());
+                        msg.emm_cause = Some(buf.read_u8()?);
                     }
                 }
                 0x17 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        msg.t3402_value = Some(GprsTimer::decode(buf.get_u8()));
+                        msg.t3402_value = Some(GprsTimer::decode(buf.read_u8()?));
                     }
                 }
                 0x59 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        msg.t3423_value = Some(GprsTimer::decode(buf.get_u8()));
+                        msg.t3423_value = Some(GprsTimer::decode(buf.read_u8()?));
                     }
                 }
                 0x4A => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        let len = buf.get_u8() as usize;
+                        let len = buf.read_u8()? as usize;
                         if buf.remaining() >= len {
                             let mut plmns = Vec::with_capacity(len / 3);
                             for _ in 0..(len / 3) {
@@ -315,11 +316,11 @@ impl AttachAccept {
                     }
                 }
                 _ => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
+                        let len = buf.read_u8()? as usize;
                         if buf.remaining() >= len {
-                            buf.advance(len);
+                            buf.skip(len)?;
                         }
                     }
                 }
@@ -516,25 +517,25 @@ impl AttachReject {
                 actual: buf.remaining(),
             });
         }
-        let emm_cause = buf.get_u8();
+        let emm_cause = buf.read_u8()?;
         let mut msg = Self {
             emm_cause,
             ..Default::default()
         };
 
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x78 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.esm_message_container = Some(EsmMessageContainer::decode(buf)?);
                 }
                 0x5F => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.t3346_value = Some(GprsTimer2::decode(buf)?);
                 }
                 0x16 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.t3402_value = Some(GprsTimer2::decode(buf)?);
                 }
                 _ => break,
@@ -560,7 +561,7 @@ impl DetachRequest {
                 actual: buf.remaining(),
             });
         }
-        let first_byte = buf.get_u8();
+        let first_byte = buf.read_u8()?;
         let detach_type = first_byte & 0x0F;
         let nas_key_set_identifier = KeySetIdentifier::decode((first_byte >> 4) & 0x0F);
         let eps_mobile_identity = EpsMobileIdentity::decode(buf)?;
@@ -587,7 +588,7 @@ impl TrackingAreaUpdateRequest {
                 actual: buf.remaining(),
             });
         }
-        let first_byte = buf.get_u8();
+        let first_byte = buf.read_u8()?;
         let eps_update_type = first_byte & 0x0F;
         let nas_key_set_identifier = KeySetIdentifier::decode((first_byte >> 4) & 0x0F);
         let old_guti = EpsMobileIdentity::decode(buf)?;
@@ -627,27 +628,27 @@ impl TrackingAreaUpdateAccept {
                 actual: buf.remaining(),
             });
         }
-        let eps_update_result = buf.get_u8() & 0x07;
+        let eps_update_result = buf.read_u8()? & 0x07;
         let mut msg = Self {
             eps_update_result,
             ..Default::default()
         };
 
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x5A => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        msg.t3412_value = Some(GprsTimer::decode(buf.get_u8()));
+                        msg.t3412_value = Some(GprsTimer::decode(buf.read_u8()?));
                     }
                 }
                 0x50 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.guti = Some(EpsMobileIdentity::decode(buf)?);
                 }
                 0x54 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.tai_list = Some(EpsTaiList::decode(buf)?);
                 }
                 _ => break,
@@ -673,7 +674,7 @@ impl TrackingAreaUpdateReject {
             });
         }
         Ok(Self {
-            emm_cause: buf.get_u8(),
+            emm_cause: buf.read_u8()?,
         })
     }
 }
@@ -703,11 +704,11 @@ impl EpsAuthenticationRequest {
                 actual: buf.remaining(),
             });
         }
-        let nas_key_set_identifier = KeySetIdentifier::decode(buf.get_u8() & 0x0F);
+        let nas_key_set_identifier = KeySetIdentifier::decode(buf.read_u8()? & 0x0F);
         let mut rand = [0u8; 16];
-        buf.copy_to_slice(&mut rand);
+        buf.read_into(&mut rand)?;
         // AUTN is LV with a fixed 16-octet value (TS 24.301 Section 9.9.3.2)
-        let autn_len = buf.get_u8() as usize;
+        let autn_len = buf.read_u8()? as usize;
         if autn_len != 16 {
             return Err(NasError::InvalidIeLength {
                 expected: 16,
@@ -715,7 +716,7 @@ impl EpsAuthenticationRequest {
             });
         }
         let mut autn = [0u8; 16];
-        buf.copy_to_slice(&mut autn);
+        buf.read_into(&mut autn)?;
         Ok(Self {
             nas_key_set_identifier,
             rand,
@@ -758,22 +759,22 @@ impl EpsAuthenticationFailure {
                 actual: buf.remaining(),
             });
         }
-        let emm_cause = buf.get_u8();
+        let emm_cause = buf.read_u8()?;
         let mut msg = Self {
             emm_cause,
             ..Default::default()
         };
 
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x30 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        let len = buf.get_u8() as usize;
+                        let len = buf.read_u8()? as usize;
                         if buf.remaining() >= len {
                             msg.authentication_failure_parameter =
-                                Some(buf.copy_to_bytes(len).to_vec());
+                                Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
@@ -815,8 +816,8 @@ impl EpsSecurityModeCommand {
                 actual: buf.remaining(),
             });
         }
-        let selected_nas_security_algorithms = SecurityAlgorithms::decode(buf.get_u8());
-        let nas_key_set_identifier = KeySetIdentifier::decode(buf.get_u8() & 0x0F);
+        let selected_nas_security_algorithms = SecurityAlgorithms::decode(buf.read_u8()?);
+        let nas_key_set_identifier = KeySetIdentifier::decode(buf.read_u8()? & 0x0F);
         let replayed_ue_security_capabilities = UeNetworkCapability::decode(buf)?;
 
         let mut msg = Self {
@@ -827,26 +828,26 @@ impl EpsSecurityModeCommand {
         };
 
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0xC0..=0xCF => {
-                    msg.imeisv_request = Some(buf.get_u8() & 0x0F);
+                    msg.imeisv_request = Some(buf.read_u8()? & 0x0F);
                 }
                 0x55 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 5 {
-                        let _len = buf.get_u8();
+                        let _len = buf.read_u8()?;
                         let mut nonce = [0u8; 4];
-                        buf.copy_to_slice(&mut nonce);
+                        buf.read_into(&mut nonce)?;
                         msg.replayed_nonce_ue = Some(nonce);
                     }
                 }
                 0x56 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 5 {
-                        let _len = buf.get_u8();
+                        let _len = buf.read_u8()?;
                         let mut nonce = [0u8; 4];
-                        buf.copy_to_slice(&mut nonce);
+                        buf.read_into(&mut nonce)?;
                         msg.nonce_mme = Some(nonce);
                     }
                 }
@@ -873,14 +874,14 @@ impl EpsSecurityModeComplete {
         let mut msg = Self::default();
 
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x23 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        let len = buf.get_u8() as usize;
+                        let len = buf.read_u8()? as usize;
                         if buf.remaining() >= len {
-                            msg.imeisv = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.imeisv = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
@@ -907,7 +908,7 @@ impl EpsSecurityModeReject {
             });
         }
         Ok(Self {
-            emm_cause: buf.get_u8(),
+            emm_cause: buf.read_u8()?,
         })
     }
 }
@@ -927,7 +928,7 @@ impl EpsIdentityRequest {
             });
         }
         Ok(Self {
-            identity_type: buf.get_u8() & 0x07,
+            identity_type: buf.read_u8()? & 0x07,
         })
     }
 }
@@ -960,7 +961,7 @@ impl EmmStatus {
             });
         }
         Ok(Self {
-            emm_cause: buf.get_u8(),
+            emm_cause: buf.read_u8()?,
         })
     }
 }
@@ -988,8 +989,8 @@ impl EpsServiceRequest {
                 actual: buf.remaining(),
             });
         }
-        let ksi_and_sequence_number = buf.get_u8();
-        let short_mac = buf.get_u16();
+        let ksi_and_sequence_number = buf.read_u8()?;
+        let short_mac = buf.read_u16()?;
         Ok(Self {
             ksi_and_sequence_number,
             short_mac,
@@ -1033,7 +1034,7 @@ impl ExtendedServiceRequest {
                 actual: buf.remaining(),
             });
         }
-        let first_byte = buf.get_u8();
+        let first_byte = buf.read_u8()?;
         let service_type = first_byte & 0x0F;
         let nas_key_set_identifier = KeySetIdentifier::decode((first_byte >> 4) & 0x0F);
         let m_tmsi = EpsMobileIdentity::decode(buf)?;
@@ -1044,26 +1045,26 @@ impl ExtendedServiceRequest {
             ..Default::default()
         };
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             let iei_type = if iei >= 0x80 { iei & 0xF0 } else { iei };
             match iei_type {
                 0xB0 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.csfb_response = Some(iei & 0x0F);
                 }
                 0x57 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 3 {
-                        let _len = buf.get_u8();
-                        msg.eps_bearer_context_status = Some(buf.get_u16());
+                        let _len = buf.read_u8()?;
+                        msg.eps_bearer_context_status = Some(buf.read_u16()?);
                     }
                 }
                 _ => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
+                        let len = buf.read_u8()? as usize;
                         if buf.remaining() >= len {
-                            buf.advance(len);
+                            buf.skip(len)?;
                         }
                     }
                 }
@@ -1104,20 +1105,20 @@ impl EpsServiceReject {
                 actual: buf.remaining(),
             });
         }
-        let emm_cause = buf.get_u8();
+        let emm_cause = buf.read_u8()?;
         let mut msg = Self {
             emm_cause,
             ..Default::default()
         };
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x5F => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.t3346_value = Some(GprsTimer2::decode(buf)?);
                 }
                 0x6B => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.t3448_value = Some(GprsTimer2::decode(buf)?);
                 }
                 _ => break,
@@ -1152,10 +1153,10 @@ impl GutiReallocationCommand {
             ..Default::default()
         };
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x54 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.tai_list = Some(EpsTaiList::decode(buf)?);
                 }
                 _ => break,
@@ -1210,45 +1211,45 @@ impl EmmInformation {
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         let mut msg = Self::default();
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x43 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        let len = buf.get_u8() as usize;
+                        let len = buf.read_u8()? as usize;
                         if buf.remaining() >= len {
-                            msg.full_name_for_network = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.full_name_for_network = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
                 0x45 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        let len = buf.get_u8() as usize;
+                        let len = buf.read_u8()? as usize;
                         if buf.remaining() >= len {
-                            msg.short_name_for_network = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.short_name_for_network = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
                 0x46 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        msg.local_time_zone = Some(buf.get_u8());
+                        msg.local_time_zone = Some(buf.read_u8()?);
                     }
                 }
                 0x47 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 7 {
                         let mut utltz = [0u8; 7];
-                        buf.copy_to_slice(&mut utltz);
+                        buf.read_into(&mut utltz)?;
                         msg.universal_time_and_local_time_zone = Some(utltz);
                     }
                 }
                 0x49 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
-                        let _len = buf.get_u8();
-                        msg.network_daylight_saving_time = Some(buf.get_u8());
+                        let _len = buf.read_u8()?;
+                        msg.network_daylight_saving_time = Some(buf.read_u8()?);
                     }
                 }
                 _ => break,
@@ -1278,14 +1279,14 @@ impl EpsDownlinkNasTransport {
                 actual: buf.remaining(),
             });
         }
-        let len = buf.get_u8() as usize;
+        let len = buf.read_u8()? as usize;
         if buf.remaining() < len {
             return Err(NasError::BufferTooShort {
                 expected: len,
                 actual: buf.remaining(),
             });
         }
-        let nas_message_container = buf.copy_to_bytes(len).to_vec();
+        let nas_message_container = buf.read_bytes(len)?.to_vec();
         Ok(Self {
             nas_message_container,
         })
@@ -1312,14 +1313,14 @@ impl EpsUplinkNasTransport {
                 actual: buf.remaining(),
             });
         }
-        let len = buf.get_u8() as usize;
+        let len = buf.read_u8()? as usize;
         if buf.remaining() < len {
             return Err(NasError::BufferTooShort {
                 expected: len,
                 actual: buf.remaining(),
             });
         }
-        let nas_message_container = buf.copy_to_bytes(len).to_vec();
+        let nas_message_container = buf.read_bytes(len)?.to_vec();
         Ok(Self {
             nas_message_container,
         })
@@ -1346,7 +1347,7 @@ impl CsServiceNotification {
             });
         }
         Ok(Self {
-            paging_identity: buf.get_u8(),
+            paging_identity: buf.read_u8()?,
         })
     }
 }
@@ -1514,7 +1515,7 @@ impl PdnConnectivityRequest {
                 actual: buf.remaining(),
             });
         }
-        let byte = buf.get_u8();
+        let byte = buf.read_u8()?;
         Ok(Self {
             request_type: byte & 0x0F,
             pdn_type: (byte >> 4) & 0x0F,
@@ -1536,7 +1537,7 @@ impl PdnConnectivityReject {
             });
         }
         Ok(Self {
-            esm_cause: buf.get_u8(),
+            esm_cause: buf.read_u8()?,
             ..Default::default()
         })
     }
@@ -1555,7 +1556,7 @@ impl PdnDisconnectRequest {
             });
         }
         Ok(Self {
-            linked_eps_bearer_identity: buf.get_u8() & 0x0F,
+            linked_eps_bearer_identity: buf.read_u8()? & 0x0F,
             ..Default::default()
         })
     }
@@ -1574,7 +1575,7 @@ impl PdnDisconnectReject {
             });
         }
         Ok(Self {
-            esm_cause: buf.get_u8(),
+            esm_cause: buf.read_u8()?,
             ..Default::default()
         })
     }
@@ -1597,42 +1598,42 @@ impl ActivateDefaultEpsBearerContextRequest {
                 actual: buf.remaining(),
             });
         }
-        let qos_len = buf.get_u8() as usize;
+        let qos_len = buf.read_u8()? as usize;
         if buf.remaining() < qos_len {
             return Err(NasError::BufferTooShort {
                 expected: qos_len,
                 actual: buf.remaining(),
             });
         }
-        let eps_qos = buf.copy_to_bytes(qos_len).to_vec();
+        let eps_qos = buf.read_bytes(qos_len)?.to_vec();
         if buf.remaining() < 1 {
             return Err(NasError::BufferTooShort {
                 expected: 1,
                 actual: buf.remaining(),
             });
         }
-        let apn_len = buf.get_u8() as usize;
+        let apn_len = buf.read_u8()? as usize;
         if buf.remaining() < apn_len {
             return Err(NasError::BufferTooShort {
                 expected: apn_len,
                 actual: buf.remaining(),
             });
         }
-        let access_point_name = buf.copy_to_bytes(apn_len).to_vec();
+        let access_point_name = buf.read_bytes(apn_len)?.to_vec();
         if buf.remaining() < 1 {
             return Err(NasError::BufferTooShort {
                 expected: 1,
                 actual: buf.remaining(),
             });
         }
-        let addr_len = buf.get_u8() as usize;
+        let addr_len = buf.read_u8()? as usize;
         if buf.remaining() < addr_len {
             return Err(NasError::BufferTooShort {
                 expected: addr_len,
                 actual: buf.remaining(),
             });
         }
-        let pdn_address = buf.copy_to_bytes(addr_len).to_vec();
+        let pdn_address = buf.read_bytes(addr_len)?.to_vec();
         Ok(Self {
             eps_qos,
             access_point_name,
@@ -1655,7 +1656,7 @@ impl ActivateDefaultEpsBearerContextReject {
             });
         }
         Ok(Self {
-            esm_cause: buf.get_u8(),
+            esm_cause: buf.read_u8()?,
             ..Default::default()
         })
     }
@@ -1677,35 +1678,35 @@ impl BearerResourceAllocationRequest {
                 actual: buf.remaining(),
             });
         }
-        let linked = buf.get_u8() & 0x0F;
+        let linked = buf.read_u8()? & 0x0F;
         if buf.remaining() < 1 {
             return Err(NasError::BufferTooShort {
                 expected: 1,
                 actual: buf.remaining(),
             });
         }
-        let tfa_len = buf.get_u8() as usize;
+        let tfa_len = buf.read_u8()? as usize;
         if buf.remaining() < tfa_len {
             return Err(NasError::BufferTooShort {
                 expected: tfa_len,
                 actual: buf.remaining(),
             });
         }
-        let tfa = buf.copy_to_bytes(tfa_len).to_vec();
+        let tfa = buf.read_bytes(tfa_len)?.to_vec();
         if buf.remaining() < 1 {
             return Err(NasError::BufferTooShort {
                 expected: 1,
                 actual: buf.remaining(),
             });
         }
-        let qos_len = buf.get_u8() as usize;
+        let qos_len = buf.read_u8()? as usize;
         if buf.remaining() < qos_len {
             return Err(NasError::BufferTooShort {
                 expected: qos_len,
                 actual: buf.remaining(),
             });
         }
-        let qos = buf.copy_to_bytes(qos_len).to_vec();
+        let qos = buf.read_bytes(qos_len)?.to_vec();
         Ok(Self {
             linked_eps_bearer_identity: linked,
             traffic_flow_aggregate: tfa,
@@ -1728,7 +1729,7 @@ impl BearerResourceAllocationReject {
             });
         }
         Ok(Self {
-            esm_cause: buf.get_u8(),
+            esm_cause: buf.read_u8()?,
             ..Default::default()
         })
     }
@@ -1748,21 +1749,21 @@ impl BearerResourceModificationRequest {
                 actual: buf.remaining(),
             });
         }
-        let ebi = buf.get_u8() & 0x0F;
+        let ebi = buf.read_u8()? & 0x0F;
         if buf.remaining() < 1 {
             return Err(NasError::BufferTooShort {
                 expected: 1,
                 actual: buf.remaining(),
             });
         }
-        let tfa_len = buf.get_u8() as usize;
+        let tfa_len = buf.read_u8()? as usize;
         if buf.remaining() < tfa_len {
             return Err(NasError::BufferTooShort {
                 expected: tfa_len,
                 actual: buf.remaining(),
             });
         }
-        let tfa = buf.copy_to_bytes(tfa_len).to_vec();
+        let tfa = buf.read_bytes(tfa_len)?.to_vec();
         Ok(Self {
             eps_bearer_identity: ebi,
             traffic_flow_aggregate: tfa,
@@ -1784,7 +1785,7 @@ impl BearerResourceModificationReject {
             });
         }
         Ok(Self {
-            esm_cause: buf.get_u8(),
+            esm_cause: buf.read_u8()?,
             ..Default::default()
         })
     }
@@ -1817,35 +1818,35 @@ impl ActivateDedicatedEpsBearerContextRequest {
                 actual: buf.remaining(),
             });
         }
-        let linked = buf.get_u8() & 0x0F;
+        let linked = buf.read_u8()? & 0x0F;
         if buf.remaining() < 1 {
             return Err(NasError::BufferTooShort {
                 expected: 1,
                 actual: buf.remaining(),
             });
         }
-        let qos_len = buf.get_u8() as usize;
+        let qos_len = buf.read_u8()? as usize;
         if buf.remaining() < qos_len {
             return Err(NasError::BufferTooShort {
                 expected: qos_len,
                 actual: buf.remaining(),
             });
         }
-        let eps_qos = buf.copy_to_bytes(qos_len).to_vec();
+        let eps_qos = buf.read_bytes(qos_len)?.to_vec();
         if buf.remaining() < 1 {
             return Err(NasError::BufferTooShort {
                 expected: 1,
                 actual: buf.remaining(),
             });
         }
-        let tft_len = buf.get_u8() as usize;
+        let tft_len = buf.read_u8()? as usize;
         if buf.remaining() < tft_len {
             return Err(NasError::BufferTooShort {
                 expected: tft_len,
                 actual: buf.remaining(),
             });
         }
-        let tft = buf.copy_to_bytes(tft_len).to_vec();
+        let tft = buf.read_bytes(tft_len)?.to_vec();
         Ok(Self {
             linked_eps_bearer_identity: linked,
             eps_qos,
@@ -1874,7 +1875,7 @@ impl ActivateDedicatedEpsBearerContextReject {
             });
         }
         Ok(Self {
-            esm_cause: buf.get_u8(),
+            esm_cause: buf.read_u8()?,
         })
     }
 }
@@ -1907,23 +1908,23 @@ impl ModifyEpsBearerContextRequest {
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         let mut msg = Self::default();
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x5B => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        let len = buf.get_u8() as usize;
+                        let len = buf.read_u8()? as usize;
                         if buf.remaining() >= len {
-                            msg.new_eps_qos = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.new_eps_qos = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
                 0x36 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        let len = buf.get_u8() as usize;
+                        let len = buf.read_u8()? as usize;
                         if buf.remaining() >= len {
-                            msg.tft = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.tft = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
@@ -1953,15 +1954,15 @@ impl ModifyEpsBearerContextAccept {
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         let mut msg = Self::default();
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x27 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        let len = buf.get_u8() as usize;
+                        let len = buf.read_u8()? as usize;
                         if buf.remaining() >= len {
                             msg.protocol_configuration_options =
-                                Some(buf.copy_to_bytes(len).to_vec());
+                                Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
@@ -1992,7 +1993,7 @@ impl ModifyEpsBearerContextReject {
             });
         }
         Ok(Self {
-            esm_cause: buf.get_u8(),
+            esm_cause: buf.read_u8()?,
         })
     }
 }
@@ -2017,7 +2018,7 @@ impl DeactivateEpsBearerContextRequest {
             });
         }
         Ok(Self {
-            esm_cause: buf.get_u8(),
+            esm_cause: buf.read_u8()?,
         })
     }
 }
@@ -2039,24 +2040,24 @@ impl EsmInformationResponse {
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         let mut msg = Self::default();
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x28 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        let len = buf.get_u8() as usize;
+                        let len = buf.read_u8()? as usize;
                         if buf.remaining() >= len {
-                            msg.access_point_name = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.access_point_name = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
                 0x27 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        let len = buf.get_u8() as usize;
+                        let len = buf.read_u8()? as usize;
                         if buf.remaining() >= len {
                             msg.protocol_configuration_options =
-                                Some(buf.copy_to_bytes(len).to_vec());
+                                Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
@@ -2080,7 +2081,7 @@ impl EsmStatus {
             });
         }
         Ok(Self {
-            esm_cause: buf.get_u8(),
+            esm_cause: buf.read_u8()?,
             ..Default::default()
         })
     }
