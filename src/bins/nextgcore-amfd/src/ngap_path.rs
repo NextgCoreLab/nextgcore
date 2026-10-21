@@ -8135,20 +8135,57 @@ impl NgapServer {
     /// preparation is rejected with HandoverPreparationFailure carrying the
     /// spec cause (TS 38.413 Section 9.2.3.6), rather than being dropped.
     async fn handle_handover_required(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
-        let required = match nextgcore_ngap::parser::decode_ngap_pdu(data) {
-            Ok(nextgcore_ngap::NgapMessage::HandoverRequired(r)) => r,
-            Ok(other) => {
-                log::warn!("Expected HandoverRequired, decoded {other:?}");
+        // #417: the GENERATED codec, applying TS 38.413 §10.3.4.2 / §10.3.5.
+        let required = match crate::ngap_asn1::decode_handover_required_asn1(data) {
+            crate::ngap_asn1::NasTransportDecode::Proceed {
+                message,
+                error_indication,
+            } => {
+                // "Ignore IE and notify sender": the preparation goes on, and the
+                // not-comprehended IEs are reported in an Error Indication.
+                if let Some(report) = error_indication {
+                    self.send_criticality_error_indication(association_id, &report)
+                        .await?;
+                }
+                message
+            }
+            crate::ngap_asn1::NasTransportDecode::Reject(report) => {
+                log::warn!(
+                    "HandoverRequired from association {association_id} rejected: {report:?}"
+                );
+                // Class 1 with an unsuccessful outcome: answer with HANDOVER
+                // PREPARATION FAILURE naming the IEs, when the UE can be named.
+                if let (Some(amf_ue_ngap_id), Some(ran_ue_ngap_id)) =
+                    (report.amf_ue_ngap_id, report.ran_ue_ngap_id)
+                {
+                    let failure = nextgcore_ngap::types::HandoverPreparationFailure {
+                        amf_ue_ngap_id,
+                        ran_ue_ngap_id,
+                        cause: nextgcore_ngap::types::Cause::Protocol(
+                            nextgcore_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
+                        ),
+                        criticality_diagnostics: Some(crate::ngap_asn1::hand_written_diagnostics(
+                            &report,
+                        )),
+                    };
+                    if let Some(bytes) =
+                        crate::ngap_asn1::build_handover_preparation_failure_asn1(&failure)
+                    {
+                        self.send_to_association(association_id, &bytes).await?;
+                    }
+                } else {
+                    self.send_criticality_error_indication(association_id, &report)
+                        .await?;
+                }
                 return Ok(());
             }
-            Err(e) => {
-                log::error!("Failed to decode HandoverRequired: {e}");
+            crate::ngap_asn1::NasTransportDecode::Undecodable => {
                 self.send_error_indication(
                     association_id,
                     None,
                     None,
                     nextgcore_ngap::types::Cause::Protocol(
-                        nextgcore_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
+                        nextgcore_asn1c::ngap::cause::CauseProtocol::TransferSyntaxError,
                     ),
                 )
                 .await?;

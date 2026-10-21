@@ -3855,6 +3855,233 @@ pub fn decode_handover_notify_asn1(
     }
 }
 
+/// The value of a BIT STRING as an unsigned integer, most significant bit first.
+fn bits_value(bits: &bitvec::prelude::BitSlice<u8, bitvec::prelude::Msb0>) -> u32 {
+    bits.iter().fold(0u32, |v, bit| (v << 1) | u32::from(*bit))
+}
+
+/// A generated NgENB-ID's value (macro 20, short macro 18 or long macro 21 bits).
+/// `None` for the uninhabitable choice extension.
+fn ng_enb_id_value(id: &ngap_gen::NgENB_ID) -> Option<u32> {
+    Some(match id {
+        ngap_gen::NgENB_ID::MacroNgENB_ID(b) => bits_value(&b.0),
+        ngap_gen::NgENB_ID::ShortMacroNgENB_ID(b) => bits_value(&b.0),
+        ngap_gen::NgENB_ID::LongMacroNgENB_ID(b) => bits_value(&b.0),
+        #[allow(unreachable_patterns)]
+        _ => return None,
+    })
+}
+
+/// The hand-written GlobalRanNodeId a generated GlobalRANNodeID maps to: a gNB or
+/// an ng-eNB; `None` for an N3IWF or a choice extension, which a handover target
+/// cannot be.
+fn hand_written_global_ran_node_id(id: &ngap_gen::GlobalRANNodeID) -> Option<GlobalRanNodeId> {
+    match id {
+        ngap_gen::GlobalRANNodeID::GlobalGNB_ID(gnb) => {
+            let bits = match &gnb.gnb_id {
+                ngap_gen::GNB_ID::GNB_ID(bits) => bits,
+                #[allow(unreachable_patterns)]
+                _ => return None,
+            };
+            Some(GlobalRanNodeId::GlobalGnbId {
+                plmn_identity: gnb.plmn_identity.0.as_slice().try_into().ok()?,
+                gnb_id: bits_value(&bits.0),
+                gnb_id_len: bits.0.len() as u8,
+            })
+        }
+        ngap_gen::GlobalRANNodeID::GlobalNgENB_ID(enb) => Some(GlobalRanNodeId::GlobalNgEnbId {
+            plmn_identity: enb.plmn_identity.0.as_slice().try_into().ok()?,
+            ng_enb_id: ng_enb_id_value(&enb.ng_enb_id)?,
+        }),
+        _ => None,
+    }
+}
+
+/// The hand-written TargetId a generated TargetID maps to (TS 38.413 §9.3.1.25).
+///
+/// The hand-written decoder this replaces read `targeteNB-ID` wrongly: it took
+/// three PLMN octets straight after the SEQUENCE preamble, skipping the
+/// GlobalNgENB-ID's own extension and optional bits and its ngENB-ID CHOICE,
+/// then 32 raw bits as the eNB id, then a 5GS TAI with a 3-octet TAC where
+/// EPS-TAI has a 2-octet one. So a 5GS-to-EPS HANDOVER REQUIRED naming its
+/// target as an eNB decoded to a garbage PLMN and eNB id, which the AMF then
+/// relayed to the MME in the Forward Relocation's Target Identification. The
+/// EPS TAC goes into the low two octets of `tai_tac`.
+fn hand_written_target_id(target: &ngap_gen::TargetID) -> Option<TargetId> {
+    match target {
+        ngap_gen::TargetID::TargetRANNodeID(t) => Some(TargetId::TargetRanNodeId {
+            global_ran_node_id: hand_written_global_ran_node_id(&t.global_ran_node_id)?,
+            selected_tai: TaiListItem {
+                tai_plmn: t.selected_tai.plmn_identity.0.as_slice().try_into().ok()?,
+                tai_tac: t.selected_tai.tac.0.as_slice().try_into().ok()?,
+            },
+        }),
+        ngap_gen::TargetID::TargeteNB_ID(t) => {
+            let tac: [u8; 2] = t.selected_eps_tai.eps_tac.0.as_slice().try_into().ok()?;
+            Some(TargetId::TargetGlobalNgEnbId {
+                plmn_identity: t.global_enb_id.plmn_identity.0.as_slice().try_into().ok()?,
+                ng_enb_id: ng_enb_id_value(&t.global_enb_id.ng_enb_id)?,
+                selected_tai: TaiListItem {
+                    tai_plmn: t.selected_eps_tai.plmn_identity.0.as_slice().try_into().ok()?,
+                    tai_tac: [0, tac[0], tac[1]],
+                },
+            })
+        }
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
+/// A [`CriticalityErrorIndication`]'s report as the hand-written Criticality
+/// Diagnostics a HANDOVER PREPARATION FAILURE carries.
+pub fn hand_written_diagnostics(report: &CriticalityErrorIndication) -> CriticalityDiagnostics {
+    CriticalityDiagnostics {
+        procedure_code: Some(report.procedure.procedure_code),
+        triggering_message: Some(report.procedure.triggering_message),
+        procedure_criticality: Some(report.procedure.procedure_criticality),
+        ies: report
+            .diagnostics
+            .iter()
+            .map(|ie| IeCriticalityDiagnostics {
+                ie_criticality: match ie.criticality {
+                    ngap_gen::Criticality::REJECT => nextgcore_asn1c::ngap::types::Criticality::Reject,
+                    ngap_gen::Criticality::IGNORE => nextgcore_asn1c::ngap::types::Criticality::Ignore,
+                    _ => nextgcore_asn1c::ngap::types::Criticality::Notify,
+                },
+                ie_id: ie.ie_id,
+                type_of_error: if ie.type_of_error == ngap_gen::TypeOfError::MISSING {
+                    TypeOfError::Missing
+                } else {
+                    TypeOfError::NotUnderstood
+                },
+            })
+            .collect(),
+    }
+}
+
+/// Decode a HANDOVER REQUIRED (TS 38.413 §9.2.3.1) with the GENERATED codec
+/// (#417), applying §10.3.4.2 and §10.3.5. Handover Preparation is a Class 1
+/// procedure whose unsuccessful outcome is HANDOVER PREPARATION FAILURE, so a
+/// not-comprehended "reject" IE, or a missing one of the six mandatory
+/// criticality-reject IEs, comes back as `Reject` for the caller to answer
+/// with that failure (or an Error Indication when the UE cannot be named); a
+/// "notify" IE comes back in `error_indication`. Cause and Direct Forwarding
+/// Path Availability are criticality ignore: a missing Cause is
+/// misc/unspecified. A TargetID this AMF cannot represent (an N3IWF, a
+/// choice extension) is `Undecodable`, as the hand-written parser had it.
+pub fn decode_handover_required_asn1(data: &[u8]) -> NasTransportDecode<HandoverRequired> {
+    use ngap_gen::HandoverRequiredProtocolIEs_EntryValue as Ie;
+    let Some((criticality, ies, mut reject, notify)) =
+        decode_initiating(data, "Handover Required", |v| match v {
+            ngap_gen::InitiatingMessageValue::Id_HandoverPreparation(m) => {
+                Some(m.protocol_i_es.0)
+            }
+            _ => None,
+        })
+    else {
+        return NasTransportDecode::Undecodable;
+    };
+    let (mut amf, mut ran, mut ho_type, mut cause, mut target) = (None, None, None, None, None);
+    let (mut sessions, mut container, mut direct) = (None, None, None);
+    for entry in ies {
+        match entry.value {
+            Ie::Id_AMF_UE_NGAP_ID(v) => amf = Some(v.0),
+            Ie::Id_RAN_UE_NGAP_ID(v) => ran = Some(v.0),
+            Ie::Id_HandoverType(v) => {
+                ho_type = Some(match v.0 {
+                    ngap_gen::HandoverType::INTRA5GS => HandoverType::Intra5gs,
+                    ngap_gen::HandoverType::FIVEGS_TO_EPS => HandoverType::FivegsToEps,
+                    ngap_gen::HandoverType::EPS_TO_5GS => HandoverType::EpsTo5gs,
+                    other => {
+                        // 5GS-to-UTRAN and later: no hand-written value, as before.
+                        log::warn!("Handover Required with an unsupported HandoverType {other}");
+                        return NasTransportDecode::Undecodable;
+                    }
+                })
+            }
+            Ie::Id_Cause(v) => cause = Some(hand_written_cause(&v)),
+            Ie::Id_TargetID(v) => match hand_written_target_id(&v) {
+                Some(t) => target = Some(t),
+                None => {
+                    log::warn!("Handover Required names a target this AMF cannot represent");
+                    return NasTransportDecode::Undecodable;
+                }
+            },
+            Ie::Id_DirectForwardingPathAvailability(_) => {
+                direct = Some(
+                    nextgcore_asn1c::ngap::ies::DirectForwardingPathAvailability::DirectPathAvailable,
+                )
+            }
+            Ie::Id_PDUSessionResourceListHORqd(v) => {
+                sessions = Some(
+                    v.0.iter()
+                        .map(|item| PduSessionResourceItemHoRqd {
+                            pdu_session_id: item.pdu_session_id.0,
+                            transfer: item.handover_required_transfer.0.clone(),
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            }
+            Ie::Id_SourceToTarget_TransparentContainer(v) => container = Some(v.0),
+        }
+    }
+    for (present, id) in [
+        (amf.is_some(), ngap_gen::ID_AMF_UE_NGAP_ID),
+        (ran.is_some(), ngap_gen::ID_RAN_UE_NGAP_ID),
+        (ho_type.is_some(), ngap_gen::ID_HANDOVER_TYPE),
+        (target.is_some(), ngap_gen::ID_TARGET_ID),
+        (sessions.is_some(), ngap_gen::ID_PDU_SESSION_RESOURCE_LIST_HO_RQD),
+        (container.is_some(), ngap_gen::ID_SOURCE_TO_TARGET_TRANSPARENT_CONTAINER),
+    ] {
+        if !present {
+            reject.push(missing_ie(id));
+        }
+    }
+    let report = |cause_protocol, diagnostics| {
+        handover_report(
+            ngap_gen::ID_HANDOVER_PREPARATION,
+            ngap_gen::TriggeringMessage::INITIATING_MESSAGE,
+            criticality,
+            (amf, ran),
+            cause_protocol,
+            diagnostics,
+        )
+    };
+    let (
+        Some(amf_ue_ngap_id),
+        Some(ran_ue_ngap_id),
+        Some(handover_type),
+        Some(target_id),
+        Some(pdu_session_list),
+        Some(source_to_target_container),
+        true,
+    ) = (amf, ran, ho_type, target, sessions, container, reject.is_empty())
+    else {
+        return NasTransportDecode::Reject(report(
+            ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
+            reject,
+        ));
+    };
+    NasTransportDecode::Proceed {
+        message: HandoverRequired {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            handover_type,
+            cause: cause.unwrap_or(Cause::Misc(CauseMisc::Unspecified)),
+            target_id,
+            pdu_session_list,
+            source_to_target_container,
+            direct_forwarding_path_availability: direct,
+        },
+        error_indication: (!notify.is_empty()).then(|| {
+            report(
+                ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+                notify,
+            )
+        }),
+    }
+}
+
 /// Decode a HANDOVER FAILURE (TS 38.413 §9.2.3.4) with the GENERATED codec
 /// (#417). It is the unsuccessful outcome of Handover Resource Allocation, a
 /// response: a not-comprehended "reject" IE means local error handling only
