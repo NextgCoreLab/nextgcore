@@ -309,10 +309,28 @@ mod tests {
         assert_eq!(stats.tx_maa.load(Ordering::Relaxed), 1);
     }
 
+    /// `diam_stats()` is the process-wide counter set: every caller gets the
+    /// same instance, and an increment through it is visible through it.
+    ///
+    /// #549: this used to assert `rx_air == 1`, an absolute value of a counter
+    /// the S6a AIR dispatch path (`s6a_path.rs`) increments too — so whenever
+    /// one of the four AIR dispatch tests ran first in this process, it failed.
+    /// Assert identity and a lower bound instead: other tests may add their own
+    /// AIRs between the two loads, but none can remove this one.
     #[test]
     fn test_global_diam_stats() {
+        assert!(
+            Arc::ptr_eq(&diam_stats(), &diam_stats()),
+            "diam_stats() must hand out the single process-wide instance"
+        );
         let stats = diam_stats();
-        stats.s6a.inc_rx_air();
-        assert_eq!(stats.s6a.rx_air.load(Ordering::Relaxed), 1);
+        let before = stats.s6a.rx_air.load(Ordering::Relaxed);
+        diam_stats().s6a.inc_rx_air();
+        let after = stats.s6a.rx_air.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "an AIR counted through one handle must be visible through another \
+             ({before} -> {after})"
+        );
     }
 }
