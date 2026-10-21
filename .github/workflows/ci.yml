@@ -49,8 +49,36 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     needs: check
+    # Memory headroom for the generated codecs (NextgCoreLab/nextgsim#278 is the
+    # same failure, measured). `cargo test` compiles each nextgcore-*-gen crate
+    # twice, once as the lib and once as its unit-test binary, and runs the two
+    # concurrently. Peak RSS per rustc with full debuginfo: nr-rrc-gen 9.4 GB
+    # lib + 5.6 GB test, lte-rrc-gen 4.8 + 2.9, ngap-gen 2.0 + 2.0. The runner
+    # has 16 GB of RAM and a 3 GB swapfile. When the RAM runs out the job dies
+    # mid-compile: "The runner has received a shutdown signal", exit 143. That
+    # is what took nextgsim's Test job down, and its peak was 17.7 GB.
+    # A healthy run takes about 11 minutes. 60 minutes turns a swap-thrash
+    # into a clear timeout instead of a 6-hour hang.
+    timeout-minutes: 60
+    env:
+      # No DWARF for CI test builds: about 25% less rustc memory on the codec
+      # crates. Panic messages keep their file:line (that comes from
+      # `Location`), and RUST_BACKTRACE frames keep their function names. Local
+      # builds are unaffected.
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
+      - name: Add swap headroom
+        # Absorbs whatever lib/test overlap is left. On ubuntu-24.04, /mnt is
+        # on the 145 GB root disk.
+        run: |
+          set -eu
+          nproc; free -m; swapon --show; df -h / /mnt
+          sudo fallocate -l 12G /mnt/ci-swapfile
+          sudo chmod 600 /mnt/ci-swapfile
+          sudo mkswap /mnt/ci-swapfile
+          sudo swapon /mnt/ci-swapfile
+          free -m
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -79,7 +107,17 @@ jobs:
         # a child PROCESS and so cannot pass a socket at all.
         #
         # So a red here is a real failure. Read it, do not re-run it.
-        run: cd src && cargo test --workspace
+        #
+        # A background sampler records peak used RAM and swap, which the "Peak
+        # memory" step prints. A shrinking margin then shows up as a number
+        # before it shows up as a dead runner. The sampler outlives this step:
+        # the runner reaps orphans only at job end.
+        run: |
+          ( while sleep 2; do
+              awk '/^MemTotal/{t=$2} /^MemAvailable/{a=$2} /^SwapTotal/{st=$2} /^SwapFree/{sf=$2}
+                   END{printf "%d %d\n", (t-a)/1024, (st-sf)/1024}' /proc/meminfo
+            done > "$RUNNER_TEMP/mem.log" ) &
+          cd src && cargo test --workspace
 
       - name: cargo test (non-default features)
         # Feature-gated paths are invisible to the default build, so a gated
@@ -88,6 +126,13 @@ jobs:
         # has to be a feature (it binds a privileged port), so it gets an
         # explicit build+test here instead. Add a line per gated feature.
         run: cd src && cargo test -p nextgcore-easdfd --features dns-udp
+
+      - name: Peak memory
+        if: always()
+        run: |
+          echo "peak used RAM (MB): $(sort -n -k1 "$RUNNER_TEMP/mem.log" | tail -1 | cut -d' ' -f1)"
+          echo "peak used swap (MB): $(sort -n -k2 "$RUNNER_TEMP/mem.log" | tail -1 | cut -d' ' -f2)"
+          df -h /
 
   clippy:
     name: Clippy
