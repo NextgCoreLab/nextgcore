@@ -4704,6 +4704,401 @@ pub fn build_downlink_ran_status_transfer_generated(relay: &RanStatusRelay) -> O
         }
     }
 }
+
+/// A hand-written UE Security Capabilities (TS 38.413 §9.3.1.86) as the
+/// generated IE: each 16-bit algorithm bitmap MSB first.
+fn generated_ue_security_capabilities(
+    caps: &UeSecurityCapabilities,
+) -> ngap_gen::UESecurityCapabilities {
+    ngap_gen::UESecurityCapabilities {
+        n_rencryption_algorithms: ngap_gen::NRencryptionAlgorithms(low_bits(
+            u64::from(caps.nr_encryption_algorithms),
+            16,
+        )),
+        n_rintegrity_protection_algorithms: ngap_gen::NRintegrityProtectionAlgorithms(low_bits(
+            u64::from(caps.nr_integrity_algorithms),
+            16,
+        )),
+        eutr_aencryption_algorithms: ngap_gen::EUTRAencryptionAlgorithms(low_bits(
+            u64::from(caps.eutra_encryption_algorithms),
+            16,
+        )),
+        eutr_aintegrity_protection_algorithms: ngap_gen::EUTRAintegrityProtectionAlgorithms(
+            low_bits(u64::from(caps.eutra_integrity_algorithms), 16),
+        ),
+        ie_extensions: None,
+    }
+}
+
+/// The generated UE Security Capabilities as the hand-written type. A bitmap
+/// wider than 16 bits (the SIZE is extensible) keeps its first 16 bits.
+fn hand_written_ue_security_capabilities(
+    caps: &ngap_gen::UESecurityCapabilities,
+) -> UeSecurityCapabilities {
+    let first16 = |bits: &bitvec::vec::BitVec<u8, bitvec::order::Msb0>| {
+        bits.iter()
+            .take(16)
+            .enumerate()
+            .fold(0u16, |v, (i, bit)| v | (u16::from(*bit) << (15 - i)))
+    };
+    UeSecurityCapabilities {
+        nr_encryption_algorithms: first16(&caps.n_rencryption_algorithms.0),
+        nr_integrity_algorithms: first16(&caps.n_rintegrity_protection_algorithms.0),
+        eutra_encryption_algorithms: first16(&caps.eutr_aencryption_algorithms.0),
+        eutra_integrity_algorithms: first16(&caps.eutr_aintegrity_protection_algorithms.0),
+    }
+}
+
+/// A PATH SWITCH REQUEST as amfd acts on it (TS 38.413 §9.2.3.8). User
+/// Location Information and UE Security Capabilities are mandatory with
+/// criticality ignore, so their absence does not fail the message (§10.3.5):
+/// they are `None` and the handler keeps what it holds.
+#[derive(Debug, Clone)]
+pub struct PathSwitchRequestDecoded {
+    /// The target gNB's RAN UE NGAP ID.
+    pub ran_ue_ngap_id: u32,
+    /// The AMF UE NGAP ID the source gNB used.
+    pub source_amf_ue_ngap_id: u64,
+    /// Where the UE now is.
+    pub user_location_info: Option<UserLocationInformation>,
+    /// The UE security capabilities the target gNB received from the source.
+    pub ue_security_capabilities: Option<UeSecurityCapabilities>,
+    /// The PDU sessions to switch in the downlink.
+    pub pdu_session_list: Vec<PduSessionResourceSwitchItem>,
+}
+
+/// What a PATH SWITCH REQUEST decodes to (TS 38.413 §10.3.4.2 / §10.3.5 for a
+/// Class 1 initiating message).
+#[derive(Debug, Clone)]
+pub enum PathSwitchRequestDecode {
+    /// Execute; `notify` lists the "ignore IE and notify sender" IEs, reported
+    /// in the Acknowledge's Criticality Diagnostics.
+    Proceed {
+        /// The decoded request.
+        request: PathSwitchRequestDecoded,
+        /// IEs to report.
+        notify: Vec<IeDiagnostic>,
+    },
+    /// A not-comprehended "reject" IE or a missing criticality-reject mandatory
+    /// IE: answer PATH SWITCH REQUEST FAILURE listing `sessions` as released
+    /// and `report.diagnostics`; an Error Indication when the UE ids or the
+    /// sessions are missing (the Failure cannot be built without them).
+    Reject {
+        /// The PDU sessions the request named.
+        sessions: Vec<u8>,
+        /// The ids, procedure and diagnostics.
+        report: CriticalityErrorIndication,
+    },
+    /// Not a PATH SWITCH REQUEST this AMF can decode.
+    Undecodable,
+}
+
+/// Decode a PATH SWITCH REQUEST (TS 38.413 §9.2.3.8) with the GENERATED codec
+/// (#417). RAN UE NGAP ID, Source AMF UE NGAP ID and the PDU Session Resource
+/// To Be Switched DL List are mandatory with criticality reject; the rest is
+/// criticality ignore.
+pub fn decode_path_switch_request_asn1(data: &[u8]) -> PathSwitchRequestDecode {
+    use ngap_gen::PathSwitchRequestProtocolIEs_EntryValue as Ie;
+    let Some((criticality, ies, mut reject, notify)) =
+        decode_initiating(data, "Path Switch Request", |v| match v {
+            ngap_gen::InitiatingMessageValue::Id_PathSwitchRequest(m) => Some(m.protocol_i_es.0),
+            _ => None,
+        })
+    else {
+        return PathSwitchRequestDecode::Undecodable;
+    };
+    let (mut ran, mut amf, mut uli, mut caps, mut sessions) = (None, None, None, None, None);
+    for entry in ies {
+        match entry.value {
+            Ie::Id_RAN_UE_NGAP_ID(v) => ran = Some(v.0),
+            Ie::Id_SourceAMF_UE_NGAP_ID(v) => amf = Some(v.0),
+            Ie::Id_UserLocationInformation(v) => uli = hand_written_user_location(&v),
+            Ie::Id_UESecurityCapabilities(v) => {
+                caps = Some(hand_written_ue_security_capabilities(&v))
+            }
+            Ie::Id_PDUSessionResourceToBeSwitchedDLList(v) => {
+                sessions = Some(
+                    v.0.into_iter()
+                        .map(|item| PduSessionResourceSwitchItem {
+                            pdu_session_id: item.pdu_session_id.0,
+                            transfer: item.path_switch_request_transfer.0,
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            }
+            // Comprehended; the AMF does not act on them.
+            Ie::Id_PDUSessionResourceFailedToSetupListPSReq(_)
+            | Ie::Id_RRC_Resume_Cause(_)
+            | Ie::Id_RedCapIndication(_) => {}
+        }
+    }
+    for (present, id) in [
+        (ran.is_some(), ngap_gen::ID_RAN_UE_NGAP_ID),
+        (amf.is_some(), ngap_gen::ID_SOURCE_AMF_UE_NGAP_ID),
+        (
+            sessions.is_some(),
+            ngap_gen::ID_PDU_SESSION_RESOURCE_TO_BE_SWITCHED_DL_LIST,
+        ),
+    ] {
+        if !present {
+            reject.push(missing_ie(id));
+        }
+    }
+    let (Some(ran_ue_ngap_id), Some(source_amf_ue_ngap_id), Some(pdu_session_list), true) =
+        (ran, amf, sessions.clone(), reject.is_empty())
+    else {
+        return PathSwitchRequestDecode::Reject {
+            sessions: sessions
+                .unwrap_or_default()
+                .iter()
+                .map(|s| s.pdu_session_id)
+                .collect(),
+            report: handover_report(
+                ngap_gen::ID_PATH_SWITCH_REQUEST,
+                ngap_gen::TriggeringMessage::INITIATING_MESSAGE,
+                criticality,
+                (amf, ran),
+                ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
+                reject,
+            ),
+        };
+    };
+    PathSwitchRequestDecode::Proceed {
+        request: PathSwitchRequestDecoded {
+            ran_ue_ngap_id,
+            source_amf_ue_ngap_id,
+            user_location_info: uli,
+            ue_security_capabilities: caps,
+            pdu_session_list,
+        },
+        notify,
+    }
+}
+
+/// A PathSwitchRequestUnsuccessfulTransfer (TS 38.413 §9.3.4.11) carrying
+/// `cause`, the per-session content of the Acknowledge's and the Failure's
+/// released lists.
+pub fn path_switch_unsuccessful_transfer(cause: Cause) -> Option<Vec<u8>> {
+    nextgcore_ngap_gen::encode_contained(&ngap_gen::PathSwitchRequestUnsuccessfulTransfer {
+        cause: generated_cause(cause),
+        ie_extensions: None,
+    })
+    .ok()
+}
+
+/// Build a PATH SWITCH REQUEST ACKNOWLEDGE (TS 38.413 §9.2.3.9) with the
+/// GENERATED codec (#417), in `PathSwitchRequestAcknowledgeIEs` object-set
+/// order, reporting `notify` -- the request's "ignore IE and notify sender"
+/// IEs -- in Criticality Diagnostics (§10.3.4.2). `None` when the switched
+/// list is empty: the IE is SIZE(1..), and with nothing switched §8.4.4.3
+/// answers PATH SWITCH REQUEST FAILURE instead. Never logs the PDU: the
+/// Security Context carries the NH.
+pub fn build_path_switch_request_acknowledge_generated(
+    msg: &PathSwitchRequestAcknowledge,
+    notify: &[IeDiagnostic],
+) -> Option<Vec<u8>> {
+    use ngap_gen::{
+        PathSwitchRequestAcknowledgeProtocolIEs_Entry as Entry,
+        PathSwitchRequestAcknowledgeProtocolIEs_EntryValue as Ie, ProtocolIE_ID,
+    };
+    if msg.switched_list.is_empty() {
+        return None;
+    }
+    let reject = || ngap_gen::Criticality(ngap_gen::Criticality::REJECT);
+    let ignore = || ngap_gen::Criticality(ngap_gen::Criticality::IGNORE);
+    let entry = |id: u16, criticality: ngap_gen::Criticality, value: Ie| Entry {
+        id: ProtocolIE_ID(id),
+        criticality,
+        value,
+    };
+    let mut ies = vec![
+        entry(
+            ngap_gen::ID_AMF_UE_NGAP_ID,
+            ignore(),
+            Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(msg.amf_ue_ngap_id)),
+        ),
+        entry(
+            ngap_gen::ID_RAN_UE_NGAP_ID,
+            ignore(),
+            Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(msg.ran_ue_ngap_id)),
+        ),
+    ];
+    if let Some(caps) = &msg.ue_security_capabilities {
+        ies.push(entry(
+            ngap_gen::ID_UE_SECURITY_CAPABILITIES,
+            reject(),
+            Ie::Id_UESecurityCapabilities(generated_ue_security_capabilities(caps)),
+        ));
+    }
+    ies.push(entry(
+        ngap_gen::ID_SECURITY_CONTEXT,
+        reject(),
+        Ie::Id_SecurityContext(ngap_gen::SecurityContext {
+            next_hop_chaining_count: ngap_gen::NextHopChainingCount(
+                msg.security_context.next_hop_chaining_count,
+            ),
+            next_hop_nh: ngap_gen::SecurityKey(
+                bitvec::vec::BitVec::<u8, bitvec::order::Msb0>::from_slice(
+                    &msg.security_context.next_hop,
+                ),
+            ),
+            ie_extensions: None,
+        }),
+    ));
+    ies.push(entry(
+        ngap_gen::ID_PDU_SESSION_RESOURCE_SWITCHED_LIST,
+        ignore(),
+        Ie::Id_PDUSessionResourceSwitchedList(ngap_gen::PDUSessionResourceSwitchedList(
+            msg.switched_list
+                .iter()
+                .map(|item| ngap_gen::PDUSessionResourceSwitchedItem {
+                    pdu_session_id: ngap_gen::PDUSessionID(item.pdu_session_id),
+                    path_switch_request_acknowledge_transfer:
+                        ngap_gen::PDUSessionResourceSwitchedItemPathSwitchRequestAcknowledgeTransfer(
+                            item.transfer.clone(),
+                        ),
+                    ie_extensions: None,
+                })
+                .collect(),
+        )),
+    ));
+    if let Some(released) = msg.released_list.as_ref().filter(|r| !r.is_empty()) {
+        ies.push(entry(
+            ngap_gen::ID_PDU_SESSION_RESOURCE_RELEASED_LIST_PS_ACK,
+            ignore(),
+            Ie::Id_PDUSessionResourceReleasedListPSAck(
+                ngap_gen::PDUSessionResourceReleasedListPSAck(
+                    released
+                        .iter()
+                        .map(|item| ngap_gen::PDUSessionResourceReleasedItemPSAck {
+                            pdu_session_id: ngap_gen::PDUSessionID(item.pdu_session_id),
+                            path_switch_request_unsuccessful_transfer:
+                                ngap_gen::PDUSessionResourceReleasedItemPSAckPathSwitchRequestUnsuccessfulTransfer(
+                                    item.transfer.clone(),
+                                ),
+                            ie_extensions: None,
+                        })
+                        .collect(),
+                ),
+            ),
+        ));
+    }
+    ies.push(entry(
+        ngap_gen::ID_ALLOWED_NSSAI,
+        reject(),
+        Ie::Id_AllowedNSSAI(ngap_gen::AllowedNSSAI(
+            msg.allowed_nssai
+                .iter()
+                .map(|s| ngap_gen::AllowedNSSAI_Item {
+                    s_nssai: generated_s_nssai_from(s),
+                    ie_extensions: None,
+                })
+                .collect(),
+        )),
+    ));
+    if !notify.is_empty() {
+        ies.push(entry(
+            ngap_gen::ID_CRITICALITY_DIAGNOSTICS,
+            ignore(),
+            Ie::Id_CriticalityDiagnostics(generated_criticality_diagnostics(notify)),
+        ));
+    }
+    let pdu = ngap_gen::NGAP_PDU::SuccessfulOutcome(ngap_gen::SuccessfulOutcome {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_PATH_SWITCH_REQUEST),
+        criticality: reject(),
+        value: ngap_gen::SuccessfulOutcomeValue::Id_PathSwitchRequest(
+            ngap_gen::PathSwitchRequestAcknowledge {
+                protocol_i_es: ngap_gen::PathSwitchRequestAcknowledgeProtocolIEs(ies),
+            },
+        ),
+    });
+    match nextgcore_ngap_gen::encode(&pdu) {
+        Ok(bytes) => Some(bytes),
+        Err(_) => {
+            // The error's Debug form may name a failing value; the NH must not reach a log.
+            log::error!(
+                "Failed to encode the PathSwitchRequestAcknowledge for amf_ue_ngap_id={}",
+                msg.amf_ue_ngap_id
+            );
+            None
+        }
+    }
+}
+
+/// Build a PATH SWITCH REQUEST FAILURE (TS 38.413 §9.2.3.10) with the
+/// GENERATED codec (#417). Every IE is criticality ignore; the PDU Session
+/// Resource Released List PS Fail is MANDATORY with SIZE(1..), so `released`
+/// must name at least one session (`None` otherwise). `diagnostics`, when
+/// non-empty, are the request's offending IEs (§10.3.4.2).
+pub fn build_path_switch_request_failure_generated(
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+    released: &[PduSessionResourceReleasedItem],
+    diagnostics: &[IeDiagnostic],
+) -> Option<Vec<u8>> {
+    use ngap_gen::{
+        PathSwitchRequestFailureProtocolIEs_Entry as Entry,
+        PathSwitchRequestFailureProtocolIEs_EntryValue as Ie, ProtocolIE_ID,
+    };
+    if released.is_empty() {
+        return None;
+    }
+    let ignore = || ngap_gen::Criticality(ngap_gen::Criticality::IGNORE);
+    let mut ies = vec![
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_AMF_UE_NGAP_ID),
+            criticality: ignore(),
+            value: Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(amf_ue_ngap_id)),
+        },
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_RAN_UE_NGAP_ID),
+            criticality: ignore(),
+            value: Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(ran_ue_ngap_id)),
+        },
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_PDU_SESSION_RESOURCE_RELEASED_LIST_PS_FAIL),
+            criticality: ignore(),
+            value: Ie::Id_PDUSessionResourceReleasedListPSFail(
+                ngap_gen::PDUSessionResourceReleasedListPSFail(
+                    released
+                        .iter()
+                        .map(|item| ngap_gen::PDUSessionResourceReleasedItemPSFail {
+                            pdu_session_id: ngap_gen::PDUSessionID(item.pdu_session_id),
+                            path_switch_request_unsuccessful_transfer:
+                                ngap_gen::PDUSessionResourceReleasedItemPSFailPathSwitchRequestUnsuccessfulTransfer(
+                                    item.transfer.clone(),
+                                ),
+                            ie_extensions: None,
+                        })
+                        .collect(),
+                ),
+            ),
+        },
+    ];
+    if !diagnostics.is_empty() {
+        ies.push(Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_CRITICALITY_DIAGNOSTICS),
+            criticality: ignore(),
+            value: Ie::Id_CriticalityDiagnostics(generated_criticality_diagnostics(diagnostics)),
+        });
+    }
+    let pdu = ngap_gen::NGAP_PDU::UnsuccessfulOutcome(ngap_gen::UnsuccessfulOutcome {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_PATH_SWITCH_REQUEST),
+        criticality: ngap_gen::Criticality(ngap_gen::Criticality::REJECT),
+        value: ngap_gen::UnsuccessfulOutcomeValue::Id_PathSwitchRequest(
+            ngap_gen::PathSwitchRequestFailure {
+                protocol_i_es: ngap_gen::PathSwitchRequestFailureProtocolIEs(ies),
+            },
+        ),
+    });
+    match nextgcore_ngap_gen::encode(&pdu) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            log::error!("Failed to encode the PathSwitchRequestFailure: {e:?}");
+            None
+        }
+    }
+}
 /// Decode an initiating message with unknown-IE skipping: its procedure
 /// criticality, its IE entries (extracted by `pick`), and its not-comprehended
 /// IEs sorted into `(reject, notify)`. `None` when it does not decode or is not
@@ -13254,5 +13649,313 @@ mod handover_3b_ii_tests {
             decode_uplink_ran_status_transfer_asn1(&[0x00, 0x31]),
             NasTransportDecode::Undecodable
         ));
+    }
+}
+
+#[cfg(test)]
+mod path_switch_tests {
+    //! #417: PATH SWITCH REQUEST / ACKNOWLEDGE / FAILURE via the generated codec.
+    use super::tests::with_unknown_ie;
+    use super::*;
+
+    fn caps() -> UeSecurityCapabilities {
+        UeSecurityCapabilities {
+            nr_encryption_algorithms: 0xE000,
+            nr_integrity_algorithms: 0x6000,
+            eutra_encryption_algorithms: 0xF000,
+            eutra_integrity_algorithms: 0x7001,
+        }
+    }
+
+    fn request(sessions: u8, failed: u8, cell: u64) -> PathSwitchRequest {
+        PathSwitchRequest {
+            ran_ue_ngap_id: 0x42,
+            source_amf_ue_ngap_id: 0x1_0000_0001,
+            user_location_info: UserLocationInformation::Nr {
+                nr_cgi_plmn: [0x99, 0xF9, 0x07],
+                nr_cell_identity: cell,
+                tai_plmn: [0x99, 0xF9, 0x07],
+                tai_tac: [0x00, 0x00, 0x07],
+            },
+            ue_security_capabilities: caps(),
+            pdu_session_list: (1..=sessions)
+                .map(|psi| PduSessionResourceSwitchItem {
+                    pdu_session_id: psi,
+                    transfer: vec![0x00, psi, 0x33],
+                })
+                .collect(),
+            failed_list: (failed > 0).then(|| {
+                (20..20 + failed)
+                    .map(|psi| PduSessionResourceFailedItem {
+                        pdu_session_id: psi,
+                        transfer: vec![0x00, psi],
+                    })
+                    .collect()
+            }),
+        }
+    }
+
+    fn proceed(data: &[u8]) -> (PathSwitchRequestDecoded, Vec<IeDiagnostic>) {
+        match decode_path_switch_request_asn1(data) {
+            PathSwitchRequestDecode::Proceed { request, notify } => (request, notify),
+            other => panic!("expected Proceed, got {other:?}"),
+        }
+    }
+
+    /// Every Path Switch Request the hand-written parser accepts decodes to the
+    /// same values: 1..4 sessions × 0..2 failed × NR cell ids at their bounds.
+    #[test]
+    fn path_switch_request_generated_decode_matches_hand_written() {
+        for sessions in 1..=4 {
+            for failed in 0..=2 {
+                for cell in [0u64, 1, 0xF_FFFF_FFFF] {
+                    let bytes =
+                        builder::build_path_switch_request(&request(sessions, failed, cell))
+                            .expect("build");
+                    let Ok(NgapMessage::PathSwitchRequest(hand)) = parser::decode_ngap_pdu(&bytes)
+                    else {
+                        panic!("hand-written parser refused {sessions}/{failed}/{cell}");
+                    };
+                    let (gen, notify) = proceed(&bytes);
+                    assert!(notify.is_empty());
+                    assert_eq!(gen.ran_ue_ngap_id, hand.ran_ue_ngap_id);
+                    assert_eq!(gen.source_amf_ue_ngap_id, hand.source_amf_ue_ngap_id);
+                    assert_eq!(
+                        format!("{:?}", gen.user_location_info),
+                        format!("{:?}", Some(hand.user_location_info))
+                    );
+                    assert_eq!(
+                        format!("{:?}", gen.ue_security_capabilities),
+                        format!("{:?}", Some(hand.ue_security_capabilities))
+                    );
+                    assert_eq!(
+                        gen.pdu_session_list
+                            .iter()
+                            .map(|s| (s.pdu_session_id, s.transfer.clone()))
+                            .collect::<Vec<_>>(),
+                        hand.pdu_session_list
+                            .iter()
+                            .map(|s| (s.pdu_session_id, s.transfer.clone()))
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
+
+    fn without(bytes: &[u8], id: u16) -> Vec<u8> {
+        let mut pdu = nextgcore_ngap_gen::decode(bytes).expect("decode");
+        let ngap_gen::NGAP_PDU::InitiatingMessage(ref mut msg) = pdu else {
+            panic!("initiatingMessage");
+        };
+        let ngap_gen::InitiatingMessageValue::Id_PathSwitchRequest(ref mut req) = msg.value else {
+            panic!("Path Switch Request");
+        };
+        req.protocol_i_es.0.retain(|e| e.id.0 != id);
+        nextgcore_ngap_gen::encode(&pdu).expect("encode")
+    }
+
+    /// TS 38.413 §10.3.4.2 / §10.3.5 for a Class 1 initiating message.
+    #[test]
+    fn path_switch_request_follows_ie_criticality() {
+        let base = builder::build_path_switch_request(&request(1, 0, 7)).expect("build");
+        assert!(proceed(&with_unknown_ie(&base, 9999, 0x40)).1.is_empty());
+        let notify = proceed(&with_unknown_ie(&base, 9999, 0x80)).1;
+        assert_eq!(notify[0].ie_id, 9999);
+        assert_eq!(notify[0].criticality, ngap_gen::Criticality::NOTIFY);
+        let PathSwitchRequestDecode::Reject { sessions, report } =
+            decode_path_switch_request_asn1(&with_unknown_ie(&base, 9999, 0x00))
+        else {
+            panic!("reject must reject");
+        };
+        assert_eq!(sessions, vec![1]);
+        assert_eq!(report.amf_ue_ngap_id, Some(0x1_0000_0001));
+        assert_eq!(report.ran_ue_ngap_id, Some(0x42));
+        assert_eq!(report.diagnostics[0].ie_id, 9999);
+        for id in [
+            ngap_gen::ID_RAN_UE_NGAP_ID,
+            ngap_gen::ID_SOURCE_AMF_UE_NGAP_ID,
+            ngap_gen::ID_PDU_SESSION_RESOURCE_TO_BE_SWITCHED_DL_LIST,
+        ] {
+            let PathSwitchRequestDecode::Reject { report, .. } =
+                decode_path_switch_request_asn1(&without(&base, id))
+            else {
+                panic!("missing {id} must reject");
+            };
+            assert_eq!(report.diagnostics[0].ie_id, id);
+            assert_eq!(
+                report.diagnostics[0].type_of_error,
+                ngap_gen::TypeOfError::MISSING
+            );
+        }
+        // Mandatory with criticality ignore: absent, the request still proceeds.
+        assert!(
+            proceed(&without(&base, ngap_gen::ID_USER_LOCATION_INFORMATION))
+                .0
+                .user_location_info
+                .is_none()
+        );
+        assert!(
+            proceed(&without(&base, ngap_gen::ID_UE_SECURITY_CAPABILITIES))
+                .0
+                .ue_security_capabilities
+                .is_none()
+        );
+        assert!(matches!(
+            decode_path_switch_request_asn1(&[0x00, 0x19]),
+            PathSwitchRequestDecode::Undecodable
+        ));
+    }
+
+    fn ack(switched: u8, released: u8, caps_on: bool) -> PathSwitchRequestAcknowledge {
+        PathSwitchRequestAcknowledge {
+            amf_ue_ngap_id: 0x1_0000_0001,
+            ran_ue_ngap_id: 0x42,
+            ue_security_capabilities: caps_on.then(caps),
+            security_context: SecurityContext {
+                next_hop_chaining_count: 3,
+                next_hop: [0xA5; 32],
+            },
+            switched_list: (1..=switched)
+                .map(|psi| PduSessionResourceSwitchedItem {
+                    pdu_session_id: psi,
+                    transfer: vec![0x00, psi, 0x01],
+                })
+                .collect(),
+            released_list: (released > 0).then(|| {
+                (10..10 + released)
+                    .map(|psi| PduSessionResourceReleasedItem {
+                        pdu_session_id: psi,
+                        transfer: vec![0x00, 0xE0],
+                    })
+                    .collect()
+            }),
+            allowed_nssai: vec![
+                SNssai { sst: 1, sd: None },
+                SNssai {
+                    sst: 2,
+                    sd: Some([0, 0, 9]),
+                },
+            ],
+        }
+    }
+
+    /// The Acknowledge is byte-identical to the hand-written encoder whenever
+    /// its switched list is non-empty; `notify` adds Criticality Diagnostics;
+    /// an empty switched list is not encoded (SIZE(1..), §8.4.4.3 fails it).
+    #[test]
+    fn path_switch_request_acknowledge_generated_matches_hand_written() {
+        for switched in 1..=4 {
+            for released in 0..=2 {
+                for caps_on in [false, true] {
+                    let msg = ack(switched, released, caps_on);
+                    let hand =
+                        builder::build_path_switch_request_acknowledge(&msg).expect("hand-written");
+                    assert_eq!(
+                        build_path_switch_request_acknowledge_generated(&msg, &[]).as_deref(),
+                        Some(hand.as_slice()),
+                        "switched={switched} released={released} caps={caps_on}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            build_path_switch_request_acknowledge_generated(&ack(0, 1, true), &[]),
+            None
+        );
+        let notified = build_path_switch_request_acknowledge_generated(
+            &ack(1, 0, true),
+            &[IeDiagnostic {
+                ie_id: 9999,
+                criticality: ngap_gen::Criticality::NOTIFY,
+                type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+            }],
+        )
+        .expect("encodes");
+        let ngap_gen::NGAP_PDU::SuccessfulOutcome(ngap_gen::SuccessfulOutcome {
+            value: ngap_gen::SuccessfulOutcomeValue::Id_PathSwitchRequest(a),
+            ..
+        }) = nextgcore_ngap_gen::decode(&notified).expect("decodes")
+        else {
+            panic!("PathSwitchRequestAcknowledge");
+        };
+        assert!(a.protocol_i_es.0.iter().any(|e| matches!(
+            &e.value,
+            ngap_gen::PathSwitchRequestAcknowledgeProtocolIEs_EntryValue::Id_CriticalityDiagnostics(d)
+                if d.i_es_criticality_diagnostics.as_ref().is_some_and(|l| l.0[0].ie_id.0 == 9999)
+        )));
+    }
+
+    /// The Failure is byte-identical to the hand-written encoder for a non-empty
+    /// released list, with and without diagnostics; with no session to release
+    /// it is not encoded (the list is mandatory, SIZE(1..)).
+    #[test]
+    fn path_switch_request_failure_generated_matches_hand_written() {
+        let diag = [IeDiagnostic {
+            ie_id: 9999,
+            criticality: ngap_gen::Criticality::REJECT,
+            type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+        }];
+        for released in 1..=3u8 {
+            for with_diag in [false, true] {
+                let items: Vec<_> = (1..=released)
+                    .map(|psi| PduSessionResourceReleasedItem {
+                        pdu_session_id: psi,
+                        transfer: path_switch_unsuccessful_transfer(Cause::RadioNetwork(
+                            CauseRadioNetwork::UnknownLocalUeNgapId,
+                        ))
+                        .expect("transfer"),
+                    })
+                    .collect();
+                let diagnostics: &[IeDiagnostic] = if with_diag { &diag } else { &[] };
+                let hand = builder::build_path_switch_request_failure(&PathSwitchRequestFailure {
+                    amf_ue_ngap_id: 0x1_0000_0001,
+                    ran_ue_ngap_id: 0x42,
+                    released_list: Some(items.clone()),
+                    criticality_diagnostics: with_diag.then(|| CriticalityDiagnostics {
+                        procedure_code: None,
+                        triggering_message: None,
+                        procedure_criticality: None,
+                        ies: vec![IeCriticalityDiagnostics {
+                            ie_criticality: nextgcore_asn1c::ngap::types::Criticality::Reject,
+                            ie_id: 9999,
+                            type_of_error: TypeOfError::NotUnderstood,
+                        }],
+                    }),
+                })
+                .expect("hand-written");
+                assert_eq!(
+                    build_path_switch_request_failure_generated(
+                        0x1_0000_0001,
+                        0x42,
+                        &items,
+                        diagnostics
+                    )
+                    .as_deref(),
+                    Some(hand.as_slice()),
+                    "released={released} diag={with_diag}"
+                );
+            }
+        }
+        assert_eq!(
+            build_path_switch_request_failure_generated(1, 2, &[], &[]),
+            None
+        );
+    }
+
+    /// PathSwitchRequestUnsuccessfulTransfer { radioNetwork:
+    /// unknown-local-UE-NGAP-ID (14) }, derived by hand from X.691: SEQUENCE
+    /// extension bit `0`, iE-Extensions absent `0`; Cause CHOICE of six
+    /// alternatives, radioNetwork `000`; CauseRadioNetwork extension bit `0`,
+    /// value 14 of the 45-value root in 6 bits `001110`; padded:
+    /// `0000 0000 1110 0000`.
+    #[test]
+    fn unsuccessful_transfer_matches_hand_derived() {
+        assert_eq!(
+            path_switch_unsuccessful_transfer(Cause::RadioNetwork(
+                CauseRadioNetwork::UnknownLocalUeNgapId
+            )),
+            Some(vec![0x00, 0xE0])
+        );
     }
 }
