@@ -593,8 +593,7 @@ mod tests {
     /// tests were asserting against -- `test_nrf_slice_availability_configured`
     /// leaves an NSI in the global NSI table, which every later snapshot reads as
     /// `nsiInformationList`. Returns the guard, so callers must bind it:
-    /// `let _guard = setup_context();`.
-    #[must_use]
+    /// `let _guard = setup_context();` (`MutexGuard` is itself `#[must_use]`).
     fn setup_context() -> std::sync::MutexGuard<'static, ()> {
         crate::context::nssf_test_guard(100)
     }

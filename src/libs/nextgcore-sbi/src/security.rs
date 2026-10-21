@@ -851,7 +851,6 @@ mod profile_tests {
                 // peers as well as serving them), so these must exist.
                 client_cert: Some(cert.display().to_string()),
                 client_key: Some(key.display().to_string()),
-                ..TlsPaths::default()
             },
             ..SbiSecurityPolicy::production()
         };
@@ -912,7 +911,6 @@ mod profile_tests {
                 // peers as well as serving them), so these must exist.
                 client_cert: Some(cert.display().to_string()),
                 client_key: Some(key.display().to_string()),
-                ..TlsPaths::default()
             },
             ..SbiSecurityPolicy::production()
         };
@@ -952,7 +950,6 @@ mod profile_tests {
                 // peers as well as serving them), so these must exist.
                 client_cert: Some(cert.display().to_string()),
                 client_key: Some(key.display().to_string()),
-                ..TlsPaths::default()
             },
             ..SbiSecurityPolicy::production()
         };
@@ -1163,7 +1160,6 @@ mod mtls_oauth2_e2e {
                 ca_cert: pki.ca.clone(),
                 client_cert: Some(pki.client_cert.clone()),
                 client_key: Some(pki.client_key.clone()),
-                ..TlsPaths::default()
             },
             ..SbiSecurityPolicy::production()
         };
@@ -1387,7 +1383,6 @@ mod mtls_oauth2_e2e {
                 ca_cert: pki.ca.clone(),
                 client_cert: Some(pki.client_cert.clone()),
                 client_key: Some(pki.client_key.clone()),
-                ..TlsPaths::default()
             },
             ..SbiSecurityPolicy::production()
         };
@@ -1421,7 +1416,7 @@ mod mtls_oauth2_e2e {
         client_cfg.client_key = Some(pki.client_key.clone());
         let mut req = SbiRequest::get("/nudm-sdm/v1/imsi-001010000000001/am-data");
         req.http
-            .set_header("authorization", &format!("Bearer {token}"));
+            .set_header("authorization", format!("Bearer {token}"));
         let resp = SbiClient::new(client_cfg)
             .send_request(req)
             .await

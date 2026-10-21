@@ -672,7 +672,7 @@ mod tests {
                 route(&path, &post(&path.join("/"), serde_json::json!({}))).is_some(),
                 "{path:?} must be routed with the role on"
             );
-            let get = SbiRequest::get(&path.join("/"));
+            let get = SbiRequest::get(path.join("/"));
             let resp = route(&path, &get).expect("routed");
             assert_eq!(
                 resp.status, 405,
