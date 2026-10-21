@@ -181,8 +181,8 @@ pub struct PlmnId {
 impl Default for PlmnId {
     fn default() -> Self {
         Self {
-            mcc: 001,
-            mnc: 01,
+            mcc: 1, // MCC 001
+            mnc: 1, // MNC 01
             mnc_len: 2,
         }
     }
@@ -358,7 +358,7 @@ mod tests {
         // Test MCC=001, MNC=01 (2-digit)
         // MCC digits: 0, 0, 1
         // MNC digits: 0, 0, 1 (but only 2 digits used: 0, 1)
-        let plmn = PlmnId::new(001, 01, 2);
+        let plmn = PlmnId::new(1, 1, 2) /* 001/01 */;
         let bytes = plmn.to_bytes();
         assert_eq!(bytes[0], 0x00); // MCC digit 2 (0) << 4 | MCC digit 1 (0)
         assert_eq!(bytes[1], 0xF1); // 0xF0 | MCC digit 3 (1)

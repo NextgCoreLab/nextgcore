@@ -3226,6 +3226,37 @@ pub async fn call_pcf_ue_policy_delete(
     Ok(())
 }
 
+/// Npcf_AMPolicyControl_Delete: DELETE
+/// /npcf-am-policy-control/v1/policies/{polAssoId} (TS 29.507 §4.2.4, the
+/// AMF-initiated AM Policy Association Termination of TS 23.502 §4.16.3.2).
+pub async fn call_pcf_am_policy_delete(
+    pcf_host: &str,
+    pcf_port: u16,
+    pol_asso_id: &str,
+) -> SbiResult<()> {
+    let client = crate::attach_oauth2(
+        SbiClient::for_peer(pcf_host, pcf_port),
+        nextgcore_sbi::types::NfType::Pcf,
+    );
+
+    let response = client
+        .delete(&format!(
+            "/npcf-am-policy-control/v1/policies/{pol_asso_id}"
+        ))
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("AM policy delete failed: {e}")))?;
+
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "AM policy delete returned status {}",
+            response.status
+        )));
+    }
+
+    log::info!("Npcf_AMPolicyControl_Delete OK (polAssoId={pol_asso_id})");
+    Ok(())
+}
+
 /// Result of an Nnsacf UE-admission query (TS 29.536).
 #[derive(Debug, Clone)]
 pub struct NsacfUeAdmissionResult {
@@ -3789,13 +3820,44 @@ pub async fn call_smf_update_sm_context_ho_state(
     ho_state: &str,
     n2: Option<(&str, &[u8])>,
 ) -> Result<Vec<Vec<u8>>, String> {
+    let cause = (ho_state == "CANCELLED").then_some("HO_FAILURE");
+    update_sm_context_ho_state(smf_host, smf_port, sm_context_ref, ho_state, cause, n2).await
+}
+
+/// Tell the SMF an EPS→5GS handover the source cancelled is CANCELLED (#592, TS 23.502
+/// §4.11.1.2.3 step 4b; TS 29.502 §5.2.2.3.8.4 applies §5.2.2.3.4.4): `hoState` CANCELLED
+/// with cause `HO_CANCEL` (a cancel, where `HO_FAILURE` is §5.2.2.3.8.5's target refusal).
+pub async fn call_smf_cancel_sm_context_handover(
+    smf_host: &str,
+    smf_port: u16,
+    sm_context_ref: &str,
+) -> Result<Vec<Vec<u8>>, String> {
+    update_sm_context_ho_state(
+        smf_host,
+        smf_port,
+        sm_context_ref,
+        "CANCELLED",
+        Some("HO_CANCEL"),
+        None,
+    )
+    .await
+}
+
+async fn update_sm_context_ho_state(
+    smf_host: &str,
+    smf_port: u16,
+    sm_context_ref: &str,
+    ho_state: &str,
+    cause: Option<&str>,
+    n2: Option<(&str, &[u8])>,
+) -> Result<Vec<Vec<u8>>, String> {
     let client = crate::attach_oauth2(
         SbiClient::for_peer(smf_host, smf_port),
         nextgcore_sbi::types::NfType::Smf,
     );
     let mut body = serde_json::json!({ "hoState": ho_state });
-    if ho_state == "CANCELLED" {
-        body["cause"] = serde_json::json!("HO_FAILURE");
+    if let Some(cause) = cause {
+        body["cause"] = serde_json::json!(cause);
     }
     let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify");
     let mut request = SbiRequest::post(&path);

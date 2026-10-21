@@ -2768,6 +2768,7 @@ mod tests {
     /// negotiation. This one drives the real `hss_s6a_serve` with the same
     /// application set `main.rs` configures.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn s6a_server_negotiates_applications_with_its_peer() {
         let _guard = PEER_TEST_LOCK.lock().expect("peer test lock");
         disarm_restart_reset();
@@ -2832,6 +2833,7 @@ mod tests {
     /// Diameter thread, and an HSS-initiated CLR actually transmitted to the
     /// connected MME peer and answered with a CLA.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn test_s6a_server_end_to_end_air_and_clr() {
         let _guard = PEER_TEST_LOCK.lock().expect("peer test lock");
         disarm_restart_reset();

@@ -57,11 +57,14 @@ pub const COMPLETE_REQUEST_TAU: u8 = 1;
 /// GTPv2-C cause `Request accepted` (TS 29.274 Table 8.4-1).
 pub const CAUSE_REQUEST_ACCEPTED: u8 = 16;
 
-/// GTPv2-C cause `IMSI/IMEI not known` (TS 29.274 Table 8.4-1).
+/// GTPv2-C cause `IMSI/IMEI not known` (TS 29.274 Table 8.4-1: 96,
+/// `29274-j60.txt:25511`; 92 is "User authentication failed", which this was
+/// until #592).
 ///
 /// One of the four message-specific causes §7.3.6 names for a Context Response
-/// (`29274-j60.txt:19878`).
-pub const CAUSE_IMSI_IMEI_NOT_KNOWN: u8 = 92;
+/// (`29274-j60.txt:19878`), and the one §7.3.17 names for a Relocation Cancel
+/// Response.
+pub const CAUSE_IMSI_IMEI_NOT_KNOWN: u8 = 96;
 
 /// GTPv2-C cause `Request rejected` (TS 29.274 Table 8.4-1).
 pub const CAUSE_REQUEST_REJECTED: u8 = 94;
@@ -973,6 +976,41 @@ pub fn build_forward_relocation_complete_acknowledge(
     ));
     msg.add_ie(Gtp2CauseIe::new(cause).to_ie(0));
     msg
+}
+
+/// Build a **Relocation Cancel Request** (TS 29.274 §7.3.16, type 139) for an
+/// EPS→5GS handover the source eNB cancelled (TS 23.502 §4.11.1.2.3 step 2,
+/// #592).
+///
+/// - Header TEID: the target AMF's N26 TEID once its Forward Relocation
+///   Response gave it, else 0 (§5.5.2: zero "except for the case where the old
+///   ... MME ... has already been assigned the Tunnel Endpoint Identifier
+///   Control Plane of the new ... AMF").
+/// - IMSI (C): present for every UE that has one (Table 7.3.16-1).
+pub fn build_relocation_cancel_request(
+    sequence_number: u32,
+    amf_teid: Option<u32>,
+    imsi_bcd: &str,
+) -> Gtp2Message {
+    let mut msg = Gtp2Message::new(Gtp2Header::new(
+        Gtp2MessageType::RelocationCancelRequest as u8,
+        amf_teid.unwrap_or(0),
+        sequence_number,
+    ));
+    if !imsi_bcd.is_empty() {
+        msg.add_ie(Gtp2Ie::new(
+            Gtp2IeType::Imsi as u8,
+            0,
+            Bytes::from(string_to_bcd(imsi_bcd)),
+        ));
+    }
+    msg
+}
+
+/// The Cause of a Relocation Cancel Response (TS 29.274 §7.3.17, Table 7.3.17-1).
+pub fn relocation_cancel_response_cause(msg: &Gtp2Message) -> Option<u8> {
+    let ie = msg.get_ie(Gtp2IeType::Cause as u8, 0)?;
+    Gtp2CauseIe::decode(&ie.value).ok().map(|c| c.cause)
 }
 
 /// Apply a decoded MM Context to a UE's EPS security context (TS 33.501 §8.6.1).

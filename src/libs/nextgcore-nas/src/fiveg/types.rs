@@ -2,7 +2,7 @@
 //!
 //! Based on 3GPP TS 24.501
 
-use crate::buf::NasBuf;
+use crate::buf::{IeLen, NasBuf};
 use crate::common::types::{PlmnId, Tai};
 use crate::error::{NasError, NasResult};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -236,22 +236,19 @@ impl MobileIdentity {
             });
         }
 
-        let length = buf.read_u16()? as usize;
-        if buf.remaining() < length {
-            return Err(NasError::BufferTooShort {
-                expected: length,
-                actual: buf.remaining(),
-            });
-        }
+        // §9.11.3.4: type 6, minimum length 4, i.e. at least the type octet.
+        // Each identity is decoded inside the IE's own length (#613), so one
+        // that needs fewer octets than declared cannot leave the rest to be
+        // read as the next IE, and one that needs more cannot borrow them.
+        let mut ie = buf.read_lv_e(IeLen::AtLeast(1))?;
+        let length = ie.len();
+        let buf = &mut ie;
 
         let type_byte = buf.peek_u8()?;
         let id_type = MobileIdentityType::try_from(type_byte & 0x07)?;
 
         match id_type {
-            MobileIdentityType::NoIdentity => {
-                buf.skip(length)?;
-                Ok(Self::NoIdentity)
-            }
+            MobileIdentityType::NoIdentity => Ok(Self::NoIdentity),
             MobileIdentityType::Suci => {
                 let suci = Suci::decode_content(buf, length)?;
                 Ok(Self::Suci(suci))
@@ -416,12 +413,9 @@ impl FiveGGuti {
 
     /// Decode 5G-GUTI content from bytes
     pub fn decode_content(buf: &mut Bytes, length: usize) -> NasResult<Self> {
-        if length < 11 {
-            return Err(NasError::BufferTooShort {
-                expected: 11,
-                actual: length,
-            });
-        }
+        // §9.11.3.4: the 5G-GUTI fills octets 4-14, so exactly 11 value
+        // octets; any other length is an erroneous IE (#613).
+        IeLen::Exact(11).check(length)?;
 
         let _first_byte = buf.read_u8()?; // Type indicator
         let plmn_id = PlmnId::decode(buf)?;
@@ -464,12 +458,9 @@ impl FiveGSTmsi {
 
     /// Decode 5G-S-TMSI content from bytes
     pub fn decode_content(buf: &mut Bytes, length: usize) -> NasResult<Self> {
-        if length < 7 {
-            return Err(NasError::BufferTooShort {
-                expected: 7,
-                actual: length,
-            });
-        }
+        // §9.11.3.4: the 5G-S-TMSI fills octets 4-10, so exactly 7 value
+        // octets; any other length is an erroneous IE (#613).
+        IeLen::Exact(7).check(length)?;
 
         let _first_byte = buf.read_u8()?;
         let amf_id = buf.read_u16()?;
@@ -513,12 +504,9 @@ impl Imei {
 
     /// Decode IMEI content from bytes
     pub fn decode_content(buf: &mut Bytes, length: usize) -> NasResult<Self> {
-        if length < 8 {
-            return Err(NasError::BufferTooShort {
-                expected: 8,
-                actual: length,
-            });
-        }
+        // §9.11.3.4: the IMEI fills 15 digits in octets 4-11, so exactly 8 value
+        // octets; any other length is an erroneous IE (#613).
+        IeLen::Exact(8).check(length)?;
 
         let mut digits = [0u8; 15];
         let first_byte = buf.read_u8()?;
@@ -563,12 +551,9 @@ impl Imeisv {
 
     /// Decode IMEISV content from bytes
     pub fn decode_content(buf: &mut Bytes, length: usize) -> NasResult<Self> {
-        if length < 9 {
-            return Err(NasError::BufferTooShort {
-                expected: 9,
-                actual: length,
-            });
-        }
+        // §9.11.3.4: the IMEISV fills 16 digits in octets 4-12, so exactly 9 value
+        // octets; any other length is an erroneous IE (#613).
+        IeLen::Exact(9).check(length)?;
 
         let mut digits = [0u8; 16];
         let first_byte = buf.read_u8()?;
@@ -634,8 +619,9 @@ impl RegistrationResult {
                 actual: buf.remaining(),
             });
         }
-        let _length = buf.read_u8()?;
-        let byte = buf.read_u8()?;
+        // §9.11.3.6: "a type 4 information element with a length of 3
+        // octets", i.e. exactly one value octet.
+        let byte = buf.read_lv(IeLen::Exact(1))?.read_u8()?;
         let sms_allowed = (byte & 0x08) != 0;
         let emergency_registered = (byte & 0x20) != 0;
         let value = match byte & 0x07 {

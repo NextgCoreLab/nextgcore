@@ -3464,6 +3464,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn test_oauth2_missing_token_rejected() {
         let _guard = context::nssf_test_guard(512);
         let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
@@ -3484,6 +3485,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn test_oauth2_valid_token_accepted() {
         let _guard = context::nssf_test_guard(512);
         let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
@@ -3508,6 +3510,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn test_oauth2_wrong_audience_rejected() {
         let _guard = context::nssf_test_guard(512);
         let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
@@ -3529,6 +3532,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn test_http_nsselection_registration_scenario() {
         // Serialise against the tests that set the process-global
         // PLMN-supported-S-NSSAI restriction: with a sibling's `[sst 1]`
@@ -3578,6 +3582,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn test_http_nsselection_missing_mandatory_params() {
         let _guard = context::nssf_test_guard(512);
         let (server, port) = start_nssf_server().await;
@@ -3627,6 +3632,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn test_http_availability_lifecycle_with_notifications() {
         // Serialize against the nssfd-01 restriction tests and clear any
         // restriction so this lifecycle PUT/PATCH path sees the default
@@ -3890,6 +3896,7 @@ mod tests {
     /// (a) With a configured restricted set, PUT an S-NSSAI outside it ->
     /// 403 SNSSAI_NOT_SUPPORTED; nothing stored, no notification spawned.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn test_availability_put_unsupported_snssai_403() {
         let _guard = context::nssf_test_guard(512);
         // Restrict the PLMN to sst=1 only; the PUT reports sst=2 (outside it).
@@ -3925,6 +3932,7 @@ mod tests {
 
     /// (b) PUT with an empty NF Id -> 403 NOT_AUTHORIZED.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn test_availability_put_empty_nf_id_403_not_authorized() {
         let _guard = context::nssf_test_guard(512);
         with_nssf_context(|c| c.set_plmn_supported_snssais(None)); // no restriction
@@ -3954,6 +3962,7 @@ mod tests {
     /// (c) PUT with all-supported S-NSSAIs (here: no restriction configured)
     /// -> 200 and stored.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn test_availability_put_all_supported_200_stored() {
         let _guard = context::nssf_test_guard(512);
         with_nssf_context(|c| c.set_plmn_supported_snssais(None)); // default allow-all
@@ -3984,6 +3993,7 @@ mod tests {
     /// (d) PATCH producing an unsupported S-NSSAI -> 403; original doc
     /// unchanged.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn test_availability_patch_unsupported_snssai_403_original_unchanged() {
         let _guard = context::nssf_test_guard(512);
         // Restrict to sst=1: the initial PUT (sst=1) is accepted; the PATCH
@@ -4176,6 +4186,7 @@ mod tests {
     /// PDU-session request for sNssai A while NSIs {A, B, C} are configured
     /// → response allowedSnssaiList contains only A.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn test_pdu_nsselection_allowed_narrowed_to_requested_snssai() {
         let _guard = context::nssf_test_guard(512);
         // Configure three NSIs so the old all-NSIs path would have returned 3.
@@ -4234,6 +4245,7 @@ mod tests {
     /// request proceeds past the media-type check (404 here because no doc
     /// is stored for the test nfId).
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn test_availability_patch_wrong_content_type_415() {
         let _guard = context::nssf_test_guard(512);
 
@@ -4645,6 +4657,7 @@ nssf:
     /// config path — rather than through `nsi_add` directly, which is what makes
     /// this test evidence about the shipped daemon rather than about the store.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn pdu_session_selection_succeeds_for_a_configured_nsi() {
         let _guard = context::nssf_test_guard(64);
         // The global NSSF context defaults to max_num_of_nf = 0, so `nsi_add`

@@ -205,8 +205,6 @@ pub async fn start_ecs_registration(
     sbi_addr: &str,
     sbi_port: u16,
 ) {
-    let registration = build_ees_registration(ees_id, sbi_addr, sbi_port);
-
     let Some(ecs_uri) = ecs_uri else {
         log::info!(
             "No --ecs-uri configured; skipping ECS self-registration. \
@@ -646,6 +644,7 @@ mod tests {
     /// #107 criterion 5: `easIds` is populated from the current EAS pool and
     /// `expTime` is set, and a registration made AFTER an EAS registers carries it.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn the_registration_body_carries_the_current_eas_pool_and_an_expiry() {
         let _g = crate::context::PROCESS_STATE_TEST_LOCK
             .lock()

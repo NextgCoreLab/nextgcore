@@ -994,6 +994,7 @@ mod tests {
     /// binding it needs root, so nothing can be listening and the refusal is
     /// deterministic with no port allocation to contend on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn transport_failure_evicts_the_cached_instance_by_id() {
         // The discovery cache is process-global and all three #235 tests below
         // seed `NfType::Udr` entries, so `.first()` in the by-type test could pick
@@ -1052,6 +1053,7 @@ mod tests {
     /// guard below was added. Do not remove the guard on the grounds that the IDs
     /// are distinct: distinctness was never the problem, the shared view was.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn transport_failure_evicts_the_selected_udr() {
         // The discovery cache is process-global and all three #235 tests below
         // seed `NfType::Udr` entries, so `.first()` in the by-type test could pick
@@ -1104,6 +1106,7 @@ mod tests {
     /// The other three discovery writers (`amfd`, `ausfd`, `nssfd`) have the same
     /// three lines and no equivalent test — see the spec's Ceilings section.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std test guard held across .await to serialize process-global state
     async fn discovery_honours_the_search_result_validity_period() {
         // The discovery cache is process-global and all three #235 tests below
         // seed `NfType::Udr` entries, so `.first()` in the by-type test could pick

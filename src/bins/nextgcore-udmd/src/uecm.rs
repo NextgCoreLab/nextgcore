@@ -1845,8 +1845,8 @@ mod tests {
 
     /// WSB-4 acceptance: udmd's REAL production DeregistrationData body ->
     /// amfd's REAL Namf_Callback handler over the wire -> 204 + exactly one
-    /// network-initiated deregistration enqueued (reregistration_required=true
-    /// for UE_INITIAL_REGISTRATION). A relative URI or a missing router arm
+    /// deregistration enqueued (a LOCAL one for UE_INITIAL_REGISTRATION, amfd
+    /// #602). A relative URI or a missing router arm
     /// would fail this (the whole point of the WSB-4 round trip).
     #[tokio::test]
     // The amf-context guard is intentionally held across the async
@@ -1905,8 +1905,9 @@ mod tests {
         );
         assert_eq!(queued[0].amf_ue_ngap_id, ue_id);
         assert!(
-            queued[0].reregistration_required,
-            "UE_INITIAL_REGISTRATION => reregistration_required (TS 23.502 §4.2.2.3.3)"
+            queued[0].local,
+            "UE_INITIAL_REGISTRATION => the old AMF deregisters the UE locally, \
+             without NAS (TS 23.502 §4.2.2.2.2 step 14d, amfd #602)"
         );
     }
 
@@ -2066,10 +2067,10 @@ mod tests {
         let resp = nextgcore_amfd::namf_request_handler(req).await;
         assert_eq!(resp.status, 204, "amfd decodes udmd's body -> 204");
         let queued = drain_network_deregs_for(ue_id);
-        assert_eq!(queued.len(), 1, "one network-initiated dereg enqueued");
+        assert_eq!(queued.len(), 1, "one deregistration enqueued");
         assert!(
-            queued[0].reregistration_required,
-            "UE_INITIAL_REGISTRATION decodes to reregistration_required=true"
+            queued[0].local,
+            "UE_INITIAL_REGISTRATION decodes to a local deregistration (amfd #602)"
         );
     }
 

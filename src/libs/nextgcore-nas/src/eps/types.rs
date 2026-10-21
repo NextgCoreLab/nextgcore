@@ -2,7 +2,7 @@
 //!
 //! Based on 3GPP TS 24.301
 
-use crate::buf::NasBuf;
+use crate::buf::{IeLen, NasBuf};
 use crate::common::types::PlmnId;
 use crate::error::{NasError, NasResult};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -242,12 +242,9 @@ impl EpsImsi {
 
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes, length: usize) -> NasResult<Self> {
-        if length < 1 {
-            return Err(NasError::BufferTooShort {
-                expected: 1,
-                actual: length,
-            });
-        }
+        // TS 24.301 §9.9.3.12 / TS 24.008 §10.5.1.4: an IMSI is at most 15
+        // digits, the first in octet 3, so 1 to 8 value octets (#613).
+        IeLen::Between(1, 8).check(length)?;
 
         let first_byte = buf.read_u8()?;
         let odd = (first_byte & 0x08) != 0;
@@ -295,12 +292,9 @@ impl EpsImei {
 
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes, length: usize) -> NasResult<Self> {
-        if length < 8 {
-            return Err(NasError::BufferTooShort {
-                expected: 8,
-                actual: length,
-            });
-        }
+        // TS 24.008 §10.5.1.4: 15 digits in octets 3-10, so exactly 8 value
+        // octets; any other length is an erroneous IE (#613).
+        IeLen::Exact(8).check(length)?;
 
         let mut digits = [0u8; 15];
         let first_byte = buf.read_u8()?;
@@ -342,12 +336,9 @@ impl EpsGuti {
 
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes, length: usize) -> NasResult<Self> {
-        if length < 11 {
-            return Err(NasError::BufferTooShort {
-                expected: 11,
-                actual: length,
-            });
-        }
+        // TS 24.301 §9.9.3.12: octets 3-13, so exactly 11 value
+        // octets; any other length is an erroneous IE (#613).
+        IeLen::Exact(11).check(length)?;
 
         let _type_byte = buf.read_u8()?;
         let plmn_id = PlmnId::decode(buf)?;
@@ -383,13 +374,11 @@ impl EpsMobileIdentity {
             });
         }
 
-        let length = buf.read_u8()? as usize;
-        if buf.remaining() < length {
-            return Err(NasError::BufferTooShort {
-                expected: length,
-                actual: buf.remaining(),
-            });
-        }
+        // TS 24.301 §9.9.3.12: 3 to 13 octets, so at least the type octet.
+        // The identity is decoded inside the IE's own length (#613).
+        let mut ie = buf.read_lv(IeLen::AtLeast(1))?;
+        let length = ie.len();
+        let buf = &mut ie;
 
         let type_byte = buf.peek_u8()?;
         let id_type = type_byte & 0x07;
@@ -444,9 +433,13 @@ impl UeNetworkCapability {
             });
         }
 
-        let length = buf.read_u8()?;
-        let eea = buf.read_u8()?;
-        let eia = buf.read_u8()?;
+        // TS 24.301 §9.9.3.34: 4 to 15 octets, octets 5-15 optional, so it
+        // grows by release: at least EEA and EIA, the rest decoded or kept as
+        // `additional`, all inside the IE's own length (#613).
+        let mut ie = buf.read_lv(IeLen::AtLeast(2))?;
+        let length = ie.len() as u8;
+        let eea = ie.read_u8()?;
+        let eia = ie.read_u8()?;
 
         let mut cap = Self {
             length,
@@ -457,16 +450,13 @@ impl UeNetworkCapability {
             additional: Vec::new(),
         };
 
-        let remaining = (length as usize).saturating_sub(2);
-        if remaining >= 1 && buf.remaining() >= 1 {
-            cap.uea = Some(buf.read_u8()?);
+        if ie.has_remaining() {
+            cap.uea = Some(ie.read_u8()?);
         }
-        if remaining >= 2 && buf.remaining() >= 1 {
-            cap.uia = Some(buf.read_u8()?);
+        if ie.has_remaining() {
+            cap.uia = Some(ie.read_u8()?);
         }
-        if remaining > 2 && buf.remaining() >= remaining - 2 {
-            cap.additional = buf.read_bytes(remaining - 2)?.to_vec();
-        }
+        cap.additional = ie.to_vec();
 
         Ok(cap)
     }

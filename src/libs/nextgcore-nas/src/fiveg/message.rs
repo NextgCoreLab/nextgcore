@@ -5,7 +5,7 @@
 use super::header::*;
 use super::ie::*;
 use super::types::*;
-use crate::buf::NasBuf;
+use crate::buf::{IeLen, NasBuf};
 use crate::common::security::{unprotect_nas_message, NasSecurityContext};
 use crate::common::types::*;
 use crate::error::{NasError, NasResult};
@@ -275,11 +275,9 @@ impl RegistrationRequest {
                 }
                 0x2B => {
                     // UE status
+                    // §9.11.3.56: "a length of 3 octets", one value octet.
                     buf.skip(1)?;
-                    if buf.remaining() >= 2 {
-                        let _len = buf.read_u8()?;
-                        msg.ue_status = Some(buf.read_u8()?);
-                    }
+                    msg.ue_status = Some(buf.read_lv(IeLen::Exact(1))?.read_u8()?);
                 }
                 0x77 => {
                     // Additional GUTI
@@ -445,22 +443,14 @@ impl RegistrationAccept {
                             actual: buf.remaining(),
                         });
                     }
-                    let len = buf.read_u8()? as usize;
-                    if buf.remaining() < len {
-                        return Err(NasError::BufferTooShort {
-                            expected: len,
-                            actual: buf.remaining(),
-                        });
-                    }
-                    let count = len / PlmnId::encoded_len();
+                    // §9.11.3.45 -> TS 24.008 §10.5.1.13: 5 to 47 octets,
+                    // so at least one PLMN. Decoded inside the IE's length;
+                    // a trailing partial PLMN is discarded with it.
+                    let mut ie = buf.read_lv(IeLen::AtLeast(PlmnId::encoded_len()))?;
+                    let count = ie.len() / PlmnId::encoded_len();
                     let mut plmns = Vec::with_capacity(count);
                     for _ in 0..count {
-                        plmns.push(PlmnId::decode(buf)?);
-                    }
-                    // Discard any trailing octets (length not a multiple of 3).
-                    let rem = len % PlmnId::encoded_len();
-                    if rem > 0 {
-                        buf.skip(rem)?;
+                        plmns.push(PlmnId::decode(&mut ie)?);
                     }
                     msg.equivalent_plmns = Some(plmns);
                 }
@@ -877,11 +867,11 @@ impl ServiceAccept {
                     msg.pdu_session_status = Some(PduSessionStatus::decode(buf)?);
                 }
                 0x26 => {
+                    // §9.11.3.42: 4 to 34 octets, octets 5-34 spare "if
+                    // included": the PSI bitmap, extra octets skipped in the IE.
                     buf.skip(1)?;
-                    if buf.remaining() >= 3 {
-                        let _len = buf.read_u8()?;
-                        msg.pdu_session_reactivation_result = Some(buf.read_u16_le()?);
-                    }
+                    msg.pdu_session_reactivation_result =
+                        Some(buf.read_lv(IeLen::AtLeast(2))?.read_u16_le()?);
                 }
                 0x78 => {
                     buf.skip(1)?;
@@ -1159,14 +1149,11 @@ impl AuthenticationFailure {
             let iei = buf.peek_u8()?;
             match iei {
                 0x30 => {
+                    // §9.11.3.14 -> TS 24.008 §10.5.3.2.2: "a length of 16
+                    // octets", i.e. the 14-octet AUTS.
                     buf.skip(1)?;
-                    if buf.remaining() >= 1 {
-                        let len = buf.read_u8()? as usize;
-                        if buf.remaining() >= len {
-                            msg.authentication_failure_parameter =
-                                Some(buf.read_bytes(len)?.to_vec());
-                        }
-                    }
+                    msg.authentication_failure_parameter =
+                        Some(buf.read_lv(IeLen::Exact(14))?.to_vec());
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -1350,11 +1337,10 @@ impl SecurityModeCommand {
                     }
                 }
                 0x36 => {
+                    // §9.11.3.12: "a length of 3 octets", one value octet.
                     buf.skip(1)?;
-                    if buf.remaining() >= 2 {
-                        let _len = buf.read_u8()?;
-                        msg.additional_5g_security_information = Some(buf.read_u8()?);
-                    }
+                    msg.additional_5g_security_information =
+                        Some(buf.read_lv(IeLen::Exact(1))?.read_u8()?);
                 }
                 0x78 => {
                     buf.skip(1)?;
@@ -1857,11 +1843,11 @@ impl ConfigurationUpdateCommand {
                     }
                 }
                 0x49 => {
+                    // §9.11.3.19 -> TS 24.008 §10.5.3.12: "a length of 3
+                    // octets", one value octet.
                     buf.skip(1)?;
-                    if buf.remaining() >= 2 {
-                        let _len = buf.read_u8()?;
-                        msg.network_daylight_saving_time = Some(buf.read_u8()?);
-                    }
+                    msg.network_daylight_saving_time =
+                        Some(buf.read_lv(IeLen::Exact(1))?.read_u8()?);
                 }
                 0x79 => {
                     buf.skip(1)?;
