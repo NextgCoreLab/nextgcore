@@ -14,8 +14,9 @@
 //! `ext 0 + pad | protocolIEs count (SIZE 0..65535, two aligned octets)`, which
 //! is the `00 00 0N` that #455 was missing the first octet of.
 
-use nextgcore_asn1c::s1ap::cause::{Cause, CauseMisc};
-use nextgcore_s1ap::*;
+use nextgcore_s1ap::cause::{Cause, CauseMisc};
+use nextgcore_s1ap::types::*;
+use nextgcore_s1ap_oracle::*;
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -312,9 +313,9 @@ fn x691_forms_decode_to_their_values() {
 
 /// (id, criticality) of every IE in a built message, read straight off the wire
 /// container rather than through this crate's typed parser.
-fn ie_criticalities(bytes: &[u8]) -> Vec<(u16, nextgcore_asn1c::s1ap::types::Criticality)> {
+fn ie_criticalities(bytes: &[u8]) -> Vec<(u16, nextgcore_s1ap_oracle::asn1::types::Criticality)> {
     use nextgcore_asn1c::per::{AperDecode, AperDecoder};
-    use nextgcore_asn1c::s1ap::pdu::*;
+    use nextgcore_s1ap_oracle::asn1::pdu::*;
     let pdu = S1apPdu::decode_aper(&mut AperDecoder::new(bytes)).unwrap();
     let ies = match &pdu {
         S1apPdu::SuccessfulOutcome(m) => match &m.value {
@@ -336,7 +337,7 @@ fn ie_criticalities(bytes: &[u8]) -> Vec<(u16, nextgcore_asn1c::s1ap::types::Cri
 /// builder's IE criticalities against the TS 36.413 object sets (#455).
 #[test]
 fn ue_ids_are_criticality_ignore_where_the_object_set_says_so() {
-    use nextgcore_asn1c::s1ap::types::Criticality::Ignore;
+    use nextgcore_s1ap_oracle::asn1::types::Criticality::Ignore;
     let hpf = build_handover_preparation_failure(&HandoverPreparationFailure {
         mme_ue_s1ap_id: 1,
         enb_ue_s1ap_id: 1,

@@ -1,7 +1,7 @@
 //! #514 stage 4: Initial Context Setup on the generated codec.
 //!
 //! Oracle: the pre-change hand-written builders and parser
-//! (`nextgcore_s1ap::builder`, `decode_s1ap_pdu`). Golden: nextgcore-s1ap's
+//! (`nextgcore_s1ap_oracle::builder`, `decode_s1ap_pdu`). Golden: nextgcore-s1ap's
 //! `golden_x691.rs` Initial Context Setup Request (derived by hand from X.691
 //! in #456).
 
@@ -9,11 +9,12 @@ use super::*;
 use crate::context::MmeContext;
 use crate::s1ap_handler::handle_s1ap_message;
 use nextgcore_s1ap::{
-    builder, decode_s1ap_pdu, AllocationRetentionPriority, CauseMisc, CauseNas, CauseRadioNetwork,
-    ErabFailedItem, ErabLevelQosParameters, ErabSetupItem, ErabToBeSetupItem, GbrQosInformation,
+    AllocationRetentionPriority, CauseMisc, CauseNas, CauseRadioNetwork, ErabFailedItem,
+    ErabLevelQosParameters, ErabSetupItem, ErabToBeSetupItem, GbrQosInformation,
     InitialContextSetupFailure, InitialContextSetupRequest, InitialContextSetupResponse,
     S1apMessage, UeAmbr, UeSecurityCapabilities,
 };
+use nextgcore_s1ap_oracle::{builder, decode_s1ap_pdu};
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()

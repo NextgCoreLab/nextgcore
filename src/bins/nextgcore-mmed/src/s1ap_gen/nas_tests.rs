@@ -8,9 +8,9 @@ use crate::context::MmeContext;
 use crate::s1ap_build::{self, hand_written_build_downlink_nas_transport};
 use crate::s1ap_handler::handle_s1ap_message;
 use nextgcore_s1ap::{
-    builder, decode_s1ap_pdu, EutranCgi, InitialUeMessage, RrcEstablishmentCause, S1apMessage,
-    STmsi, Tai, UlNasTransport,
+    EutranCgi, InitialUeMessage, RrcEstablishmentCause, S1apMessage, STmsi, Tai, UlNasTransport,
 };
+use nextgcore_s1ap_oracle::{builder, decode_s1ap_pdu};
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()

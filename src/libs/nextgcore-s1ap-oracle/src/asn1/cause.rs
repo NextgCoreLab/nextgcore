@@ -2,7 +2,7 @@
 //!
 //! Cause types from S1AP-IEs (3GPP TS 36.413)
 
-use crate::per::{
+use nextgcore_asn1c::per::{
     AperDecode, AperDecoder, AperEncode, AperEncoder, Constraint, PerError, PerResult,
 };
 
@@ -366,10 +366,79 @@ impl AperDecode for Cause {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Conversions to and from the domain cause types (`nextgcore_s1ap::cause`).
+// The enumerations are identical; only the codec impls differ (test oracle).
+// ---------------------------------------------------------------------------
+
+impl TryFrom<i64> for CauseTransport {
+    type Error = PerError;
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::TransportResourceUnavailable),
+            1 => Ok(Self::Unspecified),
+            _ => Err(PerError::DecodeError(format!(
+                "Unknown CauseTransport value: {value}"
+            ))),
+        }
+    }
+}
+
+impl TryFrom<i64> for CauseNas {
+    type Error = PerError;
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::NormalRelease),
+            1 => Ok(Self::AuthenticationFailure),
+            2 => Ok(Self::Detach),
+            3 => Ok(Self::Unspecified),
+            4 => Ok(Self::CsgSubscriptionExpiry),
+            5 => Ok(Self::UeNotInPlmnServingArea),
+            _ => Err(PerError::DecodeError(format!(
+                "Unknown CauseNas value: {value}"
+            ))),
+        }
+    }
+}
+
+impl From<&nextgcore_s1ap::Cause> for Cause {
+    fn from(c: &nextgcore_s1ap::Cause) -> Self {
+        use nextgcore_s1ap::Cause as D;
+        let ok = "domain and oracle cause enumerations are identical";
+        match *c {
+            D::RadioNetwork(v) => {
+                Cause::RadioNetwork(CauseRadioNetwork::try_from(v as i64).expect(ok))
+            }
+            D::Transport(v) => Cause::Transport(CauseTransport::try_from(v as i64).expect(ok)),
+            D::Nas(v) => Cause::Nas(CauseNas::try_from(v as i64).expect(ok)),
+            D::Protocol(v) => Cause::Protocol(CauseProtocol::try_from(v as i64).expect(ok)),
+            D::Misc(v) => Cause::Misc(CauseMisc::try_from(v as i64).expect(ok)),
+        }
+    }
+}
+
+impl From<Cause> for nextgcore_s1ap::Cause {
+    fn from(c: Cause) -> Self {
+        use nextgcore_s1ap::cause as d;
+        let ok = "domain and oracle cause enumerations are identical";
+        match c {
+            Cause::RadioNetwork(v) => {
+                Self::RadioNetwork(d::CauseRadioNetwork::try_from(v as i64).expect(ok))
+            }
+            Cause::Transport(v) => {
+                Self::Transport(d::CauseTransport::try_from(v as i64).expect(ok))
+            }
+            Cause::Nas(v) => Self::Nas(d::CauseNas::try_from(v as i64).expect(ok)),
+            Cause::Protocol(v) => Self::Protocol(d::CauseProtocol::try_from(v as i64).expect(ok)),
+            Cause::Misc(v) => Self::Misc(d::CauseMisc::try_from(v as i64).expect(ok)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::per::{AperDecoder, AperEncoder};
+    use nextgcore_asn1c::per::{AperDecoder, AperEncoder};
 
     #[test]
     fn test_cause_radio_network_roundtrip() {

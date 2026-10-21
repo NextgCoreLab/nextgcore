@@ -2,10 +2,9 @@
 //!
 //! Strongly-typed representations of S1AP procedure messages per 3GPP TS 36.413.
 
-pub use nextgcore_asn1c::s1ap::cause::{
-    Cause, CauseMisc, CauseNas, CauseProtocol, CauseRadioNetwork, CauseTransport,
+pub use crate::cause::{
+    Cause, CauseMisc, CauseNas, CauseProtocol, CauseRadioNetwork, CauseTransport, Criticality,
 };
-pub use nextgcore_asn1c::s1ap::types::Criticality;
 
 // ============================================================================
 // S1 Setup (TS 36.413 §9.1.8.4-9.1.8.6)
@@ -375,7 +374,7 @@ pub enum TypeOfError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IeCriticalityDiagnostics {
     /// Criticality the offending IE was received with
-    pub ie_criticality: nextgcore_asn1c::s1ap::types::Criticality,
+    pub ie_criticality: Criticality,
     /// Protocol IE id of the offending IE
     pub ie_id: u16,
     /// What was wrong with it

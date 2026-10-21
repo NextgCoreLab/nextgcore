@@ -6,7 +6,6 @@
 //!
 //! - `per` - Packed Encoding Rules (APER) encoder/decoder
 //! - `ngap` - NGAP protocol types and codec (3GPP TS 38.413)
-//! - `s1ap` - S1AP protocol types and codec (3GPP TS 36.413)
 //! - `lpp` - LPP (3GPP TS 37.355, UPER)
 //!
 //! NRPPa (TS 38.455) is generated from the 3GPP ASN.1 by `nextgcore-nrppa-gen`;
@@ -21,7 +20,6 @@
 pub mod lpp; // LPP codec - LTE/NR Positioning Protocol (TS 37.355), UPER, LMF<->UE
 pub mod ngap; // NGAP codec (directory module)
 pub mod per; // Packed Encoding Rules (APER)
-pub mod s1ap; // S1AP codec
 pub mod uper; // Unaligned PER (UPER) - LPP (TS 37.355) / RRC
 
 #[cfg(test)]

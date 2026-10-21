@@ -2835,6 +2835,7 @@ dependencies = [
  "nextgcore-nas",
  "nextgcore-s1ap",
  "nextgcore-s1ap-gen",
+ "nextgcore-s1ap-oracle",
  "nextgcore-sctp",
  "proptest",
  "serde",
@@ -3109,7 +3110,6 @@ name = "nextgcore-s1ap"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "nextgcore-asn1c",
  "nextgcore-core",
  "proptest",
  "thiserror 1.0.69",
@@ -3124,8 +3124,17 @@ dependencies = [
  "asn1_codecs_derive",
  "bitvec",
  "log",
+ "nextgcore-s1ap",
+ "nextgcore-s1ap-oracle",
+]
+
+[[package]]
+name = "nextgcore-s1ap-oracle"
+version = "0.1.0"
+dependencies = [
  "nextgcore-asn1c",
  "nextgcore-s1ap",
+ "proptest",
 ]
 
 [[package]]

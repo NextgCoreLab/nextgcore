@@ -46,9 +46,3 @@ impl From<std::io::Error> for S1apError {
         S1apError::Io(e)
     }
 }
-
-impl From<nextgcore_asn1c::per::PerError> for S1apError {
-    fn from(e: nextgcore_asn1c::per::PerError) -> Self {
-        S1apError::AsnError(e.to_string())
-    }
-}

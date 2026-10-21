@@ -5,10 +5,10 @@
 //! PDU wrapper (InitiatingMessage, SuccessfulOutcome, UnsuccessfulOutcome),
 //! and APER-encodes it to bytes per 3GPP TS 36.413.
 
+use crate::asn1::ies::ProtocolIeContainer;
+use crate::asn1::pdu::*;
+use crate::asn1::types::{Criticality, ProcedureCode, ProtocolIeId};
 use nextgcore_asn1c::per::{AperEncode, AperEncoder};
-use nextgcore_asn1c::s1ap::ies::ProtocolIeContainer;
-use nextgcore_asn1c::s1ap::pdu::*;
-use nextgcore_asn1c::s1ap::types::{Criticality, ProcedureCode, ProtocolIeId};
 
 use crate::error::S1apResult;
 use crate::ie;

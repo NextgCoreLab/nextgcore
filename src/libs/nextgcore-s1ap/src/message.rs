@@ -1,0 +1,70 @@
+//! The decoded S1AP message union mmed dispatches on.
+//!
+//! mmed decodes every S1AP PDU with the generated codec (`nextgcore-s1ap-gen`,
+//! #514) and maps each decode onto these domain types; this enum is the
+//! dispatch shape the handlers match on. It carries no codec.
+
+use crate::types::*;
+
+/// Decoded S1AP message - discriminated union of all supported message types
+#[derive(Debug, Clone)]
+pub enum S1apMessage {
+    S1SetupRequest(S1SetupRequest),
+    S1SetupResponse(S1SetupResponse),
+    S1SetupFailure(S1SetupFailure),
+    InitialUeMessage(InitialUeMessage),
+    DownlinkNasTransport(DlNasTransport),
+    UplinkNasTransport(UlNasTransport),
+    NasNonDeliveryIndication(NasNonDeliveryIndication),
+    InitialContextSetupRequest(InitialContextSetupRequest),
+    InitialContextSetupResponse(InitialContextSetupResponse),
+    InitialContextSetupFailure(InitialContextSetupFailure),
+    UeContextReleaseRequest(UeContextReleaseRequest),
+    UeContextReleaseCommand(UeContextReleaseCommand),
+    UeContextReleaseComplete(UeContextReleaseComplete),
+    ErabSetupRequest(ErabSetupRequest),
+    ErabSetupResponse(ErabSetupResponse),
+    ErabModifyRequest(ErabModifyRequest),
+    ErabModifyResponse(ErabModifyResponse),
+    ErabReleaseCommand(ErabReleaseCommand),
+    ErabReleaseResponse(ErabReleaseResponse),
+    Paging(Paging),
+    Reset(Reset),
+    ResetAcknowledge(ResetAcknowledge),
+    ErrorIndication(ErrorIndication),
+    HandoverRequired(HandoverRequired),
+    HandoverCommand(HandoverCommand),
+    HandoverPreparationFailure(HandoverPreparationFailure),
+    HandoverRequest(HandoverRequest),
+    HandoverRequestAcknowledge(HandoverRequestAcknowledge),
+    HandoverFailure(HandoverFailure),
+    HandoverNotify(HandoverNotify),
+    PathSwitchRequest(PathSwitchRequest),
+    PathSwitchRequestAcknowledge(PathSwitchRequestAcknowledge),
+    PathSwitchRequestFailure(PathSwitchRequestFailure),
+    HandoverCancel(HandoverCancel),
+    HandoverCancelAcknowledge(HandoverCancelAcknowledge),
+    EnbStatusTransfer(EnbStatusTransfer),
+    MmeStatusTransfer(MmeStatusTransfer),
+    UeCapabilityInfoIndication(UeCapabilityInfoIndication),
+    EnbConfigurationUpdate(EnbConfigurationUpdate),
+    EnbConfigurationUpdateAcknowledge(EnbConfigurationUpdateAcknowledge),
+    EnbConfigurationUpdateFailure(EnbConfigurationUpdateFailure),
+    MmeConfigurationUpdate(MmeConfigurationUpdate),
+    MmeConfigurationUpdateAcknowledge(MmeConfigurationUpdateAcknowledge),
+    MmeConfigurationUpdateFailure(MmeConfigurationUpdateFailure),
+    UeContextModificationRequest(UeContextModificationRequest),
+    UeContextModificationResponse(UeContextModificationResponse),
+    UeContextModificationFailure(UeContextModificationFailure),
+    OverloadStart(OverloadStart),
+    OverloadStop(OverloadStop),
+    WriteReplaceWarningRequest(WriteReplaceWarningRequest),
+    WriteReplaceWarningResponse(WriteReplaceWarningResponse),
+    KillRequest(KillRequest),
+    KillResponse(KillResponse),
+    /// Unknown/unsupported message
+    Unknown {
+        procedure_code: u8,
+        message_type: &'static str,
+    },
+}
