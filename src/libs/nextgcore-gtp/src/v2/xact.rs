@@ -137,6 +137,13 @@ pub fn triggered_message_types(initial_type: u8) -> &'static [u8] {
         x if x == T::UpdatePdnConnectionSetRequest as u8 => {
             types!(UpdatePdnConnectionSetResponse)
         }
+        // #618: the N26/S10/S3 mobility pairs (Table 6.1-1, `29274-j60.txt:2410-2431`).
+        x if x == T::IdentificationRequest as u8 => types!(IdentificationResponse),
+        x if x == T::ContextRequest as u8 => types!(ContextResponse),
+        x if x == T::ForwardRelocationRequest as u8 => types!(ForwardRelocationResponse),
+        x if x == T::ForwardRelocationCompleteNotification as u8 => {
+            types!(ForwardRelocationCompleteAcknowledge)
+        }
         x if x == T::ModifyBearerCommand as u8 => {
             types!(UpdateBearerRequest, ModifyBearerFailureIndication)
         }
@@ -480,6 +487,34 @@ mod tests {
         );
         // A response type has no triggered message
         assert_eq!(triggered_message_type(T::CreateSessionResponse as u8), None);
+    }
+
+    /// #618: the N26/S10 request/response pairs, so a Context Response or a Forward
+    /// Relocation Response closes its request and reaches the procedure.
+    #[test]
+    fn every_n26_request_pairs_with_its_response() {
+        use Gtp2MessageType as T;
+        for (request, response) in [
+            (T::IdentificationRequest, T::IdentificationResponse),
+            (T::ContextRequest, T::ContextResponse),
+            (T::ForwardRelocationRequest, T::ForwardRelocationResponse),
+            (
+                T::ForwardRelocationCompleteNotification,
+                T::ForwardRelocationCompleteAcknowledge,
+            ),
+        ] {
+            assert_eq!(
+                triggered_message_types(request as u8),
+                &[response as u8],
+                "{request:?}"
+            );
+            let mut mgr = Gtp2XactMgr::default();
+            mgr.register_request(9, request as u8, peer(), Bytes::new(), 0);
+            assert!(mgr.match_response_from(peer(), 9, response as u8).is_some());
+            assert_eq!(mgr.outstanding(), 0);
+        }
+        // The acknowledge-type messages open no transaction of their own.
+        assert!(triggered_message_types(T::ContextAcknowledge as u8).is_empty());
     }
 
     /// #591: every Command pairs with the triggered Requests and the Failure
