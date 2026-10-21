@@ -1069,16 +1069,22 @@ mod tests {
         assert_eq!(id, vec![0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00]);
         // The same TAC and capability get the same ID back (TS 29.673 §5.2.2.3).
         assert_eq!(
-            nextgcore_amfd::racs::ucmf_assign("35123456", &cap).await.expect("re-Assign"),
+            nextgcore_amfd::racs::ucmf_assign("35123456", &cap)
+                .await
+                .expect("re-Assign"),
             id
         );
         assert_eq!(
-            nextgcore_amfd::racs::ucmf_resolve(&id).await.expect("Resolve"),
+            nextgcore_amfd::racs::ucmf_resolve(&id)
+                .await
+                .expect("Resolve"),
             Some(cap.to_vec())
         );
         let unknown = [0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x90];
         assert_eq!(
-            nextgcore_amfd::racs::ucmf_resolve(&unknown).await.expect("Resolve"),
+            nextgcore_amfd::racs::ucmf_resolve(&unknown)
+                .await
+                .expect("Resolve"),
             None,
             "404 NO_DICTIONARY_ENTRY_FOUND"
         );
@@ -1091,7 +1097,9 @@ mod tests {
             .set_version_id(0x06, Utc::now())
             .expect("the AMF is subscribed");
         assert!(
-            note.uris.iter().any(|u| u.ends_with("/namf-callback/v1/ucmf-notify")),
+            note.uris
+                .iter()
+                .any(|u| u.ends_with("/namf-callback/v1/ucmf-notify")),
             "notifications go to the AMF's callback: {:?}",
             note.uris
         );
