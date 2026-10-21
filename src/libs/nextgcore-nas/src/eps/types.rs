@@ -2,6 +2,7 @@
 //!
 //! Based on 3GPP TS 24.301
 
+use crate::buf::NasBuf;
 use crate::common::types::PlmnId;
 use crate::error::{NasError, NasResult};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -248,12 +249,12 @@ impl EpsImsi {
             });
         }
 
-        let first_byte = buf.get_u8();
+        let first_byte = buf.read_u8()?;
         let odd = (first_byte & 0x08) != 0;
         let mut digits = vec![(first_byte >> 4) & 0x0F];
 
         for _ in 1..length {
-            let byte = buf.get_u8();
+            let byte = buf.read_u8()?;
             digits.push(byte & 0x0F);
             let d2 = (byte >> 4) & 0x0F;
             if d2 != 0x0F {
@@ -302,11 +303,11 @@ impl EpsImei {
         }
 
         let mut digits = [0u8; 15];
-        let first_byte = buf.get_u8();
+        let first_byte = buf.read_u8()?;
         digits[0] = (first_byte >> 4) & 0x0F;
 
         for i in 0..7 {
-            let byte = buf.get_u8();
+            let byte = buf.read_u8()?;
             digits[1 + i * 2] = byte & 0x0F;
             digits[2 + i * 2] = (byte >> 4) & 0x0F;
         }
@@ -348,11 +349,11 @@ impl EpsGuti {
             });
         }
 
-        let _type_byte = buf.get_u8();
+        let _type_byte = buf.read_u8()?;
         let plmn_id = PlmnId::decode(buf)?;
-        let mme_gid = buf.get_u16();
-        let mme_code = buf.get_u8();
-        let m_tmsi = buf.get_u32();
+        let mme_gid = buf.read_u16()?;
+        let mme_code = buf.read_u8()?;
+        let m_tmsi = buf.read_u32()?;
 
         Ok(Self {
             plmn_id,
@@ -382,7 +383,7 @@ impl EpsMobileIdentity {
             });
         }
 
-        let length = buf.get_u8() as usize;
+        let length = buf.read_u8()? as usize;
         if buf.remaining() < length {
             return Err(NasError::BufferTooShort {
                 expected: length,
@@ -390,7 +391,7 @@ impl EpsMobileIdentity {
             });
         }
 
-        let type_byte = buf.chunk()[0];
+        let type_byte = buf.peek_u8()?;
         let id_type = type_byte & 0x07;
 
         match id_type {
@@ -443,9 +444,9 @@ impl UeNetworkCapability {
             });
         }
 
-        let length = buf.get_u8();
-        let eea = buf.get_u8();
-        let eia = buf.get_u8();
+        let length = buf.read_u8()?;
+        let eea = buf.read_u8()?;
+        let eia = buf.read_u8()?;
 
         let mut cap = Self {
             length,
@@ -458,13 +459,13 @@ impl UeNetworkCapability {
 
         let remaining = (length as usize).saturating_sub(2);
         if remaining >= 1 && buf.remaining() >= 1 {
-            cap.uea = Some(buf.get_u8());
+            cap.uea = Some(buf.read_u8()?);
         }
         if remaining >= 2 && buf.remaining() >= 1 {
-            cap.uia = Some(buf.get_u8());
+            cap.uia = Some(buf.read_u8()?);
         }
         if remaining > 2 && buf.remaining() >= remaining - 2 {
-            cap.additional = buf.copy_to_bytes(remaining - 2).to_vec();
+            cap.additional = buf.read_bytes(remaining - 2)?.to_vec();
         }
 
         Ok(cap)
@@ -503,14 +504,14 @@ impl EsmMessageContainer {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.get_u16();
+        let length = buf.read_u16()?;
         if buf.remaining() < length as usize {
             return Err(NasError::BufferTooShort {
                 expected: length as usize,
                 actual: buf.remaining(),
             });
         }
-        let data = buf.copy_to_bytes(length as usize).to_vec();
+        let data = buf.read_bytes(length as usize)?.to_vec();
         Ok(Self { length, data })
     }
 }
@@ -540,7 +541,7 @@ impl EpsTai {
                 actual: buf.remaining(),
             });
         }
-        let tac = buf.get_u16();
+        let tac = buf.read_u16()?;
         Ok(Self { plmn_id, tac })
     }
 }
@@ -569,14 +570,14 @@ impl EpsTaiList {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.get_u8();
+        let length = buf.read_u8()?;
         if buf.remaining() < length as usize {
             return Err(NasError::BufferTooShort {
                 expected: length as usize,
                 actual: buf.remaining(),
             });
         }
-        let data = buf.copy_to_bytes(length as usize).to_vec();
+        let data = buf.read_bytes(length as usize)?.to_vec();
         Ok(Self { length, data })
     }
 }

@@ -36,6 +36,7 @@
 //! let buf = build_5gmm_message(&msg);
 //! ```
 
+mod buf;
 pub mod common;
 pub mod eps;
 pub mod error;

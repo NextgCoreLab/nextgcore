@@ -2,6 +2,7 @@
 //!
 //! Based on 3GPP TS 24.301
 
+use crate::buf::NasBuf;
 use crate::common::types::SecurityHeaderType;
 use crate::error::{NasError, NasResult};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -183,10 +184,10 @@ impl EpsNasEmmHeader {
             });
         }
 
-        let first_byte = buf.get_u8();
+        let first_byte = buf.read_u8()?;
         let security_header_type = SecurityHeaderType::try_from((first_byte >> 4) & 0x0F)?;
         let protocol_discriminator = first_byte & 0x0F;
-        let message_type = buf.get_u8();
+        let message_type = buf.read_u8()?;
 
         Ok(Self {
             security_header_type,
@@ -236,11 +237,11 @@ impl EpsNasEsmHeader {
             });
         }
 
-        let first_byte = buf.get_u8();
+        let first_byte = buf.read_u8()?;
         let eps_bearer_identity = (first_byte >> 4) & 0x0F;
         let protocol_discriminator = first_byte & 0x0F;
-        let procedure_transaction_identity = buf.get_u8();
-        let message_type = buf.get_u8();
+        let procedure_transaction_identity = buf.read_u8()?;
+        let message_type = buf.read_u8()?;
 
         Ok(Self {
             eps_bearer_identity,
@@ -281,12 +282,12 @@ impl EpsNasSecurityHeader {
             });
         }
 
-        let first_byte = buf.get_u8();
+        let first_byte = buf.read_u8()?;
         let security_header_type = SecurityHeaderType::try_from((first_byte >> 4) & 0x0F)?;
         let protocol_discriminator = first_byte & 0x0F;
         let mut message_authentication_code = [0u8; 4];
-        buf.copy_to_slice(&mut message_authentication_code);
-        let sequence_number = buf.get_u8();
+        buf.read_into(&mut message_authentication_code)?;
+        let sequence_number = buf.read_u8()?;
 
         Ok(Self {
             security_header_type,
