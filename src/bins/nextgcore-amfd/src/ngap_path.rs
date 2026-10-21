@@ -422,6 +422,39 @@ fn initial_service_request_plain(nas: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// The cleartext REGISTRATION REQUEST inside an integrity-protected initial NAS
+/// message (security header type 1, TS 24.501 §4.4.6, §9.3.1): the plain message after
+/// the 6-octet MAC/SQN header. A UE with a NAS security context sends its mobility and
+/// periodic registration updates from 5GMM-IDLE in this form (#609).
+fn initial_protected_registration_request(nas: &[u8]) -> Option<&[u8]> {
+    (nas.len() >= 10
+        && nas[1] == 0x01
+        && nas[7] == 0x7E
+        && nas[8] == security_header::PLAIN_NAS_MESSAGE
+        && nas[9] == message_type::REGISTRATION_REQUEST)
+        .then(|| &nas[7..])
+}
+
+/// The NAS message container IE of a plain REGISTRATION REQUEST (IEI 0x71, TLV-E,
+/// TS 24.501 §9.11.3.33): the byte span of the whole IE in `plain`, and its value.
+/// Decoded with the shared NAS codec, so the IE is found by structure rather than by
+/// scanning for its IEI.
+fn registration_request_container(plain: &[u8]) -> Option<(std::ops::Range<usize>, Vec<u8>)> {
+    use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+    let Ok(FiveGmmMessage::RegistrationRequest(req)) =
+        parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(plain))
+    else {
+        return None;
+    };
+    let value = req.nas_message_container?.data;
+    let len = u16::try_from(value.len()).ok()?;
+    let mut ie = vec![0x71];
+    ie.extend_from_slice(&len.to_be_bytes());
+    ie.extend_from_slice(&value);
+    let start = plain.windows(ie.len()).rposition(|w| w == ie.as_slice())?;
+    Some((start..start + ie.len(), value))
+}
+
 /// The Service type of a plain SERVICE REQUEST (TS 24.501 §9.11.3.50). Octet 4
 /// carries two half-octet IEs; Table 8.2.16.1.1 lists ngKSI first and §8.1 puts
 /// the first of a half-octet run in bits 1-4, so ngKSI is bits 1-4 and Service
@@ -1931,62 +1964,86 @@ impl NgapServer {
                 .await;
         }
 
+        // A REGISTRATION REQUEST from 5GMM-IDLE over a NAS security context is sent
+        // integrity protected too (TS 24.501 §4.4.6), with the full request in a
+        // ciphered NAS message container. Opened here, before the plain dispatch,
+        // which would read a MAC octet as the message type (#609).
+        let idle_registration = initial_protected_registration_request(&nas).map(|cleartext| {
+            self.open_idle_registration_request(
+                association_id,
+                amf_ue_ngap_id,
+                &initial_ue,
+                &nas,
+                cleartext,
+            )
+        });
+        let msg_type = if idle_registration.is_some() {
+            message_type::REGISTRATION_REQUEST
+        } else {
+            msg_type
+        };
+
         match msg_type {
             message_type::REGISTRATION_REQUEST => {
-                let mut state = UeNasContext::new(
-                    amf_ue_ngap_id,
-                    initial_ue.ran_ue_ngap_id,
-                    association_id,
-                    crate::context::nas_security_canary(),
-                );
-                state.amf_ue.nr_tai = crate::context::Tai5gs {
-                    plmn_id: initial_ue.plmn_id.clone(),
-                    tac: initial_ue.tac,
-                };
-                // #406, the THIRD instance of the class: store the cell identity too.
-                //
-                // `parse_initial_ue_message_asn1` decodes `nr_cell_identity` off the
-                // InitialUEMessage's own `UserLocationInformation`
-                // (`ngap_asn1.rs:357-368`); before this it was LOGGED at `:1602-1607` and
-                // then dropped, so `amf_ue.nr_cgi` had exactly one production writer
-                // (`handle_handover_notify`) and an `ncgiList` Area of Interest could not
-                // resolve for a UE that had never handed over — #400 recorded that as a
-                // ceiling and #407 wrote a test pinning it.
-                //
-                // Worth doing because `ncgi` is not optional in what the AMF reports:
-                // TS 29.571 §5.4.4.9's `NrLocation` makes both `tai` and `ncgi` `M`
-                // (`29571-k00.txt:4674`, `:4689`), so without this half of a mandatory pair
-                // was a default for every UE that had only ever registered.
-                //
-                // `initial_ue.plmn_id` is decoded from `nr_cgi_plmn` (`ngap_asn1.rs:364`),
-                // so it is exactly the right source for `nr_cgi.plmn_id` — that IS the
-                // NR-CGI's PLMN.
-                //
-                // NOTE a PRE-EXISTING inexactness this write inherits rather than
-                // introduces: the `nr_tai` assignment immediately above uses the SAME
-                // value, so the registration path stores the NR-CGI's PLMN as the TAI's
-                // too. The IE carries them separately (`UserLocationInformation::Nr` has
-                // both `nr_cgi_plmn` and `tai_plmn`) and they can differ in a shared-RAN
-                // deployment, but `InitialUeMessageData` keeps only one and discards
-                // `tai_plmn` (`ngap_asn1.rs:357-368`). Not widened here: that is a
-                // different change, nothing in this tree distinguishes the two, and the
-                // three sites that go through `apply_user_location` do read them
-                // separately and get it right.
-                state.amf_ue.nr_cgi = crate::context::NrCgi {
-                    plmn_id: initial_ue.plmn_id.clone(),
-                    cell_id: initial_ue.nr_cell_identity,
-                };
-                state.amf_ue.access_type = 1; // 3GPP access
-                self.ue_auth_state.insert(amf_ue_ngap_id, state);
+                let (registration_request, integrity_protected) =
+                    idle_registration.unwrap_or_else(|| (nas.clone(), false));
+                // A verified request already moved the UE's own context to this id.
+                if !integrity_protected {
+                    let mut state = UeNasContext::new(
+                        amf_ue_ngap_id,
+                        initial_ue.ran_ue_ngap_id,
+                        association_id,
+                        crate::context::nas_security_canary(),
+                    );
+                    state.amf_ue.nr_tai = crate::context::Tai5gs {
+                        plmn_id: initial_ue.plmn_id.clone(),
+                        tac: initial_ue.tac,
+                    };
+                    // #406, the THIRD instance of the class: store the cell identity too.
+                    //
+                    // `parse_initial_ue_message_asn1` decodes `nr_cell_identity` off the
+                    // InitialUEMessage's own `UserLocationInformation`
+                    // (`ngap_asn1.rs:357-368`); before this it was LOGGED at `:1602-1607` and
+                    // then dropped, so `amf_ue.nr_cgi` had exactly one production writer
+                    // (`handle_handover_notify`) and an `ncgiList` Area of Interest could not
+                    // resolve for a UE that had never handed over — #400 recorded that as a
+                    // ceiling and #407 wrote a test pinning it.
+                    //
+                    // Worth doing because `ncgi` is not optional in what the AMF reports:
+                    // TS 29.571 §5.4.4.9's `NrLocation` makes both `tai` and `ncgi` `M`
+                    // (`29571-k00.txt:4674`, `:4689`), so without this half of a mandatory pair
+                    // was a default for every UE that had only ever registered.
+                    //
+                    // `initial_ue.plmn_id` is decoded from `nr_cgi_plmn` (`ngap_asn1.rs:364`),
+                    // so it is exactly the right source for `nr_cgi.plmn_id` — that IS the
+                    // NR-CGI's PLMN.
+                    //
+                    // NOTE a PRE-EXISTING inexactness this write inherits rather than
+                    // introduces: the `nr_tai` assignment immediately above uses the SAME
+                    // value, so the registration path stores the NR-CGI's PLMN as the TAI's
+                    // too. The IE carries them separately (`UserLocationInformation::Nr` has
+                    // both `nr_cgi_plmn` and `tai_plmn`) and they can differ in a shared-RAN
+                    // deployment, but `InitialUeMessageData` keeps only one and discards
+                    // `tai_plmn` (`ngap_asn1.rs:357-368`). Not widened here: that is a
+                    // different change, nothing in this tree distinguishes the two, and the
+                    // three sites that go through `apply_user_location` do read them
+                    // separately and get it right.
+                    state.amf_ue.nr_cgi = crate::context::NrCgi {
+                        plmn_id: initial_ue.plmn_id.clone(),
+                        cell_id: initial_ue.nr_cell_identity,
+                    };
+                    state.amf_ue.access_type = 1; // 3GPP access
+                    self.ue_auth_state.insert(amf_ue_ngap_id, state);
+                }
 
                 self.handle_registration_request_nas(
                     association_id,
                     amf_ue_ngap_id,
                     initial_ue.ran_ue_ngap_id,
-                    &nas,
-                    // InitialUEMessage: unprotected initial NAS message — the
-                    // §4.4.6 cleartext-IE gate applies.
-                    false,
+                    &registration_request,
+                    // An unprotected initial NAS message gets the §4.4.6 cleartext-IE
+                    // gate; a verified one (#609) carries every IE legitimately.
+                    integrity_protected,
                 )
                 .await?;
             }
@@ -2871,7 +2928,7 @@ impl NgapServer {
                             container.len()
                         );
                     }
-                } else if let Some(guti) = req.guti {
+                } else if let Some(guti) = req.guti.clone() {
                     state.amf_ue.old_guti = guti;
                 }
                 // PERSIST before the send, for the same reason as the SUCI arm above (#361):
@@ -2883,7 +2940,30 @@ impl NgapServer {
                 //
                 // Inserted BEFORE the `?` on the send, so a failed Identity Request leaves the
                 // recorded registration behind rather than discarding it (the #359 lesson).
+                //
+                // #609: a mobility registration update whose integrity was verified under
+                // the UE's current NAS security context needs neither identification nor
+                // a fresh authentication (TS 23.502 §4.2.2.2.2 step 9: authentication is
+                // optional). It is accepted under that context, as the periodic update
+                // above is. Re-authenticating instead would send an AUTHENTICATION REQUEST
+                // in the clear to a UE whose NAS security is active.
+                let accept_under_current_context = integrity_protected
+                    && !guti_mapped_from_eps
+                    && req.registration_type
+                        == crate::gmm_build::registration_type::MOBILITY_UPDATING
+                    && state.registered
+                    && state.amf_ue.security_context_available
+                    && req.guti.as_ref() == Some(&state.amf_ue.current_guti);
                 self.ue_auth_state.insert(amf_ue_ngap_id, state);
+                if accept_under_current_context {
+                    log::info!(
+                        "Mobility Registration Update from UE {amf_ue_ngap_id}, integrity \
+                         verified under its current NAS security context: accepted"
+                    );
+                    return self
+                        .send_registration_accept(association_id, amf_ue_ngap_id, ran_ue_ngap_id)
+                        .await;
+                }
 
                 // #352: decide what this 5G-GUTI actually is before asking for a SUCI.
                 //
@@ -5020,6 +5100,143 @@ impl NgapServer {
         UePolicyCreate::Attempted
     }
 
+    /// Move a UE's PDU sessions and SM context refs from the AMF UE NGAP ID it held
+    /// to the one its new N2 connection was given. A UE coming back from CM-IDLE
+    /// arrives under a fresh id (#518, #609).
+    fn rekey_ue_sessions(&mut self, old_id: u64, new_id: u64) {
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.sess_rekey_ue(old_id, new_id);
+        }
+        let moved: Vec<(u8, String)> = self
+            .sm_context_refs
+            .iter()
+            .filter(|((ue, _), _)| *ue == old_id)
+            .map(|((_, psi), r)| (*psi, r.clone()))
+            .collect();
+        for (psi, r) in moved {
+            self.sm_context_refs.remove(&(old_id, psi));
+            self.sm_context_refs.insert((new_id, psi), r);
+        }
+    }
+
+    /// Open an integrity-protected REGISTRATION REQUEST that arrived as an initial NAS
+    /// message, i.e. from 5GMM-IDLE over a NAS security context (#609).
+    ///
+    /// TS 24.501 §4.4.6: such a request carries the cleartext IEs only, integrity
+    /// protected (security header type 1), and the full request rides ciphered in the
+    /// NAS message container. The AMF finds the context by the cleartext 5G-GUTI,
+    /// checks the MAC under it, and deciphers the container.
+    ///
+    /// Returns the message to process and whether it was verified:
+    /// - `(full request, true)`: the MAC checked. The stored context has been moved to
+    ///   `amf_ue_ngap_id`, with this N2 connection's identifiers and location, and
+    ///   leaves CM-IDLE.
+    /// - `(cleartext request without the container, false)`: no context holds the
+    ///   5G-GUTI, or the MAC failed, or the container is not a REGISTRATION REQUEST.
+    ///   §4.4.6: the AMF then treats the message as if it carried no NAS message
+    ///   container, so it is processed as an unprotected initial request, which
+    ///   identifies or authenticates the UE (§5.5.1.3.4).
+    fn open_idle_registration_request(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        initial_ue: &crate::ngap_asn1::InitialUeMessageData,
+        nas: &[u8],
+        cleartext: &[u8],
+    ) -> (Vec<u8>, bool) {
+        let container = registration_request_container(cleartext);
+        let unverified = || {
+            let stripped = match &container {
+                Some((span, _)) => {
+                    let mut bytes = cleartext.to_vec();
+                    bytes.drain(span.clone());
+                    bytes
+                }
+                None => cleartext.to_vec(),
+            };
+            (stripped, false)
+        };
+
+        let guti = parse_registration_request_pdu(cleartext)
+            .filter(|req| req.identity_type == mobile_identity_type::GUTI)
+            .and_then(|req| req.guti);
+        let resolved = guti.and_then(|guti| {
+            self.ue_auth_state.snapshot().into_iter().find(|(_, st)| {
+                st.registered
+                    && st.amf_ue.security_context_available
+                    && st.amf_ue.current_guti == guti
+            })
+        });
+        let Some((old_id, mut state)) = resolved else {
+            log::info!(
+                "Integrity-protected Registration Request (initial UE {amf_ue_ngap_id}): no \
+                 security context holds its 5G-GUTI; processed as unprotected \
+                 (TS 24.501 §4.4.6)"
+            );
+            return unverified();
+        };
+
+        let decoded = nas_security::nas_5gs_security_decode(&mut state.amf_ue, nas[1], nas);
+        let mac_failed = std::mem::take(&mut state.amf_ue.mac_failed);
+        if decoded.is_err() || mac_failed {
+            log::warn!(
+                "Registration Request from CM-IDLE (UE {old_id}): integrity check failed; \
+                 processed as unprotected (TS 24.501 §4.4.6)"
+            );
+            return unverified();
+        }
+
+        let full = match &container {
+            Some((_, value)) => {
+                let mut value = value.clone();
+                if state.amf_ue.selected_enc_algorithm != 0 {
+                    nas_security::nas_encrypt(
+                        state.amf_ue.selected_enc_algorithm,
+                        &state.amf_ue.knas_enc,
+                        state.amf_ue.ul_count,
+                        state.amf_ue.access_type,
+                        nas_security::direction::UPLINK,
+                        &mut value,
+                    );
+                }
+                value
+            }
+            None => cleartext.to_vec(),
+        };
+        if full.get(2) != Some(&message_type::REGISTRATION_REQUEST)
+            || parse_registration_request_pdu(&full).is_none()
+        {
+            log::warn!(
+                "Registration Request from CM-IDLE (UE {old_id}): the NAS message container \
+                 is not a REGISTRATION REQUEST; processed as unprotected"
+            );
+            return unverified();
+        }
+
+        log::info!(
+            "Registration Request from CM-IDLE: UE {old_id} resumes as {amf_ue_ngap_id} \
+             (integrity verified, TS 24.501 §4.4.6)"
+        );
+        self.ue_auth_state.remove(old_id);
+        state.ran_ue_ngap_id = initial_ue.ran_ue_ngap_id;
+        state.association_id = association_id;
+        state.reachability = None;
+        state.cm_idle = false;
+        state.amf_ue.nr_tai = crate::context::Tai5gs {
+            plmn_id: initial_ue.plmn_id.clone(),
+            tac: initial_ue.tac,
+        };
+        state.amf_ue.nr_cgi = crate::context::NrCgi {
+            plmn_id: initial_ue.plmn_id.clone(),
+            cell_id: initial_ue.nr_cell_identity,
+        };
+        self.ue_auth_state.insert(amf_ue_ngap_id, state);
+        self.rekey_ue_sessions(old_id, amf_ue_ngap_id);
+        (full, true)
+    }
+
     /// Handle Service Request (TS 24.501 Section 5.6.1)
     /// A SERVICE REQUEST from a UE in CM-IDLE (TS 23.502 §4.2.3.2), arriving in an
     /// Initial UE Message with fresh NGAP IDs -- the response to a page (§4.2.3.3)
@@ -5163,21 +5380,7 @@ impl NgapServer {
 
         // The UE's PDU sessions are keyed by its AMF-UE-NGAP-ID; move them to the
         // new one, or every later lookup (and this one) misses them (#518).
-        {
-            let ctx = crate::context::amf_self();
-            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
-            guard.sess_rekey_ue(old_id, amf_ue_ngap_id);
-        }
-        let moved: Vec<(u8, String)> = self
-            .sm_context_refs
-            .iter()
-            .filter(|((ue, _), _)| *ue == old_id)
-            .map(|((_, psi), r)| (*psi, r.clone()))
-            .collect();
-        for (psi, r) in moved {
-            self.sm_context_refs.remove(&(old_id, psi));
-            self.sm_context_refs.insert((amf_ue_ngap_id, psi), r);
-        }
+        self.rekey_ue_sessions(old_id, amf_ue_ngap_id);
 
         // TS 24.501 §5.6.1.4.1 / TS 23.502 §4.2.3.2 steps 4-12: release what the UE
         // no longer has, re-activate what it has uplink data for (#518).
@@ -16079,6 +16282,205 @@ mod tests {
         });
         ue.cm_idle = true;
         ue
+    }
+
+    /// A plain REGISTRATION REQUEST (TS 24.501 §8.2.6) of `registration_type`,
+    /// ngKSI 1, identified by a 5G-GUTI (§9.11.3.4: type 0b010, PLMN 001/01, AMF
+    /// Region 0x02, AMF Set 0x155, AMF Pointer 0x2A) with this 5G-TMSI.
+    fn guti_registration_request(registration_type: u8, tmsi: u32) -> Vec<u8> {
+        let mut rr = vec![0x7E, 0x00, message_type::REGISTRATION_REQUEST];
+        rr.push(0x10 | registration_type);
+        rr.extend_from_slice(&[0x00, 0x0B, 0xF2, 0x00, 0xF1, 0x10, 0x02, 0x55, 0x6A]);
+        rr.extend_from_slice(&tmsi.to_be_bytes());
+        rr
+    }
+
+    /// What a UE with a NAS security context sends from 5GMM-IDLE (TS 24.501 §4.4.6):
+    /// the cleartext request, integrity protected (security header type 1), with
+    /// `full` ciphered in its NAS message container. Built under the keys and
+    /// algorithms of `ue`, for uplink NAS COUNT `count`.
+    fn protected_initial_registration(
+        ue: &AmfUe,
+        cleartext: &[u8],
+        full: &[u8],
+        count: u32,
+    ) -> Vec<u8> {
+        let mut container = full.to_vec();
+        nas_security::nas_encrypt(
+            ue.selected_enc_algorithm,
+            &ue.knas_enc,
+            count,
+            ue.access_type,
+            nas_security::direction::UPLINK,
+            &mut container,
+        );
+        let mut outer = cleartext.to_vec();
+        outer.push(0x71);
+        outer.extend_from_slice(&(container.len() as u16).to_be_bytes());
+        outer.extend_from_slice(&container);
+        let sqn = (count & 0xFF) as u8;
+        let mut mac_input = vec![sqn];
+        mac_input.extend_from_slice(&outer);
+        let mac = nas_security::nas_mac_calculate(
+            ue.selected_int_algorithm,
+            &ue.knas_int,
+            count,
+            ue.access_type,
+            nas_security::direction::UPLINK,
+            &mac_input,
+        );
+        let mut nas = vec![0x7E, 0x01];
+        nas.extend_from_slice(&mac);
+        nas.push(sqn);
+        nas.extend_from_slice(&outer);
+        nas
+    }
+
+    /// A registered CM-IDLE UE under `old_id` whose NAS security context is real
+    /// (128-NIA2 / 128-NEA2), holding the 5G-GUTI `guti_registration_request` names.
+    fn idle_ue_with_security(old_id: u64, tmsi: u32) -> UeNasContext {
+        let mut ue = idle_registered_ue(old_id);
+        let guti = parse_registration_request_pdu(&guti_registration_request(
+            crate::gmm_build::registration_type::PERIODIC_UPDATING,
+            tmsi,
+        ))
+        .and_then(|req| req.guti)
+        .expect("the fixture's 5G-GUTI parses");
+        ue.amf_ue.current_guti = guti;
+        ue.amf_ue.supi = Some(format!("imsi-0010100006{:05}", old_id % 100_000));
+        ue.amf_ue.selected_int_algorithm = 2;
+        ue.amf_ue.selected_enc_algorithm = 2;
+        ue.amf_ue.knas_int = [0x11; 16];
+        ue.amf_ue.knas_enc = [0x22; 16];
+        ue.amf_ue.access_type = 1;
+        ue.amf_ue.ul_count = 4;
+        ue.amf_ue.ul_count_established = true;
+        ue
+    }
+
+    /// #609: a periodic registration update from CM-IDLE, sent as TS 24.501 §4.4.6
+    /// requires (integrity protected, full request ciphered in the NAS message
+    /// container), resumes the UE's own context under the new N2 connection: found by
+    /// its 5G-GUTI, MAC verified, container deciphered. Its session moves with it.
+    ///
+    /// On main the request is dropped as "Unhandled NAS message type" (octet 3 is a
+    /// MAC octet), so no context exists under the new id and the old one stays idle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_protected_registration_from_cm_idle_resumes_the_ues_own_context() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let old_id = 6_090_101u64;
+        let new_id = 6_090_102u64;
+        let tmsi = 0x0609_0101u32;
+        let stored = idle_ue_with_security(old_id, tmsi);
+        let supi = stored.amf_ue.supi.clone();
+        let rr =
+            guti_registration_request(crate::gmm_build::registration_type::PERIODIC_UPDATING, tmsi);
+        let nas = protected_initial_registration(&stored.amf_ue, &rr, &rr, 5);
+        ngap.ue_auth_state.insert(old_id, stored);
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.sess_add(old_id, 5).expect("PSI 5");
+        }
+        *ngap.next_gnb_id.lock().await = new_id;
+
+        // The Registration Accept cannot be sent over this fixture's transport.
+        let _ = ngap
+            .handle_initial_ue_message(1, &service_request_initial_ue(nas))
+            .await;
+
+        let resumed = ngap
+            .ue_auth_state
+            .get(new_id)
+            .expect("the UE's context resumes under the new AMF UE NGAP ID");
+        assert_eq!(resumed.amf_ue.supi, supi, "it is the UE's OWN context");
+        assert!(
+            resumed.registered && !resumed.cm_idle,
+            "and it left CM-IDLE"
+        );
+        assert_eq!(resumed.ran_ue_ngap_id, 512, "on the new N2 connection");
+        assert_eq!(resumed.amf_ue.ul_count, 5, "the verified uplink NAS COUNT");
+        assert!(!ngap.ue_auth_state.contains(old_id), "nothing stays behind");
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            guard.sess_find_by_psi(new_id, 5).is_some(),
+            "the UE's PDU session moves to the new id"
+        );
+        if let Some(sess) = guard.sess_find_by_psi(new_id, 5) {
+            guard.sess_remove(sess.id);
+        }
+        drop(guard);
+        ngap.ue_auth_state.remove(new_id);
+    }
+
+    /// #609: a request whose MAC does not verify does not resume anything
+    /// (TS 24.501 §4.4.6, TS 33.501 §6.4.6). The stored context stays where it is, and
+    /// the request is processed as an unprotected one under the new id, without its
+    /// container and without the stored identity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_registration_from_cm_idle_failing_its_mac_resumes_nothing() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let old_id = 6_090_201u64;
+        let new_id = 6_090_202u64;
+        let tmsi = 0x0609_0201u32;
+        let stored = idle_ue_with_security(old_id, tmsi);
+        let rr =
+            guti_registration_request(crate::gmm_build::registration_type::PERIODIC_UPDATING, tmsi);
+        let mut nas = protected_initial_registration(&stored.amf_ue, &rr, &rr, 5);
+        nas[2] ^= 0xFF; // corrupt the MAC
+        ngap.ue_auth_state.insert(old_id, stored);
+        *ngap.next_gnb_id.lock().await = new_id;
+
+        let _ = ngap
+            .handle_initial_ue_message(1, &service_request_initial_ue(nas))
+            .await;
+
+        let kept = ngap
+            .ue_auth_state
+            .get(old_id)
+            .expect("the stored context stays");
+        assert!(kept.cm_idle, "still CM-IDLE");
+        assert_eq!(kept.amf_ue.ul_count, 4, "and no COUNT was committed for it");
+        assert!(
+            ngap.ue_auth_state
+                .get(new_id)
+                .is_none_or(|s| s.amf_ue.supi.is_none()),
+            "the unverified request takes nothing from the stored context"
+        );
+        ngap.ue_auth_state.remove(old_id);
+        ngap.ue_auth_state.remove(new_id);
+    }
+
+    #[test]
+    fn the_container_of_a_registration_request_is_found_by_structure() {
+        let rr = guti_registration_request(
+            crate::gmm_build::registration_type::MOBILITY_UPDATING,
+            0x0609_0301,
+        );
+        let mut with = rr.clone();
+        // A value that itself contains the IEI octet 0x71.
+        with.extend_from_slice(&[0x71, 0x00, 0x03, 0x71, 0x00, 0x01]);
+        let (span, value) = registration_request_container(&with).expect("container");
+        assert_eq!(value, vec![0x71, 0x00, 0x01]);
+        assert_eq!(span, rr.len()..with.len());
+        assert!(registration_request_container(&rr).is_none());
+        let protected = protected_initial_registration(
+            &idle_ue_with_security(1, 0x0609_0301).amf_ue,
+            &rr,
+            &rr,
+            5,
+        );
+        assert_eq!(
+            initial_protected_registration_request(&protected).map(|c| c[2]),
+            Some(message_type::REGISTRATION_REQUEST)
+        );
+        assert!(
+            initial_protected_registration_request(&rr).is_none(),
+            "plain is not"
+        );
     }
 
     fn service_request_initial_ue(nas: Vec<u8>) -> Vec<u8> {
