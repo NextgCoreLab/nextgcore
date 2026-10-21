@@ -36,6 +36,53 @@ const N3_UL_PDR_ID: u16 = 3;
 /// The FAR the EPS establishment created for the downlink (FAR 2), which execution switches
 /// to the target NG-RAN.
 const DL_FAR_ID: u32 = 2;
+/// The EPS establishment's uplink FAR (FAR 1, to the data network) and its URR.
+const UL_FAR_ID: u32 = 1;
+
+/// #583: per-bearer N4 rule ids, offset by the EBI (5..=15), so every bearer's rules are
+/// distinct, stable across the procedure, and removable without having been recorded.
+///
+/// - `0x10 + EBI`: a dedicated bearer's N3 uplink PDR (QFI = EBI) and its QER (MBR, GBR).
+/// - `0x30 + EBI`: a dedicated bearer's downlink PDR (its TFT's downlink filters), installed
+///   at execution through FAR 2 and the bearer's QER, so its packets leave on N3 marked with
+///   its QFI.
+/// - `0x50 + EBI`: a bearer's indirect-forwarding PDR and QER (TS 23.502 §4.11.1.2.2.2 step
+///   12); `FORWARDING_FAR_ID` is the one FAR they share, toward the target NG-RAN's DL
+///   forwarding tunnel.
+const DEDICATED_RULE_BASE: u8 = 0x10;
+const DEDICATED_DL_PDR_BASE: u16 = 0x30;
+const FORWARDING_RULE_BASE: u8 = 0x50;
+const FORWARDING_FAR_ID: u32 = 0x50;
+/// Precedence of a dedicated bearer's DL PDR: ahead of the default bearer's catch-all PDR 2
+/// (precedence 100; lower wins, TS 29.244 §8.2.11), as a TFT's filters are ahead of the
+/// match-all default.
+const DEDICATED_DL_PRECEDENCE: u32 = 50;
+/// Precedence of a forwarding PDR. It detects on its own F-TEID only, so it can never
+/// shadow another PDR's traffic.
+const FORWARDING_PRECEDENCE: u32 = 10;
+
+/// GTPv2 F-TEID interface types (TS 29.274 §8.22).
+const IFTYPE_ENB_GNB_DL_FORWARDING: u8 = 19;
+const IFTYPE_SGW_UPF_DL_FORWARDING: u8 = 23;
+/// Bearer Context (Table 7.3.2-2) F-TEID instances: *"eNodeB/gNodeB F-TEID for DL data
+/// forwarding"* (direct) and *"SGW/UPF F-TEID for DL data forwarding"* (indirect).
+const BC_INSTANCE_DIRECT_DL_FORWARDING: u8 = 0;
+const BC_INSTANCE_INDIRECT_DL_FORWARDING: u8 = 2;
+
+/// How long the UPF keeps the indirect forwarding tunnels after execution (TS 23.502
+/// §4.11.1.2.2.3 step 7 / step 14: *"a timer ... is started to supervise when resources in
+/// UPF (for indirect data forwarding) shall be released"*). The spec gives no value;
+/// `SMF_INDIRECT_FORWARDING_TIMER_MS` overrides this default.
+const INDIRECT_FORWARDING_TIMER_MS: u64 = 3_000;
+
+fn indirect_forwarding_timer() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        std::env::var("SMF_INDIRECT_FORWARDING_TIMER_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(INDIRECT_FORWARDING_TIMER_MS),
+    )
+}
 
 /// Whether a `SmContextCreateData` is an EPS→5GS handover preparation using N26 (TS 29.502
 /// §5.2.2.2.3): `hoState: PREPARING` with the UE EPS PDN connection.
@@ -190,13 +237,19 @@ async fn pfcp_create_n3_uplink(
 /// target while still accepting uplink from a source that has already gone — or the other
 /// way round. SNDEM is set: *"For each EPS Bearer one or more 'end marker' is sent to Serving
 /// GW by the UPF+PGW-U immediately after switching the path"*.
+///
+/// #583: the same modification installs each dedicated bearer's downlink as a QoS flow --
+/// a PDR on its TFT's downlink filters, through FAR 2 (now the target's N3 tunnel) and the
+/// bearer's QER, so its packets leave marked with its QFI. `dedicated_dl` is `(EBI, filters)`.
 async fn pfcp_switch_to_ngran(
     smf_n4_seid: u64,
     upf_seid: u64,
     gnb_teid: u32,
     gnb_addr: [u8; 4],
+    ue_ip: Option<[u8; 4]>,
+    dedicated_dl: &[(u8, Vec<String>)],
 ) -> anyhow::Result<()> {
-    use crate::n4_build::SessionModificationParams;
+    use crate::n4_build::{PdrParams, SessionModificationParams};
     let params = SessionModificationParams {
         update_fars_activate: vec![(
             DL_FAR_ID,
@@ -205,6 +258,21 @@ async fn pfcp_switch_to_ngran(
             true,
         )],
         remove_pdr_ids: vec![S5U_UL_PDR_ID],
+        create_pdrs: dedicated_dl
+            .iter()
+            .map(|(ebi, filters)| PdrParams {
+                pdr_id: DEDICATED_DL_PDR_BASE + u16::from(*ebi),
+                precedence: DEDICATED_DL_PRECEDENCE,
+                source_interface: 1, // Core
+                ue_ip_address: ue_ip.map(|ip| (Some(ip), None, false)),
+                sdf_filters: filters.clone(),
+                far_id: Some(DL_FAR_ID),
+                qer_id: Some(u32::from(DEDICATED_RULE_BASE + ebi)),
+                qfi: Some(*ebi),
+                urr_ids: vec![crate::SESSION_URR_ID],
+                ..Default::default()
+            })
+            .collect(),
         ..Default::default()
     };
     crate::pfcp_modify_with(smf_n4_seid, upf_seid, &params)
@@ -212,30 +280,256 @@ async fn pfcp_switch_to_ngran(
         .map(|_| ())
 }
 
-/// CANCELLED: remove the N3 uplink PDR step 6 created.
-async fn pfcp_remove_n3_uplink(smf_n4_seid: u64, upf_seid: u64) -> anyhow::Result<()> {
+/// CANCELLED: remove what the preparation installed -- the N3 uplink PDR step 6 created,
+/// the dedicated bearers' uplink PDRs and QERs, and any indirect forwarding tunnel.
+async fn pfcp_remove_n3_uplink(
+    smf_n4_seid: u64,
+    upf_seid: u64,
+    dedicated_ebis: &[u8],
+    forwarding_ebis: &[u8],
+) -> anyhow::Result<()> {
     use crate::n4_build::SessionModificationParams;
-    let params = SessionModificationParams {
-        remove_pdr_ids: vec![N3_UL_PDR_ID],
+    let mut params = SessionModificationParams {
+        remove_pdr_ids: std::iter::once(N3_UL_PDR_ID)
+            .chain(
+                dedicated_ebis
+                    .iter()
+                    .map(|&e| u16::from(DEDICATED_RULE_BASE + e)),
+            )
+            .collect(),
+        remove_qer_ids: dedicated_ebis
+            .iter()
+            .map(|&e| u32::from(DEDICATED_RULE_BASE + e))
+            .collect(),
         ..Default::default()
     };
+    remove_forwarding(&mut params, forwarding_ebis);
     crate::pfcp_modify_with(smf_n4_seid, upf_seid, &params)
         .await
         .map(|_| ())
 }
 
-/// A TS 29.274 §8.28 Bearer Context IE (type 93, header included) naming one EBI — the
-/// `EpsBearerContainer` element of `SmContextUpdatedData.epsBearerSetup` (TS 29.502
-/// §6.1.6.2.3, TS 23.502 step 13: *"The data forwarding information is included in the EPS
-/// Bearer Setup List"*). No forwarding F-TEIDs: this SMF offers no indirect forwarding
-/// tunnel, so the EBI is the whole of what is set up.
-fn eps_bearer_setup_element(ebi: u8) -> Vec<u8> {
-    use nextgcore_gtp::v2::{Gtp2BearerContextIe, Gtp2EbiIe};
+/// A data-forwarding tunnel for one EPS bearer, as the MME receives it in the Forward
+/// Relocation Response's Bearer Context (TS 29.274 Table 7.3.2-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BearerForwarding {
+    /// Direct: the target NG-RAN's per-E-RAB DL forwarding tunnel (instance 0, type 19).
+    Direct(u32, [u8; 4]),
+    /// Indirect: the UPF's F-TEID the source SGW forwards into (instance 2, type 23).
+    Indirect(u32, [u8; 4]),
+}
+
+/// A TS 29.274 §8.28 Bearer Context IE (type 93, header included) -- the `EpsBearerContainer`
+/// element of `SmContextUpdatedData.epsBearerSetup` (TS 29.502 §6.1.6.2.3; TS 23.502 step 13:
+/// *"The data forwarding information is included in the EPS Bearer Setup List"*): the EBI and,
+/// when the bearer's downlink is forwarded, the tunnel the source forwards it to.
+fn eps_bearer_setup_element(ebi: u8, forwarding: Option<BearerForwarding>) -> Vec<u8> {
+    use nextgcore_gtp::v2::{Gtp2BearerContextIe, Gtp2EbiIe, Gtp2FTeidIe};
     let mut bearer = Gtp2BearerContextIe::new();
     bearer.add_ie(Gtp2EbiIe::new(ebi).to_ie(0));
+    match forwarding {
+        Some(BearerForwarding::Direct(teid, addr)) => bearer.add_ie(
+            Gtp2FTeidIe::new_ipv4(IFTYPE_ENB_GNB_DL_FORWARDING, teid, addr)
+                .to_ie(BC_INSTANCE_DIRECT_DL_FORWARDING),
+        ),
+        Some(BearerForwarding::Indirect(teid, addr)) => bearer.add_ie(
+            Gtp2FTeidIe::new_ipv4(IFTYPE_SGW_UPF_DL_FORWARDING, teid, addr)
+                .to_ie(BC_INSTANCE_INDIRECT_DL_FORWARDING),
+        ),
+        None => {}
+    }
     let mut buf = bytes::BytesMut::new();
     bearer.to_ie(0).encode(&mut buf);
     buf.to_vec()
+}
+
+/// Every Created PDR (IE 8) in a Session Modification Response, as `(PDR ID, F-TEID, IPv4)`
+/// (TS 29.244 §7.5.5.2). The F-TEID's V4 flag is bit 1 (§8.2.3).
+fn created_pdr_fteids(body: &[u8]) -> Vec<(u16, u32, [u8; 4])> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    while off + 4 <= body.len() {
+        let t = u16::from_be_bytes([body[off], body[off + 1]]);
+        let l = usize::from(u16::from_be_bytes([body[off + 2], body[off + 3]]));
+        let Some(v) = body.get(off + 4..off + 4 + l) else {
+            break;
+        };
+        if t == 8 {
+            let id = crate::pfcp_path::find_ie(v, 56)
+                .filter(|id| id.len() >= 2)
+                .map(|id| u16::from_be_bytes([id[0], id[1]]));
+            let fteid = crate::pfcp_path::find_ie(v, 21)
+                .filter(|f| f.len() >= 9 && f[0] & 0x01 != 0)
+                .map(|f| {
+                    (
+                        u32::from_be_bytes([f[1], f[2], f[3], f[4]]),
+                        [f[5], f[6], f[7], f[8]],
+                    )
+                });
+            if let (Some(id), Some((teid, addr))) = (id, fteid) {
+                out.push((id, teid, addr));
+            }
+        }
+        off += 4 + l;
+    }
+    out
+}
+
+/// A dedicated bearer's QER: its MBR and, for a GBR bearer, its GBR, with QFI = EBI so the
+/// UPF marks its N3 packets (TS 29.244 §5.4.1; TS 23.501 §5.7.1).
+fn dedicated_qer(bearer: &context::SmfBearer) -> crate::n4_build::QerParams {
+    let q = &bearer.qos;
+    crate::n4_build::QerParams {
+        qer_id: u32::from(DEDICATED_RULE_BASE + bearer.ebi),
+        gate_status: (0, 0),
+        mbr: (q.mbr_uplink > 0 || q.mbr_downlink > 0).then_some((q.mbr_uplink, q.mbr_downlink)),
+        gbr: (q.gbr_uplink > 0 || q.gbr_downlink > 0).then_some((q.gbr_uplink, q.gbr_downlink)),
+        qfi: Some(bearer.ebi),
+    }
+}
+
+/// The downlink SDF filters of a bearer's TFT (its packet filters that apply downlink).
+fn downlink_filters(bearer: &context::SmfBearer) -> Vec<String> {
+    let handle = smf_self();
+    let Ok(ctx) = handle.read() else {
+        return Vec::new();
+    };
+    bearer
+        .pf_ids
+        .iter()
+        .filter_map(|&id| ctx.pf_find_by_id(id))
+        .filter(|pf| pf.direction != context::FlowDirection::UplinkOnly)
+        .filter_map(|pf| pf.flow_description)
+        .collect()
+}
+
+/// #583, step 6 for the dedicated bearers: every EPS bearer becomes a QoS flow at the UPF.
+///
+/// One uplink PDR per dedicated bearer on the SAME N3 F-TEID the default flow got (a PDU
+/// session has one N3 tunnel; its flows are told apart by QFI, TS 29.244 §5.2.1), forwarding
+/// through the session's uplink FAR and URR, policed by the bearer's own QER (MBR, GBR). It
+/// is a second modification because the F-TEID is only known from the first one's answer.
+async fn pfcp_create_dedicated_uplinks(
+    smf_n4_seid: u64,
+    upf_seid: u64,
+    n3_ul: (u32, [u8; 4]),
+    dedicated: &[context::SmfBearer],
+) -> anyhow::Result<()> {
+    use crate::n4_build::{PdrParams, SessionModificationParams};
+    let params = SessionModificationParams {
+        create_qers: dedicated.iter().map(dedicated_qer).collect(),
+        create_pdrs: dedicated
+            .iter()
+            .map(|b| PdrParams {
+                pdr_id: u16::from(DEDICATED_RULE_BASE + b.ebi),
+                precedence: 100,
+                source_interface: 0, // Access
+                f_teid: Some((n3_ul.0, Some(n3_ul.1), None)),
+                outer_header_removal: Some(0),
+                far_id: Some(UL_FAR_ID),
+                qer_id: Some(u32::from(DEDICATED_RULE_BASE + b.ebi)),
+                qfi: Some(b.ebi),
+                urr_ids: vec![crate::SESSION_URR_ID],
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    crate::pfcp_modify_with(smf_n4_seid, upf_seid, &params)
+        .await
+        .map(|_| ())
+}
+
+/// #583, preparation step 12, indirect forwarding: *"SMF+PGW-C indicates the mapping between
+/// the TEID where the UPF receives data forwarded by the source SGW and the QFI(s) and N3
+/// Tunnel Info for data forwarding"*.
+///
+/// Per bearer: a PDR on a UPF-chosen F-TEID (the tunnel the SGW forwards that bearer into)
+/// and a QER with QFI = EBI; all share one FAR toward the target NG-RAN's DL forwarding
+/// tunnel. Returns the UPF's F-TEID per EBI.
+async fn pfcp_create_indirect_forwarding(
+    smf_n4_seid: u64,
+    upf_seid: u64,
+    target: (u32, [u8; 4]),
+    ebis: &[u8],
+) -> anyhow::Result<Vec<(u8, (u32, [u8; 4]))>> {
+    use crate::n4_build::{FarParams, PdrParams, QerParams, SessionModificationParams};
+    let params = SessionModificationParams {
+        create_fars: vec![FarParams {
+            far_id: FORWARDING_FAR_ID,
+            apply_action: crate::n4_build::apply_action::FORW,
+            destination_interface: Some(0), // Access: toward the target NG-RAN
+            outer_header_creation: Some((0x0100, target.0, Some(target.1), None)),
+            network_instance: None,
+        }],
+        create_qers: ebis
+            .iter()
+            .map(|&ebi| QerParams {
+                qer_id: u32::from(FORWARDING_RULE_BASE + ebi),
+                gate_status: (0, 0),
+                mbr: None,
+                gbr: None,
+                qfi: Some(ebi),
+            })
+            .collect(),
+        create_pdrs: ebis
+            .iter()
+            .map(|&ebi| PdrParams {
+                pdr_id: u16::from(FORWARDING_RULE_BASE + ebi),
+                precedence: FORWARDING_PRECEDENCE,
+                source_interface: 0,           // Access: from the source SGW
+                f_teid: Some((0, None, None)), // CHOOSE
+                outer_header_removal: Some(0),
+                far_id: Some(FORWARDING_FAR_ID),
+                qer_id: Some(u32::from(FORWARDING_RULE_BASE + ebi)),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let body = crate::pfcp_modify_with(smf_n4_seid, upf_seid, &params).await?;
+    let created = created_pdr_fteids(&body);
+    ebis.iter()
+        .map(|&ebi| {
+            created
+                .iter()
+                .find(|(id, ..)| *id == u16::from(FORWARDING_RULE_BASE + ebi))
+                .map(|&(_, teid, addr)| (ebi, (teid, addr)))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("the UPF allocated no forwarding F-TEID for EBI {ebi}")
+                })
+        })
+        .collect()
+}
+
+/// The N4 rules that remove the indirect forwarding tunnels of `ebis`.
+fn remove_forwarding(params: &mut crate::n4_build::SessionModificationParams, ebis: &[u8]) {
+    if ebis.is_empty() {
+        return;
+    }
+    params
+        .remove_pdr_ids
+        .extend(ebis.iter().map(|&e| u16::from(FORWARDING_RULE_BASE + e)));
+    params.remove_far_ids.push(FORWARDING_FAR_ID);
+    params
+        .remove_qer_ids
+        .extend(ebis.iter().map(|&e| u32::from(FORWARDING_RULE_BASE + e)));
+}
+
+/// Execution step 14: release the indirect forwarding tunnels once the timer started at
+/// step 7 expires.
+async fn pfcp_release_forwarding(smf_n4_seid: u64, upf_seid: u64, ebis: &[u8]) {
+    let mut params = crate::n4_build::SessionModificationParams::default();
+    remove_forwarding(&mut params, ebis);
+    match crate::pfcp_modify_with(smf_n4_seid, upf_seid, &params).await {
+        Ok(_) => log::info!(
+            "EPS→5GS step 14: indirect forwarding tunnels for EBIs {ebis:?} released at the UPF"
+        ),
+        Err(e) => log::warn!(
+            "EPS→5GS step 14: the indirect forwarding tunnels for EBIs {ebis:?} were not \
+             released: {e}"
+        ),
+    }
 }
 
 /// TS 29.502 §5.2.2.2.3: the SMF's answer to an EPS→5GS handover preparation.
@@ -349,6 +643,32 @@ pub(crate) async fn handle_create(body: &serde_json::Value) -> SbiResponse {
         },
     };
 
+    // #583: every mapped EPS bearer is a QoS flow at the UPF, not the default one only.
+    let dedicated: Vec<context::SmfBearer> = bearers
+        .iter()
+        .filter(|b| b.ebi != default_bearer.ebi)
+        .cloned()
+        .collect();
+    if existing.is_none() && !dedicated.is_empty() {
+        if let Err(e) =
+            pfcp_create_dedicated_uplinks(smf_n4_seid, upf_seid, n3_ul, &dedicated).await
+        {
+            log::error!(
+                "[{supi}] EPS→5GS step 6: the UPF did not install the dedicated bearers' QoS \
+                 flows (EBIs {:?}): {e}",
+                dedicated.iter().map(|b| b.ebi).collect::<Vec<_>>()
+            );
+            if let Err(e) = pfcp_remove_n3_uplink(smf_n4_seid, upf_seid, &[], &[]).await {
+                log::warn!("[{supi}] and the N3 uplink PDR was not removed: {e}");
+            }
+            return crate::problem_response(
+                504,
+                "UPF_NOT_RESPONDING",
+                "the UPF did not install the dedicated bearers' QoS flows",
+            );
+        }
+    }
+
     let n2 = match build_handover_setup_request_transfer(&sess, &bearers, n3_ul, forwarding) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -373,6 +693,8 @@ pub(crate) async fn handle_create(body: &serde_json::Value) -> SbiResponse {
     sess.handover.n3_ul_pdr_id = Some(N3_UL_PDR_ID);
     sess.handover.data_forwarding_not_possible = forwarding.not_possible();
     sess.handover.indirect_data_forwarding = forwarding.indirect;
+    sess.handover.direct_data_forwarding = forwarding.direct;
+    sess.handover.forwarding_ebis.clear();
     let dnn = sess.session_name.clone().unwrap_or_default();
     let sd_hex = sess.s_nssai.sd.map(|sd| format!("{sd:06x}"));
     {
@@ -473,10 +795,18 @@ pub(crate) async fn handle_create(body: &serde_json::Value) -> SbiResponse {
 
 /// TS 29.502 §5.2.2.3.4.2 step 3 → 4a: the target NG-RAN's acknowledge, relayed in a
 /// PREPARED update. Records its DL N3 endpoint and answers the EPS Bearer Setup List for an
-/// EPS→5GS context. The user plane is NOT touched (§5.2.2.3.4.1, PREPARED).
-pub(crate) fn handle_prepared(sm_context_ref: &str, transfer: &[u8]) -> SbiResponse {
-    let dl = match crate::n2_transfer::parse_handover_request_acknowledge_transfer(transfer) {
-        Ok(dl) => dl,
+/// EPS→5GS context. The DL path is NOT switched (§5.2.2.3.4.1, PREPARED).
+///
+/// #583, TS 23.502 §4.11.1.2.2.2 steps 10-13, data forwarding. Each bearer whose QoS flow
+/// the target accepted for forwarding gets a forwarding tunnel in its Bearer Context:
+///
+/// - **direct** (the AMF said `directForwardingFlag`): the target's own per-E-RAB tunnel from
+///   the Data Forwarding Response E-RAB List, nothing at the UPF;
+/// - **indirect** (`indirectForwardingFlag`): step 12's UPF tunnel, one per bearer, which the
+///   UPF relays to the target's per-session DL Forwarding UP TNL Information, adding the QFI.
+pub(crate) async fn handle_prepared(sm_context_ref: &str, transfer: &[u8]) -> SbiResponse {
+    let ack = match crate::n2_transfer::parse_handover_request_acknowledge_transfer(transfer) {
+        Ok(ack) => ack,
         Err(e) => {
             log::warn!("SM Context Update (PREPARED) for ref={sm_context_ref}: undecodable HandoverRequestAcknowledgeTransfer: {e}");
             return crate::problem_400(
@@ -485,20 +815,20 @@ pub(crate) fn handle_prepared(sm_context_ref: &str, transfer: &[u8]) -> SbiRespo
             );
         }
     };
-    let Some(gnb_addr) = dl.ipv4() else {
+    let Some(gnb_addr) = ack.dl.ipv4() else {
         return crate::problem_400(
             "N2_SM_ERROR",
             "the target's DL N3 endpoint is not an IPv4 address this SMF can forward to",
         );
     };
-    let gnb_teid = dl.teid;
-    let accepted: Vec<u8> = dl.qfis;
+    let gnb_teid = ack.dl.teid;
+    let accepted: Vec<u8> = ack.dl.qfis.clone();
 
-    let handle = smf_self();
-    let Ok(ctx) = handle.read() else {
-        return SbiResponse::with_status(500);
-    };
-    let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) else {
+    let Some(mut sess) = smf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| ctx.sess_find_by_sm_context_ref(sm_context_ref))
+    else {
         return crate::problem_response(
             404,
             "CONTEXT_NOT_FOUND",
@@ -510,34 +840,100 @@ pub(crate) fn handle_prepared(sm_context_ref: &str, transfer: &[u8]) -> SbiRespo
     sess.handover.target_dl_known = true;
     sess.handover.prepared = true;
     let eps = sess.handover.eps_to_5gs;
-    ctx.sess_update(&sess);
 
     let mut root = serde_json::json!({ "hoState": "PREPARED" });
     if eps {
         // TS 23.502 §4.11.1.2.2.2 step 12: *"The EPS Bearer Setup list is a list of EPS bearer
         // Identifiers successfully handover to 5GC, which is generated based on the list of
         // accepted QFI(s)"* — QFI = EBI on this path, so an accepted QFI names its bearer.
-        let set_up: Vec<String> = sess
-            .bearer_ids
+        let set_up: Vec<u8> = session_bearers(&sess)
             .iter()
-            .filter_map(|&b| ctx.bearer_find_by_id(b))
             .filter(|b| accepted.contains(&b.ebi))
-            .map(|b| {
+            .map(|b| b.ebi)
+            .collect();
+        let forwarded: Vec<u8> = set_up
+            .iter()
+            .copied()
+            .filter(|ebi| ack.forwarding_accepted_qfis.contains(ebi))
+            .collect();
+        let mut tunnels: Vec<(u8, BearerForwarding)> = Vec::new();
+        if sess.handover.direct_data_forwarding {
+            for (erab, tunnel) in &ack.erab_forwarding {
+                match tunnel.ipv4() {
+                    Some(addr) if set_up.contains(erab) => {
+                        tunnels.push((*erab, BearerForwarding::Direct(tunnel.teid, addr)))
+                    }
+                    _ => log::warn!(
+                        "PREPARED for ref={sm_context_ref}: direct forwarding tunnel for E-RAB \
+                         {erab} not used (not a set-up bearer, or not IPv4)"
+                    ),
+                }
+            }
+        }
+        let indirect: Vec<u8> = forwarded
+            .iter()
+            .copied()
+            .filter(|ebi| !tunnels.iter().any(|(e, _)| e == ebi))
+            .collect();
+        let target_forwarding = ack
+            .dl_forwarding
+            .as_ref()
+            .and_then(|t| t.ipv4().map(|addr| (t.teid, addr)));
+        if sess.handover.indirect_data_forwarding && !indirect.is_empty() {
+            match (target_forwarding, crate::lookup_upf_seid(sm_context_ref)) {
+                (Some(target), Some(upf_seid)) => {
+                    match pfcp_create_indirect_forwarding(
+                        crate::smf_n4_seid_for(sm_context_ref),
+                        upf_seid,
+                        target,
+                        &indirect,
+                    )
+                    .await
+                    {
+                        Ok(allocated) => {
+                            sess.handover.forwarding_ebis = indirect.clone();
+                            for (ebi, (teid, addr)) in allocated {
+                                tunnels.push((ebi, BearerForwarding::Indirect(teid, addr)));
+                            }
+                        }
+                        Err(e) => log::warn!(
+                            "PREPARED for ref={sm_context_ref}: the UPF did not set up indirect \
+                             forwarding for EBIs {indirect:?} ({e}); the bearers hand over \
+                             without it and their in-flight downlink is lost"
+                        ),
+                    }
+                }
+                (None, _) => log::info!(
+                    "PREPARED for ref={sm_context_ref}: the target accepted forwarding for \
+                     EBIs {indirect:?} but assigned no IPv4 DL Forwarding UP TNL Information"
+                ),
+                (_, None) => log::warn!(
+                    "PREPARED for ref={sm_context_ref}: no N4 session for indirect forwarding"
+                ),
+            }
+        }
+        let elements: Vec<String> = set_up
+            .iter()
+            .map(|&ebi| {
                 use base64::Engine as _;
-                base64::engine::general_purpose::STANDARD.encode(eps_bearer_setup_element(b.ebi))
+                let forwarding = tunnels.iter().find(|(e, _)| *e == ebi).map(|(_, t)| *t);
+                base64::engine::general_purpose::STANDARD
+                    .encode(eps_bearer_setup_element(ebi, forwarding))
             })
             .collect();
         log::info!(
             "SM Context Update (PREPARED) for ref={sm_context_ref}: target DL N3 \
-             {}.{}.{}.{} TEID 0x{gnb_teid:08x}, accepted QFIs {accepted:?}, {} EPS bearer(s) \
-             set up; DL still on S5/S8-U until execution",
+             {}.{}.{}.{} TEID 0x{gnb_teid:08x}, accepted QFIs {accepted:?}, EPS bearers set up \
+             {set_up:?}, forwarding {tunnels:?}; DL still on S5/S8-U until execution",
             gnb_addr[0],
             gnb_addr[1],
             gnb_addr[2],
             gnb_addr[3],
-            set_up.len()
         );
-        root["epsBearerSetup"] = serde_json::json!(set_up);
+        root["epsBearerSetup"] = serde_json::json!(elements);
+    }
+    if let Ok(ctx) = smf_self().read() {
+        ctx.sess_update(&sess);
     }
     SbiResponse::with_status(200).with_body(root.to_string(), "application/json")
 }
@@ -590,8 +986,35 @@ pub(crate) async fn handle_completed(
         return completed();
     };
     let smf_n4_seid = crate::smf_n4_seid_for(sm_context_ref);
+    let forwarding_ebis = sess
+        .as_ref()
+        .map(|s| s.handover.forwarding_ebis.clone())
+        .unwrap_or_default();
     let switched = if was_eps {
-        pfcp_switch_to_ngran(smf_n4_seid, upf_seid, teid, addr).await
+        let (ue_ip, dedicated_dl) = sess.as_ref().map_or((None, Vec::new()), |s| {
+            let bearers = session_bearers(s);
+            let default_ebi = bearers.first().map(|b| b.ebi);
+            let dedicated = bearers
+                .iter()
+                .filter(|b| Some(b.ebi) != default_ebi)
+                .filter_map(|b| {
+                    let filters = downlink_filters(b);
+                    if filters.is_empty() {
+                        // A match-all PDR here would take the default flow's traffic.
+                        log::warn!(
+                            "COMPLETED for ref={sm_context_ref}: dedicated EBI {} has no \
+                             downlink packet filter, so its downlink stays on the default flow",
+                            b.ebi
+                        );
+                        None
+                    } else {
+                        Some((b.ebi, filters))
+                    }
+                })
+                .collect();
+            (s.ipv4_addr.map(|a| a.octets()), dedicated)
+        });
+        pfcp_switch_to_ngran(smf_n4_seid, upf_seid, teid, addr, ue_ip, &dedicated_dl).await
     } else {
         crate::pfcp_session_modify(smf_n4_seid, upf_seid, teid, addr).await
     };
@@ -605,6 +1028,7 @@ pub(crate) async fn handle_completed(
         sess.handover.target_dl_known = false;
         sess.handover.eps_to_5gs = false;
         sess.handover.n3_ul_pdr_id = None;
+        sess.handover.forwarding_ebis.clear();
         if was_eps {
             // The PDN connection is a PDU session now; its S5/S8 leg was released above.
             sess.epc = false;
@@ -636,6 +1060,16 @@ pub(crate) async fn handle_completed(
             )
             .await;
         }
+        if !forwarding_ebis.is_empty() {
+            // Execution step 7: *"If indirect forwarding is used, a timer in SMF+PGW-C ... is
+            // started to supervise when resources in UPF (for indirect data forwarding) shall
+            // be released"*; step 14 releases them on expiry.
+            let timer = indirect_forwarding_timer();
+            tokio::spawn(async move {
+                tokio::time::sleep(timer).await;
+                pfcp_release_forwarding(smf_n4_seid, upf_seid, &forwarding_ebis).await;
+            });
+        }
         log::info!(
             "SM Context Update (COMPLETED) for ref={sm_context_ref}: EPS→5GS executed — DL \
              switched to the NG-RAN (end markers on S5/S8-U), S5/S8-U uplink released"
@@ -658,8 +1092,15 @@ pub(crate) async fn handle_cancelled(sm_context_ref: &str) -> SbiResponse {
     if let Some(mut sess) = sess {
         if sess.handover.eps_to_5gs {
             if let Some(upf_seid) = crate::lookup_upf_seid(sm_context_ref) {
-                if let Err(e) =
-                    pfcp_remove_n3_uplink(crate::smf_n4_seid_for(sm_context_ref), upf_seid).await
+                let bearers = session_bearers(&sess);
+                let dedicated: Vec<u8> = bearers.iter().skip(1).map(|b| b.ebi).collect();
+                if let Err(e) = pfcp_remove_n3_uplink(
+                    crate::smf_n4_seid_for(sm_context_ref),
+                    upf_seid,
+                    &dedicated,
+                    &sess.handover.forwarding_ebis,
+                )
+                .await
                 {
                     log::warn!(
                         "EPS→5GS cancel for ref={sm_context_ref}: N3 uplink PDR not removed: {e}"
@@ -951,6 +1392,87 @@ mod tests {
         (server, port)
     }
 
+    /// The UE's dedicated GBR bearer, EBI 6 (QCI 1, ARP 2, GBR 64/32 kbps, MBR 128/64 kbps)
+    /// with a downlink packet filter, added to the session the PDN establishment stored.
+    ///
+    /// Seeded into the store because no production path on this PGW-C creates a dedicated
+    /// bearer over S5/S8 yet (filed separately); the EPS→5GS handover must move every bearer
+    /// the session holds, whoever created it.
+    fn seed_dedicated_gbr_bearer(pgw_c_teid: u32) {
+        seed_dedicated_gbr_bearer_with(pgw_c_teid, DEDICATED_DL_FILTER);
+    }
+
+    fn seed_dedicated_gbr_bearer_with(pgw_c_teid: u32, dl_filter: &str) {
+        let handle = smf_self();
+        let ctx = handle.read().unwrap();
+        let sess = ctx
+            .sess_find_by_teid(pgw_c_teid)
+            .expect("the PDN connection");
+        let mut bearer = ctx.bearer_add(sess.id).expect("a bearer slot");
+        bearer.ebi = DEDICATED_EBI;
+        bearer.qfi = DEDICATED_EBI;
+        bearer.qos = context::Qos {
+            index: 1,
+            arp_priority_level: 2,
+            arp_preempt_cap: false,
+            arp_preempt_vuln: true,
+            mbr_uplink: 64_000,
+            mbr_downlink: 128_000,
+            gbr_uplink: 32_000,
+            gbr_downlink: 64_000,
+        };
+        ctx.bearer_update(&bearer);
+        let mut pf = ctx.pf_add(bearer.id).expect("a packet filter slot");
+        pf.direction = context::FlowDirection::DownlinkOnly;
+        pf.flow_description = Some(dl_filter.to_string());
+        assert!(ctx.pf_update(&pf));
+    }
+
+    const DEDICATED_EBI: u8 = 6;
+    const DEDICATED_DL_FILTER: &str = "permit out 17 from 198.51.100.7 to assigned";
+    /// The target NG-RAN's DL Forwarding UP TNL Information (indirect forwarding).
+    const GNB_FWD: ([u8; 4], u32) = ([10, 1, 2, 3], 0x0000_F0D0);
+
+    /// The target's acknowledge for an indirect-forwarding handover: both flows accepted,
+    /// both accepted for forwarding, one DL forwarding tunnel for the session.
+    fn ho_ack_transfer_with_forwarding() -> Vec<u8> {
+        use nextgcore_ngap::transfer::{
+            GtpTunnel, HandoverRequestAcknowledgeTransfer, QosFlowItemWithDataForwarding,
+            TransportLayerAddress, UpTransportLayerInformation,
+        };
+        HandoverRequestAcknowledgeTransfer {
+            dl_ngu_up_tnl_information: UpTransportLayerInformation::GtpTunnel(GtpTunnel {
+                transport_layer_address: TransportLayerAddress::from_ipv4(GNB_DL.0),
+                gtp_teid: GNB_DL.1.to_be_bytes(),
+            }),
+            dl_forwarding_up_tnl_information: Some(UpTransportLayerInformation::GtpTunnel(
+                GtpTunnel {
+                    transport_layer_address: TransportLayerAddress::from_ipv4(GNB_FWD.0),
+                    gtp_teid: GNB_FWD.1.to_be_bytes(),
+                },
+            )),
+            security_result: None,
+            qos_flow_setup_response_list: [5, DEDICATED_EBI]
+                .into_iter()
+                .map(|qfi| QosFlowItemWithDataForwarding {
+                    qos_flow_identifier: qfi,
+                    data_forwarding_accepted: true,
+                })
+                .collect(),
+            qos_flow_failed_to_setup_list: Vec::new(),
+            data_forwarding_response_drb_list: Vec::new(),
+        }
+        .encode()
+        .unwrap()
+    }
+
+    /// The F-TEID at `instance` in a Bearer Context, as (interface type, TEID, IPv4).
+    fn bearer_fteid(bc: &Gtp2BearerContextIe, instance: u8) -> Option<(u8, u32, [u8; 4])> {
+        let ie = bc.get_ie(Gtp2IeType::FTeid as u8, instance)?;
+        let f = Gtp2FTeidIe::decode(&ie.value).ok()?;
+        Some((f.interface_type, f.teid, f.ipv4_addr?))
+    }
+
     fn ho_ack_transfer() -> Vec<u8> {
         use nextgcore_ngap::transfer::{
             GtpTunnel, HandoverRequestAcknowledgeTransfer, QosFlowItemWithDataForwarding,
@@ -1031,6 +1553,8 @@ mod tests {
 
         // EPS: the PDN connection, with PSI 5 in the PCO.
         let (s5, pgw_c, answered_pco) = establish_pdn(Some(&pco_with_psi(5))).await;
+        seed_dedicated_gbr_bearer(pgw_c.0);
+        std::env::set_var("SMF_INDIRECT_FORWARDING_TIMER_MS", "200");
         let answered_pco = answered_pco.expect("the PGW-C answers the PCO");
         assert_eq!(
             eps_iwk::pco_container(&answered_pco, false, eps_iwk::pco_container::NW_S_NSSAI),
@@ -1067,12 +1591,36 @@ mod tests {
             found.expect("the SMF must accept the conformant create (#475)")
         };
 
-        // Step 6 at the UPF: one modification creating the N3 uplink PDR 3.
+        // Step 6 at the UPF: the N3 uplink PDR 3, then (#583) the dedicated bearer as a QoS
+        // flow on the same N3 tunnel -- its uplink PDR 0x16 with QFI 6 and its QER with the
+        // bearer's GBR.
         let mods = upf.modification_bodies();
-        assert_eq!(mods.len(), 1, "step 6 is one N4 Session Modification");
+        assert_eq!(
+            mods.len(),
+            2,
+            "step 6: the N3 tunnel, then the dedicated flow"
+        );
         assert!(
             n4_has(&mods[0], 1, &[0x00, 0x38, 0x00, 0x02, 0x00, 0x03]),
             "Create PDR with PDR ID 3"
+        );
+        let mut n3_fteid = vec![0x00, 0x15, 0x00, 0x09, 0x01];
+        n3_fteid.extend_from_slice(&crate::pfcp_path::stand_in::N3_STAND_IN_TEID.to_be_bytes());
+        n3_fteid.extend_from_slice(&upf.upf_ip);
+        assert!(
+            n4_has(&mods[1], 1, &[0x00, 0x38, 0x00, 0x02, 0x00, 0x16])
+                && n4_has(&mods[1], 1, &n3_fteid)
+                && n4_has(&mods[1], 1, &[0x00, 0x7C, 0x00, 0x01, DEDICATED_EBI]),
+            "Create PDR 0x16 on the N3 F-TEID, QFI 6"
+        );
+        // GBR IE (type 27): UL 32 kbps, DL 64 kbps, 5 octets each.
+        assert!(
+            n4_has(
+                &mods[1],
+                7,
+                &[0x00, 0x1B, 0x00, 0x0A, 0, 0, 0, 0, 32, 0, 0, 0, 0, 64]
+            ),
+            "Create QER with the dedicated bearer's GBR"
         );
 
         // SMF state after step 7.
@@ -1166,15 +1714,28 @@ mod tests {
             crate::pfcp_path::stand_in::N3_STAND_IN_TEID,
             "CN Tunnel Info is the N3 tunnel step 6 allocated"
         );
-        assert_eq!(n2.qos_flow_setup_request_list[0].qos_flow_identifier, 5);
+        let flows: Vec<_> = n2
+            .qos_flow_setup_request_list
+            .iter()
+            .map(|f| {
+                (
+                    f.qos_flow_identifier,
+                    f.e_rab_id,
+                    f.qos_flow_level_qos_parameters
+                        .gbr_qos_information
+                        .as_ref()
+                        .map(|g| g.guaranteed_flow_bit_rate_dl),
+                )
+            })
+            .collect();
         assert_eq!(
-            n2.qos_flow_setup_request_list[0].e_rab_id,
-            Some(5),
-            "step 7: the mapping between EBI(s) and QFI(s)"
+            flows,
+            vec![(5, Some(5), None), (6, Some(6), Some(64_000))],
+            "step 7: one QoS flow per EPS bearer, the EBI↔QFI mapping, the GBR"
         );
         assert!(
-            n2.data_forwarding_not_possible,
-            "neither forwarding flag: 'Data forwarding not possible'"
+            !n2.data_forwarding_not_possible && !n2.direct_forwarding_path_availability,
+            "the MME offered no direct path, so the AMF asked for indirect forwarding"
         );
         let ue_ebis: Vec<_> = ngap
             .harness_assigned_ebis(amf_ue_ngap_id)
@@ -1183,8 +1744,11 @@ mod tests {
             .collect();
         assert_eq!(
             ue_ebis,
-            vec![(5, 5, 8, "NOT_PREEMPT".to_string())],
-            "allocatedEbiList with the bearer's ARP (PCI set → NOT_PREEMPT)"
+            vec![
+                (5, 5, 8, "NOT_PREEMPT".to_string()),
+                (6, 5, 2, "MAY_PREEMPT".to_string())
+            ],
+            "allocatedEbiList with each bearer's ARP (PCI set → NOT_PREEMPT)"
         );
 
         // Steps 10-14.
@@ -1195,7 +1759,7 @@ mod tests {
                 ran_ue_ngap_id: 77,
                 admitted_list: vec![nextgcore_ngap::types::PduSessionResourceAdmittedItemHoAck {
                     pdu_session_id: 5,
-                    transfer: ho_ack_transfer(),
+                    transfer: ho_ack_transfer_with_forwarding(),
                 }],
                 failed_list: None,
                 target_to_source_container: vec![0xC0, 0xFE],
@@ -1217,21 +1781,48 @@ mod tests {
                 .cause,
             16
         );
-        let set_up: Vec<u8> = response
+        // #583, steps 12-14: each bearer's indirect forwarding tunnel at the UPF, in its
+        // Bearer Context as the "SGW/UPF F-TEID for DL data forwarding" (instance 2, type 23).
+        let set_up: Vec<(u8, Option<(u8, u32, [u8; 4])>)> = response
             .get_ies(Gtp2IeType::BearerContext as u8)
             .iter()
             .map(|ie| {
-                Gtp2BearerContextIe::decode(&ie.value)
-                    .unwrap()
-                    .ebi()
-                    .unwrap()
+                let bc = Gtp2BearerContextIe::decode(&ie.value).unwrap();
+                (bc.ebi().unwrap(), bearer_fteid(&bc, 2))
             })
             .collect();
-        assert_eq!(set_up, vec![5], "the SMF's EPS Bearer Setup List");
-        assert!(
-            upf.modification_bodies().is_empty(),
-            "PREPARED must not touch the user plane"
+        let teid = crate::pfcp_path::stand_in::N3_STAND_IN_TEID;
+        assert_eq!(
+            set_up,
+            vec![
+                (5, Some((23, teid, upf.upf_ip))),
+                (6, Some((23, teid + 1, upf.upf_ip)))
+            ],
+            "the EPS Bearer Setup List carries a forwarding tunnel per bearer"
         );
+        // Step 12 at the UPF: one FAR to the target's forwarding tunnel, one PDR per bearer
+        // on a UPF-chosen F-TEID, each with a QER adding the bearer's QFI. The DL path is
+        // not switched.
+        let mods = upf.modification_bodies();
+        assert_eq!(mods.len(), 1, "PREPARED: the forwarding tunnels only");
+        let mut fwd_ohc = vec![0x01, 0x00];
+        fwd_ohc.extend_from_slice(&GNB_FWD.1.to_be_bytes());
+        fwd_ohc.extend_from_slice(&GNB_FWD.0);
+        assert!(
+            n4_has(&mods[0], 3, &fwd_ohc),
+            "Create FAR to the forwarding tunnel"
+        );
+        for pdr in [0x55u8, 0x56] {
+            assert!(
+                n4_has(&mods[0], 1, &[0x00, 0x38, 0x00, 0x02, 0x00, pdr]),
+                "Create PDR 0x{pdr:x}"
+            );
+        }
+        assert!(
+            !n4_has(&mods[0], 10, &[0x00, 0x6C, 0x00, 0x04, 0, 0, 0, 2]),
+            "no Update FAR 2: the DL is not switched"
+        );
+        upf.clear_seen();
 
         // Execution.
         let plmn = nextgcore_amfd::n26_build::encode_plmn_bcd(
@@ -1273,6 +1864,41 @@ mod tests {
             n4_has(&mods[0], 15, &[0x00, 0x38, 0x00, 0x02, 0x00, 0x01]),
             "Remove PDR 1, the S5/S8-U uplink"
         );
+        // #583: the dedicated bearer's downlink, as a QoS flow on the target's N3 tunnel.
+        let mut sdf = DEDICATED_DL_FILTER.as_bytes().to_vec();
+        sdf.truncate(16);
+        assert!(
+            n4_has(&mods[0], 1, &[0x00, 0x38, 0x00, 0x02, 0x00, 0x36]) && n4_has(&mods[0], 1, &sdf),
+            "Create PDR 0x36 on the dedicated bearer's downlink filter"
+        );
+        assert!(
+            !n4_has(&mods[0], 15, &[0x00, 0x38, 0x00, 0x02, 0x00, 0x55]),
+            "the forwarding tunnels outlive execution"
+        );
+        // Step 14: the forwarding timer expires and the tunnels go.
+        let released = {
+            let mut found = None;
+            for _ in 0..100 {
+                let mods = upf.modification_bodies();
+                if mods.len() >= 2 {
+                    found = Some(mods[1].clone());
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            found.expect("the indirect forwarding resources are released on the timer")
+        };
+        for pdr in [0x55u8, 0x56] {
+            assert!(
+                n4_has(&released, 15, &[0x00, 0x38, 0x00, 0x02, 0x00, pdr]),
+                "Remove PDR 0x{pdr:x}"
+            );
+        }
+        assert!(
+            n4_has(&released, 16, &[0x00, 0x6C, 0x00, 0x04, 0, 0, 0, 0x50]),
+            "Remove FAR 0x50"
+        );
+        std::env::remove_var("SMF_INDIRECT_FORWARDING_TIMER_MS");
         {
             let ctx = smf_self();
             let ctx = ctx.read().unwrap();
@@ -1360,6 +1986,396 @@ mod tests {
         s5.close();
     }
 
+    /// #583, direct forwarding: the AMF's `directForwardingFlag` becomes Direct Forwarding
+    /// Path Availability in the N2 SM information, and at PREPARED the target's per-E-RAB
+    /// tunnels from its Data Forwarding Response E-RAB List go to the MME as each bearer's
+    /// "eNodeB/gNodeB F-TEID for DL data forwarding" (instance 0, type 19) -- with nothing
+    /// installed at the UPF, which direct forwarding bypasses.
+    #[tokio::test]
+    async fn direct_forwarding_returns_the_targets_per_e_rab_tunnels() {
+        use nextgcore_ngap_gen::generated as g;
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let upf = crate::pfcp_path::stand_in::associated_upf().await;
+        crate::context::smf_context_init(64, 256, 512);
+        let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;
+        seed_dedicated_gbr_bearer(pgw_c.0);
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let body = serde_json::json!({
+            "supi": format!("imsi-{IMSI}"),
+            "hoState": "PREPARING",
+            "ueEpsPdnConnection": b64.encode(pdn_connection(pgw_c)),
+            "directForwardingFlag": true,
+            "indirectForwardingFlag": false,
+        });
+        let created = handle_create(&body).await;
+        assert_eq!(created.status, 201);
+        let n2 = nextgcore_ngap::transfer::PduSessionResourceSetupRequestTransfer::decode(
+            &created.http.parts[0].data,
+        )
+        .unwrap();
+        assert!(n2.direct_forwarding_path_availability && !n2.data_forwarding_not_possible);
+        let reference =
+            serde_json::from_str::<serde_json::Value>(created.http.content.as_deref().unwrap())
+                .unwrap()["smContextRef"]
+                .as_str()
+                .unwrap()
+                .to_string();
+        upf.clear_seen();
+
+        let erab = |ebi: u8, teid: u32| g::DataForwardingResponseERABListItem {
+            e_rab_id: g::E_RAB_ID(ebi),
+            dl_forwarding_up_tnl_information: crate::n2_transfer::gtp_tunnel((
+                teid,
+                [10, 9, 9, ebi],
+            )),
+            ie_extensions: None,
+        };
+        let ack = g::HandoverRequestAcknowledgeTransfer {
+            dl_ngu_up_tnl_information: crate::n2_transfer::gtp_tunnel((GNB_DL.1, GNB_DL.0)),
+            dl_forwarding_up_tnl_information: None,
+            security_result: None,
+            qos_flow_setup_response_list: g::QosFlowListWithDataForwarding(
+                [5, DEDICATED_EBI]
+                    .into_iter()
+                    .map(|q| g::QosFlowItemWithDataForwarding {
+                        qos_flow_identifier: g::QosFlowIdentifier(q),
+                        data_forwarding_accepted: Some(g::DataForwardingAccepted(0)),
+                        ie_extensions: None,
+                    })
+                    .collect(),
+            ),
+            qos_flow_failed_to_setup_list: None,
+            data_forwarding_response_drb_list: None,
+            ie_extensions: Some(g::HandoverRequestAcknowledgeTransferIE_Extensions(vec![
+                g::HandoverRequestAcknowledgeTransferIE_Extensions_Entry {
+                    id: g::ProtocolExtensionID(249),
+                    criticality: g::Criticality(g::Criticality::IGNORE),
+                    extension_value:
+                        g::HandoverRequestAcknowledgeTransferIE_Extensions_EntryExtensionValue::Id_DataForwardingResponseERABList(
+                            g::DataForwardingResponseERABList(vec![
+                                erab(5, 0xD5),
+                                erab(DEDICATED_EBI, 0xD6),
+                            ]),
+                        ),
+                },
+            ])),
+        };
+        let transfer = nextgcore_ngap_gen::encode_contained(&ack).unwrap();
+        let resp = handle_prepared(&reference, &transfer).await;
+        assert_eq!(resp.status, 200);
+        let root: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let set_up: Vec<(u8, Option<(u8, u32, [u8; 4])>, Option<(u8, u32, [u8; 4])>)> = root
+            ["epsBearerSetup"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                let raw = b64.decode(e.as_str().unwrap()).unwrap();
+                let bc =
+                    nextgcore_amfd::n26_eps_to_5gs::bearer_context_from_container(&raw).unwrap();
+                (
+                    bc.ebi().unwrap(),
+                    bearer_fteid(&bc, 0),
+                    bearer_fteid(&bc, 2),
+                )
+            })
+            .collect();
+        assert_eq!(
+            set_up,
+            vec![
+                (5, Some((19, 0xD5, [10, 9, 9, 5])), None),
+                (6, Some((19, 0xD6, [10, 9, 9, 6])), None),
+            ]
+        );
+        assert!(
+            upf.modification_bodies().is_empty(),
+            "direct forwarding installs nothing at the UPF"
+        );
+        s5.close();
+    }
+
+    /// A G-PDU (TS 29.281) on `teid` carrying `inner`, with a PDU Session Container (TS
+    /// 38.415 §5.5.2) of `pdu_type` (0 DL, 1 UL) and `qfi` when given.
+    fn gpdu(teid: u32, inner: &[u8], container: Option<(u8, u8)>) -> Vec<u8> {
+        let mut ext = Vec::new();
+        if let Some((pdu_type, qfi)) = container {
+            ext = vec![0, 0, 0, 0x85, 1, pdu_type << 4, qfi & 0x3F, 0];
+        }
+        let mut out = vec![if ext.is_empty() { 0x30 } else { 0x34 }, 0xFF];
+        out.extend_from_slice(&((ext.len() + inner.len()) as u16).to_be_bytes());
+        out.extend_from_slice(&teid.to_be_bytes());
+        out.extend_from_slice(&ext);
+        out.extend_from_slice(inner);
+        out
+    }
+
+    /// An IPv4/UDP packet with a valid header checksum.
+    fn ipv4_udp(src: [u8; 4], dst: [u8; 4]) -> Vec<u8> {
+        let payload = b"nextg-583";
+        let total = (20 + 8 + payload.len()) as u16;
+        let mut p = vec![0x45, 0, 0, 0, 0, 1, 0, 0, 64, 17, 0, 0];
+        p[2..4].copy_from_slice(&total.to_be_bytes());
+        p.extend_from_slice(&src);
+        p.extend_from_slice(&dst);
+        let sum = p
+            .chunks(2)
+            .map(|c| u32::from(u16::from_be_bytes([c[0], c[1]])))
+            .sum::<u32>();
+        let sum = (sum & 0xFFFF) + (sum >> 16);
+        p[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+        p.extend_from_slice(&5000u16.to_be_bytes());
+        p.extend_from_slice(&5000u16.to_be_bytes());
+        p.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        p.extend_from_slice(&[0, 0]);
+        p.extend_from_slice(payload);
+        p
+    }
+
+    /// The (TEID, QFI, inner packet) of a G-PDU with at most one PDU Session Container.
+    fn parse_gpdu(pkt: &[u8]) -> (u32, Option<u8>, Vec<u8>) {
+        let teid = u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
+        if pkt[0] & 0x07 == 0 {
+            return (teid, None, pkt[8..].to_vec());
+        }
+        let mut off = 12;
+        let mut qfi = None;
+        let mut next = pkt[11];
+        while next != 0 {
+            let len = usize::from(pkt[off]) * 4;
+            if next == 0x85 {
+                qfi = Some(pkt[off + 2] & 0x3F);
+            }
+            next = pkt[off + len - 1];
+            off += len;
+        }
+        (teid, qfi, pkt[off..].to_vec())
+    }
+
+    async fn recv_gpdu(
+        sock: &tokio::net::UdpSocket,
+        wait: Duration,
+    ) -> Option<(u32, Option<u8>, Vec<u8>)> {
+        let mut buf = vec![0u8; 4096];
+        loop {
+            let (n, _) = tokio::time::timeout(wait, sock.recv_from(&mut buf))
+                .await
+                .ok()?
+                .ok()?;
+            // Skip End Markers (message type 254) and echoes: only G-PDUs carry traffic.
+            if buf[1] == 0xFF {
+                return Some(parse_gpdu(&buf[..n]));
+            }
+        }
+    }
+
+    fn upf_ul_packets(upf: std::net::Ipv4Addr) -> u64 {
+        use std::io::{Read, Write};
+        let mut tcp = std::net::TcpStream::connect((upf, 9090)).expect("UPF metrics");
+        tcp.write_all(b"GET /metrics HTTP/1.0\r\n\r\n").unwrap();
+        let mut body = String::new();
+        tcp.read_to_string(&mut body).unwrap();
+        body.lines()
+            .find_map(|l| l.strip_prefix("upf_dataplane_ul_packets_total "))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// **#583 across the REAL `nextgcore-upfd` binary.** smfd's production N4 path (this
+    /// process) drives a running upfd; this test then plays the source SGW-U and the target
+    /// gNB on the wire and asserts on the GTP-U the UPF actually emits:
+    ///
+    /// 1. the indirect forwarding tunnels the UPF allocated relay the source's downlink to the
+    ///    target's DL forwarding tunnel, QFI added per bearer;
+    /// 2. uplink on the dedicated QoS flow's QFI is accepted on the N3 tunnel;
+    /// 3. after execution, downlink entering the UPF's TUN leaves on the target's N3 tunnel
+    ///    marked with the dedicated flow's QFI when it matches its TFT, the default one
+    ///    otherwise;
+    /// 4. the forwarding tunnels stop relaying when the step-14 timer expires.
+    ///
+    /// Ignored: needs `NEXTG_REAL_UPF` (the upfd's PFCP/GTP-U IPv4), `NEXTG_REAL_UPF_LOCAL`
+    /// (this host's IPv4 on that network) and `NEXTG_REAL_UPF_CONTAINER` (to inject the
+    /// downlink into its TUN with `docker exec`). The runbook is in the #583 spec.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "needs a running nextgcore-upfd; see the #583 spec"]
+    #[allow(clippy::await_holding_lock)]
+    async fn eps_to_5gs_forwarding_and_qos_flows_cross_the_real_upf() {
+        let ip = |var: &str| -> std::net::Ipv4Addr {
+            std::env::var(var)
+                .unwrap_or_else(|_| panic!("{var} is not set"))
+                .parse()
+                .unwrap()
+        };
+        let (upf_ip, local) = (ip("NEXTG_REAL_UPF"), ip("NEXTG_REAL_UPF_LOCAL"));
+        let container = std::env::var("NEXTG_REAL_UPF_CONTAINER").expect("container name");
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _upf =
+            crate::pfcp_path::stand_in::real_upf((local, 0).into(), (upf_ip, 8805).into()).await;
+        crate::context::smf_context_init(64, 256, 512);
+        std::env::set_var("SMF_INDIRECT_FORWARDING_TIMER_MS", "1500");
+        let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;
+        let ue = smf_self()
+            .read()
+            .unwrap()
+            .sess_find_by_teid(pgw_c.0)
+            .unwrap()
+            .ipv4_addr
+            .unwrap();
+        eprintln!("UE {ue}");
+        // The dedicated bearer's TFT: UDP from the UPF's own TUN address, so `docker exec`
+        // can produce a matching downlink packet.
+        seed_dedicated_gbr_bearer_with(pgw_c.0, &format!("permit out 17 from 10.45.0.1 to {ue}"));
+
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let created = handle_create(&serde_json::json!({
+            "supi": format!("imsi-{IMSI}"),
+            "hoState": "PREPARING",
+            "ueEpsPdnConnection": b64.encode(pdn_connection(pgw_c)),
+            "indirectForwardingFlag": true,
+        }))
+        .await;
+        assert_eq!(created.status, 201, "step 6 on the real UPF");
+        let reference =
+            serde_json::from_str::<serde_json::Value>(created.http.content.as_deref().unwrap())
+                .unwrap()["smContextRef"]
+                .as_str()
+                .unwrap()
+                .to_string();
+        let n3 = crate::lookup_upf_ul_endpoint(&reference).expect("the N3 F-TEID");
+        eprintln!("N3 uplink F-TEID {:#x} @ {:?}", n3.0, n3.1);
+        assert_eq!(n3.1, upf_ip.octets(), "allocated by the real UPF");
+
+        // The target gNB: N3 and forwarding tunnels on the GTP-U port of this host.
+        let gnb = tokio::net::UdpSocket::bind((local, 2152))
+            .await
+            .expect("gNB GTP-U");
+        const N3_DL: u32 = 0x0000_ABCD;
+        const FWD_DL: u32 = 0x0000_F0D0;
+        let ack = {
+            use nextgcore_ngap::transfer::{
+                GtpTunnel, HandoverRequestAcknowledgeTransfer, QosFlowItemWithDataForwarding,
+                TransportLayerAddress, UpTransportLayerInformation,
+            };
+            let tunnel = |teid: u32| {
+                UpTransportLayerInformation::GtpTunnel(GtpTunnel {
+                    transport_layer_address: TransportLayerAddress::from_ipv4(local.octets()),
+                    gtp_teid: teid.to_be_bytes(),
+                })
+            };
+            HandoverRequestAcknowledgeTransfer {
+                dl_ngu_up_tnl_information: tunnel(N3_DL),
+                dl_forwarding_up_tnl_information: Some(tunnel(FWD_DL)),
+                security_result: None,
+                qos_flow_setup_response_list: [5, DEDICATED_EBI]
+                    .into_iter()
+                    .map(|qfi| QosFlowItemWithDataForwarding {
+                        qos_flow_identifier: qfi,
+                        data_forwarding_accepted: true,
+                    })
+                    .collect(),
+                qos_flow_failed_to_setup_list: Vec::new(),
+                data_forwarding_response_drb_list: Vec::new(),
+            }
+            .encode()
+            .unwrap()
+        };
+        let prepared = handle_prepared(&reference, &ack).await;
+        assert_eq!(prepared.status, 200);
+        let root: serde_json::Value =
+            serde_json::from_str(prepared.http.content.as_deref().unwrap()).unwrap();
+        let forwarding: Vec<(u8, u32, [u8; 4])> = root["epsBearerSetup"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                let raw = b64.decode(e.as_str().unwrap()).unwrap();
+                let bc =
+                    nextgcore_amfd::n26_eps_to_5gs::bearer_context_from_container(&raw).unwrap();
+                let (_, teid, addr) = bearer_fteid(&bc, 2).expect("an indirect tunnel");
+                (bc.ebi().unwrap(), teid, addr)
+            })
+            .collect();
+        eprintln!("indirect forwarding tunnels at the UPF: {forwarding:x?}");
+        assert_eq!(forwarding.len(), 2);
+
+        // 1. The source SGW-U forwards in-flight downlink into each bearer's tunnel.
+        let sgw = tokio::net::UdpSocket::bind((local, 0)).await.unwrap();
+        for &(ebi, teid, addr) in &forwarding {
+            assert_eq!(addr, upf_ip.octets());
+            let inner = ipv4_udp([198, 51, 100, 7], ue.octets());
+            sgw.send_to(&gpdu(teid, &inner, None), (upf_ip, 2152))
+                .await
+                .unwrap();
+            let got = recv_gpdu(&gnb, Duration::from_secs(3))
+                .await
+                .expect("the UPF relays the forwarded packet to the target");
+            eprintln!(
+                "EBI {ebi}: forwarded G-PDU at the target: TEID {:#x} QFI {:?}",
+                got.0, got.1
+            );
+            assert_eq!(got, (FWD_DL, Some(ebi), inner), "EBI {ebi}");
+        }
+
+        // 2. Uplink on the dedicated flow, on the N3 tunnel.
+        let before = upf_ul_packets(upf_ip);
+        let ul = ipv4_udp(ue.octets(), [198, 51, 100, 7]);
+        sgw.send_to(&gpdu(n3.0, &ul, Some((1, DEDICATED_EBI))), (upf_ip, 2152))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let after = upf_ul_packets(upf_ip);
+        eprintln!("UPF uplink packets: {before} -> {after}");
+        assert_eq!(
+            after,
+            before + 1,
+            "the dedicated QFI's uplink reached the N6 side"
+        );
+
+        // 3. Execution, then downlink from the data network side of the UPF.
+        assert_eq!(handle_completed(&reference, None).await.status, 200);
+        let exec = |cmd: String| {
+            let out = std::process::Command::new("docker")
+                .args(["exec", &container, "bash", "-c", &cmd])
+                .output()
+                .expect("docker exec");
+            eprintln!("docker exec {cmd}: {:?}", out.status);
+        };
+        exec(format!("echo nextg-583 > /dev/udp/{ue}/5000"));
+        let dedicated = recv_gpdu(&gnb, Duration::from_secs(3))
+            .await
+            .expect("downlink on the dedicated flow reaches the target");
+        eprintln!(
+            "DL UDP from 10.45.0.1: TEID {:#x} QFI {:?}",
+            dedicated.0, dedicated.1
+        );
+        assert_eq!((dedicated.0, dedicated.1), (N3_DL, Some(DEDICATED_EBI)));
+        exec(format!("ping -c 1 -W 1 {ue} || true"));
+        let default = recv_gpdu(&gnb, Duration::from_secs(3))
+            .await
+            .expect("downlink on the default flow reaches the target");
+        eprintln!("DL ICMP: TEID {:#x} QFI {:?}", default.0, default.1);
+        assert_eq!((default.0, default.1), (N3_DL, Some(5)));
+
+        // 4. The forwarding tunnels go when the timer expires.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let (_, teid, _) = forwarding[0];
+        sgw.send_to(
+            &gpdu(teid, &ipv4_udp([198, 51, 100, 7], ue.octets()), None),
+            (upf_ip, 2152),
+        )
+        .await
+        .unwrap();
+        assert!(
+            recv_gpdu(&gnb, Duration::from_millis(800)).await.is_none(),
+            "no relay once the forwarding resources are released"
+        );
+        eprintln!("after the timer: nothing relayed");
+        std::env::remove_var("SMF_INDIRECT_FORWARDING_TIMER_MS");
+        s5.close();
+    }
+
     /// TS 29.502 §5.2.2.3.4.4: CANCELLED releases the N3 uplink step 6 created and forgets
     /// the SM context, leaving the PDN connection exactly as EPS was using it.
     #[tokio::test]
@@ -1368,14 +2384,29 @@ mod tests {
         let upf = crate::pfcp_path::stand_in::associated_upf().await;
         crate::context::smf_context_init(64, 256, 512);
         let (s5, pgw_c, _) = establish_pdn(Some(&pco_with_psi(5))).await;
+        seed_dedicated_gbr_bearer(pgw_c.0);
         use base64::Engine as _;
         let body = serde_json::json!({
             "supi": format!("imsi-{IMSI}"),
             "hoState": "PREPARING",
             "ueEpsPdnConnection": base64::engine::general_purpose::STANDARD.encode(pdn_connection(pgw_c)),
+            "indirectForwardingFlag": true,
         });
         let created = handle_create(&body).await;
         assert_eq!(created.status, 201);
+        let reference_ = serde_json::from_str::<serde_json::Value>(
+            created.http.content.as_deref().expect("body"),
+        )
+        .unwrap()["smContextRef"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            handle_prepared(&reference_, &ho_ack_transfer_with_forwarding())
+                .await
+                .status,
+            200
+        );
         let reference = serde_json::from_str::<serde_json::Value>(
             created.http.content.as_deref().expect("body"),
         )
@@ -1393,6 +2424,16 @@ mod tests {
             n4_has(&mods[0], 15, &[0x00, 0x38, 0x00, 0x02, 0x00, 0x03]),
             "Remove PDR 3, the N3 uplink"
         );
+        // #583: and everything else the preparation installed.
+        for (ie, needle) in [
+            (15u16, &[0x00, 0x38, 0x00, 0x02, 0x00, 0x16][..]), // the dedicated UL PDR
+            (18, &[0x00, 0x6D, 0x00, 0x04, 0, 0, 0, 0x16][..]), // its QER
+            (15, &[0x00, 0x38, 0x00, 0x02, 0x00, 0x55][..]),    // the forwarding PDRs
+            (15, &[0x00, 0x38, 0x00, 0x02, 0x00, 0x56][..]),
+            (16, &[0x00, 0x6C, 0x00, 0x04, 0, 0, 0, 0x50][..]), // the forwarding FAR
+        ] {
+            assert!(n4_has(&mods[0], ie, needle), "IE {ie} {needle:02x?}");
+        }
         let ctx = smf_self();
         let ctx = ctx.read().unwrap();
         let sess = ctx.sess_find_by_teid(pgw_c.0).unwrap();

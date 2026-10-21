@@ -47,7 +47,6 @@ bytes = "1.5"
 nextgcore-core = { path = "../libs/nextgcore-core" }
 nextgcore-crypt = { path = "../libs/nextgcore-crypt" }
 nextgcore-nas = { path = "../libs/nextgcore-nas" }
-nextgcore-ngap = { path = "../libs/nextgcore-ngap" }
 nextgcore-s1ap = { path = "../libs/nextgcore-s1ap" }
 nextgcore-gtp = { path = "../libs/nextgcore-gtp" }
 nextgcore-pfcp = { path = "../libs/nextgcore-pfcp" }

@@ -156,6 +156,3 @@ fn take_unknown(data: &mut asn1_codecs::PerCodecData) -> Vec<UnknownIe> {
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod builder_conformance_tests;

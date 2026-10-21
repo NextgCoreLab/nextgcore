@@ -323,7 +323,7 @@ proptest! {
                 .map(|f| f.qos_flow_identifier)
                 .collect(),
         );
-        prop_assert_eq!(parse_handover_request_acknowledge_transfer(&bytes).unwrap(), old);
+        prop_assert_eq!(parse_handover_request_acknowledge_transfer(&bytes).unwrap().dl, old);
     }
 
     /// The hand-written codec has no PathSwitchRequestTransfer encoder (the SMF

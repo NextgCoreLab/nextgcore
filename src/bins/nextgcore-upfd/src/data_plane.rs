@@ -1591,6 +1591,10 @@ pub struct DataPlaneSession {
     /// Whether a Downlink Data Report was already sent for the current
     /// buffering episode (reset when the buffer is flushed)
     pub ddn_sent: AtomicBool,
+    /// #583: the local F-TEID each PDR detects on, for PDRs a Session Modification
+    /// created with their own F-TEID. A PDR absent here is an establishment PDR, which
+    /// detects on the session's `ul_teid` as before.
+    pub pdr_teids: RwLock<HashMap<u16, u32>>,
 }
 
 impl DataPlaneSession {
@@ -1627,6 +1631,7 @@ impl DataPlaneSession {
             bars: RwLock::new(HashMap::new()),
             dl_buffer: std::sync::Mutex::new(std::collections::VecDeque::new()),
             ddn_sent: AtomicBool::new(false),
+            pdr_teids: RwLock::new(HashMap::new()),
         }
     }
 
@@ -1679,6 +1684,11 @@ pub struct SessionManager {
     ul_teid_map: RwLock<HashMap<u32, Arc<DataPlaneSession>>>,
     /// UE IP -> Session mapping
     ue_ip_map: RwLock<HashMap<Ipv4Addr, Arc<DataPlaneSession>>>,
+    /// #583: F-TEIDs a session holds beyond its establishment `ul_teid` -- PDRs a Session
+    /// Modification created on their own tunnel (an N3 uplink added at an EPS→5GS handover,
+    /// an indirect-forwarding tunnel). Keyed to the SEID rather than the session `Arc`,
+    /// because `update_session_from_pfcp` replaces the `Arc`; dropped with the session.
+    extra_ul_teids: RwLock<HashMap<u32, u64>>,
     /// Next TEID to allocate
     next_teid: AtomicU64,
     /// Next SEID to allocate
@@ -1691,6 +1701,7 @@ impl SessionManager {
             seid_map: RwLock::new(HashMap::new()),
             ul_teid_map: RwLock::new(HashMap::new()),
             ue_ip_map: RwLock::new(HashMap::new()),
+            extra_ul_teids: RwLock::new(HashMap::new()),
             next_teid: AtomicU64::new(1),
             next_seid: AtomicU64::new(1),
         }
@@ -1746,10 +1757,26 @@ impl SessionManager {
         map.get(&seid).cloned()
     }
 
-    /// Find session by uplink TEID
+    /// Find session by uplink TEID: its establishment F-TEID, or one a modification added.
     pub fn find_by_ul_teid(&self, teid: u32) -> Option<Arc<DataPlaneSession>> {
-        let map = self.ul_teid_map.read().unwrap();
-        map.get(&teid).cloned()
+        if let Some(s) = self.ul_teid_map.read().unwrap().get(&teid).cloned() {
+            return Some(s);
+        }
+        let seid = self.extra_ul_teids.read().unwrap().get(&teid).copied()?;
+        self.find_by_seid(seid)
+    }
+
+    /// #583: route G-PDUs on `teid` to the session `seid` (a PDR created on its own F-TEID).
+    pub fn bind_ul_teid(&self, teid: u32, seid: u64) {
+        self.extra_ul_teids.write().unwrap().insert(teid, seid);
+    }
+
+    /// #583: forget every F-TEID a modification bound to `seid`.
+    pub fn forget_ul_teids(&self, seid: u64) {
+        self.extra_ul_teids
+            .write()
+            .unwrap()
+            .retain(|_, s| *s != seid);
     }
 
     /// Find session by UE IP
@@ -1951,10 +1978,43 @@ impl DataPlaneSession {
         packet: Option<&PacketTuple>,
         pkt_qfi: Option<u8>,
     ) -> Option<(Option<u32>, Option<u32>, Vec<u32>, Option<u8>)> {
+        self.match_pdr_where(source_interface, packet, pkt_qfi, |_| true)
+    }
+
+    /// #583: the uplink match for a G-PDU received on `teid`.
+    ///
+    /// A PDR detecting on its own F-TEID (TS 29.244 §5.2.1: the Local F-TEID is part of
+    /// the PDI) matches only that tunnel's packets, and is tried first; an establishment
+    /// PDR (no recorded F-TEID) is tried after, exactly as before. So a forwarding tunnel's
+    /// packets cannot be taken by the session's own uplink PDR, nor the reverse.
+    pub fn match_uplink_pdr(
+        &self,
+        teid: u32,
+        packet: Option<&PacketTuple>,
+        pkt_qfi: Option<u8>,
+    ) -> Option<(Option<u32>, Option<u32>, Vec<u32>, Option<u8>)> {
+        let tunnels = self.pdr_teids.read().unwrap().clone();
+        self.match_pdr_where(SRC_INTF_ACCESS, packet, pkt_qfi, |p| {
+            tunnels.get(&p.pdr_id) == Some(&teid)
+        })
+        .or_else(|| {
+            self.match_pdr_where(SRC_INTF_ACCESS, packet, pkt_qfi, |p| {
+                !tunnels.contains_key(&p.pdr_id)
+            })
+        })
+    }
+
+    fn match_pdr_where(
+        &self,
+        source_interface: u8,
+        packet: Option<&PacketTuple>,
+        pkt_qfi: Option<u8>,
+        eligible: impl Fn(&DataPlanePdr) -> bool,
+    ) -> Option<(Option<u32>, Option<u32>, Vec<u32>, Option<u8>)> {
         let pdrs = self.pdrs.read().unwrap();
         // PDRs are sorted by precedence (lower = higher priority)
         for pdr in pdrs.iter() {
-            if pdr.source_interface != source_interface {
+            if pdr.source_interface != source_interface || !eligible(pdr) {
                 continue;
             }
             // QFI matching (TS 29.244 7.5.2.2): a PDI with a QFI only matches
@@ -2637,6 +2697,57 @@ impl DataPlane {
             }
         };
 
+        // --- PDR matching (uplink: source_interface = Access), on the tunnel the
+        // G-PDU arrived on (#583) ---
+        let pkt_tuple = PacketTuple::from_ipv4_packet(ip_payload);
+        let pkt_qfi = extract_qfi_from_gtp_header(pkt);
+        let matched = session.match_uplink_pdr(header.teid, pkt_tuple.as_ref(), pkt_qfi);
+
+        // #583: a PDR whose FAR forwards back toward the ACCESS side is a GTP-U relay, not
+        // an uplink -- the indirect data forwarding tunnel of an EPS→5GS handover (TS 23.502
+        // §4.11.1.2.2.3 step 3: *"The v-UPF forwards the data packets to the NG-RAN using
+        // the N3 Tunnel Info for data forwarding, adding the QFI information"*). Its inner
+        // packets are DOWNLINK packets addressed to the UE, so the uplink anti-spoofing
+        // check below does not apply to them and they never reach the TUN.
+        if let Some((Some(fid), qer_id, _, _)) = &matched {
+            let relay = {
+                let fars = session.fars.read().unwrap();
+                fars.get(fid).and_then(|f| {
+                    (f.destination_interface == SRC_INTF_ACCESS
+                        && f.apply_action & FAR_ACTION_FORW != 0)
+                        .then_some((f.ohc_teid, f.ohc_addr))
+                })
+            };
+            if let Some((Some(teid), Some(addr))) = relay {
+                let qfi = qer_id.and_then(|q| session.qers.read().unwrap().get(&q)?.qfi);
+                let out = encapsulate_dl_gpdu(ip_payload, teid, qfi);
+                let to = SocketAddr::new(IpAddr::V4(addr), GTPU_PORT);
+                match &self.gtpu_socket {
+                    Some(sock) => match sock.send_to(&out, to).await {
+                        Ok(_) => {
+                            self.stats.dl_packets.fetch_add(1, Ordering::Relaxed);
+                            self.stats
+                                .dl_bytes
+                                .fetch_add(payload_len, Ordering::Relaxed);
+                            log::debug!(
+                                "Forwarded {payload_len}B from TEID 0x{:x} to {to} TEID \
+                                 0x{teid:x} QFI={qfi:?}",
+                                header.teid
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!("GTP-U forward to {to} failed: {e}");
+                            self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                        }
+                    },
+                    None => {
+                        self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                return;
+            }
+        }
+
         // --- Uplink anti-spoofing (TS 23.501 §5.6.1): the inner source IP of
         // a G-PDU received on a tunnel MUST equal the UE IP allocated to that
         // PDU session. A mismatch is a spoofed/misrouted packet and is dropped.
@@ -2662,13 +2773,8 @@ impl DataPlane {
             }
         }
 
-        // --- PDR matching (uplink: source_interface = Access) ---
-        let pkt_tuple = PacketTuple::from_ipv4_packet(ip_payload);
-        let pkt_qfi = extract_qfi_from_gtp_header(pkt);
         let mut dscp_to_apply: Option<u8> = None;
-        if let Some((far_id, qer_id, urr_ids, _ohr)) =
-            session.match_pdr_with_packet(SRC_INTF_ACCESS, pkt_tuple.as_ref(), pkt_qfi)
-        {
+        if let Some((far_id, qer_id, urr_ids, _ohr)) = matched {
             // Check QER gate and extract DSCP
             if let Some(qid) = qer_id {
                 if !session.check_qer_gate(qid, true, payload_len) {
@@ -3202,10 +3308,22 @@ impl DataPlane {
 
             // Update the downlink FAR's outer header creation if present
             if dl_teid.is_some() || gnb_addr.is_some() {
+                // #583: only the FARs the session's DOWNLINK (Core-source) PDRs use. A FAR
+                // toward the access side that an uplink-side PDR uses -- an indirect
+                // forwarding tunnel to the target NG-RAN -- has its own endpoint, which the
+                // session's DL tunnel moving must not overwrite.
+                let dl_fars: std::collections::HashSet<u32> = session
+                    .pdrs
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .filter(|p| p.source_interface == SRC_INTF_CORE)
+                    .filter_map(|p| p.far_id)
+                    .collect();
                 let mut fars = session.fars.write().unwrap();
-                // Update any FAR targeting access interface (downlink)
                 for far in fars.values_mut() {
-                    if far.destination_interface == SRC_INTF_ACCESS {
+                    if far.destination_interface == SRC_INTF_ACCESS && dl_fars.contains(&far.far_id)
+                    {
                         if let Some(teid) = dl_teid {
                             far.ohc_teid = Some(teid);
                         }
@@ -3226,6 +3344,7 @@ impl DataPlane {
             let bars_map = std::mem::take(&mut *session.bars.write().unwrap());
             let buffered: std::collections::VecDeque<Vec<u8>> =
                 std::mem::take(&mut *session.dl_buffer.lock().unwrap());
+            let pdr_teids = std::mem::take(&mut *session.pdr_teids.write().unwrap());
 
             self.sessions.remove_session_by_seid(upf_seid);
 
@@ -3259,6 +3378,7 @@ impl DataPlane {
             *new_session.urrs.write().unwrap() = urrs_map;
             *new_session.bars.write().unwrap() = bars_map;
             *new_session.dl_buffer.lock().unwrap() = buffered;
+            *new_session.pdr_teids.write().unwrap() = pdr_teids;
             new_session
                 .ddn_sent
                 .store(session.ddn_sent.load(Ordering::SeqCst), Ordering::SeqCst);
@@ -3274,6 +3394,7 @@ impl DataPlane {
 
     /// Remove a session from PFCP deletion
     pub fn remove_session_from_pfcp(&self, upf_seid: u64) {
+        self.sessions.forget_ul_teids(upf_seid);
         if self.sessions.remove_session_by_seid(upf_seid) {
             log::info!("Removed data plane session: SEID={upf_seid:#x}");
         } else {
@@ -4792,6 +4913,114 @@ mod tests {
     /// the TUN-write success branch) and `handle_downlink_packet` (a real gNB socket, and
     /// the G-PDU is received there), then asserted on the rendered text, which is what
     /// an operator and a scraper read.
+    #[tokio::test]
+    async fn an_indirect_forwarding_tunnel_relays_to_the_target_with_the_qfi() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let dp = DataPlane::new(shutdown);
+        let dp = DataPlane {
+            gtpu_socket: Some(Arc::new(TokioUdpSocket::bind("127.0.0.1:0").await.unwrap())),
+            ..dp
+        };
+        // The target NG-RAN's DL forwarding endpoint: GTP-U port, on a loopback address
+        // of its own so it cannot collide with another test.
+        let target = TokioUdpSocket::bind("127.58.3.1:2152").await.unwrap();
+        let ue_ip = Ipv4Addr::new(10, 45, 0, 2);
+        let sgw = "127.0.0.1:9".parse().unwrap();
+        dp.add_session_from_pfcp(0x83, 0x1083, ue_ip, 0x831, 0x832, sgw, Some(5), Some(5));
+        let session = dp.sessions.find_by_seid(0x83).unwrap();
+        session.pdrs.write().unwrap().insert(
+            0,
+            DataPlanePdr {
+                pdr_id: 0x55,
+                precedence: 10,
+                source_interface: SRC_INTF_ACCESS,
+                far_id: Some(0x50),
+                qer_id: Some(0x55),
+                urr_ids: Vec::new(),
+                outer_header_removal: Some(0),
+                sdf_rule: None,
+                qfi: None,
+            },
+        );
+        session.pdr_teids.write().unwrap().insert(0x55, 0x833);
+        dp.sessions.bind_ul_teid(0x833, 0x83);
+        session.fars.write().unwrap().insert(
+            0x50,
+            DataPlaneFar {
+                far_id: 0x50,
+                apply_action: FAR_ACTION_FORW,
+                destination_interface: SRC_INTF_ACCESS,
+                ohc_teid: Some(0xF0D),
+                ohc_addr: Some(Ipv4Addr::new(127, 58, 3, 1)),
+                bar_id: None,
+            },
+        );
+        let mut qer = DataPlaneQer::new(0x55);
+        qer.set_qfi(5);
+        session.qers.write().unwrap().insert(0x55, qer);
+        let sink = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let tun_fd = std::os::unix::io::AsRawFd::as_raw_fd(&sink);
+
+        // A downlink packet the source forwards: from the network, TO the UE.
+        let mut dl = make_ipv4_udp_packet([8, 8, 8, 8], ue_ip.octets(), 53, 1234);
+        finalize_ipv4(&mut dl);
+        dp.handle_uplink_packet(&encapsulate_dl_gpdu(&dl, 0x833, None), sgw, tun_fd)
+            .await;
+        let mut buf = [0u8; 2048];
+        let (n, _) = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            target.recv_from(&mut buf),
+        )
+        .await
+        .expect("the forwarded packet must reach the target")
+        .unwrap();
+        let header = parse_gtpu_header(&buf[..n]).unwrap();
+        assert_eq!(header.teid, 0xF0D, "on the target's forwarding tunnel");
+        assert_eq!(
+            extract_qfi_from_gtp_header(&buf[..n]),
+            Some(5),
+            "with the bearer's QFI added"
+        );
+        assert_eq!(&buf[header.header_len..n], &dl[..], "inner packet intact");
+        assert_eq!(
+            dp.stats.ul_packets.load(Ordering::Relaxed),
+            0,
+            "not an uplink"
+        );
+
+        // The session's own uplink tunnel is not taken by the forwarding PDR, although
+        // that PDR is first in precedence order.
+        let mut ul = make_ipv4_udp_packet(ue_ip.octets(), [8, 8, 8, 8], 1234, 53);
+        finalize_ipv4(&mut ul);
+        dp.handle_uplink_packet(&encapsulate_dl_gpdu(&ul, 0x831, None), sgw, tun_fd)
+            .await;
+        assert_eq!(dp.stats.ul_packets.load(Ordering::Relaxed), 1, "to the TUN");
+        assert!(
+            tokio::time::timeout(
+                tokio::time::Duration::from_millis(200),
+                target.recv_from(&mut buf)
+            )
+            .await
+            .is_err(),
+            "nothing relayed for the uplink tunnel"
+        );
+
+        // Moving the session's DL tunnel (execution) leaves the forwarding FAR alone.
+        dp.update_session_from_pfcp(0x83, Some(0xABCD), Some("10.1.2.3:2152".parse().unwrap()));
+        let session = dp.sessions.find_by_seid(0x83).unwrap();
+        let fars = session.fars.read().unwrap();
+        assert_eq!(fars[&2].ohc_teid, Some(0xABCD), "the DL FAR moves");
+        assert_eq!(
+            fars[&0x50].ohc_teid,
+            Some(0xF0D),
+            "the forwarding FAR does not"
+        );
+        assert_eq!(session.pdr_teids.read().unwrap().get(&0x55), Some(&0x833));
+    }
+
     #[tokio::test]
     async fn tun_path_traffic_is_reported_in_the_stats_summary_and_metrics() {
         let shutdown = Arc::new(AtomicBool::new(false));

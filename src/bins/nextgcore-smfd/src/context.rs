@@ -984,6 +984,11 @@ pub struct HandoverInfo {
     /// #475: the PDR this handover created for the N3 uplink at step 6, removed again on
     /// CANCELLED.
     pub n3_ul_pdr_id: Option<u16>,
+    /// #583: the AMF indicated direct data forwarding (TS 29.502 `directForwardingFlag`).
+    pub direct_data_forwarding: bool,
+    /// #583: the EPS bearers whose indirect forwarding tunnel this handover installed at the
+    /// UPF (TS 23.502 §4.11.1.2.2.2 step 12), released by the step-14 timer or on CANCELLED.
+    pub forwarding_ebis: Vec<u8>,
 }
 
 /// Charging info
