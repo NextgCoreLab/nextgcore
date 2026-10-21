@@ -2833,7 +2833,6 @@ dependencies = [
  "nextgcore-nas",
  "nextgcore-s1ap",
  "nextgcore-s1ap-gen",
- "nextgcore-s1ap-oracle",
  "nextgcore-sctp",
  "proptest",
  "serde",
@@ -3123,16 +3122,6 @@ dependencies = [
  "bitvec",
  "log",
  "nextgcore-s1ap",
- "nextgcore-s1ap-oracle",
-]
-
-[[package]]
-name = "nextgcore-s1ap-oracle"
-version = "0.1.0"
-dependencies = [
- "nextgcore-asn1c",
- "nextgcore-s1ap",
- "proptest",
 ]
 
 [[package]]

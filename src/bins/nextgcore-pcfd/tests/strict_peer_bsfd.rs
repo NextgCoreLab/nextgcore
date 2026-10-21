@@ -278,8 +278,7 @@ async fn pcfd_client_registers_binding_with_real_bsfd_over_http() {
         SbiResponse::with_status(404)
     };
     nrf_server.start(nrf_handler).await.expect("start mock NRF");
-    nextgcore_sbi::context::global_context()
-        .set_nrf_uri(format!("http://127.0.0.1:{}", nrf_addr.port()))
+    nextgcore_pcfd::test_support::point_nrf_at(format!("http://127.0.0.1:{}", nrf_addr.port()))
         .await;
 
     let run = async {
@@ -358,8 +357,7 @@ async fn pcfd_updates_binding_ip_at_real_bsfd_over_http() {
         SbiResponse::with_status(404)
     };
     nrf_server.start(nrf_handler).await.expect("start mock NRF");
-    nextgcore_sbi::context::global_context()
-        .set_nrf_uri(format!("http://127.0.0.1:{}", nrf_addr.port()))
+    nextgcore_pcfd::test_support::point_nrf_at(format!("http://127.0.0.1:{}", nrf_addr.port()))
         .await;
 
     let run = async {
@@ -499,8 +497,7 @@ async fn sm_policy_update_wires_the_bsf_binding_update() {
         SbiResponse::with_status(404)
     };
     nrf_server.start(nrf_handler).await.expect("start mock NRF");
-    nextgcore_sbi::context::global_context()
-        .set_nrf_uri(format!("http://127.0.0.1:{}", nrf_addr.port()))
+    nextgcore_pcfd::test_support::point_nrf_at(format!("http://127.0.0.1:{}", nrf_addr.port()))
         .await;
 
     // One budget for both waits below. 20 s matches the timeout this replaced.

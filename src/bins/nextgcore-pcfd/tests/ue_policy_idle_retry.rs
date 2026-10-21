@@ -215,9 +215,7 @@ async fn cm_idle_delivery_carries_the_failure_uri_and_retries_on_cm_connected() 
     rec.reject.store(true, Ordering::SeqCst);
     let (amf, amf_port) = start_stub_amf(Arc::clone(&rec)).await;
     let (nrf, nrf_port) = start_stub_nrf(amf_port).await;
-    nextgcore_sbi::context::global_context()
-        .set_nrf_uri(format!("http://127.0.0.1:{nrf_port}"))
-        .await;
+    nextgcore_pcfd::test_support::point_nrf_at(format!("http://127.0.0.1:{nrf_port}")).await;
 
     // A published self identity is what makes `n1n2FailureTxfNotifURI` constructible;
     // without it the member is (correctly) OMITTED, so it must be set for this test to
@@ -401,9 +399,7 @@ async fn a_non_reachability_failure_is_still_terminal() {
         })
         .await;
     let (nrf, nrf_port) = start_stub_nrf(amf_addr.port()).await;
-    nextgcore_sbi::context::global_context()
-        .set_nrf_uri(format!("http://127.0.0.1:{nrf_port}"))
-        .await;
+    nextgcore_pcfd::test_support::point_nrf_at(format!("http://127.0.0.1:{nrf_port}")).await;
 
     let supi = "imsi-001010000009221";
     let id = seed_association(supi);

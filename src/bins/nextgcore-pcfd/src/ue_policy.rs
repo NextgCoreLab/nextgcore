@@ -519,12 +519,31 @@ pub fn ue_policy_mark_delivered(pol_asso_id: &str, upsc: u16) {
 /// registration path; the matched-sim E2E (item E9) must sign it off before
 /// it ships default-on.
 pub fn delivery_enabled() -> bool {
-    match std::env::var("PCF_UE_POLICY_DELIVERY") {
-        Ok(v) => !matches!(
+    delivery_enabled_from(std::env::var(DELIVERY_ENV).ok().as_deref())
+}
+
+/// The environment variable [`delivery_enabled`] reads.
+pub const DELIVERY_ENV: &str = "PCF_UE_POLICY_DELIVERY";
+
+/// Process-wide lock for [`DELIVERY_ENV`] (#541). The variable is process-global, so a
+/// test that sets it changes what every concurrently running test's create/update
+/// handler does: a lifecycle test that created its association while a sibling had
+/// delivery switched off saw no PTI allocated. Every test that sets the variable or
+/// depends on its value holds this, through `test_support::ue_policy_delivery`. Declared
+/// beside the reader, not in a `mod tests`, so tests in other modules and in the
+/// integration-test crates serialise on the SAME lock.
+pub static DELIVERY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Whether a [`DELIVERY_ENV`] value leaves delivery ON: unset or any value other than
+/// `off`/`0`/`false`/`disabled`/`no` (case-insensitive, trimmed). Pure, so the
+/// kill-switch parsing is testable without touching the process environment.
+pub fn delivery_enabled_from(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "off" | "0" | "false" | "disabled" | "no"
         ),
-        Err(_) => true,
+        None => true,
     }
 }
 
@@ -554,8 +573,14 @@ pub const UE_POLICY_MAX_RETRANSMISSIONS: u8 = 1;
 /// T3501 default duration (TS 24.501 D.7). Env-tunable via `PCF_T3501_SECS`
 /// (seconds); defaults to 30s. A zero/invalid value falls back to the default.
 pub fn t3501_duration() -> std::time::Duration {
-    let secs = std::env::var("PCF_T3501_SECS")
-        .ok()
+    t3501_duration_from(std::env::var("PCF_T3501_SECS").ok().as_deref())
+}
+
+/// [`t3501_duration`] for a given `PCF_T3501_SECS` value. Pure, so the parsing is
+/// testable without mutating the process-global environment that every concurrently
+/// running delivery reads.
+pub fn t3501_duration_from(value: Option<&str>) -> std::time::Duration {
+    let secs = value
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&s| s > 0)
         .unwrap_or(30);
@@ -2046,11 +2071,25 @@ mod tests {
     /// The kill-switch restores association-only behaviour when disabled.
     #[test]
     fn delivery_kill_switch() {
-        std::env::set_var("PCF_UE_POLICY_DELIVERY", "off");
-        assert!(!delivery_enabled());
-        std::env::set_var("PCF_UE_POLICY_DELIVERY", "on");
-        assert!(delivery_enabled());
-        std::env::remove_var("PCF_UE_POLICY_DELIVERY");
+        // The parsing, on values rather than on the process environment (#541): setting
+        // the variable here switched delivery off for every handler running alongside.
+        for off in ["off", "0", "false", "disabled", "no", " OFF ", "No"] {
+            assert!(
+                !delivery_enabled_from(Some(off)),
+                "{off:?} disables delivery"
+            );
+        }
+        for on in ["on", "1", "true", "", "yes"] {
+            assert!(delivery_enabled_from(Some(on)), "{on:?} leaves delivery on");
+        }
+        assert!(delivery_enabled_from(None), "unset leaves delivery on");
+
+        // And `delivery_enabled` reads the variable, under the variable's own lock.
+        {
+            let _off = crate::test_support::ue_policy_delivery(false);
+            assert!(!delivery_enabled());
+        }
+        let _on = crate::test_support::ue_policy_delivery(true);
         assert!(delivery_enabled());
     }
 
@@ -2497,12 +2536,28 @@ mod tests {
     /// back to the default.
     #[test]
     fn t3501_duration_env_tunable() {
-        std::env::set_var("PCF_T3501_SECS", "5");
-        assert_eq!(t3501_duration(), std::time::Duration::from_secs(5));
-        std::env::set_var("PCF_T3501_SECS", "0");
-        assert_eq!(t3501_duration(), std::time::Duration::from_secs(30));
-        std::env::remove_var("PCF_T3501_SECS");
-        assert_eq!(t3501_duration(), std::time::Duration::from_secs(30));
+        // On values, not the process environment: every delivery running alongside
+        // reads `PCF_T3501_SECS`, so setting it here moved their timers.
+        assert_eq!(
+            t3501_duration_from(Some("5")),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            t3501_duration_from(Some(" 7 ")),
+            std::time::Duration::from_secs(7)
+        );
+        assert_eq!(
+            t3501_duration_from(Some("0")),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            t3501_duration_from(Some("x")),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            t3501_duration_from(None),
+            std::time::Duration::from_secs(30)
+        );
     }
 
     /// A UE that never answers yields exactly one retransmission then Failed at

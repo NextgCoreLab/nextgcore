@@ -1,12 +1,13 @@
 //! #514 stage 12: the rest of mmed's S1AP on the generated codec.
 //!
 //! Oracle: the pre-change hand-written builders and parser
-//! (`nextgcore_s1ap_oracle::builder`, `decode_s1ap_pdu`). Golden: octets derived by
+//! (`test_codec::builder`, `decode_s1ap_pdu`: since #514 stage 13b the generated codec with an independently written domain mapping, and builders for messages mmed sends check that their output decodes back to their input). Golden: octets derived by
 //! hand from X.691 (APER) for TS 36.413 §9.1.8.14.
 
 use super::*;
 use crate::context::{MmeContext, S1apCauseGroup};
 use crate::s1ap_build::cause_to_s1ap;
+use crate::s1ap_gen::test_codec::{builder, decode_s1ap_pdu};
 use crate::s1ap_handler::handle_s1ap_message;
 use nextgcore_s1ap::{
     CsFallbackIndicator, EnbConfigurationUpdate, EnbConfigurationUpdateAcknowledge,
@@ -17,7 +18,6 @@ use nextgcore_s1ap::{
     UeContextModificationResponse, UeSecurityCapabilities, WarningAreaList,
     WriteReplaceWarningRequest,
 };
-use nextgcore_s1ap_oracle::{builder, decode_s1ap_pdu};
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
