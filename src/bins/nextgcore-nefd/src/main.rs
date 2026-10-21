@@ -2000,22 +2000,28 @@ fn valid_ue_identity(identity: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
     /// Serializes the tests that touch the process-global NEF context so
-    /// they cannot race (the context is process-global; parallel tests that
-    /// re-init or mutate it flake — see the CI global-state learning).
-    static GLOBAL_TEST_LOCK: Mutex<()> = Mutex::new(());
-
+    /// they cannot race. The lock itself lives beside the global
+    /// (`context::NEF_CONTEXT_TEST_LOCK`) so every test module shares it.
     fn lock_globals() -> std::sync::MutexGuard<'static, ()> {
-        GLOBAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        crate::context::lock_nef_context_for_test()
     }
 
     /// Reset the process-global context to a fresh, initialized state.
     /// Callers must hold [`lock_globals`].
     fn reset_context() {
+        reset_context_with_capacity(1024, 1024);
+    }
+
+    /// [`reset_context`] with explicit caps. Every test that re-initialises the
+    /// context must come through here: re-running `nef_context_final` +
+    /// `nef_context_init` by hand keeps the previous test's producer URIs
+    /// (#548 — the capacity test inherited a dead AMF from a sibling and got 503
+    /// instead of 201). Callers must hold [`lock_globals`].
+    fn reset_context_with_capacity(max_subscriptions: usize, max_transactions: usize) {
         nef_context_final();
-        nef_context_init(1024, 1024);
+        nef_context_init(max_subscriptions, max_transactions);
         // #111: CLEAR the southbound producer URIs too. `nef_context_final` +
         // `nef_context_init` did not, so a test that pointed the context at a
         // producer leaked it into every later test -- which then attempted a real
@@ -2432,9 +2438,9 @@ mod tests {
     #[test]
     fn monitoring_create_at_capacity_returns_507() {
         let _guard = lock_globals();
-        // Re-init with a cap of one subscription.
-        nef_context_final();
-        nef_context_init(1, 1);
+        // Re-init with a cap of one subscription, and no producer URIs, so the
+        // first create is DEFERRED (201) whatever a sibling test configured.
+        reset_context_with_capacity(1, 1);
 
         let first = block_on(handle_monitoring_subscription_create(
             "af1",
@@ -2454,8 +2460,7 @@ mod tests {
         assert_eq!(body["cause"], "MAX_SUBSCRIPTIONS_REACHED");
 
         // Restore the default test capacity for other tests.
-        nef_context_final();
-        nef_context_init(1024, 1024);
+        reset_context();
     }
 
     // ── Monitoring Event create: success path (acceptance: 201 + Location;
@@ -3437,7 +3442,13 @@ mod northbound_auth_tests {
     }
 
     async fn start_enforcing_server(jwks: serde_json::Value) -> (SbiServer, u16) {
-        super::nef_context_init(256, 256);
+        // #548: re-initialising the shared context must happen under the same
+        // lock `mod tests` uses, or it can land inside another test's
+        // final->init window and change that test's capacity.
+        {
+            let _guard = crate::context::lock_nef_context_for_test();
+            super::nef_context_init(256, 256);
+        }
         let (port_listener, port_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
         let port = port_addr.port();
         let mut cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
