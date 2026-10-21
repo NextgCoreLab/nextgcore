@@ -199,9 +199,7 @@ async fn delivery_targets_the_amf_matching_the_stored_guami() {
     let queries: Arc<Mutex<Vec<Discovery>>> = Arc::new(Mutex::new(Vec::new()));
     let (nrf_srv, nrf_port) = start_stub_nrf(wrong_port, serving_port, Arc::clone(&queries)).await;
 
-    nextgcore_sbi::context::global_context()
-        .set_nrf_uri(format!("http://127.0.0.1:{nrf_port}"))
-        .await;
+    nextgcore_pcfd::test_support::point_nrf_at(format!("http://127.0.0.1:{nrf_port}")).await;
 
     let supi = "imsi-001010000009201";
     let assoc = ue_policy_add(supi, "http://127.0.0.1:9/ue-policy-notify", "");
@@ -320,9 +318,7 @@ async fn subscribe_targets_the_same_serving_amf_as_delivery() {
     let queries: Arc<Mutex<Vec<Discovery>>> = Arc::new(Mutex::new(Vec::new()));
     let (nrf_srv, nrf_port) = start_stub_nrf(wrong_port, serving_port, Arc::clone(&queries)).await;
 
-    nextgcore_sbi::context::global_context()
-        .set_nrf_uri(format!("http://127.0.0.1:{nrf_port}"))
-        .await;
+    nextgcore_pcfd::test_support::point_nrf_at(format!("http://127.0.0.1:{nrf_port}")).await;
 
     let supi = "imsi-001010000009202";
     let assoc = ue_policy_add(supi, "http://127.0.0.1:9/ue-policy-notify", "");
@@ -409,9 +405,7 @@ async fn no_stored_guami_falls_back_to_the_first_endpoint() {
     let queries: Arc<Mutex<Vec<Discovery>>> = Arc::new(Mutex::new(Vec::new()));
     let (nrf_srv, nrf_port) = start_stub_nrf(first_port, second_port, Arc::clone(&queries)).await;
 
-    nextgcore_sbi::context::global_context()
-        .set_nrf_uri(format!("http://127.0.0.1:{nrf_port}"))
-        .await;
+    nextgcore_pcfd::test_support::point_nrf_at(format!("http://127.0.0.1:{nrf_port}")).await;
 
     // No `ue_policy_set_serving_amf` call: an association as it would exist before
     // #92, or one created by an AMF that sent no `guami`.

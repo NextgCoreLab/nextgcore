@@ -83,4 +83,58 @@ pub mod test_support {
     pub fn init_context() {
         crate::context::pcf_context_init(64, 64);
     }
+
+    /// Point the process-global NRF URI at a test's mock, dropping every cached SBI
+    /// client first (#529).
+    ///
+    /// The client cache (`nextgcore_sbi::context::global_context`) is process-global and
+    /// keyed by host:port, but each cached client's HTTP/2 connection is driven by a task
+    /// on the tokio runtime that FIRST used it -- and every `#[tokio::test]` has its own
+    /// runtime. A client another test created toward this mock dies with that test's
+    /// runtime, and the next request through it fails with "dispatch task is gone":
+    /// `a_change_for_one_slice_does_not_reauthorise_another_slices_session` saw exactly
+    /// that on its NRF discovery, so nothing was re-authorised. Clearing here means the
+    /// clients a test uses are created on its own runtime. Call it with
+    /// [`CONTEXT_GUARD`] held, as every test that touches the NRF URI must.
+    pub async fn point_nrf_at(uri: impl Into<String>) {
+        let ctx = nextgcore_sbi::context::global_context();
+        ctx.clear_clients().await;
+        ctx.set_nrf_uri(uri).await;
+    }
+
+    /// `PCF_UE_POLICY_DELIVERY` pinned to `enabled` for as long as the returned guard
+    /// lives (#541). Holds [`crate::ue_policy::DELIVERY_ENV_LOCK`], so no other test can
+    /// change the variable underneath the holder, and restores the previous value on
+    /// drop. Every test that sets the variable, or whose assertions depend on delivery
+    /// being on or off, takes one of these instead of calling `std::env::set_var`.
+    pub fn ue_policy_delivery(enabled: bool) -> UePolicyDeliveryEnv {
+        let guard = crate::ue_policy::DELIVERY_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os(crate::ue_policy::DELIVERY_ENV);
+        std::env::set_var(
+            crate::ue_policy::DELIVERY_ENV,
+            if enabled { "on" } else { "off" },
+        );
+        UePolicyDeliveryEnv {
+            previous,
+            _guard: guard,
+        }
+    }
+
+    /// Guard returned by [`ue_policy_delivery`].
+    pub struct UePolicyDeliveryEnv {
+        previous: Option<std::ffi::OsString>,
+        // Declared last so it drops after `Drop::drop` has restored the variable.
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for UePolicyDeliveryEnv {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(v) => std::env::set_var(crate::ue_policy::DELIVERY_ENV, v),
+                None => std::env::remove_var(crate::ue_policy::DELIVERY_ENV),
+            }
+        }
+    }
 }

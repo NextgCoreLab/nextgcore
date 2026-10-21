@@ -2736,9 +2736,7 @@ mod tests {
         server.start(handler).await.expect("start mock NRF/UDR");
 
         // Point the PCF's SBI context at the mock NRF.
-        global_context()
-            .set_nrf_uri(format!("http://127.0.0.1:{port}"))
-            .await;
+        crate::test_support::point_nrf_at(format!("http://127.0.0.1:{port}")).await;
 
         let run = async {
             // Discovery returns the UDR's nudr-dr endpoint (pointing at the mock).
