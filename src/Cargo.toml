@@ -2,7 +2,7 @@
 resolver = "2"
 # The patched sctp-proto (#467) is a [patch.crates-io] path crate, not a member;
 # excluded so its own tests and lints are not counted as this workspace's.
-exclude = ["vendor/sctp-proto"]
+exclude = ["vendor/sctp-proto", "fuzz"]
 
 members = [
     # Library crates (mirrors lib/)

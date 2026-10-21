@@ -8,6 +8,14 @@ publish = false
 [package.metadata]
 cargo-fuzz = true
 
+# Its own workspace (the cargo-fuzz layout), not a member of `src/Cargo.toml`
+# (#587): libfuzzer-sys compiles libFuzzer's C++ in its build script, and the
+# targets are only meaningful under `cargo +nightly fuzz`, so neither belongs in
+# every `cargo build/test --workspace`. Without this table cargo refuses to
+# build the crate at all ("believes it's in a workspace when it's not").
+# CI keeps it compiling: the `fuzz-build` job in .github/workflows/ci.yml.
+[workspace]
+
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
@@ -17,7 +25,10 @@ nextgcore-pfcp = { path = "../libs/nextgcore-pfcp" }
 nextgcore-gtp = { path = "../libs/nextgcore-gtp" }
 nextgcore-nas = { path = "../libs/nextgcore-nas" }
 nextgcore-ngap = { path = "../libs/nextgcore-ngap" }
+nextgcore-ngap-gen = { path = "../libs/nextgcore-ngap-gen" }
 nextgcore-s1ap-gen = { path = "../libs/nextgcore-s1ap-gen" }
+nextgcore-nrppa-gen = { path = "../libs/nextgcore-nrppa-gen" }
+nextgcore-lpp-gen = { path = "../libs/nextgcore-lpp-gen" }
 nextgcore-diameter = { path = "../libs/nextgcore-diameter" }
 
 # Workspace members used for fuzzing
@@ -66,6 +77,20 @@ bench = false
 [[bin]]
 name = "fuzz_s1ap_message"
 path = "fuzz_targets/fuzz_s1ap_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_nrppa_message"
+path = "fuzz_targets/fuzz_nrppa_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_lpp_message"
+path = "fuzz_targets/fuzz_lpp_message.rs"
 test = false
 doc = false
 bench = false
