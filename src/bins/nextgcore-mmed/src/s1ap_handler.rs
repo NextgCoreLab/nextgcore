@@ -455,6 +455,134 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
             },
         }
     }
+    // Handover, part 1, is decoded with the generated codec (#514 stage 8a).
+    {
+        use crate::s1ap_gen::{Class2Decode, ResponseDecode};
+        if crate::s1ap_gen::is_initiating(data, crate::s1ap_gen::PROC_HANDOVER_NOTIFICATION) {
+            match crate::s1ap_gen::decode_handover_notify(data) {
+                Class2Decode::Proceed { msg, notify } => {
+                    let mut out = class2_notify(
+                        enb_id,
+                        crate::s1ap_gen::PROC_HANDOVER_NOTIFICATION,
+                        Some(msg.enb_ue_s1ap_id),
+                        Some(msg.mme_ue_s1ap_id),
+                        &notify,
+                    );
+                    out.extend(handle_handover_notify_at(
+                        ctx,
+                        enb_id,
+                        msg.mme_ue_s1ap_id,
+                        msg.location.as_ref().map(|(t, c)| (t, c)),
+                    ));
+                    return out;
+                }
+                Class2Decode::Reject {
+                    ies,
+                    enb_ue_s1ap_id,
+                    mme_ue_s1ap_id,
+                } => {
+                    return class2_reject(
+                        enb_id,
+                        crate::s1ap_gen::PROC_HANDOVER_NOTIFICATION,
+                        enb_ue_s1ap_id,
+                        mme_ue_s1ap_id,
+                        &ies,
+                    );
+                }
+                Class2Decode::Undecodable => {}
+            }
+        }
+        if crate::s1ap_gen::is_initiating(data, crate::s1ap_gen::PROC_ENB_STATUS_TRANSFER) {
+            match crate::s1ap_gen::decode_enb_status_transfer(data) {
+                Class2Decode::Proceed { msg, notify } => {
+                    let mut out = class2_notify(
+                        enb_id,
+                        crate::s1ap_gen::PROC_ENB_STATUS_TRANSFER,
+                        Some(msg.enb_ue_s1ap_id),
+                        Some(msg.mme_ue_s1ap_id),
+                        &notify,
+                    );
+                    out.extend(handle_enb_status_transfer(ctx, enb_id, &msg));
+                    return out;
+                }
+                Class2Decode::Reject {
+                    ies,
+                    enb_ue_s1ap_id,
+                    mme_ue_s1ap_id,
+                } => {
+                    return class2_reject(
+                        enb_id,
+                        crate::s1ap_gen::PROC_ENB_STATUS_TRANSFER,
+                        enb_ue_s1ap_id,
+                        mme_ue_s1ap_id,
+                        &ies,
+                    );
+                }
+                Class2Decode::Undecodable => {}
+            }
+        }
+        if crate::s1ap_gen::is_initiating(data, crate::s1ap_gen::PROC_HANDOVER_CANCEL) {
+            // Class 1 with a response: `notify` IEs go in the acknowledge's
+            // diagnostics; a `reject` IE stops the procedure. HANDOVER CANCEL
+            // has no failure message, so that is reported by ERROR INDICATION.
+            match crate::s1ap_gen::decode_handover_cancel(data) {
+                Class2Decode::Proceed { msg, notify } => {
+                    return handle_handover_cancel_reporting(ctx, enb_id, &msg, &notify);
+                }
+                Class2Decode::Reject {
+                    ies,
+                    enb_ue_s1ap_id,
+                    mme_ue_s1ap_id,
+                } => {
+                    return class2_reject(
+                        enb_id,
+                        crate::s1ap_gen::PROC_HANDOVER_CANCEL,
+                        enb_ue_s1ap_id,
+                        mme_ue_s1ap_id,
+                        &ies,
+                    );
+                }
+                Class2Decode::Undecodable => {}
+            }
+        }
+        if crate::s1ap_gen::is_outcome(
+            data,
+            false,
+            crate::s1ap_gen::PROC_HANDOVER_RESOURCE_ALLOCATION,
+        ) {
+            match crate::s1ap_gen::decode_handover_failure(data) {
+                ResponseDecode::Decoded { msg, notify } => {
+                    let mut out = if notify.is_empty() {
+                        Vec::new()
+                    } else {
+                        error_indication_with_diagnostics(
+                            enb_id,
+                            None,
+                            Some(msg.mme_ue_s1ap_id),
+                            S1apCauseGroup::Protocol,
+                            protocol_cause::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+                            Some(crate::s1ap_gen::error_indication_diagnostics_for(
+                                crate::s1ap_gen::PROC_HANDOVER_RESOURCE_ALLOCATION,
+                                nextgcore_s1ap::triggering_message::UNSUCCESSFUL_OUTCOME,
+                                0,
+                                &notify,
+                            )),
+                        )
+                    };
+                    out.extend(handle_handover_failure(ctx, enb_id, &msg));
+                    return out;
+                }
+                ResponseDecode::Failed(ies) => {
+                    log::error!(
+                        "Handover Failure from eNB {enb_id} carries a reject IE \
+                         (TS 36.413 §10.3.4.2); handled locally: {ies:?}"
+                    );
+                    return Vec::new();
+                }
+                ResponseDecode::Undecodable => {}
+            }
+        }
+    }
     let message = match decode_s1ap_pdu(data) {
         Ok(message) => message,
         Err(e) => {
@@ -1661,7 +1789,7 @@ fn handover_preparation_failure(
         enb_ue_s1ap_id,
         cause: s1ap_build::cause_to_s1ap(S1apCauseGroup::RadioNetwork, cause_value),
     };
-    match builder::build_handover_preparation_failure(&failure) {
+    match crate::s1ap_gen::build_handover_preparation_failure(&failure) {
         Ok(pdu) => S1apSend::to_origin(enb_id, pdu),
         Err(e) => {
             log::error!("Failed to build Handover Preparation Failure: {e}");
@@ -1987,7 +2115,7 @@ pub fn handle_enb_status_transfer(
         enb_ue_s1ap_id: target_ue.enb_ue_s1ap_id,
         status_transfer_container: msg.status_transfer_container.clone(),
     };
-    match builder::build_mme_status_transfer(&relay) {
+    match crate::s1ap_gen::build_mme_status_transfer(&relay) {
         Ok(pdu) => {
             log::info!(
                 "Relaying eNB Status Transfer ({} bytes) to target eNB {} as MME Status Transfer",
@@ -2047,7 +2175,7 @@ pub fn handle_handover_failure(
         enb_ue_s1ap_id: source_ue.enb_ue_s1ap_id,
         cause: msg.cause,
     };
-    match builder::build_handover_preparation_failure(&failure) {
+    match crate::s1ap_gen::build_handover_preparation_failure(&failure) {
         Ok(pdu) => vec![S1apSend {
             enb_id: source_ue.enb_id,
             pdu,
@@ -2063,23 +2191,39 @@ pub fn handle_handover_failure(
 /// switching the UE onto the target context and releasing the source.
 pub fn handle_handover_notify(
     ctx: &MmeContext,
-    _enb_id: u64,
+    enb_id: u64,
     msg: &HandoverNotify,
 ) -> Vec<S1apSend> {
-    let Some(target_ue_id) = ctx.enb_ue_find_by_mme_ue_s1ap_id(msg.mme_ue_s1ap_id) else {
-        log::error!(
-            "Handover Notify for unknown mme_ue_s1ap_id={}",
-            msg.mme_ue_s1ap_id
-        );
+    handle_handover_notify_at(
+        ctx,
+        enb_id,
+        msg.mme_ue_s1ap_id,
+        Some((&msg.tai, &msg.eutran_cgi)),
+    )
+}
+
+/// [`handle_handover_notify`] for a notify whose EUTRAN-CGI / TAI (both
+/// criticality `ignore`, TS 36.413 §10.3.5) may be missing: without them the
+/// UE's stored location is left as it is (#514 stage 8a).
+pub fn handle_handover_notify_at(
+    ctx: &MmeContext,
+    _enb_id: u64,
+    mme_ue_s1ap_id: u32,
+    location: Option<(&nextgcore_s1ap::Tai, &nextgcore_s1ap::EutranCgi)>,
+) -> Vec<S1apSend> {
+    let Some(target_ue_id) = ctx.enb_ue_find_by_mme_ue_s1ap_id(mme_ue_s1ap_id) else {
+        log::error!("Handover Notify for unknown mme_ue_s1ap_id={mme_ue_s1ap_id}");
         return Vec::new();
     };
     let Some(target_ue) = ctx.enb_ue_find_by_id(target_ue_id) else {
         return Vec::new();
     };
 
-    let tai = tai_from_s1ap(&msg.tai);
-    let e_cgi = ecgi_from_s1ap(&msg.eutran_cgi);
-    update_ue_location(ctx, target_ue.mme_ue_id, &tai, &e_cgi);
+    if let Some((tai, cgi)) = location {
+        let tai = tai_from_s1ap(tai);
+        let e_cgi = ecgi_from_s1ap(cgi);
+        update_ue_location(ctx, target_ue.mme_ue_id, &tai, &e_cgi);
+    }
 
     // Switch the bearers onto the target eNB endpoints
     for bearer_id in ue_bearers(ctx, target_ue.mme_ue_id).iter().map(|b| b.id) {
@@ -2168,6 +2312,18 @@ pub fn handle_handover_cancel(
     enb_id: u64,
     msg: &HandoverCancel,
 ) -> Vec<S1apSend> {
+    handle_handover_cancel_reporting(ctx, enb_id, msg, &[])
+}
+
+/// [`handle_handover_cancel`], reporting `cancel_notify` (unknown
+/// ignore-and-notify IEs of the HANDOVER CANCEL, a Class 1 initiating message)
+/// in the acknowledge's Criticality Diagnostics (TS 36.413 §10.3.4.2).
+pub fn handle_handover_cancel_reporting(
+    ctx: &MmeContext,
+    enb_id: u64,
+    msg: &HandoverCancel,
+    cancel_notify: &[crate::s1ap_gen::DiagnosedIe],
+) -> Vec<S1apSend> {
     let Some(source_ue_id) = ctx.enb_ue_find_by_mme_ue_s1ap_id(msg.mme_ue_s1ap_id) else {
         return error_indication(
             enb_id,
@@ -2213,10 +2369,13 @@ pub fn handle_handover_cancel(
         msg.cause
     );
 
-    match builder::build_handover_cancel_acknowledge(&HandoverCancelAcknowledge {
-        mme_ue_s1ap_id: msg.mme_ue_s1ap_id,
-        enb_ue_s1ap_id: msg.enb_ue_s1ap_id,
-    }) {
+    match crate::s1ap_gen::build_handover_cancel_acknowledge(
+        &HandoverCancelAcknowledge {
+            mme_ue_s1ap_id: msg.mme_ue_s1ap_id,
+            enb_ue_s1ap_id: msg.enb_ue_s1ap_id,
+        },
+        cancel_notify,
+    ) {
         Ok(pdu) => {
             sends.push(S1apSend { enb_id, pdu });
             sends
@@ -3392,7 +3551,10 @@ mod tests {
             .unwrap(),
         );
 
-        let payload = vec![0x00, 0x01, 0xF0, 0x0D, 0x7F, 0x80, 0x2A];
+        // A real ENB-StatusTransfer-TransparentContainer: since #514 stage 8a
+        // the relay re-encodes it with the generated codec, which requires the
+        // ASN.1 type rather than arbitrary octets.
+        let payload = crate::s1ap_gen::handover_tests::sample_container();
         let status = nextgcore_s1ap::EnbStatusTransfer {
             mme_ue_s1ap_id,
             enb_ue_s1ap_id: 100,
