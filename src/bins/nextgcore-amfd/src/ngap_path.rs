@@ -21161,6 +21161,9 @@ mod tests {
     /// configuration, and what is under test is the state machine, not the clock.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_reachability_timers_run_in_sequence_and_end_in_deregistration() {
+        let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
         assert!(
@@ -21216,6 +21219,9 @@ mod tests {
     /// the connection is released, so an idle-timer expiry cannot reach a connected UE.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_connected_ue_is_not_under_reachability_supervision() {
+        let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
         let amf_ue_ngap_id = 7_200_004u64;
@@ -21932,6 +21938,9 @@ mod tests {
     /// long by configuration and what is under test is the emission, not the clock.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_mobile_reachable_expiry_fires_loss_of_connectivity_to_a_subscriber() {
+        let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _guard = crate::test_support::CONTEXT_GUARD
             .lock()
             .unwrap_or_else(|e| e.into_inner());

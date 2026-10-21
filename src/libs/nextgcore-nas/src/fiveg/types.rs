@@ -2,6 +2,7 @@
 //!
 //! Based on 3GPP TS 24.501
 
+use crate::buf::NasBuf;
 use crate::common::types::{PlmnId, Tai};
 use crate::error::{NasError, NasResult};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -235,7 +236,7 @@ impl MobileIdentity {
             });
         }
 
-        let length = buf.get_u16() as usize;
+        let length = buf.read_u16()? as usize;
         if buf.remaining() < length {
             return Err(NasError::BufferTooShort {
                 expected: length,
@@ -243,12 +244,12 @@ impl MobileIdentity {
             });
         }
 
-        let type_byte = buf.chunk()[0];
+        let type_byte = buf.peek_u8()?;
         let id_type = MobileIdentityType::try_from(type_byte & 0x07)?;
 
         match id_type {
             MobileIdentityType::NoIdentity => {
-                buf.advance(length);
+                buf.skip(length)?;
                 Ok(Self::NoIdentity)
             }
             MobileIdentityType::Suci => {
@@ -328,7 +329,7 @@ impl Suci {
         // Peek octet 4 (bits 5-7 = SUPI format) without consuming so the
         // IMSI-format path below stays byte-identical to the original decoder.
         let supi_format = if buf.remaining() >= 1 {
-            (buf.chunk()[0] >> 4) & 0x07
+            (buf.peek_u8()? >> 4) & 0x07
         } else {
             0
         };
@@ -340,7 +341,7 @@ impl Suci {
                     actual: length,
                 });
             }
-            let _first_byte = buf.get_u8();
+            let _first_byte = buf.read_u8()?;
             let nai_len = length - 1;
             if buf.remaining() < nai_len {
                 return Err(NasError::BufferTooShort {
@@ -348,7 +349,7 @@ impl Suci {
                     actual: buf.remaining(),
                 });
             }
-            let scheme_output = buf.copy_to_bytes(nai_len).to_vec();
+            let scheme_output = buf.read_bytes(nai_len)?.to_vec();
             return Ok(Self {
                 supi_format,
                 scheme_output,
@@ -363,15 +364,15 @@ impl Suci {
             });
         }
 
-        let first_byte = buf.get_u8();
+        let first_byte = buf.read_u8()?;
         let supi_format = (first_byte >> 4) & 0x07;
         let plmn_id = PlmnId::decode(buf)?;
         let mut routing_indicator = [0u8; 2];
-        buf.copy_to_slice(&mut routing_indicator);
-        let protection_scheme_id = buf.get_u8();
-        let home_network_pki = buf.get_u8();
+        buf.read_into(&mut routing_indicator)?;
+        let protection_scheme_id = buf.read_u8()?;
+        let home_network_pki = buf.read_u8()?;
         let scheme_output_len = length - 8;
-        let scheme_output = buf.copy_to_bytes(scheme_output_len).to_vec();
+        let scheme_output = buf.read_bytes(scheme_output_len)?.to_vec();
 
         Ok(Self {
             supi_format,
@@ -422,13 +423,13 @@ impl FiveGGuti {
             });
         }
 
-        let _first_byte = buf.get_u8(); // Type indicator
+        let _first_byte = buf.read_u8()?; // Type indicator
         let plmn_id = PlmnId::decode(buf)?;
-        let amf_region_id = buf.get_u8();
-        let amf_id = buf.get_u16();
+        let amf_region_id = buf.read_u8()?;
+        let amf_id = buf.read_u16()?;
         let amf_set_id = (amf_id >> 6) & 0x3FF;
         let amf_pointer = (amf_id & 0x3F) as u8;
-        let tmsi = buf.get_u32();
+        let tmsi = buf.read_u32()?;
 
         Ok(Self {
             plmn_id,
@@ -470,11 +471,11 @@ impl FiveGSTmsi {
             });
         }
 
-        let _first_byte = buf.get_u8();
-        let amf_id = buf.get_u16();
+        let _first_byte = buf.read_u8()?;
+        let amf_id = buf.read_u16()?;
         let amf_set_id = (amf_id >> 6) & 0x3FF;
         let amf_pointer = (amf_id & 0x3F) as u8;
-        let tmsi = buf.get_u32();
+        let tmsi = buf.read_u32()?;
 
         Ok(Self {
             amf_set_id,
@@ -520,11 +521,11 @@ impl Imei {
         }
 
         let mut digits = [0u8; 15];
-        let first_byte = buf.get_u8();
+        let first_byte = buf.read_u8()?;
         digits[0] = (first_byte >> 4) & 0x0F;
 
         for i in 0..7 {
-            let byte = buf.get_u8();
+            let byte = buf.read_u8()?;
             digits[1 + i * 2] = byte & 0x0F;
             if 2 + i * 2 < 15 {
                 digits[2 + i * 2] = (byte >> 4) & 0x0F;
@@ -570,11 +571,11 @@ impl Imeisv {
         }
 
         let mut digits = [0u8; 16];
-        let first_byte = buf.get_u8();
+        let first_byte = buf.read_u8()?;
         digits[0] = (first_byte >> 4) & 0x0F;
 
         for i in 0..8 {
-            let byte = buf.get_u8();
+            let byte = buf.read_u8()?;
             digits[1 + i * 2] = byte & 0x0F;
             if 2 + i * 2 < 16 {
                 digits[2 + i * 2] = (byte >> 4) & 0x0F;
@@ -633,8 +634,8 @@ impl RegistrationResult {
                 actual: buf.remaining(),
             });
         }
-        let _length = buf.get_u8();
-        let byte = buf.get_u8();
+        let _length = buf.read_u8()?;
+        let byte = buf.read_u8()?;
         let sms_allowed = (byte & 0x08) != 0;
         let emergency_registered = (byte & 0x20) != 0;
         let value = match byte & 0x07 {
@@ -783,7 +784,7 @@ impl TaiList {
             });
         }
 
-        let length = buf.get_u8();
+        let length = buf.read_u8()?;
         if buf.remaining() < length as usize {
             return Err(NasError::BufferTooShort {
                 expected: length as usize,
@@ -812,7 +813,7 @@ impl TaiList {
                     actual: buf.remaining(),
                 });
             }
-            let type_byte = buf.get_u8();
+            let type_byte = buf.read_u8()?;
 
             let list_type = (type_byte >> 5) & 0x03;
             let num = (type_byte & 0x1F) as usize + 1;
@@ -832,7 +833,7 @@ impl TaiList {
                             });
                         }
                         let mut tac = [0u8; 3];
-                        buf.copy_to_slice(&mut tac);
+                        buf.read_into(&mut tac)?;
                         tacs.push(tac);
                     }
                     elements.push(TaiListElement::PartialTaiList0 { plmn_id, tacs });
@@ -849,7 +850,7 @@ impl TaiList {
                         });
                     }
                     let mut tac = [0u8; 3];
-                    buf.copy_to_slice(&mut tac);
+                    buf.read_into(&mut tac)?;
                     elements.push(TaiListElement::PartialTaiList1 { plmn_id, tac });
                 }
                 2 => {

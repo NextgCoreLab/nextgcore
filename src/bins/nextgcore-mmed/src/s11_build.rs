@@ -37,6 +37,9 @@ pub mod message_type {
     pub const BEARER_RESOURCE_FAILURE_INDICATION: u8 = 69;
     pub const CHANGE_NOTIFICATION_REQUEST: u8 = 38;
     pub const CHANGE_NOTIFICATION_RESPONSE: u8 = 39;
+    pub const MODIFY_BEARER_COMMAND: u8 = 64;
+    pub const MODIFY_BEARER_FAILURE_INDICATION: u8 = 65;
+    pub const DELETE_BEARER_FAILURE_INDICATION: u8 = 67;
 }
 
 // ============================================================================

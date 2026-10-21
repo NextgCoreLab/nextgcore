@@ -240,7 +240,21 @@ impl DiameterMessage {
     pub fn decode(buf: &mut Bytes) -> DiameterResult<Self> {
         let header = DiameterHeader::decode(buf)?;
 
-        let avp_len = header.length as usize - DIAMETER_HEADER_SIZE;
+        // RFC 6733 §3: Message Length counts the 20-octet header and is always
+        // a multiple of 4. Check before subtracting: a peer-supplied length
+        // below 20 used to underflow here (#596).
+        let length = header.length as usize;
+        if length < DIAMETER_HEADER_SIZE {
+            return Err(DiameterError::InvalidMessage(format!(
+                "message length {length} is less than the header size {DIAMETER_HEADER_SIZE}"
+            )));
+        }
+        if !length.is_multiple_of(4) {
+            return Err(DiameterError::InvalidMessage(format!(
+                "message length {length} is not a multiple of 4"
+            )));
+        }
+        let avp_len = length - DIAMETER_HEADER_SIZE;
         if buf.remaining() < avp_len {
             return Err(DiameterError::BufferTooSmall {
                 needed: avp_len,
@@ -373,5 +387,51 @@ mod tests {
         assert!(answer.header.is_answer());
         assert_eq!(answer.header.command_code, request.header.command_code);
         assert_eq!(answer.header.application_id, request.header.application_id);
+    }
+
+    /// #596 fuzz repro: Message Length 8 (< the 20-octet header). Before the
+    /// check this was `8 - 20` (a debug panic; release wrapped and failed by
+    /// accident).
+    #[test]
+    fn message_length_below_header_size_is_rejected() {
+        let repro: [u8; 21] = [
+            0x01, 0x00, 0x00, 0x08, 0x01, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x2a,
+        ];
+        let err = DiameterMessage::decode(&mut Bytes::copy_from_slice(&repro)).unwrap_err();
+        assert!(
+            matches!(&err, DiameterError::InvalidMessage(m) if m.contains("less than the header")),
+            "{err:?}"
+        );
+        for length in [0u8, 1, 19] {
+            let mut m = repro;
+            m[3] = length;
+            assert!(matches!(
+                DiameterMessage::decode(&mut Bytes::copy_from_slice(&m)),
+                Err(DiameterError::InvalidMessage(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn message_length_not_a_multiple_of_four_is_rejected() {
+        let mut encoded = DiameterMessage::new_request(318, 16777251)
+            .encode()
+            .to_vec();
+        encoded[3] = 22; // header + 2 octets
+        encoded.extend_from_slice(&[0, 0]);
+        let err = DiameterMessage::decode(&mut Bytes::from(encoded)).unwrap_err();
+        assert!(
+            matches!(&err, DiameterError::InvalidMessage(m) if m.contains("multiple of 4")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn header_only_message_decodes() {
+        let encoded = DiameterMessage::new_request(280, 0).encode().freeze();
+        assert_eq!(encoded.len(), DIAMETER_HEADER_SIZE);
+        let decoded = DiameterMessage::decode(&mut encoded.clone()).unwrap();
+        assert!(decoded.avps.is_empty());
     }
 }

@@ -353,11 +353,36 @@ pub fn dispatch_triggered(raw: &[u8], msg_type: u8, sequence_number: u32, peer: 
                 ),
             }
         }
+        // #591: the triggered Request of a Delete Bearer Command / Bearer Resource
+        // Command. It closed the Command; it still needs its own answer.
+        mt::DELETE_BEARER_REQUEST => handle_delete_bearer_request(raw, sequence_number, peer),
+        // A Bearer Resource Command's triggered Create / Update Bearer Request is
+        // handled exactly as the initial one would be.
+        mt::CREATE_BEARER_REQUEST | mt::UPDATE_BEARER_REQUEST => {
+            dispatch_initial(raw, msg_type, sequence_number, peer)
+        }
+        mt::DELETE_BEARER_FAILURE_INDICATION
+        | mt::BEARER_RESOURCE_FAILURE_INDICATION
+        | mt::MODIFY_BEARER_FAILURE_INDICATION => {
+            let cause = failure_indication_cause(raw);
+            log::warn!(
+                "S11 Failure Indication type={msg_type} seq={sequence_number} from {peer}: the \
+                 Command was refused, cause={cause:?} (TS 29.274 §7.2.6/§7.2.14.2/§7.2.17.2)"
+            );
+        }
         other => log::info!(
             "S11 triggered message type={other} seq={sequence_number} from {peer} correlated but \
              not acted on: this MME has no handler for it"
         ),
     }
+}
+
+/// The Cause value of a Failure Indication, if it carries one.
+pub fn failure_indication_cause(raw: &[u8]) -> Option<u8> {
+    let mut bytes = bytes::Bytes::copy_from_slice(raw);
+    let msg = nextgcore_gtp::v2::Gtp2Message::decode(&mut bytes).ok()?;
+    msg.get_ie(nextgcore_gtp::v2::Gtp2IeType::Cause as u8, 0)
+        .and_then(|ie| ie.value.first().copied())
 }
 
 /// Apply a Create Session Response to the session and bearer it answers.
@@ -945,37 +970,46 @@ pub fn dispatch_initial(raw: &[u8], msg_type: u8, sequence_number: u32, peer: So
             }
             Err(e) => log::error!("S11 Downlink Data Notification from {peer} unparsable: {e:?}"),
         },
-        mt::DELETE_BEARER_REQUEST => {
-            let local_teid = parse_gtp_header(raw)
-                .map(|(_, teid, _, _)| teid)
-                .unwrap_or(0);
-            let ebis = delete_bearer_request_ebis(raw);
-            match delete_enb_released_bearers(crate::context::mme_self(), local_teid, &ebis) {
-                Some((sgw_teid, deleted)) => {
-                    match crate::s11_build::build_delete_bearer_response_for_ebis(
-                        sgw_teid,
-                        &deleted,
-                        crate::s11_build::GtpCause::RequestAccepted,
-                        sequence_number,
-                    ) {
-                        Ok(rsp) => {
-                            if let Err(e) = crate::gtp_path::send_response_to_sgwc(peer, &rsp) {
-                                log::error!("S11 Delete Bearer Response to {peer} failed: {e}");
-                            }
-                        }
-                        Err(e) => log::error!("Delete Bearer Response build failed: {e}"),
-                    }
-                }
-                None => log::info!(
-                    "S11 Delete Bearer Request seq={sequence_number} from {peer} for EBIs \
-                     {ebis:?} names no bearer the eNB released; network-initiated bearer \
-                     deactivation (TS 23.401 §5.4.4.1) is not implemented by this MME"
-                ),
-            }
-        }
+        mt::DELETE_BEARER_REQUEST => handle_delete_bearer_request(raw, sequence_number, peer),
         other => log::info!(
             "S11 initial message type={other} seq={sequence_number} from {peer} not handled: this \
              MME originates no procedure for it"
+        ),
+    }
+}
+
+/// A Delete Bearer Request from the Serving GW: delete the bearers the eNB
+/// released and answer (TS 23.401 §5.4.4.2 steps 6-8).
+///
+/// Reached two ways (#591): as the triggered message of this MME's Delete Bearer
+/// Command (TS 29.274 §7.6: same sequence number, it closes the Command), routed
+/// by [`dispatch_triggered`]; or as an initial message, routed by
+/// [`dispatch_initial`]. The handling is the same; only the transaction differs.
+fn handle_delete_bearer_request(raw: &[u8], sequence_number: u32, peer: SocketAddr) {
+    let local_teid = parse_gtp_header(raw)
+        .map(|(_, teid, _, _)| teid)
+        .unwrap_or(0);
+    let ebis = delete_bearer_request_ebis(raw);
+    match delete_enb_released_bearers(crate::context::mme_self(), local_teid, &ebis) {
+        Some((sgw_teid, deleted)) => {
+            match crate::s11_build::build_delete_bearer_response_for_ebis(
+                sgw_teid,
+                &deleted,
+                crate::s11_build::GtpCause::RequestAccepted,
+                sequence_number,
+            ) {
+                Ok(rsp) => {
+                    if let Err(e) = crate::gtp_path::send_response_to_sgwc(peer, &rsp) {
+                        log::error!("S11 Delete Bearer Response to {peer} failed: {e}");
+                    }
+                }
+                Err(e) => log::error!("Delete Bearer Response build failed: {e}"),
+            }
+        }
+        None => log::info!(
+            "S11 Delete Bearer Request seq={sequence_number} from {peer} for EBIs \
+             {ebis:?} names no bearer the eNB released; network-initiated bearer \
+             deactivation (TS 23.401 §5.4.4.1) is not implemented by this MME"
         ),
     }
 }
@@ -2299,6 +2333,61 @@ mod tests {
             Some(6)
         );
         release_global_ue(mme_ue_id, sess_id, bearer_id);
+    }
+
+    /// #591: the Delete Bearer Request that answers this MME's Delete Bearer
+    /// Command is routed as the Command's triggered message, and it still deletes
+    /// the bearer the eNB released (TS 23.401 §5.4.4.2 steps 6-8). Before #591
+    /// the transaction layer never matched it, and once it does, a
+    /// `dispatch_triggered` without this arm would only log it.
+    #[test]
+    fn a_triggered_delete_bearer_request_deletes_the_released_bearer() {
+        let _guard = crate::gtp_path::lock_s11();
+        let (mme_ue_id, _, sess_id, bearer_id, local_teid) = seed_global_ue(6);
+        let ctx = crate::context::mme_self();
+        if let Ok(mut pool) = ctx.bearer_pool.write() {
+            pool.get_mut(&bearer_id).unwrap().released_by_enb = true;
+        }
+
+        let mut req = nextgcore_gtp::v2::Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+            crate::s11_build::message_type::DELETE_BEARER_REQUEST,
+            local_teid,
+            0x0591,
+        ));
+        req.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
+            nextgcore_gtp::v2::Gtp2IeType::Ebi as u8,
+            1,
+            &[6],
+        ));
+        dispatch_triggered(
+            &req.encode(),
+            crate::s11_build::message_type::DELETE_BEARER_REQUEST,
+            0x0591,
+            "127.0.0.1:2123".parse().unwrap(),
+        );
+
+        assert!(
+            ctx.bearer_find_by_id(bearer_id).is_none(),
+            "the triggered Delete Bearer Request must delete bearer 6"
+        );
+        assert!(ctx.sess_find_by_id(sess_id).unwrap().bearer_list.is_empty());
+        release_global_ue(mme_ue_id, sess_id, bearer_id);
+    }
+
+    /// A Failure Indication's cause is read from its Cause IE.
+    #[test]
+    fn a_failure_indication_cause_is_read() {
+        let mut fi = nextgcore_gtp::v2::Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+            crate::s11_build::message_type::DELETE_BEARER_FAILURE_INDICATION,
+            1,
+            2,
+        ));
+        fi.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
+            nextgcore_gtp::v2::Gtp2IeType::Cause as u8,
+            0,
+            &[64, 0],
+        ));
+        assert_eq!(failure_indication_cause(&fi.encode()), Some(64));
     }
 
     /// An accepted Create Session Response carrying a PAA and one bearer context.

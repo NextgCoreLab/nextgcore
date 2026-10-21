@@ -2,6 +2,7 @@
 //!
 //! Based on 3GPP TS 24.501 Section 9.11
 
+use crate::buf::NasBuf;
 use crate::common::types::*;
 use crate::error::{NasError, NasResult};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -47,10 +48,10 @@ impl FiveGmmCapability {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.get_u8();
-        let byte = buf.get_u8();
+        let length = buf.read_u8()?;
+        let byte = buf.read_u8()?;
         let additional = if length > 1 {
-            buf.copy_to_bytes((length - 1) as usize).to_vec()
+            buf.read_bytes((length - 1) as usize)?.to_vec()
         } else {
             Vec::new()
         };
@@ -94,20 +95,14 @@ impl Nssai {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.get_u8();
-        if buf.remaining() < length as usize {
-            return Err(NasError::BufferTooShort {
-                expected: length as usize,
-                actual: buf.remaining(),
-            });
-        }
+        let length = buf.read_u8()?;
+        // Decode the S-NSSAI list inside the declared length: an S-NSSAI that
+        // runs past it is an error, not an underflow of a running count (#595).
+        let mut ie = buf.read_bytes(length as usize)?;
 
         let mut s_nssai_list = Vec::new();
-        let mut remaining = length as usize;
-        while remaining > 0 {
-            let s_nssai = SNssai::decode(buf)?;
-            remaining -= 1 + s_nssai.encoded_content_len();
-            s_nssai_list.push(s_nssai);
+        while ie.has_remaining() {
+            s_nssai_list.push(SNssai::decode(&mut ie)?);
         }
 
         Ok(Self {
@@ -162,11 +157,11 @@ impl PduSessionStatus {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.get_u8();
-        let psi = buf.get_u16_le();
+        let length = buf.read_u8()?;
+        let psi = buf.read_u16_le()?;
         // Skip any additional bytes
         if length > 2 {
-            buf.advance((length - 2) as usize);
+            buf.skip((length - 2) as usize)?;
         }
         Ok(Self { length, psi })
     }
@@ -197,10 +192,10 @@ impl UplinkDataStatus {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.get_u8();
-        let psi = buf.get_u16_le();
+        let length = buf.read_u8()?;
+        let psi = buf.read_u16_le()?;
         if length > 2 {
-            buf.advance((length - 2) as usize);
+            buf.skip((length - 2) as usize)?;
         }
         Ok(Self { length, psi })
     }
@@ -231,10 +226,10 @@ impl AllowedPduSessionStatus {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.get_u8();
-        let psi = buf.get_u16_le();
+        let length = buf.read_u8()?;
+        let psi = buf.read_u16_le()?;
         if length > 2 {
-            buf.advance((length - 2) as usize);
+            buf.skip((length - 2) as usize)?;
         }
         Ok(Self { length, psi })
     }
@@ -272,14 +267,14 @@ impl NasMessageContainer {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.get_u16();
+        let length = buf.read_u16()?;
         if buf.remaining() < length as usize {
             return Err(NasError::BufferTooShort {
                 expected: length as usize,
                 actual: buf.remaining(),
             });
         }
-        let data = buf.copy_to_bytes(length as usize).to_vec();
+        let data = buf.read_bytes(length as usize)?.to_vec();
         Ok(Self { length, data })
     }
 }
@@ -385,14 +380,14 @@ impl PayloadContainer {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.get_u16();
+        let length = buf.read_u16()?;
         if buf.remaining() < length as usize {
             return Err(NasError::BufferTooShort {
                 expected: length as usize,
                 actual: buf.remaining(),
             });
         }
-        let data = buf.copy_to_bytes(length as usize).to_vec();
+        let data = buf.read_bytes(length as usize)?.to_vec();
         Ok(Self { length, data })
     }
 }
@@ -602,14 +597,14 @@ impl QosRules {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.get_u16();
+        let length = buf.read_u16()?;
         if buf.remaining() < length as usize {
             return Err(NasError::BufferTooShort {
                 expected: length as usize,
                 actual: buf.remaining(),
             });
         }
-        let data = buf.copy_to_bytes(length as usize).to_vec();
+        let data = buf.read_bytes(length as usize)?.to_vec();
         Ok(Self { length, data })
     }
 }
@@ -641,14 +636,14 @@ impl QosFlowDescriptions {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.get_u16();
+        let length = buf.read_u16()?;
         if buf.remaining() < length as usize {
             return Err(NasError::BufferTooShort {
                 expected: length as usize,
                 actual: buf.remaining(),
             });
         }
-        let data = buf.copy_to_bytes(length as usize).to_vec();
+        let data = buf.read_bytes(length as usize)?.to_vec();
         Ok(Self { length, data })
     }
 }
@@ -679,13 +674,13 @@ impl SessionAmbr {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.get_u8();
-        let dl_unit = buf.get_u8();
-        let dl_value = buf.get_u16();
-        let ul_unit = buf.get_u8();
-        let ul_value = buf.get_u16();
+        let length = buf.read_u8()?;
+        let dl_unit = buf.read_u8()?;
+        let dl_value = buf.read_u16()?;
+        let ul_unit = buf.read_u8()?;
+        let ul_value = buf.read_u16()?;
         if length > 6 {
-            buf.advance((length - 6) as usize);
+            buf.skip((length - 6) as usize)?;
         }
         Ok(Self {
             length,
@@ -719,16 +714,16 @@ impl PduAddress {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.get_u8() as usize;
+        let length = buf.read_u8()? as usize;
         if buf.remaining() < length {
             return Err(NasError::BufferTooShort {
                 expected: length,
                 actual: buf.remaining(),
             });
         }
-        let pdu_session_type = buf.get_u8() & 0x07;
+        let pdu_session_type = buf.read_u8()? & 0x07;
         let address = if length > 1 {
-            buf.copy_to_bytes(length - 1).to_vec()
+            buf.read_bytes(length - 1)?.to_vec()
         } else {
             Vec::new()
         };
@@ -769,11 +764,11 @@ impl AiMlCapability {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.get_u8() as usize;
-        let capability_flags = buf.get_u8();
-        let max_model_size_kb = buf.get_u16();
+        let length = buf.read_u8()? as usize;
+        let capability_flags = buf.read_u8()?;
+        let max_model_size_kb = buf.read_u16()?;
         if length > 3 {
-            buf.advance(length - 3);
+            buf.skip(length - 3)?;
         }
         Ok(Self {
             capability_flags,
@@ -808,12 +803,12 @@ impl IsacParameter {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.get_u8() as usize;
-        let mode_flags = buf.get_u8();
-        let sensing_resolution = buf.get_u8();
-        let max_sensing_range = buf.get_u8();
+        let length = buf.read_u8()? as usize;
+        let mode_flags = buf.read_u8()?;
+        let sensing_resolution = buf.read_u8()?;
+        let max_sensing_range = buf.read_u8()?;
         if length > 3 {
-            buf.advance(length - 3);
+            buf.skip(length - 3)?;
         }
         Ok(Self {
             mode_flags,
@@ -846,11 +841,11 @@ impl SemanticCommParameter {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.get_u8() as usize;
-        let capability_flags = buf.get_u8();
-        let codec_type = buf.get_u8();
+        let length = buf.read_u8()? as usize;
+        let capability_flags = buf.read_u8()?;
+        let codec_type = buf.read_u8()?;
         if length > 2 {
-            buf.advance(length - 2);
+            buf.skip(length - 2)?;
         }
         Ok(Self {
             capability_flags,
@@ -885,12 +880,12 @@ impl SubThzBandParameter {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.get_u8() as usize;
-        let band_flags = buf.get_u8();
-        let max_bandwidth_mhz = buf.get_u16();
-        let beam_tracking_interval_ms = buf.get_u8();
+        let length = buf.read_u8()? as usize;
+        let band_flags = buf.read_u8()?;
+        let max_bandwidth_mhz = buf.read_u16()?;
+        let beam_tracking_interval_ms = buf.read_u8()?;
         if length > 4 {
-            buf.advance(length - 4);
+            buf.skip(length - 4)?;
         }
         Ok(Self {
             band_flags,
@@ -923,11 +918,11 @@ impl NtnTimingAdvance {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.get_u8() as usize;
-        let timing_advance = buf.get_u32();
-        let flags = buf.get_u8();
+        let length = buf.read_u8()? as usize;
+        let timing_advance = buf.read_u32()?;
+        let flags = buf.read_u8()?;
         if length > 5 {
-            buf.advance(length - 5);
+            buf.skip(length - 5)?;
         }
         Ok(Self {
             timing_advance,
@@ -962,12 +957,12 @@ impl NtnAccessBarring {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.get_u8() as usize;
-        let barring_factor = buf.get_u8();
-        let barring_time_seconds = buf.get_u16();
-        let ac_barring_flags = buf.get_u16();
+        let length = buf.read_u8()? as usize;
+        let barring_factor = buf.read_u8()?;
+        let barring_time_seconds = buf.read_u16()?;
+        let ac_barring_flags = buf.read_u16()?;
         if length > 5 {
-            buf.advance(length - 5);
+            buf.skip(length - 5)?;
         }
         Ok(Self {
             barring_factor,

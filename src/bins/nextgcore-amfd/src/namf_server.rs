@@ -7968,6 +7968,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_loc_provide_pos_info() {
+        // Serialised with the LMF-driven siblings, which point the process-wide
+        // `LMF_SBI_ADDR`/`LMF_SBI_PORT` at a stand-in LMF while they run: unguarded, this
+        // test's ProvidePositioningInfo reached THEIR stand-in, and the sibling's
+        // "what the LMF received" assertion read this test's SUPI instead of its own.
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let supi = "imsi-001010000060050";
         setup_ue(supi, true, true);
 
