@@ -3297,11 +3297,11 @@ pub fn s1ap_cause(cause: &Cause) -> S1apCause {
 mod tests {
     use super::*;
     use crate::context::{Bitrate, MmeUe, PlmnId, ServedGummei};
+    use crate::s1ap_gen::test_codec::{builder, decode_s1ap_pdu};
     use nextgcore_s1ap::{
         CauseRadioNetwork, GlobalEnbId, STmsi, SupportedTaItem, UeAssociatedLogicalS1Connection,
         UeSecurityCapabilities,
     };
-    use nextgcore_s1ap_oracle::{builder, decode_s1ap_pdu};
 
     fn test_ctx() -> MmeContext {
         let ctx = MmeContext::new();

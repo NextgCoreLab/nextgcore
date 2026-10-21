@@ -1,3 +1,7 @@
+//! (#514 stage 13b: moved here from the deleted hand-written codec's
+//! `tests/golden_x691.rs`; the same octets now pin the generated-codec
+//! builders and decode mmed's tests use.)
+//!
 //! S1AP wire forms derived by hand from X.691 (ALIGNED PER, TS 36.413 §9.4),
 //! not captured from this encoder (#455).
 //!
@@ -14,9 +18,12 @@
 //! `ext 0 + pad | protocolIEs count (SIZE 0..65535, two aligned octets)`, which
 //! is the `00 00 0N` that #455 was missing the first octet of.
 
+use super::test_codec::builder::*;
+use super::test_codec::decode_s1ap_pdu;
 use nextgcore_s1ap::cause::{Cause, CauseMisc};
 use nextgcore_s1ap::types::*;
-use nextgcore_s1ap_oracle::*;
+use nextgcore_s1ap::S1apMessage;
+use nextgcore_s1ap_gen::generated as g;
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -311,24 +318,30 @@ fn x691_forms_decode_to_their_values() {
     }
 }
 
-/// (id, criticality) of every IE in a built message, read straight off the wire
-/// container rather than through this crate's typed parser.
-fn ie_criticalities(bytes: &[u8]) -> Vec<(u16, nextgcore_s1ap_oracle::asn1::types::Criticality)> {
-    use nextgcore_asn1c::per::{AperDecode, AperDecoder};
-    use nextgcore_s1ap_oracle::asn1::pdu::*;
-    let pdu = S1apPdu::decode_aper(&mut AperDecoder::new(bytes)).unwrap();
-    let ies = match &pdu {
-        S1apPdu::SuccessfulOutcome(m) => match &m.value {
-            SuccessfulOutcomeValue::PathSwitchRequestAcknowledge(c) => c,
+/// (id, criticality) of every IE in a built message, read straight off the
+/// wire container with the generated codec rather than the typed decode.
+fn ie_criticalities(bytes: &[u8]) -> Vec<(u16, u8)> {
+    match nextgcore_s1ap_gen::decode(bytes).unwrap() {
+        g::S1AP_PDU::SuccessfulOutcome(m) => match m.value {
+            g::SuccessfulOutcomeValue::Id_PathSwitchRequest(c) => c
+                .protocol_i_es
+                .0
+                .iter()
+                .map(|f| (f.id.0, f.criticality.0))
+                .collect(),
             other => panic!("{other:?}"),
         },
-        S1apPdu::UnsuccessfulOutcome(m) => match &m.value {
-            UnsuccessfulOutcomeValue::HandoverPreparationFailure(c) => c,
+        g::S1AP_PDU::UnsuccessfulOutcome(m) => match m.value {
+            g::UnsuccessfulOutcomeValue::Id_HandoverPreparation(c) => c
+                .protocol_i_es
+                .0
+                .iter()
+                .map(|f| (f.id.0, f.criticality.0))
+                .collect(),
             other => panic!("{other:?}"),
         },
         other => panic!("{other:?}"),
-    };
-    ies.ies.iter().map(|f| (f.id.0, f.criticality)).collect()
+    }
 }
 
 /// Both UE S1AP IDs are criticality ignore in HANDOVER PREPARATION FAILURE
@@ -337,7 +350,7 @@ fn ie_criticalities(bytes: &[u8]) -> Vec<(u16, nextgcore_s1ap_oracle::asn1::type
 /// builder's IE criticalities against the TS 36.413 object sets (#455).
 #[test]
 fn ue_ids_are_criticality_ignore_where_the_object_set_says_so() {
-    use nextgcore_s1ap_oracle::asn1::types::Criticality::Ignore;
+    const IGNORE: u8 = g::Criticality::IGNORE;
     let hpf = build_handover_preparation_failure(&HandoverPreparationFailure {
         mme_ue_s1ap_id: 1,
         enb_ue_s1ap_id: 1,
@@ -347,7 +360,7 @@ fn ue_ids_are_criticality_ignore_where_the_object_set_says_so() {
     let c = ie_criticalities(&hpf);
     assert_eq!(
         &c[..2],
-        &[(0, Ignore), (8, Ignore)],
+        &[(0, IGNORE), (8, IGNORE)],
         "HANDOVER PREPARATION FAILURE"
     );
 
@@ -364,7 +377,7 @@ fn ue_ids_are_criticality_ignore_where_the_object_set_says_so() {
     let c = ie_criticalities(&psa);
     assert_eq!(
         &c[..2],
-        &[(0, Ignore), (8, Ignore)],
+        &[(0, IGNORE), (8, IGNORE)],
         "PATH SWITCH REQUEST ACKNOWLEDGE"
     );
 }

@@ -1,11 +1,11 @@
 //! #514 stage 7: Paging on the generated codec.
 //!
-//! Oracle: the pre-change hand-written builder (`nextgcore_s1ap_oracle::builder`).
+//! Oracle: `test_codec::builder::build_paging`, which since #514 stage 13b checks that the production encode decodes back to its input through an independently written mapping.
 //! Golden: octets derived by hand from X.691 (APER) for TS 36.413 §9.1.6.
 
 use super::*;
+use crate::s1ap_gen::test_codec::builder;
 use nextgcore_s1ap::{CnDomain, Paging, PagingDrx, STmsi, Tai, UePagingId};
-use nextgcore_s1ap_oracle::builder;
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()

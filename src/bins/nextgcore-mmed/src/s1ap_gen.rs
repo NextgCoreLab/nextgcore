@@ -4180,6 +4180,15 @@ pub fn decode_kill_response(bytes: &[u8]) -> ResponseDecode<nextgcore_s1ap::Kill
 }
 
 #[cfg(test)]
+pub(crate) mod test_codec;
+
+#[cfg(test)]
+mod golden_x691_tests;
+
+#[cfg(test)]
+mod codec_sweep_tests;
+
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]

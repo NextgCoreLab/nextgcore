@@ -17,8 +17,8 @@ use crate::s1ap_path;
 use crate::sbc_message::{SbcCause, SbcPwsData, StopWarningResponse, WriteReplaceWarningResponse};
 
 // The S1AP procedure codes for these messages are not redeclared here: they
-// live in `nextgcore_s1ap_oracle::asn1::types::ProcedureCode` (WRITE_REPLACE_WARNING,
-// KILL), which is what the builders and parser use. A second copy is the same
+// are the generated codec's `InitiatingMessageValue::Id_WriteReplaceWarning`
+// and `Id_Kill` keys, which is what the builders and decoders use. A second copy is the same
 // defect as the `S1apProcedureCode` enum #49 removed from `sm.rs`.
 
 // ============================================================================
@@ -586,7 +586,7 @@ mod tests {
         pws.add_tai(test_tai(99));
 
         let pdu = write_replace_warning_pdu(&enb, &pws).expect("encodes");
-        match nextgcore_s1ap_oracle::decode_s1ap_pdu(&pdu).expect("decodes") {
+        match crate::s1ap_gen::test_codec::decode_s1ap_pdu(&pdu).expect("decodes") {
             nextgcore_s1ap::S1apMessage::WriteReplaceWarningRequest(req) => {
                 assert_eq!(req.message_identifier, MSG_ID_ETWS_EARTHQUAKE);
                 assert_eq!(req.serial_number, 0x3000);
@@ -650,7 +650,7 @@ mod tests {
         assert_eq!(pws.no_of_tai, 0);
 
         let pdu = write_replace_warning_pdu(&enb, &pws).expect("encodes");
-        match nextgcore_s1ap_oracle::decode_s1ap_pdu(&pdu).unwrap() {
+        match crate::s1ap_gen::test_codec::decode_s1ap_pdu(&pdu).unwrap() {
             nextgcore_s1ap::S1apMessage::WriteReplaceWarningRequest(req) => {
                 assert!(req.warning_area.is_none());
             }
@@ -669,7 +669,7 @@ mod tests {
         pws.number_of_broadcast = 100_000; // > NumberofBroadcastRequest's 65535
 
         let pdu = write_replace_warning_pdu(&enb, &pws).expect("encodes");
-        match nextgcore_s1ap_oracle::decode_s1ap_pdu(&pdu).unwrap() {
+        match crate::s1ap_gen::test_codec::decode_s1ap_pdu(&pdu).unwrap() {
             nextgcore_s1ap::S1apMessage::WriteReplaceWarningRequest(req) => {
                 assert_eq!(req.repetition_period, 4095);
                 assert_eq!(req.number_of_broadcast_request, 65535);
@@ -687,7 +687,7 @@ mod tests {
         pws.add_tai(test_tai(1));
 
         let pdu = kill_pdu(&enb, &pws).expect("encodes");
-        match nextgcore_s1ap_oracle::decode_s1ap_pdu(&pdu).unwrap() {
+        match crate::s1ap_gen::test_codec::decode_s1ap_pdu(&pdu).unwrap() {
             nextgcore_s1ap::S1apMessage::KillRequest(req) => {
                 assert_eq!(req.message_identifier, MSG_ID_ETWS_EARTHQUAKE);
                 assert_eq!(req.serial_number, 0x3000);
@@ -766,7 +766,7 @@ mod tests {
         assert_eq!(sent[0].0, pool_id);
         assert!(
             matches!(
-                nextgcore_s1ap_oracle::decode_s1ap_pdu(&sent[0].1).unwrap(),
+                crate::s1ap_gen::test_codec::decode_s1ap_pdu(&sent[0].1).unwrap(),
                 nextgcore_s1ap::S1apMessage::WriteReplaceWarningRequest(_)
             ),
             "what goes out must be a real S1AP WRITE-REPLACE WARNING REQUEST"
@@ -826,7 +826,7 @@ mod tests {
         assert_eq!(resent, 1, "only the warning covering this eNB's area");
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].0, pool_id);
-        match nextgcore_s1ap_oracle::decode_s1ap_pdu(&sent[0].1).unwrap() {
+        match crate::s1ap_gen::test_codec::decode_s1ap_pdu(&sent[0].1).unwrap() {
             nextgcore_s1ap::S1apMessage::WriteReplaceWarningRequest(req) => {
                 assert_eq!(req.serial_number, 0x3000, "the in-area warning");
             }
@@ -930,7 +930,7 @@ mod tests {
 
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].0, pool_id);
-        match nextgcore_s1ap_oracle::decode_s1ap_pdu(&sent[0].1).unwrap() {
+        match crate::s1ap_gen::test_codec::decode_s1ap_pdu(&sent[0].1).unwrap() {
             nextgcore_s1ap::S1apMessage::KillRequest(req) => {
                 assert_eq!(req.message_identifier, MSG_ID_ETWS_EARTHQUAKE);
                 assert_eq!(req.serial_number, 0x3000);

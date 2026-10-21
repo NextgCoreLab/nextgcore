@@ -19,7 +19,6 @@ asn1-compiler.workspace = true
 
 [dev-dependencies]
 nextgcore-s1ap.workspace = true
-nextgcore-s1ap-oracle.workspace = true
 
 [lints]
 workspace = true

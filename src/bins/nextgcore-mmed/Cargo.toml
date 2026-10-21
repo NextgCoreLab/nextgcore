@@ -44,7 +44,6 @@ serde = { workspace = true }
 serde_yaml = { workspace = true }
 
 [dev-dependencies]
-nextgcore-s1ap-oracle = { workspace = true }
 proptest.workspace = true
 nextgcore-asn1c = { workspace = true }
 # #347 strict-peer test: drive amfd's REAL Context Response builder and its REAL mapped EPS
