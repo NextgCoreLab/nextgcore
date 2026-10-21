@@ -601,30 +601,34 @@ fn sm_context_refs_for_ue(ctx: &crate::context::AmfContext, amf_ue_id: u64) -> V
 ///
 /// Called after a UE context release to clean up its Nsmf_PDUSession contexts.
 /// Called with no AMF context guard held.
+///
+/// The SMF is resolved inside the spawned task, with the async resolver. The sync
+/// `resolve_smf_endpoint` blocks on the runtime with `Handle::block_on`, which
+/// panics when called from async code, and the live caller of `handle_ng_reset`
+/// is the NGAP task (#637).
 fn release_smf_sm_contexts(sm_context_refs: Vec<String>) {
     if sm_context_refs.is_empty() {
         return;
     }
-    // Resolve SMF endpoint first; if unavailable, nothing to do.
-    let (smf_host, smf_port) = match sbi_path::resolve_smf_endpoint() {
-        Ok(ep) => ep,
-        Err(e) => {
-            log::debug!("SMF endpoint not resolved, skipping session cleanup: {e}");
-            return;
-        }
-    };
-
-    for sm_context_ref in sm_context_refs {
-        let host = smf_host.clone();
-        let port = smf_port;
-        tokio::spawn(async move {
+    tokio::spawn(async move {
+        let (smf_host, smf_port) =
+            match sbi_path::resolve_nf_endpoint_async(sbi_path::SbiServiceType::NsmfPdusession)
+                .await
+            {
+                Ok(ep) => ep,
+                Err(e) => {
+                    log::debug!("SMF endpoint not resolved, skipping session cleanup: {e}");
+                    return;
+                }
+            };
+        for sm_context_ref in sm_context_refs {
             if let Err(e) =
-                sbi_path::call_smf_release_sm_context(&host, port, &sm_context_ref).await
+                sbi_path::call_smf_release_sm_context(&smf_host, smf_port, &sm_context_ref).await
             {
                 log::warn!("SMF SM Context Release failed for ref={sm_context_ref}: {e}");
             }
-        });
-    }
+        }
+    });
 }
 
 // ============================================================================
