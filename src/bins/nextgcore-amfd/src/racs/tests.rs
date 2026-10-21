@@ -39,8 +39,14 @@ fn id_type_and_version_come_from_the_digits() {
 
 #[test]
 fn tac_is_the_first_eight_pei_digits() {
-    assert_eq!(tac_from_pei("imeisv-3512345678901234").as_deref(), Some("35123456"));
-    assert_eq!(tac_from_pei("imei-351234567890123").as_deref(), Some("35123456"));
+    assert_eq!(
+        tac_from_pei("imeisv-3512345678901234").as_deref(),
+        Some("35123456")
+    );
+    assert_eq!(
+        tac_from_pei("imei-351234567890123").as_deref(),
+        Some("35123456")
+    );
     assert_eq!(tac_from_pei("mac-00-11"), None);
     assert_eq!(tac_from_pei("imei-1234"), None);
 }
@@ -61,8 +67,8 @@ fn mapping_response_octets() {
     //   IE 264: 01 08, reject 00, open length 08, OCTET STRING length 07 + ID;
     //   IE 117: 00 75, ignore 40, open length 03, OCTET STRING length 02 AA BB.
     let expected = [
-        0x20, 0x3C, 0x00, 0x16, 0x00, 0x00, 0x02, 0x01, 0x08, 0x00, 0x08, 0x07, 0x01, 0x05,
-        0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x75, 0x40, 0x03, 0x02, 0xAA, 0xBB,
+        0x20, 0x3C, 0x00, 0x16, 0x00, 0x00, 0x02, 0x01, 0x08, 0x00, 0x08, 0x07, 0x01, 0x05, 0x00,
+        0x00, 0x00, 0x00, 0x10, 0x00, 0x75, 0x40, 0x03, 0x02, 0xAA, 0xBB,
     ];
     assert_eq!(
         build_mapping_response(&ID, &[0xAA, 0xBB]).as_deref(),
@@ -75,8 +81,8 @@ fn mapping_request_octets_decode_to_the_id() {
     // InitiatingMessage index 0: 0x00; procedureCode 60; criticality reject; open
     // length 15; value: ext 0 + count 1; IE 264 reject, length 08, 07 + ID.
     let request = [
-        0x00, 0x3C, 0x00, 0x0F, 0x00, 0x00, 0x01, 0x01, 0x08, 0x00, 0x08, 0x07, 0x01, 0x05,
-        0x00, 0x00, 0x00, 0x00, 0x10,
+        0x00, 0x3C, 0x00, 0x0F, 0x00, 0x00, 0x01, 0x01, 0x08, 0x00, 0x08, 0x07, 0x01, 0x05, 0x00,
+        0x00, 0x00, 0x00, 0x10,
     ];
     assert_eq!(decode_mapping_request(&request).as_deref(), Some(&ID[..]));
     // A response is not a request.
@@ -116,9 +122,9 @@ fn info_indication_carries_ids_and_capability() {
                 criticality: ngap_gen::Criticality(ngap_gen::Criticality::IGNORE),
                 value: ngap_gen::InitiatingMessageValue::Id_UERadioCapabilityInfoIndication(
                     ngap_gen::UERadioCapabilityInfoIndication {
-                        protocol_i_es: ngap_gen::UERadioCapabilityInfoIndicationProtocolIEs(
-                            ies(with_cap),
-                        ),
+                        protocol_i_es: ngap_gen::UERadioCapabilityInfoIndicationProtocolIEs(ies(
+                            with_cap,
+                        )),
                     },
                 ),
             },
@@ -194,7 +200,10 @@ fn ics_without_an_id_carries_the_capability_before_the_nas_pdu() {
     let _g = guard();
     let out = add_capability_ies(ics(true), None, Some(&[0xAA, 0xBB]));
     let ids = ics_ids(&out);
-    let cap = ids.iter().position(|i| *i == ngap_gen::ID_UE_RADIO_CAPABILITY).unwrap();
+    let cap = ids
+        .iter()
+        .position(|i| *i == ngap_gen::ID_UE_RADIO_CAPABILITY)
+        .unwrap();
     let nas = ids.iter().position(|i| *i == ngap_gen::ID_NAS_PDU).unwrap();
     assert!(cap < nas, "117 precedes NAS-PDU in the object set: {ids:?}");
     assert!(!ids.contains(&ngap_gen::ID_UE_RADIO_CAPABILITY_ID));
@@ -227,9 +236,10 @@ fn handover_request_and_path_switch_ack_get_the_id() {
                         ngap_gen::HandoverRequestProtocolIEs_Entry {
                             id: ngap_gen::ProtocolIE_ID(ngap_gen::ID_AMF_UE_NGAP_ID),
                             criticality: ngap_gen::Criticality(ngap_gen::Criticality::REJECT),
-                            value: ngap_gen::HandoverRequestProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(
-                                ngap_gen::AMF_UE_NGAP_ID(1),
-                            ),
+                            value:
+                                ngap_gen::HandoverRequestProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(
+                                    ngap_gen::AMF_UE_NGAP_ID(1),
+                                ),
                         },
                     ]),
                 },
@@ -245,7 +255,13 @@ fn handover_request_and_path_switch_ack_get_the_id() {
         unreachable!()
     };
     let ids: Vec<u16> = r.protocol_i_es.0.iter().map(|e| e.id.0).collect();
-    assert_eq!(ids, vec![ngap_gen::ID_AMF_UE_NGAP_ID, ngap_gen::ID_UE_RADIO_CAPABILITY_ID]);
+    assert_eq!(
+        ids,
+        vec![
+            ngap_gen::ID_AMF_UE_NGAP_ID,
+            ngap_gen::ID_UE_RADIO_CAPABILITY_ID
+        ]
+    );
 
     let psa = nextgcore_ngap_gen::encode(&ngap_gen::NGAP_PDU::SuccessfulOutcome(
         ngap_gen::SuccessfulOutcome {
@@ -275,7 +291,13 @@ fn handover_request_and_path_switch_ack_get_the_id() {
         unreachable!()
     };
     let ids: Vec<u16> = r.protocol_i_es.0.iter().map(|e| e.id.0).collect();
-    assert_eq!(ids, vec![ngap_gen::ID_AMF_UE_NGAP_ID, ngap_gen::ID_UE_RADIO_CAPABILITY_ID]);
+    assert_eq!(
+        ids,
+        vec![
+            ngap_gen::ID_AMF_UE_NGAP_ID,
+            ngap_gen::ID_UE_RADIO_CAPABILITY_ID
+        ]
+    );
 }
 
 fn racs_ue() -> crate::context::AmfUe {
@@ -291,15 +313,21 @@ fn nas_sends_an_assigned_id_once_and_only_to_a_racs_ue() {
     ue.ue_radio_capability_id = Some(ID.to_vec());
     // §9.11.3.68: IEI 67, length 07, value.
     assert_eq!(
-        nas_ies_for(&mut ue),
+        nas_ies_for(&mut ue, NasMessage::RegistrationAccept),
         vec![0x67, 0x07, 0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x10]
     );
     assert!(ue.ue_radio_capability_id_known_to_ue);
-    assert!(nas_ies_for(&mut ue).is_empty(), "sent once");
+    assert!(
+        nas_ies_for(&mut ue, NasMessage::RegistrationAccept).is_empty(),
+        "sent once"
+    );
 
     let mut no_racs = crate::context::AmfUe::default();
     no_racs.ue_radio_capability_id = Some(ID.to_vec());
-    assert!(nas_ies_for(&mut no_racs).is_empty(), "§5.5.1.2.4: RACS bit required");
+    assert!(
+        nas_ies_for(&mut no_racs, NasMessage::RegistrationAccept).is_empty(),
+        "§5.5.1.2.4: RACS bit required"
+    );
 }
 
 #[test]
@@ -314,9 +342,23 @@ fn a_deleted_id_becomes_the_deletion_indication() {
         "manAssOpRequestlist": { "plmnAssiUeRadioCapId": [to_nucmf(&ID).unwrap()] },
     }));
     assert_eq!(retired, vec![ID.to_vec()]);
-    // §9.11.3.69: half-octet IEI E, "deletion requested" 1.
-    assert_eq!(nas_ies_for(&mut ue), vec![0xE1]);
+    // §9.11.3.69: half-octet IEI E in REGISTRATION ACCEPT (table 8.2.7.1.1),
+    // "deletion requested" 1.
+    assert_eq!(
+        nas_ies_for(&mut ue, NasMessage::RegistrationAccept),
+        vec![0xE1]
+    );
     assert_eq!(ue.ue_radio_capability_id, None);
+    // Sent once: the ID is gone from the context.
+    assert!(nas_ies_for(&mut ue, NasMessage::RegistrationAccept).is_empty());
+
+    // In a CONFIGURATION UPDATE COMMAND the same IE has IEI A (table 8.2.19.1.1).
+    let mut ue = racs_ue();
+    ue.ue_radio_capability_id = Some(ID.to_vec());
+    assert_eq!(
+        nas_ies_for(&mut ue, NasMessage::ConfigurationUpdateCommand),
+        vec![0xA1]
+    );
 }
 
 #[test]

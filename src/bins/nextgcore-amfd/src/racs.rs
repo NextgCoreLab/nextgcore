@@ -29,9 +29,25 @@ use std::sync::{LazyLock, Mutex};
 /// IEI of the UE radio capability ID IE (TS 24.501 §9.11.3.68), in the REGISTRATION
 /// REQUEST, REGISTRATION ACCEPT and CONFIGURATION UPDATE COMMAND.
 pub const IEI_UE_RADIO_CAPABILITY_ID: u8 = 0x67;
-/// Half-octet IEI of the UE radio capability ID deletion indication
-/// (TS 24.501 §9.11.3.69), with the value in the low nibble.
-pub const IEI_UE_RADIO_CAPABILITY_ID_DELETION: u8 = 0xE0;
+/// The NAS message the RACS IEs go into: the half-octet IEI of the UE radio
+/// capability ID deletion indication (TS 24.501 §9.11.3.69) differs per message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NasMessage {
+    /// REGISTRATION ACCEPT: IEI E- (TS 24.501 table 8.2.7.1.1).
+    RegistrationAccept,
+    /// CONFIGURATION UPDATE COMMAND: IEI A- (TS 24.501 table 8.2.19.1.1).
+    ConfigurationUpdateCommand,
+}
+
+impl NasMessage {
+    /// Half-octet IEI of the deletion indication, the value going in the low nibble.
+    pub fn deletion_iei(self) -> u8 {
+        match self {
+            NasMessage::RegistrationAccept => 0xE0,
+            NasMessage::ConfigurationUpdateCommand => 0xA0,
+        }
+    }
+}
 /// "Network-assigned UE radio capability IDs deletion requested" (§9.11.3.69).
 pub const DELETION_REQUESTED: u8 = 0x01;
 /// The RACS bit of the 5GMM capability IE: octet 4, bit 8 (TS 24.501 §9.11.3.1),
@@ -235,7 +251,7 @@ pub(crate) fn reset_for_tests() {
 /// Only for a UE that set the RACS bit. A retired ID gets the deletion indication
 /// (§9.11.3.69) and is dropped from the context; an ID the UE did not present this
 /// time (one the AMF learnt from the UCMF) is sent (§9.11.3.68).
-pub fn nas_ies_for(ue: &mut crate::context::AmfUe) -> Vec<u8> {
+pub fn nas_ies_for(ue: &mut crate::context::AmfUe, message: NasMessage) -> Vec<u8> {
     if !ue.racs_supported {
         return Vec::new();
     }
@@ -244,7 +260,7 @@ pub fn nas_ies_for(ue: &mut crate::context::AmfUe) -> Vec<u8> {
         if is_retired(&id) {
             ue.ue_radio_capability_id = None;
             ue.ue_radio_capability_id_known_to_ue = false;
-            out.push(IEI_UE_RADIO_CAPABILITY_ID_DELETION | DELETION_REQUESTED);
+            out.push(message.deletion_iei() | DELETION_REQUESTED);
         } else if !ue.ue_radio_capability_id_known_to_ue && id.len() <= 255 {
             out.push(IEI_UE_RADIO_CAPABILITY_ID);
             out.push(id.len() as u8);
@@ -268,11 +284,15 @@ pub fn decode_mapping_request(pdu: &[u8]) -> Option<Vec<u8>> {
     let ngap_gen::InitiatingMessageValue::Id_UERadioCapabilityIDMapping(req) = m.value else {
         return None;
     };
-    req.protocol_i_es.0.into_iter().find_map(|e| match e.value {
-        ngap_gen::UERadioCapabilityIDMappingRequestProtocolIEs_EntryValue::Id_UERadioCapabilityID(
-            id,
-        ) => Some(id.0),
-    })
+    use ngap_gen::UERadioCapabilityIDMappingRequestProtocolIEs_EntryValue as Ie;
+    // The ID is the request's only IE (§9.2.13.4).
+    req.protocol_i_es
+        .0
+        .into_iter()
+        .map(|e| match e.value {
+            Ie::Id_UERadioCapabilityID(id) => id.0,
+        })
+        .next()
 }
 
 /// UE RADIO CAPABILITY ID MAPPING RESPONSE (TS 38.413 §9.2.13.5): the ID (reject)
@@ -414,12 +434,13 @@ pub fn add_capability_ies(pdu: Vec<u8>, id: Option<&[u8]>, capability: Option<&[
                     req.protocol_i_es
                         .0
                         .push(ngap_gen::HandoverRequestProtocolIEs_Entry {
-                            id: ngap_gen::ProtocolIE_ID(ngap_gen::ID_UE_RADIO_CAPABILITY_ID),
-                            criticality: reject(),
-                            value: ngap_gen::HandoverRequestProtocolIEs_EntryValue::Id_UERadioCapabilityID(
+                        id: ngap_gen::ProtocolIE_ID(ngap_gen::ID_UE_RADIO_CAPABILITY_ID),
+                        criticality: reject(),
+                        value:
+                            ngap_gen::HandoverRequestProtocolIEs_EntryValue::Id_UERadioCapabilityID(
                                 ngap_gen::UERadioCapabilityID(id.to_vec()),
                             ),
-                        });
+                    });
                     true
                 }
                 None => false,
@@ -498,9 +519,9 @@ async fn resolve_ucmf_endpoint() -> Option<(String, u16)> {
 }
 
 async fn ucmf_client() -> Result<nextgcore_sbi::client::SbiClient, String> {
-    let (host, port) = resolve_ucmf_endpoint()
-        .await
-        .ok_or_else(|| "no UCMF endpoint (NRF discovery found none, UCMF_SBI_ADDR unset)".to_string())?;
+    let (host, port) = resolve_ucmf_endpoint().await.ok_or_else(|| {
+        "no UCMF endpoint (NRF discovery found none, UCMF_SBI_ADDR unset)".to_string()
+    })?;
     Ok(crate::attach_oauth2(
         nextgcore_sbi::client::SbiClient::for_peer(&host, port),
         nextgcore_sbi::types::NfType::Ucmf,
@@ -620,7 +641,10 @@ pub async fn ucmf_subscribe(nf_id: &str) -> Result<(), String> {
         .await
         .map_err(|e| format!("Subscribe at the UCMF failed: {e}"))?;
     if response.status != 201 {
-        return Err(format!("Subscribe at the UCMF returned {}", response.status));
+        return Err(format!(
+            "Subscribe at the UCMF returned {}",
+            response.status
+        ));
     }
     Ok(())
 }

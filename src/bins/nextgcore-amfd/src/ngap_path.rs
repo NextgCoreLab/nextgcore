@@ -2292,16 +2292,26 @@ impl NgapServer {
                     );
                     if was_pending {
                         state.retx = None;
+                        // #570: a command that only carried a UE radio capability ID
+                        // left the GUTI alone; say so rather than claim a reallocation.
+                        let reallocated = state.amf_ue.current_guti != state.amf_ue.next_guti;
                         // The UE accepted the new identity, so it becomes the current
                         // one (TS 33.501 §6.12.3).
                         state.amf_ue.current_guti = state.amf_ue.next_guti.clone();
                         state.amf_ue.current_m_tmsi = Some(state.amf_ue.next_guti.tmsi);
-                        log::info!(
-                            "[{}] Configuration Update Complete: 5G-GUTI reallocated \
-                             (5G-TMSI=0x{:08x})",
-                            state.suci,
-                            state.amf_ue.current_guti.tmsi
-                        );
+                        if reallocated {
+                            log::info!(
+                                "[{}] Configuration Update Complete: 5G-GUTI reallocated \
+                                 (5G-TMSI=0x{:08x})",
+                                state.suci,
+                                state.amf_ue.current_guti.tmsi
+                            );
+                        } else {
+                            log::info!(
+                                "[{}] Configuration Update Complete: T3555 stopped",
+                                state.suci
+                            );
+                        }
                     } else {
                         // Not an error: TS 24.501 permits a COMPLETE for a command the
                         // AMF has already given up on. Logged rather than dropped
@@ -4112,7 +4122,8 @@ impl NgapServer {
                 // #570: the UE radio capability ID is non-cleartext (TS 24.501
                 // §4.4.6), so on an initial registration it arrives here, in the
                 // replay, and the RACS bit with it.
-                let (racs, presented) = (inner.racs_supported, inner.ue_radio_capability_id.clone());
+                let (racs, presented) =
+                    (inner.racs_supported, inner.ue_radio_capability_id.clone());
                 self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
                     s.amf_ue.racs_supported |= racs;
                     if let Some(id) = presented {
@@ -4200,11 +4211,10 @@ impl NgapServer {
             }
         }
 
-        let mut need_pei = false;
-        {
-            let Some(mut state) = self.ue_auth_state.get(amf_ue_ngap_id) else {
-                return Ok(());
-            };
+        // Applied IN PLACE (#570): this used `ue_auth_state.get`, which returns a
+        // clone, so the PEI/IMEISV, the replayed Requested NSSAI and the T3560 stop
+        // below were all written to a copy and dropped.
+        let Some(need_pei) = self.ue_auth_state.with_mut(amf_ue_ngap_id, |state| {
             // Populate the Requested NSSAI from the integrity-protected replay
             // (TS 24.501 §4.4.6); the unprotected initial request no longer sets
             // it. Empty replay leaves it empty (subscription/PLMN config drive
@@ -4250,11 +4260,15 @@ impl NgapServer {
                 pos += 1;
             }
 
+            let mut need_pei = false;
             if state.amf_ue.pei.is_none() {
                 need_pei = true;
                 state.pei_requested = true;
             }
-        }
+            need_pei
+        }) else {
+            return Ok(());
+        };
 
         if need_pei {
             // PEI not provided: Identity Request for IMEISV (protected),
@@ -4671,7 +4685,10 @@ impl NgapServer {
         };
         // #570: the UE radio capability ID, or its deletion indication, for a UE that
         // set the RACS bit (TS 24.501 §5.5.1.2.4). T3550 is armed below in every case.
-        plain.extend(crate::racs::nas_ies_for(&mut state.amf_ue));
+        plain.extend(crate::racs::nas_ies_for(
+            &mut state.amf_ue,
+            crate::racs::NasMessage::RegistrationAccept,
+        ));
         let Some(protected) = nas_security::nas_5gs_security_encode(
             &mut state.amf_ue,
             &plain,
@@ -5691,7 +5708,10 @@ impl NgapServer {
                 if !s.registered || !s.amf_ue.security_context_available {
                     return None;
                 }
-                let ies = crate::racs::nas_ies_for(&mut s.amf_ue);
+                let ies = crate::racs::nas_ies_for(
+                    &mut s.amf_ue,
+                    crate::racs::NasMessage::ConfigurationUpdateCommand,
+                );
                 if ies.is_empty() {
                     return None;
                 }
@@ -17416,8 +17436,8 @@ mod tests {
         let mut ngap = test_ngap_server().await;
         // Hand-built request for 01 05 00 00 00 00 10 (racs::tests).
         let request = [
-            0x00u8, 0x3C, 0x00, 0x0F, 0x00, 0x00, 0x01, 0x01, 0x08, 0x00, 0x08, 0x07, 0x01,
-            0x05, 0x00, 0x00, 0x00, 0x00, 0x10,
+            0x00u8, 0x3C, 0x00, 0x0F, 0x00, 0x00, 0x01, 0x01, 0x08, 0x00, 0x08, 0x07, 0x01, 0x05,
+            0x00, 0x00, 0x00, 0x00, 0x10,
         ];
         assert!(
             ngap.process_ngap_message(1, &request).await.is_ok(),
@@ -20617,6 +20637,58 @@ mod tests {
             "a detected bidding-down attempt must release the UE even though neither reject \
              could be delivered: before #359 the `?` on the Security Mode Reject returned \
              first, so the Registration Reject was never built and the UE stayed in the map"
+        );
+    }
+
+    /// #570: what the Security Mode Complete learns lands on the UE's stored context.
+    ///
+    /// The handler took `ue_auth_state.get`, a CLONE, so the replayed Requested NSSAI,
+    /// the T3560 stop and `pei_requested` were written to a copy and dropped; the
+    /// IMEISV in the same block was lost too, which is how an end-to-end RACS UE came to
+    /// "have no PEI" when it asked for a capability ID. Driven without an IMEISV so the
+    /// handler stops at the Identity Request (which cannot be protected here) and leaves
+    /// the context in the map to inspect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_security_mode_complete_updates_the_stored_context() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let amf_ue_ngap_id = 7_570_101u64;
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 72, 1, false);
+        // The same capabilities as the replay, so no bidding-down refusal.
+        ue_ctx.amf_ue.ue_security_capability = UeSecurityCapability {
+            ea: 0xF0,
+            ia: 0xF0,
+            eea: 0,
+            eia: 0,
+        };
+        ue_ctx.retx = Some(NasRetx {
+            timer: NasProcTimer::T3560,
+            deadline: Instant::now() + Duration::from_secs(6),
+            retries: 0,
+            ngap_pdu: Vec::new(),
+        });
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        let smc = smc_with_replayed_caps(0xF0, 0xF0);
+        let _ = ngap
+            .handle_security_mode_complete_nas(1, amf_ue_ngap_id, 72, &smc)
+            .await;
+
+        let state = ngap.ue_auth_state.get(amf_ue_ngap_id).expect("still held");
+        assert!(state.retx.is_none(), "T3560 stopped");
+        assert_eq!(
+            state
+                .amf_ue
+                .requested_nssai
+                .iter()
+                .map(|s| s.sst)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "the Requested NSSAI from the protected replay"
+        );
+        assert!(
+            state.pei_requested,
+            "the Identity Request for the PEI is recorded"
         );
     }
 
