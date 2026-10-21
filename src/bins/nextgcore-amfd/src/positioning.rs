@@ -37,22 +37,8 @@
 //! N1N2MessageSubscribe registry (fail-closed: no subscription → WARN + drop,
 //! never an ErrorIndication toward the gNB).
 
-use nextgcore_asn1c::ngap::ies::{AmfUeNgapId, NrppaPdu, RanUeNgapId, RoutingId};
-use nextgcore_asn1c::ngap::pdu::{
-    build_downlink_non_ue_associated_nrppa_transport, build_downlink_ue_associated_nrppa_transport,
-    NgapPdu,
-};
-use nextgcore_asn1c::per::{AperEncode, AperEncoder};
-
 /// NAS payload container type "LPP" (TS 24.501 Table 9.11.3.40.1).
 pub const PAYLOAD_CONTAINER_TYPE_LPP: u8 = 0x03;
-
-/// APER-encode a built NGAP PDU into the byte string carried over N2 SCTP.
-fn encode_ngap(pdu: &NgapPdu) -> Option<Vec<u8>> {
-    let mut encoder = AperEncoder::new();
-    pdu.encode_aper(&mut encoder).ok()?;
-    Some(encoder.into_bytes().to_vec())
-}
 
 /// Build a `DownlinkUEAssociatedNRPPaTransport` (NGAP procedure 8, TS 38.413
 /// §9.2.9.3) relaying an LMF-provided NRPPa PDU toward the UE's serving gNB.
@@ -66,26 +52,19 @@ pub fn build_nrppa_dl_ue_associated(
     routing_id: &[u8],
     nrppa_pdu: &[u8],
 ) -> Option<Vec<u8>> {
-    let pdu = build_downlink_ue_associated_nrppa_transport(
-        AmfUeNgapId(amf_ue_ngap_id),
-        RanUeNgapId(ran_ue_ngap_id),
-        RoutingId::new(routing_id.to_vec()),
-        NrppaPdu::new(nrppa_pdu.to_vec()),
+    crate::ngap_asn1::build_downlink_ue_nrppa_transport_asn1(
+        amf_ue_ngap_id,
+        ran_ue_ngap_id,
+        routing_id,
+        nrppa_pdu,
     )
-    .ok()?;
-    encode_ngap(&pdu)
 }
 
 /// Build a `DownlinkNonUEAssociatedNRPPaTransport` (NGAP procedure 5, TS 38.413
 /// §9.2.9.5) relaying an LMF-provided NRPPa PDU not tied to a specific UE
 /// (e.g. TRP information / assistance). Returns the APER-encoded NGAP PDU.
 pub fn build_nrppa_dl_non_ue_associated(routing_id: &[u8], nrppa_pdu: &[u8]) -> Option<Vec<u8>> {
-    let pdu = build_downlink_non_ue_associated_nrppa_transport(
-        RoutingId::new(routing_id.to_vec()),
-        NrppaPdu::new(nrppa_pdu.to_vec()),
-    )
-    .ok()?;
-    encode_ngap(&pdu)
+    crate::ngap_asn1::build_downlink_non_ue_nrppa_transport_asn1(routing_id, nrppa_pdu)
 }
 
 /// Build a DL NAS Transport (TS 24.501 §8.2.10) carrying an LMF-provided LPP
@@ -101,44 +80,43 @@ pub fn build_lpp_dl_nas(lpp_pdu: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nextgcore_asn1c::ngap::pdu::{
-        parse_non_ue_associated_nrppa_transport, parse_ue_associated_nrppa_transport,
-    };
-    use nextgcore_asn1c::per::{AperDecode, AperDecoder};
 
-    fn decode(bytes: &[u8]) -> NgapPdu {
-        let mut decoder = AperDecoder::new(bytes);
-        NgapPdu::decode_aper(&mut decoder).expect("NGAP PDU decode")
-    }
+    /// A DOWNLINK UE-ASSOCIATED NRPPA TRANSPORT derived by hand from X.691
+    /// APER and TS 38.413 §9.2.9.1 / §9.4:
+    /// `00` initiatingMessage, `08` procedure 8, `40` criticality ignore,
+    /// `1F` open-type length 31; `00` SEQUENCE extension bit, `00 04` four IEs;
+    /// IE 10 AMF-UE-NGAP-ID 42 (`00 2A`: 3-bit length 1, padded, one octet);
+    /// IE 85 RAN-UE-NGAP-ID 7 (`00 07`: 2-bit length 1); IE 89 RoutingID
+    /// `02 00 01`; IE 46 NRPPa-PDU `04 AA BB CC DD` -- each IE `id`, `00`
+    /// criticality reject, open-type length, value.
+    const DL_UE_GOLDEN: [u8; 35] = [
+        0x00, 0x08, 0x40, 0x1F, 0x00, 0x00, 0x04, 0x00, 0x0A, 0x00, 0x02, 0x00, 0x2A, 0x00, 0x55,
+        0x00, 0x02, 0x00, 0x07, 0x00, 0x59, 0x00, 0x03, 0x02, 0x00, 0x01, 0x00, 0x2E, 0x00, 0x05,
+        0x04, 0xAA, 0xBB, 0xCC, 0xDD,
+    ];
+
+    /// A DOWNLINK NON UE-ASSOCIATED NRPPA TRANSPORT (procedure 5, §9.2.9.3):
+    /// RoutingID `03 05 06 07`, NRPPa-PDU `02 01 02`, value length 18.
+    const DL_NON_UE_GOLDEN: [u8; 22] = [
+        0x00, 0x05, 0x40, 0x12, 0x00, 0x00, 0x02, 0x00, 0x59, 0x00, 0x04, 0x03, 0x05, 0x06, 0x07,
+        0x00, 0x2E, 0x00, 0x03, 0x02, 0x01, 0x02,
+    ];
 
     #[test]
-    fn nrppa_dl_ue_associated_round_trips() {
-        let routing = [0x00u8, 0x01];
-        let nrppa = [0xAAu8, 0xBB, 0xCC, 0xDD];
-        let bytes = build_nrppa_dl_ue_associated(42, 7, &routing, &nrppa)
+    fn nrppa_dl_ue_associated_matches_hand_derived_bytes() {
+        let bytes = build_nrppa_dl_ue_associated(42, 7, &[0x00, 0x01], &[0xAA, 0xBB, 0xCC, 0xDD])
             .expect("build UE-associated NRPPa transport");
-        assert!(!bytes.is_empty());
-
-        let parsed = parse_ue_associated_nrppa_transport(&decode(&bytes))
-            .expect("parse UE-associated NRPPa transport");
-        assert_eq!(parsed.amf_ue_ngap_id.0, 42);
-        assert_eq!(parsed.ran_ue_ngap_id.0, 7);
-        assert_eq!(parsed.routing_id.0, routing.to_vec());
-        assert_eq!(parsed.nrppa_pdu.0, nrppa.to_vec());
+        assert_eq!(bytes, DL_UE_GOLDEN.to_vec());
+        assert_eq!(crate::ngap_asn1::extract_amf_ue_ngap_id(&bytes), Some(42));
+        assert_eq!(crate::ngap_asn1::extract_ran_ue_ngap_id(&bytes), Some(7));
     }
 
     #[test]
-    fn nrppa_dl_non_ue_associated_round_trips() {
-        let routing = [0x05u8, 0x06, 0x07];
-        let nrppa = [0x01u8, 0x02];
-        let bytes = build_nrppa_dl_non_ue_associated(&routing, &nrppa)
+    fn nrppa_dl_non_ue_associated_matches_hand_derived_bytes() {
+        let bytes = build_nrppa_dl_non_ue_associated(&[0x05, 0x06, 0x07], &[0x01, 0x02])
             .expect("build non-UE-associated NRPPa transport");
-        assert!(!bytes.is_empty());
-
-        let parsed = parse_non_ue_associated_nrppa_transport(&decode(&bytes))
-            .expect("parse non-UE-associated NRPPa transport");
-        assert_eq!(parsed.routing_id.0, routing.to_vec());
-        assert_eq!(parsed.nrppa_pdu.0, nrppa.to_vec());
+        assert_eq!(bytes, DL_NON_UE_GOLDEN.to_vec());
+        assert_eq!(crate::ngap_asn1::extract_amf_ue_ngap_id(&bytes), None);
     }
 
     #[test]
