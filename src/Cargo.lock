@@ -2743,7 +2743,6 @@ dependencies = [
  "log",
  "nextgcore-amfd",
  "nextgcore-app",
- "nextgcore-asn1c",
  "nextgcore-core",
  "nextgcore-lpp-gen",
  "nextgcore-metrics",
@@ -2767,7 +2766,6 @@ dependencies = [
  "asn1_codecs_derive",
  "bitvec",
  "log",
- "nextgcore-asn1c",
 ]
 
 [[package]]
