@@ -726,9 +726,17 @@ pub struct PendingNetworkDereg {
     pub amf_ue_ngap_id: u64,
     /// Re-registration-required flag for the DEREGISTRATION REQUEST
     /// de-registration type (TS 24.501 §9.11.3.20). Set when the UDM's
-    /// `deregReason` is `UE_INITIAL_REGISTRATION` (the UE registered in a new
-    /// AMF), so the old AMF tells the UE to re-register (TS 23.502 §4.2.2.3.3).
+    /// `deregReason` is `REREGISTRATION_REQUIRED` (TS 23.502 §4.2.2.3.3), so the
+    /// UE is told to register again. Ignored when `local` is set.
     pub reregistration_required: bool,
+    /// LOCAL deregistration: no NAS message to the UE (#602). Set when the UDM's
+    /// `deregReason` is `UE_INITIAL_REGISTRATION`, i.e. a NEW AMF now serves the
+    /// UE after an initial registration (TS 29.503 Table 6.2.6.3.3-1), and this,
+    /// the old AMF, removes the UE context (TS 23.502 §4.2.2.2.2 step 14d): it
+    /// releases the SM contexts and the policy associations, releases a still-live
+    /// N2 context, and drops the UE. Signalling the UE here would reach a UE that
+    /// is now registered with the new AMF and make it deregister from it.
+    pub local: bool,
     /// Optional 5GMM cause (TS 24.501 §9.11.3.2), carried as the raw cause
     /// value to keep this container decoupled from `gmm_build::GmmCause`. The
     /// UDM-triggered path passes `None` per TS 23.502 §4.2.2.3.3.
