@@ -140,3 +140,28 @@ fn a_truncated_body_is_an_error_not_a_panic() {
         assert!(decode_body(&GOLDEN_BODY[..len]).is_err(), "len {len}");
     }
 }
+
+/// A real reply from nextgsim's UE (its #542 sender, captured from
+/// `a_provide_location_information_carries_the_ranging_report_through_a_round_trip`):
+/// an E-CID report plus the sidelink ranging report in nextg's EPDU. The two codecs
+/// are separate products, so this is the cross-repo half of the contract.
+const NEXTGSIM_UE_REPLY: &[u8] = &[
+    0x90, 0x01, 0x28, 0x0D, 0x26, 0x50, 0x41, 0xCE, 0x82, 0xA8, 0xC0, 0x32, 0x82, 0x0E, 0x74, 0x15,
+    0x46, 0x07, 0xFE, 0xBB, 0xB2, 0xF8, 0xE9, 0x9D, 0x6F, 0x3D, 0x39, 0x32, 0xEC, 0xD3, 0xBB, 0x5A,
+    0xDE, 0x58, 0x77, 0x67, 0xD3, 0xBB, 0x38, 0x58, 0x0A, 0x5A, 0x5A, 0x50, 0x13, 0x88, 0x00, 0x01,
+    0x40, 0x00, 0xC0,
+];
+
+#[test]
+fn the_lmf_reads_both_halves_of_a_real_nextgsim_ue_reply() {
+    let (_, ranges) = decode_lpp_sidelink_ranging(NEXTGSIM_UE_REPLY).expect("decodes");
+    assert_eq!(ranges.len(), 1, "the sidelink range");
+    assert_eq!(ranges[0].peer_layer2_id, 0x00A5_A5A5);
+    assert_eq!(ranges[0].method, SidelinkRangingMethod::CarrierPhase);
+    let (_, cells) = crate::codec_glue::decode_lpp_provide_report(NEXTGSIM_UE_REPLY)
+        .expect("the E-CID half decodes too");
+    assert!(
+        !cells.is_empty(),
+        "and the E-CID measurements are still read"
+    );
+}
