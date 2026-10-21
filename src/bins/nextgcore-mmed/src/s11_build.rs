@@ -35,6 +35,8 @@ pub mod message_type {
     pub const DELETE_BEARER_COMMAND: u8 = 66;
     pub const BEARER_RESOURCE_COMMAND: u8 = 68;
     pub const BEARER_RESOURCE_FAILURE_INDICATION: u8 = 69;
+    pub const CHANGE_NOTIFICATION_REQUEST: u8 = 38;
+    pub const CHANGE_NOTIFICATION_RESPONSE: u8 = 39;
 }
 
 // ============================================================================
@@ -52,6 +54,7 @@ pub mod ie_type {
     pub const MEI: u8 = 75;
     pub const MSISDN: u8 = 76;
     pub const INDICATION: u8 = 77;
+    pub const IP_ADDRESS: u8 = 74;
     pub const PCO: u8 = 78;
     pub const CHANGE_REPORTING_ACTION: u8 = 131;
     pub const PAA: u8 = 79;
@@ -467,6 +470,15 @@ pub fn build_create_session_request(
     ));
     msg.add_ie(uli_ie(mme_ue)?);
 
+    // Indication (C, §8.12): Change Reporting Support Indication. TS 23.401 §5.9.2:
+    // the MME says in the Create Session Request whether it supports location
+    // change reporting, and since #593 it does (Change Notification Request).
+    let indication = Gtp2IndicationIe {
+        crsi: true,
+        ..Default::default()
+    };
+    msg.add_ie(typed_ie(|buf| indication.encode(buf, 0))?);
+
     // Selection Mode (C)
     msg.add_ie(typed_ie(|buf| Gtp2SelectionModeIe::new(0).encode(buf, 0))?);
 
@@ -666,6 +678,47 @@ pub fn build_delete_bearer_command(
         msg.add_bearer_context(0, &bc);
     }
     msg.add_ie(uli_ie(mme_ue)?);
+    Ok(msg)
+}
+
+/// Build a Change Notification Request (TS 29.274 §7.3.14, Table 7.3.14-1) for
+/// the PDN connection `sess`, whose default bearer is `lbi` (#593, TS 23.401
+/// §5.9.2): it tells the PDN GW, via the Serving GW, where the UE now is.
+///
+/// - IMSI (C): included when the UE has one;
+/// - RAT Type (M): the UE's;
+/// - ULI (C): the TAI and ECGI just stored;
+/// - Linked EPS Bearer ID (C, "shall include on S4/S11") and PGW S5/S8 GTP-C IP
+///   Address (C, same): together they name the PDN connection at the SGW.
+pub fn build_change_notification_request(
+    mme_ue: &MmeUe,
+    sgw_ue: &SgwUe,
+    sess: &MmeSess,
+    lbi: u8,
+    sequence_number: u32,
+) -> S11BuildResult<Gtp2Message> {
+    let mut msg = new_message(
+        message_type::CHANGE_NOTIFICATION_REQUEST,
+        sgw_ue.sgw_s11_teid,
+        sequence_number,
+    );
+    if mme_ue.imsi_len > 0 {
+        msg.add_ie(Gtp2Ie::from_slice(
+            Gtp2IeType::Imsi as u8,
+            0,
+            &mme_ue.imsi[..mme_ue.imsi_len],
+        ));
+    }
+    msg.add_ie(typed_ie(|buf| {
+        Gtp2RatTypeIe::new(mme_ue.rat_type).encode(buf, 0)
+    })?);
+    msg.add_ie(uli_ie(mme_ue)?);
+    msg.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Ebi as u8, 0, &[lbi & 0x0F]));
+    if let Some(v4) = sess.pgw_s5c_ip.ipv4 {
+        msg.add_ie(Gtp2Ie::from_slice(ie_type::IP_ADDRESS, 0, &v4));
+    } else if let Some(v6) = sess.pgw_s5c_ip.ipv6 {
+        msg.add_ie(Gtp2Ie::from_slice(ie_type::IP_ADDRESS, 0, &v6));
+    }
     Ok(msg)
 }
 
@@ -1064,6 +1117,39 @@ mod tests {
     /// #51 criterion 5, and the defect the hand-rolled encoder had: `[0x00, 0x08,
     /// 0x00]` put the OI bit in the SECOND content octet, so Operation Indication was
     /// never actually set on the wire.
+    /// #593, TS 23.401 §5.9.2: the Create Session Request says the MME supports
+    /// location change reporting (CRSI), or a PDN GW would never ask for it.
+    #[test]
+    fn a_create_session_request_announces_change_reporting_support() {
+        let mme_ue = MmeUe {
+            imsi_len: 1,
+            ..Default::default()
+        };
+        let sgw_ue = SgwUe::default();
+        let sess = MmeSess {
+            apn: "internet".to_string(),
+            ..Default::default()
+        };
+        let bearer = MmeBearer {
+            ebi: 5,
+            ..Default::default()
+        };
+        let msg = build_create_session_request(
+            &sess,
+            &mme_ue,
+            &sgw_ue,
+            GtpCreateAction::AttachRequest,
+            1,
+            &[&bearer],
+            "127.0.0.1:2123".parse().unwrap(),
+        )
+        .expect("build");
+        let indication = msg
+            .get_ie(Gtp2IeType::Indication as u8, 0)
+            .expect("the Indication IE must be present");
+        assert!(Gtp2IndicationIe::decode(&indication.value).unwrap().crsi);
+    }
+
     #[test]
     fn delete_session_request_sets_the_operation_indication_flag() {
         let sess = MmeSess::default();

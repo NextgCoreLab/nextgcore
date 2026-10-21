@@ -151,6 +151,17 @@ pub struct BearerContextCreated {
 pub struct ModifyBearerResponseData {
     pub cause: u8,
     pub bearer_contexts: Vec<BearerContextModified>,
+    /// Change Reporting Action (TS 29.274 Table 7.2.8-1, §8.61), when the PDN
+    /// GW starts or stops location change reporting here (#593).
+    pub change_reporting_action: Option<u8>,
+}
+
+/// Parsed Change Notification Response (TS 29.274 §7.3.15, #593).
+#[derive(Debug, Clone, Default)]
+pub struct ChangeNotificationResponseData {
+    pub cause: u8,
+    /// Change Reporting Action (C, Table 7.3.15-1).
+    pub change_reporting_action: Option<u8>,
 }
 
 /// Bearer context modified
@@ -286,8 +297,30 @@ pub fn dispatch_triggered(raw: &[u8], msg_type: u8, sequence_number: u32, peer: 
                         crate::s1ap_path::s1ap_send(send);
                     }
                 }
+                // #593: the PDN GW may start or stop location change reporting in
+                // a Modify Bearer Response too (Table 7.2.8-1).
+                if data.change_reporting_action.is_some() {
+                    let local_teid = parse_gtp_header(raw)
+                        .map(|(_, teid, _, _)| teid)
+                        .unwrap_or(0);
+                    let ctx = crate::context::mme_self();
+                    if let Some(mme_ue_id) = ctx.mme_ue_find_by_s11_local_teid(local_teid) {
+                        if let Some(send) = apply_change_reporting_action(
+                            ctx,
+                            mme_ue_id,
+                            &sessions_of_ue(ctx, mme_ue_id),
+                            data.change_reporting_action,
+                        ) {
+                            crate::s1ap_path::s1ap_send(send);
+                        }
+                    }
+                }
             }
             Err(e) => log::error!("S11 Modify Bearer Response from {peer} unparsable: {e:?}"),
+        },
+        mt::CHANGE_NOTIFICATION_RESPONSE => match handle_change_notification_response(raw) {
+            Ok(data) => apply_change_notification_response(&data, sequence_number, peer),
+            Err(e) => log::error!("S11 Change Notification Response from {peer} unparsable: {e:?}"),
         },
         mt::DELETE_SESSION_RESPONSE => match handle_delete_session_response(raw) {
             Ok(data) => log::info!(
@@ -404,7 +437,13 @@ fn apply_create_session_response(
     // #584: the PDN GW's Change Reporting Action (TS 29.274 §8.61) is what asks
     // this MME for ECGI change reporting, which the eNB does with LOCATION
     // REPORTING CONTROL (TS 36.413 §8.11.1, TS 23.401 §5.9.2).
-    if let Some(send) = location_reporting_for_action(ctx, mme_ue_id, data.change_reporting_action)
+    //
+    // #593: the action is kept on the PDN connection it came for, so a later
+    // LOCATION REPORT is forwarded to this PDN GW (Change Notification Request).
+    let created: Vec<u8> = data.bearer_contexts.iter().map(|b| b.ebi).collect();
+    let sess_ids = sessions_of_bearers(ctx, mme_ue_id, &created);
+    if let Some(send) =
+        apply_change_reporting_action(ctx, mme_ue_id, &sess_ids, data.change_reporting_action)
     {
         crate::s1ap_path::s1ap_send(send);
     }
@@ -465,9 +504,13 @@ pub fn location_reporting_for_action(
         START_ECGI | START_TAI_AND_ECGI => {
             crate::s1ap_handler::location_reporting_control(ctx, mme_ue_id, true)
         }
+        // Another PDN GW of this UE may still want ECGI changes (#593).
         STOP if ctx
             .mme_ue_find_by_id(mme_ue_id)
-            .is_some_and(|ue| ue.location_reporting_active) =>
+            .is_some_and(|ue| ue.location_reporting_active)
+            && !sessions_of_ue(ctx, mme_ue_id)
+                .into_iter()
+                .any(|id| reports_ecgi(session_action(ctx, id))) =>
         {
             crate::s1ap_handler::location_reporting_control(ctx, mme_ue_id, false)
         }
@@ -475,6 +518,141 @@ pub fn location_reporting_for_action(
             log::debug!("Change Reporting Action {other} needs no Location Reporting Control");
             None
         }
+    }
+}
+
+/// Change Reporting Action values this MME acts on (TS 29.274 §8.61).
+pub mod change_reporting_action {
+    pub const STOP_REPORTING: u8 = 0;
+    pub const START_REPORTING_TAI: u8 = 3;
+    pub const START_REPORTING_ECGI: u8 = 4;
+    pub const START_REPORTING_TAI_AND_ECGI: u8 = 6;
+}
+
+/// Whether `action` asks to be told about ECGI changes.
+pub fn reports_ecgi(action: Option<u8>) -> bool {
+    use change_reporting_action as a;
+    matches!(
+        action,
+        Some(a::START_REPORTING_ECGI | a::START_REPORTING_TAI_AND_ECGI)
+    )
+}
+
+/// Whether `action` asks to be told about TAI changes.
+pub fn reports_tai(action: Option<u8>) -> bool {
+    use change_reporting_action as a;
+    matches!(
+        action,
+        Some(a::START_REPORTING_TAI | a::START_REPORTING_TAI_AND_ECGI)
+    )
+}
+
+/// The stored Change Reporting Action of session `sess_id`.
+fn session_action(ctx: &crate::context::MmeContext, sess_id: u64) -> Option<u8> {
+    ctx.sess_find_by_id(sess_id)
+        .and_then(|s| s.change_reporting_action)
+}
+
+/// Every PDN connection of `mme_ue_id`.
+pub fn sessions_of_ue(ctx: &crate::context::MmeContext, mme_ue_id: u64) -> Vec<u64> {
+    ctx.mme_ue_find_by_id(mme_ue_id)
+        .map(|ue| ue.sess_list)
+        .unwrap_or_default()
+}
+
+/// The PDN connections holding the bearers `ebis`, or, when none of them
+/// names a known bearer, every PDN connection of the UE.
+fn sessions_of_bearers(ctx: &crate::context::MmeContext, mme_ue_id: u64, ebis: &[u8]) -> Vec<u64> {
+    let mut ids: Vec<u64> = ebis
+        .iter()
+        .filter_map(|ebi| ctx.bearer_find_by_ebi(mme_ue_id, *ebi))
+        .filter_map(|id| ctx.bearer_find_by_id(id))
+        .map(|b| b.sess_id)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        sessions_of_ue(ctx, mme_ue_id)
+    } else {
+        ids
+    }
+}
+
+/// Store a PDN GW's Change Reporting Action on the PDN connections `sess_ids`
+/// and drive the eNB's location reporting from it (#584, #593). An absent
+/// action changes nothing (TS 29.274 §8.61 is sent only to start or stop).
+pub fn apply_change_reporting_action(
+    ctx: &crate::context::MmeContext,
+    mme_ue_id: u64,
+    sess_ids: &[u64],
+    action: Option<u8>,
+) -> Option<crate::s1ap_handler::S1apSend> {
+    let action = action?;
+    if let Ok(mut pool) = ctx.sess_pool.write() {
+        for id in sess_ids {
+            if let Some(sess) = pool.get_mut(id) {
+                sess.change_reporting_action = Some(action);
+            }
+        }
+    }
+    location_reporting_for_action(ctx, mme_ue_id, Some(action))
+}
+
+/// The PDN connections of `mme_ue_id` whose PDN GW asked to be told about the
+/// location change just stored (TS 23.401 §5.9.2): an ECGI change for "start
+/// reporting ECGI" / "TAI and ECGI", a TAI change for "start reporting TAI" /
+/// "TAI and ECGI".
+pub fn sessions_to_notify(
+    ctx: &crate::context::MmeContext,
+    mme_ue_id: u64,
+    tai_changed: bool,
+    ecgi_changed: bool,
+) -> Vec<u64> {
+    sessions_of_ue(ctx, mme_ue_id)
+        .into_iter()
+        .filter(|id| {
+            let action = session_action(ctx, *id);
+            (ecgi_changed && reports_ecgi(action)) || (tai_changed && reports_tai(action))
+        })
+        .collect()
+}
+
+/// Act on a Change Notification Response (TS 29.274 §7.3.15, #593): a new
+/// Change Reporting Action replaces the PDN connection's, and a refusal is
+/// reported. "Context not found" is not acted on beyond the log, since tearing
+/// down the PDN connection from here is a decision this MME does not own.
+fn apply_change_notification_response(
+    data: &ChangeNotificationResponseData,
+    sequence_number: u32,
+    peer: SocketAddr,
+) {
+    let ctx = crate::context::mme_self();
+    let Some(sess_id) = crate::gtp_path::take_pending_change_notification(sequence_number) else {
+        log::debug!(
+            "S11 Change Notification Response seq={sequence_number} from {peer} has no pending \
+             record"
+        );
+        return;
+    };
+    if data.cause != 16 {
+        log::warn!(
+            "S11 Change Notification Response from {peer} (seq={sequence_number}) refused the \
+             location change for session {sess_id}: cause {}",
+            data.cause
+        );
+    } else {
+        log::info!(
+            "S11 Change Notification Response from {peer} (seq={sequence_number}) accepted the \
+             location change for session {sess_id}"
+        );
+    }
+    let Some(mme_ue_id) = ctx.sess_find_by_id(sess_id).map(|s| s.mme_ue_id) else {
+        return;
+    };
+    if let Some(send) =
+        apply_change_reporting_action(ctx, mme_ue_id, &[sess_id], data.change_reporting_action)
+    {
+        crate::s1ap_path::s1ap_send(send);
     }
 }
 
@@ -1248,6 +1426,8 @@ pub fn handle_modify_bearer_response(data: &[u8]) -> S11Result<ModifyBearerRespo
                 if let Some(cause) = parse_cause(value) {
                     result.cause = cause;
                 }
+            } else if ie_t == ie_type::CHANGE_REPORTING_ACTION {
+                result.change_reporting_action = value.first().copied();
             }
             offset += 4 + length as usize;
         } else {
@@ -1255,6 +1435,32 @@ pub fn handle_modify_bearer_response(data: &[u8]) -> S11Result<ModifyBearerRespo
         }
     }
 
+    Ok(result)
+}
+
+/// Parse a Change Notification Response (TS 29.274 §7.3.15, #593).
+pub fn handle_change_notification_response(
+    data: &[u8],
+) -> S11Result<ChangeNotificationResponseData> {
+    let (msg_type, _, _, payload) = parse_gtp_header(data)?;
+    if msg_type != message_type::CHANGE_NOTIFICATION_RESPONSE {
+        return Err(S11Error::InvalidMessageFormat);
+    }
+    let mut result = ChangeNotificationResponseData::default();
+    let mut offset = 0;
+    while offset < payload.len() {
+        let Some((ie_t, length, _, value)) = parse_ie_header(&payload[offset..]) else {
+            break;
+        };
+        if ie_t == ie_type::CAUSE {
+            if let Some(cause) = parse_cause(value) {
+                result.cause = cause;
+            }
+        } else if ie_t == ie_type::CHANGE_REPORTING_ACTION {
+            result.change_reporting_action = value.first().copied();
+        }
+        offset += 4 + length as usize;
+    }
     Ok(result)
 }
 
@@ -1943,6 +2149,156 @@ mod tests {
         ctx.bearer_remove(bearer_id);
         ctx.sess_remove(sess_id);
         ctx.mme_ue_remove(mme_ue_id);
+    }
+
+    /// #593: a Change Notification Request reaches the Serving GW on a real S11
+    /// socket, and the Change Notification Response closes it, its Change
+    /// Reporting Action replacing the PDN connection's.
+    #[test]
+    fn a_change_notification_is_answered_and_its_action_applied() {
+        use nextgcore_gtp::v2::{Gtp2Header, Gtp2IeType, Gtp2Message};
+        let _guard = crate::gtp_path::lock_s11();
+        let (mme_ue_id, _, sess_id, bearer_id, local_teid) = seed_global_ue(5);
+        let ctx = crate::context::mme_self();
+        ctx.sess_pool
+            .write()
+            .unwrap()
+            .get_mut(&sess_id)
+            .unwrap()
+            .change_reporting_action = Some(4);
+
+        let sgw = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sgw.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let server = crate::gtp_path::GtpcServer::open(
+            "127.0.0.1:0",
+            nextgcore_gtp::v2::xact::Gtp2XactConfig::default(),
+            7,
+        )
+        .unwrap();
+        let seq = crate::gtp_path::send_change_notification_on(
+            &server,
+            sgw.local_addr().unwrap(),
+            ctx,
+            mme_ue_id,
+            sess_id,
+        )
+        .expect("sent");
+
+        let mut buf = [0u8; 2048];
+        let (len, from) = sgw.recv_from(&mut buf).expect("the SGW receives it");
+        let mut bytes = bytes::Bytes::copy_from_slice(&buf[..len]);
+        let cnr = Gtp2Message::decode(&mut bytes).unwrap();
+        assert_eq!(cnr.header.message_type, 38);
+        assert_eq!(cnr.header.sequence_number, seq);
+        assert_eq!(
+            cnr.get_ie(Gtp2IeType::Ebi as u8, 0).unwrap().value.as_ref(),
+            &[5]
+        );
+
+        // The PDN GW stops reporting in its answer.
+        let mut rsp = Gtp2Message::new(Gtp2Header::new(39, local_teid, seq));
+        rsp.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
+            Gtp2IeType::Cause as u8,
+            0,
+            &[16, 0],
+        ));
+        rsp.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(131, 0, &[0]));
+        sgw.send_to(&rsp.encode(), from).unwrap();
+        for _ in 0..200 {
+            if server.outstanding() == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(server.outstanding(), 0, "the response closes the request");
+        for _ in 0..200 {
+            if ctx
+                .sess_find_by_id(sess_id)
+                .unwrap()
+                .change_reporting_action
+                == Some(0)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            ctx.sess_find_by_id(sess_id)
+                .unwrap()
+                .change_reporting_action,
+            Some(0),
+            "the response's Change Reporting Action replaces the session's"
+        );
+        assert!(crate::gtp_path::take_pending_change_notification(seq).is_none());
+        server.close();
+        release_global_ue(mme_ue_id, sess_id, bearer_id);
+    }
+
+    /// #593: a Change Reporting Action in a Modify Bearer Response is honoured.
+    #[test]
+    fn a_modify_bearer_response_change_reporting_action_is_honoured() {
+        use nextgcore_gtp::v2::{Gtp2Header, Gtp2IeType, Gtp2Message};
+        let _guard = crate::gtp_path::lock_s11();
+        let (mme_ue_id, _, sess_id, bearer_id, local_teid) = seed_global_ue(5);
+        let mut rsp = Gtp2Message::new(Gtp2Header::new(35, local_teid, 0x593));
+        rsp.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(
+            Gtp2IeType::Cause as u8,
+            0,
+            &[16, 0],
+        ));
+        rsp.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(131, 0, &[6]));
+        let raw = rsp.encode();
+        assert_eq!(
+            handle_modify_bearer_response(&raw)
+                .unwrap()
+                .change_reporting_action,
+            Some(6)
+        );
+        dispatch_triggered(&raw, 35, 0x593, "127.0.0.1:2123".parse().unwrap());
+        assert_eq!(
+            crate::context::mme_self()
+                .sess_find_by_id(sess_id)
+                .unwrap()
+                .change_reporting_action,
+            Some(6)
+        );
+        release_global_ue(mme_ue_id, sess_id, bearer_id);
+    }
+
+    #[test]
+    fn a_change_notification_response_parses_cause_and_action() {
+        let mut rsp =
+            nextgcore_gtp::v2::Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(39, 1, 2));
+        rsp.add_ie(nextgcore_gtp::v2::ie::Gtp2Ie::from_slice(2, 0, &[64, 0]));
+        let parsed = handle_change_notification_response(&rsp.encode()).unwrap();
+        assert_eq!(parsed.cause, 64);
+        assert_eq!(parsed.change_reporting_action, None);
+        assert!(handle_change_notification_response(
+            &nextgcore_gtp::v2::Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(35, 1, 2))
+                .encode()
+        )
+        .is_err());
+    }
+
+    /// #593: the Create Session Response's Change Reporting Action is kept on the
+    /// PDN connection it was sent for.
+    #[test]
+    fn a_create_session_response_action_is_kept_on_its_session() {
+        let _guard = crate::gtp_path::lock_s11();
+        crate::gtp_path::clear_pending_creates_for_test();
+        let (mme_ue_id, _, sess_id, bearer_id, local_teid) = seed_global_ue(5);
+        let mut data = accepted_response(5, [10, 45, 0, 9]);
+        data.change_reporting_action = Some(6);
+        apply_create_session_response(&data, local_teid, 4593, "127.0.0.1:2123".parse().unwrap());
+        assert_eq!(
+            crate::context::mme_self()
+                .sess_find_by_id(sess_id)
+                .unwrap()
+                .change_reporting_action,
+            Some(6)
+        );
+        release_global_ue(mme_ue_id, sess_id, bearer_id);
     }
 
     /// An accepted Create Session Response carrying a PAA and one bearer context.
