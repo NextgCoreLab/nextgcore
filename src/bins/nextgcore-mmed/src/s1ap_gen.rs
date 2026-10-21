@@ -998,6 +998,11 @@ const IMPLEMENTED_PROCEDURES: &[u8] = &[
     PROC_OVERLOAD_STOP,
     PROC_WRITE_REPLACE_WARNING,
     PROC_KILL,
+    PROC_E_RAB_RELEASE_INDICATION,
+    PROC_E_RAB_MODIFICATION_INDICATION,
+    PROC_LOCATION_REPORTING_CONTROL,
+    PROC_LOCATION_REPORTING_FAILURE_INDICATION,
+    PROC_LOCATION_REPORT,
 ];
 
 /// `(triggering message, procedure code)` of every message only the MME sends.
@@ -1017,7 +1022,9 @@ const MME_ORIGINATED: &[(u8, u8)] = &[
     (0, PROC_OVERLOAD_STOP),
     (0, PROC_WRITE_REPLACE_WARNING),
     (0, PROC_KILL),
+    (0, PROC_LOCATION_REPORTING_CONTROL),
     (1, PROC_S1_SETUP),
+    (1, PROC_E_RAB_MODIFICATION_INDICATION),
     (1, PROC_HANDOVER_PREPARATION),
     (1, PROC_PATH_SWITCH_REQUEST),
     (1, PROC_HANDOVER_CANCEL),
@@ -2201,6 +2208,15 @@ pub enum HandoverRequiredDecode {
         /// eNB-UE-S1AP-ID.
         enb_ue_s1ap_id: u32,
     },
+    /// The Target ID names a gNB (TargetNgRanNode-ID, TS 36.413 §9.2.1.6): an
+    /// EPS to 5GS handover, which this MME prepares over N26 as the source
+    /// (#584, TS 23.502 §4.11.1.2.2).
+    ToFivegs {
+        /// The message.
+        msg: HandoverRequiredTo5gs,
+        /// IEs to report.
+        notify: Vec<DiagnosedIe>,
+    },
     /// A `reject` IE is missing or not understood: answer HANDOVER PREPARATION
     /// FAILURE naming `ies` (§10.3.4.2 / §10.3.5).
     Reject {
@@ -2213,6 +2229,51 @@ pub enum HandoverRequiredDecode {
     },
     /// Not decodable (transfer syntax error).
     Undecodable,
+}
+
+/// A HANDOVER REQUIRED towards a gNB (#584).
+#[derive(Debug, Clone)]
+pub struct HandoverRequiredTo5gs {
+    /// MME-UE-S1AP-ID.
+    pub mme_ue_s1ap_id: u32,
+    /// eNB-UE-S1AP-ID.
+    pub enb_ue_s1ap_id: u32,
+    /// Handover Type.
+    pub handover_type: nextgcore_s1ap::HandoverType,
+    /// Cause (radioNetwork / unspecified when missing).
+    pub cause: Cause,
+    /// The target gNB and its selected 5GS TAI.
+    pub target: crate::n26_build::GnbTarget,
+    /// Direct Forwarding Path Availability present.
+    pub direct_forwarding: bool,
+    /// The Source to Target Transparent Container, for the target NG-RAN.
+    pub source_to_target_container: Vec<u8>,
+}
+
+/// The gNB a TargetNgRanNode-ID names: `Err(())` for an ng-eNB (well formed,
+/// not served), `Ok(None)` for a malformed one.
+fn gnb_target_from(t: &g::TargetNgRanNode_ID) -> Result<Option<crate::n26_build::GnbTarget>, ()> {
+    let g::Global_RAN_NODE_ID::GNB(gnb) = &t.global_ran_node_id else {
+        return Err(());
+    };
+    let g::GNB_Identity::GNB_ID(id) = &gnb.global_g_nb_id.gnb_id;
+    let (Some(plmn), Some(_), Ok(tac)) = (
+        plmn(&gnb.global_g_nb_id.plmn_identity.0),
+        plmn(&t.selected_tai.plm_nidentity.0),
+        <[u8; 3]>::try_from(t.selected_tai.five_gstac.0.as_slice()),
+    ) else {
+        return Ok(None);
+    };
+    let len = id.0.len();
+    if !(22..=32).contains(&len) {
+        return Ok(None);
+    }
+    Ok(Some(crate::n26_build::GnbTarget {
+        plmn,
+        gnb_id: bits_to_u32(&id.0),
+        gnb_id_len: len as u8,
+        tac,
+    }))
 }
 
 fn handover_type_from(v: u8) -> Option<nextgcore_s1ap::HandoverType> {
@@ -2317,6 +2378,7 @@ pub fn decode_handover_required(bytes: &[u8]) -> HandoverRequiredDecode {
     let (mut mme, mut enb, mut ho_type, mut cause, mut target, mut direct, mut container) =
         (None, None, None, None, None, None, None);
     let mut unsupported_target = false;
+    let mut gnb_target = None;
     use g::HandoverRequiredProtocolIEs_EntryValue as V;
     for ie in m.protocol_i_es.0 {
         match ie.value {
@@ -2327,6 +2389,11 @@ pub fn decode_handover_required(bytes: &[u8]) -> HandoverRequiredDecode {
                 None => not_understood(&mut reject, ID_HANDOVER_TYPE),
             },
             V::Id_Cause(c) => cause = domain_cause(&c),
+            V::Id_TargetID(g::TargetID::TargetgNgRanNode_ID(t)) => match gnb_target_from(&t) {
+                Ok(Some(t)) => gnb_target = Some(t),
+                Ok(None) => not_understood(&mut reject, ID_TARGET_ID),
+                Err(()) => unsupported_target = true,
+            },
             V::Id_TargetID(t) => match target_id_from(&t) {
                 Ok(Some(t)) => target = Some(t),
                 Ok(None) => not_understood(&mut reject, ID_TARGET_ID),
@@ -2348,7 +2415,7 @@ pub fn decode_handover_required(bytes: &[u8]) -> HandoverRequiredDecode {
     missing(&mut reject, ho_type.is_some(), ID_HANDOVER_TYPE);
     missing(
         &mut reject,
-        target.is_some() || unsupported_target,
+        target.is_some() || unsupported_target || gnb_target.is_some(),
         ID_TARGET_ID,
     );
     missing(
@@ -2368,6 +2435,22 @@ pub fn decode_handover_required(bytes: &[u8]) -> HandoverRequiredDecode {
     else {
         return HandoverRequiredDecode::Undecodable;
     };
+    if let Some(target) = gnb_target {
+        return HandoverRequiredDecode::ToFivegs {
+            msg: HandoverRequiredTo5gs {
+                mme_ue_s1ap_id,
+                enb_ue_s1ap_id,
+                handover_type,
+                cause: cause.unwrap_or(Cause::RadioNetwork(
+                    nextgcore_s1ap::CauseRadioNetwork::Unspecified,
+                )),
+                target,
+                direct_forwarding: direct.is_some(),
+                source_to_target_container: container,
+            },
+            notify,
+        };
+    }
     let Some(target_id) = target else {
         return HandoverRequiredDecode::UnsupportedTarget {
             mme_ue_s1ap_id,
@@ -3016,13 +3099,49 @@ const ID_SOURCE_MME_UE_S1AP_ID: u16 = 88;
 const ID_ERAB_TO_BE_SWITCHED_UL_ITEM: u16 = 94;
 const ID_ERAB_TO_BE_SWITCHED_UL_LIST: u16 = 95;
 
+/// A PATH SWITCH REQUEST whose `ignore` IEs may be absent (#584).
+///
+/// TS 36.413 §9.1.5.8 marks EUTRAN-CGI, TAI and UE Security Capabilities
+/// criticality `ignore`, and §10.3.5 says a missing `ignore` IE is ignored:
+/// the procedure runs on what is there. The shared `PathSwitchRequest` type
+/// has no "absent" for them, so this mmed-local type carries `Option`s and the
+/// handler leaves the stored location as it is, or skips the §7.2.4.3.2
+/// comparison, for whichever one is missing.
+#[derive(Debug, Clone)]
+pub struct PathSwitchRequestAt {
+    /// eNB-UE-S1AP-ID (reject).
+    pub enb_ue_s1ap_id: u32,
+    /// E-RABToBeSwitchedDLList (reject).
+    pub erab_switched_dl_list: Vec<nextgcore_s1ap::ErabSwitchedItem>,
+    /// SourceMME-UE-S1AP-ID (reject).
+    pub source_mme_ue_s1ap_id: u32,
+    /// EUTRAN-CGI (ignore), if present.
+    pub eutran_cgi: Option<EutranCgi>,
+    /// TAI (ignore), if present.
+    pub tai: Option<Tai>,
+    /// UE Security Capabilities (ignore), if present.
+    pub ue_security_capabilities: Option<nextgcore_s1ap::UeSecurityCapabilities>,
+}
+
+impl From<&nextgcore_s1ap::PathSwitchRequest> for PathSwitchRequestAt {
+    fn from(m: &nextgcore_s1ap::PathSwitchRequest) -> Self {
+        Self {
+            enb_ue_s1ap_id: m.enb_ue_s1ap_id,
+            erab_switched_dl_list: m.erab_switched_dl_list.clone(),
+            source_mme_ue_s1ap_id: m.source_mme_ue_s1ap_id,
+            eutran_cgi: Some(m.eutran_cgi.clone()),
+            tai: Some(m.tai.clone()),
+            ue_security_capabilities: Some(m.ue_security_capabilities),
+        }
+    }
+}
+
 /// Decode a PATH SWITCH REQUEST (TS 36.413 §9.1.5.8), the initiating message of
 /// a Class 1 procedure. eNB-UE-S1AP-ID, E-RABToBeSwitchedDLList and
 /// SourceMME-UE-S1AP-ID are `reject`: missing, the request fails. EUTRAN-CGI,
-/// TAI and UE Security Capabilities are `ignore`, but the handler's type has no
-/// "absent" for them and acts on all three, so a request missing one is
-/// `Undecodable`, as it was with the hand-written parser.
-pub fn decode_path_switch_request(bytes: &[u8]) -> Class2Decode<nextgcore_s1ap::PathSwitchRequest> {
+/// TAI and UE Security Capabilities are `ignore`: missing (or present but not
+/// mappable), each is `None` and the procedure runs without it (§10.3.5, #584).
+pub fn decode_path_switch_request(bytes: &[u8]) -> Class2Decode<PathSwitchRequestAt> {
     let Ok((pdu, unknown)) = nextgcore_s1ap_gen::decode_with_unknown_ies(bytes) else {
         return Class2Decode::Undecodable;
     };
@@ -3088,17 +3207,14 @@ pub fn decode_path_switch_request(bytes: &[u8]) -> Class2Decode<nextgcore_s1ap::
     else {
         return Class2Decode::Undecodable;
     };
-    let (Some(eutran_cgi), Some(tai), Some(ue_security_capabilities)) = (cgi, tai, sec) else {
-        return Class2Decode::Undecodable;
-    };
     Class2Decode::Proceed {
-        msg: nextgcore_s1ap::PathSwitchRequest {
+        msg: PathSwitchRequestAt {
             enb_ue_s1ap_id,
             erab_switched_dl_list,
             source_mme_ue_s1ap_id,
-            eutran_cgi,
+            eutran_cgi: cgi,
             tai,
-            ue_security_capabilities,
+            ue_security_capabilities: sec,
         },
         notify,
     }
@@ -4179,6 +4295,484 @@ pub fn decode_kill_response(bytes: &[u8]) -> ResponseDecode<nextgcore_s1ap::Kill
     }
 }
 
+// ============================================================================
+// E-RAB Release Indication, E-RAB Modification Indication and Location
+// Reporting (TS 36.413 §8.2.3.2, §8.2.4, §8.11) -- #584
+// ============================================================================
+
+/// `id-E-RABReleaseIndication`.
+pub const PROC_E_RAB_RELEASE_INDICATION: u8 = 8;
+/// `id-LocationReportingControl`.
+pub const PROC_LOCATION_REPORTING_CONTROL: u8 = 31;
+/// `id-LocationReportingFailureIndication`.
+pub const PROC_LOCATION_REPORTING_FAILURE_INDICATION: u8 = 32;
+/// `id-LocationReport`.
+pub const PROC_LOCATION_REPORT: u8 = 33;
+/// `id-E-RABModificationIndication`.
+pub const PROC_E_RAB_MODIFICATION_INDICATION: u8 = 50;
+
+const ID_REQUEST_TYPE: u16 = 98;
+const ID_ERAB_RELEASED_LIST: u16 = 110;
+const ID_ERAB_TO_BE_MODIFIED_LIST_BEARER_MOD_IND: u16 = 199;
+const ID_ERAB_MODIFY_LIST_BEARER_MOD_CONF: u16 = 203;
+const ID_ERAB_MODIFY_ITEM_BEARER_MOD_CONF: u16 = 204;
+const ID_ERAB_FAILED_TO_MODIFY_LIST_BEARER_MOD_CONF: u16 = 205;
+const ID_ERAB_TO_BE_RELEASED_LIST_BEARER_MOD_CONF: u16 = 210;
+
+/// One E-RAB of an E-RAB RELEASE INDICATION's E-RAB Released List.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleasedErab {
+    /// E-RAB ID (= EBI).
+    pub erab_id: u8,
+    /// Cause, when this MME's cause enumeration has the value.
+    pub cause: Option<Cause>,
+}
+
+/// An E-RAB RELEASE INDICATION (TS 36.413 §9.1.3.7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErabReleaseIndication {
+    /// MME-UE-S1AP-ID (reject).
+    pub mme_ue_s1ap_id: u32,
+    /// eNB-UE-S1AP-ID (reject).
+    pub enb_ue_s1ap_id: u32,
+    /// E-RAB Released List (ignore). Empty when the list was missing, which
+    /// §10.3.5 has the MME ignore.
+    pub released: Vec<ReleasedErab>,
+    /// User Location Information (ignore, optional).
+    pub location: Option<(Tai, EutranCgi)>,
+}
+
+fn user_location(v: &g::UserLocationInformation) -> Option<(Tai, EutranCgi)> {
+    tai_from(&v.tai).zip(cgi_from(&v.eutran_cgi))
+}
+
+/// Decode an E-RAB RELEASE INDICATION (TS 36.413 §9.1.3.7), the initiating
+/// message of a Class 2 procedure, with §10.3.4.2 / §10.3.5.
+pub fn decode_erab_release_indication(bytes: &[u8]) -> Class2Decode<ErabReleaseIndication> {
+    let Ok((pdu, unknown)) = nextgcore_s1ap_gen::decode_with_unknown_ies(bytes) else {
+        return Class2Decode::Undecodable;
+    };
+    let g::S1AP_PDU::InitiatingMessage(msg) = pdu else {
+        return Class2Decode::Undecodable;
+    };
+    let g::InitiatingMessageValue::Id_E_RABReleaseIndication(m) = msg.value else {
+        return Class2Decode::Undecodable;
+    };
+    let (mut reject, notify) = classify_unknown(&unknown);
+    let (mut mme, mut enb, mut released, mut location) = (None, None, Vec::new(), None);
+    use g::E_RABReleaseIndicationProtocolIEs_EntryValue as V;
+    for ie in m.protocol_i_es.0 {
+        match ie.value {
+            V::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
+            V::Id_eNB_UE_S1AP_ID(v) => enb = Some(v.0),
+            V::Id_E_RABReleasedList(l) => {
+                released =
+                    l.0.into_iter()
+                        .map(|entry| {
+                            let g::E_RABList_EntryValue::Id_E_RABItem(item) = entry.value;
+                            ReleasedErab {
+                                erab_id: item.e_rab_id.0,
+                                cause: domain_cause(&item.cause),
+                            }
+                        })
+                        .collect();
+            }
+            V::Id_UserLocationInformation(v) => location = user_location(&v),
+            _ => {}
+        }
+    }
+    missing(&mut reject, mme.is_some(), ID_MME_UE_S1AP_ID);
+    missing(&mut reject, enb.is_some(), ID_ENB_UE_S1AP_ID);
+    if !reject.is_empty() {
+        return Class2Decode::Reject {
+            ies: reject,
+            enb_ue_s1ap_id: enb,
+            mme_ue_s1ap_id: mme,
+        };
+    }
+    let (Some(mme_ue_s1ap_id), Some(enb_ue_s1ap_id)) = (mme, enb) else {
+        return Class2Decode::Undecodable;
+    };
+    Class2Decode::Proceed {
+        msg: ErabReleaseIndication {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id,
+            released,
+            location,
+        },
+        notify,
+    }
+}
+
+/// An E-RAB MODIFICATION INDICATION (TS 36.413 §9.1.3.8).
+#[derive(Debug, Clone)]
+pub struct ErabModificationIndication {
+    /// MME-UE-S1AP-ID (reject).
+    pub mme_ue_s1ap_id: u32,
+    /// eNB-UE-S1AP-ID (reject).
+    pub enb_ue_s1ap_id: u32,
+    /// E-RAB to be Modified List (reject): each E-RAB's new downlink endpoint.
+    pub to_be_modified: Vec<nextgcore_s1ap::ErabSwitchedItem>,
+    /// E-RAB not to be Modified List (reject, optional).
+    pub not_to_be_modified: Vec<nextgcore_s1ap::ErabSwitchedItem>,
+    /// User Location Information (ignore, optional).
+    pub location: Option<(Tai, EutranCgi)>,
+}
+
+/// Decode an E-RAB MODIFICATION INDICATION (TS 36.413 §9.1.3.8), the
+/// initiating message of a Class 1 procedure with no failure message. A
+/// missing or not understood `reject` IE is `Reject` (answered by ERROR
+/// INDICATION, §10.3.4.2); `notify` IEs go in the confirm.
+pub fn decode_erab_modification_indication(
+    bytes: &[u8],
+) -> Class2Decode<ErabModificationIndication> {
+    let Ok((pdu, unknown)) = nextgcore_s1ap_gen::decode_with_unknown_ies(bytes) else {
+        return Class2Decode::Undecodable;
+    };
+    let g::S1AP_PDU::InitiatingMessage(msg) = pdu else {
+        return Class2Decode::Undecodable;
+    };
+    let g::InitiatingMessageValue::Id_E_RABModificationIndication(m) = msg.value else {
+        return Class2Decode::Undecodable;
+    };
+    let (mut reject, notify) = classify_unknown(&unknown);
+    let (mut mme, mut enb, mut modify, mut keep, mut location) =
+        (None, None, None, Vec::new(), None);
+    let item = |erab_id: u8, addr: &g::TransportLayerAddress, t: &g::GTP_TEID| {
+        Some(nextgcore_s1ap::ErabSwitchedItem {
+            erab_id,
+            transport_layer_address: bits_to_bytes(&addr.0),
+            gtp_teid: teid(&t.0)?,
+        })
+    };
+    use g::E_RABModificationIndicationProtocolIEs_EntryValue as V;
+    for ie in m.protocol_i_es.0 {
+        match ie.value {
+            V::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
+            V::Id_eNB_UE_S1AP_ID(v) => enb = Some(v.0),
+            V::Id_E_RABToBeModifiedListBearerModInd(l) => {
+                let items: Option<Vec<_>> = l
+                    .0
+                    .iter()
+                    .map(|e| {
+                        let g::E_RABToBeModifiedListBearerModInd_EntryValue::Id_E_RABToBeModifiedItemBearerModInd(i) = &e.value;
+                        item(i.e_rab_id.0, &i.transport_layer_address, &i.dl_gtp_teid)
+                    })
+                    .collect();
+                match items {
+                    Some(items) => modify = Some(items),
+                    None => not_understood(&mut reject, ID_ERAB_TO_BE_MODIFIED_LIST_BEARER_MOD_IND),
+                }
+            }
+            V::Id_E_RABNotToBeModifiedListBearerModInd(l) => {
+                keep = l
+                    .0
+                    .iter()
+                    .filter_map(|e| {
+                        let g::E_RABNotToBeModifiedListBearerModInd_EntryValue::Id_E_RABNotToBeModifiedItemBearerModInd(i) = &e.value;
+                        item(i.e_rab_id.0, &i.transport_layer_address, &i.dl_gtp_teid)
+                    })
+                    .collect();
+            }
+            V::Id_UserLocationInformation(v) => location = user_location(&v),
+            // CSG membership, BBF tunnel information, secondary RAT usage:
+            // understood, not used by this MME.
+            _ => {}
+        }
+    }
+    missing(&mut reject, mme.is_some(), ID_MME_UE_S1AP_ID);
+    missing(&mut reject, enb.is_some(), ID_ENB_UE_S1AP_ID);
+    missing(
+        &mut reject,
+        modify.is_some(),
+        ID_ERAB_TO_BE_MODIFIED_LIST_BEARER_MOD_IND,
+    );
+    if !reject.is_empty() {
+        return Class2Decode::Reject {
+            ies: reject,
+            enb_ue_s1ap_id: enb,
+            mme_ue_s1ap_id: mme,
+        };
+    }
+    let (Some(mme_ue_s1ap_id), Some(enb_ue_s1ap_id), Some(to_be_modified)) = (mme, enb, modify)
+    else {
+        return Class2Decode::Undecodable;
+    };
+    Class2Decode::Proceed {
+        msg: ErabModificationIndication {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id,
+            to_be_modified,
+            not_to_be_modified: keep,
+            location,
+        },
+        notify,
+    }
+}
+
+/// An E-RAB MODIFICATION CONFIRM (TS 36.413 §9.1.3.9).
+#[derive(Debug, Clone, Default)]
+pub struct ErabModificationConfirm {
+    /// MME-UE-S1AP-ID.
+    pub mme_ue_s1ap_id: u32,
+    /// eNB-UE-S1AP-ID.
+    pub enb_ue_s1ap_id: u32,
+    /// E-RABs successfully modified.
+    pub modified: Vec<u8>,
+    /// E-RABs that could not be modified, with the cause.
+    pub failed: Vec<nextgcore_s1ap::ErabItem>,
+    /// E-RABs the EPC has already released (§8.2.4.2).
+    pub to_be_released: Vec<nextgcore_s1ap::ErabItem>,
+}
+
+/// Encode an E-RAB MODIFICATION CONFIRM (TS 36.413 §9.1.3.9): every IE
+/// criticality ignore; procedure criticality reject. `notify` IEs of the
+/// indication go in its Criticality Diagnostics.
+pub fn build_erab_modification_confirm(
+    msg: &ErabModificationConfirm,
+    notify: &[DiagnosedIe],
+) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    use g::E_RABModificationConfirmProtocolIEs_EntryValue as V;
+    let ie = |id: u16, value: V| g::E_RABModificationConfirmProtocolIEs_Entry {
+        id: g::ProtocolIE_ID(id),
+        criticality: g::Criticality(IGNORE),
+        value,
+    };
+    let mut ies = vec![
+        ie(
+            ID_MME_UE_S1AP_ID,
+            V::Id_MME_UE_S1AP_ID(g::MME_UE_S1AP_ID(msg.mme_ue_s1ap_id)),
+        ),
+        ie(
+            ID_ENB_UE_S1AP_ID,
+            V::Id_eNB_UE_S1AP_ID(g::ENB_UE_S1AP_ID(msg.enb_ue_s1ap_id)),
+        ),
+    ];
+    if !msg.modified.is_empty() {
+        ies.push(ie(
+            ID_ERAB_MODIFY_LIST_BEARER_MOD_CONF,
+            V::Id_E_RABModifyListBearerModConf(g::E_RABModifyListBearerModConf(
+                msg.modified
+                    .iter()
+                    .map(|id| g::E_RABModifyListBearerModConf_Entry {
+                        id: g::ProtocolIE_ID(ID_ERAB_MODIFY_ITEM_BEARER_MOD_CONF),
+                        criticality: g::Criticality(IGNORE),
+                        value:
+                            g::E_RABModifyListBearerModConf_EntryValue::Id_E_RABModifyItemBearerModConf(
+                                g::E_RABModifyItemBearerModConf {
+                                    e_rab_id: g::E_RAB_ID(*id),
+                                    ie_extensions: None,
+                                },
+                            ),
+                    })
+                    .collect(),
+            )),
+        ));
+    }
+    if !msg.failed.is_empty() {
+        ies.push(ie(
+            ID_ERAB_FAILED_TO_MODIFY_LIST_BEARER_MOD_CONF,
+            V::Id_E_RABFailedToModifyListBearerModConf(erab_list(&msg.failed)),
+        ));
+    }
+    if !msg.to_be_released.is_empty() {
+        ies.push(ie(
+            ID_ERAB_TO_BE_RELEASED_LIST_BEARER_MOD_CONF,
+            V::Id_E_RABToBeReleasedListBearerModConf(erab_list(&msg.to_be_released)),
+        ));
+    }
+    if !notify.is_empty() {
+        ies.push(ie(
+            ID_CRITICALITY_DIAGNOSTICS,
+            V::Id_CriticalityDiagnostics(diagnostics_for(
+                PROC_E_RAB_MODIFICATION_INDICATION,
+                g::TriggeringMessage::INITIATING_MESSAGE,
+                REJECT,
+                notify,
+            )),
+        ));
+    }
+    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+        procedure_code: g::ProcedureCode(PROC_E_RAB_MODIFICATION_INDICATION),
+        criticality: g::Criticality(REJECT),
+        value: g::SuccessfulOutcomeValue::Id_E_RABModificationIndication(
+            g::E_RABModificationConfirm {
+                protocol_i_es: g::E_RABModificationConfirmProtocolIEs(ies),
+            },
+        ),
+    }))
+}
+
+/// Encode a LOCATION REPORTING CONTROL (TS 36.413 §9.1.15.1): the UE IDs
+/// reject, Request Type ignore; procedure criticality ignore. `event_type` is
+/// a `g::EventType` value (direct, change-of-serve-cell,
+/// stop-change-of-serve-cell); the report area is always ECGI, the only one
+/// §9.2.1.34 defines.
+pub fn build_location_reporting_control(
+    mme_ue_s1ap_id: u32,
+    enb_ue_s1ap_id: u32,
+    event_type: u8,
+) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    use g::LocationReportingControlProtocolIEs_EntryValue as V;
+    let ie = |id: u16, criticality: u8, value: V| g::LocationReportingControlProtocolIEs_Entry {
+        id: g::ProtocolIE_ID(id),
+        criticality: g::Criticality(criticality),
+        value,
+    };
+    let ies = vec![
+        ie(
+            ID_MME_UE_S1AP_ID,
+            REJECT,
+            V::Id_MME_UE_S1AP_ID(g::MME_UE_S1AP_ID(mme_ue_s1ap_id)),
+        ),
+        ie(
+            ID_ENB_UE_S1AP_ID,
+            REJECT,
+            V::Id_eNB_UE_S1AP_ID(g::ENB_UE_S1AP_ID(enb_ue_s1ap_id)),
+        ),
+        ie(
+            ID_REQUEST_TYPE,
+            IGNORE,
+            V::Id_RequestType(g::RequestType {
+                event_type: g::EventType(event_type),
+                report_area: g::ReportArea(g::ReportArea::ECGI),
+                ie_extensions: None,
+            }),
+        ),
+    ];
+    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+        procedure_code: g::ProcedureCode(PROC_LOCATION_REPORTING_CONTROL),
+        criticality: g::Criticality(IGNORE),
+        value: g::InitiatingMessageValue::Id_LocationReportingControl(
+            g::LocationReportingControl {
+                protocol_i_es: g::LocationReportingControlProtocolIEs(ies),
+            },
+        ),
+    }))
+}
+
+/// A LOCATION REPORT (TS 36.413 §9.1.15.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocationReport {
+    /// MME-UE-S1AP-ID (reject).
+    pub mme_ue_s1ap_id: u32,
+    /// eNB-UE-S1AP-ID (reject).
+    pub enb_ue_s1ap_id: u32,
+    /// EUTRAN-CGI (ignore), if present.
+    pub eutran_cgi: Option<EutranCgi>,
+    /// TAI (ignore), if present.
+    pub tai: Option<Tai>,
+    /// The Request Type's event type the report answers (ignore), if present.
+    pub event_type: Option<u8>,
+}
+
+/// Decode a LOCATION REPORT (TS 36.413 §9.1.15.3), a Class 2 initiating
+/// message. EUTRAN-CGI, TAI and Request Type are `ignore`: missing, they are
+/// `None` (§10.3.5).
+pub fn decode_location_report(bytes: &[u8]) -> Class2Decode<LocationReport> {
+    let Ok((pdu, unknown)) = nextgcore_s1ap_gen::decode_with_unknown_ies(bytes) else {
+        return Class2Decode::Undecodable;
+    };
+    let g::S1AP_PDU::InitiatingMessage(msg) = pdu else {
+        return Class2Decode::Undecodable;
+    };
+    let g::InitiatingMessageValue::Id_LocationReport(m) = msg.value else {
+        return Class2Decode::Undecodable;
+    };
+    let (mut reject, notify) = classify_unknown(&unknown);
+    let (mut mme, mut enb, mut cgi, mut tai, mut event) = (None, None, None, None, None);
+    use g::LocationReportProtocolIEs_EntryValue as V;
+    for ie in m.protocol_i_es.0 {
+        match ie.value {
+            V::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
+            V::Id_eNB_UE_S1AP_ID(v) => enb = Some(v.0),
+            V::Id_EUTRAN_CGI(v) => cgi = cgi_from(&v),
+            V::Id_TAI(v) => tai = tai_from(&v),
+            V::Id_RequestType(v) => event = Some(v.event_type.0),
+            _ => {}
+        }
+    }
+    missing(&mut reject, mme.is_some(), ID_MME_UE_S1AP_ID);
+    missing(&mut reject, enb.is_some(), ID_ENB_UE_S1AP_ID);
+    if !reject.is_empty() {
+        return Class2Decode::Reject {
+            ies: reject,
+            enb_ue_s1ap_id: enb,
+            mme_ue_s1ap_id: mme,
+        };
+    }
+    let (Some(mme_ue_s1ap_id), Some(enb_ue_s1ap_id)) = (mme, enb) else {
+        return Class2Decode::Undecodable;
+    };
+    Class2Decode::Proceed {
+        msg: LocationReport {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id,
+            eutran_cgi: cgi,
+            tai,
+            event_type: event,
+        },
+        notify,
+    }
+}
+
+/// A LOCATION REPORTING FAILURE INDICATION (TS 36.413 §9.1.15.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocationReportingFailure {
+    /// MME-UE-S1AP-ID (reject).
+    pub mme_ue_s1ap_id: u32,
+    /// eNB-UE-S1AP-ID (reject).
+    pub enb_ue_s1ap_id: u32,
+    /// Cause (ignore), if present and in this MME's enumeration.
+    pub cause: Option<Cause>,
+}
+
+/// Decode a LOCATION REPORTING FAILURE INDICATION (TS 36.413 §9.1.15.2), a
+/// Class 2 initiating message.
+pub fn decode_location_reporting_failure_indication(
+    bytes: &[u8],
+) -> Class2Decode<LocationReportingFailure> {
+    let Ok((pdu, unknown)) = nextgcore_s1ap_gen::decode_with_unknown_ies(bytes) else {
+        return Class2Decode::Undecodable;
+    };
+    let g::S1AP_PDU::InitiatingMessage(msg) = pdu else {
+        return Class2Decode::Undecodable;
+    };
+    let g::InitiatingMessageValue::Id_LocationReportingFailureIndication(m) = msg.value else {
+        return Class2Decode::Undecodable;
+    };
+    let (mut reject, notify) = classify_unknown(&unknown);
+    let (mut mme, mut enb, mut cause) = (None, None, None);
+    use g::LocationReportingFailureIndicationProtocolIEs_EntryValue as V;
+    for ie in m.protocol_i_es.0 {
+        match ie.value {
+            V::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
+            V::Id_eNB_UE_S1AP_ID(v) => enb = Some(v.0),
+            V::Id_Cause(c) => cause = domain_cause(&c),
+        }
+    }
+    missing(&mut reject, mme.is_some(), ID_MME_UE_S1AP_ID);
+    missing(&mut reject, enb.is_some(), ID_ENB_UE_S1AP_ID);
+    if !reject.is_empty() {
+        return Class2Decode::Reject {
+            ies: reject,
+            enb_ue_s1ap_id: enb,
+            mme_ue_s1ap_id: mme,
+        };
+    }
+    let (Some(mme_ue_s1ap_id), Some(enb_ue_s1ap_id)) = (mme, enb) else {
+        return Class2Decode::Undecodable;
+    };
+    Class2Decode::Proceed {
+        msg: LocationReportingFailure {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id,
+            cause,
+        },
+        notify,
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_codec;
 
@@ -4223,3 +4817,6 @@ mod handover2_tests;
 
 #[cfg(test)]
 mod unmatched_tests;
+
+#[cfg(test)]
+mod eps_procs_tests;

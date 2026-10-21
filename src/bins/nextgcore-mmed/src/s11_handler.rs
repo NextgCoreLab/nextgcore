@@ -106,6 +106,8 @@ pub struct CreateSessionResponseData {
     pub ambr_downlink: u64,
     pub pco: Option<Vec<u8>>,
     pub epco: Option<Vec<u8>>,
+    /// Change Reporting Action (TS 29.274 §8.61), when the PDN GW sent one.
+    pub change_reporting_action: Option<u8>,
 }
 
 /// One bearer's forwarding endpoints from a Create Indirect Data Forwarding Tunnel
@@ -268,10 +270,23 @@ pub fn dispatch_triggered(raw: &[u8], msg_type: u8, sequence_number: u32, peer: 
             Err(e) => log::error!("S11 Create Session Response from {peer} unparsable: {e:?}"),
         },
         mt::MODIFY_BEARER_RESPONSE => match handle_modify_bearer_response(raw) {
-            Ok(data) => log::info!(
-                "S11 Modify Bearer Response from {peer} (seq={sequence_number}) cause={}",
-                data.cause
-            ),
+            Ok(data) => {
+                log::info!(
+                    "S11 Modify Bearer Response from {peer} (seq={sequence_number}) cause={}",
+                    data.cause
+                );
+                // #584: an E-UTRAN initiated E-RAB modification waits on this
+                // response for its confirm (TS 23.401 §5.4.7 step 5).
+                if let Some(pending) =
+                    crate::gtp_path::take_pending_erab_modification(sequence_number)
+                {
+                    if let Some(send) =
+                        crate::s1ap_handler::erab_modification_confirm(pending, data.cause)
+                    {
+                        crate::s1ap_path::s1ap_send(send);
+                    }
+                }
+            }
             Err(e) => log::error!("S11 Modify Bearer Response from {peer} unparsable: {e:?}"),
         },
         mt::DELETE_SESSION_RESPONSE => match handle_delete_session_response(raw) {
@@ -386,6 +401,14 @@ fn apply_create_session_response(
         }
     }
 
+    // #584: the PDN GW's Change Reporting Action (TS 29.274 §8.61) is what asks
+    // this MME for ECGI change reporting, which the eNB does with LOCATION
+    // REPORTING CONTROL (TS 36.413 §8.11.1, TS 23.401 §5.9.2).
+    if let Some(send) = location_reporting_for_action(ctx, mme_ue_id, data.change_reporting_action)
+    {
+        crate::s1ap_path::s1ap_send(send);
+    }
+
     // #329: continue the procedure that asked for this session. Everything above is
     // bookkeeping the response supplies; everything below is the UE's answer, which
     // before #329 was never sent because nothing tracked what the request was for.
@@ -420,6 +443,37 @@ fn apply_create_session_response(
                 "S11 session created for create action {other:?}; no attach continuation \
                  applies (its own procedure owns the next step)"
             );
+        }
+    }
+}
+
+/// The LOCATION REPORTING CONTROL a Change Reporting Action asks for (#584):
+/// "Start Reporting ECGI" (4) or "Start Reporting TAI and ECGI" (6) start
+/// change-of-serve-cell reporting at the serving eNB; "Stop Reporting" (0)
+/// stops it if it is active. Every other action names a RAT or granularity
+/// the eNB's location reporting does not serve (CGI/SAI, RAI, TAI alone,
+/// macro eNB ID), and is not answered on S1.
+pub fn location_reporting_for_action(
+    ctx: &crate::context::MmeContext,
+    mme_ue_id: u64,
+    action: Option<u8>,
+) -> Option<crate::s1ap_handler::S1apSend> {
+    const STOP: u8 = 0;
+    const START_ECGI: u8 = 4;
+    const START_TAI_AND_ECGI: u8 = 6;
+    match action? {
+        START_ECGI | START_TAI_AND_ECGI => {
+            crate::s1ap_handler::location_reporting_control(ctx, mme_ue_id, true)
+        }
+        STOP if ctx
+            .mme_ue_find_by_id(mme_ue_id)
+            .is_some_and(|ue| ue.location_reporting_active) =>
+        {
+            crate::s1ap_handler::location_reporting_control(ctx, mme_ue_id, false)
+        }
+        other => {
+            log::debug!("Change Reporting Action {other} needs no Location Reporting Control");
+            None
         }
     }
 }
@@ -713,10 +767,108 @@ pub fn dispatch_initial(raw: &[u8], msg_type: u8, sequence_number: u32, peer: So
             }
             Err(e) => log::error!("S11 Downlink Data Notification from {peer} unparsable: {e:?}"),
         },
+        mt::DELETE_BEARER_REQUEST => {
+            let local_teid = parse_gtp_header(raw)
+                .map(|(_, teid, _, _)| teid)
+                .unwrap_or(0);
+            let ebis = delete_bearer_request_ebis(raw);
+            match delete_enb_released_bearers(crate::context::mme_self(), local_teid, &ebis) {
+                Some((sgw_teid, deleted)) => {
+                    match crate::s11_build::build_delete_bearer_response_for_ebis(
+                        sgw_teid,
+                        &deleted,
+                        crate::s11_build::GtpCause::RequestAccepted,
+                        sequence_number,
+                    ) {
+                        Ok(rsp) => {
+                            if let Err(e) = crate::gtp_path::send_response_to_sgwc(peer, &rsp) {
+                                log::error!("S11 Delete Bearer Response to {peer} failed: {e}");
+                            }
+                        }
+                        Err(e) => log::error!("Delete Bearer Response build failed: {e}"),
+                    }
+                }
+                None => log::info!(
+                    "S11 Delete Bearer Request seq={sequence_number} from {peer} for EBIs \
+                     {ebis:?} names no bearer the eNB released; network-initiated bearer \
+                     deactivation (TS 23.401 §5.4.4.1) is not implemented by this MME"
+                ),
+            }
+        }
         other => log::info!(
             "S11 initial message type={other} seq={sequence_number} from {peer} not handled: this \
              MME originates no procedure for it"
         ),
+    }
+}
+
+/// The EBIs a Delete Bearer Request names: the EPS Bearer IDs (EBI instance 1)
+/// for dedicated bearers, else the Linked EBI (instance 0), per TS 29.274
+/// Table 7.2.9.2-1.
+pub fn delete_bearer_request_ebis(raw: &[u8]) -> Vec<u8> {
+    let mut bytes = bytes::Bytes::copy_from_slice(raw);
+    let Ok(msg) = nextgcore_gtp::v2::Gtp2Message::decode(&mut bytes) else {
+        return Vec::new();
+    };
+    let ebi = nextgcore_gtp::v2::Gtp2IeType::Ebi as u8;
+    let dedicated: Vec<u8> = msg
+        .get_ies(ebi)
+        .into_iter()
+        .filter(|ie| ie.instance == 1)
+        .filter_map(|ie| ie.value.first().map(|v| v & 0x0F))
+        .collect();
+    if !dedicated.is_empty() {
+        return dedicated;
+    }
+    msg.get_ie(ebi, 0)
+        .and_then(|ie| ie.value.first().map(|v| v & 0x0F))
+        .into_iter()
+        .collect()
+}
+
+/// TS 23.401 §5.4.4.2 steps 6-8 for bearers the eNB released (#584): of the
+/// `ebis` a Delete Bearer Request names for the UE whose S11 TEID is
+/// `mme_s11_teid`, delete the ones marked `released_by_enb` -- locally, with no
+/// NAS signalling, because step 7 "is omitted if the bearer deactivation was
+/// triggered by the eNodeB" -- and return the Serving GW's S11 TEID and the
+/// EBIs to acknowledge. `None` when no named bearer is one the eNB released.
+pub fn delete_enb_released_bearers(
+    ctx: &crate::context::MmeContext,
+    mme_s11_teid: u32,
+    ebis: &[u8],
+) -> Option<(u32, Vec<u8>)> {
+    let mme_ue_id = ctx.mme_ue_find_by_s11_local_teid(mme_s11_teid)?;
+    let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id)?;
+    let sgw_teid = ctx
+        .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
+        .map(|s| s.sgw_s11_teid)
+        .unwrap_or(0);
+    let mut deleted = Vec::new();
+    for ebi in ebis {
+        let Some(bearer_id) = ctx.bearer_find_by_ebi(mme_ue_id, *ebi) else {
+            continue;
+        };
+        let Some(bearer) = ctx.bearer_find_by_id(bearer_id) else {
+            continue;
+        };
+        if !bearer.released_by_enb {
+            continue;
+        }
+        if let Some(sess) = ctx.sess_pool.write().unwrap().get_mut(&bearer.sess_id) {
+            sess.bearer_list.retain(|id| *id != bearer_id);
+        }
+        ctx.bearer_remove(bearer_id);
+        deleted.push(*ebi);
+    }
+    if deleted.is_empty() {
+        None
+    } else {
+        log::info!(
+            "[{}] EPS bearers {deleted:?} released by the eNB are deleted (TS 23.401 §5.4.4.2 \
+             step 8)",
+            mme_ue.imsi_bcd
+        );
+        Some((sgw_teid, deleted))
     }
 }
 
@@ -954,6 +1106,9 @@ pub fn handle_create_session_response(data: &[u8]) -> S11Result<CreateSessionRes
                     if let Some(cause) = parse_cause(value) {
                         result.cause = cause;
                     }
+                }
+                ie_type::CHANGE_REPORTING_ACTION => {
+                    result.change_reporting_action = value.first().copied();
                 }
                 ie_type::F_TEID => {
                     if let Some((iface_type, teid, ipv4, _)) = parse_f_teid(value) {
