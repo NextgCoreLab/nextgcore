@@ -622,6 +622,9 @@ pub async fn amf_nrf_discover(target_nf_type: &str, service_name: &str) -> Resul
                 // NSACF profile was silently DROPPED here, so UE admission
                 // always fell back to degrade-open.
                 "NSACF" => nextgcore_sbi::types::NfType::Nsacf,
+                // RACS (#570): the UCMF, so `racs::resolve_ucmf_endpoint` can use
+                // what discovery found instead of every profile being dropped here.
+                "UCMF" => nextgcore_sbi::types::NfType::Ucmf,
                 _ => continue,
             };
 

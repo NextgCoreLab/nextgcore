@@ -1037,6 +1037,75 @@ mod tests {
     use super::*;
     use base64::Engine;
 
+    /// #570: the AMF's Nucmf_UECapabilityManagement consumer (`nextgcore_amfd::racs`)
+    /// against this UCMF over a real HTTP/2 SBI server: Assign, Resolve of the ID it
+    /// returned, an unknown ID's 404, and Subscribe. The AMF finds the UCMF through
+    /// `UCMF_SBI_ADDR`/`UCMF_SBI_PORT`, its no-NRF fallback.
+    #[tokio::test]
+    async fn the_amf_consumer_assigns_resolves_and_subscribes() {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let ucmf = Arc::new(ucmf());
+        let state = ucmf.clone();
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        server
+            .start(move |req: SbiRequest| {
+                let state = state.clone();
+                async move { handle(&state, &req, Utc::now()).0 }
+            })
+            .await
+            .expect("UCMF test server starts");
+        // The server above is plaintext loopback: a dev-profile deployment.
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        std::env::set_var("UCMF_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("UCMF_SBI_PORT", addr.port().to_string());
+
+        let cap = [0x0Au8, 0x0B, 0x0C];
+        let id = nextgcore_amfd::racs::ucmf_assign("35123456", &cap)
+            .await
+            .expect("Assign");
+        // The UCMF's first ID at Version ID 05: digits 1 05 00000000000, packed low
+        // nibble first -> 01 05 00 00 00 00 00 (TS 24.501 §9.11.3.68).
+        assert_eq!(id, vec![0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        // The same TAC and capability get the same ID back (TS 29.673 §5.2.2.3).
+        assert_eq!(
+            nextgcore_amfd::racs::ucmf_assign("35123456", &cap)
+                .await
+                .expect("re-Assign"),
+            id
+        );
+        assert_eq!(
+            nextgcore_amfd::racs::ucmf_resolve(&id)
+                .await
+                .expect("Resolve"),
+            Some(cap.to_vec())
+        );
+        let unknown = [0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x90];
+        assert_eq!(
+            nextgcore_amfd::racs::ucmf_resolve(&unknown)
+                .await
+                .expect("Resolve"),
+            None,
+            "404 NO_DICTIONARY_ENTRY_FOUND"
+        );
+        nextgcore_amfd::racs::ucmf_subscribe("amf-1")
+            .await
+            .expect("Subscribe");
+        let note = ucmf
+            .write()
+            .unwrap()
+            .set_version_id(0x06, Utc::now())
+            .expect("the AMF is subscribed");
+        assert!(
+            note.uris
+                .iter()
+                .any(|u| u.ends_with("/namf-callback/v1/ucmf-notify")),
+            "notifications go to the AMF's callback: {:?}",
+            note.uris
+        );
+        let _ = server.stop().await;
+    }
+
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-10-21T00:00:00Z")
             .unwrap()
