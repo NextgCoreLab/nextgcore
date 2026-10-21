@@ -4,7 +4,14 @@
 //! These types abstract over the raw ProtocolIeContainer and provide a convenient API.
 
 pub use nextgcore_asn1c::ngap::cause::Cause;
-use nextgcore_asn1c::ngap::types::Criticality;
+/// The cause groups and the Direct Forwarding Path Availability enum, re-exported
+/// so consumers of these domain types (amfd) need no direct nextgcore-asn1c
+/// dependency (#417).
+pub use nextgcore_asn1c::ngap::cause::{
+    CauseMisc, CauseNas, CauseProtocol, CauseRadioNetwork, CauseTransport,
+};
+pub use nextgcore_asn1c::ngap::ies::DirectForwardingPathAvailability;
+pub use nextgcore_asn1c::ngap::types::Criticality;
 
 // ============================================================================
 // NG Setup (Section 9.2.6)

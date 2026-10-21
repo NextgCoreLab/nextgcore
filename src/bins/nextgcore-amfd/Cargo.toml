@@ -31,7 +31,6 @@ kernel-sctp = ["nextgcore-sctp/kernel"]
 ntn = ["dep:nextgcore-proto"]
 
 [dependencies]
-nextgcore-asn1c = { workspace = true }
 nextgcore-core = { workspace = true }
 nextgcore-crypt = { workspace = true }
 # #115: TS 33.501 §5.9 — long-lived NAS/AS key material must not outlive the UE
@@ -74,6 +73,7 @@ base64.workspace = true
 hex.workspace = true
 
 [dev-dependencies]
+nextgcore-asn1c = { workspace = true }
 proptest.workspace = true
 p256 = { workspace = true, features = ["ecdsa"] }
 base64.workspace = true

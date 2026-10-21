@@ -198,24 +198,23 @@ const SCTP_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 const ACCESS_TYPE_3GPP: u8 = 0x01;
 
 /// NGAP elementary-procedure codes (TS 38.413 Section 9.3.1.2) used by the
-/// procedure dispatch. Sourced from the nextgcore-asn1c `ProcedureCode` table so
+/// procedure dispatch. Sourced from the generated ASN.1 constants (#417) so
 /// the wire byte we read at `data[1]` is matched against spec constants, not
 /// magic numbers.
 mod proc_code {
-    use nextgcore_asn1c::ngap::types::ProcedureCode;
-    pub const ERROR_INDICATION: u16 = ProcedureCode::ERROR_INDICATION.0 as u16;
+    use nextgcore_ngap_gen::generated as g;
+    pub const ERROR_INDICATION: u16 = g::ID_ERROR_INDICATION as u16;
     pub const UPLINK_UE_ASSOCIATED_NRPPA_TRANSPORT: u16 =
-        ProcedureCode::UPLINK_UE_ASSOCIATED_NRPPA_TRANSPORT.0 as u16;
+        g::ID_UPLINK_UE_ASSOCIATED_NRP_PA_TRANSPORT as u16;
     pub const UPLINK_NON_UE_ASSOCIATED_NRPPA_TRANSPORT: u16 =
-        ProcedureCode::UPLINK_NON_UE_ASSOCIATED_NRPPA_TRANSPORT.0 as u16;
-    pub const HANDOVER_CANCEL: u16 = ProcedureCode::HANDOVER_CANCEL.0 as u16;
-    pub const HANDOVER_NOTIFICATION: u16 = ProcedureCode::HANDOVER_NOTIFICATION.0 as u16;
-    pub const HANDOVER_PREPARATION: u16 = ProcedureCode::HANDOVER_PREPARATION.0 as u16;
-    pub const HANDOVER_RESOURCE_ALLOCATION: u16 =
-        ProcedureCode::HANDOVER_RESOURCE_ALLOCATION.0 as u16;
-    pub const OVERLOAD_START: u16 = ProcedureCode::OVERLOAD_START.0 as u16;
-    pub const OVERLOAD_STOP: u16 = ProcedureCode::OVERLOAD_STOP.0 as u16;
-    pub const PATH_SWITCH_REQUEST: u16 = ProcedureCode::PATH_SWITCH_REQUEST.0 as u16;
+        g::ID_UPLINK_NON_UE_ASSOCIATED_NRP_PA_TRANSPORT as u16;
+    pub const HANDOVER_CANCEL: u16 = g::ID_HANDOVER_CANCEL as u16;
+    pub const HANDOVER_NOTIFICATION: u16 = g::ID_HANDOVER_NOTIFICATION as u16;
+    pub const HANDOVER_PREPARATION: u16 = g::ID_HANDOVER_PREPARATION as u16;
+    pub const HANDOVER_RESOURCE_ALLOCATION: u16 = g::ID_HANDOVER_RESOURCE_ALLOCATION as u16;
+    pub const OVERLOAD_START: u16 = g::ID_OVERLOAD_START as u16;
+    pub const OVERLOAD_STOP: u16 = g::ID_OVERLOAD_STOP as u16;
+    pub const PATH_SWITCH_REQUEST: u16 = g::ID_PATH_SWITCH_REQUEST as u16;
 }
 
 /// Uplink NRPPa transports (NGAP procedures 50/47, TS 38.413 Sections
@@ -1739,7 +1738,7 @@ impl NgapServer {
                 if let Some(failure) =
                     crate::ngap_asn1::build_ran_configuration_update_failure_generated(
                         nextgcore_ngap::types::Cause::Protocol(
-                            nextgcore_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
+                            nextgcore_ngap::types::CauseProtocol::AbstractSyntaxErrorReject,
                         ),
                         None,
                         &diagnostics,
@@ -1757,7 +1756,7 @@ impl NgapServer {
                 if let Some(failure) =
                     crate::ngap_asn1::build_ran_configuration_update_failure_generated(
                         nextgcore_ngap::types::Cause::Protocol(
-                            nextgcore_asn1c::ngap::cause::CauseProtocol::TransferSyntaxError,
+                            nextgcore_ngap::types::CauseProtocol::TransferSyntaxError,
                         ),
                         None,
                         &[],
@@ -8252,7 +8251,7 @@ impl NgapServer {
                         amf_ue_ngap_id,
                         ran_ue_ngap_id,
                         cause: nextgcore_ngap::types::Cause::Protocol(
-                            nextgcore_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
+                            nextgcore_ngap::types::CauseProtocol::AbstractSyntaxErrorReject,
                         ),
                         criticality_diagnostics: Some(crate::ngap_asn1::hand_written_diagnostics(
                             &report,
@@ -8372,7 +8371,7 @@ impl NgapServer {
                 amf_ue_ngap_id: required.amf_ue_ngap_id,
                 ran_ue_ngap_id: required.ran_ue_ngap_id,
                 cause: nextgcore_ngap::types::Cause::RadioNetwork(
-                    nextgcore_asn1c::ngap::cause::CauseRadioNetwork::UnknownTargetId,
+                    nextgcore_ngap::types::CauseRadioNetwork::UnknownTargetId,
                 ),
                 criticality_diagnostics: None,
             };
@@ -8401,7 +8400,7 @@ impl NgapServer {
                 amf_ue_ngap_id: required.amf_ue_ngap_id,
                 ran_ue_ngap_id: required.ran_ue_ngap_id,
                 cause: nextgcore_ngap::types::Cause::RadioNetwork(
-                    nextgcore_asn1c::ngap::cause::CauseRadioNetwork::UnknownLocalUeNgapId,
+                    nextgcore_ngap::types::CauseRadioNetwork::UnknownLocalUeNgapId,
                 ),
                 criticality_diagnostics: None,
             };
@@ -8511,7 +8510,7 @@ impl NgapServer {
                     amf_ue_ngap_id: required.amf_ue_ngap_id,
                     ran_ue_ngap_id: required.ran_ue_ngap_id,
                     cause: nextgcore_ngap::types::Cause::Protocol(
-                        nextgcore_asn1c::ngap::cause::CauseProtocol::Unspecified,
+                        nextgcore_ngap::types::CauseProtocol::Unspecified,
                     ),
                     criticality_diagnostics: None,
                 };
@@ -8556,7 +8555,7 @@ impl NgapServer {
             self.refuse_inter_system_preparation(
                 association_id,
                 required,
-                nextgcore_asn1c::ngap::cause::CauseRadioNetwork::UnknownLocalUeNgapId,
+                nextgcore_ngap::types::CauseRadioNetwork::UnknownLocalUeNgapId,
             )
             .await?;
             return Ok(());
@@ -8658,7 +8657,7 @@ impl NgapServer {
                 self.refuse_inter_system_preparation(
                     association_id,
                     required,
-                    nextgcore_asn1c::ngap::cause::CauseRadioNetwork::HoTargetNotAllowed,
+                    nextgcore_ngap::types::CauseRadioNetwork::HoTargetNotAllowed,
                 )
                 .await
             }
@@ -8675,7 +8674,7 @@ impl NgapServer {
         &mut self,
         association_id: u64,
         required: &nextgcore_ngap::types::HandoverRequired,
-        cause: nextgcore_asn1c::ngap::cause::CauseRadioNetwork,
+        cause: nextgcore_ngap::types::CauseRadioNetwork,
     ) -> Result<()> {
         let failure = nextgcore_ngap::types::HandoverPreparationFailure {
             amf_ue_ngap_id: required.amf_ue_ngap_id,
@@ -9179,7 +9178,7 @@ impl NgapServer {
                 notify.amf_ue_ngap_id,
                 source_ran_ue_id,
                 ngap_handler::cause_group::RADIO_NETWORK,
-                nextgcore_asn1c::ngap::cause::CauseRadioNetwork::SuccessfulHandover as i64,
+                nextgcore_ngap::types::CauseRadioNetwork::SuccessfulHandover as i64,
             ) {
                 // A failed send must not abort the procedure: the UE has already arrived
                 // and the core path is switched, so returning an error here would leave the
@@ -9465,7 +9464,7 @@ impl NgapServer {
                     amf_ue_ngap_id: answer.amf_ue_ngap_id,
                     ran_ue_ngap_id,
                     cause: nextgcore_ngap::types::Cause::RadioNetwork(
-                        nextgcore_asn1c::ngap::cause::CauseRadioNetwork::HoFailureInTarget5gcNgranNodeOrTargetSystem,
+                        nextgcore_ngap::types::CauseRadioNetwork::HoFailureInTarget5gcNgranNodeOrTargetSystem,
                     ),
                     criticality_diagnostics: None,
                 };
@@ -10053,7 +10052,7 @@ impl NgapServer {
                         ran,
                         &sessions,
                         nextgcore_ngap::types::Cause::Protocol(
-                            nextgcore_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
+                            nextgcore_ngap::types::CauseProtocol::AbstractSyntaxErrorReject,
                         ),
                         &report.diagnostics,
                     ),
@@ -10102,7 +10101,7 @@ impl NgapServer {
                 req.ran_ue_ngap_id,
                 &requested,
                 nextgcore_ngap::types::Cause::RadioNetwork(
-                    nextgcore_asn1c::ngap::cause::CauseRadioNetwork::UnknownLocalUeNgapId,
+                    nextgcore_ngap::types::CauseRadioNetwork::UnknownLocalUeNgapId,
                 ),
                 &[],
             ) {
@@ -10218,9 +10217,8 @@ impl NgapServer {
             .copied()
             .filter(|psi| !switched_list.iter().any(|s| s.pdu_session_id == *psi))
             .collect();
-        let unswitched_cause = nextgcore_ngap::types::Cause::Misc(
-            nextgcore_asn1c::ngap::cause::CauseMisc::Unspecified,
-        );
+        let unswitched_cause =
+            nextgcore_ngap::types::Cause::Misc(nextgcore_ngap::types::CauseMisc::Unspecified);
         let ack_bytes = (!switched_list.is_empty())
             .then(|| {
                 let ack = nextgcore_ngap::types::PathSwitchRequestAcknowledge {
@@ -11168,7 +11166,7 @@ impl NgapServer {
                     if let Some(transfer) =
                         crate::ngap_asn1::modify_indication_unsuccessful_transfer(
                             nextgcore_ngap::types::Cause::Misc(
-                                nextgcore_asn1c::ngap::cause::CauseMisc::Unspecified,
+                                nextgcore_ngap::types::CauseMisc::Unspecified,
                             ),
                         )
                     {
@@ -12380,10 +12378,7 @@ fn extract_nas_message_container(nas: &[u8]) -> Option<Vec<u8>> {
 /// would send an operator looking for a RAN misconfiguration.
 fn inter_system_handover_refusal(
     handover_type: nextgcore_ngap::types::HandoverType,
-) -> Option<(
-    nextgcore_asn1c::ngap::cause::CauseRadioNetwork,
-    &'static str,
-)> {
+) -> Option<(nextgcore_ngap::types::CauseRadioNetwork, &'static str)> {
     inter_system_handover_refusal_with(
         handover_type,
         crate::n26_path::forward_relocation_drivable(),
@@ -12489,10 +12484,7 @@ pub fn inter_system_handover_command(
 fn inter_system_handover_refusal_with(
     handover_type: nextgcore_ngap::types::HandoverType,
     forward_relocation_drivable: bool,
-) -> Option<(
-    nextgcore_asn1c::ngap::cause::CauseRadioNetwork,
-    &'static str,
-)> {
+) -> Option<(nextgcore_ngap::types::CauseRadioNetwork, &'static str)> {
     use nextgcore_ngap::types::HandoverType as Ht;
     let target_system = match handover_type {
         Ht::Intra5gs => return None,
@@ -12510,7 +12502,7 @@ fn inter_system_handover_refusal_with(
         Ht::EpsTo5gs => "5GS (eps-to-5gs)",
     };
     Some((
-        nextgcore_asn1c::ngap::cause::CauseRadioNetwork::HoTargetNotAllowed,
+        nextgcore_ngap::types::CauseRadioNetwork::HoTargetNotAllowed,
         target_system,
     ))
 }
@@ -13585,7 +13577,7 @@ mod tests {
     /// was forwarded to a gNB as a handover this AMF cannot carry out.
     #[test]
     fn an_inter_system_handover_is_declined_with_ho_target_not_allowed() {
-        use nextgcore_asn1c::ngap::cause::CauseRadioNetwork as Cr;
+        use nextgcore_ngap::types::CauseRadioNetwork as Cr;
         use nextgcore_ngap::types::HandoverType as Ht;
 
         assert_eq!(
@@ -13635,7 +13627,7 @@ mod tests {
     /// aspirational.
     #[test]
     fn inter_system_handover_refusal_routes_only_when_a_forward_relocation_can_be_driven() {
-        use nextgcore_asn1c::ngap::cause::CauseRadioNetwork as Cr;
+        use nextgcore_ngap::types::CauseRadioNetwork as Cr;
         use nextgcore_ngap::types::HandoverType as Ht;
 
         for switch_on in [false, true] {
@@ -14684,7 +14676,7 @@ mod tests {
             amf_ue_ngap_id: None,
             ran_ue_ngap_id: None,
             cause: Some(nextgcore_ngap::types::Cause::Protocol(
-                nextgcore_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
+                nextgcore_ngap::types::CauseProtocol::AbstractSyntaxErrorReject,
             )),
             criticality_diagnostics: None,
         };
@@ -17500,9 +17492,7 @@ mod tests {
         assert_eq!(ids, (Some(ue), Some(7)));
         assert_eq!(modified, vec![(2, FAKE_MOD_CFM_TRANSFER.to_vec())]);
         let own_failure = crate::ngap_asn1::modify_indication_unsuccessful_transfer(
-            nextgcore_ngap::types::Cause::Misc(
-                nextgcore_asn1c::ngap::cause::CauseMisc::Unspecified,
-            ),
+            nextgcore_ngap::types::Cause::Misc(nextgcore_ngap::types::CauseMisc::Unspecified),
         )
         .expect("unsuccessful transfer");
         assert_eq!(
@@ -17900,7 +17890,7 @@ mod tests {
                 amf_ue_ngap_id: ue_cancel,
                 ran_ue_ngap_id: 10,
                 cause: nextgcore_ngap::types::Cause::RadioNetwork(
-                    nextgcore_asn1c::ngap::cause::CauseRadioNetwork::HandoverCancelled,
+                    nextgcore_ngap::types::CauseRadioNetwork::HandoverCancelled,
                 ),
             },
         )
@@ -17917,7 +17907,7 @@ mod tests {
             &nextgcore_ngap::types::HandoverFailure {
                 amf_ue_ngap_id: ue_failure,
                 cause: nextgcore_ngap::types::Cause::RadioNetwork(
-                    nextgcore_asn1c::ngap::cause::CauseRadioNetwork::NoRadioResourcesAvailableInTargetCell,
+                    nextgcore_ngap::types::CauseRadioNetwork::NoRadioResourcesAvailableInTargetCell,
                 ),
                 criticality_diagnostics: None,
             },
@@ -20414,7 +20404,7 @@ mod tests {
         // PartOfNgInterface: the reset names the UE.
         let partial = nextgcore_ngap::builder::build_ng_reset(&nextgcore_ngap::types::NgReset {
             cause: nextgcore_ngap::types::Cause::Transport(
-                nextgcore_asn1c::ngap::cause::CauseTransport::TransportResourceUnavailable,
+                nextgcore_ngap::types::CauseTransport::TransportResourceUnavailable,
             ),
             reset_type: nextgcore_ngap::types::ResetType::PartOfNgInterface(vec![
                 nextgcore_ngap::types::UeAssociatedLogicalNgConnectionItem {
@@ -20440,7 +20430,7 @@ mod tests {
         // NgInterface: the reset names no UE, so the whole association goes.
         let whole = nextgcore_ngap::builder::build_ng_reset(&nextgcore_ngap::types::NgReset {
             cause: nextgcore_ngap::types::Cause::Transport(
-                nextgcore_asn1c::ngap::cause::CauseTransport::TransportResourceUnavailable,
+                nextgcore_ngap::types::CauseTransport::TransportResourceUnavailable,
             ),
             reset_type: nextgcore_ngap::types::ResetType::NgInterface,
         })
@@ -20470,7 +20460,7 @@ mod tests {
 
         let whole = nextgcore_ngap::builder::build_ng_reset(&nextgcore_ngap::types::NgReset {
             cause: nextgcore_ngap::types::Cause::Misc(
-                nextgcore_asn1c::ngap::cause::CauseMisc::Unspecified,
+                nextgcore_ngap::types::CauseMisc::Unspecified,
             ),
             reset_type: nextgcore_ngap::types::ResetType::NgInterface,
         })
@@ -21898,8 +21888,8 @@ mod tests {
             &nextgcore_ngap::types::UeContextReleaseRequest {
                 amf_ue_ngap_id,
                 ran_ue_ngap_id,
-                cause: nextgcore_asn1c::ngap::cause::Cause::RadioNetwork(
-                    nextgcore_asn1c::ngap::cause::CauseRadioNetwork::RadioConnectionWithUeLost,
+                cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                    nextgcore_ngap::types::CauseRadioNetwork::RadioConnectionWithUeLost,
                 ),
             },
         )
@@ -22182,8 +22172,8 @@ mod tests {
             &nextgcore_ngap::types::UeContextReleaseRequest {
                 amf_ue_ngap_id,
                 ran_ue_ngap_id,
-                cause: nextgcore_asn1c::ngap::cause::Cause::RadioNetwork(
-                    nextgcore_asn1c::ngap::cause::CauseRadioNetwork::UserInactivity,
+                cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                    nextgcore_ngap::types::CauseRadioNetwork::UserInactivity,
                 ),
             },
         )
@@ -22310,8 +22300,8 @@ mod tests {
         let mut ngap = test_ngap_server().await;
         let ran = 417_800u32;
         let cause = || {
-            nextgcore_asn1c::ngap::cause::Cause::RadioNetwork(
-                nextgcore_asn1c::ngap::cause::CauseRadioNetwork::Unspecified,
+            nextgcore_ngap::types::Cause::RadioNetwork(
+                nextgcore_ngap::types::CauseRadioNetwork::Unspecified,
             )
         };
         let cases: [(u64, Vec<u8>, bool); 5] = [
@@ -22365,8 +22355,8 @@ mod tests {
             &nextgcore_ngap::types::UeContextReleaseRequest {
                 amf_ue_ngap_id,
                 ran_ue_ngap_id,
-                cause: nextgcore_asn1c::ngap::cause::Cause::RadioNetwork(
-                    nextgcore_asn1c::ngap::cause::CauseRadioNetwork::RadioConnectionWithUeLost,
+                cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                    nextgcore_ngap::types::CauseRadioNetwork::RadioConnectionWithUeLost,
                 ),
             },
         )
@@ -23736,7 +23726,7 @@ mod fivegs_to_eps_tests {
                     assert_eq!(
                         f.cause,
                         nextgcore_ngap::types::Cause::RadioNetwork(
-                            nextgcore_asn1c::ngap::cause::CauseRadioNetwork::HoFailureInTarget5gcNgranNodeOrTargetSystem
+                            nextgcore_ngap::types::CauseRadioNetwork::HoFailureInTarget5gcNgranNodeOrTargetSystem
                         )
                     );
                 }
