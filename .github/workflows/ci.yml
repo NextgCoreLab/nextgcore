@@ -1111,6 +1111,42 @@ jobs:
                  Release Command"; tail -80 /tmp/amf.log; exit 1; }
           echo "a gNB-initiated UE Context Release was dispatched and answered with a Command"
 
+      # ====================================================================
+      # The 0.2.0 UE flows (docker/rust/ue-flow-check.sh, #649). Until these steps, this
+      # job never pinged, never de-registered a UE and never paged one, so every
+      # defect the 0.2.0 wave fixed in those flows was found by hand while the
+      # nightly stayed green. Each step drives one flow through the REAL gNB and
+      # UE, prints one `PASS: <scenario>` or `FAIL: <scenario> -- <why>` line, and
+      # fails the job on FAIL. Each one was shown to FAIL against the binary that
+      # had the defect (see the PR that added them).
+      #
+      # ORDER IS LOAD-BEARING. They start where the #451 step leaves the UE:
+      # CM-IDLE, its NGAP context released. Paging goes FIRST because after any
+      # Service Request from CM-IDLE a later page is answered 404 by the AMF
+      # (#648); once #648 is fixed, a second paging round belongs after
+      # idle-uplink. De-registration and network re-registration go last because
+      # they replace the UE's registration.
+      # ====================================================================
+      - name: "UE flow: downlink data pages an idle UE (network-triggered Service Request)"
+        run: |
+          cd nextgcore/docker/rust
+          ./ue-flow-check.sh paging
+
+      - name: "UE flow: uplink data from CM-IDLE, the triggering packet is not lost (nextgsim #267)"
+        run: |
+          cd nextgcore/docker/rust
+          ./ue-flow-check.sh idle-uplink
+
+      - name: "UE flow: UE-initiated de-registration, then re-registration and a 0%-loss ping (nextgsim #266)"
+        run: |
+          cd nextgcore/docker/rust
+          ./ue-flow-check.sh deregister
+
+      - name: "UE flow: UDM REREGISTRATION_REQUIRED, prompt re-registration, session back, 0%-loss ping (#580, nextgsim #265 #272)"
+        run: |
+          cd nextgcore/docker/rust
+          ./ue-flow-check.sh network-rereg
+
       - name: Collect logs on failure
         if: failure()
         run: |
@@ -1596,7 +1632,7 @@ jobs:
             "nextgcore_ref": "${{ github.ref_name }}",
             "validated_by": ["docker-build", "docker-e2e", "docker-e2e-epc"],
             "scope": {
-              "5gc_e2e": "Real UE registration over N2 through nextgsim's gNB, plus a Service Request CM-IDLE cycle with Namf event delivery assertions (#397, #403).",
+              "5gc_e2e": "Real UE registration over N2 through nextgsim's gNB, plus a Service Request CM-IDLE cycle with Namf event delivery assertions (#397, #403); downlink-triggered paging; a UE-triggered Service Request from CM-IDLE with a 20/20 ping; UE-initiated de-registration and re-registration with a 20/20 ping; UDM REREGISTRATION_REQUIRED re-registration without T3510, with the PDU session re-established and a 20/20 ping (docker/rust/ue-flow-check.sh, #649). Not a second page after a Service Request (#648), handover or Xn.",
               "epc_e2e": "Real LTE attach through nextgsim's eNB and UE to EMM-REGISTERED with the default EPS bearer, and a 20-packet 0%-loss ping through S1-U/SGW-U/S5-U/PGW-U (#303). Not dedicated bearers, handover or paging.",
               "not_validated": "These jobs run nightly or on dispatch, NOT per-PR. A commit on main between nightlies has not been through this."
             }
