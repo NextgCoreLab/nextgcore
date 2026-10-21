@@ -5987,22 +5987,49 @@ impl NgapServer {
             .await
     }
 
-    /// The per-UE teardown every deregistration shares, short of the N2 release:
-    /// the UE Policy Association, the EPS bearer identities, the deregistration
-    /// event reports, and the NAS state. Split out of [`Self::finish_deregistration`]
-    /// for [`Self::local_deregistration`] (#602), which must not send an N2 release
-    /// for a UE with no N2 connection.
-    fn deregistered_ue_cleanup(&mut self, amf_ue_ngap_id: u64) {
-        // Npcf_UEPolicyControl_Delete (TS 29.525 §4.2.4) — Wave-6 E7: delete
-        // the UE Policy Association created at registration. Fire-and-forget
-        // on a background task: a PCF hiccup must never delay or fail the NG
-        // release. Only fires when an association was actually created (so
-        // with AMF_UE_POLICY_ASSOC=off the deregistration flow is unchanged).
-        if let Some(pol_asso_id) = self
-            .ue_auth_state
-            .get(amf_ue_ngap_id)
-            .and_then(|s| s.ue_policy_association_id.clone())
-        {
+    /// Terminate the UE's policy associations at the PCF, for a UE that is being
+    /// deregistered.
+    ///
+    /// - AM Policy Association: AMF-initiated termination (TS 23.502 §4.16.3.2),
+    ///   `Npcf_AMPolicyControl_Delete` (TS 29.507 §4.2.4). TS 23.502 §4.2.2.3.2 step 7
+    ///   (UE-initiated) and §4.2.2.3.3 step 6 (network-initiated) require it on every
+    ///   deregistration (#622).
+    /// - UE Policy Association: `Npcf_UEPolicyControl_Delete` (TS 29.525 §4.2.4,
+    ///   TS 23.502 §4.16.13.1), Wave-6 E7.
+    ///
+    /// Each delete runs on a background task: a PCF hiccup must never delay or fail
+    /// the release that follows. Only an association that was actually created is
+    /// deleted, so with `AMF_UE_POLICY_ASSOC=off` nothing extra is sent. Reads the
+    /// association ids from `ue_auth_state`, so call it before the entry is removed.
+    fn terminate_policy_associations(&self, amf_ue_ngap_id: u64) {
+        let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) else {
+            return;
+        };
+        if let Some(pol_asso_id) = state.policy_association_id {
+            tokio::spawn(async move {
+                let (pcf_host, pcf_port) = match crate::sbi_path::resolve_nf_endpoint_async(
+                    crate::sbi_path::SbiServiceType::NpcfAmPolicyControl,
+                )
+                .await
+                {
+                    Ok(ep) => ep,
+                    Err(e) => {
+                        log::warn!(
+                            "AM policy association {pol_asso_id} not deleted \
+                             (PCF endpoint resolution failed): {e}"
+                        );
+                        return;
+                    }
+                };
+                if let Err(e) =
+                    crate::sbi_path::call_pcf_am_policy_delete(&pcf_host, pcf_port, &pol_asso_id)
+                        .await
+                {
+                    log::warn!("Npcf_AMPolicyControl_Delete({pol_asso_id}) failed: {e}");
+                }
+            });
+        }
+        if let Some(pol_asso_id) = state.ue_policy_association_id {
             tokio::spawn(async move {
                 let (pcf_host, pcf_port) = match crate::sbi_path::resolve_nf_endpoint_async(
                     crate::sbi_path::SbiServiceType::NpcfAmPolicyControl,
@@ -6026,6 +6053,15 @@ impl NgapServer {
                 }
             });
         }
+    }
+
+    /// The per-UE teardown every deregistration shares, short of the N2 release:
+    /// the AM and UE Policy Associations, the EPS bearer identities, the deregistration
+    /// event reports, and the NAS state. Split out of [`Self::finish_deregistration`]
+    /// for [`Self::local_deregistration`] (#602), which must not send an N2 release
+    /// for a UE with no N2 connection.
+    fn deregistered_ue_cleanup(&mut self, amf_ue_ngap_id: u64) {
+        self.terminate_policy_associations(amf_ue_ngap_id);
 
         // #291: free the UE's EPS bearer identities. Done HERE, in the common tail of
         // both deregistration directions, and BEFORE `ue_auth_state` is dropped —
@@ -6087,9 +6123,9 @@ impl NgapServer {
     /// order:
     /// 1. Nsmf_PDUSession_ReleaseSMContext for every PDU session (step 14d, "the SMF(s)
     ///    shall release the PDU Session on getting this notification").
-    /// 2. AMF-initiated AM Policy Association Termination (§4.16.3.2) and, in
-    ///    [`Self::deregistered_ue_cleanup`], the UE Policy Association Termination
-    ///    (§4.16.13.1).
+    /// 2. In [`Self::deregistered_ue_cleanup`]: the AMF-initiated AM Policy
+    ///    Association Termination (§4.16.3.2) and the UE Policy Association
+    ///    Termination (§4.16.13.1).
     /// 3. A UE Context Release Command when the UE still has an N2 context here
     ///    (TS 38.413 §8.3.3; CauseNas "deregister"). None for a CM-IDLE UE: it has no
     ///    N2 connection to release.
@@ -6109,19 +6145,6 @@ impl NgapServer {
         );
 
         self.release_all_pdu_sessions(amf_ue_ngap_id).await;
-
-        if let Some(pol_asso_id) = state.policy_association_id.clone() {
-            let (pcf_host, pcf_port) = crate::sbi_path::resolve_nf_endpoint_async(
-                crate::sbi_path::SbiServiceType::NpcfAmPolicyControl,
-            )
-            .await
-            .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
-            if let Err(e) =
-                crate::sbi_path::call_pcf_am_policy_delete(&pcf_host, pcf_port, &pol_asso_id).await
-            {
-                log::warn!("Npcf_AMPolicyControl_Delete({pol_asso_id}) failed: {e}");
-            }
-        }
 
         self.deregistered_ue_cleanup(amf_ue_ngap_id);
         if state.cm_idle {
@@ -8137,6 +8160,10 @@ impl NgapServer {
                     self.ue_auth_state
                         .with_mut(amf_ue_ngap_id, |s| s.reachability = None);
                     self.release_all_pdu_sessions(amf_ue_ngap_id).await;
+                    // #622: an implicit deregistration is a deregistration, so the PCF's
+                    // policy associations end with it (TS 23.502 §4.16.3.2). Before
+                    // `forget_ue`, which drops the ids.
+                    self.terminate_policy_associations(amf_ue_ngap_id);
                     // `forget_ue`, not a bare remove (#356): this path never reaches
                     // `release_ue` -- deliberately, since no NAS message can be sent to an
                     // unreachable UE -- so it is the third place an emergency context has
@@ -8300,6 +8327,9 @@ impl NgapServer {
                     // owns the removal.
                     self.ue_auth_state.insert(amf_ue_ngap_id, state);
                     self.release_all_pdu_sessions(amf_ue_ngap_id).await;
+                    // #622: the UE is deregistered locally, so its policy associations
+                    // are terminated too. Before `release_ue`, which drops the ids.
+                    self.terminate_policy_associations(amf_ue_ngap_id);
                     self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 2)
                         .await?;
                 }
@@ -17560,6 +17590,13 @@ mod tests {
         .await;
         assert_eq!(resp.status, 204);
         ngap.process_network_deregs().await;
+        // The AM policy delete runs on a background task (#622): wait for it to land
+        // before the PCF address goes away.
+        let am_deleted = nf_saw(
+            &seen,
+            "DELETE /npcf-am-policy-control/v1/policies/am-pol-602",
+        )
+        .await;
         std::env::remove_var("PCF_SBI_ADDR");
         std::env::remove_var("PCF_SBI_PORT");
 
@@ -17570,7 +17607,7 @@ mod tests {
              SMF; saw {seen:?}"
         );
         assert!(
-            seen.contains(&"DELETE /npcf-am-policy-control/v1/policies/am-pol-602".to_string()),
+            am_deleted,
             "and the AM Policy Association Termination (§4.16.3.2); saw {seen:?}"
         );
         assert!(
@@ -17587,6 +17624,177 @@ mod tests {
             guard.amf_ue_find_by_id(amf_ue_id).is_none(),
             "and the AMF UE"
         );
+    }
+
+    /// Whether the recording stand-in NF receives `entry` within five seconds. The
+    /// policy deletes run on background tasks, so the request lands after the call that
+    /// spawned it returns.
+    async fn nf_saw(seen: &Arc<std::sync::Mutex<Vec<String>>>, entry: &str) -> bool {
+        for _ in 0..200 {
+            if seen.lock().expect("seen").iter().any(|s| s == entry) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        false
+    }
+
+    /// A registered UE holding an AM and a UE policy association, keyed `amf_ue_ngap_id`.
+    fn ue_with_policy_associations(amf_ue_ngap_id: u64, am: &str, ue: &str) -> UeNasContext {
+        let mut ue_ctx = UeNasContext::new(amf_ue_ngap_id, 72, 1, false);
+        ue_ctx.registered = true;
+        ue_ctx.policy_association_id = Some(am.to_string());
+        ue_ctx.ue_policy_association_id = Some(ue.to_string());
+        ue_ctx
+    }
+
+    /// Point the AMF's PCF calls at the stand-in. Held under the `SmfEnvGuard` the
+    /// caller already owns: the environment is process-global.
+    fn set_pcf_env(port: u16) {
+        std::env::set_var("PCF_SBI_ADDR", "127.0.0.1");
+        std::env::set_var("PCF_SBI_PORT", port.to_string());
+    }
+
+    fn clear_pcf_env() {
+        std::env::remove_var("PCF_SBI_ADDR");
+        std::env::remove_var("PCF_SBI_PORT");
+    }
+
+    /// #622, UE-initiated and network-initiated deregistration: both end in
+    /// `finish_deregistration`, which must terminate the AM Policy Association
+    /// (TS 23.502 §4.2.2.3.2 step 7, §4.2.2.3.3 step 6, §4.16.3.2) as well as the UE
+    /// Policy Association it already ended. On main only the UE one is deleted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deregistration_terminates_the_am_policy_association() {
+        let (_nf, port, seen) = recording_nf().await;
+        let _env = SmfEnvGuard::set(port);
+        set_pcf_env(port);
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+
+        let amf_ue_ngap_id = 6_220_001u64;
+        ngap.ue_auth_state.insert(
+            amf_ue_ngap_id,
+            ue_with_policy_associations(amf_ue_ngap_id, "am-pol-622-a", "ue-pol-622-a"),
+        );
+        // The N2 release cannot be sent over this fixture; the PCF calls come first.
+        let _ = ngap.finish_deregistration(1, amf_ue_ngap_id, 72).await;
+
+        let am = nf_saw(
+            &seen,
+            "DELETE /npcf-am-policy-control/v1/policies/am-pol-622-a",
+        )
+        .await;
+        let ue = nf_saw(
+            &seen,
+            "DELETE /npcf-ue-policy-control/v1/policies/ue-pol-622-a",
+        )
+        .await;
+        clear_pcf_env();
+        let seen = seen.lock().expect("seen").clone();
+        assert!(
+            am,
+            "the AM Policy Association must be terminated; saw {seen:?}"
+        );
+        assert!(ue, "and the UE Policy Association still is; saw {seen:?}");
+        assert!(!ngap.ue_auth_state.contains(amf_ue_ngap_id));
+    }
+
+    /// #622, implicit deregistration (TS 24.501 §5.3.7): the UE is deregistered without
+    /// any NAS exchange, and its policy associations must still end at the PCF. On main
+    /// this path deletes neither.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_implicit_deregistration_terminates_the_policy_associations() {
+        let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (_nf, port, seen) = recording_nf().await;
+        let _env = SmfEnvGuard::set(port);
+        set_pcf_env(port);
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+
+        let amf_ue_ngap_id = 6_220_002u64;
+        let mut ue_ctx =
+            ue_with_policy_associations(amf_ue_ngap_id, "am-pol-622-b", "ue-pol-622-b");
+        ue_ctx.cm_idle = true;
+        ue_ctx.reachability = Some(Reachability {
+            phase: ReachabilityPhase::ImplicitDeregistration,
+            deadline: Instant::now() - Duration::from_secs(1),
+        });
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        ngap.process_reachability_timers()
+            .await
+            .expect("implicit deregistration");
+
+        let am = nf_saw(
+            &seen,
+            "DELETE /npcf-am-policy-control/v1/policies/am-pol-622-b",
+        )
+        .await;
+        let ue = nf_saw(
+            &seen,
+            "DELETE /npcf-ue-policy-control/v1/policies/ue-pol-622-b",
+        )
+        .await;
+        clear_pcf_env();
+        let seen = seen.lock().expect("seen").clone();
+        assert!(
+            am,
+            "the AM Policy Association must be terminated; saw {seen:?}"
+        );
+        assert!(ue, "and the UE Policy Association; saw {seen:?}");
+        assert!(
+            !ngap.ue_auth_state.contains(amf_ue_ngap_id),
+            "the UE is implicitly deregistered"
+        );
+    }
+
+    /// #622, T3522 exhaustion (TS 24.501 §5.5.2.3.6): after the last retransmission of
+    /// a network-initiated DEREGISTRATION REQUEST the AMF deregisters the UE locally,
+    /// and its policy associations must end at the PCF. On main this path deletes
+    /// neither.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_t3522_exhaustion_terminates_the_policy_associations() {
+        let (_nf, port, seen) = recording_nf().await;
+        let _env = SmfEnvGuard::set(port);
+        set_pcf_env(port);
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+
+        let amf_ue_ngap_id = 6_220_003u64;
+        let (max_count, _) = NasProcTimer::T3522.config(&ngap.timer_configs);
+        let mut ue_ctx =
+            ue_with_policy_associations(amf_ue_ngap_id, "am-pol-622-c", "ue-pol-622-c");
+        ue_ctx.retx = Some(NasRetx {
+            timer: NasProcTimer::T3522,
+            deadline: Instant::now() - Duration::from_secs(1),
+            retries: max_count,
+            ngap_pdu: Vec::new(),
+        });
+        ngap.ue_auth_state.insert(amf_ue_ngap_id, ue_ctx);
+
+        // The N2 release cannot be sent over this fixture; the PCF calls come first.
+        let _ = ngap.process_nas_timers().await;
+
+        let am = nf_saw(
+            &seen,
+            "DELETE /npcf-am-policy-control/v1/policies/am-pol-622-c",
+        )
+        .await;
+        let ue = nf_saw(
+            &seen,
+            "DELETE /npcf-ue-policy-control/v1/policies/ue-pol-622-c",
+        )
+        .await;
+        clear_pcf_env();
+        let seen = seen.lock().expect("seen").clone();
+        assert!(
+            am,
+            "the AM Policy Association must be terminated; saw {seen:?}"
+        );
+        assert!(ue, "and the UE Policy Association; saw {seen:?}");
     }
 
     /// An NF stand-in that answers 204 to everything and records `"METHOD uri"`.
