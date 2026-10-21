@@ -147,7 +147,7 @@ async fn test_registration_invalid_subscriber() {
     let ctx = TestContext::default_context();
 
     // Create a subscriber that doesn't exist in DB
-    let invalid_imsi = "999999999999999";
+    let _invalid_imsi = "999999999999999";
 
     // In a real test, this would verify that registration fails
     // For now, we just verify the test infrastructure works
@@ -165,7 +165,7 @@ async fn test_concurrent_registrations() {
     let mut handles = vec![];
 
     for i in 0..5 {
-        let cap = capture.clone();
+        let _cap = capture.clone();
         let handle = tokio::spawn(async move {
             let mut env = MockEnvironment::new().with_amf();
             env.start_all().await.unwrap();
@@ -200,7 +200,7 @@ async fn test_concurrent_registrations() {
 #[test]
 fn test_plmn_id_encoding() {
     // Test MCC=001, MNC=01 (2-digit)
-    let plmn = PlmnId::new(001, 01, 2);
+    let plmn = PlmnId::new(1, 1, 2) /* 001/01 */;
     let bytes = plmn.to_bytes();
 
     // Verify encoding follows 3GPP TS 24.008

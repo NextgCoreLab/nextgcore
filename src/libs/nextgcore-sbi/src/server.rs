@@ -1527,7 +1527,7 @@ mod tests {
             Some("RESOURCE_URI_NOT_FOUND")
         );
         assert!(
-            resp.http.headers.get("allow").is_none(),
+            !resp.http.headers.contains_key("allow"),
             "a 404 must not claim a method set for a resource that does not exist"
         );
     }

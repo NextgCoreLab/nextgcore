@@ -51,7 +51,7 @@ use crate::fiveg::types::FiveGGuti;
 pub fn five_g_guti_to_eps_guti(guti: &FiveGGuti) -> EpsGuti {
     let set_id = guti.amf_set_id & 0x03FF;
     EpsGuti {
-        plmn_id: guti.plmn_id.clone(),
+        plmn_id: guti.plmn_id,
         // Region ID -> MME GID 15..8; Set ID 9..2 -> MME GID 7..0.
         mme_gid: ((guti.amf_region_id as u16) << 8) | ((set_id >> 2) & 0x00FF),
         // Set ID 1..0 -> MME Code 7..6; Pointer 5..0 -> MME Code 5..0.
@@ -66,7 +66,7 @@ pub fn five_g_guti_to_eps_guti(guti: &FiveGGuti) -> EpsGuti {
 /// why the mapping loses nothing.
 pub fn eps_guti_to_5g_guti(guti: &EpsGuti) -> FiveGGuti {
     FiveGGuti {
-        plmn_id: guti.plmn_id.clone(),
+        plmn_id: guti.plmn_id,
         // MME GID 15..8 -> Region ID.
         amf_region_id: (guti.mme_gid >> 8) as u8,
         // MME GID 7..0 -> Set ID 9..2; MME Code 7..6 -> Set ID 1..0.
