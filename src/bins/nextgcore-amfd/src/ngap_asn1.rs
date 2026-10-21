@@ -1464,6 +1464,10 @@ pub enum InitialContextSetupOutcomeDecode {
         /// The Error Indication reporting not-comprehended IEs marked "ignore IE
         /// and notify sender", if any (§10.3.4.2).
         error_indication: Option<CriticalityErrorIndication>,
+        /// The Response's PDU Session Resource Setup List: each session's ID and
+        /// its PDUSessionResourceSetupResponseTransfer, which the SMF needs to
+        /// point the downlink at the gNB (#540). Empty for a Failure.
+        setup_sessions: Vec<(u8, Vec<u8>)>,
     },
     /// A not-comprehended IE was marked "reject": the procedure is
     /// "unsuccessfully terminated" and handled locally (§10.3.4.2), with no
@@ -1513,14 +1517,26 @@ pub fn decode_initial_context_setup_response_asn1(data: &[u8]) -> InitialContext
 
     let mut amf_ue_ngap_id = None;
     let mut ran_ue_ngap_id = None;
+    let mut setup_sessions = Vec::new();
     for entry in response.protocol_i_es.0 {
         match entry.value {
             Ie::Id_AMF_UE_NGAP_ID(v) => amf_ue_ngap_id = Some(v.0),
             Ie::Id_RAN_UE_NGAP_ID(v) => ran_ue_ngap_id = Some(v.0),
             // Comprehended, and not used: the AMF's request carries no PDU
             // Session Resource Setup List, so these lists answer nothing.
-            Ie::Id_PDUSessionResourceSetupListCxtRes(_)
-            | Ie::Id_PDUSessionResourceFailedToSetupListCxtRes(_)
+            Ie::Id_PDUSessionResourceSetupListCxtRes(list) => {
+                setup_sessions = list
+                    .0
+                    .into_iter()
+                    .map(|item| {
+                        (
+                            item.pdu_session_id.0,
+                            item.pdu_session_resource_setup_response_transfer.0,
+                        )
+                    })
+                    .collect();
+            }
+            Ie::Id_PDUSessionResourceFailedToSetupListCxtRes(_)
             | Ie::Id_CriticalityDiagnostics(_) => {}
         }
     }
@@ -1528,6 +1544,7 @@ pub fn decode_initial_context_setup_response_asn1(data: &[u8]) -> InitialContext
         amf_ue_ngap_id,
         ran_ue_ngap_id,
         cause: None,
+        setup_sessions,
         error_indication: ics_error_indication(
             amf_ue_ngap_id,
             ran_ue_ngap_id,
@@ -1594,6 +1611,7 @@ pub fn decode_initial_context_setup_failure_asn1(data: &[u8]) -> InitialContextS
         amf_ue_ngap_id,
         ran_ue_ngap_id,
         cause,
+        setup_sessions: Vec::new(),
         error_indication: ics_error_indication(
             amf_ue_ngap_id,
             ran_ue_ngap_id,
@@ -6756,6 +6774,7 @@ pub(crate) mod tests {
                 ran_ue_ngap_id: Some(9),
                 cause: None,
                 error_indication: None,
+                ..
             }
         ));
 
@@ -6778,6 +6797,7 @@ pub(crate) mod tests {
                 ran_ue_ngap_id: Some(13),
                 cause: Some((crate::ngap_handler::cause_group::RADIO_NETWORK, 0)),
                 error_indication: None,
+                ..
             }
         ));
     }
@@ -10267,6 +10287,7 @@ pub(crate) mod tests {
                         ran_ue_ngap_id: Some(ran),
                         cause: None,
                         error_indication: None,
+                        setup_sessions: Vec::new(),
                     }
                 );
                 compared += 1;
@@ -10318,6 +10339,7 @@ pub(crate) mod tests {
                             ran_ue_ngap_id: Some(ran),
                             cause: Some(expected_cause),
                             error_indication: None,
+                            setup_sessions: Vec::new(),
                         },
                         "group {group} value {value}"
                     );
@@ -10378,6 +10400,7 @@ pub(crate) mod tests {
                     ran_ue_ngap_id: Some(9),
                     cause,
                     error_indication: None,
+                    setup_sessions: Vec::new(),
                 }
             );
             assert_eq!(
@@ -10398,6 +10421,7 @@ pub(crate) mod tests {
                         },
                         diagnostics: vec![diag(ngap_gen::Criticality::NOTIFY)],
                     }),
+                    setup_sessions: Vec::new(),
                 }
             );
             assert_eq!(
