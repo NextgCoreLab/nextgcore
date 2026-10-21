@@ -858,6 +858,14 @@ pub struct SmfBearer {
     pub pf_to_delete: Vec<u8>,
     /// Parent session ID
     pub sess_id: u64,
+    /// #619: the index of this dedicated EPS bearer's PGW-U rules (1..=15), 0 for none.
+    ///
+    /// The PGW-C must install the bearer's S5/S8-U uplink PDR before it sends the Create
+    /// Bearer Request (the request carries the PGW-U F-TEID), but the EBI is assigned by
+    /// the MME and is only known from the response (TS 29.274 §7.2.3: the PGW sends EBI
+    /// 0). So the rule ids cannot be derived from the EBI as #583's are; they are derived
+    /// from this index instead, which is unique among the session's bearers.
+    pub eps_rule_index: u8,
 }
 
 impl SmfBearer {
@@ -889,6 +897,7 @@ impl SmfBearer {
             pf_ids: Vec::new(),
             pf_to_delete: Vec::new(),
             sess_id,
+            eps_rule_index: 0,
         }
     }
 
@@ -1056,6 +1065,12 @@ pub struct SmfSess {
     pub sgw_s5c_teid: u32,
     /// SGW S5C IP
     pub sgw_s5c_ip: IpAddr,
+    /// #619: the SGW-C's S5/S8-C endpoint, the peer a PGW-initiated request goes to.
+    ///
+    /// The source of the Create Session Request that established the session; the SGW's
+    /// own S5/S8-C F-TEID names the same node, but the datagram's source carries the port
+    /// the SGW-C actually listens on.
+    pub sgw_s5c_peer: Option<std::net::SocketAddr>,
     /// SMF N4 SEID
     pub smf_n4_seid: u64,
     /// UPF N4 SEID
@@ -1218,6 +1233,7 @@ impl SmfSess {
             smf_n4_teid: 0,
             sgw_s5c_teid: 0,
             sgw_s5c_ip: IpAddr::default(),
+            sgw_s5c_peer: None,
             smf_n4_seid: 0,
             upf_n4_seid: 0,
             local_dl_teid: 0,

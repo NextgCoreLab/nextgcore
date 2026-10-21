@@ -1390,10 +1390,17 @@ pub fn build_create_bearer_request(
     bearer: &SmfBearer,
     linked_ebi: u8,
     tft: Option<&[u8]>,
+    pti: Option<u8>,
 ) -> Vec<u8> {
-    let mut builder = Gtp2MessageBuilder::new(gtp2_message_type::CREATE_BEARER_REQUEST)
-        .teid(sess.sgw_s5c_teid)
-        .add_ebi(linked_ebi, 0); // Linked EPS Bearer ID
+    let mut builder =
+        Gtp2MessageBuilder::new(gtp2_message_type::CREATE_BEARER_REQUEST).teid(sess.sgw_s5c_teid);
+    // TS 29.274 Table 7.2.3-1: the PTI is present when the procedure answers a UE's
+    // Bearer Resource Command (TS 23.401 §5.4.5), so the UE can correlate the activation
+    // with its own request.
+    if let Some(pti) = pti {
+        builder = builder.add_pti(pti);
+    }
+    builder = builder.add_ebi(linked_ebi, 0); // Linked EPS Bearer ID
 
     // Bearer Context
     let bearer_f_teid_interface = match sess.gtp_rat_type {
@@ -1401,18 +1408,30 @@ pub fn build_create_bearer_request(
         gtp2_rat_type::WLAN => gtp2_f_teid_interface::S2B_U_PGW_GTP_U,
         _ => gtp2_f_teid_interface::S5_S8_PGW_GTP_U,
     };
+    // #619: Table 7.2.3-2 gives each F-TEID of this Bearer Context its own instance:
+    // S1-U SGW 0, S5/S8-U PGW 1, S12 RNC 2, S4-U SGSN 3, S2b-U PGW 4. This builder put the
+    // PGW's at instance 0, which a Serving GW reads as an S1-U SGW F-TEID.
+    let bearer_f_teid_instance = match sess.gtp_rat_type {
+        gtp2_rat_type::WLAN => 4,
+        _ => 1,
+    };
 
+    // #619: the bearer's rates are held in bit/s, as the 5GC flows' are and as N4 and
+    // the EPS→5GS mapping (#583) read them; TS 29.274 §8.15 codes them in kbit/s.
+    let kbps = |bps: u64| bps.div_ceil(1000);
     let bearer_qos = BearerQos {
         qci: bearer.qos.index,
         priority_level: bearer.qos.arp_priority_level,
         pre_emption_capability: bearer.qos.arp_preempt_cap,
         pre_emption_vulnerability: bearer.qos.arp_preempt_vuln,
-        ul_mbr: bearer.qos.mbr_uplink,
-        dl_mbr: bearer.qos.mbr_downlink,
-        ul_gbr: bearer.qos.gbr_uplink,
-        dl_gbr: bearer.qos.gbr_downlink,
+        ul_mbr: kbps(bearer.qos.mbr_uplink),
+        dl_mbr: kbps(bearer.qos.mbr_downlink),
+        ul_gbr: kbps(bearer.qos.gbr_uplink),
+        dl_gbr: kbps(bearer.qos.gbr_downlink),
     };
 
+    // TS 29.274 §7.2.3: the EBI of a bearer to be created is set to 0 by the PGW. The
+    // MME assigns it and returns it in the Create Bearer Response.
     let mut bc_builder = builder
         .start_bearer_context(0)
         .add_ebi(bearer.ebi)
@@ -1421,10 +1440,10 @@ pub fn build_create_bearer_request(
     // PGW S5U F-TEID
     if let Some(addr) = bearer.pgw_s5u_addr {
         let f_teid = FTeid::new_ipv4(bearer_f_teid_interface, bearer.pgw_s5u_teid, addr);
-        bc_builder = bc_builder.add_f_teid(&f_teid, 0);
+        bc_builder = bc_builder.add_f_teid(&f_teid, bearer_f_teid_instance);
     } else if let Some(addr) = bearer.pgw_s5u_addr6 {
         let f_teid = FTeid::new_ipv6(bearer_f_teid_interface, bearer.pgw_s5u_teid, addr);
-        bc_builder = bc_builder.add_f_teid(&f_teid, 0);
+        bc_builder = bc_builder.add_f_teid(&f_teid, bearer_f_teid_instance);
     }
 
     // TFT

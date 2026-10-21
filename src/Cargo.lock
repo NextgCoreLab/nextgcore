@@ -3303,6 +3303,7 @@ dependencies = [
  "nextgcore-core",
  "nextgcore-diameter",
  "nextgcore-gtp",
+ "nextgcore-ipfw",
  "nextgcore-metrics",
  "nextgcore-nas",
  "nextgcore-ngap",

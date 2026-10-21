@@ -3320,9 +3320,22 @@ impl DataPlane {
                     .filter(|p| p.source_interface == SRC_INTF_CORE)
                     .filter_map(|p| p.far_id)
                     .collect();
+                // #619: and only those that FOLLOW the session's tunnel -- no endpoint of
+                // their own yet, or the one the session is moving away from. A downlink FAR
+                // with a different endpoint is a tunnel of its own (a dedicated EPS bearer's
+                // S5/S8-U tunnel), which this move must not overwrite.
+                let old_tunnel = (session.dl_teid, session.gnb_addr.ip());
+                let follows_session = |far: &DataPlaneFar| match (far.ohc_teid, far.ohc_addr) {
+                    (None, _) => true,
+                    (Some(teid), addr) => {
+                        teid == old_tunnel.0 && addr.is_none_or(|a| IpAddr::V4(a) == old_tunnel.1)
+                    }
+                };
                 let mut fars = session.fars.write().unwrap();
                 for far in fars.values_mut() {
-                    if far.destination_interface == SRC_INTF_ACCESS && dl_fars.contains(&far.far_id)
+                    if far.destination_interface == SRC_INTF_ACCESS
+                        && dl_fars.contains(&far.far_id)
+                        && follows_session(far)
                     {
                         if let Some(teid) = dl_teid {
                             far.ohc_teid = Some(teid);

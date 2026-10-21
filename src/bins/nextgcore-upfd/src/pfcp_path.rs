@@ -1725,11 +1725,15 @@ impl PfcpServer {
         // #583: except a FAR created together with an ACCESS-source PDR that uses it --
         // a tunnel relaying toward the access side (indirect data forwarding), whose
         // endpoint is its own and not the session's downlink.
-        let relay_fars: std::collections::HashSet<u32> = created_pdrs
-            .iter()
-            .filter(|p| p.pdi.source_interface == 0)
-            .filter_map(|p| p.far_id)
-            .collect();
+        //
+        // #619: and likewise a FAR created together with a CORE-source PDR that uses it.
+        // That is a second downlink tunnel of the session (a dedicated EPS bearer's own
+        // S5/S8-U tunnel, TS 23.401 §5.4.1), so its endpoint is its own too. Counting it
+        // as the session's tunnel moving re-pointed the default bearer's FAR 2 at the
+        // dedicated bearer's TEID, and the default bearer's downlink went to the wrong
+        // tunnel.
+        let relay_fars: std::collections::HashSet<u32> =
+            created_pdrs.iter().filter_map(|p| p.far_id).collect();
         for far in created_fars
             .iter()
             .filter(|f| !relay_fars.contains(&f.far_id))
@@ -3178,6 +3182,123 @@ mod tests {
             server.sessions.read().await[&upf_seid].dl_teid,
             dl_before,
             "a relay FAR's endpoint is not the session's downlink tunnel"
+        );
+    }
+
+    /// A Core-source PDR and a FAR forwarding to the access side toward `ohc`
+    /// (`(teid, addr)`); `None` for a buffering FAR.
+    fn downlink_rule(pdr_id: u16, far_id: u32, ohc: Option<(u32, [u8; 4])>) -> Vec<u8> {
+        let mut pdi = crate::n4_build::PfcpMessageBuilder::new();
+        pdi.add_u8(pfcp_ie::SOURCE_INTERFACE, 1); // Core
+        let mut pdr = crate::n4_build::PfcpMessageBuilder::new();
+        pdr.add_pdr_id(pdr_id);
+        pdr.add_u32(pfcp_ie::PRECEDENCE, 50);
+        pdr.add_tlv(pfcp_ie::PDI, &pdi.build());
+        pdr.add_u32(pfcp_ie::FAR_ID, far_id);
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr.build());
+        b.add_tlv(pfcp_ie::CREATE_FAR, &forwarding_far(far_id, ohc, false));
+        b.build()
+    }
+
+    /// A FAR (or Update FAR, `update`) body forwarding to Access toward `ohc`.
+    fn forwarding_far(far_id: u32, ohc: Option<(u32, [u8; 4])>, update: bool) -> Vec<u8> {
+        let mut far = crate::n4_build::PfcpMessageBuilder::new();
+        far.add_u32(pfcp_ie::FAR_ID, far_id);
+        match ohc {
+            Some((teid, addr)) => {
+                let mut fp = crate::n4_build::PfcpMessageBuilder::new();
+                fp.add_u8(pfcp_ie::DESTINATION_INTERFACE, 0);
+                let mut v = vec![0x01, 0x00];
+                v.extend_from_slice(&teid.to_be_bytes());
+                v.extend_from_slice(&addr);
+                fp.add_tlv(pfcp_ie::OUTER_HEADER_CREATION, &v);
+                far.add_u16(pfcp_ie::APPLY_ACTION, 0x02);
+                far.add_tlv(
+                    if update {
+                        pfcp_ie::UPDATE_FORWARDING_PARAMETERS
+                    } else {
+                        pfcp_ie::FORWARDING_PARAMETERS
+                    },
+                    &fp.build(),
+                );
+            }
+            None => {
+                far.add_u16(pfcp_ie::APPLY_ACTION, 0x04);
+            }
+        }
+        far.build()
+    }
+
+    /// #619: a dedicated EPS bearer's downlink tunnel is its own.
+    ///
+    /// The PGW-C creates the bearer's downlink as a Core PDR with a FAR of its own toward
+    /// the SGW's per-bearer S5/S8-U tunnel. That must not move the session's downlink
+    /// tunnel (FAR 2), and a later move of the session's tunnel must not overwrite it.
+    /// Before #619 both did: the default bearer's downlink went into the dedicated
+    /// bearer's tunnel, and then the dedicated bearer's into the default's.
+    #[tokio::test]
+    async fn a_second_downlink_tunnel_keeps_its_endpoint_across_a_move() {
+        const DEFAULT: (u32, [u8; 4]) = (0x0000_0A0A, [127, 58, 3, 1]);
+        const DEDICATED: (u32, [u8; 4]) = (0x0606_0606, [127, 58, 3, 6]);
+        const MOVED: (u32, [u8; 4]) = (0x0000_0C0C, [127, 58, 3, 12]);
+        let (server, smf, addr, mut rx, dp, upf_seid) = established_session().await;
+        let far = |id: u32| {
+            dp.sessions
+                .find_by_seid(upf_seid)
+                .and_then(|s| s.fars.read().unwrap().get(&id).cloned())
+                .map(|f| (f.ohc_teid, f.ohc_addr.map(|a| a.octets())))
+        };
+        let mut seq = 3;
+        let mut modify = |body: Vec<u8>| {
+            seq += 1;
+            encode_pfcp(52, Some(upf_seid), seq, &body)
+        };
+
+        // The default bearer's downlink, then the session's tunnel set by Update FAR 2 --
+        // what smfd's Create Session does.
+        let resp = exchange(&smf, addr, &modify(downlink_rule(2, 2, None))).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::UPDATE_FAR, &forwarding_far(2, Some(DEFAULT), true));
+        let resp = exchange(&smf, addr, &modify(b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        assert_eq!(far(2), Some((Some(DEFAULT.0), Some(DEFAULT.1))));
+
+        // The dedicated bearer's downlink.
+        let resp = exchange(
+            &smf,
+            addr,
+            &modify(downlink_rule(0x81, 0x81, Some(DEDICATED))),
+        )
+        .await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        assert_eq!(
+            far(2),
+            Some((Some(DEFAULT.0), Some(DEFAULT.1))),
+            "the default bearer's downlink must stay on its own tunnel"
+        );
+        assert_eq!(far(0x81), Some((Some(DEDICATED.0), Some(DEDICATED.1))));
+        assert_eq!(
+            server.sessions.read().await[&upf_seid].dl_teid,
+            DEFAULT.0,
+            "creating a second tunnel does not move the session's"
+        );
+
+        // The session's tunnel moves.
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::UPDATE_FAR, &forwarding_far(2, Some(MOVED), true));
+        let resp = exchange(&smf, addr, &modify(b.build())).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        apply_next(&mut rx, &dp).await;
+        assert_eq!(far(2), Some((Some(MOVED.0), Some(MOVED.1))));
+        assert_eq!(
+            far(0x81),
+            Some((Some(DEDICATED.0), Some(DEDICATED.1))),
+            "the move must not overwrite the dedicated bearer's tunnel"
         );
     }
 

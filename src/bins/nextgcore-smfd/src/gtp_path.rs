@@ -637,7 +637,7 @@ impl GtpPathManager {
         let xact_id =
             self.create_local_xact(gtp2_message_type::CREATE_BEARER_REQUEST, Some(sess.id));
 
-        let message = build_create_bearer_request(sess, bearer, linked_ebi, tft);
+        let message = build_create_bearer_request(sess, bearer, linked_ebi, tft, None);
 
         self.set_xact_request(xact_id, message.clone());
 
@@ -1024,6 +1024,18 @@ pub struct S5S8Server {
     restart_counter: u8,
     xact: tokio::sync::Mutex<Gtp2XactMgr>,
     running: Arc<AtomicBool>,
+    /// #619: the PGW-initiated requests waiting for their triggered message, by
+    /// (SGW-C peer, sequence number). The sender is dropped when N3 runs out, which is
+    /// how the waiting procedure learns that no answer is coming.
+    pending: std::sync::Mutex<
+        std::collections::HashMap<(SocketAddr, u32), tokio::sync::oneshot::Sender<Vec<u8>>>,
+    >,
+    /// #619: Commands from the SGW-C whose procedure is still running, by (peer,
+    /// sequence number), so a retransmitted Command does not start a second bearer.
+    commands_in_progress: std::sync::Mutex<std::collections::HashSet<(SocketAddr, u32)>>,
+    /// #619: the locally configured PCC rules (`smf.pcc_rules`) this PGW-C activates as
+    /// dedicated bearers when a PDN connection is established.
+    local_pcc_rules: std::sync::RwLock<Vec<crate::eps_bearer::LocalPccRule>>,
 }
 
 /// The process-wide S5/S8 server.
@@ -1051,6 +1063,9 @@ impl S5S8Server {
             restart_counter,
             xact: tokio::sync::Mutex::new(Gtp2XactMgr::new(Gtp2XactConfig::default())),
             running: Arc::new(AtomicBool::new(true)),
+            pending: std::sync::Mutex::new(std::collections::HashMap::new()),
+            commands_in_progress: std::sync::Mutex::new(std::collections::HashSet::new()),
+            local_pcc_rules: std::sync::RwLock::new(Vec::new()),
         });
 
         // Receive loop.
@@ -1106,6 +1121,8 @@ impl S5S8Server {
                             xact.message_type,
                             xact.sequence_number
                         );
+                        // #619: dropping the sender tells the waiting procedure.
+                        server.take_pending(xact.peer, xact.sequence_number);
                     }
                 }
             });
@@ -1142,9 +1159,28 @@ impl S5S8Server {
     /// Used by the PGW-initiated bearer procedures, which are the only messages this
     /// node originates on S5/S8.
     pub async fn send_request(&self, peer: SocketAddr, encoded: Vec<u8>, message_type: u8) -> u32 {
-        let seq = {
+        self.send_request_numbered(peer, encoded, message_type, None)
+            .await
+    }
+
+    /// Send a request under `sequence` (or a fresh number when `None`) and arm T3/N3.
+    ///
+    /// #619: a request TRIGGERED by a Command (a Create Bearer Request answering a Bearer
+    /// Resource Command) carries the Command's sequence number, TS 29.274 §7.6. With a
+    /// fresh number the SGW-C could not correlate it with the Command it relayed, and the
+    /// Command would run out its N3 there. The encoded message is renumbered here, so a
+    /// caller cannot send one number and register another.
+    pub async fn send_request_numbered(
+        &self,
+        peer: SocketAddr,
+        encoded: Vec<u8>,
+        message_type: u8,
+        sequence: Option<u32>,
+    ) -> u32 {
+        let (seq, encoded) = {
             let mut xact = self.xact.lock().await;
-            let seq = xact.alloc_sequence();
+            let seq = sequence.unwrap_or_else(|| xact.alloc_sequence());
+            let encoded = crate::gtp_handler::with_sequence_number(encoded, seq);
             xact.register_request(
                 seq,
                 message_type,
@@ -1152,12 +1188,94 @@ impl S5S8Server {
                 bytes::Bytes::from(encoded.clone()),
                 0,
             );
-            seq
+            (seq, encoded)
         };
         if let Err(e) = self.socket.send_to(&encoded, peer).await {
             log::error!("S5/S8 request to {peer} failed: {e}");
         }
         seq
+    }
+
+    /// Send a request and wait for its triggered message (#619).
+    ///
+    /// Returns the raw triggered message, or an error once T3/N3 runs out. The waiter is
+    /// registered BEFORE the datagram leaves, so an answer that arrives before this
+    /// task is next polled is not lost.
+    pub async fn request(
+        &self,
+        peer: SocketAddr,
+        encoded: Vec<u8>,
+        message_type: u8,
+        sequence: Option<u32>,
+    ) -> Result<Vec<u8>, String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (seq, encoded) = {
+            let mut xact = self.xact.lock().await;
+            let seq = sequence.unwrap_or_else(|| xact.alloc_sequence());
+            let encoded = crate::gtp_handler::with_sequence_number(encoded, seq);
+            xact.register_request(
+                seq,
+                message_type,
+                peer,
+                bytes::Bytes::from(encoded.clone()),
+                0,
+            );
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.insert((peer, seq), tx);
+            }
+            (seq, encoded)
+        };
+        if let Err(e) = self.socket.send_to(&encoded, peer).await {
+            log::error!("S5/S8 request to {peer} failed: {e}");
+        }
+        rx.await.map_err(|_| {
+            format!("no answer from {peer} to message type {message_type} (seq {seq}): N3 ran out")
+        })
+    }
+
+    fn take_pending(
+        &self,
+        peer: SocketAddr,
+        seq: u32,
+    ) -> Option<tokio::sync::oneshot::Sender<Vec<u8>>> {
+        self.pending.lock().ok()?.remove(&(peer, seq))
+    }
+
+    /// Record that a Command from `peer` is being served; `false` when it already is, which
+    /// means this datagram is a retransmission of it (#619).
+    pub(crate) fn begin_command(&self, peer: SocketAddr, seq: u32) -> bool {
+        self.commands_in_progress
+            .lock()
+            .map(|mut set| set.insert((peer, seq)))
+            .unwrap_or(false)
+    }
+
+    /// The Command's procedure finished (#619).
+    pub(crate) fn end_command(&self, peer: SocketAddr, seq: u32) {
+        if let Ok(mut set) = self.commands_in_progress.lock() {
+            set.remove(&(peer, seq));
+        }
+    }
+
+    /// Install the locally configured PCC rules (#619).
+    pub fn set_local_pcc_rules(&self, rules: Vec<crate::eps_bearer::LocalPccRule>) {
+        if let Ok(mut r) = self.local_pcc_rules.write() {
+            *r = rules;
+        }
+    }
+
+    /// The local PCC rules that apply to a PDN connection to `apn` (#619).
+    pub(crate) fn local_pcc_rules_for(&self, apn: &str) -> Vec<crate::eps_bearer::LocalPccRule> {
+        self.local_pcc_rules
+            .read()
+            .map(|rules| {
+                rules
+                    .iter()
+                    .filter(|r| r.applies_to(apn))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Outstanding transactions awaiting a triggered message.
@@ -1191,17 +1309,22 @@ impl S5S8Server {
             return;
         }
 
-        // A triggered message closes one of this node's own transactions.
+        // A triggered message closes one of this node's own transactions. #619: by
+        // (peer, sequence number), so only the SGW-C the request went to can answer it.
         let matched = {
             let mut xact = self.xact.lock().await;
-            xact.match_response(seq, msg_type)
+            xact.match_response_from(peer, seq, msg_type)
         };
         if let Some(closed) = matched {
             log::debug!(
                 "S5/S8 RX response type={msg_type} seq={seq} from {peer} correlates to type={}",
                 closed.message_type
             );
-            crate::gtp_handler::dispatch_s5s8_response(msg_type, data, peer);
+            match self.take_pending(peer, seq) {
+                // A send error means the waiting procedure gave up; nothing to do.
+                Some(waiter) => drop(waiter.send(data.to_vec())),
+                None => crate::gtp_handler::dispatch_s5s8_response(msg_type, data, peer),
+            }
             return;
         }
 
@@ -1215,7 +1338,11 @@ impl S5S8Server {
 /// With no `smf.gtpc.server` configured this returns `Ok(())` and logs why: an SMF with
 /// no S5/S8 address is a 5G-only deployment, and refusing to start would break every
 /// existing 5GC config that never needed the socket.
-pub async fn s5s8_open(bind: Option<SocketAddr>, restart_counter: u8) -> Result<(), String> {
+pub async fn s5s8_open(
+    bind: Option<SocketAddr>,
+    restart_counter: u8,
+    local_pcc_rules: Vec<crate::eps_bearer::LocalPccRule>,
+) -> Result<(), String> {
     let Some(bind) = bind else {
         log::info!(
             "no smf.gtpc.server configured: the S5/S8 (PGW-C) role is NOT bound, so no LTE \
@@ -1224,6 +1351,13 @@ pub async fn s5s8_open(bind: Option<SocketAddr>, restart_counter: u8) -> Result<
         return Ok(());
     };
     let server = S5S8Server::open(bind, restart_counter).await?;
+    if !local_pcc_rules.is_empty() {
+        log::info!(
+            "S5/S8: {} local PCC rule(s) will be activated as dedicated bearers",
+            local_pcc_rules.len()
+        );
+    }
+    server.set_local_pcc_rules(local_pcc_rules);
     if S5S8_SERVER.set(server).is_err() {
         log::warn!("an S5/S8 server is already installed; this one is dropped");
     }
