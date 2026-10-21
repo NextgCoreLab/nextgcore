@@ -14,7 +14,7 @@
 //! Release (§8.3.2, §8.3.3): the UE CONTEXT RELEASE COMMAND encode and the
 //! REQUEST / COMPLETE decodes. Stage 6 is E-RAB management (§8.2.1-§8.2.3):
 //! the E-RAB SETUP / MODIFY REQUEST and E-RAB RELEASE COMMAND encodes and their
-//! responses' decodes.
+//! responses' decodes. Stage 7 is Paging (§8.5): the PAGING encode.
 
 use bitvec::prelude::{BitVec, Msb0};
 use nextgcore_s1ap::{
@@ -78,7 +78,7 @@ fn bits_to_u32(bits: &BitVec<u8, Msb0>) -> u32 {
     bits.iter().fold(0u32, |acc, b| (acc << 1) | u32::from(*b))
 }
 
-#[cfg(test)]
+/// The low `width` bits of `value`, most significant first.
 fn u32_to_bits(value: u32, width: usize) -> BitVec<u8, Msb0> {
     (0..width).rev().map(|i| (value >> i) & 1 == 1).collect()
 }
@@ -1586,6 +1586,81 @@ pub fn decode_erab_release_response(
     }
 }
 
+// ============================================================================
+// Paging (TS 36.413 §8.5) -- stage 7
+// ============================================================================
+
+/// `id-Paging`.
+pub const PROC_PAGING: u8 = 10;
+
+const ID_UE_PAGING_ID: u16 = 43;
+const ID_PAGING_DRX: u16 = 44;
+const ID_TAI_LIST: u16 = 46;
+const ID_TAI_ITEM: u16 = 47;
+const ID_UE_IDENTITY_INDEX_VALUE: u16 = 80;
+const ID_CN_DOMAIN: u16 = 109;
+
+/// Encode a PAGING (TS 36.413 §9.1.6) with the generated codec. IE order
+/// follows `PagingIEs`; every IE, and each TAI item, criticality ignore;
+/// procedure criticality ignore.
+pub fn build_paging(msg: &nextgcore_s1ap::Paging) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    use g::PagingProtocolIEs_EntryValue as V;
+    let ie = |id: u16, value: V| g::PagingProtocolIEs_Entry {
+        id: g::ProtocolIE_ID(id),
+        criticality: g::Criticality(IGNORE),
+        value,
+    };
+    let paging_id = match &msg.ue_paging_id {
+        nextgcore_s1ap::UePagingId::STmsi(s) => g::UEPagingID::S_TMSI(g::S_TMSI {
+            mmec: g::MME_Code(vec![s.mmec]),
+            m_tmsi: g::M_TMSI(s.m_tmsi.to_be_bytes().to_vec()),
+            ie_extensions: None,
+        }),
+        nextgcore_s1ap::UePagingId::Imsi(imsi) => g::UEPagingID::IMSI(g::IMSI(imsi.clone())),
+    };
+    let tais = msg
+        .tai_list
+        .iter()
+        .map(|t| g::TAIList_Entry {
+            id: g::ProtocolIE_ID(ID_TAI_ITEM),
+            criticality: g::Criticality(IGNORE),
+            value: g::TAIList_EntryValue::Id_TAIItem(g::TAIItem {
+                tai: g::TAI {
+                    plm_nidentity: g::TBCD_STRING(t.plmn_identity.to_vec()),
+                    tac: g::TAC(t.tac.to_be_bytes().to_vec()),
+                    ie_extensions: None,
+                },
+                ie_extensions: None,
+            }),
+        })
+        .collect();
+    let mut ies = vec![
+        ie(
+            ID_UE_IDENTITY_INDEX_VALUE,
+            V::Id_UEIdentityIndexValue(g::UEIdentityIndexValue(u32_to_bits(
+                u32::from(msg.ue_identity_index),
+                10,
+            ))),
+        ),
+        ie(ID_UE_PAGING_ID, V::Id_UEPagingID(paging_id)),
+    ];
+    if let Some(drx) = msg.paging_drx {
+        ies.push(ie(ID_PAGING_DRX, V::Id_pagingDRX(g::PagingDRX(drx as u8))));
+    }
+    ies.push(ie(
+        ID_CN_DOMAIN,
+        V::Id_CNDomain(g::CNDomain(msg.cn_domain as u8)),
+    ));
+    ies.push(ie(ID_TAI_LIST, V::Id_TAIList(g::TAIList(tais))));
+    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+        procedure_code: g::ProcedureCode(PROC_PAGING),
+        criticality: g::Criticality(IGNORE),
+        value: g::InitiatingMessageValue::Id_Paging(g::Paging {
+            protocol_i_es: g::PagingProtocolIEs(ies),
+        }),
+    }))
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -1600,3 +1675,6 @@ mod release_tests;
 
 #[cfg(test)]
 mod erab_tests;
+
+#[cfg(test)]
+mod paging_tests;
