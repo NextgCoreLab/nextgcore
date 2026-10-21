@@ -844,21 +844,27 @@ impl N26Server {
 
         // Data forwarding (step 4: "Based on configuration and the Direct Forwarding Flag
         // received from the MME, the initial AMF determines the applicability of data
-        // forwarding"). NEITHER is claimed, whatever the MME offered: forwarding needs the
-        // target gNB's forwarding tunnels relayed back to the MME in the EPS Bearer Setup
-        // List, which needs the HandoverRequestAcknowledgeTransfer's data-forwarding members
-        // decoded -- and this AMF relays that transfer opaquely to the SMF. So the SMF is
-        // told forwarding is not possible (it then sends the gNB "Data forwarding not
-        // possible", step 7), and downlink data in flight at the source eNB is discarded.
-        if request.direct_forwarding {
-            log::info!(
-                "N26 Forward Relocation Request (seq={seq}): MME {peer} offers DIRECT data \
-                 forwarding (DFI=1). Not used: this AMF does not decode the target gNB's \
-                 forwarding tunnels, so it cannot return them to the MME; the SMF is told \
-                 forwarding is not possible and in-flight downlink data at the source eNB is \
-                 discarded."
-            );
-        }
+        // forwarding and indicates to the SMF whether the direct data forwarding or indirect
+        // data forwarding is applicable"). #583: the MME's DFI selects direct forwarding;
+        // without it, indirect forwarding through the SMF's UPF applies. Either way the SMF
+        // returns the forwarding tunnels in its EPS Bearer Setup List (step 13), which this
+        // AMF relays to the MME unchanged in the Forward Relocation Response (step 14).
+        let direct_forwarding = request.direct_forwarding;
+        log::info!(
+            "N26 Forward Relocation Request (seq={seq}): MME {peer} {} direct data \
+             forwarding (DFI={}); the SMF is asked for {} data forwarding",
+            if direct_forwarding {
+                "offers"
+            } else {
+                "does not offer"
+            },
+            u8::from(direct_forwarding),
+            if direct_forwarding {
+                "DIRECT"
+            } else {
+                "INDIRECT"
+            },
+        );
 
         // Steps 3-7, one PDN connection at a time.
         let mut sessions = Vec::new();
@@ -897,8 +903,8 @@ impl N26Server {
                     .map(|g| (g.plmn_id.mcc(), g.plmn_id.mnc())),
                 ue_eps_pdn_connection: pdn.contents.clone(),
                 target_id: target_id.clone(),
-                direct_forwarding: false,
-                indirect_forwarding: false,
+                direct_forwarding,
+                indirect_forwarding: !direct_forwarding,
             };
             match crate::sbi_path::call_smf_create_sm_context_eps_handover(
                 &smf_host, smf_port, &create,

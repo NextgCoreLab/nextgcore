@@ -1208,6 +1208,24 @@ pub(crate) mod stand_in {
     /// distinct from the establishment's so a test can tell the two tunnels apart.
     pub(crate) const N3_STAND_IN_TEID: u32 = 0x0000_3475;
 
+    /// The value of every top-level Create PDR IE (type 1) in a message body.
+    fn create_pdrs(body: &[u8]) -> Vec<&[u8]> {
+        let mut out = Vec::new();
+        let mut off = 0usize;
+        while off + 4 <= body.len() {
+            let t = u16::from_be_bytes([body[off], body[off + 1]]);
+            let l = usize::from(u16::from_be_bytes([body[off + 2], body[off + 3]]));
+            let Some(v) = body.get(off + 4..off + 4 + l) else {
+                break;
+            };
+            if t == 1 {
+                out.push(v);
+            }
+            off += 4 + l;
+        }
+        out
+    }
+
     /// Flat TLV encoder for the response IEs the SMF's establishment parser reads.
     fn tlv(ie_type: u16, value: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(4 + value.len());
@@ -1378,12 +1396,32 @@ pub(crate) mod stand_in {
                         // allocated F-TEID (TS 29.244 §7.5.5.2), as the establishment is.
                         let req_body = &buf[h.body_offset..len];
                         if cause == pfcp_cause::REQUEST_ACCEPTED {
-                            if let Some(pdr_id) = find_ie(req_body, 1)
-                                .and_then(|pdr| find_ie(pdr, 56))
-                                .filter(|v| v.len() >= 2)
-                            {
+                            // #583: EVERY Create PDR whose F-TEID is to be chosen (TEID 0)
+                            // gets its own, N3_STAND_IN_TEID first; a message naming none
+                            // that way keeps the #475 answer for its first Create PDR.
+                            let pdrs = create_pdrs(req_body);
+                            let choose: Vec<&[u8]> = pdrs
+                                .iter()
+                                .copied()
+                                .filter(|pdr| {
+                                    find_ie(pdr, 2)
+                                        .and_then(|pdi| find_ie(pdi, 21))
+                                        .is_some_and(|f| f.len() >= 5 && f[1..5] == [0; 4])
+                                })
+                                .collect();
+                            let answered = if choose.is_empty() {
+                                pdrs.into_iter().take(1).collect()
+                            } else {
+                                choose
+                            };
+                            for (k, pdr) in answered.into_iter().enumerate() {
+                                let Some(pdr_id) = find_ie(pdr, 56).filter(|v| v.len() >= 2) else {
+                                    continue;
+                                };
                                 let mut f_teid = vec![0x01];
-                                f_teid.extend_from_slice(&N3_STAND_IN_TEID.to_be_bytes());
+                                f_teid.extend_from_slice(
+                                    &(N3_STAND_IN_TEID + k as u32).to_be_bytes(),
+                                );
                                 f_teid.extend_from_slice(&upf_ip);
                                 let mut created = tlv(56, &pdr_id[..2]);
                                 created.extend_from_slice(&tlv(21, &f_teid));
@@ -1427,6 +1465,49 @@ pub(crate) mod stand_in {
             session_cause,
             modification_bodies,
             establishment_bodies,
+            _n4_guard: n4_guard,
+        }
+    }
+
+    /// #583: a REAL UPF -- a running `nextgcore-upfd` at `peer` -- installed as the
+    /// process-wide PFCP client and associated, for the env-gated real-binary tests. The
+    /// client binds `local` (an address the UPF can answer). Serialised and uninstalled like
+    /// the stand-in.
+    #[must_use = "the UPF client is uninstalled as soon as it is dropped"]
+    pub(crate) struct RealUpf {
+        _n4_guard: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for RealUpf {
+        fn drop(&mut self) {
+            clear_global_upf_for_test();
+        }
+    }
+
+    pub(crate) async fn real_upf(local: SocketAddr, peer: SocketAddr) -> RealUpf {
+        let n4_guard = N4_TEST_LOCK.lock().await;
+        let sock = Arc::new(UdpSocket::bind(local).await.expect("bind the N4 client"));
+        let ip = match local.ip() {
+            std::net::IpAddr::V4(v4) => v4.octets(),
+            std::net::IpAddr::V6(_) => panic!("an IPv4 N4 address"),
+        };
+        let client = Arc::new(PfcpClient::new(sock, peer, ip));
+        let c = client.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            loop {
+                let Ok((len, from)) = c.socket.recv_from(&mut buf).await else {
+                    break;
+                };
+                c.on_datagram(&buf[..len], from).await;
+            }
+        });
+        set_global_pool(vec![client.clone()]);
+        client
+            .associate()
+            .await
+            .expect("the real UPF must accept the association");
+        RealUpf {
             _n4_guard: n4_guard,
         }
     }
