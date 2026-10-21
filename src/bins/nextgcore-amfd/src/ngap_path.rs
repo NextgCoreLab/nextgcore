@@ -17695,7 +17695,12 @@ mod tests {
             &nextgcore_ngap::types::RanStatusTransfer {
                 amf_ue_ngap_id,
                 ran_ue_ngap_id,
-                container: vec![0x00, 0x11, 0x22, 0x33, 0x44],
+                // A valid RANStatusTransfer-TransparentContainer (one DRB, 12-bit
+                // COUNTs): since #417 the AMF decodes it (§9.3.1.31 is a
+                // SEQUENCE) instead of relaying opaque octets.
+                container: vec![
+                    0x00, 0x00, 0x00, 0x01, 0x23, 0x00, 0x45, 0x00, 0x04, 0x56, 0x00, 0x78,
+                ],
             },
         )
         .expect("build UplinkRANStatusTransfer")
