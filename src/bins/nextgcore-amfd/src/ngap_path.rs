@@ -4934,6 +4934,10 @@ impl NgapServer {
         plain: &[u8],
     ) -> Result<()> {
         let ran_ue_ngap_id = initial_ue.ran_ue_ngap_id;
+        log::info!(
+            "Service Request from CM-IDLE (initial UE {amf_ue_ngap_id}): service_type={}",
+            service_request_service_type(plain).unwrap_or(0)
+        );
         let resolved = service_request_s_tmsi(plain).and_then(|(set, ptr, tmsi)| {
             self.ue_auth_state.snapshot().into_iter().find(|(_, st)| {
                 st.registered
