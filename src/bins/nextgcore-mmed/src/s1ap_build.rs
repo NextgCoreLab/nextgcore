@@ -11,15 +11,16 @@ use crate::context::{
     ECgi, EnbUe, EpsTai, IpAddr, MmeBearer, MmeContext, MmeUe, PlmnId, S1apCause, S1apCauseGroup,
 };
 use crate::sbc_message::SbcPwsData;
+#[cfg(test)]
+use nextgcore_s1ap::builder;
 use nextgcore_s1ap::{
-    builder, AllocationRetentionPriority, Cause, CauseMisc, CauseNas, CauseProtocol,
-    CauseRadioNetwork, CauseTransport, CnDomain, CsFallbackIndicator,
-    EnbConfigurationUpdateAcknowledge, EnbConfigurationUpdateFailure, ErabItem,
-    ErabLevelQosParameters, ErabModifyRequest, ErabReleaseCommand, ErabSetupRequest,
-    ErabToBeModifiedItem, ErabToBeSetupItem, ErrorIndication, EutranCgi, GbrQosInformation,
-    InitialContextSetupRequest, KillRequest, OverloadAction, OverloadStart, OverloadStop, Paging,
-    PagingDrx, S1apResult, STmsi, Tai, TimeToWait, UeAmbr, UeContextModificationRequest,
-    UePagingId, UeS1apIds, UeSecurityCapabilities, WarningAreaList, WriteReplaceWarningRequest,
+    AllocationRetentionPriority, Cause, CauseMisc, CauseNas, CauseProtocol, CauseRadioNetwork,
+    CauseTransport, CnDomain, CsFallbackIndicator, ErabItem, ErabLevelQosParameters,
+    ErabModifyRequest, ErabReleaseCommand, ErabSetupRequest, ErabToBeModifiedItem,
+    ErabToBeSetupItem, ErrorIndication, EutranCgi, GbrQosInformation, InitialContextSetupRequest,
+    KillRequest, OverloadAction, Paging, PagingDrx, S1apResult, STmsi, Tai, TimeToWait, UeAmbr,
+    UeContextModificationRequest, UePagingId, UeS1apIds, UeSecurityCapabilities, WarningAreaList,
+    WriteReplaceWarningRequest,
 };
 
 // ============================================================================
@@ -618,9 +619,7 @@ pub fn build_paging(
 
 /// Build eNB Configuration Update Acknowledge (TS 36.413 §9.1.8.8)
 pub fn build_enb_configuration_update_acknowledge() -> S1apResult<Vec<u8>> {
-    builder::build_enb_configuration_update_acknowledge(&EnbConfigurationUpdateAcknowledge {
-        criticality_diagnostics: None,
-    })
+    crate::s1ap_gen::build_enb_configuration_update_acknowledge(&[]).map_err(gen_err)
 }
 
 /// Build eNB Configuration Update Failure (TS 36.413 §9.1.8.9)
@@ -629,11 +628,12 @@ pub fn build_enb_configuration_update_failure(
     cause_value: i64,
     time_to_wait: Option<TimeToWait>,
 ) -> S1apResult<Vec<u8>> {
-    builder::build_enb_configuration_update_failure(&EnbConfigurationUpdateFailure {
-        cause: cause_to_s1ap(cause_group, cause_value),
+    crate::s1ap_gen::build_enb_configuration_update_failure(
+        cause_to_s1ap(cause_group, cause_value),
         time_to_wait,
-        criticality_diagnostics: None,
-    })
+        &[],
+    )
+    .map_err(gen_err)
 }
 
 // ============================================================================
@@ -651,7 +651,7 @@ pub fn build_ue_context_modification_for_csfb(
     enb_ue: &EnbUe,
     high_priority: bool,
 ) -> S1apResult<Vec<u8>> {
-    builder::build_ue_context_modification_request(&UeContextModificationRequest {
+    crate::s1ap_gen::build_ue_context_modification_request(&UeContextModificationRequest {
         mme_ue_s1ap_id: enb_ue.mme_ue_s1ap_id,
         enb_ue_s1ap_id: enb_ue.enb_ue_s1ap_id,
         security_key: None,
@@ -664,6 +664,7 @@ pub fn build_ue_context_modification_for_csfb(
         }),
         ue_security_capabilities: None,
     })
+    .map_err(gen_err)
 }
 
 // ============================================================================
@@ -672,14 +673,12 @@ pub fn build_ue_context_modification_for_csfb(
 
 /// Build Overload Start (TS 36.413 §9.1.8.13)
 pub fn build_overload_start(action: OverloadAction) -> S1apResult<Vec<u8>> {
-    builder::build_overload_start(&OverloadStart {
-        overload_action: action,
-    })
+    crate::s1ap_gen::build_overload_start(action).map_err(gen_err)
 }
 
 /// Build Overload Stop (TS 36.413 §9.1.8.14)
 pub fn build_overload_stop() -> S1apResult<Vec<u8>> {
-    builder::build_overload_stop(&OverloadStop)
+    crate::s1ap_gen::build_overload_stop().map_err(gen_err)
 }
 
 // ============================================================================
@@ -696,7 +695,7 @@ pub fn build_write_replace_warning(
     sbc_pws: &SbcPwsData,
     warning_tais: &[EpsTai],
 ) -> S1apResult<Vec<u8>> {
-    builder::build_write_replace_warning_request(&WriteReplaceWarningRequest {
+    crate::s1ap_gen::build_write_replace_warning_request(&WriteReplaceWarningRequest {
         message_identifier: sbc_pws.message_id,
         serial_number: sbc_pws.serial_number,
         warning_area: warning_area_from(sbc_pws, warning_tais)?,
@@ -714,11 +713,12 @@ pub fn build_write_replace_warning(
             .then(|| sbc_pws.message_contents.clone()),
         concurrent_warning_message_indicator: sbc_pws.concurrent_warning_message_indicator,
     })
+    .map_err(gen_err)
 }
 
 /// Build a Kill Request for one eNB (TS 36.413 §9.1.13.3).
 pub fn build_kill(sbc_pws: &SbcPwsData, warning_tais: &[EpsTai]) -> S1apResult<Vec<u8>> {
-    builder::build_kill_request(&KillRequest {
+    crate::s1ap_gen::build_kill_request(&KillRequest {
         message_identifier: sbc_pws.message_id,
         serial_number: sbc_pws.serial_number,
         warning_area: warning_area_from(sbc_pws, warning_tais)?,
@@ -727,6 +727,7 @@ pub fn build_kill(sbc_pws: &SbcPwsData, warning_tais: &[EpsTai]) -> S1apResult<V
         // message, so killing them all would cancel unrelated live alerts.
         kill_all_warning_messages: false,
     })
+    .map_err(gen_err)
 }
 
 /// `RepetitionPeriod ::= INTEGER (0..4095)` (TS 36.413 §9.2.1.49)

@@ -3080,6 +3080,951 @@ pub fn build_path_switch_request_failure(
     }))
 }
 
+// ============================================================================
+// The rest (TS 36.413 §8.3.4, §8.6.2.4, §8.7.4, §8.7.6, §8.9, §8.12) -- stage 12
+// ============================================================================
+
+/// `id-NASNonDeliveryIndication`.
+pub const PROC_NAS_NON_DELIVERY_INDICATION: u8 = 16;
+/// `id-UEContextModification`.
+pub const PROC_UE_CONTEXT_MODIFICATION: u8 = 21;
+/// `id-UECapabilityInfoIndication`.
+pub const PROC_UE_CAPABILITY_INFO_INDICATION: u8 = 22;
+/// `id-ENBConfigurationUpdate`.
+pub const PROC_ENB_CONFIGURATION_UPDATE: u8 = 29;
+/// `id-MMEConfigurationUpdate`.
+pub const PROC_MME_CONFIGURATION_UPDATE: u8 = 30;
+/// `id-OverloadStart`.
+pub const PROC_OVERLOAD_START: u8 = 34;
+/// `id-OverloadStop`.
+pub const PROC_OVERLOAD_STOP: u8 = 35;
+/// `id-WriteReplaceWarning`.
+pub const PROC_WRITE_REPLACE_WARNING: u8 = 36;
+/// `id-Kill`.
+pub const PROC_KILL: u8 = 43;
+
+const ID_SUBSCRIBER_PROFILE_ID_FOR_RFP: u16 = 106;
+const ID_UE_RADIO_CAPABILITY: u16 = 74;
+const ID_OVERLOAD_RESPONSE: u16 = 101;
+const ID_CS_FALLBACK_INDICATOR: u16 = 108;
+const ID_MESSAGE_IDENTIFIER: u16 = 111;
+const ID_SERIAL_NUMBER: u16 = 112;
+const ID_WARNING_AREA_LIST: u16 = 113;
+const ID_REPETITION_PERIOD: u16 = 114;
+const ID_NUMBER_OF_BROADCAST_REQUEST: u16 = 115;
+const ID_WARNING_TYPE: u16 = 116;
+const ID_WARNING_SECURITY_INFO: u16 = 117;
+const ID_DATA_CODING_SCHEME: u16 = 118;
+const ID_WARNING_MESSAGE_CONTENTS: u16 = 119;
+const ID_CONCURRENT_WARNING_MESSAGE_INDICATOR: u16 = 142;
+const ID_KILL_ALL_WARNING_MESSAGES: u16 = 191;
+
+/// Encode an ENB CONFIGURATION UPDATE ACKNOWLEDGE (TS 36.413 §9.1.8.8);
+/// `notify` IEs of the update go in its Criticality Diagnostics (§10.3.4.2).
+pub fn build_enb_configuration_update_acknowledge(
+    notify: &[DiagnosedIe],
+) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    use g::ENBConfigurationUpdateAcknowledgeProtocolIEs_EntryValue as V;
+    let mut ies = Vec::new();
+    if !notify.is_empty() {
+        ies.push(g::ENBConfigurationUpdateAcknowledgeProtocolIEs_Entry {
+            id: g::ProtocolIE_ID(ID_CRITICALITY_DIAGNOSTICS),
+            criticality: g::Criticality(IGNORE),
+            value: V::Id_CriticalityDiagnostics(diagnostics_for(
+                PROC_ENB_CONFIGURATION_UPDATE,
+                g::TriggeringMessage::INITIATING_MESSAGE,
+                REJECT,
+                notify,
+            )),
+        });
+    }
+    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+        procedure_code: g::ProcedureCode(PROC_ENB_CONFIGURATION_UPDATE),
+        criticality: g::Criticality(REJECT),
+        value: g::SuccessfulOutcomeValue::Id_ENBConfigurationUpdate(
+            g::ENBConfigurationUpdateAcknowledge {
+                protocol_i_es: g::ENBConfigurationUpdateAcknowledgeProtocolIEs(ies),
+            },
+        ),
+    }))
+}
+
+/// Encode an ENB CONFIGURATION UPDATE FAILURE (TS 36.413 §9.1.8.9): every IE
+/// ignore; `reject` names the update's IEs that caused it.
+pub fn build_enb_configuration_update_failure(
+    cause: Cause,
+    time_to_wait: Option<TimeToWait>,
+    reject: &[DiagnosedIe],
+) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    use g::ENBConfigurationUpdateFailureProtocolIEs_EntryValue as V;
+    let ie = |id: u16, value: V| g::ENBConfigurationUpdateFailureProtocolIEs_Entry {
+        id: g::ProtocolIE_ID(id),
+        criticality: g::Criticality(IGNORE),
+        value,
+    };
+    let mut ies = vec![ie(ID_CAUSE, V::Id_Cause(generated_cause(cause)))];
+    if let Some(ttw) = time_to_wait {
+        ies.push(ie(
+            ID_TIME_TO_WAIT,
+            V::Id_TimeToWait(g::TimeToWait(ttw as u8)),
+        ));
+    }
+    if !reject.is_empty() {
+        ies.push(ie(
+            ID_CRITICALITY_DIAGNOSTICS,
+            V::Id_CriticalityDiagnostics(diagnostics_for(
+                PROC_ENB_CONFIGURATION_UPDATE,
+                g::TriggeringMessage::INITIATING_MESSAGE,
+                REJECT,
+                reject,
+            )),
+        ));
+    }
+    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::UnsuccessfulOutcome(g::UnsuccessfulOutcome {
+        procedure_code: g::ProcedureCode(PROC_ENB_CONFIGURATION_UPDATE),
+        criticality: g::Criticality(REJECT),
+        value: g::UnsuccessfulOutcomeValue::Id_ENBConfigurationUpdate(
+            g::ENBConfigurationUpdateFailure {
+                protocol_i_es: g::ENBConfigurationUpdateFailureProtocolIEs(ies),
+            },
+        ),
+    }))
+}
+
+/// Outcome of decoding an ENB CONFIGURATION UPDATE (TS 36.413 §9.1.8.7), the
+/// initiating message of a Class 1 procedure with a response and a failure.
+#[derive(Debug, Clone)]
+pub enum ConfigUpdateDecode {
+    /// Run the procedure; report `notify` IEs in the acknowledge.
+    Proceed {
+        /// The update, in the handler's existing type.
+        msg: nextgcore_s1ap::EnbConfigurationUpdate,
+        /// IEs to report.
+        notify: Vec<DiagnosedIe>,
+    },
+    /// Answer ENB CONFIGURATION UPDATE FAILURE naming `ies`.
+    Reject(Vec<DiagnosedIe>),
+    /// Not decodable.
+    Undecodable,
+}
+
+fn supported_tas_from(v: g::SupportedTAs) -> Vec<SupportedTaItem> {
+    v.0.into_iter()
+        .filter_map(|item| {
+            Some(SupportedTaItem {
+                tac: u16::from_be_bytes(item.tac.0.as_slice().try_into().ok()?),
+                broadcast_plmns: item
+                    .broadcast_plm_ns
+                    .0
+                    .iter()
+                    .filter_map(|p| plmn(&p.0))
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+fn paging_drx_from(v: &g::PagingDRX) -> PagingDrx {
+    match v.0 {
+        g::PagingDRX::V32 => PagingDrx::V32,
+        g::PagingDRX::V64 => PagingDrx::V64,
+        g::PagingDRX::V256 => PagingDrx::V256,
+        _ => PagingDrx::V128,
+    }
+}
+
+/// Decode an ENB CONFIGURATION UPDATE (TS 36.413 §9.1.8.7). Every IE is
+/// optional; SupportedTAs and CSG-IdList are `reject`, the others `ignore`.
+pub fn decode_enb_configuration_update(bytes: &[u8]) -> ConfigUpdateDecode {
+    let Ok((pdu, unknown)) = nextgcore_s1ap_gen::decode_with_unknown_ies(bytes) else {
+        return ConfigUpdateDecode::Undecodable;
+    };
+    let g::S1AP_PDU::InitiatingMessage(msg) = pdu else {
+        return ConfigUpdateDecode::Undecodable;
+    };
+    let g::InitiatingMessageValue::Id_ENBConfigurationUpdate(m) = msg.value else {
+        return ConfigUpdateDecode::Undecodable;
+    };
+    let (reject, notify) = classify_unknown(&unknown);
+    if !reject.is_empty() {
+        return ConfigUpdateDecode::Reject(reject);
+    }
+    let mut update = nextgcore_s1ap::EnbConfigurationUpdate {
+        enb_name: None,
+        supported_tas: None,
+        default_paging_drx: None,
+    };
+    use g::ENBConfigurationUpdateProtocolIEs_EntryValue as V;
+    for ie in m.protocol_i_es.0 {
+        match ie.value {
+            V::Id_eNBname(v) => update.enb_name = Some(v.0),
+            V::Id_SupportedTAs(v) => update.supported_tas = Some(supported_tas_from(v)),
+            V::Id_DefaultPagingDRX(v) => update.default_paging_drx = Some(paging_drx_from(&v)),
+            // CSG list, NB-IoT DRX, connected en-gNBs: understood, not used.
+            _ => {}
+        }
+    }
+    ConfigUpdateDecode::Proceed {
+        msg: update,
+        notify,
+    }
+}
+
+/// Encode a UE CONTEXT MODIFICATION REQUEST (TS 36.413 §9.1.4.6). IE order
+/// follows `UEContextModificationRequestIEs`; Subscriber Profile ID and UE
+/// AMBR are `ignore`, every other IE `reject`; procedure criticality reject.
+pub fn build_ue_context_modification_request(
+    msg: &nextgcore_s1ap::UeContextModificationRequest,
+) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    use g::UEContextModificationRequestProtocolIEs_EntryValue as V;
+    let ie =
+        |id: u16, criticality: u8, value: V| g::UEContextModificationRequestProtocolIEs_Entry {
+            id: g::ProtocolIE_ID(id),
+            criticality: g::Criticality(criticality),
+            value,
+        };
+    let mut ies = vec![
+        ie(
+            ID_MME_UE_S1AP_ID,
+            REJECT,
+            V::Id_MME_UE_S1AP_ID(g::MME_UE_S1AP_ID(msg.mme_ue_s1ap_id)),
+        ),
+        ie(
+            ID_ENB_UE_S1AP_ID,
+            REJECT,
+            V::Id_eNB_UE_S1AP_ID(g::ENB_UE_S1AP_ID(msg.enb_ue_s1ap_id)),
+        ),
+    ];
+    if let Some(key) = &msg.security_key {
+        ies.push(ie(
+            ID_SECURITY_KEY,
+            REJECT,
+            V::Id_SecurityKey(g::SecurityKey(bytes_to_bits(key))),
+        ));
+    }
+    if let Some(spid) = msg.subscriber_profile_id_for_rfp {
+        ies.push(ie(
+            ID_SUBSCRIBER_PROFILE_ID_FOR_RFP,
+            IGNORE,
+            V::Id_SubscriberProfileIDforRFP(g::SubscriberProfileIDforRFP(spid)),
+        ));
+    }
+    if let Some(a) = &msg.ue_ambr {
+        ies.push(ie(
+            ID_UE_AMBR,
+            IGNORE,
+            V::Id_uEaggregateMaximumBitrate(ambr(a)),
+        ));
+    }
+    if let Some(csfb) = msg.cs_fallback_indicator {
+        ies.push(ie(
+            ID_CS_FALLBACK_INDICATOR,
+            REJECT,
+            V::Id_CSFallbackIndicator(g::CSFallbackIndicator(match csfb {
+                nextgcore_s1ap::CsFallbackIndicator::CsFallbackRequired => {
+                    g::CSFallbackIndicator::CS_FALLBACK_REQUIRED
+                }
+                nextgcore_s1ap::CsFallbackIndicator::CsFallbackHighPriority => {
+                    g::CSFallbackIndicator::CS_FALLBACK_HIGH_PRIORITY
+                }
+            })),
+        ));
+    }
+    if let Some(sec) = &msg.ue_security_capabilities {
+        ies.push(ie(
+            ID_UE_SECURITY_CAPABILITIES,
+            REJECT,
+            V::Id_UESecurityCapabilities(g::UESecurityCapabilities {
+                encryption_algorithms: g::EncryptionAlgorithms(bytes_to_bits(
+                    &sec.encryption_algorithms.to_be_bytes(),
+                )),
+                integrity_protection_algorithms: g::IntegrityProtectionAlgorithms(bytes_to_bits(
+                    &sec.integrity_algorithms.to_be_bytes(),
+                )),
+                ie_extensions: None,
+            }),
+        ));
+    }
+    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+        procedure_code: g::ProcedureCode(PROC_UE_CONTEXT_MODIFICATION),
+        criticality: g::Criticality(REJECT),
+        value: g::InitiatingMessageValue::Id_UEContextModification(
+            g::UEContextModificationRequest {
+                protocol_i_es: g::UEContextModificationRequestProtocolIEs(ies),
+            },
+        ),
+    }))
+}
+
+/// Encode an OVERLOAD START (TS 36.413 §9.1.8.13): Overload Response `reject`;
+/// procedure criticality ignore.
+pub fn build_overload_start(
+    action: nextgcore_s1ap::OverloadAction,
+) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+        procedure_code: g::ProcedureCode(PROC_OVERLOAD_START),
+        criticality: g::Criticality(IGNORE),
+        value: g::InitiatingMessageValue::Id_OverloadStart(g::OverloadStart {
+            protocol_i_es: g::OverloadStartProtocolIEs(vec![g::OverloadStartProtocolIEs_Entry {
+                id: g::ProtocolIE_ID(ID_OVERLOAD_RESPONSE),
+                criticality: g::Criticality(REJECT),
+                value: g::OverloadStartProtocolIEs_EntryValue::Id_OverloadResponse(
+                    g::OverloadResponse::OverloadAction(g::OverloadAction(action as u8)),
+                ),
+            }]),
+        }),
+    }))
+}
+
+/// Encode an OVERLOAD STOP (TS 36.413 §9.1.8.14): no IEs; procedure
+/// criticality reject.
+pub fn build_overload_stop() -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+        procedure_code: g::ProcedureCode(PROC_OVERLOAD_STOP),
+        criticality: g::Criticality(REJECT),
+        value: g::InitiatingMessageValue::Id_OverloadStop(g::OverloadStop {
+            protocol_i_es: g::OverloadStopProtocolIEs(vec![]),
+        }),
+    }))
+}
+
+fn warning_area(a: &nextgcore_s1ap::WarningAreaList) -> g::WarningAreaList {
+    use nextgcore_s1ap::WarningAreaList as W;
+    match a {
+        W::CellIdList(cells) => g::WarningAreaList::CellIDList(g::ECGIList(
+            cells
+                .iter()
+                .map(|c| g::EUTRAN_CGI {
+                    plm_nidentity: g::TBCD_STRING(c.plmn_identity.to_vec()),
+                    cell_id: g::CellIdentity(u32_to_bits(c.cell_identity, 28)),
+                    ie_extensions: None,
+                })
+                .collect(),
+        )),
+        W::TrackingAreaListForWarning(tais) => {
+            g::WarningAreaList::TrackingAreaListforWarning(g::TAIListforWarning(
+                tais.iter()
+                    .map(|t| g::TAI {
+                        plm_nidentity: g::TBCD_STRING(t.plmn_identity.to_vec()),
+                        tac: g::TAC(t.tac.to_be_bytes().to_vec()),
+                        ie_extensions: None,
+                    })
+                    .collect(),
+            ))
+        }
+        W::EmergencyAreaIdList(ids) => g::WarningAreaList::EmergencyAreaIDList(
+            g::EmergencyAreaIDList(ids.iter().map(|i| g::EmergencyAreaID(i.to_vec())).collect()),
+        ),
+    }
+}
+
+fn bits16(v: u16) -> BitVec<u8, Msb0> {
+    bytes_to_bits(&v.to_be_bytes())
+}
+
+/// Encode a WRITE-REPLACE WARNING REQUEST (TS 36.413 §9.1.13.1). IE order
+/// follows `WriteReplaceWarningRequestIEs`; the area, warning type, security
+/// info, coding scheme and contents are `ignore`, the others `reject`;
+/// procedure criticality reject.
+pub fn build_write_replace_warning_request(
+    msg: &nextgcore_s1ap::WriteReplaceWarningRequest,
+) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    use g::WriteReplaceWarningRequestProtocolIEs_EntryValue as V;
+    let ie = |id: u16, criticality: u8, value: V| g::WriteReplaceWarningRequestProtocolIEs_Entry {
+        id: g::ProtocolIE_ID(id),
+        criticality: g::Criticality(criticality),
+        value,
+    };
+    let mut ies = vec![
+        ie(
+            ID_MESSAGE_IDENTIFIER,
+            REJECT,
+            V::Id_MessageIdentifier(g::MessageIdentifier(bits16(msg.message_identifier))),
+        ),
+        ie(
+            ID_SERIAL_NUMBER,
+            REJECT,
+            V::Id_SerialNumber(g::SerialNumber(bits16(msg.serial_number))),
+        ),
+    ];
+    if let Some(area) = &msg.warning_area {
+        ies.push(ie(
+            ID_WARNING_AREA_LIST,
+            IGNORE,
+            V::Id_WarningAreaList(warning_area(area)),
+        ));
+    }
+    ies.push(ie(
+        ID_REPETITION_PERIOD,
+        REJECT,
+        V::Id_RepetitionPeriod(g::RepetitionPeriod(msg.repetition_period)),
+    ));
+    ies.push(ie(
+        ID_NUMBER_OF_BROADCAST_REQUEST,
+        REJECT,
+        V::Id_NumberofBroadcastRequest(g::NumberofBroadcastRequest(
+            msg.number_of_broadcast_request,
+        )),
+    ));
+    if let Some(t) = msg.warning_type {
+        ies.push(ie(
+            ID_WARNING_TYPE,
+            IGNORE,
+            V::Id_WarningType(g::WarningType(t.to_vec())),
+        ));
+    }
+    if let Some(info) = &msg.warning_security_info {
+        ies.push(ie(
+            ID_WARNING_SECURITY_INFO,
+            IGNORE,
+            V::Id_WarningSecurityInfo(g::WarningSecurityInfo(info.to_vec())),
+        ));
+    }
+    if let Some(dcs) = msg.data_coding_scheme {
+        ies.push(ie(
+            ID_DATA_CODING_SCHEME,
+            IGNORE,
+            V::Id_DataCodingScheme(g::DataCodingScheme(bytes_to_bits(&[dcs]))),
+        ));
+    }
+    if let Some(contents) = &msg.warning_message_contents {
+        ies.push(ie(
+            ID_WARNING_MESSAGE_CONTENTS,
+            IGNORE,
+            V::Id_WarningMessageContents(g::WarningMessageContents(contents.clone())),
+        ));
+    }
+    if msg.concurrent_warning_message_indicator {
+        ies.push(ie(
+            ID_CONCURRENT_WARNING_MESSAGE_INDICATOR,
+            REJECT,
+            V::Id_ConcurrentWarningMessageIndicator(g::ConcurrentWarningMessageIndicator(
+                g::ConcurrentWarningMessageIndicator::TRUE,
+            )),
+        ));
+    }
+    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+        procedure_code: g::ProcedureCode(PROC_WRITE_REPLACE_WARNING),
+        criticality: g::Criticality(REJECT),
+        value: g::InitiatingMessageValue::Id_WriteReplaceWarning(g::WriteReplaceWarningRequest {
+            protocol_i_es: g::WriteReplaceWarningRequestProtocolIEs(ies),
+        }),
+    }))
+}
+
+/// Encode a KILL REQUEST (TS 36.413 §9.1.13.3): the area `ignore`, the others
+/// `reject`; procedure criticality reject.
+pub fn build_kill_request(
+    msg: &nextgcore_s1ap::KillRequest,
+) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    use g::KillRequestProtocolIEs_EntryValue as V;
+    let ie = |id: u16, criticality: u8, value: V| g::KillRequestProtocolIEs_Entry {
+        id: g::ProtocolIE_ID(id),
+        criticality: g::Criticality(criticality),
+        value,
+    };
+    let mut ies = vec![
+        ie(
+            ID_MESSAGE_IDENTIFIER,
+            REJECT,
+            V::Id_MessageIdentifier(g::MessageIdentifier(bits16(msg.message_identifier))),
+        ),
+        ie(
+            ID_SERIAL_NUMBER,
+            REJECT,
+            V::Id_SerialNumber(g::SerialNumber(bits16(msg.serial_number))),
+        ),
+    ];
+    if let Some(area) = &msg.warning_area {
+        ies.push(ie(
+            ID_WARNING_AREA_LIST,
+            IGNORE,
+            V::Id_WarningAreaList(warning_area(area)),
+        ));
+    }
+    if msg.kill_all_warning_messages {
+        ies.push(ie(
+            ID_KILL_ALL_WARNING_MESSAGES,
+            REJECT,
+            V::Id_KillAllWarningMessages(g::KillAllWarningMessages(
+                g::KillAllWarningMessages::TRUE,
+            )),
+        ));
+    }
+    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+        procedure_code: g::ProcedureCode(PROC_KILL),
+        criticality: g::Criticality(REJECT),
+        value: g::InitiatingMessageValue::Id_Kill(g::KillRequest {
+            protocol_i_es: g::KillRequestProtocolIEs(ies),
+        }),
+    }))
+}
+
+/// Decode a NAS NON DELIVERY INDICATION (TS 36.413 §9.1.7.5), Class 2. The UE
+/// IDs are `reject`; NAS-PDU and Cause are `ignore` (missing → empty /
+/// radioNetwork-unspecified).
+pub fn decode_nas_non_delivery_indication(
+    bytes: &[u8],
+) -> Class2Decode<nextgcore_s1ap::NasNonDeliveryIndication> {
+    let Ok((pdu, unknown)) = nextgcore_s1ap_gen::decode_with_unknown_ies(bytes) else {
+        return Class2Decode::Undecodable;
+    };
+    let g::S1AP_PDU::InitiatingMessage(msg) = pdu else {
+        return Class2Decode::Undecodable;
+    };
+    let g::InitiatingMessageValue::Id_NASNonDeliveryIndication(m) = msg.value else {
+        return Class2Decode::Undecodable;
+    };
+    let (mut reject, notify) = classify_unknown(&unknown);
+    let (mut mme, mut enb, mut nas, mut cause) = (None, None, None, None);
+    use g::NASNonDeliveryIndicationProtocolIEs_EntryValue as V;
+    for ie in m.protocol_i_es.0 {
+        match ie.value {
+            V::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
+            V::Id_eNB_UE_S1AP_ID(v) => enb = Some(v.0),
+            V::Id_NAS_PDU(v) => nas = Some(v.0),
+            V::Id_Cause(c) => cause = hand_written_cause(&c),
+        }
+    }
+    missing(&mut reject, mme.is_some(), ID_MME_UE_S1AP_ID);
+    missing(&mut reject, enb.is_some(), ID_ENB_UE_S1AP_ID);
+    if !reject.is_empty() {
+        return Class2Decode::Reject {
+            ies: reject,
+            enb_ue_s1ap_id: enb,
+            mme_ue_s1ap_id: mme,
+        };
+    }
+    let (Some(mme_ue_s1ap_id), Some(enb_ue_s1ap_id)) = (mme, enb) else {
+        return Class2Decode::Undecodable;
+    };
+    Class2Decode::Proceed {
+        msg: nextgcore_s1ap::NasNonDeliveryIndication {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id,
+            nas_pdu: nas.unwrap_or_default(),
+            cause: cause.unwrap_or(Cause::RadioNetwork(
+                nextgcore_s1ap::CauseRadioNetwork::Unspecified,
+            )),
+        },
+        notify,
+    }
+}
+
+/// Decode a UE CAPABILITY INFO INDICATION (TS 36.413 §9.1.10), Class 2. The UE
+/// IDs are `reject`; UE Radio Capability is `ignore` — missing, the indication
+/// carries nothing to store and is `Undecodable`.
+pub fn decode_ue_capability_info_indication(
+    bytes: &[u8],
+) -> Class2Decode<nextgcore_s1ap::UeCapabilityInfoIndication> {
+    let Ok((pdu, unknown)) = nextgcore_s1ap_gen::decode_with_unknown_ies(bytes) else {
+        return Class2Decode::Undecodable;
+    };
+    let g::S1AP_PDU::InitiatingMessage(msg) = pdu else {
+        return Class2Decode::Undecodable;
+    };
+    let g::InitiatingMessageValue::Id_UECapabilityInfoIndication(m) = msg.value else {
+        return Class2Decode::Undecodable;
+    };
+    let (mut reject, notify) = classify_unknown(&unknown);
+    let (mut mme, mut enb, mut cap) = (None, None, None);
+    use g::UECapabilityInfoIndicationProtocolIEs_EntryValue as V;
+    for ie in m.protocol_i_es.0 {
+        match ie.value {
+            V::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
+            V::Id_eNB_UE_S1AP_ID(v) => enb = Some(v.0),
+            V::Id_UERadioCapability(v) => cap = Some(v.0),
+            _ => {}
+        }
+    }
+    missing(&mut reject, mme.is_some(), ID_MME_UE_S1AP_ID);
+    missing(&mut reject, enb.is_some(), ID_ENB_UE_S1AP_ID);
+    if !reject.is_empty() {
+        return Class2Decode::Reject {
+            ies: reject,
+            enb_ue_s1ap_id: enb,
+            mme_ue_s1ap_id: mme,
+        };
+    }
+    let (Some(mme_ue_s1ap_id), Some(enb_ue_s1ap_id), Some(ue_radio_capability)) = (mme, enb, cap)
+    else {
+        return Class2Decode::Undecodable;
+    };
+    Class2Decode::Proceed {
+        msg: nextgcore_s1ap::UeCapabilityInfoIndication {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id,
+            ue_radio_capability,
+        },
+        notify,
+    }
+}
+
+/// Decode a RESET ACKNOWLEDGE (TS 36.413 §9.1.8.2), a response: its IEs are
+/// optional `ignore`.
+pub fn decode_reset_acknowledge(bytes: &[u8]) -> ResponseDecode<nextgcore_s1ap::ResetAcknowledge> {
+    let Some((g::SuccessfulOutcomeValue::Id_Reset(ack), unknown)) = successful_outcome(bytes)
+    else {
+        return ResponseDecode::Undecodable;
+    };
+    let (reject, notify) = classify_unknown(&unknown);
+    if !reject.is_empty() {
+        return ResponseDecode::Failed(reject);
+    }
+    let mut ue_associated_connections = Vec::new();
+    use g::ResetAcknowledgeProtocolIEs_EntryValue as V;
+    for ie in ack.protocol_i_es.0 {
+        if let V::Id_UE_associatedLogicalS1_ConnectionListResAck(list) = ie.value {
+            for e in list.0 {
+                let g::UE_associatedLogicalS1_ConnectionListResAck_EntryValue::Id_UE_associatedLogicalS1_ConnectionItem(i) = e.value;
+                ue_associated_connections.push(nextgcore_s1ap::UeAssociatedLogicalS1Connection {
+                    mme_ue_s1ap_id: i.mme_ue_s1ap_id.map(|v| v.0),
+                    enb_ue_s1ap_id: i.enb_ue_s1ap_id.map(|v| v.0),
+                });
+            }
+        }
+    }
+    ResponseDecode::Decoded {
+        msg: nextgcore_s1ap::ResetAcknowledge {
+            ue_associated_connections,
+        },
+        notify,
+    }
+}
+
+/// Decode an MME CONFIGURATION UPDATE ACKNOWLEDGE (TS 36.413 §9.1.8.11), a
+/// response: its one IE is optional `ignore`.
+pub fn decode_mme_configuration_update_acknowledge(bytes: &[u8]) -> ResponseDecode<()> {
+    let Some((g::SuccessfulOutcomeValue::Id_MMEConfigurationUpdate(_), unknown)) =
+        successful_outcome(bytes)
+    else {
+        return ResponseDecode::Undecodable;
+    };
+    let (reject, notify) = classify_unknown(&unknown);
+    if !reject.is_empty() {
+        return ResponseDecode::Failed(reject);
+    }
+    ResponseDecode::Decoded { msg: (), notify }
+}
+
+fn unsuccessful_outcome(bytes: &[u8]) -> Option<(g::UnsuccessfulOutcomeValue, Vec<UnknownIe>)> {
+    let (pdu, unknown) = nextgcore_s1ap_gen::decode_with_unknown_ies(bytes).ok()?;
+    let g::S1AP_PDU::UnsuccessfulOutcome(msg) = pdu else {
+        return None;
+    };
+    Some((msg.value, unknown))
+}
+
+/// Decode an MME CONFIGURATION UPDATE FAILURE (TS 36.413 §9.1.8.12), a
+/// response: every IE `ignore` (missing Cause → radioNetwork / unspecified).
+pub fn decode_mme_configuration_update_failure(
+    bytes: &[u8],
+) -> ResponseDecode<nextgcore_s1ap::MmeConfigurationUpdateFailure> {
+    let Some((g::UnsuccessfulOutcomeValue::Id_MMEConfigurationUpdate(f), unknown)) =
+        unsuccessful_outcome(bytes)
+    else {
+        return ResponseDecode::Undecodable;
+    };
+    let (reject, notify) = classify_unknown(&unknown);
+    if !reject.is_empty() {
+        return ResponseDecode::Failed(reject);
+    }
+    let (mut cause, mut time_to_wait, mut diag) = (None, None, None);
+    use g::MMEConfigurationUpdateFailureProtocolIEs_EntryValue as V;
+    for ie in f.protocol_i_es.0 {
+        match ie.value {
+            V::Id_Cause(c) => cause = hand_written_cause(&c),
+            V::Id_TimeToWait(t) => time_to_wait = time_to_wait_from(t.0),
+            V::Id_CriticalityDiagnostics(d) => diag = Some(hand_written_diagnostics(&d)),
+        }
+    }
+    ResponseDecode::Decoded {
+        msg: nextgcore_s1ap::MmeConfigurationUpdateFailure {
+            cause: cause.unwrap_or(Cause::RadioNetwork(
+                nextgcore_s1ap::CauseRadioNetwork::Unspecified,
+            )),
+            time_to_wait,
+            criticality_diagnostics: diag,
+        },
+        notify,
+    }
+}
+
+fn time_to_wait_from(v: u8) -> Option<TimeToWait> {
+    Some(match v {
+        0 => TimeToWait::V1s,
+        1 => TimeToWait::V2s,
+        2 => TimeToWait::V5s,
+        3 => TimeToWait::V10s,
+        4 => TimeToWait::V20s,
+        5 => TimeToWait::V60s,
+        _ => return None,
+    })
+}
+
+/// Decode a UE CONTEXT MODIFICATION RESPONSE (TS 36.413 §9.1.4.7), a
+/// response: every IE `ignore`; one naming no MME-UE-S1AP-ID is
+/// `Undecodable`.
+pub fn decode_ue_context_modification_response(
+    bytes: &[u8],
+) -> ResponseDecode<nextgcore_s1ap::UeContextModificationResponse> {
+    let Some((g::SuccessfulOutcomeValue::Id_UEContextModification(r), unknown)) =
+        successful_outcome(bytes)
+    else {
+        return ResponseDecode::Undecodable;
+    };
+    let (reject, notify) = classify_unknown(&unknown);
+    if !reject.is_empty() {
+        return ResponseDecode::Failed(reject);
+    }
+    let (mut mme, mut enb, mut diag) = (None, None, None);
+    use g::UEContextModificationResponseProtocolIEs_EntryValue as V;
+    for ie in r.protocol_i_es.0 {
+        match ie.value {
+            V::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
+            V::Id_eNB_UE_S1AP_ID(v) => enb = Some(v.0),
+            V::Id_CriticalityDiagnostics(d) => diag = Some(hand_written_diagnostics(&d)),
+        }
+    }
+    let Some(mme_ue_s1ap_id) = mme else {
+        return ResponseDecode::Undecodable;
+    };
+    ResponseDecode::Decoded {
+        msg: nextgcore_s1ap::UeContextModificationResponse {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id: enb.unwrap_or(0),
+            criticality_diagnostics: diag,
+        },
+        notify,
+    }
+}
+
+/// Decode a UE CONTEXT MODIFICATION FAILURE (TS 36.413 §9.1.4.8), a
+/// response: every IE `ignore`.
+pub fn decode_ue_context_modification_failure(
+    bytes: &[u8],
+) -> ResponseDecode<nextgcore_s1ap::UeContextModificationFailure> {
+    let Some((g::UnsuccessfulOutcomeValue::Id_UEContextModification(f), unknown)) =
+        unsuccessful_outcome(bytes)
+    else {
+        return ResponseDecode::Undecodable;
+    };
+    let (reject, notify) = classify_unknown(&unknown);
+    if !reject.is_empty() {
+        return ResponseDecode::Failed(reject);
+    }
+    let (mut mme, mut enb, mut cause, mut diag) = (None, None, None, None);
+    use g::UEContextModificationFailureProtocolIEs_EntryValue as V;
+    for ie in f.protocol_i_es.0 {
+        match ie.value {
+            V::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
+            V::Id_eNB_UE_S1AP_ID(v) => enb = Some(v.0),
+            V::Id_Cause(c) => cause = hand_written_cause(&c),
+            V::Id_CriticalityDiagnostics(d) => diag = Some(hand_written_diagnostics(&d)),
+        }
+    }
+    let Some(mme_ue_s1ap_id) = mme else {
+        return ResponseDecode::Undecodable;
+    };
+    ResponseDecode::Decoded {
+        msg: nextgcore_s1ap::UeContextModificationFailure {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id: enb.unwrap_or(0),
+            cause: cause.unwrap_or(Cause::RadioNetwork(
+                nextgcore_s1ap::CauseRadioNetwork::Unspecified,
+            )),
+            criticality_diagnostics: diag,
+        },
+        notify,
+    }
+}
+
+fn ecgi_from(v: &g::EUTRAN_CGI) -> Option<EutranCgi> {
+    cgi_from(v)
+}
+
+fn u16_bits(b: &BitVec<u8, Msb0>) -> Option<u16> {
+    u16_from(bits_to_bytes(b).get(..2)?)
+}
+
+fn eai(v: &g::EmergencyAreaID) -> Option<[u8; 3]> {
+    v.0.as_slice().try_into().ok()
+}
+
+fn completed_area(
+    a: g::BroadcastCompletedAreaList,
+) -> Option<nextgcore_s1ap::BroadcastCompletedAreaList> {
+    use nextgcore_s1ap::BroadcastCompletedAreaList as B;
+    Some(match a {
+        g::BroadcastCompletedAreaList::CellID_Broadcast(l) => B::CellIdBroadcast(
+            l.0.iter()
+                .map(|i| ecgi_from(&i.ecgi))
+                .collect::<Option<_>>()?,
+        ),
+        g::BroadcastCompletedAreaList::TAI_Broadcast(l) => B::TaiBroadcast(
+            l.0.iter()
+                .map(|i| {
+                    Some(nextgcore_s1ap::TaiBroadcastItem {
+                        tai: tai_from(&i.tai)?,
+                        completed_cells: i
+                            .completed_cellin_tai
+                            .0
+                            .iter()
+                            .map(|c| ecgi_from(&c.ecgi))
+                            .collect::<Option<_>>()?,
+                    })
+                })
+                .collect::<Option<_>>()?,
+        ),
+        g::BroadcastCompletedAreaList::EmergencyAreaID_Broadcast(l) => B::EmergencyAreaIdBroadcast(
+            l.0.iter()
+                .map(|i| {
+                    Some(nextgcore_s1ap::EmergencyAreaIdBroadcastItem {
+                        emergency_area_id: eai(&i.emergency_area_id)?,
+                        completed_cells: i
+                            .completed_cellin_eai
+                            .0
+                            .iter()
+                            .map(|c| ecgi_from(&c.ecgi))
+                            .collect::<Option<_>>()?,
+                    })
+                })
+                .collect::<Option<_>>()?,
+        ),
+    })
+}
+
+fn cancelled_cell(
+    ecgi: &g::EUTRAN_CGI,
+    n: &g::NumberOfBroadcasts,
+) -> Option<nextgcore_s1ap::CellIdCancelledItem> {
+    Some(nextgcore_s1ap::CellIdCancelledItem {
+        ecgi: ecgi_from(ecgi)?,
+        number_of_broadcasts: n.0,
+    })
+}
+
+fn cancelled_area(
+    a: g::BroadcastCancelledAreaList,
+) -> Option<nextgcore_s1ap::BroadcastCancelledAreaList> {
+    use nextgcore_s1ap::BroadcastCancelledAreaList as B;
+    Some(match a {
+        g::BroadcastCancelledAreaList::CellID_Cancelled(l) => B::CellIdCancelled(
+            l.0.iter()
+                .map(|i| cancelled_cell(&i.ecgi, &i.number_of_broadcasts))
+                .collect::<Option<_>>()?,
+        ),
+        g::BroadcastCancelledAreaList::TAI_Cancelled(l) => B::TaiCancelled(
+            l.0.iter()
+                .map(|i| {
+                    Some(nextgcore_s1ap::TaiCancelledItem {
+                        tai: tai_from(&i.tai)?,
+                        cancelled_cells: i
+                            .cancelled_cellin_tai
+                            .0
+                            .iter()
+                            .map(|c| cancelled_cell(&c.ecgi, &c.number_of_broadcasts))
+                            .collect::<Option<_>>()?,
+                    })
+                })
+                .collect::<Option<_>>()?,
+        ),
+        g::BroadcastCancelledAreaList::EmergencyAreaID_Cancelled(l) => B::EmergencyAreaIdCancelled(
+            l.0.iter()
+                .map(|i| {
+                    Some(nextgcore_s1ap::EmergencyAreaIdCancelledItem {
+                        emergency_area_id: eai(&i.emergency_area_id)?,
+                        cancelled_cells: i
+                            .cancelled_cellin_eai
+                            .0
+                            .iter()
+                            .map(|c| cancelled_cell(&c.ecgi, &c.number_of_broadcasts))
+                            .collect::<Option<_>>()?,
+                    })
+                })
+                .collect::<Option<_>>()?,
+        ),
+    })
+}
+
+/// Decode a WRITE-REPLACE WARNING RESPONSE (TS 36.413 §9.1.13.2), a response:
+/// Message Identifier and Serial Number are `reject` (missing → handled
+/// locally); the completed area list and diagnostics `ignore`.
+pub fn decode_write_replace_warning_response(
+    bytes: &[u8],
+) -> ResponseDecode<nextgcore_s1ap::WriteReplaceWarningResponse> {
+    let Some((g::SuccessfulOutcomeValue::Id_WriteReplaceWarning(r), unknown)) =
+        successful_outcome(bytes)
+    else {
+        return ResponseDecode::Undecodable;
+    };
+    let (mut reject, notify) = classify_unknown(&unknown);
+    let (mut mid, mut sn, mut area, mut diag) = (None, None, None, None);
+    use g::WriteReplaceWarningResponseProtocolIEs_EntryValue as V;
+    for ie in r.protocol_i_es.0 {
+        match ie.value {
+            V::Id_MessageIdentifier(v) => mid = u16_bits(&v.0),
+            V::Id_SerialNumber(v) => sn = u16_bits(&v.0),
+            V::Id_BroadcastCompletedAreaList(a) => area = completed_area(a),
+            V::Id_CriticalityDiagnostics(d) => diag = Some(hand_written_diagnostics(&d)),
+        }
+    }
+    missing(&mut reject, mid.is_some(), ID_MESSAGE_IDENTIFIER);
+    missing(&mut reject, sn.is_some(), ID_SERIAL_NUMBER);
+    if !reject.is_empty() {
+        return ResponseDecode::Failed(reject);
+    }
+    let (Some(message_identifier), Some(serial_number)) = (mid, sn) else {
+        return ResponseDecode::Undecodable;
+    };
+    ResponseDecode::Decoded {
+        msg: nextgcore_s1ap::WriteReplaceWarningResponse {
+            message_identifier,
+            serial_number,
+            broadcast_completed_area: area,
+            criticality_diagnostics: diag,
+        },
+        notify,
+    }
+}
+
+/// Decode a KILL RESPONSE (TS 36.413 §9.1.13.4), a response: Message
+/// Identifier and Serial Number are `reject`; the cancelled area list and
+/// diagnostics `ignore`.
+pub fn decode_kill_response(bytes: &[u8]) -> ResponseDecode<nextgcore_s1ap::KillResponse> {
+    let Some((g::SuccessfulOutcomeValue::Id_Kill(r), unknown)) = successful_outcome(bytes) else {
+        return ResponseDecode::Undecodable;
+    };
+    let (mut reject, notify) = classify_unknown(&unknown);
+    let (mut mid, mut sn, mut area, mut diag) = (None, None, None, None);
+    use g::KillResponseProtocolIEs_EntryValue as V;
+    for ie in r.protocol_i_es.0 {
+        match ie.value {
+            V::Id_MessageIdentifier(v) => mid = u16_bits(&v.0),
+            V::Id_SerialNumber(v) => sn = u16_bits(&v.0),
+            V::Id_BroadcastCancelledAreaList(a) => area = cancelled_area(a),
+            V::Id_CriticalityDiagnostics(d) => diag = Some(hand_written_diagnostics(&d)),
+        }
+    }
+    missing(&mut reject, mid.is_some(), ID_MESSAGE_IDENTIFIER);
+    missing(&mut reject, sn.is_some(), ID_SERIAL_NUMBER);
+    if !reject.is_empty() {
+        return ResponseDecode::Failed(reject);
+    }
+    let (Some(message_identifier), Some(serial_number)) = (mid, sn) else {
+        return ResponseDecode::Undecodable;
+    };
+    ResponseDecode::Decoded {
+        msg: nextgcore_s1ap::KillResponse {
+            message_identifier,
+            serial_number,
+            broadcast_cancelled_area: area,
+            criticality_diagnostics: diag,
+        },
+        notify,
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -3106,6 +4051,9 @@ mod reset_tests;
 
 #[cfg(test)]
 mod path_switch_tests;
+
+#[cfg(test)]
+mod rest_tests;
 
 #[cfg(test)]
 mod handover2_tests;

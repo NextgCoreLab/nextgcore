@@ -747,7 +747,232 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
             Class2Decode::Undecodable => {}
         }
     }
-    let message = match decode_s1ap_pdu(data) {
+    // The rest of mmed's S1AP (#514 stage 12) is decoded with the generated
+    // codec; each decode is mapped back onto the handler's existing types and
+    // dispatched through the arms below. Class 2 initiating messages answer
+    // `notify` / `reject` IEs with ERROR INDICATION; responses report `notify`
+    // by ERROR INDICATION and handle a `reject` IE locally.
+    let mut reported: Vec<S1apSend> = Vec::new();
+    let generated: Option<S1apMessage> = {
+        use crate::s1ap_gen::{Class2Decode, ResponseDecode};
+        let response_notify =
+            |reported: &mut Vec<S1apSend>,
+             proc_code: u8,
+             successful: bool,
+             mme_ue_s1ap_id: Option<u32>,
+             notify: &[crate::s1ap_gen::DiagnosedIe]| {
+                if !notify.is_empty() {
+                    reported.extend(error_indication_with_diagnostics(
+                        enb_id,
+                        None,
+                        mme_ue_s1ap_id,
+                        S1apCauseGroup::Protocol,
+                        protocol_cause::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+                        Some(crate::s1ap_gen::error_indication_diagnostics_for(
+                            proc_code,
+                            if successful {
+                                nextgcore_s1ap::triggering_message::SUCCESSFUL_OUTCOME
+                            } else {
+                                nextgcore_s1ap::triggering_message::UNSUCCESSFUL_OUTCOME
+                            },
+                            0,
+                            notify,
+                        )),
+                    ));
+                }
+            };
+        macro_rules! response {
+            ($decode:expr, $proc:expr, $successful:expr, $mme:expr, $wrap:expr, $what:literal) => {
+                match $decode {
+                    ResponseDecode::Decoded { msg, notify } => {
+                        response_notify(&mut reported, $proc, $successful, $mme(&msg), &notify);
+                        Some($wrap(msg))
+                    }
+                    ResponseDecode::Failed(ies) => {
+                        log::error!(
+                            concat!($what, " from eNB {} carries a reject IE (TS 36.413 §10.3.4.2); handled locally: {:?}"),
+                            enb_id,
+                            ies
+                        );
+                        return Vec::new();
+                    }
+                    ResponseDecode::Undecodable => None,
+                }
+            };
+        }
+        if crate::s1ap_gen::is_initiating(data, crate::s1ap_gen::PROC_ENB_CONFIGURATION_UPDATE) {
+            // Class 1 with a response and a failure: `notify` IEs go in the
+            // acknowledge, a `reject` IE is answered by the failure.
+            match crate::s1ap_gen::decode_enb_configuration_update(data) {
+                crate::s1ap_gen::ConfigUpdateDecode::Proceed { msg, notify } => {
+                    return handle_enb_configuration_update_reporting(ctx, enb_id, &msg, &notify);
+                }
+                crate::s1ap_gen::ConfigUpdateDecode::Reject(ies) => {
+                    log::error!(
+                        "eNB Configuration Update from eNB {enb_id} rejected (TS 36.413 §10.3.4): {ies:?}"
+                    );
+                    return config_update_failure_with(
+                        enb_id,
+                        S1apCauseGroup::Protocol,
+                        protocol_cause::ABSTRACT_SYNTAX_ERROR_REJECT,
+                        None,
+                        &ies,
+                    );
+                }
+                crate::s1ap_gen::ConfigUpdateDecode::Undecodable => None,
+            }
+        } else if crate::s1ap_gen::is_initiating(
+            data,
+            crate::s1ap_gen::PROC_NAS_NON_DELIVERY_INDICATION,
+        ) {
+            match crate::s1ap_gen::decode_nas_non_delivery_indication(data) {
+                Class2Decode::Proceed { msg, notify } => {
+                    reported.extend(class2_notify(
+                        enb_id,
+                        crate::s1ap_gen::PROC_NAS_NON_DELIVERY_INDICATION,
+                        Some(msg.enb_ue_s1ap_id),
+                        Some(msg.mme_ue_s1ap_id),
+                        &notify,
+                    ));
+                    Some(S1apMessage::NasNonDeliveryIndication(msg))
+                }
+                Class2Decode::Reject {
+                    ies,
+                    enb_ue_s1ap_id,
+                    mme_ue_s1ap_id,
+                } => {
+                    return class2_reject(
+                        enb_id,
+                        crate::s1ap_gen::PROC_NAS_NON_DELIVERY_INDICATION,
+                        enb_ue_s1ap_id,
+                        mme_ue_s1ap_id,
+                        &ies,
+                    );
+                }
+                Class2Decode::Undecodable => None,
+            }
+        } else if crate::s1ap_gen::is_initiating(
+            data,
+            crate::s1ap_gen::PROC_UE_CAPABILITY_INFO_INDICATION,
+        ) {
+            match crate::s1ap_gen::decode_ue_capability_info_indication(data) {
+                Class2Decode::Proceed { msg, notify } => {
+                    reported.extend(class2_notify(
+                        enb_id,
+                        crate::s1ap_gen::PROC_UE_CAPABILITY_INFO_INDICATION,
+                        Some(msg.enb_ue_s1ap_id),
+                        Some(msg.mme_ue_s1ap_id),
+                        &notify,
+                    ));
+                    Some(S1apMessage::UeCapabilityInfoIndication(msg))
+                }
+                Class2Decode::Reject {
+                    ies,
+                    enb_ue_s1ap_id,
+                    mme_ue_s1ap_id,
+                } => {
+                    return class2_reject(
+                        enb_id,
+                        crate::s1ap_gen::PROC_UE_CAPABILITY_INFO_INDICATION,
+                        enb_ue_s1ap_id,
+                        mme_ue_s1ap_id,
+                        &ies,
+                    );
+                }
+                Class2Decode::Undecodable => None,
+            }
+        } else if crate::s1ap_gen::is_outcome(data, true, crate::s1ap_gen::PROC_RESET) {
+            response!(
+                crate::s1ap_gen::decode_reset_acknowledge(data),
+                crate::s1ap_gen::PROC_RESET,
+                true,
+                |_: &nextgcore_s1ap::ResetAcknowledge| None,
+                S1apMessage::ResetAcknowledge,
+                "Reset Acknowledge"
+            )
+        } else if crate::s1ap_gen::is_outcome(
+            data,
+            true,
+            crate::s1ap_gen::PROC_MME_CONFIGURATION_UPDATE,
+        ) {
+            response!(
+                crate::s1ap_gen::decode_mme_configuration_update_acknowledge(data),
+                crate::s1ap_gen::PROC_MME_CONFIGURATION_UPDATE,
+                true,
+                |_: &()| None,
+                |()| S1apMessage::MmeConfigurationUpdateAcknowledge(
+                    nextgcore_s1ap::MmeConfigurationUpdateAcknowledge {
+                        criticality_diagnostics: None,
+                    }
+                ),
+                "MME Configuration Update Acknowledge"
+            )
+        } else if crate::s1ap_gen::is_outcome(
+            data,
+            false,
+            crate::s1ap_gen::PROC_MME_CONFIGURATION_UPDATE,
+        ) {
+            response!(
+                crate::s1ap_gen::decode_mme_configuration_update_failure(data),
+                crate::s1ap_gen::PROC_MME_CONFIGURATION_UPDATE,
+                false,
+                |_: &nextgcore_s1ap::MmeConfigurationUpdateFailure| None,
+                S1apMessage::MmeConfigurationUpdateFailure,
+                "MME Configuration Update Failure"
+            )
+        } else if crate::s1ap_gen::is_outcome(
+            data,
+            true,
+            crate::s1ap_gen::PROC_UE_CONTEXT_MODIFICATION,
+        ) {
+            response!(
+                crate::s1ap_gen::decode_ue_context_modification_response(data),
+                crate::s1ap_gen::PROC_UE_CONTEXT_MODIFICATION,
+                true,
+                |m: &nextgcore_s1ap::UeContextModificationResponse| Some(m.mme_ue_s1ap_id),
+                S1apMessage::UeContextModificationResponse,
+                "UE Context Modification Response"
+            )
+        } else if crate::s1ap_gen::is_outcome(
+            data,
+            false,
+            crate::s1ap_gen::PROC_UE_CONTEXT_MODIFICATION,
+        ) {
+            response!(
+                crate::s1ap_gen::decode_ue_context_modification_failure(data),
+                crate::s1ap_gen::PROC_UE_CONTEXT_MODIFICATION,
+                false,
+                |m: &nextgcore_s1ap::UeContextModificationFailure| Some(m.mme_ue_s1ap_id),
+                S1apMessage::UeContextModificationFailure,
+                "UE Context Modification Failure"
+            )
+        } else if crate::s1ap_gen::is_outcome(
+            data,
+            true,
+            crate::s1ap_gen::PROC_WRITE_REPLACE_WARNING,
+        ) {
+            response!(
+                crate::s1ap_gen::decode_write_replace_warning_response(data),
+                crate::s1ap_gen::PROC_WRITE_REPLACE_WARNING,
+                true,
+                |_: &nextgcore_s1ap::WriteReplaceWarningResponse| None,
+                S1apMessage::WriteReplaceWarningResponse,
+                "Write-Replace Warning Response"
+            )
+        } else if crate::s1ap_gen::is_outcome(data, true, crate::s1ap_gen::PROC_KILL) {
+            response!(
+                crate::s1ap_gen::decode_kill_response(data),
+                crate::s1ap_gen::PROC_KILL,
+                true,
+                |_: &nextgcore_s1ap::KillResponse| None,
+                S1apMessage::KillResponse,
+                "Kill Response"
+            )
+        } else {
+            None
+        }
+    };
+    let message = match generated.map(Ok).unwrap_or_else(|| decode_s1ap_pdu(data)) {
         Ok(message) => message,
         Err(e) => {
             log::error!("Failed to decode S1AP PDU from eNB {enb_id}: {e}");
@@ -770,7 +995,7 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
         }
     };
 
-    match message {
+    reported.extend(match message {
         S1apMessage::S1SetupRequest(msg) => handle_s1_setup_request(ctx, enb_id, &msg),
         S1apMessage::InitialUeMessage(msg) => {
             // TS 36.413 §8.6.2.1: the NAS-PDU IE carries the UE's initial
@@ -970,7 +1195,8 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
                 }),
             )
         }
-    }
+    });
+    reported
 }
 
 fn error_indication(
@@ -1209,6 +1435,18 @@ pub fn handle_enb_configuration_update(
     enb_id: u64,
     msg: &EnbConfigurationUpdate,
 ) -> Vec<S1apSend> {
+    handle_enb_configuration_update_reporting(ctx, enb_id, msg, &[])
+}
+
+/// [`handle_enb_configuration_update`] for an update decoded with the
+/// generated codec (#514 stage 12): `notify` IEs (TS 36.413 §10.3.4.2) are
+/// reported in the acknowledge's Criticality Diagnostics.
+pub fn handle_enb_configuration_update_reporting(
+    ctx: &MmeContext,
+    enb_id: u64,
+    msg: &EnbConfigurationUpdate,
+    notify: &[crate::s1ap_gen::DiagnosedIe],
+) -> Vec<S1apSend> {
     // An update from an eNB that never completed S1 Setup has no configuration
     // to update (TS 36.413 §8.7.4.4).
     if !ctx
@@ -1277,7 +1515,7 @@ pub fn handle_enb_configuration_update(
         log::info!("eNB {enb_id} reports name \"{name}\"");
     }
 
-    match s1ap_build::build_enb_configuration_update_acknowledge() {
+    match crate::s1ap_gen::build_enb_configuration_update_acknowledge(notify) {
         Ok(pdu) => S1apSend::to_origin(enb_id, pdu),
         Err(e) => {
             log::error!("Failed to build eNB Configuration Update Acknowledge: {e}");
@@ -1292,7 +1530,21 @@ fn config_update_failure(
     value: i64,
     ttw: Option<TimeToWait>,
 ) -> Vec<S1apSend> {
-    match s1ap_build::build_enb_configuration_update_failure(group, value, ttw) {
+    config_update_failure_with(enb_id, group, value, ttw, &[])
+}
+
+fn config_update_failure_with(
+    enb_id: u64,
+    group: S1apCauseGroup,
+    value: i64,
+    ttw: Option<TimeToWait>,
+    reject: &[crate::s1ap_gen::DiagnosedIe],
+) -> Vec<S1apSend> {
+    match crate::s1ap_gen::build_enb_configuration_update_failure(
+        s1ap_build::cause_to_s1ap(group, value),
+        ttw,
+        reject,
+    ) {
         Ok(pdu) => S1apSend::to_origin(enb_id, pdu),
         Err(e) => {
             log::error!("Failed to build eNB Configuration Update Failure: {e}");
