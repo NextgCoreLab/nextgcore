@@ -123,6 +123,29 @@ jobs:
       - name: cargo fmt
         run: cd src && cargo fmt --all -- --check
 
+  fuzz-build:
+    name: Fuzz targets build
+    # #587: `src/fuzz` is its own workspace (the cargo-fuzz layout), so neither
+    # `cargo check --workspace` nor `cargo fmt --all` above reaches it, and it had
+    # stopped compiling unnoticed. This keeps every target (NGAP/S1AP/NRPPa/LPP
+    # generated codecs, NAS, GTP, PFCP, Diameter) compiling against the libraries
+    # on every PR. Stable `clippy` rather than `cargo +nightly fuzz build`: it
+    # type-checks the same code without the sanitizer build, so it is cheap.
+    # `--locked` because src/fuzz/Cargo.lock is committed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src/fuzz
+      - name: cargo fmt (fuzz)
+        run: cd src/fuzz && cargo fmt -- --check
+      - name: cargo clippy (fuzz targets)
+        run: cd src/fuzz && cargo clippy --locked --bins -- -D warnings
+
   docker-build:
     name: Docker Build
     # Nightly OR on demand. A disjunction, not a replacement: the dispatch path

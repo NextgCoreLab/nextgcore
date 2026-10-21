@@ -2,7 +2,7 @@
 resolver = "2"
 # The patched sctp-proto (#467) is a [patch.crates-io] path crate, not a member;
 # excluded so its own tests and lints are not counted as this workspace's.
-exclude = ["vendor/sctp-proto"]
+exclude = ["vendor/sctp-proto", "fuzz"]
 
 members = [
     # Library crates (mirrors lib/)
@@ -18,6 +18,8 @@ members = [
     "libs/nextgcore-ngap",
     "libs/nextgcore-ngap-gen",
     "libs/nextgcore-lpp-gen",
+    "libs/nextgcore-nr-rrc-gen",
+    "libs/nextgcore-lte-rrc-gen",
     "libs/nextgcore-nrppa-gen",
     "libs/nextgcore-s1ap",
     "libs/nextgcore-s1ap-gen",
@@ -202,6 +204,8 @@ nextgcore-sctp = { path = "libs/nextgcore-sctp" }
 nextgcore-ngap = { path = "libs/nextgcore-ngap" }
 nextgcore-ngap-gen = { path = "libs/nextgcore-ngap-gen" }
 nextgcore-lpp-gen = { path = "libs/nextgcore-lpp-gen" }
+nextgcore-nr-rrc-gen = { path = "libs/nextgcore-nr-rrc-gen" }
+nextgcore-lte-rrc-gen = { path = "libs/nextgcore-lte-rrc-gen" }
 nextgcore-nrppa-gen = { path = "libs/nextgcore-nrppa-gen" }
 nextgcore-s1ap = { path = "libs/nextgcore-s1ap" }
 nextgcore-s1ap-gen = { path = "libs/nextgcore-s1ap-gen" }

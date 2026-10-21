@@ -486,6 +486,29 @@ pub fn handle_sm_context_status(
     Ok(())
 }
 
+/// Whether a Nudm_UECM DeregistrationNotification reason makes the AMF send its
+/// DEREGISTRATION REQUEST with de-registration type "re-registration required"
+/// (TS 24.501 §9.11.3.20 bit 3).
+///
+/// - `REREGISTRATION_REQUIRED` (TS 29.503 Table 6.2.6.3.3-1): the UDM uses it when
+///   a UDR data-change notification carries `purgeFlag` and
+///   `reRegistrationRequired` both true on the stored `Amf3GppAccessRegistration`
+///   (TS 29.503 §6.2.6.2.2), i.e. the UE has to register again.
+///   The reason exists to say exactly that, so the UE is told to re-register
+///   (#580: it used to be sent "re-registration not required", leaving the UE
+///   deregistered instead of re-registered).
+/// - `UE_INITIAL_REGISTRATION`: unchanged from WSB-4, which asks the UE to
+///   re-register.
+///
+/// No 5GMM cause is set for these: with "re-registration required" the UE
+/// ignores the 5GMM cause IE (TS 24.501 §5.5.2.3.2).
+pub fn dereg_reason_requires_reregistration(reason: DeregistrationReason) -> bool {
+    matches!(
+        reason,
+        DeregistrationReason::UeInitialRegistration | DeregistrationReason::ReregistrationRequired
+    )
+}
+
 /// Handle a Nudm_UECM DeregistrationNotification (TS 29.503 §5.3.2.3.2).
 ///
 /// WSB-4: this now has a real effect. When the notification targets 3GPP
@@ -497,9 +520,8 @@ pub fn handle_sm_context_status(
 /// on the Deregistration Accept / T3522 exhaustion inside the GMM state
 /// machine, exactly like the UE-initiated path.
 ///
-/// `reregistration_required` (TS 23.502 §4.2.2.3.3): the UDM sends
-/// `deregReason == UE_INITIAL_REGISTRATION` when the UE performed an initial
-/// registration in a *new* AMF, so the old AMF must ask the UE to re-register.
+/// `reregistration_required` (TS 23.502 §4.2.2.3.3 step 2, TS 24.501 §5.5.2.3.1):
+/// see [`dereg_reason_requires_reregistration`] for which reasons set it.
 ///
 /// A non-3GPP-access notification is accepted (the SBI callback answers 204)
 /// but not actioned here — this AMF models only the 3GPP-access context.
@@ -519,7 +541,7 @@ pub fn handle_dereg_notify(amf_ue: &AmfUe, data: &DeregistrationData) -> NamfHan
         return Ok(());
     }
 
-    let reregistration_required = data.dereg_reason == DeregistrationReason::UeInitialRegistration;
+    let reregistration_required = dereg_reason_requires_reregistration(data.dereg_reason);
 
     if let Ok(context) = crate::context::amf_self().read() {
         context.network_dereg_add(crate::context::PendingNetworkDereg {

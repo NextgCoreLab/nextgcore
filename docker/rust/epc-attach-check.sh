@@ -25,6 +25,7 @@ COUNT="${2:-20}"
 MME=nextgcore-mme
 ENB=nextgsim-lte-enb
 UE=nextgsim-lte-ue
+PGWU="${EPC_PGWU_CONTAINER:-nextgcore-pgwu}"
 TIMEOUT="${EPC_ATTACH_TIMEOUT:-90}"
 
 # wait_for <container> <extended-regex> <what>
@@ -78,3 +79,21 @@ wait_for "$MME" "Default EPS bearer \\(ebi=${ebi}\\) activated" "MME activated t
 echo "Pinging ${TARGET} x${COUNT} from the UE's default bearer..."
 docker exec "$UE" lte-ue-ping-check "$TARGET" "$COUNT"
 echo "OK: ${COUNT}/${COUNT} echo replies through the default bearer (0% loss)"
+
+# 4. The PGW-U counted that traffic (#581). Its `/metrics` serves the data-plane
+#    counters of the forwarding path itself, so >= COUNT packets each way proves the
+#    echoes crossed upfd's TUN path AND that the counters an operator reads move.
+#    (Before #581 the only view was a log line that never printed under traffic.)
+metric() {
+    docker exec "$PGWU" curl -fsS http://localhost:9090/metrics 2>/dev/null \
+        | awk -v m="$1" '$1 == m { print $2 }'
+}
+ul=$(metric upf_dataplane_ul_packets_total)
+dl=$(metric upf_dataplane_dl_packets_total)
+echo "    PGW-U data plane: UL=${ul:-?} DL=${dl:-?} packets"
+if [ -z "$ul" ] || [ -z "$dl" ] || [ "$ul" -lt "$COUNT" ] || [ "$dl" -lt "$COUNT" ]; then
+    echo "FAIL: PGW-U data-plane counters below ${COUNT} after a ${COUNT}-packet ping"
+    docker exec "$PGWU" curl -fsS http://localhost:9090/metrics 2>/dev/null | grep dataplane || true
+    exit 1
+fi
+echo "OK: PGW-U counted the ping on its TUN path (UL=${ul}, DL=${dl})"
