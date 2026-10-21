@@ -4851,7 +4851,7 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                  ref={sm_context_ref}: prepared, DL tunnel still on the source gNB"
             );
             match resolve_binary_ref(request, &req_body["n2SmInfo"]) {
-                Some(transfer) => eps_to_5gs::handle_prepared(sm_context_ref, &transfer),
+                Some(transfer) => eps_to_5gs::handle_prepared(sm_context_ref, &transfer).await,
                 None => {
                     let response_body = serde_json::json!({ "hoState": "PREPARED" });
                     SbiResponse::with_status(200)

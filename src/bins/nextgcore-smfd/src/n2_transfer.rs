@@ -94,7 +94,7 @@ fn qfi(what: &str, value: u8) -> Result<g::QosFlowIdentifier, TransferError> {
 
 /// A GTP-U endpoint as `UPTransportLayerInformation` (TS 38.413 §9.3.2.2): an
 /// IPv4 Transport Layer Address (32 bits, TS 38.414 §5.1) and the TEID.
-fn gtp_tunnel((teid, address): (u32, [u8; 4])) -> g::UPTransportLayerInformation {
+pub(crate) fn gtp_tunnel((teid, address): (u32, [u8; 4])) -> g::UPTransportLayerInformation {
     let bits = (0..32)
         .map(|i| address[i / 8] & (0x80 >> (i % 8)) != 0)
         .collect();
@@ -576,21 +576,61 @@ pub(crate) fn parse_path_switch_request_transfer(
     endpoint(WHAT, t.dl_ngu_up_tnl_information, qfis)
 }
 
+/// What the SMF reads from a `HandoverRequestAcknowledgeTransfer`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HandoverAck {
+    /// The target NG-RAN's DL N3 endpoint; `qfis` are the QoS flows it
+    /// accepted (its QoS Flow Setup Response List), in order.
+    pub dl: DlEndpoint,
+    /// The accepted QoS flows whose `dataForwardingAccepted` is set.
+    pub forwarding_accepted_qfis: Vec<u8>,
+    /// DL Forwarding UP TNL Information: the one tunnel per PDU session the
+    /// NG-RAN assigns for INDIRECT forwarding (TS 23.502 §4.11.1.2.2.2 step 10).
+    pub dl_forwarding: Option<DlEndpoint>,
+    /// Data Forwarding Response E-RAB List (TS 38.413 §9.3.1.121): one DL
+    /// forwarding tunnel per E-RAB accepted for DIRECT forwarding, as
+    /// `(E-RAB ID, tunnel)`.
+    pub erab_forwarding: Vec<(u8, DlEndpoint)>,
+}
+
 /// `HandoverRequestAcknowledgeTransfer` (TS 38.413 §9.3.4.11): the target
-/// NG-RAN's DL N3 endpoint, and the QoS flows it accepted (its QoS Flow Setup
-/// Response List).
+/// NG-RAN's DL N3 endpoint, the QoS flows it accepted, and the data-forwarding
+/// tunnels it assigned -- per PDU session for indirect forwarding, per E-RAB
+/// for direct forwarding from E-UTRAN (step 10).
 pub(crate) fn parse_handover_request_acknowledge_transfer(
     bytes: &[u8],
-) -> Result<DlEndpoint, TransferError> {
+) -> Result<HandoverAck, TransferError> {
     const WHAT: &str = "HandoverRequestAcknowledgeTransfer";
     let t = decode::<g::HandoverRequestAcknowledgeTransfer>(WHAT, bytes)?;
-    let qfis = t
-        .qos_flow_setup_response_list
-        .0
+    let flows = &t.qos_flow_setup_response_list.0;
+    let qfis = flows.iter().map(|f| f.qos_flow_identifier.0).collect();
+    let forwarding_accepted_qfis = flows
         .iter()
+        .filter(|f| f.data_forwarding_accepted.is_some())
         .map(|f| f.qos_flow_identifier.0)
         .collect();
-    endpoint(WHAT, t.dl_ngu_up_tnl_information, qfis)
+    let dl_forwarding = t
+        .dl_forwarding_up_tnl_information
+        .map(|tunnel| endpoint(WHAT, tunnel, Vec::new()))
+        .transpose()?;
+    let mut erab_forwarding = Vec::new();
+    for ext in t.ie_extensions.map(|e| e.0).unwrap_or_default() {
+        use g::HandoverRequestAcknowledgeTransferIE_Extensions_EntryExtensionValue as Ext;
+        if let Ext::Id_DataForwardingResponseERABList(list) = ext.extension_value {
+            for item in list.0 {
+                erab_forwarding.push((
+                    item.e_rab_id.0,
+                    endpoint(WHAT, item.dl_forwarding_up_tnl_information, Vec::new())?,
+                ));
+            }
+        }
+    }
+    Ok(HandoverAck {
+        dl: endpoint(WHAT, t.dl_ngu_up_tnl_information, qfis)?,
+        forwarding_accepted_qfis,
+        dl_forwarding,
+        erab_forwarding,
+    })
 }
 
 #[cfg(test)]

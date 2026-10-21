@@ -1135,7 +1135,30 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
 
                 // Creates: rules added to a session that is already running.
                 // Provisioning charging mid-session is the normal way it is added.
+                if !removed_pdr_ids.is_empty() {
+                    let mut tunnels = session.pdr_teids.write().unwrap();
+                    for id in &removed_pdr_ids {
+                        tunnels.remove(id);
+                    }
+                }
                 if !created_pdrs.is_empty() {
+                    // #583: a PDR created on its own F-TEID (chosen by the PFCP handler, or
+                    // named by the SMF) detects on that tunnel, and the tunnel routes to
+                    // this session.
+                    {
+                        let mut tunnels = session.pdr_teids.write().unwrap();
+                        for p in &created_pdrs {
+                            match p.pdi.local_f_teid.as_ref().filter(|f| !f.ch && f.teid != 0) {
+                                Some(f) => {
+                                    tunnels.insert(p.pdr_id, f.teid);
+                                    data_plane.sessions.bind_ul_teid(f.teid, upf_seid);
+                                }
+                                None => {
+                                    tunnels.remove(&p.pdr_id);
+                                }
+                            }
+                        }
+                    }
                     let mut dp_pdrs = session.pdrs.write().unwrap();
                     for p in &created_pdrs {
                         dp_pdrs.retain(|e| e.pdr_id != p.pdr_id);
