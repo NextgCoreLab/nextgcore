@@ -2,7 +2,7 @@
 //!
 //! Based on 3GPP TS 24.501 and TS 24.301
 
-use crate::buf::NasBuf;
+use crate::buf::{IeLen, NasBuf};
 use crate::error::{NasError, NasResult};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::fmt;
@@ -356,8 +356,11 @@ impl GprsTimer2 {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.read_u8()?;
-        let value = buf.read_u8()?;
+        // TS 24.008 §10.5.7.4: "a type 4 information element with 3 octets
+        // length", i.e. exactly one value octet.
+        let mut ie = buf.read_lv(IeLen::Exact(1))?;
+        let length = ie.len() as u8;
+        let value = ie.read_u8()?;
         Ok(Self { length, value })
     }
 }
@@ -414,8 +417,11 @@ impl GprsTimer3 {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.read_u8()?;
-        let byte = buf.read_u8()?;
+        // TS 24.008 §10.5.7.4a: "a type 4 information element with 3 octets
+        // length", i.e. exactly one value octet.
+        let mut ie = buf.read_lv(IeLen::Exact(1))?;
+        let length = ie.len() as u8;
+        let byte = ie.read_u8()?;
         Ok(Self {
             length,
             unit: (byte >> 5) & 0x07,
@@ -638,18 +644,22 @@ impl UeSecurityCapability {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.read_u8()?;
-        let ea = buf.read_u8()?;
-        let ia = buf.read_u8()?;
+        // TS 24.501 §9.11.3.54: 4 to 10 octets. Octets 5-6 (EEA/EIA) are
+        // optional and 7-10 spare, so the IE may be longer than what is decoded
+        // here; it must hold at least the 5G EA and IA octets.
+        let mut ie = buf.read_lv(IeLen::AtLeast(2))?;
+        let length = ie.len() as u8;
+        let ea = ie.read_u8()?;
+        let ia = ie.read_u8()?;
 
         let mut cap = Self::new(ea, ia);
         cap.length = length;
 
-        if length >= 3 && buf.remaining() >= 1 {
-            cap.eea = Some(buf.read_u8()?);
+        if ie.has_remaining() {
+            cap.eea = Some(ie.read_u8()?);
         }
-        if length >= 4 && buf.remaining() >= 1 {
-            cap.eia = Some(buf.read_u8()?);
+        if ie.has_remaining() {
+            cap.eia = Some(ie.read_u8()?);
         }
 
         Ok(cap)
@@ -694,15 +704,13 @@ impl AuthenticationResponseParameter {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.read_u8()?;
-        if buf.remaining() < length as usize {
-            return Err(NasError::BufferTooShort {
-                expected: length as usize,
-                actual: buf.remaining(),
-            });
-        }
-        let res = buf.read_bytes(length as usize)?.to_vec();
-        Ok(Self { length, res })
+        // TS 24.301 §9.9.3.4 (TS 24.501 §9.11.3.17 refers there): RES is 4
+        // to 16 octets, RES* 16; 6 to 18 octets with IEI and length.
+        let res = buf.read_lv(IeLen::Between(4, 16))?.to_vec();
+        Ok(Self {
+            length: res.len() as u8,
+            res,
+        })
     }
 }
 
@@ -738,15 +746,13 @@ impl Abba {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.read_u8()?;
-        if buf.remaining() < length as usize {
-            return Err(NasError::BufferTooShort {
-                expected: length as usize,
-                actual: buf.remaining(),
-            });
-        }
-        let contents = buf.read_bytes(length as usize)?.to_vec();
-        Ok(Self { length, contents })
+        // TS 24.501 §9.11.3.10: 4 to 257 octets with IEI and length, so at
+        // least 2 ABBA octets.
+        let contents = buf.read_lv(IeLen::AtLeast(2))?.to_vec();
+        Ok(Self {
+            length: contents.len() as u8,
+            contents,
+        })
     }
 }
 

@@ -4,7 +4,7 @@
 
 use super::header::*;
 use super::types::*;
-use crate::buf::NasBuf;
+use crate::buf::{IeLen, NasBuf};
 use crate::common::types::*;
 use crate::error::{NasError, NasResult};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -303,17 +303,16 @@ impl AttachAccept {
                     }
                 }
                 0x4A => {
+                    // §9.9.2.8 -> TS 24.008 §10.5.1.13: 5 to 47 octets, so
+                    // at least one PLMN. Decoded inside the IE's length, so
+                    // a trailing partial PLMN is not read as the next IE (#613).
                     buf.skip(1)?;
-                    if buf.remaining() >= 1 {
-                        let len = buf.read_u8()? as usize;
-                        if buf.remaining() >= len {
-                            let mut plmns = Vec::with_capacity(len / 3);
-                            for _ in 0..(len / 3) {
-                                plmns.push(PlmnId::decode(buf)?);
-                            }
-                            msg.equivalent_plmns = Some(plmns);
-                        }
+                    let mut ie = buf.read_lv(IeLen::AtLeast(3))?;
+                    let mut plmns = Vec::with_capacity(ie.len() / 3);
+                    for _ in 0..(ie.len() / 3) {
+                        plmns.push(PlmnId::decode(&mut ie)?);
                     }
+                    msg.equivalent_plmns = Some(plmns);
                 }
                 _ => {
                     buf.skip(1)?;
@@ -769,14 +768,11 @@ impl EpsAuthenticationFailure {
             let iei = buf.peek_u8()?;
             match iei {
                 0x30 => {
+                    // §9.9.3.1 -> TS 24.008 §10.5.3.2.2: "a length of 16
+                    // octets", i.e. the 14-octet AUTS (#613).
                     buf.skip(1)?;
-                    if buf.remaining() >= 1 {
-                        let len = buf.read_u8()? as usize;
-                        if buf.remaining() >= len {
-                            msg.authentication_failure_parameter =
-                                Some(buf.read_bytes(len)?.to_vec());
-                        }
-                    }
+                    msg.authentication_failure_parameter =
+                        Some(buf.read_lv(IeLen::Exact(14))?.to_vec());
                 }
                 _ => break,
             }
@@ -1053,11 +1049,9 @@ impl ExtendedServiceRequest {
                     msg.csfb_response = Some(iei & 0x0F);
                 }
                 0x57 => {
+                    // §9.9.2.1: "4 octets length", two value octets (#613).
                     buf.skip(1)?;
-                    if buf.remaining() >= 3 {
-                        let _len = buf.read_u8()?;
-                        msg.eps_bearer_context_status = Some(buf.read_u16()?);
-                    }
+                    msg.eps_bearer_context_status = Some(buf.read_lv(IeLen::Exact(2))?.read_u16()?);
                 }
                 _ => {
                     buf.skip(1)?;
@@ -1246,11 +1240,11 @@ impl EmmInformation {
                     }
                 }
                 0x49 => {
+                    // §9.9.3.6 -> TS 24.008 §10.5.3.12: "a length of 3
+                    // octets", one value octet (#613).
                     buf.skip(1)?;
-                    if buf.remaining() >= 2 {
-                        let _len = buf.read_u8()?;
-                        msg.network_daylight_saving_time = Some(buf.read_u8()?);
-                    }
+                    msg.network_daylight_saving_time =
+                        Some(buf.read_lv(IeLen::Exact(1))?.read_u8()?);
                 }
                 _ => break,
             }
