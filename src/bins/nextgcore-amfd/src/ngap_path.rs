@@ -1725,26 +1725,68 @@ impl NgapServer {
         association_id: u64,
         data: &[u8],
     ) -> Result<()> {
-        if let Ok(nextgcore_ngap::NgapMessage::RanConfigurationUpdate(upd)) =
-            nextgcore_ngap::parser::decode_ngap_pdu(data)
-        {
-            log::info!(
-                "RAN Configuration Update from association {}: ran_node_name={:?}, ta_list_len={}",
-                association_id,
-                upd.ran_node_name,
-                upd.supported_ta_list.as_ref().map_or(0, |l| l.len())
-            );
+        // #417: the GENERATED codec, TS 38.413 §10.3.4.2 for a Class 1 initiating
+        // message. Before, an update that did not decode -- or carried a
+        // not-comprehended "reject" IE -- was still ACKNOWLEDGED, telling the gNB
+        // the AMF had taken a configuration it never read.
+        let (upd, notify) = match crate::ngap_asn1::decode_ran_configuration_update_asn1(data) {
+            crate::ngap_asn1::RanConfigurationUpdateDecode::Proceed { update, notify } => {
+                (update, notify)
+            }
+            crate::ngap_asn1::RanConfigurationUpdateDecode::Reject(diagnostics) => {
+                log::warn!(
+                    "RAN Configuration Update from association {association_id} has {} \
+                     not-comprehended IE(s) marked reject; sending RAN CONFIGURATION UPDATE FAILURE",
+                    diagnostics.len()
+                );
+                if let Some(failure) =
+                    crate::ngap_asn1::build_ran_configuration_update_failure_generated(
+                        nextgcore_ngap::types::Cause::Protocol(
+                            nextgcore_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
+                        ),
+                        None,
+                        &diagnostics,
+                    )
+                {
+                    self.send_to_association(association_id, &failure).await?;
+                }
+                return Ok(());
+            }
+            crate::ngap_asn1::RanConfigurationUpdateDecode::Undecodable => {
+                log::warn!(
+                    "Undecodable RAN Configuration Update from association {association_id}; \
+                     sending RAN CONFIGURATION UPDATE FAILURE"
+                );
+                if let Some(failure) =
+                    crate::ngap_asn1::build_ran_configuration_update_failure_generated(
+                        nextgcore_ngap::types::Cause::Protocol(
+                            nextgcore_asn1c::ngap::cause::CauseProtocol::TransferSyntaxError,
+                        ),
+                        None,
+                        &[],
+                    )
+                {
+                    self.send_to_association(association_id, &failure).await?;
+                }
+                return Ok(());
+            }
+        };
+        log::info!(
+            "RAN Configuration Update from association {}: ran_node_name={:?}, ta_list_len={}",
+            association_id,
+            upd.ran_node_name,
+            upd.supported_ta_list.as_ref().map_or(0, |l| l.len())
+        );
 
-            // TS 38.413 §8.7.2: the update carries the gNB's *new*
-            // configuration, and the AMF "shall overwrite" the corresponding
-            // stored values. Acknowledging without storing was the subtler half
-            // of this bug: NG-C looked synchronised while the AMF went on
-            // serving the TAC/slice set from NG Setup, so a TAI the gNB had just
-            // stopped broadcasting still resolved, and one it had just added did
-            // not.
+        // TS 38.413 §8.7.2: the update carries the gNB's *new* configuration, and
+        // the AMF "shall overwrite" the corresponding stored values. Acknowledging
+        // without storing was the subtler half of an earlier bug: NG-C looked
+        // synchronised while the AMF went on serving the TAC/slice set from NG
+        // Setup. The list is SIZE(1..), so a present one always replaces.
+        {
             let mut sessions = self.sessions.write().await;
             if let Some(session) = sessions.get_mut(&association_id) {
-                match ta_list_replacement(upd.supported_ta_list.as_deref()) {
+                match upd.supported_ta_list {
                     Some(converted) => {
                         log::info!(
                             "Applying {} Supported TA entries from RAN Configuration Update to \
@@ -1758,7 +1800,7 @@ impl NgapServer {
                     }
                     None => log::debug!(
                         "RAN Configuration Update from association {association_id} carries no \
-                         usable Supported TA List; keeping the stored {} entries",
+                         Supported TA List; keeping the stored {} entries",
                         session.gnb.num_of_supported_ta_list
                     ),
                 }
@@ -1775,15 +1817,9 @@ impl NgapServer {
                 );
             }
         }
-        match nextgcore_ngap::builder::build_ran_configuration_update_acknowledge(
-            &nextgcore_ngap::types::RanConfigurationUpdateAcknowledge {
-                criticality_diagnostics: None,
-            },
-        ) {
-            Ok(ack) => self.send_to_association(association_id, &ack).await?,
-            Err(e) => {
-                log::error!("Failed to build RAN Configuration Update Acknowledge: {e:?}")
-            }
+        match crate::ngap_asn1::build_ran_configuration_update_acknowledge_generated(&notify) {
+            Some(ack) => self.send_to_association(association_id, &ack).await?,
+            None => log::error!("Failed to build RAN Configuration Update Acknowledge"),
         }
         Ok(())
     }
@@ -13108,64 +13144,6 @@ fn apply_user_location(
         ((tai_tac[0] as u32) << 16) | ((tai_tac[1] as u32) << 8) | tai_tac[2] as u32;
 }
 
-/// The stored Supported TA List a RAN Configuration Update should replace the
-/// existing one with, or `None` to keep what is stored.
-///
-/// The IE is OPTIONAL in this message (unlike in NG Setup), and an absent
-/// optional IE means "unchanged", never "none" — clearing the list on an update
-/// that did not mention it would strand every UE on that gNB. An *empty* list is
-/// treated the same way: the ASN.1 constraint is `minItems 1`, so a conformant
-/// encoder cannot produce one, but a peer that does must not be able to erase the
-/// gNB's service area with it.
-fn ta_list_replacement(
-    incoming: Option<&[nextgcore_ngap::types::SupportedTaItem]>,
-) -> Option<Vec<SupportedTa>> {
-    let items = incoming?;
-    if items.is_empty() {
-        return None;
-    }
-    Some(items.iter().map(supported_ta_from_ngap).collect())
-}
-
-/// Convert a wire `SupportedTAItem` into the stored `SupportedTa`.
-///
-/// Needed because NG Setup and RAN Configuration Update reach the AMF through
-/// different decoders: NG Setup arrives already converted by `ngap_asn1`, while
-/// RAN Configuration Update comes from the `nextgcore-ngap` parser and carries
-/// the raw wire shapes (TAC as 3 octets, PLMN as 3 BCD octets).
-fn supported_ta_from_ngap(item: &nextgcore_ngap::types::SupportedTaItem) -> SupportedTa {
-    let bplmn_list: Vec<crate::context::BplmnEntry> = item
-        .broadcast_plmn_list
-        .iter()
-        .map(|bplmn| crate::context::BplmnEntry {
-            plmn_id: plmn_id_from_ngap_bytes(&bplmn.plmn_identity),
-            num_of_s_nssai: bplmn.tai_slice_support_list.len(),
-            s_nssai: bplmn
-                .tai_slice_support_list
-                .iter()
-                .map(|s| crate::context::SNssai {
-                    sst: s.sst,
-                    // SD is a 24-bit value on the wire; 0xffffff means "no SD"
-                    // (TS 23.003), so it is stored as absent rather than as the
-                    // literal, which would otherwise compare unequal to a
-                    // profile that simply omits it.
-                    sd: s.sd.and_then(|sd| {
-                        let value =
-                            u32::from(sd[0]) << 16 | u32::from(sd[1]) << 8 | u32::from(sd[2]);
-                        (value != 0x00ff_ffff).then_some(value)
-                    }),
-                })
-                .collect(),
-        })
-        .collect();
-    SupportedTa {
-        // TAC is 3 octets, big-endian (TS 38.413 Section 9.3.3.10).
-        tac: u32::from(item.tac[0]) << 16 | u32::from(item.tac[1]) << 8 | u32::from(item.tac[2]),
-        num_of_bplmn_list: bplmn_list.len(),
-        bplmn_list,
-    }
-}
-
 /// Convert a configured algorithm preference order into a support mask;
 /// `default_mask` when no order is configured
 ///
@@ -17728,55 +17706,6 @@ mod tests {
              clearing it would strand every UE on the gNB"
         );
         assert_eq!(gnb.supported_ta_list[0].tac, 0x01);
-    }
-
-    #[test]
-    fn ta_list_replacement_only_replaces_on_a_non_empty_list() {
-        // Absent => keep what is stored.
-        assert!(ta_list_replacement(None).is_none());
-        // Empty => keep what is stored. Not reachable through this codec (the
-        // ASN.1 constraint is minItems 1, so `build_ran_configuration_update`
-        // refuses to encode one), but a non-conformant peer must not be able to
-        // erase a gNB's service area, and that guard is only assertable here.
-        assert!(ta_list_replacement(Some(&[])).is_none());
-        // Present => replace, converted from the wire shapes.
-        let replacement =
-            ta_list_replacement(Some(&[ta_item(0x00_00aa, 4)])).expect("a non-empty list replaces");
-        assert_eq!(replacement.len(), 1);
-        assert_eq!(replacement[0].tac, 0xaa);
-        assert_eq!(replacement[0].bplmn_list[0].s_nssai[0].sst, 4);
-    }
-
-    #[test]
-    fn supported_ta_conversion_decodes_the_wire_shapes() {
-        // TAC is 3 octets big-endian.
-        let converted = supported_ta_from_ngap(&nextgcore_ngap::types::SupportedTaItem {
-            tac: [0x01, 0x02, 0x03],
-            broadcast_plmn_list: vec![nextgcore_ngap::types::BroadcastPlmnItem {
-                plmn_identity: plmn_id_to_ngap_bytes(&PlmnId::new("310", "260")),
-                tai_slice_support_list: vec![
-                    nextgcore_ngap::types::SNssai {
-                        sst: 1,
-                        sd: Some([0x00, 0x00, 0xab]),
-                    },
-                    // 0xffffff is "no slice differentiator" (TS 23.003) and must
-                    // become absent, not the literal — otherwise it never
-                    // compares equal to a profile that simply omits the SD.
-                    nextgcore_ngap::types::SNssai {
-                        sst: 2,
-                        sd: Some([0xff, 0xff, 0xff]),
-                    },
-                    nextgcore_ngap::types::SNssai { sst: 3, sd: None },
-                ],
-            }],
-        });
-        assert_eq!(converted.tac, 0x01_0203);
-        assert_eq!(converted.num_of_bplmn_list, 1);
-        assert_eq!(converted.bplmn_list[0].plmn_id, PlmnId::new("310", "260"));
-        assert_eq!(converted.bplmn_list[0].num_of_s_nssai, 3);
-        assert_eq!(converted.bplmn_list[0].s_nssai[0].sd, Some(0x0000ab));
-        assert_eq!(converted.bplmn_list[0].s_nssai[1].sd, None);
-        assert_eq!(converted.bplmn_list[0].s_nssai[2].sd, None);
     }
 
     // ---- criterion 2: UPLINK RAN STATUS TRANSFER is relayed to the target ----
