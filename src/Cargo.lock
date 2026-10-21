@@ -2706,7 +2706,6 @@ dependencies = [
  "nextgcore-diameter",
  "nextgcore-gtp",
  "nextgcore-nas",
- "nextgcore-ngap",
  "nextgcore-pfcp",
  "nextgcore-s1ap",
  "nextgcore-sbi",
@@ -2793,10 +2792,8 @@ dependencies = [
  "hex",
  "log",
  "nextgcore-app",
- "nextgcore-asn1c",
  "nextgcore-core",
  "nextgcore-metrics",
- "nextgcore-ngap",
  "nextgcore-ngap-gen",
  "nextgcore-pfcp",
  "nextgcore-sbi",
@@ -2891,9 +2888,11 @@ dependencies = [
 name = "nextgcore-ngap"
 version = "0.1.0"
 dependencies = [
+ "bitvec",
  "bytes",
  "nextgcore-asn1c",
  "nextgcore-core",
+ "nextgcore-ngap-gen",
  "proptest",
  "thiserror 1.0.69",
 ]
@@ -2907,8 +2906,6 @@ dependencies = [
  "asn1_codecs_derive",
  "bitvec",
  "log",
- "nextgcore-asn1c",
- "nextgcore-ngap",
 ]
 
 [[package]]

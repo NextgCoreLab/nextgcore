@@ -11,9 +11,9 @@
 //! client in-tree (verified: zero `nmbsmf` hits in amfd), so this yaml-driven
 //! test client is the conformant peer, avoiding the lenient-mock trap.
 //!
-//! The response is decoded with the shared `nextgcore_ngap` NGAP codec AND its
-//! first bytes are independently asserted against a hand-derived golden prefix,
-//! so an encoder+decoder pair sharing the same bug cannot pass. Flipping one
+//! The response is decoded with the generated NGAP codec AND its first bytes
+//! are independently asserted against a hand-derived golden prefix, so an
+//! encoder+decoder pair sharing the same bug cannot pass. Flipping one
 //! byte in the golden request container makes mbsmfd fail-closed (4xx), proving
 //! real APER decoding rather than pass-through.
 //!
@@ -22,8 +22,8 @@
 //! drives that real handler in-process while keeping request construction fully
 //! independent of `crate::types`.
 
+use crate::n2_mbs_transfer::golden::decode_setup_response;
 use bytes::Bytes;
-use nextgcore_ngap::mbs_transfer::{MbsDistributionSetupResponseTransfer, MbsSessionStatus};
 use nextgcore_sbi::constants::content_type::APPLICATION_NGAP;
 use nextgcore_sbi::message::{SbiPart, SbiRequest, SbiResponse};
 use nextgcore_sbi::multipart;
@@ -209,24 +209,20 @@ async fn mbs_context_update_strict_peer_setup_roundtrip() {
         "§9.3.5.8 golden prefix (SEQUENCE preamble + TMGI)"
     );
 
-    // Decode with the shared NGAP codec and cross-check the session's real
+    // Decode with the generated NGAP codec and cross-check the session's real
     // N4mb transport (the C-TEID the SMF/JSON path would report).
-    let decoded = MbsDistributionSetupResponseTransfer::decode(&part.data)
+    let decoded = decode_setup_response(&part.data)
         .expect("part decodes as §9.3.5.8 Setup Response Transfer");
-    assert_eq!(decoded.mbs_session_id.plmn_identity, [0x02, 0xF8, 0x39]);
-    assert_eq!(decoded.mbs_session_id.mbs_service_id, SVC);
-    assert_eq!(decoded.mbs_session_status, MbsSessionStatus::Activated);
-    let tnl = decoded
-        .shared_ngu_multicast_tnl_information
-        .expect("Shared NG-U Multicast TNL present");
+    assert_eq!(decoded.tmgi, ([0x02, 0xF8, 0x39], SVC));
+    assert!(decoded.activated);
+    let tnl = decoded.tunnel.expect("Shared NG-U Multicast TNL present");
     let c_teid = session_c_teid(SVC).expect("session established a shared N4mb transport");
     assert_eq!(
-        u32::from_be_bytes(tnl.gtp_teid),
-        c_teid,
+        tnl.teid, c_teid,
         "decoded SharedNguMulticastTnl gtp_teid == the session's real cTeid"
     );
     assert_eq!(
-        decoded.mbs_qos_flows_to_be_setup_list.len(),
+        decoded.qfis.len(),
         1,
         "single QoS flow derived from the session model"
     );
