@@ -2784,6 +2784,7 @@ name = "nextgcore-mbsmfd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "asn1-codecs",
  "base64 0.22.1",
  "bytes",
  "clap",
@@ -2796,6 +2797,7 @@ dependencies = [
  "nextgcore-core",
  "nextgcore-metrics",
  "nextgcore-ngap",
+ "nextgcore-ngap-gen",
  "nextgcore-pfcp",
  "nextgcore-sbi",
  "p256",

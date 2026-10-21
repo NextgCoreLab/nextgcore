@@ -5,6 +5,7 @@
 use super::header::*;
 use super::ie::*;
 use super::types::*;
+use crate::buf::NasBuf;
 use crate::common::security::{unprotect_nas_message, NasSecurityContext};
 use crate::common::types::*;
 use crate::error::{NasError, NasResult};
@@ -31,7 +32,7 @@ fn is_tlv_e_iei(iei: u8) -> bool {
 /// Skip an unknown / unhandled optional IE in a default IE-loop arm, per
 /// TS 24.501 §7.6.1 (unknown IEs are ignored, not errored) and the TS 24.007
 /// IE-format rules. `buf` must be positioned at the IEI octet; `iei` is the
-/// peeked IEI (`buf.chunk()[0]`).
+/// peeked IEI (`buf.peek_u8()?`).
 ///
 /// - `iei >= 0x80`: type-1 (TV, half-octet IEI in the high nibble) or type-2
 ///   (T) — the whole IE is the single IEI octet; consume 1 octet, no length,
@@ -43,20 +44,20 @@ fn is_tlv_e_iei(iei: u8) -> bool {
 ///   length TV) IEs still cannot be distinguished, but all *known* such IEIs
 ///   are matched explicitly, so this only affects unknown ones.
 fn skip_unknown_ie(buf: &mut Bytes, iei: u8) -> NasResult<()> {
-    buf.advance(1); // consume the IEI octet (peeked, not yet advanced by caller)
+    buf.skip(1)?; // consume the IEI octet (peeked, not yet advanced by caller)
     if iei >= 0x80 {
         return Ok(());
     }
     if is_tlv_e_iei(iei) {
         if buf.remaining() >= 2 {
-            let len = buf.get_u16() as usize;
+            let len = buf.read_u16()? as usize;
             let take = len.min(buf.remaining());
-            buf.advance(take);
+            buf.skip(take)?;
         }
     } else if buf.remaining() > 0 {
-        let len = buf.get_u8() as usize;
+        let len = buf.read_u8()? as usize;
         let take = len.min(buf.remaining());
-        buf.advance(take);
+        buf.skip(take)?;
     }
     Ok(())
 }
@@ -219,7 +220,7 @@ impl RegistrationRequest {
             });
         }
 
-        let first_byte = buf.get_u8();
+        let first_byte = buf.read_u8()?;
         let registration_type = RegistrationType::decode(first_byte & 0x0F)?;
         let ngksi = KeySetIdentifier::decode((first_byte >> 4) & 0x0F);
         let mobile_identity = MobileIdentity::decode(buf)?;
@@ -233,61 +234,61 @@ impl RegistrationRequest {
 
         // Decode optional IEs
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             let iei_type = if iei >= 0x80 { iei & 0xF0 } else { iei };
 
             match iei_type {
                 0xC0 => {
                     // Non-current native NAS key set identifier (half-byte)
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.non_current_native_ngksi = Some(KeySetIdentifier::decode(iei & 0x0F));
                 }
                 0x10 => {
                     // 5GMM capability
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.gmm_capability = Some(FiveGmmCapability::decode(buf)?);
                 }
                 0x2E => {
                     // UE security capability
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.ue_security_capability = Some(UeSecurityCapability::decode(buf)?);
                 }
                 0x2F => {
                     // Requested NSSAI
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.requested_nssai = Some(Nssai::decode(buf)?);
                 }
                 0x52 => {
                     // Last visited registered TAI
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.last_visited_tai = Some(Tai::decode(buf)?);
                 }
                 0x40 => {
                     // Uplink data status
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.uplink_data_status = Some(UplinkDataStatus::decode(buf)?);
                 }
                 0x50 => {
                     // PDU session status
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.pdu_session_status = Some(PduSessionStatus::decode(buf)?);
                 }
                 0x2B => {
                     // UE status
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
-                        let _len = buf.get_u8();
-                        msg.ue_status = Some(buf.get_u8());
+                        let _len = buf.read_u8()?;
+                        msg.ue_status = Some(buf.read_u8()?);
                     }
                 }
                 0x77 => {
                     // Additional GUTI
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.additional_guti = Some(MobileIdentity::decode(buf)?);
                 }
                 0x71 => {
                     // NAS message container (TLV-E), cleartext-IE reg (§4.4.6)
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.nas_message_container = Some(NasMessageContainer::decode(buf)?);
                 }
                 0x80 => {
@@ -298,12 +299,12 @@ impl RegistrationRequest {
                     // that is otherwise valid must not fail on a payload the AMF
                     // does not recognise. The container below is then still decoded
                     // and simply not interpretable, which is the honest state.
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.payload_container_type = PayloadContainerType::from_u8(iei & 0x0F);
                 }
                 0x7B => {
                     // Payload container (TLV-E) — §5.5.1.2.2's UE policy container
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.payload_container = Some(PayloadContainer::decode(buf)?);
                 }
                 _ => skip_unknown_ie(buf, iei)?,
@@ -429,22 +430,22 @@ impl RegistrationAccept {
 
         // Decode optional IEs
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x77 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.guti = Some(MobileIdentity::decode(buf)?);
                 }
                 0x4A => {
                     // Equivalent PLMNs (TLV, 3 octets per PLMN).
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() < 1 {
                         return Err(NasError::BufferTooShort {
                             expected: 1,
                             actual: buf.remaining(),
                         });
                     }
-                    let len = buf.get_u8() as usize;
+                    let len = buf.read_u8()? as usize;
                     if buf.remaining() < len {
                         return Err(NasError::BufferTooShort {
                             expected: len,
@@ -459,71 +460,71 @@ impl RegistrationAccept {
                     // Discard any trailing octets (length not a multiple of 3).
                     let rem = len % PlmnId::encoded_len();
                     if rem > 0 {
-                        buf.advance(rem);
+                        buf.skip(rem)?;
                     }
                     msg.equivalent_plmns = Some(plmns);
                 }
                 0x54 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.tai_list = Some(TaiList::decode(buf)?);
                 }
                 0x15 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.allowed_nssai = Some(Nssai::decode(buf)?);
                 }
                 0x11 => {
                     // Rejected NSSAI (TLV) — stored as opaque octets.
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() < 1 {
                         return Err(NasError::BufferTooShort {
                             expected: 1,
                             actual: buf.remaining(),
                         });
                     }
-                    let len = buf.get_u8() as usize;
+                    let len = buf.read_u8()? as usize;
                     if buf.remaining() < len {
                         return Err(NasError::BufferTooShort {
                             expected: len,
                             actual: buf.remaining(),
                         });
                     }
-                    msg.rejected_nssai = Some(buf.copy_to_bytes(len).to_vec());
+                    msg.rejected_nssai = Some(buf.read_bytes(len)?.to_vec());
                 }
                 0x21 => {
                     // 5GS network feature support (TLV, TS 24.501 §9.11.3.5). Only
                     // octet 3 is modelled, but the whole contents field is consumed
                     // so the IE walk stays aligned — a decoder that stopped after
                     // the modelled octet would read the next octet as an IEI.
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() < 1 {
                         return Err(NasError::BufferTooShort {
                             expected: 1,
                             actual: buf.remaining(),
                         });
                     }
-                    let len = buf.get_u8() as usize;
+                    let len = buf.read_u8()? as usize;
                     if buf.remaining() < len {
                         return Err(NasError::BufferTooShort {
                             expected: len,
                             actual: buf.remaining(),
                         });
                     }
-                    let contents = buf.copy_to_bytes(len);
+                    let contents = buf.read_bytes(len)?;
                     msg.network_feature_support =
                         crate::interworking::FiveGsNetworkFeatureSupport::decode_contents(
                             &contents,
                         );
                 }
                 0x50 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.pdu_session_status = Some(PduSessionStatus::decode(buf)?);
                 }
                 0x5E => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.t3512_value = Some(GprsTimer3::decode(buf)?);
                 }
                 0x16 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.t3502_value = Some(GprsTimer2::decode(buf)?);
                 }
                 _ => skip_unknown_ie(buf, iei)?,
@@ -573,25 +574,25 @@ impl RegistrationReject {
                 actual: buf.remaining(),
             });
         }
-        let gmm_cause = buf.get_u8();
+        let gmm_cause = buf.read_u8()?;
         let mut msg = Self {
             gmm_cause,
             ..Default::default()
         };
 
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x5F => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.t3346_value = Some(GprsTimer2::decode(buf)?);
                 }
                 0x16 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.t3502_value = Some(GprsTimer2::decode(buf)?);
                 }
                 0x78 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.eap_message = Some(EapMessage::decode(buf)?);
                 }
                 _ => skip_unknown_ie(buf, iei)?,
@@ -621,16 +622,16 @@ impl RegistrationComplete {
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         let mut msg = Self::default();
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x73 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() < 2 {
                         break;
                     }
-                    let len = buf.get_u16() as usize;
+                    let len = buf.read_u16()? as usize;
                     if buf.remaining() >= len {
-                        msg.sor_transparent_container = Some(buf.copy_to_bytes(len).to_vec());
+                        msg.sor_transparent_container = Some(buf.read_bytes(len)?.to_vec());
                     }
                 }
                 _ => skip_unknown_ie(buf, iei)?,
@@ -664,7 +665,7 @@ impl DeregistrationRequestFromUe {
                 actual: buf.remaining(),
             });
         }
-        let first_byte = buf.get_u8();
+        let first_byte = buf.read_u8()?;
         let de_registration_type = DeRegistrationType::decode(first_byte & 0x0F);
         let ngksi = KeySetIdentifier::decode((first_byte >> 4) & 0x0F);
         let mobile_identity = MobileIdentity::decode(buf)?;
@@ -707,23 +708,23 @@ impl DeregistrationRequestToUe {
                 actual: buf.remaining(),
             });
         }
-        let first_byte = buf.get_u8();
+        let first_byte = buf.read_u8()?;
         let de_registration_type = DeRegistrationType::decode(first_byte & 0x0F);
         let mut msg = Self {
             de_registration_type,
             ..Default::default()
         };
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x58 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        msg.gmm_cause = Some(buf.get_u8());
+                        msg.gmm_cause = Some(buf.read_u8()?);
                     }
                 }
                 0x5F => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.t3346_value = Some(GprsTimer2::decode(buf)?);
                 }
                 _ => skip_unknown_ie(buf, iei)?,
@@ -784,7 +785,7 @@ impl ServiceRequest {
                 actual: buf.remaining(),
             });
         }
-        let first_byte = buf.get_u8();
+        let first_byte = buf.read_u8()?;
         // ngKSI in bits 1-4, service type in bits 5-8 (Table 8.2.16.1.1, §8.1).
         let ngksi = KeySetIdentifier::decode(first_byte & 0x0F);
         let service_type_val = (first_byte >> 4) & 0x0F;
@@ -806,22 +807,22 @@ impl ServiceRequest {
             ..Default::default()
         };
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x40 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.uplink_data_status = Some(UplinkDataStatus::decode(buf)?);
                 }
                 0x50 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.pdu_session_status = Some(PduSessionStatus::decode(buf)?);
                 }
                 0x25 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.allowed_pdu_session_status = Some(AllowedPduSessionStatus::decode(buf)?);
                 }
                 0x71 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.nas_message_container = Some(NasMessageContainer::decode(buf)?);
                 }
                 _ => skip_unknown_ie(buf, iei)?,
@@ -869,25 +870,25 @@ impl ServiceAccept {
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         let mut msg = Self::default();
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x50 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.pdu_session_status = Some(PduSessionStatus::decode(buf)?);
                 }
                 0x26 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 3 {
-                        let _len = buf.get_u8();
-                        msg.pdu_session_reactivation_result = Some(buf.get_u16_le());
+                        let _len = buf.read_u8()?;
+                        msg.pdu_session_reactivation_result = Some(buf.read_u16_le()?);
                     }
                 }
                 0x78 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.eap_message = Some(EapMessage::decode(buf)?);
                 }
                 0x6B => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.t3448_value = Some(GprsTimer2::decode(buf)?);
                 }
                 _ => skip_unknown_ie(buf, iei)?,
@@ -934,24 +935,24 @@ impl ServiceReject {
                 actual: buf.remaining(),
             });
         }
-        let gmm_cause = buf.get_u8();
+        let gmm_cause = buf.read_u8()?;
         let mut msg = Self {
             gmm_cause,
             ..Default::default()
         };
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x50 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.pdu_session_status = Some(PduSessionStatus::decode(buf)?);
                 }
                 0x5F => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.t3346_value = Some(GprsTimer2::decode(buf)?);
                 }
                 0x78 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.eap_message = Some(EapMessage::decode(buf)?);
                 }
                 _ => skip_unknown_ie(buf, iei)?,
@@ -1004,7 +1005,7 @@ impl AuthenticationRequest {
                 actual: buf.remaining(),
             });
         }
-        let ngksi = KeySetIdentifier::decode(buf.get_u8() & 0x0F);
+        let ngksi = KeySetIdentifier::decode(buf.read_u8()? & 0x0F);
         let abba = Abba::decode(buf)?;
 
         let mut msg = Self {
@@ -1014,27 +1015,32 @@ impl AuthenticationRequest {
         };
 
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x21 => {
-                    buf.advance(1);
+                    // TV, 17 octets (TS 24.501 §9.11.3.16).
+                    buf.skip(1)?;
                     let mut rand = [0u8; 16];
-                    if buf.remaining() >= 16 {
-                        buf.copy_to_slice(&mut rand);
-                        msg.rand = Some(rand);
-                    }
+                    buf.read_into(&mut rand)?;
+                    msg.rand = Some(rand);
                 }
                 0x20 => {
-                    buf.advance(1);
-                    let len = buf.get_u8();
-                    if buf.remaining() >= len as usize && len >= 16 {
-                        let mut autn = [0u8; 16];
-                        buf.copy_to_slice(&mut autn);
-                        msg.autn = Some(autn);
-                    }
+                    // TLV, contents exactly 16 octets (TS 24.501 §9.11.3.15).
+                    buf.skip(1)?;
+                    let len = buf.read_u8()? as usize;
+                    let contents = buf.read_bytes(len)?;
+                    let autn: [u8; 16] =
+                        contents
+                            .as_ref()
+                            .try_into()
+                            .map_err(|_| NasError::InvalidIeLength {
+                                expected: 16,
+                                actual: len,
+                            })?;
+                    msg.autn = Some(autn);
                 }
                 0x78 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.eap_message = Some(EapMessage::decode(buf)?);
                 }
                 _ => skip_unknown_ie(buf, iei)?,
@@ -1069,15 +1075,15 @@ impl AuthenticationResponse {
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         let mut msg = Self::default();
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x2D => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.authentication_response_parameter =
                         Some(AuthenticationResponseParameter::decode(buf)?);
                 }
                 0x78 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.eap_message = Some(EapMessage::decode(buf)?);
                 }
                 _ => skip_unknown_ie(buf, iei)?,
@@ -1105,10 +1111,10 @@ impl AuthenticationReject {
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         let mut msg = Self::default();
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x78 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.eap_message = Some(EapMessage::decode(buf)?);
                 }
                 _ => skip_unknown_ie(buf, iei)?,
@@ -1144,21 +1150,21 @@ impl AuthenticationFailure {
                 actual: buf.remaining(),
             });
         }
-        let gmm_cause = buf.get_u8();
+        let gmm_cause = buf.read_u8()?;
         let mut msg = Self {
             gmm_cause,
             ..Default::default()
         };
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x30 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        let len = buf.get_u8() as usize;
+                        let len = buf.read_u8()? as usize;
                         if buf.remaining() >= len {
                             msg.authentication_failure_parameter =
-                                Some(buf.copy_to_bytes(len).to_vec());
+                                Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
@@ -1197,7 +1203,7 @@ impl AuthenticationResult {
                 actual: buf.remaining(),
             });
         }
-        let ngksi = KeySetIdentifier::decode(buf.get_u8() & 0x0F);
+        let ngksi = KeySetIdentifier::decode(buf.read_u8()? & 0x0F);
         let eap_message = EapMessage::decode(buf)?;
         let mut msg = Self {
             ngksi,
@@ -1205,10 +1211,10 @@ impl AuthenticationResult {
             ..Default::default()
         };
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x38 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.abba = Some(Abba::decode(buf)?);
                 }
                 _ => skip_unknown_ie(buf, iei)?,
@@ -1237,7 +1243,7 @@ impl IdentityRequest {
                 actual: buf.remaining(),
             });
         }
-        let identity_type = FiveGsIdentityType::from(buf.get_u8());
+        let identity_type = FiveGsIdentityType::from(buf.read_u8()?);
         Ok(Self { identity_type })
     }
 }
@@ -1318,8 +1324,8 @@ impl SecurityModeCommand {
                 actual: buf.remaining(),
             });
         }
-        let selected_nas_security_algorithms = SecurityAlgorithms::decode(buf.get_u8());
-        let ngksi = KeySetIdentifier::decode(buf.get_u8() & 0x0F);
+        let selected_nas_security_algorithms = SecurityAlgorithms::decode(buf.read_u8()?);
+        let ngksi = KeySetIdentifier::decode(buf.read_u8()? & 0x0F);
         let replayed_ue_security_capabilities = UeSecurityCapability::decode(buf)?;
         let mut msg = Self {
             selected_nas_security_algorithms,
@@ -1328,34 +1334,34 @@ impl SecurityModeCommand {
             ..Default::default()
         };
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             let iei_type = if iei >= 0x80 { iei & 0xF0 } else { iei };
             match iei_type {
                 0xE0 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.imeisv_request = Some(iei & 0x0F);
                 }
                 0x57 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
-                        let _len = buf.get_u8();
+                        let _len = buf.read_u8()?;
                         msg.selected_eps_nas_security_algorithms =
-                            Some(SecurityAlgorithms::decode(buf.get_u8()));
+                            Some(SecurityAlgorithms::decode(buf.read_u8()?));
                     }
                 }
                 0x36 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
-                        let _len = buf.get_u8();
-                        msg.additional_5g_security_information = Some(buf.get_u8());
+                        let _len = buf.read_u8()?;
+                        msg.additional_5g_security_information = Some(buf.read_u8()?);
                     }
                 }
                 0x78 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.eap_message = Some(EapMessage::decode(buf)?);
                 }
                 0x38 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.abba = Some(Abba::decode(buf)?);
                 }
                 _ => skip_unknown_ie(buf, iei)?,
@@ -1395,18 +1401,18 @@ impl SecurityModeComplete {
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         let mut msg = Self::default();
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x77 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.imeisv = Some(MobileIdentity::decode(buf)?);
                 }
                 0x71 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.nas_message_container = Some(NasMessageContainer::decode(buf)?);
                 }
                 0x78 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.non_imeisv_pei = Some(MobileIdentity::decode(buf)?);
                 }
                 _ => skip_unknown_ie(buf, iei)?,
@@ -1436,7 +1442,7 @@ impl SecurityModeReject {
             });
         }
         Ok(Self {
-            gmm_cause: buf.get_u8(),
+            gmm_cause: buf.read_u8()?,
         })
     }
 }
@@ -1461,7 +1467,7 @@ impl FiveGmmStatus {
             });
         }
         Ok(Self {
-            gmm_cause: buf.get_u8(),
+            gmm_cause: buf.read_u8()?,
         })
     }
 }
@@ -1519,7 +1525,7 @@ impl UlNasTransport {
                 actual: buf.remaining(),
             });
         }
-        let pct_byte = buf.get_u8();
+        let pct_byte = buf.read_u8()?;
         let payload_container_type = match pct_byte & 0x0F {
             1 => PayloadContainerType::N1SmInformation,
             2 => PayloadContainerType::SmsContainer,
@@ -1541,25 +1547,25 @@ impl UlNasTransport {
             ..Default::default()
         };
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             let iei_type = if iei >= 0x80 { iei & 0xF0 } else { iei };
             match iei_type {
                 0x12 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
-                        let _len = buf.get_u8();
-                        msg.pdu_session_id = Some(buf.get_u8());
+                        let _len = buf.read_u8()?;
+                        msg.pdu_session_id = Some(buf.read_u8()?);
                     }
                 }
                 0x59 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
-                        let _len = buf.get_u8();
-                        msg.old_pdu_session_id = Some(buf.get_u8());
+                        let _len = buf.read_u8()?;
+                        msg.old_pdu_session_id = Some(buf.read_u8()?);
                     }
                 }
                 0x80 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     let rt = match iei & 0x0F {
                         1 => RequestType::InitialRequest,
                         2 => RequestType::ExistingPduSession,
@@ -1572,11 +1578,11 @@ impl UlNasTransport {
                     msg.request_type = Some(rt);
                 }
                 0x22 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.s_nssai = Some(SNssai::decode(buf)?);
                 }
                 0x25 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.dnn = Some(Dnn::decode(buf)?);
                 }
                 _ => skip_unknown_ie(buf, iei)?,
@@ -1634,7 +1640,7 @@ impl DlNasTransport {
                 actual: buf.remaining(),
             });
         }
-        let pct_byte = buf.get_u8();
+        let pct_byte = buf.read_u8()?;
         let payload_container_type = match pct_byte & 0x0F {
             1 => PayloadContainerType::N1SmInformation,
             2 => PayloadContainerType::SmsContainer,
@@ -1656,32 +1662,32 @@ impl DlNasTransport {
             ..Default::default()
         };
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x12 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
-                        let _len = buf.get_u8();
-                        msg.pdu_session_id = Some(buf.get_u8());
+                        let _len = buf.read_u8()?;
+                        msg.pdu_session_id = Some(buf.read_u8()?);
                     }
                 }
                 0x24 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        let len = buf.get_u8() as usize;
+                        let len = buf.read_u8()? as usize;
                         if buf.remaining() >= len {
-                            msg.additional_information = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.additional_information = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
                 0x58 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        msg.gmm_cause = Some(buf.get_u8());
+                        msg.gmm_cause = Some(buf.read_u8()?);
                     }
                 }
                 0x37 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.back_off_timer_value = Some(GprsTimer3::decode(buf)?);
                 }
                 _ => skip_unknown_ie(buf, iei)?,
@@ -1786,92 +1792,92 @@ impl ConfigurationUpdateCommand {
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         let mut msg = Self::default();
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             let iei_type = if iei >= 0x80 { iei & 0xF0 } else { iei };
             match iei_type {
                 0xD0 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.configuration_update_indication = Some(iei & 0x0F);
                 }
                 0x77 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.guti = Some(MobileIdentity::decode(buf)?);
                 }
                 0x54 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.tai_list = Some(TaiList::decode(buf)?);
                 }
                 0x15 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.allowed_nssai = Some(Nssai::decode(buf)?);
                 }
                 0x31 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.configured_nssai = Some(Nssai::decode(buf)?);
                 }
                 0x11 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        let len = buf.get_u8() as usize;
+                        let len = buf.read_u8()? as usize;
                         if buf.remaining() >= len {
-                            msg.rejected_nssai = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.rejected_nssai = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
                 0x43 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        let len = buf.get_u8() as usize;
+                        let len = buf.read_u8()? as usize;
                         if buf.remaining() >= len {
-                            msg.full_name_for_network = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.full_name_for_network = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
                 0x45 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        let len = buf.get_u8() as usize;
+                        let len = buf.read_u8()? as usize;
                         if buf.remaining() >= len {
-                            msg.short_name_for_network = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.short_name_for_network = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
                 0x46 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        msg.local_time_zone = Some(buf.get_u8());
+                        msg.local_time_zone = Some(buf.read_u8()?);
                     }
                 }
                 0x47 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 7 {
                         let mut utltz = [0u8; 7];
-                        buf.copy_to_slice(&mut utltz);
+                        buf.read_into(&mut utltz)?;
                         msg.universal_time_and_local_time_zone = Some(utltz);
                     }
                 }
                 0x49 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
-                        let _len = buf.get_u8();
-                        msg.network_daylight_saving_time = Some(buf.get_u8());
+                        let _len = buf.read_u8()?;
+                        msg.network_daylight_saving_time = Some(buf.read_u8()?);
                     }
                 }
                 0x79 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
-                        let len = buf.get_u16() as usize;
+                        let len = buf.read_u16()? as usize;
                         if buf.remaining() >= len {
-                            msg.ladn_information = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.ladn_information = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
                 0x27 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        let len = buf.get_u8() as usize;
+                        let len = buf.read_u8()? as usize;
                         if buf.remaining() >= len {
-                            msg.service_area_list = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.service_area_list = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
@@ -1902,7 +1908,7 @@ impl Notification {
             });
         }
         Ok(Self {
-            access_type: buf.get_u8() & 0x03,
+            access_type: buf.read_u8()? & 0x03,
         })
     }
 }
@@ -1925,10 +1931,10 @@ impl NotificationResponse {
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         let mut msg = Self::default();
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x50 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.pdu_session_status = Some(PduSessionStatus::decode(buf)?);
                 }
                 _ => skip_unknown_ie(buf, iei)?,
@@ -1989,7 +1995,7 @@ impl ControlPlaneServiceRequest {
                 actual: buf.remaining(),
             });
         }
-        let first_byte = buf.get_u8();
+        let first_byte = buf.read_u8()?;
         let ngksi = KeySetIdentifier::decode((first_byte >> 4) & 0x0F);
         let control_plane_service_type = first_byte & 0x0F;
         let mut msg = Self {
@@ -1998,32 +2004,32 @@ impl ControlPlaneServiceRequest {
             ..Default::default()
         };
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             let iei_type = if iei >= 0x80 { iei & 0xF0 } else { iei };
             match iei_type {
                 0x6F => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
-                        let len = buf.get_u16() as usize;
+                        let len = buf.read_u16()? as usize;
                         if buf.remaining() >= len {
-                            msg.ciot_small_data_container = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.ciot_small_data_container = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
                 0x80 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.payload_container_type = Some(iei & 0x0F);
                 }
                 0x7B => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.payload_container = Some(PayloadContainer::decode(buf)?);
                 }
                 0x50 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.pdu_session_status = Some(PduSessionStatus::decode(buf)?);
                 }
                 0x71 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.nas_message_container = Some(NasMessageContainer::decode(buf)?);
                 }
                 _ => skip_unknown_ie(buf, iei)?,
@@ -2457,29 +2463,29 @@ impl PduSessionEstablishmentRequest {
             });
         }
         let mut ipmdr = [0u8; 2];
-        buf.copy_to_slice(&mut ipmdr);
+        buf.read_into(&mut ipmdr)?;
         let mut msg = Self {
             integrity_protection_max_data_rate: ipmdr,
             ..Default::default()
         };
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             let iei_type = if iei >= 0x80 { iei & 0xF0 } else { iei };
             match iei_type {
                 0x90 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.pdu_session_type = Some(iei & 0x0F);
                 }
                 0xA0 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.ssc_mode = Some(iei & 0x0F);
                 }
                 0x7B => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
-                        let len = buf.get_u16() as usize;
+                        let len = buf.read_u16()? as usize;
                         if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
@@ -2548,7 +2554,7 @@ impl PduSessionEstablishmentAccept {
                 actual: buf.remaining(),
             });
         }
-        let type_byte = buf.get_u8();
+        let type_byte = buf.read_u8()?;
         let selected_pdu_session_type = type_byte & 0x0F;
         let selected_ssc_mode = (type_byte >> 4) & 0x0F;
         let authorized_qos_rules = QosRules::decode(buf)?;
@@ -2561,33 +2567,33 @@ impl PduSessionEstablishmentAccept {
             ..Default::default()
         };
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x59 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        msg.gsm_cause = Some(buf.get_u8());
+                        msg.gsm_cause = Some(buf.read_u8()?);
                     }
                 }
                 0x29 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.pdu_address = Some(PduAddress::decode(buf)?);
                 }
                 0x79 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.authorized_qos_flow_descriptions = Some(QosFlowDescriptions::decode(buf)?);
                 }
                 0x7B => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
-                        let len = buf.get_u16() as usize;
+                        let len = buf.read_u16()? as usize;
                         if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
                 0x25 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.dnn = Some(Dnn::decode(buf)?);
                 }
                 _ => skip_unknown_ie(buf, iei)?,
@@ -2629,24 +2635,24 @@ impl PduSessionEstablishmentReject {
                 actual: buf.remaining(),
             });
         }
-        let gsm_cause = buf.get_u8();
+        let gsm_cause = buf.read_u8()?;
         let mut msg = Self {
             gsm_cause,
             ..Default::default()
         };
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x37 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.back_off_timer_value = Some(GprsTimer3::decode(buf)?);
                 }
                 0x7B => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
-                        let len = buf.get_u16() as usize;
+                        let len = buf.read_u16()? as usize;
                         if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
@@ -2688,22 +2694,22 @@ impl PduSessionModificationRequest {
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         let mut msg = Self::default();
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x7A => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.requested_qos_rules = Some(QosRules::decode(buf)?);
                 }
                 0x79 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.requested_qos_flow_descriptions = Some(QosFlowDescriptions::decode(buf)?);
                 }
                 0x7B => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
-                        let len = buf.get_u16() as usize;
+                        let len = buf.read_u16()? as usize;
                         if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
@@ -2750,24 +2756,24 @@ impl PduSessionModificationCommand {
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         let mut msg = Self::default();
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x59 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        msg.gsm_cause = Some(buf.get_u8());
+                        msg.gsm_cause = Some(buf.read_u8()?);
                     }
                 }
                 0x2A => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.session_ambr = Some(SessionAmbr::decode(buf)?);
                 }
                 0x7A => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.authorized_qos_rules = Some(QosRules::decode(buf)?);
                 }
                 0x79 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.authorized_qos_flow_descriptions = Some(QosFlowDescriptions::decode(buf)?);
                 }
                 _ => skip_unknown_ie(buf, iei)?,
@@ -2809,24 +2815,24 @@ impl PduSessionModificationReject {
                 actual: buf.remaining(),
             });
         }
-        let gsm_cause = buf.get_u8();
+        let gsm_cause = buf.read_u8()?;
         let mut msg = Self {
             gsm_cause,
             ..Default::default()
         };
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x37 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.back_off_timer_value = Some(GprsTimer3::decode(buf)?);
                 }
                 0x7B => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
-                        let len = buf.get_u16() as usize;
+                        let len = buf.read_u16()? as usize;
                         if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
@@ -2863,20 +2869,20 @@ impl PduSessionModificationCommandReject {
                 actual: buf.remaining(),
             });
         }
-        let gsm_cause = buf.get_u8();
+        let gsm_cause = buf.read_u8()?;
         let mut msg = Self {
             gsm_cause,
             ..Default::default()
         };
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x7B => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
-                        let len = buf.get_u16() as usize;
+                        let len = buf.read_u16()? as usize;
                         if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
@@ -2912,20 +2918,20 @@ impl PduSessionReleaseRequest {
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         let mut msg = Self::default();
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x59 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        msg.gsm_cause = Some(buf.get_u8());
+                        msg.gsm_cause = Some(buf.read_u8()?);
                     }
                 }
                 0x7B => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
-                        let len = buf.get_u16() as usize;
+                        let len = buf.read_u16()? as usize;
                         if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
@@ -2962,20 +2968,20 @@ impl PduSessionReleaseReject {
                 actual: buf.remaining(),
             });
         }
-        let gsm_cause = buf.get_u8();
+        let gsm_cause = buf.read_u8()?;
         let mut msg = Self {
             gsm_cause,
             ..Default::default()
         };
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x7B => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
-                        let len = buf.get_u16() as usize;
+                        let len = buf.read_u16()? as usize;
                         if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
@@ -3018,24 +3024,24 @@ impl PduSessionReleaseCommand {
                 actual: buf.remaining(),
             });
         }
-        let gsm_cause = buf.get_u8();
+        let gsm_cause = buf.read_u8()?;
         let mut msg = Self {
             gsm_cause,
             ..Default::default()
         };
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x37 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.back_off_timer_value = Some(GprsTimer3::decode(buf)?);
                 }
                 0x7B => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
-                        let len = buf.get_u16() as usize;
+                        let len = buf.read_u16()? as usize;
                         if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
@@ -3071,20 +3077,20 @@ impl PduSessionReleaseComplete {
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         let mut msg = Self::default();
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x59 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 1 {
-                        msg.gsm_cause = Some(buf.get_u8());
+                        msg.gsm_cause = Some(buf.read_u8()?);
                     }
                 }
                 0x7B => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
-                        let len = buf.get_u16() as usize;
+                        let len = buf.read_u16()? as usize;
                         if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
@@ -3115,7 +3121,7 @@ impl FiveGsmStatus {
             });
         }
         Ok(Self {
-            gsm_cause: buf.get_u8(),
+            gsm_cause: buf.read_u8()?,
         })
     }
 }
@@ -3146,14 +3152,14 @@ impl PduSessionAuthenticationCommand {
             ..Default::default()
         };
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x7B => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
-                        let len = buf.get_u16() as usize;
+                        let len = buf.read_u16()? as usize;
                         if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
@@ -3190,14 +3196,14 @@ impl PduSessionAuthenticationComplete {
             ..Default::default()
         };
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x7B => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
-                        let len = buf.get_u16() as usize;
+                        let len = buf.read_u16()? as usize;
                         if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
@@ -3233,18 +3239,18 @@ impl PduSessionAuthenticationResult {
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         let mut msg = Self::default();
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x78 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     msg.eap_message = Some(EapMessage::decode(buf)?);
                 }
                 0x7B => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
-                        let len = buf.get_u16() as usize;
+                        let len = buf.read_u16()? as usize;
                         if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
@@ -3281,24 +3287,24 @@ impl RemoteUeReport {
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         let mut msg = Self::default();
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             match iei {
                 0x79 => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
-                        let len = buf.get_u16() as usize;
+                        let len = buf.read_u16()? as usize;
                         if buf.remaining() >= len {
-                            msg.remote_ue_context_connected = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.remote_ue_context_connected = Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
                 0x7A => {
-                    buf.advance(1);
+                    buf.skip(1)?;
                     if buf.remaining() >= 2 {
-                        let len = buf.get_u16() as usize;
+                        let len = buf.read_u16()? as usize;
                         if buf.remaining() >= len {
                             msg.remote_ue_context_disconnected =
-                                Some(buf.copy_to_bytes(len).to_vec());
+                                Some(buf.read_bytes(len)?.to_vec());
                         }
                     }
                 }
@@ -3321,7 +3327,7 @@ impl RemoteUeReportResponse {
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         // Skip any optional IEs (type-aware, per TS 24.501 §7.6.1 / TS 24.007).
         while buf.remaining() > 0 {
-            let iei = buf.chunk()[0];
+            let iei = buf.peek_u8()?;
             skip_unknown_ie(buf, iei)?;
         }
         Ok(Self)

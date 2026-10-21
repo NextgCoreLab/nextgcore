@@ -76,35 +76,98 @@ pub struct Gtp2XactPoll {
 }
 
 /// Return the triggered (response) message type for a request type, if the
-/// message pair is known (TS 29.274 Table 6.1-1)
+/// message pair is known (TS 29.274 Table 6.1-1).
+///
+/// For a Command this is the triggered *Request* it normally produces; a Command
+/// can be answered by more than one message type, so use
+/// [`triggered_message_types`] (or [`is_triggered_message`]) to decide whether a
+/// received message closes it.
 pub fn triggered_message_type(request_type: u8) -> Option<u8> {
+    triggered_message_types(request_type).first().copied()
+}
+
+/// Every message type that is a triggered message of `initial_type` and so
+/// closes its transaction (TS 29.274 §7.6, Table 6.1-1). Empty when
+/// `initial_type` is not an initial message this layer knows.
+///
+/// A Command is closed by the triggered Request it causes, which carries the
+/// Command's sequence number (TS 29.274 §7.6: "a Command message ... the
+/// triggered message ... shall be a Request"), or by its Failure Indication:
+/// - Modify Bearer Command (§7.2.14.1): Update Bearer Request, or Modify Bearer
+///   Failure Indication (§7.2.14.2);
+/// - Delete Bearer Command (§7.2.17.1): Delete Bearer Request, or Delete Bearer
+///   Failure Indication (§7.2.17.2);
+/// - Bearer Resource Command (§7.2.5): Create, Update or Delete Bearer Request
+///   (TS 23.401 §5.4.5 step 3 lets the PGW pick any of the three), or Bearer
+///   Resource Failure Indication (§7.2.6).
+pub fn triggered_message_types(initial_type: u8) -> &'static [u8] {
     use Gtp2MessageType as T;
-    let t = match request_type {
-        x if x == T::EchoRequest as u8 => T::EchoResponse as u8,
-        x if x == T::CreateSessionRequest as u8 => T::CreateSessionResponse as u8,
-        x if x == T::ModifyBearerRequest as u8 => T::ModifyBearerResponse as u8,
-        x if x == T::DeleteSessionRequest as u8 => T::DeleteSessionResponse as u8,
-        x if x == T::ChangeNotificationRequest as u8 => T::ChangeNotificationResponse as u8,
-        x if x == T::CreateBearerRequest as u8 => T::CreateBearerResponse as u8,
-        x if x == T::UpdateBearerRequest as u8 => T::UpdateBearerResponse as u8,
-        x if x == T::DeleteBearerRequest as u8 => T::DeleteBearerResponse as u8,
+    macro_rules! types {
+        ($($t:ident),+) => {{
+            const LIST: &[u8] = &[$(T::$t as u8),+];
+            LIST
+        }};
+    }
+    match initial_type {
+        x if x == T::EchoRequest as u8 => types!(EchoResponse),
+        x if x == T::CreateSessionRequest as u8 => types!(CreateSessionResponse),
+        x if x == T::ModifyBearerRequest as u8 => types!(ModifyBearerResponse),
+        x if x == T::DeleteSessionRequest as u8 => types!(DeleteSessionResponse),
+        x if x == T::ChangeNotificationRequest as u8 => types!(ChangeNotificationResponse),
+        x if x == T::CreateBearerRequest as u8 => types!(CreateBearerResponse),
+        x if x == T::UpdateBearerRequest as u8 => types!(UpdateBearerResponse),
+        x if x == T::DeleteBearerRequest as u8 => types!(DeleteBearerResponse),
         x if x == T::CreateIndirectDataForwardingTunnelRequest as u8 => {
-            T::CreateIndirectDataForwardingTunnelResponse as u8
+            types!(CreateIndirectDataForwardingTunnelResponse)
         }
         x if x == T::DeleteIndirectDataForwardingTunnelRequest as u8 => {
-            T::DeleteIndirectDataForwardingTunnelResponse as u8
+            types!(DeleteIndirectDataForwardingTunnelResponse)
         }
-        x if x == T::ReleaseAccessBearersRequest as u8 => T::ReleaseAccessBearersResponse as u8,
-        x if x == T::DownlinkDataNotification as u8 => T::DownlinkDataNotificationAcknowledge as u8,
-        x if x == T::ModifyAccessBearersRequest as u8 => T::ModifyAccessBearersResponse as u8,
-        x if x == T::CreateForwardingTunnelRequest as u8 => T::CreateForwardingTunnelResponse as u8,
-        x if x == T::DeletePdnConnectionSetRequest as u8 => T::DeletePdnConnectionSetResponse as u8,
-        x if x == T::UpdatePdnConnectionSetRequest as u8 => T::UpdatePdnConnectionSetResponse as u8,
+        x if x == T::ReleaseAccessBearersRequest as u8 => types!(ReleaseAccessBearersResponse),
+        x if x == T::DownlinkDataNotification as u8 => {
+            types!(DownlinkDataNotificationAcknowledge)
+        }
+        x if x == T::ModifyAccessBearersRequest as u8 => types!(ModifyAccessBearersResponse),
+        x if x == T::CreateForwardingTunnelRequest as u8 => {
+            types!(CreateForwardingTunnelResponse)
+        }
+        x if x == T::DeletePdnConnectionSetRequest as u8 => {
+            types!(DeletePdnConnectionSetResponse)
+        }
+        x if x == T::UpdatePdnConnectionSetRequest as u8 => {
+            types!(UpdatePdnConnectionSetResponse)
+        }
+        x if x == T::ModifyBearerCommand as u8 => {
+            types!(UpdateBearerRequest, ModifyBearerFailureIndication)
+        }
+        x if x == T::DeleteBearerCommand as u8 => {
+            types!(DeleteBearerRequest, DeleteBearerFailureIndication)
+        }
         // #592: N26/S10/S3 handover cancel (TS 29.274 §7.3.16-7.3.17).
-        x if x == T::RelocationCancelRequest as u8 => T::RelocationCancelResponse as u8,
-        _ => return None,
-    };
-    Some(t)
+        x if x == T::RelocationCancelRequest as u8 => types!(RelocationCancelResponse),
+        x if x == T::BearerResourceCommand as u8 => types!(
+            CreateBearerRequest,
+            UpdateBearerRequest,
+            DeleteBearerRequest,
+            BearerResourceFailureIndication
+        ),
+        _ => &[],
+    }
+}
+
+/// Whether `message_type` is a triggered message of `initial_type`, i.e. one
+/// that closes a transaction opened by `initial_type` (TS 29.274 §7.6).
+pub fn is_triggered_message(initial_type: u8, message_type: u8) -> bool {
+    triggered_message_types(initial_type).contains(&message_type)
+}
+
+/// Whether `message_type` is a Command (TS 29.274 §7.6), whose triggered
+/// message is itself a Request the receiver must answer.
+pub fn is_command(message_type: u8) -> bool {
+    use Gtp2MessageType as T;
+    message_type == T::ModifyBearerCommand as u8
+        || message_type == T::DeleteBearerCommand as u8
+        || message_type == T::BearerResourceCommand as u8
 }
 
 /// GTPv2-C transaction manager
@@ -112,8 +175,14 @@ pub fn triggered_message_type(request_type: u8) -> Option<u8> {
 pub struct Gtp2XactMgr {
     config: Gtp2XactConfig,
     next_sequence: u32,
-    /// Outstanding locally originated requests, keyed by sequence number
-    local: HashMap<u32, Gtp2LocalXact>,
+    /// Outstanding locally originated requests, keyed by (peer, sequence number).
+    ///
+    /// The peer is part of the key because a triggered Request (one answering a
+    /// peer's Command) carries the *Command's* sequence number, which comes from
+    /// the peer's sequence space, not this node's (TS 29.274 §7.6). A relay such as
+    /// the SGW-C sends those with numbers it did not allocate, so keyed by number
+    /// alone one could silently replace an unrelated outstanding request.
+    local: HashMap<(SocketAddr, u32), Gtp2LocalXact>,
     /// Cached responses for duplicate peer requests
     responses: HashMap<(SocketAddr, u32), CachedResponse>,
 }
@@ -164,23 +233,45 @@ impl Gtp2XactMgr {
             deadline: Instant::now() + self.config.t3_response,
             retries_left: self.config.n3_requests,
         };
-        self.local.insert(sequence_number, xact);
+        self.local.insert((peer, sequence_number), xact);
     }
 
     /// Match an incoming triggered message to an outstanding request.
     /// Returns the completed transaction if the sequence number matches an
-    /// outstanding request and `response_type` is the correct triggered type.
+    /// outstanding request and `response_type` is one of its triggered types
+    /// ([`triggered_message_types`]): a Response for a Request, the triggered
+    /// Request or the Failure Indication for a Command.
+    ///
+    /// Matches on any peer. Prefer [`Self::match_response_from`] where the
+    /// sender is known.
     pub fn match_response(
         &mut self,
         sequence_number: u32,
         response_type: u8,
     ) -> Option<Gtp2LocalXact> {
-        let expected = self
+        let key = self
             .local
-            .get(&sequence_number)
-            .and_then(|xact| triggered_message_type(xact.message_type));
-        match expected {
-            Some(t) if t == response_type => self.local.remove(&sequence_number),
+            .iter()
+            .find(|((_, seq), xact)| {
+                *seq == sequence_number && is_triggered_message(xact.message_type, response_type)
+            })
+            .map(|(key, _)| *key)?;
+        self.local.remove(&key)
+    }
+
+    /// [`Self::match_response`] for a triggered message received from `peer`:
+    /// only a request sent to that peer can be closed by it.
+    pub fn match_response_from(
+        &mut self,
+        peer: SocketAddr,
+        sequence_number: u32,
+        response_type: u8,
+    ) -> Option<Gtp2LocalXact> {
+        let key = (peer, sequence_number);
+        match self.local.get(&key) {
+            Some(xact) if is_triggered_message(xact.message_type, response_type) => {
+                self.local.remove(&key)
+            }
             _ => None,
         }
     }
@@ -194,14 +285,14 @@ impl Gtp2XactMgr {
     /// transactions that must be treated as peer-unreachable.
     pub fn poll(&mut self, now: Instant) -> Gtp2XactPoll {
         let mut result = Gtp2XactPoll::default();
-        let mut exhausted_seqs = Vec::new();
+        let mut exhausted_keys = Vec::new();
 
         for xact in self.local.values_mut() {
             if now < xact.deadline {
                 continue;
             }
             if xact.retries_left == 0 {
-                exhausted_seqs.push(xact.sequence_number);
+                exhausted_keys.push((xact.peer, xact.sequence_number));
             } else {
                 xact.retries_left -= 1;
                 xact.deadline = now + self.config.t3_response;
@@ -209,8 +300,8 @@ impl Gtp2XactMgr {
             }
         }
 
-        for seq in exhausted_seqs {
-            if let Some(xact) = self.local.remove(&seq) {
+        for key in exhausted_keys {
+            if let Some(xact) = self.local.remove(&key) {
                 result.exhausted.push(xact);
             }
         }
@@ -389,5 +480,117 @@ mod tests {
         );
         // A response type has no triggered message
         assert_eq!(triggered_message_type(T::CreateSessionResponse as u8), None);
+    }
+
+    /// #591: every Command pairs with the triggered Requests and the Failure
+    /// Indication TS 29.274 §7.6 / Table 6.1-1 give it, and with nothing else.
+    #[test]
+    fn every_command_pairs_with_its_triggered_messages() {
+        use Gtp2MessageType as T;
+        let pairs: &[(T, &[T])] = &[
+            (
+                T::ModifyBearerCommand,
+                &[T::UpdateBearerRequest, T::ModifyBearerFailureIndication],
+            ),
+            (
+                T::DeleteBearerCommand,
+                &[T::DeleteBearerRequest, T::DeleteBearerFailureIndication],
+            ),
+            (
+                T::BearerResourceCommand,
+                &[
+                    T::CreateBearerRequest,
+                    T::UpdateBearerRequest,
+                    T::DeleteBearerRequest,
+                    T::BearerResourceFailureIndication,
+                ],
+            ),
+        ];
+        for (command, triggered) in pairs {
+            let command = *command as u8;
+            let expected: Vec<u8> = triggered.iter().map(|t| *t as u8).collect();
+            assert_eq!(triggered_message_types(command), expected.as_slice());
+            assert!(is_command(command));
+            for t in 0..=u8::MAX {
+                assert_eq!(
+                    is_triggered_message(command, t),
+                    expected.contains(&t),
+                    "command {command} / type {t}"
+                );
+            }
+        }
+        // A Command's own Response type does not exist; a Response closes nothing.
+        assert!(!is_command(T::DeleteBearerRequest as u8));
+        assert_eq!(
+            triggered_message_type(T::DeleteBearerCommand as u8),
+            Some(T::DeleteBearerRequest as u8)
+        );
+    }
+
+    /// #591: the triggered message closes a Command's transaction, so T3/N3 no
+    /// longer retransmits it.
+    #[test]
+    fn a_triggered_request_stops_the_command_retransmitting() {
+        use Gtp2MessageType as T;
+        let config = Gtp2XactConfig {
+            t3_response: Duration::from_millis(1),
+            n3_requests: 3,
+            response_hold: Duration::from_secs(1),
+        };
+        for (command, triggered) in [
+            (T::DeleteBearerCommand, T::DeleteBearerRequest),
+            (T::DeleteBearerCommand, T::DeleteBearerFailureIndication),
+            (T::ModifyBearerCommand, T::UpdateBearerRequest),
+            (T::ModifyBearerCommand, T::ModifyBearerFailureIndication),
+            (T::BearerResourceCommand, T::CreateBearerRequest),
+            (T::BearerResourceCommand, T::UpdateBearerRequest),
+            (T::BearerResourceCommand, T::DeleteBearerRequest),
+            (T::BearerResourceCommand, T::BearerResourceFailureIndication),
+        ] {
+            let mut mgr = Gtp2XactMgr::new(config);
+            let seq = mgr.alloc_sequence();
+            mgr.register_request(seq, command as u8, peer(), Bytes::from_static(b"cmd"), 7);
+            // A Response type is not the triggered message of a Command.
+            assert!(mgr
+                .match_response(seq, T::DeleteBearerResponse as u8)
+                .is_none());
+            let closed = mgr
+                .match_response_from(peer(), seq, triggered as u8)
+                .unwrap_or_else(|| panic!("{command:?} not closed by {triggered:?}"));
+            assert_eq!(closed.message_type, command as u8);
+            assert_eq!(closed.data, 7);
+            std::thread::sleep(Duration::from_millis(3));
+            let poll = mgr.poll(Instant::now());
+            assert!(
+                poll.retransmits.is_empty(),
+                "{command:?} still retransmitted"
+            );
+            assert!(poll.exhausted.is_empty());
+        }
+    }
+
+    /// A triggered Request a relay sends carries the peer's sequence number, so
+    /// the same number may be outstanding towards two peers at once. Each one is
+    /// closed only by its own answer.
+    #[test]
+    fn the_same_sequence_towards_two_peers_is_two_transactions() {
+        use Gtp2MessageType as T;
+        let other: SocketAddr = "127.0.0.2:2123".parse().unwrap();
+        let mut mgr = Gtp2XactMgr::default();
+        mgr.register_request(5, T::CreateSessionRequest as u8, peer(), Bytes::new(), 1);
+        mgr.register_request(5, T::DeleteBearerRequest as u8, other, Bytes::new(), 2);
+        assert_eq!(mgr.outstanding(), 2);
+        assert!(mgr
+            .match_response_from(peer(), 5, T::DeleteBearerResponse as u8)
+            .is_none());
+        let closed = mgr
+            .match_response_from(other, 5, T::DeleteBearerResponse as u8)
+            .unwrap();
+        assert_eq!(closed.data, 2);
+        let closed = mgr
+            .match_response(5, T::CreateSessionResponse as u8)
+            .unwrap();
+        assert_eq!(closed.data, 1);
+        assert_eq!(mgr.outstanding(), 0);
     }
 }

@@ -86,7 +86,27 @@ struct GtpcInner {
     peer_restart: Mutex<HashMap<IpAddr, u8>>,
     /// Path state per peer
     peer_state: Mutex<HashMap<SocketAddr, GtpPathState>>,
+    /// Commands relayed MME -> PGW and awaiting their triggered message, keyed by
+    /// (PGW peer, S5-C sequence number) (#591).
+    command_relays: Mutex<HashMap<(SocketAddr, u32), CommandRelay>>,
     running: AtomicBool,
+}
+
+/// A Command this SGW-C relayed from the MME to the PGW (#591).
+///
+/// TS 29.274 §7.6: the triggered message of a Command carries the Command's
+/// sequence number. The SGW-C renumbers the Command into its own S5-C sequence
+/// space, so the PGW's triggered message comes back under that number, and must
+/// go on to the MME under the number the MME used, or the MME cannot tell that
+/// its Command was answered and keeps retransmitting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommandRelay {
+    /// The MME that sent the Command.
+    mme_peer: SocketAddr,
+    /// The Command's sequence number on S11.
+    mme_seq: u32,
+    /// The MME's S11 control TEID, which the relayed answer is addressed to.
+    mme_teid: u32,
 }
 
 /// GTPv2-C server bound to the S11 interface
@@ -111,6 +131,7 @@ impl GtpcServer {
             xact: Mutex::new(Gtp2XactMgr::new(config)),
             peer_restart: Mutex::new(HashMap::new()),
             peer_state: Mutex::new(HashMap::new()),
+            command_relays: Mutex::new(HashMap::new()),
             running: AtomicBool::new(true),
         });
 
@@ -173,6 +194,9 @@ impl GtpcServer {
                             );
                             if let Ok(mut states) = inner.peer_state.lock() {
                                 states.insert(xact.peer, GtpPathState::Failed);
+                            }
+                            if let Ok(mut relays) = inner.command_relays.lock() {
+                                relays.remove(&(xact.peer, xact.sequence_number));
                             }
                             // A failed path leaves the same stale contexts a
                             // restart does, so run the same cleanup rather than
@@ -262,6 +286,43 @@ impl GtpcServer {
             .lock()
             .map(|mut x| x.alloc_sequence())
             .unwrap_or(1)
+    }
+
+    /// Remember a Command relayed to `pgw_peer` at S5-C sequence `s5c_seq` (#591).
+    fn record_command_relay(&self, pgw_peer: SocketAddr, s5c_seq: u32, relay: CommandRelay) {
+        if let Ok(mut relays) = self.inner.command_relays.lock() {
+            relays.insert((pgw_peer, s5c_seq), relay);
+        }
+    }
+
+    /// Forget a relayed Command, returning what was recorded for it.
+    fn take_command_relay(&self, pgw_peer: SocketAddr, s5c_seq: u32) -> Option<CommandRelay> {
+        self.inner
+            .command_relays
+            .lock()
+            .ok()?
+            .remove(&(pgw_peer, s5c_seq))
+    }
+
+    /// If `msg_type` from `pgw_peer` at `s5c_seq` is the triggered message of a
+    /// Command this node relayed, close the Command's S5-C transaction (TS 29.274
+    /// §7.6) and return where the MME expects the answer (#591).
+    fn close_command_relay(
+        &self,
+        pgw_peer: SocketAddr,
+        s5c_seq: u32,
+        msg_type: u8,
+    ) -> Option<CommandRelay> {
+        let closed = self
+            .inner
+            .xact
+            .lock()
+            .ok()?
+            .match_response_from(pgw_peer, s5c_seq, msg_type)?;
+        if !nextgcore_gtp::v2::xact::is_command(closed.message_type) {
+            return None;
+        }
+        self.take_command_relay(pgw_peer, s5c_seq)
     }
 
     /// Send an initial (request) message and arm T3/N3 retransmission.
@@ -817,7 +878,39 @@ fn handle_datagram(inner: &Arc<GtpcInner>, data: &[u8], peer: SocketAddr) {
             || t == T::UpdateBearerRequest as u8
             || t == T::DeleteBearerRequest as u8 =>
         {
-            forward_pgw_bearer_procedure_to_mme(inner, &msg, peer, data);
+            // #591: the triggered Request of a Command this node relayed closes
+            // that Command's S5-C transaction and goes to the MME under the
+            // Command's S11 sequence number.
+            let relay = server.close_command_relay(peer, seq, msg_type);
+            forward_pgw_bearer_procedure_to_mme(inner, &msg, peer, data, relay);
+        }
+        // #591: a Command the PGW refused. The Failure Indication is the Command's
+        // triggered message on both legs, so it is relayed under the S11 sequence
+        // number, not dropped as an unknown message.
+        t if t == T::BearerResourceFailureIndication as u8
+            || t == T::DeleteBearerFailureIndication as u8
+            || t == T::ModifyBearerFailureIndication as u8 =>
+        {
+            match server.close_command_relay(peer, seq, msg_type) {
+                Some(relay) => {
+                    let mut relayed = msg.clone();
+                    relayed.header.teid = Some(relay.mme_teid);
+                    relayed.header.sequence_number = relay.mme_seq;
+                    log::info!(
+                        "Relaying Failure Indication type {msg_type} from PGW {peer} to MME {} \
+                         (seq {seq} -> {})",
+                        relay.mme_peer,
+                        relay.mme_seq
+                    );
+                    if let Err(e) = server.send_response(relay.mme_peer, &relayed) {
+                        log::error!("Failure Indication relay to {} failed: {e}", relay.mme_peer);
+                    }
+                }
+                None => log::warn!(
+                    "Failure Indication type {msg_type} seq={seq} from {peer} answers no Command \
+                     this node relayed; dropped"
+                ),
+            }
         }
         other => {
             log::error!("[DROP] Unhandled GTPv2-C message type {other} from {peer}");
@@ -840,6 +933,7 @@ fn forward_pgw_bearer_procedure_to_mme(
     msg: &Gtp2Message,
     peer: SocketAddr,
     data: &[u8],
+    triggered_by: Option<CommandRelay>,
 ) {
     let ctx = sgwc_self();
     let msg_type = msg.header.message_type;
@@ -862,7 +956,7 @@ fn forward_pgw_bearer_procedure_to_mme(
         log::warn!("S5/S8 message type {msg_type} from {peer}: the session has no UE context");
         return;
     };
-    let Some(mme_peer) = ue.mme_addr else {
+    let Some(mme_peer) = triggered_by.map(|r| r.mme_peer).or(ue.mme_addr) else {
         log::warn!(
             "S5/S8 message type {msg_type} from {peer}: no MME address recorded for this UE, so \
              the procedure cannot be relayed"
@@ -877,7 +971,12 @@ fn forward_pgw_bearer_procedure_to_mme(
     let server = GtpcServer {
         inner: inner.clone(),
     };
-    let seq = server.alloc_sequence();
+    // A triggered Request keeps the MME's Command sequence number (TS 29.274
+    // §7.6, #591); any other is a new transaction in this node's space.
+    let seq = match triggered_by {
+        Some(relay) => relay.mme_seq,
+        None => server.alloc_sequence(),
+    };
     relayed.header.sequence_number = seq;
 
     log::info!(
@@ -1962,7 +2061,19 @@ fn dispatch_bearer_resource_command(server: &GtpcServer, msg: &Gtp2Message, peer
                         "Relaying Bearer Resource Command to PGW {pgw_peer} (S5-C TEID \
                          {pgw_teid:#x}, seq {s5c_seq})"
                     );
+                    // #591: remembered before the send, so a triggered message that
+                    // races the return of `send_to` still finds it.
+                    server.record_command_relay(
+                        pgw_peer,
+                        s5c_seq,
+                        CommandRelay {
+                            mme_peer: peer,
+                            mme_seq: seq,
+                            mme_teid: teid,
+                        },
+                    );
                     if let Err(e) = server.send_request(pgw_peer, &relayed, 0) {
+                        server.take_command_relay(pgw_peer, s5c_seq);
                         log::error!("Bearer Resource Command relay to {pgw_peer} failed: {e}");
                         send_cause_response(
                             server,
@@ -3438,6 +3549,116 @@ mod tests {
         );
         assert_eq!(server.inner.xact.lock().unwrap().outstanding(), 0);
 
+        server.close();
+    }
+
+    /// A UE whose MME is `mme`, with one session anchored at a PGW and default
+    /// bearer 5. Returns (UE id, SGW S11 TEID, SGW S5-C TEID).
+    fn ue_with_pgw_session(mme: SocketAddr, imsi: &[u8]) -> (u64, u32, u32) {
+        let ctx = sgwc_self();
+        let mut ue = ctx.ue_add(imsi).expect("ue");
+        ue.mme_addr = Some(mme);
+        ue.mme_s11_teid = 0x0000_0591;
+        ctx.ue_update(&ue);
+        let mut sess = ctx.sess_add(ue.id, "internet").expect("sess");
+        sess.pgw_s5c_teid = 0x0000_5c5c;
+        ctx.sess_update(&sess);
+        let mut bearer = ctx.bearer_add(sess.id).expect("bearer");
+        bearer.ebi = 5;
+        ctx.bearer_update(&bearer);
+        (ue.id, ue.sgw_s11_teid, sess.sgw_s5c_teid)
+    }
+
+    /// #591, TS 29.274 §7.6: a Bearer Resource Command relayed to the PGW is
+    /// closed by the PGW's triggered message, which goes on to the MME under the
+    /// sequence number the MME used. Before #591 the S5-C Command was retransmitted
+    /// until N3, the triggered Create Bearer Request reached the MME under a new
+    /// number (so the MME's Command never closed either), and a Bearer Resource
+    /// Failure Indication was dropped as an unknown message.
+    #[test]
+    fn a_relayed_command_is_closed_by_its_triggered_message_on_both_legs() {
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let server = test_server(&ambient, 100, 3);
+        let mme = client();
+        let pgw = client();
+        sgwc_self().set_pgw_s5c_peer(Some(pgw.local_addr().unwrap()));
+
+        for (n, triggered) in [
+            Gtp2MessageType::CreateBearerRequest,
+            Gtp2MessageType::BearerResourceFailureIndication,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let imsi = format!("00101059100000{n}");
+            let (ue_id, s11_teid, s5c_teid) =
+                ue_with_pgw_session(mme.local_addr().unwrap(), imsi.as_bytes());
+            let mme_seq = 0x0005_9100 + n as u32;
+            let mut brc = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+                Gtp2MessageType::BearerResourceCommand as u8,
+                s11_teid,
+                mme_seq,
+            ));
+            brc.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Ebi as u8, 0, &[5]));
+            mme.send_to(&brc.encode(), server.local_addr()).unwrap();
+
+            let relayed = recv_msg(&pgw);
+            assert_eq!(
+                relayed.header.message_type,
+                Gtp2MessageType::BearerResourceCommand as u8
+            );
+            assert_eq!(relayed.header.teid, Some(0x0000_5c5c));
+            let s5c_seq = relayed.header.sequence_number;
+
+            // The PGW answers with the triggered message under the S5-C number.
+            let mut answer = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+                triggered as u8,
+                s5c_teid,
+                s5c_seq,
+            ));
+            answer.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Ebi as u8, 0, &[5]));
+            if triggered == Gtp2MessageType::BearerResourceFailureIndication {
+                answer.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Cause as u8, 0, &[73, 0]));
+            }
+            pgw.send_to(&answer.encode(), server.local_addr()).unwrap();
+
+            // The MME receives it under ITS number, addressed to its TEID.
+            let at_mme = recv_msg(&mme);
+            assert_eq!(at_mme.header.message_type, triggered as u8);
+            assert_eq!(
+                at_mme.header.sequence_number, mme_seq,
+                "{triggered:?} must reach the MME under the Command's S11 sequence number"
+            );
+            assert_eq!(at_mme.header.teid, Some(0x0000_0591));
+            if triggered == Gtp2MessageType::CreateBearerRequest {
+                // The MME answers the triggered Request under the same number,
+                // which closes the SGW-C's S11 transaction for it.
+                let mut rsp = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+                    Gtp2MessageType::CreateBearerResponse as u8,
+                    s11_teid,
+                    mme_seq,
+                ));
+                rsp.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Cause as u8, 0, &[16, 0]));
+                mme.send_to(&rsp.encode(), server.local_addr()).unwrap();
+            }
+
+            // And the S5-C Command is not retransmitted after its answer.
+            pgw.set_read_timeout(Some(Duration::from_millis(450)))
+                .unwrap();
+            let mut buf = [0u8; 2048];
+            let mut retransmitted = 0;
+            while let Ok((len, _)) = pgw.recv_from(&mut buf) {
+                if buf[..len].get(1) == Some(&(Gtp2MessageType::BearerResourceCommand as u8)) {
+                    retransmitted += 1;
+                }
+            }
+            assert_eq!(retransmitted, 0, "the S5-C Command was retransmitted");
+            pgw.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            assert!(server.inner.command_relays.lock().unwrap().is_empty());
+            assert_eq!(server.inner.xact.lock().unwrap().outstanding(), 0);
+            sgwc_self().ue_remove(ue_id);
+        }
+        sgwc_self().set_pgw_s5c_peer(None);
         server.close();
     }
 

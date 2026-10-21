@@ -3,6 +3,9 @@
 //! Exercises the real `nextgcore_nas` decoders (5GS NAS, TS 24.501, and EPS NAS,
 //! TS 24.301: every message body and the plain/security headers) against
 //! arbitrary bytes. The first byte selects the decoder, the rest is its input.
+//! After the per-message tables come the dispatching parsers (`parse_*`, the
+//! secured 5GMM path), the UE policy delivery service (TS 24.501 Annex D) and
+//! the identity decoders that take a caller-supplied length (#595).
 //! Before #587 this target carried its own hand-written parser and called nothing
 //! in `nextgcore_nas`. No decoder may panic; malformed input is `Err`.
 //!
@@ -12,7 +15,9 @@
 
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
-use nextgcore_nas::{eps, fiveg};
+use nextgcore_nas::common::security::{unprotect_nas_message, NasSecurityContext};
+use nextgcore_nas::fiveg::ue_policy;
+use nextgcore_nas::{eps, fiveg, interworking};
 
 type Decoder = fn(&mut Bytes) -> bool;
 
@@ -117,13 +122,70 @@ const EPS: &[Decoder] = &[
     |b| eps::EpsNasSecurityHeader::decode(b).is_ok(),
 ];
 
+/// Length-taking decoders get the body length, as their callers pass the IE
+/// length octet they just read.
+const OTHER: &[Decoder] = &[
+    |b| fiveg::parse_5gmm_message(b).is_ok(),
+    |b| fiveg::parse_5gsm_message(b).is_ok(),
+    |b| eps::parse_emm_message(b).is_ok(),
+    |b| eps::parse_esm_message(b).is_ok(),
+    |b| fiveg::parse_5gmm_secured(b, &mut NasSecurityContext::default()).is_ok(),
+    |b| unprotect_nas_message(&mut NasSecurityContext::default(), 0, b, false).is_ok(),
+    |b| unprotect_nas_message(&mut NasSecurityContext::default(), 1, b, true).is_ok(),
+    |b| fiveg::MobileIdentity::decode(b).is_ok(),
+    |b| {
+        let n = b.len();
+        fiveg::Suci::decode_content(b, n).is_ok()
+    },
+    |b| {
+        let n = b.len();
+        fiveg::FiveGGuti::decode_content(b, n).is_ok()
+    },
+    |b| {
+        let n = b.len();
+        fiveg::FiveGSTmsi::decode_content(b, n).is_ok()
+    },
+    |b| {
+        let n = b.len();
+        fiveg::Imei::decode_content(b, n).is_ok()
+    },
+    |b| {
+        let n = b.len();
+        fiveg::Imeisv::decode_content(b, n).is_ok()
+    },
+    |b| eps::EpsMobileIdentity::decode(b).is_ok(),
+    |b| {
+        let n = b.len();
+        eps::EpsImsi::decode(b, n).is_ok()
+    },
+    |b| {
+        let n = b.len();
+        eps::EpsImei::decode(b, n).is_ok()
+    },
+    |b| {
+        let n = b.len();
+        eps::EpsGuti::decode(b, n).is_ok()
+    },
+    |b| ue_policy::peek_message_type(b).is_ok(),
+    |b| ue_policy::ManageUePolicyCommand::decode(b).is_ok(),
+    |b| ue_policy::ManageUePolicyComplete::decode(b).is_ok(),
+    |b| ue_policy::ManageUePolicyCommandReject::decode(b).is_ok(),
+    |b| ue_policy::UeStateIndication::decode(b).is_ok(),
+    |b| ue_policy::decode_ursp_rules(b).is_ok(),
+    |b| ue_policy::UePolicySectionManagementList::decode_lv_e(b).is_ok(),
+    |b| interworking::FiveGsNetworkFeatureSupport::decode_contents(b).is_some(),
+    |b| interworking::claims_s1_mode(b),
+];
+
 fuzz_target!(|data: &[u8]| {
     if let Some((&sel, body)) = data.split_first() {
-        let sel = sel as usize % (FIVEG.len() + EPS.len());
+        let sel = sel as usize % (FIVEG.len() + EPS.len() + OTHER.len());
         let decode = if sel < FIVEG.len() {
             FIVEG[sel]
-        } else {
+        } else if sel < FIVEG.len() + EPS.len() {
             EPS[sel - FIVEG.len()]
+        } else {
+            OTHER[sel - FIVEG.len() - EPS.len()]
         };
         let _ = decode(&mut Bytes::copy_from_slice(body));
     }

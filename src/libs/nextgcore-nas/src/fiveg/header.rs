@@ -2,6 +2,7 @@
 //!
 //! Based on 3GPP TS 24.501
 
+use crate::buf::NasBuf;
 use crate::common::types::{ProtocolDiscriminator, SecurityHeaderType};
 use crate::error::{NasError, NasResult};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -195,9 +196,9 @@ impl FiveGsNasHeader {
             });
         }
 
-        let extended_protocol_discriminator = buf.get_u8();
-        let security_header_type = SecurityHeaderType::try_from(buf.get_u8() & 0x0F)?;
-        let message_type = buf.get_u8();
+        let extended_protocol_discriminator = buf.read_u8()?;
+        let security_header_type = SecurityHeaderType::try_from(buf.read_u8()? & 0x0F)?;
+        let message_type = buf.read_u8()?;
 
         Ok(Self {
             extended_protocol_discriminator,
@@ -239,10 +240,10 @@ impl FiveGsNasSmHeader {
         }
 
         Ok(Self {
-            extended_protocol_discriminator: buf.get_u8(),
-            pdu_session_id: buf.get_u8(),
-            procedure_transaction_identity: buf.get_u8(),
-            message_type: buf.get_u8(),
+            extended_protocol_discriminator: buf.read_u8()?,
+            pdu_session_id: buf.read_u8()?,
+            procedure_transaction_identity: buf.read_u8()?,
+            message_type: buf.read_u8()?,
         })
     }
 }
@@ -278,11 +279,11 @@ impl FiveGsNasSecurityHeader {
             });
         }
 
-        let extended_protocol_discriminator = buf.get_u8();
-        let security_header_type = SecurityHeaderType::try_from(buf.get_u8() & 0x0F)?;
+        let extended_protocol_discriminator = buf.read_u8()?;
+        let security_header_type = SecurityHeaderType::try_from(buf.read_u8()? & 0x0F)?;
         let mut message_authentication_code = [0u8; 4];
-        buf.copy_to_slice(&mut message_authentication_code);
-        let sequence_number = buf.get_u8();
+        buf.read_into(&mut message_authentication_code)?;
+        let sequence_number = buf.read_u8()?;
 
         Ok(Self {
             extended_protocol_discriminator,

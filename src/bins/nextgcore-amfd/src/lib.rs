@@ -1119,6 +1119,31 @@ pub async fn run() -> Result<()> {
 mod tests {
     use super::*;
 
+    /// A fixture path inside a directory nothing else touches (#601).
+    ///
+    /// `std::env::temp_dir()` is host-wide: two amfd test binaries running at once (two
+    /// worktrees, two agents, a CI matrix sharing /tmp) would otherwise race on one fixed
+    /// filename, one deleting or rewriting it while the other loads it. The directory is named
+    /// for this process AND this fixture, so neither a concurrent process nor a sibling test in
+    /// this process can create, rewrite or remove it. Pair with [`remove_fixture`].
+    fn unique_fixture_path(file_name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nextgcore-amfd-{}-{}",
+            std::process::id(),
+            file_name
+        ));
+        std::fs::create_dir_all(&dir).expect("create the fixture dir");
+        dir.join(file_name)
+    }
+
+    /// Remove a [`unique_fixture_path`] file and its (now empty, single-owner) directory.
+    fn remove_fixture(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+
     #[test]
     fn test_amf_app_creation() {
         let app = AmfApp::new();
@@ -1172,9 +1197,9 @@ amf:
   emergency:
     allow_unauthenticated: false
 "#;
-        // A distinct filename from every sibling config test: these run in one process against
-        // one temp dir, so a shared name would have two tests overwrite each other's fixture.
-        let path = std::env::temp_dir().join("nextgcore-amfd-361-emergency-policy.yaml");
+        // A distinct filename from every sibling config test (they share this process's fixture
+        // dir), inside a directory no other test process shares (#601).
+        let path = unique_fixture_path("nextgcore-amfd-361-emergency-policy.yaml");
         {
             let mut f = std::fs::File::create(&path).expect("write the fixture config");
             f.write_all(yaml.as_bytes())
@@ -1205,7 +1230,7 @@ amf:
         crate::emergency::set_allow_unauthenticated_emergency(
             crate::emergency::EmergencyPolicy::default(),
         );
-        let _ = std::fs::remove_file(&path);
+        remove_fixture(&path);
     }
 
     /// #363: there is ONE `AmfContext` in the process, so everything the config loader
@@ -1256,7 +1281,7 @@ amf:
     t3502:
       value: 888
 "#;
-        let path = std::env::temp_dir().join("nextgcore-amfd-363-one-context.yaml");
+        let path = unique_fixture_path("nextgcore-amfd-363-one-context.yaml");
         {
             let mut f = std::fs::File::create(&path).expect("write the fixture config");
             f.write_all(yaml.as_bytes())
@@ -1371,7 +1396,7 @@ amf:
             c.t3502_value = saved.11;
             c.amf_name = saved.12;
         }
-        let _ = std::fs::remove_file(&path);
+        remove_fixture(&path);
     }
 
     #[test]
