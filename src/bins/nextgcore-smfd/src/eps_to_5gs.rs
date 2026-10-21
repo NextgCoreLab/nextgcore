@@ -114,77 +114,39 @@ fn build_handover_setup_request_transfer(
     bearers: &[context::SmfBearer],
     n3_ul: (u32, [u8; 4]),
     forwarding: eps_iwk::DataForwarding,
-) -> nextgcore_ngap::NgapResult<Vec<u8>> {
-    use nextgcore_ngap::transfer::{
-        AllocationAndRetentionPriority, GbrQosInformation, GtpTunnel, NonDynamic5qiDescriptor,
-        PduSessionAggregateMaximumBitRate, PduSessionResourceSetupRequestTransfer, PduSessionType,
-        PreEmptionCapability, PreEmptionVulnerability, QosCharacteristics,
-        QosFlowLevelQosParameters, QosFlowSetupRequestItem, TransportLayerAddress,
-        UpTransportLayerInformation,
-    };
+) -> Result<Vec<u8>, crate::n2_transfer::TransferError> {
+    use crate::n2_transfer::{Arp, Gbr, QosFlowSetup, SetupRequest};
     let flows = bearers
         .iter()
-        .map(|b| {
-            let gbr =
-                (b.qos.gbr_uplink > 0 || b.qos.gbr_downlink > 0).then_some(GbrQosInformation {
-                    maximum_flow_bit_rate_dl: b.qos.mbr_downlink,
-                    maximum_flow_bit_rate_ul: b.qos.mbr_uplink,
-                    guaranteed_flow_bit_rate_dl: b.qos.gbr_downlink,
-                    guaranteed_flow_bit_rate_ul: b.qos.gbr_uplink,
-                    notification_control: false,
-                    maximum_packet_loss_rate_dl: None,
-                    maximum_packet_loss_rate_ul: None,
-                });
-            QosFlowSetupRequestItem {
-                qos_flow_identifier: b.ebi,
-                qos_flow_level_qos_parameters: QosFlowLevelQosParameters {
-                    // TS 23.501 §5.7.4: the standardized QCIs 1..9 and their 5QIs share
-                    // values, which is what lets a PGW-C+SMF map one onto the other.
-                    qos_characteristics: QosCharacteristics::NonDynamic5qi(
-                        NonDynamic5qiDescriptor::new(u16::from(b.qos.index)),
-                    ),
-                    allocation_and_retention_priority: AllocationAndRetentionPriority {
-                        priority_level_arp: b.qos.arp_priority_level.clamp(1, 15),
-                        // PCI / PVI are "disable" flags in the Bearer QoS IE (TS 29.274
-                        // §8.15); see `eps_iwk::ebi_arp_mapping`.
-                        pre_emption_capability: if b.qos.arp_preempt_cap {
-                            PreEmptionCapability::ShallNotTriggerPreEmption
-                        } else {
-                            PreEmptionCapability::MayTriggerPreEmption
-                        },
-                        pre_emption_vulnerability: if b.qos.arp_preempt_vuln {
-                            PreEmptionVulnerability::NotPreEmptable
-                        } else {
-                            PreEmptionVulnerability::PreEmptable
-                        },
-                    },
-                    gbr_qos_information: gbr,
-                    reflective_qos_attribute: false,
-                    additional_qos_flow_information: false,
-                },
-                e_rab_id: Some(b.ebi),
-            }
+        .map(|b| QosFlowSetup {
+            qfi: b.ebi,
+            // TS 23.501 §5.7.4: the standardized QCIs 1..9 and their 5QIs share values,
+            // which is what lets a PGW-C+SMF map one onto the other.
+            five_qi: u16::from(b.qos.index),
+            arp: Arp {
+                priority_level: b.qos.arp_priority_level.clamp(1, 15),
+                // PCI / PVI are "disable" flags in the Bearer QoS IE (TS 29.274 §8.15);
+                // see `eps_iwk::ebi_arp_mapping`.
+                may_trigger_pre_emption: !b.qos.arp_preempt_cap,
+                pre_emptable: !b.qos.arp_preempt_vuln,
+            },
+            gbr: (b.qos.gbr_uplink > 0 || b.qos.gbr_downlink > 0).then_some(Gbr {
+                mfbr_dl: b.qos.mbr_downlink,
+                mfbr_ul: b.qos.mbr_uplink,
+                gfbr_dl: b.qos.gbr_downlink,
+                gfbr_ul: b.qos.gbr_uplink,
+            }),
+            e_rab_id: Some(b.ebi),
         })
         .collect();
-    PduSessionResourceSetupRequestTransfer {
-        pdu_session_aggregate_maximum_bit_rate: (sess.session_ambr.downlink > 0
-            || sess.session_ambr.uplink > 0)
-            .then_some(PduSessionAggregateMaximumBitRate {
-                dl: sess.session_ambr.downlink,
-                ul: sess.session_ambr.uplink,
-            }),
-        ul_ngu_up_tnl_information: UpTransportLayerInformation::GtpTunnel(GtpTunnel {
-            transport_layer_address: TransportLayerAddress::from_ipv4(n3_ul.1),
-            gtp_teid: n3_ul.0.to_be_bytes(),
-        }),
+    crate::n2_transfer::setup_request_transfer(&SetupRequest {
+        ambr: (sess.session_ambr.downlink > 0 || sess.session_ambr.uplink > 0)
+            .then_some((sess.session_ambr.downlink, sess.session_ambr.uplink)),
+        ul_tunnel: n3_ul,
         data_forwarding_not_possible: forwarding.not_possible(),
-        pdu_session_type: PduSessionType::Ipv4,
-        security_indication: None,
-        network_instance: None,
-        qos_flow_setup_request_list: flows,
         direct_forwarding_path_availability: forwarding.direct,
-    }
-    .encode()
+        flows,
+    })
 }
 
 /// Step 6: allocate the N3 uplink CN tunnel at the PGW-U+UPF with an N4 Session
@@ -513,33 +475,24 @@ pub(crate) async fn handle_create(body: &serde_json::Value) -> SbiResponse {
 /// PREPARED update. Records its DL N3 endpoint and answers the EPS Bearer Setup List for an
 /// EPS→5GS context. The user plane is NOT touched (§5.2.2.3.4.1, PREPARED).
 pub(crate) fn handle_prepared(sm_context_ref: &str, transfer: &[u8]) -> SbiResponse {
-    let ack = match nextgcore_ngap::transfer::HandoverRequestAcknowledgeTransfer::decode(transfer) {
-        Ok(ack) => ack,
+    let dl = match crate::n2_transfer::parse_handover_request_acknowledge_transfer(transfer) {
+        Ok(dl) => dl,
         Err(e) => {
-            log::warn!("SM Context Update (PREPARED) for ref={sm_context_ref}: undecodable HandoverRequestAcknowledgeTransfer: {e:?}");
+            log::warn!("SM Context Update (PREPARED) for ref={sm_context_ref}: undecodable HandoverRequestAcknowledgeTransfer: {e}");
             return crate::problem_400(
                 "N2_SM_ERROR",
                 "n2SmInfo is not a HandoverRequestAcknowledgeTransfer",
             );
         }
     };
-    let nextgcore_ngap::transfer::UpTransportLayerInformation::GtpTunnel(ref tunnel) =
-        ack.dl_ngu_up_tnl_information;
-    let Some(gnb_addr) = <[u8; 4]>::try_from(tunnel.transport_layer_address.octets.as_slice())
-        .ok()
-        .filter(|_| tunnel.transport_layer_address.bit_len == 32)
-    else {
+    let Some(gnb_addr) = dl.ipv4() else {
         return crate::problem_400(
             "N2_SM_ERROR",
             "the target's DL N3 endpoint is not an IPv4 address this SMF can forward to",
         );
     };
-    let gnb_teid = u32::from_be_bytes(tunnel.gtp_teid);
-    let accepted: Vec<u8> = ack
-        .qos_flow_setup_response_list
-        .iter()
-        .map(|f| f.qos_flow_identifier)
-        .collect();
+    let gnb_teid = dl.teid;
+    let accepted: Vec<u8> = dl.qfis;
 
     let handle = smf_self();
     let Ok(ctx) = handle.read() else {
@@ -1563,5 +1516,128 @@ mod tests {
             profile["smfInfo"]["sNssaiSmfInfoList"][0]["dnnSmfInfoList"][0]["dnn"], "*",
             "SmfInfo's required sNssaiSmfInfoList, with the wildcard DNN"
         );
+    }
+
+    /// #417: the EPS→5GS Setup Request Transfer, now encoded by the generated codec, is
+    /// byte for byte what the hand-written codec built from the same session -- over GBR and
+    /// non-GBR bearers, both PCI / PVI settings, with and without a Session-AMBR, and every
+    /// forwarding indication. The oracle below is the pre-#417 builder, verbatim.
+    #[test]
+    fn the_handover_setup_request_transfer_is_the_hand_written_bytes() {
+        use nextgcore_ngap::transfer::{
+            AllocationAndRetentionPriority, GbrQosInformation, GtpTunnel, NonDynamic5qiDescriptor,
+            PduSessionAggregateMaximumBitRate, PduSessionResourceSetupRequestTransfer,
+            PduSessionType, PreEmptionCapability, PreEmptionVulnerability, QosCharacteristics,
+            QosFlowLevelQosParameters, QosFlowSetupRequestItem, TransportLayerAddress,
+            UpTransportLayerInformation,
+        };
+        fn oracle(
+            sess: &SmfSess,
+            bearers: &[context::SmfBearer],
+            n3_ul: (u32, [u8; 4]),
+            forwarding: eps_iwk::DataForwarding,
+        ) -> Vec<u8> {
+            let flows = bearers
+                .iter()
+                .map(|b| {
+                    let gbr = (b.qos.gbr_uplink > 0 || b.qos.gbr_downlink > 0).then_some(
+                        GbrQosInformation {
+                            maximum_flow_bit_rate_dl: b.qos.mbr_downlink,
+                            maximum_flow_bit_rate_ul: b.qos.mbr_uplink,
+                            guaranteed_flow_bit_rate_dl: b.qos.gbr_downlink,
+                            guaranteed_flow_bit_rate_ul: b.qos.gbr_uplink,
+                            notification_control: false,
+                            maximum_packet_loss_rate_dl: None,
+                            maximum_packet_loss_rate_ul: None,
+                        },
+                    );
+                    QosFlowSetupRequestItem {
+                        qos_flow_identifier: b.ebi,
+                        qos_flow_level_qos_parameters: QosFlowLevelQosParameters {
+                            qos_characteristics: QosCharacteristics::NonDynamic5qi(
+                                NonDynamic5qiDescriptor::new(u16::from(b.qos.index)),
+                            ),
+                            allocation_and_retention_priority: AllocationAndRetentionPriority {
+                                priority_level_arp: b.qos.arp_priority_level.clamp(1, 15),
+                                pre_emption_capability: if b.qos.arp_preempt_cap {
+                                    PreEmptionCapability::ShallNotTriggerPreEmption
+                                } else {
+                                    PreEmptionCapability::MayTriggerPreEmption
+                                },
+                                pre_emption_vulnerability: if b.qos.arp_preempt_vuln {
+                                    PreEmptionVulnerability::NotPreEmptable
+                                } else {
+                                    PreEmptionVulnerability::PreEmptable
+                                },
+                            },
+                            gbr_qos_information: gbr,
+                            reflective_qos_attribute: false,
+                            additional_qos_flow_information: false,
+                        },
+                        e_rab_id: Some(b.ebi),
+                    }
+                })
+                .collect();
+            PduSessionResourceSetupRequestTransfer {
+                pdu_session_aggregate_maximum_bit_rate: (sess.session_ambr.downlink > 0
+                    || sess.session_ambr.uplink > 0)
+                    .then_some(PduSessionAggregateMaximumBitRate {
+                        dl: sess.session_ambr.downlink,
+                        ul: sess.session_ambr.uplink,
+                    }),
+                ul_ngu_up_tnl_information: UpTransportLayerInformation::GtpTunnel(GtpTunnel {
+                    transport_layer_address: TransportLayerAddress::from_ipv4(n3_ul.1),
+                    gtp_teid: n3_ul.0.to_be_bytes(),
+                }),
+                data_forwarding_not_possible: forwarding.not_possible(),
+                pdu_session_type: PduSessionType::Ipv4,
+                security_indication: None,
+                network_instance: None,
+                qos_flow_setup_request_list: flows,
+                direct_forwarding_path_availability: forwarding.direct,
+            }
+            .encode()
+            .unwrap()
+        }
+
+        let bearer =
+            |ebi: u8, qci: u8, arp: u8, cap: bool, vuln: bool, gbr: u64| context::SmfBearer {
+                ebi,
+                qfi: ebi,
+                qos: context::Qos {
+                    index: qci,
+                    arp_priority_level: arp,
+                    arp_preempt_cap: cap,
+                    arp_preempt_vuln: vuln,
+                    gbr_downlink: gbr,
+                    gbr_uplink: gbr / 2,
+                    mbr_downlink: gbr * 2,
+                    mbr_uplink: gbr,
+                },
+                ..Default::default()
+            };
+        let bearers = [
+            bearer(5, 9, 8, true, true, 0),
+            bearer(6, 1, 2, false, true, 64_000),
+            bearer(7, 2, 0, true, false, 0),
+            bearer(15, 4, 20, false, false, 4_000_000_000),
+        ];
+        for (dl, ul) in [(0, 0), (100_000_000, 50_000_000), (0, 1)] {
+            let mut sess = SmfSess::new(1, 0, 1);
+            sess.session_ambr.downlink = dl;
+            sess.session_ambr.uplink = ul;
+            for (indirect, direct) in [(false, false), (true, false), (false, true), (true, true)] {
+                let forwarding = eps_iwk::DataForwarding { indirect, direct };
+                for n in 1..=bearers.len() {
+                    let n3 = (0x0102_0304, [10, 45, 0, n as u8]);
+                    assert_eq!(
+                        build_handover_setup_request_transfer(&sess, &bearers[..n], n3, forwarding)
+                            .unwrap(),
+                        oracle(&sess, &bearers[..n], n3, forwarding),
+                        "AMBR ({dl}, {ul}), forwarding {forwarding:?}, {n} bearers"
+                    );
+                }
+            }
+        }
     }
 }
