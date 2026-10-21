@@ -754,7 +754,10 @@ pub struct ServiceRequest {
 
 impl ServiceRequest {
     pub fn encode(&self, buf: &mut BytesMut) {
-        buf.put_u8((self.ngksi.encode() << 4) | (self.service_type as u8 & 0x0F));
+        // TS 24.501 Table 8.2.16.1.1 lists ngKSI before Service type, and §8.1
+        // puts the first IE of a half-octet run in bits 1-4: ngKSI low, service
+        // type high (e.g. 0x20 = mobile terminated services, ngKSI 0). #537.
+        buf.put_u8(((self.service_type as u8 & 0x0F) << 4) | (self.ngksi.encode() & 0x0F));
         self.s_tmsi.encode(buf);
         if let Some(ref uds) = self.uplink_data_status {
             buf.put_u8(0x40); // IEI
@@ -782,8 +785,9 @@ impl ServiceRequest {
             });
         }
         let first_byte = buf.get_u8();
-        let ngksi = KeySetIdentifier::decode((first_byte >> 4) & 0x0F);
-        let service_type_val = first_byte & 0x0F;
+        // ngKSI in bits 1-4, service type in bits 5-8 (Table 8.2.16.1.1, §8.1).
+        let ngksi = KeySetIdentifier::decode(first_byte & 0x0F);
+        let service_type_val = (first_byte >> 4) & 0x0F;
         let service_type = match service_type_val {
             0 => ServiceType::Signalling,
             1 => ServiceType::Data,
