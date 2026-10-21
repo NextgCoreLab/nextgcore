@@ -3922,7 +3922,13 @@ fn hand_written_target_id(target: &ngap_gen::TargetID) -> Option<TargetId> {
                 plmn_identity: t.global_enb_id.plmn_identity.0.as_slice().try_into().ok()?,
                 ng_enb_id: ng_enb_id_value(&t.global_enb_id.ng_enb_id)?,
                 selected_tai: TaiListItem {
-                    tai_plmn: t.selected_eps_tai.plmn_identity.0.as_slice().try_into().ok()?,
+                    tai_plmn: t
+                        .selected_eps_tai
+                        .plmn_identity
+                        .0
+                        .as_slice()
+                        .try_into()
+                        .ok()?,
                     tai_tac: [0, tac[0], tac[1]],
                 },
             })
@@ -3944,8 +3950,12 @@ pub fn hand_written_diagnostics(report: &CriticalityErrorIndication) -> Critical
             .iter()
             .map(|ie| IeCriticalityDiagnostics {
                 ie_criticality: match ie.criticality {
-                    ngap_gen::Criticality::REJECT => nextgcore_asn1c::ngap::types::Criticality::Reject,
-                    ngap_gen::Criticality::IGNORE => nextgcore_asn1c::ngap::types::Criticality::Ignore,
+                    ngap_gen::Criticality::REJECT => {
+                        nextgcore_asn1c::ngap::types::Criticality::Reject
+                    }
+                    ngap_gen::Criticality::IGNORE => {
+                        nextgcore_asn1c::ngap::types::Criticality::Ignore
+                    }
                     _ => nextgcore_asn1c::ngap::types::Criticality::Notify,
                 },
                 ie_id: ie.ie_id,
@@ -3973,9 +3983,7 @@ pub fn decode_handover_required_asn1(data: &[u8]) -> NasTransportDecode<Handover
     use ngap_gen::HandoverRequiredProtocolIEs_EntryValue as Ie;
     let Some((criticality, ies, mut reject, notify)) =
         decode_initiating(data, "Handover Required", |v| match v {
-            ngap_gen::InitiatingMessageValue::Id_HandoverPreparation(m) => {
-                Some(m.protocol_i_es.0)
-            }
+            ngap_gen::InitiatingMessageValue::Id_HandoverPreparation(m) => Some(m.protocol_i_es.0),
             _ => None,
         })
     else {
@@ -4007,11 +4015,9 @@ pub fn decode_handover_required_asn1(data: &[u8]) -> NasTransportDecode<Handover
                     return NasTransportDecode::Undecodable;
                 }
             },
-            Ie::Id_DirectForwardingPathAvailability(_) => {
-                direct = Some(
-                    nextgcore_asn1c::ngap::ies::DirectForwardingPathAvailability::DirectPathAvailable,
-                )
-            }
+            Ie::Id_DirectForwardingPathAvailability(_) => direct = Some(
+                nextgcore_asn1c::ngap::ies::DirectForwardingPathAvailability::DirectPathAvailable,
+            ),
             Ie::Id_PDUSessionResourceListHORqd(v) => {
                 sessions = Some(
                     v.0.iter()
@@ -4030,8 +4036,14 @@ pub fn decode_handover_required_asn1(data: &[u8]) -> NasTransportDecode<Handover
         (ran.is_some(), ngap_gen::ID_RAN_UE_NGAP_ID),
         (ho_type.is_some(), ngap_gen::ID_HANDOVER_TYPE),
         (target.is_some(), ngap_gen::ID_TARGET_ID),
-        (sessions.is_some(), ngap_gen::ID_PDU_SESSION_RESOURCE_LIST_HO_RQD),
-        (container.is_some(), ngap_gen::ID_SOURCE_TO_TARGET_TRANSPARENT_CONTAINER),
+        (
+            sessions.is_some(),
+            ngap_gen::ID_PDU_SESSION_RESOURCE_LIST_HO_RQD,
+        ),
+        (
+            container.is_some(),
+            ngap_gen::ID_SOURCE_TO_TARGET_TRANSPARENT_CONTAINER,
+        ),
     ] {
         if !present {
             reject.push(missing_ie(id));
@@ -4055,7 +4067,15 @@ pub fn decode_handover_required_asn1(data: &[u8]) -> NasTransportDecode<Handover
         Some(pdu_session_list),
         Some(source_to_target_container),
         true,
-    ) = (amf, ran, ho_type, target, sessions, container, reject.is_empty())
+    ) = (
+        amf,
+        ran,
+        ho_type,
+        target,
+        sessions,
+        container,
+        reject.is_empty(),
+    )
     else {
         return NasTransportDecode::Reject(report(
             ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
@@ -11908,6 +11928,264 @@ pub(crate) mod tests {
         assert_eq!(
             modify_indication_unsuccessful_transfer(Cause::Misc(CauseMisc::Unspecified)).unwrap(),
             [0x22, 0x80]
+        );
+    }
+}
+
+#[cfg(test)]
+mod handover_required_tests {
+    //! #417 handover part 3b: HANDOVER REQUIRED decode via the generated codec.
+    use super::tests::with_unknown_ie;
+    use super::*;
+
+    fn required(target_id: TargetId, sessions: u8, direct: bool) -> HandoverRequired {
+        HandoverRequired {
+            amf_ue_ngap_id: 0x1_0000_0001,
+            ran_ue_ngap_id: 7,
+            handover_type: HandoverType::Intra5gs,
+            cause: Cause::RadioNetwork(CauseRadioNetwork::HandoverDesirableForRadioReason),
+            target_id,
+            pdu_session_list: (1..=sessions)
+                .map(|psi| PduSessionResourceItemHoRqd {
+                    pdu_session_id: psi,
+                    transfer: vec![0x00, psi],
+                })
+                .collect(),
+            source_to_target_container: vec![0xAB; 5],
+            direct_forwarding_path_availability: direct.then_some(
+                nextgcore_asn1c::ngap::ies::DirectForwardingPathAvailability::DirectPathAvailable,
+            ),
+        }
+    }
+
+    fn gnb_target(gnb_id: u32, gnb_id_len: u8) -> TargetId {
+        TargetId::TargetRanNodeId {
+            global_ran_node_id: GlobalRanNodeId::GlobalGnbId {
+                plmn_identity: [0x99, 0xF9, 0x07],
+                gnb_id,
+                gnb_id_len,
+            },
+            selected_tai: TaiListItem {
+                tai_plmn: [0x99, 0xF9, 0x07],
+                tai_tac: [0x00, 0x00, 0x07],
+            },
+        }
+    }
+
+    /// What the hand-written parser and the generated decoder say about the same
+    /// bytes, flattened to comparable values.
+    fn view(r: &HandoverRequired) -> String {
+        format!(
+            "{} {} {:?} {:?} {:?} {:?} {:?} {:?}",
+            r.amf_ue_ngap_id,
+            r.ran_ue_ngap_id,
+            r.handover_type,
+            r.cause,
+            r.target_id,
+            r.pdu_session_list
+                .iter()
+                .map(|s| (s.pdu_session_id, s.transfer.clone()))
+                .collect::<Vec<_>>(),
+            r.source_to_target_container,
+            r.direct_forwarding_path_availability.is_some(),
+        )
+    }
+
+    fn generated(data: &[u8]) -> HandoverRequired {
+        match decode_handover_required_asn1(data) {
+            NasTransportDecode::Proceed {
+                message,
+                error_indication: None,
+            } => message,
+            other => panic!("expected a clean decode, got {other:?}"),
+        }
+    }
+
+    /// Every Handover Required naming a gNB target the hand-written parser
+    /// accepted decodes to the same values through the generated codec: gNB id
+    /// lengths 22..32 at their extremes, 1..4 sessions, both handover types the
+    /// gNB path takes, with and without Direct Forwarding Path Availability.
+    #[test]
+    fn handover_required_generated_decode_matches_hand_written() {
+        let mut cases = 0;
+        for len in [22u8, 25, 32] {
+            for gnb_id in [0u32, 1, ((1u64 << len) - 1) as u32] {
+                // SIZE(1..256): an empty list is refused by the hand-written
+                // builder itself, so the sweep starts at one session.
+                for sessions in 1..=4 {
+                    for direct in [false, true] {
+                        for ho_type in [HandoverType::Intra5gs, HandoverType::FivegsToEps] {
+                            let mut msg = required(gnb_target(gnb_id, len), sessions, direct);
+                            msg.handover_type = ho_type;
+                            let bytes = builder::build_handover_required(&msg).expect("build");
+                            let Ok(NgapMessage::HandoverRequired(old)) =
+                                parser::decode_ngap_pdu(&bytes)
+                            else {
+                                panic!("hand-written parser refused {len}/{gnb_id}/{sessions}");
+                            };
+                            assert_eq!(view(&generated(&bytes)), view(&old));
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 3 * 3 * 4 * 2 * 2);
+    }
+
+    /// The targeteNB-ID form (TS 38.413 §9.3.1.25), octets derived by hand from
+    /// X.691: CHOICE index 1 of 3 (`01`); TargeteNB-ID and GlobalNgENB-ID each
+    /// open with an extension bit and an optional bitmap (`0000`), padding ->
+    /// `40`; PLMN (fixed 3, aligned) `99 F9 07`; ngENB-ID CHOICE macro (`00`),
+    /// padding, BIT STRING(20) 0x12345 (fixed > 16 bits, aligned) `00 12 34 5`;
+    /// EPS-TAI's extension and optional bits `00`, padding -> `50`; PLMN
+    /// `99 F9 07`; ePS-TAC (fixed 2, unaligned) `00 07`.
+    #[test]
+    fn an_enb_target_decodes_to_its_plmn_enb_id_and_eps_tac() {
+        const GOLDEN: [u8; 13] = [
+            0x40, 0x99, 0xF9, 0x07, 0x00, 0x12, 0x34, 0x50, 0x99, 0xF9, 0x07, 0x00, 0x07,
+        ];
+        let target = ngap_gen::TargetID::TargeteNB_ID(ngap_gen::TargeteNB_ID {
+            global_enb_id: ngap_gen::GlobalNgENB_ID {
+                plmn_identity: ngap_gen::PLMNIdentity(vec![0x99, 0xF9, 0x07]),
+                ng_enb_id: ngap_gen::NgENB_ID::MacroNgENB_ID(ngap_gen::NgENB_ID_macroNgENB_ID(
+                    bitvec::bitvec![u8, bitvec::prelude::Msb0;
+                        0,0,0,1, 0,0,1,0, 0,0,1,1, 0,1,0,0, 0,1,0,1],
+                )),
+                ie_extensions: None,
+            },
+            selected_eps_tai: ngap_gen::EPS_TAI {
+                plmn_identity: ngap_gen::PLMNIdentity(vec![0x99, 0xF9, 0x07]),
+                eps_tac: ngap_gen::EPS_TAC(vec![0x00, 0x07]),
+                ie_extensions: None,
+            },
+            ie_extensions: None,
+        });
+        assert_eq!(
+            nextgcore_ngap_gen::encode_contained(&target).expect("encode"),
+            GOLDEN
+        );
+
+        // The same TargetID inside a whole Handover Required: start from one the
+        // hand-written builder made and replace its TargetID IE.
+        let base = builder::build_handover_required(&required(gnb_target(1, 22), 1, false))
+            .expect("build");
+        let mut pdu = nextgcore_ngap_gen::decode(&base).expect("decode");
+        let ngap_gen::NGAP_PDU::InitiatingMessage(ref mut msg) = pdu else {
+            panic!("initiatingMessage");
+        };
+        let ngap_gen::InitiatingMessageValue::Id_HandoverPreparation(ref mut req) = msg.value
+        else {
+            panic!("Handover Required");
+        };
+        for e in req.protocol_i_es.0.iter_mut() {
+            if let ngap_gen::HandoverRequiredProtocolIEs_EntryValue::Id_TargetID(ref mut t) =
+                e.value
+            {
+                *t = target.clone();
+            }
+        }
+        let bytes = nextgcore_ngap_gen::encode(&pdu).expect("encode");
+        let TargetId::TargetGlobalNgEnbId {
+            plmn_identity,
+            ng_enb_id,
+            selected_tai,
+        } = generated(&bytes).target_id
+        else {
+            panic!("an eNB target");
+        };
+        assert_eq!(plmn_identity, [0x99, 0xF9, 0x07]);
+        assert_eq!(ng_enb_id, 0x12345);
+        assert_eq!(selected_tai.tai_plmn, [0x99, 0xF9, 0x07]);
+        assert_eq!(selected_tai.tai_tac, [0x00, 0x00, 0x07]);
+        // The hand-written parser misreads this conformant encoding.
+        let misread = match parser::decode_ngap_pdu(&bytes) {
+            Ok(NgapMessage::HandoverRequired(old)) => match old.target_id {
+                TargetId::TargetGlobalNgEnbId {
+                    plmn_identity,
+                    ng_enb_id,
+                    ..
+                } => plmn_identity != [0x99, 0xF9, 0x07] || ng_enb_id != 0x12345,
+                _ => true,
+            },
+            _ => true,
+        };
+        assert!(
+            misread,
+            "the hand-written TargetID decoder was expected to misread"
+        );
+    }
+
+    fn without(bytes: &[u8], id: u16) -> Vec<u8> {
+        let mut pdu = nextgcore_ngap_gen::decode(bytes).expect("decode");
+        let ngap_gen::NGAP_PDU::InitiatingMessage(ref mut msg) = pdu else {
+            panic!("initiatingMessage");
+        };
+        let ngap_gen::InitiatingMessageValue::Id_HandoverPreparation(ref mut req) = msg.value
+        else {
+            panic!("Handover Required");
+        };
+        req.protocol_i_es.0.retain(|e| e.id.0 != id);
+        nextgcore_ngap_gen::encode(&pdu).expect("encode")
+    }
+
+    /// TS 38.413 §10.3.4.2 / §10.3.5 for a Class 1 initiating message.
+    #[test]
+    fn handover_required_follows_ie_criticality() {
+        let base = builder::build_handover_required(&required(gnb_target(1, 22), 1, false))
+            .expect("build");
+        // ignore: dropped, no report.
+        assert!(matches!(
+            decode_handover_required_asn1(&with_unknown_ie(&base, 9999, 0x40)),
+            NasTransportDecode::Proceed {
+                error_indication: None,
+                ..
+            }
+        ));
+        // notify: proceeds, reported.
+        let NasTransportDecode::Proceed {
+            error_indication: Some(report),
+            ..
+        } = decode_handover_required_asn1(&with_unknown_ie(&base, 9999, 0x80))
+        else {
+            panic!("notify must proceed and be reported");
+        };
+        assert_eq!(report.diagnostics[0].ie_id, 9999);
+        assert_eq!(
+            report.procedure.procedure_code,
+            ngap_gen::ID_HANDOVER_PREPARATION
+        );
+        // reject: rejected, naming the IE and both UE ids.
+        let NasTransportDecode::Reject(report) =
+            decode_handover_required_asn1(&with_unknown_ie(&base, 9999, 0x00))
+        else {
+            panic!("reject must reject");
+        };
+        assert_eq!(report.amf_ue_ngap_id, Some(0x1_0000_0001));
+        assert_eq!(report.ran_ue_ngap_id, Some(7));
+        let diag = hand_written_diagnostics(&report);
+        assert_eq!(diag.ies[0].ie_id, 9999);
+        // A missing mandatory reject IE is rejected as Missing; a missing Cause
+        // (criticality ignore) is misc/unspecified.
+        for id in [
+            ngap_gen::ID_HANDOVER_TYPE,
+            ngap_gen::ID_TARGET_ID,
+            ngap_gen::ID_PDU_SESSION_RESOURCE_LIST_HO_RQD,
+            ngap_gen::ID_SOURCE_TO_TARGET_TRANSPARENT_CONTAINER,
+        ] {
+            let NasTransportDecode::Reject(r) = decode_handover_required_asn1(&without(&base, id))
+            else {
+                panic!("missing {id} must reject");
+            };
+            assert_eq!(r.diagnostics[0].ie_id, id);
+            assert_eq!(
+                r.diagnostics[0].type_of_error,
+                ngap_gen::TypeOfError::MISSING
+            );
+        }
+        assert_eq!(
+            generated(&without(&base, ngap_gen::ID_CAUSE)).cause,
+            Cause::Misc(CauseMisc::Unspecified)
         );
     }
 }
