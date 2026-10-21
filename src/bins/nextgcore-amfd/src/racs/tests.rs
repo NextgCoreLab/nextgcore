@@ -2,13 +2,10 @@
 //! TS 29.571 and X.691 APER, not captured from the encoder.
 
 use super::*;
-use std::sync::Mutex;
 
-/// The RACS cache is process-global: tests that touch it hold this lock.
-static LOCK: Mutex<()> = Mutex::new(());
-
-fn guard() -> std::sync::MutexGuard<'static, ()> {
-    let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+/// The RACS cache is process-global: tests that touch it hold its lock.
+pub(crate) fn guard() -> std::sync::MutexGuard<'static, ()> {
+    let g = RACS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     reset_for_tests();
     g
 }

@@ -14068,6 +14068,26 @@ mod tests {
         let _ = UE;
     }
 
+    /// #570: the RACS bit (5GMM capability octet 4 bit 8, TS 24.501 §9.11.3.1) and the
+    /// UE radio capability ID IE (0x67, §9.11.3.68) are read from a Registration
+    /// Request; octet 3 alone does not set RACS.
+    #[test]
+    fn the_parser_reads_the_racs_bit_and_the_ue_radio_capability_id() {
+        let (mut nas, _) = eps_mobility_registration_request(false);
+        let req = parse_registration_request_pdu(&nas).expect("parse");
+        assert!(!req.racs_supported, "the fixture's capability is one octet");
+        assert_eq!(req.ue_radio_capability_id, None);
+        // 5GMM capability as nextgsim sends it with RACS: 10 02 00 80; then the ID.
+        nas.extend_from_slice(&[0x10, 0x02, 0x00, 0x80]);
+        nas.extend_from_slice(&[0x67, 0x07, 0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x10]);
+        let req = parse_registration_request_pdu(&nas).expect("parse");
+        assert!(req.racs_supported);
+        assert_eq!(
+            req.ue_radio_capability_id.as_deref(),
+            Some(&[0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x10][..])
+        );
+    }
+
     /// #116 criterion 2: the LIVE parser captures the UE's S1-mode capability.
     ///
     /// The parser #116's text cites (`gmm_handler`'s) has only test callers -- its own
@@ -17384,6 +17404,30 @@ mod tests {
                     panic!("procedure {pc} must be accepted without an Error Indication, got {e:?}")
                 });
         }
+    }
+
+    /// #570: a UE Radio Capability ID Mapping Request the AMF can resolve is answered
+    /// (the send is attempted, so with no association it fails), and one nobody can
+    /// resolve gets no answer, TS 38.413 §8.14.3.3 defining no unsuccessful outcome.
+    #[tokio::test]
+    async fn a_mapping_request_is_answered_only_when_the_id_resolves() {
+        let _racs = crate::racs::tests::guard();
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        // Hand-built request for 01 05 00 00 00 00 10 (racs::tests).
+        let request = [
+            0x00u8, 0x3C, 0x00, 0x0F, 0x00, 0x00, 0x01, 0x01, 0x08, 0x00, 0x08, 0x07, 0x01,
+            0x05, 0x00, 0x00, 0x00, 0x00, 0x10,
+        ];
+        assert!(
+            ngap.process_ngap_message(1, &request).await.is_ok(),
+            "unknown ID, no UCMF: no response is sent"
+        );
+        crate::racs::cache_put(&request[12..], &[0xAA, 0xBB]);
+        assert!(
+            ngap.process_ngap_message(1, &request).await.is_err(),
+            "a cached ID is answered (the send is attempted)"
+        );
     }
 
     // ==================================================================

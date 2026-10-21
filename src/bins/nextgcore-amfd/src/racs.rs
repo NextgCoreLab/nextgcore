@@ -216,6 +216,10 @@ pub fn apply_notification(body: &serde_json::Value) -> Vec<Vec<u8>> {
     }
 }
 
+/// Serialises every test that touches [`RACS`], declared beside it.
+#[cfg(test)]
+pub(crate) static RACS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 #[cfg(test)]
 pub(crate) fn reset_for_tests() {
     with_cache(|c| *c = Cache::default());
@@ -622,4 +626,4 @@ pub async fn ucmf_subscribe(nf_id: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

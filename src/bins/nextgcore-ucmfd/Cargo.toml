@@ -29,3 +29,7 @@ chrono = "0.4"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# #570: drive the AMF's Nucmf consumer against this UCMF over real HTTP/2.
+nextgcore-amfd = { path = "../nextgcore-amfd" }
