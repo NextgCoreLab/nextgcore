@@ -2743,7 +2743,7 @@ mod tests {
         // One pooled connection, so every round lands on the slot the
         // previous round's (now dead) runtime dialled.
         let client = Arc::new(SbiClient::new(
-            SbiClientConfig::new(&addr.ip().to_string(), addr.port()).with_pool_size(1),
+            SbiClientConfig::new(addr.ip().to_string(), addr.port()).with_pool_size(1),
         ));
 
         for round in 0..3 {
@@ -2772,7 +2772,7 @@ mod tests {
     fn a_driver_dying_between_ready_check_and_send_is_redialled_once() {
         let addr = serve_on_own_runtime();
         let client = Arc::new(SbiClient::new(
-            SbiClientConfig::new(&addr.ip().to_string(), addr.port()).with_pool_size(1),
+            SbiClientConfig::new(addr.ip().to_string(), addr.port()).with_pool_size(1),
         ));
 
         // Runtime A dials the only pooled connection; its driver lives on A.
