@@ -3845,6 +3845,9 @@ pub fn handle_location_report(
         Ok(ue) => ue,
         Err(out) => return out,
     };
+    let before = ctx
+        .mme_ue_find_by_id(enb_ue.mme_ue_id)
+        .map(|ue| (ue.tai, ue.e_cgi));
     store_location(
         ctx,
         enb_ue.id,
@@ -3859,6 +3862,24 @@ pub fn handle_location_report(
         msg.tai,
         msg.eutran_cgi
     );
+    // #593, TS 23.401 §5.9.2: a PDN GW that asked for location change reporting
+    // is told with a Change Notification Request, via the Serving GW.
+    let after = ctx
+        .mme_ue_find_by_id(enb_ue.mme_ue_id)
+        .map(|ue| (ue.tai, ue.e_cgi));
+    if let (Some((tai0, cgi0)), Some((tai1, cgi1))) = (before, after) {
+        let tai_changed = tai0 != tai1;
+        let ecgi_changed = cgi0.plmn_id != cgi1.plmn_id || cgi0.cell_id != cgi1.cell_id;
+        let notify = crate::s11_handler::sessions_to_notify(
+            ctx,
+            enb_ue.mme_ue_id,
+            tai_changed,
+            ecgi_changed,
+        );
+        if !notify.is_empty() {
+            crate::gtp_path::send_change_notifications(ctx, enb_ue.mme_ue_id, &notify);
+        }
+    }
     Vec::new()
 }
 
