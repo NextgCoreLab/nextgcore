@@ -380,6 +380,15 @@ pub fn cancel_eps_to_5gs_relocation(mme_ue_id: u64) -> bool {
         .is_some()
 }
 
+/// Record a relocation without sending. Test-only; declared beside the map.
+/// Callers hold [`crate::gtp_path::S11_TEST_LOCK`].
+#[cfg(test)]
+pub fn record_eps_to_5gs_relocation_for_test(record: EpsTo5gsRelocation) {
+    if let Ok(mut map) = eps_to_5gs_relocations().lock() {
+        map.insert(eps_to_5gs_local_teid(record.mme_ue_id), record);
+    }
+}
+
 /// Drop every relocation record. Test-only; declared beside the map. Callers
 /// hold [`crate::gtp_path::S11_TEST_LOCK`].
 #[cfg(test)]
@@ -1458,6 +1467,128 @@ pub fn n26_open() -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::gtp_path::lock_s11;
+
+    /// #618: each N26 response arriving on the REAL socket closes its request and
+    /// reaches the procedure. Before #618 the transaction layer had no N26 pair, so
+    /// `handle_datagram` dispatched none of them: the Context Response never reached
+    /// the TAU, the Forward Relocation Response never reached the handover, and every
+    /// request ran out its N3. The answers are built by **amfd's** own N26 builders.
+    #[test]
+    fn n26_responses_on_the_socket_close_their_requests_and_reach_the_procedure() {
+        let _guard = lock_s11();
+        clear_pending_context_requests_for_test();
+        clear_eps_to_5gs_relocations_for_test();
+        let amf = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        amf.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        let amf_addr = amf.local_addr().unwrap();
+        let server = N26Server::open(
+            "127.0.0.1:0".parse().unwrap(),
+            // N3 x T3 (3.3 s) outlasts every wait below, so a request can only leave
+            // the table by being answered, never by running out its retransmissions.
+            Gtp2XactConfig {
+                t3_response: std::time::Duration::from_millis(300),
+                n3_requests: 10,
+                response_hold: std::time::Duration::from_secs(1),
+            },
+            3,
+        )
+        .unwrap();
+        let wait_idle = |server: &N26Server| {
+            for _ in 0..200 {
+                if server.outstanding() == 0 {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        let request = |t: Gtp2MessageType, teid: u32| {
+            let seq = server.alloc_sequence();
+            let msg = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(t as u8, teid, seq));
+            server.send_request(amf_addr, &msg).unwrap();
+            let mut buf = [0u8; 2048];
+            let (_, from) = amf.recv_from(&mut buf).unwrap();
+            (seq, from)
+            // (Retransmissions of earlier requests cannot be read here: each one is
+            // answered before the next is sent.)
+        };
+
+        // Context Request -> Context Response (a refusal): the TAU's record is consumed.
+        let (seq, from) = request(Gtp2MessageType::ContextRequest, 0);
+        record_pending_context_request_for_test(
+            seq,
+            PendingContextRequest {
+                mme_ue_id: 0x618_0001,
+                enb_ue_id: 0x618_0002,
+            },
+        );
+        let rsp = nextgcore_amfd::n26_path::build_context_response_reject(
+            seq,
+            0,
+            nextgcore_amfd::n26_path::CAUSE_IMSI_IMEI_NOT_KNOWN,
+        );
+        amf.send_to(&rsp.encode(), from).unwrap();
+        wait_idle(&server);
+        assert_eq!(
+            server.outstanding(),
+            0,
+            "the Context Response closes the request"
+        );
+        assert!(
+            take_pending_context_request(seq).is_none(),
+            "the Context Response reached the TAU continuation"
+        );
+
+        // Forward Relocation Request -> Forward Relocation Response (a refusal): the
+        // relocation reaches the handler, which drops it.
+        let mme_ue_id = 0x618_0003;
+        let (seq, from) = request(Gtp2MessageType::ForwardRelocationRequest, 0);
+        record_eps_to_5gs_relocation_for_test(EpsTo5gsRelocation {
+            mme_ue_id,
+            source_enb_ue_id: 0x618_0004,
+            sequence: seq,
+            amf_peer: amf_addr,
+            amf_teid: None,
+        });
+        let rsp = nextgcore_amfd::n26_eps_to_5gs::build_forward_relocation_response_refusal(
+            seq,
+            eps_to_5gs_local_teid(mme_ue_id),
+            81,
+        );
+        amf.send_to(&rsp.encode(), from).unwrap();
+        wait_idle(&server);
+        assert_eq!(
+            server.outstanding(),
+            0,
+            "the Forward Relocation Response closes the request"
+        );
+        assert!(
+            eps_to_5gs_relocation(mme_ue_id).is_none(),
+            "the refusal reached the handover, which abandoned it"
+        );
+
+        // Forward Relocation Complete Notification -> Acknowledge.
+        let (seq, from) = request(
+            Gtp2MessageType::ForwardRelocationCompleteNotification,
+            0x618,
+        );
+        let ack =
+            nextgcore_amfd::n26_build::build_forward_relocation_complete_acknowledge(seq, 0, 16);
+        amf.send_to(&ack.encode(), from).unwrap();
+        wait_idle(&server);
+        assert_eq!(
+            server.outstanding(),
+            0,
+            "the Acknowledge closes the notification"
+        );
+
+        // And nothing is retransmitted after the answers.
+        amf.set_read_timeout(Some(std::time::Duration::from_millis(700)))
+            .unwrap();
+        let mut buf = [0u8; 2048];
+        assert!(amf.recv_from(&mut buf).is_err(), "no retransmission");
+        server.close();
+    }
 
     /// With the switch off nothing is sent, and the reason names the switch.
     ///
