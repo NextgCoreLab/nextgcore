@@ -633,6 +633,23 @@ impl Default for NefContext {
 static GLOBAL_NEF_CONTEXT: std::sync::OnceLock<Arc<RwLock<NefContext>>> =
     std::sync::OnceLock::new();
 
+/// Serialises every test, in any module of this crate, that re-initialises or
+/// mutates [`GLOBAL_NEF_CONTEXT`]. Declared beside the global rather than inside
+/// one `mod tests`, so a second test module cannot miss it (#548: the
+/// northbound-auth tests re-ran `nef_context_init` without the lock that
+/// `main.rs`'s `mod tests` held).
+#[cfg(test)]
+pub(crate) static NEF_CONTEXT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`NEF_CONTEXT_TEST_LOCK`], recovering from a poisoning panic so one
+/// failed test does not cascade into every later one.
+#[cfg(test)]
+pub(crate) fn lock_nef_context_for_test() -> std::sync::MutexGuard<'static, ()> {
+    NEF_CONTEXT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 pub fn nef_self() -> Arc<RwLock<NefContext>> {
     GLOBAL_NEF_CONTEXT
         .get_or_init(|| Arc::new(RwLock::new(NefContext::new())))
