@@ -612,40 +612,7 @@ pub fn decode_ng_setup_request_asn1(data: &[u8]) -> NgSetupRequestDecode {
         }
     }
 
-    // TAC SIZE(3), SST SIZE(1), SD SIZE(3): the decoder enforces each bound.
-    let octets = |bytes: &[u8]| bytes.iter().fold(0u32, |v, b| (v << 8) | u32::from(*b));
-    request.supported_ta_list = supported_ta_list
-        .0
-        .iter()
-        .map(|ta| {
-            let bplmn_list: Vec<crate::context::BplmnEntry> = ta
-                .broadcast_plmn_list
-                .0
-                .iter()
-                .map(|bp| {
-                    let s_nssai: Vec<crate::context::SNssai> = bp
-                        .tai_slice_support_list
-                        .0
-                        .iter()
-                        .map(|item| crate::context::SNssai {
-                            sst: octets(&item.s_nssai.sst.0) as u8,
-                            sd: item.s_nssai.sd.as_ref().map(|sd| octets(&sd.0)),
-                        })
-                        .collect();
-                    crate::context::BplmnEntry {
-                        plmn_id: decode_plmn_id(&bp.plmn_identity.0),
-                        num_of_s_nssai: s_nssai.len(),
-                        s_nssai,
-                    }
-                })
-                .collect();
-            crate::context::SupportedTa {
-                tac: octets(&ta.tac.0),
-                num_of_bplmn_list: bplmn_list.len(),
-                bplmn_list,
-            }
-        })
-        .collect();
+    request.supported_ta_list = context_supported_ta_list(&supported_ta_list);
 
     // PagingDRX is extensible; an extension value is one the hand-written
     // parser refused, and the AMF has no representation for it.
@@ -5099,6 +5066,203 @@ pub fn build_path_switch_request_failure_generated(
         }
     }
 }
+
+/// A generated Supported TA List (TS 38.413 §9.3.3.9) as the stored
+/// [`crate::context::SupportedTa`] entries. TAC SIZE(3), SST SIZE(1), SD
+/// SIZE(3): the decoder enforces each bound. An SD of 0xFFFFFF is "no SD"
+/// (TS 23.003 §28.4.2) and is stored as absent, so it compares equal to a
+/// profile that simply omits it.
+fn context_supported_ta_list(list: &ngap_gen::SupportedTAList) -> Vec<crate::context::SupportedTa> {
+    let octets = |bytes: &[u8]| bytes.iter().fold(0u32, |v, b| (v << 8) | u32::from(*b));
+    list.0
+        .iter()
+        .map(|ta| {
+            let bplmn_list: Vec<crate::context::BplmnEntry> = ta
+                .broadcast_plmn_list
+                .0
+                .iter()
+                .map(|bp| {
+                    let s_nssai: Vec<crate::context::SNssai> = bp
+                        .tai_slice_support_list
+                        .0
+                        .iter()
+                        .map(|item| crate::context::SNssai {
+                            sst: octets(&item.s_nssai.sst.0) as u8,
+                            sd: item
+                                .s_nssai
+                                .sd
+                                .as_ref()
+                                .map(|sd| octets(&sd.0))
+                                .filter(|sd| *sd != 0x00FF_FFFF),
+                        })
+                        .collect();
+                    crate::context::BplmnEntry {
+                        plmn_id: decode_plmn_id(&bp.plmn_identity.0),
+                        num_of_s_nssai: s_nssai.len(),
+                        s_nssai,
+                    }
+                })
+                .collect();
+            crate::context::SupportedTa {
+                tac: octets(&ta.tac.0),
+                num_of_bplmn_list: bplmn_list.len(),
+                bplmn_list,
+            }
+        })
+        .collect()
+}
+
+/// A RAN CONFIGURATION UPDATE as amfd acts on it (TS 38.413 §9.2.6.7).
+#[derive(Debug, Clone, Default)]
+pub struct RanConfigurationUpdateDecoded {
+    /// The RAN node's new name, if it sent one.
+    pub ran_node_name: Option<String>,
+    /// The new Supported TA List, if it sent one (already converted).
+    pub supported_ta_list: Option<Vec<crate::context::SupportedTa>>,
+}
+
+/// What a RAN CONFIGURATION UPDATE decodes to (TS 38.413 §10.3.4.2 / §10.3.5
+/// for a Class 1 initiating message).
+#[derive(Debug, Clone)]
+pub enum RanConfigurationUpdateDecode {
+    /// Execute and acknowledge; `notify` goes in the Acknowledge's Criticality
+    /// Diagnostics.
+    Proceed {
+        /// The update.
+        update: RanConfigurationUpdateDecoded,
+        /// IEs to report.
+        notify: Vec<IeDiagnostic>,
+    },
+    /// A not-comprehended "reject" IE: execute nothing, answer RAN
+    /// CONFIGURATION UPDATE FAILURE naming the IEs.
+    Reject(Vec<IeDiagnostic>),
+    /// Not a RAN CONFIGURATION UPDATE this AMF can decode.
+    Undecodable,
+}
+
+/// Decode a RAN CONFIGURATION UPDATE (TS 38.413 §9.2.6.7) with the GENERATED
+/// codec (#417). Every IE is optional, so nothing can be missing (§10.3.5).
+pub fn decode_ran_configuration_update_asn1(data: &[u8]) -> RanConfigurationUpdateDecode {
+    use ngap_gen::RANConfigurationUpdateProtocolIEs_EntryValue as Ie;
+    let Some((_criticality, ies, reject, notify)) =
+        decode_initiating(data, "RAN Configuration Update", |v| match v {
+            ngap_gen::InitiatingMessageValue::Id_RANConfigurationUpdate(m) => {
+                Some(m.protocol_i_es.0)
+            }
+            _ => None,
+        })
+    else {
+        return RanConfigurationUpdateDecode::Undecodable;
+    };
+    if !reject.is_empty() {
+        return RanConfigurationUpdateDecode::Reject(reject);
+    }
+    let mut update = RanConfigurationUpdateDecoded::default();
+    for entry in ies {
+        match entry.value {
+            Ie::Id_RANNodeName(v) => update.ran_node_name = Some(v.0),
+            Ie::Id_SupportedTAList(v) => {
+                update.supported_ta_list = Some(context_supported_ta_list(&v))
+            }
+            // Comprehended; the AMF does not act on them. (Removing the TNL
+            // associations an NGRAN-TNLAssociationToRemoveList names, §8.7.2,
+            // is not implemented: this AMF runs one association per gNB.)
+            Ie::Id_DefaultPagingDRX(_)
+            | Ie::Id_GlobalRANNodeID(_)
+            | Ie::Id_NGRAN_TNLAssociationToRemoveList(_)
+            | Ie::Id_NB_IoT_DefaultPagingDRX(_)
+            | Ie::Id_Extended_RANNodeName(_) => {}
+        }
+    }
+    RanConfigurationUpdateDecode::Proceed { update, notify }
+}
+
+/// Build a RAN CONFIGURATION UPDATE ACKNOWLEDGE (TS 38.413 §9.2.6.8) with the
+/// GENERATED codec (#417), reporting `notify` in Criticality Diagnostics.
+pub fn build_ran_configuration_update_acknowledge_generated(
+    notify: &[IeDiagnostic],
+) -> Option<Vec<u8>> {
+    use ngap_gen::{
+        RANConfigurationUpdateAcknowledgeProtocolIEs_Entry as Entry,
+        RANConfigurationUpdateAcknowledgeProtocolIEs_EntryValue as Ie,
+    };
+    let ies = if notify.is_empty() {
+        vec![]
+    } else {
+        vec![Entry {
+            id: ngap_gen::ProtocolIE_ID(ngap_gen::ID_CRITICALITY_DIAGNOSTICS),
+            criticality: ngap_gen::Criticality(ngap_gen::Criticality::IGNORE),
+            value: Ie::Id_CriticalityDiagnostics(generated_criticality_diagnostics(notify)),
+        }]
+    };
+    let pdu = ngap_gen::NGAP_PDU::SuccessfulOutcome(ngap_gen::SuccessfulOutcome {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_RAN_CONFIGURATION_UPDATE),
+        criticality: ngap_gen::Criticality(ngap_gen::Criticality::REJECT),
+        value: ngap_gen::SuccessfulOutcomeValue::Id_RANConfigurationUpdate(
+            ngap_gen::RANConfigurationUpdateAcknowledge {
+                protocol_i_es: ngap_gen::RANConfigurationUpdateAcknowledgeProtocolIEs(ies),
+            },
+        ),
+    });
+    match nextgcore_ngap_gen::encode(&pdu) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            log::error!("Failed to encode the RAN Configuration Update Acknowledge: {e:?}");
+            None
+        }
+    }
+}
+
+/// Build a RAN CONFIGURATION UPDATE FAILURE (TS 38.413 §9.2.6.9) with the
+/// GENERATED codec (#417): Cause, an optional Time to Wait, and `diagnostics`
+/// (the update's offending IEs) in Criticality Diagnostics. Every IE is
+/// criticality ignore.
+pub fn build_ran_configuration_update_failure_generated(
+    cause: Cause,
+    time_to_wait: Option<u8>,
+    diagnostics: &[IeDiagnostic],
+) -> Option<Vec<u8>> {
+    use ngap_gen::{
+        RANConfigurationUpdateFailureProtocolIEs_Entry as Entry,
+        RANConfigurationUpdateFailureProtocolIEs_EntryValue as Ie,
+    };
+    let ignore = || ngap_gen::Criticality(ngap_gen::Criticality::IGNORE);
+    let mut ies = vec![Entry {
+        id: ngap_gen::ProtocolIE_ID(ngap_gen::ID_CAUSE),
+        criticality: ignore(),
+        value: Ie::Id_Cause(generated_cause(cause)),
+    }];
+    if let Some(ttw) = time_to_wait {
+        ies.push(Entry {
+            id: ngap_gen::ProtocolIE_ID(ngap_gen::ID_TIME_TO_WAIT),
+            criticality: ignore(),
+            value: Ie::Id_TimeToWait(ngap_gen::TimeToWait(ttw)),
+        });
+    }
+    if !diagnostics.is_empty() {
+        ies.push(Entry {
+            id: ngap_gen::ProtocolIE_ID(ngap_gen::ID_CRITICALITY_DIAGNOSTICS),
+            criticality: ignore(),
+            value: Ie::Id_CriticalityDiagnostics(generated_criticality_diagnostics(diagnostics)),
+        });
+    }
+    let pdu = ngap_gen::NGAP_PDU::UnsuccessfulOutcome(ngap_gen::UnsuccessfulOutcome {
+        procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_RAN_CONFIGURATION_UPDATE),
+        criticality: ngap_gen::Criticality(ngap_gen::Criticality::REJECT),
+        value: ngap_gen::UnsuccessfulOutcomeValue::Id_RANConfigurationUpdate(
+            ngap_gen::RANConfigurationUpdateFailure {
+                protocol_i_es: ngap_gen::RANConfigurationUpdateFailureProtocolIEs(ies),
+            },
+        ),
+    });
+    match nextgcore_ngap_gen::encode(&pdu) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            log::error!("Failed to encode the RAN Configuration Update Failure: {e:?}");
+            None
+        }
+    }
+}
 /// Decode an initiating message with unknown-IE skipping: its procedure
 /// criticality, its IE entries (extracted by `pick`), and its not-comprehended
 /// IEs sorted into `(reject, notify)`. `None` when it does not decode or is not
@@ -6764,7 +6928,19 @@ pub(crate) mod tests {
                 format!("{:?}", proceed_or_none(data)),
                 format!(
                     "{:?}",
-                    hand_written_oracle::hand_written_parse_ng_setup_request(data)
+                    // Deliberate change (#417 RAN Configuration Update stage): an SD of
+                    // 0xFFFFFF is "no SD" (TS 23.003 §28.4.2) and is now stored as absent
+                    // on NG Setup too, as RAN Configuration Update always did.
+                    hand_written_oracle::hand_written_parse_ng_setup_request(data).map(|mut r| {
+                        for ta in &mut r.supported_ta_list {
+                            for bp in &mut ta.bplmn_list {
+                                for s in &mut bp.s_nssai {
+                                    s.sd = s.sd.filter(|sd| *sd != 0x00FF_FFFF);
+                                }
+                            }
+                        }
+                        r
+                    })
                 ),
                 "input {i}: {data:02x?}"
             );
@@ -13957,5 +14133,248 @@ mod path_switch_tests {
             )),
             Some(vec![0x00, 0xE0])
         );
+    }
+}
+
+#[cfg(test)]
+mod ran_configuration_update_tests {
+    //! #417: RAN CONFIGURATION UPDATE / ACKNOWLEDGE / FAILURE via the generated codec.
+    use super::tests::with_unknown_ie;
+    use super::*;
+
+    fn ta(tac: [u8; 3], slices: Vec<SNssai>) -> SupportedTaItem {
+        SupportedTaItem {
+            tac,
+            broadcast_plmn_list: vec![BroadcastPlmnItem {
+                plmn_identity: [0x99, 0xF9, 0x07],
+                tai_slice_support_list: slices,
+            }],
+        }
+    }
+
+    fn update(name: Option<&str>, tas: Option<Vec<SupportedTaItem>>) -> RanConfigurationUpdate {
+        RanConfigurationUpdate {
+            ran_node_name: name.map(str::to_string),
+            supported_ta_list: tas,
+            default_paging_drx: Some(PagingDrx::V64),
+            global_ran_node_id: None,
+        }
+    }
+
+    fn proceed(data: &[u8]) -> (RanConfigurationUpdateDecoded, Vec<IeDiagnostic>) {
+        match decode_ran_configuration_update_asn1(data) {
+            RanConfigurationUpdateDecode::Proceed { update, notify } => (update, notify),
+            other => panic!("expected Proceed, got {other:?}"),
+        }
+    }
+
+    /// Every update the hand-written parser accepts decodes to the same name and
+    /// the same Supported TA List: TAC as 3 octets big-endian, PLMN, SST, and an
+    /// SD of 0xFFFFFF stored as absent ("no SD", TS 23.003 §28.4.2).
+    #[test]
+    fn ran_configuration_update_generated_decode_matches_hand_written() {
+        let lists = [
+            None,
+            Some(vec![ta([0, 0, 1], vec![SNssai { sst: 1, sd: None }])]),
+            Some(vec![
+                ta(
+                    [0x01, 0x02, 0x03],
+                    vec![
+                        SNssai {
+                            sst: 1,
+                            sd: Some([0, 0, 0xAB]),
+                        },
+                        SNssai {
+                            sst: 2,
+                            sd: Some([0xFF, 0xFF, 0xFF]),
+                        },
+                        SNssai { sst: 3, sd: None },
+                    ],
+                ),
+                ta(
+                    [0xFF, 0xFF, 0xFF],
+                    vec![SNssai {
+                        sst: 255,
+                        sd: Some([0xFF, 0xFF, 0xFE]),
+                    }],
+                ),
+            ]),
+        ];
+        for name in [None, Some("gnb-renamed")] {
+            for list in &lists {
+                let bytes = builder::build_ran_configuration_update(&update(name, list.clone()))
+                    .expect("build");
+                let Ok(NgapMessage::RanConfigurationUpdate(hand)) = parser::decode_ngap_pdu(&bytes)
+                else {
+                    panic!("hand-written parser refused {name:?}/{list:?}");
+                };
+                let (gen, notify) = proceed(&bytes);
+                assert!(notify.is_empty());
+                assert_eq!(gen.ran_node_name, hand.ran_node_name);
+                let expected = hand.supported_ta_list.as_ref().map(|items| {
+                    items
+                        .iter()
+                        .map(|item| {
+                            (
+                                u32::from(item.tac[0]) << 16
+                                    | u32::from(item.tac[1]) << 8
+                                    | u32::from(item.tac[2]),
+                                item.broadcast_plmn_list
+                                    .iter()
+                                    .map(|bp| {
+                                        bp.tai_slice_support_list
+                                            .iter()
+                                            .map(|s| {
+                                                (
+                                                    s.sst,
+                                                    s.sd.map(|sd| {
+                                                        u32::from(sd[0]) << 16
+                                                            | u32::from(sd[1]) << 8
+                                                            | u32::from(sd[2])
+                                                    })
+                                                    .filter(|sd| *sd != 0x00FF_FFFF),
+                                                )
+                                            })
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                });
+                let got = gen.supported_ta_list.as_ref().map(|tas| {
+                    tas.iter()
+                        .map(|t| {
+                            (
+                                t.tac,
+                                t.bplmn_list
+                                    .iter()
+                                    .map(|bp| {
+                                        assert_eq!(bp.plmn_id, decode_plmn_id(&[0x99, 0xF9, 0x07]));
+                                        bp.s_nssai.iter().map(|s| (s.sst, s.sd)).collect::<Vec<_>>()
+                                    })
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                });
+                assert_eq!(got, expected, "name={name:?}");
+            }
+        }
+    }
+
+    /// TS 38.413 §10.3.4.2 for a Class 1 initiating message whose IEs are all optional.
+    #[test]
+    fn ran_configuration_update_follows_ie_criticality() {
+        let base =
+            builder::build_ran_configuration_update(&update(Some("g"), None)).expect("build");
+        assert!(proceed(&with_unknown_ie(&base, 9999, 0x40)).1.is_empty());
+        assert_eq!(
+            proceed(&with_unknown_ie(&base, 9999, 0x80)).1[0].ie_id,
+            9999
+        );
+        let RanConfigurationUpdateDecode::Reject(diag) =
+            decode_ran_configuration_update_asn1(&with_unknown_ie(&base, 9999, 0x00))
+        else {
+            panic!("reject must reject");
+        };
+        assert_eq!(diag[0].ie_id, 9999);
+        assert_eq!(diag[0].criticality, ngap_gen::Criticality::REJECT);
+        assert!(matches!(
+            decode_ran_configuration_update_asn1(&[0x00, 0x23, 0x00]),
+            RanConfigurationUpdateDecode::Undecodable
+        ));
+    }
+
+    /// The empty acknowledge, derived by hand from X.691: successfulOutcome
+    /// (CHOICE extension bit `0`, index 1 `01`) + pad `20`; procedure code 35
+    /// `23`; criticality reject `00` + pad; open type length 3; SEQUENCE
+    /// extension bit + pad `00`; IE count 0 `00 00`.
+    #[test]
+    fn ran_configuration_update_acknowledge_matches_hand_derived_and_hand_written() {
+        let generated = build_ran_configuration_update_acknowledge_generated(&[]).expect("encodes");
+        assert_eq!(generated, [0x20, 0x23, 0x00, 0x03, 0x00, 0x00, 0x00]);
+        let hand = builder::build_ran_configuration_update_acknowledge(
+            &RanConfigurationUpdateAcknowledge {
+                criticality_diagnostics: None,
+            },
+        )
+        .expect("hand-written");
+        assert_eq!(generated, hand);
+        let notify = [IeDiagnostic {
+            ie_id: 9999,
+            criticality: ngap_gen::Criticality::NOTIFY,
+            type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+        }];
+        let hand_diag = builder::build_ran_configuration_update_acknowledge(
+            &RanConfigurationUpdateAcknowledge {
+                criticality_diagnostics: Some(CriticalityDiagnostics {
+                    procedure_code: None,
+                    triggering_message: None,
+                    procedure_criticality: None,
+                    ies: vec![IeCriticalityDiagnostics {
+                        ie_criticality: nextgcore_asn1c::ngap::types::Criticality::Notify,
+                        ie_id: 9999,
+                        type_of_error: TypeOfError::NotUnderstood,
+                    }],
+                }),
+            },
+        )
+        .expect("hand-written");
+        assert_eq!(
+            build_ran_configuration_update_acknowledge_generated(&notify).as_deref(),
+            Some(hand_diag.as_slice())
+        );
+    }
+
+    /// The Failure is byte-identical to the hand-written encoder across cause
+    /// groups, Time to Wait and diagnostics.
+    #[test]
+    fn ran_configuration_update_failure_matches_hand_written() {
+        let diag = [IeDiagnostic {
+            ie_id: 9999,
+            criticality: ngap_gen::Criticality::REJECT,
+            type_of_error: ngap_gen::TypeOfError::NOT_UNDERSTOOD,
+        }];
+        for cause in [
+            Cause::Protocol(CauseProtocol::AbstractSyntaxErrorReject),
+            Cause::Protocol(CauseProtocol::TransferSyntaxError),
+            Cause::Misc(CauseMisc::Unspecified),
+            Cause::RadioNetwork(CauseRadioNetwork::Unspecified),
+        ] {
+            for ttw in [None, Some(TimeToWait::V1s), Some(TimeToWait::V60s)] {
+                for with_diag in [false, true] {
+                    let hand = builder::build_ran_configuration_update_failure(
+                        &RanConfigurationUpdateFailure {
+                            cause,
+                            time_to_wait: ttw,
+                            criticality_diagnostics: with_diag.then(|| CriticalityDiagnostics {
+                                procedure_code: None,
+                                triggering_message: None,
+                                procedure_criticality: None,
+                                ies: vec![IeCriticalityDiagnostics {
+                                    ie_criticality:
+                                        nextgcore_asn1c::ngap::types::Criticality::Reject,
+                                    ie_id: 9999,
+                                    type_of_error: TypeOfError::NotUnderstood,
+                                }],
+                            }),
+                        },
+                    )
+                    .expect("hand-written");
+                    let diagnostics: &[IeDiagnostic] = if with_diag { &diag } else { &[] };
+                    assert_eq!(
+                        build_ran_configuration_update_failure_generated(
+                            cause,
+                            ttw.map(|t| t as u8),
+                            diagnostics
+                        )
+                        .as_deref(),
+                        Some(hand.as_slice()),
+                        "{cause:?} {ttw:?} {with_diag}"
+                    );
+                }
+            }
+        }
     }
 }
