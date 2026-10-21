@@ -2358,12 +2358,10 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // #417: the hand-written MBS transfer decoder, a dev-dependency, as an independent
-    // reader of what the generated codec now builds (n2_mbs_transfer/oracle_tests.rs
-    // pins the bytes themselves).
-    use nextgcore_ngap::mbs_transfer::{
-        MbsDistributionSetupResponseTransfer, MbsSessionStatus as NgapMbsSessionStatus,
-    };
+    // #417: the Setup Response is read back by the generated codec's strict
+    // decode and pinned whole against the hand-derived octets
+    // (n2_mbs_transfer/golden.rs), not against the hand-written codec.
+    use crate::n2_mbs_transfer::golden;
 
     #[test]
     fn test_args_default() {
@@ -3350,7 +3348,7 @@ mod tests {
             .expect("contract: contentId resolves to an application/vnd.3gpp.ngap part");
         // The part decodes as a Setup Response Transfer (§9.3.5.8).
         let part = &rsp.http.parts[0];
-        MbsDistributionSetupResponseTransfer::decode(&part.data)
+        golden::decode_setup_response(&part.data)
             .expect("part decodes as MBS Distribution Setup Response Transfer");
     }
 
@@ -3388,15 +3386,11 @@ mod tests {
             .iter()
             .find(|p| p.content_id.as_deref() == Some("n2MbsSmInfo"))
             .expect("response part n2MbsSmInfo");
-        let decoded = MbsDistributionSetupResponseTransfer::decode(&part.data)
-            .expect("decodes as Setup Response Transfer");
-        assert_eq!(decoded.mbs_session_id.plmn_identity, [0x02, 0xF8, 0x39]);
-        assert_eq!(decoded.mbs_session_id.mbs_service_id, [0x00, 0x00, 0x01]);
-        assert_eq!(decoded.mbs_session_status, NgapMbsSessionStatus::Activated);
-        let tnl = decoded
-            .shared_ngu_multicast_tnl_information
-            .as_ref()
-            .expect("shared NG-U multicast TNL present");
+        let decoded =
+            golden::decode_setup_response(&part.data).expect("decodes as Setup Response Transfer");
+        assert_eq!(decoded.tmgi, ([0x02, 0xF8, 0x39], [0x00, 0x00, 0x01]));
+        assert!(decoded.activated);
+        let tnl = decoded.tunnel.expect("shared NG-U multicast TNL present");
 
         // The decoded TNL matches the stored session's N4mb transport.
         let ctx = mbsmf_self();
@@ -3413,20 +3407,15 @@ mod tests {
             .session_find_by_tmgi(&tmgi)
             .expect("session");
         let n4mb = session.n4mb_session.as_ref().expect("n4mb allocated");
-        assert_eq!(u32::from_be_bytes(tnl.gtp_teid), n4mb.dl_teid);
-        assert_eq!(
-            tnl.ip_multicast_address.octets,
-            n4mb.ll_ssm_dst.unwrap().octets().to_vec()
-        );
-        assert_eq!(
-            tnl.ip_source_address.octets,
-            n4mb.ll_ssm_src.unwrap().octets().to_vec()
-        );
+        assert_eq!(tnl.teid, n4mb.dl_teid);
+        assert_eq!(tnl.multicast_address, n4mb.ll_ssm_dst.unwrap().octets());
+        assert_eq!(tnl.source_address, n4mb.ll_ssm_src.unwrap().octets());
         // One QoS flow derived from the session model (QFI 1 / 5QI 9 default).
-        assert_eq!(decoded.mbs_qos_flows_to_be_setup_list.len(), 1);
+        assert_eq!(decoded.qfis, vec![session.qfi]);
+        // The whole part is the hand-derived §9.3.5.8 octets for these values.
         assert_eq!(
-            decoded.mbs_qos_flows_to_be_setup_list[0].mbs_qos_flow_identifier,
-            session.qfi
+            part.data[..],
+            golden::setup_response_octets(decoded.tmgi, tnl, session.qfi, session.fiveqi)[..]
         );
 
         // Acceptance cross-check: the SMF Start path of the SAME session
@@ -3444,7 +3433,7 @@ mod tests {
             serde_json::from_str(smf_rsp.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(
             smf_parsed.c_teid.expect("cTeid"),
-            u32::from_be_bytes(tnl.gtp_teid),
+            tnl.teid,
             "SMF-path JSON cTeid == decoded NGAP SharedNguMulticastTnl gtp_teid"
         );
     }

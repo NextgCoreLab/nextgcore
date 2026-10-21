@@ -14,6 +14,11 @@ bytes.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# #417: the old-vs-new cross-checks (tests/builder_conformance.rs,
+# tests/*_transfer_cross_check.rs) live here, with their subject, so the
+# generated codec's crate no longer depends on this one.
+nextgcore-ngap-gen.workspace = true
+bitvec.workspace = true
 
 [lints]
 workspace = true

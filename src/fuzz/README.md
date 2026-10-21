@@ -24,7 +24,7 @@ rustup install nightly
 | `fuzz_gtp_message` | GTPv1-C/GTPv2-C | Gn/Gp/S5/S8/S11 interfaces |
 | `fuzz_nas_message` | 5G NAS / EPS NAS | 5GMM/5GSM/EMM/ESM messages |
 | `fuzz_diameter_message` | Diameter | S6a/S6b/Gx/Gy/Rx/Cx/SWx interfaces |
-| `fuzz_ngap_message` | NGAP | N2: hand-written parser and the generated codec (`nextgcore-ngap-gen`) |
+| `fuzz_ngap_message` | NGAP | N2: generated codec (`nextgcore-ngap-gen`) |
 | `fuzz_s1ap_message` | S1AP | S1-MME: generated codec (`nextgcore-s1ap-gen`) |
 | `fuzz_nrppa_message` | NRPPa | NG-RAN positioning: generated codec (`nextgcore-nrppa-gen`) |
 | `fuzz_lpp_message` | LPP | UE positioning: generated codec (`nextgcore-lpp-gen`) |
