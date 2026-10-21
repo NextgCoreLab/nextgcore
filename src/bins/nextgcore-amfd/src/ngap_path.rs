@@ -17430,6 +17430,9 @@ mod tests {
     /// (the send is attempted, so with no association it fails), and one nobody can
     /// resolve gets no answer, TS 38.413 §8.14.3.3 defining no unsuccessful outcome.
     #[tokio::test]
+    // The RACS cache lock is held across the awaits on purpose: it serialises the
+    // process-global cache with the racs:: tests on this single-threaded runtime.
+    #[allow(clippy::await_holding_lock)]
     async fn a_mapping_request_is_answered_only_when_the_id_resolves() {
         let _racs = crate::racs::tests::guard();
         crate::context::amf_context_init(64, 1024, 4096);
