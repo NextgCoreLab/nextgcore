@@ -2,8 +2,10 @@
 //!
 //! Protocol IE containers and common IEs from S1AP-IEs (3GPP TS 36.413)
 
-use super::types::{Criticality, ProtocolIeId};
-use crate::per::{AperDecode, AperDecoder, AperEncode, AperEncoder, Constraint, PerResult};
+use crate::asn1::types::{Criticality, ProtocolIeId};
+use nextgcore_asn1c::per::{
+    AperDecode, AperDecoder, AperEncode, AperEncoder, Constraint, PerResult,
+};
 
 /// ProtocolIE-Field - Single IE with ID, criticality, and value
 /// ASN.1: ProtocolIE-Field ::= SEQUENCE { id, criticality, value }
@@ -204,7 +206,7 @@ impl AperDecode for TimeToWait {
             3 => Ok(TimeToWait::V10s),
             4 => Ok(TimeToWait::V20s),
             5 => Ok(TimeToWait::V60s),
-            _ => Err(crate::per::PerError::DecodeError(format!(
+            _ => Err(nextgcore_asn1c::per::PerError::DecodeError(format!(
                 "Unknown TimeToWait value: {value}"
             ))),
         }
@@ -330,7 +332,7 @@ impl AperDecode for PriorityLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::per::{AperDecoder, AperEncoder};
+    use nextgcore_asn1c::per::{AperDecoder, AperEncoder};
 
     #[test]
     fn test_mme_ue_s1ap_id_roundtrip() {

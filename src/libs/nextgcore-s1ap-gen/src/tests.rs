@@ -6,8 +6,9 @@
 //! must agree with the hand-written builders over a sweep of their inputs.
 
 use super::{decode, decode_with_unknown_ies, encode, S1AP_PDU};
-use nextgcore_asn1c::s1ap::cause::{Cause, CauseMisc, CauseNas, CauseRadioNetwork};
-use nextgcore_s1ap::*;
+use nextgcore_s1ap::cause::{Cause, CauseMisc, CauseNas, CauseRadioNetwork};
+use nextgcore_s1ap::types::*;
+use nextgcore_s1ap_oracle::*;
 
 const S1_SETUP_REQUEST: &str = "00110031000004003b00080099f907000019b0003c400e05806e6578746773696d2d656e62004000070000004099f9070089400140";
 const S1_SETUP_RESPONSE: &str =

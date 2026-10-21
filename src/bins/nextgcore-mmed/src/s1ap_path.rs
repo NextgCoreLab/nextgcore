@@ -445,9 +445,9 @@ mod tests {
     async fn s1_setup_request_over_real_sctp_is_answered() {
         use crate::context::PlmnId;
         use nextgcore_s1ap::{
-            builder, decode_s1ap_pdu, GlobalEnbId, PagingDrx, S1SetupRequest, S1apMessage,
-            SupportedTaItem,
+            GlobalEnbId, PagingDrx, S1SetupRequest, S1apMessage, SupportedTaItem,
         };
+        use nextgcore_s1ap_oracle::{builder, decode_s1ap_pdu};
 
         let ctx = static_ctx_with_gummei();
         let (_tx, rx) = mpsc::unbounded_channel();

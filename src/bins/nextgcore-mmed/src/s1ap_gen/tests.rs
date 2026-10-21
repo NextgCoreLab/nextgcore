@@ -11,7 +11,8 @@ use crate::s1ap_build::{
     self, hand_written_build_setup_failure, hand_written_build_setup_response,
 };
 use crate::s1ap_handler::handle_s1ap_message;
-use nextgcore_s1ap::{builder, decode_s1ap_pdu, S1apMessage};
+use nextgcore_s1ap::S1apMessage;
+use nextgcore_s1ap_oracle::{builder, decode_s1ap_pdu};
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()

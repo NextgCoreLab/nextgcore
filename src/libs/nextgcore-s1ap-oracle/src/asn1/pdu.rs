@@ -2,9 +2,9 @@
 //!
 //! Top-level PDU structures from S1AP-PDU-Descriptions (3GPP TS 36.413)
 
-use super::ies::ProtocolIeContainer;
-use super::types::{Criticality, ProcedureCode};
-use crate::per::{AperDecode, AperDecoder, AperEncode, AperEncoder, PerError, PerResult};
+use crate::asn1::ies::ProtocolIeContainer;
+use crate::asn1::types::{Criticality, ProcedureCode};
+use nextgcore_asn1c::per::{AperDecode, AperDecoder, AperEncode, AperEncoder, PerError, PerResult};
 
 /// Encode the body of an S1AP elementary-procedure message value as the open
 /// type's content.
@@ -450,10 +450,10 @@ impl AperEncode for UnsuccessfulOutcomeValue {
 
 #[cfg(test)]
 mod tests {
-    use super::super::ies::ProtocolIeField;
-    use super::super::types::{Criticality, ProtocolIeId};
     use super::*;
-    use crate::per::{AperDecoder, AperEncoder};
+    use crate::asn1::ies::ProtocolIeField;
+    use crate::asn1::types::{Criticality, ProtocolIeId};
+    use nextgcore_asn1c::per::{AperDecoder, AperEncoder};
 
     #[test]
     fn test_s1ap_pdu_initiating_message_roundtrip() {

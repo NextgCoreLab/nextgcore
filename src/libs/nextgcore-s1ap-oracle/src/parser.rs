@@ -5,77 +5,16 @@
 //! CHOICE (initiatingMessage / successfulOutcome / unsuccessfulOutcome) and
 //! dispatches on the procedure code.
 
+use crate::asn1::ies::ProtocolIeContainer;
+use crate::asn1::pdu::*;
+use crate::asn1::types::{ProcedureCode, ProtocolIeId};
 use nextgcore_asn1c::per::{AperDecode, AperDecoder};
-use nextgcore_asn1c::s1ap::ies::ProtocolIeContainer;
-use nextgcore_asn1c::s1ap::pdu::*;
-use nextgcore_asn1c::s1ap::types::{ProcedureCode, ProtocolIeId};
 
 use crate::error::{S1apError, S1apResult};
 use crate::ie;
 use crate::types::*;
 
-/// Decoded S1AP message - discriminated union of all supported message types
-#[derive(Debug, Clone)]
-pub enum S1apMessage {
-    S1SetupRequest(S1SetupRequest),
-    S1SetupResponse(S1SetupResponse),
-    S1SetupFailure(S1SetupFailure),
-    InitialUeMessage(InitialUeMessage),
-    DownlinkNasTransport(DlNasTransport),
-    UplinkNasTransport(UlNasTransport),
-    NasNonDeliveryIndication(NasNonDeliveryIndication),
-    InitialContextSetupRequest(InitialContextSetupRequest),
-    InitialContextSetupResponse(InitialContextSetupResponse),
-    InitialContextSetupFailure(InitialContextSetupFailure),
-    UeContextReleaseRequest(UeContextReleaseRequest),
-    UeContextReleaseCommand(UeContextReleaseCommand),
-    UeContextReleaseComplete(UeContextReleaseComplete),
-    ErabSetupRequest(ErabSetupRequest),
-    ErabSetupResponse(ErabSetupResponse),
-    ErabModifyRequest(ErabModifyRequest),
-    ErabModifyResponse(ErabModifyResponse),
-    ErabReleaseCommand(ErabReleaseCommand),
-    ErabReleaseResponse(ErabReleaseResponse),
-    Paging(Paging),
-    Reset(Reset),
-    ResetAcknowledge(ResetAcknowledge),
-    ErrorIndication(ErrorIndication),
-    HandoverRequired(HandoverRequired),
-    HandoverCommand(HandoverCommand),
-    HandoverPreparationFailure(HandoverPreparationFailure),
-    HandoverRequest(HandoverRequest),
-    HandoverRequestAcknowledge(HandoverRequestAcknowledge),
-    HandoverFailure(HandoverFailure),
-    HandoverNotify(HandoverNotify),
-    PathSwitchRequest(PathSwitchRequest),
-    PathSwitchRequestAcknowledge(PathSwitchRequestAcknowledge),
-    PathSwitchRequestFailure(PathSwitchRequestFailure),
-    HandoverCancel(HandoverCancel),
-    HandoverCancelAcknowledge(HandoverCancelAcknowledge),
-    EnbStatusTransfer(EnbStatusTransfer),
-    MmeStatusTransfer(MmeStatusTransfer),
-    UeCapabilityInfoIndication(UeCapabilityInfoIndication),
-    EnbConfigurationUpdate(EnbConfigurationUpdate),
-    EnbConfigurationUpdateAcknowledge(EnbConfigurationUpdateAcknowledge),
-    EnbConfigurationUpdateFailure(EnbConfigurationUpdateFailure),
-    MmeConfigurationUpdate(MmeConfigurationUpdate),
-    MmeConfigurationUpdateAcknowledge(MmeConfigurationUpdateAcknowledge),
-    MmeConfigurationUpdateFailure(MmeConfigurationUpdateFailure),
-    UeContextModificationRequest(UeContextModificationRequest),
-    UeContextModificationResponse(UeContextModificationResponse),
-    UeContextModificationFailure(UeContextModificationFailure),
-    OverloadStart(OverloadStart),
-    OverloadStop(OverloadStop),
-    WriteReplaceWarningRequest(WriteReplaceWarningRequest),
-    WriteReplaceWarningResponse(WriteReplaceWarningResponse),
-    KillRequest(KillRequest),
-    KillResponse(KillResponse),
-    /// Unknown/unsupported message
-    Unknown {
-        procedure_code: u8,
-        message_type: &'static str,
-    },
-}
+pub use nextgcore_s1ap::S1apMessage;
 
 /// Decode an S1AP PDU from APER bytes into a high-level S1apMessage
 pub fn decode_s1ap_pdu(data: &[u8]) -> S1apResult<S1apMessage> {

@@ -2,7 +2,7 @@
 //!
 //! Port of src/mme/s1ap-handler.c - S1AP message handling functions.
 //!
-//! Incoming PDUs are decoded with `nextgcore_s1ap::decode_s1ap_pdu` (real APER per
+//! Incoming PDUs are decoded with the generated codec (`crate::s1ap_gen`; real APER per
 //! TS 36.413) and dispatched by message type. Each handler updates the MME
 //! context and returns the S1AP PDUs to transmit (responses may target a
 //! different eNB than the origin, e.g. during S1 handover).
@@ -17,8 +17,8 @@ use crate::s1ap_build::{
     radio_network_cause, tai_from_s1ap, transport_address_to_ip, ue_security_capabilities_from,
 };
 use nextgcore_s1ap::{
-    decode_s1ap_pdu, BroadcastCancelledAreaList, BroadcastCompletedAreaList, Cause,
-    CauseRadioNetwork, CriticalityDiagnostics, EnbConfigurationUpdate, EnbId, EnbStatusTransfer,
+    BroadcastCancelledAreaList, BroadcastCompletedAreaList, Cause, CauseRadioNetwork,
+    CriticalityDiagnostics, EnbConfigurationUpdate, EnbId, EnbStatusTransfer,
     ErabDataForwardingItem, ErabSwitchedItem, ErabToBeSetupItemHoReq, ErrorIndication,
     HandoverCancel, HandoverCancelAcknowledge, HandoverCommand, HandoverFailure, HandoverNotify,
     HandoverPreparationFailure, HandoverRequest, HandoverRequestAcknowledge, HandoverRequired,
@@ -972,26 +972,16 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
             None
         }
     };
-    let message = match generated.map(Ok).unwrap_or_else(|| decode_s1ap_pdu(data)) {
-        Ok(message) => message,
-        Err(e) => {
-            log::error!("Failed to decode S1AP PDU from eNB {enb_id}: {e}");
-            // The PDU did not decode, so its procedure code is unknown; the
-            // diagnostics can still say that an initiating message was what
-            // failed, which is more than the bare cause conveys.
-            return error_indication_with_diagnostics(
+    // A PDU none of the generated family decodes took (#514 stage 13; this
+    // was the hand-written decoder's job until it was deleted).
+    let message = match generated {
+        Some(message) => message,
+        None => {
+            reported.extend(answer_unmatched(
                 enb_id,
-                None,
-                None,
-                S1apCauseGroup::Protocol,
-                protocol_cause::TRANSFER_SYNTAX_ERROR,
-                Some(CriticalityDiagnostics {
-                    triggering_message: Some(
-                        nextgcore_s1ap::triggering_message::INITIATING_MESSAGE,
-                    ),
-                    ..Default::default()
-                }),
-            );
+                crate::s1ap_gen::classify_unmatched(data),
+            ));
+            return reported;
         }
     };
 
@@ -1139,32 +1129,62 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
             handle_kill_response(enb_id, &msg);
             Vec::new()
         }
-        // MME-originated messages arriving at the MME are a protocol error
-        S1apMessage::DownlinkNasTransport(_)
-        | S1apMessage::InitialContextSetupRequest(_)
-        | S1apMessage::UeContextReleaseCommand(_)
-        | S1apMessage::ErabSetupRequest(_)
-        | S1apMessage::ErabModifyRequest(_)
-        | S1apMessage::ErabReleaseCommand(_)
-        | S1apMessage::Paging(_)
-        | S1apMessage::S1SetupResponse(_)
-        | S1apMessage::S1SetupFailure(_)
-        | S1apMessage::HandoverRequest(_)
-        | S1apMessage::HandoverCommand(_)
-        | S1apMessage::HandoverPreparationFailure(_)
-        | S1apMessage::PathSwitchRequestAcknowledge(_)
-        | S1apMessage::PathSwitchRequestFailure(_)
-        | S1apMessage::HandoverCancelAcknowledge(_)
-        | S1apMessage::MmeStatusTransfer(_)
-        | S1apMessage::MmeConfigurationUpdate(_)
-        | S1apMessage::EnbConfigurationUpdateAcknowledge(_)
-        | S1apMessage::EnbConfigurationUpdateFailure(_)
-        | S1apMessage::UeContextModificationRequest(_)
-        | S1apMessage::OverloadStart(_)
-        | S1apMessage::OverloadStop(_)
-        | S1apMessage::WriteReplaceWarningRequest(_)
-        | S1apMessage::KillRequest(_) => {
-            log::error!("MME-originated S1AP message received from eNB {enb_id}");
+        other => {
+            // Every variant the generated dispatch above produces has an arm;
+            // anything else was classified by `answer_unmatched` first.
+            log::error!("S1AP message from eNB {enb_id} has no handler: {other:?}");
+            Vec::new()
+        }
+    });
+    reported
+}
+
+/// Answers a PDU none of the generated family decodes took (TS 36.413 §10).
+fn answer_unmatched(enb_id: u64, unmatched: crate::s1ap_gen::Unmatched) -> Vec<S1apSend> {
+    use crate::s1ap_gen::Unmatched;
+    match unmatched {
+        Unmatched::TransferSyntaxError => {
+            log::error!("Failed to decode the S1AP-PDU header from eNB {enb_id}");
+            // The header did not decode, so the procedure code is unknown; the
+            // diagnostics can still say an initiating message was what failed.
+            error_indication_with_diagnostics(
+                enb_id,
+                None,
+                None,
+                S1apCauseGroup::Protocol,
+                protocol_cause::TRANSFER_SYNTAX_ERROR,
+                Some(CriticalityDiagnostics {
+                    triggering_message: Some(
+                        nextgcore_s1ap::triggering_message::INITIATING_MESSAGE,
+                    ),
+                    ..Default::default()
+                }),
+            )
+        }
+        Unmatched::Undecodable {
+            procedure_code,
+            triggering_message,
+        } => {
+            log::error!(
+                "Failed to decode S1AP procedure {procedure_code} (triggering message {triggering_message}) from eNB {enb_id}"
+            );
+            error_indication_with_diagnostics(
+                enb_id,
+                None,
+                None,
+                S1apCauseGroup::Protocol,
+                protocol_cause::TRANSFER_SYNTAX_ERROR,
+                Some(CriticalityDiagnostics {
+                    procedure_code: Some(procedure_code),
+                    triggering_message: Some(triggering_message),
+                    ..Default::default()
+                }),
+            )
+        }
+        Unmatched::MmeOriginated { procedure_code } => {
+            log::error!(
+                "MME-originated S1AP message (procedure {procedure_code}) received from eNB {enb_id}"
+            );
             error_indication(
                 enb_id,
                 None,
@@ -1173,30 +1193,38 @@ pub fn handle_s1ap_message(ctx: &MmeContext, enb_id: u64, data: &[u8]) -> Vec<S1
                 protocol_cause::MESSAGE_NOT_COMPATIBLE_WITH_RECEIVER_STATE,
             )
         }
-        S1apMessage::Unknown {
+        Unmatched::UnknownProcedure {
             procedure_code,
-            message_type,
+            triggering_message,
+            criticality,
         } => {
-            log::error!(
-                "Unknown S1AP {message_type} (procedure code {procedure_code}) from eNB {enb_id}"
+            // TS 36.413 §10.3.4.1: reject -> reject the procedure by Error
+            // Indication; ignore-and-notify -> ignore it and send one; ignore
+            // -> ignore it. The Error Indication names the procedure code,
+            // triggering message and procedure criticality.
+            log::warn!(
+                "S1AP procedure {procedure_code} (criticality {criticality}) from eNB {enb_id} is not comprehended"
             );
+            let cause = match criticality {
+                0 => protocol_cause::ABSTRACT_SYNTAX_ERROR_REJECT,
+                2 => protocol_cause::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+                _ => return Vec::new(),
+            };
             error_indication_with_diagnostics(
                 enb_id,
                 None,
                 None,
                 S1apCauseGroup::Protocol,
-                protocol_cause::ABSTRACT_SYNTAX_ERROR_REJECT,
+                cause,
                 Some(CriticalityDiagnostics {
                     procedure_code: Some(procedure_code),
-                    triggering_message: Some(
-                        nextgcore_s1ap::triggering_message::INITIATING_MESSAGE,
-                    ),
+                    triggering_message: Some(triggering_message),
+                    procedure_criticality: Some(criticality),
                     ..Default::default()
                 }),
             )
         }
-    });
-    reported
+    }
 }
 
 fn error_indication(
@@ -3269,11 +3297,11 @@ pub fn s1ap_cause(cause: &Cause) -> S1apCause {
 mod tests {
     use super::*;
     use crate::context::{Bitrate, MmeUe, PlmnId, ServedGummei};
-    use nextgcore_s1ap::builder;
     use nextgcore_s1ap::{
         CauseRadioNetwork, GlobalEnbId, STmsi, SupportedTaItem, UeAssociatedLogicalS1Connection,
         UeSecurityCapabilities,
     };
+    use nextgcore_s1ap_oracle::{builder, decode_s1ap_pdu};
 
     fn test_ctx() -> MmeContext {
         let ctx = MmeContext::new();

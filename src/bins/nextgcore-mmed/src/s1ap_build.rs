@@ -5,14 +5,12 @@
 //! All messages are APER-encoded via the `nextgcore-s1ap` codec per 3GPP TS 36.413.
 //! This module converts MME context types into `nextgcore-s1ap` message structures
 //! and returns the encoded wire bytes. There is no bespoke byte layout here:
-//! every builder goes through `nextgcore_s1ap::builder`.
+//! every builder goes through `nextgcore_s1ap_oracle::builder`.
 
 use crate::context::{
     ECgi, EnbUe, EpsTai, IpAddr, MmeBearer, MmeContext, MmeUe, PlmnId, S1apCause, S1apCauseGroup,
 };
 use crate::sbc_message::SbcPwsData;
-#[cfg(test)]
-use nextgcore_s1ap::builder;
 use nextgcore_s1ap::{
     AllocationRetentionPriority, Cause, CauseMisc, CauseNas, CauseProtocol, CauseRadioNetwork,
     CauseTransport, CnDomain, CsFallbackIndicator, ErabItem, ErabLevelQosParameters,
@@ -22,6 +20,8 @@ use nextgcore_s1ap::{
     UeContextModificationRequest, UePagingId, UeS1apIds, UeSecurityCapabilities, WarningAreaList,
     WriteReplaceWarningRequest,
 };
+#[cfg(test)]
+use nextgcore_s1ap_oracle::builder;
 
 // ============================================================================
 // S1AP Cause Values (TS 36.413 §9.2.1.3)
@@ -395,6 +395,7 @@ pub(crate) fn hand_written_build_setup_response(ctx: &MmeContext) -> S1apResult<
         served_gummeis,
         relative_mme_capacity: ctx.relative_capacity,
     })
+    .map_err(Into::into)
 }
 
 /// The pre-#514 hand-written S1 Setup Failure, kept as the oracle.
@@ -408,6 +409,7 @@ pub(crate) fn hand_written_build_setup_failure(
         cause: cause_to_s1ap(cause_group, cause_value),
         time_to_wait,
     })
+    .map_err(Into::into)
 }
 
 // ============================================================================
@@ -441,6 +443,7 @@ pub(crate) fn hand_written_build_downlink_nas_transport(
         enb_ue_s1ap_id,
         nas_pdu: nas_pdu.to_vec(),
     })
+    .map_err(Into::into)
 }
 
 // ============================================================================
@@ -793,7 +796,8 @@ pub fn build_error_indication(
 mod tests {
     use super::*;
     use crate::context::{Bitrate, ServedGummei, TmsiInfo};
-    use nextgcore_s1ap::{decode_s1ap_pdu, S1apMessage};
+    use nextgcore_s1ap::S1apMessage;
+    use nextgcore_s1ap_oracle::decode_s1ap_pdu;
 
     fn test_plmn() -> PlmnId {
         PlmnId::new("310", "410")
@@ -1263,13 +1267,17 @@ mod tests {
         // Hand-craft a Downlink NAS Transport whose container only carries
         // the UE S1AP IDs (no NAS-PDU): a strict peer must reject it.
         use nextgcore_asn1c::per::{AperEncode, AperEncoder};
-        use nextgcore_asn1c::s1ap::ies::ProtocolIeContainer;
-        use nextgcore_asn1c::s1ap::pdu::{InitiatingMessage, InitiatingMessageValue, S1apPdu};
-        use nextgcore_asn1c::s1ap::types::{Criticality, ProcedureCode};
+        use nextgcore_s1ap_oracle::asn1::ies::ProtocolIeContainer;
+        use nextgcore_s1ap_oracle::asn1::pdu::{
+            InitiatingMessage, InitiatingMessageValue, S1apPdu,
+        };
+        use nextgcore_s1ap_oracle::asn1::types::{Criticality, ProcedureCode};
 
         let mut container = ProtocolIeContainer::new();
-        nextgcore_s1ap::ie::encode_mme_ue_s1ap_id(&mut container, 42, Criticality::Reject).unwrap();
-        nextgcore_s1ap::ie::encode_enb_ue_s1ap_id(&mut container, 7, Criticality::Reject).unwrap();
+        nextgcore_s1ap_oracle::ie::encode_mme_ue_s1ap_id(&mut container, 42, Criticality::Reject)
+            .unwrap();
+        nextgcore_s1ap_oracle::ie::encode_enb_ue_s1ap_id(&mut container, 7, Criticality::Reject)
+            .unwrap();
 
         let pdu = S1apPdu::InitiatingMessage(InitiatingMessage {
             procedure_code: ProcedureCode::DOWNLINK_NAS_TRANSPORT,
@@ -1282,7 +1290,9 @@ mod tests {
         let bytes = encoder.into_bytes().to_vec();
 
         match decode_s1ap_pdu(&bytes) {
-            Err(nextgcore_s1ap::S1apError::MissingMandatoryIe(name)) => assert_eq!(name, "NAS-PDU"),
+            Err(nextgcore_s1ap_oracle::S1apError::MissingMandatoryIe(name)) => {
+                assert_eq!(name, "NAS-PDU")
+            }
             other => panic!("expected MissingMandatoryIe(NAS-PDU), got {other:?}"),
         }
     }

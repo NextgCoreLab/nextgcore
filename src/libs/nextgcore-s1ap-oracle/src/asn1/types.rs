@@ -2,7 +2,9 @@
 //!
 //! Basic types from S1AP-CommonDataTypes (3GPP TS 36.413)
 
-use crate::per::{AperDecode, AperDecoder, AperEncode, AperEncoder, Constraint, PerResult};
+use nextgcore_asn1c::per::{
+    AperDecode, AperDecoder, AperEncode, AperEncoder, Constraint, PerResult,
+};
 
 /// Criticality - indicates how to handle unrecognized IEs
 /// ASN.1: Criticality ::= ENUMERATED { reject, ignore, notify }
@@ -31,7 +33,7 @@ impl AperDecode for Criticality {
             0 => Ok(Criticality::Reject),
             1 => Ok(Criticality::Ignore),
             2 => Ok(Criticality::Notify),
-            _ => Err(crate::per::PerError::DecodeError(format!(
+            _ => Err(nextgcore_asn1c::per::PerError::DecodeError(format!(
                 "Invalid Criticality value: {value}"
             ))),
         }
@@ -289,7 +291,7 @@ impl AperDecode for TriggeringMessage {
             0 => Ok(TriggeringMessage::InitiatingMessage),
             1 => Ok(TriggeringMessage::SuccessfulOutcome),
             2 => Ok(TriggeringMessage::UnsuccessfulOutcome),
-            _ => Err(crate::per::PerError::DecodeError(format!(
+            _ => Err(nextgcore_asn1c::per::PerError::DecodeError(format!(
                 "Invalid TriggeringMessage value: {value}"
             ))),
         }
@@ -323,9 +325,29 @@ impl AperDecode for Presence {
             0 => Ok(Presence::Optional),
             1 => Ok(Presence::Conditional),
             2 => Ok(Presence::Mandatory),
-            _ => Err(crate::per::PerError::DecodeError(format!(
+            _ => Err(nextgcore_asn1c::per::PerError::DecodeError(format!(
                 "Invalid Presence value: {value}"
             ))),
+        }
+    }
+}
+
+impl From<nextgcore_s1ap::Criticality> for Criticality {
+    fn from(c: nextgcore_s1ap::Criticality) -> Self {
+        match c {
+            nextgcore_s1ap::Criticality::Reject => Criticality::Reject,
+            nextgcore_s1ap::Criticality::Ignore => Criticality::Ignore,
+            nextgcore_s1ap::Criticality::Notify => Criticality::Notify,
+        }
+    }
+}
+
+impl From<Criticality> for nextgcore_s1ap::Criticality {
+    fn from(c: Criticality) -> Self {
+        match c {
+            Criticality::Reject => Self::Reject,
+            Criticality::Ignore => Self::Ignore,
+            Criticality::Notify => Self::Notify,
         }
     }
 }

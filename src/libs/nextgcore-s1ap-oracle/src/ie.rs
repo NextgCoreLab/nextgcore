@@ -4,13 +4,13 @@
 //! suitable for ProtocolIeField values, and decoding them back, per
 //! 3GPP TS 36.413 §9.2.
 
-use nextgcore_asn1c::per::{AperDecode, AperDecoder, AperEncode, AperEncoder, Constraint};
-use nextgcore_asn1c::s1ap::cause::Cause;
-use nextgcore_asn1c::s1ap::ies::{
+use crate::asn1::cause::Cause as AsnCause;
+use crate::asn1::ies::{
     EnbUeS1apId as AsnEnbUeS1apId, MmeUeS1apId as AsnMmeUeS1apId, NasPdu, ProtocolIeContainer,
     ProtocolIeField, RelativeMmeCapacity,
 };
-use nextgcore_asn1c::s1ap::types::{Criticality, ProtocolIeId};
+use crate::asn1::types::{Criticality, ProtocolIeId};
+use nextgcore_asn1c::per::{AperDecode, AperDecoder, AperEncode, AperEncoder, Constraint};
 
 use crate::error::{S1apError, S1apResult};
 use crate::types::*;
@@ -819,14 +819,14 @@ fn decode_erab_setup_shape_item(decoder: &mut AperDecoder) -> S1apResult<(u8, Ve
 fn encode_erab_item(encoder: &mut AperEncoder, erab_id: u8, cause: &Cause) -> S1apResult<()> {
     encode_seq_preamble(encoder, &[false]);
     encode_erab_id(encoder, erab_id)?;
-    cause.encode_aper(encoder)?;
+    AsnCause::from(cause).encode_aper(encoder)?;
     Ok(())
 }
 
 fn decode_erab_item(decoder: &mut AperDecoder) -> S1apResult<(u8, Cause)> {
     let (ext, opts) = decode_seq_preamble(decoder, 1)?;
     let erab_id = decode_erab_id(decoder)?;
-    let cause = Cause::decode_aper(decoder)?;
+    let cause: Cause = AsnCause::decode_aper(decoder)?.into();
     decode_seq_trailer(decoder, ext, opts[0])?;
     Ok((erab_id, cause))
 }
@@ -1169,7 +1169,7 @@ pub fn encode_criticality_diagnostics(
         for item in &diag.ies {
             encoder.write_bit(false); // extension marker
             encoder.write_bit(false); // no iE-Extensions
-            item.ie_criticality.encode_aper(&mut encoder)?;
+            Criticality::from(item.ie_criticality).encode_aper(&mut encoder)?;
             encoder
                 .encode_constrained_whole_number(item.ie_id as i64, &Constraint::new(0, 65535))?;
             encoder.encode_enumerated(
@@ -1224,7 +1224,7 @@ pub fn decode_criticality_diagnostics(
             let type_of_error =
                 index_to_type_of_error(decoder.decode_enumerated(&Constraint::extensible(0, 1))?);
             ies.push(IeCriticalityDiagnostics {
-                ie_criticality,
+                ie_criticality: ie_criticality.into(),
                 ie_id,
                 type_of_error,
             });
@@ -1243,30 +1243,30 @@ pub fn encode_cause(container: &mut ProtocolIeContainer, cause: &Cause) -> S1apR
     container.push(make_ie_field(
         ProtocolIeId::CAUSE,
         Criticality::Ignore,
-        cause,
+        &AsnCause::from(cause),
     )?);
     Ok(())
 }
 
 pub fn decode_cause(field: &ProtocolIeField) -> S1apResult<Cause> {
-    decode_ie_value(&field.value)
+    Ok(decode_ie_value::<AsnCause>(&field.value)?.into())
 }
 
 /// Decode a standalone APER-encoded `Cause` value. #514 uses it to turn a Cause
 /// decoded by the generated codec into this crate's type with exactly the old
 /// parser's mapping, until the deletion pass retires both.
 pub fn decode_cause_aper(bytes: &[u8]) -> S1apResult<Cause> {
-    decode_ie_value(bytes)
+    Ok(decode_ie_value::<AsnCause>(bytes)?.into())
 }
 
 pub fn encode_time_to_wait(container: &mut ProtocolIeContainer, ttw: TimeToWait) -> S1apResult<()> {
     let asn_ttw = match ttw {
-        TimeToWait::V1s => nextgcore_asn1c::s1ap::ies::TimeToWait::V1s,
-        TimeToWait::V2s => nextgcore_asn1c::s1ap::ies::TimeToWait::V2s,
-        TimeToWait::V5s => nextgcore_asn1c::s1ap::ies::TimeToWait::V5s,
-        TimeToWait::V10s => nextgcore_asn1c::s1ap::ies::TimeToWait::V10s,
-        TimeToWait::V20s => nextgcore_asn1c::s1ap::ies::TimeToWait::V20s,
-        TimeToWait::V60s => nextgcore_asn1c::s1ap::ies::TimeToWait::V60s,
+        TimeToWait::V1s => crate::asn1::ies::TimeToWait::V1s,
+        TimeToWait::V2s => crate::asn1::ies::TimeToWait::V2s,
+        TimeToWait::V5s => crate::asn1::ies::TimeToWait::V5s,
+        TimeToWait::V10s => crate::asn1::ies::TimeToWait::V10s,
+        TimeToWait::V20s => crate::asn1::ies::TimeToWait::V20s,
+        TimeToWait::V60s => crate::asn1::ies::TimeToWait::V60s,
     };
     container.push(make_ie_field(
         ProtocolIeId::TIME_TO_WAIT,
@@ -1277,14 +1277,14 @@ pub fn encode_time_to_wait(container: &mut ProtocolIeContainer, ttw: TimeToWait)
 }
 
 pub fn decode_time_to_wait(field: &ProtocolIeField) -> S1apResult<TimeToWait> {
-    let asn_ttw: nextgcore_asn1c::s1ap::ies::TimeToWait = decode_ie_value(&field.value)?;
+    let asn_ttw: crate::asn1::ies::TimeToWait = decode_ie_value(&field.value)?;
     Ok(match asn_ttw {
-        nextgcore_asn1c::s1ap::ies::TimeToWait::V1s => TimeToWait::V1s,
-        nextgcore_asn1c::s1ap::ies::TimeToWait::V2s => TimeToWait::V2s,
-        nextgcore_asn1c::s1ap::ies::TimeToWait::V5s => TimeToWait::V5s,
-        nextgcore_asn1c::s1ap::ies::TimeToWait::V10s => TimeToWait::V10s,
-        nextgcore_asn1c::s1ap::ies::TimeToWait::V20s => TimeToWait::V20s,
-        nextgcore_asn1c::s1ap::ies::TimeToWait::V60s => TimeToWait::V60s,
+        crate::asn1::ies::TimeToWait::V1s => TimeToWait::V1s,
+        crate::asn1::ies::TimeToWait::V2s => TimeToWait::V2s,
+        crate::asn1::ies::TimeToWait::V5s => TimeToWait::V5s,
+        crate::asn1::ies::TimeToWait::V10s => TimeToWait::V10s,
+        crate::asn1::ies::TimeToWait::V20s => TimeToWait::V20s,
+        crate::asn1::ies::TimeToWait::V60s => TimeToWait::V60s,
     })
 }
 

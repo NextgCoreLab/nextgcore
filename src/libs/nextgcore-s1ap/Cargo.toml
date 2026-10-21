@@ -8,7 +8,6 @@ description = "NextGCore S1AP Protocol Library"
 
 [dependencies]
 nextgcore-core = { workspace = true }
-nextgcore-asn1c = { workspace = true }
 thiserror.workspace = true
 bytes.workspace = true
 

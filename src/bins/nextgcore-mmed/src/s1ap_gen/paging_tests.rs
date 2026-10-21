@@ -1,10 +1,11 @@
 //! #514 stage 7: Paging on the generated codec.
 //!
-//! Oracle: the pre-change hand-written builder (`nextgcore_s1ap::builder`).
+//! Oracle: the pre-change hand-written builder (`nextgcore_s1ap_oracle::builder`).
 //! Golden: octets derived by hand from X.691 (APER) for TS 36.413 §9.1.6.
 
 use super::*;
-use nextgcore_s1ap::{builder, CnDomain, Paging, PagingDrx, STmsi, Tai, UePagingId};
+use nextgcore_s1ap::{CnDomain, Paging, PagingDrx, STmsi, Tai, UePagingId};
+use nextgcore_s1ap_oracle::builder;
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()

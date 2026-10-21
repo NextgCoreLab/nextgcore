@@ -2,7 +2,7 @@
 //! on the generated codec.
 //!
 //! Oracle: the pre-change hand-written builders and parser
-//! (`nextgcore_s1ap::builder`, `decode_s1ap_pdu`). Golden: octets derived by
+//! (`nextgcore_s1ap_oracle::builder`, `decode_s1ap_pdu`). Golden: octets derived by
 //! hand from X.691 (APER) for TS 36.413 §9.1.5.2.
 
 use super::*;
@@ -10,12 +10,13 @@ use crate::context::{Bitrate, MmeContext, S1apCauseGroup};
 use crate::s1ap_build::cause_to_s1ap;
 use crate::s1ap_handler::handle_s1ap_message;
 use nextgcore_s1ap::{
-    builder, decode_s1ap_pdu, AllocationRetentionPriority, CauseNas, CauseRadioNetwork,
-    DirectForwardingPathAvailability, ErabAdmittedItem, ErabDataForwardingItem, ErabFailedItem,
-    ErabItem, ErabLevelQosParameters, ErabToBeSetupItemHoReq, GbrQosInformation, HandoverCommand,
-    HandoverRequest, HandoverRequestAcknowledge, HandoverRequired, HandoverType, S1apMessage,
-    SecurityContext, TargetId, UeAmbr, UeSecurityCapabilities,
+    AllocationRetentionPriority, CauseNas, CauseRadioNetwork, DirectForwardingPathAvailability,
+    ErabAdmittedItem, ErabDataForwardingItem, ErabFailedItem, ErabItem, ErabLevelQosParameters,
+    ErabToBeSetupItemHoReq, GbrQosInformation, HandoverCommand, HandoverRequest,
+    HandoverRequestAcknowledge, HandoverRequired, HandoverType, S1apMessage, SecurityContext,
+    TargetId, UeAmbr, UeSecurityCapabilities,
 };
+use nextgcore_s1ap_oracle::{builder, decode_s1ap_pdu};
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()

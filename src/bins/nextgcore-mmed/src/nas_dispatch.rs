@@ -2199,7 +2199,7 @@ mod tests {
         let pdu = csfb_context_modification(&enb_ue, 1)
             .expect("an MT CS fallback must produce a modification")
             .expect("it must encode");
-        match nextgcore_s1ap::decode_s1ap_pdu(&pdu).unwrap() {
+        match nextgcore_s1ap_oracle::decode_s1ap_pdu(&pdu).unwrap() {
             nextgcore_s1ap::S1apMessage::UeContextModificationRequest(req) => {
                 assert_eq!(req.mme_ue_s1ap_id, 4242);
                 assert_eq!(req.enb_ue_s1ap_id, 100);
@@ -2213,7 +2213,7 @@ mod tests {
 
         // Service type 2: an emergency call gets priority handling.
         let pdu = csfb_context_modification(&enb_ue, 2).unwrap().unwrap();
-        match nextgcore_s1ap::decode_s1ap_pdu(&pdu).unwrap() {
+        match nextgcore_s1ap_oracle::decode_s1ap_pdu(&pdu).unwrap() {
             nextgcore_s1ap::S1apMessage::UeContextModificationRequest(req) => {
                 assert_eq!(
                     req.cs_fallback_indicator,
