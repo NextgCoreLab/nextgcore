@@ -449,19 +449,6 @@ fn parse_dereg_reason(s: &str) -> Option<DeregistrationReason> {
     })
 }
 
-/// Nudm_UECM DeregistrationNotification callback (WSB-4, TS 29.503 §5.3.2.3.2).
-///
-/// The UDM POSTs a `DeregistrationData` (deregReason + accessType) to the
-/// absolute `deregCallbackUri` the AMF registered at UECM registration, when
-/// the serving AMF for the SUPI changed. The AMF triggers a network-initiated
-/// deregistration toward the UE (TS 23.502 §4.2.2.3.3 → DEREGISTRATION REQUEST,
-/// TS 24.501 §5.5.2.3), enqueued for the NGAP server task by
-/// [`namf_handler::handle_dereg_notify`].
-///
-/// Fail-closed (TS 29.500 §5.2.7): an unparseable body is 400
-/// INVALID_MSG_FORMAT; a missing/unknown mandatory member is 400
-/// MANDATORY_IE_MISSING / MANDATORY_IE_INCORRECT; an unknown SUPI is 404
-/// CONTEXT_NOT_FOUND. On success the AMF answers 204 No Content.
 /// #570: a UCMF dictionary notification (TS 29.673 §6.1.5.2, `UcmfNotification`).
 /// Deleted and out-of-version IDs are retired, so they leave NGAP and the UEs holding
 /// them get the deletion indication at their next registration or UE configuration
@@ -482,6 +469,19 @@ fn handle_ucmf_notify_callback(request: &SbiRequest) -> SbiResponse {
     SbiResponse::no_content()
 }
 
+/// Nudm_UECM DeregistrationNotification callback (WSB-4, TS 29.503 §5.3.2.3.2).
+///
+/// The UDM POSTs a `DeregistrationData` (deregReason + accessType) to the
+/// absolute `deregCallbackUri` the AMF registered at UECM registration, when
+/// the serving AMF for the SUPI changed. The AMF triggers a network-initiated
+/// deregistration toward the UE (TS 23.502 §4.2.2.3.3 → DEREGISTRATION REQUEST,
+/// TS 24.501 §5.5.2.3), enqueued for the NGAP server task by
+/// [`namf_handler::handle_dereg_notify`].
+///
+/// Fail-closed (TS 29.500 §5.2.7): an unparseable body is 400
+/// INVALID_MSG_FORMAT; a missing/unknown mandatory member is 400
+/// MANDATORY_IE_MISSING / MANDATORY_IE_INCORRECT; an unknown SUPI is 404
+/// CONTEXT_NOT_FOUND. On success the AMF answers 204 No Content.
 fn handle_dereg_notify_callback(supi: &str, request: &SbiRequest) -> SbiResponse {
     let Some(body) = parse_json_body(request) else {
         return malformed_body();
