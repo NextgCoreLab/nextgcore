@@ -30,9 +30,9 @@ mod context;
 mod lpp_equivalence_tests;
 // #515: the pre-migration LPP code, kept as the equivalence oracle.
 #[cfg(test)]
-mod lpp_oracle;
-// A2: lmfd → AMF Namf_Communication client leg (NRF discovery of the serving
-// AMF, N1N2MessageSubscribe registration, multipart N1N2MessageTransfer POST).
+mod lpp_fixtures; // #515: generated-codec LPP test fixtures
+                  // A2: lmfd → AMF Namf_Communication client leg (NRF discovery of the serving
+                  // AMF, N1N2MessageSubscribe registration, multipart N1N2MessageTransfer POST).
 mod namf_client;
 mod nlmf;
 mod nrppa_downlink; // #103: LMF-initiated NRPPa toward NG-RAN
@@ -5159,8 +5159,7 @@ lmf:
         );
 
         // Decoded, so the assertion is about the message rather than about some bytes.
-        let decoded = nextgcore_asn1c::lpp::message::LppMessage::decode(&pdu)
-            .expect("the emitted PDU must decode");
+        let decoded = nextgcore_lpp_gen::decode(&pdu).expect("the emitted PDU must decode");
         assert_eq!(
             decoded
                 .transaction_id
@@ -5169,14 +5168,21 @@ lmf:
             Some(9),
             "the response must answer the UE's transaction, or the UE discards it"
         );
-        let body = decoded.message_body.expect("a c1 body");
-        let nextgcore_asn1c::lpp::message::LppMessageBody::C1(c1) = body else {
-            panic!("expected a c1 body");
-        };
-        let nextgcore_asn1c::lpp::message::MessageBodyC1::ProvideAssistanceData(pad) = c1 else {
+        use nextgcore_lpp_gen::generated as lpp;
+        let Some(lpp::LPP_MessageBody::C1(lpp::LPP_MessageBody_c1::ProvideAssistanceData(pad))) =
+            decoded.lpp_message_body
+        else {
             panic!("expected ProvideAssistanceData");
         };
-        let a_gnss = pad.ies.a_gnss.expect("a-gnss assistance is present");
+        let lpp::ProvideAssistanceDataCriticalExtensions::C1(
+            lpp::ProvideAssistanceDataCriticalExtensions_c1::ProvideAssistanceData_r9(ies),
+        ) = pad.critical_extensions
+        else {
+            panic!("expected the -r9 IEs");
+        };
+        let a_gnss = ies
+            .a_gnss_provide_assistance_data
+            .expect("a-gnss assistance is present");
         let common = a_gnss
             .gnss_common_assist_data
             .expect("gnssCommonAssistData is present");
@@ -5184,11 +5190,11 @@ lmf:
             .gnss_reference_location
             .expect("the reference LOCATION is the assistance this LMF can honestly provide");
         assert_ne!(
-            reference.three_d_location.degrees_latitude, 0,
+            reference.three_dlocation.degrees_latitude.0, 0,
             "a zero latitude would mean the centroid never reached the encoder"
         );
         assert_eq!(
-            reference.three_d_location.confidence, 68,
+            reference.three_dlocation.confidence.0, 68,
             "one standard deviation, matching the northbound encoder's convention"
         );
     }
@@ -5265,64 +5271,7 @@ lmf:
     /// Encode a UE LPP `ProvideLocationInformation` (nr-Multi-RTT) carrying the
     /// given `(nr-PhysCellID, K0 code)` measurements.
     fn build_multi_rtt_lpp(cells: &[(u16, u32)], txn: u8) -> Vec<u8> {
-        use nextgcore_asn1c::lpp::ecid::{
-            ProvideLocationInformation, ProvideLocationInformationR9,
-        };
-        use nextgcore_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
-        use nextgcore_asn1c::lpp::nr_dl_tdoa::{NrRstd, NrSlot, NrTimeStamp, NrTimingQuality};
-        use nextgcore_asn1c::lpp::nr_multi_rtt::{
-            NrMultiRttMeasElement, NrMultiRttMeasList, NrMultiRttProvideLocationInformation,
-            NrMultiRttSignalMeasurementInformation,
-        };
-        use nextgcore_asn1c::lpp::types::{Initiator, LppTransactionId, TransactionNumber};
-
-        let items: Vec<NrMultiRttMeasElement> = cells
-            .iter()
-            .map(|(pci, val)| NrMultiRttMeasElement {
-                dl_prs_id: 5,
-                nr_phys_cell_id: Some(*pci),
-                nr_arfcn: None,
-                nr_ue_rx_tx_time_diff: NrRstd::K0(*val),
-                nr_time_stamp: NrTimeStamp {
-                    dl_prs_id: 5,
-                    nr_phys_cell_id: None,
-                    nr_arfcn: None,
-                    nr_sfn: 700,
-                    nr_slot: NrSlot::Scs30(11),
-                },
-                nr_timing_quality: NrTimingQuality {
-                    timing_quality_value: 8,
-                    timing_quality_resolution: 1,
-                },
-                nr_dl_prs_rsrp_result: Some(90),
-            })
-            .collect();
-        let msg = LppMessage {
-            transaction_id: Some(LppTransactionId {
-                initiator: Initiator::TargetDevice,
-                transaction_number: TransactionNumber(txn),
-            }),
-            end_transaction: true,
-            sequence_number: None,
-            acknowledgement: None,
-            message_body: Some(LppMessageBody::C1(
-                MessageBodyC1::ProvideLocationInformation(ProvideLocationInformation {
-                    ies: ProvideLocationInformationR9 {
-                        ecid: None,
-                        nr_multi_rtt: Some(NrMultiRttProvideLocationInformation {
-                            signal_measurement_information: Some(
-                                NrMultiRttSignalMeasurementInformation {
-                                    meas_list: NrMultiRttMeasList { items },
-                                },
-                            ),
-                        }),
-                        nr_dl_tdoa: None,
-                        sidelink_ranging: None,
-                    },
-                }),
-            )),
-        };
-        msg.encode().expect("encode multi-rtt lpp").to_vec()
+        crate::lpp_fixtures::multi_rtt_lpp(cells, txn)
     }
 
     /// Seed the global TRP registry with a solvable 4-cell Multi-RTT scene and
@@ -5528,76 +5477,10 @@ lmf:
     /// Encode a UE LPP `ProvideLocationInformation` (E-CID) carrying one
     /// measured-results element (physCellId `pci`, rsrp-Result, ue-RxTxTimeDiff).
     fn build_ecid_lpp(pci: u16, rsrp_result: u8, ue_rx_tx: u16, txn: u8) -> Vec<u8> {
-        use nextgcore_asn1c::lpp::ecid::{
-            EcidProvideLocationInformation, EcidSignalMeasurementInformation,
-            MeasuredResultsElement, ProvideLocationInformation, ProvideLocationInformationR9,
-        };
-        use nextgcore_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
-        use nextgcore_asn1c::lpp::types::{Initiator, LppTransactionId, TransactionNumber};
-        let element = MeasuredResultsElement {
-            phys_cell_id: pci,
-            arfcn_eutra: 1850,
-            system_frame_number: None,
-            rsrp_result: Some(rsrp_result),
-            rsrq_result: Some(20),
-            ue_rx_tx_time_diff: Some(ue_rx_tx),
-        };
-        let msg = LppMessage {
-            transaction_id: Some(LppTransactionId {
-                initiator: Initiator::TargetDevice,
-                transaction_number: TransactionNumber(txn),
-            }),
-            end_transaction: true,
-            sequence_number: None,
-            acknowledgement: None,
-            message_body: Some(LppMessageBody::C1(
-                MessageBodyC1::ProvideLocationInformation(ProvideLocationInformation {
-                    ies: ProvideLocationInformationR9 {
-                        ecid: Some(EcidProvideLocationInformation {
-                            // MeasuredResultsList SIZE(1..32): the serving cell
-                            // rides in the list (an empty list fails encode).
-                            signal_measurement_information: Some(
-                                EcidSignalMeasurementInformation {
-                                    primary_cell_measured_results: None,
-                                    measured_results_list: vec![element],
-                                },
-                            ),
-                            ecid_error: None,
-                        }),
-                        nr_multi_rtt: None,
-                        nr_dl_tdoa: None,
-                        sidelink_ranging: None,
-                    },
-                }),
-            )),
-        };
-        msg.encode().expect("encode E-CID lpp").to_vec()
+        crate::lpp_fixtures::ecid_lpp(pci, rsrp_result, ue_rx_tx, txn)
     }
 
-    /// The sender's hand-derived sidelink ranging report, byte for byte from
-    /// nextgsim's `GOLDEN_SIDELINK_RANGING_REPORT` (nextgsim #137): one range of
-    /// 50.00 m to peer 0xA5A5A5, measured by carrier phase, 3 measurements.
-    ///
-    /// Held as the PAYLOAD rather than as a whole message so the assertion is about
-    /// the report the UE encodes; the LPP framing around it is this codec's, and
-    /// `lpp::sidelink_ranging`'s own tests are what pin the payload bytes against the
-    /// sender.
-    fn sender_golden_report() -> nextgcore_asn1c::lpp::sidelink_ranging::SidelinkRangingReport {
-        use nextgcore_asn1c::lpp::sidelink_ranging::{
-            SidelinkRangingMethod, SidelinkRangingReport, SidelinkRangingResult,
-        };
-        SidelinkRangingReport {
-            results: vec![SidelinkRangingResult {
-                peer_layer2_id: 0x00A5_A5A5,
-                range_cm: 5_000,
-                accuracy_cm: 1,
-                method: SidelinkRangingMethod::CarrierPhase,
-                measurement_count: 3,
-            }],
-        }
-    }
-
-    /// The same golden report as [`sender_golden_report`], as the EPDU body type.
+    /// The golden sidelink report (nextgsim #137): 50.00 m to 0xA5A5A5, carrier phase.
     fn epdu_golden_report() -> crate::sidelink_epdu::SidelinkRangingReport {
         use crate::sidelink_epdu::{
             SidelinkRangingMethod, SidelinkRangingReport, SidelinkRangingResult,
@@ -5611,64 +5494,6 @@ lmf:
                 measurement_count: 3,
             }],
         }
-    }
-
-    // Transition (#542): a UE that still sends the legacy fourth-group report is
-    // still read until nextgsim's sender has moved to the EPDU.
-    #[test]
-    fn test_legacy_group4_sidelink_report_is_still_read_during_the_transition() {
-        let (_, ranges) =
-            codec_glue::decode_lpp_sidelink_ranging(&build_legacy_group4_sidelink_lpp(9))
-                .expect("decodes");
-        assert_eq!(ranges.len(), 1);
-        assert_eq!(ranges[0].peer_layer2_id, 0x00A5_A5A5);
-    }
-
-    /// An uplink LPP `ProvideLocationInformation` carrying the sidelink ranging
-    /// report in addition group 4, plus the E-CID body a real UE sends alongside it.
-    fn build_legacy_group4_sidelink_lpp(txn: u8) -> Vec<u8> {
-        use nextgcore_asn1c::lpp::ecid::{
-            EcidProvideLocationInformation, EcidSignalMeasurementInformation,
-            MeasuredResultsElement, ProvideLocationInformation, ProvideLocationInformationR9,
-        };
-        use nextgcore_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
-        use nextgcore_asn1c::lpp::types::{Initiator, LppTransactionId, TransactionNumber};
-        let element = MeasuredResultsElement {
-            phys_cell_id: 7,
-            arfcn_eutra: 1850,
-            system_frame_number: None,
-            rsrp_result: Some(60),
-            rsrq_result: None,
-            ue_rx_tx_time_diff: None,
-        };
-        let msg = LppMessage {
-            transaction_id: Some(LppTransactionId {
-                initiator: Initiator::TargetDevice,
-                transaction_number: TransactionNumber(txn),
-            }),
-            end_transaction: true,
-            sequence_number: None,
-            acknowledgement: None,
-            message_body: Some(LppMessageBody::C1(
-                MessageBodyC1::ProvideLocationInformation(ProvideLocationInformation {
-                    ies: ProvideLocationInformationR9 {
-                        ecid: Some(EcidProvideLocationInformation {
-                            signal_measurement_information: Some(
-                                EcidSignalMeasurementInformation {
-                                    primary_cell_measured_results: None,
-                                    measured_results_list: vec![element],
-                                },
-                            ),
-                            ecid_error: None,
-                        }),
-                        nr_multi_rtt: None,
-                        nr_dl_tdoa: None,
-                        sidelink_ranging: Some(sender_golden_report()),
-                    },
-                }),
-            )),
-        };
-        msg.encode().expect("encode sidelink-ranging lpp").to_vec()
     }
 
     /// Encode an NRPPa E-CID Measurement Report (serving cell + TA + RSRP), on the
@@ -6674,48 +6499,7 @@ mod positioning_chain_strict_peer {
     /// is what the scripted UE returns; it decodes to a `CellMeasurement` keyed
     /// `pci-<pci>` (TS 37.355 §6.5 ECID-SignalMeasurementInformation).
     fn build_ecid_lpp(pci: u16, rsrp_result: u8, ue_rx_tx: u16, txn: u8) -> Vec<u8> {
-        use nextgcore_asn1c::lpp::ecid::{
-            EcidProvideLocationInformation, EcidSignalMeasurementInformation,
-            MeasuredResultsElement, ProvideLocationInformation, ProvideLocationInformationR9,
-        };
-        use nextgcore_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
-        use nextgcore_asn1c::lpp::types::{Initiator, LppTransactionId, TransactionNumber};
-        let element = MeasuredResultsElement {
-            phys_cell_id: pci,
-            arfcn_eutra: 1850,
-            system_frame_number: None,
-            rsrp_result: Some(rsrp_result),
-            rsrq_result: Some(20),
-            ue_rx_tx_time_diff: Some(ue_rx_tx),
-        };
-        let msg = LppMessage {
-            transaction_id: Some(LppTransactionId {
-                initiator: Initiator::TargetDevice,
-                transaction_number: TransactionNumber(txn),
-            }),
-            end_transaction: true,
-            sequence_number: None,
-            acknowledgement: None,
-            message_body: Some(LppMessageBody::C1(
-                MessageBodyC1::ProvideLocationInformation(ProvideLocationInformation {
-                    ies: ProvideLocationInformationR9 {
-                        ecid: Some(EcidProvideLocationInformation {
-                            signal_measurement_information: Some(
-                                EcidSignalMeasurementInformation {
-                                    primary_cell_measured_results: None,
-                                    measured_results_list: vec![element],
-                                },
-                            ),
-                            ecid_error: None,
-                        }),
-                        nr_multi_rtt: None,
-                        nr_dl_tdoa: None,
-                        sidelink_ranging: None,
-                    },
-                }),
-            )),
-        };
-        msg.encode().expect("encode E-CID lpp").to_vec()
+        crate::lpp_fixtures::ecid_lpp(pci, rsrp_result, ue_rx_tx, txn)
     }
 
     /// Build the scripted UE's N1MessageNotify request the way amfd's REAL
@@ -7029,8 +6813,7 @@ mod positioning_chain_strict_peer {
         // Transparent-relay proof (DL leg): amfd extracted EXACTLY lmfd's encoder
         // output. Decode the relayed PDU for its LPP transactionID, then re-encode
         // lmfd's own builder for that txn and compare byte-for-byte.
-        let dl_msg =
-            nextgcore_asn1c::lpp::message::LppMessage::decode(&dl_lpp).expect("DL LPP decodes");
+        let dl_msg = nextgcore_lpp_gen::decode(&dl_lpp).expect("DL LPP decodes");
         let txn = dl_msg
             .transaction_id
             .as_ref()

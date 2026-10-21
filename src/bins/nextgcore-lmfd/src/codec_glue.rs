@@ -24,7 +24,6 @@
 
 pub use crate::sidelink_epdu::SidelinkRangingMethod;
 use crate::CellMeasurement;
-use nextgcore_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
 use nextgcore_lpp_gen::generated as lpp;
 
 // ---------------------------------------------------------------------------
@@ -898,39 +897,6 @@ impl SidelinkRange {
     }
 }
 
-/// Adapt the legacy (pre-#542) sidelink ranging report that nextgsim's UE carried
-/// in an invented fourth addition group of `ProvideLocationInformation-r9-IEs`.
-///
-/// Kept only for the transition: nextgsim's sender moves to the EPDU after this
-/// decoder ships, and the next change removes this path with the hand-written LPP
-/// codec it needs (#515).
-fn legacy_group4_ranges(msg: &LppMessage) -> Vec<SidelinkRange> {
-    use nextgcore_asn1c::lpp::sidelink_ranging::SidelinkRangingMethod as Legacy;
-    let prov = match msg.message_body.as_ref() {
-        Some(LppMessageBody::C1(MessageBodyC1::ProvideLocationInformation(p))) => p,
-        _ => return vec![],
-    };
-    let Some(report) = prov.ies.sidelink_ranging.as_ref() else {
-        return vec![];
-    };
-    report
-        .results
-        .iter()
-        .map(|r| {
-            SidelinkRange::from_result(&crate::sidelink_epdu::SidelinkRangingResult {
-                peer_layer2_id: r.peer_layer2_id,
-                range_cm: r.range_cm,
-                accuracy_cm: r.accuracy_cm,
-                method: match r.method {
-                    Legacy::Rtt => SidelinkRangingMethod::Rtt,
-                    Legacy::CarrierPhase => SidelinkRangingMethod::CarrierPhase,
-                },
-                measurement_count: r.measurement_count,
-            })
-        })
-        .collect()
-}
-
 /// Decode raw LPP UPER bytes and adapt any sidelink ranging report.
 ///
 /// The report rides in `epdu-ProvideLocationInformation` (TS 37.355 §6.5.7) under
@@ -944,23 +910,14 @@ fn legacy_group4_ranges(msg: &LppMessage) -> Vec<SidelinkRange> {
 pub fn decode_lpp_sidelink_ranging(bytes: &[u8]) -> Result<(u64, Vec<SidelinkRange>), String> {
     let msg = decode_lpp(bytes)?;
     let request_id = extract_lpp_request_id(&msg).unwrap_or(0);
-    if let Some(ies) = provide_location_r9(&msg) {
-        if let Some(report) = crate::sidelink_epdu::report_in(ies) {
-            let report = report?;
-            return Ok((
-                request_id,
-                report
-                    .results
-                    .iter()
-                    .map(SidelinkRange::from_result)
-                    .collect(),
-            ));
-        }
-    }
-    // Transition only: a sender that still uses the legacy fourth group.
-    let ranges = LppMessage::decode(bytes)
-        .map(|m| legacy_group4_ranges(&m))
-        .unwrap_or_default();
+    let ranges = match provide_location_r9(&msg).and_then(crate::sidelink_epdu::report_in) {
+        Some(report) => report?
+            .results
+            .iter()
+            .map(SidelinkRange::from_result)
+            .collect(),
+        None => vec![],
+    };
     Ok((request_id, ranges))
 }
 
@@ -977,23 +934,7 @@ mod tests {
         TC_NS,
     };
 
-    /// A hand-written test message on the generated codec, through the wire: the
-    /// hand-written encoder is the test fixture builder, the generated decoder is
-    /// what production uses (#515).
-    fn to_gen(
-        m: &nextgcore_asn1c::lpp::message::LppMessage,
-    ) -> nextgcore_lpp_gen::generated::LPP_Message {
-        super::decode_lpp(&m.encode().expect("hand encode")).expect("generated decode")
-    }
     use crate::nrppa_uplink::test_support::{aoa, ecid_report, nr_cgi, rsrp, ta1};
-    use nextgcore_asn1c::lpp::ecid::{ProvideLocationInformation, ProvideLocationInformationR9};
-    use nextgcore_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
-    use nextgcore_asn1c::lpp::nr_dl_tdoa::{NrRstd, NrSlot, NrTimeStamp, NrTimingQuality};
-    use nextgcore_asn1c::lpp::nr_multi_rtt::{
-        NrMultiRttMeasElement, NrMultiRttMeasList, NrMultiRttProvideLocationInformation,
-        NrMultiRttSignalMeasurementInformation, NrUeRxTxTimeDiff,
-    };
-    use nextgcore_asn1c::lpp::types::{Initiator, LppTransactionId, TransactionNumber};
 
     /// The LMF-initiated LPP RequestLocationInformation round-trips: encode ->
     /// decode -> it is a RequestLocationInformation carrying the E-CID request,
@@ -1001,21 +942,34 @@ mod tests {
     #[test]
     fn lpp_ecid_request_roundtrips() {
         let bytes = build_lpp_ecid_request(7).expect("encode LPP request");
-        let decoded = LppMessage::decode(&bytes).expect("decode LPP request");
-        assert_eq!(extract_lpp_request_id(&to_gen(&decoded)), Some(7));
-        assert!(matches!(
-            decoded.message_body,
-            Some(LppMessageBody::C1(
-                MessageBodyC1::RequestLocationInformation(_)
-            ))
-        ));
-        if let Some(LppMessageBody::C1(MessageBodyC1::RequestLocationInformation(r))) =
-            &decoded.message_body
-        {
-            assert!(r.ies.ecid.is_some(), "E-CID request IE present");
-            assert!(r.ies.nr_multi_rtt.is_none());
-            assert!(r.ies.nr_dl_tdoa.is_none());
-        }
+        let decoded = super::decode_lpp(&bytes).expect("decode LPP request");
+        assert_eq!(extract_lpp_request_id(&decoded), Some(7));
+        use nextgcore_lpp_gen::generated as lpp;
+        let Some(lpp::LPP_MessageBody::C1(lpp::LPP_MessageBody_c1::RequestLocationInformation(r))) =
+            &decoded.lpp_message_body
+        else {
+            panic!("expected RequestLocationInformation");
+        };
+        let lpp::RequestLocationInformationCriticalExtensions::C1(
+            lpp::RequestLocationInformationCriticalExtensions_c1::RequestLocationInformation_r9(
+                ies,
+            ),
+        ) = &r.critical_extensions
+        else {
+            panic!("expected the -r9 IEs");
+        };
+        assert!(
+            ies.ecid_request_location_information.is_some(),
+            "E-CID request IE present"
+        );
+        assert!(ies
+            .extensions
+            .nr_multi_rtt_request_location_information_r16
+            .is_none());
+        assert!(ies
+            .extensions
+            .nr_dl_tdoa_request_location_information_r16
+            .is_none());
     }
 
     /// A4 golden byte-vector: a hand-built UPER LPP E-CID
@@ -1030,67 +984,22 @@ mod tests {
     /// decoded through the adapter and the adapted values are asserted.
     #[test]
     fn a4_lpp_ecid_provide_golden_vector_to_measurements() {
-        use nextgcore_asn1c::lpp::ecid::{
-            EcidProvideLocationInformation, EcidSignalMeasurementInformation,
-            MeasuredResultsElement,
-        };
-        let primary = MeasuredResultsElement {
-            phys_cell_id: 42,
-            arfcn_eutra: 1850,
-            system_frame_number: None,
-            rsrp_result: Some(60),
-            rsrq_result: Some(20),
-            ue_rx_tx_time_diff: Some(700),
-        };
-        let neighbour = MeasuredResultsElement {
-            phys_cell_id: 7,
-            arfcn_eutra: 1850,
-            system_frame_number: None,
-            rsrp_result: Some(30),
-            rsrq_result: None,
-            ue_rx_tx_time_diff: None,
-        };
-        let msg = LppMessage {
-            transaction_id: Some(LppTransactionId {
-                initiator: Initiator::TargetDevice,
-                transaction_number: TransactionNumber(9),
-            }),
-            end_transaction: true,
-            sequence_number: None,
-            acknowledgement: None,
-            message_body: Some(LppMessageBody::C1(
-                MessageBodyC1::ProvideLocationInformation(ProvideLocationInformation {
-                    ies: ProvideLocationInformationR9 {
-                        ecid: Some(EcidProvideLocationInformation {
-                            signal_measurement_information: Some(
-                                EcidSignalMeasurementInformation {
-                                    primary_cell_measured_results: Some(primary),
-                                    measured_results_list: vec![neighbour],
-                                },
-                            ),
-                            ecid_error: None,
-                        }),
-                        nr_multi_rtt: None,
-                        nr_dl_tdoa: None,
-                        sidelink_ranging: None,
-                    },
-                }),
-            )),
-        };
-        let bytes = msg.encode().expect("encode E-CID provide").to_vec();
+        // Captured from the hand-written LPP encoder before it was deleted (#515):
+        // the exact input this test has always decoded.
+        let bytes: &[u8] = &[
+            0x92, 0x13, 0x28, 0x09, 0x23, 0x8A, 0x81, 0xCE, 0x9E, 0x28, 0x57, 0x80, 0x10, 0x0E,
+            0x0E, 0x74, 0x78,
+        ];
 
-        // Byte fidelity: the UPER PDU decodes back to the SAME typed value
-        // (the per-field UPER framing is pinned bit-for-bit by the golden
-        // vectors in nextgcore-asn1c/src/lpp/ecid.rs). This guards the wire
-        // encode without hand-transcribing the deeply-nested octets here.
-        let redecoded = LppMessage::decode(&bytes).expect("re-decode E-CID provide");
+        // Byte fidelity: the generated codec re-encodes the captured bytes exactly.
         assert_eq!(
-            redecoded, msg,
+            super::encode(&super::decode_lpp(bytes).expect("decodes"), "E-CID").expect("encodes"),
+            bytes,
             "E-CID ProvideLocationInformation must round-trip byte-exact"
         );
 
         // Decode through the A4 adapter and assert the anchored values.
-        let (txn, cells) = decode_lpp_ecid_report(&bytes).expect("decode E-CID report");
+        let (txn, cells) = decode_lpp_ecid_report(bytes).expect("decode E-CID report");
         assert_eq!(txn, 9, "LPP transactionNumber survives");
         assert_eq!(
             cells.len(),
@@ -1116,7 +1025,7 @@ mod tests {
 
         // The unified decode entry point also selects the E-CID measurements.
         let (_txn2, cells2) =
-            decode_lpp_provide_report(&bytes).expect("decode via the provide entry point");
+            decode_lpp_provide_report(bytes).expect("decode via the provide entry point");
         assert_eq!(cells2.len(), 2);
         assert_eq!(cells2[0].nr_cgi, "pci-42");
         assert_eq!(cells2[0].timing_advance, Some(700));
@@ -1126,35 +1035,10 @@ mod tests {
     /// empty measurement set (never a fabricated cell).
     #[test]
     fn ecid_error_only_provide_yields_no_measurements() {
-        use nextgcore_asn1c::lpp::ecid::{
-            EcidError, EcidLocationServerErrorCauses, EcidProvideLocationInformation,
-        };
-        let msg = LppMessage {
-            transaction_id: Some(LppTransactionId {
-                initiator: Initiator::TargetDevice,
-                transaction_number: TransactionNumber(3),
-            }),
-            end_transaction: true,
-            sequence_number: None,
-            acknowledgement: None,
-            message_body: Some(LppMessageBody::C1(
-                MessageBodyC1::ProvideLocationInformation(ProvideLocationInformation {
-                    ies: ProvideLocationInformationR9 {
-                        ecid: Some(EcidProvideLocationInformation {
-                            signal_measurement_information: None,
-                            ecid_error: Some(EcidError::LocationServerErrorCauses(
-                                EcidLocationServerErrorCauses { cause: 0 },
-                            )),
-                        }),
-                        nr_multi_rtt: None,
-                        nr_dl_tdoa: None,
-                        sidelink_ranging: None,
-                    },
-                }),
-            )),
-        };
-        let bytes = msg.encode().expect("encode").to_vec();
-        let (_txn, cells) = decode_lpp_ecid_report(&bytes).expect("decode");
+        // Captured from the hand-written LPP encoder before it was deleted (#515):
+        // the exact input this test has always decoded.
+        let bytes: &[u8] = &[0x92, 0x07, 0x28, 0x08, 0x80];
+        let (_txn, cells) = decode_lpp_ecid_report(bytes).expect("decode");
         assert!(cells.is_empty(), "an error-only report yields no cells");
     }
 
@@ -1175,17 +1059,6 @@ mod tests {
         assert_eq!(nrrstd_to_ns(TimeReport { v: 1, k: 4 }), 8);
         // K5(1) → 1 × 32 × 0.5086 ≈ 16 ns
         assert_eq!(nrrstd_to_ns(TimeReport { v: 1, k: 5 }), 16);
-    }
-
-    // Helper: a minimal NrTimeStamp (required in NrMultiRttMeasElement).
-    fn sample_nr_timestamp() -> NrTimeStamp {
-        NrTimeStamp {
-            dl_prs_id: 5,
-            nr_phys_cell_id: None,
-            nr_arfcn: None,
-            nr_sfn: 700,
-            nr_slot: NrSlot::Scs30(11),
-        }
     }
 
     /// NRPPa E-CID: generated encode → `decode_nrppa_ecid_report` → adapt.
@@ -1220,72 +1093,18 @@ mod tests {
     /// Verifies k-choice → ns conversion and PCI/PRS-fallback CGI formatting.
     #[test]
     fn rt_lpp_multi_rtt_to_measurements() {
-        let msg = LppMessage {
-            transaction_id: Some(LppTransactionId {
-                initiator: Initiator::TargetDevice,
-                transaction_number: TransactionNumber(7),
-            }),
-            end_transaction: true,
-            sequence_number: None,
-            acknowledgement: None,
-            message_body: Some(LppMessageBody::C1(
-                MessageBodyC1::ProvideLocationInformation(ProvideLocationInformation {
-                    ies: ProvideLocationInformationR9 {
-                        ecid: None,
-                        nr_multi_rtt: Some(NrMultiRttProvideLocationInformation {
-                            signal_measurement_information: Some(
-                                NrMultiRttSignalMeasurementInformation {
-                                    meas_list: NrMultiRttMeasList {
-                                        items: vec![
-                                            // Cell 0: PCI 123, K2(300_000), RSRP 80.
-                                            NrMultiRttMeasElement {
-                                                dl_prs_id: 5,
-                                                nr_phys_cell_id: Some(123),
-                                                nr_arfcn: None,
-                                                nr_ue_rx_tx_time_diff: NrUeRxTxTimeDiff::K2(
-                                                    300_000,
-                                                ),
-                                                nr_time_stamp: sample_nr_timestamp(),
-                                                nr_timing_quality: NrTimingQuality {
-                                                    timing_quality_value: 12,
-                                                    timing_quality_resolution: 2,
-                                                },
-                                                nr_dl_prs_rsrp_result: Some(80),
-                                            },
-                                            // Cell 1: PCI absent → prs-6 fallback, K1(200_000).
-                                            NrMultiRttMeasElement {
-                                                dl_prs_id: 6,
-                                                nr_phys_cell_id: None,
-                                                nr_arfcn: None,
-                                                nr_ue_rx_tx_time_diff: NrUeRxTxTimeDiff::K1(
-                                                    200_000,
-                                                ),
-                                                nr_time_stamp: sample_nr_timestamp(),
-                                                nr_timing_quality: NrTimingQuality {
-                                                    timing_quality_value: 8,
-                                                    timing_quality_resolution: 1,
-                                                },
-                                                nr_dl_prs_rsrp_result: None,
-                                            },
-                                        ],
-                                    },
-                                },
-                            ),
-                        }),
-                        nr_dl_tdoa: None,
-                        sidelink_ranging: None,
-                    },
-                }),
-            )),
-        };
+        // Captured from the hand-written LPP encoder before it was deleted (#515):
+        // the exact input this test has always decoded.
+        let decoded = super::decode_lpp(&[
+            0x92, 0x0F, 0x28, 0x80, 0x0A, 0x30, 0x88, 0x01, 0x41, 0x02, 0x8F, 0x65, 0x24, 0xF8,
+            0x00, 0x16, 0xBC, 0x56, 0x62, 0xA0, 0x00, 0x06, 0x13, 0x0D, 0x40, 0x00, 0x5A, 0xF1,
+            0x59, 0x04,
+        ])
+        .expect("decodes");
 
-        // UPER round-trip.
-        let encoded = msg.encode().expect("LppMessage::encode");
-        let decoded = LppMessage::decode(&encoded).expect("LppMessage::decode");
+        assert_eq!(extract_lpp_request_id(&decoded), Some(7));
 
-        assert_eq!(extract_lpp_request_id(&to_gen(&decoded)), Some(7));
-
-        let cells = lpp_multi_rtt_provide_to_measurements(&to_gen(&decoded));
+        let cells = lpp_multi_rtt_provide_to_measurements(&decoded);
         assert_eq!(cells.len(), 2);
 
         // Cell 0: PCI present → "pci-123"; K2(300_000) → ~610_351 ns.
@@ -1332,55 +1151,16 @@ mod tests {
     /// The reference TRP leads with rstd_ns 0; each element carries its signed RSTD.
     #[test]
     fn rt_lpp_dl_tdoa_to_measurements() {
-        use nextgcore_asn1c::lpp::nr_dl_tdoa::{
-            DlPrsIdInfo, NrDlTdoaMeasElement, NrDlTdoaMeasList, NrDlTdoaProvideLocationInformation,
-            NrDlTdoaSignalMeasurementInformation,
-        };
-        let msg = LppMessage {
-            transaction_id: Some(LppTransactionId {
-                initiator: Initiator::TargetDevice,
-                transaction_number: TransactionNumber(9),
-            }),
-            end_transaction: true,
-            sequence_number: None,
-            acknowledgement: None,
-            message_body: Some(LppMessageBody::C1(
-                MessageBodyC1::ProvideLocationInformation(ProvideLocationInformation {
-                    ies: ProvideLocationInformationR9 {
-                        ecid: None,
-                        nr_multi_rtt: None,
-                        nr_dl_tdoa: Some(NrDlTdoaProvideLocationInformation {
-                            signal_measurement_information: Some(
-                                NrDlTdoaSignalMeasurementInformation {
-                                    dl_prs_reference_info: DlPrsIdInfo { dl_prs_id: 3 },
-                                    meas_list: NrDlTdoaMeasList {
-                                        items: vec![NrDlTdoaMeasElement {
-                                            dl_prs_id: 7,
-                                            nr_phys_cell_id: Some(123),
-                                            nr_arfcn: None,
-                                            nr_time_stamp: sample_nr_timestamp(),
-                                            nr_rstd: NrRstd::K0(985_124),
-                                            nr_timing_quality: NrTimingQuality {
-                                                timing_quality_value: 10,
-                                                timing_quality_resolution: 1,
-                                            },
-                                            nr_dl_prs_rsrp_result: Some(100),
-                                        }],
-                                    },
-                                },
-                            ),
-                        }),
-                        sidelink_ranging: None,
-                    },
-                }),
-            )),
-        };
+        // Captured from the hand-written LPP encoder before it was deleted (#515):
+        // the exact input this test has always decoded.
+        let decoded = super::decode_lpp(&[
+            0x92, 0x13, 0x28, 0x80, 0x0A, 0x20, 0x28, 0x00, 0xC0, 0x10, 0x40, 0xE3, 0xD8, 0x02,
+            0xD7, 0x8A, 0xC1, 0xE1, 0x04, 0x85, 0x1C, 0x80,
+        ])
+        .expect("decodes");
+        assert_eq!(extract_lpp_request_id(&decoded), Some(9));
 
-        let encoded = msg.encode().expect("LppMessage::encode");
-        let decoded = LppMessage::decode(&encoded).expect("LppMessage::decode");
-        assert_eq!(extract_lpp_request_id(&to_gen(&decoded)), Some(9));
-
-        let cells = lpp_dl_tdoa_provide_to_measurements(&to_gen(&decoded));
+        let cells = lpp_dl_tdoa_provide_to_measurements(&decoded);
         assert_eq!(cells.len(), 2, "reference + 1 measurement element");
         // Reference TRP first, RSTD 0.
         assert_eq!(cells[0].nr_cgi, "prs-3");
@@ -1398,47 +1178,14 @@ mod tests {
     /// in a `binaryDataLppMessage` multipart part reaches the decode adapter.
     #[test]
     fn decode_lpp_provide_report_multi_rtt_golden() {
-        let msg = LppMessage {
-            transaction_id: Some(LppTransactionId {
-                initiator: Initiator::TargetDevice,
-                transaction_number: TransactionNumber(42),
-            }),
-            end_transaction: true,
-            sequence_number: None,
-            acknowledgement: None,
-            message_body: Some(LppMessageBody::C1(
-                MessageBodyC1::ProvideLocationInformation(ProvideLocationInformation {
-                    ies: ProvideLocationInformationR9 {
-                        ecid: None,
-                        nr_multi_rtt: Some(NrMultiRttProvideLocationInformation {
-                            signal_measurement_information: Some(
-                                NrMultiRttSignalMeasurementInformation {
-                                    meas_list: NrMultiRttMeasList {
-                                        items: vec![NrMultiRttMeasElement {
-                                            dl_prs_id: 5,
-                                            nr_phys_cell_id: Some(321),
-                                            nr_arfcn: None,
-                                            nr_ue_rx_tx_time_diff: NrUeRxTxTimeDiff::K1(200_000),
-                                            nr_time_stamp: sample_nr_timestamp(),
-                                            nr_timing_quality: NrTimingQuality {
-                                                timing_quality_value: 8,
-                                                timing_quality_resolution: 1,
-                                            },
-                                            nr_dl_prs_rsrp_result: Some(80),
-                                        }],
-                                    },
-                                },
-                            ),
-                        }),
-                        nr_dl_tdoa: None,
-                        sidelink_ranging: None,
-                    },
-                }),
-            )),
-        };
-        let bytes = msg.encode().expect("LppMessage::encode");
+        // Captured from the hand-written LPP encoder before it was deleted (#515):
+        // the exact input this test has always decoded.
+        let bytes: &[u8] = &[
+            0x92, 0x55, 0x28, 0x80, 0x0A, 0x1E, 0x88, 0x00, 0x41, 0x02, 0xA8, 0x22, 0x61, 0xA8,
+            0x00, 0x0B, 0x5E, 0x2B, 0x20, 0xD0, 0x00,
+        ];
 
-        let (req_id, cells) = decode_lpp_provide_report(&bytes).expect("decode_lpp_provide_report");
+        let (req_id, cells) = decode_lpp_provide_report(bytes).expect("decode_lpp_provide_report");
         // request_id is the LPP transaction number.
         assert_eq!(req_id, 42);
         assert_eq!(cells.len(), 1);
