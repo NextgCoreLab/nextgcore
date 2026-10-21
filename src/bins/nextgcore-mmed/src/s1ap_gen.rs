@@ -18,6 +18,8 @@
 //! is the handover family's simpler half (§8.4): HANDOVER NOTIFY, HANDOVER
 //! CANCEL, HANDOVER FAILURE and ENB STATUS TRANSFER decodes, and HANDOVER
 //! PREPARATION FAILURE, HANDOVER CANCEL ACKNOWLEDGE and MME STATUS TRANSFER
+//! encodes. Stage 9 is Reset and Error Indication (§8.7.1, §8.7.2): the RESET
+//! and ERROR INDICATION decodes and the RESET ACKNOWLEDGE and ERROR INDICATION
 //! encodes.
 
 use bitvec::prelude::{BitVec, Msb0};
@@ -2024,6 +2026,278 @@ pub fn decode_handover_failure(bytes: &[u8]) -> ResponseDecode<nextgcore_s1ap::H
     }
 }
 
+// ============================================================================
+// Reset and Error Indication (TS 36.413 §8.7.1, §8.7.2) -- stage 9
+// ============================================================================
+
+/// `id-Reset`.
+pub const PROC_RESET: u8 = 14;
+/// `id-ErrorIndication`.
+pub const PROC_ERROR_INDICATION: u8 = 15;
+
+const ID_UE_ASSOCIATED_CONNECTION_ITEM: u16 = 91;
+const ID_RESET_TYPE: u16 = 92;
+const ID_UE_ASSOCIATED_CONNECTION_LIST_RES_ACK: u16 = 93;
+
+/// Criticality Diagnostics in the hand-written type, as the generated one.
+fn diagnostics_from(d: &nextgcore_s1ap::CriticalityDiagnostics) -> g::CriticalityDiagnostics {
+    g::CriticalityDiagnostics {
+        procedure_code: d.procedure_code.map(g::ProcedureCode),
+        triggering_message: d.triggering_message.map(g::TriggeringMessage),
+        procedure_criticality: d.procedure_criticality.map(g::Criticality),
+        i_es_criticality_diagnostics: (!d.ies.is_empty()).then(|| {
+            g::CriticalityDiagnostics_IE_List(
+                d.ies
+                    .iter()
+                    .take(256)
+                    .map(|i| g::CriticalityDiagnostics_IE_Item {
+                        ie_criticality: g::Criticality(match i.ie_criticality {
+                            nextgcore_s1ap::Criticality::Reject => REJECT,
+                            nextgcore_s1ap::Criticality::Ignore => IGNORE,
+                            nextgcore_s1ap::Criticality::Notify => NOTIFY,
+                        }),
+                        ie_id: g::ProtocolIE_ID(i.ie_id),
+                        type_of_error: g::TypeOfError(match i.type_of_error {
+                            nextgcore_s1ap::TypeOfError::NotUnderstood => {
+                                g::TypeOfError::NOT_UNDERSTOOD
+                            }
+                            nextgcore_s1ap::TypeOfError::Missing => g::TypeOfError::MISSING,
+                        }),
+                        ie_extensions: None,
+                    })
+                    .collect(),
+            )
+        }),
+        ie_extensions: None,
+    }
+}
+
+/// Encode an ERROR INDICATION (TS 36.413 §9.1.8.4): every IE optional and
+/// criticality ignore; procedure criticality ignore.
+pub fn build_error_indication(
+    msg: &nextgcore_s1ap::ErrorIndication,
+) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    use g::ErrorIndicationProtocolIEs_EntryValue as V;
+    let ie = |id: u16, value: V| g::ErrorIndicationProtocolIEs_Entry {
+        id: g::ProtocolIE_ID(id),
+        criticality: g::Criticality(IGNORE),
+        value,
+    };
+    let mut ies = Vec::new();
+    if let Some(id) = msg.mme_ue_s1ap_id {
+        ies.push(ie(
+            ID_MME_UE_S1AP_ID,
+            V::Id_MME_UE_S1AP_ID(g::MME_UE_S1AP_ID(id)),
+        ));
+    }
+    if let Some(id) = msg.enb_ue_s1ap_id {
+        ies.push(ie(
+            ID_ENB_UE_S1AP_ID,
+            V::Id_eNB_UE_S1AP_ID(g::ENB_UE_S1AP_ID(id)),
+        ));
+    }
+    if let Some(c) = msg.cause {
+        ies.push(ie(ID_CAUSE, V::Id_Cause(generated_cause(c))));
+    }
+    if let Some(d) = &msg.criticality_diagnostics {
+        ies.push(ie(
+            ID_CRITICALITY_DIAGNOSTICS,
+            V::Id_CriticalityDiagnostics(diagnostics_from(d)),
+        ));
+    }
+    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+        procedure_code: g::ProcedureCode(PROC_ERROR_INDICATION),
+        criticality: g::Criticality(IGNORE),
+        value: g::InitiatingMessageValue::Id_ErrorIndication(g::ErrorIndication {
+            protocol_i_es: g::ErrorIndicationProtocolIEs(ies),
+        }),
+    }))
+}
+
+fn hand_written_diagnostics(
+    d: &g::CriticalityDiagnostics,
+) -> nextgcore_s1ap::CriticalityDiagnostics {
+    nextgcore_s1ap::CriticalityDiagnostics {
+        procedure_code: d.procedure_code.as_ref().map(|p| p.0),
+        triggering_message: d.triggering_message.as_ref().map(|t| t.0),
+        procedure_criticality: d.procedure_criticality.as_ref().map(|c| c.0),
+        ies: d
+            .i_es_criticality_diagnostics
+            .as_ref()
+            .map(|l| {
+                l.0.iter()
+                    .map(|i| nextgcore_s1ap::IeCriticalityDiagnostics {
+                        ie_criticality: match i.ie_criticality.0 {
+                            IGNORE => nextgcore_s1ap::Criticality::Ignore,
+                            NOTIFY => nextgcore_s1ap::Criticality::Notify,
+                            _ => nextgcore_s1ap::Criticality::Reject,
+                        },
+                        ie_id: i.ie_id.0,
+                        type_of_error: if i.type_of_error.0 == g::TypeOfError::MISSING {
+                            nextgcore_s1ap::TypeOfError::Missing
+                        } else {
+                            nextgcore_s1ap::TypeOfError::NotUnderstood
+                        },
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// Decode an ERROR INDICATION (TS 36.413 §9.1.8.4): every IE is optional and
+/// `ignore`. Unknown IEs are returned for logging only — an ERROR INDICATION
+/// is never answered with another.
+pub fn decode_error_indication(
+    bytes: &[u8],
+) -> Option<(nextgcore_s1ap::ErrorIndication, Vec<UnknownIe>)> {
+    let (pdu, unknown) = nextgcore_s1ap_gen::decode_with_unknown_ies(bytes).ok()?;
+    let g::S1AP_PDU::InitiatingMessage(msg) = pdu else {
+        return None;
+    };
+    let g::InitiatingMessageValue::Id_ErrorIndication(m) = msg.value else {
+        return None;
+    };
+    let mut out = nextgcore_s1ap::ErrorIndication {
+        mme_ue_s1ap_id: None,
+        enb_ue_s1ap_id: None,
+        cause: None,
+        criticality_diagnostics: None,
+    };
+    use g::ErrorIndicationProtocolIEs_EntryValue as V;
+    for ie in m.protocol_i_es.0 {
+        match ie.value {
+            V::Id_MME_UE_S1AP_ID(v) => out.mme_ue_s1ap_id = Some(v.0),
+            V::Id_eNB_UE_S1AP_ID(v) => out.enb_ue_s1ap_id = Some(v.0),
+            V::Id_Cause(c) => out.cause = hand_written_cause(&c),
+            V::Id_CriticalityDiagnostics(d) => {
+                out.criticality_diagnostics = Some(hand_written_diagnostics(&d));
+            }
+            V::Id_S_TMSI(_) => {}
+        }
+    }
+    Some((out, unknown))
+}
+
+/// Decode a RESET (TS 36.413 §9.1.8.1), the initiating message of a Class 1
+/// procedure. ResetType is `reject`: missing, the reset is not run; a missing
+/// Cause (`ignore`) reads as radioNetwork / unspecified.
+pub fn decode_reset(bytes: &[u8]) -> Class2Decode<nextgcore_s1ap::Reset> {
+    let Ok((pdu, unknown)) = nextgcore_s1ap_gen::decode_with_unknown_ies(bytes) else {
+        return Class2Decode::Undecodable;
+    };
+    let g::S1AP_PDU::InitiatingMessage(msg) = pdu else {
+        return Class2Decode::Undecodable;
+    };
+    let g::InitiatingMessageValue::Id_Reset(m) = msg.value else {
+        return Class2Decode::Undecodable;
+    };
+    let (mut reject, notify) = classify_unknown(&unknown);
+    let (mut cause, mut reset_type) = (None, None);
+    use g::ResetProtocolIEs_EntryValue as V;
+    for ie in m.protocol_i_es.0 {
+        match ie.value {
+            V::Id_Cause(c) => cause = hand_written_cause(&c),
+            V::Id_ResetType(t) => {
+                reset_type = Some(match t {
+                    g::ResetType::S1_Interface(_) => nextgcore_s1ap::ResetType::S1Interface,
+                    g::ResetType::PartOfS1_Interface(list) => {
+                        nextgcore_s1ap::ResetType::PartOfS1Interface(
+                            list.0
+                                .into_iter()
+                                .map(|e| {
+                                    let g::UE_associatedLogicalS1_ConnectionListRes_EntryValue::Id_UE_associatedLogicalS1_ConnectionItem(i) = e.value;
+                                    nextgcore_s1ap::UeAssociatedLogicalS1Connection {
+                                        mme_ue_s1ap_id: i.mme_ue_s1ap_id.map(|v| v.0),
+                                        enb_ue_s1ap_id: i.enb_ue_s1ap_id.map(|v| v.0),
+                                    }
+                                })
+                                .collect(),
+                        )
+                    }
+                });
+            }
+        }
+    }
+    missing(&mut reject, reset_type.is_some(), ID_RESET_TYPE);
+    if !reject.is_empty() {
+        return Class2Decode::Reject {
+            ies: reject,
+            enb_ue_s1ap_id: None,
+            mme_ue_s1ap_id: None,
+        };
+    }
+    let Some(reset_type) = reset_type else {
+        return Class2Decode::Undecodable;
+    };
+    Class2Decode::Proceed {
+        msg: nextgcore_s1ap::Reset {
+            cause: cause.unwrap_or(Cause::RadioNetwork(
+                nextgcore_s1ap::CauseRadioNetwork::Unspecified,
+            )),
+            reset_type,
+        },
+        notify,
+    }
+}
+
+/// Encode a RESET ACKNOWLEDGE (TS 36.413 §9.1.8.2): its IEs ignore, each
+/// connection item ignore; procedure criticality reject. `notify` IEs of the
+/// RESET are reported in its Criticality Diagnostics (§10.3.4.2).
+pub fn build_reset_acknowledge(
+    msg: &nextgcore_s1ap::ResetAcknowledge,
+    notify: &[DiagnosedIe],
+) -> Result<Vec<u8>, asn1_codecs::PerCodecError> {
+    use g::ResetAcknowledgeProtocolIEs_EntryValue as V;
+    let ie = |id: u16, value: V| g::ResetAcknowledgeProtocolIEs_Entry {
+        id: g::ProtocolIE_ID(id),
+        criticality: g::Criticality(IGNORE),
+        value,
+    };
+    let mut ies = Vec::new();
+    if !msg.ue_associated_connections.is_empty() {
+        ies.push(ie(
+            ID_UE_ASSOCIATED_CONNECTION_LIST_RES_ACK,
+            V::Id_UE_associatedLogicalS1_ConnectionListResAck(
+                g::UE_associatedLogicalS1_ConnectionListResAck(
+                    msg.ue_associated_connections
+                        .iter()
+                        .map(|c| g::UE_associatedLogicalS1_ConnectionListResAck_Entry {
+                            id: g::ProtocolIE_ID(ID_UE_ASSOCIATED_CONNECTION_ITEM),
+                            criticality: g::Criticality(IGNORE),
+                            value: g::UE_associatedLogicalS1_ConnectionListResAck_EntryValue::Id_UE_associatedLogicalS1_ConnectionItem(
+                                g::UE_associatedLogicalS1_ConnectionItem {
+                                    mme_ue_s1ap_id: c.mme_ue_s1ap_id.map(g::MME_UE_S1AP_ID),
+                                    enb_ue_s1ap_id: c.enb_ue_s1ap_id.map(g::ENB_UE_S1AP_ID),
+                                    ie_extensions: None,
+                                },
+                            ),
+                        })
+                        .collect(),
+                ),
+            ),
+        ));
+    }
+    if !notify.is_empty() {
+        ies.push(ie(
+            ID_CRITICALITY_DIAGNOSTICS,
+            V::Id_CriticalityDiagnostics(diagnostics_for(
+                PROC_RESET,
+                g::TriggeringMessage::INITIATING_MESSAGE,
+                REJECT,
+                notify,
+            )),
+        ));
+    }
+    nextgcore_s1ap_gen::encode(&g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+        procedure_code: g::ProcedureCode(PROC_RESET),
+        criticality: g::Criticality(REJECT),
+        value: g::SuccessfulOutcomeValue::Id_Reset(g::ResetAcknowledge {
+            protocol_i_es: g::ResetAcknowledgeProtocolIEs(ies),
+        }),
+    }))
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -2044,3 +2318,6 @@ mod paging_tests;
 
 #[cfg(test)]
 pub(crate) mod handover_tests;
+
+#[cfg(test)]
+mod reset_tests;
