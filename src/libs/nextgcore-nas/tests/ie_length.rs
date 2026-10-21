@@ -381,12 +381,11 @@ fn eps_attach_accept_plmn_list_is_decoded_inside_its_length() {
 
 #[test]
 fn eps_bearer_context_status_holds_two_octets() {
-    // Extended Service Request: service type + KSI, a GUTI in the M-TMSI slot,
-    // then EPS bearer context status (0x57) with length 1 (TS 24.301 §9.9.2.1:
-    // "4 octets length"). It used to be skipped silently.
-    let mut body = vec![
-        0x01, 11, 0xf6, 0x00, 0xf1, 0x10, 0x80, 0x01, 0x01, 1, 2, 3, 4,
-    ];
+    // Extended Service Request: service type + KSI, the M-TMSI (TS 24.008
+    // Mobile identity, type 4), then EPS bearer context status (0x57) with
+    // length 1 (TS 24.301 §9.9.2.1: "4 octets length"). It used to be skipped
+    // silently.
+    let mut body = vec![0x01, 5, 0xf4, 1, 2, 3, 4];
     let mut ok = body.clone();
     ok.extend_from_slice(&[0x57, 0x02, 0x20, 0x00]);
     let msg = eps::ExtendedServiceRequest::decode(&mut b(&ok)).unwrap();

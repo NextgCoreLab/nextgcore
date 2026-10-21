@@ -793,13 +793,12 @@ impl EpsSecurityModeCommand {
             buf.put_u8(0xC0 | (imeisv_req & 0x0F)); // Type 1 IE
         }
         if let Some(ref nonce) = self.replayed_nonce_ue {
+            // TV, 5 (TS 24.301 §8.2.20, §9.9.3.25: no length octet; #629).
             buf.put_u8(0x55); // IEI
-            buf.put_u8(4); // Length
             buf.put_slice(nonce);
         }
         if let Some(ref nonce) = self.nonce_mme {
-            buf.put_u8(0x56); // IEI
-            buf.put_u8(4); // Length
+            buf.put_u8(0x56); // IEI (TV, 5)
             buf.put_slice(nonce);
         }
     }
@@ -829,23 +828,19 @@ impl EpsSecurityModeCommand {
                 0xC0..=0xCF => {
                     msg.imeisv_request = Some(buf.read_u8()? & 0x0F);
                 }
+                // Replayed nonceUE / NonceMME: TV, 5 (TS 24.301 §8.2.20,
+                // §9.9.3.25), the IEI then the 4-octet nonce.
                 0x55 => {
                     buf.skip(1)?;
-                    if buf.remaining() >= 5 {
-                        let _len = buf.read_u8()?;
-                        let mut nonce = [0u8; 4];
-                        buf.read_into(&mut nonce)?;
-                        msg.replayed_nonce_ue = Some(nonce);
-                    }
+                    let mut nonce = [0u8; 4];
+                    buf.read_into(&mut nonce)?;
+                    msg.replayed_nonce_ue = Some(nonce);
                 }
                 0x56 => {
                     buf.skip(1)?;
-                    if buf.remaining() >= 5 {
-                        let _len = buf.read_u8()?;
-                        let mut nonce = [0u8; 4];
-                        buf.read_into(&mut nonce)?;
-                        msg.nonce_mme = Some(nonce);
-                    }
+                    let mut nonce = [0u8; 4];
+                    buf.read_into(&mut nonce)?;
+                    msg.nonce_mme = Some(nonce);
                 }
                 _ => break,
             }
@@ -1033,7 +1028,8 @@ impl ExtendedServiceRequest {
         let first_byte = buf.read_u8()?;
         let service_type = first_byte & 0x0F;
         let nas_key_set_identifier = KeySetIdentifier::decode((first_byte >> 4) & 0x0F);
-        let m_tmsi = EpsMobileIdentity::decode(buf)?;
+        // M-TMSI is a TS 24.008 Mobile identity (TS 24.301 §8.2.15), type 4.
+        let m_tmsi = EpsMobileIdentity::decode_mobile_identity(buf)?;
         let mut msg = Self {
             service_type,
             nas_key_set_identifier,

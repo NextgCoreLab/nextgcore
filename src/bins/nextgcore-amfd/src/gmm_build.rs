@@ -1430,26 +1430,20 @@ mod tests {
         assert_drift_roundtrip(&amfd, "SecurityModeCommand");
     }
 
-    /// KNOWN DIVERGENCE LOCK (nas-06): amfd writes the PDU-session-id as a
-    /// 2-octet type-3 TV (`12 <psi>`, spec-correct per TS 24.501 §9.11.3.41),
-    /// but nextgcore-nas `DlNasTransport` decode/encode treats it as a 3-octet TLV
-    /// (`12 01 <psi>`). So an amfd-built DL NAS Transport does NOT yet
-    /// round-trip byte-equal through nextgcore-nas. This guard fails the moment the
-    /// divergence is fixed (nextgcore-nas `message.rs` ~1411 encode / ~1461 decode,
-    /// TLV->TV) — at which point convert it into a positive drift round-trip.
+    /// DL NAS Transport round-trips byte-equal through nextgcore-nas. amfd writes the
+    /// PDU session ID as type-3 TV (`12 <psi>`, TS 24.501 §8.2.11, §9.11.3.41); nas
+    /// coded it as TLV (`12 01 <psi>`) until #629, and this was a divergence lock.
     #[test]
-    fn drift_dl_nas_transport_psi_divergence_locked() {
-        use nextgcore_nas::fiveg::message::{build_5gmm_message, parse_5gmm_message};
+    fn drift_dl_nas_transport_through_nextgcore_nas() {
+        use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
         let payload = [0x2eu8, 0x01, 0x01, 0xc1]; // minimal N1-SM-ish container
         let amfd = build_dl_nas_transport(Some(5), 1, &payload, None, None).unwrap();
-        let roundtrips = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd))
-            .map(|parsed| build_5gmm_message(&parsed)[..] == amfd[..])
-            .unwrap_or(false);
-        assert!(
-            !roundtrips,
-            "DL NAS Transport now round-trips through nextgcore-nas — the PSI TLV/TV \
-             divergence is fixed; convert this guard into a byte-equal drift test"
-        );
+        let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd)).unwrap();
+        assert!(matches!(
+            parsed,
+            FiveGmmMessage::DlNasTransport(ref m) if m.pdu_session_id == Some(5)
+        ));
+        assert_drift_roundtrip(&amfd, "DlNasTransport");
     }
 
     /// **#361:** a Registration Accept for an EMERGENCY registration reports the UE

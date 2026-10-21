@@ -1407,7 +1407,9 @@ fn emm_extended_service_request() {
     roundtrip_emm(EmmMessage::ExtendedServiceRequest(ExtendedServiceRequest {
         service_type: 0x01,
         nas_key_set_identifier: KeySetIdentifier::new(0, 1),
-        m_tmsi: EpsMobileIdentity::Guti(test_eps_guti()),
+        // TS 24.301 §8.2.15: the M-TMSI is a TS 24.008 Mobile identity (type
+        // 4), not an EPS GUTI (#629).
+        m_tmsi: EpsMobileIdentity::Tmsi(nextgcore_nas::eps::EpsTmsi { tmsi: 0xc0de_0001 }),
         csfb_response: Some(0x01),
         eps_bearer_context_status: Some(0x0020),
     }));
