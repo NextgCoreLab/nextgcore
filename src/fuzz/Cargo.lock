@@ -860,16 +860,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nextgcore-asn1c"
-version = "0.1.0"
-dependencies = [
- "bitvec",
- "bytes",
- "nextgcore-core",
- "thiserror",
-]
-
-[[package]]
 name = "nextgcore-core"
 version = "0.1.0"
 dependencies = [
@@ -930,7 +920,6 @@ dependencies = [
  "nextgcore-gtp",
  "nextgcore-lpp-gen",
  "nextgcore-nas",
- "nextgcore-ngap",
  "nextgcore-ngap-gen",
  "nextgcore-nrppa-gen",
  "nextgcore-pfcp",
@@ -964,16 +953,6 @@ dependencies = [
  "bytes",
  "nextgcore-core",
  "nextgcore-crypt",
- "thiserror",
-]
-
-[[package]]
-name = "nextgcore-ngap"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "nextgcore-asn1c",
- "nextgcore-core",
  "thiserror",
 ]
 

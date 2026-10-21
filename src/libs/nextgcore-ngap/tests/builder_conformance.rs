@@ -1,5 +1,8 @@
 //! Hand-written builder conformance against TS 38.413's own object sets.
 //!
+//! #417: moved here from `nextgcore-ngap-gen` -- its subject is this crate's
+//! builders, so it lives (and is deleted) with them.
+//!
 //! For each hand-written `nextgcore-ngap` builder this checks two things the
 //! codecs cannot vouch for themselves:
 //!
@@ -24,9 +27,9 @@ use nextgcore_ngap::ie::MulticastGroupPagingArea;
 use nextgcore_ngap::mbs_transfer::MbsSessionId;
 use nextgcore_ngap::types::*;
 
-use super::{decode, encode};
+use nextgcore_ngap_gen::{decode, encode};
 
-const SCHEMA: &str = include_str!("../asn/ngap-17.9.asn");
+const SCHEMA: &str = include_str!("../../nextgcore-ngap-gen/asn/ngap-17.9.asn");
 
 /// `id-Foo ProtocolIE-ID ::= n` for every IE id in the schema.
 fn schema_ids() -> HashMap<String, u16> {

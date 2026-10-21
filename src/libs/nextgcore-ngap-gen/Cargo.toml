@@ -18,9 +18,5 @@ log.workspace = true
 [build-dependencies]
 asn1-compiler.workspace = true
 
-[dev-dependencies]
-nextgcore-asn1c.workspace = true
-nextgcore-ngap.workspace = true
-
 [lints]
 workspace = true

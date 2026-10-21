@@ -9,8 +9,9 @@
 //! type leaks past this module.
 //!
 //! Before #417 these went through `nextgcore-ngap`'s hand-written
-//! `mbs_transfer` codec. The oracle tests below pin every builder byte for byte
-//! against it, and every parser against its decoder.
+//! `mbs_transfer` codec. The tests below pin every builder byte for byte, and
+//! every parser, against octets derived by hand from TS 38.413 and X.691
+//! (`golden`), not against either encoder.
 
 use nextgcore_ngap_gen::generated as g;
 
@@ -206,4 +207,7 @@ pub(crate) fn parse_release_request_tmgi(bytes: &[u8]) -> Result<NgapTmgi, Trans
 }
 
 #[cfg(test)]
-mod oracle_tests;
+pub(crate) mod golden;
+
+#[cfg(test)]
+mod golden_tests;
