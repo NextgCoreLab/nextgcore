@@ -45,6 +45,7 @@ mod gtp_build;
 mod gtp_handler;
 mod gtp_path;
 pub mod mbs_session; // Rel-17: MBS multicast/broadcast session
+mod n2_transfer; // #417: the N2 SM transfers, on the generated NGAP codec
 mod n4_build;
 mod n4_handler;
 mod pfcp_path;
@@ -2739,110 +2740,59 @@ fn sbi_response_with_n1_n2(
 }
 
 /// Build the N2 SM `PDUSessionResourceSetupRequestTransfer` (TS 38.413
-/// §9.3.4.1) carrying the UPF N3 GTP-U F-TEID and the QoS flow setup list,
-/// using the real-APER `nextgcore-ngap` transfer codec (not bespoke bytes).
+/// §9.3.4.1) carrying the UPF N3 GTP-U F-TEID and the QoS flow setup list.
+/// Encoded by the generated NGAP codec (#417), byte for byte what the
+/// hand-written transfer codec produced (`n2_transfer` oracle tests).
 fn build_setup_request_transfer(
     upf_teid: u32,
     upf_addr: [u8; 4],
     qfi: u8,
     five_qi: u16,
     arp_priority_level: u8,
-) -> nextgcore_ngap::NgapResult<Vec<u8>> {
-    use nextgcore_ngap::transfer::{
-        AllocationAndRetentionPriority, GtpTunnel, NonDynamic5qiDescriptor,
-        PduSessionResourceSetupRequestTransfer, PduSessionType, PreEmptionCapability,
-        PreEmptionVulnerability, QosCharacteristics, QosFlowLevelQosParameters,
-        QosFlowSetupRequestItem, TransportLayerAddress, UpTransportLayerInformation,
-    };
-
-    let transfer = PduSessionResourceSetupRequestTransfer {
-        pdu_session_aggregate_maximum_bit_rate: None,
-        ul_ngu_up_tnl_information: UpTransportLayerInformation::GtpTunnel(GtpTunnel {
-            transport_layer_address: TransportLayerAddress::from_ipv4(upf_addr),
-            gtp_teid: upf_teid.to_be_bytes(),
-        }),
+) -> Result<Vec<u8>, n2_transfer::TransferError> {
+    n2_transfer::setup_request_transfer(&n2_transfer::SetupRequest {
+        ambr: None,
+        ul_tunnel: (upf_teid, upf_addr),
         data_forwarding_not_possible: false,
         direct_forwarding_path_availability: false,
-        pdu_session_type: PduSessionType::Ipv4,
-        security_indication: None,
-        network_instance: None,
-        qos_flow_setup_request_list: vec![QosFlowSetupRequestItem {
-            qos_flow_identifier: qfi,
-            qos_flow_level_qos_parameters: QosFlowLevelQosParameters {
-                qos_characteristics: QosCharacteristics::NonDynamic5qi(
-                    NonDynamic5qiDescriptor::new(five_qi),
-                ),
-                allocation_and_retention_priority: AllocationAndRetentionPriority {
-                    priority_level_arp: arp_priority_level,
-                    pre_emption_capability: PreEmptionCapability::ShallNotTriggerPreEmption,
-                    pre_emption_vulnerability: PreEmptionVulnerability::NotPreEmptable,
-                },
-                gbr_qos_information: None,
-                reflective_qos_attribute: false,
-                additional_qos_flow_information: false,
+        flows: vec![n2_transfer::QosFlowSetup {
+            qfi,
+            five_qi,
+            arp: n2_transfer::Arp {
+                priority_level: arp_priority_level,
+                may_trigger_pre_emption: false,
+                pre_emptable: false,
             },
+            gbr: None,
             e_rab_id: None,
         }],
-    };
-    transfer.encode()
+    })
 }
 
-/// Build a real-APER `PDUSessionResourceModifyRequestTransfer` (TS 38.413
-/// clause 9.3.4.3) carrying the re-authorized Session-AMBR and the QoS flow to
-/// add/modify. Mirrors [`build_setup_request_transfer`]; the gNB's strict APER
-/// decoder rejects a hand-rolled byte layout (smfd#2).
+/// Build a `PDUSessionResourceModifyRequestTransfer` (TS 38.413 clause 9.3.4.3)
+/// carrying the re-authorized Session-AMBR and the QoS flow to add/modify.
+/// Mirrors [`build_setup_request_transfer`]; the gNB's strict APER decoder
+/// rejects a hand-rolled byte layout (smfd#2).
 fn build_modify_request_transfer(
     qfi: u8,
     ambr_dl_bps: u64,
     ambr_ul_bps: u64,
-) -> nextgcore_ngap::NgapResult<Vec<u8>> {
-    use nextgcore_ngap::transfer::{
-        PduSessionAggregateMaximumBitRate, PduSessionResourceModifyRequestTransfer,
-        QosFlowAddOrModifyRequestItem,
-    };
-    let transfer = PduSessionResourceModifyRequestTransfer {
-        pdu_session_aggregate_maximum_bit_rate: Some(PduSessionAggregateMaximumBitRate {
-            dl: ambr_dl_bps,
-            ul: ambr_ul_bps,
-        }),
-        ul_ngu_up_tnl_modify_list: Vec::new(),
-        network_instance: None,
-        qos_flow_add_or_modify_request_list: vec![QosFlowAddOrModifyRequestItem {
-            qos_flow_identifier: qfi,
-            qos_flow_level_qos_parameters: None,
-            e_rab_id: None,
-        }],
-        qos_flow_to_release_list: Vec::new(),
-    };
-    transfer.encode()
+) -> Result<Vec<u8>, n2_transfer::TransferError> {
+    n2_transfer::modify_request_transfer(Some((ambr_dl_bps, ambr_ul_bps)), &[qfi])
 }
 
 /// Extract the gNB DL GTP-U endpoint (TEID, IPv4 address, first QFI) from a
-/// real-APER `PDUSessionResourceSetupResponseTransfer` (TS 38.413 §9.3.4.2).
+/// `PDUSessionResourceSetupResponseTransfer` (TS 38.413 §9.3.4.2).
 fn decode_setup_response_dl_endpoint(data: &[u8]) -> Option<(u32, [u8; 4], u8)> {
-    use nextgcore_ngap::transfer::{
-        PduSessionResourceSetupResponseTransfer, UpTransportLayerInformation,
-    };
-
-    let transfer = match PduSessionResourceSetupResponseTransfer::decode(data) {
-        Ok(t) => t,
+    let dl = match n2_transfer::parse_setup_response_transfer(data) {
+        Ok(dl) => dl,
         Err(e) => {
-            log::warn!("Failed to decode PDUSessionResourceSetupResponseTransfer: {e:?}");
+            log::warn!("Failed to decode PDUSessionResourceSetupResponseTransfer: {e}");
             return None;
         }
     };
-    let UpTransportLayerInformation::GtpTunnel(tunnel) = &transfer
-        .dl_qos_flow_per_tnl_information
-        .up_transport_layer_information;
-    let teid = u32::from_be_bytes(tunnel.gtp_teid);
-    let addr = ipv4_from_octets(&tunnel.transport_layer_address.octets)?;
-    let qfi = transfer
-        .dl_qos_flow_per_tnl_information
-        .associated_qos_flow_list
-        .first()
-        .map(|f| f.qos_flow_identifier)
-        .unwrap_or(0);
-    Some((teid, addr, qfi))
+    let addr = ipv4_of(&dl)?;
+    Some((dl.teid, addr, dl.qfis.first().copied().unwrap_or(0)))
 }
 
 /// The SMF side of an AN-initiated PDU session modification (#525, TS 23.502
@@ -2854,25 +2804,19 @@ fn decode_setup_response_dl_endpoint(data: &[u8]) -> Option<(u32, [u8; 4], u8)> 
 /// `PDU_RES_MOD_IND_FAIL` with a PDUSessionResourceModifyIndicationUnsuccessfulTransfer
 /// (§9.3.4.21) naming why.
 async fn an_initiated_modification(sm_context_ref: &str, n2_bytes: &[u8]) -> SbiResponse {
-    use nextgcore_asn1c::ngap::cause::{Cause, CauseMisc, CauseProtocol, CauseTransport};
-    use nextgcore_ngap::transfer::{
-        GtpTunnel, PduSessionResourceModifyConfirmTransfer,
-        PduSessionResourceModifyIndicationTransfer,
-        PduSessionResourceModifyIndicationUnsuccessfulTransfer, TransportLayerAddress,
-        UpTransportLayerInformation,
-    };
+    use n2_transfer::SmfCause;
 
-    let fail = |cause: Cause, why: &str| -> SbiResponse {
+    let fail = |cause: SmfCause, why: &str| -> SbiResponse {
         log::warn!(
             "PDU_RES_MOD_IND for ref={sm_context_ref}: {why}; answering PDU_RES_MOD_IND_FAIL"
         );
-        match (PduSessionResourceModifyIndicationUnsuccessfulTransfer { cause }).encode() {
+        match n2_transfer::modify_indication_unsuccessful_transfer(cause) {
             Ok(bytes) => sbi_response_with_n2(
                 serde_json::json!({ "n2SmInfoType": "PDU_RES_MOD_IND_FAIL" }),
                 &bytes,
             ),
             Err(e) => {
-                log::error!("Failed to encode ModifyIndicationUnsuccessfulTransfer: {e:?}");
+                log::error!("Failed to encode ModifyIndicationUnsuccessfulTransfer: {e}");
                 nextgcore_sbi::server::send_internal_error(
                     "could not build the Modify Indication Unsuccessful Transfer",
                 )
@@ -2880,58 +2824,44 @@ async fn an_initiated_modification(sm_context_ref: &str, n2_bytes: &[u8]) -> Sbi
         }
     };
 
-    let indication = match PduSessionResourceModifyIndicationTransfer::decode(n2_bytes) {
+    let indication = match n2_transfer::parse_modify_indication_transfer(n2_bytes) {
         Ok(t) => t,
         Err(e) => {
             return fail(
-                Cause::Protocol(CauseProtocol::AbstractSyntaxErrorFalselyConstructedMessage),
-                &format!("undecodable Modify Indication Transfer ({e:?})"),
+                SmfCause::ProtocolFalselyConstructedMessage,
+                &format!("undecodable Modify Indication Transfer ({e})"),
             )
         }
     };
-    let UpTransportLayerInformation::GtpTunnel(tunnel) = &indication
-        .dl_qos_flow_per_tnl_information
-        .up_transport_layer_information;
-    let teid = u32::from_be_bytes(tunnel.gtp_teid);
-    let Some(addr) = ipv4_from_octets(&tunnel.transport_layer_address.octets) else {
+    let teid = indication.dl.teid;
+    let Some(addr) = ipv4_of(&indication.dl) else {
         return fail(
-            Cause::Transport(CauseTransport::Unspecified),
+            SmfCause::TransportUnspecified,
             "the DL endpoint is not an IPv4 address",
         );
     };
-    let qfis: Vec<u8> = indication
-        .dl_qos_flow_per_tnl_information
-        .associated_qos_flow_list
-        .iter()
-        .map(|f| f.qos_flow_identifier)
-        .collect();
-    if !indication
-        .additional_dl_qos_flow_per_tnl_information
-        .is_empty()
-    {
+    let qfis = indication.dl.qfis.clone();
+    if indication.additional_dl_tunnels > 0 {
         log::warn!(
             "PDU_RES_MOD_IND for ref={sm_context_ref}: {} additional DL tunnels are not \
              installed at the UPF (dual connectivity is not supported); only the primary \
              tunnel's flows are confirmed",
-            indication.additional_dl_qos_flow_per_tnl_information.len()
+            indication.additional_dl_tunnels
         );
     }
     let Some(upf_seid) = lookup_upf_seid(sm_context_ref) else {
-        return fail(
-            Cause::Misc(CauseMisc::Unspecified),
-            "no N4 session for this context",
-        );
+        return fail(SmfCause::MiscUnspecified, "no N4 session for this context");
     };
     let Some((ul_teid, ul_addr)) = lookup_upf_ul_endpoint(sm_context_ref) else {
         return fail(
-            Cause::Misc(CauseMisc::Unspecified),
+            SmfCause::MiscUnspecified,
             "no recorded UPF uplink endpoint to confirm",
         );
     };
     if let Err(e) = pfcp_session_modify(smf_n4_seid_for(sm_context_ref), upf_seid, teid, addr).await
     {
         return fail(
-            Cause::Transport(CauseTransport::TransportResourceUnavailable),
+            SmfCause::TransportResourceUnavailable,
             &format!("PFCP Session Modification failed ({e})"),
         );
     }
@@ -2943,22 +2873,14 @@ async fn an_initiated_modification(sm_context_ref: &str, n2_bytes: &[u8]) -> Sbi
         addr[2],
         addr[3]
     );
-    let confirm = PduSessionResourceModifyConfirmTransfer {
-        qos_flow_modify_confirm_list: qfis,
-        ul_ngu_up_tnl_information: UpTransportLayerInformation::GtpTunnel(GtpTunnel {
-            transport_layer_address: TransportLayerAddress::from_ipv4(ul_addr),
-            gtp_teid: ul_teid.to_be_bytes(),
-        }),
-        qos_flow_failed_to_modify_list: Vec::new(),
-    };
-    match confirm.encode() {
+    match n2_transfer::modify_confirm_transfer(&qfis, (ul_teid, ul_addr)) {
         Ok(bytes) => sbi_response_with_n2(
             serde_json::json!({ "n2SmInfoType": "PDU_RES_MOD_CFM" }),
             &bytes,
         ),
         Err(e) => fail(
-            Cause::Misc(CauseMisc::Unspecified),
-            &format!("could not encode the Modify Confirm Transfer ({e:?})"),
+            SmfCause::MiscUnspecified,
+            &format!("could not encode the Modify Confirm Transfer ({e})"),
         ),
     }
 }
@@ -2978,41 +2900,28 @@ fn sbi_response_with_n2(mut json_root: serde_json::Value, n2_sm_info: &[u8]) -> 
         ))
 }
 
-/// Extract the target-gNB DL GTP-U endpoint from a real-APER
-/// `PathSwitchRequestTransfer` (TS 38.413 §9.3.4.8) during an Xn handover.
+/// Extract the target-gNB DL GTP-U endpoint from a `PathSwitchRequestTransfer`
+/// (TS 38.413 §9.3.4.8) during an Xn handover.
 fn decode_path_switch_dl_endpoint(data: &[u8]) -> Option<(u32, [u8; 4], u8)> {
-    use nextgcore_ngap::transfer::{PathSwitchRequestTransfer, UpTransportLayerInformation};
-
-    let transfer = match PathSwitchRequestTransfer::decode(data) {
-        Ok(t) => t,
+    let dl = match n2_transfer::parse_path_switch_request_transfer(data) {
+        Ok(dl) => dl,
         Err(e) => {
-            log::warn!("Failed to decode PathSwitchRequestTransfer: {e:?}");
+            log::warn!("Failed to decode PathSwitchRequestTransfer: {e}");
             return None;
         }
     };
-    let UpTransportLayerInformation::GtpTunnel(tunnel) = &transfer.dl_ngu_up_tnl_information;
-    let teid = u32::from_be_bytes(tunnel.gtp_teid);
-    let addr = ipv4_from_octets(&tunnel.transport_layer_address.octets)?;
-    let qfi = transfer
-        .qos_flow_accepted_list
-        .first()
-        .copied()
-        .unwrap_or(0);
-    Some((teid, addr, qfi))
+    let addr = ipv4_of(&dl)?;
+    Some((dl.teid, addr, dl.qfis.first().copied().unwrap_or(0)))
 }
 
-/// Coerce a TransportLayerAddress octet vector to an IPv4 quad (None if not 4).
-fn ipv4_from_octets(octets: &[u8]) -> Option<[u8; 4]> {
-    if octets.len() == 4 {
-        Some([octets[0], octets[1], octets[2], octets[3]])
-    } else {
-        // IPv6 (16) or other widths are not supported for the GTP-U DL path here
-        log::warn!(
-            "gNB transport address is not IPv4 ({} octets)",
-            octets.len()
-        );
-        None
+/// The NG-RAN endpoint's IPv4 quad (None, logged, if it is not one).
+fn ipv4_of(dl: &n2_transfer::DlEndpoint) -> Option<[u8; 4]> {
+    let addr = dl.ipv4();
+    if addr.is_none() {
+        // IPv6 (128) or other widths are not supported for the GTP-U DL path here
+        log::warn!("gNB transport address is not IPv4 ({} bits)", dl.bit_len);
     }
+    addr
 }
 
 /// Build an SmContextCreateError (TS 29.502 §6.1.6.2.4) carrying a
@@ -4668,34 +4577,17 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                 // establishment recorded no endpoint the transfer is sent with the UL
                 // tunnel ABSENT, which §9.3.4.9 permits and which honestly means "no
                 // change" — better than inventing a tunnel the UPF does not serve.
-                let ack = match lookup_upf_ul_endpoint(sm_context_ref) {
-                    Some((teid, addr)) => {
-                        use nextgcore_ngap::transfer::{
-                            GtpTunnel, PathSwitchRequestAcknowledgeTransfer, TransportLayerAddress,
-                            UpTransportLayerInformation,
-                        };
-                        PathSwitchRequestAcknowledgeTransfer {
-                            ul_ngu_up_tnl_information: Some(
-                                UpTransportLayerInformation::GtpTunnel(GtpTunnel {
-                                    transport_layer_address: TransportLayerAddress::from_ipv4(addr),
-                                    gtp_teid: teid.to_be_bytes(),
-                                }),
-                            ),
-                            ..Default::default()
-                        }
-                    }
-                    None => {
-                        log::warn!(
-                            "PATH_SWITCH_REQ for ref={sm_context_ref}: no recorded UPF uplink \
-                             endpoint, so the acknowledge carries no UL tunnel (TS 38.413 \
-                             §9.3.4.9 permits its absence, and it means the UL path is \
-                             unchanged)"
-                        );
-                        nextgcore_ngap::transfer::PathSwitchRequestAcknowledgeTransfer::default()
-                    }
-                };
+                let ul = lookup_upf_ul_endpoint(sm_context_ref);
+                if ul.is_none() {
+                    log::warn!(
+                        "PATH_SWITCH_REQ for ref={sm_context_ref}: no recorded UPF uplink \
+                         endpoint, so the acknowledge carries no UL tunnel (TS 38.413 \
+                         §9.3.4.9 permits its absence, and it means the UL path is \
+                         unchanged)"
+                    );
+                }
                 use nextgcore_sbi::constants::content_type;
-                match ack.encode() {
+                match n2_transfer::path_switch_request_acknowledge_transfer(ul) {
                     Ok(bytes) => {
                         response_body["n2SmInfoType"] = serde_json::json!("PATH_SWITCH_REQ_ACK");
                         response_body["n2SmInfo"] = serde_json::json!({ "contentId": "n2SmInfo" });
@@ -5647,13 +5539,7 @@ async fn release_user_plane(sm_context_ref: &str) {
 /// The N2 `PDUSessionResourceReleaseCommandTransfer` (TS 38.413 §9.3.4.4) the AMF
 /// relays to the gNB so the radio and N3 resources are released too.
 fn build_release_command_transfer() -> Vec<u8> {
-    use nextgcore_ngap::transfer::PduSessionResourceReleaseCommandTransfer;
-    let transfer = PduSessionResourceReleaseCommandTransfer {
-        cause: nextgcore_ngap::types::Cause::Nas(
-            nextgcore_asn1c::ngap::cause::CauseNas::NormalRelease,
-        ),
-    };
-    transfer.encode().unwrap_or_else(|e| {
+    n2_transfer::release_command_transfer().unwrap_or_else(|e| {
         log::error!("Failed to encode PDUSessionResourceReleaseCommandTransfer: {e}");
         Vec::new()
     })
@@ -7540,18 +7426,9 @@ mod tests {
     /// same encoder directly) must produce the spec-derived bytes exactly.
     #[test]
     fn golden_modify_request_transfer_ambr_only_encodes_ts38413_bytes() {
-        use nextgcore_ngap::transfer::{
-            PduSessionAggregateMaximumBitRate, PduSessionResourceModifyRequestTransfer,
-        };
-        let transfer = PduSessionResourceModifyRequestTransfer {
-            pdu_session_aggregate_maximum_bit_rate: Some(PduSessionAggregateMaximumBitRate {
-                dl: 1_000_000_000,
-                ul: 250_000,
-            }),
-            ..Default::default()
-        };
         assert_eq!(
-            transfer.encode().expect("encode"),
+            n2_transfer::modify_request_transfer(Some((1_000_000_000, 250_000)), &[])
+                .expect("encode"),
             GOLDEN_MODIFY_REQUEST_AMBR_ONLY.to_vec(),
             "AMBR-only ModifyRequestTransfer must match the hand-derived TS 38.413 APER vector"
         );
@@ -7576,42 +7453,55 @@ mod tests {
     /// drift — a symmetric codec bug passes the roundtrip but fails here).
     #[test]
     fn golden_modify_request_transfer_decodes_from_frozen_bytes() {
-        use nextgcore_ngap::transfer::{
-            PduSessionAggregateMaximumBitRate, PduSessionResourceModifyRequestTransfer,
-            QosFlowAddOrModifyRequestItem,
+        use g::PDUSessionResourceModifyRequestTransferProtocolIEs_EntryValue as Ie;
+        use nextgcore_ngap_gen::generated as g;
+        let decode = |bytes: &[u8]| {
+            nextgcore_ngap_gen::decode_contained::<g::PDUSessionResourceModifyRequestTransfer>(
+                bytes,
+            )
+            .expect("decode golden")
+            .protocol_i_es
+            .0
+            .into_iter()
+            .map(|ie| (ie.id.0, ie.criticality.0, ie.value))
+            .collect::<Vec<_>>()
         };
+        let ambr = |dl, ul| g::PDUSessionAggregateMaximumBitRate {
+            pdu_session_aggregate_maximum_bit_rate_dl: g::BitRate(dl),
+            pdu_session_aggregate_maximum_bit_rate_ul: g::BitRate(ul),
+            ie_extensions: None,
+        };
+        let reject = g::Criticality::REJECT;
 
-        let a = PduSessionResourceModifyRequestTransfer::decode(&GOLDEN_MODIFY_REQUEST_AMBR_ONLY)
-            .expect("decode golden A");
         assert_eq!(
-            a,
-            PduSessionResourceModifyRequestTransfer {
-                pdu_session_aggregate_maximum_bit_rate: Some(PduSessionAggregateMaximumBitRate {
-                    dl: 1_000_000_000,
-                    ul: 250_000,
-                }),
-                ..Default::default()
-            }
+            decode(&GOLDEN_MODIFY_REQUEST_AMBR_ONLY),
+            vec![(
+                130,
+                reject,
+                Ie::Id_PDUSessionAggregateMaximumBitRate(ambr(1_000_000_000, 250_000))
+            )]
         );
-
-        let b = PduSessionResourceModifyRequestTransfer::decode(
-            &GOLDEN_MODIFY_REQUEST_AMBR_PLUS_QOS_FLOW_ADD,
-        )
-        .expect("decode golden B");
         assert_eq!(
-            b,
-            PduSessionResourceModifyRequestTransfer {
-                pdu_session_aggregate_maximum_bit_rate: Some(PduSessionAggregateMaximumBitRate {
-                    dl: 200_000_000,
-                    ul: 100_000_000,
-                }),
-                qos_flow_add_or_modify_request_list: vec![QosFlowAddOrModifyRequestItem {
-                    qos_flow_identifier: 1,
-                    qos_flow_level_qos_parameters: None,
-                    e_rab_id: None,
-                }],
-                ..Default::default()
-            }
+            decode(&GOLDEN_MODIFY_REQUEST_AMBR_PLUS_QOS_FLOW_ADD),
+            vec![
+                (
+                    130,
+                    reject,
+                    Ie::Id_PDUSessionAggregateMaximumBitRate(ambr(200_000_000, 100_000_000))
+                ),
+                (
+                    135,
+                    reject,
+                    Ie::Id_QosFlowAddOrModifyRequestList(g::QosFlowAddOrModifyRequestList(vec![
+                        g::QosFlowAddOrModifyRequestItem {
+                            qos_flow_identifier: g::QosFlowIdentifier(1),
+                            qos_flow_level_qos_parameters: None,
+                            e_rab_id: None,
+                            ie_extensions: None,
+                        }
+                    ]))
+                ),
+            ]
         );
     }
 
@@ -11934,32 +11824,22 @@ mod path_switch_ack_tests {
     /// the request transfer, which is precisely the defect.
     #[test]
     fn the_path_switch_acknowledge_transfer_carries_the_recorded_uplink_endpoint() {
-        use nextgcore_ngap::transfer::{
-            PathSwitchRequestAcknowledgeTransfer, UpTransportLayerInformation,
-        };
-
+        use nextgcore_ngap_gen::generated as g;
         // The shape the handler builds when establishment recorded an endpoint.
-        let ack = PathSwitchRequestAcknowledgeTransfer {
-            ul_ngu_up_tnl_information: Some(UpTransportLayerInformation::GtpTunnel(
-                nextgcore_ngap::transfer::GtpTunnel {
-                    transport_layer_address:
-                        nextgcore_ngap::transfer::TransportLayerAddress::from_ipv4([10, 45, 0, 1]),
-                    gtp_teid: 0x0001_0001u32.to_be_bytes(),
-                },
-            )),
-            ..Default::default()
-        };
-        let bytes = ack
-            .encode()
-            .expect("the handler must be able to encode this");
+        let bytes = n2_transfer::path_switch_request_acknowledge_transfer(Some((
+            0x0001_0001,
+            [10, 45, 0, 1],
+        )))
+        .expect("the handler must be able to encode this");
         assert!(!bytes.is_empty(), "the n2SmInfo part must be non-empty");
 
         let decoded =
-            PathSwitchRequestAcknowledgeTransfer::decode(&bytes).expect("decode as the ack type");
+            nextgcore_ngap_gen::decode_contained::<g::PathSwitchRequestAcknowledgeTransfer>(&bytes)
+                .expect("decode as the ack type");
         match decoded.ul_ngu_up_tnl_information {
-            Some(UpTransportLayerInformation::GtpTunnel(t)) => {
+            Some(g::UPTransportLayerInformation::GTPTunnel(t)) => {
                 assert_eq!(
-                    t.gtp_teid,
+                    t.gtp_teid.0,
                     0x0001_0001u32.to_be_bytes(),
                     "the UPF uplink TEID must survive: it is what the target gNB sends to"
                 );
@@ -11973,15 +11853,15 @@ mod path_switch_ack_tests {
     /// invented tunnel.
     #[test]
     fn an_acknowledge_without_a_recorded_endpoint_is_still_a_valid_transfer() {
-        use nextgcore_ngap::transfer::PathSwitchRequestAcknowledgeTransfer;
-        let bytes = PathSwitchRequestAcknowledgeTransfer::default()
-            .encode()
-            .expect("encode");
+        use nextgcore_ngap_gen::generated as g;
+        let bytes = n2_transfer::path_switch_request_acknowledge_transfer(None).expect("encode");
         assert!(
             !bytes.is_empty(),
             "even the no-change form has a preamble, so the n2SmInfo part is non-empty"
         );
-        let decoded = PathSwitchRequestAcknowledgeTransfer::decode(&bytes).expect("decode");
+        let decoded =
+            nextgcore_ngap_gen::decode_contained::<g::PathSwitchRequestAcknowledgeTransfer>(&bytes)
+                .expect("decode");
         assert!(
             decoded.ul_ngu_up_tnl_information.is_none(),
             "and it says 'no uplink change' rather than naming a tunnel the UPF does not serve"
