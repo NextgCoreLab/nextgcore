@@ -16403,7 +16403,7 @@ mod tests {
             let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
             guard.sess_add(old_id, 5).expect("PSI 5");
         }
-        *ngap.next_gnb_id.lock().await = new_id;
+        ngap.forced_amf_ue_ngap_id = Some(new_id);
 
         // The Registration Accept cannot be sent over this fixture's transport.
         let _ = ngap
@@ -16452,7 +16452,7 @@ mod tests {
         let mut nas = protected_initial_registration(&stored.amf_ue, &rr, &rr, 5);
         nas[2] ^= 0xFF; // corrupt the MAC
         ngap.ue_auth_state.insert(old_id, stored);
-        *ngap.next_gnb_id.lock().await = new_id;
+        ngap.forced_amf_ue_ngap_id = Some(new_id);
 
         let _ = ngap
             .handle_initial_ue_message(1, &service_request_initial_ue(nas))
