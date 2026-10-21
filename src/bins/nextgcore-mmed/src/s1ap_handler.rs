@@ -3167,13 +3167,24 @@ pub fn handle_handover_cancel_reporting(
     };
 
     // #584: a cancelled EPS to 5GS preparation must not be finished by a late
-    // Forward Relocation Response (TS 23.502 §4.11.1.2.3).
+    // Forward Relocation Response (TS 23.502 §4.11.1.2.3). #592: and the target
+    // AMF is told, with a Relocation Cancel Request (step 2), so it releases the
+    // target NG-RAN resources and the SM contexts it prepared.
     if let Some(source) = ctx.enb_ue_find_by_id(source_ue_id) {
-        if crate::n26_path::cancel_eps_to_5gs_relocation(source.mme_ue_id) {
-            log::info!(
-                "Handover Cancel: the EPS to 5GS relocation of UE {} is abandoned; the target                  AMF is not told (this core has no Relocation Cancel Request), and its                  preparation lapses on its own supervision",
-                source.mme_ue_id
-            );
+        if let Some(record) = crate::n26_path::take_eps_to_5gs_relocation(source.mme_ue_id) {
+            match crate::n26_path::send_relocation_cancel(ctx, &record) {
+                Ok(_) => log::info!(
+                    "Handover Cancel: the EPS to 5GS relocation of UE {} is abandoned and the \
+                     target AMF {} told",
+                    source.mme_ue_id,
+                    record.amf_peer
+                ),
+                Err(e) => log::warn!(
+                    "Handover Cancel: the EPS to 5GS relocation of UE {} is abandoned, but the \
+                     Relocation Cancel Request could not be sent: {e}",
+                    source.mme_ue_id
+                ),
+            }
         }
     }
 

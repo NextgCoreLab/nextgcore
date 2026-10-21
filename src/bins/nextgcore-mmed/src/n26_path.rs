@@ -373,11 +373,44 @@ pub fn eps_to_5gs_relocation(mme_ue_id: u64) -> Option<EpsTo5gsRelocation> {
 /// HANDOVER COMMAND for a handover the eNB gave up. Returns whether one was in
 /// flight.
 pub fn cancel_eps_to_5gs_relocation(mme_ue_id: u64) -> bool {
+    take_eps_to_5gs_relocation(mme_ue_id).is_some()
+}
+
+/// Drop `mme_ue_id`'s relocation and return it (#592): the HANDOVER CANCEL path
+/// needs the record to tell the target AMF.
+pub fn take_eps_to_5gs_relocation(mme_ue_id: u64) -> Option<EpsTo5gsRelocation> {
     eps_to_5gs_relocations()
         .lock()
         .ok()
         .and_then(|mut m| m.remove(&eps_to_5gs_local_teid(mme_ue_id)))
-        .is_some()
+}
+
+/// Tell the target AMF that an EPS→5GS handover was cancelled (TS 23.502
+/// §4.11.1.2.3 step 2, #592): a Relocation Cancel Request carrying the UE's
+/// IMSI, so the AMF releases the target NG-RAN resources and the SM contexts
+/// it prepared. Returns the request's sequence number; the Relocation Cancel
+/// Response closes it.
+pub fn send_relocation_cancel(
+    ctx: &MmeContext,
+    record: &EpsTo5gsRelocation,
+) -> Result<u32, String> {
+    let server = server().ok_or_else(|| "no N26 socket bound".to_string())?;
+    // The same IMSI digits the Forward Relocation Request carried.
+    let imsi = ctx
+        .mme_ue_find_by_id(record.mme_ue_id)
+        .map(|ue| ue.imsi_bcd)
+        .unwrap_or_default();
+    let msg =
+        n26_build::build_relocation_cancel_request(server.alloc_sequence(), record.amf_teid, &imsi);
+    let seq = server.send_request(record.amf_peer, &msg)?;
+    log::info!(
+        "N26 Relocation Cancel Request sent to AMF {} (seq={seq}, TEID {:#x}) for UE {}: the \
+         source eNB cancelled the EPS to 5GS handover (TS 23.502 §4.11.1.2.3 step 2)",
+        record.amf_peer,
+        record.amf_teid.unwrap_or(0),
+        record.mme_ue_id
+    );
+    Ok(seq)
 }
 
 /// Drop every relocation record. Test-only; declared beside the map. Callers
@@ -752,6 +785,21 @@ fn handle_datagram(inner: &Arc<N26Inner>, data: &[u8], peer: SocketAddr) {
             // #584: this MME is the SOURCE of an EPS to 5GS handover.
             for send in handle_eps_to_5gs_relocation_response(mme_self(), &msg) {
                 crate::s1ap_path::s1ap_send(send);
+            }
+        } else if msg_type == Gtp2MessageType::RelocationCancelResponse as u8 {
+            // #592: TS 23.502 §4.11.1.2.3 step 5. The source eNB was already
+            // acknowledged; this only closes the request.
+            let cause = n26_build::relocation_cancel_response_cause(&msg);
+            if cause == Some(n26_build::CAUSE_REQUEST_ACCEPTED) {
+                log::info!(
+                    "N26 Relocation Cancel Response from AMF {peer} (seq={seq}): the target \
+                     released its preparation"
+                );
+            } else {
+                log::warn!(
+                    "N26 Relocation Cancel Response from AMF {peer} (seq={seq}) cause {cause:?}: \
+                     the target did not confirm the release"
+                );
             }
         } else if msg_type == Gtp2MessageType::ForwardRelocationCompleteAcknowledge as u8 {
             // #408: the source AMF has confirmed the handover completed, which per

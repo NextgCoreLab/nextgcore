@@ -100,6 +100,8 @@ pub fn triggered_message_type(request_type: u8) -> Option<u8> {
         x if x == T::CreateForwardingTunnelRequest as u8 => T::CreateForwardingTunnelResponse as u8,
         x if x == T::DeletePdnConnectionSetRequest as u8 => T::DeletePdnConnectionSetResponse as u8,
         x if x == T::UpdatePdnConnectionSetRequest as u8 => T::UpdatePdnConnectionSetResponse as u8,
+        // #592: N26/S10/S3 handover cancel (TS 29.274 §7.3.16-7.3.17).
+        x if x == T::RelocationCancelRequest as u8 => T::RelocationCancelResponse as u8,
         _ => return None,
     };
     Some(t)
@@ -379,6 +381,11 @@ mod tests {
         assert_eq!(
             triggered_message_type(T::ReleaseAccessBearersRequest as u8),
             Some(T::ReleaseAccessBearersResponse as u8)
+        );
+        assert_eq!(
+            triggered_message_type(T::RelocationCancelRequest as u8),
+            Some(T::RelocationCancelResponse as u8),
+            "#592: the Relocation Cancel Response closes the request"
         );
         // A response type has no triggered message
         assert_eq!(triggered_message_type(T::CreateSessionResponse as u8), None);

@@ -1024,6 +1024,39 @@ fn an_eps_to_5gs_handover_runs_against_the_amfs_own_n26_codec() {
         "a cancelled handover gets no HANDOVER COMMAND"
     );
 
+    // #592: and the AMF is told (TS 23.502 §4.11.1.2.3 step 2). amfd's own parser
+    // reads the Relocation Cancel Request; the AMF had not answered, so mmed has no
+    // AMF TEID and the header TEID is 0 (TS 29.274 §5.5.2).
+    let rcr = recv_fresh(&amf_sock, &mut seen);
+    assert_eq!(rcr.header.message_type, 139, "Relocation Cancel Request");
+    let parsed = amf::parse_relocation_cancel_request(&rcr);
+    assert_eq!(parsed.imsi.as_deref(), Some("001010123456789"));
+    assert_eq!(parsed.amf_teid, 0);
+    // amfd's Relocation Cancel Response closes mmed's request.
+    let n26 = crate::n26_path::server().expect("installed");
+    let before = n26.outstanding();
+    amf_sock
+        .send_to(
+            &amf::build_relocation_cancel_response(
+                rcr.header.sequence_number,
+                crate::n26_path::eps_to_5gs_local_teid(mme_ue_id),
+                16,
+            )
+            .encode(),
+            n26.local_addr(),
+        )
+        .unwrap();
+    for _ in 0..200 {
+        if n26.outstanding() < before {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        n26.outstanding() < before,
+        "the Relocation Cancel Response closes the request"
+    );
+
     crate::n26_path::set_for_test(false);
 }
 

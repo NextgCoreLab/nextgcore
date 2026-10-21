@@ -55,7 +55,7 @@ pub const CAUSE_REQUEST_ACCEPTED: u8 = 16;
 ///
 /// One of the four message-specific causes §7.3.6 names (`29274-j60.txt:19878`), and the
 /// right one when the 4G-GUTI an MME sent does not reverse-map to any UE this AMF serves.
-pub const CAUSE_IMSI_IMEI_NOT_KNOWN: u8 = 92;
+pub const CAUSE_IMSI_IMEI_NOT_KNOWN: u8 = 96;
 
 /// GTPv2-C cause `Request rejected` (TS 29.274 Table 8.4-1).
 ///
@@ -525,6 +525,155 @@ pub fn drain_eps_to_5gs_preparations() -> Vec<EpsToFivegsPreparation> {
     )
 }
 
+// ============================================================================
+// EPS→5GS handover cancel (#592, TS 23.502 §4.11.1.2.3)
+// ============================================================================
+
+/// A Relocation Cancel Request for a preparation the NGAP layer holds, waiting for it.
+pub struct EpsToFivegsCancel {
+    /// The N26 server the request arrived on, which the response leaves from.
+    pub server: Arc<N26Server>,
+    /// The request's sequence number, echoed by the response.
+    pub seq: u32,
+    /// The MME's N26 address.
+    pub mme_peer: SocketAddr,
+    /// `imsi-<digits>`, when the request carried an IMSI.
+    pub supi: Option<String>,
+    /// The request's header TEID: this AMF's N26 TEID for the UE, or 0.
+    pub amf_teid: u32,
+}
+
+impl std::fmt::Debug for EpsToFivegsCancel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EpsToFivegsCancel")
+            .field("seq", &self.seq)
+            .field("mme_peer", &self.mme_peer)
+            .field("supi", &self.supi)
+            .field("amf_teid", &self.amf_teid)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Cancels waiting for the NGAP layer, drained by `ngap_path`'s poll loop AFTER the
+/// preparations, so a cancel for a preparation queued in the same tick finds it. Declared
+/// beside its reader and writer (#308).
+static EPS_TO_5GS_CANCELS: std::sync::Mutex<Vec<EpsToFivegsCancel>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Take every queued cancel.
+pub fn drain_eps_to_5gs_cancels() -> Vec<EpsToFivegsCancel> {
+    std::mem::take(&mut *EPS_TO_5GS_CANCELS.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// A preparation the N26 leg is still running (steps 3-7: the SMF round trips), by SUPI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PreparationInProgress {
+    /// The MME's control-plane TEID, which the Relocation Cancel Response goes to.
+    mme_teid: u32,
+    /// A Relocation Cancel Request arrived while the preparation ran.
+    cancelled: bool,
+}
+
+/// Preparations in progress on the N26 leg (#592).
+///
+/// The receive loop spawns one task per datagram, so a Relocation Cancel Request can arrive
+/// while the Forward Relocation Request's task still waits on the SMFs, before anything has
+/// reached the NGAP layer. Such a cancel is recorded here, and the preparation is abandoned
+/// when it would have been queued. The hand-off from here to the NGAP queue happens under
+/// this lock, so a cancel either marks the preparation here or finds it in the NGAP layer;
+/// it cannot fall between the two.
+static PREPARATIONS_IN_PROGRESS: OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, PreparationInProgress>>,
+> = OnceLock::new();
+
+fn preparations_in_progress(
+) -> std::sync::MutexGuard<'static, std::collections::HashMap<String, PreparationInProgress>> {
+    PREPARATIONS_IN_PROGRESS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Removes a preparation's in-progress record on every exit of the N26 leg.
+pub(crate) struct PreparationGuard(Option<String>);
+
+impl PreparationGuard {
+    pub(crate) fn start(supi: Option<&String>, mme_teid: u32) -> Self {
+        if let Some(supi) = supi {
+            preparations_in_progress().insert(
+                supi.clone(),
+                PreparationInProgress {
+                    mme_teid,
+                    cancelled: false,
+                },
+            );
+        }
+        Self(supi.cloned())
+    }
+}
+
+impl Drop for PreparationGuard {
+    fn drop(&mut self) {
+        if let Some(supi) = &self.0 {
+            preparations_in_progress().remove(supi);
+        }
+    }
+}
+
+/// What a Relocation Cancel Request found on the N26 leg (#592).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOnN26 {
+    /// The preparation is still running here and is now marked cancelled; answer the MME
+    /// at this TEID.
+    MarkedInProgress { mme_teid: u32 },
+    /// Nothing runs here for this UE: the cancel was queued for the NGAP layer.
+    Queued,
+}
+
+/// Route a Relocation Cancel Request (#592): mark a preparation still running on the N26
+/// leg, or queue the cancel for the NGAP layer. One lock, see [`PREPARATIONS_IN_PROGRESS`].
+pub fn route_relocation_cancel(cancel: EpsToFivegsCancel) -> CancelOnN26 {
+    let mut in_progress = preparations_in_progress();
+    if let Some(p) = cancel.supi.as_ref().and_then(|s| in_progress.get_mut(s)) {
+        p.cancelled = true;
+        return CancelOnN26::MarkedInProgress {
+            mme_teid: p.mme_teid,
+        };
+    }
+    EPS_TO_5GS_CANCELS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(cancel);
+    CancelOnN26::Queued
+}
+
+/// Hand a finished preparation to the NGAP layer, unless the MME cancelled it meanwhile
+/// (#592). Returns the preparation back when it was cancelled.
+pub(crate) fn hand_over_unless_cancelled(
+    prep: EpsToFivegsPreparation,
+) -> Option<EpsToFivegsPreparation> {
+    let mut in_progress = preparations_in_progress();
+    let cancelled = prep
+        .supi
+        .as_ref()
+        .and_then(|s| in_progress.remove(s))
+        .is_some_and(|p| p.cancelled);
+    if cancelled {
+        return Some(prep);
+    }
+    // Under the lock: see PREPARATIONS_IN_PROGRESS.
+    enqueue_eps_to_5gs_preparation(prep);
+    None
+}
+
+/// Test door onto the in-progress record (#592).
+#[cfg(test)]
+pub(crate) fn preparation_in_progress_for_test(supi: &str) -> Option<(u32, bool)> {
+    preparations_in_progress()
+        .get(supi)
+        .map(|p| (p.mme_teid, p.cancelled))
+}
+
 impl N26Server {
     /// Send `msg` to `peer` from this server's socket (#418): step 14's Forward Relocation
     /// Response and the Complete Notification leave from the NGAP layer, which holds the
@@ -706,6 +855,12 @@ impl N26Server {
             return;
         }
 
+        // #592: the source MME cancels an EPS→5GS handover (TS 23.502 §4.11.1.2.3 step 2).
+        if msg_type == Gtp2MessageType::RelocationCancelRequest as u8 {
+            self.handle_relocation_cancel_request(&msg, seq, peer).await;
+            return;
+        }
+
         if msg_type == Gtp2MessageType::ForwardRelocationCompleteAcknowledge as u8 {
             // This AMF is the TARGET in that exchange (EPS→5GS), so the acknowledge closes a
             // notification it sent. TS 23.502 §4.11.1.2.2.3 step 5 has the notification tell
@@ -784,6 +939,9 @@ impl N26Server {
         let mme_teid = request.mme_fteid.teid;
         let refuse =
             |cause: u8| eps::build_forward_relocation_response_refusal(seq, mme_teid, cause);
+        // #592: a Relocation Cancel Request may arrive while this task waits on the SMFs.
+        let in_progress_supi = request.imsi.as_ref().map(|d| format!("imsi-{d}"));
+        let _in_progress = PreparationGuard::start(in_progress_supi.as_ref(), mme_teid);
 
         // Step 3: the mapped 5G security context, with the AMF's configured algorithm
         // preference -- the same masks the Security Mode Command path selects from.
@@ -941,7 +1099,7 @@ impl N26Server {
             return;
         }
 
-        enqueue_eps_to_5gs_preparation(EpsToFivegsPreparation {
+        let prep = EpsToFivegsPreparation {
             server: Arc::clone(self),
             seq,
             mme_peer: peer,
@@ -953,7 +1111,102 @@ impl N26Server {
             target,
             source_to_target_container: request.source_to_target_container,
             sessions,
+        };
+        if let Some(cancelled) = hand_over_unless_cancelled(prep) {
+            self.abandon_cancelled_preparation(cancelled).await;
+        }
+    }
+
+    /// Handle a **Relocation Cancel Request** (TS 29.274 §7.3.16, type 139), #592: the source
+    /// eNB cancelled an EPS→5GS handover this AMF is preparing as target (TS 23.502
+    /// §4.11.1.2.3).
+    ///
+    /// A preparation still on the N26 leg is marked and answered here. It is abandoned
+    /// (SMFs told CANCELLED, the Forward Relocation Request refused) when its SMF round
+    /// trips finish. Any other cancel goes to the NGAP layer, which releases the target
+    /// gNB's resources and the SM contexts and answers. With no IMSI and no TEID the
+    /// request names no UE, and is answered "IMSI/IMEI not known".
+    async fn handle_relocation_cancel_request(
+        self: &Arc<Self>,
+        msg: &Gtp2Message,
+        seq: u32,
+        peer: SocketAddr,
+    ) {
+        let parsed = crate::n26_eps_to_5gs::parse_relocation_cancel_request(msg);
+        let supi = parsed.imsi.as_ref().map(|d| format!("imsi-{d}"));
+        if supi.is_none() && parsed.amf_teid == 0 {
+            log::warn!(
+                "N26 Relocation Cancel Request from MME {peer} (seq={seq}) names no UE (no IMSI, \
+                 TEID 0); answering 'IMSI/IMEI not known'"
+            );
+            self.send(
+                peer,
+                &crate::n26_eps_to_5gs::build_relocation_cancel_response(
+                    seq,
+                    0,
+                    CAUSE_IMSI_IMEI_NOT_KNOWN,
+                ),
+            )
+            .await;
+            return;
+        }
+        let routed = route_relocation_cancel(EpsToFivegsCancel {
+            server: Arc::clone(self),
+            seq,
+            mme_peer: peer,
+            supi: supi.clone(),
+            amf_teid: parsed.amf_teid,
         });
+        match routed {
+            CancelOnN26::MarkedInProgress { mme_teid } => {
+                log::info!(
+                    "N26 Relocation Cancel Request from MME {peer} (seq={seq}) for {supi:?}: the \
+                     preparation is still at its SMFs and will be abandoned there"
+                );
+                self.send(
+                    peer,
+                    &crate::n26_eps_to_5gs::build_relocation_cancel_response(
+                        seq,
+                        mme_teid,
+                        crate::n26_eps_to_5gs::CAUSE_REQUEST_ACCEPTED,
+                    ),
+                )
+                .await;
+            }
+            CancelOnN26::Queued => log::info!(
+                "N26 Relocation Cancel Request from MME {peer} (seq={seq}) for {supi:?}: handed \
+                 to the NGAP layer"
+            ),
+        }
+    }
+
+    /// Abandon a preparation the MME cancelled while it was at its SMFs (#592): each SMF is
+    /// told the handover is CANCELLED and the Forward Relocation Request, which is still
+    /// owed an answer, is refused.
+    pub(crate) async fn abandon_cancelled_preparation(&self, prep: EpsToFivegsPreparation) {
+        for sess in &prep.sessions {
+            let _ = crate::sbi_path::call_smf_cancel_sm_context_handover(
+                &sess.smf.0,
+                sess.smf.1,
+                &sess.created.sm_context_ref,
+            )
+            .await;
+        }
+        self.send(
+            prep.mme_peer,
+            &crate::n26_eps_to_5gs::build_forward_relocation_response_refusal(
+                prep.seq,
+                prep.mme_teid,
+                crate::n26_eps_to_5gs::CAUSE_RELOCATION_FAILURE,
+            ),
+        )
+        .await;
+        log::info!(
+            "N26 EPS→5GS (seq={}): cancelled by the MME during preparation; {} SMF \
+             preparation(s) cancelled, the request refused",
+            prep.seq,
+            prep.sessions.len()
+        );
     }
 
     /// Handle a **Forward Relocation Response** (TS 29.274 §7.3.2, type 134), #408.
