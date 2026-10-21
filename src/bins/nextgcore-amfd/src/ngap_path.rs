@@ -706,6 +706,10 @@ pub struct NgapServer {
     assoc_to_addr: Arc<RwLock<HashMap<u64, SocketAddr>>>,
     /// Next gNB ID
     next_gnb_id: Arc<Mutex<u64>>,
+    /// Test seam: the AMF UE NGAP ID the next Initial UE Message takes instead of
+    /// one from the allocator, so a test can key its assertions on a known value.
+    #[cfg(test)]
+    forced_amf_ue_ngap_id: Option<u64>,
     /// Event sender for NGAP events
     event_tx: mpsc::Sender<AmfEvent>,
     /// Server event receiver
@@ -836,6 +840,8 @@ impl NgapServer {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             assoc_to_addr: Arc::new(RwLock::new(HashMap::new())),
             next_gnb_id: Arc::new(Mutex::new(1)),
+            #[cfg(test)]
+            forced_amf_ue_ngap_id: None,
             event_tx,
             server_event_rx,
             ue_auth_state,
@@ -1851,6 +1857,25 @@ impl NgapServer {
     /// service request). No blanket Identity Request: identification is
     /// only initiated when the UE identified itself with a GUTI unknown
     /// to this AMF (TS 23.502 Section 4.2.2.2.2 step 4).
+    /// The AMF UE NGAP ID (TS 38.413 §9.3.3.1) for a UE this AMF meets over N2.
+    ///
+    /// From the AMF context's allocator, the one every other UE id comes from: the
+    /// RAN UE pool, Namf-created UEs (`amf_ue_add`, #600) and the EPS→5GS target UE.
+    /// They all key the one live UE store. Before #600 this drew from the server's
+    /// gNB-id counter, which starts at 1 like the context allocator does, so an
+    /// N2-registered UE and a Namf-created one could take the same key and the second
+    /// overwrote the first.
+    fn allocate_amf_ue_ngap_id(&mut self) -> u64 {
+        #[cfg(test)]
+        if let Some(forced) = self.forced_amf_ue_ngap_id.take() {
+            return forced;
+        }
+        crate::context::amf_self()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .next_amf_ue_ngap_id()
+    }
+
     async fn handle_initial_ue_message(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
         log::info!(
             "Initial UE Message from association {} ({} bytes)",
@@ -1901,12 +1926,7 @@ impl NgapServer {
         );
 
         // Allocate AMF-UE-NGAP-ID for this UE
-        let amf_ue_ngap_id = {
-            let mut id = self.next_gnb_id.lock().await;
-            let current = *id;
-            *id += 1;
-            current
-        };
+        let amf_ue_ngap_id = self.allocate_amf_ue_ngap_id();
 
         let nas = initial_ue.nas_pdu.clone();
         if nas.len() < 3 || nas[0] != 0x7E {
@@ -16106,7 +16126,7 @@ mod tests {
         let mut ngap = test_ngap_server().await;
         let old_id = 5_120_101u64;
         let new_id = 5_120_102u64;
-        *ngap.next_gnb_id.lock().await = new_id;
+        ngap.forced_amf_ue_ngap_id = Some(new_id);
         ngap.ue_auth_state
             .insert(old_id, idle_registered_ue(old_id));
         {
@@ -16305,7 +16325,7 @@ mod tests {
         let mut ngap = test_ngap_server().await;
         let old_id = 5_180_101u64;
         let new_id = 5_180_102u64;
-        *ngap.next_gnb_id.lock().await = new_id;
+        ngap.forced_amf_ue_ngap_id = Some(new_id);
         ngap.ue_auth_state
             .insert(old_id, idle_registered_ue(old_id));
         ngap.sm_context_refs
@@ -20592,7 +20612,7 @@ mod tests {
     /// -- it is terminated with an Error Indication -- while one carrying a
     /// 5G-S-TMSI, which the hand-written parser refused outright, now starts
     /// the registration. The UE context is the observable: the handler
-    /// allocates it from `next_gnb_id` before the NAS dispatch.
+    /// allocates its AMF UE NGAP ID before the NAS dispatch.
     ///
     /// REVERT-VERIFIED: routing the handler back to the hand-written parser
     /// fails the 5G-S-TMSI half; treating `Reject` as `Proceed` fails the other.
@@ -20604,7 +20624,7 @@ mod tests {
         let mut ngap = test_ngap_server().await;
 
         let rejected = 7_417_101u64;
-        *ngap.next_gnb_id.lock().await = rejected;
+        ngap.forced_amf_ue_ngap_id = Some(rejected);
         let base = crate::ngap_asn1::tests::initial_ue_corpus().remove(0);
         let pdu = crate::ngap_asn1::tests::with_unknown_ie(&base, 9999, 0x00);
         let _ = ngap.process_ngap_message(1, &pdu).await;
@@ -20613,13 +20633,13 @@ mod tests {
             "a not-comprehended IE marked reject terminates the procedure"
         );
         assert_eq!(
-            *ngap.next_gnb_id.lock().await,
-            rejected,
+            ngap.forced_amf_ue_ngap_id,
+            Some(rejected),
             "no AMF UE NGAP ID was allocated"
         );
 
         let accepted = 7_417_102u64;
-        *ngap.next_gnb_id.lock().await = accepted;
+        ngap.forced_amf_ue_ngap_id = Some(accepted);
         let pdu = crate::ngap_asn1::tests::initial_ue_edited(|ies| {
             ies.push(ngap_gen::InitialUEMessageProtocolIEs_Entry {
                 id: ngap_gen::ProtocolIE_ID(ngap_gen::ID_FIVE_G_S_TMSI),
@@ -20641,15 +20661,87 @@ mod tests {
         );
     }
 
+    /// #600: a UE met over N2 is keyed by an AMF UE NGAP ID from the AMF context's
+    /// allocator, the one Namf-created UEs take theirs from, so the two can never share
+    /// a key in the live store. Before, the Initial UE Message drew from the server's
+    /// own counter, which starts at 1 as the context allocator does: a fresh server's
+    /// first UE took key 1 whatever the context had already issued, and overwrote a
+    /// Namf-created UE holding it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_n2_registered_ue_never_takes_the_key_of_a_namf_created_ue() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let ctx = crate::context::amf_self();
+        let supi = "imsi-001010000600900";
+        let namf_ue = {
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            let ran_ue = guard.ran_ue_add(900_600, 600_900).expect("ran_ue_add");
+            let mut ue = guard.amf_ue_add(ran_ue.id).expect("amf_ue_add");
+            ue.supi = Some(supi.to_string());
+            guard.amf_ue_update(&ue);
+            guard.amf_ue_publish(&ue, 600_900, 1);
+            ue
+        };
+        let mut ngap = test_ngap_server().await;
+
+        let ran_ue_ngap_id = 600_901u32;
+        let pdu = nextgcore_ngap::builder::build_initial_ue_message(
+            &nextgcore_ngap::types::InitialUeMessage {
+                ran_ue_ngap_id,
+                nas_pdu: vec![
+                    0x7E,
+                    security_header::PLAIN_NAS_MESSAGE,
+                    message_type::REGISTRATION_REQUEST,
+                    0x09,
+                    0x00,
+                ],
+                user_location_info: test_user_location(1, 0x10),
+                rrc_establishment_cause: nextgcore_ngap::types::RrcEstablishmentCause::MoSignalling,
+                ue_context_request: Some(true),
+                allowed_nssai: Vec::new(),
+            },
+        )
+        .expect("encode an InitialUEMessage");
+        let _ = ngap.handle_initial_ue_message(1, &pdu).await;
+
+        let n2_key = ngap
+            .ue_auth_state
+            .snapshot()
+            .into_iter()
+            .find(|(_, s)| s.ran_ue_ngap_id == ran_ue_ngap_id && s.association_id == 1)
+            .map(|(key, _)| key)
+            .expect("the Initial UE Message creates a UE context");
+        assert!(
+            n2_key > namf_ue.id,
+            "the N2 UE's AMF UE NGAP ID ({n2_key}) comes from the allocator that already \
+             issued {} to the Namf-created UE",
+            namf_ue.id
+        );
+        let still = ctx
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .amf_ue_find_by_supi(supi)
+            .map(|ue| ue.id);
+        assert_eq!(
+            still,
+            Some(namf_ue.id),
+            "the Namf-created UE is still in the live store under its own key"
+        );
+
+        ngap.ue_auth_state.remove(n2_key);
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        guard.amf_ue_unpublish(namf_ue.id);
+        guard.amf_ue_remove(namf_ue.id);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_initial_ue_message_stores_the_cell_identity_it_parsed() {
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = test_ngap_server().await;
-        // The AMF-UE-NGAP-ID is ALLOCATED by the handler from `next_gnb_id`, not chosen
+        // The AMF-UE-NGAP-ID is ALLOCATED by the handler, not chosen
         // by the test, so it is seeded to a value distinct from the sibling tests'
         // literals for the shared-key reason recorded on them.
         let allocated = 7_406_004u64;
-        *ngap.next_gnb_id.lock().await = allocated;
+        ngap.forced_amf_ue_ngap_id = Some(allocated);
 
         // The cell and tracking area the gNB reports at registration.
         let reg_tac = 0x00040Fu32;

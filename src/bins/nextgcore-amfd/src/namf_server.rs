@@ -9266,6 +9266,161 @@ mod tests {
         assert_eq!(sessions[0].s_nssai.sd, Some(0x0000AB));
     }
 
+    /// #600: a UE relocated INTO this AMF never takes the key of a UE registered over NGAP.
+    ///
+    /// Both live in one `ue_store` and one session list. The NGAP UE is keyed by its AMF UE
+    /// NGAP ID, and the relocated UE by `AmfUe.id`. Before #600 the two came from two
+    /// counters that both start at 1, so in a freshly started AMF the first relocated UE got
+    /// the id of the first NGAP UE: `amf_ue_publish` overwrote the NGAP UE's live context,
+    /// and `sess_list_for_ue` returned both UEs' PDU sessions to each.
+    ///
+    /// The fixture recreates that fresh-AMF alignment against the shared global context.
+    /// With two counters, it advances whichever is behind so the NGAP UE's id is exactly
+    /// the id the next `amf_ue_add` would hand out. With one allocator, every draw is
+    /// already past every earlier one, so both loops exit on their first pass. The
+    /// assertions are on outcomes: separate keys, the NGAP UE's context intact, and
+    /// session lists that do not leak between the two.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relocated_ue_never_takes_the_key_of_an_ngap_registered_ue() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        amf_context_init(64, 1024, 4096);
+        let ngap_supi = "imsi-001010000600001";
+        let relocated_supi = "imsi-001010000600002";
+        let ngap_sm_ref = "smctx-600-ngap";
+        let relocated_sm_ref = "smctx-600-relocated";
+
+        let ctx = amf_self();
+        let ngap_key = {
+            let guard = ctx.read().expect("ctx lock");
+            // The id the next `amf_ue_add` would allocate is one past this probe.
+            let probe = guard.amf_ue_add(0).expect("probe UE").id;
+            guard.amf_ue_remove(probe);
+            // Bring the NGAP id allocator up to the probe (a no-op with one allocator).
+            let mut drawn = guard.next_amf_ue_ngap_id();
+            for _ in 0..1_000_000 {
+                if drawn >= probe {
+                    break;
+                }
+                drawn = guard.next_amf_ue_ngap_id();
+            }
+            // The NGAP-registered UE, its AMF UE NGAP ID drawn from the NGAP allocator
+            // exactly as an InitialUEMessage's is (`ran_ue_add`).
+            let ran_ue = guard.ran_ue_add(900_600, 600).expect("ran_ue_add");
+            let key = ran_ue.amf_ue_ngap_id;
+            // ...and the AMF UE allocator up to it, so with two counters the relocation
+            // below draws exactly `key`. With one allocator `next_amf` is already
+            // stale-low, so this takes one probe, which lands past `key`, and stops.
+            let mut next_amf = probe + 1;
+            for _ in 0..1_000_000 {
+                if next_amf >= key {
+                    break;
+                }
+                let probe = guard.amf_ue_add(0).expect("probe UE").id;
+                guard.amf_ue_remove(probe);
+                next_amf = probe + 1;
+            }
+            // The NGAP UE's context and PDU session, as the NGAP path stores them:
+            // `ue_store` keyed by AMF UE NGAP ID, session recorded under the same id
+            // (`ngap_path::record_amf_session`).
+            // On that path `AmfUe.id` IS the AMF UE NGAP ID (`UeNasContext::new`).
+            let mut ngap_ue = AmfUe::new(key, ran_ue.id);
+            ngap_ue.supi = Some(ngap_supi.to_string());
+            guard.ue_store().insert(
+                key,
+                crate::ngap_path::UeNasContext::published(ngap_ue, 600, 1),
+            );
+            let mut sess = guard.sess_add(key, 5).expect("sess_add");
+            sess.sm_context_ref = Some(ngap_sm_ref.to_string());
+            guard.sess_update(&sess);
+            key
+        };
+
+        let body = json!({
+            "ueContext": {
+                "supi": relocated_supi,
+                "mmContextList": [{ "accessType": "3GPP_ACCESS" }],
+                "sessionContextList": [{
+                    "pduSessionId": 7,
+                    "smContextRef": relocated_sm_ref,
+                    "sNssai": { "sst": 1 },
+                    "dnn": "internet",
+                    "accessType": "3GPP_ACCESS",
+                }],
+            },
+            "targetId": {
+                "ranNodeId": { "gNbId": { "bitLength": 24, "gNBValue": "000600" } },
+                "tai": { "plmnId": { "mcc": "001", "mnc": "01" }, "tac": "0600" },
+            },
+            "sourceToTargetData": { "ngapIeType": "SRC_TO_TAR_CONTAINER",
+                                    "ngapData": { "contentId": "n2SrcToTar" } },
+            "forwardRelocationRequest": { "contentId": "fwdReloc" },
+        });
+        let req = SbiRequest::post(format!(
+            "/namf-comm/v1/ue-contexts/{relocated_supi}/relocate"
+        ))
+        .with_json_body(&body)
+        .expect("json")
+        .with_part(SbiPart::with_content(
+            "fwdReloc",
+            "application/vnd.3gpp.ngap",
+            bytes::Bytes::from_static(b"\x06\x00"),
+        ));
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 201, "the relocation itself must succeed");
+
+        let relocated =
+            find_ue_by_context_id(relocated_supi).expect("the relocated context must resolve");
+        assert_ne!(
+            relocated.id, ngap_key,
+            "TS 38.413 §9.3.3.1: one AMF-side UE identity space -- the relocated UE must \
+             not be given the id of a UE already registered over NGAP"
+        );
+        let guard = ctx.read().expect("ctx lock");
+        let ngap_ue = guard
+            .ue_store()
+            .get(ngap_key)
+            .expect("the NGAP-registered UE's context must survive the relocation");
+        assert_eq!(
+            ngap_ue.amf_ue.supi.as_deref(),
+            Some(ngap_supi),
+            "and still be THAT UE's context, not overwritten by the relocated one"
+        );
+        let relocated_refs: Vec<_> = guard
+            .sess_list_for_ue(relocated.id)
+            .into_iter()
+            .map(|s| s.sm_context_ref)
+            .collect();
+        assert_eq!(
+            relocated_refs,
+            vec![Some(relocated_sm_ref.to_string())],
+            "the relocated UE holds exactly the session it brought"
+        );
+        let ngap_refs: Vec<_> = guard
+            .sess_list_for_ue(ngap_key)
+            .into_iter()
+            .map(|s| s.sm_context_ref)
+            .collect();
+        assert_eq!(
+            ngap_refs,
+            vec![Some(ngap_sm_ref.to_string())],
+            "and the NGAP UE exactly its own"
+        );
+
+        // Leave the shared store as it was found.
+        guard.ue_store().remove(ngap_key);
+        for sess in guard.sess_list_for_ue(ngap_key) {
+            guard.sess_remove(sess.id);
+        }
+        if let Some(ran_ue) = guard.ran_ue_find_by_amf_ue_ngap_id(ngap_key) {
+            guard.ran_ue_remove(ran_ue.id);
+        }
+        guard.amf_ue_unpublish(relocated.id);
+        guard.amf_ue_remove(relocated.id);
+        guard.ran_ue_remove(relocated.ran_ue_id);
+    }
+
     /// `forwardRelocationRequest` is `required` (yaml:3742-3746) and it is a
     /// `RefToBinaryData`, so a reference with no multipart part behind it is a
     /// relocation whose Forward Relocation Request never arrived — refused, not

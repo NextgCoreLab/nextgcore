@@ -564,8 +564,6 @@ pub struct AmfContext {
     next_gnb_id: AtomicUsize,
     /// Next RAN UE ID
     next_ran_ue_id: AtomicUsize,
-    /// Next AMF UE ID
-    next_amf_ue_id: AtomicUsize,
     /// Next session ID
     next_sess_id: AtomicUsize,
     /// RAN UE index counter
@@ -1194,7 +1192,6 @@ impl AmfContext {
             t3512_value: 540,
             next_gnb_id: AtomicUsize::new(1),
             next_ran_ue_id: AtomicUsize::new(1),
-            next_amf_ue_id: AtomicUsize::new(1),
             next_sess_id: AtomicUsize::new(1),
             ran_ue_index: AtomicU64::new(1),
             max_num_of_gnb: 0,
@@ -1531,7 +1528,16 @@ impl AmfContext {
             return None;
         }
 
-        let id = self.next_amf_ue_id.fetch_add(1, Ordering::SeqCst) as u64;
+        // ONE id space for every UE this AMF holds (#600). An NGAP-created UE is keyed by
+        // its AMF UE NGAP ID, in `ue_store` and in the session list alike, and that id comes
+        // from `next_amf_ue_ngap_id`. A UE created here -- an inter-AMF relocation
+        // (`/relocate`, CreateUEContext), a context transfer -- is published into the SAME
+        // `ue_store` under `amf_ue.id` and its sessions are recorded under it. A second
+        // counter also starting at 1 handed out ids the NGAP side had already used: the
+        // relocated UE overwrote a live NGAP UE's context and inherited its PDU sessions.
+        // TS 38.413 §9.3.3.1: the AMF UE NGAP ID uniquely identifies the UE association
+        // within the AMF, so the AMF has one UE identity space, and this draws from it.
+        let id = self.next_amf_ue_ngap_id();
         let mut amf_ue = AmfUe::new(id, ran_ue_id);
         // Wave-6 H9 runtime canary: newly created UEs adopt the process-wide
         // NAS-security setting (default OFF → legacy byte-for-byte path).
@@ -5603,6 +5609,34 @@ mod tests {
         assert_eq!(memento.nh, [0u8; NEXTGCORE_SHA256_DIGEST_SIZE]);
         assert_eq!(memento.rand, [0u8; NEXTGCORE_RAND_LEN]);
         assert_eq!(memento.hxres_star, [0u8; NEXTGCORE_MAX_RES_LEN]);
+    }
+
+    /// #600: `amf_ue_add` and the AMF UE NGAP ID allocator share ONE id space.
+    ///
+    /// `ue_store` and the session list key NGAP-created UEs by their AMF UE NGAP ID and
+    /// Namf-created UEs by `AmfUe.id`. On a freshly started AMF, interleaving the two
+    /// creation paths must never yield an id twice. With the two counters this replaced,
+    /// both started at 1, so the very first pair collided.
+    #[test]
+    fn amf_ue_ids_and_amf_ue_ngap_ids_never_coincide() {
+        let mut ctx = AmfContext::new();
+        ctx.init(4, 64, 64);
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..16u64 {
+            let ran_ue = ctx.ran_ue_add(1, i).expect("ran_ue_add");
+            assert!(
+                seen.insert(ran_ue.amf_ue_ngap_id),
+                "AMF UE NGAP ID {} was already handed out",
+                ran_ue.amf_ue_ngap_id
+            );
+            let amf_ue = ctx.amf_ue_add(ran_ue.id).expect("amf_ue_add");
+            assert!(
+                seen.insert(amf_ue.id),
+                "AmfUe.id {} is also an AMF UE NGAP ID or an earlier AmfUe.id: a \
+                 Namf-created UE would share its ue_store and session keys",
+                amf_ue.id
+            );
+        }
     }
 
     /// A UE removed from the context has its keys cleared when the caller drops it, which
