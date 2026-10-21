@@ -245,6 +245,12 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
         // (sbi_path::call_udm_uecm_registration) when the serving AMF changed.
         //   POST /namf-callback/v1/{supi}/dereg-notify
         // --------------------------------------------------------------
+        // Namf_Callback: Nucmf_UECapabilityManagement Notify (#570, TS 29.673
+        // §5.2.2.4), POSTed to the ucmfNotificationUri the AMF subscribed with.
+        //   POST /namf-callback/v1/ucmf-notify
+        "namf-callback" if parts.len() == 3 && parts[2] == "ucmf-notify" && method == "POST" => {
+            handle_ucmf_notify_callback(&request)
+        }
         "namf-callback" if parts.len() == 4 && parts[3] == "dereg-notify" && method == "POST" => {
             handle_dereg_notify_callback(parts[2], &request)
         }
@@ -456,6 +462,26 @@ fn parse_dereg_reason(s: &str) -> Option<DeregistrationReason> {
 /// INVALID_MSG_FORMAT; a missing/unknown mandatory member is 400
 /// MANDATORY_IE_MISSING / MANDATORY_IE_INCORRECT; an unknown SUPI is 404
 /// CONTEXT_NOT_FOUND. On success the AMF answers 204 No Content.
+/// #570: a UCMF dictionary notification (TS 29.673 §6.1.5.2, `UcmfNotification`).
+/// Deleted and out-of-version IDs are retired, so they leave NGAP and the UEs holding
+/// them get the deletion indication at their next registration or UE configuration
+/// update (TS 24.501 §5.4.4.1 f).
+fn handle_ucmf_notify_callback(request: &SbiRequest) -> SbiResponse {
+    let Some(body) = parse_json_body(request) else {
+        return malformed_body();
+    };
+    if body.get("eventType").and_then(Value::as_str).is_none() {
+        return mandatory_ie_missing("eventType");
+    }
+    let retired = crate::racs::apply_notification(&body);
+    log::info!(
+        "UCMF notification {}: {} UE radio capability ID(s) retired",
+        body["eventType"],
+        retired.len()
+    );
+    SbiResponse::no_content()
+}
+
 fn handle_dereg_notify_callback(supi: &str, request: &SbiRequest) -> SbiResponse {
     let Some(body) = parse_json_body(request) else {
         return malformed_body();

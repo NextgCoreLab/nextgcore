@@ -1374,6 +1374,18 @@ impl NgapServer {
                     );
                 }
             }
+            // #570: UE Radio Capability Info Indication (TS 38.413 §8.14.1), an
+            // NG-RAN-initiated class-2 procedure: store the capability and, for a RACS
+            // UE, have the UCMF assign an ID.
+            Some(44) if data[0] == 0x00 => {
+                self.handle_ue_radio_capability_info_indication(association_id, data)
+                    .await?;
+            }
+            // #570: UE Radio Capability ID Mapping (TS 38.413 §8.14.3), non UE-associated.
+            Some(60) if data[0] == 0x00 => {
+                self.handle_ue_radio_capability_id_mapping(association_id, data)
+                    .await?;
+            }
             Some(19) | Some(44) | Some(48) | Some(52) => {
                 // Expected gNB-initiated procedures the AMF accepts without a
                 // response (TS 38.413): NAS Non Delivery Indication (19), UE Radio
@@ -2256,6 +2268,14 @@ impl NgapServer {
                         state.amf_ue.current_guti.tmsi
                     );
                 });
+                // #570: an ID the UCMF assigned while the registration was in progress
+                // is delivered now, by a UE configuration update (TS 24.501 §5.4.4.2).
+                self.send_racs_configuration_update(
+                    association_id,
+                    ul_nas.amf_ue_ngap_id,
+                    ul_nas.ran_ue_ngap_id,
+                )
+                .await?;
             }
             message_type::CONFIGURATION_UPDATE_COMPLETE => {
                 // TS 24.501 §5.4.4.3: the COMPLETE stops T3555 and the procedure is
@@ -2619,6 +2639,13 @@ impl NgapServer {
         // this bit. Recorded here, with the other capability-shaped fields, so it is
         // set before any branch that reads it.
         state.amf_ue.gmm_capability.s1_mode = req.s1_mode;
+        // #570: RACS (TS 24.501 §5.4.4.1). The bit is re-read on every registration;
+        // an ID the UE presents is one it already holds.
+        state.amf_ue.racs_supported = req.racs_supported;
+        if let Some(id) = req.ue_radio_capability_id.clone() {
+            state.amf_ue.ue_radio_capability_id = Some(id);
+            state.amf_ue.ue_radio_capability_id_known_to_ue = true;
+        }
         // Computed here, before anything moves a field out of `req` (the security
         // capability below is not `Copy`): this predicate reads three of them.
         let guti_mapped_from_eps = req.guti_is_mapped_from_eps();
@@ -4082,6 +4109,17 @@ impl NgapServer {
         if let Some(replayed) = extract_nas_message_container(nas) {
             if let Some(inner) = parse_registration_request_pdu(&replayed) {
                 replayed_requested_nssai = inner.requested_nssai.clone();
+                // #570: the UE radio capability ID is non-cleartext (TS 24.501
+                // §4.4.6), so on an initial registration it arrives here, in the
+                // replay, and the RACS bit with it.
+                let (racs, presented) = (inner.racs_supported, inner.ue_radio_capability_id.clone());
+                self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
+                    s.amf_ue.racs_supported |= racs;
+                    if let Some(id) = presented {
+                        s.amf_ue.ue_radio_capability_id = Some(id);
+                        s.amf_ue.ue_radio_capability_id_known_to_ue = true;
+                    }
+                });
                 if let Some(replayed_caps) = inner.sec_cap {
                     let stored = self
                         .ue_auth_state
@@ -4627,10 +4665,13 @@ impl NgapServer {
             return Ok(());
         };
 
-        let Some(plain) = gmm_build::build_registration_accept(&state.amf_ue) else {
+        let Some(mut plain) = gmm_build::build_registration_accept(&state.amf_ue) else {
             self.ue_auth_state.insert(amf_ue_ngap_id, state);
             return Ok(());
         };
+        // #570: the UE radio capability ID, or its deletion indication, for a UE that
+        // set the RACS bit (TS 24.501 §5.5.1.2.4). T3550 is armed below in every case.
+        plain.extend(crate::racs::nas_ies_for(&mut state.amf_ue));
         let Some(protected) = nas_security::nas_5gs_security_encode(
             &mut state.amf_ue,
             &plain,
@@ -4740,6 +4781,13 @@ impl NgapServer {
             self.ue_auth_state.insert(amf_ue_ngap_id, state);
             return Ok(());
         };
+        // #570: IE 264 when the UE has an ID, else IE 117 when the AMF holds the UE's
+        // capability (TS 23.501 §5.4.4.1 / §5.4.4.1a).
+        let ics = crate::racs::add_capability_ies(
+            ics,
+            state.amf_ue.ue_radio_capability_id.as_deref(),
+            Some(&state.amf_ue.ue_radio_capability),
+        );
 
         state.initial_context_setup_request_sent = true;
         state.gmm_fsm.transition_to_initial_context_setup();
@@ -5245,6 +5293,8 @@ impl NgapServer {
             log::error!("Failed to build Initial Context Setup Request for the Service Request of UE {amf_ue_ngap_id}");
             return Ok(());
         };
+        let (racs_id, racs_cap) = self.racs_ies_for(amf_ue_ngap_id);
+        let ics = crate::racs::add_capability_ies(ics, racs_id.as_deref(), racs_cap.as_deref());
         self.send_to_association(association_id, &ics).await?;
         if let Some(p) = &paging {
             self.deliver_paged_after_service_request(
@@ -5525,6 +5575,196 @@ impl NgapServer {
             "Configuration Update Command sent to UE {amf_ue_ngap_id}: 5G-GUTI reallocation, \
              T3555 armed"
         );
+        Ok(())
+    }
+
+    /// #570: the UE's UE Radio Capability ID and capability, for the NGAP IEs.
+    fn racs_ies_for(&self, amf_ue_ngap_id: u64) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        self.ue_auth_state
+            .get(amf_ue_ngap_id)
+            .map(|s| {
+                (
+                    s.amf_ue.ue_radio_capability_id.clone(),
+                    Some(s.amf_ue.ue_radio_capability.clone()),
+                )
+            })
+            .unwrap_or((None, None))
+    }
+
+    /// #570: UE RADIO CAPABILITY INFO INDICATION (TS 38.413 §8.14.1).
+    ///
+    /// The capability replaces the stored one (§8.14.1.2). For a UE that set the RACS
+    /// bit and holds no usable ID, the UCMF assigns one keyed on the PEI's TAC
+    /// (TS 23.501 §5.4.4.1a, TS 29.673 §5.2.2.3); a registered UE then gets it in a
+    /// CONFIGURATION UPDATE COMMAND, an unregistered one at Registration Complete.
+    async fn handle_ue_radio_capability_info_indication(
+        &mut self,
+        association_id: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        let Some(ind) = crate::racs::decode_info_indication(data) else {
+            log::warn!(
+                "UE Radio Capability Info Indication from association {association_id} is \
+                 undecodable or lacks a mandatory IE; ignored"
+            );
+            return Ok(());
+        };
+        let Some((want_id, tac)) = self.ue_auth_state.with_mut(ind.amf_ue_ngap_id, |s| {
+            s.amf_ue.ue_radio_capability = ind.capability.clone();
+            let usable = s
+                .amf_ue
+                .ue_radio_capability_id
+                .as_deref()
+                .is_some_and(|id| !crate::racs::is_retired(id));
+            (
+                s.amf_ue.racs_supported && !usable,
+                s.amf_ue.pei.as_deref().and_then(crate::racs::tac_from_pei),
+            )
+        }) else {
+            log::warn!(
+                "UE Radio Capability Info Indication for unknown UE {}; ignored",
+                ind.amf_ue_ngap_id
+            );
+            return Ok(());
+        };
+        log::info!(
+            "UE Radio Capability Info Indication: stored {} octets for UE {}",
+            ind.capability.len(),
+            ind.amf_ue_ngap_id
+        );
+        if !want_id {
+            return Ok(());
+        }
+        let Some(tac) = tac else {
+            // TS 24.501 §5.4.4.1 c): the network may ask for the PEI. The AMF always
+            // requests the IMEISV in the Security Mode Command, so a UE without one
+            // here did not answer it; no ID is assigned rather than one keyed on
+            // nothing.
+            log::warn!(
+                "UE {} supports RACS but has no PEI, so no TAC to assign an ID under",
+                ind.amf_ue_ngap_id
+            );
+            return Ok(());
+        };
+        match crate::racs::ucmf_assign(&tac, &ind.capability).await {
+            Ok(id) => {
+                log::info!(
+                    "UCMF assigned UE radio capability ID {:02x?} to UE {} (TAC {tac})",
+                    id,
+                    ind.amf_ue_ngap_id
+                );
+                self.ue_auth_state.with_mut(ind.amf_ue_ngap_id, |s| {
+                    if s.amf_ue.ue_radio_capability_id.as_deref() != Some(id.as_slice()) {
+                        s.amf_ue.ue_radio_capability_id = Some(id);
+                        s.amf_ue.ue_radio_capability_id_known_to_ue = false;
+                    }
+                });
+                self.send_racs_configuration_update(
+                    association_id,
+                    ind.amf_ue_ngap_id,
+                    ind.ran_ue_ngap_id,
+                )
+                .await?;
+            }
+            Err(e) => log::warn!(
+                "No UE radio capability ID for UE {}: {e}",
+                ind.amf_ue_ngap_id
+            ),
+        }
+        Ok(())
+    }
+
+    /// #570: deliver a pending UE radio capability ID (or its deletion indication) in
+    /// a CONFIGURATION UPDATE COMMAND (TS 24.501 §5.4.4.2), acknowledgement requested
+    /// so T3555 supervises it. Nothing to do for a UE that is not registered yet (the
+    /// Registration Complete will call again), has nothing pending, or did not set the
+    /// RACS bit.
+    async fn send_racs_configuration_update(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+    ) -> Result<()> {
+        let plain = self
+            .ue_auth_state
+            .with_mut(amf_ue_ngap_id, |s| {
+                if !s.registered || !s.amf_ue.security_context_available {
+                    return None;
+                }
+                let ies = crate::racs::nas_ies_for(&mut s.amf_ue);
+                if ies.is_empty() {
+                    return None;
+                }
+                let param = crate::gmm_build::ConfigurationUpdateCommandParam {
+                    acknowledgement_requested: true,
+                    registration_requested: false,
+                    guti: false,
+                    ..Default::default()
+                };
+                let mut msg = gmm_build::build_configuration_update_command(&s.amf_ue, &param)?;
+                msg.extend(ies);
+                Some(msg)
+            })
+            .flatten();
+        let Some(plain) = plain else {
+            return Ok(());
+        };
+        let Some(protected) = self.protect_nas(amf_ue_ngap_id, &plain) else {
+            return Ok(());
+        };
+        let ngap_pdu = self
+            .send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
+            .await?;
+        self.arm_retx(amf_ue_ngap_id, NasProcTimer::T3555, ngap_pdu);
+        log::info!(
+            "Configuration Update Command sent to UE {amf_ue_ngap_id}: UE radio capability \
+             ID, T3555 armed"
+        );
+        Ok(())
+    }
+
+    /// #570: UE RADIO CAPABILITY ID MAPPING (TS 38.413 §8.14.3): answer with the UE
+    /// radio capability mapped to the ID, from the AMF's cache or a UCMF Resolve.
+    ///
+    /// §8.14.3.3 defines no unsuccessful outcome, so an ID nobody can resolve gets no
+    /// answer: the NG-RAN node then retrieves the capability from the UE itself.
+    async fn handle_ue_radio_capability_id_mapping(
+        &mut self,
+        association_id: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        let Some(id) = crate::racs::decode_mapping_request(data) else {
+            log::warn!(
+                "UE Radio Capability ID Mapping Request from association {association_id} \
+                 is undecodable or carries no ID; ignored"
+            );
+            return Ok(());
+        };
+        let capability = match crate::racs::cache_get(&id) {
+            Some(cap) if !crate::racs::is_retired(&id) => Some(cap),
+            _ => match crate::racs::ucmf_resolve(&id).await {
+                Ok(cap) => cap,
+                Err(e) => {
+                    log::warn!("UE radio capability ID {id:02x?} not resolved: {e}");
+                    None
+                }
+            },
+        };
+        let Some(capability) = capability else {
+            log::warn!(
+                "UE radio capability ID {id:02x?} maps to no capability; no mapping \
+                 response (TS 38.413 §8.14.3.3: no unsuccessful outcome)"
+            );
+            return Ok(());
+        };
+        if let Some(pdu) = crate::racs::build_mapping_response(&id, &capability) {
+            self.send_to_association(association_id, &pdu).await?;
+            log::info!(
+                "UE Radio Capability ID Mapping Response sent to association \
+                 {association_id}: {} octets for ID {id:02x?}",
+                capability.len()
+            );
+        }
         Ok(())
     }
 
@@ -8495,8 +8735,11 @@ impl NgapServer {
         };
 
         // #417: the GENERATED codec.
+        let (racs_id, _) = self.racs_ies_for(required.amf_ue_ngap_id);
         match crate::ngap_asn1::build_handover_request_generated(&ho_request).ok_or(()) {
             Ok(bytes) => {
+                // #570: the UE Radio Capability ID, when the UE has one (TS 38.413 §9.2.3.4).
+                let bytes = crate::racs::add_capability_ies(bytes, racs_id.as_deref(), None);
                 self.send_to_association(target_assoc, &bytes).await?;
                 log::info!(
                     "HandoverRequest forwarded to target association {target_assoc} \
@@ -10236,8 +10479,11 @@ impl NgapServer {
                 crate::ngap_asn1::build_path_switch_request_acknowledge_generated(&ack, &notify)
             })
             .flatten();
+        let (racs_id, _) = self.racs_ies_for(amf_ue_ngap_id);
         match ack_bytes {
             Some(bytes) => {
+                // #570: the UE Radio Capability ID, when the UE has one (TS 38.413 §9.2.3.9).
+                let bytes = crate::racs::add_capability_ies(bytes, racs_id.as_deref(), None);
                 self.send_to_association(association_id, &bytes).await?;
                 log::info!(
                     "PathSwitchRequestAcknowledge sent for UE {amf_ue_ngap_id} \
@@ -11769,6 +12015,12 @@ struct ParsedRegistrationRequest {
     /// write-never and the AMF could not obey §5.5.1.2.4 — which makes signalling
     /// `IWK N26` conditional on exactly this bit.
     s1_mode: bool,
+    /// RACS (#570): the 5GMM capability IE's RACS bit (octet 4 bit 8,
+    /// TS 24.501 §9.11.3.1).
+    racs_supported: bool,
+    /// RACS (#570): the UE radio capability ID IE's value octets (IEI 0x67,
+    /// TS 24.501 §9.11.3.68), a non-cleartext IE (§4.4.6).
+    ue_radio_capability_id: Option<Vec<u8>>,
     /// EPS NAS message container contents (IEI 0x70, TLV-E, TS 24.501 §9.11.3.24).
     ///
     /// #116: previously skipped. Per §5.5.1.2.2 a UE arriving from EPS puts an
@@ -12646,8 +12898,20 @@ fn parse_registration_request_pdu(nas: &[u8]) -> Option<ParsedRegistrationReques
                 }
                 let len = nas[pos + 1] as usize;
                 if pos + 2 + len <= nas.len() {
-                    req.s1_mode =
-                        nextgcore_nas::interworking::claims_s1_mode(&nas[pos + 2..pos + 2 + len]);
+                    let contents = &nas[pos + 2..pos + 2 + len];
+                    req.s1_mode = nextgcore_nas::interworking::claims_s1_mode(contents);
+                    req.racs_supported = crate::racs::gmm_capability_supports_racs(contents);
+                }
+                pos += 2 + len;
+            }
+            // UE radio capability ID (IEI 0x67, TLV, TS 24.501 §9.11.3.68), #570.
+            0x67 => {
+                if pos + 1 >= nas.len() {
+                    break;
+                }
+                let len = nas[pos + 1] as usize;
+                if len > 0 && pos + 2 + len <= nas.len() {
+                    req.ue_radio_capability_id = Some(nas[pos + 2..pos + 2 + len].to_vec());
                 }
                 pos += 2 + len;
             }
