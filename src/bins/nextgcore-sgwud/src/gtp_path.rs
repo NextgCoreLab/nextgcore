@@ -1085,6 +1085,10 @@ mod tests {
 
     #[test]
     fn test_gpdu_buffered_per_far_and_reported_once() {
+        // #635: buffers through `buffer_capacity`, which reads the variable.
+        let _buffer_env = crate::context::MAX_BUFFERED_PACKETS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let server = test_server(GTPV1_U_UDP_PORT);
         let ctx = sgwu_self();
 
@@ -1123,6 +1127,10 @@ mod tests {
 
     #[test]
     fn test_buffered_packets_drained_on_forw_transition() {
+        // #635: buffers through `buffer_capacity`, which reads the variable.
+        let _buffer_env = crate::context::MAX_BUFFERED_PACKETS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Fake eNB peer that receives the drained downlink packets
         let enb = client();
         let enb_port = enb.local_addr().unwrap().port();
@@ -1620,6 +1628,10 @@ mod tests {
     fn a_packet_dropped_because_the_buffer_is_full_is_not_billed() {
         use crate::context::{measurement_method, reporting_trigger, SgwuUrr, Volume};
         let _env = QER_ENFORCEMENT_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // #635: the variable's own lock, which every reader of it takes too.
+        let _buffer_env = crate::context::MAX_BUFFERED_PACKETS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let ctx = sgwu_self();
