@@ -5900,41 +5900,22 @@ fn handle_non_ue_n2_message_transfer(request: &SbiRequest) -> SbiResponse {
     // Validate the container really is a PWS NGAP PDU before enqueueing it. An
     // unvalidated relay would forward whatever the consumer sent to every served
     // gNB, and the gNB would answer an Error Indication the CBCF never sees.
-    // `decode_ngap_pdu` is the real APER decoder, so this also rejects a
-    // truncated or malformed PDU.
-    let decoded = match nextgcore_ngap::parser::decode_ngap_pdu(&ngap_pdu) {
-        Ok(msg) => msg,
-        Err(e) => {
-            return mandatory_ie_incorrect(
-                "pwsInfo.pwsContainer.ngapData",
-                &format!("not a decodable NGAP PDU: {e}"),
-            );
+    // Decoded with the GENERATED codec (#417), so this also rejects a
+    // truncated or malformed PDU. TS 38.413 §8.12: the AMF-initiated PWS
+    // procedures are WriteReplaceWarning (51) and PWSCancel (32); the two
+    // indications are gNB-initiated, so a consumer sending one is confused
+    // about the direction.
+    let ids = match crate::ngap_asn1::pws_request_ids_asn1(&ngap_pdu) {
+        Ok(ids) => ids,
+        Err(reason) => {
+            return mandatory_ie_incorrect("pwsInfo.pwsContainer.ngapData", &reason);
         }
     };
-    // TS 38.413 §8.12: the AMF-initiated PWS procedures are WriteReplaceWarning
-    // (51) and PWSCancel (32). The two indications are gNB-initiated, so a
-    // consumer sending one is confused about the direction.
-    let (ngap_message_type, container_mid, container_sn) = match &decoded {
-        nextgcore_ngap::NgapMessage::WriteReplaceWarningRequest(req) => (
-            nextgcore_asn1c::ngap::types::ProcedureCode::WRITE_REPLACE_WARNING.0,
-            req.message_identifier,
-            req.serial_number,
-        ),
-        nextgcore_ngap::NgapMessage::PwsCancelRequest(req) => (
-            nextgcore_asn1c::ngap::types::ProcedureCode::PWS_CANCEL.0,
-            req.message_identifier,
-            req.serial_number,
-        ),
-        other => {
-            return mandatory_ie_incorrect(
-                "pwsInfo.pwsContainer.ngapData",
-                &format!(
-                    "expected a WRITE-REPLACE WARNING REQUEST (procedure 51) or PWS CANCEL \
-                     REQUEST (procedure 32); got {other:?}"
-                ),
-            );
-        }
-    };
+    let (ngap_message_type, container_mid, container_sn) = (
+        ids.procedure_code,
+        ids.message_identifier,
+        ids.serial_number,
+    );
 
     // The JSON identifiers and the ones inside the container must agree: they are
     // what the CBCF will match the response against (§5.2.2.4.1.3 step 2a), and a
@@ -6135,7 +6116,7 @@ fn handle_non_ue_n2_message_transfer(request: &SbiRequest) -> SbiResponse {
     // semantics exist to avoid. A TAI the AMF does not serve can never match a
     // served node, so it is an unknown TAI under any reading, and it IS knowable
     // here.
-    if ngap_message_type == nextgcore_asn1c::ngap::types::ProcedureCode::PWS_CANCEL.0 {
+    if ngap_message_type == nextgcore_ngap_gen::generated::ID_PWS_CANCEL {
         let unknown: Vec<Value> = {
             let Ok(guard) = ctx.read() else {
                 return send_error(

@@ -2944,33 +2944,67 @@ pub fn build_paging_generated(msg: &Paging) -> Option<Vec<u8>> {
     }
 }
 
-/// The raw value of the protocol IE `id` in an NGAP PDU of any procedure.
-///
-/// Walks the decoded `ProtocolIE-Container` rather than the procedure's typed
-/// form, so it works for every UE-associated message -- including procedures the
-/// AMF does not handle, which is exactly when the Error Indication path needs the
-/// IDs (#447). `None` when the PDU does not decode or carries no such IE.
-fn find_protocol_ie_value(data: &[u8], id: nextgcore_asn1c::ngap::ProtocolIeId) -> Option<Vec<u8>> {
-    use nextgcore_asn1c::ngap::pdu::NgapPdu;
-    use nextgcore_asn1c::per::{AperDecode, AperDecoder};
-
-    let pdu = match NgapPdu::decode_aper(&mut AperDecoder::new(data)) {
-        Ok(pdu) => pdu,
-        Err(e) => {
-            log::debug!("NGAP PDU undecodable while looking for IE {}: {e:?}", id.0);
-            return None;
-        }
-    };
-    pdu.protocol_ies().find(id).map(|ie| ie.value.clone())
+/// An APER length determinant (X.691 §11.9.3.6-§11.9.3.7) at `pos`: one octet
+/// below 128, two octets `10xxxxxx` below 16384. A fragmented length
+/// (`11xxxxxx`, §11.9.3.8) is `None`: no UE NGAP ID lookup needs one.
+fn aper_length(data: &[u8], pos: usize) -> Option<(usize, usize)> {
+    let first = *data.get(pos)?;
+    match first >> 6 {
+        0b00 | 0b01 => Some((usize::from(first), pos + 1)),
+        0b10 => Some((
+            (usize::from(first & 0x3f) << 8) | usize::from(*data.get(pos + 1)?),
+            pos + 2,
+        )),
+        _ => None,
+    }
 }
 
-/// Extract the AMF-UE-NGAP-ID (IE 10) from any UE-associated NGAP PDU.
-pub fn extract_amf_ue_ngap_id(data: &[u8]) -> Option<u64> {
-    use nextgcore_asn1c::ngap::{AmfUeNgapId, ProtocolIeId};
-    use nextgcore_asn1c::per::{AperDecode, AperDecoder};
+/// The raw value of protocol IE `id` in an NGAP PDU of ANY procedure,
+/// including procedures this AMF does not implement and the generated codec
+/// therefore cannot decode (#447: those are exactly when the Error Indication
+/// path needs the UE IDs).
+///
+/// A framing-only walk, decoding no IE content (X.691 APER, TS 38.413 §9.4):
+/// - NGAP-PDU CHOICE: extension bit + 2-bit index, padded to the octet;
+/// - procedureCode INTEGER (0..255): one aligned octet;
+/// - criticality ENUMERATED (3 values): 2 bits, padded;
+/// - value: an open type, a length determinant then that many octets;
+/// - inside, the message SEQUENCE: extension bit, padded, then the
+///   ProtocolIE-Container count, SIZE (0..65535), as two aligned octets;
+/// - each ProtocolIE-Field: id INTEGER (0..65535) as two octets, criticality
+///   2 bits padded, then its value as an open type.
+///
+/// `None` when the framing does not parse or the IE is absent.
+fn find_protocol_ie_value(data: &[u8], id: u16) -> Option<Vec<u8>> {
+    // Octet 0: CHOICE; octet 1: procedureCode; octet 2: criticality.
+    if data.len() < 3 || data[0] & 0x80 != 0 {
+        log::debug!("NGAP PDU framing not recognised while looking for IE {id}");
+        return None;
+    }
+    let (value_len, value_start) = aper_length(data, 3)?;
+    let value = data.get(value_start..value_start.checked_add(value_len)?)?;
+    // value[0]: the message SEQUENCE's extension bit + padding.
+    let count = usize::from(u16::from_be_bytes([*value.get(1)?, *value.get(2)?]));
+    let mut pos = 3;
+    for _ in 0..count {
+        let ie_id = u16::from_be_bytes([*value.get(pos)?, *value.get(pos + 1)?]);
+        // pos + 2: the IE criticality octet.
+        let (len, start) = aper_length(value, pos + 3)?;
+        let end = start.checked_add(len)?;
+        let ie_value = value.get(start..end)?;
+        if ie_id == id {
+            return Some(ie_value.to_vec());
+        }
+        pos = end;
+    }
+    None
+}
 
-    let value = find_protocol_ie_value(data, ProtocolIeId::AMF_UE_NGAP_ID)?;
-    AmfUeNgapId::decode_aper(&mut AperDecoder::new(&value))
+/// Extract the AMF-UE-NGAP-ID (IE 10) from any UE-associated NGAP PDU,
+/// decoding the IE value with the GENERATED codec (#417).
+pub fn extract_amf_ue_ngap_id(data: &[u8]) -> Option<u64> {
+    let value = find_protocol_ie_value(data, ngap_gen::ID_AMF_UE_NGAP_ID)?;
+    nextgcore_ngap_gen::decode_contained::<ngap_gen::AMF_UE_NGAP_ID>(&value)
         .ok()
         .map(|id| id.0)
 }
@@ -3038,13 +3072,11 @@ pub fn extract_mbs_session_id(data: &[u8]) -> Option<crate::ngap_mcast::Tmgi> {
     crate::ngap_mcast::tmgi_from_generated(&id)
 }
 
-/// Extract the RAN-UE-NGAP-ID (IE 85) from any UE-associated NGAP PDU.
+/// Extract the RAN-UE-NGAP-ID (IE 85) from any UE-associated NGAP PDU,
+/// decoding the IE value with the GENERATED codec (#417).
 pub fn extract_ran_ue_ngap_id(data: &[u8]) -> Option<u32> {
-    use nextgcore_asn1c::ngap::{ProtocolIeId, RanUeNgapId};
-    use nextgcore_asn1c::per::{AperDecode, AperDecoder};
-
-    let value = find_protocol_ie_value(data, ProtocolIeId::RAN_UE_NGAP_ID)?;
-    RanUeNgapId::decode_aper(&mut AperDecoder::new(&value))
+    let value = find_protocol_ie_value(data, ngap_gen::ID_RAN_UE_NGAP_ID)?;
+    nextgcore_ngap_gen::decode_contained::<ngap_gen::RAN_UE_NGAP_ID>(&value)
         .ok()
         .map(|id| id.0)
 }
@@ -5351,6 +5383,626 @@ pub fn build_ran_configuration_update_failure_generated(
         }
     }
 }
+/// Decode a successful outcome with unknown-IE skipping; the counterpart of
+/// [`decode_initiating`] for response messages.
+fn decode_successful<E>(
+    data: &[u8],
+    message: &str,
+    pick: impl FnOnce(ngap_gen::SuccessfulOutcomeValue) -> Option<Vec<E>>,
+) -> Option<(u8, Vec<E>, Vec<IeDiagnostic>, Vec<IeDiagnostic>)> {
+    let (pdu, unknown) = match nextgcore_ngap_gen::decode_with_unknown_ies(data) {
+        Ok(decoded) => decoded,
+        Err(e) => {
+            log::warn!("Failed to decode {message}: {e:?}");
+            return None;
+        }
+    };
+    let ngap_gen::NGAP_PDU::SuccessfulOutcome(msg) = pdu else {
+        log::warn!("Expected {message}");
+        return None;
+    };
+    let criticality = msg.criticality.0;
+    let Some(ies) = pick(msg.value) else {
+        log::warn!("Expected {message}");
+        return None;
+    };
+    let (reject, notify) = classify_unknown_ies(&unknown, message)?;
+    Some((criticality, ies, reject, notify))
+}
+
+/// A 16-bit MessageIdentifier / SerialNumber BIT STRING (TS 38.413 §9.3.1.35,
+/// §9.3.1.36) as its value; `None` when it is not exactly 16 bits.
+fn bit_string_u16(bits: &bitvec::prelude::BitSlice<u8, bitvec::prelude::Msb0>) -> Option<u16> {
+    (bits.len() == 16).then(|| bits_value(bits) as u16)
+}
+
+/// The AMF-initiated PWS request a CBCF hands the AMF to relay (TS 29.518
+/// §5.2.2.4.1.3): its procedure code and the (messageIdentifier,
+/// serialNumber) pair inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PwsRequestIds {
+    /// WRITE-REPLACE WARNING (51) or PWS CANCEL (32).
+    pub procedure_code: u8,
+    /// Message Identifier (TS 38.413 §9.3.1.35).
+    pub message_identifier: u16,
+    /// Serial Number (TS 38.413 §9.3.1.36).
+    pub serial_number: u16,
+}
+
+/// Validate a CBCF-supplied PWS container with the GENERATED codec (#417) and
+/// lift its identifiers. `Err` names why it is not a WRITE-REPLACE WARNING
+/// REQUEST or PWS CANCEL REQUEST: undecodable, another message, or a
+/// mandatory identifier missing (both are criticality reject, §9.2.8.1/§9.2.8.3).
+pub fn pws_request_ids_asn1(data: &[u8]) -> Result<PwsRequestIds, String> {
+    let pdu =
+        nextgcore_ngap_gen::decode(data).map_err(|e| format!("not a decodable NGAP PDU: {e:?}"))?;
+    let ngap_gen::NGAP_PDU::InitiatingMessage(msg) = pdu else {
+        return Err("not an initiating message".to_string());
+    };
+    let (procedure_code, mid, sn) = match msg.value {
+        ngap_gen::InitiatingMessageValue::Id_WriteReplaceWarning(req) => {
+            use ngap_gen::WriteReplaceWarningRequestProtocolIEs_EntryValue as Ie;
+            let (mut mid, mut sn) = (None, None);
+            for e in req.protocol_i_es.0 {
+                match e.value {
+                    Ie::Id_MessageIdentifier(v) => mid = bit_string_u16(&v.0),
+                    Ie::Id_SerialNumber(v) => sn = bit_string_u16(&v.0),
+                    _ => {}
+                }
+            }
+            (ngap_gen::ID_WRITE_REPLACE_WARNING, mid, sn)
+        }
+        ngap_gen::InitiatingMessageValue::Id_PWSCancel(req) => {
+            use ngap_gen::PWSCancelRequestProtocolIEs_EntryValue as Ie;
+            let (mut mid, mut sn) = (None, None);
+            for e in req.protocol_i_es.0 {
+                match e.value {
+                    Ie::Id_MessageIdentifier(v) => mid = bit_string_u16(&v.0),
+                    Ie::Id_SerialNumber(v) => sn = bit_string_u16(&v.0),
+                    _ => {}
+                }
+            }
+            (ngap_gen::ID_PWS_CANCEL, mid, sn)
+        }
+        _ => {
+            return Err(format!(
+                "expected a WRITE-REPLACE WARNING REQUEST (procedure 51) or PWS CANCEL REQUEST \
+                 (procedure 32); got procedure {}",
+                msg.procedure_code.0
+            ))
+        }
+    };
+    match (mid, sn) {
+        (Some(message_identifier), Some(serial_number)) => Ok(PwsRequestIds {
+            procedure_code,
+            message_identifier,
+            serial_number,
+        }),
+        _ => Err("Message Identifier or Serial Number missing".to_string()),
+    }
+}
+
+/// A WRITE-REPLACE WARNING RESPONSE or PWS CANCEL RESPONSE (TS 38.413
+/// §9.2.8.2, §9.2.8.4) as the AMF relays it: the identifiers it is matched by
+/// and whether the gNB reported an area list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PwsResponse {
+    /// Message Identifier.
+    pub message_identifier: u16,
+    /// Serial Number.
+    pub serial_number: u16,
+    /// Broadcast Completed / Cancelled Area List present.
+    pub has_area_list: bool,
+}
+
+/// Decode a PWS response with the GENERATED codec (#417), applying
+/// §10.3.4.2/§10.3.5 for a response: a "reject" IE or a missing identifier
+/// (both criticality reject) is local error handling, a "notify" IE comes back
+/// for the caller to report.
+pub fn decode_pws_response_asn1(data: &[u8]) -> NasTransportDecode<PwsResponse> {
+    enum Ies {
+        Wrw(Vec<ngap_gen::WriteReplaceWarningResponseProtocolIEs_Entry>),
+        Cancel(Vec<ngap_gen::PWSCancelResponseProtocolIEs_Entry>),
+    }
+    let Some((criticality, ies, mut reject, notify)) =
+        decode_successful(data, "PWS response", |v| match v {
+            ngap_gen::SuccessfulOutcomeValue::Id_WriteReplaceWarning(m) => {
+                Some(vec![Ies::Wrw(m.protocol_i_es.0)])
+            }
+            ngap_gen::SuccessfulOutcomeValue::Id_PWSCancel(m) => {
+                Some(vec![Ies::Cancel(m.protocol_i_es.0)])
+            }
+            _ => None,
+        })
+    else {
+        return NasTransportDecode::Undecodable;
+    };
+    let (mut mid, mut sn, mut area, mut procedure_code) = (None, None, false, 0);
+    for group in ies {
+        match group {
+            Ies::Wrw(entries) => {
+                use ngap_gen::WriteReplaceWarningResponseProtocolIEs_EntryValue as Ie;
+                procedure_code = ngap_gen::ID_WRITE_REPLACE_WARNING;
+                for e in entries {
+                    match e.value {
+                        Ie::Id_MessageIdentifier(v) => mid = bit_string_u16(&v.0),
+                        Ie::Id_SerialNumber(v) => sn = bit_string_u16(&v.0),
+                        Ie::Id_BroadcastCompletedAreaList(_) => area = true,
+                        Ie::Id_CriticalityDiagnostics(_) => {}
+                    }
+                }
+            }
+            Ies::Cancel(entries) => {
+                use ngap_gen::PWSCancelResponseProtocolIEs_EntryValue as Ie;
+                procedure_code = ngap_gen::ID_PWS_CANCEL;
+                for e in entries {
+                    match e.value {
+                        Ie::Id_MessageIdentifier(v) => mid = bit_string_u16(&v.0),
+                        Ie::Id_SerialNumber(v) => sn = bit_string_u16(&v.0),
+                        Ie::Id_BroadcastCancelledAreaList(_) => area = true,
+                        Ie::Id_CriticalityDiagnostics(_) => {}
+                    }
+                }
+            }
+        }
+    }
+    if mid.is_none() {
+        reject.push(missing_ie(ngap_gen::ID_MESSAGE_IDENTIFIER));
+    }
+    if sn.is_none() {
+        reject.push(missing_ie(ngap_gen::ID_SERIAL_NUMBER));
+    }
+    let report = |cause_protocol, diagnostics| {
+        handover_report(
+            procedure_code,
+            ngap_gen::TriggeringMessage::SUCCESSFUL_OUTCOME,
+            criticality,
+            (None, None),
+            cause_protocol,
+            diagnostics,
+        )
+    };
+    let (Some(message_identifier), Some(serial_number), true) = (mid, sn, reject.is_empty()) else {
+        return NasTransportDecode::Reject(report(
+            ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
+            reject,
+        ));
+    };
+    NasTransportDecode::Proceed {
+        message: PwsResponse {
+            message_identifier,
+            serial_number,
+            has_area_list: area,
+        },
+        error_indication: (!notify.is_empty()).then(|| {
+            report(
+                ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+                notify,
+            )
+        }),
+    }
+}
+
+/// A PWS RESTART INDICATION or PWS FAILURE INDICATION (TS 38.413 §9.2.8.5,
+/// §9.2.8.6) as the AMF relays it.
+#[derive(Debug, Clone)]
+pub struct PwsIndication {
+    /// True for a restart indication, false for a failure indication.
+    pub restart: bool,
+    /// The reporting node (mandatory, criticality reject, in both).
+    pub global_ran_node_id: GlobalRanNodeId,
+    /// TAIs available for reload (restart only).
+    pub tai_count: usize,
+    /// Emergency area IDs available for reload (restart only).
+    pub emergency_area_count: usize,
+}
+
+/// Decode a PWS indication with the GENERATED codec (#417), applying
+/// §10.3.4.2/§10.3.5 for a procedure with no response.
+pub fn decode_pws_indication_asn1(data: &[u8]) -> NasTransportDecode<PwsIndication> {
+    enum Ies {
+        Restart(Vec<ngap_gen::PWSRestartIndicationProtocolIEs_Entry>),
+        Failure(Vec<ngap_gen::PWSFailureIndicationProtocolIEs_Entry>),
+    }
+    let Some((criticality, ies, mut reject, notify)) =
+        decode_initiating(data, "PWS indication", |v| match v {
+            ngap_gen::InitiatingMessageValue::Id_PWSRestartIndication(m) => {
+                Some(vec![Ies::Restart(m.protocol_i_es.0)])
+            }
+            ngap_gen::InitiatingMessageValue::Id_PWSFailureIndication(m) => {
+                Some(vec![Ies::Failure(m.protocol_i_es.0)])
+            }
+            _ => None,
+        })
+    else {
+        return NasTransportDecode::Undecodable;
+    };
+    let (mut node, mut restart, mut tais, mut areas, mut procedure_code) = (None, false, 0, 0, 0);
+    // Restart: Cell ID List for Restart and TAI List for Restart are mandatory
+    // (§9.2.8.5); Failure: PWS Failed Cell ID List is (§9.2.8.6). All reject.
+    let (mut cells, mut tai_list, mut failed_cells) = (false, false, false);
+    for group in ies {
+        match group {
+            Ies::Restart(entries) => {
+                use ngap_gen::PWSRestartIndicationProtocolIEs_EntryValue as Ie;
+                restart = true;
+                procedure_code = ngap_gen::ID_PWS_RESTART_INDICATION;
+                for e in entries {
+                    match e.value {
+                        Ie::Id_GlobalRANNodeID(v) => node = hand_written_global_ran_node_id(&v),
+                        Ie::Id_TAIListForRestart(v) => {
+                            tais = v.0.len();
+                            tai_list = true;
+                        }
+                        Ie::Id_EmergencyAreaIDListForRestart(v) => areas = v.0.len(),
+                        Ie::Id_CellIDListForRestart(_) => cells = true,
+                    }
+                }
+            }
+            Ies::Failure(entries) => {
+                use ngap_gen::PWSFailureIndicationProtocolIEs_EntryValue as Ie;
+                procedure_code = ngap_gen::ID_PWS_FAILURE_INDICATION;
+                for e in entries {
+                    match e.value {
+                        Ie::Id_GlobalRANNodeID(v) => node = hand_written_global_ran_node_id(&v),
+                        Ie::Id_PWSFailedCellIDList(_) => failed_cells = true,
+                    }
+                }
+            }
+        }
+    }
+    if node.is_none() {
+        reject.push(missing_ie(ngap_gen::ID_GLOBAL_RAN_NODE_ID));
+    }
+    if restart && !cells {
+        reject.push(missing_ie(ngap_gen::ID_CELL_ID_LIST_FOR_RESTART));
+    }
+    if restart && !tai_list {
+        reject.push(missing_ie(ngap_gen::ID_TAI_LIST_FOR_RESTART));
+    }
+    if !restart && !failed_cells {
+        reject.push(missing_ie(ngap_gen::ID_PWS_FAILED_CELL_ID_LIST));
+    }
+    let report = |cause_protocol, diagnostics| {
+        handover_report(
+            procedure_code,
+            ngap_gen::TriggeringMessage::INITIATING_MESSAGE,
+            criticality,
+            (None, None),
+            cause_protocol,
+            diagnostics,
+        )
+    };
+    let (Some(global_ran_node_id), true) = (node, reject.is_empty()) else {
+        return NasTransportDecode::Reject(report(
+            ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
+            reject,
+        ));
+    };
+    NasTransportDecode::Proceed {
+        message: PwsIndication {
+            restart,
+            global_ran_node_id,
+            tai_count: tais,
+            emergency_area_count: areas,
+        },
+        error_indication: (!notify.is_empty()).then(|| {
+            report(
+                ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+                notify,
+            )
+        }),
+    }
+}
+
+/// An uplink NRPPa transport (TS 38.413 §9.2.9.2 UE-associated, §9.2.9.4
+/// non-UE-associated) as the AMF relays it to the LMF.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UplinkNrppa {
+    /// AMF UE NGAP ID (UE-associated only).
+    pub amf_ue_ngap_id: Option<u64>,
+    /// RAN UE NGAP ID (UE-associated only).
+    pub ran_ue_ngap_id: Option<u32>,
+    /// The LMF's opaque Routing ID.
+    pub routing_id: Vec<u8>,
+    /// The opaque NRPPa PDU.
+    pub nrppa_pdu: Vec<u8>,
+}
+
+/// Decode an uplink NRPPa transport with the GENERATED codec (#417). Every IE
+/// is criticality reject (§9.2.9.2, §9.2.9.4) and the procedures have no
+/// response, so a missing one, or a not-comprehended "reject" IE, terminates
+/// the procedure with an Error Indication (§10.3.4.2, §10.3.5).
+pub fn decode_uplink_nrppa_transport_asn1(
+    data: &[u8],
+    ue_associated: bool,
+) -> NasTransportDecode<UplinkNrppa> {
+    let mut out = UplinkNrppa {
+        amf_ue_ngap_id: None,
+        ran_ue_ngap_id: None,
+        routing_id: Vec::new(),
+        nrppa_pdu: Vec::new(),
+    };
+    let (mut routing, mut nrppa) = (false, false);
+    let (criticality, mut reject, notify, procedure_code) = if ue_associated {
+        use ngap_gen::UplinkUEAssociatedNRPPaTransportProtocolIEs_EntryValue as Ie;
+        let Some((c, ies, r, n)) =
+            decode_initiating(data, "Uplink UE-associated NRPPa Transport", |v| match v {
+                ngap_gen::InitiatingMessageValue::Id_UplinkUEAssociatedNRPPaTransport(m) => {
+                    Some(m.protocol_i_es.0)
+                }
+                _ => None,
+            })
+        else {
+            return NasTransportDecode::Undecodable;
+        };
+        for e in ies {
+            match e.value {
+                Ie::Id_AMF_UE_NGAP_ID(v) => out.amf_ue_ngap_id = Some(v.0),
+                Ie::Id_RAN_UE_NGAP_ID(v) => out.ran_ue_ngap_id = Some(v.0),
+                Ie::Id_RoutingID(v) => {
+                    out.routing_id = v.0;
+                    routing = true;
+                }
+                Ie::Id_NRPPa_PDU(v) => {
+                    out.nrppa_pdu = v.0;
+                    nrppa = true;
+                }
+            }
+        }
+        (c, r, n, ngap_gen::ID_UPLINK_UE_ASSOCIATED_NRP_PA_TRANSPORT)
+    } else {
+        use ngap_gen::UplinkNonUEAssociatedNRPPaTransportProtocolIEs_EntryValue as Ie;
+        let Some((c, ies, r, n)) = decode_initiating(
+            data,
+            "Uplink non-UE-associated NRPPa Transport",
+            |v| match v {
+                ngap_gen::InitiatingMessageValue::Id_UplinkNonUEAssociatedNRPPaTransport(m) => {
+                    Some(m.protocol_i_es.0)
+                }
+                _ => None,
+            },
+        ) else {
+            return NasTransportDecode::Undecodable;
+        };
+        for e in ies {
+            match e.value {
+                Ie::Id_RoutingID(v) => {
+                    out.routing_id = v.0;
+                    routing = true;
+                }
+                Ie::Id_NRPPa_PDU(v) => {
+                    out.nrppa_pdu = v.0;
+                    nrppa = true;
+                }
+            }
+        }
+        (
+            c,
+            r,
+            n,
+            ngap_gen::ID_UPLINK_NON_UE_ASSOCIATED_NRP_PA_TRANSPORT,
+        )
+    };
+    if ue_associated && out.amf_ue_ngap_id.is_none() {
+        reject.push(missing_ie(ngap_gen::ID_AMF_UE_NGAP_ID));
+    }
+    if ue_associated && out.ran_ue_ngap_id.is_none() {
+        reject.push(missing_ie(ngap_gen::ID_RAN_UE_NGAP_ID));
+    }
+    if !routing {
+        reject.push(missing_ie(ngap_gen::ID_ROUTING_ID));
+    }
+    if !nrppa {
+        reject.push(missing_ie(ngap_gen::ID_NRP_PA_PDU));
+    }
+    let ids = (out.amf_ue_ngap_id, out.ran_ue_ngap_id);
+    let report = |cause_protocol, diagnostics| {
+        handover_report(
+            procedure_code,
+            ngap_gen::TriggeringMessage::INITIATING_MESSAGE,
+            criticality,
+            ids,
+            cause_protocol,
+            diagnostics,
+        )
+    };
+    if !reject.is_empty() {
+        return NasTransportDecode::Reject(report(
+            ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
+            reject,
+        ));
+    }
+    NasTransportDecode::Proceed {
+        error_indication: (!notify.is_empty()).then(|| {
+            report(
+                ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+                notify,
+            )
+        }),
+        message: out,
+    }
+}
+
+/// Build a DOWNLINK UE-ASSOCIATED NRPPA TRANSPORT (TS 38.413 §9.2.9.1,
+/// procedure 8) with the GENERATED codec (#417). Every IE is criticality reject.
+pub fn build_downlink_ue_nrppa_transport_asn1(
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+    routing_id: &[u8],
+    nrppa_pdu: &[u8],
+) -> Option<Vec<u8>> {
+    use ngap_gen::{
+        DownlinkUEAssociatedNRPPaTransportProtocolIEs_Entry as Entry,
+        DownlinkUEAssociatedNRPPaTransportProtocolIEs_EntryValue as Ie, ProtocolIE_ID,
+    };
+    let reject = || ngap_gen::Criticality(ngap_gen::Criticality::REJECT);
+    let entry = |id, value| Entry {
+        id: ProtocolIE_ID(id),
+        criticality: reject(),
+        value,
+    };
+    let ies = vec![
+        entry(
+            ngap_gen::ID_AMF_UE_NGAP_ID,
+            Ie::Id_AMF_UE_NGAP_ID(ngap_gen::AMF_UE_NGAP_ID(amf_ue_ngap_id)),
+        ),
+        entry(
+            ngap_gen::ID_RAN_UE_NGAP_ID,
+            Ie::Id_RAN_UE_NGAP_ID(ngap_gen::RAN_UE_NGAP_ID(ran_ue_ngap_id)),
+        ),
+        entry(
+            ngap_gen::ID_ROUTING_ID,
+            Ie::Id_RoutingID(ngap_gen::RoutingID(routing_id.to_vec())),
+        ),
+        entry(
+            ngap_gen::ID_NRP_PA_PDU,
+            Ie::Id_NRPPa_PDU(ngap_gen::NRPPa_PDU(nrppa_pdu.to_vec())),
+        ),
+    ];
+    let pdu = ngap_gen::NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+        procedure_code: ngap_gen::ProcedureCode(
+            ngap_gen::ID_DOWNLINK_UE_ASSOCIATED_NRP_PA_TRANSPORT,
+        ),
+        criticality: ngap_gen::Criticality(ngap_gen::Criticality::IGNORE),
+        value: ngap_gen::InitiatingMessageValue::Id_DownlinkUEAssociatedNRPPaTransport(
+            ngap_gen::DownlinkUEAssociatedNRPPaTransport {
+                protocol_i_es: ngap_gen::DownlinkUEAssociatedNRPPaTransportProtocolIEs(ies),
+            },
+        ),
+    });
+    nextgcore_ngap_gen::encode(&pdu)
+        .map_err(|e| {
+            log::error!("Failed to encode a Downlink UE-associated NRPPa Transport: {e:?}")
+        })
+        .ok()
+}
+
+/// Build a DOWNLINK NON UE-ASSOCIATED NRPPA TRANSPORT (TS 38.413 §9.2.9.3,
+/// procedure 5) with the GENERATED codec (#417). Both IEs are criticality reject.
+pub fn build_downlink_non_ue_nrppa_transport_asn1(
+    routing_id: &[u8],
+    nrppa_pdu: &[u8],
+) -> Option<Vec<u8>> {
+    use ngap_gen::{
+        DownlinkNonUEAssociatedNRPPaTransportProtocolIEs_Entry as Entry,
+        DownlinkNonUEAssociatedNRPPaTransportProtocolIEs_EntryValue as Ie, ProtocolIE_ID,
+    };
+    let reject = || ngap_gen::Criticality(ngap_gen::Criticality::REJECT);
+    let ies = vec![
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_ROUTING_ID),
+            criticality: reject(),
+            value: Ie::Id_RoutingID(ngap_gen::RoutingID(routing_id.to_vec())),
+        },
+        Entry {
+            id: ProtocolIE_ID(ngap_gen::ID_NRP_PA_PDU),
+            criticality: reject(),
+            value: Ie::Id_NRPPa_PDU(ngap_gen::NRPPa_PDU(nrppa_pdu.to_vec())),
+        },
+    ];
+    let pdu = ngap_gen::NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+        procedure_code: ngap_gen::ProcedureCode(
+            ngap_gen::ID_DOWNLINK_NON_UE_ASSOCIATED_NRP_PA_TRANSPORT,
+        ),
+        criticality: ngap_gen::Criticality(ngap_gen::Criticality::IGNORE),
+        value: ngap_gen::InitiatingMessageValue::Id_DownlinkNonUEAssociatedNRPPaTransport(
+            ngap_gen::DownlinkNonUEAssociatedNRPPaTransport {
+                protocol_i_es: ngap_gen::DownlinkNonUEAssociatedNRPPaTransportProtocolIEs(ies),
+            },
+        ),
+    });
+    nextgcore_ngap_gen::encode(&pdu)
+        .map_err(|e| {
+            log::error!("Failed to encode a Downlink non-UE-associated NRPPa Transport: {e:?}")
+        })
+        .ok()
+}
+
+/// Decode a PDU SESSION RESOURCE NOTIFY (TS 38.413 §9.2.1.16) with the
+/// GENERATED codec (#417), applying §10.3.4.2/§10.3.5 for a procedure with no
+/// response: both UE NGAP IDs are criticality reject; the two lists and User
+/// Location Information are criticality reject / ignore per the IE table, and
+/// an absent list is simply empty.
+pub fn decode_pdu_session_resource_notify_asn1(
+    data: &[u8],
+) -> NasTransportDecode<PduSessionResourceNotify> {
+    use ngap_gen::PDUSessionResourceNotifyProtocolIEs_EntryValue as Ie;
+    let Some((criticality, ies, mut reject, notify)) =
+        decode_initiating(data, "PDU Session Resource Notify", |v| match v {
+            ngap_gen::InitiatingMessageValue::Id_PDUSessionResourceNotify(m) => {
+                Some(m.protocol_i_es.0)
+            }
+            _ => None,
+        })
+    else {
+        return NasTransportDecode::Undecodable;
+    };
+    let (mut amf, mut ran, mut notify_list, mut released_list) =
+        (None, None, Vec::new(), Vec::new());
+    for e in ies {
+        match e.value {
+            Ie::Id_AMF_UE_NGAP_ID(v) => amf = Some(v.0),
+            Ie::Id_RAN_UE_NGAP_ID(v) => ran = Some(v.0),
+            Ie::Id_PDUSessionResourceNotifyList(v) => {
+                notify_list =
+                    v.0.into_iter()
+                        .map(|i| PduSessionResourceNotifyItem {
+                            pdu_session_id: i.pdu_session_id.0,
+                            transfer: i.pdu_session_resource_notify_transfer.0,
+                        })
+                        .collect();
+            }
+            Ie::Id_PDUSessionResourceReleasedListNot(v) => {
+                released_list =
+                    v.0.into_iter()
+                        .map(|i| PduSessionResourceReleasedItem {
+                            pdu_session_id: i.pdu_session_id.0,
+                            transfer: i.pdu_session_resource_notify_released_transfer.0,
+                        })
+                        .collect();
+            }
+            Ie::Id_UserLocationInformation(_) => {}
+        }
+    }
+    if amf.is_none() {
+        reject.push(missing_ie(ngap_gen::ID_AMF_UE_NGAP_ID));
+    }
+    if ran.is_none() {
+        reject.push(missing_ie(ngap_gen::ID_RAN_UE_NGAP_ID));
+    }
+    let report = |cause_protocol, diagnostics| {
+        handover_report(
+            ngap_gen::ID_PDU_SESSION_RESOURCE_NOTIFY,
+            ngap_gen::TriggeringMessage::INITIATING_MESSAGE,
+            criticality,
+            (amf, ran),
+            cause_protocol,
+            diagnostics,
+        )
+    };
+    let (Some(amf_ue_ngap_id), Some(ran_ue_ngap_id), true) = (amf, ran, reject.is_empty()) else {
+        return NasTransportDecode::Reject(report(
+            ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT,
+            reject,
+        ));
+    };
+    NasTransportDecode::Proceed {
+        message: PduSessionResourceNotify {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            notify_list,
+            released_list,
+        },
+        error_indication: (!notify.is_empty()).then(|| {
+            report(
+                ngap_gen::CauseProtocol::ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY,
+                notify,
+            )
+        }),
+    }
+}
+
 /// Decode an initiating message with unknown-IE skipping: its procedure
 /// criticality, its IE entries (extracted by `pick`), and its not-comprehended
 /// IEs sorted into `(reject, notify)`. `None` when it does not decode or is not
@@ -14705,5 +15357,350 @@ mod error_indication_tests {
         }
         let ack = build_ran_configuration_update_acknowledge_generated(&[]).expect("ack");
         assert_eq!(decode_error_indication_asn1(&ack), None);
+    }
+}
+
+/// #417: the last production NGAP paths moved off the hand-written codec --
+/// PWS, uplink NRPPa, PDU Session Resource Notify and the any-procedure UE ID
+/// lookup. Byte vectors are derived by hand from X.691 APER and TS 38.413 §9.
+#[cfg(test)]
+pub(crate) mod generated_remnant_tests {
+    use super::*;
+    use bitvec::prelude::*;
+
+    /// UPLINK UE-ASSOCIATED NRPPA TRANSPORT (procedure 50 = `0x32`, §9.2.9.2):
+    /// `00` initiatingMessage, `32`, `40` ignore, `1F` length; `00` extension
+    /// bit, `00 04` four IEs; AMF-UE-NGAP-ID 42, RAN-UE-NGAP-ID 7, RoutingID
+    /// `00 01`, NRPPa-PDU `AA BB CC DD`, each `id 00 len value`.
+    const UL_UE: [u8; 35] = [
+        0x00, 0x32, 0x40, 0x1F, 0x00, 0x00, 0x04, 0x00, 0x0A, 0x00, 0x02, 0x00, 0x2A, 0x00, 0x55,
+        0x00, 0x02, 0x00, 0x07, 0x00, 0x59, 0x00, 0x03, 0x02, 0x00, 0x01, 0x00, 0x2E, 0x00, 0x05,
+        0x04, 0xAA, 0xBB, 0xCC, 0xDD,
+    ];
+
+    /// The same PDU without its RoutingID IE (three IEs, value length 24).
+    const UL_UE_NO_ROUTING: [u8; 28] = [
+        0x00, 0x32, 0x40, 0x18, 0x00, 0x00, 0x03, 0x00, 0x0A, 0x00, 0x02, 0x00, 0x2A, 0x00, 0x55,
+        0x00, 0x02, 0x00, 0x07, 0x00, 0x2E, 0x00, 0x05, 0x04, 0xAA, 0xBB, 0xCC, 0xDD,
+    ];
+
+    /// PDU SESSION RESOURCE NOTIFY (procedure 30 = `0x1E`, §9.2.1.16): UE IDs
+    /// 42/7 and a one-item Notify List (IE 66): count `00`, item bits `00`
+    /// (extension, iE-Extensions absent), PDU Session ID `05`, transfer
+    /// `02 AB CD`.
+    const NOTIFY: [u8; 29] = [
+        0x00, 0x1E, 0x40, 0x19, 0x00, 0x00, 0x03, 0x00, 0x0A, 0x00, 0x02, 0x00, 0x2A, 0x00, 0x55,
+        0x00, 0x02, 0x00, 0x07, 0x00, 0x42, 0x00, 0x06, 0x00, 0x00, 0x05, 0x02, 0xAB, 0xCD,
+    ];
+
+    /// WRITE-REPLACE WARNING RESPONSE (successfulOutcome `20`, procedure 51 =
+    /// `0x33`, criticality reject `00`, §9.2.8.2): Message Identifier `12 34`
+    /// (IE 35) and Serial Number `56 78` (IE 95), each a fixed 16-bit BIT
+    /// STRING (two octets, no length).
+    const WRW_RESPONSE: [u8; 19] = [
+        0x20, 0x33, 0x00, 0x0F, 0x00, 0x00, 0x02, 0x00, 0x23, 0x00, 0x02, 0x12, 0x34, 0x00, 0x5F,
+        0x00, 0x02, 0x56, 0x78,
+    ];
+
+    /// A WRITE-REPLACE WARNING RESPONSE carrying a one-cell NR Broadcast
+    /// Completed Area List, derived by hand: IE 13 (criticality ignore `40`,
+    /// length 12) = CHOICE index 3 (cellIDBroadcastNR) in 3 bits, padded
+    /// (`60`; NGAP CHOICEs carry no extension bit), count-1 `00 00` (SIZE
+    /// 1..65535), item and NR-CGI extension/optional bits `00`, PLMN, then the
+    /// 36-bit NR Cell Identity left-aligned in 5 octets.
+    ///
+    /// The hand-written builder wrote the CHOICE with an extension bit (`30`),
+    /// and its parser read it the same way, so a conformant gNB's response
+    /// with an area list was undecodable on main.
+    pub(crate) fn wrw_response_with_nr_cell(
+        mid: u16,
+        sn: u16,
+        plmn: [u8; 3],
+        cell: u64,
+    ) -> Vec<u8> {
+        let c = (cell & 0xF_FFFF_FFFF) << 4;
+        let mut v = vec![
+            0x20, 0x33, 0x00, 0x1F, 0x00, 0x00, 0x03, 0x00, 0x23, 0x00, 0x02,
+        ];
+        v.extend_from_slice(&mid.to_be_bytes());
+        v.extend_from_slice(&[0x00, 0x5F, 0x00, 0x02]);
+        v.extend_from_slice(&sn.to_be_bytes());
+        v.extend_from_slice(&[0x00, 0x0D, 0x40, 0x0C, 0x60, 0x00, 0x00, 0x00]);
+        v.extend_from_slice(&plmn);
+        v.extend_from_slice(&c.to_be_bytes()[3..8]);
+        v
+    }
+
+    #[test]
+    fn a_conformant_nr_completed_area_list_decodes() {
+        let pdu = wrw_response_with_nr_cell(0x1112, 0x3031, [0x00, 0xF1, 0x10], 0x399);
+        let NasTransportDecode::Proceed { message, .. } = decode_pws_response_asn1(&pdu) else {
+            panic!("a conformant response must decode");
+        };
+        assert!(message.has_area_list);
+        assert_eq!(
+            (message.message_identifier, message.serial_number),
+            (0x1112, 0x3031)
+        );
+    }
+
+    #[test]
+    fn the_ue_ids_are_found_in_any_procedure() {
+        assert_eq!(extract_amf_ue_ngap_id(&UL_UE), Some(42));
+        assert_eq!(extract_ran_ue_ngap_id(&UL_UE), Some(7));
+        // A procedure code the schema does not define: the framing walk still
+        // finds the IDs, which is the #447 case.
+        let mut unknown = UL_UE;
+        unknown[1] = 0xF0;
+        assert!(nextgcore_ngap_gen::decode(&unknown).is_err());
+        assert_eq!(extract_amf_ue_ngap_id(&unknown), Some(42));
+        assert_eq!(extract_ran_ue_ngap_id(&unknown), Some(7));
+        // Truncation and a non-UE-associated message yield nothing.
+        for n in 0..UL_UE.len() - 4 {
+            assert_eq!(extract_ran_ue_ngap_id(&UL_UE[..n]), None, "prefix {n}");
+        }
+        assert_eq!(extract_amf_ue_ngap_id(&WRW_RESPONSE), None);
+    }
+
+    #[test]
+    fn an_uplink_ue_nrppa_transport_decodes_its_routing_id_and_pdu() {
+        let NasTransportDecode::Proceed {
+            message,
+            error_indication: None,
+        } = decode_uplink_nrppa_transport_asn1(&UL_UE, true)
+        else {
+            panic!("expected Proceed");
+        };
+        assert_eq!(message.amf_ue_ngap_id, Some(42));
+        assert_eq!(message.ran_ue_ngap_id, Some(7));
+        assert_eq!(message.routing_id, vec![0x00, 0x01]);
+        assert_eq!(message.nrppa_pdu, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    #[test]
+    fn an_uplink_nrppa_transport_without_its_routing_id_is_rejected() {
+        let NasTransportDecode::Reject(report) =
+            decode_uplink_nrppa_transport_asn1(&UL_UE_NO_ROUTING, true)
+        else {
+            panic!("expected Reject");
+        };
+        assert_eq!(report.amf_ue_ngap_id, Some(42));
+        assert_eq!(
+            report.procedure.procedure_code,
+            ngap_gen::ID_UPLINK_UE_ASSOCIATED_NRP_PA_TRANSPORT
+        );
+        assert_eq!(
+            report
+                .diagnostics
+                .iter()
+                .map(|d| d.ie_id)
+                .collect::<Vec<_>>(),
+            vec![ngap_gen::ID_ROUTING_ID]
+        );
+    }
+
+    #[test]
+    fn a_pdu_session_resource_notify_decodes_its_lists() {
+        let NasTransportDecode::Proceed {
+            message,
+            error_indication: None,
+        } = decode_pdu_session_resource_notify_asn1(&NOTIFY)
+        else {
+            panic!("expected Proceed");
+        };
+        assert_eq!((message.amf_ue_ngap_id, message.ran_ue_ngap_id), (42, 7));
+        assert_eq!(message.notify_list.len(), 1);
+        assert_eq!(message.notify_list[0].pdu_session_id, 5);
+        assert_eq!(message.notify_list[0].transfer, vec![0xAB, 0xCD]);
+        assert!(message.released_list.is_empty());
+        // Without the AMF UE NGAP ID (criticality reject) it is rejected:
+        // two IEs, value length 19.
+        let missing = [
+            0x00, 0x1E, 0x40, 0x13, 0x00, 0x00, 0x02, 0x00, 0x55, 0x00, 0x02, 0x00, 0x07, 0x00,
+            0x42, 0x00, 0x06, 0x00, 0x00, 0x05, 0x02, 0xAB, 0xCD,
+        ];
+        let NasTransportDecode::Reject(report) = decode_pdu_session_resource_notify_asn1(&missing)
+        else {
+            panic!("expected Reject");
+        };
+        assert_eq!(
+            report
+                .diagnostics
+                .iter()
+                .map(|d| d.ie_id)
+                .collect::<Vec<_>>(),
+            vec![ngap_gen::ID_AMF_UE_NGAP_ID]
+        );
+        assert!(matches!(
+            decode_pdu_session_resource_notify_asn1(&UL_UE),
+            NasTransportDecode::Undecodable
+        ));
+    }
+
+    #[test]
+    fn a_write_replace_warning_response_yields_its_identifiers() {
+        let NasTransportDecode::Proceed {
+            message,
+            error_indication: None,
+        } = decode_pws_response_asn1(&WRW_RESPONSE)
+        else {
+            panic!("expected Proceed");
+        };
+        assert_eq!(
+            message,
+            PwsResponse {
+                message_identifier: 0x1234,
+                serial_number: 0x5678,
+                has_area_list: false
+            }
+        );
+        // The Serial Number dropped: count 1, value length 9.
+        let missing = [
+            0x20, 0x33, 0x00, 0x09, 0x00, 0x00, 0x01, 0x00, 0x23, 0x00, 0x02, 0x12, 0x34,
+        ];
+        let NasTransportDecode::Reject(report) = decode_pws_response_asn1(&missing) else {
+            panic!("expected Reject");
+        };
+        assert_eq!(
+            report
+                .diagnostics
+                .iter()
+                .map(|d| d.ie_id)
+                .collect::<Vec<_>>(),
+            vec![ngap_gen::ID_SERIAL_NUMBER]
+        );
+    }
+
+    fn bits16(v: u16) -> BitVec<u8, Msb0> {
+        BitVec::from_vec(v.to_be_bytes().to_vec())
+    }
+
+    #[test]
+    fn a_cbcf_pws_container_is_validated_and_its_identifiers_lifted() {
+        use ngap_gen::WriteReplaceWarningRequestProtocolIEs_EntryValue as Ie;
+        let entry = |id, value| ngap_gen::WriteReplaceWarningRequestProtocolIEs_Entry {
+            id: ngap_gen::ProtocolIE_ID(id),
+            criticality: ngap_gen::Criticality(ngap_gen::Criticality::REJECT),
+            value,
+        };
+        let pdu = ngap_gen::NGAP_PDU::InitiatingMessage(ngap_gen::InitiatingMessage {
+            procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_WRITE_REPLACE_WARNING),
+            criticality: ngap_gen::Criticality(ngap_gen::Criticality::REJECT),
+            value: ngap_gen::InitiatingMessageValue::Id_WriteReplaceWarning(
+                ngap_gen::WriteReplaceWarningRequest {
+                    protocol_i_es: ngap_gen::WriteReplaceWarningRequestProtocolIEs(vec![
+                        entry(
+                            ngap_gen::ID_MESSAGE_IDENTIFIER,
+                            Ie::Id_MessageIdentifier(ngap_gen::MessageIdentifier(bits16(0x1112))),
+                        ),
+                        entry(
+                            ngap_gen::ID_SERIAL_NUMBER,
+                            Ie::Id_SerialNumber(ngap_gen::SerialNumber(bits16(0x3031))),
+                        ),
+                    ]),
+                },
+            ),
+        });
+        let bytes = nextgcore_ngap_gen::encode(&pdu).expect("encode");
+        assert_eq!(
+            pws_request_ids_asn1(&bytes),
+            Ok(PwsRequestIds {
+                procedure_code: ngap_gen::ID_WRITE_REPLACE_WARNING,
+                message_identifier: 0x1112,
+                serial_number: 0x3031,
+            })
+        );
+        assert!(
+            pws_request_ids_asn1(&UL_UE).is_err(),
+            "an NRPPa transport is not a PWS request"
+        );
+        assert!(
+            pws_request_ids_asn1(&bytes[..bytes.len() - 1]).is_err(),
+            "truncated"
+        );
+    }
+
+    fn pws_failure_indication(with_cells: bool) -> Vec<u8> {
+        use ngap_gen::PWSFailureIndicationProtocolIEs_EntryValue as Ie;
+        let entry = |id, value| ngap_gen::PWSFailureIndicationProtocolIEs_Entry {
+            id: ngap_gen::ProtocolIE_ID(id),
+            criticality: ngap_gen::Criticality(ngap_gen::Criticality::REJECT),
+            value,
+        };
+        let mut gnb = BitVec::<u8, Msb0>::new();
+        for i in 0..22 {
+            gnb.push(i == 21);
+        }
+        let mut ies = vec![entry(
+            ngap_gen::ID_GLOBAL_RAN_NODE_ID,
+            Ie::Id_GlobalRANNodeID(ngap_gen::GlobalRANNodeID::GlobalGNB_ID(
+                ngap_gen::GlobalGNB_ID {
+                    plmn_identity: ngap_gen::PLMNIdentity(vec![0x99, 0xF9, 0x07]),
+                    gnb_id: ngap_gen::GNB_ID::GNB_ID(ngap_gen::GNB_ID_gNB_ID(gnb)),
+                    ie_extensions: None,
+                },
+            )),
+        )];
+        if with_cells {
+            let mut cell = BitVec::<u8, Msb0>::new();
+            for _ in 0..36 {
+                cell.push(false);
+            }
+            ies.push(entry(
+                ngap_gen::ID_PWS_FAILED_CELL_ID_LIST,
+                Ie::Id_PWSFailedCellIDList(ngap_gen::PWSFailedCellIDList::NR_CGI_PWSFailedList(
+                    ngap_gen::NR_CGIList(vec![ngap_gen::NR_CGI {
+                        plmn_identity: ngap_gen::PLMNIdentity(vec![0x99, 0xF9, 0x07]),
+                        nr_cell_identity: ngap_gen::NRCellIdentity(cell),
+                        ie_extensions: None,
+                    }]),
+                )),
+            ));
+        }
+        nextgcore_ngap_gen::encode(&ngap_gen::NGAP_PDU::InitiatingMessage(
+            ngap_gen::InitiatingMessage {
+                procedure_code: ngap_gen::ProcedureCode(ngap_gen::ID_PWS_FAILURE_INDICATION),
+                criticality: ngap_gen::Criticality(ngap_gen::Criticality::IGNORE),
+                value: ngap_gen::InitiatingMessageValue::Id_PWSFailureIndication(
+                    ngap_gen::PWSFailureIndication {
+                        protocol_i_es: ngap_gen::PWSFailureIndicationProtocolIEs(ies),
+                    },
+                ),
+            },
+        ))
+        .expect("encode")
+    }
+
+    #[test]
+    fn a_pws_failure_indication_names_its_node_and_needs_its_cell_list() {
+        let NasTransportDecode::Proceed {
+            message,
+            error_indication: None,
+        } = decode_pws_indication_asn1(&pws_failure_indication(true))
+        else {
+            panic!("expected Proceed");
+        };
+        assert!(!message.restart);
+        assert_eq!(
+            message.global_ran_node_id,
+            GlobalRanNodeId::GlobalGnbId {
+                plmn_identity: [0x99, 0xF9, 0x07],
+                gnb_id: 1,
+                gnb_id_len: 22
+            }
+        );
+        let NasTransportDecode::Reject(report) =
+            decode_pws_indication_asn1(&pws_failure_indication(false))
+        else {
+            panic!("expected Reject");
+        };
+        assert_eq!(
+            report
+                .diagnostics
+                .iter()
+                .map(|d| d.ie_id)
+                .collect::<Vec<_>>(),
+            vec![ngap_gen::ID_PWS_FAILED_CELL_ID_LIST]
+        );
     }
 }

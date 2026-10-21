@@ -6799,38 +6799,46 @@ impl NgapServer {
         procedure_code: Option<u16>,
         data: &[u8],
     ) -> Result<()> {
-        use nextgcore_ngap::{parser::decode_ngap_pdu, NgapMessage};
-
         // Decoded so the identifiers can be lifted into `pwsInfo` and so the
         // presence of the area list is known (it drives `bcEmptyAreaList`). The
         // PDU itself is still forwarded verbatim — this is a read, not a
-        // re-encode.
-        let (message_identifier, serial_number, has_area_list) = match decode_ngap_pdu(data) {
-            Ok(NgapMessage::WriteReplaceWarningResponse(resp)) => (
-                resp.message_identifier,
-                resp.serial_number,
-                resp.broadcast_completed_area_list.is_some(),
-            ),
-            Ok(NgapMessage::PwsCancelResponse(resp)) => (
-                resp.message_identifier,
-                resp.serial_number,
-                resp.broadcast_cancelled_area_list.is_some(),
-            ),
-            Ok(other) => {
+        // re-encode. A response is a class-1 outcome: a "reject" IE or a
+        // missing identifier is local error handling, a "notify" IE is reported
+        // in an Error Indication (TS 38.413 §10.3.4.2).
+        let resp = match crate::ngap_asn1::decode_pws_response_asn1(data) {
+            crate::ngap_asn1::NasTransportDecode::Proceed {
+                message,
+                error_indication,
+            } => {
+                if let Some(report) = error_indication {
+                    if let Some(ei) =
+                        crate::ngap_asn1::build_criticality_error_indication_asn1(&report)
+                    {
+                        self.send_to_association(association_id, &ei).await?;
+                    }
+                }
+                message
+            }
+            crate::ngap_asn1::NasTransportDecode::Reject(report) => {
                 log::warn!(
-                    "Expected a PWS response for procedure {procedure_code:?} from association \
-                     {association_id}, got {other:?}; dropped"
+                    "PWS response (procedure {procedure_code:?}) from association \
+                     {association_id} rejected, dropped: {report:?}"
                 );
                 return Ok(());
             }
-            Err(e) => {
+            crate::ngap_asn1::NasTransportDecode::Undecodable => {
                 log::warn!(
                     "PWS response (procedure {procedure_code:?}) from association \
-                     {association_id} undecodable, dropped: {e}"
+                     {association_id} undecodable, dropped"
                 );
                 return Ok(());
             }
         };
+        let (message_identifier, serial_number, has_area_list) = (
+            resp.message_identifier,
+            resp.serial_number,
+            resp.has_area_list,
+        );
 
         let (request, subscription) = {
             let ctx = crate::context::amf_self();
@@ -6941,40 +6949,56 @@ impl NgapServer {
         procedure_code: Option<u16>,
         data: &[u8],
     ) -> Result<()> {
-        use nextgcore_ngap::{parser::decode_ngap_pdu, NgapMessage};
-
-        let global_ran_node_id = match decode_ngap_pdu(data) {
-            Ok(NgapMessage::PwsRestartIndication(ind)) => {
-                log::info!(
-                    "PWS RESTART INDICATION from association {association_id}: {} TAI(s), {} \
-                     emergency area ID(s) available for reload (TS 38.413 §8.12.3)",
-                    ind.tai_list_for_restart.len(),
-                    ind.emergency_area_id_list_for_restart.len(),
-                );
-                ind.global_ran_node_id
+        // A class-2 procedure with no response: a "reject" IE or a missing Global
+        // RAN Node ID terminates it with an Error Indication, a "notify" IE is
+        // reported in one (TS 38.413 §10.3.4.2, §10.3.5).
+        let ind = match crate::ngap_asn1::decode_pws_indication_asn1(data) {
+            crate::ngap_asn1::NasTransportDecode::Proceed {
+                message,
+                error_indication,
+            } => {
+                if let Some(report) = error_indication {
+                    if let Some(ei) =
+                        crate::ngap_asn1::build_criticality_error_indication_asn1(&report)
+                    {
+                        self.send_to_association(association_id, &ei).await?;
+                    }
+                }
+                message
             }
-            Ok(NgapMessage::PwsFailureIndication(ind)) => {
-                log::warn!(
-                    "PWS FAILURE INDICATION from association {association_id}: PWS operation \
-                     failed for cells (TS 38.413 §8.12.4)"
-                );
-                ind.global_ran_node_id
-            }
-            Ok(other) => {
-                log::warn!(
-                    "Expected a PWS indication for procedure {procedure_code:?} from association \
-                     {association_id}, got {other:?}; dropped"
-                );
-                return Ok(());
-            }
-            Err(e) => {
+            crate::ngap_asn1::NasTransportDecode::Reject(report) => {
                 log::warn!(
                     "PWS indication (procedure {procedure_code:?}) from association \
-                     {association_id} undecodable, dropped: {e}"
+                     {association_id} rejected: {report:?}"
+                );
+                if let Some(ei) = crate::ngap_asn1::build_criticality_error_indication_asn1(&report)
+                {
+                    self.send_to_association(association_id, &ei).await?;
+                }
+                return Ok(());
+            }
+            crate::ngap_asn1::NasTransportDecode::Undecodable => {
+                log::warn!(
+                    "PWS indication (procedure {procedure_code:?}) from association \
+                     {association_id} undecodable, dropped"
                 );
                 return Ok(());
             }
         };
+        if ind.restart {
+            log::info!(
+                "PWS RESTART INDICATION from association {association_id}: {} TAI(s), {} \
+                 emergency area ID(s) available for reload (TS 38.413 §8.12.3)",
+                ind.tai_count,
+                ind.emergency_area_count,
+            );
+        } else {
+            log::warn!(
+                "PWS FAILURE INDICATION from association {association_id}: PWS operation \
+                 failed for cells (TS 38.413 §8.12.4)"
+            );
+        }
+        let global_ran_node_id = ind.global_ran_node_id;
 
         // No `nfId` filter: there is no originating transfer to have named one, so
         // any PWS-RF/PWS subscriber is a legitimate recipient of a node-raised
@@ -7177,23 +7201,39 @@ impl NgapServer {
         association_id: u64,
         data: &[u8],
     ) -> Result<()> {
-        use nextgcore_asn1c::ngap::pdu::{parse_ue_associated_nrppa_transport, NgapPdu};
-        use nextgcore_asn1c::per::{AperDecode, AperDecoder};
-
-        let mut decoder = AperDecoder::new(data);
-        let ul = match NgapPdu::decode_aper(&mut decoder)
-            .and_then(|pdu| parse_ue_associated_nrppa_transport(&pdu))
-        {
-            Ok(ul) => ul,
-            Err(e) => {
+        let ul = match crate::ngap_asn1::decode_uplink_nrppa_transport_asn1(data, true) {
+            crate::ngap_asn1::NasTransportDecode::Proceed {
+                message,
+                error_indication,
+            } => {
+                if let Some(report) = error_indication {
+                    if let Some(ei) =
+                        crate::ngap_asn1::build_criticality_error_indication_asn1(&report)
+                    {
+                        self.send_to_association(association_id, &ei).await?;
+                    }
+                }
+                message
+            }
+            crate::ngap_asn1::NasTransportDecode::Reject(report) => {
+                log::warn!("Uplink UE-associated NRPPa transport from association {association_id} rejected: {report:?}");
+                if let Some(ei) = crate::ngap_asn1::build_criticality_error_indication_asn1(&report)
+                {
+                    self.send_to_association(association_id, &ei).await?;
+                }
+                return Ok(());
+            }
+            crate::ngap_asn1::NasTransportDecode::Undecodable => {
                 log::warn!(
                     "Uplink UE-associated NRPPa transport from association \
-                     {association_id} undecodable, dropped: {e}"
+                     {association_id} undecodable, dropped"
                 );
                 return Ok(());
             }
         };
-        let amf_ue_ngap_id = ul.amf_ue_ngap_id.0;
+        let Some(amf_ue_ngap_id) = ul.amf_ue_ngap_id else {
+            return Ok(());
+        };
 
         // Resolve the UE's ueContextId (SUPI) — the key of the N1N2
         // subscription registry (TS 29.518 Section 6.1.3.2.2): the NGAP
@@ -7244,14 +7284,14 @@ impl NgapServer {
         // The RoutingID is the opaque LMF identity echo (seeded from
         // nrppaInfo.nfId on the downlink leg); recover it as nfId when it is
         // printable, never fabricate one.
-        let nf_id = String::from_utf8(ul.routing_id.0.clone())
+        let nf_id = String::from_utf8(ul.routing_id.clone())
             .ok()
             .filter(|s| !s.is_empty());
 
         log::info!(
             "LCS: relaying uplink UE-associated NRPPa ({} B, amf_ue_ngap_id \
              {amf_ue_ngap_id}) to LMF callback {callback_uri} (sub={})",
-            ul.nrppa_pdu.0.len(),
+            ul.nrppa_pdu.len(),
             sub.subscription_id
         );
         crate::namf_server::send_n2_info_notify(
@@ -7259,7 +7299,7 @@ impl NgapServer {
             sub.subscription_id,
             lcs_correlation_id,
             nf_id,
-            ul.nrppa_pdu.0,
+            ul.nrppa_pdu,
         );
         Ok(())
     }
@@ -7280,18 +7320,32 @@ impl NgapServer {
         association_id: u64,
         data: &[u8],
     ) -> Result<()> {
-        use nextgcore_asn1c::ngap::pdu::{parse_non_ue_associated_nrppa_transport, NgapPdu};
-        use nextgcore_asn1c::per::{AperDecode, AperDecoder};
-
-        let mut decoder = AperDecoder::new(data);
-        let ul = match NgapPdu::decode_aper(&mut decoder)
-            .and_then(|pdu| parse_non_ue_associated_nrppa_transport(&pdu))
-        {
-            Ok(ul) => ul,
-            Err(e) => {
+        let ul = match crate::ngap_asn1::decode_uplink_nrppa_transport_asn1(data, false) {
+            crate::ngap_asn1::NasTransportDecode::Proceed {
+                message,
+                error_indication,
+            } => {
+                if let Some(report) = error_indication {
+                    if let Some(ei) =
+                        crate::ngap_asn1::build_criticality_error_indication_asn1(&report)
+                    {
+                        self.send_to_association(association_id, &ei).await?;
+                    }
+                }
+                message
+            }
+            crate::ngap_asn1::NasTransportDecode::Reject(report) => {
+                log::warn!("Uplink non-UE-associated NRPPa transport from association {association_id} rejected: {report:?}");
+                if let Some(ei) = crate::ngap_asn1::build_criticality_error_indication_asn1(&report)
+                {
+                    self.send_to_association(association_id, &ei).await?;
+                }
+                return Ok(());
+            }
+            crate::ngap_asn1::NasTransportDecode::Undecodable => {
                 log::warn!(
                     "Uplink non-UE-associated NRPPa transport from association \
-                     {association_id} undecodable, dropped: {e}"
+                     {association_id} undecodable, dropped"
                 );
                 return Ok(());
             }
@@ -7315,14 +7369,14 @@ impl NgapServer {
         };
         let sub = sub.expect("callback_uri implies subscription");
 
-        let nf_id = String::from_utf8(ul.routing_id.0.clone())
+        let nf_id = String::from_utf8(ul.routing_id.clone())
             .ok()
             .filter(|s| !s.is_empty());
 
         log::info!(
             "LCS: relaying uplink non-UE-associated NRPPa ({} B) to LMF \
              callback {callback_uri} (sub={})",
-            ul.nrppa_pdu.0.len(),
+            ul.nrppa_pdu.len(),
             sub.subscription_id
         );
         crate::namf_server::send_n2_info_notify(
@@ -7330,7 +7384,7 @@ impl NgapServer {
             sub.subscription_id,
             sub.lcs_correlation_id,
             nf_id,
-            ul.nrppa_pdu.0,
+            ul.nrppa_pdu,
         );
         Ok(())
     }
@@ -11160,16 +11214,34 @@ impl NgapServer {
         association_id: u64,
         data: &[u8],
     ) -> Result<()> {
-        let notify = match nextgcore_ngap::parser::decode_ngap_pdu(data) {
-            Ok(nextgcore_ngap::NgapMessage::PduSessionResourceNotify(n)) => n,
-            Ok(other) => {
-                log::warn!("Expected PduSessionResourceNotify, got {other:?}");
+        // A class-2 procedure with no response (TS 38.413 §10.3.4.2, §10.3.5).
+        let notify = match crate::ngap_asn1::decode_pdu_session_resource_notify_asn1(data) {
+            crate::ngap_asn1::NasTransportDecode::Proceed {
+                message,
+                error_indication,
+            } => {
+                if let Some(report) = error_indication {
+                    if let Some(ei) =
+                        crate::ngap_asn1::build_criticality_error_indication_asn1(&report)
+                    {
+                        self.send_to_association(association_id, &ei).await?;
+                    }
+                }
+                message
+            }
+            crate::ngap_asn1::NasTransportDecode::Reject(report) => {
+                log::warn!(
+                    "PDU Session Resource Notify from association {association_id} rejected: {report:?}"
+                );
+                if let Some(ei) = crate::ngap_asn1::build_criticality_error_indication_asn1(&report)
+                {
+                    self.send_to_association(association_id, &ei).await?;
+                }
                 return Ok(());
             }
-            Err(e) => {
+            crate::ngap_asn1::NasTransportDecode::Undecodable => {
                 log::warn!(
-                    "Failed to decode PDU Session Resource Notify from association \
-                     {association_id}: {e:?}"
+                    "Failed to decode PDU Session Resource Notify from association {association_id}"
                 );
                 return Ok(());
             }
@@ -16122,22 +16194,12 @@ mod tests {
 
         // A conformant response as the gNB would build it, with a real completed
         // area list.
-        let pdu = nextgcore_ngap::builder::build_write_replace_warning_response(
-            &nextgcore_ngap::types::WriteReplaceWarningResponse {
-                message_identifier: mid,
-                serial_number: sn,
-                broadcast_completed_area_list: Some(
-                    nextgcore_ngap::types::BroadcastCompletedAreaList::CellIdNr(vec![
-                        nextgcore_ngap::types::NrCgi {
-                            plmn_identity: [0x00, 0xF1, 0x10],
-                            nr_cell_identity: 0x399,
-                        },
-                    ]),
-                ),
-                criticality_diagnostics: None,
-            },
-        )
-        .expect("build WRITE-REPLACE WARNING RESPONSE");
+        let pdu = crate::ngap_asn1::generated_remnant_tests::wrw_response_with_nr_cell(
+            mid,
+            sn,
+            [0x00, 0xF1, 0x10],
+            0x399,
+        );
         // Byte 0 is the PDU-type CHOICE index and byte 1 the procedure code. A
         // response is a SuccessfulOutcome (0x20) of procedure 51
         // (`38413-j30.txt:59115`) -- the pair the new dispatch arm keys on.
