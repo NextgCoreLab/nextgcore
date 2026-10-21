@@ -523,7 +523,7 @@ pub fn build_e_rab_setup_request(
     bearer: &MmeBearer,
     nas_pdu: &[u8],
 ) -> S1apResult<Vec<u8>> {
-    builder::build_erab_setup_request(&ErabSetupRequest {
+    crate::s1ap_gen::build_erab_setup_request(&ErabSetupRequest {
         mme_ue_s1ap_id: enb_ue.mme_ue_s1ap_id,
         enb_ue_s1ap_id: enb_ue.enb_ue_s1ap_id,
         ue_ambr: None,
@@ -535,6 +535,7 @@ pub fn build_e_rab_setup_request(
             nas_pdu: Some(nas_pdu.to_vec()),
         }],
     })
+    .map_err(gen_err)
 }
 
 /// Build E-RAB Modify Request for a bearer
@@ -543,7 +544,7 @@ pub fn build_e_rab_modify_request(
     bearer: &MmeBearer,
     nas_pdu: &[u8],
 ) -> S1apResult<Vec<u8>> {
-    builder::build_erab_modify_request(&ErabModifyRequest {
+    crate::s1ap_gen::build_erab_modify_request(&ErabModifyRequest {
         mme_ue_s1ap_id: enb_ue.mme_ue_s1ap_id,
         enb_ue_s1ap_id: enb_ue.enb_ue_s1ap_id,
         ue_ambr: None,
@@ -553,6 +554,7 @@ pub fn build_e_rab_modify_request(
             nas_pdu: nas_pdu.to_vec(),
         }],
     })
+    .map_err(gen_err)
 }
 
 /// Build E-RAB Release Command for a bearer
@@ -563,7 +565,7 @@ pub fn build_e_rab_release_command(
     cause_value: i64,
     nas_pdu: Option<&[u8]>,
 ) -> S1apResult<Vec<u8>> {
-    builder::build_erab_release_command(&ErabReleaseCommand {
+    crate::s1ap_gen::build_erab_release_command(&ErabReleaseCommand {
         mme_ue_s1ap_id: enb_ue.mme_ue_s1ap_id,
         enb_ue_s1ap_id: enb_ue.enb_ue_s1ap_id,
         ue_ambr: None,
@@ -573,6 +575,7 @@ pub fn build_e_rab_release_command(
         }],
         nas_pdu: nas_pdu.map(|pdu| pdu.to_vec()),
     })
+    .map_err(gen_err)
 }
 
 // ============================================================================
