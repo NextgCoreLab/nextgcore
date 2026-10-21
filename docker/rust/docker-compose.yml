@@ -492,6 +492,22 @@ services:
       nrf:
         condition: service_healthy
 
+  ucmf:
+    image: nextgcore-rust/ucmf:latest
+    container_name: nextgcore-ucmf
+    <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+    command: ["--sbi-addr", "172.23.0.39", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
+    volumes:
+      - ./configs/5gc/ucmf.yaml:/etc/nextgcore/ucmf.yaml:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.39
+    depends_on:
+      nrf:
+        condition: service_healthy
+
   pin:
     image: nextgcore-rust/pin:latest
     container_name: nextgcore-pin

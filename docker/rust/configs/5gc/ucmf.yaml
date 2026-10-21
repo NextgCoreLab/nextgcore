@@ -1,0 +1,21 @@
+# UCMF (UE radio Capability Management Function) Configuration
+# TS 23.501 5.4.4.1a (RACS), TS 29.673 Nucmf_UECapabilityManagement,
+# TS 29.675 Nucmf_Provisioning.
+logger:
+  level: info
+
+ucmf:
+  nrf:
+    uri: http://172.23.0.10:7777
+  # TS 23.003 29.2 Version ID of the PLMN-assigned UE Radio Capability IDs this
+  # UCMF assigns (two hex digits). Changing it makes every older PLMN-assigned
+  # ID resolve as OUT_DATED_VERSION_ID_IN_RAC_ID and is notified to subscribers.
+  version_id: "01"
+  # TS 23.501 5.4.4.1a mode of operation: B (RAN sends the TS 38.331 format
+  # only; the only mode allowed when RACS is used in 5GS alone) or A.
+  mode: B
+  # Delete PLMN-assigned IDs under older Version IDs at startup.
+  purge_outdated_ids: false
+  # Durable dictionary/subscriptions/provisionings. Absent = memory only, like
+  # the other NFs in this compose (the container has no writable state volume).
+  # state_file: /var/lib/nextgcore/ucmf.json

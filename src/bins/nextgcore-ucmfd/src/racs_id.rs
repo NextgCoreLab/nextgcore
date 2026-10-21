@@ -52,10 +52,16 @@ pub enum RacsId {
 pub enum RacsIdError {
     NotBase64,
     WrongIei(u8),
-    LengthMismatch { declared: usize, actual: usize },
+    LengthMismatch {
+        declared: usize,
+        actual: usize,
+    },
     /// Type Field 2..F are spare (TS 23.003 §29.2).
     SpareTypeField(u8),
-    WrongLength { type_field: u8, digits: usize },
+    WrongLength {
+        type_field: u8,
+        digits: usize,
+    },
     NotHexDigit(char),
     RciOutOfRange(u64),
 }
@@ -66,11 +72,17 @@ impl fmt::Display for RacsIdError {
             Self::NotBase64 => write!(f, "not base64"),
             Self::WrongIei(i) => write!(f, "IEI 0x{i:02X} is not 0x67 (UE radio capability ID)"),
             Self::LengthMismatch { declared, actual } => {
-                write!(f, "IE length octet says {declared}, {actual} value octets present")
+                write!(
+                    f,
+                    "IE length octet says {declared}, {actual} value octets present"
+                )
             }
             Self::SpareTypeField(t) => write!(f, "Type Field {t:X} is a spare value"),
             Self::WrongLength { type_field, digits } => {
-                write!(f, "Type Field {type_field} needs a fixed length, got {digits} digits")
+                write!(
+                    f,
+                    "Type Field {type_field} needs a fixed length, got {digits} digits"
+                )
             }
             Self::NotHexDigit(c) => write!(f, "'{c}' is not a hexadecimal digit"),
             Self::RciOutOfRange(r) => write!(f, "RCI {r:#x} does not fit 11 hex digits"),
@@ -90,14 +102,14 @@ impl RacsId {
     }
 
     /// The TS 23.003 §29.2 digits, as nibble values 0..=15.
-    pub fn digits(&self) -> Vec<u8> {
+    pub fn digits(self) -> Vec<u8> {
         let mut d = Vec::with_capacity(MANUFACTURER_ASSIGNED_DIGITS);
         let push = |d: &mut Vec<u8>, value: u64, width: usize| {
             for i in (0..width).rev() {
                 d.push(((value >> (4 * i)) & 0xF) as u8);
             }
         };
-        match *self {
+        match self {
             Self::ManufacturerAssigned { vendor_id, rci } => {
                 d.push(0);
                 push(&mut d, u64::from(vendor_id), VENDOR_ID_DIGITS);
@@ -116,7 +128,11 @@ impl RacsId {
     pub fn from_digit_str(s: &str) -> Result<Self, RacsIdError> {
         let digits = s
             .chars()
-            .map(|c| c.to_digit(16).map(|v| v as u8).ok_or(RacsIdError::NotHexDigit(c)))
+            .map(|c| {
+                c.to_digit(16)
+                    .map(|v| v as u8)
+                    .ok_or(RacsIdError::NotHexDigit(c))
+            })
             .collect::<Result<Vec<u8>, _>>()?;
         Self::from_digits(&digits)
     }
@@ -145,7 +161,7 @@ impl RacsId {
     }
 
     /// TS 24.501 §9.11.3.68 value octets (what NGAP/S1AP carry).
-    pub fn to_value_octets(&self) -> Vec<u8> {
+    pub fn to_value_octets(self) -> Vec<u8> {
         self.digits()
             .chunks(2)
             .map(|p| p[0] | (p.get(1).copied().unwrap_or(0xF) << 4))
@@ -161,7 +177,7 @@ impl RacsId {
     }
 
     /// TS 29.571 `Bytes` form: base64 of the whole NAS IE (`67 LL value`).
-    pub fn to_nucmf(&self) -> String {
+    pub fn to_nucmf(self) -> String {
         let value = self.to_value_octets();
         let mut ie = Vec::with_capacity(value.len() + 2);
         ie.push(UE_RADIO_CAPABILITY_ID_IEI);
@@ -193,7 +209,7 @@ impl RacsId {
         }
     }
 
-    pub fn is_plmn_assigned(&self) -> bool {
+    pub fn is_plmn_assigned(self) -> bool {
         matches!(self, Self::PlmnAssigned { .. })
     }
 }
@@ -221,7 +237,10 @@ mod tests {
     fn plmn_assigned_id_matches_hand_derived_bytes() {
         let id = RacsId::plmn_assigned(0x05, 1).unwrap();
         assert_eq!(id.to_string(), "10500000000001");
-        assert_eq!(id.to_value_octets(), [0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x10]);
+        assert_eq!(
+            id.to_value_octets(),
+            [0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x10]
+        );
         assert_eq!(id.to_nucmf(), "ZwcBBQAAAAAQ");
         assert_eq!(RacsId::from_nucmf("ZwcBBQAAAAAQ").unwrap(), id);
     }
@@ -256,7 +275,10 @@ mod tests {
         let octets = id.to_value_octets();
         // digits 0 | 0 0 0 0 7 e d 9 | 0 0 0 0 0 0 0 0 a b c, paired first-digit-low:
         // (0,0)(0,0)(0,7)(e,d)(9,0)(0,0)(0,0)(0,0)(0,a)(b,c).
-        assert_eq!(octets, [0x00, 0x00, 0x70, 0xDE, 0x09, 0x00, 0x00, 0x00, 0xA0, 0xCB]);
+        assert_eq!(
+            octets,
+            [0x00, 0x00, 0x70, 0xDE, 0x09, 0x00, 0x00, 0x00, 0xA0, 0xCB]
+        );
         assert_eq!(RacsId::from_value_octets(&octets).unwrap(), id);
         assert_eq!(RacsId::from_nucmf(&id.to_nucmf()).unwrap(), id);
     }
@@ -266,7 +288,10 @@ mod tests {
         assert_eq!(RacsId::from_nucmf("!!"), Err(RacsIdError::NotBase64));
         // IEI 0x68 instead of 0x67.
         let wrong_iei = B64.encode([0x68, 0x07, 1, 5, 0, 0, 0, 0, 0x10]);
-        assert_eq!(RacsId::from_nucmf(&wrong_iei), Err(RacsIdError::WrongIei(0x68)));
+        assert_eq!(
+            RacsId::from_nucmf(&wrong_iei),
+            Err(RacsIdError::WrongIei(0x68))
+        );
         // Length octet disagrees with the value length.
         let bad_len = B64.encode([0x67, 0x08, 1, 5, 0, 0, 0, 0, 0x10]);
         assert!(matches!(

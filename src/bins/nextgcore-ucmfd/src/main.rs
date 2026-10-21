@@ -34,14 +34,17 @@ use anyhow::{Context as _, Result};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use clap::Parser;
-use context::{AssignError, Capabilities, DicEntry, ModeOfOperation, Notification, RacFormat, ResolveError, Ucmf};
+use context::{
+    AssignError, Capabilities, DicEntry, ModeOfOperation, Notification, RacFormat, ResolveError,
+    Ucmf,
+};
 use nextgcore_sbi::client::{SbiClient, SbiClientConfig};
 use nextgcore_sbi::context::global_context;
 use nextgcore_sbi::message::{SbiPart, SbiRequest, SbiResponse};
 use nextgcore_sbi::oauth::{JwksCache, OAuth2Client};
 use nextgcore_sbi::server::{
-    send_bad_request, send_error, send_internal_error, send_method_not_allowed, send_not_found, SbiServer,
-    SbiServerConfig as NextgcoreSbiServerConfig,
+    send_bad_request, send_error, send_internal_error, send_method_not_allowed, send_not_found,
+    SbiServer, SbiServerConfig as NextgcoreSbiServerConfig,
 };
 use nextgcore_sbi::types::NfType;
 use racs_id::RacsId;
@@ -176,16 +179,31 @@ fn settle(args: &Args, yaml: Option<&str>) -> Result<Settings> {
             .unwrap_or_default(),
         None => UcmfSection::default(),
     };
-    let version = args.version_id.as_deref().or(section.version_id.as_deref()).unwrap_or("00");
-    let mode = args.mode.as_deref().or(section.mode.as_deref()).unwrap_or("B");
+    let version = args
+        .version_id
+        .as_deref()
+        .or(section.version_id.as_deref())
+        .unwrap_or("00");
+    let mode = args
+        .mode
+        .as_deref()
+        .or(section.mode.as_deref())
+        .unwrap_or("B");
     Ok(Settings {
-        nrf_uri: section.nrf.and_then(|n| n.uri).unwrap_or_else(|| args.nrf_uri.clone()),
+        nrf_uri: section
+            .nrf
+            .and_then(|n| n.uri)
+            .unwrap_or_else(|| args.nrf_uri.clone()),
         version_id: parse_version_id(version)?,
         mode: parse_mode(mode)?,
         state_file: args.state_file.clone().or(section.state_file),
         purge_outdated_ids: section.purge_outdated_ids.unwrap_or(false),
         require_oauth2: args.oauth2_require.unwrap_or_else(|| {
-            section.sbi.and_then(|s| s.oauth2).and_then(|o| o.require).unwrap_or(false)
+            section
+                .sbi
+                .and_then(|s| s.oauth2)
+                .and_then(|o| o.require)
+                .unwrap_or(false)
         }),
     })
 }
@@ -206,12 +224,15 @@ fn api_root() -> &'static str {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(args.log_level.as_str()))
-        .format_timestamp_millis()
-        .init();
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(args.log_level.as_str()),
+    )
+    .format_timestamp_millis()
+    .init();
     let _otel = nextgcore_metrics::otel::init_otel(
         nextgcore_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
-            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_else(|_| "http://jaeger:4317".to_string()),
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
         ),
     )
     .ok();
@@ -259,15 +280,22 @@ async fn main() -> Result<()> {
 
     let mut sbi_config = NextgcoreSbiServerConfig::new(addr);
     if args.tls {
-        let cert = args.tls_cert.as_deref().unwrap_or("/etc/nextgcore/tls/server.crt");
-        let key = args.tls_key.as_deref().unwrap_or("/etc/nextgcore/tls/server.key");
+        let cert = args
+            .tls_cert
+            .as_deref()
+            .unwrap_or("/etc/nextgcore/tls/server.crt");
+        let key = args
+            .tls_key
+            .as_deref()
+            .unwrap_or("/etc/nextgcore/tls/server.key");
         sbi_config = sbi_config.with_tls(key, cert);
     }
     if settings.require_oauth2 {
         // TS 33.501 §13.4.1: verify Bearer tokens against the NRF JWKS, with
         // this NF's type as the required audience.
         sbi_config.require_oauth2 = true;
-        sbi_config.oauth2_jwks_uri = Some(JwksCache::for_nrf(&settings.nrf_uri).jwks_uri().to_string());
+        sbi_config.oauth2_jwks_uri =
+            Some(JwksCache::for_nrf(&settings.nrf_uri).jwks_uri().to_string());
         sbi_config = sbi_config.with_expected_audience_nf_type(NfType::Ucmf);
         let _ = OAUTH2_CLIENT.set(Arc::new(OAuth2Client::new(
             &settings.nrf_uri,
@@ -343,7 +371,12 @@ fn nf_profile(nf_instance_id: &str, sbi_addr: &str, sbi_port: u16, scheme: &str)
     })
 }
 
-async fn register_with_nrf(sbi_addr: &str, sbi_port: u16, scheme: &str, nf_instance_id: &str) -> Result<(), String> {
+async fn register_with_nrf(
+    sbi_addr: &str,
+    sbi_port: u16,
+    scheme: &str,
+    nf_instance_id: &str,
+) -> Result<(), String> {
     let sbi_ctx = global_context();
     let Some(nrf_uri) = sbi_ctx.get_nrf_uri().await else {
         return Ok(());
@@ -402,7 +435,9 @@ fn dispatch(note: Notification) {
                 client = client.with_oauth2(oauth2.clone(), NfType::Amf);
             }
             match client.post_json(&path, &body).await {
-                Ok(r) if r.status == 204 || r.is_success() => log::debug!("UCMF notification delivered to {uri}"),
+                Ok(r) if r.status == 204 || r.is_success() => {
+                    log::debug!("UCMF notification delivered to {uri}")
+                }
                 Ok(r) => log::warn!("UCMF notification to {uri} returned {}", r.status),
                 Err(e) => log::warn!("UCMF notification to {uri} failed: {e}"),
             }
@@ -425,7 +460,11 @@ async fn ucmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 // Request handling (no I/O: returns the response and notifications to send)
 // ---------------------------------------------------------------------------
 
-fn handle(ucmf: &RwLock<Ucmf>, request: &SbiRequest, now: DateTime<Utc>) -> (SbiResponse, Vec<Notification>) {
+fn handle(
+    ucmf: &RwLock<Ucmf>,
+    request: &SbiRequest,
+    now: DateTime<Utc>,
+) -> (SbiResponse, Vec<Notification>) {
     let method = request.header.method.as_str();
     let uri = request.header.uri.as_str();
     let path = uri.split('?').next().unwrap_or(uri);
@@ -450,7 +489,10 @@ fn handle(ucmf: &RwLock<Ucmf>, request: &SbiRequest, now: DateTime<Utc>) -> (Sbi
                 Ok(u) => (get_dic_entry(&u, id, request), Vec::new()),
                 Err(_) => lock_poisoned(),
             },
-            _ => (send_method_not_allowed(method, "dic-entries/{dicEntryId}"), Vec::new()),
+            _ => (
+                send_method_not_allowed(method, "dic-entries/{dicEntryId}"),
+                Vec::new(),
+            ),
         },
         [UECM_API, "v1", "subscriptions"] => match method {
             "POST" => match ucmf.write() {
@@ -464,7 +506,10 @@ fn handle(ucmf: &RwLock<Ucmf>, request: &SbiRequest, now: DateTime<Utc>) -> (Sbi
                 Ok(mut u) => (unsubscribe(&mut u, id), Vec::new()),
                 Err(_) => lock_poisoned(),
             },
-            _ => (send_method_not_allowed(method, "subscriptions/{subscriptionId}"), Vec::new()),
+            _ => (
+                send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
+                Vec::new(),
+            ),
         },
         [PROVISIONING_API, "v1", "provisionings"] => match method {
             "POST" => match ucmf.write() {
@@ -479,25 +524,39 @@ fn handle(ucmf: &RwLock<Ucmf>, request: &SbiRequest, now: DateTime<Utc>) -> (Sbi
                 "PUT" => replace_provisioning(&mut u, id, request, now),
                 "PATCH" => patch_provisioning(&mut u, id, request, now),
                 "DELETE" => (delete_provisioning(&mut u, id), Vec::new()),
-                _ => (send_method_not_allowed(method, "provisionings/{provisioningId}"), Vec::new()),
+                _ => (
+                    send_method_not_allowed(method, "provisionings/{provisioningId}"),
+                    Vec::new(),
+                ),
             },
             Err(_) => lock_poisoned(),
         },
-        _ => (send_not_found(&format!("Resource not found: {path}"), None), Vec::new()),
+        _ => (
+            send_not_found(&format!("Resource not found: {path}"), None),
+            Vec::new(),
+        ),
     }
 }
 
 /// The request's JSON body (the JSON part of a multipart body).
 fn request_json(request: &SbiRequest) -> Option<Value> {
-    request.http.content.as_deref().and_then(|c| serde_json::from_str(c).ok())
+    request
+        .http
+        .content
+        .as_deref()
+        .and_then(|c| serde_json::from_str(c).ok())
 }
 
+#[allow(clippy::result_large_err)] // the Err is the response to send, built once per request
 fn rac_format(request: &SbiRequest) -> Result<Option<RacFormat>, SbiResponse> {
     match request.http.params.get("rac-format") {
         None => Ok(None),
-        Some(f) => RacFormat::parse(f)
-            .map(Some)
-            .ok_or_else(|| send_bad_request(&format!("unknown rac-format '{f}'"), Some("INVALID_QUERY_PARAM"))),
+        Some(f) => RacFormat::parse(f).map(Some).ok_or_else(|| {
+            send_bad_request(
+                &format!("unknown rac-format '{f}'"),
+                Some("INVALID_QUERY_PARAM"),
+            )
+        }),
     }
 }
 
@@ -524,11 +583,19 @@ fn resolve(u: &Ucmf, request: &SbiRequest) -> SbiResponse {
         Err(r) => return r,
     };
     let Some(raw) = request.http.params.get("ue-radio-capa-id") else {
-        return send_bad_request("ue-radio-capa-id is required", Some("MANDATORY_QUERY_PARAM_MISSING"));
+        return send_bad_request(
+            "ue-radio-capa-id is required",
+            Some("MANDATORY_QUERY_PARAM_MISSING"),
+        );
     };
     let query: Value = match serde_json::from_str(raw) {
         Ok(v) => v,
-        Err(_) => return send_bad_request("ue-radio-capa-id is not a UeRadioCapaId object", Some("INVALID_QUERY_PARAM")),
+        Err(_) => {
+            return send_bad_request(
+                "ue-radio-capa-id is not a UeRadioCapaId object",
+                Some("INVALID_QUERY_PARAM"),
+            )
+        }
     };
     let field = query
         .get("plmnAssiUeRadioCapId")
@@ -536,13 +603,26 @@ fn resolve(u: &Ucmf, request: &SbiRequest) -> SbiResponse {
         .and_then(Value::as_str);
     let id = match field.map(RacsId::from_nucmf) {
         Some(Ok(id)) => id,
-        Some(Err(e)) => return send_bad_request(&format!("ue-radio-capa-id: {e}"), Some("INVALID_QUERY_PARAM")),
-        None => return send_bad_request("ue-radio-capa-id carries no ID", Some("INVALID_QUERY_PARAM")),
+        Some(Err(e)) => {
+            return send_bad_request(
+                &format!("ue-radio-capa-id: {e}"),
+                Some("INVALID_QUERY_PARAM"),
+            )
+        }
+        None => {
+            return send_bad_request(
+                "ue-radio-capa-id carries no ID",
+                Some("INVALID_QUERY_PARAM"),
+            )
+        }
     };
     // The ID type must agree with the member that carried it.
     let plmn_member = query.get("plmnAssiUeRadioCapId").is_some();
     if plmn_member != id.is_plmn_assigned() {
-        return send_bad_request("ID type does not match its UeRadioCapaId member", Some("INVALID_QUERY_PARAM"));
+        return send_bad_request(
+            "ID type does not match its UeRadioCapaId member",
+            Some("INVALID_QUERY_PARAM"),
+        );
     }
     match u.resolve(&id, format) {
         Ok(entry) => dic_entry_response(entry, format),
@@ -581,14 +661,38 @@ fn dic_entry_response(e: &DicEntry, format: Option<RacFormat>) -> SbiResponse {
     let want_eps = format != Some(RacFormat::FiveGs);
     let mut parts = Vec::new();
     for (name, bytes, content_type, wanted) in [
-        ("ueRadioCapability5GS", &e.caps.cap_5gs, CONTENT_NGAP, want_5gs),
-        ("ueRadioCapabilityEPS", &e.caps.cap_eps, CONTENT_S1AP, want_eps),
-        ("ueRadioCap5GSForPaging", &e.caps.paging_5gs, CONTENT_NGAP, want_5gs),
-        ("ueRadioCapEPSForPaging", &e.caps.paging_eps, CONTENT_S1AP, want_eps),
+        (
+            "ueRadioCapability5GS",
+            &e.caps.cap_5gs,
+            CONTENT_NGAP,
+            want_5gs,
+        ),
+        (
+            "ueRadioCapabilityEPS",
+            &e.caps.cap_eps,
+            CONTENT_S1AP,
+            want_eps,
+        ),
+        (
+            "ueRadioCap5GSForPaging",
+            &e.caps.paging_5gs,
+            CONTENT_NGAP,
+            want_5gs,
+        ),
+        (
+            "ueRadioCapEPSForPaging",
+            &e.caps.paging_eps,
+            CONTENT_S1AP,
+            want_eps,
+        ),
     ] {
         if let (Some(b), true) = (bytes, wanted) {
             data.insert(name.into(), json!({ "contentId": name }));
-            parts.push(SbiPart::with_content(name, content_type, Bytes::from(b.clone())));
+            parts.push(SbiPart::with_content(
+                name,
+                content_type,
+                Bytes::from(b.clone()),
+            ));
         }
     }
     let mut response = match SbiResponse::ok().with_json_body(&Value::Object(data)) {
@@ -602,30 +706,62 @@ fn dic_entry_response(e: &DicEntry, format: Option<RacFormat>) -> SbiResponse {
 }
 
 /// The binary part a `RefToBinaryData` member names, if any.
-fn referenced_part(request: &SbiRequest, json: &Value, member: &str) -> Result<Option<Vec<u8>>, SbiResponse> {
+#[allow(clippy::result_large_err)] // the Err is the response to send, built once per request
+fn referenced_part(
+    request: &SbiRequest,
+    json: &Value,
+    member: &str,
+) -> Result<Option<Vec<u8>>, SbiResponse> {
     let Some(reference) = json.get(member) else {
         return Ok(None);
     };
     let Some(cid) = reference.get("contentId").and_then(Value::as_str) else {
-        return Err(send_bad_request(&format!("{member} is not a RefToBinaryData"), Some("INVALID_MSG_FORMAT")));
+        return Err(send_bad_request(
+            &format!("{member} is not a RefToBinaryData"),
+            Some("INVALID_MSG_FORMAT"),
+        ));
     };
     request
         .http
         .parts
         .iter()
-        .find(|p| p.content_id.as_deref().map(|c| c.trim_matches(|ch| ch == '<' || ch == '>')) == Some(cid))
+        .find(|p| {
+            p.content_id
+                .as_deref()
+                .map(|c| c.trim_matches(|ch| ch == '<' || ch == '>'))
+                == Some(cid)
+        })
         .map(|p| Some(p.data.to_vec()))
-        .ok_or_else(|| send_bad_request(&format!("{member} references missing part '{cid}'"), Some("INVALID_MSG_FORMAT")))
+        .ok_or_else(|| {
+            send_bad_request(
+                &format!("{member} references missing part '{cid}'"),
+                Some("INVALID_MSG_FORMAT"),
+            )
+        })
 }
 
 /// TS 29.673 §5.2.2.3 Assign: `POST /dic-entries` (multipart/related).
-fn assign(u: &mut Ucmf, request: &SbiRequest, now: DateTime<Utc>) -> (SbiResponse, Vec<Notification>) {
+fn assign(
+    u: &mut Ucmf,
+    request: &SbiRequest,
+    now: DateTime<Utc>,
+) -> (SbiResponse, Vec<Notification>) {
     let Some(json) = request_json(request) else {
-        return (send_bad_request("DicEntryCreateData is required", Some("INVALID_MSG_FORMAT")), Vec::new());
+        return (
+            send_bad_request("DicEntryCreateData is required", Some("INVALID_MSG_FORMAT")),
+            Vec::new(),
+        );
     };
     let Some(tac) = json.get("typeAllocationCode").and_then(Value::as_str) else {
-        return (send_bad_request("typeAllocationCode is required", Some("MANDATORY_IE_MISSING")), Vec::new());
+        return (
+            send_bad_request(
+                "typeAllocationCode is required",
+                Some("MANDATORY_IE_MISSING"),
+            ),
+            Vec::new(),
+        );
     };
+    #[allow(clippy::result_large_err)]
     let caps = (|| {
         Ok::<_, SbiResponse>(Capabilities {
             cap_5gs: referenced_part(request, &json, "ueRadioCapability5GS")?,
@@ -680,16 +816,27 @@ fn subscribe(u: &mut Ucmf, request: &SbiRequest, now: DateTime<Utc>) -> SbiRespo
         return send_bad_request("CreateSubscription is required", Some("INVALID_MSG_FORMAT"));
     };
     let Some(uri) = json.get("ucmfNotificationUri").and_then(Value::as_str) else {
-        return send_bad_request("ucmfNotificationUri is required", Some("MANDATORY_IE_MISSING"));
+        return send_bad_request(
+            "ucmfNotificationUri is required",
+            Some("MANDATORY_IE_MISSING"),
+        );
     };
     if split_uri(uri).is_none() || !(uri.starts_with("http://") || uri.starts_with("https://")) {
-        return send_bad_request("ucmfNotificationUri is not an http(s) URI", Some("INVALID_MSG_FORMAT"));
+        return send_bad_request(
+            "ucmfNotificationUri is not an http(s) URI",
+            Some("INVALID_MSG_FORMAT"),
+        );
     }
     let suggested = match json.get("suggestedExpires").and_then(Value::as_str) {
         None => None,
         Some(s) => match DateTime::parse_from_rfc3339(s) {
             Ok(t) => Some(t.with_timezone(&Utc)),
-            Err(_) => return send_bad_request("suggestedExpires is not a DateTime", Some("INVALID_MSG_FORMAT")),
+            Err(_) => {
+                return send_bad_request(
+                    "suggestedExpires is not a DateTime",
+                    Some("INVALID_MSG_FORMAT"),
+                )
+            }
         },
     };
     let nf_id = json.get("nfId").and_then(Value::as_str).map(str::to_string);
@@ -700,7 +847,10 @@ fn subscribe(u: &mut Ucmf, request: &SbiRequest, now: DateTime<Utc>) -> SbiRespo
     }
     body["supportedFeatures"] = json!(UECM_SUPPORTED_FEATURES);
     SbiResponse::created()
-        .with_header("Location", format!("{}/{UECM_API}/v1/subscriptions/{}", api_root(), sub.id))
+        .with_header(
+            "Location",
+            format!("{}/{UECM_API}/v1/subscriptions/{}", api_root(), sub.id),
+        )
         .with_json_body(&body)
         .unwrap_or_else(|e| send_internal_error(&format!("encoding CreatedSubscription: {e}")))
 }
@@ -710,10 +860,14 @@ fn unsubscribe(u: &mut Ucmf, id: &str) -> SbiResponse {
     if u.unsubscribe(id) {
         SbiResponse::no_content()
     } else {
-        send_not_found(&format!("No subscription {id}"), Some("SUBSCRIPTION_NOT_FOUND"))
+        send_not_found(
+            &format!("No subscription {id}"),
+            Some("SUBSCRIPTION_NOT_FOUND"),
+        )
     }
 }
 
+#[allow(clippy::result_large_err)] // the Err is the response to send, built once per request
 fn racs_configs(request: &SbiRequest) -> Result<(Map<String, Value>, Option<String>), SbiResponse> {
     let json = request_json(request)
         .ok_or_else(|| send_bad_request("RacsData is required", Some("INVALID_MSG_FORMAT")))?;
@@ -722,8 +876,18 @@ fn racs_configs(request: &SbiRequest) -> Result<(Map<String, Value>, Option<Stri
         .and_then(Value::as_object)
         .filter(|m| !m.is_empty())
         .cloned()
-        .ok_or_else(|| send_bad_request("racsConfigs is required (minProperties 1)", Some("MANDATORY_IE_MISSING")))?;
-    Ok((configs, json.get("suppFeat").and_then(Value::as_str).map(str::to_string)))
+        .ok_or_else(|| {
+            send_bad_request(
+                "racsConfigs is required (minProperties 1)",
+                Some("MANDATORY_IE_MISSING"),
+            )
+        })?;
+    Ok((
+        configs,
+        json.get("suppFeat")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    ))
 }
 
 fn racs_reports(failed: &[(String, &'static str)]) -> Vec<Value> {
@@ -764,7 +928,11 @@ fn all_failed(failed: &[(String, &'static str)]) -> SbiResponse {
 }
 
 /// TS 29.675 §5.2.2.2: `POST /provisionings`.
-fn create_provisioning(u: &mut Ucmf, request: &SbiRequest, now: DateTime<Utc>) -> (SbiResponse, Vec<Notification>) {
+fn create_provisioning(
+    u: &mut Ucmf,
+    request: &SbiRequest,
+    now: DateTime<Utc>,
+) -> (SbiResponse, Vec<Notification>) {
     let (configs, supp_feat) = match racs_configs(request) {
         Ok(c) => c,
         Err(r) => return (r, Vec::new()),
@@ -772,7 +940,14 @@ fn create_provisioning(u: &mut Ucmf, request: &SbiRequest, now: DateTime<Utc>) -
     match u.create_provisioning(&configs, supp_feat, now) {
         (Some(p), failed, note) => {
             let response = SbiResponse::created()
-                .with_header("Location", format!("{}/{PROVISIONING_API}/v1/provisionings/{}", api_root(), p.id))
+                .with_header(
+                    "Location",
+                    format!(
+                        "{}/{PROVISIONING_API}/v1/provisionings/{}",
+                        api_root(),
+                        p.id
+                    ),
+                )
                 .with_json_body(&racs_data_body(&p, &failed))
                 .unwrap_or_else(|e| send_internal_error(&format!("encoding RacsData: {e}")));
             (response, note.into_iter().collect())
@@ -790,11 +965,26 @@ fn get_provisioning(u: &Ucmf, id: &str) -> SbiResponse {
     }
 }
 
-type ProvisioningOutcome = Option<Result<(context::Provisioning, Vec<(String, &'static str)>, Option<Notification>), Vec<(String, &'static str)>>>;
+type ProvisioningOutcome = Option<
+    Result<
+        (
+            context::Provisioning,
+            Vec<(String, &'static str)>,
+            Option<Notification>,
+        ),
+        Vec<(String, &'static str)>,
+    >,
+>;
 
-fn provisioning_update_response(id: &str, outcome: ProvisioningOutcome) -> (SbiResponse, Vec<Notification>) {
+fn provisioning_update_response(
+    id: &str,
+    outcome: ProvisioningOutcome,
+) -> (SbiResponse, Vec<Notification>) {
     match outcome {
-        None => (send_not_found(&format!("No provisioning {id}"), Some("RESOURCE_NOT_FOUND")), Vec::new()),
+        None => (
+            send_not_found(&format!("No provisioning {id}"), Some("RESOURCE_NOT_FOUND")),
+            Vec::new(),
+        ),
         Some(Err(failed)) => (all_failed(&failed), Vec::new()),
         Some(Ok((p, failed, note))) => (
             SbiResponse::ok()
@@ -806,7 +996,12 @@ fn provisioning_update_response(id: &str, outcome: ProvisioningOutcome) -> (SbiR
 }
 
 /// TS 29.675 §5.2.2.3: `PUT /provisionings/{id}`.
-fn replace_provisioning(u: &mut Ucmf, id: &str, request: &SbiRequest, now: DateTime<Utc>) -> (SbiResponse, Vec<Notification>) {
+fn replace_provisioning(
+    u: &mut Ucmf,
+    id: &str,
+    request: &SbiRequest,
+    now: DateTime<Utc>,
+) -> (SbiResponse, Vec<Notification>) {
     let (configs, supp_feat) = match racs_configs(request) {
         Ok(c) => c,
         Err(r) => return (r, Vec::new()),
@@ -815,7 +1010,12 @@ fn replace_provisioning(u: &mut Ucmf, id: &str, request: &SbiRequest, now: DateT
 }
 
 /// TS 29.675 §5.2.2.3: `PATCH /provisionings/{id}` (`application/merge-patch+json`).
-fn patch_provisioning(u: &mut Ucmf, id: &str, request: &SbiRequest, now: DateTime<Utc>) -> (SbiResponse, Vec<Notification>) {
+fn patch_provisioning(
+    u: &mut Ucmf,
+    id: &str,
+    request: &SbiRequest,
+    now: DateTime<Utc>,
+) -> (SbiResponse, Vec<Notification>) {
     let (configs, _) = match racs_configs(request) {
         Ok(c) => c,
         Err(r) => return (r, Vec::new()),
@@ -838,7 +1038,9 @@ mod tests {
     use base64::Engine;
 
     fn now() -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339("2026-10-21T00:00:00Z").unwrap().with_timezone(&Utc)
+        DateTime::parse_from_rfc3339("2026-10-21T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
     }
 
     fn ucmf() -> RwLock<Ucmf> {
@@ -866,7 +1068,11 @@ mod tests {
             req("POST", "/nucmf-uecm/v1/dic-entries"),
             json!({"typeAllocationCode": tac, "ueRadioCapability5GS": {"contentId": "nr"}}),
         );
-        r.http.parts.push(SbiPart::with_content("nr", CONTENT_NGAP, Bytes::from(nr.to_vec())));
+        r.http.parts.push(SbiPart::with_content(
+            "nr",
+            CONTENT_NGAP,
+            Bytes::from(nr.to_vec()),
+        ));
         r
     }
 
@@ -893,8 +1099,13 @@ mod tests {
             Some("http://ucmf/nucmf-uecm/v1/dic-entries/1")
         );
         // TS 23.003: Version ID 05, RCI 0 → value octets 01 05 00 00 00 00 00.
-        let id = body(&r)["plmnAssiUeRadioCapId"].as_str().unwrap().to_string();
-        let ie = base64::engine::general_purpose::STANDARD.decode(&id).unwrap();
+        let id = body(&r)["plmnAssiUeRadioCapId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let ie = base64::engine::general_purpose::STANDARD
+            .decode(&id)
+            .unwrap();
         assert_eq!(ie, [0x67, 0x07, 0x01, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00]);
 
         let (r, _) = handle(&u, &resolve_request(&id, Some("5GS")), now());
@@ -903,7 +1114,10 @@ mod tests {
         assert_eq!(data["dicEntryId"], 1);
         assert_eq!(data["typeAllocationCode"], "35123456");
         assert_eq!(data["plmnAssiUeRadioCapId"], id);
-        assert_eq!(data["ueRadioCapability5GS"]["contentId"], "ueRadioCapability5GS");
+        assert_eq!(
+            data["ueRadioCapability5GS"]["contentId"],
+            "ueRadioCapability5GS"
+        );
         assert_eq!(r.http.parts.len(), 1);
         assert_eq!(r.http.parts[0].content_type.as_deref(), Some(CONTENT_NGAP));
         assert_eq!(&r.http.parts[0].data[..], &[0xAA, 0xBB]);
@@ -921,21 +1135,38 @@ mod tests {
     fn resolve_errors_carry_the_spec_causes() {
         let u = ucmf();
         let (r, _) = handle(&u, &assign_request("35123456", &[1]), now());
-        let id = body(&r)["plmnAssiUeRadioCapId"].as_str().unwrap().to_string();
+        let id = body(&r)["plmnAssiUeRadioCapId"]
+            .as_str()
+            .unwrap()
+            .to_string();
         let (r, _) = handle(&u, &resolve_request(&id, Some("EPS")), now());
-        assert_eq!((r.status, cause(&r)), (404, json!("NO_DICTIONARY_ENTRY_FOUND")));
+        assert_eq!(
+            (r.status, cause(&r)),
+            (404, json!("NO_DICTIONARY_ENTRY_FOUND"))
+        );
         let unknown = RacsId::plmn_assigned(5, 99).unwrap().to_nucmf();
         let (r, _) = handle(&u, &resolve_request(&unknown, None), now());
-        assert_eq!((r.status, cause(&r)), (404, json!("NO_DICTIONARY_ENTRY_FOUND")));
+        assert_eq!(
+            (r.status, cause(&r)),
+            (404, json!("NO_DICTIONARY_ENTRY_FOUND"))
+        );
         u.write().unwrap().set_version_id(6, now());
         let (r, _) = handle(&u, &resolve_request(&id, None), now());
-        assert_eq!((r.status, cause(&r)), (404, json!("OUT_DATED_VERSION_ID_IN_RAC_ID")));
+        assert_eq!(
+            (r.status, cause(&r)),
+            (404, json!("OUT_DATED_VERSION_ID_IN_RAC_ID"))
+        );
         let (r, _) = handle(&u, &resolve_request("not base64!", None), now());
         assert_eq!(r.status, 400);
         let (r, _) = handle(&u, &req("GET", "/nucmf-uecm/v1/dic-entries"), now());
-        assert_eq!((r.status, cause(&r)), (400, json!("MANDATORY_QUERY_PARAM_MISSING")));
+        assert_eq!(
+            (r.status, cause(&r)),
+            (400, json!("MANDATORY_QUERY_PARAM_MISSING"))
+        );
         // A manufacturer ID under the plmnAssi member is refused.
-        let man = RacsId::from_digit_str("000007ed900000000abc").unwrap().to_nucmf();
+        let man = RacsId::from_digit_str("000007ed900000000abc")
+            .unwrap()
+            .to_nucmf();
         let (r, _) = handle(&u, &resolve_request(&man, None), now());
         assert_eq!(r.status, 400);
     }
@@ -949,7 +1180,10 @@ mod tests {
         missing_part.http.parts.clear();
         let (r, _) = handle(&u, &missing_part, now());
         assert_eq!(r.status, 400);
-        let no_cap = with_json(req("POST", "/nucmf-uecm/v1/dic-entries"), json!({"typeAllocationCode": "35123456"}));
+        let no_cap = with_json(
+            req("POST", "/nucmf-uecm/v1/dic-entries"),
+            json!({"typeAllocationCode": "35123456"}),
+        );
         let (r, _) = handle(&u, &no_cap, now());
         assert_eq!((r.status, cause(&r)), (400, json!("MANDATORY_IE_MISSING")));
     }
@@ -977,8 +1211,14 @@ mod tests {
         let (r, _) = handle(&u, &req("DELETE", "/nucmf-uecm/v1/subscriptions/1"), now());
         assert_eq!(r.status, 204);
         let (r, _) = handle(&u, &req("DELETE", "/nucmf-uecm/v1/subscriptions/1"), now());
-        assert_eq!((r.status, cause(&r)), (404, json!("SUBSCRIPTION_NOT_FOUND")));
-        let bad = with_json(req("POST", "/nucmf-uecm/v1/subscriptions"), json!({"nfId": "a1"}));
+        assert_eq!(
+            (r.status, cause(&r)),
+            (404, json!("SUBSCRIPTION_NOT_FOUND"))
+        );
+        let bad = with_json(
+            req("POST", "/nucmf-uecm/v1/subscriptions"),
+            json!({"nfId": "a1"}),
+        );
         assert_eq!(handle(&u, &bad, now()).0.status, 400);
     }
 
@@ -991,16 +1231,26 @@ mod tests {
     #[test]
     fn provisioning_lifecycle_over_the_api() {
         let u = ucmf();
-        let create = with_json(req("POST", "/nucmf-provisioning/v1/provisionings"), provisioning_body("0a0b"));
+        let create = with_json(
+            req("POST", "/nucmf-provisioning/v1/provisionings"),
+            provisioning_body("0a0b"),
+        );
         let (r, _) = handle(&u, &create, now());
         assert_eq!(r.status, 201);
-        assert!(r.http.get_header("Location").unwrap().ends_with("/nucmf-provisioning/v1/provisionings/1"));
+        assert!(r
+            .http
+            .get_header("Location")
+            .unwrap()
+            .ends_with("/nucmf-provisioning/v1/provisionings/1"));
         assert_eq!(body(&r)["racsConfigs"][MAN]["racsParam5Gs"], "0a0b");
 
         // The provisioned manufacturer-assigned ID now resolves.
         let mut q = req("GET", "/nucmf-uecm/v1/dic-entries");
         let man = RacsId::from_digit_str(MAN).unwrap().to_nucmf();
-        q.http.params.insert("ue-radio-capa-id".into(), json!({"manAssiUeRadioCapId": man}).to_string());
+        q.http.params.insert(
+            "ue-radio-capa-id".into(),
+            json!({"manAssiUeRadioCapId": man}).to_string(),
+        );
         let (r, _) = handle(&u, &q, now());
         assert_eq!(r.status, 200);
         assert_eq!(body(&r)["manAssiUeRadioCapId"], man);
@@ -1008,9 +1258,16 @@ mod tests {
         // A duplicate RACS ID: nothing provisioned → 500 with RacsFailureReport.
         let (r, _) = handle(&u, &create, now());
         assert_eq!(r.status, 500);
-        assert_eq!(body(&r), json!([{"racsIds": [MAN], "failureCode": "RACS_ID_DUPLICATED"}]));
+        assert_eq!(
+            body(&r),
+            json!([{"racsIds": [MAN], "failureCode": "RACS_ID_DUPLICATED"}])
+        );
 
-        let (r, _) = handle(&u, &req("GET", "/nucmf-provisioning/v1/provisionings/1"), now());
+        let (r, _) = handle(
+            &u,
+            &req("GET", "/nucmf-provisioning/v1/provisionings/1"),
+            now(),
+        );
         assert_eq!(r.status, 200);
         let patch = with_json(
             req("PATCH", "/nucmf-provisioning/v1/provisionings/1"),
@@ -1019,11 +1276,22 @@ mod tests {
         let (r, _) = handle(&u, &patch, now());
         assert_eq!(r.status, 200);
         assert_eq!(body(&r)["racsConfigs"][MAN]["racsParam5Gs"], "ff");
-        let put = with_json(req("PUT", "/nucmf-provisioning/v1/provisionings/1"), provisioning_body("0c"));
+        let put = with_json(
+            req("PUT", "/nucmf-provisioning/v1/provisionings/1"),
+            provisioning_body("0c"),
+        );
         assert_eq!(handle(&u, &put, now()).0.status, 200);
-        let (r, _) = handle(&u, &req("DELETE", "/nucmf-provisioning/v1/provisionings/1"), now());
+        let (r, _) = handle(
+            &u,
+            &req("DELETE", "/nucmf-provisioning/v1/provisionings/1"),
+            now(),
+        );
         assert_eq!(r.status, 204);
-        let (r, _) = handle(&u, &req("DELETE", "/nucmf-provisioning/v1/provisionings/1"), now());
+        let (r, _) = handle(
+            &u,
+            &req("DELETE", "/nucmf-provisioning/v1/provisionings/1"),
+            now(),
+        );
         assert_eq!(r.status, 404);
         let (r, _) = handle(&u, &q, now());
         assert_eq!(r.status, 404);
@@ -1032,9 +1300,24 @@ mod tests {
     #[test]
     fn unknown_paths_and_methods_are_refused() {
         let u = ucmf();
-        assert_eq!(handle(&u, &req("GET", "/nucmf-uecm/v1/nope"), now()).0.status, 404);
-        assert_eq!(handle(&u, &req("PUT", "/nucmf-uecm/v1/dic-entries"), now()).0.status, 405);
-        assert_eq!(handle(&u, &req("GET", "/nucmf-uecm/v1/dic-entries/x"), now()).0.status, 400);
+        assert_eq!(
+            handle(&u, &req("GET", "/nucmf-uecm/v1/nope"), now())
+                .0
+                .status,
+            404
+        );
+        assert_eq!(
+            handle(&u, &req("PUT", "/nucmf-uecm/v1/dic-entries"), now())
+                .0
+                .status,
+            405
+        );
+        assert_eq!(
+            handle(&u, &req("GET", "/nucmf-uecm/v1/dic-entries/x"), now())
+                .0
+                .status,
+            400
+        );
     }
 
     #[test]
@@ -1048,7 +1331,10 @@ mod tests {
             .map(|s| s["serviceName"].as_str().unwrap())
             .collect();
         // TS 29.510 ServiceName values.
-        assert_eq!(names, ["nucmf-uecapabilitymanagement", "nucmf-provisioning"]);
+        assert_eq!(
+            names,
+            ["nucmf-uecapabilitymanagement", "nucmf-provisioning"]
+        );
         assert_eq!(p["nfServices"][0]["supportedFeatures"], "1");
     }
 
@@ -1064,6 +1350,10 @@ mod tests {
         let args = Args::parse_from(["nextgcore-ucmfd", "--version-id", "1f", "--mode", "B"]);
         let s = settle(&args, Some(yaml)).unwrap();
         assert_eq!((s.version_id, s.mode), (0x1F, ModeOfOperation::B));
-        assert!(settle(&Args::parse_from(["nextgcore-ucmfd", "--version-id", "100"]), None).is_err());
+        assert!(settle(
+            &Args::parse_from(["nextgcore-ucmfd", "--version-id", "100"]),
+            None
+        )
+        .is_err());
     }
 }

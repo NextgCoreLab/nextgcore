@@ -60,7 +60,9 @@ impl Capabilities {
     /// The provided formats agree with `stored`, and at least one was provided.
     fn matches(&self, stored: &Capabilities) -> bool {
         let agrees = |p: &Option<Vec<u8>>, s: &Option<Vec<u8>>| p.is_none() || p == s;
-        self.has_any() && agrees(&self.cap_5gs, &stored.cap_5gs) && agrees(&self.cap_eps, &stored.cap_eps)
+        self.has_any()
+            && agrees(&self.cap_5gs, &stored.cap_5gs)
+            && agrees(&self.cap_eps, &stored.cap_eps)
     }
 
     /// Fill formats `stored` lacks from `self` (never overwrite stored bytes).
@@ -206,7 +208,11 @@ impl Ucmf {
     // ---------------------------------------------------------------- Resolve
 
     /// TS 29.673 §5.2.2.2.1: find the entry for a UE radio capability ID.
-    pub fn resolve(&self, id: &RacsId, format: Option<RacFormat>) -> Result<&DicEntry, ResolveError> {
+    pub fn resolve(
+        &self,
+        id: &RacsId,
+        format: Option<RacFormat>,
+    ) -> Result<&DicEntry, ResolveError> {
         if let RacsId::PlmnAssigned { version_id, .. } = id {
             // TS 23.501 §5.4.4.1a: an old Version ID is an error even if an
             // entry with that ID still exists.
@@ -372,7 +378,8 @@ impl Ucmf {
         if deleted.is_empty() {
             return None;
         }
-        self.entries.retain(|_, e| e.plmn_id.is_some() || e.man_id.is_some());
+        self.entries
+            .retain(|_, e| e.plmn_id.is_some() || e.man_id.is_some());
         self.persist();
         self.notification(
             now,
@@ -457,7 +464,11 @@ impl Ucmf {
         racs_configs: &Map<String, Value>,
         supp_feat: Option<String>,
         now: DateTime<Utc>,
-    ) -> (Option<Provisioning>, Vec<(String, &'static str)>, Option<Notification>) {
+    ) -> (
+        Option<Provisioning>,
+        Vec<(String, &'static str)>,
+        Option<Notification>,
+    ) {
         let prov_id = self.next_prov_seq.to_string();
         let (ok, failed) = self.provision_entries(&prov_id, racs_configs, None);
         if ok.is_empty() {
@@ -489,7 +500,16 @@ impl Ucmf {
         racs_configs: &Map<String, Value>,
         supp_feat: Option<String>,
         now: DateTime<Utc>,
-    ) -> Option<Result<(Provisioning, Vec<(String, &'static str)>, Option<Notification>), Vec<(String, &'static str)>>> {
+    ) -> Option<
+        Result<
+            (
+                Provisioning,
+                Vec<(String, &'static str)>,
+                Option<Notification>,
+            ),
+            Vec<(String, &'static str)>,
+        >,
+    > {
         self.provisionings.get(id)?;
         let removed: Vec<DicEntry> = self.take_entries_of(id);
         let (ok, failed) = self.provision_entries(id, racs_configs, Some(id));
@@ -520,7 +540,16 @@ impl Ucmf {
         id: &str,
         patch: &Map<String, Value>,
         now: DateTime<Utc>,
-    ) -> Option<Result<(Provisioning, Vec<(String, &'static str)>, Option<Notification>), Vec<(String, &'static str)>>> {
+    ) -> Option<
+        Result<
+            (
+                Provisioning,
+                Vec<(String, &'static str)>,
+                Option<Notification>,
+            ),
+            Vec<(String, &'static str)>,
+        >,
+    > {
         let current = self.provisionings.get(id)?.clone();
         let mut merged = current.configs.clone();
         for (racs_id, change) in patch {
@@ -558,7 +587,9 @@ impl Ucmf {
             .filter(|e| e.provisioning_id.as_deref() == Some(prov_id))
             .map(|e| e.id)
             .collect();
-        ids.into_iter().filter_map(|i| self.entries.remove(&i)).collect()
+        ids.into_iter()
+            .filter_map(|i| self.entries.remove(&i))
+            .collect()
     }
 
     /// Create one entry per valid RACS configuration. A RACS ID already in the
@@ -573,7 +604,8 @@ impl Ucmf {
         let mut ok = Map::new();
         let mut failed = Vec::new();
         for (racs_key, config) in racs_configs {
-            let Ok(man_id @ RacsId::ManufacturerAssigned { .. }) = RacsId::from_digit_str(racs_key) else {
+            let Ok(man_id @ RacsId::ManufacturerAssigned { .. }) = RacsId::from_digit_str(racs_key)
+            else {
                 failed.push((racs_key.clone(), RACS_OTHER_REASON));
                 continue;
             };
@@ -675,14 +707,33 @@ impl Ucmf {
         if let Some(v) = u64_of("nextProvSeq") {
             self.next_prov_seq = v;
         }
-        let b64 = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).and_then(|s| B64.decode(s).ok());
-        let id = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).and_then(|s| RacsId::from_nucmf(s).ok());
-        for e in doc.get("entries").and_then(Value::as_array).into_iter().flatten() {
-            let Some(entry_id) = e.get("id").and_then(Value::as_u64) else { continue };
+        let b64 = |v: &Value, k: &str| {
+            v.get(k)
+                .and_then(Value::as_str)
+                .and_then(|s| B64.decode(s).ok())
+        };
+        let id = |v: &Value, k: &str| {
+            v.get(k)
+                .and_then(Value::as_str)
+                .and_then(|s| RacsId::from_nucmf(s).ok())
+        };
+        for e in doc
+            .get("entries")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(entry_id) = e.get("id").and_then(Value::as_u64) else {
+                continue;
+            };
             let tacs = e
                 .get("tacs")
                 .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|t| t.as_str().map(str::to_string)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|t| t.as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default();
             self.entries.insert(
                 entry_id as u32,
@@ -697,11 +748,19 @@ impl Ucmf {
                         paging_5gs: b64(e, "paging5gs"),
                         paging_eps: b64(e, "pagingEps"),
                     },
-                    provisioning_id: e.get("provisioningId").and_then(Value::as_str).map(str::to_string),
+                    provisioning_id: e
+                        .get("provisioningId")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                 },
             );
         }
-        for s in doc.get("subscriptions").and_then(Value::as_array).into_iter().flatten() {
+        for s in doc
+            .get("subscriptions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
             let (Some(sid), Some(uri)) = (
                 s.get("id").and_then(Value::as_str),
                 s.get("uri").and_then(Value::as_str),
@@ -722,14 +781,28 @@ impl Ucmf {
                 },
             );
         }
-        for p in doc.get("provisionings").and_then(Value::as_array).into_iter().flatten() {
-            let Some(pid) = p.get("id").and_then(Value::as_str) else { continue };
+        for p in doc
+            .get("provisionings")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let Some(pid) = p.get("id").and_then(Value::as_str) else {
+                continue;
+            };
             self.provisionings.insert(
                 pid.to_string(),
                 Provisioning {
                     id: pid.to_string(),
-                    configs: p.get("configs").and_then(Value::as_object).cloned().unwrap_or_default(),
-                    supp_feat: p.get("suppFeat").and_then(Value::as_str).map(str::to_string),
+                    configs: p
+                        .get("configs")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default(),
+                    supp_feat: p
+                        .get("suppFeat")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                 },
             );
         }
@@ -771,7 +844,7 @@ fn parse_racs_configuration(config: &Value) -> Option<(Vec<String>, Capabilities
 }
 
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if s.is_empty() || s.len() % 2 != 0 {
+    if s.is_empty() || !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())
@@ -805,7 +878,9 @@ mod tests {
     use super::*;
 
     fn now() -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339("2026-10-21T00:00:00Z").unwrap().with_timezone(&Utc)
+        DateTime::parse_from_rfc3339("2026-10-21T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
     }
 
     fn caps(nr: &[u8]) -> Capabilities {
@@ -819,7 +894,13 @@ mod tests {
     fn assign_gives_a_current_version_id_and_the_same_id_for_the_same_input() {
         let mut u = Ucmf::new(0x05, ModeOfOperation::B);
         let (e1, id1, _) = u.assign("35123456", caps(&[1, 2, 3]), now()).unwrap();
-        assert_eq!(id1, RacsId::PlmnAssigned { version_id: 0x05, rci: 0 });
+        assert_eq!(
+            id1,
+            RacsId::PlmnAssigned {
+                version_id: 0x05,
+                rci: 0
+            }
+        );
         // Same TAC + same capability → the already assigned ID (TS 29.673 §5.2.2.3 2a).
         let (e2, id2, note) = u.assign("35123456", caps(&[1, 2, 3]), now()).unwrap();
         assert_eq!((e2, id2), (e1, id1));
@@ -827,7 +908,13 @@ mod tests {
         // A different capability → a new entry and ID.
         let (e3, id3, _) = u.assign("35123456", caps(&[9]), now()).unwrap();
         assert_ne!(e3, e1);
-        assert_eq!(id3, RacsId::PlmnAssigned { version_id: 0x05, rci: 1 });
+        assert_eq!(
+            id3,
+            RacsId::PlmnAssigned {
+                version_id: 0x05,
+                rci: 1
+            }
+        );
         // The same capability under another TAC is another device model.
         let (e4, _, _) = u.assign("35999999", caps(&[1, 2, 3]), now()).unwrap();
         assert_ne!(e4, e1);
@@ -837,9 +924,18 @@ mod tests {
     fn resolve_finds_by_either_id_and_refuses_an_outdated_version_id() {
         let mut u = Ucmf::new(0x05, ModeOfOperation::B);
         let (_, id, _) = u.assign("35123456", caps(&[1, 2, 3]), now()).unwrap();
-        assert_eq!(u.resolve(&id, Some(RacFormat::FiveGs)).unwrap().caps.cap_5gs, Some(vec![1, 2, 3]));
+        assert_eq!(
+            u.resolve(&id, Some(RacFormat::FiveGs))
+                .unwrap()
+                .caps
+                .cap_5gs,
+            Some(vec![1, 2, 3])
+        );
         // Not stored in EPS format, and this UCMF does not transcode.
-        assert_eq!(u.resolve(&id, Some(RacFormat::Eps)), Err(ResolveError::FormatNotStored));
+        assert_eq!(
+            u.resolve(&id, Some(RacFormat::Eps)),
+            Err(ResolveError::FormatNotStored)
+        );
         let unknown = RacsId::plmn_assigned(0x05, 77).unwrap();
         assert_eq!(u.resolve(&unknown, None), Err(ResolveError::NotFound));
         // TS 23.501 §5.4.4.1a: after a Version ID change the old ID is outdated
@@ -847,7 +943,13 @@ mod tests {
         u.set_version_id(0x06, now());
         assert_eq!(u.resolve(&id, None), Err(ResolveError::OutdatedVersionId));
         let (_, fresh, _) = u.assign("35123456", caps(&[1, 2, 3]), now()).unwrap();
-        assert!(matches!(fresh, RacsId::PlmnAssigned { version_id: 0x06, .. }));
+        assert!(matches!(
+            fresh,
+            RacsId::PlmnAssigned {
+                version_id: 0x06,
+                ..
+            }
+        ));
         assert!(u.resolve(&fresh, None).is_ok());
     }
 
@@ -872,15 +974,23 @@ mod tests {
     #[test]
     fn assign_refuses_a_bad_tac_and_no_capability() {
         let mut u = Ucmf::new(1, ModeOfOperation::B);
-        assert_eq!(u.assign("3512345", caps(&[1]), now()), Err(AssignError::BadTac));
-        assert_eq!(u.assign("35123456", Capabilities::default(), now()), Err(AssignError::NoCapability));
+        assert_eq!(
+            u.assign("3512345", caps(&[1]), now()),
+            Err(AssignError::BadTac)
+        );
+        assert_eq!(
+            u.assign("35123456", Capabilities::default(), now()),
+            Err(AssignError::NoCapability)
+        );
     }
 
     #[test]
     fn creation_is_notified_to_active_subscribers_with_the_highest_entry_id() {
         let mut u = Ucmf::new(1, ModeOfOperation::B);
         let sub = u.subscribe(None, "http://amf/notify".into(), None, now());
-        assert!(sub.expires.unwrap() <= now() + ChronoDuration::seconds(MAX_SUBSCRIPTION_LIFETIME_SECS));
+        assert!(
+            sub.expires.unwrap() <= now() + ChronoDuration::seconds(MAX_SUBSCRIPTION_LIFETIME_SECS)
+        );
         let (eid, _, note) = u.assign("35123456", caps(&[1]), now()).unwrap();
         let note = note.unwrap();
         assert_eq!(note.uris, ["http://amf/notify"]);
@@ -896,10 +1006,20 @@ mod tests {
     fn subscription_expiry_honours_the_hint_the_ceiling_and_lapses() {
         let mut u = Ucmf::new(1, ModeOfOperation::B);
         let hint = now() + ChronoDuration::seconds(60);
-        assert_eq!(u.subscribe(None, "http://a/n".into(), Some(hint), now()).expires, Some(hint));
+        assert_eq!(
+            u.subscribe(None, "http://a/n".into(), Some(hint), now())
+                .expires,
+            Some(hint)
+        );
         let far = now() + ChronoDuration::days(30);
-        let a = u.subscribe(None, "http://b/n".into(), Some(far), now()).expires.unwrap();
-        let b = u.subscribe(None, "http://c/n".into(), Some(far), now()).expires.unwrap();
+        let a = u
+            .subscribe(None, "http://b/n".into(), Some(far), now())
+            .expires
+            .unwrap();
+        let b = u
+            .subscribe(None, "http://c/n".into(), Some(far), now())
+            .expires
+            .unwrap();
         assert!(a < far && b < far);
         assert_ne!(a, b, "two subscriptions must not share an expiry");
         // After the hinted expiry the first subscriber is no longer notified.
@@ -919,13 +1039,23 @@ mod tests {
         assert!(u.set_version_id(2, now()).is_none());
         let d = u.purge_outdated_plmn_ids(now()).unwrap();
         assert_eq!(d.body["eventType"], "DELETION_OF_PLMN_ASSIGNED_IDS");
-        assert_eq!(d.body["manAssOpRequestlist"]["plmnAssiUeRadioCapId"], json!([old.to_nucmf()]));
-        assert_eq!(u.entry_count(), 0, "an entry with neither ID left is removed");
+        assert_eq!(
+            d.body["manAssOpRequestlist"]["plmnAssiUeRadioCapId"],
+            json!([old.to_nucmf()])
+        );
+        assert_eq!(
+            u.entry_count(),
+            0,
+            "an entry with neither ID left is removed"
+        );
     }
 
     fn racs(key: &str, nr_hex: &str) -> Map<String, Value> {
         let mut m = Map::new();
-        m.insert(key.into(), json!({"imeiTacs": ["35123456"], "racsParam5Gs": nr_hex}));
+        m.insert(
+            key.into(),
+            json!({"imeiTacs": ["35123456"], "racsParam5Gs": nr_hex}),
+        );
         m
     }
 
@@ -938,7 +1068,13 @@ mod tests {
         let prov = prov.unwrap();
         assert!(failed.is_empty());
         let man = RacsId::from_digit_str(MAN).unwrap();
-        assert_eq!(u.resolve(&man, Some(RacFormat::FiveGs)).unwrap().caps.cap_5gs, Some(vec![0x0a, 0x0b]));
+        assert_eq!(
+            u.resolve(&man, Some(RacFormat::FiveGs))
+                .unwrap()
+                .caps
+                .cap_5gs,
+            Some(vec![0x0a, 0x0b])
+        );
         // The same RACS ID again → RACS_ID_DUPLICATED, and no resource.
         let (none, failed, _) = u.create_provisioning(&racs(MAN, "0c"), None, now());
         assert!(none.is_none());
@@ -966,7 +1102,10 @@ mod tests {
         assert_eq!(p.configs[MAN]["racsParam5Gs"], "ff");
         assert_eq!(p.configs[MAN]["imeiTacs"], json!(["35123456"]));
         let man = RacsId::from_digit_str(MAN).unwrap();
-        assert_eq!(u.resolve(&man, None).unwrap().caps.cap_5gs, Some(vec![0xff]));
+        assert_eq!(
+            u.resolve(&man, None).unwrap().caps.cap_5gs,
+            Some(vec![0xff])
+        );
         // Removing the only RACS ID leaves nothing to provision: refused, unchanged.
         let mut remove = Map::new();
         remove.insert(MAN.into(), Value::Null);
@@ -993,11 +1132,22 @@ mod tests {
         assert_eq!(u.attach_store(Some(path.clone())), Ok(true));
         assert_eq!(u.version_id(), 3);
         assert_eq!(u.resolve(&id, None).unwrap().caps.cap_5gs, Some(vec![7, 7]));
-        assert_eq!(u.subscription(&sub_id).unwrap().nf_id.as_deref(), Some("nf-1"));
-        assert!(u.resolve(&RacsId::from_digit_str(MAN).unwrap(), None).is_ok());
+        assert_eq!(
+            u.subscription(&sub_id).unwrap().nf_id.as_deref(),
+            Some("nf-1")
+        );
+        assert!(u
+            .resolve(&RacsId::from_digit_str(MAN).unwrap(), None)
+            .is_ok());
         // A new ID after restart does not reuse an RCI.
         let (_, next, _) = u.assign("35123456", caps(&[8]), now()).unwrap();
-        assert_eq!(next, RacsId::PlmnAssigned { version_id: 3, rci: 1 });
+        assert_eq!(
+            next,
+            RacsId::PlmnAssigned {
+                version_id: 3,
+                rci: 1
+            }
+        );
         // A corrupt file is refused and not overwritten.
         std::fs::write(&path, "{not json").unwrap();
         let mut bad = Ucmf::new(3, ModeOfOperation::B);
