@@ -6,11 +6,11 @@
 use super::*;
 use crate::context::MmeContext;
 use crate::s1ap_build::{self, hand_written_build_downlink_nas_transport};
+use crate::s1ap_gen::test_codec::{builder, decode_s1ap_pdu};
 use crate::s1ap_handler::handle_s1ap_message;
 use nextgcore_s1ap::{
     EutranCgi, InitialUeMessage, RrcEstablishmentCause, S1apMessage, STmsi, Tai, UlNasTransport,
 };
-use nextgcore_s1ap_oracle::{builder, decode_s1ap_pdu};
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -73,7 +73,6 @@ fn the_downlink_nas_transport_matches_the_hand_written_encoder() {
 #[test]
 fn a_downlink_nas_pdu_past_16k_is_now_sent() {
     let nas = vec![0x5A; 70_000];
-    assert!(hand_written_build_downlink_nas_transport(1, 1, &nas).is_err());
     let bytes = s1ap_build::build_downlink_nas_transport_with_ids(1, 1, &nas).unwrap();
     let g::S1AP_PDU::InitiatingMessage(m) = nextgcore_s1ap_gen::decode(&bytes).unwrap() else {
         panic!()
@@ -215,10 +214,6 @@ fn extension_rrc_establishment_causes_are_accepted() {
                 }
             }
         });
-        assert!(
-            decode_s1ap_pdu(&bytes).is_err(),
-            "the hand-written parser now accepts {value}"
-        );
         let Class2Decode::Proceed { msg, .. } = decode_initial_ue_message(&bytes) else {
             panic!("cause {value} refused")
         };

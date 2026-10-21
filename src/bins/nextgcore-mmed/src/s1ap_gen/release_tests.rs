@@ -1,19 +1,19 @@
 //! #514 stage 5: UE Context Release on the generated codec.
 //!
 //! Oracle: the pre-change hand-written builders and parser
-//! (`nextgcore_s1ap_oracle::builder`, `decode_s1ap_pdu`). Golden: octets derived by
+//! (`test_codec::builder`, `decode_s1ap_pdu`: since #514 stage 13b the generated codec with an independently written domain mapping, and builders for messages mmed sends check that their output decodes back to their input). Golden: octets derived by
 //! hand from X.691 (APER) for the TS 36.413 §9.1.4.5–§9.1.4.7 messages.
 
 use super::*;
 use crate::context::MmeContext;
 use crate::context::S1apCauseGroup;
 use crate::s1ap_build::cause_to_s1ap;
+use crate::s1ap_gen::test_codec::{builder, decode_s1ap_pdu};
 use crate::s1ap_handler::handle_s1ap_message;
 use nextgcore_s1ap::{
     CauseNas, CauseRadioNetwork, S1apMessage, UeContextReleaseCommand, UeContextReleaseComplete,
     UeContextReleaseRequest, UeS1apIds,
 };
-use nextgcore_s1ap_oracle::{builder, decode_s1ap_pdu};
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
