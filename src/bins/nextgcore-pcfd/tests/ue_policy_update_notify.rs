@@ -119,7 +119,8 @@ async fn update_posts_a_policy_update_to_the_recorded_notification_uri() {
     // The re-delivery an update triggers would try to reach an AMF; with delivery off
     // the only traffic the stub can see is the notification, so an arrival there is
     // unambiguous.
-    std::env::set_var("PCF_UE_POLICY_DELIVERY", "off");
+    // Pinned under the variable's own lock, restored on drop (#541).
+    let _delivery = nextgcore_pcfd::test_support::ue_policy_delivery(false);
 
     let (consumer, port, log, hits) = start_stub_consumer().await;
     let notification_uri =
@@ -186,7 +187,6 @@ async fn update_posts_a_policy_update_to_the_recorded_notification_uri() {
         "the 200 body must report the notification that demonstrably went out, got {reported}"
     );
 
-    std::env::remove_var("PCF_UE_POLICY_DELIVERY");
     consumer.stop().await.ok();
 }
 
@@ -205,7 +205,8 @@ async fn delete_posts_a_terminate_notification() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-    std::env::set_var("PCF_UE_POLICY_DELIVERY", "off");
+    // Pinned under the variable's own lock, restored on drop (#541).
+    let _delivery = nextgcore_pcfd::test_support::ue_policy_delivery(false);
 
     let (consumer, port, log, hits) = start_stub_consumer().await;
     let notification_uri =
@@ -249,7 +250,6 @@ async fn delete_posts_a_terminate_notification() {
         arrived.body
     );
 
-    std::env::remove_var("PCF_UE_POLICY_DELIVERY");
     consumer.stop().await.ok();
 }
 
