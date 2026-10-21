@@ -4274,12 +4274,20 @@ mod tests {
     /// Every assertion here is on association state the update MUTATED, not on the
     /// response shape, because the response was the part that already looked right.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn ue_policy_update_applies_the_request_instead_of_answering_a_canned_200() {
+        // Serialised with every test that touches the process-global PCF context or,
+        // through the handlers, the process-global NRF URI / SBI client cache (#529).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use base64::Engine as _;
 
         // Delivery off, so the update's re-delivery decision is observable without an
-        // AMF: the state changes are the subject here, not the N1N2 transfer.
-        std::env::set_var("PCF_UE_POLICY_DELIVERY", "off");
+        // AMF: the state changes are the subject here, not the N1N2 transfer. Pinned
+        // under the variable's own lock (#541) -- set bare, it switched delivery off for
+        // every UE-policy create running alongside, which then allocated no PTI.
+        let _delivery = crate::test_support::ue_policy_delivery(false);
         let assoc =
             ue_policy::ue_policy_add("imsi-001010000091004", "http://127.0.0.1:9/old-notify", "");
         let id = assoc.pol_asso_id.clone();
@@ -4359,8 +4367,6 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status, 404);
-
-        std::env::remove_var("PCF_UE_POLICY_DELIVERY");
     }
 
     fn full_create_body(supi: &str, psi: u8) -> serde_json::Value {
@@ -4378,7 +4384,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn sm_policy_create_missing_notification_uri_is_400() {
+        // Serialised with every test that touches the process-global PCF context or,
+        // through the handlers, the process-global NRF URI / SBI client cache (#529).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
         let mut body = full_create_body("imsi-001010000000050", 5);
         body.as_object_mut().unwrap().remove("notificationUri");
@@ -4388,7 +4400,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn sm_policy_update_without_triggers_does_not_panic() {
+        // Serialised with every test that touches the process-global PCF context or,
+        // through the handlers, the process-global NRF URI / SBI client cache (#529).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
         // Create
         let req = make_request(
@@ -4664,7 +4682,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn sm_policy_delete_via_post_subresource() {
+        // Serialised with every test that touches the process-global PCF context or,
+        // through the handlers, the process-global NRF URI / SBI client cache (#529).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
         let req = make_request(
             "POST",
@@ -4801,7 +4825,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn am_policy_update_via_post_subresource() {
+        // Serialised with every test that touches the process-global PCF context or,
+        // through the handlers, the process-global NRF URI / SBI client cache (#529).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
         let req = make_request(
             "POST",
@@ -4832,7 +4862,13 @@ mod tests {
     /// installs an AF-derived PccRule on the bound PDU session and the outbound
     /// SM policy update notify body carries it; the 201 echoes suppFeat.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn app_session_create_with_media_components_installs_pcc_rule() {
+        // Serialised with every test that touches the process-global PCF context or,
+        // through the handlers, the process-global NRF URI / SBI client cache (#529).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
 
         // Bind a PDU session with a known UE IP via SM policy create.
@@ -4949,7 +4985,13 @@ mod tests {
     /// bound to a real session, so the body-shape assertion — what the test is
     /// actually for — is unchanged while the fabrication is gone.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn app_session_create_without_media_components_is_backward_compatible() {
+        // Serialised with every test that touches the process-global PCF context or,
+        // through the handlers, the process-global NRF URI / SBI client cache (#529).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
         provision_session_with_ipv4("imsi-001010000000250", 12, "10.45.0.250").await;
         let resp = pcf_sbi_request_handler(make_request(
@@ -4982,7 +5024,13 @@ mod tests {
     /// so the original body was non-conformant and only passed because nothing
     /// validated it. The ascRespData claim is untouched.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn app_session_create_emergency_emits_asc_resp_data() {
+        // Serialised with every test that touches the process-global PCF context or,
+        // through the handlers, the process-global NRF URI / SBI client cache (#529).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
         provision_session_with_ipv4("imsi-001010000000251", 13, "10.45.0.251").await;
         let resp = pcf_sbi_request_handler(make_request(
@@ -5036,7 +5084,13 @@ mod tests {
     /// pcfd-08: AM policy create rejects (400 MANDATORY_IE_MISSING) when `supi`
     /// is absent — it must never synthesize a SUPI.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn am_policy_create_missing_supi_is_400() {
+        // Serialised with every test that touches the process-global PCF context or,
+        // through the handlers, the process-global NRF URI / SBI client cache (#529).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
@@ -5057,7 +5111,13 @@ mod tests {
     /// the matched-AMF's empty `suppFeat`) succeeds and the 201 always carries a
     /// negotiated `suppFeat` (mandatory per TS 29.507 §5.8).
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn am_policy_create_includes_negotiated_supp_feat() {
+        // Serialised with every test that touches the process-global PCF context or,
+        // through the handlers, the process-global NRF URI / SBI client cache (#529).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
@@ -5082,7 +5142,13 @@ mod tests {
     /// pcfd-05: SM policy create returns the negotiated (AND) suppFeat, not an
     /// echo of the SMF-requested value.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn sm_policy_create_negotiates_supp_feat_not_echo() {
+        // Serialised with every test that touches the process-global PCF context or,
+        // through the handlers, the process-global NRF URI / SBI client cache (#529).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
         let mut body = full_create_body("imsi-001010000000202", 12);
         // Consumer requests every bit; producer supports only PCF_SM mask.
@@ -5208,7 +5274,16 @@ mod tests {
 
     /// pcfd#0: full Npcf_UEPolicyControl lifecycle (TS 29.525).
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn ue_policy_create_get_update_delete_lifecycle() {
+        // Serialised with every test that touches the process-global PCF context or,
+        // through the handlers, the process-global NRF URI / SBI client cache (#529).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // The PTI assertion below holds only while delivery is ON, which is the default
+        // but a process-global any sibling can flip (#541): pin it for this test.
+        let _delivery = crate::test_support::ue_policy_delivery(true);
         pcf_context_init(64, 64);
         // Missing mandatory suppFeat -> 400
         let bad = serde_json::json!({
@@ -5319,7 +5394,13 @@ mod tests {
     /// used to read was the wrong envelope. The claim — non-empty rule maps — is
     /// unchanged.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn sm_policy_get_returns_stored_decision() {
+        // Serialised with every test that touches the process-global PCF context or,
+        // through the handlers, the process-global NRF URI / SBI client cache (#529).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
         let resp = pcf_sbi_request_handler(make_request(
             "POST",
@@ -5410,9 +5491,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        nextgcore_sbi::context::global_context()
-            .set_nrf_uri(format!("http://127.0.0.1:{port}"))
-            .await;
+        crate::test_support::point_nrf_at(format!("http://127.0.0.1:{port}")).await;
         server
     }
 
@@ -5442,6 +5521,17 @@ mod tests {
     async fn start_policy_data_peers(
         sm_data_for: std::collections::HashMap<String, serde_json::Value>,
     ) -> PolicyDataPeers {
+        start_policy_data_peers_with(sm_data_for, None).await
+    }
+
+    /// [`start_policy_data_peers`], with the stub SMF holding its FIRST answer back for
+    /// `first_answer_delay` -- longer than the PCF's 3 s request timeout makes the PCF's
+    /// notification client time out and retry (TS 29.500 §6.10), which is the at-least-once
+    /// delivery #529 tripped over: the stub then holds two copies of one notification.
+    async fn start_policy_data_peers_with(
+        sm_data_for: std::collections::HashMap<String, serde_json::Value>,
+        first_answer_delay: Option<Duration>,
+    ) -> PolicyDataPeers {
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
 
@@ -5450,8 +5540,10 @@ mod tests {
         let smf_port = smf_addr.port();
         let smf = SbiServer::on_listener(SbiServerConfig::new(smf_addr), smf_listener);
         let seen = notified.clone();
+        let delayed_once = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         smf.start(move |req: SbiRequest| {
             let seen = seen.clone();
+            let delayed_once = delayed_once.clone();
             async move {
                 let path = req.header.uri.split('?').next().unwrap_or("").to_string();
                 let body = req
@@ -5463,6 +5555,14 @@ mod tests {
                 seen.lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push((path, body));
+                if let Some(delay) = first_answer_delay {
+                    if !delayed_once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        // Received and processed, answered late: what a CPU-starved SMF (or
+                        // test host) does. The PCF times out and retries a notification the
+                        // SMF already has.
+                        tokio::time::sleep(delay).await;
+                    }
+                }
                 SbiResponse::with_status(204)
             }
         })
@@ -5531,9 +5631,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }
-        nextgcore_sbi::context::global_context()
-            .set_nrf_uri(format!("http://127.0.0.1:{udr_port}"))
-            .await;
+        crate::test_support::point_nrf_at(format!("http://127.0.0.1:{udr_port}")).await;
 
         PolicyDataPeers {
             udr,
@@ -5589,28 +5687,65 @@ mod tests {
         sess.sm_policy_id.clone()
     }
 
-    /// Every notification received by the stub SMF, after giving the detached POST a
-    /// bounded chance to arrive (`spawn_notification` is fire-and-forget).
+    /// The DISTINCT notifications the stub SMF has received, in arrival order (#529).
+    ///
+    /// PCF notification delivery is at-least-once: `deliver_notification` retries an
+    /// attempt that timed out (TS 29.500 §6.10), so a slow SMF -- or a starved test host --
+    /// legitimately receives the same notification twice. Two identical (path, body)
+    /// copies are one re-authorisation; counting raw arrivals is what made
+    /// `a_change_for_one_slice_does_not_reauthorise_another_slices_session` flake.
+    fn distinct_notifications(peers: &PolicyDataPeers) -> Vec<(String, serde_json::Value)> {
+        let raw = peers
+            .notified
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let mut distinct: Vec<(String, serde_json::Value)> = Vec::new();
+        for n in raw {
+            if !distinct.contains(&n) {
+                distinct.push(n);
+            }
+        }
+        distinct
+    }
+
+    /// Wait until the stub SMF holds `expected` distinct notifications, and return them.
+    ///
+    /// Event-bounded (#529): it returns as soon as they are there, and the ceiling only
+    /// stops a broken build from hanging -- it is not a timing assumption. The old 2 s
+    /// window was one: on a loaded host the detached POST (plus the PCF's own UDR re-read
+    /// before it) could take longer, and the count read as 0.
+    async fn await_notifications(
+        peers: &PolicyDataPeers,
+        expected: usize,
+    ) -> Vec<(String, serde_json::Value)> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            let got = distinct_notifications(peers);
+            if got.len() >= expected || tokio::time::Instant::now() >= deadline {
+                return got;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The distinct notifications present after a settle window, for ABSENCE checks
+    /// ("nothing is re-authorised", "no second session is"). An absence can only be
+    /// observed over a window; a late spurious notification makes such a check MISS a
+    /// defect, never fail on a correct PCF, so the window cannot produce a false failure.
+    /// Presence is asserted with [`await_notifications`].
     async fn drain_notifications(
         peers: &PolicyDataPeers,
         expected: usize,
     ) -> Vec<(String, serde_json::Value)> {
         for _ in 0..200 {
-            let got = peers
-                .notified
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
+            let got = distinct_notifications(peers);
             if got.len() >= expected {
                 return got;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        peers
-            .notified
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        distinct_notifications(peers)
     }
 
     /// #299 criterion 1: the URI the subscription advertises is one this router serves.
@@ -5621,7 +5756,13 @@ mod tests {
     /// a path nothing serves. So the guard feeds the advertised URI's own path back
     /// through the real router and refuses a 404/405.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn the_advertised_policy_data_callback_is_a_path_this_pcf_serves() {
+        // Serialised with every test that touches the process-global PCF context or,
+        // through the handlers, the process-global NRF URI / SBI client cache (#529).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let body = sbi_path::policy_data_subscription_body("http://10.0.0.1:7777/x");
         assert_eq!(
             body["monitoredResourceUris"],
@@ -5701,7 +5842,7 @@ mod tests {
         .await;
         assert_eq!(resp.status, 204);
 
-        let got = drain_notifications(&peers, 1).await;
+        let got = await_notifications(&peers, 1).await;
         assert_eq!(
             got.len(),
             1,
@@ -5744,6 +5885,9 @@ mod tests {
         ))
         .await;
         assert_eq!(resp.status, 204);
+        // One re-authorisation must arrive (event-bounded), and no second one over the
+        // settle window (#529: the split is presence vs absence).
+        await_notifications(&peers, 1).await;
         let got = drain_notifications(&peers, 2).await;
         assert_eq!(
             got.len(),
@@ -5888,16 +6032,12 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        nextgcore_sbi::context::global_context()
-            .set_nrf_uri(format!("http://127.0.0.1:{nrf_port}"))
-            .await;
+        crate::test_support::point_nrf_at(format!("http://127.0.0.1:{nrf_port}")).await;
 
         let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
         // `start_policy_data_peers` points the NRF URI at its own mock; put it back at
         // the one advertising the dead UDR.
-        nextgcore_sbi::context::global_context()
-            .set_nrf_uri(format!("http://127.0.0.1:{nrf_port}"))
-            .await;
+        crate::test_support::point_nrf_at(format!("http://127.0.0.1:{nrf_port}")).await;
 
         let stored = serde_json::json!({ "dnn": "internet", "online": true, "offline": false });
         seed_sm_policy_session(supi, 3, 1, "internet", peers.smf_port, Some(stored.clone()));
@@ -5974,7 +6114,7 @@ mod tests {
         .await;
         assert_eq!(resp.status, 204);
 
-        let got = drain_notifications(&peers, 1).await;
+        let got = await_notifications(&peers, 1).await;
         assert_eq!(
             got.len(),
             1,
@@ -6004,6 +6144,79 @@ mod tests {
         peers.smf.stop().await.ok();
     }
 
+    /// #529 regression: a notification the SMF received TWICE is still ONE re-authorisation.
+    ///
+    /// The stub SMF holds its first answer past the PCF's 3 s request timeout, so the
+    /// PCF's at-least-once delivery retries (TS 29.500 §6.10) and the SMF records the same
+    /// notification twice -- the condition a loaded host produced at random and the old
+    /// raw-count assertion read as "a second session was re-authorised". The raw count is
+    /// asserted to be 2 here, so this test fails if it stops exercising the retry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global NRF URI / PCF context
+    async fn a_retried_notification_is_one_reauthorisation_not_two() {
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pcf_context_init(64, 64);
+        let supi = "imsi-001010000000529";
+
+        let mut answers = std::collections::HashMap::new();
+        answers.insert(
+            "\"sst\":2".to_string(),
+            sm_policy_body(2, "internet", true, false),
+        );
+        let peers = start_policy_data_peers_with(answers, Some(Duration::from_millis(3500))).await;
+        seed_sm_policy_session(supi, 1, 1, "internet", peers.smf_port, None);
+        seed_sm_policy_session(
+            supi,
+            2,
+            2,
+            "internet",
+            peers.smf_port,
+            Some(serde_json::json!({ "dnn": "internet", "online": false, "offline": false })),
+        );
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            sbi_path::POLICY_DATA_NOTIFY_PATH,
+            Some(serde_json::json!({ "ueId": supi })),
+        ))
+        .await;
+        assert_eq!(resp.status, 204);
+
+        // Both copies arrive: the original (answered late), then the retry.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let raw = loop {
+            let raw = peers
+                .notified
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if raw.len() >= 2 || tokio::time::Instant::now() >= deadline {
+                break raw;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(
+            raw.len(),
+            2,
+            "the slow first answer must make the PCF retry, or this test no longer \
+             reproduces #529: {raw:?}"
+        );
+        assert_eq!(raw[0], raw[1], "the two arrivals are the same notification");
+
+        let got = await_notifications(&peers, 1).await;
+        assert_eq!(
+            got.len(),
+            1,
+            "one notification delivered twice is ONE re-authorisation, got {got:?}"
+        );
+        assert_eq!(got[0].0, "/nsmf-callback/v1/sm-policy-notify/2/update");
+
+        peers.udr.stop().await.ok();
+        peers.smf.stop().await.ok();
+    }
+
     /// #299 criterion 5: with no UDR configured or discoverable, the PCF behaves exactly
     /// as it did before — the notification is accepted and nothing is re-authorised,
     /// because there is nothing to re-read the decision from.
@@ -6018,9 +6231,7 @@ mod tests {
 
         // A stub SMF only: no NRF URI is set, so discovery yields nothing.
         let peers = start_policy_data_peers(std::collections::HashMap::new()).await;
-        nextgcore_sbi::context::global_context()
-            .set_nrf_uri(String::new())
-            .await;
+        crate::test_support::point_nrf_at(String::new()).await;
 
         let stored = serde_json::json!({ "dnn": "internet", "online": true, "offline": false });
         seed_sm_policy_session(supi, 7, 1, "internet", peers.smf_port, Some(stored.clone()));
@@ -6459,7 +6670,13 @@ mod tests {
     /// `SmPolicyControl{context, policy}`, and `context.supi` is the session's
     /// real SUPI — the flat body it used to return had no context at all.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn sm_policy_get_returns_the_sm_policy_control_envelope() {
+        // Serialised with every test that touches the process-global PCF context or,
+        // through the handlers, the process-global NRF URI / SBI client cache (#529).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
         let supi = "imsi-001010000000893";
         let mut create = full_create_body(supi, 30);
@@ -6549,7 +6766,13 @@ mod tests {
     /// arm, so a conformant AF teardown minted a phantom session and left the
     /// original PCC rules installed.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn spec_app_session_delete_removes_the_session_and_its_pcc_rules() {
+        // Serialised with every test that touches the process-global PCF context or,
+        // through the handlers, the process-global NRF URI / SBI client cache (#529).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
         provision_session_with_ipv4("imsi-001010000000880", 20, "10.45.0.180").await;
 
@@ -6607,7 +6830,13 @@ mod tests {
     /// The create arm no longer matches deeper paths: an unknown 5-segment POST
     /// is not dispatched to create (which would answer 201 and store a context).
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn create_arm_does_not_match_deeper_paths() {
+        // Serialised with every test that touches the process-global PCF context or,
+        // through the handlers, the process-global NRF URI / SBI client cache (#529).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
         provision_session_with_ipv4("imsi-001010000000881", 21, "10.45.0.181").await;
         let resp = pcf_sbi_request_handler(make_request(
@@ -6634,7 +6863,13 @@ mod tests {
     /// PDU_SESSION_NOT_AVAILABLE`, and nothing is stored. Before #88 it was a
     /// `201` with a fabricated, unaddressable appSessionId.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn create_with_unbindable_address_is_403_and_stores_nothing() {
+        // Serialised with every test that touches the process-global PCF context or,
+        // through the handlers, the process-global NRF URI / SBI client cache (#529).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
         for address in [
             ("ueIpv4", "10.99.99.99"),
@@ -6670,7 +6905,13 @@ mod tests {
     /// TS 29.514 Table 5.7.3-1: `notifUri` and `suppFeat` are mandatory and the
     /// UE address is a `oneOf` — zero and more-than-one are both `400`.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn create_rejects_missing_mandatory_ies_and_the_oneof() {
+        // Serialised with every test that touches the process-global PCF context or,
+        // through the handlers, the process-global NRF URI / SBI client cache (#529).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
         let cases: [(&str, serde_json::Value); 4] = [
             (
@@ -6714,7 +6955,13 @@ mod tests {
     /// address while the session holds a prefix, so an exact-string lookup would
     /// never match.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn create_binds_by_ipv6_address_within_the_session_prefix() {
+        // Serialised with every test that touches the process-global PCF context or,
+        // through the handlers, the process-global NRF URI / SBI client cache (#529).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
         let mut create = full_create_body("imsi-001010000000882", 22);
         create.as_object_mut().unwrap().insert(
@@ -6764,7 +7011,13 @@ mod tests {
     /// allocation then delivers an `EventsNotification` to the AF's `notifUri`
     /// (TS 29.514 §4.2.6). The notification is captured on a real local listener.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn events_subscription_stores_and_a_trigger_notifies_the_af() {
+        // Serialised with every test that touches the process-global PCF context or,
+        // through the handlers, the process-global NRF URI / SBI client cache (#529).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
         use std::sync::Mutex as StdMutex;
 
@@ -6927,7 +7180,13 @@ mod tests {
 
     /// `POST /app-sessions/pcscf-restoration` is its own operation, not a create.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // std guard held across .await to serialize the process-global PCF context / NRF URI
     async fn pcscf_restoration_is_routed_and_resolves_the_ue() {
+        // Serialised with every test that touches the process-global PCF context or,
+        // through the handlers, the process-global NRF URI / SBI client cache (#529).
+        let _guard = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         pcf_context_init(64, 64);
         provision_session_with_ipv4("imsi-001010000000884", 24, "10.45.0.184").await;
 
