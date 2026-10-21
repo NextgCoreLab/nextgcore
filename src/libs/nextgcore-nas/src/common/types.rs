@@ -2,6 +2,7 @@
 //!
 //! Based on 3GPP TS 24.501 and TS 24.301
 
+use crate::buf::NasBuf;
 use crate::error::{NasError, NasResult};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::fmt;
@@ -103,9 +104,9 @@ impl PlmnId {
             });
         }
 
-        let b0 = buf.get_u8();
-        let b1 = buf.get_u8();
-        let b2 = buf.get_u8();
+        let b0 = buf.read_u8()?;
+        let b1 = buf.read_u8()?;
+        let b2 = buf.read_u8()?;
 
         let mcc = [b0 & 0x0F, (b0 >> 4) & 0x0F, b1 & 0x0F];
         let mnc3 = (b1 >> 4) & 0x0F;
@@ -159,7 +160,7 @@ impl Tai {
             });
         }
         let mut tac = [0u8; 3];
-        buf.copy_to_slice(&mut tac);
+        buf.read_into(&mut tac)?;
         Ok(Self { plmn_id, tac })
     }
 
@@ -228,33 +229,30 @@ impl SNssai {
             });
         }
 
-        let len = buf.get_u8() as usize;
-        if buf.remaining() < len {
-            return Err(NasError::BufferTooShort {
-                expected: len,
-                actual: buf.remaining(),
+        let len = buf.read_u8()? as usize;
+        // TS 24.501 §9.11.2.8: the contents are at least the SST octet. Decode
+        // inside the declared length so a short or odd length can neither read
+        // past it nor leave octets behind for the next IE (#595).
+        if len < 1 {
+            return Err(NasError::InvalidIeLength {
+                expected: 1,
+                actual: len,
             });
         }
+        let mut ie = buf.read_bytes(len)?;
 
-        let sst = buf.get_u8();
-        let mut snssai = Self::new(sst);
-
-        let remaining = len - 1;
-        if remaining >= 3 {
+        let mut snssai = Self::new(ie.read_u8()?);
+        if ie.remaining() >= 3 {
             let mut sd = [0u8; 3];
-            buf.copy_to_slice(&mut sd);
+            ie.read_into(&mut sd)?;
             snssai.sd = Some(sd);
         }
-
-        let remaining = remaining.saturating_sub(3);
-        if remaining >= 1 {
-            snssai.mapped_hplmn_sst = Some(buf.get_u8());
+        if ie.remaining() >= 1 {
+            snssai.mapped_hplmn_sst = Some(ie.read_u8()?);
         }
-
-        let remaining = remaining.saturating_sub(1);
-        if remaining >= 3 {
+        if ie.remaining() >= 3 {
             let mut sd = [0u8; 3];
-            buf.copy_to_slice(&mut sd);
+            ie.read_into(&mut sd)?;
             snssai.mapped_hplmn_sd = Some(sd);
         }
 
@@ -358,8 +356,8 @@ impl GprsTimer2 {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.get_u8();
-        let value = buf.get_u8();
+        let length = buf.read_u8()?;
+        let value = buf.read_u8()?;
         Ok(Self { length, value })
     }
 }
@@ -416,8 +414,8 @@ impl GprsTimer3 {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.get_u8();
-        let byte = buf.get_u8();
+        let length = buf.read_u8()?;
+        let byte = buf.read_u8()?;
         Ok(Self {
             length,
             unit: (byte >> 5) & 0x07,
@@ -461,14 +459,14 @@ impl Dnn {
                 actual: buf.remaining(),
             });
         }
-        let len = buf.get_u8() as usize;
+        let len = buf.read_u8()? as usize;
         if buf.remaining() < len {
             return Err(NasError::BufferTooShort {
                 expected: len,
                 actual: buf.remaining(),
             });
         }
-        let value = buf.copy_to_bytes(len).to_vec();
+        let value = buf.read_bytes(len)?.to_vec();
         Ok(Self { value })
     }
 }
@@ -640,18 +638,18 @@ impl UeSecurityCapability {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.get_u8();
-        let ea = buf.get_u8();
-        let ia = buf.get_u8();
+        let length = buf.read_u8()?;
+        let ea = buf.read_u8()?;
+        let ia = buf.read_u8()?;
 
         let mut cap = Self::new(ea, ia);
         cap.length = length;
 
         if length >= 3 && buf.remaining() >= 1 {
-            cap.eea = Some(buf.get_u8());
+            cap.eea = Some(buf.read_u8()?);
         }
         if length >= 4 && buf.remaining() >= 1 {
-            cap.eia = Some(buf.get_u8());
+            cap.eia = Some(buf.read_u8()?);
         }
 
         Ok(cap)
@@ -696,14 +694,14 @@ impl AuthenticationResponseParameter {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.get_u8();
+        let length = buf.read_u8()?;
         if buf.remaining() < length as usize {
             return Err(NasError::BufferTooShort {
                 expected: length as usize,
                 actual: buf.remaining(),
             });
         }
-        let res = buf.copy_to_bytes(length as usize).to_vec();
+        let res = buf.read_bytes(length as usize)?.to_vec();
         Ok(Self { length, res })
     }
 }
@@ -740,14 +738,14 @@ impl Abba {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.get_u8();
+        let length = buf.read_u8()?;
         if buf.remaining() < length as usize {
             return Err(NasError::BufferTooShort {
                 expected: length as usize,
                 actual: buf.remaining(),
             });
         }
-        let contents = buf.copy_to_bytes(length as usize).to_vec();
+        let contents = buf.read_bytes(length as usize)?.to_vec();
         Ok(Self { length, contents })
     }
 }
@@ -784,14 +782,14 @@ impl EapMessage {
                 actual: buf.remaining(),
             });
         }
-        let length = buf.get_u16();
+        let length = buf.read_u16()?;
         if buf.remaining() < length as usize {
             return Err(NasError::BufferTooShort {
                 expected: length as usize,
                 actual: buf.remaining(),
             });
         }
-        let data = buf.copy_to_bytes(length as usize).to_vec();
+        let data = buf.read_bytes(length as usize)?.to_vec();
         Ok(Self { length, data })
     }
 }

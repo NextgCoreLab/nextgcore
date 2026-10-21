@@ -243,6 +243,11 @@ async fn pcfd_client_registers_binding_with_real_bsfd_over_http() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     init_peers();
+    // Plaintext loopback peers: a dev-profile deployment (issue #63). Declared
+    // here, not inherited from a sibling test that happened to run first; with
+    // no override the profile resolves to Production and NRF discovery dials TLS
+    // with /etc/nextgcore/tls/client.crt (#594).
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
 
     // Real bsfd SBI server.
     let (bsf_listener, bsf_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
@@ -324,6 +329,11 @@ async fn pcfd_updates_binding_ip_at_real_bsfd_over_http() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     init_peers();
+    // Plaintext loopback peers: a dev-profile deployment (issue #63). Declared
+    // here, not inherited from a sibling test that happened to run first; with
+    // no override the profile resolves to Production and NRF discovery dials TLS
+    // with /etc/nextgcore/tls/client.crt (#594).
+    nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
 
     let (bsf_listener, bsf_addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
     let bsf_server = SbiServer::on_listener(SbiServerConfig::new(bsf_addr), bsf_listener);
