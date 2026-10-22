@@ -102,7 +102,8 @@ for b in sgwcd sgwud hssd pcrfd smfd upfd; do cp binaries/nextgcore-$b /tmp/epc-
    && mkdir -p binaries && cp target/release/lte-enb target/release/lte-ue binaries/)
 
 PROFILE=epc CORE_BIN_DIR=/tmp/epc-binaries ./build-and-push.sh
-PROFILE=epc ./deploy-eks.sh
+# EPHEMERAL_STORAGE=true where there is no EBS CSI driver / gp3 class (devtest1)
+EPHEMERAL_STORAGE=true PROFILE=epc ./deploy-eks.sh
 PROFILE=epc ./e2e-internet.sh
 ```
 
