@@ -758,7 +758,11 @@ impl PfcpClient {
             }
             std::mem::replace(&mut *peer, resolved)
         };
-        log::warn!("PFCP: UPF hostname {host} now resolves to {resolved} (was {previous})");
+        if previous.ip().is_unspecified() {
+            log::info!("PFCP: UPF hostname {host} resolves to {resolved}");
+        } else {
+            log::warn!("PFCP: UPF hostname {host} now resolves to {resolved} (was {previous})");
+        }
         Some(resolved)
     }
 
