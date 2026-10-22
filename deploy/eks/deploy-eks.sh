@@ -7,8 +7,12 @@
 # StorageClass, and a namespace Pod Security label.
 #
 # Usage:
-#   ./deploy-eks.sh                              # control plane only (default)
+#   ./deploy-eks.sh                              # fresh: control plane only;
+#                                                #   re-run: keeps the live modes
 #   ENABLE_DATAPLANE=true ./deploy-eks.sh        # privileged UPF w/ real TUN
+#   EPHEMERAL_STORAGE=true ./deploy-eks.sh       # MongoDB on emptyDir (no EBS CSI)
+#   RECREATE_MONGODB=true ./deploy-eks.sh        # allow recreating the mongodb
+#                                                #   StatefulSet (data loss, see below)
 #   DRY_RUN=true ./deploy-eks.sh                 # render + validate, apply nothing
 #   PROFILE=epc ./deploy-eks.sh                  # another profile (default 5g)
 set -euo pipefail
@@ -26,14 +30,32 @@ NAMESPACE="${PROFILE_NAMESPACE}"
 
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-west-2}}"
 REPO_PREFIX="${REPO_PREFIX:-nextg}"
-ENABLE_DATAPLANE="${ENABLE_DATAPLANE:-false}"
+# "auto" (the default) adopts the live install's mode, so a plain re-run never
+# downgrades a data-plane install (#662): with a false default the UPF went
+# back to --no-dataplane and the namespace to baseline, and UE traffic stopped
+# with no error. A fresh install resolves auto to false. true/false force it.
+ENABLE_DATAPLANE="${ENABLE_DATAPLANE:-auto}"
 DRY_RUN="${DRY_RUN:-false}"
 # Swap MongoDB's gp3 PVC for an emptyDir. Needed on clusters without the EBS
 # CSI driver, where the PVC would stay Pending and stall every NF behind its
 # wait-for-mongodb initContainer. Data does not survive a pod restart; the
 # mongodb-init Job re-seeds subscribers each deploy, so for an E2E run the DB
 # is derived state. See profiles/5g/patches/mongodb-ephemeral.yaml.
-EPHEMERAL_STORAGE="${EPHEMERAL_STORAGE:-false}"
+#
+# "auto" (the default) adopts the live StatefulSet's storage (#657). Its
+# volumeClaimTemplates are IMMUTABLE: an install created with an emptyDir that a
+# re-run renders with a gp3 claim fails `kubectl apply` with "spec: Forbidden:
+# updates to statefulset spec for fields other than ...", which stopped this
+# script before its rollout waits and its image assertion. A fresh install
+# resolves auto to false (gp3 PVC).
+EPHEMERAL_STORAGE="${EPHEMERAL_STORAGE:-auto}"
+# Changing an immutable StatefulSet field (storage mode, claim size or class)
+# needs the StatefulSet deleted and recreated. Never done silently: MongoDB
+# holds the subscriber data, and on an emptyDir install the recreate LOSES it
+# (the mongodb-init Job re-seeds only the repo's test subscribers). A PVC
+# install's claims are retained. Without this flag such a change stops the
+# script before anything is applied.
+RECREATE_MONGODB="${RECREATE_MONGODB:-false}"
 
 log()  { printf '\033[0;32m[deploy]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn  ]\033[0m %s\n' "$*"; }
@@ -72,6 +94,39 @@ if [[ "${DRY_RUN}" != "true" ]]; then
   CTX="$(kubectl config current-context 2>/dev/null || true)"
   [[ -n "${CTX}" ]] || die "no kubectl context set. Run: aws eks update-kubeconfig ..."
 
+  # Resolve the "auto" modes from the live objects BEFORE the confirmation, so
+  # the operator approves what will actually be applied. The rules live in
+  # lib/live_modes.py with fixture tests.
+  LIVE_STS_JSON="$(mktemp -t nextg-live-sts-XXXXXX.json)"
+  LIVE_DP_JSON="$(mktemp -t nextg-live-dp-XXXXXX.json)"
+  trap 'rm -f "${LIVE_STS_JSON}" "${LIVE_DP_JSON}"' EXIT
+  kubectl get statefulset mongodb -n "${NAMESPACE}" -o json > "${LIVE_STS_JSON}" 2>/dev/null \
+    || : > "${LIVE_STS_JSON}"
+  : > "${LIVE_DP_JSON}"
+  if [[ -n "${PROFILE_DATAPLANE_DEPLOYMENT}" ]]; then
+    kubectl get deployment "${PROFILE_DATAPLANE_DEPLOYMENT}" -n "${NAMESPACE}" -o json \
+      > "${LIVE_DP_JSON}" 2>/dev/null || : > "${LIVE_DP_JSON}"
+  fi
+  LIVE_STORAGE="$(python3 "${SCRIPT_DIR}/lib/live_modes.py" storage "${LIVE_STS_JSON}")"
+  LIVE_DATAPLANE="$(python3 "${SCRIPT_DIR}/lib/live_modes.py" dataplane "${LIVE_DP_JSON}" \
+    "${PROFILE_DATAPLANE_DEPLOYMENT:-upf}")"
+  STORAGE_NOTE=""
+  if [[ "${EPHEMERAL_STORAGE}" == "auto" ]]; then
+    case "${LIVE_STORAGE}" in
+      ephemeral) EPHEMERAL_STORAGE=true;  STORAGE_NOTE=" (auto: kept from the live StatefulSet)" ;;
+      pvc)       EPHEMERAL_STORAGE=false; STORAGE_NOTE=" (auto: kept from the live StatefulSet)" ;;
+      *)         EPHEMERAL_STORAGE=false; STORAGE_NOTE=" (auto: fresh install)" ;;
+    esac
+  fi
+  DATAPLANE_NOTE=""
+  if [[ "${ENABLE_DATAPLANE}" == "auto" ]]; then
+    case "${LIVE_DATAPLANE}" in
+      true)  ENABLE_DATAPLANE=true;  DATAPLANE_NOTE=" (auto: kept from the live ${PROFILE_DATAPLANE_DEPLOYMENT})" ;;
+      false) ENABLE_DATAPLANE=false; DATAPLANE_NOTE=" (auto: kept from the live ${PROFILE_DATAPLANE_DEPLOYMENT})" ;;
+      *)     ENABLE_DATAPLANE=false; DATAPLANE_NOTE=" (auto: fresh install)" ;;
+    esac
+  fi
+
   # Deploying to the wrong cluster is the expensive mistake here, so make the
   # target explicit and require confirmation.
   cat <<EOF
@@ -82,8 +137,8 @@ if [[ "${DRY_RUN}" != "true" ]]; then
   registry       : ${REGISTRY}/${REPO_PREFIX}
   core NF tag    : ${CORE_TAG}
   gnb/ue tag     : ${SIM_TAG}
-  data plane     : ${ENABLE_DATAPLANE}
-  mongo storage  : $([[ "${EPHEMERAL_STORAGE}" == "true" ]] && echo "emptyDir (EPHEMERAL - data lost on restart)" || echo "gp3 PVC")
+  data plane     : ${ENABLE_DATAPLANE}${DATAPLANE_NOTE}
+  mongo storage  : $([[ "${EPHEMERAL_STORAGE}" == "true" ]] && echo "emptyDir (EPHEMERAL - data lost on restart)" || echo "gp3 PVC")${STORAGE_NOTE}
 
 EOF
   read -r -p "Apply to this cluster? [y/N] " reply
@@ -94,12 +149,15 @@ EOF
 else
   REGISTRY="${REGISTRY:-000000000000.dkr.ecr.${REGION}.amazonaws.com}"
   log "DRY_RUN: rendering only, nothing will be applied."
+  # No cluster to read: "auto" renders a fresh install.
+  [[ "${EPHEMERAL_STORAGE}" == "auto" ]] && EPHEMERAL_STORAGE=false
+  [[ "${ENABLE_DATAPLANE}" == "auto" ]] && ENABLE_DATAPLANE=false
 fi
 
 # --- render ----------------------------------------------------------------
 
 RENDERED="$(mktemp -t nextg-eks-XXXXXX.yaml)"
-trap 'rm -f "${RENDERED}" "${RENDERED}.tmp"' EXIT
+trap 'rm -f "${RENDERED}" "${RENDERED}.tmp" "${LIVE_STS_JSON:-}" "${LIVE_DP_JSON:-}"' EXIT
 
 log "rendering kustomize overlay..."
 # shellcheck disable=SC2086  # PROFILE_KUSTOMIZE_FLAGS is a word list
@@ -297,7 +355,7 @@ if [[ "${ENABLE_DATAPLANE}" == "true" && -n "${PROFILE_DATAPLANE_DEPLOYMENT}" ]]
   # `cmd | python3 - <<PY` overrides the piped stdin (shellcheck SC2259), so
   # the transform would read the script instead of the manifests.
   SWAP_PY="$(mktemp -t nextg-upf-swap-XXXXXX.py)"
-  trap 'rm -f "${RENDERED}" "${RENDERED}.tmp" "${SWAP_PY}"' EXIT
+  trap 'rm -f "${RENDERED}" "${RENDERED}.tmp" "${SWAP_PY}" "${LIVE_STS_JSON:-}" "${LIVE_DP_JSON:-}"' EXIT
   cat > "${SWAP_PY}" <<'PY'
 import sys, yaml
 patch = yaml.safe_load(open(sys.argv[1]))
@@ -447,6 +505,26 @@ PY
   exit 0
 fi
 
+# --- immutable StatefulSet fields (#657) -----------------------------------
+#
+# Checked against the FINAL rendered manifest (after the storage swap) and
+# before anything is applied (namespace, Secret, manifests), so a refused
+# change leaves the cluster untouched instead of half-applied.
+if [[ -s "${LIVE_STS_JSON:-}" ]]; then
+  if ! STS_DIFF="$(python3 "${SCRIPT_DIR}/lib/live_modes.py" sts-diff \
+        "${LIVE_STS_JSON}" "${RENDERED}" mongodb)"; then
+    warn "the mongodb StatefulSet would change IMMUTABLE fields:"
+    printf '         %s\n' "${STS_DIFF}" >&2
+    if [[ "${RECREATE_MONGODB}" != "true" ]]; then
+      die "refusing to recreate mongodb: it holds the subscriber data (live storage: ${LIVE_STORAGE}).
+       Leave EPHEMERAL_STORAGE unset to keep the live mode, or re-run with
+       RECREATE_MONGODB=true to delete and recreate the StatefulSet (an emptyDir's data is LOST)."
+    fi
+    warn "RECREATE_MONGODB=true: deleting statefulset/mongodb (PVCs are retained; an emptyDir's data is lost)"
+    kubectl delete statefulset mongodb -n "${NAMESPACE}" --wait=true
+  fi
+fi
+
 # --- namespace + pod security ---------------------------------------------
 
 log "creating namespace..."
@@ -556,7 +634,7 @@ profile_rollout
 # (IMAGE_TAG=latest) moving underneath an unchanged spec -- hence that warning.
 log "verifying running pods match the deployed images..."
 PODS_JSON="${RENDERED}.pods.json"
-trap 'rm -f "${RENDERED}" "${RENDERED}.tmp" "${PODS_JSON}" "${PEER_A_JSON}" "${PEER_B_JSON}"' EXIT
+trap 'rm -f "${RENDERED}" "${RENDERED}.tmp" "${PODS_JSON}" "${PEER_A_JSON}" "${PEER_B_JSON}" "${LIVE_STS_JSON:-}" "${LIVE_DP_JSON:-}"' EXIT
 
 if kubectl get pods -n "${NAMESPACE}" -o json > "${PODS_JSON}" 2>/dev/null; then
   verify_rc=0
