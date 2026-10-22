@@ -46,15 +46,24 @@ for arg in "$@"; do
   esac
 done
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/profile.sh
+source "${SCRIPT_DIR}/lib/profile.sh"
+nextg_load_profile "${PROFILE}" || exit 2
+
 case "${PROFILE}" in
   5g)
-    NAMESPACE="${NAMESPACE:-nextg-system}"
+    NAMESPACE="${NAMESPACE:-${PROFILE_NAMESPACE}}"
     UE_SELECTOR="${UE_SELECTOR:-app.kubernetes.io/name=ue}"
     UE_CONTAINER="${UE_CONTAINER:-ue}"
     UPF_SELECTOR="${UPF_SELECTOR:-app.kubernetes.io/name=upf}"
     UPF_CONTAINER="${UPF_CONTAINER:-upf}"
     TUN="${TUN:-uesimtun}"
     ;;
+  # A new profile adds a section here, setting the same six knobs: the UE pod
+  # selector and container, the core user-plane pod (whose log carries the
+  # "Data plane stats" line) and container, and the UE tunnel interface.
+  # NAMESPACE comes from the profile's profile.env.
   *)
     echo "PROFILE=${PROFILE} has no e2e-internet section yet (only 5g)" >&2
     exit 2
