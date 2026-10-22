@@ -434,7 +434,9 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
-    command: ["--sbi-addr", "172.23.0.31", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
+    # No --nrf-uri: eesd registers with an ECS over EDGE-6 (--ecs-uri), not with
+    # the NRF, and an unknown flag makes clap exit before the daemon starts (#694).
+    command: ["--sbi-addr", "172.23.0.31", "--sbi-port", "7777"]
     volumes:
       - ./configs/5gc/ees.yaml:/etc/nextgcore/ees.yaml:ro
     networks:
