@@ -10,6 +10,11 @@
 # one. S1-MME is kernel SCTP (mmed and lte-enb built with kernel-sctp, as
 # Dockerfile.builder does for the nightly); profile.env's postrender rewrites
 # the mme Service's s1ap port protocol when S1AP_PROTOCOL says otherwise.
+#
+# Every pod is pinned to the nextg.io/dataplane=true node(s), the same nodes the
+# 5G profile's privileged UPF uses (CloudFormation EnableDataPlanePrivileges):
+# SGW-U, PGW-U and the UE are privileged, and the MME and eNB need the node's
+# `sctp` kernel module, so one node set has to provide both.
 apiVersion: v1
 kind: Service
 metadata:
@@ -115,6 +120,8 @@ spec:
       - name: run
         emptyDir: {}
       terminationGracePeriodSeconds: 5
+      nodeSelector:
+        nextg.io/dataplane: 'true'
 ---
 apiVersion: v1
 kind: Service
@@ -221,6 +228,8 @@ spec:
       - name: run
         emptyDir: {}
       terminationGracePeriodSeconds: 5
+      nodeSelector:
+        nextg.io/dataplane: 'true'
 ---
 apiVersion: v1
 kind: Service
@@ -327,6 +336,8 @@ spec:
       - name: run
         emptyDir: {}
       terminationGracePeriodSeconds: 5
+      nodeSelector:
+        nextg.io/dataplane: 'true'
 ---
 apiVersion: v1
 kind: Service
@@ -458,6 +469,8 @@ spec:
       - name: run
         emptyDir: {}
       terminationGracePeriodSeconds: 5
+      nodeSelector:
+        nextg.io/dataplane: 'true'
 ---
 apiVersion: v1
 kind: Service
@@ -609,6 +622,8 @@ spec:
         securityContext:
           privileged: true
           runAsUser: 0
+      nodeSelector:
+        nextg.io/dataplane: 'true'
 ---
 apiVersion: v1
 kind: Service
@@ -750,6 +765,8 @@ spec:
         securityContext:
           privileged: true
           runAsUser: 0
+      nodeSelector:
+        nextg.io/dataplane: 'true'
 ---
 apiVersion: v1
 kind: Service
@@ -864,6 +881,8 @@ spec:
       - name: run
         emptyDir: {}
       terminationGracePeriodSeconds: 5
+      nodeSelector:
+        nextg.io/dataplane: 'true'
 ---
 apiVersion: v1
 kind: Service
@@ -968,6 +987,8 @@ spec:
       - name: run
         emptyDir: {}
       terminationGracePeriodSeconds: 5
+      nodeSelector:
+        nextg.io/dataplane: 'true'
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -1071,3 +1092,5 @@ spec:
         securityContext:
           privileged: true
           runAsUser: 0
+      nodeSelector:
+        nextg.io/dataplane: 'true'
