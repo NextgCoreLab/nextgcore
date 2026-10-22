@@ -5708,6 +5708,75 @@ impl NgapServer {
         Ok(())
     }
 
+    /// The connected-mode half of a Service Request's user-plane re-activation
+    /// (TS 23.502 §4.2.3.2): every PSI in the Uplink data status that the AMF holds
+    /// an SM context for is activated at its SMF, and the N2 SM information the SMF
+    /// answers goes to the gNB in a PDU SESSION RESOURCE SETUP REQUEST.
+    async fn activate_up_for_connected_service_request(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        nas: &[u8],
+    ) {
+        // `nas` is the plain message: the Uplink NAS Transport path already
+        // deciphered it, so a NAS message container needs no second pass.
+        let ies = service_request_session_ies(nas, &|_value: &mut Vec<u8>| {});
+        let held: Vec<(u8, Option<String>, crate::context::SNssai)> = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard
+                .sess_list_for_ue(amf_ue_ngap_id)
+                .into_iter()
+                .map(|s| {
+                    let r = self
+                        .sm_context_refs
+                        .get(&(amf_ue_ngap_id, s.psi))
+                        .cloned()
+                        .or(s.sm_context_ref.clone());
+                    (s.psi, r, s.s_nssai)
+                })
+                .collect()
+        };
+        for (psi, sm_ref, s_nssai) in
+            connected_sessions_to_activate(amf_ue_ngap_id, &held, ies.uplink_data_status)
+        {
+            let (smf_host, smf_port) = self.smf_target_for(amf_ue_ngap_id, psi);
+            let transfer = match crate::sbi_path::call_smf_activate_up_connection(
+                &smf_host, smf_port, &sm_ref,
+            )
+            .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    log::warn!("UE {amf_ue_ngap_id}: PSI {psi} UP activation failed: {e}");
+                    continue;
+                }
+            };
+            let Some(setup_req) = crate::ngap_asn1::build_pdu_session_resource_setup_request_asn1(
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                psi,
+                s_nssai.sst,
+                s_nssai.sd,
+                None,
+                &transfer,
+            ) else {
+                log::error!(
+                    "UE {amf_ue_ngap_id}: PSI {psi} PDU Session Resource Setup did not encode"
+                );
+                continue;
+            };
+            match self.send_to_association(association_id, &setup_req).await {
+                Ok(()) => log::info!(
+                    "UE {amf_ue_ngap_id}: PSI {psi} user plane re-activated (connected-mode \
+                     Service Request): PDU Session Resource Setup Request sent"
+                ),
+                Err(e) => log::warn!("UE {amf_ue_ngap_id}: PSI {psi} setup request not sent: {e}"),
+            }
+        }
+    }
+
     async fn handle_service_request_nas(
         &mut self,
         association_id: u64,
@@ -5763,6 +5832,21 @@ impl NgapServer {
         self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
             .await?;
         log::info!("Service Accept sent to UE {amf_ue_ngap_id} (protected)");
+
+        // TS 23.502 §4.2.3.2 steps 4-12 for a UE that is already CM-CONNECTED: the
+        // sessions in its Uplink data status get their user plane back --
+        // Nsmf_PDUSession_UpdateSMContext (upCnxState ACTIVATING), then a PDU SESSION
+        // RESOURCE SETUP REQUEST carrying the SMF's N2 SM information. The CM-IDLE
+        // path does this through the Initial Context Setup; before this nothing did it
+        // here, so a UE whose gNB moved (new cell, same NG context) was accepted and
+        // left with no user plane (nextgsim #288).
+        self.activate_up_for_connected_service_request(
+            association_id,
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            nas,
+        )
+        .await;
 
         // #74 criterion 5: CONNECTIVITY_STATE_REPORT, the CM-IDLE -> CM-CONNECTED half.
         // A Service Request is exactly that transition (TS 24.501 §5.6.1), which is the
@@ -13281,6 +13365,37 @@ pub(crate) fn service_request_session_ies(
         uplink_data_status: sr.uplink_data_status.map(|u| u.psi),
         pdu_session_status: sr.pdu_session_status.map(|p| p.psi),
     }
+}
+
+/// The sessions a CM-CONNECTED Service Request re-activates: each PSI in the
+/// Uplink data status that the AMF holds an SM context for (TS 23.502 §4.2.3.2).
+/// Release on PDU session status is the CM-IDLE path's job.
+pub(crate) fn connected_sessions_to_activate(
+    amf_ue_ngap_id: u64,
+    held: &[(u8, Option<String>, crate::context::SNssai)],
+    uplink_data_status: Option<u16>,
+) -> Vec<(u8, String, crate::context::SNssai)> {
+    let plan = plan_service_request_sessions(
+        &held.iter().map(|(psi, _, _)| *psi).collect::<Vec<_>>(),
+        ServiceRequestSessionIes {
+            uplink_data_status,
+            pdu_session_status: None,
+        },
+        &[],
+    );
+    plan.activate
+        .into_iter()
+        .filter_map(|psi| match held.iter().find(|(p, _, _)| *p == psi) {
+            Some((_, Some(r), s_nssai)) => Some((psi, r.clone(), s_nssai.clone())),
+            _ => {
+                log::warn!(
+                    "UE {amf_ue_ngap_id}: Service Request asks to activate PSI {psi}, which has \
+                     no SM context"
+                );
+                None
+            }
+        })
+        .collect()
 }
 
 /// What a Service Request asks of the AMF's sessions (#518).
@@ -21023,6 +21138,23 @@ mod tests {
     }
 
     // ---- #406: the AMF learns a location from every message that reports one ----
+
+    /// A CM-CONNECTED Service Request re-activates exactly the held sessions its
+    /// Uplink data status names (TS 23.502 §4.2.3.2; nextgsim #288).
+    #[test]
+    fn a_connected_service_request_activates_the_sessions_with_uplink_data() {
+        let slice = crate::context::SNssai { sst: 1, sd: None };
+        let held = vec![
+            (1u8, Some("ref-1".to_string()), slice.clone()),
+            (2u8, Some("ref-2".to_string()), slice.clone()),
+            (3u8, None, slice.clone()),
+        ];
+        // PSI 1 and PSI 3 have uplink data; PSI 3 has no SM context.
+        let picked = connected_sessions_to_activate(7, &held, Some((1 << 1) | (1 << 3)));
+        let picked: Vec<(u8, String)> = picked.into_iter().map(|(p, r, _)| (p, r)).collect();
+        assert_eq!(picked, vec![(1, "ref-1".to_string())]);
+        assert!(connected_sessions_to_activate(7, &held, None).is_empty());
+    }
 
     /// #669: Update/Release for an SM context go to the SMF that created it, not to
     /// `SMF_SBI_ADDR`; a context with no recorded owner keeps the old fallback.
