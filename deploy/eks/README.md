@@ -13,13 +13,50 @@ infrastructure they assume already exists.
 deploy/eks/
 ├── cloudformation/
 │   └── eks-cluster.yaml      VPC, EKS, node group, ECR, EBS CSI IRSA
-├── kustomization.yaml        overlay entrypoint (patches k8s/ + nextgsim/k8s/)
-├── patches/                  per-concern strategic-merge patches
+├── kustomization.yaml        default entrypoint: includes profiles/5g
+├── profiles/
+│   └── 5g/                   PROFILE=5g (default)
+│       ├── kustomization.yaml  overlay (patches k8s/ + nextgsim/k8s/)
+│       ├── patches/            per-concern strategic-merge patches
+│       └── profile.env         namespace, images, features, rollout hooks
 ├── lib/image-tag.sh          git-SHA image tag, shared by both scripts
+├── lib/profile.sh            PROFILE loader, shared by both scripts
 ├── build-and-push.sh         build 12 images, push to ECR
 ├── deploy-eks.sh             apply the overlay in dependency order
 └── README.md
 ```
+
+## Profiles
+
+Both scripts take `PROFILE=<name>` (default `5g`) and read
+`profiles/<name>/`:
+
+- `kustomization.yaml`: the overlay `deploy-eks.sh` renders.
+- `profile.env`: sourced bash (loaded by `lib/profile.sh`) that sets:
+
+| Variable | Meaning |
+|---|---|
+| `PROFILE_NAMESPACE` | namespace the profile deploys into (required) |
+| `PROFILE_NAMESPACE_MANIFEST` | repo-relative manifest that creates it; empty: `kubectl create namespace` |
+| `PROFILE_POD_SECURITY` | forced `pod-security.kubernetes.io/enforce` level; empty: baseline, or privileged with `ENABLE_DATAPLANE=true` |
+| `PROFILE_KUSTOMIZE_FLAGS` | extra `kubectl kustomize` flags |
+| `PROFILE_CARGO_FEATURES` | cargo features the binaries are built with (informational) |
+| `PROFILE_TAG_SUFFIX` | appended to the SHA-derived tags (not to an explicit `IMAGE_TAG`) |
+| `PROFILE_CORE_NFS` | core images, `<image>:<binary>`, packaged with `Dockerfile.nf` |
+| `PROFILE_SIM_IMAGES` | simulator images, `<image>:<Dockerfile>:<context>:<binary>[,...]`, relative to nextgsim |
+| `PROFILE_ADVERTISE_NFS` | NFs whose advertised SBI address is rewritten to the pod IP |
+| `PROFILE_HNET_SECRET` | `true`: create the `udm-hnet-keys` Secret |
+| `PROFILE_DATAPLANE_DEPLOYMENT` / `_PATCH` | what `ENABLE_DATAPLANE=true` swaps in |
+| `profile_postrender <file>` | in-place transform of the rendered manifests (before the generic rewrites) |
+| `profile_rollout()` / `profile_summary()` | rollout waits after apply; closing summary |
+
+`CORE_BIN_DIR=<dir>` makes `build-and-push.sh` package core binaries from a
+directory other than `nextgcore/binaries/`, e.g. a feature build's own output.
+
+`PROFILE=5g` renders byte-identically to the overlay before profiles existed,
+and `build-and-push.sh` issues the same docker/aws commands.
+`DRY_RUN=true` writes `rendered.dryrun.yaml` for 5g and
+`rendered.dryrun.<profile>.yaml` for the others.
 
 ## Images are tagged by git SHA, not `:latest`
 
