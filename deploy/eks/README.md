@@ -251,6 +251,20 @@ aws eks update-kubeconfig --region us-west-2 --name nextg
 ./deploy-eks.sh
 ```
 
+### Re-running against an existing install
+
+`ENABLE_DATAPLANE` and `EPHEMERAL_STORAGE` default to `auto`: a re-run keeps
+whatever the live install has (a privileged data-plane UPF, an emptyDir or
+PVC MongoDB), and the confirmation prompt says so. A fresh install resolves
+`auto` to `false`. Set either to `true`/`false` to change the mode on purpose.
+
+MongoDB's `volumeClaimTemplates` are immutable, so switching its storage, or
+its claim's size or class, means deleting and recreating the StatefulSet. The
+script checks the rendered StatefulSet against the live one before applying
+anything, and refuses unless `RECREATE_MONGODB=true` is set. On an emptyDir
+install the recreate loses the subscriber data; a PVC install keeps its
+claims.
+
 ## Verify
 
 ```bash
