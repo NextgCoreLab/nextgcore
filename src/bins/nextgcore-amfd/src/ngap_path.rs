@@ -5241,6 +5241,9 @@ impl NgapServer {
         );
         self.ue_auth_state.remove(old_id);
         state.ran_ue_ngap_id = initial_ue.ran_ue_ngap_id;
+        // #648: the AmfUe's own id is the key its sessions and store entry live under;
+        // it moves with them, or a SUPI lookup returns the old id and misses both.
+        state.amf_ue.id = amf_ue_ngap_id;
         state.association_id = association_id;
         state.reachability = None;
         state.cm_idle = false;
@@ -5353,6 +5356,11 @@ impl NgapServer {
         // The UE is back: its record moves to the new NGAP IDs and leaves CM-IDLE.
         self.ue_auth_state.remove(old_id);
         state.ran_ue_ngap_id = ran_ue_ngap_id;
+        // #648: the AmfUe's own id is the key its sessions and store entry live under;
+        // it moves with them. Left behind, every SUPI-addressed Namf request after this
+        // Service Request (the SMF's next paging N1N2MessageTransfer among them)
+        // looked the session up under the old id and answered 404.
+        state.amf_ue.id = amf_ue_ngap_id;
         state.association_id = association_id;
         state.reachability = None;
         state.cm_idle = false;
@@ -16421,6 +16429,10 @@ mod tests {
         );
         assert_eq!(resumed.ran_ue_ngap_id, 512, "on the new N2 connection");
         assert_eq!(resumed.amf_ue.ul_count, 5, "the verified uplink NAS COUNT");
+        assert_eq!(
+            resumed.amf_ue.id, new_id,
+            "#648: the AmfUe's own id moves with it, or a SUPI lookup misses its session"
+        );
         assert!(!ngap.ue_auth_state.contains(old_id), "nothing stays behind");
         let ctx = crate::context::amf_self();
         let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
@@ -16576,6 +16588,49 @@ mod tests {
             "#518: the session moved with the UE to its new NGAP ID"
         );
         assert!(!guard.sess_find_by_psi(new_id, 5).unwrap().paging.ongoing);
+    }
+
+    /// #648: after a Service Request from CM-IDLE moves the UE to its new AMF UE NGAP
+    /// ID, a SUPI-addressed Namf request still finds the UE's session. The SMF's next
+    /// paging N1N2MessageTransfer is such a request: it resolves the UE by SUPI and
+    /// looks the PDU session up under the `AmfUe`'s own id. That id stayed the old one
+    /// while the session moved, so the second downlink page was answered 404.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn after_a_service_request_the_ues_session_is_found_by_its_supi() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let old_id = 6_480_101u64;
+        let new_id = 6_480_102u64;
+        let supi = "imsi-001010000648101";
+        ngap.forced_amf_ue_ngap_id = Some(new_id);
+        let mut ue = idle_registered_ue(old_id);
+        ue.amf_ue.supi = Some(supi.to_string());
+        ngap.ue_auth_state.insert(old_id, ue);
+        {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard.sess_add(old_id, 5).expect("PSI 5");
+        }
+
+        let pdu = service_request_initial_ue(protected_service_request([0; 4], old_id as u32));
+        let _ = ngap.handle_initial_ue_message(1, &pdu).await;
+
+        let resolved =
+            crate::namf_server::find_ue_by_context_id(supi).expect("the UE resolves by its SUPI");
+        assert_eq!(resolved.id, new_id, "under the id it now lives under");
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        let sess = guard.sess_find_by_psi(resolved.id, 5);
+        assert!(
+            sess.is_some(),
+            "and the SUPI-resolved UE finds its PDU session, as the SMF's paging \
+             N1N2MessageTransfer needs"
+        );
+        if let Some(sess) = sess {
+            guard.sess_remove(sess.id);
+        }
+        drop(guard);
+        ngap.ue_auth_state.remove(new_id);
     }
 
     /// #518: a SERVICE REQUEST's session IEs are read from the full message in its
