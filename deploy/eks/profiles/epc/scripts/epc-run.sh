@@ -88,7 +88,14 @@ for pair in $MAP; do
   n=${pair%%:*}
   name=${pair#*:}
   grep -qE "172\.24\.0\.$n([^0-9]|\$)" "$OUT"/* || continue
-  ip=$(addr_of "$name")
+  # A node named only in comments (pgwu.yaml mentions the PGW-C and the
+  # SGW-U, but takes neither address) is not a peer. Tracking it made this
+  # pod restart, and drop every session it held, whenever that node moved.
+  if grep -hvE '^[[:space:]]*#' "$OUT"/* | grep -qE "172\.24\.0\.$n([^0-9]|\$)"; then
+    ip=$(addr_of "$name")
+  else
+    ip="<$name>"
+  fi
   sed -i -E "s/172\.24\.0\.$n([^0-9]|\$)/$ip\1/g" "$OUT"/*
   log "172.24.0.$n ($name) -> $ip"
 done

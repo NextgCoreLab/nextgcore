@@ -299,6 +299,13 @@ spec:
           value: '1'
         - name: EPC_EXPORT
           value: SGWC_PGW_S5C=pgwc SGWC_GTPU_ADVERTISE=sgwu
+        # TS 23.007 §18: the GTP-C restart counter must survive the restart it
+        # signals. The image's /var/lib/nextgcore is the container's writable
+        # layer, which a container restart (the liveness probe's remedy) discards,
+        # so every restart advertised Recovery 1 again and no peer could see it.
+        # /run/epc is the pod's emptyDir, which outlives container restarts.
+        - name: SGWC_RESTART_COUNTER_FILE
+          value: /run/epc/sgwc-restart-counter
         volumeMounts:
         - name: templates
           mountPath: /epc/templates
@@ -848,6 +855,9 @@ spec:
           value: info
         - name: RUST_BACKTRACE
           value: '1'
+        # TS 23.007 §18: see sgwc; the counter outlives a container restart.
+        - name: MME_RESTART_COUNTER_FILE
+          value: /run/epc/mme-restart-counter
         volumeMounts:
         - name: templates
           mountPath: /epc/templates
