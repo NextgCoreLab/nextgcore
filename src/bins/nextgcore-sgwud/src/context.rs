@@ -825,7 +825,11 @@ impl SgwuContext {
         if let Some(mut sess) = sess_list.remove(&id) {
             // Remove from hash tables
             sgwu_sxa_seid_hash.remove(&sess.sgwu_sxa_seid);
-            sgwc_sxa_seid_hash.remove(&sess.sgwc_sxa_f_seid.seid);
+            // #700: two CP functions may use the same SEID, so the SEID-only entry
+            // may name another session; it is removed only when it names this one.
+            if sgwc_sxa_seid_hash.get(&sess.sgwc_sxa_f_seid.seid) == Some(&id) {
+                sgwc_sxa_seid_hash.remove(&sess.sgwc_sxa_f_seid.seid);
+            }
             sgwc_sxa_f_seid_hash.remove(&sess.sgwc_sxa_f_seid);
 
             // Drop all user-plane rules belonging to the session
