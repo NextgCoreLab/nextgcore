@@ -727,8 +727,10 @@ async fn main() -> Result<()> {
     // Issue #20: UPF_PFCP_ADDR accepts a comma-separated peer list
     // ("10.0.0.5,10.0.0.6:8806"); an entry without a port uses
     // UPF_PFCP_PORT. A single entry — the default — behaves exactly as the
-    // pre-pool single-UPF configuration.
-    let upf_pfcp_addrs: Vec<SocketAddr> = {
+    // pre-pool single-UPF configuration. #658: an entry may also be a hostname
+    // ("upf.nextg-system.svc.cluster.local"), re-resolved on every association
+    // attempt so a UPF that restarts at a new address is found again.
+    let upf_pfcp_peers: Vec<pfcp_path::UpfPeerSpec> = {
         let addrs = std::env::var("UPF_PFCP_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
         let default_port: u16 = std::env::var("UPF_PFCP_PORT")
             .ok()
@@ -736,15 +738,9 @@ async fn main() -> Result<()> {
             .unwrap_or(8805);
         let mut peers = Vec::new();
         for entry in addrs.split(',').map(str::trim).filter(|e| !e.is_empty()) {
-            let candidate = if entry.contains(':') {
-                entry.to_string()
-            } else {
-                format!("{entry}:{default_port}")
-            };
             peers.push(
-                candidate
-                    .parse()
-                    .with_context(|| format!("Invalid UPF PFCP address '{entry}'"))?,
+                pfcp_path::parse_upf_peer(entry, default_port)
+                    .map_err(|e| anyhow::anyhow!("Invalid UPF PFCP address '{entry}': {e}"))?,
             );
         }
         anyhow::ensure!(!peers.is_empty(), "UPF_PFCP_ADDR contains no usable peer");
@@ -765,7 +761,7 @@ async fn main() -> Result<()> {
             .await
             .with_context(|| format!("Failed to bind SMF PFCP socket on {pfcp_bind_addr}"))?,
     );
-    log::info!("SMF N4 PFCP socket bound on {pfcp_bind_addr} (UPF peers: {upf_pfcp_addrs:?})");
+    log::info!("SMF N4 PFCP socket bound on {pfcp_bind_addr} (UPF peers: {upf_pfcp_peers:?})");
 
     // The S5/S8 (PGW-C) role (#52). Bound AFTER the N4 socket and the PFCP pool,
     // because a Create Session Request cannot be answered without a UPF to provision —
@@ -780,16 +776,12 @@ async fn main() -> Result<()> {
         }
     });
 
-    let pfcp_clients: Vec<Arc<pfcp_path::PfcpClient>> = upf_pfcp_addrs
-        .iter()
-        .map(|&peer| {
-            Arc::new(pfcp_path::PfcpClient::new(
-                pfcp_socket.clone(),
-                peer,
-                smf_node_ip,
-            ))
-        })
-        .collect();
+    let mut pfcp_clients: Vec<Arc<pfcp_path::PfcpClient>> = Vec::new();
+    for spec in &upf_pfcp_peers {
+        pfcp_clients.push(Arc::new(
+            pfcp_path::client_for_peer(pfcp_socket.clone(), spec, smf_node_ip).await,
+        ));
+    }
     // Installs the whole pool and pool slot 0 as the process-wide default
     // client (the legacy single-client paths keep working unchanged).
     pfcp_path::set_global_pool(pfcp_clients.clone());
@@ -874,7 +866,7 @@ async fn main() -> Result<()> {
             }
             for client_assoc in &clients_assoc {
                 if !client_assoc.is_associated().await {
-                    if let Err(e) = client_assoc.associate().await {
+                    if let Err(e) = pfcp_path::try_associate(client_assoc).await {
                         // Abnormal action on association failure: declare the
                         // UPF unreachable and retry next cycle. Handled
                         // per-peer (issue #20 review): one unreachable UPF

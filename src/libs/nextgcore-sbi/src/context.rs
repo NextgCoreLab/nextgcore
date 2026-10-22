@@ -106,6 +106,34 @@ impl NfInstance {
             .iter()
             .find(|s| s.service_type == service_type)
     }
+
+    /// The `(host, port)` a consumer dials for `service_type` on this instance:
+    /// the service's own IP, else the instance IPv4, else the service FQDN, else
+    /// the instance FQDN, on the service's port. The one spelling every
+    /// consumer uses, so a failed endpoint can be matched back to its profile
+    /// (#435, #664).
+    pub fn endpoint_for(&self, service_type: SbiServiceType) -> Option<(String, u16)> {
+        let svc = self.find_service(service_type)?;
+        let host = svc
+            .ip_addresses
+            .first()
+            .or(self.ipv4_addresses.first())
+            .or(svc.fqdn.as_ref())
+            .or(self.fqdn.as_ref())?;
+        Some((host.clone(), svc.port))
+    }
+
+    /// Every `(host, port)` this instance can be reached at, for any service.
+    fn endpoints(&self) -> impl Iterator<Item = (&str, u16)> + '_ {
+        self.services.iter().flat_map(move |svc| {
+            svc.ip_addresses
+                .iter()
+                .chain(self.ipv4_addresses.iter())
+                .chain(svc.fqdn.iter())
+                .chain(self.fqdn.iter())
+                .map(move |h| (h.as_str(), svc.port))
+        })
+    }
 }
 
 /// NF Status
@@ -179,6 +207,32 @@ pub fn search_result_validity(search_result: &serde_json::Value) -> Duration {
     }
 }
 
+/// How long an endpoint that just failed at the transport level is avoided
+/// (#664). Long enough to outlast an NRF that still lists a dead pod's profile
+/// (heartbeat expiry is 2 x heartBeatTimer, 20 s by default), short enough that
+/// a peer which comes back at the same address is used again soon. A success
+/// to the endpoint clears it at once.
+pub const ENDPOINT_HOLD_DOWN: Duration = Duration::from_secs(30);
+
+/// A transport failure recorded against an endpoint (#664).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EndpointFailure {
+    /// When it failed.
+    pub at: Instant,
+    /// `true` when the request provably never reached the peer (connection
+    /// refused/reset before sending, connect timeout): safe to resend anywhere.
+    pub undelivered: bool,
+}
+
+/// Re-runs NRF discovery for `(target NF type, service name)` on behalf of the
+/// SBI client (#664). Each NF registers its own, because the discovery query
+/// (requester type, extra query factors) is NF-specific.
+pub type RediscoveryHook = Arc<
+    dyn Fn(NfType, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// SBI Context - manages NF instances and clients
 pub struct SbiContext {
     /// Self NF instance
@@ -191,6 +245,11 @@ pub struct SbiContext {
     subscriptions: RwLock<HashMap<String, NfSubscription>>,
     /// NRF URI
     nrf_uri: RwLock<Option<String>>,
+    /// Endpoints (`host:port`) whose last transport attempt failed (#664).
+    /// A std lock: never held across an await, and read from sync sort keys.
+    failed_endpoints: std::sync::RwLock<HashMap<String, EndpointFailure>>,
+    /// NRF re-discovery, registered by the NF (#664).
+    rediscovery: std::sync::RwLock<Option<RediscoveryHook>>,
 }
 
 impl SbiContext {
@@ -202,6 +261,133 @@ impl SbiContext {
             clients: RwLock::new(HashMap::new()),
             subscriptions: RwLock::new(HashMap::new()),
             nrf_uri: RwLock::new(None),
+            failed_endpoints: std::sync::RwLock::new(HashMap::new()),
+            rediscovery: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Record a transport failure to `host:port` (#664). Instances reachable
+    /// there sort last in every lookup for [`ENDPOINT_HOLD_DOWN`].
+    pub fn note_endpoint_failure(&self, host: &str, port: u16, undelivered: bool) {
+        if let Ok(mut map) = self.failed_endpoints.write() {
+            map.insert(
+                format!("{host}:{port}"),
+                EndpointFailure {
+                    at: Instant::now(),
+                    undelivered,
+                },
+            );
+        }
+    }
+
+    /// The peer at `host:port` answered: it is not dead, whatever happened before.
+    pub fn clear_endpoint_failure(&self, host: &str, port: u16) {
+        let key = format!("{host}:{port}");
+        let present = self
+            .failed_endpoints
+            .read()
+            .map(|m| m.contains_key(&key))
+            .unwrap_or(false);
+        if present {
+            if let Ok(mut map) = self.failed_endpoints.write() {
+                map.remove(&key);
+            }
+        }
+    }
+
+    /// The failure recorded against `host:port` within the hold-down, if any.
+    pub fn endpoint_failure(&self, host: &str, port: u16) -> Option<EndpointFailure> {
+        let map = self.failed_endpoints.read().ok()?;
+        map.get(&format!("{host}:{port}"))
+            .copied()
+            .filter(|f| f.at.elapsed() < ENDPOINT_HOLD_DOWN)
+    }
+
+    /// Whether `host:port` failed within the hold-down.
+    pub fn endpoint_held_down(&self, host: &str, port: u16) -> bool {
+        self.endpoint_failure(host, port).is_some()
+    }
+
+    /// Whether any endpoint of `instance` is held down.
+    pub fn instance_held_down(&self, instance: &NfInstance) -> bool {
+        let Ok(map) = self.failed_endpoints.read() else {
+            return false;
+        };
+        if map.is_empty() {
+            return false;
+        }
+        instance.endpoints().any(|(h, p)| {
+            map.get(&format!("{h}:{p}"))
+                .is_some_and(|f| f.at.elapsed() < ENDPOINT_HOLD_DOWN)
+        })
+    }
+
+    /// Order `instances` so held-down ones come last, keeping the rest in their
+    /// order. A held-down instance stays selectable when nothing else exists:
+    /// avoiding a peer is not the same as refusing the only one there is.
+    fn healthy_first(&self, mut instances: Vec<NfInstance>) -> Vec<NfInstance> {
+        instances.sort_by_key(|i| self.instance_held_down(i));
+        instances
+    }
+
+    /// Register this NF's NRF re-discovery (#664).
+    pub fn set_rediscovery_hook(&self, hook: RediscoveryHook) {
+        if let Ok(mut slot) = self.rediscovery.write() {
+            *slot = Some(hook);
+        }
+    }
+
+    /// Run the registered re-discovery, if any. Returns whether one ran.
+    pub async fn rediscover(&self, nf_type: NfType, service_name: &str) -> bool {
+        let hook = self.rediscovery.read().ok().and_then(|h| h.clone());
+        match hook {
+            Some(hook) => {
+                hook(nf_type, service_name.to_string()).await;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Replace every cached instance of `nf_type` with the profiles one discovery
+    /// answer returned (#664), each valid for `validity`.
+    ///
+    /// Discovery used to MERGE into the cache, so a profile the NRF had dropped
+    /// (a restarted pod registers under a new random instance id) stayed
+    /// selectable for its whole validity, next to its replacement. The answer is
+    /// the NRF's current view; anything of that type it no longer lists goes.
+    pub async fn replace_nf_instances(
+        &self,
+        nf_type: NfType,
+        fresh: Vec<NfInstance>,
+        validity: Duration,
+    ) {
+        let mut instances = self.nf_instances.write().await;
+        let keep: std::collections::HashSet<&str> = fresh.iter().map(|i| i.id.as_str()).collect();
+        let dropped: Vec<String> = instances
+            .iter()
+            .filter(|(id, c)| c.instance.nf_type == nf_type && !keep.contains(id.as_str()))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &dropped {
+            instances.remove(id);
+        }
+        let expires_at = Some(Instant::now() + validity);
+        for instance in fresh {
+            instances.insert(
+                instance.id.clone(),
+                CachedNfInstance {
+                    instance,
+                    expires_at,
+                },
+            );
+        }
+        drop(instances);
+        for id in dropped {
+            log::info!(
+                "Dropped {} instance {id} from the discovery cache: the NRF no longer lists it",
+                nf_type.to_str()
+            );
         }
     }
 
@@ -221,6 +407,11 @@ impl SbiContext {
     pub async fn set_nrf_uri(&self, uri: impl Into<String>) {
         let mut nrf_uri = self.nrf_uri.write().await;
         *nrf_uri = Some(uri.into());
+    }
+
+    /// Forget the NRF URI (a test restoring the "no NRF configured" state).
+    pub async fn clear_nrf_uri(&self) {
+        *self.nrf_uri.write().await = None;
     }
 
     /// Get the NRF URI
@@ -308,31 +499,40 @@ impl SbiContext {
     /// FQDN, is `host`. Returns the evicted IDs; an endpoint matching nothing
     /// (the NRF itself, a notification URI, an env-var fallback) evicts nothing.
     pub async fn evict_nf_instances_at_endpoint(&self, host: &str, port: u16) -> Vec<String> {
+        self.take_nf_instances_at_endpoint(host, port)
+            .await
+            .into_iter()
+            .map(|i| i.id)
+            .collect()
+    }
+
+    /// [`Self::evict_nf_instances_at_endpoint`], returning the evicted profiles
+    /// themselves, so the SBI client knows which NF type and service to find a
+    /// replacement for (#664).
+    pub async fn take_nf_instances_at_endpoint(&self, host: &str, port: u16) -> Vec<NfInstance> {
         let mut instances = self.nf_instances.write().await;
         let dead: Vec<String> = instances
             .iter()
             .filter(|(_, cached)| {
-                let inst = &cached.instance;
-                inst.services.iter().any(|svc| {
-                    svc.port == port
-                        && (svc.ip_addresses.iter().any(|a| a == host)
-                            || svc.fqdn.as_deref() == Some(host)
-                            || inst.ipv4_addresses.iter().any(|a| a == host)
-                            || inst.fqdn.as_deref() == Some(host))
-                })
+                cached
+                    .instance
+                    .endpoints()
+                    .any(|(h, p)| h == host && p == port)
             })
             .map(|(id, _)| id.clone())
             .collect();
-        for id in &dead {
-            instances.remove(id);
-        }
+        let taken: Vec<NfInstance> = dead
+            .iter()
+            .filter_map(|id| instances.remove(id).map(|c| c.instance))
+            .collect();
         drop(instances);
-        for id in &dead {
+        for inst in &taken {
             log::info!(
-                "Evicted NF instance {id} from the discovery cache: {host}:{port} is unreachable"
+                "Evicted NF instance {} from the discovery cache: {host}:{port} is unreachable",
+                inst.id
             );
         }
-        dead
+        taken
     }
 
     /// Drop every entry past its validity deadline, returning how many went.
@@ -357,13 +557,19 @@ impl SbiContext {
     }
 
     /// Find non-expired NF instances by type
+    ///
+    /// Instances with a held-down endpoint (#664) come last, so `first()` picks a
+    /// peer that has not just failed whenever one exists.
     pub async fn find_nf_instances_by_type(&self, nf_type: NfType) -> Vec<NfInstance> {
-        let instances = self.nf_instances.read().await;
-        instances
-            .values()
-            .filter(|cached| !cached.is_expired() && cached.instance.nf_type == nf_type)
-            .map(|cached| cached.instance.clone())
-            .collect()
+        let found: Vec<NfInstance> = {
+            let instances = self.nf_instances.read().await;
+            instances
+                .values()
+                .filter(|cached| !cached.is_expired() && cached.instance.nf_type == nf_type)
+                .map(|cached| cached.instance.clone())
+                .collect()
+        };
+        self.healthy_first(found)
     }
 
     /// Find non-expired NF instances by service type
@@ -371,19 +577,23 @@ impl SbiContext {
         &self,
         service_type: SbiServiceType,
     ) -> Vec<NfInstance> {
-        let instances = self.nf_instances.read().await;
-        instances
-            .values()
-            .filter(|cached| {
-                !cached.is_expired()
-                    && cached
-                        .instance
-                        .services
-                        .iter()
-                        .any(|s| s.service_type == service_type)
-            })
-            .map(|cached| cached.instance.clone())
-            .collect()
+        let found: Vec<NfInstance> = {
+            let instances = self.nf_instances.read().await;
+            instances
+                .values()
+                .filter(|cached| {
+                    !cached.is_expired()
+                        && cached
+                            .instance
+                            .services
+                            .iter()
+                            .any(|s| s.service_type == service_type)
+                })
+                .map(|cached| cached.instance.clone())
+                .collect()
+        };
+        // Held-down instances last (#664), as in `find_nf_instances_by_type`.
+        self.healthy_first(found)
     }
 
     /// Get or create a client for the given endpoint
@@ -462,6 +672,14 @@ impl Default for SbiContext {
 
 /// Global SBI context (thread-safe singleton pattern)
 static GLOBAL_CONTEXT: std::sync::OnceLock<Arc<SbiContext>> = std::sync::OnceLock::new();
+
+/// Serialises this crate's tests that install a re-discovery hook or rely on the
+/// global context's failover (#664). The hook is one process-wide slot, so two
+/// tests installing different stand-in NRFs would answer each other's lookups.
+/// Declared beside the global it guards, never in a `mod tests`.
+#[cfg(test)]
+pub(crate) static GLOBAL_FAILOVER_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 /// Get the global SBI context
 pub fn global_context() -> Arc<SbiContext> {
@@ -744,6 +962,75 @@ mod tests {
                 .is_empty(),
             "nothing left at that endpoint to evict"
         );
+    }
+
+    fn svc_instance(id: &str, nf_type: NfType, host: &str, port: u16) -> NfInstance {
+        let mut inst = NfInstance::new(id, nf_type);
+        let mut svc = NfService::new("nsmf-pdusession", SbiServiceType::NsmfPdusession);
+        svc.ip_addresses = vec![host.to_string()];
+        svc.port = port;
+        inst.services = vec![svc];
+        inst
+    }
+
+    /// #664: a discovery answer replaces what the cache holds for that NF type.
+    /// A profile the NRF no longer lists goes; other types are untouched.
+    #[tokio::test]
+    async fn a_discovery_answer_replaces_the_cached_profiles_of_its_type() {
+        let ctx = SbiContext::new();
+        let ttl = Duration::from_secs(3600);
+        ctx.add_nf_instance_with_validity(svc_instance("old", NfType::Smf, "10.0.0.1", 7777), ttl)
+            .await;
+        ctx.add_nf_instance_with_validity(svc_instance("pcf", NfType::Pcf, "10.0.0.9", 7777), ttl)
+            .await;
+        ctx.replace_nf_instances(
+            NfType::Smf,
+            vec![svc_instance("new", NfType::Smf, "10.0.0.2", 7777)],
+            ttl,
+        )
+        .await;
+        assert!(
+            ctx.get_nf_instance("old").await.is_none(),
+            "dropped by the NRF"
+        );
+        assert!(ctx.get_nf_instance("new").await.is_some());
+        assert!(
+            ctx.get_nf_instance("pcf").await.is_some(),
+            "another type is untouched"
+        );
+    }
+
+    /// #664: an endpoint that just failed sorts last, so `first()` picks the peer
+    /// that has not; a success clears it; with no alternative it stays usable.
+    #[tokio::test]
+    async fn a_failed_endpoint_sorts_last_until_it_answers() {
+        let ctx = SbiContext::new();
+        let ttl = Duration::from_secs(3600);
+        ctx.add_nf_instance_with_validity(svc_instance("a", NfType::Smf, "10.0.0.1", 7777), ttl)
+            .await;
+        ctx.add_nf_instance_with_validity(svc_instance("b", NfType::Smf, "10.0.0.2", 7777), ttl)
+            .await;
+        for dead in ["10.0.0.1", "10.0.0.2"] {
+            ctx.note_endpoint_failure(dead, 7777, true);
+            let other = if dead == "10.0.0.1" { "b" } else { "a" };
+            for _ in 0..10 {
+                let by_svc = ctx
+                    .find_nf_instances_by_service(SbiServiceType::NsmfPdusession)
+                    .await;
+                assert_eq!(by_svc[0].id, other, "{dead} failed");
+                assert_eq!(
+                    ctx.find_nf_instances_by_type(NfType::Smf).await[0].id,
+                    other
+                );
+            }
+            assert_eq!(
+                ctx.find_nf_instances_by_type(NfType::Smf).await.len(),
+                2,
+                "held down is not removed"
+            );
+            ctx.clear_endpoint_failure(dead, 7777);
+            assert!(!ctx.endpoint_held_down(dead, 7777));
+        }
     }
 
     /// `validityPeriod` drives the TTL; a MISSING member falls back to the
