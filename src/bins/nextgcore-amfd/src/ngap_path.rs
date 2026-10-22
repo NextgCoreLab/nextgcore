@@ -20974,31 +20974,6 @@ mod tests {
 
     // ---- #406: the AMF learns a location from every message that reports one ----
 
-    /// #406 criteria 1-4: a real `UplinkNASTransport` refreshes BOTH the stored TAI and
-    /// the stored cell identity, and the values are the ones the message carried.
-    ///
-    /// **This is a CONTRAST PAIR, and the contrast is the test.** The UE is seeded with a
-    /// genuine prior location — the TAC and cell a registration would have written — and
-    /// the PDU carries a DIFFERENT one. So an implementation that never applies the
-    /// message's location fails loudly by reading back the registration's value, which is
-    /// exactly the defect #406 was filed for. Asserting only "the field is populated"
-    /// would have passed against the stale value; #407 caught one of its own tests
-    /// passing with its guard deleted because its fixture had no location at all, so this
-    /// fixture has a real, distinct one.
-    ///
-    /// Driven through `handle_uplink_nas_transport` with an APER-encoded PDU, not by
-    /// calling `apply_user_location`: the question is whether the LIVE path applies it,
-    /// and a direct call on the helper would pass even with the production call site
-    /// deleted.
-    ///
-    /// The NAS payload is a CONFIGURATION UPDATE COMPLETE rather than a Service Request,
-    /// deliberately — it makes the location write independent of which 5GMM procedure
-    /// runs, which is the design claim ("placed before the dispatch, not beside the
-    /// SERVICE REQUEST arm"). The sibling test covers the Service Request itself.
-    ///
-    /// REVERT-VERIFIED: deleting the `apply_user_location` call from
-    /// `handle_uplink_nas_transport` makes this FAIL, reading back the registration's
-    /// TAC 0x000401 instead of 0x0A0B0C.
     /// #675: an initial Registration Request (SUCI) arriving in an Uplink NAS
     /// Transport on an NG connection with no NAS context gets a fresh context; any
     /// other message on such a connection does not.
@@ -21067,6 +21042,31 @@ mod tests {
         ngap.ue_auth_state.remove(amf_ue_ngap_id);
     }
 
+    /// #406 criteria 1-4: a real `UplinkNASTransport` refreshes BOTH the stored TAI and
+    /// the stored cell identity, and the values are the ones the message carried.
+    ///
+    /// **This is a CONTRAST PAIR, and the contrast is the test.** The UE is seeded with a
+    /// genuine prior location — the TAC and cell a registration would have written — and
+    /// the PDU carries a DIFFERENT one. So an implementation that never applies the
+    /// message's location fails loudly by reading back the registration's value, which is
+    /// exactly the defect #406 was filed for. Asserting only "the field is populated"
+    /// would have passed against the stale value; #407 caught one of its own tests
+    /// passing with its guard deleted because its fixture had no location at all, so this
+    /// fixture has a real, distinct one.
+    ///
+    /// Driven through `handle_uplink_nas_transport` with an APER-encoded PDU, not by
+    /// calling `apply_user_location`: the question is whether the LIVE path applies it,
+    /// and a direct call on the helper would pass even with the production call site
+    /// deleted.
+    ///
+    /// The NAS payload is a CONFIGURATION UPDATE COMPLETE rather than a Service Request,
+    /// deliberately — it makes the location write independent of which 5GMM procedure
+    /// runs, which is the design claim ("placed before the dispatch, not beside the
+    /// SERVICE REQUEST arm"). The sibling test covers the Service Request itself.
+    ///
+    /// REVERT-VERIFIED: deleting the `apply_user_location` call from
+    /// `handle_uplink_nas_transport` makes this FAIL, reading back the registration's
+    /// TAC 0x000401 instead of 0x0A0B0C.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_uplink_nas_transport_refreshes_the_stored_tai_and_cell() {
         crate::context::amf_context_init(64, 1024, 4096);
