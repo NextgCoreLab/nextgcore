@@ -94,6 +94,10 @@ pub struct N2InfoContainer {
 pub struct N1N2MessageTransferRspData {
     /// Transfer cause
     pub cause: N1N2MessageTransferCause,
+    /// What the NGAP task must send to a CM-CONNECTED UE now (#666). The caller
+    /// enqueues it; returned rather than enqueued here so the decision is
+    /// testable without the process-wide queue.
+    pub deliver_now: Option<crate::context::PendingConnectedDownlink>,
 }
 
 // ============================================================================
@@ -445,11 +449,54 @@ pub fn handle_n1_n2_message_transfer(
         }
     }
 
+    // #666: a CM-CONNECTED UE gets the transfer NOW. Before #666 these branches
+    // logged "Sending ..." and answered N1_N2_TRANSFER_INITIATED while nothing
+    // reached NGAP, so every network-initiated 5GSM message to a connected UE
+    // (an SMF-initiated release, a T3591/T3592 retransmission) was lost.
+    let deliver_now = if cause == N1N2MessageTransferCause::N1N2TransferInitiated {
+        connected_downlink_for(amf_ue, cm_idle, req_data)
+    } else {
+        None
+    };
+
     // Update session state
     sess.n1_released = false;
     sess.n2_released = false;
 
-    Ok(N1N2MessageTransferRspData { cause })
+    Ok(N1N2MessageTransferRspData { cause, deliver_now })
+}
+
+/// What a N1N2MessageTransfer must deliver to a CM-CONNECTED UE now (#666), or
+/// `None` when the transfer is not for a connected UE or carries nothing this
+/// path delivers.
+///
+/// Delivered: an N1-only transfer (DOWNLINK NAS TRANSPORT) and a PDU Session
+/// Resource Release (PDU SESSION RESOURCE RELEASE COMMAND, then the N1), the same
+/// two shapes a paged transfer is delivered in after the Service Request.
+/// PDU_RES_SETUP_REQ and PDU_RES_MOD_REQ for a connected UE are not covered here.
+pub fn connected_downlink_for(
+    amf_ue: &AmfUe,
+    cm_idle: bool,
+    req_data: &N1N2MessageTransferReqData,
+) -> Option<crate::context::PendingConnectedDownlink> {
+    if cm_idle {
+        return None;
+    }
+    let psi = req_data.pdu_session_id?;
+    let n2_release = match req_data.n2_info.as_ref().map(|n2| &n2.ngap_ie_type) {
+        None => false,
+        Some(NgapIeType::PduResRelCmd) => true,
+        Some(_) => return None,
+    };
+    if req_data.n1_message.is_none() && !n2_release {
+        return None;
+    }
+    Some(crate::context::PendingConnectedDownlink {
+        amf_ue_ngap_id: amf_ue.id,
+        pdu_session_id: psi,
+        n1: req_data.n1_message.clone(),
+        n2_release,
+    })
 }
 
 /// Handle SM context status notification
@@ -933,6 +980,59 @@ mod tests {
             .unwrap()
             .paging_find(5_180_002)
             .is_none());
+    }
+
+    /// #666: a CM-CONNECTED UE's N1-only transfer and PDU Session Resource
+    /// Release are handed to the NGAP task for delivery NOW. Before #666 both were
+    /// answered N1_N2_TRANSFER_INITIATED and never sent.
+    #[test]
+    fn a_connected_ues_n1_and_release_are_delivered_now() {
+        let mut ue = create_test_ue();
+        ue.id = 6_660_001;
+        let mut sess = create_test_sess();
+        let release_cmd = vec![0x2E, 0x01, 0x00, 0xD3, 0x27];
+
+        let n1_only = N1N2MessageTransferReqData {
+            pdu_session_id: Some(1),
+            n1_message: Some(release_cmd.clone()),
+            n2_info: None,
+            ..Default::default()
+        };
+        let rsp = handle_n1_n2_message_transfer(&ue, &mut sess, None, false, &n1_only).expect("ok");
+        assert_eq!(rsp.cause, N1N2MessageTransferCause::N1N2TransferInitiated);
+        assert_eq!(
+            rsp.deliver_now,
+            Some(crate::context::PendingConnectedDownlink {
+                amf_ue_ngap_id: 6_660_001,
+                pdu_session_id: 1,
+                n1: Some(release_cmd.clone()),
+                n2_release: false,
+            })
+        );
+
+        let release = N1N2MessageTransferReqData {
+            pdu_session_id: Some(1),
+            n1_message: Some(release_cmd.clone()),
+            n2_info: Some(N2InfoContainer {
+                ngap_ie_type: NgapIeType::PduResRelCmd,
+                ngap_data: Some(vec![0x10]),
+            }),
+            ..Default::default()
+        };
+        let rsp = handle_n1_n2_message_transfer(&ue, &mut sess, None, false, &release).expect("ok");
+        let item = rsp.deliver_now.expect("the release is delivered");
+        assert!(item.n2_release);
+        assert_eq!(item.n1, Some(release_cmd));
+
+        // CM-IDLE is the paging path, not this one.
+        ue.id = 6_660_002;
+        let rsp = handle_n1_n2_message_transfer(&ue, &mut sess, None, true, &release).expect("ok");
+        assert_eq!(rsp.cause, N1N2MessageTransferCause::AttemptingToReachUe);
+        assert!(rsp.deliver_now.is_none());
+        crate::context::amf_self()
+            .read()
+            .unwrap()
+            .paging_remove(6_660_002);
     }
 
     #[test]
