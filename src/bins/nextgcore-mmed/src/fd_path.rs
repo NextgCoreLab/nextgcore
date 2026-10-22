@@ -353,6 +353,12 @@ impl S6aClientState {
 /// Global S6a client state
 static S6A_CLIENT: OnceLock<Mutex<Option<S6aClientState>>> = OnceLock::new();
 
+/// Serialises the tests that set or rely on the S6a globals (`S6A_CLIENT`,
+/// `S6A_CONFIG`): the "without init" tests need both empty, and the #708
+/// reconnect test fills them.
+#[cfg(test)]
+pub(crate) static S6A_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn s6a_client() -> &'static Mutex<Option<S6aClientState>> {
     S6A_CLIENT.get_or_init(|| Mutex::new(None))
 }
@@ -428,6 +434,11 @@ pub async fn mme_fd_init_async(config: DiameterConfig, hss_addr: SocketAddr) -> 
 /// step rather than the previous init-then-connect pair. Calling this again after
 /// a connection loss replaces the session and aborts the old reader task.
 pub async fn mme_fd_connect() -> DiameterResult<()> {
+    mme_fd_connect_attempts(3).await
+}
+
+/// [`mme_fd_connect`] with `attempts` dial attempts, Tc apart.
+async fn mme_fd_connect_attempts(attempts: u32) -> DiameterResult<()> {
     let (config, hss_addr) = {
         let guard = s6a_config().lock().await;
         guard.clone().ok_or(DiameterError::NotInitialized)?
@@ -437,7 +448,7 @@ pub async fn mme_fd_connect() -> DiameterResult<()> {
     // attempts, and holding the lock across that would reintroduce exactly the
     // stall this change removes.
     let mut client = DiameterClient::new(config.clone(), hss_addr);
-    client.connect_with_retry(3).await.map_err(|e| {
+    client.connect_with_retry(attempts).await.map_err(|e| {
         log::error!("Failed to connect to HSS: {e}");
         DiameterError::ConnectionFailed
     })?;
@@ -460,6 +471,62 @@ pub async fn mme_fd_connect() -> DiameterResult<()> {
     });
     log::info!("S6a session established with HSS={hss_addr}");
     Ok(())
+}
+
+/// #708: whether the S6a connection has to be dialled: an HSS is configured and no
+/// reader task is driving a connection to it. The reader ends when the peer closes
+/// the connection or the socket fails (`DiameterSession` fails every waiter and
+/// stops), and it never existed when the startup dial failed.
+async fn s6a_needs_connect() -> bool {
+    if s6a_config().lock().await.is_none() {
+        return false;
+    }
+    match s6a_client().lock().await.as_ref() {
+        Some(state) => state.reader.as_ref().is_none_or(|h| h.is_finished()),
+        None => true,
+    }
+}
+
+/// One supervision step (#708): dial the HSS once if the S6a connection is down.
+/// `None` when it is up (or no HSS is configured), else the dial's result.
+pub async fn mme_fd_supervise_once() -> Option<DiameterResult<()>> {
+    if !s6a_needs_connect().await {
+        return None;
+    }
+    log::warn!("S6a connection to the HSS is down; redialling (RFC 6733 §2.1)");
+    Some(mme_fd_connect_attempts(1).await)
+}
+
+/// Keep the S6a connection up for the life of the daemon (#708).
+///
+/// RFC 6733 §2.1 and §5.6: the initiator re-establishes a lost peer connection,
+/// and Tc is the interval between its attempts. Before this, [`mme_fd_connect`] ran
+/// once, at startup. A restarted HSS, or one not yet up when the MME started, meant
+/// no S6a for the rest of the process: every AIR failed "Send failed" and every
+/// attach was rejected #17. The loss is noticed within `poll` and dialled at once.
+/// A failed dial is retried after Tc (`DiameterConfig::timer_tc`).
+pub async fn mme_fd_supervise(poll: std::time::Duration) {
+    let mut next_attempt = tokio::time::Instant::now();
+    loop {
+        tokio::time::sleep(poll).await;
+        if tokio::time::Instant::now() < next_attempt {
+            continue;
+        }
+        match mme_fd_supervise_once().await {
+            None => {}
+            Some(Ok(())) => log::info!("S6a connection to the HSS re-established"),
+            Some(Err(e)) => {
+                let tc = s6a_config()
+                    .lock()
+                    .await
+                    .as_ref()
+                    .map(|(c, _)| u64::from(c.timer_tc.max(1)))
+                    .unwrap_or(30);
+                log::warn!("S6a redial failed ({e}); next attempt in Tc = {tc} s");
+                next_attempt = tokio::time::Instant::now() + std::time::Duration::from_secs(tc);
+            }
+        }
+    }
 }
 
 /// Finalize Diameter S6a interface (sync version for shutdown)
@@ -1501,6 +1568,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_air_without_init() {
+        let _s6a = S6A_TEST_LOCK.lock().await;
         // Sending AIR without async init should fail with NotInitialized
         let mme_ue = crate::context::MmeUe {
             imsi_bcd: "001010123456789".to_string(),
@@ -1513,6 +1581,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_ulr_without_init() {
+        let _s6a = S6A_TEST_LOCK.lock().await;
         let mme_ue = crate::context::MmeUe {
             imsi_bcd: "001010123456789".to_string(),
             ..Default::default()
@@ -1524,6 +1593,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_pur_without_init() {
+        let _s6a = S6A_TEST_LOCK.lock().await;
         let mme_ue = crate::context::MmeUe {
             imsi_bcd: "001010123456789".to_string(),
             ..Default::default()
@@ -1531,6 +1601,83 @@ mod tests {
         let result = mme_s6a_send_pur(&mme_ue).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), DiameterError::NotInitialized);
+    }
+
+    /// #708: the S6a connection comes back after the HSS drops it.
+    ///
+    /// A fake HSS answers CER and then closes the connection, the way a restarting
+    /// HSS does. Before #708 nothing redialled: the reader ended and every later
+    /// request failed. The supervisor must notice the dead reader and dial again,
+    /// and a second HSS on the same address must see a second CER.
+    #[tokio::test]
+    async fn test_a_lost_s6a_connection_is_redialled() {
+        use nextgcore_diameter::peer::DiameterPeer;
+        use nextgcore_diameter::transport::DiameterListener;
+        let _s6a = S6A_TEST_LOCK.lock().await;
+
+        let listener = DiameterListener::bind(([127, 0, 0, 1], 0).into())
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hss_cfg = DiameterConfig {
+            diameter_id: "hss.localdomain".to_string(),
+            diameter_realm: "localdomain".to_string(),
+            ..Default::default()
+        };
+        // Accept a connection, complete CER/CEA, then close: `drop(peer)`.
+        let accept_and_close = |listener: DiameterListener, cfg: DiameterConfig| {
+            tokio::spawn(async move {
+                let transport = listener.accept().await.unwrap();
+                let mut peer = DiameterPeer::new_responder(transport, &cfg);
+                peer.start().await.unwrap();
+                let _cer = peer.next_event().await.unwrap();
+                (listener, peer)
+            })
+        };
+        let first = accept_and_close(listener, hss_cfg.clone());
+
+        let mme_cfg = DiameterConfig {
+            diameter_id: "mme.localdomain".to_string(),
+            diameter_realm: "localdomain".to_string(),
+            timer_tc: 1,
+            ..Default::default()
+        };
+        mme_fd_init_async(mme_cfg, addr).await.unwrap();
+        mme_fd_connect().await.expect("the first dial succeeds");
+        assert_eq!(
+            mme_fd_supervise_once().await,
+            None,
+            "a live connection is left alone"
+        );
+
+        // The HSS goes away: the reader ends.
+        let (listener, peer) = first.await.unwrap();
+        drop(peer);
+        let mut down = false;
+        for _ in 0..50 {
+            if s6a_needs_connect().await {
+                down = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(down, "the closed connection must be seen as down");
+
+        // The HSS is back on the same address: the supervisor redials it.
+        let second = accept_and_close(listener, hss_cfg);
+        assert_eq!(
+            mme_fd_supervise_once().await,
+            Some(Ok(())),
+            "a down S6a connection must be redialled (RFC 6733 §2.1)"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(3), second)
+            .await
+            .expect("the HSS must see a second CER")
+            .unwrap();
+
+        // Leave the globals as the "without init" tests expect them.
+        mme_fd_final_async().await;
+        *s6a_config().lock().await = None;
     }
 
     #[tokio::test]

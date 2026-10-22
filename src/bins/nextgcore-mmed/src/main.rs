@@ -241,9 +241,12 @@ impl MmeApp {
             Ok(()) => log::info!("S6a connected to {peer_identity} at {peer_addr}"),
             Err(e) => log::warn!(
                 "S6a connection to {peer_identity} at {peer_addr} failed: {e}. Authentication \
-                 will fail until the peer is reachable."
+                 will fail until the peer is reachable; redialling every Tc."
             ),
         }
+        // #708: keep it up. A lost connection (an HSS restart) or a failed startup
+        // dial is redialled, rather than leaving every later attach rejected #17.
+        tokio::spawn(fd_path::mme_fd_supervise(std::time::Duration::from_secs(1)));
     }
 
     /// Run the MME main loop.
