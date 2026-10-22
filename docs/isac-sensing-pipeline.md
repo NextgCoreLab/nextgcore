@@ -34,9 +34,9 @@ pub-sub bus). The default build and default nwdafd behaviour are unchanged.
   wire type; the duplicate non-serde `SensingResult`/`SensingConfig` that
   lived in `nextgcore-proto::types` was removed, and the isac types are
   re-exported at the proto crate root.
-- **Reuse nwdafd, not a new NF.** NWDAF is the natural analytics sink; a
-  future NEF (no `nextgcore-nefd` exists today) would re-expose the summary
-  northbound to AFs — out of scope here.
+- **Reuse nwdafd, not a new NF.** NWDAF is the natural analytics sink; the
+  NEF (`nextgcore-nefd`, added after this note was written) could re-expose the
+  summary northbound to AFs, but does not today — out of scope here.
 - **`ISAC_SENSING` is not a TS 29.520 `NwdafEvent`.** The analytics GET
   intercepts the token before `AnalyticsId` parsing so the real TS 29.520
   surface stays untouched.

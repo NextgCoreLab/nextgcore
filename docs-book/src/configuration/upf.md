@@ -2,7 +2,7 @@
 
 The UPF (User Plane Function, `nextgcore-upfd`) terminates the N4/PFCP interface toward the SMF and the N3/GTP-U interface toward the gNB, and forwards user traffic through a TUN device.
 
-> **Important — how the UPF is actually configured:** unlike most other NextGCore NFs, `nextgcore-upfd` currently takes its runtime settings from **command-line flags**, not from the YAML file. The `-c/--config` flag points at a YAML file, and if that file exists the daemon reads it — but it only logs the file size (`main.rs`, "Configuration file loaded (N bytes)") and **does not deserialize or apply any of its contents**. There is no `#[derive(Deserialize)]` config struct in the UPF binary. The entire YAML file is therefore parsed-but-inert today; it is shipped for deployment-layout consistency with the other NFs (Docker/k8s/Helm mount it), and CLI flags are the source of truth.
+> **Important — how the UPF is actually configured:** unlike most other NextGCore NFs, `nextgcore-upfd` currently takes its runtime settings from **command-line flags**, not from the YAML file. The `-c/--config` flag points at a YAML file, and if that file exists the daemon reads it — but it only logs the file size at `debug` level (`main.rs`, "Configuration file loaded (N bytes)") and **does not deserialize or apply any of its contents**. There is no `#[derive(Deserialize)]` config struct in the UPF binary. The entire YAML file is therefore parsed-but-inert today; it is shipped for deployment-layout consistency with the other NFs (Docker/k8s/Helm mount it), and CLI flags are the source of truth.
 
 ## Example YAML (`docker/rust/configs/5gc/upf.yaml`)
 
@@ -64,7 +64,7 @@ Defaults below are the real clap `default_value`s from the source.
 | `-l, --log-file` | string | *(none)* | Log file path. |
 | `-e, --log-level` | string | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error`. |
 | `-m, --no-color` | bool | `false` | Disable colored log output. |
-| `-k, --kill` | bool | `false` | Kill a running instance (currently logs intent and exits). |
+| `-k, --kill` | bool | `false` | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |
 | `--pfcp-addr` | string | `127.0.0.4` | N4 PFCP server bind address. |
 | `--pfcp-port` | u16 | `8805` | N4 PFCP server port. |
 | `--gtpu-addr` | string | `127.0.0.4` | N3 GTP-U bind address. |
@@ -80,12 +80,14 @@ Defaults below are the real clap `default_value`s from the source.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `UPF_METRICS_PORT` | `9090` | Prometheus `/metrics` port (bound on `0.0.0.0`), including the TUN-path data-plane counters (#581). |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4317` | OTLP endpoint for OpenTelemetry tracing (initialization is best-effort; failure is ignored). |
 
 ## Behavior notes
 
 - **PFCP heartbeats:** the UPF also initiates PFCP heartbeats toward the associated CP function every 10 seconds (code comment cites TS 29.244 §6.2.2: either node may initiate).
-- **Reports:** the data plane emits Downlink Data Reports (on first buffered downlink packet) and Error Indication Reports over N4.
+- **Reports:** the data plane emits Downlink Data Reports (on first buffered downlink packet) and Error Indication Reports over N4. URRs provisioned by the SMF are measured and enforced (Volume/Time Quota, #80), Usage Reports are sent, and an explicit Query URR IE is honoured (#428).
+- **EPC role:** the EPC compose runs a dedicated upfd as PGW-U (`docker/rust/configs/epc/pgwu.yaml`, which it does not parse either; the flags in `docker-compose-epc.yml` drive it).
 - **Validation status:** UPF behavior has been exercised in the project's matched-simulator Docker E2E suite (UE→UPF GTP-U traffic). This is internal test validation, not third-party conformance certification.
 
 ## Parsed-but-inert summary
@@ -97,5 +99,5 @@ Defaults below are the real clap `default_value`s from the source.
 | `upf.pfcp.server` | Ignored — use `--pfcp-addr` / `--pfcp-port`. |
 | `upf.gtpu.server` | Ignored — use `--gtpu-addr` / `--gtpu-port`. |
 | `upf.session` | Ignored — use `--tun-ifname` / `--tun-ip` / `--tun-prefix` (single IPv4 subnet only via CLI; the YAML's IPv6 entry has no CLI equivalent). |
-| `upf.metrics.server` | Ignored by the UPF binary. |
-| `upf.tls.*` | Ignored by the UPF binary; the deployment's TLS switch is the `TLS_ENABLED` / `SBI_SCHEME` compose environment, per the file's own comment. |
+| `upf.metrics.server` | Ignored — use `UPF_METRICS_PORT`. |
+| `upf.tls.*` | Ignored. The file's comment names `TLS_ENABLED` / `SBI_SCHEME`, but no code reads them; the UPF serves no SBI listener (it is only an NRF client when `--nrf-uri` is set). |

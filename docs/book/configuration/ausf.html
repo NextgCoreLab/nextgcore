@@ -15,8 +15,8 @@
         <link rel="icon" href="../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../css/general-0392ca55.css">
-        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
         <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-10d7638c.js";
+            window.path_to_searchindex_js = "../searchindex-c2411517.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-1b88980e.js"></script>
+        <script src="../toc-be5dca41.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -181,7 +181,7 @@
 <p>The AUSF (Authentication Server Function, <code>nextgcore-ausfd</code>) runs primary UE authentication — both 5G-AKA and EAP-AKA’ (RFC 5448/9048) — deriving KAUSF/KSEAF and confirming results to the UDM, per TS 33.501 and TS 29.509 (as cited in the daemon’s source comments). Its SBI router (<code>ausf_sbi_request_handler</code> in <code>src/bins/nextgcore-ausfd/src/app.rs</code>) serves the <code>Nausf_UEAuthentication</code> API (<code>POST /nausf-auth/v1/ue-authentications</code>, <code>PUT .../{authCtxId}/5g-aka-confirmation</code>, <code>POST .../{authCtxId}/eap-session</code>, <code>DELETE .../{authCtxId}</code>) plus the Wave-6 F-03 producer services <code>Nausf_SoRProtection</code> (<code>POST /nausf-sorprotection/v1/{supi}/ue-sor</code>) and <code>Nausf_UPUProtection</code> (<code>POST /nausf-upuprotection/v1/{supi}/ue-upu</code>), both TS 29.509 per code comments (the vendored <code>specs/TS29509_Nausf_SoRProtection.yaml</code> / <code>TS29509_Nausf_UPUProtection.yaml</code> are referenced from <code>sor_protection.rs</code> / <code>upu_protection.rs</code>).</p>
 <p>Configuration is split between a YAML file (default path <code>/etc/nextgcore/ausf.yaml</code>, overridable with <code>-c/--config</code>) and command-line flags, with a precedence quirk worth knowing: when the YAML lists an SBI server entry, its address/port <strong>override</strong> the <code>--sbi-addr</code>/<code>--sbi-port</code> CLI flags (the code comment explains this is so the NRF NFProfile advertises a routable endpoint instead of <code>0.0.0.0</code>). The YAML carries only the SBI endpoint, the NRF URI, and the OAuth2 knob; everything else (log level, UE capacity, TLS flags) is CLI-only. A few environment variables are also read — see the behavior notes. Since the Wave-6 H1 lib split, <code>main.rs</code> is a thin wrapper around <code>nextgcore_ausfd::run()</code>; all logic including the clap <code>Args</code> struct lives in <code>src/bins/nextgcore-ausfd/src/app.rs</code>.</p>
 <blockquote>
-<p><strong>Honesty note:</strong> AUSF behavior is validated by this project’s own unit tests, in-crate strict-peer integration tests (the lib-target exists precisely so peer NF crates can drive the real <code>ausf_sbi_request_handler</code> in-process), and the matched-simulator docker E2E suite (84/84 as of 2026-07-02) — not by third-party conformance certification. Known bespoke/non-normative points, all documented in code comments: the consumer-PLMN entitlement check (<code>extract_consumer_plmns</code>) decodes the OAuth2 JWT payload <strong>without signature verification</strong> and is default-permissive for token-less peers; the <code>--tls*</code> CLI flags and the YAML <code>tls:</code> block are not wired to the live HTTP/2 server (see below), so all shipped deployments serve plain HTTP; and the registered NFProfile is a simplified subset of TS 29.510.</p>
+<p><strong>Honesty note:</strong> AUSF behavior is validated by this project’s own unit tests, in-crate strict-peer integration tests (the lib-target exists precisely so peer NF crates can drive the real <code>ausf_sbi_request_handler</code> in-process), and the matched-simulator docker E2E suite — not by third-party conformance certification. Known bespoke/non-normative points, all documented in code comments: the consumer-PLMN entitlement check (<code>extract_consumer_plmns</code>) decodes the OAuth2 JWT payload <strong>without signature verification</strong> and is default-permissive for token-less peers; the <code>--tls*</code> CLI flags and the YAML <code>tls:</code> block are not wired to the live HTTP/2 server (see below); the listener’s TLS comes from <code>NEXTGCORE_SBI_PROFILE</code> (mutual TLS under the default <code>production</code>, plaintext under the <code>dev</code> opt-out every shipped deployment sets); and the registered NFProfile is a simplified subset of TS 29.510.</p>
 </blockquote>
 <h2 id="example-configuration"><a class="header" href="#example-configuration">Example configuration</a></h2>
 <p>From <code>nextgcore/docker/rust/configs/5gc/ausf.yaml</code>:</p>
@@ -240,7 +240,7 @@ ausf:
 <ul>
 <li><strong><code>logger.file.path</code> and <code>logger.level</code> are inert.</strong> The log level comes solely from the CLI flag <code>-e/--log-level</code>; <code>init_logging</code> builds an <code>env_logger::Builder::new()</code> with <code>filter_level</code>, so even <code>RUST_LOG</code> (which the docker compose sets) is not consulted by this daemon. Nothing writes to the YAML’s log-file path.</li>
 <li><strong><code>global.max.ue</code> / <code>global.max.peer</code> are inert.</strong> The auth-context pool capacity comes from the CLI flag <code>--max-ue</code> (default <code>1024</code> — the example’s matching <code>1024</code> is coincidence, not causation). <code>max.peer</code> is read by nothing in this binary.</li>
-<li><strong><code>ausf.sbi.tls.*</code> (enabled/cert/key/ca/min_version) is inert.</strong> More honestly: even the CLI <code>--tls</code>/<code>--tls-cert</code>/<code>--tls-key</code> flags only populate the legacy <code>SbiServerConfig</code> consumed by the <code>ausf_sbi_open()</code> logging shim (<code>sbi_path.rs</code>, marked inert by the “ausfd-10” note). The live HTTP/2 server is built from <code>nextgcore_sbi::server::SbiServerConfig::new(addr)</code> with no TLS fields set, so the served endpoint is plain HTTP regardless.</li>
+<li><strong><code>ausf.sbi.tls.*</code> (enabled/cert/key/ca/min_version) is inert.</strong> More honestly: even the CLI <code>--tls</code>/<code>--tls-cert</code>/<code>--tls-key</code> flags only populate the legacy <code>SbiServerConfig</code> consumed by the <code>ausf_sbi_open()</code> logging shim (<code>sbi_path.rs</code>, marked inert by the “ausfd-10” note). The live HTTP/2 server’s TLS is set only by the SBI security profile (<code>NEXTGCORE_SBI_PROFILE</code>, see <a href="./overview.html">Configuration Overview</a>).</li>
 <li><strong><code>ausf.security.pqc.*</code> is inert.</strong> No PQC code path exists in this binary.</li>
 </ul>
 <h2 id="command-line-flags"><a class="header" href="#command-line-flags">Command-line flags</a></h2>
@@ -255,7 +255,7 @@ ausf:
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td>Accepted but <strong>not wired</strong> — <code>init_logging</code> never reads it; logs go to stdout/stderr.</td></tr>
 <tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>); unrecognized values fall back to <code>info</code>.</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output.</td></tr>
-<tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Stub: logs “would send SIGTERM to running instance” and exits 0 without signaling anything.</td></tr>
+<tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor.</td></tr>
 <tr><td><code>--sbi-addr</code></td><td>string</td><td><code>0.0.0.0</code></td><td>SBI bind address — <strong>overridden</strong> by <code>ausf.sbi.server[0].address</code> when the YAML sets it.</td></tr>
 <tr><td><code>--sbi-port</code></td><td>u16</td><td><code>7777</code></td><td>SBI port — <strong>overridden</strong> by <code>ausf.sbi.server[0].port</code> when the YAML sets it.</td></tr>
 <tr><td><code>--tls</code></td><td>flag</td><td>off</td><td>Feeds only the inert legacy <code>ausf_sbi_open</code> config; the live HTTP/2 server ignores it (see above).</td></tr>
@@ -268,7 +268,7 @@ ausf:
 <h2 id="behavior-notes"><a class="header" href="#behavior-notes">Behavior notes</a></h2>
 <ul>
 <li><strong>Admission/rejection on <code>Nausf_UEAuthentication</code>:</strong> a malformed or non-5G <code>servingNetworkName</code> → 403 <code>SERVING_NETWORK_NOT_AUTHORIZED</code> (TS 33.501 §6.1.2, TS 29.509 §6.1.7.3 per code comments); a null/absent <code>resStar</code> in the 5G-AKA confirmation → 200 with <code>AUTHENTICATION_FAILURE</code> while present-but-bad hex → 400 (TS 29.509 §6.1.6.2.6/§6.1.6.2.8 per code comments); <code>kseaf</code>/<code>supi</code> appear in responses only on success (and <code>supi</code> only when the original identity was a SUCI). Pool exhaustion at <code>--max-ue</code> yields a <strong>400</strong> “Failed to allocate UE context” (cause <code>INTERNAL_ERROR</code>), not a 5xx. Unmatched routes get 405; the API version path segment is not validated.</li>
-<li><strong>NRF registration is best-effort, no retry loop:</strong> with an NRF URI configured, the AUSF PUTs a NFProfile (<code>/nnrf-nfm/v1/nf-instances/{uuid}</code>) advertising <code>nausf-auth</code>, <code>nausf-sorprotection</code>, and <code>nausf-upuprotection</code> with <code>allowedNfTypes</code> [AMF, UDM, SCP] and <code>heartBeatTimer: 10</code>; on success a heartbeat worker runs every 5 s, PATCHing a real load gauge (auth contexts vs <code>--max-ue</code>, TS 29.510 §5.2.2.3.2 per code comment). On failure it logs a warning and continues without NRF.</li>
+<li><strong>NRF registration is best-effort, no retry loop:</strong> with an NRF URI configured, the AUSF PUTs a NFProfile (<code>/nnrf-nfm/v1/nf-instances/{uuid}</code>) advertising <code>nausf-auth</code>, <code>nausf-sorprotection</code>, and <code>nausf-upuprotection</code> with <code>allowedNfTypes</code> [AMF, UDM, SCP] and <code>heartBeatTimer: 10</code>; on success a heartbeat worker runs every 5 s, PATCHing a real load gauge (auth contexts vs <code>--max-ue</code>, TS 29.510 §5.2.2.3.2 per code comment). On failure it logs a warning and continues without NRF. A heartbeat the NRF answers with 404 re-registers the profile (#434), and the NF deregisters from the NRF on shutdown (#235).</li>
 <li><strong>UDM resolution order:</strong> startup discovery via <code>/nnrf-disc</code> (target <code>UDM</code>, service <code>nudm-ueau</code>, failure = “will retry on demand”); per-request, cached discovery results win, else the <code>UDM_SBI_ADDR</code>/<code>UDM_SBI_PORT</code> env fallback (port defaults to <code>7777</code>; the docker compose sets <code>172.23.0.12:7777</code>). An unreachable UDM turns <code>POST /ue-authentications</code> into a 503 <code>UDM_UNAVAILABLE</code>.</li>
 <li><strong>SoR/UPU are fail-closed</strong> (per the module-header invariants in <code>sor_protection.rs</code>/<code>upu_protection.rs</code>): no per-SUPI KAUSF anchor (no completed primary authentication) → 404 <code>CONTEXT_NOT_FOUND</code>, never a MAC over a zero key; counter about to wrap → 503 <code>COUNTER_WRAP</code> with the counter not consumed (TS 33.501 §14.1.3/§6.14.2.3 per code comments); anything not encodable byte-exactly → 400.</li>
 <li><strong>No state files — everything is in-memory.</strong> A restart loses all auth contexts and the SoR/UPU anchors/counters. <code>DELETE .../{authCtxId}</code> zeroizes the context’s KAUSF/KSEAF/XRES* (TS 33.501 §6.1.4.1a per code comment) but deliberately keeps the per-SUPI anchor store so SoR/UPU keep working afterwards (TS 33.501 §6.14.1 per code comment).</li>
@@ -323,7 +323,7 @@ ausf:
 
         <script src="../clipboard-1626706a.min.js"></script>
         <script src="../highlight-abc7f01d.js"></script>
-        <script src="../book-c22b7243.js"></script>
+        <script src="../book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

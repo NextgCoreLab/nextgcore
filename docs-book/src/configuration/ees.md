@@ -25,7 +25,7 @@ ees:
     uri: http://172.23.0.10:7777
 ```
 
-The docker deployment does its real configuration on the command line: `command: ["--sbi-addr", "172.23.0.31", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]`. Note that `--nrf-uri` is a flag the current `Args` struct no longer defines — the `--ecs-uri` doc comment states it "Replaces the former `--nrf-uri`" (eesd-01 removed NRF self-registration) — so the shipped compose command line is stale relative to the current binary.
+The docker deployment does its real configuration on the command line: `command: ["--sbi-addr", "172.23.0.31", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]`. Note that `--nrf-uri` is a flag the current `Args` struct no longer defines — the `--ecs-uri` doc comment states it "Replaces the former `--nrf-uri`" (eesd-01 removed NRF self-registration) — so the shipped compose command line is stale: clap rejects an unknown argument, so `eesd` started with that command line exits with a usage error instead of serving.
 
 ## YAML parameters
 

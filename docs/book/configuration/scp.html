@@ -15,8 +15,8 @@
         <link rel="icon" href="../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../css/general-0392ca55.css">
-        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
         <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-10d7638c.js";
+            window.path_to_searchindex_js = "../searchindex-c2411517.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-1b88980e.js"></script>
+        <script src="../toc-be5dca41.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -179,9 +179,10 @@
                     <main>
                         <h1 id="scp-configuration"><a class="header" href="#scp-configuration">SCP Configuration</a></h1>
 <p>The SCP (Service Communication Proxy, <code>nextgcore-scpd</code>) is the 5GC indirect-communication proxy: an HTTP/2 forwarding engine implementing TS 29.500 §6.10 (as cited in the daemon’s source comments) with both <strong>Model C</strong> (consumer supplies <code>3gpp-Sbi-Target-apiRoot</code>) and <strong>Model D</strong> (delegated discovery driven by <code>3gpp-Sbi-Discovery-*</code> headers, resolved against the NRF’s <code>nnrf-disc</code> service per TS 29.500 §6.10.3 / TS 29.510 §5.3.2 per code comments). It exposes no NF-specific API routes of its own — a single catch-all handler (<code>ScpProxy::handle</code> in <code>src/bins/nextgcore-scpd/src/proxy.rs</code>) proxies every inbound SBI request, adding binding stickiness (TS 29.500 §6.12), Via/Server loop detection (§6.10.10), and delegated OAuth2 token acquisition (TS 33.501 §13, per code comments).</p>
-<p>Configuration is <strong>CLI flags and environment variables only</strong>. There is a YAML file path (default <code>/etc/nextgcore/scp.yaml</code>, overridable with <code>-c/--config</code>), but the daemon does not parse it — see the honesty note below. The NRF URI, the SCP’s NF Instance ID, and its FQDN each have an environment-variable fallback (<code>NRF_URI</code>, <code>NF_INSTANCE_ID</code>, <code>SCP_FQDN</code>) used when the corresponding flag is absent; the flag always wins over the env var.</p>
+<p>Configuration comes from <strong>CLI flags, environment variables and the YAML file</strong>, in that precedence order (CLI &gt; env &gt; file &gt; built-in default). The file path defaults to <code>/etc/nextgcore/scp.yaml</code> and is overridable with <code>-c/--config</code>. The NRF URI, the SCP’s NF Instance ID, and its FQDN each have an environment-variable fallback (<code>NRF_URI</code>, <code>NF_INSTANCE_ID</code>, <code>SCP_FQDN</code>) used when the corresponding flag is absent; the flag always wins over the env var, and the file is consulted after both.</p>
 <blockquote>
-<p><strong>Honesty note:</strong> SCP behavior is validated by this project’s own unit tests (including an in-process mock NRF in <code>proxy.rs</code>) and the matched-simulator Docker E2E, not by third-party conformance certification. Three things an operator should know up front: (1) the daemon <strong>reads the YAML config file only to log its byte count</strong> — <code>main.rs</code> contains a placeholder (<code>// In C: scp_context_parse_config()</code>) and no <code>#[derive(Deserialize)]</code> config structs exist anywhere in the crate, so every field in the shipped <code>scp.yaml</code> is decorative; (2) the <code>-k/--kill</code> flag is a stub that logs “would send SIGTERM” and exits without killing anything; (3) <code>-l/--log-file</code> is accepted by clap but never used by <code>init_logging</code> — logs always go to the <code>env_logger</code> default sink.</p>
+<p><strong>Honesty note:</strong> SCP behavior is validated by this project’s own unit tests (including an in-process mock NRF in <code>proxy.rs</code>) and the matched-simulator Docker E2E, not by third-party conformance certification. Two things an operator should know up front: (1) the <code>-k/--kill</code> flag is refused with an error (not supported); (2) <code>-l/--log-file</code> is accepted by clap but never used by <code>init_logging</code> — logs always go to the <code>env_logger</code> default sink.</p>
+<p>This note previously stated that the daemon read the YAML file only to log its byte count and that every field in it was decorative. <strong>That is no longer true</strong> and is corrected below: <code>config.rs</code> carries <code>#[derive(Deserialize)]</code> structs and <code>main.rs</code> reads the <code>scp</code> section for the SBI address/port, the NRF URI, <code>fqdn</code>, <code>nf_instance_id</code>, both timeouts, the cache bounds, <code>max_producer_attempts</code>, and <code>sbi.tls.enabled</code>/<code>cert</code>/<code>key</code>.</p>
 </blockquote>
 <h2 id="example-configuration"><a class="header" href="#example-configuration">Example configuration</a></h2>
 <p>From <code>nextgcore/docker/rust/configs/scp.yaml</code>:</p>
@@ -214,17 +215,35 @@ scp:
       ca: /etc/nextgcore/certs/ca.crt
       min_version: "1.2"
 </code></pre>
-<p>Note that the shipped <code>docker-compose.yml</code> service (<code>scp:</code>, lines 491–503) does not even mount this file into the container — it runs the daemon purely on CLI flags: <code>command: ["--sbi-addr", "172.23.0.37", "--sbi-port", "7777"]</code>. The YAML’s addresses (<code>172.22.0.x</code>) do not match the compose network (<code>172.23.0.x</code>), which is further evidence the file is not load-bearing.</p>
+<p>The commented-out optional <code>scp</code>-level keys are omitted from the excerpt above; see the live-fields table below.</p>
+<p>Note that the shipped <code>docker-compose.yml</code> service (<code>scp:</code>) does not mount this file into the container — it runs the daemon purely on CLI flags: <code>command: ["--sbi-addr", "172.23.0.37", "--sbi-port", "7777"]</code>. The YAML’s addresses (<code>172.22.0.x</code>) do not match the compose network (<code>172.23.0.x</code>) either. So the file <strong>is</strong> parsed when present, but in <em>that</em> deployment it is never mounted and the flags supply everything.</p>
 <h2 id="yaml-parameters"><a class="header" href="#yaml-parameters">YAML parameters</a></h2>
-<p><strong>None.</strong> Unlike the other NF daemons, <code>nextgcore-scpd</code> deserializes no YAML fields at all. <code>main.rs</code> checks whether the <code>--config</code> path exists, reads the file to a string, and logs <code>"Configuration file loaded (N bytes)"</code> — nothing more. There are no serde <code>Deserialize</code> structs in <code>src/bins/nextgcore-scpd/</code>. All runtime knobs are CLI flags (below) with three env-var fallbacks, plumbed into <code>ScpProxyConfig</code> (<code>proxy.rs</code>) and <code>SbiServerConfig</code> (<code>sbi_path.rs</code>).</p>
-<h3 id="parsed-but-inert--decorative-yaml-fields"><a class="header" href="#parsed-but-inert--decorative-yaml-fields">Parsed-but-inert / decorative YAML fields</a></h3>
-<p>Every field in the shipped example file is inert. Where the real knob lives:</p>
+<p><code>nextgcore-scpd</code> deserializes its <code>scp</code> section in <code>src/bins/nextgcore-scpd/src/config.rs</code> (serde <code>Deserialize</code> structs) and <code>main.rs</code> resolves each value as CLI flag &gt; env var &gt; file &gt; built-in default via <code>config::resolve</code>. The resolved values are plumbed into <code>ScpProxyConfig</code> (<code>proxy.rs</code>) and <code>SbiServerConfig</code> (<code>sbi_path.rs</code>).</p>
+<h3 id="which-yaml-fields-are-live-and-which-are-inert"><a class="header" href="#which-yaml-fields-are-live-and-which-are-inert">Which YAML fields are live, and which are inert</a></h3>
+<p><strong>Live</strong> — read by <code>config.rs</code> / <code>main.rs</code>, and used when no CLI flag or environment variable supplies the value:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>key</th><th>effect</th></tr>
+</thead>
+<tbody>
+<tr><td><code>scp.sbi.server[0].address</code> / <code>.port</code></td><td>SBI bind address / port (after <code>--sbi-addr</code> / <code>--sbi-port</code>)</td></tr>
+<tr><td><code>scp.sbi.client.nrf[0].uri</code></td><td>NRF URI for Model D (after <code>--nrf-uri</code>, then <code>NRF_URI</code>)</td></tr>
+<tr><td><code>scp.sbi.tls.enabled</code> / <code>.cert</code> / <code>.key</code></td><td>TLS on the SBI server; <code>--tls</code> forces it on regardless</td></tr>
+<tr><td><code>scp.fqdn</code></td><td>SCP identity for <code>Via</code> / <code>Server</code> / loop detection (after <code>--scp-fqdn</code>, then <code>SCP_FQDN</code>)</td></tr>
+<tr><td><code>scp.nf_instance_id</code></td><td>own <code>nfInstanceId</code> for delegated tokens (after <code>--nf-instance-id</code>, then <code>NF_INSTANCE_ID</code>)</td></tr>
+<tr><td><code>scp.connect_timeout</code> / <code>scp.request_timeout</code></td><td>upstream timeouts, whole seconds</td></tr>
+<tr><td><code>scp.max_cache_entries</code> / <code>scp.cache_ttl</code></td><td>proxy cache bounds</td></tr>
+<tr><td><code>scp.max_producer_attempts</code></td><td>Model D alternate-producer reselection bound</td></tr>
+</tbody>
+</table>
+</div>
+<p>All of the <code>scp</code>-level keys are shipped <strong>commented out</strong>, so the built-in defaults apply unless an operator uncomments them.</p>
+<p><strong>Inert</strong> — present in the shipped file and not read anywhere:</p>
 <ul>
-<li><strong><code>logger.file.path</code> and <code>logger.level</code> are inert.</strong> The log level comes from the CLI flag <code>-e/--log-level</code> (default <code>info</code>); <code>init_logging</code> builds <code>env_logger</code> with an explicit filter level, so even <code>RUST_LOG</code> (set to <code>info</code> by the compose file’s common environment) is not consulted. There is no working log-file output (<code>-l/--log-file</code> is accepted but unused).</li>
-<li><strong><code>global.max.ue</code> / <code>global.max.peer</code> are inert.</strong> The only pool sizing the daemon applies is <code>--max-assoc</code> (default <code>8192</code>), passed to <code>scp_context_init</code>.</li>
-<li><strong><code>scp.sbi.server[]</code> (address/port) is inert.</strong> The SBI bind address and port come from <code>--sbi-addr</code>/<code>--sbi-port</code>.</li>
-<li><strong><code>scp.sbi.client.nrf[].uri</code> is inert.</strong> The NRF URI for Model D delegated discovery comes from <code>--nrf-uri</code>, falling back to the <code>NRF_URI</code> environment variable; when neither is set, delegated discovery is disabled.</li>
-<li><strong><code>scp.sbi.tls.*</code> (enabled/cert/key/ca/min_version) is inert.</strong> TLS is controlled by the <code>--tls</code>, <code>--tls-cert</code>, and <code>--tls-key</code> flags; there is no CA-bundle or minimum-version knob in the code.</li>
+<li><strong><code>logger.file.path</code> and <code>logger.level</code>.</strong> The log level comes from the CLI flag <code>-e/--log-level</code> (default <code>info</code>); <code>init_logging</code> builds <code>env_logger</code> with an explicit filter level, so even <code>RUST_LOG</code> (set to <code>info</code> by the compose file’s common environment) is not consulted. There is no working log-file output (<code>-l/--log-file</code> is accepted but unused).</li>
+<li><strong><code>global.max.ue</code> / <code>global.max.peer</code>.</strong> Not read; <code>scp_context_init()</code> takes no size.</li>
+<li><strong><code>scp.sbi.tls.ca</code> and <code>scp.sbi.tls.min_version</code>.</strong> There is no CA-bundle or minimum-version knob in the code; the rest of the <code>tls</code> block <em>is</em> read.</li>
 </ul>
 <h2 id="command-line-flags"><a class="header" href="#command-line-flags">Command-line flags</a></h2>
 <p>From the clap <code>Args</code> struct in <code>src/bins/nextgcore-scpd/src/main.rs</code>:</p>
@@ -234,19 +253,20 @@ scp:
 <tr><th>Flag</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/scp.yaml</code></td><td>Configuration file path (read but <strong>not parsed</strong> — see honesty note).</td></tr>
+<tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/scp.yaml</code></td><td>Configuration file path. Parsed; see the live-fields table above.</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td>Log file path — <strong>accepted but unused</strong> by <code>init_logging</code>.</td></tr>
 <tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>); unrecognized values fall back to <code>info</code>.</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output.</td></tr>
-<tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Stub: logs “would send SIGTERM to running instance” and exits.</td></tr>
-<tr><td><code>--sbi-addr</code></td><td>string</td><td><code>127.0.0.1</code></td><td>SBI server bind address (docker deployments pass the container IP).</td></tr>
-<tr><td><code>--sbi-port</code></td><td>u16</td><td><code>7777</code></td><td>SBI server port.</td></tr>
+<tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor.</td></tr>
+<tr><td><code>--sbi-addr</code></td><td>string</td><td><code>127.0.0.1</code></td><td>SBI server bind address (docker deployments pass the container IP). Precedence: flag &gt; <code>SCP_SBI_ADDR</code> &gt; <code>scp.sbi.server[0].address</code> &gt; default.</td></tr>
+<tr><td><code>--sbi-port</code></td><td>u16</td><td><code>7777</code></td><td>SBI server port. Precedence: flag &gt; <code>SCP_SBI_PORT</code> &gt; <code>scp.sbi.server[0].port</code> &gt; default.</td></tr>
 <tr><td><code>--tls</code></td><td>flag</td><td>off</td><td>Enable TLS on the SBI server. Startup fails unless <strong>both</strong> <code>--tls-cert</code> and <code>--tls-key</code> are given.</td></tr>
 <tr><td><code>--tls-cert</code></td><td>path</td><td>unset</td><td>TLS certificate file.</td></tr>
 <tr><td><code>--tls-key</code></td><td>path</td><td>unset</td><td>TLS private key file.</td></tr>
-<tr><td><code>--max-assoc</code></td><td>usize</td><td><code>8192</code></td><td>Maximum number of associations in the SCP context pool.</td></tr>
+<tr><td><code>--connect-timeout</code></td><td>u64 (s)</td><td><code>2</code></td><td>Upstream connect timeout. Precedence: flag &gt; <code>SCP_CONNECT_TIMEOUT</code> &gt; <code>scp.connect_timeout</code> &gt; default.</td></tr>
+<tr><td><code>--request-timeout</code></td><td>u64 (s)</td><td><code>10</code></td><td>Upstream request timeout. Precedence: flag &gt; <code>SCP_REQUEST_TIMEOUT</code> &gt; <code>scp.request_timeout</code> &gt; default.</td></tr>
 <tr><td><code>--nrf-uri</code></td><td>string</td><td>unset (falls back to <code>NRF_URI</code> env)</td><td>NRF base URI for Model D delegated discovery. When neither flag nor env is set, Model D is disabled and a warning is logged at startup.</td></tr>
-<tr><td><code>--nf-instance-id</code></td><td>string</td><td>unset (falls back to <code>NF_INSTANCE_ID</code> env, then <code>nextgcore-scp</code>)</td><td>The SCP’s own NF Instance ID, sent as <code>nfInstanceId</code> in delegated OAuth2 token requests to the NRF (TS 29.510 §6.3 per code comment).</td></tr>
+<tr><td><code>--nf-instance-id</code></td><td>string</td><td>unset (falls back to <code>NF_INSTANCE_ID</code> env, then <code>scp.nf_instance_id</code>, then <code>nextgcore-scp</code>)</td><td>The SCP’s own NF Instance ID, sent as <code>nfInstanceId</code> in delegated OAuth2 token requests to the NRF (TS 29.510 §6.3 per code comment).</td></tr>
 <tr><td><code>--scp-fqdn</code></td><td>string</td><td>unset (falls back to <code>SCP_FQDN</code> env, then <code>scp.5gc.local</code>)</td><td>The SCP’s identity for <code>Via</code>/<code>Server</code> headers and <code>SCP-&lt;FQDN&gt;</code> loop detection (TS 29.500 §6.10.8/§6.10.10 per code comment).</td></tr>
 <tr><td><code>--next-hop-scp</code></td><td>flag</td><td>off</td><td>Treat the next hop as another SCP: convey the selected producer apiRoot in <code>3gpp-Sbi-Target-apiRoot</code> instead of stripping it (TS 29.500 §6.10.2.5 per code comment). Default off = next hop is the producer.</td></tr>
 </tbody>
@@ -254,19 +274,76 @@ scp:
 </div>
 <h2 id="behavior-notes"><a class="header" href="#behavior-notes">Behavior notes</a></h2>
 <ul>
-<li><strong>Routing precedence</strong> (<code>ScpProxy::route</code>, TS 29.500 §6.10.2 per code comment): a valid <code>3gpp-Sbi-Target-apiRoot</code> wins (Model C); otherwise a <code>3gpp-Sbi-Routing-Binding</code> matching a cached <code>3gpp-Sbi-Binding</code> learnt from an earlier producer response (§6.12 stickiness, with NF-set-level reselection per §5.2.3.2.6); otherwise any <code>3gpp-Sbi-Discovery-*</code> header triggers Model D. A request with none of these — or an unparsable Target-apiRoot — is rejected <strong>400</strong> ProblemDetails, cause <code>MANDATORY_IE_MISSING</code>.</li>
-<li><strong>Loop/hop guard</strong> (before any forwarding, §6.10.10 per code comments): a received <code>Via</code> already containing this SCP’s <code>SCP-&lt;FQDN&gt;</code> token → <strong>400</strong> <code>MSG_LOOP_DETECTED</code>; an scp-typed <code>3gpp-Sbi-Max-Forward-Hops: 0</code> → <strong>502</strong> <code>MAX_SCP_HOPS_REACHED</code>. On forwarding, the hop header is decremented only when present (never added), and <code>Via: 2.0 SCP-&lt;fqdn&gt;</code> is appended. A plain single-hop request is never blocked.</li>
-<li><strong>Model D admission/rejection</strong>: <code>3gpp-Sbi-Discovery-target-nf-type</code> and <code>-requester-nf-type</code> are mandatory (<strong>400</strong> <code>MANDATORY_IE_MISSING</code> if absent); all other Discovery-* headers are forwarded as <code>nnrf-disc</code> query parameters (TS 29.500 §6.10.3.2 ↔ TS 29.510 §6.2.3.2.3 per code comment). No NRF configured or invalid NRF URI → <strong>503</strong> <code>NRF_NOT_AVAILABLE</code>; NRF non-200 or no usable NF instance → <strong>502</strong> <code>NF_DISCOVERY_FAILURE</code>. SearchResults are cached per (target-nf-type, service-names, discovery-factor discriminator) with the SearchResult’s <code>validityPeriod</code> as TTL, <strong>defaulting to 3600 s when absent</strong>.</li>
-<li><strong>Delegated OAuth2</strong>: when an NRF URI is known, the SCP acts as an OAuth2 client of NF type <code>SCP</code> and attaches producer-scoped access tokens on the Model D path; a token the NRF refuses yields <strong>403</strong> <code>ACCESS_TOKEN_DENIED</code>, and a producer <code>401</code> with a Bearer <code>WWW-Authenticate</code> challenge triggers one token-retry (TS 29.500 §6.10.11.2.3 per code comment). Model C requests are forwarded with the consumer’s own <code>Authorization</code> untouched.</li>
-<li><strong>No NRF registration</strong>: the SCP never registers or heartbeats itself with the NRF — its only NRF traffic is <code>GET /nnrf-disc/v1/nf-instances</code> and token requests. Note the shipped <code>docker-compose.yml</code> sets no <code>NRF_URI</code> for the <code>scp</code> service, so Model D is disabled in that deployment (discovery requests get 503). Error identity: SCP-originated errors carry <code>Server: SCP-&lt;fqdn&gt;</code> (§6.10.8.2 per code comment); relayed producer 4xx/5xx keep their body/status verbatim but gain this SCP’s <code>Via</code> (§6.10.8.3).</li>
-<li><strong>Environment variables</strong> (all read in <code>main.rs</code>; flags take precedence): <code>NRF_URI</code>, <code>NF_INSTANCE_ID</code>, <code>SCP_FQDN</code> (fallbacks as in the flags table) and <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> (OpenTelemetry OTLP trace exporter endpoint, default <code>http://jaeger:4317</code>). Upstream timeouts are compile-time constants — 2 s connect, 10 s request (<code>proxy.rs</code>, bounded per TS 29.500 §6.11 guidance per code comment) — with no CLI or YAML override.</li>
+<li>
+<p><strong>Routing precedence</strong> (<code>ScpProxy::route</code>, TS 29.500 §6.10.2 per code comment): a <code>3gpp-Sbi-Callback</code> notification wins first (see below); then a valid <code>3gpp-Sbi-Target-apiRoot</code> (Model C); otherwise a <code>3gpp-Sbi-Routing-Binding</code> matching a cached <code>3gpp-Sbi-Binding</code> learnt from an earlier producer response (§6.12 stickiness, with NF-set-level reselection per §5.2.3.2.6); otherwise any <code>3gpp-Sbi-Discovery-*</code> header triggers Model D. A request with none of these — or an unparsable Target-apiRoot — is rejected <strong>400</strong> ProblemDetails, cause <code>MANDATORY_IE_MISSING</code>.</p>
+</li>
+<li>
+<p><strong>Callbacks / notifications</strong> (TS 29.500 §6.10.7 per code comment): a request carrying <code>3gpp-Sbi-Callback</code> is routed straight to its callback URI with <strong>no discovery query and no access-token acquisition</strong> — the destination is fixed by the consumer that registered the callback, so discovering a producer for it would address the wrong node and minting a token would be an NRF round-trip for a credential the callback target never asked for. The header outranks <code>Routing-Binding</code> and the <code>Discovery-*</code> headers; it is <em>not</em> in competition with <code>Target-apiRoot</code>, which supplies the address while the callback header decides the mode. The <code>3gpp-Sbi-Callback</code> header itself is forwarded to the target (it identifies the message as a notification), and a callback is not treated as retargeting, so no <code>Location</code> fix-up is applied.</p>
+<blockquote>
+<p><strong>Conveyance limitation.</strong> In practice the callback destination must come from <code>3gpp-Sbi-Target-apiRoot</code>: the shared SBI server records only the request <em>path</em>, so an absolute callback URI does not survive the hop into the SCP’s routing. A callback naming no resolvable destination logs a warning and falls through to ordinary routing rather than being rejected, so a deployment whose notifications currently reach their target via the Discovery headers is not regressed. Tracked as issue #259.</p>
+</blockquote>
+</li>
+<li>
+<p><strong>Loop/hop guard</strong> (before any forwarding, §6.10.10 per code comments): a received <code>Via</code> already containing this SCP’s <code>SCP-&lt;FQDN&gt;</code> token → <strong>400</strong> <code>MSG_LOOP_DETECTED</code>; an scp-typed <code>3gpp-Sbi-Max-Forward-Hops: 0</code> → <strong>502</strong> <code>MAX_SCP_HOPS_REACHED</code>. On forwarding, the hop header is decremented only when present (never added), and <code>Via: 2.0 SCP-&lt;fqdn&gt;</code> is appended. A plain single-hop request is never blocked.</p>
+</li>
+<li>
+<p><strong>Model D admission/rejection</strong>: <code>3gpp-Sbi-Discovery-target-nf-type</code> and <code>-requester-nf-type</code> are mandatory (<strong>400</strong> <code>MANDATORY_IE_MISSING</code> if absent); all other Discovery-* headers are forwarded as <code>nnrf-disc</code> query parameters (TS 29.500 §6.10.3.2 ↔ TS 29.510 §6.2.3.2.3 per code comment). SearchResults are cached per (target-nf-type, service-names, discovery-factor discriminator) with the SearchResult’s <code>validityPeriod</code> as TTL, <strong>defaulting to 3600 s when absent</strong>.</p>
+</li>
+<li>
+<p><strong>Model D producer selection</strong> (TS 29.510 §6.2.6.2 per code comment): the endpoint is selected by matching the requested <strong>service name</strong> and the <strong>API major version in the URI</strong>, and scheme / <code>apiPrefix</code> / port come from the <em>matching</em> <code>NFService</code> — so a producer registering several services on different ports is addressed on the right one. The request URI is authoritative for the service name; <code>3gpp-Sbi-Discovery-service-names</code> is used only when the URI names no service, and only when the header names exactly one. A service declaring no <code>versions</code> serves <strong>any</strong> version, and a profile registering no <code>nfServices</code> at all keeps its profile-level endpoint — both because those fields are optional in TS 29.510 and reading silence as “supports nothing” would reject conformant producers. The existing health / priority / capacity ordering then applies <em>within</em> the matching set.</p>
+</li>
+<li>
+<p><strong>Model D failure conditions are reported distinctly</strong> (TS 29.500 §6.10.8.2 per code comment) — five outcomes, each with its own status <strong>and</strong> cause, so an operator can tell an NRF outage from a typo in the consumer’s Discovery headers without reading SCP logs:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>condition</th><th>status</th><th>cause</th></tr>
+</thead>
+<tbody>
+<tr><td>no NRF configured, or an invalid NRF URI</td><td><strong>503</strong></td><td><code>NRF_NOT_AVAILABLE</code></td></tr>
+<tr><td>NRF unreachable (connection refused) or timing out</td><td><strong>504</strong></td><td><code>NRF_NOT_REACHABLE</code></td></tr>
+<tr><td>NRF answered, non-200</td><td><strong>502</strong></td><td><code>NF_DISCOVERY_FAILURE</code></td></tr>
+<tr><td>empty <code>SearchResult</code>, or no instance offering the requested service</td><td><strong>404</strong></td><td><code>NF_DISCOVERY_FAILURE</code></td></tr>
+<tr><td>requested API major version served by no discovered producer</td><td><strong>400</strong></td><td><code>INVALID_API</code></td></tr>
+<tr><td>every discovered producer unreachable (candidate set exhausted)</td><td><strong>504</strong></td><td><code>TARGET_NF_NOT_REACHABLE</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>TARGET_NF_NOT_REACHABLE</code> is reserved for <strong>producer</strong>-side unreachability and is never used for an NRF failure.</p>
+</li>
+<li>
+<p><strong>Model D alternate-producer reselection</strong> (TS 29.500 §6.10.8.2 per code comment): the whole ranked candidate set is kept, and a forward that <strong>provably never reached</strong> the selected producer is retried against the next-best one. Bounded by <code>scp.max_producer_attempts</code> (default <strong>3</strong> — the selected producer plus two alternates; <code>1</code> disables reselection), and the bound is logged at <code>warn</code> when it leaves discovered candidates untried. Three rules govern when it fires:</p>
+<ul>
+<li><strong>Only pre-send failures.</strong> A connection refused or a TLS handshake failure proves the request bytes were never written, so replaying them cannot duplicate work even for a <code>POST</code>. A <strong>timeout</strong> does <em>not</em> qualify — the same error covers “never connected” and “sent, producer still working” — and neither does any post-send transport error, so a possibly-delivered request is never replayed.</li>
+<li><strong>An open circuit breaker reselects rather than shedding.</strong> Previously the breaker protected a dead producer but still failed the request; now the request goes to a sibling while the dead producer stays protected. If <em>every</em> candidate is shed by its own breaker, the answer is <strong>503</strong> <code>TARGET_NF_NOT_REACHABLE</code> (load shedding, retry shortly) rather than 504.</li>
+<li><strong>A producer that answered is never reselected.</strong> Any status the producer returns — including 4xx and 5xx — is relayed verbatim; a sibling has no business overriding it.</li>
+</ul>
+<p>A reselected producer reports <strong>its own</strong> <code>3gpp-Sbi-Producer-Id</code>, not the originally selected one’s. Model C and binding-stickiness forwarding have no alternates, so a single pinned target keeps its previous mapping (<strong>502</strong> refused / <strong>504</strong> timeout).</p>
+</li>
+<li>
+<p><strong>Delegated OAuth2</strong>: when an NRF URI is known, the SCP acts as an OAuth2 client of NF type <code>SCP</code> and attaches producer-scoped access tokens on the Model D path; a token the NRF refuses yields <strong>403</strong> <code>ACCESS_TOKEN_DENIED</code>, and a producer <code>401</code> with a Bearer <code>WWW-Authenticate</code> challenge triggers one token-retry (TS 29.500 §6.10.11.2.3 per code comment). Model C requests are forwarded with the consumer’s own <code>Authorization</code> untouched.</p>
+</li>
+<li>
+<p><strong>Response relay</strong> (TS 29.500 §6.10.3.4 / §6.10.4 per code comments): on a <strong>2xx</strong>, the SCP surfaces the producer it selected in <code>3gpp-Sbi-Producer-Id</code> (<code>nfinst=&lt;uuid&gt;[; nfset=&lt;set-id&gt;]</code>) and its NF group in <code>3gpp-Sbi-Target-Nf-Group-Id</code>. Three properties worth knowing:</p>
+<ul>
+<li><strong>The metadata does not depend on cache state.</strong> <code>nfSetId</code>/<code>nfGroupId</code> are parsed onto the cached candidate, so a discovery-cache <em>hit</em> reports the same <code>Producer-Id</code> as the miss that populated it. (Previously they were read from the raw <code>SearchResult</code>, which the cache does not store, so <code>nfset=</code> vanished on every cache hit and the loss looked intermittent.)</li>
+<li><strong>A <code>Producer-Id</code> the producer or a downstream SCP already supplied is preserved</strong>, never overwritten. A producer naming itself is first-hand and a downstream SCP’s is derived from the instance <em>it</em> selected; the SCP’s own value is second-hand and is only used where there is none.</li>
+<li><strong>After retargeting, a relative <code>Location</code> gains <code>3gpp-Sbi-Target-apiRoot</code>.</strong> When the SCP chose the producer (Model D, or a sticky binding resolved from its own cache) the consumer cannot resolve a relative <code>Location</code> — it names a resource without naming the holder. §6.10.4 permits either absolutising the <code>Location</code> or adding the header; <strong>this SCP adds the header</strong> because that is additive (the producer’s <code>Location</code> stays intact), because it keeps the consumer’s follow-up flowing <em>through</em> the SCP rather than inviting it to address the producer directly and lose stickiness and token delegation, and because the follow-up then takes the existing Model C path with no new handling. An <strong>absolute</strong> <code>Location</code> is already addressable and is left alone; Model C gets no fix-up, since the consumer named the target itself.</li>
+</ul>
+</li>
+<li>
+<p><strong>No NRF registration</strong>: the SCP never registers or heartbeats itself with the NRF — its only NRF traffic is <code>GET /nnrf-disc/v1/nf-instances</code> and token requests. Note the shipped <code>docker-compose.yml</code> sets no <code>NRF_URI</code> for the <code>scp</code> service, so Model D is disabled in that deployment (discovery requests get 503). Error identity: SCP-originated errors carry <code>Server: SCP-&lt;fqdn&gt;</code> (§6.10.8.2 per code comment); relayed producer 4xx/5xx keep their body/status verbatim but gain this SCP’s <code>Via</code> (§6.10.8.3).</p>
+</li>
+<li>
+<p><strong>Environment variables</strong> (all read in <code>main.rs</code>; flags take precedence): <code>SCP_SBI_ADDR</code>, <code>SCP_SBI_PORT</code>, <code>SCP_CONNECT_TIMEOUT</code>, <code>SCP_REQUEST_TIMEOUT</code>, <code>NRF_URI</code>, <code>NF_INSTANCE_ID</code>, <code>SCP_FQDN</code> (fallbacks as in the flags table) and <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> (OpenTelemetry OTLP trace exporter endpoint, default <code>http://jaeger:4317</code>).</p>
+</li>
 </ul>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../configuration/pin.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../configuration/ucmf.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
@@ -280,7 +357,7 @@ scp:
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../configuration/pin.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../configuration/ucmf.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
@@ -310,7 +387,7 @@ scp:
 
         <script src="../clipboard-1626706a.min.js"></script>
         <script src="../highlight-abc7f01d.js"></script>
-        <script src="../book-c22b7243.js"></script>
+        <script src="../book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

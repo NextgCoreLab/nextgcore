@@ -87,7 +87,7 @@ From the clap `Args` struct in `src/bins/nextgcore-udrd/src/main.rs`:
 | `-l, --log-file` | path | unset | **Accepted but currently unused** — `init_logging` never opens it; logging always goes to stderr. |
 | `-e, --log-level` | string | `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`); unrecognized values fall back to `info`. |
 | `-m, --no-color` | flag | off | Disable color output. |
-| `-k, --kill` | flag | off | **Stub**: logs "would send SIGTERM to running instance" and exits without signaling anything. |
+| `-k, --kill` | flag | off | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |
 | `--sbi-addr` | string | `0.0.0.0` | SBI server bind address. Overridden by `udr.sbi.server[0].address` when present. |
 | `--sbi-port` | u16 | `7777` | SBI server port. Overridden by `udr.sbi.server[0].port` when present. |
 | `--tls` | flag | off | Enable TLS on the SBI server. |

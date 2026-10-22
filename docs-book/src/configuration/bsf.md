@@ -4,7 +4,7 @@ The BSF (Binding Support Function, `nextgcore-bsfd`) stores and serves PCF bindi
 
 Configuration is split between a YAML file (default path `/etc/nextgcore/bsf.yaml`, overridable with `-c/--config`; the docker deployment passes `-c /etc/nextgcore/bsf.yaml`) and command-line flags. Unusually for this codebase, the YAML SBI `server` entry **overrides** the CLI `--sbi-addr`/`--sbi-port` (so the NRF NFProfile advertises a routable endpoint instead of `0.0.0.0`, per the code comment); everything else — TLS flags, session capacity, log level — is CLI-only. The only environment variable the binary reads is `OTEL_EXPORTER_OTLP_ENDPOINT`.
 
-> **Honesty note:** BSF behavior is validated by this project's own unit tests and matched-simulator Docker E2E runs (84/84 as of 2026-07-02), not by third-party conformance certification. Known gaps visible in the source: the `--tls` flag does **not** enable TLS on the actual HTTP/2 listener (it only flips the advertised URI scheme in the legacy NF-instance metadata built in `sbi_path.rs`); the daemon is **memory-only** by decision — bindings and subscriptions do not survive a restart, see [Durability](#durability-bsfd-is-a-memory-only-nf); and `nnrf_handler.rs`'s `handle_nf_status_notify` has no non-test caller, so inbound NF-status notifications are observed by nothing (the legacy `bsf_sbi_send_request` / `bsf_sbi_discover_and_send` placeholders that used to be named here were deleted by #234, along with the consumer-side discovery path they belonged to).
+> **Honesty note:** BSF behavior is validated by this project's own unit tests and matched-simulator Docker E2E runs, not by third-party conformance certification. Known gaps visible in the source: the `--tls` flag does **not** enable TLS on the actual HTTP/2 listener (it only flips the advertised URI scheme in the legacy NF-instance metadata built in `sbi_path.rs`); the daemon is **memory-only** by decision — bindings and subscriptions do not survive a restart, see [Durability](#durability-bsfd-is-a-memory-only-nf); and `nnrf_handler.rs`'s `handle_nf_status_notify` has no non-test caller, so inbound NF-status notifications are observed by nothing (the legacy `bsf_sbi_send_request` / `bsf_sbi_discover_and_send` placeholders that used to be named here were deleted by #234, along with the consumer-side discovery path they belonged to).
 
 ## Example configuration
 
@@ -80,7 +80,7 @@ Runtime knobs with real defaults from the clap `Args` struct in `src/bins/nextgc
 | `-l, --log-file` | path | unset | Parsed but **never used** — `init_logging` wires no file sink; logging goes to stderr. |
 | `-e, --log-level` | string | `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`); unrecognized values fall back to `info`. |
 | `-m, --no-color` | flag | off | Disable color output. |
-| `-k, --kill` | flag | off | Stub: logs "would send SIGTERM to running instance" and exits without signaling anything. |
+| `-k, --kill` | flag | off | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |
 | `--sbi-addr` | string | `0.0.0.0` | SBI server bind address; **overridden** by `bsf.sbi.server[0].address` when the YAML provides one. |
 | `--sbi-port` | u16 | `7777` | SBI server port; **overridden** by `bsf.sbi.server[0].port` when present. |
 | `--tls` | flag | off | Sets `tls_enabled` in the legacy context config; switches the advertised URI scheme to `https` but does not enable TLS on the HTTP/2 listener (see Behavior notes). |

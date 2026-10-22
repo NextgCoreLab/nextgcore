@@ -1,16 +1,29 @@
 # NextGCore - Pure Rust 5G/LTE Core Network
 
-NextGCore is a pure Rust implementation of a 5G/LTE mobile core network, derived from the Open5GS project. It provides a complete 5G Standalone (SA) core with zero C library dependencies, validated end-to-end against the companion nextgsim gNB/UE simulator (registration + PDU session + user-plane data). It is a research/interop implementation, not a production-certified core.
+NextGCore is a Rust implementation of a 5G/LTE mobile core network, derived from the Open5GS project. It provides a 5G Standalone (SA) core and a 4G EPC, validated end-to-end against the companion [nextgsim](https://github.com/NextgCoreLab/nextgsim) gNB/UE and eNB/UE simulators: 5G registration, PDU session, paging, Service Request and de-registration with user-plane pings, and LTE attach with a ping through the default bearer. It is a research/interop implementation, not a production-certified core.
 
 ## Key Features
 
-- **Pure Rust** - No C library dependencies, enabling true cross-compilation
+- **Rust** - every NF is Rust. The default build still compiles one C library, `aws-lc-sys` (the rustls crypto provider), so a C compiler and `cmake` are needed; the optional kernel-SCTP backend also needs `libsctp`
 - **Cross-Platform** - Build for Linux (x86_64, ARM64), macOS, and more
-- **Userspace SCTP** - Pure Rust SCTP implementation over UDP (no kernel SCTP required)
+- **Two SCTP backends** - userspace SCTP over UDP (`sctp-proto`, the default, which nextgsim speaks) and native Linux kernel SCTP for a standard RAN (`--features kernel-sctp`; the AMF selects it with `--sctp-backend kernel`, and the MME's S1-MME is kernel SCTP only)
+- **Generated ASN.1 codecs** - NGAP, S1AP, NRPPa, LPP, NR RRC and LTE RRC are compiled from the 3GPP ASN.1 by [NextgCoreLab/asn1-codegen](https://github.com/NextgCoreLab/asn1-codegen) (`src/libs/nextgcore-*-gen`); each crate's `asn/PROVENANCE.md` names the spec version
 - **Async/Await** - Modern async runtime using Tokio
-- **Container-Ready** - Optimized Docker images with minimal footprint
-- **Complete 5GC** - All core network functions implemented
+- **Container-Ready** - Docker Compose for 5GC and EPC, Kind manifests, a Helm chart, and an EKS deployment (`deploy/eks`)
+- **28 network functions** - 23 5GC/Rel-17+ NFs and 5 EPC NFs (see [Network Functions](#network-functions))
 - **Rel-17/18 features** - RedCap reduced-AMBR, XR delay-critical GBR 5QI (82-85), SNPN NID authorization, MINT/disaster-roaming multi-SUPI, and UAV geofence authorization wired end-to-end (see `docker/rust/README.md` → Rel-17/18 Feature Knobs / End-to-End Tests)
+
+## New in 0.2.0
+
+Since 0.1.0 (2026-07-02); see [CHANGELOG.md](CHANGELOG.md) for the full list.
+
+- **Generated codecs.** NGAP, S1AP, NRPPa and LPP traffic in amfd, smfd, mbsmfd, mmed and lmfd is encoded and decoded by codecs generated from the 3GPP ASN.1, pinned to NextgCoreLab/asn1-codegen v0.1.0. The hand-written S1AP, NRPPa, LPP, E1AP, F1AP and XnAP codecs are deleted. The hand-written NGAP crates (`nextgcore-ngap` and the `nextgcore-asn1c` APER engine under it) are still in the tree; deleting them is tracked in #417.
+- **A real LTE attach.** The EPC stage attaches nextgsim's LTE UE through its eNB to mmed, with SGW-C/SGW-U and a PGW-C/PGW-U (`smfd`/`upfd` in their EPC roles), and pings through the default bearer.
+- **Paging and Service Request.** CM-IDLE UEs are paged on downlink data, and a Service Request from CM-IDLE or CM-CONNECTED re-activates the user plane.
+- **EPS-5GS interworking over N26.** Idle-mode context transfer and connected-mode handover in both directions (Forward Relocation, Relocation Cancel, data-forwarding tunnels), with the AMF and the MME each as source and target. Off by default: set `AMF_N26_INTERWORKING` / `MME_N26_INTERWORKING`. The nightly E2E does not run a handover yet.
+- **RACS.** A new NF, `nextgcore-ucmfd` (UCMF, TS 29.673/29.675), transcodes UE radio capabilities between TS 38.331 and TS 36.331; the AMF uses it over Nucmf.
+- **Deployment.** `deploy/eks` selects what to deploy with `PROFILE=<name>` (`profiles/5g` ships; `epc` and `6g` profiles are being added), checks UE-to-internet traffic with `e2e-internet.sh`, and recovers from a pod restart without manual restarts of its peers.
+- **CI.** A nightly cross-repo E2E gates the UE flows (paging, idle uplink, de-registration, UDM-triggered re-registration) and LTE attach, records the validated (nextgcore, nextgsim) commit pair, and `release.yml` releases only such a pair. Fuzz targets for NGAP, S1AP, NRPPa, LPP, NAS, GTP, PFCP and Diameter build on every PR (`src/fuzz`).
 
 ## Quickstart
 
@@ -54,32 +67,33 @@ nextgcore-upf       Up 2 minutes (healthy)
 ### Option 2: Build from Source
 
 ```bash
-# Prerequisites: Rust 1.85+
+# Prerequisites: the toolchain pinned in src/rust-toolchain.toml (Rust 1.95.0,
+# installed by rustup automatically), a C compiler and cmake.
 cd src
 cargo build --release
 
-# Start network functions individually
-./target/release/nextgcore-nrfd -c configs/nrf.yaml &
-./target/release/nextgcore-amfd -c configs/amf.yaml &
-./target/release/nextgcore-smfd -c configs/smf.yaml &
-./target/release/nextgcore-upfd -c configs/upf.yaml &
+# Every NF takes -c <config>. The configs under docker/rust/configs/ bind the
+# compose network's 172.23.0.0/24 addresses; copy and edit them for a host run.
+./target/release/nextgcore-nrfd -c ../docker/rust/configs/5gc/nrf.yaml &
+./target/release/nextgcore-amfd -c ../docker/rust/configs/5gc/amf.yaml &
+./target/release/nextgcore-smfd -c ../docker/rust/configs/5gc/smf.yaml &
+./target/release/nextgcore-upfd -c ../docker/rust/configs/5gc/upf.yaml &
 ```
 
-### Option 3: Connect with nextgsim Simulator
+Run `<binary> --help` for an NF's flags.
+
+### Option 3: Watch the nextgsim UE register
+
+`docker/rust/docker-compose.yml` already runs nextgsim's gNB (`nextgsim-gnb`) and
+UE (`nextgsim-ue`) next to the core, so after Option 1:
 
 ```bash
-# Start the 5G core
-cd nextgcore/docker/rust
-docker compose -f docker-compose.yml up -d
-
-# Start the UE/gNB simulator (from nextgsim repository)
-cd ../../nextgsim
-docker compose up -d
-
-# Verify UE registration
-docker logs nextgsim-ue 2>&1 | grep "REGISTERED"
-# Expected: "UE is now REGISTERED"
+docker logs nextgsim-ue 2>&1 | grep "Registration Accept"
+docker exec nextgsim-ue ping -c 3 -I uesimtun0 10.45.0.1
 ```
+
+For the 4G EPC with nextgsim's LTE eNB and UE, use `docker-compose-epc.yml`
+(see [docker/rust/README.md](docker/rust/README.md)).
 
 ## Network Architecture
 
@@ -123,22 +137,28 @@ docker logs nextgsim-ue 2>&1 | grep "REGISTERED"
 |---------|------------|-------|
 | MongoDB | 172.23.0.2 | 27017 |
 | NRF | 172.23.0.10 | 7777 (SBI) |
-| AUSF | 172.23.0.11 | SBI |
-| UDM | 172.23.0.12 | SBI |
-| PCF | 172.23.0.13 | 9093 (metrics) |
-| NSSF | 172.23.0.14 | SBI |
-| BSF | 172.23.0.15 | SBI |
-| UDR | 172.23.0.20 | SBI |
-| **AMF** | **172.23.0.5** | **38412/NGAP** |
-| SMF | 172.23.0.4 | 8805/PFCP |
-| **UPF** | **172.23.0.7** | **2152/GTP-U** |
+| AUSF | 172.23.0.11 | 7777 (SBI) |
+| UDM | 172.23.0.12 | 7777 (SBI) |
+| PCF | 172.23.0.13 | 7777 (SBI), 9090 (metrics) |
+| NSSF | 172.23.0.14 | 7777 (SBI) |
+| BSF | 172.23.0.15 | 7777 (SBI) |
+| UDR | 172.23.0.20 | 7777 (SBI) |
+| **AMF** | **172.23.0.5** | **38412 (NGAP, SCTP over UDP)**, 7777 (SBI) |
+| SMF | 172.23.0.4 | 8805 (PFCP), 7777 (SBI) |
+| **UPF** | **172.23.0.7** | **2152 (GTP-U)**, 8805 (PFCP) |
+| NWDAF, EES, LMF, MB-SMF, NSACF, PIN, DCCF, SCP, SEPP | 172.23.0.30-38 | SBI |
+| UCMF | 172.23.0.39 | 7777 (SBI) |
+| gNB / UE (nextgsim) | 172.23.0.100 / .101 | |
+| Prometheus / Grafana / Jaeger | 172.23.0.200-202 | 9090 / 3000 / 16686 |
+
+`docker/rust/configs/5gc/README.md` lists every NF's address.
 
 ### Docker Compose Files
 
 | File | Description |
 |------|-------------|
-| `docker-compose.yml` | Full 22-NF 5GC + nextgsim gNB/UE matched-sim E2E stack (recommended) |
-| `docker-compose-epc.yml` | 4G EPC deployment |
+| `docker-compose.yml` | 20 5GC NFs + MongoDB + nextgsim gNB/UE + Prometheus/Grafana/Jaeger (recommended) |
+| `docker-compose-epc.yml` | 4G EPC (MME, HSS, PCRF, SGW-C, SGW-U, PGW-C, PGW-U) + nextgsim LTE eNB/UE |
 | `docker-compose.features.yml` | Rel-17/18 feature-knobs overlay |
 | `docker-compose.oauth2.yml` | SBI OAuth2 token-enforcement overlay |
 | `docker-compose.kernel-sctp.yml` | Native kernel-SCTP N2 overlay |
@@ -146,41 +166,32 @@ docker logs nextgsim-ue 2>&1 | grep "REGISTERED"
 ### Environment Variables
 
 ```bash
-RUST_LOG=info           # Log level (trace, debug, info, warn, error)
 RUST_BACKTRACE=1        # Enable backtraces for debugging
+RUST_LOG=info           # Log filter, honoured by 13 of the 28 NFs (#691);
+                        # every NF but smfd also takes --log-level
 ```
+
+Per-NF environment variables are documented in the
+[configuration reference](https://nextgcorelab.github.io/nextgcore/book/configuration/overview.html)
+(`docs-book/src/configuration/`).
 
 ## Project Structure
 
 ```
 nextgcore/
-├── src/           # Rust source code
-│   ├── bins/           # Network function binaries
-│   │   ├── nextgcore-amfd/    # Access and Mobility Management Function
-│   │   ├── nextgcore-ausfd/   # Authentication Server Function
-│   │   ├── nextgcore-bsfd/    # Binding Support Function
-│   │   ├── nextgcore-hssd/    # Home Subscriber Server
-│   │   ├── nextgcore-mmed/    # Mobility Management Entity
-│   │   ├── nextgcore-nrfd/    # Network Repository Function
-│   │   ├── nextgcore-nssfd/   # Network Slice Selection Function
-│   │   ├── nextgcore-pcfd/    # Policy Control Function
-│   │   ├── nextgcore-pcrfd/   # Policy and Charging Rules Function
-│   │   ├── nextgcore-scpd/    # Service Communication Proxy
-│   │   ├── nextgcore-seppd/   # Security Edge Protection Proxy
-│   │   ├── nextgcore-sgwcd/   # Serving Gateway Control Plane
-│   │   ├── nextgcore-sgwud/   # Serving Gateway User Plane
-│   │   ├── nextgcore-smfd/    # Session Management Function
-│   │   ├── nextgcore-udmd/    # Unified Data Management
-│   │   ├── nextgcore-udrd/    # Unified Data Repository
-│   │   └── nextgcore-upfd/    # User Plane Function
-│   ├── libs/           # Shared library crates
-│   └── tests/          # Integration tests
-├── docker/             # Docker deployment files
-│   ├── rust/           # Rust NF Docker configurations
-│   │   ├── configs/    # Network function configurations
-│   │   └── binaries/   # Pre-built binaries (for fast builds)
-│   └── webui/          # WebUI Docker configuration
-└── webui/              # Web-based management interface
+├── src/                # Cargo workspace root
+│   ├── bins/           # 28 NF daemons (nextgcore-<nf>d) + nextgcore-webui
+│   ├── libs/           # 23 shared library crates, 6 of them generated ASN.1 codecs (*-gen)
+│   ├── tests/          # Mock-based flow tests (nextgcore-integration-tests)
+│   ├── fuzz/           # cargo-fuzz targets (own workspace)
+│   └── vendor/         # patched sctp-proto
+├── docker/rust/        # Docker Compose stacks, configs, E2E scripts
+├── k8s/                # Kind manifests and scripts
+├── deploy/helm/        # Helm chart (5GC control plane)
+├── deploy/eks/         # EKS deployment (PROFILE=<name>)
+├── docs/               # GitHub Pages site, OpenAPI specs, design notes
+├── docs-book/          # mdBook sources (built into docs/book/)
+└── webui/              # Node.js subscriber-management WebUI
 ```
 
 ## Network Functions
@@ -206,6 +217,10 @@ nextgcore/
 | **MBSMF** | MBS Session Management Function | TS 29.532 |
 | **PIN** | Personal IoT Network server | TS 23.542 |
 | **DCCF** | Data Collection Coordination Function | TS 23.288 |
+| **NEF** | Network Exposure Function | TS 29.522, TS 29.122 |
+| **EASDF** | Edge Application Server Discovery Function | TS 23.548 |
+| **TSCTSF** | Time Sensitive Communication and Time Synchronization Function | TS 23.501 §5.27-5.28 |
+| **UCMF** | UE radio Capability Management Function (RACS) | TS 29.673, TS 29.675 |
 
 ### Evolved Packet Core (EPC)
 
@@ -216,6 +231,9 @@ nextgcore/
 | **MME** | Mobility Management Entity |
 | **SGW-C** | Serving Gateway Control Plane |
 | **SGW-U** | Serving Gateway User Plane |
+
+The PGW-C and PGW-U are `nextgcore-smfd` and `nextgcore-upfd` in their EPC
+roles (`docker/rust/configs/epc/pgwc.yaml`, `pgwu.yaml`).
 
 ### Optional Components
 
@@ -228,17 +246,21 @@ nextgcore/
 
 ### AMF Configuration
 
+Excerpt of `docker/rust/configs/5gc/amf.yaml`:
+
 ```yaml
-# configs/5gc/amf.yaml
 amf:
   sbi:
     server:
-      address: 0.0.0.0
-      port: 7777
+      - address: 172.23.0.5
+        port: 7777
+    client:
+      nrf:
+        - uri: http://172.23.0.10:7777
   ngap:
     server:
-      address: 0.0.0.0
-      port: 38412
+      - address: 172.23.0.5
+        port: 38412
   guami:
     - plmn_id:
         mcc: 999
@@ -261,19 +283,26 @@ amf:
 
 ### UPF Configuration
 
+Excerpt of `docker/rust/configs/5gc/upf.yaml`:
+
 ```yaml
-# configs/5gc/upf.yaml
 upf:
   pfcp:
     server:
-      address: 172.23.0.7
+      - address: 172.23.0.7
+        port: 8805
   gtpu:
     server:
-      address: 172.23.0.7
+      - address: 172.23.0.7
+        port: 2152
   session:
     - subnet: 10.45.0.0/16
       gateway: 10.45.0.1
+      dev: ogstun
 ```
+
+Every NF's keys, flags and environment variables are in the
+[configuration reference](docs-book/src/configuration/overview.md).
 
 ## Testing
 
@@ -286,8 +315,8 @@ cargo test
 
 ### End-to-End (matched-sim)
 
-The one-command matched-sim E2E runs our nextgsim gNB+UE against our 22-NF 5G
-core (no Open5GS): disk preflight -> build -> full registration + PDU session
+The one-command matched-sim E2E runs our nextgsim gNB+UE against our 5G core
+(no Open5GS): disk preflight -> build -> full registration + PDU session
 + user-plane ping through the GTP-U tunnel (UE gets 10.45.0.2 on `uesimtun0`).
 See `docker/rust/CI.md`.
 
@@ -296,16 +325,30 @@ cd docker/rust
 ./e2e.sh            # preflight -> build -> E2E  (exit 0/1/2)
 ./e2e.sh --quick    # reuse prebuilt binaries (fast re-run)
 ./e2e.sh --overlay features   # baseline + Rel-17/18 feature harness
+./ue-flow-check.sh all        # paging, idle uplink, de-registration, UDM re-registration
+                              # (against a running stack, e.g. after ./e2e.sh --keep)
 ```
+
+The nightly CI runs the same flows, plus the OAuth2 overlay and the EPC LTE
+attach (`epc-attach-check.sh`); see [docs/ci-and-release.md](docs/ci-and-release.md).
 
 ### Protocol Conformance
 
-The implementation follows 3GPP Release 17 specifications:
-- NGAP: TS 38.413
-- NAS 5G: TS 24.501
-- SBI: TS 29.500 series
-- PFCP: TS 29.244
-- GTP-U: TS 29.281
+The generated codecs are compiled from these ASN.1 versions (from each crate's
+`asn/PROVENANCE.md`):
+
+| Protocol | Spec | Version |
+|---|---|---|
+| NGAP | TS 38.413 | V17.9.0 |
+| S1AP | TS 36.413 | V19.2.0 |
+| NRPPa | TS 38.455 | V19.2.0 |
+| LPP | TS 37.355 | V19.3.0 |
+| NR RRC | TS 38.331 | V19.3.0 |
+| LTE RRC | TS 36.331 | V19.4.0 |
+
+The hand-written protocols cite their specs in doc comments: NAS (TS 24.501 /
+TS 24.301), SBI (TS 29.500 series), PFCP (TS 29.244), GTP (TS 29.274 / TS 29.281),
+Diameter (RFC 6733, TS 29.272 / 29.212).
 
 ## Development
 
@@ -340,8 +383,8 @@ cargo build --release --target aarch64-unknown-linux-gnu
 # Format code
 cargo fmt
 
-# Run lints
-cargo clippy --all-targets
+# Run lints (CI also checks every feature: --all-features --all-targets)
+cargo clippy --workspace --all-targets
 
 # Check for security vulnerabilities
 cargo audit
@@ -358,6 +401,9 @@ cargo audit
 - [docs/nwdaf-inference.md](docs/nwdaf-inference.md) — NWDAF analytics inference abstraction and ONNX-subset backend design note (non-normative 6G research)
 - [docs/slice-sla-observe.md](docs/slice-sla-observe.md) — observe-only slice-SLA assurance loop design note (non-normative research)
 - [docker/rust/CI.md](docker/rust/CI.md) — the one-command matched-sim end-to-end suite (`e2e.sh`)
+- [docs-book/](docs-book/src/SUMMARY.md) — the mdBook: getting started, per-NF configuration reference, call flows ([published](https://nextgcorelab.github.io/nextgcore/book/))
+- [deploy/eks/README.md](deploy/eks/README.md) — EKS deployment; [deploy/helm/nextgcore/README.md](deploy/helm/nextgcore/README.md) — Helm chart
+- [src/fuzz/README.md](src/fuzz/README.md) — fuzz targets
 - [docs/](docs/) — per-component gap analyses and architecture notes
 
 ## Contributing
@@ -368,7 +414,7 @@ We welcome contributions! Here's how to get started:
 
 ```bash
 # Clone the repository
-git clone https://github.com/nextgcore/nextgcore.git
+git clone https://github.com/NextgCoreLab/nextgcore.git
 cd nextgcore
 
 # Install Rust (if not already installed)
@@ -390,9 +436,9 @@ cargo test
 
 ### Pull Request Process
 
-1. Ensure all tests pass: `cargo test`
-2. Run lints: `cargo clippy --all-targets`
-3. Format code: `cargo fmt`
+1. Ensure all tests pass: `cargo test --workspace`
+2. Run lints: `cargo clippy --workspace --all-targets`
+3. Format code: `cargo fmt --all`
 4. Update CHANGELOG.md if applicable
 5. Submit PR with clear description of changes
 
@@ -414,30 +460,28 @@ Use GitHub Issues for:
 
 ## WebUI
 
-### Access
+Two subscriber-management front ends ship, and neither has a default account
+(TS 33.117 §4.2.3.4.2.2; issue #118):
 
-Open http://localhost:9999 in your browser.
+- **Node.js WebUI** (`webui/`, port 9999 by default, `PORT` to change). Create
+  the first admin with `node server/bin/create-admin.js <username>`; the password
+  is read from the terminal or `WEBUI_ADMIN_PASSWORD`, at least 12 characters.
+- **`nextgcore-webui`** (Rust, `src/bins/nextgcore-webui`). Listens on
+  `127.0.0.1:3000` by default (`--listen`, `--port`) and requires an API token
+  (`--api-token-file` or `NEXTGCORE_WEBUI_API_TOKEN`); `--tls-cert`/`--tls-key`
+  for HTTPS, `--insecure-dev` only for local development.
 
-### Default Credentials
-
-- Username: `admin`
-- Password: `1423`
-
-### Features
-
-- Subscriber management
-- Network slice configuration
-- Session monitoring
-- Statistics and metrics
+Both read and write the `nextgcore` MongoDB database the UDR uses.
 
 ## Key Dependencies
 
 - **tokio** - Async runtime
-- **hyper** - HTTP/2 for SBI
-- **tonic** - gRPC (optional)
-- **serde** - Configuration parsing
-- **tracing** - Structured logging
-- **sctp-proto** - Pure Rust SCTP
+- **hyper** / **h2** - HTTP/2 for SBI
+- **rustls** - TLS for SBI
+- **serde** / **serde_yaml** - Configuration parsing
+- **log** / **env_logger** - Logging
+- **sctp-proto** - Userspace SCTP (patched copy in `src/vendor/sctp-proto`)
+- **asn1-codecs** / **asn1-compiler** - generated ASN.1 codecs ([NextgCoreLab/asn1-codegen](https://github.com/NextgCoreLab/asn1-codegen))
 - **mongodb** - Subscriber database
 
 ## References
@@ -453,7 +497,7 @@ Open http://localhost:9999 in your browser.
 ### Related Projects
 
 - [Open5GS](https://open5gs.org/) - Original C implementation
-- [nextgsim](../nextgsim) - Companion UE/gNB simulator
+- [nextgsim](https://github.com/NextgCoreLab/nextgsim) - Companion UE/gNB and LTE UE/eNB simulator
 
 ## Troubleshooting
 
@@ -462,8 +506,8 @@ Open http://localhost:9999 in your browser.
 **AMF not accepting gNB connections**
 ```bash
 # Check AMF is listening on NGAP port
-docker logs nextgcore-amf | grep "NGAP"
-# Should show: "NGAP server listening on 0.0.0.0:38412"
+docker logs nextgcore-amf | grep "NGAP server listening"
+# Should show: "NGAP server listening on 172.23.0.5:38412 (...)" with the SCTP backend in brackets
 ```
 
 **UPF not forwarding traffic**

@@ -2,7 +2,7 @@
 
 A PDU session is the end-to-end user-plane pipe between a UE and a data network: an IP address for the UE, a GTP-U tunnel across N3, and a set of forwarding/QoS rules programmed into the UPF over N4/PFCP. This chapter traces how NextGCore actually builds one — from the NAS *PDU Session Establishment Request* that arrives at the SMF, through the PCF policy call, the PFCP session toward the UPF, the N2 resource-setup container handed back to the gNB, and finally the GTP-U packets that the UPF forwards. Every step below names the file and function/struct that implements it, and where the implementation takes a shortcut relative to the 3GPP procedure, that shortcut is called out rather than glossed over.
 
-> **Honesty note:** The PDU-session and PFCP behavior described here is validated by this project's own unit tests plus a matched-simulator docker E2E (84/84 green as of 2026-07-02), **not** by third-party conformance certification. The peer on the other side is the in-tree `nextgsim` gNB/UE, not a commercial RAN or a certified test set. Concrete simplifications (a hand-rolled NAS accept encoder, a bespoke PFCP TLV codec, a userspace UPF fast path, an unwired UDM fetch) are listed under [Simplifications and known gaps](#simplifications-and-known-gaps). TS numbers below are quoted only where they appear in this repo's source comments, phrased "per code comments".
+> **Honesty note:** The PDU-session and PFCP behavior described here is validated by this project's own unit tests plus a matched-simulator docker E2E (nightly in `.github/workflows/ci.yml`), **not** by third-party conformance certification. The peer on the other side is the in-tree `nextgsim` gNB/UE, not a commercial RAN or a certified test set. Concrete simplifications (a hand-rolled NAS accept encoder, a bespoke PFCP TLV codec, a userspace UPF fast path) are listed under [Simplifications and known gaps](#simplifications-and-known-gaps). TS numbers below are quoted only where they appear in this repo's source comments, phrased "per code comments".
 
 ## Components involved
 
@@ -14,7 +14,8 @@ A PDU session is the end-to-end user-plane pipe between a UE and a data network:
 | PCF | [`nextgcore-pcfd`](../configuration/pcf.md) | Authorizes Session-AMBR / 5QI via Npcf_SMPolicyControl (optional — a config-default is used when absent). |
 | NSACF | [`nextgcore-nsacfd`](../configuration/nsacf.md) | Optional per-slice PDU-session admission (fail-open when not deployed). |
 | PFCP model | `src/libs/nextgcore-pfcp` | Header/SEID model, IE-type registry, typed message structs. |
-| NGAP transfers | `src/libs/nextgcore-ngap` | Real-APER PDU Session Resource *transfer* codec used for the N2 container. |
+| UDM | [`nextgcore-udmd`](../configuration/udm.md) | `Nudm_UECM` serving-SMF registration, `Nudm_SDM` sm-data get and subscribe (#79, #293). |
+| NGAP transfers | `src/bins/nextgcore-smfd/src/n2_transfer.rs` on `src/libs/nextgcore-ngap-gen` | PDU Session Resource *transfer* codec generated from the TS 38.413 ASN.1, used for the N2 container (#417). |
 
 ## The two state machines (and how much they actually drive)
 
@@ -23,7 +24,7 @@ The SMF ships two ported finite-state machines:
 - **GSM (5G Session Management)** — `src/bins/nextgcore-smfd/src/gsm_sm.rs`, struct `GsmFsm`, states `Initial → Wait5gcSmPolicyAssociation → WaitPfcpEstablishment → Operational → WaitPfcpDeletion → …` (`GsmState`).
 - **PFCP node FSM** — `src/bins/nextgcore-smfd/src/pfcp_sm.rs`, struct `PfcpFsm`, states `Initial → WillAssociate → Associated`.
 
-Be aware of a real structural fact: these FSMs are largely **state-tracking scaffolding**, not the engine that builds messages. Their handlers (`GsmFsm::dispatch`, `PfcpFsm::dispatch`) mostly log, flip a state, and return `Handled`/`Ignored`; the header comments describe them as a "Port of src/smf/gsm-sm.c / pfcp-sm.c". The real establishment logic lives in one imperative async function, `handle_sm_context_create` in `src/bins/nextgcore-smfd/src/main.rs`, which constructs a fresh `GsmFsm`, calls `fsm.init()`, and drives it with several `fsm.dispatch(...)` calls — the initial `ESTABLISHMENT_REQUEST` gsm_message dispatch (~line 2006), the PCF policy response via `fsm_dispatch_policy_response(&mut fsm, …)` (which itself calls `fsm.dispatch`, ~lines 2052/2059), and an `n4_message` dispatch after PFCP establishment (~line 2212) — interleaved with explicit `fsm.transition_to(...)` calls (`WaitPfcpEstablishment`/`Exception`) for logging while it does the actual work inline. When you read the flow below, treat the FSM state names as a narration of `handle_sm_context_create`, not as an independent dispatcher.
+Be aware of a real structural fact: these FSMs are largely **state-tracking scaffolding**, not the engine that builds messages. Their handlers (`GsmFsm::dispatch`, `PfcpFsm::dispatch`) mostly log, flip a state, and return `Handled`/`Ignored`; the header comments describe them as a "Port of src/smf/gsm-sm.c / pfcp-sm.c". The real establishment logic lives in one imperative async function, `handle_sm_context_create` in `src/bins/nextgcore-smfd/src/main.rs`, which constructs a fresh `GsmFsm`, calls `fsm.init()`, and drives it with several `fsm.dispatch(...)` calls — the initial `ESTABLISHMENT_REQUEST` gsm_message dispatch, the PCF policy response via `fsm_dispatch_policy_response(&mut fsm, …)` (which itself calls `fsm.dispatch`), and an `n4_message` dispatch after PFCP establishment — interleaved with explicit `fsm.transition_to(...)` calls (`WaitPfcpEstablishment`/`Exception`) for logging while it does the actual work inline. When you read the flow below, treat the FSM state names as a narration of `handle_sm_context_create`, not as an independent dispatcher.
 
 ## PDU session establishment, step by step
 
@@ -33,7 +34,7 @@ The trigger is an SBI `POST` to `Nsmf_PDUSession` CreateSMContext from the AMF. 
 UE ──NAS PDU Session Est. Req──▶ AMF ──Nsmf CreateSMContext──▶ SMF
                                                                 │
                           (1) validate  (2) parse N1  (3) alloc UE IP
-                          (4) NSAC admit (5) PCF policy
+                          (4) NSAC admit (5) UDM + PCF policy
                                                                 │
                                         (6) PFCP Session Est. ──▶ UPF
                                         ◀── UP F-SEID + UPF N3 F-TEID ──
@@ -51,28 +52,26 @@ SMF ──201 multipart {SmContext, n1SmMsg, n2SmInfo}──▶ AMF ──▶ gN
 
 4. **Slice admission (optional).** `policy::resolve_nsacf_endpoint()` + `policy::nsac_pdu_session_admit(...)` ask the NSACF whether a new PDU session is admissible for this S-NSSAI (per code comments, TS 29.536 §5.3). This is **fail-open**: no NSACF configured, or an unreachable one, proceeds anyway; only an explicit `Rejected` (quota exhausted) fails the session with 5GSM cause #67.
 
-5. **SM policy (PCF, or config-default).** `policy::resolve_pcf_endpoint()` decides the source:
+5. **UDM, then SM policy (PCF, or subscription / config default).** The SMF first registers with the UDM as the serving SMF (`udm::register_as_serving_smf`, `Nudm_UECM_Registration`), fetches the SM subscription data (`udm::fetch_sm_data`, `Nudm_SDM_Get sm-data`) and subscribes to changes (`udm::subscribe_sm_data`), all in `src/bins/nextgcore-smfd/src/udm.rs` (#79, #293). The subscribed Session-AMBR and default 5QI are the baseline; per the module's comments (TS 23.503 §6.1.3.2) the PCF outranks them. `policy::resolve_pcf_endpoint()` then decides the source:
    - **PCF present:** `policy::sm_policy_create(...)` performs Npcf_SMPolicyControl_Create (per code comments, TS 29.512 §4.2.2) and returns a `PolicyDecision` (default 5QI, Session-AMBR UL/DL, PCC rules). A PCF *rejection* fails the session (cause #29-family); a PCF that is configured-but-**unreachable** is a hard `504` failure with cause #38 — no silent fallback.
-   - **No PCF:** `PolicyDecision::config_default_for_dnn(&dnn)` applies a documented default (DNN-derived 5QI, AMBR 100/100 Mbps). An "xr" DNN yields a delay-critical GBR XR 5QI so the XR QER path below is still exercised.
+   - **No PCF:** the subscribed values, else `PolicyDecision::config_default_for_dnn(&dnn)` applies a documented default (DNN-derived 5QI, AMBR 100/100 Mbps). An "xr" DNN yields a delay-critical GBR XR 5QI so the XR QER path below is still exercised.
 
    The decision is then post-processed: `decision.ensure_xr_for_dnn(&dnn)` (Rel-18 XR 5QI upgrade for an XR DNN) and, for a `redcapIndication` UE, a Session-AMBR cap (default 150/50 Mbps DL/UL, env-overridable) applied once so it flows to the N1 accept, the PFCP QER, and the stored binding.
-
-   > **Not wired:** there is **no** UDM `Nudm_SDM` subscription-data fetch on this path. The GSM FSM has a placeholder `nudm-sdm` branch, but `handle_sm_context_create` and `policy.rs` never call UDM — session type, DNN and S-NSSAI come from `SmContextCreateData` + the N1 container, and QoS comes from PCF or the config default. (SMF↔UDM N10 exists as an interface line but is not on the establishment path.)
 
 6. **PFCP Session Establishment toward the UPF.** `pfcp_session_establish` (`main.rs`) builds and sends the N4 request. See [The PFCP session, as built](#the-pfcp-session-as-built) for the exact PDR/FAR/QER layout. On success it returns the UPF's `UP F-SEID`, the UPF N3 GTP-U TEID, and the UPF N3 address, and stores the `upf_seid` in `SmfContext.pfcp_sessions` keyed by `smContextRef`.
 
 7. **Build the N1 `PDU Session Establishment Accept`.** `policy::build_establishment_accept` (`src/bins/nextgcore-smfd/src/policy.rs`) hand-encodes the 5GSM message byte-by-byte: octet-5 SSC|type, the authorized QoS-rules LV-E, the Session-AMBR, the IPv4 PDU address, the S-NSSAI IE (`0x22`), conditional QoS-flow descriptions (`0x79`), and the DNN. Its doc comment stresses the layout is byte-identical to the legacy encoding and golden-tested. When the UE asked for IPv4v6 but only the IPv4 leg is granted, 5GSM cause #50 is attached (per code comments, TS 24.501 §8.3.2.2).
 
-8. **Build the N2 `PDUSessionResourceSetupRequestTransfer`.** `build_setup_request_transfer` (`main.rs`) — this is **real APER**, encoded through `nextgcore_ngap::transfer::PduSessionResourceSetupRequestTransfer::encode()`, carrying the UPF N3 F-TEID (`UpTransportLayerInformation::GtpTunnel`) and a `QosFlowSetupRequestItem` (QFI, `NonDynamic5qi`, ARP). The code comment is explicit about *why* it is real APER: "the gNB's strict APER decoder rejects the legacy hand-rolled byte layout (smfd#2)." This is a place where an earlier bespoke-bytes shortcut was deliberately replaced with a spec codec — the N2 setup, modify, path-switch, and setup-response transfers all go through `nextgcore-ngap`.
+8. **Build the N2 `PDUSessionResourceSetupRequestTransfer`.** `build_setup_request_transfer` (`main.rs`) calls `n2_transfer::setup_request_transfer` (`src/bins/nextgcore-smfd/src/n2_transfer.rs`), which encodes on the codec **generated from the TS 38.413 ASN.1** (`nextgcore-ngap-gen`, #417 / #590), carrying the UPF N3 F-TEID (UL GTP tunnel) and a QoS flow setup item (QFI, non-dynamic 5QI, ARP). The gNB's strict APER decoder rejected the original hand-rolled byte layout (smfd#2); the transfers then moved to the hand-written `nextgcore-ngap` codec, and since #590 every N2 SM transfer the SMF builds or parses — setup, modify, release, path switch, handover, setup response — goes through `n2_transfer.rs`. Oracle tests there pin each one against the old hand-written encoder.
 
-9. **Respond.** `sbi_response_with_n1_n2` (`main.rs`) returns `201` as `multipart/related`: a JSON `SmContextCreatedData` root (`smContextRef`, `pduSessionId`, `upCnxState: "ACTIVATING"`, `n2SmInfoType: "PDU_RES_SETUP_REQ"`) plus two binary parts — `n1SmMsg` (`application/vnd.3gpp.5gnas`) and `n2SmInfo` (`application/vnd.3gpp.ngap`) — referenced by `RefToBinaryData` (per code comments, TS 29.502 §6.1.2.2.2/§6.1.2.4). **Shortcut:** the N1/N2 are kept *inline* in the CreateSMContext response; the separate `Namf_Communication` N1N2MessageTransfer is noted in-code as out of scope (smfd-03).
+9. **Respond.** `sbi_response_with_n1_n2` (`main.rs`) returns `201` as `multipart/related`: a JSON `SmContextCreatedData` root (`smContextRef`, `pduSessionId`, `upCnxState: "ACTIVATING"`, `n2SmInfoType: "PDU_RES_SETUP_REQ"`) plus two binary parts — `n1SmMsg` (`application/vnd.3gpp.5gnas`) and `n2SmInfo` (`application/vnd.3gpp.ngap`) — referenced by `RefToBinaryData` (per code comments, TS 29.502 §6.1.2.2.2/§6.1.2.4). **Shortcut:** on establishment the N1/N2 are kept *inline* in the CreateSMContext response (smfd-03). The SMF does use `Namf_Communication_N1N2MessageTransfer` for network-initiated procedures — release, modification and paging on a Downlink Data Report (#283, #633).
 
 ### Completing the tunnel: SM Context Update
 
 The gNB accepts the resource and reports its own downlink GTP-U endpoint. The AMF forwards this as an `Nsmf_PDUSession` update, handled by `handle_sm_context_update` (`main.rs`), which dispatches on `n2SmInfoType`:
 
-- `PDU_RES_SETUP_RSP` → `decode_setup_response_dl_endpoint` (real-APER `PDUSessionResourceSetupResponseTransfer`) extracts the gNB DL TEID + address + QFI.
-- `PATH_SWITCH_REQ` → `decode_path_switch_dl_endpoint` (real-APER `PathSwitchRequestTransfer`) for an Xn handover.
+- `PDU_RES_SETUP_RSP` → `decode_setup_response_dl_endpoint` (generated-codec `PDUSessionResourceSetupResponseTransfer`) extracts the gNB DL TEID + address + QFI.
+- `PATH_SWITCH_REQ` → `decode_path_switch_dl_endpoint` (generated-codec `PathSwitchRequestTransfer`) for an Xn handover.
 
 Either way the SMF then calls `pfcp_session_modify` (`main.rs`), which sends a PFCP **Session Modification** that flips the downlink FAR from BUFF to FORW and installs an `OuterHeaderCreation` (GTP-U/UDP/IPv4, description `0x0100`) pointing at the gNB TEID, with the SNDEM flag to emit End Markers on any old tunnel. Only after this does downlink traffic actually flow to the UE.
 
@@ -100,23 +99,23 @@ It sends `SESSION_ESTABLISHMENT_REQUEST` with **SEID=0** for a new session (per 
 
 ### The object model (UPF side)
 
-The UPF stores everything in a per-session `SessionContext` (`src/bins/nextgcore-upfd/src/n4_handler.rs`), which is just four `HashMap`s plus a BAR:
+The UPF's live PFCP path is `src/bins/nextgcore-upfd/src/pfcp_path.rs`: its `handle_session_establishment_request` / `handle_session_modification_request` parse each Create/Update/Remove IE with the `n4_build::parse_create_pdr` / `parse_create_far` / `parse_create_qer` / `parse_create_urr` family and install the result as a `DataPlaneSession` in the forwarder (`src/bins/nextgcore-upfd/src/data_plane.rs`):
 
 ```
-SessionContext { upf_n4_seid, smf_n4_seid,
-                 pdrs: HashMap<u16, Pdr>,
-                 fars: HashMap<u32, Far>,
-                 urrs: HashMap<u32, Urr>,
-                 qers: HashMap<u32, Qer>,
-                 bar:  Option<Bar> }
+DataPlaneSession { upf_seid, smf_seid, ue_ip, ul_teid, dl_teid, gnb_addr, qfi,
+                   ul/dl packet and byte counters,
+                   pdrs: RwLock<Vec<DataPlanePdr>>,          // sorted by precedence
+                   fars: RwLock<HashMap<u32, DataPlaneFar>>,
+                   qers: RwLock<HashMap<u32, DataPlaneQer>>,
+                   urrs: RwLock<HashMap<u32, Arc<DataPlaneUrr>>> }
 ```
 
-- **`Pdr`** (`context.rs`) — `pdr_id`, `precedence`, `source_interface`, optional `ue_ip`/`f_teid`/`sdf_filter`, `far_id`, `qer_id`, `urr_ids`, `outer_header_removal`. `Pdr::pdr_match` compares source interface, UE IP, and TEID; SDF filters compile via `nextgcore-ipfw` but full per-packet SDF matching happens in the data plane.
-- **`Far`** (`context.rs`) — `apply_action` bitmask (DROP `0x01`, FORW `0x02`, BUFF `0x04`, NOCP `0x08`, DUPL `0x10`), `destination_interface`, optional `OuterHeaderCreation`, forwarding/duplicating params, `bar_id`. Helpers `should_forward`/`should_drop`.
-- **`Qer`** (`n4_handler.rs`) — `qer_id`, `GateStatus{ul_gate,dl_gate}` (0=open), `Mbr`, `Gbr`, `qfi`, `rqi`, `ppi`.
-- **`Urr`** (`n4_handler.rs`) — measurement method/reporting-trigger flag structs, volume/time thresholds and quotas; accounting lives in `UrrAccounting`.
+- **`DataPlanePdr`** — `pdr_id`, `precedence`, `source_interface`, `far_id`, `qer_id`, `urr_ids`, `outer_header_removal`, an optional compiled SDF rule (`nextgcore_ipfw::IpfwRule`), `qfi`.
+- **`DataPlaneFar`** — `apply_action` bitmask (DROP `0x01`, FORW `0x02`, BUFF `0x04`, NOCP `0x08`, DUPL `0x10`), `destination_interface`, the outer-header-creation TEID/address, `bar_id`.
+- **`DataPlaneQer`** — gate status, MBR/GBR token buckets, QFI, RQI and paging-policy markings.
+- **`DataPlaneUrr`** — measurement method, reporting triggers, volume/time thresholds and quotas, and the usage accounting.
 
-`handle_session_establishment_request` (`n4_handler.rs`) inserts the incoming PDRs/FARs/URRs/QERs/BAR into those maps (each guarded by `MAX_NUM_OF_*` caps → `NoResourcesAvailable`). `handle_session_modification_request` applies create/update/remove for each rule class. `handle_session_deletion_request` snapshots each URR into a final `UsageReport` before teardown.
+`n4_handler.rs` still declares an Open5GS-style `SessionContext` with `Pdr`/`Far`/`Urr`/`Qer` maps and `handle_session_*` functions, but nothing outside that module calls them; read `pfcp_path.rs` and `data_plane.rs` for what runs. #325 and #335 deleted two other dead session/rule models from `context.rs`.
 
 The shared **`nextgcore-pfcp`** library underpins the wire format: `header.rs` models the `PfcpHeader` (the S-bit `seid_presence`, the 8-byte no-SEID vs 16-byte with-SEID layouts, and `has_seid()` per message type); `ie.rs` is the `IeType` registry (`CreatePdr=1`, `CreateFar=3`, `CreateUrr=6`, `CreateQer=7`, `CreatedPdr=8`, …); `message.rs` and `types.rs` carry typed structs (`AssociationSetupRequest/Response` with a Recovery Time Stamp, `SessionEstablishmentRequest`/`Response` that validate a present `UP F-SEID` on accept, `CreatePdr`/`CreateFar`/`CreateQer`). In practice the daemons build and parse the concrete bytes through their own per-daemon `n4_build` module, so the library's typed message structs and the daemons' TLV codecs coexist.
 
@@ -129,7 +128,7 @@ Session signalling requires a live association, and **the SMF is the initiator**
 
 Heartbeats keep the association alive and detect restarts. Both sides build/handle `HEARTBEAT_REQUEST`/`HEARTBEAT_RESPONSE` (`build_heartbeat_response` carries the sender's Recovery Time Stamp; heartbeat messages use SEID=0). On the SMF, a lapsed no-heartbeat timer tears down the association and returns the `PfcpFsm` to `WillAssociate` (i.e., UPF reselection, `PfcpFsm::handle_associated` on `N4NoHeartbeat`). On the UPF, a per-N3-peer `path_table` compares the Recovery Time Stamp on each heartbeat/echo to spot a restarted peer whose tunnels are now stale (per code comments, TS 29.281 §7.2.2 / TS 23.007).
 
-Teardown mirrors setup: `handle_sm_context_release` (`main.rs`) calls `pfcp_session_delete`, which sends `SESSION_DELETION_REQUEST` (no body IEs, per code comments TS 29.244 7.5.6) keyed on the stored `upf_seid`; the UPF returns the final usage reports and drops the `SessionContext`.
+Teardown mirrors setup: `handle_sm_context_release` (`main.rs`) calls `pfcp_session_delete`, which sends `SESSION_DELETION_REQUEST` (no body IEs, per code comments TS 29.244 7.5.6) keyed on the stored `upf_seid`; the UPF returns the final usage reports and drops the `DataPlaneSession`.
 
 ## The UPF data plane (GTP-U ⇄ TUN)
 
@@ -163,18 +162,17 @@ When the SMF's modification flips the DL FAR to FORW, `main.rs`'s `handle_pfcp_s
 Grounded in the code, not aspirational:
 
 - **The GSM/PFCP FSMs are scaffolding.** `gsm_sm.rs`/`pfcp_sm.rs` mostly log and track state; the establishment logic is imperative in `handle_sm_context_create`, which advances the FSM with explicit `transition_to` calls. Do not expect the dispatcher to be authoritative.
-- **No UDM subscription fetch.** Establishment never calls `Nudm_SDM`; QoS is PCF-or-config-default and session parameters come from `SmContextCreateData`/N1. The `nudm-sdm` FSM branch is unused.
 - **Bespoke NAS 5GSM encoder.** `policy::build_establishment_accept` hand-writes bytes (golden-tested, byte-identical to the legacy layout) rather than using a general NAS codec.
 - **Bespoke PFCP TLV codec with a hand-rolled response parser.** PFCP messages are built/parsed via each daemon's `n4_build`; `pfcp_session_establish` walks response TLVs manually, in parallel with the typed structs in `nextgcore-pfcp`.
-- **N1/N2 carried inline in CreateSMContext.** The separate `Namf_Communication` N1N2MessageTransfer is explicitly out of scope (smfd-03).
+- **N1/N2 carried inline in CreateSMContext.** Establishment does not use `Namf_Communication` N1N2MessageTransfer (smfd-03); network-initiated release, modification and paging do.
 - **IPv4 only.** IPv6/Ethernet/Unstructured sessions are rejected (cause #50); the IP pool is a single `/16` bitmap with no per-DNN/per-slice pools.
 - **Userspace UPF forwarder, Linux-only TUN.** No eBPF/kernel offload; `data_plane.rs` uses `unsafe libc::read`/`write`; the macOS TUN path is a stub. The `nextgcore-tun` library is unused by the UPF.
 - **Optional NFs fail open.** A missing/unreachable NSACF (and a missing PCF) do not block the basic data path by design.
-- **What is genuinely spec-faithful:** the N2 resource transfers use the real-APER `nextgcore-ngap` codec (a deliberate fix so a strict-APER gNB decoder accepts them), the PFCP F-TEID/F-SEID flag handling and SEID=0-on-new-session semantics follow TS 29.244, and the GTP-U path implements Echo, Error Indication, End Marker, QFI extension headers, uplink anti-spoofing, and DL buffering with Downlink Data Reports.
+- **What is genuinely spec-faithful:** the N2 resource transfers use the codec generated from the TS 38.413 ASN.1 (`nextgcore-ngap-gen`), the PFCP F-TEID/F-SEID flag handling and SEID=0-on-new-session semantics follow TS 29.244, and the GTP-U path implements Echo, Error Indication, End Marker, QFI extension headers, uplink anti-spoofing, and DL buffering with Downlink Data Reports.
 
 ## How it is validated
 
-**Unit / property tests.** State-machine transitions (`gsm_sm.rs`, `pfcp_sm.rs` `#[cfg(test)]`), the NAS accept builder (`gsm_build.rs::test_build_pdu_session_establishment_accept`), the multipart N1/N2 response and APER transfer round-trip (`main.rs` tests such as `sm_context_created_response_is_multipart_with_binary_refs` and the `PduSessionResourceSetupRequestTransfer` decode test), the IPv4 pool (`session_extensions.rs`), and `property_tests.rs` in both `nextgcore-smfd` and `nextgcore-upfd`.
+**Unit / property tests.** State-machine transitions (`gsm_sm.rs`, `pfcp_sm.rs` `#[cfg(test)]`), the NAS accept builder (`gsm_build.rs::test_build_pdu_session_establishment_accept`), the multipart N1/N2 response (`main.rs` tests such as `sm_context_created_response_is_multipart_with_binary_refs`), the N2 transfers and their oracle tests against the old hand-written encoder (`n2_transfer.rs`), the IPv4 pool (`session_extensions.rs`), and `property_tests.rs` in both `nextgcore-smfd` and `nextgcore-upfd`.
 
 **Matched-simulator docker E2E.** The single entrypoint `docker/rust/e2e.sh` chains `preflight.sh → build.sh → e2e-test.sh`. `e2e-test.sh` brings up the full stack (5GC NFs + `nextgsim-gnb` + `nextgsim-ue`) and asserts, against real container logs, the whole establishment and — crucially — the data plane:
 
@@ -183,4 +181,4 @@ Grounded in the code, not aspirational:
 - UE: `Sending PDU Session Establishment Request`, `PDU Session Establishment Accept`, `PDU session 1 is now ACTIVE (IPv4: Some…)`, `Creating TUN interface`;
 - **User-plane proof:** `docker exec nextgsim-ue ping -c 3 10.45.0.1` — an ICMP round-trip *through the UE's GTP-U tunnel* to the UPF gateway.
 
-The full baseline suite was **84/84 green on 2026-07-02** with 0% loss on the UE→UPF GTP-U path. Overlays extend the same suite: `--overlay kernel-sctp` (native N2 SCTP), `--overlay oauth2` (SBI token enforcement), `--overlay features` (Rel-17/18 harness). When an assertion fails, `e2e.sh` saves every container's `docker logs` under `docker/rust/artifacts/` before teardown; see [Observability & Troubleshooting](../observability.md) for the recipe and the log-grep pitfalls.
+The nightly CI also runs `docker/rust/ue-flow-check.sh`, which takes the session through CM-IDLE and back (paging on downlink data with the UPF buffering, and a UE-triggered Service Request) and pings 20/20 after each step. Overlays extend the same suite: `--overlay kernel-sctp` (native N2 SCTP), `--overlay oauth2` (SBI token enforcement), `--overlay features` (Rel-17/18 harness). When an assertion fails, `e2e.sh` saves every container's `docker logs` under `docker/rust/artifacts/` before teardown; see [Observability & Troubleshooting](../observability.md) for the recipe and the log-grep pitfalls.

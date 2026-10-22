@@ -1,6 +1,6 @@
 # NextGCore Rust Docker Deployment
 
-This directory contains Docker configurations for deploying the NextGCore Rust implementation. The Rust version provides memory-safe network functions with exact algorithm parity to the C implementation.
+This directory contains the Docker Compose stacks, per-NF configs and E2E scripts for the NextGCore Rust network functions and the nextgsim RAN simulators.
 
 ## Table of Contents
 
@@ -18,7 +18,8 @@ This directory contains Docker configurations for deploying the NextGCore Rust i
 
 - Docker 24.0+ with BuildKit support
 - Docker Compose v2.20+
-- 4GB+ RAM (8GB recommended for full deployment)
+- 8 GB RAM for the health-gated 5GC containers; 12-16 GB to keep all 26 `docker-compose.yml` containers running (see [CI.md](CI.md))
+- >= 25 GB free disk (the preflight refuses to build below that; 60 GB recommended)
 - `curl` and `jq` for validation scripts
 
 ### Verify Prerequisites
@@ -55,14 +56,22 @@ docker compose -f docker-compose.yml logs -f amf gnb ue
 ```bash
 cd docker/rust
 
-# Build images
-./build.sh -4
+# Build the NF images (build.sh compiles both workspaces, including nextgsim's
+# lte-enb and lte-ue, into ./binaries)
+./build.sh
+
+# build.sh does not package the LTE eNB/UE images; build them as CI does
+mkdir -p ../../../nextgsim/binaries
+cp binaries/lte-enb binaries/lte-ue ../../../nextgsim/binaries/
+docker build -f ../../../nextgsim/Dockerfile.enb-local -t nextgsim-lte-enb:latest ../../../nextgsim
+docker build -f ../../../nextgsim/Dockerfile.lte-ue-local -t nextgsim-lte-ue:latest ../../../nextgsim
 
 # Deploy
 docker compose -f docker-compose-epc.yml up -d
 
-# Verify deployment
-./e2e.sh --overlay epc   # or: docker compose -f docker-compose-epc.yml ps
+# Verify deployment: health, then a real LTE attach and a 0%-loss ping
+docker compose -f docker-compose-epc.yml ps
+./epc-attach-check.sh 10.45.0.1 20
 
 # View logs
 docker compose -f docker-compose-epc.yml logs -f
@@ -86,26 +95,20 @@ docker compose -f docker-compose-epc.yml logs -f
 > seeded by the same `docs/assets/webui/mongo-init.js` the 5G compose uses. The
 > `lte-ue` service needs `NET_ADMIN` and `/dev/net/tun` for the bearer's TUN;
 > the eNB needs only the host `sctp` module (S1-MME is an outbound kernel SCTP
-> association). Not exercised: dedicated bearers, handover, paging, and egress
-> beyond the PGW-U. History: `specs/epc-e2e-scope.md` (#328) and
+> association). Not exercised: dedicated bearers, handover, idle mode/paging,
+> IPv6 PDN, and egress beyond the PGW-U. History: `specs/epc-e2e-scope.md` (#328) and
 > `specs/epc-pgw-container.md` (#380).
 
-### Deploy Full Stack (5GC + EPC)
+### 5GC and EPC together
+
+The two stacks are separate compose files on separate networks
+(`172.23.0.0/24` and `172.24.0.0/24`) and can run side by side:
 
 ```bash
 cd docker/rust
-
-# Build all images
 ./build.sh
-
-# Deploy
-docker compose up -d
-
-# Verify deployment
-./e2e.sh            # preflight -> build -> full matched-sim E2E
-
-# View logs
-docker compose logs -f
+docker compose -f docker-compose.yml up -d
+docker compose -f docker-compose-epc.yml up -d
 ```
 
 ## Building Images
@@ -137,14 +140,14 @@ flags.
 ./build.sh --skip-rust
 ```
 
-### Build Individual Images
+### Multi-architecture images
+
+`build-multiarch.sh` builds linux/amd64 and linux/arm64 images with Buildx:
 
 ```bash
-# Using Docker directly
-docker build -f Dockerfile.nf-template \
-  --build-arg NF_NAME=nextgcore-amfd \
-  -t nextgcore-rust/amf:latest \
-  ../..
+./build-multiarch.sh                                   # local platform only
+./build-multiarch.sh --platform linux/amd64,linux/arm64
+./build-multiarch.sh --push <registry> --platform linux/amd64,linux/arm64
 ```
 
 ## Deployment Options
@@ -153,55 +156,41 @@ docker build -f Dockerfile.nf-template \
 
 | File | Description |
 |------|-------------|
-| `docker-compose.yml` | Matched-sim E2E: MongoDB + 5GC NFs + nextgsim gNB/UE + advanced NFs + observability (no EPC) |
-| `docker-compose-epc.yml` | EPC (4G) only: MME, SGW-C, SGW-U, PGW-C, PGW-U, HSS, PCRF. The PGW-C/PGW-U are `smfd`/`upfd` in their EPC roles (#380) |
+| `docker-compose.yml` | Matched-sim E2E: MongoDB + 20 5GC NFs + nextgsim gNB/UE + Prometheus/Grafana/Jaeger (no EPC) |
+| `docker-compose-epc.yml` | EPC (4G): MME, SGW-C, SGW-U, PGW-C, PGW-U, HSS, PCRF + nextgsim LTE eNB/UE. The PGW-C/PGW-U are `smfd`/`upfd` in their EPC roles (#380) |
 | `docker-compose.oauth2.yml` | Overlay: OAuth2 SBI enforcement (`./e2e.sh --overlay oauth2`) |
 | `docker-compose.kernel-sctp.yml` | Overlay: native kernel-SCTP N2 (`./e2e.sh --overlay kernel-sctp`) |
 | `docker-compose.features.yml` | Overlay: Rel-17/18 feature harness (`./e2e.sh --overlay features`) |
 
-### Deployment Profiles
+### Starting a subset
+
+`docker-compose.yml` has no profiles: `docker compose up -d` starts every
+service, including SCP and SEPP. Start a subset by naming services, as the CI
+E2E does:
 
 ```bash
-# Basic 5GC deployment
-docker compose -f docker-compose.yml up -d
-
-# 5GC with SCP (Service Communication Proxy)
-docker compose -f docker-compose.yml --profile scp up -d
-
-# 5GC with SEPP (Security Edge Protection Proxy for roaming)
-docker compose -f docker-compose.yml --profile sepp up -d
-
-# Full deployment with all optional services
-docker compose --profile scp --profile sepp up -d
-```
-
-### Scaling Services
-
-```bash
-# Scale UPF instances
-docker compose -f docker-compose.yml up -d --scale upf=3
+docker compose up -d mongodb nrf
+docker compose up -d ausf udm udr pcf nssf bsf
+docker compose up -d amf smf upf gnb ue
 ```
 
 ## Configuration
 
 ### Environment Variables
 
-Copy `.env.example` to `.env` and customize:
-
-```bash
-cp .env.example .env
-```
-
-Key configuration options:
+There is no `.env` file; the compose files set each NF's environment inline.
+Common ones:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `RUST_LOG` | Log level | `info` |
-| `PLMN_MCC` | Mobile Country Code | `999` |
-| `PLMN_MNC` | Mobile Network Code | `70` |
-| `TAC` | Tracking Area Code | `1` |
-| `MAX_UE` | Maximum UEs | `1024` |
-| `SBI_TLS_ENABLED` | Enable TLS for SBI | `false` |
+| `RUST_LOG` | Log filter. Honoured by 13 of the 28 NFs; the others take `--log-level` only (#691) | `info` |
+| `NEXTGCORE_SBI_PROFILE` | SBI security profile for amf/smf/ausf/udm; the compose files set `dev` (h2c, no mTLS) | `production` when unset |
+| `NEXTGCORE_SBI_OAUTH2_REQUIRE` | Force OAuth2 enforcement on an NF's SBI server (the `oauth2` overlay sets it) | unset |
+
+`TLS_ENABLED` and `SBI_SCHEME`, set in the compose file's common block, are not
+read by any NF. SBI TLS comes from an NF's `--tls --tls-cert --tls-key` flags or
+from the `production` SBI profile; see the
+[configuration overview](../../docs-book/src/configuration/overview.md).
 
 #### Rel-17/18 Feature Knobs
 
@@ -237,6 +226,8 @@ configs/
 │   ├── pcf.yaml
 │   ├── nssf.yaml
 │   ├── bsf.yaml
+│   ├── nsacf.yaml, nwdaf.yaml, lmf.yaml, mbsmf.yaml, ees.yaml, pin.yaml, dccf.yaml, ucmf.yaml
+│   ├── *-oauth2.yaml      # variants for the oauth2 overlay (nrf, udr, bsf, nssf, nsacf)
 │   └── hnet/              # Home network keys
 ├── epc/                    # EPC configurations
 │   ├── mme.yaml
@@ -244,10 +235,13 @@ configs/
 │   ├── pcrf.yaml
 │   ├── sgwc.yaml
 │   ├── sgwu.yaml
+│   ├── pgwc.yaml          # smfd as PGW-C
+│   ├── pgwu.yaml          # upfd as PGW-U
 │   └── freeDiameter/      # Diameter configurations
 ├── scp.yaml               # SCP configuration
 ├── sepp1.yaml             # SEPP1 configuration
 ├── sepp2.yaml             # SEPP2 configuration
+├── observability/         # Prometheus / tracing
 └── tls/                   # TLS certificates
 ```
 
@@ -268,8 +262,8 @@ Each entry maps to an S-NSSAI `{sst, sd?}`; NSACF admits UEs / PDU sessions up t
 `max_ues` / `max_pdu_sessions` (TS 29.536). An absent limit means that count is
 uncapped for the slice; an S-NSSAI with no matching quota entry is treated as
 not-NSAC-subject (`SLICE_NOT_FOUND`). The other advanced NFs (`nwdaf.yaml`,
-`lmf.yaml`, `mbsmf.yaml`, `ees.yaml`, `pin.yaml`, `dccf.yaml`) also live under
-`configs/5gc/`.
+`lmf.yaml`, `mbsmf.yaml`, `ees.yaml`, `pin.yaml`, `dccf.yaml`, `ucmf.yaml`) also
+live under `configs/5gc/`.
 
 ### Custom Configuration
 
@@ -279,7 +273,7 @@ Mount custom configuration files:
 services:
   amf:
     volumes:
-      - ./my-configs/amf.yaml:/etc/nextgcore/nextgcore-amfd.yaml:ro
+      - ./my-configs/amf.yaml:/etc/nextgcore/amf.yaml:ro
 ```
 
 ## Network Architecture
@@ -300,14 +294,14 @@ services:
 │                          │ SBI                                  │
 │  ┌─────────┐    ┌─────────┐    ┌─────────┐    ┌─────────┐     │
 │  │   PCF   │    │  NSSF   │    │   BSF   │    │   SCP   │     │
-│  │ .0.13   │    │ .0.14   │    │ .0.15   │    │ .0.50   │     │
+│  │ .0.13   │    │ .0.14   │    │ .0.15   │    │ .0.37   │     │
 │  └────┬────┘    └────┬────┘    └────┬────┘    └────┬────┘     │
 │       │              │              │              │           │
 │       └──────────────┴──────────────┴──────────────┘           │
 │                          │                                      │
 │  ┌─────────────────────────────────────────────────────────┐   │
 │  │                    AMF (.0.5)                            │   │
-│  │              NGAP: 38412/sctp, SBI: 7777                │   │
+│  │         NGAP: 38412 (SCTP over UDP), SBI: 7777          │   │
 │  └─────────────────────────┬───────────────────────────────┘   │
 │                            │                                    │
 │  ┌─────────────────────────────────────────────────────────┐   │
@@ -337,7 +331,7 @@ services:
 │                            │ S6a                               │
 │  ┌─────────────────────────────────────────────────────────┐   │
 │  │                    MME (.0.5)                            │   │
-│  │              S1AP: 36412/sctp, GTP-C: 2123              │   │
+│  │       S1AP: 36412 (kernel SCTP), GTP-C: 2123            │   │
 │  └─────────────────────────┬───────────────────────────────┘   │
 │                            │ S11                               │
 │  ┌─────────────────────────────────────────────────────────┐   │
@@ -383,7 +377,7 @@ services:
 | SMF | HTTP/2 | 7777 | SBI interface |
 | UPF | UDP | 2152 | GTP-U (N3 to gNB) |
 | UPF | UDP | 8805 | PFCP (N4 to SMF) |
-| MME | SCTP | 36412 | S1AP (to eNB) |
+| MME | SCTP | 36412 | S1AP (to eNB). Kernel SCTP only: mmed is built with `--features kernel-sctp` and needs the host `sctp` module |
 | PGW-C | UDP | 2123 | GTPv2-C (S5/S8-C, from SGW-C). TS 29.274 §4.1 fixes the port. On-network only — not published to the host, since nothing outside the `epc` bridge speaks S5/S8 |
 | PGW-C | UDP | 8805 | PFCP (Sxb/N4 to PGW-U). On-network only |
 | PGW-U | UDP | 2152 | GTP-U (S5/S8-U, to SGW-U). On-network only |
@@ -409,23 +403,27 @@ services:
 ./e2e.sh --keep
 ```
 
+### UE flows (the nightly 0.2.0 gate)
+
+Against a running stack (e.g. after `./e2e.sh --keep`), `ue-flow-check.sh`
+drives nextgsim's real gNB and UE through the flows the nightly CI gates:
+
+```bash
+./ue-flow-check.sh paging         # downlink data pages a CM-IDLE UE; Service Request; ping
+./ue-flow-check.sh idle-uplink    # uplink from CM-IDLE; the triggering packet is not lost
+./ue-flow-check.sh deregister     # UE-initiated de-registration, re-registration, ping
+./ue-flow-check.sh network-rereg  # UDM REREGISTRATION_REQUIRED; prompt re-registration; ping
+./ue-flow-check.sh all            # all of the above, with a second paging round
+```
+
+Each prints one `PASS: <scenario>` or `FAIL: <scenario> -- <why>` line and exits
+non-zero on failure.
+
 The preflight (`preflight.sh`) refuses to build with < 25 GB free disk and
 trims the BuildKit cache (`docker builder prune --keep-storage=20GB`) — see
 hazard #269 (Docker image-store wipe under disk pressure). On failure, per-NF
 `docker logs` are captured under `artifacts/` before teardown. CI runner
 requirements and artifact layout: [CI.md](CI.md).
-
-### Automated Validation
-
-```bash
-# Full baseline E2E (preflight -> build -> registration + PDU session + data-plane ping)
-./e2e.sh
-
-# Re-run against an already-built stack without recompiling
-./e2e.sh --quick
-```
-
-CI runner requirements, exit codes, and failure-artifact layout: [CI.md](CI.md).
 
 ### End-to-End Tests
 
@@ -486,8 +484,8 @@ curl -v http://localhost:7777/nnrf-nfm/v1/nf-instances
 # Check NF logs for registration errors
 docker logs nextgcore-amf 2>&1 | grep -i "register\|nrf"
 
-# Verify network connectivity
-docker network inspect nextgcore-5gc
+# Verify network connectivity (compose names the network <project>_core)
+docker network inspect rust_core
 ```
 
 #### MongoDB Connection Issues
@@ -550,36 +548,10 @@ docker compose down -v --rmi all
 
 ## Advanced Usage
 
-### Multi-Platform Builds
+### CI
 
-```bash
-# Create buildx builder
-docker buildx create --name nextgcore-builder --use
-
-# Build for multiple platforms
-./build.sh --platforms linux/amd64,linux/arm64 -p -a
-```
-
-### CI/CD Integration
-
-```yaml
-# GitHub Actions example
-jobs:
-  build-and-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Build images
-        run: |
-          cd docker/rust
-          ./build.sh
-      
-      - name: Validate deployment
-        run: |
-          cd docker/rust
-          ./e2e.sh
-```
+`.github/workflows/ci.yml` runs this directory's build and E2E nightly and on
+demand: see [CI.md](CI.md) and [docs/ci-and-release.md](../../docs/ci-and-release.md).
 
 ### Production Deployment
 
@@ -592,14 +564,14 @@ For production deployments:
 5. Configure log aggregation
 6. Use secrets management for credentials
 
-```bash
-# Production deployment with TLS
-SBI_TLS_ENABLED=true docker compose up -d
-```
+For SBI TLS, set `NEXTGCORE_SBI_PROFILE=production` and mount certificates
+(amf/smf/ausf/udm), or start the other SBI NFs with `--tls --tls-cert --tls-key`.
 
 ### Kubernetes Deployment
 
-Helm charts for Kubernetes deployment are available in the `helm/` directory (coming soon).
+- `k8s/` — Kind manifests with `deploy.sh`, `e2e-test.sh`, `teardown.sh`
+- `deploy/helm/nextgcore/` — Helm chart for the 5GC control plane
+- `deploy/eks/` — EKS deployment with the nextgsim gNB/UE
 
 ## License
 
@@ -607,6 +579,4 @@ NextGCore is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0
 
 ## Support
 
-- [GitHub Issues](https://github.com/nextgcore/nextgcore/issues)
-- [GitHub Discussions](https://github.com/nextgcore/nextgcore/discussions)
-- [Discord](https://discord.gg/GreNkuc)
+- [GitHub Issues](https://github.com/NextgCoreLab/nextgcore/issues)

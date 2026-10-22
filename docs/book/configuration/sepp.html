@@ -15,8 +15,8 @@
         <link rel="icon" href="../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../css/general-0392ca55.css">
-        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
         <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-10d7638c.js";
+            window.path_to_searchindex_js = "../searchindex-c2411517.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-1b88980e.js"></script>
+        <script src="../toc-be5dca41.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -178,10 +178,10 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="sepp-configuration"><a class="header" href="#sepp-configuration">SEPP Configuration</a></h1>
-<p>The SEPP (Security Edge Protection Proxy, <code>nextgcore-seppd</code>) secures inter-PLMN (roaming) signaling per TS 29.573 and TS 33.501 (as cited in the daemon’s source comments). It runs two HTTP servers: a consumer-facing SBI server where home-PLMN NFs send outbound roaming requests (forwarded to the peer SEPP over N32-f), and an N32 listener serving the TS 29.573 endpoints <code>POST /n32c-handshake/v1/exchange-capability</code> (§6.1.5.2 per code comment), <code>POST /n32c-handshake/v1/exchange-params</code> (§6.1.5.3), <code>POST /n32c-handshake/v1/n32f-error</code> (§6.1.5.4), and <code>POST /n32f-forward/v1/n32f-process</code> (§6.2). Both TLS and PRINS N32-f security schemes are implemented; PRINS applies JWE/JWS protection per TS 29.573 §6.3 with the key hierarchy derived from the N32-c TLS RFC 5705 exporter per TS 33.501 §13.2.4.4.1 (all citations from the daemon source, <code>n32_server.rs</code>/<code>n32c_handler.rs</code>/<code>sbi_path.rs</code>).</p>
+<p>The SEPP (Security Edge Protection Proxy, <code>nextgcore-seppd</code>) secures inter-PLMN (roaming) signaling per TS 29.573 and TS 33.501 (as cited in the daemon’s source comments). It runs two HTTP servers: a consumer-facing SBI server where home-PLMN NFs send outbound roaming requests (forwarded to the peer SEPP over N32-f), and an N32 listener serving the TS 29.573 endpoints <code>POST /n32c-handshake/v1/exchange-capability</code> (§6.1.5.2 per code comment), <code>POST /n32c-handshake/v1/exchange-params</code> (§6.1.5.3), <code>POST /n32c-handshake/v1/n32f-error</code> (§6.1.5.4), and <code>POST /n32f-forward/v1/n32f-process</code> (§6.2). The consumer-facing SBI server also serves <code>GET /nsepp-telescopic/v1/mapping</code> (<code>Nsepp_Telescopic_FQDN_Mapping</code>, TS 29.573 §5.4/§6.3) to NFs in its own PLMN. Both TLS and PRINS N32-f security schemes are implemented; PRINS applies JWE/JWS protection per TS 29.573 §6.3 with the key hierarchy derived from the N32-c TLS RFC 5705 exporter per TS 33.501 §13.2.4.4.1 (all citations from the daemon source, <code>n32_server.rs</code>/<code>n32c_handler.rs</code>/<code>sbi_path.rs</code>).</p>
 <p>Configuration is unusual for this project: the daemon accepts a YAML file path (default <code>/etc/nextgcore/sepp.yaml</code>, overridable with <code>-c/--config</code>), but <strong>it never deserializes the file</strong> — <code>main.rs</code> only checks the path exists, reads it, and logs its size in bytes. Every functional setting (bind addresses, ports, TLS, peers, PLMNs, security schemes) comes from command-line flags. One environment variable is read (<code>OTEL_EXPORTER_OTLP_ENDPOINT</code>); notably, <code>RUST_LOG</code> is <strong>not</strong> consulted (logging is built with <code>env_logger::Builder::new()</code> + <code>filter_level</code> from <code>--log-level</code>, not <code>from_default_env</code>).</p>
 <blockquote>
-<p><strong>Honesty note:</strong> SEPP behavior is validated by this project’s own unit tests and matched-simulator Docker E2E only, not by third-party conformance certification or interop against another vendor’s SEPP. The N32-c/N32-f handshake and PRINS JWE/JWS protection are exercised SEPP-to-SEPP within this codebase. Bespoke/non-normative aspects: the shipped YAML config files are entirely decorative (see below), the <code>-k/--kill</code> flag is a stub that logs and exits without signaling anything, <code>--log-file</code> is parsed but never used, the daemon performs <strong>no NRF registration</strong> (its state machine contains <code>nnrf-nfm</code> handlers but nothing initiates a registration and there is no NRF URI flag), and a zero-trust policy module (<code>zero_trust.rs</code>, TS 33.501 §13 per its header comment) is compiled in but not invoked on any runtime path.</p>
+<p><strong>Honesty note:</strong> SEPP behavior is validated by this project’s own unit tests and matched-simulator Docker E2E only, not by third-party conformance certification or interop against another vendor’s SEPP. The N32-c/N32-f handshake and PRINS JWE/JWS protection are exercised SEPP-to-SEPP within this codebase. Bespoke/non-normative aspects: the shipped YAML config files are entirely decorative (see below), the <code>-k/--kill</code> flag is refused with an error (not supported), <code>--log-file</code> is parsed but never used, the daemon performs <strong>no NRF registration</strong> (its state machine contains <code>nnrf-nfm</code> handlers but nothing initiates a registration and there is no NRF URI flag). Two modules that presented as SEPP security — <code>zero_trust.rs</code> (a policy engine citing TS 33.501 §13) and <code>pqc_security.rs</code> (a hand-rolled post-quantum layer), 1098 lines between them — were <strong>deleted</strong> in #100: neither was invoked from any runtime path, TS 33.501 §13.2 mandates neither, and post-quantum protection is provided at the TLS layer (hybrid X25519MLKEM768) rather than in the application.</p>
 </blockquote>
 <h2 id="example-configuration"><a class="header" href="#example-configuration">Example configuration</a></h2>
 <p>From <code>nextgcore/docker/rust/configs/sepp1.yaml</code> (the home-PLMN SEPP):</p>
@@ -261,7 +261,7 @@ sepp:
 <tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>); unrecognized values fall back to <code>info</code>.</td></tr>
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td>Declared but <strong>never used</strong> — no file logging is wired up.</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output.</td></tr>
-<tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Stub: logs “would send SIGTERM” and exits; does not signal anything.</td></tr>
+<tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor.</td></tr>
 <tr><td><code>--sbi-addr</code></td><td>string</td><td><code>127.0.0.1</code></td><td>Consumer-facing SBI server bind address (docker passes <code>172.23.0.38</code>).</td></tr>
 <tr><td><code>--sbi-port</code></td><td>u16</td><td><code>7777</code></td><td>Consumer-facing SBI server port.</td></tr>
 <tr><td><code>--n32-addr</code></td><td>string</td><td>unset</td><td>N32 listener address. The N32 listener starts <strong>only</strong> if both <code>--n32-addr</code> and <code>--n32-port</code> are given.</td></tr>
@@ -291,6 +291,16 @@ sepp:
 <li><strong>Handshake at startup, no automatic retry from <code>main</code>.</strong> One N32-c handshake (exchange-capability, plus exchange-params when PRINS is negotiated) is attempted per <code>--peer-sepp</code> entry at startup; a failure is logged (<code>Peer SEPP [...] handshake failed</code>) and the peer stays unestablished, so forwarding toward it keeps returning 503. A capability mismatch is a negotiation failure per TS 29.573 (code comment). Reconnect timer plumbing exists (<code>TimerConfig</code> defaults: 3000 ms, 10000 ms in exception state) but registration/heartbeat toward an NRF is never initiated — this NF does not register with the NRF, unlike the other NextGCore NFs (<code>docker-compose.yml</code>’s <code>depends_on: nrf</code> is ordering only).</li>
 <li><strong>PRINS key material</strong> is derived exclusively from the N32-c TLS RFC 5705 exporter (label <code>EXPORTER_3GPP_N32_MASTER</code>, 64 octets, TS 33.501 §13.2.4.4.1 per code comments); JWE suites offered are A256GCM (preferred) and A128GCM with ES256 JWS for modifications (TS 33.501 §13.2.4.9 / §13.2.4.6 per code comments). On plaintext lab transports, key derivation only works with <code>--allow-insecure-no-tls</code>, which logs a prominent warning.</li>
 <li><strong>Received <code>n32f-error</code> reports</strong> (TS 29.573 §6.1.5.4 per code comment) are logged, counted, and kept in an in-memory queue drainable by operators/tests; there is no state file — all peer/handshake state is in-memory and lost on restart.</li>
+<li><strong>Telescopic FQDN mapping</strong> (#100, TS 29.573 §5.4): <code>GET /nsepp-telescopic/v1/mapping</code> on the <strong>consumer SBI</strong> port (not the N32 listener — it is served to NFs in this PLMN). <strong>Exactly one</strong> query parameter is required; neither or both is <strong>400</strong> <code>MANDATORY_IE_INCORRECT</code>, and any method other than GET on that path is <strong>405</strong>.
+<ul>
+<li><code>foreign-fqdn=&lt;fqdn&gt;</code> (§5.4.2) → <strong>200</strong> <code>{telescopicLabel, seppDomain, foreignFqdn}</code>. The consumer forms <code>&lt;telescopicLabel&gt;.&lt;seppDomain&gt;</code>. <code>seppDomain</code> is this SEPP’s own FQDN, so <strong><code>--sender</code> must be set</strong> — without it the request is <strong>500</strong> <code>SYSTEM_FAILURE</code>, because a label with no domain is an answer the consumer cannot use.</li>
+<li><code>telescopic-label=&lt;label&gt;</code> (§5.4.3) → <strong>200</strong> with <code>foreignFqdn</code> when this SEPP issued that label, else <strong>404</strong> <code>DATA_NOT_FOUND</code>, which is the procedure’s own “no existing mapping” answer.</li>
+<li>The label is <code>tl</code> + the first 16 octets of <code>SHA-256(lower-cased foreign FQDN)</code> in hex — one 34-character DNS label for any input, as TS 23.003 §28.5.2 requires (RFC 2818 wildcard certificates cover a single subdomain level), and NOTE 1 of that clause leaves the construction implementation-specific. Deterministic and FQDN-case-insensitive, so repeated requests are idempotent.</li>
+<li>Mappings are <strong>in-memory and capped at 8192</strong>. At the cap new ones are not stored (logged at <code>warn</code>): §5.4.2 still returns a usable telescopic FQDN, but a sibling SEPP’s §5.4.3 lookup for that label answers 404. Nothing survives a restart, so a peer holding a pre-restart telescopic FQDN must re-request the mapping.</li>
+</ul>
+</li>
+<li><strong>N32-c handshake IE corrections</strong> (#100): the target-apiRoot capability is negotiated as <code>3GppSbiTargetApiRootSupported</code> — capital G, JSON <strong>boolean</strong> (TS 29.573 §6.1.5.2). It was previously emitted as a lowercase-<code>g</code> <strong>integer</strong> <code>1</code>, and typed <code>Option&lt;i32&gt;</code> on the way in, so a conformant peer’s boolean <code>true</code> was a serde type error that aborted the whole <code>SecNegotiateReqData</code> parse and rejected the handshake. If you peer this SEPP with an older build of itself, the capability now reads as <code>false</code> in both directions rather than negotiating — no handshake fails, but target-apiRoot forwarding is not negotiated until both sides are upgraded.</li>
+<li><strong><code>sender</code> on parameter exchange is optional</strong> (#100), per <code>SecParamExchReqData</code>/<code>SecParamExchRspData</code> (<code>required: [n32fContextId]</code> only). When omitted, the peer is resolved from <code>senderApiRoot</code>’s host, or from the single N32-c handshake in flight; with two in flight and no other identifier the request is <strong>400</strong>, because guessing would derive the N32-f key hierarchy against the wrong peer’s exporter secret and yield a context that establishes and then cannot decrypt. A <code>sender</code> naming a third party on an established association is still refused as an FQDN mismatch.</li>
 <li><strong>Environment variables:</strong> the only one read is <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> (OTLP trace exporter endpoint, default <code>http://jaeger:4317</code>). <code>RUST_LOG</code> — although set by the docker compose environment — is <strong>ignored</strong> by this binary; the log level is controlled solely by <code>-e/--log-level</code>.</li>
 </ul>
 
@@ -342,7 +352,7 @@ sepp:
 
         <script src="../clipboard-1626706a.min.js"></script>
         <script src="../highlight-abc7f01d.js"></script>
-        <script src="../book-c22b7243.js"></script>
+        <script src="../book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

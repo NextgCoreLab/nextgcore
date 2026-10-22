@@ -9,7 +9,7 @@ NSSF, BSF) plus MongoDB and its subscriber-seeding Job.
 |---|---|
 | 10 control-plane NFs | gNB / UE simulator (`nextgsim/k8s/`) |
 | MongoDB + subscriber seed Job | Prometheus / Grafana / Jaeger (`k8s/monitoring/`) |
-| UPF data plane (TUN + NAT) | The 16 non-core NFs (SCP, SEPP, NWDAF, LMF, …) |
+| UPF data plane (TUN + NAT) | The other 18 NFs (SCP, SEPP, NWDAF, LMF, the EPC NFs, …) |
 
 For a full stack including the simulator, use `k8s/` (Kind) or `deploy/eks/`
 (EKS). Those are the paths the E2E suite targets directly.
@@ -63,7 +63,7 @@ done
 
 ## Verified
 
-Against Kind, `helm install --wait` then the simulator from `nextgsim/k8s/`
+When the chart was fixed (#136): against Kind, `helm install --wait` then the simulator from `nextgsim/k8s/`
 pointed at the release: **74 passed / 0 failed / 6 skipped** on
 `k8s/e2e-test.sh`, and 0% packet loss from the UE to 8.8.8.8 through the GTP-U
 tunnel. Design notes and the full defect list are in

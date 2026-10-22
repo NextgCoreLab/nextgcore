@@ -1,60 +1,43 @@
 # NextGCore Rust Integration Tests
 
-This directory contains integration tests for the NextGCore Rust implementation.
-The tests verify end-to-end functionality of the 5G Core and EPC network functions.
+This crate (`nextgcore-integration-tests`, one `[[test]]` target named
+`integration`) holds flow-level tests that run against **mock network
+functions** (`integration/common/nf_mock.rs`, `MockEnvironment`), not against
+the real NF binaries. They check message sequencing and state bookkeeping for
+each flow. Tests that drive the real daemons over the wire are the Docker E2E
+stages in `docker/rust/` (see `docker/rust/CI.md` and `docs/ci-and-release.md`).
 
-## Test Categories
+## Test Categories (`integration/`)
 
-### 1. Registration Flow Tests (`registration/`)
-- 5G UE registration through AMF
-- 4G UE attach through MME
-
-### 2. Session Establishment Tests (`session/`)
-- PDU session establishment through SMF/UPF
-- EPS bearer activation through MME/SGWC/SGWU
-
-### 3. Inter-NF Communication Tests (`inter_nf/`)
-- SBI communication between 5G NFs
-- Diameter communication between EPC NFs
-- GTP-C/GTP-U communication
-
-### 4. Property Tests (`property/`)
-- Message sequence equivalence with C implementation
+| Module | Covers |
+|---|---|
+| `registration/` | 5G registration through the AMF, 4G attach through the MME |
+| `session/` | PDU session establishment (SMF/UPF), EPS bearer activation (MME/SGW-C/SGW-U) |
+| `inter_nf/` | SBI between 5G NFs, Diameter between EPC NFs, GTP-C/GTP-U |
+| `pfcp/` | N4 association and session establishment/modification/deletion |
+| `handover/` | X2/S1, Xn/N2 and inter-RAT handover sequences, failure and recovery |
+| `slicing/` | S-NSSAI selection at registration, per-slice sessions and QoS |
+| `volte/` | IMS registration, MO/MT call setup, QCI 1/5 dedicated bearers |
+| `property/` | proptest strategies over the mocked message sequences |
 
 ## Prerequisites
 
-### MongoDB
-Integration tests require MongoDB for subscriber data storage.
-The test framework uses `testcontainers` to automatically spin up MongoDB containers.
-
-### Docker
-Docker must be installed and running for testcontainers to work.
+None for the flow tests above. `integration/common/mongodb.rs` has a
+`testcontainers` MongoDB helper; its own self-test is skipped when `docker info`
+fails.
 
 ## Running Tests
 
 ```bash
-# Run all integration tests
-cargo test --test integration
-
-# Run specific test category
-cargo test --test integration registration
-cargo test --test integration session
-cargo test --test integration inter_nf
-
-# Run with verbose output
-cargo test --test integration -- --nocapture
+cd src
+cargo test -p nextgcore-integration-tests                      # everything in this crate
+cargo test -p nextgcore-integration-tests --test integration registration
+cargo test -p nextgcore-integration-tests --test integration -- --nocapture
 ```
-
-## Test Configuration
-
-Tests use the following default configuration:
-- MongoDB: Automatically provisioned via testcontainers
-- Network: Uses localhost with dynamic port allocation
-- Timeouts: 30 seconds for NF startup, 10 seconds for message exchange
 
 ## Writing New Tests
 
-1. Add test functions to the appropriate module
-2. Use the `TestContext` for NF lifecycle management
-3. Use `TestSubscriber` for subscriber provisioning
-4. Follow the existing patterns for message verification
+1. Add test functions to the matching module.
+2. Use `MockEnvironment` / `TestContext` for NF set-up and `TestSubscriber` for
+   subscriber provisioning.
+3. Assert on captured messages (`MessageCapture`) rather than on log output.

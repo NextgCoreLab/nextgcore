@@ -15,8 +15,8 @@
         <link rel="icon" href="favicon-de23e50b.svg">
         <link rel="shortcut icon" href="favicon-8114d1fc.png">
         <link rel="stylesheet" href="css/variables-8adf115d.css">
-        <link rel="stylesheet" href="css/general-0392ca55.css">
-        <link rel="stylesheet" href="css/chrome-fc474251.css">
+        <link rel="stylesheet" href="css/general-e96d0476.css">
+        <link rel="stylesheet" href="css/chrome-d279d366.css">
         <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-10d7638c.js";
+            window.path_to_searchindex_js = "searchindex-c2411517.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-1b88980e.js"></script>
+        <script src="toc-be5dca41.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -195,11 +195,14 @@ Nnrf incl. the <code>/oauth2/token</code> endpoint, and more). Regenerate the in
 <pre><code class="language-bash">bash docs/scripts/update-api-docs.sh
 </code></pre>
 <h2 id="observability"><a class="header" href="#observability">Observability</a></h2>
-<p>Every NF exposes Prometheus metrics on port 9090 (<code>/metrics</code>) and OpenTelemetry traces
-(Jaeger in the Docker/K8s stacks). The Docker Compose stack wires both up automatically.</p>
+<p>The shipped configs expose Prometheus metrics on port 9090 (<code>/metrics</code>), and NFs export
+OpenTelemetry traces to <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> (Jaeger in the Docker/K8s stacks). See
+<a href="observability.html">Observability &amp; Troubleshooting</a>.</p>
 <h2 id="validation-status"><a class="header" href="#validation-status">Validation status</a></h2>
-<p>E2E validation runs against the matched NextGSim UE/gNB simulator (84/84 suite, including a
-UE→UPF GTP-U data-plane path). This proves internal consistency of the pair — it is <strong>not</strong>
+<p>E2E validation runs nightly against the matched nextgsim simulators: 5G registration, PDU
+session, paging, Service Request, de-registration and UDM-triggered re-registration, each with a
+UE→UPF ping through the GTP-U tunnel, and an LTE attach with a ping through the default bearer
+(see <code>docs/ci-and-release.md</code>). This proves internal consistency of the pair — it is <strong>not</strong>
 third-party conformance certification. 6G/Rel-20 items are research prototypes; no frozen
 Rel-20 Stage-3 specs exist.</p>
 
@@ -251,7 +254,7 @@ Rel-20 Stage-3 specs exist.</p>
 
         <script src="clipboard-1626706a.min.js"></script>
         <script src="highlight-abc7f01d.js"></script>
-        <script src="book-c22b7243.js"></script>
+        <script src="book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

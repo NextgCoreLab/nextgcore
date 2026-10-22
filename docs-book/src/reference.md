@@ -25,12 +25,15 @@ bash docs/scripts/update-api-docs.sh
 
 ## Observability
 
-Every NF exposes Prometheus metrics on port 9090 (`/metrics`) and OpenTelemetry traces
-(Jaeger in the Docker/K8s stacks). The Docker Compose stack wires both up automatically.
+The shipped configs expose Prometheus metrics on port 9090 (`/metrics`), and NFs export
+OpenTelemetry traces to `OTEL_EXPORTER_OTLP_ENDPOINT` (Jaeger in the Docker/K8s stacks). See
+[Observability & Troubleshooting](observability.md).
 
 ## Validation status
 
-E2E validation runs against the matched NextGSim UE/gNB simulator (84/84 suite, including a
-UE→UPF GTP-U data-plane path). This proves internal consistency of the pair — it is **not**
+E2E validation runs nightly against the matched nextgsim simulators: 5G registration, PDU
+session, paging, Service Request, de-registration and UDM-triggered re-registration, each with a
+UE→UPF ping through the GTP-U tunnel, and an LTE attach with a ping through the default bearer
+(see `docs/ci-and-release.md`). This proves internal consistency of the pair — it is **not**
 third-party conformance certification. 6G/Rel-20 items are research prototypes; no frozen
 Rel-20 Stage-3 specs exist.

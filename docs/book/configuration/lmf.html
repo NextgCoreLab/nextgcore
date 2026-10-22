@@ -15,8 +15,8 @@
         <link rel="icon" href="../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../css/general-0392ca55.css">
-        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
         <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-10d7638c.js";
+            window.path_to_searchindex_js = "../searchindex-c2411517.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-1b88980e.js"></script>
+        <script src="../toc-be5dca41.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -178,7 +178,7 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="lmf-configuration"><a class="header" href="#lmf-configuration">LMF Configuration</a></h1>
-<p>The LMF (Location Management Function, <code>nextgcore-lmfd</code>) computes UE position fixes for the 5G core, per TS 23.273 (as cited in the daemon’s source comments). It serves the <code>Nlmf_Location</code> service under the apiName <code>nlmf-loc</code> (TS 29.572 §6.1.1 per code comments): <code>POST /nlmf-loc/v1/determine-location</code> (§6.1.4.2), the custom operations <code>cancel-location</code>, <code>location-context-transfer</code>, <code>measure-location</code>, <code>configure-up</code>, and <code>up-subscriptions</code> (§6.1.4 per code comments), plus a <code>GET /nlmf-loc/v1/capabilities</code> query. It also serves two Namf_Communication notify callbacks — <code>POST /nlmf-loc/v1/notify/n1</code> and <code>/notify/n2</code> (TS 29.518 §5.2.2.4 N1MessageNotify / §5.2.2.3.3 N2InfoNotify per code comments) — which complete pending positioning sessions from uplink LPP/NRPPa reports. For deferred PERIODIC location requests the LMF acts as an outbound EventNotify producer, POSTing <code>EventNotifyDataExt</code> to the request’s <code>hgmlcCallBackURI</code> (TS 29.572 §6.1.5.1 per code comments); UPNotify (§6.1.5.2) is deferred. Six additional ingest routes (<code>measurements</code>, <code>nrppa-reports</code>, <code>nrppa-binary-reports</code>, <code>lpp-binary-reports</code>, <code>ue-locations/{supi}</code>) are explicitly marked in the source as <strong>not</strong> TS 29.572 resources and are gated behind <code>--debug-endpoints</code> (default off).</p>
+<p>The LMF (Location Management Function, <code>nextgcore-lmfd</code>) computes UE position fixes for the 5G core, per TS 23.273 (as cited in the daemon’s source comments). It serves the <code>Nlmf_Location</code> service under the apiName <code>nlmf-loc</code> (TS 29.572 §6.1.1 per code comments): <code>POST /nlmf-loc/v1/determine-location</code> (§6.1.4.2), the custom operations <code>cancel-location</code>, <code>location-context-transfer</code>, <code>measure-location</code>, <code>configure-up</code>, and <code>up-subscriptions</code> (§6.1.4 per code comments), plus a <code>GET /nlmf-loc/v1/capabilities</code> query. It also serves two Namf_Communication notify callbacks — <code>POST /nlmf-loc/v1/notify/n1</code> and <code>/notify/n2</code> (TS 29.518 §5.2.2.4 N1MessageNotify / §5.2.2.3.3 N2InfoNotify per code comments) — which complete pending positioning sessions from uplink LPP/NRPPa reports. For deferred PERIODIC location requests the LMF acts as an outbound EventNotify producer, POSTing <code>EventNotifyDataExt</code> to the request’s <code>hgmlcCallBackURI</code> (TS 29.572 §6.1.5.1 per code comments); UPNotify (§6.1.5.2) is deferred. It also serves <code>Nlmf_Broadcast</code> (<code>POST /nlmf-broadcast/v1/cipher-key-data</code>) and <code>Nlmf_DataExposure</code> (<code>/nlmf-dataexposure/v1/subscriptions</code>, #104). LPP and NRPPa are encoded and decoded by the codecs generated from the 3GPP ASN.1 (<code>nextgcore-lpp-gen</code>, TS 37.355; <code>nextgcore-nrppa-gen</code>, TS 38.455; #515); the hand-written codecs were removed (#527, #563). An uplink LPP carrying a sidelink ranging report in an EPDU (TS 37.355 §6.5.7) is decoded and stored for the UE (#559). Six additional ingest routes (<code>measurements</code>, <code>nrppa-reports</code>, <code>nrppa-binary-reports</code>, <code>lpp-binary-reports</code>, <code>ue-locations/{supi}</code>) are explicitly marked in the source as <strong>not</strong> TS 29.572 resources and are gated behind <code>--debug-endpoints</code> (default off).</p>
 <p>Configuration is split between a YAML file (default path <code>/etc/nextgcore/lmf.yaml</code>, overridable with <code>-c/--config</code>), command-line flags, and two environment variables. Unusually for this project, the LMF reads almost nothing from YAML: the file is probed exactly once, for the OAuth2 knob. Bind address/port, TLS, the NRF URI, the measurement-pool cap, and the debug-route gate are all CLI flags.</p>
 <blockquote>
 <p><strong>Honesty note:</strong> LMF behavior is validated by this project’s own unit tests and matched-simulator Docker E2E only — not third-party conformance certification (positioning is not on the matched-sim registration+PDU+ping path, so E2E coverage of these flows is limited). The six <code>--debug-endpoints</code> ingest routes and the <code>capabilities</code> endpoint are bespoke NextGCore extensions, not TS 29.572 resources. UPNotify and area/motion-event triggered LDR are not implemented (scoped out per code comments).</p>
@@ -206,6 +206,8 @@ lmf:
 <tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
+<tr><td><code>lmf.positioning.cells[]</code></td><td>list</td><td>absent</td><td><strong>Serving-cell reference coordinates (#103).</strong> Each entry is <code>{ id, lat, lon, height? }</code>. <code>id</code> is the key measurement reports use (an NR-CGI, a <code>pci-&lt;n&gt;</code>, a TRP id) and is not interpreted — it must match what the RAN reports. <code>height</code> is optional (metres above the WGS-84 ellipsoid, default 0; the 2-D solvers do not read it). See <em>Positioning reference points</em> below.</td></tr>
+<tr><td><code>lmf.positioning.trps[]</code></td><td>list</td><td>absent</td><td><strong>TRP reference points (#103).</strong> Same shape as <code>cells</code>. A separate list because TS 38.455 §8.2.6 makes TRP information its own exchange and an operator provisioning one is not necessarily provisioning the other; both lists land in the same registry the solvers read.</td></tr>
 <tr><td><code>lmf.sbi.oauth2.require</code></td><td>bool</td><td><code>false</code></td><td>SBI OAuth2 bearer-token enforcement (TS 33.501 §13.4.1, TS 29.510 §5.4.2 per code comments). The probe is root-key agnostic: it is <code>true</code> iff <strong>any</strong> top-level YAML section carries <code>sbi.oauth2.require: true</code>. When enabled, incoming requests must carry an NRF-issued token whose audience includes <code>LMF</code> (verified against the NRF JWKS; with no NRF URI configured the server fails closed with 503, per the code comment referencing <code>nextgcore-sbi</code> server.rs), and outbound SBI calls attach tokens. An unreadable or unparseable file, or an absent field, means <code>false</code>. The environment variable <code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code> is checked <strong>first</strong> and, when set, decides in either direction — the YAML is not consulted at all.</td></tr>
 </tbody>
 </table>
@@ -242,12 +244,52 @@ lmf:
 </div>
 <h2 id="behavior-notes"><a class="header" href="#behavior-notes">Behavior notes</a></h2>
 <ul>
-<li><strong>Environment variables.</strong> <code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code> (<code>1</code>/<code>true</code>/<code>TRUE</code>/<code>yes</code> = on) overrides the YAML OAuth2 knob in both directions and is how the <code>docker-compose.oauth2.yml</code> overlay enables enforcement. <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> sets the OpenTelemetry OTLP exporter endpoint (default <code>http://jaeger:4317</code>). <code>RUST_LOG</code>, when set, overrides <code>--log-level</code> via env_logger.</li>
-<li><strong>NRF registration is best-effort, no retry.</strong> At startup the LMF PUTs an NFProfile (<code>nfType: LMF</code>, service <code>nlmf-loc</code>, <code>allowedNfTypes: [AMF, SCP]</code>, <code>heartBeatTimer: 10</code>) to <code>/nnrf-nfm/v1/nf-instances/{id}</code>. On failure it logs a warning and <strong>operates without NRF</strong> — and the heartbeat worker is only spawned after a successful registration. On success it heartbeats every 5 s, PATCHing a real <code>/load</code> gauge derived from the active positioning-session count saturated at 100 (TS 29.510 §5.2.2.3.2 per code comment) — no fabricated CPU numbers.</li>
-<li><strong>DetermineLocation never fabricates a fix.</strong> A real measurement-derived fix returns 200 <code>LocationDataExt</code>; failures map per the TS 29.572 Table 6.1.7.3-1 cause table (per code comments): no discoverable serving AMF, UE not reachable, or timeout → 504 <code>UNREACHABLE_USER</code>; report received but unsolvable → 500 <code>POSITIONING_FAILED</code>; malformed <code>InputData</code>, <code>ecgi</code>+<code>ncgi</code> together, or a dangling multipart <code>contentId</code> → 400; unsupported media type → 415. A stored per-SUPI fix short-circuits the procedure only when its capture timestamp allows an honest <code>ageOfLocationEstimate</code>.</li>
-<li><strong>Response-time budget.</strong> The handler waits <code>min(maxRespTime, QoS bound, 20 s hard cap)</code> for the positioning outcome; <code>responseTime: LOW_DELAY</code> caps the wait at 5 s and <code>NO_DELAY</code> waits not at all (<code>maxRespTime: 0</code> is rejected 504 immediately). SBI client timeouts (2 s connect / 3 s request) nest inside this cap.</li>
-<li><strong>Callback reachability.</strong> The N1N2 notify callback base advertised to the AMF is <code>http://&lt;sbi-addr&gt;:&lt;sbi-port&gt;</code>; when <code>--sbi-addr</code> is the default <code>0.0.0.0</code> it falls back to <code>127.0.0.1</code>, so in any multi-host or container deployment you must bind to (or pass) a concretely reachable address — the docker compose passes <code>172.23.0.32</code>.</li>
-<li><strong>No state file.</strong> All measurement contexts, positioning sessions, LDR registrations, and stored fixes live in memory and are lost on restart; periodic-LDR scheduler tasks are aborted on shutdown, and EventNotify delivery retries exactly once before auto-cancelling the deferred session (no infinite retry).</li>
+<li>
+<p><strong>Environment variables.</strong> <code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code> (<code>1</code>/<code>true</code>/<code>TRUE</code>/<code>yes</code> = on) overrides the YAML OAuth2 knob in both directions and is how the <code>docker-compose.oauth2.yml</code> overlay enables enforcement. <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> sets the OpenTelemetry OTLP exporter endpoint (default <code>http://jaeger:4317</code>). <code>RUST_LOG</code>, when set, overrides <code>--log-level</code> via env_logger.</p>
+</li>
+<li>
+<p><strong>NRF registration is best-effort, no retry.</strong> At startup the LMF PUTs an NFProfile (<code>nfType: LMF</code>, service <code>nlmf-loc</code>, <code>allowedNfTypes: [AMF, SCP]</code>, <code>heartBeatTimer: 10</code>) to <code>/nnrf-nfm/v1/nf-instances/{id}</code>. On failure it logs a warning and <strong>operates without NRF</strong> — and the heartbeat worker is only spawned after a successful registration. On success it heartbeats every 5 s, PATCHing a real <code>/load</code> gauge derived from the active positioning-session count saturated at 100 (TS 29.510 §5.2.2.3.2 per code comment) — no fabricated CPU numbers.</p>
+</li>
+<li>
+<p><strong>Positioning reference points are REQUIRED (#103).</strong> Every geometric solver reads the cell/TRP registry, and before #103 the only writer was test code — so a deployed LMF had an empty registry and could never produce a fix. Provision them under <code>lmf.positioning</code>:</p>
+<pre><code class="language-yaml">lmf:
+  positioning:
+    cells:
+      - id: pci-42
+        lat: 37.5665
+        lon: 126.9780
+        height: 38.0
+    trps:
+      - id: trp-1
+        lat: 37.5670
+        lon: 126.9790
+</code></pre>
+<p>A bad entry (latitude outside ±90, longitude outside ±180, missing <code>id</code>/<code>lat</code>/<code>lon</code>) is <strong>rejected individually and named at error level</strong>; the rest of the list still loads, because one typo should not cost every cell. With <strong>nothing</strong> configured, <code>DetermineLocation</code> is refused with 500 <code>POSITIONING_FAILED</code> whose detail names <code>lmf.positioning.cells</code> — it does not fabricate a coordinate. With <strong>fewer than three</strong>, only E-CID is selectable however high the requested accuracy; both cases are warned about once at startup.</p>
+</li>
+<li>
+<p><strong>The requested positioning method follows the LCS QoS (#103).</strong> Before #103 every network-initiated request was LPP E-CID with the Multi-RTT and DL-TDOA bodies hardcoded absent, so a request for ≤10 m accuracy was answered by a method whose output is a Timing-Advance ring. The rule, in order: fewer than three reference points ⇒ E-CID; the UE reported E-CID-only capability ⇒ E-CID; <code>hAccuracy ≤ 10</code> or <code>EMERGENCY_SERVICES</code> ⇒ <strong>Multi-RTT</strong>; <code>LOW_DELAY</code> ⇒ E-CID (it is a statement about time, and PRS scheduling is not fast); otherwise E-CID.</p>
+</li>
+<li>
+<p><strong>NRPPa toward NG-RAN is gated (#103).</strong> <code>LMF_NRPPA_DOWNLINK=1</code> makes the LMF send an E-CID Measurement Initiation Request (TS 38.455 §8.2.1.2, procedure code 2) to the serving gNB before it asks the UE over LPP — the gNB half of the measurement. Off by default because it is new external N2 signalling. Best-effort: a gNB that declines must not fail a request the UE could still answer. The AMF relays it over NGAP procedure 8 and echoes the LMF id into the RoutingID, so the uplink reply routes back here.</p>
+</li>
+<li>
+<p><strong>MO-LR assistance data delivers a reference location (#103).</strong> <code>ueLocationServiceInd: LOCATION_ASSISTANCE_DATA</code> used to answer a bare 204 without looking at the UE’s PDU. It now decodes the UE’s LPP <code>RequestAssistanceData</code>, builds a <code>ProvideAssistanceData</code> carrying a GNSS reference location (the centroid of the configured reference points, with their spread as the uncertainty at 68% confidence), and delivers it over N1 — still answering 204 to the AMF, but a 204 that means something happened. An attached body that is <em>not</em> a <code>RequestAssistanceData</code> is a 400. Only a reference location is provided: ephemerides, ionospheric models and Earth-orientation parameters would need a GNSS data feed this build has no client for, and fabricating them would be worse than omitting them.</p>
+</li>
+<li>
+<p><strong>Area- and motion-event deferred LDRs are REFUSED (#103).</strong> <code>ENTERING_INTO_AREA</code>, <code>LEAVING_FROM_AREA</code>, <code>BEING_INSIDE_AREA</code> and <code>MOTION</code> answer <strong>501 <code>UNSUPPORTED_EVENT_TYPE</code></strong> (TS 29.572 Table 6.1.7.3-1: “the request for creation of a subscription is rejected because none of the events is supported by the LMF”). They used to register a context and answer 200 while nothing armed the trigger and nothing ever reported it. <code>PERIODIC</code> deferred location still works and still registers. <code>UE_AVAILABLE</code> still registers and is not reported — left that way deliberately, because its trigger source is the AMF’s reachability report rather than a missing UE capability, so the gap is an AMF subscription.</p>
+</li>
+<li>
+<p><strong>DetermineLocation never fabricates a fix.</strong> A real measurement-derived fix returns 200 <code>LocationDataExt</code>; failures map per the TS 29.572 Table 6.1.7.3-1 cause table (per code comments): no discoverable serving AMF, UE not reachable, or timeout → 504 <code>UNREACHABLE_USER</code>; report received but unsolvable → 500 <code>POSITIONING_FAILED</code>; malformed <code>InputData</code>, <code>ecgi</code>+<code>ncgi</code> together, or a dangling multipart <code>contentId</code> → 400; unsupported media type → 415. A stored per-SUPI fix short-circuits the procedure only when its capture timestamp allows an honest <code>ageOfLocationEstimate</code>.</p>
+</li>
+<li>
+<p><strong>Response-time budget.</strong> The handler waits <code>min(maxRespTime, QoS bound, 20 s hard cap)</code> for the positioning outcome; <code>responseTime: LOW_DELAY</code> caps the wait at 5 s and <code>NO_DELAY</code> waits not at all (<code>maxRespTime: 0</code> is rejected 504 immediately). SBI client timeouts (2 s connect / 3 s request) nest inside this cap.</p>
+</li>
+<li>
+<p><strong>Callback reachability.</strong> The N1N2 notify callback base advertised to the AMF is <code>http://&lt;sbi-addr&gt;:&lt;sbi-port&gt;</code>; when <code>--sbi-addr</code> is the default <code>0.0.0.0</code> it falls back to <code>127.0.0.1</code>, so in any multi-host or container deployment you must bind to (or pass) a concretely reachable address — the docker compose passes <code>172.23.0.32</code>.</p>
+</li>
+<li>
+<p><strong>No state file.</strong> All measurement contexts, positioning sessions, LDR registrations, and stored fixes live in memory and are lost on restart; periodic-LDR scheduler tasks are aborted on shutdown, and EventNotify delivery retries exactly once before auto-cancelling the deferred session (no infinite retry).</p>
+</li>
 </ul>
 
                     </main>
@@ -298,7 +340,7 @@ lmf:
 
         <script src="../clipboard-1626706a.min.js"></script>
         <script src="../highlight-abc7f01d.js"></script>
-        <script src="../book-c22b7243.js"></script>
+        <script src="../book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

@@ -4,6 +4,9 @@ This directory contains configuration files for the 5G Core network functions.
 
 ## Network Functions
 
+Addresses and ports as `docker-compose.yml` runs them (`ipv4_address`, `command`
+and the files here).
+
 | NF | IP Address | SBI Port | Other Ports | Description |
 |----|------------|----------|-------------|-------------|
 | NRF | 172.23.0.10 | 7777 | - | Network Repository Function |
@@ -13,9 +16,19 @@ This directory contains configuration files for the 5G Core network functions.
 | PCF | 172.23.0.13 | 7777 | 9090 (metrics) | Policy Control Function |
 | NSSF | 172.23.0.14 | 7777 | - | Network Slice Selection Function |
 | BSF | 172.23.0.15 | 7777 | - | Binding Support Function |
-| AMF | 172.23.0.5 | 7777 | 38412/sctp (NGAP), 9090 (metrics) | Access and Mobility Management |
+| AMF | 172.23.0.5 | 7777 | 38412 (NGAP, SCTP over UDP by default), 9090 (metrics) | Access and Mobility Management |
 | SMF | 172.23.0.4 | 7777 | 8805/udp (PFCP), 9090 (metrics) | Session Management Function |
-| UPF | 172.23.0.7 | - | 2152/udp (GTP-U), 9090 (metrics) | User Plane Function |
+| UPF | 172.23.0.7 | - | 2152/udp (GTP-U), 8805/udp (PFCP), 9090 (metrics) | User Plane Function |
+| NWDAF | 172.23.0.30 | 7777 | - | Network Data Analytics Function |
+| EES | 172.23.0.31 | 7777 | - | Edge Enabler Server |
+| LMF | 172.23.0.32 | 7777 | - | Location Management Function |
+| MB-SMF | 172.23.0.33 | 7777 | - | MBS Session Management Function |
+| NSACF | 172.23.0.34 | 7777 | - | Network Slice Admission Control Function |
+| PIN | 172.23.0.35 | 7815 | - | Personal IoT Network server |
+| DCCF | 172.23.0.36 | 7777 | - | Data Collection Coordination Function |
+| SCP | 172.23.0.37 | 7777 | - | Service Communication Proxy (`../scp.yaml`) |
+| SEPP | 172.23.0.38 | 7777 | - | Security Edge Protection Proxy (`../sepp1.yaml`) |
+| UCMF | 172.23.0.39 | 7777 | - | UE radio Capability Management Function (RACS) |
 
 ## Infrastructure
 
@@ -39,18 +52,15 @@ This directory contains configuration files for the 5G Core network functions.
 ## Usage
 
 ```bash
-# Start 5G Core
+# Start the 5G Core (plus the nextgsim gNB/UE and observability)
 cd docker/rust
-docker-compose -f docker-compose-5gc.yml up -d
+docker compose up -d
 
 # View logs
-docker-compose -f docker-compose-5gc.yml logs -f
+docker compose logs -f amf smf upf
 
-# Stop 5G Core
-docker-compose -f docker-compose-5gc.yml down
-
-# Stop and remove volumes
-docker-compose -f docker-compose-5gc.yml down -v
+# Stop, and remove volumes
+docker compose down -v
 ```
 
 ## Home Network Keys (UDM)
@@ -68,7 +78,10 @@ openssl ecparam -name prime256v1 -genkey -conv_form compressed -out hnet/secp256
 ## Connecting a gNB
 
 Configure your gNB to connect to:
-- AMF NGAP: `172.23.0.5:38412` (SCTP)
+- AMF NGAP: `172.23.0.5:38412`. The default transport is SCTP over UDP
+  (`sctp-proto`), which nextgsim's gNB speaks. A standard RAN needs native
+  kernel SCTP: run the AMF with `--sctp-backend kernel` (binary built with
+  `--features kernel-sctp`), as `docker-compose.kernel-sctp.yml` does.
 
 ## Adding Subscribers
 
@@ -76,11 +89,12 @@ Use the NextGCore WebUI or directly insert into MongoDB:
 
 ```bash
 # Connect to MongoDB
-docker exec -it nextgcore-5gc-mongodb mongosh nextgcore
+docker exec -it nextgcore-mongodb mongosh nextgcore
 
-# Example subscriber (IMSI: 999700000000001)
+# The stack already seeds IMSI 999700000000001 from
+# docs/assets/webui/mongo-init.js. A further subscriber looks like this:
 db.subscribers.insertOne({
-  "imsi": "999700000000001",
+  "imsi": "999700000000002",
   "msisdn": [],
   "imeisv": [],
   "mme_host": [],

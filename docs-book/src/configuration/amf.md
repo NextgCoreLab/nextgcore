@@ -74,6 +74,8 @@ All keys live under the top-level `amf:` section. Types and defaults below come 
 | `sbi.client.nrf` | list of `{uri}` | none | NRF client endpoints. Only the **first** entry's `uri` is used, seeded into the SBI context for NF registration. |
 | `sbi.oauth2.require` | bool | `false` | Opt-in SBI OAuth2 enforcement (producer token verification + outbound Bearer-token attach; code comments cite TS 33.501 §13.4.1, TS 29.510 §5.4.2). Parsed root-key-agnostically: true if any top-level section sets it. `NEXTGCORE_SBI_OAUTH2_REQUIRE` env var takes precedence. With enforcement on but no NRF URI configured, the server fails closed (503). |
 | `nas.use_nextgcore_security` | bool | `false` | NAS-security canary knob. Default off keeps the legacy byte-for-byte NAS path. The `AMF_NAS_SECURITY` env var overrides this YAML value. |
+| `time.t3512.value` | u64 (seconds) | `540` | Periodic registration update timer sent to the UE in the Registration Accept (GPRS Timer 3). The mobile-reachable timer is derived from it (T3512 + 240 s) unless `AMF_MOBILE_REACHABLE_SECS` overrides it. |
+| `time.t3502.value` | u64 (seconds) | none | Parsed and stored, but not yet signalled to the UE. |
 | `emergency.allow_unauthenticated` | bool | **`true`** | Whether an EMERGENCY registration the network could not authenticate (e.g. the AUSF is unreachable) proceeds as an unauthenticated, emergency-only registration, or is refused. **This is a regulatory setting** — see [Unauthenticated emergency service](#unauthenticated-emergency-service) below. `AMF_EMERGENCY_ALLOW_UNAUTHENTICATED` overrides it. |
 
 ## Command-line flags
@@ -86,6 +88,8 @@ The binary also takes flags that are not part of the YAML file:
 | `-l, --log-level` | `info` | `trace`, `debug`, `info`, `warn`, `error`. |
 | `--ngap-addr` | `0.0.0.0:38412` | NGAP (N2) bind address. |
 | `--sctp-backend` | `userspace` | `userspace` (sctp-proto over UDP, matched nextgsim gNB) or `kernel` (Linux kernel SCTP for an external RAN; requires the `kernel-sctp` build feature and libsctp). |
+
+Cargo features: `kernel-sctp` (enables `--sctp-backend kernel`; the Docker builder compiles amfd with it) and `ntn` (non-normative NTN timer extension, see `AMF_NTN_TIMING_ADVANCE_US`).
 | `--no-color` | off | Disable colored log output. |
 | `-d, --daemon` | off | Run in daemon mode. |
 
@@ -96,6 +100,23 @@ The binary also takes flags that are not part of the YAML file:
 | `AMF_NAS_SECURITY` | Overrides `amf.nas.use_nextgcore_security` (truthy: `1`/`true`/`yes`). |
 | `NEXTGCORE_SBI_OAUTH2_REQUIRE` | Overrides `sbi.oauth2.require` (truthy: `1`/`true`/`TRUE`/`yes`); useful for docker overlays without editing the YAML. |
 | `AMF_EMERGENCY_ALLOW_UNAUTHENTICATED` | Overrides `amf.emergency.allow_unauthenticated` (truthy: `1`/`true`/`yes`/`on`). Any other value — including an empty one — reads as **disabled** rather than falling back to the YAML or the default, so a typo in a regulatory setting fails visibly instead of silently reverting. |
+| `AMF_SBI_ADDR` / `AMF_SBI_PORT` | Namf SBI bind and advertised address. Default `127.0.0.1:7777`; the YAML has no SBI server key. |
+| `NRF_URI` | NRF URI; when set it is written into the SBI context when the SBI opens, overriding `sbi.client.nrf`. |
+| `AMF_N26_ADDR` / `AMF_N26_PORT` | Opens the N26 GTPv2-C endpoint for EPS↔5GS interworking (idle-mode context transfer, connected-mode handover). Unset = no N26. Port default `2124`. A bind failure is logged and N26 stays off; the AMF still serves 5GC. |
+| `AMF_N26_MME_ADDR` | Comma-separated target MME N26 endpoints for 5GS→EPS Forward Relocation; a bare address gets port `2123`. Malformed entries are skipped with a log. |
+| `AMF_RESTART_COUNTER` | TS 23.007 restart counter sent on N26 (u8, default `0` = not available). |
+| `AMF_PEER_SBI_ADDR` / `AMF_PEER_SBI_PORT` | Fallback peer AMF (UE context transfer by 5G-GUTI) when the NRF cannot discover one. Port default `7777`. |
+| `LMF_SBI_ADDR` / `LMF_SBI_PORT` | Fallback LMF when none is discoverable via the NRF. |
+| `UCMF_SBI_ADDR` / `UCMF_SBI_PORT` | Fallback UCMF for RACS (UE Radio Capability ID resolution) when none is discoverable via the NRF. Port default `7777`. |
+| `AMF_NAMF_LOC_LMF` | `off`/`0`/`false` makes Namf_Location answer from the stored NGAP cell identity with no LMF round trip. Default on. |
+| `AMF_UE_POLICY_ASSOC` | `off`/`0`/`false` disables the Npcf_UEPolicyControl association at registration. Default on. |
+| `AMF_GUTI_REALLOCATION` | Truthy (`1`/`true`/`yes`/`on`) enables NAS 5G-GUTI reallocation (UE Configuration Update). Default off. |
+| `AMF_T3513_SECS` | Paging timer T3513, default `5` s. |
+| `AMF_MOBILE_REACHABLE_SECS` / `AMF_IMPLICIT_DEREG_SECS` | Override the mobile-reachable timer (default T3512 + 240 s) and implicit-deregistration timer (default 240 s). |
+| `AMF_NAS_CONGESTION_THRESHOLD` / `AMF_T3346_SECS` | Registered-UE count above which NAS congestion is declared (unset or `0` = off), and the T3346 back-off imposed while congested. |
+| `AMF_OVERLOAD_REDUCE_PERCENT` | Traffic reduction requested in NGAP Overload Start while congested, default `50`. |
+| `AMF_SNPN_ALLOWED_NIDS` / `AMF_UAV_GEOFENCE` | Rel-17/18 knobs: served SNPN NIDs, and the UAV geofence (see `docker/rust/README.md`). |
+| `AMF_NTN_TIMING_ADVANCE_US` | Default NTN timing advance; read only in an `ntn` feature build. |
 
 ## Behavior notes and caveats
 
@@ -103,7 +124,7 @@ The binary also takes flags that are not part of the YAML file:
 - **PLMN flexibility:** `mcc`/`mnc` accept YAML strings or integers; a 2-digit MNC is encoded with the filler digit per standard PLMN encoding.
 - **Empty security lists:** if `security` is omitted, the integrity/ciphering preference lists in the AMF context stay empty; supply explicit orders (as in the example) for deterministic algorithm selection.
 - **Multiple NRF entries** in `sbi.client.nrf` are parsed but only the first is used — additional entries are currently inert.
-- There is no `amf.sbi.server` bind-address key in the typed config; the SBI server and NGAP addresses are controlled by code defaults and the `--ngap-addr` flag, not this YAML file.
+- There is no `amf.sbi.server` bind-address key in the typed config; the SBI address comes from `AMF_SBI_ADDR`/`AMF_SBI_PORT` and the NGAP address from `--ngap-addr`, not this YAML file. The `sbi.server`, `ngap.server` and `metrics.server` blocks in `docker/rust/configs/5gc/amf.yaml` are not read.
 
 ## Unauthenticated emergency service
 

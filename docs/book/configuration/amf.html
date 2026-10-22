@@ -15,8 +15,8 @@
         <link rel="icon" href="../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../css/general-0392ca55.css">
-        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
         <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-10d7638c.js";
+            window.path_to_searchindex_js = "../searchindex-c2411517.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-1b88980e.js"></script>
+        <script src="../toc-be5dca41.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -214,6 +214,13 @@ amf:
   security:
     integrity_order: ["NIA2", "NIA1", "NIA0"]
     ciphering_order: ["NEA2", "NEA1", "NEA0"]
+
+  # REGULATORY switch, default true. Read "Unauthenticated emergency service"
+  # below before changing it: this key decides whether an emergency call
+  # connects when the AUSF is unreachable, and the correct value is a matter of
+  # local law, not of taste.
+  emergency:
+    allow_unauthenticated: true
 </code></pre>
 <h2 id="parameters"><a class="header" href="#parameters">Parameters</a></h2>
 <p>All keys live under the top-level <code>amf:</code> section. Types and defaults below come from the <code>#[derive(Deserialize)]</code> structs and the <code>load_config</code> logic in <code>src/bins/nextgcore-amfd/src/lib.rs</code>.</p>
@@ -244,6 +251,9 @@ amf:
 <tr><td><code>sbi.client.nrf</code></td><td>list of <code>{uri}</code></td><td>none</td><td>NRF client endpoints. Only the <strong>first</strong> entry’s <code>uri</code> is used, seeded into the SBI context for NF registration.</td></tr>
 <tr><td><code>sbi.oauth2.require</code></td><td>bool</td><td><code>false</code></td><td>Opt-in SBI OAuth2 enforcement (producer token verification + outbound Bearer-token attach; code comments cite TS 33.501 §13.4.1, TS 29.510 §5.4.2). Parsed root-key-agnostically: true if any top-level section sets it. <code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code> env var takes precedence. With enforcement on but no NRF URI configured, the server fails closed (503).</td></tr>
 <tr><td><code>nas.use_nextgcore_security</code></td><td>bool</td><td><code>false</code></td><td>NAS-security canary knob. Default off keeps the legacy byte-for-byte NAS path. The <code>AMF_NAS_SECURITY</code> env var overrides this YAML value.</td></tr>
+<tr><td><code>time.t3512.value</code></td><td>u64 (seconds)</td><td><code>540</code></td><td>Periodic registration update timer sent to the UE in the Registration Accept (GPRS Timer 3). The mobile-reachable timer is derived from it (T3512 + 240 s) unless <code>AMF_MOBILE_REACHABLE_SECS</code> overrides it.</td></tr>
+<tr><td><code>time.t3502.value</code></td><td>u64 (seconds)</td><td>none</td><td>Parsed and stored, but not yet signalled to the UE.</td></tr>
+<tr><td><code>emergency.allow_unauthenticated</code></td><td>bool</td><td><strong><code>true</code></strong></td><td>Whether an EMERGENCY registration the network could not authenticate (e.g. the AUSF is unreachable) proceeds as an unauthenticated, emergency-only registration, or is refused. <strong>This is a regulatory setting</strong> — see <a href="#unauthenticated-emergency-service">Unauthenticated emergency service</a> below. <code>AMF_EMERGENCY_ALLOW_UNAUTHENTICATED</code> overrides it.</td></tr>
 </tbody>
 </table>
 </div>
@@ -259,11 +269,12 @@ amf:
 <tr><td><code>-l, --log-level</code></td><td><code>info</code></td><td><code>trace</code>, <code>debug</code>, <code>info</code>, <code>warn</code>, <code>error</code>.</td></tr>
 <tr><td><code>--ngap-addr</code></td><td><code>0.0.0.0:38412</code></td><td>NGAP (N2) bind address.</td></tr>
 <tr><td><code>--sctp-backend</code></td><td><code>userspace</code></td><td><code>userspace</code> (sctp-proto over UDP, matched nextgsim gNB) or <code>kernel</code> (Linux kernel SCTP for an external RAN; requires the <code>kernel-sctp</code> build feature and libsctp).</td></tr>
-<tr><td><code>--no-color</code></td><td>off</td><td>Disable colored log output.</td></tr>
-<tr><td><code>-d, --daemon</code></td><td>off</td><td>Run in daemon mode.</td></tr>
 </tbody>
 </table>
 </div>
+<p>Cargo features: <code>kernel-sctp</code> (enables <code>--sctp-backend kernel</code>; the Docker builder compiles amfd with it) and <code>ntn</code> (non-normative NTN timer extension, see <code>AMF_NTN_TIMING_ADVANCE_US</code>).
+| <code>--no-color</code> | off | Disable colored log output. |
+| <code>-d, --daemon</code> | off | Run in daemon mode. |</p>
 <h2 id="environment-overrides"><a class="header" href="#environment-overrides">Environment overrides</a></h2>
 <div class="table-wrapper">
 <table>
@@ -273,6 +284,24 @@ amf:
 <tbody>
 <tr><td><code>AMF_NAS_SECURITY</code></td><td>Overrides <code>amf.nas.use_nextgcore_security</code> (truthy: <code>1</code>/<code>true</code>/<code>yes</code>).</td></tr>
 <tr><td><code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code></td><td>Overrides <code>sbi.oauth2.require</code> (truthy: <code>1</code>/<code>true</code>/<code>TRUE</code>/<code>yes</code>); useful for docker overlays without editing the YAML.</td></tr>
+<tr><td><code>AMF_EMERGENCY_ALLOW_UNAUTHENTICATED</code></td><td>Overrides <code>amf.emergency.allow_unauthenticated</code> (truthy: <code>1</code>/<code>true</code>/<code>yes</code>/<code>on</code>). Any other value — including an empty one — reads as <strong>disabled</strong> rather than falling back to the YAML or the default, so a typo in a regulatory setting fails visibly instead of silently reverting.</td></tr>
+<tr><td><code>AMF_SBI_ADDR</code> / <code>AMF_SBI_PORT</code></td><td>Namf SBI bind and advertised address. Default <code>127.0.0.1:7777</code>; the YAML has no SBI server key.</td></tr>
+<tr><td><code>NRF_URI</code></td><td>NRF URI; when set it is written into the SBI context when the SBI opens, overriding <code>sbi.client.nrf</code>.</td></tr>
+<tr><td><code>AMF_N26_ADDR</code> / <code>AMF_N26_PORT</code></td><td>Opens the N26 GTPv2-C endpoint for EPS↔5GS interworking (idle-mode context transfer, connected-mode handover). Unset = no N26. Port default <code>2124</code>. A bind failure is logged and N26 stays off; the AMF still serves 5GC.</td></tr>
+<tr><td><code>AMF_N26_MME_ADDR</code></td><td>Comma-separated target MME N26 endpoints for 5GS→EPS Forward Relocation; a bare address gets port <code>2123</code>. Malformed entries are skipped with a log.</td></tr>
+<tr><td><code>AMF_RESTART_COUNTER</code></td><td>TS 23.007 restart counter sent on N26 (u8, default <code>0</code> = not available).</td></tr>
+<tr><td><code>AMF_PEER_SBI_ADDR</code> / <code>AMF_PEER_SBI_PORT</code></td><td>Fallback peer AMF (UE context transfer by 5G-GUTI) when the NRF cannot discover one. Port default <code>7777</code>.</td></tr>
+<tr><td><code>LMF_SBI_ADDR</code> / <code>LMF_SBI_PORT</code></td><td>Fallback LMF when none is discoverable via the NRF.</td></tr>
+<tr><td><code>UCMF_SBI_ADDR</code> / <code>UCMF_SBI_PORT</code></td><td>Fallback UCMF for RACS (UE Radio Capability ID resolution) when none is discoverable via the NRF. Port default <code>7777</code>.</td></tr>
+<tr><td><code>AMF_NAMF_LOC_LMF</code></td><td><code>off</code>/<code>0</code>/<code>false</code> makes Namf_Location answer from the stored NGAP cell identity with no LMF round trip. Default on.</td></tr>
+<tr><td><code>AMF_UE_POLICY_ASSOC</code></td><td><code>off</code>/<code>0</code>/<code>false</code> disables the Npcf_UEPolicyControl association at registration. Default on.</td></tr>
+<tr><td><code>AMF_GUTI_REALLOCATION</code></td><td>Truthy (<code>1</code>/<code>true</code>/<code>yes</code>/<code>on</code>) enables NAS 5G-GUTI reallocation (UE Configuration Update). Default off.</td></tr>
+<tr><td><code>AMF_T3513_SECS</code></td><td>Paging timer T3513, default <code>5</code> s.</td></tr>
+<tr><td><code>AMF_MOBILE_REACHABLE_SECS</code> / <code>AMF_IMPLICIT_DEREG_SECS</code></td><td>Override the mobile-reachable timer (default T3512 + 240 s) and implicit-deregistration timer (default 240 s).</td></tr>
+<tr><td><code>AMF_NAS_CONGESTION_THRESHOLD</code> / <code>AMF_T3346_SECS</code></td><td>Registered-UE count above which NAS congestion is declared (unset or <code>0</code> = off), and the T3346 back-off imposed while congested.</td></tr>
+<tr><td><code>AMF_OVERLOAD_REDUCE_PERCENT</code></td><td>Traffic reduction requested in NGAP Overload Start while congested, default <code>50</code>.</td></tr>
+<tr><td><code>AMF_SNPN_ALLOWED_NIDS</code> / <code>AMF_UAV_GEOFENCE</code></td><td>Rel-17/18 knobs: served SNPN NIDs, and the UAV geofence (see <code>docker/rust/README.md</code>).</td></tr>
+<tr><td><code>AMF_NTN_TIMING_ADVANCE_US</code></td><td>Default NTN timing advance; read only in an <code>ntn</code> feature build.</td></tr>
 </tbody>
 </table>
 </div>
@@ -282,7 +311,44 @@ amf:
 <li><strong>PLMN flexibility:</strong> <code>mcc</code>/<code>mnc</code> accept YAML strings or integers; a 2-digit MNC is encoded with the filler digit per standard PLMN encoding.</li>
 <li><strong>Empty security lists:</strong> if <code>security</code> is omitted, the integrity/ciphering preference lists in the AMF context stay empty; supply explicit orders (as in the example) for deterministic algorithm selection.</li>
 <li><strong>Multiple NRF entries</strong> in <code>sbi.client.nrf</code> are parsed but only the first is used — additional entries are currently inert.</li>
-<li>There is no <code>amf.sbi.server</code> bind-address key in the typed config; the SBI server and NGAP addresses are controlled by code defaults and the <code>--ngap-addr</code> flag, not this YAML file.</li>
+<li>There is no <code>amf.sbi.server</code> bind-address key in the typed config; the SBI address comes from <code>AMF_SBI_ADDR</code>/<code>AMF_SBI_PORT</code> and the NGAP address from <code>--ngap-addr</code>, not this YAML file. The <code>sbi.server</code>, <code>ngap.server</code> and <code>metrics.server</code> blocks in <code>docker/rust/configs/5gc/amf.yaml</code> are not read.</li>
+</ul>
+<h2 id="unauthenticated-emergency-service"><a class="header" href="#unauthenticated-emergency-service">Unauthenticated emergency service</a></h2>
+<blockquote>
+<p><strong>Set this key deliberately.</strong> <code>amf.emergency.allow_unauthenticated</code> decides whether an emergency call connects when the AMF cannot authenticate the caller. In some jurisdictions the answer is legally mandatory; in others the feature is forbidden. The shipped default is <code>true</code>, and it is not the right value everywhere.</p>
+</blockquote>
+<h3 id="what-the-setting-does"><a class="header" href="#what-the-setting-does">What the setting does</a></h3>
+<p>When a UE sends a REGISTRATION REQUEST whose 5GS registration type is <strong>Emergency Registration</strong> and the AMF <strong>cannot obtain an authentication vector</strong> — the AUSF is unreachable, or refuses the request — the AMF has two conformant options, and this key chooses between them.</p>
+<p><strong><code>true</code> (default): proceed unauthenticated.</strong> The AMF continues the registration without authentication, per TS 33.501 §10.2.2.2 (“If the AMF cannot identify the subscriber, or cannot obtain authentication vector (when SUPI is provided), the AMF shall send NAS SMC with NULL algorithms to the UE”). Concretely:</p>
+<ul>
+<li><strong>NIA0 and NEA0 are forced</strong>, not negotiated, regardless of the algorithms the UE advertised (TS 33.501 §6.7.3.6). <strong>The session has no NAS integrity protection and no NAS ciphering.</strong></li>
+<li>K_AMF is generated <strong>locally from the OS CSPRNG</strong>, per TS 33.501 §10.2.2.3.1 (“the UE and the AMF independently generate the K_(AMF) in an implementation defined way”). The UE generates its own; the two never match, and nothing requires them to, because NIA0 computes no MAC and NEA0 enciphers nothing.</li>
+<li><strong>No UDM, PCF or NSACF interaction.</strong> TS 23.502 §4.12.2.3: “if the UE was not successfully authenticated, the AMF shall not update the UDM … the AMF shall not check for access restrictions, regional restrictions or subscription restrictions”, and AM/UE policy “are not required for Emergency Registration”. So no subscription is fetched and no SUPI is registered at the UECM.</li>
+<li><strong>No Allowed NSSAI</strong> is sent in the Registration Accept (same clause).</li>
+<li>The Registration Accept reports the UE <strong>Emergency registered</strong> (TS 24.501 §9.11.3.6 octet 3 bit 6).</li>
+<li><strong>Only the emergency DNN is reachable.</strong> A PDU session request on any other DNN is refused with 5GMM/5GSM cause #29, per TS 23.501 §5.16.4.9a (“the network shall reject any PDU Session Establishment request for normal service from the UE on this Access Type”).</li>
+<li>The UE security capabilities conveyed to the gNB are <strong>narrowed to the null set</strong> (TS 33.501 §6.7.3.6).</li>
+</ul>
+<p><strong><code>false</code>: refuse.</strong> The registration is rejected and the UE released, exactly as an ordinary registration with an unreachable AUSF would be. Set this where local regulation forbids unauthenticated emergency service — TS 33.501 §5.1.2: “Serving networks located in regions where unauthenticated emergency services are forbidden shall not support this feature.”</p>
+<h3 id="why-the-default-is-true"><a class="header" href="#why-the-default-is-true">Why the default is <code>true</code></a></h3>
+<p>TS 33.501 §5.1.2 imposes two obligations pointing opposite ways: the 5G system “shall support unauthenticated access for emergency services … only to those serving networks where regulatory requirements for unauthenticated emergency services exist”, and networks where it is forbidden “shall not support this feature”. A shipped default must pick one, and the two are not symmetric:</p>
+<ul>
+<li>An operator deploying into a <strong>forbidding</strong> jurisdiction knows that fact and can set the key. The spec expects this: TS 33.501 §10.2.2.2 says “It shall be possible to configure whether the network allows or rejects an emergency registration request”.</li>
+<li>A default of <code>false</code> would make the software non-conformant out of the box in every jurisdiction where unauthenticated emergency calling is mandatory — and it fails in the direction where the failure is a caller who cannot reach a PSAP.</li>
+</ul>
+<p>The worst case under <code>true</code> is an unauthenticated device obtaining an emergency-only, null-ciphered, single-DNN, no-subscription session — which is precisely the fenced session TS 33.501 §10.2.2 and TS 23.501 §5.16.4.9a specify for this case. The worst case under <code>false</code> is an emergency call that does not connect. The full argument, with the rejected alternatives, is in <code>specs/decide-unauthenticated-emergency-registration.md</code>.</p>
+<h3 id="operational-notes"><a class="header" href="#operational-notes">Operational notes</a></h3>
+<ul>
+<li>Every unauthenticated emergency registration logs at <strong><code>warn</code></strong>, twice: once when the AMF decides to continue without authentication, and once when it sends the Security Mode Command with NULL algorithms. A refusal under <code>false</code> also logs at <code>warn</code>, naming the setting. Neither case is silent.</li>
+<li>The setting is read <strong>once at startup</strong>. Changing it requires an AMF restart.</li>
+<li>An emergency registration that <strong>does</strong> authenticate successfully is unaffected by this key: it keeps a real key hierarchy, a real SUPI, its UDM subscription and a non-NULL integrity algorithm. It is still reported “Emergency registered” and still restricted to the emergency DNN, because that restriction follows from the registration type rather than from the authentication outcome.</li>
+</ul>
+<h3 id="current-limitations"><a class="header" href="#current-limitations">Current limitations</a></h3>
+<ul>
+<li><strong>Authentication <em>failure</em> is still refused, regardless of this setting.</strong> Only the <em>inability to obtain</em> a vector takes the unauthenticated path. A UE that answers with 5GMM cause #20 (MAC failure), or an AUSF that answers <code>AUTHENTICATION_FAILURE</code>, is refused. TS 33.501 §10.2.2.2 would permit NULL algorithms there too; it is not yet implemented.</li>
+<li><strong>No PEI-only (UICC-less) registration.</strong> TS 33.501 §10.2.2.1 behaviour (b) admits UEs presenting only a PEI. This AMF’s registration parser accepts SUCI and 5G-GUTI identities only, so a credential-less UE is refused before the emergency path is reached. This implements §10.2.2.1 behaviour <strong>(a)</strong>, “IMSI required, authentication optional”, and not (b).</li>
+<li><strong>No IMS leg.</strong> The emergency PDU session is established on the emergency DNN and a P-CSCF address is configurable, but there is no IMS core in this tree, so no SIP INVITE reaches a PSAP.</li>
+<li><strong>The EPC/MME path is unchanged.</strong> An emergency <em>attach</em> over S1 (<code>nextgcore-mmed</code>) is recognised and recorded but follows the normal authentication path; see <code>specs/fix-mmed-attach-tau-accept-correctness.md</code>.</li>
 </ul>
 
                     </main>
@@ -333,7 +399,7 @@ amf:
 
         <script src="../clipboard-1626706a.min.js"></script>
         <script src="../highlight-abc7f01d.js"></script>
-        <script src="../book-c22b7243.js"></script>
+        <script src="../book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 
