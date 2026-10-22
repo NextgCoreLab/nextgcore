@@ -81,6 +81,12 @@ spec:
           value: info
         - name: RUST_BACKTRACE
           value: '1'
+        # The MME dials the HSS (S6a), and the HSS answers and sends CLR/IDR over
+        # that connection, so the HSS has no use for the MME's address at start.
+        # Tracking it made the HSS restart whenever the MME moved, which dropped
+        # the new MME's S6a connection right after it was set up.
+        - name: EPC_UNTRACKED
+          value: mme
         volumeMounts:
         - name: templates
           mountPath: /epc/templates
