@@ -10,15 +10,19 @@
 #   ./deploy-eks.sh                              # control plane only (default)
 #   ENABLE_DATAPLANE=true ./deploy-eks.sh        # privileged UPF w/ real TUN
 #   DRY_RUN=true ./deploy-eks.sh                 # render + validate, apply nothing
+#   PROFILE=epc ./deploy-eks.sh                  # another profile (default 5g)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CORE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 SIM_DIR="$(cd "${CORE_DIR}/../nextgsim" && pwd)"
-NAMESPACE="nextg-system"
 
 # shellcheck source=lib/image-tag.sh
 source "${SCRIPT_DIR}/lib/image-tag.sh"
+# shellcheck source=lib/profile.sh
+source "${SCRIPT_DIR}/lib/profile.sh"
+nextg_load_profile "${PROFILE:-5g}" || exit 1
+NAMESPACE="${PROFILE_NAMESPACE}"
 
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-west-2}}"
 REPO_PREFIX="${REPO_PREFIX:-nextg}"
@@ -28,7 +32,7 @@ DRY_RUN="${DRY_RUN:-false}"
 # CSI driver, where the PVC would stay Pending and stall every NF behind its
 # wait-for-mongodb initContainer. Data does not survive a pod restart; the
 # mongodb-init Job re-seeds subscribers each deploy, so for an E2E run the DB
-# is derived state. See patches/mongodb-ephemeral.yaml.
+# is derived state. See profiles/5g/patches/mongodb-ephemeral.yaml.
 EPHEMERAL_STORAGE="${EPHEMERAL_STORAGE:-false}"
 
 log()  { printf '\033[0;32m[deploy]\033[0m %s\n' "$*"; }
@@ -51,6 +55,8 @@ if [[ -n "${IMAGE_TAG:-}" ]]; then
 else
   CORE_TAG="$(nextg_image_tag "${CORE_DIR}")" || die "cannot derive nextgcore image tag"
   SIM_TAG="$(nextg_image_tag "${SIM_DIR}")"   || die "cannot derive nextgsim image tag"
+  CORE_TAG="${CORE_TAG}${PROFILE_TAG_SUFFIX}"
+  SIM_TAG="${SIM_TAG}${PROFILE_TAG_SUFFIX}"
 fi
 
 # --- preflight -------------------------------------------------------------
@@ -71,6 +77,7 @@ if [[ "${DRY_RUN}" != "true" ]]; then
   cat <<EOF
 
   target cluster : ${CTX}
+  profile        : ${PROFILE_NAME}
   namespace      : ${NAMESPACE}
   registry       : ${REGISTRY}/${REPO_PREFIX}
   core NF tag    : ${CORE_TAG}
@@ -95,7 +102,14 @@ RENDERED="$(mktemp -t nextg-eks-XXXXXX.yaml)"
 trap 'rm -f "${RENDERED}" "${RENDERED}.tmp"' EXIT
 
 log "rendering kustomize overlay..."
-kubectl kustomize "${SCRIPT_DIR}" > "${RENDERED}" || die "kustomize render failed"
+# shellcheck disable=SC2086  # PROFILE_KUSTOMIZE_FLAGS is a word list
+kubectl kustomize ${PROFILE_KUSTOMIZE_FLAGS} "${PROFILE_DIR}" > "${RENDERED}" \
+  || die "kustomize render failed"
+
+# Profile-specific transforms of the rendered manifests, in place (a no-op for
+# 5g). Runs before the generic rewrites below, so it sees the Kind-local image
+# names.
+profile_postrender "${RENDERED}" || die "profile ${PROFILE_NAME} post-render failed"
 
 # Make each NF advertise its POD IP to the NRF instead of its bind address.
 #
@@ -129,15 +143,18 @@ kubectl kustomize "${SCRIPT_DIR}" > "${RENDERED}" || die "kustomize render faile
 # 0.0.0.0:7777 -- itself -- and got 404 from its own SBI router, so every
 # registration failed. The base manifests now carry an equivalent
 # rewrite-advertise-addr initContainer plus AMF_SBI_ADDR from status.podIP.
+if [[ -n "${PROFILE_ADVERTISE_NFS}" ]]; then
 log "rewriting NF advertise addresses to the pod IP..."
+ADVERTISE_NFS="${PROFILE_ADVERTISE_NFS}" \
 python3 - "${RENDERED}" <<'PY' > "${RENDERED}.tmp" || die "advertise-address rewrite failed"
-import sys, yaml
+import os, sys, yaml
 
 # The NRF is excluded: it is the registry itself, reached by URI from each NF's
 # config, and registers no profile. The UPF is excluded: it joins the SBI plane
 # only when --nrf-uri is set (off by default) and its wrapper.sh owns its
 # startup.
-NFS = {'amf', 'ausf', 'bsf', 'nssf', 'pcf', 'smf', 'udm', 'udr'}
+# The set comes from the profile (PROFILE_ADVERTISE_NFS).
+NFS = set(os.environ['ADVERTISE_NFS'].split())
 
 SCRIPT = r'''set -eu
 echo "[advertise] pod IP: $POD_IP"
@@ -236,6 +253,7 @@ yaml.safe_dump_all(out, sys.stdout, default_flow_style=False)
 print(f'  patched: {", ".join(sorted(patched))}', file=sys.stderr)
 PY
 mv "${RENDERED}.tmp" "${RENDERED}"
+fi
 
 # Swap MongoDB's PVC for an emptyDir. Done post-render rather than in
 # kustomization.yaml so the default (a real gp3 volume) stays correct and the
@@ -270,7 +288,7 @@ fi
 # Swap the control-plane-only UPF for the privileged variant. Done here rather
 # than in kustomization.yaml so the default stays safe and the opt-in is a
 # single explicit env var.
-if [[ "${ENABLE_DATAPLANE}" == "true" ]]; then
+if [[ "${ENABLE_DATAPLANE}" == "true" && -n "${PROFILE_DATAPLANE_DEPLOYMENT}" ]]; then
   warn "data plane enabled: the UPF will run privileged with hostPath /dev/net/tun."
   warn "this requires a namespace at pod-security enforce=privileged and nodes"
   warn "labelled nextg.io/dataplane=true (CloudFormation EnableDataPlanePrivileges=true)."
@@ -289,7 +307,7 @@ out = []
 for d in yaml.safe_load_all(open(sys.argv[2])):
     if not d:
         continue
-    if d.get('kind') == 'Deployment' and d['metadata']['name'] == 'upf':
+    if d.get('kind') == 'Deployment' and d['metadata']['name'] == sys.argv[3]:
         spec = d['spec']['template']['spec']
         spec['nodeSelector'] = ps['nodeSelector']
         spec['volumes'] = ps['volumes']
@@ -305,8 +323,8 @@ for d in yaml.safe_load_all(open(sys.argv[2])):
     out.append(d)
 yaml.safe_dump_all(out, sys.stdout, default_flow_style=False)
 PY
-  python3 "${SWAP_PY}" "${SCRIPT_DIR}/patches/upf-dataplane.yaml" "${RENDERED}" \
-    > "${RENDERED}.tmp" || die "UPF data-plane swap failed"
+  python3 "${SWAP_PY}" "${SCRIPT_DIR}/${PROFILE_DATAPLANE_PATCH}" "${RENDERED}" \
+    "${PROFILE_DATAPLANE_DEPLOYMENT}" > "${RENDERED}.tmp" || die "UPF data-plane swap failed"
   mv "${RENDERED}.tmp" "${RENDERED}"
 fi
 
@@ -314,15 +332,18 @@ fi
 # nextgcore-rust/<nf>:latest and nextgsim-<node>:latest, which do not exist on
 # EKS - without this every pod ends in ErrImagePull.
 log "rewriting image references to ${REGISTRY}/${REPO_PREFIX}..."
-python3 - "${RENDERED}" "${REGISTRY}" "${REPO_PREFIX}" "${CORE_TAG}" "${SIM_TAG}" <<'PY'
+python3 - "${RENDERED}" "${REGISTRY}" "${REPO_PREFIX}" "${CORE_TAG}" "${SIM_TAG}" \
+  "$(nextg_profile_sim_names)" <<'PY'
 import re, sys
-path, registry, prefix, core_tag, sim_tag = sys.argv[1:6]
+path, registry, prefix, core_tag, sim_tag, sim_names = sys.argv[1:7]
+# Simulator image names come from the profile (PROFILE_SIM_IMAGES).
+sim_alt = '|'.join(re.escape(n) for n in sim_names.split())
 src = open(path).read()
 # Two tags, because the core NFs and the simulator come from different
 # repositories at different commits (see lib/image-tag.sh).
 src, n1 = re.subn(r'nextgcore-rust/([a-z0-9]+):latest',
                   rf'{registry}/{prefix}/\1:{core_tag}', src)
-src, n2 = re.subn(r'\bnextgsim-(gnb|ue):latest',
+src, n2 = re.subn(rf'\bnextgsim-({sim_alt}):latest',
                   rf'{registry}/{prefix}/\1:{sim_tag}', src)
 # imagePullPolicy IfNotPresent is right for Kind (images side-loaded). On EKS an
 # immutable SHA tag makes the choice moot for correctness -- a changed tag is a
@@ -419,7 +440,7 @@ print(f'  {len(docs)} manifests checked, {len(errors)} errors, {len(warnings)} w
 sys.exit(1 if errors else 0)
 PY
   log "offline validation passed."
-  OUT="${SCRIPT_DIR}/rendered.dryrun.yaml"
+  OUT="${SCRIPT_DIR}/${PROFILE_DRYRUN_FILE}"
   cp "${RENDERED}" "${OUT}"
   log "wrote ${OUT}"
   warn "offline only: schema validation against the live API server was skipped."
@@ -429,9 +450,17 @@ fi
 # --- namespace + pod security ---------------------------------------------
 
 log "creating namespace..."
-kubectl apply -f "${CORE_DIR}/k8s/base/namespace.yaml"
+if [[ -n "${PROFILE_NAMESPACE_MANIFEST}" ]]; then
+  kubectl apply -f "${CORE_DIR}/${PROFILE_NAMESPACE_MANIFEST}"
+else
+  kubectl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kubectl apply -f -
+fi
 
-if [[ "${ENABLE_DATAPLANE}" == "true" ]]; then
+if [[ -n "${PROFILE_POD_SECURITY}" ]]; then
+  log "labelling namespace pod-security enforce=${PROFILE_POD_SECURITY} (profile ${PROFILE_NAME})..."
+  kubectl label namespace "${NAMESPACE}" \
+    "pod-security.kubernetes.io/enforce=${PROFILE_POD_SECURITY}" --overwrite
+elif [[ "${ENABLE_DATAPLANE}" == "true" ]]; then
   # The UPF cannot create a TUN device under baseline/restricted admission.
   log "labelling namespace pod-security enforce=privileged (data plane)..."
   kubectl label namespace "${NAMESPACE}" \
@@ -448,7 +477,9 @@ fi
 # /etc/nextgcore/hnet/*.key but no manifest ever mounts them. These are the
 # SUCI de-concealment private keys, so a Secret rather than a ConfigMap.
 HNET_DIR="${CORE_DIR}/docker/rust/configs/5gc/hnet"
-if [[ -f "${HNET_DIR}/curve25519-1.key" && -f "${HNET_DIR}/secp256r1-2.key" ]]; then
+if [[ "${PROFILE_HNET_SECRET}" != "true" ]]; then
+  log "profile ${PROFILE_NAME} needs no udm-hnet-keys Secret"
+elif [[ -f "${HNET_DIR}/curve25519-1.key" && -f "${HNET_DIR}/secp256r1-2.key" ]]; then
   log "creating udm-hnet-keys Secret from repo development keys..."
   kubectl create secret generic udm-hnet-keys \
     --namespace "${NAMESPACE}" \
@@ -465,32 +496,9 @@ fi
 log "applying manifests..."
 kubectl apply -f "${RENDERED}"
 
-# Dependency order is enforced by each manifest's initContainers, so this loop
-# reports progress rather than sequencing it. Failures here are usually image
-# pulls or an unbound PVC.
-log "waiting for MongoDB..."
-kubectl rollout status statefulset/mongodb -n "${NAMESPACE}" --timeout=300s \
-  || warn "MongoDB not ready. Check: kubectl describe pvc -n ${NAMESPACE} (gp3/EBS CSI bound?)"
-
-log "waiting for the MongoDB init job..."
-kubectl wait --for=condition=complete job/mongodb-init \
-  -n "${NAMESPACE}" --timeout=180s || warn "init job did not complete"
-
-log "waiting for the NRF (every other NF blocks on it)..."
-kubectl rollout status deployment/nrf -n "${NAMESPACE}" --timeout=300s \
-  || warn "NRF not ready"
-
-for nf in ausf udm udr pcf nssf bsf amf smf upf; do
-  log "waiting for ${nf}..."
-  kubectl rollout status "deployment/${nf}" -n "${NAMESPACE}" --timeout=300s \
-    || warn "${nf} not ready - kubectl logs -n ${NAMESPACE} deploy/${nf}"
-done
-
-for dep in prometheus grafana jaeger; do
-  kubectl rollout status "deployment/${dep}" -n "${NAMESPACE}" --timeout=180s \
-    || warn "${dep} not ready"
-done
-
+# Dependency order is enforced by each manifest's initContainers, so the
+# profile's rollout waits report progress rather than sequencing it. Failures
+# here are usually image pulls or an unbound PVC.
 # --- re-resolve peers pinned by IP (#436) ------------------------------------
 #
 # Three dependents resolve a peer's POD IP once, in an init container: the SMF
@@ -528,17 +536,7 @@ restart_if_resolved_before_ready() {
   done
 }
 
-restart_if_resolved_before_ready smf upf
-
-log "waiting for the gNB..."
-restart_if_resolved_before_ready gnb amf upf
-kubectl rollout status deployment/gnb -n "${NAMESPACE}" --timeout=300s \
-  || warn "gNB not ready - check the resolve-dns initContainer logs"
-
-log "waiting for the UE..."
-restart_if_resolved_before_ready ue gnb
-kubectl rollout status deployment/ue -n "${NAMESPACE}" --timeout=300s \
-  || warn "UE not ready - check the resolve-dns initContainer logs"
+profile_rollout
 
 # --- verify the running pods carry the images we just deployed --------------
 #
@@ -580,29 +578,4 @@ kubectl get pods -n "${NAMESPACE}" -o wide
 echo
 kubectl get svc -n "${NAMESPACE}"
 
-cat <<EOF
-
-Deployed.
-
-Verify:
-  kubectl logs -n ${NAMESPACE} deploy/nrf | grep -i register
-  kubectl logs -n ${NAMESPACE} deploy/amf | grep -i ngap
-  kubectl logs -n ${NAMESPACE} deploy/ue  | grep -iE '5GMM|REGISTERED'
-
-Dashboards (no NodePort on EKS - port-forward):
-  kubectl port-forward -n ${NAMESPACE} svc/grafana 3000:3000
-  kubectl port-forward -n ${NAMESPACE} svc/prometheus 9090:9090
-  kubectl port-forward -n ${NAMESPACE} svc/nrf 7777:7777
-EOF
-
-if [[ "${ENABLE_DATAPLANE}" != "true" ]]; then
-  cat <<EOF
-
-NOTE: the UPF is running with --no-dataplane, so there is no user-plane
-forwarding and a UE ping will NOT work. Signalling (NGAP/NAS/PFCP/SBI,
-registration, PDU session establishment) does work.
-
-For a real data plane: redeploy the CloudFormation stack with
-EnableDataPlanePrivileges=true, then ENABLE_DATAPLANE=true ./deploy-eks.sh
-EOF
-fi
+profile_summary

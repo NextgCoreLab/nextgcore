@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the 12 NextG workload images and push them to ECR.
+# Build the NextG workload images (12 for PROFILE=5g) and push them to ECR.
 #
 # Replaces the `kind load docker-image` step in nextgcore/k8s/deploy.sh, which
 # has no equivalent on EKS - without a registry every pod lands in
@@ -19,6 +19,11 @@
 #   REGISTRY=<acct>.dkr.ecr.<region>.amazonaws.com ./build-and-push.sh
 #   REPO_PREFIX=nextg IMAGE_TAG=v1 ./build-and-push.sh
 #   FORCE_PUSH=true ./build-and-push.sh        # re-push tags already in ECR
+#   PROFILE=epc ./build-and-push.sh            # another profile's images (default 5g)
+#   CORE_BIN_DIR=/path/to/bins ./build-and-push.sh  # core binaries from elsewhere
+#
+# The image lists, tag suffix and cargo features come from
+# profiles/$PROFILE/profile.env (see lib/profile.sh).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,24 +32,22 @@ SIM_DIR="$(cd "${CORE_DIR}/../nextgsim" && pwd)"
 
 # shellcheck source=lib/image-tag.sh
 source "${SCRIPT_DIR}/lib/image-tag.sh"
+# shellcheck source=lib/profile.sh
+source "${SCRIPT_DIR}/lib/profile.sh"
+nextg_load_profile "${PROFILE:-5g}" || exit 1
 
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-west-2}}"
 REPO_PREFIX="${REPO_PREFIX:-nextg}"
 
 # NF -> binary name. The image name is the short NF name; the binary is the
 # daemon name. Dockerfile.nf symlinks it to /usr/local/bin/nf-binary.
-CORE_NFS=(
-  "nrf:nextgcore-nrfd"
-  "amf:nextgcore-amfd"
-  "smf:nextgcore-smfd"
-  "upf:nextgcore-upfd"
-  "ausf:nextgcore-ausfd"
-  "udm:nextgcore-udmd"
-  "udr:nextgcore-udrd"
-  "pcf:nextgcore-pcfd"
-  "nssf:nextgcore-nssfd"
-  "bsf:nextgcore-bsfd"
-)
+CORE_NFS=("${PROFILE_CORE_NFS[@]}")
+# Where the core binaries are read from. The default is the repo's binaries/;
+# a feature build (6G) points this at its own output dir instead of
+# overwriting the shared one.
+DEFAULT_CORE_BIN_DIR="${CORE_DIR}/binaries"
+CORE_BIN_DIR="${CORE_BIN_DIR:-${DEFAULT_CORE_BIN_DIR}}"
+NUM_IMAGES=$(( ${#CORE_NFS[@]} + ${#PROFILE_SIM_IMAGES[@]} ))
 
 log()  { printf '\033[0;32m[build]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn ]\033[0m %s\n' "$*"; }
@@ -67,6 +70,8 @@ if [[ -n "${IMAGE_TAG:-}" ]]; then
 else
   CORE_TAG="$(nextg_image_tag "${CORE_DIR}")" || die "cannot derive nextgcore image tag"
   SIM_TAG="$(nextg_image_tag "${SIM_DIR}")"   || die "cannot derive nextgsim image tag"
+  CORE_TAG="${CORE_TAG}${PROFILE_TAG_SUFFIX}"
+  SIM_TAG="${SIM_TAG}${PROFILE_TAG_SUFFIX}"
 fi
 
 for repo_tag in "nextgcore:${CORE_TAG}" "nextgsim:${SIM_TAG}"; do
@@ -87,6 +92,7 @@ if ! ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text 2>/
 fi
 
 REGISTRY="${REGISTRY:-${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com}"
+[[ "${PROFILE_NAME}" == 5g ]] || log "profile:  ${PROFILE_NAME} (cargo features: ${PROFILE_CARGO_FEATURES:-none})"
 log "registry: ${REGISTRY}"
 log "prefix:   ${REPO_PREFIX}    core tag: ${CORE_TAG}    gnb/ue tag: ${SIM_TAG}"
 
@@ -96,10 +102,23 @@ log "prefix:   ${REPO_PREFIX}    core tag: ${CORE_TAG}    gnb/ue tag: ${SIM_TAG}
 MISSING=()
 for entry in "${CORE_NFS[@]}"; do
   bin="${entry#*:}"
-  [[ -f "${CORE_DIR}/binaries/${bin}" ]] || MISSING+=("nextgcore/binaries/${bin}")
+  if [[ "${CORE_BIN_DIR}" == "${DEFAULT_CORE_BIN_DIR}" ]]; then
+    [[ -f "${CORE_BIN_DIR}/${bin}" ]] || MISSING+=("nextgcore/binaries/${bin}")
+  else
+    [[ -f "${CORE_BIN_DIR}/${bin}" ]] || MISSING+=("${CORE_BIN_DIR}/${bin}")
+  fi
 done
-[[ -f "${SIM_DIR}/docker/binaries/nr-gnb" ]] || MISSING+=("nextgsim/docker/binaries/nr-gnb")
-[[ -f "${SIM_DIR}/docker/binaries/nr-ue"  ]] || MISSING+=("nextgsim/docker/binaries/nr-ue")
+for entry in "${PROFILE_SIM_IMAGES[@]}"; do
+  IFS=: read -r _node _dockerfile ctx bins <<<"${entry}"
+  IFS=, read -r -a _bins <<<"${bins}"
+  for bin in "${_bins[@]}"; do
+    if [[ "${ctx}" == . ]]; then
+      [[ -f "${SIM_DIR}/binaries/${bin}" ]] || MISSING+=("nextgsim/binaries/${bin}")
+    else
+      [[ -f "${SIM_DIR}/${ctx}/binaries/${bin}" ]] || MISSING+=("nextgsim/${ctx}/binaries/${bin}")
+    fi
+  done
+done
 if (( ${#MISSING[@]} )); then
   printf 'missing prebuilt binaries:\n'; printf '  %s\n' "${MISSING[@]}"
   printf 'build them with:\n'
@@ -171,14 +190,26 @@ for entry in "${CORE_NFS[@]}"; do
     continue
   fi
   log "building ${nf} (${bin})"
-  # Build context is the repo root so COPY binaries/<bin> resolves.
+  # Build context is the repo root so COPY binaries/<bin> resolves. A
+  # CORE_BIN_DIR elsewhere gets a throwaway context holding just that binary,
+  # since Dockerfile.nf only ever reads binaries/<bin>.
+  context="${CORE_DIR}"
+  if [[ "${CORE_BIN_DIR}" != "${DEFAULT_CORE_BIN_DIR}" ]]; then
+    context="$(mktemp -d -t nextg-nf-ctx-XXXXXX)"
+    mkdir -p "${context}/binaries"
+    cp "${CORE_BIN_DIR}/${bin}" "${context}/binaries/${bin}"
+  fi
   docker build \
     -f "${CORE_DIR}/docker/rust/Dockerfile.nf" \
     --build-arg CORE_IMAGE=nextgcore-core:latest \
     --build-arg "NF_NAME=${bin}" \
     -t "${remote}" \
-    "${CORE_DIR}" \
+    "${context}" \
     || die "${nf} build failed"
+  if [[ "${context}" != "${CORE_DIR}" ]]; then
+    rm -f "${context}/binaries/${bin}"
+    rmdir "${context}/binaries" "${context}"
+  fi
 
   log "pushing ${remote}"
   docker push "${remote}" >/dev/null || die "${nf} push failed"
@@ -187,9 +218,8 @@ done
 
 # --- simulator -------------------------------------------------------------
 
-for pair in "gnb:Dockerfile.gnb-local" "ue:Dockerfile.ue-local"; do
-  node="${pair%%:*}"
-  dockerfile="${pair#*:}"
+for entry in "${PROFILE_SIM_IMAGES[@]}"; do
+  IFS=: read -r node dockerfile ctx _bins <<<"${entry}"
   remote="${REGISTRY}/${REPO_PREFIX}/${node}:${SIM_TAG}"
 
   ensure_repo "${node}"
@@ -199,13 +229,14 @@ for pair in "gnb:Dockerfile.gnb-local" "ue:Dockerfile.ue-local"; do
     continue
   fi
   log "building ${node}"
-  # Context is nextgsim/docker, NOT nextgsim: the Dockerfiles do
-  # `COPY binaries/nr-gnb`, and the binaries live in nextgsim/docker/binaries/.
-  # There is no nextgsim/binaries/, so building from the repo root fails.
+  # For gnb/ue the context is nextgsim/docker, NOT nextgsim: those Dockerfiles
+  # do `COPY binaries/nr-gnb`, and the binaries live in
+  # nextgsim/docker/binaries/. The LTE Dockerfiles also COPY config/ and
+  # scripts/, so their context is the repo root (with nextgsim/binaries/).
   docker build \
     -f "${SIM_DIR}/${dockerfile}" \
     -t "${remote}" \
-    "${SIM_DIR}/docker" \
+    "${SIM_DIR}/${ctx}" \
     || die "${node} build failed"
 
   log "pushing ${remote}"
@@ -217,7 +248,7 @@ done
 
 cat <<EOF
 
-All 12 images are in ECR: ${PUSHED} pushed, ${SKIPPED} already present.
+All ${NUM_IMAGES} images are in ECR: ${PUSHED} pushed, ${SKIPPED} already present.
 
   registry:      ${REGISTRY}
   prefix:        ${REPO_PREFIX}
@@ -228,5 +259,5 @@ Next (deploy-eks.sh derives the SAME tags from the same two repos, so it needs
 no tag argument -- commit either repo in between and it will fail fast on a
 missing ECR tag rather than deploying a stale image):
 
-  REGISTRY=${REGISTRY} REPO_PREFIX=${REPO_PREFIX} ./deploy-eks.sh
+  $([[ "${PROFILE_NAME}" == 5g ]] || printf 'PROFILE=%s ' "${PROFILE_NAME}")REGISTRY=${REGISTRY} REPO_PREFIX=${REPO_PREFIX} ./deploy-eks.sh
 EOF

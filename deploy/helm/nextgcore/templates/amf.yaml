@@ -101,7 +101,7 @@ spec:
   # Headless: N2/NGAP is userspace SCTP over UDP. kube-proxy balances UDP
   # per-flow with a conntrack timeout, which breaks a long-lived NGAP
   # association, and the gNB must reach the specific pod holding its UE
-  # contexts. Matches deploy/eks/patches/headless-services.yaml.
+  # contexts. Matches deploy/eks/profiles/5g/patches/headless-services.yaml.
   clusterIP: None
   {{- else }}
   type: {{ .Values.amf.service.type }}

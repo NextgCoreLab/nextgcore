@@ -114,7 +114,7 @@ amf:
   service:
     # Headless: NGAP is userspace SCTP over UDP and GTP-U-adjacent traffic
     # tolerates kube-proxy per-flow UDP balancing poorly. Matches
-    # deploy/eks/patches/headless-services.yaml.
+    # deploy/eks/profiles/5g/patches/headless-services.yaml.
     headless: true
     type: ClusterIP
     sbiPort: 7777
