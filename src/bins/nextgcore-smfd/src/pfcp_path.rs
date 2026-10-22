@@ -258,7 +258,14 @@ pub struct AssociationState {
 /// transactions matched on sequence number.
 pub struct PfcpClient {
     socket: Arc<UdpSocket>,
-    peer: SocketAddr,
+    /// The UPF endpoint currently dialled. Behind a lock because a peer named by
+    /// hostname is re-resolved when Association Setup fails (#658): a UPF pod
+    /// that restarts comes back at a new address, and an endpoint fixed at
+    /// startup would be retried forever.
+    peer: std::sync::RwLock<SocketAddr>,
+    /// The hostname and port `peer` was resolved from, when the operator named
+    /// the UPF rather than giving a literal address (#658).
+    peer_host: Option<(String, u16)>,
     node_ip: [u8; 4],
     /// Our own Recovery Time Stamp (seconds since the epoch at startup)
     pub recovery_time_stamp: u32,
@@ -567,6 +574,84 @@ pub fn select_least_loaded(candidates: &[(bool, Option<u8>)]) -> Option<usize> {
         .map(|(idx, _)| idx)
 }
 
+/// A UPF peer as configured in `UPF_PFCP_ADDR` (#20, #658): a literal endpoint,
+/// or a hostname the client resolves and keeps re-resolving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpfPeerSpec {
+    /// `10.0.0.5`, `10.0.0.5:8806`, `[::1]:8805`
+    Literal(SocketAddr),
+    /// `upf.nextg-system.svc.cluster.local`, `upf:8806`
+    Hostname(String, u16),
+}
+
+/// Parse one comma-separated `UPF_PFCP_ADDR` entry. An entry without a port
+/// takes `default_port`. Anything that is not a literal address is a hostname;
+/// it is NOT resolved here, so a name whose DNS record does not exist yet (a UPF
+/// pod that is not Ready) does not stop the SMF from starting (#658).
+pub fn parse_upf_peer(entry: &str, default_port: u16) -> Result<UpfPeerSpec, String> {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return Err("empty UPF peer".into());
+    }
+    if let Ok(sa) = entry.parse::<SocketAddr>() {
+        return Ok(UpfPeerSpec::Literal(sa));
+    }
+    if let Ok(ip) = entry.parse::<std::net::IpAddr>() {
+        return Ok(UpfPeerSpec::Literal(SocketAddr::new(ip, default_port)));
+    }
+    let (host, port) = match entry.rsplit_once(':') {
+        Some((h, p)) => (
+            h,
+            p.parse::<u16>()
+                .map_err(|_| format!("invalid port in UPF peer '{entry}'"))?,
+        ),
+        None => (entry, default_port),
+    };
+    let valid = !host.is_empty()
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_');
+    if !valid {
+        return Err(format!("invalid UPF peer '{entry}'"));
+    }
+    Ok(UpfPeerSpec::Hostname(host.to_string(), port))
+}
+
+/// Build the client for one configured UPF peer. A hostname is resolved once
+/// here on a best-effort basis; when it does not resolve yet the client starts
+/// at the unspecified address and [`try_associate`] keeps resolving it.
+pub async fn client_for_peer(
+    socket: Arc<UdpSocket>,
+    spec: &UpfPeerSpec,
+    node_ip: [u8; 4],
+) -> PfcpClient {
+    match spec {
+        UpfPeerSpec::Literal(sa) => PfcpClient::new(socket, *sa, node_ip),
+        UpfPeerSpec::Hostname(host, port) => {
+            let unresolved = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), *port);
+            let client = PfcpClient::new(socket, unresolved, node_ip)
+                .with_peer_hostname(host.clone(), *port);
+            if client.reresolve_peer().await.is_none() {
+                log::warn!(
+                    "PFCP: UPF hostname {host} does not resolve yet; association will retry it"
+                );
+            }
+            client
+        }
+    }
+}
+
+/// One association attempt for a client that is not associated (#658).
+///
+/// A UPF named by hostname is re-resolved first, every attempt: a restarted UPF
+/// pod comes back at a new address, and the previous one will never answer.
+/// Before #658 the endpoint was fixed at startup, so the SMF retried a dead IP
+/// forever and rejected every PDU session with #26.
+pub async fn try_associate(client: &PfcpClient) -> Result<(), PfcpRequestError> {
+    client.reresolve_peer().await;
+    client.associate().await
+}
+
 impl PfcpClient {
     /// Create a client bound to an existing N4 socket.
     pub fn new(socket: Arc<UdpSocket>, peer: SocketAddr, node_ip: [u8; 4]) -> Self {
@@ -576,7 +661,8 @@ impl PfcpClient {
             .unwrap_or(1);
         Self {
             socket,
-            peer,
+            peer: std::sync::RwLock::new(peer),
+            peer_host: None,
             node_ip,
             recovery_time_stamp,
             pending: Mutex::new(HashMap::new()),
@@ -606,9 +692,74 @@ impl PfcpClient {
         self.associated_gauge.load(Ordering::Relaxed)
     }
 
+    /// Name the UPF by hostname (#658). `peer` passed to [`Self::new`] is then
+    /// only the first resolution — or the unspecified address when the name did
+    /// not resolve yet — and [`Self::reresolve_peer`] refreshes it.
+    pub fn with_peer_hostname(mut self, host: impl Into<String>, port: u16) -> Self {
+        self.peer_host = Some((host.into(), port));
+        self
+    }
+
+    /// Test-only: shorten Association Setup's T1/N1 so a silent peer fails fast.
+    #[cfg(test)]
+    pub(crate) fn with_association_timer_for_test(mut self, t1: Duration, n1: u32) -> Self {
+        self.timers.pfcp_association.duration = t1;
+        self.timers.pfcp_association.max_count = n1;
+        self
+    }
+
     /// The UPF endpoint this client talks to.
     pub fn peer(&self) -> SocketAddr {
-        self.peer
+        *self.peer.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The hostname this client re-resolves, if the UPF was named rather than
+    /// addressed.
+    pub fn peer_hostname(&self) -> Option<&str> {
+        self.peer_host.as_ref().map(|(h, _)| h.as_str())
+    }
+
+    /// Whether `peer` holds a usable address. A hostname that did not resolve
+    /// at startup leaves the unspecified address in place; nothing is sent to it.
+    pub fn has_resolved_peer(&self) -> bool {
+        !self.peer().ip().is_unspecified()
+    }
+
+    /// Resolve the configured hostname again and adopt the new address if it
+    /// moved (#658). Returns the new endpoint when it changed, `None` when there
+    /// is no hostname, the lookup failed, or the address is the same.
+    ///
+    /// Sessions bound to the old address are not flushed here: the new endpoint
+    /// is either the same UPF (same Recovery Time Stamp, sessions intact) or a
+    /// new incarnation, and the next Association Setup's Recovery Time Stamp
+    /// check (`check_peer_restart`) already tears the old sessions down and
+    /// notifies the AMFs in that case. IPv4 is preferred because the Node ID this
+    /// client sends is IPv4.
+    pub async fn reresolve_peer(&self) -> Option<SocketAddr> {
+        let (host, port) = self.peer_host.as_ref()?;
+        let resolved = match tokio::net::lookup_host((host.as_str(), *port)).await {
+            Ok(addrs) => {
+                let addrs: Vec<SocketAddr> = addrs.collect();
+                addrs
+                    .iter()
+                    .find(|a| a.is_ipv4())
+                    .or_else(|| addrs.first())
+                    .copied()
+            }
+            Err(e) => {
+                log::warn!("PFCP: resolving UPF hostname {host}:{port} failed: {e}");
+                None
+            }
+        }?;
+        let previous = {
+            let mut peer = self.peer.write().unwrap_or_else(|e| e.into_inner());
+            if *peer == resolved {
+                return None;
+            }
+            std::mem::replace(&mut *peer, resolved)
+        };
+        log::warn!("PFCP: UPF hostname {host} now resolves to {resolved} (was {previous})");
+        Some(resolved)
     }
 
     /// Our Node ID address.
@@ -644,7 +795,7 @@ impl PfcpClient {
         log::info!(
             "PFCP {}: seeded peer Recovery Time Stamp {rts} from durable state; a different \
              stamp at Association Setup will flush the restored sessions",
-            self.peer
+            self.peer()
         );
     }
 
@@ -697,6 +848,14 @@ impl PfcpClient {
         let max_attempts = n1 + 1;
         let mut attempt = 0u32;
 
+        let peer = self.peer();
+        if peer.ip().is_unspecified() {
+            return Err(PfcpRequestError::Local(format!(
+                "UPF {} has not resolved to an address yet",
+                self.peer_hostname().unwrap_or("peer")
+            )));
+        }
+
         let result = loop {
             attempt += 1;
 
@@ -704,7 +863,7 @@ impl PfcpClient {
             let (tx, rx) = oneshot::channel();
             self.pending.lock().await.insert(seq, tx);
 
-            if let Err(e) = self.socket.send_to(&pkt, self.peer).await {
+            if let Err(e) = self.socket.send_to(&pkt, peer).await {
                 self.pending.lock().await.remove(&seq);
                 break Err(PfcpRequestError::Local(format!("send failed: {e}")));
             }
@@ -724,8 +883,7 @@ impl PfcpClient {
                     if attempt >= max_attempts {
                         log::error!(
                             "PFCP request type={msg_type} seq={seq} exhausted \
-                             {max_attempts} attempts — peer {} unreachable",
-                            self.peer
+                             {max_attempts} attempts — peer {peer} unreachable"
                         );
                         break Err(PfcpRequestError::Timeout {
                             attempts: max_attempts,
@@ -741,7 +899,7 @@ impl PfcpClient {
         if matches!(result, Err(PfcpRequestError::Timeout { .. })) {
             let mut assoc = self.assoc.write().await;
             if assoc.associated {
-                log::error!("Marking PFCP association with {} as DOWN", self.peer);
+                log::error!("Marking PFCP association with {peer} as DOWN");
                 assoc.associated = false;
             }
             self.publish_associated(&assoc);
@@ -857,7 +1015,7 @@ impl PfcpClient {
         if restarted {
             log::error!(
                 "UPF {} restarted (recovery time stamp changed to {rts})",
-                self.peer
+                self.peer()
             );
             self.teardown_association("peer restarted").await;
             // Remember the new incarnation so re-association succeeds
@@ -938,7 +1096,7 @@ impl PfcpClient {
             self.publish_associated(&assoc);
             log::info!(
                 "PFCP association established with {} (peer RTS={}, UP features={:?})",
-                self.peer,
+                self.peer(),
                 resp.recovery_time_stamp,
                 assoc
                     .up_function_features
@@ -956,7 +1114,7 @@ impl PfcpClient {
     /// Store the peer's Recovery Time Stamp in the SMF context so it reaches the
     /// durable snapshot (issue #191). A no-op when persistence is disabled.
     fn record_peer_recovery_time_stamp(&self, rts: u32) {
-        let peer = self.peer.to_string();
+        let peer = self.peer().to_string();
         if let Ok(ctx) = smf_self().read() {
             ctx.note_upf_recovery_time_stamp(&peer, rts);
         }
@@ -1650,6 +1808,139 @@ mod tests {
         let st = client.association().await;
         assert_eq!(st.peer_recovery_time_stamp, Some(777));
         assert!(st.up_function_features.unwrap().ftup);
+    }
+
+    /// #658: `UPF_PFCP_ADDR` entries parse as literals or hostnames; a hostname
+    /// is kept as a name (not resolved, not rejected) so the SMF can start before
+    /// the UPF's DNS record exists.
+    #[test]
+    fn upf_peer_entries_parse_as_literals_or_hostnames() {
+        assert_eq!(
+            parse_upf_peer("10.0.0.5", 8805),
+            Ok(UpfPeerSpec::Literal("10.0.0.5:8805".parse().unwrap()))
+        );
+        assert_eq!(
+            parse_upf_peer("10.0.0.6:8806", 8805),
+            Ok(UpfPeerSpec::Literal("10.0.0.6:8806".parse().unwrap()))
+        );
+        assert_eq!(
+            parse_upf_peer("::1", 8805),
+            Ok(UpfPeerSpec::Literal("[::1]:8805".parse().unwrap()))
+        );
+        assert_eq!(
+            parse_upf_peer("upf.nextg-system.svc.cluster.local", 8805),
+            Ok(UpfPeerSpec::Hostname(
+                "upf.nextg-system.svc.cluster.local".into(),
+                8805
+            ))
+        );
+        assert_eq!(
+            parse_upf_peer("upf:8806", 8805),
+            Ok(UpfPeerSpec::Hostname("upf".into(), 8806))
+        );
+        assert!(parse_upf_peer("upf:notaport", 8805).is_err());
+        assert!(parse_upf_peer("bad host", 8805).is_err());
+        assert!(parse_upf_peer("", 8805).is_err());
+    }
+
+    /// Answer one Association Setup Request on `upf` with Request Accepted.
+    async fn accept_one_association(upf: UdpSocket, rts: u32) {
+        let mut buf = vec![0u8; 4096];
+        let (len, from) = upf.recv_from(&mut buf).await.unwrap();
+        let h = parse_wire_header(&buf[..len]).unwrap();
+        assert_eq!(h.msg_type, pfcp_message_type::ASSOCIATION_SETUP_REQUEST);
+        let resp = AssociationSetupResponse::new(
+            NodeId::new_ipv4([127, 0, 0, 4]),
+            nextgcore_pfcp::types::PfcpCause::RequestAccepted,
+            rts,
+        );
+        let pkt = build_message(
+            &PfcpMessage::AssociationSetupResponse(resp),
+            h.sequence_number,
+            None,
+        );
+        upf.send_to(&pkt, from).await.unwrap();
+    }
+
+    /// Bind a client to `peer`, pumping its socket into the engine.
+    async fn pumped_client(client: PfcpClient) -> Arc<PfcpClient> {
+        let client = Arc::new(client);
+        let c = client.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let Ok((len, from)) = c.socket.recv_from(&mut buf).await else {
+                    break;
+                };
+                c.on_datagram(&buf[..len], from).await;
+            }
+        });
+        client
+    }
+
+    /// #658: a UPF named by hostname that comes back at a NEW address (a
+    /// restarted pod) is found again. The client was associated with the old
+    /// UPF; that UPF is gone and its address is dead. The association attempt
+    /// re-resolves the name and lands on the new UPF, whose different Recovery
+    /// Time Stamp then flushes the old sessions.
+    ///
+    /// Before #658 the endpoint was fixed at startup and every Association Setup
+    /// went to the dead address forever.
+    #[tokio::test]
+    async fn a_upf_named_by_hostname_is_found_again_at_its_new_address() {
+        // The old UPF incarnation: associates once, then dies.
+        let old_upf = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let old_addr = old_upf.local_addr().unwrap();
+        // The new incarnation is bound on another port of the same host, so
+        // "localhost" stands in for the Service name that now points at it.
+        let new_upf = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let new_port = new_upf.local_addr().unwrap().port();
+
+        let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client = pumped_client(
+            PfcpClient::new(local, old_addr, [127, 0, 0, 1])
+                .with_peer_hostname("localhost", new_port)
+                .with_association_timer_for_test(Duration::from_millis(100), 1),
+        )
+        .await;
+
+        // Associated with the old UPF directly (no re-resolution yet).
+        tokio::spawn(accept_one_association(old_upf, 1000));
+        client.associate().await.expect("first association");
+        assert_eq!(client.peer(), old_addr);
+        // The old UPF dies: heartbeat exhaustion marks the association down.
+        client.set_assoc_state_for_test(false, None, None).await;
+
+        tokio::spawn(accept_one_association(new_upf, 2000));
+        try_associate(&client)
+            .await
+            .expect("the association must be re-established at the new address");
+        assert!(client.is_associated().await);
+        assert_eq!(client.peer().port(), new_port);
+        assert!(client.peer().ip().is_loopback());
+        assert_eq!(
+            client.association().await.peer_recovery_time_stamp,
+            Some(2000),
+            "the new incarnation's stamp replaces the old one"
+        );
+    }
+
+    /// #658: a hostname that does not resolve at startup is not fatal and is
+    /// never dialled as 0.0.0.0; the request fails locally instead.
+    #[tokio::test]
+    async fn an_unresolved_upf_hostname_sends_nothing() {
+        let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let client = client_for_peer(
+            local,
+            &UpfPeerSpec::Hostname("upf.invalid".into(), 8805),
+            [127, 0, 0, 1],
+        )
+        .await;
+        assert!(!client.has_resolved_peer());
+        match client.associate().await {
+            Err(PfcpRequestError::Local(msg)) => assert!(msg.contains("upf.invalid"), "{msg}"),
+            other => panic!("expected a local error, got {other:?}"),
+        }
     }
 
     /// A rejected Association Setup must surface the real cause value.

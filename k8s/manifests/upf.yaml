@@ -172,17 +172,9 @@ spec:
       # timer (nextgcore-smfd/src/pfcp_sm.rs:116,138), so the UPF only has to
       # be listening on 8805 -- it never calls the SMF first.
       #
-      # Worse, that wait deadlocked the bring-up. The SMF needs the UPF's IP at
-      # startup (UPF_PFCP_ADDR is parsed as a SocketAddr), so it resolves the
-      # UPF's DNS name in an initContainer. The UPF Service is headless, so its
-      # DNS record only appears once a UPF pod is Ready. That gave:
-      #
-      #   UPF.wait-smf -> waits for SMF:7777
-      #   SMF.resolve-upf -> waits for UPF DNS -> waits for UPF Ready
-      #
-      # Neither side could ever start. Removing this wait lets the UPF come up
-      # first, publish its endpoint, and the SMF then resolves it and
-      # associates.
+      # Worse, that wait once deadlocked the bring-up against the SMF's old
+      # resolve-upf initContainer. Since #658 the SMF takes the UPF's hostname
+      # and keeps resolving it, so there is no ordering between the two.
       containers:
         - name: upf
           image: nextgcore-rust/upf:latest
