@@ -174,6 +174,24 @@ registered with the NRF, the gNB associated over NGAP, and the UE reaching
 `MM_REGISTERED` with a PDU session established. **`ping` from the UE will not
 work** — see below.
 
+### UE to internet (`e2e-internet.sh`)
+
+With the data plane on (`ENABLE_DATAPLANE=true`), check real traffic from the
+UE through the PDU session:
+
+```bash
+PROFILE=5g ./e2e-internet.sh
+```
+
+It runs from an ephemeral `kubectl debug --target=ue --profile=netadmin`
+netshoot container (no image change) and prints PASS/FAIL for `ping -I
+uesimtun -c 10 8.8.8.8` (0% loss), `dig @8.8.8.8 -b <UE IP>` (DNS through the
+tunnel), `curl --interface uesimtun` to the dig answer (200), and the UPF's
+"Data plane stats" UL/DL counters (both must increase). A temporary policy
+route (`from <UE IP> lookup 145`, `default dev uesimtun table 145`) keeps every
+UE-sourced packet, DNS included, in the tunnel; it is removed on exit. Exit 0
+only when every step passes.
+
 ## The user plane does not work by default
 
 `EnableDataPlanePrivileges=false` (the default) means the UPF runs with
