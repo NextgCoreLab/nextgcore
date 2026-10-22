@@ -63,13 +63,16 @@ smf:
 
 ## Parsed parameters
 
-The typed loader (`SmfYaml`/`SmfConfig` in `src/bins/nextgcore-smfd/src/main.rs`) deserializes only the `smf.sbi` subtree. Only the **first** entry of each list is used.
+The typed loader (`SmfYaml`/`SmfConfig` in `src/bins/nextgcore-smfd/src/main.rs`) deserializes `smf.sbi`, `smf.gtpc`, `smf.dns` and `smf.mtu`. Only the **first** entry of each list is used.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `smf.sbi.server[0].address` | string | `0.0.0.0` | Bind address for the SBI HTTP/2 server. |
 | `smf.sbi.server[0].port` | u16 | `7777` | SBI server port. Address+port also derive the advertised callback base URI (with `0.0.0.0` replaced by `127.0.0.1` unless `SMF_SBI_ADVERTISE_URI` is set). |
 | `smf.sbi.client.nrf[0].uri` | string | none | NRF base URI; seeded into the SBI context for NF registration. Without it the SMF operates NRF-less. |
+| `smf.gtpc.server[0].address` / `.port` | string / u16 | unset / `2123` | S5/S8 GTPv2-C bind address for the PGW-C role (#52). Unset leaves the PGW-C role unbound; a second entry is named in a warning and ignored. The EPC compose runs a dedicated smfd as PGW-C with `docker/rust/configs/epc/pgwc.yaml`. |
+| `smf.dns` | list of strings | none | DNS servers signalled to the UE in the Establishment Accept's ePCO. IPv6 entries are accepted and skipped (only the IPv4 DNS container is emitted). |
+| `smf.mtu` | u16 | none | IPv4 link MTU signalled in the same ePCO. |
 | `smf.sbi.oauth2.require` | bool | `false` | Opt-in SBI OAuth2 enforcement (TS 33.501 §13.4.1, TS 29.510 §5.4.2, per code comments). Read by a separate generic YAML scan: true if *any* top-level section sets it, or if `NEXTGCORE_SBI_OAUTH2_REQUIRE=1/true/yes`. With no NRF URI configured the producer side fails closed (503). |
 
 ### Internal defaults not settable via YAML
@@ -94,6 +97,17 @@ The N4/PFCP endpoints are configured by environment variables, **not** by the `s
 | `SMF_PFCP_RELEASE_ON_SHUTDOWN` | `false` | Send PFCP Association Release on graceful shutdown. Off by default: the UPF deletes every session of a released association, so a restart would cut all UE traffic. Set `true` only when the SMF is being removed for good. |
 | `SMF_SBI_ADVERTISE_URI` | derived from SBI server address/port | Externally reachable base URI used in PCF callback (`notificationUri`) URIs. |
 | `UDM_SBI_ADDR` / `UDM_SBI_PORT` | unset / `7777` | UDM address for `Nudm_SDM_Get(smf-select-data)`, used only to resolve the **subscribed default DNN** (#204). Tried **after** NRF discovery, so it is the fallback for a deployment with no NRF. With neither available, a `SmContextCreateData` carrying no `dnn` is refused with `SUBSCRIPTION_DATA_NOT_AVAILABLE`. |
+| `NRF_URI` | unset | NRF URI, used when the YAML names none. |
+| `PCF_URI` / `NSACF_URI` | unset | PCF / NSACF endpoint, tried before NRF discovery. With no NSACF configured or discoverable, slice admission control is skipped. |
+| `SMF_METRICS_PORT` | `9090` | Prometheus endpoint port (bound on `0.0.0.0`). |
+| `SMF_UDM` | off | `1`/`true` turns on the UDM interaction of TS 23.502 §4.3.2.2.1 step 4 (UECM registration, SM-data subscription, #79). Off by default because the E2E harness has no conformant UDM. |
+| `SMF_EPS_INTERWORKING` | off | `1`/`true` makes an establishing PDU session request an EPS Bearer Identity from the AMF and send Mapped EPS bearer contexts to the UE, so the session can later move to the EPC (#117). |
+| `SMF_IWK_SNSSAI` | SST `1` | S-NSSAI (`sst` or `sst:sd`, SD six hex digits) the PGW-C+SMF assigns to a PDN connection that can move to 5GS (#475). |
+| `SMF_PGW_FQDN` | unset | PGW-C+SMF FQDN registered with the UDM; blank is treated as unset. |
+| `SMF_INDIRECT_FORWARDING_TIMER_MS` | `3000` | How long the UPF keeps EPS→5GS indirect data-forwarding tunnels after the handover executes. |
+| `SMF_GN_ADDR` | `127.0.0.1` | GGSN address this SMF puts in Gn Create/Update PDP Context Responses (GTPv1 interworking). |
+| `SMF_EASDF` / `SMF_EASDF_EDGE_FQDN` | off / unset | `1`/`true` enables the EASDF DNS-context leg (TS 23.501 §5.6.7, #114); `SMF_EASDF_EDGE_FQDN` lists the FQDN patterns (e.g. `*.edge.example.com`) to steer. Enabled with no pattern logs a warning and steers nothing. |
+| `REDCAP_SESS_AMBR_DL_BPS` / `_UL_BPS` | `150000000` / `50000000` | Session-AMBR caps for RedCap UEs. |
 | `NEXTGCORE_SBI_OAUTH2_REQUIRE` | unset | `1`/`true`/`yes` forces OAuth2 enforcement, taking precedence over the YAML knob. |
 | `NEXTGCORE_SMF_STATE_FILE` | unset | JSON snapshot file for PFCP sessions, policy bindings and IPv4-pool allocations (#191). Read only when `--state-file` is absent — the flag wins; an empty value is treated as unset. With neither set the SMF is memory-only, which is the shipped default. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4317` | OpenTelemetry OTLP trace exporter endpoint. |
@@ -194,14 +208,14 @@ itself be restarting).
 
 ## Parsed-but-inert YAML sections
 
-The example file follows an Open5GS-style layout, but the typed deserializer ignores everything outside `smf.sbi` (unknown keys are silently dropped). The following sections in the shipped example currently have **no effect** on `nextgcore-smfd`:
+The example file follows an Open5GS-style layout, but the typed deserializer reads only `smf.sbi`, `smf.gtpc`, `smf.dns` and `smf.mtu` (unknown keys are silently dropped). The following sections in the shipped example currently have **no effect** on `nextgcore-smfd`:
 
 - `logger` — logging is controlled by `env_logger` (`RUST_LOG`, default `info`), not this section.
 - `global.max.ue` / `global.max.peer` — not read; context limits use the hard-coded defaults above.
 - `smf.pfcp` — PFCP addressing comes from the `SMF_PFCP_*` / `UPF_PFCP_*` environment variables.
-- `smf.gtpc`, `smf.gtpu`, `smf.metrics` — not deserialized by the config structs.
-- `smf.session` (UE IP subnets/gateways), `smf.dns`, `smf.mtu` — not deserialized by the config structs.
-- `smf.tls` — not read by the SMF loader; the file comment ties TLS to `TLS_ENABLED`/`SBI_SCHEME` deployment variables.
+- `smf.gtpu`, `smf.metrics` — not deserialized (the metrics port is `SMF_METRICS_PORT`).
+- `smf.session` (UE IP subnets/gateways) — not deserialized.
+- `smf.tls` — not read. The file comment says `TLS_ENABLED`/`SBI_SCHEME` enable TLS, but no code reads those variables; the SMF's SBI security follows `NEXTGCORE_SBI_PROFILE` (see [Configuration Overview](./overview.md)).
 
 ## Subscribed default DNN (#204)
 

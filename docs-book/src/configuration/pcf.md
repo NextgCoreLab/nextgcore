@@ -4,7 +4,7 @@ The PCF (Policy Control Function, `nextgcore-pcfd`) makes access-, session-, and
 
 Configuration is split between a YAML file (default path `/etc/nextgcore/pcf.yaml`, overridable with `-c/--config`), command-line flags, and an unusually large set of environment variables. The YAML file supplies the advertised SBI address/port, an optional FQDN, and the NRF URI; capacities and TLS-related flags are CLI-only; UE-policy delivery, URSP rules, UAV gating, the local PLMN, OAuth2 enforcement, and the OTLP endpoint are env-var driven.
 
-> **Honesty note:** PCF behavior is validated by this project's own unit tests and matched-simulator Docker E2E runs, not by third-party conformance certification. Several pieces are explicitly bespoke or partial: the `urspRules` member the PCF reads from the UDR UePolicySet is a provisioning-side convention of this deployment, never a 3GPP wire field (documented as such in `ue_policy.rs`); the UAV flight-zone gate uses a hardcoded geofence (lat 37–38, lon −123…−122); the `intent_policy` module is Rel-20 research scaffolding not wired to any live handler; the `--tls*` flags do **not** enable TLS on the live HTTP/2 listener (see below); and `-k/--kill` and `-l/--log-file` are accepted but not functional (kill only logs and exits; no file logging is wired in `init_logging`).
+> **Honesty note:** PCF behavior is validated by this project's own unit tests and matched-simulator Docker E2E runs, not by third-party conformance certification. Several pieces are explicitly bespoke or partial: the `urspRules` member the PCF reads from the UDR UePolicySet is a provisioning-side convention of this deployment, never a 3GPP wire field (documented as such in `ue_policy.rs`); the UAV flight-zone gate uses a hardcoded geofence (lat 37–38, lon −123…−122); the `intent_policy` module is Rel-20 research scaffolding not wired to any live handler; the `--tls*` flags do **not** enable TLS on the live HTTP/2 listener (see below); and `-k/--kill` is refused with an error and `-l/--log-file` is accepted but unused (no file logging is wired in `init_logging`).
 
 ## Example configuration
 
@@ -80,7 +80,7 @@ Runtime knobs with real defaults from the clap `Args` struct in `src/bins/nextgc
 | `-l, --log-file` | path | unset | Log file path — parsed but currently **not used** by `init_logging` (no file logging). |
 | `-e, --log-level` | string | `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; anything else falls back to `info`). |
 | `-m, --no-color` | flag | off | Disable color output. |
-| `-k, --kill` | flag | off | Stub: logs "would send SIGTERM to running instance" and exits — does not actually signal anything. |
+| `-k, --kill` | flag | off | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |
 | `--sbi-addr` | string | `0.0.0.0` | SBI bind address; overridden by `pcf.sbi.server[0].address` when the YAML sets one. |
 | `--sbi-port` | u16 | `7777` | SBI port; overridden by `pcf.sbi.server[0].port`. |
 | `--tls` | flag | off | Sets the advertised scheme to `https` in the legacy NF-instance builder only; does **not** enable TLS on the live listener. |

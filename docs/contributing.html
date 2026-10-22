@@ -60,20 +60,19 @@
       <h3 class="group-heading">2. Clone &amp; provision your environment</h3>
       <table class="cg-table">
         <tr><th>Tool</th><th>Version</th><th>Purpose</th></tr>
-        <tr><td>Rust</td><td>stable (&ge;1.75)</td><td>Build toolchain</td></tr>
-        <tr><td>protobuf-compiler</td><td>&ge;3.21</td><td>Protobuf codegen</td></tr>
-        <tr><td>clang / libclang-dev</td><td>any</td><td>LLVM bindings</td></tr>
-        <tr><td>libssl-dev</td><td>any</td><td>TLS support</td></tr>
-        <tr><td>cmake</td><td>&ge;3.16</td><td>FFI build scripts</td></tr>
-        <tr><td>Docker + docker-compose</td><td>&ge;24</td><td>E2E testing</td></tr>
+        <tr><td>Rust</td><td>1.95.0, pinned by <code>src/rust-toolchain.toml</code> (rustup installs it)</td><td>Build toolchain</td></tr>
+        <tr><td>C/C++ compiler, cmake</td><td>any recent</td><td><code>aws-lc-sys</code>, the C crypto library under rustls</td></tr>
+        <tr><td>libsctp-dev</td><td>any</td><td>only for <code>--features kernel-sctp</code> (amfd, mmed)</td></tr>
+        <tr><td>Docker + Compose v2</td><td>Engine &ge;24, Compose &ge;2.20</td><td>E2E testing</td></tr>
       </table>
       <div class="code-block">
         <button class="copy-btn">Copy</button>
         <code><span class="comment"># Ubuntu/Debian</span>
-<span class="cmd">sudo apt-get install -y pkg-config libssl-dev cmake protobuf-compiler clang</span>
+<span class="cmd">sudo apt-get install -y build-essential cmake pkg-config</span>
+<span class="cmd">sudo apt-get install -y libsctp-dev</span>   <span class="comment"># kernel-SCTP builds only</span>
 
 <span class="comment"># macOS (Homebrew)</span>
-<span class="cmd">brew install protobuf cmake openssl</span>
+<span class="cmd">brew install cmake</span>
 
 <span class="comment"># Fork on GitHub, then:</span>
 <span class="cmd">git clone https://github.com/&lt;you&gt;/nextgcore.git &amp;&amp; cd nextgcore</span></code>
@@ -97,13 +96,14 @@
       <div class="code-block">
         <button class="copy-btn">Copy</button>
         <code><span class="cmd">cd src</span>
-<span class="cmd">cargo test --workspace</span>                 <span class="comment"># all unit + integration tests</span>
+<span class="cmd">cargo test --workspace</span>                 <span class="comment"># all unit + mock-based flow tests (16 GB+ RAM: the generated codecs are heavy to compile)</span>
 <span class="cmd">cargo test -p nextgcore-amfd</span>           <span class="comment"># a single NF</span>
 <span class="cmd">cargo test --workspace -- --nocapture</span>  <span class="comment"># with log output</span>
 
 <span class="comment"># E2E against the matched RAN simulator (requires Docker)</span>
 <span class="cmd">cd ../docker/rust &amp;&amp; bash e2e.sh</span>
-<span class="cmd">bash e2e-test.sh --no-build --keep</span>     <span class="comment"># iterate without rebuilding</span></code>
+<span class="cmd">bash e2e-test.sh --no-build --keep</span>     <span class="comment"># iterate without rebuilding</span>
+<span class="cmd">bash ue-flow-check.sh all</span>              <span class="comment"># paging, idle uplink, de/re-registration (the nightly gate)</span></code>
       </div>
       <p><strong>Honesty rule:</strong> E2E validation runs against the matched NextGSim UE/gNB — it proves internal consistency, not third-party conformance. Never claim spec conformance in code, docs, or commit messages beyond what the tests actually demonstrate.</p>
     </div>
@@ -113,14 +113,16 @@
       <div class="code-block">
         <button class="copy-btn">Copy</button>
         <code><span class="cmd">cd src</span>
-<span class="cmd">cargo fmt --all</span>
-<span class="cmd">cargo clippy --workspace -- -D warnings</span>
+<span class="cmd">cargo fmt --all -- --check</span>
+<span class="cmd">cargo clippy --workspace --all-targets</span>
+<span class="cmd">cargo check --workspace --all-features --all-targets</span>
 <span class="cmd">cargo test --workspace</span>
 <span class="cmd">cargo audit</span>   <span class="comment"># cargo install cargo-audit</span></code>
       </div>
       <ul>
-        <li>Zero clippy warnings and zero <code>cargo fmt</code> diffs — CI enforces both.</li>
-        <li>Every new NF binary must: register with NRF on startup, expose Prometheus <code>/metrics</code>, shut down gracefully on SIGTERM, and log via <code>RUST_LOG</code>.</li>
+        <li>Zero <code>cargo fmt</code> diffs and zero clippy <em>errors</em> — CI enforces both; clippy warnings are reported, so add no new ones.</li>
+        <li>Every cargo feature must compile (<code>--all-features</code> is checked in CI), and the fuzz workspace must still build (<code>cd src/fuzz &amp;&amp; cargo clippy --locked --bins -- -D warnings</code>).</li>
+        <li>Every new NF binary must: register with NRF on startup and deregister on shutdown, expose Prometheus <code>/metrics</code>, shut down gracefully on SIGTERM, and take <code>--log-level</code> (and honour <code>RUST_LOG</code>, which 13 of the 28 NFs do today; #691).</li>
         <li>&ge; 1 unit test per public function on new code.</li>
       </ul>
     </div>

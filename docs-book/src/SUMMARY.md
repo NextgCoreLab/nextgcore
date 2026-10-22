@@ -25,6 +25,8 @@
   - [EASDF](configuration/easdf.md)
   - [PIN](configuration/pin.md)
   - [TSCTSF](configuration/tsctsf.md)
+  - [NEF](configuration/nef.md)
+  - [UCMF (RACS)](configuration/ucmf.md)
   - [SCP](configuration/scp.md)
   - [SEPP](configuration/sepp.md)
   - [MME (4G/EPC)](configuration/mme.md)

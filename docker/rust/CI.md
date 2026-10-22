@@ -1,9 +1,10 @@
 # CI-ability: running the matched-sim Docker E2E as a CI gate
 
-Wave-6 H10 deliverable. This documents the *shape* of a CI job for the
-matched-sim E2E (our nextgsim gNB/UE against our nextgcore 5GC — **no
-Open5GS anywhere**). It is wire-ready; actually wiring a CI system is out of
-scope here (no repo CI-infrastructure decision is made by this file).
+This documents the one-command local E2E (`e2e.sh`) for the matched-sim stack
+(our nextgsim gNB/UE against our nextgcore 5GC — **no Open5GS anywhere**) and
+the runner it needs. GitHub Actions runs its own version of these stages
+nightly (`docker-build`, `docker-e2e`, `docker-e2e-epc` in
+`.github/workflows/ci.yml`); see [docs/ci-and-release.md](../../docs/ci-and-release.md).
 
 ## The one command
 
@@ -37,10 +38,10 @@ Exit codes (CI gates on them directly):
 - Linux or macOS host. On macOS note the APFS df gotcha: local snapshots
   pin space `df` reports as used; the preflight error text explains the
   `tmutil` remedy.
-- ~8 GB RAM for the 13 health-gated containers (mongodb + 5GC NFs + gNB + UE).
+- ~8 GB RAM for the 13 health-gated containers (mongodb + 10 5GC NFs + gNB + UE).
   Note `docker-compose.yml` has no profiles, so `docker compose up -d` also
-  starts the advanced NFs (nwdaf/ees/lmf/mbsmf/nsacf/pin/dccf/scp/sepp) and
-  observability (prometheus/grafana/jaeger) — ~25 containers total; budget
+  starts the advanced NFs (nwdaf/ees/lmf/mbsmf/nsacf/ucmf/pin/dccf/scp/sepp) and
+  observability (prometheus/grafana/jaeger) — 26 containers total; budget
   12-16 GB to keep those running.
 - No network egress needed beyond pulling base images
   (`rust`, `debian:trixie-slim`, `mongo`, `alpine:3`).
@@ -56,6 +57,11 @@ Exit codes (CI gates on them directly):
    for health, asserts the full registration + PDU-session + data-plane
    chain from container logs, pings through the GTP-U tunnel.
 4. On failure `e2e.sh` captures artifacts **before** teardown.
+
+`e2e.sh` does not run the 0.2.0 UE flows or the EPC attach; with the stack kept
+up (`--keep`), run `./ue-flow-check.sh all` for the former, and bring up
+`docker-compose-epc.yml` then run `./epc-attach-check.sh` for the latter. The
+nightly CI runs both.
 
 ## Artifact capture (on failure)
 

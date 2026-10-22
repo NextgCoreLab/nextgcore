@@ -15,8 +15,8 @@
         <link rel="icon" href="../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../css/general-0392ca55.css">
-        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
         <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-10d7638c.js";
+            window.path_to_searchindex_js = "../searchindex-c2411517.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-1b88980e.js"></script>
+        <script src="../toc-be5dca41.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -240,6 +240,7 @@ nwdaf:
 <tr><td><code>--tls-key</code></td><td>path</td><td><code>/etc/nextgcore/tls/server.key</code> (when <code>--tls</code>)</td><td>TLS private key file.</td></tr>
 <tr><td><code>--max-subscriptions</code></td><td>usize</td><td><code>1024</code></td><td>Capacity cap applied separately to the <code>Nnwdaf_EventsSubscription</code> pool and the <code>Nnwdaf_MLModelProvision</code> pool.</td></tr>
 <tr><td><code>--nrf-uri</code></td><td>string</td><td><code>http://127.0.0.1:7777</code></td><td>NRF base URI for registration, heartbeat, NFStatusSubscribe, and (when OAuth2 is on) token/JWKS.</td></tr>
+<tr><td><code>--state-file</code></td><td>path</td><td>unset</td><td>JSON snapshot file for analytics and ML-provision subscriptions plus THRESHOLD edge state. Falls back to <code>NEXTGCORE_NWDAF_STATE_FILE</code> (the flag wins; an empty value is treated as unset). With neither set the NWDAF is memory-only — the shipped default. See Durable state below.</td></tr>
 <tr><td><code>--nf-instance-id</code></td><td>string</td><td>unset (generates <code>nwdaf-&lt;uuid4&gt;</code>)</td><td>NF instance ID used for NRF registration and context init.</td></tr>
 </tbody>
 </table>
@@ -250,8 +251,16 @@ nwdaf:
 <li><strong>Data collection callback uses <code>--sbi-addr</code> literally.</strong> At startup the daemon sends an NRF NFStatusSubscribe (TS 29.510 §5.2.2.5 per code comment) with callback <code>http://&lt;sbi-addr&gt;:&lt;sbi-port&gt;/nnwdaf-nfstatus-notify/v1/notify</code>. With the default bind of <code>0.0.0.0</code> that callback URI is unroutable, so real deployments must pass a reachable address (docker passes the container IP <code>172.23.0.30</code>). Subscribe failures are non-fatal — the dispatcher tick retries/renews, and analytics simply degrade to no-data.</li>
 <li><strong>Admission/rejection semantics of the analytics query:</strong> an unrecognized <code>event-id</code> token returns <code>400</code> with cause <code>INVALID_ANALYTICS_TYPE</code>; a recognized-but-unsupported event (anything outside <code>SUPPORTED_EVENTS</code>) returns <code>204 No Content</code> with an empty body; <code>NF_LOAD</code> with no ingested NRF data also returns <code>204</code> — after the data source deregisters, analytics deliberately “go dark” rather than serving stale or invented values. A NFStatusNotify body missing its mandatory <code>event</code> IE fails closed with <code>400</code>.</li>
 <li><strong>Subscription capacity:</strong> both subscription pools are capped at <code>--max-subscriptions</code> (1024 each by default). At capacity, creation is refused and surfaces as a <code>400</code> (<code>SUBSCRIPTION_FAILED</code> for events subscriptions), not a 5xx.</li>
+<li><strong>Prediction model (<code>NWDAF_PREDICTION_MODEL</code>, #26):</strong> selects the NF_LOAD predictor: <code>ols-linear</code> (the default when unset), <code>ewma</code>, <code>ewma:&lt;alpha&gt;</code>, or <code>onnx:&lt;path&gt;</code> (only in an <code>onnx-model</code> feature build). An invalid value is logged and the OLS baseline is kept.</li>
 <li><strong>Notification dispatcher:</strong> a background task wakes every 30 s (<code>DEFAULT_DISPATCH_INTERVAL_SECS</code> in <code>notification_dispatcher.rs</code>, overridable via the <code>NWDAF_DISPATCH_INTERVAL_SECS</code> env var; unparsable values fall back to 30), computes analytics, and POSTs <code>Nnwdaf_EventsSubscription</code> notifications to all due subscribers. New subscriptions default to a 60 s repetition period, so the first notification arrives within roughly one tick.</li>
-<li><strong>Environment variables</strong> read by this binary, with precedence: <code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code> (beats the YAML OAuth2 knob whenever set), <code>RUST_LOG</code> (beats <code>-e/--log-level</code>), <code>NWDAF_DISPATCH_INTERVAL_SECS</code> (default 30), and <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> (OTLP tracing endpoint, default <code>http://jaeger:4317</code>; OTel init failure is non-fatal). There are no state files — all subscriptions and ingested analytics data are in-memory and lost on restart.</li>
+<li><strong>Durable state (optional, off by default).</strong> With <code>--state-file</code> or <code>NEXTGCORE_NWDAF_STATE_FILE</code> set, both subscription pools (<code>Nnwdaf_EventsSubscription</code> and <code>Nnwdaf_MLModelProvision</code>) and the THRESHOLD edge state are written to a JSON snapshot and reloaded at boot, before the SBI server accepts anything. Ingested analytics samples and the NWDAF’s own NRF NFStatusSubscribe subscription are deliberately <strong>not</strong> persisted: the samples rebuild from NRF notifications within a tick or two, and re-subscribing at boot is safer than trusting a restored record — a stale one would make the NWDAF believe it has a collector channel it does not have, silently ending NF_LOAD collection. Three things worth knowing operationally:
+<ul>
+<li>An unreadable snapshot, or one written by a <strong>newer</strong> <code>nwdafd</code>, <strong>fails startup</strong> and is left untouched, rather than coming up empty and overwriting it. Move the file aside to start fresh.</li>
+<li>Subscription create/update/delete is written synchronously, so a resource the NWDAF has acknowledged is durable. The dispatcher’s per-tick bookkeeping (<code>last_notification_time</code>, <code>reports_sent</code>, the termination and ML-notified flags, threshold levels) is written <strong>once per tick</strong> instead of once per subscription — a full-store rewrite per counter bump would rewrite the whole file up to <code>--max-subscriptions</code> times every 30 s. A crash inside that window can repeat one notification; it cannot resurrect a deleted subscription.</li>
+<li>Restoring is not capped by <code>--max-subscriptions</code>. A snapshot holding more records than the cap is restored in full and new subscriptions are refused until enough are deleted — dropping a restored subscription would 404 a consumer’s live resource while the snapshot still claimed it existed.</li>
+</ul>
+</li>
+<li><strong>Environment variables</strong> read by this binary, with precedence: <code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code> (beats the YAML OAuth2 knob whenever set), <code>RUST_LOG</code> (beats <code>-e/--log-level</code>), <code>NEXTGCORE_NWDAF_STATE_FILE</code> (loses to <code>--state-file</code>), <code>NWDAF_DISPATCH_INTERVAL_SECS</code> (default 30), and <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> (OTLP tracing endpoint, default <code>http://jaeger:4317</code>; OTel init failure is non-fatal).</li>
 </ul>
 
                     </main>
@@ -302,7 +311,7 @@ nwdaf:
 
         <script src="../clipboard-1626706a.min.js"></script>
         <script src="../highlight-abc7f01d.js"></script>
-        <script src="../book-c22b7243.js"></script>
+        <script src="../book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

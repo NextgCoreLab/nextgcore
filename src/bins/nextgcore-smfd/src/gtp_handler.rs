@@ -3268,4 +3268,73 @@ mod tests {
     }
 
     use crate::gtp_build::gtp2_f_teid_interface;
+    /// #687: a PGW-U restart deletes each EPC PDN connection toward its SGW.
+    ///
+    /// The PDN connection arrived over S5/S8, so it has no SM context and no
+    /// `pfcp_sessions` entry, and the 5G restoration path never counted it. The
+    /// release must put a Delete Bearer Request on the wire to the SGW's S5/S8-C
+    /// F-TEID (127.0.0.1 in the fixture), addressed to the SGW's TEID, naming the
+    /// default bearer as the Linked EBI with cause 8 "Reactivation requested"
+    /// (TS 29.274 Table 8.4-1), and must drop the session and its address.
+    #[tokio::test]
+    async fn a_pgwu_restart_deletes_the_epc_pdn_connection_toward_the_sgw() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _upf = crate::pfcp_path::stand_in::associated_upf().await;
+        // IMSI ...0x68 and SGW TEID 0x6870_0001 are this test's alone.
+        let (server, sgw, sess) = establish_over_the_wire(9, 0x68, 0x6870_0001).await;
+        let addr = sess.ipv4_addr.expect("the session holds its PDN address");
+        assert_eq!(
+            sess.sgw_s5c_ip.ipv4,
+            Some(std::net::Ipv4Addr::LOCALHOST),
+            "the SGW's S5/S8-C address comes from the request's Sender F-TEID"
+        );
+
+        let sent = crate::restoration::release_epc_pdn_connections_via(
+            &server,
+            sgw.local_addr().expect("sgw addr").port(),
+            "peer restarted",
+        )
+        .await;
+        assert!(sent >= 1, "at least this test's PDN connection is deleted");
+
+        let mut buf = vec![0u8; 4096];
+        let dbr = loop {
+            let (len, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(3), sgw.recv_from(&mut buf))
+                    .await
+                    .expect("the PGW-C must send a Delete Bearer Request to the SGW")
+                    .expect("recv");
+            let mut bytes = bytes::Bytes::copy_from_slice(&buf[..len]);
+            let msg = nextgcore_gtp::v2::Gtp2Message::decode(&mut bytes).expect("decode");
+            if msg.header.teid == Some(0x6870_0001) {
+                break msg;
+            }
+        };
+        assert_eq!(
+            dbr.header.message_type,
+            gtp2_message_type::DELETE_BEARER_REQUEST
+        );
+        assert_eq!(
+            dbr.get_ie(Gtp2IeType::Ebi as u8, 0)
+                .and_then(|ie| ie.value.first().copied()),
+            Some(5),
+            "the default bearer, as the Linked EBI, so the whole PDN connection goes"
+        );
+        assert_eq!(
+            dbr.get_ie(Gtp2IeType::Cause as u8, 0)
+                .and_then(|ie| ie.value.first().copied()),
+            Some(8),
+            "TS 29.274 Table 8.4-1: 8 is Reactivation requested"
+        );
+        assert!(
+            session_for_teid(Some(sess.smf_n4_teid)).is_none(),
+            "the session is gone at the PGW-C"
+        );
+        let held = crate::context::smf_self()
+            .read()
+            .ok()
+            .and_then(|ctx| ctx.sess_find_by_ipv4(addr));
+        assert!(held.is_none(), "the PDN address is released");
+        server.close();
+    }
 }

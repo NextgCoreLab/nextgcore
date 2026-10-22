@@ -47,33 +47,35 @@
 <tr><td>Namf_MT (namf-mt)</td><td>EnableUeReachability, MT UE-context info GET</td><td>TS 29.518</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>Namf_Location (namf-loc)</td><td>ProvidePositioningInfo (LMF relay)</td><td>TS 29.518 / TS 23.273</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>UDM dereg callback (namf-callback)</td><td>DeregistrationNotification from UDM</td><td>TS 29.503 §5.3.2.3.2</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
-<tr><td>NGAP / N2 server</td><td>NGSetup, InitialUEMessage, UL NAS, UEContextRelease, InitialContextSetup, NGReset, ErrorIndication</td><td>TS 38.413</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
-<tr><td>N2/Xn handover</td><td>HandoverRequired/Ack/Notify/Cancel, PathSwitchRequest</td><td>TS 23.502 §4.9 / TS 38.413</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
-<tr><td>5GMM NAS handling</td><td>Registration, ServiceRequest, Deregistration, Auth/Identity/SecurityModeComplete, UL NAS transport</td><td>TS 24.501</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>NGAP / N2 server</td><td>NG Setup, NG Reset, RAN Configuration Update, Initial UE Message, UL/DL NAS Transport, Initial Context Setup, UE Context Release family, PDU Session Resource Setup/Modify/Release/Notify, Paging, Error Indication, Overload Start/Stop, PWS; encoded and decoded by the generated codec (nextgcore-ngap-gen, TS 38.413 V17.9.0)</td><td>TS 38.413</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>N2/Xn handover</td><td>Handover Required/Request/Command/Notify/Cancel, Preparation and Handover Failure, RAN Status Transfer, Path Switch Request/Acknowledge/Failure</td><td>TS 23.502 §4.9 / TS 38.413</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>5GMM NAS handling</td><td>Registration, Service Request from CM-IDLE and CM-CONNECTED, paging of CM-IDLE UEs, UE- and network-initiated Deregistration, Auth/Identity/SecurityModeComplete, UL NAS transport, emergency registration</td><td>TS 24.501 / TS 23.502 §4.2.3</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>NRPPa/LPP positioning relay</td><td>DL UE-/non-UE-associated NRPPa transport, LPP DL NAS transport</td><td>TS 38.455 / TS 37.355 / TS 23.273</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
-<tr><td>NGAP MBS multicast sessions</td><td>Multicast session create/manage (custom PER builders, unwired to dispatch)</td><td>TS 38.413 §9.2.9 / TS 23.247</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
+<tr><td>NGAP MBS multicast sessions</td><td>MBS session setup/modify/release toward NG-RAN on the generated codec, NG-RAN outcomes tracked per gNB and relayed to the MB-SMF</td><td>TS 38.413 §9.2.9 / TS 23.247</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>RACS (Nucmf client)</td><td>UE Radio Capability ID mapping/resolution with the UCMF, NGAP UE Radio Capability ID (IE 264) and info indication</td><td>TS 23.501 §5.4.4.1a / TS 29.673</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>UAV tracking (Rel-18)</td><td>UAV tracking report handling</td><td>TS 23.256</td><td><span class="fm-status fm-partial">partial</span></td></tr>
 <tr><td>SBI consumer side</td><td>NRF register/discover, AUSF auth, UDM UECM/SDM, SMF PDU session, PCF AM/UE policy, NSACF admission</td><td>TS 29.510/29.509/29.503/29.502/29.507/29.525/29.536</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 </table></div>
-<p class="fm-notes">SCTP transports: userspace sctp-proto/UDP default plus kernel-SCTP feature (port 38412); mcast MBS module has no call sites outside its own file.</p>
+<p class="fm-notes">SCTP transports: userspace sctp-proto over UDP (default) or native kernel SCTP (<code>--features kernel-sctp</code>, <code>--sctp-backend kernel</code>), port 38412. The hand-written nextgcore-ngap types are still used beside the generated codec; their deletion is #417.</p>
 <h3 class="group-heading">SMF</h3>
 <div class="fm-wrap"><table class="fm-table">
 <tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
 <tr><td>Nsmf_PDUSession sm-contexts (N11)</td><td>SM context create/update/release/retrieve; N1/N2 multipart, PCF policy, PFCP orchestration</td><td>TS 29.502</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
-<tr><td>Nsmf_PDUSession pdu-sessions (HO/roaming)</td><td>pdu-sessions create/modify/release; create returns hardcoded ref, minimal logic</td><td>TS 29.502</td><td><span class="fm-status fm-partial">partial</span></td></tr>
-<tr><td>Nsmf_EventExposure</td><td>Subscribe/unsubscribe; issues subscription IDs only, no event delivery</td><td>TS 29.508 (nsmf-event-exposure)</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>Nsmf_PDUSession pdu-sessions (H-SMF, home-routed roaming)</td><td>create/modify/release answer 501: there is no V-SMF/H-SMF split in this tree</td><td>TS 29.502</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>Nsmf_EventExposure</td><td>Subscribe/unsubscribe and event notifications to the subscriber's notifUri</td><td>TS 29.508 (nsmf-event-exposure)</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>SBI callbacks (nsmf-callback)</td><td>PCF SM-policy update/terminate notify, N1N2 transfer failure, AMF status change</td><td>TS 29.512 / TS 29.518</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>N4 PFCP toward UPF</td><td>Association setup/release, heartbeat, session est/mod/del, session report (usage reports); UDP 8805 server</td><td>TS 29.244</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>NRF registration + OAuth2 enforcement</td><td>NF register w/ load reporting, token validation on inbound SBI</td><td>TS 29.510, TS 33.501 s13.4.1</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>NSACF slice admission (Nnsacf_NSAC)</td><td>Per-S-NSSAI PDU session admission at SM context create</td><td>TS 29.536</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>Gn/Gp GTPv1-C GGSN interworking</td><td>Create/Update/Delete PDP Context, echo; handler module present, no bound GTP-C socket</td><td>TS 29.060, TS 23.401 Annex E</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
 <tr><td>GTPv2-C S5/S8 (PGW-C role)</td><td>Bound UDP GTP-C listener with live dispatch; Create/Modify/Delete Session, bearer procedures</td><td>TS 29.274</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
-<tr><td>N26 interworking &#8212; idle-mode 5GS&#8594;EPS</td><td>AMF answers an MME&#39;s Context Request with the mapped EPS security context (K<sub>ASME</sub>&#39; per TS 33.501 A.14.1) and PDN connections; MME sends Context Request/Acknowledge on an inter-system TAU. Off by default (<code>AMF_N26_INTERWORKING</code> / <code>MME_N26_INTERWORKING</code>)</td><td>TS 23.502 s4.11.1.3.2, TS 29.274 s7.3.5-7.3.7</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
-<tr><td>N26 interworking &#8212; connected-mode 5GS&#8594;EPS handover</td><td>GTPv2-C Forward Relocation Request/Response and Complete Notification/Acknowledge (types 133-136). The AMF stops refusing a <code>fivegs-to-eps</code> HandoverRequired when the leg is enabled, a socket is bound and a target MME is configured (<code>AMF_N26_MME_ADDR</code>), and still refuses when it cannot. Mapped key per TS 33.501 A.14.2 (FC 0x74, downlink NAS COUNT) with {NH, NCC=2}. <strong>Data forwarding is NOT established</strong>: the HandoverCommand carries an empty PDU Session Resource Handover List and the sites name which bearers lose in-flight downlink data &#8212; direct forwarding needs an NGAP HandoverCommandTransfer encoder this tree lacks, and indirect forwarding needs UPF-allocated tunnel info the SMF does not produce. The NAS Security Parameters from NG-RAN IE is computed but not encoded, so NAS security does not yet interoperate with a real UE</td><td>TS 23.502 s4.11.1.2.1, TS 29.274 s7.3.1-7.3.4, TS 33.501 A.14.2</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>N26 interworking &#8212; idle-mode 5GS&#8594;EPS</td><td>AMF answers an MME&#39;s Context Request with the mapped EPS security context (K<sub>ASME</sub>&#39; per TS 33.501 A.14.1) and PDN connections; MME sends Context Request/Acknowledge on an inter-system TAU. Off by default (<code>AMF_N26_INTERWORKING</code> / <code>MME_N26_INTERWORKING</code>; the AMF binds its N26 socket from <code>AMF_N26_ADDR</code>/<code>AMF_N26_PORT</code>)</td><td>TS 23.502 s4.11.1.3.2, TS 29.274 s7.3.5-7.3.7</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>N26 interworking &#8212; connected-mode 5GS&#8594;EPS handover</td><td>GTPv2-C Forward Relocation Request/Response and Complete Notification/Acknowledge (types 133-136), Relocation Cancel. Needs the leg enabled, a bound socket and a target MME (<code>AMF_N26_MME_ADDR</code>). Mapped key per TS 33.501 A.14.2 with {NH, NCC=2}; the HandoverCommand carries the NAS Security Parameters from NG-RAN. <strong>No data forwarding</strong>: the HandoverCommand declines it and names the bearers that lose in-flight downlink data</td><td>TS 23.502 s4.11.1.2.1, TS 29.274 s7.3.1-7.3.4, TS 33.501 A.14.2</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>N26 interworking &#8212; connected-mode EPS&#8594;5GS handover</td><td>The AMF as target and the MME as source: Forward Relocation, the SMF (PGW-C+SMF) side with every EPS bearer mapped to a QoS flow, indirect data-forwarding tunnels from the SMF/UPF, Relocation Cancel</td><td>TS 23.502 s4.11.1.2.2, TS 29.274</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>MBS session management</td><td>Multicast session context, UE join/leave; MBSF/MBSTF/N4mb interface stubs</td><td>TS 23.247 (Rel-17)</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
 <tr><td>Rel-17/18 QoS features</td><td>RedCap AMBR reduction, XR 5QI upgrade and QoS-flow binding in session create</td><td>TS 23.501 s5.7</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 </table></div>
-<p class="fm-notes">GTPv1 (Gn/Gp) handlers exist but no GTPv1-C listener is wired. GTPv2-C listeners ARE bound: the SMF&#39;s S5/S8 PGW-C socket, and &#8212; when the runtime switch is set &#8212; the AMF&#39;s N26 socket toward an MME.</p>
+<p class="fm-notes">GTPv1 (Gn/Gp) handlers exist but no GTPv1-C listener is wired. GTPv2-C listeners ARE bound: the SMF&#39;s S5/S8 PGW-C socket, and &#8212; when the runtime switch is set &#8212; the AMF&#39;s N26 socket toward an MME. The N26 handovers are unit/integration tested; the nightly E2E does not drive a handover.</p>
 <h3 class="group-heading">UPF</h3>
 <div class="fm-wrap"><table class="fm-table">
 <tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
@@ -126,7 +128,7 @@
 <tr><td>Nudr client (outbound)</td><td>Subscription/auth data fetch from UDR (nudr_handler)</td><td>TS 29.504/29.505 (per code, Nudr DR)</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>NRF registration (outbound)</td><td>NF profile with nudm-sdm/uecm/ueau service entries; OAuth2 scope checks on inbound</td><td>TS 29.510 (implied)</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 </table></div>
-<p class="fm-notes">Explicit 501 stubs: ue-context-in-smf-data GET, id-translation-result GET, sdm-subscriptions PATCH (udmd-12); dispatch in app.rs:524-635</p>
+<p class="fm-notes">Dispatch in <code>src/bins/nextgcore-udmd/src/app.rs</code>; id-translation-result GET is served.</p>
 <h3 class="group-heading">UDR</h3>
 <div class="fm-wrap"><table class="fm-table">
 <tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
@@ -295,17 +297,46 @@
 <tr><td>SBI security/auth layer</td><td>OAuth2/consumer-header (3gpp-Sbi-Consumer-Info) caller verification, SUPI-vs-ueId check</td><td>TS 29.500 / TS 33.501</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 </table></div>
 <p class="fm-notes">pind is deliberately application-layer only (no NRF registration; no PIN NfType in TS 29.510) — all routes use bespoke /pinapp/v1 binding for PIN-6/7/8, hence &quot;prototype&quot; (non-normative wire) though handlers are fully implemented. Files: nextgcore/src/bins/nextgcore-pind/src/main.rs (routes ~line 406), context.rs.</p>
-<h2 class="section-title" style="font-size:1.4rem;margin-top:2.5rem;">EPC (4G Interworking)</h2>
-<h3 class="group-heading">EPC (MME / HSS / SGW-C / SGW-U / PCRF)</h3>
+<h3 class="group-heading">NEF</h3>
 <div class="fm-wrap"><table class="fm-table">
 <tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
-<tr><td>mmed (MME)</td><td>S1AP+NAS-EPS attach/detach/TAU, EMM/ESM handlers, S11 GTP-C, S6a client, SGsAP, SBC, N26 toward an AMF (idle-mode TAU-with-N26 and connected-mode Forward Relocation as the target, both off by default)</td><td>TS 36.413 / 24.301 / 29.274 / 23.502 s4.11.1.3.2</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Northbound T8 exposure</td><td>Monitoring-event subscriptions and device triggering toward AFs; a monitoring target must resolve to exactly one UE (GPSI via UDM id-translation); the SUPI is never sent to an AF</td><td>TS 29.122 / TS 33.501 §5.9.2.3</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Caller authentication</td><td>OAuth2 (audience NEF) and/or mTLS client certificate, opt-in; ownership keyed to the authenticated identity</td><td>TS 33.501 §12.1</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+</table></div>
+<h3 class="group-heading">EASDF</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>Neasdf_DNSContext</td><td>DNS context create/update/delete, DNS handling rules, reports to the SMF, BaselineDNSPattern</td><td>TS 29.556 / TS 23.548</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Edge DNS plane</td><td>UDP/53 listener with a DNS wire codec and source-address scoping, behind the <code>dns-udp</code> cargo feature</td><td>TS 23.548 §6.2</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+</table></div>
+<h3 class="group-heading">TSCTSF</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>Ntsctsf_TimeSynchronization</td><td>ConfigCreate/Get/Update/Delete, capability subscribe/notify</td><td>TS 29.565 / TS 23.502 §5.2.27.2</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Ntsctsf_QoSandTSCAssistance</td><td>Create/Get/Update/Delete; PMIC/UMIC/TSCAI derivation, authorised with the PCF</td><td>TS 23.502 §5.2.27.3</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Ntsctsf_ASTI</td><td>Create/Get/Update/Delete</td><td>TS 23.502 §5.2.27.4</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+</table></div>
+<p class="fm-notes">The TS 29.565 OpenAPI is not vendored in this tree, so member spellings follow the stage-2 text (see the crate doc comment).</p>
+<h3 class="group-heading">UCMF (RACS)</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>Nucmf_UECapabilityManagement</td><td>Resolve, Assign, Subscribe/Unsubscribe, Notify; PLMN-assigned UE Radio Capability IDs under a Version ID</td><td>TS 29.673</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Nucmf_Provisioning</td><td>Create/read/replace/update/remove manufacturer-assigned dictionary entries (for the NEF)</td><td>TS 29.675</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>Capability transcoding</td><td>TS 38.331 &#8596; TS 36.331 transcoding and UE Radio Capability for Paging derivation, on the generated RRC codecs</td><td>TS 23.501 §5.4.4.1a</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+</table></div>
+<p class="fm-notes">Deleting a provisioning does not notify the deletion of its manufacturer-assigned IDs: TS 29.673 has no event type for it.</p>
+<h2 class="section-title" style="font-size:1.4rem;margin-top:2.5rem;">EPC (4G Interworking)</h2>
+<h3 class="group-heading">EPC (MME / HSS / SGW-C / SGW-U / PCRF / PGW)</h3>
+<div class="fm-wrap"><table class="fm-table">
+<tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
+<tr><td>mmed (MME)</td><td>S1AP (generated codec, nextgcore-s1ap-gen) + NAS-EPS attach/detach/TAU, paging, S1 handover and X2 Path Switch, E-RAB management, EMM/ESM handlers, S11 GTP-C, S6a client, SGsAP, SBC, N26 toward an AMF (idle-mode TAU-with-N26, connected-mode Forward Relocation as target for 5GS&#8594;EPS and as source for EPS&#8594;5GS, all off by default). S1-MME is kernel SCTP only</td><td>TS 36.413 / 24.301 / 29.274 / 23.502 s4.11.1.3.2</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>hssd (HSS)</td><td>Diameter S6a AIR/ULR subscriber data, plus Cx and SWx paths</td><td>TS 29.272</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>sgwcd (SGW-C)</td><td>S11 GTP-C session create/modify/delete, S5-C relay, Sxa PFCP to SGW-U</td><td>TS 29.274 / 29.244</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>sgwud (SGW-U)</td><td>Sxa PFCP session control, GTP-U user-plane forwarding</td><td>TS 29.244 / 29.281</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>pcrfd (PCRF)</td><td>Diameter Gx CCR/CCA policy rules, Rx AF session binding</td><td>TS 29.212 / 29.214</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
+<tr><td>PGW-C / PGW-U</td><td><code>smfd</code> / <code>upfd</code> in their EPC roles: S5/S8 GTPv2-C, Sxb PFCP, SGi</td><td>TS 23.401 / 29.274 / 29.244</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 </table></div>
-<p class="fm-notes">All 5 are restored Open5GS-port scaffolding (~42k lines total, near-zero TODOs); &quot;implemented&quot; = code-complete port, not conformance-validated.</p>
+<p class="fm-notes">The five EPC daemons are about 97k lines of Rust in total. The nightly CI attaches a real LTE UE through nextgsim&#39;s eNB and pings through the default bearer (S1 Setup, attach, default bearer, Sxa and Sxb PFCP); dedicated bearers, handover, idle mode and IPv6 PDN are not exercised there. &quot;implemented&quot; is not a conformance claim.</p>
   </div>
 </section>
 <footer class="footer">

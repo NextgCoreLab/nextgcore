@@ -2,7 +2,17 @@
 
 > Generated: 2026-02-07 | Scope: AMF, SMF, NRF, SCP
 
-> **STALENESS NOTICE (updated 2026-07):** This 2026-02-07 snapshot is superseded. The per-NF "completeness %" and "stubbed/scaffolding" claims below are STALE. Since then the matched-sim Docker E2E (our gNB+UE <-> our 22-NF core) is 84/84 GREEN with full registration + PDU session + user-plane data (UE gets IP 10.45.0.2, ping through the GTP-U tunnel, 0% loss). AMF/PCF/UDM/AUSF/BSF are now lib+bin crates (src/lib.rs|app.rs expose `<nf>_sbi_request_handler`; src/main.rs is a ~10-line wrapper). AMF does on-demand NRF discovery on endpoint-cache miss (TS 29.510) and ingests NSACF profiles; NRF has an OAuth2 `/nnrf-oauth2/*` token endpoint with CCA JWS ES256 verification and optional mTLS client-auth. Treat the tables below as a historical baseline, not current state.
+> **STALENESS NOTICE (updated 2026-10, pre-0.2.0):** The body below is the 2026-02-07 snapshot, kept as a historical baseline: its completeness percentages, file and line counts and "stub" / "missing" verdicts are measurements from that date, not current state.
+>
+> State at 0.1.0 (2026-07): the matched-sim Docker E2E (our gNB+UE against our core) passed registration + PDU session + user-plane data (UE gets 10.45.0.2, ping through the GTP-U tunnel). AMF/PCF/UDM/AUSF/BSF are lib+bin crates (`src/lib.rs`/`app.rs` expose `<nf>_sbi_request_handler`; `src/main.rs` is a thin wrapper). AMF does on-demand NRF discovery on endpoint-cache miss (TS 29.510) and ingests NSACF profiles; NRF has an OAuth2 `/nnrf-oauth2/*` token endpoint with CCA JWS ES256 verification and optional mTLS client-auth.
+>
+> Since 0.1.0, among others:
+> - **AMF:** every NGAP procedure it builds or decodes moved onto the codec generated from the TS 38.413 ASN.1 (`nextgcore-ngap-gen`, #417 stages, e.g. #443, #458, #504, #562, #571, #575); paging of CM-IDLE UEs and Service Request from CM-IDLE and CM-CONNECTED (#516, #521, #550, #648, #683, #685); EPS-5GS interworking over N26, idle and connected mode, both directions (#409, #416, #474, #483, #624); RACS via the new UCMF (#578); PWS (#401, #405); the Namf producer surface and event fire points (#398, #402); one authoritative UE store (#374); NG Reset (#532, #638, #647).
+> - **SMF:** UDM interaction (`Nudm_UECM` registration, `Nudm_SDM` sm-data get/subscribe, #292, #298); a durable store for PFCP sessions, bindings and the IP pool (#279); URR provisioning and quota enforcement (#376); the PGW-C role and EPS interworking (#384, #419, #477, #621); N2 SM transfers on the generated codec (#590); restart handling (#672, #678).
+> - **NRF:** real subscription PATCH/SubscrCond matching (#219, #220); one NFProfile per NF (#394); x5c-bound CCA (#395). NFs deregister on shutdown (#244) and re-register when a heartbeat gets 404 (#437).
+> - **SCP:** endpoint selection by service and API version, failover, callback routing and authority handling (#255-#260, #382).
+>
+> Validation now runs nightly: `.github/workflows/ci.yml` (`docker-e2e`, `docker-e2e-epc`) and `docker/rust/ue-flow-check.sh`.
 
 ---
 

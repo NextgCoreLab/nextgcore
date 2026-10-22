@@ -2615,6 +2615,15 @@ impl SmfContext {
         sess_list.values().find(|s| matches(s)).cloned()
     }
 
+    /// Every session satisfying `matches` (#687: the EPC PDN connections a restarted
+    /// PGW-U no longer holds).
+    pub fn sess_find_all_by(&self, matches: impl Fn(&SmfSess) -> bool) -> Vec<SmfSess> {
+        match self.sess_list.read() {
+            Ok(sess_list) => sess_list.values().filter(|s| matches(s)).cloned().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Find session by APN (EPC)
     pub fn sess_find_by_apn(&self, smf_ue_id: u64, apn: &str, rat_type: u8) -> Option<SmfSess> {
         let sess_list = self.sess_list.read().ok()?;

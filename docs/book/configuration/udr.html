@@ -15,8 +15,8 @@
         <link rel="icon" href="../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../css/general-0392ca55.css">
-        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
         <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-10d7638c.js";
+            window.path_to_searchindex_js = "../searchindex-c2411517.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-1b88980e.js"></script>
+        <script src="../toc-be5dca41.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -261,13 +261,13 @@ udr:
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td><strong>Accepted but currently unused</strong> — <code>init_logging</code> never opens it; logging always goes to stderr.</td></tr>
 <tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>); unrecognized values fall back to <code>info</code>.</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output.</td></tr>
-<tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td><strong>Stub</strong>: logs “would send SIGTERM to running instance” and exits without signaling anything.</td></tr>
+<tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor.</td></tr>
 <tr><td><code>--sbi-addr</code></td><td>string</td><td><code>0.0.0.0</code></td><td>SBI server bind address. Overridden by <code>udr.sbi.server[0].address</code> when present.</td></tr>
 <tr><td><code>--sbi-port</code></td><td>u16</td><td><code>7777</code></td><td>SBI server port. Overridden by <code>udr.sbi.server[0].port</code> when present.</td></tr>
 <tr><td><code>--tls</code></td><td>flag</td><td>off</td><td>Enable TLS on the SBI server.</td></tr>
 <tr><td><code>--tls-cert</code></td><td>path</td><td>unset</td><td>TLS certificate file.</td></tr>
 <tr><td><code>--tls-key</code></td><td>path</td><td>unset</td><td>TLS private key file.</td></tr>
-<tr><td><code>--state-file</code></td><td>path</td><td>unset</td><td>JSON snapshot file for the non-subscriber resource trees (exposure-data, application-data, smf-registrations, subs-to-notify, policy provisioning, amf-3gpp-access). Falls back to <code>NEXTGCORE_UDR_STATE_FILE</code>; empty strings are treated as unset. When neither is set the trees are in-memory only and lost on restart.</td></tr>
+<tr><td><code>--state-file</code></td><td>path</td><td>unset (but <strong>set in the shipped Docker compose</strong>, see below)</td><td>JSON snapshot file for the non-subscriber resource trees (exposure-data, application-data, smf-registrations, subs-to-notify, policy provisioning, amf-3gpp-access). Falls back to <code>NEXTGCORE_UDR_STATE_FILE</code>; empty strings are treated as unset. When neither is set the trees are in-memory only and lost on restart.</td></tr>
 </tbody>
 </table>
 </div>
@@ -278,6 +278,29 @@ udr:
 <li><strong>Change notifications are fire-and-forget.</strong> <code>subs-to-notify</code> subscriptions on the subscription-data, exposure-data, influenceData, and application-data trees trigger real HTTP POSTs to the registered callback URI with a 2 s connect / 3 s request timeout; delivery failures are logged and never retried.</li>
 <li><strong>UE identifier handling</strong> (TS 29.571 <code>VarUeId</code> forms per code comments): null-scheme SUCIs are converted to IMSI locally; syntactically valid but unprovisioned <code>nai-</code>/<code>gci-</code>/<code>gli-</code> identifiers get <strong>404</strong> <code>NOT_FOUND</code> (not 400); <code>extgroupid-</code> gets <strong>501</strong> <code>NOT_SUPPORTED</code>; anything else is <strong>400</strong> <code>INVALID_SUPI</code>.</li>
 <li><strong>PATCH on <code>authentication-subscription</code> stores exactly what is written</strong> — the UDR applies the <code>/sequenceNumber/sqn</code> PatchItem verbatim with no SQN side effects; SQN advancement is the UDM/ARPF’s job per the TS 33.102 Annex C.3 code comment (a previous unconditional +32 SEQ increment here was a bug, WSB-6).</li>
+</ul>
+<h2 id="durable-state-is-on-by-default-in-docker"><a class="header" href="#durable-state-is-on-by-default-in-docker">Durable state is on by default in Docker</a></h2>
+<p><code>docker/rust/docker-compose.yml</code> sets <code>NEXTGCORE_UDR_STATE_FILE=/var/lib/nextgcore/udr-state.json</code>
+and backs it with the <code>udr_state</code> named volume, so the resource trees survive both
+<code>docker compose restart</code> and <code>up -d</code> recreating the container (issue #66).</p>
+<p>The UDR is the most severe member of that issue: memory-only, a restart erases
+every subscriber’s <code>amf-3gpp-access</code> and <code>smf-registration</code> at once, and consumers
+then receive authoritative-looking “not registered” answers for subscribers that
+<em>are</em> registered.</p>
+<p>Two things make enabling it safe rather than merely convenient:</p>
+<ul>
+<li>a <strong>corrupt</strong> snapshot is refused, not overwritten — the NF logs an error, starts
+empty, and declines to persist, so the unreadable file survives for recovery
+(see the shared-store section in <a href="./overview.html">Configuration Overview</a>);</li>
+<li>snapshots are written atomically, fsynced and <code>0600</code> — this file is keyed by
+IMSI.</li>
+</ul>
+<p><strong>Kubernetes and Helm are not covered.</strong> The <code>udr</code> manifest is a <code>Deployment</code> with
+no volume for this, so persistence there still needs a <code>PersistentVolumeClaim</code> plus
+<code>strategy: Recreate</code> (or conversion to a <code>StatefulSet</code>, as MongoDB uses). That is a
+storage-topology decision rather than a config line, so it is deliberately left
+out.</p>
+<ul>
 <li><strong>Environment variables</strong>: <code>DB_URI</code> (MongoDB URI; read only when the YAML has no <code>db_uri</code> line), <code>NEXTGCORE_UDR_STATE_FILE</code> (state-file path; read only when <code>--state-file</code> is absent — the flag wins), and <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> (OpenTelemetry OTLP exporter endpoint, default <code>http://jaeger:4317</code>).</li>
 </ul>
 
@@ -329,7 +352,7 @@ udr:
 
         <script src="../clipboard-1626706a.min.js"></script>
         <script src="../highlight-abc7f01d.js"></script>
-        <script src="../book-c22b7243.js"></script>
+        <script src="../book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

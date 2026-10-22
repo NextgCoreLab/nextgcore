@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>NextGCore — Agentic 6G Core Network</title>
-  <meta name="description" content="5G Core Network in Rust. 24 Network Functions with AI-native analytics, intent-based automation, zero-trust security, and a full 4G/EPC network-function set (MME, HSS, SGW, PCRF). 5GS&#8596;EPS interworking is PARTIAL: the N26 interface carries idle-mode 5GS&#8594;EPS context transfer and connected-mode 5GS&#8594;EPS handover via GTPv2-C Forward Relocation (both off by default), though the handover establishes no data-forwarding tunnels, so in-flight downlink data is discarded rather than forwarded. Targets 3GPP Rel-15 with selected Rel-17/18 features; 6G/Rel-20 capabilities are non-normative research prototypes (no frozen Rel-20 specs exist).">
+  <meta name="description" content="5G Core Network in Rust. 28 Network Functions with AI-native analytics, intent-based automation, zero-trust security, and a 4G/EPC network-function set (MME, HSS, SGW, PCRF, PGW). 5GS&#8596;EPS interworking over N26 in both directions (off by default). Rel-15 baseline with selected Rel-16/17/18 features; 6G/Rel-20 capabilities are non-normative research prototypes (no frozen Rel-20 specs exist).">
   <link rel="stylesheet" href="css/style.css">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔷</text></svg>">
 </head>
@@ -33,21 +33,39 @@
   <div class="container">
     <div class="hero-content">
       <div class="hero-badge">
-        <span>v0.1.0</span> &middot; 3GPP Rel-15 / Rel-17/18 features &middot; 6G prototypes (non-normative, no frozen Rel-20 specs)
+        <span>v0.2.0</span> &middot; 3GPP Rel-15 / Rel-16/17/18 features &middot; 6G prototypes (non-normative, no frozen Rel-20 specs)
       </div>
       <h1>Agentic <span class="accent">6G Core</span> Network</h1>
-      <p>The first AI-native 5G/6G Core Network — 24 Network Functions with ML-driven analytics, intent-based autonomous operations, zero-trust security, and edge intelligence — plus a full 4G/EPC network-function set (MME, HSS, SGW, PCRF). Built entirely in Rust. <strong>5GS&#8596;EPS interworking is partial</strong>: the AMF signals the IWK-N26 indicator, maps 5G-GUTI&#8596;EPS-GUTI, and &#8212; behind an off-by-default runtime switch &#8212; runs the <strong>N26</strong> interface toward an MME, so an idle UE moving from 5GS to EPS keeps its security context and PDN connections (TS 23.502 &#167;4.11.1.3.2), and a <em>connected</em> UE can be handed over with GTPv2-C Forward Relocation (&#167;4.11.1.2.1). That handover establishes <strong>no data-forwarding tunnels</strong>, so downlink data in flight at the source gNB is discarded rather than forwarded, and the NAS Security Parameters from NG-RAN IE is not yet encoded &#8212; so NAS security does not interoperate with a real UE. See the <a href="features.html">feature matrix</a>.</p>
+      <p>The first AI-native 5G/6G Core Network — 28 Network Functions with ML-driven analytics, intent-based autonomous operations, zero-trust security, and edge intelligence — plus a 4G/EPC network-function set (MME, HSS, SGW, PCRF, and the SMF/UPF as PGW). Built in Rust, validated every night against the companion nextgsim gNB/UE and LTE eNB/UE simulators. 5GS&#8596;EPS interworking runs over <strong>N26</strong> in both directions behind off-by-default runtime switches (<code>AMF_N26_INTERWORKING</code>, <code>MME_N26_INTERWORKING</code>): idle-mode context transfer (TS 23.502 &#167;4.11.1.3) and connected-mode handover with GTPv2-C Forward Relocation (&#167;4.11.1.2), with the AMF and the MME each as source and target, Relocation Cancel, and data-forwarding tunnels for EPS&#8594;5GS. A 5GS&#8594;EPS handover still establishes no data forwarding, and the N26 handover is not yet exercised by the nightly end-to-end run. See the <a href="features.html">feature matrix</a>.</p>
       <div class="hero-buttons">
         <a href="#quickstart" class="btn btn-primary">Get Started</a>
         <a href="#ai-native" class="btn btn-secondary">Explore AI Features</a>
         <a href="api.html" class="btn btn-secondary">31 OpenAPI Specs</a>
       </div>
       <div class="stats-row">
-        <div class="stat"><div class="stat-value">24</div><div class="stat-label">Network Functions</div></div>
-        <div class="stat"><div class="stat-value">17</div><div class="stat-label">Libraries</div></div>
-        <div class="stat"><div class="stat-value">~400k</div><div class="stat-label">Lines of Rust</div></div>
-        <div class="stat"><div class="stat-value">7</div><div class="stat-label">AI/6G NFs</div></div>
+        <div class="stat"><div class="stat-value">28</div><div class="stat-label">Network Functions</div></div>
+        <div class="stat"><div class="stat-value">23</div><div class="stat-label">Libraries</div></div>
+        <div class="stat"><div class="stat-value">6</div><div class="stat-label">Generated ASN.1 codecs</div></div>
+        <div class="stat"><div class="stat-value">~620k</div><div class="stat-label">Lines of Rust</div></div>
       </div>
+    </div>
+  </div>
+</section>
+
+<!-- New in 0.2.0 -->
+<section id="new">
+  <div class="container">
+    <h2 class="section-title">New in 0.2.0</h2>
+    <p class="section-subtitle">Since 0.1.0 (2026-07-02). Full list in the <a href="https://github.com/NextgCoreLab/nextgcore/blob/main/CHANGELOG.md">CHANGELOG</a>.</p>
+    <div class="features-grid">
+      <div class="feature-card"><h3>Generated ASN.1 codecs</h3><p>NGAP, S1AP, NRPPa, LPP, NR RRC and LTE RRC compiled from the 3GPP ASN.1 with <a href="https://github.com/NextgCoreLab/asn1-codegen">NextgCoreLab/asn1-codegen</a>. The hand-written S1AP, NRPPa, LPP, E1AP, F1AP and XnAP codecs are gone; deleting the hand-written NGAP crates is tracked in #417.</p></div>
+      <div class="feature-card"><h3>Real LTE attach</h3><p>nextgsim's LTE UE attaches through its eNB to the MME, with SGW-C/SGW-U and a PGW-C/PGW-U (the SMF/UPF in their EPC roles), and pings through the default bearer.</p></div>
+      <div class="feature-card"><h3>Paging &amp; Service Request</h3><p>CM-IDLE UEs are paged on downlink data; a Service Request from CM-IDLE or CM-CONNECTED re-activates the user plane.</p></div>
+      <div class="feature-card"><h3>EPS&#8596;5GS over N26</h3><p>Idle-mode context transfer and connected-mode handover in both directions, Relocation Cancel, and EPS&#8594;5GS data-forwarding tunnels.</p></div>
+      <div class="feature-card"><h3>RACS</h3><p>A new NF, the UCMF (<code>nextgcore-ucmfd</code>, TS 29.673/29.675), transcodes UE radio capabilities between TS 38.331 and TS 36.331; the AMF uses it over Nucmf.</p></div>
+      <div class="feature-card"><h3>EKS deployment</h3><p><code>deploy/eks</code> with a <code>PROFILE=&lt;name&gt;</code> interface (the <code>5g</code> profile ships), a UE-to-internet check (<code>e2e-internet.sh</code>), and recovery from a pod restart without restarting its peers.</p></div>
+      <div class="feature-card"><h3>Nightly UE-flow gate</h3><p>The cross-repo E2E runs nightly: registration, paging, idle uplink, de-registration and UDM-triggered re-registration with 0%-loss pings, the OAuth2 overlay, and the LTE attach. A release promotes a commit pair that passed it.</p></div>
+      <div class="feature-card"><h3>SCTP backends &amp; fuzzing</h3><p>Userspace SCTP over UDP (default) or native kernel SCTP (<code>--features kernel-sctp</code>, AMF <code>--sctp-backend kernel</code>; the MME's S1-MME is kernel only). Fuzz targets for NGAP, S1AP, NRPPa, LPP, NAS, GTP, PFCP and Diameter build on every PR.</p></div>
     </div>
   </div>
 </section>
@@ -76,7 +94,7 @@
       <div class="feature-card">
         <div class="feature-icon">&#9729;</div>
         <h3>Cloud Native</h3>
-        <p>Kubernetes with Helm charts, Prometheus metrics on every NF, Jaeger distributed tracing, horizontal scaling. Docker Compose for dev (24 NF services), Kubernetes for production.</p>
+        <p>Docker Compose for dev (20 5GC NFs plus the RAN simulator and observability; a separate EPC stack), Kind manifests, a Helm chart for the 5GC control plane, and an EKS deployment. Prometheus and Jaeger in the compose and Kind stacks.</p>
       </div>
       <div class="feature-card">
         <div class="feature-icon">&#128640;</div>
@@ -85,8 +103,8 @@
       </div>
       <div class="feature-card">
         <div class="feature-icon">&#9878;</div>
-        <h3>3GPP Rel-15, Rel-17/18 features</h3>
-        <p>Full 5G SA and selected 5G-Advanced (Rel-17/18) features: MBS multicast, PIN IoT networks, NSACF slice admission, LMF positioning with 10+ methods, RedCap admission with AMBR capping, XR QoS (5QI 82&ndash;85, PDU Set GTP-U container), SNPN (44-bit NID, allowed-NID gating, onboarding), MINT disaster roaming, and UAV Service-level-AA (TS 23.256, IEI 0x72). 6G/Rel-20 items (ISAC, FL, PQC, semantic comms) are research prototypes informed by TR 22.870 use cases only — no frozen Rel-20 3GPP stage-3 specs exist.</p>
+        <h3>3GPP Rel-15, Rel-16/17/18 features</h3>
+        <p>5G SA and selected Rel-16/17/18 features: RACS (UCMF), MBS multicast, PIN IoT networks, NSACF slice admission, LMF positioning with 10+ methods, RedCap admission with AMBR capping, XR QoS (5QI 82&ndash;85, PDU Set GTP-U container), SNPN (44-bit NID, allowed-NID gating, onboarding), MINT disaster roaming, and UAV Service-level-AA (TS 23.256, IEI 0x72). 6G/Rel-20 items (ISAC, FL, PQC, semantic comms) are research prototypes informed by TR 22.870 use cases only — no frozen Rel-20 3GPP stage-3 specs exist.</p>
       </div>
     </div>
   </div>
@@ -96,7 +114,7 @@
 <section id="ai-native">
   <div class="container">
     <h2 class="section-title">AI-Native Network Functions</h2>
-    <p class="section-subtitle">Seven specialized NFs that bring intelligence, analytics, and autonomy to the core network.</p>
+    <p class="section-subtitle">Specialized NFs that bring analytics, edge, positioning and slice control to the core network.</p>
 
     <!-- NWDAF Deep Dive -->
     <div class="ai-feature-block">
@@ -260,13 +278,12 @@
 <section id="architecture">
   <div class="container">
     <h2 class="section-title">Architecture</h2>
-    <p class="section-subtitle">Service-Based Architecture (SBA) with AI/analytics overlay. AMF uses nextgcore-ngap with tokio::select! event loop. NRF issues real ES256/RS256 JWS access tokens. SEPP enforces AES-128-GCM PRINS. All 7 Rel-17 NFs register with NRF. nextgcore-app provides nf_common_init(); nextgcore-dbi and nextgcore-sbi carry cfg(feature = "6g-extensions") gates.</p>
+    <p class="section-subtitle">Service-Based Architecture (SBA) with AI/analytics overlay. NGAP and S1AP are encoded and decoded by codecs generated from the 3GPP ASN.1 (nextgcore-ngap-gen, nextgcore-s1ap-gen). NRF issues real ES256/RS256 JWS access tokens. SEPP enforces AES-128-GCM PRINS. The NWDAF, LMF, MB-SMF, NSACF, DCCF, NEF, EASDF, TSCTSF and UCMF register with the NRF; the EES registers with an ECS over EDGE-6 and the PIN server is application-layer only. nextgcore-dbi and nextgcore-sbi carry cfg(feature = "6g-extensions") gates.</p>
     <div class="arch-diagram">
       <div class="arch-layer">
         <div class="arch-label">AI &amp; Analytics</div>
         <div class="arch-nodes">
           <div class="arch-node ai-node">NWDAF</div>
-          <div class="arch-node ai-node">NWDAF-D</div>
           <div class="arch-node ai-node">DCCF</div>
           <div class="arch-node ai-node">EES</div>
           <div class="arch-node ai-node">LMF</div>
@@ -287,6 +304,10 @@
           <div class="arch-node">PCF</div>
           <div class="arch-node">NSSF</div>
           <div class="arch-node">BSF</div>
+          <div class="arch-node">NEF</div>
+          <div class="arch-node">EASDF</div>
+          <div class="arch-node">TSCTSF</div>
+          <div class="arch-node">UCMF</div>
         </div>
       </div>
       <div class="arch-connector">&#8597; SBI (HTTP/2 + JSON + TLS) &#8597;</div>
@@ -315,6 +336,7 @@
           <div class="arch-node epc">SGW-U</div>
           <div class="arch-node epc">HSS</div>
           <div class="arch-node epc">PCRF</div>
+          <div class="arch-node epc">PGW-C/U</div>
         </div>
       </div>
     </div>
@@ -366,7 +388,7 @@
 
     <!-- Handover Flow -->
     <h3 class="group-heading">3. Xn Handover (TS 23.502 §4.9.1)</h3>
-    <p class="wf-desc">Intra-AMF handover with path switch, GTP tunnel update, and seamless session continuity. AMF dispatches NGAP handover procedures by procedure code: HandoverRequired (0), HandoverCommand (1), HandoverPreparationFailure (3), PathSwitchRequest (25), HandoverCancel (27).</p>
+    <p class="wf-desc">Intra-AMF handover with path switch, GTP tunnel update, and session continuity. The AMF handles the N2 handover family (Handover Required/Request/Command/Notify/Cancel, Preparation and Handover Failure, RAN Status Transfer) and Path Switch, all on the generated NGAP codec.</p>
     <div class="workflow-diagram">
       <div class="workflow-step"><span class="wf-actor">UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">RRC: MeasurementReport (neighbor cell RSRP > serving + hysteresis)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Source gNB</span></div>
       <div class="workflow-step"><span class="wf-actor">Source gNB</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Xn: HandoverRequest (UE context, PDU sessions, security keys, target cell ID)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Target gNB</span></div>
@@ -398,23 +420,23 @@
     <div class="workflow-diagram">
       <div class="workflow-step"><span class="wf-actor">UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Registration Request (Requested NSSAI: SST=1/SD=0x010203 eMBB, SST=2 URLLC)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF</span></div>
       <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Nnssf_NSSelection (Requested NSSAI, TAI, PLMN) → Allowed NSSAI, AMF set for each slice</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">NSSF</span></div>
-      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Nnsacf_UEAdmission (SUPI, S-NSSAI=SST:1) → check per-slice quota</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">NSACF</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Nnsacf_NSAC_NumOfUEsUpdate (SUPI, S-NSSAI=SST:1) → check per-slice quota</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">NSACF</span></div>
       <div class="workflow-step"><span class="wf-actor">NSACF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Quota check: SST=1 → 150 UEs / 200 max, 89 PDU sessions / 500 max → ADMITTED, counters incremented</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF</span></div>
-      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Nnsacf_UEAdmission (SUPI, S-NSSAI=SST:2) → SST=2: 200 UEs / 200 max → REJECTED (QUOTA_EXCEEDED)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">NSACF</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Nnsacf_NSAC_NumOfUEsUpdate (SUPI, S-NSSAI=SST:2) → SST=2: 200 UEs / 200 max → REJECTED (QUOTA_EXCEEDED)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">NSACF</span></div>
       <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Registration Accept: Allowed NSSAI = [SST=1/SD=0x010203], Rejected NSSAI = [SST=2, cause: QUOTA]</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UE</span></div>
-      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">On UE deregistration: Nnsacf_UERelease → counters decremented, slot freed for next UE</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">NSACF</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">On UE deregistration: Nnsacf_NSAC_NumOfUEsUpdate (decrease) → counters decremented, slot freed for next UE</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">NSACF</span></div>
     </div>
 
     <!-- Edge Relocation Flow -->
     <h3 class="group-heading">6. Edge Application Relocation (TS 23.558)</h3>
-    <p class="wf-desc">Seamless MEC edge relocation with EAS discovery, context preservation, and traffic re-routing.</p>
+    <p class="wf-desc">Edge relocation with EAS discovery and Application Context Relocation (ACR) over the <code>eees-*</code> APIs (TS 29.558 / TS 24.558). ACR notification delivery to EAS/EEC peers is a logged stub in this stack.</p>
     <div class="workflow-diagram">
       <div class="workflow-step"><span class="wf-actor">UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Mobility event: TAC changes from 0x01 to 0x02 (detected by AMF via Tracking Area Update)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF</span></div>
       <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Location change notification → EES evaluates if current EAS is still optimal</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">EES</span></div>
-      <div class="workflow-step"><span class="wf-actor">EES</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">POST /nees-easdiscovery/v1/discover (app_id="ar-nav", TAC=0x02) → ranked EAS list by distance score</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Discovery</span></div>
+      <div class="workflow-step"><span class="wf-actor">EES</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">POST /eees-easdiscovery/v1/eas-profiles/request-discovery (EasDiscoveryReq: acId="ar-nav", service area TAC=0x02) → matching EAS profiles</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Discovery</span></div>
       <div class="workflow-step"><span class="wf-actor">EES</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Best match: EAS "edge-east-2" (type: AR, compute: 80%, distance_score: 0.92, TAC: 0x02)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Selected</span></div>
-      <div class="workflow-step"><span class="wf-actor">EES</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">GET /nees-uecontexttransfer/v1/contexts/{supi} → fetch UE app state from old EAS (session data, model weights, UI state)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Old EAS</span></div>
-      <div class="workflow-step"><span class="wf-actor">EES</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">PATCH /nees-uecontexttransfer/v1/contexts/{supi} → transfer context to new EAS</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">New EAS</span></div>
+      <div class="workflow-step"><span class="wf-actor">EES</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">eees-appctxtreloc: Determine / Initiate ACR for (EEC, source EAS) → target EAS selected</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Old EAS</span></div>
+      <div class="workflow-step"><span class="wf-actor">EES</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">eees-acrstatus-update / eees-acrevents: relocation progress reported to subscribers</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">New EAS</span></div>
       <div class="workflow-step"><span class="wf-actor">New EAS</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Context restored, app resumes — UE sees no interruption. SMF updates UL CL / ULCL rules</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UE</span></div>
     </div>
 
@@ -436,7 +458,7 @@
     <h3 class="group-heading">8. UE Positioning via LMF (TS 23.273)</h3>
     <p class="wf-desc">Multi-method positioning: LMF drives LPP (UE) and NRPPa (gNB) sessions through the AMF over N1N2 (TS 29.518), then computes the position from returned measurements with QoS-based accuracy.</p>
     <div class="workflow-diagram">
-      <div class="workflow-step"><span class="wf-actor">App / AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">POST /nlmf-location/v1/determine-location (SUPI, QoS=HIGH_ACCURACY, methods=[DL-TDOA, Multi-RTT])</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">LMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">App / AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">POST /nlmf-loc/v1/determine-location (SUPI, QoS=HIGH_ACCURACY, methods=[DL-TDOA, Multi-RTT])</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">LMF</span></div>
       <div class="workflow-step"><span class="wf-actor">LMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Namf_Communication_N1N2MessageTransfer (LPP RequestLocationInformation in n1MessageContainer, NRPPa MeasurementRequest in n2InfoContainer)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF</span></div>
       <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NGAP: DownlinkUEAssociatedNRPPaTransport to gNB + DL NAS Transport (LPP) to UE</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNB / UE</span></div>
       <div class="workflow-step"><span class="wf-actor">gNB / UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Uplink NRPPa MeasurementResponse + LPP ProvideLocationInformation (RSRP, timing advance, AoA, RTT) returned via AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">LMF</span></div>
@@ -487,13 +509,13 @@
 <section id="components">
   <div class="container">
     <h2 class="section-title">Components</h2>
-    <p class="section-subtitle">24 Network Functions and 17 shared libraries.</p>
+    <p class="section-subtitle">28 Network Functions (23 5GC/Rel-16+, 5 EPC), a WebUI, and 23 shared libraries.</p>
 
     <h3 class="group-heading">Core 5G Network Functions</h3>
     <div class="components-grid">
       <div class="component-card">
         <div class="component-header"><span class="component-name">AMF</span><span class="component-badge badge-core">Core</span></div>
-        <div class="component-desc">Access and Mobility Management — UE registration, authentication orchestration, connection management, NGAP handover dispatch (procedures 0,1,3,25,27). Uses nextgcore-ngap exclusively; async event loop via tokio::select!.</div>
+        <div class="component-desc">Access and Mobility Management — UE registration, authentication orchestration, connection management, paging and Service Request, N2/Xn handover, N26 toward an MME, PWS, RACS via the UCMF. NGAP is encoded and decoded by the generated codec (nextgcore-ngap-gen); the hand-written nextgcore-ngap types are still used beside it (#417).</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">SMF</span><span class="component-badge badge-core">Core</span></div>
@@ -505,7 +527,7 @@
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">NRF</span><span class="component-badge badge-core">Core</span></div>
-        <div class="component-desc">NF Repository — Service discovery, profiles, OAuth2 JWT with RS256/ES256 JWS signing, health monitoring. All 7 Rel-17 NFs (NWDAF, EES, LMF, MBSMF, NSACF, PIN, DCCF) register with NRF. Verifies Client Credentials Assertions (CCA-JWS, ES256) per TS 33.501 §13.3.8.3.</div>
+        <div class="component-desc">NF Repository — Service discovery, profiles, OAuth2 JWT with RS256/ES256 JWS signing, health monitoring. A 404 heartbeat makes an NF re-register. Verifies Client Credentials Assertions (CCA-JWS, ES256) per TS 33.501 §13.3.8.3.</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">AUSF</span><span class="component-badge badge-core">Core</span></div>
@@ -530,6 +552,22 @@
       <div class="component-card">
         <div class="component-header"><span class="component-name">BSF</span><span class="component-badge badge-core">Core</span></div>
         <div class="component-desc">Binding Support — PCF binding discovery, session binding for policy consistency.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">NEF</span><span class="component-badge badge-core">Core</span></div>
+        <div class="component-desc">Network Exposure (TS 23.501 §6.2.5) — exposes 5GC event services to external AFs over the TS 29.122 APIs. Never sends a SUPI to an AF; OAuth2/mTLS caller authentication is opt-in.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">EASDF</span><span class="component-badge badge-core">Edge</span></div>
+        <div class="component-desc">Edge Application Server Discovery (TS 23.548, TS 29.556) — Neasdf_DNSContext create/update/delete and DNS handling rules reported to the SMF; UDP/53 DNS listener behind the <code>dns-udp</code> feature.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">TSCTSF</span><span class="component-badge badge-core">TSN</span></div>
+        <div class="component-desc">Time Sensitive Communication and Time Synchronization (TS 23.501 §5.27-5.28, TS 29.565) — Ntsctsf_TimeSynchronization, QoS and ASTI services; derives PMIC/UMIC/TSCAI and authorises with the PCF.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">UCMF</span><span class="component-badge badge-core">RACS</span></div>
+        <div class="component-desc">UE radio Capability Management (TS 23.501 §5.4.4.1a) — Nucmf_UECapabilityManagement (TS 29.673) and Nucmf_Provisioning (TS 29.675); assigns PLMN-assigned UE Radio Capability IDs and transcodes between TS 38.331 and TS 36.331.</div>
       </div>
     </div>
 
@@ -560,10 +598,6 @@
         <div class="component-desc">Personal IoT Networks: device group management, PEGC gateways, capability discovery, relay path management.</div>
       </div>
       <div class="component-card">
-        <div class="component-header"><span class="component-name">NWDAF-D (module)</span><span class="component-badge badge-6g">AI</span></div>
-        <div class="component-desc">NWDAF Data Collector — the data-collection module inside the nextgcore-nwdafd binary (not a separate NF). Collects UE measurements, NF load metrics, and cell telemetry; feeds the NWDAF analytics engine via internal event bus.</div>
-      </div>
-      <div class="component-card">
         <div class="component-header"><span class="component-name">DCCF</span><span class="component-badge badge-6g">Analytics</span></div>
         <div class="component-desc">Data Collection Coordination Function (TS 23.288) — coordinates data collection across multiple analytics consumers, manages data exposure subscriptions, and brokers NWDAF analytics requests at scale.</div>
       </div>
@@ -581,7 +615,7 @@
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">WebUI</span><span class="component-badge badge-support">Ops</span></div>
-        <div class="component-desc">Subscriber dashboard: CRUD for profiles, security contexts, QoS config. MongoDB backend.</div>
+        <div class="component-desc">Subscriber dashboard: CRUD for profiles, security contexts, QoS config. MongoDB backend. No default account: the Node WebUI's first admin is created with <code>node server/bin/create-admin.js</code>; the Rust <code>nextgcore-webui</code> listens on 127.0.0.1:3000 and requires an API token (<code>--api-token-file</code>).</div>
       </div>
     </div>
 
@@ -589,7 +623,7 @@
     <div class="components-grid">
       <div class="component-card">
         <div class="component-header"><span class="component-name">MME</span><span class="component-badge badge-epc">EPC</span></div>
-        <div class="component-desc">Mobility Management Entity — LTE attach, TAU, S1-MME.</div>
+        <div class="component-desc">Mobility Management Entity — LTE attach, TAU, paging, S1 and X2 handover, S1-MME over kernel SCTP with the generated S1AP codec, N26 toward an AMF.</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">SGW-C</span><span class="component-badge badge-epc">EPC</span></div>
@@ -607,9 +641,13 @@
         <div class="component-header"><span class="component-name">PCRF</span><span class="component-badge badge-epc">EPC</span></div>
         <div class="component-desc">Policy and Charging Rules — Diameter Gx/Rx.</div>
       </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">PGW-C / PGW-U</span><span class="component-badge badge-epc">EPC</span></div>
+        <div class="component-desc">Not separate binaries: <code>nextgcore-smfd</code> and <code>nextgcore-upfd</code> in their EPC roles (S5/S8 GTPv2-C, Sxb PFCP, SGi).</div>
+      </div>
     </div>
 
-    <h3 class="group-heading">Shared Libraries (17)</h3>
+    <h3 class="group-heading">Shared Libraries (23)</h3>
     <div class="components-grid">
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgcore-sbi</span><span class="component-badge badge-lib">Lib</span></div>
@@ -621,7 +659,7 @@
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgcore-ngap</span><span class="component-badge badge-lib">Lib</span></div>
-        <div class="component-desc">NGAP ASN.1 PER codec for AMF-gNB signaling.</div>
+        <div class="component-desc">Hand-written NGAP message types and builders for AMF-gNB signaling, on top of nextgcore-asn1c. Being replaced by nextgcore-ngap-gen (#417).</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgcore-pfcp</span><span class="component-badge badge-lib">Lib</span></div>
@@ -649,7 +687,7 @@
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgcore-app</span><span class="component-badge badge-lib">Lib</span></div>
-        <div class="component-desc">CLI, YAML config, signal handling, NF lifecycle. Provides nf_common_init() helper used by all NFs. cfg(feature = "6g-extensions") gates for optional 6G capabilities.</div>
+        <div class="component-desc">CLI, YAML config, signal handling, NF lifecycle, and an nf_common_init() helper. cfg(feature = "6g-extensions") gates for optional 6G capabilities.</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgcore-crypt</span><span class="component-badge badge-lib">Lib</span></div>
@@ -657,11 +695,11 @@
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgcore-sctp</span><span class="component-badge badge-lib">Lib</span></div>
-        <div class="component-desc">SCTP transport for NGAP/S1AP signaling.</div>
+        <div class="component-desc">SCTP transport for NGAP/S1AP: userspace sctp-proto over UDP (default) and native Linux kernel SCTP (<code>kernel</code> feature).</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgcore-asn1c</span><span class="component-badge badge-lib">Lib</span></div>
-        <div class="component-desc">ASN.1 PER codecs — NGAP (TS 38.413), S1AP (TS 36.413) and NRPPa (TS 38.455) in APER, plus LPP (TS 37.355, UPER) including A-GNSS assistance data. No E1AP, F1AP or XnAP codec.</div>
+        <div class="component-desc">Hand-written APER engine and NGAP codec under nextgcore-ngap. Its S1AP, NRPPa, LPP, E1AP, F1AP and XnAP modules were deleted in favour of the generated codecs; the rest goes with #417.</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgcore-ipfw</span><span class="component-badge badge-lib">Lib</span></div>
@@ -673,13 +711,38 @@
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgcore-s1ap</span><span class="component-badge badge-lib">Lib</span></div>
-        <div class="component-desc">S1AP message building/parsing for eNodeB–MME (TS 36.413), APER-encoded via nextgcore-asn1c.</div>
+        <div class="component-desc">S1AP domain types for eNodeB–MME (TS 36.413). Carries no codec: every S1AP PDU goes through nextgcore-s1ap-gen.</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">nextgcore-tun</span><span class="component-badge badge-lib">Lib</span></div>
         <div class="component-desc">TUN/TAP device management (Linux, macOS utun) for the UPF/SGW-U user plane.</div>
       </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgcore-ngap-gen</span><span class="component-badge badge-lib">Generated</span></div>
+        <div class="component-desc">NGAP APER codec generated from the TS 38.413 V17.9.0 ASN.1.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgcore-s1ap-gen</span><span class="component-badge badge-lib">Generated</span></div>
+        <div class="component-desc">S1AP APER codec generated from the TS 36.413 V19.2.0 ASN.1.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgcore-nrppa-gen</span><span class="component-badge badge-lib">Generated</span></div>
+        <div class="component-desc">NRPPa APER codec generated from the TS 38.455 V19.2.0 ASN.1 (LMF).</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgcore-lpp-gen</span><span class="component-badge badge-lib">Generated</span></div>
+        <div class="component-desc">LPP UPER codec generated from the TS 37.355 V19.3.0 ASN.1 (LMF).</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgcore-nr-rrc-gen</span><span class="component-badge badge-lib">Generated</span></div>
+        <div class="component-desc">NR RRC UPER codec generated from the TS 38.331 V19.3.0 ASN.1 (UCMF capability transcoding).</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">nextgcore-lte-rrc-gen</span><span class="component-badge badge-lib">Generated</span></div>
+        <div class="component-desc">E-UTRA RRC UPER codec generated from the TS 36.331 V19.4.0 ASN.1 (UCMF capability transcoding).</div>
+      </div>
     </div>
+    <p class="section-subtitle" style="margin-top:1rem;">The generated crates are compiled by <a href="https://github.com/NextgCoreLab/asn1-codegen">NextgCoreLab/asn1-codegen</a>, pinned by rev in <code>src/Cargo.toml</code>; each crate's <code>asn/PROVENANCE.md</code> records its schema source.</p>
   </div>
 </section>
 
@@ -696,7 +759,7 @@
 <span class="cmd">git clone https://github.com/NextgCoreLab/nextgcore.git</span>
 <span class="cmd">cd nextgcore/src</span>
 
-<span class="comment"># Build all 24 NFs (release mode)</span>
+<span class="comment"># Build all 28 NFs + the WebUI (release mode; needs a C compiler and cmake)</span>
 <span class="cmd">cargo build --release</span>
 
 <span class="comment"># Binaries are in target/release/</span>
@@ -706,23 +769,28 @@
     <h3 class="group-heading">Docker Compose</h3>
     <div class="code-block">
       <button class="copy-btn">Copy</button>
-      <code><span class="comment"># Start all 24 NF services (5GC + RAN) + observability</span>
-<span class="comment"># Includes Rel-17 NFs: NWDAF, NWDAF-D, DCCF, EES, LMF, MBSMF, NSACF, PIN</span>
+      <code><span class="comment"># Start 20 5GC NFs + nextgsim gNB/UE + MongoDB + observability</span>
+<span class="comment"># Includes NWDAF, DCCF, EES, LMF, MBSMF, NSACF, UCMF, PIN, SCP, SEPP</span>
 <span class="cmd">cd docker/rust</span>
 <span class="cmd">docker compose up -d</span>
 
-<span class="comment"># Check all services are running (expect 25 containers)</span>
+<span class="comment"># Check all services are running (expect 26 containers)</span>
 <span class="cmd">docker compose ps</span>
 
-<span class="comment"># Run E2E tests</span>
-<span class="cmd">bash e2e-test.sh</span></code>
+<span class="comment"># Run E2E tests, then the 0.2.0 UE flows against the kept stack</span>
+<span class="cmd">bash e2e-test.sh --keep</span>
+<span class="cmd">bash ue-flow-check.sh all</span>
+
+<span class="comment"># 4G EPC with nextgsim's LTE eNB/UE (separate stack)</span>
+<span class="cmd">docker compose -f docker-compose-epc.yml up -d</span>
+<span class="cmd">bash epc-attach-check.sh 10.45.0.1 20</span></code>
     </div>
 
     <h3 class="group-heading">Configuration Layout &amp; One-Command E2E</h3>
     <div class="code-block">
       <button class="copy-btn">Copy</button>
-      <code><span class="comment"># Per-NF YAML configs live in configs/ (amf.yaml, smf.yaml, upf.yaml, ...)</span>
-<span class="cmd">ls configs/</span>
+      <code><span class="comment"># Per-NF YAML configs live in docker/rust/configs/ (5gc/amf.yaml, 5gc/smf.yaml, epc/mme.yaml, ...)</span>
+<span class="cmd">ls docker/rust/configs/5gc docker/rust/configs/epc</span>
 
 <span class="comment"># One-command Docker E2E: build + start 5GC + matched RAN simulator + run suite</span>
 <span class="cmd">cd docker/rust &amp;&amp; bash e2e.sh</span>
@@ -731,23 +799,21 @@
 <span class="cmd">bash e2e-test.sh --no-build --keep</span></code>
     </div>
 
-    <h3 class="group-heading">Kubernetes (Production)</h3>
+    <h3 class="group-heading">Kubernetes (Kind), Helm and EKS</h3>
     <div class="code-block">
       <button class="copy-btn">Copy</button>
-      <code><span class="comment"># Deploy to K8s cluster (16 pods)</span>
+      <code><span class="comment"># Kind: 10 5GC NFs + MongoDB (manifests in k8s/manifests)</span>
 <span class="cmd">cd k8s && bash deploy.sh</span>
-
-<span class="comment"># Verify all pods running</span>
-<span class="cmd">kubectl get pods -n nextgcore</span>
-
-<span class="comment"># Run full E2E suite (70 tests)</span>
+<span class="cmd">kubectl get pods -n nextg-system</span>
 <span class="cmd">bash e2e-test.sh</span>
 
-<span class="comment"># Check Prometheus metrics</span>
-<span class="cmd">curl http://amf:9090/metrics | head</span>
+<span class="comment"># Helm chart for the same 5GC control plane</span>
+<span class="cmd">helm install nextg deploy/helm/nextgcore -n nextg-system --wait</span>
+
+<span class="comment"># EKS: see deploy/eks/README.md (PROFILE=5g; e2e-internet.sh checks UE-to-internet)</span>
 
 <span class="comment"># View traces in Jaeger</span>
-<span class="cmd">kubectl port-forward svc/jaeger 16686:16686</span></code>
+<span class="cmd">kubectl port-forward -n nextg-system svc/jaeger 16686:16686</span></code>
     </div>
   </div>
 </section>
@@ -756,7 +822,7 @@
 <section id="contributing">
   <div class="container">
     <h2 class="section-title">Contributing</h2>
-    <p class="section-subtitle">We welcome contributions of all kinds. The full guide takes you from a clean machine to a merged PR: environment setup, building the <code>src/</code> workspace, unit and Docker E2E testing, the zero-warning style gate, 3GPP spec-reference rules, conventional commits with DCO sign-off, and the review process.</p>
+    <p class="section-subtitle">We welcome contributions of all kinds. The full guide takes you from a clean machine to a merged PR: environment setup, building the <code>src/</code> workspace, unit and Docker E2E testing, the fmt/clippy/all-features style gate, 3GPP spec-reference rules, conventional commits with DCO sign-off, and the review process.</p>
     <div class="hero-buttons" style="justify-content:center;">
       <a href="contributing.html" class="btn btn-primary">Read the Contributing Guide</a>
       <a href="https://github.com/NextgCoreLab/nextgcore/blob/main/CONTRIBUTING.md" class="btn btn-secondary">CONTRIBUTING.md</a>

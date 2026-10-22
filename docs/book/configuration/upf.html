@@ -15,8 +15,8 @@
         <link rel="icon" href="../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../css/general-0392ca55.css">
-        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
         <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-10d7638c.js";
+            window.path_to_searchindex_js = "../searchindex-c2411517.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-1b88980e.js"></script>
+        <script src="../toc-be5dca41.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -180,7 +180,7 @@
                         <h1 id="upf-configuration"><a class="header" href="#upf-configuration">UPF Configuration</a></h1>
 <p>The UPF (User Plane Function, <code>nextgcore-upfd</code>) terminates the N4/PFCP interface toward the SMF and the N3/GTP-U interface toward the gNB, and forwards user traffic through a TUN device.</p>
 <blockquote>
-<p><strong>Important — how the UPF is actually configured:</strong> unlike most other NextGCore NFs, <code>nextgcore-upfd</code> currently takes its runtime settings from <strong>command-line flags</strong>, not from the YAML file. The <code>-c/--config</code> flag points at a YAML file, and if that file exists the daemon reads it — but it only logs the file size (<code>main.rs</code>, “Configuration file loaded (N bytes)”) and <strong>does not deserialize or apply any of its contents</strong>. There is no <code>#[derive(Deserialize)]</code> config struct in the UPF binary. The entire YAML file is therefore parsed-but-inert today; it is shipped for deployment-layout consistency with the other NFs (Docker/k8s/Helm mount it), and CLI flags are the source of truth.</p>
+<p><strong>Important — how the UPF is actually configured:</strong> unlike most other NextGCore NFs, <code>nextgcore-upfd</code> currently takes its runtime settings from <strong>command-line flags</strong>, not from the YAML file. The <code>-c/--config</code> flag points at a YAML file, and if that file exists the daemon reads it — but it only logs the file size at <code>debug</code> level (<code>main.rs</code>, “Configuration file loaded (N bytes)”) and <strong>does not deserialize or apply any of its contents</strong>. There is no <code>#[derive(Deserialize)]</code> config struct in the UPF binary. The entire YAML file is therefore parsed-but-inert today; it is shipped for deployment-layout consistency with the other NFs (Docker/k8s/Helm mount it), and CLI flags are the source of truth.</p>
 </blockquote>
 <h2 id="example-yaml-dockerrustconfigs5gcupfyaml"><a class="header" href="#example-yaml-dockerrustconfigs5gcupfyaml">Example YAML (<code>docker/rust/configs/5gc/upf.yaml</code>)</a></h2>
 <p>This is the file mounted in the Docker E2E deployment. Every key below is currently ignored by the daemon (see note above):</p>
@@ -239,7 +239,7 @@ upf:
 <tr><td><code>-l, --log-file</code></td><td>string</td><td><em>(none)</em></td><td>Log file path.</td></tr>
 <tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level: <code>trace</code>, <code>debug</code>, <code>info</code>, <code>warn</code>, <code>error</code>.</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>bool</td><td><code>false</code></td><td>Disable colored log output.</td></tr>
-<tr><td><code>-k, --kill</code></td><td>bool</td><td><code>false</code></td><td>Kill a running instance (currently logs intent and exits).</td></tr>
+<tr><td><code>-k, --kill</code></td><td>bool</td><td><code>false</code></td><td>Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor.</td></tr>
 <tr><td><code>--pfcp-addr</code></td><td>string</td><td><code>127.0.0.4</code></td><td>N4 PFCP server bind address.</td></tr>
 <tr><td><code>--pfcp-port</code></td><td>u16</td><td><code>8805</code></td><td>N4 PFCP server port.</td></tr>
 <tr><td><code>--gtpu-addr</code></td><td>string</td><td><code>127.0.0.4</code></td><td>N3 GTP-U bind address.</td></tr>
@@ -260,6 +260,7 @@ upf:
 <tr><th>Variable</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
+<tr><td><code>UPF_METRICS_PORT</code></td><td><code>9090</code></td><td>Prometheus <code>/metrics</code> port (bound on <code>0.0.0.0</code>), including the TUN-path data-plane counters (#581).</td></tr>
 <tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td><code>http://jaeger:4317</code></td><td>OTLP endpoint for OpenTelemetry tracing (initialization is best-effort; failure is ignored).</td></tr>
 </tbody>
 </table>
@@ -267,7 +268,8 @@ upf:
 <h2 id="behavior-notes"><a class="header" href="#behavior-notes">Behavior notes</a></h2>
 <ul>
 <li><strong>PFCP heartbeats:</strong> the UPF also initiates PFCP heartbeats toward the associated CP function every 10 seconds (code comment cites TS 29.244 §6.2.2: either node may initiate).</li>
-<li><strong>Reports:</strong> the data plane emits Downlink Data Reports (on first buffered downlink packet) and Error Indication Reports over N4.</li>
+<li><strong>Reports:</strong> the data plane emits Downlink Data Reports (on first buffered downlink packet) and Error Indication Reports over N4. URRs provisioned by the SMF are measured and enforced (Volume/Time Quota, #80), Usage Reports are sent, and an explicit Query URR IE is honoured (#428).</li>
+<li><strong>EPC role:</strong> the EPC compose runs a dedicated upfd as PGW-U (<code>docker/rust/configs/epc/pgwu.yaml</code>, which it does not parse either; the flags in <code>docker-compose-epc.yml</code> drive it).</li>
 <li><strong>Validation status:</strong> UPF behavior has been exercised in the project’s matched-simulator Docker E2E suite (UE→UPF GTP-U traffic). This is internal test validation, not third-party conformance certification.</li>
 </ul>
 <h2 id="parsed-but-inert-summary"><a class="header" href="#parsed-but-inert-summary">Parsed-but-inert summary</a></h2>
@@ -282,8 +284,8 @@ upf:
 <tr><td><code>upf.pfcp.server</code></td><td>Ignored — use <code>--pfcp-addr</code> / <code>--pfcp-port</code>.</td></tr>
 <tr><td><code>upf.gtpu.server</code></td><td>Ignored — use <code>--gtpu-addr</code> / <code>--gtpu-port</code>.</td></tr>
 <tr><td><code>upf.session</code></td><td>Ignored — use <code>--tun-ifname</code> / <code>--tun-ip</code> / <code>--tun-prefix</code> (single IPv4 subnet only via CLI; the YAML’s IPv6 entry has no CLI equivalent).</td></tr>
-<tr><td><code>upf.metrics.server</code></td><td>Ignored by the UPF binary.</td></tr>
-<tr><td><code>upf.tls.*</code></td><td>Ignored by the UPF binary; the deployment’s TLS switch is the <code>TLS_ENABLED</code> / <code>SBI_SCHEME</code> compose environment, per the file’s own comment.</td></tr>
+<tr><td><code>upf.metrics.server</code></td><td>Ignored — use <code>UPF_METRICS_PORT</code>.</td></tr>
+<tr><td><code>upf.tls.*</code></td><td>Ignored. The file’s comment names <code>TLS_ENABLED</code> / <code>SBI_SCHEME</code>, but no code reads them; the UPF serves no SBI listener (it is only an NRF client when <code>--nrf-uri</code> is set).</td></tr>
 </tbody>
 </table>
 </div>
@@ -336,7 +338,7 @@ upf:
 
         <script src="../clipboard-1626706a.min.js"></script>
         <script src="../highlight-abc7f01d.js"></script>
-        <script src="../book-c22b7243.js"></script>
+        <script src="../book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

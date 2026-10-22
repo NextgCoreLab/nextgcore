@@ -55,8 +55,8 @@ cargo +nightly fuzz run fuzz_pfcp_message -- -max_total_time=60
 # Run with 4 parallel jobs
 cargo +nightly fuzz run fuzz_pfcp_message -- -jobs=4 -workers=4
 
-# Run with specific dictionary
-cargo +nightly fuzz run fuzz_pfcp_message -- -dict=dictionaries/pfcp.dict
+# Run with a libFuzzer dictionary (none ship with the repo)
+cargo +nightly fuzz run fuzz_pfcp_message -- -dict=/path/to/pfcp.dict
 ```
 
 ### Check coverage
@@ -100,3 +100,5 @@ mkdir -p corpus/fuzz_pfcp_message/
 - 5G NAS: 3GPP TS 24.501
 - EPS NAS: 3GPP TS 24.301
 - Diameter: RFC 6733, 3GPP TS 29.272/273/212/214/229
+- NGAP: 3GPP TS 38.413; S1AP: 3GPP TS 36.413
+- NRPPa: 3GPP TS 38.455; LPP: 3GPP TS 37.355

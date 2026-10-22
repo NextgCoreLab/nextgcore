@@ -2,7 +2,7 @@
 
 > Generated: 2026-02-07 | Scope: 9 infrastructure libraries under nextgcore/src/libs/
 
-> **Partial staleness (2026-07):** Most entries here remain accurate, with corrections: `nextgcore-dbi` is now consumed by `nextgcore-udrd` (in-memory Nudr `data_store` via the `test-helpers` feature), so it is no longer unused. Note: SBI TLS/mTLS + OAuth2 and the NGAP/S1AP/PFCP protocol codecs are covered in gap-libs-proto.md, which is now substantially out of date - see its notice. Post-quantum crypto is still absent (`nextgcore-crypt` remains 0% PQC).
+> **Partial staleness (updated 2026-10, pre-0.2.0):** The module counts and percentages below are the 2026-02-07 snapshot. Corrections: `nextgcore-dbi` is consumed by `nextgcore-udrd` (in-memory Nudr `data_store` via the `test-helpers` feature), so it is not unused. There is no `nextgcore-ffi` crate in this repository (`ls src/libs`); its row and section describe nothing that ships. `nextgcore-crypt` is not "0% PQC": it has `ml_kem.rs` (FIPS 203), `ml_dsa.rs` and `hybrid.rs` modules, and since 0.1.0 TUAK (TS 35.231) and key zeroization (#331); SBI TLS can negotiate hybrid X25519MLKEM768 behind the `pqc-tls` feature (#30). `nextgcore-core` gained the shared `state_store` the persisting NFs use. `nextgcore-metrics`' `MetricsServer` is still a stub, but `nes_energy::serve_metrics` serves `/metrics` for smfd, upfd and sgwud (see the Observability chapter of the book). The UPF still does not use `nextgcore-tun`. SBI TLS/mTLS + OAuth2 and the protocol codecs are covered in gap-libs-proto.md; see its notice.
 
 ---
 
@@ -14,7 +14,7 @@
 | nextgcore-app | Application framework (config, init) | 4 | **80%** | Low |
 | nextgcore-crypt | 3GPP cryptographic algorithms | 10 | **80%** | Low |
 | nextgcore-dbi | MongoDB database interface | 5 | **70%** | Low |
-| nextgcore-ffi | FFI bindings for C comparison testing | 2 | **90%** | N/A |
+| nextgcore-ffi | FFI bindings for C comparison testing (not in this repository) | — | — | N/A |
 | nextgcore-metrics | Prometheus metrics collection | 5 | **75%** | Medium |
 | nextgcore-tun | TUN/TAP device management | 4 | **80%** | Low |
 | nextgcore-ipfw | IP firewall rule parsing | 3 | **85%** | Low |
@@ -131,7 +131,7 @@
 
 ## 5. nextgcore-ffi -- FFI Bindings
 
-Testing utility for C comparison. Provides stub bindings by default, optional generated bindings.
+Not present in this repository (`src/libs/` has no such crate). The original snapshot described it as a testing utility for C comparison. Provides stub bindings by default, optional generated bindings.
 
 ### Completeness: **90%** | N/A for 6G
 
