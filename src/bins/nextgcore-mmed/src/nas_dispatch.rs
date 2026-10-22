@@ -1237,6 +1237,20 @@ pub fn continue_inter_system_tau(ctx: &MmeContext, mme_ue_id: u64, enb_ue_id: u6
     }
 }
 
+/// #702: a SERVICE REJECT ends the service request procedure, so the MME releases
+/// the S1 connection it rode on: UE Context Release Command, cause NAS
+/// normal-release (TS 23.401 §5.3.4.1, TS 36.413 §8.3.3).
+///
+/// Both causes sent here (#9, #40) make the UE re-attach once its NAS signalling
+/// connection is released (TS 24.301 §5.6.1.5). Without this release the UE
+/// waited for its local T3440 (10 s), and the eNB kept an S1 UE connection that
+/// nothing would use again. The UE context goes too: after #9 it is a context for
+/// an identity the network cannot derive, and after #40 the UE re-attaches.
+/// Only the `enb_ue_pool` is locked, so this is safe under an `mme_ue_pool` guard.
+fn release_after_service_reject(ctx: &MmeContext, enb_ue: &EnbUe) {
+    release_ue_context_with_cause(ctx, enb_ue, s1ap_build::nas_cause::NORMAL_RELEASE);
+}
+
 fn emm_service_request(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, pdu: &[u8]) {
     // TS 24.301 §8.2.25: SERVICE REQUEST is 4 octets — header, KSI and sequence
     // number, then a 2-octet short MAC.
@@ -1275,6 +1289,7 @@ fn emm_service_request(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, pdu: &[
         ) {
             log::error!("Service Reject send failed: {e}");
         }
+        release_after_service_reject(ctx, enb_ue);
         return;
     }
     if std::mem::take(&mut mme_ue.mac_failed) {
@@ -1304,6 +1319,7 @@ fn emm_service_request(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, pdu: &[
         ) {
             log::error!("Service Reject send failed: {e}");
         }
+        release_after_service_reject(ctx, enb_ue);
         return;
     }
 
@@ -3207,6 +3223,31 @@ mod tests {
                 .is_some(),
             "an ATTACH/AUTHENTICATION-class message may arrive unprotected"
         );
+    }
+
+    /// #702: a SERVICE REQUEST the MME cannot verify is rejected with #9 AND its S1
+    /// connection released (NAS normal-release), so the UE re-attaches at once
+    /// instead of after its own T3440.
+    #[test]
+    fn test_a_service_reject_releases_the_s1_connection() {
+        let ctx = test_ctx();
+        let enb_ue_id = enb_with_connection(&ctx);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+        ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
+
+        // Security header type 12 (SERVICE REQUEST), KSI 0 / seq 1, short MAC.
+        // No security context exists for this UE, so it cannot be verified (#9).
+        let pdu = vec![0xC7, 0x01, 0xAB, 0xCD];
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &pdu));
+
+        let enb_ue = ctx.enb_ue_find_by_id(enb_ue_id).unwrap();
+        assert_eq!(
+            enb_ue.ue_ctx_rel_action,
+            UeCtxRelAction::UeContextRemove,
+            "the S1 connection must be released after SERVICE REJECT"
+        );
+        assert_eq!(enb_ue.relcause.group, S1apCauseGroup::Nas);
+        assert_eq!(enb_ue.relcause.cause, s1ap_build::nas_cause::NORMAL_RELEASE);
     }
 
     /// #688: DETACH ACCEPT completes a network-initiated detach: T3422 stops
