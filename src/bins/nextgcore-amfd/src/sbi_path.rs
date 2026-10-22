@@ -4531,6 +4531,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_amf_sbi_open_close() {
+        // `amf_sbi_close` clears the process-wide discovery cache and client pool,
+        // which `sm_context_create_reaches_an_smf_restarted_at_a_new_address`
+        // seeds and reads: serialise against it (#673).
+        let _guard = AMF_NRF_URI_TEST_LOCK.lock().await;
         assert!(amf_sbi_open().is_ok());
         amf_sbi_close();
     }
