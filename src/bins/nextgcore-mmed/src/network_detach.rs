@@ -130,6 +130,52 @@ pub fn complete_mme_initiated_detach(ctx: &MmeContext, mme_ue_id: u64) -> bool {
     in_detach
 }
 
+/// TS 23.007 §15 (#689): the Serving GW at `restarted` lost its contexts.
+///
+/// Every UE with a PDN connection established through it is detached with
+/// "re-attach required" (or implicitly, when idle). "Established" means the SGW's
+/// S11 TEID is recorded for the UE. A Create Session still in flight to the
+/// restarted SGW is not counted: its response comes from the new incarnation and
+/// is applied after this runs.
+///
+/// The MME does not record a per-UE SGW. Every request goes to `sgw_in_use`, the
+/// first configured `sgwc` (TS 23.401 §4.3.8.1 selection is not implemented). So
+/// a restart of a peer that is not that SGW detaches nobody. Returns the number
+/// of UEs detached.
+pub fn sgw_restarted(
+    ctx: &MmeContext,
+    sgw_in_use: Option<std::net::SocketAddr>,
+    restarted: std::net::IpAddr,
+) -> usize {
+    if sgw_in_use.map(|a| a.ip()) != Some(restarted) {
+        log::info!(
+            "S11 peer {restarted} restarted, but it is not the Serving GW this MME uses \
+             ({sgw_in_use:?}); no UE is affected"
+        );
+        return 0;
+    }
+    let affected: Vec<u64> = {
+        let pool = ctx.mme_ue_pool.read().unwrap();
+        pool.iter()
+            .filter(|(_, ue)| ue.nas_eps.type_ != MmeEpsType::DetachRequestToUe)
+            .filter(|(_, ue)| {
+                ctx.sgw_ue_find_by_id(ue.sgw_ue_id)
+                    .is_some_and(|s| s.sgw_s11_teid != 0)
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    };
+    for id in &affected {
+        mme_initiated_detach(
+            ctx,
+            *id,
+            DetachTypeToUe::ReAttachRequired,
+            &format!("a restart of its Serving GW {restarted} (TS 23.007 §15)"),
+        );
+    }
+    affected.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,5 +286,50 @@ mod tests {
         let (_, mme_ue_id, _) = attached_ue(&ctx, true);
         assert!(!complete_mme_initiated_detach(&ctx, mme_ue_id));
         assert!(ctx.mme_ue_find_by_id(mme_ue_id).is_some());
+    }
+
+    #[test]
+    fn a_restart_of_the_sgw_in_use_detaches_its_ues_re_attach_required() {
+        let ctx = test_ctx();
+        let sgw: std::net::SocketAddr = "10.10.4.41:2123".parse().unwrap();
+        let (_, on_sgw, _) = attached_ue(&ctx, true);
+        ctx.set_sgw_s11_teid_for_ue(on_sgw, 0x11);
+        let (_, idle_on_sgw, _) = attached_ue(&ctx, false);
+        ctx.set_sgw_s11_teid_for_ue(idle_on_sgw, 0x12);
+        // Mid-attach: a session exists but the SGW has not answered yet.
+        let (_, attaching, _) = attached_ue(&ctx, true);
+
+        assert_eq!(sgw_restarted(&ctx, Some(sgw), sgw.ip()), 2);
+
+        let ue = ctx
+            .mme_ue_find_by_id(on_sgw)
+            .expect("kept until DETACH ACCEPT");
+        assert!(ue.sess_list.is_empty());
+        assert_eq!(ue.nas_eps.type_, MmeEpsType::DetachRequestToUe);
+        let nas = ue.t3422.pkbuf.expect("DETACH REQUEST");
+        assert_eq!(&nas[nas.len() - 5..nas.len() - 2], &[0x07, 0x45, 0x01]);
+        assert!(
+            ctx.mme_ue_find_by_id(idle_on_sgw).is_none(),
+            "idle: implicit"
+        );
+        let ue = ctx.mme_ue_find_by_id(attaching).unwrap();
+        assert_eq!(ue.sess_list.len(), 1, "an attach in flight is left alone");
+
+        // A second restart does not re-detach a UE already being detached.
+        assert_eq!(sgw_restarted(&ctx, Some(sgw), sgw.ip()), 0);
+    }
+
+    #[test]
+    fn a_restart_of_another_peer_detaches_nobody() {
+        let ctx = test_ctx();
+        let (_, id, _) = attached_ue(&ctx, true);
+        ctx.set_sgw_s11_teid_for_ue(id, 0x11);
+        let sgw: std::net::SocketAddr = "10.10.4.41:2123".parse().unwrap();
+        assert_eq!(
+            sgw_restarted(&ctx, Some(sgw), "10.10.9.9".parse().unwrap()),
+            0
+        );
+        assert_eq!(sgw_restarted(&ctx, None, sgw.ip()), 0);
+        assert_eq!(ctx.mme_ue_find_by_id(id).unwrap().sess_list.len(), 1);
     }
 }

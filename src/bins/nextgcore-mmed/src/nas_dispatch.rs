@@ -3240,6 +3240,60 @@ mod tests {
         );
     }
 
+    /// #689: after an SGW-restart detach completes, the same UE's re-attach
+    /// (on a new S1 connection, carrying its old S-TMSI) gets a fresh context
+    /// and goes on to authentication; the old context does not come back.
+    #[test]
+    fn test_a_re_attach_after_an_sgw_restart_detach_starts_afresh() {
+        let ctx = test_ctx();
+        let enb_ue_id = enb_with_connection(&ctx);
+        let old = ctx.mme_ue_add(enb_ue_id);
+        ctx.enb_ue_associate_mme_ue(enb_ue_id, old);
+        ctx.mme_ue_set_imsi(old, TEST_IMSI);
+        ctx.set_sgw_s11_teid_for_ue(old, 0x11);
+        // The S-TMSI the old attach assigned (no served GUMMEI in a test context).
+        if let Some(ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&old) {
+            ue.current.m_tmsi = Some(0x689);
+            ue.current.guti.mme_code = 1;
+        }
+        assert_eq!(ctx.mme_ue_find_by_s_tmsi(1, 0x689), Some(old));
+        let sgw: std::net::SocketAddr = "10.10.4.41:2123".parse().unwrap();
+        assert_eq!(
+            crate::network_detach::sgw_restarted(&ctx, Some(sgw), sgw.ip()),
+            1
+        );
+        nas_eps_handle_uplink(
+            &ctx,
+            uplink(
+                enb_ue_id,
+                &[
+                    NAS_PROTOCOL_DISCRIMINATOR_EMM,
+                    NasEpsMessageType::DetachAccept as u8,
+                ],
+            ),
+        );
+        assert!(ctx.mme_ue_find_by_id(old).is_none());
+
+        let enb_id = ctx.enb_add("127.0.0.2:36412".parse().unwrap());
+        let new_conn = ctx.enb_ue_add(enb_id, 101);
+        let pdu = attach_request(&imsi_identity(), &pdn_connectivity_request(1, false));
+        nas_eps_handle_uplink(
+            &ctx,
+            UplinkNas {
+                enb_ue_id: new_conn,
+                nas_pdu: &pdu,
+                s_tmsi: Some((1, 0x689)),
+            },
+        );
+        let fresh = ctx
+            .mme_ue_find_by_imsi(TEST_IMSI)
+            .expect("re-attach indexed");
+        assert_ne!(fresh, old);
+        let ue = ctx.mme_ue_find_by_id(fresh).unwrap();
+        assert_eq!(ue.nas_eps.type_, MmeEpsType::AttachRequest);
+        assert_eq!(ue.enb_ue_id, new_conn, "the new S1 connection's context");
+    }
+
     #[test]
     fn test_detach_request_removes_the_ue_context() {
         let ctx = test_ctx();
