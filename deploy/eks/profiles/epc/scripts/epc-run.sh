@@ -24,7 +24,12 @@
 # Env:
 #   POD_IP, POD_NAMESPACE   downward API (required)
 #   EPC_EXPORT              "VAR=<node> ..." exported before exec; <node> is a
-#                           name in MAP below, or "self"
+#                           name in MAP below, "self", or "dns:<node>" for the
+#                           node's Service FQDN (for an NF that re-resolves a
+#                           hostname itself, e.g. smfd's UPF_PFCP_ADDR since
+#                           #658), which is not tracked
+#   EPC_UNTRACKED           nodes not to record for the liveness probe (their
+#                           consumer re-resolves them itself)
 set -eu
 
 SELF="$1"; shift
@@ -65,7 +70,10 @@ addr_of() { # <name> -> IP (self or resolved), recording peers
     return 0
   fi
   _a=$(resolve "$1") || return 1
-  grep -q "^$1 " "$STATE" 2>/dev/null || echo "$1 $_a" >> "$STATE"
+  case " ${EPC_UNTRACKED:-} " in
+    *" $1 "*) ;;
+    *) grep -q "^$1 " "$STATE" 2>/dev/null || echo "$1 $_a" >> "$STATE" ;;
+  esac
   echo "$_a"
 }
 
@@ -87,7 +95,10 @@ done
 
 for kv in ${EPC_EXPORT:-}; do
   var=${kv%%=*}
-  ip=$(addr_of "${kv#*=}")
+  case "${kv#*=}" in
+    dns:*) ip="${kv#*=dns:}.${POD_NAMESPACE}.svc.cluster.local" ;;
+    *) ip=$(addr_of "${kv#*=}") ;;
+  esac
   export "$var=$ip"
   log "$var=$ip"
 done
