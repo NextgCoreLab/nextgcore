@@ -538,9 +538,19 @@ impl SbiClient {
     ) -> SbiResult<SendRequest<Full<Bytes>>> {
         let addr = format!("{host}:{port}");
 
+        // #664: a connect-phase timeout is a CONNECTION error, not
+        // `SbiError::Timeout`. Nothing was sent, so the request may be resent
+        // anywhere — the same reading `scpd`'s `is_provably_undelivered` and the
+        // failover below give `ConnectionError`. `Timeout` is kept for a request
+        // that was handed to the connection and may have been processed.
         let stream = tokio::time::timeout(self.config.connect_timeout, TcpStream::connect(&addr))
             .await
-            .map_err(|_| SbiError::Timeout)?
+            .map_err(|_| {
+                SbiError::ConnectionError(format!(
+                    "connect to {addr} timed out after {:?}",
+                    self.config.connect_timeout
+                ))
+            })?
             .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
 
         if scheme == UriScheme::Https {
@@ -553,7 +563,12 @@ impl SbiClient {
                 connector.connect(server_name, stream),
             )
             .await
-            .map_err(|_| SbiError::Timeout)?
+            .map_err(|_| {
+                SbiError::ConnectionError(format!(
+                    "TLS handshake with {addr} timed out after {:?}",
+                    self.config.connect_timeout
+                ))
+            })?
             .map_err(|e| SbiError::TlsError(format!("TLS handshake failed: {e}")))?;
 
             // ── T1.5b: extract RFC 5705 N32-f exporter secret (client side) ──
@@ -767,22 +782,78 @@ impl SbiClient {
             None => (self.config.host.clone(), self.config.port),
         };
 
-        let result = self.dispatch(request, reselected, &target_key).await;
+        // Kept for a #664 failover resend; cloned only when a failover is
+        // possible at all (a primary attempt, not an overload reselection).
+        let failover_copy = reselected.is_none().then(|| request.clone());
+        let mut result = self.dispatch(request, reselected, &target_key).await;
 
-        // #435: a TRANSPORT failure, after any retries, is evidence that a cached
-        // discovery profile naming this endpoint is stale -- the peer pod was
-        // replaced and its old IP is dead. Evict it so the next lookup
-        // re-discovers, instead of dialling the dead IP for the whole
-        // validityPeriod. Deliberately NOT for an error status (the peer answered,
+        // #435/#664: a TRANSPORT failure, after any retries, is evidence that a
+        // cached discovery profile naming this endpoint is stale -- the peer pod
+        // was replaced and its old IP is dead. Evict it so the next lookup
+        // re-discovers, and hold the endpoint down so a re-discovery that still
+        // lists it (the NRF has not expired the old profile yet) does not pick
+        // it again. Deliberately NOT for an error status (the peer answered,
         // so its profile is right), a TLS error (misconfiguration, not a dead
         // peer), or OverloadShed (decided locally, returned before dispatch).
-        if matches!(
-            &result,
-            Err(SbiError::ConnectionError(_) | SbiError::Timeout)
-        ) {
-            crate::context::global_context()
-                .evict_nf_instances_at_endpoint(&target_host, target_port)
-                .await;
+        if let Err(err) = &result {
+            if matches!(
+                err,
+                SbiError::ConnectionError(_) | SbiError::Timeout | SbiError::HyperError(_)
+            ) {
+                let undelivered = matches!(err, SbiError::ConnectionError(_));
+                let ctx = crate::context::global_context();
+                ctx.note_endpoint_failure(&target_host, target_port, undelivered);
+                let evicted = ctx
+                    .take_nf_instances_at_endpoint(&target_host, target_port)
+                    .await;
+                // #664: when the request provably never left, send it ONCE to
+                // another instance of the same service instead of failing the
+                // procedure (TS 29.500 §6.5 reselection). Only for an endpoint
+                // that came from discovery: an env-var Service name has no
+                // profile to replace, and the NRF itself is not discovered.
+                if undelivered {
+                    if let Some(request) = failover_copy {
+                        if let Some(alt) = self.failover_target(&request, &evicted).await {
+                            log::warn!(
+                                "SBI peer {target_host}:{target_port} is unreachable ({err}); \
+                                 resending once to {}:{} (re-discovered)",
+                                alt.host,
+                                alt.port
+                            );
+                            let alt_key = alt.base_uri();
+                            let (alt_host, alt_port) = (alt.host.clone(), alt.port);
+                            let mut request = request;
+                            if !request.header.uri.starts_with("http") {
+                                request.header.uri = format!("{alt_key}{}", request.header.uri);
+                            }
+                            result = self.dispatch(request, Some(alt), &alt_key).await;
+                            match &result {
+                                Ok(_) => ctx.clear_endpoint_failure(&alt_host, alt_port),
+                                Err(
+                                    e @ (SbiError::ConnectionError(_)
+                                    | SbiError::Timeout
+                                    | SbiError::HyperError(_)),
+                                ) => {
+                                    ctx.note_endpoint_failure(
+                                        &alt_host,
+                                        alt_port,
+                                        matches!(e, SbiError::ConnectionError(_)),
+                                    );
+                                    ctx.take_nf_instances_at_endpoint(&alt_host, alt_port).await;
+                                }
+                                Err(_) => {}
+                            }
+                            if let Ok(response) = &result {
+                                self.record_overload_and_binding(&alt_key, response);
+                            }
+                            return result;
+                        }
+                    }
+                }
+            }
+        } else {
+            // The peer answered: whatever failed against it before is over.
+            crate::context::global_context().clear_endpoint_failure(&target_host, target_port);
         }
 
         // Record what the response reported, whether it was a 503 or a 200: an
@@ -792,6 +863,49 @@ impl SbiClient {
             self.record_overload_and_binding(&target_key, response);
         }
         result
+    }
+
+    /// Another instance to resend an undelivered request to (#664): one serving
+    /// the request's service (the first path segment, e.g. `nsmf-pdusession`)
+    /// whose endpoint is not held down. Looked up in the discovery cache first;
+    /// when it has none, the NF's registered NRF re-discovery runs and the cache
+    /// is consulted again. `None` when the failed endpoint was not a discovered
+    /// profile, or no alternative exists.
+    async fn failover_target(
+        &self,
+        request: &SbiRequest,
+        evicted: &[crate::context::NfInstance],
+    ) -> Option<ConnectTarget> {
+        let first = evicted.first()?;
+        let path = request
+            .header
+            .uri
+            .split_once("://")
+            .map(|(_, rest)| rest.split_once('/').map_or("", |(_, p)| p))
+            .unwrap_or_else(|| request.header.uri.trim_start_matches('/'));
+        let service_name = path.split(['/', '?']).next().unwrap_or("");
+        let service = crate::types::SbiServiceType::from_name(service_name)?;
+        let ctx = crate::context::global_context();
+        let pick = |instances: Vec<crate::context::NfInstance>| {
+            instances.into_iter().find_map(|i| {
+                let (host, port) = i.endpoint_for(service)?;
+                (!ctx.endpoint_held_down(&host, port)).then_some((host, port))
+            })
+        };
+        let found = match pick(ctx.find_nf_instances_by_service(service).await) {
+            Some(ep) => Some(ep),
+            None => {
+                if !ctx.rediscover(first.nf_type, service_name).await {
+                    return None;
+                }
+                pick(ctx.find_nf_instances_by_service(service).await)
+            }
+        }?;
+        Some(ConnectTarget {
+            scheme: self.config.scheme,
+            host: found.0,
+            port: found.1,
+        })
     }
 
     /// Send via the retry/redirect stack, optionally against a reselected target.
@@ -1073,13 +1187,35 @@ impl SbiClient {
         request: &SbiRequest,
         target: Option<&ConnectTarget>,
     ) -> SbiResult<SbiResponse> {
-        let (pooled_slot, mut sender) = match target {
+        let (pooled_slot, sender) = match target {
             None => {
                 let (slot, sender) = self.get_connection().await?;
                 (Some(slot), sender)
             }
             Some(t) => (None, self.connect_to(t).await?),
         };
+        let result = self.send_on(request, pooled_slot, sender).await;
+        // #664: a pooled connection whose request timed out, or that failed
+        // mid-request, is not trusted again. `is_ready()` stays true for a peer
+        // that vanished without a RST (a deleted pod), so without this every
+        // later request on the slot waited out the full request timeout until
+        // the kernel gave up on the TCP connection, and a hostname-keyed pool
+        // (the NRF, an env-var Service name) never re-resolved its target.
+        if let (Some(slot), Err(SbiError::Timeout | SbiError::HyperError(_))) =
+            (pooled_slot, &result)
+        {
+            *self.pool[slot].lock().await = None;
+        }
+        result
+    }
+
+    /// The body of [`Self::send_once`] once a connection is chosen.
+    async fn send_on(
+        &self,
+        request: &SbiRequest,
+        pooled_slot: Option<usize>,
+        mut sender: SendRequest<Full<Bytes>>,
+    ) -> SbiResult<SbiResponse> {
         #[cfg(test)]
         if pooled_slot.is_some() {
             test_hooks::before_pooled_send();
@@ -1487,11 +1623,13 @@ mod tests {
             })
             .await;
 
+        let _guard = crate::context::GLOBAL_FAILOVER_TEST_LOCK.lock().await;
         let dead_id = "lmf-0435-dead";
         let live_id = "lmf-0435-live";
+        // Only the dead profile is cached while the dead request runs: with a
+        // live alternative cached too, #664's failover would (correctly) resend
+        // the request there, and this test is about the eviction alone.
         ctx.add_nf_instance_with_validity(cached(dead_id, dead_port), ttl)
-            .await;
-        ctx.add_nf_instance_with_validity(cached(live_id, live.port()), ttl)
             .await;
 
         let to_dead = SbiClient::new(
@@ -1510,6 +1648,8 @@ mod tests {
             ctx.get_nf_instance(dead_id).await.is_none(),
             "a transport failure must evict the profile naming that endpoint (#435)"
         );
+        ctx.add_nf_instance_with_validity(cached(live_id, live.port()), ttl)
+            .await;
 
         let to_live = SbiClient::with_host_port("127.0.0.1", live.port());
         let resp = to_live
@@ -1528,6 +1668,212 @@ mod tests {
         ctx.remove_nf_instance(live_id).await;
         ctx.remove_nf_instance(dead_id).await;
         server.stop().await.expect("stop");
+    }
+
+    /// A cached SMF-like profile at `127.0.0.1:port` serving `nsmf-pdusession`.
+    fn smf_profile(id: &str, port: u16) -> crate::context::NfInstance {
+        use crate::context::{NfInstance, NfService};
+        use crate::types::{NfType, SbiServiceType};
+        let mut inst = NfInstance::new(id, NfType::Smf);
+        inst.ipv4_addresses = vec!["127.0.0.1".to_string()];
+        let mut svc = NfService::new("nsmf-pdusession", SbiServiceType::NsmfPdusession);
+        svc.ip_addresses = vec!["127.0.0.1".to_string()];
+        svc.port = port;
+        inst.services = vec![svc];
+        inst
+    }
+
+    /// A port nothing listens on: reserved, then released.
+    fn dead_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind")
+            .local_addr()
+            .expect("addr")
+            .port()
+    }
+
+    /// #664: the peer restarted at a NEW address. The consumer still holds the
+    /// old profile, and the NRF still lists it (its heartbeat has not expired)
+    /// next to the new one. The SAME request must reach the new peer: the dead
+    /// endpoint refuses the connection (provably undelivered), the profile is
+    /// evicted and held down, re-discovery runs, and the request is resent once
+    /// to the instance that did not just fail.
+    ///
+    /// Before #664 the request failed (the AMF rejected the PDU session with
+    /// #26), and the merge-only re-discovery could hand the dead IP back.
+    #[tokio::test]
+    async fn a_peer_restarted_at_a_new_address_gets_the_same_request() {
+        use crate::context::global_context;
+        use crate::types::{NfType, SbiServiceType};
+        let _guard = crate::context::GLOBAL_FAILOVER_TEST_LOCK.lock().await;
+        let ctx = global_context();
+        let ttl = Duration::from_secs(3600);
+
+        let old_port = dead_port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let new_peer = serve_fixed(201, vec![], "{}", hits.clone()).await;
+        let (old_id, new_id) = ("smf-0664-old", "smf-0664-new");
+        ctx.replace_nf_instances(NfType::Smf, vec![smf_profile(old_id, old_port)], ttl)
+            .await;
+
+        // The stand-in NRF: lists the dead profile AND its replacement.
+        let rediscoveries = Arc::new(AtomicUsize::new(0));
+        let seen = rediscoveries.clone();
+        let new_port = new_peer.port();
+        ctx.set_rediscovery_hook(Arc::new(move |nf_type, service| {
+            let seen = seen.clone();
+            Box::pin(async move {
+                assert_eq!(nf_type, NfType::Smf);
+                assert_eq!(service, "nsmf-pdusession");
+                seen.fetch_add(1, Ordering::SeqCst);
+                global_context()
+                    .replace_nf_instances(
+                        NfType::Smf,
+                        vec![smf_profile(old_id, old_port), smf_profile(new_id, new_port)],
+                        Duration::from_secs(3600),
+                    )
+                    .await;
+            })
+        }));
+
+        let client = SbiClient::new(
+            SbiClientConfig::new("127.0.0.1", old_port)
+                .with_connect_timeout(Duration::from_millis(500)),
+        );
+        let resp = client
+            .send_request(
+                SbiRequest::post("/nsmf-pdusession/v1/sm-contexts")
+                    .with_body("{}".to_string(), "application/json"),
+            )
+            .await
+            .expect("the request must be resent to the restarted peer");
+        assert_eq!(resp.status, 201);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the new peer served it, once"
+        );
+        assert_eq!(
+            rediscoveries.load(Ordering::SeqCst),
+            1,
+            "re-discovered once"
+        );
+
+        // The NRF still lists the dead profile; selection must not pick it.
+        let first = ctx
+            .find_nf_instances_by_service(SbiServiceType::NsmfPdusession)
+            .await
+            .into_iter()
+            .next()
+            .expect("cached SMF");
+        assert_eq!(
+            first.id, new_id,
+            "a held-down endpoint sorts after the one that answered"
+        );
+
+        ctx.replace_nf_instances(NfType::Smf, vec![], ttl).await;
+        ctx.clear_endpoint_failure("127.0.0.1", old_port);
+        ctx.set_rediscovery_hook(Arc::new(|_, _| Box::pin(async {})));
+    }
+
+    /// #664: a request that may have been processed (a REQUEST timeout, not a
+    /// refused connection) is never resent elsewhere -- a duplicated SM Context
+    /// Create or UE authentication is worse than a failed one.
+    #[tokio::test]
+    async fn a_request_timeout_is_not_resent_to_another_peer() {
+        use crate::context::global_context;
+        use crate::types::NfType;
+        let _guard = crate::context::GLOBAL_FAILOVER_TEST_LOCK.lock().await;
+        let ctx = global_context();
+        let ttl = Duration::from_secs(3600);
+
+        // A peer that accepts the connection and never answers.
+        let (silent, _silent_hits) = serve_silent().await;
+        let alt_hits = Arc::new(AtomicUsize::new(0));
+        let alt = serve_fixed(201, vec![], "{}", alt_hits.clone()).await;
+        ctx.replace_nf_instances(
+            NfType::Smf,
+            vec![
+                smf_profile("smf-0664-silent", silent.port()),
+                smf_profile("smf-0664-alt", alt.port()),
+            ],
+            ttl,
+        )
+        .await;
+
+        let client = SbiClient::new(
+            SbiClientConfig::new("127.0.0.1", silent.port())
+                .with_request_timeout(Duration::from_millis(300)),
+        );
+        let err = client
+            .send_request(SbiRequest::post("/nsmf-pdusession/v1/sm-contexts"))
+            .await
+            .expect_err("the silent peer never answers");
+        assert!(matches!(err, SbiError::Timeout), "got {err:?}");
+        assert_eq!(
+            alt_hits.load(Ordering::SeqCst),
+            0,
+            "no resend after a request timeout"
+        );
+        assert!(
+            client.pool[0].lock().await.is_none(),
+            "the connection whose request timed out is dropped, so the next request redials"
+        );
+
+        ctx.replace_nf_instances(NfType::Smf, vec![], ttl).await;
+        ctx.clear_endpoint_failure("127.0.0.1", silent.port());
+    }
+
+    /// An HTTP/2 server that accepts requests and never responds.
+    async fn serve_silent() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let svc = hyper::service::service_fn(move |_req: hyper::Request<Incoming>| {
+                        let counter = counter.clone();
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_secs(3600)).await;
+                            Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                                http_body_util::Full::new(bytes::Bytes::new()),
+                            ))
+                        }
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(io, svc)
+                    .await;
+                });
+            }
+        });
+        (addr, hits)
+    }
+
+    /// #664: a connect-phase timeout is a connection error (nothing was sent),
+    /// not the request `Timeout` that may have been processed.
+    #[tokio::test]
+    async fn a_connect_timeout_reports_a_connection_error() {
+        // TEST-NET-1 (RFC 5737): never routed, so the SYN goes unanswered (or
+        // the host reports it unreachable at once -- a connection error too).
+        let client = SbiClient::new(
+            SbiClientConfig::new("192.0.2.1", 7777)
+                .with_connect_timeout(Duration::from_millis(200)),
+        );
+        let err = client
+            .send_request(SbiRequest::get("/nsmf-pdusession/v1/x"))
+            .await
+            .expect_err("unreachable");
+        assert!(matches!(err, SbiError::ConnectionError(_)), "got {err:?}");
     }
 
     #[test]

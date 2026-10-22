@@ -3007,6 +3007,8 @@ async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Resul
     // be selected; without it a cached peer was chosen for the process lifetime.
     let validity = nextgcore_sbi::context::search_result_validity(&json);
 
+    // #664: the answer REPLACES the cached profiles of the target type.
+    let mut fresh: Vec<nextgcore_sbi::context::NfInstance> = Vec::new();
     if let Some(nf_instances) = json.get("nfInstances").and_then(|v| v.as_array()) {
         for nf_json in nf_instances {
             let nf_id = nf_json
@@ -3061,13 +3063,30 @@ async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Resul
                 }
             }
 
-            sbi_ctx
-                .add_nf_instance_with_validity(instance, validity)
-                .await;
             log::info!(
                 "Discovered {nf_type_str} instance: {nf_id} (valid for {}s)",
                 validity.as_secs()
             );
+            fresh.push(instance);
+        }
+    }
+    match nextgcore_sbi::types::NfType::from_name(target_nf_type) {
+        Some(target) => {
+            let (mine, other): (Vec<_>, Vec<_>) =
+                fresh.into_iter().partition(|i| i.nf_type == target);
+            sbi_ctx.replace_nf_instances(target, mine, validity).await;
+            for instance in other {
+                sbi_ctx
+                    .add_nf_instance_with_validity(instance, validity)
+                    .await;
+            }
+        }
+        None => {
+            for instance in fresh {
+                sbi_ctx
+                    .add_nf_instance_with_validity(instance, validity)
+                    .await;
+            }
         }
     }
 

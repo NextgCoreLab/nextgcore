@@ -1072,6 +1072,10 @@ pub async fn run() -> Result<()> {
         }
     }
 
+    // #664: a request that cannot reach a cached peer re-discovers through this
+    // and is resent once, instead of failing the UE's procedure.
+    sbi_path::register_rediscovery_hook();
+
     // Discover AUSF and SMF from NRF
     if let Err(e) = sbi_path::amf_nrf_discover("AUSF", "nausf-auth").await {
         log::warn!("AUSF discovery failed (will retry on demand): {e}");
