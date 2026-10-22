@@ -47,6 +47,7 @@ Both scripts take `PROFILE=<name>` (default `5g`) and read
 | `PROFILE_ADVERTISE_NFS` | NFs whose advertised SBI address is rewritten to the pod IP |
 | `PROFILE_HNET_SECRET` | `true`: create the `udm-hnet-keys` Secret |
 | `PROFILE_DATAPLANE_DEPLOYMENT` / `_PATCH` | what `ENABLE_DATAPLANE=true` swaps in |
+| `profile_postrender <file>` | in-place transform of the rendered manifests (before the generic rewrites) |
 | `profile_rollout()` / `profile_summary()` | rollout waits after apply; closing summary |
 
 `CORE_BIN_DIR=<dir>` makes `build-and-push.sh` package core binaries from a

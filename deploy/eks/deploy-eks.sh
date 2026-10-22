@@ -106,6 +106,11 @@ log "rendering kustomize overlay..."
 kubectl kustomize ${PROFILE_KUSTOMIZE_FLAGS} "${PROFILE_DIR}" > "${RENDERED}" \
   || die "kustomize render failed"
 
+# Profile-specific transforms of the rendered manifests, in place (a no-op for
+# 5g). Runs before the generic rewrites below, so it sees the Kind-local image
+# names.
+profile_postrender "${RENDERED}" || die "profile ${PROFILE_NAME} post-render failed"
+
 # Make each NF advertise its POD IP to the NRF instead of its bind address.
 #
 # k8s/manifests/configmap.yaml sets every NF's sbi.server[0].address to

@@ -5,7 +5,7 @@
 # A profile is a directory deploy/eks/profiles/<name>/ holding:
 #   kustomization.yaml  the overlay deploy-eks.sh renders
 #   profile.env         sourced bash: namespace, image lists, cargo features,
-#                       tag suffix, and the rollout/summary hooks
+#                       tag suffix, and the postrender/rollout/summary hooks
 # PROFILE=5g is the default and reproduces the pre-profile behaviour exactly.
 
 # nextg_load_profile <name>
@@ -50,6 +50,8 @@ nextg_load_profile() {
   profile_rollout() { :; }
   # shellcheck disable=SC2317
   profile_summary() { :; }
+  # shellcheck disable=SC2317
+  profile_postrender() { :; }
 
   # shellcheck source=/dev/null
   source "${PROFILE_DIR}/profile.env"
