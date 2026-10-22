@@ -1,18 +1,12 @@
 # UE addressing for EKS.
 #
-# The UE's failure mode here is the nastiest one in the deployment:
-#
-#   nextgsim-ue/src/rls/task.rs:100-106
-#     let gnb_search_list: Vec<SocketAddr> = ...
-#         .filter_map(|s| s.parse::<std::net::IpAddr>().ok())
-#
-# gnb_search_list is Vec<String>, so a hostname *deserializes fine* and is
-# then SILENTLY DROPPED by filter_map. The UE starts with an empty search
-# list, never finds a cell, and emits no error naming the config. Symptom is
-# "UE just sits there".
-#
-# So the resolver below treats a failed resolution as fatal, and asserts the
-# rewritten value is a literal IPv4 address before the UE container starts.
+# Since nextgsim #286 gnb_search_list takes hostnames: the UE resolves them at
+# start, every 5 s and when it loses the cell, so a gNB pod that restarts at a
+# new IP is found again. Before #286 a hostname was SILENTLY DROPPED
+# (rls/task.rs `filter_map(|s| s.parse::<IpAddr>().ok())`), which is why this
+# patch used to rewrite the Service name to the IP the gNB had at UE start --
+# stranding the UE whenever the gNB moved. The config now ships the Service
+# name unchanged (the headless gnb Service resolves it to the pod IP).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -51,44 +45,10 @@ spec:
             - -c
             - |
               set -eu
-
-              resolve() {
-                _host="$1"; _ip=""; _i=0
-                while [ "$_i" -lt 60 ]; do
-                  _ip=$(nslookup "$_host" 2>/dev/null \
-                        | awk '/^Name:/{n=1;next} n&&/^Address( 1)?:/{print $NF; exit}')
-                  case "$_ip" in
-                    *.*.*.*) echo "$_ip"; return 0 ;;
-                  esac
-                  _i=$((_i+1))
-                  echo "[resolve-dns] waiting for $_host ($_i/60)" >&2
-                  sleep 2
-                done
-                echo "[resolve-dns] FATAL: could not resolve $_host" >&2
-                return 1
-              }
-
-              GNB_IP=$(resolve gnb.nextg-system.svc.cluster.local)
-              case "$GNB_IP" in
-                *[0-9].[0-9]*) ;;
-                *) echo "[resolve-dns] FATAL: gNB IP not IPv4: '$GNB_IP'" >&2; exit 1 ;;
-              esac
-              echo "[resolve-dns] gNB=$GNB_IP"
-
+              # Nothing to resolve any more (#286): the UE resolves the gNB
+              # Service name itself. Kept as a copy step so the config path and
+              # the volume layout stay what the base manifest expects.
               cp /tmp/config-template/ue.yaml /etc/nextgsim/ue.yaml
-              sed -i "s|gnb\.nextg-system\.svc\.cluster\.local|$GNB_IP|g" \
-                /etc/nextgsim/ue.yaml
-
-              # This is the check that prevents the silent-drop failure. If any
-              # gnb_search_list entry is still a hostname, the UE would discard
-              # it and search nothing.
-              if grep -q 'svc\.cluster\.local' /etc/nextgsim/ue.yaml; then
-                echo "[resolve-dns] FATAL: gnb_search_list still contains a hostname." >&2
-                echo "[resolve-dns] The UE would silently drop it (rls/task.rs:104)." >&2
-                grep -n 'svc\.cluster\.local' /etc/nextgsim/ue.yaml >&2
-                exit 1
-              fi
-
               echo "[resolve-dns] final ue.yaml:"
               cat /etc/nextgsim/ue.yaml
           volumeMounts:
