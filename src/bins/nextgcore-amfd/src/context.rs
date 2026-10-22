@@ -630,6 +630,10 @@ pub struct AmfContext {
     /// reg/PDU/ping path — only populated when the serving AMF changes.
     network_dereg_queue: RwLock<Vec<PendingNetworkDereg>>,
 
+    /// N1N2MessageTransfers for CM-CONNECTED UEs awaiting NGAP egress (#666).
+    /// Same shape and reason as `network_dereg_queue`.
+    connected_downlink_queue: RwLock<Vec<PendingConnectedDownlink>>,
+
     /// PWS N2 relay queue (#396, TS 29.518 §5.2.2.4.1.3 / TS 38.413 §8.12):
     /// warning containers a CBCF/PWS-IWF handed the AMF over
     /// `POST /namf-comm/v1/non-ue-n2-messages/transfer`, for egress to the
@@ -717,6 +721,24 @@ pub enum PositioningDlKind {
 /// callback (TS 29.503 §5.3.2.3.2) asked the AMF to execute (WSB-4), enqueued
 /// by the Namf SBI handler task and carried out by the NGAP server task
 /// (TS 23.502 §4.2.2.3.3 → DEREGISTRATION REQUEST, TS 24.501 §5.5.2.3).
+/// A Namf N1N2MessageTransfer for a CM-CONNECTED UE (#666): the N1 and/or the
+/// PDU Session Resource Release the SMF asked the AMF to deliver now. Enqueued by
+/// the Namf SBI handler task and sent by the NGAP server task, which owns the SCTP
+/// associations, exactly as a paged transfer is sent after the Service Request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingConnectedDownlink {
+    /// Target UE (AMF-UE-NGAP-ID); the NGAP task resolves the association and
+    /// RAN-UE-NGAP-ID at send time.
+    pub amf_ue_ngap_id: u64,
+    /// The PDU session the transfer is about.
+    pub pdu_session_id: u8,
+    /// The 5GSM message, delivered in a DOWNLINK NAS TRANSPORT.
+    pub n1: Option<Vec<u8>>,
+    /// Whether to send a PDU SESSION RESOURCE RELEASE COMMAND for the session
+    /// (`ngapIeType` PDU_RES_REL_CMD) before the N1.
+    pub n2_release: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct PendingNetworkDereg {
     /// Target UE (AMF-UE-NGAP-ID). The NGAP task resolves the serving SCTP
@@ -1206,6 +1228,7 @@ impl AmfContext {
             lcs_correlations: RwLock::new(HashMap::new()),
             amf_status_subscriptions: RwLock::new(HashMap::new()),
             network_dereg_queue: RwLock::new(Vec::new()),
+            connected_downlink_queue: RwLock::new(Vec::new()),
             pws_n2_queue: RwLock::new(Vec::new()),
             non_ue_n2_subscriptions: RwLock::new(HashMap::new()),
             pws_response_requests: RwLock::new(HashMap::new()),
@@ -2083,6 +2106,21 @@ impl AmfContext {
     pub fn network_dereg_add(&self, item: PendingNetworkDereg) {
         if let Ok(mut q) = self.network_dereg_queue.write() {
             q.push(item);
+        }
+    }
+
+    /// Enqueue an N1N2MessageTransfer for a CM-CONNECTED UE (#666).
+    pub fn connected_downlink_add(&self, item: PendingConnectedDownlink) {
+        if let Ok(mut q) = self.connected_downlink_queue.write() {
+            q.push(item);
+        }
+    }
+
+    /// Drain every pending connected-UE transfer (called by the NGAP server pump).
+    pub fn connected_downlink_drain(&self) -> Vec<PendingConnectedDownlink> {
+        match self.connected_downlink_queue.write() {
+            Ok(mut q) => std::mem::take(&mut *q),
+            Err(_) => Vec::new(),
         }
     }
 
