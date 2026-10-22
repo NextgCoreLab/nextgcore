@@ -15,8 +15,8 @@
         <link rel="icon" href="favicon-de23e50b.svg">
         <link rel="shortcut icon" href="favicon-8114d1fc.png">
         <link rel="stylesheet" href="css/variables-8adf115d.css">
-        <link rel="stylesheet" href="css/general-0392ca55.css">
-        <link rel="stylesheet" href="css/chrome-fc474251.css">
+        <link rel="stylesheet" href="css/general-e96d0476.css">
+        <link rel="stylesheet" href="css/chrome-d279d366.css">
         <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-10d7638c.js";
+            window.path_to_searchindex_js = "searchindex-c2411517.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-1b88980e.js"></script>
+        <script src="toc-be5dca41.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -178,7 +178,7 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="contributing-to-nextgcore"><a class="header" href="#contributing-to-nextgcore">Contributing to NextGCore</a></h1>
-<p>NextGCore is a research-faithful 5G Core Network implementation in Rust targeting 3GPP Rel-15 with selected Rel-17/18 features. 6G/Rel-20 items (ISAC, FL, PQC, semantic, agent-native) are non-normative prototypes — no frozen Rel-20 3GPP specs exist.</p>
+<p>NextGCore is a research-faithful 5G Core and 4G EPC implementation in Rust: a Rel-15 baseline with selected Rel-16/17/18 features (RACS, MBS, NSACF, LMF positioning, RedCap, XR QoS, SNPN, MINT, UAV). 6G/Rel-20 items (ISAC, FL, PQC, semantic, agent-native) are non-normative prototypes — no frozen Rel-20 3GPP specs exist.</p>
 <h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
 <div class="table-wrapper">
 <table>
@@ -186,21 +186,26 @@
 <tr><th>Tool</th><th>Version</th><th>Purpose</th></tr>
 </thead>
 <tbody>
-<tr><td>Rust</td><td>stable (≥1.75)</td><td>Build toolchain</td></tr>
-<tr><td>protobuf-compiler</td><td>≥3.21</td><td>Protobuf codegen</td></tr>
-<tr><td>clang / libclang-dev</td><td>any</td><td>LLVM bindings</td></tr>
-<tr><td>libssl-dev</td><td>any</td><td>TLS support</td></tr>
-<tr><td>cmake</td><td>≥3.16</td><td>FFI build scripts</td></tr>
-<tr><td>Docker + docker-compose</td><td>≥24</td><td>E2E testing</td></tr>
+<tr><td>Rust</td><td>1.95.0, pinned by <code>src/rust-toolchain.toml</code> (rustup installs it)</td><td>Build toolchain</td></tr>
+<tr><td>C/C++ compiler, cmake</td><td>any recent</td><td><code>aws-lc-sys</code>, the C crypto library under rustls</td></tr>
+<tr><td>libsctp-dev</td><td>any</td><td>only for <code>--features kernel-sctp</code> (amfd, mmed)</td></tr>
+<tr><td>Docker + Compose v2</td><td>Engine ≥ 24, Compose ≥ 2.20</td><td>E2E testing</td></tr>
 </tbody>
 </table>
 </div>
 <pre><code class="language-bash"># Ubuntu/Debian
-sudo apt-get install -y pkg-config libssl-dev cmake protobuf-compiler clang
+sudo apt-get install -y build-essential cmake pkg-config
+sudo apt-get install -y libsctp-dev        # kernel-SCTP builds only
 
 # macOS (Homebrew)
-brew install protobuf cmake openssl
+brew install cmake
 </code></pre>
+<p>The Docker builder image (<code>docker/rust/Dockerfile.builder</code>) installs a superset
+(<code>protobuf-compiler</code>, <code>clang</code>, <code>libssl-dev</code>, …) because it also builds nextgsim.</p>
+<p>The generated codec crates (<code>nextgcore-*-gen</code>) are memory-hungry to compile: the
+NR RRC codec alone peaks at about 9.4 GB of rustc RSS with debuginfo, so give
+<code>cargo test --workspace</code> 16 GB or more, or set <code>CARGO_PROFILE_TEST_DEBUG=0</code>
+as CI does.</p>
 <h2 id="building"><a class="header" href="#building">Building</a></h2>
 <p>The workspace root is <code>nextgcore/src/</code> (not <code>nextgcore/</code>):</p>
 <pre><code class="language-bash">cd nextgcore/src
@@ -216,10 +221,11 @@ cargo test --workspace                          # all tests
 cargo test -p nextgcore-amfd                    # single NF
 cargo test --workspace -- --nocapture           # with log output
 </code></pre>
-<p>Integration / E2E tests require Docker:</p>
+<p><code>src/tests</code> (<code>nextgcore-integration-tests</code>) runs flow tests against mock NFs.
+The end-to-end tests against the real binaries need Docker:</p>
 <pre><code class="language-bash">cd nextgcore/docker/rust
-docker compose up -d
-bash e2e-test.sh
+./e2e.sh                     # preflight -&gt; build -&gt; registration, PDU session, ping
+./e2e.sh --keep &amp;&amp; ./ue-flow-check.sh all   # paging, idle uplink, de/re-registration
 </code></pre>
 <p>Multi-UE stress test:</p>
 <pre><code class="language-bash">bash test-multi-ue.sh               # 5 UEs (default)
@@ -229,15 +235,23 @@ bash test-multi-ue.sh --ue-count 10 # 10 UEs
 <p>All code must pass <code>cargo fmt</code> and <code>cargo clippy</code>:</p>
 <pre><code class="language-bash">cd nextgcore/src
 cargo fmt --all
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-targets
+cargo check --workspace --all-features --all-targets
 </code></pre>
+<p>CI fails on clippy <strong>errors</strong>; warnings are reported but do not fail the job.
+Do not add new warnings to the code you touch.</p>
 <p>Pre-commit checklist:</p>
 <ul>
-<li><input disabled="" type="checkbox"> <code>cargo fmt --all</code> — no formatting changes</li>
-<li><input disabled="" type="checkbox"> <code>cargo clippy --workspace -- -D warnings</code> — zero warnings</li>
+<li><input disabled="" type="checkbox"> <code>cargo fmt --all -- --check</code> — no formatting changes</li>
+<li><input disabled="" type="checkbox"> <code>cargo clippy --workspace --all-targets</code> — no errors, no new warnings</li>
+<li><input disabled="" type="checkbox"> <code>cargo check --workspace --all-features --all-targets</code> — every feature compiles</li>
 <li><input disabled="" type="checkbox"> <code>cargo test --workspace</code> — all tests pass</li>
+<li><input disabled="" type="checkbox"> <code>cd fuzz &amp;&amp; cargo clippy --locked --bins -- -D warnings</code> — if you touched a decoder the fuzz targets call</li>
 <li><input disabled="" type="checkbox"> <code>cargo audit</code> — no unpatched advisories</li>
 </ul>
+<p>Tests that touch process-global state (an NF context, an environment
+variable) must take the lock declared beside that global, so the default
+parallel <code>cargo test</code> cannot race them.</p>
 <h2 id="security-auditing"><a class="header" href="#security-auditing">Security Auditing</a></h2>
 <pre><code class="language-bash">cargo install cargo-audit
 cd nextgcore/src
@@ -246,21 +260,26 @@ cargo audit
 <h2 id="project-layout"><a class="header" href="#project-layout">Project Layout</a></h2>
 <pre><code>nextgcore/
 ├── src/                     # Workspace root
-│   ├── bins/                # 24 NF binaries + webui
+│   ├── bins/                # 28 NF binaries + webui
 │   │   ├── nextgcore-amfd/  # AMF
-│   │   ├── nextgcore-smfd/  # SMF
-│   │   ├── nextgcore-upfd/  # UPF
-│   │   └── ...              # (all 24 NFs)
-│   ├── libs/                # Shared libraries
-│   │   ├── nextgcore-core/        # Core types
-│   │   ├── nextgcore-sbi/         # HTTP/2 SBI client + server
+│   │   ├── nextgcore-smfd/  # SMF (also the EPC PGW-C)
+│   │   ├── nextgcore-upfd/  # UPF (also the EPC PGW-U)
+│   │   └── ...
+│   ├── libs/                # 23 shared libraries
+│   │   ├── nextgcore-core/        # Core types, state store
+│   │   ├── nextgcore-sbi/         # HTTP/2 SBI client + server, OAuth2, TLS
 │   │   ├── nextgcore-crypt/       # 5G cryptography (SUCI, AKA, PQC)
 │   │   ├── nextgcore-metrics/     # Prometheus + OpenTelemetry
+│   │   ├── nextgcore-*-gen/       # NGAP, S1AP, NRPPa, LPP, NR RRC, LTE RRC codecs generated from the 3GPP ASN.1
 │   │   └── ...
-│   └── tests/               # Integration tests
-├── k8s/                     # Kubernetes manifests + Helm
-├── docker/rust/             # Docker Compose E2E stack
-└── docs/                    # OpenAPI specs, architecture docs
+│   ├── tests/               # Mock-based flow tests
+│   ├── fuzz/                # cargo-fuzz targets (own workspace)
+│   └── vendor/sctp-proto/   # patched sctp-proto
+├── k8s/                     # Kind manifests
+├── deploy/                  # Helm chart, EKS deployment
+├── docker/rust/             # Docker Compose E2E stacks
+├── docs/                    # Pages site, OpenAPI specs, design notes
+└── docs-book/               # mdBook sources
 </code></pre>
 <h2 id="3gpp-specification-references"><a class="header" href="#3gpp-specification-references">3GPP Specification References</a></h2>
 <p>Each file includes a doc comment referencing the 3GPP TS number and section (e.g. <code>//! TS 23.501 §5.15</code>). When adding new protocol logic, always cite the relevant spec:</p>
@@ -269,8 +288,14 @@ cargo audit
 <li><strong>TS 23.502</strong> — 5G procedures</li>
 <li><strong>TS 29.xxx</strong> — SBI service definitions</li>
 <li><strong>TS 38.331</strong> — NR RRC</li>
-<li><strong>TS 38.413</strong> — NGAP</li>
+<li><strong>TS 38.413</strong> — NGAP; <strong>TS 36.413</strong> — S1AP</li>
+<li><strong>TS 24.501 / TS 24.301</strong> — 5GS / EPS NAS</li>
 </ul>
+<p>Generated codecs are rebuilt from the ASN.1 in each <code>nextgcore-*-gen/asn/</code>;
+the version and source are recorded in that directory’s <code>PROVENANCE.md</code>. Do not
+hand-edit generated code; change the schema or the compiler
+(<a href="https://github.com/NextgCoreLab/asn1-codegen">NextgCoreLab/asn1-codegen</a>,
+pinned by rev in <code>src/Cargo.toml</code>).</p>
 <h2 id="commit-messages"><a class="header" href="#commit-messages">Commit Messages</a></h2>
 <p>Follow conventional commits:</p>
 <pre><code>feat(smf): add MBS multicast session context (TS 23.247)
@@ -292,14 +317,16 @@ test(upf): add SDF filter 5-tuple matching unit tests
 <h2 id="nf-implementation-standards"><a class="header" href="#nf-implementation-standards">NF Implementation Standards</a></h2>
 <p>Each NF binary must:</p>
 <ul>
-<li>Register with NRF on startup (via <code>nextgcore-sbi</code> NF management)</li>
+<li>Register with NRF on startup (via <code>nextgcore-sbi</code> NF management), and
+deregister on shutdown</li>
 <li>Expose <code>/metrics</code> (Prometheus, port 9090)</li>
 <li>Respond to SIGTERM with graceful shutdown</li>
-<li>Log at <code>info</code> level by default, configurable via <code>RUST_LOG</code></li>
+<li>Log at <code>info</code> level by default, configurable via <code>--log-level</code> and <code>RUST_LOG</code>
+(13 NFs honour <code>RUST_LOG</code> today; #691 tracks the rest)</li>
 <li>Have ≥ 1 unit test per public function</li>
 </ul>
 <h2 id="license"><a class="header" href="#license">License</a></h2>
-<p>AGPL-3.0. See <a href="LICENSE">LICENSE</a>.</p>
+<p>AGPL-3.0. See <a href="https://github.com/NextgCoreLab/nextgcore/blob/main/LICENSE">LICENSE</a>.</p>
 
                     </main>
 
@@ -343,7 +370,7 @@ test(upf): add SDF filter 5-tuple matching unit tests
 
         <script src="clipboard-1626706a.min.js"></script>
         <script src="highlight-abc7f01d.js"></script>
-        <script src="book-c22b7243.js"></script>
+        <script src="book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

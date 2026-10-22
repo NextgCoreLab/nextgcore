@@ -15,8 +15,8 @@
         <link rel="icon" href="favicon-de23e50b.svg">
         <link rel="shortcut icon" href="favicon-8114d1fc.png">
         <link rel="stylesheet" href="css/variables-8adf115d.css">
-        <link rel="stylesheet" href="css/general-0392ca55.css">
-        <link rel="stylesheet" href="css/chrome-fc474251.css">
+        <link rel="stylesheet" href="css/general-e96d0476.css">
+        <link rel="stylesheet" href="css/chrome-d279d366.css">
         <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-10d7638c.js";
+            window.path_to_searchindex_js = "searchindex-c2411517.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-1b88980e.js"></script>
+        <script src="toc-be5dca41.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -178,7 +178,7 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="getting-started"><a class="header" href="#getting-started">Getting Started</a></h1>
-<p>NextGCore is a 5G Core Network implemented in Rust, targeting 3GPP Rel-15 with selected Rel-17/18 features (MBS, NSACF, LMF positioning, RedCap, XR QoS, SNPN, MINT, UAV Service-level-AA per TS 23.256), plus 4G/EPC interworking. 6G/Rel-20 items (ISAC, FL, PQC, semantic comms) are <strong>non-normative research prototypes</strong> — no frozen Rel-20 Stage-3 specs exist. End-to-end validation runs against the project’s own matched RAN simulator (nextgsim gNB/UE); it is <strong>not third-party certified</strong>.</p>
+<p>NextGCore is a 5G Core Network implemented in Rust, with a 3GPP Rel-15 baseline and selected Rel-16/17/18 features (RACS, MBS, NSACF, LMF positioning, RedCap, XR QoS, SNPN, MINT, UAV Service-level-AA per TS 23.256), plus a 4G EPC and EPS-5GS interworking over N26. 6G/Rel-20 items (ISAC, FL, PQC, semantic comms) are <strong>non-normative research prototypes</strong> — no frozen Rel-20 Stage-3 specs exist. End-to-end validation runs against the project’s own matched RAN simulators (nextgsim gNB/UE and LTE eNB/UE); it is <strong>not third-party certified</strong>.</p>
 <h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
 <div class="table-wrapper">
 <table>
@@ -186,27 +186,28 @@
 <tr><th>Tool</th><th>Version</th><th>Purpose</th></tr>
 </thead>
 <tbody>
-<tr><td>Rust</td><td>stable (≥ 1.75)</td><td>Build toolchain</td></tr>
-<tr><td>protobuf-compiler</td><td>≥ 3.21</td><td>Protobuf codegen</td></tr>
-<tr><td>clang / libclang-dev</td><td>any</td><td>LLVM bindings</td></tr>
-<tr><td>libssl-dev</td><td>any</td><td>TLS support</td></tr>
-<tr><td>cmake</td><td>≥ 3.16</td><td>FFI build scripts</td></tr>
-<tr><td>Docker + docker-compose</td><td>≥ 24</td><td>E2E testing</td></tr>
+<tr><td>Rust</td><td>1.95.0, pinned by <code>src/rust-toolchain.toml</code> (rustup installs it)</td><td>Build toolchain</td></tr>
+<tr><td>C/C++ compiler, cmake</td><td>any recent</td><td><code>aws-lc-sys</code>, the C crypto library under rustls</td></tr>
+<tr><td>libsctp-dev</td><td>any</td><td>only for <code>--features kernel-sctp</code> (amfd, mmed)</td></tr>
+<tr><td>Docker + Compose v2</td><td>Engine ≥ 24, Compose ≥ 2.20</td><td>E2E testing</td></tr>
 </tbody>
 </table>
 </div>
 <pre><code class="language-bash"># Ubuntu/Debian
-sudo apt-get install -y pkg-config libssl-dev cmake protobuf-compiler clang
+sudo apt-get install -y build-essential cmake pkg-config
+sudo apt-get install -y libsctp-dev        # kernel-SCTP builds only
 
 # macOS (Homebrew)
-brew install protobuf cmake openssl
+brew install cmake
 </code></pre>
+<p>The generated codec crates need a lot of compiler memory (about 9.4 GB of rustc RSS for
+the NR RRC codec with debuginfo), so give a full <code>cargo test --workspace</code> 16 GB or more.</p>
 <h2 id="build-from-source"><a class="header" href="#build-from-source">Build from Source</a></h2>
 <p>The Cargo workspace root is <strong><code>nextgcore/src/</code></strong>, not the repository root:</p>
 <pre><code class="language-bash">git clone https://github.com/NextgCoreLab/nextgcore.git
 cd nextgcore/src
 
-cargo build --workspace --release   # all 24 NF binaries + webui
+cargo build --workspace --release   # all 28 NF binaries + webui
 ls target/release/nextgcore-*
 
 cargo build -p nextgcore-amfd       # or build a single NF
@@ -220,7 +221,7 @@ cargo test --workspace -- --nocapture  # with log output
 <p>The Docker E2E stack lives in <code>docker/rust/</code>:</p>
 <pre><code class="language-bash">cd nextgcore/docker/rust
 docker compose up -d      # 5GC + matched RAN simulator + observability
-docker compose ps         # expect 25 containers
+docker compose ps         # expect 26 containers
 bash e2e-test.sh          # run the E2E suite
 </code></pre>
 <p>Overlay compose files extend the baseline stack:</p>
@@ -234,7 +235,7 @@ bash e2e-test.sh          # run the E2E suite
 <tr><td><code>docker-compose.oauth2.yml</code></td><td>OAuth2 enforcement on SBI</td></tr>
 <tr><td><code>docker-compose.kernel-sctp.yml</code></td><td>Native kernel-SCTP N2 transport</td></tr>
 <tr><td><code>docker-compose.features.yml</code></td><td>Rel-17/18 feature harness</td></tr>
-<tr><td><code>docker-compose-epc.yml</code></td><td>4G/EPC stack</td></tr>
+<tr><td><code>docker-compose-epc.yml</code></td><td>4G/EPC stack with nextgsim’s LTE eNB and UE (separate stack, not an overlay)</td></tr>
 </tbody>
 </table>
 </div>
@@ -254,18 +255,25 @@ bash e2e.sh --artifacts DIR        # failure-artifact directory (default: artifa
 <p><code>e2e-test.sh</code> runs the suite directly against an existing stack and accepts <code>--no-build</code>, <code>--keep</code>, <code>--no-preflight</code>, and <code>--overlay NAME</code>. Typical iteration loop:</p>
 <pre><code class="language-bash">bash e2e-test.sh --no-build --keep   # skip rebuild, keep containers for debugging
 </code></pre>
+<p>The 0.2.0 UE flows the nightly CI gates run against a stack left up with <code>--keep</code>:</p>
+<pre><code class="language-bash">bash ue-flow-check.sh all          # paging, idle uplink, de-registration, UDM re-registration
+</code></pre>
+<p>For the EPC, after <code>docker compose -f docker-compose-epc.yml up -d</code>:</p>
+<pre><code class="language-bash">bash epc-attach-check.sh 10.45.0.1 20   # S1 Setup, LTE attach, 20 pings through the default bearer
+</code></pre>
 <p>A multi-UE stress test is also available:</p>
 <pre><code class="language-bash">bash test-multi-ue.sh                # 5 UEs (default)
 bash test-multi-ue.sh --ue-count 10
 </code></pre>
 <h2 id="kubernetes"><a class="header" href="#kubernetes">Kubernetes</a></h2>
-<p>Kubernetes manifests, Helm assets, and a kind config live in <code>k8s/</code>:</p>
+<p>Kind manifests, scripts and a kind config live in <code>k8s/</code>; the Helm chart is in
+<code>deploy/helm/nextgcore/</code> and the EKS deployment in <code>deploy/eks/</code> (see their READMEs):</p>
 <pre><code class="language-bash">cd nextgcore/k8s
 bash deploy.sh                     # deploy the stack
-kubectl get pods -n nextgcore      # verify pods are running
+kubectl get pods -n nextg-system   # verify pods are running
 bash e2e-test.sh                   # run the E2E suite against the cluster
 
-kubectl port-forward svc/jaeger 16686:16686   # traces
+kubectl port-forward -n nextg-system svc/jaeger 16686:16686   # traces
 </code></pre>
 <p>Every NF exposes Prometheus metrics on port 9090 (<code>/metrics</code>); monitoring assets are under <code>k8s/monitoring/</code> and <code>docker/rust/monitoring/</code>. <code>teardown.sh</code> removes the deployment.</p>
 <h2 id="where-configs-live"><a class="header" href="#where-configs-live">Where Configs Live</a></h2>
@@ -277,10 +285,10 @@ kubectl port-forward svc/jaeger 16686:16686   # traces
 ├── scp.yaml, sepp1.yaml, sepp2.yaml
 └── tls/            # SBI TLS material (see also docker/rust/certs/)
 </code></pre>
-<p>Kubernetes configuration lives in <code>k8s/base/</code> and <code>k8s/manifests/</code>. NFs log at <code>info</code> by default, tunable via <code>RUST_LOG</code>.</p>
+<p>Kubernetes configuration lives in <code>k8s/base/</code> and <code>k8s/manifests/</code>. NFs log at <code>info</code> by default, tunable via <code>--log-level</code> (and <code>RUST_LOG</code> in 13 of the 28 NFs; see the <a href="configuration/overview.html">configuration overview</a>).</p>
 <h2 id="next-steps"><a class="header" href="#next-steps">Next Steps</a></h2>
 <ul>
-<li>Read <code>CONTRIBUTING.md</code> for the style gate (<code>cargo fmt --all</code>, <code>cargo clippy --workspace -- -D warnings</code>, <code>cargo audit</code>) and the PR process.</li>
+<li>Read the <a href="contributing.html">Contributing guide</a> for the style gate (<code>cargo fmt --all</code>, <code>cargo clippy --workspace --all-targets</code>, <code>cargo check --all-features</code>, <code>cargo audit</code>) and the PR process.</li>
 <li>Protocol code cites its 3GPP spec in doc comments (e.g. <code>//! TS 23.501 §5.15</code>); key references are TS 23.501/23.502 (architecture/procedures), TS 29.xxx (SBI), TS 38.331 (NR RRC), and TS 38.413 (NGAP).</li>
 <li>Remember the validation caveat: green E2E means the suite passes against the matched simulator — it is not a conformance certification.</li>
 </ul>
@@ -333,7 +341,7 @@ kubectl port-forward svc/jaeger 16686:16686   # traces
 
         <script src="clipboard-1626706a.min.js"></script>
         <script src="highlight-abc7f01d.js"></script>
-        <script src="book-c22b7243.js"></script>
+        <script src="book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

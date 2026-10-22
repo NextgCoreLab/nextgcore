@@ -201,6 +201,100 @@ pub async fn notify_sessions_unrecoverable(reason: &str) -> usize {
     notifiable.len()
 }
 
+/// #687: release every EPC PDN connection after its PGW-U restarted or released
+/// the association. Returns how many Delete Bearer Requests were sent.
+///
+/// The EPC counterpart of [`notify_sessions_unrecoverable`]. A PDN connection that
+/// arrived over S5/S8 has no SM context, no `pfcp_sessions` entry and no AMF to
+/// notify, so that path counted none of them ("0 stale sessions flushed"). The UE
+/// kept a default bearer whose PGW-U session no longer existed, and nobody told the
+/// SGW, the MME or the UE.
+///
+/// TS 23.007 §16 and TS 29.244 §5.22: every PFCP session on a restarted UP function
+/// is gone. The PGW-C deletes the PDN connection toward the SGW with a Delete Bearer
+/// Request naming the default bearer (Linked EBI), so the whole PDN connection goes
+/// (TS 29.274 §7.2.9.2), with cause "Reactivation requested" (TS 29.274 §8.4). The
+/// MME can then have the UE re-attach and build the user plane again on the
+/// restarted PGW-U, the way #667 has a 5G UE re-establish its PDU session.
+///
+/// The session is removed here rather than on the Delete Bearer Response. Nothing
+/// can be kept for it: the user plane is already gone, and a late or missing answer
+/// must not hold the UE's address out of the pool.
+pub async fn release_epc_pdn_connections(reason: &str) -> usize {
+    let Some(server) = crate::gtp_path::s5s8_server() else {
+        return 0;
+    };
+    release_epc_pdn_connections_via(server, crate::gtp_path::GTPC_PORT, reason).await
+}
+
+/// [`release_epc_pdn_connections`] through `server`, addressing each SGW-C at
+/// `sgw_port` (TS 29.274 §4.1 fixes it at 2123; tests bind an ephemeral one).
+pub async fn release_epc_pdn_connections_via(
+    server: &crate::gtp_path::S5S8Server,
+    sgw_port: u16,
+    reason: &str,
+) -> usize {
+    let global = smf_self();
+    // Owned data, so no guard is held across the sends below.
+    let targets: Vec<(crate::context::SmfSess, u8)> = match global.read() {
+        Ok(ctx) => ctx
+            .sess_find_all_by(|s| s.epc && s.sgw_s5c_teid != 0 && s.sgw_s5c_ip.ipv4.is_some())
+            .into_iter()
+            .filter_map(|sess| {
+                // The default bearer is the one the Create Session Request created,
+                // so the first one linked into the session.
+                let ebi = sess
+                    .bearer_ids
+                    .first()
+                    .and_then(|id| ctx.bearer_find_by_id(*id))
+                    .map(|b| b.ebi)?;
+                Some((sess, ebi))
+            })
+            .collect(),
+        Err(_) => return 0,
+    };
+    if targets.is_empty() {
+        return 0;
+    }
+    log::warn!(
+        "PFCP restoration ({reason}): {} EPC PDN connection(s) lost their PGW-U session; \
+         deleting each toward its SGW with cause Reactivation requested",
+        targets.len()
+    );
+    let mut sent = 0;
+    for (sess, ebi) in &targets {
+        let Some(sgw_ip) = sess.sgw_s5c_ip.ipv4 else {
+            continue;
+        };
+        let peer = std::net::SocketAddr::new(std::net::IpAddr::V4(sgw_ip), sgw_port);
+        let request = crate::gtp_build::build_delete_bearer_request(
+            sess,
+            *ebi,
+            *ebi,
+            None,
+            Some(crate::gtp_build::Gtp2Cause::ReactivationRequested),
+        );
+        let seq = server
+            .send_request(
+                peer,
+                request,
+                crate::gtp_build::gtp2_message_type::DELETE_BEARER_REQUEST,
+            )
+            .await;
+        log::warn!(
+            "S5/S8 Delete Bearer Request to {peer} (seq {seq}): LBI {ebi}, SGW TEID {:#x}, \
+             PDN address {:?}, after {reason}",
+            sess.sgw_s5c_teid,
+            sess.ipv4_addr
+        );
+        if let Ok(ctx) = global.read() {
+            ctx.sess_remove(sess.id);
+        }
+        sent += 1;
+    }
+    sent
+}
+
 /// Reconcile one session the UPF says it does not have (TS 29.244 §7.5.3.1
 /// cause 65): drop it locally, persist the smaller map, and tell the AMF.
 ///

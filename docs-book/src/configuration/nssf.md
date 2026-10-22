@@ -4,7 +4,7 @@ The NSSF (Network Slice Selection Function, `nextgcore-nssfd`) selects the netwo
 
 Configuration is split between a YAML file (default path `/etc/nextgcore/nssf.yaml`, overridable with `-c/--config`) and command-line flags, plus two environment variables (`NEXTGCORE_NSSF_STATE_FILE`, `OTEL_EXPORTER_OTLP_ENDPOINT`). Unusually for this codebase, the YAML `nssf.sbi.server` address/port **overrides** the CLI `--sbi-addr`/`--sbi-port` flags — per the code comment, so the NRF NFProfile advertises a routable endpoint instead of `0.0.0.0`.
 
-> **Honesty note:** NSSF behavior is validated by this project's own unit tests and matched-simulator docker E2E only, not by third-party conformance certification. Two stances are explicitly non-strict by design (documented in code comments as matched-sim back-compat): availability updates are **default-allow** — any non-empty NF Id is treated as authorized without an NRF lookup, and with no `supported_snssai_list` configured every reported S-NSSAI is accepted. The NSSF advertises `supportedFeatures: "1"` and does not advertise the REROUTE capability (TS 29.531 §6.1.6.3 per code comment). The `-k/--kill` flag is a stub (logs and exits), and the TLS flags are not wired into the actual HTTP/2 listener (see below).
+> **Honesty note:** NSSF behavior is validated by this project's own unit tests and matched-simulator docker E2E only, not by third-party conformance certification. Two stances are explicitly non-strict by design (documented in code comments as matched-sim back-compat): availability updates are **default-allow** — any non-empty NF Id is treated as authorized without an NRF lookup, and with no `supported_snssai_list` configured every reported S-NSSAI is accepted. The NSSF advertises `supportedFeatures: "1"` and does not advertise the REROUTE capability (TS 29.531 §6.1.6.3 per code comment). The `-k/--kill` flag is refused with an error (not supported), and the TLS flags are not wired into the actual HTTP/2 listener (see below).
 
 ## Example configuration
 
@@ -93,7 +93,7 @@ From the clap `Args` struct in `src/bins/nextgcore-nssfd/src/main.rs`:
 | `-l, --log-file` | path | unset | **Parsed but never used** — no file-logging sink is wired; logs go to the `env_logger` default (stderr). |
 | `-e, --log-level` | string | `info` | Log level (`trace`/`debug`/`info`/`warn`/`error`; unknown values fall back to `info`). |
 | `-m, --no-color` | flag | off | Disable color output. |
-| `-k, --kill` | flag | off | Stub: logs "would send SIGTERM to running instance" and exits without signalling anything. |
+| `-k, --kill` | flag | off | Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor. |
 | `--sbi-addr` | string | `0.0.0.0` | SBI bind address — **overridden** by `nssf.sbi.server[0].address` when the YAML sets it. |
 | `--sbi-port` | u16 | `7777` | SBI port — overridden by `nssf.sbi.server[0].port`. |
 | `--tls` | flag | off | Recorded in the legacy `SbiServerConfig` (`sbi_path.rs`) only; the actual HTTP/2 listener in `main.rs` is built without TLS, so the SBI server always speaks cleartext HTTP/2. |

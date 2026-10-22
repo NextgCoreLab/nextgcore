@@ -15,8 +15,8 @@
         <link rel="icon" href="../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../css/general-0392ca55.css">
-        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
         <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-10d7638c.js";
+            window.path_to_searchindex_js = "../searchindex-c2411517.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-1b88980e.js"></script>
+        <script src="../toc-be5dca41.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -178,13 +178,13 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="mme-configuration"><a class="header" href="#mme-configuration">MME Configuration</a></h1>
-<p>The MME (Mobility Management Entity, <code>nextgcore-mmed</code>) is the 4G/EPS control-plane anchor of the dual 5G+4G core, ported from the C reference <code>src/mme/</code>. Its crate implements the protocol logic for five EPC interfaces: S1AP toward eNBs (APER-encoded via the <code>nextgcore-s1ap</code> codec per TS 36.413, as cited in <code>s1ap_build.rs</code>), NAS EMM/ESM toward UEs (cause codes and bitrate/APN-AMBR encodings per TS 24.301, per code comments) with NAS integrity/ciphering EIA0–EIA3/EEA0–EEA3 (<code>nas_security.rs</code>), S11 GTPv2-C toward the SGW-C (<code>s11_build.rs</code>/<code>s11_handler.rs</code>), S6a Diameter toward the HSS (Application ID 16777251; AIR/ULR/CLR/IDR/PUR grouped-AVP wire format per TS 29.272 §7.3.x, per code comments in <code>fd_path.rs</code>), plus SGsAP toward the MSC/VLR (<code>sgsap_build.rs</code>) and SBc-AP warning-message handling (TS 29.168 / TS 23.041, as cited in <code>sbc_message.rs</code>).</p>
-<p>Configuration is nominally split between a YAML file (default path <code>/etc/nextgcore/mme.yaml</code>, overridable with <code>-c/--config</code>) and command-line flags — but unlike most NextGCore NFs, <strong>this daemon currently parses no YAML at all</strong>. The crate contains no <code>#[derive(Deserialize)]</code> config structs and no file reads; <code>MmeApp::init</code> in <code>src/bins/nextgcore-mmed/src/main.rs</code> receives the config path as <code>_config_path</code> and ignores it. All runtime knobs that exist come from the four CLI flags, one environment variable, and hardcoded defaults in <code>context.rs</code>.</p>
+<p>The MME (Mobility Management Entity, <code>nextgcore-mmed</code>) is the 4G/EPS control-plane anchor of the dual 5G+4G core. It serves S1-MME toward eNBs (S1AP encoded and decoded by <code>nextgcore-s1ap-gen</code>, the codec generated from the TS 36.413 ASN.1; the hand-written S1AP codec was removed, #514), NAS EMM/ESM toward UEs (TS 24.301), S11 GTPv2-C toward the SGW-C, S6a Diameter toward the HSS, and optionally N26 GTPv2-C toward an AMF for EPS↔5GS interworking. The crate also carries SGsAP and SBc-AP message handling.</p>
+<p>Configuration comes from a YAML file (default <code>/etc/nextgcore/mme.yaml</code>, <code>-c/--config</code>), the freeDiameter <code>.conf</code> that file names, a few environment variables, and four CLI flags. A missing or malformed file, or one with no <code>mme:</code> section, logs a warning and leaves the built-in defaults in place (<code>src/bins/nextgcore-mmed/src/config.rs</code>).</p>
 <blockquote>
-<p><strong>Honesty note:</strong> <code>nextgcore-mmed</code> is a protocol-logic port, not yet a wired daemon. The message builders, decoders, state machines (<code>MmeFsm</code>/<code>EmmFsm</code>/<code>EsmFsm</code>/<code>S1apFsm</code>/<code>SgsapFsm</code>), and NAS security functions are real and unit-tested — including proptest state-machine property tests and a 128-EIA2 check against TS 33.401 Annex C.2 Test Set 2, per code comments — but the binary’s main loop only sleeps in 100 ms ticks (the code comment reads “In a real implementation, this would: 1. Poll for S1AP messages from eNBs…”). No SCTP/UDP socket is bound anywhere in the crate: <code>gtp_open</code> just sets a flag, and the S6a Diameter client is created in deferred-connect mode and never connected from <code>main</code>. The MME is <strong>not</strong> exercised by the 84/84 docker E2E suite (that suite covers the 5GC); validation is in-crate unit and property tests only, not third-party certification.</p>
+<p><strong>Honesty note:</strong> the nightly <code>Docker E2E (EPC)</code> job attaches a real LTE UE through nextgsim’s eNB to this MME and pings through the default bearer with 0% loss (<code>docker/rust/epc-attach-check.sh</code>). Dedicated bearers, handover, idle mode/paging and IPv6 PDN are not asserted there. This is the project’s own matched-simulator validation, not third-party certification.</p>
 </blockquote>
 <h2 id="example-configuration"><a class="header" href="#example-configuration">Example configuration</a></h2>
-<p>From <code>nextgcore/docker/rust/configs/epc/mme.yaml</code> (mounted by <code>docker-compose-epc.yml</code>, which runs the daemon as <code>-c /etc/nextgcore/mme.yaml</code> at <code>172.24.0.5</code> and publishes <code>36412/sctp</code>):</p>
+<p>From <code>nextgcore/docker/rust/configs/epc/mme.yaml</code> (mounted by <code>docker-compose-epc.yml</code>, which runs the daemon as <code>-c /etc/nextgcore/mme.yaml</code> at <code>172.24.0.5</code> and publishes <code>36412/sctp</code>; abridged, the shipped file also carries a commented-out <code>overload:</code> block):</p>
 <pre><code class="language-yaml"># NextGCore MME Configuration for Docker EPC Deployment
 # Rust implementation
 
@@ -235,24 +235,30 @@ mme:
   mme_name: nextgcore-mme0
 </code></pre>
 <h2 id="yaml-parameters"><a class="header" href="#yaml-parameters">YAML parameters</a></h2>
-<p><strong>None.</strong> The daemon deserializes no YAML fields: there are no <code>#[derive(Deserialize)]</code> structs in <code>src/bins/nextgcore-mmed/src/</code> and no <code>serde</code>/<code>std::fs</code> usage in the crate. The values an operator would expect to set in YAML are instead hardcoded defaults in <code>MmeContext::new()</code> (<code>src/bins/nextgcore-mmed/src/context.rs</code>):</p>
+<p>All keys live under <code>mme:</code>. Every field is optional.</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Setting (in-memory field)</th><th>Hardcoded value</th><th>Notes</th></tr>
+<tr><th>Parameter</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>s1ap_port</code></td><td><code>36412</code></td><td>S1AP port constant; no listener is actually bound.</td></tr>
-<tr><td><code>sgsap_port</code></td><td><code>29118</code></td><td>SGsAP port constant; no listener is actually bound.</td></tr>
-<tr><td><code>relative_capacity</code></td><td><code>255</code></td><td>RelativeMMECapacity advertised in S1 Setup Response builders.</td></tr>
-<tr><td><code>mme_ue_s1ap_id</code></td><td>starts at <code>1</code></td><td>Wraps back to 1 on reaching the invalid value <code>0xffffffff</code>.</td></tr>
-<tr><td><code>served_gummei</code>, <code>served_tai</code>, <code>integrity_order</code>, <code>ciphering_order</code>, <code>network_name</code>, <code>mme_name</code>, timers (<code>t3402</code>/<code>t3412</code>/<code>t3423</code>)</td><td>empty / <code>Default</code></td><td><code>MmeContext</code> has fields for all of these, but nothing populates them from the YAML file.</td></tr>
+<tr><td><code>freeDiameter</code></td><td>path</td><td>none</td><td>freeDiameter <code>.conf</code> read for the S6a identity, realm, listen address and the HSS peer: <code>ConnectPeer = "&lt;id&gt;" { ConnectTo = "&lt;addr&gt;"; }</code> becomes the peer mmed dials (port <code>3868</code> when the file names none). Without a <code>ConnectPeer</code> with <code>ConnectTo</code>, no S6a peer is dialled and the warning says so.</td></tr>
+<tr><td><code>s1ap.server[].address</code> / <code>.port</code></td><td>string / u16</td><td>none / <code>36412</code></td><td>S1-MME bind address. Only the first entry is bound; extra entries are named in a warning.</td></tr>
+<tr><td><code>gtpc.server[].address</code> / <code>.port</code></td><td>string / u16</td><td>none / <code>2123</code></td><td>S11 GTP-C bind address. Only the first is bound.</td></tr>
+<tr><td><code>gtpc.client.sgwc[].address</code> / <code>.port</code></td><td>string / u16</td><td>none / <code>2123</code></td><td>SGW-C S11 peer. The first is used for every session (TS 23.401 SGW selection by DNS is not implemented; a second entry is named in a warning). <code>gtpc.client.smf</code> is accepted and unused (the PGW-C is the SGW-C’s peer, not the MME’s).</td></tr>
+<tr><td><code>n26.server[].address</code> / <code>.port</code></td><td>string / u16</td><td>none / <code>2123</code></td><td>N26 GTP-C bind address toward an AMF (#347). Read always, bound only when <code>MME_N26_INTERWORKING</code> is on.</td></tr>
+<tr><td><code>n26.client.amf[].address</code> / <code>.port</code></td><td>string / u16</td><td>none / <code>2123</code></td><td>AMF N26 peer for Context Request / Forward Relocation.</td></tr>
+<tr><td><code>gummei[]</code></td><td>list</td><td>empty</td><td>Served GUMMEIs: <code>plmn_id.{mcc,mnc}</code> (string or int), <code>mme_gid</code> (u16), <code>mme_code</code> (u8). With none configured every S1 Setup is answered with S1 Setup Failure (TS 36.413 §8.7.3.4).</td></tr>
+<tr><td><code>tai[]</code></td><td>list</td><td>empty</td><td>Served TAIs: <code>plmn_id</code>, <code>tac</code> (u16).</td></tr>
+<tr><td><code>security.integrity_order</code> / <code>.ciphering_order</code></td><td>list of strings</td><td>built-in order</td><td><code>EIA0</code>–<code>EIA3</code> / <code>EEA0</code>–<code>EEA3</code>. A configured list replaces the built-in one.</td></tr>
+<tr><td><code>network_name.full</code> / <code>.short</code></td><td>string</td><td>none</td><td>Network names sent to the UE.</td></tr>
+<tr><td><code>mme_name</code></td><td>string</td><td>none</td><td>MME name.</td></tr>
+<tr><td><code>time.t3402.value</code> / <code>t3412.value</code> / <code>t3423.value</code></td><td>u64 (s)</td><td>built-in</td><td>EMM timers signalled to the UE.</td></tr>
+<tr><td><code>overload.max_ue</code></td><td>usize</td><td><code>0</code> (off)</td><td>Above this many attached UEs the MME sends S1AP OVERLOAD START to every eNB, and OVERLOAD STOP when the count falls to 90% of it (TS 36.413 §8.7.6).</td></tr>
 </tbody>
 </table>
 </div>
-<h3 id="parsed-but-inert--decorative-yaml-fields"><a class="header" href="#parsed-but-inert--decorative-yaml-fields">Parsed-but-inert / decorative YAML fields</a></h3>
-<p>Because the config file is never read, <strong>every field in the shipped <code>mme.yaml</code> is decorative</strong> for this daemon: <code>logger.*</code>, <code>global.max.*</code>, <code>mme.freeDiameter</code>, <code>mme.s1ap.server</code>, <code>mme.gtpc.server/client</code>, <code>mme.metrics.server</code>, <code>mme.gummei</code>, <code>mme.tai</code>, <code>mme.security.integrity_order/ciphering_order</code>, <code>mme.network_name</code>, and <code>mme.mme_name</code>. The file documents the intended deployment shape (its keys mirror the <code>MmeContext</code> fields above) but changing it has no effect on the running binary.</p>
-<p>The same applies to the freeDiameter configs: <code>docker-compose-epc.yml</code> mounts <code>configs/epc/freeDiameter/</code> (containing <code>mme.conf</code>, <code>hss.conf</code>, <code>pcrf.conf</code>) at <code>/etc/freeDiameter:ro</code>, and the YAML points at <code>/etc/freeDiameter/mme.conf</code>, but the daemon never opens these files. The S6a stack is pure Rust (<code>nextgcore-diameter</code>); its <code>DiameterConfig</code> would be supplied programmatically to <code>mme_fd_init_async()</code>, which <code>main</code> does not call.</p>
+<p>Not read: <code>logger.*</code>, <code>global.max.*</code>, <code>mme.metrics.server</code>.</p>
 <h2 id="command-line-flags"><a class="header" href="#command-line-flags">Command-line flags</a></h2>
 <p>From the clap <code>Args</code> struct in <code>src/bins/nextgcore-mmed/src/main.rs</code>:</p>
 <div class="table-wrapper">
@@ -261,22 +267,31 @@ mme:
 <tr><th>Flag</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/mme.yaml</code></td><td>Configuration file path. Logged at startup, then <strong>ignored</strong> (<code>init</code> takes it as <code>_config_path</code>).</td></tr>
+<tr><td><code>-c, --config</code></td><td>path</td><td><code>/etc/nextgcore/mme.yaml</code></td><td>Configuration file path.</td></tr>
 <tr><td><code>-l, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>); unrecognized values fall back to <code>info</code>.</td></tr>
-<tr><td><code>--no-color</code></td><td>flag</td><td>off</td><td>Parsed but never referenced after parsing — has no effect.</td></tr>
-<tr><td><code>-d, --daemon</code></td><td>flag</td><td>off</td><td>Parsed but never referenced after parsing — has no effect.</td></tr>
+<tr><td><code>--no-color</code></td><td>flag</td><td>off</td><td>Disable colored output.</td></tr>
+<tr><td><code>-d, --daemon</code></td><td>flag</td><td>off</td><td>Daemon mode.</td></tr>
 </tbody>
 </table>
 </div>
-<h2 id="behavior-notes"><a class="header" href="#behavior-notes">Behavior notes</a></h2>
-<ul>
-<li><strong>The config file is logged, not loaded.</strong> Startup prints <code>Configuration: &lt;path&gt;</code>, then initializes the global <code>MmeContext</code> (a <code>OnceLock</code> singleton) purely from hardcoded defaults. Operators cannot currently change GUMMEI/TAI, security algorithm order, or peer addresses without recompiling.</li>
-<li><strong>S6a is deferred-connect and never connected by <code>main</code>.</strong> <code>mme_fd_init()</code> only initializes client state; <code>mme_fd_init_async(config, hss_addr)</code> plus <code>mme_fd_connect()</code> (which retries the HSS connection 3 times via <code>connect_with_retry(3)</code>) exist in <code>fd_path.rs</code> but are not invoked from the binary’s startup path. HSS-initiated CLR/IDR polling (<code>TS 29.272 §7.2.7/7.2.9</code> mandatory-AVP checks, per code comments) is implemented in the same module.</li>
-<li><strong>Environment variables:</strong> the only one this binary reads is <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> (default <code>http://jaeger:4317</code>) for OpenTelemetry trace export at startup. Note that <code>RUST_LOG</code> is <strong>not</strong> honored — logging uses <code>env_logger::Builder::new().filter_level(...)</code> without parsing the environment, so the level comes solely from <code>-l/--log-level</code>. The <code>RUST_LOG: info</code> set in <code>docker-compose-epc.yml</code> is therefore inert for the MME.</li>
-<li><strong>Docker publishes <code>36412/sctp</code>, but nothing listens.</strong> The compose file’s port mapping and the <code>kill -0 1</code> healthcheck both succeed because the process stays alive in its sleep loop, not because S1AP is serviceable.</li>
-<li><strong>Built-in capacity constants</strong> (<code>context.rs</code>): max 8 served GUMMEIs, 16 supported TAs, 6 PLMNs per MME, 4 sessions and 8 bearers per UE, EPS bearer IDs 5–15. GUTI space is 256 MME group IDs × 256 MME codes per MME.</li>
-<li><strong>What is real and tested:</strong> S1AP APER decode/dispatch including S1 handover paths (TS 36.413, per code comments), UE paging identity index <code>IMSI mod 1024</code> (TS 36.304 §7.1, per code comment), byte-level NAS builders with TAI-list encoding (TS 24.301 §9.9.3.33, per code comment), GTPv2-C S11 builders with TS 23.003 APN label encoding, SBc-AP/ETWS message codecs (TS 23.041), and proptest-based FSM equivalence tests (<code>property_tests.rs</code>) — all as library logic exercised by <code>cargo test</code>, not over the wire by this binary.</li>
-</ul>
+<h2 id="cargo-feature-kernel-sctp"><a class="header" href="#cargo-feature-kernel-sctp">Cargo feature: <code>kernel-sctp</code></a></h2>
+<p>S1-MME runs <strong>only</strong> over native Linux kernel SCTP: mmed offers no userspace (sctp-proto) S1 backend. Built without <code>--features kernel-sctp</code> the daemon starts, binds nothing on 36412, and logs that S1-MME is absent, so no eNB can connect. The Docker builder (<code>docker/rust/Dockerfile.builder</code>) compiles mmed with the feature; it needs <code>libsctp</code> at build and run time and the host <code>sctp</code> kernel module.</p>
+<h2 id="environment-variables"><a class="header" href="#environment-variables">Environment variables</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Variable</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>MME_N26_INTERWORKING</code></td><td>off</td><td><code>1</code>/<code>true</code> binds the N26 socket and enables EPS↔5GS interworking (idle-mode context transfer, connected-mode handover). Off: a standalone EPC, and a UE arriving from 5GS is handled as TS 24.301 requires of an MME with no N26.</td></tr>
+<tr><td><code>MME_ECHO_INTERVAL_SECS</code></td><td><code>60</code></td><td>GTPv2-C Echo (path management) interval; <code>0</code> disables it.</td></tr>
+<tr><td><code>MME_RESTART_COUNTER_FILE</code></td><td><code>/var/lib/nextgcore/mme-restart-counter</code></td><td>Where the TS 23.007 restart counter is persisted; it is advanced on every start.</td></tr>
+<tr><td><code>MME_RESTART_COUNTER</code></td><td>unset</td><td>Fixed restart counter (u8), overriding the persisted one.</td></tr>
+<tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td><code>http://jaeger:4317</code></td><td>OpenTelemetry OTLP exporter.</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>RUST_LOG</code> is <strong>not</strong> honoured: the logger is built with <code>env_logger::Builder::new().filter_level(...)</code>, so the level comes only from <code>-l/--log-level</code>, and the <code>RUST_LOG: info</code> in <code>docker-compose-epc.yml</code> has no effect on the MME.</p>
 
                     </main>
 
@@ -326,7 +341,7 @@ mme:
 
         <script src="../clipboard-1626706a.min.js"></script>
         <script src="../highlight-abc7f01d.js"></script>
-        <script src="../book-c22b7243.js"></script>
+        <script src="../book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

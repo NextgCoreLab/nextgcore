@@ -17,8 +17,8 @@ this path end-to-end is a **separate repository** — here it appears only as th
 peer on the far side of the N2 (NGAP) association.
 
 > **Honesty note:** This registration flow is validated by NextGCore's own unit
-> tests and matched-simulator docker E2E (84/84 green as of 2026-07-02), **not**
-> by third-party conformance certification. The implementation drives **5G-AKA
+> tests and matched-simulator docker E2E (nightly in `.github/workflows/ci.yml`),
+> **not** by third-party conformance certification. The implementation drives **5G-AKA
 > only** on the live path (the AMF's EAP-AKA′ Authentication-Request builder is
 > compiled but unreferenced — see *Simplifications and known gaps*), takes a
 > number of documented wire-format and control-plane shortcuts, and matches a
@@ -39,8 +39,11 @@ peer on the far side of the N2 (NGAP) association.
 | NRF | `nextgcore-nrfd` | On-demand NF discovery for every peer above | [NRF](../configuration/nrf.md) |
 
 Supporting libraries: `nextgcore-nas` (5GMM message codec, SUCI, NAS security),
-`nextgcore-ngap` + `nextgcore-asn1c` (NGAP/APER), and `nextgcore-sctp` (the N2
-transport). The NSSF (`nextgcore-nssfd`) is listed here only to say what does
+`nextgcore-ngap-gen` (the NGAP APER codec generated from the TS 38.413 ASN.1;
+the AMF's wrappers around it live in `src/bins/nextgcore-amfd/src/ngap_asn1.rs`),
+`nextgcore-ngap` (the typed message structs those wrappers fill in; its
+hand-written APER builders and `nextgcore-asn1c` survive only as test oracles,
+deletion tracked in #417), and `nextgcore-sctp` (the N2 transport). The NSSF (`nextgcore-nssfd`) is listed here only to say what does
 **not** happen: it is **not** consulted during registration (see step 12).
 
 ## The N2 transport underneath
@@ -63,9 +66,9 @@ identically over either transport once bytes arrive at `handle_ngap_message`.
 ## The initial NAS message
 
 1. **gNB → AMF: `InitialUEMessage`.** The dispatcher in `ngap_path.rs`
-   (procedure code 15) routes to `handle_initial_ue_message`, which parses the
-   PDU with `crate::ngap_asn1::parse_initial_ue_message_asn1` into an
-   `InitialUeMessageData` (RAN-UE-NGAP-ID, NAS-PDU, PLMN, TAC, NR-CGI). It
+   (procedure code 15) routes to `handle_initial_ue_message`, which decodes the
+   PDU with the generated codec (`crate::ngap_asn1::decode_initial_ue_message_asn1`)
+   into an `InitialUeMessageData` (RAN-UE-NGAP-ID, NAS-PDU, PLMN, TAC, NR-CGI). It
    allocates an AMF-UE-NGAP-ID, creates a `UeNasContext` (seeded with
    `crate::context::nas_security_canary()`), records the TAI and 3GPP access
    type, and switches on the inner NAS message type. A `REGISTRATION_REQUEST`
@@ -73,9 +76,13 @@ identically over either transport once bytes arrive at `handle_ngap_message`.
    `integrity_protected = false` — this is an unprotected initial NAS message.
    Logs `Initial UE Message from association …`.
 
-   A `SERVICE_REQUEST` arriving in an `InitialUEMessage` with no stored context
-   is rejected with 5GMM cause #9 (`build_service_reject`) — the code comment
-   cites TS 24.501 §5.6.1.5.
+   Two integrity-protected initial NAS messages are recognised before that
+   dispatch: a **Service Request** from CM-IDLE (`initial_service_request_plain`
+   → `handle_idle_service_request`, which also answers a page, #512/#648) and a
+   **Registration Request from CM-IDLE** over an existing NAS security context
+   (`open_idle_registration_request`, #609). A plain `SERVICE_REQUEST` that
+   reaches the dispatch with no stored context is rejected with 5GMM cause #9
+   (`build_service_reject`) — the code comment cites TS 24.501 §5.6.1.5.
 
 2. **Registration Request parsing + cleartext gate.**
    `handle_registration_request_nas` (`ngap_path.rs`) runs
@@ -289,7 +296,8 @@ UE            gNB           AMF(amfd)        AUSF(ausfd)      UDM(udmd)     UDR(
 14. **AMF → gNB: `InitialContextSetupRequest` (Registration Accept piggybacked).**
     The AMF derives `KgNB = nextgcore_kdf_kgnb_and_kn3iwf(Kamf, ul_count,
     access_type_distinguisher)` (per code comment TS 33.501 Annex A.9) and calls
-    `ngap_asn1::build_initial_context_setup_request_asn1` to carry the GUAMI, the
+    `ngap_asn1::build_initial_context_setup_request_asn1` (generated codec, #417
+    stage 7) to carry the GUAMI, the
     **replayed** UE security capabilities, the UE Security Key (KgNB), the Allowed
     NSSAI, the UE-AMBR, and — as the NAS-PDU — the protected Registration Accept.
     It sends this to the gNB and arms T3550 against the whole ICS PDU (so a
@@ -364,9 +372,10 @@ registration:
   new NAS-security path without a code change.
 - **Fire-and-forget policy legs behind kill-switches.** Both the UE-policy
   association (`AMF_UE_POLICY_ASSOC`) and its delivery (`PCF_UE_POLICY_DELIVERY`)
-  can be disabled, restoring the pre-Wave-6 byte flow. Some inbound AMF SBI
-  callbacks (am-policy-notify, sdm-subscription-notify) are noted in
-  `sbi_path.rs` as "still-unserved".
+  can be disabled, restoring the pre-Wave-6 byte flow. The AMF serves the
+  `dereg-notify`, `ue-policy-notify`, `sm-context-status` and `ucmf-notify`
+  callbacks (`namf_server.rs`), but not the `am-policy-notify` URI it hands the
+  PCF in `Npcf_AMPolicyControl_Create`.
 - **Config loading is lenient.** An unreadable/unparsable `amf.yaml` logs a
   warning and continues with built-in defaults (`load_config` in
   `lib.rs`) — a running AMF is not proof your config was applied. See the
@@ -416,6 +425,8 @@ Registration Accept piggybacked
 and on the simulator side `Sending Registration Request` … `Registration
 Accept: UE is now …` … `Sending Registration Complete`. The suite then verifies
 the data plane by pinging **through the UE's GTP-U tunnel** and finishes at
-`UE PDU session 1 ACTIVE with IPv4 address`. The full baseline was **84/84 green
-on 2026-07-02**. This is functional validation against a cooperative peer — it
-is not third-party conformance certification.
+`UE PDU session 1 ACTIVE with IPv4 address`. The nightly CI additionally drives
+the same UE through CM-IDLE, paging, Service Request, de-registration and
+UDM-triggered re-registration (`docker/rust/ue-flow-check.sh`). This is
+functional validation against a cooperative peer — it is not third-party
+conformance certification.

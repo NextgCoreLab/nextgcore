@@ -2,76 +2,88 @@
 
 ## GitHub Actions workflows
 
-Two workflows live in `.github/workflows/`.
+Three workflows live in `.github/workflows/`: `ci.yml`, `release.yml` and `pages.yml`.
 
-### `ci.yml` — build, lint, test, container E2E
+### `ci.yml` — build, lint, test, fuzz-target build, cross-repo E2E
 
-| Job | Command | Gates on |
-|-----|---------|----------|
-| **Check** | `cd src && cargo check --workspace` | compile errors |
-| **Format** | `cd src && cargo fmt --all -- --check` | rustfmt drift (fails on any diff) |
-| **Clippy** | `cd src && cargo clippy --workspace` | **errors only** — style warnings are shown but do not fail CI (see the note in the job) |
-| **Test** | `cd src && cargo test --workspace` | any failing test |
-| **Docker Build** | builds `Dockerfile.builder` → extracts binaries → builds `Dockerfile.core` + per-NF `Dockerfile.nf` | image build failures (needs the sibling `nextgsim` checkout) |
-| **Docker E2E** | brings up the 5GC stack (mongodb, nrf, ausf/udm/udr/pcf/nssf/bsf, amf/smf/upf) and health-checks NRF/AMF | startup / health failures |
-| **Docker E2E (EPC)** | brings up the 4G EPC stack from `docker-compose-epc.yml` and inspects hss/pcrf/sgwc/sgwu/mme | startup / health failures |
+Triggers: push and pull request to `main` (and the legacy `initial_commit` branch),
+a nightly `schedule` (`cron: "0 4 * * *"`, 04:00 UTC), and manual `workflow_dispatch`.
 
-> **Docker jobs are opt-in.** `docker-build` (and the dependent `docker-e2e`/`docker-e2e-epc`) run **only on manual `workflow_dispatch`** (Actions tab → Run workflow), not on push/PR — they recompile both workspaces in a container and need a cross-repo checkout, so they are too heavy/fragile for every commit. The fast gate (Check/Format/Clippy/Test) protects every push/PR.
+| Job | What it runs | When |
+|-----|--------------|------|
+| **Check** | `cargo check --workspace`, then `cargo check --workspace --all-features --all-targets` (every cargo feature of every crate must compile) | every push/PR |
+| **Format** | `cargo fmt --all -- --check` | every push/PR |
+| **Clippy** | `cargo clippy --workspace`, plus `-p nextgcore-easdfd --features dns-udp --all-targets` | every push/PR (errors gate; warnings are shown) |
+| **Test** | `cargo test --workspace`, plus `cargo test -p nextgcore-easdfd --features dns-udp`. No retry: a red run is a real failure. The job adds swap and disables test debuginfo because the generated RRC codec crates need a lot of rustc memory | every push/PR |
+| **Fuzz targets build** | `src/fuzz` is its own workspace: `cargo fmt -- --check` and `cargo clippy --locked --bins -- -D warnings` there | every push/PR |
+| **Docker Build** | checks out the sibling `nextgsim`, records the (nextgcore, nextgsim) commit pair, builds `Dockerfile.builder` → binaries → `Dockerfile.core` + per-NF `Dockerfile.nf` images, and fails if any expected image is missing | nightly + dispatch |
+| **Docker E2E** | brings up the 5GC (mongodb, nrf, ausf/udm/udr/pcf/nssf/bsf, amf/smf/upf), registers a real nextgsim UE over N2, asserts the Namf event notifications, drives a CM-IDLE → Service Request cycle and a gNB-initiated UE Context Release, then runs the **0.2.0 UE-flow gate** (`docker/rust/ue-flow-check.sh`): downlink paging of an idle UE, uplink from CM-IDLE, a page after a Service Request, UE-initiated de-registration + re-registration, and UDM `REREGISTRATION_REQUIRED` re-registration, each ending in a 0%-loss ping. A second stage brings up the OAuth2 overlay and asserts authenticated token exchange | nightly + dispatch |
+| **Docker E2E (EPC)** | brings up `docker-compose-epc.yml` (hss, pcrf, sgwc, sgwu, pgwc, pgwu, mme), waits for the Sxa and Sxb PFCP associations, then attaches a real LTE UE through nextgsim's eNB (`docker/rust/epc-attach-check.sh`) and pings through the default bearer with 0% loss. Dedicated bearers, handover, idle mode/paging and IPv6 PDN are not asserted | nightly + dispatch |
+| **Record the validated commit pair** | runs only if Docker Build and both E2E jobs passed; uploads `validated-pair.json` naming the nextgcore and nextgsim commits that passed together | nightly + dispatch |
 
-`Test`/`Clippy` depend on `Check`; the two Docker E2E jobs depend on `Docker Build`.
+`Test`/`Clippy` depend on `Check`; the Docker E2E jobs depend on `Docker Build`.
 
-**The `Test` job runs `cargo test --workspace` at the runner's default parallelism.** Tests
-that touch process-global NF state (a `<nf>_context_init` or `std::env::set_var`) must serialize
-on their crate's `test_support::CONTEXT_GUARD`, or they race and flake here — see
-`docker/rust/CI.md` and the per-crate test guards.
+Tests that touch process-global NF state (a `<nf>_context_init` or `std::env::set_var`) must
+serialize on the lock declared beside that global, or they race under the default parallelism.
 
-The richer matched-sim data-plane E2E (registration + PDU session + GTP-U ping) is **not** run by
-`ci.yml`; it is the one-command `docker/rust/e2e.sh` (documented in `docker/rust/CI.md`).
+The local one-command matched-sim E2E, `docker/rust/e2e.sh`, is documented in
+[`docker/rust/CI.md`](../docker/rust/CI.md).
+
+### `release.yml` — paired release
+
+nextgcore and nextgsim are one system under test, so a release is the **promotion of a commit
+pair that passed the nightly E2E together**, not "tag main". `release.yml` is
+`workflow_dispatch` only, with inputs:
+
+| Input | Meaning |
+|-------|---------|
+| `version` | the version to release this repo as (e.g. `0.2.0`) |
+| `validated_run_id` | the CI run whose `validated-pair.json` authorises the release (a green nightly) |
+| `paired_version` | the nextgsim version released alongside |
+| `dry_run` | default `true`: validate and print the notes without writing anything |
+
+The workflow validates the manifest, refuses to re-release an existing tag, generates release
+notes from `git log <previous-tag>..<validated sha>`, bumps `[workspace.package] version` in
+`src/Cargo.toml`, commits, tags the bump commit, and creates the GitHub release. nextgsim has a
+sibling workflow that tags itself from the same manifest.
 
 ### `pages.yml` — documentation site
 
 Deploys `docs/` to GitHub Pages (runs `docs/scripts/update-api-docs.sh`, uploads `docs/`).
-Triggered **only when a GitHub release is published** (`on: release: [published]`) so the site
-tracks the last release, plus `workflow_dispatch` for a manual re-deploy — it does **not** redeploy
-on every `docs/**` push.
+Triggers: `release: [published]` and `workflow_dispatch`. It does not redeploy on every
+`docs/**` push. A release created by `release.yml` with the default `GITHUB_TOKEN` does not
+start other workflows (a GitHub Actions rule), so after a release run `pages.yml` by hand
+from the Actions tab.
 
-## Branch triggers
-
-Both workflows run on the default release branch **`main`** and on the development branch
-**`initial_commit`**:
-
-```yaml
-on:
-  push:    { branches: [initial_commit, main] }
-  pull_request: { branches: [initial_commit, main] }
-```
-
-(`ci.yml` on push + PR to either branch. `pages.yml` is **not** branch-triggered — it deploys the
-docs site when a release is published; see below.)
+The mdBook sources live in `docs-book/`; `mdbook build docs-book` writes the book into
+`docs/book/`, which is committed and served under `/book/`.
 
 ## Local pre-push gate (mirror of CI)
 
-Run from `src/` in both repos before pushing:
+Run from `src/` before pushing:
 
 ```bash
-cargo fmt --all -- --check      # Format
-cargo check --workspace         # Check
-cargo clippy --workspace        # Clippy (errors only)
-cargo test --workspace          # Test
+cargo fmt --all -- --check                                  # Format
+cargo check --workspace --all-features --all-targets        # Check
+cargo clippy --workspace                                    # Clippy
+cargo test --workspace                                      # Test
+(cd fuzz && cargo clippy --locked --bins -- -D warnings)    # Fuzz targets build
 ```
 
-Optionally the full data-plane E2E: `cd docker/rust && ./e2e.sh`.
+Optionally the data-plane E2E: `cd docker/rust && ./e2e.sh`.
 
 ## Cutting a release
 
-1. Ensure `main` (or the release branch) is green in CI and the matched-sim E2E passes (`docker/rust/e2e.sh` → 84/84).
-2. Bump the workspace version in `src/Cargo.toml` (`[workspace.package] version`) if used, and per-crate versions as needed. Current: `0.1.0`.
-3. Move the `## [Unreleased]` section of `CHANGELOG.md` under a dated `## [X.Y.Z]` heading; add a fresh empty `Unreleased`.
-4. Commit (`Signed-off-by: Murat Parlakisik <parlakisik@gmail.com>`), tag `X.Y.Z`, push the tag.
-5. Create the GitHub release from the tag, pasting the CHANGELOG section as the release notes:
-   `gh release create X.Y.Z --repo NextgCoreLab/nextgcore --title "NextGCore X.Y.Z" --notes-file <(...)`.
-   Publishing the release fires `pages.yml`, which deploys the docs site for this version.
+1. Pick a green nightly `ci.yml` run on `main`; note its run id. Its `validated-pair.json`
+   artifact names the nextgcore and nextgsim commits it validated.
+2. Move the `## [Unreleased]` section of `CHANGELOG.md` under a dated `## [X.Y.Z]` heading and
+   merge that to `main` (the release notes the workflow publishes come from `git log`, not from
+   the CHANGELOG).
+3. Run `release.yml` with `version`, `validated_run_id`, `paired_version` and `dry_run=true`;
+   read the notes in the job summary. Re-run with `dry_run=false` to tag and publish.
+4. Do the same in nextgsim with the same run id.
+5. Run `pages.yml` by hand to publish the docs site for the release.
 
-> **Honesty in release notes:** keep the validation caveat — spec-text + golden-vector + strict-peer
-> + matched-sim E2E, **not** TTCN-certified or third-party-interop tested. 6G/Rel-20 items are
-> research prototypes (no frozen stage-3 spec).
+> **Honesty in release notes:** keep the validation caveat: spec text, golden vectors, strict
+> peers and the matched-sim E2E, **not** TTCN-certified or third-party-interop tested. 6G/Rel-20
+> items are research prototypes (no frozen stage-3 spec).

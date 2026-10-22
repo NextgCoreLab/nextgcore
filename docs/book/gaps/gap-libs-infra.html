@@ -15,8 +15,8 @@
         <link rel="icon" href="../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../css/general-0392ca55.css">
-        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
         <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-10d7638c.js";
+            window.path_to_searchindex_js = "../searchindex-c2411517.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-1b88980e.js"></script>
+        <script src="../toc-be5dca41.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -182,7 +182,7 @@
 <p>Generated: 2026-02-07 | Scope: 9 infrastructure libraries under nextgcore/src/libs/</p>
 </blockquote>
 <blockquote>
-<p><strong>Partial staleness (2026-07):</strong> Most entries here remain accurate, with corrections: <code>nextgcore-dbi</code> is now consumed by <code>nextgcore-udrd</code> (in-memory Nudr <code>data_store</code> via the <code>test-helpers</code> feature), so it is no longer unused. Note: SBI TLS/mTLS + OAuth2 and the NGAP/S1AP/PFCP protocol codecs are covered in gap-libs-proto.md, which is now substantially out of date - see its notice. Post-quantum crypto is still absent (<code>nextgcore-crypt</code> remains 0% PQC).</p>
+<p><strong>Partial staleness (updated 2026-10, pre-0.2.0):</strong> The module counts and percentages below are the 2026-02-07 snapshot. Corrections: <code>nextgcore-dbi</code> is consumed by <code>nextgcore-udrd</code> (in-memory Nudr <code>data_store</code> via the <code>test-helpers</code> feature), so it is not unused. There is no <code>nextgcore-ffi</code> crate in this repository (<code>ls src/libs</code>); its row and section describe nothing that ships. <code>nextgcore-crypt</code> is not “0% PQC”: it has <code>ml_kem.rs</code> (FIPS 203), <code>ml_dsa.rs</code> and <code>hybrid.rs</code> modules, and since 0.1.0 TUAK (TS 35.231) and key zeroization (#331); SBI TLS can negotiate hybrid X25519MLKEM768 behind the <code>pqc-tls</code> feature (#30). <code>nextgcore-core</code> gained the shared <code>state_store</code> the persisting NFs use. <code>nextgcore-metrics</code>’ <code>MetricsServer</code> is still a stub, but <code>nes_energy::serve_metrics</code> serves <code>/metrics</code> for smfd, upfd and sgwud (see the Observability chapter of the book). The UPF still does not use <code>nextgcore-tun</code>. SBI TLS/mTLS + OAuth2 and the protocol codecs are covered in gap-libs-proto.md; see its notice.</p>
 </blockquote>
 <hr>
 <h2 id="overview"><a class="header" href="#overview">Overview</a></h2>
@@ -196,7 +196,7 @@
 <tr><td>nextgcore-app</td><td>Application framework (config, init)</td><td>4</td><td><strong>80%</strong></td><td>Low</td></tr>
 <tr><td>nextgcore-crypt</td><td>3GPP cryptographic algorithms</td><td>10</td><td><strong>80%</strong></td><td>Low</td></tr>
 <tr><td>nextgcore-dbi</td><td>MongoDB database interface</td><td>5</td><td><strong>70%</strong></td><td>Low</td></tr>
-<tr><td>nextgcore-ffi</td><td>FFI bindings for C comparison testing</td><td>2</td><td><strong>90%</strong></td><td>N/A</td></tr>
+<tr><td>nextgcore-ffi</td><td>FFI bindings for C comparison testing (not in this repository)</td><td>—</td><td>—</td><td>N/A</td></tr>
 <tr><td>nextgcore-metrics</td><td>Prometheus metrics collection</td><td>5</td><td><strong>75%</strong></td><td>Medium</td></tr>
 <tr><td>nextgcore-tun</td><td>TUN/TAP device management</td><td>4</td><td><strong>80%</strong></td><td>Low</td></tr>
 <tr><td>nextgcore-ipfw</td><td>IP firewall rule parsing</td><td>3</td><td><strong>85%</strong></td><td>Low</td></tr>
@@ -340,7 +340,7 @@
 <h3 id="completeness-70"><a class="header" href="#completeness-70">Completeness: <strong>70%</strong></a></h3>
 <hr>
 <h2 id="5-nextgcore-ffi--ffi-bindings"><a class="header" href="#5-nextgcore-ffi--ffi-bindings">5. nextgcore-ffi – FFI Bindings</a></h2>
-<p>Testing utility for C comparison. Provides stub bindings by default, optional generated bindings.</p>
+<p>Not present in this repository (<code>src/libs/</code> has no such crate). The original snapshot described it as a testing utility for C comparison. Provides stub bindings by default, optional generated bindings.</p>
 <h3 id="completeness-90--na-for-6g"><a class="header" href="#completeness-90--na-for-6g">Completeness: <strong>90%</strong> | N/A for 6G</a></h3>
 <hr>
 <h2 id="6-nextgcore-metrics--prometheus-metrics"><a class="header" href="#6-nextgcore-metrics--prometheus-metrics">6. nextgcore-metrics – Prometheus Metrics</a></h2>
@@ -515,7 +515,7 @@
 
         <script src="../clipboard-1626706a.min.js"></script>
         <script src="../highlight-abc7f01d.js"></script>
-        <script src="../book-c22b7243.js"></script>
+        <script src="../book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

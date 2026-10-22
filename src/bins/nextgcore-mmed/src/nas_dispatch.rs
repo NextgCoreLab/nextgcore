@@ -363,9 +363,21 @@ fn dispatch_emm(ctx: &MmeContext, enb_ue: &EnbUe, mme_ue_id: u64, pdu: &[u8]) {
             release_ue_context(ctx, enb_ue);
         }
         emm_type::DETACH_ACCEPT => {
+            // TS 24.301 §5.5.2.3.2: DETACH ACCEPT completes a network-initiated
+            // detach. T3422 stops and the UE is EMM-DEREGISTERED, so its context
+            // goes with the S1 connection (#688).
+            if let Some(mme_ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
+                mme_ue.t3422.stop();
+            }
+            let deregistered = crate::network_detach::complete_mme_initiated_detach(ctx, mme_ue_id);
             log::info!(
-                "Detach Accept from enb_ue_s1ap_id={}; releasing the S1 connection",
-                enb_ue.enb_ue_s1ap_id
+                "Detach Accept from enb_ue_s1ap_id={}; releasing the S1 connection{}",
+                enb_ue.enb_ue_s1ap_id,
+                if deregistered {
+                    " (network-initiated detach complete, UE context removed)"
+                } else {
+                    ""
+                }
             );
             release_ue_context(ctx, enb_ue);
         }
@@ -3194,6 +3206,37 @@ mod tests {
                 .pkbuf
                 .is_some(),
             "an ATTACH/AUTHENTICATION-class message may arrive unprotected"
+        );
+    }
+
+    /// #688: DETACH ACCEPT completes a network-initiated detach: T3422 stops
+    /// and the UE context is removed with the S1 connection.
+    #[test]
+    fn test_detach_accept_completes_a_network_initiated_detach() {
+        let ctx = test_ctx();
+        let enb_ue_id = enb_with_connection(&ctx);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+        ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
+        ctx.mme_ue_set_imsi(mme_ue_id, TEST_IMSI);
+        let out = crate::network_detach::mme_initiated_detach(
+            &ctx,
+            mme_ue_id,
+            crate::emm_build::DetachTypeToUe::ReAttachRequired,
+            "test",
+        );
+        assert_eq!(out, crate::network_detach::DetachOutcome::DetachRequestSent);
+
+        let pdu = vec![
+            NAS_PROTOCOL_DISCRIMINATOR_EMM,
+            NasEpsMessageType::DetachAccept as u8,
+        ];
+        nas_eps_handle_uplink(&ctx, uplink(enb_ue_id, &pdu));
+
+        assert!(ctx.mme_ue_find_by_id(mme_ue_id).is_none());
+        assert!(ctx.mme_ue_find_by_imsi(TEST_IMSI).is_none());
+        assert_eq!(
+            ctx.enb_ue_find_by_id(enb_ue_id).unwrap().ue_ctx_rel_action,
+            UeCtxRelAction::UeContextRemove
         );
     }
 

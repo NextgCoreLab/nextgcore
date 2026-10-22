@@ -45,6 +45,9 @@ pub const T3470_DURATION: Duration = Duration::from_secs(6);
 /// NAS retransmission timers and gives a sleeping UE a DRX cycle or two to answer.
 pub const T3413_DURATION: Duration = Duration::from_secs(6);
 
+/// T3422 — DETACH REQUEST from the network (TS 24.301 Table 10.2.1, §5.5.2.3.1).
+pub const T3422_DURATION: Duration = Duration::from_secs(6);
+
 /// Retransmissions before the procedure is aborted on the next expiry.
 pub const MAX_RETRANSMISSIONS: u32 = 4;
 
@@ -59,6 +62,8 @@ pub enum NasTimer {
     T3470,
     /// Paging
     T3413,
+    /// Network-initiated detach (#688)
+    T3422,
 }
 
 impl NasTimer {
@@ -69,6 +74,7 @@ impl NasTimer {
             NasTimer::T3460 => T3460_DURATION,
             NasTimer::T3470 => T3470_DURATION,
             NasTimer::T3413 => T3413_DURATION,
+            NasTimer::T3422 => T3422_DURATION,
         }
     }
 
@@ -78,6 +84,7 @@ impl NasTimer {
             NasTimer::T3460 => "T3460",
             NasTimer::T3470 => "T3470",
             NasTimer::T3413 => "T3413",
+            NasTimer::T3422 => "T3422",
         }
     }
 
@@ -87,15 +94,17 @@ impl NasTimer {
             NasTimer::T3460 => &mut mme_ue.t3460,
             NasTimer::T3470 => &mut mme_ue.t3470,
             NasTimer::T3413 => &mut mme_ue.t3413,
+            NasTimer::T3422 => &mut mme_ue.t3422,
         }
     }
 }
 
-const ALL_TIMERS: [NasTimer; 4] = [
+const ALL_TIMERS: [NasTimer; 5] = [
     NasTimer::T3450,
     NasTimer::T3460,
     NasTimer::T3470,
     NasTimer::T3413,
+    NasTimer::T3422,
 ];
 
 /// Retransmit or abort every NAS procedure whose timer has expired by `now`.
@@ -114,6 +123,7 @@ pub fn expire_nas_timers(ctx: &MmeContext, now: Instant) {
                         NasTimer::T3460 => &mme_ue.t3460,
                         NasTimer::T3470 => &mme_ue.t3470,
                         NasTimer::T3413 => &mme_ue.t3413,
+                        NasTimer::T3422 => &mme_ue.t3422,
                     };
                     state.is_expired(now).then_some((*id, timer))
                 })
@@ -149,6 +159,11 @@ fn handle_expiry(ctx: &MmeContext, mme_ue_id: u64, timer: NasTimer) {
             "[{imsi}] {} expired with no S1 connection; procedure aborted",
             timer.name()
         );
+        // TS 24.301 §5.5.2.3.4 b: an aborted network detach still leaves the UE
+        // EMM-DEREGISTERED in the network.
+        if timer == NasTimer::T3422 {
+            crate::network_detach::complete_mme_initiated_detach(ctx, mme_ue_id);
+        }
         return;
     };
 
@@ -211,6 +226,18 @@ fn handle_expiry(ctx: &MmeContext, mme_ue_id: u64, timer: NasTimer) {
                 mme_ue.imsi_bcd
             );
         }
+        return;
+    }
+
+    if abort && timer == NasTimer::T3422 {
+        // TS 24.301 §5.5.2.3.4 b: "on the fifth expiry of timer T3422, the detach
+        // procedure shall be aborted and the MME enters state EMM-DEREGISTERED".
+        log::warn!(
+            "T3422 exhausted its {MAX_RETRANSMISSIONS} retransmissions for UE {mme_ue_id}; \
+             detaching it locally and releasing the S1 connection"
+        );
+        crate::network_detach::complete_mme_initiated_detach(ctx, mme_ue_id);
+        crate::nas_dispatch::release_ue_context(ctx, &enb_ue);
         return;
     }
 
@@ -282,6 +309,32 @@ mod tests {
         let ctx = MmeContext::new();
         ctx.init();
         ctx
+    }
+
+    /// #688: T3422 retransmits the DETACH REQUEST, and on the fifth expiry
+    /// the UE is detached locally (TS 24.301 §5.5.2.3.4 b).
+    #[test]
+    fn test_t3422_retransmits_then_detaches_locally() {
+        let ctx = test_ctx();
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        let enb_ue_id = ctx.enb_ue_add(enb_id, 100);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+        ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
+        crate::network_detach::mme_initiated_detach(
+            &ctx,
+            mme_ue_id,
+            crate::emm_build::DetachTypeToUe::ReAttachRequired,
+            "test",
+        );
+        for n in 1..=MAX_RETRANSMISSIONS {
+            force_expiry(&ctx, mme_ue_id, NasTimer::T3422);
+            expire_nas_timers(&ctx, Instant::now());
+            let ue = ctx.mme_ue_find_by_id(mme_ue_id).expect("still detaching");
+            assert_eq!(ue.t3422.retry_count, n);
+        }
+        force_expiry(&ctx, mme_ue_id, NasTimer::T3422);
+        expire_nas_timers(&ctx, Instant::now());
+        assert!(ctx.mme_ue_find_by_id(mme_ue_id).is_none());
     }
 
     #[test]

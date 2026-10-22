@@ -15,8 +15,8 @@
         <link rel="icon" href="../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../css/general-0392ca55.css">
-        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
         <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-10d7638c.js";
+            window.path_to_searchindex_js = "../searchindex-c2411517.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-1b88980e.js"></script>
+        <script src="../toc-be5dca41.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -243,7 +243,7 @@ mbsmf:
 <h2 id="behavior-notes"><a class="header" href="#behavior-notes">Behavior notes</a></h2>
 <ul>
 <li><strong>Session admission is pool-capped, not quota-based.</strong> <code>session_add</code> (<code>context.rs</code>) refuses new sessions once <code>--max-sessions</code> is reached; the <code>POST /mbs-sessions</code> handler then returns <strong>400</strong> with cause <code>CREATION_FAILED</code> (not 503). All session, subscription, and TMGI state is in-memory only — there is no state file, so everything is lost on restart.</li>
-<li><strong>NRF registration is best-effort.</strong> At startup the MB-SMF <code>PUT</code>s an NF profile (<code>nfType: MB_SMF</code>, services <code>nmbsmf-mbssession</code> and <code>nmbsmf-tmgi</code>, <code>allowedNfTypes: AMF/SMF/NEF/SCP</code>, <code>heartBeatTimer: 10</code>) to <code>--nrf-uri</code>. A failure logs a warning and the daemon <strong>operates without NRF</strong> — no retry loop. On success a heartbeat worker runs every 5 seconds and PATCHes a real <code>/load</code> gauge: the active MBS-session count saturated at 100 (TS 29.510 §5.2.2.3.2 per code comment — “honest session-count proxy, no fabricated CPU numbers”).</li>
+<li><strong>NRF registration is best-effort.</strong> At startup the MB-SMF <code>PUT</code>s an NF profile (<code>nfType: MB_SMF</code>, services <code>nmbsmf-mbssession</code> and <code>nmbsmf-tmgi</code>, <code>allowedNfTypes: AMF/SMF/NEF/SCP</code>, <code>heartBeatTimer: 10</code>) to <code>--nrf-uri</code>. A failure logs a warning and the daemon <strong>operates without NRF</strong> — no retry loop. On success a heartbeat worker runs every 5 seconds and PATCHes a real <code>/load</code> gauge: the active MBS-session count saturated at 100 (TS 29.510 §5.2.2.3.2 per code comment — “honest session-count proxy, no fabricated CPU numbers”). A heartbeat the NRF answers with 404 re-registers the profile (#434), and the NF deregisters from the NRF on shutdown (#235).</li>
 <li><strong>N4mb PFCP endpoints come from environment variables.</strong> The persistent PFCP node targets <code>MB_UPF_ADDR</code> (default <code>127.0.0.7</code>) : <code>UPF_PFCP_PORT</code> (default <code>8805</code>), using <code>MBSMF_N4MB_ADDR</code> (default <code>127.0.0.1</code>) as the CP Node ID / F-SEID address. Requests are retransmitted on T1 expiry (3 s) up to N1 = 2 times (TS 29.244 §6.4 per code comments). The lower-layer SSM for multicast delivery is source = MB-UPF address, destination = a deterministic admin-scoped group <code>239.1.x.y</code> derived from the session id.</li>
 <li><strong>TMGI allocation</strong> (<code>POST /nmbsmf-tmgi/v1/tmgi</code>) uses the serving PLMN from <code>MBSMF_PLMN_MCC</code>/<code>MBSMF_PLMN_MNC</code> (defaults <code>001</code>/<code>01</code>) and a fixed TTL of <strong>3600 s</strong> (<code>TMGI_DEFAULT_TTL_SECS</code>); expired entries are purged lazily on the next allocate/refresh. A session create that carries no TMGI gets the default TMGI <code>010203</code> in PLMN 001/01.</li>
 <li><strong>Debug routes are opt-in.</strong> Setting <code>MBSMF_DEBUG_ROUTES</code> to any non-empty value exposes the non-spec <code>/mbs-sessions/{id}/activate</code> and <code>/mbs-sessions/{id}/members[/{supi}]</code> routes; off by default so the SBI surface is exactly the TS 29.532 resource set (per the code comment).</li>
@@ -298,7 +298,7 @@ mbsmf:
 
         <script src="../clipboard-1626706a.min.js"></script>
         <script src="../highlight-abc7f01d.js"></script>
-        <script src="../book-c22b7243.js"></script>
+        <script src="../book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

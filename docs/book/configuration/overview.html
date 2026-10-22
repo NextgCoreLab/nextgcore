@@ -15,8 +15,8 @@
         <link rel="icon" href="../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../css/general-0392ca55.css">
-        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
         <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-10d7638c.js";
+            window.path_to_searchindex_js = "../searchindex-c2411517.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-1b88980e.js"></script>
+        <script src="../toc-be5dca41.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -190,9 +190,9 @@
 </thead>
 <tbody>
 <tr><td><code>configs/</code> (repo root)</td><td>Minimal sample; currently only <code>amf.yaml</code> (PLMN 999-70, TAC 1, SST 1)</td></tr>
-<tr><td><code>docker/rust/configs/5gc/</code></td><td>The full working set used by the Docker E2E deployment: <code>amf.yaml</code>, <code>smf.yaml</code>, <code>upf.yaml</code>, <code>nrf.yaml</code>, <code>ausf.yaml</code>, <code>udm.yaml</code>, <code>udr.yaml</code>, <code>pcf.yaml</code>, <code>nssf.yaml</code>, <code>bsf.yaml</code>, <code>nsacf.yaml</code>, <code>nwdaf.yaml</code>, <code>lmf.yaml</code>, <code>ees.yaml</code>, <code>mbsmf.yaml</code>, <code>dccf.yaml</code>, <code>pin.yaml</code> plus <code>*-oauth2.yaml</code> variants (NRF/UDR/BSF/NSSF/NSACF) for OAuth2-enabled runs</td></tr>
-<tr><td><code>docker/rust/configs/</code></td><td><code>scp.yaml</code>, <code>sepp1.yaml</code>, <code>sepp2.yaml</code>; <code>epc/</code> holds the 4G/EPS set (<code>mme.yaml</code>, <code>hss.yaml</code>, <code>sgwc.yaml</code>, <code>sgwu.yaml</code>, <code>pcrf.yaml</code>)</td></tr>
-<tr><td><code>k8s/manifests/</code>, <code>deploy/helm/</code></td><td>Kubernetes/Helm packaging of the same configs</td></tr>
+<tr><td><code>docker/rust/configs/5gc/</code></td><td>The full working set used by the Docker E2E deployment: <code>amf.yaml</code>, <code>smf.yaml</code>, <code>upf.yaml</code>, <code>nrf.yaml</code>, <code>ausf.yaml</code>, <code>udm.yaml</code>, <code>udr.yaml</code>, <code>pcf.yaml</code>, <code>nssf.yaml</code>, <code>bsf.yaml</code>, <code>nsacf.yaml</code>, <code>nwdaf.yaml</code>, <code>lmf.yaml</code>, <code>ees.yaml</code>, <code>mbsmf.yaml</code>, <code>dccf.yaml</code>, <code>pin.yaml</code>, <code>ucmf.yaml</code> plus <code>*-oauth2.yaml</code> variants (NRF/UDR/BSF/NSSF/NSACF) for OAuth2-enabled runs</td></tr>
+<tr><td><code>docker/rust/configs/</code></td><td><code>scp.yaml</code>, <code>sepp1.yaml</code>, <code>sepp2.yaml</code>; <code>epc/</code> holds the 4G/EPS set (<code>mme.yaml</code>, <code>hss.yaml</code>, <code>sgwc.yaml</code>, <code>sgwu.yaml</code>, <code>pcrf.yaml</code>, and <code>pgwc.yaml</code>/<code>pgwu.yaml</code> for <code>smfd</code>/<code>upfd</code> in their PGW roles)</td></tr>
+<tr><td><code>k8s/manifests/</code>, <code>deploy/helm/</code>, <code>deploy/eks/</code></td><td>Kubernetes, Helm and EKS packaging of the same configs</td></tr>
 </tbody>
 </table>
 </div>
@@ -202,7 +202,7 @@
 <p><strong>1. Per-NF binary (clap).</strong> Each NF binary (e.g. <code>nextgcore-amfd</code>) parses CLI args and loads its YAML with <code>serde_yaml</code>. From <code>src/bins/nextgcore-amfd/src/lib.rs</code>:</p>
 <ul>
 <li><code>-c / --config &lt;path&gt;</code> — config file, default <code>/etc/nextgcore/amf.yaml</code></li>
-<li><code>-l / --log_level &lt;level&gt;</code> — <code>trace|debug|info|warn|error</code>, default <code>info</code></li>
+<li><code>--log-level &lt;level&gt;</code> — <code>trace|debug|info|warn|error</code>, default <code>info</code>. The short form is <code>-l</code> in amfd, mmed, sgwcd and sgwud; most other NFs follow Open5GS and use <code>-e</code> for the level and <code>-l</code> for <code>--log-file</code>. smfd has no log-level flag (it reads <code>RUST_LOG</code>, default <code>info</code>). Run <code>&lt;binary&gt; --help</code> for the rest of an NF’s flags</li>
 <li><code>--ngap-addr</code> (AMF only) — NGAP bind address, default <code>0.0.0.0:38412</code></li>
 <li><code>--sctp-backend</code> (AMF only) — <code>userspace</code> (default, sctp-proto over UDP) or <code>kernel</code> (Linux kernel SCTP, needs the <code>kernel-sctp</code> build feature)</li>
 </ul>
@@ -215,7 +215,7 @@
     path: /var/log/nextgcore/amf.log
   level: info
 </code></pre>
-<p><code>RUST_LOG</code> takes precedence over the configured level where NFs use <code>nf_common_init()</code> (<code>env_logger::Env::default().default_filter_or(log_level)</code>); binaries that build the logger from <code>--log_level</code> use that flag directly.</p>
+<p><code>--log-level</code> works for every NF but smfd. <code>RUST_LOG</code> is honoured only by the NFs that build their logger with <code>env_logger::Env::default().default_filter_or(..)</code> (dccfd, easdfd, eesd, lmfd, mbsmfd, nefd, nsacfd, nwdafd, pind, sgwud, smfd, tsctsf, ucmfd). The other fifteen (amfd, ausfd, bsfd, hssd, mmed, nrfd, nssfd, pcfd, pcrfd, scpd, seppd, sgwcd, udmd, udrd, upfd) ignore it; tracked in <a href="https://github.com/NextgCoreLab/nextgcore/issues/691">#691</a>.</p>
 <h3 id="global"><a class="header" href="#global"><code>global</code></a></h3>
 <pre><code class="language-yaml">global:
   max:
@@ -229,7 +229,7 @@
 <li><code>sbi.server</code> — list of <code>{address, port}</code> (port 7777 everywhere)</li>
 <li><code>sbi.client.nrf</code> — list of <code>{uri}</code> pointing at the NRF</li>
 <li><code>metrics.server</code> — Prometheus endpoint, port 9090 in all shipped configs</li>
-<li><code>tls</code> — <code>enabled</code> (false by default), <code>cert</code>/<code>key</code>/<code>ca</code> paths, <code>min_version: "1.2"</code>; enabled at deploy time via <code>TLS_ENABLED=true SBI_SCHEME=https</code></li>
+<li><code>tls</code> — <code>enabled</code> (false by default), <code>cert</code>/<code>key</code>/<code>ca</code> paths, <code>min_version: "1.2"</code>. The config comments say <code>TLS_ENABLED=true SBI_SCHEME=https</code> turns it on, but no Rust code reads those variables. An NF’s SBI listener uses TLS when started with <code>--tls --tls-cert &lt;pem&gt; --tls-key &lt;pem&gt;</code> (the SBI NFs other than amfd/smfd) or under the <code>production</code> SBI profile (amf/smf/ausf/udm, below)</li>
 <li>Protocol servers per NF: AMF <code>ngap</code> (38412), SMF/UPF <code>pfcp</code> (8805), UPF <code>gtpu</code> (2152), SMF <code>gtpc</code>/<code>gtpu</code></li>
 <li>SMF/UPF <code>session</code> subnets (<code>10.45.0.0/16</code> gw <code>10.45.0.1</code>, <code>2001:db8:cafe::/48</code>), SMF <code>dns</code> and <code>mtu: 1400</code></li>
 <li>AMF-specific: <code>guami</code>, <code>tai</code>, <code>plmn_support</code> (PLMN 999/70 in samples), <code>security.integrity_order</code>/<code>ciphering_order</code> (NIA/NEA lists), <code>network_name</code>, <code>time.t3512</code> (540 s in the Docker config), and <code>nas.use_nextgcore_security</code> (default <code>false</code> — canary for the strict TS 24.501 §4.4 NAS-security path)</li>
@@ -241,19 +241,139 @@
 <tr><th>Variable</th><th>Effect</th><th>Source</th></tr>
 </thead>
 <tbody>
-<tr><td><code>RUST_LOG</code></td><td>Overrides log level (via <code>nf_common_init</code>)</td><td><code>init.rs</code></td></tr>
+<tr><td><code>RUST_LOG</code></td><td>Overrides the log level in the thirteen NFs listed under <code>logger</code> above</td><td><code>init.rs</code>, NF <code>main.rs</code></td></tr>
 <tr><td><code>DB_URI</code></td><td>Overrides the YAML <code>db_uri</code> (MongoDB)</td><td><code>init.rs</code> stage 4</td></tr>
 <tr><td><code>&lt;NF&gt;_SBI_ADDR</code> / <code>&lt;NF&gt;_SBI_PORT</code></td><td>SBI bind address/port (e.g. <code>AMF_SBI_ADDR</code>, <code>UDM_SBI_PORT</code>); defaults <code>127.0.0.1:7777</code></td><td>each NF <code>lib.rs</code></td></tr>
 <tr><td><code>NRF_URI</code>, <code>PCF_URI</code>, <code>NSACF_URI</code></td><td>Peer NF discovery URIs</td><td>NF binaries</td></tr>
 <tr><td><code>SMF_PFCP_ADDR/PORT</code>, <code>UPF_PFCP_ADDR/PORT</code></td><td>PFCP endpoints</td><td>SMF/UPF</td></tr>
 <tr><td><code>AMF_NAS_SECURITY=nextgcore</code></td><td>Forces the strict NAS-security path, overriding <code>nas.use_nextgcore_security</code> in YAML</td><td>amfd <code>lib.rs</code></td></tr>
 <tr><td><code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code></td><td>Forces OAuth2 enforcement on the SBI server regardless of YAML</td><td>amfd <code>lib.rs</code></td></tr>
-<tr><td><code>TLS_ENABLED</code>, <code>SBI_SCHEME</code></td><td>Docker-compose knobs to enable SBI TLS</td><td>config comments</td></tr>
+<tr><td><code>NEXTGCORE_SBI_PROFILE</code></td><td>SBI security profile for amf/smf/ausf/udm. <strong>Defaults to <code>production</code></strong> (mutually-authenticated TLS + a required OAuth2 access token). <code>dev</code>/<code>development</code>/<code>insecure</code>/<code>local</code>/<code>test</code> opt out to cleartext h2c; <strong>any other value, including a typo, stays <code>production</code></strong> so a mistake cannot silently downgrade security</td><td><code>nextgcore-sbi</code> <code>security.rs</code></td></tr>
+<tr><td><code>NEXTGCORE_SBI_TLS_CERT</code> / <code>_KEY</code> / <code>_CA</code></td><td>Override the production profile’s <strong>server</strong> certificate paths (defaults under <code>/etc/nextgcore/tls/</code>), so the certs can be mounted wherever the deployment puts them</td><td><code>nextgcore-sbi</code> <code>security.rs</code></td></tr>
+<tr><td><code>NEXTGCORE_SBI_TLS_CLIENT_CERT</code> / <code>_CLIENT_KEY</code></td><td>Override the certificate this NF <strong>presents when it dials a peer</strong>. Under mTLS an NF is both server and client, and a deployment may mount the two roles’ material separately</td><td><code>nextgcore-sbi</code> <code>security.rs</code></td></tr>
+<tr><td><code>TLS_ENABLED</code>, <code>SBI_SCHEME</code></td><td>Set in <code>docker-compose.yml</code>, but <strong>not read</strong> by any NF; use <code>--tls</code>/<code>--tls-cert</code>/<code>--tls-key</code> or the SBI profile</td><td>compose file</td></tr>
 <tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td>OTLP collector (default <code>http://jaeger:4317</code>; no-op if absent)</td><td><code>init.rs</code></td></tr>
 </tbody>
 </table>
 </div>
 <p>Precedence, where both exist: <strong>environment variable &gt; YAML &gt; compiled-in default.</strong></p>
+<h3 id="durable-state-snapshots"><a class="header" href="#durable-state-snapshots">Durable state snapshots</a></h3>
+<p>Ten NFs can persist their long-lived runtime state as a full-store JSON snapshot,
+rewritten on every mutation and reloaded at boot: <strong>nrfd</strong> (NF registry),
+<strong>nssfd</strong> (NSSAI-availability subscriptions and data), <strong>nsacfd</strong> (admission
+counters), <strong>udrd</strong> (the non-subscriber resource trees), <strong>nefd</strong> (TS 29.122
+monitoring subscriptions and device-triggering transactions) and <strong>nwdafd</strong>
+(TS 29.520 analytics and ML-provision subscriptions — see
+<a href="./nwdaf.html">NWDAF</a>) and <strong>pcfd</strong> (AM/SM policy associations, PDU sessions and AF
+application sessions — see <a href="./pcf.html">PCF</a>). Since 0.1.0 three more do the
+same: <strong>smfd</strong> (PFCP sessions, policy bindings and the IPv4 pool, #191),
+<strong>pcrfd</strong> (Gx sessions) and <strong>ucmfd</strong> (the RACS capability store). Each is enabled by its
+own <code>--state-file</code> flag or <code>NEXTGCORE_&lt;NF&gt;_STATE_FILE</code> variable (nsacfd and ucmfd
+have the flag or their config’s <code>state_file</code> only); with neither set
+the NF is purely in-memory — the shipped Docker/E2E default for all but udrd, which
+is on by default (see <a href="./udr.html">UDR</a>).</p>
+<p><code>nefd</code>, <code>nwdafd</code> and <code>pcfd</code> differ from the older four in one respect worth
+knowing: an unreadable snapshot <strong>fails their startup</strong> rather than only refusing to persist.
+They adopt the <code>StateStore</code> type directly, so the caller sees the load error and
+declines to serve; the other four predate that type and keep their own flag,
+refusing the write but coming up empty.</p>
+<p><code>nwdafd</code> and <code>pcfd</code> go one step further and version their snapshot document,
+refusing one written by a <em>newer</em> build. Restoring only the members an older build recognises and
+then rewriting the file would discard the rest — the same data loss the table below
+guards against, reached by downgrade instead of by corruption.</p>
+<p>They share one implementation (<code>nextgcore-core</code>’s <code>state_store</code>), which
+distinguishes three cases:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>snapshot file</th><th>meaning</th><th>behaviour</th></tr>
+</thead>
+<tbody>
+<tr><td>absent</td><td>first boot, or persistence disabled</td><td>start empty, persisting enabled</td></tr>
+<tr><td>present, valid</td><td>normal restart</td><td>state restored, persisting enabled</td></tr>
+<tr><td>present, <strong>invalid</strong></td><td>a human must look at it</td><td>start empty, <strong>persisting REFUSED</strong></td></tr>
+</tbody>
+</table>
+</div>
+<p>The third row is the one to know about. Previously an unreadable or malformed
+snapshot was logged as a warning and treated as “no state” — and the next mutation
+rewrote the file from the resulting empty snapshot, making the loss permanent and
+destroying the only recoverable copy. Now the NF logs an error, starts empty, and
+<strong>refuses to write</strong>, so the file survives for inspection. Move it aside to start
+fresh deliberately.</p>
+<p>Snapshots are written atomically (temporary file, fsync, rename, parent-directory
+fsync) and created <code>0600</code> — the UDR’s contains IMSI-keyed subscriber
+registrations.</p>
+<h3 id="sbi-security-profile-issue-63"><a class="header" href="#sbi-security-profile-issue-63">SBI security profile (issue #63)</a></h3>
+<p><code>amf</code>, <code>smf</code>, <code>ausf</code> and <code>udm</code> resolve <code>NEXTGCORE_SBI_PROFILE</code> at startup. Under
+<code>production</code>:</p>
+<ul>
+<li>their <strong>listener</strong> serves SBI over mutually-authenticated TLS and requires an
+OAuth2 access token whose audience is their own NF type;</li>
+<li>their <strong>outbound peer calls</strong> use <code>https</code>, presenting this NF’s client
+certificate and verifying the peer against the configured CA;</li>
+<li>they <strong>refuse to start</strong> when any certificate named above is missing —
+including the client material, since an NF that cannot dial its peers is not
+usable — rather than falling back to cleartext.</li>
+</ul>
+<p>The outbound half also covers the shared peer-client cache in
+<code>nextgcore-sbi</code>’s global context, so <strong>peripheral NFs that resolve peers through
+it follow the profile too</strong>. Their own listeners are still configured by their
+individual <code>--tls</code> flags rather than by this profile.</p>
+<p>Every artefact this repo ships — <code>docker/rust/docker-compose.yml</code>,
+<code>k8s/manifests/</code>, and the Helm chart via <code>global.sbiProfile</code> — sets the explicit
+<code>dev</code> opt-out, because none of them mount SBI certificates. Local development and
+the matched-simulator E2E are therefore unchanged.</p>
+<p><strong>Mixed deployments are not supported:</strong> the scheme comes from the profile, not
+from a peer’s advertised URI, so run either a uniformly <code>production</code> or a
+uniformly <code>dev</code> core. (Before this, the scheme was hardcoded <code>http</code> regardless of
+what a peer advertised, so mixed was already broken.)</p>
+<h3 id="nef-northbound-exposure-issue-110"><a class="header" href="#nef-northbound-exposure-issue-110">NEF northbound exposure (issue #110)</a></h3>
+<p><code>nefd</code> is the only NF whose consumers are <strong>outside</strong> the operator — third-party
+Application Functions over the TS 29.122 T8 APIs — so its northbound surface has
+rules the internal SBI ones do not.</p>
+<p><strong>Always on, not configurable:</strong></p>
+<ul>
+<li><strong>The SUPI is never sent to an AF</strong> (TS 33.501 §5.9.2.3). Monitoring
+notifications echo the external identity the AF itself supplied (<code>msisdn</code> or
+<code>externalId</code>), in the same member it used. An AF that targeted a UE by the
+NextGCore-internal <code>supi</code> extension gets <strong>no</strong> UE identity in its
+notifications rather than the SUPI.</li>
+<li><strong>A monitoring request must resolve to exactly one UE.</strong> A GPSI is translated
+to a SUPI via UDM (TS 29.503 <code>id-translation-result</code>), and a target that
+cannot be resolved is refused with <code>404 UE_NOT_FOUND</code>. It is never promoted to
+a network-wide <code>anyUE</code> subscription — which is what previously happened to any
+request naming its UE by <code>msisdn</code> or <code>externalId</code>.</li>
+<li><code>externalGroupId</code> (group-scoped monitoring) is refused rather than ignored, for
+the same reason: an ignored group identifier used to fall through to
+network-wide scope.</li>
+</ul>
+<p><strong>Caller authentication is opt-in and off by default</strong>, so the matched-simulator
+E2E path is unchanged:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>knob</th><th>effect</th></tr>
+</thead>
+<tbody>
+<tr><td><code>nef.sbi.oauth2.require: true</code> / <code>NEXTGCORE_SBI_OAUTH2_REQUIRE=1</code></td><td>require an OAuth2 token with audience <code>NEF</code> on every northbound route</td></tr>
+<tr><td><code>--verify-client</code> (needs <code>--tls</code>)</td><td>require and verify a client certificate; its URI SAN becomes the caller’s identity</td></tr>
+<tr><td><code>--verify-client-cacert</code></td><td>CA bundle for the above</td></tr>
+<tr><td><code>--udm-sdm-uri</code></td><td>UDM used for GPSI→SUPI resolution; defaults to <code>--udm-uri</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>With authentication enabled, <strong>subscription ownership is keyed to the
+authenticated identity</strong> rather than to the <code>{scsAsId}</code> path segment, so one
+client can no longer delete another’s subscriptions by naming their ID. With it
+disabled the NF logs a startup warning and ownership falls back to that path
+segment, which is a routing check and not a security one — do not expose such a
+listener to an untrusted or partner-facing network.</p>
+<p>Two limits worth knowing. <code>--verify-client</code> without <code>--tls</code> <strong>fails startup</strong>
+rather than running a plaintext listener that reports itself as mutually
+authenticated. GPSI resolution needs the UDM’s <code>id-translation-result</code>, which
+this repo’s <code>udmd</code> serves from the UDR’s identity data (it answered <code>501</code> before
+#85 was fixed); a GPSI the UDR has no mapping for is still refused with <code>404</code>.</p>
 <h2 id="common-parameters-and-code-defaults"><a class="header" href="#common-parameters-and-code-defaults">Common parameters and code defaults</a></h2>
 <div class="table-wrapper">
 <table>
@@ -328,7 +448,7 @@
 
         <script src="../clipboard-1626706a.min.js"></script>
         <script src="../highlight-abc7f01d.js"></script>
-        <script src="../book-c22b7243.js"></script>
+        <script src="../book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 
