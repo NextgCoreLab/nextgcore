@@ -15,8 +15,8 @@
         <link rel="icon" href="favicon-de23e50b.svg">
         <link rel="shortcut icon" href="favicon-8114d1fc.png">
         <link rel="stylesheet" href="css/variables-8adf115d.css">
-        <link rel="stylesheet" href="css/general-0392ca55.css">
-        <link rel="stylesheet" href="css/chrome-fc474251.css">
+        <link rel="stylesheet" href="css/general-e96d0476.css">
+        <link rel="stylesheet" href="css/chrome-d279d366.css">
         <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-10d7638c.js";
+            window.path_to_searchindex_js = "searchindex-c2411517.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-1b88980e.js"></script>
+        <script src="toc-be5dca41.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -178,8 +178,8 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="introduction"><a class="header" href="#introduction">Introduction</a></h1>
-<p><strong>NextGCore</strong> is a research-faithful 5G core network implemented entirely in Rust. It provides <strong>24 network function (NF) binaries</strong> — a full 5G Standalone (SA) control and user plane, an AI/analytics overlay, and a complete <strong>4G/EPC interworking core</strong> (MME, HSS, SGW-C, SGW-U, PCRF) — built on <strong>17 shared libraries</strong>.</p>
-<p>The project targets <strong>3GPP Release 15</strong> with selected <strong>Release 17/18</strong> features (MBS multicast, NSACF slice admission, LMF positioning, RedCap admission, XR QoS, SNPN, MINT disaster roaming, UAV Service-Level-AA per TS 23.256). Any 6G/Release-20 items (ISAC, federated learning, PQC, semantic communications) are <strong>non-normative research prototypes</strong> — no frozen Rel-20 Stage-3 specifications exist, and those modules are informed by TR 22.870 use cases only.</p>
+<p><strong>NextGCore</strong> is a research-faithful 5G core network implemented in Rust. It provides <strong>28 network function (NF) binaries</strong> — a 5G Standalone (SA) control and user plane, an AI/analytics overlay, and a <strong>4G/EPC core</strong> (MME, HSS, SGW-C, SGW-U, PCRF, with <code>smfd</code>/<code>upfd</code> as PGW-C/PGW-U) — built on <strong>23 shared libraries</strong>, six of which are codecs generated from the 3GPP ASN.1.</p>
+<p>The project has a <strong>3GPP Release 15</strong> baseline with selected <strong>Release 16/17/18</strong> features (RACS, MBS multicast, NSACF slice admission, LMF positioning, RedCap admission, XR QoS, SNPN, MINT disaster roaming, UAV Service-Level-AA per TS 23.256). Any 6G/Release-20 items (ISAC, federated learning, PQC, semantic communications) are <strong>non-normative research prototypes</strong> — no frozen Rel-20 Stage-3 specifications exist, and those modules are informed by TR 22.870 use cases only.</p>
 <h2 id="at-a-glance"><a class="header" href="#at-a-glance">At a Glance</a></h2>
 <div class="table-wrapper">
 <table>
@@ -187,11 +187,11 @@
 <tr><th>Metric</th><th>Value</th></tr>
 </thead>
 <tbody>
-<tr><td>Network Functions</td><td>24 binaries (5G SA + EPC + AI/analytics)</td></tr>
-<tr><td>Shared libraries</td><td>17</td></tr>
-<tr><td>Language</td><td>100% Rust</td></tr>
-<tr><td>OpenAPI specs</td><td>31</td></tr>
-<tr><td>3GPP target</td><td>Rel-15 core, selected Rel-17/18 features</td></tr>
+<tr><td>Network Functions</td><td>28 binaries (23 5GC/Rel-17+ NFs, 5 EPC NFs) + a WebUI</td></tr>
+<tr><td>Shared libraries</td><td>23 (6 generated ASN.1 codecs: NGAP, S1AP, NRPPa, LPP, NR RRC, LTE RRC)</td></tr>
+<tr><td>Language</td><td>Rust (plus <code>aws-lc-sys</code>, the C crypto library under rustls)</td></tr>
+<tr><td>OpenAPI specs on the site</td><td>31</td></tr>
+<tr><td>3GPP target</td><td>Rel-15 core, selected Rel-16/17/18 features</td></tr>
 <tr><td>6G / Rel-20</td><td>Non-normative research prototypes only</td></tr>
 </tbody>
 </table>
@@ -199,23 +199,23 @@
 <h2 id="architecture"><a class="header" href="#architecture">Architecture</a></h2>
 <p>NextGCore follows the 3GPP Service-Based Architecture (SBA), organized in layers:</p>
 <ul>
-<li><strong>SBI control plane</strong> — AMF, SMF, NRF, AUSF, UDM, UDR, PCF, NSSF, BSF communicating over HTTP/2 + JSON with TLS. NRF issues real ES256/RS256 JWS OAuth2 access tokens and verifies Client Credentials Assertions (CCA-JWS, ES256) per TS 33.501 §13.3.8.3. The AMF drives NGAP via the <code>nextgcore-ngap</code> library with an async <code>tokio::select!</code> event loop.</li>
+<li><strong>SBI control plane</strong> — AMF, SMF, NRF, AUSF, UDM, UDR, PCF, NSSF, BSF communicating over HTTP/2 + JSON with TLS. NRF issues real ES256/RS256 JWS OAuth2 access tokens and verifies Client Credentials Assertions (CCA-JWS, ES256) per TS 33.501 §13.3.8.3. NGAP and S1AP messages are encoded and decoded by codecs generated from the TS 38.413 / TS 36.413 ASN.1 (<code>nextgcore-ngap-gen</code>, <code>nextgcore-s1ap-gen</code>), built with <a href="https://github.com/NextgCoreLab/asn1-codegen">NextgCoreLab/asn1-codegen</a>.</li>
 <li><strong>Routing and inter-PLMN security</strong> — SCP for indirect communication and load balancing; SEPP for zero-trust N32c/N32f roaming with AES-128-GCM PRINS selective IE protection, per-PLMN trust scoring, and rate limiting (TS 33.501 / TS 29.573); a WebUI for subscriber management (MongoDB backend).</li>
 <li><strong>Data plane</strong> — UPF with 5-tuple SDF filtering, QoS enforcement, GTP-U tunneling, and PFCP-driven usage reporting, connected to the control plane via NGAP / PFCP / GTP-U.</li>
-<li><strong>EPC (4G) layer</strong> — MME, SGW-C, SGW-U, HSS, and PCRF for full LTE attach and 4G/5G interworking. The dual 5G/LTE core is a deliberate, permanent design decision.</li>
-<li><strong>AI &amp; analytics overlay</strong> — NWDAF (4-layer analytics engine per TS 23.288: real-time anomaly detection → ONNX prediction → prescriptive recommendations → autonomous actions), DCCF data-collection coordination, EES edge enabler (TS 23.558), LMF positioning (TS 23.273), MBSMF multicast/broadcast (TS 23.247), NSACF slice admission, and PIN personal-IoT management (TS 23.542). All seven Rel-17 NFs register with the NRF.</li>
+<li><strong>EPC (4G) layer</strong> — MME, SGW-C, SGW-U, HSS, PCRF, and <code>smfd</code>/<code>upfd</code> as PGW-C/PGW-U. A real LTE UE attaches through nextgsim’s eNB in the nightly CI. EPS-5GS interworking over N26 covers idle-mode context transfer and connected-mode handover in both directions. The dual 5G/LTE core is a deliberate, permanent design decision.</li>
+<li><strong>AI &amp; analytics overlay</strong> — NWDAF (4-layer analytics engine per TS 23.288: real-time anomaly detection → ONNX prediction → prescriptive recommendations → autonomous actions), DCCF data-collection coordination, EES edge enabler (TS 23.558), LMF positioning (TS 23.273), MBSMF multicast/broadcast (TS 23.247), NSACF slice admission, and PIN personal-IoT management (TS 23.542). The Rel-16+ NFs also include NEF, EASDF, TSCTSF and UCMF (RACS, TS 29.673/29.675).</li>
 </ul>
 <p>Shared infrastructure includes <code>nextgcore-app</code> (<code>nf_common_init()</code> for common NF bootstrap) and <code>nextgcore-sbi</code> / <code>nextgcore-dbi</code>, which gate experimental 6G behavior behind a <code>6g-extensions</code> Cargo feature.</p>
 <h2 id="key-capabilities"><a class="header" href="#key-capabilities">Key Capabilities</a></h2>
 <ul>
-<li><strong>Full 5G SA procedures</strong> — UE registration with SUCI concealment and 5G-AKA (TS 23.502 §4.2.2), PDU session establishment with PCC-driven QoS and PFCP (TS 23.502 §4.3.2), Xn handover with path switch (§4.9.1), URSP delivery (TS 29.525 / TS 24.501 Annex D), and fail-closed SoR/UPU protection (TS 33.501 §6.14/6.15).</li>
+<li><strong>5G SA procedures</strong> — UE registration with SUCI concealment and 5G-AKA (TS 23.502 §4.2.2), PDU session establishment with PCC-driven QoS and PFCP (TS 23.502 §4.3.2), paging and Service Request from CM-IDLE and CM-CONNECTED (§4.2.3), UE- and network-initiated de-registration, Xn and N2 handover with path switch (§4.9.1), URSP delivery (TS 29.525 / TS 24.501 Annex D), and fail-closed SoR/UPU protection (TS 33.501 §6.14/6.15).</li>
 <li><strong>AI-native operation</strong> — ML model lifecycle management with ONNX inference, intent-based automation, and event subscriptions for consumer NFs.</li>
-<li><strong>Cloud native</strong> — Docker Compose for development (all 24 NF services), Kubernetes with Helm charts for deployment, Prometheus metrics and Jaeger tracing on every NF.</li>
+<li><strong>Cloud native</strong> — Docker Compose for development (20 5GC NFs in <code>docker-compose.yml</code>, the EPC in <code>docker-compose-epc.yml</code>), Kind manifests, a Helm chart and an EKS deployment, Prometheus metrics and Jaeger tracing.</li>
 </ul>
 <h2 id="validation-honesty"><a class="header" href="#validation-honesty">Validation Honesty</a></h2>
 <p>Be clear about what the test results mean:</p>
 <ul>
-<li>NextGCore is validated with <strong>matched simulators and 3GPP/RFC golden vectors</strong>, plus Docker-based end-to-end tests. It has <strong>not</strong> been certified by any third-party conformance body.</li>
+<li>NextGCore is validated with <strong>matched simulators and 3GPP/RFC golden vectors</strong>, plus Docker-based end-to-end tests that run nightly. It has <strong>not</strong> been certified by any third-party conformance body.</li>
 <li>A feature listed as “implemented” means the module exists and passes its tests — it is <strong>not</strong> a claim of full 3GPP conformance. Rel-15/16 NAS, SBI, and N4 are the most spec-faithful; some Rel-17/18 encodings are bespoke and simulator-only.</li>
 <li>All 6G/Rel-20 material is prototype research code and should never be treated as standards-conformant.</li>
 </ul>
@@ -231,7 +231,7 @@
 cargo build --workspace
 cargo test --workspace
 </code></pre>
-<p>See the Contributing guide for prerequisites (Rust ≥1.75, protobuf, clang, OpenSSL, cmake) and Docker-based E2E testing.</p>
+<p>See the <a href="contributing.html">Contributing guide</a> for prerequisites (the pinned Rust 1.95.0 toolchain, a C compiler and cmake) and Docker-based E2E testing.</p>
 
                     </main>
 
@@ -275,7 +275,7 @@ cargo test --workspace
 
         <script src="clipboard-1626706a.min.js"></script>
         <script src="highlight-abc7f01d.js"></script>
-        <script src="book-c22b7243.js"></script>
+        <script src="book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

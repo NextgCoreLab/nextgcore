@@ -9,9 +9,9 @@ NextGCore network functions (NFs) are configured with per-NF YAML files, modelle
 | Location | Purpose |
 |---|---|
 | `configs/` (repo root) | Minimal sample; currently only `amf.yaml` (PLMN 999-70, TAC 1, SST 1) |
-| `docker/rust/configs/5gc/` | The full working set used by the Docker E2E deployment: `amf.yaml`, `smf.yaml`, `upf.yaml`, `nrf.yaml`, `ausf.yaml`, `udm.yaml`, `udr.yaml`, `pcf.yaml`, `nssf.yaml`, `bsf.yaml`, `nsacf.yaml`, `nwdaf.yaml`, `lmf.yaml`, `ees.yaml`, `mbsmf.yaml`, `dccf.yaml`, `pin.yaml` plus `*-oauth2.yaml` variants (NRF/UDR/BSF/NSSF/NSACF) for OAuth2-enabled runs |
-| `docker/rust/configs/` | `scp.yaml`, `sepp1.yaml`, `sepp2.yaml`; `epc/` holds the 4G/EPS set (`mme.yaml`, `hss.yaml`, `sgwc.yaml`, `sgwu.yaml`, `pcrf.yaml`) |
-| `k8s/manifests/`, `deploy/helm/` | Kubernetes/Helm packaging of the same configs |
+| `docker/rust/configs/5gc/` | The full working set used by the Docker E2E deployment: `amf.yaml`, `smf.yaml`, `upf.yaml`, `nrf.yaml`, `ausf.yaml`, `udm.yaml`, `udr.yaml`, `pcf.yaml`, `nssf.yaml`, `bsf.yaml`, `nsacf.yaml`, `nwdaf.yaml`, `lmf.yaml`, `ees.yaml`, `mbsmf.yaml`, `dccf.yaml`, `pin.yaml`, `ucmf.yaml` plus `*-oauth2.yaml` variants (NRF/UDR/BSF/NSSF/NSACF) for OAuth2-enabled runs |
+| `docker/rust/configs/` | `scp.yaml`, `sepp1.yaml`, `sepp2.yaml`; `epc/` holds the 4G/EPS set (`mme.yaml`, `hss.yaml`, `sgwc.yaml`, `sgwu.yaml`, `pcrf.yaml`, and `pgwc.yaml`/`pgwu.yaml` for `smfd`/`upfd` in their PGW roles) |
+| `k8s/manifests/`, `deploy/helm/`, `deploy/eks/` | Kubernetes, Helm and EKS packaging of the same configs |
 
 Each file has the same shape: optional `logger:` and `global:` sections, plus one NF-specific root section named after the NF (`amf:`, `smf:`, `upf:`, ...).
 
@@ -22,7 +22,7 @@ There are two cooperating layers.
 **1. Per-NF binary (clap).** Each NF binary (e.g. `nextgcore-amfd`) parses CLI args and loads its YAML with `serde_yaml`. From `src/bins/nextgcore-amfd/src/lib.rs`:
 
 - `-c / --config <path>` — config file, default `/etc/nextgcore/amf.yaml`
-- `-l / --log_level <level>` — `trace|debug|info|warn|error`, default `info`
+- `--log-level <level>` — `trace|debug|info|warn|error`, default `info`. The short form is `-l` in amfd, mmed, sgwcd and sgwud; most other NFs follow Open5GS and use `-e` for the level and `-l` for `--log-file`. smfd has no log-level flag (it reads `RUST_LOG`, default `info`). Run `<binary> --help` for the rest of an NF's flags
 - `--ngap-addr` (AMF only) — NGAP bind address, default `0.0.0.0:38412`
 - `--sctp-backend` (AMF only) — `userspace` (default, sctp-proto over UDP) or `kernel` (Linux kernel SCTP, needs the `kernel-sctp` build feature)
 
@@ -41,7 +41,7 @@ logger:
   level: info
 ```
 
-`RUST_LOG` takes precedence over the configured level where NFs use `nf_common_init()` (`env_logger::Env::default().default_filter_or(log_level)`); binaries that build the logger from `--log_level` use that flag directly.
+`--log-level` works for every NF but smfd. `RUST_LOG` is honoured only by the NFs that build their logger with `env_logger::Env::default().default_filter_or(..)` (dccfd, easdfd, eesd, lmfd, mbsmfd, nefd, nsacfd, nwdafd, pind, sgwud, smfd, tsctsf, ucmfd). The other fifteen (amfd, ausfd, bsfd, hssd, mmed, nrfd, nssfd, pcfd, pcrfd, scpd, seppd, sgwcd, udmd, udrd, upfd) ignore it; tracked in [#691](https://github.com/NextgCoreLab/nextgcore/issues/691).
 
 ### `global`
 
@@ -61,7 +61,7 @@ Common sub-blocks seen in the Docker configs:
 - `sbi.server` — list of `{address, port}` (port 7777 everywhere)
 - `sbi.client.nrf` — list of `{uri}` pointing at the NRF
 - `metrics.server` — Prometheus endpoint, port 9090 in all shipped configs
-- `tls` — `enabled` (false by default), `cert`/`key`/`ca` paths, `min_version: "1.2"`; enabled at deploy time via `TLS_ENABLED=true SBI_SCHEME=https`
+- `tls` — `enabled` (false by default), `cert`/`key`/`ca` paths, `min_version: "1.2"`. The config comments say `TLS_ENABLED=true SBI_SCHEME=https` turns it on, but no Rust code reads those variables. An NF's SBI listener uses TLS when started with `--tls --tls-cert <pem> --tls-key <pem>` (the SBI NFs other than amfd/smfd) or under the `production` SBI profile (amf/smf/ausf/udm, below)
 - Protocol servers per NF: AMF `ngap` (38412), SMF/UPF `pfcp` (8805), UPF `gtpu` (2152), SMF `gtpc`/`gtpu`
 - SMF/UPF `session` subnets (`10.45.0.0/16` gw `10.45.0.1`, `2001:db8:cafe::/48`), SMF `dns` and `mtu: 1400`
 - AMF-specific: `guami`, `tai`, `plmn_support` (PLMN 999/70 in samples), `security.integrity_order`/`ciphering_order` (NIA/NEA lists), `network_name`, `time.t3512` (540 s in the Docker config), and `nas.use_nextgcore_security` (default `false` — canary for the strict TS 24.501 §4.4 NAS-security path)
@@ -70,7 +70,7 @@ Common sub-blocks seen in the Docker configs:
 
 | Variable | Effect | Source |
 |---|---|---|
-| `RUST_LOG` | Overrides log level (via `nf_common_init`) | `init.rs` |
+| `RUST_LOG` | Overrides the log level in the thirteen NFs listed under `logger` above | `init.rs`, NF `main.rs` |
 | `DB_URI` | Overrides the YAML `db_uri` (MongoDB) | `init.rs` stage 4 |
 | `<NF>_SBI_ADDR` / `<NF>_SBI_PORT` | SBI bind address/port (e.g. `AMF_SBI_ADDR`, `UDM_SBI_PORT`); defaults `127.0.0.1:7777` | each NF `lib.rs` |
 | `NRF_URI`, `PCF_URI`, `NSACF_URI` | Peer NF discovery URIs | NF binaries |
@@ -80,22 +80,25 @@ Common sub-blocks seen in the Docker configs:
 | `NEXTGCORE_SBI_PROFILE` | SBI security profile for amf/smf/ausf/udm. **Defaults to `production`** (mutually-authenticated TLS + a required OAuth2 access token). `dev`/`development`/`insecure`/`local`/`test` opt out to cleartext h2c; **any other value, including a typo, stays `production`** so a mistake cannot silently downgrade security | `nextgcore-sbi` `security.rs` |
 | `NEXTGCORE_SBI_TLS_CERT` / `_KEY` / `_CA` | Override the production profile's **server** certificate paths (defaults under `/etc/nextgcore/tls/`), so the certs can be mounted wherever the deployment puts them | `nextgcore-sbi` `security.rs` |
 | `NEXTGCORE_SBI_TLS_CLIENT_CERT` / `_CLIENT_KEY` | Override the certificate this NF **presents when it dials a peer**. Under mTLS an NF is both server and client, and a deployment may mount the two roles' material separately | `nextgcore-sbi` `security.rs` |
-| `TLS_ENABLED`, `SBI_SCHEME` | Docker-compose knobs to enable SBI TLS | config comments |
+| `TLS_ENABLED`, `SBI_SCHEME` | Set in `docker-compose.yml`, but **not read** by any NF; use `--tls`/`--tls-cert`/`--tls-key` or the SBI profile | compose file |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP collector (default `http://jaeger:4317`; no-op if absent) | `init.rs` |
 
 Precedence, where both exist: **environment variable > YAML > compiled-in default.**
 
 ### Durable state snapshots
 
-Seven NFs persist their long-lived runtime state as a full-store JSON snapshot,
+Ten NFs can persist their long-lived runtime state as a full-store JSON snapshot,
 rewritten on every mutation and reloaded at boot: **nrfd** (NF registry),
 **nssfd** (NSSAI-availability subscriptions and data), **nsacfd** (admission
 counters), **udrd** (the non-subscriber resource trees), **nefd** (TS 29.122
 monitoring subscriptions and device-triggering transactions) and **nwdafd**
 (TS 29.520 analytics and ML-provision subscriptions — see
 [NWDAF](./nwdaf.md)) and **pcfd** (AM/SM policy associations, PDU sessions and AF
-application sessions — see [PCF](./pcf.md)). Each is enabled by its
-own `--state-file` flag or `NEXTGCORE_<NF>_STATE_FILE` variable; with neither set
+application sessions — see [PCF](./pcf.md)). Since 0.1.0 three more do the
+same: **smfd** (PFCP sessions, policy bindings and the IPv4 pool, #191),
+**pcrfd** (Gx sessions) and **ucmfd** (the RACS capability store). Each is enabled by its
+own `--state-file` flag or `NEXTGCORE_<NF>_STATE_FILE` variable (nsacfd and ucmfd
+have the flag or their config's `state_file` only); with neither set
 the NF is purely in-memory — the shipped Docker/E2E default for all but udrd, which
 is on by default (see [UDR](./udr.md)).
 
@@ -199,9 +202,9 @@ listener to an untrusted or partner-facing network.
 
 Two limits worth knowing. `--verify-client` without `--tls` **fails startup**
 rather than running a plaintext listener that reports itself as mutually
-authenticated. And this repo's own `udmd` answers `id-translation-result` with
-`501 Not Implemented`, so against nextgcore's UDM every `msisdn`/`externalId`
-request is refused; making it succeed needs the UDM side (issue #85).
+authenticated. GPSI resolution needs the UDM's `id-translation-result`, which
+this repo's `udmd` serves from the UDR's identity data (it answered `501` before
+#85 was fixed); a GPSI the UDR has no mapping for is still refused with `404`.
 
 ## Common parameters and code defaults
 

@@ -15,8 +15,8 @@
         <link rel="icon" href="../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../css/general-0392ca55.css">
-        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
         <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-10d7638c.js";
+            window.path_to_searchindex_js = "../searchindex-c2411517.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-1b88980e.js"></script>
+        <script src="../toc-be5dca41.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -178,10 +178,10 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="bsf-configuration"><a class="header" href="#bsf-configuration">BSF Configuration</a></h1>
-<p>The BSF (Binding Support Function, <code>nextgcore-bsfd</code>) stores and serves PCF binding information so that policy consumers (e.g. an AF or NEF via PCF) can find the PCF that owns a given PDU session, UE, or MBS session. It serves the <code>Nbsf_Management</code> API (TS 29.521, as cited throughout the daemon’s source comments): <code>/nbsf-management/v1/pcfBindings</code> (PDU-session bindings, full POST/GET/PATCH/DELETE plus query-based discovery), <code>/nbsf-management/v1/pcf-ue-bindings</code> (UE-policy bindings, TS 29.521 §4.2.2.3/§4.2.4.3 per code comments), and <code>/nbsf-management/v1/pcf-mbs-bindings</code> (MBS-session bindings, TS 29.521 §4.2.2.4/§4.2.4.4 per code comments). The <code>Nbsf_Management</code> Subscribe/Unsubscribe sub-resource (<code>pcfBindings/.../subscriptions</code>) is a deliberate stub that returns <strong>501 Not Implemented</strong>. Routing and handlers live in <code>bsf_sbi_request_handler</code> in <code>src/bins/nextgcore-bsfd/src/lib.rs</code> — since the Wave-6 H1 lib-targetization, <code>main.rs</code> is a thin wrapper around <code>nextgcore_bsfd::run()</code>.</p>
+<p>The BSF (Binding Support Function, <code>nextgcore-bsfd</code>) stores and serves PCF binding information so that policy consumers (e.g. an AF or NEF via PCF) can find the PCF that owns a given PDU session, UE, or MBS session. It serves the <code>Nbsf_Management</code> API (TS 29.521, as cited throughout the daemon’s source comments): <code>/nbsf-management/v1/pcfBindings</code> (PDU-session bindings, full POST/GET/PATCH/DELETE plus query-based discovery), <code>/nbsf-management/v1/pcf-ue-bindings</code> (UE-policy bindings, TS 29.521 §4.2.2.3/§4.2.4.3 per code comments), and <code>/nbsf-management/v1/pcf-mbs-bindings</code> (MBS-session bindings, TS 29.521 §4.2.2.4/§4.2.4.4 per code comments). It also serves <code>/nbsf-management/v1/subscriptions</code> (event Subscribe/Unsubscribe/Notify, TS 29.521 §4.2.6–§4.2.8) — new in #98, which removed the <code>bsfd-13</code> 501 stub that sat on <code>pcfBindings/.../subscriptions</code>, a path the spec does not define, while the spec’s own top-level resource was unrouted and answered 405. Routing and handlers live in <code>bsf_sbi_request_handler</code> in <code>src/bins/nextgcore-bsfd/src/lib.rs</code> — since the Wave-6 H1 lib-targetization, <code>main.rs</code> is a thin wrapper around <code>nextgcore_bsfd::run()</code>.</p>
 <p>Configuration is split between a YAML file (default path <code>/etc/nextgcore/bsf.yaml</code>, overridable with <code>-c/--config</code>; the docker deployment passes <code>-c /etc/nextgcore/bsf.yaml</code>) and command-line flags. Unusually for this codebase, the YAML SBI <code>server</code> entry <strong>overrides</strong> the CLI <code>--sbi-addr</code>/<code>--sbi-port</code> (so the NRF NFProfile advertises a routable endpoint instead of <code>0.0.0.0</code>, per the code comment); everything else — TLS flags, session capacity, log level — is CLI-only. The only environment variable the binary reads is <code>OTEL_EXPORTER_OTLP_ENDPOINT</code>.</p>
 <blockquote>
-<p><strong>Honesty note:</strong> BSF behavior is validated by this project’s own unit tests and matched-simulator Docker E2E runs (84/84 as of 2026-07-02), not by third-party conformance certification. Known gaps visible in the source: <code>Nbsf_Management</code> subscriptions are a 501 stub (<code>bsfd-13</code>); the <code>--tls</code> flag does <strong>not</strong> enable TLS on the actual HTTP/2 listener (it only flips the advertised URI scheme in the legacy NF-instance metadata built in <code>sbi_path.rs</code>); the MongoDB persistence layer (<code>bsf_bindings</code> collection) is best-effort and the daemon never initializes a MongoDB connection itself — no <code>nextgcore_mongoc_init</code>/<code>nextgcore_dbi_init</code> call exists in this crate, so in the standalone binary bindings live in memory only; and <code>sbi_path.rs</code> still contains legacy placeholder helpers (<code>bsf_sbi_send_request</code>/<code>bsf_sbi_discover_and_send</code> return a hardcoded transaction ID).</p>
+<p><strong>Honesty note:</strong> BSF behavior is validated by this project’s own unit tests and matched-simulator Docker E2E runs, not by third-party conformance certification. Known gaps visible in the source: the <code>--tls</code> flag does <strong>not</strong> enable TLS on the actual HTTP/2 listener (it only flips the advertised URI scheme in the legacy NF-instance metadata built in <code>sbi_path.rs</code>); the daemon is <strong>memory-only</strong> by decision — bindings and subscriptions do not survive a restart, see <a href="#durability-bsfd-is-a-memory-only-nf">Durability</a>; and <code>nnrf_handler.rs</code>’s <code>handle_nf_status_notify</code> has no non-test caller, so inbound NF-status notifications are observed by nothing (the legacy <code>bsf_sbi_send_request</code> / <code>bsf_sbi_discover_and_send</code> placeholders that used to be named here were deleted by #234, along with the consumer-side discovery path they belonged to).</p>
 </blockquote>
 <h2 id="example-configuration"><a class="header" href="#example-configuration">Example configuration</a></h2>
 <p>From <code>nextgcore/docker/rust/configs/5gc/bsf.yaml</code>:</p>
@@ -255,7 +255,7 @@ bsf:
 <tr><td><code>-l, --log-file</code></td><td>path</td><td>unset</td><td>Parsed but <strong>never used</strong> — <code>init_logging</code> wires no file sink; logging goes to stderr.</td></tr>
 <tr><td><code>-e, --log-level</code></td><td>string</td><td><code>info</code></td><td>Log level (<code>trace</code>/<code>debug</code>/<code>info</code>/<code>warn</code>/<code>error</code>); unrecognized values fall back to <code>info</code>.</td></tr>
 <tr><td><code>-m, --no-color</code></td><td>flag</td><td>off</td><td>Disable color output.</td></tr>
-<tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Stub: logs “would send SIGTERM to running instance” and exits without signaling anything.</td></tr>
+<tr><td><code>-k, --kill</code></td><td>flag</td><td>off</td><td>Not supported: logs an error and exits non-zero without signalling anything; stop the NF through its supervisor.</td></tr>
 <tr><td><code>--sbi-addr</code></td><td>string</td><td><code>0.0.0.0</code></td><td>SBI server bind address; <strong>overridden</strong> by <code>bsf.sbi.server[0].address</code> when the YAML provides one.</td></tr>
 <tr><td><code>--sbi-port</code></td><td>u16</td><td><code>7777</code></td><td>SBI server port; <strong>overridden</strong> by <code>bsf.sbi.server[0].port</code> when present.</td></tr>
 <tr><td><code>--tls</code></td><td>flag</td><td>off</td><td>Sets <code>tls_enabled</code> in the legacy context config; switches the advertised URI scheme to <code>https</code> but does not enable TLS on the HTTP/2 listener (see Behavior notes).</td></tr>
@@ -271,10 +271,62 @@ bsf:
 <li><strong>Create/validation semantics</strong> (<code>POST /nbsf-management/v1/pcfBindings</code>): mandatory <code>dnn</code> + <code>snssai</code> (TS 29.521 PcfBinding, per code comment), at least one UE address (<code>ipv4Addr</code>/<code>ipv6Prefix</code>/<code>macAddr48</code> — MAC-only Ethernet bindings are valid), and at least one PCF address (<code>pcfFqdn</code>, non-empty <code>pcfIpEndPoints</code>, or <code>pcfDiamHost</code>+<code>pcfDiamRealm</code>; <code>bsfd-05</code>), each violation returning 400 <code>MANDATORY_IE_MISSING</code>. When the <code>--max-sess</code> pool (default 1024) is full, creation fails with 400 / <code>SYSTEM_FAILURE</code>. Success is 201 with a <code>Location</code> header; PDU-session binding IDs are numeric (a non-numeric ID on DELETE yields 400 <code>INVALID_BINDING_ID</code>), while UE/MBS binding IDs are UUIDs.</li>
 <li><strong>Feature negotiation and duplicate detection</strong>: the BSF advertises <code>suppFeat</code> <code>0x6</code> — BindingUpdate + SamePcf, not MultiUeAddr (TS 29.521 Table 5.8-1 per code comment) — and echoes the negotiated intersection per session. With SamePcf negotiated and <code>paraCom</code> present, a duplicate <code>dnn</code>+<code>snssai</code>+<code>supi</code> binding is rejected 403 <code>EXISTING_BINDING_INFO_FOUND</code> with <code>pcfSmFqdn</code>/<code>pcfSmIpEndPoints</code> extensions; MBS binding creation likewise rejects a duplicate <code>mbsSessionId</code> with 403.</li>
 <li><strong>Discovery semantics</strong>: <code>GET /pcfBindings</code> requires a UE-address query parameter (TS 29.521 §4.2.4.2 per code comment) — SUPI/GPSI/DNN-only queries get 400 <code>MANDATORY_QUERY_PARAM_MISSING</code>; no match returns <strong>204</strong> (not 404); multiple matches return 400 <code>MULTIPLE_BINDING_INFO_FOUND</code>. MBS discovery uses the <code>mbs-session-id</code> query parameter (TS 29.521 §4.2.4.4 per code comment), accepting legacy <code>mbsSessionId</code> leniently. PATCH bodies must be <code>application/merge-patch+json</code> (TS 29.521 §5.2 per code comment); <code>application/json</code> and an absent Content-Type are accepted leniently, anything else is 415.</li>
+<li><strong>Event subscriptions and notifications</strong> (#98, TS 29.521 §4.2.6–§4.2.8). <code>POST /nbsf-management/v1/subscriptions</code> creates a subscription (201 + <code>Location</code>), <code>PUT /subscriptions/{subId}</code> replaces it (200; 404 when unknown) and <code>DELETE</code> removes it (204; 404 when unknown). <code>BsfSubscription</code> requires <strong>four</strong> members — <code>events</code>, <code>notifUri</code>, <code>notifCorreId</code> and <code>supi</code> — and a <code>notifUri</code> that is not an absolute <code>http(s)</code> URI is refused at ingress rather than failing silently at every notification.
+<ul>
+<li>On PCF-binding <strong>register</strong> and <strong>deregister</strong> (both PDU-session and UE bindings) the BSF POSTs a <code>BsfNotification</code> to each matching subscriber. The <code>notifCorreId</code> + <code>eventNotifs</code> form is emitted, so both members are always present — <code>BsfNotification</code>’s <code>oneOf</code> is satisfied by neither branch if <code>eventNotifs</code> appears without <code>notifCorreId</code>. The notification carries the binding identity (<code>pcfForPduSessInfos</code> or <code>pcfForUeInfo</code>), not just an id, so a consumer can tell <strong>which</strong> PCF now serves the session — the point of a PCF watching for a binding created by a different PCF.</li>
+<li>Matching is <strong>per-SUPI</strong>, because <code>supi</code> is a required member of the subscription: a binding for another UE, an event the subscription did not request, a binding with no SUPI, and an expired subscription all match nothing.</li>
+<li>Only the four events this BSF can actually observe are reportable (<code>PCF_PDU_SESSION_BINDING_REGISTRATION</code>/<code>_DEREGISTRATION</code>, <code>PCF_UE_BINDING_REGISTRATION</code>/<code>_DEREGISTRATION</code>). <code>SNSSAI_DNN_BINDING_*</code> has no producer here, so a subscription naming only those is refused rather than accepted and never fired; an <strong>unrecognised</strong> token alongside a reportable one is accepted, since <code>BsfEvent</code> is an <code>anyOf</code>.</li>
+<li>Delivery is fire-and-forget per subscriber with bounded timeouts, so a subscriber that is down adds no latency to binding CRUD.</li>
+</ul>
+</li>
+<li><strong>Spec-clean binding responses</strong> (#98). <code>PcfBinding</code> responses no longer carry the bespoke <code>expiry</code> attribute — TS 29.521 defines <code>expiry</code> on the <strong>subscription</strong> resource, not on <code>PcfBinding</code>, so emitting it made every binding response fail strict schema validation. The value is still honoured for the TTL timer below. <code>GET /pcfBindings/{bindingId}</code> is likewise no longer served: the spec defines only <code>DELETE</code> and <code>PATCH</code> there, so it answers 405 with an <code>Allow: DELETE, PATCH</code> header. Discovery via <code>GET /pcfBindings?...</code> is unaffected, and a PATCH response already returns the updated representation.</li>
 <li><strong>Binding TTL</strong>: every PDU-session binding arms an expiry timer — from the RFC 3339 <code>expiry</code> attribute when supplied (invalid values are rejected 400), otherwise the default TTL of <strong>3600 s</strong> (<code>timer::defaults::BINDING_EXPIRY</code> in <code>src/bins/nextgcore-bsfd/src/timer.rs</code>). The event loop removes expired bindings, and expired-but-unswept bindings are excluded from GET/discovery.</li>
 <li><strong>NRF registration and load reporting</strong>: the BSF PUTs an NFProfile (<code>nfType: BSF</code>, service <code>nbsf-management</code>, <code>allowedNfTypes: PCF/SMF/SCP</code>, <code>heartBeatTimer: 10</code>) to <code>/nnrf-nfm/v1/nf-instances/{id}</code> and, on success, spawns a heartbeat worker every <strong>5 s</strong> that PATCHes a live <code>/load</code> gauge computed as bindings vs. <code>--max-sess</code> capacity (TS 29.510 §5.2.2.3.2 per code comment). Registration failure is non-fatal (“will operate without NRF”). Quirk: passing <code>--nrf-uri</code> on the CLI additionally triggers a second, legacy registration with a separate random NF instance ID from <code>bsf_sbi_open</code> (<code>sbi_path.rs</code>); the YAML-configured URI only drives the main registration path.</li>
 <li><strong>Environment variables</strong>: the only one read is <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> (default <code>http://jaeger:4317</code>) for the OpenTelemetry OTLP exporter. <code>RUST_LOG</code> is not honored, and MongoDB persistence has no URI source in this binary at all — the <code>bsf_bindings</code> upsert/delete/load calls are best-effort no-ops (failures logged at debug) unless some in-process embedder initializes the shared DBI layer first.</li>
 </ul>
+<h2 id="durability-bsfd-is-a-memory-only-nf"><a class="header" href="#durability-bsfd-is-a-memory-only-nf">Durability: bsfd is a memory-only NF</a></h2>
+<p><strong>Decided deliberately, not by omission.</strong> Every resource this BSF holds — PDU-session bindings, UE
+bindings, MBS bindings and event subscriptions — lives in process memory and is <strong>lost when the daemon
+restarts</strong>. There is no state file and no database connection: the <code>bsf_bindings</code> MongoDB helpers exist in
+<code>context.rs</code> but the daemon never calls <code>nextgcore_mongoc_init</code> / <code>nextgcore_dbi_init</code>, so every
+upsert/delete/load is a best-effort no-op that logs at debug. A source guard
+(<code>bsfd_is_declared_memory_only</code> in <code>context.rs</code>) fails the build’s test suite if a future change initialises
+the DBI layer without updating this section, so this statement cannot quietly stop being true.</p>
+<h3 id="what-a-consumer-must-do"><a class="header" href="#what-a-consumer-must-do">What a consumer must do</a></h3>
+<p>After a BSF restart, a consumer must:</p>
+<ol>
+<li><strong>re-register its bindings.</strong> A <code>GET /pcfBindings?ipv4Addr=…</code> for a session registered before the restart
+returns <strong>204</strong> (no match), which is the same answer as “never registered” — deliberately, because it is
+the truth. The PCF or SMF that owns the binding is the only party that can restore it.</li>
+<li><strong>re-subscribe.</strong> A <code>POST /nbsf-management/v1/subscriptions</code> from before the restart is gone, and no
+notification will be delivered for it. <code>DELETE</code> on its <code>{subId}</code> answers 404.</li>
+</ol>
+<p>Nothing is silently degraded: there is no path that returns a stale binding or accepts a notification
+subscription it will not honour.</p>
+<h3 id="why-restoring-bindings-would-be-worse-than-losing-them"><a class="header" href="#why-restoring-bindings-would-be-worse-than-losing-them">Why restoring bindings would be <em>worse</em> than losing them</a></h3>
+<p>This is the reason the memory-only posture is a decision rather than a gap to be filled later.</p>
+<p>A TS 29.521 binding is a <strong>live</strong> association between a UE’s PDU session and the PCF currently serving it.
+While the BSF is down, that association can change: the session can be released, or a different PCF can take
+it over. A restored binding therefore asserts a fact that may no longer hold — and a consumer that reads it
+is told <strong>the wrong PCF</strong>, which is worse than being told nothing, because “nothing” makes it re-discover
+while a wrong answer makes it send policy traffic to a PCF that does not serve the session.</p>
+<p>Restoring subscriptions <strong>alone</strong> would be worse still, and is specifically not done: a subscriber that
+survived a restart while its bindings did not would either be notified about nothing at all, or — if the
+sweep treated absent bindings as removed — be told bindings “deregistered” that were simply never restored.
+That is a fabricated event, which is the failure this project treats as most serious.</p>
+<h3 id="what-would-have-to-change-to-make-it-durable"><a class="header" href="#what-would-have-to-change-to-make-it-durable">What would have to change to make it durable</a></h3>
+<p>Recorded so the option stays open and costed, rather than being rediscovered:</p>
+<ol>
+<li><strong>bindings first, subscriptions with them</strong> — never subscriptions alone, for the reason above.</li>
+<li>a URI source for the DBI layer (there is none in this binary today: no config key, no environment
+variable) plus a <code>nextgcore_dbi_init</code> call on the startup path, and a decision about whether a database
+that is unreachable at boot is fatal or degrades to memory-only;</li>
+<li>a <strong>recovery-time</strong> answer for the staleness above — most plausibly writing <code>recoveryTime</code> on each
+binding and refusing to serve a restored binding whose owning PCF has not reconfirmed it, which is a
+protocol addition rather than a storage change;</li>
+<li>the durable-snapshot hazards this project has already paid for elsewhere: restore <strong>before</strong> the SBI
+listener accepts, persist removals as well as inserts, and never resurrect a deleted record.</li>
+</ol>
 
                     </main>
 
@@ -324,7 +376,7 @@ bsf:
 
         <script src="../clipboard-1626706a.min.js"></script>
         <script src="../highlight-abc7f01d.js"></script>
-        <script src="../book-c22b7243.js"></script>
+        <script src="../book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

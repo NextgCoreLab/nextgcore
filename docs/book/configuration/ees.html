@@ -15,8 +15,8 @@
         <link rel="icon" href="../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../css/general-0392ca55.css">
-        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
         <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-10d7638c.js";
+            window.path_to_searchindex_js = "../searchindex-c2411517.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-1b88980e.js"></script>
+        <script src="../toc-be5dca41.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -198,7 +198,7 @@ ees:
   nrf:
     uri: http://172.23.0.10:7777
 </code></pre>
-<p>The docker deployment does its real configuration on the command line: <code>command: ["--sbi-addr", "172.23.0.31", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]</code>. Note that <code>--nrf-uri</code> is a flag the current <code>Args</code> struct no longer defines — the <code>--ecs-uri</code> doc comment states it “Replaces the former <code>--nrf-uri</code>” (eesd-01 removed NRF self-registration) — so the shipped compose command line is stale relative to the current binary.</p>
+<p>The docker deployment does its real configuration on the command line: <code>command: ["--sbi-addr", "172.23.0.31", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]</code>. Note that <code>--nrf-uri</code> is a flag the current <code>Args</code> struct no longer defines — the <code>--ecs-uri</code> doc comment states it “Replaces the former <code>--nrf-uri</code>” (eesd-01 removed NRF self-registration) — so the shipped compose command line is stale: clap rejects an unknown argument, so <code>eesd</code> started with that command line exits with a usage error instead of serving.</p>
 <h2 id="yaml-parameters"><a class="header" href="#yaml-parameters">YAML parameters</a></h2>
 <p><strong>None.</strong> The daemon defines no <code>#[derive(Deserialize)]</code> configuration struct and never reads the file named by <code>-c/--config</code>. All <code>Deserialize</code> structs in this crate are SBI message bodies (<code>types.rs</code>, <code>services.rs</code>, <code>acr.rs</code>, <code>acrevents.rs</code>, <code>eec.rs</code>, <code>ecs_registration.rs</code>), not configuration. If you need to change the bind address, port, capacity, ECS URI, or OAuth2 keys, use the command-line flags below — editing <code>ees.yaml</code> has no effect on <code>nextgcore-eesd</code>.</p>
 <h3 id="parsed-but-inert--decorative-yaml-fields"><a class="header" href="#parsed-but-inert--decorative-yaml-fields">Parsed-but-inert / decorative YAML fields</a></h3>
@@ -228,7 +228,7 @@ ees:
 <tr><td><code>--tls-key</code></td><td>path</td><td><code>/etc/nextgcore/tls/server.key</code> (when <code>--tls</code>)</td><td>TLS private key file.</td></tr>
 <tr><td><code>--max-eas</code></td><td>usize</td><td><code>512</code></td><td>Capacity cap, applied <strong>per resource family</strong> (see behavior notes).</td></tr>
 <tr><td><code>--ecs-uri</code></td><td>string</td><td>unset</td><td>ECS apiRoot for EES self-registration over EDGE-6 (TS 29.558 §9.1 per code comment). When unset, the registration request is built and logged but skipped.</td></tr>
-<tr><td><code>--ees-id</code></td><td>string</td><td>fresh <code>ees-&lt;UUIDv4&gt;</code> per start</td><td>EES identifier advertised to the ECS (<code>eesId</code>).</td></tr>
+<tr><td><code>--ees-id</code></td><td>string</td><td>fresh <code>ees-&lt;UUIDv4&gt;</code> per start</td><td>EES identifier advertised to the ECS (<code>eesId</code>), and the <code>ees-id</code> this EES presents when it pulls an EEC context from a source EES (see EEC context relocation below).</td></tr>
 <tr><td><code>--oauth2-jwks-file</code></td><td>path</td><td>unset</td><td>JSON JWKS used to verify OAuth2 access tokens (CAPIF/NRF issuer). When unset, <strong>every protected operation fails closed with 401</strong> (authorization is mandatory, TS 29.558 §6 per code comment).</td></tr>
 <tr><td><code>--callback-max-attempts</code></td><td>u32</td><td><code>3</code></td><td>Max delivery attempts per notification callback, including the first (clamped to ≥ 1); exhausting the budget drops the notification.</td></tr>
 <tr><td><code>--callback-backoff-ms</code></td><td>u64</td><td><code>1000</code></td><td>Base backoff between callback retries; a <code>Retry-After</code> response header takes precedence (RFC 9110 §10.2.3 per code comment).</td></tr>
@@ -239,10 +239,73 @@ ees:
 <h2 id="behavior-notes"><a class="header" href="#behavior-notes">Behavior notes</a></h2>
 <ul>
 <li><strong>OAuth2 is fail-closed and per-operation</strong> (eesd-08, <code>auth.rs</code>): every <code>eees-*</code> route runs <code>require_oauth2</code> <em>before</em> method dispatch. No JWKS configured, or a missing/invalid/expired bearer → 401; a valid token whose space-delimited <code>scope</code> lacks the per-API scope (the scope string equals the apiName, e.g. <code>eees-easregistration</code>) → 403 <code>INSUFFICIENT_SCOPE</code>. The shipped docker-compose command passes no <code>--oauth2-jwks-file</code>, so in that deployment every protected EES operation answers 401; <code>main.rs</code> logs a startup warning to that effect.</li>
-<li><strong>ECS, not NRF</strong>: with <code>--ecs-uri</code> set, the EES POSTs an <code>EESRegistration</code> to <code>{ecsApiRoot}/eecs-eesregistration/v1/registrations</code> and, on 200/201, spawns a refresh task that PUTs the resource every 60 s. A failed initial POST is logged (<code>will operate without ECS</code>) and <strong>not retried</strong>; without <code>--ecs-uri</code> the daemon runs standalone.</li>
+<li><strong>ECS, not NRF</strong>: with <code>--ecs-uri</code> set, the EES POSTs an <code>EESRegistration</code> to <code>{ecsApiRoot}/eecs-eesregistration/v1/registrations</code> and, on 200/201, spawns a refresh task that PUTs the resource every 60 s; without <code>--ecs-uri</code> the daemon runs standalone. As of #107 the initial POST is <strong>retried with capped exponential backoff</strong> (5 attempts, 500 ms doubling to a 30 s cap) instead of being abandoned after one failure, the refresh <strong>re-POSTs</strong> on any non-2xx instead of looping on a resource the ECS no longer has, and the body carries live <code>easIds</code> and an <code>expTime</code> instead of <code>null</code> — see <em>Restoring a lost registration</em> below.</li>
+</ul>
+<h2 id="restoring-a-lost-registration-and-the-ecs-role-107"><a class="header" href="#restoring-a-lost-registration-and-the-ecs-role-107">Restoring a lost registration, and the ECS role (#107)</a></h2>
+<p>Three things were silently brittle before #107, and one thing was missing entirely.</p>
+<p><strong>The EDGE-6 client.</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>was</th><th>now</th></tr>
+</thead>
+<tbody>
+<tr><td>one POST, then <code>warn!("will operate without ECS")</code> forever — a transient blip during startup dropped the EES from the registry permanently</td><td>retried up to <code>MAX_REGISTRATION_ATTEMPTS</code> (5) with backoff <code>500 ms → 1 s → 2 s → 4 s</code>, capped at 30 s. The body is <strong>rebuilt each attempt</strong>, so an EAS that registered while the ECS was unreachable appears in the registration that finally lands</td></tr>
+<tr><td>the refresh only ever PUT; a 404 — what an ECS returns for a resource lost across a restart — was logged and the loop kept PUTting forever</td><td>any <strong>non-2xx</strong> re-POSTs and adopts the new <code>registrationId</code>. Not only 404: a 410 or a schema-version 400 leave the EES in the identical state, and re-creating is idempotent from this side, so the narrower check would buy nothing and loop forever on those</td></tr>
+<tr><td><code>easIds: null</code> and <code>expTime: null</code>, so the ECS’s view of this EES was wrong even on the happy path and target-EES selection could never match it</td><td>both derived from live state on every POST <strong>and</strong> every refresh. <code>expTime</code> is 10 minutes out and the refresh runs every 60 s, so a live EES is never expired while one that stopped refreshing is</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>easIds</code> is absent rather than <code>[]</code> when the EES serves no EAS: the member is optional, and an empty array asserts “serves no EAS” where absent says “not stated”. Either way the ECS’s discovery does not match it, which is the point — an EES advertising no EAS cannot be selected as a target.</p>
+<p><strong>The ECS role.</strong> All eight ECS-side APIs were unimplemented anywhere in the workspace, so an EEC had no EDGE-4 bootstrap and an EES could not be brought into a deployment through an ECS. <code>ECS_ROLE=1</code> now makes this process serve three of them:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>API</th><th>Path</th><th>What it does</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Eecs_EESRegistration</code></td><td><code>POST/PUT/GET/DELETE /eecs-eesregistration/v1/registrations[/{registrationId}]</code></td><td>EDGE-6. Mints the <code>registrationId</code> server-side and returns it in <code>Location</code>. <strong>404 for an id it does not hold</strong>, which is what makes the client’s re-POST recovery reachable.</td></tr>
+<tr><td><code>Eecs_ServiceProvisioning</code></td><td><code>POST /eecs-serviceprovisioning/v1/provisioning-requests</code></td><td>EDGE-4. Returns the registered EES endpoints an EEC needs. <code>eecId</code> is mandatory. An ECS with no EES answers <strong>200 with an empty list</strong>, not 404 — “none available yet” and “not served here” are different states.</td></tr>
+<tr><td><code>Eecs_TargetEESDiscovery</code></td><td><code>POST /eecs-targeteesdiscovery/v1/target-ees-discovery</code></td><td>Matches <code>easId</code> (directly, or via an AC profile’s <code>easIds</code>) against the registered <code>eesProf.easIds</code>. An unfiltered query returns every EES: “which EESs exist” is a legitimate discovery.</td></tr>
+</tbody>
+</table>
+</div>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Variable</th><th>Default</th><th>Effect</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ECS_ROLE</code></td><td>unset (off)</td><td><code>1</code>/<code>true</code>/<code>yes</code>/<code>on</code> serves the three <code>eecs-*</code> APIs from this process. A <strong>runtime</strong> switch rather than a cargo feature, per this project’s convention that a feature-gated path is left uncompiled by CI and rots.</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Limits worth knowing:</strong></p>
+<ul>
+<li><strong>Five of the eight ECS APIs are not implemented</strong> — <code>Eecs_ECSDiscovery</code>, <code>Eecs_EASInfoManagement</code>, <code>Eecs_ACREvents</code>, <code>Eecs_ECSServiceProvisioning</code> and <code>Ecas_SelectedEES</code>. They answer 404, deliberately: a route returning a fabricated 2xx is worse than one that is honest about not existing. #107’s own suggested approach scoped the initial surface to three.</li>
+<li><strong>The role is a role, not a separate <code>ecsd</code>.</strong> An ECS has no <code>nfType</code> in TS 29.510 — the same fact that made EDGE-6 registration replace this daemon’s old NRF self-registration — so a separate binary would gain none of the NF machinery that justifies one, and the registry an ECS matches against is the EAS pool this process already keeps. With <code>ECS_ROLE</code> unset the <code>eecs-*</code> paths answer 404 exactly as before.</li>
+<li><strong>The ECS registry is in memory</strong>, like every other piece of EES state, so it is lost on restart — which is precisely the case the hardened client’s re-POST recovery handles.</li>
+<li><strong>The <code>eecs-*</code> routes are not OAuth2-gated.</strong> They are a different reference point (EDGE-4/EDGE-6) with different consumers, and requiring an <code>eees-*</code> scope would make an EEC’s bootstrap need an EAS’s token. A test pins the contrast.</li>
+<li><strong><code>ECS_ROLE</code> is not set by any compose service</strong>, so the default E2E path is unchanged.</li>
 <li><strong>Capacity and rejection</strong>: the single <code>--max-eas</code> value caps each resource family independently in <code>context.rs</code> — EAS registrations, EEC registrations, discovery subscriptions, AC-information subscriptions, ACR-management-event subscriptions, ACR-events subscriptions, and stored EEC contexts. On exhaustion, create handlers return <strong>507</strong> with cause <code>INSUFFICIENT_RESOURCES</code>. Mandatory-IE violations return 400 <code>MANDATORY_IE_MISSING</code>; malformed JSON returns 400 <code>INVALID_MSG_FORMAT</code>; changing an immutable <code>easId</code>/<code>eecId</code> on update returns 403 <code>MODIFICATION_NOT_ALLOWED</code>.</li>
 <li><strong>Registration lifecycle</strong> (eesd-12): a sweep every 30 s (<code>LIFECYCLE_SWEEP_INTERVAL_SECS</code>) drops expired EAS/EEC registrations; an EEC registration created without <code>expTime</code> is minted one 3600 s out (<code>DEFAULT_EEC_REG_LIFETIME_SECS</code> in <code>eec.rs</code>). All state is in-memory only — there is no state file, and the context is cleared on shutdown.</li>
 <li><strong>Notification callbacks</strong> (D6, <code>notifier.rs</code>): every subscription callback is POSTed to its <code>notificationDestination</code> through a bounded queue (default capacity 1024; a full queue drops the newest with a warning) with bounded retry per the <code>--callback-*</code> flags; <code>suppFeat</code> negotiation echoes the hex-AND of the consumer’s mask with <code>EES_SUPPORTED_FEATURES = 0x1</code> (<code>types.rs</code>).</li>
+<li><strong>EEC registration and AC profiles</strong> (#105, TS 24.558 §5.2.2.2): when an EEC registration carries <code>acProfs</code>, the EES matches each profile against its registered EASes — but <strong>only for profiles that include <code>eass</code></strong>, because the clause conditions the matching rule on that member. For each such profile the named <code>easId</code> must be registered <em>and</em> satisfy the profile’s <code>minimumReqSvcKPIs</code> (<code>respTime</code>, <code>avail</code>, <code>reqRate</code> are compared; <code>connBand</code> is not, because it is a <code>BitRate</code> string on both sides and this tree has no parser for it). Outcomes:
+<ul>
+<li><strong>no profile matched</strong> → the registration is refused with <strong>404</strong> <code>RESOURCE_NOT_FOUND</code>, before any resource is created and before any context pull is attempted;</li>
+<li><strong>some profiles matched</strong> → <strong>201</strong>, with the failures reported in the response body as <code>unfulfilledAcProfs</code> (exactly one failure) or <code>unfulfillAcProfs</code> (two or more), per NOTE 2 of the clause. Reason is <code>EAS_NOT_AVAILABLE</code> when no EAS answers to the <code>easId</code>, <code>REQ_UNFULFILLED</code> when one does but misses the KPIs. There is <strong>no 422</strong> — the OpenAPI declares none for <code>CreateEECReg</code>, and both members belong to <code>EECRegistration</code>, which is the 201 body;</li>
+<li><code>easSelReqInd: true</code> additionally returns the EASes the EES selected in <code>discoveredEas</code>. Omitted or <code>false</code> means the EES does not select, and the member is left as the EEC sent it.
+<code>ueMobilityReq</code> and <code>ueType</code> are stored but drive nothing: the EdgeApp_2 behaviour behind them (subscribing to UE location via NEF/NWDAF) has no path in this binary. <code>easBundleInfos</code> is not modelled at all.</li>
+</ul>
+</li>
+<li><strong>EEC context relocation</strong> (#105, TS 29.558 §5.10): a registration presenting <strong>both</strong> <code>eecCntxId</code> and <code>srcEesId</code> makes the EES <code>GET {srcEesId}/eees-eeccontextreloc/v1/eec-contexts?ees-id={--ees-id}&amp;eec-cntx-id={eecCntxId}</code> and store a retrieved context under its own <code>cntxId</code>, so a later pull from this EES serves it. Operational limits:
+<ul>
+<li><code>srcEesId</code> must be an <strong>absolute <code>http(s)</code> URI</strong> — it is used as the source EES <code>apiRoot</code>. A bare identifier logs <code>not addressable</code> and the registration proceeds without the relocated context; there is no EES-level NRF discovery in this tree to resolve one, and the OpenAPI has no companion member carrying the source EES endpoint.</li>
+<li>The pull is bounded at <strong>3 s</strong> and never fails the registration. An unreachable, 404-ing, or malformed-responding source EES produces a <code>warn</code> and a registration that succeeded <em>without</em> continuity data — that log line is the only signal, so watch for it.</li>
+<li>Only one of the two identifiers present is treated as <strong>no</strong> relocation (a context id with no source EES names a context nobody can be asked for, and vice versa).</li>
+<li>The EES does <strong>not</strong> mint a new <code>eecCntxId</code> on registration, which §5.2.2.2 permits but does not require; the context keeps the id its owner gave it.</li>
+</ul>
+</li>
 <li><strong>Environment variables</strong>: <code>RUST_LOG</code> overrides <code>-e/--log-level</code> (the <code>env_logger</code> builder uses the flag only as the default filter), and <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> sets the OpenTelemetry OTLP exporter endpoint, defaulting to <code>http://jaeger:4317</code> when unset. These are the only env vars read by this binary’s sources.</li>
 </ul>
 
@@ -254,7 +317,7 @@ ees:
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../configuration/pin.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../configuration/easdf.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -268,7 +331,7 @@ ees:
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../configuration/pin.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../configuration/easdf.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>
@@ -294,7 +357,7 @@ ees:
 
         <script src="../clipboard-1626706a.min.js"></script>
         <script src="../highlight-abc7f01d.js"></script>
-        <script src="../book-c22b7243.js"></script>
+        <script src="../book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

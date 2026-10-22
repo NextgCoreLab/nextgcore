@@ -15,8 +15,8 @@
         <link rel="icon" href="../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../css/general-0392ca55.css">
-        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
         <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-10d7638c.js";
+            window.path_to_searchindex_js = "../searchindex-c2411517.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-1b88980e.js"></script>
+        <script src="../toc-be5dca41.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -181,7 +181,7 @@
 <p>The NSACF (Network Slice Admission Control Function, <code>nextgcore-nsacfd</code>) enforces per-slice admission quotas for UE registrations and PDU session establishment, per TS 23.502 §4.2.9 and TS 29.536 (as cited in the daemon’s source comments). It serves the <code>Nnsacf_NSAC</code> (<code>/nnsacf-nsac/v1/slices/ues</code>, <code>/nnsacf-nsac/v1/slices/pdus</code>) and <code>Nnsacf_SliceEventExposure</code> APIs, plus Early Admission Control (EAC) notifications.</p>
 <p>Configuration is split between a YAML file (default path <code>/etc/nextgcore/nsacf.yaml</code>, overridable with <code>-c/--config</code>) and command-line flags. The YAML file is the source for slice quotas, the NRF URI, and OAuth2 enforcement; most runtime knobs (bind address/port, TLS, thresholds) are CLI flags only.</p>
 <blockquote>
-<p><strong>Honesty note:</strong> NSACF behavior is validated by this project’s own unit and matched-simulator E2E tests (84/84 docker E2E as of 2026-07-02), not by third-party conformance certification. The vendored OpenAPI sets do not include <code>TS29536_Nnsacf_*.yaml</code>; field names mirror TS 29.536 terminology as documented in code comments.</p>
+<p><strong>Honesty note:</strong> NSACF behavior is validated by this project’s own unit and matched-simulator E2E tests, not by third-party conformance certification. The vendored OpenAPI sets do not include <code>TS29536_Nnsacf_*.yaml</code>; field names mirror TS 29.536 terminology as documented in code comments.</p>
 </blockquote>
 <h2 id="example-configuration"><a class="header" href="#example-configuration">Example configuration</a></h2>
 <p>From <code>nextgcore/docker/rust/configs/5gc/nsacf.yaml</code>:</p>
@@ -266,8 +266,26 @@ nsacf:
 <ul>
 <li><strong>Admission result encoding</strong> (TS 29.536 §6.1.3.2.3.1 per code comment): HTTP <strong>204</strong> = all requested S-NSSAIs admitted; <strong>200</strong> with <code>acuFailureList</code> keyed by SUPI = partial failure; <strong>403</strong> ProblemDetails = total failure. Failure reasons include <code>SLICE_NOT_FOUND</code>, <code>EXCEED_MAX_UE_NUM[_3GPP/_N3GPP]</code>, <code>EXCEED_MAX_PDU_NUM[_3GPP/_N3GPP]</code>.</li>
 <li><strong>Supported features</strong>: the NSACF advertises <code>supportedFeatures: "0"</code> — no optional TS 29.536 §6.1.8 features; HNSAC/VHNSAC home/visited delegation is <strong>not</strong> supported.</li>
+<li><strong>Slice event exposure</strong> (<code>Nnsacf_SliceEventExposure</code>, TS 29.536 §5.3.2). <code>POST /nnsacf-slice-ee/v1/subscriptions</code> creates a subscription; <code>PATCH</code> (RFC 6902 JSON Patch, <code>application/json-patch+json</code>) and <code>PUT</code> on <code>.../subscriptions/{id}</code> modify and replace it, and <code>DELETE</code> removes it. <strong>PATCH and PUT used to answer 405</strong> (#96), so a consumer had to delete and re-create to change anything. A modification never resets the report budget, so <code>maxReports</code> cannot be refreshed by patching, and a PATCH whose result no longer validates is rejected without committing.</li>
+<li><strong>Report triggers</strong> (#96). Every trigger field is honoured, and note which object each lives on: <code>eventTrigger</code>, <code>notifThreshold</code>, <code>notificationPeriod</code> and <code>immediateFlag</code> are on the nested <code>event</code> (<code>SACEvent</code>), while <code>notifyCorrelationId</code>, <code>maxReports</code> and <code>expiry</code> are top-level on <code>SACEventSubscription</code>.
+<ul>
+<li><code>THRESHOLD</code> (the default when the consumer names none) is <strong>edge-triggered</strong>: a report goes out when occupancy crosses <code>notifThreshold</code>, once per crossing, and the edge re-arms when occupancy falls back below. Sub-threshold admit/release churn is silent. Any single met member of the <code>SACInfo</code> threshold crosses it, so a consumer that sets two is not silenced. A <code>THRESHOLD</code> subscription with no threshold at all degenerates to reporting each change rather than never reporting.</li>
+<li><code>PERIODIC</code> is paced by <code>notificationPeriod</code> seconds regardless of how much occupancy moved; with no period it reports on each event.</li>
+<li>An unrecognised trigger token is edge-triggered rather than rejected — <code>SACEventTrigger</code> is an <code>anyOf</code> over the enum plus a free-form string.</li>
+<li><code>maxReports</code> and <code>expiry</code> are enforced and are <strong>terminal</strong>: a spent subscription is removed rather than merely skipped. <code>notifyCorrelationId</code> is echoed in every notification when the consumer set one, and absent when it did not.</li>
+<li><code>immediateFlag</code> sends exactly one report to that subscription at subscribe time, bypassing the trigger, because the consumer asked for the current state rather than for a change.</li>
+<li>Before #96 <strong>every</strong> admit/release fanned out a notification to every matching subscriber with none of this gating — untenable for a consumer at any real scale.</li>
+</ul>
+</li>
+<li><strong>Immediate EAC notification</strong> (#96, TS 29.536 §5.2.2.2.2). The first time an AMF supplies an <code>eacNotificationUri</code>, the NSACF immediately POSTs an <code>EacNotification</code> carrying the current EAC mode of <strong>every</strong> NSAC-subject slice, not just the one that most recently transitioned. Previously the callback was registered and nothing was sent, so a consumer did not learn the current mode until the next transition — which for a stable slice could be never. Only on the <strong>first</strong> subscription: an AMF that re-sends the URI on every <code>NumOfUEsUpdate</code> is not re-notified. With no slice quotas configured nothing is sent, since an empty <code>eacModeList</code> would assert “no slices” rather than “nothing configured yet”.</li>
+<li><strong>NRF profile</strong> (#96). Both services are registered with per-service <code>allowedNfTypes</code>: <code>nnsacf-nsac</code> to <code>[AMF, SMF, SCP]</code>, and <code>nnsacf-slice-ee</code> to <code>[NEF, NWDAF, AF, DCCF, SCP]</code> — <strong>AF and DCCF were missing</strong>, and TS 29.536 §5.3.2.2.2 names both as legitimate Slice-EE consumers, so the NRF would not issue either a token scoped to the service. The NF-level list is the union. Service names come from the typed <code>SbiServiceType</code> (<code>NnsacfSliceEe</code> is new in #96, so a consumer can now select the exposure service by type) rather than from string literals, and <code>apiFullVersion</code> is one named constant <code>1.3.0</code> matching the vendored OpenAPI’s <code>info.version</code> instead of a hardcoded <code>1.1.0</code> that claimed an older revision than the contract this daemon is built against.</li>
 <li><strong>Runtime reprovisioning</strong>: quotas can also be updated at runtime via the spec custom operation <code>POST /nnsacf-nsac/v1/slices/local-configs/update</code>, and via a NextGCore admin-only extension at <code>/nnsacf-nsac/v1/slice-quotas</code> (explicitly <em>not</em> a TS 29.536 resource). The admin extension applies its own defaults when omitted: <code>maxUes</code> 10000, <code>maxPduSessions</code> 50000 — different from the YAML’s uncapped semantic.</li>
-<li><strong>Per-access ceilings</strong> (<code>maxUes3gpp</code>, <code>maxUesN3gpp</code>, <code>maxPdu3gpp</code>, <code>maxPduN3gpp</code>) are configurable only through <code>local-configs/update</code>, not through the YAML file.</li>
+<li><strong><code>local-configs/update</code> takes an <code>ACUpdateData</code> and answers <code>204</code> with an empty body</strong> (#95, TS 29.536 §5.2.2.5.2): a single object with <code>snssai</code> mandatory and <code>maxUesNumber</code> / <code>maxPdusNumber</code> optional. <strong>This replaced a bespoke wire</strong> that required a <code>localConfigurations</code> <em>array</em> envelope with <code>maxUes</code> / <code>maxPduSessions</code> and answered <code>200</code> with a body — an OSS/BSS or OAM system driving slice limits speaks <code>ACUpdateData</code> and would not have interworked with either half. An omitted <code>maxUesNumber</code> or <code>maxPdusNumber</code> <strong>keeps</strong> the slice’s current ceiling rather than resetting it to the default; only a brand-new S-NSSAI falls back to 10000 / 50000.</li>
+<li><strong><code>roaming-quotas/query</code> takes a <code>QuotaUpdateRequestData</code> and answers a <code>QuotaUpdateResponseData</code></strong> (#95, TS 29.536 §5.2.2.6.2 / §5.3.2.4.1): <code>snssai</code>, <code>plmnId</code> and <code>quotaType</code> are <strong>all required</strong> — a body missing any one is <code>400 MANDATORY_IE_MISSING</code>, and a <code>plmnId</code> that does not carry both <code>mcc</code> and <code>mnc</code> is not a PLMN. The response is <code>{snssai, maxUesNumber, maxPdusNumber}</code>; an unconfigured S-NSSAI is <code>404</code>, not an empty <code>200</code>. The <code>quotaType</code> <strong>value</strong> is accepted as given rather than validated against an enumeration, because TS 29.536’s <code>QuotaType</code> list is not in the vendored OpenAPI set and an invented allow-list would reject conformant peers. Per-PLMN quota differentiation is <strong>not</strong> implemented: <code>plmnId</code> is validated and logged, and the quota returned is the slice-level one.</li>
+<li><strong>Per-access ceilings</strong> (<code>maxUes3gpp</code>, <code>maxUesN3gpp</code>, <code>maxPdu3gpp</code>, <code>maxPduN3gpp</code>) are configurable only through <code>local-configs/update</code>, not through the YAML file. They are a NextGCore extension carried as extra optional members of the <code>ACUpdateData</code> object, and an update that names none of them <strong>keeps</strong> whatever a previous call installed.</li>
+<li><strong><code>nfId</code> is optional on <code>POST /slices/pdus</code> and mandatory on <code>POST /slices/ues</code></strong> (#95). That asymmetry is what TS 29.536 specifies: Table 6.1.6.2.7-1 lists <code>pduACRequestInfo</code> as the only required attribute of <code>PduACRequestData</code>, so an SMF/PGW-C identifying itself by <code>pgwFqdn</code> is conformant. <code>pgwFqdn</code>, <code>nsacServiceArea</code> and <code>supportedFeatures</code> are now parsed too, and <code>pgwFqdn</code> is the fallback identity in logs.</li>
+<li><strong>A UE registered over both accesses survives a <code>DECREASE</code> on one</strong> (#95, TS 29.536 §5.2.2.2.2). Membership records the access type <strong>set</strong> per SUPI, fed by <code>anType</code> plus <code>additionalAnType</code>; the registration entry — and the aggregate registered-UE count — goes only when the last access is released. Per-access buckets are counted independently, so <code>currentUes3gpp + currentUesN3gpp</code> may exceed <code>currentUes</code>. A <code>DECREASE</code> that names <strong>no</strong> access at all releases every access, so a consumer that does not send <code>anType</code> cannot strand a registration. The roaming IEs (<code>plmnId</code>, <code>plmnIdNid</code>, <code>ueRegInd</code>, <code>servingPlmnId</code>, <code>nsacMode</code>, <code>numberExceedInfo</code>) are parsed and logged but do not yet drive per-PLMN quota selection.</li>
+<li><strong>Per-access registered counts are on the admin resource</strong>, <code>GET /nnsacf-nsac/v1/slice-quotas/{quotaId}</code> (<code>currentUes3gpp</code> / <code>currentUesN3gpp</code>). They moved there in #95 when <code>roaming-quotas</code> became the spec’s ceilings-only <code>QuotaUpdateResponseData</code>.</li>
 </ul>
 
                     </main>
@@ -318,7 +336,7 @@ nsacf:
 
         <script src="../clipboard-1626706a.min.js"></script>
         <script src="../highlight-abc7f01d.js"></script>
-        <script src="../book-c22b7243.js"></script>
+        <script src="../book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

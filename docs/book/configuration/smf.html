@@ -15,8 +15,8 @@
         <link rel="icon" href="../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../css/general-0392ca55.css">
-        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
         <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-10d7638c.js";
+            window.path_to_searchindex_js = "../searchindex-c2411517.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-1b88980e.js"></script>
+        <script src="../toc-be5dca41.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -235,7 +235,7 @@ smf:
     min_version: "1.2"
 </code></pre>
 <h2 id="parsed-parameters"><a class="header" href="#parsed-parameters">Parsed parameters</a></h2>
-<p>The typed loader (<code>SmfYaml</code>/<code>SmfConfig</code> in <code>src/bins/nextgcore-smfd/src/main.rs</code>) deserializes only the <code>smf.sbi</code> subtree. Only the <strong>first</strong> entry of each list is used.</p>
+<p>The typed loader (<code>SmfYaml</code>/<code>SmfConfig</code> in <code>src/bins/nextgcore-smfd/src/main.rs</code>) deserializes <code>smf.sbi</code>, <code>smf.gtpc</code>, <code>smf.dns</code> and <code>smf.mtu</code>. Only the <strong>first</strong> entry of each list is used.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -245,6 +245,9 @@ smf:
 <tr><td><code>smf.sbi.server[0].address</code></td><td>string</td><td><code>0.0.0.0</code></td><td>Bind address for the SBI HTTP/2 server.</td></tr>
 <tr><td><code>smf.sbi.server[0].port</code></td><td>u16</td><td><code>7777</code></td><td>SBI server port. Address+port also derive the advertised callback base URI (with <code>0.0.0.0</code> replaced by <code>127.0.0.1</code> unless <code>SMF_SBI_ADVERTISE_URI</code> is set).</td></tr>
 <tr><td><code>smf.sbi.client.nrf[0].uri</code></td><td>string</td><td>none</td><td>NRF base URI; seeded into the SBI context for NF registration. Without it the SMF operates NRF-less.</td></tr>
+<tr><td><code>smf.gtpc.server[0].address</code> / <code>.port</code></td><td>string / u16</td><td>unset / <code>2123</code></td><td>S5/S8 GTPv2-C bind address for the PGW-C role (#52). Unset leaves the PGW-C role unbound; a second entry is named in a warning and ignored. The EPC compose runs a dedicated smfd as PGW-C with <code>docker/rust/configs/epc/pgwc.yaml</code>.</td></tr>
+<tr><td><code>smf.dns</code></td><td>list of strings</td><td>none</td><td>DNS servers signalled to the UE in the Establishment Accept’s ePCO. IPv6 entries are accepted and skipped (only the IPv4 DNS container is emitted).</td></tr>
+<tr><td><code>smf.mtu</code></td><td>u16</td><td>none</td><td>IPv4 link MTU signalled in the same ePCO.</td></tr>
 <tr><td><code>smf.sbi.oauth2.require</code></td><td>bool</td><td><code>false</code></td><td>Opt-in SBI OAuth2 enforcement (TS 33.501 §13.4.1, TS 29.510 §5.4.2, per code comments). Read by a separate generic YAML scan: true if <em>any</em> top-level section sets it, or if <code>NEXTGCORE_SBI_OAUTH2_REQUIRE=1/true/yes</code>. With no NRF URI configured the producer side fails closed (503).</td></tr>
 </tbody>
 </table>
@@ -273,22 +276,206 @@ smf:
 <tbody>
 <tr><td><code>SMF_CONFIG</code></td><td><code>/etc/nextgcore/smf.yaml</code></td><td>Config file path (overridden by <code>-c</code>/<code>--config</code>).</td></tr>
 <tr><td><code>SMF_PFCP_ADDR</code> / <code>SMF_PFCP_PORT</code></td><td><code>0.0.0.0</code> / <code>8805</code></td><td>N4 PFCP bind address (single socket; sequence-number matching per TS 29.244 §7.2.1, per code comment). <code>SMF_PFCP_ADDR</code> also supplies the PFCP Node ID (falls back to <code>127.0.0.1</code> if not a dotted IPv4).</td></tr>
-<tr><td><code>UPF_PFCP_ADDR</code> / <code>UPF_PFCP_PORT</code></td><td><code>127.0.0.1</code> / <code>8805</code></td><td>UPF N4 peer address.</td></tr>
+<tr><td><code>UPF_PFCP_ADDR</code> / <code>UPF_PFCP_PORT</code></td><td><code>127.0.0.1</code> / <code>8805</code></td><td>UPF N4 peer(s), comma-separated. Each entry is an IP, <code>IP:port</code>, or a hostname (<code>host</code> or <code>host:port</code>); a hostname is re-resolved on every Association Setup attempt, so a UPF that moves to a new IP is re-associated.</td></tr>
+<tr><td><code>SMF_PFCP_RELEASE_ON_SHUTDOWN</code></td><td><code>false</code></td><td>Send PFCP Association Release on graceful shutdown. Off by default: the UPF deletes every session of a released association, so a restart would cut all UE traffic. Set <code>true</code> only when the SMF is being removed for good.</td></tr>
 <tr><td><code>SMF_SBI_ADVERTISE_URI</code></td><td>derived from SBI server address/port</td><td>Externally reachable base URI used in PCF callback (<code>notificationUri</code>) URIs.</td></tr>
+<tr><td><code>UDM_SBI_ADDR</code> / <code>UDM_SBI_PORT</code></td><td>unset / <code>7777</code></td><td>UDM address for <code>Nudm_SDM_Get(smf-select-data)</code>, used only to resolve the <strong>subscribed default DNN</strong> (#204). Tried <strong>after</strong> NRF discovery, so it is the fallback for a deployment with no NRF. With neither available, a <code>SmContextCreateData</code> carrying no <code>dnn</code> is refused with <code>SUBSCRIPTION_DATA_NOT_AVAILABLE</code>.</td></tr>
+<tr><td><code>NRF_URI</code></td><td>unset</td><td>NRF URI, used when the YAML names none.</td></tr>
+<tr><td><code>PCF_URI</code> / <code>NSACF_URI</code></td><td>unset</td><td>PCF / NSACF endpoint, tried before NRF discovery. With no NSACF configured or discoverable, slice admission control is skipped.</td></tr>
+<tr><td><code>SMF_METRICS_PORT</code></td><td><code>9090</code></td><td>Prometheus endpoint port (bound on <code>0.0.0.0</code>).</td></tr>
+<tr><td><code>SMF_UDM</code></td><td>off</td><td><code>1</code>/<code>true</code> turns on the UDM interaction of TS 23.502 §4.3.2.2.1 step 4 (UECM registration, SM-data subscription, #79). Off by default because the E2E harness has no conformant UDM.</td></tr>
+<tr><td><code>SMF_EPS_INTERWORKING</code></td><td>off</td><td><code>1</code>/<code>true</code> makes an establishing PDU session request an EPS Bearer Identity from the AMF and send Mapped EPS bearer contexts to the UE, so the session can later move to the EPC (#117).</td></tr>
+<tr><td><code>SMF_IWK_SNSSAI</code></td><td>SST <code>1</code></td><td>S-NSSAI (<code>sst</code> or <code>sst:sd</code>, SD six hex digits) the PGW-C+SMF assigns to a PDN connection that can move to 5GS (#475).</td></tr>
+<tr><td><code>SMF_PGW_FQDN</code></td><td>unset</td><td>PGW-C+SMF FQDN registered with the UDM; blank is treated as unset.</td></tr>
+<tr><td><code>SMF_INDIRECT_FORWARDING_TIMER_MS</code></td><td><code>3000</code></td><td>How long the UPF keeps EPS→5GS indirect data-forwarding tunnels after the handover executes.</td></tr>
+<tr><td><code>SMF_GN_ADDR</code></td><td><code>127.0.0.1</code></td><td>GGSN address this SMF puts in Gn Create/Update PDP Context Responses (GTPv1 interworking).</td></tr>
+<tr><td><code>SMF_EASDF</code> / <code>SMF_EASDF_EDGE_FQDN</code></td><td>off / unset</td><td><code>1</code>/<code>true</code> enables the EASDF DNS-context leg (TS 23.501 §5.6.7, #114); <code>SMF_EASDF_EDGE_FQDN</code> lists the FQDN patterns (e.g. <code>*.edge.example.com</code>) to steer. Enabled with no pattern logs a warning and steers nothing.</td></tr>
+<tr><td><code>REDCAP_SESS_AMBR_DL_BPS</code> / <code>_UL_BPS</code></td><td><code>150000000</code> / <code>50000000</code></td><td>Session-AMBR caps for RedCap UEs.</td></tr>
 <tr><td><code>NEXTGCORE_SBI_OAUTH2_REQUIRE</code></td><td>unset</td><td><code>1</code>/<code>true</code>/<code>yes</code> forces OAuth2 enforcement, taking precedence over the YAML knob.</td></tr>
+<tr><td><code>NEXTGCORE_SMF_STATE_FILE</code></td><td>unset</td><td>JSON snapshot file for PFCP sessions, policy bindings and IPv4-pool allocations (#191). Read only when <code>--state-file</code> is absent — the flag wins; an empty value is treated as unset. With neither set the SMF is memory-only, which is the shipped default.</td></tr>
 <tr><td><code>OTEL_EXPORTER_OTLP_ENDPOINT</code></td><td><code>http://jaeger:4317</code></td><td>OpenTelemetry OTLP trace exporter endpoint.</td></tr>
 </tbody>
 </table>
 </div>
+<h2 id="command-line-flags"><a class="header" href="#command-line-flags">Command-line flags</a></h2>
+<p><code>smfd</code> has no <code>clap</code> argument parser; it scans <code>argv</code> for the two flags it
+understands and ignores everything else.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>-c</code> / <code>--config</code></td><td><code>/etc/nextgcore/smf.yaml</code></td><td>Config file path. Falls back to <code>SMF_CONFIG</code>.</td></tr>
+<tr><td><code>--state-file</code></td><td>unset</td><td>JSON snapshot file for durable state (#191). Falls back to <code>NEXTGCORE_SMF_STATE_FILE</code>; an empty value is treated as unset.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="durable-state-191"><a class="header" href="#durable-state-191">Durable state (#191)</a></h2>
+<p>Off by default. With <code>--state-file</code> (or <code>NEXTGCORE_SMF_STATE_FILE</code>) the SMF
+snapshots three things on every mutation and reloads them at boot:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Snapshotted</th><th>Why it matters on restart</th></tr>
+</thead>
+<tbody>
+<tr><td>PFCP sessions (<code>sm_context_ref</code> → UPF SEID)</td><td>Without it the UPF holds N4 sessions the SMF can no longer delete or modify.</td></tr>
+<tr><td>Policy bindings (PCF association, authorized QoS, GSM FSM state, EASDF DNS context)</td><td>Without it a restarted SMF cannot terminate or update policy for a live session.</td></tr>
+<tr><td>IPv4-pool allocations</td><td><strong>The one with a correctness consequence beyond lost state.</strong> The pool is a bitmap; rebuilt empty, the next allocation returns an address a live UE still holds, and nothing logs the collision.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Uses the shared <code>nextgcore-core::state_store::StateStore</code>: atomic +
+fsynced + <code>0600</code> writes, and a snapshot that cannot be read is <strong>never
+overwritten</strong>. An unreadable snapshot, or one written by a newer build,
+<strong>fails startup</strong> rather than coming up with an empty pool.</p>
+<p><strong>The restored PFCP session map is checked, not trusted.</strong> The snapshot also
+carries the last Recovery Time Stamp each UPF reported. That value is seeded
+back into each <code>PfcpClient</code> before the association loop starts, so the first
+Association Setup after a reload compares the UPF’s reported stamp against it:
+a changed stamp means the UPF restarted while the SMF was down, and the restored
+sessions are flushed (TS 29.244 §5.22, TS 23.527 §4.2) instead of being believed
+in. An unchanged stamp means they are genuinely still valid.</p>
+<p><strong>Limits worth knowing:</strong></p>
+<ul>
+<li>The flush is process-wide, not per-peer — <code>clear_pfcp_sessions</code> empties the
+whole map, so with several UPFs configured one peer’s restart discards the
+session bookkeeping for all of them. The map has no peer column to do better.</li>
+<li>Not enabled in the shipped Docker compose (unlike <code>udrd</code>), so the default E2E
+path is unchanged.</li>
+</ul>
+<h2 id="restoration-signalling-193"><a class="header" href="#restoration-signalling-193">Restoration signalling (#193)</a></h2>
+<p>The interlock above decides what the SMF <em>believes</em>. This decides what it
+<strong>tells the AMF</strong>, which before #193 was nothing: the SMF flushed N sessions,
+logged a count, and left every AMF holding an <code>smContextStatusUri</code> for a PDU
+session that could no longer carry a packet. The AMF found out on its next
+request, as a 404 with no context, or never.</p>
+<p><strong>Signal emitted:</strong> <code>SmContextStatusNotification</code> (TS 29.502 §6.1.6.2.8) POSTed
+to the <code>smContextStatusUri</code> the AMF supplied at SM Context Create, with
+<code>statusInfo.resourceStatus = RELEASED</code> and a <code>cause</code> naming why.</p>
+<p><strong>Two triggers, both evidence rather than assumption:</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Trigger</th><th>Scope</th><th>Cause carried</th></tr>
+</thead>
+<tbody>
+<tr><td>The UPF’s Recovery Time Stamp changed, or the association was released</td><td>every session on that UPF (TS 23.527 §4.2)</td><td>the teardown reason, e.g. <code>peer restarted</code></td></tr>
+<tr><td>The UPF answered a request for one session with cause 65, <em>Session context not found</em> (TS 29.244 §7.5.3.1)</td><td>that one session only</td><td><code>session context not found at the UPF</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>The second is the SMF/UPF <strong>reconciliation</strong> path, and it is the case the
+Recovery Time Stamp interlock cannot see: no restart happened, so the stamp
+matches and the restored session is kept — yet the UPF may still have no context
+for it (reconfigured, deleted out of band, or a snapshot predating a UPF-side
+deletion). The UPF’s own cause code is the only evidence, and the SMF now drops
+the session and notifies rather than logging the cause and repeating the round
+trip on every later request. Only cause 65 does this: the other rejection causes
+are about the <em>request</em>, and dropping a session on those would destroy a live
+one over a malformed message.</p>
+<p><strong>Nothing is emitted at boot.</strong> A boot-time burst would have to guess: at boot
+the SMF has restored a session map and cannot yet know whether the UPF agrees.
+The first Association Setup is when the truth arrives, which is why that is where
+the signal is emitted (TS 29.500 §6.5 permits either reading; this is the lazy
+one in substance — self-throttling, and no burst against a consumer that may
+itself be restarting).</p>
+<p><strong>Limits worth knowing:</strong></p>
+<ul>
+<li><strong>Not gated on <code>--state-file</code>.</strong> A memory-only SMF strands the AMF’s view just
+as thoroughly when a live UPF restarts, so gating the signal on persistence
+would leave the shipped default carrying the defect. What the default <em>does</em>
+keep is silence at boot: with no snapshot there are no restored sessions and
+nothing is emitted.</li>
+<li><strong>A session whose AMF supplied no <code>smContextStatusUri</code> cannot be told
+anything.</strong> The count in the log reports those separately rather than implying
+every consumer was notified.</li>
+<li><strong>No throttling.</strong> One POST per session, sequentially. A UPF restart with a
+large session count produces a proportional burst at the AMF.</li>
+<li><strong>Only the SMF→AMF direction.</strong> The PCF holds an SM policy association for the
+same sessions and is not notified here; that is <code>Npcf_SMPolicyControl_Delete</code>
+on the release path, which this does not drive.</li>
+</ul>
 <h2 id="parsed-but-inert-yaml-sections"><a class="header" href="#parsed-but-inert-yaml-sections">Parsed-but-inert YAML sections</a></h2>
-<p>The example file follows an Open5GS-style layout, but the typed deserializer ignores everything outside <code>smf.sbi</code> (unknown keys are silently dropped). The following sections in the shipped example currently have <strong>no effect</strong> on <code>nextgcore-smfd</code>:</p>
+<p>The example file follows an Open5GS-style layout, but the typed deserializer reads only <code>smf.sbi</code>, <code>smf.gtpc</code>, <code>smf.dns</code> and <code>smf.mtu</code> (unknown keys are silently dropped). The following sections in the shipped example currently have <strong>no effect</strong> on <code>nextgcore-smfd</code>:</p>
 <ul>
 <li><code>logger</code> — logging is controlled by <code>env_logger</code> (<code>RUST_LOG</code>, default <code>info</code>), not this section.</li>
 <li><code>global.max.ue</code> / <code>global.max.peer</code> — not read; context limits use the hard-coded defaults above.</li>
 <li><code>smf.pfcp</code> — PFCP addressing comes from the <code>SMF_PFCP_*</code> / <code>UPF_PFCP_*</code> environment variables.</li>
-<li><code>smf.gtpc</code>, <code>smf.gtpu</code>, <code>smf.metrics</code> — not deserialized by the config structs.</li>
-<li><code>smf.session</code> (UE IP subnets/gateways), <code>smf.dns</code>, <code>smf.mtu</code> — not deserialized by the config structs.</li>
-<li><code>smf.tls</code> — not read by the SMF loader; the file comment ties TLS to <code>TLS_ENABLED</code>/<code>SBI_SCHEME</code> deployment variables.</li>
+<li><code>smf.gtpu</code>, <code>smf.metrics</code> — not deserialized (the metrics port is <code>SMF_METRICS_PORT</code>).</li>
+<li><code>smf.session</code> (UE IP subnets/gateways) — not deserialized.</li>
+<li><code>smf.tls</code> — not read. The file comment says <code>TLS_ENABLED</code>/<code>SBI_SCHEME</code> enable TLS, but no code reads those variables; the SMF’s SBI security follows <code>NEXTGCORE_SBI_PROFILE</code> (see <a href="./overview.html">Configuration Overview</a>).</li>
+</ul>
+<h2 id="subscribed-default-dnn-204"><a class="header" href="#subscribed-default-dnn-204">Subscribed default DNN (#204)</a></h2>
+<p><code>dnn</code> is <strong>optional</strong> in <code>SmContextCreateData</code> (TS 29.502 §6.1.6.2.2). When the UE omits the DNN IE the AMF omits the member — it used to substitute the literal <code>"internet"</code>, so any deployment whose subscribers do not all default to a DNN of that name attached DNN-less sessions to the <strong>wrong data network</strong>, silently, because the session established fine against it. The SMF now selects the subscribed default itself, which is correct per TS 23.501 §6.2.2: the SMF is the NF that retrieves SM subscription data.</p>
+<p>Resolution, in order:</p>
+<ol>
+<li><code>Nudm_SDM_Get</code> on <strong><code>smf-select-data</code></strong> (<code>SmfSelectionSubscriptionData</code>), because the default-DNN flag is <code>DnnInfo.defaultDnnIndicator</code> and lives there. <code>sm-data</code>’s <code>dnnConfigurations</code> has <strong>no</strong> default flag (TS 29.503 Table 5.5.2.4-1), so it cannot answer this question.</li>
+<li>The <code>dnnInfos</code> entry flagged <code>defaultDnnIndicator: true</code> wins.</li>
+<li>If exactly <strong>one</strong> DNN is subscribed for the S-NSSAI and none is flagged, that one is used — unambiguous.</li>
+<li>Otherwise the session is <strong>refused</strong> with <code>400 MANDATORY_IE_MISSING</code>, listing the candidate DNNs. Choosing among several unflagged DNNs would invent an answer the subscription does not give.</li>
+</ol>
+<p>Failure causes are distinct so an operator can tell a provisioning gap from an unreachable UDM: <code>MANDATORY_IE_MISSING</code> for “the subscription supplies no usable default”, <code>SUBSCRIPTION_DATA_NOT_AVAILABLE</code> for “no UDM endpoint” or “the Nudm_SDM_Get failed”.</p>
+<p><strong>Limit worth knowing:</strong> nothing in this tree emits <code>defaultDnnIndicator</code> — the subscription DB has no such field and <code>udrd</code>’s <code>build_smf_selection_data</code> writes only the DNN name. So against this tree’s own UDM/UDR, rule 3 is what makes it work, and a subscriber with <strong>two or more DNNs on one S-NSSAI cannot establish a DNN-less PDU session</strong> (it is refused, with the candidates named). Tracked as issue #264 (<code>decision</code>).</p>
+<p>No <code>single-nssai</code> query parameter is sent, even though TS 29.503 §5.2.2.2.1 allows scoping: the value is JSON and must be percent-encoded, but the shared SBI server stores query values verbatim without decoding them (issue #65), so a scoped query cannot round-trip to the in-tree UDM. The S-NSSAI’s entry is selected locally by key instead.</p>
+<h2 id="sm-context-lifecycle-78"><a class="header" href="#sm-context-lifecycle-78">SM context lifecycle (#78)</a></h2>
+<p><code>POST /sm-contexts</code> now <strong>registers</strong> the session in the SMF context list and takes
+the <code>smContextRef</code> from the session itself. Before #78 it minted a reference from a
+counter and registered nothing, so every <code>Retrieve</code> answered
+<code>404 CONTEXT_NOT_FOUND</code> for a session that had just been created successfully. The
+reference is read back out of the session rather than computed alongside it because
+<code>sess_add_by_psi</code> mints it from the <em>same</em> counter — computing both would consume the
+counter twice and leave the handler’s reference one behind the session’s.</p>
+<p>A create that fails after registration <strong>rolls the registration back</strong>. An abandoned
+registration would be an SM context the AMF never learned about and will never
+release.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Operation</th><th>Before #78</th><th>Now</th></tr>
+</thead>
+<tbody>
+<tr><td>Retrieve, known ref</td><td><code>404 CONTEXT_NOT_FOUND</code> (nothing was registered)</td><td><code>200</code> with <code>SmContextRetrievedData</code> including the required <code>ueEpsPdnConnection</code></td></tr>
+<tr><td>Retrieve, unknown ref</td><td><code>404</code>, body <code>{"status","cause"}</code> at <code>application/json</code></td><td><code>404</code> ProblemDetails at <code>application/problem+json</code></td></tr>
+<tr><td>Update, unknown ref</td><td><code>200</code></td><td><code>404</code> + ProblemDetails (TS 29.502 §5.2.2.3.2)</td></tr>
+<tr><td>Release, unknown ref</td><td><code>204</code></td><td><code>404</code> + ProblemDetails (TS 29.502 §5.2.2.4)</td></tr>
+<tr><td>Release body</td><td>not parsed at all — the handler took no body argument</td><td><code>SmContextReleaseData</code> (<code>cause</code>, <code>n2SmInfo</code>, <code>vsmfReleaseOnly</code>)</td></tr>
+<tr><td><code>HANDOVER_REQUIRED</code> / <code>_REQ_ACK</code> / <code>_COMPLETE</code> / <code>_CANCEL</code></td><td><code>400 N2_SM_ERROR</code> via the catch-all</td><td>processed, <code>hoState</code> driven per TS 29.502 §5.2.2.3.4</td></tr>
+<tr><td>PFCP Downlink Data Report</td><td>logged only</td><td>drives <code>Namf_Communication_N1N2MessageTransfer</code> toward the serving AMF</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>The handover states deliberately do not touch the user plane until completion.</strong>
+<code>PREPARING</code> and <code>PREPARED</code> leave the DL tunnel on the source gNB, because until the
+UE has actually moved the source is still serving it and re-pointing the UPF would
+black-hole downlink traffic for the whole handover-execution window.
+<code>HANDOVER_COMPLETE</code> switches it, through the same <code>pfcp_session_modify</code> call a path
+switch uses, and <strong>says so in the log when the request carried no decodable target
+F-TEID</strong> — a bare 200 would leave an operator unable to tell a switched tunnel from
+an unswitched one. <code>HANDOVER_CANCEL</code> has nothing to undo, which is exactly why the
+earlier states do nothing.</p>
+<p><strong>Paging carries the N2 form, not the N1 form.</strong> TS 23.502 §4.2.3.3 has the SMF send
+N2 SM information so the AMF can re-establish the user plane; there is no NAS message
+to deliver to a sleeping UE. So the DLDR path posts an <code>n2InfoContainer</code> (with the
+QFI the UPF reported, so the gNB knows which flow to restore) rather than reusing the
+<code>n1MessageContainer</code> sender the 5GSM timer path uses. A DLDR for a session whose user
+plane is <strong>not</strong> <code>DEACTIVATED</code> does not page: TS 29.244 §7.5.8.2 scopes the report to
+a deactivated connection, and paging a connected UE is a spurious service request.</p>
+<p><strong>Limits worth knowing:</strong></p>
+<ul>
+<li><code>ueEpsPdnConnection</code> is the minimal PDN-connection descriptor derivable from the
+5GS session (APN, PDN type, UE address, default-bearer QCI). It is <strong>not</strong> a mapped
+EPS bearer-context list, because this tree has no EBI assignment and no Mapped EPS
+bearer context IE at all — that is #117. A fabricated bearer list would be worse
+than a minimal descriptor: the AMF would forward it to an MME that would then try
+to use bearers this SMF never established.</li>
+<li><code>vsmfReleaseOnly</code> is parsed and <strong>logged, not honoured</strong>: this SMF has no
+V-SMF/H-SMF split on the <code>sm-contexts</code> path, so acting on the flag would mean
+pretending to a split that does not exist.</li>
+<li>The create handler’s <em>success</em> path is unreachable in this tree’s test harness (it
+needs a PFCP-responding UPF, and no test establishes an N4 session), so what tests
+cover is the registration function’s invariant plus the rollback contract.</li>
 </ul>
 <h2 id="honesty-notes"><a class="header" href="#honesty-notes">Honesty notes</a></h2>
 <ul>
@@ -345,7 +532,7 @@ smf:
 
         <script src="../clipboard-1626706a.min.js"></script>
         <script src="../highlight-abc7f01d.js"></script>
-        <script src="../book-c22b7243.js"></script>
+        <script src="../book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

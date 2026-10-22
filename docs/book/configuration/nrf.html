@@ -15,8 +15,8 @@
         <link rel="icon" href="../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../css/general-0392ca55.css">
-        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
         <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-10d7638c.js";
+            window.path_to_searchindex_js = "../searchindex-c2411517.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-1b88980e.js"></script>
+        <script src="../toc-be5dca41.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -225,24 +225,34 @@ nrf:
 <tr><td><code>nrf.discovery.max_page_size</code></td><td>usize</td><td><code>1000</code></td><td>Cap on consumer-requested discovery page size.</td></tr>
 <tr><td><code>nrf.sbi.oauth2.require</code></td><td>bool</td><td><code>false</code></td><td>Client-side: the NRF attaches NRF-issued Bearer tokens to its own outbound calls (status notifications).</td></tr>
 <tr><td><code>nrf.sbi.oauth2.require_server</code></td><td>bool</td><td><code>false</code></td><td>Server-side OAuth2 enforcement on the NRF’s own <code>nnrf-nfm</code>/<code>nnrf-disc</code> producer endpoints. The <code>/nnrf-oauth2/v1/access-token</code> and <code>/jwks</code> endpoints always stay exempt (the NRF is the Authorization Server).</td></tr>
-<tr><td><code>nrf.sbi.oauth2.require_client_auth</code></td><td>bool</td><td><code>false</code></td><td>Token endpoint requires client authentication: a Client-Credentials-Assertion (CCA) bound to the body <code>nfInstanceId</code>, or an mTLS client identity.</td></tr>
-<tr><td><code>nrf.sbi.oauth2.require_client_cert_binding</code></td><td>bool</td><td><code>false</code></td><td>Mandates a transport-authenticated (mTLS) client identity — conveyed via <code>x-forwarded-client-cert</code> — whose URI SAN matches the request <code>nfInstanceId</code> (code cites TS 33.501 §13.3.1/§13.4.1, TS 33.310). Mismatch checks always run when an identity is present, even with this off.</td></tr>
-<tr><td><code>nrf.sbi.oauth2.cca_verify_signature</code></td><td>bool</td><td><code>false</code></td><td>Cryptographically verify the CCA’s ES256 JWS signature against <code>cca_trusted_keys</code> (code cites TS 33.501 §13.3.8.3). Fail-closed for issuers with no trusted key.</td></tr>
-<tr><td><code>nrf.sbi.oauth2.cca_trusted_keys</code></td><td>list</td><td>empty</td><td>Entries of <code>nfInstanceId</code> + RFC 7517 EC/P-256 <code>jwk</code>. Malformed keys are logged and dropped (the issuer then fails closed when verification is on).</td></tr>
+<tr><td><code>nrf.sbi.oauth2.require_client_auth</code></td><td>bool</td><td><strong><code>true</code></strong></td><td>Token endpoint requires client authentication: a <strong>signature-verified</strong> Client-Credentials-Assertion (CCA) bound to the body <code>nfInstanceId</code>, or an mTLS client identity. Setting this to <code>false</code> is the documented escape hatch — it makes the endpoint mint a token for any registered <code>nfInstanceId</code> a caller names, and is announced with a startup <code>warn!</code>.</td></tr>
+<tr><td><code>nrf.sbi.oauth2.require_client_cert_binding</code></td><td>bool</td><td><code>false</code></td><td>Mandates a transport-authenticated (mTLS) client identity whose certificate URI SAN matches the request <code>nfInstanceId</code> (code cites TS 33.501 §13.3.1/§13.4.1, TS 33.310). Mismatch checks always run when an identity is present, even with this off. A CCA does <strong>not</strong> satisfy it.</td></tr>
+<tr><td><code>nrf.sbi.oauth2.trust_forwarded_client_cert</code></td><td>bool</td><td><code>false</code></td><td>Whether an <code>x-forwarded-client-cert</code> header is trusted as proof of mTLS identity. With this off the header confers no identity at all. Turn it on <strong>only</strong> when every path to the NRF passes through a TLS terminator that sets the header and strips any client-supplied copy — it is an ordinary request header, so without such a terminator any client could assert any identity by setting it.</td></tr>
+<tr><td><code>nrf.sbi.oauth2.cca_verify_signature</code></td><td>bool</td><td><strong><code>true</code></strong></td><td>Cryptographically verify the CCA’s ES256 JWS signature against <code>cca_trusted_keys</code> (code cites TS 33.501 §13.3.8.3). Fail-closed for issuers with no trusted key. With this off a CCA is still claim-checked but authenticates nothing, so it cannot satisfy <code>require_client_auth</code>.</td></tr>
+<tr><td><code>nrf.sbi.oauth2.cca_trusted_keys</code></td><td>list</td><td>empty</td><td>Entries of <code>nfInstanceId</code> + RFC 7517 EC/P-256 <code>jwk</code>. Malformed keys are logged and dropped (the issuer then fails closed when verification is on). <strong>With the default policy and an empty store, no CCA can verify</strong> — provision the consumers’ public keys here, or use <code>trust_forwarded_client_cert</code> behind a terminator.</td></tr>
+<tr><td><code>nrf.sbi.oauth2.cca_trusted_keys_dir</code></td><td>path</td><td>none</td><td>Directory of <code>&lt;nfInstanceId&gt;.jwk</code> public keys, loaded at startup in addition to <code>cca_trusted_keys</code> (#187). Each consumer NF publishes its own key there when <code>NEXTGCORE_SBI_CCA_PUBLIC_JWK_DIR</code> names the directory (its private key lives in <code>NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE</code>, generated on first use). An absent or unreadable directory is not fatal; a CCA from an NF with no key is rejected. Pin each NF’s identity with <code>NEXTGCORE_NF_INSTANCE_ID</code> or <code>NEXTGCORE_&lt;TYPE&gt;_INSTANCE_ID</code> so the key name is stable across restarts.</td></tr>
+<tr><td><code>nrf.sbi.oauth2.cca_trust_anchors</code></td><td>path</td><td>none</td><td>PEM file of CA certificates a CCA’s <code>x5c</code> chain is validated against (TS 33.501 §13.3.8.2/§13.3.8.3, #393). Set: an <code>x5c</code> certificate is authoritative, must bind the NF Instance ID, and the key store is not consulted. Unset: a CCA carrying <code>x5c</code> is <code>invalid_client</code>; a CCA without <code>x5c</code> uses the trust store above. Consumers emit <code>x5c</code> when <code>NEXTGCORE_SBI_CCA_CERT_FILE</code> is set.</td></tr>
 </tbody>
 </table>
 </div>
 <h2 id="parsed-but-inert--non-yaml-settings"><a class="header" href="#parsed-but-inert--non-yaml-settings">Parsed-but-inert / non-YAML settings</a></h2>
 <ul>
 <li><code>logger</code>, <code>global.max.{ue,peer}</code>, <code>nrf.serving[].plmn_id</code>, and <code>nrf.sbi.server[]</code> (address, advertise, port, tls block) are present in the example YAML but ignored by nrfd’s config structs. Equivalent runtime behavior comes from CLI flags: <code>--sbi-addr</code> (default <code>0.0.0.0</code>), <code>--sbi-port</code> (default <code>7777</code>), <code>--max-ue</code> (default <code>1024</code>), <code>--log-level</code> (default <code>info</code>), <code>--log-file</code>, and the TLS/mTLS flags.</li>
+<li><code>--signing-key-file &lt;path&gt;</code> holds the ES256 access-token signing key: generated on first start if absent, then reused. Mount the same file into every NRF replica, or restarts and scale-out invalidate outstanding tokens (#64). <code>--token-expires-in</code> sets the access-token lifetime in seconds (default <code>3600</code>).</li>
+<li><code>-k/--kill</code> is not supported and exits with an error; stop the NRF through its supervisor. <code>-m/--no-color</code> disables colored logs.</li>
 <li><code>--nf-instance-id</code> sets the NRF’s NF Instance ID (OAuth2 <code>iss</code> per TS 29.510 §6.3.5.2.4, per code comments); auto-generated UUID otherwise.</li>
 <li><code>--state-file</code> (or <code>NEXTGCORE_NRF_STATE_FILE</code>) enables JSON-snapshot persistence of the NF registry; without it the registry is in-memory and lost on restart.</li>
-<li>Env overrides <code>NRF_SBI_OAUTH2_REQUIRE_CLIENT_AUTH</code> and <code>NRF_SBI_OAUTH2_REQUIRE_CLIENT_CERT_BINDING</code> (<code>1</code>/<code>true</code>) force those knobs <strong>on</strong> only; they never turn a YAML-enabled knob off.</li>
+<li>Env overrides <code>NRF_SBI_OAUTH2_REQUIRE_CLIENT_AUTH</code>, <code>NRF_SBI_OAUTH2_REQUIRE_CLIENT_CERT_BINDING</code> and <code>NRF_SBI_OAUTH2_TRUST_FORWARDED_CLIENT_CERT</code> (<code>1</code>/<code>true</code>) force those knobs <strong>on</strong> only; they never turn a YAML-enabled knob off.</li>
+<li><code>NRF_SBI_OAUTH2_ALLOW_UNAUTHENTICATED</code> (<code>1</code>/<code>true</code>) is the one <strong>loosening</strong> override: it turns client authentication off for non-TLS dev and the matched simulator. It is applied last, so it wins over <code>NRF_SBI_OAUTH2_REQUIRE_CLIENT_AUTH</code>.</li>
+<li>Consumer side: an NF signs its CCA with the ES256 key at <code>NEXTGCORE_SBI_CCA_SIGNING_KEY_FILE</code> (resolved process-wide in <code>nextgcore-sbi</code>, generated <code>0600</code> on first use if absent, and an error — never a silent replacement — if malformed). Its public half must be registered here under <code>cca_trusted_keys</code>, keyed by that NF’s <code>nfInstanceId</code>.</li>
+<li><strong>The NRF is not exempt from its own policy.</strong> With <code>nrf.sbi.oauth2.require = true</code> the NRF requests tokens from itself for its outbound status notifications, and that request is authenticated like any other: give the NRF a CCA signing key and register its own public key under <code>cca_trusted_keys</code>. It deliberately does <strong>not</strong> self-exempt by <code>nfInstanceId</code> — a token request arriving over the network claiming to be the NRF is indistinguishable from a spoofed one, so exempting that identity would reopen the bypass this closes.</li>
 <li><code>OTEL_EXPORTER_OTLP_ENDPOINT</code> sets the OpenTelemetry export target (default <code>http://jaeger:4317</code>).</li>
 </ul>
 <h2 id="honesty-notes"><a class="header" href="#honesty-notes">Honesty notes</a></h2>
 <ul>
-<li>All security knobs default <strong>off</strong> so the matched in-house simulator keeps working; enabling them is a deliberate operator step.</li>
+<li>Token-endpoint client authentication (<code>require_client_auth</code>) and CCA signature verification (<code>cca_verify_signature</code>) default <strong>on</strong> (issue #64 gaps 1+2, TS 33.501 §13.3.1/§13.4.1.1). They are one decision: an enforced requirement that accepts an unverified assertion is no requirement at all. The matched simulator and non-TLS dev reach the previous behaviour through the explicit, <code>warn!</code>-announced escape hatch, not through a silent default.</li>
+<li>The remaining knobs (<code>require_server</code>, <code>require_client_cert_binding</code>, <code>trust_forwarded_client_cert</code>) default <strong>off</strong>: the first would gate the NRF’s own producer endpoints, and the other two describe a deployment posture (mTLS-only, or a trusted TLS terminator) that the NRF cannot verify for itself.</li>
+<li><strong>Direct mTLS now yields an identity</strong> (issue #186): the rustls-verified peer certificate’s URI SubjectAltName (TS 33.310, conventionally <code>urn:uuid:&lt;nfInstanceId&gt;</code>) is surfaced onto <code>SbiRequest</code> and <strong>preferred over</strong> <code>x-forwarded-client-cert</code>. It needs no trust declaration — this process verified the chain itself, so there is no terminator to trust. <code>require_client_cert_binding</code> is therefore satisfiable on a direct connection, which it previously was not. Caveat: only rcgen-generated certificates have been tested; a vendor certificate that encodes the NF Instance ID somewhere other than a URI SAN will not be recognised.</li>
 <li>Behavior is validated against the project’s matched simulator and unit/E2E tests, not third-party certified. Statements above describe what the code does; TS references are those cited in code comments, not conformance claims.</li>
 </ul>
 
@@ -294,7 +304,7 @@ nrf:
 
         <script src="../clipboard-1626706a.min.js"></script>
         <script src="../highlight-abc7f01d.js"></script>
-        <script src="../book-c22b7243.js"></script>
+        <script src="../book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 

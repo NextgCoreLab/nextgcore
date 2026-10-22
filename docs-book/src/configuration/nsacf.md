@@ -4,7 +4,7 @@ The NSACF (Network Slice Admission Control Function, `nextgcore-nsacfd`) enforce
 
 Configuration is split between a YAML file (default path `/etc/nextgcore/nsacf.yaml`, overridable with `-c/--config`) and command-line flags. The YAML file is the source for slice quotas, the NRF URI, and OAuth2 enforcement; most runtime knobs (bind address/port, TLS, thresholds) are CLI flags only.
 
-> **Honesty note:** NSACF behavior is validated by this project's own unit and matched-simulator E2E tests (84/84 docker E2E as of 2026-07-02), not by third-party conformance certification. The vendored OpenAPI sets do not include `TS29536_Nnsacf_*.yaml`; field names mirror TS 29.536 terminology as documented in code comments.
+> **Honesty note:** NSACF behavior is validated by this project's own unit and matched-simulator E2E tests, not by third-party conformance certification. The vendored OpenAPI sets do not include `TS29536_Nnsacf_*.yaml`; field names mirror TS 29.536 terminology as documented in code comments.
 
 ## Example configuration
 

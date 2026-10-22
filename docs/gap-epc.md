@@ -2,7 +2,15 @@
 
 > Generated: 2026-02-07 | Scope: 5 EPC NFs ported from Open5GS C to Rust
 
-> **Note (2026-07):** EPC (4G/LTE) is RETAINED - nextgcore is a dual 5G/LTE core, not 5G-SA-only. This 2026-02-07 snapshot remains broadly accurate for the EPC NFs (scaffolding-to-partial); the 5GC Wave-6 PRs did not change EPC functional completeness, though NF-context lock-ordering (AB-BA deadlock) fixes were applied across hssd/pcrfd. The per-NF percentages below are a historical baseline.
+> **STALENESS NOTICE (updated 2026-10, pre-0.2.0):** EPC (4G/LTE) is RETAINED - nextgcore is a dual 5G/LTE core, not 5G-SA-only. The body below is the 2026-02-07 snapshot, kept as a historical baseline: its completeness percentages, file and line counts and "stub" / "missing" verdicts are measurements from that date, not current state. The EPC changed most of all since 0.1.0: the nightly CI (`docker-e2e-epc`) now attaches a real LTE UE through nextgsim's eNB and pings 20/20 through the default bearer (#509), so "scaffolding only" no longer describes any of these NFs.
+>
+> Since 0.1.0, among others:
+> - **MME:** a real S11 GTP-C endpoint (#316); the attach reaches S11 and the Attach Accept (#330, #486, #499); all of S1AP on the codec generated from the TS 36.413 ASN.1, with the hand-written codec deleted (#523-#555, e.g. #538 paging, #547 path switch, #551 handover preparation, #552); EPS→5GS handover as source, E-RAB indications, location reporting (#598); kernel-SCTP S1-MME.
+> - **HSS:** opens the subscriber store at startup and answers AIR from it (#484); the HSS-initiated half of S6a (#282).
+> - **PCRF:** reacts to event triggers and rule failures, survives a restart, and releases a restarted PCEF's sessions (#281, #372).
+> - **SGW-C / SGW-U:** GTP-C path management and restart restoration (#214); S5/S8 on both legs (#318); a real Sxa PFCP transport (#302); URR measurement and usage reports (#266, #269, #427); DDN end to end (#312).
+> - **PGW-C / PGW-U:** `smfd`/`upfd` in their EPC roles, deployed in `docker-compose-epc.yml` (#385).
+> - **Diameter:** Origin-State-Id restart detection (#286, #366) and failover to an alternate peer (#332).
 
 ## Executive Summary
 

@@ -15,8 +15,8 @@
         <link rel="icon" href="../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../css/general-0392ca55.css">
-        <link rel="stylesheet" href="../css/chrome-fc474251.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
         <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-10d7638c.js";
+            window.path_to_searchindex_js = "../searchindex-c2411517.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-1b88980e.js"></script>
+        <script src="../toc-be5dca41.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -194,8 +194,8 @@ this path end-to-end is a <strong>separate repository</strong> — here it appea
 peer on the far side of the N2 (NGAP) association.</p>
 <blockquote>
 <p><strong>Honesty note:</strong> This registration flow is validated by NextGCore’s own unit
-tests and matched-simulator docker E2E (84/84 green as of 2026-07-02), <strong>not</strong>
-by third-party conformance certification. The implementation drives <strong>5G-AKA
+tests and matched-simulator docker E2E (nightly in <code>.github/workflows/ci.yml</code>),
+<strong>not</strong> by third-party conformance certification. The implementation drives <strong>5G-AKA
 only</strong> on the live path (the AMF’s EAP-AKA′ Authentication-Request builder is
 compiled but unreferenced — see <em>Simplifications and known gaps</em>), takes a
 number of documented wire-format and control-plane shortcuts, and matches a
@@ -221,8 +221,11 @@ phrased “per code comments”.</p>
 </table>
 </div>
 <p>Supporting libraries: <code>nextgcore-nas</code> (5GMM message codec, SUCI, NAS security),
-<code>nextgcore-ngap</code> + <code>nextgcore-asn1c</code> (NGAP/APER), and <code>nextgcore-sctp</code> (the N2
-transport). The NSSF (<code>nextgcore-nssfd</code>) is listed here only to say what does
+<code>nextgcore-ngap-gen</code> (the NGAP APER codec generated from the TS 38.413 ASN.1;
+the AMF’s wrappers around it live in <code>src/bins/nextgcore-amfd/src/ngap_asn1.rs</code>),
+<code>nextgcore-ngap</code> (the typed message structs those wrappers fill in; its
+hand-written APER builders and <code>nextgcore-asn1c</code> survive only as test oracles,
+deletion tracked in #417), and <code>nextgcore-sctp</code> (the N2 transport). The NSSF (<code>nextgcore-nssfd</code>) is listed here only to say what does
 <strong>not</strong> happen: it is <strong>not</strong> consulted during registration (see step 12).</p>
 <h2 id="the-n2-transport-underneath"><a class="header" href="#the-n2-transport-underneath">The N2 transport underneath</a></h2>
 <p>The AMF terminates NGAP over SCTP through the <code>NgapTransport</code> enum and
@@ -242,18 +245,22 @@ identically over either transport once bytes arrive at <code>handle_ngap_message
 <ol>
 <li>
 <p><strong>gNB → AMF: <code>InitialUEMessage</code>.</strong> The dispatcher in <code>ngap_path.rs</code>
-(procedure code 15) routes to <code>handle_initial_ue_message</code>, which parses the
-PDU with <code>crate::ngap_asn1::parse_initial_ue_message_asn1</code> into an
-<code>InitialUeMessageData</code> (RAN-UE-NGAP-ID, NAS-PDU, PLMN, TAC, NR-CGI). It
+(procedure code 15) routes to <code>handle_initial_ue_message</code>, which decodes the
+PDU with the generated codec (<code>crate::ngap_asn1::decode_initial_ue_message_asn1</code>)
+into an <code>InitialUeMessageData</code> (RAN-UE-NGAP-ID, NAS-PDU, PLMN, TAC, NR-CGI). It
 allocates an AMF-UE-NGAP-ID, creates a <code>UeNasContext</code> (seeded with
 <code>crate::context::nas_security_canary()</code>), records the TAI and 3GPP access
 type, and switches on the inner NAS message type. A <code>REGISTRATION_REQUEST</code>
 (<code>0x7E … 0x41</code>) is dispatched to <code>handle_registration_request_nas</code> with
 <code>integrity_protected = false</code> — this is an unprotected initial NAS message.
 Logs <code>Initial UE Message from association …</code>.</p>
-<p>A <code>SERVICE_REQUEST</code> arriving in an <code>InitialUEMessage</code> with no stored context
-is rejected with 5GMM cause #9 (<code>build_service_reject</code>) — the code comment
-cites TS 24.501 §5.6.1.5.</p>
+<p>Two integrity-protected initial NAS messages are recognised before that
+dispatch: a <strong>Service Request</strong> from CM-IDLE (<code>initial_service_request_plain</code>
+→ <code>handle_idle_service_request</code>, which also answers a page, #512/#648) and a
+<strong>Registration Request from CM-IDLE</strong> over an existing NAS security context
+(<code>open_idle_registration_request</code>, #609). A plain <code>SERVICE_REQUEST</code> that
+reaches the dispatch with no stored context is rejected with 5GMM cause #9
+(<code>build_service_reject</code>) — the code comment cites TS 24.501 §5.6.1.5.</p>
 </li>
 <li>
 <p><strong>Registration Request parsing + cleartext gate.</strong>
@@ -475,7 +482,8 @@ already has AS security is delivered over <code>DownlinkNASTransport</code>; an
 <li>
 <p><strong>AMF → gNB: <code>InitialContextSetupRequest</code> (Registration Accept piggybacked).</strong>
 The AMF derives <code>KgNB = nextgcore_kdf_kgnb_and_kn3iwf(Kamf, ul_count, access_type_distinguisher)</code> (per code comment TS 33.501 Annex A.9) and calls
-<code>ngap_asn1::build_initial_context_setup_request_asn1</code> to carry the GUAMI, the
+<code>ngap_asn1::build_initial_context_setup_request_asn1</code> (generated codec, #417
+stage 7) to carry the GUAMI, the
 <strong>replayed</strong> UE security capabilities, the UE Security Key (KgNB), the Allowed
 NSSAI, the UE-AMBR, and — as the NAS-PDU — the protected Registration Accept.
 It sends this to the gNB and arms T3550 against the whole ICS PDU (so a
@@ -551,9 +559,10 @@ removed the old Identity assertions for this reason.</li>
 new NAS-security path without a code change.</li>
 <li><strong>Fire-and-forget policy legs behind kill-switches.</strong> Both the UE-policy
 association (<code>AMF_UE_POLICY_ASSOC</code>) and its delivery (<code>PCF_UE_POLICY_DELIVERY</code>)
-can be disabled, restoring the pre-Wave-6 byte flow. Some inbound AMF SBI
-callbacks (am-policy-notify, sdm-subscription-notify) are noted in
-<code>sbi_path.rs</code> as “still-unserved”.</li>
+can be disabled, restoring the pre-Wave-6 byte flow. The AMF serves the
+<code>dereg-notify</code>, <code>ue-policy-notify</code>, <code>sm-context-status</code> and <code>ucmf-notify</code>
+callbacks (<code>namf_server.rs</code>), but not the <code>am-policy-notify</code> URI it hands the
+PCF in <code>Npcf_AMPolicyControl_Create</code>.</li>
 <li><strong>Config loading is lenient.</strong> An unreadable/unparsable <code>amf.yaml</code> logs a
 warning and continues with built-in defaults (<code>load_config</code> in
 <code>lib.rs</code>) — a running AMF is not proof your config was applied. See the
@@ -598,9 +607,11 @@ Registration Accept piggybacked
 </code></pre>
 <p>and on the simulator side <code>Sending Registration Request</code> … <code>Registration Accept: UE is now …</code> … <code>Sending Registration Complete</code>. The suite then verifies
 the data plane by pinging <strong>through the UE’s GTP-U tunnel</strong> and finishes at
-<code>UE PDU session 1 ACTIVE with IPv4 address</code>. The full baseline was <strong>84/84 green
-on 2026-07-02</strong>. This is functional validation against a cooperative peer — it
-is not third-party conformance certification.</p>
+<code>UE PDU session 1 ACTIVE with IPv4 address</code>. The nightly CI additionally drives
+the same UE through CM-IDLE, paging, Service Request, de-registration and
+UDM-triggered re-registration (<code>docker/rust/ue-flow-check.sh</code>). This is
+functional validation against a cooperative peer — it is not third-party
+conformance certification.</p>
 
                     </main>
 
@@ -650,7 +661,7 @@ is not third-party conformance certification.</p>
 
         <script src="../clipboard-1626706a.min.js"></script>
         <script src="../highlight-abc7f01d.js"></script>
-        <script src="../book-c22b7243.js"></script>
+        <script src="../book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 
