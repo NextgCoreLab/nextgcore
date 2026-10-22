@@ -882,6 +882,27 @@ pub fn build_delete_bearer_response_for_ebis(
     Ok(msg)
 }
 
+/// Delete Bearer Response for a request that named a PDN connection by its
+/// Linked EPS Bearer ID (TS 29.274 Table 7.2.10.2-1: the LBI is included "if
+/// the request contained" it, and Bearer Contexts only for EBIs it named) (#688).
+pub fn build_delete_bearer_response_for_lbi(
+    sgw_s11_teid: u32,
+    lbi: u8,
+    cause_value: GtpCause,
+    sequence_number: u32,
+) -> S11BuildResult<Gtp2Message> {
+    let mut msg = new_message(
+        message_type::DELETE_BEARER_RESPONSE,
+        sgw_s11_teid,
+        sequence_number,
+    );
+    msg.add_ie(typed_ie(|buf| {
+        Gtp2CauseIe::new(cause_value as u8).encode(buf, 0)
+    })?);
+    msg.add_ie(nextgcore_gtp::v2::Gtp2EbiIe::new(lbi).to_ie(0));
+    Ok(msg)
+}
+
 /// Build Release Access Bearers Request (TS 29.274 §7.2.21)
 pub fn build_release_access_bearers_request(teid: u32, sequence_number: u32) -> Gtp2Message {
     new_message(

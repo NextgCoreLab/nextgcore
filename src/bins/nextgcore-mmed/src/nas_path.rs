@@ -558,11 +558,16 @@ pub fn nas_eps_send_security_mode_command(mme_ue: &mut MmeUe, enb_ue: &EnbUe) ->
 /// # Arguments
 /// * `mme_ue` - MME UE context
 /// * `enb_ue` - eNB UE context
+/// * `detach_type` - TS 24.301 §9.9.3.7 detach type to the UE
 ///
 /// # Returns
 /// * `Ok(())` - Message sent successfully
 /// * `Err(NasError)` - On error
-pub fn nas_eps_send_detach_request(mme_ue: &mut MmeUe, enb_ue: &EnbUe) -> NasResult<()> {
+pub fn nas_eps_send_detach_request(
+    mme_ue: &mut MmeUe,
+    enb_ue: &EnbUe,
+    detach_type: emm_build::DetachTypeToUe,
+) -> NasResult<()> {
     if mme_ue.id == 0 {
         log::error!("UE(mme-ue) context has already been removed");
         return Err(NasError::UeNotFound);
@@ -579,8 +584,7 @@ pub fn nas_eps_send_detach_request(mme_ue: &mut MmeUe, enb_ue: &EnbUe) -> NasRes
     let emm_message = if let Some(ref pkbuf) = mme_ue.t3422.pkbuf {
         pkbuf.clone()
     } else {
-        let plain_message =
-            emm_build::build_detach_request(mme_ue, emm_build::DetachTypeToUe::ReAttachRequired);
+        let plain_message = emm_build::build_detach_request(mme_ue, detach_type);
 
         // Apply security encoding
         nas_security::nas_eps_security_encode(
