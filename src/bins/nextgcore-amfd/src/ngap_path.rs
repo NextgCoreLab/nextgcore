@@ -2199,6 +2199,25 @@ impl NgapServer {
             );
         });
 
+        // #675: an INITIAL registration on an NG connection that has no NAS context
+        // yet -- the connection began with a Service Request the AMF rejected with #9
+        // (`reject_idle_service_request` creates no context), and the UE, as told,
+        // registers afresh with its SUCI on the same connection. An initial
+        // registration needs no prior context (TS 24.501 §5.5.1.2), so it gets one
+        // here, exactly as the Initial UE Message path creates it. Before #675 it fell
+        // to the "unknown UE" branch and was answered REGISTRATION REJECT #9 on every
+        // T3511 retry: after an AMF restart the UE could never register again.
+        if !self.ue_auth_state.contains(ul_nas.amf_ue_ngap_id) {
+            if let Some(state) = fresh_context_for_initial_registration(association_id, &ul_nas) {
+                log::info!(
+                    "UE {}: initial Registration Request on an NG connection with no NAS \
+                     context; creating one (TS 24.501 §5.5.1.2)",
+                    ul_nas.amf_ue_ngap_id
+                );
+                self.ue_auth_state.insert(ul_nas.amf_ue_ngap_id, state);
+            }
+        }
+
         if ul_nas.nas_pdu.len() < 3 {
             return Ok(());
         }
@@ -14164,6 +14183,36 @@ fn path_switch_failure(
     )
 }
 
+/// The NAS context an Uplink-NAS-borne PLAIN initial REGISTRATION REQUEST gets
+/// when its NG connection has none (#675), or `None` for anything else. Mirrors the
+/// Initial UE Message path: location from the message's mandatory User Location
+/// Information, 3GPP access, a fresh security canary.
+fn fresh_context_for_initial_registration(
+    association_id: u64,
+    ul_nas: &crate::ngap_asn1::UplinkNasTransportData,
+) -> Option<UeNasContext> {
+    let nas = &ul_nas.nas_pdu;
+    let is_plain_initial_registration = nas.len() >= 4
+        && nas[0] == 0x7E
+        && nas[1] == security_header::PLAIN_NAS_MESSAGE
+        && nas[2] == message_type::REGISTRATION_REQUEST
+        && nas[3] & 0x07 == crate::gmm_build::registration_type::INITIAL;
+    if !is_plain_initial_registration {
+        return None;
+    }
+    let mut state = UeNasContext::new(
+        ul_nas.amf_ue_ngap_id,
+        ul_nas.ran_ue_ngap_id,
+        association_id,
+        crate::context::nas_security_canary(),
+    );
+    if let Some(location) = &ul_nas.user_location_info {
+        apply_user_location(&mut state.amf_ue, location);
+    }
+    state.amf_ue.access_type = 1; // 3GPP access
+    Some(state)
+}
+
 fn apply_user_location(
     amf_ue: &mut AmfUe,
     location: &nextgcore_ngap::types::UserLocationInformation,
@@ -20950,6 +20999,74 @@ mod tests {
     /// REVERT-VERIFIED: deleting the `apply_user_location` call from
     /// `handle_uplink_nas_transport` makes this FAIL, reading back the registration's
     /// TAC 0x000401 instead of 0x0A0B0C.
+    /// #675: an initial Registration Request (SUCI) arriving in an Uplink NAS
+    /// Transport on an NG connection with no NAS context gets a fresh context; any
+    /// other message on such a connection does not.
+    #[test]
+    fn an_initial_registration_without_a_context_gets_one() {
+        let ul = |nas: Vec<u8>| crate::ngap_asn1::UplinkNasTransportData {
+            amf_ue_ngap_id: 7_675_001,
+            ran_ue_ngap_id: 75,
+            nas_pdu: nas,
+            user_location_info: Some(test_user_location(0x000675, 0x0006_7500)),
+        };
+        let state = fresh_context_for_initial_registration(3, &ul(sample_registration_request()))
+            .expect("an initial registration gets a context");
+        assert_eq!(state.association_id, 3);
+        assert_eq!(state.ran_ue_ngap_id, 75);
+        assert_eq!(
+            state.amf_ue.nr_tai.tac, 0x000675,
+            "location from the message"
+        );
+        assert_eq!(state.amf_ue.access_type, 1);
+
+        let mut mobility = sample_registration_request();
+        mobility[3] = 0x0A; // FOR + mobility registration updating
+        assert!(fresh_context_for_initial_registration(3, &ul(mobility)).is_none());
+        assert!(fresh_context_for_initial_registration(
+            3,
+            &ul(vec![
+                0x7E,
+                0x00,
+                message_type::CONFIGURATION_UPDATE_COMPLETE
+            ])
+        )
+        .is_none());
+        let mut protected = sample_registration_request();
+        protected[1] = 0x01;
+        assert!(fresh_context_for_initial_registration(3, &ul(protected)).is_none());
+    }
+
+    /// #675 through the handler: the connection's first message was a Service
+    /// Request the AMF rejected (#9), so there is no NAS context; the UE's initial
+    /// Registration Request must be taken up, not rejected #9 again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_initial_registration_after_a_service_reject_is_taken_up() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let amf_ue_ngap_id = 7_675_002u64;
+        assert!(!ngap.ue_auth_state.contains(amf_ue_ngap_id));
+        let ul_pdu = nextgcore_ngap::builder::build_uplink_nas_transport(
+            &nextgcore_ngap::types::UplinkNasTransport {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id: 76,
+                nas_pdu: sample_registration_request(),
+                user_location_info: test_user_location(0x000676, 0x0006_7600),
+            },
+        )
+        .expect("encode an Uplink NAS Transport");
+        let _ = ngap.handle_uplink_nas_transport(1, &ul_pdu).await;
+        // Before #675 the handler found no context, answered REGISTRATION REJECT #9
+        // and left none behind; the procedure now runs on a context of its own.
+        let state = ngap
+            .ue_auth_state
+            .get(amf_ue_ngap_id)
+            .expect("the initial registration created a NAS context");
+        assert_eq!(state.ran_ue_ngap_id, 76);
+        assert_eq!(state.amf_ue.nr_tai.tac, 0x000676);
+        ngap.ue_auth_state.remove(amf_ue_ngap_id);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_uplink_nas_transport_refreshes_the_stored_tai_and_cell() {
         crate::context::amf_context_init(64, 1024, 4096);
