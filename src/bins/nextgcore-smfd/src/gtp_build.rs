@@ -208,21 +208,23 @@ pub mod gtp2_ie_type {
 #[repr(u8)]
 #[derive(Default)]
 pub enum Gtp2Cause {
-    // Request / Initial message
+    // Request / Initial message: TS 29.274 Table 8.4-1. #687: these were one off
+    // from 5 on (ReactivationRequested was 7, which is "IMSI Detach Only"); no
+    // caller used them until the PGW-U restart release did.
     LocalDetach = 2,
     CompleteDetach = 3,
     RatChangedFrom3gppToNon3gpp = 4,
-    IsgInterfaceDown = 5,
-    ConnectionNotNeeded = 6,
-    ReactivationRequested = 7,
-    PdnReconnectionToThisApnDisallowed = 8,
-    AccessChangedFromNon3gppTo3gpp = 9,
-    PgwNotResponding = 10,
-    NetworkFailure = 11,
-    QosParameterMismatch = 12,
-    EpsToS5S8NotAllowed = 13,
-    RequestTimedOut = 14,
-    UnableToPageUe = 15,
+    IsrDeactivation = 5,
+    ErrorIndicationReceived = 6,
+    ImsiDetachOnly = 7,
+    ReactivationRequested = 8,
+    PdnReconnectionToThisApnDisallowed = 9,
+    AccessChangedFromNon3gppTo3gpp = 10,
+    PdnConnectionInactivityTimerExpires = 11,
+    PgwNotResponding = 12,
+    NetworkFailure = 13,
+    QosParameterMismatch = 14,
+    EpsTo5gsMobility = 15,
     #[default]
     RequestAccepted = 16,
     RequestAcceptedPartially = 17,
@@ -1502,8 +1504,8 @@ pub fn build_delete_bearer_request(
         // Default bearer - use Linked EPS Bearer ID
         builder = builder.add_ebi(bearer_ebi, 0);
     } else {
-        // Dedicated bearer - use EPS Bearer IDs
-        builder = builder.add_ebi(bearer_ebi, 0);
+        // Dedicated bearer - use EPS Bearer IDs (instance 1, TS 29.274 Table 7.2.9.2-1)
+        builder = builder.add_ebi(bearer_ebi, 1);
     }
 
     // PTI

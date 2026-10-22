@@ -1040,6 +1040,8 @@ impl PfcpClient {
     /// believing in contexts that could not carry a packet.
     async fn teardown_association(&self, reason: &str) {
         let notified = crate::restoration::notify_sessions_unrecoverable(reason).await;
+        // #687: the EPC PDN connections on this PGW-U, which have no SM context.
+        let epc_released = crate::restoration::release_epc_pdn_connections(reason).await;
         {
             let mut assoc = self.assoc.write().await;
             assoc.associated = false;
@@ -1054,7 +1056,8 @@ impl PfcpClient {
         let cleared = clear_pfcp_sessions();
         log::warn!(
             "PFCP association torn down ({reason}); {cleared} stale sessions flushed, \
-             {notified} AMF status callback(s) notified"
+             {notified} AMF status callback(s) notified, {epc_released} EPC PDN \
+             connection(s) deleted toward the SGW"
         );
     }
 
