@@ -843,8 +843,13 @@ impl SbiClient {
                                 }
                                 Err(_) => {}
                             }
-                            if let Ok(response) = &result {
+                            if let Ok(response) = &mut result {
                                 self.record_overload_and_binding(&alt_key, response);
+                                // #669: say which peer answered, so a consumer that
+                                // must address later requests to the SAME producer
+                                // (an SM context lives in one SMF) can follow the
+                                // resend instead of the dead endpoint it asked for.
+                                response.header.authority = Some(format!("{alt_host}:{alt_port}"));
                             }
                             return result;
                         }
@@ -1748,6 +1753,11 @@ mod tests {
             .await
             .expect("the request must be resent to the restarted peer");
         assert_eq!(resp.status, 201);
+        assert_eq!(
+            resp.header.authority.as_deref(),
+            Some(format!("127.0.0.1:{new_port}").as_str()),
+            "#669: the response names the peer that answered the resend"
+        );
         assert_eq!(
             hits.load(Ordering::SeqCst),
             1,

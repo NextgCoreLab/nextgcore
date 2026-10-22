@@ -964,6 +964,10 @@ pub struct SmContextCreateResponse {
     pub n2_sm_info: Vec<u8>,
     /// SM Context reference
     pub sm_context_ref: String,
+    /// The SMF that created the context, as `host:port` (#669): the one the
+    /// request was sent to, or the one the SBI client resent it to (#664). Every
+    /// later Update/Release for this context must go to it.
+    pub smf_authority: Option<String>,
 }
 
 /// Extract an N1/N2 binary payload referenced from the JSON root of an SMF
@@ -1214,10 +1218,16 @@ pub async fn call_smf_create_sm_context(
         n2_sm_info.len()
     );
 
+    let smf_authority = response
+        .header
+        .authority
+        .clone()
+        .or_else(|| Some(format!("{smf_host}:{smf_port}")));
     Ok(SmContextCreateResponse {
         n1_sm_msg,
         n2_sm_info,
         sm_context_ref,
+        smf_authority,
     })
 }
 
@@ -4531,6 +4541,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_amf_sbi_open_close() {
+        // `amf_sbi_close` clears the process-wide discovery cache and client pool,
+        // which `sm_context_create_reaches_an_smf_restarted_at_a_new_address`
+        // seeds and reads: serialise against it (#673).
+        let _guard = AMF_NRF_URI_TEST_LOCK.lock().await;
         assert!(amf_sbi_open().is_ok());
         amf_sbi_close();
     }
@@ -4656,6 +4670,11 @@ mod tests {
         .await
         .expect("SM Context Create must reach the restarted SMF");
         assert_eq!(created.sm_context_ref, "664");
+        assert_eq!(
+            created.smf_authority,
+            Some(format!("127.0.0.1:{}", new_smf.port())),
+            "#669: the context lives in the SMF that answered, not the dead one asked"
+        );
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         // And the next PDU session resolves straight to the new SMF.
         assert_eq!(

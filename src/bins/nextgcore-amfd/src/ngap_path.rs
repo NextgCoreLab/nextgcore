@@ -775,6 +775,11 @@ pub struct NgapServer {
     /// so the downlink FAR (gNB TEID) was installed on a stale session and
     /// downlink user traffic was silently black-holed.
     sm_context_refs: HashMap<(u64, u8), String>,
+    /// The SMF that holds each SM context, as (host, port) (#669). Written beside
+    /// `sm_context_refs` at Create; Update/Release go here rather than to
+    /// `SMF_SBI_ADDR`, which after an SMF restart may still route to the old pod
+    /// and with several SMFs names the wrong one.
+    sm_context_smfs: HashMap<(u64, u8), (String, u16)>,
     /// The target gNB's SCTP association for a UE with an N2 handover in flight,
     /// keyed by AMF-UE-NGAP-ID.
     ///
@@ -879,6 +884,7 @@ impl NgapServer {
             server_event_rx,
             ue_auth_state,
             sm_context_refs: HashMap::new(),
+            sm_context_smfs: HashMap::new(),
             handover_target_assoc: HashMap::new(),
             handover_target_transfers: HashMap::new(),
             eps_ho_in_flight: HashMap::new(),
@@ -2198,6 +2204,25 @@ impl NgapServer {
                 state.amf_ue.nr_cgi.cell_id
             );
         });
+
+        // #675: an INITIAL registration on an NG connection that has no NAS context
+        // yet -- the connection began with a Service Request the AMF rejected with #9
+        // (`reject_idle_service_request` creates no context), and the UE, as told,
+        // registers afresh with its SUCI on the same connection. An initial
+        // registration needs no prior context (TS 24.501 §5.5.1.2), so it gets one
+        // here, exactly as the Initial UE Message path creates it. Before #675 it fell
+        // to the "unknown UE" branch and was answered REGISTRATION REJECT #9 on every
+        // T3511 retry: after an AMF restart the UE could never register again.
+        if !self.ue_auth_state.contains(ul_nas.amf_ue_ngap_id) {
+            if let Some(state) = fresh_context_for_initial_registration(association_id, &ul_nas) {
+                log::info!(
+                    "UE {}: initial Registration Request on an NG connection with no NAS \
+                     context; creating one (TS 24.501 §5.5.1.2)",
+                    ul_nas.amf_ue_ngap_id
+                );
+                self.ue_auth_state.insert(ul_nas.amf_ue_ngap_id, state);
+            }
+        }
 
         if ul_nas.nas_pdu.len() < 3 {
             return Ok(());
@@ -5143,6 +5168,9 @@ impl NgapServer {
         for (psi, r) in moved {
             self.sm_context_refs.remove(&(old_id, psi));
             self.sm_context_refs.insert((new_id, psi), r);
+            if let Some(owner) = self.sm_context_smfs.remove(&(old_id, psi)) {
+                self.sm_context_smfs.insert((new_id, psi), owner);
+            }
         }
     }
 
@@ -5454,8 +5482,8 @@ impl NgapServer {
                 }
             }
         }
-        let (smf_host, smf_port) = Self::smf_sbi_target();
         for psi in &plan.release {
+            let (smf_host, smf_port) = self.smf_target_for(amf_ue_ngap_id, *psi);
             let sm_ref = held
                 .iter()
                 .find(|(p, _, _)| p == psi)
@@ -5479,6 +5507,7 @@ impl NgapServer {
         }
         let mut reactivation_failed: u16 = 0;
         for psi in &plan.activate {
+            let (smf_host, smf_port) = self.smf_target_for(amf_ue_ngap_id, *psi);
             let found = held.iter().find(|(p, _, _)| p == psi).cloned();
             let transfer = match &found {
                 Some((_, Some(r), _)) => {
@@ -5679,6 +5708,85 @@ impl NgapServer {
         Ok(())
     }
 
+    /// The connected-mode half of a Service Request's user-plane re-activation
+    /// (TS 23.502 §4.2.3.2): every PSI in the Uplink data status that the AMF holds
+    /// an SM context for is activated at its SMF, and the N2 SM information the SMF
+    /// answers goes to the gNB in a PDU SESSION RESOURCE SETUP REQUEST.
+    ///
+    /// `accept` (the protected SERVICE ACCEPT) is carried in the first setup
+    /// request that goes out; returns whether it was, so the caller sends it on its
+    /// own otherwise.
+    async fn activate_up_for_connected_service_request(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        nas: &[u8],
+        accept: &[u8],
+    ) -> bool {
+        let mut carried = false;
+        // `nas` is the plain message: the Uplink NAS Transport path already
+        // deciphered it, so a NAS message container needs no second pass.
+        let ies = service_request_session_ies(nas, &|_value: &mut Vec<u8>| {});
+        let held: Vec<(u8, Option<String>, crate::context::SNssai)> = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard
+                .sess_list_for_ue(amf_ue_ngap_id)
+                .into_iter()
+                .map(|s| {
+                    let r = self
+                        .sm_context_refs
+                        .get(&(amf_ue_ngap_id, s.psi))
+                        .cloned()
+                        .or(s.sm_context_ref.clone());
+                    (s.psi, r, s.s_nssai)
+                })
+                .collect()
+        };
+        for (psi, sm_ref, s_nssai) in
+            connected_sessions_to_activate(amf_ue_ngap_id, &held, ies.uplink_data_status)
+        {
+            let (smf_host, smf_port) = self.smf_target_for(amf_ue_ngap_id, psi);
+            let transfer = match crate::sbi_path::call_smf_activate_up_connection(
+                &smf_host, smf_port, &sm_ref,
+            )
+            .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    log::warn!("UE {amf_ue_ngap_id}: PSI {psi} UP activation failed: {e}");
+                    continue;
+                }
+            };
+            let Some(setup_req) = crate::ngap_asn1::build_pdu_session_resource_setup_request_asn1(
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                psi,
+                s_nssai.sst,
+                s_nssai.sd,
+                (!carried).then_some(accept),
+                &transfer,
+            ) else {
+                log::error!(
+                    "UE {amf_ue_ngap_id}: PSI {psi} PDU Session Resource Setup did not encode"
+                );
+                continue;
+            };
+            match self.send_to_association(association_id, &setup_req).await {
+                Ok(()) => {
+                    carried = true;
+                    log::info!(
+                        "UE {amf_ue_ngap_id}: PSI {psi} user plane re-activated (connected-mode \
+                         Service Request): PDU Session Resource Setup Request sent"
+                    )
+                }
+                Err(e) => log::warn!("UE {amf_ue_ngap_id}: PSI {psi} setup request not sent: {e}"),
+            }
+        }
+        carried
+    }
+
     async fn handle_service_request_nas(
         &mut self,
         association_id: u64,
@@ -5731,9 +5839,38 @@ impl NgapServer {
         let Some(protected) = self.protect_nas(amf_ue_ngap_id, &plain) else {
             return Ok(());
         };
-        self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
-            .await?;
-        log::info!("Service Accept sent to UE {amf_ue_ngap_id} (protected)");
+
+        // TS 23.502 §4.2.3.2 steps 4-12 for a UE that is already CM-CONNECTED: the
+        // sessions in its Uplink data status get their user plane back --
+        // Nsmf_PDUSession_UpdateSMContext (upCnxState ACTIVATING), then a PDU SESSION
+        // RESOURCE SETUP REQUEST carrying the SMF's N2 SM information (#682).
+        //
+        // The Service Accept rides INSIDE that setup request (its NAS-PDU, step 12),
+        // so the UE learns its service was accepted when the gNB has the bearer -- not
+        // before. Sent ahead of the setup, the Accept let the UE release its held
+        // uplink about 10 ms before the gNB had the session, and that packet was lost
+        // (devtest1: the first ping after a gNB move, #684).
+        let carried = self
+            .activate_up_for_connected_service_request(
+                association_id,
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                nas,
+                &protected,
+            )
+            .await;
+        if !carried {
+            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
+                .await?;
+        }
+        log::info!(
+            "Service Accept sent to UE {amf_ue_ngap_id} (protected{})",
+            if carried {
+                ", in the PDU Session Resource Setup Request"
+            } else {
+                ""
+            }
+        );
 
         // #74 criterion 5: CONNECTIVITY_STATE_REPORT, the CM-IDLE -> CM-CONNECTED half.
         // A Service Request is exactly that transition (TS 24.501 §5.6.1), which is the
@@ -6820,6 +6957,12 @@ impl NgapServer {
         )
         .await
         .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
+        // #669: a 5GSM message for an EXISTING session goes to the SMF holding its
+        // context; only a new establishment is a fresh selection.
+        let (smf_host, smf_port) = match self.sm_context_smfs.get(&(amf_ue_ngap_id, psi)) {
+            Some(owner) if sm_msg_type != 0xC1 => owner.clone(),
+            _ => (smf_host, smf_port),
+        };
 
         match sm_msg_type {
             // PDU Session Establishment Request
@@ -6950,6 +7093,15 @@ impl NgapServer {
                         // PSI and must not be reconstructed from one.
                         self.sm_context_refs
                             .insert((amf_ue_ngap_id, psi), resp.sm_context_ref.clone());
+                        // #669: and WHICH SMF holds it.
+                        match resp.smf_authority.as_deref().and_then(split_authority) {
+                            Some(owner) => {
+                                self.sm_context_smfs.insert((amf_ue_ngap_id, psi), owner);
+                            }
+                            None => {
+                                self.sm_context_smfs.remove(&(amf_ue_ngap_id, psi));
+                            }
+                        }
                         // #540: also the AmfSess the Namf N1N2MessageTransfer handler
                         // and the Service Request's re-activation look the session up
                         // in. Before this only `sm_context_refs` was written, so every
@@ -8309,8 +8461,8 @@ impl NgapServer {
         if refs.is_empty() {
             return;
         }
-        let (smf_host, smf_port) = Self::smf_sbi_target();
         for (psi, sm_ref) in refs {
+            let (smf_host, smf_port) = self.smf_target_for(amf_ue_ngap_id, psi);
             match crate::sbi_path::call_smf_deactivate_up_connection(&smf_host, smf_port, &sm_ref)
                 .await
             {
@@ -8685,6 +8837,12 @@ impl NgapServer {
         };
 
         for (psi, sm_context_ref) in &sm_context_refs {
+            // #669: each context is released at the SMF that holds it.
+            let (smf_host, smf_port) = self
+                .sm_context_smfs
+                .get(&(amf_ue_ngap_id, *psi))
+                .cloned()
+                .unwrap_or_else(|| (smf_host.clone(), smf_port));
             match crate::sbi_path::call_smf_release_sm_context(&smf_host, smf_port, sm_context_ref)
                 .await
             {
@@ -11382,6 +11540,16 @@ impl NgapServer {
     /// The SMF then sends PFCP Session Modification to the UPF to activate the DL FAR.
     /// The SMF's SBI host/port, from the environment (same lookup every N11 call
     /// site in this file uses).
+    /// The SMF holding UE `amf_ue_ngap_id`'s PSI `psi` SM context (#669), falling
+    /// back to [`Self::smf_sbi_target`] for a context created before this was
+    /// recorded.
+    fn smf_target_for(&self, amf_ue_ngap_id: u64, psi: u8) -> (String, u16) {
+        self.sm_context_smfs
+            .get(&(amf_ue_ngap_id, psi))
+            .cloned()
+            .unwrap_or_else(Self::smf_sbi_target)
+    }
+
     fn smf_sbi_target() -> (String, u16) {
         let host = std::env::var("SMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
         let port: u16 = std::env::var("SMF_SBI_PORT")
@@ -11472,7 +11640,7 @@ impl NgapServer {
             .sm_context_refs
             .get(&(amf_ue_ngap_id, pdu_session_id))
             .cloned()?;
-        let (host, port) = Self::smf_sbi_target();
+        let (host, port) = self.smf_target_for(amf_ue_ngap_id, pdu_session_id);
         match crate::sbi_path::call_smf_update_sm_context_n2(
             &host,
             port,
@@ -11531,7 +11699,7 @@ impl NgapServer {
             );
             return None;
         };
-        let (host, port) = Self::smf_sbi_target();
+        let (host, port) = self.smf_target_for(amf_ue_ngap_id, pdu_session_id);
         match crate::sbi_path::call_smf_update_sm_context_n2(
             &host,
             port,
@@ -11576,7 +11744,7 @@ impl NgapServer {
             return false;
         };
 
-        let (host, port) = Self::smf_sbi_target();
+        let (host, port) = self.smf_target_for(amf_ue_ngap_id, pdu_session_id);
         // The container is forwarded opaquely: the AMF never re-encodes N2 SM
         // information (TS 23.502).
         // Each container with its own n2SmInfoType (TS 29.502 §6.1.6.3.12, #525).
@@ -12187,7 +12355,7 @@ impl NgapServer {
                 );
                 continue;
             };
-            let (host, port) = Self::smf_sbi_target();
+            let (host, port) = self.smf_target_for(notify.amf_ue_ngap_id, item.pdu_session_id);
             match crate::sbi_path::call_smf_update_sm_context_n2(
                 &host,
                 port,
@@ -13223,6 +13391,37 @@ pub(crate) fn service_request_session_ies(
     }
 }
 
+/// The sessions a CM-CONNECTED Service Request re-activates: each PSI in the
+/// Uplink data status that the AMF holds an SM context for (TS 23.502 §4.2.3.2).
+/// Release on PDU session status is the CM-IDLE path's job.
+pub(crate) fn connected_sessions_to_activate(
+    amf_ue_ngap_id: u64,
+    held: &[(u8, Option<String>, crate::context::SNssai)],
+    uplink_data_status: Option<u16>,
+) -> Vec<(u8, String, crate::context::SNssai)> {
+    let plan = plan_service_request_sessions(
+        &held.iter().map(|(psi, _, _)| *psi).collect::<Vec<_>>(),
+        ServiceRequestSessionIes {
+            uplink_data_status,
+            pdu_session_status: None,
+        },
+        &[],
+    );
+    plan.activate
+        .into_iter()
+        .filter_map(|psi| match held.iter().find(|(p, _, _)| *p == psi) {
+            Some((_, Some(r), s_nssai)) => Some((psi, r.clone(), s_nssai.clone())),
+            _ => {
+                log::warn!(
+                    "UE {amf_ue_ngap_id}: Service Request asks to activate PSI {psi}, which has \
+                     no SM context"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
 /// What a Service Request asks of the AMF's sessions (#518).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct ServiceRequestSessionPlan {
@@ -14162,6 +14361,45 @@ fn path_switch_failure(
         &released_items(sessions, cause)?,
         diagnostics,
     )
+}
+
+/// `host:port` -> (host, port); `None` when the port is missing or invalid.
+fn split_authority(authority: &str) -> Option<(String, u16)> {
+    let (host, port) = authority.rsplit_once(':')?;
+    Some((
+        host.trim_matches(['[', ']']).to_string(),
+        port.parse().ok()?,
+    ))
+}
+
+/// The NAS context an Uplink-NAS-borne PLAIN initial REGISTRATION REQUEST gets
+/// when its NG connection has none (#675), or `None` for anything else. Mirrors the
+/// Initial UE Message path: location from the message's mandatory User Location
+/// Information, 3GPP access, a fresh security canary.
+fn fresh_context_for_initial_registration(
+    association_id: u64,
+    ul_nas: &crate::ngap_asn1::UplinkNasTransportData,
+) -> Option<UeNasContext> {
+    let nas = &ul_nas.nas_pdu;
+    let is_plain_initial_registration = nas.len() >= 4
+        && nas[0] == 0x7E
+        && nas[1] == security_header::PLAIN_NAS_MESSAGE
+        && nas[2] == message_type::REGISTRATION_REQUEST
+        && nas[3] & 0x07 == crate::gmm_build::registration_type::INITIAL;
+    if !is_plain_initial_registration {
+        return None;
+    }
+    let mut state = UeNasContext::new(
+        ul_nas.amf_ue_ngap_id,
+        ul_nas.ran_ue_ngap_id,
+        association_id,
+        crate::context::nas_security_canary(),
+    );
+    if let Some(location) = &ul_nas.user_location_info {
+        apply_user_location(&mut state.amf_ue, location);
+    }
+    state.amf_ue.access_type = 1; // 3GPP access
+    Some(state)
 }
 
 fn apply_user_location(
@@ -20924,6 +21162,122 @@ mod tests {
     }
 
     // ---- #406: the AMF learns a location from every message that reports one ----
+
+    /// A CM-CONNECTED Service Request re-activates exactly the held sessions its
+    /// Uplink data status names (TS 23.502 §4.2.3.2; nextgsim #288).
+    #[test]
+    fn a_connected_service_request_activates_the_sessions_with_uplink_data() {
+        let slice = crate::context::SNssai { sst: 1, sd: None };
+        let held = vec![
+            (1u8, Some("ref-1".to_string()), slice.clone()),
+            (2u8, Some("ref-2".to_string()), slice.clone()),
+            (3u8, None, slice.clone()),
+        ];
+        // PSI 1 and PSI 3 have uplink data; PSI 3 has no SM context.
+        let picked = connected_sessions_to_activate(7, &held, Some((1 << 1) | (1 << 3)));
+        let picked: Vec<(u8, String)> = picked.into_iter().map(|(p, r, _)| (p, r)).collect();
+        assert_eq!(picked, vec![(1, "ref-1".to_string())]);
+        assert!(connected_sessions_to_activate(7, &held, None).is_empty());
+    }
+
+    /// #669: Update/Release for an SM context go to the SMF that created it, not to
+    /// `SMF_SBI_ADDR`; a context with no recorded owner keeps the old fallback.
+    #[tokio::test]
+    async fn sm_context_updates_go_to_the_smf_that_holds_the_context() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        ngap.sm_context_refs.insert((7_669_001, 1), "1".to_string());
+        ngap.sm_context_smfs
+            .insert((7_669_001, 1), ("10.10.18.36".to_string(), 7777));
+        assert_eq!(
+            ngap.smf_target_for(7_669_001, 1),
+            ("10.10.18.36".to_string(), 7777)
+        );
+        assert_eq!(
+            ngap.smf_target_for(7_669_001, 2),
+            NgapServer::smf_sbi_target(),
+            "no recorded owner: the environment fallback"
+        );
+        ngap.rekey_ue_sessions(7_669_001, 7_669_002);
+        assert_eq!(
+            ngap.smf_target_for(7_669_002, 1),
+            ("10.10.18.36".to_string(), 7777),
+            "the owner follows the UE across an AMF UE NGAP ID change"
+        );
+        assert_eq!(
+            split_authority("[::1]:7777"),
+            Some(("::1".to_string(), 7777))
+        );
+        assert_eq!(split_authority("smf"), None);
+    }
+
+    /// #675: an initial Registration Request (SUCI) arriving in an Uplink NAS
+    /// Transport on an NG connection with no NAS context gets a fresh context; any
+    /// other message on such a connection does not.
+    #[test]
+    fn an_initial_registration_without_a_context_gets_one() {
+        let ul = |nas: Vec<u8>| crate::ngap_asn1::UplinkNasTransportData {
+            amf_ue_ngap_id: 7_675_001,
+            ran_ue_ngap_id: 75,
+            nas_pdu: nas,
+            user_location_info: Some(test_user_location(0x000675, 0x0006_7500)),
+        };
+        let state = fresh_context_for_initial_registration(3, &ul(sample_registration_request()))
+            .expect("an initial registration gets a context");
+        assert_eq!(state.association_id, 3);
+        assert_eq!(state.ran_ue_ngap_id, 75);
+        assert_eq!(
+            state.amf_ue.nr_tai.tac, 0x000675,
+            "location from the message"
+        );
+        assert_eq!(state.amf_ue.access_type, 1);
+
+        let mut mobility = sample_registration_request();
+        mobility[3] = 0x0A; // FOR + mobility registration updating
+        assert!(fresh_context_for_initial_registration(3, &ul(mobility)).is_none());
+        assert!(fresh_context_for_initial_registration(
+            3,
+            &ul(vec![
+                0x7E,
+                0x00,
+                message_type::CONFIGURATION_UPDATE_COMPLETE
+            ])
+        )
+        .is_none());
+        let mut protected = sample_registration_request();
+        protected[1] = 0x01;
+        assert!(fresh_context_for_initial_registration(3, &ul(protected)).is_none());
+    }
+
+    /// #675 through the handler: the connection's first message was a Service
+    /// Request the AMF rejected (#9), so there is no NAS context; the UE's initial
+    /// Registration Request must be taken up, not rejected #9 again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_initial_registration_after_a_service_reject_is_taken_up() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let amf_ue_ngap_id = 7_675_002u64;
+        assert!(!ngap.ue_auth_state.contains(amf_ue_ngap_id));
+        let ul_pdu = nextgcore_ngap::builder::build_uplink_nas_transport(
+            &nextgcore_ngap::types::UplinkNasTransport {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id: 76,
+                nas_pdu: sample_registration_request(),
+                user_location_info: test_user_location(0x000676, 0x0006_7600),
+            },
+        )
+        .expect("encode an Uplink NAS Transport");
+        let _ = ngap.handle_uplink_nas_transport(1, &ul_pdu).await;
+        // Before #675 the handler found no context, answered REGISTRATION REJECT #9
+        // and left none behind; the procedure now runs on a context of its own.
+        let state = ngap
+            .ue_auth_state
+            .get(amf_ue_ngap_id)
+            .expect("the initial registration created a NAS context");
+        assert_eq!(state.ran_ue_ngap_id, 76);
+        assert_eq!(state.amf_ue.nr_tai.tac, 0x000676);
+        ngap.ue_auth_state.remove(amf_ue_ngap_id);
+    }
 
     /// #406 criteria 1-4: a real `UplinkNASTransport` refreshes BOTH the stored TAI and
     /// the stored cell identity, and the values are the ones the message carried.

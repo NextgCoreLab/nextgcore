@@ -579,6 +579,10 @@ kubectl apply -f "${RENDERED}"
 # here are usually image pulls or an unbound PVC.
 # --- re-resolve peers pinned by IP (#436) ------------------------------------
 #
+# Not used by PROFILE=5g any more: its NFs re-resolve Service names themselves
+# (README "Peer addressing"). Kept for a profile whose peers still need a
+# literal IP at start.
+#
 # Three dependents resolve a peer's POD IP once, in an init container: the SMF
 # pins the UPF (resolve-upf), the gNB pins the AMF and the UPF, and the UE pins
 # the gNB (resolve-dns). When the peer gets a new pod and the dependent does not
