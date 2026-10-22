@@ -1,0 +1,52 @@
+# PROFILE=epc: the standalone EPC of docker/rust/docker-compose-epc.yml on EKS,
+# in namespace nextg-epc.
+#   - nextgcore: mongodb, hss, pcrf, sgwc, sgwu, mme, pgwc (smfd as PGW-C)
+#     and pgwu (upfd as PGW-U);
+#   - nextgsim: the LTE eNB and UE (nextgsim #186).
+#
+# The NF configs are the compose ones, unmodified (configMapGenerator below);
+# scripts/epc-run.sh adapts their addresses per pod. Rendering them from their
+# real paths needs `--load-restrictor LoadRestrictionsNone`, which profile.env
+# passes:
+#   kubectl kustomize --load-restrictor LoadRestrictionsNone deploy/eks/profiles/epc
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: nextg-epc
+
+resources:
+  - namespace.yaml
+  # MongoDB + the subscriber seed Job (IMSI 999700000000001, APN internet:
+  # the subscriber config/lte-ue.yaml attaches as), shared with the 5G base.
+  - ../../../../k8s/manifests/mongodb.yaml
+  - ../../../../k8s/manifests/mongodb-init.yaml
+  - epc.yaml
+
+patches:
+  # gp3 PVC for MongoDB, as in the 5G profile.
+  - path: ../5g/patches/storage-class.yaml
+
+configMapGenerator:
+  - name: epc-configs
+    files:
+      - ../../../../docker/rust/configs/epc/hss.yaml
+      - ../../../../docker/rust/configs/epc/pcrf.yaml
+      - ../../../../docker/rust/configs/epc/mme.yaml
+      - ../../../../docker/rust/configs/epc/sgwc.yaml
+      - ../../../../docker/rust/configs/epc/sgwu.yaml
+      - ../../../../docker/rust/configs/epc/pgwc.yaml
+      - ../../../../docker/rust/configs/epc/pgwu.yaml
+      - ../../../../docker/rust/configs/epc/freeDiameter/hss.conf
+      - ../../../../docker/rust/configs/epc/freeDiameter/mme.conf
+      - ../../../../docker/rust/configs/epc/freeDiameter/pcrf.conf
+      - ../../../../../nextgsim/config/enb.yaml
+      - ../../../../../nextgsim/config/lte-ue.yaml
+  - name: epc-scripts
+    files:
+      - scripts/epc-run.sh
+      - scripts/epc-peers-check.sh
+
+labels:
+  - includeSelectors: false
+    pairs:
+      nextg.io/environment: eks-lab

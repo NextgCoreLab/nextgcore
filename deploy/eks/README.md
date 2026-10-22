@@ -15,10 +15,12 @@ deploy/eks/
 │   └── eks-cluster.yaml      VPC, EKS, node group, ECR, EBS CSI IRSA
 ├── kustomization.yaml        default entrypoint: includes profiles/5g
 ├── profiles/
-│   └── 5g/                   PROFILE=5g (default)
-│       ├── kustomization.yaml  overlay (patches k8s/ + nextgsim/k8s/)
-│       ├── patches/            per-concern strategic-merge patches
-│       └── profile.env         namespace, images, features, rollout hooks
+│   ├── 5g/                   PROFILE=5g (default)
+│   │   ├── kustomization.yaml  overlay (patches k8s/ + nextgsim/k8s/)
+│   │   ├── patches/            per-concern strategic-merge patches
+│   │   └── profile.env         namespace, images, features, rollout hooks
+│   └── epc/                  PROFILE=epc (nextg-epc): EPC + LTE eNB/UE
+├── e2e-internet.sh           UE -> internet check, PROFILE=5g|epc
 ├── lib/image-tag.sh          git-SHA image tag, shared by both scripts
 ├── lib/profile.sh            PROFILE loader, shared by both scripts
 ├── build-and-push.sh         build 12 images, push to ECR
@@ -57,6 +59,58 @@ directory other than `nextgcore/binaries/`, e.g. a feature build's own output.
 and `build-and-push.sh` issues the same docker/aws commands.
 `DRY_RUN=true` writes `rendered.dryrun.yaml` for 5g and
 `rendered.dryrun.<profile>.yaml` for the others.
+
+## PROFILE=epc
+
+`profiles/epc/` is `docker/rust/docker-compose-epc.yml`, the nightly EPC
+stage, in namespace `nextg-epc`:
+- mongodb + the shared subscriber seed;
+- hss, pcrf, sgwc, sgwu, mme;
+- pgwc (`smfd`) and pgwu (`upfd`);
+- nextgsim's LTE `enb` and `lte-ue`.
+
+**Configs.** The compose configs are mounted unmodified, from their real
+paths (hence `--load-restrictor LoadRestrictionsNone`).
+`profiles/epc/scripts/epc-run.sh`, the entrypoint of every pod, maps each
+compose address `172.24.0.N` to this pod's IP (its own node) or to the peer's
+pod IP from a headless Service. Both nextgcore's EPC configs and nextgsim's
+`IpAddr` fields need literal IPs. The Services use
+`publishNotReadyAddresses`, so the HSS and MME, which name each other,
+cannot deadlock.
+
+**Restarted peers.** The resolution runs at every container start. The
+liveness probe `epc-peers-check.sh` fails when a recorded peer's IP changes,
+so a restarted peer does not strand its dependents.
+
+**Why pod IPs, not ClusterIPs.** GTP-C, PFCP and GTP-U peers address each
+other by advertised F-TEID/F-SEID addresses. Per-flow kube-proxy NAT on those
+UDP flows clashes in conntrack.
+
+**S1-MME is kernel SCTP**, as in the nightly. mmed and lte-enb must be
+built with their `kernel-sctp` features, and the nodes need the `sctp` kernel
+module. The mme Service's `s1ap` port is `protocol: SCTP`; `S1AP_PROTOCOL`
+overrides it. The images are built from those binaries:
+
+```bash
+# mmed with kernel SCTP, next to the six default-build EPC binaries
+(cd src && cargo build --release -p nextgcore-mmed --features kernel-sctp)
+mkdir -p /tmp/epc-binaries && cp src/target/release/nextgcore-mmed /tmp/epc-binaries/
+for b in sgwcd sgwud hssd pcrfd smfd upfd; do cp binaries/nextgcore-$b /tmp/epc-binaries/; done
+# nextgsim LTE eNB (kernel SCTP) and UE, into nextgsim/binaries/ (gitignored)
+(cd ../nextgsim && cargo build --release -p nextgsim-enb --features kernel-sctp --bin lte-enb \
+   && cargo build --release -p nextgsim-lte-ue --bin lte-ue \
+   && mkdir -p binaries && cp target/release/lte-enb target/release/lte-ue binaries/)
+
+PROFILE=epc CORE_BIN_DIR=/tmp/epc-binaries ./build-and-push.sh
+PROFILE=epc ./deploy-eks.sh
+PROFILE=epc ./e2e-internet.sh
+```
+
+**Privileges.** The namespace is `privileged`. sgwu and pgwu run privileged
+with `/dev/net/tun`. lte-ue gets NET_ADMIN and `/dev/net/tun`. The sysctls
+(`ip_forward`, loose `rp_filter`) are not on the kubelet's safe list, so a
+privileged busybox init container writes them into the pod's network
+namespace. No `hostNetwork`, NodePort or LoadBalancer is used.
 
 ## Images are tagged by git SHA, not `:latest`
 
@@ -265,7 +319,7 @@ Workload:
 - Single replica per NF. The NFs hold per-UE state in a process-global context
   and the NRF is the source of truth for topology; `replicas: 2` has not been
   validated and is not expected to work.
-- Only 10 of nextgcore's 28 NFs are deployed (the 5G control + user plane).
-  The EPC tier (mme/hss/pcrf/sgwc/sgwu) has no simulator and is not included.
+- PROFILE=5g deploys 10 of nextgcore's 28 NFs (the 5G control + user
+  plane). The EPC tier is PROFILE=epc (see above).
 - All 6G/AI features are off. That is the validated configuration — the
   84/84 E2E result is with every 6G flag disabled.
