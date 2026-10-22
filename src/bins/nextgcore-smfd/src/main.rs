@@ -933,9 +933,24 @@ async fn main() -> Result<()> {
 
     pfcp_assoc_handle.abort();
 
-    // Graceful shutdown: release the N4 association before going down
-    // (TS 29.244 6.2.9 — Association Release initiated by the CP function)
-    if pfcp_client.is_associated().await {
+    // Graceful shutdown. #677: the N4 association is NOT released by default. A
+    // UPF answers an Association Release by deleting every session of the
+    // association (TS 29.244 §6.2.9), so releasing on a mere restart cut every
+    // UE's traffic; left in place, the UPF keeps forwarding while the next SMF
+    // incarnation associates (TS 23.527). An SMF being removed for good opts in
+    // with SMF_PFCP_RELEASE_ON_SHUTDOWN=true.
+    let release_on_shutdown = release_association_on_shutdown(
+        std::env::var("SMF_PFCP_RELEASE_ON_SHUTDOWN")
+            .ok()
+            .as_deref(),
+    );
+    if !release_on_shutdown {
+        log::info!(
+            "PFCP association kept on shutdown: the UPF keeps forwarding the PDU sessions \
+             (SMF_PFCP_RELEASE_ON_SHUTDOWN=true releases it)"
+        );
+    }
+    if release_on_shutdown && pfcp_client.is_associated().await {
         match pfcp_client.release_association().await {
             Ok(()) => log::info!("PFCP association released"),
             Err(e) => log::warn!("PFCP Association Release failed: {e}"),
@@ -5581,6 +5596,15 @@ async fn send_n1_n2_paging_request(amf_uri: &str, supi: &str, psi: u8, qfi: Opti
     }
 }
 
+/// Whether a graceful shutdown releases the PFCP association (#677), from
+/// `SMF_PFCP_RELEASE_ON_SHUTDOWN`. Off unless set to `true`/`1`/`yes`.
+fn release_association_on_shutdown(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("true" | "1" | "yes")
+    )
+}
+
 /// Send a 5GSM message to the UE via the AMF (Namf_Communication
 /// N1N2MessageTransfer, TS 29.518 §5.2.2.3.1).
 ///
@@ -7045,6 +7069,18 @@ async fn handle_amf_status_change(sm_context_ref: &str) -> SbiResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #677: a graceful shutdown keeps the PFCP association unless the operator
+    /// opts in, because a UPF deletes every session of a released association.
+    #[test]
+    fn a_shutdown_keeps_the_pfcp_association_unless_told_otherwise() {
+        assert!(!release_association_on_shutdown(None));
+        assert!(!release_association_on_shutdown(Some("")));
+        assert!(!release_association_on_shutdown(Some("false")));
+        assert!(release_association_on_shutdown(Some("true")));
+        assert!(release_association_on_shutdown(Some(" TRUE ")));
+        assert!(release_association_on_shutdown(Some("1")));
+    }
 
     // ------------------------------------------------------------------
     // #525: AN-initiated modification (PDU_RES_MOD_IND -> PDU_RES_MOD_CFM)
