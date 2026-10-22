@@ -421,8 +421,14 @@ spec:
           value: '8805'
         - name: NEXTGCORE_SBI_PROFILE
           value: dev
+        # smfd re-resolves a hostname UPF_PFCP_ADDR on every PFCP association
+        # attempt (#658), so the PGW-U is named by its Service and is not a
+        # liveness-tracked peer: a restarted PGW-U is found again without
+        # restarting the PGW-C.
         - name: EPC_EXPORT
-          value: SMF_PFCP_ADDR=self UPF_PFCP_ADDR=pgwu
+          value: SMF_PFCP_ADDR=self UPF_PFCP_ADDR=dns:pgwu
+        - name: EPC_UNTRACKED
+          value: pgwu
         volumeMounts:
         - name: templates
           mountPath: /epc/templates

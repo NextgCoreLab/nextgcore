@@ -32,8 +32,9 @@
 # the pod at the next rollout.
 #
 # Exit status: 0 when every step PASSes, 1 when any step FAILs, 2 on a usage or
-# environment error (no UE pod, no TUN, ...). PROFILE=epc and PROFILE=6g add
-# their sections here when those profiles land.
+# environment error (no UE pod, no TUN, ...). PROFILE=epc additionally checks
+# the LTE attach (S1 Setup, EMM-REGISTERED, default bearer) from the logs.
+# PROFILE=6g adds its section when that profile lands.
 set -uo pipefail
 
 PROFILE="${PROFILE:-5g}"
@@ -60,12 +61,23 @@ case "${PROFILE}" in
     UPF_CONTAINER="${UPF_CONTAINER:-upf}"
     TUN="${TUN:-uesimtun}"
     ;;
+  epc)
+    # The LTE UE puts the default bearer's PDN address on lteuetun<EBI>; the
+    # default bearer is EBI 5. The PGW-U is upfd, so it logs the same
+    # "Data plane stats" line as the 5G UPF.
+    NAMESPACE="${NAMESPACE:-${PROFILE_NAMESPACE}}"
+    UE_SELECTOR="${UE_SELECTOR:-app.kubernetes.io/name=lte-ue}"
+    UE_CONTAINER="${UE_CONTAINER:-lte-ue}"
+    UPF_SELECTOR="${UPF_SELECTOR:-app.kubernetes.io/name=pgwu}"
+    UPF_CONTAINER="${UPF_CONTAINER:-pgwu}"
+    TUN="${TUN:-lteuetun5}"
+    ;;
   # A new profile adds a section here, setting the same six knobs: the UE pod
   # selector and container, the core user-plane pod (whose log carries the
   # "Data plane stats" line) and container, and the UE tunnel interface.
   # NAMESPACE comes from the profile's profile.env.
   *)
-    echo "PROFILE=${PROFILE} has no e2e-internet section yet (only 5g)" >&2
+    echo "PROFILE=${PROFILE} has no e2e-internet section yet (5g, epc)" >&2
     exit 2
     ;;
 esac
@@ -95,6 +107,31 @@ UE_POD="$(running_pod "${UE_SELECTOR}")"
 UPF_POD="$(running_pod "${UPF_SELECTOR}")"
 [[ -n "${UPF_POD}" ]] || die "no Running UPF pod (${UPF_SELECTOR}) in ${NAMESPACE}"
 echo "profile=${PROFILE} namespace=${NAMESPACE} ue=${UE_POD} upf=${UPF_POD}"
+
+# ---- EPC signalling ---------------------------------------------------------
+# The attach chain, from the full logs of the running pods, with the patterns of
+# docker/rust/epc-attach-check.sh (the nightly EPC stage): S1 Setup accepted,
+# EMM-REGISTERED, and the SAME default-bearer EBI on the UE and the MME.
+if [[ "${PROFILE}" == epc ]]; then
+  MME_LOG="$("${KUBECTL[@]}" logs deployment/mme -c mme --tail=-1 2>/dev/null)"
+  UE_LOG="$("${KUBECTL[@]}" logs "${UE_POD}" -c "${UE_CONTAINER}" --tail=-1 2>/dev/null)"
+  if line="$(grep -Em1 'S1 Setup: eNB 0x[0-9a-fA-F]+ .*accepted' <<<"${MME_LOG}")"; then
+    pass "S1 Setup accepted by the MME: ${line##*] }"
+  else
+    fail "S1 Setup: no 'S1 Setup: eNB ... accepted' in the mme log"
+  fi
+  if grep -q 'EMM-REGISTERED' <<<"${UE_LOG}"; then
+    pass "UE reached EMM-REGISTERED"
+  else
+    fail "UE never logged EMM-REGISTERED"
+  fi
+  EBI="$(grep -Eo 'default EPS bearer [0-9]+ activated' <<<"${UE_LOG}" | head -n1 | awk '{print $4}')"
+  if [[ -n "${EBI}" ]] && grep -Eq "Default EPS bearer \(ebi=${EBI}\) activated" <<<"${MME_LOG}"; then
+    pass "default EPS bearer EBI ${EBI} activated on the UE and the MME"
+  else
+    fail "default EPS bearer: UE EBI '${EBI:-none}' not activated in the mme log"
+  fi
+fi
 
 # ---- UPF counters ---------------------------------------------------------
 # "Data plane stats: UL=47 pkts/4590 B, DL=44 pkts/13675 B, dropped=9 ..."
