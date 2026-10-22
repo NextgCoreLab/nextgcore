@@ -21,6 +21,7 @@ pub mod nas_dispatch;
 pub mod nas_path;
 pub mod nas_security;
 pub mod nas_timer;
+pub mod network_detach;
 pub mod overload;
 pub mod paging;
 pub mod s11_build;

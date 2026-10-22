@@ -978,39 +978,267 @@ pub fn dispatch_initial(raw: &[u8], msg_type: u8, sequence_number: u32, peer: So
     }
 }
 
-/// A Delete Bearer Request from the Serving GW: delete the bearers the eNB
-/// released and answer (TS 23.401 §5.4.4.2 steps 6-8).
+/// A Delete Bearer Request from the Serving GW (TS 29.274 §7.2.9.2).
 ///
 /// Reached two ways (#591): as the triggered message of this MME's Delete Bearer
 /// Command (TS 29.274 §7.6: same sequence number, it closes the Command), routed
 /// by [`dispatch_triggered`]; or as an initial message, routed by
 /// [`dispatch_initial`]. The handling is the same; only the transaction differs.
+///
+/// Bearers the eNB released are deleted and acknowledged as in TS 23.401 §5.4.4.2
+/// (#584). Any other request is a PGW-initiated deactivation (§5.4.4.1), which
+/// [`network_initiated_bearer_deletion`] decides (#688). Every request is
+/// answered: before #688 such a request got no Delete Bearer Response at all.
 fn handle_delete_bearer_request(raw: &[u8], sequence_number: u32, peer: SocketAddr) {
     let local_teid = parse_gtp_header(raw)
         .map(|(_, teid, _, _)| teid)
         .unwrap_or(0);
+    let ctx = crate::context::mme_self();
     let ebis = delete_bearer_request_ebis(raw);
-    match delete_enb_released_bearers(crate::context::mme_self(), local_teid, &ebis) {
-        Some((sgw_teid, deleted)) => {
-            match crate::s11_build::build_delete_bearer_response_for_ebis(
+    use crate::s11_build::GtpCause;
+    let rsp = if let Some((sgw_teid, deleted)) = delete_enb_released_bearers(ctx, local_teid, &ebis)
+    {
+        crate::s11_build::build_delete_bearer_response_for_ebis(
+            sgw_teid,
+            &deleted,
+            GtpCause::RequestAccepted,
+            sequence_number,
+        )
+    } else {
+        match network_initiated_bearer_deletion(ctx, local_teid, raw) {
+            DeleteBearerAction::DetachUe {
+                mme_ue_id,
                 sgw_teid,
-                &deleted,
-                crate::s11_build::GtpCause::RequestAccepted,
-                sequence_number,
-            ) {
-                Ok(rsp) => {
-                    if let Err(e) = crate::gtp_path::send_response_to_sgwc(peer, &rsp) {
-                        log::error!("S11 Delete Bearer Response to {peer} failed: {e}");
-                    }
+                lbi,
+                detach_type,
+            } => {
+                crate::network_detach::mme_initiated_detach(
+                    ctx,
+                    mme_ue_id,
+                    detach_type,
+                    &format!("a Delete Bearer Request for its last PDN connection (LBI {lbi})"),
+                );
+                crate::s11_build::build_delete_bearer_response_for_lbi(
+                    sgw_teid,
+                    lbi,
+                    GtpCause::RequestAccepted,
+                    sequence_number,
+                )
+            }
+            DeleteBearerAction::PdnDeletedLocally { sgw_teid, lbi } => {
+                crate::s11_build::build_delete_bearer_response_for_lbi(
+                    sgw_teid,
+                    lbi,
+                    GtpCause::RequestAccepted,
+                    sequence_number,
+                )
+            }
+            DeleteBearerAction::BearersDeletedLocally { sgw_teid, ebis } => {
+                crate::s11_build::build_delete_bearer_response_for_ebis(
+                    sgw_teid,
+                    &ebis,
+                    GtpCause::RequestAccepted,
+                    sequence_number,
+                )
+            }
+            DeleteBearerAction::NoContext { sgw_teid, lbi } => {
+                log::warn!(
+                    "S11 Delete Bearer Request seq={sequence_number} from {peer} (TEID \
+                     {local_teid:#x}, EBIs {ebis:?}) names no PDN connection or bearer this MME \
+                     holds; answering Context Not Found"
+                );
+                match lbi {
+                    Some(lbi) => crate::s11_build::build_delete_bearer_response_for_lbi(
+                        sgw_teid,
+                        lbi,
+                        GtpCause::ContextNotFound,
+                        sequence_number,
+                    ),
+                    None => crate::s11_build::build_delete_bearer_response_for_ebis(
+                        sgw_teid,
+                        &ebis,
+                        GtpCause::ContextNotFound,
+                        sequence_number,
+                    ),
                 }
-                Err(e) => log::error!("Delete Bearer Response build failed: {e}"),
             }
         }
-        None => log::info!(
-            "S11 Delete Bearer Request seq={sequence_number} from {peer} for EBIs \
-             {ebis:?} names no bearer the eNB released; network-initiated bearer \
-             deactivation (TS 23.401 §5.4.4.1) is not implemented by this MME"
-        ),
+    };
+    match rsp {
+        Ok(rsp) => {
+            if let Err(e) = crate::gtp_path::send_response_to_sgwc(peer, &rsp) {
+                log::error!("S11 Delete Bearer Response to {peer} failed: {e}");
+            }
+        }
+        Err(e) => log::error!("Delete Bearer Response build failed: {e}"),
+    }
+}
+
+/// GTPv2 cause "Reactivation requested" (TS 29.274 Table 8.4-1, value 8).
+pub const GTP_CAUSE_REACTIVATION_REQUESTED: u8 = 8;
+
+/// What a PGW-initiated Delete Bearer Request asks of this MME (#688).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeleteBearerAction {
+    /// The default bearer of the UE's LAST PDN connection: TS 23.401 §5.4.4.1
+    /// has the MME run the MME-initiated detach (§5.3.8.3) instead of deactivating
+    /// the bearer, "re-attach required" when the cause is Reactivation requested
+    /// (TS 24.301 §5.5.2.3.1).
+    DetachUe {
+        /// The UE to detach.
+        mme_ue_id: u64,
+        /// The Serving GW's S11 TEID, for the response.
+        sgw_teid: u32,
+        /// The LBI the request named.
+        lbi: u8,
+        /// The detach type the cause calls for.
+        detach_type: crate::emm_build::DetachTypeToUe,
+    },
+    /// A PDN connection that is not the UE's last, deleted in the MME only. The
+    /// ESM DEACTIVATE EPS BEARER CONTEXT REQUEST toward the UE is not implemented
+    /// here, and is logged as such.
+    PdnDeletedLocally {
+        /// The Serving GW's S11 TEID.
+        sgw_teid: u32,
+        /// The LBI the request named.
+        lbi: u8,
+    },
+    /// Dedicated bearers, deleted in the MME only (no ESM signalling, as above).
+    BearersDeletedLocally {
+        /// The Serving GW's S11 TEID.
+        sgw_teid: u32,
+        /// The EBIs found and deleted.
+        ebis: Vec<u8>,
+    },
+    /// No such UE, PDN connection or bearer.
+    NoContext {
+        /// The Serving GW's S11 TEID, when the UE is known (else 0).
+        sgw_teid: u32,
+        /// The LBI the request named, if it named one.
+        lbi: Option<u8>,
+    },
+}
+
+/// The Cause a GTPv2-C message carries, if any.
+fn message_cause(raw: &[u8]) -> Option<u8> {
+    let mut bytes = bytes::Bytes::copy_from_slice(raw);
+    let msg = nextgcore_gtp::v2::Gtp2Message::decode(&mut bytes).ok()?;
+    msg.get_ie(nextgcore_gtp::v2::Gtp2IeType::Cause as u8, 0)
+        .and_then(|ie| ie.value.first().copied())
+}
+
+/// Whether a Delete Bearer Request names its bearers by EBI (instance 1) rather
+/// than its PDN connection by LBI (instance 0) (TS 29.274 Table 7.2.9.2-1).
+fn names_dedicated_bearers(raw: &[u8]) -> bool {
+    let mut bytes = bytes::Bytes::copy_from_slice(raw);
+    let Ok(msg) = nextgcore_gtp::v2::Gtp2Message::decode(&mut bytes) else {
+        return false;
+    };
+    msg.get_ies(nextgcore_gtp::v2::Gtp2IeType::Ebi as u8)
+        .into_iter()
+        .any(|ie| ie.instance == 1)
+}
+
+/// Decide and apply (in the MME's own contexts) a PGW-initiated Delete Bearer
+/// Request for the UE whose S11 TEID is `mme_s11_teid` (TS 23.401 §5.4.4.1, #688).
+/// The detach itself is left to the caller, which owns the S11 response.
+pub fn network_initiated_bearer_deletion(
+    ctx: &crate::context::MmeContext,
+    mme_s11_teid: u32,
+    raw: &[u8],
+) -> DeleteBearerAction {
+    let ebis = delete_bearer_request_ebis(raw);
+    let dedicated = names_dedicated_bearers(raw);
+    let lbi = (!dedicated).then(|| ebis.first().copied()).flatten();
+    let Some(mme_ue_id) = ctx.mme_ue_find_by_s11_local_teid(mme_s11_teid) else {
+        return DeleteBearerAction::NoContext { sgw_teid: 0, lbi };
+    };
+    let Some(mme_ue) = ctx.mme_ue_find_by_id(mme_ue_id) else {
+        return DeleteBearerAction::NoContext { sgw_teid: 0, lbi };
+    };
+    let sgw_teid = ctx
+        .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
+        .map(|s| s.sgw_s11_teid)
+        .unwrap_or(0);
+
+    if let Some(lbi) = lbi {
+        // The PDN connection whose default (first) bearer is the LBI.
+        let sess = mme_ue.sess_list.iter().copied().find(|sess_id| {
+            ctx.sess_find_by_id(*sess_id)
+                .and_then(|s| s.bearer_list.first().copied())
+                .and_then(|b| ctx.bearer_find_by_id(b))
+                .is_some_and(|b| b.ebi == lbi)
+        });
+        let Some(sess_id) = sess else {
+            return DeleteBearerAction::NoContext {
+                sgw_teid,
+                lbi: Some(lbi),
+            };
+        };
+        if mme_ue.sess_list.len() <= 1 {
+            let cause = message_cause(raw);
+            let detach_type = if cause == Some(GTP_CAUSE_REACTIVATION_REQUESTED) {
+                crate::emm_build::DetachTypeToUe::ReAttachRequired
+            } else {
+                crate::emm_build::DetachTypeToUe::ReAttachNotRequired
+            };
+            log::warn!(
+                "[{}] Delete Bearer Request (cause {cause:?}) for the default bearer of the last \
+                 PDN connection (LBI {lbi}): MME-initiated detach, {detach_type:?} (TS 23.401 \
+                 §5.4.4.1, §5.3.8.3)",
+                mme_ue.imsi_bcd
+            );
+            return DeleteBearerAction::DetachUe {
+                mme_ue_id,
+                sgw_teid,
+                lbi,
+                detach_type,
+            };
+        }
+        if let Some(sess) = ctx.sess_find_by_id(sess_id) {
+            for b in &sess.bearer_list {
+                ctx.bearer_remove(*b);
+            }
+        }
+        ctx.sess_remove(sess_id);
+        if let Some(ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
+            ue.sess_list.retain(|id| *id != sess_id);
+        }
+        log::warn!(
+            "[{}] PDN connection LBI {lbi} deleted by the gateway and in this MME; the UE is not \
+             told: ESM DEACTIVATE EPS BEARER CONTEXT REQUEST is not implemented here",
+            mme_ue.imsi_bcd
+        );
+        return DeleteBearerAction::PdnDeletedLocally { sgw_teid, lbi };
+    }
+
+    let mut deleted = Vec::new();
+    for ebi in &ebis {
+        let Some(bearer_id) = ctx.bearer_find_by_ebi(mme_ue_id, *ebi) else {
+            continue;
+        };
+        if let Some(bearer) = ctx.bearer_find_by_id(bearer_id) {
+            if let Some(sess) = ctx.sess_pool.write().unwrap().get_mut(&bearer.sess_id) {
+                sess.bearer_list.retain(|id| *id != bearer_id);
+            }
+        }
+        ctx.bearer_remove(bearer_id);
+        deleted.push(*ebi);
+    }
+    if deleted.is_empty() {
+        return DeleteBearerAction::NoContext {
+            sgw_teid,
+            lbi: None,
+        };
+    }
+    log::warn!(
+        "[{}] dedicated bearers {deleted:?} deleted by the gateway and in this MME; the UE is \
+         not told: ESM DEACTIVATE EPS BEARER CONTEXT REQUEST is not implemented here",
+        mme_ue.imsi_bcd
+    );
+    DeleteBearerAction::BearersDeletedLocally {
+        sgw_teid,
+        ebis: deleted,
     }
 }
 
@@ -2870,5 +3098,207 @@ mod tests {
             crate::nas_path::GtpCreateAction::InAttachRequest,
         );
         assert!(!esm.is_empty(), "it must still produce a message");
+    }
+}
+
+/// #688: a PGW-initiated Delete Bearer Request is decided and answered.
+#[cfg(test)]
+mod pgw_initiated_delete_bearer_tests {
+    use super::*;
+    use crate::context::MmeContext;
+    use crate::emm_build::DetachTypeToUe;
+    use nextgcore_gtp::v2::ie::Gtp2Ie;
+    use nextgcore_gtp::v2::{Gtp2Header, Gtp2IeType, Gtp2Message};
+
+    fn ctx() -> MmeContext {
+        let ctx = MmeContext::new();
+        ctx.init();
+        ctx
+    }
+
+    /// An attached, connected UE with one PDN connection per entry of `default_ebis`.
+    fn ue(ctx: &MmeContext, default_ebis: &[u8]) -> (u64, u32) {
+        let enb_id = ctx.enb_add("127.0.0.1:36412".parse().unwrap());
+        let enb_ue_id = ctx.enb_ue_add(enb_id, 100);
+        let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
+        ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
+        ctx.set_sgw_s11_teid_for_ue(mme_ue_id, 0x5ca1);
+        for (pti, ebi) in default_ebis.iter().enumerate() {
+            let sess_id = ctx.sess_add(mme_ue_id, pti as u8 + 1);
+            let bearer_id = ctx.bearer_add(sess_id, mme_ue_id);
+            ctx.bearer_pool
+                .write()
+                .unwrap()
+                .get_mut(&bearer_id)
+                .unwrap()
+                .ebi = *ebi;
+            ctx.sess_pool
+                .write()
+                .unwrap()
+                .get_mut(&sess_id)
+                .unwrap()
+                .bearer_list
+                .push(bearer_id);
+            ctx.mme_ue_pool
+                .write()
+                .unwrap()
+                .get_mut(&mme_ue_id)
+                .unwrap()
+                .sess_list
+                .push(sess_id);
+        }
+        let teid = ctx.mme_ue_find_by_id(mme_ue_id).unwrap().mme_s11_teid;
+        (mme_ue_id, teid)
+    }
+
+    /// Delete Bearer Request naming `lbi` (instance 0) with `cause`.
+    fn dbr_lbi(teid: u32, lbi: u8, cause: Option<u8>) -> Vec<u8> {
+        let mut m = Gtp2Message::new(Gtp2Header::new(
+            crate::s11_build::message_type::DELETE_BEARER_REQUEST,
+            teid,
+            0x688,
+        ));
+        m.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Ebi as u8, 0, &[lbi]));
+        if let Some(c) = cause {
+            m.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Cause as u8, 0, &[c, 0]));
+        }
+        m.encode().to_vec()
+    }
+
+    #[test]
+    fn the_default_bearer_of_the_last_pdn_with_reactivation_requested_detaches_re_attach_required()
+    {
+        let ctx = ctx();
+        let (mme_ue_id, teid) = ue(&ctx, &[5]);
+        let action = network_initiated_bearer_deletion(
+            &ctx,
+            teid,
+            &dbr_lbi(teid, 5, Some(GTP_CAUSE_REACTIVATION_REQUESTED)),
+        );
+        assert_eq!(
+            action,
+            DeleteBearerAction::DetachUe {
+                mme_ue_id,
+                sgw_teid: 0x5ca1,
+                lbi: 5,
+                detach_type: DetachTypeToUe::ReAttachRequired,
+            }
+        );
+    }
+
+    #[test]
+    fn another_cause_detaches_re_attach_not_required() {
+        let ctx = ctx();
+        let (_, teid) = ue(&ctx, &[5]);
+        let action = network_initiated_bearer_deletion(&ctx, teid, &dbr_lbi(teid, 5, Some(16)));
+        assert!(matches!(
+            action,
+            DeleteBearerAction::DetachUe {
+                detach_type: DetachTypeToUe::ReAttachNotRequired,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_pdn_that_is_not_the_last_is_deleted_without_a_detach() {
+        let ctx = ctx();
+        let (mme_ue_id, teid) = ue(&ctx, &[5, 6]);
+        let action = network_initiated_bearer_deletion(&ctx, teid, &dbr_lbi(teid, 6, Some(8)));
+        assert_eq!(
+            action,
+            DeleteBearerAction::PdnDeletedLocally {
+                sgw_teid: 0x5ca1,
+                lbi: 6
+            }
+        );
+        let ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert_eq!(ue.sess_list.len(), 1, "only LBI 6's PDN connection goes");
+        assert!(ctx.bearer_find_by_ebi(mme_ue_id, 6).is_none());
+        assert!(ctx.bearer_find_by_ebi(mme_ue_id, 5).is_some());
+    }
+
+    #[test]
+    fn an_unknown_lbi_or_teid_is_context_not_found() {
+        let ctx = ctx();
+        let (_, teid) = ue(&ctx, &[5]);
+        assert_eq!(
+            network_initiated_bearer_deletion(&ctx, teid, &dbr_lbi(teid, 9, Some(8))),
+            DeleteBearerAction::NoContext {
+                sgw_teid: 0x5ca1,
+                lbi: Some(9)
+            }
+        );
+        assert_eq!(
+            network_initiated_bearer_deletion(&ctx, 0xdead, &dbr_lbi(0xdead, 5, Some(8))),
+            DeleteBearerAction::NoContext {
+                sgw_teid: 0,
+                lbi: Some(5)
+            }
+        );
+    }
+
+    #[test]
+    fn a_dedicated_bearer_is_deleted_and_acknowledged() {
+        let ctx = ctx();
+        let (mme_ue_id, teid) = ue(&ctx, &[5]);
+        let sess_id = ctx.mme_ue_find_by_id(mme_ue_id).unwrap().sess_list[0];
+        let ded = ctx.bearer_add(sess_id, mme_ue_id);
+        ctx.bearer_pool.write().unwrap().get_mut(&ded).unwrap().ebi = 7;
+        let mut m = Gtp2Message::new(Gtp2Header::new(
+            crate::s11_build::message_type::DELETE_BEARER_REQUEST,
+            teid,
+            1,
+        ));
+        m.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Ebi as u8, 1, &[7]));
+        assert_eq!(
+            network_initiated_bearer_deletion(&ctx, teid, &m.encode()),
+            DeleteBearerAction::BearersDeletedLocally {
+                sgw_teid: 0x5ca1,
+                ebis: vec![7]
+            }
+        );
+        assert!(ctx.bearer_find_by_ebi(mme_ue_id, 7).is_none());
+    }
+
+    /// The response for an LBI request carries the Cause and the LBI, and no
+    /// Bearer Context (TS 29.274 Table 7.2.10.2-1).
+    #[test]
+    fn the_lbi_response_carries_cause_and_lbi() {
+        let rsp = crate::s11_build::build_delete_bearer_response_for_lbi(
+            0x5ca1,
+            5,
+            crate::s11_build::GtpCause::RequestAccepted,
+            0x688,
+        )
+        .unwrap();
+        assert_eq!(rsp.header.teid, Some(0x5ca1));
+        assert_eq!(rsp.header.sequence_number, 0x688);
+        assert_eq!(rsp.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value[0], 16);
+        assert_eq!(rsp.get_ie(Gtp2IeType::Ebi as u8, 0).unwrap().value[..], [5]);
+        assert!(rsp.get_ie(Gtp2IeType::BearerContext as u8, 0).is_none());
+    }
+
+    /// End to end through the S11 dispatch on the process-global context: the UE
+    /// is sent DETACH REQUEST (re-attach required) and its PDN is gone.
+    #[test]
+    fn a_dispatched_delete_bearer_request_detaches_the_ue() {
+        let _guard = crate::gtp_path::lock_s11();
+        let ctx = crate::context::mme_self();
+        let (mme_ue_id, teid) = ue(ctx, &[5]);
+        dispatch_initial(
+            &dbr_lbi(teid, 5, Some(GTP_CAUSE_REACTIVATION_REQUESTED)),
+            crate::s11_build::message_type::DELETE_BEARER_REQUEST,
+            0x688,
+            "127.0.0.1:2123".parse().unwrap(),
+        );
+        let ue = ctx
+            .mme_ue_find_by_id(mme_ue_id)
+            .expect("kept until DETACH ACCEPT");
+        assert!(ue.sess_list.is_empty());
+        assert!(ue.t3422.is_running());
+        let nas = ue.t3422.pkbuf.clone().unwrap();
+        assert_eq!(&nas[nas.len() - 5..nas.len() - 2], &[0x07, 0x45, 0x01]);
+        ctx.mme_ue_remove(mme_ue_id);
     }
 }
