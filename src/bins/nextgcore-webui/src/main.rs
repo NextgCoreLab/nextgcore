@@ -1881,6 +1881,34 @@ mod shipped_artefact_guards {
              explicit provisioning step"
         );
 
+        // #692: the Kind manifests and the Helm chart run their own copy of the
+        // init script, and kept seeding the account after #118 removed it here.
+        for manifest in [
+            "k8s/manifests/mongodb-init.yaml",
+            "deploy/helm/nextgcore/templates/mongodb-init.yaml",
+        ] {
+            let text = read(manifest);
+            assert!(
+                !text.contains("$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"),
+                "{manifest} must not seed the default admin password hash"
+            );
+            for write in [
+                "db.accounts.insert",
+                "db.accounts.updateOne",
+                "db.accounts.update(",
+            ] {
+                assert!(
+                    !text.contains(write),
+                    "{manifest} must not write any WebUI account ({write}); the first \
+                     admin is an explicit provisioning step"
+                );
+            }
+            assert!(
+                text.contains("db.accounts.createIndex"),
+                "{manifest} should still create the accounts uniqueness index"
+            );
+        }
+
         let server = read_code("webui/server/index.js");
         assert!(
             !server.contains("Account.register(newAccount"),

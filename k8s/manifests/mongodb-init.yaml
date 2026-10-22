@@ -18,21 +18,13 @@ data:
     db.sessions.createIndex({ "dnn": 1 });
     db.policyData.createIndex({ "supi": 1 });
     db.accounts.createIndex({ "username": 1 }, { unique: true });
-    // updateOne+upsert rather than insertOne: this Job is re-applied by every
-    // deploy.sh run, and insertOne against the existing unique index aborted
-    // the script with "E11000 duplicate key error ... username: admin",
-    // CrashLoopBackOff-ing the Job even though the seed data was already
-    // correct. $setOnInsert so a re-run never overwrites a changed password.
-    db.accounts.updateOne(
-        { username: "admin" },
-        { $setOnInsert: {
-            username: "admin",
-            password: "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",
-            roles: ["admin"],
-            created: new Date()
-        } },
-        { upsert: true }
-    );
+    // The subscriber seed below is updateOne+upsert rather than insertOne: this
+    // Job is re-applied by every deploy.sh run, and insertOne against an existing
+    // unique index aborts the script with "E11000 duplicate key error",
+    // CrashLoopBackOff-ing the Job even though the seed data was already correct.
+    // No WebUI account is seeded (#692, as #118 did for the compose stack):
+    // TS 33.117 4.2.3.4.2.2 forbids shipping a predefined privileged credential.
+    // Create the first admin with webui/server/bin/create-admin.js <username>.
     db.subscribers.updateOne({ imsi: "999700000000001" }, { $setOnInsert: {
         imsi: "999700000000001",
         msisdn: ["821000000001"],
