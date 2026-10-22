@@ -5712,13 +5712,19 @@ impl NgapServer {
     /// (TS 23.502 §4.2.3.2): every PSI in the Uplink data status that the AMF holds
     /// an SM context for is activated at its SMF, and the N2 SM information the SMF
     /// answers goes to the gNB in a PDU SESSION RESOURCE SETUP REQUEST.
+    ///
+    /// `accept` (the protected SERVICE ACCEPT) is carried in the first setup
+    /// request that goes out; returns whether it was, so the caller sends it on its
+    /// own otherwise.
     async fn activate_up_for_connected_service_request(
         &mut self,
         association_id: u64,
         amf_ue_ngap_id: u64,
         ran_ue_ngap_id: u32,
         nas: &[u8],
-    ) {
+        accept: &[u8],
+    ) -> bool {
+        let mut carried = false;
         // `nas` is the plain message: the Uplink NAS Transport path already
         // deciphered it, so a NAS message container needs no second pass.
         let ies = service_request_session_ies(nas, &|_value: &mut Vec<u8>| {});
@@ -5759,7 +5765,7 @@ impl NgapServer {
                 psi,
                 s_nssai.sst,
                 s_nssai.sd,
-                None,
+                (!carried).then_some(accept),
                 &transfer,
             ) else {
                 log::error!(
@@ -5768,13 +5774,17 @@ impl NgapServer {
                 continue;
             };
             match self.send_to_association(association_id, &setup_req).await {
-                Ok(()) => log::info!(
-                    "UE {amf_ue_ngap_id}: PSI {psi} user plane re-activated (connected-mode \
-                     Service Request): PDU Session Resource Setup Request sent"
-                ),
+                Ok(()) => {
+                    carried = true;
+                    log::info!(
+                        "UE {amf_ue_ngap_id}: PSI {psi} user plane re-activated (connected-mode \
+                         Service Request): PDU Session Resource Setup Request sent"
+                    )
+                }
                 Err(e) => log::warn!("UE {amf_ue_ngap_id}: PSI {psi} setup request not sent: {e}"),
             }
         }
+        carried
     }
 
     async fn handle_service_request_nas(
@@ -5829,24 +5839,38 @@ impl NgapServer {
         let Some(protected) = self.protect_nas(amf_ue_ngap_id, &plain) else {
             return Ok(());
         };
-        self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
-            .await?;
-        log::info!("Service Accept sent to UE {amf_ue_ngap_id} (protected)");
 
         // TS 23.502 §4.2.3.2 steps 4-12 for a UE that is already CM-CONNECTED: the
         // sessions in its Uplink data status get their user plane back --
         // Nsmf_PDUSession_UpdateSMContext (upCnxState ACTIVATING), then a PDU SESSION
-        // RESOURCE SETUP REQUEST carrying the SMF's N2 SM information. The CM-IDLE
-        // path does this through the Initial Context Setup; before this nothing did it
-        // here, so a UE whose gNB moved (new cell, same NG context) was accepted and
-        // left with no user plane (nextgsim #288).
-        self.activate_up_for_connected_service_request(
-            association_id,
-            amf_ue_ngap_id,
-            ran_ue_ngap_id,
-            nas,
-        )
-        .await;
+        // RESOURCE SETUP REQUEST carrying the SMF's N2 SM information (#682).
+        //
+        // The Service Accept rides INSIDE that setup request (its NAS-PDU, step 12),
+        // so the UE learns its service was accepted when the gNB has the bearer -- not
+        // before. Sent ahead of the setup, the Accept let the UE release its held
+        // uplink about 10 ms before the gNB had the session, and that packet was lost
+        // (devtest1: the first ping after a gNB move, #684).
+        let carried = self
+            .activate_up_for_connected_service_request(
+                association_id,
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                nas,
+                &protected,
+            )
+            .await;
+        if !carried {
+            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
+                .await?;
+        }
+        log::info!(
+            "Service Accept sent to UE {amf_ue_ngap_id} (protected{})",
+            if carried {
+                ", in the PDU Session Resource Setup Request"
+            } else {
+                ""
+            }
+        );
 
         // #74 criterion 5: CONNECTIVITY_STATE_REPORT, the CM-IDLE -> CM-CONNECTED half.
         // A Service Request is exactly that transition (TS 24.501 §5.6.1), which is the
