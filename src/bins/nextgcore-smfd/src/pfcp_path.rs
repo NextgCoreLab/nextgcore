@@ -652,6 +652,13 @@ pub async fn try_associate(client: &PfcpClient) -> Result<(), PfcpRequestError> 
     client.associate().await
 }
 
+/// The teardown reason of an Association Release this SMF initiated (graceful
+/// shutdown). Not a user-plane failure: the UPF is alive, and a restarted SMF
+/// re-associates with it. The sessions are NOT released through the UE for this
+/// one (#667): a UE told to come back at once would re-establish against the SMF
+/// that is shutting down, and lose the session it still had.
+pub const LOCAL_RELEASE_REASON: &str = "association release requested locally";
+
 impl PfcpClient {
     /// Create a client bound to an existing N4 socket.
     pub fn new(socket: Arc<UdpSocket>, peer: SocketAddr, node_ip: [u8; 4]) -> Self {
@@ -1140,8 +1147,7 @@ impl PfcpClient {
             .await;
 
         // Whether the peer answered or not, the association is gone locally
-        self.teardown_association("association release requested locally")
-            .await;
+        self.teardown_association(LOCAL_RELEASE_REASON).await;
 
         match result {
             Ok((_, body)) => match parse_cause(&body) {

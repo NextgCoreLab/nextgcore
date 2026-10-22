@@ -176,7 +176,9 @@ pub async fn notify_sessions_unrecoverable(reason: &str) -> usize {
         // so the user plane is rebuilt on the restarted UPF. A binding without the
         // UE's identity cannot be addressed that way, and gets the bare RELEASED
         // status the AMF was sent before #667.
-        let ue = lookup_ue(sm_context_ref);
+        // Not for this SMF's own graceful shutdown: see `LOCAL_RELEASE_REASON`.
+        let ue =
+            lookup_ue(sm_context_ref).filter(|_| reason != crate::pfcp_path::LOCAL_RELEASE_REASON);
         match ue {
             Some((supi, psi)) => {
                 log::warn!(
@@ -566,6 +568,28 @@ mod tests {
             binding_kept,
             "the SM context lives until the UE's RELEASE COMPLETE or T3592 exhaustion"
         );
+    }
+
+    /// #667: this SMF's own graceful shutdown (it released the association) does
+    /// NOT send the UE a release for reactivation; the AMF gets the plain RELEASED
+    /// status, as before #667.
+    #[tokio::test]
+    async fn a_local_association_release_does_not_reactivate_through_the_ue() {
+        let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = N4_TEST_LOCK.lock().await;
+        let sink = start_status_sink().await;
+        seed_session("restore-local-ref", 0x0193_0005, Some(&sink.uri));
+
+        let notified = notify_sessions_unrecoverable(crate::pfcp_path::LOCAL_RELEASE_REASON).await;
+
+        let t3592 = crate::cancel_gsm_timer_for_test("restore-local-ref");
+        forget_session("restore-local-ref");
+        sink.server.stop().await.expect("stop sink");
+
+        assert_eq!(notified, 1);
+        assert!(!t3592, "no release command, so no T3592");
+        let bodies = sink.bodies.lock().expect("bodies");
+        assert_eq!(bodies[0]["statusInfo"]["resourceStatus"], "RELEASED");
     }
 
     /// #667: when the UE never answers, the final T3592 expiry releases the session
