@@ -775,6 +775,11 @@ pub struct NgapServer {
     /// so the downlink FAR (gNB TEID) was installed on a stale session and
     /// downlink user traffic was silently black-holed.
     sm_context_refs: HashMap<(u64, u8), String>,
+    /// The SMF that holds each SM context, as (host, port) (#669). Written beside
+    /// `sm_context_refs` at Create; Update/Release go here rather than to
+    /// `SMF_SBI_ADDR`, which after an SMF restart may still route to the old pod
+    /// and with several SMFs names the wrong one.
+    sm_context_smfs: HashMap<(u64, u8), (String, u16)>,
     /// The target gNB's SCTP association for a UE with an N2 handover in flight,
     /// keyed by AMF-UE-NGAP-ID.
     ///
@@ -879,6 +884,7 @@ impl NgapServer {
             server_event_rx,
             ue_auth_state,
             sm_context_refs: HashMap::new(),
+            sm_context_smfs: HashMap::new(),
             handover_target_assoc: HashMap::new(),
             handover_target_transfers: HashMap::new(),
             eps_ho_in_flight: HashMap::new(),
@@ -5143,6 +5149,9 @@ impl NgapServer {
         for (psi, r) in moved {
             self.sm_context_refs.remove(&(old_id, psi));
             self.sm_context_refs.insert((new_id, psi), r);
+            if let Some(owner) = self.sm_context_smfs.remove(&(old_id, psi)) {
+                self.sm_context_smfs.insert((new_id, psi), owner);
+            }
         }
     }
 
@@ -5454,8 +5463,8 @@ impl NgapServer {
                 }
             }
         }
-        let (smf_host, smf_port) = Self::smf_sbi_target();
         for psi in &plan.release {
+            let (smf_host, smf_port) = self.smf_target_for(amf_ue_ngap_id, *psi);
             let sm_ref = held
                 .iter()
                 .find(|(p, _, _)| p == psi)
@@ -5479,6 +5488,7 @@ impl NgapServer {
         }
         let mut reactivation_failed: u16 = 0;
         for psi in &plan.activate {
+            let (smf_host, smf_port) = self.smf_target_for(amf_ue_ngap_id, *psi);
             let found = held.iter().find(|(p, _, _)| p == psi).cloned();
             let transfer = match &found {
                 Some((_, Some(r), _)) => {
@@ -6820,6 +6830,12 @@ impl NgapServer {
         )
         .await
         .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
+        // #669: a 5GSM message for an EXISTING session goes to the SMF holding its
+        // context; only a new establishment is a fresh selection.
+        let (smf_host, smf_port) = match self.sm_context_smfs.get(&(amf_ue_ngap_id, psi)) {
+            Some(owner) if sm_msg_type != 0xC1 => owner.clone(),
+            _ => (smf_host, smf_port),
+        };
 
         match sm_msg_type {
             // PDU Session Establishment Request
@@ -6950,6 +6966,15 @@ impl NgapServer {
                         // PSI and must not be reconstructed from one.
                         self.sm_context_refs
                             .insert((amf_ue_ngap_id, psi), resp.sm_context_ref.clone());
+                        // #669: and WHICH SMF holds it.
+                        match resp.smf_authority.as_deref().and_then(split_authority) {
+                            Some(owner) => {
+                                self.sm_context_smfs.insert((amf_ue_ngap_id, psi), owner);
+                            }
+                            None => {
+                                self.sm_context_smfs.remove(&(amf_ue_ngap_id, psi));
+                            }
+                        }
                         // #540: also the AmfSess the Namf N1N2MessageTransfer handler
                         // and the Service Request's re-activation look the session up
                         // in. Before this only `sm_context_refs` was written, so every
@@ -8309,8 +8334,8 @@ impl NgapServer {
         if refs.is_empty() {
             return;
         }
-        let (smf_host, smf_port) = Self::smf_sbi_target();
         for (psi, sm_ref) in refs {
+            let (smf_host, smf_port) = self.smf_target_for(amf_ue_ngap_id, psi);
             match crate::sbi_path::call_smf_deactivate_up_connection(&smf_host, smf_port, &sm_ref)
                 .await
             {
@@ -8685,6 +8710,12 @@ impl NgapServer {
         };
 
         for (psi, sm_context_ref) in &sm_context_refs {
+            // #669: each context is released at the SMF that holds it.
+            let (smf_host, smf_port) = self
+                .sm_context_smfs
+                .get(&(amf_ue_ngap_id, *psi))
+                .cloned()
+                .unwrap_or_else(|| (smf_host.clone(), smf_port));
             match crate::sbi_path::call_smf_release_sm_context(&smf_host, smf_port, sm_context_ref)
                 .await
             {
@@ -11382,6 +11413,16 @@ impl NgapServer {
     /// The SMF then sends PFCP Session Modification to the UPF to activate the DL FAR.
     /// The SMF's SBI host/port, from the environment (same lookup every N11 call
     /// site in this file uses).
+    /// The SMF holding UE `amf_ue_ngap_id`'s PSI `psi` SM context (#669), falling
+    /// back to [`Self::smf_sbi_target`] for a context created before this was
+    /// recorded.
+    fn smf_target_for(&self, amf_ue_ngap_id: u64, psi: u8) -> (String, u16) {
+        self.sm_context_smfs
+            .get(&(amf_ue_ngap_id, psi))
+            .cloned()
+            .unwrap_or_else(Self::smf_sbi_target)
+    }
+
     fn smf_sbi_target() -> (String, u16) {
         let host = std::env::var("SMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
         let port: u16 = std::env::var("SMF_SBI_PORT")
@@ -11472,7 +11513,7 @@ impl NgapServer {
             .sm_context_refs
             .get(&(amf_ue_ngap_id, pdu_session_id))
             .cloned()?;
-        let (host, port) = Self::smf_sbi_target();
+        let (host, port) = self.smf_target_for(amf_ue_ngap_id, pdu_session_id);
         match crate::sbi_path::call_smf_update_sm_context_n2(
             &host,
             port,
@@ -11531,7 +11572,7 @@ impl NgapServer {
             );
             return None;
         };
-        let (host, port) = Self::smf_sbi_target();
+        let (host, port) = self.smf_target_for(amf_ue_ngap_id, pdu_session_id);
         match crate::sbi_path::call_smf_update_sm_context_n2(
             &host,
             port,
@@ -11576,7 +11617,7 @@ impl NgapServer {
             return false;
         };
 
-        let (host, port) = Self::smf_sbi_target();
+        let (host, port) = self.smf_target_for(amf_ue_ngap_id, pdu_session_id);
         // The container is forwarded opaquely: the AMF never re-encodes N2 SM
         // information (TS 23.502).
         // Each container with its own n2SmInfoType (TS 29.502 §6.1.6.3.12, #525).
@@ -12187,7 +12228,7 @@ impl NgapServer {
                 );
                 continue;
             };
-            let (host, port) = Self::smf_sbi_target();
+            let (host, port) = self.smf_target_for(notify.amf_ue_ngap_id, item.pdu_session_id);
             match crate::sbi_path::call_smf_update_sm_context_n2(
                 &host,
                 port,
@@ -14162,6 +14203,15 @@ fn path_switch_failure(
         &released_items(sessions, cause)?,
         diagnostics,
     )
+}
+
+/// `host:port` -> (host, port); `None` when the port is missing or invalid.
+fn split_authority(authority: &str) -> Option<(String, u16)> {
+    let (host, port) = authority.rsplit_once(':')?;
+    Some((
+        host.trim_matches(['[', ']']).to_string(),
+        port.parse().ok()?,
+    ))
 }
 
 fn apply_user_location(
@@ -20924,6 +20974,37 @@ mod tests {
     }
 
     // ---- #406: the AMF learns a location from every message that reports one ----
+
+    /// #669: Update/Release for an SM context go to the SMF that created it, not to
+    /// `SMF_SBI_ADDR`; a context with no recorded owner keeps the old fallback.
+    #[tokio::test]
+    async fn sm_context_updates_go_to_the_smf_that_holds_the_context() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        ngap.sm_context_refs.insert((7_669_001, 1), "1".to_string());
+        ngap.sm_context_smfs
+            .insert((7_669_001, 1), ("10.10.18.36".to_string(), 7777));
+        assert_eq!(
+            ngap.smf_target_for(7_669_001, 1),
+            ("10.10.18.36".to_string(), 7777)
+        );
+        assert_eq!(
+            ngap.smf_target_for(7_669_001, 2),
+            NgapServer::smf_sbi_target(),
+            "no recorded owner: the environment fallback"
+        );
+        ngap.rekey_ue_sessions(7_669_001, 7_669_002);
+        assert_eq!(
+            ngap.smf_target_for(7_669_002, 1),
+            ("10.10.18.36".to_string(), 7777),
+            "the owner follows the UE across an AMF UE NGAP ID change"
+        );
+        assert_eq!(
+            split_authority("[::1]:7777"),
+            Some(("::1".to_string(), 7777))
+        );
+        assert_eq!(split_authority("smf"), None);
+    }
 
     /// #406 criteria 1-4: a real `UplinkNASTransport` refreshes BOTH the stored TAI and
     /// the stored cell identity, and the values are the ones the message carried.
