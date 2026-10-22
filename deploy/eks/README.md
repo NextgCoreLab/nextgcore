@@ -85,61 +85,44 @@ rollout wait alone cannot detect this.
 To pin a release or redeploy an older build, set `IMAGE_TAG` on **both**
 scripts; `IMAGE_TAG=latest` still works but warns.
 
-## Why the addressing needed real work
+## Peer addressing: Service names, re-resolved by the NFs
 
-The simulator's config types force literal IP addresses. From
-`nextgsim/nextgsim-common/src/config.rs`:
+Every peer is named by its Service, and the process that dials it re-resolves
+the name. So a single pod restart (new pod IP) recovers on its own, with no
+dependent restarted by hand:
 
-```rust
-pub struct AmfConfig {
-    pub address: IpAddr,   // <-- not String
-    pub port: u16,
-}
-pub struct GnbConfig {
-    pub link_ip: IpAddr,
-    pub ngap_ip: IpAddr,
-    pub gtp_ip: IpAddr,
-    pub upf_addr: Option<IpAddr>,
-}
-```
+| dialler -> peer | config | re-resolved |
+|---|---|---|
+| SMF -> UPF (PFCP) | `UPF_PFCP_ADDR=upf.<ns>.svc.cluster.local` | before every Association Setup attempt (#658) |
+| gNB -> AMF (NGAP) | `amf_configs[].address: amf.<ns>.svc...` | on every reconnect, and every 5 s (nextgsim #286) |
+| gNB -> UPF (GTP-U) | `upf_addr: upf.<ns>.svc...` | per PDU session (the SMF's UL tunnel address) |
+| UE -> gNB (RLS) | `gnb_search_list: [gnb.<ns>.svc...]` | at start, every 5 s, on losing the cell (nextgsim #286) |
+| SBI consumers -> producers | NRF discovery | on a transport failure, with a resend to the new instance (#664, #669) |
 
-A DNS name like `amf.nextg-system.svc.cluster.local` **fails to deserialize**
-into `IpAddr`, so the gNB cannot be handed a Service name. The UE is worse:
-`gnb_search_list` is `Vec<String>`, but
-`nextgsim-ue/src/rls/task.rs:104` does
+The amf, gnb and upf Services are **headless** (`patches/headless-services.yaml`)
+so the names resolve to pod IPs: that is what lets a moved pod be noticed, and
+it keeps kube-proxy out of the NGAP/RLS/GTP-U UDP paths.
 
-```rust
-.filter_map(|s| s.parse::<std::net::IpAddr>().ok())
-```
+The gNB's own `link_ip`/`ngap_ip`/`gtp_ip` are still written from the pod IP by
+an init container: the gNB advertises them in NGAP and GTP-U, and 0.0.0.0 is
+not an address a peer can answer.
 
-so a hostname is **silently discarded**. The UE then starts with an empty
-search list, finds no cell, and logs nothing that points at the config. That
-is the single most confusing failure mode in this deployment, and it is why
-the original manifests resolve names with `nslookup` + `sed` in an init
-container.
+What a restart of each pod does now (validated on devtest1):
+- **UPF**: the SMF re-resolves, sees the new Recovery Time Stamp, and releases
+  each PDU session with 5GSM #39 "reactivation requested" (#667); the AMF
+  delivers it (#666) and the UE re-establishes the session.
+- **SMF**: the PFCP association is not released on shutdown (#677), so the UPF
+  keeps forwarding while the new SMF associates.
+- **AMF**: the gNB notices the move, releases its UEs and re-runs NG Setup; the
+  UE's Service Request is rejected #9 and it registers again (#675).
+- **gNB**: the UE re-resolves the gNB name. A UE that attached to the OLD gNB pod
+  during a rolling update is still being fixed in nextgsim (see that repo's
+  open issues).
 
-### What this overlay changes
-
-The `nslookup | grep -A1 | awk` pipeline is replaced with a resolver that:
-
-1. Uses `getent hosts` instead of parsing `nslookup` output. `nslookup` output
-   format varies between busybox versions and the `grep -A1 'Name:'` pattern
-   breaks when the answer section is ordered differently.
-2. Resolves **headless Service** DNS to pod IPs rather than a ClusterIP. The
-   original pinned a ClusterIP into the config, which defeats kube-proxy for
-   the NGAP/GTP-U path and goes stale if the Service is recreated. For the RLS
-   and GTP-U paths that is not just inelegant: UDP flows to a ClusterIP are
-   load-balanced per-flow, and the RLS heartbeat reconciliation assumes a
-   stable peer.
-3. Writes `link_ip`/`ngap_ip`/`gtp_ip` from the pod's own IP via the downward
-   API, and fails loudly with a non-zero exit and a clear message if any
-   substitution did not happen.
-4. Validates that every substituted value parses as an IPv4 address before
-   the main container starts, so a resolution failure surfaces in the init
-   container instead of as a silent empty cell search 40 seconds later.
-
-The AMF, UPF and gNB get **headless** Services (`clusterIP: None`) in this
-overlay so their DNS resolves to pod IPs directly.
+Before these fixes the simulator's config types were `IpAddr` and the SMF's
+`UPF_PFCP_ADDR` a `SocketAddr`, so init containers wrote each peer's IP at pod
+start, and `deploy-eks.sh` had to restart dependents whose peer had moved
+(#436). A pod restarted later, outside the script, stranded its dependents.
 
 ## NGAP transport: UDP, deliberately
 
