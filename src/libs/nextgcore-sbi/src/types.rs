@@ -315,6 +315,52 @@ pub enum NfType {
 }
 
 impl NfType {
+    /// Inverse of [`Self::to_str`] (`"SMF"` -> `Smf`); `None` for an unknown name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "NRF" => Some(Self::Nrf),
+            "UDM" => Some(Self::Udm),
+            "AMF" => Some(Self::Amf),
+            "SMF" => Some(Self::Smf),
+            "AUSF" => Some(Self::Ausf),
+            "NEF" => Some(Self::Nef),
+            "PCF" => Some(Self::Pcf),
+            "SMSF" => Some(Self::Smsf),
+            "NSSF" => Some(Self::Nssf),
+            "UDR" => Some(Self::Udr),
+            "LMF" => Some(Self::Lmf),
+            "GMLC" => Some(Self::Gmlc),
+            "5G_EIR" => Some(Self::FiveGEir),
+            "SEPP" => Some(Self::Sepp),
+            "UPF" => Some(Self::Upf),
+            "N3IWF" => Some(Self::N3iwf),
+            "AF" => Some(Self::Af),
+            "UDSF" => Some(Self::Udsf),
+            "BSF" => Some(Self::Bsf),
+            "CHF" => Some(Self::Chf),
+            "NWDAF" => Some(Self::Nwdaf),
+            "PCSCF" => Some(Self::Pcscf),
+            "CBCF" => Some(Self::Cbcf),
+            "HSS" => Some(Self::Hss),
+            "UCMF" => Some(Self::Ucmf),
+            "SCP" => Some(Self::Scp),
+            "NSSAAF" => Some(Self::Nssaaf),
+            "MFAF" => Some(Self::Mfaf),
+            "MBSMF" => Some(Self::Mbsmf),
+            "MBSTF" => Some(Self::Mbstf),
+            "PANF" => Some(Self::Panf),
+            "TSCTSF" => Some(Self::Tsctsf),
+            "EASDF" => Some(Self::Easdf),
+            "EES" => Some(Self::Ees),
+            "DCCF" => Some(Self::Dccf),
+            "NSACF" => Some(Self::Nsacf),
+            "PKMF" => Some(Self::Pkmf),
+            "MNPF" => Some(Self::Mnpf),
+            "SMSF_5G" => Some(Self::Smsf5G),
+            _ => None,
+        }
+    }
+
     pub fn to_str(&self) -> &'static str {
         match self {
             Self::Nrf => "NRF",

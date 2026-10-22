@@ -3651,6 +3651,13 @@ pub fn handle_n1_n2_message_transfer_request(
             return send_error(500, "Internal Server Error", "context lock poisoned", None);
         };
         guard.sess_update(&sess);
+        // #666: hand a CM-CONNECTED UE's N1 / PDU Session Resource Release to the
+        // NGAP task, which owns the SCTP associations and sends it.
+        if let Ok(rsp) = &result {
+            if let Some(item) = rsp.deliver_now.clone() {
+                guard.connected_downlink_add(item);
+            }
+        }
     }
 
     match result {

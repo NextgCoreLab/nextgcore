@@ -356,6 +356,8 @@ pub async fn run() -> Result<()> {
     }
 
     // Discover UDM instances from NRF
+    // #664: an unreachable cached UDM is re-discovered and the request resent.
+    register_rediscovery_hook();
     if let Err(e) = discover_nf_from_nrf("UDM", "nudm-ueau").await {
         log::warn!("UDM discovery failed (will retry on demand): {e}");
     }
@@ -1548,9 +1550,20 @@ async fn send_udm_generate_auth_data(
 
     // Find UDM instance via cached discovery results or env var fallback
     let (host_owned, port);
-    let udm_instances = sbi_ctx
+    let mut udm_instances = sbi_ctx
         .find_nf_instances_by_service(nextgcore_sbi::types::SbiServiceType::NudmUeau)
         .await;
+    // #664: a cache miss (startup discovery failed, or the last UDM was evicted
+    // as unreachable) re-discovers before falling back to UDM_SBI_ADDR; before,
+    // discovery ran only at startup, so one eviction meant the env var forever.
+    if udm_instances.is_empty() && sbi_ctx.get_nrf_uri().await.is_some() {
+        if let Err(e) = discover_nf_from_nrf("UDM", "nudm-ueau").await {
+            log::warn!("UDM re-discovery failed: {e}");
+        }
+        udm_instances = sbi_ctx
+            .find_nf_instances_by_service(nextgcore_sbi::types::SbiServiceType::NudmUeau)
+            .await;
+    }
 
     if let Some(udm_instance) = udm_instances.first() {
         let udm_service = udm_instance
@@ -1972,6 +1985,9 @@ async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Resul
     // be selected; without it a cached peer was chosen for the process lifetime.
     let validity = nextgcore_sbi::context::search_result_validity(&json);
 
+    // #664: the answer REPLACES the cached profiles of the target type, so a
+    // profile the NRF dropped (a restarted UDM's old instance id) goes too.
+    let mut fresh: Vec<nextgcore_sbi::context::NfInstance> = Vec::new();
     // Parse NF instances from discovery response
     if let Some(nf_instances) = json.get("nfInstances").and_then(|v| v.as_array()) {
         for nf_json in nf_instances {
@@ -2030,17 +2046,50 @@ async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Resul
                 }
             }
 
-            sbi_ctx
-                .add_nf_instance_with_validity(instance, validity)
-                .await;
             log::info!(
                 "Discovered {nf_type_str} instance: {nf_id} (valid for {}s)",
                 validity.as_secs()
             );
+            fresh.push(instance);
+        }
+    }
+    match nextgcore_sbi::types::NfType::from_name(target_nf_type) {
+        Some(target) => {
+            let (mine, other): (Vec<_>, Vec<_>) =
+                fresh.into_iter().partition(|i| i.nf_type == target);
+            sbi_ctx.replace_nf_instances(target, mine, validity).await;
+            for instance in other {
+                sbi_ctx
+                    .add_nf_instance_with_validity(instance, validity)
+                    .await;
+            }
+        }
+        None => {
+            for instance in fresh {
+                sbi_ctx
+                    .add_nf_instance_with_validity(instance, validity)
+                    .await;
+            }
         }
     }
 
     Ok(())
+}
+
+/// Register [`discover_nf_from_nrf`] as the SBI client's re-discovery (#664).
+fn register_rediscovery_hook() {
+    nextgcore_sbi::context::global_context().set_rediscovery_hook(std::sync::Arc::new(
+        |nf_type, service| {
+            Box::pin(async move {
+                if let Err(e) = discover_nf_from_nrf(nf_type.to_str(), &service).await {
+                    log::warn!(
+                        "Re-discovery of {} ({service}) failed: {e}",
+                        nf_type.to_str()
+                    );
+                }
+            })
+        },
+    ));
 }
 
 /// Parse host and port from a URI string (e.g., "http://localhost:7777")

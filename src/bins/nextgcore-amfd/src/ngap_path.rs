@@ -943,6 +943,11 @@ impl NgapServer {
         // Dormant when none pending.
         self.process_network_deregs().await;
 
+        // Deliver every N1N2MessageTransfer the Namf handler queued for a
+        // CM-CONNECTED UE (#666): PDU SESSION RESOURCE RELEASE COMMAND and/or the
+        // N1 in a DOWNLINK NAS TRANSPORT. Dormant when none pending.
+        self.process_connected_downlinks().await;
+
         // Relay any PWS warning containers the Namf non-UE N2 transfer handler
         // enqueued (#396, TS 29.518 §5.2.2.4.1.3 / TS 38.413 §8.12) to the
         // NG-RAN nodes the consumer targeted. Dormant when none pending.
@@ -5598,35 +5603,58 @@ impl NgapServer {
         ran_ue_ngap_id: u32,
         paging: &crate::context::PagingContext,
     ) -> Result<()> {
-        if paging.pending_n2_release {
-            if let Some(psi) = paging.pdu_session_id {
+        self.deliver_n1_n2(
+            association_id,
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            paging.pdu_session_id,
+            paging.pending_n2_release,
+            paging.pending_n1.as_deref(),
+            paging.pending_n1_container_type,
+        )
+        .await
+    }
+
+    /// Send an N1N2MessageTransfer's payload to a UE that has an NG context: a
+    /// PDU SESSION RESOURCE RELEASE COMMAND for `psi` when `n2_release`, then the
+    /// N1 in a protected DOWNLINK NAS TRANSPORT. Shared by the paged path (#518)
+    /// and the CM-CONNECTED path (#666).
+    #[allow(clippy::too_many_arguments)]
+    async fn deliver_n1_n2(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        psi: Option<u8>,
+        n2_release: bool,
+        n1: Option<&[u8]>,
+        n1_container_type: u8,
+    ) -> Result<()> {
+        if n2_release {
+            if let Some(psi) = psi {
                 match crate::ngap_asn1::build_pdu_session_resource_release_command_asn1(
                     amf_ue_ngap_id,
                     ran_ue_ngap_id,
                     &[psi],
                 ) {
                     Some(cmd) => self.send_to_association(association_id, &cmd).await?,
-                    None => log::error!(
-                        "UE {amf_ue_ngap_id}: paged release of PSI {psi} did not encode"
-                    ),
+                    None => log::error!("UE {amf_ue_ngap_id}: release of PSI {psi} did not encode"),
                 }
             }
         }
-        if let Some(n1) = &paging.pending_n1 {
-            let plain = gmm_build::build_dl_nas_transport(
-                paging.pdu_session_id,
-                paging.pending_n1_container_type,
-                n1,
-                None,
-                None,
-            )
-            .unwrap_or_default();
-            if let Some(protected) = self.protect_nas(amf_ue_ngap_id, &plain) {
-                self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
-                    .await?;
-                log::info!(
-                    "UE {amf_ue_ngap_id}: paged N1 message delivered after the Service Request"
-                );
+        if let Some(n1) = n1 {
+            let plain = gmm_build::build_dl_nas_transport(psi, n1_container_type, n1, None, None)
+                .unwrap_or_default();
+            match self.protect_nas(amf_ue_ngap_id, &plain) {
+                Some(protected) => {
+                    self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
+                        .await?;
+                    log::info!("UE {amf_ue_ngap_id}: N1 message for PSI {psi:?} delivered");
+                }
+                None => log::warn!(
+                    "UE {amf_ue_ngap_id}: N1 message for PSI {psi:?} not sent: no NAS \
+                     security context"
+                ),
             }
         }
         Ok(())
@@ -7255,6 +7283,58 @@ impl NgapServer {
     /// DEREGISTRATION REQUEST + arm T3522 for each (TS 23.502 §4.2.2.3.3 /
     /// TS 24.501 §5.5.2.3). This is the (non-test) caller of
     /// [`Self::send_network_initiated_deregistration`].
+    /// Drain the connected-UE N1N2 queue (#666) and send each item to the UE's
+    /// serving gNB, in the shapes a paged transfer is delivered in after the
+    /// Service Request. An item for a UE the NGAP task no longer knows is dropped
+    /// with a warning: the SMF's T3591/T3592 retransmits, and an abandoned
+    /// procedure is the SMF's to clean up.
+    async fn process_connected_downlinks(&mut self) {
+        let pending = {
+            let ctx = crate::context::amf_self();
+            let Ok(guard) = ctx.read() else {
+                return;
+            };
+            guard.connected_downlink_drain()
+        };
+        for item in pending {
+            let Some(state) = self.ue_auth_state.get(item.amf_ue_ngap_id) else {
+                log::warn!(
+                    "N1N2 transfer for UE {} (PSI {}) dropped: no NG context",
+                    item.amf_ue_ngap_id,
+                    item.pdu_session_id
+                );
+                continue;
+            };
+            let (association_id, ran_ue_ngap_id) = (state.association_id, state.ran_ue_ngap_id);
+            if let Err(e) = self
+                .deliver_n1_n2(
+                    association_id,
+                    item.amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    Some(item.pdu_session_id),
+                    item.n2_release,
+                    item.n1.as_deref(),
+                    crate::gmm_handler::payload_container_type::N1_SM_INFORMATION,
+                )
+                .await
+            {
+                log::warn!(
+                    "N1N2 transfer for UE {} (PSI {}) not sent: {e}",
+                    item.amf_ue_ngap_id,
+                    item.pdu_session_id
+                );
+            } else {
+                log::info!(
+                    "UE {}: N1N2 transfer for PSI {} delivered (release command: {}, N1: {})",
+                    item.amf_ue_ngap_id,
+                    item.pdu_session_id,
+                    item.n2_release,
+                    item.n1.is_some()
+                );
+            }
+        }
+    }
+
     async fn process_network_deregs(&mut self) {
         let ctx = crate::context::amf_self();
         let pending = {

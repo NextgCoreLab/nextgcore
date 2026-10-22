@@ -38,6 +38,10 @@ pub mod gsm_cause {
     /// session in the ordinary course -- here, because the NG-RAN released it (#582).
     pub const REGULAR_DEACTIVATION: u8 = 36;
     pub const NETWORK_FAILURE: u8 = 38;
+    /// #39 Reactivation requested (TS 24.501 §9.11.4.2): the network releases the
+    /// session and asks the UE to establish it again -- here, because the UPF that
+    /// anchored it restarted and holds none of its state (#667, TS 23.527 §4.2).
+    pub const REACTIVATION_REQUESTED: u8 = 39;
     pub const PDU_SESSION_TYPE_IPV4_ONLY_ALLOWED: u8 = 50;
     /// #67 Insufficient resources for specific slice (TS 24.501 §9.11.4.2).
     /// Used when the NSACF declines a PDU-session admission for the S-NSSAI

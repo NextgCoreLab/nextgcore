@@ -2566,16 +2566,21 @@ mod tests {
         amf.stop().await.expect("stop amf");
 
         assert!(flushed, "the stale session is still flushed locally");
+        let t3592 = crate::cancel_gsm_timer_for_test("restart-signal-ref");
         assert_eq!(
             seen_posts, 1,
             "the AMF must be told the session is gone -- this is the notification the flush \
              used to replace with a log line"
         );
+        // #667: told by releasing the session through the UE for reactivation, which
+        // the AMF relays as the N1 release command and the N2 resource release.
         assert_eq!(
-            seen_bodies[0]["statusInfo"]["resourceStatus"], "RELEASED",
+            seen_bodies[0]["n2InfoContainer"]["smInfo"]["n2InfoContent"]["ngapIeType"],
+            "PDU_RES_REL_CMD",
             "body was {:?}",
             seen_bodies[0]
         );
+        assert!(t3592, "T3592 guards the release command");
     }
 
     /// The interlock's other side, at the wiring level: a UPF that did NOT
