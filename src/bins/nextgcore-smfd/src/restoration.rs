@@ -507,6 +507,7 @@ mod tests {
     #[tokio::test]
     async fn an_unrecoverable_session_is_released_through_the_ue_for_reactivation() {
         let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        let _timers = crate::GSM_TIMERS_TEST_LOCK.lock().await;
         // These tests seed and read `pfcp_sessions`, which `N4_TEST_LOCK` also
         // guards: `teardown_association` calls `clear_pfcp_sessions`, wiping the map
         // for the WHOLE process. Documented order: ambient first, N4 second.

@@ -5121,6 +5121,13 @@ static GSM_PROCEDURE_TIMERS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, GsmProcedureTimer>>,
 > = std::sync::OnceLock::new();
 
+/// Serialises tests that need a timer in `GSM_PROCEDURE_TIMERS` to survive:
+/// `gsm_timers_retransmit_then_exhaust` drives `expire_gsm_timers` with a clock an
+/// hour ahead, which retransmits and then EXHAUSTS every armed timer in the map,
+/// not just its own.
+#[cfg(test)]
+pub(crate) static GSM_TIMERS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn gsm_procedure_timers(
 ) -> &'static std::sync::Mutex<std::collections::HashMap<String, GsmProcedureTimer>> {
     GSM_PROCEDURE_TIMERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
@@ -10434,6 +10441,7 @@ mod tests {
 
     #[test]
     fn gsm_timers_retransmit_then_exhaust() {
+        let _timers = GSM_TIMERS_TEST_LOCK.blocking_lock();
         let reference = "n77-timer";
         // Clear any residue from another test using the same key.
         gsm_procedure_timers()

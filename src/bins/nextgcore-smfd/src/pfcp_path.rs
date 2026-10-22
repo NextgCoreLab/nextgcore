@@ -2495,6 +2495,7 @@ mod tests {
     async fn a_peer_restart_notifies_the_amf_before_flushing_the_session_map() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         let _map_guard = N4_TEST_LOCK.lock().await;
+        let _timers = crate::GSM_TIMERS_TEST_LOCK.lock().await;
 
         // Plaintext loopback AMF: declare the dev profile rather than inherit it.
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
