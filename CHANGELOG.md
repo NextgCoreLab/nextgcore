@@ -14,6 +14,198 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 
 _Nothing yet._
 
+## [0.2.0] — Unreleased (draft for operator review)
+
+Draft built from the PRs merged into `main` since the 0.1.0 tag (2026-07-02), cross-checked
+against `git log 0.1.0..main`. Every bullet cites its PR; the operator reviews this section
+before the tag. The validation line is filled from the release run, not carried over.
+
+### Highlights
+- **Generated ASN.1 codecs.** NGAP, S1AP, NRPPa, LPP, NR RRC and LTE RRC are generated from
+  the 3GPP ASN.1 by the NextgCoreLab/asn1-codegen compiler (pinned at v0.1.0) instead of being
+  hand-written (#440, #519, #520, #579). amfd, mmed, lmfd, smfd and mbsmfd encode and decode on
+  them (#417, #514, #515 stage PRs below).
+- **A real EPC.** mmed, sgwcd/sgwud, hssd and the PGW side of smfd complete an LTE attach with a
+  nextgsim eNB and UE, and the EPC stage of the E2E asserts the attach and a 0%-loss ping (#509).
+- **Paging and Service Request.** CM-IDLE UEs are paged; a Service Request from CM-IDLE or
+  CM-CONNECTED re-activates the user plane and delivers the paged N1 (#516, #521, #550, #652,
+  #683, #685).
+- **EPS↔5GS interworking over N26**, idle and connected mode, both directions (#409, #416, #474,
+  #477, #483, #598, #621, #624).
+- **RACS**: a new UCMF NF (`nextgcore-ucmfd`) and the AMF side of RACS (#569, #578, #603).
+- **EKS deployment** with `PROFILE=5g|epc|6g`, a UE-to-internet check and pod-restart recovery
+  (#127, #656, #660, #663, #681).
+- **Nightly gate** on the 0.2.0 UE flows: paging, idle uplink, de-registration, UDM
+  re-registration (#651).
+
+### Generated ASN.1 codecs
+- New crates `nextgcore-ngap-gen` (#440), `nextgcore-s1ap-gen` (#519), `nextgcore-nrppa-gen`
+  and `nextgcore-lpp-gen` (#520), plus the NR/LTE RRC generated crates used by ucmfd (#603);
+  the compiler is pinned to NextgCoreLab/asn1-codegen v0.1.0, no longer to a nextgsim commit (#579).
+- amfd moved procedure families onto the generated NGAP codec, applying TS 38.413 §10.3.4 error
+  handling: NG Setup (#443, #444), UE Context Release (#446), PDU Session Resource Release/Setup
+  (#448, #449), Initial Context Setup (#458), NAS transport (#504), Paging (#513), NG Reset
+  (#532), Overload Start/Stop (#534), the handover family (#539, #556, #562), Path Switch (#566),
+  RAN Configuration Update (#571), Error Indication (#572), MBS (#574), PWS, NRPPa transport and
+  PDU Session Resource Notify (#575). Production amfd no longer depends on `nextgcore-asn1c` (#576).
+- smfd (#590) and mbsmfd (#597) build their N2 SM transfers on the generated codec; consumers
+  outside amfd/smfd/mmed left the hand-written NGAP crate (#623).
+- mmed moved all of S1AP onto the generated codec, applying TS 36.413 §10.3.4: S1 Setup (#523),
+  NAS transport (#526), Initial Context Setup (#531), UE Context Release (#533), E-RAB management
+  (#535), Paging (#538), handover (#543, #551), Reset and Error Indication (#545), Path Switch
+  (#547), the rest (#552); the hand-written S1AP codec left production (#555).
+- lmfd uses generated NRPPa (#522, #524) and LPP with NR capabilities and the Rel-18 time arms (#544).
+- Codec fixes found on the way: extension bits, criticalities and object sets (#456, #463, #464,
+  #470), 16,383-octet ceiling lifted (#460), misdecoded eNB TargetID (#556), NG Reset
+  connection-list length form (#532).
+
+### LTE / EPC
+- S1-MME over SCTP (#153), uplink NAS dispatch into EMM/ESM (#154), a real NAS security context
+  (#155), EMM abnormal cases (#156), config parsing (#158).
+- S6a: freeDiameter `.conf` parsing (#159), AIR (#160), CLR/IDR (#161), ULR/ULA (#162, #163),
+  APN matching (#164), multiplexed instead of serialised (#149); HSS-initiated CLR/NOR/DSR/RSR
+  (#282); hssd opens the subscriber store at startup (#484).
+- Attach end to end: S11 endpoint on the shared GTP codec (#316), accept content from negotiated
+  state (#317), attach reaching S11 (#330), Create Session after the ULA with IMSI and PAA
+  (#486), K_eNB derivation (#487), Bearer Contexts and Modify Bearer Request (#499), EBI/ESM
+  octet packing (#498), ATTACH/PDN CONNECTIVITY REJECT on a refused Create Session (#494), S1
+  release after ATTACH REJECT (#473), protected downlink ESM (#503), and the E2E assertion (#509).
+- SGW/PGW: GTP-C path management and restart restoration (#214), Sxa results gating S11 and DDN
+  end to end (#312), S5/S8 on both legs (#318, #385, #388, #493, #507, #508), Create Session
+  retransmission and configured addresses (#489), Delete/Modify Bearer Command relayed (#634),
+  Commands closed on their triggered message (#611).
+- sgwud: real Sxa PFCP transport (#302), Error Indication, BAR/DDN buffering, End Marker, QER
+  (#216), path failure detection and Node Report (#218, #307), URR usage measurement and reports
+  (#266, #269, #427).
+- S1AP: missing elementary procedures (#168), setup failure/error indication handling (#165),
+  Paging (#166), S1 Status Transfer, data forwarding and Handover Cancel (#337), interworking
+  handover types and mapped QCI (#348); E-RAB Release/Modification Indication, Location
+  Reporting (#598); Change Notification Request toward the PGW (#616).
+- Diameter: application registry and CER/CEA negotiation (#150), Origin-State-Id and bounded
+  answers (#148, #286), peer-restart detection (#366), failover with the T flag (#332),
+  Message Length < 20 rejected (#617); pcrfd reacts to Event-Triggers and restarted PCEFs (#281,
+  #372); hssd/pcrfd parse their YAML Diameter config (#147).
+
+### Paging and Service Request
+- Page CM-IDLE UEs and let the Service Request answer the page (#516); deliver the paged N1 and
+  re-activate uplink sessions (#521); network-triggered service and idle-mode user-plane
+  resumption end to end (#550); a page after a Service Request from CM-IDLE reaches the UE (#652).
+- Service Request from CM-CONNECTED re-activates the user plane (#683), with the Service Accept
+  in the PDU Session Resource Setup Request (#685); N1N2MessageTransfer and Resource Release to a
+  CM-CONNECTED UE (#671); an integrity-protected Registration Request from CM-IDLE (#650).
+- NAS fixes behind these flows: Service Request ngKSI/service-type half-octet order (#553), TV
+  IEs and the ESR M-TMSI (#639), fixed-layout IEs within their length (#631), every decoder
+  returns `Err` on short input (#612).
+
+### EPS↔5GS interworking (N26)
+- Non-N26 seam (#345), EBI assignment over Namf and Mapped EPS bearer contexts (#290, #297).
+- Idle-mode 5GS→EPS context transfer (#409), connected-mode Forward Relocation (#416).
+- EPS→5GS handover with this AMF as target (#474), the PGW-C+SMF side (#477), 5GS→EPS Handover
+  Command with the F-Container type (#483), ueEpsPdnConnection consumed on CreateSMContext (#419).
+- mmed as EPS→5GS source (#598), data-forwarding tunnels and every EPS bearer as a QoS flow
+  (#621), Relocation Cancel (#624), N26/S10 transactions close (#632).
+
+### RACS (TS 23.501 §5.4.4.1a)
+- New NF `nextgcore-ucmfd` with Nucmf_UECapabilityManagement and Nucmf_Provisioning (#569);
+  TS 36.331/38.331 transcoding, paging derivation and delete notification (#603).
+- amfd: Nucmf client, NGAP UE Radio Capability ID mapping and info indication, IE 264, NAS ID (#578).
+
+### 5GC control plane (selected)
+- amfd: gNB-initiated NGAP dispatch arms (#120, #222), N2/Xn mobility control plane (#333) and
+  the {NH, NCC} chain (#213), the unwired 5GMM procedures (#354), one authoritative UE store
+  (#374) and one AmfContext (#371), UE context retrieval from the old AMF (#390), unauthenticated
+  emergency registration under operator policy (#389), PWS (#401, #405), Namf producer surface and
+  event fire points (#398, #402, #407, #410), UDM dereg-notify handling (#605, #626), AM policy
+  termination on every deregistration (#640), one UE id space (#644), several lock-order and
+  deadlock fixes (#604, #638, #646, #647).
+- smfd: UE-initiated 5GSM procedures (#224), SM context registration/404s/N2 handover/DDN paging
+  (#283), UDM interaction and event exposure (#292, #298), durable PFCP/binding/IP-pool store
+  (#279), URR quotas over N4 (#376), dual connectivity and Notify-released sessions (#633), UPF
+  restart releases with reactivation (#672), graceful restart keeps the PFCP association (#678),
+  `UPF_PFCP_ADDR` accepts a hostname (#665), subscribed default DNN (#265, #364).
+- udmd/udrd/pcfd/nrfd/nssfd/bsfd/nsacfd conformance passes (#219, #220, #227–#232, #237–#241,
+  #243, #253, #263, #311, #339, #350, #377); RFC 3339 migration onto `nextgcore_sbi::datetime`
+  (#246–#250).
+- Other NFs: nefd (#33, #199, #268), easdfd (#35, #277, #288), tsctsf (#37, #285, #322), lmfd
+  (#278, #324, #358, #559), eesd (#270, #274, #323), dccfd (#275), mbsmfd (#294, #300, #309, #379),
+  nwdafd (#169–#177, #198), seppd (#202, #271), scpd (#152, #255–#260).
+
+### SBI and security
+- Production SBI security profile on by default for the core NFs, outbound calls follow it (#188,
+  #189); fail closed when an OAuth2 token cannot be obtained (#181); UDR audience binding (#182).
+- nrfd: authenticated token requester (#185), persisted ES256 signing key (#184), x5c in the CCA
+  bound to the NF Instance ID (#395); identity from a verified TLS peer certificate (#195).
+- One NFProfile per startup (#394), deregister on shutdown and a validityPeriod-bounded discovery
+  cache (#244), re-register on a 404 heartbeat (#437), evict a cached profile on transport failure
+  (#438), redial a dead pooled connection (#565), resend to a peer restarted at a new address
+  (#670), route SM Context Update/Release to the SMF holding the context (#679).
+- §6.4.2.2 overload abatement by default (#383); OAuth2 overlay shows the secure posture (#391).
+- Hybrid X25519MLKEM768 TLS under the `pqc-tls` feature (#30).
+- webui no longer returns subscriber keys, authenticates `/api`, and has no default admin (#179);
+  SQN stored as BSON Int64 (#137).
+
+### Deployment
+- EKS overlay for the matched-pair E2E on a shared cluster (#127), image tags by git SHA (#146,
+  #431), rollout reporting (#439).
+- `deploy/eks` script interface `PROFILE=5g|epc|6g` (#656), `e2e-internet.sh` UE-to-internet
+  check (#660), re-runs keep live MongoDB storage and UPF data-plane modes (#663), 5G peers
+  addressed by Service name with the pinned-peer restarts dropped (#681).
+- k8s base advertises pod IPs and seeds idempotently (#135); the Helm chart renders a working
+  5GC control plane (#136); SBI-profile opt-out fixed in k8s/Helm (#432).
+- Docker: UDR durable state on by default (#194), PGW-C/PGW-U deployed for S5/S8 (#385), pinned
+  builder toolchain (#138), scoped build-context ignore (#140).
+
+### CI and release
+- Cross-repo E2E runs nightly (#378); a nightly gate on the 0.2.0 UE flows (#651).
+- Each E2E run records the (nextgcore, nextgsim) commit pair it validated (#425); a release is cut
+  by promoting an E2E-validated pair (#426).
+- A failed NF image build fails `docker-build` (#424); every cargo feature compiles and CI checks
+  all features (#466); EPC bring-up asserted on real readiness (#381).
+
+### Fuzzing
+- `src/fuzz` builds as its own workspace and every target drives the real decoders, including the
+  generated NGAP/S1AP/NRPPa/LPP codecs (#599).
+
+### SCTP
+- The patched pure-Rust `sctp-proto` lives in `src/vendor/sctp-proto` and the userspace backend
+  carries the PPID verbatim (#468); the kernel backend reassembles partial deliveries until
+  `MSG_EOR` (#517), pins its structs against libc's ABI (#429, #442); the dead userspace client
+  was removed and the kernel client kept (#441). Diameter over kernel SCTP behind a default-off
+  feature (#151).
+
+### 6G research prototypes (feature-gated, off by default)
+- HTTP/3 SBI transport spike (#28), ISAC sensing pipeline (#29), NTN timing advance (#31),
+  compute-aware UPF selection (#34), per-NF energy metrics (#36), intent-driven policy loop (#38),
+  network-state snapshot (#39), NWDAF inference with an ONNX subset (#40), slice-SLA observe loop (#41).
+
+### Removed
+- Hand-written codecs: E1AP/F1AP/XnAP modules in `nextgcore-asn1c` (#459), the hand-written LPP
+  codec and its UPER engine (#563), the hand-written NRPPa codec (#527), the hand-written S1AP
+  oracle (#560).
+- Dead code that read as working: the udmd state-machine SBI half (#262) and a second Nudm
+  implementation (#243), bsfd/nwdafd registries (#245), upfd rule and session models (#336, #342),
+  seppd security modules (#271).
+
+### Fixed (test isolation)
+- Process-global test locks declared beside their globals and fixtures in per-process temp dirs
+  (#314, #367, #369, #567, #568, #604, #610, #615, #642, #674).
+
+### Known limitations / deferred to next release
+Issues labelled `post-0.2.0` (open, as of this draft):
+- #686 amfd: an AMF restart loses every UE context (no AMF restoration); each UE re-registers.
+- #668 amfd: no NRF NF-status subscription; a changed peer profile is noticed only on failure.
+- #653 amfd: no service restoration after a radio link failure when the mobility update has no
+  follow-on request.
+- #641 mmed / #619 smfd (PGW-C): no dedicated EPS bearer activation.
+- #614, #607 sgwcd: Change Notification and bearer Responses are not relayed to the PGW.
+- #630 nextgcore-nas: a malformed optional IE fails the message instead of being ignored.
+- #655 pcfd, #654 ausfd: dead C-port handlers that would re-take a held context lock.
+- #643 clippy: 77 `await_holding_lock` warnings in amfd test code.
+- #417 amfd/smfd/mmed: the hand-written NGAP crate is not yet fully deleted.
+
+### Validation
+- _To be filled from the release run (`cargo test --workspace`, clippy, fmt, nightly E2E pair)._
+
 ## [0.1.0] — 2026-07-02
 
 First release aligning the core with the 3GPP Rel-15/16/17/18 procedures and adding a
