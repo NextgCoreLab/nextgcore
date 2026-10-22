@@ -105,6 +105,16 @@ fn notifiable_sessions() -> (Vec<(String, String)>, usize) {
     (notifiable, silent)
 }
 
+/// The SUPI and PSI a session's release command is addressed to, when the binding
+/// carries both.
+fn lookup_ue(sm_context_ref: &str) -> Option<(String, u8)> {
+    let global = smf_self();
+    let ctx = global.read().ok()?;
+    let bindings = ctx.policy_bindings.read().ok()?;
+    let b = bindings.get(sm_context_ref)?;
+    (!b.supi.is_empty() && b.psi != 0).then(|| (b.supi.clone(), b.psi))
+}
+
 /// Every `sm_context_ref` mapped to `upf_seid`.
 ///
 /// A scan rather than a second index: the N4 request path knows the SEID but not
@@ -162,13 +172,31 @@ pub async fn notify_sessions_unrecoverable(reason: &str) -> usize {
         silent
     );
     for (sm_context_ref, uri) in &notifiable {
-        log::warn!("releasing sm_context_ref={sm_context_ref} after {reason}; notifying {uri}");
-        crate::send_sm_context_status_notification(
-            Some(uri),
-            RESOURCE_STATUS_RELEASED,
-            Some(reason),
-        )
-        .await;
+        // #667: release the session through the UE, asking it to come back (#39),
+        // so the user plane is rebuilt on the restarted UPF. A binding without the
+        // UE's identity cannot be addressed that way, and gets the bare RELEASED
+        // status the AMF was sent before #667.
+        let ue = lookup_ue(sm_context_ref);
+        match ue {
+            Some((supi, psi)) => {
+                log::warn!(
+                    "releasing sm_context_ref={sm_context_ref} after {reason}: PDU Session \
+                     Release Command #39 (reactivation requested) to {supi} PSI {psi} via {uri}"
+                );
+                crate::release_for_reactivation(sm_context_ref, uri, &supi, psi).await;
+            }
+            None => {
+                log::warn!(
+                    "releasing sm_context_ref={sm_context_ref} after {reason}; notifying {uri}"
+                );
+                crate::send_sm_context_status_notification(
+                    Some(uri),
+                    RESOURCE_STATUS_RELEASED,
+                    Some(reason),
+                )
+                .await;
+            }
+        }
     }
     notifiable.len()
 }
@@ -357,6 +385,9 @@ mod tests {
         uri: String,
         bodies: Arc<Mutex<Vec<serde_json::Value>>>,
         posts: Arc<AtomicUsize>,
+        /// (path, [(content id, bytes)]) per request, for the multipart N1N2
+        /// transfer (#667).
+        requests: Arc<Mutex<Vec<(String, Vec<(String, Vec<u8>)>)>>>,
     }
 
     async fn start_status_sink() -> StatusSink {
@@ -367,14 +398,30 @@ mod tests {
         nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
         let bodies: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
         let posts = Arc::new(AtomicUsize::new(0));
+        let requests: Arc<Mutex<Vec<(String, Vec<(String, Vec<u8>)>)>>> =
+            Arc::new(Mutex::new(Vec::new()));
         let sink_bodies = Arc::clone(&bodies);
         let sink_posts = Arc::clone(&posts);
+        let sink_requests = Arc::clone(&requests);
         let (server, addr) =
             nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
                 let bodies = Arc::clone(&sink_bodies);
                 let posts = Arc::clone(&sink_posts);
+                let requests = Arc::clone(&sink_requests);
                 async move {
                     posts.fetch_add(1, Ordering::SeqCst);
+                    if let Ok(mut r) = requests.lock() {
+                        r.push((
+                            req.header.uri.clone(),
+                            req.http
+                                .parts
+                                .iter()
+                                .map(|p| {
+                                    (p.content_id.clone().unwrap_or_default(), p.data.to_vec())
+                                })
+                                .collect(),
+                        ));
+                    }
                     if let Some(c) = req.http.content.as_deref() {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(c) {
                             if let Ok(mut b) = bodies.lock() {
@@ -391,6 +438,7 @@ mod tests {
             uri: format!("http://127.0.0.1:{}/callbacks/sm-status", addr.port()),
             bodies,
             posts,
+            requests,
         }
     }
 
@@ -448,50 +496,96 @@ mod tests {
         }
     }
 
-    /// #193 criterion 1: a resource the SMF can no longer honour produces a
-    /// notification to its registered consumer, observed on the wire.
+    /// #193 criterion 1, as #667 refined it: a session on a restarted UPF is
+    /// released THROUGH THE UE, observed on the wire. The AMF gets one
+    /// N1N2MessageTransfer carrying the PDU SESSION RELEASE COMMAND with 5GSM cause
+    /// #39 (reactivation requested) and the N2 PDU Session Resource Release
+    /// Command, and T3592 guards it.
     ///
-    /// Asserted POSITIVELY on the body: `statusInfo.resourceStatus == "RELEASED"`
-    /// is only reachable from inside this path. A negative assertion (no error) is
-    /// satisfied by every path that never arrives.
+    /// Before #667 the AMF was sent only a RELEASED status notification: it dropped
+    /// its record and the UE kept a dead session forever.
     #[tokio::test]
-    async fn an_unrecoverable_session_notifies_the_amf_status_callback() {
+    async fn an_unrecoverable_session_is_released_through_the_ue_for_reactivation() {
         let _state = PROCESS_STATE_TEST_LOCK.lock().await;
         // These tests seed and read `pfcp_sessions`, which `N4_TEST_LOCK` also
         // guards: `teardown_association` calls `clear_pfcp_sessions`, wiping the map
-        // for the WHOLE process. Taking only the ambient lock left a window in which
-        // an `pfcp_path` sibling cleared the map between the seed and the assertion,
-        // which made `two_references_on_one_seid_are_both_reconciled` fail about 1
-        // whole-workspace run in 12. Documented order: ambient first, N4 second.
+        // for the WHOLE process. Documented order: ambient first, N4 second.
         let _n4 = N4_TEST_LOCK.lock().await;
         let sink = start_status_sink().await;
         seed_session("restore-notify-ref", 0x0193_0001, Some(&sink.uri));
 
         let notified = notify_sessions_unrecoverable("peer restarted").await;
 
+        let t3592_armed = crate::cancel_gsm_timer_for_test("restore-notify-ref");
+        let binding_kept = crate::lookup_policy_binding_for_test("restore-notify-ref");
         forget_session("restore-notify-ref");
         sink.server.stop().await.expect("stop sink");
 
-        assert_eq!(
-            notified, 1,
-            "the one session with a callback must be notified"
-        );
+        assert_eq!(notified, 1, "the one session with a callback is released");
         assert_eq!(
             sink.posts.load(Ordering::SeqCst),
             1,
             "exactly one POST, on the wire"
         );
+        let requests = sink.requests.lock().expect("requests");
+        let (path, parts) = &requests[0];
+        assert_eq!(
+            path, "/namf-comm/v1/ue-contexts/imsi-001010000000193/n1-n2-messages",
+            "Namf_Communication_N1N2MessageTransfer to the serving AMF"
+        );
+        let n1 = &parts
+            .iter()
+            .find(|(id, _)| id == "n1SmMsg")
+            .expect("the N1 part")
+            .1;
+        assert_eq!(
+            n1[..5],
+            [
+                0x2E,
+                7,
+                0,
+                crate::gsm_build::message_type::PDU_SESSION_RELEASE_COMMAND,
+                crate::policy::gsm_cause::REACTIVATION_REQUESTED
+            ],
+            "5GSM, PSI 7, PTI 0 (network-initiated), RELEASE COMMAND, cause #39"
+        );
+        assert!(
+            parts
+                .iter()
+                .any(|(id, data)| id == "n2SmInfo" && !data.is_empty()),
+            "the N2 PDU Session Resource Release Command transfer rides along"
+        );
         let bodies = sink.bodies.lock().expect("bodies");
-        let status = &bodies[0]["statusInfo"];
         assert_eq!(
-            status["resourceStatus"], "RELEASED",
-            "TS 29.502 §6.1.6.2.8: the AMF must be told the resource is gone, body was {:?}",
-            bodies[0]
+            bodies[0]["n2InfoContainer"]["smInfo"]["n2InfoContent"]["ngapIeType"],
+            "PDU_RES_REL_CMD"
         );
-        assert_eq!(
-            status["cause"], "peer restarted",
-            "the cause carries why, so the AMF's log says something an operator can act on"
+        assert!(t3592_armed, "T3592 guards the release command");
+        assert!(
+            binding_kept,
+            "the SM context lives until the UE's RELEASE COMPLETE or T3592 exhaustion"
         );
+    }
+
+    /// #667: when the UE never answers, the final T3592 expiry releases the session
+    /// locally and tells the AMF RELEASED (TS 24.501 §6.3.3.5).
+    #[tokio::test]
+    async fn an_unanswered_release_is_released_locally_and_the_amf_told() {
+        let _state = PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = N4_TEST_LOCK.lock().await;
+        let sink = start_status_sink().await;
+        seed_session("restore-t3592-ref", 0x0193_0004, Some(&sink.uri));
+
+        crate::abandon_gsm_procedure_for_test("restore-t3592-ref").await;
+
+        let binding_kept = crate::lookup_policy_binding_for_test("restore-t3592-ref");
+        forget_session("restore-t3592-ref");
+        sink.server.stop().await.expect("stop sink");
+
+        assert!(!binding_kept, "the SM context is gone");
+        let bodies = sink.bodies.lock().expect("bodies");
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0]["statusInfo"]["resourceStatus"], "RELEASED");
     }
 
     /// The other half of criterion 1, and the reason the count is reported

@@ -5257,6 +5257,152 @@ fn expire_gsm_timers(now: std::time::Instant) -> Vec<(String, GsmProcedureTimer,
     due
 }
 
+/// The final T3592 expiry of a network-initiated release (TS 24.501 §6.3.3.5):
+/// the SMF releases the PDU session locally and tells the AMF, exactly as a PDU
+/// SESSION RELEASE COMPLETE would have (#667). Without this an unanswered release
+/// left the SM context, and the AMF's record of it, behind for good. An exhausted
+/// T3591 (modification) abandons only the procedure; the session stays.
+async fn abandon_gsm_procedure(sm_context_ref: &str, timer_id: timer::SmfTimerId) {
+    if timer_id != timer::SmfTimerId::T3592 {
+        return;
+    }
+    let status_uri = release_sm_context_locally(sm_context_ref);
+    log::warn!("ref={sm_context_ref}: released locally after T3592 exhaustion");
+    send_sm_context_status_notification(status_uri.as_deref(), "RELEASED", None).await;
+}
+
+/// Test-only: whether a 5GSM procedure timer was running for `sm_context_ref`
+/// (cancelled as a side effect, so a test leaves no timer behind).
+#[cfg(test)]
+pub(crate) fn cancel_gsm_timer_for_test(sm_context_ref: &str) -> bool {
+    gsm_procedure_timers()
+        .lock()
+        .map(|mut t| t.remove(sm_context_ref).is_some())
+        .unwrap_or(false)
+}
+
+/// Test-only: whether a policy binding exists for `sm_context_ref`.
+#[cfg(test)]
+pub(crate) fn lookup_policy_binding_for_test(sm_context_ref: &str) -> bool {
+    lookup_policy_binding(sm_context_ref).is_some()
+}
+
+/// Test-only: drive a T3592 exhaustion for `sm_context_ref`.
+#[cfg(test)]
+pub(crate) async fn abandon_gsm_procedure_for_test(sm_context_ref: &str) {
+    abandon_gsm_procedure(sm_context_ref, timer::SmfTimerId::T3592).await;
+}
+
+/// Drop an SM context and its policy binding, returning the AMF's
+/// `smContextStatusUri` for the RELEASED notification.
+fn release_sm_context_locally(sm_context_ref: &str) -> Option<String> {
+    let removed = smf_self().read().ok().and_then(|ctx| {
+        ctx.policy_bindings
+            .write()
+            .ok()
+            .and_then(|mut b| b.remove(sm_context_ref))
+    });
+    if let Ok(context) = smf_self().read() {
+        if let Some(sess) = context.sess_find_by_sm_context_ref(sm_context_ref) {
+            context.sess_remove(sess.id);
+        }
+    }
+    removed.and_then(|b| b.sm_context_status_uri)
+}
+
+/// Release a PDU session whose UPF restarted, asking the UE to establish it again
+/// (#667, TS 23.527 §4.2, TS 23.502 §4.3.4.2): N1 PDU SESSION RELEASE COMMAND with
+/// 5GSM cause #39 "reactivation requested" plus the N2 PDU Session Resource Release
+/// Command, in one N1N2MessageTransfer, guarded by T3592.
+///
+/// The SM context lives until the UE's PDU SESSION RELEASE COMPLETE (the existing
+/// `/modify` path removes it and notifies the AMF) or T3592 exhaustion. Before
+/// #667 the SMF only sent the AMF a RELEASED status notification: the AMF dropped
+/// its record, the UE and the gNB were never told, and the UE kept a session whose
+/// tunnel ended at a UPF that no longer had it.
+pub(crate) async fn release_for_reactivation(
+    sm_context_ref: &str,
+    amf_uri: &str,
+    supi: &str,
+    psi: u8,
+) {
+    let n1_cmd = policy::build_release_command(
+        psi,
+        0, // network-initiated: no procedure transaction (TS 24.501 §6.3.3.2)
+        policy::gsm_cause::REACTIVATION_REQUESTED,
+    );
+    let n2 = build_release_command_transfer();
+    if let Ok(ctx) = smf_self().read() {
+        if let Some(mut sess) = ctx.sess_find_by_sm_context_ref(sm_context_ref) {
+            sess.up_cnx_state = context::UpCnxState::Deactivated;
+            ctx.sess_update(&sess);
+        }
+    }
+    arm_gsm_timer(
+        sm_context_ref,
+        timer::SmfTimerId::T3592,
+        &n1_cmd,
+        supi,
+        psi,
+        Some(amf_uri),
+    );
+    send_n1_n2_release_transfer(amf_uri, supi, psi, &n1_cmd, &n2).await;
+}
+
+/// N1N2MessageTransfer carrying an N1 5GSM message AND an N2 PDU Session Resource
+/// Release Command transfer (`ngapIeType` PDU_RES_REL_CMD, TS 29.518 §6.1.6.2.x).
+async fn send_n1_n2_release_transfer(amf_uri: &str, supi: &str, psi: u8, n1: &[u8], n2: &[u8]) {
+    use nextgcore_sbi::constants::content_type;
+    use nextgcore_sbi::message::{SbiPart, SbiRequest as SReq};
+
+    let Some((host, port)) = policy::split_host_port(amf_uri) else {
+        log::warn!("AMF URI '{amf_uri}' is not a valid URI — skipping N1N2MessageTransfer");
+        return;
+    };
+    let path = format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages");
+    let body = serde_json::json!({
+        "n1MessageContainer": {
+            "n1MessageClass": "SM",
+            "n1MessageContent": { "contentId": "n1SmMsg" }
+        },
+        "n2InfoContainer": {
+            "n2InformationClass": "SM",
+            "smInfo": {
+                "pduSessionId": psi,
+                "n2InfoContent": {
+                    "ngapIeType": "PDU_RES_REL_CMD",
+                    "ngapData": { "contentId": "n2SmInfo" }
+                }
+            }
+        },
+        "pduSessionId": psi,
+    });
+    let request = SReq::post(&path)
+        .with_body(body.to_string(), content_type::APPLICATION_JSON)
+        .with_part(SbiPart::with_content(
+            "n1SmMsg",
+            content_type::APPLICATION_5GNAS,
+            bytes::Bytes::copy_from_slice(n1),
+        ))
+        .with_part(SbiPart::with_content(
+            "n2SmInfo",
+            content_type::APPLICATION_NGAP,
+            bytes::Bytes::copy_from_slice(n2),
+        ));
+    let client = nextgcore_sbi::client::SbiClient::new(
+        nextgcore_sbi::security::sbi_peer_client_config(&host, port)
+            .with_connect_timeout(std::time::Duration::from_secs(2))
+            .with_request_timeout(std::time::Duration::from_secs(3)),
+    );
+    match client.send_request(request).await {
+        Ok(resp) => log::info!(
+            "N1N2MessageTransfer (release, SUPI {supi}, PSI {psi}) → {host}:{port}: status={}",
+            resp.status
+        ),
+        Err(e) => log::warn!("N1N2MessageTransfer (release) to {host}:{port} failed: {e}"),
+    }
+}
+
 /// Drive 5GSM timer expiry: retransmit what is due, abandon what is exhausted.
 ///
 /// Called from the main loop tick.
@@ -5287,6 +5433,7 @@ async fn run_gsm_timer_tick() {
                      the 5GSM command; abandoning the procedure",
                     entry.timer_id.name()
                 );
+                abandon_gsm_procedure(&sm_context_ref, entry.timer_id).await;
             }
         }
     }
@@ -5640,18 +5787,7 @@ async fn handle_n1_sm_message(sm_context_ref: &str, n1: &[u8]) -> SbiResponse {
             cancel_gsm_timer(sm_context_ref, timer::SmfTimerId::T3592);
             // The release procedure is finished: drop the context and tell the
             // AMF, which is what the SMF-initiated release path also does.
-            let removed = smf_self().read().ok().and_then(|ctx| {
-                ctx.policy_bindings
-                    .write()
-                    .ok()
-                    .and_then(|mut b| b.remove(sm_context_ref))
-            });
-            if let Ok(context) = smf_self().read() {
-                if let Some(sess) = context.sess_find_by_sm_context_ref(sm_context_ref) {
-                    context.sess_remove(sess.id);
-                }
-            }
-            let status_uri = removed.and_then(|b| b.sm_context_status_uri);
+            let status_uri = release_sm_context_locally(sm_context_ref);
             send_sm_context_status_notification(status_uri.as_deref(), "RELEASED", None).await;
             SbiResponse::with_status(204)
         }
