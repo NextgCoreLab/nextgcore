@@ -1589,7 +1589,9 @@ mod tests {
         // EPS: the PDN connection, with PSI 5 in the PCO.
         let (s5, pgw_c, answered_pco) = establish_pdn(Some(&pco_with_psi(5))).await;
         seed_dedicated_gbr_bearer(pgw_c.0);
-        std::env::set_var("SMF_INDIRECT_FORWARDING_TIMER_MS", "200");
+        // Long enough that the step-14 release cannot land before the execution check
+        // reads the UPF's modifications, which asserts exactly one (#900 review m1).
+        std::env::set_var("SMF_INDIRECT_FORWARDING_TIMER_MS", "1500");
         let answered_pco = answered_pco.expect("the PGW-C answers the PCO");
         assert_eq!(
             eps_iwk::pco_container(&answered_pco, false, eps_iwk::pco_container::NW_S_NSSAI),
@@ -1893,24 +1895,27 @@ mod tests {
             "Forward Relocation Complete Notification"
         );
 
-        // Execution step 8 at the UPF: DL FAR 2 → the target gNB, PDR 1 removed.
-        //
-        // #791: waited for, not read once. The FRCN above is the AMF's; the switch is
-        // the SMF's answer to the AMF's separate COMPLETED update, and TS 23.502
-        // §4.11.1.2.2.3 orders the FRCN (step 5) before that update (step 7), so the
-        // AMF need not wait for it. Under load the read used to win the race.
+        // Execution step 8 at the UPF: DL FAR 2 → the target gNB, PDR 1 removed. Read once:
+        // the AMF sends the FRCN only after the SMF answered COMPLETED, and the SMF answers
+        // after the switch reached the UPF. #791's `left: 0` was the SMF finding no N4
+        // session (an unlocked sibling had wiped `pfcp_sessions`, closed by #762), which no
+        // wait would recover; the diagnostics say which state it was in.
+        let mods = upf.modification_bodies();
+        assert_eq!(
+            mods.len(),
+            1,
+            "execution is one N4 Session Modification (#791 diagnostics: N4 messages {:?}, \
+             handover {:?})",
+            upf.seen(),
+            smf_self()
+                .read()
+                .ok()
+                .and_then(|c| c.sess_find_by_sm_context_ref(&ref_))
+                .map(|s| s.handover)
+        );
         let mut ohc = vec![0x01, 0x00]; // GTP-U/UDP/IPv4
         ohc.extend_from_slice(&GNB_DL.1.to_be_bytes());
         ohc.extend_from_slice(&GNB_DL.0);
-        let mods = poll_modifications(&upf, |m| m.iter().any(|b| n4_has(b, 10, &ohc))).await;
-        let switches: Vec<&Vec<u8>> = mods.iter().filter(|b| n4_has(b, 10, &ohc)).collect();
-        assert_eq!(
-            switches.len(),
-            1,
-            "execution is one N4 Session Modification: {} seen",
-            mods.len()
-        );
-        let mods = [switches[0].clone()];
         assert!(
             n4_has(&mods[0], 10, &ohc),
             "Update FAR to the target's DL N3 endpoint"
