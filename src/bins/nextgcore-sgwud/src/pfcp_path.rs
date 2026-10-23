@@ -1187,12 +1187,8 @@ impl SxaNode {
             // retransmitting: answer from the existing session rather than allocating a
             // second one for the same UE.
             Some(existing) => existing,
-            None => match ctx.sess_add(&cp_f_seid) {
-                Some(mut sess) => {
-                    sess.pfcp_node_id = node_id;
-                    ctx.sess_update(&sess);
-                    sess
-                }
+            None => match ctx.sess_add_for_node(&cp_f_seid, node_id) {
+                Some(sess) => sess,
                 None => {
                     log::error!(
                         "Cannot add SGW-U session for CP F-SEID 0x{:x}",
