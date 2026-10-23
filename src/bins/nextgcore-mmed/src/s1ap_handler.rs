@@ -25,8 +25,8 @@ use nextgcore_s1ap::{
     HandoverType as S1apHandoverType, InitialContextSetupFailure, InitialContextSetupResponse,
     InitialUeMessage, KillResponse, MmeStatusTransfer, NasNonDeliveryIndication, PathSwitchRequest,
     PathSwitchRequestFailure, Reset, ResetAcknowledge, ResetType, S1SetupRequest, S1apMessage,
-    SecurityContext, TargetId, TimeToWait, UeAmbr, UeCapabilityInfoIndication,
-    UeContextReleaseComplete, UeContextReleaseRequest, UlNasTransport, WriteReplaceWarningResponse,
+    SecurityContext, TargetId, TimeToWait, UeCapabilityInfoIndication, UeContextReleaseComplete,
+    UeContextReleaseRequest, UlNasTransport, WriteReplaceWarningResponse,
 };
 
 // ============================================================================
@@ -2353,10 +2353,8 @@ pub fn handle_handover_required_reporting(
         mme_ue_s1ap_id: target_mme_ue_s1ap_id,
         handover_type: msg.handover_type,
         cause: msg.cause,
-        ue_ambr: UeAmbr {
-            dl: mme_ue.ambr.downlink,
-            ul: mme_ue.ambr.uplink,
-        },
+        // #811: the UE-AMBR of the active APNs (TS 23.401 §4.7.3).
+        ue_ambr: s1ap_build::ue_ambr_of(ctx, &mme_ue),
         erab_list,
         source_to_target_container: msg.source_to_target_container.clone(),
         ue_security_capabilities: ue_security_capabilities_from(&mme_ue),
@@ -4167,22 +4165,33 @@ pub fn handle_erab_modification_indication(
         enb_ue_s1ap_id: msg.enb_ue_s1ap_id,
         ..Default::default()
     };
-    let mut ebis = Vec::new();
+    // #736: the new endpoints travel in the pending record and reach the
+    // bearer contexts only once the Serving GW accepts them.
+    let mut switched = Vec::new();
     for item in &msg.to_be_modified {
+        let ip = transport_address_to_ip(&item.transport_layer_address);
         match ctx.bearer_find_by_ebi(mme_ue_id, item.erab_id) {
-            Some(bearer_id) => {
-                if let Some(b) = ctx.bearer_pool.write().unwrap().get_mut(&bearer_id) {
-                    b.enb_s1u_teid = item.gtp_teid;
-                    b.enb_s1u_ip = transport_address_to_ip(&item.transport_layer_address);
-                }
-                ebis.push(item.erab_id);
+            Some(_) if item.gtp_teid == 0 || ip.ipv4.is_none() => {
+                // The S11 builder carries IPv4 S1-U F-TEIDs only.
+                confirm.failed.push(nextgcore_s1ap::ErabItem {
+                    erab_id: item.erab_id,
+                    cause: Cause::Transport(
+                        nextgcore_s1ap::CauseTransport::TransportResourceUnavailable,
+                    ),
+                });
             }
+            Some(_) => switched.push(crate::gtp_path::SwitchedBearer {
+                ebi: item.erab_id,
+                teid: item.gtp_teid,
+                ip,
+            }),
             None => confirm.failed.push(nextgcore_s1ap::ErabItem {
                 erab_id: item.erab_id,
                 cause: Cause::RadioNetwork(CauseRadioNetwork::UnknownERabId),
             }),
         }
     }
+    let ebis: Vec<u8> = switched.iter().map(|s| s.ebi).collect();
     confirm.modified = ebis.clone();
     if ebis.is_empty() {
         return erab_modification_confirm_now(enb_id, &confirm, notify);
@@ -4191,10 +4200,10 @@ pub fn handle_erab_modification_indication(
         enb_id,
         confirm: confirm.clone(),
         notify: notify.to_vec(),
+        mme_ue_id,
+        switched,
     };
-    match crate::gtp_path::send_modify_bearer_request_for_erab_modification(
-        ctx, mme_ue_id, &ebis, pending,
-    ) {
+    match crate::gtp_path::send_modify_bearer_request_for_erab_modification(ctx, pending) {
         Ok(seq) => {
             log::info!(
                 "E-RAB Modification Indication: Modify Bearer Request (seq={seq}) for EBIs \
@@ -4247,25 +4256,96 @@ fn erab_modification_confirm_now(
 }
 
 /// The E-RAB MODIFICATION CONFIRM a parked modification gets once the Modify
-/// Bearer Response arrives with GTP `cause` (TS 23.401 §5.4.7 step 5): the
-/// E-RABs as modified on "Request accepted" (16), else all failed.
+/// Bearer Response arrives (TS 23.401 §5.4.7 step 5, TS 36.413 §8.2.4.2).
+///
+/// Each E-RAB is decided by the Serving GW's answer for its bearer (Table
+/// 7.2.8-1, the rule the handover path uses): on Request accepted or accepted
+/// partially, a bearer the SGW accepted is written with its new eNB endpoint
+/// and listed modified, and every other one is listed failed; any other
+/// message cause fails them all. Nothing is written for a failed one (#736),
+/// and nothing is sent when the S1 association is gone.
 pub fn erab_modification_confirm(
+    ctx: &MmeContext,
     pending: crate::gtp_path::PendingErabModification,
-    cause: u8,
+    data: &crate::s11_handler::ModifyBearerResponseData,
 ) -> Option<S1apSend> {
-    let confirm = if cause == crate::s11_build::GtpCause::RequestAccepted as u8 {
-        pending.confirm
+    use crate::s11_build::GtpCause;
+    let accepted_at_all = data.cause == GtpCause::RequestAccepted as u8
+        || data.cause == GtpCause::RequestAcceptedPartially as u8;
+    let (accepted, refused) = if accepted_at_all {
+        crate::handover_switch::split_by_response(&pending.switched, data)
     } else {
         log::warn!(
-            "Modify Bearer Response cause {cause} refused the E-RAB modification; the confirm \
-             lists every E-RAB as failed to modify"
+            "Modify Bearer Response cause {} refused the E-RAB modification; the confirm lists \
+             every E-RAB as failed to modify",
+            data.cause
         );
-        switch_failed(
-            pending.confirm,
-            Cause::Misc(nextgcore_s1ap::CauseMisc::Unspecified),
+        (
+            Vec::new(),
+            pending.switched.iter().map(|s| s.ebi).collect::<Vec<_>>(),
         )
     };
-    erab_modification_confirm_now(pending.enb_id, &confirm, &pending.notify)
+    for s in &accepted {
+        if let Some(bearer_id) = ctx.bearer_find_by_ebi(pending.mme_ue_id, s.ebi) {
+            if let Some(b) = ctx.bearer_pool.write().unwrap().get_mut(&bearer_id) {
+                b.enb_s1u_teid = s.teid;
+                b.enb_s1u_ip = s.ip.clone();
+            }
+        }
+    }
+    let mut confirm = pending.confirm.clone();
+    confirm.modified = accepted.iter().map(|s| s.ebi).collect();
+    for erab_id in refused {
+        confirm.failed.push(nextgcore_s1ap::ErabItem {
+            erab_id,
+            cause: Cause::Transport(nextgcore_s1ap::CauseTransport::TransportResourceUnavailable),
+        });
+    }
+    confirm_on_live_association(ctx, &pending, &confirm)
+}
+
+/// N3 exhaustion of the Modify Bearer Request of an E-RAB modification: the
+/// Serving GW never answered, so nothing was switched. The eNB gets its
+/// E-RAB MODIFICATION CONFIRM with every E-RAB failed (#736, TS 36.413
+/// §8.2.4.2), and no endpoint is written.
+pub fn erab_modification_unanswered(
+    ctx: &MmeContext,
+    pending: crate::gtp_path::PendingErabModification,
+) -> Option<S1apSend> {
+    log::error!(
+        "UE {}: the Serving GW never answered the E-RAB modification's Modify Bearer Request; \
+         confirming every E-RAB as failed",
+        pending.mme_ue_id
+    );
+    let confirm = switch_failed(
+        pending.confirm.clone(),
+        Cause::Transport(nextgcore_s1ap::CauseTransport::TransportResourceUnavailable),
+    );
+    confirm_on_live_association(ctx, &pending, &confirm)
+}
+
+/// Send `confirm` only if the S1 association it answers still serves the UE.
+fn confirm_on_live_association(
+    ctx: &MmeContext,
+    pending: &crate::gtp_path::PendingErabModification,
+    confirm: &crate::s1ap_gen::ErabModificationConfirm,
+) -> Option<S1apSend> {
+    let live = ctx
+        .enb_ue_find_by_mme_ue_s1ap_id(confirm.mme_ue_s1ap_id)
+        .and_then(|id| ctx.enb_ue_find_by_id(id))
+        .is_some_and(|ue| {
+            ue.enb_id == pending.enb_id
+                && ue.enb_ue_s1ap_id == confirm.enb_ue_s1ap_id
+                && ue.mme_ue_id == pending.mme_ue_id
+        });
+    if !live {
+        log::warn!(
+            "UE {}: the S1 association of the E-RAB modification is gone; no confirm sent",
+            pending.mme_ue_id
+        );
+        return None;
+    }
+    erab_modification_confirm_now(pending.enb_id, confirm, &pending.notify)
         .into_iter()
         .next()
 }
@@ -4553,6 +4633,87 @@ mod tests {
         let ctx = MmeContext::new();
         ctx.init();
         ctx
+    }
+
+    /// #811: the HANDOVER REQUEST signals the UE-AMBR of the active APNs
+    /// (TS 23.401 §4.7.3), not the subscribed value as such.
+    #[test]
+    fn the_handover_request_carries_the_ue_ambr_of_the_active_apns() {
+        use nextgcore_s1ap_gen::generated as g;
+        let ctx = test_ctx();
+        let (_enb_id, enb_ue_id, mme_ue_id, mme_ue_s1ap_id) = add_ue(&ctx);
+        let source_enb = ctx.enb_ue_find_by_id(enb_ue_id).unwrap().enb_id;
+        let sess_id = ctx.sess_add(mme_ue_id, 1);
+        let bearer_id = ctx.bearer_add(sess_id, mme_ue_id);
+        {
+            let mut pool = ctx.bearer_pool.write().unwrap();
+            let b = pool.get_mut(&bearer_id).unwrap();
+            b.ebi = 5;
+            b.qos.qci = 9;
+            b.sgw_s1u_teid = 0x811;
+            b.sgw_s1u_ip.ipv4 = Some([10, 0, 0, 2]);
+            b.enb_s1u_teid = 0x118;
+        }
+        {
+            let mut pool = ctx.sess_pool.write().unwrap();
+            let sess = pool.get_mut(&sess_id).unwrap();
+            sess.bearer_list.push(bearer_id);
+            sess.ambr.downlink = 300_000;
+            sess.ambr.uplink = 200_000;
+        }
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&mme_ue_id)
+            .unwrap()
+            .sess_list
+            .push(sess_id);
+        let target = ctx.enb_add("127.0.0.1:36481".parse().unwrap());
+        ctx.enb_set_enb_id(target, 0x811);
+        let required = HandoverRequired {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id: 100,
+            handover_type: nextgcore_s1ap::HandoverType::IntraLte,
+            cause: Cause::RadioNetwork(CauseRadioNetwork::Unspecified),
+            target_id: TargetId::TargetEnbId {
+                global_enb_id: GlobalEnbId {
+                    plmn_identity: [0x13, 0x00, 0x14],
+                    enb_id: EnbId::Macro(0x811),
+                },
+                selected_tai: nextgcore_s1ap::Tai {
+                    plmn_identity: [0x13, 0x00, 0x14],
+                    tac: 1,
+                },
+            },
+            direct_forwarding_path_availability: None,
+            source_to_target_container: vec![0],
+        };
+        let out = handle_handover_required(&ctx, source_enb, &required);
+        let ambr = out
+            .iter()
+            .filter(|o| o.enb_id == target)
+            .find_map(|o| match nextgcore_s1ap_gen::decode(&o.pdu) {
+                Ok(g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+                    value: g::InitiatingMessageValue::Id_HandoverResourceAllocation(req),
+                    ..
+                })) => req
+                    .protocol_i_es
+                    .0
+                    .into_iter()
+                    .find_map(|ie| match ie.value {
+                        g::HandoverRequestProtocolIEs_EntryValue::Id_uEaggregateMaximumBitrate(
+                            a,
+                        ) => Some((
+                            a.u_eaggregate_maximum_bit_rate_dl.0,
+                            a.u_eaggregate_maximum_bit_rate_ul.0,
+                        )),
+                        _ => None,
+                    }),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("a HANDOVER REQUEST to the target: {out:?}"));
+        // add_ue subscribes 1 Gbit/s / 500 Mbit/s; the one active APN is lower.
+        assert_eq!(ambr, (300_000, 200_000));
     }
 
     /// Whether `out` is exactly one ERROR INDICATION to `enb_id` with the

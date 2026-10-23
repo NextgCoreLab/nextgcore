@@ -1922,6 +1922,54 @@ mod tests {
         (ctx, s.id)
     }
 
+    /// #866: the DATA PATH honours a flush in progress. A packet that reads a FAR
+    /// already switched to FORW while its buffer is still being flushed is queued
+    /// BEHIND the buffered packets (the flusher sends it, in order), not forwarded
+    /// past them; once the flush has ended it is forwarded directly.
+    #[test]
+    fn a_packet_on_a_forwarding_far_mid_flush_queues_behind_the_buffer() {
+        let ctx = sgwu_self();
+        let server = test_server(GTPV1_U_UDP_PORT);
+        let sess = ctx
+            .sess_add(&FSeid::with_ipv4(0x8660, Ipv4Addr::new(10, 86, 6, 1)))
+            .unwrap();
+        ctx.far_install(SgwuFar {
+            sess_id: sess.id,
+            far_id: 1,
+            apply_action: apply_action::FORW,
+            outer_header_creation: Some((0x866, Some(Ipv4Addr::new(127, 0, 0, 1)), None)),
+            buffered: vec![b"first".to_vec()],
+            flushing: true,
+            ..Default::default()
+        });
+        let pdr = SgwuPdr {
+            sess_id: sess.id,
+            pdr_id: 1,
+            source_interface: crate::sxa_handler::pfcp_interface::CORE,
+            local_teid: 0x8661,
+            far_id: Some(1),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            apply_far(&server, &pdr, b"second"),
+            GtpuRecvResult::Buffered
+        ));
+        assert_eq!(
+            ctx.far_find(sess.id, 1).unwrap().buffered,
+            vec![b"first".to_vec(), b"second".to_vec()],
+            "queued behind the buffered packet, in order"
+        );
+        // The flusher drains (and ends the flush); a later packet forwards directly.
+        assert_eq!(ctx.far_flush_step(sess.id, 1).len(), 2);
+        assert!(ctx.far_flush_step(sess.id, 1).is_empty());
+        assert!(matches!(
+            apply_far(&server, &pdr, b"third"),
+            GtpuRecvResult::Forwarded
+        ));
+        ctx.sess_remove(sess.id);
+    }
+
     /// The MBR token bucket: the first packet fits within one second of credit,
     /// and a packet far larger than the whole per-second allowance cannot.
     #[test]
