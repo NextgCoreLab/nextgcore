@@ -1726,6 +1726,13 @@ pub struct SmfContext {
     sess_index: AtomicU64,
     /// N4 SEID generator
     n4_seid_generator: AtomicU64,
+    /// This incarnation's boot epoch, with durable state (#718 review n3): one more
+    /// than the snapshot's, written back at once. The EPC SEIDs of this
+    /// incarnation start at `epoch << 32`, so they cannot meet those of an earlier
+    /// incarnation that crashed and left its EPC sessions in the PGW-U (EPC sessions
+    /// are not in the snapshot, so nothing else records how far it counted). 0
+    /// without durable state, where every SEID counts from 1 as before.
+    boot_epoch: AtomicU64,
     /// Next MBS session ID
     next_mbs_sess_id: AtomicUsize,
 
@@ -1893,6 +1900,7 @@ impl SmfContext {
             next_pf_id: AtomicUsize::new(1),
             sess_index: AtomicU64::new(1),
             n4_seid_generator: AtomicU64::new(1),
+            boot_epoch: AtomicU64::new(0),
             next_mbs_sess_id: AtomicUsize::new(1),
             max_num_of_ue: 0,
             max_num_of_sess: 0,
@@ -1978,7 +1986,7 @@ impl SmfContext {
     pub fn set_state_file(&mut self, path: std::path::PathBuf) -> Result<usize, SmfStateError> {
         use nextgcore_core::state_store::{Loaded, StateStore};
         self.state = StateStore::new(Some(path.clone()));
-        match self.state.load()? {
+        let restored = match self.state.load()? {
             Loaded::Snapshot(doc) => {
                 let restored = self.restore_from(&doc, &path);
                 if restored.is_err() {
@@ -1986,11 +1994,37 @@ impl SmfContext {
                     // caller that logged and carried on could otherwise overwrite a
                     // snapshot this build cannot fully read. Disable instead.
                     self.state = StateStore::disabled();
+                    return restored;
                 }
+                let previous = doc.get("bootEpoch").and_then(|v| v.as_u64()).unwrap_or(0);
+                self.begin_boot_epoch(previous);
                 restored
             }
-            Loaded::Absent => Ok(0),
-        }
+            Loaded::Absent => {
+                self.begin_boot_epoch(0);
+                Ok(0)
+            }
+        };
+        // Written now, not at the first mutation: a crash before any would
+        // otherwise let the next incarnation reuse this one's epoch.
+        self.persist();
+        restored
+    }
+
+    /// The largest boot epoch; EPC SEIDs stay below the 5G base (2^48).
+    const MAX_BOOT_EPOCH: u64 = 0xFFFF;
+
+    /// Start this incarnation's boot epoch after `previous` (#718 review n3) and
+    /// move the EPC SEID counter into it.
+    fn begin_boot_epoch(&self, previous: u64) {
+        let epoch = if previous >= Self::MAX_BOOT_EPOCH {
+            1
+        } else {
+            previous + 1
+        };
+        self.boot_epoch.store(epoch, Ordering::SeqCst);
+        self.n4_seid_generator
+            .fetch_max(epoch << 32, Ordering::SeqCst);
     }
 
     /// Whether durable state is armed. `false` is the shipped default.
@@ -2052,6 +2086,7 @@ impl SmfContext {
             "ipv4Allocations": ipv4_allocations,
             "upfRecoveryTimeStamps": upf_rts,
             "cpN4Seids": cp_n4_seids,
+            "bootEpoch": self.boot_epoch.load(Ordering::SeqCst),
         })
     }
 
@@ -3681,6 +3716,32 @@ mod tests {
         // An EPC session's SEID is past the inherited one restored for ref 7.
         let epc = ctx.sess_add_by_apn(ue.id, "internet", 6).expect("epc");
         assert!(epc.smf_n4_seid > 0x40, "EPC SEID {:#x}", epc.smf_n4_seid);
+    }
+
+    /// #718 review n3: EPC sessions are not in the snapshot, so after a crash with
+    /// durable state the PGW-U can still hold the previous incarnation's. Each boot
+    /// takes a new epoch, written at once, and its EPC SEIDs start inside it, so
+    /// they never meet the previous incarnation's.
+    #[test]
+    fn each_boot_with_durable_state_mints_epc_seids_in_a_new_epoch() {
+        let path = temp_state_path("n3-epoch");
+        let first = ctx_with_state(&path);
+        let ue = first.ue_add_by_imsi(b"001010000071830").expect("ue");
+        let a = first
+            .sess_add_by_apn(ue.id, "internet", 6)
+            .expect("sess")
+            .smf_n4_seid;
+        // A crash: nothing else was persisted after the boot.
+        drop(first);
+        let second = ctx_with_state(&path);
+        let ue = second.ue_add_by_imsi(b"001010000071830").expect("ue");
+        let b = second
+            .sess_add_by_apn(ue.id, "internet", 6)
+            .expect("sess")
+            .smf_n4_seid;
+        assert_eq!(a >> 32, 1, "first boot, epoch 1: {a:#x}");
+        assert_eq!(b >> 32, 2, "second boot, epoch 2: {b:#x}");
+        assert!(b < FIVE_G_CP_SEID_BASE, "EPC SEIDs stay below the 5G range");
     }
 
     /// A version-1 snapshot's sessions keep the legacy CP SEID (`ref | 0x1000`): the
