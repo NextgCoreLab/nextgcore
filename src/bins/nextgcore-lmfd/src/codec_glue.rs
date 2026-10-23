@@ -9,7 +9,7 @@
 //! - [`decode_nrppa_ecid_report`] — E-CID Measurement Report (procedure code 4),
 //!   decoded and adapted by [`crate::nrppa_uplink`] on the generated NRPPa codec:
 //!   serving-cell NG-RAN-CGI → `nr_cgi`; measuredResults CHOICE →
-//!   `timing_advance`, `aoa`, `rsrp`, `rsrq`.
+//!   `ecid_rtt_ns` (TADV, TS 36.133 §10.3.1), `aoa`, `rsrp`, `rsrq`.
 //!
 //! - [`lpp_multi_rtt_provide_to_measurements`] — ProvideLocationInformation →
 //!   nr-Multi-RTT list: `nr-UE-RxTxTimeDiff` k-arm → `ue_rx_tx_ns` (signed
@@ -130,7 +130,7 @@ fn empty_request_ies() -> lpp::RequestLocationInformation_r9_IEs {
 /// `ECID-RequestLocationInformation`): bit0 rsrpReq, bit1 rsrqReq, bit2 ueRxTxReq.
 ///
 /// ueRxTxReq is set (#715): the UE Rx–Tx time difference is the E-CID timing
-/// term (`timing_advance`), and a conformant UE does not report what it was not
+/// term (`ecid_rtt_ns`), and a conformant UE does not report what it was not
 /// asked for. Without it an LPP-only E-CID session had no timing term to solve.
 fn ecid_request_ies() -> lpp::RequestLocationInformation_r9_IEs {
     lpp::RequestLocationInformation_r9_IEs {
@@ -757,6 +757,17 @@ pub fn decode_nrppa_ecid_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasuremen
 // LPP E-CID adapter (A4)
 // ---------------------------------------------------------------------------
 
+/// N_TA,offset of an E-UTRA TDD cell, in T_s (TS 36.211 §8.1: 624 for frame
+/// structure type 2, 0 for type 1).
+const N_TA_OFFSET_TDD_TS: f64 = 624.0;
+
+/// Whether `earfcn` is a downlink EARFCN of an E-UTRA TDD band: bands 33..54,
+/// N_DL 36000..60304 (TS 36.101 Table 5.7.3-1; band 54 is 60255..60304). Every
+/// FDD band is below 36000 or, for bands 65 and up, at 65536 and above.
+fn is_eutra_tdd_earfcn(earfcn: u32) -> bool {
+    (36_000..=60_304).contains(&earfcn)
+}
+
 /// Map one LPP `MeasuredResultsElement` (TS 37.355 §6.5.3
 /// `ECID-SignalMeasurementInformation`) to a [`CellMeasurement`].
 ///
@@ -765,18 +776,49 @@ pub fn decode_nrppa_ecid_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasuremen
 /// | `phys_cell_id` (0..503)      | `nr_cgi`          | `"pci-<n>"` (matches the Multi-RTT / DL-TDOA adapters, so one seeded registry serves all methods) |
 /// | `rsrp_result` (0..97)        | `rsrp`            | `v − 140` → −140..−43 dBm (E-UTRA RSRP-Range, TS 36.133 §9.1.4; same convention as the NRPPa E-CID adapter in [`crate::nrppa_uplink`]) |
 /// | `rsrq_result` (0..34)        | `rsrq`            | raw 0..34 index (E-UTRA RSRQ-Range, TS 36.133 §9.1.7; same as the NRPPa adapter) |
-/// | `ue_rx_tx_time_diff` (0..4095) | `timing_advance` | raw UE Rx−Tx time-difference units — the E-CID ranging term `solve_ecid`'s TA ring consumes |
+/// | `ue_rx_tx_time_diff` (0..4095) | `ecid_rtt_ns` | TS 36.133 §9.1.9.3 bins (2 T_s to 4096 T_s, then 8 T_s), midpoint in ns, less N_TA,offset on a TDD cell; the last value is open-ended and dropped (#832) |
 fn measured_results_element_to_cell(elem: &lpp::MeasuredResultsElement) -> CellMeasurement {
+    // ARFCN-ValueEUTRA-v9a0 carries an EARFCN above 65535 when the root field
+    // holds maxEARFCN (TS 37.355).
+    let earfcn = elem
+        .extensions
+        .arfcn_eutra_v9a0
+        .as_ref()
+        .map(|v| v.0)
+        .unwrap_or(u32::from(elem.arfcn_eutra.0));
+    let rtt = elem.ue_rx_tx_time_diff.as_ref().and_then(|v| {
+        crate::positioning::eutra_time_report_to_ns(
+            u32::from(v.0),
+            crate::positioning::EUTRA_UE_RX_TX_MAX,
+        )
+        .map(|(mid, width)| {
+            // #865 review: on a TDD cell the UE Rx–Tx includes the uplink timing
+            // offset N_TA,offset = 624 T_s (TS 36.211 §8.1, frame structure type 2),
+            // which is not propagation. Removed, so the ring is not ~3 km too large.
+            if is_eutra_tdd_earfcn(earfcn) {
+                (
+                    (mid - N_TA_OFFSET_TDD_TS * crate::positioning::TS_NS).max(0.0),
+                    width,
+                )
+            } else {
+                (mid, width)
+            }
+        })
+    });
     CellMeasurement {
         nr_cgi: format!("pci-{}", elem.phys_cell_id.0),
         rsrp: elem.rsrp_result.as_ref().map(|v| i16::from(v.0) - 140),
         rsrq: elem.rsrq_result.as_ref().map(|v| i16::from(v.0)),
-        timing_advance: elem.ue_rx_tx_time_diff.as_ref().map(|v| u32::from(v.0)),
+        timing_advance: None,
         aoa: None,
         rtt_ns: None,
         rstd_ns: None,
         ue_rx_tx_ns: None,
         rstd_reference: None,
+        // TS 36.133 §9.1.9.3: the UE Rx–Tx time difference, in T_s bins. With the
+        // TA loop converged it is the UE's N_TA, the round trip (#832).
+        ecid_rtt_ns: rtt.map(|(mid, _)| mid),
+        ecid_rtt_width_ns: rtt.map(|(_, width)| width),
         gnb_rx_tx_ns: None,
         dl_prs_id: None,
         eutra: true,
@@ -842,7 +884,7 @@ fn nr_rsrp_dbm(v: u8) -> i16 {
 /// | `resultsSSB-Cell-r16.nr-RSRP-r16` (0..127), else the CSI-RS cell result | `rsrp` | `v − 156` dBm ([`nr_rsrp_dbm`]) |
 /// | `…nr-RSRQ-r16` (0..127) | `rsrq` | raw index (TS 38.133 §10.1.11.1), like the E-UTRA adapter's raw index |
 ///
-/// NR E-CID carries no UE timing quantity, so `timing_advance` stays empty. The
+/// NR E-CID carries no UE timing quantity, so `ecid_rtt_ns` stays empty. The
 /// timing term of an NR E-CID fix is the gNB's, from the NRPPa E-CID leg.
 fn nr_measured_results_element_to_cell(
     elem: &lpp::NR_MeasuredResultsElement_r16,
@@ -864,6 +906,8 @@ fn nr_measured_results_element_to_cell(
         rtt_ns: None,
         rstd_ns: None,
         ue_rx_tx_ns: None,
+        ecid_rtt_ns: None,
+        ecid_rtt_width_ns: None,
         gnb_rx_tx_ns: None,
         rstd_reference: None,
         dl_prs_id: None,
@@ -947,6 +991,8 @@ pub fn lpp_multi_rtt_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<Cell
                 // None for a saturated (open-ended) report value.
                 ue_rx_tx_ns: ue_rx_tx_to_signed_ns(rx_tx_report(&elem.nr_ue_rx_tx_time_diff_r16)),
                 rstd_reference: None,
+                ecid_rtt_ns: None,
+                ecid_rtt_width_ns: None,
                 gnb_rx_tx_ns: None,
                 dl_prs_id: Some(elem.dl_prs_id_r16.0),
                 eutra: false,
@@ -1018,6 +1064,8 @@ pub fn lpp_dl_tdoa_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMe
         rstd_ns: Some(0.0),
         ue_rx_tx_ns: None,
         rstd_reference: Some(reference),
+        ecid_rtt_ns: None,
+        ecid_rtt_width_ns: None,
         gnb_rx_tx_ns: None,
         dl_prs_id: Some(sig.dl_prs_reference_info_r16.dl_prs_id_r16.0),
         eutra: false,
@@ -1045,6 +1093,8 @@ pub fn lpp_dl_tdoa_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMe
                 .map(nrrstd_to_signed_ns),
             ue_rx_tx_ns: None,
             rstd_reference: Some(reference),
+            ecid_rtt_ns: None,
+            ecid_rtt_width_ns: None,
             gnb_rx_tx_ns: None,
             dl_prs_id: Some(elem.dl_prs_id_r16.0),
             eutra: false,
@@ -1212,7 +1262,7 @@ mod tests {
     ///   physCellId 42        -> `"pci-42"`
     ///   rsrp-Result 60       -> 60 − 140 = −80 dBm (E-UTRA RSRP-Range §9.1.4)
     ///   rsrq-Result 20       -> raw index 20 (E-UTRA RSRQ-Range §9.1.7)
-    ///   ue-RxTxTimeDiff 700  -> timing_advance 700 (the ranging term)
+    ///   ue-RxTxTimeDiff 700  -> ecid_rtt_ns 1401·T_s (TS 36.133 §9.1.9.3, #832)
     /// The exact UPER bytes are pinned so an encoder regression is caught, then
     /// decoded through the adapter and the adapted values are asserted.
     #[test]
@@ -1243,10 +1293,12 @@ mod tests {
         assert_eq!(cells[0].nr_cgi, "pci-42");
         assert_eq!(cells[0].rsrp, Some(-80), "rsrp-Result 60 -> 60-140 dBm");
         assert_eq!(cells[0].rsrq, Some(20), "rsrq-Result raw index");
+        // #832: TS 36.133 §9.1.9.3, value 700 is [1400, 1402) T_s: midpoint 1401 T_s.
+        assert_eq!(cells[0].timing_advance, None);
         assert_eq!(
-            cells[0].timing_advance,
-            Some(700),
-            "ue-RxTxTimeDiff -> TA term"
+            cells[0].ecid_rtt_ns,
+            Some(1401.0 * crate::positioning::TS_NS),
+            "ue-RxTxTimeDiff -> the E-CID round trip"
         );
         assert_eq!(cells[0].rtt_ns, None);
         assert_eq!(cells[0].rstd_ns, None);
@@ -1261,7 +1313,10 @@ mod tests {
             decode_lpp_provide_report(bytes).expect("decode via the provide entry point");
         assert_eq!(cells2.len(), 2);
         assert_eq!(cells2[0].nr_cgi, "pci-42");
-        assert_eq!(cells2[0].timing_advance, Some(700));
+        assert_eq!(
+            cells2[0].ecid_rtt_ns,
+            Some(1401.0 * crate::positioning::TS_NS)
+        );
     }
 
     /// An `ECID-Error`-only provide body (no signal measurements) adapts to an
@@ -1337,7 +1392,7 @@ mod tests {
         assert_eq!(cells.len(), 1, "one serving-cell entry");
         let c = &cells[0];
         assert_eq!(c.nr_cgi, "02f839-000000001");
-        assert_eq!(c.timing_advance, Some(500));
+        assert_eq!(c.ecid_rtt_ns, Some(1001.0 * crate::positioning::TS_NS));
         assert_eq!(c.aoa, Some(90.0));
         // Best RSRP item = 60 → 60 − 140 = −80 dBm.
         assert_eq!(c.rsrp, Some(-80));

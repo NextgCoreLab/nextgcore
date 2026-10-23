@@ -3711,42 +3711,49 @@ impl DataPlane {
             let new_dl_teid = dl_teid.unwrap_or(old_teid);
             let new_gnb_addr = gnb_addr.unwrap_or(old_addr);
 
-            // Update the downlink FAR's outer header creation if present
+            // #583: only the FARs the session's DOWNLINK (Core-source) PDRs use. A FAR
+            // toward the access side that an uplink-side PDR uses -- an indirect
+            // forwarding tunnel to the target NG-RAN -- has its own endpoint, which the
+            // session's DL tunnel moving must not overwrite.
+            let dl_fars: std::collections::HashSet<u32> = session
+                .pdrs
+                .read()
+                .unwrap()
+                .iter()
+                .filter(|p| p.source_interface == SRC_INTF_CORE)
+                .filter_map(|p| p.far_id)
+                .collect();
+            // #883: the FARs' endpoint and the session's tunnel move in ONE critical
+            // section (lock order `fars` -> `dl_tunnel`; nothing takes them the other
+            // way), so a downlink packet never pairs the new FAR endpoint with the old
+            // tunnel or the reverse.
+            let mut fars = session.fars.write().unwrap();
             if dl_teid.is_some() || gnb_addr.is_some() {
-                // #583: only the FARs the session's DOWNLINK (Core-source) PDRs use. A FAR
-                // toward the access side that an uplink-side PDR uses -- an indirect
-                // forwarding tunnel to the target NG-RAN -- has its own endpoint, which the
-                // session's DL tunnel moving must not overwrite.
-                let dl_fars: std::collections::HashSet<u32> = session
-                    .pdrs
-                    .read()
-                    .unwrap()
-                    .iter()
-                    .filter(|p| p.source_interface == SRC_INTF_CORE)
-                    .filter_map(|p| p.far_id)
-                    .collect();
-                let mut fars = session.fars.write().unwrap();
                 for far in fars.values_mut() {
                     if far.destination_interface == SRC_INTF_ACCESS && dl_fars.contains(&far.far_id)
                     {
                         if let Some(teid) = dl_teid {
                             far.ohc_teid = Some(teid);
                         }
-                        if let Some(addr) = gnb_addr {
-                            if let IpAddr::V4(ip) = addr.ip() {
-                                far.ohc_addr = Some(ip);
-                            }
+                        match gnb_addr.map(|a| a.ip()) {
+                            Some(IpAddr::V4(ip)) => far.ohc_addr = Some(ip),
+                            // #883: the FAR endpoint is IPv4-only. Keeping the stale IPv4
+                            // address would forward to the gNB the session just LEFT;
+                            // cleared, the downlink falls back to the session tunnel,
+                            // which carries the IPv6 address.
+                            Some(IpAddr::V6(_)) => far.ohc_addr = None,
+                            None => {}
                         }
                     }
                 }
             }
-
             // #822: moved IN PLACE. This used to `mem::take` the PDRs, FARs, QERs, URRs,
             // BARs and DL buffer out of the live session and re-add a rebuilt one, so a
             // packet already holding the old `Arc` found no rules (dropped, or forwarded
             // unmeasured) and a concurrent TERMR/QAURR found no session -- on every
             // DL-tunnel modification (handover, Service Request) under traffic.
             session.set_dl_tunnel(new_dl_teid, new_gnb_addr);
+            drop(fars);
             log::info!(
                 "Updated data plane session: SEID={upf_seid:#x}, DL_TEID=0x{new_dl_teid:x}, gNB={new_gnb_addr}"
             );
@@ -6426,6 +6433,55 @@ mod tests {
             "the next report carries the undelivered usage plus the new"
         );
         assert!(next[0].ur_seqn > lost[0].ur_seqn);
+    }
+
+    /// #883: a DL-tunnel modification to an IPv6 gNB clears the DL FAR's IPv4 endpoint,
+    /// so the downlink follows the session tunnel to the NEW gNB instead of forwarding
+    /// to the IPv4 gNB the session just left; an IPv4 move still updates the FAR.
+    #[test]
+    fn a_dl_tunnel_move_to_an_ipv6_gnb_does_not_leave_the_far_on_the_old_gnb() {
+        let dp = DataPlane::new(Arc::new(AtomicBool::new(false)));
+        dp.add_session_from_pfcp(
+            0x883,
+            0x1883,
+            Ipv4Addr::new(10, 45, 8, 83),
+            0x8831,
+            0x8832,
+            "127.0.0.1:2152".parse().unwrap(),
+            Some(5),
+            Some(9),
+        );
+        let session = dp.sessions.find_by_seid(0x883).expect("session");
+        let dl_far_id = session
+            .pdrs
+            .read()
+            .unwrap()
+            .iter()
+            .find(|p| p.source_interface == SRC_INTF_CORE)
+            .and_then(|p| p.far_id)
+            .expect("a downlink PDR with a FAR");
+        let far_addr = || session.fars.read().unwrap()[&dl_far_id].ohc_addr;
+
+        dp.update_session_from_pfcp(0x883, Some(0x1), Some("127.0.0.9:2152".parse().unwrap()));
+        assert_eq!(far_addr(), Some(Ipv4Addr::new(127, 0, 0, 9)));
+
+        let v6: SocketAddr = "[2001:db8::9]:2152".parse().unwrap();
+        dp.update_session_from_pfcp(0x883, Some(0x2), Some(v6));
+        assert_eq!(far_addr(), None, "no stale IPv4 endpoint left on the FAR");
+        assert_eq!(session.dl_tunnel(), (0x2, v6));
+        match session.apply_far(dl_far_id) {
+            FarDecision::Forward { ohc_teid, ohc_addr } => {
+                assert_eq!(ohc_teid, Some(0x2));
+                assert_eq!(
+                    ohc_addr
+                        .map(|ip| SocketAddr::new(IpAddr::V4(ip), GTPU_PORT))
+                        .unwrap_or(session.gnb_addr()),
+                    v6,
+                    "the downlink resolves to the new IPv6 gNB"
+                );
+            }
+            other => panic!("expected Forward, got {other:?}"),
+        }
     }
 
     /// #822: a DL-tunnel modification moves the tunnel IN PLACE. A packet that already
