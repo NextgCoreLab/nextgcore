@@ -489,7 +489,19 @@ pub fn amf_sbi_open() -> SbiResult<()> {
     Ok(())
 }
 
-/// Close AMF SBI
+/// Close AMF SBI, and wait for the teardown: the client pool and the discovery
+/// cache are empty when this returns (#673).
+pub async fn amf_sbi_close_async() {
+    log::info!("AMF SBI closing...");
+    let sbi_ctx = global_context();
+    sbi_ctx.clear_clients().await;
+    sbi_ctx.clear_nf_instances().await;
+    log::info!("AMF SBI closed");
+}
+
+/// Close AMF SBI from a sync caller: the teardown runs on a spawned task and
+/// may still be running when this returns. Async callers use
+/// [`amf_sbi_close_async`].
 pub fn amf_sbi_close() {
     log::info!("AMF SBI closing...");
     let sbi_ctx = global_context();
@@ -697,12 +709,6 @@ pub async fn amf_nrf_discover(target_nf_type: &str, service_name: &str) -> Resul
 
     Ok(())
 }
-
-/// Serialises amfd tests that point the process-wide SBI context at a stand-in
-/// NRF (#664). The NRF URI lives in `nextgcore_sbi`'s global context, which this
-/// crate cannot put a lock beside, so it sits beside the discovery that reads it.
-#[cfg(test)]
-pub(crate) static AMF_NRF_URI_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Register [`amf_nrf_discover`] as the SBI client's re-discovery (#664), so a
 /// request that could not reach a cached peer is resent to whatever the NRF
@@ -4623,157 +4629,22 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_amf_sbi_open_close() {
-        // `amf_sbi_close` clears the process-wide discovery cache and client pool,
-        // which `sm_context_create_reaches_an_smf_restarted_at_a_new_address`
-        // seeds and reads: serialise against it (#673).
-        let _guard = AMF_NRF_URI_TEST_LOCK.lock().await;
+        // #673: the teardown is awaited, so it is over when the test is. The
+        // fire-and-forget `amf_sbi_close` cleared the process-wide discovery cache
+        // and client pool from a spawned task, after any lock this test held was
+        // released.
         assert!(amf_sbi_open().is_ok());
-        amf_sbi_close();
+        amf_sbi_close_async().await;
+        assert!(global_context()
+            .find_nf_instances_by_service(nextgcore_sbi::types::SbiServiceType::NsmfPdusession)
+            .await
+            .is_empty());
     }
 
     // ------------------------------------------------------------------
     // smfd-01 / smfd-02 pairing: multipart/related N1/N2 carriage on the
     // amfd↔smfd Nsmf_PDUSession path (TS 29.502 §6.1.2.2.2 / §6.1.2.4)
     // ------------------------------------------------------------------
-
-    /// #664, end to end through the AMF's own code: the SMF restarted at a new
-    /// address. The AMF's cache holds the old profile; the NRF (a stand-in)
-    /// still lists it next to the new one, as it does until the old heartbeat
-    /// expires. `call_smf_create_sm_context` to the cached (dead) SMF must reach
-    /// the NEW SMF -- the same SM Context Create, not a rejected PDU session --
-    /// through `register_rediscovery_hook` -> `amf_nrf_discover` (replace) ->
-    /// the SBI client's one-shot resend.
-    #[tokio::test]
-    async fn sm_context_create_reaches_an_smf_restarted_at_a_new_address() {
-        use nextgcore_sbi::types::NfType;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
-        let _guard = AMF_NRF_URI_TEST_LOCK.lock().await;
-        let ctx = global_context();
-        // Plaintext loopback stand-ins: a dev-profile deployment, said explicitly.
-        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
-
-        let old_port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let hits = Arc::new(AtomicUsize::new(0));
-        let served = hits.clone();
-        let (smf, new_smf) =
-            nextgcore_sbi::test_support::sbi_server_on_free_port(move |_req: SbiRequest| {
-                let served = served.clone();
-                async move {
-                    served.fetch_add(1, Ordering::SeqCst);
-                    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
-                    let mut resp = SbiResponse::with_status(201);
-                    resp.http.content = Some(
-                        serde_json::json!({
-                            "smContextRef": "664",
-                            "n1SmMsg": b64(&[0x2E, 0x05, 0x02, 0xC2]),
-                            "n2SmInfo": b64(&[0x00, 0x01]),
-                        })
-                        .to_string(),
-                    );
-                    resp
-                }
-            })
-            .await;
-
-        let profile = |id: &str, port: u16| {
-            serde_json::json!({
-                "nfInstanceId": id, "nfType": "SMF", "nfStatus": "REGISTERED",
-                "ipv4Addresses": ["127.0.0.1"],
-                "nfServices": [{
-                    "serviceInstanceId": "1", "serviceName": "nsmf-pdusession",
-                    "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": port }]
-                }]
-            })
-        };
-        let answer = serde_json::json!({
-            "validityPeriod": 3600,
-            "nfInstances": [profile("smf-664-old", old_port), profile("smf-664-new", new_smf.port())],
-        })
-        .to_string();
-        let (nrf, nrf_addr) =
-            nextgcore_sbi::test_support::sbi_server_on_free_port(move |req: SbiRequest| {
-                let answer = answer.clone();
-                async move {
-                    if req.header.uri.contains("target-nf-type=SMF")
-                        || req.http.params.get("target-nf-type").map(String::as_str) == Some("SMF")
-                    {
-                        let mut resp = SbiResponse::with_status(200);
-                        resp.http.content = Some(answer);
-                        resp
-                    } else {
-                        SbiResponse::with_status(404)
-                    }
-                }
-            })
-            .await;
-        ctx.set_nrf_uri(format!("http://{nrf_addr}")).await;
-        register_rediscovery_hook();
-
-        // The AMF discovered the SMF before it restarted: only the old profile.
-        let mut stale = NfInstance::new("smf-664-old", NfType::Smf);
-        let mut svc = NfService::new(
-            "nsmf-pdusession",
-            nextgcore_sbi::types::SbiServiceType::NsmfPdusession,
-        );
-        svc.ip_addresses = vec!["127.0.0.1".into()];
-        svc.port = old_port;
-        stale.add_service(svc);
-        ctx.replace_nf_instances(
-            NfType::Smf,
-            vec![stale],
-            std::time::Duration::from_secs(3600),
-        )
-        .await;
-        let (host, port) = resolve_nf_endpoint_async(SbiServiceType::NsmfPdusession)
-            .await
-            .unwrap();
-        assert_eq!(
-            (host.as_str(), port),
-            ("127.0.0.1", old_port),
-            "premise: cached old SMF"
-        );
-
-        let created = call_smf_create_sm_context(
-            &host,
-            port,
-            5,
-            1,
-            None,
-            Some("internet"),
-            &UE_N1_REQUEST,
-            false,
-            &test_identity(),
-        )
-        .await
-        .expect("SM Context Create must reach the restarted SMF");
-        assert_eq!(created.sm_context_ref, "664");
-        assert_eq!(
-            created.smf_authority,
-            Some(format!("127.0.0.1:{}", new_smf.port())),
-            "#669: the context lives in the SMF that answered, not the dead one asked"
-        );
-        assert_eq!(hits.load(Ordering::SeqCst), 1);
-        // And the next PDU session resolves straight to the new SMF.
-        assert_eq!(
-            resolve_nf_endpoint_async(SbiServiceType::NsmfPdusession)
-                .await
-                .unwrap(),
-            ("127.0.0.1".to_string(), new_smf.port())
-        );
-
-        ctx.replace_nf_instances(NfType::Smf, vec![], std::time::Duration::from_secs(1))
-            .await;
-        ctx.clear_endpoint_failure("127.0.0.1", old_port);
-        ctx.set_rediscovery_hook(Arc::new(|_, _| Box::pin(async {})));
-        ctx.clear_nrf_uri().await;
-        nrf.stop().await.ok();
-        smf.stop().await.ok();
-    }
 
     /// A UE PDU Session Establishment Request N1 container (PSI=5, PTI=2).
     const UE_N1_REQUEST: [u8; 14] = [

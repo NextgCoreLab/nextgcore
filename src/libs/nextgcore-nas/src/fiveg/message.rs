@@ -5,62 +5,14 @@
 use super::header::*;
 use super::ie::*;
 use super::types::*;
-use crate::buf::{optional_tlv, optional_tlv_e, set_first, IeLen, NasBuf};
+use crate::buf::{
+    opaque_tlv, opaque_tlv_e, optional_tlv, optional_tlv_e, set_first, skip_unknown_ie, IeLen,
+    NasBuf,
+};
 use crate::common::security::{unprotect_nas_message, NasSecurityContext};
 use crate::common::types::*;
 use crate::error::{NasError, NasResult};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-
-/// Returns true if `iei` denotes a type-6 (TLV-E) IE in the 5GS NAS protocol,
-/// i.e. one whose length field is 2 octets rather than 1 (TS 24.007 §11.2.5).
-///
-/// These are the TLV-E IEIs defined across the TS 24.501 5GMM/5GSM message
-/// tables: NAS message container (0x71), Additional GUTI (0x77), EAP message
-/// (0x78), LADN information (0x79), Payload container (0x7B), and the other
-/// container-style IEs in the 0x70..=0x7F band (SOR transparent container 0x73,
-/// operator-defined access category definitions 0x76, extended emergency number
-/// list 0x7A, ciphering key data 0x74, CAG information list 0x75, mapped/EPS
-/// bearer contexts 0x7A/0x7C, extended PCO 0x7B). Consuming the correct number
-/// of length octets keeps the IE loop in sync when such an IE is not modelled.
-fn is_tlv_e_iei(iei: u8) -> bool {
-    matches!(
-        iei,
-        0x71 | 0x73 | 0x74 | 0x75 | 0x76 | 0x77 | 0x78 | 0x79 | 0x7A | 0x7B | 0x7C
-    )
-}
-
-/// Skip an unknown / unhandled optional IE in a default IE-loop arm, per
-/// TS 24.501 §7.6.1 (unknown IEs are ignored, not errored) and the TS 24.007
-/// IE-format rules. `buf` must be positioned at the IEI octet; `iei` is the
-/// peeked IEI (`buf.peek_u8()?`).
-///
-/// - `iei >= 0x80`: type-1 (TV, half-octet IEI in the high nibble) or type-2
-///   (T) — the whole IE is the single IEI octet; consume 1 octet, no length,
-///   no value.
-/// - `iei <  0x80` and TLV-E (see `is_tlv_e_iei`): consume the IEI octet, a
-///   2-octet length, then that many value octets.
-/// - other `iei <  0x80`: treated as type-4 (TLV) — consume the IEI octet, a
-///   1-octet length, then `len` value octets. NOTE: unknown type-3 (fixed
-///   length TV) IEs still cannot be distinguished, but all *known* such IEIs
-///   are matched explicitly, so this only affects unknown ones.
-fn skip_unknown_ie(buf: &mut Bytes, iei: u8) -> NasResult<()> {
-    buf.skip(1)?; // consume the IEI octet (peeked, not yet advanced by caller)
-    if iei >= 0x80 {
-        return Ok(());
-    }
-    if is_tlv_e_iei(iei) {
-        if buf.remaining() >= 2 {
-            let len = buf.read_u16()? as usize;
-            let take = len.min(buf.remaining());
-            buf.skip(take)?;
-        }
-    } else if buf.remaining() > 0 {
-        let len = buf.read_u8()? as usize;
-        let take = len.min(buf.remaining());
-        buf.skip(take)?;
-    }
-    Ok(())
-}
 
 /// 5GMM message
 #[derive(Debug, Clone, PartialEq)]
@@ -646,13 +598,7 @@ impl RegistrationComplete {
             match iei {
                 0x73 => {
                     buf.skip(1)?;
-                    if buf.remaining() < 2 {
-                        break;
-                    }
-                    let len = buf.read_u16()? as usize;
-                    if buf.remaining() >= len {
-                        msg.sor_transparent_container = Some(buf.read_bytes(len)?.to_vec());
-                    }
+                    set_first(&mut msg.sor_transparent_container, Some(opaque_tlv_e(buf)?));
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -1734,12 +1680,7 @@ impl DlNasTransport {
                 }
                 0x24 => {
                     buf.skip(1)?;
-                    if buf.remaining() >= 1 {
-                        let len = buf.read_u8()? as usize;
-                        if buf.remaining() >= len {
-                            msg.additional_information = Some(buf.read_bytes(len)?.to_vec());
-                        }
-                    }
+                    set_first(&mut msg.additional_information, Some(opaque_tlv(buf)?));
                 }
                 0x58 => {
                     buf.skip(1)?;
@@ -1881,30 +1822,15 @@ impl ConfigurationUpdateCommand {
                 }
                 0x11 => {
                     buf.skip(1)?;
-                    if buf.remaining() >= 1 {
-                        let len = buf.read_u8()? as usize;
-                        if buf.remaining() >= len {
-                            msg.rejected_nssai = Some(buf.read_bytes(len)?.to_vec());
-                        }
-                    }
+                    set_first(&mut msg.rejected_nssai, Some(opaque_tlv(buf)?));
                 }
                 0x43 => {
                     buf.skip(1)?;
-                    if buf.remaining() >= 1 {
-                        let len = buf.read_u8()? as usize;
-                        if buf.remaining() >= len {
-                            msg.full_name_for_network = Some(buf.read_bytes(len)?.to_vec());
-                        }
-                    }
+                    set_first(&mut msg.full_name_for_network, Some(opaque_tlv(buf)?));
                 }
                 0x45 => {
                     buf.skip(1)?;
-                    if buf.remaining() >= 1 {
-                        let len = buf.read_u8()? as usize;
-                        if buf.remaining() >= len {
-                            msg.short_name_for_network = Some(buf.read_bytes(len)?.to_vec());
-                        }
-                    }
+                    set_first(&mut msg.short_name_for_network, Some(opaque_tlv(buf)?));
                 }
                 0x46 => {
                     buf.skip(1)?;
@@ -1931,21 +1857,11 @@ impl ConfigurationUpdateCommand {
                 }
                 0x79 => {
                     buf.skip(1)?;
-                    if buf.remaining() >= 2 {
-                        let len = buf.read_u16()? as usize;
-                        if buf.remaining() >= len {
-                            msg.ladn_information = Some(buf.read_bytes(len)?.to_vec());
-                        }
-                    }
+                    set_first(&mut msg.ladn_information, Some(opaque_tlv_e(buf)?));
                 }
                 0x27 => {
                     buf.skip(1)?;
-                    if buf.remaining() >= 1 {
-                        let len = buf.read_u8()? as usize;
-                        if buf.remaining() >= len {
-                            msg.service_area_list = Some(buf.read_bytes(len)?.to_vec());
-                        }
-                    }
+                    set_first(&mut msg.service_area_list, Some(opaque_tlv(buf)?));
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -2078,12 +1994,7 @@ impl ControlPlaneServiceRequest {
             match iei_type {
                 0x6F => {
                     buf.skip(1)?;
-                    if buf.remaining() >= 2 {
-                        let len = buf.read_u16()? as usize;
-                        if buf.remaining() >= len {
-                            msg.ciot_small_data_container = Some(buf.read_bytes(len)?.to_vec());
-                        }
-                    }
+                    set_first(&mut msg.ciot_small_data_container, Some(opaque_tlv_e(buf)?));
                 }
                 0x80 => {
                     buf.skip(1)?;
@@ -2110,6 +2021,9 @@ impl ControlPlaneServiceRequest {
                         optional_tlv_e(buf, NasMessageContainer::decode)?,
                     );
                 }
+                // PDU session ID (TV 2): not modelled. Type 3, so skipped by its fixed
+                // length; read as TLV its value octet would be taken as a length (#784).
+                0x12 => buf.skip(2)?,
                 _ => skip_unknown_ie(buf, iei)?,
             }
         }
@@ -2560,13 +2474,11 @@ impl PduSessionEstablishmentRequest {
                 }
                 0x7B => {
                     buf.skip(1)?;
-                    if buf.remaining() >= 2 {
-                        let len = buf.read_u16()? as usize;
-                        if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
-                        }
-                    }
+                    set_first(&mut msg.extended_pco, Some(opaque_tlv_e(buf)?));
                 }
+                // Maximum number of supported packet filters (TV 3): not modelled. Type 3, so skipped by its fixed
+                // length; read as TLV its value octet would be taken as a length (#784).
+                0x55 => buf.skip(3)?,
                 _ => skip_unknown_ie(buf, iei)?,
             }
         }
@@ -2666,17 +2578,15 @@ impl PduSessionEstablishmentAccept {
                 }
                 0x7B => {
                     buf.skip(1)?;
-                    if buf.remaining() >= 2 {
-                        let len = buf.read_u16()? as usize;
-                        if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
-                        }
-                    }
+                    set_first(&mut msg.extended_pco, Some(opaque_tlv_e(buf)?));
                 }
                 0x25 => {
                     buf.skip(1)?;
                     set_first(&mut msg.dnn, optional_tlv(buf, Dnn::decode)?);
                 }
+                // RQ timer value (TV 2): not modelled. Type 3, so skipped by its fixed
+                // length; read as TLV its value octet would be taken as a length (#784).
+                0x56 => buf.skip(2)?,
                 _ => skip_unknown_ie(buf, iei)?,
             }
         }
@@ -2733,12 +2643,7 @@ impl PduSessionEstablishmentReject {
                 }
                 0x7B => {
                     buf.skip(1)?;
-                    if buf.remaining() >= 2 {
-                        let len = buf.read_u16()? as usize;
-                        if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
-                        }
-                    }
+                    set_first(&mut msg.extended_pco, Some(opaque_tlv_e(buf)?));
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -2796,13 +2701,17 @@ impl PduSessionModificationRequest {
                 }
                 0x7B => {
                     buf.skip(1)?;
-                    if buf.remaining() >= 2 {
-                        let len = buf.read_u16()? as usize;
-                        if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
-                        }
-                    }
+                    set_first(&mut msg.extended_pco, Some(opaque_tlv_e(buf)?));
                 }
+                // 5GSM cause (TV 2): not modelled. Type 3, so skipped by its fixed
+                // length; read as TLV its value octet would be taken as a length (#784).
+                0x59 => buf.skip(2)?,
+                // Maximum number of supported packet filters (TV 3): not modelled. Type 3, so skipped by its fixed
+                // length; read as TLV its value octet would be taken as a length (#784).
+                0x55 => buf.skip(3)?,
+                // Integrity protection maximum data rate (TV 3): not modelled. Type 3, so skipped by its fixed
+                // length; read as TLV its value octet would be taken as a length (#784).
+                0x13 => buf.skip(3)?,
                 _ => skip_unknown_ie(buf, iei)?,
             }
         }
@@ -2875,6 +2784,9 @@ impl PduSessionModificationCommand {
                         optional_tlv_e(buf, QosFlowDescriptions::decode)?,
                     );
                 }
+                // RQ timer value (TV 2): not modelled. Type 3, so skipped by its fixed
+                // length; read as TLV its value octet would be taken as a length (#784).
+                0x56 => buf.skip(2)?,
                 _ => skip_unknown_ie(buf, iei)?,
             }
         }
@@ -2931,12 +2843,7 @@ impl PduSessionModificationReject {
                 }
                 0x7B => {
                     buf.skip(1)?;
-                    if buf.remaining() >= 2 {
-                        let len = buf.read_u16()? as usize;
-                        if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
-                        }
-                    }
+                    set_first(&mut msg.extended_pco, Some(opaque_tlv_e(buf)?));
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -2981,12 +2888,7 @@ impl PduSessionModificationCommandReject {
             match iei {
                 0x7B => {
                     buf.skip(1)?;
-                    if buf.remaining() >= 2 {
-                        let len = buf.read_u16()? as usize;
-                        if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
-                        }
-                    }
+                    set_first(&mut msg.extended_pco, Some(opaque_tlv_e(buf)?));
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -3030,12 +2932,7 @@ impl PduSessionReleaseRequest {
                 }
                 0x7B => {
                     buf.skip(1)?;
-                    if buf.remaining() >= 2 {
-                        let len = buf.read_u16()? as usize;
-                        if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
-                        }
-                    }
+                    set_first(&mut msg.extended_pco, Some(opaque_tlv_e(buf)?));
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -3080,12 +2977,7 @@ impl PduSessionReleaseReject {
             match iei {
                 0x7B => {
                     buf.skip(1)?;
-                    if buf.remaining() >= 2 {
-                        let len = buf.read_u16()? as usize;
-                        if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
-                        }
-                    }
+                    set_first(&mut msg.extended_pco, Some(opaque_tlv_e(buf)?));
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -3143,12 +3035,7 @@ impl PduSessionReleaseCommand {
                 }
                 0x7B => {
                     buf.skip(1)?;
-                    if buf.remaining() >= 2 {
-                        let len = buf.read_u16()? as usize;
-                        if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
-                        }
-                    }
+                    set_first(&mut msg.extended_pco, Some(opaque_tlv_e(buf)?));
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -3192,12 +3079,7 @@ impl PduSessionReleaseComplete {
                 }
                 0x7B => {
                     buf.skip(1)?;
-                    if buf.remaining() >= 2 {
-                        let len = buf.read_u16()? as usize;
-                        if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
-                        }
-                    }
+                    set_first(&mut msg.extended_pco, Some(opaque_tlv_e(buf)?));
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -3261,12 +3143,7 @@ impl PduSessionAuthenticationCommand {
             match iei {
                 0x7B => {
                     buf.skip(1)?;
-                    if buf.remaining() >= 2 {
-                        let len = buf.read_u16()? as usize;
-                        if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
-                        }
-                    }
+                    set_first(&mut msg.extended_pco, Some(opaque_tlv_e(buf)?));
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -3305,12 +3182,7 @@ impl PduSessionAuthenticationComplete {
             match iei {
                 0x7B => {
                     buf.skip(1)?;
-                    if buf.remaining() >= 2 {
-                        let len = buf.read_u16()? as usize;
-                        if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
-                        }
-                    }
+                    set_first(&mut msg.extended_pco, Some(opaque_tlv_e(buf)?));
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -3355,12 +3227,7 @@ impl PduSessionAuthenticationResult {
                 }
                 0x7B => {
                     buf.skip(1)?;
-                    if buf.remaining() >= 2 {
-                        let len = buf.read_u16()? as usize;
-                        if buf.remaining() >= len {
-                            msg.extended_pco = Some(buf.read_bytes(len)?.to_vec());
-                        }
-                    }
+                    set_first(&mut msg.extended_pco, Some(opaque_tlv_e(buf)?));
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -3399,22 +3266,17 @@ impl RemoteUeReport {
             match iei {
                 0x79 => {
                     buf.skip(1)?;
-                    if buf.remaining() >= 2 {
-                        let len = buf.read_u16()? as usize;
-                        if buf.remaining() >= len {
-                            msg.remote_ue_context_connected = Some(buf.read_bytes(len)?.to_vec());
-                        }
-                    }
+                    set_first(
+                        &mut msg.remote_ue_context_connected,
+                        Some(opaque_tlv_e(buf)?),
+                    );
                 }
                 0x7A => {
                     buf.skip(1)?;
-                    if buf.remaining() >= 2 {
-                        let len = buf.read_u16()? as usize;
-                        if buf.remaining() >= len {
-                            msg.remote_ue_context_disconnected =
-                                Some(buf.read_bytes(len)?.to_vec());
-                        }
-                    }
+                    set_first(
+                        &mut msg.remote_ue_context_disconnected,
+                        Some(opaque_tlv_e(buf)?),
+                    );
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -3637,11 +3499,15 @@ mod nas05_tests {
     }
 
     #[test]
-    fn test_skip_unknown_ie_truncated_tlv_clamps() {
-        // Malformed length > remaining: clamp and terminate, no panic.
+    fn test_skip_unknown_ie_overrun_ends_the_walk() {
+        // An unknown IE whose length runs past the message is not present and
+        // ends the walk, without failing the message (#784 review). No panic.
         let mut buf = Bytes::from(vec![0x4A, 0x05, 0xAA]);
         skip_unknown_ie(&mut buf, 0x4A).unwrap();
         assert_eq!(buf.remaining(), 0);
+        let mut buf = Bytes::from(vec![0x7B, 0x00]);
+        skip_unknown_ie(&mut buf, 0x7B).unwrap();
+        assert_eq!(buf.remaining(), 0, "half a TLV-E length");
     }
 
     #[test]
@@ -3812,6 +3678,7 @@ mod tlv_e_skip_tests {
     //! REGISTRATION REQUEST must model the NAS message container (IEI 0x71) so
     //! the cleartext-IE initial registration flow round-trips.
     use super::*;
+    use crate::buf::is_tlv_e_iei;
 
     #[test]
     fn test_registration_request_nas_message_container_roundtrip() {
@@ -3868,7 +3735,7 @@ mod tlv_e_skip_tests {
 
     #[test]
     fn test_is_tlv_e_iei_classification() {
-        for iei in [0x71u8, 0x77, 0x78, 0x79, 0x7B, 0x7C] {
+        for iei in [0x70u8, 0x71, 0x72, 0x77, 0x78, 0x79, 0x7B, 0x7C, 0x7D, 0x7F] {
             assert!(is_tlv_e_iei(iei), "0x{iei:02x} is a TLV-E IEI");
         }
         for iei in [0x40u8, 0x50, 0x2E, 0x2B, 0x80, 0xC0] {
