@@ -68,9 +68,14 @@ fn configuration_update_nssai_overrunning_its_length_is_absent() {
     // 2 octets; the running `remaining -= ...` count underflowed. The NSSAI is
     // syntactically incorrect and optional, so since #630 it is treated as not
     // present (TS 24.501 §7.7.1) rather than failing the message.
-    let msg =
-        fiveg::ConfigurationUpdateCommand::decode(&mut b(&[0x31, 0x01, 0x02, 0x00, 0x10])).unwrap();
+    let msg = fiveg::ConfigurationUpdateCommand::decode(&mut b(&[0x31, 0x01, 0x02])).unwrap();
     assert_eq!(msg.configured_nssai, None);
+    // The full repro ends in `00 10`: an unknown IE whose 16-octet length runs
+    // past the message. That is a truncated message, so an error (#784), and
+    // still no panic.
+    assert!(
+        fiveg::ConfigurationUpdateCommand::decode(&mut b(&[0x31, 0x01, 0x02, 0x00, 0x10])).is_err()
+    );
 }
 
 type Decoder = fn(&mut Bytes) -> bool;

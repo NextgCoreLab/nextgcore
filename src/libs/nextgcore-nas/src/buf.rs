@@ -204,6 +204,69 @@ pub(crate) fn set_first<T>(slot: &mut Option<T>, ie: Option<T>) {
     }
 }
 
+/// Returns true if `iei` denotes a type-6 (TLV-E) IE in the 5GS/EPS NAS
+/// protocols, i.e. one whose length field is 2 octets rather than 1
+/// (TS 24.007 §11.2.5).
+///
+/// These are the TLV-E IEIs of the TS 24.501 / TS 24.301 message tables: NAS
+/// message container (0x71), Additional GUTI (0x77), EAP message (0x78), LADN
+/// information (0x79), Payload container / Extended PCO (0x7B), and the other
+/// container-style IEs in the 0x70..=0x7F band (SOR transparent container 0x73,
+/// ciphering key data 0x74, CAG information list 0x75, operator-defined access
+/// category definitions 0x76, extended emergency number list 0x7A, mapped/EPS
+/// bearer contexts 0x7C). Consuming the correct number of length octets keeps
+/// the IE loop in sync when such an IE is not modelled.
+pub(crate) fn is_tlv_e_iei(iei: u8) -> bool {
+    matches!(
+        iei,
+        0x71 | 0x73 | 0x74 | 0x75 | 0x76 | 0x77 | 0x78 | 0x79 | 0x7A | 0x7B | 0x7C
+    )
+}
+
+/// Skip an unknown / unhandled optional IE in a default IE-loop arm, per
+/// TS 24.501 / TS 24.301 §7.6.1 (unknown IEs are ignored, not errored) and the
+/// TS 24.007 IE-format rules. `buf` must be positioned at the IEI octet; `iei`
+/// is the peeked IEI (`buf.peek_u8()?`).
+///
+/// - `iei >= 0x80`: type-1 (TV, half-octet IEI in the high nibble) or type-2
+///   (T): the whole IE is the single IEI octet.
+/// - TLV-E ([`is_tlv_e_iei`]): the IEI octet, a 2-octet length, the value.
+/// - other `iei < 0x80`: type-4 (TLV): the IEI octet, a 1-octet length, the
+///   value. Unknown type-3 (fixed-length TV) IEs cannot be told apart, but all
+///   *known* ones are matched explicitly, so this only affects unknown ones.
+///
+/// An IE whose length (or length octets) runs past the message is an error
+/// (#784): the message is truncated, so there is nothing to skip by. Before
+/// #784 the skip was clamped to what was left, hiding the truncation.
+pub(crate) fn skip_unknown_ie(buf: &mut Bytes, iei: u8) -> NasResult<()> {
+    buf.skip(1)?; // consume the IEI octet (peeked, not yet advanced by caller)
+    if iei >= 0x80 {
+        return Ok(());
+    }
+    let len = if is_tlv_e_iei(iei) {
+        buf.read_u16()? as usize
+    } else {
+        buf.read_u8()? as usize
+    };
+    buf.skip(len)
+}
+
+/// Read the length and value of an opaque type 4 IE (TLV; the IEI already
+/// consumed). The value is kept as octets, so the only syntax error is a
+/// length past the message, which is `BufferTooShort` (#784). Before #784 the
+/// inline arms skipped such an IE without advancing, so the walk re-read its
+/// value octets as IEIs.
+pub(crate) fn opaque_tlv(buf: &mut Bytes) -> NasResult<Vec<u8>> {
+    let len = buf.read_u8()? as usize;
+    Ok(buf.read_bytes(len)?.to_vec())
+}
+
+/// [`opaque_tlv`] for a type 6 IE (TLV-E, 2-octet length).
+pub(crate) fn opaque_tlv_e(buf: &mut Bytes) -> NasResult<Vec<u8>> {
+    let len = buf.read_u16()? as usize;
+    Ok(buf.read_bytes(len)?.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
