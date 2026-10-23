@@ -39,6 +39,13 @@
 //! length-scope over/under-runs, set spare bits, reserved part types and
 //! unknown component identifiers.
 //!
+//! That strictness stops at the message's non-imperative part: optional IEs
+//! after the mandatory ones are walked per TS 24.501 D.8.6 (#763). An unknown
+//! IE that is not comprehension required is ignored (D.8.6.1), a repeated IE
+//! keeps its first instance (D.8.6.3), and a syntactically incorrect optional
+//! IE is not present (D.8.7.1). Do not "restore" a `finish()` there: it would
+//! reject conformant messages from a later-release peer.
+//!
 //! NOTE on the S-NSSAI *traffic descriptor*: TS 24.526 V18.5.0 Table 5.2.1
 //! (specs/24526-i50.txt:2466-2498) defines NO "S-NSSAI type" traffic
 //! descriptor component identifier ("All other values are spare") — S-NSSAI
@@ -159,6 +166,49 @@ impl<'a> Reader<'a> {
         }
         Ok(())
     }
+}
+
+/// Walks the non-imperative part of a UPDS message: the optional IEs after
+/// the mandatory ones, to the end of the message (TS 24.501 D.8.6, #763).
+///
+/// `on_ie(iei, value)` is called for every IE and returns whether the message
+/// defines that IEI. The format follows TS 24.007 §11.2.4: an IEI with bit 8
+/// set is type 1/2 (the IEI octet is the whole IE, value empty); an IEI in
+/// 70H-7FH is type 6 (TLV-E, 2-octet length); anything else is type 4 (TLV).
+/// The 70H-7FH rule matches every IE TS 24.501 defines today: each optional IE
+/// in that band in the clause 8 and Annex D tables is TLV-E, none is TLV.
+///
+/// - An IE the message does not define is ignored (D.8.6.1), unless its IEI
+///   has bits 8 to 5 set to 0000, which is "comprehension required": that is
+///   an error (D.8.5.1 b).
+/// - An IE whose length runs past the message is an error: the message is
+///   truncated, so there is no length to skip by.
+/// - Repeated IEs (D.8.6.3) and syntactically incorrect ones (D.8.7.1) are
+///   for `on_ie` to judge; it sees every instance in order.
+fn walk_optional_ies(
+    r: &mut Reader<'_>,
+    scope: &str,
+    mut on_ie: impl FnMut(u8, &[u8]) -> bool,
+) -> NasResult<()> {
+    while r.remaining() > 0 {
+        let iei = r.u8()?;
+        let value: &[u8] = if iei & 0x80 != 0 {
+            &[]
+        } else if (0x70..=0x7F).contains(&iei) {
+            let len = usize::from(r.u16()?);
+            r.take(len)?
+        } else {
+            let len = usize::from(r.u8()?);
+            r.take(len)?
+        };
+        if !on_ie(iei, value) && iei & 0xF0 == 0 {
+            return Err(NasError::DecodingError(format!(
+                "{scope}: unknown IEI {iei:#04x} is encoded as comprehension required \
+                 (TS 24.007 §11.2.4, TS 24.501 D.8.5.1)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Appends a 2-octet big-endian length field, failing closed if the value
@@ -1507,8 +1557,8 @@ fn check_pcf_pti(pti: u8, msg: &str, encoding: bool) -> NasResult<()> {
 /// MANAGE UE POLICY COMMAND (TS 24.501 Table D.5.1.1.1): PTI (M,V,1) +
 /// message type (M,V,1, D.6.1) + UE policy section management list
 /// (M, LV-E, 11-65533). The optional IEs 0x42 (UE policy network classmark)
-/// and 0x70 (VPS URSP configuration) are not supported; decoding rejects any
-/// trailing octets (fail-closed).
+/// and 0x70 (VPS URSP configuration) are not supported: decoding skips them,
+/// and ignores unknown IEs that are not comprehension required (D.8.6, #763).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManageUePolicyCommand {
     /// PCF-allocated PTI, 80H-FEH (D.1.2).
@@ -1541,7 +1591,11 @@ impl ManageUePolicyCommand {
         check_pcf_pti(pti, "MANAGE UE POLICY COMMAND", false)?;
         let len = usize::from(r.u16()?);
         let contents = r.take(len)?;
-        r.finish("MANAGE UE POLICY COMMAND")?;
+        // 42H UE policy network classmark, 70H VPS URSP configuration: known,
+        // not supported, skipped by their own length.
+        walk_optional_ies(&mut r, "MANAGE UE POLICY COMMAND", |iei, _| {
+            matches!(iei, 0x42 | 0x70)
+        })?;
         Ok(Self {
             pti,
             list: UePolicySectionManagementList::decode_contents(contents)?,
@@ -1573,7 +1627,7 @@ impl ManageUePolicyComplete {
             return Err(NasError::InvalidMessageType(msg_type));
         }
         check_pcf_pti(pti, "MANAGE UE POLICY COMPLETE", false)?;
-        r.finish("MANAGE UE POLICY COMPLETE")?;
+        walk_optional_ies(&mut r, "MANAGE UE POLICY COMPLETE", |_, _| false)?;
         Ok(Self { pti })
     }
 }
@@ -1616,7 +1670,7 @@ impl ManageUePolicyCommandReject {
         check_pcf_pti(pti, "MANAGE UE POLICY COMMAND REJECT", false)?;
         let len = usize::from(r.u16()?);
         let contents = r.take(len)?;
-        r.finish("MANAGE UE POLICY COMMAND REJECT")?;
+        walk_optional_ies(&mut r, "MANAGE UE POLICY COMMAND REJECT", |_, _| false)?;
         Ok(Self {
             pti,
             result: UePolicySectionManagementResult::decode_contents(contents)?,
@@ -1676,8 +1730,8 @@ impl UeStateIndication {
         Ok(out)
     }
 
-    /// Strict inverse of [`Self::encode`]; unknown trailing IEs are rejected
-    /// (fail-closed — Table D.5.4.1.1 defines exactly one optional IE, 0x41).
+    /// Inverse of [`Self::encode`]. Table D.5.4.1.1 defines one optional IE,
+    /// 0x41; unknown IEs are ignored unless comprehension required (D.8.6).
     pub fn decode(content: &[u8]) -> NasResult<Self> {
         let mut r = Reader::new(content);
         let pti = r.u8()?;
@@ -1695,26 +1749,26 @@ impl UeStateIndication {
         let upsi_list = UpsiList::decode_contents(r.take(upsi_len)?)?;
         let classmark = UePolicyClassmark::decode_lv(&mut r)?;
         let mut os_ids = Vec::new();
-        if r.remaining() > 0 {
-            let iei = r.u8()?;
+        let mut os_ids_seen = false;
+        walk_optional_ies(&mut r, "UE STATE INDICATION", |iei, contents| {
             if iei != IEI_UE_OS_ID {
-                return Err(NasError::InvalidIeType(iei));
+                return false;
             }
-            let len = usize::from(r.u8()?);
-            let contents = r.take(len)?;
             // D.6.6: 1..=15 sixteen-octet OS Ids. Any other length makes the
             // optional IE syntactically incorrect, so it is treated as not
-            // present (D.8.7.1, #630); its own length frames it, so the walk
-            // is unaffected. A frame past the message end is still an error.
-            if len != 0 && len % 16 == 0 && len <= 240 {
+            // present (D.8.7.1, #630). Only the first instance present is
+            // handled (D.8.6.3).
+            let len = contents.len();
+            if !os_ids_seen && len != 0 && len % 16 == 0 && len <= 240 {
+                os_ids_seen = true;
                 for chunk in contents.chunks_exact(16) {
                     let mut os_id = [0u8; 16];
                     os_id.copy_from_slice(chunk);
                     os_ids.push(os_id);
                 }
             }
-        }
-        r.finish("UE STATE INDICATION")?;
+            true
+        })?;
         Ok(Self {
             pti,
             upsi_list,

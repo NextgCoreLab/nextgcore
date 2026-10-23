@@ -158,8 +158,10 @@ kubectl apply -f "${SCRIPT_DIR}/monitoring/prometheus.yaml"
 # Grafana's admin password lives in a Secret, never in a manifest (#837). Create
 # it with a generated value the first time; an existing one is kept.
 if ! kubectl get secret grafana-admin -n "${NAMESPACE}" >/dev/null 2>&1; then
-  kubectl create secret generic grafana-admin -n "${NAMESPACE}" \
-    --from-literal=password="$(openssl rand -base64 24)" >/dev/null
+  # Piped, never in argv: an argv value shows in `ps` and under `bash -x`.
+  openssl rand -base64 24 | tr -d '\n' \
+    | kubectl create secret generic grafana-admin -n "${NAMESPACE}" \
+        --from-file=password=/dev/stdin >/dev/null
   echo "  Created Secret grafana-admin with a generated Grafana admin password"
 fi
 kubectl apply -f "${SCRIPT_DIR}/monitoring/grafana.yaml"

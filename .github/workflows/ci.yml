@@ -182,10 +182,35 @@ jobs:
       - name: cargo fmt
         run: cd src && cargo fmt --all -- --check
 
-      - name: webui session key fails closed
+      - name: webui session key fails closed; bind defaults to loopback
         # #913: the provisioning UI refuses to start without a real SECRET_KEY;
-        # this pins the check without installing the UI's dependencies.
-        run: node webui/server/lib/session-key.check.js
+        # #850: it listens on 127.0.0.1 unless WEBUI_BIND_ADDR says otherwise.
+        # These pin both checks without installing the UI's dependencies.
+        run: |
+          node webui/server/lib/session-key.check.js
+          node webui/server/lib/bind-address.check.js
+
+  helm:
+    # #753 review: `helm lint` reports a template `fail` only at [INFO] and exits
+    # 0, so it cannot catch the chart's refusal of amf.replicas > 1. The render
+    # is checked with `helm template`, both ways.
+    name: Helm chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: helm lint
+        run: helm lint deploy/helm/nextgcore --set global.siteId=ci
+      - name: helm template renders
+        run: helm template t deploy/helm/nextgcore --set global.siteId=ci > /dev/null
+      - name: helm template refuses amf.replicas=2
+        run: |
+          if out=$(helm template t deploy/helm/nextgcore --set global.siteId=ci \
+              --set amf.replicas=2 2>&1); then
+            echo "amf.replicas=2 rendered; it must fail (#753)"; exit 1
+          fi
+          echo "$out" | grep -q 'amf.replicas > 1 is not supported' \
+            || { echo "failed for another reason: $out"; exit 1; }
 
   fuzz-build:
     name: Fuzz targets build

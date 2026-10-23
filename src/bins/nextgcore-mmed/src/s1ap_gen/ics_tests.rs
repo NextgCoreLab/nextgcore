@@ -1,5 +1,11 @@
 //! #514 stage 4: Initial Context Setup on the generated codec.
 //!
+//! #737: since the hand-written encoder was deleted (#560), the
+//! `*_with_schema_criticalities` tests below compare the production encoder
+//! with itself and check it decodes back; what pins each IE criticality is
+//! `criticality_oracle`, which checks every PDU a production builder encodes
+//! against the TS 36.413 §9.3 object sets.
+//!
 //! Oracle: the pre-change hand-written builders and parser
 //! (`test_codec::builder`, `decode_s1ap_pdu`: since #514 stage 13b the generated codec with an independently written domain mapping, and builders for messages mmed sends check that their output decodes back to their input). Golden: nextgcore-s1ap's
 //! `golden_x691.rs` Initial Context Setup Request (derived by hand from X.691
@@ -114,7 +120,7 @@ fn requests() -> Vec<InitialContextSetupRequest> {
 }
 
 #[test]
-fn the_request_matches_the_hand_written_encoder() {
+fn the_request_round_trips_with_schema_criticalities() {
     let reqs = requests();
     assert_eq!(reqs.len(), 4 * 2 * 3 * 3 * 2);
     for req in &reqs {
@@ -294,4 +300,74 @@ fn through_the_handler_a_failure_for_an_unknown_ue_still_gets_an_error_indicatio
         decode_s1ap_pdu(&out[0].pdu).unwrap(),
         S1apMessage::ErrorIndication(_)
     ));
+}
+
+/// #880 review: the oracle's EXTENSION comparison, through a real builder. No
+/// production builder writes `ie_extensions`, so the suite compared none; here
+/// the production INITIAL CONTEXT SETUP REQUEST gains a Correlation-ID (id
+/// 156, `CRITICALITY ignore` in E-RABToBeSetupItemCtxtSUReqExtIEs). With
+/// ignore the oracle reads the extension entry and passes; with reject it fails.
+#[test]
+fn the_oracle_compares_a_real_extension_entry() {
+    use crate::s1ap_gen::criticality_oracle::{assert_matches_ts_36_413, entries};
+    use nextgcore_s1ap_gen::generated as g;
+    let bytes = build_initial_context_setup_request(&golden_request()).unwrap();
+    let pdu = nextgcore_s1ap_gen::decode(&bytes).unwrap();
+    let with_extension = |crit: u8| {
+        let mut pdu = pdu.clone();
+        let g::S1AP_PDU::InitiatingMessage(ref mut m) = pdu else {
+            panic!("an initiating message")
+        };
+        let g::InitiatingMessageValue::Id_InitialContextSetup(ref mut req) = m.value else {
+            panic!("an Initial Context Setup Request")
+        };
+        let mut added = 0;
+        for ie in req.protocol_i_es.0.iter_mut() {
+            if let g::InitialContextSetupRequestProtocolIEs_EntryValue::Id_E_RABToBeSetupListCtxtSUReq(
+                ref mut list,
+            ) = ie.value
+            {
+                for item in list.0.iter_mut() {
+                    let g::E_RABToBeSetupListCtxtSUReq_EntryValue::Id_E_RABToBeSetupItemCtxtSUReq(
+                        ref mut erab,
+                    ) = item.value;
+                    erab.ie_extensions = Some(g::E_RABToBeSetupItemCtxtSUReqIE_Extensions(vec![
+                        g::E_RABToBeSetupItemCtxtSUReqIE_Extensions_Entry {
+                            id: g::ProtocolExtensionID(156),
+                            criticality: g::Criticality(crit),
+                            extension_value:
+                                g::E_RABToBeSetupItemCtxtSUReqIE_Extensions_EntryExtensionValue::Id_Correlation_ID(
+                                    g::Correlation_ID(vec![0, 0, 0, 1]),
+                                ),
+                        },
+                    ]));
+                    added += 1;
+                }
+            }
+        }
+        assert_eq!(added, 1, "the golden request has one E-RAB");
+        pdu
+    };
+
+    let ok = with_extension(g::Criticality::IGNORE);
+    let read: Vec<_> = entries(&format!("{ok:?}"))
+        .into_iter()
+        .filter(|(container, ..)| container == "E_RABToBeSetupItemCtxtSUReqIE_Extensions")
+        .collect();
+    assert_eq!(
+        read,
+        vec![(
+            "E_RABToBeSetupItemCtxtSUReqIE_Extensions".to_string(),
+            156,
+            g::Criticality::IGNORE
+        )],
+        "the extension entry is read"
+    );
+    assert_matches_ts_36_413(&ok);
+
+    let wrong = with_extension(g::Criticality::REJECT);
+    assert!(
+        std::panic::catch_unwind(|| assert_matches_ts_36_413(&wrong)).is_err(),
+        "a reject Correlation-ID is caught"
+    );
 }

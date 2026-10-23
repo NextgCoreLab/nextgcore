@@ -10,7 +10,8 @@
 // already corrected for exactly this reason; this was the last holdout.
 process.env.DB_URI = process.env.DB_URI || 'mongodb://127.0.0.1/nextgcore';
 
-const _hostname = process.env.HOSTNAME || 'localhost';
+// Loopback unless WEBUI_BIND_ADDR is set; never the container's HOSTNAME (#850).
+const _hostname = require('./lib/bind-address').bindAddress(process.env);
 const port = process.env.PORT || 9999;
 
 const co = require('co');

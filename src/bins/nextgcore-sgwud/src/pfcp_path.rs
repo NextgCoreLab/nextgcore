@@ -1182,42 +1182,26 @@ impl SxaNode {
         // its sessions from 1 again; matched by SEID alone, its first Establishment was
         // answered from the OLD SGW-C's session, still tagged with the old node, and
         // that node's restoration then deleted the new UE's rules.
-        let sess = match ctx.sess_find_by_sgwc_sxa_f_seid(&cp_f_seid) {
-            // A repeated Establishment for a CP F-SEID we already hold is the CP
-            // retransmitting: answer from the existing session rather than allocating a
-            // second one for the same UE.
-            Some(existing) => existing,
-            None => match ctx.sess_add(&cp_f_seid) {
-                Some(mut sess) => {
-                    sess.pfcp_node_id = node_id;
-                    ctx.sess_update(&sess);
-                    sess
-                }
-                None => {
-                    log::error!(
-                        "Cannot add SGW-U session for CP F-SEID 0x{:x}",
-                        cp_f_seid.seid
-                    );
-                    self.reply_error(
-                        header,
-                        pfcp_msg_type::SESSION_ESTABLISHMENT_RESPONSE,
-                        cp_f_seid.seid,
-                        sxa_build::pfcp_cause::NO_RESOURCES_AVAILABLE,
-                        from,
-                    )
-                    .await;
-                    return;
-                }
-            },
-        };
-
         let parsed = establishment_from_lib(&req, &cp_f_seid);
-        let (result, created_pdrs) =
-            crate::sxa_handler::handle_session_establishment_request(Some(&sess), 0, &parsed);
-        // Re-read: the handler installs PDRs/FARs/QERs/URRs on the stored session.
-        let sess = ctx.sess_find_by_id(sess.id).unwrap_or(sess);
-        match result {
-            crate::sxa_handler::HandlerResult::Error(cause) => {
+        let outcome = establish_session(ctx, &cp_f_seid, node_id, |sess| {
+            crate::sxa_handler::handle_session_establishment_request(Some(sess), 0, &parsed)
+        });
+        match outcome {
+            Establishment::NoResources => {
+                log::error!(
+                    "Cannot add SGW-U session for CP F-SEID 0x{:x}",
+                    cp_f_seid.seid
+                );
+                self.reply_error(
+                    header,
+                    pfcp_msg_type::SESSION_ESTABLISHMENT_RESPONSE,
+                    cp_f_seid.seid,
+                    sxa_build::pfcp_cause::NO_RESOURCES_AVAILABLE,
+                    from,
+                )
+                .await;
+            }
+            Establishment::Rejected(cause) => {
                 self.reply_error(
                     header,
                     pfcp_msg_type::SESSION_ESTABLISHMENT_RESPONSE,
@@ -1227,7 +1211,7 @@ impl SxaNode {
                 )
                 .await;
             }
-            _ => {
+            Establishment::Accepted(sess, created_pdrs) => {
                 let Some(msg) =
                     sxa_build::build_session_establishment_response(&sess, &created_pdrs)
                 else {
@@ -1462,6 +1446,65 @@ fn apply_action_octet(action: &LibApplyAction) -> u8 {
 /// library models the two as `true` = open, so both are inverted here.
 fn gate_status_octet(gate: &LibGateStatus) -> u8 {
     ((!gate.ul_gate) as u8) | (((!gate.dl_gate) as u8) << 2)
+}
+
+/// The outcome of [`establish_session`].
+enum Establishment {
+    /// The session could not be created at all.
+    NoResources,
+    /// The request was rejected with this cause. A session this request CREATED has
+    /// been removed again, with every rule and TEID it had installed (#836).
+    Rejected(u8),
+    /// Accepted: the session as stored after the rules were installed.
+    Accepted(Box<SgwuSess>, Vec<sxa_build::CreatedPdr>),
+}
+
+/// Find or create the session for an Establishment and run `install` on it (#836).
+///
+/// A repeated Establishment for a CP F-SEID already held is the CP retransmitting, so
+/// it is answered from the existing session (#700: matched by the whole F-SEID). A
+/// session created HERE whose installation is rejected is removed again: the SGW-C
+/// was told the Establishment failed, so it will never delete it, and before this the
+/// session -- and the PDRs, TEIDs and URRs installed before the failing IE -- stayed
+/// until a CP peer restart flushed it. A retransmitted Establishment that fails leaves
+/// the existing session alone: it was established by an earlier request.
+fn establish_session(
+    ctx: &crate::context::SgwuContext,
+    cp_f_seid: &crate::context::FSeid,
+    node_id: Option<u64>,
+    install: impl FnOnce(
+        &SgwuSess,
+    ) -> (
+        crate::sxa_handler::HandlerResult,
+        Vec<sxa_build::CreatedPdr>,
+    ),
+) -> Establishment {
+    let (sess, created_here) = match ctx.sess_find_by_sgwc_sxa_f_seid(cp_f_seid) {
+        Some(existing) => (existing, false),
+        None => match ctx.sess_add_for_node(cp_f_seid, node_id) {
+            Some(sess) => (sess, true),
+            None => return Establishment::NoResources,
+        },
+    };
+    let (result, created_pdrs) = install(&sess);
+    match result {
+        crate::sxa_handler::HandlerResult::Error(cause) => {
+            if created_here {
+                log::warn!(
+                    "Session Establishment for CP F-SEID 0x{:x} rejected (cause {cause}): \
+                     removing the session it created",
+                    cp_f_seid.seid
+                );
+                ctx.sess_remove(sess.id);
+            }
+            Establishment::Rejected(cause)
+        }
+        // Re-read: the handler installs PDRs/FARs/QERs/URRs on the stored session.
+        _ => Establishment::Accepted(
+            Box::new(ctx.sess_find_by_id(sess.id).unwrap_or(sess)),
+            created_pdrs,
+        ),
+    }
 }
 
 /// Scan a flat TLV body for the Cause IE (type 19).
@@ -2006,6 +2049,50 @@ mod tests {
     use nextgcore_pfcp::types::{CreateQer, CreateUrr};
 
     /// A bound node plus a socket standing in for the SGW-C.
+    /// #836: a rejected Establishment removes the session IT created, with the PDR
+    /// and TEID installed before the failing IE; a rejected RETRANSMISSION leaves the
+    /// session the earlier request established alone. A private context, so the
+    /// counts are this test's own.
+    #[test]
+    fn a_rejected_establishment_removes_only_the_session_it_created() {
+        let ctx = crate::context::SgwuContext::with_first_sess_id(0x8360_0000);
+        let f_seid = crate::context::FSeid::with_ipv4(0x836, Ipv4Addr::new(10, 8, 3, 6));
+        let install_then_fail = |sess: &SgwuSess| {
+            ctx.pdr_install(crate::context::SgwuPdr {
+                sess_id: sess.id,
+                pdr_id: 1,
+                local_teid: 0x8361,
+                ..Default::default()
+            });
+            (
+                crate::sxa_handler::HandlerResult::Error(sxa_build::pfcp_cause::SYSTEM_FAILURE),
+                Vec::new(),
+            )
+        };
+
+        let out = establish_session(&ctx, &f_seid, Some(7), install_then_fail);
+        assert!(
+            matches!(out, Establishment::Rejected(c) if c == sxa_build::pfcp_cause::SYSTEM_FAILURE)
+        );
+        assert_eq!(ctx.sess_count(), 0, "the half-built session is gone");
+        assert!(ctx.pdr_find_by_teid(0x8361).is_none(), "and so is its TEID");
+
+        // Established for real, then a retransmission of it is rejected.
+        let ok = establish_session(&ctx, &f_seid, Some(7), |_| {
+            (crate::sxa_handler::HandlerResult::Ok, Vec::new())
+        });
+        let Establishment::Accepted(sess, _) = ok else {
+            panic!("accepted");
+        };
+        assert_eq!(sess.pfcp_node_id, Some(7));
+        let again = establish_session(&ctx, &f_seid, Some(7), install_then_fail);
+        assert!(matches!(again, Establishment::Rejected(_)));
+        assert!(
+            ctx.sess_find_by_id(sess.id).is_some(),
+            "a rejected retransmission must not tear down the established session"
+        );
+    }
+
     async fn node_and_peer() -> (SxaTestGuard, Arc<SxaNode>, UdpSocket) {
         let guard = sxa_test_guard().await;
         sgwu_context_init(1024);
@@ -2900,10 +2987,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_gtpu_path_is_reported_once_over_the_wire() {
         let (_guard, node, peer) = node_and_peer().await;
+        // #827 (after SXA_TEST_LOCK, the documented order): this test writes the
+        // process-global GTP-U path table.
+        let _paths = crate::gtp_path::GTPU_PATH_TEST_LOCK.lock().await;
         let _shutdown = associate_and_run(&node, &peer).await;
 
         let failed = IpAddr::V4(Ipv4Addr::new(10, 217, 0, 1));
         crate::gtp_path::forget_gtpu_path(failed);
+        let _forget = crate::gtp_path::ForgetPathOnDrop(failed);
 
         // Four unanswered Echoes EXCEED the default N3-REQUESTS of 3, which is the
         // transition (TS 23.007 §20.3.1).
@@ -2946,10 +3037,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_recovered_gtpu_path_is_reported_with_uprr() {
         let (_guard, node, peer) = node_and_peer().await;
+        // #827 (after SXA_TEST_LOCK, the documented order): this test writes the
+        // process-global GTP-U path table.
+        let _paths = crate::gtp_path::GTPU_PATH_TEST_LOCK.lock().await;
         let _shutdown = associate_and_run(&node, &peer).await;
 
         let path = IpAddr::V4(Ipv4Addr::new(10, 217, 0, 2));
         crate::gtp_path::forget_gtpu_path(path);
+        let _forget = crate::gtp_path::ForgetPathOnDrop(path);
 
         // An answered Echo on a HEALTHY path is not a transition and reports nothing.
         crate::gtp_path::note_echo_answered(path);
@@ -2991,6 +3086,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_path_failure_with_no_associated_peer_reports_to_nobody_and_says_so() {
         let (_guard, node, peer) = node_and_peer().await;
+        // #827 (after SXA_TEST_LOCK, the documented order): this test writes the
+        // process-global GTP-U path table.
+        let _paths = crate::gtp_path::GTPU_PATH_TEST_LOCK.lock().await;
         let (_tx, rx) = tokio::sync::watch::channel(false);
         let pump = node.clone();
         tokio::spawn(async move { pump.run(rx).await });
@@ -3016,6 +3114,7 @@ mod tests {
         );
 
         crate::gtp_path::forget_gtpu_path(failed);
+        let _forget = crate::gtp_path::ForgetPathOnDrop(failed);
         for _ in 0..4 {
             crate::gtp_path::note_echo_unanswered(failed);
         }
