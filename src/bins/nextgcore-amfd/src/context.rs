@@ -276,6 +276,12 @@ impl Guti5gs {
     /// guess at.
     pub fn from_context_id(ue_context_id: &str) -> Option<Self> {
         let rest = ue_context_id.strip_prefix("5g-guti-")?;
+        // The ueContextId arrives raw in the URI path. A non-ASCII character is
+        // never valid here, and `split_at` below would panic if its cut landed
+        // inside one (#765 review).
+        if !rest.is_ascii() {
+            return None;
+        }
         // 14 trailing hex digits, so the leading decimal run is everything else.
         if rest.len() < 5 + 14 {
             return None;
@@ -4909,6 +4915,19 @@ mod tests {
             "5g-guti-1234567020040deadbeef", // 7 PLMN digits: no such pattern
             "5g-guti-1010020040deadbeef",    // 4 PLMN digits
             "",
+        ] {
+            let bad = bad.replace(' ', "");
+            assert!(
+                Guti5gs::from_context_id(&bad).is_none(),
+                "{bad:?} is not a conformant 5g-guti ueContextId and must be refused"
+            );
+        }
+        // #765 review: a multi-byte character where `split_at(len - 14)` cuts
+        // used to panic the Namf handler; raw UTF-8 reaches it from the path.
+        for bad in [
+            "5g-guti-0010\u{e9}0000000000000",
+            "5g-guti-\u{e9}\u{e9}\u{e9}0000000000000",
+            "5g-guti-00101\u{e9}deadbeef00000",
         ] {
             let bad = bad.replace(' ', "");
             assert!(
