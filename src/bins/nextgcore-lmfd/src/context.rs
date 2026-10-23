@@ -253,8 +253,42 @@ pub struct PositioningSession {
     /// the E-CID Measurement Initiation was relayed through, so an ERROR
     /// INDICATION for the gNB's report can go back the same way.
     pub nrppa_peer: Option<NrppaPeer>,
+    /// The measurement legs this session waits for (#715, #807). LPP always; the
+    /// NRPPa legs once they are solicited.
+    expected_legs: Vec<MeasurementLeg>,
+    /// The legs that have reported.
+    reported_legs: Vec<MeasurementLeg>,
+    /// Every measurement the reported legs carried, solved together.
+    accumulated: Vec<CellMeasurement>,
     /// One-shot completion channel to the awaiting DetermineLocation handler.
     sender: Option<tokio::sync::oneshot::Sender<PositioningOutcome>>,
+}
+
+/// One source of measurements for a positioning session (#715, #807).
+///
+/// A fix may need more than one: an NR E-CID fix takes the serving cell from the
+/// UE's LPP report and its timing term from the gNB's NRPPa E-CID measurement
+/// (#834 review), and a Multi-RTT range is the UE's Rx–Tx half (LPP) plus the
+/// gNB's (NRPPa Measurement, #807). Each leg arrives in its own notification, so the session collects
+/// them and solves once every expected leg has reported, or when the response-time
+/// budget runs out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeasurementLeg {
+    /// The UE's LPP `ProvideLocationInformation`.
+    Lpp,
+    /// The serving gNB's NRPPa E-CID measurement.
+    NrppaEcid,
+}
+
+/// What a leg's report did to its session.
+#[derive(Debug, Clone)]
+pub enum LegProgress {
+    /// Every expected leg is in; the session was solved and completed.
+    Completed(Option<LocationEstimate>),
+    /// The session waits for more legs.
+    Waiting,
+    /// No pending session has this request id.
+    NoSession,
 }
 
 /// Cloneable lookup view of a [`PositioningSession`] (the completion channel
@@ -826,6 +860,9 @@ impl LmfContext {
             request_id,
             created_at: std::time::Instant::now(),
             nrppa_peer: None,
+            expected_legs: vec![MeasurementLeg::Lpp],
+            reported_legs: Vec::new(),
+            accumulated: Vec::new(),
             sender: Some(tx),
         };
         if let Ok(mut s) = self.positioning_sessions.write() {
@@ -923,6 +960,132 @@ impl LmfContext {
                 session.nrppa_peer = Some(peer);
             }
         }
+    }
+
+    /// Add `leg` to the legs session `corr` waits for. Call it BEFORE the leg is
+    /// solicited, so its report cannot arrive first and find the session complete.
+    pub fn positioning_session_expect_leg(&self, corr: &str, leg: MeasurementLeg) {
+        if let Ok(mut sessions) = self.positioning_sessions.write() {
+            if let Some(s) = sessions.get_mut(corr) {
+                if !s.expected_legs.contains(&leg) {
+                    s.expected_legs.push(leg);
+                }
+            }
+        }
+    }
+
+    /// Stop waiting for `leg` (its solicitation failed). When every other leg has
+    /// already reported, the session is solved now.
+    pub fn positioning_session_withdraw_leg(&self, corr: &str, leg: MeasurementLeg) -> LegProgress {
+        let ready = {
+            let Ok(mut sessions) = self.positioning_sessions.write() else {
+                return LegProgress::NoSession;
+            };
+            let Some(s) = sessions.get_mut(corr) else {
+                return LegProgress::NoSession;
+            };
+            if s.reported_legs.contains(&leg) {
+                return LegProgress::Waiting;
+            }
+            s.expected_legs.retain(|l| *l != leg);
+            Self::all_legs_in(s).then(|| (s.request_id, s.accumulated.clone()))
+        };
+        match ready {
+            Some((request_id, cells)) => {
+                LegProgress::Completed(self.measurement_report(request_id, cells))
+            }
+            None => LegProgress::Waiting,
+        }
+    }
+
+    fn all_legs_in(s: &PositioningSession) -> bool {
+        !s.reported_legs.is_empty() && s.expected_legs.iter().all(|l| s.reported_legs.contains(l))
+    }
+
+    /// Report one leg's measurements for the session with measurement-store
+    /// `request_id` (#715, #807).
+    ///
+    /// The measurements are added to the session's. When every expected leg has
+    /// reported, all of them are solved together ([`Self::measurement_report`]) and
+    /// the session completes. Until then nothing is solved, so a leg that arrives
+    /// first (an NR E-CID LPP report with no timing term, a UE-only Multi-RTT
+    /// report) can no longer end the session as `SolverFailed` before the leg that
+    /// completes it arrives. A leg that reports twice adds its measurements again;
+    /// the solvers count each TRP once.
+    ///
+    /// With no pending session (a debug route, or a session that already ended)
+    /// the report is solved on its own, as before.
+    pub fn measurement_leg_report(
+        &self,
+        request_id: u64,
+        leg: MeasurementLeg,
+        cells: Vec<CellMeasurement>,
+    ) -> LegProgress {
+        let corr = self
+            .positioning_request_index
+            .read()
+            .ok()
+            .and_then(|r| r.get(&request_id).cloned());
+        let Some(corr) = corr else {
+            return LegProgress::NoSession;
+        };
+        let ready = {
+            let Ok(mut sessions) = self.positioning_sessions.write() else {
+                return LegProgress::NoSession;
+            };
+            let Some(s) = sessions.get_mut(&corr) else {
+                return LegProgress::NoSession;
+            };
+            s.accumulated.extend(cells);
+            if !s.reported_legs.contains(&leg) {
+                s.reported_legs.push(leg);
+            }
+            if Self::all_legs_in(s) {
+                Some(s.accumulated.clone())
+            } else {
+                log::info!(
+                    "Positioning session {corr}: {leg:?} reported; waiting for {:?}",
+                    s.expected_legs
+                        .iter()
+                        .filter(|l| !s.reported_legs.contains(l))
+                        .collect::<Vec<_>>()
+                );
+                None
+            }
+        };
+        match ready {
+            Some(cells) => LegProgress::Completed(self.measurement_report(request_id, cells)),
+            None => LegProgress::Waiting,
+        }
+    }
+
+    /// The response-time budget of session `corr` ran out (#807): solve with the
+    /// legs that did report and complete the session. `None`, and the session left
+    /// in place, when no leg reported at all, which the caller answers as
+    /// unreachable.
+    pub fn positioning_session_solve_now(&self, corr: &str) -> Option<PositioningOutcome> {
+        let (request_id, cells, missing) = {
+            let sessions = self.positioning_sessions.read().ok()?;
+            let s = sessions.get(corr)?;
+            if s.reported_legs.is_empty() {
+                return None;
+            }
+            let missing: Vec<MeasurementLeg> = s
+                .expected_legs
+                .iter()
+                .copied()
+                .filter(|l| !s.reported_legs.contains(l))
+                .collect();
+            (s.request_id, s.accumulated.clone(), missing)
+        };
+        log::info!(
+            "Positioning session {corr}: response-time budget expired without {missing:?}; \
+             solving with the legs that reported"
+        );
+        Some(match self.measurement_report(request_id, cells) {
+            Some(fix) => PositioningOutcome::Fix(fix),
+            None => PositioningOutcome::SolverFailed,
+        })
     }
 
     /// Look up the `lcsCorrelationId` of the newest session that used LPP
@@ -3087,5 +3250,144 @@ mod tests_ecid_label {
         let label = |eutra| try_real_solve(&[serving(eutra)], &reg).unwrap().method_used;
         assert_eq!(label(true).as_deref(), Some("ECID"));
         assert_eq!(label(false).as_deref(), Some("NR_ECID"));
+    }
+}
+
+/// #715 review MAJOR: the legs of one session are solved together, once all of them
+/// are in or when the budget runs out, and the first one no longer decides alone.
+#[cfg(test)]
+mod tests_session_legs {
+    use super::*;
+
+    fn ctx() -> LmfContext {
+        let mut c = LmfContext::new();
+        c.init(16);
+        c.set_cell_coord("pci-77", TrpCoord::new(40.1, -74.5, 0.0));
+        c
+    }
+
+    /// The UE's NR E-CID report: the serving cell and its SS-RSRP, no timing term.
+    fn lpp_leg() -> Vec<CellMeasurement> {
+        vec![cell(Some(-80), None)]
+    }
+
+    /// The gNB's E-CID measurement of the same cell, with its timing advance.
+    fn nrppa_leg() -> Vec<CellMeasurement> {
+        vec![cell(None, Some(100))]
+    }
+
+    fn cell(rsrp: Option<i16>, ta: Option<u32>) -> CellMeasurement {
+        CellMeasurement {
+            nr_cgi: "pci-77".to_string(),
+            rsrp,
+            rsrq: None,
+            timing_advance: ta,
+            aoa: None,
+            rtt_ns: None,
+            rstd_ns: None,
+            rstd_reference: None,
+            ue_rx_tx_ns: None,
+            gnb_rx_tx_ns: None,
+            dl_prs_id: None,
+            eutra: false,
+        }
+    }
+
+    fn session(
+        c: &LmfContext,
+    ) -> (
+        u64,
+        String,
+        tokio::sync::oneshot::Receiver<PositioningOutcome>,
+    ) {
+        let req = c
+            .measurement_request(
+                0,
+                PositioningMethod::Ecid,
+                None,
+                None,
+                PositioningQos::BestEffort,
+            )
+            .unwrap();
+        let (corr, rx) = c.positioning_session_register(Some("imsi-1".into()), 3, req.request_id);
+        c.positioning_session_expect_leg(&corr, MeasurementLeg::NrppaEcid);
+        (req.request_id, corr, rx)
+    }
+
+    /// The race the review describes: the LPP report arrives first. It must wait
+    /// for the NRPPa leg, and the two together give an NR_ECID fix.
+    #[test]
+    fn the_lpp_leg_first_waits_for_the_nrppa_leg_and_both_solve() {
+        let c = ctx();
+        let (request_id, _corr, mut rx) = session(&c);
+        assert!(matches!(
+            c.measurement_leg_report(request_id, MeasurementLeg::Lpp, lpp_leg()),
+            LegProgress::Waiting
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "the LPP leg alone must not end the session"
+        );
+        let LegProgress::Completed(Some(fix)) =
+            c.measurement_leg_report(request_id, MeasurementLeg::NrppaEcid, nrppa_leg())
+        else {
+            panic!("both legs in: solved");
+        };
+        assert_eq!(fix.method_used.as_deref(), Some("NR_ECID"));
+        assert!(matches!(rx.try_recv(), Ok(PositioningOutcome::Fix(_))));
+    }
+
+    /// The other order gives the same answer.
+    #[test]
+    fn the_nrppa_leg_first_waits_for_the_lpp_leg() {
+        let c = ctx();
+        let (request_id, _corr, _rx) = session(&c);
+        assert!(matches!(
+            c.measurement_leg_report(request_id, MeasurementLeg::NrppaEcid, nrppa_leg()),
+            LegProgress::Waiting
+        ));
+        assert!(matches!(
+            c.measurement_leg_report(request_id, MeasurementLeg::Lpp, lpp_leg()),
+            LegProgress::Completed(Some(_))
+        ));
+    }
+
+    /// A gNB that never answers: when the budget runs out, the legs that did
+    /// report are solved. Here the LPP leg alone has no timing term: no fix.
+    #[test]
+    fn budget_expiry_solves_with_the_legs_that_reported() {
+        let c = ctx();
+        let (request_id, corr, _rx) = session(&c);
+        c.measurement_leg_report(request_id, MeasurementLeg::Lpp, lpp_leg());
+        assert!(matches!(
+            c.positioning_session_solve_now(&corr),
+            Some(PositioningOutcome::SolverFailed)
+        ));
+        assert_eq!(c.positioning_session_count(), 0, "the session is complete");
+    }
+
+    /// Nothing reported at all: no outcome, which the caller answers 504.
+    #[test]
+    fn budget_expiry_with_no_leg_is_no_outcome() {
+        let c = ctx();
+        let (_request_id, corr, _rx) = session(&c);
+        assert!(c.positioning_session_solve_now(&corr).is_none());
+        assert_eq!(c.positioning_session_count(), 1);
+    }
+
+    /// A leg whose solicitation failed is withdrawn: the session is solved as soon
+    /// as the others are in, with no wait for a gNB that was never asked.
+    #[test]
+    fn a_withdrawn_leg_is_not_waited_for() {
+        let c = ctx();
+        let (request_id, corr, _rx) = session(&c);
+        assert!(matches!(
+            c.measurement_leg_report(request_id, MeasurementLeg::Lpp, lpp_leg()),
+            LegProgress::Waiting
+        ));
+        assert!(matches!(
+            c.positioning_session_withdraw_leg(&corr, MeasurementLeg::NrppaEcid),
+            LegProgress::Completed(None)
+        ));
     }
 }

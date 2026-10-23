@@ -928,18 +928,32 @@ async fn initiate_positioning(
     // Rx-Tx half, the TA, the serving cell as NG-RAN sees it) while the LPP leg is
     // what asks for the measurements a fix needs at all. A gNB that declines NRPPa
     // must not fail a request the UE could still answer.
+    //
+    // #715 review: an E-CID fix needs this leg's timing term (NR E-CID over LPP
+    // carries none), so an E-CID session waits for it as well as for the LPP
+    // report before it is solved. The leg is expected BEFORE it is solicited, and
+    // withdrawn when the solicitation fails, so a gNB that cannot be reached costs
+    // no wait.
+    let ecid_session = matches!(
+        method,
+        crate::codec_glue::LppMethod::Ecid | crate::codec_glue::LppMethod::NrEcid
+    );
     if nrppa_downlink::enabled() {
-        match nrppa_downlink::build_ecid_measurement_initiation(NRPPA_UE_MEASUREMENT_ID) {
+        if let Ok(context) = lmf_self().read() {
+            context.positioning_session_set_nrppa_peer(
+                &corr,
+                crate::context::NrppaPeer {
+                    amf: amf.clone(),
+                    ue_context_id: target.to_string(),
+                },
+            );
+            if ecid_session {
+                context.positioning_session_expect_leg(&corr, MeasurementLeg::NrppaEcid);
+            }
+        }
+        let sent = match nrppa_downlink::build_ecid_measurement_initiation(NRPPA_UE_MEASUREMENT_ID)
+        {
             Ok((nrppa_txn, nrppa_pdu)) => {
-                if let Ok(context) = lmf_self().read() {
-                    context.positioning_session_set_nrppa_peer(
-                        &corr,
-                        crate::context::NrppaPeer {
-                            amf: amf.clone(),
-                            ue_context_id: target.to_string(),
-                        },
-                    );
-                }
                 let outcome =
                     namf_client::send_n2_nrppa_transfer(&amf, target, &corr, &lmf_id, nrppa_pdu)
                         .await;
@@ -947,8 +961,17 @@ async fn initiate_positioning(
                     "NRPPa E-CID Measurement Initiation (transaction {nrppa_txn:?}) toward the \
                      serving gNB: {outcome:?}"
                 );
+                outcome == namf_client::TransferOutcome::Initiated
             }
-            Err(e) => log::warn!("NRPPa E-CID Measurement Initiation not sent: {e}"),
+            Err(e) => {
+                log::warn!("NRPPa E-CID Measurement Initiation not sent: {e}");
+                false
+            }
+        };
+        if !sent && ecid_session {
+            if let Ok(context) = lmf_self().read() {
+                context.positioning_session_withdraw_leg(&corr, MeasurementLeg::NrppaEcid);
+            }
         }
     }
 
@@ -1050,14 +1073,31 @@ async fn await_positioning_outcome(
             "The positioning session was aborted",
         ),
         Err(_elapsed) => {
-            if let Ok(context) = lmf_self().read() {
-                context.positioning_session_expire(&corr);
+            // #715 review: a leg that reported is used; only a session that heard from
+            // nobody is unreachable.
+            let solved = lmf_self()
+                .read()
+                .ok()
+                .and_then(|c| c.positioning_session_solve_now(&corr));
+            match solved {
+                Some(PositioningOutcome::Fix(est)) => encode_location_response(input, &est, 0),
+                Some(PositioningOutcome::SolverFailed) => problem(
+                    500,
+                    nlmf::cause::POSITIONING_FAILED,
+                    "The measurements received within the response-time budget give no \
+                     location fix",
+                ),
+                None => {
+                    if let Ok(context) = lmf_self().read() {
+                        context.positioning_session_expire(&corr);
+                    }
+                    problem(
+                        504,
+                        nlmf::cause::UNREACHABLE_USER,
+                        "Positioning did not complete within the response-time budget",
+                    )
+                }
             }
-            problem(
-                504,
-                nlmf::cause::UNREACHABLE_USER,
-                "Positioning did not complete within the response-time budget",
-            )
         }
     }
 }
@@ -2859,7 +2899,7 @@ async fn handle_n1_message_notify(request: &SbiRequest) -> SbiResponse {
         }
     };
     if let Ok(context) = lmf_self().read() {
-        context.measurement_report(request_id, cells);
+        context.measurement_leg_report(request_id, MeasurementLeg::Lpp, cells);
     }
     SbiResponse::no_content()
 }
@@ -2955,7 +2995,7 @@ async fn handle_n2_info_notify(request: &SbiRequest) -> SbiResponse {
         send_nrppa_error_indication(lcs_correlation_id, ei).await;
     }
     if let Ok(context) = lmf_self().read() {
-        context.measurement_report(request_id, cells);
+        context.measurement_leg_report(request_id, MeasurementLeg::NrppaEcid, cells);
     }
     SbiResponse::no_content()
 }
@@ -5952,8 +5992,9 @@ lmf:
         assert_eq!(v["cause"], "MANDATORY_IE_MISSING");
     }
 
-    // -- A4: N2InfoNotify (NRPPa) correlates on lcsCorrelationId and completes
-    // the session; the report is attached to the session's request_id.
+    // -- A4: N2InfoNotify (NRPPa) correlates on lcsCorrelationId and feeds the
+    // session's NRPPa leg; with the LPP leg in, the session completes and the
+    // report is attached to the session's request_id.
     #[tokio::test]
     async fn test_n2_info_notify_completes_session() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
@@ -5992,6 +6033,18 @@ lmf:
         );
         let resp = handle_n2_info_notify(&req).await;
         assert_eq!(resp.status, 204, "successful N2InfoNotify callback → 204");
+        // #715 review: the NRPPa leg alone does not end a session that also waits
+        // for the UE's LPP report; that report completes it.
+        let mut rx = rx;
+        assert!(
+            rx.try_recv().is_err(),
+            "the NRPPa leg alone must not end the session"
+        );
+        lmf_self().read().unwrap().measurement_leg_report(
+            request_id,
+            crate::context::MeasurementLeg::Lpp,
+            Vec::new(),
+        );
 
         // The session completed (outcome delivered) and the report was stored.
         let _outcome = tokio::time::timeout(Duration::from_secs(2), rx)
@@ -7072,6 +7125,104 @@ mod positioning_chain_strict_peer {
             .expect("DetermineLocation task did not panic");
         assert_eq!(resp.status, 500);
         assert_eq!(body_json(&resp)["cause"], "POSITIONING_FAILED");
+
+        let _ = amf_server.stop().await;
+        let _ = nrf_server.stop().await;
+    }
+
+    /// #715 review MAJOR, end to end through real amfd: with the NRPPa downlink on,
+    /// the UE's NR E-CID report arrives BEFORE the gNB's E-CID answer. It used to
+    /// end the session with 500 on its own (no timing term). Now the session waits
+    /// for the NRPPa leg, and the two give a 200 NR_ECID fix.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_positioning_chain_nr_ecid_lpp_before_nrppa_is_a_fix() {
+        use crate::nrppa_uplink::test_support::{ecid_initiation_response, nr_cgi, rsrp, ta1};
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let _serial = chain_lock().lock().await;
+        let supi = "imsi-001010000000715".to_string();
+
+        lmf_context_init(1024);
+        prime_lmf_self();
+        nrppa_downlink::set_for_test(true);
+        {
+            let ctx = lmf_self();
+            let g = ctx.read().unwrap();
+            // The same cell as the UE names it (PCI) and as the gNB does (NR CGI).
+            let cell = crate::positioning::TrpCoord::new(40.1, -74.5, 0.0);
+            g.set_cell_coord("pci-77".to_string(), cell);
+            g.set_cell_coord("02f839-000000001".to_string(), cell);
+        }
+        seed_amf_connected_ue(&supi);
+        let (amf_server, nrf_server, mut tap_rx) = start_positioning_harness(supi.clone()).await;
+
+        let body = format!(
+            r#"{{"supi":"{supi}","supportedGADShapes":["POINT_UNCERTAINTY_CIRCLE"],
+                "ncgi":{{"plmnId":{{"mcc":"001","mnc":"01"}},"nrCellId":"000000001"}}}}"#
+        );
+        let req =
+            SbiRequest::post("/nlmf-loc/v1/determine-location").with_body(body, "application/json");
+        let det = tokio::spawn(async move { handle_determine_location(&req).await });
+
+        let (corr, dl_lpp) = tokio::time::timeout(Duration::from_secs(5), tap_rx.recv())
+            .await
+            .expect("amfd accepted the N1N2MessageTransfer within budget")
+            .expect("harness captured the correlation + downlink LPP");
+        let txn = nextgcore_lpp_gen::decode(&dl_lpp)
+            .expect("DL LPP decodes")
+            .transaction_id
+            .expect("txn")
+            .transaction_number
+            .0;
+
+        // 1. The UE's leg first.
+        let ul_lpp = crate::lpp_fixtures::nr_ecid_lpp(77, 80, 60, &[], txn);
+        assert_eq!(
+            handle_n1_message_notify(&amfd_notify_request(&corr, &supi, &ul_lpp))
+                .await
+                .status,
+            204
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !det.is_finished(),
+            "the LPP leg alone must not answer the DetermineLocation"
+        );
+
+        // 2. The gNB's answer to the on-demand E-CID request.
+        let nrppa = ecid_initiation_response(
+            0,
+            1,
+            5,
+            nr_cgi([0x02, 0xf8, 0x39], 1),
+            [0x00, 0x00, 0x01],
+            Some(vec![rsrp(&[60]), ta1(100)]),
+        );
+        let json = format!(
+            "{{\"n2NotifySubscriptionId\":\"sub-715\",\
+             \"n2InfoContainer\":{{\"n2InformationClass\":\"NRPPa\",\
+             \"nrppaInfo\":{{\"nrppaPdu\":{{\"ngapIeType\":\"NRPPA_PDU\",\
+             \"ngapData\":{{\"contentId\":\"nrppa\"}}}}}}}},\
+             \"lcsCorrelationId\":\"{corr}\"}}"
+        );
+        let mut n2 = SbiRequest::post("/nlmf-loc/v1/notify/n2");
+        n2.http.set_content(json);
+        n2.http
+            .add_part(nextgcore_sbi::message::SbiPart::with_content(
+                "nrppa",
+                "application/vnd.3gpp.ngap",
+                bytes::Bytes::from(nrppa),
+            ));
+        assert_eq!(handle_n2_info_notify(&n2).await.status, 204);
+
+        let resp = tokio::time::timeout(Duration::from_secs(10), det)
+            .await
+            .expect("DetermineLocation did not hang")
+            .expect("DetermineLocation task did not panic");
+        nrppa_downlink::set_for_test(false);
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        let out = body_json(&resp);
+        assert_eq!(out["positioningDataList"][0]["method"], "NR_ECID", "{out}");
 
         let _ = amf_server.stop().await;
         let _ = nrf_server.stop().await;
