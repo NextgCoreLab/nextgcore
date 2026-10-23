@@ -411,3 +411,67 @@ fn the_live_test_vector_is_the_unit_test_capability() {
     }
     assert_eq!(std::fs::read(path).unwrap(), cap_5gs());
 }
+
+/// #725: a panic inside the codec becomes `CodecFault`, so it cannot unwind
+/// through the UCMF state lock.
+#[test]
+fn a_codec_panic_is_contained_as_a_codec_fault() {
+    let r: Result<Vec<u8>, RacError> = guarded("a test capability", || panic!("codec defect"));
+    assert_eq!(r, Err(RacError::CodecFault("a test capability")));
+    assert_eq!(
+        guarded("a test capability", || Ok(vec![1u8])),
+        Ok(vec![1u8])
+    );
+}
+
+mod fuzz {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// One of the valid capabilities with a few bytes flipped, overwritten,
+    /// dropped or added: deeper than random bytes reach, since the outer layers
+    /// mostly still decode.
+    fn mutated() -> impl Strategy<Value = Vec<u8>> {
+        (
+            0..3usize,
+            proptest::collection::vec((0..4u8, any::<usize>(), any::<u8>()), 1..6),
+        )
+            .prop_map(|(seed, edits)| {
+                let mut b = [cap_5gs(), cap_eps(false), cap_eps(true)][seed].clone();
+                for (op, at, v) in edits {
+                    let at = at % b.len();
+                    match op {
+                        0 => b[at] ^= 1 << (v % 8),
+                        1 => b[at] = v,
+                        2 => b.truncate(at.max(1)),
+                        _ => b.insert(at, v),
+                    }
+                }
+                b
+            })
+    }
+
+    fn all_four(b: &[u8]) {
+        let _ = transcode_5gs_to_eps_unguarded(b);
+        let _ = transcode_eps_to_5gs_unguarded(b);
+        let _ = derive_paging_5gs_unguarded(b);
+        let _ = derive_paging_eps_unguarded(b);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(3000))]
+
+        /// The unguarded functions, so a codec panic fails the test rather than
+        /// being contained (the cargo-fuzz target `fuzz_ucmf_capability` runs the
+        /// same code under libFuzzer).
+        #[test]
+        fn arbitrary_bytes_never_panic(b in proptest::collection::vec(any::<u8>(), 0..96)) {
+            all_four(&b);
+        }
+
+        #[test]
+        fn mutated_capabilities_never_panic(b in mutated()) {
+            all_four(&b);
+        }
+    }
+}

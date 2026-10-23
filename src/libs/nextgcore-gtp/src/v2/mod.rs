@@ -57,6 +57,7 @@ pub use teid_pool::TeidPool;
 
 // Re-export transaction layer
 pub use xact::{
-    is_command, is_triggered_message, triggered_message_type, triggered_message_types,
-    Gtp2LocalXact, Gtp2XactConfig, Gtp2XactMgr, Gtp2XactPoll, GTP2_MAX_SEQUENCE,
+    is_command, is_command_sequence, is_triggered_message, triggered_message_type,
+    triggered_message_types, Gtp2LocalXact, Gtp2XactConfig, Gtp2XactMgr, Gtp2XactPoll,
+    GTP2_COMMAND_SEQUENCE_FLAG, GTP2_MAX_INITIAL_SEQUENCE, GTP2_MAX_SEQUENCE,
 };

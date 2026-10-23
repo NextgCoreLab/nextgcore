@@ -717,6 +717,15 @@ pub struct SgwuContext {
 }
 
 impl SgwuContext {
+    /// A fresh context whose session ids start at `first`, so a test can use ids no
+    /// other test in the process will (process-global stores are keyed by them).
+    #[cfg(test)]
+    pub(crate) fn with_first_sess_id(first: u64) -> Self {
+        let ctx = Self::new();
+        ctx.next_sess_id.store(first as usize, Ordering::SeqCst);
+        ctx
+    }
+
     /// Create a new SGWU context
     pub fn new() -> Self {
         Self {
@@ -837,6 +846,21 @@ impl SgwuContext {
     /// Remove a session by ID
     /// Port of sgwu_sess_remove from context.c
     pub fn sess_remove(&self, id: u64) -> Option<SgwuSess> {
+        let removed = self.sess_remove_locked(id);
+        if removed.is_some() {
+            // #773: the MBR token buckets are keyed by session in a process-global
+            // map, so they must go with the session or the map grows by one entry per
+            // policed bearer forever. Called AFTER every context guard is released:
+            // the bucket mutex is ordered BEFORE `qer_list` (see `MBR_BUCKETS`), so it
+            // must never be taken while a context lock is held. Forgetting after the
+            // QERs are gone is also what lets `mbr_allows` refuse to re-create a bucket
+            // for a packet that raced this removal.
+            crate::gtp_path::mbr_forget_session(id);
+        }
+        removed
+    }
+
+    fn sess_remove_locked(&self, id: u64) -> Option<SgwuSess> {
         let mut sess_list = self.sess_list.write().ok()?;
         let mut sgwu_sxa_seid_hash = self.sgwu_sxa_seid_hash.write().ok()?;
         let mut sgwc_sxa_seid_hash = self.sgwc_sxa_seid_hash.write().ok()?;
@@ -1205,7 +1229,14 @@ impl SgwuContext {
 
     /// Remove a QER
     pub fn qer_remove(&self, sess_id: u64, qer_id: u32) -> Option<SgwuQer> {
-        self.qer_list.write().ok()?.remove(&(sess_id, qer_id))
+        let removed = self.qer_list.write().ok()?.remove(&(sess_id, qer_id));
+        if removed.is_some() {
+            // #773: a Remove QER drops its MBR buckets too, so a QER later re-created
+            // with the same id starts from a fresh bucket rather than inheriting the
+            // removed rule's credit (and the entry does not outlive the rule).
+            crate::gtp_path::mbr_forget_qer(sess_id, qer_id);
+        }
+        removed
     }
 
     /// Find a QER
