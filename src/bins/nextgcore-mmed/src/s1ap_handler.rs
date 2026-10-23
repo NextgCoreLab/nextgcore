@@ -1842,15 +1842,11 @@ pub fn handle_initial_context_setup_failure(
         msg.cause
     );
 
-    let Some(enb_ue_id) = ctx.enb_ue_find_by_mme_ue_s1ap_id(msg.mme_ue_s1ap_id) else {
-        // Nothing of ours to release; tell the eNB its id means nothing here.
-        return error_indication(
-            enb_id,
-            Some(msg.enb_ue_s1ap_id),
-            Some(msg.mme_ue_s1ap_id),
-            S1apCauseGroup::RadioNetwork,
-            radio_network_cause::UNKNOWN_MME_UE_S1AP_ID,
-        );
+    // #731: nothing of ours, or not this eNB's pair: an ERROR INDICATION and
+    // nothing released.
+    let enb_ue_id = match ue_by_pair(ctx, enb_id, msg.mme_ue_s1ap_id, msg.enb_ue_s1ap_id) {
+        Ok(ue) => ue.id,
+        Err(out) => return out,
     };
 
     let cause = cause_from_s1ap(&msg.cause);
@@ -1900,15 +1896,22 @@ pub fn handle_error_indication(ctx: &MmeContext, enb_id: u64, msg: &ErrorIndicat
         return;
     }
 
-    let Some(mme_ue_s1ap_id) = msg.mme_ue_s1ap_id else {
-        return;
-    };
-    let Some(enb_ue_id) = ctx.enb_ue_find_by_mme_ue_s1ap_id(mme_ue_s1ap_id) else {
+    // #731: only a context on the sending eNB, and only if every ID present
+    // matches. A stale ERROR INDICATION from an X2 source eNB names a context
+    // that now lives on the target, which must not be released.
+    let Some(enb_ue_id) = enb_ue_on_enb(ctx, enb_id, msg.mme_ue_s1ap_id, msg.enb_ue_s1ap_id) else {
+        log::info!(
+            "Error Indication from eNB {enb_id} names no S1 context on that eNB (mme_ue={:?}, \
+             enb_ue={:?}); nothing released",
+            msg.mme_ue_s1ap_id,
+            msg.enb_ue_s1ap_id
+        );
         return;
     };
 
     log::info!(
-        "eNB {enb_id} does not know mme_ue_s1ap_id={mme_ue_s1ap_id}; releasing the local S1 context"
+        "eNB {enb_id} does not know mme_ue_s1ap_id={:?}; releasing the local S1 context",
+        msg.mme_ue_s1ap_id
     );
     release_s1_connection(ctx, enb_ue_id);
 }
@@ -1954,14 +1957,10 @@ pub fn handle_ue_context_release_request(
     enb_id: u64,
     msg: &UeContextReleaseRequest,
 ) -> Vec<S1apSend> {
-    let Some(enb_ue_id) = ctx.enb_ue_find_by_mme_ue_s1ap_id(msg.mme_ue_s1ap_id) else {
-        return error_indication(
-            enb_id,
-            Some(msg.enb_ue_s1ap_id),
-            Some(msg.mme_ue_s1ap_id),
-            S1apCauseGroup::RadioNetwork,
-            radio_network_cause::UNKNOWN_MME_UE_S1AP_ID,
-        );
+    // #731: the pair must be one this eNB holds.
+    let enb_ue_id = match ue_by_pair(ctx, enb_id, msg.mme_ue_s1ap_id, msg.enb_ue_s1ap_id) {
+        Ok(ue) => ue.id,
+        Err(out) => return out,
     };
 
     let cause = cause_from_s1ap(&msg.cause);
@@ -1988,10 +1987,15 @@ pub fn handle_ue_context_release_request(
 /// Handle UE Context Release Complete: tear down the eNB UE context.
 pub fn handle_ue_context_release_complete(
     ctx: &MmeContext,
-    _enb_id: u64,
+    enb_id: u64,
     msg: &UeContextReleaseComplete,
 ) {
-    let Some(enb_ue_id) = ctx.enb_ue_find_by_mme_ue_s1ap_id(msg.mme_ue_s1ap_id) else {
+    let Some(enb_ue_id) = enb_ue_on_enb(
+        ctx,
+        enb_id,
+        Some(msg.mme_ue_s1ap_id),
+        Some(msg.enb_ue_s1ap_id),
+    ) else {
         log::warn!(
             "UE Context Release Complete for unknown mme_ue_s1ap_id={}",
             msg.mme_ue_s1ap_id
@@ -2010,18 +2014,8 @@ pub fn handle_release_complete(
     enb_id: u64,
     msg: &crate::s1ap_gen::ReleaseComplete,
 ) {
-    let enb_ue_id = msg
-        .mme_ue_s1ap_id
-        .and_then(|id| ctx.enb_ue_find_by_mme_ue_s1ap_id(id))
-        .or_else(|| {
-            let id = msg.enb_ue_s1ap_id?;
-            ctx.enb_ue_pool
-                .read()
-                .unwrap()
-                .iter()
-                .find(|(_, ue)| ue.enb_id == enb_id && ue.enb_ue_s1ap_id == id)
-                .map(|(pool_id, _)| *pool_id)
-        });
+    // #731: on this eNB only, every present ID matching.
+    let enb_ue_id = enb_ue_on_enb(ctx, enb_id, msg.mme_ue_s1ap_id, msg.enb_ue_s1ap_id);
     let Some(enb_ue_id) = enb_ue_id else {
         log::warn!(
             "UE Context Release Complete for unknown UE (mme_ue_s1ap_id={:?}, enb_ue_s1ap_id={:?})",
@@ -2062,19 +2056,10 @@ pub fn handle_reset_reporting(
         }
         ResetType::PartOfS1Interface(connections) => {
             for conn in connections {
-                let enb_ue_id = conn
-                    .mme_ue_s1ap_id
-                    .and_then(|id| ctx.enb_ue_find_by_mme_ue_s1ap_id(id))
-                    .or_else(|| {
-                        conn.enb_ue_s1ap_id.and_then(|id| {
-                            ctx.enb_ue_pool
-                                .read()
-                                .unwrap()
-                                .iter()
-                                .find(|(_, ue)| ue.enb_id == enb_id && ue.enb_ue_s1ap_id == id)
-                                .map(|(pool_id, _)| *pool_id)
-                        })
-                    });
+                // #731: a partial reset releases only connections of the
+                // resetting eNB, matching every ID it gave.
+                let enb_ue_id =
+                    enb_ue_on_enb(ctx, enb_id, conn.mme_ue_s1ap_id, conn.enb_ue_s1ap_id);
                 if let Some(enb_ue_id) = enb_ue_id {
                     if let Some(enb_ue) = ctx.enb_ue_pool.write().unwrap().get_mut(&enb_ue_id) {
                         enb_ue.part_of_s1_reset_requested = true;
@@ -2217,6 +2202,10 @@ pub fn handle_handover_required_reporting(
             notify,
         );
     };
+    // #731: the source must send it under the pair it holds.
+    if let Err(out) = ue_by_pair(ctx, enb_id, msg.mme_ue_s1ap_id, msg.enb_ue_s1ap_id) {
+        return out;
+    }
 
     // Resolve the target eNB (only intra-LTE targets are supported)
     let target_enb_pool_id = match &msg.target_id {
@@ -2422,7 +2411,7 @@ pub fn handle_handover_required_to_5gs(
     let Some(source_ue) = ctx
         .enb_ue_find_by_mme_ue_s1ap_id(msg.mme_ue_s1ap_id)
         .and_then(|id| ctx.enb_ue_find_by_id(id))
-        .filter(|ue| ue.enb_id == enb_id)
+        .filter(|ue| ue.enb_id == enb_id && ue.enb_ue_s1ap_id == msg.enb_ue_s1ap_id)
     else {
         return fail(radio_network_cause::UNKNOWN_MME_UE_S1AP_ID);
     };
@@ -2654,16 +2643,16 @@ fn handover_preparation_failure(
 /// admitted E-RABs and send Handover Command to the source eNB.
 pub fn handle_handover_request_acknowledge(
     ctx: &MmeContext,
-    _enb_id: u64,
+    enb_id: u64,
     msg: &HandoverRequestAcknowledge,
 ) -> Vec<S1apSend> {
-    let Some(target_ue_id) = ctx.enb_ue_find_by_mme_ue_s1ap_id(msg.mme_ue_s1ap_id) else {
-        log::error!(
-            "Handover Request Acknowledge for unknown mme_ue_s1ap_id={}",
-            msg.mme_ue_s1ap_id
-        );
-        return Vec::new();
-    };
+    // #731: from the recorded target eNB, for a preparation outstanding, before
+    // anything (the eNB UE S1AP ID included) is written.
+    let target_ue_id =
+        match handover_target_from(ctx, enb_id, msg.mme_ue_s1ap_id, Some(msg.enb_ue_s1ap_id)) {
+            Ok(target) => target.id,
+            Err(out) => return out,
+        };
 
     let target_ue = {
         let mut pool = ctx.enb_ue_pool.write().unwrap();
@@ -2913,23 +2902,10 @@ pub fn handle_enb_status_transfer(
     enb_id: u64,
     msg: &EnbStatusTransfer,
 ) -> Vec<S1apSend> {
-    let Some(source_ue_id) = ctx.enb_ue_find_by_mme_ue_s1ap_id(msg.mme_ue_s1ap_id) else {
-        return error_indication(
-            enb_id,
-            Some(msg.enb_ue_s1ap_id),
-            Some(msg.mme_ue_s1ap_id),
-            S1apCauseGroup::RadioNetwork,
-            radio_network_cause::UNKNOWN_MME_UE_S1AP_ID,
-        );
-    };
-    let Some(source_ue) = ctx.enb_ue_find_by_id(source_ue_id) else {
-        return error_indication(
-            enb_id,
-            Some(msg.enb_ue_s1ap_id),
-            Some(msg.mme_ue_s1ap_id),
-            S1apCauseGroup::RadioNetwork,
-            radio_network_cause::UNKNOWN_MME_UE_S1AP_ID,
-        );
+    // #731: the source eNB, under the pair it holds.
+    let source_ue = match ue_by_pair(ctx, enb_id, msg.mme_ue_s1ap_id, msg.enb_ue_s1ap_id) {
+        Ok(ue) => ue,
+        Err(out) => return out,
     };
 
     // No prepared target means there is no handover to carry the status into. §8.4.6
@@ -2990,19 +2966,16 @@ pub fn handle_enb_status_transfer(
 /// answer the source eNB with Handover Preparation Failure.
 pub fn handle_handover_failure(
     ctx: &MmeContext,
-    _enb_id: u64,
+    enb_id: u64,
     msg: &HandoverFailure,
 ) -> Vec<S1apSend> {
-    let Some(target_ue_id) = ctx.enb_ue_find_by_mme_ue_s1ap_id(msg.mme_ue_s1ap_id) else {
-        log::error!(
-            "Handover Failure for unknown mme_ue_s1ap_id={}",
-            msg.mme_ue_s1ap_id
-        );
-        return Vec::new();
+    // #731: a stray HANDOVER FAILURE (another eNB, or a UE in no handover) must
+    // not delete a live UE's eNB context.
+    let target_ue = match handover_target_from(ctx, enb_id, msg.mme_ue_s1ap_id, None) {
+        Ok(target) => target,
+        Err(out) => return out,
     };
-    let Some(target_ue) = ctx.enb_ue_find_by_id(target_ue_id) else {
-        return Vec::new();
-    };
+    let target_ue_id = target_ue.id;
     // #48: the target reported the failure itself, so it is releasing its own
     // resources -- no release command, but the supervision must be disarmed before the
     // context goes, or the sweep would try to release an id that no longer exists.
@@ -3310,14 +3283,10 @@ pub fn handle_handover_cancel_reporting(
     msg: &HandoverCancel,
     cancel_notify: &[crate::s1ap_gen::DiagnosedIe],
 ) -> Vec<S1apSend> {
-    let Some(source_ue_id) = ctx.enb_ue_find_by_mme_ue_s1ap_id(msg.mme_ue_s1ap_id) else {
-        return error_indication(
-            enb_id,
-            Some(msg.enb_ue_s1ap_id),
-            Some(msg.mme_ue_s1ap_id),
-            S1apCauseGroup::RadioNetwork,
-            radio_network_cause::UNKNOWN_MME_UE_S1AP_ID,
-        );
+    // #731: the source eNB, under the pair it holds.
+    let source_ue_id = match ue_by_pair(ctx, enb_id, msg.mme_ue_s1ap_id, msg.enb_ue_s1ap_id) {
+        Ok(ue) => ue.id,
+        Err(out) => return out,
     };
 
     // #584: a cancelled EPS to 5GS preparation must not be finished by a late
@@ -3894,6 +3863,82 @@ fn ue_by_pair(
     }
 }
 
+/// The eNB UE context a UE-associated message from `enb_id` names (#731).
+///
+/// Only contexts on `enb_id` are considered: the MME UE S1AP ID is unique in the
+/// MME, but a message from one eNB never reaches a context on another (an old
+/// source eNB after an X2 handover, or a misrouted or stray message). Each ID
+/// that is present must match. `None` when no context on this eNB fits.
+fn enb_ue_on_enb(
+    ctx: &MmeContext,
+    enb_id: u64,
+    mme_ue_s1ap_id: Option<u32>,
+    enb_ue_s1ap_id: Option<u32>,
+) -> Option<u64> {
+    if mme_ue_s1ap_id.is_none() && enb_ue_s1ap_id.is_none() {
+        return None;
+    }
+    ctx.enb_ue_pool
+        .read()
+        .unwrap()
+        .iter()
+        .find(|(_, ue)| {
+            ue.enb_id == enb_id
+                && mme_ue_s1ap_id.is_none_or(|id| ue.mme_ue_s1ap_id == id)
+                && enb_ue_s1ap_id.is_none_or(|id| ue.enb_ue_s1ap_id == id)
+        })
+        .map(|(pool_id, _)| *pool_id)
+}
+
+/// The TARGET context of a handover a target-side message (HANDOVER REQUEST
+/// ACKNOWLEDGE, HANDOVER FAILURE) from `enb_id` names (#731): it must be on that
+/// eNB, a preparation must be outstanding for it (an S1 target armed by
+/// HANDOVER REQUIRED, or a 5GS-to-EPS arrival), and an eNB UE S1AP ID the
+/// target already gave must match. Anything else is answered with ERROR
+/// INDICATION (TS 36.413 §10.6) and changes nothing.
+fn handover_target_from(
+    ctx: &MmeContext,
+    enb_id: u64,
+    mme_ue_s1ap_id: u32,
+    enb_ue_s1ap_id: Option<u32>,
+) -> Result<crate::context::EnbUe, Vec<S1apSend>> {
+    let found = ctx
+        .enb_ue_find_by_mme_ue_s1ap_id(mme_ue_s1ap_id)
+        .and_then(|id| ctx.enb_ue_find_by_id(id));
+    let Some(target) = found else {
+        return Err(error_indication(
+            enb_id,
+            enb_ue_s1ap_id,
+            Some(mme_ue_s1ap_id),
+            S1apCauseGroup::RadioNetwork,
+            radio_network_cause::UNKNOWN_MME_UE_S1AP_ID,
+        ));
+    };
+    let preparing = target.handover_prep_deadline.is_some()
+        || crate::n26_path::forward_relocation_in_flight(target.mme_ue_id);
+    let enb_ue_id_fits = match enb_ue_s1ap_id {
+        Some(id) => target.enb_ue_s1ap_id == INVALID_UE_S1AP_ID || target.enb_ue_s1ap_id == id,
+        None => true,
+    };
+    if target.enb_id == enb_id && preparing && enb_ue_id_fits {
+        return Ok(target);
+    }
+    log::warn!(
+        "target-side handover message from eNB {enb_id} for mme_ue_s1ap_id={mme_ue_s1ap_id}: \
+         the context is on eNB {} (preparation outstanding: {preparing}, enb_ue_s1ap_id {} vs \
+         {enb_ue_s1ap_id:?}); ignored (TS 36.413 §10.6)",
+        target.enb_id,
+        target.enb_ue_s1ap_id
+    );
+    Err(error_indication(
+        enb_id,
+        enb_ue_s1ap_id,
+        Some(mme_ue_s1ap_id),
+        S1apCauseGroup::RadioNetwork,
+        radio_network_cause::UNKNOWN_PAIR_UE_S1AP_ID,
+    ))
+}
+
 fn store_location(
     ctx: &MmeContext,
     enb_ue_id: u64,
@@ -4427,6 +4472,236 @@ mod tests {
         let ctx = MmeContext::new();
         ctx.init();
         ctx
+    }
+
+    /// Whether `out` is exactly one ERROR INDICATION to `enb_id` with the
+    /// radio-network cause `cause`.
+    fn is_error_indication_to(out: &[S1apSend], enb_id: u64, cause: CauseRadioNetwork) -> bool {
+        use nextgcore_s1ap_gen::generated as g;
+        out.len() == 1
+            && out[0].enb_id == enb_id
+            && matches!(
+                nextgcore_s1ap_gen::decode(&out[0].pdu),
+                Ok(g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+                    value: g::InitiatingMessageValue::Id_ErrorIndication(ref e),
+                    ..
+                })) if e.protocol_i_es.0.iter().any(|ie| matches!(
+                    &ie.value,
+                    g::ErrorIndicationProtocolIEs_EntryValue::Id_Cause(g::Cause::RadioNetwork(r))
+                        if r.0 == cause as u8
+                ))
+            )
+    }
+
+    /// #731, TS 36.413 §10.6: a HANDOVER FAILURE naming a UE that is in no
+    /// handover, or sent by an eNB that is not its target, deletes nothing and
+    /// gets ERROR INDICATION (unknown-pair-ue-s1ap-id). Before #731 the UE's
+    /// eNB context was removed and nothing was sent.
+    #[test]
+    fn a_stray_handover_failure_deletes_no_live_ue() {
+        let ctx = test_ctx();
+        let (enb_id, enb_ue_id, mme_ue_id, mme_ue_s1ap_id) = add_ue(&ctx);
+        let other_enb = ctx.enb_add("127.0.0.1:36499".parse().unwrap());
+        let failure = HandoverFailure {
+            mme_ue_s1ap_id,
+            cause: Cause::RadioNetwork(CauseRadioNetwork::Unspecified),
+        };
+        for from in [enb_id, other_enb] {
+            let out = handle_handover_failure(&ctx, from, &failure);
+            assert!(
+                is_error_indication_to(&out, from, CauseRadioNetwork::UnknownPairUeS1apId),
+                "{out:?}"
+            );
+            assert!(
+                ctx.enb_ue_find_by_id(enb_ue_id).is_some(),
+                "the live context stays"
+            );
+            assert_eq!(
+                ctx.mme_ue_find_by_id(mme_ue_id).unwrap().enb_ue_id,
+                enb_ue_id
+            );
+        }
+    }
+
+    /// #731: a HANDOVER REQUEST ACKNOWLEDGE from an eNB that is not the
+    /// recorded target changes nothing (the eNB UE S1AP ID is not overwritten)
+    /// and gets ERROR INDICATION.
+    #[test]
+    fn a_handover_request_ack_from_another_enb_changes_nothing() {
+        let ctx = test_ctx();
+        let (_enb_id, source_ue_id, mme_ue_id, _) = add_ue(&ctx);
+        let target_enb = ctx.enb_add("127.0.0.1:36498".parse().unwrap());
+        let intruder = ctx.enb_add("127.0.0.1:36497".parse().unwrap());
+        let target_ue_id = ctx.enb_ue_add(target_enb, INVALID_UE_S1AP_ID);
+        {
+            let mut pool = ctx.enb_ue_pool.write().unwrap();
+            let t = pool.get_mut(&target_ue_id).unwrap();
+            t.mme_ue_id = mme_ue_id;
+            t.source_ue_id = source_ue_id;
+            t.handover_prep_deadline =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
+        }
+        let target_mme_id = ctx.enb_ue_find_by_id(target_ue_id).unwrap().mme_ue_s1ap_id;
+        let ack = HandoverRequestAcknowledge {
+            mme_ue_s1ap_id: target_mme_id,
+            enb_ue_s1ap_id: 0x731,
+            erab_admitted_list: Vec::new(),
+            erab_failed_list: Vec::new(),
+            target_to_source_container: vec![0],
+        };
+        let out = handle_handover_request_acknowledge(&ctx, intruder, &ack);
+        assert!(
+            is_error_indication_to(&out, intruder, CauseRadioNetwork::UnknownPairUeS1apId),
+            "{out:?}"
+        );
+        let target = ctx.enb_ue_find_by_id(target_ue_id).unwrap();
+        assert_eq!(target.enb_ue_s1ap_id, INVALID_UE_S1AP_ID, "not overwritten");
+        assert!(target.handover_prep_deadline.is_some());
+        // The real target is accepted (it gets past the validation and writes
+        // its eNB UE S1AP ID).
+        handle_handover_request_acknowledge(&ctx, target_enb, &ack);
+        assert_eq!(
+            ctx.enb_ue_find_by_id(target_ue_id).unwrap().enb_ue_s1ap_id,
+            0x731
+        );
+    }
+
+    /// #731 scenario 2: after an X2 handover the context lives on eNB B under
+    /// the same MME UE S1AP ID. A stale ERROR INDICATION or partial RESET from
+    /// the old eNB A, carrying the old pair, must not release it.
+    #[test]
+    fn a_stale_error_indication_or_partial_reset_from_the_x2_source_releases_nothing() {
+        let ctx = test_ctx();
+        let (enb_a, enb_ue_id, mme_ue_id, mme_ue_s1ap_id) = add_ue(&ctx);
+        let enb_b = ctx.enb_add("127.0.0.1:36496".parse().unwrap());
+        // The Path Switch re-anchored the context on B.
+        {
+            let mut pool = ctx.enb_ue_pool.write().unwrap();
+            let ue = pool.get_mut(&enb_ue_id).unwrap();
+            ue.enb_id = enb_b;
+            ue.enb_ue_s1ap_id = 200;
+        }
+        handle_error_indication(
+            &ctx,
+            enb_a,
+            &ErrorIndication {
+                mme_ue_s1ap_id: Some(mme_ue_s1ap_id),
+                enb_ue_s1ap_id: Some(100),
+                cause: Some(Cause::RadioNetwork(CauseRadioNetwork::UnknownMmeUeS1apId)),
+                criticality_diagnostics: None,
+            },
+        );
+        assert!(
+            ctx.enb_ue_find_by_id(enb_ue_id).is_some(),
+            "Error Indication"
+        );
+        // The eNB UE S1AP ID is optional (criticality ignore): with the MME UE
+        // S1AP ID alone, the sending eNB decides.
+        handle_error_indication(
+            &ctx,
+            enb_a,
+            &ErrorIndication {
+                mme_ue_s1ap_id: Some(mme_ue_s1ap_id),
+                enb_ue_s1ap_id: None,
+                cause: Some(Cause::RadioNetwork(CauseRadioNetwork::UnknownMmeUeS1apId)),
+                criticality_diagnostics: None,
+            },
+        );
+        assert!(
+            ctx.enb_ue_find_by_id(enb_ue_id).is_some(),
+            "Error Indication without an eNB UE S1AP ID"
+        );
+        handle_reset(
+            &ctx,
+            enb_a,
+            &Reset {
+                cause: Cause::RadioNetwork(CauseRadioNetwork::Unspecified),
+                reset_type: ResetType::PartOfS1Interface(vec![UeAssociatedLogicalS1Connection {
+                    mme_ue_s1ap_id: Some(mme_ue_s1ap_id),
+                    enb_ue_s1ap_id: Some(100),
+                }]),
+            },
+        );
+        assert!(ctx.enb_ue_find_by_id(enb_ue_id).is_some(), "partial Reset");
+        assert_eq!(
+            ctx.mme_ue_find_by_id(mme_ue_id).unwrap().enb_ue_id,
+            enb_ue_id
+        );
+        // From B, with B's pair, the same Error Indication does release it.
+        handle_error_indication(
+            &ctx,
+            enb_b,
+            &ErrorIndication {
+                mme_ue_s1ap_id: Some(mme_ue_s1ap_id),
+                enb_ue_s1ap_id: Some(200),
+                cause: Some(Cause::RadioNetwork(CauseRadioNetwork::UnknownMmeUeS1apId)),
+                criticality_diagnostics: None,
+            },
+        );
+        assert!(
+            ctx.enb_ue_find_by_id(enb_ue_id).is_none(),
+            "the real eNB's indication acts"
+        );
+    }
+
+    /// #731: source-side messages (HANDOVER CANCEL, eNB STATUS TRANSFER,
+    /// HANDOVER REQUIRED) and UE CONTEXT RELEASE REQUEST with a pair this eNB
+    /// does not hold get ERROR INDICATION and change nothing.
+    #[test]
+    fn source_side_messages_with_a_foreign_pair_are_refused() {
+        let ctx = test_ctx();
+        let (enb_id, enb_ue_id, _mme_ue_id, mme_ue_s1ap_id) = add_ue(&ctx);
+        let intruder = ctx.enb_add("127.0.0.1:36495".parse().unwrap());
+        let pair_cause = CauseRadioNetwork::UnknownPairUeS1apId;
+
+        let cancel = HandoverCancel {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id: 100,
+            cause: Cause::RadioNetwork(CauseRadioNetwork::Unspecified),
+        };
+        let out = handle_handover_cancel(&ctx, intruder, &cancel);
+        assert!(
+            is_error_indication_to(&out, intruder, pair_cause),
+            "cancel {out:?}"
+        );
+
+        let transfer = EnbStatusTransfer {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id: 100,
+            status_transfer_container: vec![0],
+        };
+        let out = handle_enb_status_transfer(&ctx, intruder, &transfer);
+        assert!(
+            is_error_indication_to(&out, intruder, pair_cause),
+            "status {out:?}"
+        );
+
+        let release = UeContextReleaseRequest {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id: 999, // the right eNB, the wrong eNB UE S1AP ID
+            cause: Cause::RadioNetwork(CauseRadioNetwork::Unspecified),
+        };
+        let out = handle_ue_context_release_request(&ctx, enb_id, &release);
+        assert!(
+            is_error_indication_to(&out, enb_id, pair_cause),
+            "release {out:?}"
+        );
+        let ue = ctx.enb_ue_find_by_id(enb_ue_id).unwrap();
+        assert_eq!(ue.ue_ctx_rel_action, UeCtxRelAction::default(), "untouched");
+
+        // UE CONTEXT RELEASE COMPLETE from another eNB removes nothing.
+        handle_ue_context_release_complete(
+            &ctx,
+            intruder,
+            &UeContextReleaseComplete {
+                mme_ue_s1ap_id,
+                enb_ue_s1ap_id: 100,
+            },
+        );
+        assert!(
+            ctx.enb_ue_find_by_id(enb_ue_id).is_some(),
+            "release complete"
+        );
     }
 
     fn ctx_with_gummei() -> MmeContext {
