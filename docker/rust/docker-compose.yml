@@ -245,6 +245,8 @@ services:
     environment:
       <<: *common-env
       RUST_LOG: info,nextgcore_amfd=debug
+      # #753: a stable nfInstanceId, so a restarted AMF is the same AMF to the UDM.
+      NEXTGCORE_AMF_INSTANCE_ID: 6b1d7e3c-0000-4000-8000-000000000af0
       AMF_SBI_ADDR: 172.23.0.5
       AMF_SBI_PORT: "7777"
       SMF_SBI_ADDR: 172.23.0.4

@@ -654,6 +654,12 @@ fn qer_enforcement_enabled() -> bool {
 }
 
 /// Per-(session, QER, direction) token buckets for MBR policing.
+///
+/// **Lock order (#773 review):** `MBR_BUCKETS` -> `SgwuContext::qer_list` (read), taken
+/// in [`mbr_allows`] to re-check that a QER is still installed before a bucket is
+/// CREATED for it. Nobody may take this mutex while holding `qer_list` (or any other
+/// context lock): `sess_remove` and `qer_remove` drop their guards before forgetting
+/// buckets, which is what makes the re-check linearizable with them.
 static MBR_BUCKETS: std::sync::OnceLock<std::sync::Mutex<HashMap<(u64, u32, bool), MbrBucket>>> =
     std::sync::OnceLock::new();
 
@@ -672,7 +678,14 @@ struct MbrBucket {
 ///
 /// Returns true (forward) when the bucket cannot be locked — a poisoned lock
 /// must not become a traffic black hole.
-fn mbr_allows(sess_id: u64, qer_id: u32, uplink: bool, mbr_bps: u64, len: usize) -> bool {
+fn mbr_allows(
+    ctx: &crate::context::SgwuContext,
+    sess_id: u64,
+    qer_id: u32,
+    uplink: bool,
+    mbr_bps: u64,
+    len: usize,
+) -> bool {
     let buckets = MBR_BUCKETS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let Ok(mut buckets) = buckets.lock() else {
         return true;
@@ -681,12 +694,26 @@ fn mbr_allows(sess_id: u64, qer_id: u32, uplink: bool, mbr_bps: u64, len: usize)
     let bits = (len as f64) * 8.0;
     let capacity = mbr_bps as f64;
 
-    let bucket = buckets
-        .entry((sess_id, qer_id, uplink))
-        .or_insert(MbrBucket {
-            tokens: capacity,
-            last: now,
-        });
+    let bucket = match buckets.entry((sess_id, qer_id, uplink)) {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(e) => {
+            // #773 review: the caller read the QER BEFORE taking this mutex, so a
+            // Session Deletion / Remove QER may have dropped it -- and forgotten its
+            // buckets -- in between. Creating a bucket now would leak it for good
+            // (session ids are never reused) or hand it to a later QER with the same
+            // id. Re-checked under the mutex: a remover forgets AFTER taking the QER
+            // out of `qer_list`, so either its forget runs after this insert and
+            // removes it, or the QER is already gone here. The rule is gone either
+            // way, so the packet is not policed by it.
+            if ctx.qer_find(sess_id, qer_id).is_none() {
+                return true;
+            }
+            e.insert(MbrBucket {
+                tokens: capacity,
+                last: now,
+            })
+        }
+    };
     let elapsed = now.duration_since(bucket.last).as_secs_f64();
     bucket.last = now;
     bucket.tokens = (bucket.tokens + elapsed * capacity).min(capacity);
@@ -699,14 +726,36 @@ fn mbr_allows(sess_id: u64, qer_id: u32, uplink: bool, mbr_bps: u64, len: usize)
     }
 }
 
-/// Drop any MBR state held for a session (called when the session goes away, so
-/// buckets do not accumulate for dead sessions).
+/// Drop any MBR state held for a session. Called by `SgwuContext::sess_remove`,
+/// which every session-removal path goes through (#773), so buckets do not
+/// accumulate for dead sessions.
 pub fn mbr_forget_session(sess_id: u64) {
     if let Some(buckets) = MBR_BUCKETS.get() {
         if let Ok(mut buckets) = buckets.lock() {
             buckets.retain(|(sid, _, _), _| *sid != sess_id);
         }
     }
+}
+
+/// Drop the MBR state of one QER (both directions), on Remove QER (#773).
+pub fn mbr_forget_qer(sess_id: u64, qer_id: u32) {
+    if let Some(buckets) = MBR_BUCKETS.get() {
+        if let Ok(mut buckets) = buckets.lock() {
+            buckets.retain(|(sid, qid, _), _| !(*sid == sess_id && *qid == qer_id));
+        }
+    }
+}
+
+/// How many MBR buckets are held for `sess_id` (and, with `qer_id`, that QER).
+#[cfg(test)]
+pub(crate) fn mbr_bucket_count(sess_id: u64, qer_id: Option<u32>) -> usize {
+    MBR_BUCKETS.get().map_or(0, |b| {
+        b.lock()
+            .unwrap()
+            .keys()
+            .filter(|(sid, qid, _)| *sid == sess_id && qer_id.is_none_or(|q| q == *qid))
+            .count()
+    })
 }
 
 /// Apply the FAR linked to a PDR to a received payload
@@ -746,7 +795,7 @@ fn apply_far(server: &GtpuServer, pdr: &SgwuPdr, payload: &[u8]) -> GtpuRecvResu
                 return GtpuRecvResult::Dropped("QER gate CLOSED".to_string());
             }
             let mbr = qer.mbr_bps(uplink);
-            if mbr > 0 && !mbr_allows(pdr.sess_id, qer.qer_id, uplink, mbr, payload.len()) {
+            if mbr > 0 && !mbr_allows(ctx, pdr.sess_id, qer.qer_id, uplink, mbr, payload.len()) {
                 log::debug!("DROP per QER {} MBR {mbr} bps exceeded", qer.qer_id);
                 return GtpuRecvResult::Dropped("QER MBR exceeded".to_string());
             }
@@ -1767,38 +1816,151 @@ mod tests {
         server.close();
     }
 
+    /// A private context holding QERs `qer_ids` on one session, for the MBR tests:
+    /// `mbr_allows` only creates a bucket for a QER that is installed.
+    fn ctx_with_qers(first_sess_id: u64, qer_ids: &[u32]) -> (crate::context::SgwuContext, u64) {
+        let ctx = crate::context::SgwuContext::with_first_sess_id(first_sess_id);
+        let s = ctx
+            .sess_add(&FSeid::with_ipv4(first_sess_id, Ipv4Addr::new(10, 7, 7, 4)))
+            .unwrap();
+        for &qer_id in qer_ids {
+            ctx.qer_install(crate::context::SgwuQer {
+                sess_id: s.id,
+                qer_id,
+                ..Default::default()
+            });
+        }
+        (ctx, s.id)
+    }
+
     /// The MBR token bucket: the first packet fits within one second of credit,
     /// and a packet far larger than the whole per-second allowance cannot.
     #[test]
     fn mbr_bucket_admits_within_rate_and_rejects_beyond_it() {
+        let (ctx, sid) = ctx_with_qers(0x7740_0000, &[1, 2, 3]);
         // 8000 bits per second = 1000 bytes/s of credit.
         assert!(
-            mbr_allows(9001, 1, true, 8000, 100),
+            mbr_allows(&ctx, sid, 1, true, 8000, 100),
             "100 bytes must fit in a 1000 byte/s bucket"
         );
         // A single packet larger than the entire per-second capacity can never
         // fit, however long we wait.
         assert!(
-            !mbr_allows(9002, 1, true, 8000, 5000),
+            !mbr_allows(&ctx, sid, 2, true, 8000, 5000),
             "5000 bytes cannot fit a 1000 byte/s bucket"
         );
         // Directions are policed independently.
-        assert!(mbr_allows(9003, 1, true, 8000, 900));
-        assert!(mbr_allows(9003, 1, false, 8000, 900));
+        assert!(mbr_allows(&ctx, sid, 3, true, 8000, 900));
+        assert!(mbr_allows(&ctx, sid, 3, false, 8000, 900));
 
-        mbr_forget_session(9001);
-        mbr_forget_session(9002);
-        mbr_forget_session(9003);
+        ctx.sess_remove(sid);
+    }
+
+    /// #773 review MAJOR: a packet whose QER was read just before a Session Deletion /
+    /// Remove QER must not RE-CREATE a bucket after the remover forgot it. The
+    /// interleaving is driven deterministically: snapshot the QER as `apply_far` does,
+    /// remove, then police with the snapshot. Before the re-check this left 1 bucket
+    /// for a dead session, forever.
+    #[test]
+    fn a_packet_racing_removal_does_not_recreate_a_bucket() {
+        let (ctx, sid) = ctx_with_qers(0x7750_0000, &[1, 2]);
+        assert!(mbr_allows(&ctx, sid, 1, true, 8000, 10));
+        assert!(mbr_allows(&ctx, sid, 2, true, 8000, 10));
+
+        // Remove QER 2 while a packet holding its snapshot is in flight.
+        let snapshot = ctx.qer_find(sid, 2).unwrap();
+        ctx.qer_remove(sid, 2);
+        assert!(mbr_allows(&ctx, sid, snapshot.qer_id, false, 8000, 10));
+        assert_eq!(
+            mbr_bucket_count(sid, Some(2)),
+            0,
+            "no bucket for a removed QER"
+        );
+
+        // Session Deletion while a packet holding QER 1's snapshot is in flight.
+        let snapshot = ctx.qer_find(sid, 1).unwrap();
+        ctx.sess_remove(sid);
+        assert_eq!(mbr_bucket_count(sid, None), 0);
+        assert!(mbr_allows(&ctx, sid, snapshot.qer_id, false, 8000, 10));
+        assert_eq!(
+            mbr_bucket_count(sid, None),
+            0,
+            "no bucket may be created for a dead session"
+        );
+    }
+
+    /// #773: removing a QER, and removing a session by ANY path, drops the MBR
+    /// buckets policing created for it. Before the fix `mbr_forget_session` had no
+    /// production caller and `MBR_BUCKETS` grew by one entry per policed bearer
+    /// direction for the life of the process.
+    ///
+    /// A private context whose session ids nothing else in the process uses, so the
+    /// counts below cannot be disturbed by a concurrent test's buckets.
+    #[test]
+    fn removing_a_qer_or_a_session_drops_its_mbr_buckets() {
+        let ctx = crate::context::SgwuContext::with_first_sess_id(0x7730_0000);
+        let mk = |seid| {
+            let s = ctx
+                .sess_add(&FSeid::with_ipv4(seid, Ipv4Addr::new(10, 7, 7, 3)))
+                .unwrap();
+            for qer_id in [1, 2] {
+                ctx.qer_install(crate::context::SgwuQer {
+                    sess_id: s.id,
+                    qer_id,
+                    ..Default::default()
+                });
+                // Police both directions, as traffic on the bearer would.
+                assert!(mbr_allows(&ctx, s.id, qer_id, true, 8000, 10));
+                assert!(mbr_allows(&ctx, s.id, qer_id, false, 8000, 10));
+            }
+            assert_eq!(
+                mbr_bucket_count(s.id, None),
+                4,
+                "policing created the buckets"
+            );
+            s.id
+        };
+
+        // Remove QER: only that QER's two buckets go.
+        let a = mk(0x7731);
+        assert!(ctx.qer_remove(a, 1).is_some());
+        assert_eq!(mbr_bucket_count(a, Some(1)), 0);
+        assert_eq!(
+            mbr_bucket_count(a, Some(2)),
+            2,
+            "the other QER keeps policing"
+        );
+
+        // Session deletion (the Sx deletion handler's path).
+        assert!(ctx.sess_remove(a).is_some());
+        assert_eq!(
+            mbr_bucket_count(a, None),
+            0,
+            "sess_remove must drop the buckets"
+        );
+
+        // Peer restart / shutdown paths go through sess_remove too.
+        let b = mk(0x7732);
+        let c = mk(0x7733);
+        ctx.sess_remove_all();
+        assert_eq!(mbr_bucket_count(b, None) + mbr_bucket_count(c, None), 0);
     }
 
     #[test]
     fn mbr_forget_session_drops_only_that_sessions_buckets() {
-        assert!(mbr_allows(9101, 1, true, 8000, 10));
-        assert!(mbr_allows(9102, 1, true, 8000, 10));
-        mbr_forget_session(9101);
-        // Still functional for the other session (and for a fresh 9101).
-        assert!(mbr_allows(9102, 1, true, 8000, 10));
-        mbr_forget_session(9102);
+        let (ctx_a, a) = ctx_with_qers(0x7760_0000, &[1]);
+        let (ctx_b, b) = ctx_with_qers(0x7770_0000, &[1]);
+        assert!(mbr_allows(&ctx_a, a, 1, true, 8000, 10));
+        assert!(mbr_allows(&ctx_b, b, 1, true, 8000, 10));
+        mbr_forget_session(a);
+        assert_eq!(mbr_bucket_count(a, None), 0);
+        assert_eq!(
+            mbr_bucket_count(b, None),
+            1,
+            "the other session keeps its bucket"
+        );
+        assert!(mbr_allows(&ctx_b, b, 1, true, 8000, 10));
+        ctx_b.sess_remove(b);
     }
 
     // ================================================================
