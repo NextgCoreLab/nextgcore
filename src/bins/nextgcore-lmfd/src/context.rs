@@ -3382,11 +3382,13 @@ mod tests_ecid_timing_units {
         assert!((fdd - 1401.0 * ts).abs() < 1e-9, "{fdd}");
         assert!((tdd - (1401.0 - 624.0) * ts).abs() < 1e-9, "{tdd}");
         assert!((w_fdd - 2.0 * ts).abs() < 1e-9 && (w_tdd - w_fdd).abs() < 1e-12);
-        // Band edges: 35999 is FDD (band 32 ends below), 36000 and 60254 TDD.
+        // Band edges: 35999 is FDD (band 32 ends below); 36000 and 60304 (the top
+        // of band 54) are TDD; 60305 is not a TDD EARFCN.
         assert!((rtt_on(35_999).0 - fdd).abs() < 1e-9);
         assert!((rtt_on(36_000).0 - tdd).abs() < 1e-9);
-        assert!((rtt_on(60_254).0 - tdd).abs() < 1e-9);
-        assert!((rtt_on(60_255).0 - fdd).abs() < 1e-9);
+        assert!((rtt_on(60_255).0 - tdd).abs() < 1e-9, "band 54 is TDD");
+        assert!((rtt_on(60_304).0 - tdd).abs() < 1e-9);
+        assert!((rtt_on(60_305).0 - fdd).abs() < 1e-9);
     }
 
     /// #865 review MINOR 4: with both TADV types present, Type 1 is used whatever
