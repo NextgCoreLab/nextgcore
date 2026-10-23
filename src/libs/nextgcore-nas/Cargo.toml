@@ -11,6 +11,7 @@ nextgcore-core = { workspace = true }
 nextgcore-crypt = { workspace = true }
 thiserror.workspace = true
 bytes.workspace = true
+log.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
