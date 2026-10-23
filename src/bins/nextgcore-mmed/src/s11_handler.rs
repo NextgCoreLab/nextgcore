@@ -332,9 +332,11 @@ pub fn dispatch_triggered(raw: &[u8], msg_type: u8, sequence_number: u32, peer: 
                 if let Some(pending) =
                     crate::gtp_path::take_pending_erab_modification(sequence_number)
                 {
-                    if let Some(send) =
-                        crate::s1ap_handler::erab_modification_confirm(pending, data.cause)
-                    {
+                    if let Some(send) = crate::s1ap_handler::erab_modification_confirm(
+                        crate::context::mme_self(),
+                        pending,
+                        &data,
+                    ) {
                         crate::s1ap_path::s1ap_send(send);
                     }
                 }

@@ -60,8 +60,6 @@ pub const GTPU_IE_RECOVERY: u8 = 14;
 /// Per-peer GTP-U path state (TS 29.281 §7.2, TS 23.007).
 #[derive(Debug, Clone, Default)]
 pub struct GtpuPeerState {
-    /// Last Recovery counter seen from this peer; None = no response yet.
-    pub last_recovery: Option<u8>,
     /// Sequence number of the most recently sent (unanswered) Echo Request.
     pub pending_seq: Option<u16>,
     /// Consecutive missed responses (no reply before next tick).
@@ -116,26 +114,20 @@ impl GtpuPathTable {
         self.peers.remove(peer);
     }
 
-    /// Called on receiving an Echo Response from `peer` with `recovery` counter.
-    /// Returns `true` if the peer's Recovery counter changed (= peer restarted,
-    /// its tunnels are stale, TS 29.281 §7.2.2).
-    pub fn on_echo_response(&mut self, peer: SocketAddr, recovery: u8) -> bool {
+    /// Called on receiving an Echo Response from `peer`: the path is alive.
+    ///
+    /// The Recovery IE it carries says nothing about a restart. TS 29.281 §8.2:
+    /// "The value of the restart counter shall be set to 0 by the sending entity
+    /// and ignored by the receiving entity" (#798 review). GTP-U restarts are
+    /// learnt through the control plane (TS 23.007), not from this counter, so
+    /// before #798's follow-up a peer sending a non-zero value was misread as
+    /// restarting on every change.
+    pub fn on_echo_response(&mut self, peer: SocketAddr) {
         let state = self.peers.entry(peer).or_default();
         state.pending_seq = None;
         state.miss_count = 0;
         state.last_success = Some(std::time::Instant::now());
         state.path_failed = false;
-        match state.last_recovery {
-            Some(prev) if prev != recovery => {
-                state.last_recovery = Some(recovery);
-                true // peer restarted
-            }
-            None => {
-                state.last_recovery = Some(recovery);
-                false
-            }
-            _ => false,
-        }
     }
 
     /// Advance the state machine by one echo interval tick.
@@ -2991,26 +2983,18 @@ impl DataPlane {
                 return;
             }
             gtpu_msg_type::ECHO_RESPONSE => {
-                // TS 29.281 §7.2.2: response to our outgoing Echo Request.
-                // Parse the Recovery IE and update the N3 path table.
+                // TS 29.281 §7.2.2: response to our outgoing Echo Request; the
+                // path is alive. Its Recovery value is ignored (§8.2).
                 let recovery = if pkt.len() > header.header_len {
                     parse_gtpu_recovery_ie(&pkt[header.header_len..])
                 } else {
                     None
                 };
-                let counter = recovery.unwrap_or(0);
-                log::debug!("GTP-U Echo Response from {from}, Recovery={counter}");
-                let restarted = self
-                    .path_table
-                    .write()
-                    .unwrap()
-                    .on_echo_response(from, counter);
-                if restarted {
-                    log::warn!(
-                        "GTP-U peer {from} restarted (Recovery counter changed to {counter}) \
-                         — tunnels may be stale"
-                    );
-                }
+                log::debug!(
+                    "GTP-U Echo Response from {from}, Recovery={recovery:?} (ignored, TS 29.281 \
+                     §8.2)"
+                );
+                self.path_table.write().unwrap().on_echo_response(from);
                 return;
             }
             gtpu_msg_type::END_MARKER => {
@@ -7078,9 +7062,7 @@ mod tests {
         assert_eq!(to_send.len(), 1);
         assert!(failed.is_empty());
 
-        // Simulate a response with recovery=0 (first time → not a restart).
-        let restarted = pt.on_echo_response(peer, 0);
-        assert!(!restarted, "first response must not flag a restart");
+        pt.on_echo_response(peer);
 
         // After response the peer must not be failed.
         let state = pt.peers.get(&peer).unwrap();
@@ -7114,20 +7096,21 @@ mod tests {
         assert!(state.path_failed);
     }
 
-    /// A changed Recovery counter on a response must return `true` (peer restart).
+    /// #798 review, TS 29.281 §8.2: the GTP-U Recovery value is ignored, so
+    /// Echo Responses with changing values keep the path alive and are not a
+    /// restart.
     #[test]
-    fn test_path_table_changed_recovery_detects_restart() {
+    fn a_gtpu_recovery_value_is_ignored() {
         let peer: SocketAddr = "10.0.0.2:2152".parse().unwrap();
         let mut pt = GtpuPathTable::default();
         pt.add_peer(peer);
-
-        // First response: recovery=5, not a restart.
-        let r = pt.on_echo_response(peer, 5);
-        assert!(!r, "first response is never a restart");
-
-        // Second response: recovery=6 (counter incremented = peer restarted).
-        let r = pt.on_echo_response(peer, 6);
-        assert!(r, "changed Recovery counter must signal peer restart");
+        let _ = pt.tick();
+        pt.on_echo_response(peer);
+        let _ = pt.tick();
+        pt.on_echo_response(peer);
+        let state = pt.peers.get(&peer).unwrap();
+        assert_eq!(state.miss_count, 0);
+        assert!(!state.path_failed);
     }
 
     /// Recovery IE parser: finds IE type 14 in a 2-byte TV payload.
