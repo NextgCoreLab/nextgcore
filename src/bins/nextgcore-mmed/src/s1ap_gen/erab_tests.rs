@@ -1,5 +1,11 @@
 //! #514 stage 6: E-RAB management on the generated codec.
 //!
+//! #737: since the hand-written encoder was deleted (#560), the
+//! `*_with_schema_criticalities` tests below compare the production encoder
+//! with itself and check it decodes back; what pins each IE criticality is
+//! `criticality_oracle`, which checks every PDU a production builder encodes
+//! against the TS 36.413 §9.3 object sets.
+//!
 //! Oracle: the pre-change hand-written builders and parser
 //! (`test_codec::builder`, `decode_s1ap_pdu`: since #514 stage 13b the generated codec with an independently written domain mapping, and builders for messages mmed sends check that their output decodes back to their input). Golden: octets derived by
 //! hand from X.691 (APER) for TS 36.413 §9.1.3.5.
@@ -64,7 +70,7 @@ fn ambrs() -> [Option<UeAmbr>; 2] {
 }
 
 #[test]
-fn the_setup_request_matches_the_hand_written_encoder() {
+fn the_setup_request_round_trips_with_schema_criticalities() {
     let mut cases = 0;
     for (mme, enb) in IDS {
         for ue_ambr in ambrs() {
@@ -100,7 +106,7 @@ fn the_setup_request_matches_the_hand_written_encoder() {
 }
 
 #[test]
-fn the_modify_request_matches_the_hand_written_encoder() {
+fn the_modify_request_round_trips_with_schema_criticalities() {
     let mut cases = 0;
     for (mme, enb) in IDS {
         for ue_ambr in ambrs() {
@@ -149,7 +155,7 @@ fn causes() -> Vec<Cause> {
 }
 
 #[test]
-fn the_release_command_matches_the_hand_written_encoder() {
+fn the_release_command_round_trips_with_schema_criticalities() {
     let mut cases = 0;
     for cause in causes() {
         for (mme, enb) in IDS {
@@ -400,6 +406,7 @@ fn the_production_builders_send_the_generated_bytes() {
         5,
         S1apCauseGroup::Nas,
         crate::s1ap_build::nas_cause::DETACH,
+        None,
         None,
     )
     .unwrap();
