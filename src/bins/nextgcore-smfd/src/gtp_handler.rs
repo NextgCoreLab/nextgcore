@@ -1291,6 +1291,19 @@ async fn create_session(
         }
     };
 
+    // #718 review M3: a shutting-down PGW-C takes no new PDN connection; its N4
+    // association is about to go, and an EPC session would not survive the restart.
+    if crate::SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst) {
+        log::warn!("S5/S8 Create Session Request from {peer} refused: the PGW-C is shutting down");
+        let response = crate::gtp_build::build_error_message(
+            gtp2_message_type::CREATE_SESSION_RESPONSE,
+            0,
+            Gtp2Cause::NoResourcesAvailable,
+        );
+        server.send_response_public(peer, &response).await;
+        return;
+    }
+
     let apn = req.apn.clone().unwrap_or_default();
     let context = crate::context::smf_self();
 
