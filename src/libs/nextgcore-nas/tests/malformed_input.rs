@@ -63,12 +63,14 @@ fn authentication_request_truncated_rand_is_err() {
 }
 
 #[test]
-fn configuration_update_nssai_overrunning_its_length_is_err() {
+fn configuration_update_nssai_overrunning_its_length_is_absent() {
     // fuzz repro `75 31 01 02 00 10`: an NSSAI of length 1 whose S-NSSAI claims
-    // 2 octets; the running `remaining -= ...` count underflowed.
-    assert!(
-        fiveg::ConfigurationUpdateCommand::decode(&mut b(&[0x31, 0x01, 0x02, 0x00, 0x10])).is_err()
-    );
+    // 2 octets; the running `remaining -= ...` count underflowed. The NSSAI is
+    // syntactically incorrect and optional, so since #630 it is treated as not
+    // present (TS 24.501 §7.7.1) rather than failing the message.
+    let msg =
+        fiveg::ConfigurationUpdateCommand::decode(&mut b(&[0x31, 0x01, 0x02, 0x00, 0x10])).unwrap();
+    assert_eq!(msg.configured_nssai, None);
 }
 
 type Decoder = fn(&mut Bytes) -> bool;
