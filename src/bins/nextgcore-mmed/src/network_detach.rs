@@ -13,13 +13,16 @@
 //! # What it does
 //!
 //! [`mme_initiated_detach`]:
-//! 1. deletes the UE's EPS bearer and PDN connection contexts locally. The
-//!    gateway side is already gone in both callers: the PGW deleted it (#688), or
-//!    the SGW restarted (#689). So no Delete Session Request is sent;
+//! 1. deletes the UE's EPS bearer and PDN connection contexts locally. For the
+//!    PGW-deleted PDN (#688) and the SGW restart (#689) the gateway side is
+//!    already gone, so no Delete Session Request is sent. The HSS-initiated
+//!    detach (CLR, #733, TS 23.401 §5.3.8.4) sends one per PDN connection
+//!    first, through `gtp_path::send_delete_all_sessions`, then calls this;
 //! 2. when the UE is ECM-CONNECTED, sends DETACH REQUEST on its S1 connection
 //!    and arms T3422 (§5.5.2.3.1). DETACH ACCEPT, or the fifth T3422 expiry
-//!    (§5.5.2.3.4 b), then removes the UE context and releases the S1
-//!    connection (`nas_dispatch`, `nas_timer`);
+//!    (§5.5.2.3.5 a), then removes the UE context and releases the S1
+//!    connection (`nas_dispatch`, `nas_timer`). An ATTACH, TAU or SERVICE
+//!    REQUEST meanwhile is handled by [`on_colliding_procedure`] (#732);
 //! 3. when the UE is ECM-IDLE, detaches it implicitly (§5.5.2.3.1 allows a local
 //!    detach instead of paging). The UE's next SERVICE REQUEST or TAU then
 //!    meets a context-less MME and is rejected #9/#10, which also re-attaches it.
@@ -46,8 +49,20 @@ pub enum DetachOutcome {
 /// Remove every PDN connection and EPS bearer context of `mme_ue_id`, locally.
 /// Returns the number of PDN connections removed.
 pub fn delete_pdn_connections_locally(ctx: &MmeContext, mme_ue_id: u64) -> usize {
-    if let Some(ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&mme_ue_id) {
-        ue.sess_list.clear();
+    let sgw_ue_id = {
+        let mut pool = ctx.mme_ue_pool.write().unwrap();
+        pool.get_mut(&mme_ue_id).map(|ue| {
+            ue.sess_list.clear();
+            ue.sgw_ue_id
+        })
+    };
+    // #828: with every PDN connection gone the Serving GW holds no S11 context
+    // for the UE, so its TEID must not head the next Create Session Request
+    // (TS 29.274 §5.5.2: an initial request to a new context carries TEID 0).
+    if let Some(sgw_ue_id) = sgw_ue_id {
+        if let Some(sgw_ue) = ctx.sgw_ue_pool.write().unwrap().get_mut(&sgw_ue_id) {
+            sgw_ue.sgw_s11_teid = 0;
+        }
     }
     // By owner rather than through the parent links, so a context whose links
     // were never completed (a rejected request) cannot leave orphans behind.
@@ -84,6 +99,7 @@ pub fn mme_initiated_detach(
         let mut pool = ctx.mme_ue_pool.write().unwrap();
         if let Some(ue) = pool.get_mut(&mme_ue_id) {
             ue.nas_eps.type_ = MmeEpsType::DetachRequestToUe;
+            ue.network_detach_type = Some(detach_type);
             // A fresh procedure: a stale buffer would be resent instead.
             ue.t3422.stop();
             match crate::nas_path::nas_eps_send_detach_request(ue, &enb_ue, detach_type) {
@@ -115,6 +131,94 @@ pub fn mme_initiated_detach(
     );
     ctx.mme_ue_remove(mme_ue_id);
     DetachOutcome::ImplicitlyDetached
+}
+
+/// A UE-initiated EMM procedure that can collide with a network-initiated
+/// detach (TS 24.301 §5.5.2.3.5 d-f).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollidingProcedure {
+    /// ATTACH REQUEST (case d).
+    Attach,
+    /// TRACKING AREA UPDATE REQUEST (case e).
+    TrackingAreaUpdate,
+    /// SERVICE REQUEST, or EXTENDED SERVICE REQUEST for packet services (case f).
+    ServiceRequest,
+    /// EXTENDED SERVICE REQUEST for CS fallback (service type 0-4, TS 24.301
+    /// Table 9.9.3.27.1). Case f defines it only for IMSI detach and cause #2;
+    /// for the detach types this MME sends, the detach is progressed (#828).
+    CsFallbackServiceRequest,
+}
+
+/// What to do with a UE-initiated procedure that arrives while a network-initiated
+/// detach is pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Collision {
+    /// No detach is pending, or the detach was aborted: process the message.
+    Proceed,
+    /// The detach is progressed: the message is ignored.
+    Ignore,
+}
+
+/// TS 24.301 §5.5.2.3.5 d-f (#732), for the detach types this MME sends
+/// ("re-attach required", "re-attach not required" without EMM cause #2; and
+/// "IMSI detach" for completeness):
+/// - ATTACH REQUEST: re-attach required, the detach is aborted (T3422 stopped)
+///   and the attach progressed; the EPS bearer contexts were already deleted by
+///   [`mme_initiated_detach`]. Re-attach not required: the ATTACH is ignored.
+///   IMSI detach: aborted, attach progressed.
+/// - TAU REQUEST: ignored, the detach progressed (IMSI detach: aborted, TAU
+///   progressed).
+/// - SERVICE REQUEST: the detach is progressed, so the request is ignored (IMSI
+///   detach: both progress).
+///
+/// Before #732 every one of them overwrote `nas_eps.type_` and left T3422
+/// running, so its fifth expiry released a UE that was re-attaching.
+pub fn on_colliding_procedure(
+    ctx: &MmeContext,
+    mme_ue_id: u64,
+    procedure: CollidingProcedure,
+) -> Collision {
+    use crate::emm_build::DetachTypeToUe as T;
+    let mut pool = ctx.mme_ue_pool.write().unwrap();
+    let Some(ue) = pool.get_mut(&mme_ue_id) else {
+        return Collision::Proceed;
+    };
+    if ue.nas_eps.type_ != MmeEpsType::DetachRequestToUe {
+        return Collision::Proceed;
+    }
+    let detach_type = ue.network_detach_type.unwrap_or(T::ReAttachRequired);
+    let abort = match (procedure, detach_type) {
+        (CollidingProcedure::Attach, T::ReAttachRequired | T::ImsiDetach) => true,
+        (CollidingProcedure::Attach, T::ReAttachNotRequired) => false,
+        (CollidingProcedure::TrackingAreaUpdate, T::ImsiDetach) => true,
+        (CollidingProcedure::TrackingAreaUpdate, _) => false,
+        // §5.5.2.3.5 f has both procedures progress for an IMSI detach. This
+        // MME never sends one (only re-attach required / not required), and the
+        // service request handlers take over the UE's EMM procedure, so the
+        // detach is progressed instead: the request is ignored.
+        (CollidingProcedure::ServiceRequest | CollidingProcedure::CsFallbackServiceRequest, _) => {
+            false
+        }
+    };
+    if abort {
+        ue.t3422.stop();
+        ue.nas_eps.type_ = MmeEpsType::None;
+        ue.network_detach_type = None;
+        log::info!(
+            "[{}] {procedure:?} during a network-initiated detach ({detach_type:?}): the detach \
+             is aborted, T3422 stopped, and the {procedure:?} progressed (TS 24.301 \
+             §5.5.2.3.5)",
+            ue.imsi_bcd
+        );
+        Collision::Proceed
+    } else {
+        log::info!(
+            "[{}] {procedure:?} during a network-initiated detach ({detach_type:?}): ignored, \
+             the detach is progressed (TS 24.301 §5.5.2.3.5)",
+            ue.imsi_bcd
+        );
+        Collision::Ignore
+    }
 }
 
 /// The network side of a completed MME-initiated detach: DETACH ACCEPT arrived,
