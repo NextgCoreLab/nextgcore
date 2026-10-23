@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-c2411517.js";
+            window.path_to_searchindex_js = "../searchindex-50a6a473.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -291,7 +291,7 @@ mme:
 </tbody>
 </table>
 </div>
-<p><code>RUST_LOG</code> is <strong>not</strong> honoured: the logger is built with <code>env_logger::Builder::new().filter_level(...)</code>, so the level comes only from <code>-l/--log-level</code>, and the <code>RUST_LOG: info</code> in <code>docker-compose-epc.yml</code> has no effect on the MME.</p>
+<p><code>RUST_LOG</code> overrides <code>-l/--log-level</code> when set (the <code>RUST_LOG: info</code> in <code>docker-compose-epc.yml</code> applies).</p>
 
                     </main>
 

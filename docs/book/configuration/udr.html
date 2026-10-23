@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-c2411517.js";
+            window.path_to_searchindex_js = "../searchindex-50a6a473.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -245,7 +245,7 @@ udr:
 <h2 id="parsed-but-inert--decorative-yaml-fields"><a class="header" href="#parsed-but-inert--decorative-yaml-fields">Parsed-but-inert / decorative YAML fields</a></h2>
 <p>The daemon deserializes only the fields above; unknown YAML keys are silently ignored by serde. In the shipped example files:</p>
 <ul>
-<li><strong><code>logger.file.path</code> and <code>logger.level</code> are inert.</strong> The log level comes only from the CLI flag <code>-e/--log-level</code> (default <code>info</code>); <code>init_logging</code> builds an <code>env_logger</code> filter directly from the flag and does not consult <code>RUST_LOG</code>. Logs always go to stderr — see the <code>--log-file</code> caveat below.</li>
+<li><strong><code>logger.file.path</code> and <code>logger.level</code> are inert.</strong> The log level comes from <code>RUST_LOG</code> when set, else the CLI flag <code>-e/--log-level</code> (default <code>info</code>). Logs always go to stderr — see the <code>--log-file</code> caveat below.</li>
 <li><strong><code>global.max.ue</code> / <code>global.max.peer</code> are inert.</strong> No struct deserializes the <code>global</code> section.</li>
 <li><strong><code>udr.sbi.tls.*</code> (enabled/cert/key/ca/min_version) is inert.</strong> <code>SbiYaml</code> has only <code>server</code>, <code>client</code>, and <code>oauth2</code> members; TLS is controlled exclusively by the CLI flags <code>--tls</code>/<code>--tls-cert</code>/<code>--tls-key</code>.</li>
 </ul>

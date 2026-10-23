@@ -109,4 +109,4 @@ S1-MME runs **only** over native Linux kernel SCTP: mmed offers no userspace (sc
 | `MME_RESTART_COUNTER` | unset | Fixed restart counter (u8), overriding the persisted one. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4317` | OpenTelemetry OTLP exporter. |
 
-`RUST_LOG` is **not** honoured: the logger is built with `env_logger::Builder::new().filter_level(...)`, so the level comes only from `-l/--log-level`, and the `RUST_LOG: info` in `docker-compose-epc.yml` has no effect on the MME.
+`RUST_LOG` overrides `-l/--log-level` when set (the `RUST_LOG: info` in `docker-compose-epc.yml` applies).

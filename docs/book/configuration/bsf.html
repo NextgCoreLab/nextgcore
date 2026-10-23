@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-c2411517.js";
+            window.path_to_searchindex_js = "../searchindex-50a6a473.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-be5dca41.js"></script>
@@ -239,7 +239,7 @@ bsf:
 <h3 id="parsed-but-inert--decorative-yaml-fields"><a class="header" href="#parsed-but-inert--decorative-yaml-fields">Parsed-but-inert / decorative YAML fields</a></h3>
 <p>The daemon deserializes only the fields above; unknown YAML keys are silently ignored by serde. In particular, in the shipped example files:</p>
 <ul>
-<li><strong><code>logger.file.path</code> and <code>logger.level</code> are inert.</strong> The log level comes solely from the CLI flag <code>-e/--log-level</code> (default <code>info</code>). Note that <code>RUST_LOG</code> has <em>no</em> effect either — <code>init_logging</code> builds a fresh <code>env_logger::Builder::new()</code> without reading the environment. Logs go to stderr; no file sink is wired (see <code>--log-file</code> below).</li>
+<li><strong><code>logger.file.path</code> and <code>logger.level</code> are inert.</strong> The log level comes from <code>RUST_LOG</code> when set, else the CLI flag <code>-e/--log-level</code> (default <code>info</code>). Logs go to stderr; no file sink is wired (see <code>--log-file</code> below).</li>
 <li><strong><code>global.max.ue</code> / <code>global.max.peer</code> are inert.</strong> No <code>global</code> section exists in the deserialize structs; session capacity is the CLI flag <code>--max-sess</code>.</li>
 <li><strong><code>bsf.sbi.tls.*</code> (<code>enabled</code>/<code>cert</code>/<code>key</code>/<code>ca</code>/<code>min_version</code>) is inert.</strong> No <code>tls</code> field exists in <code>SbiYaml</code>. TLS-related knobs are the CLI flags <code>--tls</code>/<code>--tls-cert</code>/<code>--tls-key</code> — and even those only affect the advertised scheme (see Behavior notes). The <code>TLS_ENABLED</code>/<code>SBI_SCHEME</code> variables mentioned in the YAML comment, and the <code>TLS_CERT</code>/<code>TLS_KEY</code> environment variables set by <code>docker-compose.yml</code>, are not read by this binary.</li>
 </ul>
