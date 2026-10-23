@@ -749,6 +749,10 @@ pub struct NgapServer {
     /// live SCTP association. `None` (the default) keeps the real transport.
     #[cfg(test)]
     sent_ngap: Option<Vec<(u64, Vec<u8>)>>,
+    /// Test seam: the next this-many NGAP sends fail as an SCTP send error would,
+    /// so a test can drive a handler's send-failure branch (#760).
+    #[cfg(test)]
+    fail_next_sends: usize,
     /// Event sender for NGAP events
     event_tx: mpsc::Sender<AmfEvent>,
     /// Server event receiver
@@ -795,7 +799,12 @@ pub struct NgapServer {
     /// PDCP SN/HFN status *after* the HandoverCommand, and the AMF has to know
     /// where to forward it. `ue_auth_state` cannot answer that — it still names
     /// the SOURCE association until the UE arrives.
-    handover_target_assoc: HashMap<u64, u64>,
+    ///
+    /// The value is `(target association, target RAN UE NGAP ID)`. The RAN UE NGAP ID
+    /// is the one the TARGET allocated and returned in the Acknowledge (TS 38.413
+    /// §8.4.2.2, §9.2.3.5): each gNB allocates its own, so the DOWNLINK RAN STATUS
+    /// TRANSFER to the target must carry it, not the source's (#740).
+    handover_target_assoc: HashMap<u64, (u64, u32)>,
     /// The target gNB's per-session handover transfers, kept between
     /// HandoverRequestAcknowledge and HandoverNotify (#70).
     ///
@@ -888,6 +897,8 @@ impl NgapServer {
             forced_amf_ue_ngap_id: None,
             #[cfg(test)]
             sent_ngap: None,
+            #[cfg(test)]
+            fail_next_sends: 0,
             event_tx,
             server_event_rx,
             ue_auth_state,
@@ -4569,12 +4580,13 @@ impl NgapServer {
                 .await
                 .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
 
-        // 1) Nudm_UECM_Registration (amf-3gpp-access)
-        if let Err(e) = crate::sbi_path::call_udm_uecm_registration(
+        // 1) Nudm_UECM_Registration (amf-3gpp-access), under this AMF's pinnable
+        // nfInstanceId and a fresh deregCallbackUri token (#753).
+        if let Err(e) = register_with_udm_uecm(
+            &mut state.amf_ue,
             &udm_host,
             udm_port,
             &supi,
-            &amf_instance_id(),
             &guami_mcc,
             &guami_mnc,
             &amf_id_hex,
@@ -9706,8 +9718,11 @@ impl NgapServer {
                 // Recorded only on the success path: if the HandoverCommand never
                 // reached the source, the source will not send a status transfer,
                 // and a stale target entry would misroute the next handover's.
+                //
+                // With the RAN UE NGAP ID the TARGET allocated (#740): the relayed
+                // status must name the UE as the target knows it.
                 self.handover_target_assoc
-                    .insert(ack.amf_ue_ngap_id, association_id);
+                    .insert(ack.amf_ue_ngap_id, (association_id, ack.ran_ue_ngap_id));
                 // #70: keep each admitted session's transfer so HandoverNotify can relay
                 // the target DL tunnel to the SMF once the UE has actually arrived.
                 for admitted in &ack.admitted_list {
@@ -9769,7 +9784,9 @@ impl NgapServer {
             }
         };
 
-        let Some(&target_assoc) = self.handover_target_assoc.get(&transfer.amf_ue_ngap_id) else {
+        let Some(&(target_assoc, target_ran_ue_ngap_id)) =
+            self.handover_target_assoc.get(&transfer.amf_ue_ngap_id)
+        else {
             // No handover in flight for this UE. Log and drop: the AMF must not
             // invent an NGAP error toward the gNB for a procedure that needs no
             // response, which is the same rule the uplink NRPPa relay follows.
@@ -9791,11 +9808,15 @@ impl NgapServer {
             return Ok(None);
         }
 
-        // The RAN-UE-NGAP-ID is carried through unchanged because this AMF reuses
-        // the source id at the target (it allocates no new RAN-UE-NGAP-ID during
-        // handover — see handle_handover_required). If target-side id allocation
-        // is ever added, this is the site that has to substitute it, and sending
-        // the source's id would then point the target at the wrong UE.
+        // #740: the target names the UE by the RAN UE NGAP ID IT allocated, returned in
+        // the HandoverRequestAcknowledge (TS 38.413 §8.4.2.2, §9.2.3.5); the source's
+        // id is meaningless there. Relaying it unchanged made the target see an
+        // inconsistent UE NGAP ID pair (§10.6) or, worse, address another UE's PDCP
+        // state. The AMF UE NGAP ID is the same on both legs.
+        let transfer = crate::ngap_asn1::RanStatusRelay {
+            ran_ue_ngap_id: target_ran_ue_ngap_id,
+            ..transfer
+        };
         match crate::ngap_asn1::build_downlink_ran_status_transfer_generated(&transfer).ok_or(()) {
             Ok(bytes) => {
                 // A failed send to the TARGET is not a reason to abort handling of
@@ -12812,6 +12833,11 @@ impl NgapServer {
         );
 
         #[cfg(test)]
+        if self.fail_next_sends > 0 {
+            self.fail_next_sends -= 1;
+            return Err(anyhow::anyhow!("SCTP send error: injected by a test"));
+        }
+        #[cfg(test)]
         if let Some(sent) = self.sent_ngap.as_mut() {
             sent.push((association_id, data.to_vec()));
             return Ok(());
@@ -12863,11 +12889,54 @@ impl NgapServer {
 // NAS parsing / helper functions (TS 24.501)
 // ============================================================================
 
-/// Stable AMF NF instance ID for SBI registrations/subscriptions
+/// This AMF's `nfInstanceId`, the one it registers with the NRF and the UDM.
+///
+/// #753: this used to be a SECOND random UUID per process, so it could not be
+/// pinned (`NEXTGCORE_AMF_INSTANCE_ID` did not reach it). After every restart the
+/// UDM therefore saw a "new AMF" and sent the restarted AMF a
+/// UE_INITIAL_REGISTRATION dereg-notify for each re-registering UE.
 fn amf_instance_id() -> String {
-    static ID: once_cell::sync::Lazy<String> =
-        once_cell::sync::Lazy::new(|| uuid::Uuid::new_v4().to_string());
-    ID.clone()
+    nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf).to_string()
+}
+
+/// Nudm_UECM_Registration (amf-3gpp-access) for `amf_ue` under this AMF's
+/// `nfInstanceId` (#753), with a fresh `deregCallbackUri` token.
+///
+/// The token is recorded on the UE only once the UDM has ACCEPTED the
+/// registration. After a failed PUT the UDM still holds the previous registration
+/// and its URI, and a genuine notification about it must still act. During the
+/// PUT the UE is out of the store (`complete_registration` holds it), so a
+/// notification the PUT provokes for an older registration gets 404 anyway.
+/// Afterwards it names an older token and is ignored.
+async fn register_with_udm_uecm(
+    amf_ue: &mut AmfUe,
+    udm_host: &str,
+    udm_port: u16,
+    supi: &str,
+    guami_mcc: &str,
+    guami_mnc: &str,
+    amf_id_hex: &str,
+) -> crate::sbi_path::SbiResult<()> {
+    let dereg_token = crate::sbi_path::new_dereg_callback_token();
+    crate::sbi_path::call_udm_uecm_registration(
+        udm_host,
+        udm_port,
+        supi,
+        &amf_instance_id(),
+        &dereg_token,
+        guami_mcc,
+        guami_mnc,
+        amf_id_hex,
+    )
+    .await?;
+    amf_ue.uecm_dereg_token = Some(dereg_token);
+    Ok(())
+}
+
+/// [`amf_instance_id`], for the UECM wire test in `sbi_path`.
+#[cfg(test)]
+pub(crate) fn amf_instance_id_for_tests() -> String {
+    amf_instance_id()
 }
 
 /// Parsed Registration Request (TS 24.501 Section 8.2.6)
@@ -14584,6 +14653,9 @@ pub async fn amf_ngap_poll() -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    /// Handler-level tests asserting what amfd SENDS (#760, ...), in their own file.
+    mod handler_tests;
+
     use super::*;
     use crate::context::AmfContext;
     use tokio::sync::mpsc;
@@ -18407,6 +18479,115 @@ mod tests {
         );
     }
 
+    /// #753 review MAJOR-1: the token the AMF registers at the UDM is the token it
+    /// stores on the UE, and a notification posted to the registered
+    /// `deregCallbackUri` verbatim acts. If the PUT fails, the UE keeps its previous
+    /// token, because the UDM still holds the previous registration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_registered_dereg_callback_uri_is_the_one_that_acts() {
+        let _serial = crate::namf_server::dereg_queue_test_lock().lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        crate::context::amf_context_init(64, 1024, 4096);
+        let puts: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let sink = Arc::clone(&puts);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let udm = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        udm.start(move |req: nextgcore_sbi::message::SbiRequest| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let body: serde_json::Value = req
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|c| serde_json::from_str(c).ok())
+                    .unwrap_or_default();
+                let refuse = req.header.uri.contains("imsi-001010000753099");
+                sink.lock().expect("sink").push(body);
+                nextgcore_sbi::message::SbiResponse::with_status(if refuse { 500 } else { 201 })
+            }
+        })
+        .await
+        .expect("stand-in UDM");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let supi = "imsi-001010000753003";
+        let id = 7_753_003u64;
+        let mut ue = UeNasContext::new(id, 53, 1, false);
+        ue.registered = true;
+        ue.amf_ue.supi = Some(supi.to_string());
+        register_with_udm_uecm(
+            &mut ue.amf_ue,
+            "127.0.0.1",
+            addr.port(),
+            supi,
+            "001",
+            "01",
+            "020040",
+        )
+        .await
+        .expect("registered");
+        let uri = puts.lock().expect("puts")[0]["deregCallbackUri"]
+            .as_str()
+            .expect("deregCallbackUri")
+            .to_string();
+        let token = uri.rsplit('/').next().expect("a last segment").to_string();
+        assert_eq!(ue.amf_ue.uecm_dereg_token.as_deref(), Some(token.as_str()));
+        let ngap = test_ngap_server().await;
+        ngap.ue_auth_state.insert(id, ue);
+
+        // The path of the URI the UDM holds, POSTed verbatim.
+        let path = &uri[uri.find("/namf-callback/").expect("callback path")..];
+        let resp = crate::namf_server::namf_request_handler(
+            nextgcore_sbi::message::SbiRequest::post(path.to_string())
+                .with_json_body(&serde_json::json!({
+                    "deregReason": "SUBSCRIPTION_WITHDRAWN",
+                    "accessType": "3GPP_ACCESS",
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 204);
+        let queued: Vec<_> = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx");
+            let (mine, others): (Vec<_>, Vec<_>) = guard
+                .network_dereg_drain()
+                .into_iter()
+                .partition(|d| d.amf_ue_ngap_id == id);
+            for o in others {
+                guard.network_dereg_add(o);
+            }
+            mine
+        };
+        assert_eq!(queued.len(), 1, "the registered URI's notification acts");
+        ngap.ue_auth_state.remove(id);
+
+        // A refused PUT leaves the previous token in place.
+        let mut refused = AmfUe::new(7_753_099, 0);
+        refused.uecm_dereg_token = Some("tok-previous".to_string());
+        assert!(register_with_udm_uecm(
+            &mut refused,
+            "127.0.0.1",
+            addr.port(),
+            "imsi-001010000753099",
+            "001",
+            "01",
+            "020040"
+        )
+        .await
+        .is_err());
+        assert_eq!(refused.uecm_dereg_token.as_deref(), Some("tok-previous"));
+        udm.stop().await.expect("stop");
+    }
+
     /// #602: a Nudm_UECM_DeregistrationNotification with `UE_INITIAL_REGISTRATION` is a
     /// LOCAL deregistration, driven from the Namf callback through the NGAP task's pump:
     /// the SM context is released at the SMF, the AM policy association is deleted at
@@ -18443,12 +18624,13 @@ mod tests {
         ue_ctx.registered = true;
         ue_ctx.cm_idle = true;
         ue_ctx.amf_ue.supi = Some(supi.to_string());
+        ue_ctx.amf_ue.uecm_dereg_token = Some("tok-602".to_string());
         ue_ctx.policy_association_id = Some("am-pol-602".to_string());
         ngap.ue_auth_state.insert(key, ue_ctx);
 
         let resp = crate::namf_server::namf_request_handler(
             nextgcore_sbi::message::SbiRequest::post(format!(
-                "/namf-callback/v1/{supi}/dereg-notify"
+                "/namf-callback/v1/{supi}/dereg-notify/tok-602"
             ))
             .with_json_body(&serde_json::json!({
                 "deregReason": "UE_INITIAL_REGISTRATION",
@@ -19725,7 +19907,9 @@ mod tests {
         );
 
         // Target admitted the UE -> the status transfer follows it.
-        server.handover_target_assoc.insert(amf_ue_ngap_id, target);
+        server
+            .handover_target_assoc
+            .insert(amf_ue_ngap_id, (target, 1));
         assert_eq!(
             server
                 .handle_uplink_ran_status_transfer(source, &uplink_status_pdu(amf_ue_ngap_id, 5))
@@ -19769,6 +19953,106 @@ mod tests {
         );
     }
 
+    /// The `(amf_ue_ngap_id, ran_ue_ngap_id)` a DOWNLINK RAN STATUS TRANSFER carries,
+    /// decoded with the generated codec; `None` for any other PDU.
+    fn decoded_downlink_ran_status_ids(pdu: &[u8]) -> Option<(u64, u32)> {
+        use nextgcore_ngap_gen::generated as g;
+        let g::NGAP_PDU::InitiatingMessage(m) = nextgcore_ngap_gen::decode(pdu).ok()? else {
+            return None;
+        };
+        let g::InitiatingMessageValue::Id_DownlinkRANStatusTransfer(t) = m.value else {
+            return None;
+        };
+        let (mut amf, mut ran) = (None, None);
+        for ie in t.protocol_i_es.0 {
+            match ie.value {
+                g::DownlinkRANStatusTransferProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(id) => {
+                    amf = Some(id.0)
+                }
+                g::DownlinkRANStatusTransferProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(id) => {
+                    ran = Some(id.0)
+                }
+                _ => {}
+            }
+        }
+        Some((amf?, ran?))
+    }
+
+    /// **#740.** The DOWNLINK RAN STATUS TRANSFER relayed to the handover target names
+    /// the UE by the RAN UE NGAP ID the TARGET allocated in its HandoverRequestAcknowledge
+    /// (TS 38.413 §8.4.2.2, §8.4.8, §9.2.3.5), not by the source's: each gNB allocates
+    /// its own, and the source's id at the target is an inconsistent pair (§10.6) or
+    /// another UE.
+    ///
+    /// Driven through both handlers with the sent NGAP captured: the Acknowledge from
+    /// the target (whose HandoverCommand to the source keeps the SOURCE id), then the
+    /// source's UPLINK RAN STATUS TRANSFER, whose relay to the target is decoded.
+    ///
+    /// REVERT-VERIFIED: relaying `transfer` with the decoded (source) id fails the
+    /// relayed-id assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_relayed_ran_status_carries_the_target_allocated_ran_ue_id() {
+        let mut server = capturing_ngap_server().await;
+        let (source, target) = (97_401u64, 97_402u64);
+        let amf_ue_ngap_id = 7_740_001u64;
+        let (source_ran, target_ran) = (5u32, 74_001u32);
+        seed_gnb_session(&server, source).await;
+        seed_gnb_session(&server, target).await;
+        server.ue_auth_state.insert(
+            amf_ue_ngap_id,
+            UeNasContext::new(amf_ue_ngap_id, source_ran, source, false),
+        );
+
+        let ack = nextgcore_ngap::builder::build_handover_request_acknowledge(
+            &nextgcore_ngap::types::HandoverRequestAcknowledge {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id: target_ran,
+                admitted_list: vec![nextgcore_ngap::types::PduSessionResourceAdmittedItemHoAck {
+                    pdu_session_id: 5,
+                    transfer: vec![0x00, 0x03, 0xE0, 0x0A],
+                }],
+                failed_list: None,
+                target_to_source_container: vec![0xC0, 0xFE],
+            },
+        )
+        .expect("build HandoverRequestAcknowledge");
+        server
+            .handle_handover_request_acknowledge(target, &ack)
+            .await
+            .expect("handled");
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(sent.len(), 1, "the HandoverCommand: {sent:?}");
+        assert_eq!(sent[0].0, source, "the HandoverCommand goes to the source");
+        assert_eq!(
+            (
+                crate::ngap_asn1::extract_amf_ue_ngap_id(&sent[0].1),
+                crate::ngap_asn1::extract_ran_ue_ngap_id(&sent[0].1)
+            ),
+            (Some(amf_ue_ngap_id), Some(source_ran)),
+            "toward the source the UE keeps the SOURCE's RAN UE NGAP ID"
+        );
+
+        assert_eq!(
+            server
+                .handle_uplink_ran_status_transfer(
+                    source,
+                    &uplink_status_pdu(amf_ue_ngap_id, source_ran)
+                )
+                .await
+                .expect("handled"),
+            Some(target)
+        );
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(sent.len(), 1, "the relayed status: {sent:?}");
+        assert_eq!(sent[0].0, target, "relayed to the target");
+        assert_eq!(
+            decoded_downlink_ran_status_ids(&sent[0].1),
+            Some((amf_ue_ngap_id, target_ran)),
+            "the DOWNLINK RAN STATUS TRANSFER names the UE by the id the TARGET \
+             allocated in its Acknowledge, not the source's {source_ran}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn handover_terminal_events_drop_the_relay_target() {
         let mut server = test_ngap_server().await;
@@ -19785,7 +20069,7 @@ mod tests {
         // That surfaced as that test reading THIS test's association (9212) instead
         // of its own (9301), about 1 run in 3.
         let ue_notify = 78_101u64;
-        server.handover_target_assoc.insert(ue_notify, target);
+        server.handover_target_assoc.insert(ue_notify, (target, 1));
         let notify = nextgcore_ngap::builder::build_handover_notify(
             &nextgcore_ngap::types::HandoverNotify {
                 amf_ue_ngap_id: ue_notify,
@@ -19810,7 +20094,7 @@ mod tests {
 
         // HandoverCancel: the source abandoned it.
         let ue_cancel = 78_002u64;
-        server.handover_target_assoc.insert(ue_cancel, target);
+        server.handover_target_assoc.insert(ue_cancel, (target, 1));
         let cancel = nextgcore_ngap::builder::build_handover_cancel(
             &nextgcore_ngap::types::HandoverCancel {
                 amf_ue_ngap_id: ue_cancel,
@@ -19828,7 +20112,7 @@ mod tests {
         // ue_auth_state entry, because a stale record would misroute the NEXT
         // handover's status transfer to a gNB that already rejected the UE.
         let ue_failure = 78_003u64;
-        server.handover_target_assoc.insert(ue_failure, target);
+        server.handover_target_assoc.insert(ue_failure, (target, 1));
         let failure = nextgcore_ngap::builder::build_handover_failure(
             &nextgcore_ngap::types::HandoverFailure {
                 amf_ue_ngap_id: ue_failure,

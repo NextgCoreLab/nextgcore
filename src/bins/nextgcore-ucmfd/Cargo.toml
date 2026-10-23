@@ -38,3 +38,5 @@ workspace = true
 [dev-dependencies]
 # #570: drive the AMF's Nucmf consumer against this UCMF over real HTTP/2.
 nextgcore-amfd = { path = "../nextgcore-amfd" }
+# #725: property-based fuzzing of the request decoders.
+proptest.workspace = true
