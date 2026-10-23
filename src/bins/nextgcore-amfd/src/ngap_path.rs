@@ -749,6 +749,10 @@ pub struct NgapServer {
     /// live SCTP association. `None` (the default) keeps the real transport.
     #[cfg(test)]
     sent_ngap: Option<Vec<(u64, Vec<u8>)>>,
+    /// Test seam: the next this-many NGAP sends fail as an SCTP send error would,
+    /// so a test can drive a handler's send-failure branch (#760).
+    #[cfg(test)]
+    fail_next_sends: usize,
     /// Event sender for NGAP events
     event_tx: mpsc::Sender<AmfEvent>,
     /// Server event receiver
@@ -888,6 +892,8 @@ impl NgapServer {
             forced_amf_ue_ngap_id: None,
             #[cfg(test)]
             sent_ngap: None,
+            #[cfg(test)]
+            fail_next_sends: 0,
             event_tx,
             server_event_rx,
             ue_auth_state,
@@ -4569,12 +4575,13 @@ impl NgapServer {
                 .await
                 .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
 
-        // 1) Nudm_UECM_Registration (amf-3gpp-access)
-        if let Err(e) = crate::sbi_path::call_udm_uecm_registration(
+        // 1) Nudm_UECM_Registration (amf-3gpp-access), under this AMF's pinnable
+        // nfInstanceId and a fresh deregCallbackUri token (#753).
+        if let Err(e) = register_with_udm_uecm(
+            &mut state.amf_ue,
             &udm_host,
             udm_port,
             &supi,
-            &amf_instance_id(),
             &guami_mcc,
             &guami_mnc,
             &amf_id_hex,
@@ -12817,6 +12824,11 @@ impl NgapServer {
         );
 
         #[cfg(test)]
+        if self.fail_next_sends > 0 {
+            self.fail_next_sends -= 1;
+            return Err(anyhow::anyhow!("SCTP send error: injected by a test"));
+        }
+        #[cfg(test)]
         if let Some(sent) = self.sent_ngap.as_mut() {
             sent.push((association_id, data.to_vec()));
             return Ok(());
@@ -12868,11 +12880,54 @@ impl NgapServer {
 // NAS parsing / helper functions (TS 24.501)
 // ============================================================================
 
-/// Stable AMF NF instance ID for SBI registrations/subscriptions
+/// This AMF's `nfInstanceId`, the one it registers with the NRF and the UDM.
+///
+/// #753: this used to be a SECOND random UUID per process, so it could not be
+/// pinned (`NEXTGCORE_AMF_INSTANCE_ID` did not reach it). After every restart the
+/// UDM therefore saw a "new AMF" and sent the restarted AMF a
+/// UE_INITIAL_REGISTRATION dereg-notify for each re-registering UE.
 fn amf_instance_id() -> String {
-    static ID: once_cell::sync::Lazy<String> =
-        once_cell::sync::Lazy::new(|| uuid::Uuid::new_v4().to_string());
-    ID.clone()
+    nextgcore_sbi::nf_instance_id::nf_instance_id(nextgcore_sbi::types::NfType::Amf).to_string()
+}
+
+/// Nudm_UECM_Registration (amf-3gpp-access) for `amf_ue` under this AMF's
+/// `nfInstanceId` (#753), with a fresh `deregCallbackUri` token.
+///
+/// The token is recorded on the UE only once the UDM has ACCEPTED the
+/// registration. After a failed PUT the UDM still holds the previous registration
+/// and its URI, and a genuine notification about it must still act. During the
+/// PUT the UE is out of the store (`complete_registration` holds it), so a
+/// notification the PUT provokes for an older registration gets 404 anyway.
+/// Afterwards it names an older token and is ignored.
+async fn register_with_udm_uecm(
+    amf_ue: &mut AmfUe,
+    udm_host: &str,
+    udm_port: u16,
+    supi: &str,
+    guami_mcc: &str,
+    guami_mnc: &str,
+    amf_id_hex: &str,
+) -> crate::sbi_path::SbiResult<()> {
+    let dereg_token = crate::sbi_path::new_dereg_callback_token();
+    crate::sbi_path::call_udm_uecm_registration(
+        udm_host,
+        udm_port,
+        supi,
+        &amf_instance_id(),
+        &dereg_token,
+        guami_mcc,
+        guami_mnc,
+        amf_id_hex,
+    )
+    .await?;
+    amf_ue.uecm_dereg_token = Some(dereg_token);
+    Ok(())
+}
+
+/// [`amf_instance_id`], for the UECM wire test in `sbi_path`.
+#[cfg(test)]
+pub(crate) fn amf_instance_id_for_tests() -> String {
+    amf_instance_id()
 }
 
 /// Parsed Registration Request (TS 24.501 Section 8.2.6)
@@ -14589,6 +14644,9 @@ pub async fn amf_ngap_poll() -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    /// Handler-level tests asserting what amfd SENDS (#760, ...), in their own file.
+    mod handler_tests;
+
     use super::*;
     use crate::context::AmfContext;
     use tokio::sync::mpsc;
@@ -18412,6 +18470,115 @@ mod tests {
         );
     }
 
+    /// #753 review MAJOR-1: the token the AMF registers at the UDM is the token it
+    /// stores on the UE, and a notification posted to the registered
+    /// `deregCallbackUri` verbatim acts. If the PUT fails, the UE keeps its previous
+    /// token, because the UDM still holds the previous registration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_registered_dereg_callback_uri_is_the_one_that_acts() {
+        let _serial = crate::namf_server::dereg_queue_test_lock().lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        crate::context::amf_context_init(64, 1024, 4096);
+        let puts: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let sink = Arc::clone(&puts);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let udm = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        udm.start(move |req: nextgcore_sbi::message::SbiRequest| {
+            let sink = Arc::clone(&sink);
+            async move {
+                let body: serde_json::Value = req
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|c| serde_json::from_str(c).ok())
+                    .unwrap_or_default();
+                let refuse = req.header.uri.contains("imsi-001010000753099");
+                sink.lock().expect("sink").push(body);
+                nextgcore_sbi::message::SbiResponse::with_status(if refuse { 500 } else { 201 })
+            }
+        })
+        .await
+        .expect("stand-in UDM");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let supi = "imsi-001010000753003";
+        let id = 7_753_003u64;
+        let mut ue = UeNasContext::new(id, 53, 1, false);
+        ue.registered = true;
+        ue.amf_ue.supi = Some(supi.to_string());
+        register_with_udm_uecm(
+            &mut ue.amf_ue,
+            "127.0.0.1",
+            addr.port(),
+            supi,
+            "001",
+            "01",
+            "020040",
+        )
+        .await
+        .expect("registered");
+        let uri = puts.lock().expect("puts")[0]["deregCallbackUri"]
+            .as_str()
+            .expect("deregCallbackUri")
+            .to_string();
+        let token = uri.rsplit('/').next().expect("a last segment").to_string();
+        assert_eq!(ue.amf_ue.uecm_dereg_token.as_deref(), Some(token.as_str()));
+        let ngap = test_ngap_server().await;
+        ngap.ue_auth_state.insert(id, ue);
+
+        // The path of the URI the UDM holds, POSTed verbatim.
+        let path = &uri[uri.find("/namf-callback/").expect("callback path")..];
+        let resp = crate::namf_server::namf_request_handler(
+            nextgcore_sbi::message::SbiRequest::post(path.to_string())
+                .with_json_body(&serde_json::json!({
+                    "deregReason": "SUBSCRIPTION_WITHDRAWN",
+                    "accessType": "3GPP_ACCESS",
+                }))
+                .expect("json"),
+        )
+        .await;
+        assert_eq!(resp.status, 204);
+        let queued: Vec<_> = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().expect("ctx");
+            let (mine, others): (Vec<_>, Vec<_>) = guard
+                .network_dereg_drain()
+                .into_iter()
+                .partition(|d| d.amf_ue_ngap_id == id);
+            for o in others {
+                guard.network_dereg_add(o);
+            }
+            mine
+        };
+        assert_eq!(queued.len(), 1, "the registered URI's notification acts");
+        ngap.ue_auth_state.remove(id);
+
+        // A refused PUT leaves the previous token in place.
+        let mut refused = AmfUe::new(7_753_099, 0);
+        refused.uecm_dereg_token = Some("tok-previous".to_string());
+        assert!(register_with_udm_uecm(
+            &mut refused,
+            "127.0.0.1",
+            addr.port(),
+            "imsi-001010000753099",
+            "001",
+            "01",
+            "020040"
+        )
+        .await
+        .is_err());
+        assert_eq!(refused.uecm_dereg_token.as_deref(), Some("tok-previous"));
+        udm.stop().await.expect("stop");
+    }
+
     /// #602: a Nudm_UECM_DeregistrationNotification with `UE_INITIAL_REGISTRATION` is a
     /// LOCAL deregistration, driven from the Namf callback through the NGAP task's pump:
     /// the SM context is released at the SMF, the AM policy association is deleted at
@@ -18448,12 +18615,13 @@ mod tests {
         ue_ctx.registered = true;
         ue_ctx.cm_idle = true;
         ue_ctx.amf_ue.supi = Some(supi.to_string());
+        ue_ctx.amf_ue.uecm_dereg_token = Some("tok-602".to_string());
         ue_ctx.policy_association_id = Some("am-pol-602".to_string());
         ngap.ue_auth_state.insert(key, ue_ctx);
 
         let resp = crate::namf_server::namf_request_handler(
             nextgcore_sbi::message::SbiRequest::post(format!(
-                "/namf-callback/v1/{supi}/dereg-notify"
+                "/namf-callback/v1/{supi}/dereg-notify/tok-602"
             ))
             .with_json_body(&serde_json::json!({
                 "deregReason": "UE_INITIAL_REGISTRATION",
