@@ -916,11 +916,14 @@ dependencies = [
  "arbitrary",
  "bytes",
  "libfuzzer-sys",
+ "log",
  "nextgcore-diameter",
  "nextgcore-gtp",
  "nextgcore-lpp-gen",
+ "nextgcore-lte-rrc-gen",
  "nextgcore-nas",
  "nextgcore-ngap-gen",
+ "nextgcore-nr-rrc-gen",
  "nextgcore-nrppa-gen",
  "nextgcore-pfcp",
  "nextgcore-s1ap-gen",
@@ -947,6 +950,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextgcore-lte-rrc-gen"
+version = "0.1.0"
+dependencies = [
+ "asn1-codecs 0.7.2 (git+https://github.com/NextgCoreLab/asn1-codegen.git?rev=6d75c4962d09dcdb75eee7e4b8c03b14def2f123)",
+ "asn1-compiler",
+ "asn1_codecs_derive",
+ "bitvec",
+ "log",
+]
+
+[[package]]
 name = "nextgcore-nas"
 version = "0.1.0"
 dependencies = [
@@ -958,6 +972,17 @@ dependencies = [
 
 [[package]]
 name = "nextgcore-ngap-gen"
+version = "0.1.0"
+dependencies = [
+ "asn1-codecs 0.7.2 (git+https://github.com/NextgCoreLab/asn1-codegen.git?rev=6d75c4962d09dcdb75eee7e4b8c03b14def2f123)",
+ "asn1-compiler",
+ "asn1_codecs_derive",
+ "bitvec",
+ "log",
+]
+
+[[package]]
+name = "nextgcore-nr-rrc-gen"
 version = "0.1.0"
 dependencies = [
  "asn1-codecs 0.7.2 (git+https://github.com/NextgCoreLab/asn1-codegen.git?rev=6d75c4962d09dcdb75eee7e4b8c03b14def2f123)",

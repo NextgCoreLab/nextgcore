@@ -61,7 +61,7 @@ use serde_json::{json, Map, Value};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
 /// TS 29.673 V20.0.0 / TS 29.675 OpenAPI `info.version`.
@@ -479,71 +479,84 @@ fn handle(
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     log::debug!("UCMF SBI: {method} {path}");
 
-    let lock_poisoned = || (send_internal_error("UCMF state lock poisoned"), Vec::new());
     match parts.as_slice() {
         [UECM_API, "v1", "dic-entries"] => match method {
-            "GET" => match ucmf.read() {
-                Ok(u) => (resolve(&u, request), Vec::new()),
-                Err(_) => lock_poisoned(),
-            },
-            "POST" => match ucmf.write() {
-                Ok(mut u) => assign(&mut u, request, now),
-                Err(_) => lock_poisoned(),
-            },
+            "GET" => (resolve(&read_state(ucmf), request), Vec::new()),
+            "POST" => assign(&mut write_state(ucmf), request, now),
             _ => (send_method_not_allowed(method, "dic-entries"), Vec::new()),
         },
         [UECM_API, "v1", "dic-entries", id] => match method {
-            "GET" => match ucmf.read() {
-                Ok(u) => (get_dic_entry(&u, id, request), Vec::new()),
-                Err(_) => lock_poisoned(),
-            },
+            "GET" => (get_dic_entry(&read_state(ucmf), id, request), Vec::new()),
             _ => (
                 send_method_not_allowed(method, "dic-entries/{dicEntryId}"),
                 Vec::new(),
             ),
         },
         [UECM_API, "v1", "subscriptions"] => match method {
-            "POST" => match ucmf.write() {
-                Ok(mut u) => (subscribe(&mut u, request, now), Vec::new()),
-                Err(_) => lock_poisoned(),
-            },
+            "POST" => (subscribe(&mut write_state(ucmf), request, now), Vec::new()),
             _ => (send_method_not_allowed(method, "subscriptions"), Vec::new()),
         },
         [UECM_API, "v1", "subscriptions", id] => match method {
-            "DELETE" => match ucmf.write() {
-                Ok(mut u) => (unsubscribe(&mut u, id), Vec::new()),
-                Err(_) => lock_poisoned(),
-            },
+            "DELETE" => (unsubscribe(&mut write_state(ucmf), id), Vec::new()),
             _ => (
                 send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
                 Vec::new(),
             ),
         },
         [PROVISIONING_API, "v1", "provisionings"] => match method {
-            "POST" => match ucmf.write() {
-                Ok(mut u) => create_provisioning(&mut u, request, now),
-                Err(_) => lock_poisoned(),
-            },
+            "POST" => create_provisioning(&mut write_state(ucmf), request, now),
             _ => (send_method_not_allowed(method, "provisionings"), Vec::new()),
         },
-        [PROVISIONING_API, "v1", "provisionings", id] => match ucmf.write() {
-            Ok(mut u) => match method {
-                "GET" => (get_provisioning(&u, id), Vec::new()),
-                "PUT" => replace_provisioning(&mut u, id, request, now),
-                "PATCH" => patch_provisioning(&mut u, id, request, now),
-                "DELETE" => delete_provisioning(&mut u, id, now),
-                _ => (
-                    send_method_not_allowed(method, "provisionings/{provisioningId}"),
-                    Vec::new(),
-                ),
-            },
-            Err(_) => lock_poisoned(),
+        [PROVISIONING_API, "v1", "provisionings", id] => match method {
+            "GET" => (get_provisioning(&read_state(ucmf), id), Vec::new()),
+            "PUT" => replace_provisioning(&mut write_state(ucmf), id, request, now),
+            "PATCH" => patch_provisioning(&mut write_state(ucmf), id, request, now),
+            "DELETE" => delete_provisioning(&mut write_state(ucmf), id, now),
+            _ => (
+                send_method_not_allowed(method, "provisionings/{provisioningId}"),
+                Vec::new(),
+            ),
         },
         _ => (
             send_not_found(&format!("Resource not found: {path}"), None),
             Vec::new(),
         ),
     }
+}
+
+/// The UCMF state for reading. See [`write_state`] for why a poisoned lock is
+/// taken rather than refused.
+fn read_state(ucmf: &RwLock<Ucmf>) -> RwLockReadGuard<'_, Ucmf> {
+    ucmf.read().unwrap_or_else(|poisoned| {
+        log_poison_recovery();
+        ucmf.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+/// The UCMF state for writing, even when an earlier request panicked while
+/// holding it (#725).
+///
+/// Refusing a poisoned lock would make one panicking request answer `500` to
+/// every later request on both services until the process restarts. Taking it
+/// is sound because nothing that runs under the lock can leave the dictionary
+/// half-changed when it unwinds: the request decoders validate before they
+/// slice, the RRC codec calls are contained by `rac::guarded`, and the `Ucmf`
+/// operations do no indexing or arithmetic that request data can make fail. So a
+/// poisoned lock means a defect elsewhere, which is logged, not a torn state.
+fn write_state(ucmf: &RwLock<Ucmf>) -> RwLockWriteGuard<'_, Ucmf> {
+    ucmf.write().unwrap_or_else(|poisoned| {
+        log_poison_recovery();
+        ucmf.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
+fn log_poison_recovery() {
+    log::error!(
+        "UCMF state lock was poisoned by a request that panicked; recovering it so \
+         later requests are still served (#725). The panic above is a defect to report."
+    );
 }
 
 /// The request's JSON body (the JSON part of a multipart body).
@@ -1458,6 +1471,312 @@ mod tests {
         assert_eq!(r.status, 404);
         let (r, _) = handle(&u, &q, now());
         assert_eq!(r.status, 404);
+    }
+
+    // ----------------------------------------------------------------- #725
+
+    /// The issue's request: `"aéa"` is four bytes, passed the even-length check,
+    /// and panicked slicing across the `é` with the state write lock held.
+    const BAD_RACS_BODY: &str = r#"{"racsConfigs":{"000007ed900000000abc":{"imeiTacs":["12345678"],"racsParam5Gs":"aéa"}}}"#;
+
+    fn raw_body(mut r: SbiRequest, body: &str) -> SbiRequest {
+        r.http.content = Some(body.to_string());
+        r
+    }
+
+    /// Assign a capability and resolve it by entry ID: both locks, both services.
+    fn assert_still_serving(u: &RwLock<Ucmf>) {
+        let (r, _) = handle(u, &assign_request("35123456", &[0x5A]), now());
+        assert_eq!(
+            r.status,
+            201,
+            "Assign after the bad request: {:?}",
+            body(&r)
+        );
+        let entry = r
+            .http
+            .get_header("Location")
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string();
+        let (r, _) = handle(
+            u,
+            &req("GET", &format!("/nucmf-uecm/v1/dic-entries/{entry}")),
+            now(),
+        );
+        assert_eq!(
+            r.status,
+            200,
+            "Resolve after the bad request: {:?}",
+            body(&r)
+        );
+        assert!(!u.is_poisoned());
+    }
+
+    #[test]
+    fn a_non_ascii_racs_param_is_other_reason_and_the_ucmf_keeps_serving() {
+        let u = ucmf();
+        let (r, _) = handle(
+            &u,
+            &raw_body(
+                req("POST", "/nucmf-provisioning/v1/provisionings"),
+                BAD_RACS_BODY,
+            ),
+            now(),
+        );
+        assert_eq!(r.status, 500);
+        assert_eq!(
+            body(&r),
+            json!([{"racsIds": [MAN], "failureCode": "OTHER_REASON"}])
+        );
+        assert!(
+            !u.is_poisoned(),
+            "the bad request must not poison the state lock"
+        );
+
+        // The same value through PUT and PATCH of an existing provisioning.
+        let create = with_json(
+            req("POST", "/nucmf-provisioning/v1/provisionings"),
+            provisioning_body("0a0b"),
+        );
+        assert_eq!(handle(&u, &create, now()).0.status, 201);
+        for method in ["PUT", "PATCH"] {
+            let (r, _) = handle(
+                &u,
+                &raw_body(
+                    req(method, "/nucmf-provisioning/v1/provisionings/1"),
+                    BAD_RACS_BODY,
+                ),
+                now(),
+            );
+            assert_eq!(r.status, 500, "{method}");
+            assert_eq!(body(&r)[0]["failureCode"], "OTHER_REASON", "{method}");
+        }
+        // A refused replace leaves the provisioning as it was.
+        let (r, _) = handle(
+            &u,
+            &req("GET", "/nucmf-provisioning/v1/provisionings/1"),
+            now(),
+        );
+        assert_eq!(body(&r)["racsConfigs"][MAN]["racsParam5Gs"], "0a0b");
+        assert_still_serving(&u);
+    }
+
+    /// Whatever panics under the lock, later requests are still served: the
+    /// lock is recovered, not refused with `500 "UCMF state lock poisoned"`.
+    #[test]
+    fn a_poisoned_state_lock_is_recovered_not_refused() {
+        let u = Arc::new(ucmf());
+        let held = u.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = held.write().unwrap();
+            panic!("a request handler panicking with the state write lock held");
+        })
+        .join();
+        assert!(u.is_poisoned(), "the test must start from a poisoned lock");
+        let (r, _) = handle(&u, &req("GET", "/nucmf-uecm/v1/dic-entries/1"), now());
+        assert_eq!(
+            (r.status, cause(&r)),
+            (404, json!("NO_DICTIONARY_ENTRY_FOUND"))
+        );
+        assert!(!u.is_poisoned());
+        assert_still_serving(&u);
+
+        // Poisoned again, and this time the first request after is a write.
+        let held = u.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = held.write().unwrap();
+            panic!("again");
+        })
+        .join();
+        assert!(u.is_poisoned());
+        assert_still_serving(&u);
+    }
+
+    /// The issue's scenario end to end over HTTP/2: the bad provisioning, then
+    /// good requests on both services, through the real SBI server (whose
+    /// `catch_handler_panic` is what used to hide the poisoning).
+    #[tokio::test]
+    async fn over_http_a_bad_racs_param_is_refused_and_the_next_requests_are_served() {
+        use nextgcore_sbi::server::{SbiServer, SbiServerConfig};
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let state = Arc::new(ucmf());
+        let shared = state.clone();
+        let server = SbiServer::on_listener(SbiServerConfig::new(addr), listener);
+        server
+            .start(move |req: SbiRequest| {
+                let state = shared.clone();
+                async move { handle(&state, &req, Utc::now()).0 }
+            })
+            .await
+            .expect("UCMF test server starts");
+        let client = SbiClient::with_host_port("127.0.0.1", addr.port());
+        let send = |r: SbiRequest| {
+            let client = &client;
+            async move { client.send_request(r).await.expect("the UCMF answers") }
+        };
+        let json_of = |r: &SbiResponse| -> Value {
+            serde_json::from_str(r.http.content.as_deref().unwrap_or("null")).unwrap()
+        };
+        let bad: Value = serde_json::from_str(BAD_RACS_BODY).unwrap();
+
+        let r = send(
+            SbiRequest::post("/nucmf-provisioning/v1/provisionings")
+                .with_json_body(&bad)
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(r.status, 500);
+        assert_eq!(json_of(&r)[0]["failureCode"], "OTHER_REASON");
+
+        let r = send(
+            SbiRequest::post("/nucmf-provisioning/v1/provisionings")
+                .with_json_body(&provisioning_body("0a0b"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            r.status,
+            201,
+            "a good provisioning after the bad one: {:?}",
+            json_of(&r)
+        );
+        let r = send(
+            SbiRequest::patch("/nucmf-provisioning/v1/provisionings/1")
+                .with_json_body(&bad)
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(r.status, 500);
+        let r = send(SbiRequest::get("/nucmf-provisioning/v1/provisionings/1")).await;
+        assert_eq!(r.status, 200);
+        assert_eq!(json_of(&r)["racsConfigs"][MAN]["racsParam5Gs"], "0a0b");
+        // Nucmf_UECapabilityManagement too: the provisioned entry by its ID.
+        let r = send(SbiRequest::get("/nucmf-uecm/v1/dic-entries/1")).await;
+        assert_eq!(r.status, 200, "{:?}", json_of(&r));
+        assert_eq!(
+            json_of(&r)["manAssiUeRadioCapId"],
+            RacsId::from_digit_str(MAN).unwrap().to_nucmf()
+        );
+        assert!(!state.is_poisoned());
+        let _ = server.stop().await;
+    }
+
+    mod fuzz {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn method() -> impl Strategy<Value = &'static str> {
+            prop_oneof![
+                Just("GET"),
+                Just("POST"),
+                Just("PUT"),
+                Just("PATCH"),
+                Just("DELETE")
+            ]
+        }
+
+        fn path() -> impl Strategy<Value = String> {
+            prop_oneof![
+                Just("/nucmf-provisioning/v1/provisionings".to_string()),
+                Just("/nucmf-provisioning/v1/provisionings/1".to_string()),
+                Just("/nucmf-uecm/v1/dic-entries".to_string()),
+                Just("/nucmf-uecm/v1/subscriptions".to_string()),
+                "/nucmf-(uecm|provisioning)/v1/[a-z-]{0,12}/.{0,8}",
+            ]
+        }
+
+        /// JSON values shaped like the request bodies, with arbitrary leaves.
+        fn json_leaf() -> impl Strategy<Value = Value> {
+            prop_oneof![
+                Just(Value::Null),
+                any::<bool>().prop_map(Value::from),
+                any::<i64>().prop_map(Value::from),
+                any::<String>().prop_map(Value::from),
+                "[0-9a-f]{0,64}".prop_map(Value::from),
+                // Mostly hex, now and then a multi-byte character (#725).
+                "[0-9a-fA-Fé€]{0,16}".prop_map(Value::from),
+                "[0-9]{8}".prop_map(|t| json!([t])),
+            ]
+        }
+
+        fn body() -> impl Strategy<Value = String> {
+            let config = proptest::collection::btree_map(
+                prop_oneof![
+                    Just("imeiTacs".to_string()),
+                    Just("racsParam5Gs".to_string()),
+                    Just("racsParamEps".to_string()),
+                    ".{0,6}",
+                ],
+                json_leaf(),
+                0..4,
+            );
+            // A well-formed RacsConfiguration whose parameter alone is arbitrary,
+            // so the hex decoder is reached on most cases rather than few.
+            let well_formed = (
+                "0[0-9a-f]{19}",
+                "[0-9a-fA-Fé€ ]{0,16}|.{0,16}",
+                any::<bool>(),
+            )
+                .prop_map(|(key, param, eps)| {
+                    let member = if eps { "racsParamEps" } else { "racsParam5Gs" };
+                    json!({"racsConfigs": {key: {"imeiTacs": ["35123456"], member: param}}})
+                        .to_string()
+                });
+            prop_oneof![
+                2 => well_formed,
+                1 => proptest::collection::btree_map("0[0-9a-f]{19}|.{0,22}", config, 0..3)
+                    .prop_map(|m| json!({ "racsConfigs": m }).to_string()),
+                1 => proptest::collection::btree_map(".{0,24}", json_leaf(), 0..4)
+                    .prop_map(|m| json!(m).to_string()),
+                1 => any::<String>(),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            /// Arbitrary requests at every route: each is answered, none panics,
+            /// and afterwards the UCMF still serves a good Assign and Resolve.
+            #[test]
+            fn arbitrary_requests_never_panic_or_wedge_the_ucmf(
+                reqs in proptest::collection::vec(
+                    (method(), path(), body(), proptest::collection::vec(any::<u8>(), 0..48)),
+                    1..6,
+                ),
+            ) {
+                let u = ucmf();
+                for (m, p, b, part) in reqs {
+                    let mut r = raw_body(req(m, &p), &b);
+                    r.http.parts.push(SbiPart::with_content("nr", CONTENT_NGAP, Bytes::from(part)));
+                    let (resp, _) = handle(&u, &r, now());
+                    prop_assert!((200..600).contains(&resp.status));
+                    prop_assert!(!u.is_poisoned());
+                }
+                assert_still_serving(&u);
+            }
+
+            /// Assign with arbitrary capability bytes in every format.
+            #[test]
+            fn an_assign_with_arbitrary_capability_bytes_is_answered(
+                parts in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..64), 4),
+            ) {
+                let u = ucmf();
+                let names = ["ueRadioCapability5GS", "ueRadioCapabilityEPS", "ueRadioCap5GSForPaging", "ueRadioCapEPSForPaging"];
+                let mut j = json!({"typeAllocationCode": "35123456"});
+                let mut r = req("POST", "/nucmf-uecm/v1/dic-entries");
+                for (name, bytes) in names.iter().zip(parts) {
+                    j[*name] = json!({"contentId": name});
+                    r.http.parts.push(SbiPart::with_content(*name, CONTENT_NGAP, Bytes::from(bytes)));
+                }
+                let r = with_json(r, j);
+                let (resp, _) = handle(&u, &r, now());
+                prop_assert!(resp.status == 201 || resp.status == 400, "{}", resp.status);
+                prop_assert!(!u.is_poisoned());
+            }
+        }
     }
 
     #[test]
