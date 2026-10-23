@@ -772,11 +772,11 @@ pub fn decode_nrppa_ecid_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasuremen
 /// structure type 2, 0 for type 1).
 const N_TA_OFFSET_TDD_TS: f64 = 624.0;
 
-/// Whether `earfcn` is a downlink EARFCN of an E-UTRA TDD band: bands 33..53,
-/// N_DL 36000..60254 (TS 36.101 Table 5.7.3-1). Every FDD band is below 36000 or,
-/// for bands 65 and up, at 65536 and above.
+/// Whether `earfcn` is a downlink EARFCN of an E-UTRA TDD band: bands 33..54,
+/// N_DL 36000..60304 (TS 36.101 Table 5.7.3-1; band 54 is 60255..60304). Every
+/// FDD band is below 36000 or, for bands 65 and up, at 65536 and above.
 fn is_eutra_tdd_earfcn(earfcn: u32) -> bool {
-    (36_000..=60_254).contains(&earfcn)
+    (36_000..=60_304).contains(&earfcn)
 }
 
 /// Map one LPP `MeasuredResultsElement` (TS 37.355 §6.5.3
