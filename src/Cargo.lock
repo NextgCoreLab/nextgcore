@@ -3372,6 +3372,7 @@ dependencies = [
  "nextgcore-ngap-gen",
  "nextgcore-nr-rrc-gen",
  "nextgcore-sbi",
+ "proptest",
  "serde",
  "serde_json",
  "serde_yaml",
