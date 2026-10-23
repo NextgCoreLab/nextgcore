@@ -167,6 +167,12 @@ pub mod pfcp_ie {
     pub const FRAMED_IPV6_ROUTE: u16 = 155;
     pub const APN_DNN: u16 = 159;
     pub const PFCPSEREQ_FLAGS: u16 = 186;
+    /// PFCP Session Retention Information (TS 29.244 Table 7.4.4.1-2), grouped (#718)
+    pub const PFCP_SESSION_RETENTION_INFORMATION: u16 = 183;
+    /// PFCPASRsp-Flags (TS 29.244 8.2.134): PSREI / UUPSI (#718)
+    pub const PFCPASRSP_FLAGS: u16 = 184;
+    /// CP PFCP Entity IP Address (TS 29.244 8.2.135), within the retention IE (#718)
+    pub const CP_PFCP_ENTITY_IP_ADDRESS: u16 = 185;
     /// PFCPSMReq-Flags (TS 29.244 8.2.50): DROBU / SNDEM / QAURR
     pub const PFCPSMREQ_FLAGS: u16 = 49;
     /// Downlink Data Notification Delay (TS 29.244 8.2.28)
@@ -1917,10 +1923,16 @@ pub fn upf_function_features() -> Vec<u8> {
 }
 
 /// Build Association Setup Response
+///
+/// `sessions_retained` sets PSREI in a PFCPASRsp-Flags IE (TS 29.244 §6.2.6.2.2,
+/// §8.2.134): the request carried PFCP Session Retention Information for a Node ID
+/// that already had an association, and the requested sessions were kept. The IE is
+/// omitted otherwise, which a CP function reads as "nothing was retained".
 pub fn build_association_setup_response(
     node_id: &NodeId,
     recovery_time_stamp: u32,
     cause: PfcpCause,
+    sessions_retained: bool,
 ) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
     builder.add_node_id(node_id);
@@ -1928,7 +1940,44 @@ pub fn build_association_setup_response(
     builder.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, recovery_time_stamp);
     // UP Function Features — only the bits this UPF really implements
     builder.add_tlv(pfcp_ie::UP_FUNCTION_FEATURES, &upf_function_features());
+    if sessions_retained {
+        builder.add_u8(pfcp_ie::PFCPASRSP_FLAGS, 0x01); // PSREI
+    }
     builder.build()
+}
+
+/// The PFCP Session Retention Information IE of an Association Setup Request
+/// (TS 29.244 Table 7.4.4.1-2), parsed (#718).
+///
+/// `None`: the IE is absent, so the existing association's sessions are deleted.
+/// `Some(vec![])`: present with no CP PFCP Entity IP Address, which means "keep all
+/// existing sessions". `Some(ips)`: keep the sessions of those CP PFCP entities only.
+pub fn parse_session_retention_information(payload: &[u8]) -> Option<Vec<std::net::IpAddr>> {
+    let ies = ParsedIe::parse_all(payload);
+    let retention = ParsedIe::find_ie(&ies, pfcp_ie::PFCP_SESSION_RETENTION_INFORMATION)?;
+    let inner = ParsedIe::parse_all(&retention.value);
+    let mut ips = Vec::new();
+    for entity in ParsedIe::find_all_ies(&inner, pfcp_ie::CP_PFCP_ENTITY_IP_ADDRESS) {
+        // Octet 5: bit 2 = V4, bit 1 = V6 (TS 29.244 §8.2.135); a field the flag
+        // announces but the IE is too short to carry is ignored, not read past.
+        let v = &entity.value;
+        let Some(&flags) = v.first() else { continue };
+        let mut off = 1;
+        if flags & 0x02 != 0 {
+            if let Some(b) = v.get(off..off + 4) {
+                ips.push(std::net::IpAddr::V4(Ipv4Addr::new(b[0], b[1], b[2], b[3])));
+            }
+            off += 4;
+        }
+        if flags & 0x01 != 0 {
+            if let Some(b) = v.get(off..off + 16) {
+                let mut o = [0u8; 16];
+                o.copy_from_slice(b);
+                ips.push(std::net::IpAddr::V6(Ipv6Addr::from(o)));
+            }
+        }
+    }
+    Some(ips)
 }
 
 /// Build Association Release Response (TS 29.244 7.4.4.2): Node ID + Cause

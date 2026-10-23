@@ -492,10 +492,11 @@ fn an_erab_modification_indication_switches_known_erabs_and_fails_unknown_ones()
     assert!(failed
         .iter()
         .any(|(e, c)| *e == 5 && matches!(c, g::Cause::Transport(_))));
-    // The new downlink endpoint is stored for the Modify Bearer Request.
-    assert_eq!(ctx.bearer_find_by_id(ids[0]).unwrap().enb_s1u_teid, 0x5151);
+    // #736: an endpoint the Serving GW never accepted is not written.
+    assert_ne!(ctx.bearer_find_by_id(ids[0]).unwrap().enb_s1u_teid, 0x5151);
 
-    // With the Serving GW's answer: accepted, E-RAB 5 is modified ...
+    // With the Serving GW's answer: accepted, E-RAB 5 is modified and its new
+    // endpoint written ...
     let pending = crate::gtp_path::PendingErabModification {
         enb_id,
         confirm: crate::s1ap_gen::ErabModificationConfirm {
@@ -506,15 +507,66 @@ fn an_erab_modification_indication_switches_known_erabs_and_fails_unknown_ones()
             to_be_released: vec![],
         },
         notify: vec![],
+        mme_ue_id: ctx.bearer_find_by_id(ids[0]).unwrap().mme_ue_id,
+        switched: vec![crate::gtp_path::SwitchedBearer {
+            ebi: 5,
+            teid: 0x5151,
+            ip: crate::context::IpAddr {
+                ipv4: Some([10, 0, 0, 51]),
+                ..Default::default()
+            },
+        }],
     };
-    let send = crate::s1ap_handler::erab_modification_confirm(pending.clone(), 16).unwrap();
-    assert_eq!(send.enb_id, enb_id);
-    assert_eq!(confirm_lists(&send.pdu), (vec![5], vec![]));
-    // ... refused, it failed.
-    let send = crate::s1ap_handler::erab_modification_confirm(pending.clone(), 64).unwrap();
+    let response =
+        |cause: u8, per_bearer: Option<u8>| crate::s11_handler::ModifyBearerResponseData {
+            cause,
+            bearer_contexts: per_bearer
+                .map(|c| {
+                    vec![crate::s11_handler::BearerContextModified {
+                        ebi: 5,
+                        cause: Some(c),
+                    }]
+                })
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+    // ... refused (message cause), it failed, and nothing is written ...
+    let send =
+        crate::s1ap_handler::erab_modification_confirm(&ctx, pending.clone(), &response(64, None))
+            .unwrap();
     let (modified, failed) = confirm_lists(&send.pdu);
     assert!(modified.is_empty());
     assert_eq!(failed.iter().map(|f| f.0).collect::<Vec<_>>(), vec![5]);
+    assert_ne!(ctx.bearer_find_by_id(ids[0]).unwrap().enb_s1u_teid, 0x5151);
+    // ... accepted partially with the bearer's own cause a refusal: failed ...
+    let send = crate::s1ap_handler::erab_modification_confirm(
+        &ctx,
+        pending.clone(),
+        &response(17, Some(73)),
+    )
+    .unwrap();
+    assert_eq!(confirm_lists(&send.pdu).0, Vec::<u8>::new());
+    assert_ne!(ctx.bearer_find_by_id(ids[0]).unwrap().enb_s1u_teid, 0x5151);
+    // ... and accepted: modified, with the endpoint written.
+    let send = crate::s1ap_handler::erab_modification_confirm(
+        &ctx,
+        pending.clone(),
+        &response(16, Some(16)),
+    )
+    .unwrap();
+    assert_eq!(send.enb_id, enb_id);
+    assert_eq!(confirm_lists(&send.pdu), (vec![5], vec![]));
+    let b = ctx.bearer_find_by_id(ids[0]).unwrap();
+    assert_eq!(b.enb_s1u_teid, 0x5151);
+    assert_eq!(b.enb_s1u_ip.ipv4, Some([10, 0, 0, 51]));
+
+    // #736: the Serving GW never answers: every E-RAB failed, transport cause.
+    let send = crate::s1ap_handler::erab_modification_unanswered(&ctx, pending.clone()).unwrap();
+    let (modified, failed) = confirm_lists(&send.pdu);
+    assert!(modified.is_empty());
+    assert!(failed
+        .iter()
+        .any(|(e, c)| *e == 5 && matches!(c, g::Cause::Transport(_))));
 
     // The S11 response path takes the parked record by sequence number.
     crate::gtp_path::record_pending_erab_modification_for_test(0x5_84, pending);
@@ -1105,6 +1157,43 @@ fn an_eps_to_5gs_handover_runs_against_the_amfs_own_n26_codec() {
         n26.outstanding() < before,
         "the Relocation Cancel Response closes the request"
     );
+
+    // --- #735, TS 29.274 §7.6: a retransmitted Complete Notification ---------
+    // Through the SOCKET: the AMF's first Acknowledge is lost, it retransmits
+    // the Notification, and gets the same Acknowledge from the response cache
+    // rather than silence (before #735 the cached Acknowledge was never read).
+    let teid = 0x0735_0001;
+    crate::n26_path::record_eps_to_5gs_relocation_for_test(crate::n26_path::EpsTo5gsRelocation {
+        mme_ue_id: 0x0735_0001,
+        source_enb_ue_id: 0,
+        sequence: 0x735,
+        amf_peer: amf_sock.local_addr().unwrap(),
+        amf_teid: Some(0xA735),
+    });
+    let notification = amf::build_forward_relocation_complete_notification(0x0735, teid);
+    let mut acks = Vec::new();
+    for _ in 0..2 {
+        amf_sock
+            .send_to(&notification.encode(), n26.local_addr())
+            .unwrap();
+        let mut buf = [0u8; 4096];
+        let (len, _) = loop {
+            let (len, from) = amf_sock.recv_from(&mut buf).expect("an Acknowledge");
+            if buf.get(1) == Some(&136) {
+                break (len, from);
+            }
+        };
+        acks.push(buf[..len].to_vec());
+    }
+    assert_eq!(acks.len(), 2, "both Notifications are answered");
+    assert_eq!(
+        acks[0], acks[1],
+        "the retransmission gets the same Acknowledge"
+    );
+    let ack =
+        nextgcore_gtp::v2::Gtp2Message::decode(&mut bytes::Bytes::from(acks[1].clone())).unwrap();
+    assert_eq!(ack.header.sequence_number, 0x0735);
+    assert_eq!(ack.header.teid, Some(0xA735));
 
     crate::n26_path::set_for_test(false);
 }
