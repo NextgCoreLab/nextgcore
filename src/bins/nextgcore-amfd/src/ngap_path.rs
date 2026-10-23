@@ -743,6 +743,12 @@ pub struct NgapServer {
     /// one from the allocator, so a test can key its assertions on a known value.
     #[cfg(test)]
     forced_amf_ue_ngap_id: Option<u64>,
+    /// Test seam: when `Some`, every NGAP PDU `send_to_association` would put on the
+    /// wire is recorded here as `(association_id, pdu)` instead, and the send
+    /// succeeds. Lets a handler test assert what amfd SENDS, and to whom, without a
+    /// live SCTP association. `None` (the default) keeps the real transport.
+    #[cfg(test)]
+    sent_ngap: Option<Vec<(u64, Vec<u8>)>>,
     /// Event sender for NGAP events
     event_tx: mpsc::Sender<AmfEvent>,
     /// Server event receiver
@@ -880,6 +886,8 @@ impl NgapServer {
             next_gnb_id: Arc::new(Mutex::new(1)),
             #[cfg(test)]
             forced_amf_ue_ngap_id: None,
+            #[cfg(test)]
+            sent_ngap: None,
             event_tx,
             server_event_rx,
             ue_auth_state,
@@ -12795,6 +12803,12 @@ impl NgapServer {
             association_id
         );
 
+        #[cfg(test)]
+        if let Some(sent) = self.sent_ngap.as_mut() {
+            sent.push((association_id, data.to_vec()));
+            return Ok(());
+        }
+
         // Use stream 0 for NGAP signaling
         self.transport
             .send(association_id, 0, data)
@@ -14559,6 +14573,9 @@ pub async fn amf_ngap_poll() -> Result<bool> {
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[cfg(test)]
+mod handler_tests;
 
 #[cfg(test)]
 mod tests {
