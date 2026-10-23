@@ -382,7 +382,9 @@ assert_log_contains "nextgcore-amf" "PDU Session Resource Setup Response" \
 # "Extracted gNB TEID=0x..". Match the VALUE, not the sentence, so a further
 # rewording cannot make a working TEID relay look broken -- which is what the
 # stale "Extracted gNB TEID" string did until 2026-10-06.
-assert_log_contains "nextgcore-amf" "gNB TEID=0x[0-9a-f]{8}" \
+# assert_log_contains greps a BASIC regex, so the repeat count is \{8\}: a bare
+# {8} is literal there and never matched, which kept ./e2e.sh at exit 1 (#697).
+assert_log_contains "nextgcore-amf" "gNB TEID=0x[0-9a-f]\{8\}" \
     "AMF extracted gNB TEID from Setup Response"
 
 assert_log_contains "nextgcore-amf" "Calling SMF SM Context Update" \
@@ -515,8 +517,8 @@ assert_log_contains "nextgsim-ue" "Sending PDU Session Establishment Request" \
 assert_log_contains "nextgsim-ue" "PDU Session Establishment Accept" \
     "UE received PDU Session Establishment Accept"
 
-# main.rs: "PDU session {psi} is now ACTIVE (IPv4: {ipv4:?})"
-assert_log_contains "nextgsim-ue" "PDU session 1 is now ACTIVE (IPv4: Some" \
+# main.rs: "PDU Session {psi} is now ACTIVE (IPv4: {ipv4:?})"
+assert_log_contains "nextgsim-ue" "PDU Session 1 is now ACTIVE (IPv4: Some" \
     "UE PDU session 1 ACTIVE with IPv4 address"
 
 assert_log_contains "nextgsim-ue" "Creating TUN interface" \
