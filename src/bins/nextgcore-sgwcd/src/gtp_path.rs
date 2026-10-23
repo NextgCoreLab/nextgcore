@@ -1010,43 +1010,10 @@ fn forward_pgw_bearer_procedure_to_mme(
     }
 }
 
-/// How a received restart counter relates to the one already stored for a peer
-/// (TS 23.007 Section 18).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RestartOrder {
-    /// Received value is ahead of the stored one: the peer restarted.
-    Restarted,
-    /// Received value equals the stored one: nothing happened.
-    Unchanged,
-    /// Received value is behind the stored one. TS 23.007 Section 18: "If the
-    /// value ... previously stored for a peer is larger than the Restart
-    /// counter value received ... this indicates a possible race condition ...
-    /// [the message] shall be discarded."
-    Stale,
-}
-
-/// Classify a received restart counter against the stored one.
-///
-/// The previous code used `previous != restart_counter`, which treats a value
-/// moving BACKWARDS as a restart. That is precisely the race TS 23.007 Section 18
-/// says to discard, and acting on it tears down live contexts on a reordered
-/// datagram.
-///
-/// Note on the counter's modulo-256 wrap: a genuine wrap (255 -> 0) is reported
-/// here as `Stale`, not `Restarted`, because Section 18 is written as a plain
-/// magnitude comparison on the stored-versus-received values and nextgcore #53's
-/// acceptance criteria require a rolled-over value to be discarded. The cost is
-/// that the 256th restart of a peer is not detected from its counter alone; it
-/// is still detected by N3 exhaustion on the path. Chosen deliberately: treating
-/// a backwards jump as a restart would delete live sessions on every reordered
-/// message, which is the far more damaging error.
-pub(crate) fn restart_counter_order(stored: u8, received: u8) -> RestartOrder {
-    match received.cmp(&stored) {
-        std::cmp::Ordering::Greater => RestartOrder::Restarted,
-        std::cmp::Ordering::Equal => RestartOrder::Unchanged,
-        std::cmp::Ordering::Less => RestartOrder::Stale,
-    }
-}
+/// TS 23.007 §18 ordering of Restart counters, with the 8-bit roll-over taken into
+/// account. Shared with mmed in `nextgcore-gtp` (#728); before that this node
+/// compared plain magnitudes, so a peer's 255 -> 0 restart read as a stale value.
+pub(crate) use nextgcore_gtp::v2::{restart_counter_order, RestartOrder};
 
 /// Whether restart-triggered context deletion is enabled.
 ///
@@ -4106,14 +4073,15 @@ mod tests {
     #[test]
     fn restart_counter_order_discards_a_backwards_jump() {
         assert_eq!(restart_counter_order(5, 6), RestartOrder::Restarted);
-        assert_eq!(restart_counter_order(5, 200), RestartOrder::Restarted);
+        assert_eq!(restart_counter_order(5, 132), RestartOrder::Restarted);
         assert_eq!(restart_counter_order(5, 5), RestartOrder::Unchanged);
         // The race: stored is larger than received.
         assert_eq!(restart_counter_order(5, 4), RestartOrder::Stale);
-        assert_eq!(restart_counter_order(200, 5), RestartOrder::Stale);
-        // A modulo-256 roll-over is reported Stale, per #53's criteria and the
-        // plain magnitude reading of Section 18. Documented on the function.
-        assert_eq!(restart_counter_order(255, 0), RestartOrder::Stale);
+        assert_eq!(restart_counter_order(5, 200), RestartOrder::Stale);
+        // Section 18 says "taking the integer roll-over into account" (#728):
+        // 255 -> 0 is the next incarnation, and 0 -> 255 the stale one.
+        assert_eq!(restart_counter_order(255, 0), RestartOrder::Restarted);
+        assert_eq!(restart_counter_order(0, 255), RestartOrder::Stale);
     }
 
     /// TS 29.274 Section 7.7.2: a datagram of a version higher than GTPv2 must
