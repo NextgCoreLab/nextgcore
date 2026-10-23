@@ -2641,14 +2641,6 @@ impl NgapServer {
         // initial NAS message (InitialUEMessage). Drives the §4.4.6 gate.
         integrity_protected: bool,
     ) -> Result<()> {
-        // #759: the session IEs of a mobility or periodic update, for the Accept.
-        // Read before `parse_registration_request_pdu` consumes nothing, and
-        // recorded on the UE's context so every accept path finds them.
-        if let Some(ies) = registration_update_session_ies(nas) {
-            self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
-                s.registration_session_ies = Some(ies);
-            });
-        }
         let Some(req) = parse_registration_request_pdu(nas) else {
             log::error!("Malformed Registration Request: rejecting (#96)");
             let reject =
@@ -2692,6 +2684,16 @@ impl NgapServer {
                 return Ok(());
             }
         }
+
+        // #759: the session IEs of a mobility or periodic update, recorded on the
+        // UE's context so whichever path sends the Accept finds them. Recorded only
+        // once the request has passed the §4.4.6 and congestion gates, and always
+        // overwritten, so a rejected or earlier request never leaves IEs behind for
+        // a later Accept.
+        let session_ies = registration_update_session_ies(nas);
+        self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
+            s.registration_session_ies = session_ies;
+        });
 
         log::info!(
             "Registration Request: type={}, ngKSI={}/{}, identity_type={}, suci={:?}",
@@ -4829,16 +4831,6 @@ impl NgapServer {
             .await
     }
 
-    /// Establish AS-layer security and deliver the initial Registration Accept.
-    ///
-    /// Per TS 23.502 §4.2.2.2.2 step 16 / TS 38.413 §8.3.1, the AMF derives
-    /// KgNB (TS 33.501 Annex A.9) and sends NGAP InitialContextSetupRequest to
-    /// the gNB carrying the GUAMI, the replayed UE security capabilities, the
-    /// UE Security Key (KgNB), the Allowed NSSAI, the UE-AMBR and — piggybacked
-    /// as the NAS-PDU — the protected Registration Accept. The registration is
-    /// only considered established once the gNB returns
-    /// InitialContextSetupResponse; T3550 is armed for the NAS-layer
-    /// Registration Complete.
     /// Release and re-activate a registration update's sessions (#759, TS 24.501
     /// §5.5.1.3.4, TS 23.502 §4.2.2.2.2 steps 17-21). This is the Service Request's
     /// plan applied to the REGISTRATION REQUEST's IEs:
@@ -4942,8 +4934,11 @@ impl NgapServer {
         }
     }
 
-    /// The Accept of a registration update from CM-IDLE that re-activates
-    /// sessions, sent in an Initial Context Setup together with them (#759).
+    /// The Accept of a registration update on a new NG connection (from CM-IDLE),
+    /// sent in an Initial Context Setup together with the sessions it re-activated
+    /// (#759). If the Initial Context Setup cannot be encoded, the Accept still
+    /// goes, on its own in a Downlink NAS Transport, and the UE stays without AS
+    /// security on this connection, as it was before.
     async fn send_update_accept_in_initial_context_setup(
         &mut self,
         association_id: u64,
@@ -4954,7 +4949,8 @@ impl NgapServer {
         sessions: &[crate::ngap_asn1::CxtReqSession],
     ) -> Result<()> {
         // KgNB from the uplink NAS COUNT of the REGISTRATION REQUEST, as the
-        // Service Request path derives it (TS 33.501 Annex A.9).
+        // initial registration and the idle Service Request derive it (TS 33.501
+        // Annex A.9), and the {NH, NCC} chain restarted from it (Annex A.10).
         let kgnb = nextgcore_crypt::kdf::nextgcore_kdf_kgnb_and_kn3iwf(
             &state.amf_ue.kamf,
             state.amf_ue.ul_count,
@@ -4964,15 +4960,8 @@ impl NgapServer {
                 state.amf_ue.access_type
             },
         );
-        state.amf_ue.kgnb = kgnb;
-        state.amf_ue.init_next_hop_chain();
-        state.initial_context_setup_request_sent = true;
-        state.initial_context_setup_response_received = false;
-        let allowed_nssai = state.amf_ue.allowed_nssai.clone();
-        let ue_security_capability = state.amf_ue.ue_security_capability.clone();
         let ue_ambr = (state.amf_ue.ue_ambr.downlink > 0 || state.amf_ue.ue_ambr.uplink > 0)
             .then_some((state.amf_ue.ue_ambr.downlink, state.amf_ue.ue_ambr.uplink));
-        self.ue_auth_state.insert(amf_ue_ngap_id, state);
         let ics = {
             let ctx = crate::context::amf_self();
             let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
@@ -4980,8 +4969,8 @@ impl NgapServer {
                 &guard,
                 amf_ue_ngap_id,
                 ran_ue_ngap_id,
-                &allowed_nssai,
-                &ue_security_capability,
+                &state.amf_ue.allowed_nssai,
+                &state.amf_ue.ue_security_capability,
                 &kgnb,
                 Some(protected),
                 ue_ambr,
@@ -4989,11 +4978,22 @@ impl NgapServer {
             )
         };
         let Some(ics) = ics else {
-            anyhow::bail!(
-                "UE {amf_ue_ngap_id}: Initial Context Setup for the registration update did \
-                 not encode"
+            log::error!(
+                "UE {amf_ue_ngap_id}: the Initial Context Setup for the registration update \
+                 did not encode; the Accept goes in a Downlink NAS Transport, and {} \
+                 re-activated session(s) get no user plane on this connection",
+                sessions.len()
             );
+            self.ue_auth_state.insert(amf_ue_ngap_id, state);
+            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, protected)
+                .await?;
+            return Ok(());
         };
+        state.amf_ue.kgnb = kgnb;
+        state.amf_ue.init_next_hop_chain();
+        state.initial_context_setup_request_sent = true;
+        state.initial_context_setup_response_received = false;
+        self.ue_auth_state.insert(amf_ue_ngap_id, state);
         let (racs_id, racs_cap) = self.racs_ies_for(amf_ue_ngap_id);
         let ics = crate::racs::add_capability_ies(ics, racs_id.as_deref(), racs_cap.as_deref());
         self.send_to_association(association_id, &ics).await?;
@@ -5044,6 +5044,16 @@ impl NgapServer {
         carried
     }
 
+    /// Establish AS-layer security and deliver the initial Registration Accept.
+    ///
+    /// Per TS 23.502 §4.2.2.2.2 step 16 / TS 38.413 §8.3.1, the AMF derives
+    /// KgNB (TS 33.501 Annex A.9) and sends NGAP InitialContextSetupRequest to
+    /// the gNB carrying the GUAMI, the replayed UE security capabilities, the
+    /// UE Security Key (KgNB), the Allowed NSSAI, the UE-AMBR and — piggybacked
+    /// as the NAS-PDU — the protected Registration Accept. The registration is
+    /// only considered established once the gNB returns
+    /// InitialContextSetupResponse; T3550 is armed for the NAS-layer
+    /// Registration Complete.
     async fn send_registration_accept(
         &mut self,
         association_id: u64,
@@ -5096,11 +5106,17 @@ impl NgapServer {
         if update {
             let tmsi = state.amf_ue.next_guti.tmsi;
             let sessions = reconciled.map(|r| r.activated).unwrap_or_default();
-            if !sessions.is_empty() && !state.initial_context_setup_request_sent {
-                // A new NG connection (the UE came back from CM-IDLE): the gNB has
-                // no UE context, so the re-activated sessions and the Accept ride an
-                // Initial Context Setup, as a Service Request's do (TS 23.502
-                // §4.2.2.2.2 step 21, §4.2.3.2 step 12).
+            let reactivated = sessions.len();
+            if !state.initial_context_setup_request_sent {
+                // A new NG connection: the UE came back from CM-IDLE (#609 resume),
+                // so the gNB holds no UE context and no AS security for it. The
+                // Accept rides an Initial Context Setup together with any session
+                // this request re-activated, as a Service Request's does (TS 23.502
+                // §4.2.2.2.2 step 21, §4.2.3.2 step 12; TS 38.413 §8.3.1). It does
+                // so even with no session to re-activate: a PDU session the UE
+                // establishes next on this connection needs the gNB's UE context,
+                // and the AMF only sends that session's setup once an Initial
+                // Context Setup Response has arrived.
                 self.send_update_accept_in_initial_context_setup(
                     association_id,
                     amf_ue_ngap_id,
@@ -5133,8 +5149,8 @@ impl NgapServer {
                     .await?;
             }
             log::info!(
-                "Registration Accept (update) sent via DownlinkNASTransport to UE \
-                 {amf_ue_ngap_id} (5G-TMSI=0x{tmsi:08x})"
+                "Registration Accept (update) sent to UE {amf_ue_ngap_id} \
+                 (5G-TMSI=0x{tmsi:08x}, {reactivated} re-activated PDU session(s))"
             );
             // #91: AFTER the Accept is on the wire, never before.
             self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
@@ -11166,6 +11182,17 @@ impl NgapServer {
                 ),
             }
         }
+        // The Handover Request set up the UE's context and AS security at the
+        // target gNB (TS 38.413 §8.4.2.2), and its Handover Notify says the UE is
+        // there. Record that as an established UE context, as an Initial Context
+        // Setup Response would: the registration update that follows (TS 23.502
+        // §4.11.1.2.2 step 14) must not be answered with an Initial Context Setup
+        // to a gNB that already holds one (#759), and a new PDU session's setup is
+        // only sent once this is true.
+        self.ue_auth_state.with_mut(amf_ue_ngap_id, |s| {
+            s.initial_context_setup_request_sent = true;
+            s.initial_context_setup_response_received = true;
+        });
         let seq = in_flight.server.alloc_sequence().await;
         let notification = crate::n26_eps_to_5gs::build_forward_relocation_complete_notification(
             seq,
@@ -13646,7 +13673,6 @@ fn is_snpn_onboarding_suci(suci: &str) -> bool {
     suci.contains("onboarding")
 }
 
-/// Parse a plain Registration Request NAS PDU
 /// What `reconcile_update_sessions` did (#759).
 struct UpdateSessionOutcome {
     /// The PDU session status for the Accept: `Some` when the UE sent one.
@@ -26021,6 +26047,15 @@ mod eps_to_5gs_tests {
         );
         assert_eq!(complete.header.teid, Some(MME_TEID));
         assert!(!ngap.eps_ho_in_flight.contains_key(&amf_ue_ngap_id));
+        // #759: the target gNB holds the UE's context and AS security now, so the
+        // registration update that follows is not answered with an Initial
+        // Context Setup, and a new PDU session's setup is not deferred.
+        let arrived = ngap.ue_auth_state.get(amf_ue_ngap_id).unwrap();
+        assert!(
+            arrived.initial_context_setup_request_sent
+                && arrived.initial_context_setup_response_received,
+            "the handed-over UE has an established UE context at the target"
+        );
 
         crate::sbi_path::set_pgw_discovery_nrf_for_test(None);
         ngap.ue_auth_state.remove(amf_ue_ngap_id);

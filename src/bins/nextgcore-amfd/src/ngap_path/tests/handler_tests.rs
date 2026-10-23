@@ -688,11 +688,7 @@ fn registered_ue_with_guti(server: &mut NgapServer, ue: u64, ran: u32) {
 
 /// The decoded REGISTRATION ACCEPT inside a protected DL NAS PDU (NEA0).
 fn registration_accept_of(nas: &[u8]) -> nextgcore_nas::fiveg::message::RegistrationAccept {
-    use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
-    match parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&nas[7..])) {
-        Ok(FiveGmmMessage::RegistrationAccept(a)) => a,
-        other => panic!("a REGISTRATION ACCEPT, got {other:?}"),
-    }
+    registration_accept_of_plain(&nas[7..])
 }
 
 /// #759: a connected UE's mobility update says PSI 1 is active and has uplink
@@ -824,4 +820,365 @@ async fn an_update_without_session_ies_touches_no_session() {
     let accept = registration_accept_of(nas_pdu);
     assert_eq!(accept.pdu_session_status, None);
     assert_eq!(accept.pdu_session_reactivation_result, None);
+}
+
+// ---------------------------------------------------------------------------
+// #759 from CM-IDLE: the update arrives in an Initial UE Message (#609 resume),
+// so the gNB holds no UE context and the Accept rides an Initial Context Setup
+// ---------------------------------------------------------------------------
+
+/// An INITIAL CONTEXT SETUP REQUEST, reduced to what the CM-IDLE update asserts.
+#[derive(Debug)]
+struct SentIcs {
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+    nas_pdu: Option<Vec<u8>>,
+    items: Vec<SetupItem>,
+    security_key: Vec<u8>,
+}
+
+/// Decode `pdu` as an INITIAL CONTEXT SETUP REQUEST, or `None` for anything else.
+fn decode_ics(pdu: &[u8]) -> Option<SentIcs> {
+    use g::InitialContextSetupRequestProtocolIEs_EntryValue as V;
+    let Ok(g::NGAP_PDU::InitiatingMessage(m)) = nextgcore_ngap_gen::decode(pdu) else {
+        return None;
+    };
+    let g::InitiatingMessageValue::Id_InitialContextSetup(req) = m.value else {
+        return None;
+    };
+    let mut out = SentIcs {
+        amf_ue_ngap_id: 0,
+        ran_ue_ngap_id: 0,
+        nas_pdu: None,
+        items: Vec::new(),
+        security_key: Vec::new(),
+    };
+    for ie in req.protocol_i_es.0 {
+        match ie.value {
+            V::Id_AMF_UE_NGAP_ID(id) => out.amf_ue_ngap_id = id.0,
+            V::Id_RAN_UE_NGAP_ID(id) => out.ran_ue_ngap_id = id.0,
+            V::Id_NAS_PDU(n) => out.nas_pdu = Some(n.0),
+            V::Id_SecurityKey(k) => out.security_key = k.0.into_vec(),
+            V::Id_PDUSessionResourceSetupListCxtReq(l) => {
+                for it in l.0 {
+                    out.items.push(SetupItem {
+                        psi: it.pdu_session_id.0,
+                        sst: it.s_nssai.sst.0.first().copied().unwrap_or_default(),
+                        sd: it
+                            .s_nssai
+                            .sd
+                            .map(|sd| sd.0.iter().fold(0u32, |acc, b| (acc << 8) | u32::from(*b))),
+                        transfer: it.pdu_session_resource_setup_request_transfer.0,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(out)
+}
+
+/// The GUAMI the #609 fixtures' 5G-GUTI names (PLMN 001/01, region 0x02, set
+/// 0x155, pointer 0x2A), installed as the only served one so the Initial Context
+/// Setup encodes and the GUTI is this AMF's own. Restores the previous list on drop.
+struct ServeFixtureGuami(Vec<crate::context::Guami>);
+
+impl ServeFixtureGuami {
+    fn install() -> Self {
+        let ctx = crate::context::amf_self();
+        let mut guard = ctx.write().unwrap_or_else(|e| e.into_inner());
+        let previous = std::mem::replace(
+            &mut guard.served_guami,
+            vec![crate::context::Guami {
+                plmn_id: PlmnId::new("001", "01"),
+                amf_id: crate::context::AmfId {
+                    region: 0x02,
+                    set: 0x155,
+                    pointer: 0x2A,
+                },
+            }],
+        );
+        Self(previous)
+    }
+}
+
+impl Drop for ServeFixtureGuami {
+    fn drop(&mut self) {
+        let ctx = crate::context::amf_self();
+        ctx.write().unwrap_or_else(|e| e.into_inner()).served_guami = std::mem::take(&mut self.0);
+    }
+}
+
+/// The CM-IDLE UE the two tests below resume: the #609 fixture with a K_AMF, an
+/// Allowed NSSAI and security capabilities, so an Initial Context Setup encodes,
+/// and the previous connection's UE context recorded as established.
+fn idle_ue_for_update(old_id: u64, tmsi: u32) -> UeNasContext {
+    let mut ue = super::idle_ue_with_security(old_id, tmsi);
+    // As its registration left it: the previous connection's Initial Context
+    // Setup was sent and answered. The resume must not inherit that.
+    ue.initial_context_setup_request_sent = true;
+    ue.initial_context_setup_response_received = true;
+    ue.amf_ue.kamf = [0x33; 32];
+    ue.amf_ue.allowed_nssai = vec![crate::context::SNssai {
+        sst: SLICE.0,
+        sd: SLICE.1,
+    }];
+    ue.amf_ue.ue_security_capability = crate::context::UeSecurityCapability {
+        ea: 0xE0,
+        ia: 0xE0,
+        eea: 0,
+        eia: 0,
+    };
+    ue
+}
+
+/// The REGISTRATION ACCEPT inside a downlink NAS PDU protected under `ue`'s
+/// context (integrity and NEA2 ciphering, downlink COUNT = the PDU's SQN).
+fn deciphered_registration_accept(
+    ue: &crate::context::AmfUe,
+    nas: &[u8],
+) -> nextgcore_nas::fiveg::message::RegistrationAccept {
+    assert_eq!(
+        nas.get(1),
+        Some(&security_header::INTEGRITY_PROTECTED_AND_CIPHERED),
+        "{nas:02x?}"
+    );
+    let mut plain = nas[7..].to_vec();
+    nas_security::nas_encrypt(
+        ue.selected_enc_algorithm,
+        &ue.knas_enc,
+        u32::from(nas[6]),
+        ue.access_type,
+        nas_security::direction::DOWNLINK,
+        &mut plain,
+    );
+    registration_accept_of_plain(&plain)
+}
+
+/// The decoded REGISTRATION ACCEPT of a plain 5GMM message.
+fn registration_accept_of_plain(plain: &[u8]) -> nextgcore_nas::fiveg::message::RegistrationAccept {
+    use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+    match parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(plain)) {
+        Ok(FiveGmmMessage::RegistrationAccept(a)) => a,
+        other => panic!("a REGISTRATION ACCEPT, got {other:?}"),
+    }
+}
+
+/// #759 from CM-IDLE (TS 24.501 §5.5.1.3.4, TS 23.502 §4.2.2.2.2 steps 17-21).
+/// A CM-IDLE UE sends a protected mobility update in an Initial UE Message. The
+/// cleartext part holds only the cleartext IEs, and the full request in the
+/// NAS message container holds Uplink data status {1} and PDU session status
+/// {1}. PSI 2, which the AMF holds, is inactive at the UE. The AMF:
+/// - releases PSI 2 at its SMF and activates PSI 1 (ACTIVATING), both under the
+///   UE's new AMF UE NGAP ID;
+/// - sends ONE Initial Context Setup Request on the new connection. It carries
+///   PSI 1's transfer, a K_gNB derived from this request's uplink NAS COUNT
+///   (5), and as its NAS-PDU the REGISTRATION ACCEPT, which reports PDU
+///   session status {1} and reactivation result "no failure";
+/// - sends no Downlink NAS Transport and no PDU Session Resource Setup Request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// CONTEXT_GUARD is held across the awaits on purpose: `served_guami` is
+// process-global and this test needs its own for the whole exchange.
+#[allow(clippy::await_holding_lock)]
+async fn a_mobility_update_from_cm_idle_rides_an_initial_context_setup_with_its_sessions() {
+    let _guard = crate::test_support::CONTEXT_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    crate::context::amf_context_init(64, 1024, 4096);
+    let _guami = ServeFixtureGuami::install();
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (old_id, new_id, tmsi) = (7_759_101u64, 7_759_102u64, 0x0759_0101u32);
+    let stored = idle_ue_for_update(old_id, tmsi);
+    let ue_keys = stored.amf_ue.clone();
+    let kamf = stored.amf_ue.kamf;
+    server.ue_auth_state.insert(old_id, stored);
+    hold_session(&mut server, old_id, 1, "reg759-idle-1", port);
+    hold_session(&mut server, old_id, 2, "reg759-idle-2", port);
+    server.forced_amf_ue_ngap_id = Some(new_id);
+
+    let cleartext = super::guti_registration_request(
+        crate::gmm_build::registration_type::MOBILITY_UPDATING,
+        tmsi,
+    );
+    let mut full = cleartext.clone();
+    full.extend_from_slice(&[0x40, 0x02, 1 << 1, 0x00]); // Uplink data status: PSI 1
+    full.extend_from_slice(&[0x50, 0x02, 1 << 1, 0x00]); // PDU session status: PSI 1
+    let nas = super::protected_initial_registration(&ue_keys, &cleartext, &full, 5);
+    server
+        .handle_initial_ue_message(ASSOC, &super::service_request_initial_ue(nas))
+        .await
+        .expect("the update is handled");
+
+    let calls = calls.lock().expect("calls").clone();
+    assert_eq!(calls.len(), 2, "one release and one activation: {calls:?}");
+    assert!(
+        calls
+            .iter()
+            .any(|(u, _)| u.ends_with("/sm-contexts/reg759-idle-2/release")),
+        "PSI 2, inactive at the UE, is released at its SMF: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|(u, b)| u.ends_with("/sm-contexts/reg759-idle-1/modify")
+                && b["upCnxState"] == "ACTIVATING"),
+        "PSI 1's user plane is re-activated: {calls:?}"
+    );
+
+    let sent = take_sent_ngap(&mut server);
+    assert_eq!(sent.len(), 1, "exactly one NGAP PDU: {sent:?}");
+    assert_eq!(sent[0].0, ASSOC);
+    let ics = decode_ics(&sent[0].1).unwrap_or_else(|| {
+        panic!(
+            "an INITIAL CONTEXT SETUP REQUEST, got {:?}",
+            decode_sent(&sent[0].1)
+        )
+    });
+    assert_eq!((ics.amf_ue_ngap_id, ics.ran_ue_ngap_id), (new_id, 512));
+    assert_eq!(
+        ics.items,
+        vec![setup_item(1, transfer_for("reg759-idle-1"))]
+    );
+    let kgnb = nextgcore_crypt::kdf::nextgcore_kdf_kgnb_and_kn3iwf(&kamf, 5, ACCESS_TYPE_3GPP);
+    assert_eq!(
+        ics.security_key,
+        kgnb.to_vec(),
+        "K_gNB from the REGISTRATION REQUEST's uplink NAS COUNT (TS 33.501 Annex A.9)"
+    );
+    let accept = deciphered_registration_accept(
+        &ue_keys,
+        ics.nas_pdu.as_deref().expect("the Accept rides the ICS"),
+    );
+    assert_eq!(accept.pdu_session_status.map(|p| p.psi), Some(1 << 1));
+    assert_eq!(accept.pdu_session_reactivation_result, Some(0));
+
+    let resumed = server.ue_auth_state.get(new_id).expect("the resumed UE");
+    assert!(resumed.initial_context_setup_request_sent);
+    assert!(
+        !resumed.initial_context_setup_response_received,
+        "the UE context is up only once the gNB answers"
+    );
+    assert_eq!(resumed.amf_ue.kgnb, kgnb);
+    drop(resumed);
+    {
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        assert!(guard.sess_find_by_psi(new_id, 2).is_none(), "PSI 2 is gone");
+        if let Some(sess) = guard.sess_find_by_psi(new_id, 1) {
+            guard.sess_remove(sess.id);
+        }
+    }
+    server.ue_auth_state.remove(new_id);
+}
+
+/// A periodic update from CM-IDLE with no session IE still sets up the UE's
+/// context on the new connection: an Initial Context Setup with no session and
+/// the Accept, no N11 call. Otherwise a PDU session the UE establishes next on
+/// this connection would wait for an Initial Context Setup Response that never
+/// comes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn a_periodic_update_from_cm_idle_without_session_ies_still_sets_up_the_ue_context() {
+    let _guard = crate::test_support::CONTEXT_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    crate::context::amf_context_init(64, 1024, 4096);
+    let _guami = ServeFixtureGuami::install();
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (old_id, new_id, tmsi) = (7_759_201u64, 7_759_202u64, 0x0759_0201u32);
+    let stored = idle_ue_for_update(old_id, tmsi);
+    let ue_keys = stored.amf_ue.clone();
+    server.ue_auth_state.insert(old_id, stored);
+    hold_session(&mut server, old_id, 1, "reg759-idle-none-1", port);
+    server.forced_amf_ue_ngap_id = Some(new_id);
+
+    let rr = super::guti_registration_request(
+        crate::gmm_build::registration_type::PERIODIC_UPDATING,
+        tmsi,
+    );
+    let nas = super::protected_initial_registration(&ue_keys, &rr, &rr, 5);
+    server
+        .handle_initial_ue_message(ASSOC, &super::service_request_initial_ue(nas))
+        .await
+        .expect("the update is handled");
+
+    assert!(
+        calls.lock().expect("calls").is_empty(),
+        "no session touched"
+    );
+    let sent = take_sent_ngap(&mut server);
+    assert_eq!(sent.len(), 1, "exactly one NGAP PDU: {sent:?}");
+    let ics = decode_ics(&sent[0].1).unwrap_or_else(|| {
+        panic!(
+            "an INITIAL CONTEXT SETUP REQUEST, got {:?}",
+            decode_sent(&sent[0].1)
+        )
+    });
+    assert_eq!(ics.amf_ue_ngap_id, new_id);
+    assert!(ics.items.is_empty(), "no session re-activated");
+    let accept = deciphered_registration_accept(
+        &ue_keys,
+        ics.nas_pdu.as_deref().expect("the Accept rides the ICS"),
+    );
+    assert_eq!(accept.pdu_session_status, None);
+    assert_eq!(accept.pdu_session_reactivation_result, None);
+    {
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(sess) = guard.sess_find_by_psi(new_id, 1) {
+            guard.sess_remove(sess.id);
+        }
+    }
+    server.ue_auth_state.remove(new_id);
+}
+
+/// The fallback: when the Initial Context Setup cannot be encoded (here: an
+/// empty Allowed NSSAI, which the SIZE(1..8) list refuses), the Accept is not
+/// lost. It goes on its own in a Downlink NAS Transport, and the UE context is
+/// not recorded as being set up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn an_update_from_cm_idle_whose_initial_context_setup_cannot_encode_still_gets_its_accept() {
+    let _guard = crate::test_support::CONTEXT_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    crate::context::amf_context_init(64, 1024, 4096);
+    let _guami = ServeFixtureGuami::install();
+    let mut server = capturing_ngap_server().await;
+    let (old_id, new_id, tmsi) = (7_759_301u64, 7_759_302u64, 0x0759_0301u32);
+    let mut stored = idle_ue_for_update(old_id, tmsi);
+    stored.amf_ue.allowed_nssai.clear();
+    let ue_keys = stored.amf_ue.clone();
+    server.ue_auth_state.insert(old_id, stored);
+    server.forced_amf_ue_ngap_id = Some(new_id);
+
+    let rr = super::guti_registration_request(
+        crate::gmm_build::registration_type::PERIODIC_UPDATING,
+        tmsi,
+    );
+    let nas = super::protected_initial_registration(&ue_keys, &rr, &rr, 5);
+    server
+        .handle_initial_ue_message(ASSOC, &super::service_request_initial_ue(nas))
+        .await
+        .expect("the update is handled");
+
+    let sent: Vec<Sent> = take_sent_ngap(&mut server)
+        .into_iter()
+        .map(|(_, p)| decode_sent(&p))
+        .collect();
+    let [Sent::DownlinkNas {
+        amf_ue_ngap_id,
+        nas_pdu,
+    }] = sent.as_slice()
+    else {
+        panic!("one DL NAS Transport, got {sent:?}");
+    };
+    assert_eq!(*amf_ue_ngap_id, new_id);
+    let _ = deciphered_registration_accept(&ue_keys, nas_pdu);
+    let resumed = server.ue_auth_state.get(new_id).expect("the resumed UE");
+    assert!(!resumed.initial_context_setup_request_sent);
+    drop(resumed);
+    server.ue_auth_state.remove(new_id);
 }
