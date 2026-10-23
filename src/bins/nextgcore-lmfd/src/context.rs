@@ -126,6 +126,10 @@ pub struct CellMeasurement {
     /// NR DL-TDOA reference-signal time difference vs the DL-PRS reference TRP
     /// (nanoseconds, SIGNED; the reference TRP itself reports 0). TS 37.355.
     pub rstd_ns: Option<f64>,
+    /// The DL-PRS ID of the reference TRP that `rstd_ns` is relative to, for an
+    /// LPP DL-TDOA measurement. Reports with different references are rebased
+    /// onto each other before they are solved together (#824 review).
+    pub rstd_reference: Option<u8>,
     /// UE Rx–Tx time difference against this TRP (TS 38.215 §5.1.30), signed
     /// nanoseconds: the UE half of a Multi-RTT measurement (LPP
     /// `nr-UE-RxTxTimeDiff-r16`). Not an RTT on its own (#713).
@@ -1168,20 +1172,25 @@ fn try_real_solve(
     }
 
     // --- NR DL-TDOA (≥3 TRPs with an RSTD known to the registry) ------------
-    let tdoa_obs = tdoa_observations(measurements, registry);
+    let (tdoa_obs, rebased) = tdoa_observations(measurements, registry);
 
     if tdoa_obs.len() >= 3 {
         match solve_tdoa(registry, &tdoa_obs) {
             Ok(est) => {
+                // Losing the reporting reference costs one TRP of redundancy; with
+                // three TRPs left the residual is zero by construction and says
+                // nothing about the error. The reported accuracy is doubled so a
+                // consumer does not read that as precision (#824 review).
+                let widen = if rebased { 2.0 } else { 1.0 };
                 return Some(LocationEstimate {
                     latitude: est.lat_deg,
                     longitude: est.lon_deg,
                     altitude: est.height_m,
-                    horizontal_accuracy: est.horizontal_uncertainty_m(),
+                    horizontal_accuracy: est.horizontal_uncertainty_m() * widen,
                     vertical_accuracy: None,
                     method_used: Some(est.method.as_spec_str().to_string()),
                     timestamp: 0,
-                })
+                });
             }
             Err(e) => log::warn!("DL-TDOA solve failed: {e}"),
         }
@@ -1262,14 +1271,23 @@ fn resolve_trp(m: &CellMeasurement, registry: &TrpRegistry) -> Option<String> {
 }
 
 /// The DL-TDOA observations in `measurements`, with element 0 the reference
-/// that `solve_tdoa` expects (#714).
+/// that `solve_tdoa` expects, and whether a reported reference had to be
+/// replaced (#714).
 ///
-/// Every RSTD in a report is relative to the same DL-PRS reference TRP r
-/// (TS 38.215 §5.1.29): `rstd_i = t_i − t_r`. For any TRP j of the set,
-/// `t_i − t_j = rstd_i − rstd_j`. So the observations are re-expressed relative
-/// to one TRP the registry knows, and that TRP is put first. The choice is the
-/// entry with the smallest |RSTD|: the reporting reference itself (RSTD 0) when
-/// the registry knows it, else the neighbour nearest it in time.
+/// Every RSTD in a report is relative to that report's DL-PRS reference TRP r
+/// (TS 38.215 §5.1.29): `rstd_i = t_i − t_r`. So for any TRP j of the same
+/// report, `t_i − t_j = rstd_i − rstd_j`, and a report can be re-expressed
+/// relative to any TRP the registry knows.
+///
+/// Measurements are grouped by `rstd_reference`, one group per reference TRP.
+/// An MO-LR can carry several LPP reports, and reports may use different
+/// references (#824 review). The group with the most known TRPs is the base.
+/// Another group joins it through a TRP both hold: the offset
+/// `rstd_base(s) − rstd_group(s)` moves the whole group onto the base's
+/// reference. A group that shares no known TRP with the base cannot be related
+/// to it, and is dropped and logged rather than mixed in. Finally every RSTD is
+/// rebased on element 0, the known TRP with the smallest |RSTD|: the reporting
+/// reference itself when the registry knows it.
 ///
 /// Before #714 the entries were sorted by |RSTD| and the first one was used as
 /// the reference without rebasing. When the registry did not know the true
@@ -1281,18 +1299,73 @@ fn resolve_trp(m: &CellMeasurement, registry: &TrpRegistry) -> Option<String> {
 fn tdoa_observations(
     measurements: &[CellMeasurement],
     registry: &TrpRegistry,
-) -> Vec<TdoaObservation> {
-    let mut obs: Vec<TdoaObservation> = Vec::new();
+) -> (Vec<TdoaObservation>, bool) {
+    // A DL-PRS ID names one TRP across the reports of a session. A neighbour that
+    // resolves by its PCI therefore also tells which TRP its DL-PRS ID is, and a
+    // reference TRP, which only carries a DL-PRS ID, can be found through it.
+    let mut by_prs: HashMap<u8, String> = HashMap::new();
     for m in measurements {
-        let (Some(rstd), Some(key)) = (m.rstd_ns, resolve_trp(m, registry)) else {
+        if let (Some(prs), Some(key)) = (m.dl_prs_id, resolve_trp(m, registry)) {
+            by_prs.entry(prs).or_insert(key);
+        }
+    }
+    let resolve = |m: &CellMeasurement| {
+        resolve_trp(m, registry).or_else(|| m.dl_prs_id.and_then(|p| by_prs.get(&p).cloned()))
+    };
+    // Per reference, the known TRPs and their RSTDs in report order.
+    let mut groups: Vec<(Option<u8>, Vec<TdoaObservation>)> = Vec::new();
+    for m in measurements {
+        let (Some(rstd), Some(key)) = (m.rstd_ns, resolve(m)) else {
             continue;
         };
-        if rstd.is_finite() && !obs.iter().any(|o| o.trp_id == key) {
-            obs.push(TdoaObservation {
+        if !rstd.is_finite() {
+            continue;
+        }
+        let g = match groups.iter().position(|(r, _)| *r == m.rstd_reference) {
+            Some(g) => g,
+            None => {
+                groups.push((m.rstd_reference, Vec::new()));
+                groups.len() - 1
+            }
+        };
+        if !groups[g].1.iter().any(|o| o.trp_id == key) {
+            groups[g].1.push(TdoaObservation {
                 trp_id: key,
                 tdoa_ns: rstd,
             });
         }
+    }
+    let Some(base_group) = (0..groups.len()).max_by_key(|&g| groups[g].1.len()) else {
+        return (Vec::new(), false);
+    };
+    let mut obs = groups.swap_remove(base_group).1;
+    // Join the other groups through a shared TRP, until no more join.
+    loop {
+        let joinable = groups.iter().enumerate().find_map(|(g, (_, group))| {
+            group.iter().find_map(|o| {
+                obs.iter()
+                    .find(|b| b.trp_id == o.trp_id)
+                    .map(|b| (g, b.tdoa_ns - o.tdoa_ns))
+            })
+        });
+        let Some((g, offset)) = joinable else {
+            break;
+        };
+        for o in groups.swap_remove(g).1 {
+            if !obs.iter().any(|b| b.trp_id == o.trp_id) {
+                obs.push(TdoaObservation {
+                    trp_id: o.trp_id,
+                    tdoa_ns: o.tdoa_ns + offset,
+                });
+            }
+        }
+    }
+    for (reference, group) in &groups {
+        log::warn!(
+            "DL-TDOA: a report relative to DL-PRS reference {reference:?} shares no known TRP \
+             with the others; its {} RSTD(s) are dropped, not mixed in",
+            group.len()
+        );
     }
     let Some(reference) = (0..obs.len()).min_by(|&a, &b| {
         obs[a]
@@ -1301,11 +1374,12 @@ fn tdoa_observations(
             .partial_cmp(&obs[b].tdoa_ns.abs())
             .unwrap_or(std::cmp::Ordering::Equal)
     }) else {
-        return obs;
+        return (obs, false);
     };
     obs.swap(0, reference);
     let base = obs[0].tdoa_ns;
-    if base != 0.0 {
+    let rebased = base != 0.0;
+    if rebased {
         log::info!(
             "DL-TDOA: the reporting reference TRP is not in the registry; RSTDs rebased \
              on {} ({base} ns)",
@@ -1315,7 +1389,7 @@ fn tdoa_observations(
     for o in &mut obs {
         o.tdoa_ns -= base;
     }
-    obs
+    (obs, rebased)
 }
 
 /// The Multi-RTT range observations in `measurements`, one per TRP the registry
@@ -1581,6 +1655,7 @@ mod tests {
             rtt_ns: None,
             rstd_ns: None,
             ue_rx_tx_ns: None,
+            rstd_reference: None,
             gnb_rx_tx_ns: None,
             dl_prs_id: None,
             eutra: false,
@@ -1626,6 +1701,7 @@ mod tests {
                 rtt_ns: Some(1000),
                 rstd_ns: None,
                 ue_rx_tx_ns: None,
+                rstd_reference: None,
                 gnb_rx_tx_ns: None,
                 dl_prs_id: None,
                 eutra: false,
@@ -1639,6 +1715,7 @@ mod tests {
                 rtt_ns: Some(2000),
                 rstd_ns: None,
                 ue_rx_tx_ns: None,
+                rstd_reference: None,
                 gnb_rx_tx_ns: None,
                 dl_prs_id: None,
                 eutra: false,
@@ -1760,6 +1837,7 @@ mod tests {
             rtt_ns: None,
             rstd_ns: None,
             ue_rx_tx_ns: None,
+            rstd_reference: None,
             gnb_rx_tx_ns: None,
             dl_prs_id: None,
             eutra: false,
@@ -1783,6 +1861,7 @@ mod tests {
             rtt_ns: None,
             rstd_ns: None,
             ue_rx_tx_ns: None,
+            rstd_reference: None,
             gnb_rx_tx_ns: None,
             dl_prs_id: None,
             eutra: false,
@@ -1909,6 +1988,7 @@ mod tests_real_solve {
                     rtt_ns: Some(rtt_ns),
                     rstd_ns: None,
                     ue_rx_tx_ns: None,
+                    rstd_reference: None,
                     gnb_rx_tx_ns: None,
                     dl_prs_id: None,
                     eutra: false,
@@ -1950,6 +2030,7 @@ mod tests_real_solve {
                     rtt_ns: None,
                     rstd_ns: Some(rstd_ns),
                     ue_rx_tx_ns: None,
+                    rstd_reference: None,
                     gnb_rx_tx_ns: None,
                     dl_prs_id: None,
                     eutra: false,
@@ -1991,6 +2072,7 @@ mod tests_real_solve {
             rtt_ns: None,
             rstd_ns: None,
             ue_rx_tx_ns: None,
+            rstd_reference: None,
             gnb_rx_tx_ns: None,
             dl_prs_id: None,
             eutra: false,
@@ -2037,6 +2119,7 @@ mod tests_real_solve {
                     rtt_ns: None,
                     rstd_ns: None,
                     ue_rx_tx_ns: None,
+                    rstd_reference: None,
                     gnb_rx_tx_ns: None,
                     dl_prs_id: None,
                     eutra: false,
@@ -2076,6 +2159,7 @@ mod tests_real_solve {
                     rtt_ns: Some(rtt_ns),
                     rstd_ns: None,
                     ue_rx_tx_ns: None,
+                    rstd_reference: None,
                     gnb_rx_tx_ns: None,
                     dl_prs_id: None,
                     eutra: false,
@@ -2104,6 +2188,7 @@ mod tests_real_solve {
             rtt_ns: None,
             rstd_ns: None,
             ue_rx_tx_ns: None,
+            rstd_reference: None,
             gnb_rx_tx_ns: None,
             dl_prs_id: None,
             eutra: false,
@@ -2149,6 +2234,7 @@ mod tests_real_solve {
             rtt_ns: None,
             rstd_ns: None,
             ue_rx_tx_ns: None,
+            rstd_reference: None,
             gnb_rx_tx_ns: None,
             dl_prs_id: None,
             eutra: false,
@@ -2321,6 +2407,7 @@ mod tests_real_solve {
             rtt_ns: None,
             rstd_ns: None,
             ue_rx_tx_ns: None,
+            rstd_reference: None,
             gnb_rx_tx_ns: None,
             dl_prs_id: None,
             eutra: false,
@@ -2438,6 +2525,7 @@ mod tests_multi_rtt_two_sided {
                 rtt_ns: None,
                 rstd_ns: None,
                 ue_rx_tx_ns: None,
+                rstd_reference: None,
                 gnb_rx_tx_ns: Some(propagation_ns(*e, *n) - UE_CLOCK_OFFSET_NS + SRS_AFTER_PRS_NS),
                 dl_prs_id: None,
                 eutra: false,
@@ -2631,7 +2719,7 @@ mod tests_dl_tdoa_reference {
         assert_eq!(cells[0].nr_cgi, "prs-0");
         assert!(reg.lookup("prs-0").is_none());
 
-        let obs = tdoa_observations(&cells, &reg);
+        let (obs, _) = tdoa_observations(&cells, &reg);
         assert_eq!(obs.len(), 3);
         assert_eq!(obs[0].tdoa_ns, 0.0, "element 0 is the rebased reference");
         // Each rebased RSTD is the true range difference to the new reference.
@@ -2664,7 +2752,7 @@ mod tests_dl_tdoa_reference {
     fn a_prs_keyed_registry_resolves_neighbours_that_reported_a_pci() {
         let reg = registry(|prs, _| format!("prs-{prs}"));
         let cells = report();
-        let obs = tdoa_observations(&cells, &reg);
+        let (obs, _) = tdoa_observations(&cells, &reg);
         assert_eq!(
             obs.iter().map(|o| o.trp_id.as_str()).collect::<Vec<_>>(),
             ["prs-0", "prs-1", "prs-2", "prs-3"]
@@ -2684,7 +2772,7 @@ mod tests_dl_tdoa_reference {
             }
         });
         let cells = report();
-        let obs = tdoa_observations(&cells, &reg);
+        let (obs, _) = tdoa_observations(&cells, &reg);
         assert_eq!(obs[0].trp_id, "prs-0");
         assert_eq!(obs.len(), 4);
         for (o, c) in obs.iter().zip(&cells) {
@@ -2694,6 +2782,131 @@ mod tests_dl_tdoa_reference {
         assert!(error_m(&fix) < 1.0, "position error {:.3} m", error_m(&fix));
     }
 
+    /// A report relative to TRP `reference` (by index into TRPS), with the
+    /// neighbours `neighbours` reported by DL-PRS ID and PCI.
+    fn report_with(reference: usize, neighbours: &[usize], txn: u8) -> Vec<CellMeasurement> {
+        let (rp, _, re, rn) = TRPS[reference];
+        let d_ref = range(re, rn);
+        let list: Vec<(u8, Option<u16>, u32)> = neighbours
+            .iter()
+            .map(|&t| {
+                let (prs, pci, e, n) = TRPS[t];
+                let rstd = (range(e, n) - d_ref) / SPEED_OF_LIGHT_M_S * 1e9;
+                (prs, Some(pci), (rstd / TC_NS + MIDPOINT).round() as u32)
+            })
+            .collect();
+        let bytes = crate::lpp_fixtures::dl_tdoa_lpp(rp, &list, txn);
+        crate::codec_glue::decode_lpp_provide_report(&bytes)
+            .expect("decodes")
+            .1
+    }
+
+    /// #824 review: an MO-LR carrying two LPP reports with different reference
+    /// TRPs. Report A is relative to TRP 1 (neighbours PCI 2, 3); report B is
+    /// relative to TRP 2 (neighbours PCI 1, 4). Mixed as one set they gave a fix
+    /// 69.65 m off. Joined through the TRPs they share, they give the UE.
+    #[test]
+    fn two_reports_with_different_references_are_joined_not_mixed() {
+        let reg = registry(|_, pci| format!("pci-{pci}"));
+        let mut cells = report_with(0, &[1, 2], 1);
+        cells.extend(report_with(1, &[0, 3], 2));
+        let (obs, _) = tdoa_observations(&cells, &reg);
+        assert_eq!(
+            obs.len(),
+            4,
+            "all four TRPs, B joined to A through PCI 1 / PCI 2"
+        );
+        let fix = try_real_solve(&cells, &reg).expect("a DL-TDOA fix");
+        assert!(error_m(&fix) < 1.0, "position error {:.3} m", error_m(&fix));
+    }
+
+    /// A report that shares no known TRP with the others cannot be related to
+    /// them: it is dropped, not mixed in.
+    #[test]
+    fn a_report_sharing_no_trp_is_dropped() {
+        // TRP 1 known as prs-0, TRPs 2..4 by PCI.
+        let reg = registry(|prs, pci| {
+            if prs == 0 {
+                "prs-0".into()
+            } else {
+                format!("pci-{pci}")
+            }
+        });
+        // A: reference TRP 1, neighbours TRP 2 and 3. B: one RSTD for TRP 4 relative
+        // to a reference (DL-PRS 7) no other report names, so it shares no TRP with A.
+        let mut cells = report_with(0, &[1, 2], 1);
+        cells.push(CellMeasurement {
+            nr_cgi: "pci-4".into(),
+            rsrp: None,
+            rsrq: None,
+            timing_advance: None,
+            aoa: None,
+            rtt_ns: None,
+            rstd_ns: Some(1234.0),
+            ue_rx_tx_ns: None,
+            rstd_reference: Some(7),
+            gnb_rx_tx_ns: None,
+            dl_prs_id: Some(3),
+            eutra: false,
+        });
+        let (obs, rebased) = tdoa_observations(&cells, &reg);
+        assert_eq!(
+            obs.iter().map(|o| o.trp_id.as_str()).collect::<Vec<_>>(),
+            ["prs-0", "pci-2", "pci-3"]
+        );
+        assert!(!rebased);
+        let fix = try_real_solve(&cells, &reg).expect("A alone still solves");
+        assert!(error_m(&fix) < 1.0, "position error {:.3} m", error_m(&fix));
+    }
+
+    /// Losing the reporting reference doubles the reported accuracy (#824 review).
+    #[test]
+    fn a_rebased_fix_reports_a_wider_accuracy() {
+        let known = registry(|prs, pci| {
+            if prs == 0 {
+                "prs-0".into()
+            } else {
+                format!("pci-{pci}")
+            }
+        });
+        let unknown = registry(|_, pci| format!("pci-{pci}"));
+        // Three TRPs in both cases, so only the rebase differs.
+        let cells = report_with(0, &[1, 2], 1);
+        let mut unknown_cells = report_with(0, &[1, 2, 3], 1);
+        unknown_cells.retain(|c| c.nr_cgi != "pci-2");
+        let (_, rebased) = tdoa_observations(&cells, &known);
+        assert!(!rebased);
+        let (obs, rebased) = tdoa_observations(&unknown_cells, &unknown);
+        assert!(rebased);
+        assert_eq!(obs.len(), 2, "too few to solve after the rebase");
+        let a = try_real_solve(&report_with(0, &[1, 2, 3], 1), &known).unwrap();
+        let b = try_real_solve(&report_with(0, &[1, 2, 3], 1), &unknown).unwrap();
+        let est = solve_tdoa(
+            &unknown,
+            &tdoa_observations(&report_with(0, &[1, 2, 3], 1), &unknown).0,
+        )
+        .unwrap();
+        assert!((b.horizontal_accuracy - 2.0 * est.horizontal_uncertainty_m()).abs() < 1e-9);
+        assert!(a.horizontal_accuracy.is_finite());
+    }
+
+    /// TS 38.133 §10.1.23.3: an open-ended RSTD report value is not decoded.
+    #[test]
+    fn an_open_ended_rstd_is_not_decoded() {
+        let bytes = crate::lpp_fixtures::dl_tdoa_lpp(
+            0,
+            &[
+                (1, Some(2), 0),
+                (2, Some(3), 1_970_049),
+                (3, Some(4), 985_024),
+            ],
+            1,
+        );
+        let (_, cells) = crate::codec_glue::decode_lpp_provide_report(&bytes).unwrap();
+        let rstd: Vec<Option<f64>> = cells.iter().map(|c| c.rstd_ns).collect();
+        assert_eq!(rstd, [Some(0.0), None, None, Some(0.0)]);
+    }
+
     /// Two entries for one TRP (once by PCI, once by DL-PRS ID) count once.
     #[test]
     fn a_trp_reported_twice_is_used_once() {
@@ -2701,7 +2914,7 @@ mod tests_dl_tdoa_reference {
         let mut cells = report();
         let dup = cells[1].clone();
         cells.push(dup);
-        assert_eq!(tdoa_observations(&cells, &reg).len(), 3);
+        assert_eq!(tdoa_observations(&cells, &reg).0.len(), 3);
     }
 }
 
@@ -2721,6 +2934,7 @@ mod tests_ecid_label {
             rstd_ns: None,
             ue_rx_tx_ns: None,
             gnb_rx_tx_ns: None,
+            rstd_reference: None,
             dl_prs_id: None,
             eutra,
         }
