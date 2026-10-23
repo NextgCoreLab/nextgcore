@@ -18,6 +18,8 @@ NextGCore ships a Docker-based observability stack (Prometheus, Grafana, Jaeger)
 | `nextgcore-udmd` | NES energy gauges, only with `--features nes` | NES `metrics_port` (default 9090) |
 | `nextgcore-nsacfd` | slice-SLA observe gauges, only with `--features sla-observe` | its `metrics_port` when > 0 |
 
+Every one of these listeners is unauthenticated, so it binds `127.0.0.1` by default (#837): set `NEXTGCORE_METRICS_BIND` (an IP address, e.g. `0.0.0.0`) to widen it. The compose files, the Kind manifests, the Helm chart and the EKS overlays set it to `0.0.0.0` inside the private container or pod network, where Prometheus scrapes by container/pod address; none of them publishes a metrics port on the host. The compose host-port publishes (MongoDB, NRF, PFCP, Prometheus, Grafana, Jaeger, OTLP) are bound to `127.0.0.1`; the RAN-facing NGAP/S1AP and GTP-U publishes use `${NEXTGCORE_RAN_PUBLISH_ADDR:-127.0.0.1}`, so an external gNB/eNB needs that set to the host address it reaches.
+
 `docker-compose-epc.yml` uses these endpoints as healthchecks (`curl -fsS http://localhost:9090/metrics | grep -q '^smf_up 1$'`, likewise `upf_up`, `sgwu_up`).
 
 The other NF daemons serve **no** Prometheus metrics over HTTP:

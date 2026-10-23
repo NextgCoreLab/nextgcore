@@ -81,6 +81,10 @@ spec:
           value: info
         - name: RUST_BACKTRACE
           value: '1'
+        # /metrics defaults to 127.0.0.1 (#837); in the pod it must accept the
+        # pod IP for Prometheus and the kubelet. Not exposed beyond the cluster.
+        - name: NEXTGCORE_METRICS_BIND
+          value: "0.0.0.0"
         # The MME dials the HSS (S6a), and the HSS answers and sends CLR/IDR over
         # that connection, so the HSS has no use for the MME's address at start.
         # Tracking it made the HSS restart whenever the MME moved, which dropped
@@ -195,6 +199,10 @@ spec:
           value: info
         - name: RUST_BACKTRACE
           value: '1'
+        # /metrics defaults to 127.0.0.1 (#837); in the pod it must accept the
+        # pod IP for Prometheus and the kubelet. Not exposed beyond the cluster.
+        - name: NEXTGCORE_METRICS_BIND
+          value: "0.0.0.0"
         volumeMounts:
         - name: templates
           mountPath: /epc/templates
@@ -303,6 +311,10 @@ spec:
           value: info
         - name: RUST_BACKTRACE
           value: '1'
+        # /metrics defaults to 127.0.0.1 (#837); in the pod it must accept the
+        # pod IP for Prometheus and the kubelet. Not exposed beyond the cluster.
+        - name: NEXTGCORE_METRICS_BIND
+          value: "0.0.0.0"
         - name: EPC_EXPORT
           value: SGWC_PGW_S5C=pgwc SGWC_GTPU_ADVERTISE=sgwu
         # TS 23.007 §18: the GTP-C restart counter must survive the restart it
@@ -430,6 +442,10 @@ spec:
           value: info
         - name: RUST_BACKTRACE
           value: '1'
+        # /metrics defaults to 127.0.0.1 (#837); in the pod it must accept the
+        # pod IP for Prometheus and the kubelet. Not exposed beyond the cluster.
+        - name: NEXTGCORE_METRICS_BIND
+          value: "0.0.0.0"
         - name: UPF_PFCP_PORT
           value: '8805'
         - name: NEXTGCORE_SBI_PROFILE
@@ -571,6 +587,10 @@ spec:
           value: info
         - name: RUST_BACKTRACE
           value: '1'
+        # /metrics defaults to 127.0.0.1 (#837); in the pod it must accept the
+        # pod IP for Prometheus and the kubelet. Not exposed beyond the cluster.
+        - name: NEXTGCORE_METRICS_BIND
+          value: "0.0.0.0"
         volumeMounts:
         - name: templates
           mountPath: /epc/templates
@@ -714,6 +734,10 @@ spec:
           value: info
         - name: RUST_BACKTRACE
           value: '1'
+        # /metrics defaults to 127.0.0.1 (#837); in the pod it must accept the
+        # pod IP for Prometheus and the kubelet. Not exposed beyond the cluster.
+        - name: NEXTGCORE_METRICS_BIND
+          value: "0.0.0.0"
         volumeMounts:
         - name: templates
           mountPath: /epc/templates
@@ -861,6 +885,10 @@ spec:
           value: info
         - name: RUST_BACKTRACE
           value: '1'
+        # /metrics defaults to 127.0.0.1 (#837); in the pod it must accept the
+        # pod IP for Prometheus and the kubelet. Not exposed beyond the cluster.
+        - name: NEXTGCORE_METRICS_BIND
+          value: "0.0.0.0"
         # TS 23.007 §18: see sgwc; the counter outlives a container restart.
         - name: MME_RESTART_COUNTER_FILE
           value: /run/epc/mme-restart-counter
@@ -972,6 +1000,10 @@ spec:
           value: info
         - name: RUST_BACKTRACE
           value: '1'
+        # /metrics defaults to 127.0.0.1 (#837); in the pod it must accept the
+        # pod IP for Prometheus and the kubelet. Not exposed beyond the cluster.
+        - name: NEXTGCORE_METRICS_BIND
+          value: "0.0.0.0"
         volumeMounts:
         - name: templates
           mountPath: /epc/templates
@@ -1055,6 +1087,10 @@ spec:
           value: info
         - name: RUST_BACKTRACE
           value: '1'
+        # /metrics defaults to 127.0.0.1 (#837); in the pod it must accept the
+        # pod IP for Prometheus and the kubelet. Not exposed beyond the cluster.
+        - name: NEXTGCORE_METRICS_BIND
+          value: "0.0.0.0"
         volumeMounts:
         - name: templates
           mountPath: /epc/templates
