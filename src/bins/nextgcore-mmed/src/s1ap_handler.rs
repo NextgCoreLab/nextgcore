@@ -4160,6 +4160,38 @@ pub fn handle_erab_modification_indication(
     if let Some((tai, cgi)) = &msg.location {
         store_location(ctx, enb_ue.id, mme_ue_id, Some(tai), Some(cgi));
     }
+    // TS 36.413 §8.2.4.4: several E-RAB ID IEs set to the same value, or a list
+    // that leaves out an E-RAB of the UE context, and "the MME shall trigger the
+    // UE Context Release procedure" (#852 review). Before, a duplicate was
+    // switched twice and listed twice in the confirm.
+    if let Some(why) = erab_modification_abnormal(ctx, mme_ue_id, msg) {
+        log::warn!(
+            "E-RAB Modification Indication for UE {mme_ue_id}: {why}; releasing the UE context \
+             (TS 36.413 §8.2.4.4)"
+        );
+        let cause_value = if why.starts_with("duplicate") {
+            radio_network_cause::MULTIPLE_E_RAB_ID_INSTANCES
+        } else {
+            radio_network_cause::UNSPECIFIED
+        };
+        if let Some(ue) = ctx.enb_ue_pool.write().unwrap().get_mut(&enb_ue.id) {
+            ue.relcause.group = S1apCauseGroup::RadioNetwork;
+            ue.relcause.cause = cause_value;
+            ue.ue_ctx_rel_action = UeCtxRelAction::S1ContextRemove;
+        }
+        return match s1ap_build::build_ue_context_release_command(
+            Some(msg.enb_ue_s1ap_id),
+            msg.mme_ue_s1ap_id,
+            S1apCauseGroup::RadioNetwork,
+            cause_value,
+        ) {
+            Ok(pdu) => S1apSend::to_origin(enb_id, pdu),
+            Err(e) => {
+                log::error!("Failed to build UE Context Release Command: {e}");
+                Vec::new()
+            }
+        };
+    }
     let mut confirm = crate::s1ap_gen::ErabModificationConfirm {
         mme_ue_s1ap_id: msg.mme_ue_s1ap_id,
         enb_ue_s1ap_id: msg.enb_ue_s1ap_id,
@@ -4228,6 +4260,33 @@ pub fn handle_erab_modification_indication(
     }
 }
 
+/// The TS 36.413 §8.2.4.4 condition an E-RAB MODIFICATION INDICATION meets, if
+/// any: an E-RAB ID listed twice (across the to-be-modified and not-to-be-modified
+/// lists), or an E-RAB of the UE context (a bearer with an eNB endpoint the eNB
+/// has not released) in neither list.
+fn erab_modification_abnormal(
+    ctx: &MmeContext,
+    mme_ue_id: u64,
+    msg: &crate::s1ap_gen::ErabModificationIndication,
+) -> Option<String> {
+    let mut listed = std::collections::BTreeSet::new();
+    for item in msg.to_be_modified.iter().chain(&msg.not_to_be_modified) {
+        if !listed.insert(item.erab_id) {
+            return Some(format!("duplicate E-RAB ID {}", item.erab_id));
+        }
+    }
+    let missing: Vec<u8> = ctx
+        .bearer_pool
+        .read()
+        .unwrap()
+        .values()
+        .filter(|b| b.mme_ue_id == mme_ue_id && b.enb_s1u_teid != 0 && !b.released_by_enb)
+        .map(|b| b.ebi)
+        .filter(|ebi| !listed.contains(ebi))
+        .collect();
+    (!missing.is_empty()).then(|| format!("E-RABs {missing:?} of the UE context are not listed"))
+}
+
 /// Move every "modified" E-RAB of `confirm` into its failed list with `cause`.
 fn switch_failed(
     mut confirm: crate::s1ap_gen::ErabModificationConfirm,
@@ -4285,14 +4344,37 @@ pub fn erab_modification_confirm(
             pending.switched.iter().map(|s| s.ebi).collect::<Vec<_>>(),
         )
     };
+    // #852 review: nothing is written for an S1 association that no longer
+    // serves the UE (an X2 path switch or a release overtook the Modify Bearer
+    // Request): its late answer would overwrite the newer endpoint.
+    if !association_live(ctx, &pending, &pending.confirm) {
+        log::warn!(
+            "UE {}: the S1 association of the E-RAB modification is gone; its Modify Bearer \
+             Response changes nothing and no confirm is sent",
+            pending.mme_ue_id
+        );
+        return None;
+    }
+    let mut released = Vec::new();
     for s in &accepted {
         if let Some(bearer_id) = ctx.bearer_find_by_ebi(pending.mme_ue_id, s.ebi) {
             if let Some(b) = ctx.bearer_pool.write().unwrap().get_mut(&bearer_id) {
+                // An E-RAB RELEASE INDICATION for it arrived meanwhile: it stays
+                // released, not revived with the eNB TEID it had.
+                if b.released_by_enb {
+                    released.push(s.ebi);
+                    continue;
+                }
                 b.enb_s1u_teid = s.teid;
                 b.enb_s1u_ip = s.ip.clone();
             }
         }
     }
+    let accepted: Vec<_> = accepted
+        .into_iter()
+        .filter(|s| !released.contains(&s.ebi))
+        .collect();
+    let refused: Vec<u8> = refused.into_iter().chain(released).collect();
     let mut confirm = pending.confirm.clone();
     confirm.modified = accepted.iter().map(|s| s.ebi).collect();
     for erab_id in refused {
@@ -4324,21 +4406,28 @@ pub fn erab_modification_unanswered(
     confirm_on_live_association(ctx, &pending, &confirm)
 }
 
+/// Whether the S1 association `confirm` answers still serves the UE.
+fn association_live(
+    ctx: &MmeContext,
+    pending: &crate::gtp_path::PendingErabModification,
+    confirm: &crate::s1ap_gen::ErabModificationConfirm,
+) -> bool {
+    ctx.enb_ue_find_by_mme_ue_s1ap_id(confirm.mme_ue_s1ap_id)
+        .and_then(|id| ctx.enb_ue_find_by_id(id))
+        .is_some_and(|ue| {
+            ue.enb_id == pending.enb_id
+                && ue.enb_ue_s1ap_id == confirm.enb_ue_s1ap_id
+                && ue.mme_ue_id == pending.mme_ue_id
+        })
+}
+
 /// Send `confirm` only if the S1 association it answers still serves the UE.
 fn confirm_on_live_association(
     ctx: &MmeContext,
     pending: &crate::gtp_path::PendingErabModification,
     confirm: &crate::s1ap_gen::ErabModificationConfirm,
 ) -> Option<S1apSend> {
-    let live = ctx
-        .enb_ue_find_by_mme_ue_s1ap_id(confirm.mme_ue_s1ap_id)
-        .and_then(|id| ctx.enb_ue_find_by_id(id))
-        .is_some_and(|ue| {
-            ue.enb_id == pending.enb_id
-                && ue.enb_ue_s1ap_id == confirm.enb_ue_s1ap_id
-                && ue.mme_ue_id == pending.mme_ue_id
-        });
-    if !live {
+    if !association_live(ctx, pending, confirm) {
         log::warn!(
             "UE {}: the S1 association of the E-RAB modification is gone; no confirm sent",
             pending.mme_ue_id
