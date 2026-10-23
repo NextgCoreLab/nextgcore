@@ -529,3 +529,6 @@ docker exec nextgcore-amf ping -c 1 172.23.0.2
 ## License
 
 AGPL-3.0 - See [LICENSE](LICENSE) for details.
+
+
+<!-- Automated fix for issue #887: upfd: a spoofed GTP-U Echo Response grows the N3 path table and makes upfd probe arbitrary addresses -->
