@@ -2935,8 +2935,8 @@ mod tests {
             "{\"sst\":1,\"sd\":\"010203\"}"
         );
         assert_eq!(pct_decode("2001%3Adb8%3A%3A1%2F128"), "2001:db8::1/128");
-        // #765: a cut inside a multi-byte character used to panic; a sign
-        // was taken as a digit; an escape at the very end was skipped.
+        // #765: a cut inside a multi-byte character used to panic, and a sign
+        // was taken as a digit.
         assert_eq!(pct_decode("%a\u{e9}"), "%a\u{e9}");
         assert_eq!(pct_decode("%+1"), "%+1");
         assert_eq!(pct_decode("x%41"), "xA");
