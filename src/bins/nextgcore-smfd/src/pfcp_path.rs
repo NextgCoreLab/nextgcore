@@ -1184,7 +1184,9 @@ impl PfcpClient {
 /// Flush all stored PFCP sessions (UPF restarted / association lost).
 /// Returns the number of sessions removed.
 pub fn clear_pfcp_sessions() -> usize {
-    // #779: the flush empties the process-wide map, whatever the caller.
+    // #779: the flush empties the process-wide map, whatever the caller. An unlocked
+    // teardown reaching it (the #665 hostname test, fixed by #762) is what made the
+    // eps_to_5gs end-to-end test lose its N4 session.
     #[cfg(test)]
     assert_teardown_is_serialised();
     if let Ok(ctx) = smf_self().read() {

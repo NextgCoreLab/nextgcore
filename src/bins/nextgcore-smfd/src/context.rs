@@ -3261,13 +3261,15 @@ pub fn smf_self() -> Arc<RwLock<SmfContext>> {
 
 /// Initialize the global SMF context
 pub fn smf_context_init(max_ue: usize, max_sess: usize, max_bearer: usize) {
-    // #779: the wipe is process-wide (see PROCESS_STATE_TEST_LOCK), so a test that
-    // reaches it without the ambient lock clears a sibling's sessions mid-assertion.
+    // #779: not a wipe (`SmfContext::init` is idempotent; only `fini` clears), but
+    // every test that calls this goes on to read or write the process-wide context,
+    // and under the #308 rule those readers and writers hold the ambient lock. This
+    // makes the serial CI run name a test that forgets it.
     #[cfg(test)]
     require_test_lock(
         &PROCESS_STATE_TEST_LOCK,
         "PROCESS_STATE_TEST_LOCK",
-        "smf_context_init (the process-wide context wipe)",
+        "smf_context_init (a test that then uses the process-wide SMF context)",
     );
     let ctx = smf_self();
     if let Ok(mut context) = ctx.write() {
@@ -3279,9 +3281,11 @@ pub fn smf_context_init(max_ue: usize, max_sess: usize, max_bearer: usize) {
 ///
 /// Four globals are involved and they cannot be guarded separately, because the
 /// production paths under test read all four together:
-/// - [`GLOBAL_SMF_CONTEXT`] — [`smf_context_init`] calls `SmfContext::init`, which
-///   clears the UE, session, bearer, policy-binding and PFCP-session maps for the
-///   WHOLE process rather than for the test that asked;
+/// - [`GLOBAL_SMF_CONTEXT`] — its UE, session, bearer, policy-binding and PFCP-session
+///   maps are shared by every test in the process. (`SmfContext::init`, which
+///   [`smf_context_init`] calls, is idempotent and clears nothing; the bulk removers
+///   are `fini` and `pfcp_path::clear_pfcp_sessions`, the latter reached through the
+///   PFCP teardown, #762/#779);
 /// - `udm::UDM_ENABLED`, `easdf`'s config slot and `eps_iwk::EPS_IWK_ENABLED` — the
 ///   feature switches `handle_sm_context_create` / `_release` consult, so a sibling
 ///   that turns one ON changes what a create does in a test that never mentions it;
