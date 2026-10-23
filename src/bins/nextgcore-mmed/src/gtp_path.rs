@@ -39,6 +39,9 @@ struct GtpcInner {
     xact: Mutex<Gtp2XactMgr>,
     /// Last Recovery (restart counter) seen per peer IP (TS 23.007 §18).
     peer_restart: Mutex<HashMap<IpAddr, u8>>,
+    /// A Recovery value behind the stored one, being verified by an Echo Request
+    /// (#798 review), per peer IP.
+    stale_probe: Mutex<HashMap<IpAddr, StaleProbe>>,
     peer_state: Mutex<HashMap<SocketAddr, GtpPeerState>>,
     running: AtomicBool,
 }
@@ -337,6 +340,7 @@ impl GtpcServer {
             restart_counter,
             xact: Mutex::new(Gtp2XactMgr::new(config)),
             peer_restart: Mutex::new(HashMap::new()),
+            stale_probe: Mutex::new(HashMap::new()),
             peer_state: Mutex::new(HashMap::new()),
             running: AtomicBool::new(true),
         });
@@ -704,6 +708,96 @@ fn echo_interval() -> Option<Duration> {
 /// current incarnation is not read as another restart. Before #728 any change was
 /// a restart and the stored value was overwritten, so 3 -> 4 -> 3 -> 4 detached
 /// every UE on the SGW three times.
+/// A Recovery value behind the stored one under verification (#798 review).
+#[derive(Debug, Clone, Copy)]
+struct StaleProbe {
+    /// The lower value seen.
+    counter: u8,
+    /// The Echo Request asking the peer for its current value.
+    seq: u32,
+    sent: Instant,
+}
+
+/// How long one verification stands before a further stale value probes again.
+const STALE_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// TS 23.007 §18 discards a lower Recovery value as a reordered message from an
+/// older incarnation. That reading is wrong when the peer LOST its persisted
+/// counter and came back lower (a recreated volume, or a malformed file reset to
+/// 1): every later message would read stale and its restarts would be missed. So
+/// a stale value is verified (#798 review): an Echo Request is sent, and a fresh
+/// Echo Response is the current incarnation speaking. One period of warning per
+/// peer and value; the stale datagrams in between log at debug.
+fn probe_stale_recovery(inner: &Arc<GtpcInner>, peer: SocketAddr, counter: u8) -> bool {
+    let now = Instant::now();
+    let Ok(mut probes) = inner.stale_probe.lock() else {
+        return false;
+    };
+    if probes
+        .get(&peer.ip())
+        .is_some_and(|p| p.counter == counter && now.duration_since(p.sent) < STALE_PROBE_INTERVAL)
+    {
+        return false;
+    }
+    let server = GtpcServer {
+        inner: Arc::clone(inner),
+    };
+    match server.send_echo_request(peer) {
+        Ok(seq) => {
+            probes.insert(
+                peer.ip(),
+                StaleProbe {
+                    counter,
+                    seq,
+                    sent: now,
+                },
+            );
+            true
+        }
+        Err(e) => {
+            log::warn!("S11 Echo Request to verify {peer}'s Recovery {counter} not sent: {e}");
+            false
+        }
+    }
+}
+
+/// An Echo Response answering a stale-Recovery probe (#798 review). When it
+/// carries the same lower value, the current incarnation of the peer uses it:
+/// the peer restarted and lost its counter. The stored value is re-based and
+/// `true` returned, a restart. Any other answer only closes the probe.
+fn confirm_stale_recovery(inner: &Arc<GtpcInner>, peer: SocketAddr, seq: u32, counter: u8) -> bool {
+    let probe = {
+        let Ok(mut probes) = inner.stale_probe.lock() else {
+            return false;
+        };
+        match probes.get(&peer.ip()) {
+            Some(p) if p.seq == seq => probes.remove(&peer.ip()),
+            _ => None,
+        }
+    };
+    let Some(probe) = probe else {
+        return false;
+    };
+    let Ok(mut seen) = inner.peer_restart.lock() else {
+        return false;
+    };
+    let stored = seen.get(&peer.ip()).copied();
+    // Only the probed value proves anything: a different one is an ordinary
+    // Recovery, judged by `note_peer_recovery` as any other.
+    if probe.counter == counter && stored != Some(counter) {
+        seen.insert(peer.ip(), counter);
+        drop(seen);
+        log::warn!(
+            "S11 peer {peer} answered an Echo Request with Recovery {counter}, behind the stored \
+             {}: its current incarnation uses the lower value, so it restarted and lost its \
+             persisted counter. Treated as a restart and re-based (TS 23.007 §18)",
+            stored.unwrap_or_default()
+        );
+        return true;
+    }
+    false
+}
+
 fn note_peer_recovery(inner: &Arc<GtpcInner>, peer: SocketAddr, counter: u8) -> bool {
     use nextgcore_gtp::v2::RestartOrder;
     let Ok(mut seen) = inner.peer_restart.lock() else {
@@ -725,10 +819,17 @@ fn note_peer_recovery(inner: &Arc<GtpcInner>, peer: SocketAddr, counter: u8) -> 
             true
         }
         (RestartOrder::Stale, Some(previous)) => {
-            log::warn!(
-                "S11 peer {peer} sent Recovery {counter}, behind the stored {previous}: a \
-                 reordered message from an older incarnation, discarded (TS 23.007 §18)"
-            );
+            if probe_stale_recovery(inner, peer, counter) {
+                log::warn!(
+                    "S11 peer {peer} sent Recovery {counter}, behind the stored {previous}: \
+                     discarded as a message from an older incarnation (TS 23.007 §18), and an \
+                     Echo Request asks the peer for its current value"
+                );
+            } else {
+                log::debug!(
+                    "S11 peer {peer} Recovery {counter} behind the stored {previous}: discarded"
+                );
+            }
             false
         }
         _ => {
@@ -762,7 +863,17 @@ fn handle_datagram(inner: &Arc<GtpcInner>, data: &[u8], peer: SocketAddr) {
             // Acted on BEFORE the message is dispatched: a Create Session Response
             // from the new incarnation then lands on a UE whose S11 session is not
             // yet recorded, so its fresh PDN connection is not mistaken for a lost one.
-            if note_peer_recovery(inner, peer, rec.restart_counter) {
+            let echo_response = msg.header.message_type == Gtp2MessageType::EchoResponse as u8;
+            if echo_response
+                && confirm_stale_recovery(
+                    inner,
+                    peer,
+                    msg.header.sequence_number,
+                    rec.restart_counter,
+                )
+            {
+                on_s11_peer_restart(peer);
+            } else if note_peer_recovery(inner, peer, rec.restart_counter) {
                 on_s11_peer_restart(peer);
             }
         }
@@ -2411,6 +2522,80 @@ mod tests {
             roll.push(note_peer_recovery(&server.inner, peer_addr, c));
         }
         assert_eq!(roll, [true, true, true, true, false]);
+        server.close();
+    }
+
+    /// #798 review: a stale Recovery is verified with an Echo Request. A peer that
+    /// lost its persisted counter answers with the same lower value: a restart,
+    /// re-based, so its later restarts are caught again. A reordered old message is
+    /// answered with the current (higher) value: still discarded. Repeated stale
+    /// datagrams send one probe per period, not one per datagram.
+    #[test]
+    fn a_stale_recovery_is_verified_by_an_echo_request() {
+        let _guard = lock_s11();
+        let (server, peer, peer_addr) = spawn_server_and_peer(Gtp2XactConfig::default());
+        let recv_echo = |peer: &UdpSocket| -> Option<u32> {
+            let mut buf = [0u8; 4096];
+            let (len, _) = peer.recv_from(&mut buf).ok()?;
+            let msg = Gtp2Message::decode(&mut Bytes::copy_from_slice(&buf[..len])).ok()?;
+            (msg.header.message_type == Gtp2MessageType::EchoRequest as u8)
+                .then_some(msg.header.sequence_number)
+        };
+        let stored = |server: &GtpcServer| {
+            server
+                .inner
+                .peer_restart
+                .lock()
+                .unwrap()
+                .get(&peer_addr.ip())
+                .copied()
+        };
+
+        // The peer lost its counter: stored 100, it now says 1.
+        assert!(!note_peer_recovery(&server.inner, peer_addr, 100));
+        assert!(
+            !note_peer_recovery(&server.inner, peer_addr, 1),
+            "stale, discarded"
+        );
+        let seq = recv_echo(&peer).expect("an Echo Request verifies it");
+        peer.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        assert!(!note_peer_recovery(&server.inner, peer_addr, 1));
+        assert!(recv_echo(&peer).is_none(), "one probe per period");
+        assert!(
+            !confirm_stale_recovery(&server.inner, peer_addr, seq.wrapping_add(1), 1),
+            "only the probe's own answer counts"
+        );
+        assert!(
+            confirm_stale_recovery(&server.inner, peer_addr, seq, 1),
+            "the fresh answer carries the lower value: a restart"
+        );
+        assert_eq!(stored(&server), Some(1), "re-based");
+        assert!(
+            note_peer_recovery(&server.inner, peer_addr, 2),
+            "the next restart is seen"
+        );
+
+        // A reordered old message: stored 4, a stray 3; the peer answers 4.
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        assert!(note_peer_recovery(&server.inner, peer_addr, 4));
+        assert!(!note_peer_recovery(&server.inner, peer_addr, 3));
+        let seq = recv_echo(&peer).expect("probed");
+        // Answered over the socket, so the receive path's routing of an Echo
+        // Response to the probe is what is tested.
+        let answer = Gtp2Message::echo_response(seq, 4);
+        peer.send_to(&answer.encode(), server.local_addr()).unwrap();
+        for _ in 0..200 {
+            if server.inner.stale_probe.lock().unwrap().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            server.inner.stale_probe.lock().unwrap().is_empty(),
+            "the Echo Response closed the probe"
+        );
+        assert_eq!(stored(&server), Some(4), "kept");
         server.close();
     }
 }

@@ -26,3 +26,7 @@ docker/rust/artifacts/
 # Python bytecode (deploy/eks/lib tests, #436)
 __pycache__/
 *.pyc
+
+# Proptest regression seeds from local runs. A seed worth keeping becomes a
+# named test; the few committed regression files elsewhere stay tracked.
+proptest-regressions/
