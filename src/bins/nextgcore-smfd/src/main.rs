@@ -5840,6 +5840,8 @@ async fn graceful_shutdown(
             );
         }
     }
+    // #928 review m1: the #39 fan-outs a UPF restart or release started earlier.
+    pfcp_path::drain_restart_fanouts(std::time::Duration::from_secs(5)).await;
     pfcp_listener.abort();
     log::info!("SMF N4 PFCP listener stopped");
     // #718 review m2: the Delete Bearer Requests sent above, on either path, are
@@ -7825,6 +7827,274 @@ mod tests {
             took < std::time::Duration::from_millis(750),
             "the deletions overlapped: {took:?}"
         );
+    }
+
+    use std::time::Duration;
+
+    /// The fixture of the #721/#928 receive-task tests: an AMF taking `amf_delay` per
+    /// request, UPF A (a raw socket the test drives) and UPF B (answers deletions),
+    /// both on one N4 socket behind the real listener, and one session on A whose
+    /// release goes to that AMF.
+    struct RestartFixture {
+        posts: Arc<std::sync::atomic::AtomicUsize>,
+        amf: nextgcore_sbi::server::SbiServer,
+        upf_a: tokio::net::UdpSocket,
+        smf_addr: std::net::SocketAddr,
+        a: Arc<pfcp_path::PfcpClient>,
+        b: Arc<pfcp_path::PfcpClient>,
+        task_b: tokio::task::JoinHandle<()>,
+        listener: tokio::task::JoinHandle<()>,
+        reference: &'static str,
+    }
+
+    async fn restart_fixture(reference: &'static str, amf_delay: Duration) -> RestartFixture {
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        smf_context_init(64, 256, 512);
+        let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = posts.clone();
+        let (amf, amf_addr) =
+            nextgcore_sbi::test_support::sbi_server_on_free_port(move |_req: SbiRequest| {
+                let sink = sink.clone();
+                async move {
+                    tokio::time::sleep(amf_delay).await;
+                    sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await;
+        let upf_a = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (upf_b, _seen_b, task_b) = raw_upf(None).await;
+        let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let smf_addr = sock.local_addr().unwrap();
+        let a = Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            upf_a.local_addr().unwrap(),
+            [127, 0, 0, 1],
+        ));
+        let b = Arc::new(pfcp_path::PfcpClient::new(
+            sock.clone(),
+            upf_b,
+            [127, 0, 0, 1],
+        ));
+        for c in [&a, &b] {
+            c.set_assoc_state_for_test(true, None, None).await;
+        }
+        a.seed_peer_recovery_time_stamp(100).await;
+        pfcp_path::set_global_pool(vec![a.clone(), b.clone()]);
+        let listener = spawn_pfcp_listener(sock, vec![a.clone(), b.clone()]);
+        seed_binding(reference, 5);
+        set_status_uri(
+            reference,
+            &format!(
+                "http://127.0.0.1:{}/namf-callback/v1/sm-status",
+                amf_addr.port()
+            ),
+        );
+        if let Ok(ctx) = smf_self().read() {
+            ctx.pfcp_sessions
+                .write()
+                .unwrap()
+                .insert(reference.to_string(), 0x928);
+        }
+        pfcp_path::record_session_peer(context::derive_cp_n4_seid(reference), a.peer());
+        RestartFixture {
+            posts,
+            amf,
+            upf_a,
+            smf_addr,
+            a,
+            b,
+            task_b,
+            listener,
+            reference,
+        }
+    }
+
+    impl RestartFixture {
+        fn released(&self) -> usize {
+            self.posts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn session_kept(&self) -> bool {
+            smf_self()
+                .read()
+                .unwrap()
+                .pfcp_sessions
+                .read()
+                .unwrap()
+                .contains_key(self.reference)
+        }
+        async fn wait_released(&self, n: usize) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while self.released() < n && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        async fn teardown(self) {
+            cancel_gsm_timer(self.reference, timer::SmfTimerId::T3592);
+            if let Ok(ctx) = smf_self().read() {
+                ctx.policy_bindings.write().unwrap().remove(self.reference);
+                ctx.pfcp_sessions.write().unwrap().remove(self.reference);
+            }
+            pfcp_path::forget_session_peer(context::derive_cp_n4_seid(self.reference));
+            self.listener.abort();
+            self.task_b.abort();
+            self.amf.stop().await.ok();
+            pfcp_path::clear_global_upf_for_test();
+        }
+    }
+
+    fn pfcp_body_rts(rts: u32) -> Vec<u8> {
+        let mut b = 96u16.to_be_bytes().to_vec();
+        b.extend_from_slice(&4u16.to_be_bytes());
+        b.extend_from_slice(&rts.to_be_bytes());
+        b
+    }
+
+    /// #928 review M2: a UPF's Association Release Request is answered at once, the
+    /// receive task keeps serving UPF B while A's releases run (the AMF takes 2 s per
+    /// request), and A's session is then released.
+    #[tokio::test]
+    async fn an_association_release_from_a_upf_does_not_stall_the_n4_receive_task() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let fx = restart_fixture("92801", Duration::from_secs(2)).await;
+        let mut body = 60u16.to_be_bytes().to_vec();
+        body.extend_from_slice(&5u16.to_be_bytes());
+        body.extend_from_slice(&[0, 127, 0, 0, 7]);
+        let rel = pfcp_path::encode_wire_message(
+            pfcp_path::pfcp_message_type::ASSOCIATION_RELEASE_REQUEST,
+            None,
+            0x928,
+            &body,
+        );
+        let started = std::time::Instant::now();
+        fx.upf_a.send_to(&rel, fx.smf_addr).await.unwrap();
+        let mut buf = vec![0u8; 512];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(5), fx.upf_a.recv_from(&mut buf))
+            .await
+            .expect("an Association Release Response")
+            .unwrap();
+        let answered_in = started.elapsed();
+        let h = pfcp_path::parse_wire_header(&buf[..len]).unwrap();
+        let b_started = std::time::Instant::now();
+        let b_result =
+            fx.b.request(
+                pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST,
+                Some(0x928b),
+                &[],
+            )
+            .await;
+        let b_in = b_started.elapsed();
+        let in_flight = fx.released();
+        fx.wait_released(1).await;
+        let released = fx.released();
+        fx.teardown().await;
+
+        assert_eq!(
+            h.msg_type,
+            pfcp_path::pfcp_message_type::ASSOCIATION_RELEASE_RESPONSE
+        );
+        assert!(answered_in < Duration::from_millis(500), "{answered_in:?}");
+        assert!(
+            b_result.is_ok() && b_in < Duration::from_millis(500),
+            "{b_in:?}"
+        );
+        assert_eq!(in_flight, 0, "A's release was still in flight");
+        assert_eq!(released, 1, "and A's session is released afterwards");
+    }
+
+    /// #928 review M1: a restart detected on the SMF's own heartbeat (the path a
+    /// restarted nextgcore UPF takes: it has no association, so it sends no Heartbeat
+    /// Request) returns at once, so the one association/heartbeat task goes on to the
+    /// next pool member.
+    #[tokio::test]
+    async fn a_restart_seen_on_our_heartbeat_does_not_hold_the_association_task() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let fx = restart_fixture("92802", Duration::from_secs(2)).await;
+        let a = fx.a.clone();
+        let hb = tokio::spawn(async move { a.heartbeat_once().await });
+        let mut buf = vec![0u8; 512];
+        let (len, from) = fx.upf_a.recv_from(&mut buf).await.unwrap();
+        let h = pfcp_path::parse_wire_header(&buf[..len]).unwrap();
+        let started = std::time::Instant::now();
+        let resp = pfcp_path::encode_wire_message(
+            pfcp_path::pfcp_message_type::HEARTBEAT_RESPONSE,
+            None,
+            h.sequence_number,
+            &pfcp_body_rts(200),
+        );
+        fx.upf_a.send_to(&resp, from).await.unwrap();
+        let result = hb.await.unwrap();
+        let took = started.elapsed();
+        let in_flight = fx.released();
+        let kept = fx.session_kept();
+        fx.wait_released(1).await;
+        let released = fx.released();
+        fx.teardown().await;
+
+        assert!(result.is_ok());
+        assert!(
+            took < Duration::from_millis(500),
+            "heartbeat_once returned at once: {took:?}"
+        );
+        assert!(!kept, "the restarted UPF's session is flushed at once");
+        assert_eq!(in_flight, 0);
+        assert_eq!(released, 1);
+    }
+
+    /// #928 review M3 (TS 23.007 §19A): a Heartbeat Request from an address that is
+    /// not the UPF, carrying a different stamp, is answered and tears nothing down.
+    /// The listener routes an unknown source to pool slot 0.
+    #[tokio::test]
+    async fn a_heartbeat_from_a_stranger_cannot_release_a_upfs_sessions() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let fx = restart_fixture("92803", Duration::ZERO).await;
+        let stranger = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let hb = pfcp_path::encode_wire_message(
+            pfcp_path::pfcp_message_type::HEARTBEAT_REQUEST,
+            None,
+            0x9283,
+            &pfcp_body_rts(9999),
+        );
+        stranger.send_to(&hb, fx.smf_addr).await.unwrap();
+        let mut buf = vec![0u8; 512];
+        let answered = tokio::time::timeout(Duration::from_secs(2), stranger.recv_from(&mut buf))
+            .await
+            .is_ok();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let kept = fx.session_kept();
+        let associated = fx.a.is_associated().await;
+        fx.teardown().await;
+
+        assert!(
+            answered,
+            "§19A: a Heartbeat Request from anyone is answered"
+        );
+        assert!(kept && associated, "and tears nothing down");
+    }
+
+    /// #928 review m3 (TS 23.007 §19A): a SMALLER stamp than the stored one is a
+    /// reordered message, discarded, not a restart. m2: the same larger stamp seen
+    /// twice (receive task and heartbeat task) tears down once.
+    #[tokio::test]
+    async fn an_older_stamp_is_discarded_and_a_new_one_tears_down_once() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _n4 = pfcp_path::N4_TEST_LOCK.lock().await;
+        let fx = restart_fixture("92804", Duration::ZERO).await;
+        fx.a.check_peer_restart(50).await;
+        let kept_after_older = fx.session_kept();
+        let a1 = fx.a.clone();
+        let a2 = fx.a.clone();
+        let (_, _) = tokio::join!(a1.check_peer_restart(300), a2.check_peer_restart(300));
+        fx.wait_released(1).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let released = fx.released();
+        fx.teardown().await;
+
+        assert!(kept_after_older, "an older stamp is not a restart");
+        assert_eq!(released, 1, "one restart, one release");
     }
 
     /// #721: a UPF restart seen on a Heartbeat Request is answered at once, and the
