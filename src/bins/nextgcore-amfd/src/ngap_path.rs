@@ -749,6 +749,10 @@ pub struct NgapServer {
     /// live SCTP association. `None` (the default) keeps the real transport.
     #[cfg(test)]
     sent_ngap: Option<Vec<(u64, Vec<u8>)>>,
+    /// Test seam: the next this-many NGAP sends fail as an SCTP send error would,
+    /// so a test can drive a handler's send-failure branch (#760).
+    #[cfg(test)]
+    fail_next_sends: usize,
     /// Event sender for NGAP events
     event_tx: mpsc::Sender<AmfEvent>,
     /// Server event receiver
@@ -888,6 +892,8 @@ impl NgapServer {
             forced_amf_ue_ngap_id: None,
             #[cfg(test)]
             sent_ngap: None,
+            #[cfg(test)]
+            fail_next_sends: 0,
             event_tx,
             server_event_rx,
             ue_auth_state,
@@ -12804,6 +12810,11 @@ impl NgapServer {
         );
 
         #[cfg(test)]
+        if self.fail_next_sends > 0 {
+            self.fail_next_sends -= 1;
+            return Err(anyhow::anyhow!("SCTP send error: injected by a test"));
+        }
+        #[cfg(test)]
         if let Some(sent) = self.sent_ngap.as_mut() {
             sent.push((association_id, data.to_vec()));
             return Ok(());
@@ -14575,10 +14586,10 @@ pub async fn amf_ngap_poll() -> Result<bool> {
 // ============================================================================
 
 #[cfg(test)]
-mod handler_tests;
-
-#[cfg(test)]
 mod tests {
+    /// Handler-level tests asserting what amfd SENDS (#760, ...), in their own file.
+    mod handler_tests;
+
     use super::*;
     use crate::context::AmfContext;
     use tokio::sync::mpsc;
