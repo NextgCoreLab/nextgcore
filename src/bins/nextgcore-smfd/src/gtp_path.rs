@@ -300,7 +300,15 @@ impl GtpPathManager {
         let prev = self
             .sequence_generator
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| {
-                Some(if s >= max || s == 0 { 1 } else { s + 1 })
+                Some(if s == 0 || s > max {
+                    // Out of range (never in normal running): hand out 1 now
+                    // and continue from 2, so 1 is not handed out twice.
+                    2
+                } else if s == max {
+                    1
+                } else {
+                    s + 1
+                })
             })
             .unwrap_or(1);
         if prev == 0 || prev > max {
@@ -883,6 +891,7 @@ mod tests {
         manager.sequence_generator.store(u32::MAX, Ordering::SeqCst);
         let s = manager.next_sequence();
         assert!((1..=max).contains(&s), "{s:#x}");
+        assert_ne!(manager.next_sequence(), s, "not handed out twice");
     }
 
     #[test]
