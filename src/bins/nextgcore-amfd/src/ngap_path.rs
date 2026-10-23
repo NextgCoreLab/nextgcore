@@ -799,7 +799,12 @@ pub struct NgapServer {
     /// PDCP SN/HFN status *after* the HandoverCommand, and the AMF has to know
     /// where to forward it. `ue_auth_state` cannot answer that — it still names
     /// the SOURCE association until the UE arrives.
-    handover_target_assoc: HashMap<u64, u64>,
+    ///
+    /// The value is `(target association, target RAN UE NGAP ID)`. The RAN UE NGAP ID
+    /// is the one the TARGET allocated and returned in the Acknowledge (TS 38.413
+    /// §8.4.2.2, §9.2.3.5): each gNB allocates its own, so the DOWNLINK RAN STATUS
+    /// TRANSFER to the target must carry it, not the source's (#740).
+    handover_target_assoc: HashMap<u64, (u64, u32)>,
     /// The target gNB's per-session handover transfers, kept between
     /// HandoverRequestAcknowledge and HandoverNotify (#70).
     ///
@@ -9883,8 +9888,11 @@ impl NgapServer {
                 // Recorded only on the success path: if the HandoverCommand never
                 // reached the source, the source will not send a status transfer,
                 // and a stale target entry would misroute the next handover's.
+                //
+                // With the RAN UE NGAP ID the TARGET allocated (#740): the relayed
+                // status must name the UE as the target knows it.
                 self.handover_target_assoc
-                    .insert(ack.amf_ue_ngap_id, association_id);
+                    .insert(ack.amf_ue_ngap_id, (association_id, ack.ran_ue_ngap_id));
                 // #70: keep each admitted session's transfer so HandoverNotify can relay
                 // the target DL tunnel to the SMF once the UE has actually arrived.
                 for admitted in &ack.admitted_list {
@@ -9946,7 +9954,9 @@ impl NgapServer {
             }
         };
 
-        let Some(&target_assoc) = self.handover_target_assoc.get(&transfer.amf_ue_ngap_id) else {
+        let Some(&(target_assoc, target_ran_ue_ngap_id)) =
+            self.handover_target_assoc.get(&transfer.amf_ue_ngap_id)
+        else {
             // No handover in flight for this UE. Log and drop: the AMF must not
             // invent an NGAP error toward the gNB for a procedure that needs no
             // response, which is the same rule the uplink NRPPa relay follows.
@@ -9968,11 +9978,15 @@ impl NgapServer {
             return Ok(None);
         }
 
-        // The RAN-UE-NGAP-ID is carried through unchanged because this AMF reuses
-        // the source id at the target (it allocates no new RAN-UE-NGAP-ID during
-        // handover — see handle_handover_required). If target-side id allocation
-        // is ever added, this is the site that has to substitute it, and sending
-        // the source's id would then point the target at the wrong UE.
+        // #740: the target names the UE by the RAN UE NGAP ID IT allocated, returned in
+        // the HandoverRequestAcknowledge (TS 38.413 §8.4.2.2, §9.2.3.5); the source's
+        // id is meaningless there. Relaying it unchanged made the target see an
+        // inconsistent UE NGAP ID pair (§10.6) or, worse, address another UE's PDCP
+        // state. The AMF UE NGAP ID is the same on both legs.
+        let transfer = crate::ngap_asn1::RanStatusRelay {
+            ran_ue_ngap_id: target_ran_ue_ngap_id,
+            ..transfer
+        };
         match crate::ngap_asn1::build_downlink_ran_status_transfer_generated(&transfer).ok_or(()) {
             Ok(bytes) => {
                 // A failed send to the TARGET is not a reason to abort handling of
@@ -20063,7 +20077,9 @@ mod tests {
         );
 
         // Target admitted the UE -> the status transfer follows it.
-        server.handover_target_assoc.insert(amf_ue_ngap_id, target);
+        server
+            .handover_target_assoc
+            .insert(amf_ue_ngap_id, (target, 1));
         assert_eq!(
             server
                 .handle_uplink_ran_status_transfer(source, &uplink_status_pdu(amf_ue_ngap_id, 5))
@@ -20107,6 +20123,106 @@ mod tests {
         );
     }
 
+    /// The `(amf_ue_ngap_id, ran_ue_ngap_id)` a DOWNLINK RAN STATUS TRANSFER carries,
+    /// decoded with the generated codec; `None` for any other PDU.
+    fn decoded_downlink_ran_status_ids(pdu: &[u8]) -> Option<(u64, u32)> {
+        use nextgcore_ngap_gen::generated as g;
+        let g::NGAP_PDU::InitiatingMessage(m) = nextgcore_ngap_gen::decode(pdu).ok()? else {
+            return None;
+        };
+        let g::InitiatingMessageValue::Id_DownlinkRANStatusTransfer(t) = m.value else {
+            return None;
+        };
+        let (mut amf, mut ran) = (None, None);
+        for ie in t.protocol_i_es.0 {
+            match ie.value {
+                g::DownlinkRANStatusTransferProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(id) => {
+                    amf = Some(id.0)
+                }
+                g::DownlinkRANStatusTransferProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(id) => {
+                    ran = Some(id.0)
+                }
+                _ => {}
+            }
+        }
+        Some((amf?, ran?))
+    }
+
+    /// **#740.** The DOWNLINK RAN STATUS TRANSFER relayed to the handover target names
+    /// the UE by the RAN UE NGAP ID the TARGET allocated in its HandoverRequestAcknowledge
+    /// (TS 38.413 §8.4.2.2, §8.4.8, §9.2.3.5), not by the source's: each gNB allocates
+    /// its own, and the source's id at the target is an inconsistent pair (§10.6) or
+    /// another UE.
+    ///
+    /// Driven through both handlers with the sent NGAP captured: the Acknowledge from
+    /// the target (whose HandoverCommand to the source keeps the SOURCE id), then the
+    /// source's UPLINK RAN STATUS TRANSFER, whose relay to the target is decoded.
+    ///
+    /// REVERT-VERIFIED: relaying `transfer` with the decoded (source) id fails the
+    /// relayed-id assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_relayed_ran_status_carries_the_target_allocated_ran_ue_id() {
+        let mut server = capturing_ngap_server().await;
+        let (source, target) = (97_401u64, 97_402u64);
+        let amf_ue_ngap_id = 7_740_001u64;
+        let (source_ran, target_ran) = (5u32, 74_001u32);
+        seed_gnb_session(&server, source).await;
+        seed_gnb_session(&server, target).await;
+        server.ue_auth_state.insert(
+            amf_ue_ngap_id,
+            UeNasContext::new(amf_ue_ngap_id, source_ran, source, false),
+        );
+
+        let ack = nextgcore_ngap::builder::build_handover_request_acknowledge(
+            &nextgcore_ngap::types::HandoverRequestAcknowledge {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id: target_ran,
+                admitted_list: vec![nextgcore_ngap::types::PduSessionResourceAdmittedItemHoAck {
+                    pdu_session_id: 5,
+                    transfer: vec![0x00, 0x03, 0xE0, 0x0A],
+                }],
+                failed_list: None,
+                target_to_source_container: vec![0xC0, 0xFE],
+            },
+        )
+        .expect("build HandoverRequestAcknowledge");
+        server
+            .handle_handover_request_acknowledge(target, &ack)
+            .await
+            .expect("handled");
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(sent.len(), 1, "the HandoverCommand: {sent:?}");
+        assert_eq!(sent[0].0, source, "the HandoverCommand goes to the source");
+        assert_eq!(
+            (
+                crate::ngap_asn1::extract_amf_ue_ngap_id(&sent[0].1),
+                crate::ngap_asn1::extract_ran_ue_ngap_id(&sent[0].1)
+            ),
+            (Some(amf_ue_ngap_id), Some(source_ran)),
+            "toward the source the UE keeps the SOURCE's RAN UE NGAP ID"
+        );
+
+        assert_eq!(
+            server
+                .handle_uplink_ran_status_transfer(
+                    source,
+                    &uplink_status_pdu(amf_ue_ngap_id, source_ran)
+                )
+                .await
+                .expect("handled"),
+            Some(target)
+        );
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(sent.len(), 1, "the relayed status: {sent:?}");
+        assert_eq!(sent[0].0, target, "relayed to the target");
+        assert_eq!(
+            decoded_downlink_ran_status_ids(&sent[0].1),
+            Some((amf_ue_ngap_id, target_ran)),
+            "the DOWNLINK RAN STATUS TRANSFER names the UE by the id the TARGET \
+             allocated in its Acknowledge, not the source's {source_ran}"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn handover_terminal_events_drop_the_relay_target() {
         let mut server = test_ngap_server().await;
@@ -20123,7 +20239,7 @@ mod tests {
         // That surfaced as that test reading THIS test's association (9212) instead
         // of its own (9301), about 1 run in 3.
         let ue_notify = 78_101u64;
-        server.handover_target_assoc.insert(ue_notify, target);
+        server.handover_target_assoc.insert(ue_notify, (target, 1));
         let notify = nextgcore_ngap::builder::build_handover_notify(
             &nextgcore_ngap::types::HandoverNotify {
                 amf_ue_ngap_id: ue_notify,
@@ -20148,7 +20264,7 @@ mod tests {
 
         // HandoverCancel: the source abandoned it.
         let ue_cancel = 78_002u64;
-        server.handover_target_assoc.insert(ue_cancel, target);
+        server.handover_target_assoc.insert(ue_cancel, (target, 1));
         let cancel = nextgcore_ngap::builder::build_handover_cancel(
             &nextgcore_ngap::types::HandoverCancel {
                 amf_ue_ngap_id: ue_cancel,
@@ -20166,7 +20282,7 @@ mod tests {
         // ue_auth_state entry, because a stale record would misroute the NEXT
         // handover's status transfer to a gNB that already rejected the UE.
         let ue_failure = 78_003u64;
-        server.handover_target_assoc.insert(ue_failure, target);
+        server.handover_target_assoc.insert(ue_failure, (target, 1));
         let failure = nextgcore_ngap::builder::build_handover_failure(
             &nextgcore_ngap::types::HandoverFailure {
                 amf_ue_ngap_id: ue_failure,
