@@ -262,32 +262,136 @@ fn the_scanner_flags_material_and_not_its_properties() {
 /// Wire-message and counter types whose "sensitive-looking" fields are not
 /// authentication material in the sense of this check: NAS AUTHENTICATION
 /// REQUEST / RESPONSE values are sent in clear over the air interface, and a
-/// NAS COUNT's `sqn` is a sequence number, not the AKA SQN.
+/// NAS COUNT's `sqn` is a sequence number, not the AKA SQN. Matched by full
+/// path (`<file under src/>::<Type>`), so a new type that reuses one of these
+/// names elsewhere is still checked (#861 review).
 const DEBUG_ALLOWED: &[&str] = &[
-    "EpsAuthenticationRequest",
-    "AuthenticationRequest",
-    "AuthenticationResponseParameter",
-    "NasCount",
-    "UlCount",
-    "ACRCompleteEventInfo",
-    "TimeReport",
+    "libs/nextgcore-nas/src/eps/message.rs::EpsAuthenticationRequest",
+    "libs/nextgcore-nas/src/fiveg/message.rs::AuthenticationRequest",
+    "libs/nextgcore-nas/src/common/types.rs::AuthenticationResponseParameter",
+    "libs/nextgcore-nas/src/common/security.rs::NasCount",
+    "bins/nextgcore-mmed/src/nas_security.rs::UlCount",
+    // Charging: `acr_res` is the ACR result, not an AKA RES.
+    "bins/nextgcore-eesd/src/acrevents.rs::ACRCompleteEventInfo",
+    // LPP/NRPPa timing: `k` is the TS 38.133 Tc multiplier, not the key K.
+    "bins/nextgcore-lmfd/src/codec_glue.rs::TimeReport",
     // TUAK INSTANCE octet: `ck_256` / `ik_256` / `k_256` are key-LENGTH flags.
-    "Instance",
+    "libs/nextgcore-crypt/src/tuak.rs::Instance",
 ];
 
-/// Production structs that derive `Debug` and have a field naming
-/// authentication material. Each must use a redacting manual `Debug` instead
-/// (#861 review), so a future `{:?}` cannot print it.
+/// `[pub[(...)]] (struct|enum) Name` after a derive and its trailing attributes.
+fn derived_item(rest: &str) -> Option<(&'static str, String, &str)> {
+    let mut item = rest.trim_start();
+    loop {
+        if item.starts_with("#[") {
+            item = item[item.find(']')? + 1..].trim_start();
+        } else if item.starts_with("///") || item.starts_with("//") {
+            item = item[item.find('\n')? + 1..].trim_start();
+        } else {
+            break;
+        }
+    }
+    if let Some(after) = item.strip_prefix("pub") {
+        item = after.trim_start();
+        if item.starts_with('(') {
+            item = item[item.find(')')? + 1..].trim_start();
+        }
+    }
+    let (kind, after) = if let Some(a) = item.strip_prefix("struct ") {
+        ("struct", a)
+    } else if let Some(a) = item.strip_prefix("enum ") {
+        ("enum", a)
+    } else {
+        return None;
+    };
+    let name: String = after
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    Some((kind, name.clone(), &after[name.len()..]))
+}
+
+/// `CamelCase` -> `camel_case`, so a tuple type or variant named for the
+/// material (`Kasme(..)`, `PathSwitch { nh }` aside) is checked by its name.
+fn snake(name: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in name.chars().enumerate() {
+        if c.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(c.to_ascii_lowercase());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The text between the `{`/`(` at `open` and its matching close.
+fn balanced(text: &str, open: usize) -> &str {
+    let (o, c) = match text.as_bytes()[open] {
+        b'(' => ('(', ')'),
+        _ => ('{', '}'),
+    };
+    let mut depth = 0usize;
+    for (i, ch) in text[open..].char_indices() {
+        if ch == o {
+            depth += 1;
+        } else if ch == c {
+            depth -= 1;
+            if depth == 0 {
+                return &text[open + 1..open + i];
+            }
+        }
+    }
+    &text[open + 1..]
+}
+
+/// Named fields (`[pub[(..)]] name: Type`) in a struct or enum body.
+fn named_fields(body: &str) -> Vec<&str> {
+    body.lines()
+        .filter_map(|l| {
+            let mut l = l.trim_start();
+            if let Some(after) = l.strip_prefix("pub") {
+                l = after.trim_start();
+                if l.starts_with('(') {
+                    l = &l[l.find(')')? + 1..];
+                }
+                l = l.trim_start();
+            }
+            let (field, rest) = l.split_once(':')?;
+            if rest.starts_with(':') {
+                return None; // a path, not a field
+            }
+            let field = field.trim();
+            (!field.is_empty() && field.chars().all(|c| c.is_alphanumeric() || c == '_'))
+                .then_some(field)
+        })
+        .collect()
+}
+
+/// Production structs and enums that derive `Debug` and hold authentication
+/// material: a named field, or a tuple struct / tuple variant named for it.
+/// Each must use a redacting manual `Debug` instead (#861 review), so a future
+/// `{:?}` cannot print it. Any visibility (`pub(super)` included), tuple
+/// structs and enum variants are covered.
 #[test]
-fn no_key_holding_struct_derives_debug() {
+fn no_key_holding_type_derives_debug() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut files = Vec::new();
     rust_files(&src.join("bins"), &mut files);
     rust_files(&src.join("libs"), &mut files);
     let mut problems = Vec::new();
+    let mut seen = 0usize;
     for file in &files {
         let full = fs::read_to_string(file).unwrap_or_default();
         let text = production(&full);
+        let rel = file
+            .strip_prefix(&src)
+            .unwrap_or(file)
+            .display()
+            .to_string();
         let mut from = 0;
         while let Some(at) = text[from..].find("#[derive(") {
             let start = from + at;
@@ -295,79 +399,128 @@ fn no_key_holding_struct_derives_debug() {
             let Some(close) = text[from..].find(")]") else {
                 break;
             };
-            let derives = &text[from..from + close];
-            if !derives.split(',').any(|d| d.trim() == "Debug") {
+            if !text[from..from + close]
+                .split(',')
+                .any(|d| d.trim() == "Debug")
+            {
                 continue;
             }
-            // The item the derive applies to, skipping further attributes.
             let rest = &text[from + close + 2..];
-            let item = rest.trim_start();
-            let item = item
-                .lines()
-                .skip_while(|l| {
-                    l.trim_start().starts_with("#[") || l.trim_start().starts_with("///")
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let Some(after_struct) = item
-                .trim_start()
-                .strip_prefix("pub struct ")
-                .or_else(|| item.trim_start().strip_prefix("pub(crate) struct "))
-                .or_else(|| item.trim_start().strip_prefix("struct "))
-            else {
+            let Some((kind, name, after)) = derived_item(rest) else {
                 continue;
             };
-            let name: String = after_struct
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            if DEBUG_ALLOWED.contains(&name.as_str()) {
+            seen += 1;
+            if DEBUG_ALLOWED.contains(&format!("{rel}::{name}").as_str()) {
                 continue;
             }
-            let Some(open) = after_struct.find('{') else {
+            let after_off = text.len() - after.len();
+            let Some(open) = after.find(['{', '(', ';']) else {
                 continue;
             };
-            if after_struct[..open].contains(';') {
-                continue; // tuple or unit struct
-            }
-            let body_start = open + 1;
-            let mut depth = 1usize;
-            let mut end = body_start;
-            for (i, c) in after_struct[body_start..].char_indices() {
-                match c {
-                    '{' => depth += 1,
-                    '}' => depth -= 1,
-                    _ => {}
+            let mut bad: Vec<String> = Vec::new();
+            match after.as_bytes()[open] {
+                b';' => {}
+                b'(' => {
+                    // Tuple struct: judged by its name.
+                    if is_sensitive(&snake(&name)) {
+                        bad.push(name.clone());
+                    }
                 }
-                if depth == 0 {
-                    end = body_start + i;
-                    break;
+                _ => {
+                    let body = balanced(&text, after_off + open);
+                    bad.extend(
+                        named_fields(body)
+                            .into_iter()
+                            .filter(|f| is_sensitive(f))
+                            .map(str::to_string),
+                    );
+                    if kind == "enum" {
+                        // Tuple variants: `Kasme([u8; 32]),` judged by name.
+                        for line in body.lines() {
+                            let l = line.trim_start();
+                            let v: String = l
+                                .chars()
+                                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                                .collect();
+                            if !v.is_empty()
+                                && l[v.len()..].trim_start().starts_with('(')
+                                && is_sensitive(&snake(&v))
+                            {
+                                bad.push(v);
+                            }
+                        }
+                    }
                 }
             }
-            let fields: Vec<&str> = after_struct[body_start..end]
-                .lines()
-                .filter_map(|l| {
-                    let l = l.trim_start();
-                    let l = l
-                        .strip_prefix("pub(crate) ")
-                        .or_else(|| l.strip_prefix("pub "))
-                        .unwrap_or(l);
-                    let (field, _) = l.split_once(':')?;
-                    let field = field.trim();
-                    (!field.is_empty() && field.chars().all(|c| c.is_alphanumeric() || c == '_'))
-                        .then_some(field)
-                })
-                .collect();
-            let bad: Vec<&str> = fields.into_iter().filter(|f| is_sensitive(f)).collect();
             if !bad.is_empty() {
                 problems.push(format!(
-                    "{}: struct {name} derives Debug but holds {bad:?}; give it a redacting Debug",
-                    file.strip_prefix(&src).unwrap_or(file).display()
+                    "{rel}::{name}: {kind} derives Debug but holds {bad:?}; give it a redacting Debug"
                 ));
             }
         }
     }
+    assert!(
+        seen > 200,
+        "only {seen} derived types found: the parser is broken"
+    );
     assert!(problems.is_empty(), "\n{}", problems.join("\n"));
+}
+
+/// The parser above, on the shapes the #861 review named.
+#[test]
+fn derive_check_self_test() {
+    let (kind, name, _) =
+        derived_item("\n#[serde(x)]\n/// doc\npub(super) enum HandoverModifyKind {").unwrap();
+    assert_eq!((kind, name.as_str()), ("enum", "HandoverModifyKind"));
+    let (kind, name, _) = derived_item("pub struct Kasme(pub [u8; 32]);").unwrap();
+    assert_eq!((kind, name.as_str()), ("struct", "Kasme"));
+    assert!(is_sensitive(&snake("Kasme")));
+    assert!(!is_sensitive(&snake("PathSwitch")));
+    assert_eq!(
+        named_fields("PathSwitch {\n    enb_id: u64,\n    nh: [u8; 32],\n    pub(crate) kasme: X,\n    x: a::b,\n}"),
+        vec!["enb_id", "nh", "kasme", "x"]
+    );
+}
+
+/// Whether `.field(label, value)` in a manual `Debug` prints authentication
+/// material. Judged by the VALUE (#861 review): `field("x", &self.kasme)` and
+/// `field("is_kasme_valid", &self.kasme)` leak whatever the label says. A
+/// sensitive label is also a leak unless its value is redacted. The flag
+/// exemption (`use_opc`, `has_k`, `is_kasme_valid`) applies to the value's
+/// last segment, never to the label alone.
+fn debug_field_leaks(label: &str, value: &str) -> bool {
+    if value.contains("<redacted>") {
+        return false;
+    }
+    let flag = |seg: &str| ["use_", "has_", "is_"].iter().any(|p| seg.starts_with(p));
+    let value_leaks = identifiers(value).into_iter().any(|chain| {
+        let last = chain.rsplit('.').next().unwrap_or(chain);
+        !flag(last) && is_sensitive(chain)
+    });
+    let label_leaks = is_sensitive(label) && !flag(label) && !value.trim().is_empty();
+    value_leaks || label_leaks
+}
+
+#[test]
+fn debug_field_check_self_test() {
+    for (label, value) in [
+        ("kasme", " &self.kasme"),
+        ("x", " &self.kasme"),
+        ("is_kasme_valid", " &self.kasme"),
+        ("k", " &self.k"),
+        ("opaque", " &hex::encode(&self.opc)"),
+        ("nh", " &self.next_hop"),
+    ] {
+        assert!(debug_field_leaks(label, value), "{label}: {value}");
+    }
+    for (label, value) in [
+        ("kasme", " &\"<redacted>\""),
+        ("use_opc", " &self.use_opc"),
+        ("is_kasme_valid", " &self.is_kasme_valid"),
+        ("imsi", " &self.imsi"),
+    ] {
+        assert!(!debug_field_leaks(label, value), "{label}: {value}");
+    }
 }
 
 /// Every manual `Debug` impl prints authentication material only as
@@ -419,18 +572,18 @@ fn manual_debug_impls_redact_authentication_material() {
             }
             let body = &text[body_start..end];
             checked += 1;
-            let mut rest = body;
-            while let Some(f) = rest.find(".field(\"") {
-                rest = &rest[f + 8..];
-                let Some(q) = rest.find('"') else { break };
-                let field = &rest[..q];
-                let args = &rest[q..rest.find(')').unwrap_or(rest.len())];
-                // `use_opc`, `has_k`, `is_kasme_valid`: a flag, not the key.
-                let flag = ["use_", "has_", "is_"].iter().any(|p| field.starts_with(p));
-                if is_sensitive(field) && !flag && !args.contains("<redacted>") {
+            let mut at = 0;
+            while let Some(f) = body[at..].find(".field(") {
+                let open = at + f + 6;
+                at = open + 1;
+                let args = balanced(body, open);
+                let (label, value) = args.split_once(',').unwrap_or((args, ""));
+                let label = label.trim().trim_matches('"');
+                if debug_field_leaks(label, value) {
                     problems.push(format!(
-                        "{}: Debug for {name} prints {field} unredacted",
-                        file.strip_prefix(&src).unwrap_or(file).display()
+                        "{}: Debug for {name} prints `{}` as {label:?} unredacted",
+                        file.strip_prefix(&src).unwrap_or(file).display(),
+                        value.trim()
                     ));
                 }
             }
