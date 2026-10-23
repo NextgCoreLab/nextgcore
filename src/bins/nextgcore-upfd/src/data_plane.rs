@@ -1230,8 +1230,10 @@ pub struct DataPlaneUrr {
     pub acc_dl_pkts: AtomicU64,
     /// Timestamp of first packet in this measurement period
     pub first_pkt_time: RwLock<Option<std::time::Instant>>,
-    /// Timestamp of last report
-    pub last_report_time: RwLock<Option<std::time::Instant>>,
+    /// Timestamp of last report.
+    /// Private (#724): read it through [`Self::last_report_time`], which copies the
+    /// value out, so no guard on it can outlive a [`Self::reset_counters`] call.
+    last_report_time: RwLock<Option<std::time::Instant>>,
     /// Whether a threshold has been exceeded (needs reporting)
     pub threshold_exceeded: AtomicBool,
     /// Monotonic UR-SEQN per URR (TS 29.244 8.2.60) — incremented for every
@@ -1418,6 +1420,14 @@ impl DataPlaneUrr {
         }
     }
 
+    /// When this URR last reported (or was created), copied out of its lock.
+    ///
+    /// #724: returns the VALUE, never the guard, so no caller can hold
+    /// `last_report_time` across [`Self::reset_counters`], which writes it.
+    pub fn last_report_time(&self) -> Option<std::time::Instant> {
+        *self.last_report_time.read().unwrap()
+    }
+
     /// Allocate the next monotonic UR-SEQN for a usage report from this URR.
     pub fn next_ur_seqn(&self) -> u32 {
         self.ur_seqn.fetch_add(1, Ordering::SeqCst)
@@ -1514,8 +1524,7 @@ impl DataPlaneUrr {
 
         // Check time threshold
         if let Some(time_thresh) = self.time_threshold_secs() {
-            let report_time = self.last_report_time.read().unwrap();
-            if let Some(last) = *report_time {
+            if let Some(last) = self.last_report_time() {
                 if last.elapsed().as_secs() >= time_thresh as u64 {
                     self.threshold_exceeded.store(true, Ordering::Relaxed);
                     outcome = UrrOutcome::ThresholdExceeded;
@@ -3485,8 +3494,13 @@ impl DataPlane {
             for (urr_id, urr) in urrs.iter() {
                 if !urr.threshold_exceeded.load(Ordering::Relaxed) {
                     if let Some(period) = urr.measurement_period_secs() {
-                        let last_report = urr.last_report_time.read().unwrap();
-                        if let Some(last) = *last_report {
+                        // #724: COPY the instant out; never bind the guard. The guard
+                        // used to live to the end of this block, and `reset_counters`
+                        // below takes `last_report_time.write()` -- std's RwLock is not
+                        // re-entrant, so the harvest parked on its own read guard
+                        // forever while still holding `seid_map.read()`, which then
+                        // hung every Session Establishment, the stats loop and /metrics.
+                        if let Some(last) = urr.last_report_time() {
                             if last.elapsed().as_secs() >= period as u64 {
                                 let total = urr.acc_total_bytes.load(Ordering::Relaxed);
                                 if total > 0 {
@@ -5460,6 +5474,118 @@ mod tests {
             UrrReportReason::TimeQuota,
             "a time-quota exhaustion is reported as TIMQU, not as a volume trigger"
         );
+    }
+
+    /// Run `f` on a thread of its own and hand back a receiver for its result, so a
+    /// test can wait on it with `recv_timeout` -- the only way to observe a deadlock
+    /// as a failure instead of a hung test binary. A thread that does hang is leaked,
+    /// which is acceptable: the test has already failed.
+    fn on_thread<T: Send + 'static>(
+        name: &str,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> std::sync::mpsc::Receiver<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || {
+                let _ = tx.send(f());
+            })
+            .expect("spawn");
+        rx
+    }
+
+    /// #724: the periodic (PERIO) harvest of a URR whose Measurement Period has elapsed
+    /// with traffic counted must RETURN, and a PFCP Session Establishment racing it
+    /// must complete.
+    ///
+    /// On cc8f97a this deadlocked: `collect_urr_reports` held
+    /// `urr.last_report_time.read()` across `reset_counters()`, which takes
+    /// `last_report_time.write()` on the same thread (std's RwLock is not re-entrant),
+    /// while also holding `seid_map.read()` -- so the Session Establishment's
+    /// `seid_map.write()` blocked behind it forever and the UPF stopped taking
+    /// sessions. smfd provisions a 3600 s period on every session, so every UPF that
+    /// had carried traffic hung about an hour in.
+    ///
+    /// Both calls run on their own threads under a deadline, so the regression shows up
+    /// as a failure rather than as a hung test binary. The assertions are positive: the
+    /// report exists, is PERIO, carries the measured volume, and the counters and the
+    /// period restart after it (the reporting semantics the fix must not change).
+    #[test]
+    fn a_periodic_urr_harvest_returns_and_does_not_block_session_establishment() {
+        let dp = Arc::new(DataPlane::new(Arc::new(AtomicBool::new(false))));
+        let gnb: SocketAddr = "127.0.0.1:2152".parse().unwrap();
+        dp.add_session_from_pfcp(
+            0x724,
+            0x1724,
+            Ipv4Addr::new(10, 45, 7, 24),
+            0x7241,
+            0x7242,
+            gnb,
+            Some(5),
+            Some(9),
+        );
+        let session = dp.sessions.find_by_seid(0x724).expect("session");
+        let urr = Arc::new(DataPlaneUrr::new(1));
+        // The smfd default shape: no thresholds, a Measurement Period only.
+        urr.set_reporting(None, None, None, None, Some(1));
+        session.urrs.write().unwrap().insert(1, Arc::clone(&urr));
+        assert_eq!(urr.record(600, true), UrrOutcome::Continue);
+        assert_eq!(urr.record(400, false), UrrOutcome::Continue);
+        // Back-date the last report past the period instead of sleeping through it.
+        let backdated = std::time::Instant::now() - std::time::Duration::from_secs(5);
+        *urr.last_report_time.write().unwrap() = Some(backdated);
+
+        let deadline = std::time::Duration::from_secs(5);
+        let dp_h = Arc::clone(&dp);
+        let harvest = on_thread("urr-harvest", move || dp_h.collect_urr_reports());
+        let dp_e = Arc::clone(&dp);
+        let establish = on_thread("session-establishment", move || {
+            dp_e.add_session_from_pfcp(
+                0x725,
+                0x1725,
+                Ipv4Addr::new(10, 45, 7, 25),
+                0x7251,
+                0x7252,
+                gnb,
+                Some(6),
+                Some(9),
+            );
+            dp_e.sessions.find_by_seid(0x725).is_some()
+        });
+
+        let reports = harvest.recv_timeout(deadline).unwrap_or_else(|_| {
+            panic!(
+                "collect_urr_reports did not return within {deadline:?}: the PERIO \
+                 harvest deadlocked on its own last_report_time guard (#724)"
+            )
+        });
+        let established = establish.recv_timeout(deadline).unwrap_or_else(|_| {
+            panic!(
+                "a Session Establishment racing the PERIO harvest did not complete \
+                 within {deadline:?}: seid_map stayed read-locked by a hung harvest (#724)"
+            )
+        });
+        assert!(established, "the racing session must be installed");
+
+        assert_eq!(reports.len(), 1, "exactly one periodic report: {reports:?}");
+        let r = &reports[0];
+        assert_eq!((r.upf_seid, r.smf_seid, r.urr_id), (0x724, 0x1724, 1));
+        assert_eq!(r.trigger, UrrReportReason::Periodic);
+        assert_eq!((r.total_bytes, r.ul_bytes, r.dl_bytes), (1000, 600, 400));
+        assert_eq!((r.total_pkts, r.ul_pkts, r.dl_pkts), (2, 1, 1));
+
+        // The report restarted the measurement: counters zeroed, period re-armed.
+        assert_eq!(urr.acc_total_bytes.load(Ordering::Relaxed), 0);
+        assert!(
+            urr.last_report_time().expect("set by the reset") > backdated,
+            "the reset must restart the measurement period"
+        );
+        // So the very next harvest has nothing to say -- and also returns.
+        let dp_h = Arc::clone(&dp);
+        let again = on_thread("urr-harvest-2", move || dp_h.collect_urr_reports())
+            .recv_timeout(deadline)
+            .expect("second harvest must return");
+        assert!(again.is_empty(), "the period was just restarted: {again:?}");
     }
 
     /// An uplink G-PDU whose inner source IP does not match the session's UE
