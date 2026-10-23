@@ -303,13 +303,20 @@ pub fn mme_s6a_process_inbound(inbound: &crate::fd_path::InboundS6aRequest) -> S
                     };
                     // A retransmitted CLR while the detach it started is
                     // running changes nothing: it would resend DETACH
-                    // REQUEST and reset T3422's count (#828).
-                    let detaching = ctx.mme_ue_find_by_id(ue_id).is_some_and(|ue| {
+                    // REQUEST and reset T3422's count (#828). Only a detach a
+                    // CLR started: one begun for another reason (an SGW
+                    // restart, a PGW-initiated last-bearer release) has not
+                    // carried the HSS's detach type, and its PDN connections
+                    // may still hold sessions at gateways the CLR's Delete
+                    // Session Requests reach, so the CLR is served.
+                    let detaching_by_clr = ctx.mme_ue_find_by_id(ue_id).is_some_and(|ue| {
                         ue.nas_eps.type_ == crate::context::MmeEpsType::DetachRequestToUe
+                            && ue.network_detach_by_clr
                     });
-                    if detaching {
+                    if detaching_by_clr {
                         log::info!(
-                            "[{}] Cancel Location while its detach is already running; ignored",
+                            "[{}] Cancel Location while the detach it started is running; \
+                             ignored",
                             inbound.imsi_bcd
                         );
                         return Ok(());
@@ -334,6 +341,11 @@ pub fn mme_s6a_process_inbound(inbound: &crate::fd_path::InboundS6aRequest) -> S
                         detach_type,
                         "a Cancel Location (subscription withdrawal) from the HSS",
                     );
+                    if outcome == crate::network_detach::DetachOutcome::DetachRequestSent {
+                        if let Some(ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&ue_id) {
+                            ue.network_detach_by_clr = true;
+                        }
+                    }
                     log::info!(
                         "[{}] HSS-initiated detach ({detach_type:?}, Reattach-Required={}): \
                          {outcome:?}",
@@ -1143,6 +1155,70 @@ mod tests {
         assert_eq!(ue.t3422.retry_count, retries);
         assert_eq!(ue.t3422.pkbuf, stored);
         crate::network_detach::complete_mme_initiated_detach(ctx, mme_ue_id);
+    }
+
+    /// #828 follow-up: the duplicate-CLR guard covers only a detach a CLR started. A first
+    /// CLR during a detach begun for another reason (here a re-attach-required detach, as an
+    /// SGW restart sends) is the HSS's instruction and is served: the DETACH REQUEST is resent
+    /// with the CLR's type (Reattach-Required clear: "re-attach not required"). Its
+    /// retransmission is then ignored.
+    #[test]
+    fn a_first_cancel_location_during_another_detach_is_served() {
+        use crate::emm_build::DetachTypeToUe as T;
+        const IMSI: &str = "999990000008281";
+        let mme_ue_id = seed_connected_ue(IMSI, 8281);
+        let ctx = crate::context::mme_self();
+        assert_eq!(
+            crate::network_detach::mme_initiated_detach(
+                ctx,
+                mme_ue_id,
+                T::ReAttachRequired,
+                "a Serving GW restart"
+            ),
+            crate::network_detach::DetachOutcome::DetachRequestSent
+        );
+        assert!(
+            !ctx.mme_ue_find_by_id(mme_ue_id)
+                .unwrap()
+                .network_detach_by_clr
+        );
+
+        mme_s6a_process_inbound(&clr(IMSI, cancellation_type::SUBSCRIPTION_WITHDRAWAL))
+            .expect("applied");
+        let ue = ctx
+            .mme_ue_find_by_id(mme_ue_id)
+            .expect("waits for DETACH ACCEPT");
+        assert_eq!(ue.network_detach_type, Some(T::ReAttachNotRequired));
+        assert!(ue.network_detach_by_clr);
+        assert_eq!(
+            ue.t3422
+                .pkbuf
+                .as_ref()
+                .and_then(|d| d.get(8))
+                .map(|o| o & 0x07),
+            Some(T::ReAttachNotRequired as u8),
+            "the CLR's detach type is on the wire"
+        );
+        let retries = ue.t3422.retry_count;
+        let stored = ue.t3422.pkbuf.clone();
+
+        // Its retransmission changes nothing: no DETACH REQUEST resent, T3422 not reset.
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&mme_ue_id)
+            .unwrap()
+            .t3422
+            .record_retransmission(crate::nas_timer::T3422_DURATION);
+        let retries = retries + 1;
+        mme_s6a_process_inbound(&clr(IMSI, cancellation_type::SUBSCRIPTION_WITHDRAWAL))
+            .expect("applied");
+        let ue = ctx.mme_ue_find_by_id(mme_ue_id).unwrap();
+        assert_eq!(ue.t3422.retry_count, retries);
+        assert_eq!(ue.t3422.pkbuf, stored);
+        assert!(crate::network_detach::complete_mme_initiated_detach(
+            ctx, mme_ue_id
+        ));
     }
 
     #[test]
