@@ -22,7 +22,7 @@ deploy/eks/
 │   │   └── profile.env         namespace, images, features, rollout hooks
 │   └── epc/                  PROFILE=epc (nextg-epc): EPC + LTE eNB/UE
 │       ├── kustomization.yaml  mongodb + epc.yaml + the unmodified compose configs
-│       ├── epc.yaml            9 Deployments, each with a headless Service
+│       ├── epc.yaml            9 Deployments; 8 headless Services (not lte-ue)
 │       ├── namespace.yaml      nextg-epc, pod-security privileged
 │       ├── profile.env         namespace, images, features, rollout hooks
 │       └── scripts/            epc-run.sh (entrypoint), epc-peers-check.sh (liveness)
@@ -75,7 +75,7 @@ stage, in namespace `nextg-epc`:
 - pgwc (`smfd`) and pgwu (`upfd`);
 - nextgsim's LTE `enb` and `lte-ue`.
 
-Every EPC pod except mongodb has `nodeSelector: nextg.io/dataplane=true`, so
+Every EPC Deployment (not mongodb or its init Job) has `nodeSelector: nextg.io/dataplane=true`, so
 at least one node must carry that label (CloudFormation
 `EnableDataPlanePrivileges=true` sets it on the node group; on an existing
 cluster, `kubectl label node <n> nextg.io/dataplane=true`).
@@ -108,7 +108,9 @@ kernel, so this cannot be fixed in an image. Without it, mme fails to bind
 reboots:
 
 ```bash
-# from a namespace at pod-security privileged; delete the node-debugger pod after
+# a fresh cluster has no nextg-epc yet; deploy-eks.sh re-applies this later
+kubectl apply -f profiles/epc/namespace.yaml
+# a one-shot pod: it runs and completes; delete the node-debugger-* pod kubectl names
 kubectl debug node/<n> -n nextg-epc --profile=sysadmin --image=busybox -- \
   chroot /host sh -c 'modprobe sctp && echo sctp > /etc/modules-load.d/sctp.conf'
 kubectl -n nextg-epc exec deploy/mme -- grep -w sctp /proc/modules   # after deploy
@@ -143,19 +145,37 @@ the subscriber data does not survive mongodb-0 being recreated).
 and the same default-bearer EBI on the UE and the MME, then the same ping / DNS /
 HTTPS / PGW-U counter steps as the 5G profile, on `lteuetun5`.
 
-**Restarting a pod.** Deleting any single EPC pod recovers with no manual
-restart; the next `e2e-internet.sh` passes. Measured on devtest1 (nextgcore
-cc8f97a, nextgsim 4a35c79), one deletion at a time; the time runs from the
-delete to the first e2e PASS, retrying every e2e run plus 10 s:
+**Restarting a pod.** Deleting any one of the nine pods in the table below
+recovers with no manual restart; the next `e2e-internet.sh` passes. Measured on
+devtest1 (nextgcore cc8f97a, nextgsim 4a35c79), one deletion at a time; the
+time runs from the delete to the first e2e PASS, retrying every e2e run plus
+10 s:
 
 | deleted | PASS after | recovers | how |
 |---|---|---|---|
 | pgwu | 124 s | on its own | the PGW-C's PFCP heartbeat sees the new Recovery Time Stamp, sends a Delete Bearer Request (cause 8); the MME detaches the UE (re-attach required) and the UE re-attaches |
 | sgwu | 124 s | on its own | sgwc liveness-restarts; the MME sees the SGW-C restart counter change on Echo, detaches (re-attach required), and the UE re-attaches |
-| pgwc | 73 s | on the UE's next uplink | the pods that track pgwc (sgwc, pcrf) liveness-restart; the UE's Service Request is rejected #9, the eNB releases the UE, and the UE re-attaches |
+| pgwc | 73 s | on the UE's next uplink | the pods that track pgwc (sgwc, pcrf, mme) liveness-restart; the mme restart loses the UE contexts, so the UE's Service Request is rejected #9, the eNB releases the UE, and the UE re-attaches |
 | sgwc | 39 s | on the UE's next uplink | mme liveness-restarts; then as for pgwc |
 | mme | 130 s | on the UE's next uplink | enb liveness-restarts, the UE loses the radio link and camps again idle; then as for pgwc |
 | enb | 113 s | on its own | lte-ue liveness-restarts and attaches afresh |
+| hss | 74 s | on the UE's next uplink | mme (which tracks hss) liveness-restarts, losing the UE contexts; then as for pgwc |
+| pcrf | 28 s | on its own | nothing tracks pcrf; the attached UE's bearer is unaffected, and the fresh attach of the next row (lte-ue) succeeded after it |
+| lte-ue | 28 s | on its own | the new UE attaches afresh |
+
+The hss, pcrf and lte-ue rows were measured later, on the same images.
+
+**mongodb-0 is not in the table.** With `EPHEMERAL_STORAGE=true` (as above) its
+emptyDir goes with the pod, so the subscriber the one-shot `mongodb-init` Job
+seeded is lost and the next attach fails authentication at the HSS. Recover by
+re-running `deploy-eks.sh`, which runs the `mongodb-init` Job again. On a gp3
+PVC the data survives.
+
+**A long-lived deployment hangs (#724).** upfd deadlocks at its first periodic
+usage report. smfd provisions a 3600 s Measurement Period by default, so a
+PGW-U (or 5G UPF) that has carried traffic stops answering PFCP about an hour
+later. Every new attach then fails (S5 cause 106). Until a build with #724's fix
+is deployed, delete the pgwu pod to recover.
 
 "On the UE's next uplink": an MME restart loses the UE contexts, and the UE
 stays EMM-REGISTERED and idle until it has data to send. No paging or periodic
@@ -171,8 +191,8 @@ namespace. No `hostNetwork`, NodePort or LoadBalancer is used.
 
 Both scripts derive the tag from `git rev-parse --short=12 HEAD` of the
 repository each image is built from — nextgcore for the core NFs,
-nextgsim for the simulator images (`gnb`/`ue`, or `lte-enb`/`lte-ue`), since those are separate repos at separate
-commits. A dirty tree appends `-dirty`. Neither script passes the tag to
+nextgsim for the simulator images (`gnb`/`ue`, or `lte-enb`/`lte-ue`), since
+those are separate repos at separate commits. A dirty tree appends `-dirty`. Neither script passes the tag to
 the other: both read the same two repos, so they agree by construction
 (`lib/image-tag.sh`).
 
@@ -269,11 +289,13 @@ aws sts get-caller-identity          # must succeed
 
 The binaries must be built first. They are not committed: `nextgcore/binaries/`
 and `nextgsim/docker/binaries/` are gitignored, and `build-and-push.sh` fails
-listing whatever is missing.
+listing whatever is missing (once its AWS STS check has passed; #716).
 
 - `nextgcore/binaries/`: `cd src && cargo build --release`, then copy the
   daemons from `src/target/release/`. The workspace builds all 28 NF daemons
   plus `nextgcore-webui`; PROFILE=5g packages 10 of them, PROFILE=epc 7.
+  PROFILE=epc: mmed must be the kernel-sctp build (see PROFILE=epc above); the
+  default build starts but binds nothing on 36412.
 - `nextgsim/docker/binaries/nr-gnb`, `nr-ue` (PROFILE=5g), or
   `nextgsim/binaries/lte-enb`, `lte-ue` (PROFILE=epc, see above).
 
@@ -388,7 +410,7 @@ Infrastructure (see `Outputs.Caveats` in the template):
 
 Workload:
 
-- **MongoDB is unauthenticated**, single replica, 1Gi EBS, no backup. The init
+- **MongoDB is unauthenticated**, single replica, 8Gi gp3 EBS (or an emptyDir with `EPHEMERAL_STORAGE=true`), no backup. The init
   Job seeds a test subscriber's Ki/OPc. Those are test credentials from the
   Open5GS/UERANSIM defaults, but they are real key material in a ConfigMap —
   do not reuse on a shared cluster.
