@@ -700,6 +700,22 @@ fn ue_ready_for_sessions(server: &mut NgapServer, ue: u64, ran: u32) {
     });
 }
 
+/// Run the establishment supervision until no attempt is in flight and every
+/// outcome has been applied (the attempts run off the NGAP task, #796 M1).
+async fn settle_establishments(server: &mut NgapServer) {
+    for _ in 0..500 {
+        server.process_pending_establishments().await;
+        server.process_sbi_outcomes().await;
+        let attempting = server.pending_establishments.values().any(|p| p.in_flight);
+        if !attempting && server.sbi_offload.in_flight() == 0 {
+            server.process_sbi_outcomes().await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the establishment attempts did not settle");
+}
+
 /// Make every waiting establishment due now.
 fn make_establishments_due(server: &mut NgapServer) {
     let now = std::time::Instant::now();
@@ -739,7 +755,7 @@ async fn an_establishment_while_the_smf_restarts_is_retried_and_succeeds() {
     let (_smf, seen) =
         creating_smf_on(std::net::TcpListener::bind(("127.0.0.1", port)).expect("rebind")).await;
     make_establishments_due(&mut server);
-    server.process_pending_establishments().await;
+    settle_establishments(&mut server).await;
 
     assert_eq!(
         seen.lock().expect("seen").len(),
@@ -809,5 +825,165 @@ async fn an_establishment_with_no_smf_back_in_the_window_gets_payload_not_forwar
     };
     assert_eq!(dl.gmm_cause, Some(90));
     assert_eq!(dl.payload_container.data.to_vec(), request.to_vec());
+    server.forget_ue(ue);
+}
+
+/// An SMF that never answers: a listener nobody accepts on, so the connection
+/// sits in the backlog and the request waits for the client's timeout. Locally
+/// deterministic stand-in for a blackholed address (a stale pod IP, a lost node).
+/// Keep the listener alive.
+fn hanging_smf() -> (std::net::TcpListener, u16) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    (listener, port)
+}
+
+/// Wait until `n` off-task exchanges hold a permit.
+async fn until_in_flight(server: &NgapServer, n: usize) {
+    for _ in 0..200 {
+        if server.sbi_offload.in_flight() == n {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("in flight: {}, wanted {n}", server.sbi_offload.in_flight());
+}
+
+/// #796 review M1. With the SMF not answering, a due re-selection
+/// attempt does not hold the NGAP task: the supervision returns at once while the
+/// attempt waits for its connect timeout off the task, and NGAP keeps being
+/// handled (here: a second UE's establishment, answered by being queued, and a
+/// retransmission absorbed without a new attempt).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn an_unanswering_smf_does_not_hold_the_ngap_task() {
+    let (_hang, port) = hanging_smf();
+    let _env = super::SmfEnvGuard::set(port);
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_796_011u64, 98);
+    ue_ready_for_sessions(&mut server, ue, ran);
+    let request = [0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF];
+    // As left by a first attempt that found no SMF.
+    server
+        .defer_establishment(
+            ASSOC,
+            ue,
+            ran,
+            &request,
+            None,
+            &crate::sbi_path::SbiError::Timeout,
+        )
+        .await
+        .expect("deferred");
+    make_establishments_due(&mut server);
+
+    let started = std::time::Instant::now();
+    server.process_pending_establishments().await;
+    server.process_sbi_outcomes().await;
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "the supervision spawned the attempt and returned: {:?}",
+        started.elapsed()
+    );
+    assert!(server.pending_establishments[&(ue, 5)].in_flight);
+    until_in_flight(&server, 1).await;
+
+    // N2 is still served while the attempt hangs: the UE's retransmission is
+    // handled at once and starts no second attempt.
+    let started = std::time::Instant::now();
+    server
+        .handle_uplink_nas_transport(ASSOC, &uplink_nas_transport(ue, ran, &request))
+        .await
+        .expect("handled");
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert_eq!(server.sbi_offload.in_flight(), 1);
+    assert!(take_sent_ngap(&mut server).is_empty());
+    server.forget_ue(ue);
+}
+
+/// #796 review M1: the window is wall clock. When it ends while an attempt is
+/// still waiting on an unreachable SMF, the UE gets #90 then, not when the
+/// attempt gives up. The late outcome is then ignored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn the_window_ends_on_time_while_an_attempt_hangs() {
+    let (_hang, port) = hanging_smf();
+    let _env = super::SmfEnvGuard::set(port);
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_796_012u64, 99);
+    ue_ready_for_sessions(&mut server, ue, ran);
+    let request = [0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF];
+    server
+        .defer_establishment(
+            ASSOC,
+            ue,
+            ran,
+            &request,
+            None,
+            &crate::sbi_path::SbiError::Timeout,
+        )
+        .await
+        .expect("deferred");
+    {
+        let p = server
+            .pending_establishments
+            .get_mut(&(ue, 5))
+            .expect("waiting");
+        // 300 ms of the window left, and the attempt is due now.
+        p.first_failure =
+            std::time::Instant::now() - ESTABLISHMENT_RETRY_WINDOW + Duration::from_millis(300);
+        p.next_attempt = std::time::Instant::now();
+    }
+    server.process_pending_establishments().await;
+    assert!(server.pending_establishments[&(ue, 5)].in_flight);
+    assert!(take_sent_ngap(&mut server).is_empty());
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let started = std::time::Instant::now();
+    server.process_pending_establishments().await;
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert!(server.pending_establishments.is_empty());
+    let sent: Vec<Sent> = take_sent_ngap(&mut server)
+        .into_iter()
+        .map(|(_, p)| decode_sent(&p))
+        .collect();
+    assert!(
+        matches!(sent.as_slice(), [Sent::DownlinkNas { .. }]),
+        "the #90 DL NAS Transport at the end of the window: {sent:?}"
+    );
+    // The attempt gives up within what was left of the window; its outcome
+    // changes nothing.
+    settle_establishments(&mut server).await;
+    assert!(take_sent_ngap(&mut server).is_empty());
+    server.forget_ue(ue);
+}
+
+/// #796 review m1: a UE that goes CM-IDLE during the window is dropped without
+/// an answer on the released connection, and no attempt is made for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ue_that_went_idle_is_dropped_from_the_window() {
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_796_013u64, 100);
+    ue_ready_for_sessions(&mut server, ue, ran);
+    let request = [0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF];
+    server
+        .defer_establishment(
+            ASSOC,
+            ue,
+            ran,
+            &request,
+            None,
+            &crate::sbi_path::SbiError::Timeout,
+        )
+        .await
+        .expect("deferred");
+    server.ue_auth_state.with_mut(ue, |s| s.cm_idle = true);
+    make_establishments_due(&mut server);
+
+    server.process_pending_establishments().await;
+
+    assert!(server.pending_establishments.is_empty());
+    assert_eq!(server.sbi_offload.in_flight(), 0);
+    assert!(take_sent_ngap(&mut server).is_empty());
     server.forget_ue(ue);
 }

@@ -838,6 +838,8 @@ pub struct NgapServer {
     /// [`ESTABLISHMENT_RETRY_WINDOW`] has passed. See
     /// [`NgapServer::process_pending_establishments`].
     pending_establishments: HashMap<(u64, u8), PendingEstablishment>,
+    /// SBI work run off this task (#796 review M1): the re-selection attempts.
+    sbi_offload: crate::sbi_offload::SbiOffload,
 }
 
 /// A PDU Session Establishment Request waiting for a reachable SMF (#796).
@@ -853,7 +855,35 @@ struct PendingEstablishment {
     first_failure: std::time::Instant,
     /// When the next attempt is due.
     next_attempt: std::time::Instant,
+    /// Whether an attempt is running off the NGAP task. Its outcome comes back
+    /// through [`NgapServer::process_sbi_outcomes`].
+    in_flight: bool,
+    /// Identifies this waiting request, so a late outcome of an attempt for an
+    /// earlier one (answered #90, then requested again) is not applied to it.
+    generation: u64,
 }
+
+/// Source of [`PendingEstablishment::generation`].
+static ESTABLISHMENT_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// One off-task re-selection attempt for a waiting PDU Session Establishment
+/// (#796), as it comes back to the NGAP task.
+#[derive(Debug)]
+pub(crate) struct EstablishmentAttempt {
+    amf_ue_ngap_id: u64,
+    psi: u8,
+    generation: u64,
+    sst: u8,
+    sd: Option<u32>,
+    dnn: Option<String>,
+    /// The SMF the attempt was sent to, for releasing a context nobody wants.
+    smf: (String, u16),
+    result: Result<crate::sbi_path::SmContextCreateResponse, crate::sbi_path::SbiError>,
+}
+
+/// How many SBI exchanges run off the NGAP task at once (#796 review M1).
+const MAX_OFFLOADED_SBI: usize = 16;
 
 /// How long the AMF keeps re-selecting an SMF for an establishment it could not
 /// deliver (#796). Below the UE's T3580 (16 s, TS 24.501 §10.3), so the UE gets
@@ -957,6 +987,7 @@ impl NgapServer {
             emergency: crate::emergency::EmergencyHandler::new(),
             ngap_overload_declared: false,
             pending_establishments: HashMap::new(),
+            sbi_offload: crate::sbi_offload::SbiOffload::new(MAX_OFFLOADED_SBI),
             timer_configs: {
                 // Reachability timers derive from the CONFIGURED T3512
                 // (`amf.time.t3512.value`), per TS 24.501 §5.3.7, with
@@ -1021,6 +1052,7 @@ impl NgapServer {
         // N1 in a DOWNLINK NAS TRANSPORT. Dormant when none pending.
         self.process_connected_downlinks().await;
 
+        self.process_sbi_outcomes().await;
         self.process_pending_establishments().await;
 
         // Relay any PWS warning containers the Namf non-UE N2 transfer handler
@@ -7039,6 +7071,33 @@ impl NgapServer {
             0xC1 => {
                 log::info!("PDU Session Establishment Request from UE: PSI={psi}, PTI={pti}");
 
+                // #796: a UE retransmission (T3580) of a request already waiting for
+                // an SMF is not a new attempt. Sending it on the NGAP task would hold
+                // all of N2 for the connect timeout of an unreachable SMF; the waiting
+                // entry already re-selects off the task. Past the window it is
+                // answered at once.
+                if let Some(p) = self.pending_establishments.get_mut(&(amf_ue_ngap_id, psi)) {
+                    if p.first_failure.elapsed() >= ESTABLISHMENT_RETRY_WINDOW {
+                        self.pending_establishments.remove(&(amf_ue_ngap_id, psi));
+                        return self
+                            .answer_payload_not_forwarded(
+                                association_id,
+                                amf_ue_ngap_id,
+                                ran_ue_ngap_id,
+                                sm_pdu,
+                                "within the re-selection window",
+                            )
+                            .await;
+                    }
+                    p.sm_pdu = sm_pdu.to_vec();
+                    p.dnn_override = dnn_override.map(str::to_string);
+                    log::info!(
+                        "UE {amf_ue_ngap_id}: PDU session establishment PSI={psi} \
+                         retransmitted while waiting for an SMF; the re-selection goes on"
+                    );
+                    return Ok(());
+                }
+
                 // S-NSSAI/DNN: from the UE's allowed slice when known
                 let (sst, sd) = self
                     .ue_auth_state
@@ -7151,130 +7210,17 @@ impl NgapServer {
                 .await
                 {
                     Ok(resp) => {
-                        // #796: an establishment that was waiting for an SMF is done.
-                        self.pending_establishments.remove(&(amf_ue_ngap_id, psi));
-                        log::info!(
-                            "SMF SM Context Created: ref={}, n1_len={}, n2_len={}",
-                            resp.sm_context_ref,
-                            resp.n1_sm_msg.len(),
-                            resp.n2_sm_info.len()
-                        );
-                        // Remember the SMF-chosen reference: every later
-                        // Nsmf_PDUSession_UpdateSMContext for this session must
-                        // use it verbatim (TS 29.502 §5.2.2.2.1). It is not the
-                        // PSI and must not be reconstructed from one.
-                        self.sm_context_refs
-                            .insert((amf_ue_ngap_id, psi), resp.sm_context_ref.clone());
-                        // #669: and WHICH SMF holds it.
-                        match resp.smf_authority.as_deref().and_then(split_authority) {
-                            Some(owner) => {
-                                self.sm_context_smfs.insert((amf_ue_ngap_id, psi), owner);
-                            }
-                            None => {
-                                self.sm_context_smfs.remove(&(amf_ue_ngap_id, psi));
-                            }
-                        }
-                        // #540: also the AmfSess the Namf N1N2MessageTransfer handler
-                        // and the Service Request's re-activation look the session up
-                        // in. Before this only `sm_context_refs` was written, so every
-                        // N1N2 transfer from the SMF -- the paging request included --
-                        // answered 404 and an idle UE could never be reached.
-                        record_amf_session(amf_ue_ngap_id, psi, &resp.sm_context_ref, sst, sd);
-
-                        // #356: record the emergency PDU session against the UE's
-                        // emergency context. Before this `assign_emergency_pdu_session`
-                        // had no production caller, so `EmergencyContext.pdu_session_id`
-                        // was always `None` and nothing could tell WHICH session carried
-                        // the emergency call -- the one fact an operator needs to
-                        // prioritise or trace it.
-                        //
-                        // The condition is deliberately two-part. The UE must hold an
-                        // emergency context (the method returns `false` otherwise, so
-                        // this is what makes the record meaningful rather than merely
-                        // attempted), AND the session must be on the emergency DNN. A
-                        // DNN-less request counts: TS 23.501 §5.16.4.2 has the network
-                        // use the configured emergency DNN when an emergency-registered
-                        // UE asks for a session without naming one, which is exactly the
-                        // `dnn == None` case that reaches the SMF with the member
-                        // omitted (#204). An emergency-registered UE that explicitly asks
-                        // for some OTHER DNN is not establishing the emergency session
-                        // and must not be recorded as one.
-                        let emergency_dnn = self.emergency.emergency_dnn().to_string();
-                        let on_emergency_dnn = dnn.is_none_or(|d| d == emergency_dnn);
-                        if on_emergency_dnn
-                            && self
-                                .emergency
-                                .assign_emergency_pdu_session(amf_ue_ngap_id, psi)
-                        {
-                            log::warn!(
-                                "Emergency PDU session recorded for UE {amf_ue_ngap_id}: \
-                                 PSI={psi} on DNN '{}' (TS 23.501 §5.16.4.2)",
-                                dnn.unwrap_or(&emergency_dnn)
-                            );
-                        }
-
-                        // N1: PDU Session Establishment Accept via DL NAS
-                        // TRANSPORT (protected when a context exists)
-                        self.send_n1_sm_to_ue(
+                        self.apply_sm_context_created(
                             association_id,
                             amf_ue_ngap_id,
                             ran_ue_ngap_id,
                             psi,
-                            &resp.n1_sm_msg,
+                            sst,
+                            sd,
+                            dnn,
+                            resp,
                         )
                         .await?;
-                        // The N1 container the SMF produced is the 5GSM PDU Session
-                        // Establishment Accept; the AMF only relays it. Logged here
-                        // because the relay was previously silent, so the last
-                        // AMF-visible step of a successful session establishment left
-                        // no trace.
-                        if !resp.n1_sm_msg.is_empty() {
-                            log::info!(
-                                "PDU Session Establishment Accept sent to UE \
-                                 {amf_ue_ngap_id} (PSI={psi}, {} bytes)",
-                                resp.n1_sm_msg.len()
-                            );
-                        }
-
-                        // N2: PDU Session Resource Setup Request toward the gNB.
-                        // The UE context (AS-layer security) must be established
-                        // first — i.e. the gNB must have returned an Initial
-                        // Context Setup Response (TS 38.413 §8.3.1 precedes the
-                        // PDU session setup of TS 38.413 §8.2.1). Without it the
-                        // gNB has no KgNB/DRBs to attach the session to.
-                        let ics_done = self
-                            .ue_auth_state
-                            .get(amf_ue_ngap_id)
-                            .map(|s| s.initial_context_setup_response_received)
-                            .unwrap_or(false);
-                        if !ics_done {
-                            log::warn!(
-                                "Deferring PDU Session Resource Setup for PSI={psi}: Initial \
-                                 Context Setup not yet confirmed for UE {amf_ue_ngap_id}"
-                            );
-                            return Ok(());
-                        }
-
-                        let setup_req =
-                            match crate::ngap_asn1::build_pdu_session_resource_setup_request_asn1(
-                                amf_ue_ngap_id,
-                                ran_ue_ngap_id,
-                                psi,
-                                sst,
-                                sd,
-                                None,
-                                &resp.n2_sm_info,
-                            ) {
-                                Some(bytes) => bytes,
-                                None => {
-                                    log::error!(
-                                        "Failed to build PDU Session Resource Setup Request"
-                                    );
-                                    return Ok(());
-                                }
-                            };
-                        self.send_to_association(association_id, &setup_req).await?;
-                        log::info!("PDU Session Resource Setup Request sent to gNB: PSI={psi}");
                     }
                     Err(e) if smf_unreachable(&e) => {
                         // #796: no SMF was reachable, e.g. the only one is
@@ -7575,6 +7521,146 @@ impl NgapServer {
         }
     }
 
+    /// A CreateSMContext answered (#796: extracted so an off-task re-selection
+    /// attempt is applied by the same code as the first attempt): record the
+    /// session, relay the N1 to the UE and, once the UE context is up at the gNB,
+    /// send the PDU SESSION RESOURCE SETUP REQUEST.
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_sm_context_created(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        psi: u8,
+        sst: u8,
+        sd: Option<u32>,
+        dnn: Option<&str>,
+        resp: crate::sbi_path::SmContextCreateResponse,
+    ) -> Result<()> {
+        // #796: an establishment that was waiting for an SMF is done.
+        self.pending_establishments.remove(&(amf_ue_ngap_id, psi));
+        log::info!(
+            "SMF SM Context Created: ref={}, n1_len={}, n2_len={}",
+            resp.sm_context_ref,
+            resp.n1_sm_msg.len(),
+            resp.n2_sm_info.len()
+        );
+        // Remember the SMF-chosen reference: every later
+        // Nsmf_PDUSession_UpdateSMContext for this session must
+        // use it verbatim (TS 29.502 §5.2.2.2.1). It is not the
+        // PSI and must not be reconstructed from one.
+        self.sm_context_refs
+            .insert((amf_ue_ngap_id, psi), resp.sm_context_ref.clone());
+        // #669: and WHICH SMF holds it.
+        match resp.smf_authority.as_deref().and_then(split_authority) {
+            Some(owner) => {
+                self.sm_context_smfs.insert((amf_ue_ngap_id, psi), owner);
+            }
+            None => {
+                self.sm_context_smfs.remove(&(amf_ue_ngap_id, psi));
+            }
+        }
+        // #540: also the AmfSess the Namf N1N2MessageTransfer handler
+        // and the Service Request's re-activation look the session up
+        // in. Before this only `sm_context_refs` was written, so every
+        // N1N2 transfer from the SMF -- the paging request included --
+        // answered 404 and an idle UE could never be reached.
+        record_amf_session(amf_ue_ngap_id, psi, &resp.sm_context_ref, sst, sd);
+
+        // #356: record the emergency PDU session against the UE's
+        // emergency context. Before this `assign_emergency_pdu_session`
+        // had no production caller, so `EmergencyContext.pdu_session_id`
+        // was always `None` and nothing could tell WHICH session carried
+        // the emergency call -- the one fact an operator needs to
+        // prioritise or trace it.
+        //
+        // The condition is deliberately two-part. The UE must hold an
+        // emergency context (the method returns `false` otherwise, so
+        // this is what makes the record meaningful rather than merely
+        // attempted), AND the session must be on the emergency DNN. A
+        // DNN-less request counts: TS 23.501 §5.16.4.2 has the network
+        // use the configured emergency DNN when an emergency-registered
+        // UE asks for a session without naming one, which is exactly the
+        // `dnn == None` case that reaches the SMF with the member
+        // omitted (#204). An emergency-registered UE that explicitly asks
+        // for some OTHER DNN is not establishing the emergency session
+        // and must not be recorded as one.
+        let emergency_dnn = self.emergency.emergency_dnn().to_string();
+        let on_emergency_dnn = dnn.is_none_or(|d| d == emergency_dnn);
+        if on_emergency_dnn
+            && self
+                .emergency
+                .assign_emergency_pdu_session(amf_ue_ngap_id, psi)
+        {
+            log::warn!(
+                "Emergency PDU session recorded for UE {amf_ue_ngap_id}: \
+                 PSI={psi} on DNN '{}' (TS 23.501 §5.16.4.2)",
+                dnn.unwrap_or(&emergency_dnn)
+            );
+        }
+
+        // N1: PDU Session Establishment Accept via DL NAS
+        // TRANSPORT (protected when a context exists)
+        self.send_n1_sm_to_ue(
+            association_id,
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            psi,
+            &resp.n1_sm_msg,
+        )
+        .await?;
+        // The N1 container the SMF produced is the 5GSM PDU Session
+        // Establishment Accept; the AMF only relays it. Logged here
+        // because the relay was previously silent, so the last
+        // AMF-visible step of a successful session establishment left
+        // no trace.
+        if !resp.n1_sm_msg.is_empty() {
+            log::info!(
+                "PDU Session Establishment Accept sent to UE \
+                 {amf_ue_ngap_id} (PSI={psi}, {} bytes)",
+                resp.n1_sm_msg.len()
+            );
+        }
+
+        // N2: PDU Session Resource Setup Request toward the gNB.
+        // The UE context (AS-layer security) must be established
+        // first — i.e. the gNB must have returned an Initial
+        // Context Setup Response (TS 38.413 §8.3.1 precedes the
+        // PDU session setup of TS 38.413 §8.2.1). Without it the
+        // gNB has no KgNB/DRBs to attach the session to.
+        let ics_done = self
+            .ue_auth_state
+            .get(amf_ue_ngap_id)
+            .map(|s| s.initial_context_setup_response_received)
+            .unwrap_or(false);
+        if !ics_done {
+            log::warn!(
+                "Deferring PDU Session Resource Setup for PSI={psi}: Initial \
+                 Context Setup not yet confirmed for UE {amf_ue_ngap_id}"
+            );
+            return Ok(());
+        }
+
+        let setup_req = match crate::ngap_asn1::build_pdu_session_resource_setup_request_asn1(
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            psi,
+            sst,
+            sd,
+            None,
+            &resp.n2_sm_info,
+        ) {
+            Some(bytes) => bytes,
+            None => {
+                log::error!("Failed to build PDU Session Resource Setup Request");
+                return Ok(());
+            }
+        };
+        self.send_to_association(association_id, &setup_req).await?;
+        log::info!("PDU Session Resource Setup Request sent to gNB: PSI={psi}");
+        Ok(())
+    }
+
     /// Keep a PDU Session Establishment Request whose CreateSMContext reached no
     /// SMF, for [`Self::process_pending_establishments`] to retry (#796). Once the
     /// window from its first failure has passed, or when too many are already
@@ -7594,36 +7680,33 @@ impl NgapServer {
         let now = std::time::Instant::now();
         let key = (amf_ue_ngap_id, psi);
         // A UE retransmission of the same request keeps the original window.
-        let first_failure = self
-            .pending_establishments
-            .get(&key)
-            .map_or(now, |p| p.first_failure);
+        let (first_failure, generation) = self.pending_establishments.get(&key).map_or_else(
+            || {
+                (
+                    now,
+                    ESTABLISHMENT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                )
+            },
+            |p| (p.first_failure, p.generation),
+        );
         let full = !self.pending_establishments.contains_key(&key)
             && self.pending_establishments.len() >= MAX_PENDING_ESTABLISHMENTS;
         if full || now.duration_since(first_failure) >= ESTABLISHMENT_RETRY_WINDOW {
             self.pending_establishments.remove(&key);
-            log::warn!(
-                "UE {amf_ue_ngap_id}: PDU session establishment PSI={psi} not forwarded: no \
-                 SMF reachable{} ({error}); 5GMM #90 (TS 24.501 §5.4.5.3.1 e))",
-                if full {
-                    " and the retry list is full"
-                } else {
-                    " within the re-selection window"
-                }
-            );
-            let plain = gmm_build::build_dl_nas_transport(
-                Some(psi),
-                crate::gmm_handler::payload_container_type::N1_SM_INFORMATION,
-                sm_pdu,
-                Some(GmmCause::PayloadWasNotForwarded),
-                None,
-            )
-            .unwrap_or_default();
-            if let Some(protected) = self.protect_nas(amf_ue_ngap_id, &plain) {
-                self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
-                    .await?;
-            }
-            return Ok(());
+            log::warn!("UE {amf_ue_ngap_id}: last CreateSMContext failure: {error}");
+            return self
+                .answer_payload_not_forwarded(
+                    association_id,
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    sm_pdu,
+                    if full {
+                        "and the retry list is full"
+                    } else {
+                        "within the re-selection window"
+                    },
+                )
+                .await;
         }
         log::warn!(
             "UE {amf_ue_ngap_id}: no SMF reachable for PDU session establishment PSI={psi} \
@@ -7641,51 +7724,268 @@ impl NgapServer {
                 dnn_override: dnn_override.map(str::to_string),
                 first_failure,
                 next_attempt: now + ESTABLISHMENT_RETRY_INTERVAL,
+                in_flight: false,
+                generation,
             },
         );
         Ok(())
     }
 
-    /// Retry each waiting establishment that is due (#796). Each retry runs the
-    /// establishment again from the top, so it re-selects the SMF: a failed peer
-    /// was evicted from the discovery cache and held down, and the NRF lists the
-    /// restarted one. A UE that went away in the meantime is dropped.
+    /// The routing-failure answer (#796): a DL NAS TRANSPORT carrying the UE's own
+    /// 5GSM message back, with 5GMM #90 "payload was not forwarded" (TS 24.501
+    /// §5.4.5.2.5 a) 1), §5.4.5.3.1 case e)).
+    async fn answer_payload_not_forwarded(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        sm_pdu: &[u8],
+        why: &str,
+    ) -> Result<()> {
+        let psi = sm_pdu[1];
+        log::warn!(
+            "UE {amf_ue_ngap_id}: PDU session establishment PSI={psi} not forwarded: no SMF \
+             reachable {why}; 5GMM #90 (TS 24.501 §5.4.5.3.1 e))"
+        );
+        let plain = gmm_build::build_dl_nas_transport(
+            Some(psi),
+            crate::gmm_handler::payload_container_type::N1_SM_INFORMATION,
+            sm_pdu,
+            Some(GmmCause::PayloadWasNotForwarded),
+            None,
+        )
+        .unwrap_or_default();
+        if let Some(protected) = self.protect_nas(amf_ue_ngap_id, &plain) {
+            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Supervise the waiting establishments (#796). Nothing here awaits an SBI
+    /// request: each due attempt is spawned off the NGAP task
+    /// ([`crate::sbi_offload`]) and its outcome is applied by
+    /// [`Self::process_sbi_outcomes`]. So the window is wall clock: an entry whose
+    /// window has passed is answered #90 here, at its end, even while an attempt
+    /// to an unreachable SMF is still waiting for its connect timeout.
+    ///
+    /// A UE that went away, or went CM-IDLE (its 5GSM procedure does not survive
+    /// the N1 release, and it re-requests on its own), is dropped without an
+    /// answer.
     async fn process_pending_establishments(&mut self) {
         if self.pending_establishments.is_empty() {
             return;
         }
         let now = std::time::Instant::now();
-        let due: Vec<((u64, u8), PendingEstablishment)> = self
-            .pending_establishments
-            .iter()
-            .filter(|(_, p)| p.next_attempt <= now)
-            .map(|(k, p)| (*k, p.clone()))
-            .collect();
-        for ((amf_ue_ngap_id, psi), p) in due {
-            let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) else {
-                self.pending_establishments.remove(&(amf_ue_ngap_id, psi));
+        let keys: Vec<(u64, u8)> = self.pending_establishments.keys().copied().collect();
+        for key in keys {
+            let (amf_ue_ngap_id, psi) = key;
+            let Some(p) = self.pending_establishments.get(&key).cloned() else {
                 continue;
             };
-            // The UE's current connection: it may have moved since.
-            let (association_id, ran_ue_ngap_id) = if state.is_cm_idle() {
-                (p.association_id, p.ran_ue_ngap_id)
-            } else {
-                (state.association_id, state.ran_ue_ngap_id)
+            let Some(state) = self.ue_auth_state.get(amf_ue_ngap_id) else {
+                self.pending_establishments.remove(&key);
+                continue;
             };
-            drop(state);
-            log::info!("UE {amf_ue_ngap_id}: retrying PDU session establishment PSI={psi} (#796)");
-            if let Err(e) = self
-                .handle_5gsm_message(
-                    association_id,
+            if state.is_cm_idle() {
+                log::info!(
+                    "UE {amf_ue_ngap_id}: went CM-IDLE while PDU session establishment \
+                     PSI={psi} waited for an SMF; dropped (the UE re-requests)"
+                );
+                self.pending_establishments.remove(&key);
+                continue;
+            }
+            // The UE's current connection: it may have moved since.
+            let (association_id, ran_ue_ngap_id) = (state.association_id, state.ran_ue_ngap_id);
+            if now.duration_since(p.first_failure) >= ESTABLISHMENT_RETRY_WINDOW {
+                self.pending_establishments.remove(&key);
+                if let Err(e) = self
+                    .answer_payload_not_forwarded(
+                        association_id,
+                        amf_ue_ngap_id,
+                        ran_ue_ngap_id,
+                        &p.sm_pdu,
+                        "within the re-selection window",
+                    )
+                    .await
+                {
+                    log::warn!("UE {amf_ue_ngap_id}: #90 for PSI={psi} not sent: {e}");
+                }
+                continue;
+            }
+            if p.in_flight || p.next_attempt > now {
+                continue;
+            }
+            if let Some(w) = self.pending_establishments.get_mut(&key) {
+                w.in_flight = true;
+            }
+            self.spawn_establishment_attempt(amf_ue_ngap_id, &p, &state);
+        }
+    }
+
+    /// Start one off-task re-selection attempt (#796): SMF selection (NRF discovery
+    /// on a cache miss) and CreateSMContext, bounded by what is left of the window.
+    fn spawn_establishment_attempt(
+        &self,
+        amf_ue_ngap_id: u64,
+        p: &PendingEstablishment,
+        state: &UeNasContext,
+    ) {
+        let psi = p.sm_pdu[1];
+        let (sst, sd) = state
+            .amf_ue
+            .allowed_nssai
+            .first()
+            .map_or((1, None), |n| (n.sst, n.sd));
+        let redcap_indication = state.amf_ue.redcap_indication;
+        let identity = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().ok();
+            build_sm_context_identity(
+                Some(state),
+                guard.as_ref().and_then(|c| c.served_guami.first()),
+            )
+        };
+        let sm_pdu = p.sm_pdu.clone();
+        let dnn = p.dnn_override.clone();
+        let budget = ESTABLISHMENT_RETRY_WINDOW.saturating_sub(p.first_failure.elapsed());
+        let generation = p.generation;
+        log::info!("UE {amf_ue_ngap_id}: retrying PDU session establishment PSI={psi} (#796)");
+        self.sbi_offload.spawn(async move {
+            let smf = crate::sbi_path::resolve_nf_endpoint_async(
+                crate::sbi_path::SbiServiceType::NsmfPdusession,
+            )
+            .await
+            .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
+            let call = crate::sbi_path::call_smf_create_sm_context(
+                &smf.0,
+                smf.1,
+                psi,
+                sst,
+                sd,
+                dnn.as_deref(),
+                &sm_pdu,
+                redcap_indication,
+                &identity,
+            );
+            let result = tokio::time::timeout(budget, call)
+                .await
+                .unwrap_or(Err(crate::sbi_path::SbiError::Timeout));
+            Some(crate::sbi_offload::SbiOutcome::Establishment(
+                EstablishmentAttempt {
                     amf_ue_ngap_id,
+                    psi,
+                    generation,
+                    sst,
+                    sd,
+                    dnn,
+                    smf,
+                    result,
+                },
+            ))
+        });
+    }
+
+    /// Apply every outcome the off-task SBI work produced, on the NGAP task.
+    async fn process_sbi_outcomes(&mut self) {
+        while let Some(outcome) = self.sbi_offload.try_recv() {
+            match outcome {
+                crate::sbi_offload::SbiOutcome::Establishment(attempt) => {
+                    if let Err(e) = self.apply_establishment_attempt(attempt).await {
+                        log::warn!("Establishment retry outcome not applied: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// One re-selection attempt came back (#796).
+    async fn apply_establishment_attempt(&mut self, a: EstablishmentAttempt) -> Result<()> {
+        let key = (a.amf_ue_ngap_id, a.psi);
+        let waiting = self
+            .pending_establishments
+            .get(&key)
+            .filter(|p| p.generation == a.generation)
+            .cloned();
+        let connection = self
+            .ue_auth_state
+            .get(a.amf_ue_ngap_id)
+            .filter(|s| !s.is_cm_idle())
+            .map(|s| (s.association_id, s.ran_ue_ngap_id));
+        match (a.result, waiting, connection) {
+            (Ok(resp), Some(_), Some((association_id, ran_ue_ngap_id))) => {
+                self.apply_sm_context_created(
+                    association_id,
+                    a.amf_ue_ngap_id,
                     ran_ue_ngap_id,
-                    &p.sm_pdu,
-                    p.dnn_override.as_deref(),
+                    a.psi,
+                    a.sst,
+                    a.sd,
+                    a.dnn.as_deref(),
+                    resp,
                 )
                 .await
-            {
-                log::warn!("UE {amf_ue_ngap_id}: establishment retry PSI={psi} failed: {e}");
-                self.pending_establishments.remove(&(amf_ue_ngap_id, psi));
+            }
+            (Ok(resp), _, _) => {
+                // The UE was answered #90, went away or went idle meanwhile: nobody
+                // will use this context, so it is released rather than leaked.
+                log::info!(
+                    "UE {}: SM context {} for PSI={} created after the establishment was \
+                     abandoned; releasing it",
+                    a.amf_ue_ngap_id,
+                    resp.sm_context_ref,
+                    a.psi
+                );
+                let (host, port) = resp
+                    .smf_authority
+                    .as_deref()
+                    .and_then(split_authority)
+                    .unwrap_or(a.smf);
+                let sm_ref = resp.sm_context_ref;
+                self.sbi_offload.spawn(async move {
+                    if let Err(e) =
+                        crate::sbi_path::call_smf_release_sm_context(&host, port, &sm_ref).await
+                    {
+                        log::warn!("Release of abandoned SM context {sm_ref} failed: {e}");
+                    }
+                    None
+                });
+                Ok(())
+            }
+            (Err(_), None, _) => Ok(()),
+            (Err(_), Some(_), None) => {
+                self.pending_establishments.remove(&key);
+                Ok(())
+            }
+            (Err(e), Some(p), Some((association_id, ran_ue_ngap_id))) => {
+                if smf_unreachable(&e) {
+                    if let Some(w) = self.pending_establishments.get_mut(&key) {
+                        w.in_flight = false;
+                        w.next_attempt = std::time::Instant::now() + ESTABLISHMENT_RETRY_INTERVAL;
+                    }
+                    log::warn!(
+                        "UE {}: establishment retry PSI={} reached no SMF ({e})",
+                        a.amf_ue_ngap_id,
+                        a.psi
+                    );
+                    return Ok(());
+                }
+                // An SMF answered and refused: as for a first attempt, 5GSM #26.
+                self.pending_establishments.remove(&key);
+                log::warn!(
+                    "SMF SM Context Create failed ({e}); rejecting PSI={}",
+                    a.psi
+                );
+                let pti = p.sm_pdu.get(2).copied().unwrap_or(0);
+                let reject = vec![0x2E, a.psi, pti, 0xC3, 0x1A];
+                self.send_n1_sm_to_ue(
+                    association_id,
+                    a.amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    a.psi,
+                    &reject,
+                )
+                .await
             }
         }
     }
