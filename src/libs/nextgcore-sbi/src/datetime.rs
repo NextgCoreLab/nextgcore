@@ -95,6 +95,12 @@ pub fn epoch_to_rfc3339_signed(epoch: i64) -> String {
 /// `eesd`'s parser accepts `±HHMM` generally. Accepting both spellings uniformly
 /// is easier to explain than accepting `+0000` while refusing `+0200`.
 fn split_zone(rest: &str) -> Option<(&str, i64)> {
+    // RFC 3339 is ASCII. The byte-offset `split_at` and slices below would panic
+    // if a cut landed inside a multi-byte character, and the text comes from a
+    // peer's JSON.
+    if !rest.is_ascii() {
+        return None;
+    }
     if let Some(time) = rest.strip_suffix('Z').or_else(|| rest.strip_suffix('z')) {
         return Some((time, 0));
     }
@@ -173,7 +179,14 @@ pub fn rfc3339_to_epoch_signed(text: &str) -> Option<i64> {
     let year: i64 = parts.next()?.parse().ok()?;
     let month: i64 = parts.next()?.parse().ok()?;
     let day: i64 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    // RFC 3339 `date-fullyear` is 4DIGIT. Bounding it also keeps the day and
+    // second arithmetic below inside i64: an 18-digit year from a peer used to
+    // overflow it (a panic with overflow checks, a wrapped instant without).
+    if parts.next().is_some()
+        || !(0..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+    {
         return None;
     }
 
@@ -221,6 +234,27 @@ pub fn now_epoch_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hostile_date_times_are_refused_without_panicking() {
+        // A peer's TS 29.571 DateTime: a multi-byte character where the zone
+        // split cuts used to panic `split_at`, and an oversized year overflowed
+        // the seconds arithmetic.
+        for bad in [
+            "2024-01-01T0\u{e9}00000",
+            "2024-01-01T00:00:0\u{e9}0",
+            "2024-01-01T\u{e9}\u{e9}\u{e9}",
+            "999999999999999-01-01T00:00:00Z",
+            "-1-01-01T00:00:00Z",
+            "10000-01-01T00:00:00Z",
+        ] {
+            assert_eq!(rfc3339_to_epoch_signed(bad), None, "{bad:?}");
+            assert_eq!(rfc3339_to_epoch(bad), None, "{bad:?}");
+        }
+        // The edges of the 4-digit range still parse.
+        assert!(rfc3339_to_epoch_signed("0000-01-01T00:00:00Z").is_some());
+        assert!(rfc3339_to_epoch_signed("9999-12-31T23:59:59+01:00").is_some());
+    }
 
     #[test]
     fn known_instants_round_trip() {
