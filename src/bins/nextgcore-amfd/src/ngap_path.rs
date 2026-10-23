@@ -842,9 +842,10 @@ pub struct NgapServer {
 enum ContextlessLookup {
     /// Allocated to this association and RAN UE NGAP ID.
     Matches,
-    /// Allocated, but to another association or RAN UE NGAP ID.
+    /// Allocated to this association, but to another RAN UE NGAP ID.
     Inconsistent,
-    /// Never allocated without a context (or no longer remembered).
+    /// Never allocated without a context on this association (or no longer
+    /// remembered).
     Unknown,
 }
 
@@ -1787,6 +1788,8 @@ impl NgapServer {
             log::warn!("NG Reset from unknown association {association_id}");
             return Ok(());
         };
+        // #758: a reset connection's contextless allocation goes with it.
+        self.drop_contextless_ue_ids_for_reset(association_id, &reset.reset_type);
 
         // Drop pending authentication state for the affected UEs.
         //
@@ -2301,6 +2304,12 @@ impl NgapServer {
                     }
                 }
                 lookup => {
+                    // Known deviation from TS 38.413 §10.6, Inconsistent case: §10.6 has
+                    // both nodes locally release the logical connection "having the
+                    // erroneous AP ID". The allocation is kept instead, for the genuine
+                    // connection it belongs to: a peer naming a wrong RAN UE NGAP ID
+                    // must not be able to tear down another UE's pending registration.
+                    // Only the Error Indication is sent.
                     let cause = match lookup {
                         ContextlessLookup::Inconsistent => {
                             ngap_gen::CauseRadioNetwork::INCONSISTENT_REMOTE_UE_NGAP_ID
@@ -5812,6 +5821,29 @@ impl NgapServer {
         });
     }
 
+    /// Forget the contextless allocations of the NG connections an NG Reset from
+    /// `association_id` resets (#758): every one on the association for a whole
+    /// reset; for a partial one, each that an item names by either ID.
+    fn drop_contextless_ue_ids_for_reset(
+        &mut self,
+        association_id: u64,
+        reset_type: &nextgcore_ngap::types::ResetType,
+    ) {
+        use nextgcore_ngap::types::ResetType;
+        match reset_type {
+            ResetType::NgInterface => self
+                .contextless_ue_ids
+                .retain(|c| c.association_id != association_id),
+            ResetType::PartOfNgInterface(items) => self.contextless_ue_ids.retain(|c| {
+                c.association_id != association_id
+                    || !items.iter().any(|item| {
+                        item.amf_ue_ngap_id == Some(c.amf_ue_ngap_id)
+                            || item.ran_ue_ngap_id == Some(c.ran_ue_ngap_id)
+                    })
+            }),
+        }
+    }
+
     /// Whether `amf_ue_ngap_id` was allocated to exactly this connection with no
     /// NAS context (#758). A match is consumed.
     fn take_contextless_ue_id(
@@ -5828,7 +5860,14 @@ impl NgapServer {
             return ContextlessLookup::Unknown;
         };
         let c = self.contextless_ue_ids[pos];
-        if c.association_id != association_id || c.ran_ue_ngap_id != ran_ue_ngap_id {
+        // TS 38.413 §10.6: an AP ID is local to its NG interface. On another
+        // association the ID names no logical connection there at all, so it is an
+        // unknown local ID, and saying "inconsistent" would tell that gNB the ID is
+        // live elsewhere.
+        if c.association_id != association_id {
+            return ContextlessLookup::Unknown;
+        }
+        if c.ran_ue_ngap_id != ran_ue_ngap_id {
             return ContextlessLookup::Inconsistent;
         }
         self.contextless_ue_ids.remove(pos);
@@ -8567,6 +8606,12 @@ impl NgapServer {
             }
             Undecodable => None,
         };
+        // #758: the released NG connection's contextless allocation goes with it, so
+        // the gNB cannot later mint a context under the released ID.
+        if let Some(id) = amf_ue_ngap_id {
+            self.contextless_ue_ids
+                .retain(|c| !(c.association_id == association_id && c.amf_ue_ngap_id == id));
+        }
         // The N1 signalling connection is gone: a registered UE is now CM-IDLE, which
         // is what makes a later N1N2 transfer page it (#512). Marked whether or not
         // the mobile reachable timer below is enabled.
