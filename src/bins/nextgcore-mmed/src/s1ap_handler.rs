@@ -5259,8 +5259,52 @@ mod tests {
             },
         );
         assert_eq!(ctx.bearer_find_by_id(bid).unwrap().enb_s1u_teid, 0);
+
+        // #880 review: E-RAB SETUP RESPONSE from the other eNB writes none of its
+        // S1-U endpoints onto this UE's bearers.
+        handle_erab_setup_response(
+            &ctx,
+            intruder,
+            mme_ue_s1ap_id,
+            100,
+            &[nextgcore_s1ap::ErabSetupItem {
+                erab_id: 5,
+                transport_layer_address: vec![10, 0, 0, 67],
+                gtp_teid: 0x847,
+            }],
+        );
+        assert_eq!(
+            ctx.bearer_find_by_id(bid).unwrap().enb_s1u_teid,
+            0,
+            "E-RAB SETUP RESPONSE"
+        );
+
+        // #880 review: NAS NON DELIVERY INDICATION from the other eNB leaves
+        // this UE's paging state alone.
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&mme_ue_id)
+            .unwrap()
+            .paging
+            .type_ = PagingType::DownlinkDataNotification;
+        handle_nas_non_delivery_indication(
+            &ctx,
+            intruder,
+            &NasNonDeliveryIndication {
+                mme_ue_s1ap_id,
+                enb_ue_s1ap_id: 100,
+                nas_pdu: vec![0x07],
+                cause: Cause::RadioNetwork(CauseRadioNetwork::Unspecified),
+            },
+        );
+        assert!(
+            !ctx.mme_ue_find_by_id(mme_ue_id).unwrap().paging.failed,
+            "NAS NON DELIVERY INDICATION"
+        );
+
         let eis = crate::s1ap_path::take_tapped_for_test(intruder).len();
-        assert_eq!(eis, 2, "an ERROR INDICATION for each");
+        assert_eq!(eis, 4, "an ERROR INDICATION for each");
         assert!(
             ctx.enb_ue_find_by_id(enb_ue_id).is_some(),
             "the real one stays"

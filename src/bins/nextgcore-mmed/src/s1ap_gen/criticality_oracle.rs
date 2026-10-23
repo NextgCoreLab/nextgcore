@@ -174,15 +174,24 @@ fn oracle() -> &'static Oracle {
 /// `Debug` form (each protocol IE field is a `<Container>_Entry { id:
 /// ProtocolIE_ID(n), criticality: Criticality(c), .. }`).
 pub(crate) fn entries(debug: &str) -> Vec<(String, u16, u8)> {
-    const ID: &str = "_Entry { id: ProtocolIE_ID(";
+    // Protocol IEs (`ProtocolIE_ID`) and, inside `…IE_Extensions`, protocol
+    // extensions (`ProtocolExtensionID`, #880 review): both carry a criticality
+    // from their container's object set.
+    let mut out = entries_with(debug, "_Entry { id: ProtocolIE_ID(");
+    out.extend(entries_with(debug, "_Entry { id: ProtocolExtensionID("));
+    out
+}
+
+fn entries_with(debug: &str, marker: &str) -> Vec<(String, u16, u8)> {
+    let id_marker = marker;
     let mut out = Vec::new();
     let mut rest = debug;
-    while let Some(at) = rest.find(ID) {
+    while let Some(at) = rest.find(id_marker) {
         let container_start = rest[..at]
             .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .map_or(0, |p| p + 1);
         let container = rest[container_start..at].to_string();
-        let after = &rest[at + ID.len()..];
+        let after = &rest[at + id_marker.len()..];
         let id: u16 = after[..after.find(')').unwrap()].parse().unwrap();
         let crit_at =
             after.find("criticality: Criticality(").unwrap() + "criticality: Criticality(".len();
@@ -286,6 +295,21 @@ mod tests {
         assert_eq!(expected("E_RABToBeSwitchedULList", 94), Ok(1));
         assert!(expected(c, 9999).is_err());
         assert!(expected("NoSuchContainer", 0).is_err());
+    }
+
+    /// #880 review: protocol extension entries are read and checked against
+    /// their `…IE_Extensions` object set.
+    #[test]
+    fn extension_entries_are_read_too() {
+        let debug = "CGIIE_Extensions_Entry { id: ProtocolExtensionID(9999), criticality: \
+                     Criticality(1), extension_value: X }";
+        let got = entries(debug);
+        assert_eq!(got, vec![("CGIIE_Extensions".to_string(), 9999, 1)]);
+        assert!(oracle().containers.contains_key("CGIIE_Extensions"));
+        assert!(
+            expected(&got[0].0, got[0].1).is_err(),
+            "9999 is in no extension set"
+        );
     }
 
     /// #855 review: through a REAL builder. The production PATH SWITCH REQUEST
