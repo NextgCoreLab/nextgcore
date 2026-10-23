@@ -1300,6 +1300,24 @@ fn tdoa_observations(
     measurements: &[CellMeasurement],
     registry: &TrpRegistry,
 ) -> (Vec<TdoaObservation>, bool) {
+    // One observation and the TRP identity it is joined on. Within a session a
+    // DL-PRS ID names exactly one TRP (TS 37.355 associates each `dl-PRS-ID` with a
+    // single TRP), while a PCI does not: a multi-TRP cell puts one PCI on several
+    // TRPs, and PCIs are reused across sites (#824 review). So two observations are
+    // of the same TRP when their DL-PRS IDs are equal, and only an observation
+    // without a DL-PRS ID falls back to the registry key.
+    struct Obs {
+        key: String,
+        prs: Option<u8>,
+        tdoa_ns: f64,
+    }
+    fn same(a: &Obs, b: &Obs) -> bool {
+        match (a.prs, b.prs) {
+            (Some(x), Some(y)) => x == y,
+            _ => a.key == b.key,
+        }
+    }
+
     // A DL-PRS ID names one TRP across the reports of a session. A neighbour that
     // resolves by its PCI therefore also tells which TRP its DL-PRS ID is, and a
     // reference TRP, which only carries a DL-PRS ID, can be found through it.
@@ -1312,13 +1330,38 @@ fn tdoa_observations(
     let resolve = |m: &CellMeasurement| {
         resolve_trp(m, registry).or_else(|| m.dl_prs_id.and_then(|p| by_prs.get(&p).cloned()))
     };
+    // A registry key reached from two DL-PRS IDs is two TRPs under one key (a
+    // reused PCI, or one PCI across a multi-TRP cell). Its coordinate is right for
+    // at most one of them, and which one cannot be told, so the key is not used.
+    let mut prs_of_key: HashMap<String, Vec<u8>> = HashMap::new();
+    for m in measurements.iter().filter(|m| m.rstd_ns.is_some()) {
+        if let (Some(prs), Some(key)) = (m.dl_prs_id, resolve(m)) {
+            let ids = prs_of_key.entry(key).or_default();
+            if !ids.contains(&prs) {
+                ids.push(prs);
+            }
+        }
+    }
+    let ambiguous: Vec<String> = prs_of_key
+        .into_iter()
+        .filter(|(_, ids)| ids.len() > 1)
+        .map(|(key, ids)| {
+            log::warn!(
+                "DL-TDOA: registry key {key} is reached from DL-PRS IDs {ids:?}, i.e. from \
+                 more than one TRP; its RSTDs are not used (key the registry by prs-<id> for \
+                 multi-TRP cells or reused PCIs)"
+            );
+            key
+        })
+        .collect();
+
     // Per reference, the known TRPs and their RSTDs in report order.
-    let mut groups: Vec<(Option<u8>, Vec<TdoaObservation>)> = Vec::new();
+    let mut groups: Vec<(Option<u8>, Vec<Obs>)> = Vec::new();
     for m in measurements {
         let (Some(rstd), Some(key)) = (m.rstd_ns, resolve(m)) else {
             continue;
         };
-        if !rstd.is_finite() {
+        if !rstd.is_finite() || ambiguous.contains(&key) {
             continue;
         }
         let g = match groups.iter().position(|(r, _)| *r == m.rstd_reference) {
@@ -1328,11 +1371,13 @@ fn tdoa_observations(
                 groups.len() - 1
             }
         };
-        if !groups[g].1.iter().any(|o| o.trp_id == key) {
-            groups[g].1.push(TdoaObservation {
-                trp_id: key,
-                tdoa_ns: rstd,
-            });
+        let o = Obs {
+            key,
+            prs: m.dl_prs_id,
+            tdoa_ns: rstd,
+        };
+        if !groups[g].1.iter().any(|b| same(b, &o)) {
+            groups[g].1.push(o);
         }
     }
     let Some(base_group) = (0..groups.len()).max_by_key(|&g| groups[g].1.len()) else {
@@ -1344,7 +1389,7 @@ fn tdoa_observations(
         let joinable = groups.iter().enumerate().find_map(|(g, (_, group))| {
             group.iter().find_map(|o| {
                 obs.iter()
-                    .find(|b| b.trp_id == o.trp_id)
+                    .find(|b| same(b, o))
                     .map(|b| (g, b.tdoa_ns - o.tdoa_ns))
             })
         });
@@ -1352,10 +1397,10 @@ fn tdoa_observations(
             break;
         };
         for o in groups.swap_remove(g).1 {
-            if !obs.iter().any(|b| b.trp_id == o.trp_id) {
-                obs.push(TdoaObservation {
-                    trp_id: o.trp_id,
+            if !obs.iter().any(|b| same(b, &o)) {
+                obs.push(Obs {
                     tdoa_ns: o.tdoa_ns + offset,
+                    ..o
                 });
             }
         }
@@ -1367,6 +1412,18 @@ fn tdoa_observations(
             group.len()
         );
     }
+    // The solver keys by registry key, so each key may appear once. Two
+    // observations with one key and no DL-PRS ID between them are one TRP.
+    let mut out: Vec<TdoaObservation> = Vec::new();
+    for o in obs {
+        if !out.iter().any(|b| b.trp_id == o.key) {
+            out.push(TdoaObservation {
+                trp_id: o.key,
+                tdoa_ns: o.tdoa_ns,
+            });
+        }
+    }
+    let mut obs = out;
     let Some(reference) = (0..obs.len()).min_by(|&a, &b| {
         obs[a]
             .tdoa_ns
@@ -2799,6 +2856,90 @@ mod tests_dl_tdoa_reference {
         crate::codec_glue::decode_lpp_provide_report(&bytes)
             .expect("decodes")
             .1
+    }
+
+    /// A report relative to the TRP at `reference` (east, north; DL-PRS ID
+    /// `ref_prs`), with neighbours `(DL-PRS ID, PCI, east, north)`.
+    fn report_at(
+        ref_prs: u8,
+        reference: (f64, f64),
+        neighbours: &[(u8, u16, f64, f64)],
+        txn: u8,
+    ) -> Vec<CellMeasurement> {
+        let d_ref = range(reference.0, reference.1);
+        let list: Vec<(u8, Option<u16>, u32)> = neighbours
+            .iter()
+            .map(|&(prs, pci, e, n)| {
+                let rstd = (range(e, n) - d_ref) / SPEED_OF_LIGHT_M_S * 1e9;
+                (prs, Some(pci), (rstd / TC_NS + MIDPOINT).round() as u32)
+            })
+            .collect();
+        let bytes = crate::lpp_fixtures::dl_tdoa_lpp(ref_prs, &list, txn);
+        crate::codec_glue::decode_lpp_provide_report(&bytes)
+            .expect("decodes")
+            .1
+    }
+
+    /// #824 review MAJOR: a PCI does not identify a TRP. Report B's neighbour T5'
+    /// reuses PCI 2 (T2's) at another site. Joined on the registry key, B was
+    /// joined to A through "pci-2" and the fix came out 705 m off with nothing
+    /// flagging it. Joined on the DL-PRS ID, B shares no TRP with A, and pci-2,
+    /// reached from DL-PRS IDs 1 and 4, is not used: too few TRPs, no fix.
+    #[test]
+    fn a_reused_pci_is_not_a_shared_trp() {
+        let reg = registry(|_, pci| format!("pci-{pci}"));
+        let mut cells = report_at(
+            0,
+            (0.0, 0.0),
+            &[(1, 2, 1000.0, 0.0), (2, 3, 0.0, 1000.0)],
+            1,
+        );
+        cells.extend(report_at(
+            9,
+            (-500.0, 1500.0),
+            &[(4, 2, 2000.0, 300.0), (3, 4, 1000.0, 1000.0)],
+            2,
+        ));
+        let (obs, _) = tdoa_observations(&cells, &reg);
+        assert!(
+            obs.iter().all(|o| o.trp_id != "pci-2"),
+            "pci-2 is two TRPs here and must not be used: {:?}",
+            obs.iter().map(|o| &o.trp_id).collect::<Vec<_>>()
+        );
+        assert!(
+            try_real_solve(&cells, &reg).is_none(),
+            "no fix is the right answer; a wrong one is not"
+        );
+    }
+
+    /// The single-report form: one PCI on two TRPs of a multi-TRP cell (DL-PRS IDs
+    /// 1 and 4). The key is ambiguous and dropped; the other three still solve.
+    #[test]
+    fn one_pci_on_two_trps_of_one_report_is_dropped() {
+        let reg = registry(|prs, pci| {
+            if prs == 0 {
+                "prs-0".to_string()
+            } else {
+                format!("pci-{pci}")
+            }
+        });
+        let five = report_at(
+            0,
+            (0.0, 0.0),
+            &[
+                (1, 2, 1000.0, 0.0),
+                (4, 2, 2000.0, 300.0),
+                (2, 3, 0.0, 1000.0),
+                (3, 4, 1000.0, 1000.0),
+            ],
+            3,
+        );
+        let (obs, _) = tdoa_observations(&five, &reg);
+        let keys: Vec<&str> = obs.iter().map(|o| o.trp_id.as_str()).collect();
+        assert!(!keys.contains(&"pci-2"), "{keys:?}");
+        assert_eq!(keys.len(), 3, "prs-0, pci-3 and pci-4 remain: {keys:?}");
+        let fix = try_real_solve(&five, &reg).expect("three unambiguous TRPs solve");
+        assert!(error_m(&fix) < 1.0, "position error {:.3} m", error_m(&fix));
     }
 
     /// #824 review: an MO-LR carrying two LPP reports with different reference
