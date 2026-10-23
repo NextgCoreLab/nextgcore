@@ -3313,6 +3313,35 @@ pub fn smf_context_init(max_ue: usize, max_sess: usize, max_bearer: usize) {
 pub(crate) static PROCESS_STATE_TEST_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
+/// #723: the guard for code a test may reach only while holding `lock`.
+///
+/// A lock cannot name its holder, so this catches a missing lock only when nobody
+/// else holds it: always under `--test-threads=1` (which CI runs for this crate),
+/// and when the offending test runs on its own. A legitimate caller holds the lock
+/// and never trips it, in any run.
+///
+/// It ABORTS rather than panics. Several guarded paths run in a task the test
+/// spawned (the PFCP packet pump, an SBI handler), where a panic only kills that
+/// task and the test then fails later for some unrelated-looking reason, or not at
+/// all. An abort fails the whole run with this message on stderr, so the offender
+/// is named instead of a sibling.
+#[cfg(test)]
+pub(crate) fn require_test_lock(lock: &tokio::sync::Mutex<()>, lock_name: &str, what: &str) {
+    if lock.try_lock().is_ok() {
+        // Straight to the stderr handle: libtest captures `eprintln!`, and a
+        // captured line is lost with the process.
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "TEST ISOLATION VIOLATION (#723): a test reached {what} without holding \
+             {lock_name}; take it at the top of the test (PROCESS_STATE_TEST_LOCK first, \
+             then N4_TEST_LOCK)\n{}",
+            std::backtrace::Backtrace::force_capture()
+        );
+        std::process::abort();
+    }
+}
+
 /// Finalize the global SMF context
 pub fn smf_context_final() {
     let ctx = smf_self();

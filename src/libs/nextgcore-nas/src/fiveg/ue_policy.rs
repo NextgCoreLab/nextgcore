@@ -1701,16 +1701,17 @@ impl UeStateIndication {
                 return Err(NasError::InvalidIeType(iei));
             }
             let len = usize::from(r.u8()?);
-            if len == 0 || len % 16 != 0 || len > 240 {
-                return Err(NasError::DecodingError(format!(
-                    "UE OS Id contents length {len} is not a multiple of 16 in \
-                     16..=240 (D.6.6)"
-                )));
-            }
-            for _ in 0..(len / 16) {
-                let mut os_id = [0u8; 16];
-                os_id.copy_from_slice(r.take(16)?);
-                os_ids.push(os_id);
+            let contents = r.take(len)?;
+            // D.6.6: 1..=15 sixteen-octet OS Ids. Any other length makes the
+            // optional IE syntactically incorrect, so it is treated as not
+            // present (D.8.7.1, #630); its own length frames it, so the walk
+            // is unaffected. A frame past the message end is still an error.
+            if len != 0 && len % 16 == 0 && len <= 240 {
+                for chunk in contents.chunks_exact(16) {
+                    let mut os_id = [0u8; 16];
+                    os_id.copy_from_slice(chunk);
+                    os_ids.push(os_id);
+                }
             }
         }
         r.finish("UE STATE INDICATION")?;
