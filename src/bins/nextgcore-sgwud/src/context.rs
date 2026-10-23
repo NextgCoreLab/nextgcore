@@ -228,6 +228,10 @@ pub enum BufferOutcome {
     /// The FAR no longer buffers (an Update FAR switched it away from BUFF after the
     /// caller read it); the packet was NOT taken and must be re-dispatched (#823).
     NotBuffering,
+    /// The FAR just left BUFF and its queue is being flushed: the packet was queued
+    /// behind the buffered ones and the flusher forwards it, in order (#831 review).
+    /// Taken (so measured), but it starts no buffering episode (no DDN).
+    QueuedBehindFlush,
 }
 
 impl BufferOutcome {
@@ -235,13 +239,13 @@ impl BufferOutcome {
     pub fn buffered(&self) -> usize {
         match self {
             Self::Accepted { buffered } | Self::Full { buffered } => *buffered,
-            Self::NotBuffering => 0,
+            Self::NotBuffering | Self::QueuedBehindFlush => 0,
         }
     }
 
     /// Whether the packet was actually taken, i.e. whether it may be measured.
     pub fn accepted(&self) -> bool {
-        matches!(self, Self::Accepted { .. })
+        matches!(self, Self::Accepted { .. } | Self::QueuedBehindFlush)
     }
 }
 
@@ -279,6 +283,11 @@ pub struct SgwuFar {
     pub outer_header_creation: Option<(u32, Option<Ipv4Addr>, Option<Ipv6Addr>)>,
     /// Packets buffered while the action is BUFF
     pub buffered: Vec<Vec<u8>>,
+    /// Set when an Update FAR switches BUFF -> FORW with packets buffered, until the
+    /// flusher has drained the queue (#831 review). While set, a packet that was
+    /// decided against the old BUFF action joins the END of the queue instead of being
+    /// forwarded directly, so it cannot overtake the buffered packets ahead of it.
+    pub flushing: bool,
 }
 
 /// QoS Enforcement Rule (TS 29.244 §5.2.5.1, §8.2.7).
@@ -790,6 +799,12 @@ impl SgwuContext {
 
     /// Add a new session by F-SEID
     /// Port of sgwu_sess_add from context.c
+    ///
+    /// Test-only (#831 review): production must use [`Self::sess_add_for_node`], so
+    /// the session is tagged with its PFCP node as it becomes visible. Making the
+    /// untagged form unavailable outside tests is what keeps a later edit from
+    /// reintroducing the add-then-tag window at the Establishment call site.
+    #[cfg(test)]
     pub fn sess_add(&self, cp_f_seid: &FSeid) -> Option<SgwuSess> {
         self.sess_add_for_node(cp_f_seid, None)
     }
@@ -1185,7 +1200,18 @@ impl SgwuContext {
         // flushed in between, a packet pushed now would sit in a buffer nobody flushes
         // again. The caller re-applies the FAR's current action instead.
         if far.apply_action & apply_action::BUFF == 0 {
-            return Some(BufferOutcome::NotBuffering);
+            if !far.flushing {
+                return Some(BufferOutcome::NotBuffering);
+            }
+            // A flush is in progress: queue BEHIND it, so the flusher sends this packet
+            // after the ones buffered before it (order is preserved).
+            if far.buffered.len() >= capacity {
+                return Some(BufferOutcome::Full {
+                    buffered: far.buffered.len(),
+                });
+            }
+            far.buffered.push(packet);
+            return Some(BufferOutcome::QueuedBehindFlush);
         }
         if far.buffered.len() >= capacity {
             log::warn!("FAR {far_id}: buffer full at {capacity} packets, dropping packet");
@@ -1204,10 +1230,28 @@ impl SgwuContext {
         })
     }
 
-    /// Take all buffered packets from a FAR (when transitioning BUFF -> FORW)
+    /// Take all buffered packets from a FAR, discarding the queue (no GTP-U server to
+    /// flush through, BUFF -> DROP). Ends any flush in progress.
     pub fn far_take_buffered(&self, sess_id: u64, far_id: u32) -> Vec<Vec<u8>> {
         if let Ok(mut fars) = self.far_list.write() {
             if let Some(far) = fars.get_mut(&(sess_id, far_id)) {
+                far.flushing = false;
+                return std::mem::take(&mut far.buffered);
+            }
+        }
+        Vec::new()
+    }
+
+    /// The flusher's step (#831 review): take what is queued, or -- when the queue is
+    /// empty -- END the flush, in the same critical section. A packet that queued
+    /// behind the flush is therefore either taken by a later step or, once the flush
+    /// has ended, forwarded directly by its own thread; it is never left behind.
+    pub fn far_flush_step(&self, sess_id: u64, far_id: u32) -> Vec<Vec<u8>> {
+        if let Ok(mut fars) = self.far_list.write() {
+            if let Some(far) = fars.get_mut(&(sess_id, far_id)) {
+                if far.buffered.is_empty() {
+                    far.flushing = false;
+                }
                 return std::mem::take(&mut far.buffered);
             }
         }
@@ -2154,6 +2198,42 @@ mod tests {
         assert!(
             ctx.far_find(22, 1).unwrap().buffered.is_empty(),
             "nothing may be stranded in the buffer of a forwarding FAR"
+        );
+    }
+
+    /// #831 review: a packet decided against the old BUFF action while an Update FAR's
+    /// flush is in progress queues BEHIND the buffered packets, so the flusher sends
+    /// all of them in arrival order; once the flush has ended, a late packet is sent
+    /// back to be forwarded directly.
+    #[test]
+    fn a_packet_racing_a_flush_is_sent_after_the_buffered_ones() {
+        let ctx = SgwuContext::new();
+        ctx.far_install(SgwuFar {
+            sess_id: 23,
+            far_id: 1,
+            apply_action: apply_action::BUFF,
+            ..Default::default()
+        });
+        for p in [1u8, 2] {
+            ctx.far_buffer_packet(23, 1, vec![p], 8);
+        }
+        // The Update FAR's critical section: BUFF -> FORW, flush marked.
+        ctx.far_update_with(23, 1, |f| {
+            f.apply_action = apply_action::FORW;
+            f.flushing = true;
+        });
+        assert_eq!(
+            ctx.far_buffer_packet(23, 1, vec![3], 8),
+            Some(BufferOutcome::QueuedBehindFlush)
+        );
+        // The flusher drains in order, and the empty step ends the flush.
+        assert_eq!(ctx.far_flush_step(23, 1), vec![vec![1], vec![2], vec![3]]);
+        assert!(ctx.far_flush_step(23, 1).is_empty());
+        assert!(!ctx.far_find(23, 1).unwrap().flushing);
+        assert_eq!(
+            ctx.far_buffer_packet(23, 1, vec![4], 8),
+            Some(BufferOutcome::NotBuffering),
+            "after the flush a packet is forwarded directly"
         );
     }
 

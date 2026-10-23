@@ -102,22 +102,13 @@ impl GtpuServer {
                         if let Some(interval) = gtpu_echo_interval() {
                             if last_probe.elapsed() >= interval {
                                 last_probe = Instant::now();
-                                let peers = gtpu_peer_addresses();
-                                // #823: a peer no FAR references any more is not a
-                                // path we are "in contact with" (§20.3.1); its entry
-                                // goes, or the table keeps every peer ever seen.
-                                prune_gtpu_paths(&peers);
-                                for ip in peers {
-                                    // Count the PREVIOUS round's probe as missed
-                                    // before sending the next: a response since
-                                    // then has already cleared it.
-                                    note_echo_unanswered(ip);
+                                echo_round(|ip| {
                                     let dest = SocketAddr::new(ip, inner.peer_port);
                                     let echo = Gtp1Message::echo_request(0, 0).encode();
                                     if let Err(e) = inner.socket.send_to(&echo, dest) {
                                         log::warn!("GTP-U Echo Request to {dest} failed: {e}");
                                     }
-                                }
+                                });
                             }
                         }
                         match inner.socket.recv_from(&mut buf) {
@@ -210,12 +201,20 @@ impl GtpuServer {
         let Some(far) = ctx.far_find(sess_id, far_id) else {
             return 0;
         };
-        let buffered = ctx.far_take_buffered(sess_id, far_id);
+        // #831 review: drain in steps until the queue is empty, which also ends the
+        // flush (`far_flush_step`). Packets that queued behind the flush while it ran
+        // are sent after the ones ahead of them, in arrival order.
         let mut sent = 0;
-        for payload in &buffered {
-            match self.forward_gpdu(&far, payload) {
-                Ok(()) => sent += 1,
-                Err(e) => log::error!("Failed to send buffered packet: {e}"),
+        loop {
+            let batch = ctx.far_flush_step(sess_id, far_id);
+            if batch.is_empty() {
+                break;
+            }
+            for payload in &batch {
+                match self.forward_gpdu(&far, payload) {
+                    Ok(()) => sent += 1,
+                    Err(e) => log::error!("Failed to send buffered packet: {e}"),
+                }
             }
         }
         if sent > 0 {
@@ -460,7 +459,12 @@ pub fn note_echo_answered(peer: IpAddr) -> GtpuPathState {
         let Ok(mut paths) = gtpu_paths().lock() else {
             return GtpuPathState::default();
         };
-        let state = paths.entry(peer).or_default();
+        // #831 review: UPDATE an existing entry only. An Echo Response from a peer we
+        // never probed -- or a spoofed one -- has no counter to clear and no failure to
+        // recover; inserting it let any sender grow this table without bound.
+        let Some(state) = paths.get_mut(&peer) else {
+            return GtpuPathState::default();
+        };
         let recovered = state.failed;
         if recovered {
             log::warn!(
@@ -505,12 +509,30 @@ pub fn failed_gtpu_paths() -> Vec<IpAddr> {
     failed
 }
 
+/// One Echo round (TS 23.007 §20.3.1): prune the path table to the live peers,
+/// count the previous round's probe to each live peer as missed (a response since
+/// then has already cleared it), and `send` the next probe. Factored out of the
+/// receive loop so the round itself -- not just its parts -- is testable (#831).
+pub fn echo_round(mut send: impl FnMut(IpAddr)) {
+    let peers = gtpu_peer_addresses();
+    // #823: a peer no FAR references any more is not a path we are "in contact
+    // with"; its entry goes, or the table keeps every peer ever seen.
+    prune_gtpu_paths(&peers);
+    for ip in peers {
+        note_echo_unanswered(ip);
+        send(ip);
+    }
+}
+
 /// Drop the path state of every peer not in `current` -- the peers some FAR still
-/// forwards to (#823). Run before each Echo round, so the table is bounded by the
-/// live peer set instead of by every peer this process has ever forwarded to.
+/// forwards to (#823) -- EXCEPT a peer whose path is DOWN (#831 review). The table is
+/// then bounded by the live peers plus the real peers that failed, instead of by
+/// every peer ever seen. A failed path is kept because forgetting it would make the
+/// peer look healthy when FARs to it return, and the SGW-C would never receive the
+/// Recovery report (TS 23.007 §20.3.4) for the failure it was told about.
 pub fn prune_gtpu_paths(current: &[IpAddr]) {
     if let Ok(mut paths) = gtpu_paths().lock() {
-        paths.retain(|ip, _| current.contains(ip));
+        paths.retain(|ip, state| current.contains(ip) || state.failed);
     }
 }
 
@@ -829,7 +851,11 @@ fn apply_far_once(
         }
     }
 
-    if far.apply_action & apply_action::BUFF != 0 {
+    // #831 review: a FAR that just left BUFF and is still flushing takes this path
+    // too, so a packet that read the NEW (FORW) action queues behind the buffered ones
+    // instead of overtaking them; `far_buffer_packet` sends it straight back
+    // (`NotBuffering`) once the flush has ended.
+    if far.apply_action & apply_action::BUFF != 0 || far.flushing {
         let bar = ctx.bar_find_for_sess(pdr.sess_id);
         // TS 29.244 Section 8.2.48: honour the CP function's suggested packet
         // count when it gave one; the previous hardcoded 64 ignored it.
@@ -2056,6 +2082,80 @@ mod tests {
             "a peer no FAR references is dropped from the table"
         );
         forget_gtpu_path(live);
+    }
+
+    /// #831 review MAJOR 1: an Echo Response from a peer we never probed -- here 1000
+    /// of them, as a spoofing sender would produce -- inserts nothing.
+    #[test]
+    fn echo_responses_from_unknown_peers_do_not_grow_the_path_table() {
+        let _paths = GTPU_PATH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let unknown = |i: u32| IpAddr::V4(Ipv4Addr::from(0x0A_83_00_00 | i));
+        for i in 0..1000 {
+            note_echo_answered(unknown(i));
+        }
+        let left = gtpu_paths()
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|ip| (0..1000).any(|i| unknown(i) == **ip))
+            .count();
+        assert_eq!(left, 0, "no entry for a peer that was never probed");
+    }
+
+    /// #831 review MAJOR 2: the Echo ROUND prunes -- tested through `echo_round`, the
+    /// function the receive loop calls, not just the prune helper. A peer whose FAR is
+    /// gone loses its entry, a live peer is probed, and a peer whose path is DOWN is
+    /// kept (its Recovery must still be reported, TS 23.007 §20.3.4).
+    #[test]
+    fn an_echo_round_prunes_stale_peers_and_probes_live_ones() {
+        let _paths = GTPU_PATH_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ctx = sgwu_self();
+        let live_ip = Ipv4Addr::new(10, 83, 1, 1);
+        let live = IpAddr::V4(live_ip);
+        let stale = IpAddr::V4(Ipv4Addr::new(10, 83, 1, 2));
+        let down = IpAddr::V4(Ipv4Addr::new(10, 83, 1, 3));
+        let sess = ctx
+            .sess_add(&FSeid::with_ipv4(0x8311, Ipv4Addr::new(10, 83, 0, 1)))
+            .unwrap();
+        ctx.far_install(SgwuFar {
+            sess_id: sess.id,
+            far_id: 1,
+            apply_action: apply_action::FORW,
+            outer_header_creation: Some((0x831, Some(live_ip), None)),
+            ..Default::default()
+        });
+        note_echo_unanswered(stale);
+        gtpu_paths().lock().unwrap().insert(
+            down,
+            GtpuPathState {
+                failed: true,
+                ..Default::default()
+            },
+        );
+
+        let mut probed = Vec::new();
+        echo_round(|ip| probed.push(ip));
+
+        assert!(probed.contains(&live), "the live peer is probed");
+        assert!(!probed.contains(&stale));
+        let paths = gtpu_paths().lock().unwrap().clone();
+        assert!(
+            !paths.contains_key(&stale),
+            "a peer no FAR references is pruned"
+        );
+        assert!(
+            paths.contains_key(&down),
+            "a DOWN path is kept until it recovers"
+        );
+        assert_eq!(paths.get(&live).map(|s| s.unanswered), Some(1));
+
+        ctx.sess_remove(sess.id);
+        forget_gtpu_path(live);
+        forget_gtpu_path(down);
     }
 
     /// An Echo Response confirms the path and clears the counter. The old code
