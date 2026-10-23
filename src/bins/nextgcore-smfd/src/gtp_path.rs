@@ -290,9 +290,32 @@ impl GtpPathManager {
         self.gtpu_addr6 = addr6;
     }
 
-    /// Generate next sequence number
+    /// Generate the next sequence number for an initial message that is not a
+    /// Command: 1..=0x7FFFFF, wrapping back to 1 (#792 review). GTPv2-C carries
+    /// 24 bits (TS 29.274 §5.5), and §7.6 reserves the MSB for Command
+    /// exchanges, so an unbounded counter would put a Command's bit, then
+    /// truncated garbage, on the wire.
     pub fn next_sequence(&self) -> u32 {
-        self.sequence_generator.fetch_add(1, Ordering::SeqCst)
+        let max = nextgcore_gtp::v2::GTP2_MAX_INITIAL_SEQUENCE;
+        let prev = self
+            .sequence_generator
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| {
+                Some(if s == 0 || s > max {
+                    // Out of range (never in normal running): hand out 1 now
+                    // and continue from 2, so 1 is not handed out twice.
+                    2
+                } else if s == max {
+                    1
+                } else {
+                    s + 1
+                })
+            })
+            .unwrap_or(1);
+        if prev == 0 || prev > max {
+            1
+        } else {
+            prev
+        }
     }
 
     /// Generate next transaction ID
@@ -852,6 +875,23 @@ mod tests {
         assert_eq!(seq1, 1);
         assert_eq!(seq2, 2);
         assert_eq!(seq3, 3);
+    }
+
+    /// #792 review: the counter stays in the 23-bit initial space and wraps to 1,
+    /// never 0 and never with the Command MSB (TS 29.274 §7.6).
+    #[test]
+    fn the_sequence_wraps_inside_the_initial_space() {
+        let manager = GtpPathManager::new();
+        let max = nextgcore_gtp::v2::GTP2_MAX_INITIAL_SEQUENCE;
+        manager.sequence_generator.store(max - 1, Ordering::SeqCst);
+        assert_eq!(manager.next_sequence(), max - 1);
+        assert_eq!(manager.next_sequence(), max);
+        assert_eq!(manager.next_sequence(), 1, "wrapped, skipping 0");
+        assert_eq!(manager.next_sequence(), 2);
+        manager.sequence_generator.store(u32::MAX, Ordering::SeqCst);
+        let s = manager.next_sequence();
+        assert!((1..=max).contains(&s), "{s:#x}");
+        assert_ne!(manager.next_sequence(), s, "not handed out twice");
     }
 
     #[test]

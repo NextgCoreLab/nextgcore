@@ -25,8 +25,8 @@ use nextgcore_s1ap::{
     HandoverType as S1apHandoverType, InitialContextSetupFailure, InitialContextSetupResponse,
     InitialUeMessage, KillResponse, MmeStatusTransfer, NasNonDeliveryIndication, PathSwitchRequest,
     PathSwitchRequestFailure, Reset, ResetAcknowledge, ResetType, S1SetupRequest, S1apMessage,
-    SecurityContext, TargetId, TimeToWait, UeAmbr, UeCapabilityInfoIndication,
-    UeContextReleaseComplete, UeContextReleaseRequest, UlNasTransport, WriteReplaceWarningResponse,
+    SecurityContext, TargetId, TimeToWait, UeCapabilityInfoIndication, UeContextReleaseComplete,
+    UeContextReleaseRequest, UlNasTransport, WriteReplaceWarningResponse,
 };
 
 // ============================================================================
@@ -2353,10 +2353,8 @@ pub fn handle_handover_required_reporting(
         mme_ue_s1ap_id: target_mme_ue_s1ap_id,
         handover_type: msg.handover_type,
         cause: msg.cause,
-        ue_ambr: UeAmbr {
-            dl: mme_ue.ambr.downlink,
-            ul: mme_ue.ambr.uplink,
-        },
+        // #811: the UE-AMBR of the active APNs (TS 23.401 §4.7.3).
+        ue_ambr: s1ap_build::ue_ambr_of(ctx, &mme_ue),
         erab_list,
         source_to_target_container: msg.source_to_target_container.clone(),
         ue_security_capabilities: ue_security_capabilities_from(&mme_ue),
@@ -4635,6 +4633,87 @@ mod tests {
         let ctx = MmeContext::new();
         ctx.init();
         ctx
+    }
+
+    /// #811: the HANDOVER REQUEST signals the UE-AMBR of the active APNs
+    /// (TS 23.401 §4.7.3), not the subscribed value as such.
+    #[test]
+    fn the_handover_request_carries_the_ue_ambr_of_the_active_apns() {
+        use nextgcore_s1ap_gen::generated as g;
+        let ctx = test_ctx();
+        let (_enb_id, enb_ue_id, mme_ue_id, mme_ue_s1ap_id) = add_ue(&ctx);
+        let source_enb = ctx.enb_ue_find_by_id(enb_ue_id).unwrap().enb_id;
+        let sess_id = ctx.sess_add(mme_ue_id, 1);
+        let bearer_id = ctx.bearer_add(sess_id, mme_ue_id);
+        {
+            let mut pool = ctx.bearer_pool.write().unwrap();
+            let b = pool.get_mut(&bearer_id).unwrap();
+            b.ebi = 5;
+            b.qos.qci = 9;
+            b.sgw_s1u_teid = 0x811;
+            b.sgw_s1u_ip.ipv4 = Some([10, 0, 0, 2]);
+            b.enb_s1u_teid = 0x118;
+        }
+        {
+            let mut pool = ctx.sess_pool.write().unwrap();
+            let sess = pool.get_mut(&sess_id).unwrap();
+            sess.bearer_list.push(bearer_id);
+            sess.ambr.downlink = 300_000;
+            sess.ambr.uplink = 200_000;
+        }
+        ctx.mme_ue_pool
+            .write()
+            .unwrap()
+            .get_mut(&mme_ue_id)
+            .unwrap()
+            .sess_list
+            .push(sess_id);
+        let target = ctx.enb_add("127.0.0.1:36481".parse().unwrap());
+        ctx.enb_set_enb_id(target, 0x811);
+        let required = HandoverRequired {
+            mme_ue_s1ap_id,
+            enb_ue_s1ap_id: 100,
+            handover_type: nextgcore_s1ap::HandoverType::IntraLte,
+            cause: Cause::RadioNetwork(CauseRadioNetwork::Unspecified),
+            target_id: TargetId::TargetEnbId {
+                global_enb_id: GlobalEnbId {
+                    plmn_identity: [0x13, 0x00, 0x14],
+                    enb_id: EnbId::Macro(0x811),
+                },
+                selected_tai: nextgcore_s1ap::Tai {
+                    plmn_identity: [0x13, 0x00, 0x14],
+                    tac: 1,
+                },
+            },
+            direct_forwarding_path_availability: None,
+            source_to_target_container: vec![0],
+        };
+        let out = handle_handover_required(&ctx, source_enb, &required);
+        let ambr = out
+            .iter()
+            .filter(|o| o.enb_id == target)
+            .find_map(|o| match nextgcore_s1ap_gen::decode(&o.pdu) {
+                Ok(g::S1AP_PDU::InitiatingMessage(g::InitiatingMessage {
+                    value: g::InitiatingMessageValue::Id_HandoverResourceAllocation(req),
+                    ..
+                })) => req
+                    .protocol_i_es
+                    .0
+                    .into_iter()
+                    .find_map(|ie| match ie.value {
+                        g::HandoverRequestProtocolIEs_EntryValue::Id_uEaggregateMaximumBitrate(
+                            a,
+                        ) => Some((
+                            a.u_eaggregate_maximum_bit_rate_dl.0,
+                            a.u_eaggregate_maximum_bit_rate_ul.0,
+                        )),
+                        _ => None,
+                    }),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("a HANDOVER REQUEST to the target: {out:?}"));
+        // add_ue subscribes 1 Gbit/s / 500 Mbit/s; the one active APN is lower.
+        assert_eq!(ambr, (300_000, 200_000));
     }
 
     /// Whether `out` is exactly one ERROR INDICATION to `enb_id` with the

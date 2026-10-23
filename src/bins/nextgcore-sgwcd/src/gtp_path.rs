@@ -299,6 +299,38 @@ impl GtpcServer {
             .unwrap_or(nextgcore_gtp::v2::GTP2_COMMAND_SEQUENCE_FLAG | 1)
     }
 
+    /// A sequence number for an initial S11 request to `peer` (#792 review): from
+    /// [`Self::alloc_sequence`], skipping any number in use towards that peer by
+    /// an outstanding transaction or by a Command relay whose triggered message
+    /// will carry it. A legacy MME's Commands may have the MSB clear (TS 29.274
+    /// §7.6 asks for it set), so their numbers share this node's initial space.
+    pub fn alloc_sequence_to(&self, peer: SocketAddr) -> u32 {
+        // Allocation and registration are not atomic, which is fine: S11
+        // requests to a peer are originated from this node's single dispatch
+        // context, so nothing takes the number in between.
+        let mut seq = self.alloc_sequence();
+        for _ in 0..64 {
+            if !self.sequence_in_use(peer, seq) {
+                return seq;
+            }
+            seq = self.alloc_sequence();
+        }
+        log::warn!(
+            "S11 sequence space towards {peer} saturated: 64 consecutive numbers in use; \
+             using {seq} anyway"
+        );
+        seq
+    }
+
+    /// Whether `seq` towards `peer` is taken (see [`Self::alloc_sequence_to`]).
+    fn sequence_in_use(&self, peer: SocketAddr, seq: u32) -> bool {
+        self.inner
+            .xact
+            .lock()
+            .is_ok_and(|x| x.is_outstanding(peer, seq))
+            || self.command_relay_in_flight(peer, seq)
+    }
+
     /// Remember a Command relayed to `pgw_peer` at S5-C sequence `s5c_seq` (#591).
     fn record_command_relay(&self, pgw_peer: SocketAddr, s5c_seq: u32, relay: CommandRelay) {
         if let Ok(mut relays) = self.inner.command_relays.lock() {
@@ -397,7 +429,7 @@ impl GtpcServer {
 
     /// Send an Echo Request (path management, TS 29.274 Section 7.1.1)
     pub fn send_echo_request(&self, peer: SocketAddr) -> Result<u32, String> {
-        let seq = self.alloc_sequence();
+        let seq = self.alloc_sequence_to(peer);
         let mut msg = Gtp2Message::echo_request(seq);
         // Echo Request carries the sender's Recovery (M)
         let mut rec = bytes::BytesMut::new();
@@ -424,7 +456,7 @@ impl GtpcServer {
             .mme_addr
             .ok_or_else(|| "MME address unknown".to_string())?;
 
-        let seq = self.alloc_sequence();
+        let seq = self.alloc_sequence_to(peer);
         let msg = s11_build::build_downlink_data_notification(bearer, seq, cause)?;
 
         log::info!(
@@ -1006,7 +1038,7 @@ fn forward_pgw_bearer_procedure_to_mme(
     // §7.6, #591); any other is a new transaction in this node's space.
     let seq = match triggered_by {
         Some(relay) => relay.mme_seq,
-        None => server.alloc_sequence(),
+        None => server.alloc_sequence_to(mme_peer),
     };
     relayed.header.sequence_number = seq;
 
@@ -2201,6 +2233,26 @@ fn relay_command_to_pgw(
     let mme_seq = msg.header.sequence_number;
     if server.command_relay_in_flight(mme_peer, mme_seq) {
         log::debug!("{name} seq={mme_seq} from {mme_peer} is already relayed; not relayed again");
+        return;
+    }
+    // #792 review: a legacy MME's Command with the MSB clear (TS 29.274 §7.6)
+    // whose number this node is already using for its own outstanding request
+    // to that MME: the triggered Request would have to carry the same number
+    // and would replace that transaction. The Command is dropped unanswered
+    // (#872 review): a Failure Indication would close it at the MME, and be
+    // cached here against its retransmission. The MME's T3 retransmission,
+    // once the own transaction has completed, is relayed normally.
+    let own_in_use = !nextgcore_gtp::v2::is_command_sequence(mme_seq)
+        && server
+            .inner
+            .xact
+            .lock()
+            .is_ok_and(|x| x.is_outstanding(mme_peer, mme_seq));
+    if own_in_use {
+        log::warn!(
+            "{name} seq={mme_seq} from {mme_peer} has the MSB clear and clashes with an \
+             outstanding S11 request of this node; dropped until the MME retransmits it"
+        );
         return;
     }
     let mut relayed = msg.clone();
@@ -3778,6 +3830,100 @@ mod tests {
         bearer.ebi = 5;
         ctx.bearer_update(&bearer);
         (ue.id, ue.sgw_s11_teid, sess.sgw_s5c_teid)
+    }
+
+    /// #792 review: a legacy MME's Command with the MSB clear whose number this
+    /// node already uses for its own outstanding S11 request to that MME is
+    /// refused with its Failure Indication (cause Request rejected) instead of
+    /// being relayed, so the triggered Request cannot replace that transaction;
+    /// and this node's own initial requests skip numbers in use towards a peer.
+    #[test]
+    fn a_legacy_command_number_cannot_clash_with_an_own_request() {
+        let ambient = crate::pfcp_path::process_state_test_guard_blocking();
+        let server = test_server(&ambient, 2000, 3);
+        let mme = client();
+        let pgw = client();
+        pgw.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        sgwc_self().set_pgw_s5c_peer(Some(pgw.local_addr().unwrap()));
+        let (ue_id, s11_teid, _) =
+            ue_with_pgw_session(mme.local_addr().unwrap(), b"001010792000001");
+        let mme_addr = mme.local_addr().unwrap();
+
+        // This node's own request to the MME is outstanding at seq N.
+        let n = server.alloc_sequence();
+        let own = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+            Gtp2MessageType::DownlinkDataNotification as u8,
+            0x0591,
+            n,
+        ));
+        server.send_request(mme_addr, &own, 0).unwrap();
+        let _ddn = recv_msg(&mme);
+
+        // The MME's Delete Bearer Command uses the same number, MSB clear: it
+        // is dropped, with no Failure Indication (which would close it at the
+        // MME) and no relay.
+        let cmd = bearer_command(Gtp2MessageType::DeleteBearerCommand, s11_teid, n, 5);
+        mme.send_to(&cmd.encode(), server.local_addr()).unwrap();
+        mme.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let mut buf = [0u8; 2048];
+        assert!(mme.recv_from(&mut buf).is_err(), "no answer to the MME");
+        mme.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        assert!(pgw.recv_from(&mut buf).is_err(), "not relayed to the PGW");
+        assert!(
+            server
+                .inner
+                .xact
+                .lock()
+                .unwrap()
+                .is_outstanding(mme_addr, n),
+            "the own transaction is intact"
+        );
+
+        // The MME answers the own request; its retransmitted Command is then
+        // relayed.
+        let mut ack = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+            Gtp2MessageType::DownlinkDataNotificationAcknowledge as u8,
+            s11_teid,
+            n,
+        ));
+        ack.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Cause as u8, 0, &[16, 0]));
+        mme.send_to(&ack.encode(), server.local_addr()).unwrap();
+        for _ in 0..100 {
+            if !server
+                .inner
+                .xact
+                .lock()
+                .unwrap()
+                .is_outstanding(mme_addr, n)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        mme.send_to(&cmd.encode(), server.local_addr()).unwrap();
+        pgw.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let relayed = recv_msg(&pgw);
+        assert_eq!(
+            relayed.header.message_type,
+            Gtp2MessageType::DeleteBearerCommand as u8
+        );
+
+        // The allocator skips a number in use towards that peer.
+        let next = server.alloc_sequence() + 1;
+        let busy = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+            Gtp2MessageType::DownlinkDataNotification as u8,
+            0x0591,
+            next,
+        ));
+        server.send_request(mme_addr, &busy, 0).unwrap();
+        let _ = recv_msg(&mme);
+        assert_ne!(server.alloc_sequence_to(mme_addr), next);
+
+        sgwc_self().set_pgw_s5c_peer(None);
+        sgwc_self().ue_remove(ue_id);
+        server.close();
     }
 
     /// #766, TS 29.274 Tables 7.2.7-1 / 7.2.8-1: a Modify Bearer Request with
