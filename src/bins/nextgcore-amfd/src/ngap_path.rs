@@ -749,10 +749,11 @@ pub struct NgapServer {
     /// live SCTP association. `None` (the default) keeps the real transport.
     #[cfg(test)]
     sent_ngap: Option<Vec<(u64, u16, Vec<u8>)>>,
-    /// Test seam: when `Some`, the handle of the task running an NG Reset's SMF calls is
-    /// sent here, so a test can wait for it to finish (#754).
-    #[cfg(test)]
-    ng_reset_smf_done: Option<tokio::sync::mpsc::UnboundedSender<tokio::task::JoinHandle<()>>>,
+    /// The DEACTIVATED each NG Reset owes the SMF for a kept UE's PDU session, keyed by
+    /// `(AMF UE NGAP ID, PSI)` until it has run (#754). A later activation of the same
+    /// session cancels a queued one, or waits for one in flight, so the SMF never sees a
+    /// reset's DEACTIVATED after the UE's ACTIVATING.
+    ng_reset_deactivations: HashMap<(u64, u8), Arc<DeferredDeactivation>>,
     /// Test seam: the next this-many NGAP sends fail as an SCTP send error would,
     /// so a test can drive a handler's send-failure branch (#760).
     #[cfg(test)]
@@ -978,8 +979,7 @@ impl NgapServer {
             forced_amf_ue_ngap_id: None,
             #[cfg(test)]
             sent_ngap: None,
-            #[cfg(test)]
-            ng_reset_smf_done: None,
+            ng_reset_deactivations: HashMap::new(),
             #[cfg(test)]
             fail_next_sends: 0,
             event_tx,
@@ -1913,7 +1913,8 @@ impl NgapServer {
         // serves every gNB, and a whole-interface reset can name hundreds of UEs: serial
         // SMF round trips would stall N2 for all of them, and hold the Acknowledge, which
         // §8.7.4.2.2 gates on the NG resources alone. They are collected and run after the
-        // Acknowledge, off this task, at most `NG_RESET_SMF_CONCURRENCY` at a time.
+        // Acknowledge, off this task, through the shared `sbi_offload` (its permits bound
+        // every offloaded SBI exchange of this AMF, not just this reset's).
         let mut smf_work: Vec<NgResetSmfCall> = Vec::new();
         let mut idled = 0usize;
         for amf_ue_ngap_id in affected {
@@ -1967,7 +1968,7 @@ impl NgapServer {
                 None => self.forget_ue(amf_ue_ngap_id),
             }
         }
-        NG_RESET_UES_IDLED.fetch_add(idled as u64, std::sync::atomic::Ordering::Relaxed);
+        crate::metrics::global().add(crate::metrics::GlobalMetric::NgResetUeIdled, idled as u64);
 
         // Release the affected UE contexts and get the list to echo in the Ack
         let ack_connections = ngap_handler::handle_ng_reset(gnb_pool_id, &reset);
@@ -1983,16 +1984,8 @@ impl NgapServer {
             log::error!("Failed to build NG Reset Acknowledge");
         }
 
-        if !smf_work.is_empty() {
-            #[cfg(test)]
-            let done = self.ng_reset_smf_done.clone();
-            let work = tokio::spawn(run_ng_reset_smf_calls(smf_work));
-            #[cfg(test)]
-            if let Some(done) = done {
-                let _ = done.send(work);
-            }
-            #[cfg(not(test))]
-            drop(work);
+        for call in smf_work {
+            self.offload_ng_reset_smf_call(call);
         }
 
         Ok(())
@@ -5381,6 +5374,11 @@ impl NgapServer {
         for (psi, r) in moved {
             self.sm_context_refs.remove(&(old_id, psi));
             self.sm_context_refs.insert((new_id, psi), r);
+            // #754: a pending NG Reset deactivation follows the session to its new key.
+            if let Some(token) = self.ng_reset_deactivations.remove(&(old_id, psi)) {
+                token.rekey((new_id, psi));
+                self.ng_reset_deactivations.insert((new_id, psi), token);
+            }
             if let Some(owner) = self.sm_context_smfs.remove(&(old_id, psi)) {
                 self.sm_context_smfs.insert((new_id, psi), owner);
             }
@@ -5722,6 +5720,10 @@ impl NgapServer {
         for psi in &plan.activate {
             let (smf_host, smf_port) = self.smf_target_for(amf_ue_ngap_id, *psi);
             let found = held.iter().find(|(p, _, _)| p == psi).cloned();
+            // #754: no NG Reset DEACTIVATED for this session may reach the SMF after this
+            // ACTIVATING.
+            self.settle_ng_reset_deactivation(amf_ue_ngap_id, *psi)
+                .await;
             let transfer = match &found {
                 Some((_, Some(r), _)) => {
                     match crate::sbi_path::call_smf_activate_up_connection(&smf_host, smf_port, r)
@@ -5961,6 +5963,7 @@ impl NgapServer {
             connected_sessions_to_activate(amf_ue_ngap_id, &held, ies.uplink_data_status)
         {
             let (smf_host, smf_port) = self.smf_target_for(amf_ue_ngap_id, psi);
+            self.settle_ng_reset_deactivation(amf_ue_ngap_id, psi).await;
             let transfer = match crate::sbi_path::call_smf_activate_up_connection(
                 &smf_host, smf_port, &sm_ref,
             )
@@ -8006,6 +8009,9 @@ impl NgapServer {
                         log::warn!("Establishment retry outcome not applied: {e}");
                     }
                 }
+                crate::sbi_offload::SbiOutcome::NgResetDeactivated { token } => {
+                    self.ng_reset_deactivation_done(&token)
+                }
             }
         }
     }
@@ -9065,6 +9071,101 @@ impl NgapServer {
     /// PDU session of `amf_ue_ngap_id` (TS 23.502 §4.2.6 step 5, TS 29.502
     /// §5.2.2.3.2.2), once its AN release is complete (#540). Best effort: a
     /// failed deactivation is logged and the others still go.
+    /// Run one of an NG Reset's SMF calls through the shared off-task SBI dispatch
+    /// (#754). A DEACTIVATED is tracked in `ng_reset_deactivations` so a later
+    /// activation of the same session stays ordered after it.
+    fn offload_ng_reset_smf_call(&mut self, call: NgResetSmfCall) {
+        match call {
+            NgResetSmfCall::Deactivate {
+                amf_ue_ngap_id,
+                psi,
+                sm_ref,
+                host,
+                port,
+            } => {
+                let token = Arc::new(DeferredDeactivation::new((amf_ue_ngap_id, psi)));
+                if let Some(older) = self
+                    .ng_reset_deactivations
+                    .insert((amf_ue_ngap_id, psi), Arc::clone(&token))
+                {
+                    // A second reset before the first one's call ran: one is enough.
+                    older.cancel();
+                }
+                self.sbi_offload.spawn(async move {
+                    if !token.begin() {
+                        log::info!(
+                            "UE {amf_ue_ngap_id}: PSI {psi} deactivation after NG Reset \
+                             superseded by a re-activation; not sent"
+                        );
+                        return None;
+                    }
+                    match crate::sbi_path::call_smf_deactivate_up_connection(&host, port, &sm_ref)
+                        .await
+                    {
+                        Ok(()) => log::info!(
+                            "UE {amf_ue_ngap_id}: PSI {psi} user plane deactivated (NG Reset)"
+                        ),
+                        Err(e) => log::warn!(
+                            "UE {amf_ue_ngap_id}: PSI {psi} user-plane deactivation after NG \
+                             Reset failed: {e}"
+                        ),
+                    }
+                    token.finish();
+                    Some(crate::sbi_offload::SbiOutcome::NgResetDeactivated { token })
+                });
+            }
+            NgResetSmfCall::Release {
+                amf_ue_ngap_id,
+                psi,
+                sm_ref,
+                host,
+                port,
+            } => self.sbi_offload.spawn(async move {
+                match crate::sbi_path::call_smf_release_sm_context(&host, port, &sm_ref).await {
+                    Ok(()) => log::info!(
+                        "UE {amf_ue_ngap_id}: PSI {psi} released (de-registration aborted by \
+                         NG Reset)"
+                    ),
+                    Err(e) => log::warn!(
+                        "UE {amf_ue_ngap_id}: PSI {psi} release after NG Reset failed: {e}"
+                    ),
+                }
+                None
+            }),
+        }
+    }
+
+    /// Before activating `(amf_ue_ngap_id, psi)` at the SMF: make sure an NG Reset's
+    /// DEACTIVATED for it can no longer arrive afterwards (#754, review of #848). A queued
+    /// one is cancelled; one already on the wire is waited for. That wait is bounded by
+    /// the SBI client timeout and holds only this UE's procedure.
+    async fn settle_ng_reset_deactivation(&mut self, amf_ue_ngap_id: u64, psi: u8) {
+        let Some(token) = self.ng_reset_deactivations.remove(&(amf_ue_ngap_id, psi)) else {
+            return;
+        };
+        if token.cancel() {
+            log::info!(
+                "UE {amf_ue_ngap_id}: PSI {psi} re-activated before the NG Reset's \
+                 deactivation was sent; cancelled"
+            );
+            return;
+        }
+        token.finished().await;
+    }
+
+    /// An NG Reset DEACTIVATED has run: forget it, under whatever key the UE has now,
+    /// unless a newer one replaced it.
+    fn ng_reset_deactivation_done(&mut self, token: &Arc<DeferredDeactivation>) {
+        let key = token.key();
+        if self
+            .ng_reset_deactivations
+            .get(&key)
+            .is_some_and(|t| Arc::ptr_eq(t, token))
+        {
+            self.ng_reset_deactivations.remove(&key);
+        }
+    }
+
     /// Every SM context of a UE as `(psi, smContextRef, SMF host, SMF port)`: the copy a
     /// task off the NGAP loop needs to address each session at the SMF that holds it.
     fn ue_sm_contexts(&self, amf_ue_ngap_id: u64) -> Vec<(u8, String, String, u16)> {
@@ -15299,13 +15400,6 @@ pub async fn amf_ngap_poll() -> Result<bool> {
 // Tests
 // ============================================================================
 
-/// UEs an NG Reset moved to CM-IDLE, for operators: a jump is a gNB that reset with
-/// connected UEs on it (#754).
-pub static NG_RESET_UES_IDLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// At most this many SMF calls of one NG Reset run at once (#754, review of #848).
-const NG_RESET_SMF_CONCURRENCY: usize = 16;
-
 /// One SMF call an NG Reset owes, run after its Acknowledge (#754).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum NgResetSmfCall {
@@ -15328,54 +15422,96 @@ enum NgResetSmfCall {
     },
 }
 
-/// Run an NG Reset's SMF calls, `NG_RESET_SMF_CONCURRENCY` at a time.
-async fn run_ng_reset_smf_calls(calls: Vec<NgResetSmfCall>) {
-    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(NG_RESET_SMF_CONCURRENCY));
-    let mut tasks = tokio::task::JoinSet::new();
-    for call in calls {
-        let Ok(permit) = permits.clone().acquire_owned().await else {
-            break;
-        };
-        tasks.spawn(async move {
-            let _permit = permit;
-            match call {
-                NgResetSmfCall::Deactivate {
-                    amf_ue_ngap_id,
-                    psi,
-                    sm_ref,
-                    host,
-                    port,
-                } => match crate::sbi_path::call_smf_deactivate_up_connection(&host, port, &sm_ref)
-                    .await
-                {
-                    Ok(()) => log::info!(
-                        "UE {amf_ue_ngap_id}: PSI {psi} user plane deactivated (NG Reset)"
-                    ),
-                    Err(e) => log::warn!(
-                        "UE {amf_ue_ngap_id}: PSI {psi} user-plane deactivation after NG Reset \
-                         failed: {e}"
-                    ),
-                },
-                NgResetSmfCall::Release {
-                    amf_ue_ngap_id,
-                    psi,
-                    sm_ref,
-                    host,
-                    port,
-                } => match crate::sbi_path::call_smf_release_sm_context(&host, port, &sm_ref).await
-                {
-                    Ok(()) => log::info!(
-                        "UE {amf_ue_ngap_id}: PSI {psi} released (de-registration aborted by NG \
-                         Reset)"
-                    ),
-                    Err(e) => log::warn!(
-                        "UE {amf_ue_ngap_id}: PSI {psi} release after NG Reset failed: {e}"
-                    ),
-                },
-            }
-        });
+/// Where an NG Reset's deferred DEACTIVATED for one PDU session is (#754).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeferredState {
+    /// Waiting for an offload permit; not sent.
+    Queued,
+    /// On the wire.
+    Sending,
+    /// Answered, or failed.
+    Finished,
+    /// Superseded before it was sent: it never will be.
+    Cancelled,
+}
+
+/// The NGAP task's handle on a deferred DEACTIVATED, shared with the task that sends it.
+/// It is what keeps a reset's DEACTIVATED ordered before the UE's next ACTIVATING for
+/// the same session: [`NgapServer::settle_ng_reset_deactivation`] cancels it while it is
+/// queued, and waits for it once it is on the wire.
+#[derive(Debug)]
+pub(crate) struct DeferredDeactivation {
+    state: std::sync::Mutex<DeferredState>,
+    finished: tokio::sync::Notify,
+    /// Its current key in `ng_reset_deactivations`: a Service Request re-keys the UE
+    /// while the call is pending.
+    key: std::sync::Mutex<(u64, u8)>,
+}
+
+impl DeferredDeactivation {
+    fn new(key: (u64, u8)) -> Self {
+        Self {
+            state: std::sync::Mutex::new(DeferredState::Queued),
+            finished: tokio::sync::Notify::new(),
+            key: std::sync::Mutex::new(key),
+        }
     }
-    while tasks.join_next().await.is_some() {}
+
+    fn key(&self) -> (u64, u8) {
+        *self.key.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn rekey(&self, key: (u64, u8)) {
+        *self.key.lock().unwrap_or_else(|e| e.into_inner()) = key;
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, DeferredState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The sender's step: go on the wire, unless cancelled first.
+    fn begin(&self) -> bool {
+        let mut state = self.lock();
+        if *state == DeferredState::Queued {
+            *state = DeferredState::Sending;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn finish(&self) {
+        *self.lock() = DeferredState::Finished;
+        self.finished.notify_waiters();
+    }
+
+    /// Cancel it if it has not been sent; `false` if it is on the wire or done.
+    fn cancel(&self) -> bool {
+        let mut state = self.lock();
+        match *state {
+            DeferredState::Queued => {
+                *state = DeferredState::Cancelled;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Wait until it is answered (or cancelled).
+    async fn finished(&self) {
+        loop {
+            let notified = self.finished.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if matches!(
+                *self.lock(),
+                DeferredState::Finished | DeferredState::Cancelled
+            ) {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 /// Which NAS procedure an NG release aborted, when its abort is more than dropping the
@@ -19638,8 +19774,6 @@ mod tests {
         let _env = SmfEnvGuard::set(port);
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = capturing_ngap_server().await;
-        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
-        ngap.ng_reset_smf_done = Some(done_tx);
         let (assoc, other_assoc) = (754_001u64, 754_002u64);
         seed_gnb_session(&ngap, assoc).await;
         seed_gnb_session(&ngap, other_assoc).await;
@@ -19697,12 +19831,7 @@ mod tests {
             };
             ngap.handle_ng_reset(assoc, &pdu).await.expect("handled");
             // The SMF calls run after the Acknowledge, off the NGAP task.
-            done_rx
-                .recv()
-                .await
-                .expect("SMF work spawned")
-                .await
-                .expect("SMF work ran");
+            ngap.sbi_offload.settle().await;
 
             let state = ngap
                 .ue_auth_state
@@ -19783,20 +19912,18 @@ mod tests {
 
     /// **#754, review of #848 (M1).** A whole-interface NG Reset with many connected UEs
     /// answers the gNB at once: the Acknowledge does not wait for the SMF, and the
-    /// deactivations run off the NGAP task, at most `NG_RESET_SMF_CONCURRENCY` at a time.
-    /// The stand-in SMF takes 1.5 s per call; 40 UEs with two sessions each would hold the
-    /// Ack for two minutes if the calls ran serially before it.
+    /// deactivations run off the NGAP task through the shared `sbi_offload`, at most
+    /// `MAX_OFFLOADED_SBI` at a time. The stand-in SMF takes 1 s per call; 40 UEs with two
+    /// sessions each would hold the Ack for 80 s if the calls ran serially before it.
     ///
     /// REVERT-VERIFIED: awaiting the SMF work before the Ack makes the handler take
     /// longer than the bound.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_ng_reset_is_acknowledged_before_the_smf_answers() {
-        let (_nf, port, seen) = slow_recording_nf(Duration::from_millis(1500)).await;
+        let (_nf, port, seen) = slow_recording_nf(Duration::from_millis(1000)).await;
         let _env = SmfEnvGuard::set(port);
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = capturing_ngap_server().await;
-        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
-        ngap.ng_reset_smf_done = Some(done_tx);
         let assoc = 754_011u64;
         seed_gnb_session(&ngap, assoc).await;
         let ues: Vec<u64> = (0..40).map(|i| 7_754_100 + i).collect();
@@ -19831,15 +19958,15 @@ mod tests {
             assert!(ngap.ue_auth_state.get(ue).expect("kept").is_cm_idle());
         }
 
-        // Bounded concurrency: 80 calls at 16 at a time is five waves of 1.5 s.
-        let work = done_rx.recv().await.expect("SMF work spawned");
+        // Bounded concurrency: 80 calls at 16 at a time is five waves of the SMF's delay.
         tokio::time::sleep(Duration::from_millis(500)).await;
         let in_first_wave = seen.lock().expect("seen").len();
         assert!(
-            (1..=NG_RESET_SMF_CONCURRENCY).contains(&in_first_wave),
+            (1..=MAX_OFFLOADED_SBI).contains(&in_first_wave),
             "{in_first_wave} calls in flight at once"
         );
-        work.await.expect("SMF work ran");
+        assert_eq!(ngap.sbi_offload.in_flight(), MAX_OFFLOADED_SBI);
+        ngap.sbi_offload.settle().await;
         assert_eq!(
             seen.lock().expect("seen").len(),
             80,
@@ -19847,6 +19974,204 @@ mod tests {
         );
         for &ue in &ues {
             ngap.ue_auth_state.remove(ue);
+        }
+    }
+
+    /// A stand-in SMF that answers after `delay`, recording `(smContextRef, upCnxState,
+    /// arrival)` as each UpdateSMContext ARRIVES. ACTIVATING is answered with an N2 SM
+    /// container, everything else with 204.
+    async fn slow_up_cnx_smf(
+        delay: Duration,
+    ) -> (
+        nextgcore_sbi::server::SbiServer,
+        u16,
+        Arc<std::sync::Mutex<Vec<(String, String, Instant)>>>,
+    ) {
+        use base64::Engine as _;
+        use nextgcore_sbi::message::{SbiRequest as SReq, SbiResponse as SResp};
+        use nextgcore_sbi::server::{SbiServer as NSbiServer, SbiServerConfig as NSbiCfg};
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let seen: Arc<std::sync::Mutex<Vec<(String, String, Instant)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let (addr_listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = NSbiServer::on_listener(NSbiCfg::new(addr), addr_listener);
+        server
+            .start(move |req: SReq| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    let sm_ref = req
+                        .header
+                        .uri
+                        .split("/sm-contexts/")
+                        .nth(1)
+                        .and_then(|rest| rest.split('/').next())
+                        .unwrap_or_default()
+                        .to_string();
+                    let body: serde_json::Value = req
+                        .http
+                        .content
+                        .as_deref()
+                        .and_then(|c| serde_json::from_str(c).ok())
+                        .unwrap_or_default();
+                    let state = body["upCnxState"].as_str().unwrap_or("-").to_string();
+                    sink.lock()
+                        .expect("sink")
+                        .push((sm_ref, state.clone(), Instant::now()));
+                    tokio::time::sleep(delay).await;
+                    if state != "ACTIVATING" {
+                        return SResp::no_content();
+                    }
+                    let n2 = base64::engine::general_purpose::STANDARD.encode([0xA5, 0x75, 0x04]);
+                    SResp::with_status(200).with_body(
+                        serde_json::json!({
+                            "upCnxState": "ACTIVATING",
+                            "n2SmInfoType": "PDU_RES_SETUP_REQ",
+                            "n2SmInfo": n2,
+                        })
+                        .to_string(),
+                        "application/json",
+                    )
+                }
+            })
+            .await
+            .expect("stand-in SMF starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (server, addr.port(), seen)
+    }
+
+    /// **#754, review of #848 round 2 (M1).** A reset's deferred DEACTIVATED never reaches
+    /// the SMF after the UE's own ACTIVATING for the same session. 40 UEs with PSIs 5 and
+    /// 6 are reset against an SMF that takes 1 s per call, so 16 deactivations are on the
+    /// wire and 64 are queued. Two of the UEs then come back with a Service Request
+    /// activating PSI 5:
+    /// - one whose PSI 5 deactivation is QUEUED: it is cancelled and never sent;
+    /// - one whose PSI 5 deactivation is IN FLIGHT: the ACTIVATING goes out only after it
+    ///   is answered.
+    ///
+    /// PSI 6, not activated, is still deactivated for both.
+    ///
+    /// REVERT-VERIFIED: without `settle_ng_reset_deactivation` the queued UE's SMF sees
+    /// `["ACTIVATING", "DEACTIVATED"]`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reset_deactivation_never_overtakes_the_ues_reactivation() {
+        let delay = Duration::from_millis(1000);
+        let (_smf, port, seen) = slow_up_cnx_smf(delay).await;
+        let _env = SmfEnvGuard::set(port);
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = capturing_ngap_server().await;
+        let assoc = 754_051u64;
+        seed_gnb_session(&ngap, assoc).await;
+        let ues: Vec<u64> = (0..40).map(|i| 7_754_500 + i).collect();
+        for &ue in &ues {
+            let mut state = idle_registered_ue(ue);
+            state.cm_idle = false;
+            state.reachability = None;
+            state.association_id = assoc;
+            ngap.ue_auth_state.insert(ue, state);
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap();
+            for psi in [5u8, 6] {
+                guard.sess_add(ue, psi).expect("session");
+                ngap.sm_context_refs
+                    .insert((ue, psi), format!("ref-754-{ue}-{psi}"));
+                ngap.sm_context_smfs
+                    .insert((ue, psi), ("127.0.0.1".to_string(), port));
+            }
+        }
+
+        ngap.handle_ng_reset(
+            assoc,
+            &ng_reset_pdu(nextgcore_ngap::types::ResetType::NgInterface),
+        )
+        .await
+        .expect("handled");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Which PSI 5 deactivations are on the wire now, and which are still queued.
+        let arrived: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(r, _, _)| r.clone())
+            .collect();
+        let ref5 = |ue: u64| format!("ref-754-{ue}-5");
+        let in_flight = *ues
+            .iter()
+            .find(|&&ue| arrived.contains(&ref5(ue)))
+            .expect("some PSI 5 deactivation is in flight");
+        let queued = *ues
+            .iter()
+            .find(|&&ue| {
+                !arrived.contains(&ref5(ue)) && !arrived.contains(&format!("ref-754-{ue}-6"))
+            })
+            .expect("some UE's deactivations are all still queued");
+
+        for (n, &ue) in [queued, in_flight].iter().enumerate() {
+            ngap.forced_amf_ue_ngap_id = Some(7_754_900 + n as u64);
+            let tmsi = ue as u32;
+            // Data (1), uplink data status PSI 5, PDU session status PSI 5 and 6.
+            let mut inner = vec![0x7E, 0x00, 0x4C, 0x10, 0x00, 0x07, 0xF4, 0x55, 0x6A];
+            inner.extend_from_slice(&tmsi.to_be_bytes());
+            inner.extend_from_slice(&[0x40, 0x02, 0x20, 0x00, 0x50, 0x02, 0x60, 0x00]);
+            let mut nas = protected_service_request([0; 4], tmsi);
+            nas.extend_from_slice(&[0x71, 0x00, inner.len() as u8]);
+            nas.extend_from_slice(&inner);
+            let _ = ngap
+                .handle_initial_ue_message(1, &service_request_initial_ue(nas))
+                .await;
+        }
+        ngap.sbi_offload.settle().await;
+        ngap.process_sbi_outcomes().await;
+
+        let seen = seen.lock().unwrap().clone();
+        let states = |r: &str| -> Vec<(String, Instant)> {
+            seen.iter()
+                .filter(|(x, _, _)| x == r)
+                .map(|(_, s, t)| (s.clone(), *t))
+                .collect()
+        };
+        let q = states(&ref5(queued));
+        assert_eq!(
+            q.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(),
+            vec!["ACTIVATING"],
+            "a queued reset deactivation is cancelled by the re-activation"
+        );
+        let f = states(&ref5(in_flight));
+        assert_eq!(
+            f.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(),
+            vec!["DEACTIVATED", "ACTIVATING"],
+            "an in-flight one is answered before the ACTIVATING goes out"
+        );
+        assert!(
+            f[1].1.duration_since(f[0].1) >= delay - Duration::from_millis(50),
+            "the ACTIVATING waited for the DEACTIVATED's answer"
+        );
+        for ue in [queued, in_flight] {
+            assert_eq!(
+                states(&format!("ref-754-{ue}-6"))
+                    .iter()
+                    .map(|(s, _)| s.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["DEACTIVATED"],
+                "PSI 6 was not re-activated, so its deactivation stands"
+            );
+        }
+        assert!(
+            ngap.ng_reset_deactivations.is_empty(),
+            "every deferred deactivation is accounted for"
+        );
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap();
+        for ue in ues.iter().copied().chain([7_754_900, 7_754_901]) {
+            ngap.ue_auth_state.remove(ue);
+            for sess in guard.sess_list_for_ue(ue) {
+                guard.sess_remove(sess.id);
+            }
         }
     }
 
@@ -19870,8 +20195,6 @@ mod tests {
         let _env = SmfEnvGuard::set(port);
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = capturing_ngap_server().await;
-        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
-        ngap.ng_reset_smf_done = Some(done_tx);
         let (first, second) = (754_041u64, 754_042u64);
         seed_gnb_session(&ngap, first).await;
         seed_gnb_session(&ngap, second).await;
@@ -19893,7 +20216,6 @@ mod tests {
         let whole = ng_reset_pdu(nextgcore_ngap::types::ResetType::NgInterface);
         let started = Instant::now();
         ngap.handle_ng_reset(first, &whole).await.expect("handled");
-        let hanging = done_rx.recv().await.expect("SMF work spawned");
         // The task is free: the next gNB's reset is served at once.
         ngap.handle_ng_reset(second, &whole).await.expect("handled");
         assert!(
@@ -19908,8 +20230,11 @@ mod tests {
             "both Acknowledges"
         );
         assert!(ngap.ue_auth_state.get(b).expect("kept").is_cm_idle());
-        assert!(!hanging.is_finished(), "the SMF call is still hanging");
-        hanging.abort();
+        assert_eq!(
+            ngap.sbi_offload.in_flight(),
+            1,
+            "the SMF call is still hanging"
+        );
         holder.abort();
         for id in [a, b] {
             ngap.ue_auth_state.remove(id);
@@ -19936,8 +20261,6 @@ mod tests {
         let _env = SmfEnvGuard::set(port);
         crate::context::amf_context_init(64, 1024, 4096);
         let mut ngap = capturing_ngap_server().await;
-        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
-        ngap.ng_reset_smf_done = Some(done_tx);
         let (assoc, target) = (754_021u64, 754_022u64);
         seed_gnb_session(&ngap, assoc).await;
         seed_gnb_session(&ngap, target).await;
@@ -19969,12 +20292,7 @@ mod tests {
         )
         .await
         .expect("handled");
-        done_rx
-            .recv()
-            .await
-            .expect("SMF work spawned")
-            .await
-            .expect("SMF work ran");
+        ngap.sbi_offload.settle().await;
         let sent = take_sent_ngap(&mut ngap);
         assert_eq!(
             sent.len(),

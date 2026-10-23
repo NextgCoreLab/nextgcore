@@ -19,6 +19,10 @@ use tokio::sync::{mpsc, Semaphore};
 pub(crate) enum SbiOutcome {
     /// #796: a re-selection attempt for a waiting PDU Session Establishment.
     Establishment(crate::ngap_path::EstablishmentAttempt),
+    /// #754: an NG Reset's deferred DEACTIVATED for one PDU session has run.
+    NgResetDeactivated {
+        token: std::sync::Arc<crate::ngap_path::DeferredDeactivation>,
+    },
 }
 
 /// Spawner of off-task SBI work, owned by the NGAP server.
