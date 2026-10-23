@@ -461,14 +461,30 @@ pub fn ue_ambr(
         ul = ul.saturating_add(a.uplink);
     }
     let cap = |sum: u64, sub: u64| match (sum, sub) {
+        // Neither known: 0 would tell the eNB to allow nothing (the IE is
+        // mandatory in Initial Context Setup and Handover Request), so the
+        // maximum the IE can carry (TS 36.413 §9.2.1.20, 10 Tbit/s) is sent and
+        // enforcement is left to the gateways' APN-AMBR (#869 review).
+        (0, 0) => UE_AMBR_UNKNOWN,
         (0, s) | (s, 0) => s,
         (s, sub) => s.min(sub),
     };
-    UeAmbr {
+    let ambr = UeAmbr {
         dl: cap(dl, subscribed.downlink),
         ul: cap(ul, subscribed.uplink),
+    };
+    if ambr.dl == UE_AMBR_UNKNOWN || ambr.ul == UE_AMBR_UNKNOWN {
+        log::warn!(
+            "UE-AMBR unknown in a direction (no subscribed UE-AMBR and no APN-AMBR): signalling \
+             the maximum, {UE_AMBR_UNKNOWN} bit/s"
+        );
     }
+    ambr
 }
+
+/// The UE-AMBR signalled when neither the subscription nor any APN-AMBR gives
+/// one: the largest Bit Rate (TS 36.413 §9.2.1.20, 0..10,000,000,000,000).
+pub const UE_AMBR_UNKNOWN: u64 = 10_000_000_000_000;
 
 /// [`ue_ambr`] for `mme_ue`'s ACTIVE PDN connections: those whose bearers have a
 /// Serving GW S1-U endpoint (a Create Session completed). `sess_list` also holds
@@ -714,6 +730,25 @@ pub fn build_ue_context_modification_for_csfb(
         } else {
             CsFallbackIndicator::CsFallbackRequired
         }),
+        ue_security_capabilities: None,
+    })
+    .map_err(gen_err)
+}
+
+/// Build a UE CONTEXT MODIFICATION REQUEST carrying only a new UE-AMBR
+/// (TS 36.413 §8.3.4, #811): the HSS-initiated subscribed QoS modification of
+/// TS 23.401 §5.4.2.2, when only the UE-AMBR changes.
+pub fn build_ue_context_modification_for_ue_ambr(
+    enb_ue: &EnbUe,
+    ue_ambr: UeAmbr,
+) -> S1apResult<Vec<u8>> {
+    crate::s1ap_gen::build_ue_context_modification_request(&UeContextModificationRequest {
+        mme_ue_s1ap_id: enb_ue.mme_ue_s1ap_id,
+        enb_ue_s1ap_id: enb_ue.enb_ue_s1ap_id,
+        security_key: None,
+        subscriber_profile_id_for_rfp: None,
+        ue_ambr: Some(ue_ambr),
+        cs_fallback_indicator: None,
         ue_security_capabilities: None,
     })
     .map_err(gen_err)
@@ -1023,6 +1058,14 @@ mod tests {
             ue_ambr(&b(0, 0), [b(7, 3)]),
             UeAmbr { dl: 7, ul: 3 },
             "none subscribed"
+        );
+        assert_eq!(
+            ue_ambr(&b(0, 0), []),
+            UeAmbr {
+                dl: UE_AMBR_UNKNOWN,
+                ul: UE_AMBR_UNKNOWN
+            },
+            "nothing known: the maximum, never 0 bit/s"
         );
         assert_eq!(
             ue_ambr(&b(u64::MAX, u64::MAX), [b(u64::MAX, 1), b(1, 1)]),
