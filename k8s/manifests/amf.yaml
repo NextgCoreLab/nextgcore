@@ -31,6 +31,10 @@ metadata:
     app.kubernetes.io/part-of: nextgcore
 spec:
   replicas: 1
+  # #753: one pinned nfInstanceId, so one pod and no overlapping rollout. The old
+  # pod's NFDeregister would remove the new pod's NRF profile.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: amf
@@ -73,6 +77,11 @@ spec:
               value: "dev"
             - name: RUST_LOG
               value: info
+            # #753: a stable nfInstanceId for the UDM and the NRF. Unpinned, each
+            # restart was a "new AMF", and the UDM's UE_INITIAL_REGISTRATION
+            # dereg-notify tore down re-registering UEs.
+            - name: NEXTGCORE_AMF_INSTANCE_ID
+              value: "6b1d7e3c-0000-4000-8000-000000000af0"
             - name: RUST_BACKTRACE
               value: "1"
             # The pod IP, NOT 0.0.0.0. Unlike every other NF, the AMF takes its
