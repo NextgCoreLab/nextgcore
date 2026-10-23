@@ -1056,10 +1056,14 @@ async fn a_late_success_for_an_earlier_request_is_released_not_applied() {
         })
         .await
         .expect("applied");
+    // #877 re-review m1/M1: the release is DURABLE keyed work. The window
+    // ending for this PSI supersedes its attempts, and the UE then leaves;
+    // neither may drop the release, or the context leaks at the SMF.
+    server.sbi_offload.supersede_key((ue, 5));
+    server.sbi_offload.cancel_ue(ue);
     server.sbi_offload.settle().await;
 
     assert!(take_sent_ngap(&mut server).is_empty(), "nothing set up");
-    assert!(server.pending_establishments.contains_key(&(ue, 5)));
     assert!(!server.sm_context_refs.contains_key(&(ue, 5)));
     assert!(
         seen.lock()
@@ -1116,4 +1120,121 @@ async fn defer_request(server: &mut NgapServer, ue: u64, ran: u32, request: &[u8
         )
         .await
         .expect("deferred");
+}
+
+/// A stand-in that accepts the TCP connection, holds it for `hold`, then drops
+/// it: a transport failure the AMF classifies as "no SMF reachable", but one
+/// that takes measurable time, so a test can tell the request's arrival from
+/// the moment its first attempt failed. Returns its port and a stop flag.
+async fn slow_to_fail_smf(hold: Duration) -> (u16, Arc<std::sync::atomic::AtomicBool>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    tokio::spawn(async move {
+        while !flag.load(std::sync::atomic::Ordering::Acquire) {
+            let Ok(Ok((sock, _))) =
+                tokio::time::timeout(Duration::from_secs(5), listener.accept()).await
+            else {
+                continue;
+            };
+            tokio::spawn(async move {
+                tokio::time::sleep(hold).await;
+                drop(sock);
+            });
+        }
+    });
+    (port, stop)
+}
+
+/// #877 re-review m2: the re-selection window runs from the request's ARRIVAL,
+/// pinned through `handle_uplink_nas_transport` rather than at `defer_establishment`.
+///
+/// The first attempt is made inline and takes `HOLD` to fail, so a window
+/// started at the deferral (`Instant::now()` there) would be `HOLD` shorter.
+/// The assertion is on the recorded start, which must be within a few ms of the
+/// instant before the handler was called.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn the_window_runs_from_arrival_through_the_uplink_nas_handler() {
+    const HOLD: Duration = Duration::from_millis(400);
+    let (port, stop) = slow_to_fail_smf(HOLD).await;
+    let _env = super::SmfEnvGuard::set(port);
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_796_020u64, 105);
+    ue_ready_for_sessions(&mut server, ue, ran);
+
+    let before = std::time::Instant::now();
+    server
+        .handle_uplink_nas_transport(
+            ASSOC,
+            &uplink_nas_transport(ue, ran, &[0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF]),
+        )
+        .await
+        .expect("handled");
+    let after = std::time::Instant::now();
+    let inline = after.duration_since(before);
+    assert!(
+        inline >= HOLD,
+        "the fixture must make the first attempt take time: {inline:?}"
+    );
+    let started = server.pending_establishments[&(ue, 5)].first_failure;
+    assert!(
+        started.duration_since(before) < Duration::from_millis(100),
+        "the window must start at arrival ({:?} after it), not when the first \
+         attempt failed ({inline:?} after it)",
+        started.duration_since(before)
+    );
+
+    server.forget_ue(ue);
+    stop.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// #877 re-review m1: a UE that goes CM-IDLE while an attempt is still waiting
+/// for a concurrency permit frees the PSI's key at once, so a later request for
+/// that session is not queued behind an attempt nobody waits for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn going_cm_idle_cancels_an_attempt_that_never_started() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    drop(listener);
+    let _env = super::SmfEnvGuard::set(port);
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_796_021u64, 106);
+    ue_ready_for_sessions(&mut server, ue, ran);
+    defer_request(&mut server, ue, ran, &[0x2E, 0x05, 0x01, 0xC1, 0xFF, 0xFF]).await;
+
+    // Every permit is taken by other UEs' hanging exchanges, so this UE's next
+    // attempt is spawned and waits.
+    for other in 0..MAX_OFFLOADED_SBI as u64 {
+        server
+            .sbi_offload
+            .spawn_keyed((7_796_900 + other, 1), || async {
+                std::future::pending::<()>().await;
+                None
+            });
+    }
+    until_in_flight(&server, MAX_OFFLOADED_SBI).await;
+    make_establishments_due(&mut server);
+    server.process_pending_establishments().await;
+    assert!(
+        server.sbi_offload.key_busy((ue, 5)),
+        "the attempt is waiting"
+    );
+
+    server.ue_auth_state.with_mut(ue, |s| s.cm_idle = true);
+    server.process_pending_establishments().await;
+
+    assert!(!server.pending_establishments.contains_key(&(ue, 5)));
+    assert!(
+        !server.sbi_offload.key_busy((ue, 5)),
+        "an attempt that never started must not keep the session's key"
+    );
+    for other in 0..MAX_OFFLOADED_SBI as u64 {
+        server.forget_ue(7_796_900 + other);
+    }
+    server.forget_ue(ue);
 }

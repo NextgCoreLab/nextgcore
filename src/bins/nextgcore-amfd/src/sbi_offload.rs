@@ -15,11 +15,24 @@
 //!   pair: at most one exchange per key runs, the rest wait in submission order,
 //!   so two exchanges for one PDU session reach the peer in the order they were
 //!   submitted (#796 re-review M1: a late DEACTIVATED must not overtake a later
-//!   ACTIVATING). [`SbiOffload::supersede_key`] drops the queued ones that a
-//!   newer decision makes moot; [`SbiOffload::settle_key`] also waits for the
-//!   running one; [`SbiOffload::cancel_ue`] (from `forget_ue`) aborts a departed
-//!   UE's work and frees its permits; [`SbiOffload::rekey_ue`] follows a UE that
-//!   moved to a new AMF UE NGAP ID.
+//!   ACTIVATING). [`SbiOffload::supersede_key`] drops the work for a key that a
+//!   newer decision makes moot and that has not STARTED; [`SbiOffload::settle_key`]
+//!   also waits, bounded, for the one that has; [`SbiOffload::cancel_ue`] (from
+//!   `forget_ue`) aborts a departed UE's work and frees its permits;
+//!   [`SbiOffload::rekey_ue`] follows a UE that moved to a new AMF UE NGAP ID.
+//! - [`SbiOffload::spawn_keyed_durable`] is keyed work that nothing drops: the
+//!   release of a context nobody will use must reach the peer whatever the UE
+//!   does next. Neither `supersede_key`, `settle_key` nor `cancel_ue` drops it,
+//!   so a departed UE's release is still sent.
+//!
+//! # Started means holding a permit (#877 re-review M1)
+//! A keyed job is STARTED only once its task holds a concurrency permit: then,
+//! and only then, its work is built and sent. Until then it is WAITING, and
+//! `supersede_key`, `settle_key` and `cancel_ue` cancel it outright, so a
+//! superseded exchange never reaches the peer even when every permit is taken
+//! (a blackholed peer, exactly when this helper matters). The switch is one
+//! compare-and-swap on the job's state, so a job is either cancelled before it
+//! builds anything or runs to completion, never both.
 //!
 //! Every method is called from the NGAP task (it owns the `SbiOffload`), so the
 //! per-key bookkeeping needs no lock: a finished keyed exchange reports back over
@@ -59,11 +72,46 @@ enum Report {
     },
 }
 
+/// A keyed job's state, shared by the NGAP task and the job's own task.
+const WAITING: u8 = 0;
+const STARTED: u8 = 1;
+const CANCELLED: u8 = 2;
+
+/// The keyed job that is next for its key: spawned, and either waiting for a
+/// permit or started.
+struct Running {
+    id: u64,
+    handle: JoinHandle<()>,
+    state: Arc<std::sync::atomic::AtomicU8>,
+    durable: bool,
+}
+
+impl Running {
+    /// Cancel the job if it has not started. True when it was cancelled, so it
+    /// will never build or send anything.
+    fn cancel_if_waiting(&self) -> bool {
+        let cancelled = self
+            .state
+            .compare_exchange(
+                WAITING,
+                CANCELLED,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok();
+        if cancelled {
+            // It is parked on the semaphore: let go of its place in the queue.
+            self.handle.abort();
+        }
+        cancelled
+    }
+}
+
 #[derive(Default)]
 struct KeyQueue {
-    /// The running exchange: its id and the handle that aborts it.
-    running: Option<(u64, JoinHandle<()>)>,
-    queued: VecDeque<Job>,
+    running: Option<Running>,
+    /// Not yet spawned, in submission order; `true` marks durable work.
+    queued: VecDeque<(Job, bool)>,
 }
 
 /// Spawner of off-task SBI work, owned by the NGAP server.
@@ -78,6 +126,15 @@ pub(crate) struct SbiOffload {
     ready: VecDeque<SbiOutcome>,
     /// Spawned and not yet finished, permit or not (for [`SbiOffload::settle`]).
     spawned: Arc<std::sync::atomic::AtomicUsize>,
+    /// Tasks that have reached the semaphore and not yet taken a permit.
+    ///
+    /// A test-only observable, and the one the #877 M1 reproduction needs:
+    /// "spawned but not holding a permit" also counts a task that has not been
+    /// polled at all, and superseding THAT proves nothing — such a job is
+    /// cancelled before it could mark itself started either way. This counts
+    /// only tasks really parked on the permit.
+    #[cfg(test)]
+    at_the_gate: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl std::fmt::Debug for SbiOffload {
@@ -103,6 +160,8 @@ impl SbiOffload {
             next_job: 1,
             ready: VecDeque::new(),
             spawned: Arc::default(),
+            #[cfg(test)]
+            at_the_gate: Arc::default(),
         }
     }
 
@@ -113,52 +172,100 @@ impl SbiOffload {
     where
         F: Future<Output = Option<SbiOutcome>> + Send + 'static,
     {
-        self.start(Box::pin(fut), None);
+        self.start(None, Box::new(move || Box::pin(fut) as BoxedWork));
     }
 
     /// Run the work `make` builds after every earlier keyed work for `key` has
-    /// finished (or been superseded / cancelled). The caller never awaits.
+    /// finished (or been superseded / cancelled). `make` is called only once the
+    /// job holds a permit. The caller never awaits.
     pub(crate) fn spawn_keyed<M, F>(&mut self, key: SbiKey, make: M)
     where
         M: FnOnce() -> F + Send + 'static,
         F: Future<Output = Option<SbiOutcome>> + Send + 'static,
     {
-        let job: Job = Box::new(move || Box::pin(make()) as BoxedWork);
+        self.enqueue(key, Box::new(move || Box::pin(make()) as BoxedWork), false);
+    }
+
+    /// [`SbiOffload::spawn_keyed`] for work that must reach the peer whatever
+    /// happens next: neither `supersede_key`, `settle_key` nor `cancel_ue` drops
+    /// it. For cleanup such as releasing a context nobody will use.
+    pub(crate) fn spawn_keyed_durable<M, F>(&mut self, key: SbiKey, make: M)
+    where
+        M: FnOnce() -> F + Send + 'static,
+        F: Future<Output = Option<SbiOutcome>> + Send + 'static,
+    {
+        self.enqueue(key, Box::new(move || Box::pin(make()) as BoxedWork), true);
+    }
+
+    fn enqueue(&mut self, key: SbiKey, job: Job, durable: bool) {
         let queue = self.keys.entry(key).or_default();
-        queue.queued.push_back(job);
+        queue.queued.push_back((job, durable));
         if queue.running.is_none() {
             self.start_next(key);
         }
     }
 
-    /// Drop the keyed work for `key` that has not started. The running exchange,
-    /// if any, is left to finish.
+    /// Drop the keyed work for `key` that has not started: the queued work and a
+    /// job still waiting for a permit. Durable work stays. A started exchange is
+    /// left to finish; its outcome is still delivered.
     pub(crate) fn supersede_key(&mut self, key: SbiKey) {
-        if let Some(queue) = self.keys.get_mut(&key) {
-            queue.queued.clear();
-            if queue.running.is_none() {
-                self.keys.remove(&key);
+        let Some(queue) = self.keys.get_mut(&key) else {
+            return;
+        };
+        queue.queued.retain(|(_, durable)| *durable);
+        let cancelled = queue
+            .running
+            .as_ref()
+            .is_some_and(|r| !r.durable && r.cancel_if_waiting());
+        if cancelled {
+            queue.running = None;
+            // Durable work queued behind it goes next.
+            self.start_next(key);
+        } else if queue.running.is_none() && queue.queued.is_empty() {
+            self.keys.remove(&key);
+        }
+    }
+
+    /// [`SbiOffload::supersede_key`], then wait until nothing for `key` is left
+    /// running: the started exchange, and any durable work. Outcomes are still
+    /// delivered by `try_recv`.
+    ///
+    /// **This awaits on the caller's task** (the NGAP task, for every caller in
+    /// this crate), so it is bounded by `max_wait`: one exchange against a peer
+    /// that accepts and never answers can take the SBI client's whole request
+    /// timeout. Returns `false` when `max_wait` ran out first; the work is then
+    /// still running, and still ordered ahead of anything submitted for `key`.
+    pub(crate) async fn settle_key(&mut self, key: SbiKey, max_wait: std::time::Duration) -> bool {
+        self.supersede_key(key);
+        let deadline = tokio::time::Instant::now() + max_wait;
+        loop {
+            let Some(queue) = self.keys.get_mut(&key) else {
+                return true;
+            };
+            let Some(running) = queue.running.as_mut() else {
+                self.start_next(key);
+                continue;
+            };
+            let id = running.id;
+            match tokio::time::timeout_at(deadline, &mut running.handle).await {
+                // Finished (a panicked or aborted task is finished too). Its
+                // KeyDone report will find another job, or none, and is ignored.
+                Ok(_) => {
+                    if let Some(queue) = self.keys.get_mut(&key) {
+                        if queue.running.as_ref().is_some_and(|r| r.id == id) {
+                            queue.running = None;
+                        }
+                    }
+                    self.start_next(key);
+                }
+                Err(_) => return false,
             }
         }
     }
 
-    /// Drop the queued work for `key` and wait until the running exchange, if
-    /// any, has finished. Its outcome is still delivered by `try_recv`. Awaits on
-    /// the caller for at most that one exchange.
-    pub(crate) async fn settle_key(&mut self, key: SbiKey) {
-        let Some(mut queue) = self.keys.remove(&key) else {
-            return;
-        };
-        queue.queued.clear();
-        if let Some((_, handle)) = queue.running.take() {
-            // A panicked or aborted task is finished too.
-            let _ = handle.await;
-        }
-        // Its KeyDone report finds no running job any more and is ignored.
-    }
-
     /// Abort and drop all keyed work of a UE that is gone, freeing the permits of
-    /// its running exchanges. Their outcomes are never delivered.
+    /// its running exchanges; their outcomes are never delivered. Durable work
+    /// is kept and still runs.
     pub(crate) fn cancel_ue(&mut self, amf_ue_ngap_id: u64) {
         let gone: Vec<SbiKey> = self
             .keys
@@ -167,10 +274,25 @@ impl SbiOffload {
             .copied()
             .collect();
         for key in gone {
-            if let Some(queue) = self.keys.remove(&key) {
-                if let Some((_, handle)) = queue.running {
-                    handle.abort();
+            let Some(queue) = self.keys.get_mut(&key) else {
+                continue;
+            };
+            queue.queued.retain(|(_, durable)| *durable);
+            let aborted = match queue.running.as_ref() {
+                Some(r) if !r.durable => {
+                    // Mark it so a task between its permit and its build stops.
+                    r.state
+                        .store(CANCELLED, std::sync::atomic::Ordering::Release);
+                    r.handle.abort();
+                    true
                 }
+                _ => false,
+            };
+            if aborted {
+                queue.running = None;
+                self.start_next(key);
+            } else if queue.running.is_none() && queue.queued.is_empty() {
+                self.keys.remove(&key);
             }
         }
     }
@@ -215,6 +337,13 @@ impl SbiOffload {
         self.keys.contains_key(&key)
     }
 
+    /// Tests: how many spawned exchanges are parked ON the permit semaphore
+    /// (see [`SbiOffload::at_the_gate`]).
+    #[cfg(test)]
+    pub(crate) fn waiting_for_a_permit(&self) -> usize {
+        self.at_the_gate.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Tests: wait until every spawned and every queued exchange has finished.
     /// Outcomes stay queued for `try_recv`. Panics after 10 s.
     #[cfg(test)]
@@ -239,7 +368,7 @@ impl SbiOffload {
         let Some(key) = self
             .keys
             .iter()
-            .find(|(_, q)| q.running.as_ref().is_some_and(|(id, _)| *id == job))
+            .find(|(_, q)| q.running.as_ref().is_some_and(|r| r.id == job))
             .map(|(k, _)| *k)
         else {
             // Settled, cancelled or superseded meanwhile.
@@ -255,19 +384,34 @@ impl SbiOffload {
         let Some(queue) = self.keys.get_mut(&key) else {
             return;
         };
-        let Some(job) = queue.queued.pop_front() else {
-            self.keys.remove(&key);
+        let Some((job, durable)) = queue.queued.pop_front() else {
+            if queue.running.is_none() {
+                self.keys.remove(&key);
+            }
             return;
         };
         let id = self.next_job;
         self.next_job += 1;
-        let handle = self.start(job(), Some(id));
+        let state = Arc::new(std::sync::atomic::AtomicU8::new(WAITING));
+        let handle = self.start(Some((id, Arc::clone(&state))), job);
         if let Some(queue) = self.keys.get_mut(&key) {
-            queue.running = Some((id, handle));
+            queue.running = Some(Running {
+                id,
+                handle,
+                state,
+                durable,
+            });
         }
     }
 
-    fn start(&self, work: BoxedWork, job: Option<u64>) -> JoinHandle<()> {
+    /// Spawn the task that takes a permit, then builds and runs `make`'s work.
+    /// For keyed work, `keyed` is its id and state: the work is built only if
+    /// the job is still WAITING once it holds the permit.
+    fn start(
+        &self,
+        keyed: Option<(u64, Arc<std::sync::atomic::AtomicU8>)>,
+        make: Job,
+    ) -> JoinHandle<()> {
         let tx = self.tx.clone();
         let permits = Arc::clone(&self.permits);
         let spawned = Arc::clone(&self.spawned);
@@ -279,17 +423,41 @@ impl SbiOffload {
                 self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             }
         }
+        // Built here and moved in, so a task aborted before its first poll (a
+        // waiting job that was cancelled) still counts itself out when dropped.
+        let done = Done(spawned);
+        #[cfg(test)]
+        let at_the_gate = Arc::clone(&self.at_the_gate);
         tokio::spawn(async move {
-            let _done = Done(spawned);
+            let _done = done;
+            #[cfg(test)]
+            at_the_gate.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             // The semaphore is never closed, so this cannot fail; if it ever did,
             // running without a permit is better than dropping the work.
             let _permit = permits.acquire_owned().await.ok();
-            if let Some(outcome) = work.await {
+            #[cfg(test)]
+            at_the_gate.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            if let Some((_, state)) = &keyed {
+                if state
+                    .compare_exchange(
+                        WAITING,
+                        STARTED,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    // Superseded, settled or cancelled while it waited: nothing is
+                    // built, nothing is sent, and the permit goes straight back.
+                    return;
+                }
+            }
+            if let Some(outcome) = make().await {
                 // The receiver lives as long as the NGAP server; after it is gone
                 // there is nobody to apply the outcome to.
                 let _ = tx.send(Report::Outcome(outcome));
             }
-            if let Some(job) = job {
+            if let Some((job, _)) = keyed {
                 let _ = tx.send(Report::KeyDone { job });
             }
         })
@@ -361,7 +529,7 @@ mod tests {
         );
     }
 
-    /// Superseded keyed work is never built nor sent; the running one finishes.
+    /// Superseded keyed work is never built nor sent; the started one finishes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn superseded_work_never_reaches_the_peer() {
         let mut offload = SbiOffload::new(16);
@@ -375,6 +543,8 @@ mod tests {
                 None
             });
         }
+        // Started: it holds its permit, so supersede leaves it to finish.
+        until(|| offload.in_flight() == 1).await;
         for name in ["queued 1", "queued 2"] {
             let seen = Arc::clone(&seen);
             offload.spawn_keyed((2, 1), move || async move {
@@ -407,7 +577,7 @@ mod tests {
             });
         }
         until(|| offload.in_flight() == 1).await;
-        offload.settle_key((3, 1)).await;
+        assert!(offload.settle_key((3, 1), Duration::from_secs(5)).await);
         assert_eq!(*seen.lock().expect("seen"), vec!["running"]);
         assert!(!offload.key_busy((3, 1)));
         offload.settle().await;
@@ -467,5 +637,199 @@ mod tests {
         gate.notify_one();
         offload.settle().await;
         assert_eq!(*seen.lock().expect("seen"), vec!["before", "after"]);
+    }
+
+    /// Keyed work that records `name` when built and when sent.
+    fn recording(
+        seen: &Arc<std::sync::Mutex<Vec<String>>>,
+        name: &'static str,
+    ) -> impl FnOnce() -> std::future::Ready<Option<SbiOutcome>> + Send + 'static {
+        let seen = Arc::clone(seen);
+        move || {
+            seen.lock().expect("seen").push(format!("built {name}"));
+            std::future::ready(None)
+        }
+    }
+
+    /// Occupy the only permit with another UE's exchange until `gate` opens.
+    async fn hold_the_permit(offload: &mut SbiOffload, gate: &Arc<Semaphore>) {
+        let gate = Arc::clone(gate);
+        offload.spawn_keyed((900, 1), move || async move {
+            let _ = gate.acquire().await.map(|p| p.forget());
+            None
+        });
+        until(|| offload.in_flight() == 1).await;
+    }
+
+    /// #877 re-review M1, the reviewer's reproduction: with every permit taken, a
+    /// keyed DEACTIVATED waits for one; it is superseded; the permit is freed.
+    /// Nothing is built or sent for it, the key is free at once, and the next
+    /// exchange for the key runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_superseded_job_still_waiting_for_a_permit_never_reaches_the_peer() {
+        let mut offload = SbiOffload::new(1);
+        let gate = Arc::new(Semaphore::new(0));
+        hold_the_permit(&mut offload, &gate).await;
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        offload.spawn_keyed((848, 5), recording(&seen, "DEACTIVATED"));
+        assert!(offload.key_busy((848, 5)));
+        // Parked on the semaphore: this is the reviewer's race, not a task that
+        // was never polled.
+        until(|| offload.waiting_for_a_permit() == 1).await;
+
+        offload.supersede_key((848, 5));
+        assert!(
+            !offload.key_busy((848, 5)),
+            "nothing for the key has started"
+        );
+
+        gate.add_permits(1);
+        offload.spawn_keyed((848, 5), recording(&seen, "ACTIVATING"));
+        offload.settle().await;
+        assert_eq!(*seen.lock().expect("seen"), vec!["built ACTIVATING"]);
+        assert_eq!(offload.in_flight(), 0);
+    }
+
+    /// `settle_key` on a job that is only waiting for a permit cancels it and
+    /// returns at once: it does not wait for the permit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn settle_key_cancels_a_waiting_job_without_waiting_for_a_permit() {
+        let mut offload = SbiOffload::new(1);
+        let gate = Arc::new(Semaphore::new(0));
+        hold_the_permit(&mut offload, &gate).await;
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        offload.spawn_keyed((848, 6), recording(&seen, "DEACTIVATED"));
+        until(|| offload.waiting_for_a_permit() == 1).await;
+
+        let started = std::time::Instant::now();
+        assert!(offload.settle_key((848, 6), Duration::from_secs(5)).await);
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(!offload.key_busy((848, 6)));
+
+        gate.add_permits(1);
+        offload.settle().await;
+        assert!(seen.lock().expect("seen").is_empty());
+    }
+
+    /// #877 re-review m3: `settle_key` is bounded. A started exchange that never
+    /// finishes makes it return `false` after `max_wait`, the work still keyed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn settle_key_is_bounded() {
+        let mut offload = SbiOffload::new(4);
+        offload.spawn_keyed((848, 7), || async {
+            std::future::pending::<()>().await;
+            None
+        });
+        until(|| offload.in_flight() == 1).await;
+        let started = std::time::Instant::now();
+        assert!(
+            !offload
+                .settle_key((848, 7), Duration::from_millis(200))
+                .await
+        );
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(200) && took < Duration::from_secs(2),
+            "{took:?}"
+        );
+        assert!(
+            offload.key_busy((848, 7)),
+            "the started exchange still holds its key"
+        );
+        offload.cancel_ue(848);
+        offload.settle().await;
+    }
+
+    /// Durable work survives `supersede_key` and `cancel_ue`, and runs in its
+    /// place in the key's order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_work_is_never_dropped() {
+        let mut offload = SbiOffload::new(1);
+        let gate = Arc::new(Semaphore::new(0));
+        hold_the_permit(&mut offload, &gate).await;
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        offload.spawn_keyed((850, 5), recording(&seen, "attempt"));
+        until(|| offload.waiting_for_a_permit() == 1).await;
+        offload.spawn_keyed_durable((850, 5), recording(&seen, "release"));
+        offload.spawn_keyed((850, 5), recording(&seen, "later"));
+        offload.supersede_key((850, 5));
+        offload.spawn_keyed_durable((850, 6), recording(&seen, "release of a gone UE"));
+        offload.cancel_ue(850);
+
+        gate.add_permits(1);
+        offload.settle().await;
+        let mut got = seen.lock().expect("seen").clone();
+        got.sort();
+        assert_eq!(got, vec!["built release", "built release of a gone UE"]);
+    }
+
+    /// #877 re-review M1 / #848's requirement: the abort of a not-yet-started
+    /// job and that job starting its exchange are ONE compare-and-swap, so the
+    /// race between `supersede_key` and the permit becoming free has exactly
+    /// two outcomes and never both.
+    ///
+    /// 1000 rounds, each releasing the permit and superseding concurrently with
+    /// a yield between, so the two land in every interleaving. Either the job
+    /// was aborted and NOTHING was built, or it started and built exactly once;
+    /// a build after a successful abort (`key_busy` false) is the defect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn aborting_and_starting_a_job_race_to_one_outcome() {
+        let mut aborted_and_built = 0usize;
+        let mut aborted = 0usize;
+        let mut started = 0usize;
+        for round in 0..1000u32 {
+            let mut offload = SbiOffload::new(1);
+            let hold = Arc::new(Semaphore::new(0));
+            hold_the_permit(&mut offload, &hold).await;
+            let built = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = Arc::clone(&built);
+            offload.spawn_keyed((877, 9), move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                std::future::ready(None)
+            });
+            until(|| offload.waiting_for_a_permit() == 1).await;
+
+            // The permit is freed from another task while this one supersedes.
+            let release = Arc::clone(&hold);
+            let freeing = tokio::spawn(async move {
+                release.add_permits(1);
+            });
+            // A delay that varies with the round, so the supersede lands before
+            // the job wakes, while it is waking, and after it has started,
+            // across the 1000 rounds. The distribution is asserted below.
+            for _ in 0..(round % 4) {
+                tokio::task::yield_now().await;
+            }
+            if round % 4 == 3 {
+                tokio::time::sleep(Duration::from_micros(u64::from(round % 400))).await;
+            }
+            offload.supersede_key((877, 9));
+            let was_aborted = !offload.key_busy((877, 9));
+            let _ = freeing.await;
+            offload.settle().await;
+
+            let builds = built.load(std::sync::atomic::Ordering::Acquire);
+            assert!(builds <= 1, "round {round}: built {builds} times");
+            if was_aborted {
+                aborted += 1;
+                if builds > 0 {
+                    aborted_and_built += 1;
+                }
+            } else {
+                started += 1;
+                assert_eq!(builds, 1, "round {round}: a started job must run its work");
+            }
+            assert_eq!(offload.in_flight(), 0, "round {round}");
+        }
+        assert_eq!(
+            aborted_and_built, 0,
+            "a job reported aborted built its work anyway in {aborted_and_built} of 1000 rounds"
+        );
+        // Both outcomes must actually occur, or the test is not racing anything.
+        // Both outcomes must occur, or the interleavings were not explored.
+        assert!(
+            aborted > 0 && started > 0,
+            "the race was not exercised: aborted {aborted}, started {started} of 1000"
+        );
     }
 }

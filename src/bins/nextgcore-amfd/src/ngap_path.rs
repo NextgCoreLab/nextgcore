@@ -7801,12 +7801,19 @@ impl NgapServer {
                      PSI={psi} waited for an SMF; dropped (the UE re-requests)"
                 );
                 self.pending_establishments.remove(&key);
+                // #877 re-review m1: an attempt still waiting for a permit is
+                // cancelled, so it neither holds the PSI's key nor creates a
+                // context nobody waits for. A started one finishes; a late
+                // success is released (`apply_establishment_attempt`).
+                self.sbi_offload.supersede_key(key);
                 continue;
             }
             // The UE's current connection: it may have moved since.
             let (association_id, ran_ue_ngap_id) = (state.association_id, state.ran_ue_ngap_id);
             if now.duration_since(p.first_failure) >= ESTABLISHMENT_RETRY_WINDOW {
                 self.pending_establishments.remove(&key);
+                // #877 re-review m1, as for CM-IDLE above.
+                self.sbi_offload.supersede_key(key);
                 if let Err(e) = self
                     .answer_payload_not_forwarded(
                         association_id,
@@ -7955,14 +7962,17 @@ impl NgapServer {
                 let sm_ref = resp.sm_context_ref;
                 // Keyed on the session, so it reaches the SMF before any later
                 // CreateSMContext for the same PSI.
-                self.sbi_offload.spawn_keyed(key, move || async move {
-                    if let Err(e) =
-                        crate::sbi_path::call_smf_release_sm_context(&host, port, &sm_ref).await
-                    {
-                        log::warn!("Release of abandoned SM context {sm_ref} failed: {e}");
-                    }
-                    None
-                });
+                // Durable: a later supersede for this PSI, or the UE leaving, must
+                // not drop it, or the context leaks at the SMF.
+                self.sbi_offload
+                    .spawn_keyed_durable(key, move || async move {
+                        if let Err(e) =
+                            crate::sbi_path::call_smf_release_sm_context(&host, port, &sm_ref).await
+                        {
+                            log::warn!("Release of abandoned SM context {sm_ref} failed: {e}");
+                        }
+                        None
+                    });
                 Ok(())
             }
             (Err(_), None, _) => Ok(()),
