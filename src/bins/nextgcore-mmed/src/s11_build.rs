@@ -558,12 +558,21 @@ fn create_session_paa(gtp_pdn_type: u8) -> Gtp2PaaIe {
     }
 }
 
-/// Build Modify Bearer Request (TS 29.274 §7.2.7)
+/// Build Modify Bearer Request (TS 29.274 §7.2.7).
+///
+/// `to_remove` are the EBIs sent as "Bearer Contexts to be removed" (instance 1,
+/// EBI only). Table 7.2.7-1 makes them mandatory "on the S4 and S11 interfaces for
+/// the TAU/RAU/Handover ... procedures where any of the bearers existing before
+/// the ... Handover procedure will be deactivated as consequence of the ...
+/// Handover procedure"; NOTE 3 says the MME then removes them by a separate
+/// procedure (#730 review M1).
+///
+/// The User Location Information IE is not encoded: a stated ceiling of #730.
 pub fn build_modify_bearer_request(
     mme_ue: &MmeUe,
     sgw_ue: &SgwUe,
     bearers: &[&MmeBearer],
-    _uli_presence: bool,
+    to_remove: &[u8],
     sequence_number: u32,
 ) -> S11BuildResult<Gtp2Message> {
     log::debug!("Build Modify Bearer Request with {} bearers", bearers.len());
@@ -601,6 +610,11 @@ pub fn build_modify_bearer_request(
             "Modify Bearer Request requires at least one bearer context with an eNB S1-U F-TEID"
                 .to_string(),
         ));
+    }
+    for ebi in to_remove {
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(*ebi);
+        msg.add_bearer_context(1, &bc);
     }
 
     // RAT Type (C)

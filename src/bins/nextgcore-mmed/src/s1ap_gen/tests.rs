@@ -1,5 +1,11 @@
 //! #514 stage 2: the S1 Setup family on the generated codec.
 //!
+//! #737: since the hand-written encoder was deleted (#560), the
+//! `*_with_schema_criticalities` tests below compare the production encoder
+//! with itself and check it decodes back; what pins each IE criticality is
+//! `criticality_oracle`, which checks every PDU a production builder encodes
+//! against the TS 36.413 §9.3 object sets.
+//!
 //! The pre-change hand-written builders and parser are the oracle: the
 //! generated encoders must produce the same bytes and the generated decoder the
 //! same request. Golden octets come from nextgcore-s1ap's `golden_x691.rs`
@@ -83,7 +89,7 @@ fn the_setup_failure_is_the_x691_golden() {
 }
 
 #[test]
-fn the_setup_response_matches_the_hand_written_encoder() {
+fn the_setup_response_round_trips_with_schema_criticalities() {
     let mut cases = 0;
     for name in [None, Some(1usize), Some(3), Some(40), Some(150)] {
         for gummeis in 1..=8usize {
@@ -102,7 +108,7 @@ fn the_setup_response_matches_the_hand_written_encoder() {
 }
 
 #[test]
-fn the_setup_failure_matches_the_hand_written_encoder() {
+fn the_setup_failure_round_trips_with_schema_criticalities() {
     let groups = [
         S1apCauseGroup::Nothing,
         S1apCauseGroup::RadioNetwork,
