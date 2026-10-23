@@ -19255,14 +19255,20 @@ mod tests {
             let ctx = crate::context::amf_self();
             let g = ctx.read().unwrap();
             let _ = g.non_ue_nrppa_drain();
-            g.non_ue_nrppa_add(crate::context::PendingNonUeNrppa {
+            assert!(g.non_ue_nrppa_add(crate::context::PendingNonUeNrppa {
                 nrppa_pdu: nrppa.clone(),
                 routing_id: b"lmf-807".to_vec(),
                 target_gnb_ids: vec![0x807, 0x999],
-            });
+            }));
         }
         ngap.process_non_ue_nrppa_transfers().await;
-        let sent = ngap.sent_ngap.take().unwrap();
+        let sent: Vec<(u64, Vec<u8>)> = ngap
+            .sent_ngap
+            .take()
+            .unwrap()
+            .into_iter()
+            .map(|(association, _stream, pdu)| (association, pdu))
+            .collect();
         assert_eq!(
             sent,
             vec![(

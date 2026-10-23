@@ -301,6 +301,13 @@ pub enum MeasurementLeg {
     NrppaTrp,
 }
 
+/// An NRPPa exchange waiting for its answer (#807).
+struct NrppaWaiter {
+    sender: tokio::sync::oneshot::Sender<Vec<u8>>,
+    /// The session of a UE-associated exchange; `None` for a non-UE one.
+    session: Option<String>,
+}
+
 /// What a leg's report did to its session.
 #[derive(Debug, Clone)]
 pub enum LegProgress {
@@ -410,7 +417,7 @@ pub struct LmfContext {
     /// NRPPATransactionID)` (#807). The uplink notify hands a matching
     /// SUCCESSFUL/UNSUCCESSFUL OUTCOME to the waiter instead of the E-CID path.
     /// Taken alone, like every map here.
-    nrppa_waiters: RwLock<HashMap<(u8, u16), tokio::sync::oneshot::Sender<Vec<u8>>>>,
+    nrppa_waiters: RwLock<HashMap<(u8, u16), NrppaWaiter>>,
     /// The NG-RAN nodes the Multi-RTT gNB half is measured on
     /// (`lmf.positioning.ngRanNodes`, #807).
     ng_ran_nodes: RwLock<Vec<crate::site_config::NgRanNode>>,
@@ -421,7 +428,14 @@ pub struct LmfContext {
             crate::nrppa_positioning::TrpInfo,
         )>,
     >,
+    /// When each node last failed TRP Information Exchange (#903 review): it is
+    /// not asked again for [`TRP_INFORMATION_RETRY`], so a silent node does not
+    /// cost every request a timeout.
+    trp_info_failed: RwLock<HashMap<crate::site_config::NgRanNode, std::time::Instant>>,
 }
+
+/// How long a node that failed TRP Information Exchange is left alone.
+pub const TRP_INFORMATION_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl LmfContext {
     pub fn new() -> Self {
@@ -455,6 +469,7 @@ impl LmfContext {
             nrppa_waiters: RwLock::new(HashMap::new()),
             ng_ran_nodes: RwLock::new(Vec::new()),
             trp_info: RwLock::new(Vec::new()),
+            trp_info_failed: RwLock::new(HashMap::new()),
         }
     }
 
@@ -1152,23 +1167,53 @@ impl LmfContext {
         &self,
         procedure_code: u8,
         txn: u16,
+        session: Option<&str>,
     ) -> tokio::sync::oneshot::Receiver<Vec<u8>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if let Ok(mut w) = self.nrppa_waiters.write() {
-            w.insert((procedure_code, txn), tx);
+            w.insert(
+                (procedure_code, txn),
+                NrppaWaiter {
+                    sender: tx,
+                    session: session.map(str::to_string),
+                },
+            );
         }
         rx
     }
 
-    /// Hand an answer to its waiter. `false` when nobody waits for it.
-    pub fn nrppa_deliver(&self, procedure_code: u8, txn: u16, pdu: Vec<u8>) -> bool {
-        let waiter = self
-            .nrppa_waiters
-            .write()
-            .ok()
-            .and_then(|mut w| w.remove(&(procedure_code, txn)));
+    /// Hand an answer to its waiter. `false` when nobody waits for it, or when
+    /// the waiter belongs to a UE-associated exchange of one session and the
+    /// notification names another (#903 review): the transaction id alone is not
+    /// enough to bind a UE-associated answer to its session.
+    pub fn nrppa_deliver(
+        &self,
+        procedure_code: u8,
+        txn: u16,
+        notify_session: Option<&str>,
+        pdu: Vec<u8>,
+    ) -> bool {
+        let waiter = {
+            let Ok(mut w) = self.nrppa_waiters.write() else {
+                return false;
+            };
+            match w.get(&(procedure_code, txn)) {
+                Some(found)
+                    if found.session.is_some() && found.session.as_deref() != notify_session =>
+                {
+                    log::warn!(
+                        "NRPPa answer to procedure {procedure_code} transaction {txn} names \
+                         session {notify_session:?}, not the waiting {:?}; not delivered",
+                        found.session
+                    );
+                    return false;
+                }
+                Some(_) => w.remove(&(procedure_code, txn)),
+                None => None,
+            }
+        };
         match waiter {
-            Some(tx) => tx.send(pdu).is_ok(),
+            Some(w) => w.sender.send(pdu).is_ok(),
             None => false,
         }
     }
@@ -1204,10 +1249,21 @@ impl LmfContext {
         node: &crate::site_config::NgRanNode,
         trps: Vec<crate::nrppa_positioning::TrpInfo>,
     ) {
+        // #903 review: a PCI on two TRPs (of this node or another) names neither,
+        // so no coordinate is learned for it.
+        let mut known = self.trp_information();
+        known.retain(|(n, _)| n != node);
+        let ambiguous = crate::nrppa_positioning::ambiguous_pcis(
+            known.iter().map(|(_, t)| t).chain(trps.iter()),
+        );
         for t in &trps {
             let (Some(pci), Some(coord)) = (t.pci, t.coord) else {
                 continue;
             };
+            if ambiguous.contains(&pci) {
+                log::warn!("TRP {} of {node:?}: PCI {pci} is on more than one TRP; its position is not used", t.trp_id);
+                continue;
+            }
             let key = format!("pci-{pci}");
             let configured = self
                 .cell_registry
@@ -1228,6 +1284,22 @@ impl LmfContext {
             info.retain(|(n, _)| n != node);
             info.extend(trps.into_iter().map(|t| (node.clone(), t)));
         }
+    }
+
+    /// Record that `node` did not answer TRP Information Exchange.
+    pub fn note_trp_information_failed(&self, node: &crate::site_config::NgRanNode) {
+        if let Ok(mut f) = self.trp_info_failed.write() {
+            f.insert(node.clone(), std::time::Instant::now());
+        }
+    }
+
+    /// Whether `node` failed TRP Information Exchange within the retry interval.
+    pub fn trp_information_backed_off(&self, node: &crate::site_config::NgRanNode) -> bool {
+        self.trp_info_failed
+            .read()
+            .ok()
+            .and_then(|f| f.get(node).copied())
+            .is_some_and(|t| t.elapsed() < TRP_INFORMATION_RETRY)
     }
 
     /// Every known TRP with the node it belongs to.
@@ -1811,17 +1883,44 @@ fn multi_rtt_observations(
             by_prs.entry(prs).or_insert(key);
         }
     }
+    let resolve = |m: &CellMeasurement| {
+        resolve_trp(m, registry).or_else(|| m.dl_prs_id.and_then(|p| by_prs.get(&p).cloned()))
+    };
+    // #903 review: a key reached by UE halves of two DL-PRS IDs is two TRPs under
+    // one key (a multi-TRP cell, or a reused PCI). Its gNB halves cannot be told
+    // apart either, so the key is not ranged, as DL-TDOA does since #824.
+    let mut prs_of_key: HashMap<String, Vec<u8>> = HashMap::new();
+    for m in measurements.iter().filter(|m| m.ue_rx_tx_ns.is_some()) {
+        if let (Some(prs), Some(key)) = (m.dl_prs_id, resolve(m)) {
+            let ids = prs_of_key.entry(key).or_default();
+            if !ids.contains(&prs) {
+                ids.push(prs);
+            }
+        }
+    }
+    let ambiguous: Vec<String> = prs_of_key
+        .into_iter()
+        .filter(|(_, ids)| ids.len() > 1)
+        .map(|(key, ids)| {
+            log::warn!(
+                "Multi-RTT: {key} is reached from DL-PRS IDs {ids:?}, i.e. from more than one \
+                 TRP; it is not ranged"
+            );
+            key
+        })
+        .collect();
     let mut order: Vec<String> = Vec::new();
     let mut by_trp: HashMap<String, Halves> = HashMap::new();
     for m in measurements {
         if m.rtt_ns.is_none() && m.ue_rx_tx_ns.is_none() && m.gnb_rx_tx_ns.is_none() {
             continue;
         }
-        let Some(key) =
-            resolve_trp(m, registry).or_else(|| m.dl_prs_id.and_then(|p| by_prs.get(&p).cloned()))
-        else {
+        let Some(key) = resolve(m) else {
             continue;
         };
+        if ambiguous.contains(&key) {
+            continue;
+        }
         let h = by_trp.entry(key.clone()).or_insert_with(|| {
             order.push(key);
             Halves::default()
@@ -1887,7 +1986,10 @@ fn multi_rtt_observations(
 /// TS 38.305 §8.10 sums two measurements of one round trip, so the UE must not
 /// have moved between them; the range error is up to the distance it moved, and
 /// 200 ms is 6 m at 30 m/s. Neither TS 38.305 nor TS 38.455 sets a value: this is
-/// the LMF's choice.
+/// the LMF's choice. SFN/slot stamps repeat every 10.24 s, so two halves exactly a
+/// whole SFN cycle apart would compare as simultaneous; a session lives at most
+/// the 20 s budget plus setup, and both halves are measured inside it on request,
+/// which bounds that to the improbable (#903 review MINOR 4).
 pub const MULTI_RTT_PAIRING_WINDOW_MS: f64 = 200.0;
 
 /// Heuristic placeholder that returns a lat/lon 0.0 fix with a method-derived
@@ -1980,6 +2082,9 @@ pub fn lmf_context_init(max_measurements: usize) {
             context.set_ng_ran_nodes(Vec::new());
             if let Ok(mut info) = context.trp_info.write() {
                 info.clear();
+            }
+            if let Ok(mut f) = context.trp_info_failed.write() {
+                f.clear();
             }
         }
     };
@@ -3795,5 +3900,79 @@ mod tests_session_legs {
             c.positioning_session_withdraw_leg(&corr, MeasurementLeg::NrppaEcid),
             LegProgress::Completed(None)
         ));
+    }
+}
+
+/// #903 review MINOR 2: a UE-associated NRPPa answer is delivered only to the
+/// waiter of the session the notification names.
+#[cfg(test)]
+mod tests_nrppa_waiters {
+    use super::*;
+
+    #[test]
+    fn a_ue_associated_answer_for_another_session_is_not_delivered() {
+        let c = LmfContext::new();
+        let mut rx = c.nrppa_wait(9, 77, Some("corr-a"));
+        assert!(!c.nrppa_deliver(9, 77, Some("corr-b"), vec![1]));
+        assert!(!c.nrppa_deliver(9, 77, None, vec![1]));
+        assert!(rx.try_recv().is_err(), "still waiting");
+        assert!(c.nrppa_deliver(9, 77, Some("corr-a"), vec![2]));
+        assert_eq!(rx.try_recv().unwrap(), vec![2]);
+        // A non-UE waiter takes any (or no) correlation.
+        let mut rx = c.nrppa_wait(11, 78, None);
+        assert!(c.nrppa_deliver(11, 78, Some("whatever"), vec![3]));
+        assert_eq!(rx.try_recv().unwrap(), vec![3]);
+    }
+}
+
+/// #903 review MAJOR 1, the pairing itself: UE halves of two DL-PRS IDs under one
+/// key are two TRPs, so the key is not ranged (it gave (d_A + d_B)/2 before).
+#[cfg(test)]
+mod tests_multi_rtt_shared_pci {
+    use super::*;
+
+    fn half(prs: Option<u8>, ue: Option<f64>, gnb: Option<f64>) -> CellMeasurement {
+        CellMeasurement {
+            nr_cgi: "pci-201".into(),
+            rsrp: None,
+            rsrq: None,
+            timing_advance: None,
+            ecid_rtt_ns: None,
+            ecid_rtt_width_ns: None,
+            aoa: None,
+            rtt_ns: None,
+            rstd_ns: None,
+            rstd_reference: None,
+            ue_rx_tx_ns: ue,
+            gnb_rx_tx_ns: gnb,
+            meas_time: None,
+            dl_prs_id: prs,
+            eutra: false,
+        }
+    }
+
+    #[test]
+    fn a_key_reached_from_two_dl_prs_ids_is_not_ranged() {
+        let reg =
+            TrpRegistry::from_entries([("pci-201".to_string(), TrpCoord::new(51.0, 0.0, 0.0))]);
+        let one = [
+            half(Some(5), Some(1000.0), None),
+            half(None, None, Some(1000.0)),
+        ];
+        assert_eq!(
+            multi_rtt_observations(&one, &reg).len(),
+            1,
+            "one TRP: ranged"
+        );
+        let two = [
+            half(Some(5), Some(1000.0), None),
+            half(Some(6), Some(3000.0), None),
+            half(None, None, Some(1000.0)),
+            half(None, None, Some(3000.0)),
+        ];
+        assert!(
+            multi_rtt_observations(&two, &reg).is_empty(),
+            "two TRPs under pci-201: not ranged"
+        );
     }
 }

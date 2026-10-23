@@ -107,6 +107,25 @@ pub struct TrpInfo {
     pub coord: Option<TrpCoord>,
 }
 
+/// The PCIs that TRP Information reports on more than one TRP (#903 review). A
+/// PCI names a cell, not a TRP: a multi-TRP cell has several TRPs under one PCI,
+/// and PCIs are reused across sites. The UE half names its TRP by PCI, so a TRP
+/// whose PCI is ambiguous cannot be paired and is not measured.
+pub fn ambiguous_pcis<'a>(trps: impl Iterator<Item = &'a TrpInfo>) -> Vec<u16> {
+    let mut seen: Vec<u16> = Vec::new();
+    let mut twice: Vec<u16> = Vec::new();
+    for pci in trps.filter_map(|t| t.pci) {
+        if seen.contains(&pci) {
+            if !twice.contains(&pci) {
+                twice.push(pci);
+            }
+        } else {
+            seen.push(pci);
+        }
+    }
+    twice
+}
+
 /// The gNB half of one TRP's Multi-RTT measurement.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GnbRxTx {
@@ -682,6 +701,39 @@ pub mod test_support {
                 },
             ),
         )
+    }
+
+    /// A MEASUREMENT FAILURE (TS 38.455 §8.5.1.3).
+    pub fn measurement_failure(txn: u16, lmf_measurement_id: u32) -> Vec<u8> {
+        use nrppa::MeasurementFailureProtocolIEs_EntryValue as V;
+        nextgcore_nrppa_gen::encode(&nrppa::NRPPA_PDU::UnsuccessfulOutcome(
+            nrppa::UnsuccessfulOutcome {
+                procedure_code: nrppa::ProcedureCode(nrppa::ID_MEASUREMENT),
+                criticality: nrppa::Criticality(super::REJECT),
+                nrppatransaction_id: nrppa::NRPPATransactionID(txn),
+                value: nrppa::UnsuccessfulOutcomeValue::Id_Measurement(nrppa::MeasurementFailure {
+                    protocol_i_es: nrppa::MeasurementFailureProtocolIEs(vec![
+                        nrppa::MeasurementFailureProtocolIEs_Entry {
+                            id: nrppa::ProtocolIE_ID(nrppa::ID_LMF_MEASUREMENT_ID),
+                            criticality: nrppa::Criticality(super::REJECT),
+                            value: V::Id_LMF_Measurement_ID(nrppa::Measurement_ID(
+                                lmf_measurement_id,
+                            )),
+                        },
+                        nrppa::MeasurementFailureProtocolIEs_Entry {
+                            id: nrppa::ProtocolIE_ID(nrppa::ID_CAUSE),
+                            criticality: nrppa::Criticality(1),
+                            value: V::Id_Cause(nrppa::Cause::RadioNetwork(
+                                nrppa::CauseRadioNetwork(
+                                    nrppa::CauseRadioNetwork::REQUESTED_ITEM_NOT_SUPPORTED,
+                                ),
+                            )),
+                        },
+                    ]),
+                }),
+            },
+        ))
+        .expect("generated encode")
     }
 
     pub fn positioning_activation_response(txn: u16) -> Vec<u8> {

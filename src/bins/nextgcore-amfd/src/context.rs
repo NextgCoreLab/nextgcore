@@ -819,6 +819,9 @@ pub struct PendingPwsN2Transfer {
     pub rat_selector: Option<PwsRatSelector>,
 }
 
+/// The most non-UE NRPPa PDUs awaiting the NGAP pump (#903 review).
+pub const MAX_PENDING_NON_UE_NRPPA: usize = 1024;
+
 /// A non-UE-associated NRPPa PDU to relay to NG-RAN nodes (#807, TS 29.518
 /// §5.2.2.4.1.2, TS 38.413 §8.15.4).
 #[derive(Debug, Clone)]
@@ -2163,10 +2166,17 @@ impl AmfContext {
         }
     }
 
-    /// Enqueue a non-UE-associated NRPPa relay (#807).
-    pub fn non_ue_nrppa_add(&self, item: PendingNonUeNrppa) {
-        if let Ok(mut q) = self.non_ue_nrppa_queue.write() {
-            q.push(item);
+    /// Enqueue a non-UE-associated NRPPa relay (#807). `false` when the queue
+    /// already holds [`MAX_PENDING_NON_UE_NRPPA`] PDUs (#903 review): the pump
+    /// drains it every loop, so a full queue means the NGAP task is not keeping
+    /// up, and the transfer is refused rather than queued without bound.
+    pub fn non_ue_nrppa_add(&self, item: PendingNonUeNrppa) -> bool {
+        match self.non_ue_nrppa_queue.write() {
+            Ok(mut q) if q.len() < MAX_PENDING_NON_UE_NRPPA => {
+                q.push(item);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -2179,25 +2189,18 @@ impl AmfContext {
     }
 
     /// The non-UE N2 subscription for the NRPPa class that an LMF's answer goes to
-    /// (#807, TS 29.518 §5.2.2.4.4.2): the one created by the LMF whose nfId is the
-    /// NGAP Routing ID, else one that named no nfId. No PWS fallback, and a
-    /// subscription of another LMF never matches.
+    /// (#807, TS 29.518 §5.2.2.4.4.2): the one created by the LMF whose nfId is
+    /// the NGAP Routing ID. A subscription that named no nfId is used only when
+    /// the answer names none either (#903 review): it may belong to another
+    /// consumer, and an answer that names its LMF must not go elsewhere. No PWS
+    /// fallback.
     pub fn non_ue_nrppa_subscription_find(
         &self,
         nf_id: Option<&str>,
     ) -> Option<NonUeN2InfoSubscription> {
         let subs = self.non_ue_n2_subscriptions.read().ok()?;
-        let mut named: Vec<&NonUeN2InfoSubscription> = Vec::new();
-        let mut anonymous: Vec<&NonUeN2InfoSubscription> = Vec::new();
-        for s in subs.values().filter(|s| s.n2_information_class == "NRPPa") {
-            match (s.nf_id.as_deref(), nf_id) {
-                (Some(a), Some(b)) if a == b => named.push(s),
-                (None, _) => anonymous.push(s),
-                _ => {}
-            }
-        }
-        let pick = if named.is_empty() { anonymous } else { named };
-        pick.into_iter()
+        subs.values()
+            .filter(|s| s.n2_information_class == "NRPPa" && s.nf_id.as_deref() == nf_id)
             .max_by(|a, b| a.subscription_id.cmp(&b.subscription_id))
             .cloned()
     }

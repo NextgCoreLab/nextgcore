@@ -543,7 +543,31 @@ pub fn select_lpp_method(
 /// The NR bodies are Rel-16 extension additions of `RequestLocationInformation-r9-IEs`
 /// (TS 37.355 §6.2), which the generated codec carries since nextgsim #253.
 pub fn build_lpp_request(method: LppMethod, transaction_number: u8) -> Result<Vec<u8>, String> {
-    let ies = match method {
+    encode(
+        &request_location(transaction_number, request_ies(method)),
+        &format!("RequestLocationInformation ({method:?})"),
+    )
+}
+
+/// A Multi-RTT request that also asks for NR DL-TDOA (#903 review): both are
+/// members of the same Rel-16 extension group of `RequestLocationInformation-r9-IEs`
+/// (TS 37.355 §6.2), and a UE measures both on the same DL-PRS. The DL-TDOA RSTDs
+/// let the solver fall back when no Multi-RTT pair forms: the gNB answered
+/// MEASUREMENT FAILURE, never answered, or its halves did not pair. The fix states
+/// which method produced it.
+pub fn build_lpp_multi_rtt_with_dl_tdoa_request(transaction_number: u8) -> Result<Vec<u8>, String> {
+    let mut ies = request_ies(LppMethod::MultiRtt);
+    ies.extensions.nr_dl_tdoa_request_location_information_r16 = request_ies(LppMethod::DlTdoa)
+        .extensions
+        .nr_dl_tdoa_request_location_information_r16;
+    encode(
+        &request_location(transaction_number, ies),
+        "RequestLocationInformation (Multi-RTT + DL-TDOA)",
+    )
+}
+
+fn request_ies(method: LppMethod) -> lpp::RequestLocationInformation_r9_IEs {
+    match method {
         LppMethod::Ecid => ecid_request_ies(),
         LppMethod::NrEcid => nr_ecid_request_ies(),
         LppMethod::MultiRtt => {
@@ -609,11 +633,7 @@ pub fn build_lpp_request(method: LppMethod, transaction_number: u8) -> Result<Ve
                 });
             ies
         }
-    };
-    encode(
-        &request_location(transaction_number, ies),
-        &format!("RequestLocationInformation ({method:?})"),
-    )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1165,12 +1185,12 @@ pub fn decode_lpp_provide_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasureme
     let cells = if !ecid.is_empty() {
         ecid
     } else {
-        let multi_rtt = lpp_multi_rtt_provide_to_measurements(&msg);
-        if multi_rtt.is_empty() {
-            lpp_dl_tdoa_provide_to_measurements(&msg)
-        } else {
-            multi_rtt
-        }
+        // #903 review: a report answering a Multi-RTT + DL-TDOA request carries both
+        // sets. Both are kept, so the solver falls back to DL-TDOA when the
+        // Multi-RTT halves do not pair.
+        let mut cells = lpp_multi_rtt_provide_to_measurements(&msg);
+        cells.extend(lpp_dl_tdoa_provide_to_measurements(&msg));
+        cells
     };
     Ok((request_id, cells))
 }

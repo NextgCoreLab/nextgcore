@@ -6021,12 +6021,21 @@ fn handle_non_ue_nrppa_transfer(
             None,
         );
     };
-    guard.non_ue_nrppa_add(crate::context::PendingNonUeNrppa {
+    let queued = guard.non_ue_nrppa_add(crate::context::PendingNonUeNrppa {
         nrppa_pdu,
         routing_id: nf_id.as_bytes().to_vec(),
         target_gnb_ids: target_gnb_ids.clone(),
     });
     drop(guard);
+    if !queued {
+        // TS 29.500 Table 5.2.7.2-1: INSUFFICIENT_RESOURCES is a 500.
+        return send_error(
+            500,
+            "Internal Server Error",
+            "The non-UE NRPPa relay queue is full",
+            Some("INSUFFICIENT_RESOURCES"),
+        );
+    }
     log::info!(
         "Namf NonUeN2MessageTransfer (NRPPa): enqueued for {} NG-RAN node(s), Routing ID \
          {nf_id}",
@@ -12456,7 +12465,7 @@ mod tests {
             );
             assert!(
                 g.non_ue_nrppa_subscription_find(Some("another-lmf"))
-                    .is_none_or(|s| s.subscription_id != id),
+                    .is_none(),
                 "another LMF's answers never go to this subscription"
             );
             assert!(
@@ -12466,6 +12475,60 @@ mod tests {
             );
             g.non_ue_n2_subscription_remove(&id);
         }
+        // #903 review: a subscription that named no nfId does not receive an
+        // answer that names its LMF; it may belong to another consumer.
+        let resp = namf_request_handler(non_ue_n2_subscribe_request(json!({
+            "n2InformationClass": "NRPPa",
+            "n2NotifyCallbackUri": "http://127.0.0.1:19808/nlmf-loc/v1/notify/n2",
+        })))
+        .await;
+        assert_eq!(resp.status, 201);
+        let v: Value = serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let anon = v["n2NotifySubscriptionId"].as_str().unwrap().to_string();
+        let g = ctx.read().unwrap();
+        assert!(g
+            .non_ue_nrppa_subscription_find(Some("lmf-sub-807"))
+            .is_none());
+        assert_eq!(
+            g.non_ue_nrppa_subscription_find(None)
+                .map(|s| s.subscription_id),
+            Some(anon.clone())
+        );
+        g.non_ue_n2_subscription_remove(&anon);
+    }
+
+    /// #903 review: the non-UE NRPPa queue is bounded; a transfer past it is
+    /// refused 500 INSUFFICIENT_RESOURCES, not queued.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_non_ue_nrppa_queue_refuses_the_transfer() {
+        let _ctx = crate::test_support::CONTEXT_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _serial = super::non_ue_nrppa_queue_test_lock().lock().await;
+        amf_context_init(64, 1024, 4096);
+        let ctx = crate::context::amf_self();
+        {
+            let g = ctx.read().unwrap();
+            let _ = g.non_ue_nrppa_drain();
+            for _ in 0..crate::context::MAX_PENDING_NON_UE_NRPPA {
+                assert!(g.non_ue_nrppa_add(crate::context::PendingNonUeNrppa {
+                    nrppa_pdu: vec![0],
+                    routing_id: b"x".to_vec(),
+                    target_gnb_ids: vec![1],
+                }));
+            }
+        }
+        let resp = namf_request_handler(non_ue_nrppa_transfer(json!({
+            "globalRanNodeList": [{ "plmnId": { "mcc": "001", "mnc": "01" },
+                "gNbId": { "bitLength": 22, "gNBValue": "000807" } }],
+            "n2Information": { "n2InformationClass": "NRPPa", "nrppaInfo": {
+                "nfId": "lmf-807",
+                "nrppaPdu": { "ngapIeType": "NRPPA_PDU", "ngapData": { "contentId": "nrppa-non-ue" } } } }
+        })))
+        .await;
+        assert_eq!(resp.status, 500);
+        let drained = ctx.read().unwrap().non_ue_nrppa_drain();
+        assert_eq!(drained.len(), crate::context::MAX_PENDING_NON_UE_NRPPA);
     }
 
     fn non_ue_n2_subscribe_request(body: Value) -> SbiRequest {

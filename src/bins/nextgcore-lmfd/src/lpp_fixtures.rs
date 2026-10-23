@@ -216,6 +216,57 @@ pub(crate) fn dl_tdoa_lpp(
     provide_location_information(transaction_number, ies)
 }
 
+/// #903 review: the answer to a Multi-RTT + DL-TDOA request, carrying both
+/// measurement sets in one `ProvideLocationInformation`.
+pub(crate) fn multi_rtt_and_dl_tdoa_lpp(
+    cells: &[(u16, u32)],
+    reference_prs_id: u8,
+    neighbours: &[(u8, Option<u16>, u32)],
+    transaction_number: u8,
+) -> Vec<u8> {
+    let mut ies = empty_ies();
+    ies.extensions.nr_multi_rtt_provide_location_information_r16 =
+        Some(lpp::NR_Multi_RTT_ProvideLocationInformation_r16 {
+            nr_multi_rtt_signal_measurement_information_r16: Some(
+                lpp::NR_Multi_RTT_SignalMeasurementInformation_r16 {
+                    nr_multi_rtt_meas_list_r16: lpp::NR_Multi_RTT_MeasList_r16(
+                        cells
+                            .iter()
+                            .map(|(pci, k0)| multi_rtt_element(*pci, *k0))
+                            .collect(),
+                    ),
+                    nr_nta_offset_r16: None,
+                    extensions: Default::default(),
+                },
+            ),
+            nr_multi_rtt_error_r16: None,
+            extensions: Default::default(),
+        });
+    ies.extensions.nr_dl_tdoa_provide_location_information_r16 =
+        Some(lpp::NR_DL_TDOA_ProvideLocationInformation_r16 {
+            nr_dl_tdoa_signal_measurement_information_r16: Some(
+                lpp::NR_DL_TDOA_SignalMeasurementInformation_r16 {
+                    dl_prs_reference_info_r16: lpp::DL_PRS_ID_Info_r16 {
+                        dl_prs_id_r16: lpp::DL_PRS_ID_Info_r16Dl_PRS_ID_r16(reference_prs_id),
+                        nr_dl_prs_resource_id_list_r16: None,
+                        nr_dl_prs_resource_set_id_r16: None,
+                    },
+                    nr_dl_tdoa_meas_list_r16: lpp::NR_DL_TDOA_MeasList_r16(
+                        neighbours
+                            .iter()
+                            .map(|(prs, pci, k0)| dl_tdoa_element(*prs, *pci, *k0))
+                            .collect(),
+                    ),
+                    extensions: Default::default(),
+                },
+            ),
+            nr_dl_tdoa_location_information_r16: None,
+            nr_dl_tdoa_error_r16: None,
+            extensions: Default::default(),
+        });
+    provide_location_information(transaction_number, ies)
+}
+
 /// An NR E-CID `ProvideLocationInformation` (TS 37.355 Rel-16): the primary cell
 /// `pci` with SS-RSRP `ss_rsrp` and SS-RSRQ `ss_rsrq` (report values), and one
 /// neighbour per `(pci, ss_rsrp)` with only an SS-RSRP.

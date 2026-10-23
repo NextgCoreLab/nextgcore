@@ -995,6 +995,7 @@ async fn initiate_positioning(
             corr: corr.clone(),
             lmf_id: lmf_id.clone(),
         };
+        let setup_started = std::time::Instant::now();
         namf_client::ensure_non_ue_nrppa_subscription(&amf, &lmf_id).await;
         let step = (budget / 5).min(Duration::from_secs(2));
         match crate::multi_rtt::prepare(&transport, step, budget.as_millis() as u32).await {
@@ -1004,7 +1005,9 @@ async fn initiate_positioning(
                     .ok()
                     .and_then(|c| c.positioning_session_find(&corr))
                     .map(|i| i.request_id);
-                let collect_for = budget.mul_f32(0.75);
+                // What is left of the budget after the setup, less a margin for
+                // the solve, is how long the gNBs' answers are waited for.
+                let collect_for = budget.saturating_sub(setup_started.elapsed()).mul_f32(0.75);
                 tokio::spawn(async move {
                     let cells = crate::multi_rtt::collect(&transport, prepared, collect_for).await;
                     log::info!("Multi-RTT: {} gNB half/halves collected", cells.len());
@@ -1021,12 +1024,12 @@ async fn initiate_positioning(
                 if let Ok(context) = lmf_self().read() {
                     context.positioning_session_withdraw_leg(&corr, MeasurementLeg::NrppaTrp);
                 }
-                method = crate::codec_glue::LppMethod::DlTdoa;
+                method = method_after_gnb_leg(method, false);
             }
         }
     }
 
-    let lpp_pdu = match crate::codec_glue::build_lpp_request(method, txn) {
+    let lpp_pdu = match lpp_request_for(method, txn) {
         Ok(pdu) => pdu,
         Err(e) => {
             if let Ok(context) = lmf_self().read() {
@@ -1077,6 +1080,33 @@ async fn initiate_positioning(
 /// to the LMF.
 const NRPPA_UE_MEASUREMENT_ID: u16 = 1;
 
+/// The LPP method once the gNB half's setup is known (#807): Multi-RTT stays
+/// only when the gNB half was set up; otherwise the UE is asked for DL-TDOA,
+/// which needs no gNB measurement.
+fn method_after_gnb_leg(
+    method: crate::codec_glue::LppMethod,
+    gnb_leg_prepared: bool,
+) -> crate::codec_glue::LppMethod {
+    match method {
+        crate::codec_glue::LppMethod::MultiRtt if !gnb_leg_prepared => {
+            crate::codec_glue::LppMethod::DlTdoa
+        }
+        m => m,
+    }
+}
+
+/// The LPP request for `method` (#903 review): a Multi-RTT request also asks for
+/// DL-TDOA, so that a gNB that fails or never answers the Measurement procedure
+/// after it was sent leaves a fix to fall back to, not a 500.
+fn lpp_request_for(method: crate::codec_glue::LppMethod, txn: u8) -> Result<Vec<u8>, String> {
+    match method {
+        crate::codec_glue::LppMethod::MultiRtt => {
+            crate::codec_glue::build_lpp_multi_rtt_with_dl_tdoa_request(txn)
+        }
+        m => crate::codec_glue::build_lpp_request(m, txn),
+    }
+}
+
 /// NRPPa through the serving AMF (#807): UE-associated over N1N2MessageTransfer,
 /// non-UE-associated over NonUeN2MessageTransfer.
 struct AmfNrppa {
@@ -1087,6 +1117,10 @@ struct AmfNrppa {
 }
 
 impl crate::multi_rtt::NrppaTransport for AmfNrppa {
+    fn session(&self) -> Option<String> {
+        Some(self.corr.clone())
+    }
+
     async fn send_ue(&self, pdu: Vec<u8>) -> bool {
         namf_client::send_n2_nrppa_transfer(
             &self.amf,
@@ -1157,7 +1191,19 @@ async fn await_positioning_outcome(
     corr: String,
     rx: tokio::sync::oneshot::Receiver<PositioningOutcome>,
 ) -> SbiResponse {
-    match tokio::time::timeout(wait_budget(input), rx).await {
+    await_positioning_outcome_within(input, corr, rx, wait_budget(input)).await
+}
+
+/// [`await_positioning_outcome`] with what is left of the budget (#903 review):
+/// the Multi-RTT gNB-half setup runs before the wait starts, and it counts
+/// against `maxRespTime`.
+async fn await_positioning_outcome_within(
+    input: &nlmf::InputData,
+    corr: String,
+    rx: tokio::sync::oneshot::Receiver<PositioningOutcome>,
+    budget: Duration,
+) -> SbiResponse {
+    match tokio::time::timeout(budget, rx).await {
         Ok(Ok(PositioningOutcome::Fix(est))) => encode_location_response(input, &est, 0),
         Ok(Ok(PositioningOutcome::SolverFailed)) => problem(
             500,
@@ -1427,11 +1473,13 @@ async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
 
     // A2: the live 5GC-MT-LR procedure — LPP request → Namf N1N2 POST to the
     // serving AMF → bounded wait on THIS session's completion channel.
+    let started = std::time::Instant::now();
     let (corr, rx) = match initiate_positioning(&input).await {
         Ok(pair) => pair,
         Err(resp) => return *resp,
     };
-    await_positioning_outcome(&input, corr, rx).await
+    let left = wait_budget(&input).saturating_sub(started.elapsed());
+    await_positioning_outcome_within(&input, corr, rx, left).await
 }
 
 /// A5: whether the `DetermineLocation` request body media type is supported.
@@ -3063,7 +3111,7 @@ async fn handle_n2_info_notify(request: &SbiRequest) -> SbiResponse {
         if kind != crate::nrppa_positioning::Kind::Initiating {
             let delivered = lmf_self()
                 .read()
-                .map(|c| c.nrppa_deliver(procedure, txn, nrppa_bytes.clone()))
+                .map(|c| c.nrppa_deliver(procedure, txn, lcs_correlation_id, nrppa_bytes.clone()))
                 .unwrap_or(false);
             if delivered {
                 return SbiResponse::no_content();
@@ -5110,6 +5158,34 @@ lmf:
             detail.contains("lmf.positioning.cells"),
             "the detail must name the configuration to provision, not just say 'failed'; got \
              {detail}"
+        );
+    }
+
+    /// #903 review MAJOR 2: a Multi-RTT request also asks for DL-TDOA, and a
+    /// Multi-RTT session whose gNB half could not be set up asks for DL-TDOA only.
+    #[test]
+    fn a_multi_rtt_request_carries_its_dl_tdoa_fallback() {
+        use crate::codec_glue::LppMethod;
+        assert_eq!(
+            method_after_gnb_leg(LppMethod::MultiRtt, false),
+            LppMethod::DlTdoa
+        );
+        assert_eq!(
+            method_after_gnb_leg(LppMethod::MultiRtt, true),
+            LppMethod::MultiRtt
+        );
+        assert_eq!(
+            method_after_gnb_leg(LppMethod::NrEcid, false),
+            LppMethod::NrEcid
+        );
+        let bytes = lpp_request_for(LppMethod::MultiRtt, 3).unwrap();
+        let msg = nextgcore_lpp_gen::decode(&bytes).unwrap();
+        let dbg = format!("{msg:?}");
+        assert!(dbg.contains("nr_multi_rtt_request_location_information_r16: Some("));
+        assert!(dbg.contains("nr_dl_tdoa_request_location_information_r16: Some("));
+        assert_eq!(
+            lpp_request_for(LppMethod::DlTdoa, 3).unwrap(),
+            codec_glue::build_lpp_request(LppMethod::DlTdoa, 3).unwrap()
         );
     }
 
@@ -7481,6 +7557,7 @@ mod positioning_chain_strict_peer {
         let waiter = lmf_self().read().unwrap().nrppa_wait(
             nextgcore_nrppa_gen::generated::ID_T_RP_INFORMATION_EXCHANGE,
             txn.0,
+            None,
         );
         assert_eq!(handle_n2_info_notify(&notify).await.status, 204);
         let got = tokio::time::timeout(Duration::from_secs(1), waiter)

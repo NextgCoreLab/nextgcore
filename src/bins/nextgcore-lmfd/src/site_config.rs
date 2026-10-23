@@ -77,7 +77,7 @@ pub struct SiteCoord {
 ///         gnbId: "000001"     # hex, TS 29.571 GNbId.gNBValue
 ///         bitLength: 22       # 22..32, TS 38.413 gNB-ID
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NgRanNode {
     pub mcc: String,
     pub mnc: String,
@@ -150,6 +150,9 @@ pub struct SiteConfig {
     pub trps: Vec<SiteCoord>,
     /// The NG-RAN nodes whose TRPs measure the gNB half of Multi-RTT (#807).
     pub ng_ran_nodes: Vec<NgRanNode>,
+    /// `lmf.positioning.srsBandwidthMhz`: the FR1 SRS bandwidth the Positioning
+    /// Information Request asks for (#903 review). `None` keeps the default.
+    pub srs_bandwidth_mhz: Option<u16>,
     /// One message per rejected entry, so a mistyped coordinate is visible in the
     /// startup log rather than silently absent from the registry.
     pub rejected: Vec<String>,
@@ -196,6 +199,17 @@ pub fn parse_site_config(doc: &serde_yaml::Value) -> SiteConfig {
             &mut out.trps,
             &mut out.rejected,
         );
+        if let Some(v) = positioning.get("srsBandwidthMhz") {
+            match v.as_u64().and_then(|m| u16::try_from(m).ok()) {
+                Some(mhz) if crate::nrppa_downlink::fr1_srs_bandwidth(mhz).is_some() => {
+                    out.srs_bandwidth_mhz = Some(mhz)
+                }
+                _ => out.rejected.push(format!(
+                    "lmf.positioning.srsBandwidthMhz: {v:?} is not a TS 38.455 FR1 SRS \
+                     bandwidth (5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80, 90, 100, 160, 200)"
+                )),
+            }
+        }
         if let Some(seq) = positioning.get("ngRanNodes").and_then(|n| n.as_sequence()) {
             for (idx, entry) in seq.iter().enumerate() {
                 match parse_ng_ran_node(entry) {
@@ -296,6 +310,9 @@ pub fn load_into_context(config_path: &str) -> SiteConfig {
     for reason in &cfg.rejected {
         log::error!("LMF positioning: rejected {reason}");
     }
+    if let Some(mhz) = cfg.srs_bandwidth_mhz {
+        crate::nrppa_downlink::set_srs_bandwidth_mhz(mhz);
+    }
     if !cfg.ng_ran_nodes.is_empty() {
         log::info!(
             "LMF positioning: {} NG-RAN node(s) configured for the Multi-RTT gNB half (#807)",
@@ -345,6 +362,9 @@ pub fn apply(cfg: &SiteConfig) {
         guard.set_cell_coord(site.id.clone(), site.coord);
     }
     guard.set_ng_ran_nodes(cfg.ng_ran_nodes.clone());
+    if let Some(mhz) = cfg.srs_bandwidth_mhz {
+        crate::nrppa_downlink::set_srs_bandwidth_mhz(mhz);
+    }
 }
 
 #[cfg(test)]

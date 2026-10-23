@@ -38,6 +38,10 @@ pub trait NrppaTransport: Send + Sync {
     fn send_ue(&self, pdu: Vec<u8>) -> impl Future<Output = bool> + Send;
     /// Send a non-UE-associated NRPPa PDU to `node`.
     fn send_non_ue(&self, node: &NgRanNode, pdu: Vec<u8>) -> impl Future<Output = bool> + Send;
+    /// The session the UE-associated answers must name (#903 review).
+    fn session(&self) -> Option<String> {
+        None
+    }
 }
 
 /// One MEASUREMENT REQUEST in flight.
@@ -59,11 +63,12 @@ pub struct PreparedGnbLeg {
 async fn exchange(
     procedure: u8,
     txn: u16,
+    session: Option<&str>,
     send: impl Future<Output = bool>,
     timeout: Duration,
 ) -> Result<Vec<u8>, String> {
     let rx = match lmf_self().read() {
-        Ok(c) => c.nrppa_wait(procedure, txn),
+        Ok(c) => c.nrppa_wait(procedure, txn, session),
         Err(_) => return Err("context lock poisoned".to_string()),
     };
     let unwait = || {
@@ -96,12 +101,19 @@ async fn ensure_trp_information<T: NrppaTransport>(t: &T, timeout: Duration) {
         if known.iter().any(|(n, _)| *n == node) {
             continue;
         }
+        if lmf_self()
+            .read()
+            .is_ok_and(|c| c.trp_information_backed_off(&node))
+        {
+            continue;
+        }
         let Ok((txn, pdu)) = nrppa_downlink::build_trp_information(&[]) else {
             continue;
         };
         match exchange(
             nrppa::ID_T_RP_INFORMATION_EXCHANGE,
             txn.0,
+            None,
             t.send_non_ue(&node, pdu),
             timeout,
         )
@@ -114,7 +126,16 @@ async fn ensure_trp_information<T: NrppaTransport>(t: &T, timeout: Duration) {
                     c.note_trp_information(&node, trps);
                 }
             }
-            Err(e) => log::warn!("Multi-RTT: TRP Information Exchange with {node:?}: {e}"),
+            Err(e) => {
+                log::warn!(
+                    "Multi-RTT: TRP Information Exchange with {node:?}: {e}; not asked again for \
+                     {:?}",
+                    crate::context::TRP_INFORMATION_RETRY
+                );
+                if let Ok(c) = lmf_self().read() {
+                    c.note_trp_information_failed(&node);
+                }
+            }
         }
     }
 }
@@ -130,22 +151,33 @@ pub async fn prepare<T: NrppaTransport>(
     response_time_ms: u32,
 ) -> Result<PreparedGnbLeg, String> {
     ensure_trp_information(t, step_timeout).await;
-    let trps: Vec<(NgRanNode, u16)> = lmf_self()
+    let all = lmf_self()
         .read()
         .map(|c| c.trp_information())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // #903 review: a PCI on several TRPs cannot key a TRP, so those TRPs are not
+    // measured (their halves could not be paired with the right UE half).
+    let ambiguous = answers::ambiguous_pcis(all.iter().map(|(_, t)| t));
+    if !ambiguous.is_empty() {
+        log::warn!(
+            "Multi-RTT: PCIs {ambiguous:?} are on more than one TRP; those TRPs are not measured"
+        );
+    }
+    let trps: Vec<(NgRanNode, u16)> = all
         .into_iter()
-        .filter(|(_, info)| info.pci.is_some())
+        .filter(|(_, info)| info.pci.is_some_and(|p| !ambiguous.contains(&p)))
         .map(|(node, info)| (node, info.trp_id))
         .collect();
     if trps.is_empty() {
         return Err("no NG-RAN node reported a TRP with an NR PCI".to_string());
     }
 
+    let session = t.session();
     let (txn, pdu) = nrppa_downlink::build_positioning_information_request()?;
     let info = exchange(
         nrppa::ID_POSITIONING_INFORMATION_EXCHANGE,
         txn.0,
+        session.as_deref(),
         t.send_ue(pdu),
         step_timeout,
     )
@@ -164,6 +196,7 @@ pub async fn prepare<T: NrppaTransport>(
         exchange(
             nrppa::ID_POSITIONING_ACTIVATION,
             txn.0,
+            session.as_deref(),
             t.send_ue(pdu),
             step_timeout,
         )
@@ -195,7 +228,7 @@ pub async fn prepare<T: NrppaTransport>(
                 response_time_ms: Some(response_time_ms),
             })?;
         let answer = match lmf_self().read() {
-            Ok(c) => c.nrppa_wait(nrppa::ID_MEASUREMENT, txn.0),
+            Ok(c) => c.nrppa_wait(nrppa::ID_MEASUREMENT, txn.0, None),
             Err(_) => continue,
         };
         if t.send_non_ue(&node, pdu).await {
@@ -251,6 +284,7 @@ pub async fn collect<T: NrppaTransport>(
         .read()
         .map(|c| c.trp_information())
         .unwrap_or_default();
+    let ambiguous = answers::ambiguous_pcis(trps.iter().map(|(_, t)| t));
     let mut cells = Vec::new();
     for m in prepared.measurements {
         let answer = tokio::time::timeout_at(deadline, m.answer).await;
@@ -274,7 +308,8 @@ pub async fn collect<T: NrppaTransport>(
                     let pci = trps
                         .iter()
                         .find(|(n, info)| *n == m.node && info.trp_id == h.trp_id)
-                        .and_then(|(_, info)| info.pci);
+                        .and_then(|(_, info)| info.pci)
+                        .filter(|p| !ambiguous.contains(p));
                     let (Some(pci), Some(rx_tx)) = (pci, h.rx_tx_ns) else {
                         log::warn!(
                             "Multi-RTT: TRP {} of {:?}: no PCI known or an open-ended gNB \

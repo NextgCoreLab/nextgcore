@@ -58,6 +58,19 @@ struct FakeNgRan {
     /// The gNB measures at SFN 700, slot `gnb_slot` (30 kHz). The UE's LPP
     /// fixture is stamped SFN 700, slot 11.
     gnb_slot: u8,
+    /// An extra TRP `(id, pci, east, north)` reported in TRP Information and
+    /// measured (#903 review: a PCI shared by two TRPs).
+    extra: Option<(u16, u16, f64, f64)>,
+    /// Answer the Measurement procedure with MEASUREMENT FAILURE.
+    measurement_fails: bool,
+    /// Never answer TRP Information Exchange.
+    silent_trp_information: bool,
+}
+
+impl FakeNgRan {
+    fn trps(&self) -> Vec<(u16, u16, f64, f64)> {
+        TRPS.iter().copied().chain(self.extra).collect()
+    }
 }
 
 impl FakeNgRan {
@@ -72,8 +85,12 @@ impl FakeNgRan {
             .push((procedure, ue, pdu.to_vec()));
         let answer = match m.value {
             nrppa::InitiatingMessageValue::Id_tRPInformationExchange(_) => {
+                if self.silent_trp_information {
+                    return true;
+                }
                 let scale = f64::from(1u32 << 31);
-                let trps: Vec<_> = TRPS
+                let trps: Vec<_> = self
+                    .trps()
                     .iter()
                     .map(|(id, pci, e, n)| {
                         let c = coord(*e, *n);
@@ -106,9 +123,32 @@ impl FakeNgRan {
                         _ => None,
                     })
                     .expect("LMF-Measurement-ID");
+                if self.measurement_fails {
+                    let answer = gnb::measurement_failure(txn, lmf_id);
+                    lmf_self()
+                        .read()
+                        .unwrap()
+                        .nrppa_deliver(procedure, txn, None, answer);
+                    return true;
+                }
                 // gNB Rx-Tx_i = (gap - offset) + t_i, as a k1 code:
                 // T = (2v - 985024)·T_c.
-                let results: Vec<_> = TRPS
+                let requested: Vec<u16> = req
+                    .protocol_i_es
+                    .0
+                    .iter()
+                    .find_map(|ie| match &ie.value {
+                        nrppa::MeasurementRequestProtocolIEs_EntryValue::Id_TRP_MeasurementRequestList(l) => {
+                            Some(l.0.iter().map(|t| t.trp_id.0).collect())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let results: Vec<_> = self
+                    .trps()
+                    .into_iter()
+                    .filter(|(id, ..)| requested.contains(id))
+                    .collect::<Vec<_>>()
                     .iter()
                     .map(|(id, _, e, n)| {
                         let t = propagation_ns(*e, *n) - UE_CLOCK_OFFSET_NS + SRS_AFTER_PRS_NS;
@@ -130,7 +170,7 @@ impl FakeNgRan {
             lmf_self()
                 .read()
                 .unwrap()
-                .nrppa_deliver(procedure, txn, answer),
+                .nrppa_deliver(procedure, txn, None, answer),
             "nobody waited for the answer to procedure {procedure} transaction {txn}"
         );
         true
@@ -345,7 +385,7 @@ async fn no_srs_configuration_means_no_gnb_half() {
                 lmf_self()
                     .read()
                     .unwrap()
-                    .nrppa_deliver(procedure, txn, answer);
+                    .nrppa_deliver(procedure, txn, None, answer);
                 return true;
             }
             self.0.answer(&pdu, true)
@@ -370,5 +410,159 @@ async fn no_srs_configuration_means_no_gnb_half() {
             .iter()
             .any(|(p, _, _)| *p == nrppa::ID_MEASUREMENT),
         "no Measurement Request without the SRS to measure"
+    );
+}
+
+/// The UE's answer to the Multi-RTT + DL-TDOA request: both sets.
+fn ue_halves_and_rstds() -> Vec<CellMeasurement> {
+    let cells: Vec<(u16, u32)> = TRPS
+        .iter()
+        .map(|(_, pci, e, n)| {
+            let t = propagation_ns(*e, *n) + UE_CLOCK_OFFSET_NS - SRS_AFTER_PRS_NS;
+            (*pci, (t / TC_NS + 985_024.0).round() as u32)
+        })
+        .collect();
+    // RSTDs relative to TRP 1 (DL-PRS 0), neighbours by DL-PRS and PCI.
+    let d_ref = propagation_ns(TRPS[0].2, TRPS[0].3);
+    let neighbours: Vec<(u8, Option<u16>, u32)> = TRPS[1..]
+        .iter()
+        .enumerate()
+        .map(|(i, (_, pci, e, n))| {
+            let rstd = propagation_ns(*e, *n) - d_ref;
+            (
+                (i + 1) as u8,
+                Some(*pci),
+                (rstd / TC_NS + 985_024.0).round() as u32,
+            )
+        })
+        .collect();
+    let bytes = crate::lpp_fixtures::multi_rtt_and_dl_tdoa_lpp(&cells, 0, &neighbours, 7);
+    crate::codec_glue::decode_lpp_provide_report(&bytes)
+        .expect("decodes")
+        .1
+}
+
+/// #903 review MAJOR 2: once the Measurement Request has gone out, a gNB that
+/// answers MEASUREMENT FAILURE leaves no gNB half. The UE was asked for DL-TDOA
+/// too, so the session falls back to a DL-TDOA fix instead of ending in 500.
+#[tokio::test]
+async fn a_measurement_failure_falls_back_to_the_dl_tdoa_fix() {
+    let _g = PROCESS_STATE_TEST_LOCK.lock().await;
+    setup();
+    let ran = FakeNgRan {
+        measurement_fails: true,
+        ..Default::default()
+    };
+    let prepared = prepare(&ran, Duration::from_secs(1), 1_000).await.unwrap();
+    let (request_id, _corr, mut rx) = register();
+    let ctx = lmf_self();
+    // DL-TDOA needs the reference TRP, which reports no PCI: key it by DL-PRS ID.
+    ctx.read()
+        .unwrap()
+        .set_cell_coord("prs-0", coord(TRPS[0].2, TRPS[0].3));
+    ctx.read().unwrap().measurement_leg_report(
+        request_id,
+        MeasurementLeg::Lpp,
+        ue_halves_and_rstds(),
+    );
+    let cells = collect(&ran, prepared, Duration::from_secs(1)).await;
+    assert!(cells.is_empty(), "MEASUREMENT FAILURE gives no gNB half");
+    let progress =
+        ctx.read()
+            .unwrap()
+            .measurement_leg_report(request_id, MeasurementLeg::NrppaTrp, cells);
+    let LegProgress::Completed(Some(fix)) = progress else {
+        panic!("a DL-TDOA fix, not a failure: {progress:?}");
+    };
+    assert_eq!(fix.method_used.as_deref(), Some("DL_TDOA"));
+    let got = geodetic_to_enu(TrpCoord::new(fix.latitude, fix.longitude, 0.0), origin());
+    assert!((got.e - UE.0).hypot(got.n - UE.1) < 1.0);
+    assert!(matches!(rx.try_recv(), Ok(PositioningOutcome::Fix(_))));
+}
+
+/// #903 review MAJOR 1: two TRPs under one PCI (a multi-TRP cell, or PCI reuse).
+/// TRP 5 shares PCI 201 with TRP 1 at another site. Keyed by PCI, the halves of
+/// the two were summed and the range came out as (d1 + d5)/2. That PCI is now not
+/// measured and its position is not learned; the other three TRPs are measured.
+#[tokio::test]
+async fn a_pci_on_two_trps_is_not_ranged() {
+    let _g = PROCESS_STATE_TEST_LOCK.lock().await;
+    setup();
+    let ran = FakeNgRan {
+        gnb_slot: 12,
+        extra: Some((5, 201, 2000.0, 300.0)),
+        ..Default::default()
+    };
+    let prepared = prepare(&ran, Duration::from_secs(1), 1_000).await.unwrap();
+    // The Measurement Request names neither TRP of PCI 201.
+    let seen = ran.seen.lock().unwrap().clone();
+    let (_, _, req) = seen
+        .iter()
+        .find(|(p, ..)| *p == nrppa::ID_MEASUREMENT)
+        .unwrap();
+    let nrppa::NRPPA_PDU::InitiatingMessage(m) = nextgcore_nrppa_gen::decode(req).unwrap() else {
+        unreachable!()
+    };
+    let nrppa::InitiatingMessageValue::Id_Measurement(r) = m.value else {
+        unreachable!()
+    };
+    assert!(r.protocol_i_es.0.iter().any(|ie| matches!(&ie.value,
+        nrppa::MeasurementRequestProtocolIEs_EntryValue::Id_TRP_MeasurementRequestList(l)
+            if l.0.iter().map(|t| t.trp_id.0).collect::<Vec<_>>() == [2, 3, 4])));
+    assert!(
+        lmf_self()
+            .read()
+            .unwrap()
+            .build_trp_registry()
+            .lookup("pci-201")
+            .is_none(),
+        "no coordinate is learned for an ambiguous PCI"
+    );
+    let (request_id, _corr, _rx) = register();
+    let ctx = lmf_self();
+    ctx.read()
+        .unwrap()
+        .measurement_leg_report(request_id, MeasurementLeg::Lpp, ue_halves());
+    let cells = collect(&ran, prepared, Duration::from_secs(1)).await;
+    assert_eq!(cells.len(), 3);
+    let LegProgress::Completed(Some(fix)) =
+        ctx.read()
+            .unwrap()
+            .measurement_leg_report(request_id, MeasurementLeg::NrppaTrp, cells)
+    else {
+        panic!("three unambiguous TRPs solve");
+    };
+    // Three TRPs remain, which the Multi-RTT solver ranges (its 3-D solve is not
+    // pinned by three ranges, so the position itself is not asserted here; the
+    // four-TRP test does that).
+    assert_eq!(fix.method_used.as_deref(), Some("MULTI-RTT"));
+}
+
+/// #903 review MINOR 1: a node that does not answer TRP Information is not asked
+/// again on the next request, so it does not cost every request a timeout.
+#[tokio::test]
+async fn a_silent_node_is_backed_off() {
+    let _g = PROCESS_STATE_TEST_LOCK.lock().await;
+    setup();
+    let ran = FakeNgRan {
+        silent_trp_information: true,
+        ..Default::default()
+    };
+    assert!(prepare(&ran, Duration::from_millis(50), 1_000)
+        .await
+        .is_err());
+    assert!(prepare(&ran, Duration::from_millis(50), 1_000)
+        .await
+        .is_err());
+    let asked = ran
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(p, ..)| *p == nrppa::ID_T_RP_INFORMATION_EXCHANGE)
+        .count();
+    assert_eq!(
+        asked, 1,
+        "the second request does not ask the silent node again"
     );
 }

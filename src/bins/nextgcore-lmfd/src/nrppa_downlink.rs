@@ -268,10 +268,28 @@ fn encode_trp_information_request(
 // §8.2.10, §8.5.1)
 // ---------------------------------------------------------------------------
 
-/// The SRS bandwidth asked for in the Positioning Information Request: 20 MHz in
-/// FR1. TS 38.455 §8.2.6.2 has the gNB "take this information into account", so it
-/// is a preference the gNB may override with its own carrier, not a demand.
-const REQUESTED_SRS_BANDWIDTH_FR1: u8 = nrppa::BandwidthSRS_fR1::M_HZ20;
+/// The FR1 SRS bandwidth asked for in the Positioning Information Request, as the
+/// `BandwidthSRS.fR1` enumeration index. TS 38.455 §8.2.6.2 has the gNB "take
+/// this information into account", so it is a preference, not a demand. 20 MHz
+/// unless `lmf.positioning.srsBandwidthMhz` says otherwise (#903 review).
+static REQUESTED_SRS_BANDWIDTH_FR1: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(nrppa::BandwidthSRS_fR1::M_HZ20);
+
+/// The `BandwidthSRS.fR1` index of `mhz` (TS 38.455: mHz5, 10, 20, 40, 50, 80,
+/// 100, then the extensions 160, 200, 15, 25, 30, 60, 35, 45, 70, 90), or `None`.
+pub fn fr1_srs_bandwidth(mhz: u16) -> Option<u8> {
+    const ORDER: [u16; 17] = [
+        5, 10, 20, 40, 50, 80, 100, 160, 200, 15, 25, 30, 60, 35, 45, 70, 90,
+    ];
+    ORDER.iter().position(|&m| m == mhz).map(|i| i as u8)
+}
+
+/// Set the requested FR1 SRS bandwidth (startup configuration).
+pub fn set_srs_bandwidth_mhz(mhz: u16) {
+    if let Some(index) = fr1_srs_bandwidth(mhz) {
+        REQUESTED_SRS_BANDWIDTH_FR1.store(index, Ordering::Relaxed);
+    }
+}
 
 /// Build a `POSITIONING INFORMATION REQUEST` (TS 38.455 §8.2.6, procedure code 9),
 /// UE-associated, toward the serving gNB.
@@ -301,7 +319,7 @@ fn encode_positioning_information_request(txn: NrppaTransactionId) -> Result<Vec
                     nrppa::RequestedSRSTransmissionCharacteristicsResourceType::SEMI_PERSISTENT,
                 ),
                 bandwidth: nrppa::BandwidthSRS::FR1(nrppa::BandwidthSRS_fR1(
-                    REQUESTED_SRS_BANDWIDTH_FR1,
+                    REQUESTED_SRS_BANDWIDTH_FR1.load(Ordering::Relaxed),
                 )),
                 list_of_srs_resource_set: None,
                 ssb_information: None,
@@ -952,5 +970,17 @@ mod tests {
             Some((128, nrppa::ResponseTimeTimeUnit::TEN_MILLISECONDS))
         );
         assert_eq!(rt(20_000), Some((20, nrppa::ResponseTimeTimeUnit::SECOND)));
+    }
+
+    /// #903 review MINOR 5: the requested SRS bandwidth follows the TS 38.455
+    /// `BandwidthSRS.fR1` enumeration, root values first, then the extensions.
+    #[test]
+    fn fr1_srs_bandwidths_map_to_their_enumeration_index() {
+        assert_eq!(fr1_srs_bandwidth(5), Some(0));
+        assert_eq!(fr1_srs_bandwidth(20), Some(nrppa::BandwidthSRS_fR1::M_HZ20));
+        assert_eq!(fr1_srs_bandwidth(100), Some(6));
+        assert_eq!(fr1_srs_bandwidth(160), Some(7));
+        assert_eq!(fr1_srs_bandwidth(90), Some(16));
+        assert_eq!(fr1_srs_bandwidth(21), None);
     }
 }
