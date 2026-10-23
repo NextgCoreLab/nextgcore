@@ -850,7 +850,39 @@ pub struct NgapServer {
     /// Whether an NGAP Overload Start has been broadcast and not yet stopped, so the
     /// signal is sent on transitions only (TS 38.413 §8.7.6/§8.7.7).
     ngap_overload_declared: bool,
+    /// AMF UE NGAP IDs this AMF allocated to an NG connection that has no NAS
+    /// context, with the (association, RAN UE NGAP ID) they were allocated on (#758).
+    /// Today that is a CM-IDLE Service Request answered SERVICE REJECT #9: the UE,
+    /// as told, registers afresh on the same connection, and only then may the
+    /// Uplink NAS Transport create a context under the ID. Bounded by
+    /// [`MAX_CONTEXTLESS_UE_IDS`], oldest first.
+    contextless_ue_ids: std::collections::VecDeque<ContextlessUeId>,
 }
+
+/// What [`NgapServer::take_contextless_ue_id`] found (#758).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextlessLookup {
+    /// Allocated to this association and RAN UE NGAP ID.
+    Matches,
+    /// Allocated to this association, but to another RAN UE NGAP ID.
+    Inconsistent,
+    /// Never allocated without a context on this association (or no longer
+    /// remembered).
+    Unknown,
+}
+
+/// An AMF UE NGAP ID allocated to an NG connection that has no NAS context (#758).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContextlessUeId {
+    amf_ue_ngap_id: u64,
+    association_id: u64,
+    ran_ue_ngap_id: u32,
+}
+
+/// How many [`ContextlessUeId`]s the AMF remembers (#758). A UE re-registers
+/// within seconds of its SERVICE REJECT. The bound only stops a gNB that sends
+/// Service Requests nobody can resolve from growing the list without limit.
+const MAX_CONTEXTLESS_UE_IDS: usize = 4096;
 
 impl NgapServer {
     /// Create a new NGAP server on the selected SCTP backend.
@@ -929,6 +961,7 @@ impl NgapServer {
             eps_ho_in_flight: HashMap::new(),
             emergency: crate::emergency::EmergencyHandler::new(),
             ngap_overload_declared: false,
+            contextless_ue_ids: std::collections::VecDeque::new(),
             timer_configs: {
                 // Reachability timers derive from the CONFIGURED T3512
                 // (`amf.time.t3512.value`), per TS 24.501 §5.3.7, with
@@ -1050,6 +1083,9 @@ impl NgapServer {
                 reason,
             } => {
                 self.outbound_streams.remove(&association_id);
+                // #758: the connections allocated there are gone with it.
+                self.contextless_ue_ids
+                    .retain(|c| c.association_id != association_id);
                 self.handle_association_closed(association_id, &reason)
                     .await?;
             }
@@ -1778,6 +1814,8 @@ impl NgapServer {
             log::warn!("NG Reset from unknown association {association_id}");
             return Ok(());
         };
+        // #758: a reset connection's contextless allocation goes with it.
+        self.drop_contextless_ue_ids_for_reset(association_id, &reset.reset_type);
 
         // Drop pending authentication state for the affected UEs.
         //
@@ -2125,6 +2163,13 @@ impl NgapServer {
                 log::warn!(
                     "Service Request in Initial UE Message without stored context: rejecting (#9)"
                 );
+                // #758: allocated to this connection with no NAS context, as in
+                // `reject_idle_service_request`.
+                self.remember_contextless_ue_id(
+                    association_id,
+                    amf_ue_ngap_id,
+                    initial_ue.ran_ue_ngap_id,
+                );
                 let reject = gmm_build::build_service_reject(
                     &AmfUe::default(),
                     GmmCause::UeIdentityCannotBeDerivedByTheNetwork,
@@ -2253,14 +2298,66 @@ impl NgapServer {
         // here, exactly as the Initial UE Message path creates it. Before #675 it fell
         // to the "unknown UE" branch and was answered REGISTRATION REJECT #9 on every
         // T3511 retry: after an AMF restart the UE could never register again.
+        //
+        // #758: only for an ID this AMF allocated to THIS connection (association and
+        // RAN UE NGAP ID), which `reject_idle_service_request` recorded. An ID never
+        // allocated, or allocated elsewhere, is answered with an Error Indication
+        // (TS 38.413 §10.6), not given a context: such an ID could later be allocated
+        // to a different UE, and one context per invented ID is unbounded.
         if !self.ue_auth_state.contains(ul_nas.amf_ue_ngap_id) {
-            if let Some(state) = fresh_context_for_initial_registration(association_id, &ul_nas) {
-                log::info!(
-                    "UE {}: initial Registration Request on an NG connection with no NAS \
-                     context; creating one (TS 24.501 §5.5.1.2)",
-                    ul_nas.amf_ue_ngap_id
-                );
-                self.ue_auth_state.insert(ul_nas.amf_ue_ngap_id, state);
+            match self.take_contextless_ue_id(
+                association_id,
+                ul_nas.amf_ue_ngap_id,
+                ul_nas.ran_ue_ngap_id,
+            ) {
+                ContextlessLookup::Matches => {
+                    match fresh_context_for_initial_registration(association_id, &ul_nas) {
+                        Some(state) => {
+                            log::info!(
+                                "UE {}: initial Registration Request on an NG connection with \
+                                 no NAS context; creating one (TS 24.501 §5.5.1.2)",
+                                ul_nas.amf_ue_ngap_id
+                            );
+                            self.ue_auth_state.insert(ul_nas.amf_ue_ngap_id, state);
+                        }
+                        // Not (yet) an initial registration: the connection keeps its
+                        // allocation for the one that follows.
+                        None => self.remember_contextless_ue_id(
+                            association_id,
+                            ul_nas.amf_ue_ngap_id,
+                            ul_nas.ran_ue_ngap_id,
+                        ),
+                    }
+                }
+                lookup => {
+                    // Known deviation from TS 38.413 §10.6, Inconsistent case: §10.6 has
+                    // both nodes locally release the logical connection "having the
+                    // erroneous AP ID". The allocation is kept instead, for the genuine
+                    // connection it belongs to: a peer naming a wrong RAN UE NGAP ID
+                    // must not be able to tear down another UE's pending registration.
+                    // Only the Error Indication is sent.
+                    let cause = match lookup {
+                        ContextlessLookup::Inconsistent => {
+                            ngap_gen::CauseRadioNetwork::INCONSISTENT_REMOTE_UE_NGAP_ID
+                        }
+                        _ => ngap_gen::CauseRadioNetwork::UNKNOWN_LOCAL_UE_NGAP_ID,
+                    };
+                    log::warn!(
+                        "Uplink NAS Transport on association {association_id} names AMF UE NGAP \
+                         ID {} (RAN UE NGAP ID {}), which has no context here: Error Indication \
+                         ({lookup:?}, TS 38.413 §10.6)",
+                        ul_nas.amf_ue_ngap_id,
+                        ul_nas.ran_ue_ngap_id
+                    );
+                    return self
+                        .send_error_indication(
+                            association_id,
+                            Some(ul_nas.amf_ue_ngap_id),
+                            Some(ul_nas.ran_ue_ngap_id),
+                            ngap_gen::Cause::RadioNetwork(ngap_gen::CauseRadioNetwork(cause)),
+                        )
+                        .await;
+                }
             }
         }
 
@@ -5730,6 +5827,79 @@ impl NgapServer {
         Ok(())
     }
 
+    /// Record that `amf_ue_ngap_id` was allocated to (association, RAN UE NGAP ID)
+    /// with no NAS context behind it (#758).
+    fn remember_contextless_ue_id(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+    ) {
+        self.contextless_ue_ids
+            .retain(|c| c.amf_ue_ngap_id != amf_ue_ngap_id);
+        if self.contextless_ue_ids.len() >= MAX_CONTEXTLESS_UE_IDS {
+            self.contextless_ue_ids.pop_front();
+        }
+        self.contextless_ue_ids.push_back(ContextlessUeId {
+            amf_ue_ngap_id,
+            association_id,
+            ran_ue_ngap_id,
+        });
+    }
+
+    /// Forget the contextless allocations of the NG connections an NG Reset from
+    /// `association_id` resets (#758): every one on the association for a whole
+    /// reset; for a partial one, each that an item names by either ID.
+    fn drop_contextless_ue_ids_for_reset(
+        &mut self,
+        association_id: u64,
+        reset_type: &nextgcore_ngap::types::ResetType,
+    ) {
+        use nextgcore_ngap::types::ResetType;
+        match reset_type {
+            ResetType::NgInterface => self
+                .contextless_ue_ids
+                .retain(|c| c.association_id != association_id),
+            ResetType::PartOfNgInterface(items) => self.contextless_ue_ids.retain(|c| {
+                c.association_id != association_id
+                    || !items.iter().any(|item| {
+                        item.amf_ue_ngap_id == Some(c.amf_ue_ngap_id)
+                            || item.ran_ue_ngap_id == Some(c.ran_ue_ngap_id)
+                    })
+            }),
+        }
+    }
+
+    /// Whether `amf_ue_ngap_id` was allocated to exactly this connection with no
+    /// NAS context (#758). A match is consumed.
+    fn take_contextless_ue_id(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+    ) -> ContextlessLookup {
+        let Some(pos) = self
+            .contextless_ue_ids
+            .iter()
+            .position(|c| c.amf_ue_ngap_id == amf_ue_ngap_id)
+        else {
+            return ContextlessLookup::Unknown;
+        };
+        let c = self.contextless_ue_ids[pos];
+        // TS 38.413 §10.6: an AP ID is local to its NG interface. On another
+        // association the ID names no logical connection there at all, so it is an
+        // unknown local ID, and saying "inconsistent" would tell that gNB the ID is
+        // live elsewhere.
+        if c.association_id != association_id {
+            return ContextlessLookup::Unknown;
+        }
+        if c.ran_ue_ngap_id != ran_ue_ngap_id {
+            return ContextlessLookup::Inconsistent;
+        }
+        self.contextless_ue_ids.remove(pos);
+        ContextlessLookup::Matches
+    }
+
     /// SERVICE REJECT #9 for a CM-IDLE Service Request the AMF cannot accept
     /// (TS 24.501 §5.6.1.5): the UE re-registers.
     async fn reject_idle_service_request(
@@ -5740,6 +5910,8 @@ impl NgapServer {
         why: &str,
     ) -> Result<()> {
         log::warn!("Service Request in Initial UE Message rejected (#9): {why}");
+        // #758: the ID is allocated to this connection with no NAS context behind it.
+        self.remember_contextless_ue_id(association_id, amf_ue_ngap_id, ran_ue_ngap_id);
         let reject = gmm_build::build_service_reject(
             &AmfUe::default(),
             GmmCause::UeIdentityCannotBeDerivedByTheNetwork,
@@ -8460,6 +8632,12 @@ impl NgapServer {
             }
             Undecodable => None,
         };
+        // #758: the released NG connection's contextless allocation goes with it, so
+        // the gNB cannot later mint a context under the released ID.
+        if let Some(id) = amf_ue_ngap_id {
+            self.contextless_ue_ids
+                .retain(|c| !(c.association_id == association_id && c.amf_ue_ngap_id == id));
+        }
         // The N1 signalling connection is gone: a registered UE is now CM-IDLE, which
         // is what makes a later N1N2 transfer page it (#512). Marked whether or not
         // the mobile reachable timer below is enabled.
@@ -8520,9 +8698,12 @@ impl NgapServer {
     /// Start mobile-reachable supervision for every registered UE whose N1 connection
     /// this release complete ended (TS 24.501 §5.3.7).
     ///
-    /// `amf_ue_ngap_id` is the UE the Release Complete names, when it could be used; a
-    /// Release Complete that cannot falls back to the association's UEs, because the
-    /// alternative -- supervising nobody -- is the defect being fixed.
+    /// `amf_ue_ngap_id` is the UE the Release Complete names, when it could be used. A
+    /// Release Complete that cannot (undecodable, or a not-comprehended reject IE, which
+    /// TS 38.413 §10.3.4.2 has handled locally) names nobody, so it falls back to the
+    /// association's UEs that are ALREADY CM-IDLE and unsupervised -- never a CONNECTED
+    /// one (#802). Arming every registered UE of the association put the connected UEs
+    /// on the gNB on the path to implicit deregistration on one malformed PDU.
     async fn start_reachability_supervision(
         &mut self,
         association_id: u64,
@@ -8541,7 +8722,12 @@ impl NgapServer {
                 .ue_auth_state
                 .snapshot()
                 .into_iter()
-                .filter(|(_, s)| s.association_id == association_id)
+                .filter(|(_, s)| {
+                    s.association_id == association_id
+                        && s.registered
+                        && s.cm_idle
+                        && s.reachability.is_none()
+                })
                 .map(|(id, _)| id)
                 .collect(),
         };
@@ -22221,13 +22407,23 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_initial_registration_after_a_service_reject_is_taken_up() {
         crate::context::amf_context_init(64, 1024, 4096);
-        let mut ngap = test_ngap_server().await;
+        let mut ngap = capturing_ngap_server().await;
         let amf_ue_ngap_id = 7_675_002u64;
+        assert!(!ngap.ue_auth_state.contains(amf_ue_ngap_id));
+        // The connection's first message: a Service Request no UE context resolves,
+        // answered SERVICE REJECT #9, which allocates the ID with no context (#758).
+        ngap.forced_amf_ue_ngap_id = Some(amf_ue_ngap_id);
+        ngap.handle_initial_ue_message(
+            1,
+            &service_request_initial_ue(handler_tests::service_request(None)),
+        )
+        .await
+        .expect("rejected #9");
         assert!(!ngap.ue_auth_state.contains(amf_ue_ngap_id));
         let ul_pdu = nextgcore_ngap::builder::build_uplink_nas_transport(
             &nextgcore_ngap::types::UplinkNasTransport {
                 amf_ue_ngap_id,
-                ran_ue_ngap_id: 76,
+                ran_ue_ngap_id: 512,
                 nas_pdu: sample_registration_request(),
                 user_location_info: test_user_location(0x000676, 0x0006_7600),
             },
@@ -22240,7 +22436,7 @@ mod tests {
             .ue_auth_state
             .get(amf_ue_ngap_id)
             .expect("the initial registration created a NAS context");
-        assert_eq!(state.ran_ue_ngap_id, 76);
+        assert_eq!(state.ran_ue_ngap_id, 512);
         assert_eq!(state.amf_ue.nr_tai.tac, 0x000676);
         ngap.ue_auth_state.remove(amf_ue_ngap_id);
     }
@@ -25167,6 +25363,64 @@ mod tests {
             guard.event_subscription_remove("sub-417-s4-release");
         }
         sink.stop().await.expect("sink stop");
+    }
+
+    /// **#802.** A UE Context Release Complete that names no usable UE -- undecodable,
+    /// or carrying a not-comprehended IE marked reject (TS 38.413 §10.3.4.2) -- must not
+    /// arm the mobile reachable timer for a CONNECTED UE of the sending gNB. Before, the
+    /// fallback armed every registered UE of the association, so one malformed PDU put
+    /// every connected UE on the gNB on the path to implicit deregistration. An idle,
+    /// unsupervised UE there is still supervised (the reason the fallback exists).
+    ///
+    /// REVERT-VERIFIED: with the fallback's old association-only filter the connected
+    /// UE is armed and this fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unusable_release_complete_never_supervises_a_connected_ue() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut ngap = test_ngap_server().await;
+        let assoc = 98_021u64;
+        let valid = nextgcore_ngap::builder::build_ue_context_release_complete(
+            &nextgcore_ngap::types::UeContextReleaseComplete {
+                amf_ue_ngap_id: 7_802_999,
+                ran_ue_ngap_id: 9,
+            },
+        )
+        .expect("encode");
+        let reject_ie = crate::ngap_asn1::tests::with_unknown_ie(&valid, 9_999, 0x00);
+        for (n, pdu) in [vec![0x20, 0x29, 0x00], reject_ie].into_iter().enumerate() {
+            let (connected, idle) = (7_802_001u64 + 10 * n as u64, 7_802_002u64 + 10 * n as u64);
+            let mut c = UeNasContext::new(connected, 1, assoc, false);
+            c.registered = true;
+            ngap.ue_auth_state.insert(connected, c);
+            let mut i = UeNasContext::new(idle, 2, assoc, false);
+            i.registered = true;
+            i.cm_idle = true;
+            ngap.ue_auth_state.insert(idle, i);
+
+            ngap.handle_ue_context_release_complete(assoc, &pdu)
+                .await
+                .expect("handled");
+
+            let phase = |id| {
+                ngap.ue_auth_state
+                    .get(id)
+                    .and_then(|s| s.reachability)
+                    .map(|r| r.phase)
+            };
+            assert_eq!(
+                phase(connected),
+                None,
+                "case {n}: a CONNECTED UE is not supervised"
+            );
+            assert!(!ngap.ue_auth_state.get(connected).unwrap().is_cm_idle());
+            assert_eq!(
+                phase(idle),
+                Some(ReachabilityPhase::MobileReachable),
+                "case {n}: the idle, unsupervised UE of the association is"
+            );
+            ngap.ue_auth_state.remove(connected);
+            ngap.ue_auth_state.remove(idle);
+        }
     }
 
     /// **#417 stage 4.** A UE Context Release Complete listing its released PDU

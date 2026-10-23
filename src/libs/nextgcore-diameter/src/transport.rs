@@ -65,6 +65,14 @@ pub trait DiameterTransportIo: Send {
 
     /// Close the connection.
     async fn close(&mut self) -> DiameterResult<()>;
+
+    /// Bound how long sent data may stay unacknowledged before the kernel
+    /// gives up on the connection (TCP_USER_TIMEOUT, RFC 5482), so a peer that
+    /// vanished cannot hold a write for the ~15 minutes of tcp_retries2 (#729).
+    /// A no-op where the transport has no such option.
+    fn set_user_timeout(&self, _timeout: Duration) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -79,6 +87,54 @@ impl DiameterTransportIo for DiameterTransport {
 
     async fn close(&mut self) -> DiameterResult<()> {
         self.shutdown().await
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_user_timeout(&self, timeout: Duration) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let ms = libc::c_uint::try_from(timeout.as_millis()).unwrap_or(libc::c_uint::MAX);
+        // SAFETY: a valid socket fd owned by `self.stream`, and a correctly
+        // sized c_uint option value (tcp(7) TCP_USER_TIMEOUT).
+        let rc = unsafe {
+            libc::setsockopt(
+                self.stream.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_USER_TIMEOUT,
+                (&ms as *const libc::c_uint).cast(),
+                std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
+impl DiameterTransport {
+    /// The TCP_USER_TIMEOUT currently set on the socket, in milliseconds.
+    /// Test/diagnostic.
+    #[cfg(target_os = "linux")]
+    pub fn user_timeout_ms(&self) -> std::io::Result<u32> {
+        use std::os::fd::AsRawFd;
+        let mut ms: libc::c_uint = 0;
+        let mut len = std::mem::size_of::<libc::c_uint>() as libc::socklen_t;
+        // SAFETY: as in `set_user_timeout`; `ms` and `len` are valid out-params.
+        let rc = unsafe {
+            libc::getsockopt(
+                self.stream.as_raw_fd(),
+                libc::IPPROTO_TCP,
+                libc::TCP_USER_TIMEOUT,
+                (&mut ms as *mut libc::c_uint).cast(),
+                &mut len,
+            )
+        };
+        if rc == 0 {
+            Ok(ms)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
     }
 }
 
@@ -441,10 +497,31 @@ impl DiameterClient {
             DiameterTransport::connect_timeout(self.peer_addr, Duration::from_secs(5)).await?;
 
         let mut peer = DiameterPeer::new_initiator(transport, &self.config);
-        peer.start().await?;
+        // #729 review M1: the CER write and the CEA wait are bounded. A hung peer
+        // whose kernel still completes the handshake (a deadlocked or stalled HSS
+        // process) would otherwise hold the redial forever: the supervisor would
+        // never retry and never log.
+        let bound = self.capabilities_exchange_timeout();
+        let peer_addr = self.peer_addr;
+        let timed_out = move || {
+            log::warn!(
+                "Diameter peer {peer_addr} did not complete CER/CEA within {bound:?}; giving up \
+                 on this connection"
+            );
+            DiameterError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("CER/CEA with {peer_addr} not completed within {bound:?}"),
+            ))
+        };
+        tokio::time::timeout(bound, peer.start())
+            .await
+            .map_err(|_| timed_out())??;
 
         // Wait for CEA
-        match peer.next_event().await? {
+        let event = tokio::time::timeout(bound, peer.next_event())
+            .await
+            .map_err(|_| timed_out())??;
+        match event {
             PeerEvent::Established {
                 origin_host,
                 origin_realm,
@@ -458,6 +535,12 @@ impl DiameterClient {
                 "unexpected event during CER/CEA exchange".into(),
             )),
         }
+    }
+
+    /// How long the CER/CEA exchange may take: Tw (RFC 3539 §3.4.1, the bound on
+    /// any answer from a live peer), floored at 6 s like Tw itself.
+    pub fn capabilities_exchange_timeout(&self) -> Duration {
+        Duration::from_secs(u64::from(self.config.timer_tw.max(6)))
     }
 
     /// Connect with automatic retry

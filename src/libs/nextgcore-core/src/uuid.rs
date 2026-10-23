@@ -87,20 +87,33 @@ pub fn nextgcore_uuid_parse(uuid: &mut NextgcoreUuid, uuid_str: &str) -> i32 {
         return -1;
     }
 
-    // Parse hex string
-    for i in 0..16 {
-        match u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16) {
-            Ok(b) => uuid.data[i] = b,
-            Err(_) => return -1,
+    // Parse hex string (octet-wise: a multi-byte character must not panic, #765)
+    match crate::conv::hex_decode(&hex).and_then(|b| <[u8; 16]>::try_from(b).ok()) {
+        Some(data) => {
+            uuid.data = data;
+            0
         }
+        None => -1,
     }
-
-    0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uuid_parse_refuses_non_ascii_without_panicking() {
+        let mut uuid = NextgcoreUuid { data: [0u8; 16] };
+        // 32 octets once the hyphens go, but cut inside a multi-byte character (#765).
+        let bad = format!("a\u{e9}{}", "0".repeat(29));
+        assert_eq!(bad.len(), 32);
+        assert_eq!(nextgcore_uuid_parse(&mut uuid, &bad), -1);
+        assert_eq!(
+            nextgcore_uuid_parse(&mut uuid, "00112233-4455-6677-8899-aabbccddeeff"),
+            0
+        );
+        assert_eq!(uuid.data[15], 0xff);
+    }
 
     #[test]
     fn test_uuid_new() {

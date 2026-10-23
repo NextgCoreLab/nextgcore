@@ -535,7 +535,8 @@ impl AttachReject {
                     buf.skip(1)?;
                     set_first(&mut msg.t3402_value, optional_tlv(buf, GprsTimer2::decode)?);
                 }
-                _ => break,
+                // An unknown IE is ignored, not the end of the message (§7.6.1, #810).
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
 
@@ -648,7 +649,20 @@ impl TrackingAreaUpdateAccept {
                     buf.skip(1)?;
                     set_first(&mut msg.tai_list, optional_tlv(buf, EpsTaiList::decode)?);
                 }
-                _ => break,
+                // Location area (TV 6): not modelled; type 3, so skipped by its
+                // fixed length (TS 24.301 clause 8, #810).
+                0x13 => buf.skip(6)?,
+                // EMM cause (TV 2): not modelled; type 3, so skipped by its
+                // fixed length (TS 24.301 clause 8, #810).
+                0x53 => buf.skip(2)?,
+                // T3402 value (TV 2): not modelled; type 3, so skipped by its
+                // fixed length (TS 24.301 clause 8, #810).
+                0x17 => buf.skip(2)?,
+                // T3423 value (TV 2): not modelled; type 3, so skipped by its
+                // fixed length (TS 24.301 clause 8, #810).
+                0x59 => buf.skip(2)?,
+                // An unknown IE is ignored, not the end of the message (§7.6.1, #810).
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
 
@@ -774,7 +788,8 @@ impl EpsAuthenticationFailure {
                         optional_tlv(buf, |b| Ok(b.read_lv(IeLen::Exact(14))?.to_vec()))?,
                     );
                 }
-                _ => break,
+                // An unknown IE is ignored, not the end of the message (§7.6.1, #810).
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
 
@@ -842,7 +857,8 @@ impl EpsSecurityModeCommand {
                     buf.read_into(&mut nonce)?;
                     msg.nonce_mme = Some(nonce);
                 }
-                _ => break,
+                // An unknown IE is ignored, not the end of the message (§7.6.1, #810).
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
 
@@ -871,7 +887,8 @@ impl EpsSecurityModeComplete {
                     buf.skip(1)?;
                     set_first(&mut msg.imeisv, Some(opaque_tlv(buf)?));
                 }
-                _ => break,
+                // An unknown IE is ignored, not the end of the message (§7.6.1, #810).
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
 
@@ -1101,7 +1118,11 @@ impl EpsServiceReject {
                     buf.skip(1)?;
                     set_first(&mut msg.t3448_value, optional_tlv(buf, GprsTimer2::decode)?);
                 }
-                _ => break,
+                // T3442 value (TV 2): not modelled; type 3, so skipped by its
+                // fixed length (TS 24.301 clause 8, #810).
+                0x5B => buf.skip(2)?,
+                // An unknown IE is ignored, not the end of the message (§7.6.1, #810).
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -1139,7 +1160,8 @@ impl GutiReallocationCommand {
                     buf.skip(1)?;
                     set_first(&mut msg.tai_list, optional_tlv(buf, EpsTaiList::decode)?);
                 }
-                _ => break,
+                // An unknown IE is ignored, not the end of the message (§7.6.1, #810).
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -1224,7 +1246,8 @@ impl EmmInformation {
                         optional_tlv(buf, |b| b.read_lv(IeLen::Exact(1))?.read_u8())?,
                     );
                 }
-                _ => break,
+                // An unknown IE is ignored, not the end of the message (§7.6.1, #810).
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -1890,7 +1913,11 @@ impl ModifyEpsBearerContextRequest {
                     buf.skip(1)?;
                     set_first(&mut msg.tft, Some(opaque_tlv(buf)?));
                 }
-                _ => break,
+                // Negotiated LLC (TV 2): not modelled; type 3, so skipped by its
+                // fixed length (TS 24.301 clause 8, #810).
+                0x32 => buf.skip(2)?,
+                // An unknown IE is ignored, not the end of the message (§7.6.1, #810).
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -1925,7 +1952,8 @@ impl ModifyEpsBearerContextAccept {
                         Some(opaque_tlv(buf)?),
                     );
                 }
-                _ => break,
+                // An unknown IE is ignored, not the end of the message (§7.6.1, #810).
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -2012,7 +2040,8 @@ impl EsmInformationResponse {
                         Some(opaque_tlv(buf)?),
                     );
                 }
-                _ => break,
+                // An unknown IE is ignored, not the end of the message (§7.6.1, #810).
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
