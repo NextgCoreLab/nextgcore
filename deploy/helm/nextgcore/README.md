@@ -22,8 +22,16 @@ kubectl create namespace nextg-system
 kubectl label namespace nextg-system \
   pod-security.kubernetes.io/enforce=privileged --overwrite
 
-helm install nextg deploy/helm/nextgcore -n nextg-system --wait
+helm install nextg deploy/helm/nextgcore -n nextg-system --wait \
+  --set global.siteId=<a-name-unique-to-this-cluster>
 ```
+
+Set `global.siteId` (#753). It salts the AMF's derived `nfInstanceId`, which the
+UDM keys the UE's UECM registration on, so it must stay the same across
+upgrades and restarts. Without it the chart falls back to the kube-system
+namespace UID through `lookup`. That needs cluster-wide read on Namespaces, and
+it is always empty under `helm template` and GitOps renderers such as ArgoCD, so
+those derive a different id than `helm install` does for the same release.
 
 Then follow the `NOTES.txt` output — it prints the one out-of-band step (the
 SUCI de-concealment Secret) and the checks worth running.
@@ -57,6 +65,8 @@ done
 | `upf.dataPlane.enabled` | `true` | `false` for control-plane-only where the node cannot provide `/dev/net/tun` (Kind on macOS). No user plane: a UE ping will not work. |
 | `mongodb.persistence.enabled` | `true` | `false` on clusters with no CSI driver, where a PVC stays Pending. Data is lost on restart. |
 | `mongodb.enabled` / `mongodb.externalUri` | `true` / `""` | Point at an existing MongoDB. The seed Job still runs against it. |
+| `global.siteId` | `""` | Set it, always (see Install). Salts derived NF instance ids. The empty fallback (`lookup` of the kube-system UID) needs cluster-wide RBAC and is empty under `helm template` / ArgoCD. |
+| `amf.nfInstanceId` | `""` | Pin the AMF's id outright, e.g. when an NRF trust store keys on it. `amf.replicas` must stay 1: every pod would share the id, and the render fails on purpose. |
 | `global.plmn` | 999-70 | Must match the simulator's PLMN. |
 | `subscriber.*` | test IMSI | Must match the UE's USIM config. |
 | `amf.service.headless`, `upf.service.headless` | `true` | Leave alone. NGAP and GTP-U are UDP; kube-proxy's per-flow balancing plus a conntrack timeout breaks both. |
