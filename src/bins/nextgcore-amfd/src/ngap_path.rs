@@ -11182,6 +11182,33 @@ impl NgapServer {
             req.ran_ue_ngap_id
         );
 
+        // #745, TS 38.413 §8.4.4.4: the same PDU Session ID more than once in the
+        // To Be Switched DL List is answered with PATH SWITCH REQUEST FAILURE, the AMF
+        // generating the Path Switch Request Unsuccessful Transfer itself. Checked before
+        // ANY state change: no NH/NCC advance, no relocation, no N11 call. Each session
+        // is listed once in the Released List, cause multiple-PDU-session-ID-instances.
+        let mut distinct = requested.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        if distinct.len() != requested.len() {
+            log::warn!(
+                "PathSwitchRequest for UE {amf_ue_ngap_id} lists a PDU Session ID more than \
+                 once ({requested:?}); failing it (TS 38.413 §8.4.4.4)"
+            );
+            if let Some(bytes) = path_switch_failure(
+                amf_ue_ngap_id,
+                req.ran_ue_ngap_id,
+                &distinct,
+                nextgcore_ngap::types::Cause::RadioNetwork(
+                    nextgcore_ngap::types::CauseRadioNetwork::MultiplePduSessionIdInstances,
+                ),
+                &[],
+            ) {
+                self.send_to_association(association_id, &bytes).await?;
+            }
+            return Ok(());
+        }
+
         // Unknown UE → PathSwitchRequestFailure releasing every session it named,
         // cause unknown-local-UE-NGAP-ID (the list is mandatory, §9.2.3.10).
         if !self.ue_auth_state.contains(amf_ue_ngap_id) {
@@ -20919,6 +20946,158 @@ mod tests {
             "UE Context Release Command, SOURCE id pair, successful-handover"
         );
         assert!(take_sent_ngap(&mut server).is_empty(), "take drains");
+    }
+
+    /// A PATH SWITCH REQUEST FAILURE's `(amf id, ran id, [(psi, unsuccessful transfer)])`,
+    /// decoded with the generated codec; `None` for any other PDU.
+    #[allow(clippy::type_complexity)]
+    fn decoded_path_switch_failure(pdu: &[u8]) -> Option<(u64, u32, Vec<(u8, Vec<u8>)>)> {
+        use nextgcore_ngap_gen::generated as g;
+        let g::NGAP_PDU::UnsuccessfulOutcome(m) = nextgcore_ngap_gen::decode(pdu).ok()? else {
+            return None;
+        };
+        let g::UnsuccessfulOutcomeValue::Id_PathSwitchRequest(f) = m.value else {
+            return None;
+        };
+        let (mut amf, mut ran, mut released) = (None, None, Vec::new());
+        for ie in f.protocol_i_es.0 {
+            use g::PathSwitchRequestFailureProtocolIEs_EntryValue as Ie;
+            match ie.value {
+                Ie::Id_AMF_UE_NGAP_ID(id) => amf = Some(id.0),
+                Ie::Id_RAN_UE_NGAP_ID(id) => ran = Some(id.0),
+                Ie::Id_PDUSessionResourceReleasedListPSFail(list) => {
+                    released = list
+                        .0
+                        .into_iter()
+                        .map(|i| {
+                            (
+                                i.pdu_session_id.0,
+                                i.path_switch_request_unsuccessful_transfer.0,
+                            )
+                        })
+                        .collect()
+                }
+                _ => {}
+            }
+        }
+        Some((amf?, ran?, released))
+    }
+
+    fn path_switch_request_pdu(amf_ue_ngap_id: u64, ran_ue_ngap_id: u32, psis: &[u8]) -> Vec<u8> {
+        nextgcore_ngap::builder::build_path_switch_request(
+            &nextgcore_ngap::types::PathSwitchRequest {
+                ran_ue_ngap_id,
+                source_amf_ue_ngap_id: amf_ue_ngap_id,
+                user_location_info: nextgcore_ngap::types::UserLocationInformation::Nr {
+                    nr_cgi_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("001", "01")),
+                    nr_cell_identity: 7,
+                    tai_plmn: plmn_id_to_ngap_bytes(&PlmnId::new("001", "01")),
+                    tai_tac: [0, 0, 1],
+                },
+                ue_security_capabilities: nextgcore_ngap::types::UeSecurityCapabilities {
+                    nr_encryption_algorithms: 0xF000,
+                    nr_integrity_algorithms: 0xF000,
+                    eutra_encryption_algorithms: 0,
+                    eutra_integrity_algorithms: 0,
+                },
+                pdu_session_list: psis
+                    .iter()
+                    .map(|&psi| nextgcore_ngap::types::PduSessionResourceSwitchItem {
+                        pdu_session_id: psi,
+                        transfer: vec![0x11, 0x22, 0x33, 0x44],
+                    })
+                    .collect(),
+                failed_list: None,
+            },
+        )
+        .expect("build PathSwitchRequest")
+    }
+
+    /// **#745, TS 38.413 §8.4.4.4.** A PATH SWITCH REQUEST naming the same PDU Session
+    /// ID twice is answered with PATH SWITCH REQUEST FAILURE -- each session once in the
+    /// Released List, with an AMF-generated Unsuccessful Transfer carrying
+    /// multiple-PDU-session-ID-instances -- and changes nothing: the UE stays on the
+    /// source with its NH chain where it was, and no SMF is called (none is reachable
+    /// here, so a relay attempt would show up as a switched session in an Acknowledge).
+    ///
+    /// REVERT-VERIFIED: without the duplicate check the handler relocates the UE and the
+    /// captured PDU is not a Failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_path_switch_request_with_a_duplicated_psi_is_failed_and_changes_nothing() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut server = capturing_ngap_server().await;
+        let (source, target) = (97_451u64, 97_452u64);
+        let amf_ue_ngap_id = 7_745_001u64;
+        seed_gnb_session(&server, source).await;
+        seed_gnb_session(&server, target).await;
+        let mut state = UeNasContext::new(amf_ue_ngap_id, 11, source, false);
+        state.registered = true;
+        server.ue_auth_state.insert(amf_ue_ngap_id, state);
+        let before = server.ue_auth_state.get(amf_ue_ngap_id).expect("UE");
+        let nh_before = (before.amf_ue.nhcc, before.amf_ue.nh);
+
+        server
+            .handle_path_switch_request(
+                target,
+                &path_switch_request_pdu(amf_ue_ngap_id, 67, &[5, 6, 5]),
+            )
+            .await
+            .expect("handled");
+
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, target, "answered on the requesting association");
+        let (amf, ran, released) =
+            decoded_path_switch_failure(&sent[0].1).expect("a PATH SWITCH REQUEST FAILURE");
+        assert_eq!((amf, ran), (amf_ue_ngap_id, 67));
+        let expected_transfer = crate::ngap_asn1::path_switch_unsuccessful_transfer(
+            nextgcore_ngap::types::Cause::RadioNetwork(
+                nextgcore_ngap::types::CauseRadioNetwork::MultiplePduSessionIdInstances,
+            ),
+        )
+        .expect("encode");
+        assert_eq!(
+            released,
+            vec![(5, expected_transfer.clone()), (6, expected_transfer)],
+            "each session once, cause multiple-PDU-session-ID-instances"
+        );
+        let after = server.ue_auth_state.get(amf_ue_ngap_id).expect("UE");
+        assert_eq!(
+            (after.association_id, after.ran_ue_ngap_id),
+            (source, 11),
+            "not relocated"
+        );
+        assert_eq!(
+            (after.amf_ue.nhcc, after.amf_ue.nh),
+            nh_before,
+            "NH chain untouched"
+        );
+    }
+
+    /// #745's handler-level gap (#566): a PATH SWITCH REQUEST for an unknown UE is
+    /// answered with a Failure releasing every session it named, cause
+    /// unknown-local-UE-NGAP-ID.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_path_switch_request_for_an_unknown_ue_is_failed_releasing_its_sessions() {
+        let mut server = capturing_ngap_server().await;
+        let target = 97_453u64;
+        seed_gnb_session(&server, target).await;
+        server
+            .handle_path_switch_request(target, &path_switch_request_pdu(7_745_099, 68, &[1, 2]))
+            .await
+            .expect("handled");
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let (amf, ran, released) =
+            decoded_path_switch_failure(&sent[0].1).expect("a PATH SWITCH REQUEST FAILURE");
+        assert_eq!((amf, ran), (7_745_099, 68));
+        let transfer = crate::ngap_asn1::path_switch_unsuccessful_transfer(
+            nextgcore_ngap::types::Cause::RadioNetwork(
+                nextgcore_ngap::types::CauseRadioNetwork::UnknownLocalUeNgapId,
+            ),
+        )
+        .expect("encode");
+        assert_eq!(released, vec![(1, transfer.clone()), (2, transfer)]);
     }
 
     /// #400: a HANDOVER that moves the UE out of a subscribed Area of Interest delivers
