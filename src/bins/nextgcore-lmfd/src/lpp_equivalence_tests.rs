@@ -81,31 +81,99 @@ fn provide_assistance_data_is_byte_identical_to_the_captured_builder() {
     assert_eq!(n, 15);
 }
 
+/// The captured adapter output as field → value text, one map per cell.
+fn cells_of(debug: &str) -> Vec<std::collections::BTreeMap<String, String>> {
+    debug
+        .split("CellMeasurement { ")
+        .skip(1)
+        .map(|c| {
+            let body = &c[..c.find(" }").expect("a closing brace")];
+            body.split(", ")
+                .map(|f| {
+                    let (k, v) = f.split_once(": ").expect("field: value");
+                    (k.to_string(), v.to_string())
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// `new` minus the Rx–Tx fields #713 added, which must be absent here.
+fn without_rx_tx(
+    mut new: Vec<std::collections::BTreeMap<String, String>>,
+    what: &str,
+) -> Vec<std::collections::BTreeMap<String, String>> {
+    for c in &mut new {
+        for k in ["ue_rx_tx_ns", "gnb_rx_tx_ns"] {
+            assert_eq!(c.remove(k).as_deref(), Some("None"), "{what}: {k}");
+        }
+    }
+    new
+}
+
+fn some_f64(v: &str) -> f64 {
+    v.strip_prefix("Some(")
+        .and_then(|v| v.strip_suffix(')'))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("not Some(number): {v}"))
+}
+
+/// E-CID and DL-TDOA adapt exactly as the captured hand-written adapters did.
+///
+/// Multi-RTT does not, on purpose (#713). The old adapter read
+/// `nr-UE-RxTxTimeDiff` as an unsigned magnitude, `⌊v·2^k·T_c⌋`, and called it
+/// an RTT. The new one decodes the signed TS 38.133 §10.1.25.3 value
+/// `(v·2^k − 985024)·T_c` as the UE half (`ue_rx_tx_ns`) and leaves `rtt_ns`
+/// empty. So each captured `rtt_ns` R must satisfy
+/// `R ≤ ue_rx_tx_ns + 985024·T_c < R + 1`, with every other field unchanged.
 #[test]
 fn every_report_adapts_as_the_old_adapters_did() {
+    let tc = 1_000_000_000.0 / (480_000.0 * 4_096.0);
     let mut n = 0;
     for l in lines("RPT") {
         let f: Vec<&str> = l.split('\t').collect();
         let bytes = unhex(f[0]);
         let g = codec_glue::decode_lpp(&bytes).expect("decodes");
+        let ecid = cells_of(&format!(
+            "{:?}",
+            codec_glue::lpp_ecid_provide_to_measurements(&g)
+        ));
         assert_eq!(
-            format!("{:?}", codec_glue::lpp_ecid_provide_to_measurements(&g)),
-            f[1],
+            without_rx_tx(ecid, "E-CID"),
+            cells_of(f[1]),
             "E-CID {}",
             f[0]
         );
+
+        let rtt = cells_of(&format!(
+            "{:?}",
+            codec_glue::lpp_multi_rtt_provide_to_measurements(&g)
+        ));
+        let captured = cells_of(f[2]);
+        assert_eq!(rtt.len(), captured.len(), "Multi-RTT {}", f[0]);
+        for (mut new, old) in rtt.into_iter().zip(captured) {
+            let r = some_f64(&old["rtt_ns"]);
+            let ue = some_f64(&new.remove("ue_rx_tx_ns").expect("ue_rx_tx_ns"));
+            let unsigned = ue + 985_024.0 * tc;
+            assert!(
+                r <= unsigned + 1e-6 && unsigned < r + 1.0,
+                "Multi-RTT {}: captured rtt_ns {r}, new ue_rx_tx_ns {ue}",
+                f[0]
+            );
+            assert_eq!(new.remove("rtt_ns").as_deref(), Some("None"));
+            assert_eq!(new.remove("gnb_rx_tx_ns").as_deref(), Some("None"));
+            let mut old = old;
+            old.remove("rtt_ns");
+            assert_eq!(new, old, "Multi-RTT {}", f[0]);
+        }
+
+        let tdoa = cells_of(&format!(
+            "{:?}",
+            codec_glue::lpp_dl_tdoa_provide_to_measurements(&g)
+        ));
         assert_eq!(
-            format!(
-                "{:?}",
-                codec_glue::lpp_multi_rtt_provide_to_measurements(&g)
-            ),
-            f[2],
-            "Multi-RTT {}",
-            f[0]
-        );
-        assert_eq!(
-            format!("{:?}", codec_glue::lpp_dl_tdoa_provide_to_measurements(&g)),
-            f[3],
+            without_rx_tx(tdoa, "DL-TDOA"),
+            cells_of(f[3]),
             "DL-TDOA {}",
             f[0]
         );
@@ -117,10 +185,11 @@ fn every_report_adapts_as_the_old_adapters_did() {
 }
 
 /// The Rel-18 finer-granularity arms (kMinus6..kMinus1) no hand-written codec could
-/// carry: `v × 2^k × T_c` with a negative k, and the RSTD keeps its midpoint.
+/// carry: `v × 2^k × T_c` with a negative k, and both RSTD and UE Rx–Tx keep their
+/// midpoint.
 #[test]
 fn rel18_fine_granularity_arms_convert() {
-    use codec_glue::{nrrstd_to_ns, nrrstd_to_signed_ns, TimeReport};
+    use codec_glue::{nrrstd_to_signed_ns, ue_rx_tx_to_signed_ns, TimeReport};
     let tc = 1_000_000_000.0 / (480_000.0 * 4_096.0);
     assert_eq!(
         nrrstd_to_signed_ns(TimeReport {
@@ -137,9 +206,10 @@ fn rel18_fine_granularity_arms_convert() {
             .abs()
             < 1e-9
     );
-    assert_eq!(
-        nrrstd_to_ns(TimeReport { v: 2_000, k: -1 }),
-        (1_000.0 * tc) as u64
+    // #713: the UE Rx–Tx keeps the same midpoint at the finer step.
+    assert!(
+        (ue_rx_tx_to_signed_ns(TimeReport { v: 2_000, k: -1 }) - (1_000.0 - 985_024.0) * tc).abs()
+            < 1e-6
     );
 }
 

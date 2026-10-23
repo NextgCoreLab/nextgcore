@@ -2479,6 +2479,8 @@ async fn handle_nrppa_report(request: &SbiRequest) -> SbiResponse {
                     aoa: c.get("aoa").and_then(|v| v.as_f64()),
                     rtt_ns: c.get("rttNs").and_then(|v| v.as_u64()),
                     rstd_ns: c.get("rstdNs").and_then(|v| v.as_f64()),
+                    ue_rx_tx_ns: c.get("ueRxTxNs").and_then(|v| v.as_f64()),
+                    gnb_rx_tx_ns: c.get("gnbRxTxNs").and_then(|v| v.as_f64()),
                 })
                 .collect()
         })
@@ -3972,6 +3974,8 @@ mod tests {
                     aoa: None,
                     rtt_ns: None,
                     rstd_ns: None,
+                    ue_rx_tx_ns: None,
+                    gnb_rx_tx_ns: None,
                 }],
             );
             req.request_id
@@ -4857,6 +4861,8 @@ lmf:
                     aoa: None,
                     rtt_ns: None,
                     rstd_ns: None,
+                    ue_rx_tx_ns: None,
+                    gnb_rx_tx_ns: None,
                 }],
             )
             .expect(
@@ -4941,17 +4947,28 @@ lmf:
     fn the_positioning_method_follows_qos_capability_and_the_registry() {
         use crate::codec_glue::{select_lpp_method, LppMethod, UeLppCapability};
 
-        // High accuracy, enough reference points, capability unknown -> Multi-RTT.
+        // High accuracy, enough reference points, capability unknown -> a
+        // multilateration method. DL-TDOA, not Multi-RTT: this LMF cannot obtain
+        // the gNB Rx-Tx half a Multi-RTT range needs (TS 38.305 §8.10, #713).
+        const { assert!(!crate::codec_glue::MULTI_RTT_GNB_HALF_AVAILABLE) };
         assert_eq!(
             select_lpp_method(PositioningQos::HighAccuracy, 3, UeLppCapability::Unknown),
-            LppMethod::MultiRtt,
+            LppMethod::DlTdoa,
             "answering a <=10 m request with E-CID commits to an accuracy a TA ring cannot \
-             deliver"
+             deliver, and Multi-RTT without the gNB half cannot range at all"
         );
         assert_eq!(
             select_lpp_method(PositioningQos::Emergency, 5, UeLppCapability::Unknown),
-            LppMethod::MultiRtt,
+            LppMethod::DlTdoa,
             "an emergency fix is a high-accuracy fix"
+        );
+        assert_eq!(
+            select_lpp_method(
+                PositioningQos::HighAccuracy,
+                3,
+                UeLppCapability::AdvancedMethods
+            ),
+            LppMethod::DlTdoa
         );
 
         // Same QoS, TOO FEW reference points -> E-CID fallback. The registry is the
@@ -5274,13 +5291,59 @@ lmf:
         crate::lpp_fixtures::multi_rtt_lpp(cells, txn)
     }
 
-    /// Seed the global TRP registry with a solvable 4-cell Multi-RTT scene and
-    /// build a matching UE LPP ProvideLocationInformation (K0 codes derived
-    /// from the true UE position via the codec's T_c scaling).
-    fn seed_scene_and_build_multi_rtt_lpp(txn: u8) -> Vec<u8> {
+    /// Seed the global TRP registry with a solvable 4-TRP NR DL-TDOA scene and build
+    /// the matching UE LPP ProvideLocationInformation: DL-PRS ID 1 is the
+    /// reference, and three neighbours report their PCI. Each RSTD is the true
+    /// range difference over c, as a k0 code `(RSTD/T_c) + 985024`
+    /// (TS 38.133 §10.1.23.3).
+    ///
+    /// DL-TDOA rather than Multi-RTT: a UE's report alone can be solved only for
+    /// DL-TDOA. A Multi-RTT range also needs the gNB Rx-Tx half (#713).
+    fn seed_scene_and_build_dl_tdoa_lpp(txn: u8) -> Vec<u8> {
         use crate::positioning::{enu_to_geodetic, EnuPoint, TrpCoord, SPEED_OF_LIGHT_M_S};
         // T_c ns, matching codec_glue::TC_NS (TS 38.211 §4.1).
         const TC_NS: f64 = 1_000_000_000.0 / (480_000.0 * 4_096.0);
+        let origin = TrpCoord::new(37.7749, -122.4194, 0.0);
+        // (registry key, DL-PRS ID, PCI, east, north)
+        let trps = [
+            ("prs-1", 1u8, None, 0.0f64, 0.0f64),
+            ("pci-202", 2, Some(202u16), 1000.0, 0.0),
+            ("pci-203", 3, Some(203), 0.0, 1000.0),
+            ("pci-204", 4, Some(204), 1000.0, 1000.0),
+        ];
+        let (ue_e, ue_n) = (350.0f64, 600.0f64);
+        let range = |e: f64, n: f64| (ue_e - e).hypot(ue_n - n);
+        let reference_range = range(trps[0].3, trps[0].4);
+
+        let ctx = lmf_self();
+        let guard = ctx.read().unwrap();
+        for (key, _, _, e, n) in trps.iter() {
+            guard.set_cell_coord(
+                *key,
+                enu_to_geodetic(
+                    EnuPoint {
+                        e: *e,
+                        n: *n,
+                        u: 0.0,
+                    },
+                    origin,
+                ),
+            );
+        }
+        let neighbours: Vec<(u8, Option<u16>, u32)> = trps[1..]
+            .iter()
+            .map(|(_, prs, pci, e, n)| {
+                let rstd_ns = (range(*e, *n) - reference_range) / SPEED_OF_LIGHT_M_S * 1e9;
+                (*prs, *pci, (rstd_ns / TC_NS + 985_024.0).round() as u32)
+            })
+            .collect();
+        crate::lpp_fixtures::dl_tdoa_lpp(trps[0].1, &neighbours, txn)
+    }
+
+    /// Seed the same four positions as PCI-keyed cells and build a UE-only
+    /// nr-Multi-RTT report for them (UE Rx-Tx k0 codes around the midpoint).
+    fn seed_scene_and_build_multi_rtt_lpp(txn: u8) -> Vec<u8> {
+        use crate::positioning::{enu_to_geodetic, EnuPoint, TrpCoord};
         let origin = TrpCoord::new(37.7749, -122.4194, 0.0);
         let trps = [
             (201u16, 0.0f64, 0.0f64),
@@ -5288,28 +5351,25 @@ lmf:
             (203, 0.0, 1000.0),
             (204, 1000.0, 1000.0),
         ];
-        let (ue_e, ue_n) = (350.0f64, 600.0f64);
-
         let ctx = lmf_self();
-        let mut cells: Vec<(u16, u32)> = Vec::new();
-        {
-            let guard = ctx.read().unwrap();
-            for (pci, e, n) in trps.iter() {
-                let coord = enu_to_geodetic(
+        let guard = ctx.read().unwrap();
+        for (pci, e, n) in trps.iter() {
+            guard.set_cell_coord(
+                format!("pci-{pci}"),
+                enu_to_geodetic(
                     EnuPoint {
                         e: *e,
                         n: *n,
                         u: 0.0,
                     },
                     origin,
-                );
-                guard.set_cell_coord(format!("pci-{pci}"), coord);
-                let range_m = (ue_e - e).hypot(ue_n - n);
-                let target_rtt_ns = range_m * 2.0 / SPEED_OF_LIGHT_M_S * 1e9;
-                let val = (target_rtt_ns / TC_NS).round() as u32;
-                cells.push((*pci, val));
-            }
+                ),
+            );
         }
+        let cells: Vec<(u16, u32)> = trps
+            .iter()
+            .map(|(pci, _, _)| (*pci, 985_024 + 3_000))
+            .collect();
         build_multi_rtt_lpp(&cells, txn)
     }
 
@@ -5318,7 +5378,7 @@ lmf:
     async fn test_determine_location_multipart_lpp_produces_fix_200() {
         let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
         lmf_context_init(1024);
-        let lpp = seed_scene_and_build_multi_rtt_lpp(55);
+        let lpp = seed_scene_and_build_dl_tdoa_lpp(55);
         let input = r#"{"supi":"imsi-001010000000501",
             "ueLocationServiceInd":"LOCATION_ESTIMATE",
             "lppMessage":{"contentId":"lpp-mo-lr"}}"#;
@@ -5337,7 +5397,21 @@ lmf:
             "lat={lat} (placeholder leaked?)"
         );
         assert!((-123.0..-122.0).contains(&lon), "lon={lon}");
-        assert_eq!(v["positioningDataList"][0]["method"], "MULTI-RTT");
+    }
+
+    /// #713: a UE's Multi-RTT report on its own carries UE Rx-Tx halves only. With
+    /// no gNB Rx-Tx to pair them with there is no range, so no fix: 500
+    /// POSITIONING_FAILED, where the old code ranged the UE half alone.
+    #[tokio::test]
+    async fn test_determine_location_ue_only_multi_rtt_is_not_ranged_500() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        lmf_context_init(1024);
+        let lpp = seed_scene_and_build_multi_rtt_lpp(56);
+        let input = r#"{"supi":"imsi-001010000000507","lppMessage":{"contentId":"lpp-1"}}"#;
+        let req = multipart_lpp_request(input, &[("lpp-1", lpp)]);
+        let resp = handle_determine_location(&req).await;
+        assert_eq!(resp.status, 500);
+        assert_eq!(body_json(&resp)["cause"], "POSITIONING_FAILED");
     }
 
     // -- A5: decode happens but no solvable fix -> 500 (not the network 504) --
@@ -5442,7 +5516,7 @@ lmf:
         use nextgcore_sbi::message::SbiPart;
         use nextgcore_sbi::multipart;
         lmf_context_init(1024);
-        let lpp = seed_scene_and_build_multi_rtt_lpp(57);
+        let lpp = seed_scene_and_build_dl_tdoa_lpp(57);
         let input = r#"{"supi":"imsi-001010000000506","lppMessage":{"contentId":"lpp-mo-lr"}}"#;
         let part = SbiPart::with_content(
             "lpp-mo-lr",

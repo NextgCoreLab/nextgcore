@@ -126,6 +126,15 @@ pub struct CellMeasurement {
     /// NR DL-TDOA reference-signal time difference vs the DL-PRS reference TRP
     /// (nanoseconds, SIGNED; the reference TRP itself reports 0). TS 37.355.
     pub rstd_ns: Option<f64>,
+    /// UE Rx–Tx time difference against this TRP (TS 38.215 §5.1.30), signed
+    /// nanoseconds: the UE half of a Multi-RTT measurement (LPP
+    /// `nr-UE-RxTxTimeDiff-r16`). Not an RTT on its own (#713).
+    pub ue_rx_tx_ns: Option<f64>,
+    /// gNB Rx–Tx time difference at this TRP (TS 38.215 §5.2.3), signed
+    /// nanoseconds: the gNB half of a Multi-RTT measurement (NRPPa
+    /// `gNB-RxTxTimeDiff`, TS 38.455). `RTT = ue_rx_tx_ns + gnb_rx_tx_ns`
+    /// (TS 38.305 §8.10).
+    pub gnb_rx_tx_ns: Option<f64>,
 }
 
 /// Positioning QoS requirements
@@ -1090,7 +1099,8 @@ impl LmfContext {
 /// cells, this calls the real geometric solvers from [`crate::positioning`].
 /// Solver priority (highest confidence first):
 ///
-/// 1. **Multi-RTT** — if ≥ 3 cells report `rtt_ns` and are in the registry.
+/// 1. **Multi-RTT** — if ≥ 3 registry TRPs have a two-sided RTT: `rtt_ns`, or
+///    `ue_rx_tx_ns + gnb_rx_tx_ns` (TS 38.305 §8.10, #713).
 /// 2. **NR DL-TDOA** — if ≥ 3 cells report `rstd_ns` and are in the registry.
 /// 3. **AoA** — if ≥ 2 cells report `aoa` and are in the registry.
 /// 4. **ECID** — if the best-RSRP cell has `timing_advance` and is in the registry.
@@ -1129,15 +1139,8 @@ fn try_real_solve(
     measurements: &[CellMeasurement],
     registry: &TrpRegistry,
 ) -> Option<LocationEstimate> {
-    // --- Multi-RTT (≥3 cells with rtt_ns known to the registry) -------------
-    let rtt_obs: Vec<RttObservation> = measurements
-        .iter()
-        .filter(|m| m.rtt_ns.is_some() && registry.lookup(&m.nr_cgi).is_some())
-        .map(|m| RttObservation {
-            trp_id: m.nr_cgi.clone(),
-            range_m: rtt_ns_to_range_m(m.rtt_ns.unwrap() as f64),
-        })
-        .collect();
+    // --- Multi-RTT (≥3 TRPs with a two-sided RTT known to the registry) ------
+    let rtt_obs = multi_rtt_observations(measurements, registry);
 
     if rtt_obs.len() >= 3 {
         match solve_multi_rtt(registry, &rtt_obs) {
@@ -1240,6 +1243,69 @@ fn try_real_solve(
             None
         }
     }
+}
+
+/// The Multi-RTT range observations in `measurements`, one per TRP the registry
+/// knows (#713).
+///
+/// TS 38.305 §8.10 defines the Multi-RTT observable as the sum of the two Rx–Tx
+/// time differences of one TRP: the UE's (TS 38.215 §5.1.30, measured on that
+/// TRP's DL-PRS and reported over LPP) and the gNB's (TS 38.215 §5.2.3, measured
+/// on the UE's UL SRS and reported over NRPPa). With `t` the propagation time,
+/// `UE Rx–Tx = t_UE-RX − t_UE-TX` and `gNB Rx–Tx = t_gNB-RX − t_gNB-TX`, so the
+/// sum is `2t` whatever the two clocks' offset, and the range is `c·RTT/2`.
+///
+/// Either half alone is NOT a range: it carries the unknown offset between the UE
+/// and the gNB clocks. So a TRP contributes only when:
+/// - a measurement carries a two-sided `rtt_ns` already, or
+/// - both halves are present for it, in one measurement or two with the same key.
+///
+/// UE halves without a gNB half are counted and logged, never ranged. A
+/// negative sum is a measurement error, not a distance, and that TRP is dropped.
+fn multi_rtt_observations(
+    measurements: &[CellMeasurement],
+    registry: &TrpRegistry,
+) -> Vec<RttObservation> {
+    let mut obs: Vec<RttObservation> = Vec::new();
+    let mut unpaired: Vec<&str> = Vec::new();
+    for m in measurements {
+        let key = m.nr_cgi.as_str();
+        if registry.lookup(key).is_none() || obs.iter().any(|o| o.trp_id == key) {
+            continue;
+        }
+        let same_trp = || measurements.iter().filter(move |o| o.nr_cgi == key);
+        let rtt_ns = same_trp()
+            .find_map(|o| o.rtt_ns.map(|r| r as f64))
+            .or_else(|| {
+                let ue = same_trp().find_map(|o| o.ue_rx_tx_ns)?;
+                let gnb = same_trp().find_map(|o| o.gnb_rx_tx_ns)?;
+                Some(ue + gnb)
+            });
+        match rtt_ns {
+            Some(rtt) if rtt.is_finite() && rtt >= 0.0 => obs.push(RttObservation {
+                trp_id: key.to_string(),
+                range_m: rtt_ns_to_range_m(rtt),
+            }),
+            Some(rtt) => log::warn!(
+                "Multi-RTT: TRP {key} has a negative or non-finite RTT ({rtt} ns); dropped"
+            ),
+            None if m.ue_rx_tx_ns.is_some() || m.gnb_rx_tx_ns.is_some() => {
+                if !unpaired.contains(&key) {
+                    unpaired.push(key);
+                }
+            }
+            None => {}
+        }
+    }
+    if !unpaired.is_empty() {
+        log::warn!(
+            "Multi-RTT: {} TRP(s) ({}) have one Rx-Tx half but not the other; TS 38.305 \
+             §8.10 ranges on UE Rx-Tx + gNB Rx-Tx, so they are not ranged",
+            unpaired.len(),
+            unpaired.join(", ")
+        );
+    }
+    obs
 }
 
 /// Heuristic placeholder that returns a lat/lon 0.0 fix with a method-derived
@@ -1432,6 +1498,8 @@ mod tests {
             aoa: None,
             rtt_ns: None,
             rstd_ns: None,
+            ue_rx_tx_ns: None,
+            gnb_rx_tx_ns: None,
         }];
 
         // A7 (lmfd-11): with no TRP registry configured the report cannot be
@@ -1473,6 +1541,8 @@ mod tests {
                 aoa: Some(45.0),
                 rtt_ns: Some(1000),
                 rstd_ns: None,
+                ue_rx_tx_ns: None,
+                gnb_rx_tx_ns: None,
             },
             CellMeasurement {
                 nr_cgi: "001-01-0002-02".to_string(),
@@ -1482,6 +1552,8 @@ mod tests {
                 aoa: Some(120.0),
                 rtt_ns: Some(2000),
                 rstd_ns: None,
+                ue_rx_tx_ns: None,
+                gnb_rx_tx_ns: None,
             },
         ];
 
@@ -1599,6 +1671,8 @@ mod tests {
             aoa: None,
             rtt_ns: None,
             rstd_ns: None,
+            ue_rx_tx_ns: None,
+            gnb_rx_tx_ns: None,
         }];
         let loc = compute_location(&PositioningMethod::Ecid, &cells, &registry);
         assert!(loc.horizontal_accuracy > 50.0); // ECID is coarse
@@ -1618,6 +1692,8 @@ mod tests {
             aoa: None,
             rtt_ns: None,
             rstd_ns: None,
+            ue_rx_tx_ns: None,
+            gnb_rx_tx_ns: None,
         }];
         let loc = compute_location(&PositioningMethod::Gnss, &cells, &registry);
         assert!(loc.horizontal_accuracy <= 5.0); // GNSS is accurate
@@ -1740,6 +1816,8 @@ mod tests_real_solve {
                     aoa: None,
                     rtt_ns: Some(rtt_ns),
                     rstd_ns: None,
+                    ue_rx_tx_ns: None,
+                    gnb_rx_tx_ns: None,
                 }
             })
             .collect();
@@ -1777,6 +1855,8 @@ mod tests_real_solve {
                     aoa: None,
                     rtt_ns: None,
                     rstd_ns: Some(rstd_ns),
+                    ue_rx_tx_ns: None,
+                    gnb_rx_tx_ns: None,
                 }
             })
             .collect();
@@ -1814,6 +1894,8 @@ mod tests_real_solve {
             aoa: None,
             rtt_ns: None,
             rstd_ns: None,
+            ue_rx_tx_ns: None,
+            gnb_rx_tx_ns: None,
         }];
 
         let loc = compute_location(&PositioningMethod::Ecid, &cells, &registry);
@@ -1856,6 +1938,8 @@ mod tests_real_solve {
                     aoa: Some(azimuth_deg),
                     rtt_ns: None,
                     rstd_ns: None,
+                    ue_rx_tx_ns: None,
+                    gnb_rx_tx_ns: None,
                 }
             })
             .collect();
@@ -1891,6 +1975,8 @@ mod tests_real_solve {
                     aoa: Some(azimuth_deg),
                     rtt_ns: Some(rtt_ns),
                     rstd_ns: None,
+                    ue_rx_tx_ns: None,
+                    gnb_rx_tx_ns: None,
                 }
             })
             .collect();
@@ -1915,6 +2001,8 @@ mod tests_real_solve {
             aoa: None,
             rtt_ns: None,
             rstd_ns: None,
+            ue_rx_tx_ns: None,
+            gnb_rx_tx_ns: None,
         }];
         let loc = compute_location(&PositioningMethod::Ecid, &cells, &registry);
         // Placeholder: origin 0/0 with heuristic accuracy.
@@ -1956,6 +2044,8 @@ mod tests_real_solve {
             aoa: None,
             rtt_ns: None,
             rstd_ns: None,
+            ue_rx_tx_ns: None,
+            gnb_rx_tx_ns: None,
         }];
         ctx.measurement_report(req.request_id, cells).unwrap();
         match rx.try_recv() {
@@ -2124,6 +2214,8 @@ mod tests_real_solve {
             aoa: None,
             rtt_ns: None,
             rstd_ns: None,
+            ue_rx_tx_ns: None,
+            gnb_rx_tx_ns: None,
         }];
         // A7: no fabricated placeholder — an unsolvable report yields None.
         let no_fix = ctx.measurement_report(req.request_id, cells);
@@ -2153,5 +2245,169 @@ mod tests_real_solve {
         );
         ctx.set_nf_instance_id("lmf-test");
         assert_eq!(ctx.nf_instance_id().as_deref(), Some("lmf-test"));
+    }
+}
+
+/// #713: Multi-RTT ranges on UE Rx–Tx + gNB Rx–Tx (TS 38.305 §8.10), with the UE
+/// half decoded from LPP bytes through the real adapter.
+#[cfg(test)]
+mod tests_multi_rtt_two_sided {
+    use super::*;
+    use crate::positioning::{enu_to_geodetic, geodetic_to_enu, EnuPoint, SPEED_OF_LIGHT_M_S};
+
+    /// T_c in ns (TS 38.211 §4.1), written out independently of codec_glue.
+    const TC_NS: f64 = 1e9 / (480_000.0 * 4_096.0);
+    /// TS 38.133 §10.1.25.3: the k0 report value of a zero Rx–Tx difference.
+    const MIDPOINT: f64 = 985_024.0;
+    const ORIGIN: (f64, f64) = (51.4778, -0.0015);
+
+    /// Four TRPs on a 1 km square and a UE at (350, 600) m. The UE clock runs
+    /// `UE_CLOCK_OFFSET_NS` ahead of the gNBs', and the UE transmits its SRS
+    /// `SRS_AFTER_PRS_NS` after the gNBs transmit their PRS. So, with t_i the
+    /// one-way propagation time to TRP i:
+    /// - UE Rx–Tx_i = (t_i + offset) − gap
+    /// - gNB Rx–Tx_i = (gap − offset) + t_i
+    ///
+    /// Neither is a range; their sum is 2·t_i.
+    const TRPS: [(u16, f64, f64); 4] = [
+        (201, 0.0, 0.0),
+        (202, 1000.0, 0.0),
+        (203, 0.0, 1000.0),
+        (204, 1000.0, 1000.0),
+    ];
+    const UE: (f64, f64) = (350.0, 600.0);
+    const UE_CLOCK_OFFSET_NS: f64 = 3_000.0;
+    const SRS_AFTER_PRS_NS: f64 = 1_000.0;
+
+    fn origin() -> TrpCoord {
+        TrpCoord::new(ORIGIN.0, ORIGIN.1, 0.0)
+    }
+
+    fn registry() -> TrpRegistry {
+        TrpRegistry::from_entries(TRPS.iter().map(|(pci, e, n)| {
+            (
+                format!("pci-{pci}"),
+                enu_to_geodetic(
+                    EnuPoint {
+                        e: *e,
+                        n: *n,
+                        u: 0.0,
+                    },
+                    origin(),
+                ),
+            )
+        }))
+    }
+
+    fn propagation_ns(e: f64, n: f64) -> f64 {
+        (UE.0 - e).hypot(UE.1 - n) / SPEED_OF_LIGHT_M_S * 1e9
+    }
+
+    /// The UE's LPP report: each TRP's UE Rx–Tx as a k0 code, (T/T_c) + 985024.
+    fn ue_report() -> Vec<CellMeasurement> {
+        let cells: Vec<(u16, u32)> = TRPS
+            .iter()
+            .map(|(pci, e, n)| {
+                let ue_rx_tx = propagation_ns(*e, *n) + UE_CLOCK_OFFSET_NS - SRS_AFTER_PRS_NS;
+                (*pci, (ue_rx_tx / TC_NS + MIDPOINT).round() as u32)
+            })
+            .collect();
+        let bytes = crate::lpp_fixtures::multi_rtt_lpp(&cells, 3);
+        crate::codec_glue::decode_lpp_provide_report(&bytes)
+            .expect("decodes")
+            .1
+    }
+
+    /// The gNBs' halves, as their own measurements of the same TRPs.
+    fn gnb_report() -> Vec<CellMeasurement> {
+        TRPS.iter()
+            .map(|(pci, e, n)| CellMeasurement {
+                nr_cgi: format!("pci-{pci}"),
+                rsrp: None,
+                rsrq: None,
+                timing_advance: None,
+                aoa: None,
+                rtt_ns: None,
+                rstd_ns: None,
+                ue_rx_tx_ns: None,
+                gnb_rx_tx_ns: Some(propagation_ns(*e, *n) - UE_CLOCK_OFFSET_NS + SRS_AFTER_PRS_NS),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_ue_half_decodes_signed_with_the_ts_38_133_midpoint() {
+        let cells = ue_report();
+        assert_eq!(cells.len(), 4);
+        for (c, (pci, e, n)) in cells.iter().zip(TRPS) {
+            assert_eq!(c.nr_cgi, format!("pci-{pci}"));
+            assert_eq!(c.rtt_ns, None, "the UE half is not an RTT");
+            let want = propagation_ns(e, n) + UE_CLOCK_OFFSET_NS - SRS_AFTER_PRS_NS;
+            let got = c.ue_rx_tx_ns.expect("ue_rx_tx_ns");
+            assert!(
+                (got - want).abs() <= TC_NS / 2.0 + 1e-9,
+                "{pci}: {got} vs {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn ranges_are_ue_plus_gnb_rx_tx_over_two() {
+        let mut cells = ue_report();
+        cells.extend(gnb_report());
+        let obs = multi_rtt_observations(&cells, &registry());
+        assert_eq!(obs.len(), 4);
+        for (o, (pci, e, n)) in obs.iter().zip(TRPS) {
+            assert_eq!(o.trp_id, format!("pci-{pci}"));
+            let want = (UE.0 - e).hypot(UE.1 - n);
+            // One k0 step is T_c ≈ 0.51 ns, ±0.25 ns after rounding: ±0.04 m of range.
+            assert!(
+                (o.range_m - want).abs() < 0.05,
+                "{pci}: {} vs {want}",
+                o.range_m
+            );
+        }
+    }
+
+    /// Hand-computed geometry in, the UE position out.
+    #[test]
+    fn the_solver_recovers_the_ue_from_paired_halves() {
+        let mut cells = ue_report();
+        cells.extend(gnb_report());
+        let fix = try_real_solve(&cells, &registry()).expect("a Multi-RTT fix");
+        assert_eq!(fix.method_used.as_deref(), Some("MULTI-RTT"));
+        let p = geodetic_to_enu(TrpCoord::new(fix.latitude, fix.longitude, 0.0), origin());
+        let err = (p.e - UE.0).hypot(p.n - UE.1);
+        assert!(err < 0.1, "position error {err:.3} m");
+    }
+
+    /// The issue's scenario: a conformant UE alone. Its Rx–Tx carries the clock
+    /// offset and is not a range, so there is no Multi-RTT fix (before #713 these
+    /// decoded to ≈ 501 µs, ranges of ≈ 75 km).
+    #[test]
+    fn the_ue_half_alone_is_never_ranged() {
+        let cells = ue_report();
+        assert!(multi_rtt_observations(&cells, &registry()).is_empty());
+        assert!(try_real_solve(&cells, &registry()).is_none());
+    }
+
+    #[test]
+    fn the_gnb_half_alone_is_never_ranged() {
+        assert!(multi_rtt_observations(&gnb_report(), &registry()).is_empty());
+    }
+
+    #[test]
+    fn a_negative_round_trip_is_dropped_not_ranged() {
+        let mut cells = ue_report();
+        cells.extend(gnb_report());
+        cells
+            .iter_mut()
+            .filter(|c| c.nr_cgi == "pci-204" && c.gnb_rx_tx_ns.is_some())
+            .for_each(|c| c.gnb_rx_tx_ns = Some(-1e6));
+        let obs = multi_rtt_observations(&cells, &registry());
+        assert_eq!(
+            obs.iter().map(|o| o.trp_id.as_str()).collect::<Vec<_>>(),
+            ["pci-201", "pci-202", "pci-203"]
+        );
     }
 }

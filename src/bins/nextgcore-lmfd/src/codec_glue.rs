@@ -12,8 +12,9 @@
 //!   `timing_advance`, `aoa`, `rsrp`, `rsrq`.
 //!
 //! - [`lpp_multi_rtt_provide_to_measurements`] — ProvideLocationInformation →
-//!   nr-Multi-RTT list: `nr_ue_rx_tx_time_diff` k0..k5 CHOICE → `rtt_ns`
-//!   (nanoseconds); `nr_phys_cell_id` → `nr_cgi`.
+//!   nr-Multi-RTT list: `nr-UE-RxTxTimeDiff` k-arm → `ue_rx_tx_ns` (signed
+//!   nanoseconds, TS 38.133 §10.1.25.3); `nr_phys_cell_id` → `nr_cgi`. That is the
+//!   UE half of an RTT only (#713).
 //!
 //! NR-DL-TDOA is **DEFERRED**: `CellMeasurement` carries no TDOA/RSTD field,
 //! and the `solve_tdoa` solver remains unwired.
@@ -382,6 +383,16 @@ pub fn classify_ue_capability(caps: &lpp::ProvideCapabilities) -> UeLppCapabilit
 /// solve for would spend a UE measurement campaign to arrive at no fix.
 pub const MIN_POINTS_FOR_MULTILATERATION: usize = 3;
 
+/// Whether this LMF can obtain the gNB half of a Multi-RTT measurement (#713).
+///
+/// TS 38.305 §8.10: a Multi-RTT range is UE Rx–Tx plus gNB Rx–Tx for the same TRP.
+/// The gNB half comes from the NRPPa Measurement procedure (TS 38.455), after the
+/// serving gNB has configured the UE's SRS through Positioning Information
+/// Exchange and Positioning Activation. This LMF implements none of those, so a
+/// Multi-RTT request would collect UE halves that can never be ranged. Until it
+/// does (#807), Multi-RTT is not requested.
+pub const MULTI_RTT_GNB_HALF_AVAILABLE: bool = false;
+
 /// Choose the LPP method for a positioning request (#103 criterion 4).
 ///
 /// Before this the network-initiated leg always asked for E-CID with the other two
@@ -396,9 +407,11 @@ pub const MIN_POINTS_FOR_MULTILATERATION: usize = 3;
 ///    known positions, and asking anyway wastes a measurement campaign.
 /// 2. **The UE reported E-CID only ⇒ E-CID.** Asking a UE for a method it has said
 ///    it cannot perform gets an error or an empty report.
-/// 3. **High-accuracy or emergency QoS ⇒ Multi-RTT.** Multi-RTT is the more
-///    accurate of the two available methods because the RTT is a two-sided
-///    measurement, and this LMF now solicits the gNB half over NRPPa.
+/// 3. **High-accuracy or emergency QoS ⇒ a multilateration method.** Multi-RTT
+///    when the gNB Rx–Tx half can be obtained ([`MULTI_RTT_GNB_HALF_AVAILABLE`]),
+///    because its two-sided measurement cancels the clock offset. Otherwise
+///    NR DL-TDOA (TS 38.305 §8.12), whose RSTDs the UE measures alone and which
+///    needs no gNB measurement (#713).
 /// 4. **Low-latency QoS ⇒ E-CID**, deliberately: one serving-cell measurement with
 ///    no PRS scheduling is the fastest thing available, and `LOW_DELAY` is a
 ///    statement about time rather than accuracy.
@@ -423,7 +436,13 @@ pub fn select_lpp_method(
         return LppMethod::Ecid;
     }
     match qos {
-        PositioningQos::HighAccuracy | PositioningQos::Emergency => LppMethod::MultiRtt,
+        PositioningQos::HighAccuracy | PositioningQos::Emergency => {
+            if MULTI_RTT_GNB_HALF_AVAILABLE {
+                LppMethod::MultiRtt
+            } else {
+                LppMethod::DlTdoa
+            }
+        }
         PositioningQos::LowLatency | PositioningQos::BestEffort => LppMethod::Ecid,
     }
 }
@@ -515,7 +534,7 @@ pub fn build_lpp_request(method: LppMethod, transaction_number: u8) -> Result<Ve
 // ---------------------------------------------------------------------------
 
 /// T_c = 1 / (480 000 × 4096) seconds, in nanoseconds (TS 38.211 §4.1).
-/// Used by [`nrrstd_to_ns`] to convert k-choice RSTD / UE-Rx-Tx values.
+/// Used by [`nrrstd_to_signed_ns`] to convert k-choice RSTD / UE-Rx-Tx values.
 const TC_NS: f64 = 1_000_000_000.0 / (480_000.0 * 4_096.0);
 
 // ---------------------------------------------------------------------------
@@ -536,17 +555,22 @@ fn pow2(k: i8) -> f64 {
     2f64.powi(i32::from(k))
 }
 
-/// Convert an NR-UE-Rx-Tx-TimeDiff report to nanoseconds as an unsigned magnitude
-/// `v × 2^k × T_c`, used by the Multi-RTT path for ranging.
+/// Convert an `nr-UE-RxTxTimeDiff-r16` report to SIGNED nanoseconds (TS 37.355
+/// `NR-Multi-RTT-MeasElement`, report mapping TS 38.133 §10.1.25.3).
 ///
-/// NOTE: per TS 38.133 §10.1.25 the UE Rx–Tx time difference is itself a SIGNED
-/// quantity with the same per-arm midpoint offset as NR-RSTD; treating it as an
-/// unsigned magnitude here is a known simplification of the Multi-RTT RTT model
-/// (RTT = UE-Rx-Tx + gNB-Rx-Tx) and is left unchanged to avoid regressing the
-/// committed Multi-RTT path — revisit alongside a proper two-sided RTT model.
-/// The DL-TDOA path uses the spec-correct signed converter [`nrrstd_to_signed_ns`].
-pub(crate) fn nrrstd_to_ns(r: TimeReport) -> u64 {
-    (f64::from(r.v) * pow2(r.k) * TC_NS) as u64
+/// The UE Rx–Tx time difference (TS 38.215 §5.1.30) is `T_UE-RX − T_UE-TX`, a
+/// signed quantity. Its report mapping is the one NR-RSTD uses: the k0 range
+/// `0..1970049` puts `RX-TX_TIME_DIFF_0000` at `T ≤ −985024·T_c` and steps by
+/// `2^k·T_c`, so the value is `(v·2^k − 985024)·T_c` and a UE whose Rx–Tx
+/// difference is about zero reports `v ≈ 985024/2^k`. Reading `v` as an unsigned
+/// magnitude instead (as this LMF did before #713) turns that zero into about
+/// 501 µs, a range of about 75 km.
+///
+/// This is one half of an RTT only. TS 38.305 §8.10 defines the Multi-RTT
+/// observable as UE Rx–Tx plus the gNB Rx–Tx of the same TRP; see
+/// `context::try_real_solve`, which never ranges on this half alone.
+pub(crate) fn ue_rx_tx_to_signed_ns(r: TimeReport) -> f64 {
+    nrrstd_to_signed_ns(r)
 }
 
 /// Convert an NR-RSTD report to SIGNED nanoseconds (TS 37.355 §6.5.10, mapping
@@ -654,6 +678,8 @@ fn measured_results_element_to_cell(elem: &lpp::MeasuredResultsElement) -> CellM
         aoa: None,
         rtt_ns: None,
         rstd_ns: None,
+        ue_rx_tx_ns: None,
+        gnb_rx_tx_ns: None,
     }
 }
 
@@ -706,7 +732,7 @@ pub fn decode_lpp_ecid_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasurement>
 /// | PDU field                       | `CellMeasurement` field | Notes                            |
 /// |---------------------------------|-------------------------|----------------------------------|
 /// | `nr-PhysCellID` (NR PCI)        | `nr_cgi`                | `"pci-<n>"`; `"prs-<id>"` fallback |
-/// | `nr-UE-RxTxTimeDiff` k-arm      | `rtt_ns`                | v × 2^k × T_c nanoseconds        |
+/// | `nr-UE-RxTxTimeDiff` k-arm      | `ue_rx_tx_ns`           | (v·2^k − 985024)·T_c ns, signed (TS 38.133 §10.1.25.3) |
 /// | `nr-DL-PRS-RSRP-Result`         | `rsrp`                  | 0..126 → −140..−14 dBm           |
 ///
 /// Returns an empty `Vec` when the message is not a `ProvideLocationInformation`,
@@ -741,8 +767,13 @@ pub fn lpp_multi_rtt_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<Cell
                 rsrq: None,
                 timing_advance: None,
                 aoa: None,
-                rtt_ns: Some(nrrstd_to_ns(rx_tx_report(&elem.nr_ue_rx_tx_time_diff_r16))),
+                // The UE half of the RTT only: never an RTT by itself (#713).
+                rtt_ns: None,
                 rstd_ns: None,
+                ue_rx_tx_ns: Some(ue_rx_tx_to_signed_ns(rx_tx_report(
+                    &elem.nr_ue_rx_tx_time_diff_r16,
+                ))),
+                gnb_rx_tx_ns: None,
             }
         })
         .collect()
@@ -801,6 +832,8 @@ pub fn lpp_dl_tdoa_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMe
         aoa: None,
         rtt_ns: None,
         rstd_ns: Some(0.0),
+        ue_rx_tx_ns: None,
+        gnb_rx_tx_ns: None,
     });
     for elem in &sig.nr_dl_tdoa_meas_list_r16.0 {
         let nr_cgi = match &elem.nr_phys_cell_id_r16 {
@@ -819,6 +852,8 @@ pub fn lpp_dl_tdoa_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMe
             aoa: None,
             rtt_ns: None,
             rstd_ns: Some(nrrstd_to_signed_ns(rstd_report(&elem.nr_rstd_r16))),
+            ue_rx_tx_ns: None,
+            gnb_rx_tx_ns: None,
         });
     }
     out
@@ -930,8 +965,8 @@ mod tests {
     use super::{
         build_lpp_ecid_request, decode_lpp_ecid_report, decode_lpp_provide_report,
         decode_nrppa_ecid_report, extract_lpp_request_id, lpp_dl_tdoa_provide_to_measurements,
-        lpp_multi_rtt_provide_to_measurements, nrrstd_to_ns, nrrstd_to_signed_ns, TimeReport,
-        TC_NS,
+        lpp_multi_rtt_provide_to_measurements, nrrstd_to_signed_ns, ue_rx_tx_to_signed_ns,
+        TimeReport, TC_NS,
     };
 
     use crate::nrppa_uplink::test_support::{aoa, ecid_report, nr_cgi, rsrp, ta1};
@@ -1042,23 +1077,37 @@ mod tests {
         assert!(cells.is_empty(), "an error-only report yields no cells");
     }
 
-    /// `nrrstd_to_ns`: single-unit inputs verify the 2^k × T_c scaling.
-    ///
-    /// T_c ≈ 0.5086 ns; the (f64 → u64) truncation is intentional.
+    /// #713: `nr-UE-RxTxTimeDiff-r16` is signed, with the TS 38.133 §10.1.25.3
+    /// midpoint. A UE whose Rx–Tx difference is about zero reports v ≈ 985024/2^k,
+    /// which is ≈ 0 ns, not the ≈ 501 µs an unsigned reading gives.
     #[test]
-    fn nrrstd_k_to_ns_unit_values() {
-        // K0(1) → 1 × 1 × 0.5086 ≈ 0 ns (truncated)
-        assert_eq!(nrrstd_to_ns(TimeReport { v: 1, k: 0 }), 0);
-        // K1(1) → 1 × 2 × 0.5086 ≈ 1 ns
-        assert_eq!(nrrstd_to_ns(TimeReport { v: 1, k: 1 }), 1);
-        // K2(1) → 1 × 4 × 0.5086 ≈ 2 ns
-        assert_eq!(nrrstd_to_ns(TimeReport { v: 1, k: 2 }), 2);
-        // K3(1) → 1 × 8 × 0.5086 ≈ 4 ns
-        assert_eq!(nrrstd_to_ns(TimeReport { v: 1, k: 3 }), 4);
-        // K4(1) → 1 × 16 × 0.5086 ≈ 8 ns
-        assert_eq!(nrrstd_to_ns(TimeReport { v: 1, k: 4 }), 8);
-        // K5(1) → 1 × 32 × 0.5086 ≈ 16 ns
-        assert_eq!(nrrstd_to_ns(TimeReport { v: 1, k: 5 }), 16);
+    fn ue_rx_tx_decodes_signed_around_the_midpoint() {
+        for k in 0..=5i8 {
+            let zero = 985_024u32 >> k;
+            assert_eq!(
+                ue_rx_tx_to_signed_ns(TimeReport { v: zero, k }),
+                0.0,
+                "k{k}"
+            );
+            // One step either side is ±2^k·T_c.
+            let step = f64::from(1u32 << k) * TC_NS;
+            assert!((ue_rx_tx_to_signed_ns(TimeReport { v: zero + 1, k }) - step).abs() < 1e-9);
+            assert!((ue_rx_tx_to_signed_ns(TimeReport { v: zero - 1, k }) + step).abs() < 1e-9);
+        }
+        // The issue's value: v = 985024 + δ is δ·T_c, a few ns, not 501 µs.
+        let near_zero = ue_rx_tx_to_signed_ns(TimeReport {
+            v: 985_024 + 7,
+            k: 0,
+        });
+        assert!((near_zero - 7.0 * TC_NS).abs() < 1e-9, "{near_zero}");
+        // The k0 endpoints are ≈ ±501 µs.
+        assert!(
+            (ue_rx_tx_to_signed_ns(TimeReport { v: 0, k: 0 }) + 985_024.0 * TC_NS).abs() < 1e-6
+        );
+        assert!(
+            (ue_rx_tx_to_signed_ns(TimeReport { v: 1_970_049, k: 0 }) - 985_025.0 * TC_NS).abs()
+                < 1e-6
+        );
     }
 
     /// NRPPa E-CID: generated encode → `decode_nrppa_ecid_report` → adapt.
@@ -1107,28 +1156,23 @@ mod tests {
         let cells = lpp_multi_rtt_provide_to_measurements(&decoded);
         assert_eq!(cells.len(), 2);
 
-        // Cell 0: PCI present → "pci-123"; K2(300_000) → ~610_351 ns.
+        // Cell 0: PCI present → "pci-123"; K2(300_000) → (1_200_000 − 985_024)·T_c
+        // = 214_976·T_c ≈ 109_342 ns of UE Rx–Tx (#713: signed, and not an RTT).
         let c0 = &cells[0];
         assert_eq!(c0.nr_cgi, "pci-123");
         // nr_dl_prs_rsrp_result=80 → 80 − 140 = −60 dBm.
         assert_eq!(c0.rsrp, Some(-60));
-        let rtt0 = c0.rtt_ns.expect("rtt_ns cell 0");
-        // K2(300_000): 300_000 × 4 × TC_NS = 1_200_000 × (1e9/1_966_080_000) ≈ 610_351 ns.
-        assert!(
-            (610_000..=611_000).contains(&rtt0),
-            "K2(300_000) rtt_ns={rtt0}, expected ~610_351"
-        );
+        assert_eq!(c0.rtt_ns, None, "the UE half is not an RTT");
+        let rx_tx0 = c0.ue_rx_tx_ns.expect("ue_rx_tx_ns cell 0");
+        assert!((rx_tx0 - 214_976.0 * TC_NS).abs() < 1e-6, "{rx_tx0}");
 
-        // Cell 1: PCI absent → "prs-6"; K1(200_000) → ~203_450 ns; no RSRP.
+        // Cell 1: PCI absent → "prs-6"; K1(200_000) → (400_000 − 985_024)·T_c, negative.
         let c1 = &cells[1];
         assert_eq!(c1.nr_cgi, "prs-6");
         assert_eq!(c1.rsrp, None);
-        let rtt1 = c1.rtt_ns.expect("rtt_ns cell 1");
-        // K1(200_000): 200_000 × 2 × TC_NS = 400_000 × (1e9/1_966_080_000) ≈ 203_450 ns.
-        assert!(
-            (203_000..=204_000).contains(&rtt1),
-            "K1(200_000) rtt_ns={rtt1}, expected ~203_450"
-        );
+        assert_eq!(c1.rtt_ns, None);
+        let rx_tx1 = c1.ue_rx_tx_ns.expect("ue_rx_tx_ns cell 1");
+        assert!((rx_tx1 + 585_024.0 * TC_NS).abs() < 1e-6, "{rx_tx1}");
     }
 
     /// `nrrstd_to_signed_ns`: NR-RSTD is a SIGNED time difference; verify the
@@ -1192,9 +1236,13 @@ mod tests {
         assert_eq!(cells[0].nr_cgi, "pci-321");
         // nr_dl_prs_rsrp_result=80 -> 80 - 140 = -60 dBm.
         assert_eq!(cells[0].rsrp, Some(-60));
-        // K1(200_000): 200_000 * 2 * TC_NS ~= 203_450 ns.
-        let rtt = cells[0].rtt_ns.expect("rtt_ns");
-        assert!((203_000..=204_000).contains(&rtt), "rtt_ns={rtt}");
+        // K1(200_000): (400_000 − 985_024)·T_c of UE Rx–Tx, signed (#713).
+        assert_eq!(cells[0].rtt_ns, None);
+        let rx_tx = cells[0].ue_rx_tx_ns.expect("ue_rx_tx_ns");
+        assert!(
+            (rx_tx + 585_024.0 * TC_NS).abs() < 1e-6,
+            "ue_rx_tx_ns={rx_tx}"
+        );
     }
 
     /// A5: a decodable LPP message with no recognised signal measurements
