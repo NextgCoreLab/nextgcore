@@ -186,6 +186,10 @@ pub enum AssignError {
     IdSpaceExhausted,
     /// The dictionary holds [`Limits::max_dic_entries`] entries (#786).
     DictionaryFull,
+    /// The ID reservation could not be written to the state file, so no ID is
+    /// handed out (#843 review): one handed out above what is on disk could be
+    /// issued again after a restart.
+    StateNotPersisted,
 }
 
 /// Subscribe failures (#786).
@@ -197,6 +201,8 @@ pub enum SubscribeError {
     TooManyForConsumer,
     /// The subscription ID counter is at the top of its range.
     IdSpaceExhausted,
+    /// The ID reservation could not be written (#843 review).
+    StateNotPersisted,
 }
 
 /// A notification to deliver to every active subscriber (TS 29.673 §5.2.2.6).
@@ -397,6 +403,52 @@ struct Counters {
 /// How many IDs of each kind one synchronous reservation write covers (#786).
 const ID_RESERVATION: u64 = 1024;
 
+/// A snapshot's contents copied out of the state (#843 review), serialised by
+/// [`SnapshotSource::to_json`] outside the state lock.
+#[derive(Debug, Clone)]
+pub struct SnapshotSource {
+    version_id: u8,
+    counters: Counters,
+    entries: Vec<DicEntry>,
+    subscriptions: Vec<Subscription>,
+    provisionings: Vec<Provisioning>,
+}
+
+impl SnapshotSource {
+    pub fn to_json(&self) -> Value {
+        let opt_b64 = |b: &Option<Vec<u8>>| b.as_ref().map(|v| B64.encode(v));
+        json!({
+            "versionId": self.version_id,
+            "nextEntryId": self.counters.entry_id,
+            "nextRci": self.counters.rci,
+            "nextSubSeq": self.counters.sub_seq,
+            "nextProvSeq": self.counters.prov_seq,
+            "entries": self.entries.iter().map(|e| json!({
+                "id": e.id,
+                "tacs": e.tacs,
+                "plmnId": e.plmn_id.map(|i| i.to_nucmf()),
+                "manId": e.man_id.map(|i| i.to_nucmf()),
+                "cap5gs": opt_b64(&e.caps.cap_5gs),
+                "capEps": opt_b64(&e.caps.cap_eps),
+                "paging5gs": opt_b64(&e.caps.paging_5gs),
+                "pagingEps": opt_b64(&e.caps.paging_eps),
+                "provisioningId": e.provisioning_id,
+            })).collect::<Vec<_>>(),
+            "subscriptions": self.subscriptions.iter().map(|s| json!({
+                "id": s.id,
+                "nfId": s.nf_id,
+                "uri": s.notification_uri,
+                "expires": s.expires.map(|t| t.to_rfc3339()),
+            })).collect::<Vec<_>>(),
+            "provisionings": self.provisionings.iter().map(|p| json!({
+                "id": p.id,
+                "configs": p.configs,
+                "suppFeat": p.supp_feat,
+            })).collect::<Vec<_>>(),
+        })
+    }
+}
+
 /// Writes snapshots in generation order (#786).
 ///
 /// Snapshots are taken under the state lock but may be written after it is
@@ -409,17 +461,26 @@ pub struct Persister {
 }
 
 impl Persister {
-    pub fn write(&self, generation: u64, doc: &Value) {
+    /// Write `doc` unless a newer generation is already on disk. `Err` when the
+    /// write failed (#843 review): a caller that needs the write to have happened
+    /// (an ID reservation) must not proceed.
+    pub fn write(&self, generation: u64, doc: &Value) -> Result<(), String> {
         let mut written = self
             .written
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if generation <= *written {
-            return;
+            return Ok(());
         }
         match self.store.persist(doc) {
-            Ok(()) => *written = generation,
-            Err(e) => log::error!("UCMF state not persisted: {e}"),
+            Ok(()) => {
+                *written = generation;
+                Ok(())
+            }
+            Err(e) => {
+                log::error!("UCMF state not persisted: {e}");
+                Err(e.to_string())
+            }
         }
     }
 }
@@ -566,9 +627,7 @@ impl Ucmf {
             );
             return Err(AssignError::DictionaryFull);
         }
-        let entry_id = self
-            .allocate_entry_id()
-            .ok_or(AssignError::IdSpaceExhausted)?;
+        let entry_id = self.allocate_entry_id()?;
         let id = self.allocate_plmn_id()?;
         let mut caps = caps;
         caps.complete();
@@ -585,7 +644,8 @@ impl Ucmf {
     }
 
     fn allocate_plmn_id(&mut self) -> Result<RacsId, AssignError> {
-        self.reserve_ids();
+        self.reserve_ids()
+            .map_err(|_| AssignError::StateNotPersisted)?;
         if self.next_rci > MAX_RCI {
             return Err(AssignError::IdSpaceExhausted);
         }
@@ -595,13 +655,15 @@ impl Ucmf {
         Ok(id)
     }
 
-    /// The next Dictionary Entry ID, or `None` when the counter cannot advance:
-    /// handing out its last value again would give two entries one ID.
-    fn allocate_entry_id(&mut self) -> Option<u32> {
-        self.reserve_ids();
+    /// The next Dictionary Entry ID. `StateNotPersisted` when the reservation could
+    /// not be written (#843 review), `IdSpaceExhausted` when the counter cannot
+    /// advance: handing out its last value again would give two entries one ID.
+    fn allocate_entry_id(&mut self) -> Result<u32, AssignError> {
+        self.reserve_ids()
+            .map_err(|_| AssignError::StateNotPersisted)?;
         let id = self.next_entry_id;
-        self.next_entry_id = id.checked_add(1)?;
-        Some(id)
+        self.next_entry_id = id.checked_add(1).ok_or(AssignError::IdSpaceExhausted)?;
+        Ok(id)
     }
 
     fn creation_notification(&mut self, now: DateTime<Utc>) -> Option<Notification> {
@@ -698,20 +760,33 @@ impl Ucmf {
             );
             return Err(SubscribeError::TooManySubscriptions);
         }
-        let consumer = consumer_of(nf_id.as_deref(), &notification_uri);
-        let held = self
+        // #843 review: the consumer is self-declared by `nfId`, so a cap keyed on it
+        // alone is sidestepped by varying it. A subscription counts against both
+        // its nfId and its notification URI's authority, and either reaching the
+        // cap refuses.
+        let by_nf = nf_id.as_deref().map(|id| {
+            self.subscriptions
+                .values()
+                .filter(|s| s.nf_id.as_deref() == Some(id))
+                .count()
+        });
+        let authority = uri_authority(&notification_uri);
+        let by_uri = self
             .subscriptions
             .values()
-            .filter(|s| consumer_of(s.nf_id.as_deref(), &s.notification_uri) == consumer)
+            .filter(|s| uri_authority(&s.notification_uri) == authority)
             .count();
+        let consumer = consumer_of(nf_id.as_deref(), &notification_uri);
+        let held = by_nf.unwrap_or(0).max(by_uri);
         if held >= self.limits.max_subscriptions_per_consumer {
             log::warn!(
-                "Subscribe refused: consumer {consumer} holds {held} subscriptions, the \
-                 configured maximum"
+                "Subscribe refused: consumer {consumer} (callback {authority}) holds {held} \
+                 subscriptions, the configured maximum"
             );
             return Err(SubscribeError::TooManyForConsumer);
         }
-        self.reserve_ids();
+        self.reserve_ids()
+            .map_err(|_| SubscribeError::StateNotPersisted)?;
         let seq = self.next_sub_seq;
         // The counter is restored from the state file, so it is not trusted not
         // to be near the top of its range. At the top it refuses rather than
@@ -783,7 +858,15 @@ impl Ucmf {
         Vec<(String, &'static str)>,
         Option<Notification>,
     ) {
-        self.reserve_ids();
+        if self.reserve_ids().is_err() {
+            // TS 29.122 RacsFailureCode: nothing is provisioned without an ID that
+            // is safe to hand out (#843 review).
+            let failed = racs_configs
+                .keys()
+                .map(|k| (k.clone(), RACS_OTHER_REASON))
+                .collect();
+            return (None, failed, None);
+        }
         let Some(next_prov_seq) = self.next_prov_seq.checked_add(1) else {
             // The counter cannot advance: refuse rather than reuse an ID.
             log::error!("Provisioning refused: the provisioning ID space is used up");
@@ -985,7 +1068,7 @@ impl Ucmf {
                 failed.push((racs_key.clone(), RACS_OTHER_REASON));
                 continue;
             }
-            let Some(entry_id) = self.allocate_entry_id() else {
+            let Ok(entry_id) = self.allocate_entry_id() else {
                 failed.push((racs_key.clone(), RACS_OTHER_REASON));
                 continue;
             };
@@ -1056,7 +1139,10 @@ impl Ucmf {
         self.generation += 1;
         self.dirty = false;
         let doc = self.snapshot();
-        self.persister.write(self.generation, &doc);
+        // Outside write-behind mode a failed write is logged by the persister and
+        // the change stays in memory, as before #786; the reservation path below
+        // is the one that must not proceed on failure.
+        let _ = self.persister.write(self.generation, &doc);
     }
 
     /// In write-behind mode, make sure every counter is below what the written
@@ -1064,9 +1150,14 @@ impl Ucmf {
     /// reservation, reserve [`ID_RESERVATION`] more of each and write that
     /// synchronously. One write per 1024 IDs, and a crash leaves gaps, never
     /// reuse.
-    fn reserve_ids(&mut self) {
+    ///
+    /// Fail-closed (#843 review): the reservation counts only once it is on disk.
+    /// When the write fails, `reserved` stays where it was and the caller refuses
+    /// the allocation, so no ID is ever handed out above what a restart resumes
+    /// from.
+    fn reserve_ids(&mut self) -> Result<(), String> {
         if !self.write_behind {
-            return;
+            return Ok(());
         }
         let c = self.counters();
         let r = self.reserved;
@@ -1075,62 +1166,72 @@ impl Ucmf {
             && c.sub_seq < r.sub_seq
             && c.prov_seq < r.prov_seq
         {
-            return;
+            return Ok(());
         }
         let step = ID_RESERVATION;
+        let previous = self.reserved;
         self.reserved = Counters {
             entry_id: c.entry_id.saturating_add(step as u32),
             rci: c.rci.saturating_add(step),
             sub_seq: c.sub_seq.saturating_add(step),
             prov_seq: c.prov_seq.saturating_add(step),
         };
-        self.write_now();
+        self.generation += 1;
+        let doc = self.snapshot();
+        match self.persister.write(self.generation, &doc) {
+            Ok(()) => {
+                self.dirty = false;
+                Ok(())
+            }
+            Err(e) => {
+                self.reserved = previous;
+                // The in-memory changes still need writing.
+                self.dirty = true;
+                log::error!(
+                    "UCMF ID reservation not written ({e}); no ID is handed out until the \
+                     state file can be written"
+                );
+                Err(e)
+            }
+        }
     }
 
     /// In write-behind mode, the snapshot to write if anything changed since the
     /// last one, with its generation and the writer to hand it to. Taken under
     /// the state lock; the caller writes it after releasing the lock.
-    pub fn take_pending_write(&mut self) -> Option<(Arc<Persister>, u64, Value)> {
+    pub fn take_pending_write(&mut self) -> Option<(Arc<Persister>, u64, SnapshotSource)> {
         if !self.dirty {
             return None;
         }
         self.dirty = false;
-        Some((self.persister.clone(), self.generation, self.snapshot()))
+        Some((
+            self.persister.clone(),
+            self.generation,
+            self.snapshot_source(),
+        ))
     }
 
     pub fn snapshot(&self) -> Value {
-        let opt_b64 = |b: &Option<Vec<u8>>| b.as_ref().map(|v| B64.encode(v));
-        json!({
-            "versionId": self.version_id,
+        self.snapshot_source().to_json()
+    }
+
+    /// What a snapshot is made of, copied out of the state (#843 review). The
+    /// copy is taken under the state lock; the JSON and base64 serialisation of
+    /// every capability is done from it after the lock is released.
+    fn snapshot_source(&self) -> SnapshotSource {
+        SnapshotSource {
+            version_id: self.version_id,
             // In write-behind mode the reservations, so a restart after a crash
             // continues above every ID handed out (#786).
-            "nextEntryId": if self.write_behind { self.reserved.entry_id } else { self.next_entry_id },
-            "nextRci": if self.write_behind { self.reserved.rci } else { self.next_rci },
-            "nextSubSeq": if self.write_behind { self.reserved.sub_seq } else { self.next_sub_seq },
-            "nextProvSeq": if self.write_behind { self.reserved.prov_seq } else { self.next_prov_seq },
-            "entries": self.entries.values().map(|e| json!({
-                "id": e.id,
-                "tacs": e.tacs,
-                "plmnId": e.plmn_id.map(|i| i.to_nucmf()),
-                "manId": e.man_id.map(|i| i.to_nucmf()),
-                "cap5gs": opt_b64(&e.caps.cap_5gs),
-                "capEps": opt_b64(&e.caps.cap_eps),
-                "paging5gs": opt_b64(&e.caps.paging_5gs),
-                "pagingEps": opt_b64(&e.caps.paging_eps),
-                "provisioningId": e.provisioning_id,
-            })).collect::<Vec<_>>(),
-            "subscriptions": self.subscriptions.values().map(|s| json!({
-                "id": s.id,
-                "nfId": s.nf_id,
-                "uri": s.notification_uri,
-                "expires": s.expires.map(|t| t.to_rfc3339()),
-            })).collect::<Vec<_>>(),
-            "provisionings": self.provisionings.values().map(|p| json!({
-                "id": p.id,
-                "configs": p.configs,
-                "suppFeat": p.supp_feat,
-            })).collect::<Vec<_>>(),
-        })
+            counters: if self.write_behind {
+                self.reserved
+            } else {
+                self.counters()
+            },
+            entries: self.entries.values().cloned().collect(),
+            subscriptions: self.subscriptions.values().cloned().collect(),
+            provisionings: self.provisionings.values().cloned().collect(),
+        }
     }
 
     fn restore(&mut self, doc: &Value) {
@@ -1249,8 +1350,16 @@ impl Ucmf {
     }
 }
 
-/// Who a subscription belongs to, for the per-consumer cap (#786): its `nfId`
-/// when given, else the authority (`host[:port]`) of its notification URI.
+/// The authority (`host[:port]`) of a notification URI.
+fn uri_authority(notification_uri: &str) -> &str {
+    let rest = notification_uri
+        .split_once("://")
+        .map_or(notification_uri, |(_, r)| r);
+    rest.split('/').next().unwrap_or(rest)
+}
+
+/// Who a subscription belongs to, for logging the per-consumer cap (#786): its
+/// `nfId` when given, else the authority (`host[:port]`) of its notification URI.
 fn consumer_of(nf_id: Option<&str>, notification_uri: &str) -> String {
     match nf_id {
         Some(id) => format!("nf:{id}"),
@@ -1927,6 +2036,42 @@ mod tests {
         u
     }
 
+    /// #843 review MINOR 4: the nfId is self-declared, so varying it must not
+    /// sidestep the per-consumer cap: one callback authority is one consumer.
+    #[test]
+    fn varying_the_nf_id_does_not_sidestep_the_per_consumer_cap() {
+        let mut u = limited(10, 10, 2);
+        for i in 0..2 {
+            u.subscribe(Some(format!("nf-{i}")), "http://a:80/n".into(), None, now())
+                .unwrap();
+        }
+        assert_eq!(
+            u.subscribe(
+                Some("nf-new".into()),
+                "http://a:80/other".into(),
+                None,
+                now()
+            )
+            .map(|s| s.id),
+            Err(SubscribeError::TooManyForConsumer)
+        );
+        // One nfId across callback hosts is still one consumer.
+        let mut u = limited(10, 10, 2);
+        for host in ["b", "c"] {
+            u.subscribe(Some("nf-x".into()), format!("http://{host}/n"), None, now())
+                .unwrap();
+        }
+        assert_eq!(
+            u.subscribe(Some("nf-x".into()), "http://d/n".into(), None, now())
+                .map(|s| s.id),
+            Err(SubscribeError::TooManyForConsumer)
+        );
+        // Another consumer is unaffected.
+        assert!(u
+            .subscribe(Some("nf-y".into()), "http://e/n".into(), None, now())
+            .is_ok());
+    }
+
     #[test]
     fn the_dictionary_is_capped_and_a_matching_assign_still_works() {
         let mut u = limited(2, 10, 10);
@@ -2002,13 +2147,15 @@ mod tests {
         );
         let (persister, generation, doc) = u.take_pending_write().expect("dirty");
         assert!(u.take_pending_write().is_none(), "taken once");
-        persister.write(generation, &doc);
+        persister.write(generation, &doc.to_json()).unwrap();
         let mut back = Ucmf::new(0, ModeOfOperation::B);
         assert_eq!(back.attach_store(Some(path.clone())), Ok(true));
         assert_eq!(back.entry_count(), 2);
         assert!(back.resolve(&id, None).is_ok());
         // An older snapshot written late does not overwrite a newer one.
-        persister.write(generation - 1, &json!({"versionId": 9}));
+        persister
+            .write(generation - 1, &json!({"versionId": 9}))
+            .unwrap();
         let on_disk: Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(on_disk["versionId"], 3, "the newer snapshot stays");
@@ -2045,6 +2192,65 @@ mod tests {
         assert!(entry > 5);
         let sub = u.subscribe(None, "http://a/n".into(), None, now()).unwrap();
         assert_ne!(sub.id, "1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #843 review MAJOR: when the reservation cannot be written, no ID is handed
+    /// out. Before, `reserved` advanced anyway, IDs were issued above what was on
+    /// disk, and after a crash RCI 0 was issued again. The store is made
+    /// unwritable by putting a FILE where its directory was (ENOTDIR), which
+    /// fails for root too, unlike a read-only mode.
+    #[test]
+    fn an_unwritable_reservation_hands_out_no_id() {
+        let dir = std::env::temp_dir().join(format!("ucmf-ro-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ucmf.json");
+        let mut handed_out = Vec::new();
+        {
+            let mut u = Ucmf::new(3, ModeOfOperation::B);
+            u.attach_store(Some(path.clone())).unwrap();
+            u.set_write_behind(true);
+            // Sabotage: the state directory becomes a file.
+            std::fs::remove_dir_all(&dir).unwrap();
+            std::fs::write(&dir, b"not a directory").unwrap();
+            for i in 0..3u8 {
+                assert_eq!(
+                    u.assign("35123456", caps(&[i]), now()).map(|r| r.1),
+                    Err(AssignError::StateNotPersisted),
+                    "no RCI without a reservation on disk"
+                );
+            }
+            assert_eq!(
+                u.subscribe(None, "http://a/n".into(), None, now())
+                    .map(|s| s.id),
+                Err(SubscribeError::StateNotPersisted)
+            );
+            let mut configs = Map::new();
+            configs.insert(
+                "01ABCDEF".into(),
+                json!({ "imeiTacs": ["35123456"], "racsParam5Gs": "0102" }),
+            );
+            let (prov, failed, _) = u.create_provisioning(&configs, None, now());
+            assert!(prov.is_none());
+            assert_eq!(failed, vec![("01ABCDEF".to_string(), RACS_OTHER_REASON)]);
+            // The store heals: allocation resumes.
+            std::fs::remove_file(&dir).unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            for i in 0..3u8 {
+                handed_out.push(u.assign("35123456", caps(&[i]), now()).unwrap().1);
+            }
+            // Dropped without a flush: the crash.
+        }
+        let mut u = Ucmf::new(3, ModeOfOperation::B);
+        u.attach_store(Some(path.clone())).unwrap();
+        u.set_write_behind(true);
+        let next = u.assign("35123456", caps(&[99]), now()).unwrap().1;
+        assert!(
+            !handed_out.contains(&next),
+            "{next:?} was handed out before the crash"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

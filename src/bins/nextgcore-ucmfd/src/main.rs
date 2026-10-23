@@ -274,13 +274,13 @@ fn render_metrics(ucmf: Option<&RwLock<Ucmf>>) -> String {
     metric(
         "ucmf_dictionary_full_refusals_total",
         "counter",
-        "Assigns refused because the dictionary is at ucmf.limits.max_dic_entries",
+        "Assign requests refused because the dictionary is at ucmf.limits.max_dic_entries (provisioning refusals are not counted)",
         DICTIONARY_FULL_REFUSALS.load(Ordering::Relaxed),
     );
     metric(
         "ucmf_subscription_limit_refusals_total",
         "counter",
-        "Subscribes refused at a subscription limit",
+        "Subscribe requests refused at ucmf.limits.max_subscriptions or max_subscriptions_per_consumer",
         SUBSCRIPTION_LIMIT_REFUSALS.load(Ordering::Relaxed),
     );
     if let Some(ucmf) = ucmf {
@@ -301,13 +301,27 @@ fn render_metrics(ucmf: Option<&RwLock<Ucmf>>) -> String {
     out
 }
 
+/// The default `/metrics` address: loopback, on a port of its own. 9090 is the
+/// default of mmed, sgwud and upfd, and on a shared host the second NF to bind it
+/// would lose its metrics (#857 review).
+const DEFAULT_METRICS_ADDR: ([u8; 4], u16) = ([127, 0, 0, 1], 9096);
+
 /// Where `/metrics` listens: `UCMF_METRICS_ADDR`, else loopback. The endpoint
 /// is unauthenticated, so reaching it from another host is an operator's
-/// explicit choice of a private address (or a scraping sidecar).
+/// explicit choice of a private address (or a scraping sidecar). A value that
+/// does not parse falls back to the default and says so (#857 review), so an
+/// operator learns why a scrape from another host fails.
 fn metrics_addr(value: Option<&str>) -> SocketAddr {
-    value
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 9090)))
+    let default = SocketAddr::from(DEFAULT_METRICS_ADDR);
+    match value {
+        None => default,
+        Some(v) => v.parse().unwrap_or_else(|_| {
+            log::warn!(
+                "UCMF_METRICS_ADDR '{v}' is not an ip:port; /metrics listens on {default} instead"
+            );
+            default
+        }),
+    }
 }
 
 fn api_root() -> &'static str {
@@ -445,15 +459,18 @@ async fn main() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     log::info!("Shutting down...");
+    // Deregister before the listener goes away (TS 29.510 §5.2.2.4), stop
+    // serving, and only then write the final snapshot, so no request served
+    // after it is lost on a clean shutdown (#843 review).
+    nextgcore_sbi::heartbeat::deregister_self().await;
+    let stopped = sbi_server
+        .stop()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"));
     if let Some(ucmf) = UCMF.get() {
         flush_state(ucmf).await;
     }
-    // Deregister before the listener goes away (TS 29.510 §5.2.2.4).
-    nextgcore_sbi::heartbeat::deregister_self().await;
-    sbi_server
-        .stop()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"))?;
+    stopped?;
     log::info!("UCMF shutdown complete");
     Ok(())
 }
@@ -544,8 +561,11 @@ fn split_uri(uri: &str) -> Option<(String, u16, String)> {
 /// thread, so requests are not held up by the disk.
 async fn flush_state(ucmf: &Arc<RwLock<Ucmf>>) {
     let pending = write_state(ucmf).take_pending_write();
-    if let Some((persister, generation, doc)) = pending {
-        let _ = tokio::task::spawn_blocking(move || persister.write(generation, &doc)).await;
+    if let Some((persister, generation, source)) = pending {
+        // Serialised and written off the state lock (#843 review). A failed write
+        // is logged by the persister; the next reservation retries it.
+        let _ = tokio::task::spawn_blocking(move || persister.write(generation, &source.to_json()))
+            .await;
     }
 }
 
@@ -966,6 +986,16 @@ fn assign(
             ),
             Vec::new(),
         ),
+        // #843 review: no ID is handed out that the state file does not cover.
+        Err(AssignError::StateNotPersisted) => (
+            send_error(
+                500,
+                "Internal Server Error",
+                "The UCMF state could not be written, so no ID can be assigned safely",
+                Some("SYSTEM_FAILURE"),
+            ),
+            Vec::new(),
+        ),
     }
 }
 
@@ -1003,22 +1033,34 @@ fn subscribe(u: &mut Ucmf, request: &SbiRequest, now: DateTime<Utc>) -> SbiRespo
         Ok(sub) => sub,
         // TS 29.500 Table 5.2.7.2-1: INSUFFICIENT_RESOURCES is a 500 (#786).
         Err(e) => {
-            SUBSCRIPTION_LIMIT_REFUSALS.fetch_add(1, Ordering::Relaxed);
-            let detail = match e {
-                context::SubscribeError::TooManySubscriptions => {
-                    "The UCMF holds its maximum number of subscriptions"
+            // MINOR 3 of the #857 review: the series counts the configured
+            // limits only, not an exhausted ID space or a failed write.
+            if matches!(
+                e,
+                context::SubscribeError::TooManySubscriptions
+                    | context::SubscribeError::TooManyForConsumer
+            ) {
+                SUBSCRIPTION_LIMIT_REFUSALS.fetch_add(1, Ordering::Relaxed);
+            }
+            let (detail, cause) = match e {
+                context::SubscribeError::TooManySubscriptions => (
+                    "The UCMF holds its maximum number of subscriptions",
+                    "INSUFFICIENT_RESOURCES",
+                ),
+                context::SubscribeError::TooManyForConsumer => (
+                    "This consumer holds its maximum number of subscriptions",
+                    "INSUFFICIENT_RESOURCES",
+                ),
+                context::SubscribeError::IdSpaceExhausted => {
+                    ("No subscription ID is left", "INSUFFICIENT_RESOURCES")
                 }
-                context::SubscribeError::TooManyForConsumer => {
-                    "This consumer holds its maximum number of subscriptions"
-                }
-                context::SubscribeError::IdSpaceExhausted => "No subscription ID is left",
+                context::SubscribeError::StateNotPersisted => (
+                    "The UCMF state could not be written, so no subscription ID can be \
+                     assigned safely",
+                    "SYSTEM_FAILURE",
+                ),
             };
-            return send_error(
-                500,
-                "Internal Server Error",
-                detail,
-                Some("INSUFFICIENT_RESOURCES"),
-            );
+            return send_error(500, "Internal Server Error", detail, Some(cause));
         }
     };
     let mut body = json!({ "dicEntryId": u.highest_entry_id() });
@@ -2010,7 +2052,12 @@ mod tests {
         assert!(text.contains("# TYPE ucmf_state_lock_poison_recoveries_total counter\n"));
         assert!(text.contains("\nucmf_dictionary_entries 1\n"), "{text}");
         assert!(text.contains("\nucmf_subscriptions 0\n"));
-        assert_eq!(metrics_addr(None), SocketAddr::from(([127, 0, 0, 1], 9090)));
+        assert_eq!(metrics_addr(None), SocketAddr::from(([127, 0, 0, 1], 9096)));
+        assert_eq!(
+            metrics_addr(Some("not-an-address")),
+            SocketAddr::from(([127, 0, 0, 1], 9096)),
+            "a bad value falls back to loopback"
+        );
         assert_eq!(
             metrics_addr(Some("10.0.0.5:9100")),
             "10.0.0.5:9100".parse::<SocketAddr>().unwrap()
