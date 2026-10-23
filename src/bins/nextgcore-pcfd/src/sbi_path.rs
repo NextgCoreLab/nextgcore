@@ -926,14 +926,31 @@ fn notify_unrestorable_associations(
 /// #655. The live `app::handle_sm_policy_delete` calls it for every app
 /// session bound to the deleted SM policy (#767).
 pub fn pcf_sbi_send_policyauthorization_terminate_notify(app_id: u64) -> bool {
-    let info = crate::context::pcf_self().read().ok().and_then(|ctx| {
-        ctx.app_find_by_id(app_id)
-            .and_then(|app| app.notif_uri.clone().map(|uri| (uri, app.app_session_id)))
-    });
-    let Some((uri, app_session_id)) = info else {
-        log::warn!("[app_id={app_id}] AF terminate notify: no notification URI stored");
+    let app = crate::context::pcf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| ctx.app_find_by_id(app_id));
+    match app {
+        Some(app) => pcf_sbi_send_policyauthorization_terminate_notify_for(&app),
+        None => {
+            log::warn!("[app_id={app_id}] AF terminate notify: no such app session");
+            false
+        }
+    }
+}
+
+/// [`pcf_sbi_send_policyauthorization_terminate_notify`] for an app session the
+/// caller already holds, typically one just removed from the context, so the
+/// notification needs no lookup and cannot race the removal (#767 review).
+pub fn pcf_sbi_send_policyauthorization_terminate_notify_for(app: &crate::context::PcfApp) -> bool {
+    let Some(uri) = app.notif_uri.clone() else {
+        log::warn!(
+            "[app_id={}] AF terminate notify: no notification URI stored",
+            app.id
+        );
         return false;
     };
+    let app_session_id = &app.app_session_id;
     let body = serde_json::json!({
         "resUri": format!("/npcf-policyauthorization/v1/app-sessions/{app_session_id}"),
         "termCause": "PDU_SESSION_TERMINATION",
