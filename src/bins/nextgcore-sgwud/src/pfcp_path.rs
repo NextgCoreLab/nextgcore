@@ -367,6 +367,11 @@ pub fn sxa_node() -> Option<Arc<SxaNode>> {
     SXA_NODE.read().ok()?.clone()
 }
 
+/// PFCP messages refused because they did not come from an associated SGW-C, or a
+/// response from a host our request did not go to. Rendered as
+/// `sgwu_pfcp_unauthorized_messages_total`.
+pub static PFCP_UNAUTHORIZED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The SGW-U's PFCP endpoint on Sxa: one UDP socket, transactions matched on
 /// sequence number, peers tracked for heartbeat-driven failure detection.
 pub struct SxaNode {
@@ -377,7 +382,9 @@ pub struct SxaNode {
     /// every Association Setup Response and Heartbeat (TS 29.244 §8.2.65).
     pub recovery_time_stamp: u32,
     seq: AtomicU32,
-    pending: Mutex<HashMap<u32, oneshot::Sender<(u8, Vec<u8>)>>>,
+    /// Outstanding requests by sequence number, with the address each was sent to:
+    /// only a response FROM that address completes it (security, see `on_datagram`).
+    pending: Mutex<HashMap<u32, (SocketAddr, oneshot::Sender<(u8, Vec<u8>)>)>>,
     peers: RwLock<HashMap<SocketAddr, SxaPeer>>,
     /// Associated-peer count, readable without awaiting.
     ///
@@ -540,7 +547,7 @@ impl SxaNode {
         loop {
             attempt += 1;
             let (tx, rx) = oneshot::channel();
-            self.pending.lock().await.insert(seq, tx);
+            self.pending.lock().await.insert(seq, (to, tx));
 
             if let Err(e) = self.send(msg_type, seid, seq, body, to).await {
                 self.pending.lock().await.remove(&seq);
@@ -703,14 +710,56 @@ impl SxaNode {
 
         // Responses complete the transaction that is waiting for them.
         if is_response_type(msg_type) {
-            if let Some(tx) = self.pending.lock().await.remove(&header.sequence_number) {
-                let _ = tx.send((msg_type, body));
+            let mut pending = self.pending.lock().await;
+            let ours = pending
+                .get(&header.sequence_number)
+                .is_some_and(|(to, _)| *to == from);
+            if ours {
+                if let Some((_, tx)) = pending.remove(&header.sequence_number) {
+                    let _ = tx.send((msg_type, body));
+                }
+            } else if pending.contains_key(&header.sequence_number) {
+                // SECURITY: a response from a host our request did not go to cannot
+                // complete it (it would acknowledge a report the SGW-C never saw, or
+                // keep a dead peer's heartbeat looking answered).
+                PFCP_UNAUTHORIZED.fetch_add(1, Ordering::Relaxed);
+                log::warn!(
+                    "PFCP response type={msg_type} seq={} from {from}, which is not where \
+                     the request went: dropped",
+                    header.sequence_number
+                );
             } else {
                 log::debug!(
                     "PFCP response type={msg_type} seq={} with no pending transaction",
                     header.sequence_number
                 );
             }
+            return;
+        }
+
+        // SECURITY: only an ASSOCIATED SGW-C may send anything but Heartbeat Request and
+        // Association Setup Request (TS 29.244 §5.8.3, cause 72). Before, a Session
+        // Modification or Deletion from any source was executed on a guessed SEID, and
+        // an Establishment from an unassociated host created a session no restart
+        // would ever flush.
+        if !matches!(
+            msg_type,
+            pfcp_msg_type::HEARTBEAT_REQUEST | pfcp_msg_type::ASSOCIATION_SETUP_REQUEST
+        ) && !self.peers.read().await.contains_key(&from)
+        {
+            PFCP_UNAUTHORIZED.fetch_add(1, Ordering::Relaxed);
+            log::warn!(
+                "PFCP request type={msg_type} from {from}, which is not an associated SGW-C: \
+                 rejected (cause 72), not executed"
+            );
+            let seid = header.seid.map(|_| 0);
+            let mut rej = Vec::new();
+            rej.extend_from_slice(&19u16.to_be_bytes());
+            rej.extend_from_slice(&1u16.to_be_bytes());
+            rej.push(sxa_build::pfcp_cause::NO_ESTABLISHED_PFCP_ASSOCIATION);
+            let _ = self
+                .send(msg_type + 1, seid, header.sequence_number, &rej, from)
+                .await;
             return;
         }
 
@@ -1016,7 +1065,7 @@ impl SxaNode {
                     .encode_body(&mut buf);
                 let seq = self.alloc_seq();
                 let (tx, rx) = oneshot::channel();
-                self.pending.lock().await.insert(seq, tx);
+                self.pending.lock().await.insert(seq, (peer, tx));
                 if let Err(e) = self
                     .send(pfcp_msg_type::HEARTBEAT_REQUEST, None, seq, &buf, peer)
                     .await
@@ -2093,6 +2142,120 @@ mod tests {
         );
     }
 
+    /// Associate `peer` with `node` (session messages need an association, §5.8.3).
+    async fn associate_from(node: &SxaNode, peer: &UdpSocket) {
+        let mut assoc = BytesMut::new();
+        PfcpLibMessage::AssociationSetupRequest(AssociationSetupRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 9]),
+            1000,
+        ))
+        .encode_body(&mut assoc);
+        deliver(
+            node,
+            peer,
+            &wire(pfcp_msg_type::ASSOCIATION_SETUP_REQUEST, None, 1, &assoc),
+        )
+        .await;
+        let _ = recv_decoded(peer).await;
+    }
+
+    /// SECURITY: a response completes our request only if it comes from the host the
+    /// request went to; one from anywhere else is dropped and counted.
+    #[tokio::test]
+    async fn a_response_from_the_wrong_host_does_not_complete_a_request() {
+        let (_guard, node, peer) = node_and_peer().await;
+        let (tx, mut rx) = oneshot::channel();
+        node.pending
+            .lock()
+            .await
+            .insert(99, (peer.local_addr().unwrap(), tx));
+        let mut body = BytesMut::new();
+        PfcpLibMessage::HeartbeatResponse(HeartbeatResponse::new(1)).encode_body(&mut body);
+        let resp = wire(pfcp_msg_type::HEARTBEAT_RESPONSE, None, 99, &body);
+
+        let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        deliver(&node, &attacker, &resp).await;
+        assert!(rx.try_recv().is_err(), "not completed by the wrong host");
+        assert!(node.pending.lock().await.contains_key(&99));
+
+        deliver(&node, &peer, &resp).await;
+        assert!(rx.try_recv().is_ok(), "completed by the right one");
+    }
+
+    /// SECURITY: an SGW-C that is not associated cannot drive sessions. A Session
+    /// Deletion and a Session Modification for a LIVE session, sent from a host that is
+    /// not associated, are rejected with cause 72 (§5.8.3) and not executed; a
+    /// Session Establishment from it creates nothing. Before, all three were executed.
+    #[tokio::test]
+    async fn session_messages_from_an_unassociated_host_are_refused() {
+        let (_guard, node, peer) = node_and_peer().await;
+        associate_from(&node, &peer).await;
+        let ctx = sgwu_self();
+        let sess = ctx
+            .sess_add(&FSeid::with_ipv4(0x5EC1, Ipv4Addr::new(127, 0, 0, 9)))
+            .expect("add");
+        let before = PFCP_UNAUTHORIZED.load(Ordering::Relaxed);
+
+        let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for (seq, msg) in [
+            (70, pfcp_msg_type::SESSION_DELETION_REQUEST),
+            (71, pfcp_msg_type::SESSION_MODIFICATION_REQUEST),
+        ] {
+            let body = if msg == pfcp_msg_type::SESSION_MODIFICATION_REQUEST {
+                let mut b = BytesMut::new();
+                LibSessionModificationRequest::new().encode(&mut b);
+                b.to_vec()
+            } else {
+                Vec::new()
+            };
+            deliver(
+                &node,
+                &attacker,
+                &wire(msg, Some(sess.sgwu_sxa_seid), seq, &body),
+            )
+            .await;
+            let (_, resp) = recv_decoded(&attacker).await;
+            assert_eq!(
+                find_cause(&resp),
+                Some(sxa_build::pfcp_cause::NO_ESTABLISHED_PFCP_ASSOCIATION)
+            );
+        }
+        assert!(
+            ctx.sess_find_by_id(sess.id).is_some(),
+            "the session survives"
+        );
+
+        let n = ctx.sess_count();
+        let req = LibSessionEstablishmentRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 66]),
+            LibFSeid::new_ipv4(0xBAD, [127, 0, 0, 66]),
+        );
+        let mut body = BytesMut::new();
+        req.encode(&mut body);
+        deliver(
+            &node,
+            &attacker,
+            &wire(
+                pfcp_msg_type::SESSION_ESTABLISHMENT_REQUEST,
+                Some(0),
+                72,
+                &body,
+            ),
+        )
+        .await;
+        let (_, resp) = recv_decoded(&attacker).await;
+        assert_eq!(
+            find_cause(&resp),
+            Some(sxa_build::pfcp_cause::NO_ESTABLISHED_PFCP_ASSOCIATION)
+        );
+        assert_eq!(ctx.sess_count(), n, "no session created");
+        assert!(
+            PFCP_UNAUTHORIZED.load(Ordering::Relaxed) >= before + 3,
+            "counted"
+        );
+        ctx.sess_remove(sess.id);
+    }
+
     async fn node_and_peer() -> (SxaTestGuard, Arc<SxaNode>, UdpSocket) {
         let guard = sxa_test_guard().await;
         sgwu_context_init(1024);
@@ -2811,6 +2974,7 @@ mod tests {
     #[tokio::test]
     async fn a_session_deletion_is_answered_and_an_unknown_seid_is_refused() {
         let (_guard, node, peer) = node_and_peer().await;
+        associate_from(&node, &peer).await;
         let ctx = sgwu_self();
         let sess = ctx
             .sess_add(&FSeid::with_ipv4(0xDD01, Ipv4Addr::new(127, 0, 0, 9)))

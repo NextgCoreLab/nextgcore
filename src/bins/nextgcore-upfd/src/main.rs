@@ -195,6 +195,7 @@ fn render_metrics() -> String {
         Some(src) => src.data_plane.stats.render_prometheus(),
         None => data_plane::DataPlaneStats::default().render_prometheus(),
     };
+    let unauthorized = pfcp_path::PFCP_UNAUTHORIZED.load(Ordering::Relaxed);
     let mut body = format!(
         "# HELP upf_pfcp_associations Associated CP peers on N4/Sxb (0 or 1: TS 29.244 6.2.6 scopes an association to one CP/UP function pair)\n\
          # TYPE upf_pfcp_associations gauge\n\
@@ -202,6 +203,9 @@ fn render_metrics() -> String {
          # HELP upf_pfcp_sessions Number of PFCP sessions held on N4/Sxb\n\
          # TYPE upf_pfcp_sessions gauge\n\
          upf_pfcp_sessions {sessions}\n\
+         # HELP upf_pfcp_unauthorized_messages_total PFCP messages refused for not coming from the associated CP function\n\
+         # TYPE upf_pfcp_unauthorized_messages_total counter\n\
+         upf_pfcp_unauthorized_messages_total {unauthorized}\n\
          # HELP upf_up 1 when the UPF runtime is serving\n\
          # TYPE upf_up gauge\n\
          upf_up 1\n"

@@ -500,6 +500,11 @@ pub struct PendingReport {
     pub usage: Vec<crate::data_plane::UrrReportEntry>,
 }
 
+/// PFCP messages refused because they did not come from the associated CP function
+/// (rejected requests and dropped responses). Rendered as
+/// `upf_pfcp_unauthorized_messages_total`.
+pub static PFCP_UNAUTHORIZED: AtomicU64 = AtomicU64::new(0);
+
 /// Async PFCP server for handling SMF requests
 pub struct PfcpServer {
     socket: Arc<UdpSocket>,
@@ -951,6 +956,60 @@ impl PfcpServer {
             header.sequence_number,
             header.seid
         );
+
+        // SECURITY: only the ASSOCIATED CP function may drive sessions, release the
+        // association or answer our requests. Only Heartbeat Request and Association
+        // Setup Request may come from anyone (TS 29.244 §8.2.1 cause 72). Before, a
+        // Session Modification or Deletion from ANY source was executed on a guessed
+        // SEID -- redirecting or tearing down a UE's user plane -- and a stray response
+        // could acknowledge our reports or keep a dead peer looking alive.
+        let from_peer =
+            self.association.read().await.as_ref().map(|a| a.peer_addr) == Some(src_addr);
+        // A report response is accepted from exactly the address its request went to.
+        let answers_our_report = header.msg_type == pfcp_type::SESSION_REPORT_RESPONSE
+            && self
+                .pending_reports
+                .lock()
+                .await
+                .get(&header.sequence_number)
+                .is_some_and(|p| p.dest == src_addr);
+        if !from_peer && !answers_our_report {
+            match header.msg_type {
+                pfcp_type::HEARTBEAT_REQUEST | pfcp_type::ASSOCIATION_SETUP_REQUEST => {}
+                2 | 4 | 6 | 8 | 10 | 11 | 13 | 15 | 51 | 53 | 55 | 57 => {
+                    // A response (Table 7.3-1): not ours to accept. Dropped and counted.
+                    let t = header.msg_type;
+                    PFCP_UNAUTHORIZED.fetch_add(1, Ordering::Relaxed);
+                    log::warn!(
+                        "PFCP response type={t} seq={} from {src_addr}, which is not the \
+                         associated CP function: dropped",
+                        header.sequence_number
+                    );
+                    return Ok(());
+                }
+                t => {
+                    // A request: rejected with "No established PFCP Association" (§5.8.3,
+                    // cause 72), never executed, and counted.
+                    PFCP_UNAUTHORIZED.fetch_add(1, Ordering::Relaxed);
+                    log::warn!(
+                        "PFCP request type={t} from {src_addr}, which is not the associated \
+                         CP function: rejected (cause 72), not executed"
+                    );
+                    let resp_payload =
+                        build_failure_response(PfcpCause::NoEstablishedPfcpAssociation, None);
+                    let session_level = t >= pfcp_type::SESSION_ESTABLISHMENT_REQUEST;
+                    let response = self.build_response(
+                        t + 1,
+                        0,
+                        header.sequence_number,
+                        &resp_payload,
+                        session_level,
+                    );
+                    let _ = self.socket.send_to(&response, src_addr).await;
+                    return Ok(());
+                }
+            }
+        }
 
         match header.msg_type {
             pfcp_type::HEARTBEAT_REQUEST => {
@@ -4393,9 +4452,14 @@ mod tests {
         rel.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
         let resp = exchange(&smf_b, addr, &encode_pfcp(9, None, 2, &rel.build())).await;
 
-        // B is still answered per TS 29.244 7.4.4.2 ...
+        // B is answered with "No established PFCP Association" (TS 29.244 §8.2.1
+        // cause 72: any message but Association Setup / Heartbeat from a peer with no
+        // association) ...
         assert_eq!(resp[1], pfcp_type::ASSOCIATION_RELEASE_RESPONSE);
-        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::NoEstablishedPfcpAssociation as u8
+        );
         // ... but A's association and sessions survive.
         assert!(
             server.is_associated().await,
@@ -4536,6 +4600,128 @@ mod tests {
             .keys()
             .find(|k| !before.contains(k))
             .expect("the accepted establishment must be held")
+    }
+
+    /// SECURITY: only the associated CP function may modify, delete or establish
+    /// sessions, or release the association. A host that is NOT the associated SMF --
+    /// here one that guesses a live SEID -- gets "No established PFCP Association"
+    /// (cause 72, §5.8.3) and NOTHING is executed; the attempt is counted. Before, a
+    /// Session Modification from any source re-pointed a UE's downlink tunnel and a
+    /// Deletion tore the session down.
+    #[tokio::test]
+    async fn session_messages_from_a_host_that_is_not_the_associated_smf_are_refused() {
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        let assoc = build_association_setup_request_payload(Some(100));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        let upf_seid = establish(&server, &smf, addr, 0x5ec).await;
+        let dl_before = server.sessions.read().await[&upf_seid].dl_teid;
+        let before = PFCP_UNAUTHORIZED.load(Ordering::Relaxed);
+
+        let attacker = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // Modification re-pointing the downlink tunnel.
+        let mut far = crate::n4_build::PfcpMessageBuilder::new();
+        far.add_u32(pfcp_ie::FAR_ID, 1);
+        far.add_u8(pfcp_ie::APPLY_ACTION, 0x02);
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_tlv(pfcp_ie::UPDATE_FAR, &far.build());
+        let resp = exchange(
+            &attacker,
+            addr,
+            &encode_pfcp(52, Some(upf_seid), 60, &b.build()),
+        )
+        .await;
+        assert_eq!(resp[1], pfcp_type::SESSION_MODIFICATION_RESPONSE);
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::NoEstablishedPfcpAssociation as u8
+        );
+        assert_eq!(server.sessions.read().await[&upf_seid].dl_teid, dl_before);
+
+        // Deletion: the session survives.
+        let resp = exchange(&attacker, addr, &encode_pfcp(54, Some(upf_seid), 61, &[])).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::NoEstablishedPfcpAssociation as u8
+        );
+        assert!(
+            server.sessions.read().await.contains_key(&upf_seid),
+            "not deleted"
+        );
+
+        // Establishment: no session is created for it.
+        let n = server.sessions.read().await.len();
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(SMF_NODE));
+        b.add_f_seid(&crate::n4_build::FSeid {
+            seid: 0xbad,
+            ipv4: Some(SMF_NODE),
+            ipv6: None,
+        });
+        b.add_tlv(pfcp_ie::CREATE_PDR, &pdr_body(1, 100, 1, 1, 1));
+        b.add_tlv(pfcp_ie::CREATE_FAR, &far_body(1, 0x02));
+        let resp = exchange(&attacker, addr, &encode_pfcp(50, Some(0), 62, &b.build())).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::NoEstablishedPfcpAssociation as u8
+        );
+        assert_eq!(server.sessions.read().await.len(), n, "no session created");
+
+        assert!(
+            server.is_associated().await,
+            "the real association is untouched"
+        );
+        assert!(
+            PFCP_UNAUTHORIZED.load(Ordering::Relaxed) >= before + 3,
+            "counted"
+        );
+
+        // The associated SMF itself is still served.
+        let resp = exchange(&smf, addr, &encode_pfcp(54, Some(upf_seid), 63, &[])).await;
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+    }
+
+    /// SECURITY: a response from a host that is not where our request went is dropped:
+    /// it can neither acknowledge our Session Report (so it keeps retransmitting) nor
+    /// keep a dead peer looking alive with a Heartbeat Response.
+    #[tokio::test]
+    async fn responses_from_the_wrong_host_are_dropped() {
+        let (server, smf, upf_seid, smf_seid) = server_with_session().await;
+        server
+            .send_downlink_data_report(upf_seid, smf_seid, 2, Some(9))
+            .await
+            .unwrap();
+        let (hdr, _) = {
+            let mut buf = vec![0u8; 2048];
+            let (len, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let (h, _) = ParsedPfcpHeader::parse(&buf[..len]).unwrap();
+            (h.sequence_number, ())
+        };
+        let mut ok = crate::n4_build::PfcpMessageBuilder::new();
+        ok.add_u8(pfcp_ie::CAUSE, PfcpCause::RequestAccepted as u8);
+        let resp = encode_pfcp(
+            pfcp_type::SESSION_REPORT_RESPONSE,
+            Some(smf_seid),
+            hdr,
+            &ok.build(),
+        );
+        let attacker: SocketAddr = "127.0.0.66:8805".parse().unwrap();
+        server.handle_message(&resp, attacker).await.unwrap();
+        assert_eq!(
+            server.pending_report_count().await,
+            1,
+            "still waiting for the SMF"
+        );
+
+        // The real SMF's answer does clear it.
+        server
+            .handle_message(&resp, smf.local_addr().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(server.pending_report_count().await, 0);
     }
 
     /// The UPF's sessions as (UPF SEID, CP SEID, address it reports to).
