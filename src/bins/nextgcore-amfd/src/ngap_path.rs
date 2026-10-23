@@ -193,6 +193,9 @@ pub const MAX_GNB_CONNECTIONS: usize = 64;
 /// SCTP receive timeout
 const SCTP_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// How often the NGAP task sweeps orphaned per-session state (#756).
+const SESSION_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
+
 /// KgNB access type distinguisher for 3GPP access (TS 33.501 Annex A.9).
 /// Non-3GPP access uses 0x02; both match the stored `AmfUe::access_type`.
 const ACCESS_TYPE_3GPP: u8 = 0x01;
@@ -481,25 +484,38 @@ fn service_request_s_tmsi(plain: &[u8]) -> Option<(u16, u8, u32)> {
 
 /// Record PDU session `psi` of `amf_ue_ngap_id` in the AMF context's session
 /// store -- where the Namf N1N2MessageTransfer handler and the Service Request's
-/// re-activation find it (#540) -- unless it is already there.
+/// re-activation find it (#540) -- unless it is already there. Returns whether the
+/// session is recorded: `false` when the table is full (#756).
 fn record_amf_session(
     amf_ue_ngap_id: u64,
     psi: u8,
     sm_context_ref: &str,
     sst: u8,
     sd: Option<u32>,
-) {
+) -> bool {
     let ctx = crate::context::amf_self();
     let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
     let sess = match guard.sess_find_by_psi(amf_ue_ngap_id, psi) {
         Some(sess) => Some(sess),
         None => guard.sess_add(amf_ue_ngap_id, psi),
     };
-    if let Some(mut sess) = sess {
-        sess.sm_context_ref = Some(sm_context_ref.to_string());
-        sess.s_nssai.sst = sst;
-        sess.s_nssai.sd = sd;
-        guard.sess_update(&sess);
+    match sess {
+        Some(mut sess) => {
+            sess.sm_context_ref = Some(sm_context_ref.to_string());
+            sess.s_nssai.sst = sst;
+            sess.s_nssai.sd = sd;
+            guard.sess_update(&sess);
+            true
+        }
+        // #756: not silent. Without this record, paging, N1N2 and Service Request
+        // re-activation cannot find the session; the caller refuses it.
+        None => {
+            log::error!(
+                "UE {amf_ue_ngap_id}: PDU session {psi} (SM context {sm_context_ref}) NOT \
+                 recorded: the AMF session table is full"
+            );
+            false
+        }
     }
 }
 
@@ -753,6 +769,10 @@ pub struct NgapServer {
     /// so a test can drive a handler's send-failure branch (#760).
     #[cfg(test)]
     fail_next_sends: usize,
+    /// Test seam: the next PDU session record fails as a full session table
+    /// would (#756 review m1), without filling the process-global table.
+    #[cfg(test)]
+    fail_next_session_record: bool,
     /// Event sender for NGAP events
     event_tx: mpsc::Sender<AmfEvent>,
     /// Server event receiver
@@ -833,6 +853,8 @@ pub struct NgapServer {
     /// Whether an NGAP Overload Start has been broadcast and not yet stopped, so the
     /// signal is sent on transitions only (TS 38.413 §8.7.6/§8.7.7).
     ngap_overload_declared: bool,
+    /// When `sweep_orphaned_session_state` last ran (#756).
+    last_session_sweep: std::time::Instant,
 }
 
 impl NgapServer {
@@ -899,6 +921,8 @@ impl NgapServer {
             sent_ngap: None,
             #[cfg(test)]
             fail_next_sends: 0,
+            #[cfg(test)]
+            fail_next_session_record: false,
             event_tx,
             server_event_rx,
             ue_auth_state,
@@ -909,6 +933,7 @@ impl NgapServer {
             eps_ho_in_flight: HashMap::new(),
             emergency: crate::emergency::EmergencyHandler::new(),
             ngap_overload_declared: false,
+            last_session_sweep: std::time::Instant::now(),
             timer_configs: {
                 // Reachability timers derive from the CONFIGURED T3512
                 // (`amf.time.t3512.value`), per TS 24.501 §5.3.7, with
@@ -995,6 +1020,17 @@ impl NgapServer {
         // Send the HandoverCommand (or HandoverPreparationFailure) for every 5GS→EPS
         // preparation the target MME answered (#476, TS 23.502 §4.11.1.2.1 step 11).
         self.process_fivegs_to_eps_answers().await;
+
+        // #756: drop per-session state whose end this task never saw (e.g. the SMF's
+        // RELEASED status notification, handled on the SBI task). Every 10 s: a scan,
+        // and nothing depends on it being prompt.
+        if self.last_session_sweep.elapsed() >= SESSION_SWEEP_INTERVAL {
+            self.last_session_sweep = std::time::Instant::now();
+            let dropped = self.sweep_orphaned_session_state();
+            if dropped > 0 {
+                log::info!("Dropped {dropped} orphaned per-session entries (#756)");
+            }
+        }
 
         // Process any pending server events
         while let Ok(event) = self.server_event_rx.try_recv() {
@@ -7127,7 +7163,59 @@ impl NgapServer {
                         // in. Before this only `sm_context_refs` was written, so every
                         // N1N2 transfer from the SMF -- the paging request included --
                         // answered 404 and an idle UE could never be reached.
-                        record_amf_session(amf_ue_ngap_id, psi, &resp.sm_context_ref, sst, sd);
+                        #[cfg(test)]
+                        let forced_full = std::mem::take(&mut self.fail_next_session_record);
+                        #[cfg(not(test))]
+                        let forced_full = false;
+                        let recorded = !forced_full
+                            && record_amf_session(
+                                amf_ue_ngap_id,
+                                psi,
+                                &resp.sm_context_ref,
+                                sst,
+                                sd,
+                            );
+                        if !recorded {
+                            // #756 review m1: a session the AMF cannot record is one it
+                            // could never page, modify, re-activate or release, and its
+                            // refs would be swept within 10 s, leaking it at the SMF and
+                            // UPF. So it is not established: released at the SMF, and the
+                            // 5GSM message sent back to the UE as not forwarded (TS
+                            // 24.501 §5.4.5.2.5 a), §5.4.5.3.1 case e): 5GMM #90). The
+                            // SMF's Accept is not relayed.
+                            let (smf_host, smf_port) = self.smf_target_for(amf_ue_ngap_id, psi);
+                            if let Err(e) = crate::sbi_path::call_smf_release_sm_context(
+                                &smf_host,
+                                smf_port,
+                                &resp.sm_context_ref,
+                            )
+                            .await
+                            {
+                                log::warn!(
+                                    "UE {amf_ue_ngap_id}: SMF release of the unrecorded PDU \
+                                     session {psi} failed: {e}"
+                                );
+                            }
+                            self.forget_session(amf_ue_ngap_id, psi);
+                            let plain = gmm_build::build_dl_nas_transport(
+                                Some(psi),
+                                crate::gmm_handler::payload_container_type::N1_SM_INFORMATION,
+                                sm_pdu,
+                                Some(GmmCause::PayloadWasNotForwarded),
+                                None,
+                            )
+                            .unwrap_or_default();
+                            if let Some(protected) = self.protect_nas(amf_ue_ngap_id, &plain) {
+                                self.send_nas_pdu(
+                                    association_id,
+                                    amf_ue_ngap_id,
+                                    ran_ue_ngap_id,
+                                    &protected,
+                                )
+                                .await?;
+                            }
+                            return Ok(());
+                        }
 
                         // #356: record the emergency PDU session against the UE's
                         // emergency context. Before this `assign_emergency_pdu_session`
@@ -7344,6 +7432,10 @@ impl NgapServer {
                     Ok(()) => log::info!("SMF SM Context Released: PSI={psi}"),
                     Err(e) => log::warn!("SMF release failed: {e}"),
                 }
+                // #756: the session is over at the AMF too. Forgotten even when the
+                // SMF call failed: the UE is told the session is released below, so
+                // nothing will address it again, and keeping the ref would leak it.
+                self.forget_session(amf_ue_ngap_id, psi);
 
                 // PDU Session Release Command (cause #36 regular deactivation)
                 let release_cmd = vec![0x2E, psi, pti, 0xD3, 0x24];
@@ -8890,6 +8982,11 @@ impl NgapServer {
     /// `handle_handover_notify` documents why it must not use `release_ue` either.
     fn forget_ue(&mut self, amf_ue_ngap_id: u64) {
         self.ue_auth_state.remove(amf_ue_ngap_id);
+        // #756: the UE's per-session state goes with it. AMF UE NGAP IDs are never
+        // reused, so an entry left here is never overwritten. Before this, every
+        // session the AMF ever served stayed in these maps (and in the context's
+        // `sess_list`, capped at `max_num_of_sess`) for the life of the process.
+        self.forget_ue_sessions(amf_ue_ngap_id);
         // Logged at info, and only when there WAS one: the overwhelming majority of
         // releases are for ordinary UEs, and a line per release saying "no emergency
         // context" would bury the ones that matter. `active_count` is included because
@@ -8902,6 +8999,65 @@ impl NgapServer {
                 self.emergency.active_count()
             );
         }
+    }
+
+    /// Drop everything this AMF holds about `amf_ue_ngap_id`'s PDU sessions (#756):
+    /// the SM context refs and owning SMFs, any handover-in-flight per-session
+    /// state, and the UE's entries in the context's `sess_list`. Callers release
+    /// the sessions at the SMF first, where that is the procedure's job.
+    fn forget_ue_sessions(&mut self, amf_ue_ngap_id: u64) {
+        self.sm_context_refs
+            .retain(|(ue, _), _| *ue != amf_ue_ngap_id);
+        self.sm_context_smfs
+            .retain(|(ue, _), _| *ue != amf_ue_ngap_id);
+        self.handover_target_transfers
+            .retain(|(ue, _), _| *ue != amf_ue_ngap_id);
+        self.handover_target_assoc.remove(&amf_ue_ngap_id);
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        for sess in guard.sess_list_for_ue(amf_ue_ngap_id) {
+            guard.sess_remove(sess.id);
+        }
+    }
+
+    /// Drop one PDU session's state (#756): released at the SMF, so nothing will
+    /// address it again.
+    fn forget_session(&mut self, amf_ue_ngap_id: u64, psi: u8) {
+        self.sm_context_refs.remove(&(amf_ue_ngap_id, psi));
+        self.sm_context_smfs.remove(&(amf_ue_ngap_id, psi));
+        self.handover_target_transfers
+            .remove(&(amf_ue_ngap_id, psi));
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(sess) = guard.sess_find_by_psi(amf_ue_ngap_id, psi) {
+            guard.sess_remove(sess.id);
+        }
+    }
+
+    /// Backstop sweep for per-session state whose end this task never sees (#756).
+    /// For example, the SMF's SmContextStatusNotification RELEASED, which the SBI
+    /// task handles by removing the `sess_list` entry. Drops any `sm_context_refs`
+    /// / `sm_context_smfs` entry whose UE is gone or whose session the context no
+    /// longer holds. Every write of those maps happens on this task, together with
+    /// its `sess_list` write, so the sweep cannot interleave with one.
+    fn sweep_orphaned_session_state(&mut self) -> usize {
+        let held: std::collections::HashSet<(u64, u8)> = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            guard
+                .sess_list_snapshot()
+                .into_iter()
+                .map(|s| (s.amf_ue_id, s.psi))
+                .collect()
+        };
+        let live = |key: &(u64, u8), store: &crate::ue_store::UeStore<UeNasContext>| {
+            held.contains(key) && store.contains(key.0)
+        };
+        let before = self.sm_context_refs.len() + self.sm_context_smfs.len();
+        let store = std::sync::Arc::clone(&self.ue_auth_state);
+        self.sm_context_refs.retain(|k, _| live(k, &store));
+        self.sm_context_smfs.retain(|k, _| live(k, &store));
+        before - (self.sm_context_refs.len() + self.sm_context_smfs.len())
     }
 
     /// Deliver a NAS PDU on a path whose OUTCOME does not depend on it arriving.
