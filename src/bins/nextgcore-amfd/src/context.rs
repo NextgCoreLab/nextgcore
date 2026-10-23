@@ -2023,7 +2023,6 @@ impl AmfContext {
         moved
     }
 
-    /// Get sessions for an AMF UE
     /// Every session in the table (#756's orphan sweep).
     pub fn sess_list_snapshot(&self) -> Vec<AmfSess> {
         match self.sess_list.read() {
@@ -2032,6 +2031,7 @@ impl AmfContext {
         }
     }
 
+    /// Get sessions for an AMF UE
     pub fn sess_list_for_ue(&self, amf_ue_id: u64) -> Vec<AmfSess> {
         let sess_list = self.sess_list.read().unwrap();
         sess_list

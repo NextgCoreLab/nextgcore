@@ -108,7 +108,8 @@ pub(super) type SmfCall = (String, serde_json::Value);
 
 /// A stand-in SMF: records every request, and answers an `upCnxState: ACTIVATING`
 /// update for any ref except `fail-*` with 200 and `n2SmInfo` = `transfer_for(ref)`.
-/// A `fail-*` ref gets 500. Everything else gets 204. Keep the server alive.
+/// A `fail-*` ref gets 500. A CreateSMContext gets 201 with SM context `est-<psi>`.
+/// Everything else gets 204. Keep the server alive.
 pub(super) async fn activating_smf() -> (
     nextgcore_sbi::server::SbiServer,
     u16,
@@ -142,6 +143,20 @@ pub(super) async fn activating_smf() -> (
                     .and_then(|rest| rest.split('/').next())
                     .unwrap_or_default()
                     .to_string();
+                // #756: a CreateSMContext (POST .../sm-contexts) is answered 201 with
+                // SM context `est-<psi>`, a recognisable N1 and an N2 transfer.
+                if uri.ends_with("/nsmf-pdusession/v1/sm-contexts") {
+                    let psi = body["pduSessionId"].as_u64().unwrap_or_default();
+                    let created = serde_json::json!({
+                        "smContextRef": format!("est-{psi}"),
+                        "n1SmMsg": base64::engine::general_purpose::STANDARD
+                            .encode([0x2E, psi as u8, 0x01, 0xC2]),
+                        "n2SmInfo": base64::engine::general_purpose::STANDARD
+                            .encode(transfer_for(&format!("est-{psi}"))),
+                    });
+                    return SResp::with_status(201)
+                        .with_body(created.to_string(), "application/json");
+                }
                 if body["upCnxState"] != "ACTIVATING" {
                     return SResp::no_content();
                 }
@@ -791,4 +806,151 @@ async fn the_sweep_drops_orphaned_session_state_and_keeps_live_state() {
     assert!(!server.sm_context_smfs.contains_key(&(gone, 1)));
     // Tidy the global table for the UE whose NAS context the test removed.
     server.forget_ue_sessions(gone);
+}
+
+/// A raw 5GSM PDU SESSION ESTABLISHMENT REQUEST for `psi` (the legacy 0x2E
+/// path): PTI 1, integrity protection maximum data rate full.
+fn establishment_request(psi: u8) -> Vec<u8> {
+    vec![0x2E, psi, 0x01, 0xC1, 0xFF, 0xFF]
+}
+
+/// Establish PSI 5 for a connected `ue` through the Uplink NAS Transport dispatch,
+/// with `fail_record` forcing the session record to fail as a full table would.
+/// Returns the SMF calls and the decoded NGAP.
+// `SmfEnvGuard` is held across the awaits on purpose: the SMF address is a
+// process environment variable, read during the establishment.
+#[allow(clippy::await_holding_lock)]
+async fn establish_psi_5(
+    fail_record: bool,
+    ue: u64,
+    ran: u32,
+) -> (Vec<SmfCall>, Vec<Sent>, (usize, usize, usize)) {
+    let (_smf, port, calls) = activating_smf().await;
+    let _env = super::SmfEnvGuard::set(port);
+    let mut server = capturing_ngap_server().await;
+    secured_registered_ue(&mut server, ue, ran);
+    server.ue_auth_state.with_mut(ue, |s| {
+        s.initial_context_setup_response_received = true;
+    });
+    server.fail_next_session_record = fail_record;
+    server
+        .handle_uplink_nas_transport(
+            ASSOC,
+            &uplink_nas_transport(ue, ran, &establishment_request(5)),
+        )
+        .await
+        .expect("handled");
+    let sent = take_sent_ngap(&mut server)
+        .into_iter()
+        .map(|(_, p)| decode_sent(&p))
+        .collect();
+    let state = session_state_of(&server, ue);
+    server.forget_ue_sessions(ue);
+    server.ue_auth_state.remove(ue);
+    let calls = calls.lock().expect("calls").clone();
+    (calls, sent, state)
+}
+
+/// #756 review m1. A session the AMF cannot record (its session table is full)
+/// is not established. Otherwise the AMF could never page, modify, re-activate
+/// or release it, and the sweep would drop its refs within 10 s, leaking it at
+/// the SMF and UPF. The AMF releases it at the SMF, does not relay the SMF's
+/// Accept, and sends the 5GSM message back to the UE in a DL NAS Transport with
+/// 5GMM #90 "payload was not forwarded" (TS 24.501 §5.4.5.2.5, §5.4.5.3.1 e)).
+/// Nothing is left for the UE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_the_amf_cannot_record_is_released_and_refused() {
+    let (calls, sent, state) = establish_psi_5(true, 7_756_011, 61).await;
+    let uris: Vec<&str> = calls.iter().map(|(u, _)| u.as_str()).collect();
+    assert_eq!(
+        uris.iter()
+            .filter(|u| u.ends_with("/nsmf-pdusession/v1/sm-contexts"))
+            .count(),
+        1,
+        "{uris:?}"
+    );
+    assert!(
+        uris.iter()
+            .any(|u| u.ends_with("/sm-contexts/est-5/release")),
+        "the unrecorded session is released at the SMF: {uris:?}"
+    );
+    let [Sent::DownlinkNas { nas_pdu, .. }] = sent.as_slice() else {
+        panic!("one DL NAS Transport and no setup request: {sent:?}");
+    };
+    use nextgcore_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+    let Ok(FiveGmmMessage::DlNasTransport(dl)) =
+        parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&nas_pdu[7..]))
+    else {
+        panic!("a DL NAS TRANSPORT: {nas_pdu:02x?}");
+    };
+    assert_eq!(dl.gmm_cause, Some(90), "5GMM #90 payload was not forwarded");
+    assert_eq!(
+        dl.payload_container.data.first(),
+        Some(&0x2E),
+        "the UE's own 5GSM message comes back, not the SMF's Accept"
+    );
+    assert_eq!(dl.payload_container.data.get(3), Some(&0xC1));
+    assert_eq!(state, (0, 0, 0), "nothing is left for the UE");
+}
+
+/// The positive control for the test above: with the record succeeding, the
+/// same establishment is recorded in all three stores and nothing is released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recorded_session_is_established() {
+    let (calls, _sent, state) = establish_psi_5(false, 7_756_012, 62).await;
+    assert!(
+        !calls.iter().any(|(u, _)| u.ends_with("/release")),
+        "{calls:?}"
+    );
+    assert_eq!(state, (1, 1, 1));
+}
+
+/// #756 review m4. Implicit deregistration (TS 24.501 §5.3.7) releases every
+/// session at its SMF BEFORE the UE's per-session state is pruned: two
+/// `/release` calls, then nothing left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// The reachability sweep lock is held across the awaits on purpose: the sweep
+// walks the shared store, and no sibling sweep may run in between.
+#[allow(clippy::await_holding_lock)]
+async fn an_implicit_deregistration_releases_at_the_smf_then_prunes() {
+    let _sweep = crate::context::REACHABILITY_SWEEP_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let (_smf, port, calls) = activating_smf().await;
+    let mut server = capturing_ngap_server().await;
+    let (ue, ran) = (7_756_021u64, 63);
+    secured_registered_ue(&mut server, ue, ran);
+    hold_session(&mut server, ue, 1, "implicit-756-1", port);
+    hold_session(&mut server, ue, 2, "implicit-756-2", port);
+    server.ue_auth_state.with_mut(ue, |s| {
+        s.cm_idle = true;
+        s.reachability = Some(Reachability {
+            phase: ReachabilityPhase::ImplicitDeregistration,
+            deadline: Instant::now() - Duration::from_secs(1),
+        });
+    });
+
+    server
+        .process_reachability_timers()
+        .await
+        .expect("implicit deregistration");
+
+    let mut released: Vec<String> = calls
+        .lock()
+        .expect("calls")
+        .iter()
+        .map(|(u, _)| u.clone())
+        .filter(|u| u.ends_with("/release"))
+        .collect();
+    released.sort();
+    assert_eq!(
+        released
+            .iter()
+            .map(|u| u.rsplit("/sm-contexts/").next().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["implicit-756-1/release", "implicit-756-2/release"],
+        "each session is released at the SMF holding it"
+    );
+    assert_eq!(session_state_of(&server, ue), (0, 0, 0));
+    assert!(!server.ue_auth_state.contains(ue));
 }

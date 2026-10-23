@@ -484,14 +484,15 @@ fn service_request_s_tmsi(plain: &[u8]) -> Option<(u16, u8, u32)> {
 
 /// Record PDU session `psi` of `amf_ue_ngap_id` in the AMF context's session
 /// store -- where the Namf N1N2MessageTransfer handler and the Service Request's
-/// re-activation find it (#540) -- unless it is already there.
+/// re-activation find it (#540) -- unless it is already there. Returns whether the
+/// session is recorded: `false` when the table is full (#756).
 fn record_amf_session(
     amf_ue_ngap_id: u64,
     psi: u8,
     sm_context_ref: &str,
     sst: u8,
     sd: Option<u32>,
-) {
+) -> bool {
     let ctx = crate::context::amf_self();
     let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
     let sess = match guard.sess_find_by_psi(amf_ue_ngap_id, psi) {
@@ -504,13 +505,17 @@ fn record_amf_session(
             sess.s_nssai.sst = sst;
             sess.s_nssai.sd = sd;
             guard.sess_update(&sess);
+            true
         }
         // #756: not silent. Without this record, paging, N1N2 and Service Request
-        // re-activation cannot find the session.
-        None => log::error!(
-            "UE {amf_ue_ngap_id}: PDU session {psi} (SM context {sm_context_ref}) NOT recorded: \
-             the AMF session table is full"
-        ),
+        // re-activation cannot find the session; the caller refuses it.
+        None => {
+            log::error!(
+                "UE {amf_ue_ngap_id}: PDU session {psi} (SM context {sm_context_ref}) NOT \
+                 recorded: the AMF session table is full"
+            );
+            false
+        }
     }
 }
 
@@ -764,6 +769,10 @@ pub struct NgapServer {
     /// so a test can drive a handler's send-failure branch (#760).
     #[cfg(test)]
     fail_next_sends: usize,
+    /// Test seam: the next PDU session record fails as a full session table
+    /// would (#756 review m1), without filling the process-global table.
+    #[cfg(test)]
+    fail_next_session_record: bool,
     /// Event sender for NGAP events
     event_tx: mpsc::Sender<AmfEvent>,
     /// Server event receiver
@@ -907,6 +916,8 @@ impl NgapServer {
             sent_ngap: None,
             #[cfg(test)]
             fail_next_sends: 0,
+            #[cfg(test)]
+            fail_next_session_record: false,
             event_tx,
             server_event_rx,
             ue_auth_state,
@@ -7147,7 +7158,59 @@ impl NgapServer {
                         // in. Before this only `sm_context_refs` was written, so every
                         // N1N2 transfer from the SMF -- the paging request included --
                         // answered 404 and an idle UE could never be reached.
-                        record_amf_session(amf_ue_ngap_id, psi, &resp.sm_context_ref, sst, sd);
+                        #[cfg(test)]
+                        let forced_full = std::mem::take(&mut self.fail_next_session_record);
+                        #[cfg(not(test))]
+                        let forced_full = false;
+                        let recorded = !forced_full
+                            && record_amf_session(
+                                amf_ue_ngap_id,
+                                psi,
+                                &resp.sm_context_ref,
+                                sst,
+                                sd,
+                            );
+                        if !recorded {
+                            // #756 review m1: a session the AMF cannot record is one it
+                            // could never page, modify, re-activate or release, and its
+                            // refs would be swept within 10 s, leaking it at the SMF and
+                            // UPF. So it is not established: released at the SMF, and the
+                            // 5GSM message sent back to the UE as not forwarded (TS
+                            // 24.501 §5.4.5.2.5 a), §5.4.5.3.1 case e): 5GMM #90). The
+                            // SMF's Accept is not relayed.
+                            let (smf_host, smf_port) = self.smf_target_for(amf_ue_ngap_id, psi);
+                            if let Err(e) = crate::sbi_path::call_smf_release_sm_context(
+                                &smf_host,
+                                smf_port,
+                                &resp.sm_context_ref,
+                            )
+                            .await
+                            {
+                                log::warn!(
+                                    "UE {amf_ue_ngap_id}: SMF release of the unrecorded PDU \
+                                     session {psi} failed: {e}"
+                                );
+                            }
+                            self.forget_session(amf_ue_ngap_id, psi);
+                            let plain = gmm_build::build_dl_nas_transport(
+                                Some(psi),
+                                crate::gmm_handler::payload_container_type::N1_SM_INFORMATION,
+                                sm_pdu,
+                                Some(GmmCause::PayloadWasNotForwarded),
+                                None,
+                            )
+                            .unwrap_or_default();
+                            if let Some(protected) = self.protect_nas(amf_ue_ngap_id, &plain) {
+                                self.send_nas_pdu(
+                                    association_id,
+                                    amf_ue_ngap_id,
+                                    ran_ue_ngap_id,
+                                    &protected,
+                                )
+                                .await?;
+                            }
+                            return Ok(());
+                        }
 
                         // #356: record the emergency PDU session against the UE's
                         // emergency context. Before this `assign_emergency_pdu_session`
