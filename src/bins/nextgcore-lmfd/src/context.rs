@@ -153,6 +153,10 @@ pub struct CellMeasurement {
     /// `gNB-RxTxTimeDiff`, TS 38.455). `RTT = ue_rx_tx_ns + gnb_rx_tx_ns`
     /// (TS 38.305 §8.10).
     pub gnb_rx_tx_ns: Option<f64>,
+    /// When the Rx–Tx half was measured: the UE's `nr-TimeStamp-r16` (TS 37.355)
+    /// for `ue_rx_tx_ns`, the gNB's `TimeStamp` (TS 38.455) for `gnb_rx_tx_ns`.
+    /// The two halves of one TRP pair only when these are close (#807).
+    pub meas_time: Option<crate::nrppa_positioning::SlotTime>,
     /// The DL-PRS ID (TS 37.355 `dl-PRS-ID-r16`, 0..255) the measurement was made
     /// on, when it is an LPP NR measurement. `nr_cgi` keys by PCI when the UE gave
     /// one; this is the fallback key `prs-<id>` a registry may hold instead (#714).
@@ -292,6 +296,9 @@ pub enum MeasurementLeg {
     Lpp,
     /// The serving gNB's NRPPa E-CID measurement.
     NrppaEcid,
+    /// The gNB Rx–Tx halves of the NRPPa Measurement procedure, from every
+    /// measured gNB, reported together by `multi_rtt` (TS 38.455 §8.5.1).
+    NrppaTrp,
 }
 
 /// What a leg's report did to its session.
@@ -399,6 +406,21 @@ pub struct LmfContext {
     /// LMF-minted `subscriptionId` (#104). The whole service was absent before.
     exposure_subscriptions:
         RwLock<HashMap<String, crate::broadcast_exposure::LmfDataExposureSubscription>>,
+    /// NRPPa exchanges awaiting their answer, keyed by `(procedure code,
+    /// NRPPATransactionID)` (#807). The uplink notify hands a matching
+    /// SUCCESSFUL/UNSUCCESSFUL OUTCOME to the waiter instead of the E-CID path.
+    /// Taken alone, like every map here.
+    nrppa_waiters: RwLock<HashMap<(u8, u16), tokio::sync::oneshot::Sender<Vec<u8>>>>,
+    /// The NG-RAN nodes the Multi-RTT gNB half is measured on
+    /// (`lmf.positioning.ngRanNodes`, #807).
+    ng_ran_nodes: RwLock<Vec<crate::site_config::NgRanNode>>,
+    /// What each of those nodes said about its TRPs (TS 38.455 §8.2.8), per node.
+    trp_info: RwLock<
+        Vec<(
+            crate::site_config::NgRanNode,
+            crate::nrppa_positioning::TrpInfo,
+        )>,
+    >,
 }
 
 impl LmfContext {
@@ -430,6 +452,9 @@ impl LmfContext {
             amf_subscriptions: RwLock::new(HashMap::new()),
             callback_base: RwLock::new(None),
             nf_instance_id: RwLock::new(None),
+            nrppa_waiters: RwLock::new(HashMap::new()),
+            ng_ran_nodes: RwLock::new(Vec::new()),
+            trp_info: RwLock::new(Vec::new()),
         }
     }
 
@@ -1117,6 +1142,105 @@ impl LmfContext {
     }
 
     // -----------------------------------------------------------------------
+    // #807: NRPPa exchanges, NG-RAN nodes and their TRPs
+    // -----------------------------------------------------------------------
+
+    /// Register a waiter for the answer to NRPPa procedure `procedure_code` sent
+    /// with transaction `txn`. Register BEFORE sending. A waiter for the same pair
+    /// replaces the old one, whose receiver then sees the channel closed.
+    pub fn nrppa_wait(
+        &self,
+        procedure_code: u8,
+        txn: u16,
+    ) -> tokio::sync::oneshot::Receiver<Vec<u8>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if let Ok(mut w) = self.nrppa_waiters.write() {
+            w.insert((procedure_code, txn), tx);
+        }
+        rx
+    }
+
+    /// Hand an answer to its waiter. `false` when nobody waits for it.
+    pub fn nrppa_deliver(&self, procedure_code: u8, txn: u16, pdu: Vec<u8>) -> bool {
+        let waiter = self
+            .nrppa_waiters
+            .write()
+            .ok()
+            .and_then(|mut w| w.remove(&(procedure_code, txn)));
+        match waiter {
+            Some(tx) => tx.send(pdu).is_ok(),
+            None => false,
+        }
+    }
+
+    /// Drop a waiter whose exchange was abandoned (timeout, send failure).
+    pub fn nrppa_unwait(&self, procedure_code: u8, txn: u16) {
+        if let Ok(mut w) = self.nrppa_waiters.write() {
+            w.remove(&(procedure_code, txn));
+        }
+    }
+
+    /// Set the NG-RAN nodes the Multi-RTT gNB half is measured on.
+    pub fn set_ng_ran_nodes(&self, nodes: Vec<crate::site_config::NgRanNode>) {
+        if let Ok(mut n) = self.ng_ran_nodes.write() {
+            *n = nodes;
+        }
+    }
+
+    pub fn ng_ran_nodes(&self) -> Vec<crate::site_config::NgRanNode> {
+        self.ng_ran_nodes
+            .read()
+            .map(|n| n.clone())
+            .unwrap_or_default()
+    }
+
+    /// Record a node's TRP Information (TS 38.455 §8.2.8), replacing what the
+    /// node said before. A TRP coordinate the registry does not hold yet is added
+    /// under `pci-<pci>`, so a TRP the operator did not configure can still be
+    /// ranged against. A configured coordinate is never replaced: the operator's
+    /// survey is the reference, and a disagreement is logged.
+    pub fn note_trp_information(
+        &self,
+        node: &crate::site_config::NgRanNode,
+        trps: Vec<crate::nrppa_positioning::TrpInfo>,
+    ) {
+        for t in &trps {
+            let (Some(pci), Some(coord)) = (t.pci, t.coord) else {
+                continue;
+            };
+            let key = format!("pci-{pci}");
+            let configured = self
+                .cell_registry
+                .read()
+                .ok()
+                .and_then(|r| r.get(&key).copied());
+            match configured {
+                None => self.set_cell_coord(key, coord),
+                Some(c) if c != coord => log::warn!(
+                    "TRP {} of {node:?} reports {coord:?}; the configured {key} is {c:?}, \
+                     which is kept",
+                    t.trp_id
+                ),
+                Some(_) => {}
+            }
+        }
+        if let Ok(mut info) = self.trp_info.write() {
+            info.retain(|(n, _)| n != node);
+            info.extend(trps.into_iter().map(|t| (node.clone(), t)));
+        }
+    }
+
+    /// Every known TRP with the node it belongs to.
+    pub fn trp_information(
+        &self,
+    ) -> Vec<(
+        crate::site_config::NgRanNode,
+        crate::nrppa_positioning::TrpInfo,
+    )> {
+        self.trp_info.read().map(|t| t.clone()).unwrap_or_default()
+    }
+
+    // -----------------------------------------------------------------------
     // A2: outbound-leg bookkeeping (AMF subscription cache + self identity).
     // -----------------------------------------------------------------------
 
@@ -1658,16 +1782,34 @@ fn tdoa_observations(
 ///
 /// UE halves without a gNB half are counted and logged, never ranged. A
 /// negative sum is a measurement error, not a distance, and that TRP is dropped.
+///
+/// # Matching the halves (#807)
+///
+/// The halves arrive in different messages: the UE's in the LPP report, the gNB's
+/// in an NRPPa MEASUREMENT RESPONSE. They meet on the TRP: the registry key of each
+/// ([`resolve_trp`]), where a UE half reported only by DL-PRS ID finds its TRP
+/// through any measurement of the session that carries both that DL-PRS ID and a
+/// resolvable key. Then on time: both carry the SFN and slot of that TRP when they
+/// were measured (`nr-TimeStamp-r16`, TS 37.355; `TimeStamp`, TS 38.455), and a pair
+/// is used only within [`MULTI_RTT_PAIRING_WINDOW_MS`] across the SFN wrap. Of
+/// several candidates the closest pair wins. A half with no time stamp (the debug
+/// JSON route) pairs on the TRP alone.
 fn multi_rtt_observations(
     measurements: &[CellMeasurement],
     registry: &TrpRegistry,
 ) -> Vec<RttObservation> {
-    // One pass: the first value of each quantity per TRP, in first-seen order.
+    type Stamp = Option<crate::nrppa_positioning::SlotTime>;
     #[derive(Default)]
     struct Halves {
         rtt_ns: Option<f64>,
-        ue: Option<f64>,
-        gnb: Option<f64>,
+        ue: Vec<(f64, Stamp)>,
+        gnb: Vec<(f64, Stamp)>,
+    }
+    let mut by_prs: HashMap<u8, String> = HashMap::new();
+    for m in measurements {
+        if let (Some(prs), Some(key)) = (m.dl_prs_id, resolve_trp(m, registry)) {
+            by_prs.entry(prs).or_insert(key);
+        }
     }
     let mut order: Vec<String> = Vec::new();
     let mut by_trp: HashMap<String, Halves> = HashMap::new();
@@ -1675,7 +1817,9 @@ fn multi_rtt_observations(
         if m.rtt_ns.is_none() && m.ue_rx_tx_ns.is_none() && m.gnb_rx_tx_ns.is_none() {
             continue;
         }
-        let Some(key) = resolve_trp(m, registry) else {
+        let Some(key) =
+            resolve_trp(m, registry).or_else(|| m.dl_prs_id.and_then(|p| by_prs.get(&p).cloned()))
+        else {
             continue;
         };
         let h = by_trp.entry(key.clone()).or_insert_with(|| {
@@ -1683,15 +1827,39 @@ fn multi_rtt_observations(
             Halves::default()
         });
         h.rtt_ns = h.rtt_ns.or(m.rtt_ns.map(|r| r as f64));
-        h.ue = h.ue.or(m.ue_rx_tx_ns);
-        h.gnb = h.gnb.or(m.gnb_rx_tx_ns);
+        if let Some(ue) = m.ue_rx_tx_ns {
+            h.ue.push((ue, m.meas_time));
+        }
+        if let Some(gnb) = m.gnb_rx_tx_ns {
+            h.gnb.push((gnb, m.meas_time));
+        }
     }
     let mut obs: Vec<RttObservation> = Vec::new();
     let mut unpaired: Vec<&str> = Vec::new();
     for key in &order {
         let h = &by_trp[key];
-        let rtt_ns = h.rtt_ns.or_else(|| Some(h.ue? + h.gnb?));
-        match rtt_ns {
+        let paired = h.rtt_ns.or_else(|| {
+            let mut best: Option<(f64, f64)> = None;
+            for (ue, ue_t) in &h.ue {
+                for (gnb, gnb_t) in &h.gnb {
+                    let dt = match (ue_t, gnb_t) {
+                        (Some(a), Some(b)) => a.distance_ms(b),
+                        _ => 0.0,
+                    };
+                    if dt <= MULTI_RTT_PAIRING_WINDOW_MS && best.is_none_or(|(d, _)| dt < d) {
+                        best = Some((dt, ue + gnb));
+                    }
+                }
+            }
+            if best.is_none() && !h.ue.is_empty() && !h.gnb.is_empty() {
+                log::warn!(
+                    "Multi-RTT: TRP {key} has both Rx-Tx halves, but their time stamps are \
+                     more than {MULTI_RTT_PAIRING_WINDOW_MS} ms apart; not ranged"
+                );
+            }
+            best.map(|(_, rtt)| rtt)
+        });
+        match paired {
             Some(rtt) if rtt.is_finite() && rtt >= 0.0 => obs.push(RttObservation {
                 trp_id: key.to_string(),
                 range_m: rtt_ns_to_range_m(rtt),
@@ -1704,7 +1872,7 @@ fn multi_rtt_observations(
     }
     if !unpaired.is_empty() {
         log::warn!(
-            "Multi-RTT: {} TRP(s) ({}) have one Rx-Tx half but not the other; TS 38.305 \
+            "Multi-RTT: {} TRP(s) ({}) have no usable pair of Rx-Tx halves; TS 38.305 \
              §8.10 ranges on UE Rx-Tx + gNB Rx-Tx, so they are not ranged",
             unpaired.len(),
             unpaired.join(", ")
@@ -1712,6 +1880,15 @@ fn multi_rtt_observations(
     }
     obs
 }
+
+/// How far apart, in ms, the UE and gNB Rx–Tx halves of one TRP may have been
+/// measured and still be summed into one RTT (#807).
+///
+/// TS 38.305 §8.10 sums two measurements of one round trip, so the UE must not
+/// have moved between them; the range error is up to the distance it moved, and
+/// 200 ms is 6 m at 30 m/s. Neither TS 38.305 nor TS 38.455 sets a value: this is
+/// the LMF's choice.
+pub const MULTI_RTT_PAIRING_WINDOW_MS: f64 = 200.0;
 
 /// Heuristic placeholder that returns a lat/lon 0.0 fix with a method-derived
 /// accuracy estimate.
@@ -1797,7 +1974,14 @@ pub fn lmf_context_init(max_measurements: usize) {
         // Production is untouched: `lmf_context_init` runs once at startup, before
         // `site_config::load_into_context` fills the registry.
         #[cfg(test)]
-        context.clear_cell_registry_for_test();
+        {
+            context.clear_cell_registry_for_test();
+            // #807: the NG-RAN nodes and their TRPs are process state too.
+            context.set_ng_ran_nodes(Vec::new());
+            if let Ok(mut info) = context.trp_info.write() {
+                info.clear();
+            }
+        }
     };
 }
 
@@ -1908,6 +2092,7 @@ mod tests {
             ecid_rtt_ns: None,
             ecid_rtt_width_ns: None,
             gnb_rx_tx_ns: None,
+            meas_time: None,
             dl_prs_id: None,
             eutra: false,
         }];
@@ -1956,6 +2141,7 @@ mod tests {
                 ecid_rtt_ns: None,
                 ecid_rtt_width_ns: None,
                 gnb_rx_tx_ns: None,
+                meas_time: None,
                 dl_prs_id: None,
                 eutra: false,
             },
@@ -1972,6 +2158,7 @@ mod tests {
                 ecid_rtt_ns: None,
                 ecid_rtt_width_ns: None,
                 gnb_rx_tx_ns: None,
+                meas_time: None,
                 dl_prs_id: None,
                 eutra: false,
             },
@@ -2096,6 +2283,7 @@ mod tests {
             ecid_rtt_ns: None,
             ecid_rtt_width_ns: None,
             gnb_rx_tx_ns: None,
+            meas_time: None,
             dl_prs_id: None,
             eutra: false,
         }];
@@ -2122,6 +2310,7 @@ mod tests {
             ecid_rtt_ns: None,
             ecid_rtt_width_ns: None,
             gnb_rx_tx_ns: None,
+            meas_time: None,
             dl_prs_id: None,
             eutra: false,
         }];
@@ -2251,6 +2440,7 @@ mod tests_real_solve {
                     ecid_rtt_ns: None,
                     ecid_rtt_width_ns: None,
                     gnb_rx_tx_ns: None,
+                    meas_time: None,
                     dl_prs_id: None,
                     eutra: false,
                 }
@@ -2295,6 +2485,7 @@ mod tests_real_solve {
                     ecid_rtt_ns: None,
                     ecid_rtt_width_ns: None,
                     gnb_rx_tx_ns: None,
+                    meas_time: None,
                     dl_prs_id: None,
                     eutra: false,
                 }
@@ -2339,6 +2530,7 @@ mod tests_real_solve {
             ecid_rtt_ns: None,
             ecid_rtt_width_ns: None,
             gnb_rx_tx_ns: None,
+            meas_time: None,
             dl_prs_id: None,
             eutra: false,
         }];
@@ -2388,6 +2580,7 @@ mod tests_real_solve {
                     ecid_rtt_ns: None,
                     ecid_rtt_width_ns: None,
                     gnb_rx_tx_ns: None,
+                    meas_time: None,
                     dl_prs_id: None,
                     eutra: false,
                 }
@@ -2430,6 +2623,7 @@ mod tests_real_solve {
                     ecid_rtt_ns: None,
                     ecid_rtt_width_ns: None,
                     gnb_rx_tx_ns: None,
+                    meas_time: None,
                     dl_prs_id: None,
                     eutra: false,
                 }
@@ -2461,6 +2655,7 @@ mod tests_real_solve {
             ecid_rtt_ns: None,
             ecid_rtt_width_ns: None,
             gnb_rx_tx_ns: None,
+            meas_time: None,
             dl_prs_id: None,
             eutra: false,
         }];
@@ -2509,6 +2704,7 @@ mod tests_real_solve {
             ecid_rtt_ns: None,
             ecid_rtt_width_ns: None,
             gnb_rx_tx_ns: None,
+            meas_time: None,
             dl_prs_id: None,
             eutra: false,
         }];
@@ -2684,6 +2880,7 @@ mod tests_real_solve {
             ecid_rtt_ns: None,
             ecid_rtt_width_ns: None,
             gnb_rx_tx_ns: None,
+            meas_time: None,
             dl_prs_id: None,
             eutra: false,
         }];
@@ -2804,6 +3001,7 @@ mod tests_multi_rtt_two_sided {
                 ecid_rtt_ns: None,
                 ecid_rtt_width_ns: None,
                 gnb_rx_tx_ns: Some(propagation_ns(*e, *n) - UE_CLOCK_OFFSET_NS + SRS_AFTER_PRS_NS),
+                meas_time: None,
                 dl_prs_id: None,
                 eutra: false,
             })
@@ -3209,6 +3407,7 @@ mod tests_dl_tdoa_reference {
             ecid_rtt_ns: None,
             ecid_rtt_width_ns: None,
             gnb_rx_tx_ns: None,
+            meas_time: None,
             dl_prs_id: Some(3),
             eutra: false,
         });
@@ -3299,6 +3498,7 @@ mod tests_ecid_label {
             ecid_rtt_ns: None,
             ecid_rtt_width_ns: None,
             gnb_rx_tx_ns: None,
+            meas_time: None,
             rstd_reference: None,
             dl_prs_id: None,
             eutra,
@@ -3491,6 +3691,7 @@ mod tests_session_legs {
             ecid_rtt_ns: None,
             ecid_rtt_width_ns: None,
             gnb_rx_tx_ns: None,
+            meas_time: None,
             dl_prs_id: None,
             eutra: false,
         }

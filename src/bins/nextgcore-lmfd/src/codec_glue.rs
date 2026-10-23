@@ -419,15 +419,24 @@ pub fn classify_ue_capability(caps: &lpp::ProvideCapabilities) -> UeLppCapabilit
 /// solve for would spend a UE measurement campaign to arrive at no fix.
 pub const MIN_POINTS_FOR_MULTILATERATION: usize = 3;
 
-/// Whether this LMF can obtain the gNB half of a Multi-RTT measurement (#713).
+/// Whether this build can obtain the gNB half of a Multi-RTT measurement (#713,
+/// #807).
 ///
 /// TS 38.305 §8.10: a Multi-RTT range is UE Rx–Tx plus gNB Rx–Tx for the same TRP.
-/// The gNB half comes from the NRPPa Measurement procedure (TS 38.455), after the
-/// serving gNB has configured the UE's SRS through Positioning Information
-/// Exchange and Positioning Activation. This LMF implements none of those, so a
-/// Multi-RTT request would collect UE halves that can never be ranged. Until it
-/// does (#807), Multi-RTT is not requested.
-pub const MULTI_RTT_GNB_HALF_AVAILABLE: bool = false;
+/// The gNB half comes from the NRPPa Measurement procedure (TS 38.455 §8.5.1),
+/// after the serving gNB has configured the UE's SRS through Positioning
+/// Information Exchange and Positioning Activation. Since #807 `multi_rtt` runs
+/// all of them. Whether a given request can use them is the runtime half of the
+/// decision, [`multi_rtt_gnb_half_ready`].
+pub const MULTI_RTT_GNB_HALF_AVAILABLE: bool = true;
+
+/// Whether the gNB half can be obtained in this deployment: the NRPPa downlink is
+/// enabled (`LMF_NRPPA_DOWNLINK=1`) and `lmf.positioning.ngRanNodes` names the
+/// gNBs whose TRPs are measured. Without both, a Multi-RTT request would collect UE
+/// halves that can never be ranged, so DL-TDOA is asked for instead.
+pub fn multi_rtt_gnb_half_ready(nrppa_downlink: bool, ng_ran_nodes: usize) -> bool {
+    MULTI_RTT_GNB_HALF_AVAILABLE && nrppa_downlink && ng_ran_nodes > 0
+}
 
 /// The radio access the target UE is served on, which decides the E-CID flavour
 /// (#715).
@@ -480,7 +489,8 @@ impl AccessRat {
 /// 2. **The UE reported E-CID only ⇒ E-CID.** Asking a UE for a method it has said
 ///    it cannot perform gets an error or an empty report.
 /// 3. **High-accuracy or emergency QoS ⇒ a multilateration method.** Multi-RTT
-///    when the gNB Rx–Tx half can be obtained ([`MULTI_RTT_GNB_HALF_AVAILABLE`]),
+///    when the gNB Rx–Tx half can be obtained (`gnb_half_ready`, from
+///    [`multi_rtt_gnb_half_ready`]),
 ///    because its two-sided measurement cancels the clock offset. Otherwise
 ///    NR DL-TDOA (TS 38.305 §8.12), whose RSTDs the UE measures alone and which
 ///    needs no gNB measurement (#713). This depends on #714, the DL-TDOA
@@ -501,6 +511,7 @@ pub fn select_lpp_method(
     reference_points: usize,
     capability: UeLppCapability,
     access: AccessRat,
+    gnb_half_ready: bool,
 ) -> LppMethod {
     use crate::context::PositioningQos;
 
@@ -512,7 +523,7 @@ pub fn select_lpp_method(
     }
     match qos {
         PositioningQos::HighAccuracy | PositioningQos::Emergency => {
-            if MULTI_RTT_GNB_HALF_AVAILABLE {
+            if gnb_half_ready {
                 LppMethod::MultiRtt
             } else {
                 LppMethod::DlTdoa
@@ -820,6 +831,7 @@ fn measured_results_element_to_cell(elem: &lpp::MeasuredResultsElement) -> CellM
         ecid_rtt_ns: rtt.map(|(mid, _)| mid),
         ecid_rtt_width_ns: rtt.map(|(_, width)| width),
         gnb_rx_tx_ns: None,
+        meas_time: None,
         dl_prs_id: None,
         eutra: true,
     }
@@ -909,6 +921,7 @@ fn nr_measured_results_element_to_cell(
         ecid_rtt_ns: None,
         ecid_rtt_width_ns: None,
         gnb_rx_tx_ns: None,
+        meas_time: None,
         rstd_reference: None,
         dl_prs_id: None,
         eutra: false,
@@ -994,11 +1007,29 @@ pub fn lpp_multi_rtt_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<Cell
                 ecid_rtt_ns: None,
                 ecid_rtt_width_ns: None,
                 gnb_rx_tx_ns: None,
+                meas_time: Some(lpp_time_stamp(&elem.nr_time_stamp_r16)),
                 dl_prs_id: Some(elem.dl_prs_id_r16.0),
                 eutra: false,
             }
         })
         .collect()
+}
+
+/// A TS 37.355 `NR-TimeStamp-r16` as a [`SlotTime`](crate::nrppa_positioning::SlotTime):
+/// the SFN and slot of the TRP the measurement was made on (#807).
+fn lpp_time_stamp(t: &lpp::NR_TimeStamp_r16) -> crate::nrppa_positioning::SlotTime {
+    use lpp::NR_TimeStamp_r16Nr_Slot_r16 as S;
+    let (slot, slots_per_frame) = match &t.nr_slot_r16 {
+        S::Scs15_r16(s) => (s.0, 10),
+        S::Scs30_r16(s) => (s.0, 20),
+        S::Scs60_r16(s) => (s.0, 40),
+        S::Scs120_r16(s) => (s.0, 80),
+    };
+    crate::nrppa_positioning::SlotTime {
+        sfn: t.nr_sfn_r16.0,
+        slot,
+        slots_per_frame,
+    }
 }
 
 /// Extract the LPP transaction number as a correlation request-id.
@@ -1067,6 +1098,7 @@ pub fn lpp_dl_tdoa_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMe
         ecid_rtt_ns: None,
         ecid_rtt_width_ns: None,
         gnb_rx_tx_ns: None,
+        meas_time: None,
         dl_prs_id: Some(sig.dl_prs_reference_info_r16.dl_prs_id_r16.0),
         eutra: false,
     });
@@ -1096,6 +1128,7 @@ pub fn lpp_dl_tdoa_provide_to_measurements(msg: &lpp::LPP_Message) -> Vec<CellMe
             ecid_rtt_ns: None,
             ecid_rtt_width_ns: None,
             gnb_rx_tx_ns: None,
+            meas_time: None,
             dl_prs_id: Some(elem.dl_prs_id_r16.0),
             eutra: false,
         });

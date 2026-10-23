@@ -63,6 +63,84 @@ pub struct SiteCoord {
     pub coord: TrpCoord,
 }
 
+/// An NG-RAN node (gNB) the LMF sends non-UE-associated NRPPa to (#807): TRP
+/// Information Exchange and the Measurement procedure. TS 29.518 §5.2.2.4.1.2 has
+/// the LMF name the target nodes of a NonUeN2MessageTransfer, so it has to know
+/// them; this is where it learns them.
+///
+/// ```yaml
+/// lmf:
+///   positioning:
+///     ngRanNodes:
+///       - mcc: "001"
+///         mnc: "01"
+///         gnbId: "000001"     # hex, TS 29.571 GNbId.gNBValue
+///         bitLength: 22       # 22..32, TS 38.413 gNB-ID
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NgRanNode {
+    pub mcc: String,
+    pub mnc: String,
+    pub gnb_id: u32,
+    pub bit_length: u8,
+}
+
+impl NgRanNode {
+    /// The TS 29.571 `GlobalRanNodeId` of the node.
+    pub fn global_ran_node_id(&self) -> serde_json::Value {
+        let digits = usize::from(self.bit_length).div_ceil(4).max(6);
+        serde_json::json!({
+            "plmnId": { "mcc": self.mcc, "mnc": self.mnc },
+            "gNbId": {
+                "bitLength": self.bit_length,
+                "gNBValue": format!("{:0digits$x}", self.gnb_id),
+            },
+        })
+    }
+}
+
+/// One `ngRanNodes` entry.
+fn parse_ng_ran_node(entry: &serde_yaml::Value) -> Result<NgRanNode, String> {
+    let text = |k: &str| {
+        entry
+            .get(k)
+            .and_then(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .or_else(|| v.as_u64().map(|n| n.to_string()))
+            })
+            .map(|s| s.trim().to_string())
+    };
+    let mcc = text("mcc").ok_or("missing 'mcc'")?;
+    let mnc = text("mnc").ok_or("missing 'mnc'")?;
+    if mcc.len() != 3 || !mcc.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("mcc '{mcc}' is not three digits"));
+    }
+    if !(2..=3).contains(&mnc.len()) || !mnc.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("mnc '{mnc}' is not two or three digits"));
+    }
+    let gnb = text("gnbId").ok_or("missing 'gnbId'")?;
+    let gnb_id = u32::from_str_radix(&gnb, 16).map_err(|_| format!("gnbId '{gnb}' is not hex"))?;
+    let bit_length = entry
+        .get("bitLength")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(22);
+    if !(22..=32).contains(&bit_length) {
+        return Err(format!(
+            "bitLength {bit_length} is outside 22..32 (TS 38.413 gNB-ID)"
+        ));
+    }
+    if bit_length < 32 && u64::from(gnb_id) >> bit_length != 0 {
+        return Err(format!("gnbId {gnb} does not fit in {bit_length} bits"));
+    }
+    Ok(NgRanNode {
+        mcc,
+        mnc,
+        gnb_id,
+        bit_length: bit_length as u8,
+    })
+}
+
 /// Everything `lmf.positioning` yielded, plus what it rejected.
 #[derive(Debug, Default, PartialEq)]
 pub struct SiteConfig {
@@ -70,6 +148,8 @@ pub struct SiteConfig {
     pub cells: Vec<SiteCoord>,
     /// TRP reference points.
     pub trps: Vec<SiteCoord>,
+    /// The NG-RAN nodes whose TRPs measure the gNB half of Multi-RTT (#807).
+    pub ng_ran_nodes: Vec<NgRanNode>,
     /// One message per rejected entry, so a mistyped coordinate is visible in the
     /// startup log rather than silently absent from the registry.
     pub rejected: Vec<String>,
@@ -116,6 +196,16 @@ pub fn parse_site_config(doc: &serde_yaml::Value) -> SiteConfig {
             &mut out.trps,
             &mut out.rejected,
         );
+        if let Some(seq) = positioning.get("ngRanNodes").and_then(|n| n.as_sequence()) {
+            for (idx, entry) in seq.iter().enumerate() {
+                match parse_ng_ran_node(entry) {
+                    Ok(node) => out.ng_ran_nodes.push(node),
+                    Err(reason) => out
+                        .rejected
+                        .push(format!("lmf.positioning.ngRanNodes[{idx}]: {reason}")),
+                }
+            }
+        }
     }
     out
 }
@@ -206,6 +296,15 @@ pub fn load_into_context(config_path: &str) -> SiteConfig {
     for reason in &cfg.rejected {
         log::error!("LMF positioning: rejected {reason}");
     }
+    if !cfg.ng_ran_nodes.is_empty() {
+        log::info!(
+            "LMF positioning: {} NG-RAN node(s) configured for the Multi-RTT gNB half (#807)",
+            cfg.ng_ran_nodes.len()
+        );
+        if let Ok(guard) = crate::context::lmf_self().read() {
+            guard.set_ng_ran_nodes(cfg.ng_ran_nodes.clone());
+        }
+    }
     if cfg.is_empty() {
         log::warn!(
             "LMF positioning: no lmf.positioning.cells or .trps configured. Every geometric \
@@ -245,6 +344,7 @@ pub fn apply(cfg: &SiteConfig) {
     for site in cfg.cells.iter().chain(cfg.trps.iter()) {
         guard.set_cell_coord(site.id.clone(), site.coord);
     }
+    guard.set_ng_ran_nodes(cfg.ng_ran_nodes.clone());
 }
 
 #[cfg(test)]

@@ -33,9 +33,11 @@ mod lpp_equivalence_tests;
 mod lpp_fixtures; // #515: generated-codec LPP test fixtures
                   // A2: lmfd → AMF Namf_Communication client leg (NRF discovery of the serving
                   // AMF, N1N2MessageSubscribe registration, multipart N1N2MessageTransfer POST).
+mod multi_rtt; // #807: the gNB half of Multi-RTT (TS 38.305 §8.10.3)
 mod namf_client;
 mod nlmf;
 mod nrppa_downlink; // #103: LMF-initiated NRPPa toward NG-RAN
+mod nrppa_positioning; // #807: NRPPa answers of the Multi-RTT procedures
 mod nrppa_uplink; // #515: E-CID Measurement Report on the generated codec, TS 38.455 §10
                   // lmfd-08: real multilateration solvers (ECID / Multi-RTT / TDOA / AoA).
                   // Wired into `context::compute_location`; solve_tdoa remains available for
@@ -860,7 +862,21 @@ async fn initiate_positioning(
     };
     let access =
         crate::codec_glue::AccessRat::from_serving_cell(input.ncgi.is_some(), input.ecgi.is_some());
-    let method = crate::codec_glue::select_lpp_method(qos, reference_points, capability, access);
+    let budget = wait_budget(input);
+    let gnb_half_ready = crate::codec_glue::multi_rtt_gnb_half_ready(
+        nrppa_downlink::enabled(),
+        lmf_self()
+            .read()
+            .map(|c| c.ng_ran_nodes().len())
+            .unwrap_or(0),
+    ) && !budget.is_zero();
+    let mut method = crate::codec_glue::select_lpp_method(
+        qos,
+        reference_points,
+        capability,
+        access,
+        gnb_half_ready,
+    );
     log::info!(
         "DetermineLocation: selected LPP method {} (qos={qos:?}, {reference_points} reference \
          point(s), UE capability {capability:?}, access {access:?})",
@@ -868,16 +884,6 @@ async fn initiate_positioning(
     );
 
     let txn = LPP_TRANSACTION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let lpp_pdu = match crate::codec_glue::build_lpp_request(method, txn) {
-        Ok(pdu) => pdu,
-        Err(e) => {
-            return Err(Box::new(problem(
-                500,
-                nlmf::cause::POSITIONING_FAILED,
-                &format!("LPP RequestLocationInformation encode failed: {e}"),
-            )))
-        }
-    };
 
     // Measurement-store entry + correlation session, registered BEFORE the
     // POST (TS 29.572 CorrelationID minted inside; TS 37.355 txn indexed).
@@ -975,6 +981,65 @@ async fn initiate_positioning(
         }
     }
 
+    // #807: the gNB half of Multi-RTT, set up before the UE is asked (TS 38.305
+    // §8.10.3.2 steps 1-6 precede step 8). When it cannot be set up, the UE is
+    // asked for DL-TDOA instead, which needs no gNB measurement, rather than for
+    // UE halves that could never be ranged.
+    if method == crate::codec_glue::LppMethod::MultiRtt {
+        if let Ok(context) = lmf_self().read() {
+            context.positioning_session_expect_leg(&corr, MeasurementLeg::NrppaTrp);
+        }
+        let transport = AmfNrppa {
+            amf: amf.clone(),
+            ue_context_id: target.to_string(),
+            corr: corr.clone(),
+            lmf_id: lmf_id.clone(),
+        };
+        namf_client::ensure_non_ue_nrppa_subscription(&amf, &lmf_id).await;
+        let step = (budget / 5).min(Duration::from_secs(2));
+        match crate::multi_rtt::prepare(&transport, step, budget.as_millis() as u32).await {
+            Ok(prepared) => {
+                let request_id = lmf_self()
+                    .read()
+                    .ok()
+                    .and_then(|c| c.positioning_session_find(&corr))
+                    .map(|i| i.request_id);
+                let collect_for = budget.mul_f32(0.75);
+                tokio::spawn(async move {
+                    let cells = crate::multi_rtt::collect(&transport, prepared, collect_for).await;
+                    log::info!("Multi-RTT: {} gNB half/halves collected", cells.len());
+                    if let (Some(request_id), Ok(context)) = (request_id, lmf_self().read()) {
+                        context.measurement_leg_report(request_id, MeasurementLeg::NrppaTrp, cells);
+                    }
+                });
+            }
+            Err(e) => {
+                log::warn!(
+                    "Multi-RTT: the gNB half cannot be obtained ({e}); asking the UE for NR \
+                     DL-TDOA instead"
+                );
+                if let Ok(context) = lmf_self().read() {
+                    context.positioning_session_withdraw_leg(&corr, MeasurementLeg::NrppaTrp);
+                }
+                method = crate::codec_glue::LppMethod::DlTdoa;
+            }
+        }
+    }
+
+    let lpp_pdu = match crate::codec_glue::build_lpp_request(method, txn) {
+        Ok(pdu) => pdu,
+        Err(e) => {
+            if let Ok(context) = lmf_self().read() {
+                context.positioning_session_expire(&corr);
+            }
+            return Err(Box::new(problem(
+                500,
+                nlmf::cause::POSITIONING_FAILED,
+                &format!("LPP RequestLocationInformation encode failed: {e}"),
+            )));
+        }
+    };
+
     match namf_client::send_n1n2_transfer(&amf, target, &corr, &lmf_id, lpp_pdu).await {
         namf_client::TransferOutcome::Initiated => Ok((corr, rx)),
         namf_client::TransferOutcome::UeNotReachable => {
@@ -1011,6 +1076,39 @@ async fn initiate_positioning(
 /// share the id — is safe because the id is scoped to the NG-RAN/UE association, not
 /// to the LMF.
 const NRPPA_UE_MEASUREMENT_ID: u16 = 1;
+
+/// NRPPa through the serving AMF (#807): UE-associated over N1N2MessageTransfer,
+/// non-UE-associated over NonUeN2MessageTransfer.
+struct AmfNrppa {
+    amf: namf_client::DiscoveredAmf,
+    ue_context_id: String,
+    corr: String,
+    lmf_id: String,
+}
+
+impl crate::multi_rtt::NrppaTransport for AmfNrppa {
+    async fn send_ue(&self, pdu: Vec<u8>) -> bool {
+        namf_client::send_n2_nrppa_transfer(
+            &self.amf,
+            &self.ue_context_id,
+            &self.corr,
+            &self.lmf_id,
+            pdu,
+        )
+        .await
+            == namf_client::TransferOutcome::Initiated
+    }
+
+    async fn send_non_ue(&self, node: &crate::site_config::NgRanNode, pdu: Vec<u8>) -> bool {
+        match namf_client::send_non_ue_nrppa_transfer(&self.amf, node, &self.lmf_id, pdu).await {
+            namf_client::TransferOutcome::Initiated => true,
+            other => {
+                log::warn!("Multi-RTT: non-UE NRPPa to {node:?}: {other:?}");
+                false
+            }
+        }
+    }
+}
 
 /// Map `InputData` QoS hints onto the internal [`PositioningQos`].
 fn positioning_qos_from_input(input: &nlmf::InputData) -> PositioningQos {
@@ -2528,6 +2626,7 @@ async fn handle_nrppa_report(request: &SbiRequest) -> SbiResponse {
                     ecid_rtt_ns: c.get("ecidRttNs").and_then(|v| v.as_f64()),
                     ecid_rtt_width_ns: None,
                     gnb_rx_tx_ns: c.get("gnbRxTxNs").and_then(|v| v.as_f64()),
+                    meas_time: None,
                     dl_prs_id: None,
                     eutra: false,
                 })
@@ -2955,6 +3054,22 @@ async fn handle_n2_info_notify(request: &SbiRequest) -> SbiResponse {
     let lcs_correlation_id = notification
         .get("lcsCorrelationId")
         .and_then(serde_json::Value::as_str);
+
+    // #807: the answer to an NRPPa exchange this LMF is waiting on (TRP
+    // Information, Positioning Information, Positioning Activation, Measurement)
+    // goes to its waiter, matched by procedure code and transaction id. A non-UE-
+    // associated answer names no session, so this comes before the session lookup.
+    if let Some((kind, procedure, txn)) = crate::nrppa_positioning::header(&nrppa_bytes) {
+        if kind != crate::nrppa_positioning::Kind::Initiating {
+            let delivered = lmf_self()
+                .read()
+                .map(|c| c.nrppa_deliver(procedure, txn, nrppa_bytes.clone()))
+                .unwrap_or(false);
+            if delivered {
+                return SbiResponse::no_content();
+            }
+        }
+    }
 
     let Some(request_id) = resolve_notify_session(lcs_correlation_id, None) else {
         log::warn!(
@@ -4028,6 +4143,7 @@ mod tests {
                     ecid_rtt_ns: None,
                     ecid_rtt_width_ns: None,
                     gnb_rx_tx_ns: None,
+                    meas_time: None,
                     dl_prs_id: None,
                     eutra: false,
                 }],
@@ -4920,6 +5036,7 @@ lmf:
                     ecid_rtt_ns: None,
                     ecid_rtt_width_ns: None,
                     gnb_rx_tx_ns: None,
+                    meas_time: None,
                     dl_prs_id: None,
                     eutra: false,
                 }],
@@ -5007,17 +5124,18 @@ lmf:
         use crate::codec_glue::{select_lpp_method, AccessRat, LppMethod, UeLppCapability};
         let nr = AccessRat::Nr;
 
-        // High accuracy, enough reference points, capability unknown -> a
-        // multilateration method. DL-TDOA, not Multi-RTT: this LMF cannot obtain
-        // the gNB Rx-Tx half a Multi-RTT range needs (TS 38.305 §8.10, #713).
-        const { assert!(!crate::codec_glue::MULTI_RTT_GNB_HALF_AVAILABLE) };
+        // High accuracy, enough reference points, capability unknown, and no gNB
+        // half to be had (NRPPa downlink off or no NG-RAN node configured) -> a
+        // multilateration method the UE measures alone: DL-TDOA, not Multi-RTT,
+        // which cannot range without the gNB Rx-Tx half (TS 38.305 §8.10, #713).
         for access in [AccessRat::Nr, AccessRat::Eutra] {
             assert_eq!(
                 select_lpp_method(
                     PositioningQos::HighAccuracy,
                     3,
                     UeLppCapability::Unknown,
-                    access
+                    access,
+                    false
                 ),
                 LppMethod::DlTdoa,
                 "answering a <=10 m request with E-CID commits to an accuracy a TA ring cannot \
@@ -5025,7 +5143,13 @@ lmf:
             );
         }
         assert_eq!(
-            select_lpp_method(PositioningQos::Emergency, 5, UeLppCapability::Unknown, nr),
+            select_lpp_method(
+                PositioningQos::Emergency,
+                5,
+                UeLppCapability::Unknown,
+                nr,
+                false
+            ),
             LppMethod::DlTdoa,
             "an emergency fix is a high-accuracy fix"
         );
@@ -5034,9 +5158,60 @@ lmf:
                 PositioningQos::HighAccuracy,
                 3,
                 UeLppCapability::AdvancedMethods,
-                nr
+                nr,
+                false
             ),
             LppMethod::DlTdoa
+        );
+
+        // #807: with the gNB half obtainable, high accuracy and emergency select
+        // Multi-RTT again. The readiness flag is the sole difference.
+        const { assert!(crate::codec_glue::MULTI_RTT_GNB_HALF_AVAILABLE) };
+        for qos in [PositioningQos::HighAccuracy, PositioningQos::Emergency] {
+            assert_eq!(
+                select_lpp_method(qos, 3, UeLppCapability::Unknown, nr, true),
+                LppMethod::MultiRtt,
+                "its two-sided measurement cancels the UE-gNB clock offset"
+            );
+        }
+        // ... but readiness never overrides the other branches.
+        assert_eq!(
+            select_lpp_method(
+                PositioningQos::HighAccuracy,
+                2,
+                UeLppCapability::Unknown,
+                nr,
+                true
+            ),
+            LppMethod::NrEcid
+        );
+        assert_eq!(
+            select_lpp_method(
+                PositioningQos::HighAccuracy,
+                3,
+                UeLppCapability::EcidOnly,
+                nr,
+                true
+            ),
+            LppMethod::NrEcid
+        );
+        assert_eq!(
+            select_lpp_method(
+                PositioningQos::BestEffort,
+                9,
+                UeLppCapability::Unknown,
+                nr,
+                true
+            ),
+            LppMethod::NrEcid
+        );
+        // Readiness needs both the NRPPa downlink and an NG-RAN node to measure on.
+        use crate::codec_glue::multi_rtt_gnb_half_ready as ready;
+        assert!(ready(true, 1));
+        assert!(!ready(false, 1), "no NRPPa downlink, no gNB half");
+        assert!(
+            !ready(true, 0),
+            "no NG-RAN node to send the Measurement Request to"
         );
 
         // Same QoS, TOO FEW reference points -> E-CID fallback, of the UE's access
@@ -5046,7 +5221,8 @@ lmf:
                 PositioningQos::HighAccuracy,
                 2,
                 UeLppCapability::Unknown,
-                nr
+                nr,
+                false
             ),
             LppMethod::NrEcid,
             "two known positions cannot be multilaterated against, whatever the QoS asks"
@@ -5056,7 +5232,8 @@ lmf:
                 PositioningQos::HighAccuracy,
                 2,
                 UeLppCapability::Unknown,
-                AccessRat::Eutra
+                AccessRat::Eutra,
+                false
             ),
             LppMethod::Ecid
         );
@@ -5068,7 +5245,8 @@ lmf:
                 PositioningQos::HighAccuracy,
                 3,
                 UeLppCapability::EcidOnly,
-                nr
+                nr,
+                false
             ),
             LppMethod::NrEcid,
             "asking a UE for a method it has said it cannot perform gets an empty report"
@@ -5076,12 +5254,24 @@ lmf:
 
         // Low latency prefers the cheapest measurement, not the most accurate.
         assert_eq!(
-            select_lpp_method(PositioningQos::LowLatency, 9, UeLppCapability::Unknown, nr),
+            select_lpp_method(
+                PositioningQos::LowLatency,
+                9,
+                UeLppCapability::Unknown,
+                nr,
+                false
+            ),
             LppMethod::NrEcid,
             "LOW_DELAY is a statement about time, and PRS scheduling is not fast"
         );
         assert_eq!(
-            select_lpp_method(PositioningQos::BestEffort, 9, UeLppCapability::Unknown, nr),
+            select_lpp_method(
+                PositioningQos::BestEffort,
+                9,
+                UeLppCapability::Unknown,
+                nr,
+                false
+            ),
             LppMethod::NrEcid
         );
         assert_eq!(
@@ -5089,7 +5279,8 @@ lmf:
                 PositioningQos::BestEffort,
                 9,
                 UeLppCapability::Unknown,
-                AccessRat::Eutra
+                AccessRat::Eutra,
+                false
             ),
             LppMethod::Ecid
         );
@@ -7232,6 +7423,74 @@ mod positioning_chain_strict_peer {
 
         let _ = amf_server.stop().await;
         let _ = nrf_server.stop().await;
+    }
+
+    /// #807, both ends of the non-UE NRPPa leg through real amfd code:
+    /// - lmfd's NonUeN2InfoSubscribe for NRPPa is accepted by amfd;
+    /// - lmfd's NonUeN2MessageTransfer is queued by amfd for the named gNB with the
+    ///   LMF's nfId as Routing ID;
+    /// - amfd's NonUeN2InfoNotify for the gNB's answer, which names no session, is
+    ///   handed by lmfd's N2 notify route to the exchange waiting on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_non_ue_nrppa_round_trip_through_real_amfd() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        let _serial = chain_lock().lock().await;
+        lmf_context_init(1024);
+        nextgcore_amfd::test_support::init_context();
+        let node = crate::site_config::NgRanNode {
+            mcc: "001".into(),
+            mnc: "01".into(),
+            gnb_id: 0x807,
+            bit_length: 22,
+        };
+
+        let sub = namf_client::build_non_ue_nrppa_subscription_request(
+            "lmf-807",
+            "http://127.0.0.1:7816",
+        );
+        let resp = nextgcore_amfd::namf_request_handler(sub).await;
+        assert_eq!(resp.status, 201, "{:?}", resp.http.content);
+
+        let (txn, pdu) = nrppa_downlink::build_trp_information(&[]).unwrap();
+        let _ = amf_self().read().unwrap().non_ue_nrppa_drain();
+        let resp = nextgcore_amfd::namf_request_handler(
+            namf_client::build_non_ue_nrppa_transfer_request(&node, "lmf-807", pdu.clone()),
+        )
+        .await;
+        assert_eq!(resp.status, 200, "{:?}", resp.http.content);
+        let queued = amf_self().read().unwrap().non_ue_nrppa_drain();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].routing_id, b"lmf-807");
+        assert_eq!(queued[0].target_gnb_ids, vec![0x807]);
+        assert_eq!(queued[0].nrppa_pdu, pdu);
+
+        // The gNB's answer, as amfd notifies it.
+        let answer = crate::nrppa_positioning::test_support::trp_information_response(
+            txn.0,
+            &[(1, 201, 0, 0, 0)],
+        );
+        let notify = nextgcore_amfd::namf_server::build_non_ue_nrppa_info_notify_request(
+            "/nlmf-loc/v1/notify/n2",
+            "nonuen2sub-x",
+            Some("lmf-807"),
+            Some(&serde_json::json!({"plmnId": {"mcc": "001", "mnc": "01"},
+                "gNbId": {"bitLength": 22, "gNBValue": "000807"}})),
+            &answer,
+        )
+        .unwrap();
+        let waiter = lmf_self().read().unwrap().nrppa_wait(
+            nextgcore_nrppa_gen::generated::ID_T_RP_INFORMATION_EXCHANGE,
+            txn.0,
+        );
+        assert_eq!(handle_n2_info_notify(&notify).await.status, 204);
+        let got = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("delivered")
+            .expect("not dropped");
+        assert_eq!(got, answer);
+
+        // An answer nobody waits for, with no session, is still unknown: 404.
+        assert_eq!(handle_n2_info_notify(&notify).await.status, 404);
     }
 
     /// Negative leg (WS-A §A9 step 3): amfd accepts the transfer but the UE stays
