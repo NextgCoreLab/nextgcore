@@ -1,5 +1,11 @@
 //! #514 stage 12: the rest of mmed's S1AP on the generated codec.
 //!
+//! #737: since the hand-written encoder was deleted (#560), the
+//! `*_with_schema_criticalities` tests below compare the production encoder
+//! with itself and check it decodes back; what pins each IE criticality is
+//! `criticality_oracle`, which checks every PDU a production builder encodes
+//! against the TS 36.413 §9.3 object sets.
+//!
 //! Oracle: the pre-change hand-written builders and parser
 //! (`test_codec::builder`, `decode_s1ap_pdu`: since #514 stage 13b the generated codec with an independently written domain mapping, and builders for messages mmed sends check that their output decodes back to their input). Golden: octets derived by
 //! hand from X.691 (APER) for TS 36.413 §9.1.8.14.
@@ -73,7 +79,7 @@ const ACTIONS: [OverloadAction; 7] = [
 ];
 
 #[test]
-fn the_configuration_update_answers_and_overload_match_the_hand_written_encoder() {
+fn the_configuration_update_answers_and_overload_round_trip_with_schema_criticalities() {
     assert_eq!(
         hex(&build_enb_configuration_update_acknowledge(&[]).unwrap()),
         hex(&builder::build_enb_configuration_update_acknowledge(
@@ -119,7 +125,7 @@ fn the_configuration_update_answers_and_overload_match_the_hand_written_encoder(
 }
 
 #[test]
-fn the_ue_context_modification_request_matches_the_hand_written_encoder() {
+fn the_ue_context_modification_request_round_trips_with_schema_criticalities() {
     let mut cases = 0;
     for (mme, enb) in [(0, 0), (1, 1), (0xFFFF_FFFF, 0xFF_FFFF)] {
         for mask in 0u8..32 {
@@ -179,7 +185,7 @@ fn areas() -> Vec<Option<WarningAreaList>> {
 }
 
 #[test]
-fn the_pws_requests_match_the_hand_written_encoder() {
+fn the_pws_requests_round_trip_with_schema_criticalities() {
     let mut cases = 0;
     for area in areas() {
         for mask in 0u8..32 {
