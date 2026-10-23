@@ -126,6 +126,27 @@ pub struct CellMeasurement {
     /// NR DL-TDOA reference-signal time difference vs the DL-PRS reference TRP
     /// (nanoseconds, SIGNED; the reference TRP itself reports 0). TS 37.355.
     pub rstd_ns: Option<f64>,
+    /// The DL-PRS ID of the reference TRP that `rstd_ns` is relative to, for an
+    /// LPP DL-TDOA measurement. Reports with different references are rebased
+    /// onto each other before they are solved together (#824 review).
+    pub rstd_reference: Option<u8>,
+    /// UE Rx–Tx time difference against this TRP (TS 38.215 §5.1.30), signed
+    /// nanoseconds: the UE half of a Multi-RTT measurement (LPP
+    /// `nr-UE-RxTxTimeDiff-r16`). Not an RTT on its own (#713).
+    pub ue_rx_tx_ns: Option<f64>,
+    /// gNB Rx–Tx time difference at this TRP (TS 38.215 §5.2.3), signed
+    /// nanoseconds: the gNB half of a Multi-RTT measurement (NRPPa
+    /// `gNB-RxTxTimeDiff`, TS 38.455). `RTT = ue_rx_tx_ns + gnb_rx_tx_ns`
+    /// (TS 38.305 §8.10).
+    pub gnb_rx_tx_ns: Option<f64>,
+    /// The DL-PRS ID (TS 37.355 `dl-PRS-ID-r16`, 0..255) the measurement was made
+    /// on, when it is an LPP NR measurement. `nr_cgi` keys by PCI when the UE gave
+    /// one; this is the fallback key `prs-<id>` a registry may hold instead (#714).
+    pub dl_prs_id: Option<u8>,
+    /// The measurement is of an E-UTRA cell (LPP `ECID-SignalMeasurementInformation`,
+    /// or an NRPPa E-CID report whose serving cell is an E-UTRA CGI). It decides
+    /// whether an E-CID fix is reported as `ECID` or `NR_ECID` (TS 29.572, #715).
+    pub eutra: bool,
 }
 
 /// Positioning QoS requirements
@@ -232,8 +253,42 @@ pub struct PositioningSession {
     /// the E-CID Measurement Initiation was relayed through, so an ERROR
     /// INDICATION for the gNB's report can go back the same way.
     pub nrppa_peer: Option<NrppaPeer>,
+    /// The measurement legs this session waits for (#715, #807). LPP always; the
+    /// NRPPa legs once they are solicited.
+    expected_legs: Vec<MeasurementLeg>,
+    /// The legs that have reported.
+    reported_legs: Vec<MeasurementLeg>,
+    /// Every measurement the reported legs carried, solved together.
+    accumulated: Vec<CellMeasurement>,
     /// One-shot completion channel to the awaiting DetermineLocation handler.
     sender: Option<tokio::sync::oneshot::Sender<PositioningOutcome>>,
+}
+
+/// One source of measurements for a positioning session (#715, #807).
+///
+/// A fix may need more than one: an NR E-CID fix takes the serving cell from the
+/// UE's LPP report and its timing term from the gNB's NRPPa E-CID measurement
+/// (#834 review), and a Multi-RTT range is the UE's Rx–Tx half (LPP) plus the
+/// gNB's (NRPPa Measurement, #807). Each leg arrives in its own notification, so the session collects
+/// them and solves once every expected leg has reported, or when the response-time
+/// budget runs out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeasurementLeg {
+    /// The UE's LPP `ProvideLocationInformation`.
+    Lpp,
+    /// The serving gNB's NRPPa E-CID measurement.
+    NrppaEcid,
+}
+
+/// What a leg's report did to its session.
+#[derive(Debug, Clone)]
+pub enum LegProgress {
+    /// Every expected leg is in; the session was solved and completed.
+    Completed(Option<LocationEstimate>),
+    /// The session waits for more legs.
+    Waiting,
+    /// No pending session has this request id.
+    NoSession,
 }
 
 /// Cloneable lookup view of a [`PositioningSession`] (the completion channel
@@ -805,6 +860,9 @@ impl LmfContext {
             request_id,
             created_at: std::time::Instant::now(),
             nrppa_peer: None,
+            expected_legs: vec![MeasurementLeg::Lpp],
+            reported_legs: Vec::new(),
+            accumulated: Vec::new(),
             sender: Some(tx),
         };
         if let Ok(mut s) = self.positioning_sessions.write() {
@@ -902,6 +960,132 @@ impl LmfContext {
                 session.nrppa_peer = Some(peer);
             }
         }
+    }
+
+    /// Add `leg` to the legs session `corr` waits for. Call it BEFORE the leg is
+    /// solicited, so its report cannot arrive first and find the session complete.
+    pub fn positioning_session_expect_leg(&self, corr: &str, leg: MeasurementLeg) {
+        if let Ok(mut sessions) = self.positioning_sessions.write() {
+            if let Some(s) = sessions.get_mut(corr) {
+                if !s.expected_legs.contains(&leg) {
+                    s.expected_legs.push(leg);
+                }
+            }
+        }
+    }
+
+    /// Stop waiting for `leg` (its solicitation failed). When every other leg has
+    /// already reported, the session is solved now.
+    pub fn positioning_session_withdraw_leg(&self, corr: &str, leg: MeasurementLeg) -> LegProgress {
+        let ready = {
+            let Ok(mut sessions) = self.positioning_sessions.write() else {
+                return LegProgress::NoSession;
+            };
+            let Some(s) = sessions.get_mut(corr) else {
+                return LegProgress::NoSession;
+            };
+            if s.reported_legs.contains(&leg) {
+                return LegProgress::Waiting;
+            }
+            s.expected_legs.retain(|l| *l != leg);
+            Self::all_legs_in(s).then(|| (s.request_id, s.accumulated.clone()))
+        };
+        match ready {
+            Some((request_id, cells)) => {
+                LegProgress::Completed(self.measurement_report(request_id, cells))
+            }
+            None => LegProgress::Waiting,
+        }
+    }
+
+    fn all_legs_in(s: &PositioningSession) -> bool {
+        !s.reported_legs.is_empty() && s.expected_legs.iter().all(|l| s.reported_legs.contains(l))
+    }
+
+    /// Report one leg's measurements for the session with measurement-store
+    /// `request_id` (#715, #807).
+    ///
+    /// The measurements are added to the session's. When every expected leg has
+    /// reported, all of them are solved together ([`Self::measurement_report`]) and
+    /// the session completes. Until then nothing is solved, so a leg that arrives
+    /// first (an NR E-CID LPP report with no timing term, a UE-only Multi-RTT
+    /// report) can no longer end the session as `SolverFailed` before the leg that
+    /// completes it arrives. A leg that reports twice adds its measurements again;
+    /// the solvers count each TRP once.
+    ///
+    /// With no pending session (a debug route, or a session that already ended)
+    /// the report is solved on its own, as before.
+    pub fn measurement_leg_report(
+        &self,
+        request_id: u64,
+        leg: MeasurementLeg,
+        cells: Vec<CellMeasurement>,
+    ) -> LegProgress {
+        let corr = self
+            .positioning_request_index
+            .read()
+            .ok()
+            .and_then(|r| r.get(&request_id).cloned());
+        let Some(corr) = corr else {
+            return LegProgress::NoSession;
+        };
+        let ready = {
+            let Ok(mut sessions) = self.positioning_sessions.write() else {
+                return LegProgress::NoSession;
+            };
+            let Some(s) = sessions.get_mut(&corr) else {
+                return LegProgress::NoSession;
+            };
+            s.accumulated.extend(cells);
+            if !s.reported_legs.contains(&leg) {
+                s.reported_legs.push(leg);
+            }
+            if Self::all_legs_in(s) {
+                Some(s.accumulated.clone())
+            } else {
+                log::info!(
+                    "Positioning session {corr}: {leg:?} reported; waiting for {:?}",
+                    s.expected_legs
+                        .iter()
+                        .filter(|l| !s.reported_legs.contains(l))
+                        .collect::<Vec<_>>()
+                );
+                None
+            }
+        };
+        match ready {
+            Some(cells) => LegProgress::Completed(self.measurement_report(request_id, cells)),
+            None => LegProgress::Waiting,
+        }
+    }
+
+    /// The response-time budget of session `corr` ran out (#807): solve with the
+    /// legs that did report and complete the session. `None`, and the session left
+    /// in place, when no leg reported at all, which the caller answers as
+    /// unreachable.
+    pub fn positioning_session_solve_now(&self, corr: &str) -> Option<PositioningOutcome> {
+        let (request_id, cells, missing) = {
+            let sessions = self.positioning_sessions.read().ok()?;
+            let s = sessions.get(corr)?;
+            if s.reported_legs.is_empty() {
+                return None;
+            }
+            let missing: Vec<MeasurementLeg> = s
+                .expected_legs
+                .iter()
+                .copied()
+                .filter(|l| !s.reported_legs.contains(l))
+                .collect();
+            (s.request_id, s.accumulated.clone(), missing)
+        };
+        log::info!(
+            "Positioning session {corr}: response-time budget expired without {missing:?}; \
+             solving with the legs that reported"
+        );
+        Some(match self.measurement_report(request_id, cells) {
+            Some(fix) => PositioningOutcome::Fix(fix),
+            None => PositioningOutcome::SolverFailed,
+        })
     }
 
     /// Look up the `lcsCorrelationId` of the newest session that used LPP
@@ -1090,7 +1274,8 @@ impl LmfContext {
 /// cells, this calls the real geometric solvers from [`crate::positioning`].
 /// Solver priority (highest confidence first):
 ///
-/// 1. **Multi-RTT** — if ≥ 3 cells report `rtt_ns` and are in the registry.
+/// 1. **Multi-RTT** — if ≥ 3 registry TRPs have a two-sided RTT: `rtt_ns`, or
+///    `ue_rx_tx_ns + gnb_rx_tx_ns` (TS 38.305 §8.10, #713).
 /// 2. **NR DL-TDOA** — if ≥ 3 cells report `rstd_ns` and are in the registry.
 /// 3. **AoA** — if ≥ 2 cells report `aoa` and are in the registry.
 /// 4. **ECID** — if the best-RSRP cell has `timing_advance` and is in the registry.
@@ -1129,15 +1314,8 @@ fn try_real_solve(
     measurements: &[CellMeasurement],
     registry: &TrpRegistry,
 ) -> Option<LocationEstimate> {
-    // --- Multi-RTT (≥3 cells with rtt_ns known to the registry) -------------
-    let rtt_obs: Vec<RttObservation> = measurements
-        .iter()
-        .filter(|m| m.rtt_ns.is_some() && registry.lookup(&m.nr_cgi).is_some())
-        .map(|m| RttObservation {
-            trp_id: m.nr_cgi.clone(),
-            range_m: rtt_ns_to_range_m(m.rtt_ns.unwrap() as f64),
-        })
-        .collect();
+    // --- Multi-RTT (≥3 TRPs with a two-sided RTT known to the registry) ------
+    let rtt_obs = multi_rtt_observations(measurements, registry);
 
     if rtt_obs.len() >= 3 {
         match solve_multi_rtt(registry, &rtt_obs) {
@@ -1156,37 +1334,26 @@ fn try_real_solve(
         }
     }
 
-    // --- NR DL-TDOA (≥3 cells with rstd_ns known to the registry) -----------
-    // RSTD is relative to the DL-PRS reference TRP (rstd_ns == 0). solve_tdoa
-    // expects observation[0] to be that reference, so order by |rstd| to put
-    // the zero-RSTD reference first.
-    let mut tdoa_obs: Vec<TdoaObservation> = measurements
-        .iter()
-        .filter(|m| m.rstd_ns.is_some() && registry.lookup(&m.nr_cgi).is_some())
-        .map(|m| TdoaObservation {
-            trp_id: m.nr_cgi.clone(),
-            tdoa_ns: m.rstd_ns.unwrap(),
-        })
-        .collect();
-    tdoa_obs.sort_by(|a, b| {
-        a.tdoa_ns
-            .abs()
-            .partial_cmp(&b.tdoa_ns.abs())
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // --- NR DL-TDOA (≥3 TRPs with an RSTD known to the registry) ------------
+    let (tdoa_obs, rebased) = tdoa_observations(measurements, registry);
 
     if tdoa_obs.len() >= 3 {
         match solve_tdoa(registry, &tdoa_obs) {
             Ok(est) => {
+                // Losing the reporting reference costs one TRP of redundancy; with
+                // three TRPs left the residual is zero by construction and says
+                // nothing about the error. The reported accuracy is doubled so a
+                // consumer does not read that as precision (#824 review).
+                let widen = if rebased { 2.0 } else { 1.0 };
                 return Some(LocationEstimate {
                     latitude: est.lat_deg,
                     longitude: est.lon_deg,
                     altitude: est.height_m,
-                    horizontal_accuracy: est.horizontal_uncertainty_m(),
+                    horizontal_accuracy: est.horizontal_uncertainty_m() * widen,
                     vertical_accuracy: None,
                     method_used: Some(est.method.as_spec_str().to_string()),
                     timestamp: 0,
-                })
+                });
             }
             Err(e) => log::warn!("DL-TDOA solve failed: {e}"),
         }
@@ -1232,7 +1399,16 @@ fn try_real_solve(
             altitude: est.height_m,
             horizontal_accuracy: est.horizontal_uncertainty_m(),
             vertical_accuracy: None,
-            method_used: Some(est.method.as_spec_str().to_string()),
+            // TS 29.572 PositioningMethod: E-CID of an E-UTRA serving cell is
+            // ECID, of an NR one NR_ECID (#715).
+            method_used: Some(
+                if serving.eutra {
+                    crate::nlmf::positioning_method::ECID
+                } else {
+                    est.method.as_spec_str()
+                }
+                .to_string(),
+            ),
             timestamp: 0,
         }),
         Err(e) => {
@@ -1240,6 +1416,272 @@ fn try_real_solve(
             None
         }
     }
+}
+
+/// The registry key of the TRP `m` was measured on (#714): `nr_cgi` when the
+/// registry holds it, else `prs-<dl_prs_id>`.
+///
+/// The LPP adapters key a measurement by PCI when the UE gave one, which is what
+/// a PCI-keyed registry needs. The DL-TDOA reference can only be keyed by its
+/// DL-PRS ID, because `DL-PRS-ID-Info-r16` has no PCI. So a registry keyed by
+/// DL-PRS ID would otherwise miss every neighbour that reported a PCI.
+fn resolve_trp(m: &CellMeasurement, registry: &TrpRegistry) -> Option<String> {
+    if registry.lookup(&m.nr_cgi).is_some() {
+        return Some(m.nr_cgi.clone());
+    }
+    let alias = format!("prs-{}", m.dl_prs_id?);
+    registry.lookup(&alias).map(|_| alias)
+}
+
+/// The DL-TDOA observations in `measurements`, with element 0 the reference
+/// that `solve_tdoa` expects, and whether a reported reference had to be
+/// replaced (#714).
+///
+/// Every RSTD in a report is relative to that report's DL-PRS reference TRP r
+/// (TS 38.215 §5.1.29): `rstd_i = t_i − t_r`. So for any TRP j of the same
+/// report, `t_i − t_j = rstd_i − rstd_j`, and a report can be re-expressed
+/// relative to any TRP the registry knows.
+///
+/// Measurements are grouped by `rstd_reference`, one group per reference TRP.
+/// An MO-LR can carry several LPP reports, and reports may use different
+/// references (#824 review). The group with the most known TRPs is the base.
+/// Another group joins it through a TRP both hold: the offset
+/// `rstd_base(s) − rstd_group(s)` moves the whole group onto the base's
+/// reference. A group that shares no known TRP with the base cannot be related
+/// to it, and is dropped and logged rather than mixed in. Finally every RSTD is
+/// rebased on element 0, the known TRP with the smallest |RSTD|: the reporting
+/// reference itself when the registry knows it.
+///
+/// Before #714 the entries were sorted by |RSTD| and the first one was used as
+/// the reference without rebasing. When the registry did not know the true
+/// reference, a neighbour with a non-zero RSTD became the reference while the
+/// other RSTDs stayed relative to the absent one, and the solver converged to a
+/// wrong fix and reported it as valid.
+///
+/// A TRP reported twice (e.g. once by PCI, once by DL-PRS ID) is used once.
+fn tdoa_observations(
+    measurements: &[CellMeasurement],
+    registry: &TrpRegistry,
+) -> (Vec<TdoaObservation>, bool) {
+    // One observation and the TRP identity it is joined on. Within a session a
+    // DL-PRS ID names exactly one TRP (TS 37.355 associates each `dl-PRS-ID` with a
+    // single TRP), while a PCI does not: a multi-TRP cell puts one PCI on several
+    // TRPs, and PCIs are reused across sites (#824 review). So two observations are
+    // of the same TRP when their DL-PRS IDs are equal, and only an observation
+    // without a DL-PRS ID falls back to the registry key.
+    struct Obs {
+        key: String,
+        prs: Option<u8>,
+        tdoa_ns: f64,
+    }
+    fn same(a: &Obs, b: &Obs) -> bool {
+        match (a.prs, b.prs) {
+            (Some(x), Some(y)) => x == y,
+            _ => a.key == b.key,
+        }
+    }
+
+    // A DL-PRS ID names one TRP across the reports of a session. A neighbour that
+    // resolves by its PCI therefore also tells which TRP its DL-PRS ID is, and a
+    // reference TRP, which only carries a DL-PRS ID, can be found through it.
+    let mut by_prs: HashMap<u8, String> = HashMap::new();
+    for m in measurements {
+        if let (Some(prs), Some(key)) = (m.dl_prs_id, resolve_trp(m, registry)) {
+            by_prs.entry(prs).or_insert(key);
+        }
+    }
+    let resolve = |m: &CellMeasurement| {
+        resolve_trp(m, registry).or_else(|| m.dl_prs_id.and_then(|p| by_prs.get(&p).cloned()))
+    };
+    // A registry key reached from two DL-PRS IDs is two TRPs under one key (a
+    // reused PCI, or one PCI across a multi-TRP cell). Its coordinate is right for
+    // at most one of them, and which one cannot be told, so the key is not used.
+    let mut prs_of_key: HashMap<String, Vec<u8>> = HashMap::new();
+    for m in measurements.iter().filter(|m| m.rstd_ns.is_some()) {
+        if let (Some(prs), Some(key)) = (m.dl_prs_id, resolve(m)) {
+            let ids = prs_of_key.entry(key).or_default();
+            if !ids.contains(&prs) {
+                ids.push(prs);
+            }
+        }
+    }
+    let ambiguous: Vec<String> = prs_of_key
+        .into_iter()
+        .filter(|(_, ids)| ids.len() > 1)
+        .map(|(key, ids)| {
+            log::warn!(
+                "DL-TDOA: registry key {key} is reached from DL-PRS IDs {ids:?}, i.e. from \
+                 more than one TRP; its RSTDs are not used (key the registry by prs-<id> for \
+                 multi-TRP cells or reused PCIs)"
+            );
+            key
+        })
+        .collect();
+
+    // Per reference, the known TRPs and their RSTDs in report order.
+    let mut groups: Vec<(Option<u8>, Vec<Obs>)> = Vec::new();
+    for m in measurements {
+        let (Some(rstd), Some(key)) = (m.rstd_ns, resolve(m)) else {
+            continue;
+        };
+        if !rstd.is_finite() || ambiguous.contains(&key) {
+            continue;
+        }
+        let g = match groups.iter().position(|(r, _)| *r == m.rstd_reference) {
+            Some(g) => g,
+            None => {
+                groups.push((m.rstd_reference, Vec::new()));
+                groups.len() - 1
+            }
+        };
+        let o = Obs {
+            key,
+            prs: m.dl_prs_id,
+            tdoa_ns: rstd,
+        };
+        if !groups[g].1.iter().any(|b| same(b, &o)) {
+            groups[g].1.push(o);
+        }
+    }
+    let Some(base_group) = (0..groups.len()).max_by_key(|&g| groups[g].1.len()) else {
+        return (Vec::new(), false);
+    };
+    let mut obs = groups.swap_remove(base_group).1;
+    // Join the other groups through a shared TRP, until no more join.
+    loop {
+        let joinable = groups.iter().enumerate().find_map(|(g, (_, group))| {
+            group.iter().find_map(|o| {
+                obs.iter()
+                    .find(|b| same(b, o))
+                    .map(|b| (g, b.tdoa_ns - o.tdoa_ns))
+            })
+        });
+        let Some((g, offset)) = joinable else {
+            break;
+        };
+        for o in groups.swap_remove(g).1 {
+            if !obs.iter().any(|b| same(b, &o)) {
+                obs.push(Obs {
+                    tdoa_ns: o.tdoa_ns + offset,
+                    ..o
+                });
+            }
+        }
+    }
+    for (reference, group) in &groups {
+        log::warn!(
+            "DL-TDOA: a report relative to DL-PRS reference {reference:?} shares no known TRP \
+             with the others; its {} RSTD(s) are dropped, not mixed in",
+            group.len()
+        );
+    }
+    // The solver keys by registry key, so each key may appear once. Two
+    // observations with one key and no DL-PRS ID between them are one TRP.
+    let mut out: Vec<TdoaObservation> = Vec::new();
+    for o in obs {
+        if !out.iter().any(|b| b.trp_id == o.key) {
+            out.push(TdoaObservation {
+                trp_id: o.key,
+                tdoa_ns: o.tdoa_ns,
+            });
+        }
+    }
+    let mut obs = out;
+    let Some(reference) = (0..obs.len()).min_by(|&a, &b| {
+        obs[a]
+            .tdoa_ns
+            .abs()
+            .partial_cmp(&obs[b].tdoa_ns.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }) else {
+        return (obs, false);
+    };
+    obs.swap(0, reference);
+    let base = obs[0].tdoa_ns;
+    let rebased = base != 0.0;
+    if rebased {
+        log::info!(
+            "DL-TDOA: the reporting reference TRP is not in the registry; RSTDs rebased \
+             on {} ({base} ns)",
+            obs[0].trp_id
+        );
+    }
+    for o in &mut obs {
+        o.tdoa_ns -= base;
+    }
+    (obs, rebased)
+}
+
+/// The Multi-RTT range observations in `measurements`, one per TRP the registry
+/// knows (#713).
+///
+/// TS 38.305 §8.10 defines the Multi-RTT observable as the sum of the two Rx–Tx
+/// time differences of one TRP: the UE's (TS 38.215 §5.1.30, measured on that
+/// TRP's DL-PRS and reported over LPP) and the gNB's (TS 38.215 §5.2.3, measured
+/// on the UE's UL SRS and reported over NRPPa). With `t` the propagation time,
+/// `UE Rx–Tx = t_UE-RX − t_UE-TX` and `gNB Rx–Tx = t_gNB-RX − t_gNB-TX`, so the
+/// sum is `2t` whatever the two clocks' offset, and the range is `c·RTT/2`.
+///
+/// Either half alone is NOT a range: it carries the unknown offset between the UE
+/// and the gNB clocks. So a TRP contributes only when:
+/// - a measurement carries a two-sided `rtt_ns` already, or
+/// - both halves are present for it, in one measurement or two with the same key.
+///
+/// UE halves without a gNB half are counted and logged, never ranged. A
+/// negative sum is a measurement error, not a distance, and that TRP is dropped.
+fn multi_rtt_observations(
+    measurements: &[CellMeasurement],
+    registry: &TrpRegistry,
+) -> Vec<RttObservation> {
+    // One pass: the first value of each quantity per TRP, in first-seen order.
+    #[derive(Default)]
+    struct Halves {
+        rtt_ns: Option<f64>,
+        ue: Option<f64>,
+        gnb: Option<f64>,
+    }
+    let mut order: Vec<String> = Vec::new();
+    let mut by_trp: HashMap<String, Halves> = HashMap::new();
+    for m in measurements {
+        if m.rtt_ns.is_none() && m.ue_rx_tx_ns.is_none() && m.gnb_rx_tx_ns.is_none() {
+            continue;
+        }
+        let Some(key) = resolve_trp(m, registry) else {
+            continue;
+        };
+        let h = by_trp.entry(key.clone()).or_insert_with(|| {
+            order.push(key);
+            Halves::default()
+        });
+        h.rtt_ns = h.rtt_ns.or(m.rtt_ns.map(|r| r as f64));
+        h.ue = h.ue.or(m.ue_rx_tx_ns);
+        h.gnb = h.gnb.or(m.gnb_rx_tx_ns);
+    }
+    let mut obs: Vec<RttObservation> = Vec::new();
+    let mut unpaired: Vec<&str> = Vec::new();
+    for key in &order {
+        let h = &by_trp[key];
+        let rtt_ns = h.rtt_ns.or_else(|| Some(h.ue? + h.gnb?));
+        match rtt_ns {
+            Some(rtt) if rtt.is_finite() && rtt >= 0.0 => obs.push(RttObservation {
+                trp_id: key.to_string(),
+                range_m: rtt_ns_to_range_m(rtt),
+            }),
+            Some(rtt) => log::warn!(
+                "Multi-RTT: TRP {key} has a negative or non-finite RTT ({rtt} ns); dropped"
+            ),
+            None => unpaired.push(key.as_str()),
+        }
+    }
+    if !unpaired.is_empty() {
+        log::warn!(
+            "Multi-RTT: {} TRP(s) ({}) have one Rx-Tx half but not the other; TS 38.305 \
+             §8.10 ranges on UE Rx-Tx + gNB Rx-Tx, so they are not ranged",
+            unpaired.len(),
+            unpaired.join(", ")
+        );
+    }
+    obs
 }
 
 /// Heuristic placeholder that returns a lat/lon 0.0 fix with a method-derived
@@ -1432,6 +1874,11 @@ mod tests {
             aoa: None,
             rtt_ns: None,
             rstd_ns: None,
+            ue_rx_tx_ns: None,
+            rstd_reference: None,
+            gnb_rx_tx_ns: None,
+            dl_prs_id: None,
+            eutra: false,
         }];
 
         // A7 (lmfd-11): with no TRP registry configured the report cannot be
@@ -1473,6 +1920,11 @@ mod tests {
                 aoa: Some(45.0),
                 rtt_ns: Some(1000),
                 rstd_ns: None,
+                ue_rx_tx_ns: None,
+                rstd_reference: None,
+                gnb_rx_tx_ns: None,
+                dl_prs_id: None,
+                eutra: false,
             },
             CellMeasurement {
                 nr_cgi: "001-01-0002-02".to_string(),
@@ -1482,6 +1934,11 @@ mod tests {
                 aoa: Some(120.0),
                 rtt_ns: Some(2000),
                 rstd_ns: None,
+                ue_rx_tx_ns: None,
+                rstd_reference: None,
+                gnb_rx_tx_ns: None,
+                dl_prs_id: None,
+                eutra: false,
             },
         ];
 
@@ -1599,6 +2056,11 @@ mod tests {
             aoa: None,
             rtt_ns: None,
             rstd_ns: None,
+            ue_rx_tx_ns: None,
+            rstd_reference: None,
+            gnb_rx_tx_ns: None,
+            dl_prs_id: None,
+            eutra: false,
         }];
         let loc = compute_location(&PositioningMethod::Ecid, &cells, &registry);
         assert!(loc.horizontal_accuracy > 50.0); // ECID is coarse
@@ -1618,6 +2080,11 @@ mod tests {
             aoa: None,
             rtt_ns: None,
             rstd_ns: None,
+            ue_rx_tx_ns: None,
+            rstd_reference: None,
+            gnb_rx_tx_ns: None,
+            dl_prs_id: None,
+            eutra: false,
         }];
         let loc = compute_location(&PositioningMethod::Gnss, &cells, &registry);
         assert!(loc.horizontal_accuracy <= 5.0); // GNSS is accurate
@@ -1740,6 +2207,11 @@ mod tests_real_solve {
                     aoa: None,
                     rtt_ns: Some(rtt_ns),
                     rstd_ns: None,
+                    ue_rx_tx_ns: None,
+                    rstd_reference: None,
+                    gnb_rx_tx_ns: None,
+                    dl_prs_id: None,
+                    eutra: false,
                 }
             })
             .collect();
@@ -1777,6 +2249,11 @@ mod tests_real_solve {
                     aoa: None,
                     rtt_ns: None,
                     rstd_ns: Some(rstd_ns),
+                    ue_rx_tx_ns: None,
+                    rstd_reference: None,
+                    gnb_rx_tx_ns: None,
+                    dl_prs_id: None,
+                    eutra: false,
                 }
             })
             .collect();
@@ -1814,6 +2291,11 @@ mod tests_real_solve {
             aoa: None,
             rtt_ns: None,
             rstd_ns: None,
+            ue_rx_tx_ns: None,
+            rstd_reference: None,
+            gnb_rx_tx_ns: None,
+            dl_prs_id: None,
+            eutra: false,
         }];
 
         let loc = compute_location(&PositioningMethod::Ecid, &cells, &registry);
@@ -1856,6 +2338,11 @@ mod tests_real_solve {
                     aoa: Some(azimuth_deg),
                     rtt_ns: None,
                     rstd_ns: None,
+                    ue_rx_tx_ns: None,
+                    rstd_reference: None,
+                    gnb_rx_tx_ns: None,
+                    dl_prs_id: None,
+                    eutra: false,
                 }
             })
             .collect();
@@ -1891,6 +2378,11 @@ mod tests_real_solve {
                     aoa: Some(azimuth_deg),
                     rtt_ns: Some(rtt_ns),
                     rstd_ns: None,
+                    ue_rx_tx_ns: None,
+                    rstd_reference: None,
+                    gnb_rx_tx_ns: None,
+                    dl_prs_id: None,
+                    eutra: false,
                 }
             })
             .collect();
@@ -1915,6 +2407,11 @@ mod tests_real_solve {
             aoa: None,
             rtt_ns: None,
             rstd_ns: None,
+            ue_rx_tx_ns: None,
+            rstd_reference: None,
+            gnb_rx_tx_ns: None,
+            dl_prs_id: None,
+            eutra: false,
         }];
         let loc = compute_location(&PositioningMethod::Ecid, &cells, &registry);
         // Placeholder: origin 0/0 with heuristic accuracy.
@@ -1956,6 +2453,11 @@ mod tests_real_solve {
             aoa: None,
             rtt_ns: None,
             rstd_ns: None,
+            ue_rx_tx_ns: None,
+            rstd_reference: None,
+            gnb_rx_tx_ns: None,
+            dl_prs_id: None,
+            eutra: false,
         }];
         ctx.measurement_report(req.request_id, cells).unwrap();
         match rx.try_recv() {
@@ -2124,6 +2626,11 @@ mod tests_real_solve {
             aoa: None,
             rtt_ns: None,
             rstd_ns: None,
+            ue_rx_tx_ns: None,
+            rstd_reference: None,
+            gnb_rx_tx_ns: None,
+            dl_prs_id: None,
+            eutra: false,
         }];
         // A7: no fabricated placeholder — an unsolvable report yields None.
         let no_fix = ctx.measurement_report(req.request_id, cells);
@@ -2153,5 +2660,734 @@ mod tests_real_solve {
         );
         ctx.set_nf_instance_id("lmf-test");
         assert_eq!(ctx.nf_instance_id().as_deref(), Some("lmf-test"));
+    }
+}
+
+/// #713: Multi-RTT ranges on UE Rx–Tx + gNB Rx–Tx (TS 38.305 §8.10), with the UE
+/// half decoded from LPP bytes through the real adapter.
+#[cfg(test)]
+mod tests_multi_rtt_two_sided {
+    use super::*;
+    use crate::positioning::{enu_to_geodetic, geodetic_to_enu, EnuPoint, SPEED_OF_LIGHT_M_S};
+
+    /// T_c in ns (TS 38.211 §4.1), written out independently of codec_glue.
+    const TC_NS: f64 = 1e9 / (480_000.0 * 4_096.0);
+    /// TS 38.133 §10.1.25.3: the k0 report value of a zero Rx–Tx difference.
+    const MIDPOINT: f64 = 985_024.0;
+    const ORIGIN: (f64, f64) = (51.4778, -0.0015);
+
+    /// Four TRPs on a 1 km square and a UE at (350, 600) m. The UE clock runs
+    /// `UE_CLOCK_OFFSET_NS` ahead of the gNBs', and the UE transmits its SRS
+    /// `SRS_AFTER_PRS_NS` after the gNBs transmit their PRS. So, with t_i the
+    /// one-way propagation time to TRP i:
+    /// - UE Rx–Tx_i = (t_i + offset) − gap
+    /// - gNB Rx–Tx_i = (gap − offset) + t_i
+    ///
+    /// Neither is a range; their sum is 2·t_i.
+    const TRPS: [(u16, f64, f64); 4] = [
+        (201, 0.0, 0.0),
+        (202, 1000.0, 0.0),
+        (203, 0.0, 1000.0),
+        (204, 1000.0, 1000.0),
+    ];
+    const UE: (f64, f64) = (350.0, 600.0);
+    const UE_CLOCK_OFFSET_NS: f64 = 3_000.0;
+    const SRS_AFTER_PRS_NS: f64 = 1_000.0;
+
+    fn origin() -> TrpCoord {
+        TrpCoord::new(ORIGIN.0, ORIGIN.1, 0.0)
+    }
+
+    fn registry() -> TrpRegistry {
+        TrpRegistry::from_entries(TRPS.iter().map(|(pci, e, n)| {
+            (
+                format!("pci-{pci}"),
+                enu_to_geodetic(
+                    EnuPoint {
+                        e: *e,
+                        n: *n,
+                        u: 0.0,
+                    },
+                    origin(),
+                ),
+            )
+        }))
+    }
+
+    fn propagation_ns(e: f64, n: f64) -> f64 {
+        (UE.0 - e).hypot(UE.1 - n) / SPEED_OF_LIGHT_M_S * 1e9
+    }
+
+    /// The UE's LPP report: each TRP's UE Rx–Tx as a k0 code, (T/T_c) + 985024.
+    fn ue_report() -> Vec<CellMeasurement> {
+        let cells: Vec<(u16, u32)> = TRPS
+            .iter()
+            .map(|(pci, e, n)| {
+                let ue_rx_tx = propagation_ns(*e, *n) + UE_CLOCK_OFFSET_NS - SRS_AFTER_PRS_NS;
+                (*pci, (ue_rx_tx / TC_NS + MIDPOINT).round() as u32)
+            })
+            .collect();
+        let bytes = crate::lpp_fixtures::multi_rtt_lpp(&cells, 3);
+        crate::codec_glue::decode_lpp_provide_report(&bytes)
+            .expect("decodes")
+            .1
+    }
+
+    /// The gNBs' halves, as their own measurements of the same TRPs.
+    fn gnb_report() -> Vec<CellMeasurement> {
+        TRPS.iter()
+            .map(|(pci, e, n)| CellMeasurement {
+                nr_cgi: format!("pci-{pci}"),
+                rsrp: None,
+                rsrq: None,
+                timing_advance: None,
+                aoa: None,
+                rtt_ns: None,
+                rstd_ns: None,
+                ue_rx_tx_ns: None,
+                rstd_reference: None,
+                gnb_rx_tx_ns: Some(propagation_ns(*e, *n) - UE_CLOCK_OFFSET_NS + SRS_AFTER_PRS_NS),
+                dl_prs_id: None,
+                eutra: false,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_ue_half_decodes_signed_with_the_ts_38_133_midpoint() {
+        let cells = ue_report();
+        assert_eq!(cells.len(), 4);
+        for (c, (pci, e, n)) in cells.iter().zip(TRPS) {
+            assert_eq!(c.nr_cgi, format!("pci-{pci}"));
+            assert_eq!(c.rtt_ns, None, "the UE half is not an RTT");
+            let want = propagation_ns(e, n) + UE_CLOCK_OFFSET_NS - SRS_AFTER_PRS_NS;
+            let got = c.ue_rx_tx_ns.expect("ue_rx_tx_ns");
+            assert!(
+                (got - want).abs() <= TC_NS / 2.0 + 1e-9,
+                "{pci}: {got} vs {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn ranges_are_ue_plus_gnb_rx_tx_over_two() {
+        let mut cells = ue_report();
+        cells.extend(gnb_report());
+        let obs = multi_rtt_observations(&cells, &registry());
+        assert_eq!(obs.len(), 4);
+        for (o, (pci, e, n)) in obs.iter().zip(TRPS) {
+            assert_eq!(o.trp_id, format!("pci-{pci}"));
+            let want = (UE.0 - e).hypot(UE.1 - n);
+            // One k0 step is T_c ≈ 0.51 ns, ±0.25 ns after rounding: ±0.04 m of range.
+            assert!(
+                (o.range_m - want).abs() < 0.05,
+                "{pci}: {} vs {want}",
+                o.range_m
+            );
+        }
+    }
+
+    /// Hand-computed geometry in, the UE position out.
+    #[test]
+    fn the_solver_recovers_the_ue_from_paired_halves() {
+        let mut cells = ue_report();
+        cells.extend(gnb_report());
+        let fix = try_real_solve(&cells, &registry()).expect("a Multi-RTT fix");
+        assert_eq!(fix.method_used.as_deref(), Some("MULTI-RTT"));
+        let p = geodetic_to_enu(TrpCoord::new(fix.latitude, fix.longitude, 0.0), origin());
+        let err = (p.e - UE.0).hypot(p.n - UE.1);
+        assert!(err < 0.1, "position error {err:.3} m");
+    }
+
+    /// The issue's scenario: a conformant UE alone. Its Rx–Tx carries the clock
+    /// offset and is not a range, so there is no Multi-RTT fix (before #713 these
+    /// decoded to ≈ 501 µs, ranges of ≈ 75 km).
+    #[test]
+    fn the_ue_half_alone_is_never_ranged() {
+        let cells = ue_report();
+        assert!(multi_rtt_observations(&cells, &registry()).is_empty());
+        assert!(try_real_solve(&cells, &registry()).is_none());
+    }
+
+    /// Two TRPs paired and two with the UE half only: two ranges, fewer than
+    /// trilateration needs, so no Multi-RTT fix.
+    #[test]
+    fn two_paired_and_two_ue_only_trps_give_no_fix() {
+        let mut cells = ue_report();
+        cells.extend(
+            gnb_report()
+                .into_iter()
+                .filter(|c| c.nr_cgi == "pci-201" || c.nr_cgi == "pci-202"),
+        );
+        let obs = multi_rtt_observations(&cells, &registry());
+        assert_eq!(
+            obs.iter().map(|o| o.trp_id.as_str()).collect::<Vec<_>>(),
+            ["pci-201", "pci-202"]
+        );
+        assert!(try_real_solve(&cells, &registry()).is_none());
+    }
+
+    /// A TRP reported many times is aggregated in one pass (#812 review: the
+    /// old per-key rescan was quadratic).
+    #[test]
+    fn repeated_reports_of_one_trp_count_once() {
+        let mut cells = Vec::new();
+        for _ in 0..1000 {
+            cells.extend(ue_report());
+        }
+        cells.extend(gnb_report());
+        assert_eq!(multi_rtt_observations(&cells, &registry()).len(), 4);
+    }
+
+    #[test]
+    fn the_gnb_half_alone_is_never_ranged() {
+        assert!(multi_rtt_observations(&gnb_report(), &registry()).is_empty());
+    }
+
+    #[test]
+    fn a_negative_round_trip_is_dropped_not_ranged() {
+        let mut cells = ue_report();
+        cells.extend(gnb_report());
+        cells
+            .iter_mut()
+            .filter(|c| c.nr_cgi == "pci-204" && c.gnb_rx_tx_ns.is_some())
+            .for_each(|c| c.gnb_rx_tx_ns = Some(-1e6));
+        let obs = multi_rtt_observations(&cells, &registry());
+        assert_eq!(
+            obs.iter().map(|o| o.trp_id.as_str()).collect::<Vec<_>>(),
+            ["pci-201", "pci-202", "pci-203"]
+        );
+    }
+}
+
+/// #714: DL-TDOA reference keying and RSTD rebasing, with the report decoded from
+/// LPP bytes through the real adapter.
+#[cfg(test)]
+mod tests_dl_tdoa_reference {
+    use super::*;
+    use crate::positioning::{enu_to_geodetic, geodetic_to_enu, EnuPoint, SPEED_OF_LIGHT_M_S};
+
+    /// T_c in ns (TS 38.211 §4.1) and the k0 RSTD of a zero difference
+    /// (TS 38.133 §10.1.23.3), written out independently of codec_glue.
+    const TC_NS: f64 = 1e9 / (480_000.0 * 4_096.0);
+    const MIDPOINT: f64 = 985_024.0;
+    const ORIGIN: (f64, f64) = (48.8566, 2.3522);
+    /// (DL-PRS ID, PCI, east, north): TRP 1 is the UE's DL-PRS reference.
+    const TRPS: [(u8, u16, f64, f64); 4] = [
+        (0, 1, 0.0, 0.0),
+        (1, 2, 1000.0, 0.0),
+        (2, 3, 0.0, 1000.0),
+        (3, 4, 1000.0, 1000.0),
+    ];
+    const UE: (f64, f64) = (350.0, 600.0);
+
+    fn origin() -> TrpCoord {
+        TrpCoord::new(ORIGIN.0, ORIGIN.1, 0.0)
+    }
+
+    fn registry(key: impl Fn(u8, u16) -> String) -> TrpRegistry {
+        TrpRegistry::from_entries(TRPS.iter().map(|(prs, pci, e, n)| {
+            (
+                key(*prs, *pci),
+                enu_to_geodetic(
+                    EnuPoint {
+                        e: *e,
+                        n: *n,
+                        u: 0.0,
+                    },
+                    origin(),
+                ),
+            )
+        }))
+    }
+
+    fn range(e: f64, n: f64) -> f64 {
+        (UE.0 - e).hypot(UE.1 - n)
+    }
+
+    /// What a UE reports: reference DL-PRS ID 0, and each neighbour by DL-PRS ID
+    /// and PCI with its RSTD as a k0 code. RSTD_i = (d_i − d_ref)/c.
+    fn report() -> Vec<CellMeasurement> {
+        let d_ref = range(TRPS[0].2, TRPS[0].3);
+        let neighbours: Vec<(u8, Option<u16>, u32)> = TRPS[1..]
+            .iter()
+            .map(|(prs, pci, e, n)| {
+                let rstd = (range(*e, *n) - d_ref) / SPEED_OF_LIGHT_M_S * 1e9;
+                (*prs, Some(*pci), (rstd / TC_NS + MIDPOINT).round() as u32)
+            })
+            .collect();
+        let bytes = crate::lpp_fixtures::dl_tdoa_lpp(TRPS[0].0, &neighbours, 9);
+        crate::codec_glue::decode_lpp_provide_report(&bytes)
+            .expect("decodes")
+            .1
+    }
+
+    fn error_m(fix: &LocationEstimate) -> f64 {
+        let p = geodetic_to_enu(TrpCoord::new(fix.latitude, fix.longitude, 0.0), origin());
+        (p.e - UE.0).hypot(p.n - UE.1)
+    }
+
+    /// The issue's scenario: a PCI-keyed registry. The reference arrives as
+    /// `prs-0` (it cannot carry a PCI) and is not found; the neighbours are.
+    /// Rebasing on one of them still gives the true position. Before #714 the
+    /// neighbour with the smallest |RSTD| became the reference unrebased, and
+    /// the fix was wrong.
+    #[test]
+    fn a_pci_keyed_registry_without_the_reference_still_gets_the_true_fix() {
+        let reg = registry(|_, pci| format!("pci-{pci}"));
+        let cells = report();
+        assert_eq!(cells[0].nr_cgi, "prs-0");
+        assert!(reg.lookup("prs-0").is_none());
+
+        let (obs, _) = tdoa_observations(&cells, &reg);
+        assert_eq!(obs.len(), 3);
+        assert_eq!(obs[0].tdoa_ns, 0.0, "element 0 is the rebased reference");
+        // Each rebased RSTD is the true range difference to the new reference.
+        let new_ref = TRPS
+            .iter()
+            .find(|t| format!("pci-{}", t.1) == obs[0].trp_id)
+            .unwrap();
+        for o in &obs[1..] {
+            let t = TRPS
+                .iter()
+                .find(|t| format!("pci-{}", t.1) == o.trp_id)
+                .unwrap();
+            let want = (range(t.2, t.3) - range(new_ref.2, new_ref.3)) / SPEED_OF_LIGHT_M_S * 1e9;
+            assert!(
+                (o.tdoa_ns - want).abs() < TC_NS,
+                "{}: {} vs {want}",
+                o.trp_id,
+                o.tdoa_ns
+            );
+        }
+
+        let fix = try_real_solve(&cells, &reg).expect("a DL-TDOA fix");
+        assert_eq!(fix.method_used.as_deref(), Some("DL_TDOA"));
+        assert!(error_m(&fix) < 1.0, "position error {:.3} m", error_m(&fix));
+    }
+
+    /// A registry keyed by DL-PRS ID: the neighbours reported a PCI, which the
+    /// registry does not hold, so they resolve through their DL-PRS ID.
+    #[test]
+    fn a_prs_keyed_registry_resolves_neighbours_that_reported_a_pci() {
+        let reg = registry(|prs, _| format!("prs-{prs}"));
+        let cells = report();
+        let (obs, _) = tdoa_observations(&cells, &reg);
+        assert_eq!(
+            obs.iter().map(|o| o.trp_id.as_str()).collect::<Vec<_>>(),
+            ["prs-0", "prs-1", "prs-2", "prs-3"]
+        );
+        let fix = try_real_solve(&cells, &reg).expect("a DL-TDOA fix");
+        assert!(error_m(&fix) < 1.0, "position error {:.3} m", error_m(&fix));
+    }
+
+    /// The reference is in the registry: it stays element 0, nothing moves.
+    #[test]
+    fn a_known_reference_is_used_as_reported() {
+        let reg = registry(|prs, pci| {
+            if prs == 0 {
+                "prs-0".into()
+            } else {
+                format!("pci-{pci}")
+            }
+        });
+        let cells = report();
+        let (obs, _) = tdoa_observations(&cells, &reg);
+        assert_eq!(obs[0].trp_id, "prs-0");
+        assert_eq!(obs.len(), 4);
+        for (o, c) in obs.iter().zip(&cells) {
+            assert_eq!(Some(o.tdoa_ns), c.rstd_ns, "{}", o.trp_id);
+        }
+        let fix = try_real_solve(&cells, &reg).expect("a DL-TDOA fix");
+        assert!(error_m(&fix) < 1.0, "position error {:.3} m", error_m(&fix));
+    }
+
+    /// A report relative to TRP `reference` (by index into TRPS), with the
+    /// neighbours `neighbours` reported by DL-PRS ID and PCI.
+    fn report_with(reference: usize, neighbours: &[usize], txn: u8) -> Vec<CellMeasurement> {
+        let (rp, _, re, rn) = TRPS[reference];
+        let d_ref = range(re, rn);
+        let list: Vec<(u8, Option<u16>, u32)> = neighbours
+            .iter()
+            .map(|&t| {
+                let (prs, pci, e, n) = TRPS[t];
+                let rstd = (range(e, n) - d_ref) / SPEED_OF_LIGHT_M_S * 1e9;
+                (prs, Some(pci), (rstd / TC_NS + MIDPOINT).round() as u32)
+            })
+            .collect();
+        let bytes = crate::lpp_fixtures::dl_tdoa_lpp(rp, &list, txn);
+        crate::codec_glue::decode_lpp_provide_report(&bytes)
+            .expect("decodes")
+            .1
+    }
+
+    /// A report relative to the TRP at `reference` (east, north; DL-PRS ID
+    /// `ref_prs`), with neighbours `(DL-PRS ID, PCI, east, north)`.
+    fn report_at(
+        ref_prs: u8,
+        reference: (f64, f64),
+        neighbours: &[(u8, u16, f64, f64)],
+        txn: u8,
+    ) -> Vec<CellMeasurement> {
+        let d_ref = range(reference.0, reference.1);
+        let list: Vec<(u8, Option<u16>, u32)> = neighbours
+            .iter()
+            .map(|&(prs, pci, e, n)| {
+                let rstd = (range(e, n) - d_ref) / SPEED_OF_LIGHT_M_S * 1e9;
+                (prs, Some(pci), (rstd / TC_NS + MIDPOINT).round() as u32)
+            })
+            .collect();
+        let bytes = crate::lpp_fixtures::dl_tdoa_lpp(ref_prs, &list, txn);
+        crate::codec_glue::decode_lpp_provide_report(&bytes)
+            .expect("decodes")
+            .1
+    }
+
+    /// #824 review MAJOR: a PCI does not identify a TRP. Report B's neighbour T5'
+    /// reuses PCI 2 (T2's) at another site. Joined on the registry key, B was
+    /// joined to A through "pci-2" and the fix came out 705 m off with nothing
+    /// flagging it. Joined on the DL-PRS ID, B shares no TRP with A, and pci-2,
+    /// reached from DL-PRS IDs 1 and 4, is not used: too few TRPs, no fix.
+    #[test]
+    fn a_reused_pci_is_not_a_shared_trp() {
+        let reg = registry(|_, pci| format!("pci-{pci}"));
+        let mut cells = report_at(
+            0,
+            (0.0, 0.0),
+            &[(1, 2, 1000.0, 0.0), (2, 3, 0.0, 1000.0)],
+            1,
+        );
+        cells.extend(report_at(
+            9,
+            (-500.0, 1500.0),
+            &[(4, 2, 2000.0, 300.0), (3, 4, 1000.0, 1000.0)],
+            2,
+        ));
+        let (obs, _) = tdoa_observations(&cells, &reg);
+        assert!(
+            obs.iter().all(|o| o.trp_id != "pci-2"),
+            "pci-2 is two TRPs here and must not be used: {:?}",
+            obs.iter().map(|o| &o.trp_id).collect::<Vec<_>>()
+        );
+        assert!(
+            try_real_solve(&cells, &reg).is_none(),
+            "no fix is the right answer; a wrong one is not"
+        );
+    }
+
+    /// The single-report form: one PCI on two TRPs of a multi-TRP cell (DL-PRS IDs
+    /// 1 and 4). The key is ambiguous and dropped; the other three still solve.
+    #[test]
+    fn one_pci_on_two_trps_of_one_report_is_dropped() {
+        let reg = registry(|prs, pci| {
+            if prs == 0 {
+                "prs-0".to_string()
+            } else {
+                format!("pci-{pci}")
+            }
+        });
+        let five = report_at(
+            0,
+            (0.0, 0.0),
+            &[
+                (1, 2, 1000.0, 0.0),
+                (4, 2, 2000.0, 300.0),
+                (2, 3, 0.0, 1000.0),
+                (3, 4, 1000.0, 1000.0),
+            ],
+            3,
+        );
+        let (obs, _) = tdoa_observations(&five, &reg);
+        let keys: Vec<&str> = obs.iter().map(|o| o.trp_id.as_str()).collect();
+        assert!(!keys.contains(&"pci-2"), "{keys:?}");
+        assert_eq!(keys.len(), 3, "prs-0, pci-3 and pci-4 remain: {keys:?}");
+        let fix = try_real_solve(&five, &reg).expect("three unambiguous TRPs solve");
+        assert!(error_m(&fix) < 1.0, "position error {:.3} m", error_m(&fix));
+    }
+
+    /// #824 review: an MO-LR carrying two LPP reports with different reference
+    /// TRPs. Report A is relative to TRP 1 (neighbours PCI 2, 3); report B is
+    /// relative to TRP 2 (neighbours PCI 1, 4). Mixed as one set they gave a fix
+    /// 69.65 m off. Joined through the TRPs they share, they give the UE.
+    #[test]
+    fn two_reports_with_different_references_are_joined_not_mixed() {
+        let reg = registry(|_, pci| format!("pci-{pci}"));
+        let mut cells = report_with(0, &[1, 2], 1);
+        cells.extend(report_with(1, &[0, 3], 2));
+        let (obs, _) = tdoa_observations(&cells, &reg);
+        assert_eq!(
+            obs.len(),
+            4,
+            "all four TRPs, B joined to A through PCI 1 / PCI 2"
+        );
+        let fix = try_real_solve(&cells, &reg).expect("a DL-TDOA fix");
+        assert!(error_m(&fix) < 1.0, "position error {:.3} m", error_m(&fix));
+    }
+
+    /// A report that shares no known TRP with the others cannot be related to
+    /// them: it is dropped, not mixed in.
+    #[test]
+    fn a_report_sharing_no_trp_is_dropped() {
+        // TRP 1 known as prs-0, TRPs 2..4 by PCI.
+        let reg = registry(|prs, pci| {
+            if prs == 0 {
+                "prs-0".into()
+            } else {
+                format!("pci-{pci}")
+            }
+        });
+        // A: reference TRP 1, neighbours TRP 2 and 3. B: one RSTD for TRP 4 relative
+        // to a reference (DL-PRS 7) no other report names, so it shares no TRP with A.
+        let mut cells = report_with(0, &[1, 2], 1);
+        cells.push(CellMeasurement {
+            nr_cgi: "pci-4".into(),
+            rsrp: None,
+            rsrq: None,
+            timing_advance: None,
+            aoa: None,
+            rtt_ns: None,
+            rstd_ns: Some(1234.0),
+            ue_rx_tx_ns: None,
+            rstd_reference: Some(7),
+            gnb_rx_tx_ns: None,
+            dl_prs_id: Some(3),
+            eutra: false,
+        });
+        let (obs, rebased) = tdoa_observations(&cells, &reg);
+        assert_eq!(
+            obs.iter().map(|o| o.trp_id.as_str()).collect::<Vec<_>>(),
+            ["prs-0", "pci-2", "pci-3"]
+        );
+        assert!(!rebased);
+        let fix = try_real_solve(&cells, &reg).expect("A alone still solves");
+        assert!(error_m(&fix) < 1.0, "position error {:.3} m", error_m(&fix));
+    }
+
+    /// Losing the reporting reference doubles the reported accuracy (#824 review).
+    #[test]
+    fn a_rebased_fix_reports_a_wider_accuracy() {
+        let known = registry(|prs, pci| {
+            if prs == 0 {
+                "prs-0".into()
+            } else {
+                format!("pci-{pci}")
+            }
+        });
+        let unknown = registry(|_, pci| format!("pci-{pci}"));
+        // Three TRPs in both cases, so only the rebase differs.
+        let cells = report_with(0, &[1, 2], 1);
+        let mut unknown_cells = report_with(0, &[1, 2, 3], 1);
+        unknown_cells.retain(|c| c.nr_cgi != "pci-2");
+        let (_, rebased) = tdoa_observations(&cells, &known);
+        assert!(!rebased);
+        let (obs, rebased) = tdoa_observations(&unknown_cells, &unknown);
+        assert!(rebased);
+        assert_eq!(obs.len(), 2, "too few to solve after the rebase");
+        let a = try_real_solve(&report_with(0, &[1, 2, 3], 1), &known).unwrap();
+        let b = try_real_solve(&report_with(0, &[1, 2, 3], 1), &unknown).unwrap();
+        let est = solve_tdoa(
+            &unknown,
+            &tdoa_observations(&report_with(0, &[1, 2, 3], 1), &unknown).0,
+        )
+        .unwrap();
+        assert!((b.horizontal_accuracy - 2.0 * est.horizontal_uncertainty_m()).abs() < 1e-9);
+        assert!(a.horizontal_accuracy.is_finite());
+    }
+
+    /// TS 38.133 §10.1.23.3: an open-ended RSTD report value is not decoded.
+    #[test]
+    fn an_open_ended_rstd_is_not_decoded() {
+        let bytes = crate::lpp_fixtures::dl_tdoa_lpp(
+            0,
+            &[
+                (1, Some(2), 0),
+                (2, Some(3), 1_970_049),
+                (3, Some(4), 985_024),
+            ],
+            1,
+        );
+        let (_, cells) = crate::codec_glue::decode_lpp_provide_report(&bytes).unwrap();
+        let rstd: Vec<Option<f64>> = cells.iter().map(|c| c.rstd_ns).collect();
+        assert_eq!(rstd, [Some(0.0), None, None, Some(0.0)]);
+    }
+
+    /// Two entries for one TRP (once by PCI, once by DL-PRS ID) count once.
+    #[test]
+    fn a_trp_reported_twice_is_used_once() {
+        let reg = registry(|_, pci| format!("pci-{pci}"));
+        let mut cells = report();
+        let dup = cells[1].clone();
+        cells.push(dup);
+        assert_eq!(tdoa_observations(&cells, &reg).0.len(), 3);
+    }
+}
+
+/// #715: an E-CID fix names the RAT it was measured on (TS 29.572).
+#[cfg(test)]
+mod tests_ecid_label {
+    use super::*;
+
+    fn serving(eutra: bool) -> CellMeasurement {
+        CellMeasurement {
+            nr_cgi: "cell-1".into(),
+            rsrp: Some(-80),
+            rsrq: None,
+            timing_advance: Some(10),
+            aoa: None,
+            rtt_ns: None,
+            rstd_ns: None,
+            ue_rx_tx_ns: None,
+            gnb_rx_tx_ns: None,
+            rstd_reference: None,
+            dl_prs_id: None,
+            eutra,
+        }
+    }
+
+    #[test]
+    fn an_eutra_serving_cell_is_ecid_and_an_nr_one_nr_ecid() {
+        let reg = TrpRegistry::from_entries([("cell-1".to_string(), TrpCoord::new(1.0, 2.0, 0.0))]);
+        let label = |eutra| try_real_solve(&[serving(eutra)], &reg).unwrap().method_used;
+        assert_eq!(label(true).as_deref(), Some("ECID"));
+        assert_eq!(label(false).as_deref(), Some("NR_ECID"));
+    }
+}
+
+/// #715 review MAJOR: the legs of one session are solved together, once all of them
+/// are in or when the budget runs out, and the first one no longer decides alone.
+#[cfg(test)]
+mod tests_session_legs {
+    use super::*;
+
+    fn ctx() -> LmfContext {
+        let mut c = LmfContext::new();
+        c.init(16);
+        c.set_cell_coord("pci-77", TrpCoord::new(40.1, -74.5, 0.0));
+        c
+    }
+
+    /// The UE's NR E-CID report: the serving cell and its SS-RSRP, no timing term.
+    fn lpp_leg() -> Vec<CellMeasurement> {
+        vec![cell(Some(-80), None)]
+    }
+
+    /// The gNB's E-CID measurement of the same cell, with its timing advance.
+    fn nrppa_leg() -> Vec<CellMeasurement> {
+        vec![cell(None, Some(100))]
+    }
+
+    fn cell(rsrp: Option<i16>, ta: Option<u32>) -> CellMeasurement {
+        CellMeasurement {
+            nr_cgi: "pci-77".to_string(),
+            rsrp,
+            rsrq: None,
+            timing_advance: ta,
+            aoa: None,
+            rtt_ns: None,
+            rstd_ns: None,
+            rstd_reference: None,
+            ue_rx_tx_ns: None,
+            gnb_rx_tx_ns: None,
+            dl_prs_id: None,
+            eutra: false,
+        }
+    }
+
+    fn session(
+        c: &LmfContext,
+    ) -> (
+        u64,
+        String,
+        tokio::sync::oneshot::Receiver<PositioningOutcome>,
+    ) {
+        let req = c
+            .measurement_request(
+                0,
+                PositioningMethod::Ecid,
+                None,
+                None,
+                PositioningQos::BestEffort,
+            )
+            .unwrap();
+        let (corr, rx) = c.positioning_session_register(Some("imsi-1".into()), 3, req.request_id);
+        c.positioning_session_expect_leg(&corr, MeasurementLeg::NrppaEcid);
+        (req.request_id, corr, rx)
+    }
+
+    /// The race the review describes: the LPP report arrives first. It must wait
+    /// for the NRPPa leg, and the two together give an NR_ECID fix.
+    #[test]
+    fn the_lpp_leg_first_waits_for_the_nrppa_leg_and_both_solve() {
+        let c = ctx();
+        let (request_id, _corr, mut rx) = session(&c);
+        assert!(matches!(
+            c.measurement_leg_report(request_id, MeasurementLeg::Lpp, lpp_leg()),
+            LegProgress::Waiting
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "the LPP leg alone must not end the session"
+        );
+        let LegProgress::Completed(Some(fix)) =
+            c.measurement_leg_report(request_id, MeasurementLeg::NrppaEcid, nrppa_leg())
+        else {
+            panic!("both legs in: solved");
+        };
+        assert_eq!(fix.method_used.as_deref(), Some("NR_ECID"));
+        assert!(matches!(rx.try_recv(), Ok(PositioningOutcome::Fix(_))));
+    }
+
+    /// The other order gives the same answer.
+    #[test]
+    fn the_nrppa_leg_first_waits_for_the_lpp_leg() {
+        let c = ctx();
+        let (request_id, _corr, _rx) = session(&c);
+        assert!(matches!(
+            c.measurement_leg_report(request_id, MeasurementLeg::NrppaEcid, nrppa_leg()),
+            LegProgress::Waiting
+        ));
+        assert!(matches!(
+            c.measurement_leg_report(request_id, MeasurementLeg::Lpp, lpp_leg()),
+            LegProgress::Completed(Some(_))
+        ));
+    }
+
+    /// A gNB that never answers: when the budget runs out, the legs that did
+    /// report are solved. Here the LPP leg alone has no timing term: no fix.
+    #[test]
+    fn budget_expiry_solves_with_the_legs_that_reported() {
+        let c = ctx();
+        let (request_id, corr, _rx) = session(&c);
+        c.measurement_leg_report(request_id, MeasurementLeg::Lpp, lpp_leg());
+        assert!(matches!(
+            c.positioning_session_solve_now(&corr),
+            Some(PositioningOutcome::SolverFailed)
+        ));
+        assert_eq!(c.positioning_session_count(), 0, "the session is complete");
+    }
+
+    /// Nothing reported at all: no outcome, which the caller answers 504.
+    #[test]
+    fn budget_expiry_with_no_leg_is_no_outcome() {
+        let c = ctx();
+        let (_request_id, corr, _rx) = session(&c);
+        assert!(c.positioning_session_solve_now(&corr).is_none());
+        assert_eq!(c.positioning_session_count(), 1);
+    }
+
+    /// A leg whose solicitation failed is withdrawn: the session is solved as soon
+    /// as the others are in, with no wait for a gNB that was never asked.
+    #[test]
+    fn a_withdrawn_leg_is_not_waited_for() {
+        let c = ctx();
+        let (request_id, corr, _rx) = session(&c);
+        assert!(matches!(
+            c.measurement_leg_report(request_id, MeasurementLeg::Lpp, lpp_leg()),
+            LegProgress::Waiting
+        ));
+        assert!(matches!(
+            c.positioning_session_withdraw_leg(&corr, MeasurementLeg::NrppaEcid),
+            LegProgress::Completed(None)
+        ));
     }
 }

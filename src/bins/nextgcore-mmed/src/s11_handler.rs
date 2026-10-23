@@ -150,7 +150,12 @@ pub struct BearerContextCreated {
 #[derive(Debug, Clone, Default)]
 pub struct ModifyBearerResponseData {
     pub cause: u8,
+    /// Bearer Contexts modified (instance 0, Table 7.2.8-1), each with its own
+    /// Cause (#730).
     pub bearer_contexts: Vec<BearerContextModified>,
+    /// Bearer Contexts marked for removal (instance 1): the SGW does not hold
+    /// these bearers, so they were not switched (#730).
+    pub bearers_marked_for_removal: Vec<u8>,
     /// Change Reporting Action (TS 29.274 Table 7.2.8-1, §8.61), when the PDN
     /// GW starts or stops location change reporting here (#593).
     pub change_reporting_action: Option<u8>,
@@ -168,7 +173,32 @@ pub struct ChangeNotificationResponseData {
 #[derive(Debug, Clone, Default)]
 pub struct BearerContextModified {
     pub ebi: u8,
-    pub cause: u8,
+    /// The bearer's own Cause; `None` when the context carries none.
+    pub cause: Option<u8>,
+}
+
+/// The EBI and Cause of a grouped Bearer Context IE's `value`.
+fn parse_bearer_context_ebi_cause(value: &[u8]) -> Option<BearerContextModified> {
+    let mut bearer = BearerContextModified::default();
+    let mut have_ebi = false;
+    let mut offset = 0;
+    while offset < value.len() {
+        let Some((ie_t, length, _, inner)) = parse_ie_header(&value[offset..]) else {
+            break;
+        };
+        match ie_t {
+            ie_type::EBI => {
+                if let Some(ebi) = parse_ebi(inner) {
+                    bearer.ebi = ebi;
+                    have_ebi = true;
+                }
+            }
+            ie_type::CAUSE => bearer.cause = parse_cause(inner),
+            _ => {}
+        }
+        offset += 4 + length as usize;
+    }
+    have_ebi.then_some(bearer)
 }
 
 /// Parsed Delete Session Response
@@ -286,14 +316,27 @@ pub fn dispatch_triggered(raw: &[u8], msg_type: u8, sequence_number: u32, peer: 
                     "S11 Modify Bearer Response from {peer} (seq={sequence_number}) cause={}",
                     data.cause
                 );
+                // #730: a Path Switch Request (or a completed S1 handover)
+                // waits on this response (TS 23.401 §5.5.1.1.2 step 5).
+                if let Some(pending) =
+                    crate::gtp_path::take_pending_handover_modification(sequence_number)
+                {
+                    crate::handover_switch::on_modify_bearer_response(
+                        crate::context::mme_self(),
+                        pending,
+                        &data,
+                    );
+                }
                 // #584: an E-UTRAN initiated E-RAB modification waits on this
                 // response for its confirm (TS 23.401 §5.4.7 step 5).
                 if let Some(pending) =
                     crate::gtp_path::take_pending_erab_modification(sequence_number)
                 {
-                    if let Some(send) =
-                        crate::s1ap_handler::erab_modification_confirm(pending, data.cause)
-                    {
+                    if let Some(send) = crate::s1ap_handler::erab_modification_confirm(
+                        crate::context::mme_self(),
+                        pending,
+                        &data,
+                    ) {
                         crate::s1ap_path::s1ap_send(send);
                     }
                 }
@@ -1683,13 +1726,21 @@ pub fn handle_modify_bearer_response(data: &[u8]) -> S11Result<ModifyBearerRespo
     let mut offset = 0;
 
     while offset < payload.len() {
-        if let Some((ie_t, length, _, value)) = parse_ie_header(&payload[offset..]) {
+        if let Some((ie_t, length, instance, value)) = parse_ie_header(&payload[offset..]) {
             if ie_t == ie_type::CAUSE {
                 if let Some(cause) = parse_cause(value) {
                     result.cause = cause;
                 }
             } else if ie_t == ie_type::CHANGE_REPORTING_ACTION {
                 result.change_reporting_action = value.first().copied();
+            } else if ie_t == ie_type::BEARER_CONTEXT {
+                if let Some(bc) = parse_bearer_context_ebi_cause(value) {
+                    match instance {
+                        0 => result.bearer_contexts.push(bc),
+                        1 => result.bearers_marked_for_removal.push(bc.ebi),
+                        _ => {}
+                    }
+                }
             }
             offset += 4 + length as usize;
         } else {
