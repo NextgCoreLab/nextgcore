@@ -744,11 +744,11 @@ pub struct NgapServer {
     #[cfg(test)]
     forced_amf_ue_ngap_id: Option<u64>,
     /// Test seam: when `Some`, every NGAP PDU `send_to_association` would put on the
-    /// wire is recorded here as `(association_id, pdu)` instead, and the send
-    /// succeeds. Lets a handler test assert what amfd SENDS, and to whom, without a
+    /// wire is recorded here as `(association_id, sctp_stream_id, pdu)` instead, and
+    /// the send succeeds. Lets a handler test assert what amfd SENDS, and to whom, without a
     /// live SCTP association. `None` (the default) keeps the real transport.
     #[cfg(test)]
-    sent_ngap: Option<Vec<(u64, Vec<u8>)>>,
+    sent_ngap: Option<Vec<(u64, u16, Vec<u8>)>>,
     /// Test seam: the next this-many NGAP sends fail as an SCTP send error would,
     /// so a test can drive a handler's send-failure branch (#760).
     #[cfg(test)]
@@ -9359,6 +9359,34 @@ impl NgapServer {
             .with_mut(required.amf_ue_ngap_id, |s| s.amf_ue.advance_next_hop())
             .expect("the UE was resolved at the top of this handler");
 
+        // #743: each PDU session goes to the target with ITS OWN S-NSSAI (TS 38.413
+        // §9.2.3.4, PDU Session Resource Setup Request Item (HO)), from the session
+        // record written at establishment (`record_amf_session`). It used to be the UE's
+        // FIRST allowed S-NSSAI for every session, so a UE with sessions on two slices
+        // handed the second one over under the wrong slice. The first allowed S-NSSAI
+        // stays the fallback for a session the AMF has no record of. One context read,
+        // released before anything else touches the context.
+        let session_slices: HashMap<u8, crate::context::SNssai> = {
+            let ctx = crate::context::amf_self();
+            let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+            required
+                .pdu_session_list
+                .iter()
+                .filter_map(|p| {
+                    let sess = guard.sess_find_by_psi(required.amf_ue_ngap_id, p.pdu_session_id);
+                    if sess.is_none() {
+                        log::warn!(
+                            "HandoverRequired for UE {}: no session record for PSI {}; its \
+                             S-NSSAI falls back to the first allowed one",
+                            required.amf_ue_ngap_id,
+                            p.pdu_session_id
+                        );
+                    }
+                    sess.map(|sess| (p.pdu_session_id, sess.s_nssai))
+                })
+                .collect()
+        };
+
         let ho_request = nextgcore_ngap::types::HandoverRequest {
             amf_ue_ngap_id: required.amf_ue_ngap_id,
             handover_type: required.handover_type,
@@ -9378,10 +9406,9 @@ impl NgapServer {
                 .map(
                     |p| nextgcore_ngap::types::PduSessionResourceSetupItemHoReq {
                         pdu_session_id: p.pdu_session_id,
-                        s_nssai: state
-                            .amf_ue
-                            .allowed_nssai
-                            .first()
+                        s_nssai: session_slices
+                            .get(&p.pdu_session_id)
+                            .or_else(|| state.amf_ue.allowed_nssai.first())
                             .map(|s| nextgcore_ngap::types::SNssai {
                                 sst: s.sst,
                                 sd: s.sd.map(|sd| sd.to_be_bytes()[1..4].try_into().unwrap()),
@@ -12859,15 +12886,16 @@ impl NgapServer {
             self.fail_next_sends -= 1;
             return Err(anyhow::anyhow!("SCTP send error: injected by a test"));
         }
+        // Use stream 0 for NGAP signaling
+        let stream_id = 0u16;
         #[cfg(test)]
         if let Some(sent) = self.sent_ngap.as_mut() {
-            sent.push((association_id, data.to_vec()));
+            sent.push((association_id, stream_id, data.to_vec()));
             return Ok(());
         }
 
-        // Use stream 0 for NGAP signaling
         self.transport
-            .send(association_id, 0, data)
+            .send(association_id, stream_id, data)
             .await
             .map_err(|e| anyhow::anyhow!("SCTP send error: {e}"))
     }
@@ -14608,15 +14636,6 @@ impl NgapServerHandle {
     pub async fn num_gnbs(&self) -> usize {
         let server = self.inner.lock().await;
         server.num_gnbs().await
-    }
-
-    pub async fn send(&self, association_id: u64, stream_id: u16, data: &[u8]) -> Result<()> {
-        let mut server = self.inner.lock().await;
-        server
-            .transport
-            .send(association_id, stream_id, data)
-            .await
-            .map_err(|e| anyhow::anyhow!("SCTP send error: {e}"))
     }
 }
 
@@ -19975,6 +19994,125 @@ mod tests {
         );
     }
 
+    /// **#743.** The HANDOVER REQUEST gives each PDU session its OWN S-NSSAI (TS 38.413
+    /// §9.2.3.4), from the session record, not the UE's first allowed S-NSSAI for all of
+    /// them. A UE with sessions on SST 1 and on SST 2 / SD 010203 is handed over; the
+    /// HandoverRequest captured on the target's association is decoded.
+    ///
+    /// REVERT-VERIFIED: with the old first-allowed S-NSSAI, PSI 2 goes out as SST 1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handover_request_carries_each_sessions_own_slice() {
+        use nextgcore_ngap_gen::generated as g;
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut server = capturing_ngap_server().await;
+        let (source, target, target_gnb) = (97_431u64, 97_432u64, 0x7_4302u32);
+        seed_gnb_session(&server, source).await;
+        seed_gnb_session(&server, target).await;
+        server
+            .sessions
+            .write()
+            .await
+            .get_mut(&target)
+            .expect("seeded")
+            .gnb
+            .gnb_id = target_gnb;
+        let ue = 7_743_001u64;
+        let mut state = UeNasContext::new(ue, 9, source, false);
+        state.registered = true;
+        state.amf_ue.allowed_nssai = vec![
+            SNssai { sst: 1, sd: None },
+            SNssai {
+                sst: 2,
+                sd: Some(0x01_0203),
+            },
+        ];
+        server.ue_auth_state.insert(ue, state);
+        record_amf_session(ue, 1, "ref-743-1", 1, None);
+        record_amf_session(ue, 2, "ref-743-2", 2, Some(0x01_0203));
+
+        let plmn = plmn_id_to_ngap_bytes(&PlmnId::new("001", "01"));
+        let required = nextgcore_ngap::builder::build_handover_required(
+            &nextgcore_ngap::types::HandoverRequired {
+                amf_ue_ngap_id: ue,
+                ran_ue_ngap_id: 9,
+                handover_type: nextgcore_ngap::types::HandoverType::Intra5gs,
+                cause: nextgcore_ngap::types::Cause::RadioNetwork(
+                    nextgcore_ngap::types::CauseRadioNetwork::HandoverDesirableForRadioReason,
+                ),
+                target_id: nextgcore_ngap::types::TargetId::TargetRanNodeId {
+                    global_ran_node_id: nextgcore_ngap::types::GlobalRanNodeId::GlobalGnbId {
+                        plmn_identity: plmn,
+                        gnb_id: target_gnb,
+                        gnb_id_len: 22,
+                    },
+                    selected_tai: nextgcore_ngap::types::TaiListItem {
+                        tai_plmn: plmn,
+                        tai_tac: [0x00, 0x00, 0x01],
+                    },
+                },
+                pdu_session_list: [1u8, 2]
+                    .iter()
+                    .map(|&psi| nextgcore_ngap::types::PduSessionResourceItemHoRqd {
+                        pdu_session_id: psi,
+                        transfer: vec![0x00],
+                    })
+                    .collect(),
+                source_to_target_container: vec![0xAB; 4],
+                direct_forwarding_path_availability: None,
+            },
+        )
+        .expect("build HandoverRequired");
+        server
+            .handle_handover_required(source, &required)
+            .await
+            .expect("handled");
+
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(sent[0].0, target, "the HandoverRequest goes to the target");
+        let g::NGAP_PDU::InitiatingMessage(m) =
+            nextgcore_ngap_gen::decode(&sent[0].1).expect("decodes")
+        else {
+            panic!("not an initiating message");
+        };
+        let g::InitiatingMessageValue::Id_HandoverResourceAllocation(request) = m.value else {
+            panic!("not a HandoverRequest");
+        };
+        let slices: Vec<(u8, Vec<u8>, Option<Vec<u8>>)> = request
+            .protocol_i_es
+            .0
+            .into_iter()
+            .find_map(|ie| match ie.value {
+                g::HandoverRequestProtocolIEs_EntryValue::Id_PDUSessionResourceSetupListHOReq(
+                    list,
+                ) => Some(list.0),
+                _ => None,
+            })
+            .expect("the setup list")
+            .into_iter()
+            .map(|item| {
+                (
+                    item.pdu_session_id.0,
+                    item.s_nssai.sst.0,
+                    item.s_nssai.sd.map(|sd| sd.0),
+                )
+            })
+            .collect();
+        assert_eq!(
+            slices,
+            vec![
+                (1, vec![1], None),
+                (2, vec![2], Some(vec![0x01, 0x02, 0x03]))
+            ],
+            "each session under its own S-NSSAI"
+        );
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap();
+        for sess in guard.sess_list_for_ue(ue) {
+            guard.sess_remove(sess.id);
+        }
+    }
+
     /// The `(amf_ue_ngap_id, ran_ue_ngap_id)` a DOWNLINK RAN STATUS TRANSFER carries,
     /// decoded with the generated codec; `None` for any other PDU.
     fn decoded_downlink_ran_status_ids(pdu: &[u8]) -> Option<(u64, u32)> {
@@ -20868,8 +21006,16 @@ mod tests {
         server
     }
 
-    /// Everything sent since the last call, in send order.
+    /// Everything sent since the last call, in send order, as `(association_id, pdu)`.
     fn take_sent_ngap(server: &mut NgapServer) -> Vec<(u64, Vec<u8>)> {
+        take_sent_ngap_with_streams(server)
+            .into_iter()
+            .map(|(assoc, _stream, pdu)| (assoc, pdu))
+            .collect()
+    }
+
+    /// [`take_sent_ngap`] with the SCTP stream id each PDU went out on.
+    fn take_sent_ngap_with_streams(server: &mut NgapServer) -> Vec<(u64, u16, Vec<u8>)> {
         std::mem::take(server.sent_ngap.as_mut().expect("capture enabled"))
     }
 
@@ -20922,7 +21068,21 @@ mod tests {
             .expect("handled");
 
         assert!(report.source_release_sent, "the captured send succeeds");
-        let sent = take_sent_ngap(&mut server);
+        let with_streams = take_sent_ngap_with_streams(&mut server);
+        // The capture records the SCTP stream the transport would be given. Stream 0
+        // for this UE-associated PDU is today's behaviour, not the target: TS 38.412 §7
+        // reserves separate streams for UE-associated signalling (#813).
+        assert_eq!(
+            with_streams
+                .iter()
+                .map(|(_, stream, _)| *stream)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+        let sent: Vec<(u64, Vec<u8>)> = with_streams
+            .into_iter()
+            .map(|(assoc, _, pdu)| (assoc, pdu))
+            .collect();
         assert_eq!(sent.len(), 1, "exactly the source release: {sent:?}");
         assert_eq!(sent[0].0, source, "sent to the SOURCE association");
         assert_eq!(
