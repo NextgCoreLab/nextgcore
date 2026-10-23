@@ -532,12 +532,13 @@ fn handle_dereg_notify_callback(
         return context_not_found(supi);
     };
     if ue.uecm_dereg_token.as_deref().is_none() || ue.uecm_dereg_token.as_deref() != token {
+        // The UE's CURRENT token is never logged: with it, anyone who reads the
+        // log and reaches the SBI could forge a notification that acts.
         log::info!(
-            "[{supi}] dereg-notify ({reason_str}) names UECM registration {} but the UE's \
-             current one is {}: it concerns a registration this AMF no longer holds; \
+            "[{supi}] dereg-notify ({reason_str}) names UECM registration {} which is not \
+             the UE's current one: it concerns a registration this AMF no longer holds; \
              acknowledged, nothing torn down",
-            token.unwrap_or("<untokened>"),
-            ue.uecm_dereg_token.as_deref().unwrap_or("<none>")
+            token.unwrap_or("<untokened>")
         );
         return SbiResponse::no_content();
     }

@@ -9,7 +9,20 @@ metadata:
     app.kubernetes.io/component: control-plane
     {{- include "nextgcore.labels" . | nindent 4 }}
 spec:
+  {{- /*
+  #753: the AMF has ONE pinned nfInstanceId (the NRF and UDM identity), so it
+  runs as ONE pod. Two pods under one id merge into one AMF at the NRF and the
+  UDM. An overlapping rollout lets the old pod's NFDeregister remove the new
+  pod's profile. Scale with a StatefulSet that gives each ordinal its own id.
+  */}}
+  {{- if gt (int .Values.amf.replicas) 1 }}
+  {{- fail "amf.replicas > 1 is not supported: every AMF pod would share one nfInstanceId (#753). Run one AMF per release, or a StatefulSet with a per-ordinal NEXTGCORE_AMF_INSTANCE_ID." }}
+  {{- end }}
   replicas: {{ .Values.amf.replicas }}
+  # Recreate, not RollingUpdate: the new pod must not register while the old pod,
+  # holding the same nfInstanceId, still shuts down and NFDeregisters it (#753).
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: amf

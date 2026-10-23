@@ -31,6 +31,10 @@ metadata:
     app.kubernetes.io/part-of: nextgcore
 spec:
   replicas: 1
+  # #753: one pinned nfInstanceId, so one pod and no overlapping rollout. The old
+  # pod's NFDeregister would remove the new pod's NRF profile.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: amf

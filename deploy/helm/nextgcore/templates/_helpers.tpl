@@ -210,14 +210,22 @@ livenessProbe:
 
 {{/*
 The AMF's nfInstanceId (#753): .Values.amf.nfInstanceId, or a UUID derived from
-the release namespace and name. Stable across pod restarts and upgrades, unlike
-uuidv4.
+the cluster (global.siteId, else the kube-system namespace UID), the release
+namespace and its name. Stable across pod restarts and upgrades, unlike uuidv4.
+Offline rendering (`helm template`) has no cluster to look up: set
+global.siteId or amf.nfInstanceId there, or the id differs from the one a
+`helm install` would render.
 */}}
 {{- define "nextgcore.amfInstanceId" -}}
 {{- if .Values.amf.nfInstanceId -}}
 {{- .Values.amf.nfInstanceId -}}
 {{- else -}}
-{{- $h := sha256sum (printf "%s/%s/amf" .Release.Namespace .Release.Name) -}}
+{{- /* Cluster-unique salt: the kube-system namespace UID (stable for the
+cluster's life), or global.siteId. Two clusters installed with the same
+namespace and release name then still get different AMF ids. */ -}}
+{{- $ks := lookup "v1" "Namespace" "" "kube-system" -}}
+{{- $site := .Values.global.siteId | default (dig "metadata" "uid" "" $ks) -}}
+{{- $h := sha256sum (printf "%s/%s/%s/amf" $site .Release.Namespace .Release.Name) -}}
 {{- printf "%s-%s-4%s-8%s-%s" (substr 0 8 $h) (substr 8 12 $h) (substr 13 16 $h) (substr 17 20 $h) (substr 20 32 $h) -}}
 {{- end -}}
 {{- end -}}

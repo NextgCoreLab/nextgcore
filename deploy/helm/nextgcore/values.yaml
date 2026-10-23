@@ -5,6 +5,10 @@
 # k8s/monitoring/. Rationale in specs/fix-helm-chart-control-plane.md.
 
 global:
+  # A site/cluster identifier salted into derived NF instance ids (#753). Leave
+  # empty to use the kube-system namespace UID; set it for `helm template`, or
+  # when several clusters share one UDM/NRF.
+  siteId: ""
   image:
     registry: ""
     pullPolicy: IfNotPresent
@@ -108,8 +112,11 @@ nrf:
 amf:
   enabled: true
   replicas: 1
-  # The AMF's nfInstanceId (#753). Empty: a UUID derived from the release, which is
-  # stable across restarts. Pin explicitly when an NRF trust store keys on it.
+  # The AMF's nfInstanceId (#753). Empty: a UUID derived from the cluster
+  # (global.siteId, else the kube-system namespace UID) and the release, stable
+  # across restarts. Pin it explicitly when an NRF trust store keys on it.
+  # One AMF per release: replicas > 1 fails the render, because every pod would
+  # share this id. To scale, use a StatefulSet with a per-ordinal id.
   nfInstanceId: ""
   image:
     repository: nextgcore-rust/amf
