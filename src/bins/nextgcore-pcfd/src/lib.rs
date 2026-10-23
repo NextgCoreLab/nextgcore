@@ -7,7 +7,6 @@
 //!   real builders (e.g. [`sbi_path::build_pcf_binding_body`]) in-process
 //!   for strict-peer tests instead of hand-rolled lenient mocks.
 
-pub mod am_sm;
 /// Daemon entrypoint + SBI request handlers, moved verbatim from the former
 /// `main.rs` for Wave-6 H1 lib-targetization; the binary is now a thin wrapper
 /// around [`app::run`]. Peer NF crates drive `pcf_sbi_request_handler` (and the
@@ -34,9 +33,7 @@ pub mod npcf_handler;
 pub mod nudr_handler;
 pub mod pcf_sm;
 pub mod sbi_path;
-pub mod sbi_response;
 pub mod sm_policy_build;
-pub mod sm_sm;
 pub mod timer;
 pub mod ue_policy; // Rel-16: URSP rule provisioning (TS 23.503)
 

@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# Build the NextG workload images (12 for PROFILE=5g) and push them to ECR.
+# Build the NextG workload images (12 for PROFILE=5g, 9 for epc) and push them to ECR.
 #
 # Replaces the `kind load docker-image` step in nextgcore/k8s/deploy.sh, which
 # has no equivalent on EKS - without a registry every pod lands in
 # ErrImagePull.
 #
-# Uses the prebuilt binaries committed in the repo:
-#   nextgcore/binaries/nextgcore-*d       (17 NF binaries, 10 used here)
-#   nextgsim/docker/binaries/nr-gnb,nr-ue
+# Packages prebuilt binaries. They are NOT committed (both binaries/ dirs are
+# gitignored); build them first (README "Prerequisites"):
+#   nextgcore/binaries/nextgcore-*         (the workspace builds 28 NF daemons
+#                                          plus webui; 5g packages 10, epc 7)
+#   nextgsim/docker/binaries/nr-gnb,nr-ue  (5g)
+#   nextgsim/binaries/lte-enb,lte-ue       (epc)
 #
 # Images are tagged by the git SHA of the repository they are built from, not
 # :latest. See lib/image-tag.sh for why a mutable tag makes the deploy a silent
@@ -80,6 +83,48 @@ for repo_tag in "nextgcore:${CORE_TAG}" "nextgsim:${SIM_TAG}"; do
   fi
 done
 
+# --- binaries --------------------------------------------------------------
+
+# Fail early and loudly if the binaries are missing, rather than producing
+# images that crash on start. This runs before any AWS call (#716): with
+# expired credentials the STS check below would otherwise fail first and hide
+# which binaries are missing. They are build artifacts and no longer tracked in
+# git, so a fresh clone has none until you build.
+MISSING=()
+# Bare binary names, for profile_build_hint (it prints only their steps).
+MISSING_CORE_BINS=()
+MISSING_SIM_BINS=()
+for entry in "${CORE_NFS[@]}"; do
+  bin="${entry#*:}"
+  [[ -f "${CORE_BIN_DIR}/${bin}" ]] && continue
+  MISSING_CORE_BINS+=("${bin}")
+  if [[ "${CORE_BIN_DIR}" == "${DEFAULT_CORE_BIN_DIR}" ]]; then
+    MISSING+=("nextgcore/binaries/${bin}")
+  else
+    MISSING+=("${CORE_BIN_DIR}/${bin}")
+  fi
+done
+for entry in "${PROFILE_SIM_IMAGES[@]}"; do
+  IFS=: read -r _node _dockerfile ctx bins <<<"${entry}"
+  IFS=, read -r -a _bins <<<"${bins}"
+  for bin in "${_bins[@]}"; do
+    if [[ "${ctx}" == . ]]; then
+      [[ -f "${SIM_DIR}/binaries/${bin}" ]] && continue
+      MISSING+=("nextgsim/binaries/${bin}")
+    else
+      [[ -f "${SIM_DIR}/${ctx}/binaries/${bin}" ]] && continue
+      MISSING+=("nextgsim/${ctx}/binaries/${bin}")
+    fi
+    MISSING_SIM_BINS+=("${bin}")
+  done
+done
+if (( ${#MISSING[@]} )); then
+  printf 'missing prebuilt binaries:\n'; printf '  %s\n' "${MISSING[@]}"
+  printf 'build them with (PROFILE=%s):\n' "${PROFILE_NAME}"
+  profile_build_hint
+  die "no binaries to package"
+fi
+
 # --- preflight -------------------------------------------------------------
 
 for c in aws docker; do
@@ -95,39 +140,6 @@ REGISTRY="${REGISTRY:-${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com}"
 [[ "${PROFILE_NAME}" == 5g ]] || log "profile:  ${PROFILE_NAME} (cargo features: ${PROFILE_CARGO_FEATURES:-none})"
 log "registry: ${REGISTRY}"
 log "prefix:   ${REPO_PREFIX}    core tag: ${CORE_TAG}    gnb/ue tag: ${SIM_TAG}"
-
-# Fail early and loudly if the binaries are missing, rather than producing
-# images that crash on start. They are build artifacts and no longer tracked in
-# git, so a fresh clone has none until you build.
-MISSING=()
-for entry in "${CORE_NFS[@]}"; do
-  bin="${entry#*:}"
-  if [[ "${CORE_BIN_DIR}" == "${DEFAULT_CORE_BIN_DIR}" ]]; then
-    [[ -f "${CORE_BIN_DIR}/${bin}" ]] || MISSING+=("nextgcore/binaries/${bin}")
-  else
-    [[ -f "${CORE_BIN_DIR}/${bin}" ]] || MISSING+=("${CORE_BIN_DIR}/${bin}")
-  fi
-done
-for entry in "${PROFILE_SIM_IMAGES[@]}"; do
-  IFS=: read -r _node _dockerfile ctx bins <<<"${entry}"
-  IFS=, read -r -a _bins <<<"${bins}"
-  for bin in "${_bins[@]}"; do
-    if [[ "${ctx}" == . ]]; then
-      [[ -f "${SIM_DIR}/binaries/${bin}" ]] || MISSING+=("nextgsim/binaries/${bin}")
-    else
-      [[ -f "${SIM_DIR}/${ctx}/binaries/${bin}" ]] || MISSING+=("nextgsim/${ctx}/binaries/${bin}")
-    fi
-  done
-done
-if (( ${#MISSING[@]} )); then
-  printf 'missing prebuilt binaries:\n'; printf '  %s\n' "${MISSING[@]}"
-  printf 'build them with:\n'
-  printf '  cd %s/src && cargo build --release && \\\n' "${CORE_DIR}"
-  printf '    cp target/release/nextgcore-*d ../binaries/\n'
-  printf '  cd %s && cargo build --release && \\\n' "${SIM_DIR}"
-  printf '    cp target/release/nr-gnb target/release/nr-ue docker/binaries/\n'
-  die "no binaries to package"
-fi
 
 # --- ECR login + repos -----------------------------------------------------
 

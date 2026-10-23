@@ -2855,6 +2855,7 @@ name = "nextgcore-nas"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "log",
  "nextgcore-core",
  "nextgcore-crypt",
  "proptest",
@@ -3370,6 +3371,7 @@ dependencies = [
  "nextgcore-ngap-gen",
  "nextgcore-nr-rrc-gen",
  "nextgcore-sbi",
+ "proptest",
  "serde",
  "serde_json",
  "serde_yaml",
