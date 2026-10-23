@@ -39,6 +39,13 @@
 //! length-scope over/under-runs, set spare bits, reserved part types and
 //! unknown component identifiers.
 //!
+//! That strictness stops at the message's non-imperative part: optional IEs
+//! after the mandatory ones are walked per TS 24.501 D.8.6 (#763). An unknown
+//! IE that is not comprehension required is ignored (D.8.6.1), a repeated IE
+//! keeps its first instance (D.8.6.3), and a syntactically incorrect optional
+//! IE is not present (D.8.7.1). Do not "restore" a `finish()` there: it would
+//! reject conformant messages from a later-release peer.
+//!
 //! NOTE on the S-NSSAI *traffic descriptor*: TS 24.526 V18.5.0 Table 5.2.1
 //! (specs/24526-i50.txt:2466-2498) defines NO "S-NSSAI type" traffic
 //! descriptor component identifier ("All other values are spare") — S-NSSAI
@@ -168,6 +175,8 @@ impl<'a> Reader<'a> {
 /// defines that IEI. The format follows TS 24.007 §11.2.4: an IEI with bit 8
 /// set is type 1/2 (the IEI octet is the whole IE, value empty); an IEI in
 /// 70H-7FH is type 6 (TLV-E, 2-octet length); anything else is type 4 (TLV).
+/// The 70H-7FH rule matches every IE TS 24.501 defines today: each optional IE
+/// in that band in the clause 8 and Annex D tables is TLV-E, none is TLV.
 ///
 /// - An IE the message does not define is ignored (D.8.6.1), unless its IEI
 ///   has bits 8 to 5 set to 0000, which is "comprehension required": that is
