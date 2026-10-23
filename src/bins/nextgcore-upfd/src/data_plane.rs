@@ -1575,6 +1575,25 @@ impl DataPlaneUrr {
         usage
     }
 
+    /// Why this URR must report now, or `None` (#821): a crossed threshold or quota
+    /// (the flag `record()` raises), else an elapsed Measurement Period with usage
+    /// counted (PERIO).
+    pub fn report_due(&self) -> Option<UrrReportReason> {
+        // #80: an exhausted quota is reported as a QUOTA report, not as a threshold
+        // report -- that is what tells the CP function the subscriber is being DROPPED.
+        if self.threshold_exceeded.load(Ordering::SeqCst) {
+            return Some(self.report_reason());
+        }
+        // #724: the instant is COPIED out (`last_report_time()` returns the value), so
+        // no guard on it is alive across `take_usage`, which writes it.
+        let period_elapsed = self.measurement_period_secs().is_some_and(|period| {
+            self.last_report_time()
+                .is_some_and(|last| last.elapsed().as_secs() >= period as u64)
+        });
+        (period_elapsed && self.acc_total_bytes.load(Ordering::Acquire) > 0)
+            .then_some(UrrReportReason::Periodic)
+    }
+
     /// A non-resetting read of the usage counted since the last report.
     pub fn usage(&self) -> UrrUsage {
         UrrUsage {
@@ -2302,6 +2321,10 @@ pub struct DataPlaneStats {
     /// Packets dropped because the inner IP packet exceeded the TUN MTU and
     /// could not be safely forwarded (no fragmentation here).
     pub oversize_packets: AtomicU64,
+    /// Usage reports whose taken usage was handed back to the URR because the report
+    /// was not delivered (send failure, or abandoned after N1). See
+    /// [`DataPlane::restore_urr_usage`].
+    pub urr_reports_restored: AtomicU64,
 }
 
 /// How often the forwarding loop logs [`DataPlaneStats::summary`] (#581).
@@ -2326,7 +2349,7 @@ impl DataPlaneStats {
     /// UPF's `/metrics` body. Counters, not gauges: they only ever grow for the life
     /// of the process. Read on every scrape, so they are as live as the atomics.
     pub fn render_prometheus(&self) -> String {
-        let families: [(&str, &str, &AtomicU64); 7] = [
+        let families: [(&str, &str, &AtomicU64); 8] = [
             (
                 "upf_dataplane_ul_packets_total",
                 "Uplink G-PDUs decapsulated and written to the TUN (N3/S5-U to N6/SGi)",
@@ -2362,6 +2385,11 @@ impl DataPlaneStats {
                 "Packets dropped for exceeding the TUN MTU",
                 &self.oversize_packets,
             ),
+            (
+                "upf_dataplane_urr_reports_restored_total",
+                "Usage reports not delivered (send failure or N1 abandon) whose usage was restored to the URR for the next report; one abandoned after N1 may have been received, so it is then reported twice",
+                &self.urr_reports_restored,
+            ),
         ];
         let mut out = String::new();
         for (name, help, v) in families {
@@ -2384,6 +2412,7 @@ impl Default for DataPlaneStats {
             dropped_packets: AtomicU64::new(0),
             spoofed_packets: AtomicU64::new(0),
             oversize_packets: AtomicU64::new(0),
+            urr_reports_restored: AtomicU64::new(0),
         }
     }
 }
@@ -3485,95 +3514,144 @@ impl DataPlane {
         self.sessions.get_all_session_stats()
     }
 
-    /// Snapshot one URR's live counters for an event-driven report (#80).
+    /// Take one URR's usage for an event-driven quota report (#80, #821).
     ///
-    /// Read-only and **non-resetting**, unlike [`Self::collect_urr_reports`]: the harvest
-    /// owns the reset, and resetting here would make the volume this report carries
-    /// vanish from the next one, under-reporting the usage the quota was measuring.
-    ///
-    /// A UR-SEQN is still allocated, because it is per REPORT rather than per reset
-    /// (TS 29.244 §8.2.60) — two reports carrying overlapping volume are exactly what a
-    /// sequence number lets the CP function reconcile.
-    pub fn urr_report_snapshot(&self, upf_seid: u64, urr_id: u32) -> Option<UrrReportEntry> {
-        let seid_map = self.sessions.seid_map.read().unwrap();
-        let session = seid_map.get(&upf_seid)?;
-        let urrs = session.urrs.read().unwrap();
-        let urr = urrs.get(&urr_id)?;
+    /// Resetting, like every usage report (TS 29.244 §5.2.2.3.1: "upon generating a
+    /// usage report ... reset its ongoing measurement counts"). This used to be a
+    /// non-resetting snapshot, so the next PERIO or threshold report re-sent the same
+    /// bytes and a CP function summing reports billed them twice. Taking also clears
+    /// the URR's report flag, so the harvest does not re-report an exhaustion this
+    /// report already announced; the quota LATCH is untouched (only `set_quotas`
+    /// clears it).
+    pub fn urr_report_take(&self, upf_seid: u64, urr_id: u32) -> Option<UrrReportEntry> {
+        let session = self.sessions.find_by_seid(upf_seid)?;
+        let urr = session.urrs.read().unwrap().get(&urr_id).cloned()?;
+        let reason = urr.report_reason();
+        let usage = urr.take_usage();
         Some(UrrReportEntry::new(
-            session,
+            &session,
             urr_id,
             urr.next_ur_seqn(),
-            urr.usage(),
-            urr.report_reason(),
+            usage,
+            reason,
         ))
     }
 
-    /// Harvest the usage reports that are due: every URR whose threshold/quota was
-    /// crossed, and every URR whose Measurement Period has elapsed with usage counted.
-    /// Each report's usage is TAKEN from its URR atomically ([`DataPlaneUrr::take_usage`],
-    /// #771), so traffic racing the harvest is neither lost nor counted twice.
+    /// Take the usage of a session's URRs unconditionally -- every URR, or the ones in
+    /// `only` -- for a final (TERMR) or queried (IMMER) report (#821).
     ///
-    /// No lock is held while the URRs are examined (#780 review m1): the session and
-    /// URR `Arc`s are snapshotted and every map guard is released first, so a slow
-    /// harvest can never stall Session Establishment, the forwarding path or
-    /// `/metrics` behind `seid_map` again -- which is how #724's hang spread.
-    pub fn collect_urr_reports(&self) -> Vec<UrrReportEntry> {
-        let sessions: Vec<Arc<DataPlaneSession>> = self
-            .sessions
+    /// Taking rather than reading is what stops these reports and a racing harvest
+    /// from both carrying the same bytes. The returned reports are labelled
+    /// `trigger` here only as a placeholder: the caller encodes the TERMR/IMMER
+    /// trigger it is building.
+    pub fn take_urr_reports(&self, upf_seid: u64, only: Option<&[u32]>) -> Vec<UrrReportEntry> {
+        let Some(session) = self.sessions.find_by_seid(upf_seid) else {
+            return Vec::new();
+        };
+        let urrs: Vec<(u32, Arc<DataPlaneUrr>)> = session
+            .urrs
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| only.is_none_or(|ids| ids.contains(id)))
+            .map(|(id, urr)| (*id, Arc::clone(urr)))
+            .collect();
+        urrs.into_iter()
+            .map(|(urr_id, urr)| {
+                let reason = urr.report_reason();
+                let usage = urr.take_usage();
+                UrrReportEntry::new(&session, urr_id, urr.next_ur_seqn(), usage, reason)
+            })
+            .collect()
+    }
+
+    /// The sessions with at least one URR report due now, as `(upf_seid, smf_seid)`
+    /// -- detection only, nothing is taken (#821).
+    ///
+    /// The harvest is split in two so that the TAKE can happen inside the PFCP server
+    /// while it holds the session in its table ([`crate::pfcp_path::PfcpServer::send_due_urr_reports`]):
+    /// a Session Deletion then either runs first and its TERMR carries all the usage,
+    /// or runs after the harvest's report is on the wire. Taking here, as the harvest
+    /// used to, let a deletion slip between the take and the send; the send then
+    /// failed ("session not found") and the taken bytes were in no report at all.
+    pub fn due_urr_sessions(&self) -> Vec<(u64, u64)> {
+        self.session_snapshot()
+            .into_iter()
+            .filter(|s| {
+                s.urrs
+                    .read()
+                    .unwrap()
+                    .values()
+                    .any(|urr| urr.report_due().is_some())
+            })
+            .map(|s| (s.upf_seid, s.smf_seid))
+            .collect()
+    }
+
+    /// Take every report due on one session (#821): the URRs whose threshold/quota was
+    /// crossed and those whose Measurement Period elapsed with usage counted. Each
+    /// URR's usage is TAKEN atomically ([`DataPlaneUrr::take_usage`], #771), and the
+    /// due condition is re-evaluated at the take, so a URR another report just took
+    /// is not re-reported.
+    ///
+    /// No map lock is held while URRs are examined (#780 review m1).
+    pub fn take_due_urr_reports(&self, upf_seid: u64) -> Vec<UrrReportEntry> {
+        let Some(session) = self.sessions.find_by_seid(upf_seid) else {
+            return Vec::new();
+        };
+        Self::take_due_on(&session)
+    }
+
+    fn take_due_on(session: &DataPlaneSession) -> Vec<UrrReportEntry> {
+        let urrs: Vec<(u32, Arc<DataPlaneUrr>)> = session
+            .urrs
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(id, urr)| (*id, Arc::clone(urr)))
+            .collect();
+        urrs.into_iter()
+            .filter_map(|(urr_id, urr)| {
+                let trigger = urr.report_due()?;
+                let usage = urr.take_usage();
+                Some(UrrReportEntry::new(
+                    session,
+                    urr_id,
+                    urr.next_ur_seqn(),
+                    usage,
+                    trigger,
+                ))
+            })
+            .collect()
+    }
+
+    fn session_snapshot(&self) -> Vec<Arc<DataPlaneSession>> {
+        self.sessions
             .seid_map
             .read()
             .unwrap()
             .values()
             .cloned()
-            .collect();
+            .collect()
+    }
 
-        let mut reports = Vec::new();
-        for session in sessions {
-            let urrs: Vec<(u32, Arc<DataPlaneUrr>)> = session
-                .urrs
-                .read()
-                .unwrap()
-                .iter()
-                .map(|(id, urr)| (*id, Arc::clone(urr)))
-                .collect();
-            for (urr_id, urr) in urrs {
-                // #80: the report says why it exists. An exhausted quota is reported as
-                // a QUOTA report, not as a threshold report -- that distinction is what
-                // tells the CP function the subscriber is currently being DROPPED
-                // rather than merely approaching a limit.
-                let trigger = if urr.threshold_exceeded.load(Ordering::SeqCst) {
-                    urr.report_reason()
-                } else if urr.measurement_period_secs().is_some_and(|period| {
-                    // #724: the instant is COPIED out (`last_report_time()` returns the
-                    // value), so no guard on it is alive across `take_usage`, which
-                    // writes it -- std's RwLock is not re-entrant, and holding it here
-                    // parked the harvest forever.
-                    urr.last_report_time()
-                        .is_some_and(|last| last.elapsed().as_secs() >= period as u64)
-                }) && urr.acc_total_bytes.load(Ordering::Acquire) > 0
-                {
-                    // #80: PERIO, because that is what this arm is.
-                    UrrReportReason::Periodic
-                } else {
-                    continue;
-                };
-                let usage = urr.take_usage();
-                reports.push(UrrReportEntry::new(
-                    &session,
-                    urr_id,
-                    urr.next_ur_seqn(),
-                    usage,
-                    trigger,
-                ));
-            }
-        }
-
-        reports
+    /// Take every due report on every session at once. The production harvest goes
+    /// through [`Self::due_urr_sessions`] + the PFCP server instead (#821); this is the
+    /// same take for callers that have no PFCP table to coordinate with.
+    pub fn collect_urr_reports(&self) -> Vec<UrrReportEntry> {
+        self.session_snapshot()
+            .iter()
+            .flat_map(|s| Self::take_due_on(s))
+            .collect()
     }
 
     /// Return the usage of reports that could not be delivered to their URRs, so
     /// the next report carries it (#780 review m2). A URR that has since been
     /// removed is skipped: its usage left with the rule's own final report.
+    ///
+    /// Counted in `upf_dataplane_urr_reports_restored_total` (#780 re-review): a report
+    /// restored after N1 may in fact have been received, and is then reported twice,
+    /// so an operator needs to see how often it happens.
     pub fn restore_urr_usage(&self, reports: &[UrrReportEntry]) {
         for r in reports {
             let Some(session) = self.sessions.find_by_seid(r.upf_seid) else {
@@ -3582,6 +3660,9 @@ impl DataPlane {
             let urr = session.urrs.read().unwrap().get(&r.urr_id).cloned();
             if let Some(urr) = urr {
                 urr.restore_usage(&r.usage());
+                self.stats
+                    .urr_reports_restored
+                    .fetch_add(1, Ordering::Relaxed);
                 log::warn!(
                     "URR {} on SEID {:#x}: report UR-SEQN {} was not delivered; its {}B \
                      will be carried by the next report",
@@ -5730,6 +5811,79 @@ mod tests {
                 residual.total_pkts()
             );
         }
+    }
+
+    /// #821: final (TERMR) and queried (IMMER) reports TAKE the usage too, so they
+    /// and a racing harvest never carry the same bytes. A recorder races a harvester
+    /// that alternates the PERIO harvest with `take_urr_reports` (what a query or a
+    /// Remove URR does); every byte recorded is in exactly one report or still on the
+    /// URR. With the old non-resetting read for TERMR/IMMER this double-counted.
+    #[test]
+    fn query_and_final_reports_racing_the_harvest_count_every_byte_once() {
+        let dp = Arc::new(DataPlane::new(Arc::new(AtomicBool::new(false))));
+        dp.add_session_from_pfcp(
+            0x821,
+            0x1821,
+            Ipv4Addr::new(10, 45, 8, 21),
+            0x8211,
+            0x8212,
+            "127.0.0.1:2152".parse().unwrap(),
+            Some(5),
+            Some(9),
+        );
+        let session = dp.sessions.find_by_seid(0x821).expect("session");
+        let urr = Arc::new(DataPlaneUrr::new(1));
+        urr.set_reporting(None, None, None, None, Some(1));
+        session.urrs.write().unwrap().insert(1, Arc::clone(&urr));
+
+        const PACKETS: u64 = 100_000;
+        let recorder = {
+            let urr = Arc::clone(&urr);
+            on_thread("recorder-821", move || {
+                (0..PACKETS)
+                    .map(|i| {
+                        let b = 40 + (i % 1400);
+                        urr.record(b, i % 2 == 0);
+                        b
+                    })
+                    .sum::<u64>()
+            })
+        };
+        let done = Arc::new(AtomicBool::new(false));
+        let harvester = {
+            let (dp, urr, done) = (Arc::clone(&dp), Arc::clone(&urr), Arc::clone(&done));
+            on_thread("harvester-821", move || {
+                let mut reports = Vec::new();
+                let mut pass = 0u64;
+                loop {
+                    let last = done.load(Ordering::SeqCst);
+                    if pass.is_multiple_of(2) {
+                        *urr.last_report_time.write().unwrap() =
+                            Some(std::time::Instant::now() - std::time::Duration::from_secs(5));
+                        reports.extend(dp.collect_urr_reports());
+                    } else {
+                        reports.extend(dp.take_urr_reports(0x821, None));
+                    }
+                    pass += 1;
+                    if last {
+                        break reports;
+                    }
+                }
+            })
+        };
+        let deadline = std::time::Duration::from_secs(30);
+        let sent = recorder.recv_timeout(deadline).expect("recorder finishes");
+        done.store(true, Ordering::SeqCst);
+        let reports = harvester
+            .recv_timeout(deadline)
+            .expect("harvester finishes");
+        assert!(reports.len() > 10, "raced: {}", reports.len());
+        let reported: u64 = reports.iter().map(|r| r.total_bytes).sum();
+        assert_eq!(
+            reported + urr.usage().total_bytes(),
+            sent,
+            "every byte exactly once"
+        );
     }
 
     /// #780 review m2: usage taken for a report that was never delivered is handed

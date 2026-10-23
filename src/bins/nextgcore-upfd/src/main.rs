@@ -534,37 +534,14 @@ async fn main() -> Result<()> {
             if shutdown_urr.load(Ordering::SeqCst) {
                 break;
             }
-            let reports = dp_for_urr.collect_urr_reports();
-            if reports.is_empty() {
-                continue;
-            }
-
-            // Group reports by (upf_seid, smf_seid) for batching
-            let mut grouped: std::collections::HashMap<
-                (u64, u64),
-                Vec<data_plane::UrrReportEntry>,
-            > = std::collections::HashMap::new();
-            for report in reports {
-                grouped
-                    .entry((report.upf_seid, report.smf_seid))
-                    .or_default()
-                    .push(report);
-            }
-
-            for ((upf_seid, smf_seid), session_reports) in grouped {
-                log::info!(
-                    "Sending {} URR reports for SEID={upf_seid:#x}",
-                    session_reports.len()
-                );
-                // The usage in these reports was TAKEN from the URRs (#771); a report
-                // that cannot be sent hands it back, so the next report carries it
-                // instead of it being lost (#780 review m2).
-                if let Err(e) = pfcp_for_urr
-                    .send_urr_report(upf_seid, smf_seid, session_reports.clone())
-                    .await
-                {
-                    log::error!("Failed to send URR report: {e}");
-                    dp_for_urr.restore_urr_usage(&session_reports);
+            // #821: detect here, TAKE inside the PFCP server while it holds the session,
+            // so a Session Deletion cannot slip between the take and the send.
+            for (upf_seid, smf_seid) in dp_for_urr.due_urr_sessions() {
+                match pfcp_for_urr.send_due_urr_reports(upf_seid, smf_seid).await {
+                    Ok(0) => {}
+                    Ok(n) => log::info!("Sent {n} URR reports for SEID={upf_seid:#x}"),
+                    // The usage was handed back to its URRs (#780 m2).
+                    Err(e) => log::error!("Failed to send URR report: {e}"),
                 }
             }
         }

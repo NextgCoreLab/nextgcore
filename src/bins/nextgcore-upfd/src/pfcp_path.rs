@@ -2240,15 +2240,18 @@ impl PfcpServer {
         self.collect_usage_reports(upf_seid, None, UsageReportReason::Termination)
     }
 
-    /// Read the current counters of a session's URRs and build Usage Reports.
+    /// TAKE the usage of a session's URRs and build Usage Reports (#821).
     ///
     /// `only` restricts the set to named URR ids — which is what a Remove URR needs,
     /// so a modification reports the residual volume of the rules it is detaching and
     /// nothing else (#306). `None` means every URR on the session, for a deletion's
     /// final reports or a QAURR query.
     ///
-    /// Read-only on the counters: the caller decides whether the URR survives, and
-    /// resetting here would zero a rule that is merely being queried.
+    /// Resetting, as TS 29.244 §5.2.2.3.1 requires of every usage report ("reset its
+    /// ongoing measurement counts"): a query reports the usage since the last report
+    /// and starts a new measurement. It used to READ the counters, so a racing or later
+    /// harvest re-reported the same bytes and a CP function summing reports billed
+    /// them twice.
     fn collect_usage_reports(
         &self,
         upf_seid: u64,
@@ -2259,14 +2262,9 @@ impl PfcpServer {
             Some(dp) => dp,
             None => return Vec::new(),
         };
-        let session = match dp.sessions.find_by_seid(upf_seid) {
-            Some(s) => s,
-            None => return Vec::new(),
-        };
-        let urrs = session.urrs.read().unwrap();
-        urrs.values()
-            .filter(|urr| only.is_none_or(|ids| ids.contains(&urr.urr_id)))
-            .map(|urr| {
+        dp.take_urr_reports(upf_seid, only)
+            .into_iter()
+            .map(|r| {
                 let mut trigger = crate::n4_build::UsageReportTrigger::default();
                 match reason {
                     // TS 29.244 §8.2.36: TERMR covers the removal of the URR as well
@@ -2275,30 +2273,16 @@ impl PfcpServer {
                     UsageReportReason::Immediate => trigger.immediate_report = true,
                 }
                 crate::n4_build::UsageReport {
-                    urr_id: urr.urr_id,
-                    ur_seqn: urr.next_ur_seqn(),
+                    urr_id: r.urr_id,
+                    ur_seqn: r.ur_seqn,
                     trigger,
                     volume_measurement: Some(crate::n4_build::VolumeMeasurement {
-                        total_volume: Some(
-                            urr.acc_total_bytes
-                                .load(std::sync::atomic::Ordering::Relaxed),
-                        ),
-                        uplink_volume: Some(
-                            urr.acc_ul_bytes.load(std::sync::atomic::Ordering::Relaxed),
-                        ),
-                        downlink_volume: Some(
-                            urr.acc_dl_bytes.load(std::sync::atomic::Ordering::Relaxed),
-                        ),
-                        total_packets: Some(
-                            urr.acc_total_pkts
-                                .load(std::sync::atomic::Ordering::Relaxed),
-                        ),
-                        uplink_packets: Some(
-                            urr.acc_ul_pkts.load(std::sync::atomic::Ordering::Relaxed),
-                        ),
-                        downlink_packets: Some(
-                            urr.acc_dl_pkts.load(std::sync::atomic::Ordering::Relaxed),
-                        ),
+                        total_volume: Some(r.total_bytes),
+                        uplink_volume: Some(r.ul_bytes),
+                        downlink_volume: Some(r.dl_bytes),
+                        total_packets: Some(r.total_pkts),
+                        uplink_packets: Some(r.ul_pkts),
+                        downlink_packets: Some(r.dl_pkts),
                     }),
                     ..Default::default()
                 }
@@ -2402,8 +2386,50 @@ impl PfcpServer {
         Ok(())
     }
 
-    /// Send a PFCP Session Report Request for URR usage reports.
-    /// Called by the URR threshold check task when thresholds are exceeded.
+    /// Take the reports due on one session and send them, while the session is held
+    /// in the PFCP table (#821).
+    ///
+    /// The take happens UNDER `sessions.read()`, and the request is registered and on
+    /// the wire before that guard is released. A Session Deletion needs
+    /// `sessions.write()`, so it either ran first -- the session is gone, nothing is
+    /// taken here, and its TERMR carries every byte -- or waits until this report is
+    /// sent, and its TERMR carries only what came after. Before, the harvest took the
+    /// usage with no such ordering; a deletion in between made the send fail with
+    /// "session not found" and the taken usage was in no report.
+    ///
+    /// A report that cannot be sent hands its usage back (#780 m2).
+    pub async fn send_due_urr_reports(
+        &self,
+        upf_seid: u64,
+        smf_seid: u64,
+    ) -> Result<usize, String> {
+        let sessions = self.sessions.read().await;
+        let Some(smf_addr) = sessions.get(&upf_seid).map(|s| s.smf_addr) else {
+            return Ok(0);
+        };
+        let dp = self.data_plane.read().unwrap().clone();
+        let Some(dp) = dp else {
+            return Ok(0);
+        };
+        let reports = dp.take_due_urr_reports(upf_seid);
+        if reports.is_empty() {
+            return Ok(0);
+        }
+        let n = reports.len();
+        let sent = self
+            .send_urr_report_to(upf_seid, smf_seid, smf_addr, reports.clone())
+            .await;
+        drop(sessions);
+        match sent {
+            Ok(()) => Ok(n),
+            Err(e) => {
+                dp.restore_urr_usage(&reports);
+                Err(e)
+            }
+        }
+    }
+
+    /// Send a PFCP Session Report Request for URR usage reports already taken.
     pub async fn send_urr_report(
         &self,
         upf_seid: u64,
@@ -2422,7 +2448,17 @@ impl PfcpServer {
                 return Err(format!("Session {upf_seid:#x} not found for URR report"));
             }
         };
+        self.send_urr_report_to(upf_seid, smf_seid, smf_addr, reports)
+            .await
+    }
 
+    async fn send_urr_report_to(
+        &self,
+        upf_seid: u64,
+        smf_seid: u64,
+        smf_addr: SocketAddr,
+        reports: Vec<crate::data_plane::UrrReportEntry>,
+    ) -> Result<(), String> {
         // Build usage reports
         let usage_reports: Vec<crate::n4_build::UsageReport> = reports
             .iter()
@@ -2536,7 +2572,7 @@ impl PfcpServer {
         let Some(dp) = dp else {
             return Err("no data plane attached; cannot read URR counters".to_string());
         };
-        let Some(report) = dp.urr_report_snapshot(upf_seid, urr_id) else {
+        let Some(report) = dp.urr_report_take(upf_seid, urr_id) else {
             return Err(format!(
                 "URR {urr_id} not found on SEID {upf_seid:#x} for quota report"
             ));
@@ -2587,9 +2623,22 @@ impl PfcpServer {
             smf_addr,
             &payload,
             "Session Report Request (quota exhausted)",
-            Vec::new(),
+            vec![report.clone()],
         )
-        .await?;
+        .await
+        .inspect_err(|_| {
+            // #821: the usage was TAKEN for this report; not sent, it goes back, and the
+            // report flag is re-raised so the harvest reports the exhaustion instead.
+            dp.restore_urr_usage(std::slice::from_ref(&report));
+            if let Some(urr) = dp
+                .sessions
+                .find_by_seid(upf_seid)
+                .and_then(|s| s.urrs.read().unwrap().get(&urr_id).cloned())
+            {
+                urr.threshold_exceeded
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        })?;
         log::info!(
             "Sent quota-exhausted Usage Report to {smf_addr} for SEID={upf_seid:#x} URR={urr_id} \
              ({}B total) — matching traffic is being dropped (TS 29.244 §5.2.2.2.2)",
@@ -3113,9 +3162,18 @@ mod tests {
     }
 
     fn usage_reports_in(resp: &[u8]) -> Vec<(u32, u64)> {
+        usage_reports_of(resp, pfcp_ie::USAGE_REPORT_SMR)
+    }
+
+    /// `(urr_id, total volume)` of the Usage Reports in a Session Report REQUEST.
+    fn usage_reports_in_report(req: &[u8]) -> Vec<(u32, u64)> {
+        usage_reports_of(req, pfcp_ie::USAGE_REPORT_SRR)
+    }
+
+    fn usage_reports_of(resp: &[u8], ie_type: u16) -> Vec<(u32, u64)> {
         let (_, body) = ParsedPfcpHeader::parse(resp).unwrap();
         let ies = ParsedIe::parse_all(body);
-        ParsedIe::find_all_ies(&ies, pfcp_ie::USAGE_REPORT_SMR)
+        ParsedIe::find_all_ies(&ies, ie_type)
             .iter()
             .filter_map(|ie| {
                 let inner = ParsedIe::parse_all(&ie.value);
@@ -3545,11 +3603,15 @@ mod tests {
     ///
     /// This is the path `UpfReportEvent::QuotaExhausted` drives, i.e. the one that
     /// reports the instant a subscriber is cut off rather than at the next 10-second
-    /// harvest (TS 29.244 §5.2.2.2.2). It reads the URR's counters WITHOUT resetting
-    /// them, which is asserted here: resetting would make the volume this report carries
-    /// vanish from the next one, under-reporting the usage the quota was measuring.
+    /// harvest (TS 29.244 §5.2.2.2.2).
+    ///
+    /// #821: it TAKES the URR's usage, as every usage report must (§5.2.2.3.1: "upon
+    /// generating a usage report ... reset its ongoing measurement counts"). It used to
+    /// read without resetting, so the next harvest re-sent the same 500 B -- asserted
+    /// here: the counters are zero after the report and the following harvest has
+    /// nothing to send, while the quota latch still gates traffic.
     #[tokio::test]
-    async fn the_event_driven_quota_report_carries_volqu_and_does_not_reset_counters() {
+    async fn the_event_driven_quota_report_carries_volqu_and_takes_the_usage() {
         let (server, smf, addr, _rx, dp, upf_seid) = established_session().await;
         let _ = addr;
 
@@ -3582,18 +3644,116 @@ mod tests {
             0x01,
             "the event-driven report must carry VOLQU"
         );
-        // The counters survive: the harvest owns the reset.
-        let session = dp.sessions.find_by_seid(upf_seid).unwrap();
-        let urrs = session.urrs.read().unwrap();
         assert_eq!(
-            urrs.get(&1)
-                .unwrap()
-                .acc_total_bytes
-                .load(Ordering::Relaxed),
-            500,
-            "an event-driven report must NOT reset the counters, or the volume it \
-             carries disappears from the next report"
+            usage_reports_in_report(&buf[..len]),
+            vec![(1, 500)],
+            "the quota report carries the measured 500 B"
         );
+        // The usage was taken: the next harvest has nothing to re-report.
+        let session = dp.sessions.find_by_seid(upf_seid).unwrap();
+        let urr = session.urrs.read().unwrap().get(&1).cloned().unwrap();
+        assert_eq!(urr.usage().total_bytes(), 0, "the report took the usage");
+        assert!(
+            dp.collect_urr_reports().is_empty(),
+            "the 500 B must not be reported a second time by the harvest"
+        );
+        assert!(
+            urr.is_quota_exhausted(),
+            "reporting does not lift the quota"
+        );
+    }
+
+    fn urr1(
+        dp: &crate::data_plane::DataPlane,
+        upf_seid: u64,
+    ) -> Arc<crate::data_plane::DataPlaneUrr> {
+        dp.sessions
+            .find_by_seid(upf_seid)
+            .unwrap()
+            .urrs
+            .read()
+            .unwrap()
+            .get(&1)
+            .cloned()
+            .unwrap()
+    }
+
+    /// #821: a harvest that finds the session already gone from the PFCP table (a
+    /// Session Deletion ran first) takes NOTHING, so the deletion's TERMR carries the
+    /// usage. Before, the harvest took the usage first and the send then failed with
+    /// "session not found", losing it.
+    #[tokio::test]
+    async fn a_harvest_after_deletion_leaves_the_usage_for_the_termr() {
+        let (server, _smf, _addr, _rx, dp, upf_seid) = established_session().await;
+        let urr = urr1(&dp, upf_seid);
+        urr.set_reporting(Some(1), None, None, None, None);
+        urr.record(700, true);
+        assert_eq!(dp.due_urr_sessions().len(), 1, "a report is due");
+
+        // The deletion removes the PFCP session before it builds its final reports.
+        server.sessions.write().await.remove(&upf_seid);
+        assert_eq!(
+            server.send_due_urr_reports(upf_seid, 0x4242).await,
+            Ok(0),
+            "no session, no take"
+        );
+        assert_eq!(urr.usage().ul_bytes, 700, "the usage is still there");
+        let termr = server.collect_final_usage_reports(upf_seid);
+        assert_eq!(
+            termr
+                .iter()
+                .map(|r| r.volume_measurement.as_ref().unwrap().total_volume)
+                .collect::<Vec<_>>(),
+            vec![Some(700)],
+            "the TERMR carries the usage the harvest did not take"
+        );
+        assert_eq!(urr.usage().total_bytes(), 0, "and a final report takes it");
+    }
+
+    /// #821 + #780 re-review: the harvest's send path end to end. A due report is
+    /// taken and sent to the SMF while the session is held; a report whose send FAILS
+    /// hands its usage back and is counted in `upf_dataplane_urr_reports_restored_total`.
+    #[tokio::test]
+    async fn the_harvest_send_path_sends_or_restores_and_counts_it() {
+        let (server, smf, _addr, _rx, dp, upf_seid) = established_session().await;
+        let urr = urr1(&dp, upf_seid);
+        urr.set_reporting(Some(1), None, None, None, None);
+
+        urr.record(300, true);
+        assert_eq!(server.send_due_urr_reports(upf_seid, 0x4242).await, Ok(1));
+        let mut buf = vec![0u8; 4096];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                .await
+                .expect("the report reaches the SMF")
+                .expect("recv");
+        assert_eq!(usage_reports_in_report(&buf[..len]), vec![(1, 300)]);
+        assert_eq!(urr.usage().total_bytes(), 0);
+
+        // Make the next send fail outright: an IPv6 destination on the IPv4 socket.
+        server
+            .sessions
+            .write()
+            .await
+            .get_mut(&upf_seid)
+            .unwrap()
+            .smf_addr = "[::1]:8805".parse().unwrap();
+        urr.record(400, false);
+        assert!(server.send_due_urr_reports(upf_seid, 0x4242).await.is_err());
+        assert_eq!(
+            urr.usage().dl_bytes,
+            400,
+            "a failed send restores the usage"
+        );
+        assert_eq!(
+            dp.stats.urr_reports_restored.load(Ordering::Relaxed),
+            1,
+            "and is counted"
+        );
+        assert!(dp
+            .stats
+            .render_prometheus()
+            .contains("upf_dataplane_urr_reports_restored_total 1"));
     }
 
     /// QAURR (§8.2.50) was a constant with no reader: an SMF asking for every URR to
@@ -3660,23 +3820,12 @@ mod tests {
              point of the per-URR form over QAURR"
         );
 
-        // THE COUNTERS SURVIVE, and that is upfd's model rather than an oversight.
-        //
-        // THIS DAEMON DIVERGES FROM sgwud DELIBERATELY, and the divergence is
-        // spec-visible, so it is recorded here rather than left for someone to
-        // "align". sgwud's `process_queried_urrs` TAKES the report -- it resets the
-        // measurement period, reading §5.2.2.3's "close the counts and start new
-        // counts" literally -- because sgwud has no harvest and a peek would let the
-        // same bytes be reported again and double-billed.
-        //
-        // upfd is the opposite, because it HAS a harvest: `collect_urr_reports` runs
-        // every 10s and calls `reset_counters` (data_plane.rs:3280), so the harvest
-        // owns the reset. #306 pinned that with its own test -- "an event-driven
-        // report must NOT reset the counters, or the volume it carries disappears
-        // from the next report". Resetting on a query here would destroy volume the
-        // harvest had not yet reported.
-        //
-        // So a second QAURR still carries BOTH URRs' full measurement.
+        // #821: the query TOOK URR 2's usage (TS 29.244 §5.2.2.3.1: every usage
+        // report resets the measurement), now as in sgwud. The old non-resetting read
+        // left the 222 B for the harvest to send again, double-billing it; with the
+        // take being atomic (#771) there is no volume the harvest "had not yet
+        // reported" left to protect. So a following QAURR carries URR 1's untouched
+        // 111 B and NOTHING more for URR 2.
         let mut b = crate::n4_build::PfcpMessageBuilder::new();
         b.add_u8(pfcp_ie::PFCPSMREQ_FLAGS, pfcpsmreq_flags::QAURR);
         let resp = exchange(&smf, addr, &encode_pfcp(52, Some(upf_seid), 3, &b.build())).await;
@@ -3684,9 +3833,9 @@ mod tests {
         reports.sort_unstable();
         assert_eq!(
             reports,
-            vec![(1, 111), (2, 222)],
-            "both URRs keep their volume: in THIS daemon the 10s harvest owns the \
-             reset (#306), unlike sgwud where a query takes it"
+            vec![(1, 111), (2, 0)],
+            "URR 2's 222 B were taken by the first query and must not be reported \
+             twice; URR 1 was not queried and keeps its 111 B"
         );
     }
 
