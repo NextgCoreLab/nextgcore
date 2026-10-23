@@ -39,8 +39,19 @@ pub fn dispatch(sess_id: u64, continuation: S11Continuation, resp_type: u8, body
             // #48: ONE modification now gates an S11 procedure -- the indirect
             // forwarding install. Every other modification still gates nothing, which is
             // why this dispatches on the continuation rather than on the response.
-            if let S11Continuation::IndirectForwarding { .. } = continuation {
-                indirect_forwarding_response(continuation, cause);
+            match continuation {
+                S11Continuation::IndirectForwarding { .. } => {
+                    indirect_forwarding_response(continuation, cause)
+                }
+                S11Continuation::ModifyBearer { join, sess_id } => {
+                    let outcome = if cause == Some(sxa_handler::pfcp_cause::REQUEST_ACCEPTED) {
+                        None
+                    } else {
+                        Some(gtp_cause::SYSTEM_FAILURE)
+                    };
+                    modify_bearer_session_done(join, sess_id, outcome);
+                }
+                _ => {}
             }
         }
         other => log::warn!("Unexpected PFCP response type {other} for session {sess_id}"),
@@ -138,6 +149,9 @@ pub fn fail_with_cause(continuation: S11Continuation, cause: u8) {
                 cause,
             );
         }
+        S11Continuation::ModifyBearer { join, sess_id } => {
+            modify_bearer_session_done(join, sess_id, Some(cause));
+        }
     }
 }
 
@@ -201,6 +215,145 @@ pub fn fail(continuation: S11Continuation, reason: &str) {
                 gtp_cause::REMOTE_PEER_NOT_RESPONDING,
             );
         }
+        S11Continuation::ModifyBearer { join, sess_id } => {
+            log::error!(
+                "Modify Bearer: the SGW-U never answered the Session Modification of session \
+                 {sess_id} ({reason}); its bearers are reported not modified"
+            );
+            modify_bearer_session_done(join, sess_id, Some(gtp_cause::REMOTE_PEER_NOT_RESPONDING));
+        }
+    }
+}
+
+// ============================================================================
+// Modify Bearer Request waiting for the SGW-U (#838)
+// ============================================================================
+
+/// A Modify Bearer Request whose answer waits for one PFCP Session Modification
+/// per session it touched.
+#[derive(Debug, Clone)]
+pub struct PendingModifyBearer {
+    /// The MME and its request.
+    pub peer: std::net::SocketAddr,
+    pub seq: u32,
+    pub mme_teid: u32,
+    /// Sessions still waiting for the SGW-U, with the bearers each switches.
+    pub waiting: std::collections::BTreeMap<u64, Vec<u64>>,
+    /// Bearers already settled as modified.
+    pub modified: Vec<u64>,
+    /// (EBI, cause) of the bearers not modified.
+    pub marked_for_removal: Vec<(u8, u8)>,
+}
+
+static PENDING_MODIFY_BEARER: std::sync::Mutex<
+    std::collections::BTreeMap<u64, PendingModifyBearer>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+static NEXT_MODIFY_BEARER_JOIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Park a Modify Bearer answer; returns its join id.
+pub fn park_modify_bearer(pending: PendingModifyBearer) -> u64 {
+    let join = NEXT_MODIFY_BEARER_JOIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    PENDING_MODIFY_BEARER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(join, pending);
+    join
+}
+
+/// Whether a Modify Bearer Request from `peer` at `seq` is already waiting for
+/// the SGW-U: a retransmission is then not processed again (TS 29.274 §7.6).
+pub fn modify_bearer_in_flight(peer: std::net::SocketAddr, seq: u32) -> bool {
+    PENDING_MODIFY_BEARER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .any(|p| p.peer == peer && p.seq == seq)
+}
+
+/// Number of Modify Bearer answers waiting. Test/diagnostic.
+pub fn modify_bearer_pending_count() -> usize {
+    PENDING_MODIFY_BEARER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len()
+}
+
+/// One session of Modify Bearer `join` is settled: `failure` `None` means the
+/// SGW-U switched its bearers, `Some(cause)` that it did not. When it is the last
+/// session, the MME is answered: Request accepted when every bearer is modified,
+/// Request accepted partially when some are, and the failure cause otherwise,
+/// each bearer in Bearer Contexts modified or marked for removal (TS 29.274
+/// Table 7.2.8-1).
+pub fn modify_bearer_session_done(join: u64, sess_id: u64, failure: Option<u8>) {
+    let done = {
+        let mut map = PENDING_MODIFY_BEARER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(pending) = map.get_mut(&join) else {
+            return;
+        };
+        let Some(bearers) = pending.waiting.remove(&sess_id) else {
+            return;
+        };
+        match failure {
+            None => pending.modified.extend(bearers),
+            Some(cause) => {
+                let ctx = sgwc_self();
+                for bearer_id in bearers {
+                    if let Some(b) = ctx.bearer_find_by_id(bearer_id) {
+                        pending.marked_for_removal.push((b.ebi, cause));
+                    }
+                }
+            }
+        }
+        if pending.waiting.is_empty() {
+            map.remove(&join)
+        } else {
+            None
+        }
+    };
+    if let Some(pending) = done {
+        answer_modify_bearer(&pending, failure);
+    }
+}
+
+/// Send the Modify Bearer Response for a settled request.
+pub fn answer_modify_bearer(pending: &PendingModifyBearer, last_failure: Option<u8>) {
+    let cause = match (
+        pending.modified.is_empty(),
+        pending.marked_for_removal.is_empty(),
+    ) {
+        (false, true) => gtp_cause::REQUEST_ACCEPTED,
+        (false, false) => gtp_cause::REQUEST_ACCEPTED_PARTIALLY,
+        (true, _) => pending
+            .marked_for_removal
+            .iter()
+            .map(|(_, c)| *c)
+            .find(|c| *c != gtp_cause::CONTEXT_NOT_FOUND)
+            .or(last_failure)
+            .unwrap_or(gtp_cause::CONTEXT_NOT_FOUND),
+    };
+    log::info!(
+        "Modify Bearer Response to {} (seq={}): cause {cause}, modified {} bearer(s), marked for \
+         removal {:?}",
+        pending.peer,
+        pending.seq,
+        pending.modified.len(),
+        pending.marked_for_removal
+    );
+    let Some(server) = gtp_path::s11_server() else {
+        log::error!("S11 server not open: cannot answer {}", pending.peer);
+        return;
+    };
+    let response = s11_build::build_modify_bearer_response_per_bearer(
+        pending.mme_teid,
+        pending.seq,
+        cause,
+        &pending.modified,
+        &pending.marked_for_removal,
+    );
+    if let Err(e) = server.send_response(pending.peer, &response) {
+        log::error!("Modify Bearer Response to {} failed: {e}", pending.peer);
     }
 }
 
