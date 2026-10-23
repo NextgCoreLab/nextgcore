@@ -105,6 +105,7 @@ S1-MME runs **only** over native Linux kernel SCTP: mmed offers no userspace (sc
 |---|---|---|
 | `MME_N26_INTERWORKING` | off | `1`/`true` binds the N26 socket and enables EPS↔5GS interworking (idle-mode context transfer, connected-mode handover). Off: a standalone EPC, and a UE arriving from 5GS is handled as TS 24.301 requires of an MME with no N26. |
 | `MME_ECHO_INTERVAL_SECS` | `60` | GTPv2-C Echo (path management) interval; `0` disables it. |
+| `MME_DIAMETER_TW_SECS` | `30` | S6a Device-Watchdog interval Tw (RFC 6733 §5.5, RFC 3539 §3.4.1), floored at 6. After Tw with nothing received a DWR is sent; with no answer within another Tw the connection is closed and redialled (Tc, doubling to at most 8 x Tc). A redialled connection carries traffic once three watchdogs are answered. Keep Tw below 3 x the HSS's Tc, where hssd drops an idle connection. |
 | `MME_RESTART_COUNTER_FILE` | `/var/lib/nextgcore/mme-restart-counter` | Where the TS 23.007 restart counter is persisted; it is advanced on every start. |
 | `MME_RESTART_COUNTER` | unset | Fixed restart counter (u8), overriding the persisted one. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://jaeger:4317` | OpenTelemetry OTLP exporter. |
