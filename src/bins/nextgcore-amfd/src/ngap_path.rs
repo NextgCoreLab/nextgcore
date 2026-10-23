@@ -3930,6 +3930,22 @@ impl NgapServer {
         };
         state.amf_ue.supi = Some(supi.clone());
 
+        // #774: an initial registration of a GENUINE UE supersedes whatever this AMF
+        // still holds for the subscriber. Done here, at the first point the UE is proven
+        // genuine (TS 24.501 §5.5.1.2.8 f), NOTE 1), so a UE that fails 5G-AKA never
+        // costs the real subscriber its sessions. Authentication is started only from a
+        // registration, and `registration_type` is written from each request, so this
+        // test is "this authentication belongs to an initial registration".
+        if state.amf_ue.registration_type == crate::gmm_build::registration_type::INITIAL {
+            self.supersede_earlier_registration(
+                association_id,
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                &supi,
+            )
+            .await;
+        }
+
         let abba_len = state.amf_ue.abba_len as usize;
         let kamf = nextgcore_crypt::kdf::nextgcore_kdf_kamf(
             &supi,
@@ -6602,11 +6618,31 @@ impl NgapServer {
              (UE_INITIAL_REGISTRATION, TS 23.502 §4.2.2.2.2 step 14d); no NAS is sent",
             state.amf_ue.supi.as_deref().unwrap_or("unknown")
         );
+        self.drop_registration_locally(amf_ue_ngap_id, &state, true)
+            .await;
+        Ok(())
+    }
 
+    /// The body of a local deregistration, shared by [`Self::local_deregistration`]
+    /// (another AMF now serves the UE) and [`Self::supersede_earlier_registration`]
+    /// (the UE registered afresh here, #774). No NAS is sent: the UE the context
+    /// belonged to has, in both cases, already left it.
+    ///
+    /// `release_n2` is false when the old N2 connection must NOT be addressed, because
+    /// the gNB has already reused its RAN UE NGAP ID for the UE's new connection. A
+    /// UE Context Release Command for that pair would then be an inconsistent ID pair
+    /// at the gNB (TS 38.413 §10.6), and the local release it triggers could take the
+    /// new connection down with it.
+    async fn drop_registration_locally(
+        &mut self,
+        amf_ue_ngap_id: u64,
+        state: &UeNasContext,
+        release_n2: bool,
+    ) {
         self.release_all_pdu_sessions(amf_ue_ngap_id).await;
 
         self.deregistered_ue_cleanup(amf_ue_ngap_id);
-        if state.cm_idle {
+        if state.cm_idle || !release_n2 {
             self.forget_ue(amf_ue_ngap_id);
         } else if let Err(e) = self
             .release_ue(
@@ -6637,8 +6673,90 @@ impl NgapServer {
                 .filter(|id| *id != crate::context::NEXTGCORE_INVALID_POOL_ID)
                 .unwrap_or(state.amf_ue.id);
             ctx.amf_ue_remove(amf_ue_id);
+        };
+    }
+
+    /// #774: an initial registration of a genuine UE ends everything this AMF still
+    /// holds for that subscriber. Called once 5G-AKA has proven the UE genuine.
+    ///
+    /// A UE registers for initial registration only from 5GMM-DEREGISTERED (or after
+    /// losing its state, e.g. a power cycle without a Deregistration Request), and a
+    /// deregistered UE holds no PDU session. So:
+    /// - TS 24.501 §5.5.1.2.8 f): "if it turned out that the REGISTRATION REQUEST
+    ///   message was sent by a genuine UE that has already been registered, the 5GMM
+    ///   context, if any, are deleted and the new REGISTRATION REQUEST is progressed".
+    /// - TS 23.502 §4.2.2.2.2 step 14d / §4.2.2.3.2: for an Initial Registration the
+    ///   AMF that held the old context invokes Nsmf_PDUSession_ReleaseSMContext toward
+    ///   every SMF of the UE, and "the SMF(s) shall release the PDU Session". Here the
+    ///   old and the new AMF are the same one, so the UDM notifies nobody and this AMF
+    ///   has to do it itself.
+    ///
+    /// Two places can hold the old state:
+    /// 1. Another context with this SUPI (the UE came back by SUCI, or by a 5G-GUTI
+    ///    resolved without its MAC verifying). It is locally deregistered: its SM
+    ///    contexts released at their SMFs, its policy associations terminated, and its
+    ///    N2 connection, if it still has one, released (TS 38.413 §8.3.3.1: "release of
+    ///    the old UE-associated logical NG-connection when the UE has initiated the
+    ///    establishment of a new UE-associated logical NG-connection").
+    /// 2. This context itself: an integrity-verified initial registration from
+    ///    5GMM-IDLE moves the stored context, sessions included, onto the new AMF UE
+    ///    NGAP ID (`open_idle_registration_request`). Those sessions are released and
+    ///    forgotten; the registration goes on.
+    ///
+    /// A UE that fails authentication never reaches this, so a replayed or forged
+    /// initial registration leaves the real subscriber's context unchanged (§5.5.1.2.8
+    /// f), the "not sent by a genuine UE" half).
+    async fn supersede_earlier_registration(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        supi: &str,
+    ) {
+        for (old_id, old) in self.ue_auth_state.find_all_by_supi(supi) {
+            if old_id == amf_ue_ngap_id {
+                continue;
+            }
+            // The gNB reuses a RAN UE NGAP ID once it has dropped the connection that
+            // held it. Then the old connection is already gone at the gNB.
+            let n2_reused = !old.cm_idle
+                && old.association_id == association_id
+                && old.ran_ue_ngap_id == ran_ue_ngap_id;
+            log::info!(
+                "[{supi}] Initial registration of a genuine UE (now UE {amf_ue_ngap_id}): \
+                 deleting its earlier context UE {old_id} ({}, {} PDU session(s)) and \
+                 releasing its sessions at the SMF (TS 24.501 §5.5.1.2.8 f), TS 23.502 \
+                 §4.2.2.2.2 step 14d)",
+                if old.cm_idle {
+                    "CM-IDLE"
+                } else if n2_reused {
+                    "its N2 connection already gone at the gNB"
+                } else {
+                    "CM-CONNECTED, N2 connection released"
+                },
+                self.held_session_count(old_id)
+            );
+            self.drop_registration_locally(old_id, &old, !n2_reused)
+                .await;
         }
-        Ok(())
+
+        let carried = self.held_session_count(amf_ue_ngap_id);
+        if carried > 0 {
+            log::info!(
+                "[{supi}] Initial registration of UE {amf_ue_ngap_id} carries {carried} PDU \
+                 session(s) from its earlier registration: released at the SMF \
+                 (TS 23.502 §4.2.2.2.2 step 14d)"
+            );
+            self.release_all_pdu_sessions(amf_ue_ngap_id).await;
+            self.forget_ue_sessions(amf_ue_ngap_id);
+        }
+    }
+
+    /// How many PDU sessions the context holds for `amf_ue_ngap_id`.
+    fn held_session_count(&self, amf_ue_ngap_id: u64) -> usize {
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap_or_else(|e| e.into_inner());
+        guard.sess_list_for_ue(amf_ue_ngap_id).len()
     }
 
     /// Network-initiated Deregistration Request (TS 24.501 Section 5.5.2.3).
@@ -14857,6 +14975,7 @@ pub async fn amf_ngap_poll() -> Result<bool> {
 mod tests {
     /// Handler-level tests asserting what amfd SENDS (#760, ...), in their own file.
     mod handler_tests;
+    mod initial_registration_tests;
 
     use super::*;
     use crate::context::AmfContext;
