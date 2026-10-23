@@ -612,20 +612,24 @@ async fn main() -> Result<()> {
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty());
     if let Some(path) = state_file {
-        let ctx = smf_self();
-        let mut guard = ctx
-            .write()
-            .map_err(|_| anyhow::anyhow!("SMF context lock poisoned"))?;
         // Fail STARTUP on a snapshot that cannot be read or is from a newer build.
         // Coming up with an empty IPv4 pool is the one failure mode here that is
         // worse than not starting: it re-issues addresses live UEs still hold, and
         // nothing logs the collision. The store would then also refuse every later
         // write to protect the file, so the run would be silently non-durable too.
-        let restored = guard.set_state_file(std::path::PathBuf::from(&path))?;
+        //
+        // #884: the write guard lives in this block only. It must be gone before the
+        // notifier below is awaited: the notifier takes its own read guard, and
+        // `std::sync::RwLock` is not reentrant. A guard held across an `.await` also
+        // blocks the executor thread for whatever that await does.
+        let restored = {
+            let ctx = smf_self();
+            let mut guard = ctx
+                .write()
+                .map_err(|_| anyhow::anyhow!("SMF context lock poisoned"))?;
+            guard.set_state_file(std::path::PathBuf::from(&path))?
+        };
         log::info!("SMF durable state: {path} ({restored} record(s) restored)");
-        // The context lock must be released before the notifier runs: it takes its
-        // own read guard, and `std::sync::RwLock` is not reentrant.
-        drop(guard);
         // #193: a restored session whose policy binding did not survive is unusable
         // and its consumer still believes in it. This is the ONE restoration signal
         // that belongs at boot -- it needs no evidence from the UPF -- and it runs
