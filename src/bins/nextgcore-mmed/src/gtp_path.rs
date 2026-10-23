@@ -410,6 +410,30 @@ impl GtpcServer {
                                         pending,
                                     );
                                 }
+                                // #736: an E-UTRAN initiated E-RAB modification
+                                // waits on it too. Its confirm says every E-RAB
+                                // failed, rather than never coming (TS 36.413
+                                // §8.2.4), and the record does not leak.
+                                if let Some(pending) =
+                                    take_pending_erab_modification(xact.sequence_number)
+                                {
+                                    if let Some(send) =
+                                        crate::s1ap_handler::erab_modification_unanswered(
+                                            crate::context::mme_self(),
+                                            pending,
+                                        )
+                                    {
+                                        crate::s1ap_path::s1ap_send(send);
+                                    }
+                                }
+                            }
+                            // #736 (and #616's record): nobody waits on an
+                            // unanswered Change Notification, but its record
+                            // must not stay forever.
+                            if xact.message_type
+                                == s11_build::message_type::CHANGE_NOTIFICATION_REQUEST
+                            {
+                                take_pending_change_notification(xact.sequence_number);
                             }
                         }
 
@@ -668,25 +692,44 @@ fn echo_interval() -> Option<Duration> {
     }
 }
 
-/// Note a peer's Recovery counter (TS 23.007 §18). Returns `true` when it
-/// differs from the one last seen from that peer: the peer restarted.
+/// Note a peer's Recovery counter (TS 23.007 §18). Returns `true` only when the
+/// peer restarted: the received counter is AHEAD of the stored one, taking the
+/// 8-bit roll-over into account (#728).
 ///
-/// The first counter seen from a peer is only recorded. TS 23.007 §18 makes "a
-/// value different from the one stored" the restart signal, so this is a
-/// comparison with the stored value and not an ordering. A reordered datagram
-/// from one incarnation carries that incarnation's counter, so it cannot fake a
-/// change.
+/// The first counter seen from a peer is only recorded. A counter BEHIND the
+/// stored one is, per §18, "a possible race condition (newer message arriving
+/// before the older one)": a reordered datagram from the old incarnation, or an
+/// old SGW-C still answering from the same address during a pod replacement. It
+/// is discarded, and the stored value is kept, so the next message of the
+/// current incarnation is not read as another restart. Before #728 any change was
+/// a restart and the stored value was overwritten, so 3 -> 4 -> 3 -> 4 detached
+/// every UE on the SGW three times.
 fn note_peer_recovery(inner: &Arc<GtpcInner>, peer: SocketAddr, counter: u8) -> bool {
+    use nextgcore_gtp::v2::RestartOrder;
     let Ok(mut seen) = inner.peer_restart.lock() else {
         return false;
     };
-    match seen.insert(peer.ip(), counter) {
-        Some(previous) if previous != counter => {
+    let mut stored = seen.get(&peer.ip()).copied();
+    let previous = stored;
+    let order = nextgcore_gtp::v2::note_restart_counter(&mut stored, counter);
+    if let Some(value) = stored {
+        seen.insert(peer.ip(), value);
+    }
+    drop(seen);
+    match (order, previous) {
+        (RestartOrder::Restarted, Some(previous)) => {
             log::warn!(
                 "S11 peer {peer} restarted: Recovery {previous} -> {counter}; the PDN \
                  connections this MME held with it are gone (TS 23.007 §18)"
             );
             true
+        }
+        (RestartOrder::Stale, Some(previous)) => {
+            log::warn!(
+                "S11 peer {peer} sent Recovery {counter}, behind the stored {previous}: a \
+                 reordered message from an older incarnation, discarded (TS 23.007 §18)"
+            );
+            false
         }
         _ => {
             log::debug!("S11 peer {peer} Recovery counter {counter}");
@@ -1039,14 +1082,30 @@ pub fn send_delete_all_sessions(
         .ok_or(GtpPathError::ContextNotFound)?;
     let sgw_ue_id = mme_ue.sgw_ue_id;
 
+    // #828: one PDN connection that cannot be deleted must not keep the others'
+    // Delete Session Requests from going out; the caller removes them all
+    // locally, and a skipped one would leak at the gateways.
     let mut xacts = Vec::new();
+    let mut first_error = None;
     for sess_id in &mme_ue.sess_list {
         if ctx.sess_find_by_id(*sess_id).is_some() {
-            let xact = send_delete_session_request(ctx, enb_ue_id, sgw_ue_id, *sess_id, action)?;
-            xacts.push(xact);
+            match send_delete_session_request(ctx, enb_ue_id, sgw_ue_id, *sess_id, action) {
+                Ok(xact) => xacts.push(xact),
+                Err(e) => {
+                    log::error!(
+                        "[{}] Delete Session Request for session {sess_id} not sent: {e}; the \
+                         other PDN connections are still deleted",
+                        mme_ue.imsi_bcd
+                    );
+                    first_error.get_or_insert(e);
+                }
+            }
         }
     }
-    Ok(xacts)
+    match first_error {
+        Some(e) if xacts.is_empty() => Err(e),
+        _ => Ok(xacts),
+    }
 }
 
 pub fn send_create_bearer_response(
@@ -1363,6 +1422,11 @@ pub struct PendingErabModification {
     pub confirm: crate::s1ap_gen::ErabModificationConfirm,
     /// `notify` IEs of the indication, for the confirm's diagnostics.
     pub notify: Vec<crate::s1ap_gen::DiagnosedIe>,
+    /// The UE, and the new eNB endpoint of each E-RAB to modify: written to
+    /// the bearer contexts only for the bearers the Serving GW accepts (#736),
+    /// so the MME never names an endpoint the SGW does not use.
+    pub mme_ue_id: u64,
+    pub switched: Vec<SwitchedBearer>,
 }
 
 static PENDING_ERAB_MODIFICATIONS: OnceLock<Mutex<HashMap<u32, PendingErabModification>>> =
@@ -1396,19 +1460,25 @@ pub(crate) fn record_pending_erab_modification_for_test(
 /// response arrives. Returns the request's sequence number.
 pub fn send_modify_bearer_request_for_erab_modification(
     ctx: &MmeContext,
-    mme_ue_id: u64,
-    ebis: &[u8],
     pending: PendingErabModification,
 ) -> GtpPathResult<u32> {
+    let mme_ue_id = pending.mme_ue_id;
     let mme_ue = ctx
         .mme_ue_find_by_id(mme_ue_id)
         .ok_or(GtpPathError::ContextNotFound)?;
     let sgw_ue = ctx
         .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
         .ok_or(GtpPathError::ContextNotFound)?;
+    // Copies carrying the new endpoints: the bearer contexts keep the old ones
+    // until the Serving GW accepts (#736).
     let bearers: Vec<crate::context::MmeBearer> = bearers_of_ue(ctx, mme_ue_id)
         .into_iter()
-        .filter(|b| ebis.contains(&b.ebi))
+        .filter_map(|mut b| {
+            let new = pending.switched.iter().find(|s| s.ebi == b.ebi)?;
+            b.enb_s1u_teid = new.teid;
+            b.enb_s1u_ip = new.ip.clone();
+            Some(b)
+        })
         .collect();
     let bearer_refs: Vec<&crate::context::MmeBearer> = bearers.iter().collect();
     let seq = sequence()?;
@@ -2284,7 +2354,7 @@ mod tests {
         server.close();
     }
 
-    /// #689: only a CHANGED counter from a known peer is a restart.
+    /// #689: a counter AHEAD of the stored one from a known peer is a restart.
     #[test]
     fn a_changed_recovery_counter_is_a_restart() {
         let _guard = lock_s11();
@@ -2299,6 +2369,38 @@ mod tests {
         );
         assert!(note_peer_recovery(&server.inner, peer_addr, 4), "restarted");
         assert!(!note_peer_recovery(&server.inner, peer_addr, 4));
+        server.close();
+    }
+
+    /// #728, TS 23.007 §18: 3 -> 4 -> 3 -> 4 is ONE restart. The stale 3 (a
+    /// reordered old-incarnation datagram) is discarded and does not overwrite the
+    /// stored 4, so the following 4 is not a second restart. 255 -> 0 is a restart
+    /// (the roll-over).
+    #[test]
+    fn a_reordered_old_incarnation_counter_is_not_a_restart() {
+        let _guard = lock_s11();
+        let (server, _peer, peer_addr) = spawn_server_and_peer(Gtp2XactConfig::default());
+        let restarts: Vec<bool> = [3u8, 4, 3, 4, 3, 4]
+            .into_iter()
+            .map(|c| note_peer_recovery(&server.inner, peer_addr, c))
+            .collect();
+        assert_eq!(restarts, [false, true, false, false, false, false]);
+        assert_eq!(
+            server
+                .inner
+                .peer_restart
+                .lock()
+                .unwrap()
+                .get(&peer_addr.ip()),
+            Some(&4),
+            "the stale value must not replace the stored one"
+        );
+        // Roll-over: the incarnation after 255 is 0.
+        let mut roll = Vec::new();
+        for c in [100u8, 200, 255, 0, 255] {
+            roll.push(note_peer_recovery(&server.inner, peer_addr, c));
+        }
+        assert_eq!(roll, [true, true, true, true, false]);
         server.close();
     }
 }
