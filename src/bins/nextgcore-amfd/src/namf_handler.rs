@@ -795,12 +795,6 @@ pub fn send_event_notification(
 // Paging Trigger (TS 23.502 4.2.3.3)
 // ============================================================================
 
-/// Initiate paging for an idle UE when DL data arrives
-///
-/// Creates a PagingContext, stores it in the AMF context paging map,
-/// and marks the session paging as ongoing. The NGAP Paging message
-/// will be sent by the event loop timer when it processes paging entries.
-#[allow(clippy::too_many_arguments)]
 /// What a paged N2 SM transfer is, for its delivery after the Service Request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PagedN2 {
@@ -812,6 +806,12 @@ pub(crate) enum PagedN2 {
     Modify,
 }
 
+/// Initiate paging for an idle UE when DL data arrives
+///
+/// Creates a PagingContext, stores it in the AMF context paging map,
+/// and marks the session paging as ongoing. The NGAP Paging message
+/// will be sent by the event loop timer when it processes paging entries.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn initiate_paging_for_idle_ue(
     amf_ue: &AmfUe,
     sess: Option<&mut AmfSess>,

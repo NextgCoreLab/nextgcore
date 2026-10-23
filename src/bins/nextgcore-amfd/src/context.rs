@@ -717,10 +717,6 @@ pub enum PositioningDlKind {
     UePolicyToUe { updp_pdu: Vec<u8> },
 }
 
-/// A network-initiated deregistration the Nudm_UECM DeregistrationNotification
-/// callback (TS 29.503 §5.3.2.3.2) asked the AMF to execute (WSB-4), enqueued
-/// by the Namf SBI handler task and carried out by the NGAP server task
-/// (TS 23.502 §4.2.2.3.3 → DEREGISTRATION REQUEST, TS 24.501 §5.5.2.3).
 /// The NGAP procedure an N1N2MessageTransfer's N2 SM information asks for
 /// (TS 29.518 §6.1.6.3.x `NgapIeType`), as the NGAP task delivers it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -774,6 +770,10 @@ pub struct PendingConnectedDownlink {
     pub failure_notify_uri: Option<String>,
 }
 
+/// A network-initiated deregistration the Nudm_UECM DeregistrationNotification
+/// callback (TS 29.503 §5.3.2.3.2) asked the AMF to execute (WSB-4), enqueued
+/// by the Namf SBI handler task and carried out by the NGAP server task
+/// (TS 23.502 §4.2.2.3.3 → DEREGISTRATION REQUEST, TS 24.501 §5.5.2.3).
 #[derive(Debug, Clone)]
 pub struct PendingNetworkDereg {
     /// Target UE (AMF-UE-NGAP-ID). The NGAP task resolves the serving SCTP
