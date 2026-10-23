@@ -4730,7 +4730,8 @@ pub fn build_handover_command_generated(msg: &HandoverCommand) -> Option<Vec<u8>
 pub struct RanStatusRelay {
     /// AMF UE NGAP ID.
     pub amf_ue_ngap_id: u64,
-    /// The source gNB's RAN UE NGAP ID (reused at the target).
+    /// The RAN UE NGAP ID of the gNB this message is for: the SOURCE's as decoded
+    /// from the uplink transfer, the TARGET's once the AMF relays it (#740).
     pub ran_ue_ngap_id: u32,
     /// The PDCP SN/HFN status container.
     pub container: ngap_gen::RANStatusTransfer_TransparentContainer,

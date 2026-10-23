@@ -72,6 +72,15 @@ static SEND_TX: OnceLock<mpsc::UnboundedSender<S1apSend>> = OnceLock::new();
 /// unit test) or the server has shut down — which is logged and otherwise
 /// ignored, exactly as an unreachable eNB would be.
 pub fn s1ap_send(message: S1apSend) -> bool {
+    #[cfg(test)]
+    if let Some(pdus) = S1AP_TAP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .and_then(|m| m.get_mut(&message.enb_id))
+    {
+        pdus.push(message.pdu.clone());
+    }
     let Some(tx) = SEND_TX.get() else {
         log::warn!(
             "S1AP send dropped: transport not initialised (enb_id={}, {} bytes)",
@@ -92,6 +101,38 @@ pub fn s1ap_send(message: S1apSend) -> bool {
             false
         }
     }
+}
+
+/// PDUs queued for each tapped eNB, so a test sees what an S1AP procedure sent
+/// from a thread it does not own (#730: the S11 receive thread answers a Path
+/// Switch Request). Keyed by eNB pool id, which is unique within the process
+/// context, so concurrent tests on other eNBs do not see each other's PDUs.
+/// [`SEND_TX`] cannot serve: it is installed once per process and a sibling
+/// test owns it. Declared beside the queue it shadows.
+#[cfg(test)]
+static S1AP_TAP: std::sync::Mutex<Option<std::collections::HashMap<u64, Vec<Vec<u8>>>>> =
+    std::sync::Mutex::new(None);
+
+/// Start recording PDUs queued for `enb_id`.
+#[cfg(test)]
+pub(crate) fn tap_enb_for_test(enb_id: u64) {
+    S1AP_TAP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(enb_id, Vec::new());
+}
+
+/// The PDUs queued for `enb_id` since the tap started (or the last take).
+#[cfg(test)]
+pub(crate) fn take_tapped_for_test(enb_id: u64) -> Vec<Vec<u8>> {
+    S1AP_TAP
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .and_then(|m| m.get_mut(&enb_id))
+        .map(std::mem::take)
+        .unwrap_or_default()
 }
 
 /// Convenience wrapper around [`s1ap_send`] for a raw encoded PDU.
