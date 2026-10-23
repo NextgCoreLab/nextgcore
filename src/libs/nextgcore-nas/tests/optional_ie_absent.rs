@@ -139,3 +139,45 @@ fn bad_optional_ue_os_id_is_absent_in_ue_state_indication() {
     let short = &wire[..wire.len() - 1];
     assert!(UeStateIndication::decode(short).is_err());
 }
+
+#[test]
+fn fivegsm_bad_optional_ie_is_absent_and_the_next_ie_still_decodes() {
+    // PDU SESSION ESTABLISHMENT ACCEPT: SSC mode 1 + IPv4, QoS rules (LV-E 6),
+    // Session-AMBR (LV 6), then a PDU address (0x29) of length 1, below the
+    // §9.11.4.10 minimum, then DNN (0x25) "int".
+    let mut wire = vec![0x11, 0x00, 0x06, 0x01, 0x00, 0x06, 0x31, 0x31, 0x01];
+    wire.extend_from_slice(&[0x06, 0x06, 0x00, 0x64, 0x06, 0x00, 0x32]);
+    wire.extend_from_slice(&[0x29, 0x01, 0x01]);
+    wire.extend_from_slice(&[0x25, 0x04, 0x03, b'i', b'n', b't']);
+    let msg = fiveg::PduSessionEstablishmentAccept::decode(&mut b(&wire)).unwrap();
+    assert_eq!(msg.pdu_address, None);
+    assert!(msg.dnn.is_some(), "the DNN after the bad IE still decodes");
+    assert_eq!(msg.session_ambr.dl_value, 100);
+}
+
+#[test]
+fn a_repeated_optional_ie_keeps_the_first_instance() {
+    // TS 24.501 §7.6.3: only the first instance of a repeated IE is handled.
+    let psi = |wire: &[u8]| {
+        fiveg::RegistrationRequest::decode(&mut b(wire))
+            .unwrap()
+            .pdu_session_status
+            .map(|s| s.psi)
+    };
+    // A good first instance survives a bad repetition ...
+    assert_eq!(
+        psi(&reg(&[PDU_SESSION_STATUS, &[0x50, 0x01, 0x00]])),
+        Some(0x0002)
+    );
+    // ... and a good one.
+    assert_eq!(
+        psi(&reg(&[PDU_SESSION_STATUS, &[0x50, 0x02, 0x04, 0x00]])),
+        Some(0x0002)
+    );
+    // A bad first instance is not present (§7.7.1), so the good repetition is
+    // the first one present.
+    assert_eq!(
+        psi(&reg(&[&[0x50, 0x01, 0x00], PDU_SESSION_STATUS])),
+        Some(0x0002)
+    );
+}

@@ -179,7 +179,29 @@ fn optional_framed<T>(
     decode: impl FnOnce(&mut Bytes) -> NasResult<T>,
 ) -> NasResult<Option<T>> {
     let mut frame = buf.read_bytes(frame_len)?;
-    Ok(decode(&mut frame).ok())
+    match decode(&mut frame) {
+        Ok(ie) => Ok(Some(ie)),
+        Err(e) => {
+            log::debug!(
+                "NAS: optional IE of {frame_len} octets is syntactically incorrect ({e}); \
+                 treated as not present (TS 24.501/24.301 §7.7.1)"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Store a decoded optional IE only if the message has not already got one:
+/// "the UE shall handle only the contents of the information element
+/// appearing first and shall ignore all subsequent repetitions" (TS 24.501 /
+/// TS 24.301 §7.6.3; "the network should follow the same procedures").
+///
+/// A first instance that was syntactically incorrect is not present
+/// (§7.7.1), so a later well-formed repetition is then the first one present.
+pub(crate) fn set_first<T>(slot: &mut Option<T>, ie: Option<T>) {
+    if slot.is_none() {
+        *slot = ie;
+    }
 }
 
 #[cfg(test)]
