@@ -3000,6 +3000,30 @@ fn find_protocol_ie_value(data: &[u8], id: u16) -> Option<Vec<u8>> {
     None
 }
 
+/// The UE an NGAP PDU is UE-associated signalling for, as the key its SCTP stream is
+/// chosen by (TS 38.412 §7, #813); `None` for a non-UE-associated PDU.
+///
+/// A PDU is UE-associated exactly when it names a UE-associated logical NG-connection at
+/// the top level: an AMF-UE-NGAP-ID (IE 10), a RAN-UE-NGAP-ID (IE 85) or a UE-NGAP-IDs
+/// (IE 114, the UE Context Release Command's). Every non-UE-associated procedure of TS
+/// 38.413 §8 carries none of them at the top level; NG Reset names UEs only inside its
+/// ResetType. The key is the AMF UE NGAP ID when present, else the RAN UE NGAP ID.
+pub fn ue_association_key(data: &[u8]) -> Option<u64> {
+    if let Some(value) = find_protocol_ie_value(data, ngap_gen::ID_AMF_UE_NGAP_ID) {
+        if let Ok(id) = nextgcore_ngap_gen::decode_contained::<ngap_gen::AMF_UE_NGAP_ID>(&value) {
+            return Some(id.0);
+        }
+    }
+    if let Some(value) = find_protocol_ie_value(data, ngap_gen::ID_UE_NGAP_I_DS) {
+        match nextgcore_ngap_gen::decode_contained::<ngap_gen::UE_NGAP_IDs>(&value) {
+            Ok(ngap_gen::UE_NGAP_IDs::UE_NGAP_ID_pair(pair)) => return Some(pair.amf_ue_ngap_id.0),
+            Ok(ngap_gen::UE_NGAP_IDs::AMF_UE_NGAP_ID(id)) => return Some(id.0),
+            _ => {}
+        }
+    }
+    extract_ran_ue_ngap_id(data).map(u64::from)
+}
+
 /// Extract the AMF-UE-NGAP-ID (IE 10) from any UE-associated NGAP PDU,
 /// decoding the IE value with the GENERATED codec (#417).
 pub fn extract_amf_ue_ngap_id(data: &[u8]) -> Option<u64> {
@@ -15721,6 +15745,57 @@ pub(crate) mod generated_remnant_tests {
                 .map(|d| d.ie_id)
                 .collect::<Vec<_>>(),
             vec![ngap_gen::ID_PWS_FAILED_CELL_ID_LIST]
+        );
+    }
+}
+
+#[cfg(test)]
+mod ue_association_key_tests {
+    use super::*;
+
+    /// **#813.** UE-associated NGAP is told from non-UE-associated NGAP by the UE NGAP
+    /// ids at the top level (TS 38.412 §7): the key is the AMF UE NGAP ID, also out of a
+    /// UE-NGAP-IDs pair or AMF-only choice, else the RAN UE NGAP ID; NG Reset's
+    /// acknowledgement (UEs named only inside the list), Overload, Paging and an Error
+    /// Indication without ids have none.
+    #[test]
+    fn ue_associated_pdus_are_keyed_by_their_ue_and_the_rest_are_not() {
+        let nas = build_downlink_nas_transport_asn1(0x1_0000_0813, 81, &[0x7E, 0x00]).unwrap();
+        assert_eq!(ue_association_key(&nas), Some(0x1_0000_0813));
+        let pair = build_ue_context_release_command_ids_asn1(813, Some(9), 0, 0).unwrap();
+        assert_eq!(ue_association_key(&pair), Some(813));
+        let amf_only = build_ue_context_release_command_ids_asn1(814, None, 0, 0).unwrap();
+        assert_eq!(ue_association_key(&amf_only), Some(814));
+        let ran_only = encode_error_indication(None, Some(815), None, None).unwrap();
+        assert_eq!(ue_association_key(&ran_only), Some(815));
+        let with_ids = encode_error_indication(Some(816), Some(1), None, None).unwrap();
+        assert_eq!(ue_association_key(&with_ids), Some(816));
+
+        let no_ids = encode_error_indication(None, None, None, None).unwrap();
+        assert_eq!(
+            ue_association_key(&no_ids),
+            None,
+            "Error Indication without ids"
+        );
+        let reset_ack = build_ng_reset_acknowledge_asn1(
+            Some(vec![UeAssociatedLogicalNgConnectionItem {
+                amf_ue_ngap_id: Some(817),
+                ran_ue_ngap_id: Some(2),
+            }]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(ue_association_key(&reset_ack), None, "NG Reset Acknowledge");
+        assert_eq!(
+            ue_association_key(&build_overload_start_asn1(10).unwrap()),
+            None,
+            "Overload Start"
+        );
+        let plmn = crate::context::PlmnId::new("001", "01");
+        assert_eq!(
+            ue_association_key(&build_paging_asn1(1, 1, 0x0813, &plmn, 1).unwrap()),
+            None,
+            "Paging"
         );
     }
 }

@@ -167,6 +167,15 @@ impl NgapTransport {
         }
     }
 
+    /// The negotiated outbound stream count of `association_id` (#813).
+    fn outbound_streams(&self, association_id: u64) -> Option<u16> {
+        match self {
+            Self::Userspace(s) => s.outbound_streams(association_id),
+            #[cfg(feature = "kernel-sctp")]
+            Self::Kernel(s) => s.outbound_streams(association_id),
+        }
+    }
+
     async fn send(
         &mut self,
         association_id: u64,
@@ -749,6 +758,11 @@ pub struct NgapServer {
     /// live SCTP association. `None` (the default) keeps the real transport.
     #[cfg(test)]
     sent_ngap: Option<Vec<(u64, u16, Vec<u8>)>>,
+    /// Test seam: the negotiated outbound stream count the capture reports for every
+    /// association (a captured send has no SCTP association to ask). Default 2, amfd's
+    /// configured count (#813).
+    #[cfg(test)]
+    test_outbound_streams: u16,
     /// Test seam: the next this-many NGAP sends fail as an SCTP send error would,
     /// so a test can drive a handler's send-failure branch (#760).
     #[cfg(test)]
@@ -897,6 +911,8 @@ impl NgapServer {
             forced_amf_ue_ngap_id: None,
             #[cfg(test)]
             sent_ngap: None,
+            #[cfg(test)]
+            test_outbound_streams: 2,
             #[cfg(test)]
             fail_next_sends: 0,
             event_tx,
@@ -12829,8 +12845,7 @@ impl NgapServer {
             self.fail_next_sends -= 1;
             return Err(anyhow::anyhow!("SCTP send error: injected by a test"));
         }
-        // Use stream 0 for NGAP signaling
-        let stream_id = 0u16;
+        let stream_id = self.ngap_stream_for(association_id, data);
         #[cfg(test)]
         if let Some(sent) = self.sent_ngap.as_mut() {
             sent.push((association_id, stream_id, data.to_vec()));
@@ -12841,6 +12856,41 @@ impl NgapServer {
             .send(association_id, stream_id, data)
             .await
             .map_err(|e| anyhow::anyhow!("SCTP send error: {e}"))
+    }
+
+    /// The SCTP stream an NGAP PDU goes out on (TS 38.412 §7, #813).
+    ///
+    /// §7 reserves one stream pair for the sole use of non-UE-associated signalling and
+    /// at least one pair for UE-associated signalling, and "for a single UE-associated
+    /// signalling ... one SCTP stream" that "should not be changed". So:
+    ///
+    /// - a non-UE-associated PDU (NG Setup, NG Reset, RAN / AMF Configuration Update,
+    ///   Paging, PWS, Overload, an Error Indication without UE ids, ...) goes on stream 0;
+    /// - a UE-associated one goes on stream `1 + key % (n - 1)`, where `n` is the
+    ///   association's negotiated outbound stream count and `key` is the UE's AMF UE
+    ///   NGAP ID (its RAN UE NGAP ID when the PDU carries no AMF one). The AMF UE NGAP ID
+    ///   is fixed for the UE on the association, so its stream is too.
+    ///
+    /// With fewer than two negotiated streams the peer left no second pair, and stream 0
+    /// is the only valid identifier.
+    fn ngap_stream_for(&self, association_id: u64, pdu: &[u8]) -> u16 {
+        let Some(key) = crate::ngap_asn1::ue_association_key(pdu) else {
+            return 0;
+        };
+        #[cfg(test)]
+        if self.sent_ngap.is_some() {
+            return ue_associated_stream(key, self.test_outbound_streams);
+        }
+        match self.transport.outbound_streams(association_id) {
+            Some(outbound) => ue_associated_stream(key, outbound),
+            None => {
+                log::warn!(
+                    "association {association_id}: negotiated outbound stream count unknown; \
+                     UE-associated NGAP goes on stream 0"
+                );
+                0
+            }
+        }
     }
 
     /// Send message to a gNB by ID
@@ -14634,6 +14684,16 @@ pub async fn amf_ngap_poll() -> Result<bool> {
 // ============================================================================
 // Tests
 // ============================================================================
+
+/// The stream of a UE-associated NGAP PDU keyed by `key` on an association with
+/// `outbound` negotiated outbound streams (TS 38.412 §7, #813): `1..outbound`, spread by
+/// key, or 0 when the peer allowed no second stream.
+fn ue_associated_stream(key: u64, outbound: u16) -> u16 {
+    if outbound < 2 {
+        return 0;
+    }
+    1 + (key % u64::from(outbound - 1)) as u16
+}
 
 #[cfg(test)]
 mod tests {
@@ -20893,15 +20953,15 @@ mod tests {
 
         assert!(report.source_release_sent, "the captured send succeeds");
         let with_streams = take_sent_ngap_with_streams(&mut server);
-        // The capture records the SCTP stream the transport would be given. Stream 0
-        // for this UE-associated PDU is today's behaviour, not the target: TS 38.412 §7
-        // reserves separate streams for UE-associated signalling (#813).
+        // The capture records the SCTP stream the transport would be given: a
+        // UE-associated PDU, so not stream 0 (TS 38.412 §7, #813). Two negotiated
+        // streams leave stream 1 as the only UE-associated one.
         assert_eq!(
             with_streams
                 .iter()
                 .map(|(_, stream, _)| *stream)
                 .collect::<Vec<_>>(),
-            vec![0]
+            vec![1]
         );
         let sent: Vec<(u64, Vec<u8>)> = with_streams
             .into_iter()
@@ -20919,6 +20979,96 @@ mod tests {
             "UE Context Release Command, SOURCE id pair, successful-handover"
         );
         assert!(take_sent_ngap(&mut server).is_empty(), "take drains");
+    }
+
+    /// **#813.** TS 38.412 §7 on the wire: UE-associated NGAP goes on a stream `>= 1`
+    /// that is fixed for the UE, spread over the negotiated outbound streams, and
+    /// non-UE-associated NGAP on stream 0. Driven through the real send path with the
+    /// capture recording the stream the transport would be given.
+    ///
+    /// REVERT-VERIFIED: with every PDU on stream 0 the UE-associated assertions fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ue_associated_ngap_goes_on_its_own_stream_and_the_rest_on_stream_0() {
+        let mut server = capturing_ngap_server().await;
+        server.test_outbound_streams = 5;
+        let assoc = 98_131u64;
+        seed_gnb_session(&server, assoc).await;
+        // Four UEs: AMF UE NGAP IDs 8130..=8133 land on 1 + id % 4.
+        for amf_ue_ngap_id in 8_130u64..=8_133 {
+            for _ in 0..2 {
+                let nas = crate::ngap_asn1::build_downlink_nas_transport_asn1(
+                    amf_ue_ngap_id,
+                    7,
+                    &[0x7E, 0x00],
+                )
+                .unwrap();
+                server.send_to_association(assoc, &nas).await.expect("sent");
+            }
+            let release = crate::ngap_asn1::build_ue_context_release_command_ids_asn1(
+                amf_ue_ngap_id,
+                None,
+                0,
+                0,
+            )
+            .unwrap();
+            server
+                .send_to_association(assoc, &release)
+                .await
+                .expect("sent");
+        }
+        let overload = crate::ngap_asn1::build_overload_start_asn1(10).unwrap();
+        server
+            .send_to_association(assoc, &overload)
+            .await
+            .expect("sent");
+        let streams: Vec<u16> = take_sent_ngap_with_streams(&mut server)
+            .into_iter()
+            .map(|(_, stream, _)| stream)
+            .collect();
+        assert_eq!(
+            streams,
+            vec![3, 3, 3, 4, 4, 4, 1, 1, 1, 2, 2, 2, 0],
+            "each UE keeps one stream in 1..5 for all its PDUs; Overload Start is on 0"
+        );
+
+        // Two negotiated streams leave stream 1 as the only UE-associated one.
+        server.test_outbound_streams = 2;
+        let gnb = 98_132u64;
+        seed_gnb_session(&server, gnb).await;
+        let nas = crate::ngap_asn1::build_downlink_nas_transport_asn1(9, 7, &[0x7E]).unwrap();
+        server.send_to_association(gnb, &nas).await.expect("sent");
+        let streams: Vec<u16> = take_sent_ngap_with_streams(&mut server)
+            .into_iter()
+            .map(|(_, stream, _)| stream)
+            .collect();
+        assert_eq!(streams, vec![1], "two streams: every UE on stream 1");
+
+        server.test_outbound_streams = 1;
+        server.send_to_association(gnb, &nas).await.expect("sent");
+        assert_eq!(
+            take_sent_ngap_with_streams(&mut server)[0].1,
+            0,
+            "a peer that allowed one stream gets everything on stream 0"
+        );
+    }
+
+    #[test]
+    fn the_ue_associated_stream_stays_inside_the_negotiated_streams() {
+        assert_eq!(ue_associated_stream(7, 0), 0);
+        assert_eq!(ue_associated_stream(7, 1), 0);
+        for outbound in 2u16..=64 {
+            for key in [0u64, 1, 2, 63, 64, u64::from(u32::MAX), u64::MAX] {
+                let stream = ue_associated_stream(key, outbound);
+                assert!(
+                    (1..outbound).contains(&stream),
+                    "{key} over {outbound}: {stream}"
+                );
+            }
+        }
+        assert_eq!(
+            ue_associated_stream(u64::MAX, u16::MAX),
+            1 + (u64::MAX % 65_534) as u16
+        );
     }
 
     /// #400: a HANDOVER that moves the UE out of a subscribed Area of Interest delivers
