@@ -12,10 +12,10 @@ registration cannot succeed -- the chart previously pointed the UDR at MongoDB
 with no init Job at all.
 
 Every write is an upsert, not an insert: this Job is re-applied by every
-`helm upgrade`, and insertOne against the unique username index aborted the
-script with "E11000 duplicate key error ... username: admin", CrashLoopBackOff-
-ing the Job even though the seed data was already correct. $setOnInsert so a
-re-run never overwrites a changed password.
+`helm upgrade`, and insertOne against an existing unique index aborts the
+script with "E11000 duplicate key error", CrashLoopBackOff-ing the Job even
+though the seed data was already correct. $setOnInsert so a re-run never
+overwrites a changed value. No WebUI account is seeded (#692).
 */}}
 apiVersion: v1
 kind: ConfigMap
@@ -33,16 +33,9 @@ data:
     db.sessions.createIndex({ "supi": 1 });
     db.policyData.createIndex({ "supi": 1 });
     db.accounts.createIndex({ "username": 1 }, { unique: true });
-    db.accounts.updateOne(
-        { username: "admin" },
-        { $setOnInsert: {
-            username: "admin",
-            password: "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",
-            roles: ["admin"],
-            created: new Date()
-        } },
-        { upsert: true }
-    );
+    // No WebUI account is seeded (#692, as #118 did for the compose stack):
+    // TS 33.117 4.2.3.4.2.2 forbids shipping a predefined privileged credential.
+    // Create the first admin with webui/server/bin/create-admin.js <username>.
     db.subscribers.updateOne({ imsi: "{{ .Values.subscriber.imsi }}" }, { $setOnInsert: {
         imsi: "{{ .Values.subscriber.imsi }}",
         security: {
