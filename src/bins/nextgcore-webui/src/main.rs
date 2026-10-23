@@ -437,7 +437,7 @@ pub struct SubscriberView {
 /// `amf` is an authentication-management-field constant, not a secret, and `sqn`
 /// is a replay counter the operator legitimately needs to see. `k`, `op` and
 /// `opc` have no member here at all — see [`SubscriberView`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct SecurityView {
     pub amf: String,
     pub sqn: i64,
@@ -447,6 +447,19 @@ pub struct SecurityView {
     /// provisioned" after the keys stopped being echoed back; this answers that
     /// without revealing anything about the value.
     pub key_provisioned: bool,
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (sqn) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for SecurityView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("SecurityView");
+        d.field("amf", &self.amf);
+        d.field("sqn", &"<redacted>");
+        d.field("key_provisioned", &self.key_provisioned);
+        d.finish()
+    }
 }
 
 impl From<&Subscriber> for SubscriberView {

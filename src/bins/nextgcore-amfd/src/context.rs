@@ -3776,7 +3776,7 @@ pub struct SnpnAuthContext {
 }
 
 /// SNPN subscription credentials
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct SnpnSubscriptionCredentials {
     /// K (128-bit authentication key)
     pub k: [u8; 16],
@@ -3786,6 +3786,20 @@ pub struct SnpnSubscriptionCredentials {
     pub amf: [u8; 2],
     /// SQN (6 bytes)
     pub sqn: [u8; 6],
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (k, opc, sqn) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for SnpnSubscriptionCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("SnpnSubscriptionCredentials");
+        d.field("k", &"<redacted>");
+        d.field("opc", &"<redacted>");
+        d.field("amf", &self.amf);
+        d.field("sqn", &"<redacted>");
+        d.finish()
+    }
 }
 
 /// SNPN onboarding state

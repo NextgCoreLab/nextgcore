@@ -408,7 +408,7 @@ pub fn prf_prime(key: &[u8], s: &[u8], out_len: usize) -> Vec<u8> {
 }
 
 /// EAP-AKA' key material derived from the master key (RFC 5448 §3.3).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EapAkaPrimeKeys {
     /// Encryption key for AT_ENCR_DATA (16 bytes)
     pub k_encr: [u8; 16],
@@ -420,6 +420,21 @@ pub struct EapAkaPrimeKeys {
     pub msk: [u8; 64],
     /// Extended Master Session Key (64 bytes)
     pub emsk: [u8; 64],
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (k_encr, k_aut, k_re) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for EapAkaPrimeKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("EapAkaPrimeKeys");
+        d.field("k_encr", &"<redacted>");
+        d.field("k_aut", &"<redacted>");
+        d.field("k_re", &"<redacted>");
+        d.field("msk", &self.msk);
+        d.field("emsk", &self.emsk);
+        d.finish()
+    }
 }
 
 /// Derive the full EAP-AKA' key hierarchy per RFC 5448 §3.3:

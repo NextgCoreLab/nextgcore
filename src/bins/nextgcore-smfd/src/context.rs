@@ -2092,7 +2092,10 @@ impl SmfContext {
                         match serde_json::from_value::<PolicyBinding>(v) {
                             Ok(b) => Some((k, b)),
                             Err(e) => {
-                                log::warn!("skipping unreadable SMF policy binding {k}: {e}");
+                                let binding_ref = &k;
+                                log::warn!(
+                                    "skipping unreadable SMF policy binding {binding_ref}: {e}"
+                                );
                                 unrestorable.push(UnrestorableSession {
                                     sm_context_ref: k,
                                     status_uri: salvaged,

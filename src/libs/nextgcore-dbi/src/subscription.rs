@@ -314,7 +314,7 @@ pub fn nextgcore_dbi_update_imeisv(supi: &str, imeisv: &str) -> DbiResult<()> {
 /// /subscription-data/{ueId}/authentication-data/authentication-subscription`
 /// provisioning path (TS 29.505) to create or replace the stored
 /// AuthenticationSubscription credentials.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct NextgcoreDbiAuthProvision {
     /// Permanent key K as a hex string (32 hex chars)
     pub k_hex: String,
@@ -334,6 +334,25 @@ pub struct NextgcoreDbiAuthProvision {
     pub topc_hex: Option<String>,
     /// TUAK TOP as 64 hex characters, when TOPc is not provisioned directly.
     pub top_hex: Option<String>,
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (k_hex, opc_hex, op_hex, sqn, topc_hex, top_hex) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for NextgcoreDbiAuthProvision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("NextgcoreDbiAuthProvision");
+        d.field("k_hex", &"<redacted>");
+        d.field("opc_hex", &"<redacted>");
+        d.field("op_hex", &"<redacted>");
+        d.field("amf_hex", &self.amf_hex);
+        d.field("sqn", &"<redacted>");
+        d.field("auth_method", &self.auth_method);
+        d.field("algorithm_id", &self.algorithm_id);
+        d.field("topc_hex", &"<redacted>");
+        d.field("top_hex", &"<redacted>");
+        d.finish()
+    }
 }
 
 /// Create or replace the authentication subscription for a subscriber.

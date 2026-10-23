@@ -564,7 +564,7 @@ struct Reachability {
 /// replayed UE security capabilities, GUTI) so that all downlink NAS is
 /// built by gmm_build and protected by nas_security — there is no inline
 /// plain-NAS path.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UeNasContext {
     /// Full AMF UE context (security keys, capabilities, GUTI, NSSAI).
     ///
@@ -629,6 +629,42 @@ pub struct UeNasContext {
     /// belongs to is created later in the procedure, and because it must survive the
     /// authentication round trips in between.
     ue_policy_container: Option<Vec<u8>>,
+}
+
+/// Manual `Debug` (no-auth-material-in-logs): the authentication material in
+/// this type (autn) prints as `<redacted>`, so a future
+/// `{:?}` in a log line cannot leak it.
+impl std::fmt::Debug for UeNasContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("UeNasContext");
+        d.field("amf_ue", &self.amf_ue);
+        d.field("auth_ctx_id", &self.auth_ctx_id);
+        d.field("ran_ue_ngap_id", &self.ran_ue_ngap_id);
+        d.field("association_id", &self.association_id);
+        d.field("suci", &self.suci);
+        d.field("autn", &"<redacted>");
+        d.field("registered", &self.registered);
+        d.field("pei_requested", &self.pei_requested);
+        d.field("auth_failure_count", &self.auth_failure_count);
+        d.field("retx", &self.retx);
+        d.field("reachability", &self.reachability);
+        d.field("cm_idle", &self.cm_idle);
+        d.field("sdm_subscription_id", &self.sdm_subscription_id);
+        d.field("policy_association_id", &self.policy_association_id);
+        d.field("ue_policy_association_id", &self.ue_policy_association_id);
+        d.field("gmm_fsm", &self.gmm_fsm);
+        d.field(
+            "initial_context_setup_request_sent",
+            &self.initial_context_setup_request_sent,
+        );
+        d.field(
+            "initial_context_setup_response_received",
+            &self.initial_context_setup_response_received,
+        );
+        d.field("registration_accept_sent", &self.registration_accept_sent);
+        d.field("ue_policy_container", &self.ue_policy_container);
+        d.finish()
+    }
 }
 
 impl UeNasContext {
