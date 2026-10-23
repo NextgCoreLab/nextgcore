@@ -119,6 +119,14 @@ jobs:
             done > "$RUNNER_TEMP/mem.log" ) &
           cd src && cargo test --workspace
 
+      - name: cargo test smfd, one test thread (test-isolation guards)
+        # #723: smfd's `require_test_lock` guards (teardown_association, the 5GSM
+        # timer map) can name a test that forgot PROCESS_STATE_TEST_LOCK /
+        # N4_TEST_LOCK only when no sibling holds the lock, i.e. in a serial run.
+        # The parallel run above cannot see such a test until it flakes a
+        # sibling. Reuses the build above; about 20 s.
+        run: cd src && cargo test -p nextgcore-smfd -- --test-threads=1
+
       - name: cargo test (non-default features)
         # Feature-gated paths are invisible to the default build, so a gated
         # module rots uncompiled -- the reason this project normally prefers a
