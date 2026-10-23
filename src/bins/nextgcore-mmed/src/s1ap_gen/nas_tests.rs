@@ -1,5 +1,11 @@
 //! #514 stage 3: NAS transport on the generated codec.
 //!
+//! #737: since the hand-written encoder was deleted (#560), the
+//! `*_with_schema_criticalities` tests below compare the production encoder
+//! with itself and check it decodes back; what pins each IE criticality is
+//! `criticality_oracle`, which checks every PDU a production builder encodes
+//! against the TS 36.413 §9.3 object sets.
+//!
 //! Oracle: the pre-change hand-written encoder and parser. Goldens: nextgcore-
 //! s1ap's `golden_x691.rs` (derived by hand from X.691 in #456).
 
@@ -52,7 +58,7 @@ fn the_downlink_nas_transport_is_the_x691_golden() {
 }
 
 #[test]
-fn the_downlink_nas_transport_matches_the_hand_written_encoder() {
+fn the_downlink_nas_transport_round_trips_with_schema_criticalities() {
     let mut cases = 0;
     for len in NAS_LENS {
         for (enb, mme) in IDS {

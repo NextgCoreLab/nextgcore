@@ -865,8 +865,9 @@ impl AmfApp {
         // Close NGAP
         ngap_path::amf_ngap_close().await;
 
-        // Close SBI
-        sbi_path::amf_sbi_close();
+        // Close SBI, awaited (#673): the teardown is complete before the context
+        // is finalised.
+        sbi_path::amf_sbi_close_async().await;
 
         // Finalize AMF context
         context::amf_context_final();
