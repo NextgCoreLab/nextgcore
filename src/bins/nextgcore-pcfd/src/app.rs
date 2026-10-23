@@ -2748,8 +2748,12 @@ fn terminate_af_app_sessions(apps: &[PcfApp]) -> usize {
 
 /// Remove a UE's SM-policy context with all its sessions, terminating every
 /// AF application session bound to them (TS 29.514 §4.2.5.3, #767 review).
-/// Every UE-level removal goes through here, so no AF is left believing in
-/// a context the PCF dropped.
+///
+/// No live path removes a UE's SM-policy context today (the PCF keeps one per
+/// SUPI; see the issue on that growth). This is the API any future UE-level
+/// removal must use, so no AF is left believing in a context the PCF dropped.
+/// The termCause is PDU_SESSION_TERMINATION on purpose: every PDU session of
+/// the UE is gone, which is exactly that cause (§4.2.5.3 i).
 pub fn remove_ue_sm(pcf_ue_sm_id: u64) -> bool {
     let removed = pcf_self()
         .read()
@@ -7416,6 +7420,20 @@ mod tests {
         assert!(
             uri.ends_with("/af-notif-767/terminate"),
             "delivered to {uri}"
+        );
+        // #878 review: the app session was already gone from the context when
+        // its terminate notification was sent (remove first, notify after).
+        let sent: Vec<bool> = crate::sbi_path::TERMINATES_SENT_FOR_TEST
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| *id == app_session_id)
+            .map(|(_, present)| *present)
+            .collect();
+        assert_eq!(
+            sent,
+            vec![false],
+            "notified exactly once, after the removal"
         );
         assert_eq!(body["termCause"], "PDU_SESSION_TERMINATION", "{body}");
         assert_eq!(

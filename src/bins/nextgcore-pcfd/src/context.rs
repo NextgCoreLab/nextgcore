@@ -2081,13 +2081,16 @@ impl PcfContext {
         Some(ue_sm)
     }
 
-    pub fn ue_sm_remove(&self, id: u64) -> Option<PcfUeSm> {
+    /// Remove a UE's SM-policy context, dropping its AF app sessions without
+    /// telling their AFs. Production code uses `app::remove_ue_sm`.
+    pub(crate) fn ue_sm_remove(&self, id: u64) -> Option<PcfUeSm> {
         self.ue_sm_remove_with_apps(id).map(|(ue_sm, _apps)| ue_sm)
     }
 
     /// [`Self::ue_sm_remove`], also returning the AF app sessions of the UE's
     /// sessions, which the caller must terminate toward their AFs (TS 29.514
     /// §4.2.5.3; `app::remove_ue_sm`).
+    #[must_use = "the removed app sessions must be terminated toward their AFs (TS 29.514 §4.2.5.3)"]
     pub fn ue_sm_remove_with_apps(&self, id: u64) -> Option<(PcfUeSm, Vec<PcfApp>)> {
         // Remove the UE-SM under the ue_sm_list/supi_sm_hash guards, then DROP
         // them before touching sess_list. Holding ue_sm_list while acquiring
@@ -2215,13 +2218,18 @@ impl PcfContext {
         Some(sess)
     }
 
-    pub fn sess_remove(&self, id: u64) -> Option<PcfSess> {
+    /// Remove a session, dropping its AF app sessions without telling their AFs.
+    /// Only for a session that cannot have any (the UAV-refusal path removes a
+    /// session it has just created); otherwise use
+    /// [`Self::sess_remove_with_apps`] and `app::terminate_af_app_sessions`.
+    pub(crate) fn sess_remove(&self, id: u64) -> Option<PcfSess> {
         self.sess_remove_with_apps(id).map(|(sess, _apps)| sess)
     }
 
     /// [`Self::sess_remove`], also returning the AF app sessions removed with
     /// it. Only the caller whose removal succeeded gets them, so two concurrent
     /// removals of one session cannot both notify its AFs (#767 review).
+    #[must_use = "the removed app sessions must be terminated toward their AFs (TS 29.514 §4.2.5.3)"]
     pub fn sess_remove_with_apps(&self, id: u64) -> Option<(PcfSess, Vec<PcfApp>)> {
         let removed = self.sess_remove_inner(id);
         if removed.is_some() {

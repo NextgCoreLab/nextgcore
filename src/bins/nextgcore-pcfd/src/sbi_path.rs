@@ -943,6 +943,8 @@ pub fn pcf_sbi_send_policyauthorization_terminate_notify(app_id: u64) -> bool {
 /// caller already holds, typically one just removed from the context, so the
 /// notification needs no lookup and cannot race the removal (#767 review).
 pub fn pcf_sbi_send_policyauthorization_terminate_notify_for(app: &crate::context::PcfApp) -> bool {
+    #[cfg(test)]
+    record_terminate_for_test(app);
     let Some(uri) = app.notif_uri.clone() else {
         log::warn!(
             "[app_id={}] AF terminate notify: no notification URI stored",
@@ -956,6 +958,28 @@ pub fn pcf_sbi_send_policyauthorization_terminate_notify_for(app: &crate::contex
         "termCause": "PDU_SESSION_TERMINATION",
     });
     spawn_notification(uri, "/terminate", body, "AF terminate")
+}
+
+/// Every AF terminate notification sent in tests, with whether its app session
+/// was still in the PCF context at the moment of sending (#878 review). The
+/// SM-policy delete must remove first and notify after, so an AF Delete racing
+/// the notification never finds a live app; this records the ordering
+/// deterministically, with no race to win. Beside the sender it observes.
+#[cfg(test)]
+pub(crate) static TERMINATES_SENT_FOR_TEST: std::sync::Mutex<Vec<(String, bool)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn record_terminate_for_test(app: &crate::context::PcfApp) {
+    let still_present = crate::context::pcf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| ctx.app_find_by_app_session_id(&app.app_session_id))
+        .is_some();
+    TERMINATES_SENT_FOR_TEST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((app.app_session_id.clone(), still_present));
 }
 
 /// POST an `EventsNotification` to the AF for `app_id` (TS 29.514 §4.2.6:
