@@ -1874,4 +1874,87 @@ mod tests {
             .unwrap();
         assert!(n >= 1);
     }
+
+    /// #736, TS 36.413 §8.2.4 / TS 29.274 §7.6: an E-RAB MODIFICATION
+    /// INDICATION whose Modify Bearer Request the Serving GW never answers still
+    /// gets its E-RAB MODIFICATION CONFIRM, with every E-RAB failed, once N3 is
+    /// spent; the pending record is gone and no endpoint was written. Before
+    /// #736 the eNB never got a confirm and one record leaked per indication.
+    #[test]
+    fn an_unanswered_erab_modification_is_confirmed_failed() {
+        let _guard = lock_s11();
+        let (sgw, _route) = sgw(Gtp2XactConfig {
+            t3_response: Duration::from_millis(100),
+            n3_requests: 2,
+            response_hold: Duration::from_secs(1),
+        });
+        let ue = seed(&[5]);
+        let ctx = crate::context::mme_self();
+        crate::s1ap_path::tap_enb_for_test(ue.source_enb_id);
+        let indication = crate::s1ap_gen::ErabModificationIndication {
+            mme_ue_s1ap_id: ue.mme_ue_s1ap_id,
+            enb_ue_s1ap_id: 100,
+            to_be_modified: vec![ErabSwitchedItem {
+                erab_id: 5,
+                transport_layer_address: vec![10, 0, 0, 7],
+                gtp_teid: 0x7365,
+            }],
+            not_to_be_modified: vec![],
+            location: None,
+        };
+        let out = crate::s1ap_handler::handle_erab_modification_indication(
+            ctx,
+            ue.source_enb_id,
+            &indication,
+            &[],
+        );
+        assert!(out.is_empty(), "the confirm waits for the Serving GW");
+        let (mbr, _) = recv(&sgw, 34);
+        assert_eq!(
+            bearer_contexts(&mbr),
+            vec![(5, 0, 0x7365, Some([10, 0, 0, 7]))],
+            "the new endpoint goes to the SGW"
+        );
+        assert_eq!(
+            bearer(&ue, 5).unwrap().enb_s1u_teid,
+            0x1005,
+            "not written yet"
+        );
+        let failed = wait_pdu(ue.source_enb_id, |pdu| {
+            match pdu {
+            g::S1AP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+                value: g::SuccessfulOutcomeValue::Id_E_RABModificationIndication(c),
+                ..
+            }) => Some(
+                c.protocol_i_es
+                    .0
+                    .iter()
+                    .filter_map(|ie| match &ie.value {
+                        g::E_RABModificationConfirmProtocolIEs_EntryValue::Id_E_RABFailedToModifyListBearerModConf(l) => Some(
+                            l.0.iter()
+                                .map(|e| {
+                                    let g::E_RABList_EntryValue::Id_E_RABItem(i) = &e.value;
+                                    i.e_rab_id.0
+                                })
+                                .collect::<Vec<u8>>(),
+                        ),
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect::<Vec<u8>>(),
+            ),
+            _ => None,
+        }
+        });
+        assert_eq!(failed, vec![5], "every E-RAB failed to modify");
+        assert!(
+            crate::gtp_path::take_pending_erab_modification(mbr.header.sequence_number).is_none()
+        );
+        assert_eq!(
+            bearer(&ue, 5).unwrap().enb_s1u_teid,
+            0x1005,
+            "the unconfirmed endpoint is never written"
+        );
+        release(&ue);
+    }
 }

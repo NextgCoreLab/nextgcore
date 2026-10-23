@@ -314,6 +314,12 @@ impl Gtp2XactMgr {
         }
     }
 
+    /// Whether a locally originated request to `peer` at `sequence_number` is
+    /// outstanding (a new one there would replace it).
+    pub fn is_outstanding(&self, peer: SocketAddr, sequence_number: u32) -> bool {
+        self.local.contains_key(&(peer, sequence_number))
+    }
+
     /// Number of outstanding locally originated requests
     pub fn outstanding(&self) -> usize {
         self.local.len()
