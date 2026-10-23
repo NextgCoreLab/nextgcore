@@ -4,7 +4,7 @@
 
 use super::header::*;
 use super::types::*;
-use crate::buf::{IeLen, NasBuf};
+use crate::buf::{optional_tlv, optional_tlv_e, IeLen, NasBuf};
 use crate::common::types::*;
 use crate::error::{NasError, NasResult};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -137,7 +137,7 @@ impl AttachRequest {
                 }
                 0x50 => {
                     buf.skip(1)?;
-                    msg.additional_guti = Some(EpsMobileIdentity::decode(buf)?);
+                    msg.additional_guti = optional_tlv(buf, EpsMobileIdentity::decode)?;
                 }
                 0x52 => {
                     buf.skip(1)?;
@@ -267,7 +267,7 @@ impl AttachAccept {
             match iei {
                 0x50 => {
                     buf.skip(1)?;
-                    msg.guti = Some(EpsMobileIdentity::decode(buf)?);
+                    msg.guti = optional_tlv(buf, EpsMobileIdentity::decode)?;
                 }
                 0x13 => {
                     buf.skip(1)?;
@@ -306,13 +306,16 @@ impl AttachAccept {
                     // §9.9.2.8 -> TS 24.008 §10.5.1.13: 5 to 47 octets, so
                     // at least one PLMN. Decoded inside the IE's length, so
                     // a trailing partial PLMN is not read as the next IE (#613).
+                    // Optional: a bad one is absent (§7.7.1, #630).
                     buf.skip(1)?;
-                    let mut ie = buf.read_lv(IeLen::AtLeast(3))?;
-                    let mut plmns = Vec::with_capacity(ie.len() / 3);
-                    for _ in 0..(ie.len() / 3) {
-                        plmns.push(PlmnId::decode(&mut ie)?);
-                    }
-                    msg.equivalent_plmns = Some(plmns);
+                    msg.equivalent_plmns = optional_tlv(buf, |b| {
+                        let mut ie = b.read_lv(IeLen::AtLeast(3))?;
+                        let mut plmns = Vec::with_capacity(ie.len() / 3);
+                        for _ in 0..(ie.len() / 3) {
+                            plmns.push(PlmnId::decode(&mut ie)?);
+                        }
+                        Ok(plmns)
+                    })?;
                 }
                 _ => {
                     buf.skip(1)?;
@@ -527,15 +530,15 @@ impl AttachReject {
             match iei {
                 0x78 => {
                     buf.skip(1)?;
-                    msg.esm_message_container = Some(EsmMessageContainer::decode(buf)?);
+                    msg.esm_message_container = optional_tlv_e(buf, EsmMessageContainer::decode)?;
                 }
                 0x5F => {
                     buf.skip(1)?;
-                    msg.t3346_value = Some(GprsTimer2::decode(buf)?);
+                    msg.t3346_value = optional_tlv(buf, GprsTimer2::decode)?;
                 }
                 0x16 => {
                     buf.skip(1)?;
-                    msg.t3402_value = Some(GprsTimer2::decode(buf)?);
+                    msg.t3402_value = optional_tlv(buf, GprsTimer2::decode)?;
                 }
                 _ => break,
             }
@@ -644,11 +647,11 @@ impl TrackingAreaUpdateAccept {
                 }
                 0x50 => {
                     buf.skip(1)?;
-                    msg.guti = Some(EpsMobileIdentity::decode(buf)?);
+                    msg.guti = optional_tlv(buf, EpsMobileIdentity::decode)?;
                 }
                 0x54 => {
                     buf.skip(1)?;
-                    msg.tai_list = Some(EpsTaiList::decode(buf)?);
+                    msg.tai_list = optional_tlv(buf, EpsTaiList::decode)?;
                 }
                 _ => break,
             }
@@ -772,7 +775,7 @@ impl EpsAuthenticationFailure {
                     // octets", i.e. the 14-octet AUTS (#613).
                     buf.skip(1)?;
                     msg.authentication_failure_parameter =
-                        Some(buf.read_lv(IeLen::Exact(14))?.to_vec());
+                        optional_tlv(buf, |b| Ok(b.read_lv(IeLen::Exact(14))?.to_vec()))?;
                 }
                 _ => break,
             }
@@ -1047,7 +1050,8 @@ impl ExtendedServiceRequest {
                 0x57 => {
                     // §9.9.2.1: "4 octets length", two value octets (#613).
                     buf.skip(1)?;
-                    msg.eps_bearer_context_status = Some(buf.read_lv(IeLen::Exact(2))?.read_u16()?);
+                    msg.eps_bearer_context_status =
+                        optional_tlv(buf, |b| b.read_lv(IeLen::Exact(2))?.read_u16())?;
                 }
                 _ => {
                     buf.skip(1)?;
@@ -1105,11 +1109,11 @@ impl EpsServiceReject {
             match iei {
                 0x5F => {
                     buf.skip(1)?;
-                    msg.t3346_value = Some(GprsTimer2::decode(buf)?);
+                    msg.t3346_value = optional_tlv(buf, GprsTimer2::decode)?;
                 }
                 0x6B => {
                     buf.skip(1)?;
-                    msg.t3448_value = Some(GprsTimer2::decode(buf)?);
+                    msg.t3448_value = optional_tlv(buf, GprsTimer2::decode)?;
                 }
                 _ => break,
             }
@@ -1147,7 +1151,7 @@ impl GutiReallocationCommand {
             match iei {
                 0x54 => {
                     buf.skip(1)?;
-                    msg.tai_list = Some(EpsTaiList::decode(buf)?);
+                    msg.tai_list = optional_tlv(buf, EpsTaiList::decode)?;
                 }
                 _ => break,
             }
@@ -1240,7 +1244,7 @@ impl EmmInformation {
                     // octets", one value octet (#613).
                     buf.skip(1)?;
                     msg.network_daylight_saving_time =
-                        Some(buf.read_lv(IeLen::Exact(1))?.read_u8()?);
+                        optional_tlv(buf, |b| b.read_lv(IeLen::Exact(1))?.read_u8())?;
                 }
                 _ => break,
             }

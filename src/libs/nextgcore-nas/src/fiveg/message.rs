@@ -5,7 +5,7 @@
 use super::header::*;
 use super::ie::*;
 use super::types::*;
-use crate::buf::{IeLen, NasBuf};
+use crate::buf::{optional_tlv, optional_tlv_e, IeLen, NasBuf};
 use crate::common::security::{unprotect_nas_message, NasSecurityContext};
 use crate::common::types::*;
 use crate::error::{NasError, NasResult};
@@ -246,17 +246,17 @@ impl RegistrationRequest {
                 0x10 => {
                     // 5GMM capability
                     buf.skip(1)?;
-                    msg.gmm_capability = Some(FiveGmmCapability::decode(buf)?);
+                    msg.gmm_capability = optional_tlv(buf, FiveGmmCapability::decode)?;
                 }
                 0x2E => {
                     // UE security capability
                     buf.skip(1)?;
-                    msg.ue_security_capability = Some(UeSecurityCapability::decode(buf)?);
+                    msg.ue_security_capability = optional_tlv(buf, UeSecurityCapability::decode)?;
                 }
                 0x2F => {
                     // Requested NSSAI
                     buf.skip(1)?;
-                    msg.requested_nssai = Some(Nssai::decode(buf)?);
+                    msg.requested_nssai = optional_tlv(buf, Nssai::decode)?;
                 }
                 0x52 => {
                     // Last visited registered TAI
@@ -266,28 +266,28 @@ impl RegistrationRequest {
                 0x40 => {
                     // Uplink data status
                     buf.skip(1)?;
-                    msg.uplink_data_status = Some(UplinkDataStatus::decode(buf)?);
+                    msg.uplink_data_status = optional_tlv(buf, UplinkDataStatus::decode)?;
                 }
                 0x50 => {
                     // PDU session status
                     buf.skip(1)?;
-                    msg.pdu_session_status = Some(PduSessionStatus::decode(buf)?);
+                    msg.pdu_session_status = optional_tlv(buf, PduSessionStatus::decode)?;
                 }
                 0x2B => {
                     // UE status
                     // §9.11.3.56: "a length of 3 octets", one value octet.
                     buf.skip(1)?;
-                    msg.ue_status = Some(buf.read_lv(IeLen::Exact(1))?.read_u8()?);
+                    msg.ue_status = optional_tlv(buf, |b| b.read_lv(IeLen::Exact(1))?.read_u8())?;
                 }
                 0x77 => {
                     // Additional GUTI
                     buf.skip(1)?;
-                    msg.additional_guti = Some(MobileIdentity::decode(buf)?);
+                    msg.additional_guti = optional_tlv_e(buf, MobileIdentity::decode)?;
                 }
                 0x71 => {
                     // NAS message container (TLV-E), cleartext-IE reg (§4.4.6)
                     buf.skip(1)?;
-                    msg.nas_message_container = Some(NasMessageContainer::decode(buf)?);
+                    msg.nas_message_container = optional_tlv_e(buf, NasMessageContainer::decode)?;
                 }
                 0x80 => {
                     // Payload container type (half-octet IEI `8-`, TV).
@@ -303,7 +303,7 @@ impl RegistrationRequest {
                 0x7B => {
                     // Payload container (TLV-E) — §5.5.1.2.2's UE policy container
                     buf.skip(1)?;
-                    msg.payload_container = Some(PayloadContainer::decode(buf)?);
+                    msg.payload_container = optional_tlv_e(buf, PayloadContainer::decode)?;
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -432,35 +432,32 @@ impl RegistrationAccept {
             match iei {
                 0x77 => {
                     buf.skip(1)?;
-                    msg.guti = Some(MobileIdentity::decode(buf)?);
+                    msg.guti = optional_tlv_e(buf, MobileIdentity::decode)?;
                 }
                 0x4A => {
                     // Equivalent PLMNs (TLV, 3 octets per PLMN).
                     buf.skip(1)?;
-                    if buf.remaining() < 1 {
-                        return Err(NasError::BufferTooShort {
-                            expected: 1,
-                            actual: buf.remaining(),
-                        });
-                    }
                     // §9.11.3.45 -> TS 24.008 §10.5.1.13: 5 to 47 octets,
                     // so at least one PLMN. Decoded inside the IE's length;
-                    // a trailing partial PLMN is discarded with it.
-                    let mut ie = buf.read_lv(IeLen::AtLeast(PlmnId::encoded_len()))?;
-                    let count = ie.len() / PlmnId::encoded_len();
-                    let mut plmns = Vec::with_capacity(count);
-                    for _ in 0..count {
-                        plmns.push(PlmnId::decode(&mut ie)?);
-                    }
-                    msg.equivalent_plmns = Some(plmns);
+                    // a trailing partial PLMN is discarded with it. Optional:
+                    // a bad one is absent (§7.7.1, #630).
+                    msg.equivalent_plmns = optional_tlv(buf, |b| {
+                        let mut ie = b.read_lv(IeLen::AtLeast(PlmnId::encoded_len()))?;
+                        let count = ie.len() / PlmnId::encoded_len();
+                        let mut plmns = Vec::with_capacity(count);
+                        for _ in 0..count {
+                            plmns.push(PlmnId::decode(&mut ie)?);
+                        }
+                        Ok(plmns)
+                    })?;
                 }
                 0x54 => {
                     buf.skip(1)?;
-                    msg.tai_list = Some(TaiList::decode(buf)?);
+                    msg.tai_list = optional_tlv(buf, TaiList::decode)?;
                 }
                 0x15 => {
                     buf.skip(1)?;
-                    msg.allowed_nssai = Some(Nssai::decode(buf)?);
+                    msg.allowed_nssai = optional_tlv(buf, Nssai::decode)?;
                 }
                 0x11 => {
                     // Rejected NSSAI (TLV) — stored as opaque octets.
@@ -507,15 +504,15 @@ impl RegistrationAccept {
                 }
                 0x50 => {
                     buf.skip(1)?;
-                    msg.pdu_session_status = Some(PduSessionStatus::decode(buf)?);
+                    msg.pdu_session_status = optional_tlv(buf, PduSessionStatus::decode)?;
                 }
                 0x5E => {
                     buf.skip(1)?;
-                    msg.t3512_value = Some(GprsTimer3::decode(buf)?);
+                    msg.t3512_value = optional_tlv(buf, GprsTimer3::decode)?;
                 }
                 0x16 => {
                     buf.skip(1)?;
-                    msg.t3502_value = Some(GprsTimer2::decode(buf)?);
+                    msg.t3502_value = optional_tlv(buf, GprsTimer2::decode)?;
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -575,15 +572,15 @@ impl RegistrationReject {
             match iei {
                 0x5F => {
                     buf.skip(1)?;
-                    msg.t3346_value = Some(GprsTimer2::decode(buf)?);
+                    msg.t3346_value = optional_tlv(buf, GprsTimer2::decode)?;
                 }
                 0x16 => {
                     buf.skip(1)?;
-                    msg.t3502_value = Some(GprsTimer2::decode(buf)?);
+                    msg.t3502_value = optional_tlv(buf, GprsTimer2::decode)?;
                 }
                 0x78 => {
                     buf.skip(1)?;
-                    msg.eap_message = Some(EapMessage::decode(buf)?);
+                    msg.eap_message = optional_tlv_e(buf, EapMessage::decode)?;
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -715,7 +712,7 @@ impl DeregistrationRequestToUe {
                 }
                 0x5F => {
                     buf.skip(1)?;
-                    msg.t3346_value = Some(GprsTimer2::decode(buf)?);
+                    msg.t3346_value = optional_tlv(buf, GprsTimer2::decode)?;
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -801,19 +798,20 @@ impl ServiceRequest {
             match iei {
                 0x40 => {
                     buf.skip(1)?;
-                    msg.uplink_data_status = Some(UplinkDataStatus::decode(buf)?);
+                    msg.uplink_data_status = optional_tlv(buf, UplinkDataStatus::decode)?;
                 }
                 0x50 => {
                     buf.skip(1)?;
-                    msg.pdu_session_status = Some(PduSessionStatus::decode(buf)?);
+                    msg.pdu_session_status = optional_tlv(buf, PduSessionStatus::decode)?;
                 }
                 0x25 => {
                     buf.skip(1)?;
-                    msg.allowed_pdu_session_status = Some(AllowedPduSessionStatus::decode(buf)?);
+                    msg.allowed_pdu_session_status =
+                        optional_tlv(buf, AllowedPduSessionStatus::decode)?;
                 }
                 0x71 => {
                     buf.skip(1)?;
-                    msg.nas_message_container = Some(NasMessageContainer::decode(buf)?);
+                    msg.nas_message_container = optional_tlv_e(buf, NasMessageContainer::decode)?;
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -864,22 +862,22 @@ impl ServiceAccept {
             match iei {
                 0x50 => {
                     buf.skip(1)?;
-                    msg.pdu_session_status = Some(PduSessionStatus::decode(buf)?);
+                    msg.pdu_session_status = optional_tlv(buf, PduSessionStatus::decode)?;
                 }
                 0x26 => {
                     // §9.11.3.42: 4 to 34 octets, octets 5-34 spare "if
                     // included": the PSI bitmap, extra octets skipped in the IE.
                     buf.skip(1)?;
                     msg.pdu_session_reactivation_result =
-                        Some(buf.read_lv(IeLen::AtLeast(2))?.read_u16_le()?);
+                        optional_tlv(buf, |b| b.read_lv(IeLen::AtLeast(2))?.read_u16_le())?;
                 }
                 0x78 => {
                     buf.skip(1)?;
-                    msg.eap_message = Some(EapMessage::decode(buf)?);
+                    msg.eap_message = optional_tlv_e(buf, EapMessage::decode)?;
                 }
                 0x6B => {
                     buf.skip(1)?;
-                    msg.t3448_value = Some(GprsTimer2::decode(buf)?);
+                    msg.t3448_value = optional_tlv(buf, GprsTimer2::decode)?;
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -935,15 +933,15 @@ impl ServiceReject {
             match iei {
                 0x50 => {
                     buf.skip(1)?;
-                    msg.pdu_session_status = Some(PduSessionStatus::decode(buf)?);
+                    msg.pdu_session_status = optional_tlv(buf, PduSessionStatus::decode)?;
                 }
                 0x5F => {
                     buf.skip(1)?;
-                    msg.t3346_value = Some(GprsTimer2::decode(buf)?);
+                    msg.t3346_value = optional_tlv(buf, GprsTimer2::decode)?;
                 }
                 0x78 => {
                     buf.skip(1)?;
-                    msg.eap_message = Some(EapMessage::decode(buf)?);
+                    msg.eap_message = optional_tlv_e(buf, EapMessage::decode)?;
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -1031,7 +1029,7 @@ impl AuthenticationRequest {
                 }
                 0x78 => {
                     buf.skip(1)?;
-                    msg.eap_message = Some(EapMessage::decode(buf)?);
+                    msg.eap_message = optional_tlv_e(buf, EapMessage::decode)?;
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -1070,11 +1068,11 @@ impl AuthenticationResponse {
                 0x2D => {
                     buf.skip(1)?;
                     msg.authentication_response_parameter =
-                        Some(AuthenticationResponseParameter::decode(buf)?);
+                        optional_tlv(buf, AuthenticationResponseParameter::decode)?;
                 }
                 0x78 => {
                     buf.skip(1)?;
-                    msg.eap_message = Some(EapMessage::decode(buf)?);
+                    msg.eap_message = optional_tlv_e(buf, EapMessage::decode)?;
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -1105,7 +1103,7 @@ impl AuthenticationReject {
             match iei {
                 0x78 => {
                     buf.skip(1)?;
-                    msg.eap_message = Some(EapMessage::decode(buf)?);
+                    msg.eap_message = optional_tlv_e(buf, EapMessage::decode)?;
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -1153,7 +1151,7 @@ impl AuthenticationFailure {
                     // octets", i.e. the 14-octet AUTS.
                     buf.skip(1)?;
                     msg.authentication_failure_parameter =
-                        Some(buf.read_lv(IeLen::Exact(14))?.to_vec());
+                        optional_tlv(buf, |b| Ok(b.read_lv(IeLen::Exact(14))?.to_vec()))?;
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -1202,7 +1200,7 @@ impl AuthenticationResult {
             match iei {
                 0x38 => {
                     buf.skip(1)?;
-                    msg.abba = Some(Abba::decode(buf)?);
+                    msg.abba = optional_tlv(buf, Abba::decode)?;
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -1338,15 +1336,15 @@ impl SecurityModeCommand {
                     // §9.11.3.12: "a length of 3 octets", one value octet.
                     buf.skip(1)?;
                     msg.additional_5g_security_information =
-                        Some(buf.read_lv(IeLen::Exact(1))?.read_u8()?);
+                        optional_tlv(buf, |b| b.read_lv(IeLen::Exact(1))?.read_u8())?;
                 }
                 0x78 => {
                     buf.skip(1)?;
-                    msg.eap_message = Some(EapMessage::decode(buf)?);
+                    msg.eap_message = optional_tlv_e(buf, EapMessage::decode)?;
                 }
                 0x38 => {
                     buf.skip(1)?;
-                    msg.abba = Some(Abba::decode(buf)?);
+                    msg.abba = optional_tlv(buf, Abba::decode)?;
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -1389,15 +1387,15 @@ impl SecurityModeComplete {
             match iei {
                 0x77 => {
                     buf.skip(1)?;
-                    msg.imeisv = Some(MobileIdentity::decode(buf)?);
+                    msg.imeisv = optional_tlv_e(buf, MobileIdentity::decode)?;
                 }
                 0x71 => {
                     buf.skip(1)?;
-                    msg.nas_message_container = Some(NasMessageContainer::decode(buf)?);
+                    msg.nas_message_container = optional_tlv_e(buf, NasMessageContainer::decode)?;
                 }
                 0x78 => {
                     buf.skip(1)?;
-                    msg.non_imeisv_pei = Some(MobileIdentity::decode(buf)?);
+                    msg.non_imeisv_pei = optional_tlv_e(buf, MobileIdentity::decode)?;
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -1559,11 +1557,11 @@ impl UlNasTransport {
                 }
                 0x22 => {
                     buf.skip(1)?;
-                    msg.s_nssai = Some(SNssai::decode(buf)?);
+                    msg.s_nssai = optional_tlv(buf, SNssai::decode)?;
                 }
                 0x25 => {
                     buf.skip(1)?;
-                    msg.dnn = Some(Dnn::decode(buf)?);
+                    msg.dnn = optional_tlv(buf, Dnn::decode)?;
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -1666,7 +1664,7 @@ impl DlNasTransport {
                 }
                 0x37 => {
                     buf.skip(1)?;
-                    msg.back_off_timer_value = Some(GprsTimer3::decode(buf)?);
+                    msg.back_off_timer_value = optional_tlv(buf, GprsTimer3::decode)?;
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -1779,19 +1777,19 @@ impl ConfigurationUpdateCommand {
                 }
                 0x77 => {
                     buf.skip(1)?;
-                    msg.guti = Some(MobileIdentity::decode(buf)?);
+                    msg.guti = optional_tlv_e(buf, MobileIdentity::decode)?;
                 }
                 0x54 => {
                     buf.skip(1)?;
-                    msg.tai_list = Some(TaiList::decode(buf)?);
+                    msg.tai_list = optional_tlv(buf, TaiList::decode)?;
                 }
                 0x15 => {
                     buf.skip(1)?;
-                    msg.allowed_nssai = Some(Nssai::decode(buf)?);
+                    msg.allowed_nssai = optional_tlv(buf, Nssai::decode)?;
                 }
                 0x31 => {
                     buf.skip(1)?;
-                    msg.configured_nssai = Some(Nssai::decode(buf)?);
+                    msg.configured_nssai = optional_tlv(buf, Nssai::decode)?;
                 }
                 0x11 => {
                     buf.skip(1)?;
@@ -1839,7 +1837,7 @@ impl ConfigurationUpdateCommand {
                     // octets", one value octet.
                     buf.skip(1)?;
                     msg.network_daylight_saving_time =
-                        Some(buf.read_lv(IeLen::Exact(1))?.read_u8()?);
+                        optional_tlv(buf, |b| b.read_lv(IeLen::Exact(1))?.read_u8())?;
                 }
                 0x79 => {
                     buf.skip(1)?;
@@ -1913,7 +1911,7 @@ impl NotificationResponse {
             match iei {
                 0x50 => {
                     buf.skip(1)?;
-                    msg.pdu_session_status = Some(PduSessionStatus::decode(buf)?);
+                    msg.pdu_session_status = optional_tlv(buf, PduSessionStatus::decode)?;
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -2000,15 +1998,15 @@ impl ControlPlaneServiceRequest {
                 }
                 0x7B => {
                     buf.skip(1)?;
-                    msg.payload_container = Some(PayloadContainer::decode(buf)?);
+                    msg.payload_container = optional_tlv_e(buf, PayloadContainer::decode)?;
                 }
                 0x50 => {
                     buf.skip(1)?;
-                    msg.pdu_session_status = Some(PduSessionStatus::decode(buf)?);
+                    msg.pdu_session_status = optional_tlv(buf, PduSessionStatus::decode)?;
                 }
                 0x71 => {
                     buf.skip(1)?;
-                    msg.nas_message_container = Some(NasMessageContainer::decode(buf)?);
+                    msg.nas_message_container = optional_tlv_e(buf, NasMessageContainer::decode)?;
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -2555,11 +2553,12 @@ impl PduSessionEstablishmentAccept {
                 }
                 0x29 => {
                     buf.skip(1)?;
-                    msg.pdu_address = Some(PduAddress::decode(buf)?);
+                    msg.pdu_address = optional_tlv(buf, PduAddress::decode)?;
                 }
                 0x79 => {
                     buf.skip(1)?;
-                    msg.authorized_qos_flow_descriptions = Some(QosFlowDescriptions::decode(buf)?);
+                    msg.authorized_qos_flow_descriptions =
+                        optional_tlv_e(buf, QosFlowDescriptions::decode)?;
                 }
                 0x7B => {
                     buf.skip(1)?;
@@ -2572,7 +2571,7 @@ impl PduSessionEstablishmentAccept {
                 }
                 0x25 => {
                     buf.skip(1)?;
-                    msg.dnn = Some(Dnn::decode(buf)?);
+                    msg.dnn = optional_tlv(buf, Dnn::decode)?;
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -2623,7 +2622,7 @@ impl PduSessionEstablishmentReject {
             match iei {
                 0x37 => {
                     buf.skip(1)?;
-                    msg.back_off_timer_value = Some(GprsTimer3::decode(buf)?);
+                    msg.back_off_timer_value = optional_tlv(buf, GprsTimer3::decode)?;
                 }
                 0x7B => {
                     buf.skip(1)?;
@@ -2676,11 +2675,12 @@ impl PduSessionModificationRequest {
             match iei {
                 0x7A => {
                     buf.skip(1)?;
-                    msg.requested_qos_rules = Some(QosRules::decode(buf)?);
+                    msg.requested_qos_rules = optional_tlv_e(buf, QosRules::decode)?;
                 }
                 0x79 => {
                     buf.skip(1)?;
-                    msg.requested_qos_flow_descriptions = Some(QosFlowDescriptions::decode(buf)?);
+                    msg.requested_qos_flow_descriptions =
+                        optional_tlv_e(buf, QosFlowDescriptions::decode)?;
                 }
                 0x7B => {
                     buf.skip(1)?;
@@ -2744,15 +2744,16 @@ impl PduSessionModificationCommand {
                 }
                 0x2A => {
                     buf.skip(1)?;
-                    msg.session_ambr = Some(SessionAmbr::decode(buf)?);
+                    msg.session_ambr = optional_tlv(buf, SessionAmbr::decode)?;
                 }
                 0x7A => {
                     buf.skip(1)?;
-                    msg.authorized_qos_rules = Some(QosRules::decode(buf)?);
+                    msg.authorized_qos_rules = optional_tlv_e(buf, QosRules::decode)?;
                 }
                 0x79 => {
                     buf.skip(1)?;
-                    msg.authorized_qos_flow_descriptions = Some(QosFlowDescriptions::decode(buf)?);
+                    msg.authorized_qos_flow_descriptions =
+                        optional_tlv_e(buf, QosFlowDescriptions::decode)?;
                 }
                 _ => skip_unknown_ie(buf, iei)?,
             }
@@ -2803,7 +2804,7 @@ impl PduSessionModificationReject {
             match iei {
                 0x37 => {
                     buf.skip(1)?;
-                    msg.back_off_timer_value = Some(GprsTimer3::decode(buf)?);
+                    msg.back_off_timer_value = optional_tlv(buf, GprsTimer3::decode)?;
                 }
                 0x7B => {
                     buf.skip(1)?;
@@ -3012,7 +3013,7 @@ impl PduSessionReleaseCommand {
             match iei {
                 0x37 => {
                     buf.skip(1)?;
-                    msg.back_off_timer_value = Some(GprsTimer3::decode(buf)?);
+                    msg.back_off_timer_value = optional_tlv(buf, GprsTimer3::decode)?;
                 }
                 0x7B => {
                     buf.skip(1)?;
@@ -3221,7 +3222,7 @@ impl PduSessionAuthenticationResult {
             match iei {
                 0x78 => {
                     buf.skip(1)?;
-                    msg.eap_message = Some(EapMessage::decode(buf)?);
+                    msg.eap_message = optional_tlv_e(buf, EapMessage::decode)?;
                 }
                 0x7B => {
                     buf.skip(1)?;

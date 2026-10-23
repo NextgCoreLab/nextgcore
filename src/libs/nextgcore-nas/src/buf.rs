@@ -145,6 +145,43 @@ pub(crate) trait NasBuf: Buf {
 
 impl<B: Buf + ?Sized> NasBuf for B {}
 
+/// Decode an optional type 4 IE (TLV, 1-octet length) per TS 24.501 §7.7.1 /
+/// TS 24.301 §7.7.1: "The UE shall treat all optional IEs that are
+/// syntactically incorrect in a message as not present in the message. The
+/// network shall take the same approach." (#630)
+///
+/// `buf` is positioned after the IEI, at the length octet. The IE is framed by
+/// its own length and `decode` runs on exactly that frame (length octet
+/// included, as the IE decoders expect). Any error inside the frame makes the
+/// IE absent (`None`), and the walk continues after it. A frame that runs past
+/// the message is still an error: the message is truncated, not the IE.
+pub(crate) fn optional_tlv<T>(
+    buf: &mut Bytes,
+    decode: impl FnOnce(&mut Bytes) -> NasResult<T>,
+) -> NasResult<Option<T>> {
+    let len = buf.peek_u8()? as usize;
+    optional_framed(buf, 1 + len, decode)
+}
+
+/// [`optional_tlv`] for a type 6 IE (TLV-E, 2-octet length).
+pub(crate) fn optional_tlv_e<T>(
+    buf: &mut Bytes,
+    decode: impl FnOnce(&mut Bytes) -> NasResult<T>,
+) -> NasResult<Option<T>> {
+    buf.need(2)?;
+    let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+    optional_framed(buf, 2 + len, decode)
+}
+
+fn optional_framed<T>(
+    buf: &mut Bytes,
+    frame_len: usize,
+    decode: impl FnOnce(&mut Bytes) -> NasResult<T>,
+) -> NasResult<Option<T>> {
+    let mut frame = buf.read_bytes(frame_len)?;
+    Ok(decode(&mut frame).ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
