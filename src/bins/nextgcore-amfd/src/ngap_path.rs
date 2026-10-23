@@ -22867,6 +22867,34 @@ mod tests {
         );
     }
 
+    /// **#738 (review of #550).** The PDU session establishment HANDLER records the
+    /// session in the AMF context's store, under the ref the SMF chose. The helper test
+    /// above calls `record_amf_session` directly, so removing the production call left
+    /// the suite green; this drives `handle_5gsm_message` against a fake SMF.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_established_pdu_session_is_recorded_by_the_handler() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (_smf, port) = fake_smf_creating_sm_contexts("smf-ref-738-sess").await;
+        let _env = SmfEnvGuard::set(port);
+        let mut ngap = capturing_ngap_server().await;
+        let ue = 7_738_010u64;
+        let mut state = UeNasContext::new(ue, 72, 1, false);
+        state.registered = true;
+        ngap.ue_auth_state.insert(ue, state);
+
+        let _ = ngap
+            .handle_5gsm_message(1, ue, 72, &pdu_session_establishment_request(4), None)
+            .await;
+
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap();
+        let sess = guard
+            .sess_find_by_psi(ue, 4)
+            .expect("the established session is in the AMF context's store (#540)");
+        assert_eq!(sess.sm_context_ref.as_deref(), Some("smf-ref-738-sess"));
+        guard.sess_remove(sess.id);
+    }
+
     /// **#356**: an NG Reset frees the emergency contexts of the UEs it drops, and only
     /// those.
     ///
