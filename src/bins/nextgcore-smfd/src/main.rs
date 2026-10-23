@@ -5433,6 +5433,15 @@ fn complete_sm_context_release(sm_context_ref: &str) -> Option<String> {
 
 /// Drop an SM context and its policy binding, returning the AMF's
 /// `smContextStatusUri` for the RELEASED notification.
+///
+/// #853: everything the AMF-driven release (`handle_sm_context_release`) does for
+/// the context, not only the local drop. The UE's IPv4 address goes back to the pool,
+/// any PFCP session map entry goes, and the release's effects at other NFs are sent
+/// from their own task ([`release_side_effects`]): UDM deregistration and SDM
+/// unsubscribe, the EBI back to the AMF, the EASDF DNS context, and the PDU_SES_REL
+/// event. Before, a release completed through the UE (#39 reactivation after a UPF
+/// restart, a UE-requested or RAN-released session) left one serving-SMF registration
+/// and SDM subscription per session at the UDM, and held the address.
 fn release_sm_context_locally(sm_context_ref: &str) -> Option<String> {
     let removed = smf_self().read().ok().and_then(|ctx| {
         ctx.policy_bindings
@@ -5444,8 +5453,66 @@ fn release_sm_context_locally(sm_context_ref: &str) -> Option<String> {
         if let Some(sess) = context.sess_find_by_sm_context_ref(sm_context_ref) {
             context.sess_remove(sess.id);
         }
+        for map in [&context.pfcp_sessions, &context.cp_n4_seids] {
+            if let Ok(mut m) = map.write() {
+                m.remove(sm_context_ref);
+            }
+        }
+        if let Some(b) = removed.as_ref().filter(|b| b.ue_ip != [0; 4]) {
+            context.ipv4_pool.release(std::net::Ipv4Addr::from(b.ue_ip));
+        }
+        // Issue #191: after every write guard above has dropped.
+        context.persist();
     }
-    removed.and_then(|b| b.sm_context_status_uri)
+    let status_uri = removed
+        .as_ref()
+        .and_then(|b| b.sm_context_status_uri.clone());
+    if let Some(binding) = removed {
+        let reference = sm_context_ref.to_string();
+        tokio::spawn(async move { release_side_effects(&reference, &binding).await });
+    }
+    status_uri
+}
+
+/// A released SM context's effects at other NFs, each best-effort (#853): its EASDF
+/// DNS context (#114), its UDM serving-SMF registration and SDM subscription (#293),
+/// its EPS bearer identity at the AMF (#291), and the PDU_SES_REL event (#79). Shared
+/// by every release path so none can skip one.
+async fn release_side_effects(sm_context_ref: &str, binding: &context::PolicyBinding) {
+    // #114: a failure leaves an orphan the EASDF's own capacity cap bounds, whereas
+    // failing the release would leave this SMF's session state inconsistent with
+    // the AMF's.
+    if let Some(ctx_id) = &binding.easdf_dns_context_id {
+        easdf::delete_dns_context(&binding.supi, ctx_id).await;
+    }
+    // #293: without the deregistration a UDM accumulates serving-SMF records for
+    // released sessions, so a procedure resolving the serving SMF through the UDM
+    // resolves a released session to this SMF. Without the unsubscribe the UDM keeps
+    // notifying a callback URI whose smContextRef no longer resolves.
+    udm::deregister_serving_smf(&binding.supi, binding.psi).await;
+    if let Some(sub_id) = &binding.sdm_subscription_id {
+        udm::unsubscribe_sm_data(&binding.supi, sub_id).await;
+    }
+    // #291: the eleven-wide per-UE EBI space (TS 24.301 §9.3.2) otherwise leaks one
+    // identity per session lifetime. The AMF's authority is the same
+    // `smContextStatusUri` callback root the assignment used.
+    if let Some(ebi) = binding.mapped_eps_bearer_id {
+        eps_iwk::release_ebi(
+            binding.sm_context_status_uri.as_deref(),
+            &binding.supi,
+            binding.psi,
+            ebi,
+        )
+        .await;
+    }
+    // #79: Nsmf_EventExposure_Notify for PDU_SES_REL (TS 29.508 §4.2.3.2).
+    event_exposure::notify(
+        event_exposure::event::PDU_SES_REL,
+        &binding.supi,
+        binding.psi,
+    )
+    .await;
+    log::debug!("ref={sm_context_ref}: release side effects done");
 }
 
 /// Release a PDU session whose UPF restarted, asking the UE to establish it again
@@ -6256,70 +6323,12 @@ async fn handle_sm_context_release(
             .and_then(|mut bindings| bindings.remove(sm_context_ref))
     });
 
-    // #114: delete this session's EASDF DNS context. Read off the binding taken
-    // above, so a session that never had one costs nothing here. Best-effort: a
-    // failure leaves an orphan the EASDF's own capacity cap bounds, whereas
-    // failing the release would leave this SMF's session state inconsistent with
-    // the AMF's.
+    // #114, #293, #291, #79: the release's effects at the EASDF, the UDM, the AMF
+    // (EBI) and event-exposure subscribers, shared with every other release path
+    // (#853). Read off the binding taken above; each is best-effort, because the
+    // session is leaving either way.
     if let Some(binding) = &binding {
-        if let (Some(ctx_id), supi) = (&binding.easdf_dns_context_id, &binding.supi) {
-            easdf::delete_dns_context(supi, ctx_id).await;
-        }
-    }
-
-    // #293: tell the UDM this session is over — remove the serving-SMF record and
-    // delete the SDM subscription created at establishment. Both read off the binding
-    // taken above, both are best-effort for the same reason as the EASDF delete, and
-    // both name what is left behind on failure.
-    //
-    // Without the deregistration a UDM accumulates serving-SMF records for released
-    // sessions, so a procedure resolving the serving SMF through the UDM resolves a
-    // released session to this SMF. Without the unsubscribe the UDM keeps notifying a
-    // callback URI whose smContextRef no longer resolves — which the notification
-    // handler answers 404 to, deliberately.
-    if let Some(binding) = &binding {
-        udm::deregister_serving_smf(&binding.supi, binding.psi).await;
-        if let Some(sub_id) = &binding.sdm_subscription_id {
-            udm::unsubscribe_sm_data(&binding.supi, sub_id).await;
-        }
-    }
-
-    // #291: give this session's EPS bearer identity back to the AMF, which owns the
-    // space. Same shape as the EASDF delete above and for the same reason: read off
-    // the binding taken above, so a session that never had an EBI costs nothing, and
-    // best-effort because the session is leaving either way.
-    //
-    // Without this the eleven-wide per-UE space (TS 24.301 §9.3.2 reserves 0..=4)
-    // leaks one identity per session lifetime, and because the AMF allocates
-    // lowest-free it does not look under pressure until the twelfth session gets a
-    // 403 with no live bearers to show for it.
-    //
-    // The AMF's authority is the same `smContextStatusUri` callback root the
-    // assignment used and that this handler notifies below — the only address this
-    // SMF has for it.
-    if let Some(binding) = &binding {
-        if let Some(ebi) = binding.mapped_eps_bearer_id {
-            eps_iwk::release_ebi(
-                binding.sm_context_status_uri.as_deref(),
-                &binding.supi,
-                binding.psi,
-                ebi,
-            )
-            .await;
-        }
-    }
-
-    // #79: Nsmf_EventExposure_Notify for PDU_SES_REL (TS 29.508 §4.2.3.2). Emitted
-    // from the binding taken above, so a subscription scoped to this SUPI or this
-    // PDU session id can be matched. A session with no matching subscription costs
-    // one map read.
-    if let Some(binding) = &binding {
-        event_exposure::notify(
-            event_exposure::event::PDU_SES_REL,
-            &binding.supi,
-            binding.psi,
-        )
-        .await;
+        release_side_effects(sm_context_ref, binding).await;
     }
 
     // Drive the GSM FSM: Operational → WaitPfcpDeletion
@@ -9866,6 +9875,75 @@ mod tests {
         for k in ["SMF_URR_VOLUME_QUOTA", "SMF_URR_TIME_QUOTA"] {
             std::env::remove_var(k);
         }
+    }
+
+    /// #853: a release the UE completes (here the #39 reactivation release a UPF
+    /// restart sends, then the UE's PDU SESSION RELEASE COMPLETE) tells the UDM as the
+    /// AMF-driven release does: the serving-SMF registration is deregistered and the
+    /// SDM subscription removed. The UE's address goes back to the pool. Before, every
+    /// such release left both at the UDM, and held the address.
+    #[tokio::test]
+    async fn a_ue_completed_release_deregisters_from_the_udm_and_frees_the_address() {
+        let _state = crate::context::PROCESS_STATE_TEST_LOCK.lock().await;
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let (udm_srv, seen) = spawn_recording_udm(serde_json::json!({})).await;
+        udm::set_for_test(true);
+        let reference = "n853-complete";
+        seed_binding(reference, 5);
+        let ue_ip = std::net::Ipv4Addr::new(10, 45, 8, 53);
+        let reserved = smf_self().read().unwrap().ipv4_pool.reserve(ue_ip);
+        if let Ok(ctx) = smf_self().read() {
+            if let Some(b) = ctx.policy_bindings.write().unwrap().get_mut(reference) {
+                b.sdm_subscription_id = Some("sub-853".to_string());
+                b.ue_ip = ue_ip.octets();
+            }
+        }
+        release_for_reactivation(reference, "http://127.0.0.1:1", "imsi-001010000000001", 5).await;
+
+        let complete = n1(
+            5,
+            0,
+            gsm_build::message_type::PDU_SESSION_RELEASE_COMPLETE,
+            &[],
+        );
+        let status = handle_n1_sm_message(reference, &complete).await.status;
+        let deletes = || {
+            seen.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|(m, _, _)| m == "DELETE")
+                .map(|(_, u, _)| u.clone())
+                .collect::<Vec<String>>()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while deletes().len() < 2 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let deletes = deletes();
+        let freed = smf_self().read().unwrap().ipv4_pool.reserve(ue_ip);
+        if freed {
+            smf_self().read().unwrap().ipv4_pool.release(ue_ip);
+        }
+        udm::set_for_test(false);
+        std::env::remove_var("UDM_SBI_ADDR");
+        std::env::remove_var("UDM_SBI_PORT");
+        udm_srv.stop().await.ok();
+
+        assert!(reserved, "precondition: the address was the session's");
+        assert_eq!(status, 204);
+        assert!(
+            deletes
+                .iter()
+                .any(|u| u.contains("/registrations/smf-registrations/5")),
+            "Nudm_UECM_Deregistration of the serving SMF: {deletes:?}"
+        );
+        assert!(
+            deletes
+                .iter()
+                .any(|u| u.ends_with("/sdm-subscriptions/sub-853")),
+            "Nudm_SDM_Unsubscribe: {deletes:?}"
+        );
+        assert!(freed, "the address is back in the pool");
     }
 
     // ---- #719: a reactivation release terminates the SM Policy Association ----
