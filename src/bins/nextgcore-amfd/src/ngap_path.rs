@@ -8616,33 +8616,34 @@ impl NgapServer {
         data: &[u8],
     ) -> Result<()> {
         use crate::ngap_asn1::UeContextReleaseCompleteDecode::{Complete, Failed, Undecodable};
-        let amf_ue_ngap_id = match crate::ngap_asn1::decode_ue_context_release_complete_asn1(data) {
-            Complete {
-                amf_ue_ngap_id,
-                error_indication,
-                ..
-            } => {
-                // Best effort: the report must not stop the supervision below.
-                if let Some(report) = error_indication {
-                    if let Err(e) = self
-                        .send_criticality_error_indication(association_id, &report)
-                        .await
-                    {
-                        log::warn!("Failed to send ErrorIndication: {e}");
+        let (amf_ue_ngap_id, ran_ue_ngap_id) =
+            match crate::ngap_asn1::decode_ue_context_release_complete_asn1(data) {
+                Complete {
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    error_indication,
+                } => {
+                    // Best effort: the report must not stop the supervision below.
+                    if let Some(report) = error_indication {
+                        if let Err(e) = self
+                            .send_criticality_error_indication(association_id, &report)
+                            .await
+                        {
+                            log::warn!("Failed to send ErrorIndication: {e}");
+                        }
                     }
+                    (amf_ue_ngap_id, ran_ue_ngap_id)
                 }
-                amf_ue_ngap_id
-            }
-            Failed(diagnostics) => {
-                log::warn!(
-                    "UE Context Release Complete carries not-comprehended IEs marked reject \
+                Failed(diagnostics) => {
+                    log::warn!(
+                        "UE Context Release Complete carries not-comprehended IEs marked reject \
                      ({diagnostics:?}); the release is unsuccessfully terminated (TS 38.413 \
                      §10.3.4.2), handled locally"
-                );
-                None
-            }
-            Undecodable => None,
-        };
+                    );
+                    (None, None)
+                }
+                Undecodable => (None, None),
+            };
         // #758: the released NG connection's contextless allocation goes with it, so
         // the gNB cannot later mint a context under the released ID.
         if let Some(id) = amf_ue_ngap_id {
@@ -8652,16 +8653,55 @@ impl NgapServer {
         // The N1 signalling connection is gone: a registered UE is now CM-IDLE, which
         // is what makes a later N1N2 transfer page it (#512). Marked whether or not
         // the mobile reachable timer below is enabled.
+        //
+        // #738: only when the released NG connection is the one SERVING the UE. After
+        // an N2 handover `handle_handover_notify` has moved the UE to the target and
+        // released the source with a successful-handover Release Command carrying the
+        // same AMF UE NGAP ID; the source's Release Complete ends that old leg only
+        // (TS 23.502 §4.9.1.3.3 step 14a, the release of the S-RAN's resources; TS 38.413
+        // §8.3.3.2, the Complete ends THAT UE-associated logical NG-connection). Applying
+        // it to the UE
+        // marked a connected UE idle, deactivated its user plane and armed the mobile
+        // reachable timer. The check and the idle marking share one store access, so
+        // nothing can move the UE between them.
         if let Some(id) = amf_ue_ngap_id {
-            let went_idle = self
-                .ue_auth_state
-                .with_mut(id, |s| {
-                    if s.registered {
-                        s.cm_idle = true;
-                    }
-                    s.registered
-                })
-                .unwrap_or(false);
+            let leg = self.ue_auth_state.with_mut(id, |s| {
+                let serving = (s.association_id, s.ran_ue_ngap_id);
+                // The RAN UE NGAP ID is mandatory but criticality ignore (§9.2.2.6):
+                // when it was absent the association alone decides.
+                if serving.0 != association_id || ran_ue_ngap_id.is_some_and(|ran| ran != serving.1)
+                {
+                    return Err(serving);
+                }
+                // Only the CONNECTED -> IDLE transition deactivates the user plane and
+                // arms the timer: a duplicate Complete for a UE already idle must not
+                // re-send DEACTIVATED or push the reachability deadline back.
+                let went_idle = s.registered && !s.cm_idle;
+                if s.registered {
+                    s.cm_idle = true;
+                }
+                Ok((s.registered, went_idle))
+            });
+            let went_idle = match leg {
+                Some(Err((serving_assoc, serving_ran))) => {
+                    log::info!(
+                        "UE Context Release Complete for UE {id} from association \
+                         {association_id} (ran_ue_ngap_id={ran_ue_ngap_id:?}) ends a \
+                         connection that no longer serves it (serving: association \
+                         {serving_assoc}, ran_ue_ngap_id={serving_ran}); only that leg is \
+                         released, the UE stays CM-CONNECTED"
+                    );
+                    return Ok(());
+                }
+                Some(Ok((true, false))) => {
+                    log::debug!(
+                        "Duplicate UE Context Release Complete for UE {id}: already CM-IDLE"
+                    );
+                    return Ok(());
+                }
+                Some(Ok((_, went_idle))) => went_idle,
+                None => false,
+            };
             // #540 / TS 23.502 §4.2.6 step 5: the AN release ends the user plane of
             // every PDU session the UE keeps, so the SMF has the UPF buffer
             // downlink data (and report it, which is what pages the UE) instead
@@ -10264,6 +10304,14 @@ impl NgapServer {
             // target now that the UE has arrived (TS 23.502 Section 4.9.1.3).
             state.association_id = association_id;
             state.ran_ue_ngap_id = notify.ran_ue_ngap_id;
+            // #738 review: the UE has ARRIVED on the target, so it is CM-CONNECTED
+            // whatever happened to the source leg meanwhile. A source Release Complete
+            // that came BEFORE this Notify (a source-raised release mid-execution) was
+            // the serving leg at the time and idled the UE and armed the mobile
+            // reachable timer; left in place, a connected UE would be paged and later
+            // implicitly deregistered.
+            state.cm_idle = false;
+            state.reachability = None;
             // #406: was this same unpacking written out inline. Shared with the Uplink NAS
             // Transport and PathSwitchRequest sites now, so the three cannot reassemble the
             // big-endian TAC differently. Behaviour here is unchanged — this was the one
@@ -21812,6 +21860,350 @@ mod tests {
         assert!(take_sent_ngap(&mut server).is_empty(), "take drains");
     }
 
+    /// A stand-in SMF recording every request as `(uri, json body)` and answering
+    /// `204 No Content`. Addressed per session through `sm_context_smfs` (#669), so
+    /// it needs no `SMF_SBI_*` environment and no lock on it. Keep the server alive.
+    #[allow(clippy::type_complexity)]
+    async fn recording_smf() -> (
+        nextgcore_sbi::server::SbiServer,
+        u16,
+        Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    ) {
+        // Plain h2c loopback: the client must dial it under the dev profile (#586).
+        nextgcore_sbi::security::set_sbi_profile_override(nextgcore_sbi::security::SbiProfile::Dev);
+        let seen: Arc<std::sync::Mutex<Vec<(String, String)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let (listener, addr) = nextgcore_sbi::test_support::bound_listener().into_parts();
+        let server = nextgcore_sbi::server::SbiServer::on_listener(
+            nextgcore_sbi::server::SbiServerConfig::new(addr),
+            listener,
+        );
+        server
+            .start(move |req: nextgcore_sbi::SbiRequest| {
+                let sink = Arc::clone(&sink);
+                async move {
+                    sink.lock().expect("sink").push((
+                        req.header.uri.clone(),
+                        req.http.content.clone().unwrap_or_default(),
+                    ));
+                    nextgcore_sbi::SbiResponse::no_content()
+                }
+            })
+            .await
+            .expect("recording SMF starts");
+        for _ in 0..200 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (server, addr.port(), seen)
+    }
+
+    /// **#738.** After an N2 handover the SOURCE gNB's UE Context Release Complete ends
+    /// the source leg only (TS 38.413 §8.4.3, TS 23.502 §4.9.1.3.3 step 14a). The UE is
+    /// on the target: it must stay CM-CONNECTED, keep its user plane and not be put
+    /// under the mobile reachable timer.
+    ///
+    /// Driven end to end through the handlers, with what amfd SENDS captured: the
+    /// HandoverNotify's Release Command to the source (NGAP capture), and every N11
+    /// call (recording SMF). Then the release of the SERVING leg, from the target,
+    /// must still do all three -- the positive control that the deactivation and the
+    /// timer are observable here at all (#550's deactivation had no handler test).
+    ///
+    /// REVERT-VERIFIED: without the serving-leg check in
+    /// `handle_ue_context_release_complete` the source's Release Complete marks the UE
+    /// idle, a `DEACTIVATED` update reaches the SMF and the timer is armed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_source_release_complete_after_a_handover_leaves_the_ue_connected() {
+        // (source RAN UE NGAP ID, target RAN UE NGAP ID, does the source's Complete
+        // carry its RAN UE NGAP ID). The SAME id on both gNBs is the common case --
+        // each gNB allocates from its own small counter -- and is what isolates the
+        // ASSOCIATION half of the serving check; the absent id (mandatory, criticality
+        // ignore, §9.2.2.6) leaves the association as the only discriminator.
+        for (case, (source_ran, target_ran, ran_in_complete)) in
+            [(31u32, 732u32, true), (31, 31, true), (31, 31, false)]
+                .into_iter()
+                .enumerate()
+        {
+            source_release_after_handover_case(
+                case as u64,
+                source_ran,
+                target_ran,
+                ran_in_complete,
+            )
+            .await;
+        }
+    }
+
+    /// A UE Context Release Complete naming `amf_ue_ngap_id`, with the RAN UE NGAP ID
+    /// IE only when `ran_ue_ngap_id` is `Some` (generated codec).
+    fn release_complete_pdu(amf_ue_ngap_id: u64, ran_ue_ngap_id: Option<u32>) -> Vec<u8> {
+        use g::UEContextReleaseCompleteProtocolIEs_EntryValue as Ie;
+        use nextgcore_ngap_gen::generated as g;
+        let mut ies = vec![g::UEContextReleaseCompleteProtocolIEs_Entry {
+            id: g::ProtocolIE_ID(g::ID_AMF_UE_NGAP_ID),
+            criticality: g::Criticality(g::Criticality::IGNORE),
+            value: Ie::Id_AMF_UE_NGAP_ID(g::AMF_UE_NGAP_ID(amf_ue_ngap_id)),
+        }];
+        if let Some(ran) = ran_ue_ngap_id {
+            ies.push(g::UEContextReleaseCompleteProtocolIEs_Entry {
+                id: g::ProtocolIE_ID(g::ID_RAN_UE_NGAP_ID),
+                criticality: g::Criticality(g::Criticality::IGNORE),
+                value: Ie::Id_RAN_UE_NGAP_ID(g::RAN_UE_NGAP_ID(ran)),
+            });
+        }
+        nextgcore_ngap_gen::encode(&g::NGAP_PDU::SuccessfulOutcome(g::SuccessfulOutcome {
+            procedure_code: g::ProcedureCode(g::ID_UE_CONTEXT_RELEASE),
+            criticality: g::Criticality(g::Criticality::REJECT),
+            value: g::SuccessfulOutcomeValue::Id_UEContextRelease(g::UEContextReleaseComplete {
+                protocol_i_es: g::UEContextReleaseCompleteProtocolIEs(ies),
+            }),
+        }))
+        .expect("encode UEContextReleaseComplete")
+    }
+
+    async fn source_release_after_handover_case(
+        case: u64,
+        source_ran: u32,
+        target_ran: u32,
+        ran_in_complete: bool,
+    ) {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (_smf, smf_port, smf_seen) = recording_smf().await;
+        let mut server = capturing_ngap_server().await;
+        let (source, target) = (97_381u64 + 10 * case, 97_382u64 + 10 * case);
+        let amf_ue_ngap_id = 7_738_001u64 + 100 * case;
+        let (psi, sm_ref) = (5u8, "ref-738");
+        seed_gnb_session(&server, source).await;
+        seed_gnb_session(&server, target).await;
+
+        // A registered, CONNECTED UE on the source with one PDU session, whose target
+        // admitted it (the HandoverRequestAcknowledge's per-session transfer).
+        let mut state = UeNasContext::new(amf_ue_ngap_id, source_ran, source, false);
+        state.registered = true;
+        state.amf_ue.supi = Some("imsi-001010000738001".to_string());
+        server.ue_auth_state.insert(amf_ue_ngap_id, state);
+        server
+            .sm_context_refs
+            .insert((amf_ue_ngap_id, psi), sm_ref.to_string());
+        server
+            .sm_context_smfs
+            .insert((amf_ue_ngap_id, psi), ("127.0.0.1".to_string(), smf_port));
+        server
+            .handover_target_assoc
+            .insert(amf_ue_ngap_id, (target, target_ran));
+        server
+            .handover_target_transfers
+            .insert((amf_ue_ngap_id, psi), vec![0x00, 0x03, 0xE0]);
+
+        // HandoverNotify from the target: the UE has arrived.
+        let report = server
+            .handle_handover_notify(target, &handover_notify_pdu(amf_ue_ngap_id, target_ran))
+            .await
+            .expect("handled");
+        assert!(report.source_release_sent);
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(sent.len(), 1, "one PDU: the source release, got {sent:?}");
+        assert_eq!(sent[0].0, source, "the Release Command goes to the SOURCE");
+        assert_eq!(
+            decoded_release_command(&sent[0].1),
+            Some((
+                amf_ue_ngap_id,
+                Some(source_ran),
+                Some(nextgcore_ngap_gen::generated::CauseRadioNetwork::SUCCESSFUL_HANDOVER)
+            )),
+            "UE Context Release Command, the SOURCE id pair, successful-handover"
+        );
+        let n11 = |seen: &Arc<std::sync::Mutex<Vec<(String, String)>>>| -> Vec<String> {
+            seen.lock()
+                .expect("sink")
+                .iter()
+                .map(|(_, body)| body.clone())
+                .collect()
+        };
+        let after_notify = n11(&smf_seen);
+        assert_eq!(
+            after_notify.len(),
+            1,
+            "HANDOVER_COMPLETE only: {after_notify:?}"
+        );
+        assert!(after_notify[0].contains("HANDOVER_COMPLETE"));
+
+        // The source answers its Release Command.
+        let source_complete =
+            release_complete_pdu(amf_ue_ngap_id, ran_in_complete.then_some(source_ran));
+        server
+            .handle_ue_context_release_complete(source, &source_complete)
+            .await
+            .expect("handled");
+
+        let ue = server.ue_auth_state.get(amf_ue_ngap_id).expect("UE kept");
+        assert!(
+            !ue.is_cm_idle(),
+            "the UE is connected on the target; the source leg's release must not idle it"
+        );
+        assert_eq!((ue.association_id, ue.ran_ue_ngap_id), (target, target_ran));
+        assert_eq!(
+            ue.reachability.map(|r| r.phase),
+            None,
+            "no mobile reachable timer for a CM-CONNECTED UE"
+        );
+        assert_eq!(
+            n11(&smf_seen),
+            after_notify,
+            "the source's Release Complete sent the SMF nothing: its sessions stay active"
+        );
+        assert!(take_sent_ngap(&mut server).is_empty());
+
+        // Positive control: the release of the SERVING leg (the target's) is the one
+        // that ends the N1 connection.
+        let target_complete = nextgcore_ngap::builder::build_ue_context_release_complete(
+            &nextgcore_ngap::types::UeContextReleaseComplete {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id: target_ran,
+            },
+        )
+        .expect("encode");
+        server
+            .handle_ue_context_release_complete(target, &target_complete)
+            .await
+            .expect("handled");
+        let ue = server.ue_auth_state.get(amf_ue_ngap_id).expect("UE kept");
+        assert!(
+            ue.is_cm_idle(),
+            "the serving leg's release makes the UE CM-IDLE"
+        );
+        assert_eq!(
+            ue.reachability.map(|r| r.phase),
+            Some(ReachabilityPhase::MobileReachable)
+        );
+        let calls = smf_seen.lock().expect("sink").clone();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(calls[1]
+            .0
+            .ends_with(&format!("/nsmf-pdusession/v1/sm-contexts/{sm_ref}/modify")));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&calls[1].1).expect("json")["upCnxState"],
+            "DEACTIVATED",
+            "TS 23.502 §4.2.6 step 5: the AN release deactivates the session's user plane"
+        );
+
+        // A duplicate of the serving leg's Complete is idempotent: no second
+        // DEACTIVATED, and the reachability deadline is not pushed back.
+        let deadline = ue.reachability.map(|r| r.deadline);
+        server
+            .handle_ue_context_release_complete(target, &target_complete)
+            .await
+            .expect("handled");
+        assert_eq!(
+            smf_seen.lock().expect("sink").len(),
+            2,
+            "no second N11 call"
+        );
+        assert_eq!(
+            server
+                .ue_auth_state
+                .get(amf_ue_ngap_id)
+                .and_then(|u| u.reachability)
+                .map(|r| r.deadline),
+            deadline,
+            "the timer is not re-armed"
+        );
+    }
+
+    /// **#738 review, MAJOR-2.** A source Release Complete that arrives BEFORE the
+    /// HandoverNotify (the source raised a release mid-execution) is the serving leg at
+    /// that moment and idles the UE. The Notify then says the UE has ARRIVED on the
+    /// target: it must leave the UE CM-CONNECTED with no mobile reachable timer, or a
+    /// connected UE is paged and later implicitly deregistered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handover_notify_after_the_source_release_leaves_the_ue_connected() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut server = capturing_ngap_server().await;
+        let (source, target) = (97_391u64, 97_392u64);
+        let amf_ue_ngap_id = 7_738_020u64;
+        seed_gnb_session(&server, source).await;
+        seed_gnb_session(&server, target).await;
+        let mut state = UeNasContext::new(amf_ue_ngap_id, 7, source, false);
+        state.registered = true;
+        server.ue_auth_state.insert(amf_ue_ngap_id, state);
+
+        server
+            .handle_ue_context_release_complete(
+                source,
+                &release_complete_pdu(amf_ue_ngap_id, Some(7)),
+            )
+            .await
+            .expect("handled");
+        let ue = server.ue_auth_state.get(amf_ue_ngap_id).expect("UE kept");
+        assert!(
+            ue.is_cm_idle(),
+            "precondition: the serving leg's release idled it"
+        );
+        assert!(
+            ue.reachability.is_some(),
+            "precondition: the timer is armed"
+        );
+
+        server
+            .handle_handover_notify(target, &handover_notify_pdu(amf_ue_ngap_id, 8))
+            .await
+            .expect("handled");
+        let ue = server.ue_auth_state.get(amf_ue_ngap_id).expect("UE kept");
+        assert_eq!((ue.association_id, ue.ran_ue_ngap_id), (target, 8));
+        assert!(!ue.is_cm_idle(), "arrived on the target: CM-CONNECTED");
+        assert_eq!(
+            ue.reachability.map(|r| r.phase),
+            None,
+            "no reachability timer"
+        );
+    }
+
+    /// **#738.** The serving check is on the RAN UE NGAP ID too: a Release Complete
+    /// from the serving gNB for an OLDER NG connection of the UE (a RAN UE NGAP ID the
+    /// UE no longer has there) ends that connection only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_release_complete_for_a_stale_ran_ue_id_leaves_the_ue_connected() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let mut server = capturing_ngap_server().await;
+        let (assoc, amf_ue_ngap_id) = (97_383u64, 7_738_002u64);
+        let mut state = UeNasContext::new(amf_ue_ngap_id, 41, assoc, false);
+        state.registered = true;
+        server.ue_auth_state.insert(amf_ue_ngap_id, state);
+        let complete = |ran_ue_ngap_id| {
+            nextgcore_ngap::builder::build_ue_context_release_complete(
+                &nextgcore_ngap::types::UeContextReleaseComplete {
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                },
+            )
+            .expect("encode")
+        };
+        server
+            .handle_ue_context_release_complete(assoc, &complete(40))
+            .await
+            .expect("handled");
+        let ue = server.ue_auth_state.get(amf_ue_ngap_id).expect("UE kept");
+        assert!(!ue.is_cm_idle());
+        assert_eq!(ue.reachability.map(|r| r.phase), None);
+
+        server
+            .handle_ue_context_release_complete(assoc, &complete(41))
+            .await
+            .expect("handled");
+        let ue = server.ue_auth_state.get(amf_ue_ngap_id).expect("UE kept");
+        assert!(
+            ue.is_cm_idle(),
+            "the matching id pair is the serving connection"
+        );
+        assert_eq!(
+            ue.reachability.map(|r| r.phase),
+            Some(ReachabilityPhase::MobileReachable)
+        );
+    }
+
     /// A PATH SWITCH REQUEST FAILURE's `(amf id, ran id, [(psi, unsuccessful transfer)])`,
     /// decoded with the generated codec; `None` for any other PDU.
     #[allow(clippy::type_complexity)]
@@ -23963,6 +24355,34 @@ mod tests {
             guard.sess_find_by_psi(ue, 5).is_none(),
             "exactly one record"
         );
+    }
+
+    /// **#738 (review of #550).** The PDU session establishment HANDLER records the
+    /// session in the AMF context's store, under the ref the SMF chose. The helper test
+    /// above calls `record_amf_session` directly, so removing the production call left
+    /// the suite green; this drives `handle_5gsm_message` against a fake SMF.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_established_pdu_session_is_recorded_by_the_handler() {
+        crate::context::amf_context_init(64, 1024, 4096);
+        let (_smf, port) = fake_smf_creating_sm_contexts("smf-ref-738-sess").await;
+        let _env = SmfEnvGuard::set(port);
+        let mut ngap = capturing_ngap_server().await;
+        let ue = 7_738_010u64;
+        let mut state = UeNasContext::new(ue, 72, 1, false);
+        state.registered = true;
+        ngap.ue_auth_state.insert(ue, state);
+
+        let _ = ngap
+            .handle_5gsm_message(1, ue, 72, &pdu_session_establishment_request(4), None)
+            .await;
+
+        let ctx = crate::context::amf_self();
+        let guard = ctx.read().unwrap();
+        let sess = guard
+            .sess_find_by_psi(ue, 4)
+            .expect("the established session is in the AMF context's store (#540)");
+        assert_eq!(sess.sm_context_ref.as_deref(), Some("smf-ref-738-sess"));
+        guard.sess_remove(sess.id);
     }
 
     /// **#356**: an NG Reset frees the emergency contexts of the UEs it drops, and only
