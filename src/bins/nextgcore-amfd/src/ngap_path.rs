@@ -743,6 +743,16 @@ pub struct NgapServer {
     /// one from the allocator, so a test can key its assertions on a known value.
     #[cfg(test)]
     forced_amf_ue_ngap_id: Option<u64>,
+    /// Test seam: when `Some`, every NGAP PDU `send_to_association` would put on the
+    /// wire is recorded here as `(association_id, pdu)` instead, and the send
+    /// succeeds. Lets a handler test assert what amfd SENDS, and to whom, without a
+    /// live SCTP association. `None` (the default) keeps the real transport.
+    #[cfg(test)]
+    sent_ngap: Option<Vec<(u64, Vec<u8>)>>,
+    /// Test seam: the next this-many NGAP sends fail as an SCTP send error would,
+    /// so a test can drive a handler's send-failure branch (#760).
+    #[cfg(test)]
+    fail_next_sends: usize,
     /// Event sender for NGAP events
     event_tx: mpsc::Sender<AmfEvent>,
     /// Server event receiver
@@ -880,6 +890,10 @@ impl NgapServer {
             next_gnb_id: Arc::new(Mutex::new(1)),
             #[cfg(test)]
             forced_amf_ue_ngap_id: None,
+            #[cfg(test)]
+            sent_ngap: None,
+            #[cfg(test)]
+            fail_next_sends: 0,
             event_tx,
             server_event_rx,
             ue_auth_state,
@@ -12795,6 +12809,17 @@ impl NgapServer {
             association_id
         );
 
+        #[cfg(test)]
+        if self.fail_next_sends > 0 {
+            self.fail_next_sends -= 1;
+            return Err(anyhow::anyhow!("SCTP send error: injected by a test"));
+        }
+        #[cfg(test)]
+        if let Some(sent) = self.sent_ngap.as_mut() {
+            sent.push((association_id, data.to_vec()));
+            return Ok(());
+        }
+
         // Use stream 0 for NGAP signaling
         self.transport
             .send(association_id, 0, data)
@@ -14562,6 +14587,9 @@ pub async fn amf_ngap_poll() -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    /// Handler-level tests asserting what amfd SENDS (#760, ...), in their own file.
+    mod handler_tests;
+
     use super::*;
     use crate::context::AmfContext;
     use tokio::sync::mpsc;
@@ -20528,6 +20556,85 @@ mod tests {
             .expect("the UE context must survive its own handover");
         assert_eq!(moved.association_id, target, "serving association moved");
         assert_eq!(moved.ran_ue_ngap_id, 22, "serving RAN-UE-NGAP-ID moved");
+    }
+
+    // ---- outbound capture: what amfd SENDS, not just what it stores ----
+
+    /// A test server whose `send_to_association` records each NGAP PDU as
+    /// `(association_id, pdu)` instead of writing it to SCTP (see `sent_ngap`).
+    async fn capturing_ngap_server() -> NgapServer {
+        let mut server = test_ngap_server().await;
+        server.sent_ngap = Some(Vec::new());
+        server
+    }
+
+    /// Everything sent since the last call, in send order.
+    fn take_sent_ngap(server: &mut NgapServer) -> Vec<(u64, Vec<u8>)> {
+        std::mem::take(server.sent_ngap.as_mut().expect("capture enabled"))
+    }
+
+    /// A UE Context Release Command's `(amf_ue_ngap_id, ran_ue_ngap_id, radio-network
+    /// cause)`, decoded with the generated codec; `None` for any other PDU.
+    fn decoded_release_command(pdu: &[u8]) -> Option<(u64, Option<u32>, Option<u8>)> {
+        use nextgcore_ngap_gen::generated as g;
+        let g::NGAP_PDU::InitiatingMessage(m) = nextgcore_ngap_gen::decode(pdu).ok()? else {
+            return None;
+        };
+        let g::InitiatingMessageValue::Id_UEContextRelease(cmd) = m.value else {
+            return None;
+        };
+        let (mut ids, mut cause) = (None, None);
+        for ie in cmd.protocol_i_es.0 {
+            match ie.value {
+                g::UEContextReleaseCommandProtocolIEs_EntryValue::Id_UE_NGAP_IDs(
+                    g::UE_NGAP_IDs::UE_NGAP_ID_pair(pair),
+                ) => ids = Some((pair.amf_ue_ngap_id.0, Some(pair.ran_ue_ngap_id.0))),
+                g::UEContextReleaseCommandProtocolIEs_EntryValue::Id_UE_NGAP_IDs(
+                    g::UE_NGAP_IDs::AMF_UE_NGAP_ID(amf),
+                ) => ids = Some((amf.0, None)),
+                g::UEContextReleaseCommandProtocolIEs_EntryValue::Id_Cause(
+                    g::Cause::RadioNetwork(c),
+                ) => cause = Some(c.0),
+                _ => {}
+            }
+        }
+        ids.map(|(amf, ran)| (amf, ran, cause))
+    }
+
+    /// The capture seam itself: HandoverNotify's source release (#70) is observed on
+    /// the wire it goes out on -- the SOURCE association, addressed to the SOURCE id
+    /// pair, cause successful-handover -- and the handler reports it sent. Without a
+    /// capture `handover_notify_releases_the_source_ran_context` could assert only the
+    /// decision, because the send to a seeded session with no SCTP association fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_capture_seam_records_the_source_release_command() {
+        let mut server = capturing_ngap_server().await;
+        let (source, target) = (97_301u64, 97_302u64);
+        let amf_ue_ngap_id = 7_730_001u64;
+        seed_gnb_session(&server, source).await;
+        seed_gnb_session(&server, target).await;
+        let state = UeNasContext::new(amf_ue_ngap_id, 13, source, false);
+        server.ue_auth_state.insert(amf_ue_ngap_id, state);
+
+        let report = server
+            .handle_handover_notify(target, &handover_notify_pdu(amf_ue_ngap_id, 23))
+            .await
+            .expect("handled");
+
+        assert!(report.source_release_sent, "the captured send succeeds");
+        let sent = take_sent_ngap(&mut server);
+        assert_eq!(sent.len(), 1, "exactly the source release: {sent:?}");
+        assert_eq!(sent[0].0, source, "sent to the SOURCE association");
+        assert_eq!(
+            decoded_release_command(&sent[0].1),
+            Some((
+                amf_ue_ngap_id,
+                Some(13),
+                Some(nextgcore_ngap_gen::generated::CauseRadioNetwork::SUCCESSFUL_HANDOVER)
+            )),
+            "UE Context Release Command, SOURCE id pair, successful-handover"
+        );
+        assert!(take_sent_ngap(&mut server).is_empty(), "take drains");
     }
 
     /// #400: a HANDOVER that moves the UE out of a subscribed Area of Interest delivers
