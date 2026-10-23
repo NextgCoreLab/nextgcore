@@ -1063,14 +1063,30 @@ pub fn send_delete_all_sessions(
         .ok_or(GtpPathError::ContextNotFound)?;
     let sgw_ue_id = mme_ue.sgw_ue_id;
 
+    // #828: one PDN connection that cannot be deleted must not keep the others'
+    // Delete Session Requests from going out; the caller removes them all
+    // locally, and a skipped one would leak at the gateways.
     let mut xacts = Vec::new();
+    let mut first_error = None;
     for sess_id in &mme_ue.sess_list {
         if ctx.sess_find_by_id(*sess_id).is_some() {
-            let xact = send_delete_session_request(ctx, enb_ue_id, sgw_ue_id, *sess_id, action)?;
-            xacts.push(xact);
+            match send_delete_session_request(ctx, enb_ue_id, sgw_ue_id, *sess_id, action) {
+                Ok(xact) => xacts.push(xact),
+                Err(e) => {
+                    log::error!(
+                        "[{}] Delete Session Request for session {sess_id} not sent: {e}; the \
+                         other PDN connections are still deleted",
+                        mme_ue.imsi_bcd
+                    );
+                    first_error.get_or_insert(e);
+                }
+            }
         }
     }
-    Ok(xacts)
+    match first_error {
+        Some(e) if xacts.is_empty() => Err(e),
+        _ => Ok(xacts),
+    }
 }
 
 pub fn send_create_bearer_response(

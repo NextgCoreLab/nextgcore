@@ -1158,6 +1158,43 @@ fn an_eps_to_5gs_handover_runs_against_the_amfs_own_n26_codec() {
         "the Relocation Cancel Response closes the request"
     );
 
+    // --- #735, TS 29.274 §7.6: a retransmitted Complete Notification ---------
+    // Through the SOCKET: the AMF's first Acknowledge is lost, it retransmits
+    // the Notification, and gets the same Acknowledge from the response cache
+    // rather than silence (before #735 the cached Acknowledge was never read).
+    let teid = 0x0735_0001;
+    crate::n26_path::record_eps_to_5gs_relocation_for_test(crate::n26_path::EpsTo5gsRelocation {
+        mme_ue_id: 0x0735_0001,
+        source_enb_ue_id: 0,
+        sequence: 0x735,
+        amf_peer: amf_sock.local_addr().unwrap(),
+        amf_teid: Some(0xA735),
+    });
+    let notification = amf::build_forward_relocation_complete_notification(0x0735, teid);
+    let mut acks = Vec::new();
+    for _ in 0..2 {
+        amf_sock
+            .send_to(&notification.encode(), n26.local_addr())
+            .unwrap();
+        let mut buf = [0u8; 4096];
+        let (len, _) = loop {
+            let (len, from) = amf_sock.recv_from(&mut buf).expect("an Acknowledge");
+            if buf.get(1) == Some(&136) {
+                break (len, from);
+            }
+        };
+        acks.push(buf[..len].to_vec());
+    }
+    assert_eq!(acks.len(), 2, "both Notifications are answered");
+    assert_eq!(
+        acks[0], acks[1],
+        "the retransmission gets the same Acknowledge"
+    );
+    let ack =
+        nextgcore_gtp::v2::Gtp2Message::decode(&mut bytes::Bytes::from(acks[1].clone())).unwrap();
+    assert_eq!(ack.header.sequence_number, 0x0735);
+    assert_eq!(ack.header.teid, Some(0xA735));
+
     crate::n26_path::set_for_test(false);
 }
 
