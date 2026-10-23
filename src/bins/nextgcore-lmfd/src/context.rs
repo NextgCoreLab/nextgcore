@@ -280,6 +280,18 @@ pub enum MeasurementLeg {
     NrppaEcid,
 }
 
+/// The most measurements one positioning session accumulates (#834 review). A
+/// session's legs carry tens of cells; this bounds a peer that repeats notifies.
+pub const MAX_SESSION_MEASUREMENTS: usize = 512;
+
+/// Whether `cells` already give an E-UTRA E-CID fix (#834 review MINOR 4).
+fn eutra_ecid_fix(cells: &[CellMeasurement], registry: &TrpRegistry) -> bool {
+    !registry.is_empty()
+        && try_real_solve(cells, registry).is_some_and(|f| {
+            f.method_used.as_deref() == Some(crate::nlmf::positioning_method::ECID)
+        })
+}
+
 /// What a leg's report did to its session.
 #[derive(Debug, Clone)]
 pub enum LegProgress {
@@ -334,6 +346,8 @@ pub struct LmfContext {
     /// no exchange happened, which `UeLppCapability::Unknown` is distinct from
     /// `EcidOnly` precisely to express.
     ue_capabilities: RwLock<HashMap<String, crate::codec_glue::UeLppCapability>>,
+    /// The E-CID flavours each UE reported (#834 review), keyed by SUPI.
+    ue_ecid_flavours: RwLock<HashMap<String, crate::codec_glue::EcidFlavours>>,
     /// Sidelink ranges reported by each UE (TS 23.586 §5.3.3, nextgsim #138), keyed
     /// by SUPI. The LATEST report per UE replaces the previous one: a range is a
     /// snapshot, and accumulating them would make an LMF answer with a distance the
@@ -404,6 +418,7 @@ impl LmfContext {
             initialized: AtomicBool::new(false),
             cell_registry: RwLock::new(HashMap::new()),
             ue_capabilities: RwLock::new(HashMap::new()),
+            ue_ecid_flavours: RwLock::new(HashMap::new()),
             sidelink_ranges: RwLock::new(HashMap::new()),
             up_subscriptions: RwLock::new(HashMap::new()),
             up_configs: RwLock::new(HashMap::new()),
@@ -1013,8 +1028,14 @@ impl LmfContext {
     /// completes it arrives. A leg that reports twice adds its measurements again;
     /// the solvers count each TRP once.
     ///
-    /// With no pending session (a debug route, or a session that already ended)
-    /// the report is solved on its own, as before.
+    /// With no pending session (it already ended, or the request id is not a
+    /// session's) nothing is solved and `NoSession` is returned; every caller
+    /// resolves the session before reporting a leg (#834 review).
+    ///
+    /// Bounded: a session holds at most [`MAX_SESSION_MEASUREMENTS`]; more are
+    /// dropped and logged. And an E-UTRA E-CID fix from the LPP leg alone (its
+    /// UE Rx–Tx is a timing term) completes the session at once, so a silent gNB
+    /// does not cost the whole budget; the NRPPa leg would only refine it.
     pub fn measurement_leg_report(
         &self,
         request_id: u64,
@@ -1029,6 +1050,8 @@ impl LmfContext {
         let Some(corr) = corr else {
             return LegProgress::NoSession;
         };
+        // Taken before the sessions lock, which is held alone.
+        let registry = self.build_trp_registry();
         let ready = {
             let Ok(mut sessions) = self.positioning_sessions.write() else {
                 return LegProgress::NoSession;
@@ -1036,11 +1059,21 @@ impl LmfContext {
             let Some(s) = sessions.get_mut(&corr) else {
                 return LegProgress::NoSession;
             };
-            s.accumulated.extend(cells);
+            let room = MAX_SESSION_MEASUREMENTS.saturating_sub(s.accumulated.len());
+            if cells.len() > room {
+                log::warn!(
+                    "Positioning session {corr}: {} measurement(s) of {leg:?} dropped, the \
+                     session holds its maximum of {MAX_SESSION_MEASUREMENTS}",
+                    cells.len() - room
+                );
+            }
+            s.accumulated.extend(cells.into_iter().take(room));
             if !s.reported_legs.contains(&leg) {
                 s.reported_legs.push(leg);
             }
-            if Self::all_legs_in(s) {
+            if Self::all_legs_in(s)
+                || (leg == MeasurementLeg::Lpp && eutra_ecid_fix(&s.accumulated, &registry))
+            {
                 Some(s.accumulated.clone())
             } else {
                 log::info!(
@@ -1091,7 +1124,63 @@ impl LmfContext {
     /// Look up the `lcsCorrelationId` of the newest session that used LPP
     /// `transactionNumber` `txn` (A4 fallback correlation; last-writer-wins).
     pub fn positioning_session_find_by_transaction(&self, txn: u8) -> Option<String> {
-        self.positioning_txn_index.read().ok()?.get(&txn).cloned()
+        // #834 review: the 8-bit index is last-writer-wins, and a leg routed by it
+        // is now merged with that session's other legs. With more than one
+        // pending session on the number, which one the leg belongs to cannot be
+        // told, so it is refused rather than guessed.
+        let pending = self
+            .positioning_sessions
+            .read()
+            .ok()?
+            .values()
+            .filter(|s| s.lpp_transaction == txn)
+            .count();
+        if pending > 1 {
+            log::warn!(
+                "LPP transaction {txn} is used by {pending} pending sessions; a leg \
+                 correlated only by it is refused"
+            );
+            return None;
+        }
+        let corr = self.positioning_txn_index.read().ok()?.get(&txn).cloned();
+        if corr.is_some() {
+            log::warn!(
+                "LPP leg correlated by its transaction number {txn} alone (no \
+                 lcsCorrelationId)"
+            );
+        }
+        corr
+    }
+
+    /// Remove the sessions older than `max_age` and their measurement-store
+    /// entries (#834 review). A DetermineLocation whose client went away drops
+    /// its waiter without expiring the session, which then held its slot for the
+    /// life of the process. Returns how many were removed.
+    pub fn positioning_session_reap(&self, max_age: std::time::Duration) -> usize {
+        let stale: Vec<String> = match self.positioning_sessions.read() {
+            Ok(s) => s
+                .values()
+                .filter(|s| s.created_at.elapsed() > max_age)
+                .map(|s| s.lcs_correlation_id.clone())
+                .collect(),
+            Err(_) => return 0,
+        };
+        let mut reaped = 0;
+        for corr in stale {
+            if let Some(session) = self.positioning_session_take(&corr) {
+                if let Ok(mut m) = self.measurements.write() {
+                    m.remove(&session.request_id);
+                }
+                if let Ok(mut r) = self.reports.write() {
+                    r.remove(&session.request_id);
+                }
+                reaped += 1;
+            }
+        }
+        if reaped > 0 {
+            log::info!("Reaped {reaped} positioning session(s) older than {max_age:?}");
+        }
+        reaped
     }
 
     /// Number of pending positioning sessions.
@@ -1170,6 +1259,22 @@ impl LmfContext {
     pub fn note_ue_lpp_capability(&self, supi: &str, cap: crate::codec_glue::UeLppCapability) {
         if let Ok(mut c) = self.ue_capabilities.write() {
             c.insert(supi.to_string(), cap);
+        }
+    }
+
+    /// The E-CID flavours `supi` reported, or none known.
+    pub fn ue_ecid_flavours(&self, supi: &str) -> crate::codec_glue::EcidFlavours {
+        self.ue_ecid_flavours
+            .read()
+            .ok()
+            .and_then(|c| c.get(supi).copied())
+            .unwrap_or_default()
+    }
+
+    /// Record the E-CID flavours a UE reported.
+    pub fn note_ue_ecid_flavours(&self, supi: &str, flavours: crate::codec_glue::EcidFlavours) {
+        if let Ok(mut c) = self.ue_ecid_flavours.write() {
+            c.insert(supi.to_string(), flavours);
         }
     }
 
@@ -2579,11 +2684,9 @@ mod tests_real_solve {
         let (corr_b, mut rx_b) = ctx.positioning_session_register(None, 5, 101); // wrapped txn
         assert_ne!(corr_a, corr_b, "correlation ids stay unique across wrap");
         assert_eq!(ctx.positioning_session_count(), 2);
-        // Transaction index points at the NEWEST session (last-writer-wins).
-        assert_eq!(
-            ctx.positioning_session_find_by_transaction(5).as_deref(),
-            Some(corr_b.as_str())
-        );
+        // #834 review: with two pending sessions on one number, a leg correlated
+        // by it alone cannot be told apart, so the fallback refuses it.
+        assert_eq!(ctx.positioning_session_find_by_transaction(5), None);
         // Completing the OLD session by correlation id still works and does
         // NOT disturb the newer session's txn index entry.
         assert!(ctx.positioning_session_complete(&corr_a, PositioningOutcome::SolverFailed));
@@ -3043,6 +3146,61 @@ mod tests_dl_tdoa_reference {
             .1
     }
 
+    /// #824 re-review MINOR 1: a case only the DL-PRS ID join decides. In a mixed
+    /// registry (discouraged, but legal) T3 is both `pci-3` and `prs-2`. Report A
+    /// names it by PCI, report B by DL-PRS ID alone, so the two reports reach it
+    /// under different keys; joined on the key, B shares nothing with A and is
+    /// dropped. Joined on the DL-PRS ID, B joins A through T3, and T4 is added.
+    #[test]
+    fn only_the_dl_prs_id_joins_reports_that_name_one_trp_by_different_keys() {
+        let at = |e: f64, n: f64| enu_to_geodetic(EnuPoint { e, n, u: 0.0 }, origin());
+        let reg = TrpRegistry::from_entries(
+            TRPS.iter()
+                .map(|(prs, pci, e, n)| {
+                    let key = if *prs == 0 {
+                        "prs-0".to_string()
+                    } else {
+                        format!("pci-{pci}")
+                    };
+                    (key, at(*e, *n))
+                })
+                .chain(std::iter::once((
+                    "prs-2".to_string(),
+                    at(TRPS[2].2, TRPS[2].3),
+                ))),
+        );
+        let mut cells = report_at(
+            0,
+            (0.0, 0.0),
+            &[(1, 2, 1000.0, 0.0), (2, 3, 0.0, 1000.0)],
+            1,
+        );
+        // Report B: unregistered reference T7 (DL-PRS 9); T3 by DL-PRS 2 with no
+        // PCI, and T4.
+        let mut b = report_at(
+            9,
+            (500.0, 1500.0),
+            &[(2, 3, 0.0, 1000.0), (3, 4, 1000.0, 1000.0)],
+            2,
+        );
+        for c in &mut b {
+            if c.dl_prs_id == Some(2) {
+                c.nr_cgi = "prs-2".to_string();
+            }
+        }
+        cells.extend(b);
+        let (obs, _) = tdoa_observations(&cells, &reg);
+        let mut keys: Vec<&str> = obs.iter().map(|o| o.trp_id.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["pci-2", "pci-3", "pci-4", "prs-0"],
+            "B joined A through T3"
+        );
+        let fix = try_real_solve(&cells, &reg).expect("a DL-TDOA fix");
+        assert!(error_m(&fix) < 1.0, "position error {:.3} m", error_m(&fix));
+    }
+
     /// #824 review MAJOR: a PCI does not identify a TRP. Report B's neighbour T5'
     /// reuses PCI 2 (T2's) at another site. Joined on the registry key, B was
     /// joined to A through "pci-2" and the fix came out 705 m off with nothing
@@ -3389,5 +3547,127 @@ mod tests_session_legs {
             c.positioning_session_withdraw_leg(&corr, MeasurementLeg::NrppaEcid),
             LegProgress::Completed(None)
         ));
+    }
+}
+
+/// #834 review MINORs: bounded accumulation, an early E-UTRA E-CID solve, and a
+/// reaper for sessions nobody waits on.
+#[cfg(test)]
+mod tests_session_bounds {
+    use super::*;
+
+    fn ctx() -> LmfContext {
+        let mut c = LmfContext::new();
+        c.init(16);
+        c.set_cell_coord("pci-7", TrpCoord::new(40.1, -74.5, 0.0));
+        c
+    }
+
+    fn cell(eutra: bool, ta: Option<f64>) -> CellMeasurement {
+        CellMeasurement {
+            nr_cgi: "pci-7".to_string(),
+            rsrp: Some(-80),
+            rsrq: None,
+            timing_advance: ta.map(|t| t as u32),
+            aoa: None,
+            rtt_ns: None,
+            rstd_ns: None,
+            rstd_reference: None,
+            ue_rx_tx_ns: None,
+            gnb_rx_tx_ns: None,
+            dl_prs_id: None,
+            eutra,
+        }
+    }
+
+    fn session(
+        c: &LmfContext,
+    ) -> (
+        u64,
+        String,
+        tokio::sync::oneshot::Receiver<PositioningOutcome>,
+    ) {
+        let req = c
+            .measurement_request(
+                0,
+                PositioningMethod::Ecid,
+                None,
+                None,
+                PositioningQos::BestEffort,
+            )
+            .unwrap();
+        let (corr, rx) = c.positioning_session_register(Some("imsi-1".into()), 4, req.request_id);
+        c.positioning_session_expect_leg(&corr, MeasurementLeg::NrppaEcid);
+        (req.request_id, corr, rx)
+    }
+
+    /// An E-UTRA E-CID LPP report carries the UE Rx–Tx, a timing term: it solves
+    /// alone, so a silent gNB does not cost the whole budget.
+    #[test]
+    fn an_eutra_ecid_lpp_leg_that_solves_completes_the_session() {
+        let c = ctx();
+        let (request_id, _corr, mut rx) = session(&c);
+        let LegProgress::Completed(Some(fix)) = c.measurement_leg_report(
+            request_id,
+            MeasurementLeg::Lpp,
+            vec![cell(true, Some(500.0))],
+        ) else {
+            panic!("solved without waiting for the NRPPa leg");
+        };
+        assert_eq!(fix.method_used.as_deref(), Some("ECID"));
+        assert!(matches!(rx.try_recv(), Ok(PositioningOutcome::Fix(_))));
+    }
+
+    /// An NR E-CID LPP report (no timing term) still waits for the NRPPa leg.
+    #[test]
+    fn an_lpp_leg_that_does_not_solve_still_waits() {
+        let c = ctx();
+        let (request_id, _corr, _rx) = session(&c);
+        assert!(matches!(
+            c.measurement_leg_report(request_id, MeasurementLeg::Lpp, vec![cell(false, None)]),
+            LegProgress::Waiting
+        ));
+    }
+
+    /// A peer repeating notifies cannot grow a session without bound.
+    #[test]
+    fn a_session_holds_at_most_max_session_measurements() {
+        let c = ctx();
+        let (request_id, corr, _rx) = session(&c);
+        for _ in 0..3 {
+            c.measurement_leg_report(
+                request_id,
+                MeasurementLeg::NrppaEcid,
+                vec![cell(false, None); MAX_SESSION_MEASUREMENTS / 2 + 1],
+            );
+        }
+        let held = c
+            .positioning_sessions
+            .read()
+            .unwrap()
+            .get(&corr)
+            .map(|s| s.accumulated.len());
+        assert_eq!(held, Some(MAX_SESSION_MEASUREMENTS));
+    }
+
+    /// A session older than the reap age goes, with its measurement-store entry;
+    /// a young one stays.
+    #[test]
+    fn stale_sessions_are_reaped() {
+        let c = ctx();
+        let (old_id, _old, _rx1) = session(&c);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let (young_id, young, _rx2) = session(&c);
+        assert_eq!(
+            c.positioning_session_reap(std::time::Duration::from_millis(20)),
+            1
+        );
+        assert_eq!(c.positioning_session_count(), 1);
+        assert!(c.positioning_session_find(&young).is_some());
+        assert!(
+            c.measurement_find(old_id).is_none(),
+            "its measurement slot is freed"
+        );
+        assert!(c.measurement_find(young_id).is_some());
     }
 }
