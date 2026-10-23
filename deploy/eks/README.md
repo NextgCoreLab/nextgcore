@@ -1,7 +1,8 @@
 # NextG on EKS
 
 An EKS-targeted deployment for the nextgcore 5G control/user plane plus the
-nextgsim gNB/UE. This is a **lab / non-production** deployment. Read
+nextgsim gNB/UE (PROFILE=5g), or the nextgcore EPC plus the nextgsim LTE eNB/UE
+(PROFILE=epc). This is a **lab / non-production** deployment. Read
 "Known limitations" before pointing it at anything shared.
 
 The existing `nextgcore/k8s/` manifests target **Kind** (`deploy.sh` calls
@@ -20,10 +21,15 @@ deploy/eks/
 │   │   ├── patches/            per-concern strategic-merge patches
 │   │   └── profile.env         namespace, images, features, rollout hooks
 │   └── epc/                  PROFILE=epc (nextg-epc): EPC + LTE eNB/UE
+│       ├── kustomization.yaml  mongodb + epc.yaml + the unmodified compose configs
+│       ├── epc.yaml            9 Deployments, each with a headless Service
+│       ├── namespace.yaml      nextg-epc, pod-security privileged
+│       ├── profile.env         namespace, images, features, rollout hooks
+│       └── scripts/            epc-run.sh (entrypoint), epc-peers-check.sh (liveness)
 ├── e2e-internet.sh           UE -> internet check, PROFILE=5g|epc
 ├── lib/image-tag.sh          git-SHA image tag, shared by both scripts
 ├── lib/profile.sh            PROFILE loader, shared by both scripts
-├── build-and-push.sh         build 12 images, push to ECR
+├── build-and-push.sh         build the profile's images (12 for 5g, 9 for epc), push to ECR
 ├── deploy-eks.sh             apply the overlay in dependency order
 └── README.md
 ```
@@ -69,6 +75,11 @@ stage, in namespace `nextg-epc`:
 - pgwc (`smfd`) and pgwu (`upfd`);
 - nextgsim's LTE `enb` and `lte-ue`.
 
+Every EPC pod except mongodb has `nodeSelector: nextg.io/dataplane=true`, so
+at least one node must carry that label (CloudFormation
+`EnableDataPlanePrivileges=true` sets it on the node group; on an existing
+cluster, `kubectl label node <n> nextg.io/dataplane=true`).
+
 **Configs.** The compose configs are mounted unmodified, from their real
 paths (hence `--load-restrictor LoadRestrictionsNone`).
 `profiles/epc/scripts/epc-run.sh`, the entrypoint of every pod, maps each
@@ -89,7 +100,23 @@ UDP flows clashes in conntrack.
 **S1-MME is kernel SCTP**, as in the nightly. mmed and lte-enb must be
 built with their `kernel-sctp` features, and the nodes need the `sctp` kernel
 module. The mme Service's `s1ap` port is `protocol: SCTP`; `S1AP_PROTOCOL`
-overrides it. The images are built from those binaries:
+overrides it.
+
+**Node prerequisite: the `sctp` module.** A container shares the node's
+kernel, so this cannot be fixed in an image. Without it, mme fails to bind
+36412. Load it on each `nextg.io/dataplane=true` node and persist it across
+reboots:
+
+```bash
+# from a namespace at pod-security privileged; delete the node-debugger pod after
+kubectl debug node/<n> -n nextg-epc --profile=sysadmin --image=busybox -- \
+  chroot /host sh -c 'modprobe sctp && echo sctp > /etc/modules-load.d/sctp.conf'
+kubectl -n nextg-epc exec deploy/mme -- grep -w sctp /proc/modules   # after deploy
+```
+
+A newly launched node needs the same step (or launch-template userData).
+
+The images are built from those binaries:
 
 ```bash
 # mmed with kernel SCTP, next to the six default-build EPC binaries
@@ -107,6 +134,32 @@ EPHEMERAL_STORAGE=true PROFILE=epc ./deploy-eks.sh
 PROFILE=epc ./e2e-internet.sh
 ```
 
+**Storage.** MongoDB uses the shared StatefulSet with a gp3 PVC. On a cluster
+without the EBS CSI driver (no gp3 StorageClass), the PVC stays Pending and
+mongodb never starts; deploy with `EPHEMERAL_STORAGE=true` (an emptyDir, so
+the subscriber data does not survive mongodb-0 being recreated).
+
+`PROFILE=epc ./e2e-internet.sh` checks, from the logs, S1 Setup, EMM-REGISTERED
+and the same default-bearer EBI on the UE and the MME, then the same ping / DNS /
+HTTPS / PGW-U counter steps as the 5G profile, on `lteuetun5`.
+
+**Restarting a pod.** Deleting any single EPC pod recovers with no manual
+restart; the next `e2e-internet.sh` passes. Validated on devtest1, one deletion
+at a time:
+
+| deleted | recovers | how |
+|---|---|---|
+| pgwu | on its own | the PGW-C's PFCP heartbeat sees the new Recovery Time Stamp, sends a Delete Bearer Request; the MME detaches the UE (re-attach required) and the UE re-attaches |
+| sgwu | on its own | sgwc liveness-restarts; the MME sees the SGW-C restart counter change on Echo, detaches (re-attach required), and the UE re-attaches |
+| pgwc | on the UE's next uplink | sgwc and mme liveness-restart; the UE's Service Request is rejected #9, the eNB releases the UE, and the UE re-attaches |
+| sgwc | on the UE's next uplink | mme liveness-restarts; then as for pgwc |
+| mme | on the UE's next uplink | enb liveness-restarts, the UE loses the radio link and camps again idle; then as for pgwc |
+| enb | on its own | lte-ue liveness-restarts and attaches afresh |
+
+"On the UE's next uplink": an MME restart loses the UE contexts, and the UE
+stays EMM-REGISTERED and idle until it has data to send. No paging or periodic
+TAU brings it back sooner. An idle UE with nothing to send stays down.
+
 **Privileges.** The namespace is `privileged`. sgwu and pgwu run privileged
 with `/dev/net/tun`. lte-ue gets NET_ADMIN and `/dev/net/tun`. The sysctls
 (`ip_forward`, loose `rp_filter`) are not on the kubelet's safe list, so a
@@ -116,8 +169,8 @@ namespace. No `hostNetwork`, NodePort or LoadBalancer is used.
 ## Images are tagged by git SHA, not `:latest`
 
 Both scripts derive the tag from `git rev-parse --short=12 HEAD` of the
-repository each image is built from — nextgcore for the 10 core NFs,
-nextgsim for `gnb`/`ue`, since those are separate repos at separate
+repository each image is built from — nextgcore for the core NFs,
+nextgsim for the simulator images (`gnb`/`ue`, or `lte-enb`/`lte-ue`), since those are separate repos at separate
 commits. A dirty tree appends `-dirty`. Neither script passes the tag to
 the other: both read the same two repos, so they agree by construction
 (`lib/image-tag.sh`).
@@ -182,9 +235,10 @@ start, and `deploy-eks.sh` had to restart dependents whose peer had moved
 ## NGAP transport: UDP, deliberately
 
 `--sctp-backend` defaults to `userspace` — sctp-proto over **UDP**
-(`nextgcore-amfd/src/lib.rs:280`, `ngap_path.rs:53-56`). Kernel SCTP exists
-but requires the `kernel-sctp` build feature; requesting `kernel` without it
-is a hard startup error by design (`ngap_path.rs:118-126`).
+(`nextgcore-amfd/src/lib.rs:338`, parsed by `SctpBackend::parse` at
+`ngap_path.rs:64`). Kernel SCTP needs the `kernel-sctp` build feature;
+requesting `kernel` from a binary built without it is a hard startup error by
+design (`ngap_path.rs:131-137`).
 
 So port 38412 is declared `protocol: UDP` throughout this overlay. That is
 correct for the matched nextgsim gNB and it is what the shipped binaries
@@ -192,9 +246,13 @@ support.
 
 Two consequences worth stating plainly:
 
-- **A third-party RAN cannot attach.** Real gNBs speak SCTP over IP proto 132.
-  Interop needs binaries rebuilt with `--features kernel-sctp` and
-  `--sctp-backend kernel`, plus SCTP support on the node and load balancer.
+- **A third-party RAN cannot attach as deployed.** Real gNBs speak SCTP over
+  IP proto 132. Interop needs `--sctp-backend kernel`, port 38412 declared
+  `protocol: SCTP`, the `sctp` module on the node (see PROFILE=epc) and SCTP on
+  the load balancer. It also needs an amfd built with `kernel-sctp`: the
+  builder image (`docker/rust/Dockerfile.builder`, used by
+  `docker/rust/build.sh` and CI) already builds amfd and mmed that way, but a
+  plain `cargo build --release` does not.
 - The Helm chart at `nextgcore/deploy/helm/` declares 38412 as `protocol: UDP`
   for the same reason, and mounts a real config for all 10 NFs. Both gaps this
   section used to warn about are fixed (see #124). The chart deploys the
@@ -208,10 +266,15 @@ aws --version && kubectl version --client && docker --version
 aws sts get-caller-identity          # must succeed
 ```
 
-Prebuilt binaries must be present (they are committed):
+The binaries must be built first. They are not committed: `nextgcore/binaries/`
+and `nextgsim/docker/binaries/` are gitignored, and `build-and-push.sh` fails
+listing whatever is missing.
 
-- `nextgcore/binaries/nextgcore-*d` — 17 NF binaries
-- `nextgsim/docker/binaries/nr-gnb`, `nr-ue`
+- `nextgcore/binaries/`: `cd src && cargo build --release`, then copy the
+  daemons from `src/target/release/`. The workspace builds all 28 NF daemons
+  plus `nextgcore-webui`; PROFILE=5g packages 10 of them, PROFILE=epc 7.
+- `nextgsim/docker/binaries/nr-gnb`, `nr-ue` (PROFILE=5g), or
+  `nextgsim/binaries/lte-enb`, `lte-ue` (PROFILE=epc, see above).
 
 ## Deploy
 
@@ -284,7 +347,7 @@ only when every step passes.
 ## The user plane does not work by default
 
 `EnableDataPlanePrivileges=false` (the default) means the UPF runs with
-`--no-dataplane`. That flag is real (`nextgcore-upfd/src/main.rs:104`) and the
+`--no-dataplane`. That flag is real (`nextgcore-upfd/src/main.rs:132`) and the
 UPF wrapper already falls back to it when TUN creation fails.
 
 Signalling — NGAP, NAS, PFCP, SBI, registration, PDU session establishment —
@@ -325,9 +388,9 @@ Infrastructure (see `Outputs.Caveats` in the template):
 Workload:
 
 - **MongoDB is unauthenticated**, single replica, 1Gi EBS, no backup. The init
-  Job seeds a bcrypt admin hash and a test subscriber's Ki/OPc. Those are test
-  credentials from the Open5GS/UERANSIM defaults, but they are real key
-  material in a ConfigMap — do not reuse on a shared cluster.
+  Job seeds a test subscriber's Ki/OPc. Those are test credentials from the
+  Open5GS/UERANSIM defaults, but they are real key material in a ConfigMap —
+  do not reuse on a shared cluster.
 - The UDM's SUCI de-concealment private keys are moved into a Secret by this
   overlay (the Kind manifests reference `/etc/nextgcore/hnet/*.key` but never
   mount them, so the UDM crash-loops). A Secret is still base64, not
@@ -336,6 +399,8 @@ Workload:
   and the NRF is the source of truth for topology; `replicas: 2` has not been
   validated and is not expected to work.
 - PROFILE=5g deploys 10 of nextgcore's 28 NFs (the 5G control + user
-  plane). The EPC tier is PROFILE=epc (see above).
-- All 6G/AI features are off. That is the validated configuration — the
-  84/84 E2E result is with every 6G flag disabled.
+  plane). The EPC tier, with nextgsim's LTE eNB/UE, is PROFILE=epc (see above).
+- All 6G/AI features are off. That is the validated configuration: the
+  nightly gate (`docker-build`, `docker-e2e`, `docker-e2e-epc` in
+  `.github/workflows/ci.yml`) runs with every 6G flag disabled, and
+  `e2e-internet.sh` is the on-cluster check.
