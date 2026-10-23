@@ -486,6 +486,11 @@ pub struct PendingReport {
     pub attempts: u32,
     /// When the current (re)transmission was sent.
     pub last_sent: std::time::Instant,
+    /// The usage this request carries, TAKEN from its URRs by the harvest (#771).
+    /// Handed back to the data plane if the request is abandoned after N1, so a
+    /// report the CP function never acknowledged does not take its usage with it
+    /// (#780 review m2). Empty for requests that carry no harvested usage.
+    pub usage: Vec<crate::data_plane::UrrReportEntry>,
 }
 
 /// Async PFCP server for handling SMF requests
@@ -2339,6 +2344,7 @@ impl PfcpServer {
             smf_addr,
             &payload,
             "Downlink Data Report",
+            Vec::new(),
         )
         .await?;
         log::info!(
@@ -2387,6 +2393,7 @@ impl PfcpServer {
             smf_addr,
             &payload,
             "Error Indication Report",
+            Vec::new(),
         )
         .await?;
         log::info!(
@@ -2481,6 +2488,7 @@ impl PfcpServer {
             smf_addr,
             &payload,
             "Session Report Request (URR)",
+            reports.clone(),
         )
         .await?;
 
@@ -2579,6 +2587,7 @@ impl PfcpServer {
             smf_addr,
             &payload,
             "Session Report Request (quota exhausted)",
+            Vec::new(),
         )
         .await?;
         log::info!(
@@ -2601,6 +2610,7 @@ impl PfcpServer {
         smf_addr: SocketAddr,
         payload: &[u8],
         what: &str,
+        usage: Vec<crate::data_plane::UrrReportEntry>,
     ) -> Result<(), String> {
         let seq = self.alloc_seq();
         let message = self.build_response(
@@ -2622,6 +2632,7 @@ impl PfcpServer {
                     upf_seid,
                     attempts: 0,
                     last_sent: std::time::Instant::now(),
+                    usage,
                 },
             );
         }
@@ -2641,7 +2652,7 @@ impl PfcpServer {
         // Collect work under the lock, then send without holding it.
         let now = std::time::Instant::now();
         let mut to_send: Vec<(u32, Vec<u8>, SocketAddr)> = Vec::new();
-        let mut gave_up: Vec<(u32, u64)> = Vec::new();
+        let mut gave_up: Vec<(u32, u64, Vec<crate::data_plane::UrrReportEntry>)> = Vec::new();
         {
             let mut pending = self.pending_reports.lock().await;
             pending.retain(|&seq, p| {
@@ -2650,7 +2661,7 @@ impl PfcpServer {
                 }
                 if p.attempts >= PFCP_N1_MAX_RETRANSMIT {
                     // N1 exhausted: give up on this request.
-                    gave_up.push((seq, p.upf_seid));
+                    gave_up.push((seq, p.upf_seid, std::mem::take(&mut p.usage)));
                     return false;
                 }
                 p.attempts += 1;
@@ -2667,11 +2678,23 @@ impl PfcpServer {
                 Err(e) => log::error!("Failed to retransmit Session Report (seq={seq}): {e}"),
             }
         }
-        for (seq, upf_seid) in gave_up {
+        for (seq, upf_seid, usage) in gave_up {
             log::error!(
                 "Session Report Request (seq={seq}, SEID=0x{upf_seid:x}) abandoned after {} retransmissions (N1) — peer unresponsive",
                 PFCP_N1_MAX_RETRANSMIT
             );
+            // #780 review m2: no response after N1+1 transmissions, so the CP function
+            // has not acknowledged this usage. It goes back to its URRs and rides on the
+            // next report rather than vanishing. (The opposite risk -- a request that
+            // arrived but whose every response was lost -- is the less likely of the
+            // two, and an over-report is visible to the CP function where a dropped one
+            // is not.)
+            if !usage.is_empty() {
+                let dp = self.data_plane.read().unwrap().clone();
+                if let Some(dp) = dp {
+                    dp.restore_urr_usage(&usage);
+                }
+            }
         }
     }
 
@@ -4662,6 +4685,56 @@ mod tests {
             .await
             .is_err(),
             "no retransmission after acknowledgement"
+        );
+    }
+
+    /// #780 review m2: a harvested URR report abandoned after N1 hands its usage back
+    /// to the URR, so the next report carries it instead of it vanishing.
+    #[tokio::test]
+    async fn an_abandoned_urr_report_returns_its_usage_to_the_urr() {
+        let (server, smf, upf_seid, smf_seid) = server_with_session().await;
+        let dp = Arc::new(crate::data_plane::DataPlane::new(Arc::new(
+            std::sync::atomic::AtomicBool::new(false),
+        )));
+        dp.add_session_from_pfcp(
+            upf_seid,
+            smf_seid,
+            std::net::Ipv4Addr::new(10, 45, 7, 80),
+            0x7801,
+            0x7802,
+            "127.0.0.1:2152".parse().unwrap(),
+            Some(5),
+            Some(9),
+        );
+        let urr = Arc::new(crate::data_plane::DataPlaneUrr::new(1));
+        urr.set_reporting(Some(1), None, None, None, None);
+        dp.sessions
+            .find_by_seid(upf_seid)
+            .unwrap()
+            .urrs
+            .write()
+            .unwrap()
+            .insert(1, Arc::clone(&urr));
+        server.set_data_plane(Arc::clone(&dp));
+
+        urr.record(1234, true);
+        let reports = dp.collect_urr_reports();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(urr.usage().total_bytes(), 0, "taken by the harvest");
+        server
+            .send_urr_report(upf_seid, smf_seid, reports)
+            .await
+            .unwrap();
+        let _ = recv_report(&smf).await;
+        for _ in 0..=PFCP_N1_MAX_RETRANSMIT {
+            server.test_expire_pending_t1().await;
+            server.retransmit_pending_reports().await;
+        }
+        assert_eq!(server.pending_report_count().await, 0, "abandoned after N1");
+        assert_eq!(
+            urr.usage().ul_bytes,
+            1234,
+            "the abandoned report's usage is back on the URR for the next report"
         );
     }
 
