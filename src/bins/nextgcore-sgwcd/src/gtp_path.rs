@@ -1625,6 +1625,12 @@ fn dispatch_modify_bearer_request(server: &GtpcServer, msg: &Gtp2Message, peer: 
         return;
     };
 
+    // A retransmission of a request still waiting for the SGW-U is not
+    // processed again: the answer goes out when the SGW-U has spoken (#838).
+    if crate::sxa_response::modify_bearer_in_flight(peer, seq) {
+        log::debug!("Modify Bearer Request seq={seq} from {peer} is already in progress");
+        return;
+    }
     if parsed.bearers.is_empty() {
         // No bearer change requested (e.g. TAU): accept as-is
         send_cause_response(
@@ -1692,42 +1698,49 @@ fn dispatch_modify_bearer_request(server: &GtpcServer, msg: &Gtp2Message, peer: 
             .entry(bearer.sess_id)
             .or_default()
             .push(bearer.id);
-        modified.push(bearer.id);
+        // Settled as modified only when the SGW-U confirms (#838).
     }
 
-    for (sess_id, bearer_ids) in &per_session {
-        let Some(sess) = ctx.sess_find_by_id(*sess_id) else {
-            continue;
-        };
-        if let Err(e) = pfcp_path::send_bearer_to_modify_list(
-            &sess,
-            seq as u64,
-            bearer_ids,
-            sxa_handler::pfcp_modify::DL_ONLY | sxa_handler::pfcp_modify::ACTIVATE,
-        ) {
-            log::error!("PFCP bearer modification for session {sess_id} failed: {e}");
-        }
-    }
-
-    let cause = match (modified.is_empty(), marked_for_removal.is_empty()) {
-        (false, true) => gtp_cause::REQUEST_ACCEPTED,
-        (false, false) => gtp_cause::REQUEST_ACCEPTED_PARTIALLY,
-        (true, _) => gtp_cause::CONTEXT_NOT_FOUND,
-    };
-    log::info!(
-        "Modify Bearer Response: cause {cause}, modified {} bearer(s), marked for removal {:?}",
-        modified.len(),
-        marked_for_removal
-    );
-    let response = s11_build::build_modify_bearer_response_per_bearer(
-        ue.mme_s11_teid,
+    // #838, TS 23.401 §5.5.1.1.2 steps 3-4 / TS 29.274 §7.2.2: the answer
+    // waits for the SGW-U. One PFCP Session Modification per session gates it,
+    // and a session the SGW-U refuses (or never answers) has its bearers
+    // reported not modified. Before #838 the MME got Request accepted at once,
+    // whatever the user plane did.
+    let pending = crate::sxa_response::PendingModifyBearer {
+        peer,
         seq,
-        cause,
-        &modified,
-        &marked_for_removal,
-    );
-    if let Err(e) = server.send_response(peer, &response) {
-        log::error!("Modify Bearer Response to {peer} failed: {e}");
+        mme_teid: ue.mme_s11_teid,
+        waiting: per_session.clone(),
+        modified,
+        marked_for_removal,
+    };
+    if per_session.is_empty() {
+        crate::sxa_response::answer_modify_bearer(&pending, None);
+        return;
+    }
+    let join = crate::sxa_response::park_modify_bearer(pending);
+    for (sess_id, bearer_ids) in &per_session {
+        let continuation = pfcp_path::S11Continuation::ModifyBearer {
+            join,
+            sess_id: *sess_id,
+        };
+        let sent = match ctx.sess_find_by_id(*sess_id) {
+            Some(sess) => pfcp_path::send_bearer_to_modify_list_gating(
+                &sess,
+                bearer_ids,
+                sxa_handler::pfcp_modify::DL_ONLY | sxa_handler::pfcp_modify::ACTIVATE,
+                continuation,
+            ),
+            None => Err(format!("session {sess_id} is gone")),
+        };
+        if let Err(e) = sent {
+            log::error!("PFCP bearer modification for session {sess_id} not sent: {e}");
+            crate::sxa_response::modify_bearer_session_done(
+                join,
+                *sess_id,
+                Some(gtp_cause::SYSTEM_FAILURE),
+            );
+        }
     }
 }
 
@@ -3771,6 +3784,7 @@ mod tests {
         )
         .await;
         let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
         let mme = client();
         let (ue_id, s11_teid, _) =
             ue_with_pgw_session(mme.local_addr().unwrap(), b"001010766000001");
@@ -3803,7 +3817,7 @@ mod tests {
             mbr.add_bearer_context(0, &bc);
         }
         mme.send_to(&mbr.encode(), server.local_addr()).unwrap();
-        let rsp = recv_msg(&mme);
+        let rsp = recv_s11(&mme).await.expect("a Modify Bearer Response");
         assert_eq!(
             rsp.header.message_type,
             Gtp2MessageType::ModifyBearerResponse as u8
@@ -3881,6 +3895,79 @@ mod tests {
             1,
             "one modification per session"
         );
+        ctx.ue_remove(ue_id);
+        server.close();
+    }
+
+    /// #838, TS 23.401 §5.5.1.1.2 steps 3-4: the Modify Bearer Response waits
+    /// for the SGW-U. When it refuses the Session Modification the MME is not told
+    /// Request accepted: the bearers are marked for removal with System failure.
+    /// A retransmission while the SGW-U is deciding is not processed again (one
+    /// PFCP modification, one answer).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_modify_bearer_response_waits_for_the_sgwu_and_reports_its_refusal() {
+        let ambient = crate::pfcp_path::process_state_test_guard().await;
+        let sgwu = stand_in_sgwu(
+            &ambient,
+            crate::sxa_handler::pfcp_cause::REQUEST_REJECTED,
+            Duration::from_millis(300),
+        )
+        .await;
+        let server = test_server(&ambient, 1000, 1);
+        set_s11_server(server.clone());
+        let mme = client();
+        let (ue_id, s11_teid, _) =
+            ue_with_pgw_session(mme.local_addr().unwrap(), b"001010838000001");
+        let ctx = sgwc_self();
+        let bearer = ctx.bearer_find_by_ue_ebi(ue_id, 5).unwrap();
+        let mut dl = ctx.dl_tunnel_in_bearer(bearer.id).unwrap();
+        dl.far_id = Some(0x0838);
+        ctx.tunnel_update(&dl);
+
+        let mut mbr = Gtp2Message::new(nextgcore_gtp::v2::Gtp2Header::new(
+            Gtp2MessageType::ModifyBearerRequest as u8,
+            s11_teid,
+            0x0838,
+        ));
+        let mut bc = Gtp2BearerContextIe::new();
+        bc.set_ebi(5);
+        bc.set_fteid(
+            0,
+            &nextgcore_gtp::v2::Gtp2FTeidIe::new_ipv4(0, 0x8805, [10, 0, 0, 8]),
+        );
+        mbr.add_bearer_context(0, &bc);
+        mme.send_to(&mbr.encode(), server.local_addr()).unwrap();
+        // The MME retransmits before the SGW-U has answered.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        mme.send_to(&mbr.encode(), server.local_addr()).unwrap();
+
+        let rsp = recv_s11(&mme).await.expect("a Modify Bearer Response");
+        let cause = Gtp2CauseIe::decode(&rsp.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+            .unwrap()
+            .cause;
+        assert_eq!(cause, gtp_cause::SYSTEM_FAILURE, "not Request accepted");
+        let marked: Vec<u8> = rsp
+            .get_ies(Gtp2IeType::BearerContext as u8)
+            .into_iter()
+            .filter(|ie| ie.instance == 1)
+            .filter_map(|ie| Gtp2BearerContextIe::decode(&ie.value).ok()?.ebi().ok())
+            .collect();
+        assert_eq!(marked, vec![5]);
+        assert!(rsp
+            .get_ies(Gtp2IeType::BearerContext as u8)
+            .iter()
+            .all(|ie| ie.instance != 0));
+        assert_eq!(
+            sgwu.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(t, _, _)| *t == 52)
+                .count(),
+            1,
+            "the retransmission did not reach the SGW-U a second time"
+        );
+        assert_eq!(crate::sxa_response::modify_bearer_pending_count(), 0);
         ctx.ue_remove(ue_id);
         server.close();
     }
